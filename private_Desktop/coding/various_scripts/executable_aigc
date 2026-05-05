@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+"""
+aigc - AI-powered Git Commit message generator
+
+A smart tool that generates high-quality commit messages using AI,
+leveraging git context and repository history for consistency.
+
+Usage:
+    aigc                  Generate commit message and open editor
+    aigc --dry-run        Preview message without committing
+    aigc --no-edit        Commit directly without opening editor
+    aigc --amend          Generate message for amending last commit
+    aigc --all            Stage all changes and commit
+    aigc --preview        Show message before opening editor
+    aigc --verbose        Show detailed information
+    aigc --help           Show this help message
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, List, Tuple
+
+VERSION = "2.0.0"
+DEFAULT_MODEL = "claude-haiku-4.5"
+
+# ANSI color codes
+class Colors:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    GRAY = "\033[90m"
+
+    @staticmethod
+    def is_tty():
+        return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def colorize(text: str, color: str) -> str:
+    """Apply color to text if terminal supports it."""
+    if Colors.is_tty():
+        return f"{color}{text}{Colors.RESET}"
+    return text
+
+
+@dataclass
+class Config:
+    """Configuration for aigc."""
+    model: str = DEFAULT_MODEL
+    max_history: int = 5
+    max_diff_lines: int = 500
+    timeout: int = 30
+    style: str = "conventional"  # conventional, concise, verbose
+    include_stats: bool = True
+    include_history: bool = True
+    auto_validate: bool = True
+    show_preview: bool = False
+
+    @classmethod
+    def load(cls, config_path: Optional[Path] = None) -> "Config":
+        """Load configuration from file or environment."""
+        config = cls()
+        
+        # Try to load from config file
+        if config_path is None:
+            config_path = Path.home() / ".config" / "aigc" / "config.json"
+        
+        if config_path.exists():
+            try:
+                with open(config_path) as f:
+                    data = json.load(f)
+                    for key, value in data.items():
+                        if hasattr(config, key):
+                            setattr(config, key, value)
+            except Exception:
+                pass  # Silently ignore config errors
+        
+        # Environment variables override config file
+        if model := os.environ.get("AIGC_MODEL"):
+            config.model = model
+        if max_history := os.environ.get("AIGC_MAX_HISTORY"):
+            config.max_history = int(max_history)
+        if timeout := os.environ.get("AIGC_TIMEOUT"):
+            config.timeout = int(timeout)
+        
+        return config
+
+
+class Spinner:
+    """Animated spinner for long-running operations."""
+    
+    def __init__(self, message: str):
+        self.message = message
+        self.running = False
+        self.thread = None
+        self.frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self.start_time = None
+    
+    def __enter__(self):
+        if Colors.is_tty():
+            self.running = True
+            self.start_time = time.time()
+            self.thread = threading.Thread(target=self._spin)
+            self.thread.daemon = True
+            self.thread.start()
+        else:
+            info(self.message)
+        return self
+    
+    def __exit__(self, *args):
+        if Colors.is_tty():
+            self.running = False
+            if self.thread:
+                self.thread.join()
+            elapsed = time.time() - self.start_time
+            sys.stdout.write(f"\r{colorize('✓', Colors.GREEN)} {self.message} {colorize(f'({elapsed:.1f}s)', Colors.DIM)}\n")
+            sys.stdout.flush()
+    
+    def _spin(self):
+        i = 0
+        while self.running:
+            frame = self.frames[i % len(self.frames)]
+            elapsed = time.time() - self.start_time
+            sys.stdout.write(f"\r{colorize(frame, Colors.CYAN)} {self.message} {colorize(f'({elapsed:.0f}s)', Colors.DIM)}")
+            sys.stdout.flush()
+            time.sleep(0.1)
+            i += 1
+
+
+def error(msg: str, exit_code: int = 1) -> None:
+    """Print error message and exit."""
+    print(f"{colorize('✖', Colors.RED)} {msg}", file=sys.stderr)
+    sys.exit(exit_code)
+
+
+def warn(msg: str) -> None:
+    """Print warning message."""
+    print(f"{colorize('⚠', Colors.YELLOW)} {msg}", file=sys.stderr)
+
+
+def info(msg: str) -> None:
+    """Print info message."""
+    print(f"{colorize('•', Colors.BLUE)} {msg}")
+
+
+def success(msg: str) -> None:
+    """Print success message."""
+    print(f"{colorize('✓', Colors.GREEN)} {msg}")
+
+
+def run_cmd(cmd: List[str], check: bool = True, capture: bool = True, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+    """Run a shell command and return the result."""
+    try:
+        return subprocess.run(
+            cmd,
+            check=check,
+            capture_output=capture,
+            text=True,
+            timeout=timeout
+        )
+    except subprocess.CalledProcessError as e:
+        if check:
+            error(f"Command failed: {' '.join(cmd)}\n{e.stderr}")
+        raise
+    except subprocess.TimeoutExpired:
+        error(f"Command timed out after {timeout}s: {' '.join(cmd)}")
+
+
+def check_git_repo() -> None:
+    """Verify we're inside a git repository."""
+    result = run_cmd(["git", "rev-parse", "--is-inside-work-tree"], check=False)
+    if result.returncode != 0:
+        error("Not inside a git repository.")
+
+
+def check_copilot() -> None:
+    """Verify copilot CLI is available."""
+    result = run_cmd(["which", "copilot"], check=False)
+    if result.returncode != 0:
+        error("'copilot' CLI not found. Install GitHub Copilot CLI and ensure it's on your PATH.")
+
+
+def check_staged_changes(allow_empty: bool = False) -> bool:
+    """Check if there are staged changes."""
+    result = run_cmd(["git", "diff", "--cached", "--quiet"], check=False)
+    has_changes = result.returncode != 0
+    
+    if not has_changes and not allow_empty:
+        error("No staged changes. Stage something first with 'git add'.")
+    
+    return has_changes
+
+
+def get_staged_diff(max_lines: Optional[int] = None) -> str:
+    """Get the staged diff."""
+    result = run_cmd(["git", "diff", "--cached"])
+    diff = result.stdout
+    
+    if max_lines and diff.count('\n') > max_lines:
+        # For large diffs, use --stat and a summary
+        stats = run_cmd(["git", "diff", "--cached", "--stat"]).stdout
+        numstat = run_cmd(["git", "diff", "--cached", "--numstat"]).stdout
+        
+        return f"""Diff is large ({diff.count(chr(10))} lines). Here's a summary:
+
+{stats}
+
+File-level changes:
+{numstat}
+
+Note: This is a summary view. Focus on the overall purpose of these changes.
+"""
+    
+    return diff
+
+
+def get_diff_stats() -> Tuple[int, int, int]:
+    """Get statistics about the staged changes."""
+    result = run_cmd(["git", "diff", "--cached", "--numstat"])
+    
+    files_changed = 0
+    insertions = 0
+    deletions = 0
+    
+    for line in result.stdout.strip().split('\n'):
+        if not line:
+            continue
+        parts = line.split('\t')
+        if len(parts) >= 2:
+            try:
+                insertions += int(parts[0]) if parts[0] != '-' else 0
+                deletions += int(parts[1]) if parts[1] != '-' else 0
+                files_changed += 1
+            except ValueError:
+                continue
+    
+    return files_changed, insertions, deletions
+
+
+def get_recent_commits(count: int = 5) -> List[str]:
+    """Get recent commit messages for style consistency."""
+    result = run_cmd(
+        ["git", "log", f"-{count}", "--pretty=format:%s"],
+        check=False
+    )
+    
+    if result.returncode != 0:
+        return []
+    
+    return [line for line in result.stdout.strip().split('\n') if line]
+
+
+def get_branch_name() -> Optional[str]:
+    """Get the current branch name."""
+    result = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False)
+    if result.returncode == 0:
+        branch = result.stdout.strip()
+        return branch if branch != "HEAD" else None
+    return None
+
+
+def detect_commit_style(recent_commits: List[str]) -> str:
+    """Detect if the repo uses conventional commits."""
+    conventional_pattern = r'^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?:'
+    
+    if not recent_commits:
+        return "conventional"
+    
+    conventional_count = sum(1 for msg in recent_commits if re.match(conventional_pattern, msg))
+    
+    if conventional_count >= len(recent_commits) * 0.6:  # 60% threshold
+        return "conventional"
+    
+    return "standard"
+
+
+def build_prompt(diff: str, config: Config, args, extra_context: Optional[str] = None) -> str:
+    """Build the AI prompt with context."""
+    prompt_parts = ["You are an expert at writing clear, concise git commit messages."]
+    
+    # Add user-provided context/steering if available
+    if extra_context and extra_context.strip():
+        prompt_parts.append("\nADDITIONAL CONTEXT/INSTRUCTIONS FROM USER:")
+        prompt_parts.append(extra_context.strip())
+        prompt_parts.append("")
+    
+    # Get context
+    recent_commits = get_recent_commits(config.max_history) if config.include_history else []
+    commit_style = detect_commit_style(recent_commits)
+    branch_name = get_branch_name()
+    files_changed, insertions, deletions = get_diff_stats() if config.include_stats else (0, 0, 0)
+    
+    # Add context to prompt
+    if config.include_stats and files_changed > 0:
+        prompt_parts.append(f"\nContext: {files_changed} file(s) changed, {insertions} insertion(s), {deletions} deletion(s)")
+    
+    if branch_name and branch_name not in ["main", "master", "develop"]:
+        prompt_parts.append(f"Branch: {branch_name}")
+        # Suggest type from branch name
+        if branch_name.startswith("feat/") or branch_name.startswith("feature/"):
+            prompt_parts.append("(This appears to be a feature branch)")
+        elif branch_name.startswith("fix/") or branch_name.startswith("bugfix/"):
+            prompt_parts.append("(This appears to be a bugfix branch)")
+    
+    if recent_commits and config.include_history:
+        prompt_parts.append(f"\nRecent commit messages for style reference:")
+        for i, msg in enumerate(recent_commits[:3], 1):
+            prompt_parts.append(f"  {i}. {msg}")
+    
+    # Add style guidance
+    if commit_style == "conventional":
+        prompt_parts.append("""
+Style: This repository uses Conventional Commits. Use the format:
+<type>[optional scope]: <description>
+
+[optional body]
+
+Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
+""")
+    else:
+        prompt_parts.append("""
+Style: Use a clear, imperative mood subject line (e.g., "Add feature" not "Added feature").
+""")
+    
+    # Add core rules
+    prompt_parts.append("""
+CRITICAL: You must output ONLY the raw commit message text. Do not include any
+explanations, commentary, analysis, or meta-discussion about the commit message.
+Start your response directly with the commit message subject line.
+
+Format:
+<type>[optional scope]: <description>
+
+- First bullet point explaining why/impact
+- Second bullet point explaining why/impact
+- Additional bullets as needed (typically 2-5 total)
+
+Rules:
+- Subject line: ~50 chars max, imperative mood, no period at end
+- Body: ALWAYS include multiple bullet points (-, *, or •) explaining WHY
+  - Each bullet explains motivation, impact, or reasoning
+  - Focus on user value and technical justification
+  - Typically 2-5 bullets covering different aspects
+- Wrap lines at 72 characters
+- Blank line between subject and body
+- NO explanatory text before or after the commit message
+- NO code fences, backticks, or markdown formatting
+- Start immediately with the subject line
+
+Example (this is what your ENTIRE response should look like):
+feat: add user authentication
+
+- Improve security by requiring login for sensitive operations
+- Enable personalized user experiences and preferences
+- Lay groundwork for role-based access control
+
+Here are the staged changes:
+""")
+    
+    prompt_parts.append(diff)
+    
+    return "\n".join(prompt_parts)
+
+
+def clean_commit_message(raw_output: str) -> str:
+    """Clean up AI output to extract just the commit message."""
+    lines = raw_output.strip().split('\n')
+    
+    # Find where the actual commit message starts
+    # Skip any lines that look like commentary/analysis
+    start_idx = 0
+    for i, line in enumerate(lines):
+        line_lower = line.lower().strip()
+        # Skip common AI commentary patterns
+        if any(phrase in line_lower for phrase in [
+            "i'll analyze", "based on", "here's", "here is",
+            "this is", "the commit message", "analyzing",
+            "looking at", "i see", "appears to be", "seems to"
+        ]):
+            continue
+        # Skip empty lines at the start
+        if not line.strip():
+            continue
+        # Found the start of actual commit message
+        start_idx = i
+        break
+    
+    # Extract from the commit message start
+    cleaned_lines = lines[start_idx:]
+    
+    # Remove any trailing commentary or code fences
+    result_lines = []
+    for line in cleaned_lines:
+        # Stop at code fences or obvious ending commentary
+        if line.strip().startswith('```') or line.strip().startswith('---'):
+            break
+        result_lines.append(line)
+    
+    return '\n'.join(result_lines).strip()
+
+
+def generate_commit_message(prompt: str, config: Config) -> str:
+    """Generate commit message using GitHub Copilot CLI."""
+    try:
+        # Use copilot in prompt mode with --allow-all-tools for non-interactive operation
+        result = subprocess.run(
+            ["copilot", "--model", config.model, "--allow-all-tools", "-p", prompt],
+            capture_output=True,
+            text=True,
+            timeout=config.timeout
+        )
+        
+        if result.returncode != 0:
+            stderr_msg = result.stderr.strip() if result.stderr else "Unknown error"
+            error(f"GitHub Copilot CLI failed: {stderr_msg}")
+        
+        # Clean up the output to remove any AI commentary
+        raw_output = result.stdout.strip()
+        return clean_commit_message(raw_output)
+    except subprocess.TimeoutExpired:
+        error(f"GitHub Copilot CLI timed out after {config.timeout}s. Try increasing timeout or using a faster model.")
+
+
+def validate_commit_message(msg: str, verbose: bool = False) -> Tuple[bool, List[str]]:
+    """Validate the generated commit message."""
+    warnings = []
+    
+    if not msg or not msg.strip():
+        return False, ["Message is empty"]
+    
+    lines = msg.split('\n')
+    subject = lines[0]
+    
+    # Check subject line
+    if len(subject) > 72:
+        warnings.append(f"Subject line is {len(subject)} chars (recommended: ≤50, max: 72)")
+    
+    if subject.endswith('.'):
+        warnings.append("Subject line ends with a period (unconventional)")
+    
+    # Check for blank line between subject and body
+    if len(lines) > 1 and lines[1].strip() != '':
+        warnings.append("Missing blank line between subject and body")
+    
+    # Check body line lengths
+    for i, line in enumerate(lines[2:], start=3):
+        if len(line) > 72 and not line.startswith('http'):
+            warnings.append(f"Line {i} exceeds 72 characters")
+            break  # Only warn once
+    
+    if verbose and warnings:
+        warn("Commit message validation warnings:")
+        for w in warnings:
+            print(f"  {colorize('•', Colors.YELLOW)} {w}")
+    
+    return True, warnings
+
+
+def preview_message(msg: str) -> None:
+    """Show a nice preview of the commit message."""
+    terminal_width = os.get_terminal_size().columns if Colors.is_tty() else 80
+    box_width = min(terminal_width - 4, 76)
+    
+    print()
+    print(colorize("─" * box_width, Colors.CYAN))
+    
+    for line in msg.split('\n'):
+        if len(line) > box_width - 4:
+            # Wrap long lines
+            while line:
+                chunk = line[:box_width - 4]
+                print(f"{colorize('│', Colors.CYAN)} {chunk}")
+                line = line[box_width - 4:]
+        else:
+            print(f"{colorize('│', Colors.CYAN)} {line}")
+    
+    print(colorize("─" * box_width, Colors.CYAN))
+    print()
+
+
+def commit_with_message(msg: str, amend: bool = False, no_edit: bool = False) -> None:
+    """Commit using the generated message."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(msg)
+        msg_file = f.name
+    
+    try:
+        cmd = ["git", "commit", "-F", msg_file]
+        
+        if amend:
+            cmd.append("--amend")
+        
+        if not no_edit:
+            cmd.extend(["-e"])
+            info("Opening git editor with generated message...")
+        
+        # Don't capture output for commit - let user see git's output
+        result = subprocess.run(cmd)
+        
+        if result.returncode != 0:
+            error("Git commit failed", exit_code=result.returncode)
+        
+        success("Commit created successfully!")
+    finally:
+        os.unlink(msg_file)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AI-powered git commit message generator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  aigc                                  Generate and commit with editor
+  aigc --dry-run                        Preview the message without committing
+  aigc --no-edit                        Commit directly without opening editor
+  aigc --amend                          Amend the last commit with new message
+  aigc --all                            Stage all changes and commit
+  aigc --preview                        Show preview before opening editor
+  aigc --context "Refs issue #123"     Add extra context/steering
+  echo "Critical fix" | aigc            Pipe context from stdin
+  cat notes.txt | aigc --context "..."  Combine piped and flag context
+
+Configuration:
+  Create ~/.config/aigc/config.json to customize behavior.
+  See https://github.com/yourusername/aigc for details.
+"""
+    )
+    
+    parser.add_argument("-v", "--version", action="version", version=f"aigc {VERSION}")
+    parser.add_argument("--dry-run", action="store_true", help="Generate message without committing")
+    parser.add_argument("--no-edit", action="store_true", help="Commit without opening editor")
+    parser.add_argument("--amend", action="store_true", help="Amend the last commit")
+    parser.add_argument("--all", "-a", action="store_true", help="Stage all changes before committing")
+    parser.add_argument("--preview", action="store_true", help="Show preview before committing")
+    parser.add_argument("--verbose", action="store_true", help="Show detailed information")
+    parser.add_argument("--model", "-m", help=f"AI model to use (default: {DEFAULT_MODEL}, options: claude-sonnet-4.5, claude-haiku-4.5, gpt-5, etc.)")
+    parser.add_argument("--config", type=Path, help="Path to config file")
+    parser.add_argument("--context", "-c", help="Additional context or steering instructions for the AI")
+    
+    args = parser.parse_args()
+    
+    # Load configuration
+    config = Config.load(args.config)
+    
+    if args.model:
+        config.model = args.model
+    
+    if args.preview:
+        config.show_preview = True
+    
+    # Gather extra context from stdin or --context flag
+    extra_context = None
+    if not sys.stdin.isatty():
+        # Read from stdin (piped input)
+        piped_context = sys.stdin.read().strip()
+        if piped_context:
+            extra_context = piped_context
+            if args.verbose:
+                info(f"Received context from stdin ({len(piped_context)} chars)")
+    
+    # --context flag overrides or adds to piped context
+    if args.context:
+        if extra_context:
+            extra_context = f"{extra_context}\n\n{args.context}"
+        else:
+            extra_context = args.context
+        if args.verbose:
+            info(f"Using additional context from --context flag")
+    
+    # Pre-flight checks
+    check_git_repo()
+    check_copilot()
+    
+    # Stage all changes if requested
+    if args.all:
+        info("Staging all changes...")
+        run_cmd(["git", "add", "-A"])
+    
+    # Check for staged changes
+    check_staged_changes(allow_empty=args.amend)
+    
+    if args.verbose:
+        files, insertions, deletions = get_diff_stats()
+        info(f"Changes: {files} file(s), +{insertions}/-{deletions} lines")
+        info(f"Using model: {config.model}")
+        if extra_context:
+            info(f"Extra context: {len(extra_context)} characters")
+    
+    # Get diff
+    if args.verbose:
+        info("Getting staged changes...")
+    diff = get_staged_diff(config.max_diff_lines)
+    
+    # Build prompt
+    prompt = build_prompt(diff, config, args, extra_context)
+    
+    if args.verbose:
+        info(f"Prompt length: {len(prompt)} characters")
+    
+    # Generate commit message
+    with Spinner("Generating commit message with AI"):
+        commit_msg = generate_commit_message(prompt, config)
+    
+    # Validate
+    if config.auto_validate:
+        is_valid, warnings = validate_commit_message(commit_msg, args.verbose)
+        if not is_valid:
+            error("Generated message failed validation")
+    
+    # Preview or dry-run
+    if args.dry_run or config.show_preview:
+        preview_message(commit_msg)
+    
+    if args.dry_run:
+        return
+    
+    # Commit
+    commit_with_message(commit_msg, amend=args.amend, no_edit=args.no_edit)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n" + colorize("✖ Cancelled by user", Colors.RED), file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        error(f"Unexpected error: {e}")

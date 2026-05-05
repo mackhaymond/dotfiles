@@ -49,6 +49,11 @@ node_modules/**
 .config/raycast/raycast##os.Darwin
 .config/spicetify/**
 
+Desktop/coding/various_scripts/nginx.conf
+Desktop/coding/various_scripts/aigc.bak
+Desktop/coding/various_scripts/mailstuff.py
+Desktop/coding/various_scripts/.DS_Store
+
 .claude.json
 .config/claude/**
 .copilot/**

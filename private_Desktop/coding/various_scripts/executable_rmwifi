@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# Start SSH connection to 'remarkable' in the background
+ssh -fN remarkable
+
+# Run proxychains and automate Lynx using expect
+firefox https://captiveportal-login.westport.k12.ct.us/
+
+# Get the process ID of the SSH connection
+ssh_pid=$(ps aux | grep '[s]sh -fN remarkable' | awk '{print $2}')
+
+# If an SSH process was found, kill it
+if [ -n "$ssh_pid" ]; then
+    kill "$ssh_pid"
+else
+    echo "No SSH connection found."
+fi
+
+clear && printf '\n%.0s' {1..100}

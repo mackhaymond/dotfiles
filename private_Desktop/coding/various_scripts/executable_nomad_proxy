@@ -1,0 +1,137 @@
+#!/bin/bash
+
+# Ensure Doppler CLI is installed
+if ! command -v doppler &>/dev/null; then
+	echo "Error: Doppler CLI is not installed. Install it from https://docs.doppler.com/docs/cli and try again."
+	exit 1
+fi
+
+# Ensure Docker is installed
+if ! command -v docker &>/dev/null; then
+	echo "Error: Docker is not installed. Install it from https://docs.docker.com/get-docker/ and try again."
+	exit 1
+fi
+
+ORBSTACK_STARTED=false
+
+# Ensure Docker is running, otherwise start OrbStack
+if ! docker info &>/dev/null; then
+	echo "Docker is not running. Starting OrbStack..."
+	open -a OrbStack
+	ORBSTACK_STARTED=true
+	osascript -e 'tell application "System Events" to set visible of process "OrbStack" to false' 2>/dev/null
+
+	echo "Waiting for Docker to start..."
+
+	# Wait until Docker is available
+	while ! docker info &>/dev/null; do
+		sleep 1
+	done
+
+	echo "Docker is now running."
+fi
+
+# Set hardcoded proxy pass URL
+NOMAD_PROXY_PASS="https://nomad.mackhaymond.co"
+
+# Load secrets from Doppler project "default-secrets"
+echo "Fetching secrets from Doppler (project: default-secrets)..."
+CLOUDFLARE_AUTH_CLIENT_ID=$(doppler secrets get CLOUDFLARE_AUTH_CLIENT_ID --project default-secrets --plain)
+CLOUDFLARE_AUTH_CLIENT_SECRET=$(doppler secrets get CLOUDFLARE_AUTH_CLIENT_SECRET --project default-secrets --plain)
+
+# Validate that secrets were retrieved
+if [[ -z "$CLOUDFLARE_AUTH_CLIENT_ID" || -z "$CLOUDFLARE_AUTH_CLIENT_SECRET" ]]; then
+	echo "Error: Failed to retrieve secrets from Doppler."
+	exit 1
+fi
+
+# Extract the hostname from NOMAD_PROXY_PASS
+NOMAD_HOST=$(echo "$NOMAD_PROXY_PASS" | sed -E 's,.*://([^/]+).*,\1,')
+
+# Create a temporary directory for nginx.conf
+TEMP_DIR=$(mktemp -d)
+NGINX_CONF="$TEMP_DIR/nginx.conf"
+
+# Create the Nginx configuration file
+cat <<EOF >"$NGINX_CONF"
+events {}
+
+http {
+  server {
+    listen 80;
+    location / {
+      proxy_pass "$NOMAD_PROXY_PASS";
+      proxy_set_header Host "$NOMAD_HOST";
+      proxy_set_header CF-Access-Client-Id "$CLOUDFLARE_AUTH_CLIENT_ID";
+      proxy_set_header CF-Access-Client-Secret "$CLOUDFLARE_AUTH_CLIENT_SECRET";
+      proxy_ssl_server_name on;
+      proxy_ssl_verify off;
+    }
+  }
+}
+EOF
+
+# Function to clean up on exit
+cleanup() {
+	echo "Shutting down Nginx proxy..."
+	docker stop nginx-proxy >/dev/null 2>&1
+	echo "Proxy stopped."
+
+	# Remove temporary directory
+	rm -rf "$TEMP_DIR"
+	echo "Temporary nginx.conf removed."
+
+	# Stop OrbStack if this script started it
+	if [ "$ORBSTACK_STARTED" = true ]; then
+		echo "Stopping OrbStack..."
+		osascript -e 'quit app "OrbStack"' 2>/dev/null
+		echo "OrbStack stopped."
+	fi
+
+	exit 0
+}
+
+# Trap signals for cleanup
+trap cleanup SIGINT SIGTERM SIGHUP EXIT
+
+# If running in tmux, ensure cleanup when the window is closed
+if [ -n "$TMUX" ]; then
+	tmux wait-for cleanup &
+fi
+
+# Start the proxy silently in the background
+echo "Starting Nginx proxy..."
+docker run --rm --name nginx-proxy -p 4646:80 -v "$NGINX_CONF:/etc/nginx/nginx.conf:ro" nginx:stable >/dev/null 2>&1 &
+
+# Get the process ID of the last background command
+PROXY_PID=$!
+
+# Verify that the container started correctly
+sleep 3
+if ! docker ps | grep -q nginx-proxy; then
+	echo "Error: Failed to start the Nginx proxy container."
+	exit 1
+fi
+
+NOMAD_EXPORT_CMD="export NOMAD_ADDR='http://127.0.0.1:4646'"
+
+# Copy command to clipboard (MacOS)
+echo "$NOMAD_EXPORT_CMD" | pbcopy
+
+echo "Nginx proxy started silently on port 4646."
+echo "To use Nomad, run:"
+echo ""
+echo "  $NOMAD_EXPORT_CMD"
+echo "  nomad <command>"
+echo ""
+echo "(NOMAD_ADDR export command copied to clipboard!)"
+echo ""
+echo "Press Ctrl+C or close the tmux window to stop the proxy."
+
+# Wait for the background proxy process
+wait $PROXY_PID
+
+# If running in tmux, notify that cleanup is done
+if [ -n "$TMUX" ]; then
+	tmux wait-for -S cleanup
+fi

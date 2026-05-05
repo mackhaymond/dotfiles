@@ -1,0 +1,26 @@
+#!/bin/bash
+
+local tmp="$(mktemp -t "yazi-cwd.XXXXXX")"
+
+# Check if the current session/window is already a popup
+if [ "$(tmux display-message -p -F "#{session_name}")" = "popup" ]; then
+	tmux detach-client
+else
+	# Capture the original tmux session and window
+	local original_session=$(tmux display-message -p -t $pane_id "#{session_name}")
+	local original_window=$(tmux display-message -p -t $pane_id "#{window_name}")
+	local original_cwd=$(tmux display-message -p -t $pane_id "#{pane_current_path}")
+    echo "original_cwd: $original_cwd"
+
+	# Open yazi in a popup with the captured cwd and use the temporary file to store the new cwd
+	tmux popup -E -w 80% -h 80% "yazi \"$original_cwd\" --cwd-file=\"$tmp\"; read"
+
+	# Read the new working directory from the temporary file
+	if cwd="$(cat -- "$tmp")" && [ -n "$cwd" ] && [ "$cwd" != "$PWD" ]; then
+		# Change the directory of the original tmux session/window
+		tmux send-keys -t "${original_session}:${original_window}" "cd \"$cwd\"" Enter
+	fi
+
+	# Cleanup temporary file
+	rm -f -- "$tmp"
+fi

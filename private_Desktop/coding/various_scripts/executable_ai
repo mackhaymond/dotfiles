@@ -1,0 +1,274 @@
+#!/bin/bash
+
+# AI Shell Command Generator
+# A wrapper around Claude Code for generating shell commands
+
+set -euo pipefail
+
+# Configuration
+SCRIPT_NAME="ai"
+TEMP_DIR="${TMPDIR:-/tmp}"
+CONTEXT_FILE="$TEMP_DIR/ai_shell_context.txt"
+HISTORY_FILE="$TEMP_DIR/ai_shell_history.txt"
+
+# Auto-detect clipboard tool and set up pbcopy alias
+if [[ -f /proc/version ]] && grep -qi microsoft /proc/version; then
+    # We're on WSL
+    if command -v win32yank.exe &> /dev/null; then
+        pbcopy() { win32yank.exe -i; }
+    elif command -v clip.exe &> /dev/null; then
+        pbcopy() { clip.exe; }
+    fi
+elif [[ "$OSTYPE" == "linux-gnu"* ]] && command -v xclip &> /dev/null; then
+    # We're on Linux with xclip
+    pbcopy() { xclip -selection clipboard; }
+fi
+
+# Flags
+EXECUTE_MODE=true
+NO_INTERACTION=false
+HELP_MODE=false
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+usage() {
+    echo "Usage: $SCRIPT_NAME [OPTIONS] <command description>"
+    echo ""
+    echo "Generate shell commands using Claude Code"
+    echo ""
+    echo "Options:"
+    echo "  -n, --no-interaction  Don't execute, just print and copy to clipboard"
+    echo "  -h, --help           Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $SCRIPT_NAME find all md files recursively"
+    echo "  $SCRIPT_NAME -n compress all jpg files in current directory"
+    echo ""
+    echo "Default behavior:"
+    echo "  • Prints the generated command"
+    echo "  • Copies to clipboard"
+    echo "  • Asks for confirmation before executing"
+    echo ""
+    echo "With -n flag:"
+    echo "  • Prints the generated command"
+    echo "  • Copies to clipboard"
+    echo "  • Returns without executing"
+    echo ""
+    echo "Context from previous commands and current directory is included by default."
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -n|--no-interaction)
+            NO_INTERACTION=true
+            EXECUTE_MODE=false
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Check if description provided
+if [[ $# -eq 0 ]]; then
+    echo "Error: Please provide a command description" >&2
+    usage >&2
+    exit 1
+fi
+
+# Join all remaining arguments as the command description
+COMMAND_DESCRIPTION="$*"
+
+# Claude path - update this to match your setup
+CLAUDE_PATH="/Users/mackhaymond/.config/claude/local/claude"
+
+# Check if claude is available
+if [[ ! -f "$CLAUDE_PATH" ]]; then
+    echo -e "${RED}Error: Claude Code not found at $CLAUDE_PATH${NC}" >&2
+    echo "Please update CLAUDE_PATH in this script to match your Claude installation" >&2
+    exit 1
+fi
+
+# Function to check if command is potentially dangerous
+is_dangerous_command() {
+    local cmd="$1"
+    local dangerous_patterns=(
+        "rm -rf /"
+        "rm -rf \*"
+        "rm -rf ~"
+        "rm -rf \$HOME"
+        "chmod -R 777 /"
+        "chown -R.*/"
+        "dd if="
+        "mkfs"
+        "fdisk"
+        "format"
+        "> /dev/sd"
+        "curl.*|.*sh"
+        "wget.*|.*sh"
+        "kill -9 -1"
+        "killall -9"
+        "shutdown"
+        "reboot"
+        "halt"
+    )
+    
+    for pattern in "${dangerous_patterns[@]}"; do
+        if [[ $cmd =~ $pattern ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Function to save context
+save_context() {
+    local cmd="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    # Save to history
+    echo "[$timestamp] Query: $COMMAND_DESCRIPTION" >> "$HISTORY_FILE"
+    echo "[$timestamp] Generated: $cmd" >> "$HISTORY_FILE"
+    echo "[$timestamp] PWD: $(pwd)" >> "$HISTORY_FILE"
+    echo "---" >> "$HISTORY_FILE"
+    
+    # Save current context
+    {
+        echo "Current directory: $(pwd)"
+        echo "Last command: $cmd"
+        echo "Timestamp: $timestamp"
+        echo "Files in current directory:"
+        ls -la 2>/dev/null || echo "Cannot list directory"
+    } > "$CONTEXT_FILE"
+}
+
+# Build the prompt for Claude
+build_prompt() {
+    local prompt="Generate a shell command for: $COMMAND_DESCRIPTION
+
+Requirements:
+- Only provide the command text, do not execute it
+- Return as raw text, no markdown formatting
+- Make it work on macOS/Unix systems
+- Current directory: $(pwd)"
+
+    # Always include context
+    if [[ -f "$CONTEXT_FILE" ]]; then
+        prompt="$prompt
+
+Previous context:
+$(cat "$CONTEXT_FILE")
+
+Recent history:
+$(tail -20 "$HISTORY_FILE" 2>/dev/null || echo "No previous history")"
+    fi
+
+    echo "$prompt"
+}
+
+# Main execution
+main() {
+    echo -e "${BLUE}🤖 Generating command for: ${NC}$COMMAND_DESCRIPTION"
+    
+    # Create prompt
+    PROMPT=$(build_prompt)
+    
+    # Call Claude Code
+    echo -e "${BLUE}🔍 Calling Claude Code...${NC}"
+    
+    # Debug: show the prompt content
+    if [[ "${DEBUG:-}" == "1" ]]; then
+        echo "DEBUG: Prompt content:"
+        echo "$PROMPT"
+        echo "DEBUG: Calling: $CLAUDE_PATH -p with prompt"
+    fi
+    
+    # Call Claude with text format for reliability
+    if ! CLAUDE_OUTPUT=$(timeout 30 "$CLAUDE_PATH" -p "$PROMPT" --output-format text --model claude-sonnet-4-20250514 2>&1); then
+        echo -e "${RED}Error: Claude Code call failed or timed out${NC}" >&2
+        echo "Claude output: $CLAUDE_OUTPUT" >&2
+        exit 1
+    fi
+    
+    # Debug: show raw output
+    if [[ "${DEBUG:-}" == "1" ]]; then
+        echo "DEBUG: Raw Claude output:"
+        echo "$CLAUDE_OUTPUT"
+        echo "DEBUG: End of raw output"
+    fi
+    
+    # Extract command from output - expects raw text
+    GENERATED_COMMAND=$(echo "$CLAUDE_OUTPUT" | grep -v "^$" | head -1)
+    
+    # Clean up any remaining markdown formatting
+    GENERATED_COMMAND=$(echo "$GENERATED_COMMAND" | sed 's/^`*//g' | sed 's/`*$//g' | sed 's/^bash //g' | sed 's/^sh //g')
+    
+    # Clean up temp file
+    # No longer needed since we're using -p flag instead of -f
+    
+    # Check if we got a command
+    if [[ -z "$GENERATED_COMMAND" ]]; then
+        echo -e "${RED}Error: No command generated${NC}" >&2
+        exit 1
+    fi
+    
+    # Clean up the command (remove any remaining markdown formatting)
+    # This cleanup is now redundant since we expect raw text, but kept as failsafe
+    # GENERATED_COMMAND=$(echo "$GENERATED_COMMAND" | sed 's/^`*//g' | sed 's/`*$//g' | sed 's/^bash //g' | sed 's/^sh //g')
+    
+    # Display the command
+    echo -e "\n${GREEN}📋 Generated command:${NC}"
+    echo -e "${YELLOW}$GENERATED_COMMAND${NC}"
+    
+    # Check if dangerous (only if executing)
+    if [[ $EXECUTE_MODE == true ]] && is_dangerous_command "$GENERATED_COMMAND"; then
+        echo -e "\n${RED}⚠️  WARNING: This command may be dangerous!${NC}"
+        echo -e "${RED}Please review carefully before executing.${NC}"
+    fi
+    
+    # Copy to clipboard
+    if command -v pbcopy &> /dev/null; then
+        echo "$GENERATED_COMMAND" | pbcopy
+        echo -e "\n${GREEN}✅ Command copied to clipboard${NC}"
+    else
+        echo -e "\n${YELLOW}Note: Could not copy to clipboard (no clipboard tool found)${NC}"
+    fi
+    
+    # Save context
+    save_context "$GENERATED_COMMAND"
+    
+    # Execute if not in no-interaction mode
+    if [[ $EXECUTE_MODE == true && $NO_INTERACTION == false ]]; then
+        echo -e "\n${BLUE}Execute this command? (y/N):${NC}"
+        read -r response
+        
+        if [[ $response =~ ^[Yy]$ ]]; then
+            echo -e "\n${BLUE}🚀 Executing command...${NC}"
+            echo "----------------------------------------"
+            eval "$GENERATED_COMMAND"
+            echo "----------------------------------------"
+            echo -e "${GREEN}✅ Command executed${NC}"
+        else
+            echo -e "${YELLOW}Command not executed${NC}"
+        fi
+    fi
+}
+
+# Run main function
+main "$@"

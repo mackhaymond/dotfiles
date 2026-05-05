@@ -1,0 +1,30 @@
+#!/bin/bash
+
+template_type=$1
+project_name=$2
+
+template_dir="/Users/mackhaymond/tex/templates/$template_type"
+project_dir="/Users/mackhaymond/tex/$project_name"
+
+# Check if the template directory or project name is not provided
+if [ -z "$template_type" ] || [ -z "$project_name" ]; then
+    echo "Please provide both template type and project name."
+    echo "Usage: texc <template_type> <project_name>"
+    exit 1
+fi
+
+# Check if the template directory exists
+if [ ! -d "$template_dir" ]; then
+    echo "Template '$template_type' does not exist!"
+    exit 1
+fi
+
+# Check if the project directory already exists
+if [ -d "$project_dir" ]; then
+    echo "Project '$project_name' already exists!"
+    exit 1
+fi
+
+# Copy the template directory to the new project directory
+cp -R "$template_dir" "$project_dir"
+echo "Project '$project_name' created from template '$template_type'."

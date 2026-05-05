@@ -1,0 +1,44 @@
+#!/bin/bash
+
+# Check if a directory is provided as an argument
+if [ $# -eq 0 ]; then
+    echo "Error: No directory specified."
+    echo "Usage: zz <directory>"
+    exit 1
+fi
+
+# Get the absolute path of the specified directory
+directory_path=$(realpath "$1")
+
+# Check if the specified directory exists
+if [ ! -d "$directory_path" ]; then
+    echo "Error: Directory '$directory_path' does not exist."
+    exit 1
+fi
+
+# Get the name of the directory (handle "." case)
+directory_name=$(basename "$directory_path")
+
+# Define the zip file path
+zip_file="$directory_name.zip"
+downloads_path=~/Downloads/"$zip_file"
+
+# Remove existing zip file in Downloads if it exists
+if [ -f "$downloads_path" ]; then
+    echo "Removing existing zip file in Downloads: $downloads_path"
+    rm "$downloads_path"
+fi
+
+# Change the current directory to the specified directory
+cd "$directory_path"
+
+# Run zip on the directory, creating a zip file with the directory name
+zip -r "$zip_file" .
+
+# Move the zip file to the Mac OS downloads folder
+mv "$zip_file" "$downloads_path"
+
+# Return to the original directory
+cd -
+
+echo "Zip file created and moved to Downloads: $downloads_path"
