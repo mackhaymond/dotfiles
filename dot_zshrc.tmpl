@@ -180,27 +180,81 @@ yytmux() {
   fi
 }
 
-# Background drift checker for the starship custom.chezmoi segment.
-# precmd runs at most once per 60s; spawns `chezmoi status` async (full
-# status takes ~3s warm because op:// reads), writes "drift" or "" to a
-# cache file. Starship reads the cache file synchronously — no prompt
-# latency. First prompt of a session shows nothing until the first
-# background run completes (~3s later).
+# Tier C — chezmoi drift indicator (background, op://-free).
+#
+# `_chezmoi_record_mtimes` writes a snapshot of every managed live file's
+# mtime to ~/.cache/chezmoi/applied-mtimes. Called by the chezmoi()
+# wrapper below after any write-class subcommand (apply/update/edit/
+# merge/init/import).
+#
+# `_chezmoi_drift_check` runs from precmd at most once per 60s, compares
+# current mtimes against the snapshot using the zstat builtin (no fork,
+# no PATH lookup, no op:// reads → no 1Password prompts). Result lives
+# in ~/.cache/chezmoi-drift/state and is read by the starship segment.
+#
+# Edge cases:
+#   - False positive: user/app `touch`es a file; `chezmoi diff` confirms.
+#   - False negative: tool overwrites content while preserving mtime
+#     (rare; mainly `cp -p` from old backups).
+#   - Targeted `chezmoi apply ~/.foo` from outside a shell wrapping
+#     chezmoi (e.g. cron) won't refresh the cache — but the user runs
+#     chezmoi from this shell exclusively.
+zmodload -F zsh/stat b:zstat 2>/dev/null
+zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
+
+_chezmoi_record_mtimes() {
+  (( ${+commands[chezmoi]} )) || return 0
+  local cache="$HOME/.cache/chezmoi"
+  local applied="$cache/applied-mtimes"
+  mkdir -p "$cache"
+  local -A s
+  local f lines=()
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    zstat -L -H s +mtime "$f" 2>/dev/null || continue
+    lines+=("${s[mtime]} $f")
+  done < <(command chezmoi managed --include=files --path-style absolute 2>/dev/null)
+  print -l -- "${lines[@]}" >| "$applied"
+  rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
+}
+
 _chezmoi_drift_check() {
   local cache="$HOME/.cache/chezmoi-drift"
-  local stamp="$cache/last-check" result="$cache/state"
+  local result="$cache/state"
+  local applied="$HOME/.cache/chezmoi/applied-mtimes"
   local max_age=60
-  command -v chezmoi >/dev/null 2>&1 || return 0
+  (( ${+commands[chezmoi]} )) || return 0
+  [[ -r "$applied" ]] || { _chezmoi_record_mtimes; return 0 }
   mkdir -p "$cache"
-  if [[ -f "$stamp" ]]; then
-    local age=$(( $(date +%s) - $(stat -f %m "$stamp" 2>/dev/null || stat -c %Y "$stamp" 2>/dev/null || echo 0) ))
+  if [[ -f "$result" ]]; then
+    local -A s; zstat -L -H s +mtime "$result" 2>/dev/null
+    local age=$(( EPOCHSECONDS - ${s[mtime]:-0} ))
     (( age < max_age )) && return 0
   fi
-  ( chezmoi status --exclude scripts 2>/dev/null | head -c1 > "${result}.tmp" \
-      && mv "${result}.tmp" "$result" && touch "$stamp" ) &!
+  ( local drifted="" applied_mt path
+    local -A s
+    while IFS=' ' read -r applied_mt path; do
+      [[ -f "$path" ]] || continue
+      zstat -L -H s +mtime "$path" 2>/dev/null || continue
+      if (( ${s[mtime]:-0} > applied_mt )); then drifted="M"; break; fi
+    done < "$applied"
+    print -n "$drifted" >| "$result"
+  ) &!
 }
 typeset -ga precmd_functions
 precmd_functions+=(_chezmoi_drift_check)
+
+# Wrap chezmoi to refresh the drift snapshot after write-class commands.
+# Read-only commands (diff/status/cat/managed/etc.) pass through unchanged.
+chezmoi() {
+  local cmd="$1"
+  command chezmoi "$@"
+  local rc=$?
+  case "$cmd" in
+    apply|update|init|merge|edit|import|destroy|re-add) _chezmoi_record_mtimes ;;
+  esac
+  return $rc
+}
 
 # `nvim ~/.zshrc` → opens the chezmoi source via `chezmoi edit --apply`,
 # auto-applies on save. Same keystrokes; opens the template (more useful
