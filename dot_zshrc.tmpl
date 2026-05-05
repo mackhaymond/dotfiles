@@ -180,6 +180,30 @@ yytmux() {
   fi
 }
 
+# `nvim ~/.zshrc` → opens the chezmoi source via `chezmoi edit --apply`,
+# auto-applies on save. Same keystrokes; opens the template (more useful
+# for editing) instead of the rendered file. Bypassed by:
+#   -R/-r flag, CHEZMOI_EDIT=1 env, `\nvim`/`command nvim`, source-dir paths.
+# Recovery if this function breaks:  \nvim $(chezmoi source-path ~/.zshrc)
+nvim() {
+  [[ -n "$CHEZMOI_EDIT" ]] && { command nvim "$@"; return }
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == "-R" || "$arg" == "-r" ]] && { command nvim "$@"; return }
+  done
+  for arg in "$@"; do
+    [[ "$arg" == -* || ! -e "$arg" ]] && continue
+    local abs; abs="${arg:A}"
+    [[ "$abs" == "$HOME/.local/share/chezmoi/"* ]] && continue
+    if chezmoi source-path "$abs" >/dev/null 2>&1; then
+      print -u2 "[chezmoi] managed file — opening source via 'chezmoi edit --apply'"
+      CHEZMOI_EDIT=1 command chezmoi edit --apply "$abs"
+      return $?
+    fi
+  done
+  command nvim "$@"
+}
+
 # ─── Visual: scroll prompt to bottom on shell open ────────────────────────
 # Print exactly $LINES newlines (terminal height) so prompt lands at bottom
 # regardless of window size. Skip in nested shells (SHLVL > 1) so subshells
