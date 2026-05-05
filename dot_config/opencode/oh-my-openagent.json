@@ -3,14 +3,14 @@
   "agents": {
     "sisyphus": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "max",
+      "variant": "xhigh",
       "skills": [
         "caveman"
       ]
     },
     "hephaestus": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "max",
+      "variant": "xhigh",
       "skills": [
         "caveman"
       ]
@@ -36,18 +36,18 @@
     },
     "prometheus": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "max"
+      "variant": "xhigh"
     },
     "metis": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "max",
+      "variant": "xhigh",
       "skills": [
         "caveman"
       ]
     },
     "momus": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "max"
+      "variant": "xhigh"
     },
     "atlas": {
       "model": "anthropic/claude-sonnet-4-6",
@@ -69,7 +69,7 @@
     },
     "plan": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "max"
+      "variant": "xhigh"
     },
     "OpenCode-Builder": {
       "model": "anthropic/claude-sonnet-4-6",
@@ -89,7 +89,7 @@
     },
     "deep": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "max"
+      "variant": "xhigh"
     },
     "artistry": {
       "model": "google/gemini-3.1-pro-preview",
@@ -103,7 +103,7 @@
     },
     "unspecified-high": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "max"
+      "variant": "xhigh"
     },
     "writing": {
       "model": "google/gemini-3-flash-preview"
