@@ -5,6 +5,7 @@ $directory\
 $git_branch\
 $git_state\
 $git_status\
+${custom.chezmoi}\
 $cmd_duration\
 $line_break\
 $python\
@@ -46,3 +47,11 @@ style = "yellow"
 [python]
 format = "[$virtualenv]($style) "
 style = "bright-black"
+
+[custom.chezmoi]
+description = "chezmoi drift indicator (background cache, refreshed by zsh precmd)"
+command = "cat $HOME/.cache/chezmoi-drift/state 2>/dev/null"
+when = "test -s $HOME/.cache/chezmoi-drift/state"
+format = "[ ⚠ chezmoi drift]($style) "
+style = "bold red"
+shell = ["sh", "--norc", "--noprofile"]
