@@ -4,11 +4,26 @@
     "oh-my-openagent",
     "@ex-machina/opencode-anthropic-auth@1.7.5",
     "opencode-gemini-auth@latest",
-    "opencode-dir"
+    "opencode-dir",
+    "./plugins/chezmoi-guard.ts"
   ],
   "permission": {
     "bash": {
       "*": "allow"
+    },
+    "edit": {
+      "*": "allow",
+      "{{ .chezmoi.homeDir }}/.zshrc": "deny",
+      "{{ .chezmoi.homeDir }}/.zprofile": "deny",
+      "{{ .chezmoi.homeDir }}/.zshenv": "deny",
+      "{{ .chezmoi.homeDir }}/.zshenv.private": "deny",
+      "{{ .chezmoi.homeDir }}/.gitconfig": "deny",
+      "{{ .chezmoi.homeDir }}/.tmate.conf": "deny",
+      "{{ .chezmoi.homeDir }}/.vimrc": "deny",
+      "{{ .chezmoi.homeDir }}/.ideavimrc": "deny",
+      "{{ .chezmoi.homeDir }}/.bashrc": "deny",
+      "{{ .chezmoi.homeDir }}/.bash_profile": "deny",
+      "{{ .chezmoi.homeDir }}/.profile": "deny"
     }
   },
   "skills": {
