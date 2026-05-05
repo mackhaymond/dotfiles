@@ -65,8 +65,10 @@ chmod 600 ~/.config/chezmoi/key.txt
 chezmoi init --apply https://github.com/SpyicyDev/dotfiles.git
 ```
 
-`chezmoi init` will prompt for: name, email, GitHub username, SSH signing
-key. Answers are saved to `~/.config/chezmoi/chezmoi.toml` and reused.
+`chezmoi init` will prompt for: name, email, GitHub username. Answers are
+saved to `~/.config/chezmoi/chezmoi.toml` and reused. The git commit
+signing key is pulled from 1Password automatically (no prompt) — see the
+[Secrets](#secrets) section.
 
 `--apply` will:
 - Render all templates and copy files into `~`
@@ -117,7 +119,7 @@ Templates reference data variables computed at init time:
 | Variable | Source |
 |---|---|
 | `.homebrew_prefix` | computed from os+arch (`darwin/arm64` → `/opt/homebrew`, `darwin/amd64` → `/usr/local`, `linux` → `/home/linuxbrew/.linuxbrew`) |
-| `.email`, `.name`, `.signing_key`, `.github_username` | prompted on first init via `promptStringOnce` |
+| `.email`, `.name`, `.github_username` | prompted on first init via `promptStringOnce` |
 | `.chezmoi.os`, `.chezmoi.arch`, `.chezmoi.homeDir`, `.chezmoi.hostname` | auto-populated by chezmoi |
 
 `.chezmoiignore` uses Go-template conditionals so macOS-only configs
@@ -150,6 +152,7 @@ Hybrid approach with two patterns:
 | `~/.tmate.conf` | `op://Developer/tmate-api-key/credential` |
 | `~/.config/raycast/config.json` | `op://Developer/raycast-access-token/credential` |
 | `~/.config/sketchybar/plugins/todos.sh` | `op://Developer/todoist-api-token/credential` |
+| `~/.gitconfig` (just the `signingkey` field) | `op://Personal/Github SSH Key/public_key` |
 
 Templates contain only `{{ onepasswordRead "..." }}` placeholders — never
 the literal token. Rotation is "edit in 1Password → `chezmoi apply`."

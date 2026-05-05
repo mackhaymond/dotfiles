@@ -1,8 +1,9 @@
 {{- /* User identity. promptStringOnce preserves values across re-init. */ -}}
+{{- /* signing_key is NOT prompted - it's pulled from 1Password at apply time
+       in private_dot_gitconfig.tmpl. See OPERATIONS.md for the rationale. */ -}}
 {{- $name := promptStringOnce . "name" "Your full name" -}}
 {{- $email := promptStringOnce . "email" "you@example.com" -}}
 {{- $github := promptStringOnce . "github_username" "your-github-handle" -}}
-{{- $signingKey := promptStringOnce . "signing_key" "ssh-ed25519 AAAA... your public signing key" -}}
 
 {{- /* Homebrew prefix derived from os + arch. */ -}}
 {{- $brewPrefix := "" -}}
@@ -25,7 +26,6 @@ encryption = "age"
     name = {{ $name | quote }}
     email = {{ $email | quote }}
     github_username = {{ $github | quote }}
-    signing_key = {{ $signingKey | quote }}
     homebrew_prefix = {{ $brewPrefix | quote }}
 
 [age]

@@ -105,8 +105,11 @@ chezmoi diff   # verify it still renders to the same content
 ```
 
 Inside the `.tmpl`, reference `{{ .chezmoi.homeDir }}`, `{{ .homebrew_prefix }}`,
-`{{ .email }}`, `{{ .name }}`, `{{ .signing_key }}`, `{{ .github_username }}`,
-or any conditional like `{{ if eq .chezmoi.os "darwin" }}...{{ end }}`.
+`{{ .email }}`, `{{ .name }}`, `{{ .github_username }}`, or any conditional like
+`{{ if eq .chezmoi.os "darwin" }}...{{ end }}`. For the SSH commit-signing
+public key, use `{{ onepasswordRead "op://Personal/Github SSH Key/public_key" }}`
+directly in the template (don't store it as a `data` variable — it would
+need re-init on rotation).
 
 **Age-encrypted:**
 ```sh
