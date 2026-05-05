@@ -97,6 +97,86 @@ chezmoi apply
 
 ---
 
+## Selective install
+
+This repo is intentionally **monolithic** — no init-time prompts asking "do
+you want X?" The cost of maintaining feature flags isn't justified for a
+single-author repo, and chezmoi already gives you three good ways to install
+only what you want:
+
+### Path-based — install specific files or trees
+
+```sh
+chezmoi init https://github.com/SpyicyDev/dotfiles.git    # init WITHOUT --apply
+chezmoi diff                                               # browse what's available
+
+# Pick specific things:
+chezmoi apply ~/.zshrc ~/.zprofile ~/.gitconfig            # just shell + git
+chezmoi apply ~/.config/tmux                               # the whole tmux tree
+chezmoi apply ~/.config/nvim ~/.config/wezterm             # editor + terminal
+```
+
+### Type-based — install only certain entry types
+
+Chezmoi categorizes everything into types: `files`, `dirs`, `scripts`,
+`externals`, `encrypted`, `templates`. Filter with `--include` / `--exclude`:
+
+```sh
+# All dotfiles, but skip the bootstrap automation (no Brewfile install,
+# no macOS defaults script, no broot/tpm/opam setup)
+chezmoi apply --exclude=scripts
+
+# Files only - no scripts, no external repos cloned
+chezmoi apply --exclude=scripts,externals
+
+# Just decrypt and write the age-encrypted files
+chezmoi apply --include=encrypted
+
+# Useful for a server install: skip GUI tools, big package install,
+# external repo clones
+chezmoi apply --exclude=scripts,externals
+```
+
+### Fork-and-delete — permanent exclusion
+
+For a fork that doesn't want certain tools, the lowest-friction approach is
+to delete what you don't want **before** the first apply:
+
+```sh
+git clone https://github.com/SpyicyDev/dotfiles.git ~/Code/dotfiles
+cd ~/Code/dotfiles
+
+# Drop macOS-only window-management bundle:
+rm -rf dot_config/yabai dot_config/skhd dot_config/sketchybar dot_config/karabiner
+
+# Drop the AI tooling configs:
+rm -rf dot_config/opencode dot_agents
+
+# Drop the Brewfile install entirely:
+rm Brewfile.tmpl .chezmoiscripts/run_onchange_after_install-brew-packages.sh.tmpl
+
+# Then init from your local source:
+chezmoi init --source=~/Code/dotfiles --apply
+```
+
+This is the [`mathiasbynens/dotfiles`](https://github.com/mathiasbynens/dotfiles)
+philosophy — fork it, review it, customize it. No prompts to memorize, no
+flags to keep in sync with reality.
+
+### What you might want to skip in practice
+
+The components most likely to be unwanted on a non-primary machine:
+
+| Component | How to skip |
+|---|---|
+| Brewfile install (250 packages) | `--exclude=scripts` OR delete `Brewfile.tmpl` + the brew-bundle script |
+| macOS window management (yabai/skhd/sketchybar/karabiner) | Auto-skipped on non-darwin; on darwin delete the `dot_config/{yabai,skhd,sketchybar,karabiner}/` trees |
+| macOS defaults script (modifies system settings) | `--exclude=scripts` OR delete `.chezmoiscripts/run_once_after_set-macos-defaults.sh.tmpl` |
+| External repo clones (nvim, tpm) | `--exclude=externals` OR remove entries from `.chezmoiexternal.toml` |
+| AI tooling configs | Delete `dot_config/opencode/`, `dot_agents/`, `dot_config/cursor/` |
+
+---
+
 ## Architecture
 
 The repo is organized around chezmoi's source-state conventions:

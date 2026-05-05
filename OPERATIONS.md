@@ -25,7 +25,8 @@ For the public-facing intro and architecture, see [README.md](./README.md).
 14. [Updating the Brewfile](#updating-the-brewfile)
 15. [Updating macOS defaults](#updating-macos-defaults)
 16. [Onboarding a new machine](#onboarding-a-new-machine)
-17. [Pulling changes from another machine](#pulling-changes-from-another-machine)
+17. [Selective install (for forks or partial deployments)](#selective-install-for-forks-or-partial-deployments)
+18. [Pulling changes from another machine](#pulling-changes-from-another-machine)
 18. [Resolving merge conflicts](#resolving-merge-conflicts)
 19. [Debugging](#debugging)
 20. [Disaster recovery](#disaster-recovery)
@@ -594,6 +595,45 @@ chezmoi init --apply https://github.com/SpyicyDev/dotfiles.git
 ```
 
 After init prompts run, the apply step does everything else automatically.
+
+---
+
+## Selective install (for forks or partial deployments)
+
+The repo is intentionally monolithic — no init-time module flags. When you
+or someone else wants to install only parts, three mechanisms cover the
+ground without adding complexity to the source:
+
+```sh
+# Init without applying - clones source, runs prompts, skips file copy
+chezmoi init https://github.com/SpyicyDev/dotfiles.git
+chezmoi diff       # browse what's available
+
+# Path-based selective apply
+chezmoi apply ~/.zshrc ~/.gitconfig          # specific files
+chezmoi apply ~/.config/tmux                  # whole tree
+
+# Type-based filtering
+chezmoi apply --exclude=scripts               # skip Brewfile install + macOS defaults + tpm/broot/opam
+chezmoi apply --exclude=scripts,externals     # also skip cloning nvim + tpm
+chezmoi apply --include=files                 # only file deployment, nothing else
+chezmoi apply --include=encrypted             # only age-decrypt the secret files
+
+# Fork-and-delete (for permanent exclusion)
+git clone https://github.com/SpyicyDev/dotfiles.git ~/Code/dotfiles
+cd ~/Code/dotfiles
+rm -rf dot_config/yabai dot_config/skhd dot_config/sketchybar    # drop window mgmt
+rm Brewfile.tmpl                                                  # skip the brew install
+chezmoi init --source=~/Code/dotfiles --apply
+```
+
+**Why no module flags?** The cost of maintaining `promptBoolOnce` flags
+plus conditional `.chezmoiignore` blocks plus README drift exceeds the
+~5-minute savings vs. fork-and-delete. See README.md "Selective install"
+section for the public-facing version. If a real need ever emerges (e.g.,
+you start deploying to servers regularly), the cleanest minimal addition
+is a single `promptChoiceOnce` profile selector with three options:
+`full` / `cli-only` / `minimal`.
 
 ---
 
