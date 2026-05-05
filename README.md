@@ -24,7 +24,7 @@ fork, adapt, and steal patterns. Don't blindly apply this to your machine.
 - **Secrets**: [age](https://age-encryption.org/) for whole-file encryption, [1Password](https://1password.com/) `op://` templates for rotatable tokens
 - **Git**: [delta](https://github.com/dandavison/delta) pager, SSH commit signing via 1Password agent
 - **Bootstrap**: `chezmoi init --apply` plus a handful of `run_once_after_*` scripts
-- **Brewfile**: 41 taps, 214 brews, 50 casks, 92 vscode extensions, 8 cargo, 6 uv (~250 packages)
+- **Brewfile**: ~400 entries spanning taps, brews, casks, vscode extensions, cargo, and uv. For the live breakdown: `awk '/^(tap|brew|cask|vscode|cargo|uv) /{print $1}' Brewfile.tmpl | sort | uniq -c`
 
 ---
 

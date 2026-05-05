@@ -484,7 +484,7 @@ chmod 600 ~/.config/chezmoi/key.txt
 
 # 6. Verify everything still decrypts
 chezmoi diff   # should be empty
-for f in /Users/mackhaymond/.zshenv.private /Users/mackhaymond/.ssh/config; do
+for f in "$HOME/.zshenv.private" "$HOME/.ssh/config"; do
     LIVE=$(shasum -a 256 "$f" | awk '{print $1}')
     RENDERED=$(chezmoi cat "$f" | shasum -a 256 | awk '{print $1}')
     [[ "$LIVE" == "$RENDERED" ]] && echo "OK: $f" || echo "MISMATCH: $f"
@@ -780,7 +780,7 @@ git stash pop          # if a stash needs reapplying
 
 ```sh
 chezmoi execute-template '{{ .homebrew_prefix }}'
-chezmoi execute-template < /Users/mackhaymond/.local/share/chezmoi/dot_zshrc.tmpl
+chezmoi execute-template < "$(chezmoi source-path)/dot_zshrc.tmpl"
 chezmoi cat ~/.zshrc   # shows what would be applied
 ```
 
