@@ -75,6 +75,8 @@ Desktop/coding/various_scripts/.DS_Store
 .config/opencode/agents/**
 .config/opencode/command/**
 .config/opencode/plugins/**
+!.config/opencode/plugins
+!.config/opencode/plugins/chezmoi-guard.ts
 .config/opencode/providers/**
 .config/cursor/chats/**
 .config/github-copilot/apps.json
