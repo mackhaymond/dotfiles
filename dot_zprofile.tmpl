@@ -17,8 +17,10 @@ export BUN_INSTALL="$HOME/.bun"
 export WASMER_DIR="$HOME/.wasmer"
 export WASMER_CACHE_DIR="$WASMER_DIR/cache"
 export WASIENV_DIR="$HOME/.wasienv"
+{{- if eq .chezmoi.os "darwin" }}
 export ANDROID_HOME="$HOME/Library/Android/sdk"
 export ANDROID_SDK_ROOT="$ANDROID_HOME"
+{{- end }}
 
 # Ruby (homebrew) build flags
 export LDFLAGS="-L{{ .homebrew_prefix }}/opt/ruby/lib"
@@ -39,7 +41,9 @@ path=(
   $HOME/.cargo/bin
   $BUN_INSTALL/bin
   $PYENV_ROOT/bin
+{{- if eq .chezmoi.os "darwin" }}
   /Library/Frameworks/Python.framework/Versions/3.12/bin
+{{- end }}
   {{ .homebrew_prefix }}/opt/ruby/bin
   {{ .homebrew_prefix }}/lib/ruby/gems/3.4.0/bin
   {{ .homebrew_prefix }}/opt/openjdk/bin
@@ -62,11 +66,11 @@ path=(
   $HOME/.nimble/bin
   $HOME/.cache/rebar3/bin
   $HOME/.spicetify
+{{- if eq .chezmoi.os "darwin" }}
   $ANDROID_HOME/tools
   $ANDROID_HOME/platform-tools
   "$HOME/Library/Application Support/JetBrains/Toolbox/scripts"
   "$HOME/Library/Application Support/Coursier/bin"
-{{- if eq .chezmoi.os "darwin" }}
   /usr/local/mysql-8.0.30-macos12-arm64/bin
 {{- end }}
   $HOME/.lmstudio/bin

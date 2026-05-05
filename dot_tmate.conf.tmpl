@@ -1,2 +1,2 @@
 set tmate-api-key "{{ onepasswordRead "op://Developer/tmate-api-key/credential" }}"
-set tmate-session-name "spyicydev"
+set tmate-session-name "{{ .github_username | lower }}"
