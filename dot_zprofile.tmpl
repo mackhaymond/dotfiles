@@ -80,6 +80,16 @@ path=(
 # Drop nonexistent entries (N-/) so PATH stays clean.
 path=( ${^path}(N-/) )
 
+# ─── Cached tool init (login shell) ───────────────────────────────────────
+# Cache `pyenv init --path` output instead of inlining `$PYENV_ROOT/shims`.
+# Future-proof: regenerates when the pyenv binary's mtime changes (catches
+# version upgrades), so we never hardcode pyenv's internal layout. The shell
+# function + completion are loaded lazily in .zshrc - this only handles PATH.
+# `--no-rehash`: skip rehash on shell start (pyenv install/uninstall trigger
+# rehash themselves). Specifying `zsh` skips shell detection (~40% faster).
+source "$HOME/.zsh/_cache_init.zsh"
+_cache_init pyenv "pyenv init --path --no-rehash zsh"
+
 # ─── Misc env ─────────────────────────────────────────────────────────────
 export VAGRANT_DEFAULT_PROVIDER=docker
 export HOMEBREW_NO_ENV_HINTS=1

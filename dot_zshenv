@@ -7,5 +7,13 @@ export XDG_CONFIG_HOME="$HOME/.config"
 export EDITOR="nvim"
 export LC_ALL=en_US.UTF-8
 
+# pyenv shims on PATH for non-login/non-interactive shells. .zprofile (which
+# does the canonical setup) is login-only - scripts, `zsh -c`, IDE terminals,
+# and non-login interactive shells would otherwise resolve `python3` to system
+# Python. Variable-based: $PYENV_ROOT/shims is pyenv's stable layout (since
+# 2012). Idempotent with .zprofile (typeset -U in .zprofile dedups).
+export PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
+[[ -d "$PYENV_ROOT/shims" ]] && export PATH="$PYENV_ROOT/shims:$PATH"
+
 # Secrets (chmod 600, gitignored)
 [[ -r "$HOME/.zshenv.private" ]] && source "$HOME/.zshenv.private"

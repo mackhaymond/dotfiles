@@ -5,9 +5,11 @@
 
 # ─── Bytecode compile hot files (auto-regen when source changes) ──────────
 # zsh transparently uses .zwc if newer than source. Edits Just Work.
+# Note: _cache_init compiles ~/.cache/zsh/*.zsh inline at write-time, so
+# this loop only handles files _cache_init doesn't manage.
 () {
   local f
-  for f in ~/.zshrc ~/.zsh_plugins.zsh ~/.cache/zsh/*.zsh(N); do
+  for f in ~/.zshrc ~/.zsh_plugins.zsh; do
     [[ -f $f && ( ! -f ${f}.zwc || $f -nt ${f}.zwc ) ]] && \
       zcompile -R -- ${f}.zwc $f 2>/dev/null
   done
@@ -45,21 +47,10 @@ source ~/.zsh/catppuccin_mocha-zsh-syntax-highlighting.zsh
 compdef _gnu_generic pihole
 
 # ─── Cached tool inits ────────────────────────────────────────────────────
-# Caches `<tool> init zsh` output to disk; regenerates only when binary mtime
-# changes. Saves ~280ms cold (3 fork+exec eliminated per shell start).
-_cache_init() {
-  local name=$1 cmd=$2
-  local cache="$HOME/.cache/zsh/${name}.zsh"
-  local bin="${cmd%% *}"
-  local binpath
-  binpath=${commands[$bin]}
-  [[ -z "$binpath" ]] && return
-  if [[ ! -s "$cache" || "$binpath" -nt "$cache" ]]; then
-    [[ -d "$HOME/.cache/zsh" ]] || mkdir -p "$HOME/.cache/zsh"
-    eval "$cmd" >| "$cache"
-  fi
-  source "$cache"
-}
+# `_cache_init` lives in ~/.zsh/_cache_init.zsh so .zprofile can use it too
+# (for `pyenv init --path` PATH setup at login). Re-sourcing here is
+# idempotent and covers non-login interactive shells.
+source "$HOME/.zsh/_cache_init.zsh"
 _cache_init starship "starship init zsh"
 _cache_init zoxide   "zoxide init zsh"
 _cache_init direnv   "direnv hook zsh"
@@ -80,10 +71,14 @@ _load_nvm() {
 }
 nvm() { _load_nvm; nvm "$@"; }
 
-# pyenv (~150ms hot)
+# pyenv shell function + completion (lazy: fires on first `pyenv` call).
+# Shims are already on PATH from .zprofile's cached `pyenv init --path`, so
+# `python`/`pip`/`aider` etc. work without firing this. We only need the
+# shell function here for `pyenv shell` (sets PYENV_VERSION) + completion.
+# `--no-rehash zsh`: skip rehash fork + skip shell detection (~40% faster).
 _load_pyenv() {
   unset -f pyenv 2>/dev/null
-  eval "$(command pyenv init -)"
+  eval "$(command pyenv init - --no-rehash zsh)"
 }
 pyenv() { _load_pyenv; pyenv "$@"; }
 
