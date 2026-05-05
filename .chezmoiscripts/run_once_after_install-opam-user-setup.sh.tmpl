@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+
+if ! command -v opam >/dev/null 2>&1; then
+    echo "[opam-setup] opam not installed; skipping"
+    exit 0
+fi
+
+echo "[opam-setup] running opam user-setup install"
+opam user-setup install || {
+    echo "[opam-setup] setup exited non-zero"
+    echo "[opam-setup] run manually if needed: opam user-setup install"
+}

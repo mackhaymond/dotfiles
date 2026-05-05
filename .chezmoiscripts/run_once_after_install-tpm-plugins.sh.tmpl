@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+
+TPM_DIR="$HOME/.config/tmux/plugins/tpm"
+
+if [ ! -x "$TPM_DIR/bin/install_plugins" ]; then
+    echo "[tpm-plugins] tpm not found at $TPM_DIR; chezmoiexternal should clone it first"
+    exit 0
+fi
+
+echo "[tpm-plugins] running $TPM_DIR/bin/install_plugins"
+"$TPM_DIR/bin/install_plugins" || {
+    echo "[tpm-plugins] install_plugins exited non-zero"
+    echo "[tpm-plugins] this is often expected outside an active tmux session"
+    echo "[tpm-plugins] open tmux and press prefix-I to install plugins manually"
+}

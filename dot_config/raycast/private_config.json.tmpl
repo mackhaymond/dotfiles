@@ -1,0 +1,5 @@
+{{- $token := onepasswordRead "op://Developer/raycast-access-token/credential" -}}
+{
+  "accesstoken" : "{{ $token }}",
+  "token" : "{{ $token }}"
+}{{- /* match original: no trailing newline */ -}}

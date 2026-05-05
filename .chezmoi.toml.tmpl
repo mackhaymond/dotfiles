@@ -1,0 +1,39 @@
+{{- /* User identity. promptStringOnce preserves values across re-init. */ -}}
+{{- $name := promptStringOnce . "name" "Your full name" -}}
+{{- $email := promptStringOnce . "email" "you@example.com" -}}
+{{- $github := promptStringOnce . "github_username" "your-github-handle" -}}
+{{- $signingKey := promptStringOnce . "signing_key" "ssh-ed25519 AAAA... your public signing key" -}}
+
+{{- /* Homebrew prefix derived from os + arch. */ -}}
+{{- $brewPrefix := "" -}}
+{{- if eq .chezmoi.os "darwin" -}}
+  {{- if eq .chezmoi.arch "arm64" -}}
+    {{- $brewPrefix = "/opt/homebrew" -}}
+  {{- else -}}
+    {{- $brewPrefix = "/usr/local" -}}
+  {{- end -}}
+{{- else if eq .chezmoi.os "linux" -}}
+  {{- $brewPrefix = "/home/linuxbrew/.linuxbrew" -}}
+{{- end -}}
+
+# chezmoi configuration generated from .chezmoi.toml.tmpl at init time.
+# Re-run `chezmoi init` to refresh prompts (preserves stored values).
+
+encryption = "age"
+
+[data]
+    name = {{ $name | quote }}
+    email = {{ $email | quote }}
+    github_username = {{ $github | quote }}
+    signing_key = {{ $signingKey | quote }}
+    homebrew_prefix = {{ $brewPrefix | quote }}
+
+[age]
+    identity = "~/.config/chezmoi/key.txt"
+    recipient = "age1alhmgty2xemlax3nfewlayqswp4s0nhhp0p35c60qe83g3ja8f5sy7350n"
+
+[onepassword]
+    cache = true
+
+[diff]
+    pager = ""

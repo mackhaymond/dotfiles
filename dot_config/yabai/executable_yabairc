@@ -1,0 +1,50 @@
+#vim:ft=bash
+yabai -m signal --add event=dock_did_restart action="sudo yabai --load-sa"
+sudo yabai --load-sa
+
+yabai -m config layout stack
+
+yabai -m config window_shadow off
+
+yabai -m config top_padding 0
+yabai -m config --space 1 top_padding 0
+
+# yabai -m config mouse_follows_focus on
+
+yabai -m rule --add app="^System Settings$" manage=off
+yabai -m rule --add app="^Calculator$" manage=off
+yabai -m rule --add app="^BetterTouchTool$" manage=off
+yabai -m rule --add app="^Karabiner-Elements$" manage=off
+yabai -m rule --add app="^python$" manage=off
+# yabai -m rule --add app="^Messages$" manage=off 
+yabai -m rule --add app="^DaisyDisk$" manage=off
+yabai -m rule --add app="^iStat Menus$" manage=off border=off
+yabai -m rule --add app="^Steam$" manage=off 
+# yabai -m rule --add app="^Parallels Desktop$" manage=off 
+yabai -m rule --add app="^Activity Monitor$" manage=off 
+yabai -m rule --add app="^Mail$" manage=off 
+yabai -m rule --add app="^Finder$" manage=off
+yabai -m rule --add app="^BetterZip$" manage=off 
+yabai -m rule --add app="^DevPod$" manage=off 
+yabai -m rule --add app="^Setapp$" manage=off 
+yabai -m rule --add app="^Permute$" manage=off 
+yabai -m rule --add app="^TI-Nspire$" manage=off
+yabai -m rule --add app="^LiveMath Maker$" manage=off
+yabai -m rule --add app="^Antidote$" manage=off
+
+# App -> Space pinning
+yabai -m rule --add app="^wezterm-gui$" space=1
+yabai -m rule --add app="^Todoist$" space=4
+yabai -m rule --add app="^Granola$" space=5
+yabai -m rule --add app="^Spark Mail$" space=6
+yabai -m rule --add app="^Notion Calendar$" space=7
+yabai -m rule --add app="^Messages$" space=8
+yabai -m rule --add app="^Claude$" space=9
+
+# Re-apply rules to currently-open windows on yabai (re)start.
+# Catches windows whose creation events were missed (login race, crash-restart).
+yabai -m rule --apply
+
+# Belt-and-suspenders: re-fire rules on any app launch in case the
+# window_created event is lost.
+yabai -m signal --add event=application_launched action="yabai -m rule --apply"

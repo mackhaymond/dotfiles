@@ -1,0 +1,13 @@
+# ~/.bash_profile - login shell config for bash. Minimal; daily shell is zsh.
+# Source .bashrc for interactive features.
+[[ -f ~/.bashrc ]] && source ~/.bashrc
+
+# Homebrew (sets PATH, MANPATH, INFOPATH)
+[[ -x {{ .homebrew_prefix }}/bin/brew ]] && eval "$({{ .homebrew_prefix }}/bin/brew shellenv)"
+
+# Java toolchain (sdkman manages JAVA_HOME)
+export SDKMAN_DIR="$HOME/.sdkman"
+[[ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ]] && source "$SDKMAN_DIR/bin/sdkman-init.sh"
+
+# Rust
+[[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"

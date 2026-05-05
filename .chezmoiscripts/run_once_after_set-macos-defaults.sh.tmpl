@@ -1,0 +1,62 @@
+#!/bin/bash
+set -euo pipefail
+
+{{ if ne .chezmoi.os "darwin" -}}
+echo "[macos-defaults] non-darwin OS; skipping"
+exit 0
+{{ end -}}
+
+echo "[macos-defaults] Applying preferences..."
+
+# Keyboard - faster key repeat (devs typically set these)
+defaults write NSGlobalDomain ApplePressAndHoldEnabled -bool false
+defaults write NSGlobalDomain KeyRepeat -int 2
+defaults write NSGlobalDomain InitialKeyRepeat -int 15
+
+# Trackpad - tap to click, no three-finger drag
+defaults write com.apple.AppleMultitouchTrackpad Clicking -bool true
+defaults write com.apple.driver.AppleBluetoothMultitouch.trackpad Clicking -bool true
+defaults write com.apple.AppleMultitouchTrackpad TrackpadThreeFingerDrag -bool false
+
+# Finder - column view, path bar, show extensions, folders first
+defaults write com.apple.finder FXPreferredViewStyle -string "clmv"
+defaults write com.apple.finder ShowPathbar -bool true
+defaults write com.apple.finder ShowStatusBar -bool false
+defaults write com.apple.finder _FXSortFoldersFirst -bool true
+defaults write NSGlobalDomain AppleShowAllExtensions -bool true
+
+# Don't litter network/USB volumes with .DS_Store files
+defaults write com.apple.desktopservices DSDontWriteNetworkStores -bool true
+defaults write com.apple.desktopservices DSDontWriteUSBStores -bool true
+
+# Dock - autohide instantly, no recents, no app grouping, no auto-rearrange
+defaults write com.apple.dock autohide -bool true
+defaults write com.apple.dock autohide-time-modifier -float 0.0
+defaults write com.apple.dock autohide-delay -float 0
+defaults write com.apple.dock tilesize -int 64
+defaults write com.apple.dock show-recents -bool false
+defaults write com.apple.dock expose-group-apps -bool false
+defaults write com.apple.dock mru-spaces -bool false
+
+# Mission Control - displays have separate spaces
+defaults write com.apple.spaces spans-displays -bool false
+
+# Disable smart quotes/dashes (mangle code, break terminal commands)
+defaults write NSGlobalDomain NSAutomaticQuoteSubstitutionEnabled -bool false
+defaults write NSGlobalDomain NSAutomaticDashSubstitutionEnabled -bool false
+defaults write NSGlobalDomain NSAutomaticPeriodSubstitutionEnabled -bool false
+
+# Dark mode
+defaults write NSGlobalDomain AppleInterfaceStyle -string "Dark"
+
+# Screenshots to ~/Pictures/Screenshots, with date in filename
+mkdir -p "$HOME/Pictures/Screenshots"
+defaults write com.apple.screencapture location -string "$HOME/Pictures/Screenshots"
+defaults write com.apple.screencapture include-date -bool true
+
+# Apply changes - reload affected services
+killall Dock 2>/dev/null || true
+killall Finder 2>/dev/null || true
+killall SystemUIServer 2>/dev/null || true
+
+echo "[macos-defaults] done. Some changes (login items, Trackpad changes) require logout/login to take full effect."

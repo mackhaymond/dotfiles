@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+
+{{ if ne .chezmoi.os "darwin" -}}
+echo "[brew-bundle] non-darwin OS detected; skipping macOS-only Brewfile"
+exit 0
+{{ end -}}
+
+if ! command -v brew >/dev/null 2>&1; then
+    echo "[brew-bundle] Homebrew not installed."
+    echo "[brew-bundle] Install from https://brew.sh first, then re-run 'chezmoi apply'."
+    exit 1
+fi
+
+echo "[brew-bundle] Brewfile hash: {{ includeTemplate "Brewfile.tmpl" . | sha256sum }}"
+echo "[brew-bundle] Running 'brew bundle install --file=$HOME/Brewfile'..."
+brew bundle install --file="$HOME/Brewfile"

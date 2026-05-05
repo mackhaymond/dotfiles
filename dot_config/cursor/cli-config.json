@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(ls)",
+      "Shell(cd)",
+      "Shell(git add)",
+      "Shell(git status)",
+      "Shell(git commit)",
+      "Shell(git push)",
+      "Shell(mkdir)",
+      "Shell(just)"
+    ],
+    "deny": []
+  },
+  "version": 1,
+  "editor": {
+    "vimMode": true
+  },
+  "display": {
+    "showLineNumbers": false
+  },
+  "model": {
+    "modelId": "composer-1",
+    "displayModelId": "composer-1",
+    "displayName": "Composer 1",
+    "displayNameShort": "Composer 1",
+    "aliases": []
+  },
+  "hasChangedDefaultModel": false,
+  "privacyCache": {
+    "ghostMode": true,
+    "privacyMode": 2,
+    "updatedAt": 1764958336620
+  },
+  "network": {
+    "useHttp1ForAgent": false
+  }
+}

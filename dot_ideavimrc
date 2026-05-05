@@ -1,0 +1,276 @@
+" IdeaVim configuration matching Neovim setup
+" Based on Neovim config analyzed from ~/.config/nvim/
+
+" ======================
+" Basic Settings (from set.lua)
+" ======================
+set number
+set relativenumber
+set tabstop=4
+set softtabstop=4
+set shiftwidth=4
+set expandtab
+set smartindent
+set nowrap
+set noswapfile
+set nobackup
+set undofile
+set hlsearch
+set incsearch
+set scrolloff=15
+set updatetime=50
+set clipboard=unnamedplus
+
+" Terminal colors
+set termguicolors
+
+" ======================
+" Leader Keys (from keymaps.lua)
+" ======================
+let mapleader = " "
+let maplocalleader = " "
+
+" ======================  
+" Core Keybinds (from keymaps.lua)
+" ======================
+" Save file with leader leader
+nnoremap <leader><leader> :w<CR>
+
+" Move lines in visual mode 
+vnoremap J :m '>+1<CR>gv=gv
+vnoremap K :m '<-2<CR>gv=gv
+
+" Keep cursor centered
+nnoremap J mzJ`z
+nnoremap <C-d> <C-d>zz
+nnoremap <C-u> <C-u>zz
+nnoremap n nzzzv
+nnoremap N Nzzzv
+
+" Paste without losing register
+xnoremap <leader>p "_dP
+
+" Yank to system clipboard
+nnoremap <leader>y "+y
+vnoremap <leader>y "+y
+nnoremap <leader>Y "+Y
+
+" Delete to black hole register
+nnoremap <leader>d "_d
+vnoremap <leader>d "_d
+
+" Disable Q
+nnoremap Q <nop>
+
+" ======================
+" IdeaVim Extensions
+" ======================
+" Enable various IdeaVim extensions to match plugin functionality
+set surround
+set multiple-cursors
+set commentary
+set argtextobj
+set textobj-entire
+set ReplaceWithRegister
+set exchange
+set vim-paragraph-motion
+set textobj-indent
+set highlightedyank
+
+" NERDTree equivalent (matches oil.lua and neotree.lua)
+set NERDTree
+
+" ======================
+" Telescope Equivalents (from telescope.lua)
+" ======================
+" Find files - IntelliJ equivalent
+nnoremap <leader>ff <Action>(GotoFile)
+" Find in files / live grep
+nnoremap <leader>fg <Action>(FindInPath)
+" Recent files (frecency equivalent)
+nnoremap <leader>fr <Action>(RecentFiles)
+" Find keymaps
+nnoremap <leader>fk <Action>(ShowIntentionActions)
+" Help tags equivalent
+nnoremap <leader>fl <Action>(HelpTopics)
+" File browser
+nnoremap <leader>fb <Action>(SelectInProjectView)
+
+" ======================
+" Harpoon Equivalents (from harpoon.lua)
+" ======================
+" Add file to bookmarks (harpoon equivalent)
+nnoremap <leader>hg <Action>(ToggleBookmark)
+" Show bookmarks list
+nnoremap <leader>hh <Action>(ShowBookmarks)
+
+" Navigate to numbered bookmarks (harpoon 1-5 equivalent)
+nnoremap <leader>1 <Action>(GotoBookmark1)
+nnoremap <leader>2 <Action>(GotoBookmark2)
+nnoremap <leader>3 <Action>(GotoBookmark3)
+nnoremap <leader>4 <Action>(GotoBookmark4)
+nnoremap <leader>5 <Action>(GotoBookmark5)
+
+" ======================
+" Git Integration (from git.lua - gitsigns)
+" ======================
+" Git navigation
+nnoremap ]c <Action>(VcsShowNextChangeMarker)
+nnoremap [c <Action>(VcsShowPrevChangeMarker)
+
+" Git actions
+nnoremap <leader>hs <Action>(Vcs.ShowDiffWindow)
+nnoremap <leader>hr <Action>(Vcs.RollbackLines)
+nnoremap <leader>hS <Action>(Vcs.Show.Local.Changes)
+nnoremap <leader>hp <Action>(Vcs.ShowDiffWindow)
+nnoremap <leader>hb <Action>(Annotate)
+nnoremap <leader>tb <Action>(Annotate)
+nnoremap <leader>hd <Action>(Compare.SameVersion)
+
+" ======================
+" File Explorer (from neotree.lua and oil.lua)
+" ======================
+" Toggle project tree
+nnoremap <leader>pt <Action>(ActivateProjectToolWindow)
+" Oil equivalent - file explorer
+nnoremap <leader>pv <Action>(SelectInProjectView)
+
+" ======================
+" LSP/Code Actions (from lsp_setup.lua)
+" ======================
+" Hover documentation
+nnoremap K <Action>(ShowHoverInfo)
+" Go to definition
+nnoremap gd <Action>(GotoDeclaration)
+" Go to declaration
+nnoremap gD <Action>(GotoDeclaration)
+" Go to implementation  
+nnoremap gi <Action>(GotoImplementation)
+" Go to type definition
+nnoremap go <Action>(GotoTypeDeclaration)
+" Find references
+nnoremap gr <Action>(FindUsages)
+" Signature help
+nnoremap gh <Action>(ParameterInfo)
+
+" Rename
+nnoremap gn <Action>(RenameElement)
+" Format code
+nnoremap gf <Action>(ReformatCode)
+vnoremap gf <Action>(ReformatCode)
+" Code actions
+nnoremap gc <Action>(ShowIntentionActions)
+
+" Diagnostics (from lsp_setup.lua)
+nnoremap gl <Action>(ShowErrorDescription)
+nnoremap [d <Action>(GotoPreviousError)
+nnoremap ]d <Action>(GotoNextError)
+
+" ======================
+" Trouble Equivalents (from trouble.lua)
+" ======================
+" Show diagnostics
+nnoremap <leader>xx <Action>(ActivateProblemsViewToolWindow)
+nnoremap <leader>xX <Action>(ActivateProblemsViewToolWindow)
+" Show symbols
+nnoremap <leader>cs <Action>(FileStructurePopup)
+" LSP definitions/references
+nnoremap <leader>cl <Action>(FindUsages)
+" Location list
+nnoremap <leader>xL <Action>(ActivateProblemsViewToolWindow)
+" Quickfix list
+nnoremap <leader>xQ <Action>(ActivateProblemsViewToolWindow)
+
+" ======================
+" Undotree Equivalent (from undotree.lua)
+" ======================
+nnoremap <leader>u <Action>(LocalHistory.ShowHistory)
+
+" ======================
+" Terminal (from floatterm.lua)
+" ======================
+" Toggle terminal
+nnoremap <A-d> <Action>(ActivateTerminalToolWindow)
+" Git integration (lazygit equivalent)
+nnoremap <A-g> <Action>(Git.Menu)
+
+" ======================
+" Todo Comments (from todo.lua)
+" ======================
+nnoremap <leader>tt <Action>(ActivateTODOToolWindow)
+nnoremap <leader>ft <Action>(ActivateTODOToolWindow)
+
+" ======================
+" Code Folding (from ufo.lua)
+" ======================
+" Open all folds
+nnoremap zR <Action>(ExpandAllRegions)
+" Close all folds  
+nnoremap zM <Action>(CollapseAllRegions)
+
+" ======================
+" Run Configuration (from run.lua)
+" ======================
+" Run current file/configuration
+nnoremap <leader>r <Action>(Run)
+nnoremap <leader>R <Action>(RunClass)
+
+" ======================
+" Navigation (tmux.lua equivalent)
+" ======================
+" Window navigation (matches tmux navigator)
+nnoremap <C-h> <C-w>h
+nnoremap <C-j> <C-w>j
+nnoremap <C-k> <C-w>k
+nnoremap <C-l> <C-w>l
+
+" ======================
+" Additional IntelliJ Specific Mappings
+" ======================
+" Tool windows
+nnoremap <leader>wt <Action>(HideAllWindows)
+nnoremap <leader>wr <Action>(RestoreDefaultLayout)
+
+" Refactoring
+nnoremap <leader>rf <Action>(Refactorings.QuickListPopupAction)
+
+" Search everywhere (IntelliJ's powerful search)
+nnoremap <leader>se <Action>(SearchEverywhere)
+
+" Recent locations
+nnoremap <leader>rl <Action>(RecentLocations)
+
+" Go to test
+nnoremap <leader>gt <Action>(GotoTest)
+
+" Generate code
+nnoremap <leader>gen <Action>(Generate)
+
+" Build
+nnoremap <leader>bb <Action>(CompileDirty)
+nnoremap <leader>br <Action>(Compile)
+
+" Debug
+nnoremap <leader>db <Action>(ToggleLineBreakpoint)
+nnoremap <leader>dc <Action>(Resume)
+nnoremap <leader>ds <Action>(StepInto)
+nnoremap <leader>dn <Action>(StepOver)
+nnoremap <leader>do <Action>(StepOut)
+
+" ======================
+" Settings for IdeaVim behavior
+" ======================
+" Make IdeaVim handle more like Vim
+set ideajoin
+set ideastatusicon=gray
+set idearefactormode=keep
+
+" Track action IDs for debugging mappings
+" set trackactionids
+
+" ======================
+" Custom Settings for Kotlin Development
+" ======================
+" Since you mentioned Kotlin development specifically
+nnoremap <leader>ki <Action>(Kotlin.NewFile)
+nnoremap <leader>kr <Action>(KotlinConsoleREPL)

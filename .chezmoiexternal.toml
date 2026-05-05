@@ -1,0 +1,15 @@
+[".config/nvim"]
+    type = "git-repo"
+    url = "https://github.com/SpyicyDev/nvim.git"
+    refreshPeriod = "168h"
+    [".config/nvim".pull]
+        args = ["--autostash", "--rebase"]
+
+[".config/tmux/plugins/tpm"]
+    type = "git-repo"
+    url = "https://github.com/tmux-plugins/tpm.git"
+    refreshPeriod = "720h"
+    [".config/tmux/plugins/tpm".clone]
+        args = ["--depth", "1"]
+    [".config/tmux/plugins/tpm".pull]
+        args = ["--ff-only"]

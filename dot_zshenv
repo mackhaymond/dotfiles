@@ -1,0 +1,11 @@
+# ~/.zshenv - sourced for ALL zsh invocations. Keep minimal.
+
+# XDG
+export XDG_CONFIG_HOME="$HOME/.config"
+
+# Editor + locale
+export EDITOR="nvim"
+export LC_ALL=en_US.UTF-8
+
+# Secrets (chmod 600, gitignored)
+[[ -r "$HOME/.zshenv.private" ]] && source "$HOME/.zshenv.private"

@@ -1,0 +1,14 @@
+.DS_Store
+**/.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+chezmoistate.boltdb
+*.bak
+*.backup
+*.log
+
+key.txt
+*.age.local

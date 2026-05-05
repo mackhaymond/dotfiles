@@ -1,0 +1,124 @@
+set-environment -g PATH "{{ .homebrew_prefix }}/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+setw -g mode-keys vi
+
+unbind r
+bind r source-file ~/.config/tmux/tmux.conf
+
+unbind C-b
+set -g prefix C-s
+set -g mouse on
+
+set -g default-terminal "xterm-256color"
+set-option -ga terminal-overrides ",xterm-256color:Tc"
+
+set -g base-index 1
+set -g pane-base-index 1
+set-window-option -g pane-base-index 1
+set-option -g renumber-windows on
+
+set -g pane-border-lines heavy
+
+#### end general setup ####
+
+
+bind '"' split-window -c "#{pane_current_path}"
+bind % split-window -h -c "#{pane_current_path}"
+bind c new-window -a -c "#{pane_current_path}"
+
+bind C-c new-window -a \; kill-window -t -
+
+set -g status-position top
+
+# List of plugins
+set -g @plugin 'tmux-plugins/tpm'
+set -g @plugin 'tmux-plugins/tmux-sensible'
+set -g @plugin 'christoomey/vim-tmux-navigator'
+set -g @plugin 'tmux-plugins/tmux-yank'
+
+# catppuccin
+set -g @plugin 'catppuccin/tmux#v0.2.0'
+set -g @plugin 'tmux-plugins/tmux-battery'
+set -g @catppuccin_flavor 'mocha'
+
+# Catppuccin expects an absolute custom module dir; expand #{HOME} at runtime.
+set -gF @catppuccin_custom_plugin_dir "#{HOME}/.config/tmux/catppuccin-custom"
+
+# Safe defaults for custom modules (can be overridden per-host).
+set -g @codex_session_color "colour239"
+set -g @codex_weekly_color "colour239"
+set -g @codexbar_view "percent"
+
+# Codexbar defaults ("plugin-like" surface); setup script reads these.
+# @codexbar_provider: "claude" hits Anthropic's OAuth /api/oauth/usage endpoint
+# directly (real session+weekly reset times). "codex" delegates to the codexbar
+# CLI tool against the codex provider (legacy behavior).
+set -g @codexbar_provider "claude"
+set -g @codexbar_reset_key "u"
+set -g @codexbar_reset_view_seconds "3"
+set -g @codexbar_reset_view_scope "both"
+set -g @codexbar_stale_after_seconds "60"
+set -g @codexbar_debug "0"
+set -g @codexbar_web_timeout "2"
+
+# Ensure the old inline binding is removed on reload.
+unbind u
+
+# Bootstrap codexbar keybindings/usage via script.
+run-shell "bash #{HOME}/.config/tmux/scripts/codexbar-usage-setup.sh"
+run-shell -b "bash #{HOME}/.config/tmux/scripts/codexbar-usage-status.sh --tick"
+
+# set -g @catppuccin_status_modules_right "application session battery date_time"
+set -g @catppuccin_status_modules_right "directory codex_session codex_weekly session battery"
+set -g @catppuccin_date_time_text "%I:%M %p | %m-%d-%y"
+set -g @catppuccin_status_left_separator "█"
+
+set -g @catppuccin_window_middle_separator "█ "
+set -g @catppuccin_window_right_separator "█"
+set -g @catppuccin_window_number_position "left"
+set -g @catppuccin_window_default_fill "number"
+set -g @catppuccin_window_current_fill "number"
+set -g @catppuccin_window_default_text "#W"
+set -g @catppuccin_window_current_text "#W"
+# end catppuccin
+
+set -g @plugin 'tmux-plugins/tmux-resurrect'
+set -g @resurrect-dir '{{ .chezmoi.homeDir }}/.tmux/resurrect'
+set -g @resurrect-capture-pane-contents 'on'
+set -g @resurrect-strategy-nvim 'session'
+set -g @plugin 'tmux-plugins/tmux-continuum'
+set -g @continuum-save-interval '15'
+set -g @continuum-restore 'on'
+
+unbind-key a
+bind-key a display-popup -E -w 50% -h 40% "SESSION_ONLY=1 $HOME/.config/tmux/scripts/mru-session-switch.sh"
+
+unbind-key C-a
+bind-key C-a display-popup -E -w 50% -h 40% "SESSION_ONLY=1 $HOME/.config/tmux/scripts/mru-session-switch.sh"
+
+set -g @plugin '27medkamal/tmux-session-wizard'
+set -g @session-wizard 'T'
+
+set -g @plugin 'sainnhe/tmux-fzf'
+TMUX_FZF_LAUNCH_KEY="C-m"
+
+set -g @plugin 'omerxx/tmux-floax'
+set -g @floax-bind '-n M-q'
+
+unbind -n M-a
+bind -n M-a run-shell -b "#{HOME}/.config/tmux/scripts/toggle-btop-popup.sh '#{client_tty}'"
+
+# bind -n m-w send-keys -F "yy" Enter
+
+# bind -n m-q run-shell "~/desktop/coding/various_scripts/popuptmux"
+
+# Other examples:
+# set -g @plugin 'github_username/plugin_name'
+# set -g @plugin 'github_username/plugin_name#branch'
+# set -g @plugin 'git@github.com:user/plugin'
+# set -g @plugin 'git@bitbucket.com:user/plugin'
+
+
+bind C-l kill-pane
+# Initialize TMUX plugin manager (keep this line at the very bottom of tmux.conf)
+run '~/.tmux/plugins/tpm/tpm'

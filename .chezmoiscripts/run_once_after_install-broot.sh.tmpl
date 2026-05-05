@@ -1,0 +1,19 @@
+#!/bin/bash
+set -euo pipefail
+
+LAUNCHER="$HOME/.config/broot/launcher/bash/br"
+if [ -L "$LAUNCHER" ] || [ -f "$LAUNCHER" ]; then
+    echo "[broot-install] launcher already present at $LAUNCHER; skipping"
+    exit 0
+fi
+
+if ! command -v broot >/dev/null 2>&1; then
+    echo "[broot-install] broot not installed; Brewfile install runs first via brew bundle"
+    exit 0
+fi
+
+echo "[broot-install] running broot --install"
+broot --install || {
+    echo "[broot-install] setup exited non-zero (may need interactive mode)"
+    echo "[broot-install] run manually if needed: broot --install"
+}

@@ -1,0 +1,11 @@
+{
+  "model": "claude-haiku-4.5",
+  "max_history": 5,
+  "max_diff_lines": 500,
+  "timeout": 30,
+  "style": "conventional",
+  "include_stats": true,
+  "include_history": true,
+  "auto_validate": true,
+  "show_preview": false
+}

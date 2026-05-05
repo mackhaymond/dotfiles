@@ -1,0 +1,42 @@
+[user]
+	email = {{ .email }}
+	name = {{ .name }}
+	signingkey = {{ .signing_key }}
+{{- if eq .chezmoi.os "darwin" }}
+[difftool "sourcetree"]
+	cmd = opendiff \"$LOCAL\" \"$REMOTE\"
+	path = 
+[mergetool "sourcetree"]
+	cmd = /Applications/Sourcetree.app/Contents/Resources/opendiff-w.sh \"$LOCAL\" \"$REMOTE\" -ancestor \"$BASE\" -merge \"$MERGED\"
+	trustExitCode = true
+{{- end }}
+[core]
+	excludesfile = {{ .chezmoi.homeDir }}/.gitignore_global
+    pager = delta
+
+[interactive]
+    diffFilter = delta --color-only
+
+[delta]
+    navigate = true    # use n and N to move between diff sections
+    light = false      # set to true if you're in a terminal w/ a light background color (e.g. the default macOS terminal)
+    side-by-side = true
+   jline-numbers = true
+    syntax-theme = Catppuccin-mocha
+
+[merge]
+    conflictstyle = diff3
+[commit]
+	gpgsign = true
+[http]
+	sslBackend = openssl
+[diff]
+    colorMoved = default
+[gpg]
+	format = ssh
+[gpg "ssh"]
+{{- if eq .chezmoi.os "darwin" }}
+	program = /Applications/1Password.app/Contents/MacOS/op-ssh-sign
+{{- else if eq .chezmoi.os "linux" }}
+	program = /opt/1Password/op-ssh-sign
+{{- end }}

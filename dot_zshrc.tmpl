@@ -1,0 +1,197 @@
+# ~/.zshrc - interactive shell config
+# Profile with: ZSH_DEBUGRC=1 zsh -i -c exit
+
+[[ -n "${ZSH_DEBUGRC+1}" ]] && zmodload zsh/zprof
+
+# ─── Bytecode compile hot files (auto-regen when source changes) ──────────
+# zsh transparently uses .zwc if newer than source. Edits Just Work.
+() {
+  local f
+  for f in ~/.zshrc ~/.zsh_plugins.zsh ~/.cache/zsh/*.zsh(N); do
+    [[ -f $f && ( ! -f ${f}.zwc || $f -nt ${f}.zwc ) ]] && \
+      zcompile -R -- ${f}.zwc $f 2>/dev/null
+  done
+}
+
+# ─── History ──────────────────────────────────────────────────────────────
+HISTFILE=~/.zsh_history
+HISTSIZE=10000
+SAVEHIST=10000
+setopt appendhistory hist_ignore_dups hist_ignore_space share_history
+
+# ─── Completion (must init BEFORE plugins so compdef is defined) ─────────
+# -C: skip security check + skip dump regen. Run `compinit` manually after
+# installing tools that ship completions, or `rm ~/.zcompdump` to force rebuild.
+autoload -Uz compinit
+compinit -C -d "${ZDOTDIR:-$HOME}/.zcompdump"
+
+# ─── Antidote (plugin manager) ────────────────────────────────────────────
+source ~/.antidote/antidote.zsh
+
+zsh_plugins=${ZDOTDIR:-~}/.zsh_plugins
+[[ -f ${zsh_plugins}.txt ]] || touch ${zsh_plugins}.txt
+
+# Regenerate static bundle when plugin list changes
+if [[ ! ${zsh_plugins}.zsh -nt ${zsh_plugins}.txt ]]; then
+  autoload -Uz antidote
+  antidote bundle <${zsh_plugins}.txt >|${zsh_plugins}.zsh
+fi
+source ${zsh_plugins}.zsh
+
+# Catppuccin syntax-highlighting theme (after fast-syntax-highlighting loads)
+source ~/.zsh/catppuccin_mocha-zsh-syntax-highlighting.zsh
+
+# Custom completions (after compinit + plugins)
+compdef _gnu_generic pihole
+
+# ─── Cached tool inits ────────────────────────────────────────────────────
+# Caches `<tool> init zsh` output to disk; regenerates only when binary mtime
+# changes. Saves ~280ms cold (3 fork+exec eliminated per shell start).
+_cache_init() {
+  local name=$1 cmd=$2
+  local cache="$HOME/.cache/zsh/${name}.zsh"
+  local bin="${cmd%% *}"
+  local binpath
+  binpath=${commands[$bin]}
+  [[ -z "$binpath" ]] && return
+  if [[ ! -s "$cache" || "$binpath" -nt "$cache" ]]; then
+    [[ -d "$HOME/.cache/zsh" ]] || mkdir -p "$HOME/.cache/zsh"
+    eval "$cmd" >| "$cache"
+  fi
+  source "$cache"
+}
+_cache_init starship "starship init zsh"
+_cache_init zoxide   "zoxide init zsh"
+_cache_init direnv   "direnv hook zsh"
+
+# ─── Keybindings ──────────────────────────────────────────────────────────
+bindkey '^X'   create_completion
+bindkey '^I'   autosuggest-accept       # tab          | complete
+bindkey '^[[Z' complete-word            # shift + tab  | autosuggest
+
+# ─── Lazy loaders for heavy tools ─────────────────────────────────────────
+
+# nvm (brew-installed)
+export NVM_DIR="$HOME/.nvm"
+_load_nvm() {
+  unset -f nvm 2>/dev/null
+  [[ -s "{{ .homebrew_prefix }}/opt/nvm/nvm.sh" ]] && source "{{ .homebrew_prefix }}/opt/nvm/nvm.sh"
+  [[ -s "{{ .homebrew_prefix }}/opt/nvm/etc/bash_completion.d/nvm" ]] && source "{{ .homebrew_prefix }}/opt/nvm/etc/bash_completion.d/nvm"
+}
+nvm() { _load_nvm; nvm "$@"; }
+
+# pyenv (~150ms hot)
+_load_pyenv() {
+  unset -f pyenv 2>/dev/null
+  eval "$(command pyenv init -)"
+}
+pyenv() { _load_pyenv; pyenv "$@"; }
+
+# conda (~200ms hot)
+_load_conda() {
+  unset -f conda 2>/dev/null
+  __conda_setup="$('{{ .homebrew_prefix }}/Caskroom/miniforge/base/bin/conda' 'shell.zsh' 'hook' 2>/dev/null)"
+  if [[ $? -eq 0 ]]; then
+    eval "$__conda_setup"
+  elif [[ -f "{{ .homebrew_prefix }}/Caskroom/miniforge/base/etc/profile.d/conda.sh" ]]; then
+    source "{{ .homebrew_prefix }}/Caskroom/miniforge/base/etc/profile.d/conda.sh"
+  else
+    export PATH="{{ .homebrew_prefix }}/Caskroom/miniforge/base/bin:$PATH"
+  fi
+  unset __conda_setup
+}
+conda() { _load_conda; conda "$@"; }
+
+# sdkman
+export SDKMAN_DIR="$HOME/.sdkman"
+_load_sdkman() {
+  unset -f sdk 2>/dev/null
+  [[ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ]] && source "$SDKMAN_DIR/bin/sdkman-init.sh"
+}
+sdk() { _load_sdkman; sdk "$@"; }
+
+# gh copilot aliases (forks subshell on each shell start - lazy)
+_load_gh_copilot() {
+  unset -f ghcs ghce 2>/dev/null
+  eval "$(command gh copilot alias -- zsh)"
+}
+ghcs() { _load_gh_copilot; ghcs "$@"; }
+ghce() { _load_gh_copilot; ghce "$@"; }
+
+# opam (eager - <1ms total, but env_hook MUST install precmd before first
+# prompt so `cd` into an OCaml project auto-activates the right switch env)
+[[ -r "$HOME/.opam/opam-init/init.zsh" ]] && source "$HOME/.opam/opam-init/init.zsh" >/dev/null 2>&1
+
+# bun completions (~1ms - keep eager since tiny)
+[[ -s "$HOME/.bun/_bun" ]] && source "$HOME/.bun/_bun"
+
+# atuin (defer to after first prompt for speed)
+. "$HOME/.atuin/bin/env"
+zsh-defer eval "$(atuin init zsh)"
+
+# broot (defer)
+zsh-defer source "$HOME/.config/broot/launcher/bash/br"
+
+# ─── GPG ──────────────────────────────────────────────────────────────────
+# $TTY is a zsh builtin param - no fork needed (vs $(tty))
+export GPG_TTY=$TTY
+
+# ─── Aliases ──────────────────────────────────────────────────────────────
+alias clear="clear && printf '\n%.0s' {1..100}"
+alias c=clear
+alias hh="cd ~ && c"
+alias cleardns="sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder"
+alias lvl="echo \"shlvl: \$((\$SHLVL-1))\""
+alias shlvl=lvl
+alias gitui="gitui -t mocha.ron"
+alias cops="gh copilot suggest -t shell"
+alias ls="eza --icons --group-directories-first"
+alias cd=z
+alias m="mutagen"
+alias pb="pbcopy"
+alias pbp="pbpaste"
+alias occ="oc -c"
+
+# ─── Functions ────────────────────────────────────────────────────────────
+opencode() {
+  for arg in "$@"; do
+    [[ "$arg" != -* ]] && { command opencode "$@"; return; }
+  done
+  command opencode --port 0 "$@"
+}
+oc() { opencode "$@"; }
+
+yy() {
+  local tmp="$(mktemp -t "yazi-cwd.XXXXXX")"
+  yazi "$@" --cwd-file="$tmp"
+  if cwd="$(cat -- "$tmp")" && [[ -n "$cwd" && "$cwd" != "$PWD" ]]; then
+    builtin cd -- "$cwd"
+  fi
+  rm -f -- "$tmp"
+}
+
+yytmux() {
+  local tmp="$(mktemp -t "yazi-cwd.XXXXXX")"
+  if [[ "$(tmux display-message -p -F '#{session_name}')" = "popup" ]]; then
+    tmux detach-client
+  else
+    local original_session=$(tmux display-message -p -F "#{session_name}")
+    local original_window=$(tmux display-message -p -F "#{window_name}")
+    tmux popup -E -w 80% -h 80% "yazi \"$@\" --cwd-file=\"$tmp\""
+    if cwd="$(cat -- "$tmp")" && [[ -n "$cwd" && "$cwd" != "$PWD" ]]; then
+      tmux send-keys -t "${original_session}:${original_window}" "cd \"$cwd\"" Enter
+    fi
+    rm -f -- "$tmp"
+  fi
+}
+
+# ─── Visual: scroll prompt to bottom on shell open ────────────────────────
+# Print exactly $LINES newlines (terminal height) so prompt lands at bottom
+# regardless of window size. Skip in nested shells (SHLVL > 1) so subshells
+# don't keep pushing the prompt further down. Pure zsh builtins - no fork.
+if (( SHLVL == 1 )) && [[ -t 1 ]]; then
+  repeat $LINES print
+fi
+
+# ─── Profile output ───────────────────────────────────────────────────────
+[[ -n "${ZSH_DEBUGRC+1}" ]] && zprof

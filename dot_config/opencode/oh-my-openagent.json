@@ -1,0 +1,112 @@
+{
+  "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-opencode/dev/assets/oh-my-opencode.schema.json",
+  "agents": {
+    "sisyphus": {
+      "model": "anthropic/claude-opus-4-7",
+      "variant": "max",
+      "skills": [
+        "caveman"
+      ]
+    },
+    "hephaestus": {
+      "model": "anthropic/claude-opus-4-7",
+      "variant": "max",
+      "skills": [
+        "caveman"
+      ]
+    },
+    "oracle": {
+      "model": "google/gemini-3.1-pro-preview",
+      "variant": "high"
+    },
+    "librarian": {
+      "model": "anthropic/claude-haiku-4-5",
+      "skills": [
+        "caveman"
+      ]
+    },
+    "explore": {
+      "model": "anthropic/claude-haiku-4-5",
+      "skills": [
+        "caveman"
+      ]
+    },
+    "multimodal-looker": {
+      "model": "google/gemini-3-flash-preview"
+    },
+    "prometheus": {
+      "model": "anthropic/claude-opus-4-7",
+      "variant": "max"
+    },
+    "metis": {
+      "model": "anthropic/claude-opus-4-7",
+      "variant": "max",
+      "skills": [
+        "caveman"
+      ]
+    },
+    "momus": {
+      "model": "anthropic/claude-opus-4-7",
+      "variant": "max"
+    },
+    "atlas": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "skills": [
+        "caveman"
+      ]
+    },
+    "sisyphus-junior": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "skills": [
+        "caveman"
+      ]
+    },
+    "build": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "skills": [
+        "caveman"
+      ]
+    },
+    "plan": {
+      "model": "anthropic/claude-opus-4-7",
+      "variant": "max"
+    },
+    "OpenCode-Builder": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "skills": [
+        "caveman"
+      ]
+    }
+  },
+  "categories": {
+    "visual-engineering": {
+      "model": "google/gemini-3.1-pro-preview",
+      "variant": "high"
+    },
+    "ultrabrain": {
+      "model": "google/gemini-3.1-pro-preview",
+      "variant": "high"
+    },
+    "deep": {
+      "model": "anthropic/claude-opus-4-7",
+      "variant": "max"
+    },
+    "artistry": {
+      "model": "google/gemini-3.1-pro-preview",
+      "variant": "high"
+    },
+    "quick": {
+      "model": "anthropic/claude-haiku-4-5"
+    },
+    "unspecified-low": {
+      "model": "anthropic/claude-sonnet-4-6"
+    },
+    "unspecified-high": {
+      "model": "anthropic/claude-opus-4-7",
+      "variant": "max"
+    },
+    "writing": {
+      "model": "google/gemini-3-flash-preview"
+    }
+  }
+}

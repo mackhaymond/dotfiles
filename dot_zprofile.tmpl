@@ -1,0 +1,94 @@
+# ~/.zprofile - sourced once for login shells. PATH + env only, no interactive cruft.
+
+# ─── Homebrew (inlined - avoids ruby fork from `brew shellenv`) ───────────
+export HOMEBREW_PREFIX="{{ .homebrew_prefix }}"
+export HOMEBREW_CELLAR="{{ .homebrew_prefix }}/Cellar"
+export HOMEBREW_REPOSITORY="{{ .homebrew_prefix }}"
+export INFOPATH="{{ .homebrew_prefix }}/share/info${INFOPATH:+:$INFOPATH}"
+[[ -z "${MANPATH-}" ]] || export MANPATH=":${MANPATH#:}"
+
+# ─── Path env vars (referenced by tools below) ────────────────────────────
+export GOPATH="$HOME/Desktop/coding/go"
+export GOPROXY="https://proxy.golang.org,direct"
+export GOSUMDB="sum.golang.org"
+export GOTOOLCHAIN="auto"
+export PYENV_ROOT="$HOME/.pyenv"
+export BUN_INSTALL="$HOME/.bun"
+export WASMER_DIR="$HOME/.wasmer"
+export WASMER_CACHE_DIR="$WASMER_DIR/cache"
+export WASIENV_DIR="$HOME/.wasienv"
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+
+# Ruby (homebrew) build flags
+export LDFLAGS="-L{{ .homebrew_prefix }}/opt/ruby/lib"
+export CPPFLAGS="-I{{ .homebrew_prefix }}/opt/ruby/include"
+export PKG_CONFIG_PATH="{{ .homebrew_prefix }}/opt/ruby/lib/pkgconfig"
+
+# ─── PATH (single array, deduped via typeset -U, missing dirs auto-skip) ──
+# Order matters: earlier = higher priority.
+typeset -U path PATH
+path=(
+  # User bins (highest priority)
+  $HOME/bin
+  $HOME/userbin
+  $HOME/.local/bin
+  $HOME/Desktop/coding/various_scripts
+
+  # Language toolchains
+  $HOME/.cargo/bin
+  $BUN_INSTALL/bin
+  $PYENV_ROOT/bin
+  /Library/Frameworks/Python.framework/Versions/3.12/bin
+  {{ .homebrew_prefix }}/opt/ruby/bin
+  {{ .homebrew_prefix }}/lib/ruby/gems/3.4.0/bin
+  {{ .homebrew_prefix }}/opt/openjdk/bin
+  {{ .homebrew_prefix }}/opt/node/bin
+  {{ .homebrew_prefix }}/opt/libpq/bin
+  $HOME/.local/share/bob/nvim-bin
+  $HOME/.openfang/bin
+  $WASMER_DIR/bin
+  $WASIENV_DIR/bin
+
+  # Homebrew
+  {{ .homebrew_prefix }}/bin
+  {{ .homebrew_prefix }}/sbin
+
+  # System defaults
+  $path
+
+  # Lower priority (appended)
+  $GOPATH/bin
+  $HOME/.nimble/bin
+  $HOME/.cache/rebar3/bin
+  $HOME/.spicetify
+  $ANDROID_HOME/tools
+  $ANDROID_HOME/platform-tools
+  "$HOME/Library/Application Support/JetBrains/Toolbox/scripts"
+  "$HOME/Library/Application Support/Coursier/bin"
+{{- if eq .chezmoi.os "darwin" }}
+  /usr/local/mysql-8.0.30-macos12-arm64/bin
+{{- end }}
+  $HOME/.lmstudio/bin
+  $HOME/.antigravity/antigravity/bin
+  $WASMER_DIR/globals/wapm_packages/.bin
+  /usr/local/bin
+)
+# Drop nonexistent entries (N-/) so PATH stays clean.
+path=( ${^path}(N-/) )
+
+# ─── Misc env ─────────────────────────────────────────────────────────────
+export VAGRANT_DEFAULT_PROVIDER=docker
+export HOMEBREW_NO_ENV_HINTS=1
+export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
+export AIRFLOW_HOME="$HOME/.config/airflow"
+export BAT_THEME="Catppuccin-mocha"
+export CTX=true
+export LUA_PATH="$HOME/.config/nvim/lua/setup/?.lua;$HOME/.luarocks/share/lua/5.1/?.lua;$HOME/.luarocks/lib/lua/5.1/?.so;;"
+
+# OrbStack (lightweight; integrates docker/etc.)
+[[ -r "$HOME/.orbstack/shell/init.zsh" ]] && source "$HOME/.orbstack/shell/init.zsh" 2>/dev/null
+
+# iTerm2 shell integration removed (saves ~15ms login).
+# Re-enable if you need iTerm2 marks / cmd-shift-arrow navigation:
+# [[ -r "$HOME/.iterm2_shell_integration.zsh" ]] && source "$HOME/.iterm2_shell_integration.zsh"

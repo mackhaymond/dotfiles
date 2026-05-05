@@ -1,0 +1,147 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "oh-my-openagent",
+    "@ex-machina/opencode-anthropic-auth@1.7.5",
+    "opencode-gemini-auth@latest",
+    "opencode-dir"
+  ],
+  "permission": {
+    "bash": {
+      "*": "allow"
+    }
+  },
+  "skills": {
+    "paths": [
+      "{{ .chezmoi.homeDir }}/.agents/skills"
+    ]
+  },
+  "instructions": [
+    "{{ .chezmoi.homeDir }}/.agents/skills/caveman/SKILL.md"
+  ],
+  "default_agent": "\u200bSisyphus - Ultraworker",
+  "mcp": {
+    "playwright": {
+      "type": "local",
+      "command": [
+        "sh",
+        "-c",
+        "set -eu; PORT=9222; BIND=127.0.0.1; PROFILE_DIR=/tmp/pw-cdp-profile; if command -v google-chrome >/dev/null 2>&1; then CHROME_BIN=google-chrome; elif command -v google-chrome-stable >/dev/null 2>&1; then CHROME_BIN=google-chrome-stable; elif command -v chromium >/dev/null 2>&1; then CHROME_BIN=chromium; elif command -v chromium-browser >/dev/null 2>&1; then CHROME_BIN=chromium-browser; elif command -v msedge >/dev/null 2>&1; then CHROME_BIN=msedge; elif [ -x \"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" ]; then CHROME_BIN=\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\"; elif [ -x \"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge\" ]; then CHROME_BIN=\"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge\"; else echo \"No Chrome/Chromium found in PATH; install Chrome/Chromium or add it to PATH.\" >&2; exit 1; fi; mkdir -p \"$PROFILE_DIR\" >/dev/null 2>&1 || true; \"$CHROME_BIN\" --headless --remote-debugging-address=\"$BIND\" --remote-debugging-port=\"$PORT\" --user-data-dir=\"$PROFILE_DIR\" --no-first-run --no-default-browser-check --disable-dev-shm-usage >/dev/null 2>&1 & CHROME_PID=$!; trap 'kill $CHROME_PID >/dev/null 2>&1 || true' EXIT INT TERM; sleep 1; echo \"CDP: http://127.0.0.1:${PORT}/ (open chrome://inspect/#devices and add localhost:${PORT})\" >&2; npx -y @playwright/mcp@latest --headless \"--cdp-endpoint=http://127.0.0.1:${PORT}/\""
+      ],
+      "enabled": true
+    }
+  },
+  "model": "anthropic/claude-opus-4-7",
+  "enabled_providers": [
+    "anthropic",
+    "google"
+  ],
+  "provider": {
+    "google": {
+      "models": {
+        "gemini-2.5-flash": {
+          "name": "Gemini 2.5 Flash (Gemini CLI)",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "gemini-2.5-pro": {
+          "name": "Gemini 2.5 Pro (Gemini CLI)",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "gemini-3-flash-preview": {
+          "name": "Gemini 3 Flash Preview (Gemini CLI)",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "gemini-3-pro-preview": {
+          "name": "Gemini 3 Pro Preview (Gemini CLI)",
+          "limit": {
+            "context": 1048576,
+            "output": 65535
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "gemini-3.1-pro-preview": {
+          "name": "Gemini 3.1 Pro Preview (Gemini CLI)",
+          "limit": {
+            "context": 1048576,
+            "output": 65535
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "gemini-3.1-pro-preview-customtools": {
+          "name": "Gemini 3.1 Pro Preview Custom Tools (Gemini CLI)",
+          "limit": {
+            "context": 1048576,
+            "output": 65535
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

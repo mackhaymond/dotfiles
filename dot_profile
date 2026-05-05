@@ -1,0 +1,2 @@
+# ~/.profile - sourced by sh/non-bash login shells. Minimal.
+[[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
