@@ -19,7 +19,7 @@ end)
 config.color_scheme = "catppuccin-mocha"
 
 config.enable_tab_bar = false
-config.window_decorations = "RESIZE"
+config.window_decorations = "NONE"
 
 config.font = wezterm.font_with_fallback({
     "JetBrains Mono",
