@@ -27,10 +27,11 @@ For the public-facing intro and architecture, see [README.md](./README.md).
 16. [Onboarding a new machine](#onboarding-a-new-machine)
 17. [Selective install (for forks or partial deployments)](#selective-install-for-forks-or-partial-deployments)
 18. [Pulling changes from another machine](#pulling-changes-from-another-machine)
-18. [Resolving merge conflicts](#resolving-merge-conflicts)
-19. [Debugging](#debugging)
-20. [Disaster recovery](#disaster-recovery)
-21. [Decision tree: when to use what](#decision-tree-when-to-use-what)
+19. [Resolving merge conflicts](#resolving-merge-conflicts)
+20. [Debugging](#debugging)
+21. [Disaster recovery](#disaster-recovery)
+22. [Decision tree: when to use what](#decision-tree-when-to-use-what)
+23. [Hygiene checklist before tracking new files](#hygiene-checklist-before-tracking-new-files)
 
 ---
 
@@ -473,9 +474,9 @@ for f in $(find . -name "*.age"); do
     mv "$f.new" "$f"
 done
 
-# 4. Update the recipient in chezmoi config
-$EDITOR ~/.config/chezmoi/chezmoi.toml   # update [age] recipient = "..."
-$EDITOR .chezmoi.toml.tmpl                # update the template's recipient too
+# 4. Update the recipient in the template (chezmoi init regenerates ~/.config/chezmoi/chezmoi.toml)
+$EDITOR .chezmoi.toml.tmpl                # update [age] recipient = "..."
+chezmoi init                              # regenerate local config (promptStringOnce preserves stored values)
 
 # 5. Replace local key
 mv ~/.config/chezmoi/key.txt.new ~/.config/chezmoi/key.txt
@@ -929,13 +930,15 @@ it ends in `.tmpl`, it's templated.
 
 ---
 
-## Pre-public hygiene checklist
+## Hygiene checklist before tracking new files
 
-If you ever flip the repo back to public after adding new tracked files:
+The repo is public. Before `chezmoi add` / `chezmoi re-add` / `git commit` of a new
+tracked file, run through this checklist:
 
-- [ ] `grep -rE "ghp_|sk-ant-|tmk-|password\s*=" .` in source dir — should be empty
+- [ ] Secret-pattern scan: `grep -rE "ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|sk-ant-|sk-proj-|tmk-|xoxb-|xoxp-|xapp-|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|password\s*=|api[-_]?key\s*=" .` in source dir — should be empty (or hits should be templated/encrypted, never literal)
 - [ ] No real email addresses in tracked files (other than templated `{{ .email }}`)
 - [ ] No `private_*` files containing actual credentials in plaintext
-- [ ] Run `chezmoi cat` on each new templated file to see what would be public
+- [ ] Run `chezmoi cat` on each new templated file to see what would be public after rendering
 - [ ] No new external repo URLs that point to private repos (people can't clone the bootstrap)
 - [ ] op:// references look reasonable (vault/item names will be public metadata)
+- [ ] Run `pre-commit run --all-files` if gitleaks hook is installed (`pre-commit install` once per machine)

@@ -24,7 +24,7 @@ fork, adapt, and steal patterns. Don't blindly apply this to your machine.
 - **Secrets**: [age](https://age-encryption.org/) for whole-file encryption, [1Password](https://1password.com/) `op://` templates for rotatable tokens
 - **Git**: [delta](https://github.com/dandavison/delta) pager, SSH commit signing via 1Password agent
 - **Bootstrap**: `chezmoi init --apply` plus a handful of `run_once_after_*` scripts
-- **Brewfile**: 41 taps, 214 brews, 50 casks, 92 vscode extensions
+- **Brewfile**: 41 taps, 214 brews, 50 casks, 92 vscode extensions, 8 cargo, 6 uv (~250 packages)
 
 ---
 
@@ -55,9 +55,9 @@ brew install --cask 1password-cli   # if not already installed
 # 1. Authenticate to clone over HTTPS
 gh auth login
 
-# 2. Place your age private key
+# 2. Place your age private key (replace item name with your own backup)
 mkdir -p ~/.config/chezmoi
-op read "op://Developer/your-age-key-item/notesPlain" \
+op read "op://Developer/chezmoi-age-key-mackbook/notesPlain" \
     > ~/.config/chezmoi/key.txt
 chmod 600 ~/.config/chezmoi/key.txt
 
