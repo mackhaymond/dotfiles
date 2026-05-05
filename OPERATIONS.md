@@ -39,18 +39,27 @@ For the public-facing intro and architecture, see [README.md](./README.md).
 ```sh
 chezmoi diff              # what would apply do?
 chezmoi apply             # apply pending changes
-chezmoi edit ~/.zshrc     # edit (the source) + auto-apply
+chezmoi apply --force ~/.foo   # discard live edits, restore from source
+chezmoi edit --apply ~/.zshrc  # edit source (works for plain/templated/encrypted) + auto-apply
+chezmoi merge ~/.foo      # 3-way merge if live and source diverged
 chezmoi add ~/.foo        # start tracking a new file
+chezmoi re-add ~/.foo     # propagate live edits to source (PLAIN FILES ONLY - silently skips templates)
 chezmoi forget --force ~/.bar  # stop tracking
 chezmoi cd                # cd into source dir for git ops
 chezmoi update            # git pull + apply
 chezmoi managed           # list everything chezmoi controls
 chezmoi data              # dump all template data
 chezmoi cat ~/.tmate.conf # render and print (decrypts age + resolves op://)
+chezmoi source-path ~/.zshrc   # show source filename (e.g., dot_zshrc.tmpl)
 chezmoi execute-template < FILE  # render a template through chezmoi
 chezmoi doctor            # health check
 chezmoi state delete-bucket --bucket=scriptState  # reset run_once tracking
 ```
+
+**Editing rule of thumb:** `chezmoi edit --apply` is the universal "edit
+this managed file" command. Works for plain, templated, encrypted, and
+op://-templated files. `re-add` is only useful for plain files — it
+silently skips templates.
 
 ---
 
@@ -66,16 +75,21 @@ chezmoi apply      # apply if needed
 After making a config change you want to track:
 
 ```sh
-chezmoi edit ~/.zshrc      # opens source file in $EDITOR; auto-applies on save
-# OR
-$EDITOR ~/.zshrc           # edit the LIVE file directly
-chezmoi re-add ~/.zshrc    # then mirror back to source
-chezmoi cd && git diff     # review
+# Universal pattern (works for plain, templated, encrypted, op:// files)
+chezmoi edit --apply ~/.zshrc      # opens source in $EDITOR, auto-applies on save
+chezmoi cd && git diff             # review
 chezmoi cd && git add . && git commit -m "..." && git push
+
+# Alternative ONLY for plain (non-templated) files
+$EDITOR ~/.bashrc                  # edit the LIVE file directly
+chezmoi re-add ~/.bashrc           # mirror back to source
+# WARNING: re-add silently skips templated files. For dot_zshrc.tmpl,
+# private_dot_gitconfig.tmpl, etc. this would be a no-op and your edits
+# would be reverted on next `chezmoi apply`. Use `chezmoi edit` instead.
 ```
 
-`chezmoi edit` is the cleaner workflow — edits the source, auto-applies, no
-re-add dance.
+`chezmoi edit --apply` is the safe default — it edits the source (handling
+template/encryption transparently), auto-applies, no re-add gotchas.
 
 ---
 
@@ -175,43 +189,101 @@ git push
 
 ## Editing an existing dotfile
 
-### Easiest: `chezmoi edit --apply`
+### Universal pattern: `chezmoi edit --apply`
 
 ```sh
 chezmoi edit --apply ~/.zshrc
 ```
 
-Opens the source in `$EDITOR`, auto-applies changes on save. For templated
-files, you're editing the template; for encrypted files, it decrypts to
-a temp file, you edit, and it re-encrypts on save.
+This is the **only command you need** to edit a managed file, regardless
+of whether it's plain, templated, encrypted, or op://-templated. It:
 
-### Manual: edit live file then `re-add`
+- Opens the source in `$EDITOR`
+- For plain files: edits the source directly
+- For templated files (`.tmpl`): opens the template; the `.tmpl` extension
+  is preserved so editor syntax-highlighting can detect template directives.
+  Combined with `--hardlink` (default), the editor sees the target filename
+  (e.g., `.zshrc.tmpl`) for proper syntax highlighting
+- For encrypted files (`.age`): decrypts to a tmp file, you edit, re-encrypts
+  on save (transparent)
+- For op:// templates: same as templated — edit the `.tmpl`
+- On save, auto-applies the rendered output to the live target
+
+### Editing the template directly (without `--apply`)
+
+If you want to verify the diff before applying:
 
 ```sh
-$EDITOR ~/.zshrc
-chezmoi re-add ~/.zshrc
-chezmoi diff   # verify
+chezmoi edit ~/.zshrc      # opens source, no auto-apply
+chezmoi diff               # see what would change
+chezmoi apply              # apply when satisfied
 ```
 
-Use `re-add` (not `add`) for files already tracked. `re-add` preserves the
-existing prefix/suffix attributes (encrypted_, .tmpl, etc.).
-
-### Editing an age-encrypted file
+Or open the source path manually:
 
 ```sh
-chezmoi edit ~/.zshenv.private
-```
-
-chezmoi handles the decrypt/edit/encrypt round-trip transparently.
-
-### Editing an op:// template
-
-These are plain `.tmpl` files — edit the source directly:
-
-```sh
-$EDITOR $(chezmoi source-path ~/.tmate.conf)   # opens dot_tmate.conf.tmpl
+$EDITOR $(chezmoi source-path ~/.zshrc)   # opens dot_zshrc.tmpl directly
 chezmoi diff
 chezmoi apply
+```
+
+### ⚠️ `chezmoi re-add` does NOT propagate template edits
+
+Per `chezmoi re-add --help`:
+
+> "chezmoi will **not overwrite templates**, and all entries that are not
+> files are ignored."
+
+This is a safety feature (your `{{ }}` directives won't get clobbered) but
+also a **silent no-op trap**: if you edit `~/.zshrc` directly and run
+`chezmoi re-add ~/.zshrc`, your live changes are NOT propagated to the
+source template. `chezmoi re-add` reports success and exits cleanly,
+leaving the source unchanged. Next `chezmoi apply` reverts your live edits.
+
+**`re-add` is only useful for plain, non-templated files.** For our repo,
+that's a small subset (`dot_bashrc`, `dot_profile`, `dot_zshenv`, etc.).
+
+### Recovering from "I accidentally edited the live file"
+
+It happens. `chezmoi diff` will show the drift. Three recovery paths:
+
+```sh
+# Option A: discard live edits, restore from source
+chezmoi apply --force ~/.zshrc
+
+# Option B: keep live edits, manually port them to the template source
+chezmoi edit ~/.zshrc          # opens dot_zshrc.tmpl
+# manually copy your live changes in, save
+chezmoi apply ~/.zshrc
+
+# Option C: interactive 3-way merge between source/target/destination
+chezmoi merge ~/.zshrc         # opens vimdiff (or whatever merge.command is)
+```
+
+For the merge tool, our chezmoi config doesn't override merge.command, so
+it uses the default: `vimdiff`. Three buffers: source-rendered, current
+target, your local destination. Resolve, save, exit.
+
+### Templated files vs plain files at-a-glance
+
+| Source filename | What `chezmoi edit` does | Can `chezmoi re-add` propagate live edits? |
+|---|---|---|
+| `dot_bashrc` (plain) | Opens source in editor | ✅ Yes |
+| `dot_zshrc.tmpl` (templated) | Opens .tmpl source in editor | ❌ No — silently skipped |
+| `private_dot_gitconfig.tmpl` (templated) | Opens .tmpl in editor | ❌ No |
+| `encrypted_private_dot_zshenv.private.age` | Decrypts, opens, re-encrypts | N/A — use `chezmoi edit` |
+| `dot_tmate.conf.tmpl` (op://) | Opens .tmpl with op:// reference visible | ❌ No |
+
+Bottom line: **`chezmoi edit --apply` works for everything; `re-add`
+only works for plain files.** When in doubt, use `chezmoi edit`.
+
+### Convenient alias
+
+If you edit managed files often, add to `~/.zshrc`:
+
+```sh
+alias ce='chezmoi edit --apply'
+# Then: ce ~/.zshrc
 ```
 
 ---
@@ -842,8 +914,18 @@ Is it auto-generated by another tool (logs, caches, lock files)?
 ```
 Did I edit the source file or the live file?
 ├── Source file (~/.local/share/chezmoi/...) → chezmoi apply
-└── Live file (~/...) → chezmoi re-add ~/path
+└── Live file (~/...)
+    │
+    ├── Is it a templated file (source filename ends in .tmpl)?
+    │   ├── Yes → chezmoi re-add silently skips it.
+    │   │       Either: chezmoi apply --force (discard live edits)
+    │   │       Or:     manually port to template via chezmoi edit
+    │   │       Or:     chezmoi merge ~/path (3-way interactive)
+    │   └── No  → chezmoi re-add ~/path (mirrors live to source)
 ```
+
+Quick check: `chezmoi source-path ~/path` shows the source filename. If
+it ends in `.tmpl`, it's templated.
 
 ---
 
