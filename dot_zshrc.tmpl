@@ -291,6 +291,10 @@ _chezmoi_drift_check() {
   local git_bin="${commands[git]:-/usr/bin/git}"
   local chezmoi_bin="${commands[chezmoi]}"
   local shasum_bin="${commands[shasum]:-/usr/bin/shasum}"
+  # Claim the 60s throttle window in the parent shell so subsequent precmd
+  # invocations short-circuit while this one is still running. Without this,
+  # a cold cache spawns one bg subshell per prompt until the first finishes.
+  : >| "$result"
   ( local drifted="" applied_mt applied_hash path source_dir
     local -A s
     # Glyph ~ : three-stage check, all local & TTY-free.
@@ -435,7 +439,13 @@ precmd_functions+=(_chezmoi_drift_check _chezmoi_remote_fetch)
 #      `*`/`⇡`/`⇣` from the current source-repo state. No snapshot, since
 #      these commands don't tell us anything about live-file freshness.
 chezmoi() {
-  local cmd="$1"
+  # Find the subcommand by skipping any leading global flags
+  # (`chezmoi -v apply`, `chezmoi --color=auto apply`, etc.). Using $1
+  # naively would put the flag in $cmd and fall through to the *) case.
+  local cmd="" a
+  for a in "$@"; do
+    [[ "$a" != -* ]] && { cmd="$a"; break }
+  done
   command chezmoi "$@"
   local rc=$?
   case "$cmd" in
@@ -470,26 +480,25 @@ chezmoi() {
 # Recovery if this function breaks:  \nvim $(chezmoi source-path ~/.zshrc)
 nvim() {
   [[ -n "$CHEZMOI_EDIT" ]] && { command nvim "$@"; return }
-  local arg
+  local arg abs
+  local -a managed_args=()
   for arg in "$@"; do
     [[ "$arg" == "-R" || "$arg" == "-r" ]] && { command nvim "$@"; return }
   done
   for arg in "$@"; do
     [[ "$arg" == -* || ! -e "$arg" ]] && continue
-    local abs; abs="${arg:A}"
+    abs="${arg:A}"
     [[ "$abs" == "$HOME/.local/share/chezmoi/"* ]] && continue
-    if chezmoi source-path "$abs" >/dev/null 2>&1; then
-      print -u2 "[chezmoi] managed file — opening source via 'chezmoi edit --apply'"
-      # Route through the chezmoi() wrapper (no `command`) so the post-edit
-      # case-statement fires _chezmoi_record_mtimes. Without this, the live
-      # file's new mtime drifts past the stale snapshot and the throttled
-      # precmd check leaves a phantom `~` in the prompt for up to 60s.
-      # Recursion is still safe: CHEZMOI_EDIT=1 makes chezmoi's nested
-      # editor invocation skip our nvim() wrapper.
-      CHEZMOI_EDIT=1 chezmoi edit --apply "$abs"
-      return $?
-    fi
+    chezmoi source-path "$abs" >/dev/null 2>&1 && managed_args+=("$abs")
   done
+  # Route ALL managed args through one `chezmoi edit --apply` call rather
+  # than only the first one. Mixing managed and unmanaged args is rare; if
+  # any are managed we use chezmoi edit, otherwise plain nvim.
+  if (( ${#managed_args} )); then
+    print -u2 "[chezmoi] managed file(s) — opening source via 'chezmoi edit --apply'"
+    CHEZMOI_EDIT=1 chezmoi edit --apply "${managed_args[@]}"
+    return $?
+  fi
   command nvim "$@"
 }
 
