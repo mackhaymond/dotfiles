@@ -19,24 +19,51 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { execSync } from "node:child_process"
+import { realpathSync } from "node:fs"
+import { resolve } from "node:path"
 
 const TTL_MS = 5 * 60 * 1000
 let managed = new Set<string>()
+let loaded = false
 let lastLoad = 0
 
+// Normalize an arbitrary path string the agent passed (relative, ~-prefixed,
+// containing /./ or symlinks) into a canonical absolute path. We compare
+// canonical paths on both sides so equivalence-bypasses (e.g. `./.zshrc`,
+// `/Users/me/./.zshrc`, or a symlink alias of a managed file) don't slip past.
+function normalizePath(p: string): string {
+  const home = process.env.HOME ?? ""
+  const expanded = p.startsWith("~/") ? home + p.slice(1) : p === "~" ? home : p
+  const absolute = resolve(expanded)
+  try {
+    return realpathSync(absolute)
+  } catch {
+    return absolute
+  }
+}
+
 function refresh(): void {
-  if (Date.now() - lastLoad < TTL_MS && managed.size > 0) return
+  // Honor TTL on success AND failure — without this, a hung/erroring chezmoi
+  // makes every blocked tool call pay the 3s timeout sequentially.
+  if (loaded && Date.now() - lastLoad < TTL_MS) return
   try {
     const out = execSync("chezmoi managed --path-style absolute", {
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "ignore"],
       timeout: 3000,
     })
-    managed = new Set(out.trim().split("\n").filter(Boolean))
-    lastLoad = Date.now()
+    managed = new Set(
+      out
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map(normalizePath),
+    )
+    loaded = true
   } catch {
     // Stale cache is better than no cache. Plugin must never crash opencode.
   }
+  lastLoad = Date.now()
 }
 
 const BLOCKED_TOOLS = new Set(["edit", "write", "apply_patch", "multiedit"])
@@ -62,7 +89,8 @@ export const ChezmoiGuard: Plugin = async () => {
       if (!BLOCKED_TOOLS.has(input.tool)) return
       refresh()
       const paths = pathsFromArgs(input.tool, output.args)
-      for (const p of paths) {
+      for (const raw of paths) {
+        const p = normalizePath(raw)
         if (managed.has(p)) {
           throw new Error(
             `[chezmoi-guard] ${p} is chezmoi-managed.\n` +
