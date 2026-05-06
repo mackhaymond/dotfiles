@@ -69,7 +69,16 @@ export const ChezmoiGuard: Plugin = async () => {
               `Edit the source instead:\n` +
               `  chezmoi edit --apply ${p}\n` +
               `or open the source file directly:\n` +
-              `  $(chezmoi source-path ${p})`,
+              `  $(chezmoi source-path ${p})\n` +
+              `\n` +
+              `When ALL your edits are complete (end of the entire task):\n` +
+              `  1. Ensure changes are applied (run \`chezmoi apply\` if you\n` +
+              `     edited source files without --apply).\n` +
+              `  2. Ask the user whether to commit & push the chezmoi repo\n` +
+              `     changes.\n` +
+              `\n` +
+              `Do NOT commit or push yourself. The user always commits dotfile\n` +
+              `changes themselves once the entire change is done.`,
           )
         }
       }
