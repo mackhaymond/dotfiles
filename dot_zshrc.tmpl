@@ -193,11 +193,21 @@ yytmux() {
 # in ~/.cache/chezmoi-drift/state and is read by the starship segment.
 #
 # State file format: concatenated Pure-style glyphs. Empty = clean.
-#   ~ = managed live file modified after last `chezmoi apply` (mtime drift)
+#   ~ = managed live file actually differs from chezmoi source     (verified)
 #   * = chezmoi source repo has uncommitted git changes        (Pure: dirty)
 #   ⇡ = chezmoi source repo has commits not pushed to remote   (Pure: ahead)
 #   ⇣ = chezmoi source repo is behind its remote (pull needed) (Pure: behind)
 # Example state contents: "~*⇣" = drift + uncommitted + behind remote.
+#
+# `~` detection is three-stage and local-only (no `chezmoi verify`,
+# which would need a TTY for 1Password ops):
+#   1. Cheap mtime scan finds candidates (early-exit on first hit).
+#   2. Content-hash check: if mtime newer but sha256 matches snapshot,
+#      it was just touched — auto-heal the snapshot, don't flag.
+#   3. Provenance check: if hash differs too, compare snapshot mtime to
+#      `chezmoi`'s state DB. State DB newer ⇒ chezmoi applied from a
+#      wrapper-less shell, trust live and refresh. Otherwise it's real
+#      user-side drift → flag `~`.
 #
 # B detection requires fresh remote refs. `_chezmoi_remote_fetch` runs
 # from precmd at most once per 15 minutes and does a quiet `git fetch`
@@ -215,19 +225,49 @@ yytmux() {
 #     last successful fetch's snapshot of upstream.
 zmodload -F zsh/stat b:zstat 2>/dev/null
 zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
+# zsh builtin mkdir/rm work in `&!` subshells where the command-hash table
+# is empty and `mkdir`/`rm` from /usr/bin would otherwise be "not found".
+zmodload -F zsh/files b:mkdir b:rm 2>/dev/null
 
+# Snapshot a `<mtime> <sha256> <abspath>` line per managed file.
+# Accepts an optional pre-resolved chezmoi binary path so it works inside
+# `&!` subshells (which lose the command-hash table).
 _chezmoi_record_mtimes() {
-  (( ${+commands[chezmoi]} )) || return 0
+  local chezmoi_bin="${1:-${commands[chezmoi]}}"
+  [[ -x "$chezmoi_bin" ]] || return 0
   local cache="$HOME/.cache/chezmoi"
   local applied="$cache/applied-mtimes"
   mkdir -p "$cache"
-  local -A s
-  local f lines=()
+  local -a files=()
+  local f
   while IFS= read -r f; do
-    [[ -f "$f" ]] || continue
+    [[ -f "$f" ]] && files+=("$f")
+  done < <("$chezmoi_bin" managed --include=files --path-style absolute 2>/dev/null)
+  if (( ${#files} == 0 )); then
+    : >| "$applied"
+    rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
+    return 0
+  fi
+  # Batch hash via xargs (~40ms for 145 small files vs ~700ms per-file).
+  # Null-delimited so paths with spaces work. Use absolute paths because
+  # this function may be called from `&!` subshells where the command hash
+  # is empty (`command shasum` fails despite shasum being on PATH).
+  local shasum_bin="${commands[shasum]:-/usr/bin/shasum}"
+  local xargs_bin="${commands[xargs]:-/usr/bin/xargs}"
+  local -A hashes
+  local line h p
+  while IFS= read -r line; do
+    h="${line%% *}"        # hash = everything before first space
+    p="${line#${h}  }"     # path = everything after "<hash>  " (two spaces)
+    [[ -n "$h" && -n "$p" ]] && hashes[$p]="$h"
+  done < <(printf '%s\0' "${files[@]}" | "$xargs_bin" -0 "$shasum_bin" -a 256 2>/dev/null)
+  local -A s
+  local -a lines=()
+  for f in "${files[@]}"; do
+    [[ -n "${hashes[$f]}" ]] || continue
     zstat -L -H s +mtime "$f" 2>/dev/null || continue
-    lines+=("${s[mtime]} $f")
-  done < <(command chezmoi managed --include=files --path-style absolute 2>/dev/null)
+    lines+=("${s[mtime]} ${hashes[$f]} $f")
+  done
   print -l -- "${lines[@]}" >| "$applied"
   rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
 }
@@ -246,18 +286,75 @@ _chezmoi_drift_check() {
     (( age < max_age )) && return 0
   fi
   # Pre-resolve binary paths in the parent shell. The `&!` subshell loses
-  # the command hash table, so `command git` fails with "command not found"
+  # the command hash table, so `command FOO` fails with "command not found"
   # even when PATH is intact. Resolved absolute paths inherit cleanly.
   local git_bin="${commands[git]:-/usr/bin/git}"
   local chezmoi_bin="${commands[chezmoi]}"
-  ( local drifted="" applied_mt path source_dir
+  local shasum_bin="${commands[shasum]:-/usr/bin/shasum}"
+  ( local drifted="" applied_mt applied_hash path source_dir
     local -A s
-    # Glyph ~ : managed live file mtime > last-apply snapshot.
-    while IFS=' ' read -r applied_mt path; do
+    # Glyph ~ : three-stage check, all local & TTY-free.
+    #
+    #   Stage 1 (cheap): scan live mtimes against snapshot. Stop at first
+    #     hit. If nothing's newer than the snapshot, we're clean.
+    #
+    #   Stage 2 (content): if mtime hint, hash that one live file and
+    #     compare to its snapshotted hash. If hashes match, the file was
+    #     touched (editor save, etc.) but content is unchanged → refresh
+    #     mtimes and don't flag.
+    #
+    #   Stage 3 (provenance): if hashes differ, the live file's bytes are
+    #     not what we last snapshotted. Either the user edited live (real
+    #     drift → ~) or chezmoi applied from a wrapper-less shell since
+    #     our snapshot (snapshot is stale → refresh). Distinguish by
+    #     comparing chezmoi's state DB mtime to ours: state DB newer than
+    #     snapshot ⇒ chezmoi ran ⇒ trust the system, refresh.
+    #
+    # We avoid `chezmoi verify` because it templates every managed file,
+    # and op:// reads need a TTY for 1Password auth. In a detached `&!`
+    # subshell those calls fail and verify falsely reports drift.
+    local mtime_hit_path="" mtime_hit_snap_hash=""
+    while IFS=' ' read -r applied_mt applied_hash path; do
       [[ -f "$path" ]] || continue
       zstat -L -H s +mtime "$path" 2>/dev/null || continue
-      if (( ${s[mtime]:-0} > applied_mt )); then drifted+="~"; break; fi
+      if (( ${s[mtime]:-0} > applied_mt )); then
+        mtime_hit_path="$path"
+        mtime_hit_snap_hash="$applied_hash"
+        break
+      fi
     done < "$applied"
+    if [[ -n "$mtime_hit_path" ]]; then
+      # shasum prints "<hash>  <path>". Strip via zsh expansion (no awk —
+      # awk fails the same way `command git` does in this `&!` subshell).
+      local cur_hash_raw="$("$shasum_bin" -a 256 "$mtime_hit_path" 2>/dev/null)"
+      local cur_hash="${cur_hash_raw%% *}"
+      if [[ -n "$cur_hash" && "$cur_hash" == "$mtime_hit_snap_hash" ]]; then
+        # Stage 2 win — touched but unchanged. Refresh snapshot.
+        _chezmoi_record_mtimes "$chezmoi_bin"
+      else
+        # Stage 3 — content differs. Did chezmoi apply since our snapshot?
+        local snap_mt=0 db_mt=0
+        zstat -L -H s +mtime "$applied" 2>/dev/null && snap_mt=${s[mtime]:-0}
+        local state_db=""
+        for state_db in \
+          "$HOME/.config/chezmoi/chezmoistate.boltdb" \
+          "$HOME/.local/share/chezmoi/.chezmoistate" \
+          "$HOME/Library/Application Support/chezmoi/chezmoistate.boltdb"; do
+          [[ -f "$state_db" ]] && break
+          state_db=""
+        done
+        if [[ -n "$state_db" ]]; then
+          zstat -L -H s +mtime "$state_db" 2>/dev/null && db_mt=${s[mtime]:-0}
+        fi
+        if (( db_mt > snap_mt )); then
+          # chezmoi ran outside the wrapper since our last snapshot.
+          # Trust live state, resnapshot.
+          _chezmoi_record_mtimes "$chezmoi_bin"
+        else
+          drifted+="~"
+        fi
+      fi
+    fi
     # Glyphs * / ⇡ / ⇣ : git state of the chezmoi source repo.
     # We avoid invoking `chezmoi source-path` (slow, boots templater) and
     # use the canonical XDG default with a one-shot fallback.
