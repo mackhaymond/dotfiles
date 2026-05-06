@@ -10,8 +10,8 @@
       "variant": "xhigh"
     },
     "oracle": {
-      "model": "google/gemini-3.1-pro-preview",
-      "variant": "high"
+      "model": "anthropic/claude-opus-4-7",
+      "variant": "xhigh"
     },
     "librarian": {
       "model": "anthropic/claude-haiku-4-5"
