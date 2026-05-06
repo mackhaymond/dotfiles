@@ -383,7 +383,13 @@ nvim() {
     [[ "$abs" == "$HOME/.local/share/chezmoi/"* ]] && continue
     if chezmoi source-path "$abs" >/dev/null 2>&1; then
       print -u2 "[chezmoi] managed file — opening source via 'chezmoi edit --apply'"
-      CHEZMOI_EDIT=1 command chezmoi edit --apply "$abs"
+      # Route through the chezmoi() wrapper (no `command`) so the post-edit
+      # case-statement fires _chezmoi_record_mtimes. Without this, the live
+      # file's new mtime drifts past the stale snapshot and the throttled
+      # precmd check leaves a phantom `~` in the prompt for up to 60s.
+      # Recursion is still safe: CHEZMOI_EDIT=1 makes chezmoi's nested
+      # editor invocation skip our nvim() wrapper.
+      CHEZMOI_EDIT=1 chezmoi edit --apply "$abs"
       return $?
     fi
   done
