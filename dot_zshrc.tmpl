@@ -192,6 +192,17 @@ yytmux() {
 # no PATH lookup, no op:// reads → no 1Password prompts). Result lives
 # in ~/.cache/chezmoi-drift/state and is read by the starship segment.
 #
+# State file format: concatenated Pure-style glyphs. Empty = clean.
+#   ~ = managed live file modified after last `chezmoi apply` (mtime drift)
+#   * = chezmoi source repo has uncommitted git changes        (Pure: dirty)
+#   ⇡ = chezmoi source repo has commits not pushed to remote   (Pure: ahead)
+#   ⇣ = chezmoi source repo is behind its remote (pull needed) (Pure: behind)
+# Example state contents: "~*⇣" = drift + uncommitted + behind remote.
+#
+# B detection requires fresh remote refs. `_chezmoi_remote_fetch` runs
+# from precmd at most once per 15 minutes and does a quiet `git fetch`
+# in the background. Disable with: `export CHEZMOI_DRIFT_NO_FETCH=1`.
+#
 # Edge cases:
 #   - False positive: user/app `touch`es a file; `chezmoi diff` confirms.
 #   - False negative: tool overwrites content while preserving mtime
@@ -199,6 +210,9 @@ yytmux() {
 #   - Targeted `chezmoi apply ~/.foo` from outside a shell wrapping
 #     chezmoi (e.g. cron) won't refresh the cache — but the user runs
 #     chezmoi from this shell exclusively.
+#   - No upstream branch on source repo → P/B silently skipped (not flagged).
+#   - Network down / auth required → fetch fails silently, B reflects
+#     last successful fetch's snapshot of upstream.
 zmodload -F zsh/stat b:zstat 2>/dev/null
 zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
 
@@ -231,27 +245,123 @@ _chezmoi_drift_check() {
     local age=$(( EPOCHSECONDS - ${s[mtime]:-0} ))
     (( age < max_age )) && return 0
   fi
-  ( local drifted="" applied_mt path
+  # Pre-resolve binary paths in the parent shell. The `&!` subshell loses
+  # the command hash table, so `command git` fails with "command not found"
+  # even when PATH is intact. Resolved absolute paths inherit cleanly.
+  local git_bin="${commands[git]:-/usr/bin/git}"
+  local chezmoi_bin="${commands[chezmoi]}"
+  ( local drifted="" applied_mt path source_dir
     local -A s
+    # Glyph ~ : managed live file mtime > last-apply snapshot.
     while IFS=' ' read -r applied_mt path; do
       [[ -f "$path" ]] || continue
       zstat -L -H s +mtime "$path" 2>/dev/null || continue
-      if (( ${s[mtime]:-0} > applied_mt )); then drifted="M"; break; fi
+      if (( ${s[mtime]:-0} > applied_mt )); then drifted+="~"; break; fi
     done < "$applied"
+    # Glyphs * / ⇡ / ⇣ : git state of the chezmoi source repo.
+    # We avoid invoking `chezmoi source-path` (slow, boots templater) and
+    # use the canonical XDG default with a one-shot fallback.
+    source_dir="$HOME/.local/share/chezmoi"
+    [[ -d "$source_dir/.git" ]] || source_dir=$("$chezmoi_bin" source-path 2>/dev/null)
+    if [[ -d "$source_dir/.git" ]]; then
+      # Uncommitted: any staged/unstaged/untracked change → Pure '*'.
+      if [[ -n "$("$git_bin" -C "$source_dir" status --porcelain 2>/dev/null)" ]]; then
+        drifted+="*"
+      fi
+      # Ahead/behind upstream → Pure '⇡' / '⇣'. Skip cleanly if no upstream.
+      # ⇣ uses local-only ref comparison; freshness depends on the periodic
+      # _chezmoi_remote_fetch hook below.
+      if "$git_bin" -C "$source_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+        if [[ -n "$("$git_bin" -C "$source_dir" rev-list '@{u}..HEAD' 2>/dev/null)" ]]; then
+          drifted+="⇡"
+        fi
+        if [[ -n "$("$git_bin" -C "$source_dir" rev-list 'HEAD..@{u}' 2>/dev/null)" ]]; then
+          drifted+="⇣"
+        fi
+      fi
+    fi
     print -n "$drifted" >| "$result"
   ) &!
 }
-typeset -ga precmd_functions
-precmd_functions+=(_chezmoi_drift_check)
 
-# Wrap chezmoi to refresh the drift snapshot after write-class commands.
-# Read-only commands (diff/status/cat/managed/etc.) pass through unchanged.
+# Background fetch of the chezmoi source remote so the B flag in
+# _chezmoi_drift_check stays fresh. Runs at most once per 15 minutes,
+# fully detached. Failures (offline, auth required, network slow) are
+# silent — we just keep the last successful refs.
+_chezmoi_remote_fetch() {
+  (( ${+commands[chezmoi]} )) || return 0
+  [[ -z "$CHEZMOI_DRIFT_NO_FETCH" ]] || return 0
+  local fetch_cache="$HOME/.cache/chezmoi/last-fetch"
+  local max_age=900  # 15 min
+  if [[ -f "$fetch_cache" ]]; then
+    local -A s; zstat -L -H s +mtime "$fetch_cache" 2>/dev/null
+    local age=$(( EPOCHSECONDS - ${s[mtime]:-0} ))
+    (( age < max_age )) && return 0
+  fi
+  # Touch the marker NOW (parent shell) so we don't queue many
+  # concurrent fetches if precmd fires repeatedly while one is in flight.
+  mkdir -p "${fetch_cache:h}" && : >| "$fetch_cache"
+  local git_bin="${commands[git]:-/usr/bin/git}"
+  local chezmoi_bin="${commands[chezmoi]}"
+  ( local source_dir="$HOME/.local/share/chezmoi"
+    [[ -d "$source_dir/.git" ]] || source_dir=$("$chezmoi_bin" source-path 2>/dev/null)
+    [[ -d "$source_dir/.git" ]] || return
+    "$git_bin" -C "$source_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' \
+      >/dev/null 2>&1 || return
+    "$git_bin" -C "$source_dir" fetch --quiet --no-tags --prune 2>/dev/null
+  ) &!
+}
+
+typeset -ga precmd_functions
+precmd_functions+=(_chezmoi_drift_check _chezmoi_remote_fetch)
+
+# Wrap chezmoi to keep the drift indicator in sync with reality. Each
+# subcommand falls into one of three buckets:
+#
+#   1. Write-class — apply/update/init/merge/edit/import/destroy/re-add,
+#      and the source-mutating add/forget/chattr/git/state. These all
+#      change either live files, the source repo, or both. We resnapshot
+#      mtimes synchronously so `~` clears immediately.
+#
+#   2. Verify-class — `verify` returns rc=0 iff every managed live file
+#      matches its source. If clean, resnapshot. Otherwise just invalidate
+#      the cache so the next precmd reflects real drift in `~`.
+#
+#   3. Diff — same intent as verify, but `chezmoi diff` returns 0 even
+#      when there ARE differences. Run `verify` after the diff to get the
+#      authoritative cleanliness signal, then snapshot or invalidate.
+#      This is what fixes the "ran diff, no issues, but ~ still showed"
+#      false-positive: an editor `touch` that didn't change content.
+#
+#   4. Everything else (read-only: cat/managed/dump/data/doctor/...): we
+#      just invalidate the drift cache so the next precmd recomputes
+#      `*`/`⇡`/`⇣` from the current source-repo state. No snapshot, since
+#      these commands don't tell us anything about live-file freshness.
 chezmoi() {
   local cmd="$1"
   command chezmoi "$@"
   local rc=$?
   case "$cmd" in
-    apply|update|init|merge|edit|import|destroy|re-add) _chezmoi_record_mtimes ;;
+    apply|update|init|merge|edit|import|destroy|re-add|add|forget|chattr|git|state)
+      _chezmoi_record_mtimes
+      ;;
+    verify)
+      if (( rc == 0 )); then
+        _chezmoi_record_mtimes
+      else
+        rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
+      fi
+      ;;
+    diff)
+      if (( rc == 0 )) && command chezmoi verify >/dev/null 2>&1; then
+        _chezmoi_record_mtimes
+      else
+        rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
+      fi
+      ;;
+    *)
+      rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
+      ;;
   esac
   return $rc
 }
