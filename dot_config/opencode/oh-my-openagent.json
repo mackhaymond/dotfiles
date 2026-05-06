@@ -3,33 +3,21 @@
   "agents": {
     "sisyphus": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh",
-      "skills": [
-        "caveman"
-      ]
+      "variant": "xhigh"
     },
     "hephaestus": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh",
-      "skills": [
-        "caveman"
-      ]
+      "variant": "xhigh"
     },
     "oracle": {
       "model": "google/gemini-3.1-pro-preview",
       "variant": "high"
     },
     "librarian": {
-      "model": "anthropic/claude-haiku-4-5",
-      "skills": [
-        "caveman"
-      ]
+      "model": "anthropic/claude-haiku-4-5"
     },
     "explore": {
-      "model": "anthropic/claude-haiku-4-5",
-      "skills": [
-        "caveman"
-      ]
+      "model": "anthropic/claude-haiku-4-5"
     },
     "multimodal-looker": {
       "model": "google/gemini-3-flash-preview"
@@ -40,10 +28,7 @@
     },
     "metis": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh",
-      "skills": [
-        "caveman"
-      ]
+      "variant": "xhigh"
     },
     "momus": {
       "model": "anthropic/claude-opus-4-7",
@@ -51,32 +36,20 @@
     },
     "atlas": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh",
-      "skills": [
-        "caveman"
-      ]
+      "variant": "xhigh"
     },
     "sisyphus-junior": {
-      "model": "anthropic/claude-sonnet-4-6",
-      "skills": [
-        "caveman"
-      ]
+      "model": "anthropic/claude-sonnet-4-6"
     },
     "build": {
-      "model": "anthropic/claude-sonnet-4-6",
-      "skills": [
-        "caveman"
-      ]
+      "model": "anthropic/claude-sonnet-4-6"
     },
     "plan": {
       "model": "anthropic/claude-opus-4-7",
       "variant": "xhigh"
     },
     "OpenCode-Builder": {
-      "model": "anthropic/claude-sonnet-4-6",
-      "skills": [
-        "caveman"
-      ]
+      "model": "anthropic/claude-sonnet-4-6"
     }
   },
   "categories": {
