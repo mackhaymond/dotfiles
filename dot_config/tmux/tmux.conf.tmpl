@@ -1,10 +1,9 @@
-set-environment -g PATH "{{ .homebrew_prefix }}/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-
-# Spawn login shells so .zprofile re-populates the user PATH (bob/nvim-bin,
-# pyenv, cargo, bun, etc.). Without this, the minimal PATH set above sticks
-# for every pane and child process — opencode's "open prompt in $EDITOR"
-# breaks because cross-spawn can't find `nvim` on PATH.
-set -g default-command "${SHELL} -l"
+# Baseline PATH for every process tmux spawns (panes, popups, run-shell,
+# and anything those launch in turn — including non-shell processes like
+# opencode that exec children directly). Login-shell zsh further extends
+# this via .zprofile, but non-shell child processes only see what's here.
+# Keep this list aligned with the must-have tool dirs from .zprofile.
+set-environment -g PATH "$HOME/.local/share/bob/nvim-bin:$HOME/.pyenv/shims:$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.local/bin:{{ .homebrew_prefix }}/bin:{{ .homebrew_prefix }}/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 setw -g mode-keys vi
 
