@@ -37,17 +37,34 @@ Otherwise default to ASK and stop.
 
 The `chezmoi-guard` plugin refuses `bash` commits/pushes targeting the
 chezmoi source repo by default. To run a commit the user has explicitly
-approved you must mint a **single-use nonce** via the `chezmoi-approve-commit`
-zsh helper (defined in `dot_zshrc.tmpl`) and pass it as `CHEZMOI_COMMIT_OK`:
+approved, use the **two-call escape hatch**:
 
 ```bash
-CHEZMOI_COMMIT_OK=$(chezmoi-approve-commit) git -C ~/.local/share/chezmoi commit -m "..."
-CHEZMOI_COMMIT_OK=$(chezmoi-approve-commit) git -C ~/.local/share/chezmoi push
+# Call 1 — mint a single-use approval token (writes ~/.cache/chezmoi-guard/approve-nonce)
+chezmoi-approve-commit
+
+# Call 2 — commit (in a SEPARATE bash invocation)
+CHEZMOI_COMMIT_OK=approved git -C ~/.local/share/chezmoi commit -m "..."
+CHEZMOI_COMMIT_OK=approved git -C ~/.local/share/chezmoi push
 ```
 
-The nonce is **deleted on first match**. A second commit/push needs a
-fresh nonce — re-run the helper. This forces each commit to be a deliberate
-code path, not a side-effect of a previously-granted blanket approval.
+`chezmoi-approve-commit` is a script at `~/.local/bin/chezmoi-approve-commit`
+(rendered from `dot_local/bin/executable_chezmoi-approve-commit`). It works
+in any shell; a function-based helper would not, because non-interactive
+shells skip `~/.zshrc` and the agent's bash never sees it.
+
+The plugin validates approval by **file presence + 5-min TTL**, not by
+matching the value of `CHEZMOI_COMMIT_OK`. The value is opaque — any
+non-whitespace token works as the attestation prefix. Within the 5-min
+window, the same approval covers any number of commits/pushes; after
+expiry the agent must run `chezmoi-approve-commit` again.
+
+Why two calls (not one): the plugin inspects the literal bash command
+string BEFORE shell expansion, so a one-liner like
+`CHEZMOI_COMMIT_OK=$(chezmoi-approve-commit) git commit` would only show
+the plugin `$(chezmoi-approve-commit)` as text — never the actual nonce,
+and the nonce file wouldn't exist yet anyway. Two calls is enforced by
+the architecture.
 
 Use this ONLY when you have direct, explicit user approval for THIS specific
 commit/push. Minting a nonce IS a security action; doing so without the
@@ -58,28 +75,29 @@ user's go-ahead is a hard-rule violation.
 Regex (in `dot_config/opencode/plugins/chezmoi-guard.ts` — keep in sync):
 
 ```
-^\s*(?:(?!CHEZMOI_COMMIT_OK=)(?:export\s+)?[A-Za-z_]\w*=\S*\s*[;&]*\s+)*CHEZMOI_COMMIT_OK=([0-9a-fA-F]{8,})\s+
+^\s*(?:(?!CHEZMOI_COMMIT_OK=)(?:export\s+)?[A-Za-z_]\w*=\S*\s*[;&]*\s+)*CHEZMOI_COMMIT_OK=\S+\s+
 ```
 
-- `CHEZMOI_COMMIT_OK=<nonce>` must be the first non-preamble token. **Preamble**
-  = leading env-var assignments (e.g. `CI=true`, `GIT_TERMINAL_PROMPT=0`)
-  optionally with `export` and chained by `;`/`&&`. So all of these work:
+- `CHEZMOI_COMMIT_OK=<value>` must be the first non-preamble token.
+  **Preamble** = leading env-var assignments (e.g. `CI=true`,
+  `GIT_TERMINAL_PROMPT=0`) optionally with `export` and chained by
+  `;`/`&&`. So all of these work in call 2:
   ```
-  CHEZMOI_COMMIT_OK=$(chezmoi-approve-commit) git -C ~/.local/share/chezmoi commit -m "..."
-  CI=true CHEZMOI_COMMIT_OK=$N git ... commit          # where N is your fresh nonce
-  export CI=true && CHEZMOI_COMMIT_OK=$N git ... commit
+  CHEZMOI_COMMIT_OK=approved git -C ~/.local/share/chezmoi commit -m "..."
+  CI=true CHEZMOI_COMMIT_OK=approved git ... commit
+  export CI=true && CHEZMOI_COMMIT_OK=approved git ... commit
   ```
-  But `cat foo ; CHEZMOI_COMMIT_OK=$N git commit` does NOT (the leading
-  `cat` is a real command, not preamble). Split into separate bash
-  invocations or restructure.
-- Nonce shape: `[0-9a-fA-F]{8,}` (≥8 hex chars). The helper mints 32-char
-  hex (16 bytes from `openssl rand`). Authoritative check is byte-equal
-  compare against `~/.cache/chezmoi-guard/approve-nonce`.
-- TTL: 5 minutes from helper invocation. Stale nonces are rejected and
-  cleaned up — keep approval and commit close in time.
-- `CHEZMOI_COMMIT_OK=<nonce>` appearing inside a quoted string (e.g. a
-  commit message that mentions this feature) does NOT trigger the bypass —
-  by design, so documenting the feature can't accidentally enable it.
+  But `cat foo ; CHEZMOI_COMMIT_OK=approved git commit` does NOT (the
+  leading `cat` is a real command, not preamble). Split into separate
+  bash invocations or restructure.
+- Value: any non-whitespace string. The plugin doesn't compare it to the
+  file contents — file existence + TTL is the authority.
+- TTL: 5 minutes from the `chezmoi-approve-commit` invocation. Stale
+  approvals are rejected and the file cleaned up. Within the window,
+  multiple commits/pushes are allowed under the same approval.
+- `CHEZMOI_COMMIT_OK=...` appearing inside a quoted string (e.g. a commit
+  message that mentions this feature) does NOT trigger the bypass — by
+  design, so documenting the feature can't accidentally enable it.
 
 #### What the plugin checks for commit attempts
 

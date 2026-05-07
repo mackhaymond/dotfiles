@@ -23,7 +23,7 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { execSync } from "node:child_process"
-import { readFileSync, realpathSync, statSync, unlinkSync } from "node:fs"
+import { realpathSync, statSync, unlinkSync } from "node:fs"
 import { resolve } from "node:path"
 
 const TTL_MS = 5 * 60 * 1000
@@ -120,54 +120,41 @@ function bashWorkdirFromArgs(args: any): string | undefined {
   return undefined
 }
 
-// One-shot nonce escape hatch. Replaces the previous fixed `=1` attestation
-// with a per-commit, file-backed nonce that the user-facing helper
-// `chezmoi-approve-commit` (defined in dot_zshrc.tmpl) generates. Each
-// successful bypass DELETES the nonce file, so a stale nonce can't be
-// reused for a follow-up commit/push without an explicit fresh approval.
+// File-backed approval token escape hatch. Two-call flow:
 //
-// Threat model: the previous `=1` attestation gave one-blanket-approval-
-// per-session. An agent that interpreted "go ahead" too broadly would happily
-// fire ten commits off the same approval. The nonce flow forces the agent
-// to ALSO regenerate the token (which is at minimum a deliberate step in
-// agent code, not an inherited blanket).
+//   call 1:  chezmoi-approve-commit          (creates the file)
+//   call 2:  CHEZMOI_COMMIT_OK=<any-value> git -C <chezmoi-src> commit -m "..."
 //
-// File: ~/.cache/chezmoi-guard/approve-nonce — contents = hex nonce, mtime
-// = creation time. TTL = NONCE_TTL_MS. Stale nonces are deleted on
-// inspection, mirroring single-use semantics.
+// The plugin sees the literal bash command BEFORE shell expansion, so a
+// one-call form like `CHEZMOI_COMMIT_OK=$(chezmoi-approve-commit) git ...`
+// can't be validated — the regex would only see `$(chezmoi-approve-commit)`
+// as text. Two calls are required by design.
+//
+// Validation = file existence + recent mtime. The value passed to
+// CHEZMOI_COMMIT_OK is opaque; the file is the authority. The env-var
+// prefix is a structural attestation ("I'm intentionally bypassing the
+// guard"). Within the TTL window, the same approval covers any number
+// of commits/pushes — the user's threat model is "no commits without
+// permission", not "one commit per permission".
+//
+// Threat model: a careless agent that interprets "go ahead" too broadly
+// would still have to FIRST run chezmoi-approve-commit before any commit
+// can land. An adversarial agent can mint approvals themselves (the
+// helper is just a shell script); out of scope per the plugin's
+// "best-effort, not a sandbox" framing.
 const NONCE_FILE = `${process.env.HOME ?? ""}/.cache/chezmoi-guard/approve-nonce`
 const NONCE_TTL_MS = 5 * 60 * 1000
 
 function tryConsumeBypassNonce(cmd: string): boolean {
-  const m = COMMIT_OK_RE.exec(cmd)
-  if (!m) return false
-  const provided = m[1]
-  let stored: string
+  if (!COMMIT_OK_RE.test(cmd)) return false
   let ageMs: number
   try {
-    stored = readFileSync(NONCE_FILE, "utf-8").trim()
     ageMs = Date.now() - statSync(NONCE_FILE).mtimeMs
   } catch {
     return false
   }
-  if (!stored) return false
-  if (stored !== provided) return false
   if (ageMs > NONCE_TTL_MS) {
-    // Stale: agent generated the nonce but didn't use it within TTL.
-    // Clean up so future bypasses must mint a fresh nonce. Cleanup
-    // failure here is fine to swallow — return value is false either way.
     try { unlinkSync(NONCE_FILE) } catch { /* idempotent */ }
-    return false
-  }
-  // Race-tight consume: two parallel tool calls could both reach this
-  // point with a valid file. The atomic deletion is the SERIALIZATION
-  // POINT. Whichever caller's unlinkSync succeeds wins the race; the
-  // other gets ENOENT and must NOT report a successful bypass. Without
-  // this, both callers swallow the ENOENT silently and bypass the same
-  // single-shot nonce.
-  try {
-    unlinkSync(NONCE_FILE)
-  } catch {
     return false
   }
   return true
@@ -271,47 +258,48 @@ function splitBashSegments(cmd: string): string[] {
 // — `-C`/`--git-dir=`/`workdir=` are independent ways to set the repo, and
 // `cd` sets it via cwd inside the command itself).
 //
-// ESCAPE HATCH: when the user explicitly approves a commit/push, the agent
-// must FIRST mint a single-use nonce by running the zsh helper
-// `chezmoi-approve-commit` (defined in dot_zshrc.tmpl), then prefix the
-// bash command with `CHEZMOI_COMMIT_OK=<nonce>`. Canonical form:
+// ESCAPE HATCH: when the user explicitly approves commits/pushes, the
+// agent must FIRST run the helper `chezmoi-approve-commit` (a script at
+// ~/.local/bin/, NOT a zsh function — non-interactive shells skip
+// .zshrc), THEN prefix the actual commit/push bash with CHEZMOI_COMMIT_OK
+// in a SEPARATE call. The helper writes ~/.cache/chezmoi-guard/approve-
+// nonce; the plugin checks file presence + 5min TTL. Within the window,
+// the same approval covers any number of commits/pushes.
 //
-//   CHEZMOI_COMMIT_OK=$(chezmoi-approve-commit) \
-//     git -C ~/.local/share/chezmoi commit -m "..."
+// Two calls (not one): the plugin sees the literal command string BEFORE
+// shell expansion, so `CHEZMOI_COMMIT_OK=$(chezmoi-approve-commit) git
+// commit` is unvalidated — only the text `$(chezmoi-approve-commit)` is
+// visible at regex time, not the actual nonce, and the file wouldn't
+// exist yet. Architecture forces two calls.
 //
 // Also accepted: env-var preamble before the attestation, because most
 // agentic shells auto-prepend safety env vars (CI=true, GIT_TERMINAL_PROMPT
-// =0, etc.) and forcing CHEZMOI_COMMIT_OK=<nonce> to be the LITERAL first
-// token would block legitimate use:
+// =0, etc.) and forcing CHEZMOI_COMMIT_OK= to be the LITERAL first token
+// would block legitimate use:
 //
-//   CI=true CHEZMOI_COMMIT_OK=<nonce> git ... commit
-//   export CI=true && CHEZMOI_COMMIT_OK=<nonce> git ... commit
+//   CI=true CHEZMOI_COMMIT_OK=approved git ... commit
+//   export CI=true && CHEZMOI_COMMIT_OK=approved git ... commit
 //
-// Single-use semantics: the nonce file is DELETED on first match. A second
-// commit/push using the same nonce → file gone → bypass denied. The agent
-// must rerun `chezmoi-approve-commit` for each commit/push, which means
-// each commit is a deliberate code path rather than a side-effect of an
-// earlier blanket approval.
-//
-// TTL: 5 minutes. A nonce that's been sitting around for >5min is also
-// rejected (and cleaned up). Forces approval-then-commit to stay temporally
-// close, so a nonce minted "for later" doesn't outlive its context.
+// TTL: 5 minutes. A nonce that's been sitting around for >5min is
+// rejected (and cleaned up). Forces approval-then-commit to stay
+// temporally close, so an approval minted "for later" doesn't outlive
+// its context.
 //
 // Regex anchored to start-of-command (`^`) and uses negative lookahead so
-// the preamble pattern doesn't greedily consume `CHEZMOI_COMMIT_OK=<nonce>`
+// the preamble pattern doesn't greedily consume `CHEZMOI_COMMIT_OK=<value>`
 // as just-another-env-assignment. Specifically REJECTS:
 //   - `git commit -m "doc: CHEZMOI_COMMIT_OK=abc escape"` — var inside a
 //     quoted string, preceded by non-preamble tokens → no match.
 //   - `cat /tmp/x ; CHEZMOI_COMMIT_OK=abc git commit` — leading non-
 //     preamble command (preamble allows env assignments only) → no match.
-// Nonce shape required: `[0-9a-fA-F]{8,}` (lowercase OR uppercase hex,
-// minimum 8 chars). The shape constraint is purely defensive — the
-// authoritative check is a byte-equal compare against the file contents.
+// Value pattern is `\S+` (any non-whitespace) — the value itself is opaque
+// to the plugin; the file at NONCE_FILE is the authority. See the
+// tryConsumeBypassNonce header for why we don't validate value contents.
 const GIT_VERB_RE = /\b(?:commit|push|reset|rebase|merge)\b/
 const GIT_WRITE_VERB_RE = /(?:^|[\s|;&(])git\s+(?:[^|;&]*?\s+)?(?:commit|push|reset|rebase|merge)\b/
 // IF YOU CHANGE THIS REGEX: keep `dot_config/opencode/AGENTS.md` in sync.
 // The regex literal is reproduced there for the user/agent-facing docs.
-const COMMIT_OK_RE = /^\s*(?:(?!CHEZMOI_COMMIT_OK=)(?:export\s+)?[A-Za-z_]\w*=\S*\s*[;&]*\s+)*CHEZMOI_COMMIT_OK=([0-9a-fA-F]{8,})\s+/
+const COMMIT_OK_RE = /^\s*(?:(?!CHEZMOI_COMMIT_OK=)(?:export\s+)?[A-Za-z_]\w*=\S*\s*[;&]*\s+)*CHEZMOI_COMMIT_OK=\S+\s+/
 
 function bashCommitsChezmoiRepo(cmd: string, workdir?: string): boolean {
   if (tryConsumeBypassNonce(cmd)) return false
@@ -451,12 +439,17 @@ export const ChezmoiGuard: Plugin = async () => {
               `If you have completed your edits and applied them, summarize\n` +
               `what changed and ask the user whether to commit & push.\n` +
               `\n` +
-              `IF the user has already explicitly approved this commit/push:\n` +
-              `  1. mint a single-use nonce:  N=$(chezmoi-approve-commit)\n` +
-              `  2. prefix the bash command:  CHEZMOI_COMMIT_OK=$N git ...\n` +
-              `Each commit/push needs a fresh nonce; the helper is a zsh\n` +
-              `function defined in dot_zshrc.tmpl. Nonces expire 5 min after\n` +
-              `mint and are deleted on first use (single-shot).\n` +
+              `IF the user has already explicitly approved this commit/push,\n` +
+              `use the TWO-CALL escape hatch:\n` +
+              `\n` +
+              `  call 1:  chezmoi-approve-commit\n` +
+              `           (a script in ~/.local/bin — writes ~/.cache/\n` +
+              `           chezmoi-guard/approve-nonce)\n` +
+              `\n` +
+              `  call 2:  CHEZMOI_COMMIT_OK=approved git -C ~/.local/share/chezmoi commit -m "..."\n` +
+              `           (any non-whitespace value works — the file is the\n` +
+              `           authority. Approval lasts 5 min and covers any\n` +
+              `           number of commits/pushes within the window.)\n` +
               `\n` +
               `Command (truncated): ${cmd.slice(0, 240)}`,
           )
