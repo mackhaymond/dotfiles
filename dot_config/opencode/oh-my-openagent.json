@@ -10,8 +10,14 @@
       "variant": "xhigh"
     },
     "oracle": {
-      "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh"
+      "model": "google/gemini-3.1-pro-preview",
+      "variant": "high",
+      "fallback_models": [
+        {
+          "model": "anthropic/claude-opus-4-7",
+          "variant": "xhigh"
+        }
+      ]
     },
     "librarian": {
       "model": "anthropic/claude-haiku-4-5"
@@ -35,8 +41,7 @@
       "variant": "xhigh"
     },
     "atlas": {
-      "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh"
+      "model": "anthropic/claude-sonnet-4-6"
     },
     "sisyphus-junior": {
       "model": "anthropic/claude-sonnet-4-6"
