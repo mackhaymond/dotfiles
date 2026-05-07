@@ -379,7 +379,11 @@ color_for_used_percent() {
   fi
 }
 
-weekly_pace_suffix() {
+# Compute signed pacing delta in percentage points: actual_used% - expected_used%
+# at the current point in the window. Positive => over pace, negative => under pace.
+# Prints a signed integer like "+5" or "-3" on success; prints nothing when the
+# pace is not computable (window not started, just-reset, missing fields, etc.).
+pace_delta() {
   local actual_used_percent="$1" window_minutes="$2" resets_at="$3" now="$4"
 
   [[ "$actual_used_percent" =~ ^[0-9]+$ ]] || return 0
@@ -410,19 +414,56 @@ weekly_pace_suffix() {
     return 0
   fi
 
-  local expected_used delta_sign delta_abs
-  expected_used="$(awk -v e="$elapsed" -v d="$duration" 'BEGIN { if (d <= 0) { print "0"; exit } printf "%.6f", (e / d) * 100 }')"
+  awk -v a="$actual_used_percent" -v e="$elapsed" -v d="$duration" 'BEGIN {
+    if (d <= 0) { exit }
+    expected = (e / d) * 100
+    delta = a - expected
+    if (delta < 0) { sign = "-"; delta = -delta } else { sign = "+" }
+    printf "%s%d", sign, int(delta + 0.5)
+  }'
+}
 
+# Format the pacing delta as a status-bar suffix like " (+5%)" or " (-3%)".
+# Prints nothing when pace_delta is not computable.
+pace_suffix() {
+  local delta
+  delta="$(pace_delta "$@")"
+  [[ -n "$delta" ]] || return 0
+  printf ' (%s%%)' "$delta"
+}
 
-  read -r delta_sign delta_abs < <(
-    awk -v a="$actual_used_percent" -v e="$expected_used" 'BEGIN {
-      d = a - e
-      if (d < 0) { sign = "-"; d = -d } else { sign = "+" }
-      printf "%s %d", sign, int(d + 0.5)
-    }'
-  )
+# Map a signed pacing delta (in percentage points) to a status-bar color.
+# Thresholds: delta <= 5 green, <= 15 yellow, > 15 red.
+# Returns 1 (and prints nothing) if the delta is not a parseable integer.
+color_for_pace_delta() {
+  local delta="$1"
+  [[ "$delta" =~ ^[+-]?[0-9]+$ ]] || return 1
 
-  printf ' (%s%s%%)' "$delta_sign" "$delta_abs"
+  if (( delta <= 5 )); then
+    printf '%s' 'green'
+  elif (( delta <= 15 )); then
+    printf '%s' 'yellow'
+  else
+    printf '%s' 'red'
+  fi
+}
+
+# Pick the status-bar color for a usage window. Prefers pacing-delta-based color
+# when pacing math is computable; falls back to absolute-usage color otherwise
+# (e.g., right after a reset, or when window/resets_at fields are missing).
+color_for_window() {
+  local used="$1" window_minutes="$2" resets_at="$3" now="$4"
+
+  local delta color
+  delta="$(pace_delta "$used" "$window_minutes" "$resets_at" "$now")"
+  if [[ -n "$delta" ]]; then
+    if color="$(color_for_pace_delta "$delta")"; then
+      printf '%s' "$color"
+      return 0
+    fi
+  fi
+
+  color_for_used_percent "$used"
 }
 
 cache_updated_at() {
@@ -1301,14 +1342,15 @@ refresh_cache() {
   local updated_at
   updated_at="$(now_epoch)"
 
-  local weekly_pace
-  weekly_pace="$(weekly_pace_suffix "$weekly_used" "$weekly_window_minutes" "$weekly_resets_at" "$updated_at")"
+  local session_pace weekly_pace
+  session_pace="$(pace_suffix "$session_used" "$session_window_minutes" "$session_resets_at" "$updated_at")"
+  weekly_pace="$(pace_suffix  "$weekly_used"  "$weekly_window_minutes"  "$weekly_resets_at"  "$updated_at")"
 
   local session_text weekly_text session_color weekly_color
-  session_text="${session_used}%"
+  session_text="${session_used}%${session_pace}"
   weekly_text="${weekly_used}%${weekly_pace}"
-  session_color="$(color_for_used_percent "$session_used")"
-  weekly_color="$(color_for_used_percent "$weekly_used")"
+  session_color="$(color_for_window "$session_used" "$session_window_minutes" "$session_resets_at" "$updated_at")"
+  weekly_color="$(color_for_window "$weekly_used"  "$weekly_window_minutes"  "$weekly_resets_at"  "$updated_at")"
 
   local tmp
   tmp="$(mktemp "${CACHE_DIR}/usage.json.tmp.XXXXXX")"
