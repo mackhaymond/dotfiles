@@ -49,7 +49,7 @@ format = "[$virtualenv]($style) "
 style = "bright-black"
 
 [custom.chezmoi]
-description = "chezmoi drift indicator (background cache, refreshed by zsh precmd). Pure-style glyphs: ~ live drift, * uncommitted, ⇡ ahead, ⇣ behind."
+description = "chezmoi drift indicator (background cache, refreshed by zsh precmd). Pure-style glyphs: ~ live drift, * uncommitted, ⇡ ahead, ⇣ behind, ? fetch >24h stale."
 command = "cat $HOME/.cache/chezmoi-drift/state 2>/dev/null"
 when = "test -s $HOME/.cache/chezmoi-drift/state"
 format = "[ ⚠ chezmoi:$output]($style) "

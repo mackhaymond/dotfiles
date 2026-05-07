@@ -197,17 +197,29 @@ yytmux() {
 #   * = chezmoi source repo has uncommitted git changes        (Pure: dirty)
 #   ⇡ = chezmoi source repo has commits not pushed to remote   (Pure: ahead)
 #   ⇣ = chezmoi source repo is behind its remote (pull needed) (Pure: behind)
+#   ? = remote-fetch knowledge is stale: no successful fetch in >24h
+#       (network/auth issue — `⇣` may not reflect current remote state)
 # Example state contents: "~*⇣" = drift + uncommitted + behind remote.
 #
-# `~` detection is three-stage and local-only (no `chezmoi verify`,
-# which would need a TTY for 1Password ops):
+# Snapshot ownership has moved to `run_after_99-record-mtimes.sh.tmpl`
+# in the chezmoi source dir. That hook fires after EVERY `chezmoi apply`
+# regardless of caller (zsh wrapper, bash, cron, IDE), so the snapshot
+# is always fresh after an apply. This zsh-side function exists as a
+# fallback for non-apply state changes (rare).
+#
+# `~` detection is two-stage and local-only (no `chezmoi verify`, which
+# would need a TTY for 1Password ops in detached `&!` subshells):
 #   1. Cheap mtime scan finds candidates (early-exit on first hit).
-#   2. Content-hash check: if mtime newer but sha256 matches snapshot,
-#      it was just touched — auto-heal the snapshot, don't flag.
-#   3. Provenance check: if hash differs too, compare snapshot mtime to
-#      `chezmoi`'s state DB. State DB newer ⇒ chezmoi applied from a
-#      wrapper-less shell, trust live and refresh. Otherwise it's real
-#      user-side drift → flag `~`.
+#   2. Content-hash check: sha256 of the live file vs the snapshotted
+#      hash. Match ⇒ touched-but-unchanged ⇒ refresh snapshot mtime,
+#      no flag. Differ ⇒ live file diverges from what was last applied
+#      ⇒ flag `~`.
+#
+# Stage 3 (state-DB-mtime heuristic) was removed: with the apply-hook
+# always refreshing the snapshot, the case it covered (apply from a
+# wrapper-less shell) is now handled correctly without inference. Worse,
+# stage 3 could silently absorb real user-side drift whenever any
+# unrelated chezmoi subcommand bumped the state DB.
 #
 # B detection requires fresh remote refs. `_chezmoi_remote_fetch` runs
 # from precmd at most once per 15 minutes and does a quiet `git fetch`
@@ -225,9 +237,10 @@ yytmux() {
 #     last successful fetch's snapshot of upstream.
 zmodload -F zsh/stat b:zstat 2>/dev/null
 zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
-# zsh builtin mkdir/rm work in `&!` subshells where the command-hash table
-# is empty and `mkdir`/`rm` from /usr/bin would otherwise be "not found".
-zmodload -F zsh/files b:mkdir b:rm 2>/dev/null
+# zsh builtin mkdir/rm/mv work in `&!` subshells where the command-hash
+# table is empty and the /usr/bin equivalents would be "not found".
+# (mv is required for the atomic snapshot write in _chezmoi_record_mtimes.)
+zmodload -F zsh/files b:mkdir b:rm b:mv 2>/dev/null
 
 # Snapshot a `<mtime> <sha256> <abspath>` line per managed file.
 # Accepts an optional pre-resolved chezmoi binary path so it works inside
@@ -243,9 +256,12 @@ _chezmoi_record_mtimes() {
   while IFS= read -r f; do
     [[ -f "$f" ]] && files+=("$f")
   done < <("$chezmoi_bin" managed --include=files --path-style absolute 2>/dev/null)
+  # Empty result almost always means `chezmoi managed` failed (transient
+  # state-DB lock, op:// auth required mid-template, etc.) — NOT that the
+  # user actually has zero managed files. Preserve the existing snapshot
+  # rather than installing an empty one that would silently blind the
+  # drift indicator. Same invariant as the run_after_99 hook.
   if (( ${#files} == 0 )); then
-    : >| "$applied"
-    rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
     return 0
   fi
   # Batch hash via xargs (~40ms for 145 small files vs ~700ms per-file).
@@ -268,7 +284,20 @@ _chezmoi_record_mtimes() {
     zstat -L -H s +mtime "$f" 2>/dev/null || continue
     lines+=("${s[mtime]} ${hashes[$f]} $f")
   done
-  print -l -- "${lines[@]}" >| "$applied"
+  # Atomic install: write to a sibling tmp file, then rename. APFS rename
+  # is atomic for same-filesystem ops, so concurrent readers always see
+  # either the old complete snapshot or the new complete one — never a
+  # torn-write. Concurrent writers will only race the final rename, so
+  # one of the snapshots wins cleanly.
+  # $$+$RANDOM disambiguates parent-shell and `&!`-subshell calls (zsh `$$`
+  # is the parent's PID even inside detached subshells), so two near-
+  # simultaneous calls don't collide on the tmp filename.
+  local tmp="${applied}.tmp.$$.${RANDOM}"
+  if print -l -- "${lines[@]}" >| "$tmp" && [[ -s "$tmp" ]]; then
+    mv -f "$tmp" "$applied"
+  else
+    rm -f "$tmp" 2>/dev/null
+  fi
   rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
 }
 
@@ -295,7 +324,8 @@ _chezmoi_drift_check() {
   # invocations short-circuit while this one is still running. Without this,
   # a cold cache spawns one bg subshell per prompt until the first finishes.
   : >| "$result"
-  ( local drifted="" applied_mt applied_hash path source_dir
+  # Avoid local var name `path` — zsh ties it to the PATH array.
+  ( local drifted="" applied_mt applied_hash file source_dir
     local -A s
     # Glyph ~ : three-stage check, all local & TTY-free.
     #
@@ -318,45 +348,39 @@ _chezmoi_drift_check() {
     # and op:// reads need a TTY for 1Password auth. In a detached `&!`
     # subshell those calls fail and verify falsely reports drift.
     local mtime_hit_path="" mtime_hit_snap_hash=""
-    while IFS=' ' read -r applied_mt applied_hash path; do
-      [[ -f "$path" ]] || continue
-      zstat -L -H s +mtime "$path" 2>/dev/null || continue
+    local stale_format=0
+    while IFS=' ' read -r applied_mt applied_hash file; do
+      # Detect old 2-field snapshots (pre-hash). Format mismatch forces a
+      # re-snapshot rather than silently treating everything as clean.
+      if [[ ! "$applied_hash" =~ ^[0-9a-f]{64}$ ]]; then
+        stale_format=1
+        break
+      fi
+      [[ -f "$file" ]] || continue
+      zstat -L -H s +mtime "$file" 2>/dev/null || continue
       if (( ${s[mtime]:-0} > applied_mt )); then
-        mtime_hit_path="$path"
+        mtime_hit_path="$file"
         mtime_hit_snap_hash="$applied_hash"
         break
       fi
     done < "$applied"
+    if (( stale_format )); then
+      _chezmoi_record_mtimes "$chezmoi_bin"
+      print -n "" >| "$result"
+      return
+    fi
     if [[ -n "$mtime_hit_path" ]]; then
       # shasum prints "<hash>  <path>". Strip via zsh expansion (no awk —
       # awk fails the same way `command git` does in this `&!` subshell).
       local cur_hash_raw="$("$shasum_bin" -a 256 "$mtime_hit_path" 2>/dev/null)"
       local cur_hash="${cur_hash_raw%% *}"
       if [[ -n "$cur_hash" && "$cur_hash" == "$mtime_hit_snap_hash" ]]; then
-        # Stage 2 win — touched but unchanged. Refresh snapshot.
+        # Touched-but-unchanged → refresh snapshot to suppress the false
+        # positive on subsequent prompts.
         _chezmoi_record_mtimes "$chezmoi_bin"
       else
-        # Stage 3 — content differs. Did chezmoi apply since our snapshot?
-        local snap_mt=0 db_mt=0
-        zstat -L -H s +mtime "$applied" 2>/dev/null && snap_mt=${s[mtime]:-0}
-        local state_db=""
-        for state_db in \
-          "$HOME/.config/chezmoi/chezmoistate.boltdb" \
-          "$HOME/.local/share/chezmoi/.chezmoistate" \
-          "$HOME/Library/Application Support/chezmoi/chezmoistate.boltdb"; do
-          [[ -f "$state_db" ]] && break
-          state_db=""
-        done
-        if [[ -n "$state_db" ]]; then
-          zstat -L -H s +mtime "$state_db" 2>/dev/null && db_mt=${s[mtime]:-0}
-        fi
-        if (( db_mt > snap_mt )); then
-          # chezmoi ran outside the wrapper since our last snapshot.
-          # Trust live state, resnapshot.
-          _chezmoi_record_mtimes "$chezmoi_bin"
-        else
-          drifted+="~"
-        fi
+        # Content actually differs from what was last applied → real drift.
+        drifted+="~"
       fi
     fi
     # Glyphs * / ⇡ / ⇣ : git state of the chezmoi source repo.
@@ -379,6 +403,18 @@ _chezmoi_drift_check() {
         if [[ -n "$("$git_bin" -C "$source_dir" rev-list 'HEAD..@{u}' 2>/dev/null)" ]]; then
           drifted+="⇣"
         fi
+        # If we *had* a successful fetch but it's been >24h, ⇣ knowledge is
+        # stale. Append "?" so the user can investigate network / SSH agent
+        # / git auth. Suppressed when last-fetch-ok is absent (cold cache /
+        # first fetch in flight) — give the 15-min cycle a chance to land
+        # before alarming.
+        local fetch_ok="$HOME/.cache/chezmoi/last-fetch-ok"
+        if [[ -f "$fetch_ok" ]]; then
+          local -A fs
+          if zstat -L -H fs +mtime "$fetch_ok" 2>/dev/null; then
+            (( EPOCHSECONDS - ${fs[mtime]:-0} > 86400 )) && drifted+="?"
+          fi
+        fi
       fi
     fi
     print -n "$drifted" >| "$result"
@@ -393,6 +429,7 @@ _chezmoi_remote_fetch() {
   (( ${+commands[chezmoi]} )) || return 0
   [[ -z "$CHEZMOI_DRIFT_NO_FETCH" ]] || return 0
   local fetch_cache="$HOME/.cache/chezmoi/last-fetch"
+  local fetch_ok="$HOME/.cache/chezmoi/last-fetch-ok"
   local max_age=900  # 15 min
   if [[ -f "$fetch_cache" ]]; then
     local -A s; zstat -L -H s +mtime "$fetch_cache" 2>/dev/null
@@ -409,12 +446,38 @@ _chezmoi_remote_fetch() {
     [[ -d "$source_dir/.git" ]] || return
     "$git_bin" -C "$source_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' \
       >/dev/null 2>&1 || return
-    "$git_bin" -C "$source_dir" fetch --quiet --no-tags --prune 2>/dev/null
+    # GIT_HTTP_LOW_SPEED_LIMIT/TIME caps HTTPS fetches at ~15s on stalls;
+    # for SSH this relies on the user's ssh ServerAliveInterval. Without
+    # this an unreachable remote can leave orphan git fetch processes
+    # accumulating one every 15 minutes for as long as the shell lives.
+    if GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=15 \
+       "$git_bin" -C "$source_dir" fetch --quiet --no-tags --prune 2>/dev/null
+    then
+      : >| "$fetch_ok"
+    fi
   ) &!
 }
 
+# Helper: how many seconds since the last successful remote fetch.
+# Returns -1 if we've never had a successful fetch in this cache lifetime.
+# Used by the drift indicator to surface long-stale `⇣` knowledge as a
+# hint that the network/auth is broken (>24h with no successful fetch).
+_chezmoi_fetch_age() {
+  local fetch_ok="$HOME/.cache/chezmoi/last-fetch-ok"
+  [[ -f "$fetch_ok" ]] || { print -n -- "-1"; return }
+  local -A s
+  zstat -L -H s +mtime "$fetch_ok" 2>/dev/null || { print -n -- "-1"; return }
+  print -n -- $(( EPOCHSECONDS - ${s[mtime]:-0} ))
+}
+
 typeset -ga precmd_functions
-precmd_functions+=(_chezmoi_drift_check _chezmoi_remote_fetch)
+# Guard against duplicate registration: zshrc may be re-sourced (login
+# shell rebuild, exec zsh, tmux source-file with loaded panes, etc.).
+# Without this, each precmd hook fires N times after the Nth re-source.
+[[ -z "${precmd_functions[(r)_chezmoi_drift_check]}" ]] && \
+  precmd_functions+=(_chezmoi_drift_check)
+[[ -z "${precmd_functions[(r)_chezmoi_remote_fetch]}" ]] && \
+  precmd_functions+=(_chezmoi_remote_fetch)
 
 # Wrap chezmoi to keep the drift indicator in sync with reality. Each
 # subcommand falls into one of three buckets:
@@ -439,15 +502,58 @@ precmd_functions+=(_chezmoi_drift_check _chezmoi_remote_fetch)
 #      `*`/`⇡`/`⇣` from the current source-repo state. No snapshot, since
 #      these commands don't tell us anything about live-file freshness.
 chezmoi() {
-  # Find the subcommand by skipping any leading global flags
-  # (`chezmoi -v apply`, `chezmoi --color=auto apply`, etc.). Using $1
-  # naively would put the flag in $cmd and fall through to the *) case.
+  # Two passes over $@:
+  #   PASS 1 — find the subcommand by skipping leading global flags. Some
+  #     flags take a separate argument (`chezmoi --config /tmp/foo apply`),
+  #     so the SEP_FLAGS whitelist consumes the next token. Stops at the
+  #     first non-flag token (the subcommand). Anything with `=` form
+  #     (`--config=/tmp/foo`) is a single token, no consume needed.
+  #
+  #   PASS 2 — scan the ENTIRE arg list for `--dry-run`/`-n`. Cobra/pflag
+  #     accepts global flags both BEFORE and AFTER the subcommand:
+  #     `chezmoi apply --dry-run` is the canonical form. Stopping at the
+  #     subcommand (as a previous attempt did) misses this and the wrapper
+  #     would silently resnapshot live state as "applied," absorbing any
+  #     pre-existing drift into a falsely-clean snapshot.
   local cmd="" a
+  # Whitelist of chezmoi global flags that take a separate argument. Without
+  # an entry here, `chezmoi <flag> <value> <subcommand>` mis-parses <value>
+  # as the subcommand → silently skips the post-apply resnapshot. Long and
+  # short forms both listed because chezmoi accepts both freely.
+  # Source: `chezmoi --help`. Keep aligned when chezmoi adds new globals.
+  local -a SEP_FLAGS=(
+    --config --config-format --source --destination --working-tree
+    --cache --output --color --persistent-state --use-builtin-age --use-builtin-git
+    --mode --age-recipient --age-recipient-file
+    --override-data --override-data-file --progress
+    -c -S -D -o
+  )
+  local skip_next=0
   for a in "$@"; do
-    [[ "$a" != -* ]] && { cmd="$a"; break }
+    if (( skip_next )); then skip_next=0; continue; fi
+    case "$a" in --) continue ;; esac
+    if [[ "$a" == -* ]]; then
+      if (( ${SEP_FLAGS[(I)$a]} )); then skip_next=1; fi
+      continue
+    fi
+    cmd="$a"
+    break
+  done
+  # Pass 2: scan for --dry-run / -n. Stop at `--` so positional args named
+  # literally `--dry-run` (extremely unlikely but possible) aren't treated
+  # as the flag and don't accidentally defer the snapshot refresh.
+  local dry_run=0
+  for a in "$@"; do
+    case "$a" in
+      --) break ;;
+      --dry-run|-n) dry_run=1; break ;;
+    esac
   done
   command chezmoi "$@"
   local rc=$?
+  # Dry-run mutates nothing — neither snapshot nor cache invalidation.
+  # Returning before the case statement preserves the existing snapshot.
+  (( dry_run )) && return $rc
   case "$cmd" in
     apply|update|init|merge|edit|import|destroy|re-add|add|forget|chattr|git|state)
       _chezmoi_record_mtimes
@@ -481,23 +587,37 @@ chezmoi() {
 nvim() {
   [[ -n "$CHEZMOI_EDIT" ]] && { command nvim "$@"; return }
   local arg abs
-  local -a managed_args=()
+  local -a managed_args=() other_args=()
   for arg in "$@"; do
     [[ "$arg" == "-R" || "$arg" == "-r" ]] && { command nvim "$@"; return }
   done
   for arg in "$@"; do
-    [[ "$arg" == -* || ! -e "$arg" ]] && continue
+    if [[ "$arg" == -* ]]; then other_args+=("$arg"); continue; fi
+    if [[ ! -e "$arg" ]]; then other_args+=("$arg"); continue; fi
     abs="${arg:A}"
-    [[ "$abs" == "$HOME/.local/share/chezmoi/"* ]] && continue
-    chezmoi source-path "$abs" >/dev/null 2>&1 && managed_args+=("$abs")
+    if [[ "$abs" == "$HOME/.local/share/chezmoi/"* ]]; then
+      other_args+=("$arg")
+      continue
+    fi
+    if chezmoi source-path "$abs" >/dev/null 2>&1; then
+      managed_args+=("$abs")
+    else
+      other_args+=("$arg")
+    fi
   done
-  # Route ALL managed args through one `chezmoi edit --apply` call rather
-  # than only the first one. Mixing managed and unmanaged args is rare; if
-  # any are managed we use chezmoi edit, otherwise plain nvim.
+  # Mixed-args handling: open managed files via `chezmoi edit --apply`
+  # AND open the unmanaged ones in a separate plain nvim invocation.
+  # The earlier "first managed wins, drop the rest" logic silently lost
+  # the unmanaged files (data-loss-shaped: user thought they were open).
   if (( ${#managed_args} )); then
     print -u2 "[chezmoi] managed file(s) — opening source via 'chezmoi edit --apply'"
     CHEZMOI_EDIT=1 chezmoi edit --apply "${managed_args[@]}"
-    return $?
+    local rc=$?
+    if (( ${#other_args} )); then
+      print -u2 "[chezmoi] also opening unmanaged arg(s): ${other_args[*]}"
+      command nvim "${other_args[@]}"
+    fi
+    return $rc
   fi
   command nvim "$@"
 }

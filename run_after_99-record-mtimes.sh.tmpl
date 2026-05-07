@@ -1,0 +1,70 @@
+#!/bin/sh
+# Authoritative snapshot writer for the zsh drift indicator.
+#
+# Runs after every `chezmoi apply` (and `chezmoi update`, which calls apply)
+# regardless of the calling shell. This makes the snapshot correct under
+# all invocation contexts — interactive zsh with our wrapper, cron, IDE
+# integrations, or AI agents executing `chezmoi apply` via bash.
+#
+# The drift indicator (~/.cache/chezmoi-drift/state) reads from
+# ~/.cache/chezmoi/applied-mtimes, which this script rewrites atomically.
+# Without this hook, applies that bypassed the chezmoi() shell wrapper
+# would leave the snapshot stale; the bg precmd check would then either
+# false-positive `~` (if it was lucky enough to detect the mtime change)
+# or, worse, false-negative real drift via the now-removed state-DB
+# heuristic that this hook makes unnecessary.
+#
+# Format per line: "<unix_mtime> <sha256_hex> <absolute_path>"
+#
+# Failure-mode philosophy: NEVER install an empty/short snapshot. A bad
+# snapshot blinds the drift indicator silently — better to keep the stale-
+# but-known-good one and leave the user with a slightly out-of-date `~`
+# than to zero out their detection. `pipefail` + non-empty check enforce
+# this. Also `awk` is intentionally avoided (POSIX param expansion instead)
+# so a broken PATH can't silently empty the snapshot one `awk: not found`
+# at a time.
+
+set -eu
+( set -o pipefail ) 2>/dev/null && set -o pipefail || true
+
+cache_dir="${HOME}/.cache/chezmoi"
+applied="${cache_dir}/applied-mtimes"
+drift_state="${HOME}/.cache/chezmoi-drift/state"
+tmp="${applied}.tmp.$$.${RANDOM:-0}"
+
+mkdir -p "${cache_dir}"
+
+# Resolve absolute paths to dodge PATH issues; chezmoi run scripts run with
+# whatever environment chezmoi inherited, which may differ from the user's
+# interactive shell (e.g. when invoked from an IDE or cron).
+SHASUM="$(command -v shasum 2>/dev/null || echo /usr/bin/shasum)"
+STAT="$(command -v stat 2>/dev/null || echo /usr/bin/stat)"
+CHEZMOI="{{ .chezmoi.executable }}"
+
+# Trap on failure to avoid leaving a half-written .tmp lingering on disk.
+trap 'rm -f "${tmp}"' EXIT INT TERM HUP
+
+"${CHEZMOI}" managed --include=files --path-style absolute 2>/dev/null \
+| while IFS= read -r f; do
+    [ -f "${f}" ] || continue
+    mtime="$("${STAT}" -f %m "${f}" 2>/dev/null)" || continue
+    raw="$("${SHASUM}" -a 256 "${f}" 2>/dev/null)" || continue
+    hash="${raw%% *}"
+    [ -n "${mtime}" ] && [ -n "${hash}" ] || continue
+    printf '%s %s %s\n' "${mtime}" "${hash}" "${f}"
+  done > "${tmp}"
+
+# Refuse to install a degenerate snapshot. Empty = chezmoi managed failed,
+# env is broken, or all files were unreadable. Leave the existing snapshot
+# untouched (tmp gets cleaned by the EXIT trap below).
+if [ ! -s "${tmp}" ]; then
+  exit 0
+fi
+
+# Atomic install on the same filesystem (HFS+/APFS rename is atomic).
+mv -f "${tmp}" "${applied}"
+trap - EXIT INT TERM HUP
+
+# Invalidate the drift state cache so the next prompt's check re-evaluates
+# against the freshly written snapshot. -f because the file may not exist.
+rm -f "${drift_state}" 2>/dev/null || true
