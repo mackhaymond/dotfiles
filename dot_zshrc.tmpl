@@ -152,7 +152,7 @@ opencode() {
   for arg in "$@"; do
     [[ "$arg" != -* ]] && { command opencode "$@"; return; }
   done
-  command opencode --port 0 --hostname 0.0.0.0 "$@"
+  command opencode --port 0 "$@"
 }
 oc() { opencode "$@"; }
 
