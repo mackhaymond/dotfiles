@@ -15,5 +15,18 @@ export LC_ALL=en_US.UTF-8
 export PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
 [[ -d "$PYENV_ROOT/shims" ]] && export PATH="$PYENV_ROOT/shims:$PATH"
 
+# 1Password service-account token from macOS Keychain. Used by chezmoi
+# templating (op:// references) and by the drift indicator's background
+# `chezmoi verify` call — both need non-interactive auth in subprocess
+# contexts (opencode, cron, IDE terminals, &! subshells) where biometric
+# / desktop-app prompts can't reach a TTY. Keychain entry is created
+# manually via `security add-generic-password -s op-service-account-token`.
+# Lookup is ~10ms; the `-z` guard keeps child shells free since they
+# inherit from parent.
+if [[ -z "$OP_SERVICE_ACCOUNT_TOKEN" ]] && command -v security >/dev/null 2>&1; then
+  export OP_SERVICE_ACCOUNT_TOKEN="$(security find-generic-password \
+    -s op-service-account-token -a "$USER" -w 2>/dev/null)"
+fi
+
 # Secrets (chmod 600, gitignored)
 [[ -r "$HOME/.zshenv.private" ]] && source "$HOME/.zshenv.private"

@@ -180,17 +180,12 @@ yytmux() {
   fi
 }
 
-# Tier C — chezmoi drift indicator (background, op://-free).
+# Tier C — chezmoi drift indicator (background, authoritative).
 #
-# `_chezmoi_record_mtimes` writes a snapshot of every managed live file's
-# mtime to ~/.cache/chezmoi/applied-mtimes. Called by the chezmoi()
-# wrapper below after any write-class subcommand (apply/update/edit/
-# merge/init/import).
-#
-# `_chezmoi_drift_check` runs from precmd at most once per 60s, compares
-# current mtimes against the snapshot using the zstat builtin (no fork,
-# no PATH lookup, no op:// reads → no 1Password prompts). Result lives
-# in ~/.cache/chezmoi-drift/state and is read by the starship segment.
+# `_chezmoi_drift_check` runs from precmd at most once per 60s and asks
+# `chezmoi verify` whether every managed live file matches its source.
+# Result lives in ~/.cache/chezmoi-drift/state and is read by the
+# starship segment.
 #
 # State file format: concatenated Pure-style glyphs. Empty = clean.
 #   ~ = managed live file actually differs from chezmoi source     (verified)
@@ -201,113 +196,39 @@ yytmux() {
 #       (network/auth issue — `⇣` may not reflect current remote state)
 # Example state contents: "~*⇣" = drift + uncommitted + behind remote.
 #
-# Snapshot ownership has moved to `run_after_99-record-mtimes.sh.tmpl`
-# in the chezmoi source dir. That hook fires after EVERY `chezmoi apply`
-# regardless of caller (zsh wrapper, bash, cron, IDE), so the snapshot
-# is always fresh after an apply. This zsh-side function exists as a
-# fallback for non-apply state changes (rare).
+# `~` is `chezmoi verify` (rc=0 ⇒ clean, rc!=0 ⇒ flag). This is the
+# authoritative answer — catches content drift, file deletion, mode
+# changes, symlink target changes, everything chezmoi tracks. Earlier
+# versions reimplemented this with mtime+sha256 snapshots to avoid
+# `chezmoi verify`'s op:// 1Password prompts; that constraint is gone
+# (op CLI no longer needs a TTY in this setup).
 #
-# `~` detection is two-stage and local-only (no `chezmoi verify`, which
-# would need a TTY for 1Password ops in detached `&!` subshells):
-#   1. Cheap mtime scan finds candidates (early-exit on first hit).
-#   2. Content-hash check: sha256 of the live file vs the snapshotted
-#      hash. Match ⇒ touched-but-unchanged ⇒ refresh snapshot mtime,
-#      no flag. Differ ⇒ live file diverges from what was last applied
-#      ⇒ flag `~`.
+# Cost: verify templates every managed file (~200-500ms for 145 files).
+# Acceptable because (a) it runs detached in a `&!` subshell so prompt
+# latency is zero, and (b) the 60s throttle caps load.
 #
-# Stage 3 (state-DB-mtime heuristic) was removed: with the apply-hook
-# always refreshing the snapshot, the case it covered (apply from a
-# wrapper-less shell) is now handled correctly without inference. Worse,
-# stage 3 could silently absorb real user-side drift whenever any
-# unrelated chezmoi subcommand bumped the state DB.
-#
-# B detection requires fresh remote refs. `_chezmoi_remote_fetch` runs
-# from precmd at most once per 15 minutes and does a quiet `git fetch`
-# in the background. Disable with: `export CHEZMOI_DRIFT_NO_FETCH=1`.
+# `_chezmoi_remote_fetch` (further down) runs from precmd at most once
+# per 15 min and does a quiet `git fetch` in the background, so the ⇡/⇣
+# state stays fresh. Disable with: `export CHEZMOI_DRIFT_NO_FETCH=1`.
 #
 # Edge cases:
-#   - False positive: user/app `touch`es a file; `chezmoi diff` confirms.
-#   - False negative: tool overwrites content while preserving mtime
-#     (rare; mainly `cp -p` from old backups).
-#   - Targeted `chezmoi apply ~/.foo` from outside a shell wrapping
-#     chezmoi (e.g. cron) won't refresh the cache — but the user runs
-#     chezmoi from this shell exclusively.
-#   - No upstream branch on source repo → P/B silently skipped (not flagged).
-#   - Network down / auth required → fetch fails silently, B reflects
-#     last successful fetch's snapshot of upstream.
+#   - chezmoi managed config has a template error → verify rc!=0 → flag `~`.
+#     This is conservative-correct: if we can't verify cleanliness, surface
+#     it. Run `chezmoi verify` interactively to see the underlying error.
+#   - No upstream branch on source repo → ⇡/⇣ silently skipped (not flagged).
+#   - Network down / auth required → fetch fails silently, ⇣ reflects last
+#     successful fetch's snapshot of upstream; `?` appears after 24h.
 zmodload -F zsh/stat b:zstat 2>/dev/null
 zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
-# zsh builtin mkdir/rm/mv work in `&!` subshells where the command-hash
+# zsh builtin mkdir/rm work in `&!` subshells where the command-hash
 # table is empty and the /usr/bin equivalents would be "not found".
-# (mv is required for the atomic snapshot write in _chezmoi_record_mtimes.)
-zmodload -F zsh/files b:mkdir b:rm b:mv 2>/dev/null
-
-# Snapshot a `<mtime> <sha256> <abspath>` line per managed file.
-# Accepts an optional pre-resolved chezmoi binary path so it works inside
-# `&!` subshells (which lose the command-hash table).
-_chezmoi_record_mtimes() {
-  local chezmoi_bin="${1:-${commands[chezmoi]}}"
-  [[ -x "$chezmoi_bin" ]] || return 0
-  local cache="$HOME/.cache/chezmoi"
-  local applied="$cache/applied-mtimes"
-  mkdir -p "$cache"
-  local -a files=()
-  local f
-  while IFS= read -r f; do
-    [[ -f "$f" ]] && files+=("$f")
-  done < <("$chezmoi_bin" managed --include=files --path-style absolute 2>/dev/null)
-  # Empty result almost always means `chezmoi managed` failed (transient
-  # state-DB lock, op:// auth required mid-template, etc.) — NOT that the
-  # user actually has zero managed files. Preserve the existing snapshot
-  # rather than installing an empty one that would silently blind the
-  # drift indicator. Same invariant as the run_after_99 hook.
-  if (( ${#files} == 0 )); then
-    return 0
-  fi
-  # Batch hash via xargs (~40ms for 145 small files vs ~700ms per-file).
-  # Null-delimited so paths with spaces work. Use absolute paths because
-  # this function may be called from `&!` subshells where the command hash
-  # is empty (`command shasum` fails despite shasum being on PATH).
-  local shasum_bin="${commands[shasum]:-/usr/bin/shasum}"
-  local xargs_bin="${commands[xargs]:-/usr/bin/xargs}"
-  local -A hashes
-  local line h p
-  while IFS= read -r line; do
-    h="${line%% *}"        # hash = everything before first space
-    p="${line#${h}  }"     # path = everything after "<hash>  " (two spaces)
-    [[ -n "$h" && -n "$p" ]] && hashes[$p]="$h"
-  done < <(printf '%s\0' "${files[@]}" | "$xargs_bin" -0 "$shasum_bin" -a 256 2>/dev/null)
-  local -A s
-  local -a lines=()
-  for f in "${files[@]}"; do
-    [[ -n "${hashes[$f]}" ]] || continue
-    zstat -L -H s +mtime "$f" 2>/dev/null || continue
-    lines+=("${s[mtime]} ${hashes[$f]} $f")
-  done
-  # Atomic install: write to a sibling tmp file, then rename. APFS rename
-  # is atomic for same-filesystem ops, so concurrent readers always see
-  # either the old complete snapshot or the new complete one — never a
-  # torn-write. Concurrent writers will only race the final rename, so
-  # one of the snapshots wins cleanly.
-  # $$+$RANDOM disambiguates parent-shell and `&!`-subshell calls (zsh `$$`
-  # is the parent's PID even inside detached subshells), so two near-
-  # simultaneous calls don't collide on the tmp filename.
-  local tmp="${applied}.tmp.$$.${RANDOM}"
-  if print -l -- "${lines[@]}" >| "$tmp" && [[ -s "$tmp" ]]; then
-    mv -f "$tmp" "$applied"
-  else
-    rm -f "$tmp" 2>/dev/null
-  fi
-  rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
-}
+zmodload -F zsh/files b:mkdir b:rm 2>/dev/null
 
 _chezmoi_drift_check() {
   local cache="$HOME/.cache/chezmoi-drift"
   local result="$cache/state"
-  local applied="$HOME/.cache/chezmoi/applied-mtimes"
   local max_age=60
   (( ${+commands[chezmoi]} )) || return 0
-  [[ -r "$applied" ]] || { _chezmoi_record_mtimes; return 0 }
   mkdir -p "$cache"
   if [[ -f "$result" ]]; then
     local -A s; zstat -L -H s +mtime "$result" 2>/dev/null
@@ -319,77 +240,21 @@ _chezmoi_drift_check() {
   # even when PATH is intact. Resolved absolute paths inherit cleanly.
   local git_bin="${commands[git]:-/usr/bin/git}"
   local chezmoi_bin="${commands[chezmoi]}"
-  local shasum_bin="${commands[shasum]:-/usr/bin/shasum}"
   # Claim the 60s throttle window in the parent shell so subsequent precmd
   # invocations short-circuit while this one is still running. Without this,
   # a cold cache spawns one bg subshell per prompt until the first finishes.
   : >| "$result"
-  # Avoid local var name `path` — zsh ties it to the PATH array.
-  ( local drifted="" applied_mt applied_hash file source_dir
-    local -A s
-    # Glyph ~ : three-stage check, all local & TTY-free.
-    #
-    #   Stage 1 (cheap): scan live mtimes against snapshot. Stop at first
-    #     hit. If nothing's newer than the snapshot, we're clean.
-    #
-    #   Stage 2 (content): if mtime hint, hash that one live file and
-    #     compare to its snapshotted hash. If hashes match, the file was
-    #     touched (editor save, etc.) but content is unchanged → refresh
-    #     mtimes and don't flag.
-    #
-    #   Stage 3 (provenance): if hashes differ, the live file's bytes are
-    #     not what we last snapshotted. Either the user edited live (real
-    #     drift → ~) or chezmoi applied from a wrapper-less shell since
-    #     our snapshot (snapshot is stale → refresh). Distinguish by
-    #     comparing chezmoi's state DB mtime to ours: state DB newer than
-    #     snapshot ⇒ chezmoi ran ⇒ trust the system, refresh.
-    #
-    # We avoid `chezmoi verify` because it templates every managed file,
-    # and op:// reads need a TTY for 1Password auth. In a detached `&!`
-    # subshell those calls fail and verify falsely reports drift.
-    local mtime_hit_path="" mtime_hit_snap_hash=""
-    local stale_format=0
-    while IFS=' ' read -r applied_mt applied_hash file; do
-      # Detect old 2-field snapshots (pre-hash). Format mismatch forces a
-      # re-snapshot rather than silently treating everything as clean.
-      if [[ ! "$applied_hash" =~ ^[0-9a-f]{64}$ ]]; then
-        stale_format=1
-        break
-      fi
-      [[ -f "$file" ]] || continue
-      zstat -L -H s +mtime "$file" 2>/dev/null || continue
-      if (( ${s[mtime]:-0} > applied_mt )); then
-        mtime_hit_path="$file"
-        mtime_hit_snap_hash="$applied_hash"
-        break
-      fi
-    done < "$applied"
-    if (( stale_format )); then
-      _chezmoi_record_mtimes "$chezmoi_bin"
-      print -n "" >| "$result"
-      return
-    fi
-    if [[ -n "$mtime_hit_path" ]]; then
-      # shasum prints "<hash>  <path>". Strip via zsh expansion (no awk —
-      # awk fails the same way `command git` does in this `&!` subshell).
-      local cur_hash_raw="$("$shasum_bin" -a 256 "$mtime_hit_path" 2>/dev/null)"
-      local cur_hash="${cur_hash_raw%% *}"
-      if [[ -n "$cur_hash" && "$cur_hash" == "$mtime_hit_snap_hash" ]]; then
-        # Touched-but-unchanged → refresh snapshot to suppress the false
-        # positive on subsequent prompts.
-        _chezmoi_record_mtimes "$chezmoi_bin"
-      else
-        # Content actually differs from what was last applied → real drift.
-        drifted+="~"
-      fi
-    fi
+  ( local drifted="" source_dir
+    # Glyph ~ : authoritative content drift via `chezmoi verify`.
+    # Returns 0 iff every managed live file matches its source. Catches
+    # content edits, deletions, mode/permission changes, symlink targets.
+    "$chezmoi_bin" verify >/dev/null 2>&1 || drifted+="~"
     # Glyphs * / ⇡ / ⇣ : git state of the chezmoi source repo.
     # We avoid invoking `chezmoi source-path` (slow, boots templater) and
     # use the canonical XDG default with a one-shot fallback.
     source_dir="$HOME/.local/share/chezmoi"
     [[ -d "$source_dir/.git" ]] || source_dir=$("$chezmoi_bin" source-path 2>/dev/null)
     if [[ -d "$source_dir/.git" ]]; then
-      # Uncommitted: any staged/unstaged/untracked change → Pure '*'.
       if [[ -n "$("$git_bin" -C "$source_dir" status --porcelain 2>/dev/null)" ]]; then
         drifted+="*"
       fi
@@ -479,28 +344,11 @@ typeset -ga precmd_functions
 [[ -z "${precmd_functions[(r)_chezmoi_remote_fetch]}" ]] && \
   precmd_functions+=(_chezmoi_remote_fetch)
 
-# Wrap chezmoi to keep the drift indicator in sync with reality. Each
-# subcommand falls into one of three buckets:
-#
-#   1. Write-class — apply/update/init/merge/edit/import/destroy/re-add,
-#      and the source-mutating add/forget/chattr/git/state. These all
-#      change either live files, the source repo, or both. We resnapshot
-#      mtimes synchronously so `~` clears immediately.
-#
-#   2. Verify-class — `verify` returns rc=0 iff every managed live file
-#      matches its source. If clean, resnapshot. Otherwise just invalidate
-#      the cache so the next precmd reflects real drift in `~`.
-#
-#   3. Diff — same intent as verify, but `chezmoi diff` returns 0 even
-#      when there ARE differences. Run `verify` after the diff to get the
-#      authoritative cleanliness signal, then snapshot or invalidate.
-#      This is what fixes the "ran diff, no issues, but ~ still showed"
-#      false-positive: an editor `touch` that didn't change content.
-#
-#   4. Everything else (read-only: cat/managed/dump/data/doctor/...): we
-#      just invalidate the drift cache so the next precmd recomputes
-#      `*`/`⇡`/`⇣` from the current source-repo state. No snapshot, since
-#      these commands don't tell us anything about live-file freshness.
+# Wrap chezmoi to keep the drift indicator in sync with reality. Drift
+# detection is done by `chezmoi verify` (run from precmd), so the wrapper
+# only needs to invalidate the result cache after subcommands that could
+# have changed state — the next precmd then re-runs verify and updates
+# the indicator. No snapshot file to maintain anymore.
 chezmoi() {
   # Two passes over $@:
   #   PASS 1 — find the subcommand by skipping leading global flags. Some
@@ -551,31 +399,15 @@ chezmoi() {
   done
   command chezmoi "$@"
   local rc=$?
-  # Dry-run mutates nothing — neither snapshot nor cache invalidation.
-  # Returning before the case statement preserves the existing snapshot.
+  # Dry-run mutates nothing — leave the indicator cache alone.
   (( dry_run )) && return $rc
-  case "$cmd" in
-    apply|update|init|merge|edit|import|destroy|re-add|add|forget|chattr|git|state)
-      _chezmoi_record_mtimes
-      ;;
-    verify)
-      if (( rc == 0 )); then
-        _chezmoi_record_mtimes
-      else
-        rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
-      fi
-      ;;
-    diff)
-      if (( rc == 0 )) && command chezmoi verify >/dev/null 2>&1; then
-        _chezmoi_record_mtimes
-      else
-        rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
-      fi
-      ;;
-    *)
-      rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
-      ;;
-  esac
+  # Invalidate the drift cache so the next precmd's `chezmoi verify` runs
+  # against current state. We do this for every subcommand for simplicity:
+  # the next verify is at most ~500ms in the bg subshell, so the marginal
+  # cost of an unnecessary recheck after a read-only command is small,
+  # and matching specific subcommands here would just re-create the
+  # write-vs-read classification problem the prior wrapper had.
+  rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
   return $rc
 }
 
