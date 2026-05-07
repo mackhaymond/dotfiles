@@ -23,7 +23,7 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { execSync } from "node:child_process"
-import { realpathSync } from "node:fs"
+import { readFileSync, realpathSync, statSync, unlinkSync } from "node:fs"
 import { resolve } from "node:path"
 
 const TTL_MS = 5 * 60 * 1000
@@ -106,6 +106,71 @@ function bashCommandFromArgs(args: any): string {
   if (typeof args.cmd === "string") return args.cmd
   if (typeof args.script === "string") return args.script
   return ""
+}
+
+// Read the working directory the bash tool will run the command in. opencode's
+// `bash` tool exposes `workdir`. Other shells/wrappers might use `cwd` or
+// `workingDirectory` — we accept all to stay forward-compatible. Returns
+// undefined if no workdir is set (command will run in opencode's default cwd).
+function bashWorkdirFromArgs(args: any): string | undefined {
+  if (!args) return undefined
+  for (const key of ["workdir", "cwd", "workingDirectory", "directory"]) {
+    if (typeof args[key] === "string" && args[key]) return args[key]
+  }
+  return undefined
+}
+
+// One-shot nonce escape hatch. Replaces the previous fixed `=1` attestation
+// with a per-commit, file-backed nonce that the user-facing helper
+// `chezmoi-approve-commit` (defined in dot_zshrc.tmpl) generates. Each
+// successful bypass DELETES the nonce file, so a stale nonce can't be
+// reused for a follow-up commit/push without an explicit fresh approval.
+//
+// Threat model: the previous `=1` attestation gave one-blanket-approval-
+// per-session. An agent that interpreted "go ahead" too broadly would happily
+// fire ten commits off the same approval. The nonce flow forces the agent
+// to ALSO regenerate the token (which is at minimum a deliberate step in
+// agent code, not an inherited blanket).
+//
+// File: ~/.cache/chezmoi-guard/approve-nonce — contents = hex nonce, mtime
+// = creation time. TTL = NONCE_TTL_MS. Stale nonces are deleted on
+// inspection, mirroring single-use semantics.
+const NONCE_FILE = `${process.env.HOME ?? ""}/.cache/chezmoi-guard/approve-nonce`
+const NONCE_TTL_MS = 5 * 60 * 1000
+
+function tryConsumeBypassNonce(cmd: string): boolean {
+  const m = COMMIT_OK_RE.exec(cmd)
+  if (!m) return false
+  const provided = m[1]
+  let stored: string
+  let ageMs: number
+  try {
+    stored = readFileSync(NONCE_FILE, "utf-8").trim()
+    ageMs = Date.now() - statSync(NONCE_FILE).mtimeMs
+  } catch {
+    return false
+  }
+  if (!stored) return false
+  if (stored !== provided) return false
+  if (ageMs > NONCE_TTL_MS) {
+    // Stale: agent generated the nonce but didn't use it within TTL.
+    // Clean up so future bypasses must mint a fresh nonce. Cleanup
+    // failure here is fine to swallow — return value is false either way.
+    try { unlinkSync(NONCE_FILE) } catch { /* idempotent */ }
+    return false
+  }
+  // Race-tight consume: two parallel tool calls could both reach this
+  // point with a valid file. The atomic deletion is the SERIALIZATION
+  // POINT. Whichever caller's unlinkSync succeeds wins the race; the
+  // other gets ENOENT and must NOT report a successful bypass. Without
+  // this, both callers swallow the ENOENT silently and bypass the same
+  // single-shot nonce.
+  try {
+    unlinkSync(NONCE_FILE)
+  } catch {
+    return false
+  }
+  return true
 }
 
 // Path-token extractor. Matches three families:
@@ -201,51 +266,64 @@ function splitBashSegments(cmd: string): string[] {
 // Detects bash commands that commit or push from the chezmoi source repo.
 // The user policy is "never commit/push dotfiles yourself" — applies whether
 // the agent uses raw `git -C <chezmoi-src>`, `git --git-dir=<chezmoi-src>/.git`,
-// `chezmoi git -- ...`, or the natural `cd <chezmoi-src> && git commit`
-// pattern (each requires a separate detector — `-C` and `--git-dir=` are
-// independent ways to set the repo, and `cd` sets it via cwd).
+// `chezmoi git -- ...`, the natural `cd <chezmoi-src> && git commit` pattern,
+// OR the bash-tool's `workdir` parameter (each requires a separate detector
+// — `-C`/`--git-dir=`/`workdir=` are independent ways to set the repo, and
+// `cd` sets it via cwd inside the command itself).
 //
-// ESCAPE HATCH: when the user explicitly approves a commit/push (e.g.
-// responds "go ahead" / "yes" to the agent's ask), the agent prefixes the
-// bash command with `CHEZMOI_COMMIT_OK=1`. Canonical form:
+// ESCAPE HATCH: when the user explicitly approves a commit/push, the agent
+// must FIRST mint a single-use nonce by running the zsh helper
+// `chezmoi-approve-commit` (defined in dot_zshrc.tmpl), then prefix the
+// bash command with `CHEZMOI_COMMIT_OK=<nonce>`. Canonical form:
 //
-//   CHEZMOI_COMMIT_OK=1 git -C ~/.local/share/chezmoi commit -m "..."
+//   CHEZMOI_COMMIT_OK=$(chezmoi-approve-commit) \
+//     git -C ~/.local/share/chezmoi commit -m "..."
 //
 // Also accepted: env-var preamble before the attestation, because most
 // agentic shells auto-prepend safety env vars (CI=true, GIT_TERMINAL_PROMPT
-// =0, etc.) and forcing CHEZMOI_COMMIT_OK=1 to be the LITERAL first token
-// would block legitimate use:
+// =0, etc.) and forcing CHEZMOI_COMMIT_OK=<nonce> to be the LITERAL first
+// token would block legitimate use:
 //
-//   CI=true CHEZMOI_COMMIT_OK=1 git ... commit
-//   export CI=true && CHEZMOI_COMMIT_OK=1 git ... commit
-//   GIT_TERMINAL_PROMPT=0 CHEZMOI_COMMIT_OK=1 git ... commit
+//   CI=true CHEZMOI_COMMIT_OK=<nonce> git ... commit
+//   export CI=true && CHEZMOI_COMMIT_OK=<nonce> git ... commit
 //
-// Trust model: the env var is an agent attestation that user permission was
-// obtained. Plugin TRUSTS this (a malicious agent could set it anyway, but
-// that violates the explicit AGENTS.md policy).
+// Single-use semantics: the nonce file is DELETED on first match. A second
+// commit/push using the same nonce → file gone → bypass denied. The agent
+// must rerun `chezmoi-approve-commit` for each commit/push, which means
+// each commit is a deliberate code path rather than a side-effect of an
+// earlier blanket approval.
 //
-// Regex anchored to start-of-command (`^`) so the var must be either the
-// first non-preamble token OR the very first token. Specifically REJECTS:
-//   - `git commit -m "doc: CHEZMOI_COMMIT_OK=1 escape"` — var inside a
-//     quoted string, preceded by `git commit -m "doc:` which isn't a
-//     valid env-preamble pattern → no match.
-//   - `cat /tmp/x ; CHEZMOI_COMMIT_OK=1 git commit` — leading non-preamble
-//     command, no match (preamble pattern only allows env assignments).
-// Accepts only `=1` (no =true/=yes aliases) for one canonical attestation.
+// TTL: 5 minutes. A nonce that's been sitting around for >5min is also
+// rejected (and cleaned up). Forces approval-then-commit to stay temporally
+// close, so a nonce minted "for later" doesn't outlive its context.
+//
+// Regex anchored to start-of-command (`^`) and uses negative lookahead so
+// the preamble pattern doesn't greedily consume `CHEZMOI_COMMIT_OK=<nonce>`
+// as just-another-env-assignment. Specifically REJECTS:
+//   - `git commit -m "doc: CHEZMOI_COMMIT_OK=abc escape"` — var inside a
+//     quoted string, preceded by non-preamble tokens → no match.
+//   - `cat /tmp/x ; CHEZMOI_COMMIT_OK=abc git commit` — leading non-
+//     preamble command (preamble allows env assignments only) → no match.
+// Nonce shape required: `[0-9a-fA-F]{8,}` (lowercase OR uppercase hex,
+// minimum 8 chars). The shape constraint is purely defensive — the
+// authoritative check is a byte-equal compare against the file contents.
 const GIT_VERB_RE = /\b(?:commit|push|reset|rebase|merge)\b/
+const GIT_WRITE_VERB_RE = /(?:^|[\s|;&(])git\s+(?:[^|;&]*?\s+)?(?:commit|push|reset|rebase|merge)\b/
 // IF YOU CHANGE THIS REGEX: keep `dot_config/opencode/AGENTS.md` in sync.
 // The regex literal is reproduced there for the user/agent-facing docs.
-const COMMIT_OK_RE = /^\s*(?:(?:export\s+)?[A-Za-z_]\w*=\S*\s*[;&]*\s+)*CHEZMOI_COMMIT_OK=1\s+/
+const COMMIT_OK_RE = /^\s*(?:(?!CHEZMOI_COMMIT_OK=)(?:export\s+)?[A-Za-z_]\w*=\S*\s*[;&]*\s+)*CHEZMOI_COMMIT_OK=([0-9a-fA-F]{8,})\s+/
 
-function bashCommitsChezmoiRepo(cmd: string): boolean {
-  // Honor the user-approval escape hatch before running any detection.
-  if (COMMIT_OK_RE.test(cmd)) return false
+function bashCommitsChezmoiRepo(cmd: string, workdir?: string): boolean {
+  if (tryConsumeBypassNonce(cmd)) return false
   const expanded = expandHomeVars(cmd)
   if (/(?:^|[\s|;&(])chezmoi\s+git\b[^|;&]*\b(?:commit|push|reset|rebase|merge)\b/.test(expanded)) {
     return true
   }
   // Pattern A1: explicit `git -C <chezmoi-src>` + write-class git verb.
-  const gitDashCRe = /(?:^|[\s|;&(])git\s+(?:-c\s+\S+\s+|--git-dir=\S+\s+|--work-tree=\S+\s+)*-C\s+(['"]?)([^\s'"|;&]+)\1/g
+  // `-C\s*` (NOT `\s+`) accepts both `-C /path` AND the glued form `-C/path`
+  // — git accepts both per its short-flag conventions, and the glued form
+  // would otherwise sneak past a strict `-C\s+` matcher.
+  const gitDashCRe = /(?:^|[\s|;&(])git\s+(?:-c\s+\S+\s+|--git-dir(?:=|\s+)\S+\s+|--work-tree(?:=|\s+)\S+\s+)*-C\s*(['"]?)([^\s'"|;&]+)\1/g
   let m: RegExpExecArray | null
   while ((m = gitDashCRe.exec(expanded)) !== null) {
     const dir = normalizePath(m[2])
@@ -259,12 +337,44 @@ function bashCommitsChezmoiRepo(cmd: string): boolean {
   // Pattern A2: `git --git-dir=<chezmoi-src>/.git` (or --work-tree=) + verb.
   // The `-C` form was the only one matched before; agents can use --git-dir=
   // or --work-tree= to point at the chezmoi repo without a `-C` flag at all.
-  const gitDirRe = /(?:^|[\s|;&(])git\s+(?:[^|;&]*?\s+)?(?:--git-dir|--work-tree)=(['"]?)([^\s'"|;&]+)\1/g
+  // Both `=` and space separators are accepted (git supports both).
+  const gitDirRe = /(?:^|[\s|;&(])git\s+(?:[^|;&]*?\s+)?(?:--git-dir|--work-tree)(?:=|\s+)(['"]?)([^\s'"|;&]+)\1/g
   while ((m = gitDirRe.exec(expanded)) !== null) {
     const dir = normalizePath(m[2].replace(/\/\.git$/, ""))
     if (
       (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) &&
       GIT_VERB_RE.test(expanded)
+    ) {
+      return true
+    }
+  }
+  // Pattern A2.5: GIT_DIR / GIT_WORK_TREE env vars in the command preamble.
+  // `GIT_DIR=<chezmoi>/.git git commit` and `export GIT_WORK_TREE=<chezmoi>;
+  // git commit` are both ways to redirect git at the chezmoi repo without
+  // any `-C`/`--git-dir`/`cd` syntax. Match the env-assignment, normalize
+  // the path (stripping a trailing /.git), and require a git write-verb
+  // anywhere in the rest of the command.
+  const gitEnvRe = /(?:^|[\s|;&(])(?:export\s+)?(?:GIT_DIR|GIT_WORK_TREE)=(['"]?)([^\s'"|;&]+)\1/g
+  while ((m = gitEnvRe.exec(expanded)) !== null) {
+    const dir = normalizePath(m[2].replace(/\/\.git$/, ""))
+    if (
+      (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) &&
+      GIT_WRITE_VERB_RE.test(expanded)
+    ) {
+      return true
+    }
+  }
+  // Pattern A3: bash-tool `workdir` parameter pointed at chezmoi src + a
+  // git write-verb in the command. Without this, `bash(workdir=<chezmoi>,
+  // command="git commit")` slips past every other detector — there's no
+  // syntactic chezmoi reference in the command string itself, so A1/A2/B
+  // can't match. The workdir is supplied by the bash tool wrapper (above
+  // the regex layer), not by the user/agent's command shell.
+  if (workdir) {
+    const dir = normalizePath(workdir)
+    if (
+      (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) &&
+      GIT_WRITE_VERB_RE.test(expanded)
     ) {
       return true
     }
@@ -279,7 +389,7 @@ function bashCommitsChezmoiRepo(cmd: string): boolean {
     const dir = normalizePath(m[2])
     if (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) {
       const restOfCmd = expanded.slice(m.index + m[0].length)
-      if (/(?:^|[\s|;&(])git\s+(?:[^|;&]*?\s+)?(?:commit|push|reset|rebase|merge)\b/.test(restOfCmd)) {
+      if (GIT_WRITE_VERB_RE.test(restOfCmd)) {
         return true
       }
     }
@@ -326,10 +436,13 @@ export const ChezmoiGuard: Plugin = async () => {
       if (input.tool === "bash") {
         const cmd = bashCommandFromArgs(output.args)
         if (!cmd) return
+        const workdir = bashWorkdirFromArgs(output.args)
         // Commit detection runs against the WHOLE command — `cd <src> && git
         // commit` legitimately spans segments, and the whitelist is narrow
-        // enough that whole-command match is appropriate here.
-        if (bashCommitsChezmoiRepo(cmd)) {
+        // enough that whole-command match is appropriate here. The optional
+        // `workdir` parameter is consulted for Pattern A3 (bash-tool
+        // workdir-set commits with no syntactic chezmoi reference).
+        if (bashCommitsChezmoiRepo(cmd, workdir)) {
           throw new Error(
             `[chezmoi-guard] bash command appears to commit or push the\n` +
               `chezmoi source repo. The user always commits dotfile changes\n` +
@@ -338,11 +451,12 @@ export const ChezmoiGuard: Plugin = async () => {
               `If you have completed your edits and applied them, summarize\n` +
               `what changed and ask the user whether to commit & push.\n` +
               `\n` +
-              `IF the user has already explicitly approved this commit/push\n` +
-              `(e.g. responded "go ahead" / "yes"), make CHEZMOI_COMMIT_OK=1\n` +
-              `the FIRST TOKEN of the bash command, e.g.:\n` +
-              `  CHEZMOI_COMMIT_OK=1 git -C ~/.local/share/chezmoi commit -m "..."\n` +
-              `Constraints: must be first token, only =1 accepted, no export.\n` +
+              `IF the user has already explicitly approved this commit/push:\n` +
+              `  1. mint a single-use nonce:  N=$(chezmoi-approve-commit)\n` +
+              `  2. prefix the bash command:  CHEZMOI_COMMIT_OK=$N git ...\n` +
+              `Each commit/push needs a fresh nonce; the helper is a zsh\n` +
+              `function defined in dot_zshrc.tmpl. Nonces expire 5 min after\n` +
+              `mint and are deleted on first use (single-shot).\n` +
               `\n` +
               `Command (truncated): ${cmd.slice(0, 240)}`,
           )

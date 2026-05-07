@@ -180,6 +180,36 @@ yytmux() {
   fi
 }
 
+# Single-use, time-limited approval token for chezmoi-guard's CHEZMOI_COMMIT_OK
+# escape hatch. Each commit/push to the chezmoi source repo needs its own
+# fresh nonce: the plugin DELETES the nonce file on first match, so a stale
+# nonce can't be reused. TTL on the plugin side is 5 minutes; this helper
+# only mints — expiry is enforced when the plugin reads the file.
+#
+# Workflow:
+#   1. user approves a chezmoi commit/push
+#   2. agent runs:  CHEZMOI_COMMIT_OK=$(chezmoi-approve-commit) git -C ~/.local/share/chezmoi commit -m "..."
+#   3. plugin validates the nonce, deletes the file, allows the command
+#   4. for the NEXT commit/push, agent must mint a new nonce (step 1+2)
+#
+# `openssl rand -hex 16` is preferred (constant-time on macOS, no shell glue);
+# the /dev/urandom fallback is for environments without openssl on PATH.
+chezmoi-approve-commit() {
+  local nonce_dir="$HOME/.cache/chezmoi-guard"
+  local nonce_file="$nonce_dir/approve-nonce"
+  mkdir -p "$nonce_dir"
+  local nonce
+  if (( ${+commands[openssl]} )); then
+    nonce=$(openssl rand -hex 16)
+  else
+    nonce=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  fi
+  printf '%s' "$nonce" > "$nonce_file"
+  chmod 600 "$nonce_file" 2>/dev/null
+  print -u2 "[chezmoi-approve-commit] minted single-use approval (5min TTL)"
+  print -n -- "$nonce"
+}
+
 # Tier C — chezmoi drift indicator (background, authoritative).
 #
 # `_chezmoi_drift_check` runs from precmd at most once per 60s and asks
