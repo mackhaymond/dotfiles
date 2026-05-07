@@ -10,7 +10,7 @@
       "variant": "xhigh"
     },
     "oracle": {
-      "model": "google/gemini-3.1-pro-preview",
+      "model": "google/antigravity-gemini-3.1-pro",
       "variant": "high",
       "fallback_models": [
         {
@@ -26,11 +26,17 @@
       "model": "anthropic/claude-haiku-4-5"
     },
     "multimodal-looker": {
-      "model": "google/gemini-3-flash-preview"
+      "model": "google/antigravity-gemini-3-flash"
     },
     "prometheus": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh"
+      "variant": "xhigh",
+      "fallback_models": [
+        {
+          "model": "google/antigravity-gemini-3.1-pro",
+          "variant": "high"
+        }
+      ]
     },
     "metis": {
       "model": "anthropic/claude-opus-4-7",
@@ -38,7 +44,13 @@
     },
     "momus": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh"
+      "variant": "xhigh",
+      "fallback_models": [
+        {
+          "model": "google/antigravity-gemini-3.1-pro",
+          "variant": "high"
+        }
+      ]
     },
     "atlas": {
       "model": "anthropic/claude-sonnet-4-6"
@@ -59,20 +71,44 @@
   },
   "categories": {
     "visual-engineering": {
-      "model": "google/gemini-3.1-pro-preview",
-      "variant": "high"
+      "model": "google/antigravity-gemini-3.1-pro",
+      "variant": "high",
+      "fallback_models": [
+        {
+          "model": "anthropic/claude-opus-4-7",
+          "variant": "xhigh"
+        }
+      ]
     },
     "ultrabrain": {
-      "model": "google/gemini-3.1-pro-preview",
-      "variant": "high"
+      "model": "google/antigravity-gemini-3.1-pro",
+      "variant": "high",
+      "fallback_models": [
+        {
+          "model": "anthropic/claude-opus-4-7",
+          "variant": "xhigh"
+        }
+      ]
     },
     "deep": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh"
+      "variant": "xhigh",
+      "fallback_models": [
+        {
+          "model": "google/antigravity-gemini-3.1-pro",
+          "variant": "high"
+        }
+      ]
     },
     "artistry": {
-      "model": "google/gemini-3.1-pro-preview",
-      "variant": "high"
+      "model": "google/antigravity-gemini-3.1-pro",
+      "variant": "high",
+      "fallback_models": [
+        {
+          "model": "anthropic/claude-opus-4-7",
+          "variant": "xhigh"
+        }
+      ]
     },
     "quick": {
       "model": "anthropic/claude-haiku-4-5"
@@ -82,10 +118,19 @@
     },
     "unspecified-high": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh"
+      "variant": "xhigh",
+      "fallback_models": [
+        {
+          "model": "google/antigravity-gemini-3.1-pro",
+          "variant": "high"
+        }
+      ]
     },
     "writing": {
-      "model": "google/gemini-3-flash-preview"
+      "model": "google/antigravity-gemini-3-flash",
+      "fallback_models": [
+        "anthropic/claude-sonnet-4-6"
+      ]
     }
   }
 }
