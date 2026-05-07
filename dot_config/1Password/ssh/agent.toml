@@ -1,0 +1,7 @@
+# 1Password SSH agent config: which vaults op-ssh-sign and the SSH agent
+# expose. By default they only look in Personal; adding a Developer entry
+# here so git signing finds the SSH key after we moved it for service-
+# account access (service accounts can't access Personal vaults).
+[[ssh-keys]]
+item = "Github SSH Key"
+vault = "Developer"
