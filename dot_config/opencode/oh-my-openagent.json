@@ -1,5 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-opencode/dev/assets/oh-my-opencode.schema.json",
+  "google_auth": false,
   "agents": {
     "sisyphus": {
       "model": "anthropic/claude-opus-4-7",
