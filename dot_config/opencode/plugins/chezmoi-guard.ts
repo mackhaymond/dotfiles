@@ -179,6 +179,25 @@ function pathsFromBashCommand(cmd: string): string[] {
   return out
 }
 
+// Split a bash command into roughly-independent segments on shell statement
+// terminators (`;`, `&&`, `||`, newline). Each segment is then checked
+// independently for write-intent + managed-path. Without this, a command
+// like `cmd1 > /tmp/x ; cat ~/.zshrc` would over-match: the `>` write
+// intent + the `~/.zshrc` path token combine across segments to produce a
+// false-positive block.
+//
+// Naive: doesn't respect quoting or heredocs perfectly. Good enough for
+// the over-match reduction without regressing the actual coverage —
+// pathological cases (heredoc with semicolons inside, etc.) still fall
+// back to the conservative whole-cmd over-match because they end up as
+// one big segment.
+function splitBashSegments(cmd: string): string[] {
+  return cmd
+    .split(/(?:;|&&|\|\||\n)/g)
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
 // Detects bash commands that commit or push from the chezmoi source repo.
 // The user policy is "never commit/push dotfiles yourself" — applies whether
 // the agent uses raw `git -C <chezmoi-src>`, `git --git-dir=<chezmoi-src>/.git`,
@@ -187,29 +206,36 @@ function pathsFromBashCommand(cmd: string): string[] {
 // independent ways to set the repo, and `cd` sets it via cwd).
 //
 // ESCAPE HATCH: when the user explicitly approves a commit/push (e.g.
-// responds "go ahead" / "yes" to the agent's ask), the agent may set
-// `CHEZMOI_COMMIT_OK=1` as the FIRST TOKEN of the bash command:
+// responds "go ahead" / "yes" to the agent's ask), the agent prefixes the
+// bash command with `CHEZMOI_COMMIT_OK=1`. Canonical form:
 //
 //   CHEZMOI_COMMIT_OK=1 git -C ~/.local/share/chezmoi commit -m "..."
 //
-// Trust model: the env var is an agent attestation that user permission was
-// obtained. The plugin TRUSTS this attestation (a malicious agent could set
-// it anyway, but that violates the explicit AGENTS.md policy).
+// Also accepted: env-var preamble before the attestation, because most
+// agentic shells auto-prepend safety env vars (CI=true, GIT_TERMINAL_PROMPT
+// =0, etc.) and forcing CHEZMOI_COMMIT_OK=1 to be the LITERAL first token
+// would block legitimate use:
 //
-// Regex is anchored to start-of-command (`^\s*`) and accepts only `=1` to:
-//   1. Prevent `git commit -m "doc: explain CHEZMOI_COMMIT_OK=1 escape"`
-//      from accidentally tripping the bypass (the var name appears inside
-//      a commit message string, with whitespace before it, but is no
-//      longer at the start of the command line).
-//   2. Prevent `export CHEZMOI_COMMIT_OK=1 && git -C ... commit` from
-//      satisfying the gate (the `export ` prefix means the var isn't the
-//      first token — closes the cross-statement export-then-commit leak).
-//   3. Make the attestation shape unambiguous (one canonical form, no
-//      `=true`/`=yes` aliases competing for "did the agent really mean it").
+//   CI=true CHEZMOI_COMMIT_OK=1 git ... commit
+//   export CI=true && CHEZMOI_COMMIT_OK=1 git ... commit
+//   GIT_TERMINAL_PROMPT=0 CHEZMOI_COMMIT_OK=1 git ... commit
+//
+// Trust model: the env var is an agent attestation that user permission was
+// obtained. Plugin TRUSTS this (a malicious agent could set it anyway, but
+// that violates the explicit AGENTS.md policy).
+//
+// Regex anchored to start-of-command (`^`) so the var must be either the
+// first non-preamble token OR the very first token. Specifically REJECTS:
+//   - `git commit -m "doc: CHEZMOI_COMMIT_OK=1 escape"` — var inside a
+//     quoted string, preceded by `git commit -m "doc:` which isn't a
+//     valid env-preamble pattern → no match.
+//   - `cat /tmp/x ; CHEZMOI_COMMIT_OK=1 git commit` — leading non-preamble
+//     command, no match (preamble pattern only allows env assignments).
+// Accepts only `=1` (no =true/=yes aliases) for one canonical attestation.
 const GIT_VERB_RE = /\b(?:commit|push|reset|rebase|merge)\b/
 // IF YOU CHANGE THIS REGEX: keep `dot_config/opencode/AGENTS.md` in sync.
 // The regex literal is reproduced there for the user/agent-facing docs.
-const COMMIT_OK_RE = /^\s*CHEZMOI_COMMIT_OK=1\s+/
+const COMMIT_OK_RE = /^\s*(?:(?:export\s+)?[A-Za-z_]\w*=\S*\s*[;&]*\s+)*CHEZMOI_COMMIT_OK=1\s+/
 
 function bashCommitsChezmoiRepo(cmd: string): boolean {
   // Honor the user-approval escape hatch before running any detection.
@@ -300,6 +326,9 @@ export const ChezmoiGuard: Plugin = async () => {
       if (input.tool === "bash") {
         const cmd = bashCommandFromArgs(output.args)
         if (!cmd) return
+        // Commit detection runs against the WHOLE command — `cd <src> && git
+        // commit` legitimately spans segments, and the whitelist is narrow
+        // enough that whole-command match is appropriate here.
         if (bashCommitsChezmoiRepo(cmd)) {
           throw new Error(
             `[chezmoi-guard] bash command appears to commit or push the\n` +
@@ -318,9 +347,16 @@ export const ChezmoiGuard: Plugin = async () => {
               `Command (truncated): ${cmd.slice(0, 240)}`,
           )
         }
-        if (bashHasWriteIntent(cmd)) {
-          refresh()
-          for (const raw of pathsFromBashCommand(cmd)) {
+        // Write detection is per-segment so that `cmd > /tmp/x ; cat
+        // ~/.zshrc` doesn't false-positive: the `>` intent and the
+        // `~/.zshrc` path are in DIFFERENT statements and shouldn't be
+        // paired. Each segment is checked independently for the
+        // write-intent-AND-managed-path pairing.
+        let refreshed = false
+        for (const seg of splitBashSegments(cmd)) {
+          if (!bashHasWriteIntent(seg)) continue
+          if (!refreshed) { refresh(); refreshed = true }
+          for (const raw of pathsFromBashCommand(seg)) {
             const p = normalizePath(raw)
             if (managed.has(p)) throw managedPathError(p)
           }
