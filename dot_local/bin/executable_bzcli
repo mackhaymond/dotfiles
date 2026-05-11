@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""bzcli — Backblaze CLI wrapper.
+
+Thin shim around /Applications/Backblaze.app/Contents/MacOS/bzcli that adds
+a `status` subcommand for a pretty, glow-rendered dashboard. Everything
+else (including `report`) passes through unchanged.
+
+Run `bzcli help` for the full feature list.
+"""
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+REAL = "/Applications/Backblaze.app/Contents/MacOS/bzcli"
+
+WRAPPER_HELP_MD = """# 🛠️  bzcli — wrapper additions
+
+This wrapper adds a **`status`** subcommand for a pretty, glow-rendered
+dashboard. All other commands pass through unchanged to real bzcli — see
+the native help below.
+
+## `status` — pretty dashboard
+
+Render the backup report as a styled markdown dashboard via `glow`.
+
+| Flag                  | Description                                                |
+|-----------------------|------------------------------------------------------------|
+| `-q`, `--quiet`       | One-line status string, suitable for scripts               |
+| `-V`, `--verbose`     | Add settings, storage, and exclusion counts                |
+| `-VV`, `--all`        | Add full list of excluded directories and file extensions  |
+| `-w`, `--watch [N]`   | Live mode — refresh every `N` seconds (default `5`)        |
+| `--raw`               | Skip `glow`; emit raw markdown (useful for piping)         |
+| `--no-color`          | Strip ANSI escapes from output                             |
+| `-h`, `--help`        | Show this help                                             |
+
+### Examples
+
+```bash
+bzcli status                # snapshot dashboard
+bzcli status -q             # one-liner — perfect for tmux/sketchybar
+bzcli status -V             # + settings + storage + exclusion counts
+bzcli status -VV            # + every exclusion listed
+bzcli status -w             # live updating dashboard (5s refresh)
+bzcli status -w 10          # live, refresh every 10s
+bzcli status --raw          # raw markdown (pipe to glow yourself)
+```
+"""
+
+
+# ─── Pass-through ────────────────────────────────────────────────────
+
+
+def passthrough(args):
+    """Exec real bzcli with all args, preserving signals + exit code."""
+    if not os.path.exists(REAL):
+        sys.stderr.write(f"bzcli: real binary not found at {REAL}\n")
+        sys.stderr.write("Is Backblaze installed?\n")
+        sys.exit(127)
+    os.execvp(REAL, [REAL] + args)
+
+
+# ─── Formatting helpers ──────────────────────────────────────────────
+
+
+def fmt_bytes(n):
+    if n is None or n == 0:
+        return "0 B"
+    for div, unit in [(1024**4, "TiB"), (1024**3, "GiB"),
+                      (1024**2, "MiB"), (1024, "KiB")]:
+        if n >= div:
+            return f"{n/div:.2f} {unit}"
+    return f"{n} B"
+
+
+def time_ago(last_backup):
+    """`last_backup` dict → '5m ago' / '3h12m ago' / '2d ago'."""
+    try:
+        millis = last_backup.get("gmt_millis")
+        if not millis:
+            return last_backup.get("ISO8601", "never")
+        s = int(datetime.now().timestamp() - millis / 1000)
+        if s < 0:
+            return "in the future"
+        if s < 60:
+            return f"{s}s ago"
+        if s < 3600:
+            return f"{s//60}m ago"
+        if s < 86400:
+            return f"{s//3600}h{(s%3600)//60}m ago"
+        return f"{s//86400}d ago"
+    except Exception:
+        return str(last_backup)
+
+
+def progress_bar(pct, width=40):
+    filled = max(0, min(width, int(pct / 100 * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def license_str(license_data):
+    t = license_data.get("type", "?")
+    status = license_data.get("status", "?")
+    if status == "billing_active":
+        return f"`{t}` ✅"
+    if status.startswith("expires_"):
+        ts = status.replace("expires_", "")
+        try:
+            exp = datetime.strptime(ts, "%Y%m%d%H%M%S")
+            days = (exp - datetime.now()).days
+            warn = " ⚠️" if days < 14 else ""
+            return f"`{t}` (expires in {days}d, {exp.strftime('%Y-%m-%d')}){warn}"
+        except Exception:
+            pass
+    return f"`{t}` ({status})"
+
+
+def throttle_str(s):
+    if s.get("net_auto_throttle"):
+        return "auto"
+    nt = s.get("net_throttle", 0)
+    if nt == 100:
+        return "manual / max speed"
+    return f"manual / {nt}%"
+
+
+# ─── Markdown builders ───────────────────────────────────────────────
+
+
+def build_quiet(data):
+    b = data["backup"]
+    f_sel = b["backup"]["files"]["selected"]
+    f_rem = b["backup"]["files"]["remaining"]
+    b_sel = b["backup"]["bytes"]["selected"]
+    b_rem = b["backup"]["bytes"]["remaining"]
+    pct = (b_sel - b_rem) / b_sel * 100 if b_sel else 0
+    return (f"{b['status']['summary']}: "
+            f"{f_sel-f_rem:,}/{f_sel:,} files ({pct:.1f}%) "
+            f"— {b['status']['bztransmit']}")
+
+
+def build_markdown(data, level):
+    """level: 0=default, 1=verbose, 2=all-detail."""
+    b = data["backup"]
+    s = data["settings"]
+    sysi = data.get("sysinfo", {})
+
+    f_sel = b["backup"]["files"]["selected"]
+    f_rem = b["backup"]["files"]["remaining"]
+    b_sel = b["backup"]["bytes"]["selected"]
+    b_rem = b["backup"]["bytes"]["remaining"]
+    pct = (b_sel - b_rem) / b_sel * 100 if b_sel else 0
+
+    safety = b["status"].get("safety_freeze", "?")
+    safety_icon = "✅" if safety == "not_frozen" else "⚠️"
+    last_obj = b["status"].get("last_backup", {})
+    last = last_obj.get("ISO8601", "never")
+    last_rel = time_ago(last_obj)
+
+    md = ["# 📦 Backblaze Backup Status\n"]
+
+    # ── State ────────────────────────────────────────────
+    md += [
+        "## ⚡ State\n",
+        "| Field | Value |",
+        "|---|---|",
+        f"| Summary | **{b['status'].get('summary','?')}** |",
+        f"| Transmitting | `{b['status'].get('bztransmit','?')}` |",
+        f"| Safety freeze | {safety} {safety_icon} |",
+        f"| Last backup | {last} _({last_rel})_ |",
+        f"| License | {license_str(b['license'])} |",
+        "",
+    ]
+
+    # ── Selection ────────────────────────────────────────
+    md += [
+        "## 📊 Selection\n",
+        "| Field | Value |",
+        "|---|---|",
+        f"| Selected | {f_sel:,} files / {fmt_bytes(b_sel)} |",
+        f"| Remaining | {f_rem:,} files / {fmt_bytes(b_rem)} |",
+        f"| Progress | `{progress_bar(pct)}` **{pct:.1f}%** |",
+        "",
+    ]
+
+    # ── Machine ──────────────────────────────────────────
+    md += [
+        "## 💻 Machine\n",
+        "| Field | Value |",
+        "|---|---|",
+        f"| Account | `{b['account']['email']}` |",
+        f"| Hostname | {b['installation']['hostname']} |",
+    ]
+    if sysi:
+        md.append(f"| CPU | {sysi.get('hw.cpu.brand_string','?')} |")
+        md.append(f"| RAM | {fmt_bytes(sysi.get('hw.memsize',0))} |")
+        md.append(f"| macOS | {sysi.get('os.version','?')} ({sysi.get('exe.arch','?')}) |")
+    md.append("")
+
+    if level == 0:
+        return "\n".join(md)
+
+    # ── Settings ─────────────────────────────────────────
+    md += [
+        "## ⚙️  Settings\n",
+        "| Setting | Value |",
+        "|---|---|",
+        f"| Backup threads | **{s.get('num_backup_threads','?')}** |",
+        f"| Network throttle | {throttle_str(s)} |",
+        f"| Backup on battery | {s.get('backup_on_battery','?')} |",
+        f"| Schedule | {s.get('backup_schedule_type','?')} |",
+        f"| Max file size | {fmt_bytes(s.get('max_filesize_mb',0) * 1024 * 1024)} |",
+        f"| Client version | {b['installation'].get('version','?')} |",
+        f"| Datacenter | `{b['datacenter']['cluster']}` ({b['datacenter']['url']}) |",
+        "",
+    ]
+
+    # ── Storage ──────────────────────────────────────────
+    storage = sysi.get("storage", [])
+    if storage:
+        md += [
+            "## 💾 Storage\n",
+            "| Volume | Used | Free | Total | Used % |",
+            "|---|---|---|---|---|",
+        ]
+        for v in storage:
+            name = v.get("user_readable_name", v.get("filepath", "?"))
+            total = v.get("total_bytes", 0)
+            free = v.get("free_bytes", 0)
+            used = total - free
+            used_pct = (used / total * 100) if total else 0
+            md.append(f"| {name} | {fmt_bytes(used)} | {fmt_bytes(free)} "
+                      f"| {fmt_bytes(total)} | {used_pct:.1f}% |")
+        md.append("")
+
+    # ── Exclusions summary ───────────────────────────────
+    dirs = [d for d in s.get("bzdirfilter_add", [])
+            if d.get("whichfiles") == "none"]
+    exts = [e.strip() for e in s.get("excludefiletypes_add", "").split(",")
+            if e.strip()]
+    md += [
+        "## 🚫 Exclusions\n",
+        f"- **Directories excluded:** {len(dirs)}",
+        f"- **File extensions excluded:** {len(exts)}",
+        "",
+    ]
+
+    if level >= 2:
+        md += ["### All excluded directories\n", "```"]
+        for d in sorted(dirs, key=lambda x: x["dir"]):
+            md.append(f"  {d['dir']}")
+        md += ["```\n", "### All excluded file extensions\n", "```",
+               ", ".join(exts), "```\n"]
+
+    return "\n".join(md)
+
+
+# ─── Rendering ───────────────────────────────────────────────────────
+
+
+def render(md, *, use_glow=True, no_color=False):
+    if use_glow and shutil.which("glow"):
+        try:
+            subprocess.run(["glow", "-s", "dark", "-"],
+                           input=md.encode(), check=True)
+            return
+        except subprocess.CalledProcessError:
+            pass
+    if no_color:
+        # strip backticks etc. for cleanest text output
+        md = md.replace("`", "")
+    print(md)
+
+
+def strip_ansi(text):
+    import re
+    return re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
+
+
+# ─── Data fetch ──────────────────────────────────────────────────────
+
+
+def fetch_report():
+    p = subprocess.run([REAL, "report"], capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.stderr.write(p.stderr or "bzcli failed\n")
+        sys.exit(p.returncode)
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"bzcli returned non-JSON: {e}\n")
+        sys.exit(1)
+
+
+# ─── Status subcommand ───────────────────────────────────────────────
+
+
+def parse_status_args(args):
+    """Returns (mode, level, raw, no_color, watch_seconds).
+    mode: 'quiet' | 'pretty' | 'help'
+    level: 0 (default) | 1 (-V) | 2 (-VV)
+    """
+    mode = "pretty"
+    level = 0
+    raw = False
+    no_color = False
+    watch = None
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            mode = "help"
+        elif a in ("-q", "--quiet"):
+            mode = "quiet"
+        elif a == "-VV" or a == "--all":
+            level = 2
+        elif a in ("-V", "--verbose"):
+            level = 1
+        elif a == "--raw":
+            raw = True
+        elif a == "--no-color":
+            no_color = True
+        elif a in ("-w", "--watch"):
+            watch = 5
+            # peek next arg for optional N
+            if i + 1 < len(args) and args[i + 1].isdigit():
+                watch = int(args[i + 1])
+                i += 1
+        else:
+            sys.stderr.write(f"bzcli status: unknown flag '{a}'\n")
+            sys.stderr.write("Run `bzcli help` for usage.\n")
+            sys.exit(2)
+        i += 1
+
+    return mode, level, raw, no_color, watch
+
+
+def cmd_status(args):
+    mode, level, raw, no_color, watch = parse_status_args(args)
+
+    if mode == "help":
+        render(WRAPPER_HELP_MD)
+        return
+
+    def once():
+        data = fetch_report()
+        if mode == "quiet":
+            line = build_quiet(data)
+            print(strip_ansi(line) if no_color else line)
+        else:
+            render(build_markdown(data, level),
+                   use_glow=not raw, no_color=no_color)
+
+    if watch:
+        # Live mode: clear + redraw every N seconds
+        signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+        try:
+            while True:
+                os.system("clear")
+                once()
+                sys.stdout.write(f"\n[refreshing every {watch}s — Ctrl-C to exit]\n")
+                sys.stdout.flush()
+                time.sleep(watch)
+        except KeyboardInterrupt:
+            pass
+        return
+
+    once()
+
+
+# ─── Help subcommand ─────────────────────────────────────────────────
+
+
+def cmd_help():
+    """Render wrapper-specific help, then append native bzcli --help."""
+    render(WRAPPER_HELP_MD)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    if os.path.exists(REAL):
+        subprocess.run([REAL, "--help"])
+
+
+# ─── Entry ───────────────────────────────────────────────────────────
+
+
+def main():
+    args = sys.argv[1:]
+
+    # Help (wrapper-level)
+    if not args or args[0] in ("help", "-h", "--help"):
+        cmd_help()
+        return
+
+    # Pretty status subcommand
+    if args[0] == "status":
+        cmd_status(args[1:])
+        return
+
+    # Everything else → real bzcli, unchanged
+    passthrough(args)
+
+
+if __name__ == "__main__":
+    main()
