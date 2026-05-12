@@ -8,10 +8,8 @@ else (including `report`) passes through unchanged.
 Run `bzcli help` for the full feature list.
 """
 
-import glob
 import json
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -20,7 +18,6 @@ import time
 from datetime import datetime
 
 REAL = "/Applications/Backblaze.app/Contents/MacOS/bzcli"
-BZDATA = "/Library/Backblaze.bzpkg/bzdata"
 
 WRAPPER_HELP_MD = """# 🛠️  bzcli — wrapper additions
 
@@ -132,122 +129,6 @@ def throttle_str(s):
     return f"manual / {nt}%"
 
 
-def fmt_duration(seconds):
-    """seconds → '5m 23s' / '2h 14m' / '1d 4h'."""
-    if seconds < 0:
-        return "?"
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    if seconds < 3600:
-        return f"{int(seconds//60)}m {int(seconds%60)}s"
-    if seconds < 86400:
-        return f"{int(seconds//3600)}h {int((seconds%3600)//60)}m"
-    return f"{int(seconds//86400)}d {int((seconds%86400)//3600)}h"
-
-
-def get_scan_progress():
-    """Return dict describing in-flight bzfilelist scan, or None."""
-    fl_dir = os.path.join(BZDATA, "bzfilelists")
-    if not os.path.isdir(fl_dir):
-        return None
-
-    dats = glob.glob(os.path.join(fl_dir, "v*_root_filelist.dat"))
-    futures = glob.glob(os.path.join(fl_dir, "v*_root_filelist.dat.future"))
-    if not futures:
-        return None
-
-    future_path = futures[0]
-    future_bytes = os.path.getsize(future_path)
-    future_mtime = os.path.getmtime(future_path)
-    active_bytes = os.path.getsize(dats[0]) if dats else 0
-    pct = (future_bytes / active_bytes * 100) if active_bytes else 0
-
-    # Get bzfilelist process info
-    proc = None
-    try:
-        r = subprocess.run(["pgrep", "-x", "bzfilelist"],
-                           capture_output=True, text=True)
-        if r.stdout.strip():
-            pid = r.stdout.strip().split("\n")[0]
-            ps = subprocess.run(
-                ["ps", "-p", pid, "-o", "etime=,pcpu=,state=,nice="],
-                capture_output=True, text=True)
-            parts = ps.stdout.strip().split()
-            if len(parts) >= 4:
-                proc = {
-                    "pid": pid,
-                    "etime": parts[0],
-                    "pcpu": float(parts[1]),
-                    "state": parts[2],
-                    "nice": int(parts[3]),
-                }
-    except Exception:
-        pass
-
-    # Recent scan dir from log
-    current_dir = None
-    log_files = glob.glob(os.path.join(BZDATA, "bzlogs/bzfilelist/*.log"))
-    if log_files:
-        latest_log = max(log_files, key=os.path.getmtime)
-        try:
-            with open(latest_log) as f:
-                f.seek(0, 2)
-                size = f.tell()
-                f.seek(max(0, size - 100_000))
-                tail = f.read()
-            scans = re.findall(r"about_to_scanDir=([^,]+)", tail)
-            if scans:
-                current_dir = scans[-1]
-        except Exception:
-            pass
-
-    # Estimate growth rate / ETA based on process etime + .future size
-    eta_str = None
-    rate_str = None
-    if proc and active_bytes and future_bytes < active_bytes:
-        # parse etime: [dd-]hh:mm:ss or mm:ss
-        try:
-            etime = proc["etime"]
-            secs = 0
-            if "-" in etime:
-                d, rest = etime.split("-", 1)
-                secs += int(d) * 86400
-                etime = rest
-            parts = [int(p) for p in etime.split(":")]
-            while len(parts) < 3:
-                parts.insert(0, 0)
-            secs += parts[0]*3600 + parts[1]*60 + parts[2]
-            if secs > 0:
-                rate = future_bytes / secs  # bytes/sec
-                if rate > 0:
-                    remaining = active_bytes - future_bytes
-                    eta_secs = remaining / rate
-                    eta_str = fmt_duration(eta_secs)
-                    rate_str = f"{rate/1024/1024:.2f} MiB/s avg (over {fmt_duration(secs)})"
-        except Exception:
-            pass
-
-    # Activity heuristic: is .future being written to?
-    age = time.time() - future_mtime
-    if age < 60:
-        activity = f"writing now ({int(age)}s ago)"
-    elif age < 300:
-        activity = f"recent write ({int(age/60)}m ago)"
-    else:
-        activity = f"idle ({fmt_duration(age)} since last write) — may be stalled"
-
-    return {
-        "future_bytes": future_bytes,
-        "active_bytes": active_bytes,
-        "pct": pct,
-        "current_dir": current_dir,
-        "proc": proc,
-        "activity": activity,
-        "eta": eta_str,
-        "rate": rate_str,
-    }
-
-
 # ─── Markdown builders ───────────────────────────────────────────────
 
 
@@ -263,47 +144,8 @@ def build_quiet(data):
             f"— {b['status']['bztransmit']}")
 
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-
-
-def visible_len(s):
-    return len(ANSI_RE.sub("", s))
-
-
-def pad_to(s, width):
-    return s + " " * max(0, width - visible_len(s))
-
-
-def render_glow(md, width):
-    """Pipe md through glow at fixed width, return list of lines (or fallback)."""
-    if not shutil.which("glow"):
-        return md.splitlines()
-    try:
-        r = subprocess.run(
-            ["glow", "-s", "dark", "-w", str(width), "-"],
-            input=md.encode(), capture_output=True, check=True,
-        )
-        return r.stdout.decode().splitlines()
-    except subprocess.CalledProcessError:
-        return md.splitlines()
-
-
-def join_columns(left, right, sep="  │  "):
-    """Side-by-side join, ANSI-aware width padding."""
-    if not right:
-        return left
-    width_l = max((visible_len(l) for l in left), default=0)
-    rows = max(len(left), len(right))
-    out = []
-    for i in range(rows):
-        l = left[i] if i < len(left) else ""
-        r = right[i] if i < len(right) else ""
-        out.append(f"{pad_to(l, width_l)}{sep}{r}")
-    return out
-
-
-def build_sections(data, level):
-    """Return list of (md_string,) for each panel, in display order."""
+def build_markdown(data, level):
+    """level: 0=default, 1=verbose, 2=all-detail."""
     b = data["backup"]
     s = data["settings"]
     sysi = data.get("sysinfo", {})
@@ -319,106 +161,71 @@ def build_sections(data, level):
     last_obj = b["status"].get("last_backup", {})
     last = last_obj.get("ISO8601", "never")
     last_rel = time_ago(last_obj)
-    summary = b["status"].get("summary", "?")
 
-    sections = []
+    md = ["# 📦 Backblaze Backup Status\n"]
 
-    # State panel
-    sections.append("\n".join([
-        "## ⚡ State",
-        "",
+    # ── State ────────────────────────────────────────────
+    md += [
+        "## ⚡ State\n",
         "| Field | Value |",
         "|---|---|",
-        f"| Summary | **{summary}** |",
+        f"| Summary | **{b['status'].get('summary','?')}** |",
         f"| Transmitting | `{b['status'].get('bztransmit','?')}` |",
-        f"| Safety | {safety} {safety_icon} |",
-        f"| Last backup | _{last_rel}_ |",
+        f"| Safety freeze | {safety} {safety_icon} |",
+        f"| Last backup | {last} _({last_rel})_ |",
         f"| License | {license_str(b['license'])} |",
-    ]))
-
-    # Machine panel
-    machine_rows = [
-        "## 💻 Machine",
         "",
+    ]
+
+    # ── Selection ────────────────────────────────────────
+    md += [
+        "## 📊 Selection\n",
+        "| Field | Value |",
+        "|---|---|",
+        f"| Selected | {f_sel:,} files / {fmt_bytes(b_sel)} |",
+        f"| Remaining | {f_rem:,} files / {fmt_bytes(b_rem)} |",
+        f"| Progress | `{progress_bar(pct)}` **{pct:.1f}%** |",
+        "",
+    ]
+
+    # ── Machine ──────────────────────────────────────────
+    md += [
+        "## 💻 Machine\n",
         "| Field | Value |",
         "|---|---|",
         f"| Account | `{b['account']['email']}` |",
         f"| Hostname | {b['installation']['hostname']} |",
     ]
     if sysi:
-        machine_rows += [
-            f"| CPU | {sysi.get('hw.cpu.brand_string','?')} |",
-            f"| RAM | {fmt_bytes(sysi.get('hw.memsize',0))} |",
-            f"| macOS | {sysi.get('os.version','?')} ({sysi.get('exe.arch','?')}) |",
-        ]
-    sections.append("\n".join(machine_rows))
-
-    # Selection panel
-    sections.append("\n".join([
-        "## 📊 Selection",
-        "",
-        "| Field | Value |",
-        "|---|---|",
-        f"| Selected | {f_sel:,} files |",
-        f"| Size | {fmt_bytes(b_sel)} |",
-        f"| Remaining | {f_rem:,} files / {fmt_bytes(b_rem)} |",
-        f"| Progress | **{pct:.1f}%** |",
-        f"| | `{progress_bar(pct, 28)}` |",
-    ]))
-
-    # Analyzing panel (only during scan)
-    if summary == "Analyzing":
-        scan = get_scan_progress()
-        if scan:
-            rows = [
-                "## 🔬 Analyzing",
-                "",
-                "| Field | Value |",
-                "|---|---|",
-                f"| Progress | **{scan['pct']:.1f}%** |",
-                f"| | `{progress_bar(scan['pct'], 28)}` |",
-                f"| Building | {fmt_bytes(scan['future_bytes'])} / ~{fmt_bytes(scan['active_bytes'])} |",
-                f"| Activity | {scan['activity']} |",
-            ]
-            if scan["eta"]:
-                rows.append(f"| ETA | **{scan['eta']}** |")
-            if scan["rate"]:
-                rows.append(f"| Rate | {scan['rate']} |")
-            if scan["proc"]:
-                p = scan["proc"]
-                rows.append(f"| Scanner | PID {p['pid']} · {p['pcpu']}% CPU · nice {p['nice']} |")
-            if scan["current_dir"]:
-                short = scan["current_dir"]
-                if len(short) > 45:
-                    short = "…" + short[-43:]
-                rows.append(f"| Last dir | `{short}` |")
-            sections.append("\n".join(rows))
+        md.append(f"| CPU | {sysi.get('hw.cpu.brand_string','?')} |")
+        md.append(f"| RAM | {fmt_bytes(sysi.get('hw.memsize',0))} |")
+        md.append(f"| macOS | {sysi.get('os.version','?')} ({sysi.get('exe.arch','?')}) |")
+    md.append("")
 
     if level == 0:
-        return sections
+        return "\n".join(md)
 
-    # ── Settings panel ───────────────────────────────────
-    sections.append("\n".join([
-        "## ⚙️  Settings",
-        "",
+    # ── Settings ─────────────────────────────────────────
+    md += [
+        "## ⚙️  Settings\n",
         "| Setting | Value |",
         "|---|---|",
-        f"| Threads | **{s.get('num_backup_threads','?')}** |",
-        f"| Throttle | {throttle_str(s)} |",
-        f"| On battery | {s.get('backup_on_battery','?')} |",
+        f"| Backup threads | **{s.get('num_backup_threads','?')}** |",
+        f"| Network throttle | {throttle_str(s)} |",
+        f"| Backup on battery | {s.get('backup_on_battery','?')} |",
         f"| Schedule | {s.get('backup_schedule_type','?')} |",
-        f"| Max file | {fmt_bytes(s.get('max_filesize_mb',0)*1024*1024)} |",
-        f"| Version | {b['installation'].get('version','?')} |",
-        f"| Datacenter | `{b['datacenter']['cluster']}` |",
-    ]))
+        f"| Max file size | {fmt_bytes(s.get('max_filesize_mb',0) * 1024 * 1024)} |",
+        f"| Client version | {b['installation'].get('version','?')} |",
+        f"| Datacenter | `{b['datacenter']['cluster']}` ({b['datacenter']['url']}) |",
+        "",
+    ]
 
-    # ── Storage panel ────────────────────────────────────
+    # ── Storage ──────────────────────────────────────────
     storage = sysi.get("storage", [])
     if storage:
-        rows = [
-            "## 💾 Storage",
-            "",
-            "| Volume | Used | Free | Total | % |",
+        md += [
+            "## 💾 Storage\n",
+            "| Volume | Used | Free | Total | Used % |",
             "|---|---|---|---|---|",
         ]
         for v in storage:
@@ -426,77 +233,31 @@ def build_sections(data, level):
             total = v.get("total_bytes", 0)
             free = v.get("free_bytes", 0)
             used = total - free
-            up = (used/total*100) if total else 0
-            rows.append(
-                f"| {name} | {fmt_bytes(used)} | {fmt_bytes(free)} "
-                f"| {fmt_bytes(total)} | {up:.0f}% |"
-            )
-        sections.append("\n".join(rows))
+            used_pct = (used / total * 100) if total else 0
+            md.append(f"| {name} | {fmt_bytes(used)} | {fmt_bytes(free)} "
+                      f"| {fmt_bytes(total)} | {used_pct:.1f}% |")
+        md.append("")
 
-    # ── Exclusions panel ─────────────────────────────────
+    # ── Exclusions summary ───────────────────────────────
     dirs = [d for d in s.get("bzdirfilter_add", [])
             if d.get("whichfiles") == "none"]
     exts = [e.strip() for e in s.get("excludefiletypes_add", "").split(",")
             if e.strip()]
-    sections.append("\n".join([
-        "## 🚫 Exclusions",
+    md += [
+        "## 🚫 Exclusions\n",
+        f"- **Directories excluded:** {len(dirs)}",
+        f"- **File extensions excluded:** {len(exts)}",
         "",
-        "| Type | Count |",
-        "|---|---|",
-        f"| Directories | **{len(dirs)}** |",
-        f"| File extensions | **{len(exts)}** |",
-    ]))
+    ]
 
     if level >= 2:
-        # Full lists as wide-spanning panels (no side-by-side)
-        dir_lines = ["## All excluded directories", "", "```"]
+        md += ["### All excluded directories\n", "```"]
         for d in sorted(dirs, key=lambda x: x["dir"]):
-            dir_lines.append(f"  {d['dir']}")
-        dir_lines.append("```")
-        sections.append("\n".join(dir_lines))
-        sections.append("\n".join([
-            "## All excluded file extensions", "",
-            "```", ", ".join(exts), "```",
-        ]))
+            md.append(f"  {d['dir']}")
+        md += ["```\n", "### All excluded file extensions\n", "```",
+               ", ".join(exts), "```\n"]
 
-    return sections
-
-
-def render_dashboard(sections, *, no_color=False):
-    """Render sections as side-by-side panels (2-up where it fits)."""
-    term_width = shutil.get_terminal_size((100, 24)).columns
-    sep_width = 5  # "  │  "
-    panel_width = max(36, (term_width - sep_width) // 2)
-
-    # Header (full-width)
-    header_lines = render_glow("# 📦 Backblaze Backup Status\n", term_width)
-    out = list(header_lines)
-
-    # Decide which sections go wide (no pairing) vs paired
-    # Heuristic: panels with raw ``` code blocks (verbose -VV) go full width
-    panels = []
-    full_width = []
-    for md in sections:
-        if "```" in md:
-            full_width.append(md)
-        else:
-            panels.append(md)
-
-    # Render and pair the regular panels 2-up
-    rendered = [render_glow(md, panel_width) for md in panels]
-    for i in range(0, len(rendered), 2):
-        left = rendered[i]
-        right = rendered[i + 1] if i + 1 < len(rendered) else None
-        out += join_columns(left, right)
-
-    # Append full-width panels
-    for md in full_width:
-        out += render_glow(md, term_width)
-
-    text = "\n".join(out)
-    if no_color:
-        text = ANSI_RE.sub("", text)
-    print(text)
+    return "\n".join(md)
 
 
 # ─── Rendering ───────────────────────────────────────────────────────
@@ -592,36 +353,22 @@ def cmd_status(args):
         if mode == "quiet":
             line = build_quiet(data)
             print(strip_ansi(line) if no_color else line)
-            return
-        sections = build_sections(data, level)
-        if raw or not shutil.which("glow"):
-            # Raw: just concatenate the markdown sections vertically
-            print("\n\n".join(["# 📦 Backblaze Backup Status"] + sections))
         else:
-            render_dashboard(sections, no_color=no_color)
+            render(build_markdown(data, level),
+                   use_glow=not raw, no_color=no_color)
 
     if watch:
-        # Live mode: alt-screen buffer + cursor-home overwrite = no flicker.
-        # \033[?1049h enters alt screen, \033[?25l hides cursor,
-        # \033[H homes cursor, \033[J clears from cursor down.
-        # On exit (Ctrl-C), restore cursor + alt screen.
-        sys.stdout.write("\033[?1049h\033[?25l")
-        sys.stdout.flush()
+        # Live mode: clear + redraw every N seconds
+        signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
         try:
             while True:
-                sys.stdout.write("\033[H")  # home, don't clear yet
+                os.system("clear")
                 once()
-                sys.stdout.write(
-                    f"\n[refreshing every {watch}s — Ctrl-C to exit]\n"
-                    f"\033[J"  # clear from cursor to end (erases leftover lines)
-                )
+                sys.stdout.write(f"\n[refreshing every {watch}s — Ctrl-C to exit]\n")
                 sys.stdout.flush()
                 time.sleep(watch)
         except KeyboardInterrupt:
             pass
-        finally:
-            sys.stdout.write("\033[?25h\033[?1049l")  # show cursor, exit alt screen
-            sys.stdout.flush()
         return
 
     once()
