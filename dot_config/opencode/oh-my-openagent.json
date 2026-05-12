@@ -1,12 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-opencode/dev/assets/oh-my-opencode.schema.json",
-  "google_auth": false,
   "agents": {
     "sisyphus": {
-      "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh"
-    },
-    "hephaestus": {
       "model": "anthropic/claude-opus-4-7",
       "variant": "xhigh"
     },
@@ -19,9 +14,6 @@
           "variant": "xhigh"
         }
       ]
-    },
-    "librarian": {
-      "model": "anthropic/claude-haiku-4-5"
     },
     "explore": {
       "model": "anthropic/claude-haiku-4-5"
@@ -59,6 +51,13 @@
     },
     "sisyphus-junior": {
       "model": "anthropic/claude-sonnet-4-6"
+    },
+    "hephaestus": {
+      "model": "anthropic/claude-opus-4-7",
+      "variant": "xhigh"
+    },
+    "librarian": {
+      "model": "anthropic/claude-haiku-4-5"
     },
     "build": {
       "model": "anthropic/claude-sonnet-4-6"
@@ -113,20 +112,30 @@
       ]
     },
     "quick": {
-      "model": "anthropic/claude-haiku-4-5"
+      "model": "anthropic/claude-haiku-4-5",
+      "fallback_models": [
+        {
+          "model": "google/gemini-3-flash-preview"
+        }
+      ]
     },
     "unspecified-low": {
-      "model": "anthropic/claude-sonnet-4-6"
+      "model": "anthropic/claude-sonnet-4-6",
+      "fallback_models": [
+        {
+          "model": "google/gemini-3-flash-preview"
+        }
+      ]
     },
     "unspecified-high": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh",
       "fallback_models": [
         {
           "model": "google/antigravity-gemini-3.1-pro",
           "variant": "high"
         }
-      ]
+      ],
+      "variant": "xhigh"
     },
     "writing": {
       "model": "google/antigravity-gemini-3-flash",
@@ -134,5 +143,6 @@
         "anthropic/claude-sonnet-4-6"
       ]
     }
-  }
+  },
+  "google_auth": false
 }
