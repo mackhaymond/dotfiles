@@ -409,18 +409,25 @@ def build_markdown(data, level):
 def render(md, *, use_glow=True, no_color=False):
     if use_glow and shutil.which("glow"):
         try:
+            # CLICOLOR_FORCE=1 forces glow's termenv library to emit ANSI color
+            # codes even though its stdout is a pipe (capture_output=True).
+            # Without this, glow detects non-TTY and strips colors, leaving
+            # only bold/italic attributes.
+            env = {**os.environ,
+                   "CLICOLOR_FORCE": "1",
+                   "COLORTERM": os.environ.get("COLORTERM", "truecolor")}
             r = subprocess.run(
                 ["glow", "-s", "dark", "-"],
                 input=md.encode(),
                 capture_output=True,
                 check=True,
+                env=env,
             )
             # IMPORTANT: write through sys.stdout (text mode), not
             # sys.stdout.buffer (binary). Mixing the two in watch mode causes
             # buffer-ordering bugs where \033[H written via sys.stdout.write
             # gets flushed AFTER glow bytes written via sys.stdout.buffer,
-            # silently moving the cursor home and overwriting the dashboard
-            # with the refresh footer.
+            # silently moving the cursor home and overwriting the dashboard.
             sys.stdout.write(r.stdout.decode("utf-8", errors="replace"))
             sys.stdout.flush()
             return
