@@ -511,26 +511,27 @@ def cmd_status(args):
                    use_glow=not raw, no_color=no_color)
 
     if watch:
-        # Live mode: alt-screen buffer + cursor-home overwrite = no flicker.
-        # \033[?1049h enters alt screen, \033[?25l hides cursor,
-        # \033[H homes cursor, \033[J clears from cursor down.
-        # On exit (Ctrl-C), restore cursor + alt screen.
-        sys.stdout.write("\033[?1049h\033[?25l")
+        # Live mode: top/htop-style. Clear screen once, then each iteration:
+        # cursor-home → write content → clear-to-end. No alt-screen — some
+        # terminals (Ghostty, Wezterm, etc.) handle it inconsistently, and
+        # the captured-glow-output approach already eliminates the original
+        # flicker problem.
+        sys.stdout.write("\033[2J\033[H\033[?25l")  # clear screen, home, hide cursor
         sys.stdout.flush()
         try:
             while True:
-                sys.stdout.write("\033[H")  # home, don't clear yet
+                sys.stdout.write("\033[H")  # cursor home (overwrites in place)
                 once()
                 sys.stdout.write(
                     f"\n[refreshing every {watch}s — Ctrl-C to exit]\n"
-                    f"\033[J"  # clear from cursor to end (erases leftover lines)
+                    f"\033[J"  # clear from cursor to end of screen
                 )
                 sys.stdout.flush()
                 time.sleep(watch)
         except KeyboardInterrupt:
             pass
         finally:
-            sys.stdout.write("\033[?25h\033[?1049l")  # show cursor, exit alt screen
+            sys.stdout.write("\033[?25h\n")  # show cursor + newline
             sys.stdout.flush()
         return
 
