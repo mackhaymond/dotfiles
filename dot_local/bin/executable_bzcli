@@ -409,27 +409,17 @@ def build_markdown(data, level):
 def render(md, *, use_glow=True, no_color=False):
     if use_glow and shutil.which("glow"):
         try:
-            # CLICOLOR_FORCE=1 forces glow's termenv library to emit ANSI color
-            # codes even though its stdout is a pipe (capture_output=True).
-            # Without this, glow detects non-TTY and strips colors, leaving
-            # only bold/italic attributes.
-            env = {**os.environ,
-                   "CLICOLOR_FORCE": "1",
-                   "COLORTERM": os.environ.get("COLORTERM", "truecolor")}
-            r = subprocess.run(
-                ["glow", "-s", "dark", "-"],
-                input=md.encode(),
-                capture_output=True,
-                check=True,
-                env=env,
-            )
-            # IMPORTANT: write through sys.stdout (text mode), not
-            # sys.stdout.buffer (binary). Mixing the two in watch mode causes
-            # buffer-ordering bugs where \033[H written via sys.stdout.write
-            # gets flushed AFTER glow bytes written via sys.stdout.buffer,
-            # silently moving the cursor home and overwriting the dashboard.
-            sys.stdout.write(r.stdout.decode("utf-8", errors="replace"))
+            # IMPORTANT: flush Python's stdout buffer BEFORE glow runs.
+            # We inherit stdout so glow writes to the TTY directly with full
+            # color depth (truecolor/256-color, not the dim 16-color palette
+            # glow falls back to when its stdout is a pipe). But if Python's
+            # text buffer has pending bytes (e.g. \033[H from the watch loop),
+            # they'd be flushed AFTER glow's output, scrambling the order.
+            # Flushing here ensures: Python bytes → TTY, then glow → TTY, then
+            # next Python bytes → TTY. Correct sequencing + full colors.
             sys.stdout.flush()
+            subprocess.run(["glow", "-s", "dark", "-"],
+                           input=md.encode(), check=True)
             return
         except subprocess.CalledProcessError:
             pass
