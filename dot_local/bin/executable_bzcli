@@ -409,18 +409,19 @@ def build_markdown(data, level):
 def render(md, *, use_glow=True, no_color=False):
     if use_glow and shutil.which("glow"):
         try:
-            # IMPORTANT: capture_output=True so glow can't write directly to the
-            # TTY. When glow inherits stdout in an alt-screen-buffer context
-            # (watch mode), its own terminal-control codes can exit our alt
-            # buffer mid-render and the dashboard ends up in the wrong screen.
-            # Capturing decouples glow from terminal state.
             r = subprocess.run(
                 ["glow", "-s", "dark", "-"],
                 input=md.encode(),
                 capture_output=True,
                 check=True,
             )
-            sys.stdout.buffer.write(r.stdout)
+            # IMPORTANT: write through sys.stdout (text mode), not
+            # sys.stdout.buffer (binary). Mixing the two in watch mode causes
+            # buffer-ordering bugs where \033[H written via sys.stdout.write
+            # gets flushed AFTER glow bytes written via sys.stdout.buffer,
+            # silently moving the cursor home and overwriting the dashboard
+            # with the refresh footer.
+            sys.stdout.write(r.stdout.decode("utf-8", errors="replace"))
             sys.stdout.flush()
             return
         except subprocess.CalledProcessError:
