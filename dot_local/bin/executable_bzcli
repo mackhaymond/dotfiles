@@ -409,13 +409,23 @@ def build_markdown(data, level):
 def render(md, *, use_glow=True, no_color=False):
     if use_glow and shutil.which("glow"):
         try:
-            subprocess.run(["glow", "-s", "dark", "-"],
-                           input=md.encode(), check=True)
+            # IMPORTANT: capture_output=True so glow can't write directly to the
+            # TTY. When glow inherits stdout in an alt-screen-buffer context
+            # (watch mode), its own terminal-control codes can exit our alt
+            # buffer mid-render and the dashboard ends up in the wrong screen.
+            # Capturing decouples glow from terminal state.
+            r = subprocess.run(
+                ["glow", "-s", "dark", "-"],
+                input=md.encode(),
+                capture_output=True,
+                check=True,
+            )
+            sys.stdout.buffer.write(r.stdout)
+            sys.stdout.flush()
             return
         except subprocess.CalledProcessError:
             pass
     if no_color:
-        # strip backticks etc. for cleanest text output
         md = md.replace("`", "")
     print(md)
 
