@@ -16,7 +16,7 @@ readonly GLYPH_ON=$'\xf3\xb1\x82\x9f'    # U+F109F nf-md-coffee_maker          (
 readonly GLYPH_OFF=$'\xf3\xb1\xa0\x9b'   # U+F181B nf-md-coffee_maker_outline  (empty pot)
 
 readonly COLOR_ON='#fab387'    # peach - catppuccin's orange, warm/caffeinated
-readonly COLOR_OFF='#209fb5'   # sky   - cool pastel blue, chill/decaffeinated
+readonly COLOR_OFF='#74c7ec'   # sky   - cool pastel blue, chill/decaffeinated
 
 if command -v pgrep >/dev/null 2>&1 && pgrep -xq caffeinate 2>/dev/null; then
   glyph="$GLYPH_ON"
