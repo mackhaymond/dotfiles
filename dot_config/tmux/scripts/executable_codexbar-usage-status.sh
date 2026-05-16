@@ -7,6 +7,14 @@ CACHE_DIR="${HOME}/.cache/codexbar-tmux"
 CACHE_FILE="${CACHE_DIR}/usage.json"
 LOCKDIR="${CACHE_FILE}.lock"
 
+# Rolling sample history for recent-rate pacing projection. Each line is
+# {"t":epoch,"s":session_used,"w":weekly_used,"sr":session_resets_at,
+# "wr":weekly_resets_at}. The "sr"/"wr" fields let us discard samples
+# that belong to a previous rolling window when projecting forward.
+HISTORY_FILE="${CACHE_DIR}/usage-history.jsonl"
+HISTORY_MAX_LINES=120
+HISTORY_RECENT_WINDOW_SECONDS=1800
+
 CODEXBAR_TMP_FILES=()
 
 cleanup_tmp_files() {
@@ -526,6 +534,380 @@ format_time_until_reset() {
   fi
 }
 
+# Append a successful-refresh sample to the rolling history file. Called from
+# refresh_cache after the cache file is committed. Best-effort: silently skips
+# on any I/O failure rather than failing the refresh. Trims to the last
+# HISTORY_MAX_LINES entries to bound disk usage and read cost.
+append_usage_history() {
+  local now="$1" session_used="$2" weekly_used="$3" session_resets="$4" weekly_resets="$5"
+
+  [[ "$now" =~ ^[0-9]+$ ]] || return 0
+  [[ "$session_used" =~ ^[0-9]+$ ]] || return 0
+  [[ "$weekly_used"  =~ ^[0-9]+$ ]] || return 0
+
+  mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
+
+  local sr_json wr_json
+  sr_json='null'
+  wr_json='null'
+  [[ "$session_resets" =~ ^[0-9]+$ ]] && sr_json="$session_resets"
+  [[ "$weekly_resets"  =~ ^[0-9]+$ ]] && wr_json="$weekly_resets"
+
+  umask 077
+  printf '{"t":%s,"s":%s,"w":%s,"sr":%s,"wr":%s}\n' \
+    "$now" "$session_used" "$weekly_used" "$sr_json" "$wr_json" \
+    >>"$HISTORY_FILE" 2>/dev/null || return 0
+
+  local line_count
+  line_count="$(wc -l <"$HISTORY_FILE" 2>/dev/null | tr -d ' \t' || echo 0)"
+  [[ "$line_count" =~ ^[0-9]+$ ]] || return 0
+  if (( line_count > HISTORY_MAX_LINES )); then
+    local tmp
+    tmp="$(mktemp "${HISTORY_FILE}.trim.XXXXXX" 2>/dev/null)" || return 0
+    if tail -n "$HISTORY_MAX_LINES" "$HISTORY_FILE" >"$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$HISTORY_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+      rm -f "$tmp" 2>/dev/null
+    fi
+  fi
+}
+
+# Recent-rate (% per second) from the history file, scoped to the current
+# rolling window. Picks samples with matching resets_at within the last
+# window_seconds, then derives rate = du / dt across the chronological
+# earliest and latest sample in that slice. Requires at least 2 samples
+# spanning at least min_span_seconds (guards against extrapolating from a
+# single message). Empty stdout when not computable (no jq, no history,
+# too few samples, too short a span, plateaued/decreased usage), so callers
+# can cleanly fall back to a wider window or window-start extrapolation.
+#
+# Args: mode current_resets_at now window_seconds [min_span_seconds]
+pace_recent_rate() {
+  local mode="$1" current_resets_at="$2" now="$3"
+  local window_seconds="${4:-1800}" min_span_seconds="${5:-0}"
+
+  [[ -f "$HISTORY_FILE" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  [[ "$now" =~ ^[0-9]+$ ]] || return 0
+  [[ "$current_resets_at" =~ ^[0-9]+$ ]] || return 0
+  [[ "$window_seconds" =~ ^[0-9]+$ ]] || return 0
+
+  local used_key resets_key
+  case "$mode" in
+    session) used_key='s'; resets_key='sr' ;;
+    weekly)  used_key='w'; resets_key='wr' ;;
+    *) return 0 ;;
+  esac
+
+  local cutoff samples
+  cutoff=$(( now - window_seconds ))
+
+  samples="$(jq -c \
+    --argjson c "$cutoff" \
+    --argjson r "$current_resets_at" \
+    --arg uk "$used_key" \
+    --arg rk "$resets_key" \
+    'select((.t // 0) >= $c and (.[$rk] // null) == $r) | [.t, (.[$uk] // 0)]' \
+    "$HISTORY_FILE" 2>/dev/null || true)"
+  [[ -n "$samples" ]] || return 0
+
+  awk -v min_span="$min_span_seconds" '
+    BEGIN { n = 0 }
+    {
+      line = $0
+      gsub(/[\[\]]/, "", line)
+      split(line, a, ",")
+      t = a[1] + 0; u = a[2] + 0
+      if (n == 0) { min_t = t; max_t = t; min_u = u; max_u = u }
+      else {
+        if (t < min_t) { min_t = t; min_u = u }
+        if (t > max_t) { max_t = t; max_u = u }
+      }
+      n++
+    }
+    END {
+      if (n < 2) exit
+      dt = max_t - min_t
+      du = max_u - min_u
+      if (dt <= 0) exit
+      if (dt < min_span) exit
+      if (du <= 0) exit
+      printf "%.10f", du / dt
+    }
+  ' <<<"$samples"
+}
+
+# Project seconds-until-exhaust given current usage and window-elapsed time.
+# Prefers a "recent rate" computed from the rolling history file (last ~30
+# min of samples in the current window), so a recent burst is reflected in
+# the ETA. Falls back to linear extrapolation from window start - rate =
+# used / elapsed, eta = (100 - used) / rate - when the history doesn't yet
+# have enough usable signal (just installed, just reset, plateaued, or
+# decreased). The fallback path keeps a min-elapsed floor of ~1% of the
+# window so a single early API ping right after a reset doesn't produce
+# wildly noisy ETAs. Returns the integer second count on stdout; prints
+# nothing (empty stdout) when the projection is not computable.
+#
+# Args: used window_minutes resets_at now [mode]
+#   mode = "session" or "weekly" - enables the recent-rate path. Omit to
+#   force long-term-only behavior (used by tests).
+pace_eta_seconds() {
+  local used="$1" window_minutes="$2" resets_at="$3" now="$4" mode="${5:-}"
+
+  [[ "$used" =~ ^[0-9]+$ ]] || return 0
+  [[ "$window_minutes" =~ ^[0-9]+$ ]] || return 0
+  [[ "$resets_at" =~ ^[0-9]+$ ]] || return 0
+  [[ "$now" =~ ^[0-9]+$ ]] || return 0
+
+  local duration time_until_reset elapsed
+  duration=$(( window_minutes * 60 ))
+  (( duration > 0 )) || return 0
+
+  time_until_reset=$(( resets_at - now ))
+  (( time_until_reset > 0 )) || return 0
+  (( time_until_reset <= duration )) || return 0
+
+  elapsed=$(( duration - time_until_reset ))
+  (( elapsed > 0 )) || return 0
+  (( used > 0 )) || return 0
+
+  if (( used >= 100 )); then
+    printf '%s' 0
+    return 0
+  fi
+
+  local rate=''
+  if [[ -n "$mode" ]]; then
+    local rate10 rate30 rate_long
+    rate10="$(pace_recent_rate "$mode" "$resets_at" "$now" 600 180 2>/dev/null || true)"
+    rate30="$(pace_recent_rate "$mode" "$resets_at" "$now" 1800 0 2>/dev/null || true)"
+
+    rate_long=''
+    local min_elapsed
+    min_elapsed=$(( duration / 100 ))
+    if (( min_elapsed < 60 )); then
+      min_elapsed=60
+    fi
+    if (( elapsed >= min_elapsed )); then
+      rate_long="$(awk -v u="$used" -v e="$elapsed" 'BEGIN { printf "%.10f", u/e }')"
+    fi
+
+    rate="$(awk -v r10="${rate10:-0}" -v r30="${rate30:-0}" -v rL="${rate_long:-0}" '
+      BEGIN {
+        m = 0
+        if (r10+0 > m) m = r10+0
+        if (r30+0 > m) m = r30+0
+        if (rL+0  > m) m = rL+0
+        if (m > 0) printf "%.10f", m
+      }
+    ')"
+  fi
+
+  if [[ -z "${rate:-}" ]]; then
+    local min_elapsed_fb
+    min_elapsed_fb=$(( duration / 100 ))
+    if (( min_elapsed_fb < 60 )); then
+      min_elapsed_fb=60
+    fi
+    (( elapsed >= min_elapsed_fb )) || return 0
+    rate="$(awk -v u="$used" -v e="$elapsed" 'BEGIN { printf "%.10f", u/e }')"
+    [[ -n "${rate:-}" ]] || return 0
+  fi
+
+  awk -v u="$used" -v r="$rate" 'BEGIN {
+    rem = 100 - u
+    if (rem <= 0) { printf "%d", 0; exit }
+    if (r <= 0) { exit }
+    eta = rem / r
+    if (eta < 0) eta = 0
+    printf "%d", int(eta + 0.5)
+  }'
+}
+
+# Render a positive integer second count as a compact duration: 45m, 1h30m,
+# or 2d5h - matching format_time_until_reset's vocabulary so the two strings
+# read consistently when shown side by side ("2h15m (1h30m)").
+format_duration_compact() {
+  local total_seconds="$1"
+
+  [[ "$total_seconds" =~ ^[0-9]+$ ]] || return 1
+  if (( total_seconds <= 0 )); then
+    printf '%s' '0m'
+    return 0
+  fi
+
+  local total_minutes days hours minutes
+  total_minutes=$(( total_seconds / 60 ))
+  if (( total_minutes <= 0 )); then
+    printf '%s' '<1m'
+    return 0
+  fi
+
+  days=$(( total_minutes / (60 * 24) ))
+  hours=$(( (total_minutes / 60) % 24 ))
+  minutes=$(( total_minutes % 60 ))
+
+  if (( days >= 1 )); then
+    printf '%dd%dh' "$days" "$hours"
+  elif (( hours >= 1 )); then
+    printf '%dh%dm' "$hours" "$minutes"
+  else
+    printf '%dm' "$minutes"
+  fi
+}
+
+# Round an epoch to the nearest top-of-hour (1800s = 30min half-window).
+# Used by the short-daytime renderers so projection times read cleanly as
+# "6pm" instead of "6:47pm" - hour precision is plenty given the inherent
+# uncertainty of pacing extrapolation.
+round_epoch_to_hour() {
+  local epoch="$1"
+  [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' $(( ((epoch + 1800) / 3600) * 3600 ))
+}
+
+# Render an epoch as a short calendar marker: "Mon 6pm". Local time, rounded
+# to the nearest hour. Uses BSD `date -r` first, falls back to GNU `date -d
+# @epoch`. AM/PM is lowercased, ":00" trimmed, internal padding collapsed.
+# Returns empty on failure; callers must guard.
+format_short_daytime() {
+  local epoch="$1"
+
+  [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+  epoch="$(round_epoch_to_hour "$epoch")" || return 1
+
+  local raw
+  raw="$(date -r "$epoch" "+%a %l:%M%p" 2>/dev/null || true)"
+  if [[ -z "${raw:-}" ]]; then
+    raw="$(date -d "@$epoch" "+%a %l:%M%p" 2>/dev/null || true)"
+  fi
+  [[ -n "${raw:-}" ]] || return 1
+
+  printf '%s' "$raw" | awk '{
+    gsub(/AM/, "am"); gsub(/PM/, "pm")
+    sub(/:00/, "")
+    gsub(/  +/, " ")
+    sub(/^ +/, "")
+    sub(/ +$/, "")
+    print
+  }'
+}
+
+# Render an epoch with month + day: "May 22 6pm". Rounded to the nearest
+# hour. Used for projections beyond ~6 days where bare weekday names become
+# ambiguous (weekdays repeat every 7 days). Same lowercase/`:00`-trim post-
+# processing as format_short_daytime. Returns empty on failure.
+format_short_daytime_with_date() {
+  local epoch="$1"
+
+  [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+  epoch="$(round_epoch_to_hour "$epoch")" || return 1
+
+  local raw
+  raw="$(date -r "$epoch" "+%b %e %l:%M%p" 2>/dev/null || true)"
+  if [[ -z "${raw:-}" ]]; then
+    raw="$(date -d "@$epoch" "+%b %e %l:%M%p" 2>/dev/null || true)"
+  fi
+  [[ -n "${raw:-}" ]] || return 1
+
+  printf '%s' "$raw" | awk '{
+    gsub(/AM/, "am"); gsub(/PM/, "pm")
+    sub(/:00/, "")
+    gsub(/  +/, " ")
+    sub(/^ +/, "")
+    sub(/ +$/, "")
+    print
+  }'
+}
+
+# Pick the most readable absolute-time format for a projected epoch based on
+# how far in the future it is. Within 6 days: "Mon 5pm" (weekday is intuitive
+# and unambiguous). Beyond 6 days: "May 22 5pm" (weekdays would repeat and
+# become ambiguous, so we switch to month + day).
+format_projected_daytime() {
+  local epoch="$1" now="$2"
+
+  [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+  [[ "$now"   =~ ^[0-9]+$ ]] || return 1
+
+  local delta
+  delta=$(( epoch - now ))
+
+  if (( delta < 6 * 86400 )); then
+    format_short_daytime "$epoch"
+  else
+    format_short_daytime_with_date "$epoch"
+  fi
+}
+
+# Compose the session reset-view string: "<time-until-reset> (<projected-eta>)".
+# The parens echo the percent-view's pacing suffix idiom. Falls through to just
+# the time-until-reset when the projection can't be computed (no usage yet,
+# missing window/resets_at, just-reset, etc.). Caps absurd ETAs at 99h+ so a
+# near-idle window doesn't render "(437h)".
+format_session_reset_text() {
+  local resets_at="$1" used="$2" window_minutes="$3" now="$4"
+
+  local base
+  base="$(format_time_until_reset "$resets_at" "$now")"
+  printf '%s' "$base"
+
+  [[ "$base" != "--" ]] || return 0
+
+  local eta_seconds
+  eta_seconds="$(pace_eta_seconds "$used" "$window_minutes" "$resets_at" "$now" "session")"
+  [[ -n "${eta_seconds:-}" ]] || return 0
+  [[ "$eta_seconds" =~ ^[0-9]+$ ]] || return 0
+
+  local eta_text
+  if (( eta_seconds > 99 * 3600 )); then
+    eta_text='99h+'
+  else
+    eta_text="$(format_duration_compact "$eta_seconds")"
+  fi
+  [[ -n "${eta_text:-}" ]] || return 0
+
+  printf ' (%s)' "$eta_text"
+}
+
+# Compose the weekly reset-view string:
+#   "<reset-daytime> in <time-until-reset> (<projected-exhaust-daytime>)".
+# When the reset day/time can't be rendered (no resets_at, far-past), fall
+# back to just the duration. The projected-exhaust marker switches format
+# based on how far out the projection lands (see format_projected_daytime):
+# weekday name for the near term, month+day for projections that would
+# otherwise be ambiguous as a bare weekday.
+format_weekly_reset_text() {
+  local resets_at="$1" used="$2" window_minutes="$3" now="$4"
+
+  local time_until reset_daytime
+  time_until="$(format_time_until_reset "$resets_at" "$now")"
+  reset_daytime=''
+  if [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
+    reset_daytime="$(format_short_daytime "$resets_at" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "${reset_daytime:-}" && "$time_until" != "--" ]]; then
+    printf '%s in %s' "$reset_daytime" "$time_until"
+  else
+    printf '%s' "$time_until"
+  fi
+
+  [[ "$time_until" != "--" ]] || return 0
+
+  local eta_seconds
+  eta_seconds="$(pace_eta_seconds "$used" "$window_minutes" "$resets_at" "$now" "weekly")"
+  [[ -n "${eta_seconds:-}" ]] || return 0
+  [[ "$eta_seconds" =~ ^[0-9]+$ ]] || return 0
+
+  local eta_epoch eta_daytime
+  eta_epoch=$(( now + eta_seconds ))
+  eta_daytime="$(format_projected_daytime "$eta_epoch" "$now" 2>/dev/null || true)"
+  [[ -n "${eta_daytime:-}" ]] || return 0
+
+  printf ' (%s)' "$eta_daytime"
+}
+
 load_print_context() {
   PRINT_VIEW_BASELINE='percent'
   PRINT_PREVIEW_UNTIL='0'
@@ -606,14 +988,18 @@ load_cache_fields() {
   CACHE_WEEKLY_COLOR=''
   CACHE_SESSION_RESETS=''
   CACHE_WEEKLY_RESETS=''
+  CACHE_SESSION_USED=''
+  CACHE_WEEKLY_USED=''
+  CACHE_SESSION_WINDOW_MINUTES=''
+  CACHE_WEEKLY_WINDOW_MINUTES=''
 
   [[ -f "$CACHE_FILE" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
 
   local parsed
-  parsed="$(jq -r '[.session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//""] | @tsv' "$CACHE_FILE" 2>/dev/null || true)"
+  parsed="$(jq -r '[.session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//""] | @tsv' "$CACHE_FILE" 2>/dev/null || true)"
   [[ -n "$parsed" ]] || return 0
-  IFS=$'\t' read -r CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS <<<"$parsed"
+  IFS=$'\t' read -r CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES <<<"$parsed"
 }
 
 render_text_for_mode() {
@@ -621,13 +1007,22 @@ render_text_for_mode() {
   local out=''
 
   if [[ "$view" == "reset" ]]; then
-    local now resets_at=''
+    local now resets_at='' used='' window_minutes=''
     now="$(now_epoch)"
     case "$mode" in
-      session) resets_at="$CACHE_SESSION_RESETS" ;;
-      weekly)  resets_at="$CACHE_WEEKLY_RESETS" ;;
+      session)
+        resets_at="$CACHE_SESSION_RESETS"
+        used="$CACHE_SESSION_USED"
+        window_minutes="$CACHE_SESSION_WINDOW_MINUTES"
+        out="$(format_session_reset_text "$resets_at" "$used" "$window_minutes" "$now")"
+        ;;
+      weekly)
+        resets_at="$CACHE_WEEKLY_RESETS"
+        used="$CACHE_WEEKLY_USED"
+        window_minutes="$CACHE_WEEKLY_WINDOW_MINUTES"
+        out="$(format_weekly_reset_text "$resets_at" "$used" "$window_minutes" "$now")"
+        ;;
     esac
-    out="$(format_time_until_reset "$resets_at" "$now")"
   else
     case "$mode" in
       session) out="$CACHE_SESSION_TEXT" ;;
@@ -1361,6 +1756,9 @@ refresh_cache() {
 EOF
 
   mv -f "$tmp" "$CACHE_FILE"
+
+  append_usage_history "$updated_at" "$session_used" "$weekly_used" \
+    "$session_resets_at" "$weekly_resets_at" || true
 
   if command -v tmux >/dev/null 2>&1; then
     tmux set-option -gq @codex_session_color "$session_color" >/dev/null 2>&1 || true
