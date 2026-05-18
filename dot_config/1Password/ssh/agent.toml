@@ -5,3 +5,9 @@
 [[ssh-keys]]
 item = "Github SSH Key"
 vault = "Developer"
+
+# Personal RSA key (used by ~/.ssh/id_rsa historically). Needed for hosts
+# whose authorized_keys still trust the RSA key — e.g. cs33.seas.ucla.edu.
+[[ssh-keys]]
+item = "Primary SSH Key"
+vault = "Personal"
