@@ -8,10 +8,9 @@ if wezterm.config_builder then
 end
 
 wezterm.on('gui-startup', function(cmd)
-    local tab, pane, window = mux.spawn_window(cmd or {})
+    local _, _, window = mux.spawn_window(cmd or {})
     local gui_window = window:gui_window()
-    local dims = gui_window:get_dimensions()
-    if not dims.is_full_screen then
+    if not gui_window:get_dimensions().is_full_screen then
         gui_window:toggle_fullscreen()
     end
 end)
@@ -30,7 +29,7 @@ config.font_size = 12
 config.window_padding = {
     left = 0,
     right = 0,
-    top = 0, -- was 80
+    top = 0,
     bottom = 0,
 }
 
@@ -42,6 +41,18 @@ config.macos_fullscreen_extend_behind_notch = true
 config.window_close_confirmation = 'NeverPrompt'
 
 config.scrollback_lines = 0
+
+-- ── Performance ────────────────────────────────────────────────────────
+config.front_end = "WebGpu"           -- explicit (default since 2024)
+config.max_fps = 120                  -- match ProMotion display refresh
+config.animation_fps = 1              -- minimize animation CPU
+config.cursor_blink_rate = 0          -- disable blink entirely
+config.use_ime = false                -- skip IME event loop (English only)
+
+-- ── Annoyance fixes ────────────────────────────────────────────────────
+config.audible_bell = "Disabled"
+config.adjust_window_size_when_changing_font_size = false
+config.check_for_updates = false      -- brew handles wezterm@nightly updates
 
 config.keys = {
     {
