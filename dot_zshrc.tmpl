@@ -422,48 +422,11 @@ chezmoi() {
   return $rc
 }
 
-# `nvim ~/.zshrc` → opens the chezmoi source via `chezmoi edit --apply`,
-# auto-applies on save. Same keystrokes; opens the template (more useful
-# for editing) instead of the rendered file. Bypassed by:
-#   -R/-r flag, CHEZMOI_EDIT=1 env, `\nvim`/`command nvim`, source-dir paths.
-# Recovery if this function breaks:  \nvim $(chezmoi source-path ~/.zshrc)
-nvim() {
-  [[ -n "$CHEZMOI_EDIT" ]] && { command nvim "$@"; return }
-  local arg abs
-  local -a managed_args=() other_args=()
-  for arg in "$@"; do
-    [[ "$arg" == "-R" || "$arg" == "-r" ]] && { command nvim "$@"; return }
-  done
-  for arg in "$@"; do
-    if [[ "$arg" == -* ]]; then other_args+=("$arg"); continue; fi
-    if [[ ! -e "$arg" ]]; then other_args+=("$arg"); continue; fi
-    abs="${arg:A}"
-    if [[ "$abs" == "$HOME/.local/share/chezmoi/"* ]]; then
-      other_args+=("$arg")
-      continue
-    fi
-    if chezmoi source-path "$abs" >/dev/null 2>&1; then
-      managed_args+=("$abs")
-    else
-      other_args+=("$arg")
-    fi
-  done
-  # Mixed-args handling: open managed files via `chezmoi edit --apply`
-  # AND open the unmanaged ones in a separate plain nvim invocation.
-  # The earlier "first managed wins, drop the rest" logic silently lost
-  # the unmanaged files (data-loss-shaped: user thought they were open).
-  if (( ${#managed_args} )); then
-    print -u2 "[chezmoi] managed file(s) — opening source via 'chezmoi edit --apply'"
-    CHEZMOI_EDIT=1 chezmoi edit --apply "${managed_args[@]}"
-    local rc=$?
-    if (( ${#other_args} )); then
-      print -u2 "[chezmoi] also opening unmanaged arg(s): ${other_args[*]}"
-      command nvim "${other_args[@]}"
-    fi
-    return $rc
-  fi
-  command nvim "$@"
-}
+# `nvim ~/.zshrc` interception now lives in nvim, not zsh — see
+# ~/.config/nvim/lua/chezmoi_workflow.lua. The nvim autocmd catches managed
+# live paths from any entry point (zsh, bash, :e, Telescope, Oil, …) and
+# swaps to the chezmoi source, with auto-apply on save. Same UX, broader
+# coverage.
 
 # ─── Visual: scroll prompt to bottom on shell open ────────────────────────
 # Print exactly $LINES newlines (terminal height) so prompt lands at bottom
