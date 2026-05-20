@@ -346,6 +346,38 @@ _chezmoi_fetch_age() {
   print -n -- $(( EPOCHSECONDS - ${s[mtime]:-0} ))
 }
 
+# Starship job-state indicator: split stopped (Ctrl+Z'd) vs running (&) jobs.
+# Starship's built-in `jobs` module is one count for everything, which hides
+# the dangerous case (forgotten suspended job). We split it via two
+# [env_var.*] modules in starship.toml; this hook keeps the env vars in sync
+# with the parent shell's job table.
+#
+# Why env-var instead of file cache (like _chezmoi_drift_check):
+# - $jobstates is already in zsh memory — zero fork, zero I/O.
+# - chezmoi-drift caches because `chezmoi verify` is ~500ms; jobs are free.
+# - Mirrors starship's own internal pattern: starship/src/init/starship.zsh
+#   exports STARSHIP_JOBS_COUNT="${#jobstates[*]}" from its precmd hook.
+#
+# $jobstates is provided by zsh/parameter (force-load to be explicit; usually
+# auto-loaded in interactive zsh). Keys look like "running:0=12345" /
+# "suspended:0=12345"; the (M) flag matches and #...:#pat:* counts matches.
+zmodload -F zsh/parameter p:jobstates 2>/dev/null
+
+_starship_jobs_state() {
+  local stopped=${(M)#jobstates:#suspended:*}
+  local running=${(M)#jobstates:#running:*}
+  if (( stopped > 0 )); then
+    export STARSHIP_JOBS_STOPPED=$stopped
+  else
+    unset STARSHIP_JOBS_STOPPED
+  fi
+  if (( running > 0 )); then
+    export STARSHIP_JOBS_RUNNING=$running
+  else
+    unset STARSHIP_JOBS_RUNNING
+  fi
+}
+
 typeset -ga precmd_functions
 # Guard against duplicate registration: zshrc may be re-sourced (login
 # shell rebuild, exec zsh, tmux source-file with loaded panes, etc.).
@@ -354,6 +386,8 @@ typeset -ga precmd_functions
   precmd_functions+=(_chezmoi_drift_check)
 [[ -z "${precmd_functions[(r)_chezmoi_remote_fetch]}" ]] && \
   precmd_functions+=(_chezmoi_remote_fetch)
+[[ -z "${precmd_functions[(r)_starship_jobs_state]}" ]] && \
+  precmd_functions+=(_starship_jobs_state)
 
 # Wrap chezmoi to keep the drift indicator in sync with reality. Drift
 # detection is done by `chezmoi verify` (run from precmd), so the wrapper

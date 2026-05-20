@@ -7,6 +7,8 @@ $git_state\
 $git_status\
 ${custom.chezmoi}\
 $cmd_duration\
+${env_var.STARSHIP_JOBS_STOPPED}\
+${env_var.STARSHIP_JOBS_RUNNING}\
 $line_break\
 $python\
 $character"""
@@ -47,6 +49,22 @@ style = "yellow"
 [python]
 format = "[$virtualenv]($style) "
 style = "bright-black"
+
+# Shell job indicators. The env vars are maintained by the
+# `_starship_jobs_state` precmd hook in ~/.zshrc, which reads zsh's
+# $jobstates assoc array (no fork, no I/O). Modules render only when the
+# corresponding var is set & non-empty; precmd unsets them when count is 0.
+#   ⏸ = stopped jobs (Ctrl+Z'd — forgotten vim/less/htop). Red = attention.
+#   ⚙ = running background jobs (`cmd &`). Cyan = informational.
+[env_var.STARSHIP_JOBS_STOPPED]
+description = "Suspended (Ctrl+Z'd) jobs — set by zsh precmd from $jobstates."
+format = "[⏸ $env_value]($style) "
+style = "bold red"
+
+[env_var.STARSHIP_JOBS_RUNNING]
+description = "Running background (&) jobs — set by zsh precmd from $jobstates."
+format = "[⚙ $env_value]($style) "
+style = "bold cyan"
 
 [custom.chezmoi]
 description = "chezmoi drift indicator (background cache, refreshed by zsh precmd). Pure-style glyphs: ~ live drift, * uncommitted, ⇡ ahead, ⇣ behind, ? fetch >24h stale."
