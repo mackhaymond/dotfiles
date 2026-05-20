@@ -5,4 +5,5 @@
   "cli_first": false,
   "pid_offset_enabled": true,
   "scheduling_mode": "balance",
+  "switch_on_first_rate_limit": true,
 }
