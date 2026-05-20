@@ -218,6 +218,21 @@ yytmux() {
 # Acceptable because (a) it runs detached in a `&!` subshell so prompt
 # latency is zero, and (b) the 60s throttle caps load.
 #
+# Cache layout under ~/.cache/chezmoi-drift/ :
+#   state       — current drift glyphs. Only ever written atomically
+#                 (tmp + mv-rename) by the bg job, so the indicator
+#                 NEVER flickers — readers see the last complete state
+#                 until the next bg job replaces it.
+#   last-check  — throttle marker. Touched by the parent shell to claim
+#                 the 60s refresh window. Lives separately from `state`
+#                 so claiming the window doesn't blank the indicator
+#                 (the old impl truncated `state` itself, causing a
+#                 visible flicker each minute).
+#   lock/       — mkdir-mutex acquired by the bg job. Atomic across
+#                 shells via mkdir(2) — if N shells fire precmd at the
+#                 same instant, only one bg verify runs; the rest exit
+#                 silently. Released via EXIT trap in the subshell.
+#
 # `_chezmoi_remote_fetch` (further down) runs from precmd at most once
 # per 15 min and does a quiet `git fetch` in the background, so the ⇡/⇣
 # state stays fresh. Disable with: `export CHEZMOI_DRIFT_NO_FETCH=1`.
@@ -238,21 +253,24 @@ zmodload -F zsh/files b:mkdir b:rm 2>/dev/null
 _chezmoi_drift_check() {
   local cache="$HOME/.cache/chezmoi-drift"
   local result="$cache/state"
+  local marker="$cache/last-check"
+  local lockdir="$cache/lock"
   local max_age=60
   (( ${+commands[chezmoi]} )) || return 0
   mkdir -p "$cache"
   # Expose current cache content to starship via env var, every prompt.
-  # `$(<file)` is zsh's no-fork file read — replaces starship's old
-  # [custom.chezmoi] block which forked sh + cat (plus a separate sh +
-  # test for `when`) on every prompt. Empty/missing file → unset → the
-  # [env_var] module in starship.toml renders nothing.
+  # `$(<file)` is zsh's no-fork file read. Empty/missing file → unset →
+  # [env_var.STARSHIP_CHEZMOI_DRIFT] in starship.toml renders nothing.
   if [[ -s "$result" ]]; then
     export STARSHIP_CHEZMOI_DRIFT="$(<"$result")"
   else
     unset STARSHIP_CHEZMOI_DRIFT
   fi
-  if [[ -f "$result" ]]; then
-    local -A s; zstat -L -H s +mtime "$result" 2>/dev/null
+  # Throttle via separate marker file (not $result) so claiming the window
+  # doesn't blank the indicator. $result stays at the last known glyphs
+  # until the bg job atomically replaces it via mv-rename.
+  if [[ -f "$marker" ]]; then
+    local -A s; zstat -L -H s +mtime "$marker" 2>/dev/null
     local age=$(( EPOCHSECONDS - ${s[mtime]:-0} ))
     (( age < max_age )) && return 0
   fi
@@ -261,11 +279,26 @@ _chezmoi_drift_check() {
   # even when PATH is intact. Resolved absolute paths inherit cleanly.
   local git_bin="${commands[git]:-/usr/bin/git}"
   local chezmoi_bin="${commands[chezmoi]}"
-  # Claim the 60s throttle window in the parent shell so subsequent precmd
-  # invocations short-circuit while this one is still running. Without this,
-  # a cold cache spawns one bg subshell per prompt until the first finishes.
-  : >| "$result"
-  ( local drifted="" source_dir
+  # Claim the 60s window for this shell. Other precmd calls in this shell
+  # short-circuit on the fresh marker mtime; other shells likewise.
+  : >| "$marker"
+  ( # Inter-shell mutex via mkdir(2), which is atomic. If another shell's
+    # bg job already holds the lock, exit silently rather than racing —
+    # otherwise N concurrent shells would all spawn `chezmoi verify`.
+    # zsh/files mkdir + rm are builtins loaded above (fork-free, work in
+    # `&!` where the command hash table is empty).
+    #
+    # Stale-lock recovery: if the lock dir is older than $max_age, the
+    # previous holder must be dead (typical bg job is <5s). Reclaim it.
+    # Without this, a SIGKILL'd bg job would deadlock all future refreshes.
+    if [[ -d "$lockdir" ]]; then
+      local -A ls; zstat -L -H ls +mtime "$lockdir" 2>/dev/null
+      (( EPOCHSECONDS - ${ls[mtime]:-0} > max_age )) && rm -rf -- "$lockdir" 2>/dev/null
+    fi
+    mkdir "$lockdir" 2>/dev/null || return
+    # Release the lock on every exit path including signals.
+    trap "rm -rf -- \"$lockdir\" 2>/dev/null" EXIT INT TERM HUP
+    local drifted="" source_dir
     # Glyph ~ : authoritative content drift via `chezmoi verify`.
     # Returns 0 iff every managed live file matches its source. Catches
     # content edits, deletions, mode/permission changes, symlink targets.
@@ -303,7 +336,12 @@ _chezmoi_drift_check() {
         fi
       fi
     fi
-    print -n "$drifted" >| "$result"
+    # Atomic write: tmpfile in the same dir + mv. Readers never see a
+    # partial or empty $result — they see either the old state or the
+    # new state, never an in-between. zsh/files mv is a builtin (fork-free).
+    local tmp="$result.tmp.$$"
+    print -n "$drifted" >| "$tmp"
+    mv -f -- "$tmp" "$result"
   ) &!
 }
 
@@ -342,18 +380,6 @@ _chezmoi_remote_fetch() {
       : >| "$fetch_ok"
     fi
   ) &!
-}
-
-# Helper: how many seconds since the last successful remote fetch.
-# Returns -1 if we've never had a successful fetch in this cache lifetime.
-# Used by the drift indicator to surface long-stale `⇣` knowledge as a
-# hint that the network/auth is broken (>24h with no successful fetch).
-_chezmoi_fetch_age() {
-  local fetch_ok="$HOME/.cache/chezmoi/last-fetch-ok"
-  [[ -f "$fetch_ok" ]] || { print -n -- "-1"; return }
-  local -A s
-  zstat -L -H s +mtime "$fetch_ok" 2>/dev/null || { print -n -- "-1"; return }
-  print -n -- $(( EPOCHSECONDS - ${s[mtime]:-0} ))
 }
 
 # Starship job-state indicator: split stopped (Ctrl+Z'd) vs running (&) jobs.
@@ -456,13 +482,12 @@ chezmoi() {
   local rc=$?
   # Dry-run mutates nothing — leave the indicator cache alone.
   (( dry_run )) && return $rc
-  # Invalidate the drift cache so the next precmd's `chezmoi verify` runs
-  # against current state. We do this for every subcommand for simplicity:
-  # the next verify is at most ~500ms in the bg subshell, so the marginal
-  # cost of an unnecessary recheck after a read-only command is small,
-  # and matching specific subcommands here would just re-create the
-  # write-vs-read classification problem the prior wrapper had.
-  rm -f "$HOME/.cache/chezmoi-drift/state" 2>/dev/null
+  # Invalidate the throttle marker so the NEXT precmd re-runs verify.
+  # We deliberately do NOT delete `state` — that would blank the indicator
+  # for the ~500ms window until the bg job finishes. Keeping the old state
+  # visible until the atomic mv-rename swaps in fresh glyphs is the whole
+  # point of the marker / state split.
+  rm -f "$HOME/.cache/chezmoi-drift/last-check" 2>/dev/null
   return $rc
 }
 
