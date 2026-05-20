@@ -5,7 +5,7 @@ $directory\
 $git_branch\
 $git_state\
 $git_status\
-${custom.chezmoi}\
+${env_var.STARSHIP_CHEZMOI_DRIFT}\
 $cmd_duration\
 ${env_var.STARSHIP_JOBS_STOPPED}\
 ${env_var.STARSHIP_JOBS_RUNNING}\
@@ -66,10 +66,13 @@ description = "Running background (&) jobs — set by zsh precmd from $jobstates
 format = "[⚙ $env_value]($style) "
 style = "bold cyan"
 
-[custom.chezmoi]
-description = "chezmoi drift indicator (background cache, refreshed by zsh precmd). Pure-style glyphs: ~ live drift, * uncommitted, ⇡ ahead, ⇣ behind, ? fetch >24h stale."
-command = "cat $HOME/.cache/chezmoi-drift/state 2>/dev/null"
-when = "test -s $HOME/.cache/chezmoi-drift/state"
-format = "[ ⚠ chezmoi:$output]($style) "
+# chezmoi drift indicator. The env var is maintained by the
+# `_chezmoi_drift_check` precmd hook in ~/.zshrc, which mirrors the
+# background-refreshed cache file into the env var via zsh's no-fork
+# `$(<file)` read. Zero subshell forks per prompt (previously this was
+# a [custom.*] block that ran sh+cat + sh+test per prompt).
+# Glyphs: ~ live drift, * uncommitted, ⇡ ahead, ⇣ behind, ? fetch >24h stale.
+[env_var.STARSHIP_CHEZMOI_DRIFT]
+description = "chezmoi drift glyphs (set by zsh precmd from ~/.cache/chezmoi-drift/state)"
+format = "[ ⚠ chezmoi:$env_value]($style) "
 style = "bold red"
-shell = ["sh", "--norc", "--noprofile"]

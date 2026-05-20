@@ -241,6 +241,16 @@ _chezmoi_drift_check() {
   local max_age=60
   (( ${+commands[chezmoi]} )) || return 0
   mkdir -p "$cache"
+  # Expose current cache content to starship via env var, every prompt.
+  # `$(<file)` is zsh's no-fork file read — replaces starship's old
+  # [custom.chezmoi] block which forked sh + cat (plus a separate sh +
+  # test for `when`) on every prompt. Empty/missing file → unset → the
+  # [env_var] module in starship.toml renders nothing.
+  if [[ -s "$result" ]]; then
+    export STARSHIP_CHEZMOI_DRIFT="$(<"$result")"
+  else
+    unset STARSHIP_CHEZMOI_DRIFT
+  fi
   if [[ -f "$result" ]]; then
     local -A s; zstat -L -H s +mtime "$result" 2>/dev/null
     local age=$(( EPOCHSECONDS - ${s[mtime]:-0} ))
