@@ -32,6 +32,26 @@ yabai -m rule --add app="^TI-Nspire$" manage=off
 yabai -m rule --add app="^LiveMath Maker$" manage=off
 yabai -m rule --add app="^Antidote$" manage=off
 
+# Keep space 1 reserved for wezterm. Any other window that lands on
+# space 1 — managed or not — gets relocated to space 2 with focus following.
+yabai -m signal --add event=window_created action='
+  win=$YABAI_WINDOW_ID
+  info=$(yabai -m query --windows --window "$win" 2>/dev/null) || exit 0
+  app=$(printf "%s" "$info" | jq -r .app)
+  space=$(printf "%s" "$info" | jq -r .space)
+  [ "$app" = "wezterm-gui" ] && exit 0
+  if [ "$space" = "1" ]; then
+    yabai -m window "$win" --space 2 && yabai -m space --focus 2
+  fi
+'
+
+# Re-activate wezterm on returning to space 1 so it re-asserts its
+# non-native fullscreen presentation options (hides the menu bar again
+# after an intruder window briefly trampled them).
+yabai -m signal --add event=space_changed action='
+  [ "$YABAI_SPACE_INDEX" = "1" ] && osascript -e "tell application \"WezTerm\" to activate"
+'
+
 # App -> Space pinning
 yabai -m rule --add app="^wezterm-gui$" space=1
 yabai -m rule --add app="^Todoist$" space=4
