@@ -69,7 +69,18 @@ config.keys = {
         mods = "CMD",
         action = wezterm.action.Multiple {
             wezterm.action.SendKey { key = "s", mods = "CTRL" },
-            wezterm.action.SendKey { key = "c", mods = "CTRL" },
+            wezterm.action.SendKey { key = "t", mods = "CTRL" },
+        }
+    },
+
+    -- CMD+SHIFT+R: recreate current tab in place (was CMD+SHIFT+T).
+    -- Sends `prefix R` to tmux (see `bind R` in tmux.conf).
+    {
+        key = "R",
+        mods = "CMD",
+        action = wezterm.action.Multiple {
+            wezterm.action.SendKey { key = "s", mods = "CTRL" },
+            wezterm.action.SendKey { key = "R", mods = "SHIFT" },
         }
     },
 

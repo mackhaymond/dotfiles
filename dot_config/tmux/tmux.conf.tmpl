@@ -31,7 +31,11 @@ bind '"' split-window -c "#{pane_current_path}"
 bind % split-window -h -c "#{pane_current_path}"
 bind c new-window -a -c "#{pane_current_path}"
 
-bind C-c new-window -a \; kill-window -t -
+# CMD+SHIFT+T (wezterm) → new tab at the end of all tabs, starting in $HOME.
+bind C-t new-window -a -t '{end}' -c "#{HOME}"
+
+# CMD+SHIFT+R (wezterm) → recreate current tab in place, same cwd.
+bind R new-window -a -c "#{pane_current_path}" \; kill-window -t -
 
 set -g status-position top
 
