@@ -498,11 +498,26 @@ chezmoi() {
 # coverage.
 
 # ─── Visual: scroll prompt to bottom on shell open ────────────────────────
-# Print exactly $LINES newlines (terminal height) so prompt lands at bottom
-# regardless of window size. Skip in nested shells (SHLVL > 1) so subshells
-# don't keep pushing the prompt further down. Pure zsh builtins - no fork.
-if (( SHLVL == 1 )) && [[ -t 1 ]]; then
-  repeat $LINES print
+# Fire once per pty: each tmux pane / terminal tab is a unique pty, so this
+# gives "new shell at bottom" UX without cascading in nested subshells (a
+# `zsh` inside `zsh` reuses the parent pty → marker already exists → skipped).
+#
+# Previous guard `SHLVL == 1` was brittle: tmux server's inherited SHLVL
+# depends on what launched it (wezterm → login zsh → tmux gives SHLVL=1 in
+# the server, so panes get SHLVL=2 and the block silently skipped). After a
+# reboot the SHLVL chain can shift by one and the indicator stops working.
+#
+# Marker layout: $TMPDIR/zsh-bottom.<pty-inode>.<uid>. /tmp clears on boot,
+# so markers naturally reset every restart. $UID suffix avoids cross-user
+# collisions if pty inodes are reused. `stat -f %i` is BSD-stat (macOS).
+if [[ -t 1 ]]; then
+  () {
+    local mark="${TMPDIR:-/tmp}/zsh-bottom.$(stat -f %i ${TTY:-/dev/null} 2>/dev/null).$UID"
+    if [[ ! -e $mark ]]; then
+      repeat $LINES print
+      : >| $mark
+    fi
+  }
 fi
 
 # ─── Profile output ───────────────────────────────────────────────────────
