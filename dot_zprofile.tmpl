@@ -8,7 +8,7 @@ export INFOPATH="{{ .homebrew_prefix }}/share/info${INFOPATH:+:$INFOPATH}"
 [[ -z "${MANPATH-}" ]] || export MANPATH=":${MANPATH#:}"
 
 # ─── Path env vars (referenced by tools below) ────────────────────────────
-export GOPATH="$HOME/Desktop/coding/go"
+export GOPATH="$HOME/code/go"
 export GOPROXY="https://proxy.golang.org,direct"
 export GOSUMDB="sum.golang.org"
 export GOTOOLCHAIN="auto"
@@ -35,7 +35,7 @@ path=(
   $HOME/bin
   $HOME/userbin
   $HOME/.local/bin
-  $HOME/Desktop/coding/various_scripts
+  $HOME/code/various_scripts
 
   # Language toolchains
   $HOME/.cargo/bin
