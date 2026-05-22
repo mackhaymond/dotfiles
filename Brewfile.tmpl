@@ -33,7 +33,7 @@ tap "rileyhilliard/tap"
 tap "sidneys/homebrew"
 tap "slp/krun"
 tap "socsieng/tap"
-tap "spyicydev/formulae"
+tap "{{ .github_username | lower }}/formulae"
 tap "sst/tap"
 tap "steipete/tap"
 tap "tako8ki/tap"
@@ -464,7 +464,7 @@ brew "nohajc/anylinuxfs/anylinuxfs"
 # Command-line tool for automating keystrokes and mouse events
 brew "socsieng/tap/sendkeys"
 # Local DNS sinkhole for macOS using dnsmasq
-brew "spyicydev/formulae/macblock"
+brew "{{ .github_username | lower }}/formulae/macblock"
 # Cross-platform TUI database management tool written in Rust
 brew "tako8ki/tap/gobang"
 # Ookla Speedtest

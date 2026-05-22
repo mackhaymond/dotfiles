@@ -35,7 +35,7 @@ fork, adapt, and steal patterns. Don't blindly apply this to your machine.
 Look without touching:
 
 ```sh
-chezmoi init --apply=false https://github.com/SpyicyDev/dotfiles.git
+chezmoi init --apply=false https://github.com/mackhaymond/dotfiles.git
 chezmoi diff
 ```
 
@@ -62,7 +62,7 @@ op read "op://Developer/chezmoi-age-key-mackbook/notesPlain" \
 chmod 600 ~/.config/chezmoi/key.txt
 
 # 3. Apply
-chezmoi init --apply https://github.com/SpyicyDev/dotfiles.git
+chezmoi init --apply https://github.com/mackhaymond/dotfiles.git
 ```
 
 `chezmoi init` will prompt for: name, email, GitHub username. Answers are
@@ -74,7 +74,7 @@ signing key is pulled from 1Password automatically (no prompt) — see the
 - Render all templates and copy files into `~`
 - Decrypt age files with your local key
 - Pull op:// values from 1Password at apply time
-- Clone external repos (`SpyicyDev/nvim`, `tmux-plugins/tpm`)
+- Clone external repos (`mackhaymond/nvim`, `tmux-plugins/tpm`)
 - Run `brew bundle install` against the templated Brewfile
 - Run idempotent setup scripts: macOS defaults, tpm plugins, broot launcher, opam user-setup
 
@@ -88,7 +88,7 @@ aws sso login    # AWS SSO if you use it
 ### Option 3: clone the source first, then apply
 
 ```sh
-git clone https://github.com/SpyicyDev/dotfiles.git ~/Code/dotfiles
+git clone https://github.com/mackhaymond/dotfiles.git ~/Code/dotfiles
 chezmoi init --source=~/Code/dotfiles
 # review ~/.local/share/chezmoi/ — actually it's symlinked from ~/Code/dotfiles
 chezmoi diff
@@ -107,7 +107,7 @@ only what you want:
 ### Path-based — install specific files or trees
 
 ```sh
-chezmoi init https://github.com/SpyicyDev/dotfiles.git    # init WITHOUT --apply
+chezmoi init https://github.com/mackhaymond/dotfiles.git    # init WITHOUT --apply
 chezmoi diff                                               # browse what's available
 
 # Pick specific things:
@@ -143,7 +143,7 @@ For a fork that doesn't want certain tools, the lowest-friction approach is
 to delete what you don't want **before** the first apply:
 
 ```sh
-git clone https://github.com/SpyicyDev/dotfiles.git ~/Code/dotfiles
+git clone https://github.com/mackhaymond/dotfiles.git ~/Code/dotfiles
 cd ~/Code/dotfiles
 
 # Drop macOS-only window-management bundle:

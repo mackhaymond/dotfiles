@@ -512,7 +512,7 @@ chezmoi update
 ## Working with the external nvim repo
 
 `~/.config/nvim` is **not** managed by chezmoi — it's a separate git repo
-at `github.com/SpyicyDev/nvim`, cloned and refreshed via `.chezmoiexternal.toml`.
+at `github.com/mackhaymond/nvim`, cloned and refreshed via `.chezmoiexternal.toml`.
 
 ### Edit nvim config
 
@@ -664,7 +664,7 @@ mkdir -p ~/.config/chezmoi
 op read "op://Developer/chezmoi-age-key-mackbook/notesPlain" \
     > ~/.config/chezmoi/key.txt
 chmod 600 ~/.config/chezmoi/key.txt
-chezmoi init --apply https://github.com/SpyicyDev/dotfiles.git
+chezmoi init --apply https://github.com/mackhaymond/dotfiles.git
 ```
 
 After init prompts run, the apply step does everything else automatically.
@@ -679,7 +679,7 @@ ground without adding complexity to the source:
 
 ```sh
 # Init without applying - clones source, runs prompts, skips file copy
-chezmoi init https://github.com/SpyicyDev/dotfiles.git
+chezmoi init https://github.com/mackhaymond/dotfiles.git
 chezmoi diff       # browse what's available
 
 # Path-based selective apply
@@ -693,7 +693,7 @@ chezmoi apply --include=files                 # only file deployment, nothing el
 chezmoi apply --include=encrypted             # only age-decrypt the secret files
 
 # Fork-and-delete (for permanent exclusion)
-git clone https://github.com/SpyicyDev/dotfiles.git ~/Code/dotfiles
+git clone https://github.com/mackhaymond/dotfiles.git ~/Code/dotfiles
 cd ~/Code/dotfiles
 rm -rf dot_config/yabai dot_config/skhd dot_config/sketchybar    # drop window mgmt
 rm Brewfile.tmpl                                                  # skip the brew install

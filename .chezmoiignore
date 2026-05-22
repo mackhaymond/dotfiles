@@ -94,7 +94,7 @@ code/various_scripts/restart-yabai.sh
 .ssh/known_hosts
 .ssh/known_hosts.old
 .ssh/.DS_Store
-.ssh/SpyicyDev-GitHub
+.ssh/mackhaymond-GitHub
 .ssh/guac_key
 .ssh/mackhaymond-nixbuild
 .config/gh/hosts.yml
