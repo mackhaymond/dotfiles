@@ -3,7 +3,11 @@
   "agents": {
     "sisyphus": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "high"
+      "variant": "high",
+      "ultrawork": {
+        "model": "anthropic/claude-opus-4-7",
+        "variant": "max"
+      }
     },
     "oracle": {
       "model": "google/antigravity-gemini-3.1-pro",
@@ -24,6 +28,7 @@
     "prometheus": {
       "model": "anthropic/claude-opus-4-7",
       "variant": "xhigh",
+      "prompt_append": "Always interview first. Validate scope before planning.",
       "fallback_models": [
         {
           "model": "google/antigravity-gemini-3.1-pro",
@@ -54,7 +59,8 @@
     },
     "hephaestus": {
       "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh"
+      "variant": "xhigh",
+      "prompt_append": "Explore thoroughly, then implement. Prefer small, testable changes."
     },
     "librarian": {
       "model": "anthropic/claude-haiku-4-5"
@@ -143,6 +149,15 @@
         "anthropic/claude-sonnet-4-6"
       ]
     }
+  },
+  "background_task": {
+    "providerConcurrency": {
+      "google": 5,
+      "openai": 3
+    }
+  },
+  "experimental": {
+    "aggressive_truncation": true
   },
   "google_auth": false
 }
