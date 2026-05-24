@@ -115,10 +115,10 @@ set -g @continuum-save-interval '15'
 set -g @continuum-restore 'on'
 
 unbind-key a
-bind-key a display-popup -E -w 50% -h 40% "SESSION_ONLY=1 $HOME/.config/tmux/scripts/mru-session-switch.sh"
+bind-key a display-popup -E -w 60% -h 75% "$HOME/.config/tmux/scripts/mru-session-switch.sh"
 
 unbind-key C-a
-bind-key C-a display-popup -E -w 50% -h 40% "SESSION_ONLY=1 $HOME/.config/tmux/scripts/mru-session-switch.sh"
+bind-key C-a display-popup -E -w 60% -h 75% "$HOME/.config/tmux/scripts/mru-session-switch.sh"
 
 set -g @plugin '27medkamal/tmux-session-wizard'
 set -g @session-wizard 'T'

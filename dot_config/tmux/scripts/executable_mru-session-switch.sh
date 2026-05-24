@@ -17,10 +17,13 @@ main() {
   local current_session
   current_session="$(tmux display-message -p '#S')"
 
-  local fzf_command=(fzf --exit-0 --print-query --reverse)
+  local fzf_command=(fzf --exit-0 --print-query --reverse --ansi --info=hidden)
   local preview_script="$CURRENT_DIR/preview_session.sh"
-  if [[ "${PREVIEW_ENABLED:-0}" == "1" && -x "$preview_script" ]]; then
-    fzf_command+=(--preview "$preview_script {}" --preview-window=right:60%)
+  if [[ "${PREVIEW_DISABLED:-0}" != "1" && -x "$preview_script" ]]; then
+    fzf_command+=(
+      --preview "$preview_script {}"
+      --preview-window=down:70%:nowrap:noinfo
+    )
   fi
 
   local list
@@ -33,7 +36,7 @@ main() {
 
   local out status
   set +e
-  out="$(printf '%s\n' "$list" | "${fzf_command[@]}")"
+  out="$({ [[ -n "$list" ]] && printf '%s\n' "$list"; } | "${fzf_command[@]}")"
   status=$?
   set -e
 
@@ -62,13 +65,13 @@ main() {
     exit 0
   fi
 
-  if tmux has-session -t "$target" 2>/dev/null; then
-    tmux switch-client -t "$target"
+  if tmux has-session -t "=$target" 2>/dev/null; then
+    tmux switch-client -t "=$target"
     exit 0
   fi
 
   tmux command-prompt -b -k -p "Create and go to [$target] session? [Y/n]" \
-    "if-shell -F '#{m/r:^(Enter|C-m|y|Y)$,%1}' { new-session -d -s $target -c ~ ; switch-client -t $target } { display-message Cancelled }"
+    "if-shell -F '#{m/r:^(Enter|C-m|y|Y)$,%1}' { new-session -d -s \"$target\" -c ~ ; switch-client -t \"=$target\" } { display-message Cancelled }"
 }
 
 main "$@"
