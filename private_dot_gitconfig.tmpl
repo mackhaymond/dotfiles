@@ -40,3 +40,5 @@
 {{- else if eq .chezmoi.os "linux" }}
 	program = /opt/1Password/op-ssh-sign
 {{- end }}
+[push]
+        autoSetupRemote = true
