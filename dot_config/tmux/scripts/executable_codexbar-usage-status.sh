@@ -96,10 +96,10 @@ fi
 
 WEB_TIMEOUT_SECONDS="$(clamp_int_range "$(opt_or_env_or_default '@codexbar_web_timeout' 'CODEXBAR_USAGE_WEB_TIMEOUT' '2')" 1 30)"
 
-USAGE_PROVIDER="$(opt_or_env_or_default '@codexbar_provider' 'CODEXBAR_USAGE_PROVIDER' 'claude')"
+USAGE_PROVIDER="$(opt_or_env_or_default '@codexbar_provider' 'CODEXBAR_USAGE_PROVIDER' 'codex')"
 case "$USAGE_PROVIDER" in
   claude|codex) ;;
-  *) USAGE_PROVIDER='claude' ;;
+  *) USAGE_PROVIDER='codex' ;;
 esac
 
 BACKOFF_FILE="${CACHE_DIR}/refresh_backoff_${USAGE_PROVIDER}"
@@ -1536,7 +1536,7 @@ fetch_via_codexbar_codex() {
   CODEXBAR_TMP_FILES+=("$stderr_file")
 
   set +e
-  fetch_out="$(codexbar --provider claude --format json --json-only --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
+  fetch_out="$(codexbar --provider codex --format json --json-only --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
   local fetch_status=$?
   set -e
   fetch_err="$(cat "$stderr_file" 2>/dev/null || true)"
@@ -1545,7 +1545,7 @@ fetch_via_codexbar_codex() {
     if [[ "$fetch_out" == *"Unknown option --json-only"* || "$fetch_err" == *"Unknown option --json-only"* ]]; then
       : >"$stderr_file" 2>/dev/null || true
       set +e
-      fetch_out="$(codexbar --provider claude --format json --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
+      fetch_out="$(codexbar --provider codex --format json --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
       fetch_status=$?
       set -e
       fetch_err="$(cat "$stderr_file" 2>/dev/null || true)"

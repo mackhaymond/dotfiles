@@ -69,10 +69,10 @@ set -g @coffee_glyph "󱠛"
 set -g @coffee_color "#209fb5"
 
 # Codexbar defaults ("plugin-like" surface); setup script reads these.
-# @codexbar_provider: "claude" hits Anthropic's OAuth /api/oauth/usage endpoint
-# directly (real session+weekly reset times). "codex" delegates to the codexbar
-# CLI tool against the codex provider (legacy behavior).
-set -g @codexbar_provider "claude"
+# @codexbar_provider: "codex" delegates to the codexbar CLI tool against the
+# codex provider. "claude" hits Anthropic's OAuth /api/oauth/usage endpoint
+# directly (real session+weekly reset times).
+set -g @codexbar_provider "codex"
 set -g @codexbar_reset_key "u"
 set -g @codexbar_reset_view_seconds "3"
 set -g @codexbar_reset_view_scope "both"
