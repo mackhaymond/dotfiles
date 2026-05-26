@@ -135,6 +135,9 @@ set -g @floax-bind '-n M-q'
 unbind -n M-a
 bind -n M-a run-shell -b "#{HOME}/.config/tmux/scripts/toggle-btop-popup.sh '#{client_tty}'"
 
+unbind -n M-y
+bind -n M-y run-shell -b "#{HOME}/.config/tmux/scripts/toggle-yazi-popup.sh #{q:client_tty} #{q:pane_current_path}"
+
 # bind -n m-w send-keys -F "yy" Enter
 
 # bind -n m-q run-shell "~/code/various_scripts/popuptmux"
