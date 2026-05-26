@@ -1,152 +1,235 @@
 {
-  "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-opencode/dev/assets/oh-my-opencode.schema.json",
+  "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-openagent/dev/assets/oh-my-opencode.schema.json",
   "agents": {
     "sisyphus": {
-      "model": "anthropic/claude-opus-4-7",
-      "variant": "high",
-      "ultrawork": {
-        "model": "anthropic/claude-opus-4-7",
-        "variant": "max"
-      }
+      "model": "opencode-go/kimi-k2.6",
+      "fallback_models": [
+        {
+          "model": "openai/gpt-5.5",
+          "variant": "medium"
+        }
+      ]
+    },
+    "hephaestus": {
+      "model": "openai/gpt-5.5",
+      "variant": "medium"
     },
     "oracle": {
-      "model": "google/antigravity-gemini-3.1-pro",
+      "model": "openai/gpt-5.5",
       "variant": "high",
       "fallback_models": [
         {
-          "model": "anthropic/claude-opus-4-7",
-          "variant": "xhigh"
+          "model": "google/gemini-3.1-pro-preview",
+          "variant": "high"
+        },
+        {
+          "model": "opencode-go/glm-5.1"
+        }
+      ]
+    },
+    "librarian": {
+      "model": "openai/gpt-5.4-mini-fast",
+      "fallback_models": [
+        {
+          "model": "opencode-go/qwen3.5-plus"
+        },
+        {
+          "model": "opencode-go/minimax-m2.7"
+        },
+        {
+          "model": "openai/gpt-5.4-nano"
         }
       ]
     },
     "explore": {
-      "model": "anthropic/claude-haiku-4-5"
-    },
-    "multimodal-looker": {
-      "model": "google/antigravity-gemini-3-flash"
-    },
-    "prometheus": {
-      "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh",
-      "prompt_append": "Always interview first. Validate scope before planning.",
+      "model": "openai/gpt-5.4-mini-fast",
       "fallback_models": [
         {
-          "model": "google/antigravity-gemini-3.1-pro",
-          "variant": "high"
+          "model": "opencode-go/qwen3.5-plus"
+        },
+        {
+          "model": "opencode-go/minimax-m2.7"
+        },
+        {
+          "model": "openai/gpt-5.4-nano"
+        }
+      ]
+    },
+    "multimodal-looker": {
+      "model": "openai/gpt-5.5",
+      "variant": "medium",
+      "fallback_models": [
+        {
+          "model": "opencode-go/kimi-k2.6"
+        },
+        {
+          "model": "openai/gpt-5-nano"
+        }
+      ]
+    },
+    "prometheus": {
+      "model": "openai/gpt-5.5",
+      "variant": "high",
+      "fallback_models": [
+        {
+          "model": "opencode-go/glm-5.1"
+        },
+        {
+          "model": "google/gemini-3.1-pro-preview"
         }
       ]
     },
     "metis": {
-      "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh"
+      "model": "openai/gpt-5.5",
+      "variant": "high",
+      "fallback_models": [
+        {
+          "model": "opencode-go/glm-5.1"
+        }
+      ]
     },
     "momus": {
-      "model": "anthropic/claude-opus-4-7",
+      "model": "openai/gpt-5.5",
       "variant": "xhigh",
       "fallback_models": [
         {
-          "model": "google/antigravity-gemini-3.1-pro",
+          "model": "google/gemini-3.1-pro-preview",
           "variant": "high"
+        },
+        {
+          "model": "opencode-go/glm-5.1"
         }
       ]
     },
     "atlas": {
-      "model": "anthropic/claude-opus-4-7",
-      "variant": "high"
+      "model": "opencode-go/kimi-k2.6",
+      "fallback_models": [
+        {
+          "model": "openai/gpt-5.5",
+          "variant": "medium"
+        },
+        {
+          "model": "opencode-go/minimax-m2.7"
+        }
+      ]
     },
     "sisyphus-junior": {
-      "model": "anthropic/claude-sonnet-4-6"
-    },
-    "hephaestus": {
-      "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh",
-      "prompt_append": "Explore thoroughly, then implement. Prefer small, testable changes."
-    },
-    "librarian": {
-      "model": "anthropic/claude-haiku-4-5"
-    },
-    "build": {
-      "model": "anthropic/claude-sonnet-4-6"
-    },
-    "plan": {
-      "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh"
-    },
-    "OpenCode-Builder": {
-      "model": "anthropic/claude-sonnet-4-6"
+      "model": "opencode-go/kimi-k2.6",
+      "fallback_models": [
+        {
+          "model": "openai/gpt-5.5",
+          "variant": "medium"
+        },
+        {
+          "model": "opencode-go/minimax-m2.7"
+        }
+      ]
     }
   },
   "categories": {
     "visual-engineering": {
-      "model": "google/antigravity-gemini-3.1-pro",
+      "model": "google/gemini-3.1-pro-preview",
       "variant": "high",
       "fallback_models": [
         {
-          "model": "anthropic/claude-opus-4-7",
-          "variant": "xhigh"
+          "model": "opencode-go/glm-5.1"
         }
       ]
     },
     "ultrabrain": {
-      "model": "google/antigravity-gemini-3.1-pro",
-      "variant": "high",
+      "model": "openai/gpt-5.5",
+      "variant": "xhigh",
       "fallback_models": [
         {
-          "model": "anthropic/claude-opus-4-7",
-          "variant": "xhigh"
+          "model": "google/gemini-3.1-pro-preview",
+          "variant": "high"
+        },
+        {
+          "model": "opencode-go/glm-5.1"
         }
       ]
     },
     "deep": {
-      "model": "anthropic/claude-opus-4-7",
-      "variant": "xhigh",
+      "model": "openai/gpt-5.5",
+      "variant": "medium",
       "fallback_models": [
         {
-          "model": "google/antigravity-gemini-3.1-pro",
+          "model": "google/gemini-3.1-pro-preview",
           "variant": "high"
+        },
+        {
+          "model": "opencode-go/kimi-k2.6"
+        },
+        {
+          "model": "opencode-go/glm-5.1"
         }
       ]
     },
     "artistry": {
-      "model": "google/antigravity-gemini-3.1-pro",
+      "model": "google/gemini-3.1-pro-preview",
       "variant": "high",
       "fallback_models": [
         {
-          "model": "anthropic/claude-opus-4-7",
-          "variant": "xhigh"
+          "model": "openai/gpt-5.5"
+        },
+        {
+          "model": "opencode-go/kimi-k2.6"
+        },
+        {
+          "model": "opencode-go/glm-5.1"
         }
       ]
     },
     "quick": {
-      "model": "anthropic/claude-haiku-4-5",
+      "model": "openai/gpt-5.4-mini",
       "fallback_models": [
         {
           "model": "google/gemini-3-flash-preview"
+        },
+        {
+          "model": "opencode-go/minimax-m2.7"
         }
       ]
     },
     "unspecified-low": {
-      "model": "anthropic/claude-sonnet-4-6",
+      "model": "openai/gpt-5.4",
+      "variant": "medium",
       "fallback_models": [
         {
+          "model": "opencode-go/kimi-k2.6"
+        },
+        {
           "model": "google/gemini-3-flash-preview"
+        },
+        {
+          "model": "opencode-go/minimax-m2.7"
         }
       ]
     },
     "unspecified-high": {
-      "model": "anthropic/claude-opus-4-7",
+      "model": "openai/gpt-5.4",
+      "variant": "medium",
       "fallback_models": [
         {
-          "model": "google/antigravity-gemini-3.1-pro",
-          "variant": "high"
+          "model": "opencode-go/kimi-k2.6"
+        },
+        {
+          "model": "google/gemini-3-flash-preview"
+        },
+        {
+          "model": "opencode-go/minimax-m2.7"
         }
-      ],
-      "variant": "xhigh"
+      ]
     },
     "writing": {
-      "model": "google/antigravity-gemini-3-flash",
+      "model": "google/gemini-3-flash-preview",
       "fallback_models": [
-        "anthropic/claude-sonnet-4-6"
+        {
+          "model": "opencode-go/kimi-k2.6"
+        },
+        {
+          "model": "opencode-go/minimax-m2.7"
+        }
       ]
     }
   },
@@ -159,5 +242,9 @@
   "experimental": {
     "aggressive_truncation": true
   },
-  "google_auth": false
+  "google_auth": false,
+  "_migrations": [
+    "model-version:openai/gpt-5.3-codex->openai/gpt-5.4",
+    "model-version:openai/gpt-5.3-codex->openai/gpt-5.4"
+  ]
 }

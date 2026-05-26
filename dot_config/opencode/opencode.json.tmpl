@@ -1,12 +1,11 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "@ex-machina/opencode-anthropic-auth@1.7.5",
     "opencode-antigravity-auth@latest",
     "opencode-dir",
     "./plugins/chezmoi-guard.ts",
-    "oh-my-openagent@latest",
-    "opencode-chrome-devtools"
+    "opencode-chrome-devtools",
+    "oh-my-openagent@latest"
   ],
   "permission": {
     "bash": {
@@ -44,11 +43,10 @@
       "enabled": true
     }
   },
-  "model": "anthropic/claude-opus-4-7",
   "enabled_providers": [
-    "anthropic",
-    "google",
-    "openai"
+    "opencode",
+    "openai",
+    "google"
   ],
   "provider": {
     "google": {
@@ -131,52 +129,6 @@
             },
             "high": {
               "thinkingLevel": "high"
-            }
-          }
-        },
-        "antigravity-claude-sonnet-4-6": {
-          "name": "Claude Sonnet 4.6 (Antigravity)",
-          "limit": {
-            "context": 200000,
-            "output": 64000
-          },
-          "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
-          }
-        },
-        "antigravity-claude-opus-4-6-thinking": {
-          "name": "Claude Opus 4.6 Thinking (Antigravity)",
-          "limit": {
-            "context": 200000,
-            "output": 64000
-          },
-          "modalities": {
-            "input": [
-              "text",
-              "image",
-              "pdf"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "variants": {
-            "low": {
-              "thinkingConfig": {
-                "thinkingBudget": 8192
-              }
-            },
-            "max": {
-              "thinkingConfig": {
-                "thinkingBudget": 32768
-              }
             }
           }
         },
