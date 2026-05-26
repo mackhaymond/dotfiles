@@ -39,7 +39,9 @@ yabai -m signal --add event=window_created action='
   info=$(yabai -m query --windows --window "$win" 2>/dev/null) || exit 0
   app=$(printf "%s" "$info" | jq -r .app)
   space=$(printf "%s" "$info" | jq -r .space)
-  [ "$app" = "wezterm-gui" ] && exit 0
+  case "$app" in
+    wezterm-gui|WezTerm) exit 0 ;;
+  esac
   if [ "$space" = "1" ]; then
     yabai -m window "$win" --space 2 && yabai -m space --focus 2
   fi
@@ -53,7 +55,7 @@ yabai -m signal --add event=space_changed action='
 '
 
 # App -> Space pinning
-yabai -m rule --add app="^wezterm-gui$" space=1
+yabai -m rule --add app="^(wezterm-gui|WezTerm)$" space=1
 yabai -m rule --add app="^Todoist$" space=4
 yabai -m rule --add app="^Granola$" space=5
 yabai -m rule --add app="^Spark Mail$" space=6
