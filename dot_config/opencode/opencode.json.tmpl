@@ -8,6 +8,9 @@
     "oh-my-opencode-slim@beta"
   ],
   "agent": {
+    "build": {
+      "disable": true
+    },
     "explore": {
       "disable": true
     },
@@ -40,7 +43,7 @@
       "{{ .chezmoi.homeDir }}/.agents/skills"
     ]
   },
-  "default_agent": "sisyphus",
+  "default_agent": "orchestrator",
   "mcp": {
     "codegraph": {
       "type": "local",
