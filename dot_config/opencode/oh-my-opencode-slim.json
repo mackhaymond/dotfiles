@@ -1,6 +1,7 @@
 {
-  "$schema": "https://unpkg.com/oh-my-opencode-slim@latest/oh-my-opencode-slim.schema.json",
+  "$schema": "https://unpkg.com/oh-my-opencode-slim@beta/oh-my-opencode-slim.schema.json",
   "preset": "openai",
+  "scoringEngineVersion": "v2",
   "presets": {
     "openai": {
       "orchestrator": {
