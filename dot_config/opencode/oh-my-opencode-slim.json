@@ -5,8 +5,6 @@
     "openai": {
       "orchestrator": {
         "model": "openai/gpt-5.5",
-        "variant": "medium",
-        "displayName": "sisyphus",
         "skills": [
           "*"
         ],
@@ -24,7 +22,8 @@
         "mcps": []
       },
       "librarian": {
-        "model": "openai/gpt-5.4-mini-fast",
+        "model": "openai/gpt-5.4-mini",
+        "variant": "low",
         "skills": [],
         "mcps": [
           "websearch",
@@ -33,20 +32,20 @@
         ]
       },
       "explorer": {
-        "model": "openai/gpt-5.4-mini-fast",
+        "model": "openai/gpt-5.4-mini",
+        "variant": "low",
         "skills": [],
         "mcps": []
       },
       "designer": {
-        "model": "google/gemini-3.1-pro-preview",
-        "variant": "high",
-        "skills": [
-          "agent-browser"
-        ],
+        "model": "openai/gpt-5.4-mini",
+        "variant": "medium",
+        "skills": [],
         "mcps": []
       },
       "fixer": {
         "model": "openai/gpt-5.4-mini",
+        "variant": "low",
         "skills": [],
         "mcps": []
       }
@@ -54,7 +53,6 @@
     "opencode-go": {
       "orchestrator": {
         "model": "opencode-go/glm-5.1",
-        "displayName": "sisyphus",
         "skills": [
           "*"
         ],
@@ -94,9 +92,7 @@
       "designer": {
         "model": "opencode-go/kimi-k2.6",
         "variant": "medium",
-        "skills": [
-          "agent-browser"
-        ],
+        "skills": [],
         "mcps": []
       },
       "fixer": {
@@ -111,27 +107,5 @@
         "mcps": []
       }
     }
-  },
-  "fallback": {
-    "enabled": true,
-    "chains": {
-      "oracle": [
-        "google/gemini-3.1-pro-preview"
-      ],
-      "designer": [
-        "openai/gpt-5.5"
-      ]
-    }
-  },
-  "background_task": {
-    "providerConcurrency": {
-      "google": 5,
-      "openai": 3
-    }
-  },
-  "disabled_agents": [
-    "observer"
-  ],
-  "autoUpdate": true,
-  "disabled_mcps": []
+  }
 }
