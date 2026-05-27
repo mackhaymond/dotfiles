@@ -28,5 +28,8 @@ if [[ -z "$OP_SERVICE_ACCOUNT_TOKEN" ]] && command -v security >/dev/null 2>&1; 
     -s op-service-account-token -a "$USER" -w 2>/dev/null)"
 fi
 
+# OpenCode beta background subagents
+export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=1
+
 # Secrets (chmod 600, gitignored)
 [[ -r "$HOME/.zshenv.private" ]] && source "$HOME/.zshenv.private"
