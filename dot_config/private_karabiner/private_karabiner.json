@@ -7,6 +7,40 @@
                     {
                         "manipulators": [
                             {
+                                "description": "Change hyper+escape to F18 for skhd.",
+                                "from": {
+                                    "key_code": "escape",
+                                    "modifiers": {
+                                        "mandatory": [
+                                            "left_command",
+                                            "left_control",
+                                            "left_option",
+                                            "left_shift"
+                                        ],
+                                        "optional": ["any"]
+                                    }
+                                },
+                                "to": [{ "key_code": "f18" }],
+                                "type": "basic"
+                            },
+                            {
+                                "description": "Change caps_lock+escape to F18 for skhd.",
+                                "from": {
+                                    "simultaneous": [
+                                        { "key_code": "caps_lock" },
+                                        { "key_code": "escape" }
+                                    ],
+                                    "simultaneous_options": {
+                                        "key_down_order": "strict",
+                                        "key_up_order": "insensitive",
+                                        "to_after_key_up": [{ "key_code": "vk_none" }]
+                                    },
+                                    "modifiers": { "optional": ["any"] }
+                                },
+                                "to": [{ "key_code": "f18" }],
+                                "type": "basic"
+                            },
+                            {
                                 "description": "Change caps_lock to command+control+option+shift.",
                                 "from": {
                                     "key_code": "caps_lock",

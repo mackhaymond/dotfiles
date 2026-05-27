@@ -62,6 +62,7 @@ yabai -m rule --add app="^Spark Mail$" space=6
 yabai -m rule --add app="^Notion Calendar$" space=7
 yabai -m rule --add app="^Messages$" space=8
 yabai -m rule --add app="^ChatGPT$" space=9
+yabai -m rule --add app="^Codex$" space=10
 
 # Re-apply rules to currently-open windows on yabai (re)start.
 # Catches windows whose creation events were missed (login race, crash-restart).
