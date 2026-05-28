@@ -160,28 +160,29 @@ opencode() {
 }
 oc() { opencode "$@"; }
 
-yy() {
-  local tmp="$(mktemp -t "yazi-cwd.XXXXXX")"
-  yazi "$@" --cwd-file="$tmp"
-  if cwd="$(cat -- "$tmp")" && [[ -n "$cwd" && "$cwd" != "$PWD" ]]; then
+y() {
+  local tmp cwd
+  tmp="$(mktemp -t "yazi-cwd.XXXXXX")" || return
+
+  command yazi "$@" --cwd-file="$tmp"
+  if IFS= read -r cwd < "$tmp" && [[ -n "$cwd" && "$cwd" != "$PWD" && -d "$cwd" ]]; then
     builtin cd -- "$cwd"
   fi
-  rm -f -- "$tmp"
+
+  command rm -f -- "$tmp"
 }
 
-yytmux() {
-  local tmp="$(mktemp -t "yazi-cwd.XXXXXX")"
-  if [[ "$(tmux display-message -p -F '#{session_name}')" = "popup" ]]; then
-    tmux detach-client
-  else
-    local original_session=$(tmux display-message -p -F "#{session_name}")
-    local original_window=$(tmux display-message -p -F "#{window_name}")
-    tmux popup -E -w 80% -h 80% "yazi \"$@\" --cwd-file=\"$tmp\""
-    if cwd="$(cat -- "$tmp")" && [[ -n "$cwd" && "$cwd" != "$PWD" ]]; then
-      tmux send-keys -t "${original_session}:${original_window}" "cd \"$cwd\"" Enter
-    fi
-    rm -f -- "$tmp"
+yp() {
+  if [[ -z "${TMUX:-}" ]]; then
+    y "$@"
+    return
   fi
+
+  "$HOME/.config/tmux/scripts/yazi-popup.sh" \
+    "$(tmux display-message -p '#{client_tty}')" \
+    "$PWD" \
+    "$(tmux display-message -p '#{pane_id}')" \
+    "$@"
 }
 
 # NOTE: chezmoi-approve-commit (the helper that mints CHEZMOI_COMMIT_OK

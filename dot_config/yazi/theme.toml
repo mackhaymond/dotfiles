@@ -1,0 +1,10 @@
+# Keep this file small: flavors provide the palette, local overrides tweak feel.
+# Install/update flavors with `ya pkg` rather than copying full theme files.
+
+[flavor]
+dark = "catppuccin-mocha"
+light = "catppuccin-latte"
+
+[status]
+sep_left = { open = "", close = "" }
+sep_right = { open = "", close = "" }
