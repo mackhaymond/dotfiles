@@ -483,8 +483,20 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
             properties: { sessionID },
           },
         })
-        await client.tui.appendPrompt({ text: prompt })
-        await client.tui.submitPrompt()
+        await client.tui.publish({
+          body: {
+            id: `chezmoi-guard-append-${Date.now()}`,
+            type: "tui.prompt.append",
+            properties: { text: prompt },
+          },
+        })
+        await client.tui.publish({
+          body: {
+            id: `chezmoi-guard-submit-${Date.now()}`,
+            type: "tui.command.execute",
+            properties: { command: "prompt.submit" },
+          },
+        })
         debugLog("submitted continuation through tui", { sessionID })
       } catch (err) {
         state.continuationPending = false
