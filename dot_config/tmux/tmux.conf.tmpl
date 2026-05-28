@@ -136,7 +136,7 @@ unbind -n M-a
 bind -n M-a run-shell -b "#{HOME}/.config/tmux/scripts/toggle-btop-popup.sh '#{client_tty}'"
 
 unbind -n M-y
-bind -n M-y run-shell -b "#{HOME}/.config/tmux/scripts/yazi-popup.sh #{q:client_tty} #{q:pane_current_path} #{q:pane_id}"
+bind -n M-y display-popup -E -d "#{pane_current_path}" -w 92% -h 90% -T " yazi " "command yazi"
 
 # bind -n m-w send-keys -F "yy" Enter
 

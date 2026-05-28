@@ -178,11 +178,7 @@ yp() {
     return
   fi
 
-  "$HOME/.config/tmux/scripts/yazi-popup.sh" \
-    "$(tmux display-message -p '#{client_tty}')" \
-    "$PWD" \
-    "$(tmux display-message -p '#{pane_id}')" \
-    "$@"
+  "$HOME/.config/tmux/scripts/yazi-popup.sh" "$PWD" "$@"
 }
 
 # NOTE: chezmoi-approve-commit (the helper that mints CHEZMOI_COMMIT_OK
