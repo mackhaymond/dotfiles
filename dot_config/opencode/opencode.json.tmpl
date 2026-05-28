@@ -20,11 +20,23 @@
   },
   "lsp": true,
   "permission": {
+    "read": {
+      "*": "allow",
+      "{{ .chezmoi.sourceDir }}": "allow",
+      "{{ .chezmoi.sourceDir }}/**": "allow"
+    },
     "bash": {
       "*": "allow"
     },
+    "external_directory": {
+      "*": "allow",
+      "{{ .chezmoi.sourceDir }}": "allow",
+      "{{ .chezmoi.sourceDir }}/**": "allow"
+    },
     "edit": {
       "*": "allow",
+      "{{ .chezmoi.sourceDir }}": "allow",
+      "{{ .chezmoi.sourceDir }}/**": "allow",
       "{{ .chezmoi.homeDir }}/.zshrc": "deny",
       "{{ .chezmoi.homeDir }}/.zprofile": "deny",
       "{{ .chezmoi.homeDir }}/.zshenv": "deny",
