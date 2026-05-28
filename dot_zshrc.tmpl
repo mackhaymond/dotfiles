@@ -161,48 +161,20 @@ opencode() {
 oc() { opencode "$@"; }
 
 y() {
-  local tmp cwd
+  local tmp cwd yazi_status
   tmp="$(mktemp -t "yazi-cwd.XXXXXX")" || return
 
   command yazi "$@" --cwd-file="$tmp"
-  if IFS= read -r cwd < "$tmp" && [[ -n "$cwd" && "$cwd" != "$PWD" && -d "$cwd" ]]; then
+  yazi_status=$?
+
+  cwd="$(<"$tmp")"
+  if [[ -n "$cwd" && "$cwd" != "$PWD" && -d "$cwd" ]]; then
     builtin cd -- "$cwd"
   fi
 
   command rm -f -- "$tmp"
-}
 
-yp() {
-  if [[ -n "${TMUX:-}" ]]; then
-    local popup_cmd
-    popup_cmd="$(printf '%q ' "$HOME/.config/tmux/scripts/finder-open.sh" "$PWD" "$@")"
-    tmux display-popup -E -d "$PWD" -w 92% -h 90% -T " finder " "$popup_cmd"
-    return
-  fi
-
-  local root="${1:-$PWD}" selection
-  selection="$(_finder_select "$root")" || return
-  [[ -n "$selection" ]] && command open "$selection"
-}
-
-_finder_select() {
-  local root="${1:-$PWD}"
-
-  command fd \
-    --hidden \
-    --follow \
-    --exclude .git \
-    --exclude node_modules \
-    --exclude .DS_Store \
-    . "$root" \
-    | command fzf \
-      --exit-0 \
-      --select-1 \
-      --height 80% \
-      --reverse \
-      --prompt='open ❯ ' \
-      --preview 'if [ -d {} ]; then eza --icons --group-directories-first --tree --level=2 --color=always {}; elif command -v bat >/dev/null 2>&1; then bat --style=numbers --color=always --line-range=:200 {}; else file {}; fi' \
-      --preview-window=right:60%:wrap
+  return "$yazi_status"
 }
 
 # NOTE: chezmoi-approve-commit (the helper that mints CHEZMOI_COMMIT_OK
