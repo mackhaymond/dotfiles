@@ -850,6 +850,19 @@ format_session_reset_text() {
 
   local base
   base="$(format_time_until_reset "$resets_at" "$now")"
+
+  # Guard against provider/schema mixups: a 5-hour session reset should never
+  # render as a multi-day weekly reset. If the reset is farther out than the
+  # advertised window, treat it as unavailable instead of showing nonsense.
+  if [[ "$base" != "--" && "$window_minutes" =~ ^[0-9]+$ ]]; then
+    local duration time_until
+    duration=$(( window_minutes * 60 ))
+    time_until=$(( resets_at - now ))
+    if (( duration <= 0 || time_until > duration )); then
+      base='--'
+    fi
+  fi
+
   printf '%s' "$base"
 
   [[ "$base" != "--" ]] || return 0
@@ -882,6 +895,16 @@ format_weekly_reset_text() {
 
   local time_until reset_daytime
   time_until="$(format_time_until_reset "$resets_at" "$now")"
+
+  if [[ "$time_until" != "--" && "$window_minutes" =~ ^[0-9]+$ ]]; then
+    local duration delta
+    duration=$(( window_minutes * 60 ))
+    delta=$(( resets_at - now ))
+    if (( duration <= 0 || delta > duration )); then
+      time_until='--'
+    fi
+  fi
+
   reset_daytime=''
   if [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
     reset_daytime="$(format_short_daytime "$resets_at" 2>/dev/null || true)"
@@ -1559,32 +1582,53 @@ fetch_via_codexbar_codex() {
     return 1
   fi
 
-  local normalized session_raw weekly_raw
+  local normalized session_limit weekly_limit session_raw weekly_raw
   if ! normalized="$(printf '%s' "$fetch_out" | jq -ser '[.[] | (if type=="array" then .[0] else . end)] | map(select(.usage?)) | .[0]' 2>/dev/null)"; then
     log_warn_trunc "refresh[codex]: jq parse failure (normalize) out=${fetch_out}" 300
     return 1
   fi
 
-  if ! session_raw="$(printf '%s' "$normalized" | jq -er '.usage.primary.usedPercent | tonumber' 2>/dev/null)"; then
+  # CodexBar has changed/expanded its JSON a few times. Do not trust field
+  # names alone: select the 5-hour/session and 7-day/weekly limits by their
+  # windowMinutes, falling back to primary/secondary only if needed.
+  if ! session_limit="$(printf '%s' "$normalized" | jq -cer '
+    [.usage.primary?, .usage.secondary?, .openaiDashboard.primaryLimit?, .openaiDashboard.secondaryLimit?]
+    | map(select(type == "object" and (.usedPercent? != null)))
+    | (map(select(((.windowMinutes? // 0) | tonumber) > 0 and ((.windowMinutes? // 0) | tonumber) <= 360)) | first) // .[0] // empty
+  ' 2>/dev/null)"; then
+    log_warn "refresh[codex]: jq parse failure (session limit)"
+    return 1
+  fi
+
+  if ! weekly_limit="$(printf '%s' "$normalized" | jq -cer '
+    [.usage.primary?, .usage.secondary?, .openaiDashboard.primaryLimit?, .openaiDashboard.secondaryLimit?]
+    | map(select(type == "object" and (.usedPercent? != null)))
+    | (map(select(((.windowMinutes? // 0) | tonumber) >= 1000)) | first) // .[1] // empty
+  ' 2>/dev/null)"; then
+    log_warn "refresh[codex]: jq parse failure (weekly limit)"
+    return 1
+  fi
+
+  if ! session_raw="$(printf '%s' "$session_limit" | jq -er '.usedPercent | tonumber' 2>/dev/null)"; then
     log_warn "refresh[codex]: jq parse failure (session usedPercent)"
     return 1
   fi
-  if ! weekly_raw="$(printf '%s' "$normalized" | jq -er '.usage.secondary.usedPercent | tonumber' 2>/dev/null)"; then
+  if ! weekly_raw="$(printf '%s' "$weekly_limit" | jq -er '.usedPercent | tonumber' 2>/dev/null)"; then
     log_warn "refresh[codex]: jq parse failure (weekly usedPercent)"
     return 1
   fi
 
   FETCH_SESSION_USED="$session_raw"
   FETCH_WEEKLY_USED="$weekly_raw"
-  FETCH_SESSION_WINDOW_MINUTES="$(printf '%s' "$normalized" | jq -er '.usage.primary.windowMinutes // empty | tonumber' 2>/dev/null || true)"
-  FETCH_WEEKLY_WINDOW_MINUTES="$(printf '%s' "$normalized" | jq -er '.usage.secondary.windowMinutes // empty | tonumber' 2>/dev/null || true)"
+  FETCH_SESSION_WINDOW_MINUTES="$(printf '%s' "$session_limit" | jq -er '.windowMinutes // empty | tonumber' 2>/dev/null || true)"
+  FETCH_WEEKLY_WINDOW_MINUTES="$(printf '%s' "$weekly_limit" | jq -er '.windowMinutes // empty | tonumber' 2>/dev/null || true)"
 
   local iso
-  iso="$(printf '%s' "$normalized" | jq -er -r '.usage.primary.resetsAt // empty | tostring' 2>/dev/null || true)"
+  iso="$(printf '%s' "$session_limit" | jq -er -r '.resetsAt // empty | tostring' 2>/dev/null || true)"
   if [[ -n "${iso:-}" ]]; then
     FETCH_SESSION_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
   fi
-  iso="$(printf '%s' "$normalized" | jq -er -r '.usage.secondary.resetsAt // empty | tostring' 2>/dev/null || true)"
+  iso="$(printf '%s' "$weekly_limit" | jq -er -r '.resetsAt // empty | tostring' 2>/dev/null || true)"
   if [[ -n "${iso:-}" ]]; then
     FETCH_WEEKLY_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
   fi
