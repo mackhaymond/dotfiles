@@ -173,12 +173,8 @@ y() {
 }
 
 yp() {
-  if [[ -z "${TMUX:-}" ]]; then
-    y "$@"
-    return
-  fi
-
-  "$HOME/.config/tmux/scripts/yazi-popup.sh" "$PWD" "$@"
+  print -u2 "Yazi tmux popup is disabled because tmux display-popup breaks Yazi terminal probes. Use 'y' instead."
+  return 1
 }
 
 # NOTE: chezmoi-approve-commit (the helper that mints CHEZMOI_COMMIT_OK
