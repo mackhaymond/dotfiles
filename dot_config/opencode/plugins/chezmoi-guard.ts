@@ -23,7 +23,7 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { execFileSync, execSync } from "node:child_process"
-import { realpathSync } from "node:fs"
+import { appendFileSync, mkdirSync, realpathSync } from "node:fs"
 import { relative, resolve } from "node:path"
 
 const TTL_MS = 5 * 60 * 1000
@@ -85,6 +85,19 @@ function refresh(): void {
 const BLOCKED_TOOLS = new Set(["edit", "write", "apply_patch", "multiedit"])
 
 const CHEZMOI_SOURCE_DIR = normalizePath("~/.local/share/chezmoi")
+const LOG_FILE = normalizePath("~/.local/share/opencode/chezmoi-guard.log")
+
+function debugLog(message: string, data?: Record<string, unknown>): void {
+  try {
+    mkdirSync(resolve(LOG_FILE, ".."), { recursive: true })
+    appendFileSync(
+      LOG_FILE,
+      `[${new Date().toISOString()}] ${message}${data ? ` ${JSON.stringify(data)}` : ""}\n`,
+    )
+  } catch {
+    // Logging must never interfere with guard behavior.
+  }
+}
 
 type SessionChezmoiState = {
   // Canonical absolute paths under CHEZMOI_SOURCE_DIR that THIS opencode
@@ -119,7 +132,10 @@ function rememberSourceWrites(sessionID: string, rawPaths: string[]): void {
   const state = stateForSession(sessionID)
   for (const raw of rawPaths) {
     const p = normalizePath(raw)
-    if (isInChezmoiSource(p)) state.touchedPaths.add(p)
+    if (isInChezmoiSource(p)) {
+      state.touchedPaths.add(p)
+      debugLog("remembered source write", { sessionID, path: sourceRelativePath(p) })
+    }
   }
 }
 
@@ -426,30 +442,50 @@ function managedPathError(p: string): Error {
 
 export const ChezmoiGuard: Plugin = async ({ client }) => {
   refresh()
+  debugLog("initialized", { source: CHEZMOI_SOURCE_DIR })
   return {
     event: async ({ event }) => {
-      if (event.type !== "session.next.step.ended") return
+      if (event.type !== "session.idle") return
       const sessionID = event.properties.sessionID
       const state = stateForSession(sessionID)
-      if (state.continuationPending) return
+      if (state.continuationPending) {
+        debugLog("idle skipped: continuation already pending", { sessionID })
+        return
+      }
       const prompt = uncommittedChezmoiContinuationPrompt(sessionID)
-      if (!prompt) return
+      if (!prompt) {
+        debugLog("idle clean", { sessionID })
+        return
+      }
       state.continuationPending = true
-      await client.tui.showToast({
-        title: "Continuing to commit chezmoi edits",
-        message: "chezmoi-guard found session-touched dirty dotfiles and is prompting the agent to commit/push before stopping.",
-        variant: "warning",
-        duration: 10_000,
-      })
-      await client.session.promptAsync({
-        sessionID,
-        parts: [{ type: "text", text: prompt, synthetic: true }],
-      })
+      debugLog("idle dirty: prompting continuation", { sessionID })
+      try {
+        await client.tui.showToast({
+          title: "Continuing to commit chezmoi edits",
+          message: "chezmoi-guard found session-touched dirty dotfiles and is prompting the agent to commit/push before stopping.",
+          variant: "warning",
+          duration: 10_000,
+        })
+      } catch (err) {
+        debugLog("toast failed", { sessionID, error: String(err) })
+      }
+      try {
+        await client.session.promptAsync({
+          sessionID,
+          parts: [{ type: "text", text: prompt }],
+        })
+      } catch (err) {
+        state.continuationPending = false
+        debugLog("promptAsync failed", { sessionID, error: String(err) })
+      }
     },
     "experimental.chat.system.transform": async (input, output) => {
       if (!input.sessionID) return
       const complaint = uncommittedChezmoiComplaint(input.sessionID)
-      if (complaint) output.system.push(complaint)
+      if (complaint) {
+        debugLog("system reminder injected", { sessionID: input.sessionID })
+        output.system.push(complaint)
+      }
     },
     "tool.execute.before": async (input, output) => {
       // Edit-class tools (edit/write/apply_patch/multiedit): block writes

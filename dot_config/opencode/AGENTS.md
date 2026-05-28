@@ -61,7 +61,8 @@ vectors:
   the command shell.
 
 The guard also tracks chezmoi source files written by the current opencode
-session. If those same session-touched paths are still dirty at turn end, it
+session. If those same session-touched paths are still dirty when the session
+becomes idle at turn end, it
 injects a synthetic follow-up prompt so the agent continues and applies,
 inspects, stages, commits, and pushes before it actually stops, and it shows a
 toast so the user can see why the agent resumed. The synthetic prompt also
@@ -72,6 +73,9 @@ files written in the current session so simultaneous agents do not complain
 about unrelated chezmoi changes they did not make. Agents should ignore
 chezmoi dirty paths that appear unrelated to their own work; those are very
 likely from another concurrent agent.
+
+Debug logs for this behavior are written to
+`~/.local/share/opencode/chezmoi-guard.log`.
 
 <!-- CODEGRAPH_START -->
 ## CodeGraph
