@@ -39,7 +39,7 @@ main() {
     tmux unbind-key -T prefix "$prev_key" 2>/dev/null || true
   fi
 
-  tmux bind-key -T prefix "$desired_key" run-shell "bash \"$home/.config/tmux/scripts/codexbar-usage-key.sh\"" >/dev/null 2>&1 || true
+  tmux bind-key -T prefix "$desired_key" run-shell -b "bash \"$home/.config/tmux/scripts/codexbar-usage-key.sh\"" >/dev/null 2>&1 || true
   tmux set-option -gq "@codexbar__bound_reset_key" "$desired_key" >/dev/null 2>&1 || true
 }
 

@@ -51,13 +51,27 @@ gen_nonce() {
   date +%s
 }
 
+shell_quote() {
+  printf '%q' "${1:-}"
+}
+
 refresh_usage_in_background() {
-  local status_script="${1:?}"
+  local status_script="${1:?}" seconds="${2:-0}" nonce="${3:-}"
+
+  local status_script_q nonce_q
+  status_script_q="$(shell_quote "$status_script")"
+  nonce_q="$(shell_quote "$nonce")"
 
   # Never run CodexBar's network/API refresh in the foreground from a tmux key
   # binding. `run-shell` without `-b` blocks the tmux server until the command
-  # exits, so a slow CodexBar request makes the whole session feel frozen.
-  tmux run-shell -b "bash \"$status_script\" --refresh >/dev/null 2>&1 || true; tmux refresh-client -S >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+  # exits, so a slow CodexBar request makes the whole session feel frozen. If
+  # the refresh completes after a short preview would have expired, extend the
+  # same nonce's preview long enough for the fresh reset data to be visible.
+  if (( seconds > 0 )); then
+    tmux run-shell -b "bash $status_script_q --refresh >/dev/null 2>&1 || true; n=\$(tmux show-option -gqv @codexbar_reset_preview_nonce 2>/dev/null || true); if [ \"\$n\" = $nonce_q ]; then until=\$(( \$(date +%s) + $seconds )); tmux set-option -gq @codexbar_reset_preview_until \"\$until\" >/dev/null 2>&1 || true; bash $status_script_q --publish >/dev/null 2>&1 || true; tmux refresh-client -S >/dev/null 2>&1 || true; fi" >/dev/null 2>&1 || true
+  else
+    tmux run-shell -b "bash $status_script_q --refresh >/dev/null 2>&1 || true; bash $status_script_q --publish >/dev/null 2>&1 || true; tmux refresh-client -S >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+  fi
 }
 
 main() {
@@ -78,7 +92,7 @@ main() {
 
     bash "$status_script" --publish >/dev/null 2>&1 || true
     tmux refresh-client -S >/dev/null 2>&1 || true
-    refresh_usage_in_background "$status_script"
+    refresh_usage_in_background "$status_script" 0 ""
     return 0
   fi
 
@@ -92,9 +106,12 @@ main() {
 
   bash "$status_script" --publish >/dev/null 2>&1 || true
   tmux refresh-client -S >/dev/null 2>&1 || true
-  refresh_usage_in_background "$status_script"
+  refresh_usage_in_background "$status_script" "$seconds" "$nonce"
 
-  tmux run-shell -b "sleep $seconds; n=\$(tmux show-option -gqv @codexbar_reset_preview_nonce 2>/dev/null); if [ \"\$n\" = \"$nonce\" ]; then bash \"$status_script\" --publish >/dev/null 2>&1 || true; tmux refresh-client -S >/dev/null 2>&1; fi; exit 0" >/dev/null 2>&1 || true
+  local status_script_q nonce_q
+  status_script_q="$(shell_quote "$status_script")"
+  nonce_q="$(shell_quote "$nonce")"
+  tmux run-shell -b "sleep $seconds; n=\$(tmux show-option -gqv @codexbar_reset_preview_nonce 2>/dev/null); if [ \"\$n\" = $nonce_q ]; then bash $status_script_q --publish >/dev/null 2>&1 || true; tmux refresh-client -S >/dev/null 2>&1; fi; exit 0" >/dev/null 2>&1 || true
 
 }
 
