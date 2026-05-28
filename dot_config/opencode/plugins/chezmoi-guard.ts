@@ -476,7 +476,13 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
         debugLog("toast failed", { sessionID, error: String(err) })
       }
       try {
-        await client.tui.selectSession({ sessionID })
+        await client.tui.publish({
+          body: {
+            id: `chezmoi-guard-select-${Date.now()}`,
+            type: "tui.session.select",
+            properties: { sessionID },
+          },
+        })
         await client.tui.appendPrompt({ text: prompt })
         await client.tui.submitPrompt()
         debugLog("submitted continuation through tui", { sessionID })
