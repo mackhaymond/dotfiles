@@ -140,7 +140,7 @@ unbind -n M-a
 bind -n M-a run-shell -b "#{HOME}/.config/tmux/scripts/toggle-btop-popup.sh '#{client_tty}'"
 
 unbind -n M-y
-bind -n M-y display-message "Yazi tmux popup disabled: use 'y' until TRT issue is fixed"
+bind -n M-y display-popup -E -d "#{pane_current_path}" -w 92% -h 90% -T " finder " "#{HOME}/.config/tmux/scripts/finder-open.sh #{q:pane_current_path}"
 
 # bind -n m-w send-keys -F "yy" Enter
 
