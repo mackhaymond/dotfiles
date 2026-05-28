@@ -376,7 +376,7 @@ function bashHazardsChezmoiRepo(cmd: string, workdir?: string): boolean {
   // `GIT_DIR=<chezmoi>/.git git commit` and `export GIT_WORK_TREE=<chezmoi>;
   // git commit` are both ways to redirect git at the chezmoi repo without
   // any `-C`/`--git-dir`/`cd` syntax. Match the env-assignment, normalize
-  // the path (stripping a trailing /.git), and require a git write-verb
+  // the path (stripping a trailing /.git), and require a blocked git hazard
   // anywhere in the rest of the command.
   const gitEnvRe = /(?:^|[\s|;&(])(?:export\s+)?(?:GIT_DIR|GIT_WORK_TREE)=(['"]?)([^\s'"|;&]+)\1/g
   while ((m = gitEnvRe.exec(expanded)) !== null) {
@@ -389,11 +389,11 @@ function bashHazardsChezmoiRepo(cmd: string, workdir?: string): boolean {
     }
   }
   // Pattern A3: bash-tool `workdir` parameter pointed at chezmoi src + a
-  // git write-verb in the command. Without this, `bash(workdir=<chezmoi>,
-  // command="git commit")` slips past every other detector — there's no
-  // syntactic chezmoi reference in the command string itself, so A1/A2/B
-  // can't match. The workdir is supplied by the bash tool wrapper (above
-  // the regex layer), not by the user/agent's command shell.
+  // destructive/history-rewriting git operation in the command. Without this,
+  // `bash(workdir=<chezmoi>, command="git reset")` slips past every other
+  // detector — there's no syntactic chezmoi reference in the command string
+  // itself, so A1/A2/B can't match. The workdir is supplied by the bash tool
+  // wrapper (above the regex layer), not by the user/agent's command shell.
   if (workdir) {
     const dir = normalizePath(workdir)
     if (
@@ -405,7 +405,7 @@ function bashHazardsChezmoiRepo(cmd: string, workdir?: string): boolean {
   }
   // Pattern B: implicit cwd via cd/pushd into chezmoi src + later git verb.
   // Boundary set must include `(` and `{` so subshell wrappers like
-  // `(cd ~/.local/share/chezmoi && git commit)` are caught — those are the
+  // `(cd ~/.local/share/chezmoi && git reset)` are caught — those are the
   // most natural way an agent would isolate the cd from the surrounding
   // shell state and would otherwise bypass a `[\s|;&]`-only boundary.
   const cdRe = /(?:^|[\s|;&({])(?:cd|pushd)\s+(['"]?)([^\s'"|;&]+)\1/g
