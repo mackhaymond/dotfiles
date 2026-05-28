@@ -47,8 +47,9 @@ yabai -m signal --add event=window_created action='
   fi
 '
 
-# Re-activate wezterm on returning to space 1 so the terminal/opencode
-# session is foregrounded after yabai sends intruder windows away.
+# Re-activate wezterm on returning to space 1 so it re-asserts its
+# non-native fullscreen presentation options (hides the menu bar again
+# after an intruder window briefly trampled them).
 yabai -m signal --add event=space_changed action='
   [ "$YABAI_SPACE_INDEX" = "1" ] && osascript -e "tell application \"WezTerm\" to activate"
 '
