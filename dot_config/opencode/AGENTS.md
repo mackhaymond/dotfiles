@@ -60,6 +60,13 @@ vectors:
   command string only — the workdir is supplied by the tool wrapper, not
   the command shell.
 
+The guard also tracks chezmoi source files written by the current opencode
+session. If those same session-touched paths are still dirty before a later
+model turn, it injects a reminder telling the agent to apply, inspect, stage,
+commit, and push before finishing. This check is path-scoped to files written
+in the current session so simultaneous agents do not complain about unrelated
+chezmoi changes they did not make.
+
 <!-- CODEGRAPH_START -->
 ## CodeGraph
 

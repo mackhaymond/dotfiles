@@ -22,9 +22,9 @@
 // within 5 minutes; force-refresh by restarting the opencode session.
 
 import type { Plugin } from "@opencode-ai/plugin"
-import { execSync } from "node:child_process"
+import { execFileSync, execSync } from "node:child_process"
 import { realpathSync } from "node:fs"
-import { resolve } from "node:path"
+import { relative, resolve } from "node:path"
 
 const TTL_MS = 5 * 60 * 1000
 let managed = new Set<string>()
@@ -85,6 +85,89 @@ function refresh(): void {
 const BLOCKED_TOOLS = new Set(["edit", "write", "apply_patch", "multiedit"])
 
 const CHEZMOI_SOURCE_DIR = normalizePath("~/.local/share/chezmoi")
+
+type SessionChezmoiState = {
+  // Canonical absolute paths under CHEZMOI_SOURCE_DIR that THIS opencode
+  // session wrote to through an observed tool call. This is intentionally
+  // path-scoped instead of repo-wide so simultaneous agents with unrelated
+  // dotfile work do not complain about each other's uncommitted changes.
+  touchedPaths: Set<string>
+}
+
+const sessionState = new Map<string, SessionChezmoiState>()
+
+function stateForSession(sessionID: string): SessionChezmoiState {
+  let state = sessionState.get(sessionID)
+  if (!state) {
+    state = { touchedPaths: new Set() }
+    sessionState.set(sessionID, state)
+  }
+  return state
+}
+
+function isInChezmoiSource(p: string): boolean {
+  const normalized = normalizePath(p)
+  return normalized === CHEZMOI_SOURCE_DIR || normalized.startsWith(CHEZMOI_SOURCE_DIR + "/")
+}
+
+function sourceRelativePath(p: string): string {
+  return relative(CHEZMOI_SOURCE_DIR, normalizePath(p))
+}
+
+function rememberSourceWrites(sessionID: string, rawPaths: string[]): void {
+  const state = stateForSession(sessionID)
+  for (const raw of rawPaths) {
+    const p = normalizePath(raw)
+    if (isInChezmoiSource(p)) state.touchedPaths.add(p)
+  }
+}
+
+function dirtyTouchedPaths(sessionID: string): string[] {
+  const state = sessionState.get(sessionID)
+  if (!state || state.touchedPaths.size === 0) return []
+  const rels = [...state.touchedPaths]
+    .map(sourceRelativePath)
+    .filter((p) => p && !p.startsWith(".."))
+    .sort()
+  if (rels.length === 0) return []
+
+  try {
+    const out = execFileSync("git", ["-C", CHEZMOI_SOURCE_DIR, "status", "--porcelain", "--", ...rels], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "ignore"],
+      timeout: 3000,
+    })
+    const dirty = new Set<string>()
+    for (const line of out.split("\n")) {
+      if (!line.trim()) continue
+      // Porcelain v1 is `XY path` or `XY old -> new`. For renames, track the
+      // destination path because that is what remains uncommitted.
+      const raw = line.slice(3).replace(/^.* -> /, "")
+      if (raw) dirty.add(raw)
+    }
+    for (const p of rels) {
+      if (!dirty.has(p)) state.touchedPaths.delete(resolve(CHEZMOI_SOURCE_DIR, p))
+    }
+    return rels.filter((p) => dirty.has(p))
+  } catch {
+    // If status fails, fail quiet rather than blame the agent for stale or
+    // unverifiable state. The normal hard guards still run independently.
+    return []
+  }
+}
+
+function uncommittedChezmoiComplaint(sessionID: string): string | undefined {
+  const dirty = dirtyTouchedPaths(sessionID)
+  if (dirty.length === 0) return undefined
+  const shown = dirty.slice(0, 12).map((p) => `- ${p}`).join("\n")
+  const more = dirty.length > 12 ? `\n- ...and ${dirty.length - 12} more` : ""
+  return (
+    `CHEZMOI-GUARD: You made chezmoi source changes in this session that are still uncommitted.\n` +
+    `Before finishing this dotfile task, run chezmoi apply if needed, inspect git status/diff, ` +
+    `stage only the intended files, commit, and push.\n` +
+    `Session-touched dirty paths:\n${shown}${more}`
+  )
+}
 
 function pathsFromArgs(tool: string, args: any): string[] {
   if (!args) return []
@@ -329,6 +412,11 @@ function managedPathError(p: string): Error {
 export const ChezmoiGuard: Plugin = async () => {
   refresh()
   return {
+    "experimental.chat.system.transform": async (input, output) => {
+      if (!input.sessionID) return
+      const complaint = uncommittedChezmoiComplaint(input.sessionID)
+      if (complaint) output.system.push(complaint)
+    },
     "tool.execute.before": async (input, output) => {
       // Edit-class tools (edit/write/apply_patch/multiedit): block writes
       // to canonicalized managed paths.
@@ -379,6 +467,33 @@ export const ChezmoiGuard: Plugin = async () => {
           }
         }
       }
+    },
+    "tool.execute.after": async (input) => {
+      if (BLOCKED_TOOLS.has(input.tool)) {
+        rememberSourceWrites(input.sessionID, pathsFromArgs(input.tool, input.args))
+        return
+      }
+      if (input.tool !== "bash") return
+      const cmd = bashCommandFromArgs(input.args)
+      if (!cmd) return
+      const workdir = bashWorkdirFromArgs(input.args)
+      const paths: string[] = []
+      for (const seg of splitBashSegments(cmd)) {
+        if (!bashHasWriteIntent(seg)) continue
+        paths.push(...pathsFromBashCommand(seg))
+      }
+      // Common non-interactive source edit shape: bash tool workdir points at
+      // the chezmoi source and the command writes explicit rooted paths. We do
+      // not mark repo-wide dirtiness for unknown relative writes; doing so
+      // would falsely complain about unrelated changes from concurrent agents.
+      if (workdir && isInChezmoiSource(workdir)) {
+        rememberSourceWrites(input.sessionID, paths.map((p) => (p.startsWith("/") || p.startsWith("~") ? p : resolve(workdir, p))))
+      } else {
+        rememberSourceWrites(input.sessionID, paths)
+      }
+      // Recompute after every bash command so successful commits by this or
+      // another process clear the session's pending reminder promptly.
+      dirtyTouchedPaths(input.sessionID)
     },
   }
 }
