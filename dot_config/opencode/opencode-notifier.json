@@ -10,7 +10,12 @@
     "error": true,
     "complete": true,
     "plan_exit": true,
-    "subagent_complete": false,
+    "subagent_complete": {
+      "sound": false,
+      "notification": false,
+      "command": false,
+      "bell": false
+    },
     "session_started": false,
     "user_message": false,
     "client_connected": false
