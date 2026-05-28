@@ -321,11 +321,11 @@ function pathsFromBashWriteTargets(cmd: string): string[] {
 
   // Best-effort extraction for bare relative targets used by write/delete
   // commands. This intentionally over-approximates to catch common bypasses.
-  const redirectRe = /(?:^|[\s|;&({`])(?:[0-9]+?>|>>|>|&>)(?:\|?|!)?\s*([^\s|;&()<>`]+|['"][^'"]+['"])/g
+  const redirectRe = /(?:^|[\s|;&({`])(?:[0-9]*&?>>?|&>>?)(?:\|?|!)?\s*([^\s|;&()<>`]+|['"][^'"]+['"])/g
   let m: RegExpExecArray | null
   while ((m = redirectRe.exec(expanded)) !== null) push(m[1])
 
-  const commandTargetRe = /(?:^|[\s|;&({`])(cp|mv|tee|truncate|rm|unlink)\b([^\n;|&()]*)/g
+  const commandTargetRe = /(?:^|[\s|;&({`])(cp|mv|tee|truncate|rm|unlink|install|rsync|ln|sed|perl|ruby|awk)\b([^\n;|&()]*)/g
   while ((m = commandTargetRe.exec(expanded)) !== null) {
     const kind = m[1]
     const parts = (m[2].match(/(?:['"][^'"]+['"]|\S+)/g) ?? []).filter((p) => !p.startsWith("-"))
@@ -337,8 +337,18 @@ function pathsFromBashWriteTargets(cmd: string): string[] {
     }
     else if (kind === "tee") push(parts[0])
     else if (kind === "truncate") push(parts.at(-1))
+    else if (kind === "install" || kind === "rsync" || kind === "ln") push(parts.at(-1))
+    else if (kind === "sed" || kind === "perl" || kind === "ruby" || kind === "awk") {
+      // In-place editors mutate their file operands. This is best-effort and
+      // intentionally broad after option filtering; complex scripts with
+      // additional non-file operands are acceptable false positives.
+      for (const p of parts) push(p)
+    }
     else for (const p of parts) push(p)
   }
+
+  const ddTargetRe = /(?:^|[\s|;&({`])dd\s+[^|;&]*\bof=([^\s|;&()<>`]+|['"][^'"]+['"])/g
+  while ((m = ddTargetRe.exec(expanded)) !== null) push(m[1])
 
   return out
 }
@@ -401,7 +411,7 @@ function bashHazardsChezmoiRepo(cmd: string, workdir?: string): boolean {
   // `-C\s*` (NOT `\s+`) accepts both `-C /path` AND the glued form `-C/path`
   // — git accepts both per its short-flag conventions, and the glued form
   // would otherwise sneak past a strict `-C\s+` matcher.
-  const gitDashCRe = /(?:^|[\s|;&(])git\s+(?:-c\s+\S+\s+|--git-dir(?:=|\s+)\S+\s+|--work-tree(?:=|\s+)\S+\s+)*-C\s*(['"]?)([^\s'"|;&]+)\1/g
+  const gitDashCRe = /(?:^|[\s|;&(])git\s+(?:(?:-[cC]\s*\S+|-c\s+\S+|--(?:git-dir|work-tree)(?:=|\s+)\S+|--(?:no-pager|paginate|bare))\s+)*-C\s*(['"]?)([^\s'"|;&]+)\1/g
   let m: RegExpExecArray | null
   while ((m = gitDashCRe.exec(expanded)) !== null) {
     const dir = normalizePath(m[2])
