@@ -1520,7 +1520,7 @@ try_oauth_token_refresh() {
 
   if [[ -z "$new_access" || "$new_access" != sk-ant-oat* ]] \
      || [[ -z "$new_refresh" || "$new_refresh" != sk-ant-ort* ]]; then
-    log_warn_trunc "oauth-refresh: malformed response: ${response}" 300
+    log_warn "oauth-refresh: malformed response from token endpoint"
     release_refresh_lock
     return 1
   fi
