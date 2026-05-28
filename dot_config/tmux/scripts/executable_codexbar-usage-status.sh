@@ -354,6 +354,48 @@ iso_utc_to_epoch() {
   printf '%s' "$epoch"
 }
 
+codex_reset_description_to_epoch() {
+  local description="${1:-}" now="${2:-}" window_minutes="${3:-}"
+
+  [[ -n "$description" ]] || return 1
+  [[ "$now" =~ ^[0-9]+$ ]] || return 1
+
+  # Normalize CodexBar/OpenAI copy like "Resets 7:38 PM". The app may use a
+  # narrow no-break space before AM/PM, so collapse whitespace before parsing.
+  description="${description#Resets }"
+  description="$(printf '%s' "$description" | tr '\302\240\342\200\257' '   ' | awk '{gsub(/[[:space:]]+/, " "); sub(/^ /, ""); sub(/ $/, ""); print}')"
+
+  local time_part
+  time_part="$(printf '%s' "$description" | awk 'match($0, /[0-9]{1,2}:[0-9]{2} ?[AP]M/) { print substr($0, RSTART, RLENGTH); exit }')"
+  [[ -n "${time_part:-}" ]] || return 1
+
+  local today epoch
+  today="$(date -r "$now" '+%Y-%m-%d' 2>/dev/null || date -d "@$now" '+%Y-%m-%d' 2>/dev/null || true)"
+  [[ -n "${today:-}" ]] || return 1
+
+  epoch="$(date -j -f '%Y-%m-%d %I:%M %p' "$today $time_part" +%s 2>/dev/null || true)"
+  if [[ -z "${epoch:-}" ]]; then
+    epoch="$(date -d "$today $time_part" +%s 2>/dev/null || true)"
+  fi
+  [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+
+  # If today's occurrence already passed, it is tomorrow's reset. Keep the
+  # result bounded by the advertised window to avoid confusing weekly text with
+  # a session reset.
+  if (( epoch <= now )); then
+    epoch=$(( epoch + 86400 ))
+  fi
+
+  if [[ "$window_minutes" =~ ^[0-9]+$ ]]; then
+    local duration delta
+    duration=$(( window_minutes * 60 ))
+    delta=$(( epoch - now ))
+    (( duration > 0 && delta <= duration )) || return 1
+  fi
+
+  printf '%s' "$epoch"
+}
+
 clamp_0_100_int() {
   local raw="$1" int
 
@@ -1627,6 +1669,14 @@ fetch_via_codexbar_codex() {
   iso="$(printf '%s' "$session_limit" | jq -er -r '.resetsAt // empty | tostring' 2>/dev/null || true)"
   if [[ -n "${iso:-}" ]]; then
     FETCH_SESSION_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
+  fi
+  if [[ -z "${FETCH_SESSION_RESETS_AT:-}" ]]; then
+    local reset_description fetch_now
+    reset_description="$(printf '%s' "$session_limit" | jq -er -r '.resetDescription // empty | tostring' 2>/dev/null || true)"
+    fetch_now="$(now_epoch)"
+    if [[ -n "${reset_description:-}" ]]; then
+      FETCH_SESSION_RESETS_AT="$(codex_reset_description_to_epoch "$reset_description" "$fetch_now" "$FETCH_SESSION_WINDOW_MINUTES" 2>/dev/null || true)"
+    fi
   fi
   iso="$(printf '%s' "$weekly_limit" | jq -er -r '.resetsAt // empty | tostring' 2>/dev/null || true)"
   if [[ -n "${iso:-}" ]]; then

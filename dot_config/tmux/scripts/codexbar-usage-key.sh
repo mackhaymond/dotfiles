@@ -57,6 +57,11 @@ main() {
   script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
   status_script="$script_dir/codexbar-usage-status.sh"
 
+  # Prefix+u is an explicit user request for usage details; refresh before
+  # starting the preview timer so a slow network call cannot consume the whole
+  # 3-second reset-view window.
+  bash "$status_script" --refresh >/dev/null 2>&1 || true
+
   if (( seconds == 0 )); then
     local current
     current="$(get_tmux_opt "@codexbar_reset_preview_until" "0")"
