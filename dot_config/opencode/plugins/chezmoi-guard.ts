@@ -92,6 +92,7 @@ type SessionChezmoiState = {
   // path-scoped instead of repo-wide so simultaneous agents with unrelated
   // dotfile work do not complain about each other's uncommitted changes.
   touchedPaths: Set<string>
+  continuationPending: boolean
 }
 
 const sessionState = new Map<string, SessionChezmoiState>()
@@ -99,7 +100,7 @@ const sessionState = new Map<string, SessionChezmoiState>()
 function stateForSession(sessionID: string): SessionChezmoiState {
   let state = sessionState.get(sessionID)
   if (!state) {
-    state = { touchedPaths: new Set() }
+    state = { touchedPaths: new Set(), continuationPending: false }
     sessionState.set(sessionID, state)
   }
   return state
@@ -167,6 +168,19 @@ function uncommittedChezmoiComplaint(sessionID: string): string | undefined {
     `stage only the intended files, commit, and push.\n` +
     `Ignore unrelated chezmoi dirty paths you did not touch; they are likely from another concurrent agent.\n` +
     `Session-touched dirty paths:\n${shown}${more}`
+  )
+}
+
+function uncommittedChezmoiContinuationPrompt(sessionID: string): string | undefined {
+  const complaint = uncommittedChezmoiComplaint(sessionID)
+  if (!complaint) return undefined
+  return (
+    `${complaint}\n\n` +
+    `Continue now and resolve this before stopping: apply chezmoi if needed, inspect status/diff/log, ` +
+    `stage only the session-touched intended files, commit with an appropriate message, and push. ` +
+    `Do not stage unrelated dirty chezmoi paths from other concurrent agents. ` +
+    `After the commit/push succeeds, re-print any final summary or user-facing text you output before this guard fired, ` +
+    `updated with the commit result if relevant.`
   )
 }
 
@@ -416,13 +430,20 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
     event: async ({ event }) => {
       if (event.type !== "session.next.step.ended") return
       const sessionID = event.properties.sessionID
-      const complaint = uncommittedChezmoiComplaint(sessionID)
-      if (!complaint) return
+      const state = stateForSession(sessionID)
+      if (state.continuationPending) return
+      const prompt = uncommittedChezmoiContinuationPrompt(sessionID)
+      if (!prompt) return
+      state.continuationPending = true
       await client.tui.showToast({
-        title: "Uncommitted chezmoi edits",
-        message: complaint,
+        title: "Continuing to commit chezmoi edits",
+        message: "chezmoi-guard found session-touched dirty dotfiles and is prompting the agent to commit/push before stopping.",
         variant: "warning",
-        duration: 15_000,
+        duration: 10_000,
+      })
+      await client.session.promptAsync({
+        sessionID,
+        parts: [{ type: "text", text: prompt, synthetic: true }],
       })
     },
     "experimental.chat.system.transform": async (input, output) => {
@@ -482,6 +503,8 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
       }
     },
     "tool.execute.after": async (input) => {
+      const state = stateForSession(input.sessionID)
+      state.continuationPending = false
       if (BLOCKED_TOOLS.has(input.tool)) {
         rememberSourceWrites(input.sessionID, pathsFromArgs(input.tool, input.args))
         return

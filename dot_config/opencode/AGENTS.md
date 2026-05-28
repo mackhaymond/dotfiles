@@ -62,12 +62,16 @@ vectors:
 
 The guard also tracks chezmoi source files written by the current opencode
 session. If those same session-touched paths are still dirty at turn end, it
-shows a warning toast; before a later model turn, it also injects a reminder
-telling the agent to apply, inspect, stage, commit, and push before finishing.
-This check is path-scoped to files written in the current session so
-simultaneous agents do not complain about unrelated chezmoi changes they did
-not make. Agents should ignore chezmoi dirty paths that appear unrelated to
-their own work; those are very likely from another concurrent agent.
+injects a synthetic follow-up prompt so the agent continues and applies,
+inspects, stages, commits, and pushes before it actually stops, and it shows a
+toast so the user can see why the agent resumed. The synthetic prompt also
+instructs the agent to re-print any final summary or user-facing text it had
+already output before the guard fired. Before a later model turn, it also
+injects a reminder with the same instruction. This check is path-scoped to
+files written in the current session so simultaneous agents do not complain
+about unrelated chezmoi changes they did not make. Agents should ignore
+chezmoi dirty paths that appear unrelated to their own work; those are very
+likely from another concurrent agent.
 
 <!-- CODEGRAPH_START -->
 ## CodeGraph
