@@ -10,10 +10,10 @@
 // Scope:
 //   - Blocks: edit, write, apply_patch, multiedit
 //   - Blocks (best-effort, regex-based): bash commands that redirect/write
-//     to managed live files, or commit/push from inside the chezmoi source
-//     repo. Heuristic — meant to catch typical agent bypasses (`echo X >
-//     ~/.zshrc`, `sed -i ~/.gitconfig`, `git -C ~/.local/share/chezmoi
-//     commit`), not to be a sandbox.
+//     to managed live files, or destructive/history-rewriting git operations
+//     inside the chezmoi source repo. Heuristic — meant to catch typical
+//     agent bypasses (`echo X > ~/.zshrc`, `sed -i ~/.gitconfig`,
+//     `git -C ~/.local/share/chezmoi reset`), not to be a sandbox.
 //   - Does NOT cover: GUI editors, apps writing their own configs
 //     (those are handled by Tier C drift detection in starship.toml)
 //
@@ -23,7 +23,7 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { execSync } from "node:child_process"
-import { realpathSync, statSync, unlinkSync } from "node:fs"
+import { realpathSync } from "node:fs"
 import { resolve } from "node:path"
 
 const TTL_MS = 5 * 60 * 1000
@@ -120,46 +120,6 @@ function bashWorkdirFromArgs(args: any): string | undefined {
   return undefined
 }
 
-// File-backed approval token escape hatch. Two-call flow:
-//
-//   call 1:  chezmoi-approve-commit          (creates the file)
-//   call 2:  CHEZMOI_COMMIT_OK=<any-value> git -C <chezmoi-src> commit -m "..."
-//
-// The plugin sees the literal bash command BEFORE shell expansion, so a
-// one-call form like `CHEZMOI_COMMIT_OK=$(chezmoi-approve-commit) git ...`
-// can't be validated — the regex would only see `$(chezmoi-approve-commit)`
-// as text. Two calls are required by design.
-//
-// Validation = file existence + recent mtime. The value passed to
-// CHEZMOI_COMMIT_OK is opaque; the file is the authority. The env-var
-// prefix is a structural attestation ("I'm intentionally bypassing the
-// guard"). Within the TTL window, the same approval covers any number
-// of commits/pushes — the user's threat model is "no commits without
-// permission", not "one commit per permission".
-//
-// Threat model: a careless agent that interprets "go ahead" too broadly
-// would still have to FIRST run chezmoi-approve-commit before any commit
-// can land. An adversarial agent can mint approvals themselves (the
-// helper is just a shell script); out of scope per the plugin's
-// "best-effort, not a sandbox" framing.
-const NONCE_FILE = `${process.env.HOME ?? ""}/.cache/chezmoi-guard/approve-nonce`
-const NONCE_TTL_MS = 5 * 60 * 1000
-
-function tryConsumeBypassNonce(cmd: string): boolean {
-  if (!COMMIT_OK_RE.test(cmd)) return false
-  let ageMs: number
-  try {
-    ageMs = Date.now() - statSync(NONCE_FILE).mtimeMs
-  } catch {
-    return false
-  }
-  if (ageMs > NONCE_TTL_MS) {
-    try { unlinkSync(NONCE_FILE) } catch { /* idempotent */ }
-    return false
-  }
-  return true
-}
-
 // Path-token extractor. Matches three families:
 //   1. `~`- or `/`-rooted paths (`~/.zshrc`, `/Users/me/.zshrc`)
 //   2. `$HOME`/`${HOME}` env-var paths (`$HOME/.zshrc`, `"${HOME}"/.zshrc`)
@@ -250,61 +210,23 @@ function splitBashSegments(cmd: string): string[] {
     .filter(Boolean)
 }
 
-// Detects bash commands that commit or push from the chezmoi source repo.
-// The user policy is "never commit/push dotfiles yourself" — applies whether
-// the agent uses raw `git -C <chezmoi-src>`, `git --git-dir=<chezmoi-src>/.git`,
-// `chezmoi git -- ...`, the natural `cd <chezmoi-src> && git commit` pattern,
-// OR the bash-tool's `workdir` parameter (each requires a separate detector
-// — `-C`/`--git-dir=`/`workdir=` are independent ways to set the repo, and
-// `cd` sets it via cwd inside the command itself).
+// Detects destructive/history-rewriting git operations targeting the chezmoi
+// source repo. Normal `commit` and non-force `push` are intentionally allowed:
+// agents are expected to commit and push their completed dotfile changes.
 //
-// ESCAPE HATCH: when the user explicitly approves commits/pushes, the
-// agent must FIRST run the helper `chezmoi-approve-commit` (a script at
-// ~/.local/bin/, NOT a zsh function — non-interactive shells skip
-// .zshrc), THEN prefix the actual commit/push bash with CHEZMOI_COMMIT_OK
-// in a SEPARATE call. The helper writes ~/.cache/chezmoi-guard/approve-
-// nonce; the plugin checks file presence + 5min TTL. Within the window,
-// the same approval covers any number of commits/pushes.
-//
-// Two calls (not one): the plugin sees the literal command string BEFORE
-// shell expansion, so `CHEZMOI_COMMIT_OK=$(chezmoi-approve-commit) git
-// commit` is unvalidated — only the text `$(chezmoi-approve-commit)` is
-// visible at regex time, not the actual nonce, and the file wouldn't
-// exist yet. Architecture forces two calls.
-//
-// Also accepted: env-var preamble before the attestation, because most
-// agentic shells auto-prepend safety env vars (CI=true, GIT_TERMINAL_PROMPT
-// =0, etc.) and forcing CHEZMOI_COMMIT_OK= to be the LITERAL first token
-// would block legitimate use:
-//
-//   CI=true CHEZMOI_COMMIT_OK=approved git ... commit
-//   export CI=true && CHEZMOI_COMMIT_OK=approved git ... commit
-//
-// TTL: 5 minutes. A nonce that's been sitting around for >5min is
-// rejected (and cleaned up). Forces approval-then-commit to stay
-// temporally close, so an approval minted "for later" doesn't outlive
-// its context.
-//
-// Regex anchored to start-of-command (`^`) and uses negative lookahead so
-// the preamble pattern doesn't greedily consume `CHEZMOI_COMMIT_OK=<value>`
-// as just-another-env-assignment. Specifically REJECTS:
-//   - `git commit -m "doc: CHEZMOI_COMMIT_OK=abc escape"` — var inside a
-//     quoted string, preceded by non-preamble tokens → no match.
-//   - `cat /tmp/x ; CHEZMOI_COMMIT_OK=abc git commit` — leading non-
-//     preamble command (preamble allows env assignments only) → no match.
-// Value pattern is `\S+` (any non-whitespace) — the value itself is opaque
-// to the plugin; the file at NONCE_FILE is the authority. See the
-// tryConsumeBypassNonce header for why we don't validate value contents.
-const GIT_VERB_RE = /\b(?:commit|push|reset|rebase|merge)\b/
-const GIT_WRITE_VERB_RE = /(?:^|[\s|;&(])git\s+(?:[^|;&]*?\s+)?(?:commit|push|reset|rebase|merge)\b/
-// IF YOU CHANGE THIS REGEX: keep `dot_config/opencode/AGENTS.md` in sync.
-// The regex literal is reproduced there for the user/agent-facing docs.
-const COMMIT_OK_RE = /^\s*(?:(?!CHEZMOI_COMMIT_OK=)(?:export\s+)?[A-Za-z_]\w*=\S*\s*[;&]*\s+)*CHEZMOI_COMMIT_OK=\S+\s+/
+// Blocked operations include `reset`, `rebase`, `merge`, and force pushes.
+// The repo target may be expressed with raw `git -C <chezmoi-src>`,
+// `git --git-dir=<chezmoi-src>/.git`, `chezmoi git -- ...`, cwd-changing
+// shell (`cd <chezmoi-src> && git reset`), or the bash tool's `workdir` arg.
+const GIT_HAZARD_RE = /(?:^|[\s|;&(])git\s+[^|;&]*?(?:(?:reset|rebase|merge)\b|push\b[^|;&]*(?:\s(?:--force(?:-with-lease)?|-\w*f\w*)\b))/
 
-function bashCommitsChezmoiRepo(cmd: string, workdir?: string): boolean {
-  if (tryConsumeBypassNonce(cmd)) return false
+function gitHasHazard(cmd: string): boolean {
+  return GIT_HAZARD_RE.test(cmd)
+}
+
+function bashHazardsChezmoiRepo(cmd: string, workdir?: string): boolean {
   const expanded = expandHomeVars(cmd)
-  if (/(?:^|[\s|;&(])chezmoi\s+git\b[^|;&]*\b(?:commit|push|reset|rebase|merge)\b/.test(expanded)) {
+  if (/(?:^|[\s|;&(])chezmoi\s+git\b[^|;&]*(?:(?:reset|rebase|merge)\b|push\b[^|;&]*(?:\s(?:--force(?:-with-lease)?|-\w*f\w*)\b))/.test(expanded)) {
     return true
   }
   // Pattern A1: explicit `git -C <chezmoi-src>` + write-class git verb.
@@ -317,7 +239,7 @@ function bashCommitsChezmoiRepo(cmd: string, workdir?: string): boolean {
     const dir = normalizePath(m[2])
     if (
       (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) &&
-      GIT_VERB_RE.test(expanded)
+      gitHasHazard(expanded.slice(m.index))
     ) {
       return true
     }
@@ -331,7 +253,7 @@ function bashCommitsChezmoiRepo(cmd: string, workdir?: string): boolean {
     const dir = normalizePath(m[2].replace(/\/\.git$/, ""))
     if (
       (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) &&
-      GIT_VERB_RE.test(expanded)
+      gitHasHazard(expanded.slice(m.index))
     ) {
       return true
     }
@@ -347,7 +269,7 @@ function bashCommitsChezmoiRepo(cmd: string, workdir?: string): boolean {
     const dir = normalizePath(m[2].replace(/\/\.git$/, ""))
     if (
       (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) &&
-      GIT_WRITE_VERB_RE.test(expanded)
+      gitHasHazard(expanded.slice(m.index))
     ) {
       return true
     }
@@ -362,7 +284,7 @@ function bashCommitsChezmoiRepo(cmd: string, workdir?: string): boolean {
     const dir = normalizePath(workdir)
     if (
       (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) &&
-      GIT_WRITE_VERB_RE.test(expanded)
+      gitHasHazard(expanded)
     ) {
       return true
     }
@@ -377,7 +299,7 @@ function bashCommitsChezmoiRepo(cmd: string, workdir?: string): boolean {
     const dir = normalizePath(m[2])
     if (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) {
       const restOfCmd = expanded.slice(m.index + m[0].length)
-      if (GIT_WRITE_VERB_RE.test(restOfCmd)) {
+      if (gitHasHazard(restOfCmd)) {
         return true
       }
     }
@@ -396,11 +318,11 @@ function managedPathError(p: string): Error {
       `When ALL your edits are complete (end of the entire task):\n` +
       `  1. Ensure changes are applied (run \`chezmoi apply\` if you\n` +
       `     edited source files without --apply).\n` +
-      `  2. Ask the user whether to commit & push the chezmoi repo\n` +
-      `     changes.\n` +
+      `  2. Inspect status/diff, stage only intended files, commit, and\n` +
+      `     push automatically.\n` +
       `\n` +
-      `Do NOT commit or push yourself. The user always commits dotfile\n` +
-      `changes themselves once the entire change is done.`,
+      `Do not use reset/rebase/merge or force-push unless the user\n` +
+      `explicitly asks for that specific operation.`,
   )
 }
 
@@ -420,36 +342,24 @@ export const ChezmoiGuard: Plugin = async () => {
         return
       }
       // Bash: best-effort detection of writes to managed files and of
-      // commit/push to the chezmoi source repo.
+      // destructive/history-rewriting git operations in the chezmoi repo.
       if (input.tool === "bash") {
         const cmd = bashCommandFromArgs(output.args)
         if (!cmd) return
         const workdir = bashWorkdirFromArgs(output.args)
-        // Commit detection runs against the WHOLE command — `cd <src> && git
-        // commit` legitimately spans segments, and the whitelist is narrow
+        // Hazard detection runs against the WHOLE command — `cd <src> && git
+        // reset` legitimately spans segments, and the blocklist is narrow
         // enough that whole-command match is appropriate here. The optional
         // `workdir` parameter is consulted for Pattern A3 (bash-tool
-        // workdir-set commits with no syntactic chezmoi reference).
-        if (bashCommitsChezmoiRepo(cmd, workdir)) {
+        // workdir-set git operations with no syntactic chezmoi reference).
+        if (bashHazardsChezmoiRepo(cmd, workdir)) {
           throw new Error(
-            `[chezmoi-guard] bash command appears to commit or push the\n` +
-              `chezmoi source repo. The user always commits dotfile changes\n` +
-              `themselves — stop and ask first.\n` +
+            `[chezmoi-guard] bash command appears to run a destructive or\n` +
+              `history-rewriting git operation in the chezmoi source repo.\n` +
               `\n` +
-              `If you have completed your edits and applied them, summarize\n` +
-              `what changed and ask the user whether to commit & push.\n` +
-              `\n` +
-              `IF the user has already explicitly approved this commit/push,\n` +
-              `use the TWO-CALL escape hatch:\n` +
-              `\n` +
-              `  call 1:  chezmoi-approve-commit\n` +
-              `           (a script in ~/.local/bin — writes ~/.cache/\n` +
-              `           chezmoi-guard/approve-nonce)\n` +
-              `\n` +
-              `  call 2:  CHEZMOI_COMMIT_OK=approved git -C ~/.local/share/chezmoi commit -m "..."\n` +
-              `           (any non-whitespace value works — the file is the\n` +
-              `           authority. Approval lasts 5 min and covers any\n` +
-              `           number of commits/pushes within the window.)\n` +
+              `Normal commit and non-force push are allowed. Do not reset,\n` +
+              `rebase, merge, or force-push unless the user explicitly asks\n` +
+              `for that specific operation.\n` +
               `\n` +
               `Command (truncated): ${cmd.slice(0, 240)}`,
           )
