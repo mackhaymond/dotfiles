@@ -165,6 +165,7 @@ function uncommittedChezmoiComplaint(sessionID: string): string | undefined {
     `CHEZMOI-GUARD: You made chezmoi source changes in this session that are still uncommitted.\n` +
     `Before finishing this dotfile task, run chezmoi apply if needed, inspect git status/diff, ` +
     `stage only the intended files, commit, and push.\n` +
+    `Ignore unrelated chezmoi dirty paths you did not touch; they are likely from another concurrent agent.\n` +
     `Session-touched dirty paths:\n${shown}${more}`
   )
 }
@@ -409,9 +410,21 @@ function managedPathError(p: string): Error {
   )
 }
 
-export const ChezmoiGuard: Plugin = async () => {
+export const ChezmoiGuard: Plugin = async ({ client }) => {
   refresh()
   return {
+    event: async ({ event }) => {
+      if (event.type !== "session.next.step.ended") return
+      const sessionID = event.properties.sessionID
+      const complaint = uncommittedChezmoiComplaint(sessionID)
+      if (!complaint) return
+      await client.tui.showToast({
+        title: "Uncommitted chezmoi edits",
+        message: complaint,
+        variant: "warning",
+        duration: 15_000,
+      })
+    },
     "experimental.chat.system.transform": async (input, output) => {
       if (!input.sessionID) return
       const complaint = uncommittedChezmoiComplaint(input.sessionID)

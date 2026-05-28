@@ -61,11 +61,13 @@ vectors:
   the command shell.
 
 The guard also tracks chezmoi source files written by the current opencode
-session. If those same session-touched paths are still dirty before a later
-model turn, it injects a reminder telling the agent to apply, inspect, stage,
-commit, and push before finishing. This check is path-scoped to files written
-in the current session so simultaneous agents do not complain about unrelated
-chezmoi changes they did not make.
+session. If those same session-touched paths are still dirty at turn end, it
+shows a warning toast; before a later model turn, it also injects a reminder
+telling the agent to apply, inspect, stage, commit, and push before finishing.
+This check is path-scoped to files written in the current session so
+simultaneous agents do not complain about unrelated chezmoi changes they did
+not make. Agents should ignore chezmoi dirty paths that appear unrelated to
+their own work; those are very likely from another concurrent agent.
 
 <!-- CODEGRAPH_START -->
 ## CodeGraph
