@@ -5,7 +5,7 @@
   "presets": {
     "openai": {
       "orchestrator": {
-        "model": "openai/gpt-5.5-fast",
+        "model": "openai/gpt-5.5",
         "skills": [
           "*"
         ],
@@ -15,7 +15,7 @@
         ]
       },
       "oracle": {
-        "model": "openai/gpt-5.5-fast",
+        "model": "openai/gpt-5.5",
         "variant": "high",
         "skills": [
           "simplify"
@@ -23,7 +23,7 @@
         "mcps": []
       },
       "librarian": {
-        "model": "openai/gpt-5.4-mini-fast",
+        "model": "openai/gpt-5.4-mini",
         "variant": "low",
         "skills": [],
         "mcps": [
@@ -33,19 +33,19 @@
         ]
       },
       "explorer": {
-        "model": "openai/gpt-5.4-mini-fast",
+        "model": "openai/gpt-5.4-mini",
         "variant": "low",
         "skills": [],
         "mcps": []
       },
       "designer": {
-        "model": "openai/gpt-5.4-mini-fast",
+        "model": "openai/gpt-5.4-mini",
         "variant": "medium",
         "skills": [],
         "mcps": []
       },
       "fixer": {
-        "model": "openai/gpt-5.4-mini-fast",
+        "model": "openai/gpt-5.4-mini",
         "variant": "low",
         "skills": [],
         "mcps": []
