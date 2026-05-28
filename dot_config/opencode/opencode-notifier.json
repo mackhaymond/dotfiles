@@ -1,0 +1,18 @@
+{
+  "sound": true,
+  "notification": true,
+  "suppressWhenFocused": true,
+  "notificationSystem": "osascript",
+  "minDuration": 10,
+  "events": {
+    "permission": true,
+    "question": true,
+    "error": true,
+    "complete": true,
+    "plan_exit": true,
+    "subagent_complete": false,
+    "session_started": false,
+    "user_message": false,
+    "client_connected": false
+  }
+}
