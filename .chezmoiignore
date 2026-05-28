@@ -78,6 +78,11 @@ code/various_scripts/restart-yabai.sh
 .config/opencode/plugins/**
 !.config/opencode/plugins
 !.config/opencode/plugins/chezmoi-guard.ts
+!.config/opencode/plugins/worktree.ts
+!.config/opencode/plugins/worktree
+!.config/opencode/plugins/worktree/**
+!.config/opencode/plugins/kdco-primitives
+!.config/opencode/plugins/kdco-primitives/**
 .config/opencode/providers/**
 .config/cursor/chats/**
 .config/github-copilot/apps.json
@@ -113,4 +118,3 @@ code/various_scripts/restart-yabai.sh
 .config/karabiner/**
 .config/raycast/**
 {{ end -}}
-
