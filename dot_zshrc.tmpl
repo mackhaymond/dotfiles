@@ -177,13 +177,6 @@ y() {
   return "$yazi_status"
 }
 
-# NOTE: chezmoi-approve-commit (the helper that mints CHEZMOI_COMMIT_OK
-# nonces) lives at ~/.local/bin/chezmoi-approve-commit, NOT here. It must
-# be a real script — not a shell function — because non-interactive shells
-# (opencode bash, scripts, IDE-spawned subshells) skip ~/.zshrc and would
-# never see a function. The script source is in
-# `dot_local/bin/executable_chezmoi-approve-commit`.
-
 # Tier C — chezmoi drift indicator (background, authoritative).
 #
 # `_chezmoi_drift_check` runs from precmd at most once per 60s and asks
