@@ -329,7 +329,12 @@ function pathsFromBashWriteTargets(cmd: string): string[] {
   while ((m = commandTargetRe.exec(expanded)) !== null) {
     const kind = m[1]
     const parts = (m[2].match(/(?:['"][^'"]+['"]|\S+)/g) ?? []).filter((p) => !p.startsWith("-"))
-    if (kind === "cp" || kind === "mv") push(parts.at(-1))
+    if (kind === "cp") push(parts.at(-1))
+    else if (kind === "mv") {
+      // `mv old new` writes `new` and deletes/renames `old`; track both so
+      // source-repo renames don't lose the deletion side of the change.
+      for (const p of parts) push(p)
+    }
     else if (kind === "tee") push(parts[0])
     else if (kind === "truncate") push(parts.at(-1))
     else for (const p of parts) push(p)
@@ -365,7 +370,10 @@ function splitBashSegments(cmd: string): string[] {
 // The repo target may be expressed with raw `git -C <chezmoi-src>`,
 // `git --git-dir=<chezmoi-src>/.git`, `chezmoi git -- ...`, cwd-changing
 // shell (`cd <chezmoi-src> && git reset`), or the bash tool's `workdir` arg.
-const GIT_HAZARD_RE = /(?:^|[\s|;&(])git\s+[^|;&]*?(?:(?:reset|rebase|merge)(?=$|[\s|;&)])|push\b[^|;&]*(?:\s(?:--force(?:-with-lease)?|-\w*f\w*|--mirror\b)|\s\+\S+))/
+const GIT_PREFIX = String.raw`(?:^|[\s|;&(])git\s+(?:(?:-[cC]\s*\S+|-c\s+\S+|--(?:git-dir|work-tree)(?:=|\s+)\S+|--(?:no-pager|paginate|bare))\s+)*`
+const GIT_HAZARD_RE = new RegExp(
+  `${GIT_PREFIX}(?:(?:reset|rebase|merge)(?=$|[\\s|;&)])|push\\b[^|;&]*(?:\\s['"]?\\+\\S+['"]?|\\s(?:--force(?:-with-lease)?|-\\w*f\\w*|--mirror\\b)))`,
+)
 
 function gitHasHazard(cmd: string): boolean {
   return GIT_HAZARD_RE.test(cmd)
@@ -373,12 +381,20 @@ function gitHasHazard(cmd: string): boolean {
 
 function resolveAgainstWorkdir(raw: string, workdir?: string): string {
   if (!workdir || raw.startsWith("/") || raw.startsWith("~")) return raw
-  return resolve(workdir, raw)
+  return resolve(normalizePath(workdir), raw)
+}
+
+function touchesManagedPath(p: string): boolean {
+  if (managed.has(p)) return true
+  for (const managedPath of managed) {
+    if (managedPath.startsWith(p + "/")) return true
+  }
+  return false
 }
 
 function bashHazardsChezmoiRepo(cmd: string, workdir?: string): boolean {
   const expanded = expandHomeVars(cmd)
-  if (/(?:^|[\s|;&(])chezmoi\s+git\b[^|;&]*(?:(?:reset|rebase|merge)(?=$|[\s|;&)])|push\b[^|;&]*(?:\s(?:--force(?:-with-lease)?|-\w*f\w*|--mirror\b)|\s\+\S+))/.test(expanded)) {
+  if (/(?:^|[\s|;&(])chezmoi\s+git\b\s+(?:--\s+)?(?:(?:reset|rebase|merge)(?=$|[\s|;&)])|push\b[^|;&]*(?:\s['"]?\+\S+['"]?|\s(?:--force(?:-with-lease)?|-\w*f\w*|--mirror\b)))/.test(expanded)) {
     return true
   }
   // Pattern A1: explicit `git -C <chezmoi-src>` + write-class git verb.
@@ -596,15 +612,17 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
         // ~/.zshrc` doesn't false-positive: the `>` intent and the
         // `~/.zshrc` path are in DIFFERENT statements and shouldn't be
         // paired. Each segment is checked independently for the
-        // write-intent-AND-managed-path pairing.
+        // write-intent-AND-managed-path pairing. Extracted write targets also
+        // count as write intent so bare relative redirections can be resolved
+        // against the bash tool's workdir.
         let refreshed = false
         for (const seg of splitBashSegments(cmd)) {
-          if (!bashHasWriteIntent(seg)) continue
-          if (!refreshed) { refresh(); refreshed = true }
           const candidatePaths = [...pathsFromBashCommand(seg), ...pathsFromBashWriteTargets(seg)]
+          if (!bashHasWriteIntent(seg) && candidatePaths.length === 0) continue
+          if (!refreshed) { refresh(); refreshed = true }
           for (const raw of candidatePaths) {
             const p = normalizePath(resolveAgainstWorkdir(raw, workdir))
-            if (managed.has(p)) throw managedPathError(p)
+            if (touchesManagedPath(p)) throw managedPathError(p)
           }
         }
       }
