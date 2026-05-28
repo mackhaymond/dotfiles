@@ -106,6 +106,7 @@ type SessionChezmoiState = {
   // dotfile work do not complain about each other's uncommitted changes.
   touchedPaths: Set<string>
   continuationPending: boolean
+  continuationPendingSince?: number
 }
 
 const sessionState = new Map<string, SessionChezmoiState>()
@@ -159,13 +160,18 @@ function dirtyTouchedPaths(sessionID: string): string[] {
       if (!line.trim()) continue
       // Porcelain v1 is `XY path` or `XY old -> new`. For renames, track the
       // destination path because that is what remains uncommitted.
-      const raw = line.slice(3).replace(/^.* -> /, "")
-      if (raw) dirty.add(raw)
+      const raw = line.slice(3)
+      const renamed = raw.includes(" -> ") ? raw.split(" -> ").pop() : raw
+      if (renamed) dirty.add(renamed)
+    }
+    for (const p of dirty) {
+      const abs = resolve(CHEZMOI_SOURCE_DIR, p)
+      if (isInChezmoiSource(abs)) state.touchedPaths.add(abs)
     }
     for (const p of rels) {
       if (!dirty.has(p)) state.touchedPaths.delete(resolve(CHEZMOI_SOURCE_DIR, p))
     }
-    return rels.filter((p) => dirty.has(p))
+    return [...dirty]
   } catch {
     // If status fails, fail quiet rather than blame the agent for stale or
     // unverifiable state. The normal hard guards still run independently.
@@ -180,7 +186,7 @@ function uncommittedChezmoiComplaint(sessionID: string): string | undefined {
   const more = dirty.length > 12 ? `\n- ...and ${dirty.length - 12} more` : ""
   return (
     `CHEZMOI-GUARD: You made chezmoi source changes in this session that are still uncommitted.\n` +
-    `Before finishing this dotfile task, run chezmoi apply if needed, inspect git status/diff, ` +
+    `Before finishing this dotfile task, run chezmoi apply if needed, inspect git status/diff/log, ` +
     `stage only the intended files, commit, and push.\n` +
     `Ignore unrelated chezmoi dirty paths you did not touch; they are likely from another concurrent agent.\n` +
     `Session-touched dirty paths:\n${shown}${more}`
@@ -203,10 +209,10 @@ function uncommittedChezmoiContinuationPrompt(sessionID: string): string | undef
 function pathsFromArgs(tool: string, args: any): string[] {
   if (!args) return []
   if (tool === "apply_patch" && typeof args.patchText === "string") {
-    const re = /\*\*\* (?:Add|Update|Move to|Delete) File: (.+)/g
+    const re = /\*\*\* (?:Add|Update|Delete) File: (.+)|\*\*\* Move to: (.+)/g
     const out: string[] = []
     let m: RegExpExecArray | null
-    while ((m = re.exec(args.patchText)) !== null) out.push(m[1].trim())
+    while ((m = re.exec(args.patchText)) !== null) out.push((m[1] ?? m[2] ?? "").trim())
     return out
   }
   if (typeof args.filePath === "string") return [args.filePath]
@@ -288,6 +294,7 @@ const WRITE_PATTERNS: RegExp[] = [
   /(?:^|[\s|;&({`])(?:perl|ruby)\s+(?:-[a-zA-Z]*\s+)*-i/,
   /(?:^|[\s|;&({`])awk\s+(?:[^\s]+\s+)*-i\s+inplace/,
   /(?:^|[\s|;&({`])truncate\b/,
+  /(?:^|[\s|;&({`])(?:rm|unlink)\b/,
   /(?:^|[\s|;&({`])dd\s+[^|;&]*\bof=/,
 ]
 
@@ -302,6 +309,32 @@ function pathsFromBashCommand(cmd: string): string[] {
   let m: RegExpExecArray | null
   PATH_TOKEN_RE.lastIndex = 0
   while ((m = PATH_TOKEN_RE.exec(expanded)) !== null) out.push(m[2])
+  return out
+}
+
+function pathsFromBashWriteTargets(cmd: string): string[] {
+  const expanded = expandHomeVars(cmd)
+  const out: string[] = []
+  const push = (p?: string) => {
+    if (p) out.push(p.replace(/^['"]|['"]$/g, ""))
+  }
+
+  // Best-effort extraction for bare relative targets used by write/delete
+  // commands. This intentionally over-approximates to catch common bypasses.
+  const redirectRe = /(?:^|[\s|;&({`])(?:[0-9]+?>|>>|>|&>)(?:\|?|!)?\s*([^\s|;&()<>`]+|['"][^'"]+['"])/g
+  let m: RegExpExecArray | null
+  while ((m = redirectRe.exec(expanded)) !== null) push(m[1])
+
+  const commandTargetRe = /(?:^|[\s|;&({`])(cp|mv|tee|truncate|rm|unlink)\b([^\n;|&()]*)/g
+  while ((m = commandTargetRe.exec(expanded)) !== null) {
+    const kind = m[1]
+    const parts = (m[2].match(/(?:['"][^'"]+['"]|\S+)/g) ?? []).filter((p) => !p.startsWith("-"))
+    if (kind === "cp" || kind === "mv") push(parts.at(-1))
+    else if (kind === "tee") push(parts[0])
+    else if (kind === "truncate") push(parts.at(-1))
+    else for (const p of parts) push(p)
+  }
+
   return out
 }
 
@@ -332,15 +365,20 @@ function splitBashSegments(cmd: string): string[] {
 // The repo target may be expressed with raw `git -C <chezmoi-src>`,
 // `git --git-dir=<chezmoi-src>/.git`, `chezmoi git -- ...`, cwd-changing
 // shell (`cd <chezmoi-src> && git reset`), or the bash tool's `workdir` arg.
-const GIT_HAZARD_RE = /(?:^|[\s|;&(])git\s+[^|;&]*?(?:(?:reset|rebase|merge)\b|push\b[^|;&]*(?:\s(?:--force(?:-with-lease)?|-\w*f\w*)\b))/
+const GIT_HAZARD_RE = /(?:^|[\s|;&(])git\s+[^|;&]*?(?:(?:reset|rebase|merge)(?=$|[\s|;&)])|push\b[^|;&]*(?:\s(?:--force(?:-with-lease)?|-\w*f\w*|--mirror\b)|\s\+\S+))/
 
 function gitHasHazard(cmd: string): boolean {
   return GIT_HAZARD_RE.test(cmd)
 }
 
+function resolveAgainstWorkdir(raw: string, workdir?: string): string {
+  if (!workdir || raw.startsWith("/") || raw.startsWith("~")) return raw
+  return resolve(workdir, raw)
+}
+
 function bashHazardsChezmoiRepo(cmd: string, workdir?: string): boolean {
   const expanded = expandHomeVars(cmd)
-  if (/(?:^|[\s|;&(])chezmoi\s+git\b[^|;&]*(?:(?:reset|rebase|merge)\b|push\b[^|;&]*(?:\s(?:--force(?:-with-lease)?|-\w*f\w*)\b))/.test(expanded)) {
+  if (/(?:^|[\s|;&(])chezmoi\s+git\b[^|;&]*(?:(?:reset|rebase|merge)(?=$|[\s|;&)])|push\b[^|;&]*(?:\s(?:--force(?:-with-lease)?|-\w*f\w*|--mirror\b)|\s\+\S+))/.test(expanded)) {
     return true
   }
   // Pattern A1: explicit `git -C <chezmoi-src>` + write-class git verb.
@@ -432,11 +470,12 @@ function managedPathError(p: string): Error {
       `When ALL your edits are complete (end of the entire task):\n` +
       `  1. Ensure changes are applied (run \`chezmoi apply\` if you\n` +
       `     edited source files without --apply).\n` +
-      `  2. Inspect status/diff, stage only intended files, commit, and\n` +
+      `  2. Inspect git status/diff/log, stage only intended files, commit, and\n` +
       `     push automatically.\n` +
       `\n` +
-      `Do not use reset/rebase/merge or force-push unless the user\n` +
-      `explicitly asks for that specific operation.`,
+      `Do not use reset/rebase/merge or force-push; this guard blocks those\n` +
+      `operations. Use normal git outside this guard only after explicit\n` +
+      `manual handling if needed.`,
   )
 }
 
@@ -449,8 +488,14 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
       const sessionID = event.properties.sessionID
       const state = stateForSession(sessionID)
       if (state.continuationPending) {
-        debugLog("idle skipped: continuation already pending", { sessionID })
-        return
+        const age = Date.now() - (state.continuationPendingSince ?? 0)
+        if (age < 2 * 60 * 1000) {
+          debugLog("idle skipped: continuation already pending", { sessionID, age })
+          return
+        }
+        debugLog("idle retrying stale continuation", { sessionID, age })
+        state.continuationPending = false
+        state.continuationPendingSince = undefined
       }
       const prompt = uncommittedChezmoiContinuationPrompt(sessionID)
       if (!prompt) {
@@ -458,6 +503,7 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
         return
       }
       state.continuationPending = true
+      state.continuationPendingSince = Date.now()
       debugLog("idle dirty: prompting continuation", { sessionID })
       try {
         await client.tui.publish({
@@ -500,6 +546,7 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
         debugLog("submitted continuation through tui", { sessionID })
       } catch (err) {
         state.continuationPending = false
+        state.continuationPendingSince = undefined
         debugLog("tui continuation submit failed", { sessionID, error: String(err) })
       }
     },
@@ -540,8 +587,7 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
               `history-rewriting git operation in the chezmoi source repo.\n` +
               `\n` +
               `Normal commit and non-force push are allowed. Do not reset,\n` +
-              `rebase, merge, or force-push unless the user explicitly asks\n` +
-              `for that specific operation.\n` +
+              `rebase, merge, or force-push; this guard blocks those actions.\n` +
               `\n` +
               `Command (truncated): ${cmd.slice(0, 240)}`,
           )
@@ -555,8 +601,9 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
         for (const seg of splitBashSegments(cmd)) {
           if (!bashHasWriteIntent(seg)) continue
           if (!refreshed) { refresh(); refreshed = true }
-          for (const raw of pathsFromBashCommand(seg)) {
-            const p = normalizePath(raw)
+          const candidatePaths = [...pathsFromBashCommand(seg), ...pathsFromBashWriteTargets(seg)]
+          for (const raw of candidatePaths) {
+            const p = normalizePath(resolveAgainstWorkdir(raw, workdir))
             if (managed.has(p)) throw managedPathError(p)
           }
         }
@@ -565,6 +612,7 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
     "tool.execute.after": async (input) => {
       const state = stateForSession(input.sessionID)
       state.continuationPending = false
+      state.continuationPendingSince = undefined
       if (BLOCKED_TOOLS.has(input.tool)) {
         rememberSourceWrites(input.sessionID, pathsFromArgs(input.tool, input.args))
         return
@@ -575,15 +623,16 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
       const workdir = bashWorkdirFromArgs(input.args)
       const paths: string[] = []
       for (const seg of splitBashSegments(cmd)) {
-        if (!bashHasWriteIntent(seg)) continue
-        paths.push(...pathsFromBashCommand(seg))
+        const targetPaths = pathsFromBashWriteTargets(seg)
+        if (!bashHasWriteIntent(seg) && !(workdir && isInChezmoiSource(workdir) && targetPaths.length > 0)) continue
+        paths.push(...pathsFromBashCommand(seg), ...targetPaths)
       }
       // Common non-interactive source edit shape: bash tool workdir points at
       // the chezmoi source and the command writes explicit rooted paths. We do
       // not mark repo-wide dirtiness for unknown relative writes; doing so
       // would falsely complain about unrelated changes from concurrent agents.
       if (workdir && isInChezmoiSource(workdir)) {
-        rememberSourceWrites(input.sessionID, paths.map((p) => (p.startsWith("/") || p.startsWith("~") ? p : resolve(workdir, p))))
+        rememberSourceWrites(input.sessionID, paths.map((p) => resolveAgainstWorkdir(p, workdir)))
       } else {
         rememberSourceWrites(input.sessionID, paths)
       }
