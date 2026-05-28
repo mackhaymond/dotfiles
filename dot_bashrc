@@ -7,3 +7,5 @@ export PATH="$HOME/.rd/bin:$PATH"
 [[ -f "$HOME/.atuin/bin/env" ]] && . "$HOME/.atuin/bin/env"
 [[ -f ~/.bash-preexec.sh ]] && source ~/.bash-preexec.sh
 command -v atuin >/dev/null && eval "$(atuin init bash)"
+
+if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init bash)"; fi
