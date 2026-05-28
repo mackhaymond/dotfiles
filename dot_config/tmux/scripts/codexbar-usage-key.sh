@@ -51,16 +51,20 @@ gen_nonce() {
   date +%s
 }
 
+refresh_usage_in_background() {
+  local status_script="${1:?}"
+
+  # Never run CodexBar's network/API refresh in the foreground from a tmux key
+  # binding. `run-shell` without `-b` blocks the tmux server until the command
+  # exits, so a slow CodexBar request makes the whole session feel frozen.
+  tmux run-shell -b "bash \"$status_script\" --refresh >/dev/null 2>&1 || true; tmux refresh-client -S >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+}
+
 main() {
   local seconds script_dir status_script
   seconds="$(parse_reset_seconds)"
   script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
   status_script="$script_dir/codexbar-usage-status.sh"
-
-  # Prefix+u is an explicit user request for usage details; refresh before
-  # starting the preview timer so a slow network call cannot consume the whole
-  # 3-second reset-view window.
-  bash "$status_script" --refresh >/dev/null 2>&1 || true
 
   if (( seconds == 0 )); then
     local current
@@ -74,6 +78,7 @@ main() {
 
     bash "$status_script" --publish >/dev/null 2>&1 || true
     tmux refresh-client -S >/dev/null 2>&1 || true
+    refresh_usage_in_background "$status_script"
     return 0
   fi
 
@@ -87,6 +92,7 @@ main() {
 
   bash "$status_script" --publish >/dev/null 2>&1 || true
   tmux refresh-client -S >/dev/null 2>&1 || true
+  refresh_usage_in_background "$status_script"
 
   tmux run-shell -b "sleep $seconds; n=\$(tmux show-option -gqv @codexbar_reset_preview_nonce 2>/dev/null); if [ \"\$n\" = \"$nonce\" ]; then bash \"$status_script\" --publish >/dev/null 2>&1 || true; tmux refresh-client -S >/dev/null 2>&1; fi; exit 0" >/dev/null 2>&1 || true
 
