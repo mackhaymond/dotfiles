@@ -460,23 +460,29 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
       state.continuationPending = true
       debugLog("idle dirty: prompting continuation", { sessionID })
       try {
-        await client.tui.showToast({
-          title: "Continuing to commit chezmoi edits",
-          message: "chezmoi-guard found session-touched dirty dotfiles and is prompting the agent to commit/push before stopping.",
-          variant: "warning",
-          duration: 10_000,
+        await client.tui.publish({
+          body: {
+            id: `chezmoi-guard-${Date.now()}`,
+            type: "tui.toast.show",
+            properties: {
+              title: "Continuing to commit chezmoi edits",
+              message: "chezmoi-guard found session-touched dirty dotfiles and is submitting a follow-up prompt before stopping.",
+              variant: "warning",
+              duration: 10_000,
+            },
+          },
         })
       } catch (err) {
         debugLog("toast failed", { sessionID, error: String(err) })
       }
       try {
-        await client.session.promptAsync({
-          sessionID,
-          parts: [{ type: "text", text: prompt }],
-        })
+        await client.tui.selectSession({ sessionID })
+        await client.tui.appendPrompt({ text: prompt })
+        await client.tui.submitPrompt()
+        debugLog("submitted continuation through tui", { sessionID })
       } catch (err) {
         state.continuationPending = false
-        debugLog("promptAsync failed", { sessionID, error: String(err) })
+        debugLog("tui continuation submit failed", { sessionID, error: String(err) })
       }
     },
     "experimental.chat.system.transform": async (input, output) => {

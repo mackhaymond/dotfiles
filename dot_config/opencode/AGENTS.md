@@ -63,7 +63,7 @@ vectors:
 The guard also tracks chezmoi source files written by the current opencode
 session. If those same session-touched paths are still dirty when the session
 becomes idle at turn end, it
-injects a synthetic follow-up prompt so the agent continues and applies,
+submits a synthetic follow-up prompt so the agent continues and applies,
 inspects, stages, commits, and pushes before it actually stops, and it shows a
 toast so the user can see why the agent resumed. The synthetic prompt also
 instructs the agent to re-print any final summary or user-facing text it had
