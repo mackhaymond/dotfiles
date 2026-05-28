@@ -31,7 +31,6 @@ yabai -m rule --add app="^Permute$" manage=off
 yabai -m rule --add app="^TI-Nspire$" manage=off
 yabai -m rule --add app="^LiveMath Maker$" manage=off
 yabai -m rule --add app="^Antidote$" manage=off
-yabai -m rule --add app="^(wezterm-gui|WezTerm)$" manage=off space=1
 
 # Keep space 1 reserved for wezterm. Any other window that lands on
 # space 1 — managed or not — gets relocated to space 2 with focus following.
@@ -55,6 +54,7 @@ yabai -m signal --add event=space_changed action='
 '
 
 # App -> Space pinning
+yabai -m rule --add app="^(wezterm-gui|WezTerm)$" space=1
 yabai -m rule --add app="^Todoist$" space=4
 yabai -m rule --add app="^Granola$" space=5
 yabai -m rule --add app="^Spark Mail$" space=6
