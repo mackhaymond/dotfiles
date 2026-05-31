@@ -1219,14 +1219,15 @@ clear_stale_lock_if_needed() {
       local cmdline
       cmdline="$(ps -p "$recorded_pid" -o command= 2>/dev/null || true)"
       if [[ "$cmdline" == *"codexbar-usage-status.sh"* ]]; then
-        log_warn "lock: killing wedged worker pid=${recorded_pid} age=${age}s"
-        kill -TERM "$recorded_pid" 2>/dev/null || true
-        sleep 1
-        if kill -0 "$recorded_pid" 2>/dev/null; then
-          kill -KILL "$recorded_pid" 2>/dev/null || true
-        fi
+        # Do not kill a live tmux run-shell worker just because wall-clock time
+        # advanced past the stale threshold. After laptop sleep/wake, a valid
+        # refresh can look "old" even though it was merely suspended; killing it
+        # makes tmux report the background command as signal 9 / exit 137.
+        log_warn "lock: worker still alive pid=${recorded_pid} age=${age}s; keeping lock"
+        return 0
       else
         log_warn "lock: pid ${recorded_pid} reused by unrelated process; skipping kill"
+        return 0
       fi
     fi
     rm -rf "$LOCKDIR" 2>/dev/null || true
