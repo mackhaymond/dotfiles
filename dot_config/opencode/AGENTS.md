@@ -110,5 +110,10 @@ Use codegraph for **structural** questions — what calls what, what would break
 
 ### If `.codegraph/` doesn't exist
 
-The MCP server returns "not initialized." Ask the user: *"I notice this project doesn't have CodeGraph initialized. Want me to run `codegraph init -i` to build the index?"*
+If CodeGraph is not initialized for the current project, run `codegraph init -i`
+from the project root before using CodeGraph for structural navigation. If the
+current directory is not clearly inside a project, do not initialize CodeGraph in
+`$HOME`; briefly report that there is no clear project root and continue with
+normal file inspection. If `codegraph` is unavailable or initialization fails,
+report the issue and fall back to normal file inspection.
 <!-- CODEGRAPH_END -->
