@@ -7,17 +7,17 @@ hyper - x : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_skhd_stack_prev.sh
 # hyper - s: yabai -m space --focus next
 
 # change focus by space index
-hyper - 0x32: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh external-first terminal
-hyper - 1: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh external-first main
-hyper - 2: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh external-first school
-hyper - tab: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh external-first todo
-hyper - q: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh external-first schedule
-hyper - w: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh external-first mail
-hyper - e: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh external-first calendar
-hyper - d: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh external-first messages
-hyper - f: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh external-first chatgpt
-f18 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh external-first codex # caps_lock+escape -> F18
-hyper - 3: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh external-first video
+hyper - 0x32: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal terminal
+hyper - 1: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal main
+hyper - 2: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal school
+hyper - tab: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal todo
+hyper - q: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal schedule
+hyper - w: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal mail
+hyper - e: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal calendar
+hyper - d: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal messages
+hyper - f: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal chatgpt
+f18 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal codex # caps_lock+escape -> F18
+hyper - 3: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal video
 
 hyper + fn - 0x32: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master terminal
 hyper + fn - 1: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master main
@@ -31,8 +31,8 @@ hyper + fn - f: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh m
 f19 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master codex # fn+caps_lock+escape -> F19
 hyper + fn - 3: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master video
 
-f13 : yabai -m display --focus 1
-f14 : yabai -m display --focus 2
+f13 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_display.sh master
+f14 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_display.sh external
 f15 : yabai -m window --display next || yabai -m window --display prev
 
 # go to last space

@@ -5,7 +5,6 @@ set -u
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export USER="${USER:-$(id -un)}"
 
-MASTER_DISPLAY_UUID="${YABAI_MASTER_DISPLAY_UUID:-37D8832A-2D66-02CA-B9F7-8F30A301B230}"
 CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${TMPDIR:-/tmp}/yabai_workspace_cache.env}"
 
 MODE="${1:-}"
@@ -15,7 +14,7 @@ if [ -z "$MODE" ] || [ -z "$LABEL" ]; then
   exit 64
 fi
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 
 load_cache() {
   if [ -r "$CACHE_FILE" ]; then
@@ -45,23 +44,57 @@ if ! load_cache; then
   load_cache || exit 0
 fi
 
-if [ "$DISPLAY_COUNT" -le 1 ]; then
+query_focused_display_index() {
+  yabai -m query --displays --display 2>/dev/null |
+    jq -r '.index // empty' |
+    head -n 1
+}
+
+query_space_display_index() {
+  local label="$1"
+
+  yabai -m query --spaces --space "$label" 2>/dev/null |
+    jq -r '.display // empty' |
+    head -n 1
+}
+
+move_space_to_display() {
+  local label="$1"
+  local target_index="$2"
+  local current_index
+
+  current_index=$(query_space_display_index "$label")
+  if [ -z "$current_index" ] || [ "$current_index" = "$target_index" ]; then
+    return 0
+  fi
+
+  yabai -m space "$label" --display "$target_index" >/dev/null 2>&1 || true
+}
+
+focus_space() {
   yabai -m space --focus "$LABEL" >/dev/null 2>&1 || true
+}
+
+if [ "$DISPLAY_COUNT" -le 1 ]; then
+  focus_space
   exit 0
 fi
 
 case "$MODE" in
-  external-first)
-    FOCUSED_INDEX=$(
-      yabai -m query --displays --display 2>/dev/null |
-        sed -n 's/^[[:space:]]*"index":[[:space:]]*\([0-9][0-9]*\),.*/\1/p' |
-        head -n 1
-    )
-    if [ "$FOCUSED_INDEX" = "$MASTER_DISPLAY_INDEX" ]; then
-      TARGET_INDEX="$EXTERNAL_DISPLAY_INDEX"
-    else
-      TARGET_INDEX="$FOCUSED_INDEX"
+  normal|external-first)
+    FOCUSED_INDEX=$(query_focused_display_index)
+    SPACE_DISPLAY_INDEX=$(query_space_display_index "$LABEL")
+
+    if [ -z "$FOCUSED_INDEX" ] || [ -z "$SPACE_DISPLAY_INDEX" ]; then
+      exit 0
     fi
+
+    if [ "$FOCUSED_INDEX" != "$MASTER_DISPLAY_INDEX" ] && [ "$SPACE_DISPLAY_INDEX" = "$MASTER_DISPLAY_INDEX" ]; then
+      move_space_to_display "$LABEL" "$FOCUSED_INDEX"
+    fi
+
+    focus_space
+    exit 0
     ;;
   master)
     TARGET_INDEX="$MASTER_DISPLAY_INDEX"
@@ -75,5 +108,6 @@ if [ -z "${TARGET_INDEX:-}" ]; then
   exit 0
 fi
 
-yabai -m space "$LABEL" --display "$TARGET_INDEX" >/dev/null 2>&1 || true
-yabai -m space --focus "$LABEL" >/dev/null 2>&1 || true
+move_space_to_display "$LABEL" "$TARGET_INDEX"
+yabai -m display --focus "$TARGET_INDEX" >/dev/null 2>&1 || true
+focus_space

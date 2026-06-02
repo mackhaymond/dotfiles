@@ -14,6 +14,18 @@ esac
 
 SPACES_JSON=$(yabai -m query --spaces 2>/dev/null) || exit 0
 
+WORKSPACE_LABELS='terminal
+main
+school
+todo
+schedule
+mail
+calendar
+messages
+chatgpt
+codex
+video'
+
 label_space_if_missing() {
   local index="$1"
   local label="$2"
@@ -53,6 +65,20 @@ EXTERNAL_DISPLAY_INDEX=$(
     .[] | select(.index != $master) | .index
   ' <<<"$DISPLAYS_JSON" | head -n 1
 )
+
+if [ "${DISPLAY_COUNT:-0}" -le 1 ] && [ -n "${MASTER_DISPLAY_INDEX:-}" ]; then
+  while IFS= read -r label; do
+    [ -z "$label" ] && continue
+    SPACE_DISPLAY_INDEX=$(
+      jq -r --arg label "$label" '
+        ([.[] | select(.label == $label) | .display][0]) // empty
+      ' <<<"$SPACES_JSON"
+    )
+    if [ -n "$SPACE_DISPLAY_INDEX" ] && [ "$SPACE_DISPLAY_INDEX" != "$MASTER_DISPLAY_INDEX" ]; then
+      yabai -m space "$label" --display "$MASTER_DISPLAY_INDEX" >/dev/null 2>&1 || true
+    fi
+  done <<<"$WORKSPACE_LABELS"
+fi
 
 {
   printf 'DISPLAY_COUNT=%s\n' "${DISPLAY_COUNT:-0}"
