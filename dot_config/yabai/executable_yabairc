@@ -12,7 +12,7 @@ yabai -m config top_padding 0
 yabai -m config --space 1 top_padding 0
 
 YABAI_WORKSPACE_REFRESH="${HOME}/code/various_scripts/yabai_workspace_refresh.sh"
-"$YABAI_WORKSPACE_REFRESH" labels-only
+"$YABAI_WORKSPACE_REFRESH" startup
 
 # yabai -m config mouse_follows_focus on
 
