@@ -6,7 +6,7 @@ enable-normalization-flatten-containers = true
 enable-normalization-opposite-orientation-for-nested-containers = true
 
 # Match the current yabai stack-first workflow as closely as AeroSpace allows.
-accordion-padding = 30
+accordion-padding = 1
 default-root-container-layout = 'accordion'
 default-root-container-orientation = 'auto'
 
