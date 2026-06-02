@@ -41,23 +41,23 @@ label_space_if_missing 11 video
 
 DISPLAYS_JSON=$(yabai -m query --displays 2>/dev/null) || exit 0
 DISPLAY_COUNT=$(jq -r 'length' <<<"$DISPLAYS_JSON")
-MASTER_DISPLAY_ID=$(
+MASTER_DISPLAY_INDEX=$(
   jq -r --arg uuid "$MASTER_DISPLAY_UUID" '
-    ([.[] | select(.uuid == $uuid) | .id][0]) //
-    (min_by(.frame.w * .frame.h).id) //
+    ([.[] | select(.uuid == $uuid) | .index][0]) //
+    (min_by(.frame.w * .frame.h).index) //
     empty
   ' <<<"$DISPLAYS_JSON" | head -n 1
 )
-EXTERNAL_DISPLAY_ID=$(
-  jq -r --argjson master "${MASTER_DISPLAY_ID:-0}" '
-    .[] | select(.id != $master) | .id
+EXTERNAL_DISPLAY_INDEX=$(
+  jq -r --argjson master "${MASTER_DISPLAY_INDEX:-0}" '
+    .[] | select(.index != $master) | .index
   ' <<<"$DISPLAYS_JSON" | head -n 1
 )
 
 {
   printf 'DISPLAY_COUNT=%s\n' "${DISPLAY_COUNT:-0}"
-  printf 'MASTER_DISPLAY_ID=%s\n' "${MASTER_DISPLAY_ID:-}"
-  printf 'EXTERNAL_DISPLAY_ID=%s\n' "${EXTERNAL_DISPLAY_ID:-}"
+  printf 'MASTER_DISPLAY_INDEX=%s\n' "${MASTER_DISPLAY_INDEX:-}"
+  printf 'EXTERNAL_DISPLAY_INDEX=%s\n' "${EXTERNAL_DISPLAY_INDEX:-}"
   printf 'MASTER_DISPLAY_UUID=%s\n' "$MASTER_DISPLAY_UUID"
 } >"${CACHE_FILE}.$$" && mv "${CACHE_FILE}.$$" "$CACHE_FILE"
 

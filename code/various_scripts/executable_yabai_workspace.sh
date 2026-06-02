@@ -29,11 +29,11 @@ load_cache() {
       ;;
   esac
 
-  if [ "$DISPLAY_COUNT" -le 1 ] && [ -n "${MASTER_DISPLAY_ID:-}" ]; then
+  if [ "$DISPLAY_COUNT" -le 1 ] && [ -n "${MASTER_DISPLAY_INDEX:-}" ]; then
     return 0
   fi
 
-  if [ "$DISPLAY_COUNT" -gt 1 ] && [ -n "${MASTER_DISPLAY_ID:-}" ] && [ -n "${EXTERNAL_DISPLAY_ID:-}" ]; then
+  if [ "$DISPLAY_COUNT" -gt 1 ] && [ -n "${MASTER_DISPLAY_INDEX:-}" ] && [ -n "${EXTERNAL_DISPLAY_INDEX:-}" ]; then
     return 0
   fi
 
@@ -52,28 +52,28 @@ fi
 
 case "$MODE" in
   external-first)
-    FOCUSED_ID=$(
+    FOCUSED_INDEX=$(
       yabai -m query --displays --display 2>/dev/null |
-        sed -n 's/^[[:space:]]*"id":[[:space:]]*\([0-9][0-9]*\),.*/\1/p' |
+        sed -n 's/^[[:space:]]*"index":[[:space:]]*\([0-9][0-9]*\),.*/\1/p' |
         head -n 1
     )
-    if [ "$FOCUSED_ID" = "$MASTER_DISPLAY_ID" ]; then
-      TARGET_ID="$EXTERNAL_DISPLAY_ID"
+    if [ "$FOCUSED_INDEX" = "$MASTER_DISPLAY_INDEX" ]; then
+      TARGET_INDEX="$EXTERNAL_DISPLAY_INDEX"
     else
-      TARGET_ID="$FOCUSED_ID"
+      TARGET_INDEX="$FOCUSED_INDEX"
     fi
     ;;
   master)
-    TARGET_ID="$MASTER_DISPLAY_ID"
+    TARGET_INDEX="$MASTER_DISPLAY_INDEX"
     ;;
   *)
     exit 64
     ;;
 esac
 
-if [ -z "${TARGET_ID:-}" ]; then
+if [ -z "${TARGET_INDEX:-}" ]; then
   exit 0
 fi
 
-yabai -m space "$LABEL" --display "$TARGET_ID" >/dev/null 2>&1 || true
+yabai -m space "$LABEL" --display "$TARGET_INDEX" >/dev/null 2>&1 || true
 yabai -m space --focus "$LABEL" >/dev/null 2>&1 || true
