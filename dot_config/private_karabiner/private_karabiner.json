@@ -43,6 +43,18 @@
                                 "type": "basic"
                             },
                             {
+                                "description": "Change hyper+fn+escape to F19 for skhd.",
+                                "from": {
+                                    "key_code": "escape",
+                                    "modifiers": {
+                                        "mandatory": ["left_command", "left_control", "left_option", "left_shift", "fn"],
+                                        "optional": ["any"]
+                                    }
+                                },
+                                "to": [{ "key_code": "f19" }],
+                                "type": "basic"
+                            },
+                            {
                                 "description": "Change hyper+escape to F18 for skhd.",
                                 "from": {
                                     "key_code": "escape",
@@ -52,6 +64,26 @@
                                     }
                                 },
                                 "to": [{ "key_code": "f18" }],
+                                "type": "basic"
+                            },
+                            {
+                                "description": "Change fn+caps_lock+escape to F19 for skhd.",
+                                "from": {
+                                    "modifiers": {
+                                        "mandatory": ["fn"],
+                                        "optional": ["any"]
+                                    },
+                                    "simultaneous": [
+                                        { "key_code": "caps_lock" },
+                                        { "key_code": "escape" }
+                                    ],
+                                    "simultaneous_options": {
+                                        "key_down_order": "strict",
+                                        "key_up_order": "insensitive",
+                                        "to_after_key_up": [{ "key_code": "vk_none" }]
+                                    }
+                                },
+                                "to": [{ "key_code": "f19" }],
                                 "type": "basic"
                             },
                             {

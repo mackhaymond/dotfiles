@@ -3,11 +3,16 @@ yabai -m signal --add event=dock_did_restart action="sudo yabai --load-sa"
 sudo yabai --load-sa
 
 yabai -m config layout stack
+yabai -m config window_origin_display focused
+yabai -m config display_arrangement_order horizontal
 
 yabai -m config window_shadow off
 
 yabai -m config top_padding 0
 yabai -m config --space 1 top_padding 0
+
+YABAI_WORKSPACE_REFRESH="${HOME}/code/various_scripts/yabai_workspace_refresh.sh"
+"$YABAI_WORKSPACE_REFRESH" labels-only
 
 # yabai -m config mouse_follows_focus on
 
@@ -55,14 +60,14 @@ yabai -m signal --add event=space_changed action='
 '
 
 # App -> Space pinning
-yabai -m rule --add app="^(wezterm-gui|WezTerm)$" space=1
-yabai -m rule --add app="^Todoist$" space=4
-yabai -m rule --add app="^Granola$" space=5
-yabai -m rule --add app="^Spark Mail$" space=6
-yabai -m rule --add app="^Notion Calendar$" space=7
-yabai -m rule --add app="^Messages$" space=8
-yabai -m rule --add app="^ChatGPT$" space=9
-yabai -m rule --add app="^Codex$" space=10
+yabai -m rule --add app="^(wezterm-gui|WezTerm)$" space=terminal
+yabai -m rule --add app="^Todoist$" space=todo
+yabai -m rule --add app="^Granola$" space=schedule
+yabai -m rule --add app="^Spark Mail$" space=mail
+yabai -m rule --add app="^Notion Calendar$" space=calendar
+yabai -m rule --add app="^Messages$" space=messages
+yabai -m rule --add app="^ChatGPT$" space=chatgpt
+yabai -m rule --add app="^Codex$" space=codex
 
 # Re-apply rules to currently-open windows on yabai (re)start.
 # Catches windows whose creation events were missed (login race, crash-restart).
@@ -71,3 +76,5 @@ yabai -m rule --apply
 # Belt-and-suspenders: re-fire rules on any app launch in case the
 # window_created event is lost.
 yabai -m signal --add event=application_launched action="yabai -m rule --apply"
+yabai -m signal --add event=display_added label=workspace_display_added action="$YABAI_WORKSPACE_REFRESH display-changed"
+yabai -m signal --add event=display_removed label=workspace_display_removed action="$YABAI_WORKSPACE_REFRESH display-changed"
