@@ -6,14 +6,13 @@ enable-normalization-flatten-containers = true
 enable-normalization-opposite-orientation-for-nested-containers = true
 
 # Match the current yabai stack-first workflow as closely as AeroSpace allows.
-accordion-padding = 0
+accordion-padding = 30
 default-root-container-layout = 'accordion'
 default-root-container-orientation = 'auto'
 
 persistent-workspaces = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11']
 
 on-focused-monitor-changed = ['move-mouse monitor-lazy-center']
-after-startup-command = ['exec-and-forget /Users/mackhaymond/code/various_scripts/aerospace_place_arc_windows.sh']
 
 [gaps]
 inner.horizontal = 0

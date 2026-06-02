@@ -1,6 +1,6 @@
 # change focus between windows in the current AeroSpace accordion stack
-hyper - z : aerospace swap --swap-focus --wrap-around dfs-next
-hyper - x : aerospace swap --swap-focus --wrap-around dfs-prev
+hyper - z : aerospace focus --boundaries-action wrap-around-the-workspace dfs-next
+hyper - x : aerospace focus --boundaries-action wrap-around-the-workspace dfs-prev
 
 # summon workspaces to the currently focused display
 hyper - 0x32: aerospace summon-workspace 1 # terminal
