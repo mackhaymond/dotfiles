@@ -1,6 +1,6 @@
 # change focus between windows in the current AeroSpace accordion stack
-hyper - z : {{ .chezmoi.homeDir }}/code/various_scripts/aerospace_focus_stack_window.sh next
-hyper - x : {{ .chezmoi.homeDir }}/code/various_scripts/aerospace_focus_stack_window.sh prev
+hyper - z : aerospace swap --swap-focus --wrap-around dfs-next
+hyper - x : aerospace swap --swap-focus --wrap-around dfs-prev
 
 # summon workspaces to the currently focused display
 hyper - 0x32: aerospace summon-workspace 1 # terminal
