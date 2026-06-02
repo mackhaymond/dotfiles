@@ -1,25 +1,15 @@
 local wezterm = require 'wezterm'
-local mux = wezterm.mux
-
 local config = {}
 
 if wezterm.config_builder then
     config = wezterm.config_builder()
 end
 
-wezterm.on('gui-startup', function(cmd)
-    local _, _, window = mux.spawn_window(cmd or {})
-    local gui_window = window:gui_window()
-    if not gui_window:get_dimensions().is_full_screen then
-        gui_window:toggle_fullscreen()
-    end
-end)
-
 config.color_scheme = "catppuccin-mocha"
 
 config.enable_tab_bar = false
 config.enable_kitty_graphics = true
-config.window_decorations = "NONE"
+config.window_decorations = "RESIZE"
 
 config.font = wezterm.font_with_fallback({
     "JetBrains Mono",

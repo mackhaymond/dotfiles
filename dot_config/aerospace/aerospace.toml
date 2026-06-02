@@ -1,0 +1,153 @@
+config-version = 2
+
+start-at-login = true
+
+enable-normalization-flatten-containers = true
+enable-normalization-opposite-orientation-for-nested-containers = true
+
+# Match the current yabai stack-first workflow as closely as AeroSpace allows.
+accordion-padding = 0
+default-root-container-layout = 'accordion'
+default-root-container-orientation = 'auto'
+
+persistent-workspaces = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11']
+
+on-focused-monitor-changed = ['move-mouse monitor-lazy-center']
+after-startup-command = ['exec-and-forget /Users/mackhaymond/code/various_scripts/aerospace_place_arc_windows.sh']
+
+[gaps]
+inner.horizontal = 0
+inner.vertical = 0
+outer.left = 0
+outer.bottom = 0
+outer.top = 0
+outer.right = 0
+
+[mode.main.binding]
+# skhd owns keybindings so the existing hyper layer can be preserved.
+
+[[on-window-detected]]
+check-further-callbacks = true
+run = 'layout accordion'
+
+[[on-window-detected]]
+if.app-id = 'com.github.wez.wezterm'
+run = ['move-node-to-workspace 1', 'layout accordion']
+
+[[on-window-detected]]
+if.app-id = 'com.todoist.mac.Todoist'
+run = ['move-node-to-workspace 4', 'layout accordion']
+
+[[on-window-detected]]
+if.app-id = 'com.granola.app'
+run = ['move-node-to-workspace 5', 'layout accordion']
+
+[[on-window-detected]]
+if.app-id = 'com.readdle.SparkDesktop-setapp'
+run = ['move-node-to-workspace 6', 'layout accordion']
+
+[[on-window-detected]]
+if.app-id = 'com.cron.electron'
+run = ['move-node-to-workspace 7', 'layout accordion']
+
+[[on-window-detected]]
+if.app-id = 'com.apple.MobileSMS'
+run = ['move-node-to-workspace 8', 'layout accordion']
+
+[[on-window-detected]]
+if.app-id = 'com.openai.chat'
+run = ['move-node-to-workspace 9', 'layout accordion']
+
+[[on-window-detected]]
+if.app-id = 'com.openai.codex'
+run = ['move-node-to-workspace 10', 'layout accordion']
+
+[[on-window-detected]]
+if.app-id = 'com.apple.systempreferences'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.apple.calculator'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.hegenberg.bettertouchtool-setapp'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'org.pqrs.Karabiner-Elements.Settings'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-name-regex-substring = '^python$'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.daisydiskapp.DaisyDiskStandAlone'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.bjango.istatmenus-setapp'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.valvesoftware.steam'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.apple.ActivityMonitor'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.apple.mail'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.apple.finder'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.macitbetter.betterzip-setapp'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'sh.loft.devpod'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.setapp.DesktopClient.SetappAgent'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.charliemonroe.Permute-setapp'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-name-regex-substring = '^TI-Nspire$'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.parallels.winapp.694e038f5969f372a9b896266a1822c5.5b6528226b6649beb9ee6aecc4a4edc1'
+check-further-callbacks = true
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-name-regex-substring = '^Antidote$'
+check-further-callbacks = true
+run = 'layout floating'
