@@ -59,6 +59,40 @@ first_unlabeled_space_index() {
   ' <<<"$SPACES_JSON"
 }
 
+first_unlabeled_space_index_on_display() {
+  local display_index="$1"
+
+  jq -r --argjson display_index "$display_index" '
+    ([.[] | select(.display == $display_index and .label == "") | .index][0]) // empty
+  ' <<<"$SPACES_JSON"
+}
+
+space_display_for_label() {
+  local label="$1"
+
+  jq -r --arg label "$label" '
+    ([.[] | select(.label == $label) | .display][0]) // empty
+  ' <<<"$SPACES_JSON"
+}
+
+space_windows_for_label() {
+  local label="$1"
+
+  jq -r --arg label "$label" '
+    .[] | select(.label == $label) | .windows[]?
+  ' <<<"$SPACES_JSON"
+}
+
+create_space_on_display() {
+  local display_index="$1"
+  local index
+
+  yabai -m space --create "$display_index" >/dev/null 2>&1 || true
+  refresh_spaces_json
+  index=$(first_unlabeled_space_index_on_display "$display_index")
+  [ -n "$index" ] && printf '%s\n' "$index"
+}
+
 space_for_app() {
   local app_pattern="$1"
 
@@ -114,6 +148,45 @@ assign_label_to_pinned_window_space() {
 
   index=$(space_for_app_title "$app_pattern" "$title_pattern")
   [ -n "$index" ] && assign_label_to_space "$label" "$index"
+}
+
+move_label_to_display() {
+  local label="$1"
+  local target_display_index="$2"
+  local current_display_index
+  local source_space_index
+  local target_space_index
+  local window_ids
+
+  [ -z "$target_display_index" ] && return 0
+
+  current_display_index=$(space_display_for_label "$label")
+  if [ -z "$current_display_index" ] || [ "$current_display_index" = "$target_display_index" ]; then
+    return 0
+  fi
+
+  source_space_index=$(space_index_for_label "$label")
+  [ -z "$source_space_index" ] && return 0
+  window_ids=$(space_windows_for_label "$label")
+
+  target_space_index=$(first_unlabeled_space_index_on_display "$target_display_index")
+  if [ -z "$target_space_index" ]; then
+    target_space_index=$(create_space_on_display "$target_display_index")
+  fi
+  [ -z "$target_space_index" ] && return 0
+
+  yabai -m space "$source_space_index" --label >/dev/null 2>&1 || true
+  yabai -m space "$target_space_index" --label "$label" >/dev/null 2>&1 || true
+  yabai -m display --focus "$target_display_index" >/dev/null 2>&1 || true
+  yabai -m space --focus "$label" >/dev/null 2>&1 || true
+
+  while IFS= read -r window_id; do
+    [ -z "$window_id" ] && continue
+    yabai -m window "$window_id" --display "$target_display_index" >/dev/null 2>&1 || true
+  done <<<"$window_ids"
+
+  refresh_windows_json
+  refresh_spaces_json
 }
 
 label_space_if_missing() {
@@ -181,6 +254,25 @@ assign_label_to_pinned_app_space chatgpt '^ChatGPT$'
 assign_label_to_pinned_app_space codex '^Codex$'
 
 label_missing_workspace_labels
+
+FOCUSED_SPACE_INDEX=$(
+  jq -r '
+    ([.[] | select(."has-focus" == true) | .index][0]) // empty
+  ' <<<"$SPACES_JSON"
+)
+FOCUSED_SPACE_LABEL=$(
+  jq -r '
+    ([.[] | select(."has-focus" == true) | .label][0]) // empty
+  ' <<<"$SPACES_JSON"
+)
+
+move_label_to_display chatgpt "$EXTERNAL_DISPLAY_INDEX"
+move_label_to_display video "$EXTERNAL_DISPLAY_INDEX"
+
+if [ -n "${FOCUSED_SPACE_LABEL:-}" ]; then
+  FOCUSED_SPACE_INDEX=$(space_index_for_label "$FOCUSED_SPACE_LABEL")
+fi
+[ -n "${FOCUSED_SPACE_INDEX:-}" ] && yabai -m space --focus "$FOCUSED_SPACE_INDEX" >/dev/null 2>&1 || true
 
 {
   printf 'DISPLAY_COUNT=%s\n' "${DISPLAY_COUNT:-0}"
