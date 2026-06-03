@@ -14,18 +14,20 @@ esac
 
 SPACES_JSON=$(yabai -m query --spaces 2>/dev/null) || exit 0
 WINDOWS_JSON=$(yabai -m query --windows 2>/dev/null || printf '[]')
-
-WORKSPACE_LABELS='terminal
-main
-school
-todo
-schedule
-mail
-calendar
-messages
-chatgpt
-codex
-video'
+DISPLAYS_JSON=$(yabai -m query --displays 2>/dev/null) || exit 0
+DISPLAY_COUNT=$(jq -r 'length' <<<"$DISPLAYS_JSON")
+MASTER_DISPLAY_INDEX=$(
+  jq -r --arg uuid "$MASTER_DISPLAY_UUID" '
+    ([.[] | select(.uuid == $uuid) | .index][0]) //
+    (min_by(.frame.w * .frame.h).index) //
+    empty
+  ' <<<"$DISPLAYS_JSON" | head -n 1
+)
+EXTERNAL_DISPLAY_INDEX=$(
+  jq -r --argjson master "${MASTER_DISPLAY_INDEX:-0}" '
+    .[] | select(.index != $master) | .index
+  ' <<<"$DISPLAYS_JSON" | head -n 1
+)
 
 refresh_spaces_json() {
   SPACES_JSON=$(yabai -m query --spaces 2>/dev/null) || exit 0
@@ -153,22 +155,19 @@ label_missing_workspace_labels() {
   label_space_if_missing 11 video
 }
 
-label_missing_workspace_labels
+if [ "${DISPLAY_COUNT:-0}" -le 1 ]; then
+  {
+    printf 'DISPLAY_COUNT=%s\n' "${DISPLAY_COUNT:-0}"
+    printf 'MASTER_DISPLAY_INDEX=%s\n' "${MASTER_DISPLAY_INDEX:-}"
+    printf 'EXTERNAL_DISPLAY_INDEX=%s\n' "${EXTERNAL_DISPLAY_INDEX:-}"
+    printf 'MASTER_DISPLAY_UUID=%s\n' "$MASTER_DISPLAY_UUID"
+  } >"${CACHE_FILE}.$$" && mv "${CACHE_FILE}.$$" "$CACHE_FILE"
 
-DISPLAYS_JSON=$(yabai -m query --displays 2>/dev/null) || exit 0
-DISPLAY_COUNT=$(jq -r 'length' <<<"$DISPLAYS_JSON")
-MASTER_DISPLAY_INDEX=$(
-  jq -r --arg uuid "$MASTER_DISPLAY_UUID" '
-    ([.[] | select(.uuid == $uuid) | .index][0]) //
-    (min_by(.frame.w * .frame.h).index) //
-    empty
-  ' <<<"$DISPLAYS_JSON" | head -n 1
-)
-EXTERNAL_DISPLAY_INDEX=$(
-  jq -r --argjson master "${MASTER_DISPLAY_INDEX:-0}" '
-    .[] | select(.index != $master) | .index
-  ' <<<"$DISPLAYS_JSON" | head -n 1
-)
+  yabai -m rule --apply >/dev/null 2>&1 || true
+  exit 0
+fi
+
+label_missing_workspace_labels
 
 assign_label_to_pinned_app_space terminal '^(wezterm-gui|WezTerm)$'
 assign_label_to_pinned_window_space main '^Arc$' 'codex the model'
@@ -182,21 +181,6 @@ assign_label_to_pinned_app_space chatgpt '^ChatGPT$'
 assign_label_to_pinned_app_space codex '^Codex$'
 
 label_missing_workspace_labels
-
-if [ "${DISPLAY_COUNT:-0}" -le 1 ] && [ -n "${MASTER_DISPLAY_INDEX:-}" ]; then
-  while IFS= read -r label; do
-    [ -z "$label" ] && continue
-    SPACE_DISPLAY_INDEX=$(
-      jq -r --arg label "$label" '
-        ([.[] | select(.label == $label) | .display][0]) // empty
-      ' <<<"$SPACES_JSON"
-    )
-    if [ -n "$SPACE_DISPLAY_INDEX" ] && [ "$SPACE_DISPLAY_INDEX" != "$MASTER_DISPLAY_INDEX" ]; then
-      SPACE_INDEX=$(space_index_for_label "$label")
-      [ -n "$SPACE_INDEX" ] && yabai -m space "$SPACE_INDEX" --display "$MASTER_DISPLAY_INDEX" >/dev/null 2>&1 || true
-    fi
-  done <<<"$WORKSPACE_LABELS"
-fi
 
 {
   printf 'DISPLAY_COUNT=%s\n' "${DISPLAY_COUNT:-0}"
