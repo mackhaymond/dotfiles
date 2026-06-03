@@ -170,8 +170,8 @@ fi
 label_missing_workspace_labels
 
 assign_label_to_pinned_app_space terminal '^(wezterm-gui|WezTerm)$'
-assign_label_to_pinned_window_space main '^Arc$' 'codex the model'
-assign_label_to_pinned_window_space school '^Arc$' 'Physics'
+assign_label_to_pinned_window_space main '^Arc$' '^(Main|codex the model)'
+assign_label_to_pinned_window_space school '^Arc$' '^(ECON 102|Physics)'
 assign_label_to_pinned_app_space todo '^Todoist$'
 assign_label_to_pinned_app_space schedule '^Granola$'
 assign_label_to_pinned_app_space mail '^Spark Mail$'
