@@ -225,7 +225,6 @@ label_missing_workspace_labels() {
   label_space_if_missing 8 messages
   label_space_if_missing 9 chatgpt
   label_space_if_missing 10 codex
-  label_space_if_missing 11 video
 }
 
 if [ "${DISPLAY_COUNT:-0}" -le 1 ]; then
@@ -267,7 +266,6 @@ FOCUSED_SPACE_LABEL=$(
 )
 
 move_label_to_display chatgpt "$EXTERNAL_DISPLAY_INDEX"
-move_label_to_display video "$EXTERNAL_DISPLAY_INDEX"
 
 if [ -n "${FOCUSED_SPACE_LABEL:-}" ]; then
   FOCUSED_SPACE_INDEX=$(space_index_for_label "$FOCUSED_SPACE_LABEL")
