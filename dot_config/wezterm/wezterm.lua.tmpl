@@ -8,18 +8,21 @@ if wezterm.config_builder then
 end
 
 wezterm.on('gui-startup', function(cmd)
-    local _, _, window = mux.spawn_window(cmd or {})
-    local gui_window = window:gui_window()
-    if not gui_window:get_dimensions().is_full_screen then
-        gui_window:toggle_fullscreen()
-    end
+    -- yabai manages WezTerm and sizes it to fill whatever display its space is
+    -- on, so we no longer force WezTerm's own non-native fullscreen (which locks
+    -- the window size and won't refit when moved across displays). The clean
+    -- edge-to-edge look is preserved by the system menu-bar auto-hide instead.
+    mux.spawn_window(cmd or {})
 end)
 
 config.color_scheme = "catppuccin-mocha"
 
 config.enable_tab_bar = false
 config.enable_kitty_graphics = true
-config.window_decorations = "NONE"
+-- RESIZE (no TITLE) keeps the borderless look but reports the window as
+-- resizable to the OS, so yabai can size WezTerm to fill whatever display its
+-- space is on. "NONE" makes the window non-resizable and yabai can't manage it.
+config.window_decorations = "RESIZE"
 
 config.font = wezterm.font_with_fallback({
     "JetBrains Mono",
