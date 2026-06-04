@@ -23,7 +23,7 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `/Users/mackhaymond/.local/share/chezmoi/dot_config/wezterm/wezterm.lua.tmpl` | `~/.config/wezterm/wezterm.lua` | Template config | Terminal emulator: startup, keybindings, tmux integration |
 | `/Users/mackhaymond/.local/share/chezmoi/dot_config/private_karabiner/private_karabiner.json` | `~/.config/karabiner/karabiner.json` | JSON config (git-ignored) | Key remapping: caps_lock→hyper, F-key aliases (F18/F19/F13/F14) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_workspace.sh` | `~/code/various_scripts/yabai_workspace.sh` | Executable script | Focus workspace by label |
-| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_send_window.sh` | `~/code/various_scripts/yabai_send_window.sh` | Executable script | Move focused window to space (respects pinned homes) |
+| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_send_window.sh` | `~/code/various_scripts/yabai_send_window.sh` | Executable script | Move focused window to space and follow focus (respects pinned homes) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_workspace_refresh.sh` | `~/code/various_scripts/yabai_workspace_refresh.sh` | Executable script | Reconcile canonical labels, refresh display topology cache |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_display.sh` | `~/code/various_scripts/yabai_display.sh` | Executable script | Focus display by name (master/external) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_space_move.sh` | `~/code/various_scripts/yabai_space_move.sh` | Executable script | Push/pull spaces between displays |
@@ -164,7 +164,7 @@ Move focus to a labeled space without moving it. Focus stays on the current disp
 
 #### Send Window to Workspace (Hyper+Fn Layer)
 
-Move the focused window to a target space (unless pinned to home space). Focus stays in current space.
+Move the focused window to a target space and **follow focus to it** (unless pinned to home space — then it stays put and focus is unchanged).
 
 | Keybinding | Key | Script | Destination |
 |---|---|---|---|
@@ -322,7 +322,7 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 | Script | Arguments | Purpose |
 |--------|-----------|---------|
 | `yabai_workspace.sh` | `focus <label>` \| `master <label>` | Focus workspace by label (wherever it lives) or bring home then focus |
-| `yabai_send_window.sh` | `<label>` | Move focused window to space; blocked if window is pinned and already on home space |
+| `yabai_send_window.sh` | `<label>` | Move focused window to space and follow focus to it; blocked (focus unchanged) if window is pinned and already on home space |
 | `yabai_display.sh` | `master` \| `external` | Focus the laptop or external display; no-op on single display |
 | `yabai_space_move.sh` | `push` \| `home-all` | Cross-display space movement: push focused space to other display (with follow), or pull all labels home |
 | `yabai_displays.sh` | `added` \| `removed` | Hotplug handler: dock = refresh cache (non-destructive); undock = pull home safety net |
@@ -511,24 +511,24 @@ f18                    # Focus "codex" workspace
 
 ### Send a Window to a Workspace
 
-**Goal:** Move the focused window to a target workspace. Focus stays where you are.
+**Goal:** Move the focused window to a target workspace **and follow it there** — you land on the target space alongside the window.
 
 **Action:**
 ```bash
 # From anywhere, press hyper+fn+<key> for the destination
-hyper + fn - 1         # Send focused window to "main"
-hyper + fn - 0x32 (`)  # Send to "terminal" (if not pinned)
-f19                    # Send to "codex"
+hyper + fn - 1         # Send focused window to "main" and follow
+hyper + fn - 0x32 (`)  # Send to "terminal" (if not pinned) and follow
+f19                    # Send to "codex" and follow
 ```
 
 **What happens:**
 1. skhd captures the keybinding.
 2. skhd invokes `yabai_send_window.sh <label>`.
 3. Script checks if the window is pinned to a home space (wezterm → terminal, Todoist → todo, etc.).
-4. If pinned and already on home space, script exits (bound window cannot move).
+4. If pinned and already on home space, script exits (bound window cannot move; **focus stays put** — no jump to an empty space).
 5. Otherwise, script queries target space's index by label.
 6. Script moves window: `yabai -m window --space <label>`.
-7. Window departs; focus stays on current space.
+7. Script follows focus to the moved window (`yabai -m window <id> --focus`), so you end up on the target space. (Focus only follows when the window actually moves.)
 
 ### Push a Workspace to the External Display
 

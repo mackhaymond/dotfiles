@@ -1,8 +1,10 @@
 #!/bin/bash
 
-# Send the focused window to a labeled space -- UNLESS it is a pinned app that is
-# already sitting on its home space (those are "bound to their current space" and
-# left alone). Free / unpinned windows move. Focus stays where you are.
+# Send the focused window to a labeled space and FOLLOW focus to it -- you land on
+# the target space alongside the window. UNLESS it is a pinned app already sitting
+# on its home space (those are "bound to their current space" and left alone, with
+# focus unchanged). Free / unpinned windows move and focus follows; a window that
+# does not move (pinned-on-home, or already on the target) leaves focus put.
 #
 #   yabai_send_window.sh <target-label>
 
@@ -17,6 +19,7 @@ TARGET="${1:-}"
 info=$(yabai -m query --windows --window 2>/dev/null) || exit 0
 app=$(printf '%s' "$info" | jq -r '.app // ""' 2>/dev/null)
 cur=$(printf '%s' "$info" | jq -r '.space // empty' 2>/dev/null)
+wid=$(printf '%s' "$info" | jq -r '.id // empty' 2>/dev/null)
 [ -z "$cur" ] && exit 0
 
 # Apps pinned to a home space (mirrors the `space=` rules in yabairc). If the
@@ -57,4 +60,12 @@ tidx=$(yabai -m query --spaces --space "$TARGET" 2>/dev/null | jq -r '.index // 
 [ -z "$tidx" ] && exit 0
 [ "$cur" = "$tidx" ] && exit 0
 
-yabai -m window --space "$TARGET" >/dev/null 2>&1 || true
+# Move the window, then FOLLOW focus to it so you land on the target space with
+# the window. Focusing the moved window by id reliably brings its space forward
+# (works across displays too); a bare space --focus is the fallback.
+yabai -m window --space "$TARGET" >/dev/null 2>&1 || exit 0
+if [ -n "$wid" ]; then
+  yabai -m window "$wid" --focus >/dev/null 2>&1 || true
+else
+  yabai -m space --focus "$TARGET" >/dev/null 2>&1 || true
+fi
