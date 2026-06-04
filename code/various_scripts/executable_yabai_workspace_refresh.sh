@@ -190,8 +190,11 @@ label_missing_workspace_labels() {
 label_missing_workspace_labels
 
 assign_label_to_pinned_app_space terminal '^(wezterm-gui|WezTerm)$'
-assign_label_to_pinned_window_space main '^Arc$' '^(Main|codex the model)'
-assign_label_to_pinned_window_space school '^Arc$' '^(ECON 102|Physics)'
+# Arc main/school pinning is no longer title-based (titles change as you browse,
+# and Little Arc popups are byte-identical to main windows in every yabai field).
+# It now lives in yabai_arc_pin.sh, triggered by Hammerspoon (which floats Little
+# Arc popups via AXIdentifier first, so the remaining non-floating Arc windows are
+# the real main windows). See dot_hammerspoon/init.lua.
 assign_label_to_pinned_app_space todo '^Todoist$'
 assign_label_to_pinned_app_space schedule '^Granola$'
 assign_label_to_pinned_app_space mail '^Spark Mail$'
