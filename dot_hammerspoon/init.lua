@@ -13,16 +13,18 @@
 -- Hammerspoon can. macOS AX only exposes CURRENT-Space windows, so we read the
 -- identifier off whatever Arc windows are currently on-screen and remember which
 -- window ids are "main"; the remembered set is then pinned via yabai (which can
--- report any window's space by id, cross-Space). Hammerspoon's own window/space
--- EVENTS are unreliable with yabai-driven switching, so the trigger is a light
--- periodic sync (plus the windowCreated event as a bonus for immediacy).
+-- report any window's space by id, cross-Space).
+--
+-- TRIGGER: yabai calls `hs -c "arcSync()"` from the SAME signals that re-apply the
+-- other pinned apps' space= rules -- application_launched (any app launch) and Arc
+-- window_created -- so Arc snaps to its spaces on the same cadence as every other
+-- pinned app. No polling.
 
 require("hs.ipc") -- enables the `hs` command-line tool
 
 local YABAI = "/opt/homebrew/bin/yabai"
 local MAIN_LABEL = "main"
 local SCHOOL_LABEL = "school"
-local SYNC_INTERVAL = 2 -- seconds
 
 -- Remembered ids of Arc MAIN (bigBrowserWindow) windows. Accumulated as we see
 -- them on the current Space; pruned when they close.
@@ -107,17 +109,10 @@ function arcSync()
   pinMains()
 end
 
--- Reliable trigger: light periodic sync.
-if arcTimer then arcTimer:stop() end
-arcTimer = hs.timer.doEvery(SYNC_INTERVAL, arcSync)
--- Bonus immediacy when the event actually fires.
-arcWF = hs.window.filter.new({ "Arc" })
-arcWF:subscribe(hs.window.filter.windowCreated, function()
-  hs.timer.doAfter(0.3, arcSync)
-end)
-arcWF:subscribe(hs.window.filter.windowDestroyed, function(win)
-  if win then mainSet[win:id()] = nil end
-end)
+-- One-shot initial pass after load: classify whatever Arc windows are on-screen
+-- now and pin. All ongoing re-pinning is driven by yabai signals calling
+-- `hs -c "arcSync()"` (see yabairc: application_launched + Arc window_created).
+hs.timer.doAfter(1.0, arcSync)
 
 -- Debug helpers.
 function pinNow() pinMains() end

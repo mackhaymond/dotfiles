@@ -54,6 +54,10 @@ yabai -m signal --add event=window_created action='
   win=$YABAI_WINDOW_ID
   info=$(yabai -m query --windows --window "$win" 2>/dev/null) || exit 0
   app=$(printf "%s" "$info" | jq -r .app)
+  # New Arc window -> re-pin the Arc MAIN windows via Hammerspoon (only it can
+  # read AXIdentifier to tell a main window from a Little Arc popup). Same trigger
+  # cadence as the other apps re-applying their space= rules. No-op if hs is down.
+  [ "$app" = "Arc" ] && /opt/homebrew/bin/hs -c "arcSync()" >/dev/null 2>&1
   case "$app" in
     wezterm-gui|WezTerm)
       # WezTerm defaults to native fullscreen, which lives in its own Space and is
@@ -113,7 +117,9 @@ yabai -m rule --apply
 
 # Belt-and-suspenders: re-fire rules on any app launch in case the
 # window_created event is lost.
-yabai -m signal --add event=application_launched action="yabai -m rule --apply"
+# Re-apply the space= rules (pins Todoist/Messages/etc.) AND re-pin the Arc main
+# windows (Hammerspoon) on every app launch -- one consistent "snap" moment.
+yabai -m signal --add event=application_launched action="yabai -m rule --apply; /opt/homebrew/bin/hs -c 'arcSync()' >/dev/null 2>&1"
 # Display hotplug -> debounced handler (non-destructive on connect; pull-home
 # on disconnect). Replaces the old "reset everything to the laptop" refresh.
 yabai -m signal --add event=display_added label=workspace_display_added action="$YABAI_DISPLAYS added"
