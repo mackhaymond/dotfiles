@@ -22,7 +22,8 @@ config.enable_kitty_graphics = true
 -- RESIZE (no TITLE) keeps the borderless look but reports the window as
 -- resizable to the OS, so yabai can size WezTerm to fill whatever display its
 -- space is on. "NONE" makes the window non-resizable and yabai can't manage it.
-config.window_decorations = "RESIZE"
+-- MACOS_FORCE_SQUARE_CORNERS removes macOS's rounded window corners.
+config.window_decorations = "RESIZE | MACOS_FORCE_SQUARE_CORNERS"
 
 config.font = wezterm.font_with_fallback({
     "JetBrains Mono",
