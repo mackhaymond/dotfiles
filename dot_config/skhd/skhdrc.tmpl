@@ -18,6 +18,18 @@ hyper - d: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus 
 hyper - f: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus chatgpt
 f18 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus codex # caps_lock+escape -> F18
 
+# hyper+3..9: focus the Nth native-fullscreen app, in mission-control order.
+# Native-fullscreen apps (non-pinned apps or the browser) live in their own macOS
+# Spaces outside the labeled model, so the hyper+<label> keys can't reach them.
+# hyper+3 -> 1st fullscreen app, hyper+4 -> 2nd, ... no-op if that many aren't open.
+hyper - 3 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_fullscreen_focus.sh 1
+hyper - 4 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_fullscreen_focus.sh 2
+hyper - 5 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_fullscreen_focus.sh 3
+hyper - 6 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_fullscreen_focus.sh 4
+hyper - 7 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_fullscreen_focus.sh 5
+hyper - 8 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_fullscreen_focus.sh 6
+hyper - 9 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_fullscreen_focus.sh 7
+
 # hyper+fn+<space>: send the focused window to that space, unless it's a pinned
 # app already on its home space (those stay put). Focus stays where you are.
 hyper + fn - 0x32: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh terminal
