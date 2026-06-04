@@ -114,6 +114,7 @@ case "$MODE" in
 
     yabai -m display --focus "${MASTER_DISPLAY_INDEX:-1}" >/dev/null 2>&1 || true
     focus_space
+    "$SCRIPT_DIR/yabai_reorder_spaces.sh" >/dev/null 2>&1 || true
     exit 0
     ;;
   *)

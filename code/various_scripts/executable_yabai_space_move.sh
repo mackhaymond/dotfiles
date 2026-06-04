@@ -83,6 +83,7 @@ case "$ACTION" in
       cur=$(yabai -m query --spaces --space 2>/dev/null | jq -r '.id // empty' 2>/dev/null)
       [ "$cur" = "$sid" ] && break
     done
+    "$SCRIPT_DIR/yabai_reorder_spaces.sh" >/dev/null 2>&1 || true
     exit 0
     ;;
   home-all)
@@ -94,6 +95,7 @@ case "$ACTION" in
     done
     yabai -m display --focus "$master" >/dev/null 2>&1 || true
     yabai -m rule --apply >/dev/null 2>&1 || true
+    "$SCRIPT_DIR/yabai_reorder_spaces.sh" >/dev/null 2>&1 || true
     exit 0
     ;;
   *)

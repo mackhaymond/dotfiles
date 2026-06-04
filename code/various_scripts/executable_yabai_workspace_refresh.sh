@@ -211,3 +211,6 @@ mkdir -p "$(dirname "$CACHE_FILE")" 2>/dev/null || true
 } >"${CACHE_FILE}.$$" && mv "${CACHE_FILE}.$$" "$CACHE_FILE"
 
 yabai -m rule --apply >/dev/null 2>&1 || true
+
+# Keep the labeled spaces in their canonical order on each display.
+"$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_reorder_spaces.sh" >/dev/null 2>&1 || true
