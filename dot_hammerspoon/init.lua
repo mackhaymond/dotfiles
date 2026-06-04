@@ -1,24 +1,40 @@
 -- Minimal Hammerspoon config (replaces the old, unused Spacehammer setup).
 --
--- Job: manage Arc browser windows. yabai handles everything else, but it cannot
--- read AXIdentifier, which is the ONLY reliable way to tell a "Little Arc" popup
--- (littleBrowserWindow-*) apart from a main browser window (bigBrowserWindow-*) --
--- they are byte-identical in every yabai field, including title. So Hammerspoon
--- reads AXIdentifier and FLOATS Little Arc / PiP popups in yabai (stopping them
--- from tiling and from being mistaken for a main window). Once the popups float,
--- yabai_arc_pin.sh pins the remaining (non-floating) main windows to main/school.
+-- Job: pin the two MAIN Arc browser windows to the `main` and `school` yabai
+-- spaces (one each, title-independent), while leaving everything else about Arc --
+-- including "Little Arc" popups -- as a normal MANAGED window (tiled, in the
+-- stack, cyclable). Little Arc is NOT floated and NOT pinned; it just lives
+-- wherever it opens.
 --
--- macOS AX only exposes windows on the CURRENT Space, but that is fine: a Little
--- Arc popup is always created on (and a window becomes visible on) the current
--- Space, so we catch each one the moment it is reachable.
+-- Why Hammerspoon at all: a Little Arc popup is byte-identical to a main window in
+-- every yabai field (subrole, floating, even title is the page title), so yabai
+-- cannot tell them apart. The ONLY reliable discriminator is AXIdentifier
+-- (bigBrowserWindow-* vs littleBrowserWindow-*), which yabai can't read but
+-- Hammerspoon can. macOS AX only exposes CURRENT-Space windows, so we read the
+-- identifier off whatever Arc windows are currently on-screen and remember which
+-- window ids are "main"; the remembered set is then pinned via yabai (which can
+-- report any window's space by id, cross-Space). Hammerspoon's own window/space
+-- EVENTS are unreliable with yabai-driven switching, so the trigger is a light
+-- periodic sync (plus the windowCreated event as a bonus for immediacy).
 
 require("hs.ipc") -- enables the `hs` command-line tool
 
 local YABAI = "/opt/homebrew/bin/yabai"
-local ARC_PIN = os.getenv("HOME") .. "/code/various_scripts/yabai_arc_pin.sh"
+local MAIN_LABEL = "main"
+local SCHOOL_LABEL = "school"
+local SYNC_INTERVAL = 2 -- seconds
+
+-- Remembered ids of Arc MAIN (bigBrowserWindow) windows. Accumulated as we see
+-- them on the current Space; pruned when they close.
+mainSet = mainSet or {}
 
 local function sh(cmd) return hs.execute(cmd .. " 2>/dev/null") or "" end
 local function yabai(args) return sh(YABAI .. " -m " .. args) end
+local function decode(s)
+  local ok, t = pcall(hs.json.decode, s)
+  if ok then return t end
+  return nil
+end
 
 -- Arc window kind from AXIdentifier: "main" | "little" | "other" | "unknown".
 local function arcKind(win)
@@ -30,70 +46,92 @@ local function arcKind(win)
   return "other"
 end
 
-local function isFloating(id)
-  local ok, t = pcall(hs.json.decode, yabai("query --windows --window " .. id))
-  if ok and t then return t["is-floating"] == true end
-  return nil
+local function labelIndex(label)
+  local t = decode(yabai("query --spaces --space " .. label))
+  return t and t.index or nil
 end
 
--- Float a Little Arc / popup in yabai and shrink it to a centered popup (yabai may
--- already have tiled it to full size). Only acts on the transition to floating, so
--- it never re-grabs a popup the user has since moved/resized.
-local function floatPopup(win)
-  local id = win:id()
-  if isFloating(id) == false then
-    yabai("window " .. id .. " --toggle float")
-    local scr = win:screen()
-    if scr then
-      local f = scr:frame()
-      local w, h = math.floor(f.w * 0.5), math.floor(f.h * 0.7)
-      win:setFrame({ x = f.x + (f.w - w) / 2, y = f.y + (f.h - h) / 2, w = w, h = h })
+-- Classify whatever Arc windows are currently AX-visible (current Space) and fold
+-- them into mainSet. Cheap; only touches what is on-screen now.
+local function classifyCurrent()
+  for _, w in ipairs(hs.window.allWindows()) do
+    local app = w:application()
+    if app and app:name() == "Arc" then
+      local kind = arcKind(w)
+      if kind == "main" then
+        mainSet[w:id()] = true
+      elseif kind == "little" or kind == "other" then
+        mainSet[w:id()] = nil -- never treat popups as main windows
+      end
     end
   end
 end
 
-local function repin() sh(ARC_PIN) end
+-- Pin the remembered main windows to main/school, one each, stably. Never moves a
+-- window already on a target; only fills an empty target from off-target/surplus
+-- windows. Fullscreen main windows are left alone (reachable via hyper+3-9, they
+-- return to their space on exit). Touches ONLY ids in mainSet, so Little Arc and
+-- every other Arc window are never moved.
+local function pinMains()
+  local mIdx, sIdx = labelIndex(MAIN_LABEL), labelIndex(SCHOOL_LABEL)
+  if not mIdx or not sIdx then return end
+  local all = decode(yabai("query --windows"))
+  if not all then return end
+  local byId = {}
+  for _, w in ipairs(all) do byId[w.id] = w end
 
-local function handle(win)
-  if not win then return end
-  local app = win:application()
-  if not app or app:name() ~= "Arc" then return end
-  local kind = arcKind(win)
-  if kind == "little" then
-    floatPopup(win)
-    repin() -- the popup is now floating -> safe to (re)pin the real windows
-  elseif kind == "main" then
-    repin()
+  local onMain, onSchool, pool = {}, {}, {}
+  for id in pairs(mainSet) do
+    local w = byId[id]
+    if not w then
+      mainSet[id] = nil -- window is gone
+    elseif not w["is-native-fullscreen"] then
+      if w.space == mIdx then onMain[#onMain + 1] = id
+      elseif w.space == sIdx then onSchool[#onSchool + 1] = id
+      else pool[#pool + 1] = id end
+    end
+  end
+  for i = 2, #onMain do pool[#pool + 1] = onMain[i] end
+  for i = 2, #onSchool do pool[#pool + 1] = onSchool[i] end
+
+  if #onMain == 0 and #pool > 0 then
+    yabai("window " .. table.remove(pool, 1) .. " --space " .. MAIN_LABEL)
+  end
+  if #onSchool == 0 and #pool > 0 then
+    yabai("window " .. table.remove(pool, 1) .. " --space " .. SCHOOL_LABEL)
   end
 end
 
-local arcWF = hs.window.filter.new({ "Arc" })
-arcWF:subscribe(hs.window.filter.windowCreated, function(win)
-  hs.timer.doAfter(0.2, function() handle(win) end) -- let yabai register it first
+function arcSync()
+  classifyCurrent()
+  pinMains()
+end
+
+-- Reliable trigger: light periodic sync.
+if arcTimer then arcTimer:stop() end
+arcTimer = hs.timer.doEvery(SYNC_INTERVAL, arcSync)
+-- Bonus immediacy when the event actually fires.
+arcWF = hs.window.filter.new({ "Arc" })
+arcWF:subscribe(hs.window.filter.windowCreated, function()
+  hs.timer.doAfter(0.3, arcSync)
 end)
-arcWF:subscribe(hs.window.filter.windowVisible, function(win)
-  hs.timer.doAfter(0.2, function() handle(win) end) -- catch windows as Spaces are visited
+arcWF:subscribe(hs.window.filter.windowDestroyed, function(win)
+  if win then mainSet[win:id()] = nil end
 end)
 
--- Initial pass shortly after load.
-hs.timer.doAfter(1.0, function()
-  for _, w in ipairs(hs.window.allWindows()) do
-    local app = w:application()
-    if app and app:name() == "Arc" then handle(w) end
-  end
-end)
-
--- Debug helper: `hs -c "print(arcDiag())"`.
+-- Debug helpers.
+function pinNow() pinMains() end
 function arcDiag()
-  local out = {}
+  local set = {}
+  for id in pairs(mainSet) do set[#set + 1] = tostring(id) end
+  local out = { "mainSet: " .. table.concat(set, ",") }
   for _, w in ipairs(hs.window.allWindows()) do
     local app = w:application()
     if app and app:name() == "Arc" then
-      out[#out + 1] = string.format("hsid=%s kind=%s floating=%s title=[%s]",
-        tostring(w:id()), arcKind(w), tostring(isFloating(w:id())), tostring(w:title()))
+      out[#out + 1] = string.format("hsid=%s kind=%s title=[%s]", tostring(w:id()), arcKind(w), tostring(w:title()))
     end
   end
   return table.concat(out, "\n")
 end
 
-hs.alert.show("Hammerspoon: Arc manager loaded")
+hs.alert.show("Hammerspoon: Arc pin loaded")
