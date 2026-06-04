@@ -1,5 +1,4 @@
 local wezterm = require 'wezterm'
-local mux = wezterm.mux
 
 local config = {}
 
@@ -7,14 +6,13 @@ if wezterm.config_builder then
     config = wezterm.config_builder()
 end
 
-wezterm.on('gui-startup', function(cmd)
-    -- Start WezTerm in macOS NATIVE fullscreen by default, on whatever display it
-    -- opens on. yabai then labels the resulting fullscreen Space "terminal" (via
-    -- yabai_terminal_follow.sh) and reorders it to position 1, so it stays first
-    -- regardless of display. Requires native_macos_fullscreen_mode = true (below).
-    local _, _, window = mux.spawn_window(cmd or {})
-    window:gui_window():toggle_fullscreen()
-end)
+-- WezTerm starts as a NORMAL window (not fullscreen). yabai's `space=terminal`
+-- rule + the window_created hook place it on the "terminal" space, which
+-- yabai_reorder_spaces.sh keeps at canonical index 1, where it tiles as the
+-- single stack window. You can still manually fullscreen it (hyper+fn+m); the
+-- space_changed hook (yabai_terminal_follow.sh) then keeps the "terminal" label
+-- pinned to WezTerm wherever the resulting fullscreen Space lands. We no longer
+-- auto-fullscreen on startup (previously a gui-startup toggle_fullscreen here).
 
 config.color_scheme = "catppuccin-mocha"
 
@@ -40,12 +38,13 @@ config.window_padding = {
 
 config.default_prog = { "{{ .homebrew_prefix }}/bin/tmux", "new-session", "-A", "-s", "main" }
 
--- Use macOS NATIVE fullscreen so a fullscreened WezTerm becomes a real
--- fullscreen Space. yabai can label/reorder/focus that Space, and a space_changed
--- hook (yabai_terminal_follow.sh) keeps the "terminal" label pinned to WezTerm
--- wherever it roams -- so hyper+` still reaches it and it stays in canonical
--- order. With this false, the window drops the macOS fullscreen capability
--- entirely and yabai cannot fullscreen it.
+-- Keep macOS NATIVE fullscreen available for the MANUAL case (hyper+fn+m): a
+-- fullscreened WezTerm becomes a real fullscreen Space that yabai can
+-- label/reorder/focus, and the space_changed hook (yabai_terminal_follow.sh)
+-- keeps the "terminal" label pinned to it wherever it roams -- so hyper+` still
+-- reaches it and it stays in canonical order. WezTerm no longer fullscreens on
+-- startup (see above), but this stays true so the manual toggle still works;
+-- with it false the window would lose the macOS fullscreen capability entirely.
 config.native_macos_fullscreen_mode = true
 config.macos_fullscreen_extend_behind_notch = true
 
