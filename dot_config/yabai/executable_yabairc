@@ -83,7 +83,20 @@ yabai -m signal --add event=window_created action='
   dest=$(yabai -m query --spaces --display "$tdsp" 2>/dev/null \
     | jq -r --argjson ti "$tidx" "map(select(.index != \$ti and .label != \"\")) | .[0].index // empty" 2>/dev/null)
   [ -n "$dest" ] || exit 0
-  yabai -m window "$win" --space "$dest" 2>/dev/null && yabai -m space --focus "$dest" 2>/dev/null
+  # Evict the intruder to the nearest labeled non-terminal space (main on the
+  # laptop), then follow focus. A floating "Little Arc"-style link popup (subrole
+  # AXSystemDialog) that macOS presents OVER the active space -- the FULLSCREEN
+  # terminal -- re-anchors to that active space the instant it appears, so a
+  # single --space move loses the race and the popup is stranded on the terminal.
+  # Retry until the move sticks (the dialog becomes movable a few hundred ms after
+  # it is presented; ~4s cap). A normal window moves on the first pass and breaks.
+  for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    yabai -m window "$win" --space "$dest" 2>/dev/null
+    sleep 0.25
+    cur=$(yabai -m query --windows --window "$win" 2>/dev/null | jq -r ".space // empty" 2>/dev/null)
+    [ -n "$cur" ] && [ "$cur" != "$tidx" ] && break
+  done
+  yabai -m space --focus "$dest" 2>/dev/null
   exit 0
 '
 
