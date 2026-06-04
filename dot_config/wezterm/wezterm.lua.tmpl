@@ -8,11 +8,12 @@ if wezterm.config_builder then
 end
 
 wezterm.on('gui-startup', function(cmd)
-    -- yabai manages WezTerm and sizes it to fill whatever display its space is
-    -- on, so we no longer force WezTerm's own non-native fullscreen (which locks
-    -- the window size and won't refit when moved across displays). The clean
-    -- edge-to-edge look is preserved by the system menu-bar auto-hide instead.
-    mux.spawn_window(cmd or {})
+    -- Start WezTerm in macOS NATIVE fullscreen by default, on whatever display it
+    -- opens on. yabai then labels the resulting fullscreen Space "terminal" (via
+    -- yabai_terminal_follow.sh) and reorders it to position 1, so it stays first
+    -- regardless of display. Requires native_macos_fullscreen_mode = true (below).
+    local _, _, window = mux.spawn_window(cmd or {})
+    window:gui_window():toggle_fullscreen()
 end)
 
 config.color_scheme = "catppuccin-mocha"

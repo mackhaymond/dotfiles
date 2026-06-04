@@ -56,9 +56,13 @@ yabai -m signal --add event=window_created action='
   app=$(printf "%s" "$info" | jq -r .app)
   case "$app" in
     wezterm-gui|WezTerm)
-      # Ensure wezterm lands on its terminal space. The "space=terminal" rule is
-      # racy at launch (the window often appears on the focused space first), so
-      # place it explicitly here on window creation.
+      # WezTerm defaults to native fullscreen, which lives in its own Space and is
+      # tracked by the terminal label (yabai_terminal_follow.sh). NEVER drag a
+      # fullscreen WezTerm onto a fixed space -- that would yank it out of
+      # fullscreen. Only nudge a NORMAL WezTerm onto the terminal space (the
+      # space=terminal rule is racy at launch).
+      nsfs=$(printf "%s" "$info" | jq -r '.["is-native-fullscreen"]' 2>/dev/null)
+      [ "$nsfs" = "true" ] && exit 0
       wspace=$(printf "%s" "$info" | jq -r .space)
       wtidx=$(yabai -m query --spaces --space terminal 2>/dev/null | jq -r .index 2>/dev/null)
       case "$wtidx" in ""|*[!0-9]*) exit 0 ;; esac
