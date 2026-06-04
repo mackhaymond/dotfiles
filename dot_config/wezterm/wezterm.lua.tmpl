@@ -7,12 +7,30 @@ if wezterm.config_builder then
     config = wezterm.config_builder()
 end
 
+local square_corners_applied = {}
+
 wezterm.on('gui-startup', function(cmd)
     -- yabai manages WezTerm and sizes it to fill whatever display its space is
     -- on, so we no longer force WezTerm's own non-native fullscreen (which locks
     -- the window size and won't refit when moved across displays). The clean
     -- edge-to-edge look is preserved by the system menu-bar auto-hide instead.
     mux.spawn_window(cmd or {})
+end)
+
+wezterm.on('window-resized', function(window)
+    local id = window:window_id()
+    if square_corners_applied[id] then
+        return
+    end
+
+    square_corners_applied[id] = true
+
+    local overrides = window:get_config_overrides() or {}
+    local decorations = "RESIZE|MACOS_FORCE_SQUARE_CORNERS"
+    if overrides.window_decorations ~= decorations then
+        overrides.window_decorations = decorations
+        window:set_config_overrides(overrides)
+    end
 end)
 
 config.color_scheme = "catppuccin-mocha"
@@ -22,8 +40,8 @@ config.enable_kitty_graphics = true
 -- RESIZE (no TITLE) keeps the borderless look but reports the window as
 -- resizable to the OS, so yabai can size WezTerm to fill whatever display its
 -- space is on. "NONE" makes the window non-resizable and yabai can't manage it.
--- (MACOS_FORCE_SQUARE_CORNERS was tried for square corners but it makes the
--- window resist yabai's resizing, so it's left off.)
+-- MACOS_FORCE_SQUARE_CORNERS is applied after the first resize event above;
+-- applying it at startup can make WebGPU initialize with the wrong scale.
 config.window_decorations = "RESIZE"
 
 config.font = wezterm.font_with_fallback({
