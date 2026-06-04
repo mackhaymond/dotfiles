@@ -7,52 +7,12 @@ if wezterm.config_builder then
     config = wezterm.config_builder()
 end
 
-local square_corners_applied = {}
-local refocus_after_square_corners = {}
-
-local function focus_window(window, pane)
-    if pane then
-        pane:activate()
-    end
-    window:focus()
-end
-
 wezterm.on('gui-startup', function(cmd)
     -- yabai manages WezTerm and sizes it to fill whatever display its space is
     -- on, so we no longer force WezTerm's own non-native fullscreen (which locks
     -- the window size and won't refit when moved across displays). The clean
     -- edge-to-edge look is preserved by the system menu-bar auto-hide instead.
-    local _, _, window = mux.spawn_window(cmd or {})
-    window:gui_window():focus()
-end)
-
-wezterm.on('window-resized', function(window)
-    local id = window:window_id()
-    if square_corners_applied[id] then
-        return
-    end
-
-    square_corners_applied[id] = true
-
-    local overrides = window:get_config_overrides() or {}
-    local decorations = "RESIZE|MACOS_FORCE_SQUARE_CORNERS"
-    if overrides.window_decorations ~= decorations then
-        refocus_after_square_corners[id] = true
-        overrides.window_decorations = decorations
-        window:set_config_overrides(overrides)
-    end
-end)
-
-wezterm.on('window-config-reloaded', function(window, pane)
-    local id = window:window_id()
-    if not refocus_after_square_corners[id] then
-        return
-    end
-
-    refocus_after_square_corners[id] = nil
-    wezterm.time.call_after(0.05, function()
-        focus_window(window, pane)
-    end)
+    mux.spawn_window(cmd or {})
 end)
 
 config.color_scheme = "catppuccin-mocha"
@@ -62,9 +22,9 @@ config.enable_kitty_graphics = true
 -- RESIZE (no TITLE) keeps the borderless look but reports the window as
 -- resizable to the OS, so yabai can size WezTerm to fill whatever display its
 -- space is on. "NONE" makes the window non-resizable and yabai can't manage it.
--- MACOS_FORCE_SQUARE_CORNERS is applied after the first resize event above;
--- applying it at startup can make WebGPU initialize with the wrong scale.
-config.window_decorations = "RESIZE"
+-- Square corners need OpenGL below; WebGPU currently initializes with the
+-- wrong scale when MACOS_FORCE_SQUARE_CORNERS is present at startup.
+config.window_decorations = "RESIZE|MACOS_FORCE_SQUARE_CORNERS"
 
 config.font = wezterm.font_with_fallback({
     "JetBrains Mono",
@@ -89,7 +49,7 @@ config.window_close_confirmation = 'NeverPrompt'
 config.scrollback_lines = 0
 
 -- ── Performance ────────────────────────────────────────────────────────
-config.front_end = "WebGpu"           -- explicit (default since 2024)
+config.front_end = "OpenGL"           -- avoids WebGPU square-corner scaling bug
 config.max_fps = 120                  -- match ProMotion display refresh
 config.animation_fps = 1              -- minimize animation CPU
 config.cursor_blink_rate = 0          -- disable blink entirely
