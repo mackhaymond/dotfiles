@@ -40,16 +40,10 @@ yabai -m rule --add app="^TI-Nspire$" manage=off
 yabai -m rule --add app="^LiveMath Maker$" manage=off
 yabai -m rule --add app="^Antidote$" manage=off
 
-# Keep wezterm's space (label "terminal") reserved for wezterm. Any non-wezterm
-# window that lands on it gets relocated to the nearest LABELED non-terminal
-# space ON THE SAME DISPLAY, with focus following.
-#
-# Anchored on a LIVE LABEL QUERY, not a fixed index: the terminal space may roam
-# to the external display (hyper+\), where its mission-control index renumbers.
-# Undocked this resolves to index 1 -> bounce to index 2 ("main"), identical to
-# the old behavior. The bounce target excludes UNLABELED spaces so a roamed stray
-# never lands on an external scratch space that macOS destroys on disconnect; if
-# terminal is the only labeled space on its display, the stray is left in place.
+# window_created hook. The "terminal" space is NOT reserved -- other windows may
+# land on it and stay (no bounce). This hook only: (1) re-pins the Arc MAIN
+# windows via Hammerspoon on any new Arc window, and (2) nudges a NORMAL WezTerm
+# onto the terminal space, since the space=terminal rule is racy at launch.
 yabai -m signal --add event=window_created action='
   win=$YABAI_WINDOW_ID
   info=$(yabai -m query --windows --window "$win" 2>/dev/null) || exit 0
@@ -60,11 +54,11 @@ yabai -m signal --add event=window_created action='
   [ "$app" = "Arc" ] && /opt/homebrew/bin/hs -c "arcSync()" >/dev/null 2>&1
   case "$app" in
     wezterm-gui|WezTerm)
-      # WezTerm defaults to native fullscreen, which lives in its own Space and is
-      # tracked by the terminal label (yabai_terminal_follow.sh). NEVER drag a
-      # fullscreen WezTerm onto a fixed space -- that would yank it out of
-      # fullscreen. Only nudge a NORMAL WezTerm onto the terminal space (the
-      # space=terminal rule is racy at launch).
+      # WezTerm starts as a normal window, but can be MANUALLY fullscreened
+      # (hyper+fn+m), which carries it into its own Space tracked by the terminal
+      # label (yabai_terminal_follow.sh). NEVER drag a fullscreen WezTerm onto a
+      # fixed space -- that would yank it out of fullscreen. Only nudge a NORMAL
+      # WezTerm onto the terminal space (the space=terminal rule is racy at launch).
       nsfs=$(printf "%s" "$info" | jq -r '.["is-native-fullscreen"]' 2>/dev/null)
       [ "$nsfs" = "true" ] && exit 0
       wspace=$(printf "%s" "$info" | jq -r .space)
@@ -74,29 +68,8 @@ yabai -m signal --add event=window_created action='
       exit 0
       ;;
   esac
-  space=$(printf "%s" "$info" | jq -r .space)
-  tinfo=$(yabai -m query --spaces --space terminal 2>/dev/null) || exit 0
-  tidx=$(printf "%s" "$tinfo" | jq -r .index 2>/dev/null)
-  tdsp=$(printf "%s" "$tinfo" | jq -r .display 2>/dev/null)
-  case "$tidx" in ""|*[!0-9]*) exit 0 ;; esac
-  [ "$space" = "$tidx" ] || exit 0
-  dest=$(yabai -m query --spaces --display "$tdsp" 2>/dev/null \
-    | jq -r --argjson ti "$tidx" "map(select(.index != \$ti and .label != \"\")) | .[0].index // empty" 2>/dev/null)
-  [ -n "$dest" ] || exit 0
-  # Evict the intruder to the nearest labeled non-terminal space (main on the
-  # laptop), then follow focus. A floating "Little Arc"-style link popup (subrole
-  # AXSystemDialog) that macOS presents OVER the active space -- the FULLSCREEN
-  # terminal -- re-anchors to that active space the instant it appears, so a
-  # single --space move loses the race and the popup is stranded on the terminal.
-  # Retry until the move sticks (the dialog becomes movable a few hundred ms after
-  # it is presented; ~4s cap). A normal window moves on the first pass and breaks.
-  for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
-    yabai -m window "$win" --space "$dest" 2>/dev/null
-    sleep 0.25
-    cur=$(yabai -m query --windows --window "$win" 2>/dev/null | jq -r ".space // empty" 2>/dev/null)
-    [ -n "$cur" ] && [ "$cur" != "$tidx" ] && break
-  done
-  yabai -m space --focus "$dest" 2>/dev/null
+  # Any other app: leave it wherever it landed. The terminal space is no longer
+  # reserved, so windows may share it with WezTerm.
   exit 0
 '
 

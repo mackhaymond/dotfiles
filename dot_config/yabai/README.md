@@ -106,7 +106,7 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 **2. `window_created`**
 - **WezTerm:** if a *normal* WezTerm lands on the wrong space, move it to terminal. A *fullscreen* WezTerm is left alone (guarded by `is-native-fullscreen`) so it isn't yanked out of fullscreen.
 - **Arc:** call `hs -c "arcSync()"` (Hammerspoon re-pins the Arc main windows; Little Arc untouched).
-- **Other non-WezTerm on terminal:** bounce to the nearest labeled non-terminal space on the same display, keeping terminal pure.
+- **Other apps:** left wherever they land. The terminal space is **not** reserved — any window may share it with WezTerm (the old non-WezTerm "bounce" was removed).
 
 **3. `space_changed`** → `yabai_terminal_follow.sh` then re-activate WezTerm. The follow hook keeps the `terminal` label pinned to WezTerm wherever it roams (including in/out of a native-fullscreen Space), reorders, and sweeps surplus empty husk spaces. Cheap no-op when WezTerm hasn't moved.
 
@@ -271,11 +271,12 @@ WezTerm is the primary terminal, pinned to the `terminal` space and fully manage
 
 #### Window Integration with Yabai
 
-**Critical setting: `window_decorations = "RESIZE"`**
+**Critical setting: `window_decorations = "RESIZE|MACOS_FORCE_SQUARE_CORNERS"`**
 
 - Maintains borderless, edge-to-edge aesthetics.
 - Reports window as resizable to macOS, allowing yabai to apply any dimensions.
 - Avoids native fullscreen locking that would prevent adaptive cross-display resizing.
+- `MACOS_FORCE_SQUARE_CORNERS` removes macOS's rounded window corners. It **requires the OpenGL `front_end`** (below): under WebGPU the window initializes at the wrong scale when this flag is present at startup.
 
 #### Startup & Tmux
 
@@ -297,7 +298,7 @@ Every new WezTerm window attaches or creates a tmux session named `main`.
 
 #### Performance
 
-- `front_end = "WebGpu"` — GPU-accelerated rendering.
+- `front_end = "OpenGL"` — GPU backend. Chosen over WebGpu because `MACOS_FORCE_SQUARE_CORNERS` (square corners) triggers a WebGPU square-corner scaling bug; OpenGL renders them correctly.
 - `max_fps = 120` — matches ProMotion external display.
 - `animation_fps = 1`, `cursor_blink_rate = 0`, `use_ime = false` — minimal overhead.
 
@@ -441,18 +442,14 @@ Labels persist through all these events, making the entire system stable and pre
 
 > **⚠️ Gotcha if you edit `yabai_screen_flash.js`:** build the border `CGColor` with `$.CGColorCreateGenericRGB(r,g,b,a)` directly. Converting a *dynamically created* `NSColor` to `.CGColor` through the JXA bridge **SIGKILLs (137)** the process. Don't "simplify" it back to `NSColor…CGColor`. (Also: a GUI overlay from `osascript` only persists in the Aqua session, so it can only be tested live, not from a headless/Background launchd context.)
 
-#### Terminal Space Purity
+#### Terminal Space (not reserved)
 
-Terminal space is reserved for WezTerm only. Yabai enforces this via a `window_created` signal:
+The terminal space is WezTerm's home, but it is **not** reserved — other windows may land on it and stay. The `window_created` signal only:
 
-1. When a new window appears:
-   - If it's a WezTerm window, ensure it lands on the terminal space (compensate for racy rule application).
-   - If it's non-WezTerm **and** it landed on the terminal space, bounce it to the nearest labeled non-terminal space on the same display.
-2. Bounce target: first labeled space (excluding terminal) on the same display.
-3. If no labeled space exists (terminal is alone), leave the intruder in place.
-4. Focus follows the window to the destination space.
+1. Ensures a *new normal* WezTerm window lands on the terminal space (compensates for the racy `space=terminal` rule; a manually-fullscreened WezTerm is left alone).
+2. Re-pins the Arc main windows via Hammerspoon on any new Arc window.
 
-**Why?** Terminal is a special single-window-focused workspace. The bounce ensures CLI stays uncluttered while preventing accidental window loss on the external display (where the first space is scratch and destroyed on disconnect).
+It does **not** bounce other apps off the terminal space. (Earlier this enforced "purity" by relocating any non-WezTerm window to `main`; that bounce was removed — windows are free to share the terminal space with WezTerm.)
 
 #### Canonical Space Ordering
 
@@ -794,7 +791,7 @@ git push origin main
 - **Label-based stability:** Spaces are identified by labels, not indices, surviving Mission Control renumbering and display hotplug.
 - **Non-destructive dock:** External monitor comes up empty; user manually pushes workspaces.
 - **Pull-home on undock:** Automatic safety net prevents orphaned windows on non-existent displays.
-- **Terminal purity:** Terminal space is WezTerm-only; intruders are bounced to the next labeled space.
+- **Terminal space (not reserved):** WezTerm's home space, but other windows may land on it and stay — the old non-WezTerm bounce was removed. WezTerm itself is still nudged onto it on launch.
 - **Pinned apps:** Certain apps (Todoist, Granola, Spark Mail, etc.) are sticky and cannot be moved off their home spaces.
 - **Stack layout:** Only one window visible at a time; navigate with hyper+z/x to cycle through stacked layers.
 - **Mouse follow:** Cursor automatically warps to newly focused display (reduced need for manual positioning).
