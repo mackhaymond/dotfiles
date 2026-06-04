@@ -55,7 +55,16 @@ yabai -m signal --add event=window_created action='
   info=$(yabai -m query --windows --window "$win" 2>/dev/null) || exit 0
   app=$(printf "%s" "$info" | jq -r .app)
   case "$app" in
-    wezterm-gui|WezTerm) exit 0 ;;
+    wezterm-gui|WezTerm)
+      # Ensure wezterm lands on its terminal space. The "space=terminal" rule is
+      # racy at launch (the window often appears on the focused space first), so
+      # place it explicitly here on window creation.
+      wspace=$(printf "%s" "$info" | jq -r .space)
+      wtidx=$(yabai -m query --spaces --space terminal 2>/dev/null | jq -r .index 2>/dev/null)
+      case "$wtidx" in ""|*[!0-9]*) exit 0 ;; esac
+      [ "$wspace" != "$wtidx" ] && yabai -m window "$win" --space terminal 2>/dev/null
+      exit 0
+      ;;
   esac
   space=$(printf "%s" "$info" | jq -r .space)
   tinfo=$(yabai -m query --spaces --space terminal 2>/dev/null) || exit 0
