@@ -18,16 +18,18 @@ hyper - d: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus 
 hyper - f: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus chatgpt
 f18 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus codex # caps_lock+escape -> F18
 
-hyper + fn - 0x32: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master terminal
-hyper + fn - 1: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master main
-hyper + fn - 2: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master school
-hyper + fn - tab: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master todo
-hyper + fn - q: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master schedule
-hyper + fn - w: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master mail
-hyper + fn - e: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master calendar
-hyper + fn - d: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master messages
-hyper + fn - f: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master chatgpt
-f19 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master codex # fn+caps_lock+escape -> F19
+# hyper+fn+<space>: send the focused window to that space, unless it's a pinned
+# app already on its home space (those stay put). Focus stays where you are.
+hyper + fn - 0x32: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh terminal
+hyper + fn - 1: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh main
+hyper + fn - 2: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh school
+hyper + fn - tab: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh todo
+hyper + fn - q: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh schedule
+hyper + fn - w: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh mail
+hyper + fn - e: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh calendar
+hyper + fn - d: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh messages
+hyper + fn - f: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh chatgpt
+f19 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh codex # fn+caps_lock+escape -> F19
 
 f13 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_display.sh master
 f14 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_display.sh external
