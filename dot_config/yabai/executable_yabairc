@@ -79,20 +79,14 @@ yabai -m signal --add event=window_created action='
   exit 0
 '
 
-# Auto-hide the macOS menu bar on the terminal (WezTerm) space only, and show it
-# again on every other space. macOS only exposes a GLOBAL auto-hide toggle, so we
-# flip it on each space change to fake per-space behavior. Entering terminal also
-# re-activates WezTerm so it raises cleanly. Anchored on the terminal label'\''s
-# LIVE index, so it still works when terminal roams to the external display.
+# Re-activate wezterm on entering its space so it re-asserts its non-native
+# fullscreen presentation options (hides the menu bar again after an intruder
+# briefly trampled them). Anchored on the terminal label'\''s LIVE index, so it
+# follows wezterm onto the external display. Undocked this is index 1, as before.
 yabai -m signal --add event=space_changed action='
   tidx=$(yabai -m query --spaces --space terminal 2>/dev/null | jq -r .index 2>/dev/null)
-  case "$tidx" in ""|null|*[!0-9]*) exit 0 ;; esac
-  if [ "$YABAI_SPACE_INDEX" = "$tidx" ]; then
-    osascript -e "tell application \"System Events\" to tell dock preferences to set autohide menu bar to true" >/dev/null 2>&1
-    osascript -e "tell application \"WezTerm\" to activate" >/dev/null 2>&1
-  else
-    osascript -e "tell application \"System Events\" to tell dock preferences to set autohide menu bar to false" >/dev/null 2>&1
-  fi
+  [ -n "$tidx" ] && [ "$tidx" != "null" ] && [ "$YABAI_SPACE_INDEX" = "$tidx" ] \
+    && osascript -e "tell application \"WezTerm\" to activate"
   exit 0
 '
 
@@ -127,11 +121,3 @@ yabai -m signal --add event=display_changed label=mouse_follow_display action="$
 # (non-master) display — a glance-cue that focus jumped to the big screen.
 # Never fires with one display; the helper also skips when focus is on the laptop.
 yabai -m signal --add event=display_changed label=flash_external_display action="$YABAI_SCREEN_FLASH"
-
-# Sync the menu-bar auto-hide to whatever space is focused on (re)start, since
-# space_changed has not fired yet: hidden on terminal, visible everywhere else.
-if [ "$(yabai -m query --spaces --space 2>/dev/null | jq -r .label 2>/dev/null)" = "terminal" ]; then
-  osascript -e "tell application \"System Events\" to tell dock preferences to set autohide menu bar to true" >/dev/null 2>&1
-else
-  osascript -e "tell application \"System Events\" to tell dock preferences to set autohide menu bar to false" >/dev/null 2>&1
-fi
