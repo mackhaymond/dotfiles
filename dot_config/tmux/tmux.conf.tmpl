@@ -96,7 +96,9 @@ run-shell -b "bash #{HOME}/.config/tmux/scripts/codexbar-usage-status.sh --tick"
 run-shell -b "bash #{HOME}/.config/tmux/scripts/coffee-watcher.sh"
 
 # set -g @catppuccin_status_modules_right "application session battery date_time"
-set -g @catppuccin_status_modules_right "directory codex_session codex_weekly session coffee battery"
+# Coffee (caffeinate) and battery modules disabled.
+# set -g @catppuccin_status_modules_right "directory codex_session codex_weekly session coffee battery"
+set -g @catppuccin_status_modules_right "directory codex_session codex_weekly session"
 set -g @catppuccin_date_time_text "%I:%M %p | %m-%d-%y"
 set -g @catppuccin_status_left_separator "█"
 
