@@ -753,6 +753,10 @@ git push origin main
 | `f14` | Hyper+F2 | Focus external display | Karabiner-mapped |
 | `hyper - 0x2A` | Backslash | Push focused space to other display | Moves all windows; follows |
 | `hyper - 0` | 0 | Pull all workspaces home to laptop | Safety net for undock |
+| **Native-Fullscreen App Access** |
+| `hyper - 3` | 3 | Focus 1st native-fullscreen app | `yabai_fullscreen_focus.sh 1` |
+| `hyper - 4` | 4 | Focus 2nd native-fullscreen app | ordinal 2 |
+| `hyper - 5` … `hyper - 9` | 5–9 | Focus 3rd … 7th native-fullscreen app | ordinals 3–7; no-op if absent |
 
 ## Notes & Key Design Decisions
 
@@ -765,4 +769,12 @@ git push origin main
 - **Stack layout:** Only one window visible at a time; navigate with hyper+z/x to cycle through stacked layers.
 - **Mouse follow:** Cursor automatically warps to newly focused display (reduced need for manual positioning).
 - **Screen flash:** Visual orange border confirms focus jumped to external display.
+- **Native-fullscreen access:** Apps put into macOS native fullscreen (only ever non-pinned apps or the browser) live in their own Spaces *outside* the labeled model, so the `hyper+<label>` keys can't reach them. `hyper+3`…`hyper+9` focus the 1st…7th fullscreen app in mission-control order (display, then index) via `yabai_fullscreen_focus.sh`. Mapping is dynamic by position, not pinned per-app. Such Spaces can be *moved* between displays and *reached*, but **cannot** be reordered into canonical position (macOS appends them last).
 - **Chezmoi for everything:** All configs are templated sources in chezmoi; never edit deployed files directly. Always edit source, preview, apply, reload, commit.
+
+## ⚠️ Still Needs Testing (Unverified)
+
+These behaviors are believed correct from the code/logic but have **not** been verified live. Test them next time the external display is connected and update this section.
+
+- **Cross-display native-fullscreen focus** (`hyper+3`…`hyper+9` when the target app is fullscreen on the *external* display). Verified live only on the single built-in display so far. The script (`yabai_fullscreen_focus.sh`) is display-agnostic — it sorts fullscreen Spaces by `(display, index)` and calls `yabai -m space --focus <index>`, which should switch to the external and fire mouse-follow — but the cross-display path is untested. **How to test:** with the external connected, put an app (e.g. Preview, the browser) into native fullscreen, push it to the external (`hyper+\`), return focus to the laptop, then press the matching `hyper+<3..9>` key and confirm it jumps to that fullscreen app on the external. If it does not land, add an explicit display-focus step before/after the `space --focus`.
+  - *Context:* this scenario (fullscreen app pushed to external, then unreachable without manually mousing over) is exactly what these keys were added to fix.
