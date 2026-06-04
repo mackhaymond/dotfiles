@@ -8,13 +8,15 @@ if wezterm.config_builder then
 end
 
 local square_corners_applied = {}
+local refocus_after_square_corners = {}
 
 wezterm.on('gui-startup', function(cmd)
     -- yabai manages WezTerm and sizes it to fill whatever display its space is
     -- on, so we no longer force WezTerm's own non-native fullscreen (which locks
     -- the window size and won't refit when moved across displays). The clean
     -- edge-to-edge look is preserved by the system menu-bar auto-hide instead.
-    mux.spawn_window(cmd or {})
+    local _, _, window = mux.spawn_window(cmd or {})
+    window:gui_window():focus()
 end)
 
 wezterm.on('window-resized', function(window)
@@ -28,9 +30,20 @@ wezterm.on('window-resized', function(window)
     local overrides = window:get_config_overrides() or {}
     local decorations = "RESIZE|MACOS_FORCE_SQUARE_CORNERS"
     if overrides.window_decorations ~= decorations then
+        refocus_after_square_corners[id] = true
         overrides.window_decorations = decorations
         window:set_config_overrides(overrides)
     end
+end)
+
+wezterm.on('window-config-reloaded', function(window)
+    local id = window:window_id()
+    if not refocus_after_square_corners[id] then
+        return
+    end
+
+    refocus_after_square_corners[id] = nil
+    window:focus()
 end)
 
 config.color_scheme = "catppuccin-mocha"
