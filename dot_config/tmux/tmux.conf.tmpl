@@ -50,7 +50,8 @@ set -g @plugin 'tmux-plugins/tmux-yank'
 
 # catppuccin
 set -g @plugin 'catppuccin/tmux#v0.2.0'
-set -g @plugin 'tmux-plugins/tmux-battery'
+# battery module disabled; plugin not needed.
+# set -g @plugin 'tmux-plugins/tmux-battery'
 set -g @catppuccin_flavor 'mocha'
 
 # Catppuccin expects an absolute custom module dir; expand #{HOME} at runtime.
@@ -61,15 +62,16 @@ set -g @codex_session_color "colour239"
 set -g @codex_weekly_color "colour239"
 set -g @codexbar_view "percent"
 
-# Coffee/caffeination indicator defaults. coffee-watcher.sh (spawned below)
-# overwrites these whenever caffeination state changes and forces an immediate
-# status redraw via refresh-client -S. Initial values are the "off" state so
-# the chip renders cleanly before the watcher's first tick. The empty-pot
-# glyph is U+F181B nf-md-coffee_maker_outline (Nerd Font v3, MesloLGS NF);
-# overlay0 #6c7086 is a legible neutral gray (surface1 #45475a sat too close
-# to the status bar's surface0 bg and the chip disappeared).
-set -g @coffee_glyph "󱠛"
-set -g @coffee_color "#209fb5"
+# Coffee (caffeinate) indicator disabled — module dropped from the status bar
+# and the watcher (below) no longer spawned. Defaults left commented for revive.
+# coffee-watcher.sh overwrites these whenever caffeination state changes and
+# forces an immediate status redraw via refresh-client -S. Initial values are
+# the "off" state so the chip renders cleanly before the watcher's first tick.
+# The empty-pot glyph is U+F181B nf-md-coffee_maker_outline (Nerd Font v3,
+# MesloLGS NF); overlay0 #6c7086 is a legible neutral gray (surface1 #45475a sat
+# too close to the status bar's surface0 bg and the chip disappeared).
+# set -g @coffee_glyph "󱠛"
+# set -g @coffee_color "#209fb5"
 
 # Codexbar defaults ("plugin-like" surface); setup script reads these.
 # @codexbar_provider: "codex" delegates to the codexbar CLI tool against the
@@ -90,10 +92,11 @@ unbind u
 run-shell "bash #{HOME}/.config/tmux/scripts/codexbar-usage-setup.sh"
 run-shell -b "bash #{HOME}/.config/tmux/scripts/codexbar-usage-status.sh --tick"
 
-# Spawn the coffee watcher (singleton; no-op if already running). Polls
+# Coffee watcher disabled (caffeinate chip removed). Re-enable alongside the
+# coffee module and @coffee_* defaults above. Spawned as a singleton; polls
 # caffeination state at 500ms and pushes changes to tmux via refresh-client,
 # so the chip flips near-instantly when Raycast Coffee toggles.
-run-shell -b "bash #{HOME}/.config/tmux/scripts/coffee-watcher.sh"
+# run-shell -b "bash #{HOME}/.config/tmux/scripts/coffee-watcher.sh"
 
 # set -g @catppuccin_status_modules_right "application session battery date_time"
 # Coffee (caffeinate) and battery modules disabled.
