@@ -53,18 +53,32 @@ local function labelIndex(label)
   return t and t.index or nil
 end
 
+-- Arc's AX windows (current Space only) read straight off the application's AX
+-- element. This is FAST (~ms) -- unlike hs.window.allWindows(), which enumerates
+-- EVERY app's windows via AX and takes ~2s on this machine.
+local function arcAxWindows()
+  local arc = hs.application.find("Arc")
+  if not arc then return {} end
+  local appEl = hs.axuielement.applicationElement(arc)
+  return (appEl and appEl:attributeValue("AXWindows")) or {}
+end
+
+local function idFromAx(axid)
+  if type(axid) ~= "string" then return nil end
+  if axid:sub(1, 16) == "bigBrowserWindow" then return "main" end
+  if axid:sub(1, 19) == "littleBrowserWindow" then return "little" end
+  return "other"
+end
+
 -- Classify whatever Arc windows are currently AX-visible (current Space) and fold
 -- them into mainSet. Cheap; only touches what is on-screen now.
 local function classifyCurrent()
-  for _, w in ipairs(hs.window.allWindows()) do
-    local app = w:application()
-    if app and app:name() == "Arc" then
-      local kind = arcKind(w)
-      if kind == "main" then
-        mainSet[w:id()] = true
-      elseif kind == "little" or kind == "other" then
-        mainSet[w:id()] = nil -- never treat popups as main windows
-      end
+  for _, axw in ipairs(arcAxWindows()) do
+    local kind = idFromAx(axw:attributeValue("AXIdentifier"))
+    local hw = axw.asHSWindow and axw:asHSWindow()
+    if hw then
+      if kind == "main" then mainSet[hw:id()] = true
+      elseif kind == "little" or kind == "other" then mainSet[hw:id()] = nil end
     end
   end
 end
@@ -113,6 +127,17 @@ end
 -- now and pin. All ongoing re-pinning is driven by yabai signals calling
 -- `hs -c "arcSync()"` (see yabairc: application_launched + Arc window_created).
 hs.timer.doAfter(1.0, arcSync)
+
+-- Kind of the currently FOCUSED window ("main" | "little" | "other" | "none" |
+-- "notarc"). Used by yabai_send_window.sh to protect a main Arc window from being
+-- force-moved off its home space. Fast: only inspects the one focused window.
+function arcFocusedKind()
+  local w = hs.window.focusedWindow()
+  if not w then return "none" end
+  local app = w:application()
+  if not app or app:name() ~= "Arc" then return "notarc" end
+  return arcKind(w)
+end
 
 -- Debug helpers.
 function pinNow() pinMains() end
