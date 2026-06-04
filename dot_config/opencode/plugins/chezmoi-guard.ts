@@ -627,8 +627,13 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
         // against the bash tool's workdir.
         let refreshed = false
         for (const seg of splitBashSegments(cmd)) {
-          const candidatePaths = [...pathsFromBashCommand(seg), ...pathsFromBashWriteTargets(seg)]
-          if (!bashHasWriteIntent(seg) && candidatePaths.length === 0) continue
+          const writeTargets = pathsFromBashWriteTargets(seg)
+          // Only WRITE targets are blocked; a segment that merely reads or names
+          // a managed path (e.g. `cat ~/.zshrc`) has no write target -> allowed.
+          if (!bashHasWriteIntent(seg) && writeTargets.length === 0) continue
+          // Prefer explicit write targets; fall back to all path tokens only when
+          // a write-intent segment produced no parseable target (exotic quoting).
+          const candidatePaths = writeTargets.length > 0 ? writeTargets : pathsFromBashCommand(seg)
           if (!refreshed) { refresh(); refreshed = true }
           for (const raw of candidatePaths) {
             const p = normalizePath(resolveAgainstWorkdir(raw, workdir))
