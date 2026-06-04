@@ -1,23 +1,21 @@
 #!/bin/bash
 
+# Reconcile the canonical labeled spaces and refresh the display cache.
+#
+# Jobs (all idempotent, all non-destructive):
+#   1. Resolve display topology -> DISPLAY_COUNT / MASTER / EXTERNAL indices.
+#   2. Ensure every canonical label exists (heals a missing label on the laptop).
+#   3. Re-pin each label onto the space where its app actually lives (laptop only).
+#   4. Write the shared cache consumed by the workspace/display/move scripts.
+#
+# It NO LONGER moves spaces between displays. Plug/unplug reconciliation lives in
+# yabai_displays.sh; this script never resets a docked layout back to the laptop.
+
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export USER="${USER:-$(id -un)}"
 
 MASTER_DISPLAY_UUID="${YABAI_MASTER_DISPLAY_UUID:-37D8832A-2D66-02CA-B9F7-8F30A301B230}"
-CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${TMPDIR:-/tmp}/yabai_workspace_cache.env}"
-
-case "${1:-}" in
-  display-changed)
-    sleep 1
-    ;;
-esac
-
-RESET_TO_MASTER=false
-case "${1:-}" in
-  startup|display-changed)
-    RESET_TO_MASTER=true
-    ;;
-esac
+CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${HOME}/.cache/yabai/workspace_cache.env}"
 
 SPACES_JSON=$(yabai -m query --spaces 2>/dev/null) || exit 0
 WINDOWS_JSON=$(yabai -m query --windows 2>/dev/null || printf '[]')
@@ -61,22 +59,6 @@ space_display_for_index() {
 
   jq -r --argjson index "$index" '
     ([.[] | select(.index == $index) | .display][0]) // empty
-  ' <<<"$SPACES_JSON"
-}
-
-space_display_for_label() {
-  local label="$1"
-
-  jq -r --arg label "$label" '
-    ([.[] | select(.label == $label) | .display][0]) // empty
-  ' <<<"$SPACES_JSON"
-}
-
-space_windows_for_label() {
-  local label="$1"
-
-  jq -r --arg label "$label" '
-    .[] | select(.label == $label) | .windows[]?
   ' <<<"$SPACES_JSON"
 }
 
@@ -167,45 +149,6 @@ assign_label_to_pinned_window_space() {
   [ -n "$index" ] && assign_label_to_space "$label" "$index"
 }
 
-move_label_to_master() {
-  local label="$1"
-  local current_display_index
-  local source_space_index
-  local target_space_index
-  local window_ids
-
-  [ -z "${MASTER_DISPLAY_INDEX:-}" ] && return 0
-
-  current_display_index=$(space_display_for_label "$label")
-  if [ -z "$current_display_index" ] || [ "$current_display_index" = "$MASTER_DISPLAY_INDEX" ]; then
-    return 0
-  fi
-
-  source_space_index=$(space_index_for_label "$label")
-  [ -z "$source_space_index" ] && return 0
-  window_ids=$(space_windows_for_label "$label")
-
-  target_space_index=$(first_unlabeled_space_index_on_master)
-  if [ -z "$target_space_index" ]; then
-    yabai -m space --create "$MASTER_DISPLAY_INDEX" >/dev/null 2>&1 || true
-    refresh_spaces_json
-    target_space_index=$(first_unlabeled_space_index_on_master)
-  fi
-  [ -z "$target_space_index" ] && return 0
-
-  yabai -m space "$source_space_index" --label >/dev/null 2>&1 || true
-  yabai -m space "$target_space_index" --label "$label" >/dev/null 2>&1 || true
-  yabai -m display --focus "$MASTER_DISPLAY_INDEX" >/dev/null 2>&1 || true
-  yabai -m space --focus "$target_space_index" >/dev/null 2>&1 || true
-
-  while IFS= read -r window_id; do
-    [ -z "$window_id" ] && continue
-    yabai -m window "$window_id" --display "$MASTER_DISPLAY_INDEX" >/dev/null 2>&1 || true
-  done <<<"$window_ids"
-
-  refresh_spaces_json
-}
-
 label_space_if_missing() {
   local index="$1"
   local label="$2"
@@ -244,24 +187,7 @@ label_missing_workspace_labels() {
   label_space_if_missing 10 codex
 }
 
-reset_managed_labels_to_master() {
-  move_label_to_master terminal
-  move_label_to_master main
-  move_label_to_master school
-  move_label_to_master todo
-  move_label_to_master schedule
-  move_label_to_master mail
-  move_label_to_master calendar
-  move_label_to_master messages
-  move_label_to_master chatgpt
-  move_label_to_master codex
-}
-
 label_missing_workspace_labels
-
-if [ "$RESET_TO_MASTER" = true ]; then
-  reset_managed_labels_to_master
-fi
 
 assign_label_to_pinned_app_space terminal '^(wezterm-gui|WezTerm)$'
 assign_label_to_pinned_window_space main '^Arc$' '^(Main|codex the model)'
@@ -276,6 +202,7 @@ assign_label_to_pinned_app_space codex '^Codex$'
 
 label_missing_workspace_labels
 
+mkdir -p "$(dirname "$CACHE_FILE")" 2>/dev/null || true
 {
   printf 'DISPLAY_COUNT=%s\n' "${DISPLAY_COUNT:-0}"
   printf 'MASTER_DISPLAY_INDEX=%s\n' "${MASTER_DISPLAY_INDEX:-}"

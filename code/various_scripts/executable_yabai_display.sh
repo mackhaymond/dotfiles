@@ -5,7 +5,7 @@ set -u
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export USER="${USER:-$(id -un)}"
 
-CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${TMPDIR:-/tmp}/yabai_workspace_cache.env}"
+CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${HOME}/.cache/yabai/workspace_cache.env}"
 TARGET="${1:-}"
 
 if [ -z "$TARGET" ]; then

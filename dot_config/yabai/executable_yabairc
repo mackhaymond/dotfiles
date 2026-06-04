@@ -12,6 +12,9 @@ yabai -m config top_padding 0
 yabai -m config --space 1 top_padding 0
 
 YABAI_WORKSPACE_REFRESH="${HOME}/code/various_scripts/yabai_workspace_refresh.sh"
+YABAI_DISPLAYS="${HOME}/code/various_scripts/yabai_displays.sh"
+YABAI_MOUSE_FOLLOW="${HOME}/code/various_scripts/yabai_mouse_follow.sh"
+YABAI_SCREEN_FLASH="${HOME}/code/various_scripts/yabai_screen_flash.sh"
 "$YABAI_WORKSPACE_REFRESH" startup
 
 # yabai -m config mouse_follows_focus on
@@ -37,26 +40,45 @@ yabai -m rule --add app="^TI-Nspire$" manage=off
 yabai -m rule --add app="^LiveMath Maker$" manage=off
 yabai -m rule --add app="^Antidote$" manage=off
 
-# Keep space 1 reserved for wezterm. Any other window that lands on
-# space 1 — managed or not — gets relocated to space 2 with focus following.
+# Keep wezterm's space (label "terminal") reserved for wezterm. Any non-wezterm
+# window that lands on it gets relocated to the nearest LABELED non-terminal
+# space ON THE SAME DISPLAY, with focus following.
+#
+# Anchored on a LIVE LABEL QUERY, not a fixed index: the terminal space may roam
+# to the external display (hyper+\), where its mission-control index renumbers.
+# Undocked this resolves to index 1 -> bounce to index 2 ("main"), identical to
+# the old behavior. The bounce target excludes UNLABELED spaces so a roamed stray
+# never lands on an external scratch space that macOS destroys on disconnect; if
+# terminal is the only labeled space on its display, the stray is left in place.
 yabai -m signal --add event=window_created action='
   win=$YABAI_WINDOW_ID
   info=$(yabai -m query --windows --window "$win" 2>/dev/null) || exit 0
   app=$(printf "%s" "$info" | jq -r .app)
-  space=$(printf "%s" "$info" | jq -r .space)
   case "$app" in
     wezterm-gui|WezTerm) exit 0 ;;
   esac
-  if [ "$space" = "1" ]; then
-    yabai -m window "$win" --space 2 && yabai -m space --focus 2
-  fi
+  space=$(printf "%s" "$info" | jq -r .space)
+  tinfo=$(yabai -m query --spaces --space terminal 2>/dev/null) || exit 0
+  tidx=$(printf "%s" "$tinfo" | jq -r .index 2>/dev/null)
+  tdsp=$(printf "%s" "$tinfo" | jq -r .display 2>/dev/null)
+  case "$tidx" in ""|*[!0-9]*) exit 0 ;; esac
+  [ "$space" = "$tidx" ] || exit 0
+  dest=$(yabai -m query --spaces --display "$tdsp" 2>/dev/null \
+    | jq -r --argjson ti "$tidx" "map(select(.index != \$ti and .label != \"\")) | .[0].index // empty" 2>/dev/null)
+  [ -n "$dest" ] || exit 0
+  yabai -m window "$win" --space "$dest" 2>/dev/null && yabai -m space --focus "$dest" 2>/dev/null
+  exit 0
 '
 
-# Re-activate wezterm on returning to space 1 so it re-asserts its
-# non-native fullscreen presentation options (hides the menu bar again
-# after an intruder window briefly trampled them).
+# Re-activate wezterm on entering its space so it re-asserts its non-native
+# fullscreen presentation options (hides the menu bar again after an intruder
+# briefly trampled them). Anchored on the terminal label'\''s LIVE index, so it
+# follows wezterm onto the external display. Undocked this is index 1, as before.
 yabai -m signal --add event=space_changed action='
-  [ "$YABAI_SPACE_INDEX" = "1" ] && osascript -e "tell application \"WezTerm\" to activate"
+  tidx=$(yabai -m query --spaces --space terminal 2>/dev/null | jq -r .index 2>/dev/null)
+  [ -n "$tidx" ] && [ "$tidx" != "null" ] && [ "$YABAI_SPACE_INDEX" = "$tidx" ] \
+    && osascript -e "tell application \"WezTerm\" to activate"
+  exit 0
 '
 
 # App -> Space pinning
@@ -76,5 +98,17 @@ yabai -m rule --apply
 # Belt-and-suspenders: re-fire rules on any app launch in case the
 # window_created event is lost.
 yabai -m signal --add event=application_launched action="yabai -m rule --apply"
-yabai -m signal --add event=display_added label=workspace_display_added action="$YABAI_WORKSPACE_REFRESH display-changed"
-yabai -m signal --add event=display_removed label=workspace_display_removed action="$YABAI_WORKSPACE_REFRESH display-changed"
+# Display hotplug -> debounced handler (non-destructive on connect; pull-home
+# on disconnect). Replaces the old "reset everything to the laptop" refresh.
+yabai -m signal --add event=display_added label=workspace_display_added action="$YABAI_DISPLAYS added"
+yabai -m signal --add event=display_removed label=workspace_display_removed action="$YABAI_DISPLAYS removed"
+
+# When the ACTIVE display changes (any cross-display focus: F13/F14, push,
+# home-all, master, or a focus bind whose label lives on the other screen),
+# warp the mouse onto the now-focused display. Never fires with one display.
+yabai -m signal --add event=display_changed label=mouse_follow_display action="$YABAI_MOUSE_FOLLOW"
+
+# Flash a border on the now-focused display, but ONLY when it is the external
+# (non-master) display — a glance-cue that focus jumped to the big screen.
+# Never fires with one display; the helper also skips when focus is on the laptop.
+yabai -m signal --add event=display_changed label=flash_external_display action="$YABAI_SCREEN_FLASH"

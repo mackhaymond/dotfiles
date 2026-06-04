@@ -7,16 +7,16 @@ hyper - x : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_skhd_stack_prev.sh
 # hyper - s: yabai -m space --focus next
 
 # change focus by space index
-hyper - 0x32: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal terminal
-hyper - 1: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal main
-hyper - 2: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal school
-hyper - tab: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal todo
-hyper - q: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal schedule
-hyper - w: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal mail
-hyper - e: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal calendar
-hyper - d: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal messages
-hyper - f: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal chatgpt
-f18 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh normal codex # caps_lock+escape -> F18
+hyper - 0x32: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus terminal
+hyper - 1: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus main
+hyper - 2: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus school
+hyper - tab: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus todo
+hyper - q: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus schedule
+hyper - w: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus mail
+hyper - e: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus calendar
+hyper - d: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus messages
+hyper - f: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus chatgpt
+f18 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus codex # caps_lock+escape -> F18
 
 hyper + fn - 0x32: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master terminal
 hyper + fn - 1: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master main
@@ -32,6 +32,11 @@ f19 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh master code
 f13 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_display.sh master
 f14 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_display.sh external
 f15 : yabai -m window --display next || yabai -m window --display prev
+
+# push the focused space to the other display (and follow); no-op on one display
+hyper - 0x2A : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_space_move.sh push
+# pull every labeled space home to the laptop; no-op on one display
+hyper - 0 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_space_move.sh home-all
 
 # go to last space
 
