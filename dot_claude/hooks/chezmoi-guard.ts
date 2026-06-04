@@ -10,9 +10,9 @@
 //                       source repo. Emits a permissionDecision:deny JSON.
 //   PostToolUse       - remember source-repo writes this session made; recompute
 //                       the dirty set (git status self-heals). Pure bookkeeping.
-//   UserPromptSubmit  - inject the "uncommitted chezmoi changes" complaint as
+//   UserPromptSubmit  - inject the "uncommitted/unpushed chezmoi changes" complaint as
 //                       additionalContext (per-turn analog of system.transform).
-//   Stop              - if session-touched chezmoi paths are still dirty, block
+//   Stop              - if session-touched chezmoi paths are still uncommitted/unpushed, block
 //                       the stop with a continuation prompt (loop-guarded).
 //
 // Because each hook is a separate subprocess with NO shared memory, all state
@@ -490,24 +490,55 @@ function rememberSourceWrites(state: SessionState, rawPaths: string[]): void {
   state.touchedPaths = [...set]
 }
 
-// dirtyTouchedPaths: run git status --porcelain on the touched rels, add rename
-// dests, PRUNE no-longer-dirty (self-heal), mutate state in place, return the
-// dirty rel list. (Verbatim porcelain parsing from source.)
-function dirtyTouchedPaths(state: SessionState): string[] {
-  if (state.touchedPaths.length === 0) return []
+// unpushedRels: of the given session-touched rels, return the subset that
+// appears in commits ahead of the upstream (@{u}..HEAD) — i.e. committed but not
+// yet pushed. The pathspec restricts the log to those rels AND we intersect with
+// the rels set, so a file riding along in someone else's commit is never blamed.
+// FAIL-QUIET: no upstream configured / detached HEAD / any git error -> empty
+// set (treat as "nothing unpushed"), so a repo without a remote behaves exactly
+// like the old commit-only guard.
+function unpushedRels(rels: string[]): Set<string> {
+  const out = new Set<string>()
+  if (rels.length === 0) return out
+  const relsSet = new Set(rels)
+  try {
+    const raw = execFileSync(
+      GIT_BIN,
+      ["-C", CHEZMOI_SOURCE_DIR, "log", "@{u}..HEAD", "--name-only", "--pretty=format:", "--", ...rels],
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000, env: SUBPROC_ENV },
+    )
+    for (const line of raw.split("\n")) {
+      const t = line.trim()
+      if (t && relsSet.has(t)) out.add(t)
+    }
+  } catch {
+    // No upstream / detached HEAD / git error: fail quiet (nothing unpushed).
+  }
+  return out
+}
+
+// pendingTouchedPaths: classify the session-touched rels into the work still
+// outstanding — `dirty` (uncommitted working-tree changes, via git status
+// --porcelain, incl. rename dests) and `unpushed` (committed but ahead of
+// upstream, via unpushedRels). PRUNES a path from tracking only once it is BOTH
+// clean in the working tree AND already pushed: the self-heal boundary moves
+// from "committed" to "committed AND pushed", so the guard keeps nagging until
+// the push lands. Mutates state in place.
+function pendingTouchedPaths(state: SessionState): { dirty: string[]; unpushed: string[] } {
+  if (state.touchedPaths.length === 0) return { dirty: [], unpushed: [] }
   const rels = [...new Set(state.touchedPaths)]
     .map(sourceRelativePath)
     .filter((p) => p && !p.startsWith(".."))
     .sort()
-  if (rels.length === 0) return []
+  if (rels.length === 0) return { dirty: [], unpushed: [] }
 
+  const dirty = new Set<string>()
   try {
     const out = execFileSync(
       GIT_BIN,
       ["-C", CHEZMOI_SOURCE_DIR, "status", "--porcelain", "--", ...rels],
       { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000, env: SUBPROC_ENV },
     )
-    const dirty = new Set<string>()
     for (const line of out.split("\n")) {
       if (!line.trim()) continue
       // Porcelain v1 is `XY path` or `XY old -> new`. For renames, track the
@@ -516,21 +547,27 @@ function dirtyTouchedPaths(state: SessionState): string[] {
       const renamed = raw.includes(" -> ") ? raw.split(" -> ").pop() : raw
       if (renamed) dirty.add(renamed)
     }
-    const set = new Set(state.touchedPaths)
-    for (const p of dirty) {
-      const abs = resolve(CHEZMOI_SOURCE_DIR, p)
-      if (isInChezmoiSource(abs)) set.add(abs)
-    }
-    for (const p of rels) {
-      if (!dirty.has(p)) set.delete(resolve(CHEZMOI_SOURCE_DIR, p))
-    }
-    state.touchedPaths = [...set]
-    return [...dirty]
   } catch {
     // If status fails, fail quiet rather than blame the agent for stale or
-    // unverifiable state. The normal hard guards still run independently.
-    return []
+    // unverifiable state, and do NOT prune. The normal hard guards still run.
+    return { dirty: [], unpushed: [] }
   }
+
+  const unpushed = unpushedRels(rels)
+
+  const set = new Set(state.touchedPaths)
+  for (const p of dirty) {
+    const abs = resolve(CHEZMOI_SOURCE_DIR, p)
+    if (isInChezmoiSource(abs)) set.add(abs)
+  }
+  // Self-heal at the PUSH boundary: drop a path only when it is neither
+  // uncommitted (working-tree dirty) nor committed-but-unpushed.
+  for (const p of rels) {
+    if (!dirty.has(p) && !unpushed.has(p)) set.delete(resolve(CHEZMOI_SOURCE_DIR, p))
+  }
+  state.touchedPaths = [...set]
+
+  return { dirty: [...dirty], unpushed: [...unpushed] }
 }
 
 // ---------------------------------------------------------------------------
@@ -538,19 +575,27 @@ function dirtyTouchedPaths(state: SessionState): string[] {
 // ---------------------------------------------------------------------------
 
 function uncommittedChezmoiComplaint(state: SessionState): string | undefined {
-  const dirty = dirtyTouchedPaths(state)
-  if (dirty.length === 0) return undefined
-  const shown = dirty
-    .slice(0, 12)
-    .map((p) => `- ${p}`)
-    .join("\n")
-  const more = dirty.length > 12 ? `\n- ...and ${dirty.length - 12} more` : ""
+  const { dirty, unpushed } = pendingTouchedPaths(state)
+  if (dirty.length === 0 && unpushed.length === 0) return undefined
+  const fmt = (paths: string[]) => {
+    const shown = paths
+      .slice(0, 12)
+      .map((p) => `- ${p}`)
+      .join("\n")
+    const more = paths.length > 12 ? `\n- ...and ${paths.length - 12} more` : ""
+    return `${shown}${more}`
+  }
+  const sections: string[] = []
+  if (dirty.length > 0) sections.push(`Uncommitted (working-tree) paths:\n${fmt(dirty)}`)
+  if (unpushed.length > 0) sections.push(`Committed but UNPUSHED paths:\n${fmt(unpushed)}`)
   return (
-    `CHEZMOI-GUARD: You made chezmoi source changes in this session that are still uncommitted.\n` +
+    `CHEZMOI-GUARD: You made chezmoi source changes in this session that are not yet committed AND pushed.\n` +
     `Before finishing this dotfile task, run chezmoi apply if needed, inspect git status/diff/log, ` +
     `stage only the intended files, commit, and push.\n` +
-    `Ignore unrelated chezmoi dirty paths you did not touch; they are likely from another concurrent agent.\n` +
-    `Session-touched dirty paths:\n${shown}${more}`
+    `Committing and pushing these chezmoi changes is PRE-AUTHORIZED by the user (standing approval for all ` +
+    `chezmoi dotfile work) — do it automatically, do NOT pause to ask the user for commit/push confirmation.\n` +
+    `Ignore unrelated chezmoi paths you did not touch; they are likely from another concurrent agent.\n` +
+    sections.join("\n")
   )
 }
 
@@ -944,7 +989,7 @@ function handlePostToolUse(input: any): void {
       }
     }
     // STEP recompute: prune + persist via the lock writer.
-    dirtyTouchedPaths(state)
+    pendingTouchedPaths(state)
     // DO NOT touch continuationFiredAt/continuationCount here (Stop backstop).
   })
 
@@ -956,7 +1001,7 @@ function handleUserPromptSubmit(input: any): void {
   debugLog("userpromptsubmit", { session_id: sid })
   let complaint: string | undefined
   withSessionLock(sid, (state) => {
-    complaint = uncommittedChezmoiComplaint(state) // calls dirtyTouchedPaths -> prune + persist
+    complaint = uncommittedChezmoiComplaint(state) // calls pendingTouchedPaths -> prune + persist
   })
   if (!complaint) {
     process.exit(0) // EMPTY stdout — omit additionalContext entirely

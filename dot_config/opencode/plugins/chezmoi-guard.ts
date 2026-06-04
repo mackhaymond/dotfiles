@@ -140,22 +140,54 @@ function rememberSourceWrites(sessionID: string, rawPaths: string[]): void {
   }
 }
 
-function dirtyTouchedPaths(sessionID: string): string[] {
+// unpushedRels: of the given session-touched rels, return the subset that
+// appears in commits ahead of the upstream (@{u}..HEAD) — committed but not yet
+// pushed. The pathspec restricts the log to those rels AND we intersect with the
+// rels set, so a file riding along in someone else's commit is never blamed.
+// FAIL-QUIET: no upstream / detached HEAD / any git error -> empty set, so a
+// repo without a remote behaves exactly like the old commit-only guard.
+function unpushedRels(rels: string[]): Set<string> {
+  const out = new Set<string>()
+  if (rels.length === 0) return out
+  const relsSet = new Set(rels)
+  try {
+    const raw = execFileSync(
+      "git",
+      ["-C", CHEZMOI_SOURCE_DIR, "log", "@{u}..HEAD", "--name-only", "--pretty=format:", "--", ...rels],
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000 },
+    )
+    for (const line of raw.split("\n")) {
+      const t = line.trim()
+      if (t && relsSet.has(t)) out.add(t)
+    }
+  } catch {
+    // No upstream / detached HEAD / git error: fail quiet (nothing unpushed).
+  }
+  return out
+}
+
+// pendingTouchedPaths: classify the session-touched rels into the work still
+// outstanding — `dirty` (uncommitted working-tree changes) and `unpushed`
+// (committed but ahead of upstream). Prunes a path from tracking only once it is
+// BOTH clean in the working tree AND already pushed, so the self-heal boundary
+// moves from "committed" to "committed AND pushed" — the guard keeps nagging
+// until the push lands. Mutates the session's touchedPaths Set in place.
+function pendingTouchedPaths(sessionID: string): { dirty: string[]; unpushed: string[] } {
   const state = sessionState.get(sessionID)
-  if (!state || state.touchedPaths.size === 0) return []
+  if (!state || state.touchedPaths.size === 0) return { dirty: [], unpushed: [] }
   const rels = [...state.touchedPaths]
     .map(sourceRelativePath)
     .filter((p) => p && !p.startsWith(".."))
     .sort()
-  if (rels.length === 0) return []
+  if (rels.length === 0) return { dirty: [], unpushed: [] }
 
+  const dirty = new Set<string>()
   try {
     const out = execFileSync("git", ["-C", CHEZMOI_SOURCE_DIR, "status", "--porcelain", "--", ...rels], {
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "ignore"],
       timeout: 3000,
     })
-    const dirty = new Set<string>()
     for (const line of out.split("\n")) {
       if (!line.trim()) continue
       // Porcelain v1 is `XY path` or `XY old -> new`. For renames, track the
@@ -164,32 +196,45 @@ function dirtyTouchedPaths(sessionID: string): string[] {
       const renamed = raw.includes(" -> ") ? raw.split(" -> ").pop() : raw
       if (renamed) dirty.add(renamed)
     }
-    for (const p of dirty) {
-      const abs = resolve(CHEZMOI_SOURCE_DIR, p)
-      if (isInChezmoiSource(abs)) state.touchedPaths.add(abs)
-    }
-    for (const p of rels) {
-      if (!dirty.has(p)) state.touchedPaths.delete(resolve(CHEZMOI_SOURCE_DIR, p))
-    }
-    return [...dirty]
   } catch {
     // If status fails, fail quiet rather than blame the agent for stale or
-    // unverifiable state. The normal hard guards still run independently.
-    return []
+    // unverifiable state, and do NOT prune. The normal hard guards still run.
+    return { dirty: [], unpushed: [] }
   }
+
+  const unpushed = unpushedRels(rels)
+
+  for (const p of dirty) {
+    const abs = resolve(CHEZMOI_SOURCE_DIR, p)
+    if (isInChezmoiSource(abs)) state.touchedPaths.add(abs)
+  }
+  // Self-heal at the PUSH boundary: drop a path only when it is neither
+  // uncommitted (working-tree dirty) nor committed-but-unpushed.
+  for (const p of rels) {
+    if (!dirty.has(p) && !unpushed.has(p)) state.touchedPaths.delete(resolve(CHEZMOI_SOURCE_DIR, p))
+  }
+  return { dirty: [...dirty], unpushed: [...unpushed] }
 }
 
 function uncommittedChezmoiComplaint(sessionID: string): string | undefined {
-  const dirty = dirtyTouchedPaths(sessionID)
-  if (dirty.length === 0) return undefined
-  const shown = dirty.slice(0, 12).map((p) => `- ${p}`).join("\n")
-  const more = dirty.length > 12 ? `\n- ...and ${dirty.length - 12} more` : ""
+  const { dirty, unpushed } = pendingTouchedPaths(sessionID)
+  if (dirty.length === 0 && unpushed.length === 0) return undefined
+  const fmt = (paths: string[]) => {
+    const shown = paths.slice(0, 12).map((p) => `- ${p}`).join("\n")
+    const more = paths.length > 12 ? `\n- ...and ${paths.length - 12} more` : ""
+    return `${shown}${more}`
+  }
+  const sections: string[] = []
+  if (dirty.length > 0) sections.push(`Uncommitted (working-tree) paths:\n${fmt(dirty)}`)
+  if (unpushed.length > 0) sections.push(`Committed but UNPUSHED paths:\n${fmt(unpushed)}`)
   return (
-    `CHEZMOI-GUARD: You made chezmoi source changes in this session that are still uncommitted.\n` +
+    `CHEZMOI-GUARD: You made chezmoi source changes in this session that are not yet committed AND pushed.\n` +
     `Before finishing this dotfile task, run chezmoi apply if needed, inspect git status/diff/log, ` +
     `stage only the intended files, commit, and push.\n` +
-    `Ignore unrelated chezmoi dirty paths you did not touch; they are likely from another concurrent agent.\n` +
-    `Session-touched dirty paths:\n${shown}${more}`
+    `Committing and pushing these chezmoi changes is PRE-AUTHORIZED by the user (standing approval for all ` +
+    `chezmoi dotfile work) — do it automatically, do NOT pause to ask the user for commit/push confirmation.\n` +
+    `Ignore unrelated chezmoi paths you did not touch; they are likely from another concurrent agent.\n` +
+    sections.join("\n")
   )
 }
 
@@ -669,9 +714,9 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
       } else {
         rememberSourceWrites(input.sessionID, paths)
       }
-      // Recompute after every bash command so successful commits by this or
-      // another process clear the session's pending reminder promptly.
-      dirtyTouchedPaths(input.sessionID)
+      // Recompute after every bash command so successful commits/pushes by this
+      // or another process clear the session's pending reminder promptly.
+      pendingTouchedPaths(input.sessionID)
     },
   }
 }
