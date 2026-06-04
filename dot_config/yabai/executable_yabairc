@@ -79,11 +79,14 @@ yabai -m signal --add event=window_created action='
   exit 0
 '
 
-# Re-activate wezterm on entering its space so it re-asserts its non-native
-# fullscreen presentation options (hides the menu bar again after an intruder
-# briefly trampled them). Anchored on the terminal label'\''s LIVE index, so it
-# follows wezterm onto the external display. Undocked this is index 1, as before.
+# On every space change: (1) keep the "terminal" label pinned to WezTerm wherever
+# it is -- so when WezTerm enters/exits a macOS native-fullscreen Space the label
+# follows it and stays in canonical order (yabai_terminal_follow.sh; cheap no-op
+# when nothing moved); then (2) re-activate WezTerm when entering its space so it
+# raises cleanly. Anchored on the terminal label'\''s LIVE index, so it follows
+# wezterm onto the external display too.
 yabai -m signal --add event=space_changed action='
+  "$HOME/code/various_scripts/yabai_terminal_follow.sh"
   tidx=$(yabai -m query --spaces --space terminal 2>/dev/null | jq -r .index 2>/dev/null)
   [ -n "$tidx" ] && [ "$tidx" != "null" ] && [ "$YABAI_SPACE_INDEX" = "$tidx" ] \
     && osascript -e "tell application \"WezTerm\" to activate"

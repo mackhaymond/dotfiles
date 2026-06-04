@@ -39,7 +39,13 @@ config.window_padding = {
 
 config.default_prog = { "{{ .homebrew_prefix }}/bin/tmux", "new-session", "-A", "-s", "main" }
 
-config.native_macos_fullscreen_mode = false
+-- Use macOS NATIVE fullscreen so a fullscreened WezTerm becomes a real
+-- fullscreen Space. yabai can label/reorder/focus that Space, and a space_changed
+-- hook (yabai_terminal_follow.sh) keeps the "terminal" label pinned to WezTerm
+-- wherever it roams -- so hyper+` still reaches it and it stays in canonical
+-- order. With this false, the window drops the macOS fullscreen capability
+-- entirely and yabai cannot fullscreen it.
+config.native_macos_fullscreen_mode = true
 config.macos_fullscreen_extend_behind_notch = true
 
 config.window_close_confirmation = 'NeverPrompt'
