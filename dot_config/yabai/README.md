@@ -33,6 +33,11 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_prev.sh` | `~/code/various_scripts/yabai_skhd_stack_prev.sh` | Executable script | Focus previous window in stack |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_mouse_follow.sh` | `~/code/various_scripts/yabai_mouse_follow.sh` | Executable script | Warp cursor to newly focused display |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_screen_flash.sh` | `~/code/various_scripts/yabai_screen_flash.sh` | Executable script | Visual border flash on external display focus |
+| `…/code/various_scripts/yabai_screen_flash.js` | `~/code/various_scripts/yabai_screen_flash.js` | JXA helper | Draws/fades the border overlay for `yabai_screen_flash.sh` |
+| `…/code/various_scripts/executable_yabai_reorder_spaces.sh` | `~/code/various_scripts/yabai_reorder_spaces.sh` | Executable script | Keep labeled spaces in canonical order per display |
+| `…/code/various_scripts/executable_yabai_fullscreen_focus.sh` | `~/code/various_scripts/yabai_fullscreen_focus.sh` | Executable script | Focus the Nth native-fullscreen app (`hyper+3-9`), WezTerm excluded |
+| `…/code/various_scripts/executable_yabai_terminal_follow.sh` | `~/code/various_scripts/yabai_terminal_follow.sh` | Executable script | Keep `terminal` label on WezTerm in/out of fullscreen; sweep husk spaces |
+| `…/dot_hammerspoon/init.lua` | `~/.hammerspoon/init.lua` | Lua config | **Hammerspoon**: classify Arc windows via AXIdentifier; pin the two main windows to main/school (Little Arc left managed). Required dependency, launches at login |
 
 ### Shared State: Display Topology Cache
 
@@ -87,42 +92,35 @@ These apps automatically appear on their designated space when launched:
 | ChatGPT | chatgpt |
 | Codex | codex |
 
-**Arc (browser) title-based pinning** (handled in `yabai_workspace_refresh.sh`):
-- Titles matching "Main" or "codex the model" → main
-- Titles matching "ECON 102" or "Physics" → school
+**Arc (browser):** *not* a yabai rule (the two main windows go to two different
+spaces, and Little Arc is indistinguishable to yabai). The two main Arc windows
+are pinned to `main`/`school` by **Hammerspoon** (`dot_hammerspoon/init.lua`) via
+AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note.
 
 **Why label-based queries?** When yabai queries spaces, it uses labels (e.g., `yabai -m query --spaces --space terminal`) rather than indices. This makes all rules robust to index renumbering caused by Mission Control or display hotplug.
 
 #### Signal Handlers
 
-**1. Dock Restart (line 2)**
-```bash
-yabai -m signal --add event=dock_did_restart action="sudo yabai --load-sa"
-```
-Reloads the accessibility token when macOS Dock restarts, maintaining yabai's ability to control windows.
+**1. `dock_did_restart`** → `sudo yabai --load-sa`. Reloads the scripting addition (needed for native-fullscreen, space create/destroy, etc.) after the Dock restarts.
 
-**2. Window Created (lines 53–80)**
-- **For WezTerm:** If a new WezTerm window lands on the wrong space, move it to terminal space.
-- **For non-WezTerm on terminal space:** Bounce it to the nearest labeled non-terminal space on the same display, keeping terminal pure.
+**2. `window_created`**
+- **WezTerm:** if a *normal* WezTerm lands on the wrong space, move it to terminal. A *fullscreen* WezTerm is left alone (guarded by `is-native-fullscreen`) so it isn't yanked out of fullscreen.
+- **Arc:** call `hs -c "arcSync()"` (Hammerspoon re-pins the Arc main windows; Little Arc untouched).
+- **Other non-WezTerm on terminal:** bounce to the nearest labeled non-terminal space on the same display, keeping terminal pure.
 
-**3. Space Changed (lines 86–91)**
-- When user switches to the terminal space, re-activate WezTerm via osascript to reassert non-native fullscreen (menu bar auto-hide).
+**3. `space_changed`** → `yabai_terminal_follow.sh` then re-activate WezTerm. The follow hook keeps the `terminal` label pinned to WezTerm wherever it roams (including in/out of a native-fullscreen Space), reorders, and sweeps surplus empty husk spaces. Cheap no-op when WezTerm hasn't moved.
 
-**4. Application Launched (line 109)**
-- Re-apply all rules when an app launches; catches missed window_created events.
+**4. `application_launched`** → `yabai -m rule --apply` (re-pins Todoist/Messages/etc.) **and** `hs -c "arcSync()"` (re-pins the Arc main windows) — one consistent "snap" moment.
 
-**5. Display Added (line 112, label `workspace_display_added`)**
-- Calls `yabai_displays.sh added` → debounced hotplug handler.
-- Settles display count and refreshes cache (non-destructive; external comes up empty).
+**5. `display_added` (label `workspace_display_added`)** → `yabai_displays.sh added`: debounced hotplug; settles display count and refreshes cache (non-destructive; external comes up empty).
 
-**6. Display Removed (line 113, label `workspace_display_removed`)**
-- Calls `yabai_displays.sh removed` → pulls all labeled spaces home to master display.
+**6. `display_removed` (label `workspace_display_removed`)** → `yabai_displays.sh removed`: pulls all labeled spaces home to the master display.
 
-**7. Display Changed – Mouse Follow (line 118, label `mouse_follow_display`)**
-- Calls `yabai_mouse_follow.sh` → warps cursor to newly focused display.
+**7. `display_changed` (label `mouse_follow_display`)** → `yabai_mouse_follow.sh`: warps cursor to the newly focused display.
 
-**8. Display Changed – Screen Flash (line 123, label `flash_external_display`)**
-- Calls `yabai_screen_flash.sh` → flashes orange border if focus moved to external display.
+**8. `display_changed` (label `flash_external_display`)** → `yabai_screen_flash.sh`: flashes a border if focus moved to the external display.
+
+*(Also: a one-shot menu-bar/startup sync runs at the end of yabairc. Specific line numbers are intentionally omitted here — they drift; grep the signal name in `yabairc`.)*
 
 #### Environment Variables Exported
 
@@ -188,6 +186,7 @@ Move the focused window to a target space (unless pinned to home space). Focus s
 - Messages → messages
 - ChatGPT → chatgpt
 - Codex → codex
+- Arc → protected on `main`/`school` (any Arc window on either is shielded; rare Little-Arc-on-home included)
 
 #### Window Navigation & Layout (Hyper+Fn)
 
@@ -219,6 +218,16 @@ Move the focused window to a target space (unless pinned to home space). Focus s
 | `hyper - m` | M | `yabai -m window --toggle float --grid 6:6:1:1:4:4` | Toggle float; if floating, center at 4×4 grid cell |
 | `hyper + fn - m` | Fn+M | `yabai -m window --toggle native-fullscreen` | Toggle native fullscreen |
 | `hyper - b` | B | `yabai_skhd_mode.sh` | Toggle space layout (bsp ↔ stack) |
+
+#### Native-Fullscreen App Access (Hyper)
+
+Reach apps put into macOS native fullscreen — they live in their own Spaces outside the labeled model, so the focus-workspace keys can't reach them. Ordinal = mission-control order (display, then space index); **WezTerm is excluded** (it's the terminal, reached with `hyper+\``).
+
+| Keybinding | Key | Script | Action |
+|---|---|---|---|
+| `hyper - 3` … `hyper - 9` | 3–9 | `yabai_fullscreen_focus.sh 1…7` | Focus the 1st…7th native-fullscreen app (no-op if that many aren't open) |
+
+*(`hyper - 1`/`- 2` = focus main/school; `hyper - 0` = pull-home. So 3–9 were free.)*
 
 ### 3.3 Karabiner-Elements Key Remapping
 
@@ -277,10 +286,11 @@ Every new WezTerm window attaches or creates a tmux session named `main`.
 **GUI startup event:**
 ```lua
 wezterm.on('gui-startup', function(cmd)
-    mux.spawn_window(cmd or {})
+    local _, _, window = mux.spawn_window(cmd or {})
+    window:gui_window():toggle_fullscreen()
 end)
 ```
-Launches WezTerm without forcing non-native fullscreen; yabai sizes it.
+Starts WezTerm in **macOS native fullscreen by default** (needs `native_macos_fullscreen_mode = true`). yabai/​`yabai_terminal_follow.sh` keep the `terminal` label on it and reorder it to position 1. See the "WezTerm native fullscreen (default)" design note.
 
 #### Display & UI Settings
 
@@ -326,6 +336,9 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 | `yabai_skhd_stack_prev.sh` | (none) | Focus previous window in current stack layer; wrap to last |
 | `yabai_mouse_follow.sh` | (none; signal handler) | Warp mouse cursor to focused display center (if not already there) |
 | `yabai_screen_flash.sh` | (none; signal handler) | Flash orange border around external display when focus moves there |
+| `yabai_reorder_spaces.sh` | (none) | Slide labeled spaces into canonical order per display (reserves non-master's first space as scratch); handles fullscreen spaces |
+| `yabai_fullscreen_focus.sh` | `<ordinal>` | Focus the Nth native-fullscreen app in mission-control order (`hyper+3-9`); excludes WezTerm |
+| `yabai_terminal_follow.sh` | (none; space_changed hook) | Re-pin `terminal` label onto WezTerm's space (incl. fullscreen) + reorder; sweep surplus empty husk spaces |
 
 ### How It All Connects
 
