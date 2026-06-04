@@ -40,7 +40,7 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `…/dot_hammerspoon/init.lua` | `~/.hammerspoon/init.lua` | Lua config | **Hammerspoon**: classify Arc windows via AXIdentifier; pin the two main windows to main/school (Little Arc left managed). Required dependency, launches at login |
 | `…/swiftbar_plugins/executable_yabai_layers.1s.sh` | `~/swiftbar_plugins/yabai_layers.1s.sh` | Executable plugin | **SwiftBar** menu-bar plugin — the **live** status indicator. Shows current/total stack layer (e.g. `2 / 3`), or `BSP`/`FLOAT`, refreshed every 1s. Read-only/passive (no window-manager effect) |
 | `…/dot_config/sketchybar/{items,plugins}/yabai_layers.sh` | `~/.config/sketchybar/{items,plugins}/yabai_layers.sh` | Shell scripts | **Dead/superseded** sketchybar version of the same layer indicator. sketchybar is **not running**; SwiftBar replaced it. Kept in-tree only as a dormant alternative |
-| `…/code/various_scripts/executable_restart-yabai.sh` | `~/code/various_scripts/restart-yabai.sh` | Executable script (Raycast) | Soft-restart yabai (`yabai --restart-service`), invoked from Raycast. Not wired into any signal/bind. Deployed copy is git-ignored/hand-managed (see `.chezmoiignore`), so the source can lag the live file |
+| `…/code/various_scripts/executable_restart-yabai.sh` | `~/code/various_scripts/restart-yabai.sh` | Executable script (Raycast) | Soft-restart yabai (`yabai --restart-service`), invoked from Raycast. Not wired into any signal/bind |
 
 ### Shared State: Display Topology Cache
 
@@ -326,7 +326,7 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 
 | Script | Arguments | Purpose |
 |--------|-----------|---------|
-| `yabai_workspace.sh` | `focus <label>` \| `master <label>` | Focus workspace by label (wherever it lives) or bring home then focus |
+| `yabai_workspace.sh` | `focus <label>` | Focus workspace by label, wherever it lives (never moves it) |
 | `yabai_send_window.sh` | `<label>` | Move focused window to space and follow focus to it; blocked (focus unchanged) if window is pinned and already on home space |
 | `yabai_display.sh` | `master` \| `external` | Focus the laptop or external display; no-op on single display |
 | `yabai_space_move.sh` | `push` \| `home-all` | Cross-display space movement: push focused space to other display (with follow), or pull all labels home |
@@ -354,7 +354,7 @@ yabai_workspace_refresh.sh (cache writer)
     └── Contents: DISPLAY_COUNT, MASTER_DISPLAY_INDEX, EXTERNAL_DISPLAY_INDEX, MASTER_DISPLAY_UUID
 
 Readers (scripts that `. "$CACHE_FILE"` to resolve topology):
-    ├── yabai_workspace.sh      (focus/master)
+    ├── yabai_workspace.sh      (focus)
     ├── yabai_display.sh        (master/external focus)
     ├── yabai_space_move.sh     (push/home-all)
     ├── yabai_displays.sh       (hotplug; also re-writes it)
@@ -820,7 +820,6 @@ git push origin main
 - `hyper+\` **push** — round-trips the focused space to the other display and follows focus (incl. the 3-try focus-by-id race loop in `yabai_space_move.sh`).
 - `hyper+0` **home-all** — pulls every label back to the laptop.
 - **dock / undock** — `yabai_displays.sh added` comes up non-destructive (external empty); `removed` pull-home safety net relocates any straggler labels.
-- `yabai_workspace.sh master <label>` — native whole-space move home, then focus.
 - `yabai_reorder_spaces.sh` — reserves the **external's first space as scratch** (`pos=lo+1`) and orders labels from the second space.
 - `f13`/`f14` display focus → mouse-follow warp + external screen-flash.
 

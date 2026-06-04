@@ -1,13 +1,12 @@
 #!/bin/bash
 
-# Focus (and optionally home) a labeled yabai space.
+# Focus a labeled yabai space, wherever it lives (never moves it).
 #
-#   yabai_workspace.sh focus  <label>   -> focus the label wherever it lives (never moves)
-#   yabai_workspace.sh master <label>   -> bring the label home to the laptop, then focus
+#   yabai_workspace.sh focus <label>   -> focus the label wherever it lives
 #
-# "normal"/"external-first" are accepted as aliases of "focus" for backward
-# compatibility (older skhd binds). With <=1 display every mode collapses to a
-# plain focus, byte-equivalent to the original single-laptop behavior.
+# With <=1 display this is a plain focus, byte-equivalent to the original
+# single-laptop behavior. (Cross-display pull-home lives in yabai_space_move.sh:
+# `home-all` pulls every label back to the laptop, bound to hyper+0.)
 
 set -u
 
@@ -62,25 +61,6 @@ query_space_index() {
     head -n 1
 }
 
-query_space_display_index() {
-  local label="$1"
-
-  yabai -m query --spaces --space "$label" 2>/dev/null |
-    jq -r '.display // empty' |
-    head -n 1
-}
-
-ensure_space_label() {
-  local label="$1"
-
-  if [ -n "$(query_space_display_index "$label")" ]; then
-    return 0
-  fi
-
-  "$SCRIPT_DIR/yabai_workspace_refresh.sh" >/dev/null 2>&1 || true
-  [ -n "$(query_space_display_index "$label")" ]
-}
-
 focus_space() {
   local space_index
 
@@ -97,24 +77,9 @@ if [ "${DISPLAY_COUNT:-1}" -le 1 ]; then
 fi
 
 case "$MODE" in
-  focus|normal|external-first)
+  focus)
     # Pure focus: never relocate a space. Only reached with 2+ displays.
     focus_space
-    exit 0
-    ;;
-  master)
-    # Bring the labeled space home to the laptop via a native whole-space
-    # move (carries all its windows), then focus it.
-    ensure_space_label "$LABEL" || exit 0
-
-    if [ -n "${MASTER_DISPLAY_INDEX:-}" ] &&
-       [ "$(query_space_display_index "$LABEL")" != "$MASTER_DISPLAY_INDEX" ]; then
-      yabai -m space "$LABEL" --display "$MASTER_DISPLAY_INDEX" >/dev/null 2>&1 || true
-    fi
-
-    yabai -m display --focus "${MASTER_DISPLAY_INDEX:-1}" >/dev/null 2>&1 || true
-    focus_space
-    "$SCRIPT_DIR/yabai_reorder_spaces.sh" >/dev/null 2>&1 || true
     exit 0
     ;;
   *)
