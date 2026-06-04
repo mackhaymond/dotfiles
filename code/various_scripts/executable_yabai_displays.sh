@@ -38,10 +38,14 @@ esac
 
 # --- single-flight lock (coalesce duplicate hotplug signals) ----------------
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
-  # Break a stale lock (>~30s old) left by a crashed run, then try once more.
-  # Kept well above a normal handler's runtime so a slow-but-live run is never
-  # pre-empted by a concurrent one.
-  if [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +0.5 2>/dev/null)" ]; then
+  # Break a stale lock (older than ~30s) left by a crashed run, then try once
+  # more. 30s is well above a normal handler's runtime, so a slow-but-live run is
+  # never pre-empted by a concurrent one. Age is computed in seconds via stat:
+  # BSD find rejects a fractional `-mmin +0.5`, so the old form silently never
+  # fired and a crash-orphaned lock would wedge all hotplug handling forever.
+  now=$(date +%s 2>/dev/null)
+  lock_mtime=$(stat -f %m "$LOCKDIR" 2>/dev/null)
+  if [ -n "$now" ] && [ -n "$lock_mtime" ] && [ "$((now - lock_mtime))" -gt 30 ]; then
     rmdir "$LOCKDIR" 2>/dev/null || true
   fi
   mkdir "$LOCKDIR" 2>/dev/null || exit 0

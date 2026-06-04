@@ -120,13 +120,15 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 
 **8. `display_changed` (label `flash_external_display`)** → `yabai_screen_flash.sh`: flashes a border if focus moved to the external display.
 
-*(Also: a one-shot menu-bar/startup sync runs at the end of yabairc. Specific line numbers are intentionally omitted here — they drift; grep the signal name in `yabairc`.)*
+*(Also: a one-shot startup sync — `"$YABAI_WORKSPACE_REFRESH" startup` — runs near the **top** of yabairc, before the rules. Specific line numbers are intentionally omitted here — they drift; grep the signal name in `yabairc`.)*
+
+> **Debugging signals:** there is no `yabai -m query --signals` in this yabai version (it errors `unknown command`). The authoritative list of registered signals is the `signal --add` lines in `yabairc` — grep them there.
 
 #### Environment Variables Exported
 
 | Variable | Value | Consumed By |
 |----------|-------|-------------|
-| `YABAI_WORKSPACE_REFRESH` | `${HOME}/code/various_scripts/yabai_workspace_refresh.sh` | Startup, hotplug handlers, rules |
+| `YABAI_WORKSPACE_REFRESH` | `${HOME}/code/various_scripts/yabai_workspace_refresh.sh` | Startup only (the one `"$YABAI_WORKSPACE_REFRESH" startup` call). The hotplug/reader scripts run the refresh script too, but via their own `$SCRIPT_DIR` path, not this env var. |
 | `YABAI_DISPLAYS` | `${HOME}/code/various_scripts/yabai_displays.sh` | `display_added` / `display_removed` signals |
 | `YABAI_MOUSE_FOLLOW` | `${HOME}/code/various_scripts/yabai_mouse_follow.sh` | `display_changed` signal |
 | `YABAI_SCREEN_FLASH` | `${HOME}/code/various_scripts/yabai_screen_flash.sh` | `display_changed` signal |
@@ -352,19 +354,21 @@ yabai_workspace_refresh.sh (cache writer)
     ├── Writes atomically: ~/.cache/yabai/workspace_cache.env
     └── Contents: DISPLAY_COUNT, MASTER_DISPLAY_INDEX, EXTERNAL_DISPLAY_INDEX, MASTER_DISPLAY_UUID
 
-Readers (all workspace-aware scripts):
-    ├── yabai_workspace.sh
-    ├── yabai_send_window.sh
-    ├── yabai_display.sh
-    ├── yabai_space_move.sh
-    └── yabai_display.sh
-    
+Readers (scripts that `. "$CACHE_FILE"` to resolve topology):
+    ├── yabai_workspace.sh      (focus/master)
+    ├── yabai_display.sh        (master/external focus)
+    ├── yabai_space_move.sh     (push/home-all)
+    ├── yabai_displays.sh       (hotplug; also re-writes it)
+    └── yabai_screen_flash.sh   (master-index lookup, cache-first)
+
     Load pattern:
         [ -r "$CACHE_FILE" ] && . "$CACHE_FILE"
         [ -n "$DISPLAY_COUNT" ] || call yabai_workspace_refresh.sh && retry
 ```
 
-**Key insight:** All reader scripts source the cache to avoid expensive repeated `yabai -m query --displays` calls. If the cache is missing or stale, they invoke `yabai_workspace_refresh.sh` to heal it.
+Not cache readers: `yabai_send_window.sh`, `yabai_reorder_spaces.sh`, and `yabai_fullscreen_focus.sh` work purely off live `yabai -m query` (label/UUID lookups), so they need no topology cache.
+
+**Key insight:** The reader scripts source the cache to avoid expensive repeated `yabai -m query --displays` calls. If the cache is missing or stale, they invoke `yabai_workspace_refresh.sh` to heal it.
 
 #### Labeled Space Stability
 
@@ -442,6 +446,8 @@ Labels persist through all these events, making the entire system stable and pre
 - `YABAI_FLASH_FADE` [0.22] — fade-out duration (seconds)
 - `YABAI_FLASH_RADIUS` [13] — corner radius in pixels
 
+> **⚠️ Gotcha if you edit `yabai_screen_flash.js`:** build the border `CGColor` with `$.CGColorCreateGenericRGB(r,g,b,a)` directly. Converting a *dynamically created* `NSColor` to `.CGColor` through the JXA bridge **SIGKILLs (137)** the process. Don't "simplify" it back to `NSColor…CGColor`. (Also: a GUI overlay from `osascript` only persists in the Aqua session, so it can only be tested live, not from a headless/Background launchd context.)
+
 #### Terminal Space Purity
 
 Terminal space is reserved for WezTerm only. Yabai enforces this via a `window_created` signal:
@@ -475,6 +481,22 @@ The 10 spaces are always maintained in the order: terminal, main, school, todo, 
 **Result:** Wherever labels roam, they maintain their stable sequence, making the layout predictable and recoverable.
 
 ## 5. Common Workflows & Runbook
+
+### Prerequisites & Bootstrap
+
+The single most fragile dependency in the whole system is the **scripting addition**, which yabai needs for native-fullscreen, space create/destroy, and the husk sweep. yabairc loads it on every (re)start via `sudo yabai --load-sa` (line ~3) and re-loads it from the `dock_did_restart` signal. For that `sudo` to run **non-interactively from a config/signal with no TTY**, three things must be in place — all currently satisfied on this machine, but required to reproduce on a new one:
+
+1. **Partially-disabled SIP.** `csrutil status` must show a *Custom Configuration* with at least **Filesystem Protections: disabled** (set from Recovery with `csrutil enable --without fs` or equivalent). Full SIP blocks the scripting addition.
+2. **Scripting addition installed.** `sudo yabai --install-sa` puts `yabai.osax` under `/Library/ScriptingAdditions/`. Re-run after a yabai upgrade (the binary hash changes — see #3).
+3. **Passwordless sudoers entry**, hash-pinned to the yabai binary, at `/etc/sudoers.d/yabai` (mode `0440`, owned by root):
+   ```
+   <admin-user> ALL = (root) NOPASSWD: sha256:<hash-of-yabai-binary> /opt/homebrew/bin/yabai --load-sa
+   ```
+   Generate the current line with `yabai --check-sa` (newer yabai) or copy the hash yabai prints. **A yabai version bump changes the binary hash and silently invalidates this line** — `--load-sa` then fails quietly and SA-dependent features stop working with no error in the config.
+
+**Symptom of a broken SA layer:** yabai starts and tiling/focus all work, but native-fullscreen toggling, space create/destroy, or the WezTerm husk sweep silently no-op. Fix = re-install the SA and regenerate the sudoers hash, not the config.
+
+Other login-time dependencies: **Karabiner** (caps_lock→hyper, the F13/F14/F18/F19 chords) and **Hammerspoon** (`hs.autoLaunch(true)`, for Arc pinning — degrades gracefully if absent). `skhd` and `yabai` run as user LaunchAgents.
 
 ### Focus a Workspace
 
@@ -689,6 +711,8 @@ yabai --restart-service
 launchctl kickstart -k gui/$(id -u)/com.koekeishiya.yabai
 ```
 
+> On restart, yabairc re-runs `sudo yabai --load-sa` (the scripting addition). This depends on the passwordless-sudo entry described in **Prerequisites & Bootstrap**. If a restart *appears* to succeed but scripting-addition features (native fullscreen, space create/destroy, the husk sweep) quietly stop working, check the scripting addition and the sudoers entry — not the config diff.
+
 **For Karabiner:**
 - Auto-reloads (watch the Karabiner menu for confirmation).
 - Manual reload: Preferences → Reload JSON
@@ -795,10 +819,19 @@ git push origin main
 
 ## ⚠️ Still Needs Testing (Unverified)
 
-These behaviors are believed correct from the code/logic but have **not** been verified live (no external display has been attached). Test them next time the external display is connected and update this section.
+*Last reviewed 2026-06-04; system was single-display (no external attached).* These behaviors are believed correct from the code/logic but have **not** been verified live. Test them next time the external display is connected and update this section (with a new date).
+
+**The whole Phase-1 multi-display redesign is single-display-untested.** Every cross-display path is gated off when `DISPLAY_COUNT<=1`, so a single-display session cannot exercise any of it. Sign these off on the next dock:
+- `hyper+\` **push** — round-trips the focused space to the other display and follows focus (incl. the 3-try focus-by-id race loop in `yabai_space_move.sh`).
+- `hyper+0` **home-all** — pulls every label back to the laptop.
+- **dock / undock** — `yabai_displays.sh added` comes up non-destructive (external empty); `removed` pull-home safety net relocates any straggler labels.
+- `yabai_workspace.sh master <label>` — native whole-space move home, then focus.
+- `yabai_reorder_spaces.sh` — reserves the **external's first space as scratch** (`pos=lo+1`) and orders labels from the second space.
+- `f13`/`f14` display focus → mouse-follow warp + external screen-flash.
 
 **✅ Now verified (no longer needs testing):**
 - **WezTerm auto-fullscreen on startup** — confirmed on a real launch: quit+reopen WezTerm and it comes up in native fullscreen, labeled `terminal`, at index 1. (The `gui_window()` timing edge case did not occur.)
+- **Single-display safe paths** — live-tested 2026-06-04 and confirmed non-destructive: every focus/no-op/idempotent script (focus by label, `space_move push`/`home-all` early-exit, `display.sh external` no-op, `fullscreen_focus` with WezTerm excluded, `terminal_follow` fast-path, `reorder_spaces` no-op, `workspace_refresh` run twice → byte-identical cache, spaces/windows unchanged).
 
 **Accessing a fullscreen window on the EXTERNAL display.** Getting it there works either way — `hyper+\` push moves a fullscreen Space to the external (empirically confirmed with Preview), and you can also just fullscreen an app already on the external. The question is reaching it again. Traced by code (`yabai_fullscreen_focus.sh`, `yabai_space_move.sh`, `yabai_workspace.sh`); two cases:
 
