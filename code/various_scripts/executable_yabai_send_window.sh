@@ -66,6 +66,11 @@ tidx=$(yabai -m query --spaces --space "$TARGET" 2>/dev/null | jq -r '.index // 
 yabai -m window --space "$TARGET" >/dev/null 2>&1 || exit 0
 if [ -n "$wid" ]; then
   yabai -m window "$wid" --focus >/dev/null 2>&1 || true
-else
-  yabai -m space --focus "$TARGET" >/dev/null 2>&1 || true
 fi
+# Verify focus actually landed on the target space; if the id-focus failed or raced
+# (stale id after the move, or a cross-display focus race), fall back to a bare
+# space --focus. Compared by LABEL so a reorder renumbering indices can't fool it.
+# On a single display the id-focus always brings the space forward, so this is a
+# no-op there (the fallback never fires).
+cur_now=$(yabai -m query --spaces --space 2>/dev/null | jq -r '.label // empty' 2>/dev/null)
+[ "$cur_now" = "$TARGET" ] || yabai -m space --focus "$TARGET" >/dev/null 2>&1 || true

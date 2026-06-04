@@ -32,7 +32,9 @@ midx=$(yabai -m query --displays --display mouse 2>/dev/null | jq -r '.index // 
 # Prefer the focused window's center; fall back to the focused display's center.
 target=$(yabai -m query --windows --window 2>/dev/null |
   jq -r --argjson fidx "$fidx" '
-    select(.display == $fidx and .frame != null)
+    select(.display == $fidx and .frame != null
+           and (.["is-minimized"] // false) == false
+           and (.["is-hidden"] // false) == false)
     | "\(.frame.x + .frame.w / 2) \(.frame.y + .frame.h / 2)"
   ' 2>/dev/null | head -n 1)
 [ -z "$target" ] && target=$(printf '%s' "$fdisp" |

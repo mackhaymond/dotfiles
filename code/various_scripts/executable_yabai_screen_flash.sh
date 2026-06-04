@@ -42,6 +42,7 @@ fh=$(printf '%s' "$fdisp" | jq -r '.frame.h // empty' 2>/dev/null)
 { [ -z "$fidx" ] || [ -z "$fid" ]; } && exit 0
 
 # Resolve the master (laptop) display index: cache first, then live UUID.
+# shellcheck disable=SC1090
 master=$( . "$CACHE_FILE" 2>/dev/null; printf '%s' "${MASTER_DISPLAY_INDEX:-}" )
 case "$master" in
   ''|*[!0-9]*)
@@ -55,6 +56,12 @@ esac
 # Flash only on a NON-master display; if master is unknown, stay conservative.
 [ -z "$master" ] && exit 0
 [ "$fidx" = "$master" ] && exit 0
+
+# Single-instance guard: each flash blocks its runloop for ~hold+fade (~0.4s). A
+# burst of display_changed events would otherwise stack overlapping overlays. flock
+# is absent on this machine, so skip if a flash JXA is already in flight (the .js
+# distinguishes it from this .sh, so pgrep can't match self).
+pgrep -f "yabai_screen_flash.js" >/dev/null 2>&1 && exit 0
 
 osascript -l JavaScript "$JS" \
   "$fid" "$FLASH_BORDER" "$FLASH_R" "$FLASH_G" "$FLASH_B" "$FLASH_HOLD" "$FLASH_FADE" "$FLASH_RADIUS" "$fw" "$fh" \

@@ -26,25 +26,41 @@ master=$(printf '%s' "$displays" | jq -r --arg u "$MASTER_DISPLAY_UUID" '
   ([.[] | select(.uuid == $u) | .index][0]) // (min_by(.frame.w * .frame.h).index) // empty
 ' 2>/dev/null)
 
-for disp in $(printf '%s' "$displays" | jq -r '.[].index' 2>/dev/null); do
-  lo=$(yabai -m query --spaces 2>/dev/null |
-    jq -r --argjson d "$disp" '[.[] | select(.display == $d) | .index] | min // empty' 2>/dev/null)
-  case "$lo" in ''|*[!0-9]*) continue ;; esac
+# Each `space --move` renumbers indices on its display, so a single pass that
+# derives the target `pos` from a pre-move snapshot can leave a genuinely scrambled
+# display short of canonical order. Re-run the whole placement pass, re-deriving the
+# per-display base index each time, until a full pass issues NO move (converged) or
+# a small attempt cap is hit. When everything is already ordered the first pass
+# moves nothing and the loop exits immediately -- the common case stays a cheap
+# query-only no-op, byte-identical to before.
+attempt=0
+moved=1
+while [ "$moved" = "1" ] && [ "$attempt" -lt 4 ]; do
+  moved=0
+  attempt=$((attempt + 1))
 
-  # Reserve the first space of a non-master display as scratch.
-  if [ -n "$master" ] && [ "$disp" != "$master" ]; then
-    pos=$((lo + 1))
-  else
-    pos=$lo
-  fi
+  for disp in $(printf '%s' "$displays" | jq -r '.[].index' 2>/dev/null); do
+    lo=$(yabai -m query --spaces 2>/dev/null |
+      jq -r --argjson d "$disp" '[.[] | select(.display == $d) | .index] | min // empty' 2>/dev/null)
+    case "$lo" in ''|*[!0-9]*) continue ;; esac
 
-  for label in $LABELS; do
-    info=$(yabai -m query --spaces --space "$label" 2>/dev/null) || continue
-    d=$(printf '%s' "$info" | jq -r '.display // empty' 2>/dev/null)
-    [ "$d" = "$disp" ] || continue
-    cur=$(printf '%s' "$info" | jq -r '.index // empty' 2>/dev/null)
-    case "$cur" in ''|*[!0-9]*) pos=$((pos + 1)); continue ;; esac
-    [ "$cur" != "$pos" ] && yabai -m space "$label" --move "$pos" >/dev/null 2>&1
-    pos=$((pos + 1))
+    # Reserve the first space of a non-master display as scratch.
+    if [ -n "$master" ] && [ "$disp" != "$master" ]; then
+      pos=$((lo + 1))
+    else
+      pos=$lo
+    fi
+
+    for label in $LABELS; do
+      info=$(yabai -m query --spaces --space "$label" 2>/dev/null) || continue
+      d=$(printf '%s' "$info" | jq -r '.display // empty' 2>/dev/null)
+      [ "$d" = "$disp" ] || continue
+      cur=$(printf '%s' "$info" | jq -r '.index // empty' 2>/dev/null)
+      case "$cur" in ''|*[!0-9]*) pos=$((pos + 1)); continue ;; esac
+      if [ "$cur" != "$pos" ]; then
+        yabai -m space "$label" --move "$pos" >/dev/null 2>&1 && moved=1
+      fi
+      pos=$((pos + 1))
+    done
   done
 done

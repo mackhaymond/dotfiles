@@ -9,7 +9,6 @@ yabai -m config display_arrangement_order horizontal
 yabai -m config window_shadow off
 
 yabai -m config top_padding 0
-yabai -m config --space 1 top_padding 0
 
 YABAI_WORKSPACE_REFRESH="${HOME}/code/various_scripts/yabai_workspace_refresh.sh"
 YABAI_DISPLAYS="${HOME}/code/various_scripts/yabai_displays.sh"
@@ -17,19 +16,15 @@ YABAI_MOUSE_FOLLOW="${HOME}/code/various_scripts/yabai_mouse_follow.sh"
 YABAI_SCREEN_FLASH="${HOME}/code/various_scripts/yabai_screen_flash.sh"
 "$YABAI_WORKSPACE_REFRESH" startup
 
-# yabai -m config mouse_follows_focus on
-
 yabai -m rule --add app="^System Settings$" manage=off
 yabai -m rule --add app="^Calculator$" manage=off
 yabai -m rule --add app="^BetterTouchTool$" manage=off
 yabai -m rule --add app="^Karabiner-Elements$" manage=off
 yabai -m rule --add app="^python$" manage=off
-# yabai -m rule --add app="^Messages$" manage=off 
 yabai -m rule --add app="^DaisyDisk$" manage=off
 yabai -m rule --add app="^iStat Menus$" manage=off border=off
-yabai -m rule --add app="^Steam$" manage=off 
-# yabai -m rule --add app="^Parallels Desktop$" manage=off 
-yabai -m rule --add app="^Activity Monitor$" manage=off 
+yabai -m rule --add app="^Steam$" manage=off
+yabai -m rule --add app="^Activity Monitor$" manage=off
 yabai -m rule --add app="^Mail$" manage=off 
 yabai -m rule --add app="^Finder$" manage=off
 yabai -m rule --add app="^BetterZip$" manage=off 
@@ -47,7 +42,7 @@ yabai -m rule --add app="^Antidote$" manage=off
 yabai -m signal --add event=window_created action='
   win=$YABAI_WINDOW_ID
   info=$(yabai -m query --windows --window "$win" 2>/dev/null) || exit 0
-  app=$(printf "%s" "$info" | jq -r .app)
+  app=$(printf "%s" "$info" | jq -r ".app // empty" 2>/dev/null)
   # New Arc window -> re-pin the Arc MAIN windows via Hammerspoon (only it can
   # read AXIdentifier to tell a main window from a Little Arc popup). Same trigger
   # cadence as the other apps re-applying their space= rules. No-op if hs is down.
@@ -82,8 +77,14 @@ yabai -m signal --add event=window_created action='
 yabai -m signal --add event=space_changed action='
   "$HOME/code/various_scripts/yabai_terminal_follow.sh"
   tidx=$(yabai -m query --spaces --space terminal 2>/dev/null | jq -r .index 2>/dev/null)
-  [ -n "$tidx" ] && [ "$tidx" != "null" ] && [ "$YABAI_SPACE_INDEX" = "$tidx" ] \
-    && osascript -e "tell application \"WezTerm\" to activate"
+  case "$tidx" in ""|*[!0-9]*) exit 0 ;; esac
+  [ "$YABAI_SPACE_INDEX" = "$tidx" ] || exit 0
+  # Only raise WezTerm if it actually has a window on the terminal space. The space
+  # is no longer reserved, so other windows may share it -- and a bare "activate"
+  # would LAUNCH WezTerm if it is not running. Guard on a live WezTerm window.
+  has_wt=$(yabai -m query --windows --space terminal 2>/dev/null \
+    | jq -r "any(.[]; .app == \"wezterm-gui\" or .app == \"WezTerm\")" 2>/dev/null)
+  [ "$has_wt" = "true" ] && osascript -e "tell application \"WezTerm\" to activate"
   exit 0
 '
 

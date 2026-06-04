@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -u
+
 # Reconcile the canonical labeled spaces and refresh the display cache.
 #
 # Jobs (all idempotent, all non-destructive):
@@ -28,11 +30,18 @@ MASTER_DISPLAY_INDEX=$(
     empty
   ' <<<"$DISPLAYS_JSON" | head -n 1
 )
-EXTERNAL_DISPLAY_INDEX=$(
-  jq -r --argjson master "${MASTER_DISPLAY_INDEX:-0}" '
-    .[] | select(.index != $master) | .index
-  ' <<<"$DISPLAYS_JSON" | head -n 1
-)
+# Only meaningful once master is known; computing it against a placeholder master
+# (the old `${MASTER_DISPLAY_INDEX:-0}`) conflated "master unknown" with "master is
+# display 0" and could write an inconsistent master(empty)/external(set) pair.
+if [ -n "${MASTER_DISPLAY_INDEX:-}" ]; then
+  EXTERNAL_DISPLAY_INDEX=$(
+    jq -r --argjson master "$MASTER_DISPLAY_INDEX" '
+      .[] | select(.index != $master) | .index
+    ' <<<"$DISPLAYS_JSON" | head -n 1
+  )
+else
+  EXTERNAL_DISPLAY_INDEX=""
+fi
 
 refresh_spaces_json() {
   SPACES_JSON=$(yabai -m query --spaces 2>/dev/null) || exit 0

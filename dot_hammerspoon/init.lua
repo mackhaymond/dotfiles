@@ -38,14 +38,21 @@ local function decode(s)
   return nil
 end
 
--- Arc window kind from AXIdentifier: "main" | "little" | "other" | "unknown".
+-- Arc window kind from an AXIdentifier string: "main" | "little" | "other" |
+-- "unknown" (non-string id). SINGLE source of truth for the prefix mapping -- both
+-- arcKind() and classifyCurrent() route through it so the two can never drift in
+-- prefix order or sentinel value.
+local function arcKindFromId(id)
+  if type(id) ~= "string" then return "unknown" end
+  if id:sub(1, 16) == "bigBrowserWindow" then return "main" end
+  if id:sub(1, 19) == "littleBrowserWindow" then return "little" end
+  return "other"
+end
+
+-- Kind of an hs.window via its AX element (used by the focused-window guard helper).
 local function arcKind(win)
   local ax = hs.axuielement.windowElement(win)
-  local id = ax and ax:attributeValue("AXIdentifier")
-  if type(id) ~= "string" then return "unknown" end
-  if id:sub(1, 19) == "littleBrowserWindow" then return "little" end
-  if id:sub(1, 16) == "bigBrowserWindow" then return "main" end
-  return "other"
+  return arcKindFromId(ax and ax:attributeValue("AXIdentifier"))
 end
 
 local function labelIndex(label)
@@ -63,18 +70,14 @@ local function arcAxWindows()
   return (appEl and appEl:attributeValue("AXWindows")) or {}
 end
 
-local function idFromAx(axid)
-  if type(axid) ~= "string" then return nil end
-  if axid:sub(1, 16) == "bigBrowserWindow" then return "main" end
-  if axid:sub(1, 19) == "littleBrowserWindow" then return "little" end
-  return "other"
-end
-
 -- Classify whatever Arc windows are currently AX-visible (current Space) and fold
--- them into mainSet. Cheap; only touches what is on-screen now.
+-- them into mainSet. Cheap; only touches what is on-screen now. A non-string id
+-- yields "unknown", which matches NEITHER branch below -- a deliberate no-op that
+-- preserves a window's prior classification across a transient AX read miss (do not
+-- "simplify" the elseif into a plain else that would nil a known main on a miss).
 local function classifyCurrent()
   for _, axw in ipairs(arcAxWindows()) do
-    local kind = idFromAx(axw:attributeValue("AXIdentifier"))
+    local kind = arcKindFromId(axw:attributeValue("AXIdentifier"))
     local hw = axw.asHSWindow and axw:asHSWindow()
     if hw then
       if kind == "main" then mainSet[hw:id()] = true
@@ -118,6 +121,11 @@ local function pinMains()
   end
 end
 
+-- arcSync (and the debug/guard helpers arcFocusedKind/pinNow/arcDiag below) are
+-- GLOBAL functions so they are reachable via `hs -c "..."` IPC, which evaluates in
+-- the global environment -- a `local function` would be invisible to it. mainSet is
+-- likewise global so it persists across the separate `hs -c` invocations that share
+-- this Lua state; making it local would reset cross-Space main tracking each call.
 function arcSync()
   classifyCurrent()
   pinMains()
@@ -129,8 +137,10 @@ end
 hs.timer.doAfter(1.0, arcSync)
 
 -- Kind of the currently FOCUSED window ("main" | "little" | "other" | "none" |
--- "notarc"). Used by yabai_send_window.sh to protect a main Arc window from being
--- force-moved off its home space. Fast: only inspects the one focused window.
+-- "notarc"). Kept for an OPTIONAL main-only force-move guard in yabai_send_window.sh;
+-- the shipped guard instead uses a pure-yabai main/school space check (the AX
+-- focused-window races with yabai's focus), so this is currently unreferenced. Fast:
+-- only inspects the one focused window.
 function arcFocusedKind()
   local w = hs.window.focusedWindow()
   if not w then return "none" end

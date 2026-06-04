@@ -2,10 +2,6 @@
 hyper - z : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_skhd_stack_next.sh
 hyper - x : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_skhd_stack_prev.sh
 
-# change focus between spaces
-# hyper - a: yabai -m space --focus prev
-# hyper - s: yabai -m space --focus next
-
 # change focus by space index
 hyper - 0x32: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus terminal
 hyper - 1: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus main
@@ -74,9 +70,3 @@ hyper + fn - m : yabai -m window --toggle native-fullscreen
 
 # balance windows
 hyper - b: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_skhd_mode.sh
-
-# hyper - ` : open/show/hide music
-# hyper - \ : enable/disable keypress recording
-
-# restart keybind
-# hyper - 0x2A : yabai --restart-service

@@ -14,6 +14,7 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:
 export USER="${USER:-$(id -un)}"
 
 CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${HOME}/.cache/yabai/workspace_cache.env}"
+MASTER_DISPLAY_UUID="${YABAI_MASTER_DISPLAY_UUID:-37D8832A-2D66-02CA-B9F7-8F30A301B230}"
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 
 ACTION="${1:-}"
@@ -87,7 +88,15 @@ case "$ACTION" in
     exit 0
     ;;
   home-all)
-    master="${MASTER_DISPLAY_INDEX:-1}"
+    # Resolve master from LIVE topology (UUID first, smallest-area fallback) so a
+    # stale/wrong cached index can't aim pull-home at the wrong display; fall back
+    # to the cache, then to 1. Mirrors yabai_displays.sh's removed branch.
+    master=$(yabai -m query --displays 2>/dev/null |
+      jq -r --arg uuid "$MASTER_DISPLAY_UUID" '
+        ([.[] | select(.uuid == $uuid) | .index][0]) // (min_by(.frame.w * .frame.h).index) // empty
+      ' 2>/dev/null | head -n 1)
+    case "$master" in ''|*[!0-9]*) master="${MASTER_DISPLAY_INDEX:-}" ;; esac
+    case "$master" in ''|*[!0-9]*) master=1 ;; esac
     for label in $LABELS; do
       disp=$(yabai -m query --spaces --space "$label" 2>/dev/null | jq -r '.display // empty' 2>/dev/null)
       [ -n "$disp" ] && [ "$disp" != "$master" ] &&
