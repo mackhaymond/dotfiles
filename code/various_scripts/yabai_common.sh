@@ -83,3 +83,80 @@ yabai_pull_fullscreen_home() {
     yabai -m space "$idx" --display "$master" >/dev/null 2>&1 || true
   done
 }
+
+# --- ext: the on-demand external "scratch-work" space ---------------------------
+# `ext` is a SPECIAL label, NOT one of the canonical 10 in YABAI_LABELS. It is
+# created on demand on the EXTERNAL display to hold loose, unpinned windows flung
+# there with hyper+fn+g, lives only while docked, and is dissolved back into `main`
+# (its windows moved there, the space destroyed) on home-all / push-while-on-ext /
+# undock. It always sits at a NON-first position on the external (never the
+# disconnect-fragile scratch space).
+YABAI_EXT_TARGET="main"   # where dissolved ext windows land on the laptop
+
+# Emit the current `ext` space index, or nothing if it doesn't exist.
+yabai_ext_index() {
+  yabai -m query --spaces --space ext 2>/dev/null | jq -r '.index // empty' 2>/dev/null | head -n 1
+}
+
+# Ensure an `ext` space exists on external display $1 and emit its index. Reuses an
+# existing `ext`. Otherwise CREATES a space (it lands on whatever display is active
+# -- usually master) and then MOVES it onto the external by its stable id, appending
+# after the scratch so `ext` is never the external's first (disconnect-fragile)
+# space. We move-by-id rather than focus-then-create because `display --focus`
+# races, and a create that lands on the wrong display silently mislabels the scratch.
+# Needs the SA (space create/move/label).
+yabai_ensure_ext() {
+  local ext="$1" idx before newid d
+  idx=$(yabai_ext_index)
+  case "$idx" in ''|*[!0-9]*) ;; *) printf '%s' "$idx"; return 0 ;; esac
+  case "$ext" in ''|*[!0-9]*) return 1 ;; esac
+
+  before=$(yabai -m query --spaces 2>/dev/null | jq -c '[.[].id]' 2>/dev/null)
+  yabai -m space --create >/dev/null 2>&1 || true
+  newid=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson before "${before:-[]}" '
+    ([.[].id] - $before)[0] // empty' 2>/dev/null)
+  case "$newid" in ''|*[!0-9]*) return 1 ;; esac
+
+  d=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$newid" '
+    .[] | select(.id == $id) | .display' 2>/dev/null | head -n 1)
+  if [ "$d" != "$ext" ]; then
+    idx=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$newid" '
+      .[] | select(.id == $id) | .index' 2>/dev/null | head -n 1)
+    case "$idx" in ''|*[!0-9]*) ;; *) yabai -m space "$idx" --display "$ext" >/dev/null 2>&1 || true ;; esac
+    # Wait for the cross-display space move to actually land before we label/use it
+    # -- yabai is busy reindexing right after, and a too-soon follow-up move gets
+    # silently dropped.
+    for _s in 1 2 3 4 5 6; do
+      d=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$newid" '
+        .[] | select(.id == $id) | .display' 2>/dev/null | head -n 1)
+      [ "$d" = "$ext" ] && break
+      sleep 0.1
+    done
+  fi
+  idx=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$newid" '
+    .[] | select(.id == $id) | .index' 2>/dev/null | head -n 1)
+  case "$idx" in ''|*[!0-9]*) return 1 ;; esac
+  yabai -m space "$idx" --label ext >/dev/null 2>&1 || true
+  printf '%s' "$idx"
+}
+
+# Dissolve `ext`: move all its windows to YABAI_EXT_TARGET (main) and destroy the
+# now-empty space. No-op if `ext` doesn't exist (also cleans up an empty `ext`). If
+# `ext` happens to be its display's LAST space (can't be destroyed), the label is
+# dropped instead so no empty `ext` husk lingers. Does NOT change focus.
+yabai_dissolve_ext() {
+  local idx wids wid
+  idx=$(yabai_ext_index)
+  case "$idx" in ''|*[!0-9]*) return 0 ;; esac
+  wids=$(yabai -m query --windows --space ext 2>/dev/null | jq -r '.[].id' 2>/dev/null)
+  for wid in $wids; do
+    case "$wid" in ''|*[!0-9]*) continue ;; esac
+    yabai -m window "$wid" --space "$YABAI_EXT_TARGET" >/dev/null 2>&1 || true
+  done
+  idx=$(yabai_ext_index)
+  case "$idx" in ''|*[!0-9]*) return 0 ;; esac
+  yabai -m space "$idx" --destroy >/dev/null 2>&1 || true
+  if [ -n "$(yabai_ext_index)" ]; then
+    yabai -m space ext --label >/dev/null 2>&1 || true
+  fi
+}

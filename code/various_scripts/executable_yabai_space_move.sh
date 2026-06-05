@@ -43,6 +43,16 @@ case "$ACTION" in
     sdisp=$(printf '%s' "$info" | jq -r '.display // empty' 2>/dev/null)
     [ -z "$sidx" ] && exit 0
 
+    # If the focused space is the on-demand `ext` scratch-work space, "pushing it
+    # home" DISSOLVES it into main (windows moved there, ext destroyed) and lands
+    # you on main -- rather than relocating the ext space itself. (yabai_common.sh.)
+    slabel=$(printf '%s' "$info" | jq -r '.label // ""' 2>/dev/null)
+    if [ "$slabel" = "ext" ]; then
+      yabai_dissolve_ext
+      yabai -m space --focus "$YABAI_EXT_TARGET" >/dev/null 2>&1 || true
+      exit 0
+    fi
+
     # Move THAT space to the explicit other display (deterministic), falling back
     # to relative next/prev if the cache indices are unavailable.
     target=""
@@ -91,6 +101,10 @@ case "$ACTION" in
     # unlabeled (outside the labeled model), so the loop above misses them and a
     # fullscreened window would otherwise be left behind on the external.
     yabai_pull_fullscreen_home "$master"
+    # Dissolve the on-demand `ext` scratch-work space into main (windows moved,
+    # ext destroyed). main was pulled home above, so the windows arrive on the
+    # laptop. No-op if ext doesn't exist.
+    yabai_dissolve_ext
     yabai -m display --focus "$master" >/dev/null 2>&1 || true
     yabai -m rule --apply >/dev/null 2>&1 || true
     "$SCRIPT_DIR/yabai_reorder_spaces.sh" >/dev/null 2>&1 || true

@@ -39,6 +39,13 @@ hyper + fn - d: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh
 hyper + fn - f: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh chatgpt
 f19 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh codex # fn+caps_lock+escape -> F19
 
+# hyper+fn+g: fling the focused (unpinned) window to the external's on-demand `ext`
+# scratch-work space (created on first use), and follow. Stacks; cycle with hyper+z/x.
+# hyper+g: focus `ext` (no-op if it doesn't exist). `ext` dissolves back into main on
+# hyper+0 / pushing it / undock. No-op with one display.
+hyper + fn - g : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window_external.sh
+hyper - g : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus ext
+
 f13 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_display.sh master
 f14 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_display.sh external
 

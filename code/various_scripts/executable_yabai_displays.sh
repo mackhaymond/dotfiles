@@ -120,6 +120,11 @@ case "$ACTION" in
       [ -n "$disp" ] && [ "$disp" != "$master" ] &&
         yabai -m space "$label" --display "$master" >/dev/null 2>&1 || true
     done
+    # Clean up the on-demand `ext` scratch-work space exactly as home-all does:
+    # move its windows to main and destroy it. If macOS already reparented `ext`
+    # onto the laptop on disconnect it gets dissolved here; if macOS destroyed it
+    # outright this is a no-op.
+    yabai_dissolve_ext
     yabai -m rule --apply >/dev/null 2>&1 || true
     # Final refresh so labels/cache settle after the pull-home.
     "$SCRIPT_DIR/yabai_workspace_refresh.sh" >/dev/null 2>&1 || true
