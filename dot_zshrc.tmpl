@@ -205,9 +205,11 @@ y() {
 # `chezmoi verify`'s op:// 1Password prompts; that constraint is gone
 # (op CLI no longer needs a TTY in this setup).
 #
-# Cost: verify templates every managed file (~200-500ms for 145 files).
+# Cost: verify templates every managed file (~3s for ~260 files here).
 # Acceptable because (a) it runs detached in a `&!` subshell so prompt
-# latency is zero, and (b) the 60s throttle caps load.
+# latency is zero, and (b) the 60s throttle caps load. The stale-lock
+# reclaim threshold (lock_max_age, 300s) is decoupled from this so a slow
+# verify is never misjudged dead and double-run.
 #
 # Cache layout under ~/.cache/chezmoi-drift/ :
 #   state       — current drift glyphs. Only ever written atomically
@@ -237,18 +239,27 @@ y() {
 #     successful fetch's snapshot of upstream; `?` appears after 24h.
 zmodload -F zsh/stat b:zstat 2>/dev/null
 zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
-# zsh builtin mkdir/rm work in `&!` subshells where the command-hash
+# $sysparams[pid] is the REAL pid inside `( ) &!` subshells (plain $$ stays the
+# parent pid there), used for collision-free temp/reclaim names below.
+zmodload -F zsh/system p:sysparams 2>/dev/null
+# zsh builtin mkdir/rm/mv work in `&!` subshells where the command-hash
 # table is empty and the /usr/bin equivalents would be "not found".
-zmodload -F zsh/files b:mkdir b:rm 2>/dev/null
+# `mv` is loaded too so the atomic state publish (tmp + mv-rename) stays
+# fork-free and works even when PATH lacks coreutils.
+zmodload -F zsh/files b:mkdir b:rm b:mv 2>/dev/null
 
 _chezmoi_drift_check() {
   local cache="$HOME/.cache/chezmoi-drift"
   local result="$cache/state"
   local marker="$cache/last-check"
   local lockdir="$cache/lock"
-  local max_age=60
-  (( ${+commands[chezmoi]} )) || return 0
-  mkdir -p "$cache"
+  local max_age=60        # throttle window: at most one verify per shell per 60s
+  local lock_max_age=300  # stale-lock reclaim; MUST exceed worst-case verify
+                          # (~3s for ~260 files here) so a slow-but-live holder
+                          # is never misjudged dead and double-verified.
+  # If chezmoi vanished mid-session (uninstalled / dropped from PATH), clear a
+  # previously-exported indicator instead of leaving stale glyphs on the prompt.
+  (( ${+commands[chezmoi]} )) || { unset STARSHIP_CHEZMOI_DRIFT; return 0; }
   # Expose current cache content to starship via env var, every prompt.
   # `$(<file)` is zsh's no-fork file read. Empty/missing file → unset →
   # [env_var.STARSHIP_CHEZMOI_DRIFT] in starship.toml renders nothing.
@@ -271,7 +282,10 @@ _chezmoi_drift_check() {
   local git_bin="${commands[git]:-/usr/bin/git}"
   local chezmoi_bin="${commands[chezmoi]}"
   # Claim the 60s window for this shell. Other precmd calls in this shell
-  # short-circuit on the fresh marker mtime; other shells likewise.
+  # short-circuit on the fresh marker mtime; other shells likewise. The cache
+  # dir is created here (not every prompt) — the throttle-fresh fast path above
+  # writes nothing under $cache, so it needn't pay the mkdir syscall.
+  mkdir -p "$cache"
   : >| "$marker"
   ( # Inter-shell mutex via mkdir(2), which is atomic. If another shell's
     # bg job already holds the lock, exit silently rather than racing —
@@ -279,16 +293,26 @@ _chezmoi_drift_check() {
     # zsh/files mkdir + rm are builtins loaded above (fork-free, work in
     # `&!` where the command hash table is empty).
     #
-    # Stale-lock recovery: if the lock dir is older than $max_age, the
-    # previous holder must be dead (typical bg job is <5s). Reclaim it.
+    # Stale-lock recovery: if the lock dir is older than $lock_max_age, the
+    # previous holder must be dead (typical bg job is ~3s). Reclaim it.
     # Without this, a SIGKILL'd bg job would deadlock all future refreshes.
+    # Reclaim atomically: rename-then-delete so that if two shells both see the
+    # same stale lock, only the one whose `mv` wins removes it; the loser's mv
+    # fails (already moved) and it falls through to the mkdir below, which then
+    # fails against the winner's fresh lock and returns — preserving the
+    # one-verify-per-window mutex even in the cold-start/post-crash race.
     if [[ -d "$lockdir" ]]; then
       local -A ls; zstat -L -H ls +mtime "$lockdir" 2>/dev/null
-      (( EPOCHSECONDS - ${ls[mtime]:-0} > max_age )) && rm -rf -- "$lockdir" 2>/dev/null
+      if (( EPOCHSECONDS - ${ls[mtime]:-0} > lock_max_age )); then
+        local reclaim="$lockdir.reclaim.$sysparams[pid]$RANDOM"
+        mv -- "$lockdir" "$reclaim" 2>/dev/null && rm -rf -- "$reclaim" 2>/dev/null
+      fi
     fi
     mkdir "$lockdir" 2>/dev/null || return
-    # Release the lock on every exit path including signals.
-    trap "rm -rf -- \"$lockdir\" 2>/dev/null" EXIT INT TERM HUP
+    # Release the lock on every exit path including signals. Single-quoted so
+    # $lockdir expands at trap-fire time (a stable local in this subshell) — no
+    # expanded-path re-parse hazard if the cache path ever holds odd characters.
+    trap 'rm -rf -- "$lockdir" 2>/dev/null' EXIT INT TERM HUP
     local drifted="" source_dir
     # Glyph ~ : authoritative content drift via `chezmoi verify`.
     # Returns 0 iff every managed live file matches its source. Catches
@@ -298,8 +322,12 @@ _chezmoi_drift_check() {
     # We avoid invoking `chezmoi source-path` (slow, boots templater) and
     # use the canonical XDG default with a one-shot fallback.
     source_dir="$HOME/.local/share/chezmoi"
-    [[ -d "$source_dir/.git" ]] || source_dir=$("$chezmoi_bin" source-path 2>/dev/null)
-    if [[ -d "$source_dir/.git" ]]; then
+    # `rev-parse --git-dir` (not `[[ -d .git ]]`) so a source that is a git
+    # worktree or submodule — where `.git` is a gitfile, not a dir — still
+    # reports its git state instead of silently suppressing * / ⇡ / ⇣ / ?.
+    "$git_bin" -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1 \
+      || source_dir=$("$chezmoi_bin" source-path 2>/dev/null)
+    if "$git_bin" -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1; then
       if [[ -n "$("$git_bin" -C "$source_dir" status --porcelain 2>/dev/null)" ]]; then
         drifted+="*"
       fi
@@ -329,8 +357,10 @@ _chezmoi_drift_check() {
     fi
     # Atomic write: tmpfile in the same dir + mv. Readers never see a
     # partial or empty $result — they see either the old state or the
-    # new state, never an in-between. zsh/files mv is a builtin (fork-free).
-    local tmp="$result.tmp.$$"
+    # new state, never an in-between. zsh/files mv is a builtin (fork-free,
+    # loaded above). $sysparams[pid] gives a per-subshell-unique tmp name
+    # ($$ stays the parent pid here, so concurrent bg jobs would collide).
+    local tmp="$result.tmp.$sysparams[pid]$RANDOM"
     print -n "$drifted" >| "$tmp"
     mv -f -- "$tmp" "$result"
   ) &!
@@ -357,15 +387,22 @@ _chezmoi_remote_fetch() {
   local git_bin="${commands[git]:-/usr/bin/git}"
   local chezmoi_bin="${commands[chezmoi]}"
   ( local source_dir="$HOME/.local/share/chezmoi"
-    [[ -d "$source_dir/.git" ]] || source_dir=$("$chezmoi_bin" source-path 2>/dev/null)
-    [[ -d "$source_dir/.git" ]] || return
+    # rev-parse --git-dir handles worktree/submodule gitfiles too (see drift check).
+    "$git_bin" -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1 \
+      || source_dir=$("$chezmoi_bin" source-path 2>/dev/null)
+    "$git_bin" -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1 || return
     "$git_bin" -C "$source_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' \
       >/dev/null 2>&1 || return
-    # GIT_HTTP_LOW_SPEED_LIMIT/TIME caps HTTPS fetches at ~15s on stalls;
-    # for SSH this relies on the user's ssh ServerAliveInterval. Without
-    # this an unreachable remote can leave orphan git fetch processes
-    # accumulating one every 15 minutes for as long as the shell lives.
+    # Cap a stalled fetch so it can't leave an orphan accumulating every 15 min.
+    # GIT_HTTP_LOW_SPEED_LIMIT/TIME covers smart-HTTP(S) only — a no-op for SSH,
+    # which is the remote actually in use (git@github.com). GIT_SSH_COMMAND adds
+    # the SSH-transport equivalent: ConnectTimeout bounds the initial connect
+    # (ssh defaults to none), ServerAlive* kills a mid-transfer stall, and
+    # BatchMode prevents an interactive auth/passphrase prompt from blocking the
+    # detached job forever (a failed fetch degrades gracefully — ⇣ goes stale,
+    # then `?` after 24h). Scoped to this one fetch; not exported.
     if GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=15 \
+       GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=2' \
        "$git_bin" -C "$source_dir" fetch --quiet --no-tags --prune 2>/dev/null
     then
       : >| "$fetch_ok"
@@ -473,6 +510,15 @@ chezmoi() {
   local rc=$?
   # Dry-run mutates nothing — leave the indicator cache alone.
   (( dry_run )) && return $rc
+  # Read-only subcommands can't change drift state, so skip the re-verify they
+  # would otherwise force (this is what PASS 1's $cmd is for — without this the
+  # wrapper churned a background verify after every `chezmoi diff`/`status`/etc).
+  # Conservative list: anything not clearly read-only still invalidates.
+  local -a RO_CMDS=(
+    cat data diff status verify managed source-path dump
+    execute-template doctor help completion
+  )
+  [[ -n "$cmd" && -n "${RO_CMDS[(r)$cmd]}" ]] && return $rc
   # Invalidate the throttle marker so the NEXT precmd re-runs verify.
   # We deliberately do NOT delete `state` — that would blank the indicator
   # for the ~500ms window until the bg job finishes. Keeping the old state
