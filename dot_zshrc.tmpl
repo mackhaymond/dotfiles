@@ -361,10 +361,42 @@ _chezmoi_drift_check() {
     # loaded above). $sysparams[pid] gives a per-subshell-unique tmp name
     # ($$ stays the parent pid here, so concurrent bg jobs would collide).
     local tmp="$result.tmp.$sysparams[pid]$RANDOM"
+    local old=""; [[ -f "$result" ]] && old="$(<"$result")"
     print -n "$drifted" >| "$tmp"
     mv -f -- "$tmp" "$result"
+    # Live in-place refresh: if the glyphs actually changed, poke the shell
+    # that spawned us so it redraws the prompt now — no Enter needed. zsh keeps
+    # $$ = the parent's pid inside this subshell (verified), so this targets the
+    # interactive shell, not the subshell. `kill` is a builtin (works in this
+    # fork-free &! subshell); silent if the shell already exited. Skipping the
+    # signal when unchanged avoids needless redraws every refresh cycle.
+    [[ "$drifted" != "$old" ]] && kill -USR1 $$ 2>/dev/null
   ) &!
 }
+
+# ── Live in-place refresh for the drift indicator ───────────────────────────
+# _chezmoi_drift_check's bg job sends SIGUSR1 to its spawning shell when the
+# glyphs change. This trap re-reads the cache into the env var and, if we're
+# sitting idle at the prompt, redraws it via `zle reset-prompt` — so the
+# indicator updates the instant the ~3s verify finishes, with no keypress.
+# starship's PROMPT is a live `$(starship prompt)` command substitution
+# (prompt_subst), so reset-prompt re-reads STARSHIP_CHEZMOI_DRIFT fresh.
+# While a command is running (not at the prompt) we only refresh the env var;
+# the next prompt renders it. The _CHEZMOI_AT_PROMPT flag (set by a precmd that
+# runs last, cleared by preexec) gates reset-prompt so it's only called while
+# zle is active.
+typeset -g _CHEZMOI_AT_PROMPT=0
+TRAPUSR1() {
+  local result="$HOME/.cache/chezmoi-drift/state"
+  if [[ -s "$result" ]]; then
+    export STARSHIP_CHEZMOI_DRIFT="$(<"$result")"
+  else
+    unset STARSHIP_CHEZMOI_DRIFT
+  fi
+  (( _CHEZMOI_AT_PROMPT )) && zle reset-prompt 2>/dev/null
+}
+_chezmoi_prompt_ready() { _CHEZMOI_AT_PROMPT=1; }  # precmd: about to show prompt
+_chezmoi_prompt_busy()  { _CHEZMOI_AT_PROMPT=0; }  # preexec: command running
 
 # Background fetch of the chezmoi source remote so the B flag in
 # _chezmoi_drift_check stays fresh. Runs at most once per 15 minutes,
@@ -452,6 +484,14 @@ typeset -ga precmd_functions
   precmd_functions+=(_chezmoi_remote_fetch)
 [[ -z "${precmd_functions[(r)_starship_jobs_state]}" ]] && \
   precmd_functions+=(_starship_jobs_state)
+# Registered LAST so the at-prompt flag flips true only after all precmd work,
+# right before the prompt draws — minimizing the window where a USR1 could fire
+# with the flag set but zle not yet active.
+[[ -z "${precmd_functions[(r)_chezmoi_prompt_ready]}" ]] && \
+  precmd_functions+=(_chezmoi_prompt_ready)
+typeset -ga preexec_functions
+[[ -z "${preexec_functions[(r)_chezmoi_prompt_busy]}" ]] && \
+  preexec_functions+=(_chezmoi_prompt_busy)
 
 # Wrap chezmoi to keep the drift indicator in sync with reality. Drift
 # detection is done by `chezmoi verify` (run from precmd), so the wrapper
