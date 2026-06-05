@@ -60,3 +60,26 @@ yabai_load_cache() {
 
   return 1
 }
+
+# Pull any native-fullscreen Space stranded on a non-master display home to master.
+# A native-fullscreen app (Preview, a browser, etc.) lives in its OWN, UNLABELED
+# macOS Space outside the labeled model, so the label-based pull-home loops miss it
+# -- which is why `hyper+0` home-all (and the undock safety net) would otherwise
+# leave a fullscreened window behind on the external. Each such Space is moved by
+# re-resolving its current index from a stable space id every iteration (indices
+# renumber as spaces move). The window stays fullscreen and lands after the labeled
+# spaces (reachable via hyper+3-9; yabai_reorder_spaces.sh ignores unlabeled Spaces).
+# $1 = master display index. No-op with a single display (nothing is non-master).
+yabai_pull_fullscreen_home() {
+  local master="$1" ids id idx
+  case "$master" in ''|*[!0-9]*) return 0 ;; esac
+  ids=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson m "$master" '
+    .[] | select(.display != $m and .["is-native-fullscreen"] == true) | .id' 2>/dev/null)
+  for id in $ids; do
+    case "$id" in ''|*[!0-9]*) continue ;; esac
+    idx=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$id" '
+      .[] | select(.id == $id) | .index' 2>/dev/null | head -n 1)
+    case "$idx" in ''|*[!0-9]*) continue ;; esac
+    yabai -m space "$idx" --display "$master" >/dev/null 2>&1 || true
+  done
+}

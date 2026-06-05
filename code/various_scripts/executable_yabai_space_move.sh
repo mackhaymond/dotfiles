@@ -87,6 +87,10 @@ case "$ACTION" in
       [ -n "$disp" ] && [ "$disp" != "$master" ] &&
         yabai -m space "$label" --display "$master" >/dev/null 2>&1 || true
     done
+    # Also pull any native-fullscreen Space stranded on the external -- those are
+    # unlabeled (outside the labeled model), so the loop above misses them and a
+    # fullscreened window would otherwise be left behind on the external.
+    yabai_pull_fullscreen_home "$master"
     yabai -m display --focus "$master" >/dev/null 2>&1 || true
     yabai -m rule --apply >/dev/null 2>&1 || true
     "$SCRIPT_DIR/yabai_reorder_spaces.sh" >/dev/null 2>&1 || true
