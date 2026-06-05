@@ -32,8 +32,8 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_next.sh` | `~/code/various_scripts/yabai_skhd_stack_next.sh` | Executable script | Focus next window in stack |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_prev.sh` | `~/code/various_scripts/yabai_skhd_stack_prev.sh` | Executable script | Focus previous window in stack |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_mouse_follow.sh` | `~/code/various_scripts/yabai_mouse_follow.sh` | Executable script | Warp cursor to newly focused display |
-| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_screen_flash.sh` | `~/code/various_scripts/yabai_screen_flash.sh` | Executable script | Visual border flash on external display focus |
-| `…/code/various_scripts/yabai_screen_flash.js` | `~/code/various_scripts/yabai_screen_flash.js` | JXA helper | Draws/fades the border overlay for `yabai_screen_flash.sh` |
+| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_screen_flash.sh` | `~/code/various_scripts/yabai_screen_flash.sh` | Executable script | **DISABLED (dormant)** — was the external-display focus border flash; the signal was removed 2026-06-04 |
+| `…/code/various_scripts/yabai_screen_flash.js` | `~/code/various_scripts/yabai_screen_flash.js` | JXA helper | **DISABLED (dormant)** — drew the border overlay for `yabai_screen_flash.sh` |
 | `…/code/various_scripts/executable_yabai_reorder_spaces.sh` | `~/code/various_scripts/yabai_reorder_spaces.sh` | Executable script | Keep labeled spaces in canonical order per display |
 | `…/code/various_scripts/executable_yabai_fullscreen_focus.sh` | `~/code/various_scripts/yabai_fullscreen_focus.sh` | Executable script | Focus the Nth native-fullscreen app (`hyper+3-9`), WezTerm excluded |
 | `…/code/various_scripts/executable_yabai_terminal_follow.sh` | `~/code/various_scripts/yabai_terminal_follow.sh` | Executable script | Keep `terminal` label on WezTerm in/out of fullscreen; sweep husk spaces |
@@ -123,7 +123,7 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 
 **7. `display_changed` (label `mouse_follow_display`)** → `yabai_mouse_follow.sh`: warps cursor to the newly focused display.
 
-**8. `display_changed` (label `flash_external_display`)** → `yabai_screen_flash.sh`: flashes a border if focus moved to the external display.
+**8. ~~`display_changed` (label `flash_external_display`)~~** → **DISABLED** (2026-06-04, user request). The external-display border flash signal was removed from `yabairc`. The helper scripts `yabai_screen_flash.sh` / `.js` remain in `code/various_scripts` as dormant; re-enable by restoring the `YABAI_SCREEN_FLASH` env var + a `display_changed` signal calling it.
 
 *(Also: a one-shot startup sync — `"$YABAI_WORKSPACE_REFRESH" startup` — runs near the **top** of yabairc, before the rules. Specific line numbers are intentionally omitted here — they drift; grep the signal name in `yabairc`.)*
 
@@ -136,7 +136,6 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 | `YABAI_WORKSPACE_REFRESH` | `${HOME}/code/various_scripts/yabai_workspace_refresh.sh` | Startup only (the one `"$YABAI_WORKSPACE_REFRESH" startup` call). The hotplug/reader scripts run the refresh script too, but via their own `$SCRIPT_DIR` path, not this env var. |
 | `YABAI_DISPLAYS` | `${HOME}/code/various_scripts/yabai_displays.sh` | `display_added` / `display_removed` signals |
 | `YABAI_MOUSE_FOLLOW` | `${HOME}/code/various_scripts/yabai_mouse_follow.sh` | `display_changed` signal |
-| `YABAI_SCREEN_FLASH` | `${HOME}/code/various_scripts/yabai_screen_flash.sh` | `display_changed` signal |
 
 ### 3.2 Skhd Hotkey Daemon (skhdrc)
 
@@ -336,7 +335,7 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 | `yabai_skhd_stack_next.sh` | (none) | Focus next window in current stack layer; wrap to first |
 | `yabai_skhd_stack_prev.sh` | (none) | Focus previous window in current stack layer; wrap to last |
 | `yabai_mouse_follow.sh` | (none; signal handler) | Warp mouse cursor to focused display center (if not already there) |
-| `yabai_screen_flash.sh` | (none; signal handler) | Flash orange border around external display when focus moves there |
+| `yabai_screen_flash.sh` | (none) | **DISABLED (dormant)** — was the external-display focus border flash; signal removed 2026-06-04 |
 | `yabai_reorder_spaces.sh` | (none) | Slide labeled spaces into canonical order per display (reserves non-master's first space as scratch); handles fullscreen spaces |
 | `yabai_fullscreen_focus.sh` | `<ordinal>` | Focus the Nth native-fullscreen app in mission-control order (`hyper+3-9`); excludes WezTerm |
 | `yabai_terminal_follow.sh` | (none; space_changed hook) | Re-pin `terminal` label onto WezTerm's space (incl. fullscreen) + reorder; sweep surplus empty husk spaces |
@@ -358,7 +357,7 @@ Readers (scripts that `. "$CACHE_FILE"` to resolve topology):
     ├── yabai_display.sh        (master/external focus)
     ├── yabai_space_move.sh     (push/home-all)
     ├── yabai_displays.sh       (hotplug; also re-writes it)
-    └── yabai_screen_flash.sh   (master-index lookup, cache-first)
+    └── (yabai_screen_flash.sh was a cache reader too, but the flash is now disabled/dormant)
 
     Load pattern:
         [ -r "$CACHE_FILE" ] && . "$CACHE_FILE"
@@ -423,29 +422,15 @@ Labels persist through all these events, making the entire system stable and pre
 - **Dock:** External is transient; keep laptop layout untouched; external comes up clean for fresh work.
 - **Undock:** Prevent orphaned windows on non-existent display; safety net pulls everything home.
 
-#### Mouse Follow & Screen Flash
+#### Mouse Follow (and the disabled Screen Flash)
 
-**When cross-display focus changes** (via F13, F14, or any focus binding that jumps displays):
+**When cross-display focus changes** (via F13, F14, or any focus binding that jumps displays), yabai's `display_changed` signal fires and runs:
 
-1. yabai's `display_changed` signal fires.
-2. **First handler:** `yabai_mouse_follow.sh`
-   - Queries focused display and display under cursor.
-   - If they differ, warps cursor to focused window/display center.
-   - Single-display guard: no-op on laptops without external.
-3. **Second handler:** `yabai_screen_flash.sh`
-   - Identifies focused display (UUID match for master vs. external).
-   - If external, flashes orange border for ~0.4s (hold 0.18s, fade 0.22s).
-   - If master, no flash.
-   - Single-display guard: no-op on single display.
+- **`yabai_mouse_follow.sh`** — queries the focused display and the display under the cursor; if they differ, warps the cursor to the focused window/display center. Single-display guard: no-op on a laptop with no external.
 
-**Tunables for screen flash (env vars):**
-- `YABAI_FLASH_BORDER` [8] — border width in pixels
-- `YABAI_FLASH_R/G/B` [1.0/0.6/0.0] — sRGB color (default orange)
-- `YABAI_FLASH_HOLD` [0.18] — solid border duration (seconds)
-- `YABAI_FLASH_FADE` [0.22] — fade-out duration (seconds)
-- `YABAI_FLASH_RADIUS` [13] — corner radius in pixels
-
-> **⚠️ Gotcha if you edit `yabai_screen_flash.js`:** build the border `CGColor` with `$.CGColorCreateGenericRGB(r,g,b,a)` directly. Converting a *dynamically created* `NSColor` to `.CGColor` through the JXA bridge **SIGKILLs (137)** the process. Don't "simplify" it back to `NSColor…CGColor`. (Also: a GUI overlay from `osascript` only persists in the Aqua session, so it can only be tested live, not from a headless/Background launchd context.)
+> **Screen flash — DISABLED (2026-06-04, user request).** A second `display_changed` handler used to flash an orange border on the external display when focus jumped there. That signal was removed from `yabairc`; the helper `yabai_screen_flash.sh` / `.js` and their `YABAI_FLASH_*` tunables remain in-tree but **dormant**. To re-enable, restore the `YABAI_SCREEN_FLASH` env var and a `display_changed` signal (`label=flash_external_display`) calling the helper.
+>
+> *(Preserved gotcha for if it's ever revived: in `yabai_screen_flash.js`, build the border `CGColor` with `$.CGColorCreateGenericRGB(r,g,b,a)` directly — converting a dynamically-created `NSColor` to `.CGColor` through the JXA bridge **SIGKILLs (137)** the process. And a GUI overlay from `osascript` only persists in the Aqua session, so it can only be tested live.)*
 
 #### Terminal Space (not reserved)
 
@@ -512,7 +497,7 @@ f18                    # Focus "codex" workspace
 4. Script queries space's live index by label: `yabai -m query --spaces --space <label>`.
 5. Script focuses that index: `yabai -m space --focus <index>`.
 6. Focus changes to the space (wherever it lives—laptop or external).
-7. If the space is on the external display, `display_changed` signal fires → mouse follows + border flashes.
+7. If the space is on the external display, `display_changed` signal fires → mouse follows. (The border flash that used to also fire is disabled.)
 
 ### Send a Window to a Workspace
 
@@ -599,8 +584,7 @@ f14                    # Focus external display
 3. Script focuses the display: `yabai -m display --focus <external_idx>`.
 4. yabai's `display_changed` signal fires.
 5. `yabai_mouse_follow.sh` warps cursor to the external display's center.
-6. `yabai_screen_flash.sh` flashes orange border around the external display.
-7. Result: Focus is now on the external display.
+6. Result: Focus is now on the external display. *(The border flash that used to fire here is disabled.)*
 
 ### What Happens on Dock (External Monitor Plug)
 
@@ -800,7 +784,7 @@ git push origin main
 - **Pinned apps:** Certain apps (Todoist, Granola, Spark Mail, etc.) are sticky and cannot be moved off their home spaces.
 - **Stack layout:** Only one window visible at a time; navigate with hyper+z/x to cycle through stacked layers.
 - **Mouse follow:** Cursor automatically warps to newly focused display (reduced need for manual positioning).
-- **Screen flash:** Visual orange border confirms focus jumped to external display.
+- **Screen flash:** *(disabled 2026-06-04)* — formerly an orange border confirming focus jumped to the external display; the helper remains dormant in-tree.
 - **Native-fullscreen access:** Apps put into macOS native fullscreen (non-pinned apps or the browser) live in their own Spaces *outside* the labeled model, so the `hyper+<label>` keys can't reach them. `hyper+3`…`hyper+9` focus the 1st…7th fullscreen app in mission-control order (display, then index) via `yabai_fullscreen_focus.sh`. Mapping is dynamic by position, not pinned per-app. **WezTerm is excluded** from these ordinals (it's the `terminal` workspace, reached with `hyper+\``, even when fullscreen). Note: yabai *can* label, `--move` (reorder), focus, and move fullscreen Spaces between displays — they are not as locked-down as commonly assumed.
 - **WezTerm is not fullscreenable (by design):** WezTerm lives as a **normal window** on the `terminal` space (canonical index 1), tiled as the single stack window, and is intentionally never fullscreened. `hyper+fn+m` (yabai's `--toggle native-fullscreen`) **no-ops on WezTerm** — confirmed on hardware 2026-06-04 — because its borderless `RESIZE` decoration (no title bar) has no macOS native-fullscreen action; and `native_macos_fullscreen_mode = false` removes the capability outright so its own toggle can't make a fullscreen Space either. (yabai *can* still fullscreen titled apps like Preview; the `hyper+fn+m` bind is global and works for those.)
   - **`yabai_terminal_follow.sh` (the `space_changed` hook) is therefore mostly dormant** but retained because it still does real cross-display work: it keeps the `terminal` label pinned to WezTerm wherever WezTerm's space goes (e.g. when you `hyper+\` **push** the terminal space onto the external — verified 2026-06-04 the label follows), and reorders. It is a cheap no-op on ordinary same-space switches. The `window_created` fullscreen guard and the husk-sweep are kept as defensive/general machinery (they'd handle a fullscreen Space if one ever appeared, e.g. another app's), but WezTerm itself no longer produces fullscreen husks.
@@ -825,18 +809,16 @@ A real dock/undock session exercised the cross-display paths. All passed:
 - `hyper+\` **push** + follow — the focused space moved to the other display and **focus followed across displays** (the focus-by-id retry loop landed correctly). Pinned-app windows travel with their pushed space (verified: Notion Calendar rode its `calendar` space to the external).
 - `hyper+0` **home-all** — pulled every label home and re-pinned all apps (`rule --apply`). Now resolves master from **live topology** (UUID-first).
 - `yabai_reorder_spaces.sh` external scratch — reserves the external's **first space as scratch** (`pos=lo+1`); labels order from the second space. The **retry convergence fix** was verified by scrambling the external (including parking a label on the scratch slot) → **one** `reorder` call fully normalized it.
-- `f13`/`f14` display focus → **mouse-follow warp** (cursor jumps to the focused display, both directions) + **external screen-flash** (fires only on the external; single-instance guard leaves no stray processes).
+- `f13`/`f14` display focus → **mouse-follow warp** (cursor jumps to the focused display, both directions). *(The external screen-flash, also verified at the time, was subsequently disabled by user request — see the Mouse Follow section.)*
 - `yabai_terminal_follow.sh` — the `terminal` label **follows WezTerm onto the external** (verified by pushing the terminal space to display 2). The **per-display husk-sweep fix** (`group_by(.display)`) was verified on a real 2-display multi-husk state: it keeps exactly one empty pad **per display** and destroys the rest high-index-first.
 - **Cross-display `yabai -m space --focus <idx>`** — *previously flagged as "the single thing that can't be verified without hardware."* **Now verified**: it reliably lands focus on the external. The defensive `display --focus` fallback in `yabai_fullscreen_focus.sh` is therefore not needed (kept as belt-and-suspenders if ever wanted).
 - **`yabai_send_window.sh` cross-display follow** (the verify-by-label + `space --focus` fallback) — verified **both directions** with a movable non-pinned window (Preview): laptop→external and external→laptop, focus follows the window each time.
 
 *Caveat observed:* firing several pushes in rapid scripted succession (sub-second, with manual `--move` interleaved) can transiently strand a pinned window on the wrong space. It self-heals on the next `home-all`/`rule --apply`, and a normal human-paced single `hyper+\` carries the window correctly — so this is a stress-test artifact, not a real-use defect. *(Also: pushing the **terminal** space specifically didn't always land focus on it via the push-follow loop, but the dedicated `hyper+\`` focus-terminal binding reaches WezTerm on the external reliably.)*
 
-### ⚠️ Still needs testing (minor)
+### ⚠️ Still needs testing
 
-- **Screen-flash single-instance guard under a rapid burst** — the guard is in place and left no stragglers in normal use, but overlapping sub-0.4s external-focus changes weren't stress-tested.
-
-*(The former "WezTerm fullscreen on the external" item is **removed** — WezTerm is intentionally not fullscreenable; see the design note above.)*
+Nothing outstanding. *(The former "screen-flash under a rapid burst" item is moot — the flash was disabled 2026-06-04. The former "WezTerm fullscreen on the external" item is removed — WezTerm is intentionally not fullscreenable; see the design note above.)*
 
 ### ✅ Verified single-display (2026-06-04)
 - **WezTerm startup placement** — starts as a **normal window** (auto-fullscreen removed); lands on `terminal` at canonical index 1 via the `space=terminal` rule + `window_created` hook. Intentionally **not** fullscreenable (`hyper+fn+m` no-ops on it — see the design note).
