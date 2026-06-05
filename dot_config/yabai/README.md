@@ -812,35 +812,34 @@ git push origin main
   - **Dependency:** Hammerspoon must be running (set to launch at login via `hs.autoLaunch(true)`). If it's not running, the two main windows simply won't auto-pin and Little Arc behaves like any managed window — graceful degradation, not breakage. This replaced the old fragile title-based pinning in `yabai_workspace_refresh.sh`.
 - **Chezmoi for everything:** All configs are templated sources in chezmoi; never edit deployed files directly. Always edit source, preview, apply, reload, commit.
 
-## ⚠️ Still Needs Testing (Unverified)
+## Testing status
 
-*Last reviewed 2026-06-04; system was single-display (no external attached).* These behaviors are believed correct from the code/logic but have **not** been verified live. Test them next time the external display is connected and update this section (with a new date).
+### ✅ Verified live on dual-display hardware (2026-06-04)
 
-**The whole Phase-1 multi-display redesign is single-display-untested.** Every cross-display path is gated off when `DISPLAY_COUNT<=1`, so a single-display session cannot exercise any of it. Sign these off on the next dock:
-- `hyper+\` **push** — round-trips the focused space to the other display and follows focus (incl. the 3-try focus-by-id race loop in `yabai_space_move.sh`).
-- `hyper+0` **home-all** — pulls every label back to the laptop.
-- **dock / undock** — `yabai_displays.sh added` comes up non-destructive (external empty); `removed` pull-home safety net relocates any straggler labels.
-- `yabai_reorder_spaces.sh` — reserves the **external's first space as scratch** (`pos=lo+1`) and orders labels from the second space.
-- `f13`/`f14` display focus → mouse-follow warp + external screen-flash.
+A real dock/undock session exercised the cross-display paths. All passed:
 
-**Changed in the 2026-06-04 production audit — single-laptop paths were verified byte-equivalent; the dual-display behavior is reasoned-but-not-live-verified. Sign these off on the next dock:**
-- `yabai_reorder_spaces.sh` now **retries** the placement pass (re-deriving each display's base index every pass) until a full pass moves nothing, so a genuinely scrambled external display converges in one call instead of needing a near-sorted start. Single-display converges on pass 1 (zero moves) = byte-identical. *Verify a scrambled external normalizes (scratch stays first, labels ordered).*
-- `yabai_terminal_follow.sh` husk sweep is now **per-display** (`group_by(.display)`, one empty pad kept on each display), so fullscreen toggles while WezTerm is on the external get cleaned too. *Verify husks don't pile up on the external.*
-- `yabai_terminal_follow.sh` now **stands down** (early-exits) while `yabai_displays.sh` holds the hotplug lock, to avoid racing the disconnect reconcile. *Verify dock/undock still settles to canonical order.*
-- `yabai_send_window.sh` now **verifies focus landed** on the target (compared by label) and falls back to `space --focus` on a raced/failed id-focus. Single-display: the fallback never fires. *Verify a cross-display send still follows focus.*
-- `yabai_space_move.sh home-all` now resolves master from **live topology** (UUID-first) instead of trusting the cached index. *Verify home-all with a stale cache still pulls everything to the laptop.*
-- `yabai_screen_flash.sh` now **skips if a flash is already in flight** (single-instance guard, `pgrep`). *Verify rapid external-focus changes don't stack overlapping borders.*
-- `yabai_mouse_follow.sh` now ignores a **minimized/hidden** focused window when picking the warp target (falls back to display center). *Verify the warp still lands on the focused content.*
+- **Dock** (`display_added`) — **non-destructive**: all 10 labels stayed home on the laptop; the external came up with a single empty space (scratch), ready for manual `hyper+\` push. Cache updated to `DISPLAY_COUNT=2` / `EXTERNAL_DISPLAY_INDEX` correctly.
+- **Undock** (`display_removed`) — pull-home safety net worked: every label back on the laptop in canonical order, cache reset to `DISPLAY_COUNT=1`, WezTerm intact on `terminal`.
+- `hyper+\` **push** + follow — the focused space moved to the other display and **focus followed across displays** (the focus-by-id retry loop landed correctly). Pinned-app windows travel with their pushed space (verified: Notion Calendar rode its `calendar` space to the external).
+- `hyper+0` **home-all** — pulled every label home and re-pinned all apps (`rule --apply`). Now resolves master from **live topology** (UUID-first).
+- `yabai_reorder_spaces.sh` external scratch — reserves the external's **first space as scratch** (`pos=lo+1`); labels order from the second space. The **retry convergence fix** was verified by scrambling the external (including parking a label on the scratch slot) → **one** `reorder` call fully normalized it.
+- `f13`/`f14` display focus → **mouse-follow warp** (cursor jumps to the focused display, both directions) + **external screen-flash** (fires only on the external; single-instance guard leaves no stray processes).
+- `yabai_terminal_follow.sh` — the `terminal` label **follows WezTerm onto the external** (verified by pushing the terminal space to display 2). The **per-display husk-sweep fix** (`group_by(.display)`) was verified on a real 2-display multi-husk state: it keeps exactly one empty pad **per display** and destroys the rest high-index-first.
+- **Cross-display `yabai -m space --focus <idx>`** — *previously flagged as "the single thing that can't be verified without hardware."* **Now verified**: it reliably lands focus on the external. The defensive `display --focus` fallback in `yabai_fullscreen_focus.sh` is therefore not needed (kept as belt-and-suspenders if ever wanted).
 
-**✅ Now verified (no longer needs testing):**
-- **WezTerm startup placement** — WezTerm now starts as a **normal window** (auto-fullscreen removed). On launch it lands on the `terminal` space at canonical index 1 via the `space=terminal` rule + `window_created` hook. (Manual `hyper+fn+m` fullscreen is still supported but is no longer the default; its on-external behavior is covered in the dual-display items below.)
-- **Single-display safe paths** — live-tested 2026-06-04 and confirmed non-destructive: every focus/no-op/idempotent script (focus by label, `space_move push`/`home-all` early-exit, `display.sh external` no-op, `fullscreen_focus` with WezTerm excluded, `terminal_follow` fast-path, `reorder_spaces` no-op, `workspace_refresh` run twice → byte-identical cache, spaces/windows unchanged).
+*Caveat observed:* firing several pushes in rapid scripted succession (sub-second, with manual `--move` interleaved) can transiently strand a pinned window on the wrong space. It self-heals on the next `home-all`/`rule --apply`, and a normal human-paced single `hyper+\` carries the window correctly — so this is a stress-test artifact, not a real-use defect.
 
-**Accessing a fullscreen window on the EXTERNAL display.** Getting it there works either way — `hyper+\` push moves a fullscreen Space to the external (empirically confirmed with Preview), and you can also just fullscreen an app already on the external. The question is reaching it again. Traced by code (`yabai_fullscreen_focus.sh`, `yabai_space_move.sh`, `yabai_workspace.sh`); two cases:
+### ⚠️ Still needs end-to-end testing
 
-- **Non-WezTerm app fullscreen on the external (Preview, browser) → `hyper+3`…`hyper+9`. *High confidence, not live-verified.*** `yabai_fullscreen_focus.sh` lists *all* native-fullscreen windows across *all* displays (`sort_by(.display, .space)`), so an external one is in the ordinal list (after any laptop fullscreen apps — e.g. laptop reMarkable = `hyper+3`, external Preview = `hyper+4`). It then calls `yabai -m space --focus <idx>`. Confidence comes from: that same cross-display `space --focus` is *already* how `push` follows a space onto the external (`yabai_space_move.sh` line ~82), focusing a *fullscreen* Space is separately verified, and the reorder ignores it (only reorders *labeled* spaces; a fullscreen Preview is unlabeled). This case is clean.
-- **WezTerm fullscreen on the external → `hyper+\`` (focus terminal). *Medium confidence.*** The follow hook keeps the `terminal` label on WezTerm and `focus terminal` does the same `space --focus`, so it should reach it. The murky bit is the **reorder on the external** with a *fullscreen* terminal: `yabai_reorder_spaces.sh` reserves the external's first space as scratch and would `--move` the fullscreen terminal into position — untested, most likely thing to misbehave.
+These couldn't be exercised in the session (the external was disconnected before the fullscreen test; and every open window was a guarded pinned app). The building blocks all passed, so confidence is high, but the full path is unconfirmed:
 
-**The single thing that can't be verified without the hardware:** whether `yabai -m space --focus <idx>` reliably lands focus on the *external* display in this setup. Rated high (standard yabai; `push` already depends on it), but if it ever fails, the one-line fix is a `yabai -m display --focus <display>` before the `space --focus` in `yabai_fullscreen_focus.sh`.
+- **WezTerm *fullscreen on the external*** → `hyper+\`` to reach it. The pieces verified above (terminal-label-follows-onto-external, reorder retry on the external, husk-sweep logic) cover most of it; the unconfirmed part is the **reorder of a *fullscreen* terminal on the external** (`--move` into the post-scratch slot) and the husk left when it exits fullscreen there. README's longstanding "most likely thing to misbehave."
+- **`yabai_send_window.sh` cross-display follow** (the verify-by-label + `space --focus` fallback). The cross-display focus primitive it depends on is verified (via push), but the send path itself wasn't run with a movable (non-pinned) window on the other display.
+- **Screen-flash single-instance guard under a rapid burst** — the guard is in place and left no stragglers in normal use, but overlapping sub-0.4s external-focus changes weren't stress-tested.
 
-**30-second test on the next dock:** (1) connect external, fullscreen Preview, `hyper+\` to push it over; (2) return to the laptop and press `hyper+3` (or `+4` if reMarkable is also fullscreen) — should jump to Preview on the external; (3) bonus: fullscreen WezTerm, push it over, `hyper+\`` — should reach it (watch the reorder/scratch behavior).
+### ✅ Verified single-display (2026-06-04)
+- **WezTerm startup placement** — starts as a **normal window** (auto-fullscreen removed); lands on `terminal` at canonical index 1 via the `space=terminal` rule + `window_created` hook. Manual `hyper+fn+m` fullscreen still supported.
+- **Safe/idempotent paths** — focus by label, `space_move` early-exit, `display.sh external` no-op, `fullscreen_focus` (WezTerm excluded), `terminal_follow` fast-path, `reorder_spaces` no-op, `workspace_refresh` byte-identical cache across runs.
+
+### Accessing a fullscreen app on the EXTERNAL display
+`yabai_fullscreen_focus.sh` lists *all* native-fullscreen windows across *all* displays (`sort_by(.display, .space)`), so an external fullscreen app (Preview, browser) is in the `hyper+3`…`hyper+9` ordinal list (after any laptop fullscreen apps) and is reached via `yabai -m space --focus <idx>` — and that cross-display focus is **now verified** (see above), so this case is solid. WezTerm fullscreen on the external is the one remaining end-to-end gap (above).
