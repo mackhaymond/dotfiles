@@ -13,6 +13,7 @@ set -u
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export USER="${USER:-$(id -un)}"
 
+# shellcheck disable=SC2034  # consumed by yabai_load_cache (sourced from yabai_common.sh)
 CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${HOME}/.cache/yabai/workspace_cache.env}"
 
 MODE="${1:-}"
@@ -23,34 +24,13 @@ if [ -z "$MODE" ] || [ -z "$LABEL" ]; then
 fi
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
-
-load_cache() {
-  if [ -r "$CACHE_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$CACHE_FILE"
-  fi
-
-  case "${DISPLAY_COUNT:-}" in
-    ''|*[!0-9]*)
-      return 1
-      ;;
-  esac
-
-  if [ "$DISPLAY_COUNT" -le 1 ] && [ -n "${MASTER_DISPLAY_INDEX:-}" ]; then
-    return 0
-  fi
-
-  if [ "$DISPLAY_COUNT" -gt 1 ] && [ -n "${MASTER_DISPLAY_INDEX:-}" ] && [ -n "${EXTERNAL_DISPLAY_INDEX:-}" ]; then
-    return 0
-  fi
-
-  return 1
-}
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/yabai_common.sh"
 
 # Cache miss -> heal labels + rewrite the cache WITHOUT any reset, then retry.
-if ! load_cache; then
+if ! yabai_load_cache; then
   "$SCRIPT_DIR/yabai_workspace_refresh.sh" >/dev/null 2>&1 || true
-  load_cache || exit 0
+  yabai_load_cache || exit 0
 fi
 
 query_space_index() {

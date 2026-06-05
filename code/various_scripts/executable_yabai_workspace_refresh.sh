@@ -16,20 +16,15 @@ set -u
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export USER="${USER:-$(id -un)}"
 
-MASTER_DISPLAY_UUID="${YABAI_MASTER_DISPLAY_UUID:-37D8832A-2D66-02CA-B9F7-8F30A301B230}"
+# shellcheck source=/dev/null
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
 CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${HOME}/.cache/yabai/workspace_cache.env}"
 
 SPACES_JSON=$(yabai -m query --spaces 2>/dev/null) || exit 0
 WINDOWS_JSON=$(yabai -m query --windows 2>/dev/null || printf '[]')
 DISPLAYS_JSON=$(yabai -m query --displays 2>/dev/null) || exit 0
 DISPLAY_COUNT=$(jq -r 'length' <<<"$DISPLAYS_JSON")
-MASTER_DISPLAY_INDEX=$(
-  jq -r --arg uuid "$MASTER_DISPLAY_UUID" '
-    ([.[] | select(.uuid == $uuid) | .index][0]) //
-    (min_by(.frame.w * .frame.h).index) //
-    empty
-  ' <<<"$DISPLAYS_JSON" | head -n 1
-)
+MASTER_DISPLAY_INDEX=$(yabai_master_index "$DISPLAYS_JSON")
 # Only meaningful once master is known; computing it against a placeholder master
 # (the old `${MASTER_DISPLAY_INDEX:-0}`) conflated "master unknown" with "master is
 # display 0" and could write an inconsistent master(empty)/external(set) pair.
@@ -220,7 +215,7 @@ mkdir -p "$(dirname "$CACHE_FILE")" 2>/dev/null || true
   printf 'DISPLAY_COUNT=%s\n' "${DISPLAY_COUNT:-0}"
   printf 'MASTER_DISPLAY_INDEX=%s\n' "${MASTER_DISPLAY_INDEX:-}"
   printf 'EXTERNAL_DISPLAY_INDEX=%s\n' "${EXTERNAL_DISPLAY_INDEX:-}"
-  printf 'MASTER_DISPLAY_UUID=%s\n' "$MASTER_DISPLAY_UUID"
+  printf 'MASTER_DISPLAY_UUID=%s\n' "$YABAI_MASTER_DISPLAY_UUID"
 } >"${CACHE_FILE}.$$" && mv "${CACHE_FILE}.$$" "$CACHE_FILE"
 
 yabai -m rule --apply >/dev/null 2>&1 || true

@@ -16,15 +16,12 @@ set -u
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export USER="${USER:-$(id -un)}"
 
-MASTER_DISPLAY_UUID="${YABAI_MASTER_DISPLAY_UUID:-37D8832A-2D66-02CA-B9F7-8F30A301B230}"
-
-LABELS="terminal main school todo schedule mail calendar messages chatgpt codex"
+# shellcheck source=/dev/null
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
 
 displays=$(yabai -m query --displays 2>/dev/null) || exit 0
 
-master=$(printf '%s' "$displays" | jq -r --arg u "$MASTER_DISPLAY_UUID" '
-  ([.[] | select(.uuid == $u) | .index][0]) // (min_by(.frame.w * .frame.h).index) // empty
-' 2>/dev/null)
+master=$(yabai_master_index "$displays")
 
 # Each `space --move` renumbers indices on its display, so a single pass that
 # derives the target `pos` from a pre-move snapshot can leave a genuinely scrambled
@@ -51,7 +48,7 @@ while [ "$moved" = "1" ] && [ "$attempt" -lt 4 ]; do
       pos=$lo
     fi
 
-    for label in $LABELS; do
+    for label in $YABAI_LABELS; do
       info=$(yabai -m query --spaces --space "$label" 2>/dev/null) || continue
       d=$(printf '%s' "$info" | jq -r '.display // empty' 2>/dev/null)
       [ "$d" = "$disp" ] || continue

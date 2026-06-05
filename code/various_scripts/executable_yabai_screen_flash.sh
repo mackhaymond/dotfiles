@@ -20,8 +20,9 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:
 export USER="${USER:-$(id -un)}"
 
 CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${HOME}/.cache/yabai/workspace_cache.env}"
-MASTER_DISPLAY_UUID="${YABAI_MASTER_DISPLAY_UUID:-37D8832A-2D66-02CA-B9F7-8F30A301B230}"
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/yabai_common.sh"
 JS="$SCRIPT_DIR/yabai_screen_flash.js"
 
 FLASH_BORDER="${YABAI_FLASH_BORDER:-8}"
@@ -45,12 +46,7 @@ fh=$(printf '%s' "$fdisp" | jq -r '.frame.h // empty' 2>/dev/null)
 # shellcheck disable=SC1090
 master=$( . "$CACHE_FILE" 2>/dev/null; printf '%s' "${MASTER_DISPLAY_INDEX:-}" )
 case "$master" in
-  ''|*[!0-9]*)
-    master=$(yabai -m query --displays 2>/dev/null |
-      jq -r --arg uuid "$MASTER_DISPLAY_UUID" '
-        ([.[] | select(.uuid == $uuid) | .index][0]) // (min_by(.frame.w * .frame.h).index) // empty
-      ' 2>/dev/null | head -n 1)
-    ;;
+  ''|*[!0-9]*) master=$(yabai_master_index) ;;
 esac
 
 # Flash only on a NON-master display; if master is unknown, stay conservative.

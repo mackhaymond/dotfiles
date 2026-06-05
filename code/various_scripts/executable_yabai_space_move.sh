@@ -13,30 +13,18 @@ set -u
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export USER="${USER:-$(id -un)}"
 
+# shellcheck disable=SC2034  # consumed by yabai_load_cache (sourced from yabai_common.sh)
 CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${HOME}/.cache/yabai/workspace_cache.env}"
-MASTER_DISPLAY_UUID="${YABAI_MASTER_DISPLAY_UUID:-37D8832A-2D66-02CA-B9F7-8F30A301B230}"
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/yabai_common.sh"
 
 ACTION="${1:-}"
 [ -z "$ACTION" ] && exit 64
 
-LABELS="terminal main school todo schedule mail calendar messages chatgpt codex"
-
-load_cache() {
-  if [ -r "$CACHE_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$CACHE_FILE"
-  fi
-  case "${DISPLAY_COUNT:-}" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ -n "${MASTER_DISPLAY_INDEX:-}" ] || return 1
-  return 0
-}
-
-if ! load_cache; then
+if ! yabai_load_cache; then
   "$SCRIPT_DIR/yabai_workspace_refresh.sh" >/dev/null 2>&1 || true
-  load_cache || exit 0
+  yabai_load_cache || exit 0
 fi
 
 # Single display: nothing to move anywhere.
@@ -91,13 +79,10 @@ case "$ACTION" in
     # Resolve master from LIVE topology (UUID first, smallest-area fallback) so a
     # stale/wrong cached index can't aim pull-home at the wrong display; fall back
     # to the cache, then to 1. Mirrors yabai_displays.sh's removed branch.
-    master=$(yabai -m query --displays 2>/dev/null |
-      jq -r --arg uuid "$MASTER_DISPLAY_UUID" '
-        ([.[] | select(.uuid == $uuid) | .index][0]) // (min_by(.frame.w * .frame.h).index) // empty
-      ' 2>/dev/null | head -n 1)
+    master=$(yabai_master_index)
     case "$master" in ''|*[!0-9]*) master="${MASTER_DISPLAY_INDEX:-}" ;; esac
     case "$master" in ''|*[!0-9]*) master=1 ;; esac
-    for label in $LABELS; do
+    for label in $YABAI_LABELS; do
       disp=$(yabai -m query --spaces --space "$label" 2>/dev/null | jq -r '.display // empty' 2>/dev/null)
       [ -n "$disp" ] && [ "$disp" != "$master" ] &&
         yabai -m space "$label" --display "$master" >/dev/null 2>&1 || true

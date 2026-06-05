@@ -25,10 +25,10 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:
 export USER="${USER:-$(id -un)}"
 
 CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${HOME}/.cache/yabai/workspace_cache.env}"
-MASTER_DISPLAY_UUID="${YABAI_MASTER_DISPLAY_UUID:-37D8832A-2D66-02CA-B9F7-8F30A301B230}"
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/yabai_common.sh"
 LOCKDIR="${TMPDIR:-/tmp}/yabai_displays.lock"
-LABELS="terminal main school todo schedule mail calendar messages chatgpt codex"
 
 ACTION="${1:-}"
 case "$ACTION" in
@@ -109,14 +109,13 @@ case "$ACTION" in
     # macOS normally reparents on disconnect, so this is usually a no-op; the
     # native move carries any stragglers (and their windows) home.
     # Resolve master from LIVE topology (UUID first, smallest-area fallback) so a
-    # failed cache write can't point pull-home at the just-removed display.
-    master=$(yabai -m query --displays 2>/dev/null |
-      jq -r --arg uuid "$MASTER_DISPLAY_UUID" '
-        ([.[] | select(.uuid == $uuid) | .index][0]) // (min_by(.frame.w * .frame.h).index) // empty
-      ' 2>/dev/null | head -n 1)
+    # failed cache write can't point pull-home at the just-removed display. Falls
+    # back to the cached index, then to 1. (LIVE-first is deliberate here -- do not
+    # switch to a cache-first resolve.)
+    master=$(yabai_master_index)
     case "$master" in ''|*[!0-9]*) master=$(cached_master) ;; esac
     case "$master" in ''|*[!0-9]*) master=1 ;; esac
-    for label in $LABELS; do
+    for label in $YABAI_LABELS; do
       disp=$(yabai -m query --spaces --space "$label" 2>/dev/null | jq -r '.display // empty' 2>/dev/null)
       [ -n "$disp" ] && [ "$disp" != "$master" ] &&
         yabai -m space "$label" --display "$master" >/dev/null 2>&1 || true
