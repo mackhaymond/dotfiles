@@ -49,11 +49,12 @@ yabai -m signal --add event=window_created action='
   [ "$app" = "Arc" ] && /opt/homebrew/bin/hs -c "arcSync()" >/dev/null 2>&1
   case "$app" in
     wezterm-gui|WezTerm)
-      # WezTerm starts as a normal window, but can be MANUALLY fullscreened
-      # (hyper+fn+m), which carries it into its own Space tracked by the terminal
-      # label (yabai_terminal_follow.sh). NEVER drag a fullscreen WezTerm onto a
-      # fixed space -- that would yank it out of fullscreen. Only nudge a NORMAL
-      # WezTerm onto the terminal space (the space=terminal rule is racy at launch).
+      # WezTerm is a normal, NON-fullscreenable window (native_macos_fullscreen_mode
+      # is off and the borderless RESIZE window has no macOS fullscreen action), so
+      # in practice it is never fullscreen here. The is-native-fullscreen guard below
+      # is kept DEFENSIVELY: if a WezTerm window ever were fullscreen, never drag it
+      # onto a fixed space -- that would yank it out. Only nudge a NORMAL WezTerm onto
+      # the terminal space (the space=terminal rule is racy at launch).
       nsfs=$(printf "%s" "$info" | jq -r '.["is-native-fullscreen"]' 2>/dev/null)
       [ "$nsfs" = "true" ] && exit 0
       wspace=$(printf "%s" "$info" | jq -r .space)

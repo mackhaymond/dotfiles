@@ -223,7 +223,7 @@ Move the focused window to a target space and **follow focus to it** (unless pin
 | `hyper - z` | Z | `yabai_skhd_stack_next.sh` | Focus next window in stack (wrap to first) |
 | `hyper - x` | X | `yabai_skhd_stack_prev.sh` | Focus previous window in stack (wrap to last) |
 | `hyper - m` | M | `yabai -m window --toggle float --grid 6:6:1:1:4:4` | Toggle float; if floating, center at 4×4 grid cell |
-| `hyper + fn - m` | Fn+M | `yabai -m window --toggle native-fullscreen` | Toggle native fullscreen |
+| `hyper + fn - m` | Fn+M | `yabai -m window --toggle native-fullscreen` | Toggle native fullscreen (global; **no-op on WezTerm** by design — see the "WezTerm is not fullscreenable" note) |
 | `hyper - b` | B | `yabai_skhd_mode.sh` | Toggle space layout (bsp ↔ stack) |
 
 #### Native-Fullscreen App Access (Hyper)
@@ -291,14 +291,14 @@ config.default_prog = { "{{ .homebrew_prefix }}/bin/tmux", "new-session", "-A", 
 ```
 (The source is a chezmoi template; `{{ .homebrew_prefix }}` renders to `/opt/homebrew` on this machine, i.e. `/opt/homebrew/bin/tmux`.) Every new WezTerm window attaches or creates a tmux session named `main`.
 
-**Startup window state:** WezTerm starts as a **normal (non-fullscreen) window**. There is no `gui-startup` fullscreen toggle. yabai's `space=terminal` rule + the `window_created` hook place it on the `terminal` space, which `yabai_reorder_spaces.sh` keeps at canonical **index 1**, where it tiles as the single stack window. You can still fullscreen it manually with `hyper+fn+m`; see the "WezTerm fullscreen (manual)" design note. *(Historically WezTerm auto-fullscreened on startup via a `gui-startup` `toggle_fullscreen()`; that was removed — see git `4e99ec9`.)*
+**Startup window state:** WezTerm starts as a **normal (non-fullscreen) window** and stays one — it is intentionally **not fullscreenable**. There is no `gui-startup` fullscreen toggle. yabai's `space=terminal` rule + the `window_created` hook place it on the `terminal` space, which `yabai_reorder_spaces.sh` keeps at canonical **index 1**, where it tiles as the single stack window. `hyper+fn+m` (yabai's native-fullscreen toggle) **no-ops on WezTerm** — see the "WezTerm is not fullscreenable" design note. *(Historically WezTerm auto-fullscreened on startup via a `gui-startup` `toggle_fullscreen()`; that was removed — see git `4e99ec9`.)*
 
 #### Display & UI Settings
 
 - `enable_tab_bar = false` — tabs managed by tmux, not WezTerm.
 - `enable_kitty_graphics = true` — inline images/SVG support.
 - `scrollback_lines = 0` — scrollback via tmux history, not terminal buffer.
-- `native_macos_fullscreen_mode = true` — kept so the **manual** fullscreen toggle (`hyper+fn+m`) still works: a fullscreened terminal becomes a proper fullscreen Space that yabai can label/reorder/focus (see "WezTerm fullscreen (manual)" below). WezTerm does *not* fullscreen on startup; this only enables the capability. With this `false`, the window drops the macOS fullscreen capability entirely and yabai cannot fullscreen it.
+- `native_macos_fullscreen_mode = false` — WezTerm is intentionally **not fullscreenable** (a normal tiled window by design), so `false` drops WezTerm's macOS native-fullscreen capability entirely. Independently, `hyper+fn+m` (yabai's native-fullscreen toggle) **no-ops on WezTerm regardless of this setting**, because the borderless `RESIZE` decoration (no title bar) has no macOS native-fullscreen action — verified on dual-display hardware 2026-06-04 (yabai fullscreens a titled app like Preview, but not WezTerm). The `false` makes the "stays a normal window" intent explicit in config.
 - `macos_fullscreen_extend_behind_notch = true` — extends rendering behind notch.
 
 #### Performance
@@ -451,7 +451,7 @@ Labels persist through all these events, making the entire system stable and pre
 
 The terminal space is WezTerm's home, but it is **not** reserved — other windows may land on it and stay. The `window_created` signal only:
 
-1. Ensures a *new normal* WezTerm window lands on the terminal space (compensates for the racy `space=terminal` rule; a manually-fullscreened WezTerm is left alone).
+1. Ensures a *new normal* WezTerm window lands on the terminal space (compensates for the racy `space=terminal` rule; a fullscreen WezTerm would be left alone — a defensive guard, though WezTerm isn't fullscreenable).
 2. Re-pins the Arc main windows via Hammerspoon on any new Arc window.
 
 It does **not** bounce other apps off the terminal space. (Earlier this enforced "purity" by relocating any non-WezTerm window to `main`; that bounce was removed — windows are free to share the terminal space with WezTerm.)
@@ -778,7 +778,7 @@ git push origin main
 | `hyper + fn - s` | Fn+S | Move window to next space | |
 | `hyper + fn - x` | Fn+X | Mirror space layout (x-axis) | |
 | `hyper - m` | M | Toggle float; center if floating | 6×6 grid, cell 1,1 to 4,4 |
-| `hyper + fn - m` | Fn+M | Toggle native fullscreen | |
+| `hyper + fn - m` | Fn+M | Toggle native fullscreen | Global; no-op on WezTerm by design |
 | `hyper - b` | B | Toggle space layout (bsp ↔ stack) | |
 | **Display & Cross-Display Movement** |
 | `f13` | Hyper+F1 | Focus master (laptop) display | Karabiner-mapped |
@@ -802,7 +802,9 @@ git push origin main
 - **Mouse follow:** Cursor automatically warps to newly focused display (reduced need for manual positioning).
 - **Screen flash:** Visual orange border confirms focus jumped to external display.
 - **Native-fullscreen access:** Apps put into macOS native fullscreen (non-pinned apps or the browser) live in their own Spaces *outside* the labeled model, so the `hyper+<label>` keys can't reach them. `hyper+3`…`hyper+9` focus the 1st…7th fullscreen app in mission-control order (display, then index) via `yabai_fullscreen_focus.sh`. Mapping is dynamic by position, not pinned per-app. **WezTerm is excluded** from these ordinals (it's the `terminal` workspace, reached with `hyper+\``, even when fullscreen). Note: yabai *can* label, `--move` (reorder), focus, and move fullscreen Spaces between displays — they are not as locked-down as commonly assumed.
-- **WezTerm fullscreen (manual):** WezTerm **starts as a normal window** on the `terminal` space (canonical index 1), tiled as the single stack window — it does *not* auto-fullscreen. You can still fullscreen it on demand with `hyper+fn+m` (needs `native_macos_fullscreen_mode = true`, which is kept). When you do, native fullscreen carries WezTerm into a new fullscreen Space and leaves the old `terminal` space behind empty — and the machinery below handles that gracefully (it's a no-op while WezTerm stays a normal window). The `window_created` signal is guarded so it never drags a fullscreen WezTerm onto a fixed space. The `space_changed` hook `yabai_terminal_follow.sh` re-pins the `terminal` label onto WezTerm's current Space (fullscreen or not) and reorders, so `hyper+\`` still reaches it and it stays at canonical position 1. It's a cheap no-op on ordinary space switches (only acts when WezTerm actually changed Spaces). **Husk sweep:** entering/exiting fullscreen leaves the vacated Space behind as an empty desktop; when the hook relabels it also destroys the surplus empty, unlabeled, non-fullscreen spaces, keeping exactly **one empty per display** (`group_by(.display)`; destroyed high-index-first so yabai's index compaction on `--destroy` can't stale a later target; never touches labeled/fullscreen Spaces). macOS recreates a space on fullscreen-exit if none is suitable, so the kept empty just bounds husk growth and keeps the sweep idempotent — it is not guaranteed to be the exact Space WezTerm vacated. Net result per display is its labeled spaces + at most one empty desktop, regardless of how many times you fullscreen/exit. *(Per-display sweep was added in the 2026-06-04 audit; the external-display case is hardware-untested — see "Still Needs Testing".)*
+- **WezTerm is not fullscreenable (by design):** WezTerm lives as a **normal window** on the `terminal` space (canonical index 1), tiled as the single stack window, and is intentionally never fullscreened. `hyper+fn+m` (yabai's `--toggle native-fullscreen`) **no-ops on WezTerm** — confirmed on hardware 2026-06-04 — because its borderless `RESIZE` decoration (no title bar) has no macOS native-fullscreen action; and `native_macos_fullscreen_mode = false` removes the capability outright so its own toggle can't make a fullscreen Space either. (yabai *can* still fullscreen titled apps like Preview; the `hyper+fn+m` bind is global and works for those.)
+  - **`yabai_terminal_follow.sh` (the `space_changed` hook) is therefore mostly dormant** but retained because it still does real cross-display work: it keeps the `terminal` label pinned to WezTerm wherever WezTerm's space goes (e.g. when you `hyper+\` **push** the terminal space onto the external — verified 2026-06-04 the label follows), and reorders. It is a cheap no-op on ordinary same-space switches. The `window_created` fullscreen guard and the husk-sweep are kept as defensive/general machinery (they'd handle a fullscreen Space if one ever appeared, e.g. another app's), but WezTerm itself no longer produces fullscreen husks.
+  - **Husk sweep** (general): when the hook relabels, it destroys surplus empty, unlabeled, non-fullscreen spaces, keeping exactly **one empty per display** (`group_by(.display)`; destroyed high-index-first so yabai's index compaction on `--destroy` can't stale a later target; never touches labeled/fullscreen Spaces). Verified on real 2-display multi-husk state 2026-06-04.
 - **Arc window pinning (Hammerspoon, `dot_hammerspoon/init.lua`):** The two main Arc browser windows are pinned one-to-`main`, one-to-`school` (title-independent — it doesn't matter which goes where). Everything else about Arc, **including Little Arc popups, is left fully MANAGED** (tiled, in the stack, cyclable with `hyper+z/x`) — Little Arc is *not* floated and *not* pinned; it just lives wherever it opens.
   - The hard part: a **Little Arc** popup is byte-identical to a main window in *every* yabai field (subrole, floating, even title is the page title), so yabai cannot tell them apart. The only reliable discriminator is `AXIdentifier` (`bigBrowserWindow-*` vs `littleBrowserWindow-*`), which **yabai cannot read but Hammerspoon can**. macOS AX only exposes *current-Space* windows, so Hammerspoon reads the identifier off whatever Arc windows are on-screen and remembers which window ids are "main" (`mainSet`), accumulated as Spaces are visited.
   - It then pins **only** the remembered main ids to `main`/`school` via yabai (which *can* report any window's Space by id, cross-Space): **stably** (never disturbs a correctly-placed window; only fills an empty target; recovers drift) and **fullscreen-safe** (a fullscreen Arc window — e.g. video — is left alone, reachable via `hyper+3-9`, and returns to its space on exit). Because only `mainSet` ids are ever moved, Little Arc (never in the set) is never touched.
@@ -826,20 +828,19 @@ A real dock/undock session exercised the cross-display paths. All passed:
 - `f13`/`f14` display focus → **mouse-follow warp** (cursor jumps to the focused display, both directions) + **external screen-flash** (fires only on the external; single-instance guard leaves no stray processes).
 - `yabai_terminal_follow.sh` — the `terminal` label **follows WezTerm onto the external** (verified by pushing the terminal space to display 2). The **per-display husk-sweep fix** (`group_by(.display)`) was verified on a real 2-display multi-husk state: it keeps exactly one empty pad **per display** and destroys the rest high-index-first.
 - **Cross-display `yabai -m space --focus <idx>`** — *previously flagged as "the single thing that can't be verified without hardware."* **Now verified**: it reliably lands focus on the external. The defensive `display --focus` fallback in `yabai_fullscreen_focus.sh` is therefore not needed (kept as belt-and-suspenders if ever wanted).
+- **`yabai_send_window.sh` cross-display follow** (the verify-by-label + `space --focus` fallback) — verified **both directions** with a movable non-pinned window (Preview): laptop→external and external→laptop, focus follows the window each time.
 
-*Caveat observed:* firing several pushes in rapid scripted succession (sub-second, with manual `--move` interleaved) can transiently strand a pinned window on the wrong space. It self-heals on the next `home-all`/`rule --apply`, and a normal human-paced single `hyper+\` carries the window correctly — so this is a stress-test artifact, not a real-use defect.
+*Caveat observed:* firing several pushes in rapid scripted succession (sub-second, with manual `--move` interleaved) can transiently strand a pinned window on the wrong space. It self-heals on the next `home-all`/`rule --apply`, and a normal human-paced single `hyper+\` carries the window correctly — so this is a stress-test artifact, not a real-use defect. *(Also: pushing the **terminal** space specifically didn't always land focus on it via the push-follow loop, but the dedicated `hyper+\`` focus-terminal binding reaches WezTerm on the external reliably.)*
 
-### ⚠️ Still needs end-to-end testing
+### ⚠️ Still needs testing (minor)
 
-These couldn't be exercised in the session (the external was disconnected before the fullscreen test; and every open window was a guarded pinned app). The building blocks all passed, so confidence is high, but the full path is unconfirmed:
-
-- **WezTerm *fullscreen on the external*** → `hyper+\`` to reach it. The pieces verified above (terminal-label-follows-onto-external, reorder retry on the external, husk-sweep logic) cover most of it; the unconfirmed part is the **reorder of a *fullscreen* terminal on the external** (`--move` into the post-scratch slot) and the husk left when it exits fullscreen there. README's longstanding "most likely thing to misbehave."
-- **`yabai_send_window.sh` cross-display follow** (the verify-by-label + `space --focus` fallback). The cross-display focus primitive it depends on is verified (via push), but the send path itself wasn't run with a movable (non-pinned) window on the other display.
 - **Screen-flash single-instance guard under a rapid burst** — the guard is in place and left no stragglers in normal use, but overlapping sub-0.4s external-focus changes weren't stress-tested.
 
+*(The former "WezTerm fullscreen on the external" item is **removed** — WezTerm is intentionally not fullscreenable; see the design note above.)*
+
 ### ✅ Verified single-display (2026-06-04)
-- **WezTerm startup placement** — starts as a **normal window** (auto-fullscreen removed); lands on `terminal` at canonical index 1 via the `space=terminal` rule + `window_created` hook. Manual `hyper+fn+m` fullscreen still supported.
+- **WezTerm startup placement** — starts as a **normal window** (auto-fullscreen removed); lands on `terminal` at canonical index 1 via the `space=terminal` rule + `window_created` hook. Intentionally **not** fullscreenable (`hyper+fn+m` no-ops on it — see the design note).
 - **Safe/idempotent paths** — focus by label, `space_move` early-exit, `display.sh external` no-op, `fullscreen_focus` (WezTerm excluded), `terminal_follow` fast-path, `reorder_spaces` no-op, `workspace_refresh` byte-identical cache across runs.
 
 ### Accessing a fullscreen app on the EXTERNAL display
-`yabai_fullscreen_focus.sh` lists *all* native-fullscreen windows across *all* displays (`sort_by(.display, .space)`), so an external fullscreen app (Preview, browser) is in the `hyper+3`…`hyper+9` ordinal list (after any laptop fullscreen apps) and is reached via `yabai -m space --focus <idx>` — and that cross-display focus is **now verified** (see above), so this case is solid. WezTerm fullscreen on the external is the one remaining end-to-end gap (above).
+`yabai_fullscreen_focus.sh` lists *all* native-fullscreen windows across *all* displays (`sort_by(.display, .space)`), so an external fullscreen app (Preview, browser) is in the `hyper+3`…`hyper+9` ordinal list (after any laptop fullscreen apps) and is reached via `yabai -m space --focus <idx>` — and that cross-display focus is **now verified** (see above), so this case is solid. (WezTerm is excluded from these ordinals and is not fullscreenable anyway — see the design note.)
