@@ -52,6 +52,11 @@ compdef _gnu_generic pihole
 # idempotent and covers non-login interactive shells.
 source "$HOME/.zsh/_cache_init.zsh"
 _cache_init starship "starship init zsh"
+# _ZO_DOCTOR=0: silence zoxide's "configuration issue" false-positive in
+# Claude Code shells. Claude replays a shell snapshot that restores function
+# defs but not the chpwd_functions hook array, so `z` thinks the hook is
+# missing. Interactive shells register the hook correctly; the check is moot.
+export _ZO_DOCTOR=0
 _cache_init zoxide   "zoxide init zsh"
 _cache_init direnv   "direnv hook zsh"
 
