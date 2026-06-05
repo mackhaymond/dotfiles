@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+BIN="$HOME/.config/opencode/node_modules/@code-yeongyu/comment-checker/bin/comment-checker"
+
+if [ ! -x "$BIN" ]; then
+  echo "comment-checker shim: expected binary not found at $BIN" >&2
+  echo "Try: (cd ~/.config/opencode && bun pm trust @code-yeongyu/comment-checker)" >&2
+  exit 127
+fi
+
+exec "$BIN" "$@"
