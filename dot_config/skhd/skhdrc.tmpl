@@ -82,10 +82,11 @@ hyper - b : yabai -m space --balance
 # (hyper+s is taken by BetterTouchTool; v = vertical)
 hyper - v : yabai -m window --toggle split
 
-# Flip the tree horizontally
-hyper + fn - x : yabai -m space --mirror x-axis
+# rotate the whole tree 90 deg clockwise (bsp); repeat to cycle 90/180/270/0
+hyper - n : yabai -m space --rotate 90
 
-# Flip the tree vertically
+# (mirror lives on hyper+z/x in bsp -- z=horizontal, x=vertical; the old redundant
+# hyper+fn+x mirror was removed)
 
 # toggle maximize (zoom focused window to fill its space)
 hyper - m : yabai -m window --toggle zoom-fullscreen
