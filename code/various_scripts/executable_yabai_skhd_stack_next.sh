@@ -3,6 +3,15 @@
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export USER="${USER:-$(id -un)}"
 
+# hyper+z. STACK space: focus the next stack layer (wrap to first). BSP space: the
+# stack is meaningless, so repurpose the otherwise-dead key to MIRROR the tree
+# HORIZONTALLY (--mirror x-axis). hyper+x is the vertical counterpart.
+SPACE_TYPE=$(yabai -m query --spaces --space 2>/dev/null | jq -r '.type // ""' 2>/dev/null)
+if [ "$SPACE_TYPE" = "bsp" ]; then
+  yabai -m space --mirror x-axis >/dev/null 2>&1 || true
+  exit 0
+fi
+
 WINDOW_JSON=$(yabai -m query --windows --window 2>/dev/null) || exit 0
 CURRENT_LAYER=$(jq -r '."stack-index" // 0' <<<"$WINDOW_JSON" 2>/dev/null) || exit 0
 
