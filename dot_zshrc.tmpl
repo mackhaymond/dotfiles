@@ -22,6 +22,11 @@ SAVEHIST=10000
 setopt appendhistory hist_ignore_dups hist_ignore_space share_history
 
 # ─── Completion (must init BEFORE plugins so compdef is defined) ─────────
+# Homebrew completions live here; add to fpath before compinit. (.zprofile
+# inlines brew env to avoid a ruby fork, so it skips the fpath line that
+# `brew shellenv` would normally emit — restore it here.)
+fpath=("${HOMEBREW_PREFIX:-/opt/homebrew}/share/zsh/site-functions" $fpath)
+
 # -C: skip security check + skip dump regen. Run `compinit` manually after
 # installing tools that ship completions, or `rm ~/.zcompdump` to force rebuild.
 autoload -Uz compinit
