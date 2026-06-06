@@ -78,7 +78,8 @@ hyper - 0x27 : yabai -m window --resize bottom:0:60
 hyper - b : yabai -m space --balance
 
 # toggle the focused window's split orientation: horizontal <-> vertical (bsp)
-hyper - s : yabai -m window --toggle split
+# (hyper+s is taken by BetterTouchTool; v = vertical)
+hyper - v : yabai -m window --toggle split
 
 # Flip the tree horizontally
 hyper + fn - x : yabai -m space --mirror x-axis
