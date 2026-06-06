@@ -56,21 +56,34 @@ hyper - 0 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_space_move.sh home
 
 # go to last space
 
-# swap window position in a direction
+# swap window position in a direction (bsp)
 hyper + fn - j : yabai -m window --swap south
 hyper + fn - k : yabai -m window --swap north
 hyper + fn - h : yabai -m window --swap west
 hyper + fn - l : yabai -m window --swap east
 
-hyper + fn - a : yabai -m window --space prev
-hyper + fn - s : yabai -m window --space next
+# move focus to the window in a direction (bsp; no-op in stack)
+hyper - h : yabai -m window --focus west
+hyper - j : yabai -m window --focus south
+hyper - k : yabai -m window --focus north
+hyper - l : yabai -m window --focus east
+
+# resize focused window: [ = narrower, ] = wider, ; = shorter, ' = taller (bsp)
+hyper - 0x21 : yabai -m window --resize right:-60:0
+hyper - 0x1E : yabai -m window --resize right:60:0
+hyper - 0x29 : yabai -m window --resize bottom:0:-60
+hyper - 0x27 : yabai -m window --resize bottom:0:60
+
+# balance: equalize all split ratios on the focused space (bsp)
+hyper - b : yabai -m space --balance
+
 # Flip the tree horizontally
 hyper + fn - x : yabai -m space --mirror x-axis
 
 # Flip the tree vertically
 
-# toggle float
-hyper - m: yabai -m window --toggle float --grid 6:6:1:1:4:4
+# toggle maximize (zoom focused window to fill its space)
+hyper - m : yabai -m window --toggle zoom-fullscreen
 
 # toggle fullscreen
 hyper + fn - m : yabai -m window --toggle native-fullscreen 
