@@ -33,6 +33,7 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_next.sh` | `~/code/various_scripts/yabai_skhd_stack_next.sh` | Executable script | Focus next window in stack |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_prev.sh` | `~/code/various_scripts/yabai_skhd_stack_prev.sh` | Executable script | Focus previous window in stack |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_mouse_follow.sh` | `~/code/various_scripts/yabai_mouse_follow.sh` | Executable script | Warp cursor to newly focused display |
+| `…/code/various_scripts/executable_yabai_heal.sh` | `~/code/various_scripts/yabai_heal.sh` | Executable script | **Debounced self-heal** — coalesce `space_destroyed` / `mission_control_exit` into one `yabai_workspace_refresh` (single-flight mkdir lock + settle) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_screen_flash.sh` | `~/code/various_scripts/yabai_screen_flash.sh` | Executable script | **DISABLED (dormant)** — was the external-display focus border flash; the signal was removed 2026-06-04 |
 | `…/code/various_scripts/yabai_screen_flash.js` | `~/code/various_scripts/yabai_screen_flash.js` | JXA helper | **DISABLED (dormant)** — drew the border overlay for `yabai_screen_flash.sh` |
 | `…/code/various_scripts/executable_yabai_reorder_spaces.sh` | `~/code/various_scripts/yabai_reorder_spaces.sh` | Executable script | Keep labeled spaces in canonical order per display |
@@ -125,7 +126,9 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 
 **7. `display_changed` (label `mouse_follow_display`)** → `yabai_mouse_follow.sh`: warps cursor to the newly focused display.
 
-**8. ~~`display_changed` (label `flash_external_display`)~~** → **DISABLED** (2026-06-04, user request). The external-display border flash signal was removed from `yabairc`. The helper scripts `yabai_screen_flash.sh` / `.js` remain in `code/various_scripts` as dormant; re-enable by restoring the `YABAI_SCREEN_FLASH` env var + a `display_changed` signal calling it.
+**8. `space_destroyed` (label `heal_space_destroyed`)** and **`mission_control_exit` (label `heal_mission_control`)** → `yabai_heal.sh` → `yabai_workspace_refresh.sh`. Event-driven self-heal: a destroyed/merged labeled space (the classic label-drop — e.g. a fullscreen collapse merging an adjacent space) or a Mission Control exit (it renumbers/merges spaces) reconciles the canonical labels + order. `yabai_heal.sh` single-flights + settles (mkdir lock, `YABAI_HEAL_SETTLE`, default 0.4s) so a burst (a Mission Control session churning several spaces) heals exactly **once**. refresh is idempotent (~0.34s) and these events are infrequent → no idle/poll cost. **Not** hooked to `space_created` (refresh may create a space → would self-trigger) or `window_destroyed` (too noisy; window closes don't drop labels).
+
+**9. ~~`display_changed` (label `flash_external_display`)~~** → **DISABLED** (2026-06-04, user request). The external-display border flash signal was removed from `yabairc`. The helper scripts `yabai_screen_flash.sh` / `.js` remain in `code/various_scripts` as dormant; re-enable by restoring the `YABAI_SCREEN_FLASH` env var + a `display_changed` signal calling it.
 
 *(Also: a one-shot startup sync — `"$YABAI_WORKSPACE_REFRESH" startup` — runs near the **top** of yabairc, before the rules. Specific line numbers are intentionally omitted here — they drift; grep the signal name in `yabairc`.)*
 
@@ -138,6 +141,7 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 | `YABAI_WORKSPACE_REFRESH` | `${HOME}/code/various_scripts/yabai_workspace_refresh.sh` | Startup only (the one `"$YABAI_WORKSPACE_REFRESH" startup` call). The hotplug/reader scripts run the refresh script too, but via their own `$SCRIPT_DIR` path, not this env var. |
 | `YABAI_DISPLAYS` | `${HOME}/code/various_scripts/yabai_displays.sh` | `display_added` / `display_removed` signals |
 | `YABAI_MOUSE_FOLLOW` | `${HOME}/code/various_scripts/yabai_mouse_follow.sh` | `display_changed` signal |
+| `YABAI_HEAL` | `${HOME}/code/various_scripts/yabai_heal.sh` | `space_destroyed` / `mission_control_exit` signals (debounced self-heal) |
 
 ### 3.2 Skhd Hotkey Daemon (skhdrc)
 
@@ -333,6 +337,7 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 | `yabai_space_move.sh` | `push` \| `home-all` | Cross-display space movement: push focused space to other display (with follow), or pull all labels home |
 | `yabai_displays.sh` | `added` \| `removed` | Hotplug handler: dock = refresh cache (non-destructive); undock = pull home safety net |
 | `yabai_workspace_refresh.sh` | (none; on-demand) | Reconcile canonical labels on all displays; refresh display topology cache |
+| `yabai_heal.sh` | (none; signal handler) | Debounced self-heal — single-flight (mkdir lock) + settle, then `yabai_workspace_refresh.sh`. Bound to `space_destroyed` / `mission_control_exit` |
 | `yabai_skhd_mode.sh` | (none) | Toggle focused space layout (bsp ↔ stack) |
 | `yabai_skhd_stack_next.sh` | (none) | Focus next window in current stack layer; wrap to first |
 | `yabai_skhd_stack_prev.sh` | (none) | Focus previous window in current stack layer; wrap to last |

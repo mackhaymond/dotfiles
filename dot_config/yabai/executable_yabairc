@@ -13,6 +13,7 @@ yabai -m config top_padding 0
 YABAI_WORKSPACE_REFRESH="${HOME}/code/various_scripts/yabai_workspace_refresh.sh"
 YABAI_DISPLAYS="${HOME}/code/various_scripts/yabai_displays.sh"
 YABAI_MOUSE_FOLLOW="${HOME}/code/various_scripts/yabai_mouse_follow.sh"
+YABAI_HEAL="${HOME}/code/various_scripts/yabai_heal.sh"
 "$YABAI_WORKSPACE_REFRESH" startup
 
 yabai -m rule --add app="^System Settings$" manage=off
@@ -116,6 +117,18 @@ yabai -m signal --add event=display_removed label=workspace_display_removed acti
 # home-all, master, or a focus bind whose label lives on the other screen),
 # warp the mouse onto the now-focused display. Never fires with one display.
 yabai -m signal --add event=display_changed label=mouse_follow_display action="$YABAI_MOUSE_FOLLOW"
+
+# Event-driven self-heal. The canonical-label model breaks when a LABELED space is
+# destroyed/merged (the classic label-drop -- e.g. a fullscreen collapse merging an
+# adjacent space) or when Mission Control exits (it renumbers/merges spaces). Both
+# events reconcile the canonical labels + order via yabai_workspace_refresh. Routed
+# through yabai_heal.sh, which single-flights + settles so a burst (a Mission Control
+# session churning several spaces) heals exactly ONCE. refresh is idempotent (~0.34s)
+# and these events are infrequent, so there is no idle/poll cost. NOT hooked to
+# space_created (refresh may create a space -> would self-trigger) or window_destroyed
+# (too noisy; window closes do not drop labels).
+yabai -m signal --add event=space_destroyed label=heal_space_destroyed action="$YABAI_HEAL"
+yabai -m signal --add event=mission_control_exit label=heal_mission_control action="$YABAI_HEAL"
 
 # (The external-display border flash was disabled 2026-06-04 by user request. The
 # helper scripts yabai_screen_flash.sh / .js remain in code/various_scripts as
