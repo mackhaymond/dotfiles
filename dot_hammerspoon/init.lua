@@ -259,8 +259,9 @@ local HELP_COL3 = {
   { k = "f13 / f14",  d = "focus laptop / external" },
   { gap = true },
   { h = "SYSTEM" },
-  { k = "hyper",      d = "= caps lock = ⌘⌃⌥⇧" },
-  { k = "hyper + ?",  d = "toggle this help" },
+  { k = "hyper",       d = "= caps lock = ⌘⌃⌥⇧" },
+  { k = "hyper+fn+?",  d = "toggle this help" },
+  { k = "esc",         d = "close this help" },
 }
 
 local function buildHelpCanvas()
@@ -291,17 +292,30 @@ local function buildHelpCanvas()
   return c
 end
 
--- Toggle: delete if showing, otherwise (re)build + show.
+-- Esc-to-close: a plain-Esc hotkey enabled ONLY while the overlay is showing, so
+-- Esc dismisses the HUD but behaves normally everywhere else (disabled when hidden).
+local helpEscHotkey = nil
+
+local function yabaiHelpHide()
+  if yabaiHelpCanvas then
+    yabaiHelpCanvas:hide()   -- hides instantly; dropping the ref lets GC reclaim it
+    yabaiHelpCanvas = nil     -- (explicit :delete() is deprecated for hs.canvas)
+  end
+  if helpEscHotkey then helpEscHotkey:disable() end
+end
+
+-- Toggle: hide if showing, otherwise (re)build + show and arm the Esc-to-close key.
 function yabaiHelpToggle()
   if yabaiHelpCanvas then
-    yabaiHelpCanvas:hide()    -- hides instantly; dropping the ref lets GC reclaim it
-    yabaiHelpCanvas = nil      -- (explicit :delete() is deprecated for hs.canvas)
+    yabaiHelpHide()
     return
   end
   local c = buildHelpCanvas()
   if not c then return end   -- screen detection failed mid display-reconfig; no-op (next press works)
   yabaiHelpCanvas = c
   yabaiHelpCanvas:show()
+  helpEscHotkey = helpEscHotkey or hs.hotkey.new({}, "escape", yabaiHelpHide)
+  helpEscHotkey:enable()
 end
 
 hs.alert.show("Hammerspoon: Arc pin + keybind help loaded")

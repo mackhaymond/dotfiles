@@ -97,6 +97,9 @@ hyper + fn - m : yabai -m window --toggle native-fullscreen
 # toggle the focused space's layout: bsp <-> stack
 hyper + fn - b : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_skhd_mode.sh
 
-# hyper+? (hyper + / , keycode 0x2C; hyper already holds shift) : toggle the
-# system-wide keybind help overlay (Hammerspoon yabaiHelpToggle, see init.lua)
-hyper - 0x2C : /opt/homebrew/bin/hs -c "yabaiHelpToggle()"
+# hyper+fn+? (hyper+fn + / , keycode 0x2C) : toggle the system-wide keybind help
+# overlay (Hammerspoon yabaiHelpToggle, see init.lua). On the fn layer because BARE
+# hyper+/ is swallowed before skhd — macOS reserves the cmd+? ("?") combo even with
+# the Help-menu shortcut disabled (verified: hyper+y fired, hyper+/ did not). Adding
+# fn changes the modifier set and dodges it. Esc also closes the overlay (init.lua).
+hyper + fn - 0x2C : /opt/homebrew/bin/hs -c "yabaiHelpToggle()"
