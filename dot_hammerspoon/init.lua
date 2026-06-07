@@ -265,6 +265,7 @@ local HELP_COL3 = {
 
 local function buildHelpCanvas()
   local screen = hs.mouse.getCurrentScreen() or hs.screen.mainScreen()
+  if not screen then return nil end   -- no active display (hot-plug/sleep-wake race); skip this toggle
   local sf = screen:frame()
   local W, H = 1180, 640
   local x = sf.x + (sf.w - W) / 2
@@ -297,7 +298,9 @@ function yabaiHelpToggle()
     yabaiHelpCanvas = nil      -- (explicit :delete() is deprecated for hs.canvas)
     return
   end
-  yabaiHelpCanvas = buildHelpCanvas()
+  local c = buildHelpCanvas()
+  if not c then return end   -- screen detection failed mid display-reconfig; no-op (next press works)
+  yabaiHelpCanvas = c
   yabaiHelpCanvas:show()
 end
 
