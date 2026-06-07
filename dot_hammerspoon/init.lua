@@ -164,4 +164,141 @@ function arcDiag()
   return table.concat(out, "\n")
 end
 
-hs.alert.show("Hammerspoon: Arc pin loaded")
+-- ============================================================================
+-- System-wide keybind help overlay (skhd binds hyper+? -> `hs -c "yabaiHelpToggle()"`).
+--
+-- A non-interactive hs.canvas HUD drawn on ALL spaces (canJoinAllSpaces), above
+-- normal windows, that NEVER takes keyboard focus -- so the same hyper+? that shows
+-- it also reaches skhd to toggle it back off. Toggling deletes/rebuilds the canvas,
+-- so it always re-centers on the screen under the mouse (laptop or external).
+--
+-- yabaiHelpToggle + yabaiHelpCanvas are GLOBAL (reachable via `hs -c`, and persistent
+-- across the separate IPC invocations -- same rationale as arcSync/mainSet above).
+--
+-- The content MIRRORS the skhd binds / README section 6 cheat sheet by hand; keep it
+-- in sync when binds change (there is no auto-generation from skhdrc).
+-- ============================================================================
+
+local HELP_HEADER = { red = 1.00, green = 0.62, blue = 0.22, alpha = 1.0 }
+local HELP_KEY    = { white = 0.97 }
+local HELP_DESC   = { white = 0.72 }
+
+local function helpSeg(text, color, size, bold)
+  return hs.styledtext.new(text, {
+    font  = { name = bold and "Menlo-Bold" or "Menlo", size = size },
+    color = color,
+  })
+end
+
+-- Build one styledtext column from a list of rows:
+--   { h = "HEADER" }          section header (orange, bold)
+--   { gap = true }            vertical spacer
+--   { k = "key", d = "desc" } a bind row (monospace-aligned key + description)
+local function helpColumn(rows)
+  local s = hs.styledtext.new("")
+  for _, r in ipairs(rows) do
+    if r.h then
+      s = s .. helpSeg(r.h .. "\n", HELP_HEADER, 12.5, true)
+    elseif r.gap then
+      s = s .. helpSeg("\n", HELP_DESC, 6)
+    else
+      s = s .. helpSeg(string.format("%-12s", r.k), HELP_KEY, 12.5)
+           .. helpSeg("  " .. r.d .. "\n", HELP_DESC, 12.5)
+    end
+  end
+  return s
+end
+
+local HELP_COL1 = {
+  { h = "FOCUS SPACE  ·  hyper +" },
+  { k = "`",        d = "terminal" },
+  { k = "1   2",    d = "main · school" },
+  { k = "tab  q",   d = "todo · schedule" },
+  { k = "w   e",    d = "mail · calendar" },
+  { k = "d   f",    d = "messages · chatgpt" },
+  { k = "f18",      d = "codex  (caps + esc)" },
+  { k = "g",        d = "ext  (scratch space)" },
+  { gap = true },
+  { h = "SEND WINDOW  ·  hyper+fn +" },
+  { k = "same keys", d = "move window + follow" },
+  { k = "f19",       d = "→ codex  (fn+caps+esc)" },
+  { k = "fn+g",      d = "→ ext scratch space" },
+  { gap = true },
+  { h = "FULLSCREEN APPS  ·  hyper +" },
+  { k = "3 … 9",     d = "focus Nth fullscreen app" },
+}
+
+local HELP_COL2 = {
+  { h = "BSP — MOVE / FOCUS  ·  hyper +" },
+  { k = "h j k l",    d = "focus  ← ↓ ↑ →" },
+  { k = "fn+h/j/k/l", d = "swap   ← ↓ ↑ →" },
+  { gap = true },
+  { h = "BSP — SIZE / SHAPE  ·  hyper +" },
+  { k = "[   ]",      d = "narrower / wider" },
+  { k = ";   '",      d = "shorter / taller" },
+  { k = "b",          d = "balance splits" },
+  { k = "v",          d = "split orientation  H ↔ V" },
+  { k = "n",          d = "rotate tree 90°" },
+  { k = "z   x",      d = "mirror  horiz / vert" },
+  { k = "m",          d = "maximize (zoom)" },
+  { k = "fn+m",       d = "native fullscreen" },
+  { k = "fn+b",       d = "toggle  bsp ↔ stack" },
+}
+
+local HELP_COL3 = {
+  { h = "STACK MODE  ·  hyper +" },
+  { k = "z   x",      d = "next / prev window" },
+  { k = "",           d = "(z/x are layout-aware:" },
+  { k = "",           d = " mirror in bsp, cycle in stack)" },
+  { gap = true },
+  { h = "DISPLAY & SPACES  ·  hyper +" },
+  { k = "\\",         d = "push space → other display" },
+  { k = "0",          d = "pull all spaces home" },
+  { k = "fn+g",       d = "fling window → ext" },
+  { k = "g",          d = "focus ext" },
+  { k = "f13 / f14",  d = "focus laptop / external" },
+  { gap = true },
+  { h = "SYSTEM" },
+  { k = "hyper",      d = "= caps lock = ⌘⌃⌥⇧" },
+  { k = "hyper + ?",  d = "toggle this help" },
+}
+
+local function buildHelpCanvas()
+  local screen = hs.mouse.getCurrentScreen() or hs.screen.mainScreen()
+  local sf = screen:frame()
+  local W, H = 1180, 640
+  local x = sf.x + (sf.w - W) / 2
+  local y = sf.y + (sf.h - H) / 2
+  local c = hs.canvas.new({ x = x, y = y, w = W, h = H })
+  c:level(hs.canvas.windowLevels.overlay)
+  c:behavior({ "canJoinAllSpaces", "stationary" })
+  c:clickActivating(false)
+  c:appendElements({
+    { type = "rectangle", action = "fill",
+      roundedRectRadii = { xRadius = 18, yRadius = 18 },
+      fillColor = { red = 0.04, green = 0.05, blue = 0.07, alpha = 0.95 } },
+    { type = "rectangle", action = "stroke", strokeWidth = 2,
+      roundedRectRadii = { xRadius = 18, yRadius = 18 },
+      strokeColor = { red = 1.0, green = 0.62, blue = 0.22, alpha = 0.9 } },
+    { type = "text",
+      text = helpSeg("yabai · skhd  —  keybindings", { white = 1.0 }, 20, true),
+      frame = { x = 36, y = 22, w = W - 72, h = 30 } },
+    { type = "text", text = helpColumn(HELP_COL1), frame = { x = 36,  y = 74, w = 372, h = H - 92 } },
+    { type = "text", text = helpColumn(HELP_COL2), frame = { x = 412, y = 74, w = 372, h = H - 92 } },
+    { type = "text", text = helpColumn(HELP_COL3), frame = { x = 788, y = 74, w = 372, h = H - 92 } },
+  })
+  return c
+end
+
+-- Toggle: delete if showing, otherwise (re)build + show.
+function yabaiHelpToggle()
+  if yabaiHelpCanvas then
+    yabaiHelpCanvas:hide()    -- hides instantly; dropping the ref lets GC reclaim it
+    yabaiHelpCanvas = nil      -- (explicit :delete() is deprecated for hs.canvas)
+    return
+  end
+  yabaiHelpCanvas = buildHelpCanvas()
+  yabaiHelpCanvas:show()
+end
+
+hs.alert.show("Hammerspoon: Arc pin + keybind help loaded")
