@@ -1,3 +1,14 @@
+# =============================================================================
+# SOURCE OF TRUTH for every yabai/skhd keybind. The SAME bind list is HAND-MIRRORED
+# (no auto-generation) in TWO other files -- if you ADD / REMOVE / RECHORD / REPURPOSE
+# a bind below, update ALL THREE:
+#   1. THIS FILE        ~/.config/skhd/skhdrc        (authoritative; src dot_config/skhd/skhdrc.tmpl)
+#   2. THE HELP OVERLAY ~/.hammerspoon/init.lua      -> HELP_COL1/2/3 tables (the hyper+fn+? cheat sheet)
+#   3. THE DOCS         dot_config/yabai/README.md   -> section 3.2 tables AND section 6 cheat sheet
+# Out-of-sync = the on-screen help and the docs lie about what a key does.
+# After editing: chezmoi apply && skhd --reload  (see README section 5 runbook).
+# =============================================================================
+
 # layout-aware (logic in the scripts): STACK space -> cycle stack layers (z=next,
 # x=prev). BSP space -> mirror the tree (z=horizontal/x-axis, x=vertical/y-axis).
 hyper - z : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_skhd_stack_next.sh

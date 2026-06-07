@@ -175,13 +175,19 @@ end
 -- yabaiHelpToggle + yabaiHelpCanvas are GLOBAL (reachable via `hs -c`, and persistent
 -- across the separate IPC invocations -- same rationale as arcSync/mainSet above).
 --
--- The content MIRRORS the skhd binds / README section 6 cheat sheet by hand; keep it
--- in sync when binds change (there is no auto-generation from skhdrc).
+-- These HELP_COL tables are a HAND-MAINTAINED MIRROR of the keybinds (no auto-gen).
+-- The SAME bind list lives in THREE files that MUST stay in sync:
+--   1. ~/.config/skhd/skhdrc  (chezmoi: dot_config/skhd/skhdrc.tmpl)  <- SOURCE OF TRUTH
+--   2. THIS overlay           (HELP_COL1 / HELP_COL2 / HELP_COL3 below)
+--   3. dot_config/yabai/README.md  -- section 3.2 tables AND section 6 cheat sheet
+-- Change a bind in only one place and the on-screen help LIES. When skhdrc changes,
+-- re-mirror the affected HELP_COL row(s) here and update both README sections.
 -- ============================================================================
 
 local HELP_HEADER = { red = 1.00, green = 0.62, blue = 0.22, alpha = 1.0 }
 local HELP_KEY    = { white = 0.97 }
 local HELP_DESC   = { white = 0.72 }
+local HELP_BODY   = 14   -- single source for header/key/desc point size (Menlo, monospace)
 
 local function helpSeg(text, color, size, bold)
   return hs.styledtext.new(text, {
@@ -198,17 +204,18 @@ local function helpColumn(rows)
   local s = hs.styledtext.new("")
   for _, r in ipairs(rows) do
     if r.h then
-      s = s .. helpSeg(r.h .. "\n", HELP_HEADER, 12.5, true)
+      s = s .. helpSeg(r.h .. "\n", HELP_HEADER, HELP_BODY, true)
     elseif r.gap then
-      s = s .. helpSeg("\n", HELP_DESC, 6)
+      s = s .. helpSeg("\n", HELP_DESC, 9)
     else
-      s = s .. helpSeg(string.format("%-12s", r.k), HELP_KEY, 12.5)
-           .. helpSeg("  " .. r.d .. "\n", HELP_DESC, 12.5)
+      s = s .. helpSeg(string.format("%-12s", r.k), HELP_KEY, HELP_BODY)
+           .. helpSeg("  " .. r.d .. "\n", HELP_DESC, HELP_BODY)
     end
   end
   return s
 end
 
+-- MIRROR of ~/.config/skhd/skhdrc -- also update README §3.2 + §6 when editing rows.
 local HELP_COL1 = {
   { h = "FOCUS SPACE  ·  hyper +" },
   { k = "`",        d = "terminal" },
@@ -216,13 +223,11 @@ local HELP_COL1 = {
   { k = "tab  q",   d = "todo · schedule" },
   { k = "w   e",    d = "mail · calendar" },
   { k = "d   f",    d = "messages · chatgpt" },
-  { k = "f18",      d = "codex  (caps + esc)" },
-  { k = "g",        d = "ext  (scratch space)" },
+  { k = "esc",      d = "codex" },
   { gap = true },
   { h = "SEND WINDOW  ·  hyper+fn +" },
-  { k = "same keys", d = "move window + follow" },
-  { k = "f19",       d = "→ codex  (fn+caps+esc)" },
-  { k = "fn+g",      d = "→ ext scratch space" },
+  { k = "same keys", d = "move window here + follow" },
+  { k = "esc",       d = "send to codex" },
   { gap = true },
   { h = "FULLSCREEN APPS  ·  hyper +" },
   { k = "3 … 9",     d = "focus Nth fullscreen app" },
@@ -239,24 +244,23 @@ local HELP_COL2 = {
   { k = "b",          d = "balance splits" },
   { k = "v",          d = "split orientation  H ↔ V" },
   { k = "n",          d = "rotate tree 90°" },
-  { k = "z   x",      d = "mirror  horiz / vert" },
   { k = "m",          d = "maximize (zoom)" },
   { k = "fn+m",       d = "native fullscreen" },
   { k = "fn+b",       d = "toggle  bsp ↔ stack" },
 }
 
 local HELP_COL3 = {
-  { h = "STACK MODE  ·  hyper +" },
-  { k = "z   x",      d = "next / prev window" },
-  { k = "",           d = "(z/x are layout-aware:" },
-  { k = "",           d = " mirror in bsp, cycle in stack)" },
+  { h = "STACK / MIRROR  ·  hyper +" },
+  { k = "z   x",      d = "stack: focus next / prev" },
+  { k = "",           d = "bsp:   mirror H / V" },
+  { k = "",           d = "(one key, layout-aware)" },
   { gap = true },
   { h = "DISPLAY & SPACES  ·  hyper +" },
-  { k = "\\",         d = "push space → other display" },
+  { k = "\\",         d = "push space to other display" },
   { k = "0",          d = "pull all spaces home" },
-  { k = "fn+g",       d = "fling window → ext" },
   { k = "g",          d = "focus ext" },
-  { k = "f13 / f14",  d = "focus laptop / external" },
+  { k = "fn+g",       d = "fling window to ext" },
+  { k = "F1  F2",     d = "focus laptop / external" },
   { gap = true },
   { h = "SYSTEM" },
   { k = "hyper",       d = "= caps lock = ⌘⌃⌥⇧" },
@@ -268,7 +272,7 @@ local function buildHelpCanvas()
   local screen = hs.mouse.getCurrentScreen() or hs.screen.mainScreen()
   if not screen then return nil end   -- no active display (hot-plug/sleep-wake race); skip this toggle
   local sf = screen:frame()
-  local W, H = 1180, 640
+  local W, H = 1120, 410
   local x = sf.x + (sf.w - W) / 2
   local y = sf.y + (sf.h - H) / 2
   local c = hs.canvas.new({ x = x, y = y, w = W, h = H })
@@ -284,10 +288,14 @@ local function buildHelpCanvas()
       strokeColor = { red = 1.0, green = 0.62, blue = 0.22, alpha = 0.9 } },
     { type = "text",
       text = helpSeg("yabai · skhd  —  keybindings", { white = 1.0 }, 20, true),
-      frame = { x = 36, y = 22, w = W - 72, h = 30 } },
-    { type = "text", text = helpColumn(HELP_COL1), frame = { x = 36,  y = 74, w = 372, h = H - 92 } },
-    { type = "text", text = helpColumn(HELP_COL2), frame = { x = 412, y = 74, w = 372, h = H - 92 } },
-    { type = "text", text = helpColumn(HELP_COL3), frame = { x = 788, y = 74, w = 372, h = H - 92 } },
+      frame = { x = 40, y = 20, w = W - 80, h = 30 } },
+    -- thin orange divider under the title to anchor the header band
+    { type = "rectangle", action = "fill",
+      fillColor = { red = 1.0, green = 0.62, blue = 0.22, alpha = 0.32 },
+      frame = { x = 40, y = 55, w = W - 80, h = 1.5 } },
+    { type = "text", text = helpColumn(HELP_COL1), frame = { x = 40,  y = 68, w = 330, h = H - 84 } },
+    { type = "text", text = helpColumn(HELP_COL2), frame = { x = 400, y = 68, w = 330, h = H - 84 } },
+    { type = "text", text = helpColumn(HELP_COL3), frame = { x = 760, y = 68, w = 330, h = H - 84 } },
   })
   return c
 end

@@ -151,6 +151,8 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 
 Skhd binds keyboard events (from Karabiner) to yabai commands. All paths are templated during chezmoi apply; `{{ .chezmoi.homeDir }}` becomes `/Users/mackhaymond`.
 
+> **Keep in sync — hand-mirrored, no auto-generation.** This bind list lives in THREE files: `dot_config/skhd/skhdrc.tmpl` (the **source of truth**), the `HELP_COL1/2/3` tables in `dot_hammerspoon/init.lua` (the on-screen **`hyper+fn+?`** help overlay; `Esc` closes it), and this README (§3.2 tables + §6 cheat sheet). Change a bind in skhd and you MUST update the overlay tables **and** both README sections, or the docs and the on-screen help will lie.
+
 **Hex Key Codes:**
 - `0x32` = Backtick (`)
 - `0x2A` = Backslash (\)
@@ -158,6 +160,7 @@ Skhd binds keyboard events (from Karabiner) to yabai commands. All paths are tem
 - `0x1E` = Right bracket (`]`)
 - `0x29` = Semicolon (`;`)
 - `0x27` = Apostrophe (`'`)
+- `0x2C` = Slash (`/`) — i.e. `?` once hyper's shift is applied (the help-overlay bind)
 
 All other keys referenced by character (e.g., `hyper - 1`, `hyper - z`).
 
@@ -770,6 +773,8 @@ git push origin main
 
 ## 6. Complete Keybinding Cheat Sheet
 
+> **Hand-mirrored — keep in sync.** These binds also live in `dot_config/skhd/skhdrc.tmpl` (source of truth) and the `HELP_COL` tables in `dot_hammerspoon/init.lua` (the `hyper+fn+?` on-screen overlay). Change one, change all three (see the §3.2 banner).
+
 | Keybinding | Physical Key | Action | Notes |
 |---|---|---|---|
 | **Focus Workspace** |
@@ -827,6 +832,9 @@ git push origin main
 | `hyper - 3` | 3 | Focus 1st native-fullscreen app | `yabai_fullscreen_focus.sh 1` |
 | `hyper - 4` | 4 | Focus 2nd native-fullscreen app | ordinal 2 |
 | `hyper - 5` … `hyper - 9` | 5–9 | Focus 3rd … 7th native-fullscreen app | ordinals 3–7; no-op if absent |
+| **System / Help** |
+| `hyper + fn - 0x2C` | Fn+/ (`?`) | Toggle the on-screen keybind help overlay | Hammerspoon `yabaiHelpToggle` (`init.lua`); on the fn layer because bare `hyper+/` is swallowed by macOS's reserved `cmd+?` |
+| `esc` | Escape | Close the help overlay | Active only while the overlay is showing |
 
 ## Notes & Key Design Decisions
 
