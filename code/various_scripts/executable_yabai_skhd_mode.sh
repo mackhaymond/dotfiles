@@ -17,12 +17,6 @@ else
   yabai -m config --space "$SPACE_INDEX" layout bsp >/dev/null 2>&1 || true
 fi
 
-# Gate JankyBorders to the NEW layout: borders ON in bsp, OFF in stack. No yabai
-# signal fires for a per-space layout change, so sync explicitly here (same reason the
-# layers indicator is poked below). yabai_borders.sh re-queries the focused space, so
-# it reads the layout we just set.
-"${HOME}/code/various_scripts/yabai_borders.sh" sync >/dev/null 2>&1 || true
-
 # No yabai signal fires for a layout change (config --space ... layout pushes none), so
 # poke the SwiftBar layers indicator directly -- this flips it BSP <-> N/M and there is
 # no other event to catch it. -g never steals focus; single-quote so `?` isn't globbed.

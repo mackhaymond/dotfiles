@@ -42,7 +42,6 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `…/code/various_scripts/executable_yabai_reorder_spaces.sh` | `~/code/various_scripts/yabai_reorder_spaces.sh` | Executable script | Keep labeled spaces in canonical order per display |
 | `…/code/various_scripts/executable_yabai_fullscreen_focus.sh` | `~/code/various_scripts/yabai_fullscreen_focus.sh` | Executable script | Focus the Nth native-fullscreen app (`hyper+3-9`), WezTerm excluded |
 | `…/code/various_scripts/executable_yabai_terminal_follow.sh` | `~/code/various_scripts/yabai_terminal_follow.sh` | Executable script | Keep `terminal` label on WezTerm in/out of fullscreen; sweep husk spaces |
-| `…/code/various_scripts/executable_yabai_borders.sh` | `~/code/various_scripts/yabai_borders.sh` | Executable script | **JankyBorders gate** — start/stop the `borders` daemon so window borders show only while the focused space is **bsp** (off in stack). Called from `yabai_skhd_mode.sh`, the `space_changed` signal, and once at startup |
 | `…/code/various_scripts/yabai_common.sh` | `~/code/various_scripts/yabai_common.sh` | Sourced shell lib (not executable) | **Shared helper** — single source of the master-display UUID, the canonical `YABAI_LABELS` list, `yabai_master_index()` (UUID-then-area resolver), and `yabai_load_cache()`. Sourced by the workspace/display/move/refresh/reorder/displays scripts; required sibling |
 | `…/dot_hammerspoon/init.lua` | `~/.hammerspoon/init.lua` | Lua config | **Hammerspoon**: classify Arc windows via AXIdentifier; pin the two main windows to main/school (Little Arc left managed). Required dependency, launches at login |
 | `…/swiftbar_plugins/executable_yabai_layers.1s.sh` | `~/swiftbar_plugins/yabai_layers.1s.sh` | Executable plugin | **SwiftBar** menu-bar plugin — the **live** status indicator. Shows current/total stack layer (e.g. `2 / 3`), or `BSP`/`FLOAT`, refreshed every 1s. Read-only/passive (no window-manager effect) |
@@ -78,8 +77,6 @@ MASTER_DISPLAY_UUID=37D8832A-2D66-02CA-B9F7-8F30A301B230
 | `display_arrangement_order` | `horizontal` | External display to the right of laptop. |
 | `window_shadow` | `off` | No drop shadow on borders. |
 | `top_padding` | `0` | No padding above first window; macOS menu bar handles offset. |
-| `bottom_padding` / `left_padding` / `right_padding` | `0` | No screen-edge margin — bsp windows tile to every edge. Only manifests in bsp. |
-| `window_gap` | `4` | Inter-window gap sized so adjacent JankyBorders strokes just meet without overlapping (`2 × border_width`, width `2.0`). Only manifests in bsp; in stack one window fills the space. |
 
 #### Window Rules: Unmanaged Apps
 
@@ -122,7 +119,7 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 - **Arc:** call `hs -c "arcSync()"` (Hammerspoon re-pins the Arc main windows; Little Arc untouched).
 - **Other apps:** left wherever they land. The terminal space is **not** reserved — any window may share it with WezTerm (the old non-WezTerm "bounce" was removed).
 
-**3. `space_changed`** → `yabai_terminal_follow.sh` then re-activate WezTerm. The follow hook keeps the `terminal` label pinned to WezTerm wherever it roams (including in/out of a native-fullscreen Space), reorders, and sweeps surplus empty husk spaces. Cheap no-op when WezTerm hasn't moved. **Also runs `yabai_borders.sh sync`** (placed *before* the handler's early exits so it always fires) so JankyBorders follows the focused space — borders ON when you land on a bsp space, OFF on a stack space.
+**3. `space_changed`** → `yabai_terminal_follow.sh` then re-activate WezTerm. The follow hook keeps the `terminal` label pinned to WezTerm wherever it roams (including in/out of a native-fullscreen Space), reorders, and sweeps surplus empty husk spaces. Cheap no-op when WezTerm hasn't moved.
 
 **4. `application_launched`** → `yabai -m rule --apply` (re-pins Todoist/Messages/etc.) **and** `hs -c "arcSync()"` (re-pins the Arc main windows) — one consistent "snap" moment.
 
@@ -151,7 +148,6 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 | `YABAI_MOUSE_FOLLOW` | `${HOME}/code/various_scripts/yabai_mouse_follow.sh` | `display_changed` signal |
 | `YABAI_HEAL` | `${HOME}/code/various_scripts/yabai_heal.sh` | `space_destroyed` / `mission_control_exit` signals (debounced self-heal) |
 | `YABAI_STARTUP_RECONCILE` | `${HOME}/code/various_scripts/yabai_startup_reconcile.sh` | Backgrounded once at yabai startup (login-race fix: polls — re-apply rules + Arc re-pin — until pinned apps are home, capped by `YABAI_RECONCILE_CAP` ≈90 s) |
-| `YABAI_BORDERS` | `${HOME}/code/various_scripts/yabai_borders.sh` | One-shot `sync` at startup (the `"$YABAI_BORDERS" sync &` line). The `space_changed` signal and `yabai_skhd_mode.sh` invoke the script via the literal `$HOME` path, not this var. |
 
 ### 3.2 Skhd Hotkey Daemon (skhdrc)
 
@@ -394,7 +390,6 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 | `yabai_reorder_spaces.sh` | (none) | Slide labeled spaces into canonical order per display (reserves non-master's first space as scratch); handles fullscreen spaces |
 | `yabai_fullscreen_focus.sh` | `<ordinal>` | Focus the Nth native-fullscreen app in mission-control order (`hyper+3-9`); excludes WezTerm |
 | `yabai_terminal_follow.sh` | (none; space_changed hook) | Re-pin `terminal` label onto WezTerm's space (incl. fullscreen) + reorder; sweep surplus empty husk spaces |
-| `yabai_borders.sh` | `sync` \| `on` \| `off` (default `sync`) | Gate JankyBorders to bsp: `sync` reads the focused space's layout, starts the `borders` daemon in bsp / stops it in stack. Idempotent + flicker-free (no-op if already correct). Called from `yabai_skhd_mode.sh`, the `space_changed` signal, and startup |
 
 ### How It All Connects
 
@@ -532,7 +527,7 @@ The single most fragile dependency in the whole system is the **scripting additi
 
 **Symptom of a broken SA layer:** yabai starts and tiling/focus all work, but native-fullscreen toggling, space create/destroy, or the WezTerm husk sweep silently no-op. Fix = re-install the SA and regenerate the sudoers hash, not the config.
 
-Other login-time dependencies: **Karabiner** (caps_lock→hyper, the F13/F14/F18/F19 chords) and **Hammerspoon** (`hs.autoLaunch(true)`, for Arc pinning — degrades gracefully if absent). `skhd` and `yabai` run as user LaunchAgents. **JankyBorders** (`brew install felixkratz/formulae/borders`) provides the bsp window borders; it is deliberately **not** a brew service (so it never runs at login or in stack-only sessions) — `yabai_borders.sh` owns its lifecycle and degrades to a no-op if the `borders` binary is absent.
+Other login-time dependencies: **Karabiner** (caps_lock→hyper, the F13/F14/F18/F19 chords) and **Hammerspoon** (`hs.autoLaunch(true)`, for Arc pinning — degrades gracefully if absent). `skhd` and `yabai` run as user LaunchAgents.
 
 ### Focus a Workspace
 
@@ -855,7 +850,6 @@ git push origin main
 - **Terminal space (not reserved):** WezTerm's home space, but other windows may land on it and stay — the old non-WezTerm bounce was removed. WezTerm itself is still nudged onto it on launch.
 - **Pinned apps:** Certain apps (Todoist, Granola, Spark Mail, etc.) are sticky and cannot be moved off their home spaces.
 - **Stack layout:** Only one window visible at a time; navigate with hyper+z/x to cycle through stacked layers.
-- **BSP borders + tight gap (JankyBorders):** In bsp layout the four `*_padding` knobs are `0` (windows sit flush to the screen edges) and **JankyBorders** draws a subtle border (active white / inactive gray, **2px**, rounded) so adjacent tiles stay distinguishable. `window_gap` is **4** = `2 × border_width`: a border reaches `border_width` px outward from each window edge (inner edge flush), so neighbouring tiles' borders **just meet without overlapping** at twice the width. Borders are **gated to bsp and follow the focused space**: `yabai_borders.sh sync` starts the `borders` daemon when the focused space is bsp and stops it in stack, driven from the `hyper+fn+b` toggle (`yabai_skhd_mode.sh`), the `space_changed` signal, and a one-shot at startup. It is **not** a brew service (so it never runs in stack-only sessions) and start/stop is idempotent + flicker-free (a bsp→bsp switch doesn't restart it). Tune the look in the `BORDERS_ARGS` array at the top of `yabai_borders.sh` — if you change `width`, keep `window_gap = 2 × width` (yabairc) so borders stay just-touching. The padding/gap knobs are global `yabairc` config but only manifest in bsp, since stack shows a single window per space.
 - **Mouse follow:** Cursor automatically warps to newly focused display (reduced need for manual positioning).
 - **Screen flash:** *(disabled 2026-06-04)* — formerly an orange border confirming focus jumped to the external display; the helper remains dormant in-tree.
 - **Native-fullscreen access:** Apps put into macOS native fullscreen (non-pinned apps or the browser) live in their own Spaces *outside* the labeled model, so the `hyper+<label>` keys can't reach them. `hyper+3`…`hyper+9` focus the 1st…7th fullscreen app in mission-control order (display, then index) via `yabai_fullscreen_focus.sh`. Mapping is dynamic by position, not pinned per-app. **WezTerm is excluded** from these ordinals (it's the `terminal` workspace, reached with `hyper+\``, even when fullscreen). Note: yabai *can* label, `--move` (reorder), focus, and move fullscreen Spaces between displays — they are not as locked-down as commonly assumed.
