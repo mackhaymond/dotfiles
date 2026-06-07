@@ -1,5 +1,7 @@
 # Yabai + Skhd + Karabiner-Elements + WezTerm: Complete Setup Reference
 
+> *Docs audited & synced to config: **2026-06-06** — multi-agent review of the bsp keybind set (focus/resize/balance/split/rotate/mirror) + the event-driven self-heal. 0 critical/high correctness findings; no duplicate or BetterTouchTool-reserved (`hyper+a`/`hyper+s`) binds; pinned-window guards intact.*
+
 ## 1. Overview & Mental Model
 
 This is a single-laptop-first tiling window manager setup optimized for seamless occasional multi-display work. The system treats the built-in MacBook display as the permanent "master" home for all work, with an optional external display as a temporary "external" work surface that comes and goes via dock.
@@ -30,8 +32,8 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_space_move.sh` | `~/code/various_scripts/yabai_space_move.sh` | Executable script | Push/pull spaces between displays |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_displays.sh` | `~/code/various_scripts/yabai_displays.sh` | Executable script | Hotplug handler: dock/undock logic |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_mode.sh` | `~/code/various_scripts/yabai_skhd_mode.sh` | Executable script | Toggle space layout (bsp ↔ stack) |
-| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_next.sh` | `~/code/various_scripts/yabai_skhd_stack_next.sh` | Executable script | Focus next window in stack |
-| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_prev.sh` | `~/code/various_scripts/yabai_skhd_stack_prev.sh` | Executable script | Focus previous window in stack |
+| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_next.sh` | `~/code/various_scripts/yabai_skhd_stack_next.sh` | Executable script | **`hyper+z`, layout-aware:** STACK → next stack layer; BSP → mirror tree horizontally (`--mirror x-axis`) |
+| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_prev.sh` | `~/code/various_scripts/yabai_skhd_stack_prev.sh` | Executable script | **`hyper+x`, layout-aware:** STACK → previous stack layer; BSP → mirror tree vertically (`--mirror y-axis`) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_mouse_follow.sh` | `~/code/various_scripts/yabai_mouse_follow.sh` | Executable script | Warp cursor to newly focused display |
 | `…/code/various_scripts/executable_yabai_heal.sh` | `~/code/various_scripts/yabai_heal.sh` | Executable script | **Debounced self-heal** — coalesce `space_destroyed` / `mission_control_exit` into one `yabai_workspace_refresh` (single-flight mkdir lock + settle) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_screen_flash.sh` | `~/code/various_scripts/yabai_screen_flash.sh` | Executable script | **DISABLED (dormant)** — was the external-display focus border flash; the signal was removed 2026-06-04 |
@@ -152,6 +154,10 @@ Skhd binds keyboard events (from Karabiner) to yabai commands. All paths are tem
 **Hex Key Codes:**
 - `0x32` = Backtick (`)
 - `0x2A` = Backslash (\)
+- `0x21` = Left bracket (`[`)
+- `0x1E` = Right bracket (`]`)
+- `0x29` = Semicolon (`;`)
+- `0x27` = Apostrophe (`'`)
 
 All other keys referenced by character (e.g., `hyper - 1`, `hyper - z`).
 
@@ -200,7 +206,18 @@ Move the focused window to a target space and **follow focus to it** (unless pin
 - Codex → codex
 - Arc → protected on `main`/`school` (any Arc window on either is shielded; rare Little-Arc-on-home included)
 
-#### Window Navigation & Layout (Hyper+Fn)
+#### External Scratch-Work Space (`ext`)
+
+Fling a loose, unpinned window onto the external display's on-demand `ext` scratch space (created on first use), or focus it. See the "External scratch-work space (`ext`)" design note. No-op with one display.
+
+| Keybinding | Key | Script | Action |
+|---|---|---|---|
+| `hyper + fn - g` | Fn+G | `yabai_send_window_external.sh` | Fling the focused unpinned window to `ext` (create + follow); pinned-home apps and Arc-on-main/school are guarded out. Multiple windows stack; cycle with `hyper+z`/`hyper+x` |
+| `hyper - g` | G | `yabai_workspace.sh focus ext` | Focus `ext` (no-op if it doesn't exist) |
+
+#### Window Swap (Hyper+Fn)
+
+Swap the focused window with its neighbor in a direction (bsp).
 
 | Keybinding | Key | Command |
 |---|---|---|
@@ -208,9 +225,26 @@ Move the focused window to a target space and **follow focus to it** (unless pin
 | `hyper + fn - k` | Fn+K | `yabai -m window --swap north` |
 | `hyper + fn - h` | Fn+H | `yabai -m window --swap west` |
 | `hyper + fn - l` | Fn+L | `yabai -m window --swap east` |
-| `hyper + fn - a` | Fn+A | `yabai -m window --space prev` |
-| `hyper + fn - s` | Fn+S | `yabai -m window --space next` |
-| `hyper + fn - x` | Fn+X | `yabai -m space --mirror x-axis` |
+
+*(The old `hyper+fn+a` / `hyper+fn+s` — `window --space prev`/`next`, the only un-guarded send-to-space path — and `hyper+fn+x` — `space --mirror x-axis`, redundant with `hyper+z`/`hyper+x` in bsp — were removed.)*
+
+#### Bsp Focus, Resize & Layout (Hyper)
+
+Bare-hyper bsp cluster: directional focus, resize, balance, split-orientation, and rotate. All are inline `yabai` commands (no script). No-ops / harmless in a stack space. Note `hyper - a` and `hyper - s` are **reserved by BetterTouchTool** — no skhd bind may use them.
+
+| Keybinding | Key | Command | Action |
+|---|---|---|---|
+| `hyper - h` | H | `yabai -m window --focus west` | Focus window to the west (bsp; no-op in stack) |
+| `hyper - j` | J | `yabai -m window --focus south` | Focus window to the south |
+| `hyper - k` | K | `yabai -m window --focus north` | Focus window to the north |
+| `hyper - l` | L | `yabai -m window --focus east` | Focus window to the east |
+| `hyper - 0x21` | `[` | `yabai -m window --resize right:-60:0` | Make focused window narrower (bsp) |
+| `hyper - 0x1E` | `]` | `yabai -m window --resize right:60:0` | Make focused window wider |
+| `hyper - 0x29` | `;` | `yabai -m window --resize bottom:0:-60` | Make focused window shorter |
+| `hyper - 0x27` | `'` | `yabai -m window --resize bottom:0:60` | Make focused window taller |
+| `hyper - b` | B | `yabai -m space --balance` | Balance splits — equalize all split ratios on the space (bsp) |
+| `hyper - v` | V | `yabai -m window --toggle split` | Toggle the focused window's split orientation: horizontal ↔ vertical (bsp) |
+| `hyper - n` | N | `yabai -m space --rotate 90` | Rotate the whole tree 90° clockwise (bsp); repeat to cycle 90/180/270/0 |
 
 #### Display & Space Movement
 
@@ -221,15 +255,17 @@ Move the focused window to a target space and **follow focus to it** (unless pin
 | `f13` | Hyper+F1 | `yabai_display.sh master` | Focus laptop display |
 | `f14` | Hyper+F2 | `yabai_display.sh external` | Focus external display |
 
-#### Window Focus & Stack Navigation (Hyper)
+#### Stack/Mirror, Maximize & Layout Toggle (Hyper)
+
+`hyper - z` / `hyper - x` are **dual-role / layout-aware** (logic lives in the scripts): in a **stack** space they cycle stack layers; in a **bsp** space (where the stack is meaningless) they mirror the tree instead — `z` = horizontal (`--mirror x-axis`), `x` = vertical (`--mirror y-axis`). Single-laptop stack-cycle behavior is unchanged.
 
 | Keybinding | Key | Script/Command | Action |
 |---|---|---|---|
-| `hyper - z` | Z | `yabai_skhd_stack_next.sh` | Focus next window in stack (wrap to first) |
-| `hyper - x` | X | `yabai_skhd_stack_prev.sh` | Focus previous window in stack (wrap to last) |
-| `hyper - m` | M | `yabai -m window --toggle float --grid 6:6:1:1:4:4` | Toggle float; if floating, center at 4×4 grid cell |
+| `hyper - z` | Z | `yabai_skhd_stack_next.sh` | **Stack:** focus next stack layer (wrap to first). **Bsp:** mirror tree horizontally (`space --mirror x-axis`) |
+| `hyper - x` | X | `yabai_skhd_stack_prev.sh` | **Stack:** focus previous stack layer (wrap to last). **Bsp:** mirror tree vertically (`space --mirror y-axis`) |
+| `hyper - m` | M | `yabai -m window --toggle zoom-fullscreen` | Toggle maximize — zoom the focused window to fill its space |
 | `hyper + fn - m` | Fn+M | `yabai -m window --toggle native-fullscreen` | Toggle native fullscreen (global; **no-op on WezTerm** by design — see the "WezTerm is not fullscreenable" note) |
-| `hyper - b` | B | `yabai_skhd_mode.sh` | Toggle space layout (bsp ↔ stack) |
+| `hyper + fn - b` | Fn+B | `yabai_skhd_mode.sh` | Toggle space layout (bsp ↔ stack) |
 
 #### Native-Fullscreen App Access (Hyper)
 
@@ -339,8 +375,8 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 | `yabai_workspace_refresh.sh` | (none; on-demand) | Reconcile canonical labels on all displays; refresh display topology cache |
 | `yabai_heal.sh` | (none; signal handler) | Debounced self-heal — single-flight (mkdir lock) + settle, then `yabai_workspace_refresh.sh`. Bound to `space_destroyed` / `mission_control_exit` |
 | `yabai_skhd_mode.sh` | (none) | Toggle focused space layout (bsp ↔ stack) |
-| `yabai_skhd_stack_next.sh` | (none) | Focus next window in current stack layer; wrap to first |
-| `yabai_skhd_stack_prev.sh` | (none) | Focus previous window in current stack layer; wrap to last |
+| `yabai_skhd_stack_next.sh` | (none) | **Layout-aware (`hyper+z`):** STACK space → focus next stack layer (wrap to first); BSP space → mirror tree horizontally (`space --mirror x-axis`) |
+| `yabai_skhd_stack_prev.sh` | (none) | **Layout-aware (`hyper+x`):** STACK space → focus previous stack layer (wrap to last); BSP space → mirror tree vertically (`space --mirror y-axis`) |
 | `yabai_mouse_follow.sh` | (none; signal handler) | Warp mouse cursor to focused display center (if not already there) |
 | `yabai_screen_flash.sh` | (none) | **DISABLED (dormant)** — was the external-display focus border flash; signal removed 2026-06-04 |
 | `yabai_reorder_spaces.sh` | (none) | Slide labeled spaces into canonical order per display (reserves non-master's first space as scratch); handles fullscreen spaces |
@@ -630,8 +666,8 @@ f14                    # Focus external display
 ```bash
 nano /Users/mackhaymond/.local/share/chezmoi/dot_config/skhd/skhdrc.tmpl
 
-# Add a line like:
-# hyper - n : /Users/mackhaymond/code/various_scripts/my_script.sh
+# Add a line like (hyper - p is unused; hyper - n is now a live rotate bind):
+# hyper - p : /Users/mackhaymond/code/various_scripts/my_script.sh
 
 # (Use {{ .chezmoi.homeDir }} for templates; yabairc uses $HOME at runtime)
 ```
@@ -716,7 +752,7 @@ cd /Users/mackhaymond/.local/share/chezmoi
 git add dot_config/skhd/skhdrc.tmpl
 
 # Commit (pre-commit hook runs gitleaks to detect secrets)
-git commit -m "Update skhd keybindings: add hyper-n binding for..."
+git commit -m "Update skhd keybindings: add hyper-p binding for..."
 
 # If gitleaks blocks (found hardcoded secrets):
 # 1. Remove the secret from the file
@@ -761,18 +797,27 @@ git push origin main
 | `hyper + fn - g` | Fn+G | Fling window to external `ext` space | On-demand; stacks; dissolves to main on hyper+0 / push / undock |
 | `hyper - g` | G | Focus external `ext` space | No-op if `ext` doesn't exist |
 | **Window Layout & Navigation** |
-| `hyper - z` | Z | Focus next window in stack | Wraps to first |
-| `hyper - x` | X | Focus previous window in stack | Wraps to last |
-| `hyper + fn - j` | Fn+J | Swap focused window south | |
-| `hyper + fn - k` | Fn+K | Swap focused window north | |
-| `hyper + fn - h` | Fn+H | Swap focused window west | |
-| `hyper + fn - l` | Fn+L | Swap focused window east | |
-| `hyper + fn - a` | Fn+A | Move window to previous space | |
-| `hyper + fn - s` | Fn+S | Move window to next space | |
-| `hyper + fn - x` | Fn+X | Mirror space layout (x-axis) | |
-| `hyper - m` | M | Toggle float; center if floating | 6×6 grid, cell 1,1 to 4,4 |
+| `hyper - z` | Z | Stack: next layer / Bsp: mirror horizontal | Stack-cycle wraps to first; bsp = `space --mirror x-axis` |
+| `hyper - x` | X | Stack: previous layer / Bsp: mirror vertical | Stack-cycle wraps to last; bsp = `space --mirror y-axis` |
+| `hyper + fn - j` | Fn+J | Swap focused window south | bsp |
+| `hyper + fn - k` | Fn+K | Swap focused window north | bsp |
+| `hyper + fn - h` | Fn+H | Swap focused window west | bsp |
+| `hyper + fn - l` | Fn+L | Swap focused window east | bsp |
+| `hyper - h` | H | Focus window west | bsp; no-op in stack |
+| `hyper - j` | J | Focus window south | bsp; no-op in stack |
+| `hyper - k` | K | Focus window north | bsp; no-op in stack |
+| `hyper - l` | L | Focus window east | bsp; no-op in stack |
+| `hyper - 0x21` | `[` | Resize focused window narrower | bsp; `--resize right:-60:0` |
+| `hyper - 0x1E` | `]` | Resize focused window wider | bsp; `--resize right:60:0` |
+| `hyper - 0x29` | `;` | Resize focused window shorter | bsp; `--resize bottom:0:-60` |
+| `hyper - 0x27` | `'` | Resize focused window taller | bsp; `--resize bottom:0:60` |
+| `hyper - b` | B | Balance splits | bsp; `space --balance` |
+| `hyper - v` | V | Toggle split orientation (h ↔ v) | bsp; `window --toggle split` |
+| `hyper - n` | N | Rotate tree 90° clockwise | bsp; `space --rotate 90` (repeat cycles 90/180/270/0) |
+| `hyper - m` | M | Toggle maximize (zoom-fullscreen) | `window --toggle zoom-fullscreen` |
 | `hyper + fn - m` | Fn+M | Toggle native fullscreen | Global; no-op on WezTerm by design |
-| `hyper - b` | B | Toggle space layout (bsp ↔ stack) | |
+| `hyper + fn - b` | Fn+B | Toggle space layout (bsp ↔ stack) | |
+| `hyper - a` / `hyper - s` | A / S | *(reserved by BetterTouchTool)* | Not skhd binds — never assign |
 | **Display & Cross-Display Movement** |
 | `f13` | Hyper+F1 | Focus master (laptop) display | Karabiner-mapped |
 | `f14` | Hyper+F2 | Focus external display | Karabiner-mapped |
