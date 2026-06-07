@@ -8,15 +8,18 @@ yabai -m config display_arrangement_order horizontal
 
 yabai -m config window_shadow off
 
-# Edge-to-edge BSP tiling: zero the inter-window gap AND every screen-edge pad.
-# These only manifest in bsp layout (in stack only one window is visible per space),
-# so they are safe as GLOBAL config and apply to any space toggled into bsp via
-# yabai_skhd_mode.sh. top_padding stays 0 (the macOS menu bar handles the top offset).
+# BSP tiling: screen-edge padding is 0 (windows sit flush to the display edges), but
+# the inter-window gap is sized so the JankyBorders strokes of adjacent tiles JUST
+# meet without overlapping. A border reaches `border_width` px outward from each
+# window edge (inner edge flush), so two neighbours' borders touch at
+# window_gap = 2 * border_width. With width=2.0 (see yabai_borders.sh) that is 4.
+# These only manifest in bsp (in stack one window fills the space). top_padding stays
+# 0 (the macOS menu bar handles the top offset).
 yabai -m config top_padding    0
 yabai -m config bottom_padding 0
 yabai -m config left_padding   0
 yabai -m config right_padding  0
-yabai -m config window_gap     0
+yabai -m config window_gap     4
 
 YABAI_WORKSPACE_REFRESH="${HOME}/code/various_scripts/yabai_workspace_refresh.sh"
 YABAI_DISPLAYS="${HOME}/code/various_scripts/yabai_displays.sh"

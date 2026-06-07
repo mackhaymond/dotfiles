@@ -23,13 +23,17 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:
 export LANG="${LANG:-en_US.UTF-8}"   # borders requires a UTF-8 locale (see brew caveat)
 
 # --- style tunables -------------------------------------------------------------
-# active   = white, inactive = muted slate gray, ~5px, rounded corners ("subtle").
+# active = white, inactive = muted slate gray, ~2px, rounded corners ("subtle").
 # Colors are 0xAARRGGBB. Tweak freely -- a running borders is restarted on the next
 # bsp re-entry, so style edits take effect after one stack<->bsp round-trip.
+# NOTE: a border reaches `width` px OUTWARD from each window edge (inner edge flush
+# with the frame), so two adjacent bsp tiles' borders just touch at a gap of 2*width.
+# If you change `width` here, also set yabairc's `window_gap = 2 * width` to keep the
+# borders just-not-overlapping.
 BORDERS_ARGS=(
   active_color=0xffffffff
   inactive_color=0xff5c6370
-  width=5.0
+  width=2.0
   style=round
 )
 
