@@ -16,3 +16,8 @@ if [ "$MODE" = "bsp" ]; then
 else
   yabai -m config --space "$SPACE_INDEX" layout bsp >/dev/null 2>&1 || true
 fi
+
+# No yabai signal fires for a layout change (config --space ... layout pushes none), so
+# poke the SwiftBar layers indicator directly -- this flips it BSP <-> N/M and there is
+# no other event to catch it. -g never steals focus; single-quote so `?` isn't globbed.
+/usr/bin/open -g 'swiftbar://refreshplugin?name=yabai_layers' >/dev/null 2>&1 || true

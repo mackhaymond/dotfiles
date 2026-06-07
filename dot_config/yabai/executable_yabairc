@@ -14,6 +14,11 @@ YABAI_WORKSPACE_REFRESH="${HOME}/code/various_scripts/yabai_workspace_refresh.sh
 YABAI_DISPLAYS="${HOME}/code/various_scripts/yabai_displays.sh"
 YABAI_MOUSE_FOLLOW="${HOME}/code/various_scripts/yabai_mouse_follow.sh"
 YABAI_HEAL="${HOME}/code/various_scripts/yabai_heal.sh"
+# One-shot, focus-safe refresh of the yabai_layers SwiftBar menu-bar plugin. name= is
+# the base name before the first dot (interval-independent -- survives the .30s
+# filename), -g never steals focus, /usr/bin/open is absolute (yabai actions run in a
+# non-interactive shell), single-quoted so the shell doesn't glob the `?`.
+YABAI_LAYERS_REFRESH="/usr/bin/open -g 'swiftbar://refreshplugin?name=yabai_layers'"
 "$YABAI_WORKSPACE_REFRESH" startup
 
 yabai -m rule --add app="^System Settings$" manage=off
@@ -42,6 +47,8 @@ yabai -m rule --add app="^Antidote$" manage=off
 yabai -m signal --add event=window_created action='
   win=$YABAI_WINDOW_ID
   info=$(yabai -m query --windows --window "$win" 2>/dev/null) || exit 0
+  # A new window may add a stack layer on the focused space -> bump the layers bar.
+  /usr/bin/open -g "swiftbar://refreshplugin?name=yabai_layers"
   app=$(printf "%s" "$info" | jq -r ".app // empty" 2>/dev/null)
   # New Arc window -> re-pin the Arc MAIN windows via Hammerspoon (only it can
   # read AXIdentifier to tell a main window from a Little Arc popup). Same trigger
@@ -76,6 +83,9 @@ yabai -m signal --add event=window_created action='
 # raises cleanly. Anchored on the terminal label'\''s LIVE index, so it follows
 # wezterm onto the external display too.
 yabai -m signal --add event=space_changed action='
+  # Active space changed -> re-evaluate the layers bar for the new space (covers every
+  # space switch, native-fullscreen enter/exit, and send-window-with-follow).
+  /usr/bin/open -g "swiftbar://refreshplugin?name=yabai_layers"
   "$HOME/code/various_scripts/yabai_terminal_follow.sh"
   tidx=$(yabai -m query --spaces --space terminal 2>/dev/null | jq -r .index 2>/dev/null)
   case "$tidx" in ""|*[!0-9]*) exit 0 ;; esac
@@ -129,6 +139,19 @@ yabai -m signal --add event=display_changed label=mouse_follow_display action="$
 # (too noisy; window closes do not drop labels).
 yabai -m signal --add event=space_destroyed label=heal_space_destroyed action="$YABAI_HEAL"
 yabai -m signal --add event=mission_control_exit label=heal_mission_control action="$YABAI_HEAL"
+
+# Menu-bar layers indicator (yabai_layers SwiftBar plugin): event-driven refresh.
+# The plugin polls slowly (.30s) only as a backstop; these signals make it instant.
+# window_focused fires for floating AND tiled windows (the handler tracks ALL windows,
+# no manage guard), so it is THE event for the whole focus family: stack-layer cycle
+# (hyper+z/x), mouse/cmd-tab focus onto a window with a different float/stack/type, and
+# focus landing on a manage=off app (-> FLOAT). window_destroyed catches a window close
+# lowering the stack depth (M). Opens (window_created) and every space switch
+# (space_changed) refresh inline in those handlers above; the bsp<->stack layout toggle
+# has NO yabai signal, so yabai_skhd_mode.sh pokes the refresh itself. The action is a
+# sub-ms fire-and-forget URL open and SwiftBar coalesces, so no single-flight is needed.
+yabai -m signal --add event=window_focused label=layers_refresh_focus action="$YABAI_LAYERS_REFRESH"
+yabai -m signal --add event=window_destroyed label=layers_refresh_destroyed action="$YABAI_LAYERS_REFRESH"
 
 # (The external-display border flash was disabled 2026-06-04 by user request. The
 # helper scripts yabai_screen_flash.sh / .js remain in code/various_scripts as
