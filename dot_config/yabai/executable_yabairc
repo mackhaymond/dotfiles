@@ -14,6 +14,7 @@ YABAI_WORKSPACE_REFRESH="${HOME}/code/various_scripts/yabai_workspace_refresh.sh
 YABAI_DISPLAYS="${HOME}/code/various_scripts/yabai_displays.sh"
 YABAI_MOUSE_FOLLOW="${HOME}/code/various_scripts/yabai_mouse_follow.sh"
 YABAI_HEAL="${HOME}/code/various_scripts/yabai_heal.sh"
+YABAI_STARTUP_RECONCILE="${HOME}/code/various_scripts/yabai_startup_reconcile.sh"
 # One-shot, focus-safe refresh of the yabai_layers SwiftBar menu-bar plugin. name= is
 # the base name before the first dot (interval-independent -- survives the .30s
 # filename), -g never steals focus, /usr/bin/open is absolute (yabai actions run in a
@@ -112,6 +113,13 @@ yabai -m rule --add app="^Codex$" space=codex
 # Re-apply rules to currently-open windows on yabai (re)start.
 # Catches windows whose creation events were missed (login race, crash-restart).
 yabai -m rule --apply
+
+# Login-race reconciliation. The single rule --apply above can run before macOS has
+# restored all app windows (or before --load-sa finishes), so pinned apps land on the
+# wrong space until a manual restart. This re-asserts the rules + re-pins Arc a few
+# times over the first ~30s as the session settles (see yabai_startup_reconcile.sh).
+# BACKGROUNDED (&) so it never blocks yabai startup; idempotent once windows are home.
+"$YABAI_STARTUP_RECONCILE" &
 
 # Belt-and-suspenders: re-fire rules on any app launch in case the
 # window_created event is lost.

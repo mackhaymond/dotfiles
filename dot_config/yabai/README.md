@@ -36,6 +36,7 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_prev.sh` | `~/code/various_scripts/yabai_skhd_stack_prev.sh` | Executable script | **`hyper+x`, layout-aware:** STACK → previous stack layer; BSP → mirror tree vertically (`--mirror y-axis`) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_mouse_follow.sh` | `~/code/various_scripts/yabai_mouse_follow.sh` | Executable script | Warp cursor to newly focused display |
 | `…/code/various_scripts/executable_yabai_heal.sh` | `~/code/various_scripts/yabai_heal.sh` | Executable script | **Debounced self-heal** — coalesce `space_destroyed` / `mission_control_exit` into one `yabai_workspace_refresh` (single-flight mkdir lock + settle) |
+| `…/code/various_scripts/executable_yabai_startup_reconcile.sh` | `~/code/various_scripts/yabai_startup_reconcile.sh` | Executable script | **Login-race fix** — backgrounded at startup; re-loads the SA + ramps `rule --apply` / Arc re-pin so pinned apps reach their spaces without a manual restart |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_screen_flash.sh` | `~/code/various_scripts/yabai_screen_flash.sh` | Executable script | **DISABLED (dormant)** — was the external-display focus border flash; the signal was removed 2026-06-04 |
 | `…/code/various_scripts/yabai_screen_flash.js` | `~/code/various_scripts/yabai_screen_flash.js` | JXA helper | **DISABLED (dormant)** — drew the border overlay for `yabai_screen_flash.sh` |
 | `…/code/various_scripts/executable_yabai_reorder_spaces.sh` | `~/code/various_scripts/yabai_reorder_spaces.sh` | Executable script | Keep labeled spaces in canonical order per display |
@@ -134,6 +135,8 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 
 *(Also: a one-shot startup sync — `"$YABAI_WORKSPACE_REFRESH" startup` — runs near the **top** of yabairc, before the rules. Specific line numbers are intentionally omitted here — they drift; grep the signal name in `yabairc`.)*
 
+**Startup reconciliation** (`yabai_startup_reconcile.sh`, run **backgrounded** right after the startup `rule --apply`): fixes the **login race** where pinned apps land on the wrong space. At login, macOS restores app windows around when yabai starts, so windows created before the signals registered get no `window_created`/`application_launched` event, and the one-shot `rule --apply` can run *before* those windows exist (or before `--load-sa` finishes — window→space moves need the scripting addition). The reconcile re-loads the SA once, then re-applies the `space=` rules + re-pins Arc on a short ramp (≈0/4/8/15 s) as the session settles. Backgrounded so it never blocks startup; idempotent (a no-op once windows are home). Supersedes the old workaround of manually restarting yabai after login.
+
 > **Debugging signals:** there is no `yabai -m query --signals` in this yabai version (it errors `unknown command`). The authoritative list of registered signals is the `signal --add` lines in `yabairc` — grep them there.
 
 #### Environment Variables Exported
@@ -144,6 +147,7 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 | `YABAI_DISPLAYS` | `${HOME}/code/various_scripts/yabai_displays.sh` | `display_added` / `display_removed` signals |
 | `YABAI_MOUSE_FOLLOW` | `${HOME}/code/various_scripts/yabai_mouse_follow.sh` | `display_changed` signal |
 | `YABAI_HEAL` | `${HOME}/code/various_scripts/yabai_heal.sh` | `space_destroyed` / `mission_control_exit` signals (debounced self-heal) |
+| `YABAI_STARTUP_RECONCILE` | `${HOME}/code/various_scripts/yabai_startup_reconcile.sh` | Backgrounded once at yabai startup (login-race fix: ramps `rule --apply` + Arc re-pin as apps settle) |
 
 ### 3.2 Skhd Hotkey Daemon (skhdrc)
 
@@ -377,6 +381,7 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 | `yabai_displays.sh` | `added` \| `removed` | Hotplug handler: dock = refresh cache (non-destructive); undock = pull home safety net |
 | `yabai_workspace_refresh.sh` | (none; on-demand) | Reconcile canonical labels on all displays; refresh display topology cache |
 | `yabai_heal.sh` | (none; signal handler) | Debounced self-heal — single-flight (mkdir lock) + settle, then `yabai_workspace_refresh.sh`. Bound to `space_destroyed` / `mission_control_exit` |
+| `yabai_startup_reconcile.sh` | (none; backgrounded at startup) | Login-race fix — re-loads the SA + ramps `rule --apply` + Arc re-pin (≈0/4/8/15 s) so restored windows reach their pinned spaces without a manual yabai restart |
 | `yabai_skhd_mode.sh` | (none) | Toggle focused space layout (bsp ↔ stack) |
 | `yabai_skhd_stack_next.sh` | (none) | **Layout-aware (`hyper+z`):** STACK space → focus next stack layer (wrap to first); BSP space → mirror tree horizontally (`space --mirror x-axis`) |
 | `yabai_skhd_stack_prev.sh` | (none) | **Layout-aware (`hyper+x`):** STACK space → focus previous stack layer (wrap to last); BSP space → mirror tree vertically (`space --mirror y-axis`) |
