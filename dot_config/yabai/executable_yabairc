@@ -8,13 +8,22 @@ yabai -m config display_arrangement_order horizontal
 
 yabai -m config window_shadow off
 
-yabai -m config top_padding 0
+# Edge-to-edge BSP tiling: zero the inter-window gap AND every screen-edge pad.
+# These only manifest in bsp layout (in stack only one window is visible per space),
+# so they are safe as GLOBAL config and apply to any space toggled into bsp via
+# yabai_skhd_mode.sh. top_padding stays 0 (the macOS menu bar handles the top offset).
+yabai -m config top_padding    0
+yabai -m config bottom_padding 0
+yabai -m config left_padding   0
+yabai -m config right_padding  0
+yabai -m config window_gap     0
 
 YABAI_WORKSPACE_REFRESH="${HOME}/code/various_scripts/yabai_workspace_refresh.sh"
 YABAI_DISPLAYS="${HOME}/code/various_scripts/yabai_displays.sh"
 YABAI_MOUSE_FOLLOW="${HOME}/code/various_scripts/yabai_mouse_follow.sh"
 YABAI_HEAL="${HOME}/code/various_scripts/yabai_heal.sh"
 YABAI_STARTUP_RECONCILE="${HOME}/code/various_scripts/yabai_startup_reconcile.sh"
+YABAI_BORDERS="${HOME}/code/various_scripts/yabai_borders.sh"
 # One-shot, focus-safe refresh of the yabai_layers SwiftBar menu-bar plugin. name= is
 # the base name before the first dot (interval-independent -- survives the .30s
 # filename), -g never steals focus, /usr/bin/open is absolute (yabai actions run in a
@@ -88,6 +97,11 @@ yabai -m signal --add event=space_changed action='
   # space switch, native-fullscreen enter/exit, and send-window-with-follow).
   /usr/bin/open -g "swiftbar://refreshplugin?name=yabai_layers"
   "$HOME/code/various_scripts/yabai_terminal_follow.sh"
+  # JankyBorders follows the focused space: borders ON when the space we just landed
+  # on is bsp, OFF in stack. Placed BEFORE the early exits below so it ALWAYS runs on
+  # a space change (the tidx block returns early for non-terminal spaces). Single-
+  # quoted action -> $HOME is expanded at fire time, like the terminal_follow call.
+  "$HOME/code/various_scripts/yabai_borders.sh" sync
   tidx=$(yabai -m query --spaces --space terminal 2>/dev/null | jq -r .index 2>/dev/null)
   case "$tidx" in ""|*[!0-9]*) exit 0 ;; esac
   [ "$YABAI_SPACE_INDEX" = "$tidx" ] || exit 0
@@ -160,6 +174,13 @@ yabai -m signal --add event=mission_control_exit label=heal_mission_control acti
 # sub-ms fire-and-forget URL open and SwiftBar coalesces, so no single-flight is needed.
 yabai -m signal --add event=window_focused label=layers_refresh_focus action="$YABAI_LAYERS_REFRESH"
 yabai -m signal --add event=window_destroyed label=layers_refresh_destroyed action="$YABAI_LAYERS_REFRESH"
+
+# One-shot: make the JankyBorders state match the focused space's layout at startup.
+# After a yabai (re)start every space reverts to the global `layout stack` default, so
+# in practice this just ensures borders are OFF on a fresh start; backgrounded so it
+# never blocks startup. Thereafter the space_changed signal + yabai_skhd_mode.sh keep
+# borders gated to bsp (see yabai_borders.sh).
+"$YABAI_BORDERS" sync &
 
 # (The external-display border flash was disabled 2026-06-04 by user request. The
 # helper scripts yabai_screen_flash.sh / .js remain in code/various_scripts as
