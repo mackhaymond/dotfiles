@@ -387,7 +387,7 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 | `yabai_skhd_stack_prev.sh` | (none) | **Layout-aware (`hyper+x`):** STACK space → focus previous stack layer (wrap to last); BSP space → mirror tree vertically (`space --mirror y-axis`) |
 | `yabai_mouse_follow.sh` | (none; signal handler) | Warp mouse cursor to focused display center (if not already there) |
 | `yabai_screen_flash.sh` | (none) | **DISABLED (dormant)** — was the external-display focus border flash; signal removed 2026-06-04 |
-| `yabai_reorder_spaces.sh` | (none) | Slide labeled spaces into canonical order per display (reserves non-master's first space as scratch); handles fullscreen spaces |
+| `yabai_reorder_spaces.sh` | (none) | Slide labeled spaces into canonical order per display (reserves non-master's first space as scratch); handles fullscreen spaces; preserves the focused space across the moves |
 | `yabai_fullscreen_focus.sh` | `<ordinal>` | Focus the Nth native-fullscreen app in mission-control order (`hyper+3-9`); excludes WezTerm |
 | `yabai_terminal_follow.sh` | (none; space_changed hook) | Re-pin `terminal` label onto WezTerm's space (incl. fullscreen) + reorder; sweep surplus empty husk spaces |
 
@@ -510,6 +510,13 @@ The 10 spaces are always maintained in the order: terminal, main, school, todo, 
    - Increment `pos`.
 
 **Result:** Wherever labels roam, they maintain their stable sequence, making the layout predictable and recoverable.
+
+**Focus preservation (why the reorder snapshots the focused space):** a *burst* of `space --move` calls can make macOS yank the **active desktop** onto an unrelated space as a side effect — a yabai/macOS quirk that only surfaces under rapid moves combined with concurrent `yabai -m query` load (i.e. the normal state when the signal handlers are all firing). A single move is silent; the burst is not. Because the reorder fires after a `space_changed` (via `yabai_terminal_follow.sh`) and from the self-heal (`space_destroyed` / `mission_control_exit` → `yabai_workspace_refresh.sh`), the symptom was: press `hyper+<label>`, then the view jumps across a few spaces on its own and lands on the wrong one. (Confirmed by isolation that `space --create` and `space --destroy` of a *non-focused* space are both silent, so the husk-sweep was **not** the cause.) Reordering must never change which space is focused, so `yabai_reorder_spaces.sh`:
+
+1. Snapshots the focused space's **stable id** on entry (`yabai -m query --spaces --space | jq .id`) and arms an `any_moved` flag.
+2. After the move loop, **only if a move actually drifted focus**, re-focuses the original space — resolved by **id, not index**, since the moves renumbered indices.
+
+This is a no-op in the common already-ordered case (no moves) and when focus held, so the cheap query-only fast path is byte-unchanged. It fixes all reorder callers at once (`terminal_follow`, `workspace_refresh`, `space_move`). It guarantees the view **settles** on the right space; an occasional brief mid-flight flash during the moves is a yabai/macOS internal that can't be suppressed from here. *(Fix: git `957e9ed`, 2026-06-07.)*
 
 ## 5. Common Workflows & Runbook
 
