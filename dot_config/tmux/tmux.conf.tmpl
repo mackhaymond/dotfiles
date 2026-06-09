@@ -122,9 +122,11 @@ set -g @catppuccin_window_current_fill "number"
 # separator end-caps. The expression must stay space-free and quote-free
 # (catppuccin's option batch reader splits on spaces and strips quotes).
 # Mocha: done=green #a6e3a1, needs-input=yellow #f9e2af, running=surface1
-# #45475a (subtle lift), else stock surface0 #313244 / base #1e1e2e.
-set -g @catppuccin_window_default_background "#{?#{==:#{@agent_state},done},#a6e3a1,#{?#{==:#{@agent_state},needs-input},#f9e2af,#{?#{==:#{@agent_state},running},#45475a,#313244}}}"
-set -g @catppuccin_window_current_background "#{?#{==:#{@agent_state},done},#a6e3a1,#{?#{==:#{@agent_state},needs-input},#f9e2af,#{?#{==:#{@agent_state},running},#45475a,#1e1e2e}}}"
+# #45475a (subtle lift). No-state fallbacks are swapped from catppuccin
+# stock on purpose: the SELECTED tab gets surface0 #313244 (light gray)
+# and unselected tabs get base #1e1e2e (blend into the status bar).
+set -g @catppuccin_window_default_background "#{?#{==:#{@agent_state},done},#a6e3a1,#{?#{==:#{@agent_state},needs-input},#f9e2af,#{?#{==:#{@agent_state},running},#45475a,#1e1e2e}}}"
+set -g @catppuccin_window_current_background "#{?#{==:#{@agent_state},done},#a6e3a1,#{?#{==:#{@agent_state},needs-input},#f9e2af,#{?#{==:#{@agent_state},running},#45475a,#313244}}}"
 
 # fill=number locks the window NUMBER's fg to the $background expression
 # above (number block is `#[fg=$background,bg=$color]#I`), which would put a
