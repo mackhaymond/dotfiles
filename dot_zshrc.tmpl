@@ -609,3 +609,26 @@ fi
 [ -s "/Users/mackhaymond/.bun/_bun" ] && source "/Users/mackhaymond/.bun/_bun"
 
 if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init zsh)"; fi
+
+# Send file(s) to reMarkable (same as the "Print to ReMarkable" PDF service)
+2rm() {
+  if [ $# -eq 0 ]; then
+    echo "usage: 2rm <file> [file...]" >&2
+    return 1
+  fi
+  local f rc=0
+  for f in "$@"; do
+    if [ ! -f "$f" ]; then
+      echo "2rm: no such file: $f" >&2
+      rc=1
+      continue
+    fi
+    if ~/bin/rmapi put "$f"; then
+      echo "2rm: sent $f"
+    else
+      echo "2rm: failed to send $f" >&2
+      rc=1
+    fi
+  done
+  return $rc
+}
