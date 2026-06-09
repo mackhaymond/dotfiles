@@ -58,3 +58,7 @@ if [ "$app" = "Arc" ]; then
 fi
 
 yabai -m window --toggle float >/dev/null 2>&1 || exit 0
+
+# A float just flipped, but --toggle float emits no window_created/destroyed signal,
+# so reconcile the floating-window borders here (no-op if borders isn't installed).
+"$HOME/code/various_scripts/yabai_float_borders.sh" sync >/dev/null 2>&1 || true
