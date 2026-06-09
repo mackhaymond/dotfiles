@@ -61,11 +61,13 @@ window_state() {
 
 set_state() {
     # Write + redraw only on change; heartbeat fires on every tool call and
-    # must not churn the status line.
+    # must not churn the status line. Writes are best-effort: the window can
+    # close between the read and the write, and a failed write must not make
+    # the hook exit nonzero (codex treats hook exit status as a gate).
     local win="$1" new="$2" cur
     cur=$(window_state "$win")
     [ "$cur" = "$new" ] && return 0
-    tmux set-option -w -t "$win" @agent_state "$new"
+    tmux set-option -w -t "$win" @agent_state "$new" 2>/dev/null || true
     tmux refresh-client -S 2>/dev/null || true
 }
 
@@ -92,7 +94,7 @@ set_summary() {
     [ -n "$summary" ] || return 0
     cur=$(tmux show-options -wqv -t "$win" @agent_summary 2>/dev/null || true)
     [ "$cur" = "$summary" ] && return 0
-    tmux set-option -w -t "$win" @agent_summary "$summary"
+    tmux set-option -w -t "$win" @agent_summary "$summary" 2>/dev/null || true
     tmux refresh-client -S 2>/dev/null || true
 }
 
@@ -138,8 +140,14 @@ extract_summary() {
 # ------------------------------------------------------------ entry modes
 
 # Focus hook: attention discharged for the window the user just selected.
+# The after-select-window hook passes the selected #{window_id} as $2 —
+# an untargeted display-message resolves to the most-recently-active
+# CLIENT, which can be a different one when several clients are attached.
 if [ "$mode" = "clear-current" ]; then
-    win=$(tmux display-message -p '#{window_id}' 2>/dev/null || true)
+    win="${2:-}"
+    if [ -z "$win" ]; then
+        win=$(tmux display-message -p '#{window_id}' 2>/dev/null || true)
+    fi
     [ -n "$win" ] || exit 0
     case "$(window_state "$win")" in
         needs-input|done) set_state "$win" idle ;;
@@ -157,9 +165,12 @@ else
 fi
 [ -n "$win" ] || exit 0
 
-# Heartbeat is the hot path (every tool call): no stdin read — the payload
-# includes tool_response, which can be megabytes.
+# Heartbeat is the hot path (every tool call): don't wait on stdin — the
+# payload includes tool_response, which can be megabytes. A backgrounded
+# drain consumes the pipe so the writer never sees EPIPE (codex's tolerance
+# for a hook that abandons its stdin is undocumented), without blocking us.
 if [ "$mode" = "heartbeat" ]; then
+    ( cat >/dev/null 2>&1 & ) 2>/dev/null
     set_state "$win" running
     exit 0
 fi
@@ -180,12 +191,24 @@ case "$mode" in
     idle)
         # SessionStart with source=compact fires mid-turn after auto-compaction;
         # don't downgrade a running turn.
+        src=""
         if [ -n "$JQ" ] && [ -n "$payload" ]; then
             src=$("$JQ" -r '.source // empty' <<<"$payload" 2>/dev/null || true)
             [ "$src" = "compact" ] && exit 0
         fi
         set_state "$win" idle
-        set_summary "$win" "$(extract_summary "$payload")"
+        summary=$(extract_summary "$payload")
+        if [ -n "$summary" ]; then
+            set_summary "$win" "$summary"
+        else
+            # A fresh conversation (/clear, new startup) has no title yet —
+            # drop the previous conversation's stale title rather than keep
+            # rendering it on the new session's tab. resume keeps it: the
+            # old title is still the right one for a resumed conversation.
+            case "$src" in
+                clear|startup) tmux set-option -uw -t "$win" @agent_summary 2>/dev/null || true ;;
+            esac
+        fi
         ;;
     running)
         set_state "$win" running

@@ -40,11 +40,16 @@ echo $$ > "$PIDFILE"
 trap 'rm -f "$PIDFILE"' EXIT INT TERM HUP
 
 is_agent_comm() {
-    case "$(basename "$1")" in
+    local base
+    base="$(basename "$1")"
+    case "$base" in
         claude|codex) return 0 ;;
-        [0-9]*.[0-9]*.[0-9]*) return 0 ;;   # claude's version-named binary
-        *) return 1 ;;
     esac
+    # Claude's binary is version-named (e.g. "2.1.170") in case its
+    # process-title rename ever stops applying. Anchored regex, digits-only
+    # segments — a case glob like [0-9]*.[0-9]*.[0-9]* would also match
+    # IP-like or suffixed names ("10.0.0.1", "1.2.3-beta").
+    [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
 while :; do

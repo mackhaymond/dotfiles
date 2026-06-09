@@ -92,6 +92,12 @@ must be space-free and quote-free (catppuccin's option reader splits on
 spaces and strips quotes); tmux expands conditionals inside `#[…]` style
 blocks (verified on tmux 3.6b).
 
+Side effect of `fill=number`: the window NUMBER's fg is that same
+expression, which would render a pastel digit on the blue/orange accent
+(WCAG contrast 1.2–1.7 — illegible). The companion
+`@catppuccin_window_*_color` conditionals darken the accent to crust
+`#11111b` on attention states so the state-colored digit reads against it.
+
 The text options add the state glyph, a readable fg on bright backgrounds
 (crust `#11111b`), and `#{?#{n:#{@agent_summary}},#{=/24/…:#{@agent_summary}},#W}`.
 
@@ -106,6 +112,11 @@ so stale summaries simply vanish.
   and `kill -0 $(cat …)`. It respawns on tmux.conf reload (`prefix r`).
 - **Codex tabs only ever show idle** → hook trust not granted; run `codex`
   and approve, or check `[hooks.state]` entries in `~/.codex/config.toml`.
+  (Installing the entries reserialized `hooks.json` — whitespace/`\/`
+  escaping changed but existing groups kept their content and indices, so
+  established trust hashes should survive; if codex unexpectedly re-prompts
+  for chezmoi-guard/NotchBar, re-approving once is safe. Pre-merge backup:
+  `~/.codex/hooks.json.bak-agent-tab`.)
 - **No summary on a fresh Claude session** → no `ai-title` yet; the first
   prompt is used as fallback, the real title appears on later events.
 - **Inspect state**: `tmux list-windows -a -F '#{window_id} #{@agent_state} #{@agent_summary}'`
