@@ -15,6 +15,11 @@
 # Hook-set states (running/needs-input/done) are never overridden while the
 # agent lives.
 #
+# It also drives the running-state animation: while ANY window is in state
+# running, the global @agent_blink option toggles each tick and the window
+# formats alternate the agent glyph between two colors off it. No running
+# windows → no toggling, no redraws.
+#
 # Process matching is by `ps -o comm` basename — NOT #{pane_current_command}:
 # tmux reads the kernel p_comm, which for Claude Code is the version-named
 # binary ("2.1.170"), while ps comm reflects argv[0] ("claude"). The bare
@@ -28,7 +33,8 @@
 # Spawned from tmux.conf via `run-shell -b`. set -u/-e relaxed: a daemon
 # must survive transient tmux command failures mid-loop.
 
-POLL_SECONDS=2
+# 1s: doubles as the blink interval for the running-glyph animation.
+POLL_SECONDS=1
 
 command -v tmux >/dev/null 2>&1 || exit 0
 
@@ -99,6 +105,19 @@ EOF
     done <<EOF
 $states
 EOF
+
+    # Blink driver: toggle while anything is running; redraw covers both
+    # the toggle and any reconcile changes above.
+    case "$states" in
+        *" running"*)
+            if [ "$(tmux show-options -gqv @agent_blink 2>/dev/null)" = "1" ]; then
+                tmux set-option -g @agent_blink 0 2>/dev/null
+            else
+                tmux set-option -g @agent_blink 1 2>/dev/null
+            fi
+            changed=1
+            ;;
+    esac
 
     if [ "$changed" = 1 ]; then
         tmux refresh-client -S 2>/dev/null

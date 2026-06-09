@@ -7,7 +7,7 @@ Codex CLI) running inside it, rendered through the Catppuccin status bar:
 |---|---|---|
 | *(none)* | no agent process in the window | stock Catppuccin tab |
 | `idle` | agent open, not working | mauve `󱙺` robot glyph, stock colors |
-| `running` | agent mid-turn | blue `󱙺` robot glyph, surface1 `#45475a` background lift |
+| `running` | agent mid-turn | `󱙺` glyph blinking blue↔peach at 1 s (watcher toggles global `@agent_blink`), no bg change |
 | `needs-input` | permission prompt / idle-wait / turn failed | `●` glyph, yellow `#f9e2af` background |
 | `done` | turn finished | `●` glyph, green `#a6e3a1` background |
 | any | agent has a conversation title | tab name = `project/short-title`, else `#W` |
@@ -75,7 +75,9 @@ truncation.
 ### 2. `scripts/agent-tab-watcher.sh` (presence daemon)
 
 Singleton (PID file, coffee-watcher pattern), spawned from tmux.conf,
-polls every 2 s: matches agent processes to windows by TTY (`ps -o comm`
+polls every 1 s (doubling as the running-glyph blink driver — it toggles
+the global `@agent_blink` option each tick while any window is running):
+matches agent processes to windows by TTY (`ps -o comm`
 basename `claude`/`codex`, plus the bare `N.N.N` pattern — Claude's binary
 is version-named and `#{pane_current_command}` reports that, so formats
 can't detect presence). Reconciles:

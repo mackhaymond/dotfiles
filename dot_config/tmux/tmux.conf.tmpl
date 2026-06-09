@@ -121,14 +121,14 @@ set -g @catppuccin_window_current_fill "number"
 # whole tab consistently — tinting only the text segment would leave stale
 # separator end-caps. The expression must stay space-free and quote-free
 # (catppuccin's option batch reader splits on spaces and strips quotes).
-# Mocha: done=green #a6e3a1, needs-input=yellow #f9e2af, running=surface1
-# #45475a (subtle lift). No-state fallbacks invert catppuccin stock on
-# purpose: the SELECTED tab gets a visible surface0 #313244 pill and
-# unselected tabs sit on base #1e1e2e (blending into the status bar) —
-# stock gives unselected windows the pills and leaves the selected one
-# invisible, which reads backwards.
-set -g @catppuccin_window_default_background "#{?#{==:#{@agent_state},done},#a6e3a1,#{?#{==:#{@agent_state},needs-input},#f9e2af,#{?#{==:#{@agent_state},running},#45475a,#1e1e2e}}}"
-set -g @catppuccin_window_current_background "#{?#{==:#{@agent_state},done},#a6e3a1,#{?#{==:#{@agent_state},needs-input},#f9e2af,#{?#{==:#{@agent_state},running},#45475a,#313244}}}"
+# Mocha: done=green #a6e3a1, needs-input=yellow #f9e2af. running gets NO
+# bg change (its signal is the blinking glyph in the text options below).
+# No-state fallbacks invert catppuccin stock on purpose: the SELECTED tab
+# gets a visible surface0 #313244 pill and unselected tabs sit on base
+# #1e1e2e (blending into the status bar) — stock gives unselected windows
+# the pills and leaves the selected one invisible, which reads backwards.
+set -g @catppuccin_window_default_background "#{?#{==:#{@agent_state},done},#a6e3a1,#{?#{==:#{@agent_state},needs-input},#f9e2af,#1e1e2e}}"
+set -g @catppuccin_window_current_background "#{?#{==:#{@agent_state},done},#a6e3a1,#{?#{==:#{@agent_state},needs-input},#f9e2af,#313244}}"
 
 # fill=number locks the window NUMBER's fg to the $background expression
 # above (number block is `#[fg=$background,bg=$color]#I`), which would put a
@@ -139,12 +139,15 @@ set -g @catppuccin_window_default_color "#{?#{==:#{@agent_state},done},#11111b,#
 set -g @catppuccin_window_current_color "#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#fab387}}"
 
 # Tab text: agent glyph 󱙺 (nf-md-robot-outline U+F167A; mauve #cba6f7 idle,
-# blue #89b4fa running, ● on attention states), then a fg that stays
-# readable on the bright attention backgrounds (crust #11111b), then the
-# agent summary ("project/ultra-short title", pre-condensed by the
-# indicator script so no display truncation is needed) with #W fallback.
-set -g @catppuccin_window_default_text "#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󱙺 ,}#{?#{==:#{@agent_state},running},#[fg=#89b4fa]󱙺 ,}#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,}#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,}#[fg=#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#cdd6f4}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
-set -g @catppuccin_window_current_text "#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󱙺 ,}#{?#{==:#{@agent_state},running},#[fg=#89b4fa]󱙺 ,}#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,}#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,}#[fg=#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#cdd6f4}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
+# ● on attention states). While running the glyph BLINKS blue #89b4fa ↔
+# peach #fab387: agent-tab-watcher.sh toggles the global @agent_blink
+# option every second while any window is running and the glyph fg keys
+# off it. Then a fg that stays readable on the bright attention
+# backgrounds (crust #11111b), then the agent summary ("project/ultra-
+# short title", pre-condensed by the indicator script so no display
+# truncation is needed) with #W fallback.
+set -g @catppuccin_window_default_text "#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󱙺 ,}#{?#{==:#{@agent_state},running},#[fg=#{?#{@agent_blink},#89b4fa,#fab387}]󱙺 ,}#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,}#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,}#[fg=#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#cdd6f4}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
+set -g @catppuccin_window_current_text "#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󱙺 ,}#{?#{==:#{@agent_state},running},#[fg=#{?#{@agent_blink},#89b4fa,#fab387}]󱙺 ,}#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,}#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,}#[fg=#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#cdd6f4}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
 # end catppuccin
 
 # Agent tab indicator runtime: presence/GC watcher daemon (singleton), and
