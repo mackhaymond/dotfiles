@@ -110,9 +110,16 @@ set -g @catppuccin_window_right_separator "█"
 set -g @catppuccin_window_number_position "left"
 set -g @catppuccin_window_default_fill "number"
 set -g @catppuccin_window_current_fill "number"
-set -g @catppuccin_window_default_text "#W"
-set -g @catppuccin_window_current_text "#W"
+# Tab name + a leading dot recolor when an agent in that window needs input
+# (yellow) or has finished (green). Driven by the per-window @agent_state option
+# set from Claude Code hooks via scripts/agent-tab-indicator.sh. When unset the
+# name renders with Catppuccin's normal fg. Mocha: yellow #f9e2af, green #a6e3a1.
+set -g @catppuccin_window_default_text "#{?#{==:#{@agent_state},needs-input},#[fg=#f9e2af]● ,}#{?#{==:#{@agent_state},done},#[fg=#a6e3a1]● ,}#W"
+set -g @catppuccin_window_current_text "#{?#{==:#{@agent_state},needs-input},#[fg=#f9e2af]● ,}#{?#{==:#{@agent_state},done},#[fg=#a6e3a1]● ,}#W"
 # end catppuccin
+
+# Clear a tab's agent tint the moment you switch to it (you've seen it).
+set-hook -g after-select-window 'run-shell -b "#{HOME}/.config/tmux/scripts/agent-tab-indicator.sh clear-current"'
 
 set -g @plugin 'tmux-plugins/tmux-resurrect'
 set -g @resurrect-dir '{{ .chezmoi.homeDir }}/.tmux/resurrect'
