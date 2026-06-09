@@ -57,7 +57,7 @@ pins_settled() {
     ($s | map({ (.index|tostring): (.label // "") }) | add) as $lbl
     | { "wezterm-gui":"terminal", "WezTerm":"terminal", "Todoist":"todo",
         "Granola":"schedule", "Spark Mail":"mail", "Notion Calendar":"calendar",
-        "Messages":"messages", "ChatGPT":"chatgpt", "Codex":"codex" } as $home
+        "Messages":"messages", "ChatGPT":"ai", "Claude":"ai", "Codex":"codex" } as $home
     | [ $w[]
         | select($home[.app] != null)
         | { want: $home[.app], have: ($lbl[(.space|tostring)] // "") }

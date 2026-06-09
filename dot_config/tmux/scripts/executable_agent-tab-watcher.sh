@@ -10,8 +10,8 @@
 #
 # Every POLL_SECONDS this daemon matches agent processes to tmux windows by
 # TTY and reconciles the per-window @agent_state option:
-#   agent present + no state  → idle    (seed presence)
-#   no agent     + any state  → unset @agent_state/@agent_summary (GC)
+#   agent present + no state           → idle    (seed presence)
+#   no agent     + any state OR summary → unset @agent_state/@agent_summary (GC)
 # Hook-set states (running/needs-input/done) are never overridden while the
 # agent lives.
 #
@@ -38,12 +38,24 @@ POLL_SECONDS=1
 
 command -v tmux >/dev/null 2>&1 || exit 0
 
+# Singleton: every tmux.conf reload (`prefix r`) re-runs the spawn line, so a
+# plain check-then-write leaks daemons (a transiently-exiting watcher with an
+# unconditional trap can delete a live sibling's pidfile, then the next reload
+# finds none and starts another). Reap any prior instance, then claim the
+# pidfile, and only clean it up on exit if it's still ours.
 PIDFILE="${TMPDIR:-/tmp}/agent-tab-watcher.$(id -u).pid"
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-    exit 0
+prev=$(cat "$PIDFILE" 2>/dev/null || true)
+if [ -n "$prev" ] && [ "$prev" != "$$" ] && kill -0 "$prev" 2>/dev/null; then
+    kill "$prev" 2>/dev/null || true
 fi
 echo $$ > "$PIDFILE"
-trap 'rm -f "$PIDFILE"' EXIT INT TERM HUP
+# Remove the pidfile on exit only if it's still ours. The signal traps must
+# EXIT (a bare cleanup trap on TERM/INT/HUP would run the handler and then
+# RESUME the loop — the daemon would survive `kill`, which is exactly how the
+# old version leaked); routing signals through `exit 0` fires the EXIT trap.
+cleanup() { [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"; }
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
 
 is_agent_comm() {
     local base
@@ -88,6 +100,16 @@ EOF
 $panes
 EOF
 
+    # Windows with a non-empty @agent_summary (read separately — a summary can
+    # contain spaces, and it can outlive @agent_state: a detached condenser may
+    # write a summary after the agent died and the watcher GC'd its state).
+    with_summary=" "
+    while IFS=' ' read -r win rest; do
+        [ -n "$win" ] && [ -n "$rest" ] && with_summary="${with_summary}${win} "
+    done <<EOF
+$(tmux list-windows -a -F '#{window_id} #{@agent_summary}' 2>/dev/null)
+EOF
+
     changed=0
     while IFS=' ' read -r win state; do
         [ -n "$win" ] || continue
@@ -95,9 +117,13 @@ EOF
             *" ${win} "*) has_agent=1 ;;
             *) has_agent=0 ;;
         esac
+        case "$with_summary" in
+            *" ${win} "*) has_summary=1 ;;
+            *) has_summary=0 ;;
+        esac
         if [ "$has_agent" = 1 ] && [ -z "$state" ]; then
             tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
-        elif [ "$has_agent" = 0 ] && [ -n "$state" ]; then
+        elif [ "$has_agent" = 0 ] && { [ -n "$state" ] || [ "$has_summary" = 1 ]; }; then
             tmux set-option -uw -t "$win" @agent_state 2>/dev/null
             tmux set-option -uw -t "$win" @agent_summary 2>/dev/null
             changed=1

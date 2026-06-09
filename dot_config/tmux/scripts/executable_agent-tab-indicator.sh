@@ -33,19 +33,22 @@
 #   idle         SessionStart        → mark present (skipped for compact restarts)
 #   running      UserPromptSubmit    → turn started; refresh @agent_summary
 #   heartbeat    PostToolUse         → re-arm running mid-turn (after an answered
-#                                      permission prompt); skips stdin entirely —
-#                                      tool_response payloads can be huge
+#                                      permission prompt), but ONLY from
+#                                      running/needs-input so a late tool call
+#                                      can't resurrect a finished tab; skips
+#                                      stdin entirely — payloads can be huge
 #   needs-input  PermissionRequest / Notification(permission_prompt|idle_prompt)
-#                / StopFailure       → attention; downgraded to idle on the
-#                                      active window (you're already looking)
+#                / StopFailure       → attention; always asserted (focus ≠
+#                                      answer), discharged by the focus hook
 #   done         Stop                → turn finished; refresh @agent_summary;
-#                                      downgraded to idle on the active window
+#                                      not tinted if a client is watching it
 #   clear        SessionEnd          → remove state (skipped for clear/resume,
 #                                      which are followed by a new SessionStart)
 #   clear-current  focus hook        → attention states → idle once seen
 #
-# "Seen-it" semantics: needs-input/done only ever tint BACKGROUND tabs;
-# focusing a window discharges its attention state to idle.
+# "Seen-it" semantics: a tinted tab discharges to idle when you focus it
+# (clear-current); `done` additionally isn't tinted if its window is already
+# being watched. needs-input always tints so a prompt is never lost.
 
 set -euo pipefail
 
@@ -88,9 +91,10 @@ clear_state() {
 
 sanitize_summary() {
     # One line, no format-significant characters, bounded length. The value
-    # lands inside window-status-format via #{@agent_summary}; '#' would be
-    # parsed as a format/style token there.
-    tr '\n\t' '  ' | tr -d '#"' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' | cut -c1-60
+    # lands in window-status-format via #{@agent_summary}; '#' starts a
+    # format/style token and '%' is a strftime metacharacter under #{T:…}, so
+    # strip both defensively even though the current render path is bare.
+    tr '\n\t' '  ' | tr -d '#"%' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' | cut -c1-60
 }
 
 set_summary() {
@@ -104,15 +108,65 @@ set_summary() {
 
 # --- summary composition: @agent_summary = "<project>/<ultra-short title>" -
 
+# Cache rows are TAB-separated: <key> <short> <epoch>. A row with an empty
+# <short> is a NEGATIVE entry (a failed/garbage condense) used to back off
+# retries for NEG_TTL seconds instead of re-calling the model every turn.
 CACHE="$HOME/.cache/agent-tab/titles.tsv"
+NEG_TTL=600
+
+now_epoch() { date +%s 2>/dev/null || echo 0; }
 
 title_key() {
     printf '%s' "$1" | /usr/bin/shasum -a 256 | cut -c1-16
 }
 
+# Last non-empty short for a title (skips negative rows; last writer wins).
 cached_short() {
     [ -f "$CACHE" ] || return 0
-    awk -F'\t' -v k="$(title_key "$1")" '$1==k{print $2; exit}' "$CACHE" 2>/dev/null || true
+    awk -F'\t' -v k="$(title_key "$1")" \
+        '$1==k && $2!=""{v=$2} END{if(v!="")print v}' "$CACHE" 2>/dev/null || true
+}
+
+# True if the most recent row for this key is a negative within NEG_TTL —
+# i.e. we failed to condense recently and shouldn't retry the model yet.
+negative_fresh() {
+    [ -f "$CACHE" ] || return 1
+    awk -F'\t' -v k="$1" -v now="$(now_epoch)" -v ttl="$NEG_TTL" \
+        '$1==k{s=$2;ts=$3} END{exit !(s=="" && ts!="" && (now-ts)<ttl)}' \
+        "$CACHE" 2>/dev/null
+}
+
+cache_put() {
+    mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
+    printf '%s\t%s\t%s\n' "$1" "$2" "$(now_epoch)" >> "$CACHE" 2>/dev/null || true
+}
+
+# Trim to <=N chars on whole-word boundaries (never mid-word unless the first
+# word alone is longer than N).
+fit_words() {
+    local s="$1" n="${2:-24}"
+    while [ "${#s}" -gt "$n" ] && [ "${s% *}" != "$s" ]; do s="${s% *}"; done
+    printf '%s' "$s" | cut -c1-"$n"
+}
+
+# Gate model output before caching: accept only title-like text (1-4 words,
+# <=24 chars, has a letter, no colon / sentence-final punctuation, not an
+# apology / refusal / auth-error / first-person reply). This is what stops
+# copilot error strings ("Credit balance is too…") from poisoning the cache.
+valid_short() {
+    local s="$1" lc wc
+    [ -n "$s" ] || return 1
+    [ "${#s}" -le 24 ] || return 1
+    case "$s" in *:*|*.|*!|*\?) return 1 ;; esac
+    case "$s" in *[A-Za-z]*) ;; *) return 1 ;; esac
+    wc=$(printf '%s' "$s" | wc -w | tr -d ' ')
+    [ "$wc" -ge 1 ] && [ "$wc" -le 4 ] || return 1
+    lc=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
+    case "$lc" in
+        "i "*|"i'"*|*sorry*|*"credit balance"*|*"i cannot"*|*"i can't"* \
+        |*"not authenticated"*|*"please "*|*login*|*error*|*unable*|*apolog*) return 1 ;;
+    esac
+    return 0
 }
 
 project_name() {
@@ -145,7 +199,7 @@ compose_summary() {
         set_summary "$win" "${proj:+$proj/}$short"
         return 0
     fi
-    set_summary "$win" "${proj:+$proj/}$(printf '%s' "$raw" | cut -c1-28)"
+    set_summary "$win" "${proj:+$proj/}$(fit_words "$raw" 24)"
     command -v copilot >/dev/null 2>&1 || return 0
     ( nohup bash "$0" condense "$win" "$proj" "$raw" >/dev/null 2>&1 & ) 2>/dev/null || true
 }
@@ -215,28 +269,38 @@ fi
 if [ "$mode" = "condense" ]; then
     win="${2:-}"; proj="${3:-}"; raw="${4:-}"
     { [ -n "$win" ] && [ -n "$raw" ]; } || exit 0
-    lock="${TMPDIR:-/tmp}/agent-tab-condense.$(title_key "$raw").lock"
+    key=$(title_key "$raw")
+    lock="${TMPDIR:-/tmp}/agent-tab-condense.$key.lock"
     mkdir "$lock" 2>/dev/null || exit 0   # another condenser owns this title
     trap 'rmdir "$lock" 2>/dev/null' EXIT INT TERM
+
     short=$(cached_short "$raw")
     if [ -z "$short" ]; then
-        TO=$(command -v timeout || true)
-        # Copilot CLI prints the answer on stdout and its stats footer on
-        # stderr; a pure text prompt grants no tool permissions, so the
-        # helper can't touch anything. Nonzero exit → empty out → no cache.
-        out=$(${TO:+"$TO" 90} copilot -p \
+        # Back off if a recent attempt for this title failed, so a persistent
+        # copilot error (not logged in, out of credit) isn't re-run every turn.
+        negative_fresh "$key" && exit 0
+
+        # gtimeout is coreutils' name when /usr/bin/timeout is absent (macOS).
+        TO=$(command -v timeout || command -v gtimeout || true)
+        # Copilot prints the answer on stdout, stats on stderr; a pure text
+        # prompt grants no tool permissions. Capture the exit code explicitly
+        # — `|| true` would mask a failed call whose stdout is an error string.
+        if out=$(${TO:+"$TO" 90} copilot -p \
             "Condense this coding-session title into the 2-4 words that best identify it. Output only those words - no punctuation, quotes, or explanation.
 
-Title: $raw" --model claude-haiku-4.5 --no-color </dev/null 2>/dev/null || true)
-        short=$(printf '%s' "$out" | head -1 | sanitize_summary | cut -d' ' -f1-4)
-        # Fit to 24 chars by dropping whole words, never mid-word cuts.
-        while [ "${#short}" -gt 24 ] && [ "${short% *}" != "$short" ]; do
-            short="${short% *}"
-        done
-        short=$(printf '%s' "$short" | cut -c1-24)
+Title: $raw" --model claude-haiku-4.5 --no-color </dev/null 2>/dev/null); then
+            short=$(printf '%s' "$out" | grep -m1 . | sanitize_summary | cut -d' ' -f1-4)
+            short=$(fit_words "$short" 24)
+            valid_short "$short" || short=""
+        else
+            short=""
+        fi
+
         if [ -n "$short" ]; then
-            mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
-            printf '%s\t%s\n' "$(title_key "$raw")" "$short" >> "$CACHE" 2>/dev/null || true
+            cache_put "$key" "$short"
+        else
+            cache_put "$key" ""   # negative entry → NEG_TTL backoff
+            exit 0
         fi
     fi
     [ -n "$short" ] || exit 0
@@ -258,9 +322,14 @@ fi
 # payload includes tool_response, which can be megabytes. A backgrounded
 # drain consumes the pipe so the writer never sees EPIPE (codex's tolerance
 # for a hook that abandons its stdin is undocumented), without blocking us.
+# Only re-arm running from running/needs-input — a late PostToolUse landing
+# after Stop's `done` (or a subagent tool firing past the turn boundary, which
+# bypasses the agent_id guard below) must NOT resurrect a finished tab.
 if [ "$mode" = "heartbeat" ]; then
     ( cat >/dev/null 2>&1 & ) 2>/dev/null
-    set_state "$win" running
+    case "$(window_state "$win")" in
+        running|needs-input) set_state "$win" running ;;
+    esac
     exit 0
 fi
 
@@ -274,7 +343,12 @@ if [ -n "$JQ" ] && [ -n "$payload" ]; then
     fi
 fi
 
-active_win=$(tmux display-message -p '#{window_id}' 2>/dev/null || true)
+# Is the agent's own window currently being viewed by ≥1 client? window
+# scope, so it's robust to multiple attached clients AND to detached sessions
+# (an untargeted display-message would resolve to some other client's window;
+# #{window_active} is 1 even for zero-client sessions — neither is correct).
+watched=$(tmux display-message -p -t "$win" '#{window_active_clients}' 2>/dev/null || true)
+case "$watched" in ''|*[!0-9]*) watched=0 ;; esac
 
 case "$mode" in
     idle)
@@ -304,17 +378,17 @@ case "$mode" in
         compose_summary "$win" "$(extract_summary "$payload")" "$payload"
         ;;
     needs-input)
-        if [ "$win" = "$active_win" ]; then
-            set_state "$win" idle
-        else
-            set_state "$win" needs-input
-        fi
+        # Always assert — focusing a window is not answering its prompt. The
+        # focus hook (clear-current) discharges needs-input→idle once seen, so
+        # a prompt is never silently lost by switching away.
+        set_state "$win" needs-input
         ;;
     done)
-        if [ "$win" = "$active_win" ]; then
+        # Don't tint a window someone is actively watching — they saw it finish.
+        if [ "$watched" -gt 0 ]; then
             set_state "$win" idle
         else
-            set_state "$win" done
+            set_state "$win" "done"
         fi
         compose_summary "$win" "$(extract_summary "$payload")" "$payload"
         ;;

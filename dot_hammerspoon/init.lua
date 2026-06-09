@@ -222,7 +222,7 @@ local HELP_COL1 = {
   { k = "1   2",    d = "main · school" },
   { k = "tab  q",   d = "todo · schedule" },
   { k = "w   e",    d = "mail · calendar" },
-  { k = "d   f",    d = "messages · chatgpt" },
+  { k = "d   f",    d = "messages · ai" },
   { k = "esc",      d = "codex" },
   { gap = true },
   { h = "SEND WINDOW  ·  hyper+fn +" },

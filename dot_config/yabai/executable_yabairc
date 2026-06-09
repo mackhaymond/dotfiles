@@ -111,7 +111,8 @@ yabai -m rule --add app="^Granola$" space=schedule
 yabai -m rule --add app="^Spark Mail$" space=mail
 yabai -m rule --add app="^Notion Calendar$" space=calendar
 yabai -m rule --add app="^Messages$" space=messages
-yabai -m rule --add app="^ChatGPT$" space=chatgpt
+yabai -m rule --add app="^ChatGPT$" space=ai
+yabai -m rule --add app="^Claude$" space=ai
 yabai -m rule --add app="^Codex$" space=codex
 
 # Re-apply rules to currently-open windows on yabai (re)start.

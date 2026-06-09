@@ -19,7 +19,7 @@
 # Canonical labeled spaces, in stable display order. The single source of this list.
 # (Consumed by the sourcing scripts' `for label in $YABAI_LABELS` loops.)
 # shellcheck disable=SC2034
-YABAI_LABELS="terminal main school todo schedule mail calendar messages chatgpt codex"
+YABAI_LABELS="terminal main school todo schedule mail calendar messages ai codex"
 
 # Resolve the master (laptop) display index from a displays-JSON blob passed as $1
 # (or from a live `yabai -m query --displays` if $1 is empty/omitted): UUID match

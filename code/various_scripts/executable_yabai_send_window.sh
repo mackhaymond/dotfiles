@@ -34,7 +34,7 @@ case "$app" in
   "Spark Mail")        home=mail ;;
   "Notion Calendar")   home=calendar ;;
   Messages)            home=messages ;;
-  ChatGPT)             home=chatgpt ;;
+  ChatGPT|Claude)      home=ai ;;
   Codex)               home=codex ;;
 esac
 

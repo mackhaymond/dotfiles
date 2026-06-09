@@ -8,7 +8,7 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 
 **Core Mental Model:**
 
-- **Master display (laptop)**: Always present, hosts all 10 canonical labeled workspaces (terminal, main, school, todo, schedule, mail, calendar, messages, chatgpt, codex). Stable reference point.
+- **Master display (laptop)**: Always present, hosts all 10 canonical labeled workspaces (terminal, main, school, todo, schedule, mail, calendar, messages, ai, codex). Stable reference point.
 - **External display**: Optional. Comes up empty-and-ready when docked; user manually pushes workspaces there (or pulls them back home). Automatically healed on undock.
 - **Labeled spaces, not indexed**: Spaces are identified by stable **labels** (not fragile array indices), because macOS renumbers indices whenever Mission Control is touched or displays change. All bindings, rules, and scripts use labels as the canonical reference.
 - **Stack layout**: Only one window visible at a time per space; other windows are hidden in a z-order stack. Navigate with `hyper+z` (next) / `hyper+x` (prev).
@@ -100,7 +100,8 @@ These apps automatically appear on their designated space when launched:
 | Spark Mail | mail |
 | Notion Calendar | calendar |
 | Messages | messages |
-| ChatGPT | chatgpt |
+| ChatGPT | ai |
+| Claude | ai |
 | Codex | codex |
 
 **Arc (browser):** *not* a yabai rule (the two main windows go to two different
@@ -139,7 +140,7 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 
 *(Also: a one-shot startup sync — `"$YABAI_WORKSPACE_REFRESH" startup` — runs near the **top** of yabairc, before the rules. Specific line numbers are intentionally omitted here — they drift; grep the signal name in `yabairc`.)*
 
-**Startup reconciliation** (`yabai_startup_reconcile.sh`, run **backgrounded** right after the startup `rule --apply`): fixes the **login race** where pinned apps land on the wrong space. At login, macOS restores app windows around when yabai starts, so windows created before the signals registered get no `window_created`/`application_launched` event, and the one-shot `rule --apply` can run *before* those windows exist (or before `--load-sa` finishes — window→space moves need the scripting addition). The reconcile re-loads the scripting addition once (`sudo -n`), then **polls until stable** — repeatedly re-applying the `space=` rules + re-pinning Arc until every *running* pinned app is on its home space, or a hard cap (`YABAI_RECONCILE_CAP`, default ~90 s). This self-truncates on a fast login (exits in ≈0.2 s once everything's home) and self-extends for slow-launching apps (Electron: ChatGPT, Notion Calendar, Messages), so it's more robust than a fixed ramp that could miss an app finishing after the last pass. Backgrounded so it never blocks startup; single-flighted (mkdir lock, like `yabai_heal.sh`) so repeated restarts don't stack overlapping polls; idempotent. Supersedes the old workaround of manually restarting yabai after login.
+**Startup reconciliation** (`yabai_startup_reconcile.sh`, run **backgrounded** right after the startup `rule --apply`): fixes the **login race** where pinned apps land on the wrong space. At login, macOS restores app windows around when yabai starts, so windows created before the signals registered get no `window_created`/`application_launched` event, and the one-shot `rule --apply` can run *before* those windows exist (or before `--load-sa` finishes — window→space moves need the scripting addition). The reconcile re-loads the scripting addition once (`sudo -n`), then **polls until stable** — repeatedly re-applying the `space=` rules + re-pinning Arc until every *running* pinned app is on its home space, or a hard cap (`YABAI_RECONCILE_CAP`, default ~90 s). This self-truncates on a fast login (exits in ≈0.2 s once everything's home) and self-extends for slow-launching apps (Electron: ChatGPT, Claude, Notion Calendar, Messages), so it's more robust than a fixed ramp that could miss an app finishing after the last pass. Backgrounded so it never blocks startup; single-flighted (mkdir lock, like `yabai_heal.sh`) so repeated restarts don't stack overlapping polls; idempotent. Supersedes the old workaround of manually restarting yabai after login.
 
 > **Debugging signals:** there is no `yabai -m query --signals` in this yabai version (it errors `unknown command`). The authoritative list of registered signals is the `signal --add` lines in `yabairc` — grep them there.
 
@@ -187,7 +188,7 @@ Move focus to a labeled space without moving it. Focus stays on the current disp
 | `hyper - w` | W | `yabai_workspace.sh focus mail` | mail |
 | `hyper - e` | E | `yabai_workspace.sh focus calendar` | calendar |
 | `hyper - d` | D | `yabai_workspace.sh focus messages` | messages |
-| `hyper - f` | F | `yabai_workspace.sh focus chatgpt` | chatgpt |
+| `hyper - f` | F | `yabai_workspace.sh focus ai` | ai |
 | `f18` | Caps+Esc | `yabai_workspace.sh focus codex` | codex |
 
 #### Send Window to Workspace (Hyper+Fn Layer)
@@ -204,7 +205,7 @@ Move the focused window to a target space and **follow focus to it** (unless pin
 | `hyper + fn - w` | Fn+W | `yabai_send_window.sh mail` | mail |
 | `hyper + fn - e` | Fn+E | `yabai_send_window.sh calendar` | calendar |
 | `hyper + fn - d` | Fn+D | `yabai_send_window.sh messages` | messages |
-| `hyper + fn - f` | Fn+F | `yabai_send_window.sh chatgpt` | chatgpt |
+| `hyper + fn - f` | Fn+F | `yabai_send_window.sh ai` | ai |
 | `f19` | Fn+Caps+Esc | `yabai_send_window.sh codex` | codex |
 
 **Pinned Apps (cannot be sent off their home spaces):**
@@ -214,7 +215,8 @@ Move the focused window to a target space and **follow focus to it** (unless pin
 - Spark Mail → mail
 - Notion Calendar → calendar
 - Messages → messages
-- ChatGPT → chatgpt
+- ChatGPT → ai
+- Claude → ai
 - Codex → codex
 - Arc → protected on `main`/`school` (any Arc window on either is shielded; rare Little-Arc-on-home included)
 
@@ -502,7 +504,7 @@ It does **not** bounce other apps off the terminal space. (Earlier this enforced
 
 #### Canonical Space Ordering
 
-The 10 spaces are always maintained in the order: terminal, main, school, todo, schedule, mail, calendar, messages, chatgpt, codex.
+The 10 spaces are always maintained in the order: terminal, main, school, todo, schedule, mail, calendar, messages, ai, codex.
 
 **Responsibility:** `yabai_reorder_spaces.sh` (called at the end of `yabai_workspace_refresh.sh` and after `yabai_space_move.sh` operations).
 
@@ -806,7 +808,7 @@ git push origin main
 | `hyper - w` | W | Focus mail | |
 | `hyper - e` | E | Focus calendar | |
 | `hyper - d` | D | Focus messages | |
-| `hyper - f` | F | Focus chatgpt | |
+| `hyper - f` | F | Focus ai | |
 | `f18` | Caps Lock+Escape | Focus codex | Karabiner-mapped |
 | **Send Window to Workspace** |
 | `hyper + fn - 0x32` | Fn+Backtick | Send to terminal | Respects pinned homes |
@@ -817,7 +819,7 @@ git push origin main
 | `hyper + fn - w` | Fn+W | Send to mail | Respects pinned homes |
 | `hyper + fn - e` | Fn+E | Send to calendar | Respects pinned homes |
 | `hyper + fn - d` | Fn+D | Send to messages | Respects pinned homes |
-| `hyper + fn - f` | Fn+F | Send to chatgpt | Respects pinned homes |
+| `hyper + fn - f` | Fn+F | Send to ai | Respects pinned homes |
 | `f19` | Fn+Caps Lock+Escape | Send to codex | Karabiner-mapped |
 | `hyper + fn - g` | Fn+G | Fling window to external `ext` space | On-demand; stacks; dissolves to main on hyper+0 / push / undock |
 | `hyper - g` | G | Focus external `ext` space | No-op if `ext` doesn't exist |
