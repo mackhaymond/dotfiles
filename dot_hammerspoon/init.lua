@@ -245,6 +245,7 @@ local HELP_COL2 = {
   { k = "v",          d = "split orientation  H ↔ V" },
   { k = "n",          d = "rotate tree 90°" },
   { k = "m",          d = "maximize (zoom)" },
+  { k = "t",          d = "float / unfloat window" },
   { k = "fn+m",       d = "native fullscreen" },
   { k = "fn+b",       d = "toggle  bsp ↔ stack" },
 }

@@ -32,6 +32,7 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_space_move.sh` | `~/code/various_scripts/yabai_space_move.sh` | Executable script | Push/pull spaces between displays |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_displays.sh` | `~/code/various_scripts/yabai_displays.sh` | Executable script | Hotplug handler: dock/undock logic |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_mode.sh` | `~/code/various_scripts/yabai_skhd_mode.sh` | Executable script | Toggle space layout (bsp ↔ stack) |
+| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_toggle_float.sh` | `~/code/various_scripts/yabai_toggle_float.sh` | Executable script | Toggle the focused window's float (`hyper+t`); both stack & bsp; respects pinned homes |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_next.sh` | `~/code/various_scripts/yabai_skhd_stack_next.sh` | Executable script | **`hyper+z`, layout-aware:** STACK → next stack layer; BSP → mirror tree horizontally (`--mirror x-axis`) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_prev.sh` | `~/code/various_scripts/yabai_skhd_stack_prev.sh` | Executable script | **`hyper+x`, layout-aware:** STACK → previous stack layer; BSP → mirror tree vertically (`--mirror y-axis`) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_mouse_follow.sh` | `~/code/various_scripts/yabai_mouse_follow.sh` | Executable script | Warp cursor to newly focused display |
@@ -271,6 +272,7 @@ Bare-hyper bsp cluster: directional focus, resize, balance, split-orientation, a
 | `hyper - z` | Z | `yabai_skhd_stack_next.sh` | **Stack:** focus next stack layer (wrap to first). **Bsp:** mirror tree horizontally (`space --mirror x-axis`) |
 | `hyper - x` | X | `yabai_skhd_stack_prev.sh` | **Stack:** focus previous stack layer (wrap to last). **Bsp:** mirror tree vertically (`space --mirror y-axis`) |
 | `hyper - m` | M | `yabai -m window --toggle zoom-fullscreen` | Toggle maximize — zoom the focused window to fill its space |
+| `hyper - t` | T | `yabai_toggle_float.sh` | Toggle the focused window's float (works in **both** stack & bsp). Refuses on a pinned app on its home space + Arc on main/school; manage=off apps are not guarded |
 | `hyper + fn - m` | Fn+M | `yabai -m window --toggle native-fullscreen` | Toggle native fullscreen (global; **no-op on WezTerm** by design — see the "WezTerm is not fullscreenable" note) |
 | `hyper + fn - b` | Fn+B | `yabai_skhd_mode.sh` | Toggle space layout (bsp ↔ stack) |
 
@@ -383,6 +385,7 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 | `yabai_heal.sh` | (none; signal handler) | Debounced self-heal — single-flight (mkdir lock) + settle, then `yabai_workspace_refresh.sh`. Bound to `space_destroyed` / `mission_control_exit` |
 | `yabai_startup_reconcile.sh` | (none; backgrounded at startup) | Login-race fix — re-loads the SA (`sudo -n`) + **polls until stable** (re-apply rules + Arc re-pin until every running pinned app is home, ~90 s cap) so restored windows reach their pinned spaces without a manual yabai restart. Single-flighted (mkdir lock) |
 | `yabai_skhd_mode.sh` | (none) | Toggle focused space layout (bsp ↔ stack) |
+| `yabai_toggle_float.sh` | (none) | Toggle the focused window's float (`hyper+t`); works in both stack & bsp; refuses on a pinned app on its home space + Arc on main/school (manage=off apps not guarded) |
 | `yabai_skhd_stack_next.sh` | (none) | **Layout-aware (`hyper+z`):** STACK space → focus next stack layer (wrap to first); BSP space → mirror tree horizontally (`space --mirror x-axis`) |
 | `yabai_skhd_stack_prev.sh` | (none) | **Layout-aware (`hyper+x`):** STACK space → focus previous stack layer (wrap to last); BSP space → mirror tree vertically (`space --mirror y-axis`) |
 | `yabai_mouse_follow.sh` | (none; signal handler) | Warp mouse cursor to focused display center (if not already there) |
@@ -832,6 +835,7 @@ git push origin main
 | `hyper - v` | V | Toggle split orientation (h ↔ v) | bsp; `window --toggle split` |
 | `hyper - n` | N | Rotate tree 90° clockwise | bsp; `space --rotate 90` (repeat cycles 90/180/270/0) |
 | `hyper - m` | M | Toggle maximize (zoom-fullscreen) | `window --toggle zoom-fullscreen` |
+| `hyper - t` | T | Toggle window float | Both stack & bsp; `yabai_toggle_float.sh` — refuses on pinned-on-home + Arc on main/school |
 | `hyper + fn - m` | Fn+M | Toggle native fullscreen | Global; no-op on WezTerm by design |
 | `hyper + fn - b` | Fn+B | Toggle space layout (bsp ↔ stack) | |
 | `hyper - a` / `hyper - s` | A / S | *(reserved by BetterTouchTool)* | Not skhd binds — never assign |
