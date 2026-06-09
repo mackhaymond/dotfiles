@@ -4,7 +4,11 @@
 #
 # Options written (window scope; unset = no agent in window):
 #   @agent_state    idle | running | needs-input | done
-#   @agent_summary  short conversation title shown as the tab name
+#   @agent_summary  "<project>/<ultra-short title>" shown as the tab name;
+#                   project = basename of the agent's cwd, title = the
+#                   conversation title condensed to its 2-4 identifying
+#                   words by a cached background copilot/haiku call
+#                   (interim: the raw title until the condensation lands)
 #
 # Rendering happens entirely in tmux.conf: the Catppuccin window formats
 # read these options via #{?…} conditionals (background tint per state,
@@ -98,6 +102,54 @@ set_summary() {
     tmux refresh-client -S 2>/dev/null || true
 }
 
+# --- summary composition: @agent_summary = "<project>/<ultra-short title>" -
+
+CACHE="$HOME/.cache/agent-tab/titles.tsv"
+
+title_key() {
+    printf '%s' "$1" | /usr/bin/shasum -a 256 | cut -c1-16
+}
+
+cached_short() {
+    [ -f "$CACHE" ] || return 0
+    awk -F'\t' -v k="$(title_key "$1")" '$1==k{print $2; exit}' "$CACHE" 2>/dev/null || true
+}
+
+project_name() {
+    # Basename of the hook payload's cwd (HOME → "~"), falling back to the
+    # agent pane's current path.
+    local payload="$1" cwd=""
+    if [ -n "$JQ" ] && [ -n "$payload" ]; then
+        cwd=$("$JQ" -r '.cwd // empty' <<<"$payload" 2>/dev/null || true)
+    fi
+    if [ -z "$cwd" ] && [ -n "${pane:-}" ]; then
+        cwd=$(tmux display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)
+    fi
+    [ -n "$cwd" ] || return 0
+    if [ "$cwd" = "$HOME" ]; then
+        printf '~'
+    else
+        basename "$cwd" | sanitize_summary | cut -c1-20
+    fi
+}
+
+compose_summary() {
+    # Set "<project>/<short>" immediately from cache when we've condensed
+    # this title before; otherwise show "<project>/<raw>" as an interim and
+    # condense in a detached child (an LLM call must never block a hook).
+    local win="$1" raw="$2" payload="$3" proj short
+    [ -n "$raw" ] || return 0
+    proj=$(project_name "$payload")
+    short=$(cached_short "$raw")
+    if [ -n "$short" ]; then
+        set_summary "$win" "${proj:+$proj/}$short"
+        return 0
+    fi
+    set_summary "$win" "${proj:+$proj/}$(printf '%s' "$raw" | cut -c1-28)"
+    command -v copilot >/dev/null 2>&1 || return 0
+    ( nohup bash "$0" condense "$win" "$proj" "$raw" >/dev/null 2>&1 & ) 2>/dev/null || true
+}
+
 # Conversation title, best source first.
 #   claude: latest ai-title entry near the transcript tail (cheap: last 64KB),
 #           else the prompt that started the turn.
@@ -155,6 +207,43 @@ if [ "$mode" = "clear-current" ]; then
     exit 0
 fi
 
+# Detached condenser (spawned by compose_summary): distill the raw title to
+# its 2-4 identifying words with a one-shot copilot/haiku call, cache it,
+# update the tab. argv: condense <window_id> <project> <raw-title>. Never
+# invoked by hooks directly, so a slow/failed model call only delays the
+# title swap.
+if [ "$mode" = "condense" ]; then
+    win="${2:-}"; proj="${3:-}"; raw="${4:-}"
+    { [ -n "$win" ] && [ -n "$raw" ]; } || exit 0
+    lock="${TMPDIR:-/tmp}/agent-tab-condense.$(title_key "$raw").lock"
+    mkdir "$lock" 2>/dev/null || exit 0   # another condenser owns this title
+    trap 'rmdir "$lock" 2>/dev/null' EXIT INT TERM
+    short=$(cached_short "$raw")
+    if [ -z "$short" ]; then
+        TO=$(command -v timeout || true)
+        # Copilot CLI prints the answer on stdout and its stats footer on
+        # stderr; a pure text prompt grants no tool permissions, so the
+        # helper can't touch anything. Nonzero exit → empty out → no cache.
+        out=$(${TO:+"$TO" 90} copilot -p \
+            "Condense this coding-session title into the 2-4 words that best identify it. Output only those words - no punctuation, quotes, or explanation.
+
+Title: $raw" --model claude-haiku-4.5 --no-color </dev/null 2>/dev/null || true)
+        short=$(printf '%s' "$out" | head -1 | sanitize_summary | cut -d' ' -f1-4)
+        # Fit to 24 chars by dropping whole words, never mid-word cuts.
+        while [ "${#short}" -gt 24 ] && [ "${short% *}" != "$short" ]; do
+            short="${short% *}"
+        done
+        short=$(printf '%s' "$short" | cut -c1-24)
+        if [ -n "$short" ]; then
+            mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
+            printf '%s\t%s\n' "$(title_key "$raw")" "$short" >> "$CACHE" 2>/dev/null || true
+        fi
+    fi
+    [ -n "$short" ] || exit 0
+    set_summary "$win" "${proj:+$proj/}$short"
+    exit 0
+fi
+
 # Everything below is an agent hook: resolve the agent's window from the
 # pane the hook inherited.
 pane="${TMUX_PANE:-}"
@@ -199,7 +288,7 @@ case "$mode" in
         set_state "$win" idle
         summary=$(extract_summary "$payload")
         if [ -n "$summary" ]; then
-            set_summary "$win" "$summary"
+            compose_summary "$win" "$summary" "$payload"
         else
             # A fresh conversation (/clear, new startup) has no title yet —
             # drop the previous conversation's stale title rather than keep
@@ -212,7 +301,7 @@ case "$mode" in
         ;;
     running)
         set_state "$win" running
-        set_summary "$win" "$(extract_summary "$payload")"
+        compose_summary "$win" "$(extract_summary "$payload")" "$payload"
         ;;
     needs-input)
         if [ "$win" = "$active_win" ]; then
@@ -227,7 +316,7 @@ case "$mode" in
         else
             set_state "$win" done
         fi
-        set_summary "$win" "$(extract_summary "$payload")"
+        compose_summary "$win" "$(extract_summary "$payload")" "$payload"
         ;;
     clear)
         # SessionEnd reasons clear/resume are immediately followed by a new

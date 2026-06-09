@@ -10,7 +10,7 @@ Codex CLI) running inside it, rendered through the Catppuccin status bar:
 | `running` | agent mid-turn | blue `󱙺` robot glyph, surface1 `#45475a` background lift |
 | `needs-input` | permission prompt / idle-wait / turn failed | `●` glyph, yellow `#f9e2af` background |
 | `done` | turn finished | `●` glyph, green `#a6e3a1` background |
-| any | agent has a conversation title | tab name = title (24 cells, `…`), else `#W` |
+| any | agent has a conversation title | tab name = `project/short-title`, else `#W` |
 
 **Seen-it semantics:** `needs-input`/`done` only tint *background* tabs. If
 the event lands on the focused window — or you focus a tinted tab — the
@@ -61,6 +61,16 @@ subagent's Stop can't flip the main agent's tab.
 transcript tail (`transcript_path` from the payload), else the submitted
 prompt; Codex — `thread_name` from `~/.codex/session_index.jsonl` keyed by
 `session_id`, else the prompt. Sanitized (no `#`/`"`, one line, ≤60 chars).
+
+**Tab name format**: `project/short-title`. Project is the basename of the
+hook's `cwd` (`~` for `$HOME`). The raw title is condensed to its 2–4 most
+identifying words by a detached `copilot -p … --model claude-haiku-4.5`
+call (answer on stdout, stats footer on stderr; a plain text prompt grants
+no tool permissions) and cached forever in
+`~/.cache/agent-tab/titles.tsv` keyed by title hash — each distinct title
+costs one haiku call ever. Until the condensation lands (or if `copilot`
+fails), the tab shows `project/<raw title>` as an interim. No display-side
+truncation.
 
 ### 2. `scripts/agent-tab-watcher.sh` (presence daemon)
 

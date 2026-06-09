@@ -137,9 +137,10 @@ set -g @catppuccin_window_current_color "#{?#{==:#{@agent_state},done},#11111b,#
 # Tab text: agent glyph 󱙺 (nf-md-robot-outline U+F167A; mauve #cba6f7 idle,
 # blue #89b4fa running, ● on attention states), then a fg that stays
 # readable on the bright attention backgrounds (crust #11111b), then the
-# agent conversation summary truncated to 24 cells with #W fallback.
-set -g @catppuccin_window_default_text "#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󱙺 ,}#{?#{==:#{@agent_state},running},#[fg=#89b4fa]󱙺 ,}#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,}#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,}#[fg=#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#cdd6f4}}]#{?#{n:#{@agent_summary}},#{=/24/…:#{@agent_summary}},#W}"
-set -g @catppuccin_window_current_text "#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󱙺 ,}#{?#{==:#{@agent_state},running},#[fg=#89b4fa]󱙺 ,}#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,}#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,}#[fg=#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#cdd6f4}}]#{?#{n:#{@agent_summary}},#{=/24/…:#{@agent_summary}},#W}"
+# agent summary ("project/ultra-short title", pre-condensed by the
+# indicator script so no display truncation is needed) with #W fallback.
+set -g @catppuccin_window_default_text "#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󱙺 ,}#{?#{==:#{@agent_state},running},#[fg=#89b4fa]󱙺 ,}#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,}#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,}#[fg=#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#cdd6f4}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
+set -g @catppuccin_window_current_text "#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󱙺 ,}#{?#{==:#{@agent_state},running},#[fg=#89b4fa]󱙺 ,}#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,}#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,}#[fg=#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#cdd6f4}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
 # end catppuccin
 
 # Agent tab indicator runtime: presence/GC watcher daemon (singleton), and
