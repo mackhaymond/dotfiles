@@ -6,8 +6,8 @@ Codex CLI) running inside it, rendered through the Catppuccin status bar:
 | State | Trigger | Tab appearance |
 |---|---|---|
 | *(none)* | no agent process in the window | stock Catppuccin tab |
-| `idle` | agent open, not working | dim `✳` glyph, stock colors |
-| `running` | agent mid-turn | blue `✳` glyph, surface1 `#45475a` background lift |
+| `idle` | agent open, not working | mauve `󱙺` robot glyph, stock colors |
+| `running` | agent mid-turn | blue `󱙺` robot glyph, surface1 `#45475a` background lift |
 | `needs-input` | permission prompt / idle-wait / turn failed | `●` glyph, yellow `#f9e2af` background |
 | `done` | turn finished | `●` glyph, green `#a6e3a1` background |
 | any | agent has a conversation title | tab name = title (24 cells, `…`), else `#W` |
