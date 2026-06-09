@@ -6,8 +6,8 @@ Codex CLI) running inside it, rendered through the Catppuccin status bar:
 | State | Trigger | Tab appearance |
 |---|---|---|
 | *(none)* | no agent process in the window | stock Catppuccin tab |
-| `idle` | agent open, not working | mauve `󱙺` robot glyph, stock colors |
-| `running` | agent mid-turn | `󱙺` glyph blinking blue↔peach at 1 s (watcher toggles global `@agent_blink`), no bg change |
+| `idle` | agent open, not working | mauve `󰚩` robot glyph, stock colors |
+| `running` | agent mid-turn | `󰚩` glyph blinking blue↔peach at 1 s (watcher toggles global `@agent_blink`), no bg change |
 | `needs-input` | permission prompt / idle-wait / turn failed | `●` glyph, yellow `#f9e2af` background |
 | `done` | turn finished | `●` glyph, green `#a6e3a1` background |
 | any | agent has a conversation title | tab name = `project/short-title`, else `#W` |
