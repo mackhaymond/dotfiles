@@ -166,10 +166,14 @@ valid_short() {
     case "$s" in *[A-Za-z]*) ;; *) return 1 ;; esac
     wc=$(printf '%s' "$s" | wc -w | tr -d ' ')
     [ "$wc" -ge 1 ] && [ "$wc" -le 4 ] || return 1
+    # Refusal/error preambles START with these — anchor to the front so a
+    # legit title that merely CONTAINS a word like "login" or "error"
+    # ("Add login flow", "Error boundary component") isn't rejected. Errors
+    # with a colon ("Error: …") are already caught by the *:* rule above.
     lc=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
     case "$lc" in
-        "i "*|"i'"*|*sorry*|*"credit balance"*|*"i cannot"*|*"i can't"* \
-        |*"not authenticated"*|*"please "*|*login*|*error*|*unable*|*apolog*) return 1 ;;
+        "i "*|"i'"*|sorry*|apolog*|please*|unable*|"sure,"*|"here "* \
+        |"credit balance"*|"not authenticated"*) return 1 ;;
     esac
     return 0
 }
@@ -291,7 +295,12 @@ if [ "$mode" = "condense" ]; then
         # prompt grants no tool permissions. Capture the exit code explicitly
         # — `|| true` would mask a failed call whose stdout is an error string.
         if out=$(${TO:+"$TO" 90} copilot -p \
-            "Condense this coding-session title into the 2-4 words that best identify it. Output only those words - no punctuation, quotes, or explanation.
+            "From the coding-session title or first message below, output a 2-4 word tab label built from the MOST SPECIFIC, distinctive words in it: the concrete subject, target, feature, file, tech, or action unique to THIS task. Keep proper nouns and real names. DROP generic filler (project, code, app, task, session, various, deep, inspection, thing, stuff, update, changes, improve, and a bare fix/add/refactor when what it acts on is unnamed). Someone reading the label should be able to guess the task back. Prefer the unusual identifying word over the category word. Output ONLY the label - no punctuation, quotes, or explanation.
+
+Examples:
+- 'deep inspection of this project docs, I wanna open source it, make sure nothing reads like AI or oddly specific to me' => Open-source doc cleanup
+- 'refactor the auth middleware to use JWTs instead of session cookies' => JWT auth refactor
+- 'figure out why the websocket reconnect drops messages under load' => Websocket reconnect bug
 
 Title: $raw" --model claude-haiku-4.5 --no-color </dev/null 2>/dev/null); then
             short=$(printf '%s' "$out" | grep -m1 . | sanitize_summary | cut -d' ' -f1-4)
