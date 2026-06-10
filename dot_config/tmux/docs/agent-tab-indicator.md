@@ -12,9 +12,12 @@ Codex CLI) running inside it, rendered through the Catppuccin status bar:
 | `done` | turn finished | `●` glyph, green `#a6e3a1` background |
 | any | agent has a conversation title | tab name = `project/short-title`, else `#W` |
 
-**Seen-it semantics:** `needs-input`/`done` only tint *background* tabs. If
-the event lands on the focused window — or you focus a tinted tab — the
-state discharges to `idle` (`after-select-window` hook).
+**Seen-it semantics:** focusing a tinted tab discharges it to `idle`
+(`after-select-window` → `clear-current`). `done` additionally isn't tinted
+if a client is already watching its window (`#{window_active_clients}` > 0 —
+you saw it finish). `needs-input` is *always* asserted, even on the focused
+window: focusing a prompt is not answering it, so a prompt is never silently
+lost by switching away before you respond.
 
 ## Architecture
 
@@ -37,7 +40,7 @@ payload on stdin. Hook processes are children of the agent, so
 |---|---|
 | `SessionStart` | `idle` (skips `source=compact` — fires mid-turn) |
 | `UserPromptSubmit` | `running` |
-| `PostToolUse` | `heartbeat` (re-arms `running` after an answered permission prompt; never reads stdin — `tool_response` can be huge) |
+| `PostToolUse` | `heartbeat` (re-arms `running` *only* from `running`/`needs-input`, so a late tool call can't resurrect a finished tab; never reads stdin — `tool_response` can be huge) |
 | `PermissionRequest`, `Notification` (matcher `permission_prompt\|idle_prompt`), `StopFailure` | `needs-input` |
 | `Stop` | `done` |
 | `SessionEnd` | `clear` (skips reasons `clear`/`resume` — a new SessionStart follows) |
@@ -53,6 +56,9 @@ no SessionEnd; the watcher handles cleanup. **Codex requires interactive
 trust approval for new hook entries** — run `codex` and accept the "New
 hook — review required" prompt (or `/hooks` in the TUI). Until approved the
 hooks don't fire and codex windows only get watcher-driven `idle` presence.
+Codex also has no `Notification`/idle-prompt analog, so codex `needs-input`
+only appears when the approval policy actually surfaces a `PermissionRequest`
+(a fully-auto policy never shows the yellow tint).
 
 Subagent-context events (payload has `agent_id`) are ignored so a
 subagent's Stop can't flip the main agent's tab.
@@ -60,35 +66,43 @@ subagent's Stop can't flip the main agent's tab.
 **Summary sources** (best first): Claude — last `ai-title` entry in the
 transcript tail (`transcript_path` from the payload), else the submitted
 prompt; Codex — `thread_name` from `~/.codex/session_index.jsonl` keyed by
-`session_id`, else the prompt. Sanitized (no `#`/`"`, one line, ≤60 chars).
+`session_id`, else the prompt. Sanitized (no `#`/`"`/`%`, one line, ≤60 chars).
 
 **Tab name format**: `project/short-title`. Project is the basename of the
 hook's `cwd` (`~` for `$HOME`). The raw title is condensed to its 2–4 most
 identifying words by a detached `copilot -p … --model claude-haiku-4.5`
 call (answer on stdout, stats footer on stderr; a plain text prompt grants
-no tool permissions) and cached forever in
-`~/.cache/agent-tab/titles.tsv` keyed by title hash — each distinct title
-costs one haiku call ever. Until the condensation lands (or if `copilot`
-fails), the tab shows `project/<raw title>` as an interim. No display-side
-truncation.
+no tool permissions) and cached in `~/.cache/agent-tab/titles.tsv` keyed by
+title hash. The model's output is **validated** before caching (1–4 words,
+no colon/sentence punctuation, not an apology/refusal/auth-error) so error
+strings can't poison the cache; a failed/rejected condense writes a negative
+row that backs off retries for `NEG_TTL` (600 s) instead of re-calling every
+turn. Until the condensation lands (or if `copilot` fails), the tab shows
+`project/<raw title>` (word-trimmed to 24 cells) as an interim.
 
 ### 2. `scripts/agent-tab-watcher.sh` (presence daemon)
 
-Singleton (PID file, coffee-watcher pattern), spawned from tmux.conf,
-polls every 1 s (doubling as the running-glyph blink driver — it toggles
-the global `@agent_blink` option each tick while any window is running):
-matches agent processes to windows by TTY (`ps -o comm`
-basename `claude`/`codex`, plus the bare `N.N.N` pattern — Claude's binary
-is version-named and `#{pane_current_command}` reports that, so formats
-can't detect presence). Reconciles:
+Singleton, spawned from tmux.conf, polls every 1 s (doubling as the
+running-glyph blink driver — it toggles the global `@agent_blink` option
+each tick while any window is running). The singleton guard is
+ownership-aware: each start reaps any prior instance and only clears the PID
+file if it still owns it, and signal traps route through `exit` so `kill`
+actually stops the daemon — every `prefix r` reload converges back to one
+watcher (the naive check-then-write version leaked a daemon per reload). It
+matches agent processes to windows by TTY (`ps -o comm` basename
+`claude`/`codex`, plus the bare `N.N.N` pattern — Claude's binary is
+version-named and `#{pane_current_command}` reports that, so formats can't
+detect presence). Reconciles:
 
 - agent present, no state → seed `idle`
-- no agent, state set → unset both options (covers SIGKILL, `kill-pane`,
-  crashes — SessionEnd is best-effort and codex has none)
+- no agent, state **or** summary set → unset both options (covers SIGKILL,
+  `kill-pane`, crashes — SessionEnd is best-effort and codex has none; the
+  summary is read separately so an orphaned title written by a slow
+  condenser after the agent died is still reaped)
 
 Hook-set states are never overridden while the agent lives. Known
 limitation: a one-shot `claude -p` exits right after `Stop`, so its `done`
-tint is GC'd within ~2 s. Per-window state also means two agents in one
+tint is GC'd within ~1 s. Per-window state also means two agents in one
 window share a single state (last writer wins).
 
 ### 3. Rendering (`tmux.conf`, Catppuccin v0.2.0)
@@ -110,8 +124,12 @@ expression, which would render a pastel digit on the blue/orange accent
 `@catppuccin_window_*_color` conditionals darken the accent to crust
 `#11111b` on attention states so the state-colored digit reads against it.
 
-The text options add the state glyph, a readable fg on bright backgrounds
-(crust `#11111b`), and `#{?#{n:#{@agent_summary}},#{=/24/…:#{@agent_summary}},#W}`.
+The text options add the state glyph (mauve `󰚩` idle, blinking blue↔peach
+`󰚩` running, crust `●` on attention states), a readable fg on bright
+backgrounds (crust `#11111b`), and the summary with `#W` fallback:
+`#{?#{n:#{@agent_summary}},#{@agent_summary},#W}`. The summary is
+pre-shortened by the indicator script, so there is no render-side
+truncation.
 
 `rename-window` is deliberately **not** used for titles: it disables
 `automatic-rename` per window and tmux-resurrect persists both the stale
@@ -131,7 +149,13 @@ so stale summaries simply vanish.
   `~/.codex/hooks.json.bak-agent-tab`.)
 - **No summary on a fresh Claude session** → no `ai-title` yet; the first
   prompt is used as fallback, the real title appears on later events.
+- **Wrong/garbled tab title stuck** → a bad condense may be cached. Clear it
+  with `rm ~/.cache/agent-tab/titles.tsv` (rebuilds on the next agent event);
+  a single bad title backs off for 600 s on its own (`NEG_TTL`).
 - **Inspect state**: `tmux list-windows -a -F '#{window_id} #{@agent_state} #{@agent_summary}'`
-- All files are chezmoi-managed: edit
-  `~/.local/share/chezmoi/dot_config/tmux/…`, then `chezmoi apply`.
-  (`~/.claude/settings.json` and `~/.codex/hooks.json` are *not* managed.)
+- All files are chezmoi-managed: edit the **source** under
+  `~/.local/share/chezmoi/dot_config/tmux/…`, then `chezmoi apply`. Note the
+  scripts are `executable_*.sh` and the rendering lives in `tmux.conf.tmpl`
+  (a chezmoi *template*) — use `chezmoi source-path <deployed-file>` to find
+  the source for any of them. (`~/.claude/settings.json` and
+  `~/.codex/hooks.json` are *not* chezmoi-managed.)
