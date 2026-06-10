@@ -30,15 +30,17 @@
 #   script never has to handle crashed/killed agents.
 #
 # Modes:
-#   idle         SessionStart        → mark present (skipped for compact restarts)
+#   idle         SessionStart        → mark present (skipped for compact
+#                                      restarts); a fresh session with no title
+#                                      yet shows "<project>/New Session"
 #   running      UserPromptSubmit    → turn started; refresh @agent_summary
 #   heartbeat    PostToolUse         → re-arm running mid-turn (after an answered
 #                                      permission prompt), but ONLY from
 #                                      running/needs-input so a late tool call
 #                                      can't resurrect a finished tab; skips
 #                                      stdin entirely — payloads can be huge
-#   needs-input  PermissionRequest / Notification(permission_prompt|idle_prompt)
-#                / StopFailure       → attention; always asserted (focus ≠
+#   needs-input  PermissionRequest / Notification(permission_prompt) /
+#                StopFailure         → attention; always asserted (focus ≠
 #                                      answer), discharged by the focus hook
 #   done         Stop                → turn finished; refresh @agent_summary;
 #                                      not tinted if a client is watching it
@@ -368,11 +370,14 @@ case "$mode" in
             compose_summary "$win" "$summary" "$payload"
         else
             # A fresh conversation (/clear, new startup) has no title yet —
-            # drop the previous conversation's stale title rather than keep
-            # rendering it on the new session's tab. resume keeps it: the
-            # old title is still the right one for a resumed conversation.
+            # show "<project>/New Session" as a placeholder until the first
+            # turn generates a real title (set directly, not condensed). resume
+            # keeps whatever title it had: that's still the right conversation.
             case "$src" in
-                clear|startup) tmux set-option -uw -t "$win" @agent_summary 2>/dev/null || true ;;
+                clear|startup)
+                    proj=$(project_name "$payload")
+                    set_summary "$win" "${proj:+$proj/}New Session"
+                    ;;
             esac
         fi
         ;;

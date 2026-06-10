@@ -8,7 +8,7 @@ Codex CLI) running inside it, rendered through the Catppuccin status bar:
 | *(none)* | no agent process in the window | stock Catppuccin tab |
 | `idle` | agent open, not working | mauve `󰚩` robot glyph, stock colors |
 | `running` | agent mid-turn | `󰚩` glyph blinking blue↔peach at 1 s (watcher toggles global `@agent_blink`), no bg change |
-| `needs-input` | permission prompt / idle-wait / turn failed | `●` glyph, yellow `#f9e2af` background |
+| `needs-input` | permission prompt / turn failed | `●` glyph, yellow `#f9e2af` background |
 | `done` | turn finished | `●` glyph, green `#a6e3a1` background |
 | any | agent has a conversation title | tab name = `project/short-title`, else `#W` |
 
@@ -38,15 +38,16 @@ payload on stdin. Hook processes are children of the agent, so
 
 | Hook | Mode |
 |---|---|
-| `SessionStart` | `idle` (skips `source=compact` — fires mid-turn) |
+| `SessionStart` | `idle` (skips `source=compact` — fires mid-turn; a fresh session shows `project/New Session` until the first turn titles it) |
 | `UserPromptSubmit` | `running` |
 | `PostToolUse` | `heartbeat` (re-arms `running` *only* from `running`/`needs-input`, so a late tool call can't resurrect a finished tab; never reads stdin — `tool_response` can be huge) |
-| `PermissionRequest`, `Notification` (matcher `permission_prompt\|idle_prompt`), `StopFailure` | `needs-input` |
+| `PermissionRequest`, `Notification` (matcher `permission_prompt`), `StopFailure` | `needs-input` |
 | `Stop` | `done` |
 | `SessionEnd` | `clear` (skips reasons `clear`/`resume` — a new SessionStart follows) |
 
-Note: `Notification`'s `idle_prompt` fires only after
-`messageIdleNotifThresholdMs` (default 60 s) of waiting.
+Note: only `permission_prompt` notifications tint the tab — Claude's
+`idle_prompt` (fired after ~60 s of waiting) is deliberately *not* wired, so
+a finished tab stays `done`/green rather than escalating to yellow.
 
 **Codex** (`~/.codex/hooks.json` — native hooks; the legacy `notify` slot
 stays untouched for SkyComputerUseClient): `SessionStart` (matcher
