@@ -10,7 +10,10 @@ Codex CLI) running inside it, rendered through the Catppuccin status bar:
 | `running` | agent mid-turn | `󰚩` glyph blinking blue↔peach at 1 s (watcher toggles global `@agent_blink`), no bg change |
 | `needs-input` | permission prompt / turn failed | `●` glyph, yellow `#f9e2af` background |
 | `done` | turn finished | `●` glyph, green `#a6e3a1` background |
+| *background workflow* | a Claude Workflow still running after the turn ended | distinct `󰒓` gear glyph blinking teal↔sapphire; green "done" tint suppressed to stock (it isn't really finished) |
 | any | agent has a conversation title | tab name = `project/short-title`, else `#W` |
+
+The workflow indicator is an orthogonal layer (`@agent_workflow`) over `@agent_state`, with glyph priority **needs-input > workflow > done > running > idle** — a blocked prompt still wins, but a finished-looking tab with a background workflow reads as still-working.
 
 **Seen-it semantics:** focusing a tinted tab discharges it to `idle`
 (`after-select-window` → `clear-current`). `done` additionally isn't tinted
@@ -25,6 +28,7 @@ Two per-window tmux user options are the single source of truth:
 
 - `@agent_state` — `idle | running | needs-input | done` (unset = no agent)
 - `@agent_summary` — short conversation title
+- `@agent_workflow` — `1` while a background Claude Workflow is in flight (else unset); set by the watcher, orthogonal to `@agent_state`
 
 Three components maintain and render them:
 
@@ -105,6 +109,19 @@ Hook-set states are never overridden while the agent lives. Known
 limitation: a one-shot `claude -p` exits right after `Stop`, so its `done`
 tint is GC'd within ~1 s. Per-window state also means two agents in one
 window share a single state (last writer wins).
+
+**Background-workflow awareness** (Claude only — codex has no workflows): a
+backgrounded Workflow keeps running after the main turn's `Stop` fires, and
+there's no hook for it. But the Workflow runtime writes a live dir
+`~/.claude/projects/<proj>/<session>/subagents/workflows/wf_<id>/` and only
+writes the completion file `…/workflows/wf_<id>.json` when it finishes — so a
+workflow is in flight iff its runtime dir exists *without* that completion
+file. Each tick the watcher maps each claude window pane → pid →
+`~/.claude/sessions/<pid>.json` → sessionId/cwd → that session's workflow
+dirs, and sets/clears the per-window `@agent_workflow` flag (with a 600 s
+recency backstop on the agent transcript mtime against a crashed-mid-run
+dir). The blink driver also toggles while any workflow is in flight, not just
+while a window is `running`.
 
 ### 3. Rendering (`tmux.conf`, Catppuccin v0.2.0)
 

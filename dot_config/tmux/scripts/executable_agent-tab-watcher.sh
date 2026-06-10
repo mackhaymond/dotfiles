@@ -15,10 +15,20 @@
 # Hook-set states (running/needs-input/done) are never overridden while the
 # agent lives.
 #
+# It also makes tabs aware of background Claude WORKFLOWS. A backgrounded
+# Workflow keeps running after the main turn's Stop fires (so the tab would
+# otherwise read done/idle). There's no hook for it, but the workflow runtime
+# writes a live dir subagents/workflows/wf_<id>/ and only writes the terminal
+# state file workflows/wf_<id>.json at completion — so a workflow is in-flight
+# iff its runtime dir exists without that completion file. Per claude window we
+# map pane→pid→session (~/.claude/sessions/<pid>.json) and set a per-window
+# @agent_workflow flag the formats render as a distinct blinking gear.
+# (Workflows are a Claude feature; codex windows are never checked.)
+#
 # It also drives the running-state animation: while ANY window is in state
-# running, the global @agent_blink option toggles each tick and the window
-# formats alternate the agent glyph between two colors off it. No running
-# windows → no toggling, no redraws.
+# running OR has @agent_workflow set, the global @agent_blink option toggles
+# each tick and the window formats alternate the glyph between two colors off
+# it. Nothing running → no toggling, no redraws.
 #
 # Process matching is by `ps -o comm` basename — NOT #{pane_current_command}:
 # tmux reads the kernel p_comm, which for Claude Code is the version-named
@@ -70,31 +80,76 @@ is_agent_comm() {
     [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
+# True if the claude session owning PID has a background Workflow in flight.
+# Runtime dir without its completion file = running (see header). Scoped to
+# the session's own project/<sid> dir so other panes' workflows don't leak in.
+session_has_running_workflow() {
+    local pid="$1" sf sid cwd proj base d wfid mt now
+    [ -n "$pid" ] || return 1
+    sf="$HOME/.claude/sessions/$pid.json"
+    [ -f "$sf" ] || return 1
+    sid=$(grep -o '"sessionId":"[^"]*"' "$sf" 2>/dev/null | head -1 | cut -d'"' -f4)
+    cwd=$(grep -o '"cwd":"[^"]*"' "$sf" 2>/dev/null | head -1 | cut -d'"' -f4)
+    { [ -n "$sid" ] && [ -n "$cwd" ]; } || return 1
+    # Claude munges the project dir name from cwd: '/' and '.' both become '-'.
+    proj="${cwd//\//-}"; proj="${proj//./-}"
+    base="$HOME/.claude/projects/$proj/$sid"
+    [ -d "$base/subagents/workflows" ] || return 1
+    now=$(date +%s 2>/dev/null || echo 0)
+    for d in "$base"/subagents/workflows/wf_*/; do
+        [ -d "$d" ] || continue
+        wfid=$(basename "$d")
+        [ -f "$base/workflows/$wfid.json" ] && continue   # completion file → done
+        # Backstop against a crashed/stale runtime dir: the agent transcripts
+        # stream continuously while running, so a recent mtime means live.
+        mt=$(stat -f %m "$d"/agent-*.jsonl "$d/journal.jsonl" 2>/dev/null | sort -rn | head -1)
+        [ -n "$mt" ] && [ $((now - mt)) -lt 600 ] && return 0
+    done
+    return 1
+}
+
 while :; do
     # window_id<space>pane_tty for every pane; failure = server gone.
     panes=$(tmux list-panes -a -F '#{window_id} #{pane_tty}' 2>/dev/null) || exit 0
 
-    # One ps for all TTYs: build "ttys001 ttys004 ..." list of agent TTYs.
+    # One ps for all TTYs: agent TTYs, plus tty=pid for claude panes (workflow
+    # lookup needs the pid; codex panes are skipped — no workflows there).
     agent_ttys=" "
-    while IFS=' ' read -r tty comm; do
+    tty_pid=" "
+    while IFS=' ' read -r tty pid comm; do
         [ -n "$tty" ] && [ "$tty" != "??" ] || continue
         if is_agent_comm "$comm"; then
             agent_ttys="${agent_ttys}${tty} "
+            case "$(basename "$comm")" in
+                claude|[0-9]*) tty_pid="${tty_pid}${tty}=${pid} " ;;
+            esac
         fi
     done <<EOF
-$(ps -ax -o tty=,comm= 2>/dev/null)
+$(ps -ax -o tty=,pid=,comm= 2>/dev/null)
 EOF
 
     # Current per-window state in one call (formats resolve window options).
     states=$(tmux list-windows -a -F '#{window_id} #{@agent_state}' 2>/dev/null) || exit 0
 
-    # Windows containing at least one agent pane.
+    # Windows containing at least one agent pane, and the claude pid per window
+    # (first agent pane wins) for workflow lookup.
     present=" "
+    win_pid=" "
     while IFS=' ' read -r win tty; do
         [ -n "$win" ] || continue
         short_tty="${tty#/dev/}"
         case "$agent_ttys" in
-            *" ${short_tty} "*) present="${present}${win} " ;;
+            *" ${short_tty} "*)
+                present="${present}${win} "
+                case "$win_pid" in
+                    *" ${win}="*) : ;;   # already mapped
+                    *)
+                        for kv in $tty_pid; do
+                            case "$kv" in "${short_tty}="*) win_pid="${win_pid}${win}=${kv#*=} "; break ;; esac
+                        done
+                        ;;
+                esac
+                ;;
         esac
     done <<EOF
 $panes
@@ -110,7 +165,16 @@ EOF
 $(tmux list-windows -a -F '#{window_id} #{@agent_summary}' 2>/dev/null)
 EOF
 
+    # Windows that currently carry @agent_workflow (to reconcile against).
+    wf_now=" "
+    while IFS=' ' read -r win rest; do
+        [ -n "$win" ] && [ -n "$rest" ] && wf_now="${wf_now}${win} "
+    done <<EOF
+$(tmux list-windows -a -F '#{window_id} #{@agent_workflow}' 2>/dev/null)
+EOF
+
     changed=0
+    any_workflow=0
     while IFS=' ' read -r win state; do
         [ -n "$win" ] || continue
         case "$present" in
@@ -121,6 +185,28 @@ EOF
             *" ${win} "*) has_summary=1 ;;
             *) has_summary=0 ;;
         esac
+        case "$wf_now" in
+            *" ${win} "*) had_wf=1 ;;
+            *) had_wf=0 ;;
+        esac
+
+        # Background-workflow detection (claude only; needs a live agent).
+        wf=0
+        if [ "$has_agent" = 1 ]; then
+            pid=""
+            for kv in $win_pid; do
+                case "$kv" in "${win}="*) pid="${kv#*=}"; break ;; esac
+            done
+            if [ -n "$pid" ] && session_has_running_workflow "$pid"; then
+                wf=1; any_workflow=1
+            fi
+        fi
+        if [ "$wf" = 1 ] && [ "$had_wf" = 0 ]; then
+            tmux set-option -w -t "$win" @agent_workflow 1 2>/dev/null && changed=1
+        elif [ "$wf" = 0 ] && [ "$had_wf" = 1 ]; then
+            tmux set-option -uw -t "$win" @agent_workflow 2>/dev/null && changed=1
+        fi
+
         if [ "$has_agent" = 1 ] && [ -z "$state" ]; then
             tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
         elif [ "$has_agent" = 0 ] && { [ -n "$state" ] || [ "$has_summary" = 1 ]; }; then
@@ -132,18 +218,19 @@ EOF
 $states
 EOF
 
-    # Blink driver: toggle while anything is running; redraw covers both
-    # the toggle and any reconcile changes above.
-    case "$states" in
-        *" running"*)
-            if [ "$(tmux show-options -gqv @agent_blink 2>/dev/null)" = "1" ]; then
-                tmux set-option -g @agent_blink 0 2>/dev/null
-            else
-                tmux set-option -g @agent_blink 1 2>/dev/null
-            fi
-            changed=1
-            ;;
-    esac
+    # Blink driver: toggle while anything is running or has a workflow in
+    # flight; redraw covers both the toggle and any reconcile changes above.
+    blink_active=0
+    case "$states" in *" running"*) blink_active=1 ;; esac
+    [ "$any_workflow" = 1 ] && blink_active=1
+    if [ "$blink_active" = 1 ]; then
+        if [ "$(tmux show-options -gqv @agent_blink 2>/dev/null)" = "1" ]; then
+            tmux set-option -g @agent_blink 0 2>/dev/null
+        else
+            tmux set-option -g @agent_blink 1 2>/dev/null
+        fi
+        changed=1
+    fi
 
     if [ "$changed" = 1 ]; then
         tmux refresh-client -S 2>/dev/null

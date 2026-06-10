@@ -112,7 +112,8 @@ set -g @catppuccin_window_default_fill "number"
 set -g @catppuccin_window_current_fill "number"
 # Agent tab indicator (see docs/agent-tab-indicator.md). Claude Code / Codex
 # hooks + scripts/agent-tab-watcher.sh maintain per-window options
-# @agent_state (idle|running|needs-input|done) and @agent_summary; the
+# @agent_state (idle|running|needs-input|done), @agent_summary, and
+# @agent_workflow (set while a background Claude Workflow is in flight); the
 # Catppuccin window formats below render them.
 #
 # Background tint: Catppuccin pastes @catppuccin_window_*_background verbatim
@@ -122,31 +123,35 @@ set -g @catppuccin_window_current_fill "number"
 # separator end-caps. The expression must stay space-free and quote-free
 # (catppuccin's option batch reader splits on spaces and strips quotes).
 # Mocha: done=green #a6e3a1, needs-input=yellow #f9e2af. running gets NO
-# bg change (its signal is the blinking glyph in the text options below).
-# No-state fallbacks (catppuccin stock): SELECTED tab sits on base #1e1e2e
-# (blends into the status bar) and unselected tabs get the surface0 #313244
-# gray pill.
-set -g @catppuccin_window_default_background "#{?#{==:#{@agent_state},done},#a6e3a1,#{?#{==:#{@agent_state},needs-input},#f9e2af,#313244}}"
-set -g @catppuccin_window_current_background "#{?#{==:#{@agent_state},done},#a6e3a1,#{?#{==:#{@agent_state},needs-input},#f9e2af,#1e1e2e}}"
+# bg change (its signal is the blinking glyph in the text options below). A
+# done tab with a background workflow still in flight is NOT tinted green
+# (it isn't really finished) — it falls back to stock and the blinking gear
+# glyph carries the signal. No-state fallbacks (catppuccin stock): SELECTED
+# tab sits on base #1e1e2e (blends into the status bar) and unselected tabs
+# get the surface0 #313244 gray pill.
+set -g @catppuccin_window_default_background "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#313244,#a6e3a1},#{?#{==:#{@agent_state},needs-input},#f9e2af,#313244}}"
+set -g @catppuccin_window_current_background "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#1e1e2e,#a6e3a1},#{?#{==:#{@agent_state},needs-input},#f9e2af,#1e1e2e}}"
 
 # fill=number locks the window NUMBER's fg to the $background expression
 # above (number block is `#[fg=$background,bg=$color]#I`), which would put a
 # pastel digit on the blue/orange accent — illegible (WCAG CR 1.2-1.7). Darken
 # the accent ($color: also the left cap and middle-sep stroke) to crust
 # #11111b on attention states so the state-colored digit reads against it.
-set -g @catppuccin_window_default_color "#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#89b4fa}}"
-set -g @catppuccin_window_current_color "#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#fab387}}"
+set -g @catppuccin_window_default_color "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#89b4fa,#11111b},#{?#{==:#{@agent_state},needs-input},#11111b,#89b4fa}}"
+set -g @catppuccin_window_current_color "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#fab387,#11111b},#{?#{==:#{@agent_state},needs-input},#11111b,#fab387}}"
 
-# Tab text: agent glyph 󰚩 (nf-md-robot U+F06A9; mauve #cba6f7 idle,
-# ● on attention states). While running the glyph BLINKS blue #89b4fa ↔
-# peach #fab387: agent-tab-watcher.sh toggles the global @agent_blink
-# option every second while any window is running and the glyph fg keys
-# off it. Then a fg that stays readable on the bright attention
-# backgrounds (crust #11111b), then the agent summary ("project/ultra-
-# short title", pre-condensed by the indicator script so no display
-# truncation is needed) with #W fallback.
-set -g @catppuccin_window_default_text "#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󰚩 ,}#{?#{==:#{@agent_state},running},#[fg=#{?#{@agent_blink},#89b4fa,#fab387}]󰚩 ,}#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,}#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,}#[fg=#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#cdd6f4}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
-set -g @catppuccin_window_current_text "#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󰚩 ,}#{?#{==:#{@agent_state},running},#[fg=#{?#{@agent_blink},#89b4fa,#fab387}]󰚩 ,}#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,}#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,}#[fg=#{?#{==:#{@agent_state},done},#11111b,#{?#{==:#{@agent_state},needs-input},#11111b,#cdd6f4}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
+# Tab text: a single priority glyph chain — needs-input ● > background
+# workflow > done ● > running > idle. Agent glyph 󰚩 (nf-md-robot U+F06A9):
+# mauve #cba6f7 idle, blinking blue #89b4fa ↔ peach #fab387 running. A
+# background Workflow shows a distinct blinking gear 󰒓 (nf-md-cog U+F0493)
+# in teal #94e2d5 ↔ sapphire #74c7ec, so it reads apart from an in-turn
+# run. agent-tab-watcher.sh toggles the global @agent_blink each second
+# while anything is running/working. Then a fg readable on the bright
+# attention backgrounds (crust #11111b; light #cdd6f4 when a workflow
+# suppressed the done tint), then the agent summary ("project/short
+# title") with #W fallback.
+set -g @catppuccin_window_default_text "#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,#{?#{@agent_workflow},#[fg=#{?#{@agent_blink},#94e2d5,#74c7ec}]󰒓 ,#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,#{?#{==:#{@agent_state},running},#[fg=#{?#{@agent_blink},#89b4fa,#fab387}]󰚩 ,#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󰚩 ,}}}}}#[fg=#{?#{==:#{@agent_state},needs-input},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
+set -g @catppuccin_window_current_text "#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,#{?#{@agent_workflow},#[fg=#{?#{@agent_blink},#94e2d5,#74c7ec}]󰒓 ,#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,#{?#{==:#{@agent_state},running},#[fg=#{?#{@agent_blink},#89b4fa,#fab387}]󰚩 ,#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󰚩 ,}}}}}#[fg=#{?#{==:#{@agent_state},needs-input},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
 # end catppuccin
 
 # Agent tab indicator runtime: presence/GC watcher daemon (singleton), and
