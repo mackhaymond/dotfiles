@@ -94,7 +94,10 @@ sanitize_summary() {
     # lands in window-status-format via #{@agent_summary}; '#' starts a
     # format/style token and '%' is a strftime metacharacter under #{T:…}, so
     # strip both defensively even though the current render path is bare.
-    tr '\n\t' '  ' | tr -d '#"%' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' | cut -c1-60
+    # '/' becomes a space so the only slash in a tab name is the deliberate
+    # "<project>/" separator — a model title or project basename can't add
+    # its own (it would read as a second path segment).
+    tr '\n\t/' '   ' | tr -d '#"%' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' | cut -c1-60
 }
 
 set_summary() {
