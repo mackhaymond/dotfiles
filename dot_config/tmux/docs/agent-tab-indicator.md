@@ -10,7 +10,7 @@ Codex CLI) running inside it, rendered through the Catppuccin status bar:
 | `running` | agent mid-turn | `󰚩` glyph blinking blue↔peach at 1 s (watcher toggles global `@agent_blink`), no bg change |
 | `needs-input` | permission prompt / turn failed | `●` glyph, yellow `#f9e2af` background |
 | `done` | turn finished | `●` glyph, green `#a6e3a1` background |
-| *background workflow* | a Claude Workflow still running after the turn ended | distinct `󰒓` gear glyph blinking teal↔sapphire; green "done" tint suppressed to stock (it isn't really finished) |
+| *background workflow* | a Claude Workflow still running after the turn ended | distinct `󰒓` gear glyph blinking teal↔mauve; green "done" tint suppressed to stock (it isn't really finished) |
 | any | agent has a conversation title | tab name = `project/short-title`, else `#W` |
 
 The workflow indicator is an orthogonal layer (`@agent_workflow`) over `@agent_state`, with glyph priority **needs-input > workflow > done > running > idle** — a blocked prompt still wins, but a finished-looking tab with a background workflow reads as still-working.

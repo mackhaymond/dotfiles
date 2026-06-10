@@ -144,14 +144,14 @@ set -g @catppuccin_window_current_color "#{?#{==:#{@agent_state},done},#{?#{@age
 # workflow > done ● > running > idle. Agent glyph 󰚩 (nf-md-robot U+F06A9):
 # mauve #cba6f7 idle, blinking blue #89b4fa ↔ peach #fab387 running. A
 # background Workflow shows a distinct blinking gear 󰒓 (nf-md-cog U+F0493)
-# in teal #94e2d5 ↔ sapphire #74c7ec, so it reads apart from an in-turn
+# in teal #94e2d5 ↔ mauve #cba6f7, so it reads apart from an in-turn
 # run. agent-tab-watcher.sh toggles the global @agent_blink each second
 # while anything is running/working. Then a fg readable on the bright
 # attention backgrounds (crust #11111b; light #cdd6f4 when a workflow
 # suppressed the done tint), then the agent summary ("project/short
 # title") with #W fallback.
-set -g @catppuccin_window_default_text "#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,#{?#{@agent_workflow},#[fg=#{?#{@agent_blink},#94e2d5,#74c7ec}]󰒓 ,#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,#{?#{==:#{@agent_state},running},#[fg=#{?#{@agent_blink},#89b4fa,#fab387}]󰚩 ,#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󰚩 ,}}}}}#[fg=#{?#{==:#{@agent_state},needs-input},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
-set -g @catppuccin_window_current_text "#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,#{?#{@agent_workflow},#[fg=#{?#{@agent_blink},#94e2d5,#74c7ec}]󰒓 ,#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,#{?#{==:#{@agent_state},running},#[fg=#{?#{@agent_blink},#89b4fa,#fab387}]󰚩 ,#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󰚩 ,}}}}}#[fg=#{?#{==:#{@agent_state},needs-input},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
+set -g @catppuccin_window_default_text "#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,#{?#{@agent_workflow},#[fg=#{?#{@agent_blink},#94e2d5,#cba6f7}]󰒓 ,#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,#{?#{==:#{@agent_state},running},#[fg=#{?#{@agent_blink},#89b4fa,#fab387}]󰚩 ,#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󰚩 ,}}}}}#[fg=#{?#{==:#{@agent_state},needs-input},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
+set -g @catppuccin_window_current_text "#{?#{==:#{@agent_state},needs-input},#[fg=#11111b]● ,#{?#{@agent_workflow},#[fg=#{?#{@agent_blink},#94e2d5,#cba6f7}]󰒓 ,#{?#{==:#{@agent_state},done},#[fg=#11111b]● ,#{?#{==:#{@agent_state},running},#[fg=#{?#{@agent_blink},#89b4fa,#fab387}]󰚩 ,#{?#{==:#{@agent_state},idle},#[fg=#cba6f7]󰚩 ,}}}}}#[fg=#{?#{==:#{@agent_state},needs-input},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
 # end catppuccin
 
 # Agent tab indicator runtime: presence/GC watcher daemon (singleton), and
