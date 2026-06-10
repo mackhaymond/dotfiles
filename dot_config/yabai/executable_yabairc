@@ -81,26 +81,15 @@ yabai -m signal --add event=window_created action='
   exit 0
 '
 
-# On every space change: (1) keep the "terminal" label pinned to WezTerm wherever
+# On every space change: keep the "terminal" label pinned to WezTerm wherever
 # it is -- so when WezTerm enters/exits a macOS native-fullscreen Space the label
 # follows it and stays in canonical order (yabai_terminal_follow.sh; cheap no-op
-# when nothing moved); then (2) re-activate WezTerm when entering its space so it
-# raises cleanly. Anchored on the terminal label'\''s LIVE index, so it follows
-# wezterm onto the external display too.
+# when nothing moved).
 yabai -m signal --add event=space_changed action='
   # Active space changed -> re-evaluate the layers bar for the new space (covers every
   # space switch, native-fullscreen enter/exit, and send-window-with-follow).
   /usr/bin/open -g "swiftbar://refreshplugin?name=yabai_layers"
   "$HOME/code/various_scripts/yabai_terminal_follow.sh"
-  tidx=$(yabai -m query --spaces --space terminal 2>/dev/null | jq -r .index 2>/dev/null)
-  case "$tidx" in ""|*[!0-9]*) exit 0 ;; esac
-  [ "$YABAI_SPACE_INDEX" = "$tidx" ] || exit 0
-  # Only raise WezTerm if it actually has a window on the terminal space. The space
-  # is no longer reserved, so other windows may share it -- and a bare "activate"
-  # would LAUNCH WezTerm if it is not running. Guard on a live WezTerm window.
-  has_wt=$(yabai -m query --windows --space terminal 2>/dev/null \
-    | jq -r "any(.[]; .app == \"wezterm-gui\" or .app == \"WezTerm\")" 2>/dev/null)
-  [ "$has_wt" = "true" ] && osascript -e "tell application \"WezTerm\" to activate"
   exit 0
 '
 
