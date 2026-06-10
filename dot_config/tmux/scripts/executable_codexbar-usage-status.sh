@@ -263,6 +263,13 @@ debug_flash_tick() {
 
 LOCK_STALE_SECONDS=120
 
+# A status redraw fires --tick on tmux's status-interval (a few seconds). A gap
+# between consecutive ticks far larger than that means the host was suspended
+# (laptop sleep) or the client was detached; either way any refresh backoff
+# armed beforehand is stale and no longer reflects current network health. Used
+# to clear backoff once on resume so auto-refresh recovers without prefix+u.
+WAKE_GAP_SECONDS=60
+
 usage() {
   printf '%s\n' "Usage: $0 {session|weekly|--refresh|--debug-flash-tick <nonce>}" >&2
 }
@@ -324,8 +331,22 @@ record_refresh_backoff_failure() {
 
   log_warn "backoff: fail_count=${fail_count} next_attempt_in=${delay}s provider=${USAGE_PROVIDER}"
 
+  # Write atomically (mktemp + mv) so a concurrent reader in read_refresh_backoff
+  # — which does not hold any lock — never observes a truncated/half-written
+  # file and mis-evaluates the backoff gate. Mirrors the cache write below.
   umask 077
-  printf '%s %s\n' "$fail_count" "$next_allowed" >"$BACKOFF_FILE" 2>/dev/null || true
+  local bo_tmp
+  if bo_tmp="$(mktemp "${BACKOFF_FILE}.tmp.XXXXXX" 2>/dev/null)"; then
+    if printf '%s %s\n' "$fail_count" "$next_allowed" >"$bo_tmp" 2>/dev/null \
+       && mv -f "$bo_tmp" "$BACKOFF_FILE" 2>/dev/null; then
+      :
+    else
+      rm -f "$bo_tmp" 2>/dev/null || true
+      printf '%s %s\n' "$fail_count" "$next_allowed" >"$BACKOFF_FILE" 2>/dev/null || true
+    fi
+  else
+    printf '%s %s\n' "$fail_count" "$next_allowed" >"$BACKOFF_FILE" 2>/dev/null || true
+  fi
 }
 
 refresh_fail() {
@@ -1237,18 +1258,21 @@ clear_stale_lock_if_needed() {
 try_acquire_lock() {
   local pid_value="${1:-STARTING}"
 
-  clear_stale_lock_if_needed
-
+  # mkdir is the atomic acquisition primitive; do NOT clear before the first
+  # attempt or a concurrent acquirer's live lock can be deleted out from under
+  # it (clear-then-mkdir TOCTOU). Only on contention do we clear a genuinely
+  # stale lock and retry once. Write pid before started_at so clear_stale_lock_
+  # if_needed's pid-alive guard starts protecting the lock as early as possible.
   if mkdir "$LOCKDIR" 2>/dev/null; then
-    printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
     printf '%s\n' "$pid_value" >"$LOCKDIR/pid" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
+    printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
     return 0
   fi
 
   clear_stale_lock_if_needed
   mkdir "$LOCKDIR" 2>/dev/null || return 1
-  printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
   printf '%s\n' "$pid_value" >"$LOCKDIR/pid" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
+  printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || { rm -rf "$LOCKDIR" 2>/dev/null || true; return 1; }
   return 0
 }
 
@@ -1373,6 +1397,22 @@ read_claude_oauth_refresh_token() {
   printf '%s' "$token"
 }
 
+# Returns 0 (true) when the keychain access token is missing an expiry, already
+# expired, or within 120s of expiring. .claudeAiOauth.expiresAt is epoch ms.
+claude_oauth_access_token_is_expired() {
+  command -v jq >/dev/null 2>&1 || return 1
+
+  local raw exp_ms now_ms
+  raw="$(read_claude_oauth_keychain_blob 2>/dev/null || true)"
+  [[ -n "${raw:-}" ]] || return 1
+
+  exp_ms="$(printf '%s' "$raw" | jq -er '.claudeAiOauth.expiresAt' 2>/dev/null || true)"
+  [[ "$exp_ms" =~ ^[0-9]+$ ]] || return 0   # unknown expiry -> assume it needs refreshing
+
+  now_ms=$(( $(now_epoch) * 1000 ))
+  (( exp_ms <= now_ms + 120000 ))
+}
+
 # Atomically updates the Claude Code keychain entry with new access/refresh tokens
 # while preserving any other fields (subscriptionType, scopes, rateLimitTier, etc.).
 # Verifies the refresh token in the keychain still matches `expected_old_refresh`
@@ -1437,6 +1477,11 @@ try_acquire_refresh_lock() {
   if [[ -d "$CLAUDE_OAUTH_REFRESH_LOCKDIR" ]]; then
     local started
     started="$(cat "$CLAUDE_OAUTH_REFRESH_LOCKDIR/started_at" 2>/dev/null || echo 0)"
+    # Guard arithmetic against a corrupt/partial lock file: a non-numeric token
+    # in $(( )) is treated as a variable name and, under set -u, aborts the
+    # whole script (and leaves the lock held). Treat garbage as "stale" (age
+    # from epoch 0) so the rm below reclaims it.
+    [[ "$started" =~ ^[0-9]+$ ]] || started=0
     local age=$(( $(now_epoch) - started ))
     if (( age > 60 )); then
       rm -rf "$CLAUDE_OAUTH_REFRESH_LOCKDIR" 2>/dev/null || true
@@ -1700,6 +1745,14 @@ fetch_via_claude_oauth() {
   reset_fetch_outputs
 
   local token raw
+  # Proactively refresh a known-expired/near-expired access token (common after
+  # a long sleep) so the first post-wake attempt isn't wasted on an expired
+  # token and a transient network blip can't push backoff to its ceiling.
+  if claude_oauth_access_token_is_expired; then
+    log_info "refresh[claude]: access token expired/near-expiry; refreshing proactively"
+    try_oauth_token_refresh || true
+  fi
+
   token="$(read_claude_oauth_access_token 2>/dev/null || true)"
   if [[ -z "${token:-}" ]]; then
     log_warn "refresh[claude]: keychain token unavailable"
@@ -1707,9 +1760,24 @@ fetch_via_claude_oauth() {
   fi
 
   raw="$(fetch_claude_oauth_usage_json "$token" 2>/dev/null || true)"
-  if [[ -z "${raw:-}" ]]; then
-    log_warn "refresh[claude]: empty oauth response"
-    return 1
+
+  # An empty or unparseable body can be a transient blip OR an auth-rejected
+  # request whose 401/403 carried no JSON body (fetch_claude_oauth_usage_json
+  # does not surface the HTTP status, so we can't tell from the body alone).
+  # Make one token-refresh attempt and re-fetch before giving up: a healthy
+  # token simply succeeds on retry, an expired one gets rotated.
+  if [[ -z "${raw:-}" ]] || ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+    log_warn "refresh[claude]: empty/unparseable oauth response; attempting token refresh"
+    if try_oauth_token_refresh; then
+      token="$(read_claude_oauth_access_token 2>/dev/null || true)"
+      if [[ -n "${token:-}" ]]; then
+        raw="$(fetch_claude_oauth_usage_json "$token" 2>/dev/null || true)"
+      fi
+    fi
+    if [[ -z "${raw:-}" ]]; then
+      log_warn "refresh[claude]: empty oauth response after refresh attempt"
+      return 1
+    fi
   fi
 
   if claude_oauth_response_is_auth_error "$raw"; then
@@ -1774,8 +1842,22 @@ refresh_cache() {
     printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || true
   else
     if ! try_acquire_lock "$$"; then
-      log_debug "refresh: lock busy"
-      return 0
+      # A user-initiated refresh (prefix+u sets CODEXBAR_USAGE_FORCE_REFRESH=1)
+      # must always be honoured — it is the manual escape hatch. If a wedged or
+      # suspended worker holds the lock, steal it. Auto-refresh
+      # (spawn_background_refresh_locked) does not set the flag, so it still
+      # yields on contention.
+      if [[ "${CODEXBAR_USAGE_FORCE_REFRESH:-}" == "1" ]]; then
+        log_warn "refresh: lock busy; force-stealing for manual refresh"
+        release_lock
+        if ! try_acquire_lock "$$"; then
+          log_debug "refresh: lock still busy after steal"
+          return 0
+        fi
+      else
+        log_debug "refresh: lock busy"
+        return 0
+      fi
     fi
     log_debug "refresh: lock acquired"
   fi
@@ -1909,13 +1991,42 @@ main() {
         exit 0
       fi
       mkdir -p "$CACHE_DIR"
+
+      # Wake / resume detection. Ticks normally arrive every status-interval
+      # (a few seconds); a much larger gap means the machine was suspended
+      # (laptop sleep). A refresh backoff is an absolute future epoch, so a
+      # backoff armed before sleep keeps gating every post-wake auto-refresh
+      # (for up to an hour) while only prefix+u — which bypasses backoff —
+      # recovers it. Clear the backoff once on a detected wake so this tick can
+      # attempt a refresh immediately. Fires only on a large gap, so
+      # steady-state backoff behaviour is unchanged.
+      if (( tick_marker_age >= WAKE_GAP_SECONDS )); then
+        log_info "tick: wake/resume detected (gap=${tick_marker_age}s); resetting refresh backoff"
+        reset_refresh_backoff
+      fi
+
       : >"$tick_marker" 2>/dev/null || true
+
+      # Best-effort reap of orphaned fetch temp files. The EXIT/INT/TERM/HUP
+      # trap cannot run when a worker is SIGKILLed (tmux reports exit 137 /
+      # signal 9 around sleep/wake), so tracked temp files can leak. Anything
+      # older than 5 minutes is well past any live fetch (curl max-time <=30s).
+      # The -name group MUST be parenthesized so -mmin/-delete apply to every
+      # pattern, not just the last one.
+      find "$CACHE_DIR" -maxdepth 1 -type f \
+        \( -name 'codexbar.stderr.*' -o -name 'curl.cfg.*' -o -name 'oauth.body.*' \) \
+        -mmin +5 -delete 2>/dev/null || true
 
       publish_to_tmux_opts || true
       local tick_ts tick_now tick_age
       tick_ts="$(cache_updated_at)"
       tick_now="$(now_epoch)"
       tick_age=$(( tick_now - tick_ts ))
+      # A backward wall-clock step (e.g. NTP correction on wake) makes tick_age
+      # negative; treat that as stale so the recovery refresh isn't suppressed.
+      if (( tick_age < 0 )); then
+        tick_age=$STALE_AFTER_SECONDS
+      fi
       if [[ ! -f "$CACHE_FILE" ]] || (( tick_age >= STALE_AFTER_SECONDS )); then
         local fc na
         read -r fc na < <(read_refresh_backoff)
@@ -1946,6 +2057,11 @@ main() {
   ts="$(cache_updated_at)"
   now="$(now_epoch)"
   age=$(( now - ts ))
+  # A backward wall-clock step (e.g. NTP correction on wake) makes age negative;
+  # treat that as stale so the recovery refresh isn't suppressed.
+  if (( age < 0 )); then
+    age=$STALE_AFTER_SECONDS
+  fi
 
   if [[ ! -f "$CACHE_FILE" ]] || (( age >= STALE_AFTER_SECONDS )); then
     mkdir -p "$CACHE_DIR"

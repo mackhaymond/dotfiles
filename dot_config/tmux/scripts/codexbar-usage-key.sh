@@ -69,9 +69,9 @@ refresh_usage_in_background() {
   # preview long enough for fresh reset data to be visible. Do not re-open an
   # already-expired preview; that feels like prefix+u fired by itself.
   if (( seconds > 0 )); then
-    tmux run-shell -b "bash $status_script_q --refresh >/dev/null 2>&1 || true; n=\$(tmux show-option -gqv @codexbar_reset_preview_nonce 2>/dev/null || true); preview_until=\$(tmux show-option -gqv @codexbar_reset_preview_until 2>/dev/null || echo 0); now=\$(date +%s); if [ \"\$n\" = $nonce_q ] && { [ \"\$preview_until\" = -1 ] || [ \"\${preview_until:-0}\" -gt \"\$now\" ] 2>/dev/null; }; then until=\$(( now + $seconds )); tmux set-option -gq @codexbar_reset_preview_until \"\$until\" >/dev/null 2>&1 || true; bash $status_script_q --publish >/dev/null 2>&1 || true; tmux refresh-client -S >/dev/null 2>&1 || true; fi" >/dev/null 2>&1 || true
+    tmux run-shell -b "CODEXBAR_USAGE_FORCE_REFRESH=1 bash $status_script_q --refresh >/dev/null 2>&1 || true; n=\$(tmux show-option -gqv @codexbar_reset_preview_nonce 2>/dev/null || true); preview_until=\$(tmux show-option -gqv @codexbar_reset_preview_until 2>/dev/null || echo 0); now=\$(date +%s); if [ \"\$n\" = $nonce_q ] && { [ \"\$preview_until\" = -1 ] || [ \"\${preview_until:-0}\" -gt \"\$now\" ] 2>/dev/null; }; then until=\$(( now + $seconds )); tmux set-option -gq @codexbar_reset_preview_until \"\$until\" >/dev/null 2>&1 || true; bash $status_script_q --publish >/dev/null 2>&1 || true; tmux refresh-client -S >/dev/null 2>&1 || true; fi" >/dev/null 2>&1 || true
   else
-    tmux run-shell -b "bash $status_script_q --refresh >/dev/null 2>&1 || true; bash $status_script_q --publish >/dev/null 2>&1 || true; tmux refresh-client -S >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    tmux run-shell -b "CODEXBAR_USAGE_FORCE_REFRESH=1 bash $status_script_q --refresh >/dev/null 2>&1 || true; bash $status_script_q --publish >/dev/null 2>&1 || true; tmux refresh-client -S >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
   fi
 }
 
