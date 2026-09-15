@@ -37,12 +37,15 @@ bind c new-window -a -c "#{pane_current_path}"
 # CMD+SHIFT+T (wezterm) → new tab at the end of all tabs, starting in $HOME.
 bind C-t new-window -a -t '{end}' -c "#{HOME}"
 
-# CMD+OPT+R (wezterm) → recreate current tab in place, same cwd. (Was
-# CMD+SHIFT+R, which now opens a claude tab at the end — see `bind K` below.)
+# CMD+OPT+T (wezterm) → recreate current tab in place, same cwd. (Was
+# CMD+SHIFT+T, then CMD+SHIFT+R; those are now the plain and claude "new tab at
+# the end" keys. OPT is the replace-this-tab modifier — see `bind C-k` below.)
 bind R new-window -a -c "#{pane_current_path}" \; kill-window -t -
 
-# CMD+R / CMD+SHIFT+R (wezterm) → the claude tabs: `k` mirrors `c` (after the
-# current tab, same cwd), `K` mirrors `C-t` (at the end, in $HOME).
+# CMD+R / CMD+SHIFT+R / CMD+OPT+R (wezterm) → the claude tabs, mirroring the
+# plain-shell keys one modifier at a time: `k` mirrors `c` (new tab after the
+# current one, same cwd), `K` mirrors `C-t` (new tab at the end, in $HOME), and
+# `C-k` mirrors `R` (replace the current tab in place, same cwd).
 #
 # claude is NOT the window's command — that would close the tab the moment you
 # quit claude. Instead the window runs the normal login shell and ZSH_AUTOSTART
@@ -52,6 +55,7 @@ bind R new-window -a -c "#{pane_current_path}" \; kill-window -t -
 # so it never leaks into claude or into `exec zsh`.
 bind k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude
 bind K new-window -a -t '{end}' -c "#{HOME}" -e ZSH_AUTOSTART=claude
+bind C-k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude \; kill-window -t -
 
 # CTRL+CMD+T (wezterm) → new tab running nushell, same cwd. The data tab:
 # JSON/yabai introspection, config surgery, API poking. $SHELL is untouched

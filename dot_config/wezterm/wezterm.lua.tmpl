@@ -135,9 +135,17 @@ config.keys = {
         }
     },
 
-    -- CMD+R / CMD+SHIFT+R: the claude tabs — exactly CMD+T / CMD+SHIFT+T, but
-    -- the new tab comes up already running claude. Send `prefix k` / `prefix K`
-    -- (see tmux.conf). The tab is a real zsh with claude started from .zshrc via
+    -- The tab keys form a matrix: T is a plain shell, R is claude; no modifier
+    -- opens after the current tab in the same cwd, SHIFT opens at the end in
+    -- $HOME, OPT replaces the current tab in place.
+    --
+    --            plain shell      claude
+    --   new      CMD+T            CMD+R
+    --   at end   CMD+SHIFT+T      CMD+SHIFT+R
+    --   replace  CMD+OPT+T        CMD+OPT+R
+    --
+    -- The claude half sends `prefix k` / `prefix K` / `prefix C-k` (see
+    -- tmux.conf). Those tabs are a real zsh with claude started from .zshrc via
     -- ZSH_AUTOSTART, so quitting claude leaves you at a zsh prompt in that tab
     -- rather than closing it.
     --
@@ -162,14 +170,25 @@ config.keys = {
         }
     },
 
-    -- CMD+OPT+R: recreate current tab in place (was CMD+SHIFT+T, then
-    -- CMD+SHIFT+R). Sends `prefix R` to tmux (see `bind R` in tmux.conf).
+    -- CMD+OPT+T: replace the current tab with a fresh shell, same cwd.
+    -- Sends `prefix R` to tmux (see `bind R` in tmux.conf).
+    {
+        key = "t",
+        mods = "CMD|ALT",
+        action = wezterm.action.Multiple {
+            wezterm.action.SendKey { key = "s", mods = "CTRL" },
+            wezterm.action.SendKey { key = "R", mods = "SHIFT" },
+        }
+    },
+
+    -- CMD+OPT+R: replace the current tab with a claude tab, same cwd.
+    -- Sends `prefix C-k` to tmux (see `bind C-k` in tmux.conf).
     {
         key = "r",
         mods = "CMD|ALT",
         action = wezterm.action.Multiple {
             wezterm.action.SendKey { key = "s", mods = "CTRL" },
-            wezterm.action.SendKey { key = "R", mods = "SHIFT" },
+            wezterm.action.SendKey { key = "k", mods = "CTRL" },
         }
     },
 
