@@ -492,6 +492,16 @@ run '~/.tmux/plugins/tpm/tpm'
 # is not a catppuccin module.
 run-shell "#{HOME}/.config/tmux/scripts/stash-statusline.sh"
 
+# Also after tpm, because catppuccin.tmux hardcodes status-right-length 100 and
+# would clobber an earlier setting. 100 cells fits the collapsed percent view
+# (~77) but not the prefix+u reset view: "S: 3h10m (3h15m) W: Mon 6pm in 6d4h
+# (Thu 1am) F: ..." runs ~112 cells, and tmux truncates status-right from the
+# RIGHT, so the overflow silently ate the trailing `session` module instead of
+# letting the bar grow leftward. The terminal is 272 columns, so there is no
+# real estate problem — only this cap. 200 leaves headroom for the widest reset
+# strings (long weekday+date projections) plus the stash chip.
+set -g status-right-length 200
+
 # --- resurrect save guard (must stay BELOW the tpm line) ---
 set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/plugins/tmux-assistant-resurrect/scripts/save-assistant-sessions.sh'; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-guard.sh'"
 
