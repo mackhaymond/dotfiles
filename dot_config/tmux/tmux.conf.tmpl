@@ -37,8 +37,21 @@ bind c new-window -a -c "#{pane_current_path}"
 # CMD+SHIFT+T (wezterm) → new tab at the end of all tabs, starting in $HOME.
 bind C-t new-window -a -t '{end}' -c "#{HOME}"
 
-# CMD+SHIFT+R (wezterm) → recreate current tab in place, same cwd.
+# CMD+OPT+R (wezterm) → recreate current tab in place, same cwd. (Was
+# CMD+SHIFT+R, which now opens a claude tab at the end — see `bind K` below.)
 bind R new-window -a -c "#{pane_current_path}" \; kill-window -t -
+
+# CMD+R / CMD+SHIFT+R (wezterm) → the claude tabs: `k` mirrors `c` (after the
+# current tab, same cwd), `K` mirrors `C-t` (at the end, in $HOME).
+#
+# claude is NOT the window's command — that would close the tab the moment you
+# quit claude. Instead the window runs the normal login shell and ZSH_AUTOSTART
+# tells .zshrc to launch claude as a child of the interactive shell, so quitting
+# it drops back to a zsh prompt in the same tab. `-e` scopes the variable to
+# this window's first process only; .zshrc unsets it before running the command,
+# so it never leaks into claude or into `exec zsh`.
+bind k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude
+bind K new-window -a -t '{end}' -c "#{HOME}" -e ZSH_AUTOSTART=claude
 
 # CTRL+CMD+T (wezterm) → new tab running nushell, same cwd. The data tab:
 # JSON/yabai introspection, config surgery, API poking. $SHELL is untouched

@@ -841,3 +841,22 @@ if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init zsh)
   done
   return $rc
 }
+
+# ─── ZSH_AUTOSTART: run a command once, in a freshly opened tab ────────────
+# Set by tmux's `new-window -e ZSH_AUTOSTART=...` (prefix k / prefix K, bound to
+# WezTerm's CMD+R / CMD+SHIFT+R) so a new tab comes up already inside claude.
+#
+# The point of doing it here rather than making claude the window's command:
+# claude runs as a CHILD of this interactive shell, so when it exits you land on
+# a normal zsh prompt in the same tab instead of the tab closing. Keep this at
+# the very end of .zshrc — everything above it must be initialized first.
+#
+# Unsetting before running drops the variable from the exported environment too,
+# so claude's own subshells, `exec zsh`, and anything spawned from this tab
+# don't re-trigger it. Must stay last; this blocks until the command exits.
+if [[ -o interactive && -n ${ZSH_AUTOSTART:-} ]]; then
+  _zsh_autostart_cmd=$ZSH_AUTOSTART
+  unset ZSH_AUTOSTART
+  eval "$_zsh_autostart_cmd"
+  unset _zsh_autostart_cmd
+fi

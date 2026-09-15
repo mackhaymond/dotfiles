@@ -135,11 +135,38 @@ config.keys = {
         }
     },
 
-    -- CMD+SHIFT+R: recreate current tab in place (was CMD+SHIFT+T).
-    -- Sends `prefix R` to tmux (see `bind R` in tmux.conf).
+    -- CMD+R / CMD+SHIFT+R: the claude tabs — exactly CMD+T / CMD+SHIFT+T, but
+    -- the new tab comes up already running claude. Send `prefix k` / `prefix K`
+    -- (see tmux.conf). The tab is a real zsh with claude started from .zshrc via
+    -- ZSH_AUTOSTART, so quitting claude leaves you at a zsh prompt in that tab
+    -- rather than closing it.
+    --
+    -- CMD+R shadows WezTerm's stock ReloadConfiguration. Nothing is lost:
+    -- automatically_reload_config is on by default, so saving this file already
+    -- reloads it.
+    {
+        key = "r",
+        mods = "CMD",
+        action = wezterm.action.Multiple {
+            wezterm.action.SendKey { key = "s", mods = "CTRL" },
+            wezterm.action.SendKey { key = "k" },
+        }
+    },
+
     {
         key = "R",
         mods = "CMD",
+        action = wezterm.action.Multiple {
+            wezterm.action.SendKey { key = "s", mods = "CTRL" },
+            wezterm.action.SendKey { key = "K", mods = "SHIFT" },
+        }
+    },
+
+    -- CMD+OPT+R: recreate current tab in place (was CMD+SHIFT+T, then
+    -- CMD+SHIFT+R). Sends `prefix R` to tmux (see `bind R` in tmux.conf).
+    {
+        key = "r",
+        mods = "CMD|ALT",
         action = wezterm.action.Multiple {
             wezterm.action.SendKey { key = "s", mods = "CTRL" },
             wezterm.action.SendKey { key = "R", mods = "SHIFT" },
