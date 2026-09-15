@@ -38,14 +38,27 @@
 # counted from the arcSync launches in `log show`), gave up, and nothing on the
 # machine ever tried again. The startup poll therefore HANDS OFF to the float sweep:
 #
-# 3. FLOAT SWEEP (`float` mode). yabairc runs this from `space_changed` and
-# `window_deminimized`. It does ONE thing -- unfloat_pins() over the current state --
-# with no `rule --apply`, no arcSync, no sudo, and exits in one query + one jq when
-# nothing pinned is floating (the common path). Landing on the window's home space
-# is the no-flip direct route; a deminimize is the one event that refreshes the
-# cached flags. It keeps retrying, bounded by a per-window backoff memo, for as long
-# as the window floats, and LOGS every attempt with the window's pre/post state so
-# the next incident can be explained (this one could not be: there was no log).
+# 3. FLOAT SWEEP (`float` mode). yabairc runs this from `space_changed`,
+# `window_deminimized` and `window_focused` (pinned apps only). It does ONE thing --
+# unfloat_pins() over the current state -- with no `rule --apply`, no arcSync, no
+# sudo, and exits in one query + one jq when nothing pinned is floating (the common
+# path). Landing on the window's home space is the no-flip direct route; a
+# deminimize is the one event that refreshes the cached flags. It keeps retrying,
+# bounded by a per-window backoff memo, for as long as the window floats, and LOGS
+# every attempt with the window's pre/post state so the next incident can be
+# explained (this one could not be: there was no log).
+#
+# 4. THE RECURRING CASE: CLAUDE DESKTOP'S STEALTH UPDATE (found 2026-09-15). Every
+# auto-update ends in a "[stealth-relaunch]" (main.log): ShipIt relaunches the app,
+# which brings its window back BEHIND everything so the update goes unnoticed --
+# `setAlwaysOnTop(true, "normal", -1)` + `showInactive()` in app.asar, i.e. CG window
+# level -1 -- and restores level 0 only on the window's first `focus` event. yabai
+# refuses to manage any window whose level is not 0, so the relaunched window is
+# classified FLOAT at creation and every sweep pass is a no-op (reconcile.log shows
+# `lvl:-1` on each drop) until the user clicks it. Not the can-move cache: `cm` is
+# true throughout. That focus is the level-restoring event, so `window_focused` is a
+# sweep trigger too, and one that bypasses the backoff memo like a deminimize does.
+# Seen on 10 updates between 2026-08-25 and 2026-09-14 -- roughly every release.
 #
 # STARTUP mode POLLS UNTIL STABLE: re-load the scripting addition once, then
 # repeatedly re-apply the space= rules, re-pin Arc, and un-float any misclassified
@@ -166,11 +179,18 @@ PIN_HOMES=$(yabai_home_map_json)
 MAX_ATTEMPTS=10
 
 # Float-mode backoff: after this many consecutive dropped un-floats, skip the window
-# for BACKOFF_SECONDS unless the triggering event is one that refreshes yabai's cache
-# (a deminimize). Without this a window stuck for good would cost a toggle + a query
-# on every space switch, forever.
+# for BACKOFF_SECONDS unless the triggering event is one that changes what blocked it
+# (a deminimize refreshes yabai's cache; a focus is when Claude Desktop's stealth
+# relaunch restores its window level, see header §4). Without this a window stuck
+# for good would cost a toggle + a query on every space switch, forever.
 MAX_FAILS=3
 BACKOFF_SECONDS=600
+
+# Events that may bypass the backoff memo (see above).
+case "${YABAI_EVENT:-}" in
+  window_deminimized|window_focused) BYPASS_BACKOFF=1 ;;
+  *)                                 BYPASS_BACKOFF=0 ;;
+esac
 
 # Space index -> label, plus the label of the FOCUSED space. Focused, not merely
 # visible: yabai re-tiles an un-floated window onto space_manager_active_space(),
@@ -366,7 +386,7 @@ unfloat_pins() {
       read -r fails when <<<"$(memo_get "$id")"
       fails=${fails:-0}; when=${when:-0}
       if [ "$fails" -ge "$MAX_FAILS" ] && [ $((now - when)) -lt "$BACKOFF_SECONDS" ] \
-         && [ "${YABAI_EVENT:-}" != window_deminimized ]; then
+         && [ "$BYPASS_BACKOFF" = 0 ]; then
         continue
       fi
     fi
@@ -437,6 +457,11 @@ EOF
 
 # ---------------------------------------------------------------------------------
 if [ "$MODE" = float ]; then
+  # A focus signal fires before the app's own focus handler has run; Claude Desktop
+  # restores its window level (header §4) in that handler, asynchronously, so give it
+  # a beat or the query below still sees level -1 and the toggle is dropped again.
+  # Only on this event -- the sweep must stay ~40 ms on a space switch.
+  [ "${YABAI_EVENT:-}" = window_focused ] && sleep 0.3
   # Common path: nothing pinned and eligible is floating -> one query, one jq, exit.
   win=$(yabai -m query --windows 2>/dev/null) || exit 0
   printf '%s' "$win" | jq -e --argjson home "$PIN_HOMES" "

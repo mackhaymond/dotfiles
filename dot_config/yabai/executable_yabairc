@@ -135,8 +135,16 @@ yabai -m rule --apply
 # yabai's cached flags). Common path is one query + one jq, then exit. Own lock,
 # never overlaps a live startup poll, never touches focus, no rule --apply/arcSync.
 # Log: ~/Library/Logs/yabai/reconcile.log.
+#
+# Third trigger, window_focused (2026-09-15): Claude Desktop's stealth auto-update
+# relaunches its window at CG level -1 (behind everything, on purpose) and restores
+# level 0 only when the window is first focused; yabai won't manage a level != 0
+# window, so it floats from creation and every space_changed pass drops until that
+# click. The click IS the fixing event, so sweep on it. Filtered to the pinned apps
+# in yabai (app=), so focusing anything else forks nothing.
 yabai -m signal --add event=space_changed      label=float_sweep_space_changed action="YABAI_EVENT=space_changed '$YABAI_STARTUP_RECONCILE' float"
 yabai -m signal --add event=window_deminimized label=float_sweep_deminimized   action="YABAI_EVENT=window_deminimized '$YABAI_STARTUP_RECONCILE' float"
+yabai -m signal --add event=window_focused     label=float_sweep_focused app="$YABAI_PINNED_APPS_RE" action="YABAI_EVENT=window_focused '$YABAI_STARTUP_RECONCILE' float"
 
 # Border any floating windows that already exist at startup (e.g. a manage=off app
 # that macOS restored). Backgrounded; no-op if nothing floats / borders absent.

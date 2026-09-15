@@ -53,6 +53,12 @@ YABAI_AGENT_APPS_RE="^($(printf '%s' "$YABAI_AGENT_APPS" | sed 's/[()]/\\&/g'))$
 # `case` copies; folding those in is a worthwhile follow-up, not a silent one.
 YABAI_PINNED_HOMES="wezterm-gui:terminal|WezTerm:terminal|Todoist:todo|Granola:schedule|Spark Mail:mail|Notion Calendar:calendar|Messages:messages|ChatGPT:ai|Claude:ai"
 
+# Every app the float sweep can act on -- the pinned map's app names plus the agent
+# apps -- as one anchored yabai regex, for the `window_focused` sweep signal's app=
+# filter (yabairc). Same escaping as YABAI_AGENT_APPS_RE.
+# shellcheck disable=SC2034
+YABAI_PINNED_APPS_RE="^($(printf '%s' "$YABAI_PINNED_HOMES" | sed 's/:[^|]*//g')|$(printf '%s' "$YABAI_AGENT_APPS" | sed 's/[()]/\\&/g'))$"
+
 # --- shared state + logs ---------------------------------------------------------
 # One FIXED directory for every lock, marker and memo the yabai_* scripts share.
 # NOT `${TMPDIR:-/tmp}`: the scripts are launched from three different parents
