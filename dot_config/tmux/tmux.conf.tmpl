@@ -131,6 +131,9 @@ set -gF @catppuccin_custom_plugin_dir "#{HOME}/.config/tmux/catppuccin-custom"
 # Safe defaults for custom modules (can be overridden per-host).
 set -g @codex_session_color "colour239"
 set -g @codex_weekly_color "colour239"
+set -g @codex_scoped_color "colour239"
+# Superseded by @codex_scoped_color; still set for the codex_fable module,
+# which exists only for servers that have not re-sourced this file yet.
 set -g @codex_fable_color "colour239"
 set -g @codexbar_view "percent"
 
@@ -146,9 +149,24 @@ set -g @codexbar_view "percent"
 # set -g @coffee_color "#209fb5"
 
 # Codexbar defaults ("plugin-like" surface); setup script reads these.
-# @codexbar_provider: "codex" delegates to the codexbar CLI tool against the
-# codex provider. "claude" hits Anthropic's OAuth /api/oauth/usage endpoint
-# directly (real session+weekly reset times).
+#
+# TWO AXES. @codexbar_providers is who gets FETCHED — both, so the numbers are
+# on hand for every surface that wants them (this bar, UsageBar's popover,
+# CuaNotch's usage panel, all reading ~/.cache/codexbar-tmux/usage.json).
+# @codexbar_display_provider is which ONE of them this status line renders,
+# because three modules is already the whole right-hand side.
+#
+#   claude  Anthropic's OAuth /api/oauth/usage endpoint, directly (real
+#           session + weekly reset times, and the model-scoped weekly cap)
+#   codex   the codexbar CLI against the codex provider
+#
+# Each provider keeps its own block in the cache and its own backoff ladder,
+# so one failing never blanks or throttles the other. Flip the line below to
+# "codex" to read Codex's numbers in the bar; nothing else has to change.
+set -g @codexbar_providers "claude codex"
+set -g @codexbar_display_provider "claude"
+# Legacy single-valued option: still honoured as the default for BOTH of the
+# above when they are unset, so an older config keeps its exact behaviour.
 set -g @codexbar_provider "claude"
 set -g @codexbar_reset_key "u"
 set -g @codexbar_reset_view_seconds "3"
@@ -158,9 +176,14 @@ set -g @codexbar_debug "0"
 set -g @codexbar_web_timeout "2"
 set -g @codexbar_auth_required_color "#cba6f7"
 set -g @codexbar_auth_required_text "Need to log in"
-# Model whose weekly model-scoped limit the codex_fable module tracks (matched
-# case-insensitively by prefix against the limit's scope model display name).
-set -g @codexbar_fable_model "Fable"
+# Model whose weekly model-scoped limit the codex_scoped module tracks on the
+# claude provider (matched case-insensitively by prefix against the limit's
+# scope model display name, so "Fable" still selects "Fable 5.1"). The module
+# is labelled with whatever the endpoint calls the limit it matched, not with
+# this. On codex the same module shows that provider's reserve window instead;
+# this option has no effect there. Formerly @codexbar_fable_model, which is
+# still read when this is unset.
+set -g @codexbar_scoped_model "Fable"
 
 # Ensure the old inline binding is removed on reload.
 unbind u
@@ -178,7 +201,7 @@ run-shell -b "bash #{HOME}/.config/tmux/scripts/codexbar-usage-status.sh --tick"
 # set -g @catppuccin_status_modules_right "application session battery date_time"
 # Coffee (caffeinate) and battery modules disabled.
 # set -g @catppuccin_status_modules_right "directory codex_session codex_weekly codex_fable session coffee battery"
-set -g @catppuccin_status_modules_right "directory codex_session codex_weekly codex_fable session"
+set -g @catppuccin_status_modules_right "directory codex_session codex_weekly codex_scoped session"
 set -g @catppuccin_date_time_text "%I:%M %p | %m-%d-%y"
 set -g @catppuccin_status_left_separator "█"
 

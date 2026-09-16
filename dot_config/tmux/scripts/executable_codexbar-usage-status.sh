@@ -13,6 +13,14 @@ LOCKDIR="${CACHE_FILE}.lock"
 # "sr"/"wr"/"fr" fields let us discard samples that belong to a previous
 # rolling window when projecting forward. Lines written before the fable
 # module existed have no "f"/"fr" and are simply never selected for it.
+#
+# THIS FILE IS CLAUDE'S, AND ONLY CLAUDE'S. A second provider gets its own
+# history file with the SAME short keys (history_file_for), rather than new
+# letters on these lines: CuaNotch pins the s/w/f case block in
+# pace_recent_rate against its own reader, and a per-provider FILE keeps that
+# mapping — and every line already written — exactly as it is. Same reasoning
+# for usage-raw.json. The whole cross-repo contract is spelled out above
+# write_usage_cache.
 HISTORY_FILE="${CACHE_DIR}/usage-history.jsonl"
 HISTORY_MAX_LINES=120
 HISTORY_RECENT_WINDOW_SECONDS=1800
@@ -100,19 +108,132 @@ WEB_TIMEOUT_SECONDS="$(clamp_int_range "$(opt_or_env_or_default '@codexbar_web_t
 AUTH_REQUIRED_COLOR="$(opt_or_env_or_default '@codexbar_auth_required_color' 'CODEXBAR_USAGE_AUTH_REQUIRED_COLOR' '#cba6f7')"
 AUTH_REQUIRED_TEXT="$(opt_or_env_or_default '@codexbar_auth_required_text' 'CODEXBAR_USAGE_AUTH_REQUIRED_TEXT' 'Need to log in')"
 
-# The third module tracks the model-scoped weekly limit the OAuth usage
-# endpoint reports under .limits[] with kind "weekly_scoped". Matched by the
+# The third window ("scoped") is whichever narrower cap the provider reports
+# alongside its session and weekly ones. On Claude that is the model-scoped
+# weekly limit under .limits[] with kind "weekly_scoped", matched by the
 # scope's model display name, case-insensitively and by prefix, so a versioned
-# name ("Fable 5.1") still matches.
-FABLE_MODEL_NAME="$(opt_or_env_or_default '@codexbar_fable_model' 'CODEXBAR_USAGE_FABLE_MODEL' 'Fable')"
+# name ("Fable 5.1") still matches. On Codex it is the reserve window in
+# .usage.extraRateWindows[]. The KEY is structural ("scoped") and the NAME is
+# whatever the provider calls it, published as <family>_label — the key used
+# to be "fable", which named one provider's model in a slot the other provider
+# fills with something else entirely.
+SCOPED_MODEL_NAME="$(opt_or_env_or_default '@codexbar_scoped_model' 'CODEXBAR_USAGE_SCOPED_MODEL' '')"
+if [[ -z "${SCOPED_MODEL_NAME:-}" ]]; then
+  SCOPED_MODEL_NAME="$(opt_or_env_or_default '@codexbar_fable_model' 'CODEXBAR_USAGE_FABLE_MODEL' 'Fable')"
+fi
 
-USAGE_PROVIDER="$(opt_or_env_or_default '@codexbar_provider' 'CODEXBAR_USAGE_PROVIDER' 'codex')"
-case "$USAGE_PROVIDER" in
-  claude|codex) ;;
-  *) USAGE_PROVIDER='codex' ;;
-esac
+# ── Providers ───────────────────────────────────────────────────────────────
+#
+# TWO AXES, DELIBERATELY SEPARATE.
+#
+#   @codexbar_providers        which providers get FETCHED. Normally both:
+#                              the numbers are cheap to hold and every reader
+#                              downstream (the notch's panel, UsageBar's
+#                              popover) wants them side by side.
+#   @codexbar_display_provider which ONE of them the tmux status line renders.
+#                              Three modules is already the whole right-hand
+#                              side of the bar; six would be a second bar.
+#
+# The legacy single-valued @codexbar_provider still works and seeds both, so a
+# config that predates this reads exactly as it did.
+PROVIDER_PRIMARY='claude'   # whose numbers the TOP LEVEL of usage.json carries
 
-BACKOFF_FILE="${CACHE_DIR}/refresh_backoff_${USAGE_PROVIDER}"
+provider_is_known() {
+  case "${1:-}" in
+    claude|codex) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+provider_label_for() {
+  case "${1:-}" in
+    claude) printf '%s' 'Claude' ;;
+    codex)  printf '%s' 'Codex' ;;
+    *)      printf '%s' "${1:-}" ;;
+  esac
+}
+
+# Accepts "claude codex", "claude,codex" or any mix; drops unknown names and
+# duplicates while keeping the order the user wrote.
+normalize_provider_list() {
+  local raw="${1:-}" seen=' ' out='' p
+  for p in ${raw//,/ }; do
+    provider_is_known "$p" || continue
+    [[ "$seen" == *" $p "* ]] && continue
+    seen+="$p "
+    out+="${out:+ }$p"
+  done
+  printf '%s' "$out"
+}
+
+USAGE_PROVIDER_LEGACY="$(opt_or_env_or_default '@codexbar_provider' 'CODEXBAR_USAGE_PROVIDER' '')"
+
+USAGE_PROVIDERS="$(normalize_provider_list "$(opt_or_env_or_default '@codexbar_providers' 'CODEXBAR_USAGE_PROVIDERS' '')")"
+if [[ -z "${USAGE_PROVIDERS:-}" ]]; then
+  USAGE_PROVIDERS="$(normalize_provider_list "$USAGE_PROVIDER_LEGACY")"
+fi
+if [[ -z "${USAGE_PROVIDERS:-}" ]]; then
+  USAGE_PROVIDERS='claude codex'
+fi
+
+provider_enabled() {
+  local want="${1:-}" p
+  for p in $USAGE_PROVIDERS; do
+    [[ "$p" == "$want" ]] && return 0
+  done
+  return 1
+}
+
+DISPLAY_PROVIDER="$(opt_or_env_or_default '@codexbar_display_provider' 'CODEXBAR_USAGE_DISPLAY_PROVIDER' '')"
+provider_is_known "$DISPLAY_PROVIDER" || DISPLAY_PROVIDER=''
+if [[ -z "${DISPLAY_PROVIDER:-}" ]] && provider_is_known "$USAGE_PROVIDER_LEGACY"; then
+  DISPLAY_PROVIDER="$USAGE_PROVIDER_LEGACY"
+fi
+if [[ -z "${DISPLAY_PROVIDER:-}" ]] || ! provider_enabled "$DISPLAY_PROVIDER"; then
+  DISPLAY_PROVIDER="${USAGE_PROVIDERS%% *}"
+fi
+
+# Per-provider file layout. The PRIMARY provider keeps the unsuffixed names,
+# because those three names are a cross-repo contract: CuaNotch and UsageBar
+# both read them and neither writes them (dev/check-invariants §17 in cua-notch
+# pins them against this script). A second provider gets suffixed files with
+# identical INTERNAL shape — same short history keys, same fields — so every
+# reader is one filename away from handling any number of providers.
+history_file_for() {
+  if [[ "${1:-}" == "$PROVIDER_PRIMARY" ]]; then
+    printf '%s' "$HISTORY_FILE"
+  else
+    printf '%s' "${CACHE_DIR}/usage-history-${1}.jsonl"
+  fi
+}
+
+raw_file_for() {
+  if [[ "${1:-}" == "$PROVIDER_PRIMARY" ]]; then
+    printf '%s' "${CACHE_DIR}/usage-raw.json"
+  else
+    printf '%s' "${CACHE_DIR}/usage-raw-${1}.json"
+  fi
+}
+
+backoff_file_for() {
+  printf '%s' "${CACHE_DIR}/refresh_backoff_${1}"
+}
+
+# Everything that is per-provider state — which history file pacing reads,
+# which backoff ladder a failure arms, what the log line says — hangs off this
+# one setter, so a caller switches providers in a single call and cannot half
+# switch (the bug shape when three globals are set at three call sites).
+ACTIVE_PROVIDER=''
+ACTIVE_HISTORY_FILE="$HISTORY_FILE"
+BACKOFF_FILE="$(backoff_file_for "$DISPLAY_PROVIDER")"
+
+select_provider() {
+  ACTIVE_PROVIDER="${1:-}"
+  ACTIVE_HISTORY_FILE="$(history_file_for "$ACTIVE_PROVIDER")"
+  BACKOFF_FILE="$(backoff_file_for "$ACTIVE_PROVIDER")"
+}
+
+select_provider "$DISPLAY_PROVIDER"
 
 USAGE_LOG_MAX_BYTES=$(( 256 * 1024 ))
 
@@ -170,25 +291,25 @@ debug_flash_codex_icons() {
     flash_color='default'
   fi
 
-  local prev_session prev_weekly prev_fable nonce
+  local prev_session prev_weekly prev_scoped nonce
   prev_session="$(tmux show-option -gqv @codex_session_color 2>/dev/null || true)"
   prev_weekly="$(tmux show-option -gqv @codex_weekly_color 2>/dev/null || true)"
-  prev_fable="$(tmux show-option -gqv @codex_fable_color 2>/dev/null || true)"
+  prev_scoped="$(tmux show-option -gqv @codex_scoped_color 2>/dev/null || true)"
 
   nonce="$(date +%s%N 2>/dev/null || date +%s)"
 
   tmux set-option -gq @codexbar_debug_flash_nonce "$nonce" >/dev/null 2>&1 || true
   tmux set-option -gq @codexbar_debug_flash_prev_session_color "$prev_session" >/dev/null 2>&1 || true
   tmux set-option -gq @codexbar_debug_flash_prev_weekly_color "$prev_weekly" >/dev/null 2>&1 || true
-  tmux set-option -gq @codexbar_debug_flash_prev_fable_color "$prev_fable" >/dev/null 2>&1 || true
+  tmux set-option -gq @codexbar_debug_flash_prev_scoped_color "$prev_scoped" >/dev/null 2>&1 || true
 
   tmux set-option -gq @codex_session_color "$flash_color" >/dev/null 2>&1 || true
   tmux set-option -gq @codex_weekly_color "$flash_color" >/dev/null 2>&1 || true
-  tmux set-option -gq @codex_fable_color "$flash_color" >/dev/null 2>&1 || true
+  tmux set-option -gq @codex_scoped_color "$flash_color" >/dev/null 2>&1 || true
   tmux refresh-client -S >/dev/null 2>&1 || true
   log_debug "flash: on color=${flash_color}"
 
-  tmux run-shell -b "sleep 0.5; n=\$(tmux show-option -gqv @codexbar_debug_flash_nonce 2>/dev/null); [ \"\$n\" = \"$nonce\" ] || exit 0; fc='$flash_color'; cs=\$(tmux show-option -gqv @codex_session_color 2>/dev/null || true); cw=\$(tmux show-option -gqv @codex_weekly_color 2>/dev/null || true); cfb=\$(tmux show-option -gqv @codex_fable_color 2>/dev/null || true); s=\$(tmux show-option -gqv @codexbar_debug_flash_prev_session_color 2>/dev/null); w=\$(tmux show-option -gqv @codexbar_debug_flash_prev_weekly_color 2>/dev/null); f=\$(tmux show-option -gqv @codexbar_debug_flash_prev_fable_color 2>/dev/null); if [ \"\$cs\" = \"\$fc\" ]; then if [ -n \"\$s\" ]; then tmux set-option -gq @codex_session_color \"\$s\"; else tmux set-option -gu @codex_session_color; fi; fi; if [ \"\$cw\" = \"\$fc\" ]; then if [ -n \"\$w\" ]; then tmux set-option -gq @codex_weekly_color \"\$w\"; else tmux set-option -gu @codex_weekly_color; fi; fi; if [ \"\$cfb\" = \"\$fc\" ]; then if [ -n \"\$f\" ]; then tmux set-option -gq @codex_fable_color \"\$f\"; else tmux set-option -gu @codex_fable_color; fi; fi; tmux refresh-client -S;" >/dev/null 2>&1 || true
+  tmux run-shell -b "sleep 0.5; n=\$(tmux show-option -gqv @codexbar_debug_flash_nonce 2>/dev/null); [ \"\$n\" = \"$nonce\" ] || exit 0; fc='$flash_color'; cs=\$(tmux show-option -gqv @codex_session_color 2>/dev/null || true); cw=\$(tmux show-option -gqv @codex_weekly_color 2>/dev/null || true); csc=\$(tmux show-option -gqv @codex_scoped_color 2>/dev/null || true); s=\$(tmux show-option -gqv @codexbar_debug_flash_prev_session_color 2>/dev/null); w=\$(tmux show-option -gqv @codexbar_debug_flash_prev_weekly_color 2>/dev/null); f=\$(tmux show-option -gqv @codexbar_debug_flash_prev_scoped_color 2>/dev/null); if [ \"\$cs\" = \"\$fc\" ]; then if [ -n \"\$s\" ]; then tmux set-option -gq @codex_session_color \"\$s\"; else tmux set-option -gu @codex_session_color; fi; fi; if [ \"\$cw\" = \"\$fc\" ]; then if [ -n \"\$w\" ]; then tmux set-option -gq @codex_weekly_color \"\$w\"; else tmux set-option -gu @codex_weekly_color; fi; fi; if [ \"\$csc\" = \"\$fc\" ]; then if [ -n \"\$f\" ]; then tmux set-option -gq @codex_scoped_color \"\$f\"; else tmux set-option -gu @codex_scoped_color; fi; fi; tmux refresh-client -S;" >/dev/null 2>&1 || true
 }
 
 script_abs_path() {
@@ -284,7 +405,7 @@ LOCK_STALE_SECONDS=120
 WAKE_GAP_SECONDS=60
 
 usage() {
-  printf '%s\n' "Usage: $0 {session|weekly|fable|--refresh|--publish|--tick|--auth-required|--login|--debug-flash-tick <nonce>}" >&2
+  printf '%s\n' "Usage: $0 {session|weekly|scoped|--refresh|--publish|--tick|--auth-required|--login|--debug-flash-tick <nonce>}" >&2
 }
 
 now_epoch() {
@@ -342,7 +463,7 @@ record_refresh_backoff_failure() {
   now="$(now_epoch)"
   next_allowed=$(( now + delay ))
 
-  log_warn "backoff: fail_count=${fail_count} next_attempt_in=${delay}s provider=${USAGE_PROVIDER}"
+  log_warn "backoff: fail_count=${fail_count} next_attempt_in=${delay}s provider=${ACTIVE_PROVIDER}"
 
   # Write atomically (mktemp + mv) so a concurrent reader in read_refresh_backoff
   # — which does not hold any lock — never observes a truncated/half-written
@@ -365,6 +486,30 @@ record_refresh_backoff_failure() {
 refresh_fail() {
   record_refresh_backoff_failure
   return 1
+}
+
+# True when at least ONE configured provider is past its own backoff. The
+# staleness gate asks this rather than asking a single ladder: with two
+# providers, the one that is failing must not hold the other off the network,
+# and the one that is healthy must not drag the failing one back onto it
+# before its ladder says so (refresh_cache re-checks per provider).
+any_provider_refresh_allowed() {
+  local now="${1:-}" p fc na allowed=1 saved="$ACTIVE_PROVIDER"
+  [[ "$now" =~ ^[0-9]+$ ]] || now="$(now_epoch)"
+
+  for p in $USAGE_PROVIDERS; do
+    select_provider "$p"
+    read -r fc na < <(read_refresh_backoff)
+    if (( now >= na )); then
+      allowed=0
+      break
+    fi
+  done
+
+  if [[ -n "${saved:-}" ]]; then
+    select_provider "$saved"
+  fi
+  return $allowed
 }
 
 iso_utc_to_epoch() {
@@ -550,10 +695,31 @@ color_for_window() {
   color_for_used_percent "$used"
 }
 
+# How fresh the NUMBERS are, which drives the staleness gate that triggers a
+# refresh. The OLDEST enabled provider's updated_at, so one provider fetching
+# happily never masks another that has stopped — and it is read from the file's
+# own fields rather than its mtime, because usage.json is now rewritten for
+# reasons that are not "these numbers are new" (another provider succeeded, a
+# failure recorded its state). Trusting mtime there would mark the cache fresh
+# after a failed fetch and suppress the retry that was the whole point.
 cache_updated_at() {
   [[ -f "$CACHE_FILE" ]] || { printf '%s' 0; return 0; }
 
-  local ts
+  local ts=''
+  if command -v jq >/dev/null 2>&1; then
+    ts="$(jq -r --argjson enabled "$(enabled_providers_json)" '
+      [ (.providers // {}) | to_entries[]
+        | select(.key as $k | $enabled | index($k))
+        | (.value.updated_at // 0) ] as $stamps
+      | (if ($stamps | length) > 0 then ($stamps | min) else (.updated_at // 0) end)
+      | floor
+    ' "$CACHE_FILE" 2>/dev/null || true)"
+  fi
+  if [[ "${ts:-}" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$ts"
+    return 0
+  fi
+
   ts="$(stat -f %m "$CACHE_FILE" 2>/dev/null || stat -c %Y "$CACHE_FILE" 2>/dev/null || true)"
   if [[ "$ts" =~ ^[0-9]+$ ]]; then
     printf '%s' "$ts"
@@ -616,7 +782,7 @@ format_time_until_reset() {
 # HISTORY_MAX_LINES entries to bound disk usage and read cost.
 append_usage_history() {
   local now="$1" session_used="$2" weekly_used="$3" session_resets="$4" weekly_resets="$5"
-  local fable_used="${6:-}" fable_resets="${7:-}"
+  local scoped_used="${6:-}" scoped_resets="${7:-}"
 
   [[ "$now" =~ ^[0-9]+$ ]] || return 0
   [[ "$session_used" =~ ^[0-9]+$ ]] || return 0
@@ -624,29 +790,32 @@ append_usage_history() {
 
   mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
 
-  local sr_json wr_json f_json fr_json
+  local file="$ACTIVE_HISTORY_FILE"
+  [[ -n "${file:-}" ]] || file="$HISTORY_FILE"
+
+  local sr_json wr_json sc_json scr_json
   sr_json='null'
   wr_json='null'
-  f_json='null'
-  fr_json='null'
+  sc_json='null'
+  scr_json='null'
   [[ "$session_resets" =~ ^[0-9]+$ ]] && sr_json="$session_resets"
   [[ "$weekly_resets"  =~ ^[0-9]+$ ]] && wr_json="$weekly_resets"
-  [[ "$fable_used"     =~ ^[0-9]+$ ]] && f_json="$fable_used"
-  [[ "$fable_resets"   =~ ^[0-9]+$ ]] && fr_json="$fable_resets"
+  [[ "$scoped_used"    =~ ^[0-9]+$ ]] && sc_json="$scoped_used"
+  [[ "$scoped_resets"  =~ ^[0-9]+$ ]] && scr_json="$scoped_resets"
 
   umask 077
-  printf '{"t":%s,"s":%s,"w":%s,"sr":%s,"wr":%s,"f":%s,"fr":%s}\n' \
-    "$now" "$session_used" "$weekly_used" "$sr_json" "$wr_json" "$f_json" "$fr_json" \
-    >>"$HISTORY_FILE" 2>/dev/null || return 0
+  printf '{"t":%s,"s":%s,"w":%s,"sr":%s,"wr":%s,"sc":%s,"scr":%s}\n' \
+    "$now" "$session_used" "$weekly_used" "$sr_json" "$wr_json" "$sc_json" "$scr_json" \
+    >>"$file" 2>/dev/null || return 0
 
   local line_count
-  line_count="$(wc -l <"$HISTORY_FILE" 2>/dev/null | tr -d ' \t' || echo 0)"
+  line_count="$(wc -l <"$file" 2>/dev/null | tr -d ' \t' || echo 0)"
   [[ "$line_count" =~ ^[0-9]+$ ]] || return 0
   if (( line_count > HISTORY_MAX_LINES )); then
     local tmp
-    tmp="$(mktemp "${HISTORY_FILE}.trim.XXXXXX" 2>/dev/null)" || return 0
-    if tail -n "$HISTORY_MAX_LINES" "$HISTORY_FILE" >"$tmp" 2>/dev/null; then
-      mv -f "$tmp" "$HISTORY_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    tmp="$(mktemp "${file}.trim.XXXXXX" 2>/dev/null)" || return 0
+    if tail -n "$HISTORY_MAX_LINES" "$file" >"$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
     else
       rm -f "$tmp" 2>/dev/null
     fi
@@ -667,7 +836,10 @@ pace_recent_rate() {
   local mode="$1" current_resets_at="$2" now="$3"
   local window_seconds="${4:-1800}" min_span_seconds="${5:-0}"
 
-  [[ -f "$HISTORY_FILE" ]] || return 0
+  local history_file="$ACTIVE_HISTORY_FILE"
+  [[ -n "${history_file:-}" ]] || history_file="$HISTORY_FILE"
+
+  [[ -f "$history_file" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
   [[ "$now" =~ ^[0-9]+$ ]] || return 0
   [[ "$current_resets_at" =~ ^[0-9]+$ ]] || return 0
@@ -677,7 +849,7 @@ pace_recent_rate() {
   case "$mode" in
     session) used_key='s'; resets_key='sr' ;;
     weekly)  used_key='w'; resets_key='wr' ;;
-    fable)   used_key='f'; resets_key='fr' ;;
+    scoped)  used_key='sc'; resets_key='scr' ;;
     *) return 0 ;;
   esac
 
@@ -690,7 +862,7 @@ pace_recent_rate() {
     --arg uk "$used_key" \
     --arg rk "$resets_key" \
     'select((.t // 0) >= $c and (.[$rk] // null) == $r) | [.t, (.[$uk] // 0)]' \
-    "$HISTORY_FILE" 2>/dev/null || true)"
+    "$history_file" 2>/dev/null || true)"
   [[ -n "$samples" ]] || return 0
 
   awk -v min_span="$min_span_seconds" '
@@ -731,7 +903,7 @@ pace_recent_rate() {
 # nothing (empty stdout) when the projection is not computable.
 #
 # Args: used window_minutes resets_at now [mode]
-#   mode = "session", "weekly" or "fable" - enables the recent-rate path.
+#   mode = "session", "weekly" or "scoped" - enables the recent-rate path.
 #   Omit to force long-term-only behavior (used by tests).
 pace_eta_seconds() {
   local used="$1" window_minutes="$2" resets_at="$3" now="$4" mode="${5:-}"
@@ -1081,13 +1253,24 @@ effective_view_from_context() {
       [[ "$mode" == 'session' ]] && printf '%s' 'reset' || printf '%s' "$PRINT_VIEW_BASELINE"
       ;;
     weekly)
-      # fable is a weekly-window limit, so it follows the weekly scope.
-      [[ "$mode" == 'weekly' || "$mode" == 'fable' ]] && printf '%s' 'reset' || printf '%s' "$PRINT_VIEW_BASELINE"
+      # the scoped window is a weekly-window limit, so it follows the weekly scope.
+      [[ "$mode" == 'weekly' || "$mode" == 'scoped' ]] && printf '%s' 'reset' || printf '%s' "$PRINT_VIEW_BASELINE"
       ;;
   esac
 }
 
+# Load one provider's fields out of the cache. Defaults to the display
+# provider; pass a name to read another block.
+#
+# THE SELECTOR IS A PREFIX, NOT A RESHAPE. `(.providers[$p] // …)` picks the
+# block and the field list below is unchanged — same names, same order, same
+# @tsv — because a provider block carries exactly the key names the top level
+# does. That is also what keeps cua-notch's invariant check on this line
+# meaningful: it reads the field list to learn which window families exist,
+# and the families are a property of a block, not of the root.
 load_cache_fields() {
+  local provider="${1:-$DISPLAY_PROVIDER}"
+
   CACHE_STATE='ok'
   CACHE_SESSION_TEXT=''
   CACHE_WEEKLY_TEXT=''
@@ -1099,11 +1282,12 @@ load_cache_fields() {
   CACHE_WEEKLY_USED=''
   CACHE_SESSION_WINDOW_MINUTES=''
   CACHE_WEEKLY_WINDOW_MINUTES=''
-  CACHE_FABLE_TEXT=''
-  CACHE_FABLE_COLOR=''
-  CACHE_FABLE_RESETS=''
-  CACHE_FABLE_USED=''
-  CACHE_FABLE_WINDOW_MINUTES=''
+  CACHE_SCOPED_TEXT=''
+  CACHE_SCOPED_COLOR=''
+  CACHE_SCOPED_RESETS=''
+  CACHE_SCOPED_USED=''
+  CACHE_SCOPED_WINDOW_MINUTES=''
+  CACHE_SCOPED_LABEL=''
 
   [[ -f "$CACHE_FILE" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
@@ -1115,9 +1299,11 @@ load_cache_fields() {
   # tail fields off the end. Use a non-whitespace separator (US, \037) so empty
   # fields survive; @tsv escapes any literal tab in a value, so this is lossless.
   local parsed
-  parsed="$(jq -r '[.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//"", .fable_text//"", .fable_color//"", .fable_resets_at//"", .fable_used//"", .fable_window_minutes//""] | @tsv' "$CACHE_FILE" 2>/dev/null | tr '\t' '\037' || true)"
+  parsed="$(jq -r --arg p "$provider" --arg primary "$PROVIDER_PRIMARY" \
+    '((.providers[$p]? // (if $p == $primary then . else {} end)) // {}) | [.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//"", .scoped_text//"", .scoped_color//"", .scoped_resets_at//"", .scoped_used//"", .scoped_window_minutes//"", .scoped_label//""] | @tsv' \
+    "$CACHE_FILE" 2>/dev/null | tr '\t' '\037' || true)"
   [[ -n "$parsed" ]] || return 0
-  IFS=$'\037' read -r CACHE_STATE CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES CACHE_FABLE_TEXT CACHE_FABLE_COLOR CACHE_FABLE_RESETS CACHE_FABLE_USED CACHE_FABLE_WINDOW_MINUTES <<<"$parsed"
+  IFS=$'\037' read -r CACHE_STATE CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES CACHE_SCOPED_TEXT CACHE_SCOPED_COLOR CACHE_SCOPED_RESETS CACHE_SCOPED_USED CACHE_SCOPED_WINDOW_MINUTES CACHE_SCOPED_LABEL <<<"$parsed"
 }
 
 render_text_for_mode() {
@@ -1150,15 +1336,15 @@ render_text_for_mode() {
         window_minutes="$CACHE_WEEKLY_WINDOW_MINUTES"
         out="$(format_weekly_reset_text "$resets_at" "$used" "$window_minutes" "$now")"
         ;;
-      fable)
-        resets_at="$CACHE_FABLE_RESETS"
-        used="$CACHE_FABLE_USED"
-        window_minutes="$CACHE_FABLE_WINDOW_MINUTES"
+      scoped)
+        resets_at="$CACHE_SCOPED_RESETS"
+        used="$CACHE_SCOPED_USED"
+        window_minutes="$CACHE_SCOPED_WINDOW_MINUTES"
         if [[ -z "$used" ]]; then
-          # The provider reported no Fable-scoped weekly limit at all.
+          # The provider reported no narrower scoped window at all.
           out='n/a'
         else
-          out="$(format_weekly_reset_text "$resets_at" "$used" "$window_minutes" "$now" "fable")"
+          out="$(format_weekly_reset_text "$resets_at" "$used" "$window_minutes" "$now" "scoped")"
         fi
         ;;
     esac
@@ -1166,7 +1352,7 @@ render_text_for_mode() {
     case "$mode" in
       session) out="$CACHE_SESSION_TEXT" ;;
       weekly)  out="$CACHE_WEEKLY_TEXT" ;;
-      fable)   out="$CACHE_FABLE_TEXT" ;;
+      scoped)  out="$CACHE_SCOPED_TEXT" ;;
     esac
     if [[ -z "$out" ]]; then
       out="--%"
@@ -1178,11 +1364,41 @@ render_text_for_mode() {
   printf '%s%s' "$out" "$debug_suffix"
 }
 
+# The status line renders ONE provider. Everything below is that provider's
+# numbers; which provider it is comes from @codexbar_display_provider and is
+# published alongside them as @codex_provider / @codex_provider_label, so a
+# status-line format can say whose numbers these are without asking the
+# option back.
+#
+# The @codex_fable_* options are still published as aliases of the scoped
+# ones. A tmux server that has not re-sourced tmux.conf since the rename is
+# still running the old module definitions, and a status line that silently
+# empties is exactly the failure this rename was meant to stop having.
+publish_text_and_alias() {
+  local opt="${1:-}" alias_opt="${2:-}" value="${3:-}"
+
+  tmux set-option -gq "$opt" "$value" >/dev/null 2>&1 || true
+  [[ -n "${alias_opt:-}" ]] && tmux set-option -gq "$alias_opt" "$value" >/dev/null 2>&1 || true
+  return 0
+}
+
+# "Fable" -> "F:", "gpt-reserve" -> "G:". Empty for an unnamed window, which
+# leaves the module's own default in place rather than publishing a colon.
+icon_for_label() {
+  local label="${1:-}"
+  [[ -n "${label:-}" ]] || { printf '%s' ''; return 0; }
+
+  local first="${label:0:1}"
+  [[ "$first" =~ ^[A-Za-z0-9]$ ]] || { printf '%s' ''; return 0; }
+
+  printf '%s:' "$(printf '%s' "$first" | tr '[:lower:]' '[:upper:]')"
+}
+
 publish_to_tmux_opts() {
   command -v tmux >/dev/null 2>&1 || return 0
 
   load_print_context
-  load_cache_fields
+  load_cache_fields "$DISPLAY_PROVIDER"
 
   local debug_suffix=''
   if (( CODEXBAR_USAGE_DEBUG != 0 )); then
@@ -1191,31 +1407,35 @@ publish_to_tmux_opts() {
     debug_suffix=" d${c}"
   fi
 
-  local session_view weekly_view fable_view session_text weekly_text fable_text
+  local session_view weekly_view scoped_view session_text weekly_text scoped_text
   session_view="$(effective_view_from_context session)"
   weekly_view="$(effective_view_from_context weekly)"
-  fable_view="$(effective_view_from_context fable)"
+  scoped_view="$(effective_view_from_context scoped)"
   session_text="$(render_text_for_mode session "$session_view" "$debug_suffix")"
   weekly_text="$(render_text_for_mode weekly  "$weekly_view"  "$debug_suffix")"
-  fable_text="$(render_text_for_mode fable   "$fable_view"   "$debug_suffix")"
+  scoped_text="$(render_text_for_mode scoped  "$scoped_view"  "$debug_suffix")"
 
-  tmux set-option -gq @codex_session_text "$session_text" >/dev/null 2>&1 || true
-  tmux set-option -gq @codex_weekly_text  "$weekly_text"  >/dev/null 2>&1 || true
-  tmux set-option -gq @codex_fable_text   "$fable_text"   >/dev/null 2>&1 || true
+  publish_text_and_alias @codex_session_text '' "$session_text"
+  publish_text_and_alias @codex_weekly_text  '' "$weekly_text"
+  publish_text_and_alias @codex_scoped_text  @codex_fable_text "$scoped_text"
+
+  tmux set-option -gq @codex_provider "$DISPLAY_PROVIDER" >/dev/null 2>&1 || true
+  tmux set-option -gq @codex_provider_label "$(provider_label_for "$DISPLAY_PROVIDER")" >/dev/null 2>&1 || true
+  tmux set-option -gq @codex_scoped_icon "$(icon_for_label "$CACHE_SCOPED_LABEL")" >/dev/null 2>&1 || true
 
   if [[ "$CACHE_STATE" == "auth_required" ]]; then
-    tmux set-option -gq @codex_session_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
-    tmux set-option -gq @codex_weekly_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
-    tmux set-option -gq @codex_fable_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
+    publish_text_and_alias @codex_session_color '' "$AUTH_REQUIRED_COLOR"
+    publish_text_and_alias @codex_weekly_color  '' "$AUTH_REQUIRED_COLOR"
+    publish_text_and_alias @codex_scoped_color  @codex_fable_color "$AUTH_REQUIRED_COLOR"
   else
     if [[ -n "$CACHE_SESSION_COLOR" ]]; then
-      tmux set-option -gq @codex_session_color "$CACHE_SESSION_COLOR" >/dev/null 2>&1 || true
+      publish_text_and_alias @codex_session_color '' "$CACHE_SESSION_COLOR"
     fi
     if [[ -n "$CACHE_WEEKLY_COLOR" ]]; then
-      tmux set-option -gq @codex_weekly_color "$CACHE_WEEKLY_COLOR" >/dev/null 2>&1 || true
+      publish_text_and_alias @codex_weekly_color '' "$CACHE_WEEKLY_COLOR"
     fi
-    if [[ -n "$CACHE_FABLE_COLOR" ]]; then
-      tmux set-option -gq @codex_fable_color "$CACHE_FABLE_COLOR" >/dev/null 2>&1 || true
+    if [[ -n "$CACHE_SCOPED_COLOR" ]]; then
+      publish_text_and_alias @codex_scoped_color @codex_fable_color "$CACHE_SCOPED_COLOR"
     fi
   fi
 }
@@ -1224,7 +1444,7 @@ print_value() {
   local mode="$1" view debug_suffix=''
 
   load_print_context
-  load_cache_fields
+  load_cache_fields "$DISPLAY_PROVIDER"
 
   view="$(effective_view_from_context "$mode")"
 
@@ -1236,14 +1456,14 @@ print_value() {
 
   if command -v tmux >/dev/null 2>&1; then
     if [[ "$CACHE_STATE" == "auth_required" ]]; then
-      tmux set-option -gq @codex_session_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
-      tmux set-option -gq @codex_weekly_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
-      tmux set-option -gq @codex_fable_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
+      publish_text_and_alias @codex_session_color '' "$AUTH_REQUIRED_COLOR"
+      publish_text_and_alias @codex_weekly_color  '' "$AUTH_REQUIRED_COLOR"
+      publish_text_and_alias @codex_scoped_color  @codex_fable_color "$AUTH_REQUIRED_COLOR"
     else
       case "$mode" in
-        session) [[ -n "$CACHE_SESSION_COLOR" ]] && tmux set-option -gq @codex_session_color "$CACHE_SESSION_COLOR" >/dev/null 2>&1 || true ;;
-        weekly)  [[ -n "$CACHE_WEEKLY_COLOR" ]]  && tmux set-option -gq @codex_weekly_color  "$CACHE_WEEKLY_COLOR"  >/dev/null 2>&1 || true ;;
-        fable)   [[ -n "$CACHE_FABLE_COLOR" ]]   && tmux set-option -gq @codex_fable_color   "$CACHE_FABLE_COLOR"   >/dev/null 2>&1 || true ;;
+        session) [[ -n "$CACHE_SESSION_COLOR" ]] && publish_text_and_alias @codex_session_color '' "$CACHE_SESSION_COLOR" || true ;;
+        weekly)  [[ -n "$CACHE_WEEKLY_COLOR" ]]  && publish_text_and_alias @codex_weekly_color  '' "$CACHE_WEEKLY_COLOR"  || true ;;
+        scoped)  [[ -n "$CACHE_SCOPED_COLOR" ]]  && publish_text_and_alias @codex_scoped_color  @codex_fable_color "$CACHE_SCOPED_COLOR" || true ;;
       esac
     fi
   fi
@@ -1714,29 +1934,77 @@ fetch_claude_oauth_usage_json() {
   printf '%s' "$result"
 }
 
+# One fetch's worth of output, in the shape every provider answers in. The
+# three families are structural — session (the short rolling window), weekly,
+# and scoped (whatever narrower cap the provider also enforces, if any) — and
+# each carries the same five facts, so refresh_cache renders any provider
+# through one code path.
 FETCH_SESSION_USED=''
 FETCH_WEEKLY_USED=''
-FETCH_FABLE_USED=''
+FETCH_SCOPED_USED=''
 FETCH_SESSION_WINDOW_MINUTES=''
 FETCH_WEEKLY_WINDOW_MINUTES=''
-FETCH_FABLE_WINDOW_MINUTES=''
+FETCH_SCOPED_WINDOW_MINUTES=''
 FETCH_SESSION_RESETS_AT=''
 FETCH_WEEKLY_RESETS_AT=''
-FETCH_FABLE_RESETS_AT=''
+FETCH_SCOPED_RESETS_AT=''
+FETCH_SESSION_LABEL='Session'
+FETCH_WEEKLY_LABEL='Weekly'
+FETCH_SCOPED_LABEL=''
+FETCH_SESSION_SEVERITY='normal'
+FETCH_WEEKLY_SEVERITY='normal'
+FETCH_SCOPED_SEVERITY='normal'
+FETCH_SESSION_LOCKED=0
+FETCH_WEEKLY_LOCKED=0
+FETCH_SCOPED_LOCKED=0
+# What spent the window, as the provider itself breaks it down: a JSON array
+# of {key, display_name, percent}. Published in the provider's block so a
+# reader gets it without opening the raw file. "[]" where the provider has no
+# such breakdown, which is every provider but Claude today.
+FETCH_BREAKDOWN_JSON='[]'
 FETCH_AUTH_REQUIRED=0
 
 reset_fetch_outputs() {
   FETCH_SESSION_USED=''
   FETCH_WEEKLY_USED=''
-  FETCH_FABLE_USED=''
+  FETCH_SCOPED_USED=''
   FETCH_SESSION_WINDOW_MINUTES=''
   FETCH_WEEKLY_WINDOW_MINUTES=''
-  FETCH_FABLE_WINDOW_MINUTES=''
+  FETCH_SCOPED_WINDOW_MINUTES=''
   FETCH_SESSION_RESETS_AT=''
   FETCH_WEEKLY_RESETS_AT=''
-  FETCH_FABLE_RESETS_AT=''
+  FETCH_SCOPED_RESETS_AT=''
+  FETCH_SESSION_LABEL='Session'
+  FETCH_WEEKLY_LABEL='Weekly'
+  FETCH_SCOPED_LABEL=''
+  FETCH_SESSION_SEVERITY='normal'
+  FETCH_WEEKLY_SEVERITY='normal'
+  FETCH_SCOPED_SEVERITY='normal'
+  FETCH_SESSION_LOCKED=0
+  FETCH_WEEKLY_LOCKED=0
+  FETCH_SCOPED_LOCKED=0
+  FETCH_BREAKDOWN_JSON='[]'
   FETCH_AUTH_REQUIRED=0
   CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED=0
+}
+
+# Persist a provider's raw payload next to the summary, for consumers that
+# want more than the three percentages. Claude's keeps the unsuffixed name
+# (usage-raw.json) because that name is part of the published contract.
+persist_raw_payload() {
+  local provider="${1:-}" payload="${2:-}"
+
+  [[ -n "${provider:-}" && -n "${payload:-}" ]] || return 0
+
+  local target tmp
+  target="$(raw_file_for "$provider")"
+  tmp="$(umask 077 && mktemp "${target}.tmp.XXXXXX" 2>/dev/null)" || return 0
+  if printf '%s\n' "$payload" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$target" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  else
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+  return 0
 }
 
 fetch_via_codexbar_codex() {
@@ -1836,6 +2104,47 @@ fetch_via_codexbar_codex() {
     FETCH_WEEKLY_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
   fi
 
+  # Codex's third window. `tertiary` when the account has one; otherwise the
+  # first extra rate window CodexBar reports (today: "gpt-reserve", a 7-day
+  # reserve pool). Named by the provider, not by us — see SCOPED_MODEL_NAME.
+  # Absent is normal and is not a failure: the block publishes scoped_used
+  # null and the module renders "n/a".
+  local scoped_limit
+  scoped_limit="$(printf '%s' "$normalized" | jq -c '
+    (.usage.tertiary? | select(type == "object" and (.usedPercent? != null)))
+    // ([ .usage.extraRateWindows[]?
+          | select((.window?.usedPercent? // null) != null)
+          | (.window + {title: (.title // .id // "")}) ] | first)
+    // empty
+  ' 2>/dev/null || true)"
+
+  if [[ -n "${scoped_limit:-}" ]]; then
+    FETCH_SCOPED_USED="$(printf '%s' "$scoped_limit" | jq -er '.usedPercent | tonumber' 2>/dev/null || true)"
+    if [[ -n "${FETCH_SCOPED_USED:-}" ]]; then
+      FETCH_SCOPED_WINDOW_MINUTES="$(printf '%s' "$scoped_limit" | jq -er '.windowMinutes // empty | tonumber' 2>/dev/null || true)"
+      FETCH_SCOPED_LABEL="$(printf '%s' "$scoped_limit" | jq -er -r '.title // empty' 2>/dev/null || true)"
+      [[ -n "${FETCH_SCOPED_LABEL:-}" ]] || FETCH_SCOPED_LABEL='Reserve'
+
+      iso="$(printf '%s' "$scoped_limit" | jq -er -r '.resetsAt // empty | tostring' 2>/dev/null || true)"
+      if [[ -n "${iso:-}" ]]; then
+        FETCH_SCOPED_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
+      fi
+      if [[ -z "${FETCH_SCOPED_RESETS_AT:-}" ]]; then
+        local scoped_description
+        scoped_description="$(printf '%s' "$scoped_limit" | jq -er -r '.resetDescription // empty | tostring' 2>/dev/null || true)"
+        if [[ -n "${scoped_description:-}" ]]; then
+          FETCH_SCOPED_RESETS_AT="$(codex_reset_description_to_epoch "$scoped_description" "$(now_epoch)" "$FETCH_SCOPED_WINDOW_MINUTES" 2>/dev/null || true)"
+        fi
+      fi
+    fi
+  else
+    log_debug "refresh[codex]: no tertiary or extra rate window reported"
+  fi
+
+  # The normalized object rather than the raw array: one provider payload per
+  # file, the same shape Claude's raw file has.
+  persist_raw_payload codex "$normalized"
+
   return 0
 }
 
@@ -1919,16 +2228,9 @@ fetch_via_claude_oauth() {
   fi
 
   # Persist the full endpoint response for consumers that want more than the
-  # session/weekly percentages (e.g. the SwiftBar dropdown reads the scoped
-  # per-model limits and extra-usage fields from it). Best-effort.
-  local raw_tmp
-  if raw_tmp="$(umask 077 && mktemp "${CACHE_DIR}/usage-raw.json.tmp.XXXXXX" 2>/dev/null)"; then
-    if printf '%s\n' "$raw" >"$raw_tmp" 2>/dev/null; then
-      mv -f "$raw_tmp" "${CACHE_DIR}/usage-raw.json" 2>/dev/null || rm -f "$raw_tmp" 2>/dev/null || true
-    else
-      rm -f "$raw_tmp" 2>/dev/null || true
-    fi
-  fi
+  # session/weekly percentages (the extra-usage fields, the per-limit detail).
+  # Best-effort.
+  persist_raw_payload claude "$raw"
 
   local session_raw weekly_raw
   if ! session_raw="$(printf '%s' "$raw" | jq -er '.five_hour.utilization' 2>/dev/null)"; then
@@ -1955,12 +2257,12 @@ fetch_via_claude_oauth() {
     FETCH_WEEKLY_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
   fi
 
-  # Model-scoped weekly limit (Fable). It lives only in .limits[]; there is no
-  # top-level seven_day_<model> key for it. Absent scope => module renders
-  # "n/a" rather than failing the whole refresh.
-  local fable_limit
-  fable_limit="$(printf '%s' "$raw" | jq -c \
-    --arg m "$FABLE_MODEL_NAME" '
+  # Model-scoped weekly limit (Fable, by default). It lives only in .limits[];
+  # there is no top-level seven_day_<model> key for it. Absent scope => module
+  # renders "n/a" rather than failing the whole refresh.
+  local scoped_limit
+  scoped_limit="$(printf '%s' "$raw" | jq -c \
+    --arg m "$SCOPED_MODEL_NAME" '
       [ .limits[]?
         | select((.kind? // "") == "weekly_scoped")
         | select(((.scope?.model?.display_name? // "") | ascii_downcase)
@@ -1968,39 +2270,64 @@ fetch_via_claude_oauth() {
       ] | first // empty
     ' 2>/dev/null || true)"
 
-  if [[ -n "${fable_limit:-}" ]]; then
-    FETCH_FABLE_USED="$(printf '%s' "$fable_limit" | jq -er '.percent | tonumber' 2>/dev/null || true)"
-    if [[ -n "${FETCH_FABLE_USED:-}" ]]; then
-      FETCH_FABLE_WINDOW_MINUTES=10080
-      iso="$(printf '%s' "$fable_limit" | jq -er -r '.resets_at // empty | tostring' 2>/dev/null || true)"
+  if [[ -n "${scoped_limit:-}" ]]; then
+    FETCH_SCOPED_USED="$(printf '%s' "$scoped_limit" | jq -er '.percent | tonumber' 2>/dev/null || true)"
+    if [[ -n "${FETCH_SCOPED_USED:-}" ]]; then
+      FETCH_SCOPED_WINDOW_MINUTES=10080
+      # The endpoint's own name for the window, not the option we matched on:
+      # @codexbar_scoped_model matches by prefix, so "Fable" can select a limit
+      # the endpoint calls "Fable 5.1", and the panel should say the latter.
+      FETCH_SCOPED_LABEL="$(printf '%s' "$scoped_limit" | jq -er -r '.scope?.model?.display_name // empty' 2>/dev/null || true)"
+      [[ -n "${FETCH_SCOPED_LABEL:-}" ]] || FETCH_SCOPED_LABEL="$SCOPED_MODEL_NAME"
+      iso="$(printf '%s' "$scoped_limit" | jq -er -r '.resets_at // empty | tostring' 2>/dev/null || true)"
       if [[ -n "${iso:-}" ]]; then
-        FETCH_FABLE_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
+        FETCH_SCOPED_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
       fi
     fi
   else
-    log_debug "refresh[claude]: no weekly_scoped limit for model=${FABLE_MODEL_NAME}"
+    log_debug "refresh[claude]: no weekly_scoped limit for model=${SCOPED_MODEL_NAME}"
   fi
+
+  # Severity and the locked flag, per family, straight from .limits[]. They
+  # travel in the provider block so a reader has every fact about a window in
+  # one file instead of reopening the raw payload for one boolean.
+  local kinds=(session weekly_all weekly_scoped) families=(SESSION WEEKLY SCOPED)
+  local i limit_entry severity locked
+  for i in 0 1 2; do
+    limit_entry="$(printf '%s' "$raw" | jq -c --arg k "${kinds[$i]}" \
+      '[ .limits[]? | select((.kind? // "") == $k) ] | first // empty' 2>/dev/null || true)"
+    [[ -n "${limit_entry:-}" ]] || continue
+
+    severity="$(printf '%s' "$limit_entry" | jq -er -r '.severity // empty' 2>/dev/null || true)"
+    [[ -n "${severity:-}" ]] || severity='normal'
+    if printf '%s' "$limit_entry" | jq -e '(.locked_reason // null) != null' >/dev/null 2>&1; then
+      locked=1
+    else
+      locked=0
+    fi
+
+    printf -v "FETCH_${families[$i]}_SEVERITY" '%s' "$severity"
+    printf -v "FETCH_${families[$i]}_LOCKED" '%s' "$locked"
+  done
+
+  # What spent the week ("Claude Code 98%, Chats 1%").
+  FETCH_BREAKDOWN_JSON="$(printf '%s' "$raw" | jq -c '
+    [ .seven_day_breakdown?.rows[]?
+      | select((.percent? // null) != null)
+      | {key: (.key // ""), display_name: (.display_name // .key // ""), percent: .percent}
+    ]' 2>/dev/null || true)"
+  [[ -n "${FETCH_BREAKDOWN_JSON:-}" ]] || FETCH_BREAKDOWN_JSON='[]'
 
   return 0
 }
 
-mark_auth_required_cache() {
-  mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
-
-  local updated_at tmp
-  updated_at="$(now_epoch)"
-  tmp="$(mktemp "${CACHE_DIR}/usage.json.tmp.XXXXXX")" || return 0
-  umask 077
-  printf '{"updated_at":%s,"state":"auth_required"}\n' "$updated_at" >"$tmp"
-  mv -f "$tmp" "$CACHE_FILE"
-  log_warn "refresh[claude]: authentication required"
-}
-
 cache_auth_required() {
-  [[ "$USAGE_PROVIDER" == "claude" ]] || return 1
+  provider_enabled claude || return 1
   [[ -f "$CACHE_FILE" ]] || return 1
   command -v jq >/dev/null 2>&1 || return 1
-  jq -e '.state == "auth_required"' "$CACHE_FILE" >/dev/null 2>&1
+  # The provider block is the authority; the top level is checked too so a
+  # cache written before the providers map existed still answers.
+  jq -e '((.providers.claude.state? // .state) == "auth_required")' "$CACHE_FILE" >/dev/null 2>&1
 }
 
 login_claude_oauth() {
@@ -2031,9 +2358,341 @@ login_claude_oauth() {
   fi
 }
 
+# ── The published cache ─────────────────────────────────────────────────────
+#
+# usage.json is written HERE and nowhere else, and read by three programs that
+# never write it: the tmux modules, UsageBar's menu bar popover, and CuaNotch's
+# usage panel. That makes its shape a cross-repo contract, and cua-notch's
+# dev/check-invariants pins four parts of it against this file on every commit.
+#
+#   {
+#     "updated_at": …, "state": "ok",          ← the PRIMARY provider's block,
+#     "session_used": …, "weekly_used": …,        flattened. Always Claude.
+#     "scoped_used": …, … ,                       Does NOT follow the display
+#     "schema": 2,                                option — a reader that wants
+#     "primary_provider": "claude",               "the Claude numbers" can go
+#     "display_provider": "claude",               on reading the root forever.
+#     "providers": { "claude": {…}, "codex": {…} }
+#   }
+#
+# A provider block carries the SAME key names as the root plus its own
+# label/severity/locked/breakdown/file pointers, so a reader written against
+# the root works against a block unchanged. A provider that is not configured
+# has NO ENTRY — absence, not a state string, is how "draw nothing" is said.
+#
+# Merging, not replacing: a fetch failure for one provider must never blank
+# another's numbers (the 2am bug), so each refresh merges its blocks over what
+# is already on disk and a failed provider contributes only a state/checked_at
+# patch.
+enabled_providers_json() {
+  local p out=''
+  for p in $USAGE_PROVIDERS; do
+    out+="${out:+,}\"${p}\""
+  done
+  printf '[%s]' "$out"
+}
+
+json_num_or_null() {
+  if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$1"
+  else
+    printf '%s' 'null'
+  fi
+}
+
+json_bool() {
+  if [[ "${1:-0}" == "1" ]]; then
+    printf '%s' 'true'
+  else
+    printf '%s' 'false'
+  fi
+}
+
+# A minimal well-formed block for a provider that was attempted and did not
+# answer. Merged OVER the existing one, so the last good numbers survive with
+# an honest state and a fresh checked_at on top.
+provider_status_patch() {
+  local provider="${1:-}" state="${2:-error}" checked_at="${3:-0}"
+
+  jq -nc \
+    --arg provider "$provider" \
+    --arg label "$(provider_label_for "$provider")" \
+    --arg state "$state" \
+    --argjson checked_at "$(json_num_or_null "$checked_at")" \
+    --arg raw_file "$(basename "$(raw_file_for "$provider")")" \
+    --arg history_file "$(basename "$(history_file_for "$provider")")" \
+    '{provider: $provider, label: $label, state: $state, checked_at: $checked_at,
+      raw_file: $raw_file, history_file: $history_file}' 2>/dev/null || true
+}
+
+# Merge provider blocks into usage.json and rewrite it atomically.
+# $1: a JSON object of provider -> block (or patch).
+write_usage_cache() {
+  local blocks_json="${1:-}"
+  [[ -n "${blocks_json:-}" ]] || blocks_json='{}'
+
+  mkdir -p "$CACHE_DIR" 2>/dev/null || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  local prev='{}'
+  if [[ -f "$CACHE_FILE" ]]; then
+    prev="$(jq -c '.' "$CACHE_FILE" 2>/dev/null || true)"
+    [[ -n "${prev:-}" ]] || prev='{}'
+  fi
+
+  local merged
+  merged="$(jq -n \
+    --argjson prev "$prev" \
+    --argjson blocks "$blocks_json" \
+    --argjson enabled "$(enabled_providers_json)" \
+    --arg primary "$PROVIDER_PRIMARY" \
+    --arg display "$DISPLAY_PROVIDER" \
+    --arg primary_raw "$(basename "$(raw_file_for "$PROVIDER_PRIMARY")")" \
+    --arg primary_history "$(basename "$(history_file_for "$PROVIDER_PRIMARY")")" '
+      def strip_root: del(.providers, .schema, .primary_provider, .display_provider);
+      # The third family used to be keyed on a model name. Carry a pre-rename
+      # cache forward rather than dropping that window on the floor for the
+      # first refresh after an upgrade.
+      def unfable: with_entries(
+        if (.key | startswith("fable_")) then .key |= sub("^fable_"; "scoped_") else . end);
+
+      ($prev // {}) as $p
+      # A cache written before the providers map existed IS the primary
+      # provider, so seed it as that block. Without this, a first refresh in
+      # which the primary fetch fails would merge its status patch onto
+      # nothing and publish a block with no numbers — the upgrade itself
+      # would look exactly like a wiped cache.
+      | (if ($p | has("providers")) then $p.providers
+         elif ($p | has("updated_at"))
+         then {($primary): (($p | strip_root | unfable)
+                            + {provider: $primary, label: "Claude",
+                               raw_file: $primary_raw, history_file: $primary_history})}
+         else {} end) as $seed
+      # `*` is a recursive merge, so a status patch updates state/checked_at
+      # and leaves the numbers under it alone. Only configured providers
+      # survive the filter: a provider dropped from @codexbar_providers
+      # should stop being drawn, not linger with month-old numbers.
+      | (($seed * $blocks)
+         | with_entries(select(.key as $k | $enabled | index($k)))
+         | with_entries(.value |=
+             ({updated_at: 0, checked_at: 0, state: "error", breakdown: []} * .))) as $providers
+      | (if ($providers | has($primary))
+         then $providers[$primary]
+         else ($p | strip_root | unfable)
+         end) as $root
+      | (if ($root | type) == "object" and (($root | length) > 0)
+         then $root
+         else {updated_at: 0, state: "missing"}
+         end)
+        + {schema: 2, primary_provider: $primary, display_provider: $display,
+           providers: $providers}
+    ' 2>/dev/null || true)"
+  [[ -n "${merged:-}" ]] || { log_error "cache: merge failed; leaving previous usage.json in place"; return 1; }
+
+  umask 077
+  local tmp
+  tmp="$(mktemp "${CACHE_FILE}.tmp.XXXXXX")" || return 1
+  if printf '%s\n' "$merged" >"$tmp" 2>/dev/null && mv -f "$tmp" "$CACHE_FILE" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
+# Turn one fetch's FETCH_* outputs into a provider block.
+#
+# It ANSWERS IN GLOBALS, not on stdout, and that is deliberate: a caller that
+# wrote `block="$(render_provider_block …)"` would run it in a subshell, and
+# the RENDER_* values below — which the history sample and the log line are
+# built from — would die with it. That bug is invisible in the cache (the
+# block is correct) and shows up only as a history file that never grows and
+# a projection that never appears.
+RENDER_BLOCK=''
+RENDER_SESSION_USED=''
+RENDER_WEEKLY_USED=''
+RENDER_SCOPED_USED=''
+RENDER_SESSION_RESETS=''
+RENDER_WEEKLY_RESETS=''
+RENDER_SCOPED_RESETS=''
+
+render_provider_block() {
+  local provider="$1" updated_at="$2"
+
+  RENDER_BLOCK=''
+  local session_used weekly_used scoped_used=''
+  session_used="$(clamp_0_100_int "$FETCH_SESSION_USED")" || return 1
+  weekly_used="$(clamp_0_100_int "$FETCH_WEEKLY_USED")" || return 1
+
+  # A missing scoped window is normal (other providers, other plans); it
+  # blanks that one module instead of failing the refresh.
+  if [[ -n "${FETCH_SCOPED_USED:-}" ]]; then
+    scoped_used="$(clamp_0_100_int "$FETCH_SCOPED_USED" || true)"
+  fi
+
+  local session_window="$FETCH_SESSION_WINDOW_MINUTES" weekly_window="$FETCH_WEEKLY_WINDOW_MINUTES"
+  local scoped_window="$FETCH_SCOPED_WINDOW_MINUTES"
+  local session_resets="$FETCH_SESSION_RESETS_AT" weekly_resets="$FETCH_WEEKLY_RESETS_AT"
+  local scoped_resets="$FETCH_SCOPED_RESETS_AT"
+
+  local session_pace weekly_pace session_text weekly_text session_color weekly_color
+  session_pace="$(pace_suffix "$session_used" "$session_window" "$session_resets" "$updated_at")"
+  weekly_pace="$(pace_suffix  "$weekly_used"  "$weekly_window"  "$weekly_resets"  "$updated_at")"
+  session_text="${session_used}%${session_pace}"
+  weekly_text="${weekly_used}%${weekly_pace}"
+  session_color="$(color_for_window "$session_used" "$session_window" "$session_resets" "$updated_at")"
+  weekly_color="$(color_for_window "$weekly_used"  "$weekly_window"  "$weekly_resets"  "$updated_at")"
+
+  local scoped_text='' scoped_color=''
+  if [[ -n "${scoped_used:-}" ]]; then
+    local scoped_pace
+    scoped_pace="$(pace_suffix "$scoped_used" "$scoped_window" "$scoped_resets" "$updated_at")"
+    scoped_text="${scoped_used}%${scoped_pace}"
+    scoped_color="$(color_for_window "$scoped_used" "$scoped_window" "$scoped_resets" "$updated_at")"
+  else
+    scoped_text='n/a'
+    scoped_color='brightblack'
+  fi
+
+  # Between 5-hour windows the endpoint reports utilization 0 with a null
+  # resets_at — there is no window, so pacing is undefined and the reset time is
+  # unknown. Say "idle" in gray instead of a bare green "0%", which is
+  # indistinguishable from a live-but-unpaced reading or a stalled fetch.
+  if [[ -z "${session_resets:-}" ]] && (( session_used == 0 )); then
+    session_text='idle'
+    session_color='brightblack'
+  fi
+
+  RENDER_SESSION_USED="$session_used"
+  RENDER_WEEKLY_USED="$weekly_used"
+  RENDER_SCOPED_USED="$scoped_used"
+  RENDER_SESSION_RESETS="$session_resets"
+  RENDER_WEEKLY_RESETS="$weekly_resets"
+  RENDER_SCOPED_RESETS="$scoped_resets"
+
+  local breakdown="$FETCH_BREAKDOWN_JSON"
+  printf '%s' "$breakdown" | jq -e 'type == "array"' >/dev/null 2>&1 || breakdown='[]'
+
+  RENDER_BLOCK="$(jq -nc \
+    --arg provider "$provider" \
+    --arg label "$(provider_label_for "$provider")" \
+    --argjson updated_at "$(json_num_or_null "$updated_at")" \
+    --argjson session_used "$(json_num_or_null "$session_used")" \
+    --argjson weekly_used "$(json_num_or_null "$weekly_used")" \
+    --argjson scoped_used "$(json_num_or_null "$scoped_used")" \
+    --argjson session_window "$(json_num_or_null "$session_window")" \
+    --argjson weekly_window "$(json_num_or_null "$weekly_window")" \
+    --argjson scoped_window "$(json_num_or_null "$scoped_window")" \
+    --argjson session_resets "$(json_num_or_null "$session_resets")" \
+    --argjson weekly_resets "$(json_num_or_null "$weekly_resets")" \
+    --argjson scoped_resets "$(json_num_or_null "$scoped_resets")" \
+    --arg session_text "$session_text" \
+    --arg weekly_text "$weekly_text" \
+    --arg scoped_text "$scoped_text" \
+    --arg session_color "$session_color" \
+    --arg weekly_color "$weekly_color" \
+    --arg scoped_color "$scoped_color" \
+    --arg session_label "$FETCH_SESSION_LABEL" \
+    --arg weekly_label "$FETCH_WEEKLY_LABEL" \
+    --arg scoped_label "$FETCH_SCOPED_LABEL" \
+    --arg session_severity "$FETCH_SESSION_SEVERITY" \
+    --arg weekly_severity "$FETCH_WEEKLY_SEVERITY" \
+    --arg scoped_severity "$FETCH_SCOPED_SEVERITY" \
+    --argjson session_locked "$(json_bool "$FETCH_SESSION_LOCKED")" \
+    --argjson weekly_locked "$(json_bool "$FETCH_WEEKLY_LOCKED")" \
+    --argjson scoped_locked "$(json_bool "$FETCH_SCOPED_LOCKED")" \
+    --argjson breakdown "$breakdown" \
+    --arg raw_file "$(basename "$(raw_file_for "$provider")")" \
+    --arg history_file "$(basename "$(history_file_for "$provider")")" \
+    '{
+       provider: $provider, label: $label, state: "ok",
+       updated_at: $updated_at, checked_at: $updated_at,
+
+       session_used: $session_used, session_window_minutes: $session_window,
+       session_resets_at: $session_resets, session_text: $session_text,
+       session_color: $session_color, session_label: $session_label,
+       session_severity: $session_severity, session_locked: $session_locked,
+
+       weekly_used: $weekly_used, weekly_window_minutes: $weekly_window,
+       weekly_resets_at: $weekly_resets, weekly_text: $weekly_text,
+       weekly_color: $weekly_color, weekly_label: $weekly_label,
+       weekly_severity: $weekly_severity, weekly_locked: $weekly_locked,
+
+       scoped_used: $scoped_used, scoped_window_minutes: $scoped_window,
+       scoped_resets_at: $scoped_resets, scoped_text: $scoped_text,
+       scoped_color: $scoped_color, scoped_label: $scoped_label,
+       scoped_severity: $scoped_severity, scoped_locked: $scoped_locked,
+
+       breakdown: $breakdown,
+       raw_file: $raw_file, history_file: $history_file,
+
+       # Retained spellings from the first version of this file. Cheap to
+       # keep, and something out there may still read them.
+       session_windowMinutes: $session_window, session_resetsAt: $session_resets,
+       weekly_windowMinutes: $weekly_window, weekly_resetsAt: $weekly_resets
+     }' 2>/dev/null || true)"
+
+  [[ -n "${RENDER_BLOCK:-}" ]] || return 1
+  return 0
+}
+
+# Fetch ONE provider. Leaves its block — or, on failure, its status patch —
+# in RENDER_BLOCK (see render_provider_block on why this is not stdout) and
+# returns 0 only when the provider actually produced numbers.
+refresh_one_provider() {
+  local provider="$1" now="$2"
+
+  select_provider "$provider"
+  RENDER_BLOCK=''
+
+  local fetch_ok=0
+  case "$provider" in
+    claude)
+      if fetch_via_claude_oauth; then
+        fetch_ok=1
+      elif (( FETCH_AUTH_REQUIRED != 0 )); then
+        log_warn "refresh[claude]: authentication required"
+        RENDER_BLOCK="$(provider_status_patch "$provider" auth_required "$now")"
+      else
+        RENDER_BLOCK="$(provider_status_patch "$provider" error "$now")"
+      fi
+      ;;
+    codex)
+      if fetch_via_codexbar_codex; then
+        fetch_ok=1
+      else
+        RENDER_BLOCK="$(provider_status_patch "$provider" error "$now")"
+      fi
+      ;;
+    *)
+      log_debug "refresh: unknown provider ${provider}"
+      return 1
+      ;;
+  esac
+
+  if (( fetch_ok == 0 )); then
+    record_refresh_backoff_failure
+    return 1
+  fi
+
+  if ! render_provider_block "$provider" "$now"; then
+    log_warn "refresh[${provider}]: unusable numbers; keeping the previous block"
+    RENDER_BLOCK="$(provider_status_patch "$provider" error "$now")"
+    record_refresh_backoff_failure
+    return 1
+  fi
+
+  append_usage_history "$now" "$RENDER_SESSION_USED" "$RENDER_WEEKLY_USED" \
+    "$RENDER_SESSION_RESETS" "$RENDER_WEEKLY_RESETS" \
+    "$RENDER_SCOPED_USED" "$RENDER_SCOPED_RESETS" || true
+
+  log_info "refresh[${provider}]: success updated_at=${now} session=${RENDER_SESSION_USED}% weekly=${RENDER_WEEKLY_USED}% scoped=${RENDER_SCOPED_USED:-n/a}%"
+  reset_refresh_backoff
+  return 0
+}
+
 refresh_cache() {
   mkdir -p "$CACHE_DIR"
-  log_debug "refresh: start provider=${USAGE_PROVIDER}"
+  log_debug "refresh: start providers=[${USAGE_PROVIDERS}] display=${DISPLAY_PROVIDER}"
 
   if [[ "${CODEXBAR_USAGE_LOCK_HELD:-}" == "1" && "${CODEXBAR_USAGE_LOCKDIR:-}" == "$LOCKDIR" ]]; then
     log_debug "refresh: lock inherited"
@@ -2068,122 +2727,43 @@ refresh_cache() {
     return 1
   fi
 
-  case "$USAGE_PROVIDER" in
-    claude)
-      if ! fetch_via_claude_oauth; then
-        (( FETCH_AUTH_REQUIRED != 0 )) && mark_auth_required_cache
-        refresh_fail
-        return 1
+  # Every configured provider, each behind its OWN backoff ladder: one that is
+  # failing must neither be retried ahead of its ladder nor keep the others
+  # off the network. A forced refresh (prefix+u, UsageBar's "Refresh now")
+  # bypasses every ladder — it is the manual escape hatch.
+  local blocks='{}' provider block any_ok=0 now fc na
+  for provider in $USAGE_PROVIDERS; do
+    select_provider "$provider"
+    now="$(now_epoch)"
+
+    if [[ "${CODEXBAR_USAGE_FORCE_REFRESH:-}" != "1" ]]; then
+      read -r fc na < <(read_refresh_backoff)
+      if (( now < na )); then
+        log_debug "refresh[${provider}]: backoff until ${na} (fail_count=${fc})"
+        continue
       fi
-      ;;
-    codex)
-      fetch_via_codexbar_codex || { refresh_fail; return 1; }
-      ;;
-    *)
-      log_debug "refresh: unknown provider ${USAGE_PROVIDER}"
-      refresh_fail
-      return 1
-      ;;
-  esac
+    fi
 
-  local session_window_minutes="$FETCH_SESSION_WINDOW_MINUTES"
-  local weekly_window_minutes="$FETCH_WEEKLY_WINDOW_MINUTES"
-  local fable_window_minutes="$FETCH_FABLE_WINDOW_MINUTES"
-  local session_resets_at="$FETCH_SESSION_RESETS_AT"
-  local weekly_resets_at="$FETCH_WEEKLY_RESETS_AT"
-  local fable_resets_at="$FETCH_FABLE_RESETS_AT"
+    if refresh_one_provider "$provider" "$now"; then
+      any_ok=1
+    fi
+    block="$RENDER_BLOCK"
+    [[ -n "${block:-}" ]] || continue
 
-  local session_window_minutes_json session_resets_at_json weekly_window_minutes_json weekly_resets_at_json
-  local fable_window_minutes_json fable_resets_at_json
-  session_window_minutes_json='null'
-  session_resets_at_json='null'
-  weekly_window_minutes_json='null'
-  weekly_resets_at_json='null'
-  fable_window_minutes_json='null'
-  fable_resets_at_json='null'
+    blocks="$(jq -nc --argjson acc "$blocks" --arg p "$provider" --argjson b "$block" \
+      '$acc + {($p): $b}' 2>/dev/null || printf '%s' "$blocks")"
+  done
 
-  if [[ "$session_window_minutes" =~ ^[0-9]+$ ]]; then
-    session_window_minutes_json="$session_window_minutes"
-  fi
-  if [[ "$session_resets_at" =~ ^[0-9]+$ ]]; then
-    session_resets_at_json="$session_resets_at"
-  fi
-  if [[ "$weekly_window_minutes" =~ ^[0-9]+$ ]]; then
-    weekly_window_minutes_json="$weekly_window_minutes"
-  fi
-  if [[ "$weekly_resets_at" =~ ^[0-9]+$ ]]; then
-    weekly_resets_at_json="$weekly_resets_at"
-  fi
-  if [[ "$fable_window_minutes" =~ ^[0-9]+$ ]]; then
-    fable_window_minutes_json="$fable_window_minutes"
-  fi
-  if [[ "$fable_resets_at" =~ ^[0-9]+$ ]]; then
-    fable_resets_at_json="$fable_resets_at"
+  if [[ "$blocks" == '{}' ]]; then
+    log_debug "refresh: nothing attempted (every provider in backoff)"
+    return 1
   fi
 
-  local session_used weekly_used
-  session_used="$(clamp_0_100_int "$FETCH_SESSION_USED")" || { refresh_fail; return 1; }
-  weekly_used="$(clamp_0_100_int "$FETCH_WEEKLY_USED")" || { refresh_fail; return 1; }
+  write_usage_cache "$blocks" || return 1
 
-  # A missing model-scoped limit is normal (other providers, other plans); it
-  # blanks the fable module instead of failing the refresh.
-  local fable_used=''
-  if [[ -n "${FETCH_FABLE_USED:-}" ]]; then
-    fable_used="$(clamp_0_100_int "$FETCH_FABLE_USED" || true)"
-  fi
-
-  local updated_at
-  updated_at="$(now_epoch)"
-
-  local session_pace weekly_pace
-  session_pace="$(pace_suffix "$session_used" "$session_window_minutes" "$session_resets_at" "$updated_at")"
-  weekly_pace="$(pace_suffix  "$weekly_used"  "$weekly_window_minutes"  "$weekly_resets_at"  "$updated_at")"
-
-  local session_text weekly_text session_color weekly_color
-  session_text="${session_used}%${session_pace}"
-  weekly_text="${weekly_used}%${weekly_pace}"
-  session_color="$(color_for_window "$session_used" "$session_window_minutes" "$session_resets_at" "$updated_at")"
-  weekly_color="$(color_for_window "$weekly_used"  "$weekly_window_minutes"  "$weekly_resets_at"  "$updated_at")"
-
-  local fable_used_json='null' fable_text='' fable_color=''
-  if [[ -n "$fable_used" ]]; then
-    fable_used_json="$fable_used"
-    local fable_pace
-    fable_pace="$(pace_suffix "$fable_used" "$fable_window_minutes" "$fable_resets_at" "$updated_at")"
-    fable_text="${fable_used}%${fable_pace}"
-    fable_color="$(color_for_window "$fable_used" "$fable_window_minutes" "$fable_resets_at" "$updated_at")"
-  else
-    fable_text='n/a'
-    fable_color='brightblack'
-  fi
-
-  # Between 5-hour windows the endpoint reports utilization 0 with a null
-  # resets_at — there is no window, so pacing is undefined and the reset time is
-  # unknown. Say "idle" in gray instead of a bare green "0%", which is
-  # indistinguishable from a live-but-unpaced reading or a stalled fetch.
-  if [[ -z "$session_resets_at" ]] && (( session_used == 0 )); then
-    session_text='idle'
-    session_color='brightblack'
-  fi
-
-  local tmp
-  tmp="$(mktemp "${CACHE_DIR}/usage.json.tmp.XXXXXX")"
-
-  umask 077
-  cat >"$tmp" <<EOF
-{"updated_at":${updated_at},"state":"ok","session_used":${session_used},"weekly_used":${weekly_used},"fable_used":${fable_used_json},"session_window_minutes":${session_window_minutes_json},"session_resets_at":${session_resets_at_json},"weekly_window_minutes":${weekly_window_minutes_json},"weekly_resets_at":${weekly_resets_at_json},"fable_window_minutes":${fable_window_minutes_json},"fable_resets_at":${fable_resets_at_json},"session_windowMinutes":${session_window_minutes_json},"session_resetsAt":${session_resets_at_json},"weekly_windowMinutes":${weekly_window_minutes_json},"weekly_resetsAt":${weekly_resets_at_json},"session_text":"${session_text}","weekly_text":"${weekly_text}","fable_text":"${fable_text}","session_color":"${session_color}","weekly_color":"${weekly_color}","fable_color":"${fable_color}"}
-EOF
-
-  mv -f "$tmp" "$CACHE_FILE"
-
-  append_usage_history "$updated_at" "$session_used" "$weekly_used" \
-    "$session_resets_at" "$weekly_resets_at" "$fable_used" "$fable_resets_at" || true
+  publish_to_tmux_opts || true
 
   if command -v tmux >/dev/null 2>&1; then
-    tmux set-option -gq @codex_session_color "$session_color" >/dev/null 2>&1 || true
-    tmux set-option -gq @codex_weekly_color "$weekly_color" >/dev/null 2>&1 || true
-    tmux set-option -gq @codex_fable_color "$fable_color" >/dev/null 2>&1 || true
-
     local debug_opt
     debug_opt="$(tmux show-option -gqv @codexbar_debug 2>/dev/null || true)"
 
@@ -2202,9 +2782,8 @@ EOF
     tmux refresh-client -S >/dev/null 2>&1 || true
   fi
 
-  log_info "refresh: success updated_at=${updated_at} session=${session_used}% weekly=${weekly_used}% fable=${fable_used:-n/a}% provider=${USAGE_PROVIDER}"
-
-  reset_refresh_backoff
+  (( any_ok == 1 )) || return 1
+  return 0
 }
 
 main() {
@@ -2279,9 +2858,7 @@ main() {
         tick_age=$STALE_AFTER_SECONDS
       fi
       if [[ ! -f "$CACHE_FILE" ]] || (( tick_age >= STALE_AFTER_SECONDS )); then
-        local fc na
-        read -r fc na < <(read_refresh_backoff)
-        if (( tick_now >= na )); then
+        if any_provider_refresh_allowed "$tick_now"; then
           spawn_background_refresh_locked || true
         fi
       fi
@@ -2291,8 +2868,13 @@ main() {
       debug_flash_tick "${2:-}"
       exit 0
       ;;
-    session|weekly|fable)
+    session|weekly|scoped)
       :
+      ;;
+    fable)
+      # The third window's key before it was named structurally. Still
+      # accepted so a status line from an un-reloaded tmux.conf keeps working.
+      mode='scoped'
       ;;
     *)
       usage
@@ -2319,10 +2901,8 @@ main() {
 
     log_debug "stale: now=${now} ts=${ts} age=${age} threshold=${STALE_AFTER_SECONDS}"
 
-    local fail_count next_allowed
-    read -r fail_count next_allowed < <(read_refresh_backoff)
-    if (( now < next_allowed )); then
-      log_debug "stale: backoff fail_count=${fail_count} next_allowed=${next_allowed}"
+    if ! any_provider_refresh_allowed "$now"; then
+      log_debug "stale: every provider in backoff"
       return 0
     fi
 
