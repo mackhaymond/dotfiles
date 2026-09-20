@@ -6,9 +6,16 @@
 #
 # The tab is created from INSIDE the popup rather than by the key binding,
 # because display-popup -E cannot hand a value back to tmux -- it can only
-# report the command's exit status. tmux commands work fine in a popup, so the
-# script does the new-window itself, targeting the session passed in as $1 (the
-# popup is not "in" a window, so a bare {end} would be ambiguous).
+# report the command's exit status.
+#
+# Which session/tab to aim at is discovered here, NOT passed in by the binding:
+# display-popup format-expands its own arguments (-d, -T ...) but NOT the
+# shell-command, so a '#{session_name}' written into the command string arrives
+# at the script as those 14 literal characters and every target built from it
+# silently fails. A bare `display-message -p` inside the popup resolves against
+# the invoking client, which is exactly the session and pane we want. (The
+# popup is not itself a pane -- $TMUX_PANE is empty in here -- so there is
+# nothing to pass to -t either.)
 
 set -euo pipefail
 
@@ -26,16 +33,23 @@ if [[ "${1:-}" == "--preview" ]]; then
   exit 0
 fi
 
-SESSION="${1:-}"
-PANE_PATH="${2:-$HOME}"
+# stderr is thrown away with the popup, so anything worth seeing goes to the
+# status line of the session underneath it.
+die() {
+  tmux display-message "claude-dir-picker: $*"
+  exit 1
+}
 
 main() {
   for tool in fzf zoxide; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-      tmux display-message "claude-dir-picker: $tool not found in PATH"
-      exit 1
-    fi
+    command -v "$tool" >/dev/null 2>&1 || die "$tool not found in PATH"
   done
+
+  local session pane_path
+  session="$(tmux display-message -p '#{session_name}')" || die "not inside tmux"
+  [[ -n "$session" ]] || die "could not resolve the session name"
+  pane_path="$(tmux display-message -p '#{pane_current_path}')"
+  [[ -d "$pane_path" ]] || pane_path="$HOME"
 
   # Candidates, best first: this tab's cwd, $HOME (the old unconditional
   # destination of this key), then zoxide in frecency order. awk dedups keeping
@@ -44,7 +58,7 @@ main() {
   local list
   list="$(
     {
-      printf '%s\n' "$PANE_PATH" "$HOME"
+      printf '%s\n' "$pane_path" "$HOME"
       zoxide query -l 2>/dev/null || true
     } | awk 'NF && !seen[$0]++' \
       | while IFS= read -r d; do [[ -d "$d" ]] && printf '%s\n' "$d"; done \
@@ -81,15 +95,13 @@ main() {
   [[ -n "$target" ]] || exit 0
 
   target="${target/#\~/$HOME}"
-  if [[ ! -d "$target" ]]; then
-    tmux display-message "claude-dir-picker: not a directory: $target"
-    exit 0
-  fi
+  [[ -d "$target" ]] || die "not a directory: $target"
 
   # Mirrors `bind K`'s old body. claude is NOT the window command (quitting it
   # would close the tab); ZSH_AUTOSTART tells .zshrc to launch it as a child of
   # the login shell, and -e scopes the variable to this window's first process.
-  tmux new-window -a -t "${SESSION}:{end}" -c "$target" -e ZSH_AUTOSTART=claude
+  tmux new-window -a -t "${session}:{end}" -c "$target" -e ZSH_AUTOSTART=claude \
+    || die "could not open a tab in $target"
 }
 
 main "$@"

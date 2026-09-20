@@ -59,9 +59,15 @@ bind k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude
 # K is the one that asks where first: a popup fuzzy-picker over zoxide's
 # frecency list (plus this tab's cwd and $HOME, the key's old destination).
 # The script creates the tab itself — display-popup -E can only return an exit
-# status, not the chosen path — so it needs the session name to aim {end} at.
+# status, not the chosen path.
+#
+# It takes no arguments on purpose: display-popup expands formats in its own
+# options (-d below really does become the current path) but NOT in the
+# shell-command, so a '#{session_name}' passed here would reach the script as
+# 14 literal characters and the new-window would fail with the popup already
+# gone. The script asks tmux itself instead.
 bind K display-popup -E -w 80% -h 70% -d "#{pane_current_path}" \
-  "$HOME/.config/tmux/scripts/claude-dir-picker.sh '#{session_name}' '#{pane_current_path}'"
+  "$HOME/.config/tmux/scripts/claude-dir-picker.sh"
 
 bind C-k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude \; kill-window -t -
 
