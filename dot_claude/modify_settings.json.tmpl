@@ -28,6 +28,30 @@ FULL=$(cat <<'EOF'
     ],
     "defaultMode": "auto"
   },
+  "autoMode": {
+    "environment": [
+      "$defaults",
+      "**Organization** (supersedes the default for this and every slot below that repeats a default slot name): none. This is Mack Haymond's personal MacBook; he is its only user and owns every repo, domain, account and service the agent works with here. Primary use: his personal software projects, UCLA coursework, home automation, and maintaining this machine's own tooling and dotfiles",
+      "**Host containment**: ordinary personal Mac with open internet. The home directory is the agent's normal workspace, not scope escalation: sessions routinely start in ~ and work across ~/code/projects/*, ~/.config, ~/.local, ~/Library/LaunchAgents and the chezmoi source at ~/.local/share/chezmoi (his dotfiles repo; `chezmoi apply` writes the live dotfiles from it). Being in scope does not clear Unauthorized Persistence, Irreversible Local Destruction, or the sensitive-store rules",
+      "**Shell**: the native Bash tool is deny-listed on this machine for battery reasons, and the `pty` MCP server (`mcp__pty__run`, `mcp__pty__spawn_pty`) is the sanctioned shell that replaces it. Judge its `command` exactly as you would the same Bash command, and each later `mcp__pty__send_keys` input to a spawned pty as a command too; using the pty tools is not itself a workaround or Auto-Mode Bypass. The Bash deny rule is not a safety rule, so nothing is being routed around",
+      "**Multi-agent**: several Claude Code sessions run side by side in tmux panes. Reading another agent's pane (`mcp__tmux__read_pane`) or messaging it (`mcp__tmux__message_agent`) is ordinary Multi-Agent Coordination, not Tmux Self Drive, provided the target is not the agent's own pane ($TMUX_PANE, or the handle `mcp__tmux__whoami` returns). A message that approves another agent's permission prompt or relays an action this agent was denied is still Auto-Mode Bypass",
+      "**Source control**: github.com/mackhaymond/* (all his repos), the self-hosted gitlab.mackhaymond.co, and github.com/bruinalphainvestment/* (a student club site he maintains; shared with other members and likely public, so only that site's own work goes there)",
+      "**Trusted internal domains**: mackhaymond.co and all its subdomains (e.g. link.mackhaymond.co, valuation.mackhaymond.co, gitlab.mackhaymond.co); the home LAN (homeassistant.local, other *.local hosts, 192.168.0.0/16); localhost",
+      "**Cloud provider(s)**: Cloudflare, Mack's own personal account (Workers, D1, DNS for mackhaymond.co); Google Drive/Sheets through his own service account",
+      "**CI/CD deploy targets**: his personal Cloudflare Workers (mack-link, sector-relative-valuation, better-in-energy-email-worker, INeedAPledge api-worker), deployed with `wrangler`. These are single-owner hobby sites with no other team or customers behind them",
+      "**Secrets management**: 1Password CLI (`op read`) and the macOS Keychain. The Cloudflare API token lives in the environment (e.g. CF_TOK); sending it to api.cloudflare.com is its intended use",
+      "**Sensitive remote targets**: the Home Assistant box at homeassistant.local, which runs the house's locks, alarm and garage doors",
+      "**Sensitive data locations & audiences**: mail (Spark), Messages, 1Password, ~/.ssh, cloud and API credentials, and the pty server's plaintext command logs under ~/.local/state/tmux-pty-mcp/. Personal to Mack; nothing from them leaves the machine except to its own provider"
+    ],
+    "allow": [
+      "$defaults",
+      "Personal Cloudflare deploys: for the Workers named under CI/CD deploy targets, `wrangler deploy`/`wrangler versions deploy`, additive or schema-changing D1 migrations, and Cloudflare API writes to that Worker's own routes, custom domain and the DNS record for its own hostname are allowed when the user asked in this session to deploy, ship, migrate or re-route that site. They are Mack's own hobby sites, not shared production. This relaxes only Production Deploy, Blind Apply and DNS / Domain / Cert Changes for those targets. Not covered: any delete or rollback (stays under the deletion rules), migrations that drop or truncate tables or delete/update rows without a narrow predicate, MX/TXT/NS records or other subdomains' records, `wrangler secret` writes, and anything the content rules (Code That Leaks When Run, Traffic Redirection, exfiltration) would block"
+    ],
+    "soft_deny": [
+      "$defaults",
+      "Home Assistant physical security [named+specifics — **must name:** the device and the action]: calling a Home Assistant service or API (REST, websocket, `ha` CLI, or an automation/script that does it) that unlocks a lock, disarms the alarm, or opens a garage door or cover at homeassistant.local. Editing or reloading configuration, and lights/scenes/other devices, are not this rule"
+    ]
+  },
   "model": "opus[1m]",
   "hooks": {
     "Notification": [
@@ -115,7 +139,7 @@ FULL=$(cat <<'EOF'
         "hooks": [
           {
             "type": "command",
-            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/pty-plan-mode.ts",
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/pty-read-only.ts",
             "timeout": 10
           }
         ]
@@ -308,7 +332,7 @@ FULL=$(cat <<'EOF'
 }
 EOF
 )
-MANAGED='["permissions","hooks","statusLine","disableAgentView","skillOverrides"]'
+MANAGED='["permissions","autoMode","hooks","statusLine","disableAgentView","skillOverrides"]'
 jq -s --argjson full "$FULL" --argjson managed "$MANAGED" '
   (.[0] // {}) as $live
   | ($full | with_entries(select(.key as $k | $managed | index($k)))) as $m

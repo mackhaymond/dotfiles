@@ -1,24 +1,33 @@
 #!/usr/bin/env bun
-// PreToolUse hook: give mcp__pty__run the same plan-mode treatment Claude
-// Code gives the native Bash tool.
+// PreToolUse hook: give mcp__pty__run the per-command read-only treatment
+// Claude Code gives the native Bash tool, in plan mode AND auto mode.
 //
 // WHY THIS EXISTS
-// In plan mode Claude Code permits a tool call only when the tool reports
-// isReadOnly(input) === true. Bash computes that PER COMMAND (`ls` yes,
-// `rm -rf` no). An MCP tool can't: its isReadOnly() is the static
-// `annotations.readOnlyHint`, which ignores the input — so with Bash
-// deny-listed and mcp__pty__run as its replacement, plan mode had no shell
-// at all, not even `ls`. This hook restores the per-command half: it
-// classifies the command and returns `allow` for read-only ones.
+// Bash computes read-only-ness PER COMMAND (`ls` yes, `rm -rf` no). An MCP
+// tool can't: its isReadOnly() is the static `annotations.readOnlyHint`,
+// which ignores the input. With Bash deny-listed and mcp__pty__run as its
+// replacement, that cost two things:
+//   • plan mode had no shell at all, not even `ls`;
+//   • auto mode sent EVERY command — `ls`, `dig`, `git status` — to the
+//     classifier, which native Bash skips for read-only commands. The
+//     classifier then blocked plain reads as "scouting" for an earlier
+//     denied action (2026-09-23, mack.link session: `ls <file>` and `dig`
+//     denied as [Production Deploy]).
+// This hook restores the per-command half: it classifies the command and
+// returns `allow` for read-only ones, which resolves before the classifier.
 //
-// It only ever WIDENS in plan mode and never narrows elsewhere:
-//   • not plan mode          → silent passthrough (zero opinion)
-//   • plan + read-only cmd   → allow
-//   • plan + anything else   → silent passthrough, so Claude Code's built-in
-//                              "Cannot call <tool> while in plan mode" gate
-//                              still blocks it and the user can approve.
-// Classification failure of any kind falls through to that gate, so the
-// failure mode is "blocked in plan mode", never "write executed in plan mode".
+// It only ever WIDENS and never narrows:
+//   • plan/auto + read-only cmd → allow
+//   • anything else             → silent passthrough, so plan mode's
+//                                 "Cannot call <tool>" gate or the auto-mode
+//                                 classifier still judges it.
+// Classification failure of any kind falls through, so the failure mode is
+// "the classifier looks at it", never "a write ran unreviewed".
+//
+// Auto mode adds one gate plan mode doesn't need: commands that touch
+// credentials or personal data stores (isSensitive) fall through to the
+// classifier even when they're read-only, because reading a secret is the
+// risk there, not writing.
 //
 // The read_pty / list_ptys / spawn_pty / send_keys / kill_pty tools need no
 // hook: they carry honest readOnlyHint annotations in the server itself.
@@ -32,7 +41,8 @@ interface HookInput {
 // ── read-only command vocabulary ──────────────────────────────────────────
 // Heads that cannot mutate anything on their own. Mirrors Claude Code's own
 // read-only sets (src/utils/shell/readOnlyCommandValidation.ts), plus the
-// obvious inspection tools.
+// obvious inspection tools. Heads whose flags can write or execute are
+// narrowed per-head in segmentIsReadOnly.
 const READ_ONLY_HEADS = new Set([
   // search
   "find", "grep", "rg", "ag", "ack", "locate", "which", "whereis", "type",
@@ -49,10 +59,16 @@ const READ_ONLY_HEADS = new Set([
   // machine / process facts
   "date", "uname", "hostname", "whoami", "id", "env", "printenv", "ps",
   "uptime", "getconf", "sw_vers", "arch", "groups", "locale",
+  // DNS lookups (see NETWORK_HEADS)
+  "dig", "host", "nslookup",
   // version probes are read-only regardless of the binary
   "node", "bun", "python3", "git", "gh", "docker", "tmux", "npm", "cargo",
   "go", "rustc", "swift", "brew", "kubectl", "terraform", "claude",
 ]);
+
+// Heads that send their arguments off the machine. A literal hostname is
+// fine; anything expanded into it ($VAR, $(…)) could carry data out.
+const NETWORK_HEADS = new Set(["dig", "host", "nslookup"]);
 
 // Heads reachable only via an explicit read-only subcommand allowlist. Any
 // head listed here but absent from SUBCOMMANDS is rejected outright.
@@ -89,9 +105,17 @@ const WRITE_FLAGS = new Set([
   "-d", "-D", "-m", "-M", "-f", "--force", "--delete", "--set", "--unset",
   "--add", "--edit", "--replace-all", "--set-upstream", "--move", "--create",
   "--prune", "--rename", "-i", "--in-place", "--write", "-w", "--fix",
+  "-c", "-C", "--copy", "-u", "--unset-upstream", "--set-upstream-to",
 ]);
 const GIT_BARE_ONLY = new Set(["branch", "tag", "config", "stash", "worktree", "notes", "bisect", "remote"]);
 const GIT_SUBSUB_READ = new Set(["list", "show", "get", "get-all", "get-regexp", "-l", "--list", "--get", "-v", "--verbose", "log"]);
+// `git branch foo` / `git tag v1` CREATE; with one of these flags a
+// positional is a filter instead.
+const GIT_REF_LIST_FLAGS = new Set([
+  "-l", "--list", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at",
+]);
+// Any git subcommand: flags that write a file or run a program.
+const GIT_EXEC_OR_WRITE = /^(--output|--ext-diff|--open-files-in-pager|-O|--textconv|--exec|--upload-pack|--receive-pack|--config-env)/;
 
 function isVersionProbe(argv: string[]): boolean {
   return argv.length === 2 && ["--version", "-v", "-V", "--help", "-h"].includes(argv[1]);
@@ -113,6 +137,9 @@ function tokenize(segment: string): string[] | null {
     }
     if (c === "'" || c === '"') { quote = c; continue; }
     if (c === "\\") { cur += segment[++i] ?? ""; continue; }
+    // Unquoted parens left after extractSubstitutions are subshells, zsh glob
+    // qualifiers (`*(e:'cmd':)` runs cmd), or `${(e)var}` flags — reject.
+    if (c === "(" || c === ")") return null;
     if (/\s/.test(c)) { if (cur) { out.push(cur); cur = ""; } continue; }
     cur += c;
   }
@@ -138,6 +165,8 @@ function splitSegments(command: string): string[] | null {
     }
     if (c === "'" || c === '"') { quote = c; cur += c; continue; }
     if (c === "\\") { cur += c + (command[++i] ?? ""); continue; }
+    // `2>&1`, `<&0`, `&>/dev/null` are redirections, not separators
+    if (c === "&" && (command[i - 1] === ">" || command[i - 1] === "<" || command[i + 1] === ">")) { cur += c; continue; }
     if (c === ";" || c === "\n" || c === "&" || c === "|") {
       if ((c === "&" || c === "|") && command[i + 1] === c) i++; // && ||
       segs.push(cur);
@@ -152,12 +181,13 @@ function splitSegments(command: string): string[] | null {
 }
 
 // Pull out $( … ) and ` … ` bodies so they get classified as commands in
-// their own right rather than passing as inert argument text.
+// their own right rather than passing as inert argument text. <( … ), >( … )
+// and zsh's =( … ) are process substitutions — same treatment.
 function extractSubstitutions(command: string): { stripped: string; inner: string[] } | null {
   const inner: string[] = [];
   let stripped = "";
   for (let i = 0; i < command.length; i++) {
-    if (command[i] === "$" && command[i + 1] === "(") {
+    if ("$<>=".includes(command[i]) && command[i + 1] === "(") {
       let depth = 1;
       let j = i + 2;
       let body = "";
@@ -194,6 +224,8 @@ function hasWritingRedirect(segment: string): boolean {
   return />/.test(cleaned);
 }
 
+const positionals = (args: string[]) => args.filter((a) => !a.startsWith("-"));
+
 function segmentIsReadOnly(segment: string): boolean {
   if (hasWritingRedirect(segment)) return false;
   const tokens = tokenize(segment);
@@ -206,52 +238,102 @@ function segmentIsReadOnly(segment: string): boolean {
   if (!argv.length) return false; // bare assignment mutates shell state
 
   const head = argv[0].replace(/^.*\//, ""); // /bin/ls → ls
-  if (head === "sudo" || head === "doas" || head === "env" && argv.length > 1) return false;
+  const args = argv.slice(1);
+  if (head === "sudo" || head === "doas" || head === "env" && args.length) return false;
   if (!READ_ONLY_HEADS.has(head)) return false;
 
-  // find can execute or delete
-  if (head === "find" && argv.some((a) => ["-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprint"].includes(a)))
-    return false;
-  // sed/awk/tee only read when they aren't writing
-  if (head === "sed" && argv.some((a) => a === "-i" || a.startsWith("-i") || a === "--in-place")) return false;
-  if (head === "tee") return false; // tee's whole job is writing
-  if (head === "cd") return true;
+  // Heads whose flags write files or run programs.
+  switch (head) {
+    case "find": // can execute, delete, or write its listing to a file
+      if (args.some((a) => /^-(exec|execdir|delete|ok|okdir|fprint|fprint0|fprintf|fls)$/.test(a))) return false;
+      break;
+    case "sed": // -i edits in place; the w/W commands write files, e runs one
+      if (args.some((a) => a === "--in-place" || /^-[a-zA-Z]*i/.test(a))) return false;
+      if (args.some((a) => /(^|[\s;}\/0-9$])[wWe](\s|$|;)/.test(a))) return false;
+      break;
+    case "awk": // system(), getline from a command, pipes, -f program files
+      if (args.some((a) => a === "-f" || /system|getline|\|/.test(a))) return false;
+      break;
+    case "tee": // tee's whole job is writing
+      return false;
+    case "sort":
+      if (args.some((a) => a.startsWith("--output") || /^-[a-zA-Z]*o/.test(a))) return false;
+      break;
+    case "uniq": // `uniq in out` writes out
+      if (positionals(args).length > 1) return false;
+      break;
+    case "tree":
+    case "base64":
+      if (args.some((a) => a === "-o" || a.startsWith("--output"))) return false;
+      break;
+    case "xxd": // -r patches; a second positional is an output file
+      if (args.some((a) => /^-[a-zA-Z]*r/.test(a)) || positionals(args).length > 1) return false;
+      break;
+    case "yq":
+      if (args.some((a) => a === "--inplace" || /^-[a-zA-Z]*i/.test(a))) return false;
+      break;
+    case "rg": // --pre runs a program on every file
+      if (args.some((a) => a.startsWith("--pre"))) return false;
+      break;
+    case "bat":
+      if (args.some((a) => a.startsWith("--pager"))) return false;
+      break;
+    case "date": // anything but +FORMAT sets the clock
+    case "hostname":
+      if (positionals(args).some((a) => !a.startsWith("+"))) return false;
+      break;
+    case "tmux": // #(…) in a format string runs a shell command
+      if (args.some((a) => a.includes("#("))) return false;
+      break;
+    case "cd":
+      return true;
+  }
 
   const subs = SUBCOMMANDS[head];
   if (!subs) return true; // plain read-only binary, no subcommand grammar
   if (isVersionProbe(argv)) return true;
-  const sub = argv.slice(1).find((a) => !a.startsWith("-"));
-  const subOrFlag = sub ?? argv[1];
+  const sub = args.find((a) => !a.startsWith("-"));
+  const subOrFlag = sub ?? args[0];
   if (!subOrFlag || !subs.has(subOrFlag)) return false;
+  const rest = args.slice(args.indexOf(subOrFlag) + 1);
+  const verb = rest.find((a) => !a.startsWith("-"));
 
-  if (head === "git" && GIT_BARE_ONLY.has(subOrFlag)) {
-    const rest = argv.slice(argv.indexOf(subOrFlag) + 1);
-    if (rest.some((a) => a.startsWith("-") && WRITE_FLAGS.has(a))) return false;
-    // `git config foo.bar value` writes; `git config --get foo.bar` reads
-    if (subOrFlag === "config" && !rest.some((a) => GIT_SUBSUB_READ.has(a))) return false;
-    if (["stash", "worktree", "notes", "bisect"].includes(subOrFlag)) {
-      const next = rest.find((a) => !a.startsWith("-"));
-      if (!next || !GIT_SUBSUB_READ.has(next)) return false;
+  if (head === "git") {
+    if (args.some((a) => GIT_EXEC_OR_WRITE.test(a))) return false;
+    if (GIT_BARE_ONLY.has(subOrFlag)) {
+      if (rest.some((a) => a.startsWith("-") && WRITE_FLAGS.has(a))) return false;
+      // `git config foo.bar value` writes; `git config --get foo.bar` reads
+      if (subOrFlag === "config" && !rest.some((a) => GIT_SUBSUB_READ.has(a))) return false;
+      if (["stash", "worktree", "notes", "bisect"].includes(subOrFlag)) {
+        if (!verb || !GIT_SUBSUB_READ.has(verb)) return false;
+      }
+      // `git branch foo` / `git tag v1` create a ref unless a list flag
+      // turns the positional into a pattern
+      if ((subOrFlag === "branch" || subOrFlag === "tag") && verb && !rest.some((a) => GIT_REF_LIST_FLAGS.has(a.split("=")[0])))
+        return false;
+      // `git remote add/set-url/remove/rename/prune` write
+      if (subOrFlag === "remote" && verb && !["show", "get-url"].includes(verb)) return false;
     }
   }
   if (head === "gh") {
-    const rest = argv.slice(argv.indexOf(subOrFlag) + 1);
     if (subOrFlag === "api") {
-      if (rest.some((a) => ["-X", "--method", "-f", "--field", "-F", "--raw-field", "--input"].includes(a))) return false;
-    } else {
-      const verb = rest.find((a) => !a.startsWith("-"));
-      if (!verb || !["view", "list", "diff", "checks", "status", "ls"].includes(verb)) return false;
+      if (rest.some((a) => /^(-X|--method|-f|--field|-F|--raw-field|--input)(=|$)/.test(a))) return false;
+    } else if (!verb || !["view", "list", "diff", "checks", "status", "ls"].includes(verb)) {
+      return false;
     }
   }
   if (head === "kubectl" && subOrFlag === "config") {
-    const rest = argv.slice(argv.indexOf(subOrFlag) + 1);
-    const verb = rest.find((a) => !a.startsWith("-"));
     if (!verb || !["view", "get-contexts", "current-context"].includes(verb)) return false;
   }
   if (head === "npm" && subOrFlag === "config") {
-    const rest = argv.slice(argv.indexOf(subOrFlag) + 1);
-    const verb = rest.find((a) => !a.startsWith("-"));
     if (!verb || !["get", "list", "ls"].includes(verb)) return false;
+  }
+  if (head === "npm" && subOrFlag === "audit" && verb) return false; // `npm audit fix`
+  if (head === "go" && subOrFlag === "env" && rest.some((a) => a === "-w" || a === "-u")) return false;
+  if (head === "terraform" && subOrFlag === "fmt" && !rest.includes("-check")) return false;
+  if (head === "claude") {
+    if (subOrFlag === "mcp" && (!verb || !["list", "get"].includes(verb))) return false;
+    if (subOrFlag === "config" && (!verb || !["get", "list", "ls"].includes(verb))) return false;
   }
   return true;
 }
@@ -275,6 +357,45 @@ export function isReadOnlyCommand(command: string): boolean {
   return true;
 }
 
+// ── auto mode: reads that still deserve the classifier ────────────────────
+// Credential stores, secret-shaped names, personal data stores, and the pty
+// server's own plaintext command/output logs. Deliberately loose: a false
+// match only costs one classifier call.
+const SENSITIVE = new RegExp(
+  [
+    String.raw`\.ssh\b`, String.raw`\.aws\b`, String.raw`\.gnupg`, String.raw`\.netrc`,
+    String.raw`\.npmrc`, String.raw`\.pypirc`, String.raw`\.git-credentials`,
+    String.raw`(^|[\s/'"=])\.(env|envrc|dev\.vars)\b`,String.raw`\.(pem|p12|pfx|key)\b`, String.raw`id_(rsa|ed25519|ecdsa|dsa)`,
+    String.raw`\.kube/config`, String.raw`\.docker/config`, String.raw`gh/hosts\.yml`,
+    String.raw`\.config/op\b`, "1password", "op://", String.raw`\.claude\.json`,
+    "tmux-pty-mcp/", "keychain", "cookies", "login data",
+    String.raw`library/(messages|mail)\b`, String.raw`chat\.db`,
+    "credential", String.raw`secrets?([^a-z]|$)`, "passw",
+    String.raw`(^|[^a-z])(api[_-]?)?tokens?([^a-z]|$)`,
+    // environment dumps and secret-named variables
+    String.raw`(^|[\s;|&(])(env|printenv)(\s|$|;|\|)`, String.raw`\$ENV\b`, String.raw`(^|[^.\w])env\.`,
+    String.raw`\$\{?[A-Z_]*(TOK|KEY|SECRET|PASS|AUTH|CRED|SESSION|COOKIE)`,
+  ].join("|"),
+  "i",
+);
+
+export function isSensitive(command: string): boolean {
+  if (SENSITIVE.test(command)) return true;
+  // DNS lookups carry their argument off the machine: literal names only
+  const heads = command.split(/[;&|\n(`]/).map((s) => s.trim().split(/\s+/)[0]?.replace(/^.*\//, ""));
+  if (heads.some((h) => h && NETWORK_HEADS.has(h)) && /[$`]/.test(command)) return true;
+  return false;
+}
+
+export function decide(input: HookInput): "allow" | null {
+  const mode = input.permission_mode;
+  if (mode !== "plan" && mode !== "auto") return null;
+  const command = input.tool_input?.command;
+  if (typeof command !== "string" || !isReadOnlyCommand(command)) return null;
+  if (mode === "auto" && isSensitive(command)) return null;
+  return "allow";
+}
+
 // ── hook entrypoint ───────────────────────────────────────────────────────
 if (import.meta.main) {
   let raw = "";
@@ -285,15 +406,13 @@ if (import.meta.main) {
   } catch {
     process.exit(0); // unparseable → no opinion
   }
-  if (input.permission_mode !== "plan") process.exit(0);
-  const command = input.tool_input?.command;
-  if (typeof command !== "string" || !isReadOnlyCommand(command)) process.exit(0);
+  if (decide(input) !== "allow") process.exit(0);
   console.log(
     JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "allow",
-        permissionDecisionReason: "Read-only command is allowed in plan mode (same rule Claude Code applies to Bash)",
+        permissionDecisionReason: `Read-only command is allowed in ${input.permission_mode} mode (same rule Claude Code applies to Bash)`,
       },
     }),
   );
