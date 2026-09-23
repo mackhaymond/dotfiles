@@ -51,14 +51,15 @@ main() {
   pane_path="$(tmux display-message -p '#{pane_current_path}')"
   [[ -d "$pane_path" ]] || pane_path="$HOME"
 
-  # Candidates, best first: this tab's cwd, $HOME (the old unconditional
-  # destination of this key), then zoxide in frecency order. awk dedups keeping
-  # the first — i.e. the highest-priority — copy, and the -d test drops zoxide
-  # rows whose directory has since been deleted.
+  # Candidates, best first: $HOME (always the top row, so enter alone keeps
+  # the old unconditional destination of this key), this tab's cwd, then
+  # zoxide in frecency order. awk dedups keeping the first — i.e. the
+  # highest-priority — copy, and the -d test drops zoxide rows whose directory
+  # has since been deleted.
   local list
   list="$(
     {
-      printf '%s\n' "$pane_path" "$HOME"
+      printf '%s\n' "$HOME" "$pane_path"
       zoxide query -l 2>/dev/null || true
     } | awk 'NF && !seen[$0]++' \
       | while IFS= read -r d; do [[ -d "$d" ]] && printf '%s\n' "$d"; done \
