@@ -7,7 +7,7 @@
                     {
                         "manipulators": [
                             {
-                                "description": "Change hyper+F1 to F13 for skhd.",
+                                "description": "Change hyper+F1 to F13 (skhdrc binds that key; skhd-to-karabiner.py rewrites it to run the bind).",
                                 "from": {
                                     "key_code": "f1",
                                     "modifiers": {
@@ -19,7 +19,7 @@
                                 "type": "basic"
                             },
                             {
-                                "description": "Change hyper+F2 to F14 for skhd.",
+                                "description": "Change hyper+F2 to F14 (skhdrc binds that key; skhd-to-karabiner.py rewrites it to run the bind).",
                                 "from": {
                                     "key_code": "f2",
                                     "modifiers": {
@@ -31,7 +31,7 @@
                                 "type": "basic"
                             },
                             {
-                                "description": "Change hyper+fn+escape to F19 for skhd.",
+                                "description": "Change hyper+fn+escape to F19 (skhdrc binds that key; skhd-to-karabiner.py rewrites it to run the bind).",
                                 "from": {
                                     "key_code": "escape",
                                     "modifiers": {
@@ -43,7 +43,7 @@
                                 "type": "basic"
                             },
                             {
-                                "description": "Change hyper+escape to F18 for skhd.",
+                                "description": "Change hyper+escape to F18 (skhdrc binds that key; skhd-to-karabiner.py rewrites it to run the bind).",
                                 "from": {
                                     "key_code": "escape",
                                     "modifiers": {
@@ -55,7 +55,7 @@
                                 "type": "basic"
                             },
                             {
-                                "description": "Change fn+caps_lock+escape to F19 for skhd.",
+                                "description": "Change fn+caps_lock+escape to F19 (skhdrc binds that key; skhd-to-karabiner.py rewrites it to run the bind).",
                                 "from": {
                                     "modifiers": {
                                         "mandatory": ["fn"],
@@ -75,7 +75,7 @@
                                 "type": "basic"
                             },
                             {
-                                "description": "Change caps_lock+escape to F18 for skhd.",
+                                "description": "Change caps_lock+escape to F18 (skhdrc binds that key; skhd-to-karabiner.py rewrites it to run the bind).",
                                 "from": {
                                     "modifiers": { "optional": ["any"] },
                                     "simultaneous": [

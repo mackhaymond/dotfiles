@@ -205,7 +205,7 @@ Two bugs found while testing this, both pre-dating it and both fixed here:
 
 **File:** `~/.config/skhd/skhdrc`
 
-Skhd binds keyboard events (from Karabiner) to yabai commands. All paths are templated during chezmoi apply; `{{ .chezmoi.homeDir }}` becomes `/Users/mackhaymond`.
+`skhdrc` is the declarative bind list (skhd syntax). **Karabiner executes it, not the skhd daemon:** `chezmoi apply` compiles it into `karabiner.json` via `dot_config/skhd/executable_skhd-to-karabiner.py`, so every bind is matched at the HID level where Secure Input (password fields in Chrome/Arc) can't blind it the way it blinds skhd's event tap. All paths are templated during chezmoi apply; `{{ .chezmoi.homeDir }}` becomes `/Users/mackhaymond`.
 
 > **Keep in sync — hand-mirrored, no auto-generation.** This bind list lives in THREE files: `dot_config/skhd/skhdrc.tmpl` (the **source of truth**), the `HELP_COL1/2/3` tables in `dot_hammerspoon/init.lua` (the on-screen **`hyper+fn+?`** help overlay; `Esc` closes it), and this README (§3.2 tables + §6 cheat sheet). Change a bind in skhd and you MUST update the overlay tables **and** both README sections, or the docs and the on-screen help will lie.
 
@@ -791,10 +791,7 @@ chezmoi apply
 
 #### Step 4: Reload the Service(s)
 
-**For skhd:**
-```bash
-skhd --reload
-```
+**For keybinds:** nothing — `chezmoi apply` compiles `skhdrc` into `karabiner.json` and Karabiner hot-reloads it. Karabiner (not the skhd daemon) fires every bind, because skhd's event tap is blind while any app holds Secure Input (see the `skhdrc` header). Check the reload in `~/.local/share/karabiner/log/core_service.log` ("core_configuration is updated").
 
 **For yabai (if changes affect signal handlers, rules, or layout):**
 ```bash

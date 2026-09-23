@@ -1,0 +1,12 @@
+#!/bin/sh
+# chezmoi modify_ script for ~/.config/karabiner/karabiner.json.
+#   hand-written Karabiner config : .chezmoitemplates/karabiner-base.json
+#   keybinds (source of truth)    : dot_config/skhd/skhdrc.tmpl, compiled in by
+#                                   dot_config/skhd/executable_skhd-to-karabiner.py
+# Karabiner fires every skhd bind itself (HID level) so Secure Input can't swallow them.
+# The live file on stdin is discarded: chezmoi owns the whole file, as it always has.
+cat >/dev/null
+exec /usr/bin/env python3 "{{ .chezmoi.sourceDir }}/dot_config/skhd/executable_skhd-to-karabiner.py" \
+  "{{ .chezmoi.sourceDir }}/.chezmoitemplates/karabiner-base.json" <<'SKHDRC_EOF'
+{{ includeTemplate "dot_config/skhd/skhdrc.tmpl" . }}
+SKHDRC_EOF

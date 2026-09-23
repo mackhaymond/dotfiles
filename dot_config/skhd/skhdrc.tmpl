@@ -6,7 +6,17 @@
 #   2. THE HELP OVERLAY ~/.hammerspoon/init.lua      -> HELP_COL1/2/3 tables (the hyper+fn+? cheat sheet)
 #   3. THE DOCS         dot_config/yabai/README.md   -> section 3.2 tables AND section 6 cheat sheet
 # Out-of-sync = the on-screen help and the docs lie about what a key does.
-# After editing: chezmoi apply && skhd --reload  (see README section 5 runbook).
+#
+# KARABINER, NOT skhd, FIRES THESE (since 2026-09-23). skhd's CGEventTap goes blind
+# whenever any app holds Secure Input (browsers do on password fields, and sometimes
+# leave it stuck), which is why hyper+z/x "died in Chrome/Arc". `chezmoi apply`
+# compiles this file into karabiner.json (dot_config/skhd/executable_skhd-to-karabiner.py
+# via dot_config/private_karabiner/modify_private_karabiner.json.tmpl), and Karabiner
+# matches the keys at the HID level, below Secure Input and every app. Bare-key binds
+# (f13/f14/f18/f19) must be produced by a chord in .chezmoitemplates/karabiner-base.json;
+# the generator rewires that chord to run the command. Unknown keys/mods fail the apply.
+# Karabiner runs shell commands on key-down only (no key-repeat, unlike skhd).
+# After editing: chezmoi apply  (Karabiner hot-reloads; no skhd --reload needed).
 # =============================================================================
 
 # layout-aware (logic in the scripts): STACK space -> cycle stack layers (z=next,
