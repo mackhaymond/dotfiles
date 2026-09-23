@@ -591,7 +591,7 @@ The single most fragile dependency in the whole system is the **scripting additi
 
 **Symptom of a broken SA layer:** yabai starts and tiling/focus all work, but native-fullscreen toggling, space create/destroy, or the WezTerm husk sweep silently no-op. Fix = re-install the SA and regenerate the sudoers hash, not the config.
 
-Other login-time dependencies: **Karabiner** (caps_lock→hyper, the F13/F14/F18/F19 chords) and **Hammerspoon** (`hs.autoLaunch(true)`, for Arc pinning — degrades gracefully if absent). `skhd` and `yabai` run as user LaunchAgents.
+Other login-time dependencies: **Karabiner** (caps_lock→hyper, the F13/F14/F18/F19 chords) and **Hammerspoon** (`hs.autoLaunch(true)`, for Arc pinning — degrades gracefully if absent). `yabai` runs as a user LaunchAgent. The `skhd` daemon is retired (2026-09-23: `launchctl disable gui/501/com.koekeishiya.skhd`; Karabiner fires the skhdrc binds — see §3.2); re-enabling it would be harmless but pointless, since Karabiner consumes those keys first.
 
 ### Focus a Workspace
 
