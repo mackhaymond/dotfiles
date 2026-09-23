@@ -677,10 +677,10 @@ color_for_pace_delta() {
   fi
 }
 
-# Pick the status-bar color for a usage window. Prefers pacing-delta-based color
-# when pacing math is computable; falls back to absolute-usage color otherwise
-# (e.g., right after a reset, or when window/resets_at fields are missing).
-color_for_window() {
+# Pure pace color for a usage window: pacing-delta-based when pacing math is
+# computable, absolute-usage color otherwise (e.g., right after a reset, or when
+# window/resets_at fields are missing). Published as <family>_pace_color.
+pace_color_for_window() {
   local used="$1" window_minutes="$2" resets_at="$3" now="$4"
 
   local delta color
@@ -693,6 +693,50 @@ color_for_window() {
   fi
 
   color_for_used_percent "$used"
+}
+
+# Level thresholds: how close the window is to running out, regardless of pace.
+# Defaults match CuaNotch's warnPct/criticalPct so the two surfaces agree.
+LEVEL_WARN_PERCENT="$(clamp_int_range "$(opt_or_env_or_default '@codexbar_warn_percent' 'CODEXBAR_USAGE_WARN_PERCENT' '80')" 1 100)"
+LEVEL_CRITICAL_PERCENT="$(clamp_int_range "$(opt_or_env_or_default '@codexbar_critical_percent' 'CODEXBAR_USAGE_CRITICAL_PERCENT' '95')" 1 100)"
+
+color_rank() {
+  case "${1:-}" in
+    red)    printf '%s' 2 ;;
+    yellow) printf '%s' 1 ;;
+    *)      printf '%s' 0 ;;
+  esac
+}
+
+# Pick the status-bar color for a usage window: the worse of the pace color and
+# the level band, with one escalation — ahead of pace AND near the end is red,
+# because the lead no longer fits in what's left. 100% is always red: a +11%
+# pace reads "a bit ahead", but there is nothing left to be ahead with.
+color_for_window() {
+  local used="$1" window_minutes="$2" resets_at="$3" now="$4"
+
+  local pace_color pace_rank level_rank=0 rank
+  pace_color="$(pace_color_for_window "$used" "$window_minutes" "$resets_at" "$now")"
+  pace_rank="$(color_rank "$pace_color")"
+
+  if [[ "$used" =~ ^[0-9]+$ ]]; then
+    if (( used >= 100 || used >= LEVEL_CRITICAL_PERCENT )); then
+      level_rank=2
+    elif (( used >= LEVEL_WARN_PERCENT )); then
+      level_rank=1
+    fi
+  fi
+
+  rank=$(( pace_rank > level_rank ? pace_rank : level_rank ))
+  if (( pace_rank >= 1 && level_rank >= 1 )); then
+    rank=2
+  fi
+
+  case "$rank" in
+    2) printf '%s' 'red' ;;
+    1) printf '%s' 'yellow' ;;
+    *) printf '%s' 'green' ;;
+  esac
 }
 
 # How fresh the NUMBERS are, which drives the staleness gate that triggers a
@@ -2541,16 +2585,21 @@ render_provider_block() {
   weekly_text="${weekly_used}%${weekly_pace}"
   session_color="$(color_for_window "$session_used" "$session_window" "$session_resets" "$updated_at")"
   weekly_color="$(color_for_window "$weekly_used"  "$weekly_window"  "$weekly_resets"  "$updated_at")"
+  local session_pace_color weekly_pace_color
+  session_pace_color="$(pace_color_for_window "$session_used" "$session_window" "$session_resets" "$updated_at")"
+  weekly_pace_color="$(pace_color_for_window "$weekly_used"  "$weekly_window"  "$weekly_resets"  "$updated_at")"
 
-  local scoped_text='' scoped_color=''
+  local scoped_text='' scoped_color='' scoped_pace_color=''
   if [[ -n "${scoped_used:-}" ]]; then
     local scoped_pace
     scoped_pace="$(pace_suffix "$scoped_used" "$scoped_window" "$scoped_resets" "$updated_at")"
     scoped_text="${scoped_used}%${scoped_pace}"
     scoped_color="$(color_for_window "$scoped_used" "$scoped_window" "$scoped_resets" "$updated_at")"
+    scoped_pace_color="$(pace_color_for_window "$scoped_used" "$scoped_window" "$scoped_resets" "$updated_at")"
   else
     scoped_text='n/a'
     scoped_color='brightblack'
+    scoped_pace_color='brightblack'
   fi
 
   # Between 5-hour windows the endpoint reports utilization 0 with a null
@@ -2560,6 +2609,7 @@ render_provider_block() {
   if [[ -z "${session_resets:-}" ]] && (( session_used == 0 )); then
     session_text='idle'
     session_color='brightblack'
+    session_pace_color='brightblack'
   fi
 
   RENDER_SESSION_USED="$session_used"
@@ -2591,6 +2641,9 @@ render_provider_block() {
     --arg session_color "$session_color" \
     --arg weekly_color "$weekly_color" \
     --arg scoped_color "$scoped_color" \
+    --arg session_pace_color "$session_pace_color" \
+    --arg weekly_pace_color "$weekly_pace_color" \
+    --arg scoped_pace_color "$scoped_pace_color" \
     --arg session_label "$FETCH_SESSION_LABEL" \
     --arg weekly_label "$FETCH_WEEKLY_LABEL" \
     --arg scoped_label "$FETCH_SCOPED_LABEL" \
@@ -2609,17 +2662,20 @@ render_provider_block() {
 
        session_used: $session_used, session_window_minutes: $session_window,
        session_resets_at: $session_resets, session_text: $session_text,
-       session_color: $session_color, session_label: $session_label,
+       session_color: $session_color, session_pace_color: $session_pace_color,
+       session_label: $session_label,
        session_severity: $session_severity, session_locked: $session_locked,
 
        weekly_used: $weekly_used, weekly_window_minutes: $weekly_window,
        weekly_resets_at: $weekly_resets, weekly_text: $weekly_text,
-       weekly_color: $weekly_color, weekly_label: $weekly_label,
+       weekly_color: $weekly_color, weekly_pace_color: $weekly_pace_color,
+       weekly_label: $weekly_label,
        weekly_severity: $weekly_severity, weekly_locked: $weekly_locked,
 
        scoped_used: $scoped_used, scoped_window_minutes: $scoped_window,
        scoped_resets_at: $scoped_resets, scoped_text: $scoped_text,
-       scoped_color: $scoped_color, scoped_label: $scoped_label,
+       scoped_color: $scoped_color, scoped_pace_color: $scoped_pace_color,
+       scoped_label: $scoped_label,
        scoped_severity: $scoped_severity, scoped_locked: $scoped_locked,
 
        breakdown: $breakdown,
