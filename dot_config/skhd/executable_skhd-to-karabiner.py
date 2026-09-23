@@ -22,6 +22,7 @@ Unknown modifiers / keys are a hard error: a bind must never be dropped silently
 """
 import json
 import os
+import pwd
 import re
 import sys
 
@@ -114,7 +115,10 @@ def parse_skhdrc(text):
 
 def shell_command(cmd):
     # Backgrounded like skhd's fork/exec: a slow script never queues the next bind.
-    prefix = ENV_PREFIX.format(home=os.environ["HOME"], user=os.environ.get("USER") or os.getlogin())
+    # From the passwd entry, not $USER/os.getlogin(): chezmoi may run with a bare env
+    # (no USER), where getlogin() returns "root" and yabai's socket lookup would break.
+    pw = pwd.getpwuid(os.getuid())
+    prefix = ENV_PREFIX.format(home=pw.pw_dir, user=pw.pw_name)
     return f"{prefix}({cmd}) >/dev/null 2>&1 &"
 
 
