@@ -202,6 +202,18 @@ config.keys = {
         },
     },
 
+    -- CMD+Z: reopen the most recently closed tab (and resume the claude /
+    -- codex / opencode session that was in it). Sends `prefix X`; CMD+W is
+    -- what records a close — see closed-tabs.sh.
+    {
+        key = "z",
+        mods = "CMD",
+        action = wezterm.action.Multiple {
+            wezterm.action.SendKey { key = "s", mods = "CTRL" },
+            wezterm.action.SendKey { key = "X", mods = "SHIFT" },
+        },
+    },
+
     {
         key = "W",
         mods = "CMD",
