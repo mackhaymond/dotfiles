@@ -531,7 +531,13 @@ bind-key -T stash Space  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-ca
 # before any binding lookup — so a binding for it in THIS table would never
 # run. prefix followed by either of those is therefore the way out.
 
-bind C-l kill-pane
+# CMD+SHIFT+W (wezterm) → prefix C-l: CMD+W without the y/n, still remembered
+# on the closed-tabs stack so CMD+Z brings it back.
+# vim-tmux-navigator binds prefix C-l to "clear screen" when tpm loads it,
+# which is after this line, so for a long time this key silently cleared the
+# screen instead of closing anything. The option below turns that mapping off.
+set -g @vim_navigator_prefix_mapping_clear_screen ""
+bind C-l run-shell -b "#{HOME}/.config/tmux/scripts/closed-tabs.sh close '#{pane_id}'"
 # Initialize TMUX plugin manager (keep this line at the very bottom of tmux.conf)
 run '~/.tmux/plugins/tpm/tpm'
 

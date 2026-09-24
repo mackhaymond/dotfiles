@@ -7,7 +7,8 @@
 #   closed-tabs.sh reopen <session_id> <tty>   pop the newest and recreate it
 #   closed-tabs.sh list                        print the stack, newest last
 #
-# Bound in tmux.conf: prefix x (CMD+W) closes through here, prefix X (CMD+Z)
+# Bound in tmux.conf: prefix x (CMD+W, asks y/n) and prefix C-l (CMD+SHIFT+W,
+# doesn't) close through here, prefix X (CMD+Z)
 # reopens. Only closes that go through `close` are remembered — a tab that ends
 # because its shell exited never passes through a key binding, and by the time
 # any tmux hook fires its process tree is gone.
