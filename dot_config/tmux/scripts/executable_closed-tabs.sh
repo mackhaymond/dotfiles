@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
-# Reopen closed tabs, browser-style: a stack of recently closed panes, each
-# remembered with its cwd, its place in the tab bar, and — if a claude / codex /
-# opencode session was running in it — enough to resume that conversation.
+# Reopen closed tabs. Every close is kept for a while (RETAIN_DAYS, at most
+# MAX_ENTRIES) with its cwd, its place in the tab bar, a colour snapshot of the
+# screen as it was, and — if a claude / codex / opencode session was running in
+# it — enough to resume that conversation.
 #
-#   closed-tabs.sh close <pane_id>             snapshot, push, then kill the pane
-#   closed-tabs.sh reopen <session_id> <tty>   pop the newest and recreate it
-#   closed-tabs.sh list                        print the stack, newest last
+#   closed-tabs.sh close <pane_id>                 snapshot, record, kill the pane
+#   closed-tabs.sh pick-popup <session_id> <tty>   fzf picker over the history
+#   closed-tabs.sh reopen <session_id> <tty> [id…] reopen these (default: newest)
+#   closed-tabs.sh forget <id…>                    drop entries from the history
+#   closed-tabs.sh list                            print the history, newest first
 #
 # Bound in tmux.conf: prefix x (CMD+W, asks y/n) and prefix C-l (CMD+SHIFT+W,
-# doesn't) close through here, prefix X (CMD+Z)
-# reopens. Only closes that go through `close` are remembered — a tab that ends
-# because its shell exited never passes through a key binding, and by the time
-# any tmux hook fires its process tree is gone.
+# doesn't) close through here; prefix X (CMD+Z) opens the picker. Only closes
+# that go through `close` are remembered — a tab that ends because its shell
+# exited never passes through a key binding, and by the time any tmux hook
+# fires its process tree is gone.
+#
+# Storage, all under ~/.local/state/tmux-closed-tabs/:
+#   history.jsonl        one JSON object per closed tab, oldest first
+#   previews/<id>.ansi   `capture-pane -e` of the screen at close time
+# Pruned on every close and every picker open. A snapshot is the visible screen
+# only (tens of KB), so a full history is a few MB at most.
 #
 # Agent detection and session-id resolution are NOT reimplemented here: they
 # come from tmux-assistant-resurrect's save script, which is written to be
@@ -28,15 +37,23 @@
 
 set -uo pipefail
 
+SELF="$HOME/.config/tmux/scripts/closed-tabs.sh"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-closed-tabs"
-STACK="$STATE_DIR/stack.jsonl"
+HISTORY="$STATE_DIR/history.jsonl"
+PREVIEWS="$STATE_DIR/previews"
 LOCK="$STATE_DIR/lock"
 LOGFILE="$STATE_DIR/log"
-MAX_ENTRIES=50
+RETAIN_DAYS=7
+MAX_ENTRIES=100
+# The preview sits UNDER the list so it gets (nearly) the full client width: a
+# snapshot is as wide as the tab was, and anything wider than the preview is
+# clipped on the right.
+POPUP_W_PCT=94
+POPUP_H_PCT=85
 
 RESURRECT_SAVE="$HOME/.config/tmux/plugins/tmux-assistant-resurrect/scripts/save-assistant-sessions.sh"
 
-mkdir -p "$STATE_DIR"
+mkdir -p "$STATE_DIR" "$PREVIEWS"
 
 msg() { tmux display-message "$*" 2>/dev/null; }
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOGFILE" 2>/dev/null; }
@@ -61,6 +78,32 @@ lock_acquire() {
 }
 lock_release() { rmdir "$LOCK" 2>/dev/null; }
 
+# Rewrite the history through jq, atomically. Caller holds the lock.
+history_filter() {
+    [ -s "$HISTORY" ] || return 0
+    jq -c "$@" "$HISTORY" >"$HISTORY.tmp" 2>/dev/null && mv "$HISTORY.tmp" "$HISTORY"
+}
+
+# ids as a JSON array, for jq --argjson.
+ids_json() { printf '%s\n' "$@" | jq -R . | jq -sc .; }
+
+# Age out old entries, cap the count, and delete snapshots nothing points at
+# (including any left by a close that died halfway). Caller holds the lock.
+prune() {
+    local cutoff=$(( $(date +%s) - RETAIN_DAYS * 86400 ))
+    history_filter --argjson cut "$cutoff" 'select(.ts >= $cut)'
+    if [ "$(grep -c . "$HISTORY" 2>/dev/null || echo 0)" -gt "$MAX_ENTRIES" ]; then
+        tail -n "$MAX_ENTRIES" "$HISTORY" >"$HISTORY.tmp" && mv "$HISTORY.tmp" "$HISTORY"
+    fi
+    local keep f id
+    keep=$(jq -r '.id' "$HISTORY" 2>/dev/null)
+    for f in "$PREVIEWS"/*.ansi; do
+        [ -e "$f" ] || continue
+        id=$(basename "$f" .ansi)
+        grep -qxF -- "$id" <<<"$keep" || rm -f "$f"
+    done
+}
+
 # Resolve the agent running in a pane, if any, into a resume command.
 # Prints "<tool>\x1f<session_id>\x1f<pid>\x1f<cmd>" or nothing.
 agent_resume() {
@@ -75,8 +118,8 @@ agent_resume() {
         # Seed its per-process flag cache with its own fallback list. Otherwise
         # stripping the resume flags runs `claude --help` on every close, which
         # is ~300ms of the key feeling slow.
-        _SESSION_FLAGS_claude="$SESSION_FLAGS_FALLBACK_claude"
-        _SESSION_FLAGS_opencode="$SESSION_FLAGS_FALLBACK_opencode"
+        _SESSION_FLAGS_claude="${SESSION_FLAGS_FALLBACK_claude:-}"
+        _SESSION_FLAGS_opencode="${SESSION_FLAGS_FALLBACK_opencode:-}"
         local apid args tool
         apid=$(pane_has_assistant "$pane_pid") || exit 0
         args=$(ps -o args= -p "$apid" 2>/dev/null)
@@ -132,26 +175,37 @@ do_close() {
     IFS='|' read -r pane_id pane_pid sess widx cwd label <<<"$info"
     [ -n "$pane_id" ] || return 1
 
+    local ts id
+    ts=$(date +%s); id="$ts-$$"
+
+    # The screen as it is right now, for the picker. Trailing blank rows are
+    # dropped so the preview (which follows the bottom) lands on the last line
+    # of real output rather than on empty space under a shell prompt.
+    tmux capture-pane -ep -t "$pane_id" 2>/dev/null | perl -e '
+        my @l = <STDIN>;
+        while (@l && $l[-1] =~ /^(?:\e\[[0-9;:]*[A-Za-z]|\s)*$/) { pop @l }
+        print @l;' >"$PREVIEWS/$id.ansi"
+
     local tool="" sid="" apid="" cmd=""
     local resolved; resolved=$(agent_resume "$pane_id" "$pane_pid" "$cwd")
     [ -n "$resolved" ] && IFS=$'\x1f' read -r tool sid apid cmd <<<"$resolved"
 
     local rec
-    rec=$(jq -cn --arg ts "$(date +%s)" --arg sess "$sess" --arg widx "$widx" \
-        --arg cwd "$cwd" \
-        --arg label "$label" --arg tool "$tool" --arg sid "$sid" --arg cmd "$cmd" \
-        '{ts: ($ts|tonumber), session: $sess, index: ($widx|tonumber), cwd: $cwd,
+    rec=$(jq -cn --arg id "$id" --arg ts "$ts" --arg sess "$sess" --arg widx "$widx" \
+        --arg cwd "$cwd" --arg label "$label" --arg tool "$tool" --arg sid "$sid" --arg cmd "$cmd" \
+        '{id: $id, ts: ($ts|tonumber), session: $sess, index: ($widx|tonumber), cwd: $cwd,
           label: $label, tool: $tool, session_id: $sid, cmd: $cmd}')
 
-    # Pushed BEFORE anything dies: once the agent exits, claude deletes the
+    # Recorded BEFORE anything dies: once the agent exits, claude deletes the
     # state files the session id was read from.
     if lock_acquire; then
-        printf '%s\n' "$rec" >>"$STACK"
-        tail -n "$MAX_ENTRIES" "$STACK" >"$STACK.tmp" && mv "$STACK.tmp" "$STACK"
+        printf '%s\n' "$rec" >>"$HISTORY"
+        prune
         lock_release
     else
         # Refuse rather than close something we could not remember.
-        msg "closed-tabs: stack busy — tab left open"
+        rm -f "$PREVIEWS/$id.ansi"
+        msg "closed-tabs: history busy — tab left open"
         return 1
     fi
     log "close $sess:$widx cwd=$cwd tool=${tool:--} sid=${sid:--}"
@@ -170,28 +224,17 @@ do_close() {
     return 0
 }
 
-do_reopen() {
-    local client_sess="${1:-}" client_tty="${2:-}"
-    local rec
-    lock_acquire || { msg "closed-tabs: stack busy"; return 1; }
-    rec=$(tail -n 1 "$STACK" 2>/dev/null)
-    if [ -z "$rec" ]; then
-        lock_release
-        msg "closed-tabs: nothing to reopen"
-        return 0
-    fi
-    sed -i '' '$d' "$STACK"
-    lock_release
-
-    local sess idx cwd cmd tool label
+# Recreate one recorded tab. Prints the new window id.
+reopen_one() {
+    local rec="$1" client_sess="$2"
+    local sess idx cwd cmd
     sess=$(jq -r '.session' <<<"$rec"); idx=$(jq -r '.index' <<<"$rec")
     cwd=$(jq -r '.cwd' <<<"$rec");      cmd=$(jq -r '.cmd // empty' <<<"$rec")
-    tool=$(jq -r '.tool // empty' <<<"$rec"); label=$(jq -r '.label // empty' <<<"$rec")
 
     # Back in its own session if that still exists, else wherever you are.
     if ! tmux has-session -t "=$sess" 2>/dev/null; then
         sess=$(tmux display-message -p -t "$client_sess" '#{session_name}' 2>/dev/null)
-        [ -n "$sess" ] || { msg "closed-tabs: no session to reopen into"; return 1; }
+        [ -n "$sess" ] || return 1
     fi
     [ -d "$cwd" ] || cwd="$HOME"
 
@@ -206,28 +249,142 @@ do_reopen() {
     fi
     local -a autostart=()
     [ -n "$cmd" ] && autostart=(-e "ZSH_AUTOSTART=$cmd")
+    tmux new-window -P -F '#{window_id}' "${where[@]}" -c "$cwd" "${autostart[@]}" 2>/dev/null
+}
 
-    local win
-    win=$(tmux new-window -P -F '#{window_id}' "${where[@]}" -c "$cwd" "${autostart[@]}" 2>/dev/null) || {
-        # Put it back rather than lose it.
-        lock_acquire && { printf '%s\n' "$rec" >>"$STACK"; lock_release; }
-        msg "closed-tabs: couldn't create the tab — kept it on the stack"
-        return 1
-    }
-    [ -n "$client_tty" ] && tmux switch-client -c "$client_tty" -t "$win" 2>/dev/null
-    log "reopen $sess cwd=$cwd tool=${tool:--} cmd=${cmd:--}"
-    local left; left=$(grep -c . "$STACK" 2>/dev/null || echo 0)
-    msg "reopened ${label:-tab}${tool:+ ($tool resumed)} · $left more"
+# Reopen the given entries (default: the newest). Several at once go back
+# newest-closed first: each one's recorded index was taken AFTER the ones closed
+# before it had left, so undoing in reverse order puts every tab back in its
+# original slot.
+do_reopen() {
+    local client_sess="${1:-}" client_tty="${2:-}"
+    shift 2 2>/dev/null
+    local recs
+    lock_acquire || { msg "closed-tabs: history busy"; return 1; }
+    if [ "$#" -gt 0 ]; then
+        recs=$(jq -c --argjson ids "$(ids_json "$@")" 'select(.id as $i | $ids | index($i))' "$HISTORY" 2>/dev/null)
+    else
+        recs=$(tail -n 1 "$HISTORY" 2>/dev/null)
+    fi
+    if [ -z "$recs" ]; then
+        lock_release
+        msg "closed-tabs: nothing to reopen"
+        return 0
+    fi
+    local ids; ids=$(jq -r '.id' <<<"$recs")
+    # shellcheck disable=SC2086
+    history_filter --argjson ids "$(ids_json $ids)" 'select(.id as $i | $ids | index($i) | not)'
+    lock_release
+
+    local rec win first="" n=0 failed=0
+    while IFS= read -r rec; do
+        [ -n "$rec" ] || continue
+        if win=$(reopen_one "$rec" "$client_sess") && [ -n "$win" ]; then
+            [ -n "$first" ] || first="$win"
+            n=$((n + 1))
+            rm -f "$PREVIEWS/$(jq -r '.id' <<<"$rec").ansi"
+            log "reopen $(jq -r '"\(.session) cwd=\(.cwd) tool=\(.tool) cmd=\(.cmd)"' <<<"$rec")"
+        else
+            # Put it back rather than lose it.
+            failed=$((failed + 1))
+            lock_acquire && { printf '%s\n' "$rec" >>"$HISTORY"; lock_release; }
+        fi
+    done < <(jq -sc 'sort_by(-.ts) | .[]' <<<"$recs")
+
+    [ -n "$client_tty" ] && [ -n "$first" ] && tmux switch-client -c "$client_tty" -t "$first" 2>/dev/null
+    if [ "$failed" -gt 0 ]; then
+        msg "closed-tabs: reopened $n, couldn't recreate $failed (kept in the history)"
+    fi
+}
+
+do_forget() {
+    [ "$#" -gt 0 ] || return 0
+    lock_acquire || return 1
+    history_filter --argjson ids "$(ids_json "$@")" 'select(.id as $i | $ids | index($i) | not)'
+    local id; for id in "$@"; do rm -f "$PREVIEWS/$id.ansi"; done
+    lock_release
+    msg "closed-tabs: forgot $# tab(s)"
+}
+
+# fzf needs a terminal, so the picker runs inside a popup that re-enters this
+# script as `pick`. Called from a FOREGROUND run-shell: a backgrounded one has
+# no client to raise a popup on.
+do_pick_popup() {
+    local client_sess="${1:-}" client_tty="${2:-}"
+    if lock_acquire; then prune; lock_release; fi
+    if [ ! -s "$HISTORY" ]; then
+        msg "closed-tabs: nothing to reopen"
+        return 0
+    fi
+    local -a client=()
+    [ -n "$client_tty" ] && client=(-c "$client_tty")
+    tmux display-popup "${client[@]}" -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" \
+        -T ' closed tabs ' "'$SELF' pick '$client_sess' '$client_tty'"
+}
+
+ago() {
+    local s=$(( $(date +%s) - $1 ))
+    if   [ "$s" -lt 60 ];    then echo "just now"
+    elif [ "$s" -lt 3600 ];  then echo "$((s / 60))m ago"
+    elif [ "$s" -lt 86400 ]; then echo "$((s / 3600))h ago"
+    else                          echo "$((s / 86400))d ago"
+    fi
+}
+
+# Runs inside the popup. Newest first, so CMD+Z then ⏎ is "reopen the last
+# thing I closed". ⌃x forgets instead of reopening, via --expect (which puts
+# the accepting key on the first output line, empty for a plain ⏎) — the same
+# gesture as the stash picker's kill.
+do_pick() {
+    local client_sess="${1:-}" client_tty="${2:-}"
+    local id ts tool label cwd
+    local dim=$'\e[2m' mauve=$'\e[38;2;203;166;247m' teal=$'\e[38;2;148;226;213m' off=$'\e[0m'
+    local out
+    out=$(jq -r '[.id, .ts, .tool, .label, .cwd] | join("\u001f")' "$HISTORY" 2>/dev/null \
+        | tail -r \
+        | while IFS=$'\x1f' read -r id ts tool label cwd; do
+            [ -n "$id" ] || continue
+            local c="$teal"; [ "$tool" = claude ] && c="$mauve"
+            printf '%s\t%s%-9s%s %s%-9s%s %s\t%s%s%s\n' "$id" \
+                "$dim" "$(ago "$ts")" "$off" "$c" "${tool:-shell}" "$off" "$label" \
+                "$dim" "${cwd/#"$HOME"/\~}" "$off"
+          done \
+        | fzf --ansi --delimiter='\t' --with-nth=2.. --reverse --multi \
+              --prompt='reopen > ' \
+              --expect=ctrl-x \
+              --bind 'shift-down:toggle+down,shift-up:toggle+up,ctrl-a:select-all,ctrl-d:deselect-all' \
+              --preview "'$SELF' preview {1}" \
+              --preview-window 'down,72%,border-top,follow' \
+              --header '⏎ reopen · Tab or ⇧↑/⇧↓ to pick several · ⌃x forget')
+    local key=${out%%$'\n'*}
+    local ids; ids=$(printf '%s\n' "$out" | tail -n +2 | cut -f1 | tr '\n' ' ')
+    [ -n "${ids// /}" ] || return 0
+    # Hand off so the popup closes the moment you pick. The ids are
+    # <epoch>-<pid>, nothing a shell would interpret, so unquoted is fine.
+    if [ "$key" = "ctrl-x" ]; then
+        tmux run-shell -b "'$SELF' forget $ids"
+    else
+        tmux run-shell -b "'$SELF' reopen '$client_sess' '$client_tty' $ids"
+    fi
+}
+
+do_preview() {
+    local f="$PREVIEWS/${1:-}.ansi"
+    if [ -s "$f" ]; then cat "$f"; else echo "(no snapshot)"; fi
 }
 
 do_list() {
-    [ -s "$STACK" ] || { echo "(empty)"; return 0; }
-    jq -r '"\(.ts | strflocaltime("%m-%d %H:%M"))  \(.session):\(.index)  \(.tool // "" | if . == "" then "-" else . end)\t\(.label)\t\(.cwd)"' "$STACK"
+    [ -s "$HISTORY" ] || { echo "(empty)"; return 0; }
+    jq -r '"\(.ts | strflocaltime("%m-%d %H:%M"))  \(.session):\(.index)  \(if .tool == "" then "-" else .tool end)\t\(.label)\t\(.cwd)"' "$HISTORY" | tail -r
 }
 
 case "${1:-}" in
-close)  shift; do_close "$@" ;;
-reopen) shift; do_reopen "$@" ;;
-list)   do_list ;;
-*) echo "usage: $0 close <pane_id> | reopen <session_id> <client_tty> | list" >&2; exit 2 ;;
+close)      shift; do_close "$@" ;;
+pick-popup) shift; do_pick_popup "$@" ;;
+pick)       shift; do_pick "$@" ;;
+preview)    shift; do_preview "$@" ;;
+reopen)     shift; do_reopen "$@" ;;
+forget)     shift; do_forget "$@" ;;
+list)       do_list ;;
+*) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac

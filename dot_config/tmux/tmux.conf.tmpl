@@ -85,15 +85,16 @@ bind C-k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude \; kill
 bind N new-window -a -c "#{pane_current_path}" nu
 
 # CMD+W (wezterm) → prefix x: close the pane, same y/n prompt as tmux's stock
-# `x`, but through closed-tabs.sh, which first pushes the tab onto a stack of
-# recently closed ones: cwd, position in the bar, and any claude / codex /
-# opencode session running in it.
-# CMD+Z (wezterm) → prefix X: pop that stack. The tab comes back in the slot it
-# left, same cwd, with the agent resumed (`claude --resume <id>` etc.) as a
-# child of zsh via ZSH_AUTOSTART, exactly like a CMD+R tab. Repeated presses
-# walk further back. `closed-tabs.sh list` shows what's on it.
+# `x`, but through closed-tabs.sh, which first records the tab in a history of
+# recently closed ones (kept a week): cwd, position in the bar, a snapshot of
+# the screen, and any claude / codex / opencode session running in it.
+# CMD+Z (wezterm) → prefix X: fzf over that history, newest first, previewing
+# each tab's screen as it was. ⏎ brings it back in the slot it left, same cwd,
+# with the agent resumed (`claude --resume <id>` etc.) as a child of zsh via
+# ZSH_AUTOSTART, exactly like a CMD+R tab. So CMD+Z ⏎ undoes the last close.
+# NOT run-shell -b: the popup needs the key press's client to appear on.
 bind x confirm-before -p "kill-pane #P? (y/n)" "run-shell -b '#{HOME}/.config/tmux/scripts/closed-tabs.sh close #{pane_id}'"
-bind X run-shell -b "#{HOME}/.config/tmux/scripts/closed-tabs.sh reopen '#{session_id}' '#{client_tty}'"
+bind X run-shell "#{HOME}/.config/tmux/scripts/closed-tabs.sh pick-popup '#{session_id}' '#{client_tty}'"
 
 set -g status-position bottom
 
