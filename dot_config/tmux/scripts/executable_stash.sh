@@ -32,6 +32,8 @@
 #   stash.sh sel-move  left|right grow or shrink it
 #   stash.sh sel-cancel           drop the selection
 #   stash.sh sel-commit           park everything selected
+#   stash.sh sel-send             move everything selected to another (or a
+#                                 new) session, picked in a popup
 #   stash.sh count                how many are parked (for the status line)
 #   stash.sh list                 what is parked, and where each came from
 #   stash.sh restore-state        re-apply parked state after a resurrect restore
@@ -1396,6 +1398,159 @@ do_sel_commit() {
     do_stash_many $ids
 }
 
+# --- sending a selection to another session -----------------------------------
+#
+# The selection's other exit: m (or a, the prefix+a muscle memory) raises a
+# session picker shaped like prefix+a's, and the selected tabs MOVE there —
+# an existing session, or a new one named by typing it. ⏎ follows them over,
+# ⌥⏎ sends them off and stays put.
+#
+# Three steps, each where it has to be. sel-send runs in the key binding's
+# foreground run-shell (a popup needs a client to raise on) and does nothing
+# but read the selection and open the popup — the tint stays up while you
+# pick, so you can see what is about to go. send-pick runs INSIDE the popup,
+# where fzf has a terminal. send-many does the moves from a backgrounded
+# run-shell, for the same reason do_pick hands off: the popup closes the moment
+# you pick instead of lingering over the switch. A backgrounded run-shell has
+# no client of its own, so the client name is carried through all three and
+# every switch-client / display-message names it explicitly.
+
+do_sel_send() {
+    local cur sess ids client="${2:-}" n
+    cur=$(sel_win "${1:-}"); [ -n "$cur" ] || return 0
+    sess=$(sel_sess_of "$cur"); [ -n "$sess" ] || return 0
+    case "$sess" in "$HOLD") return 0 ;; esac
+    ids=$(sel_ids "$sess")
+    [ -n "$ids" ] || ids="$cur"
+    n=$(printf '%s\n' "$ids" | wc -l | tr -d ' ')
+    # Unquoted $ids: tmux window ids (@ plus digits), nothing for a shell to
+    # interpret. The session is NOT passed — send-pick re-derives it from the
+    # ids, so a user-chosen name never has to survive a round of quoting.
+    tmux display-popup ${client:+-c "$client"} -E -w 60% -h 75% \
+        -T " move $n tab$([ "$n" -eq 1 ] || echo s) to… " \
+        "'$SELF' send-pick '$client' $(printf '%s ' $ids)"
+}
+
+do_send_pick() {
+    local client="${1:-}"; shift
+    local src out status query key selection target mode=follow
+    src=$(sel_sess_of "${1:-}")
+    [ -n "$src" ] || { do_sel_cancel; return 0; }
+
+    command -v fzf >/dev/null 2>&1 || { do_sel_cancel; tmux display-message ${client:+-c "$client"} "stash: fzf not found"; return 0; }
+
+    # Same list and order as prefix+a (mru-session-switch.sh): most recently
+    # attached first, minus the session the tabs are already in and the ones
+    # that are not places to put things.
+    local list
+    list=$(tmux list-sessions -F $'#{session_last_attached}\t#{session_name}' 2>/dev/null \
+        | awk -F '\t' -v cur="$src" -v hold="$HOLD" '$2 != cur && $2 != "scratch" && $2 != "agents" && $2 != hold' \
+        | sort -t $'\t' -k1,1nr | cut -f2-)
+
+    local fzf_cmd=(fzf --print-query --expect=alt-enter --reverse --ansi --info=hidden
+                   --prompt 'move to > '
+                   --header '⏎ move & follow · ⌥⏎ move & stay · no match ⏎ = new session')
+    local preview="$HOME/.config/tmux/scripts/preview_session.sh"
+    [ -x "$preview" ] && fzf_cmd+=(--preview "'$preview' {}" --preview-window=down:70%:nowrap:noinfo)
+
+    out=$({ [ -n "$list" ] && printf '%s\n' "$list"; } | "${fzf_cmd[@]}")
+    status=$?
+    # 0 = picked a row, 1 = no row matched (the typed name is the answer);
+    # anything else is Esc / ⌃c.
+    if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then do_sel_cancel; return 0; fi
+
+    query=$(printf '%s\n' "$out" | sed -n '1p' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    key=$(printf '%s\n' "$out" | sed -n '2p')
+    selection=$(printf '%s\n' "$out" | sed -n '3p')
+    target="${selection:-$query}"
+    [ "$key" = "alt-enter" ] && mode=stay
+
+    do_sel_cancel
+    [ -n "$target" ] || return 0
+    # Validated before it goes anywhere near a command string — the same rule
+    # prefix+a applies to names it will create.
+    if ! [[ "$target" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        tmux display-message ${client:+-c "$client"} "Invalid session name (allowed: A-Z a-z 0-9 . _ -): $target"
+        return 0
+    fi
+    tmux run-shell -b "'$SELF' send-many '$client' $mode '$target' $*"
+}
+
+do_send_many() {
+    local client="$1" mode="$2" target="$3"; shift 3
+    local w s src="" wins=() seen="" created=0 boot="" total
+    say() { tmux display-message ${client:+-c "$client"} "$*" 2>/dev/null; }
+
+    case "$target" in
+        "$HOLD")  say "that's the parking session — use H to hide tabs"; return 0 ;;
+        scratch)  return 0 ;;
+    esac
+
+    lock_acquire || { say "stash: busy — try again"; return 0; }
+
+    # Re-resolve under the lock: the picker may have sat open a while, and in
+    # the meantime a tab can have closed, been parked, or moved elsewhere.
+    for w in "$@"; do
+        [ -n "$w" ] || continue
+        s=$(tmux display-message -p -t "$w" '#{session_name}' 2>/dev/null) || continue
+        [ -n "$s" ] && [ "$s" != "$HOLD" ] || continue
+        [ -n "$src" ] || src="$s"
+        [ "$s" = "$src" ] || continue
+        case " $seen " in *" $w "*) continue ;; esac
+        seen="$seen $w"; wins+=("$w")
+    done
+
+    if [ "${#wins[@]}" -eq 0 ]; then lock_release; say "nothing to move"; return 0; fi
+    if [ "$src" = "$target" ]; then lock_release; say "already in $target"; return 0; fi
+
+    total=$(tmux list-windows -t "=$src" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ')
+    case "$total" in ''|*[!0-9]*) total=0 ;; esac
+    # Taking every tab destroys the source session, and detach-on-destroy is on:
+    # fine when the client is following them (it is switched away first), but
+    # staying behind would mean staying in a session that no longer exists.
+    if [ "$mode" = stay ] && [ "$total" -le "${#wins[@]}" ]; then
+        lock_release
+        say "that's every tab in $src — leave one behind, or ⏎ to follow them"
+        return 0
+    fi
+
+    # A session cannot be born empty: create it with a placeholder and kill
+    # that once the real tabs are in (the ensure_hold pattern, -P -F for the
+    # same reason — only ever kill the window THIS call created).
+    if ! tmux has-session -t "=$target" 2>/dev/null; then
+        boot=$(tmux new-session -d -s "$target" -c "$HOME" -P -F '#{window_id}' 2>/dev/null) || boot=""
+        [ -n "$boot" ] || { lock_release; say "could not create session $target"; return 0; }
+        created=1
+    fi
+
+    # Switch BEFORE moving when following: if the last move empties the source,
+    # the client must already be somewhere else or detach-on-destroy drops it
+    # to a shell.
+    [ "$mode" = follow ] && tmux switch-client ${client:+-c "$client"} -t "=$target" 2>/dev/null
+
+    local moved=() failed=0
+    for w in "${wins[@]}"; do
+        tmux set-option -uw -t "$w" @stash_sel 2>/dev/null
+        if tmux move-window -s "$w" -t "=$target:" 2>/dev/null; then moved+=("$w"); else failed=$((failed + 1)); fi
+    done
+
+    if [ "${#moved[@]}" -eq 0 ]; then
+        [ "$created" = 1 ] && tmux kill-session -t "=$target" 2>/dev/null
+        lock_release
+        say "could not move them"
+        return 0
+    fi
+    [ -n "$boot" ] && tmux kill-window -t "$boot" 2>/dev/null
+    renumber "$src" "$target"
+    [ "$mode" = follow ] && tmux select-window -t "${moved[0]}" 2>/dev/null
+    lock_release
+
+    local n="${#moved[@]}" report
+    report="moved $n tab$([ "$n" -eq 1 ] || echo s) to $target$([ "$created" = 1 ] && echo ' (new)')"
+    [ "$failed" -gt 0 ] && report="$report — could not move $failed"
+    say "$report"
+}
+
 # Windows that are NOT parked but still carry a suspended session — a resume
 # that was declined because the pane was busy. Before this existed the advice
 # "prefix+h again once it's at a prompt" was impossible to follow: do_unstash
@@ -1766,6 +1921,9 @@ case "${1:-}" in
     sel-move)   shift; do_sel_move "${1:-right}" "${2:-}" ;;
     sel-cancel) do_sel_cancel ;;
     sel-commit) shift; do_sel_commit "${1:-}" ;;
+    sel-send)   shift; do_sel_send "${1:-}" "${2:-}" ;;
+    send-pick)  shift; do_send_pick "$@" ;;
+    send-many)  shift; do_send_many "$@" ;;
     count)   count ;;
     publish) publish ;;
     pick)    do_pick ;;
