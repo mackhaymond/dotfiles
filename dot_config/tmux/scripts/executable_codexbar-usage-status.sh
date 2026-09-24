@@ -2,6 +2,20 @@
 
 set -euo pipefail
 
+# Not every caller hands this script a login PATH. UsageBar is a LaunchAgent
+# and runs it under launchd's /usr/bin:/bin:/usr/sbin:/sbin, where codexbar,
+# tmux and the Homebrew jq do not exist: every Codex fetch it started failed as
+# "missing tool codexbar" and walked Codex's backoff ladder up to an hour, and
+# none of the @codexbar_* options were read. Append (never prepend — a caller
+# with a real PATH keeps its own precedence) the places those tools live.
+for _bin in /opt/homebrew/bin /opt/homebrew/sbin /usr/local/bin "$HOME/.local/bin" "$HOME/.bun/bin"; do
+  if [[ -d "$_bin" && ":${PATH:-}:" != *":${_bin}:"* ]]; then
+    PATH="${PATH:+${PATH}:}${_bin}"
+  fi
+done
+unset _bin
+export PATH
+
 
 CACHE_DIR="${HOME}/.cache/codexbar-tmux"
 CACHE_FILE="${CACHE_DIR}/usage.json"
@@ -488,30 +502,6 @@ refresh_fail() {
   return 1
 }
 
-# True when at least ONE configured provider is past its own backoff. The
-# staleness gate asks this rather than asking a single ladder: with two
-# providers, the one that is failing must not hold the other off the network,
-# and the one that is healthy must not drag the failing one back onto it
-# before its ladder says so (refresh_cache re-checks per provider).
-any_provider_refresh_allowed() {
-  local now="${1:-}" p fc na allowed=1 saved="$ACTIVE_PROVIDER"
-  [[ "$now" =~ ^[0-9]+$ ]] || now="$(now_epoch)"
-
-  for p in $USAGE_PROVIDERS; do
-    select_provider "$p"
-    read -r fc na < <(read_refresh_backoff)
-    if (( now >= na )); then
-      allowed=0
-      break
-    fi
-  done
-
-  if [[ -n "${saved:-}" ]]; then
-    select_provider "$saved"
-  fi
-  return $allowed
-}
-
 iso_utc_to_epoch() {
   local iso="${1:-}"
   [[ -n "$iso" ]] || return 1
@@ -739,37 +729,62 @@ color_for_window() {
   esac
 }
 
-# How fresh the NUMBERS are, which drives the staleness gate that triggers a
-# refresh. The OLDEST enabled provider's updated_at, so one provider fetching
-# happily never masks another that has stopped — and it is read from the file's
-# own fields rather than its mtime, because usage.json is now rewritten for
-# reasons that are not "these numbers are new" (another provider succeeded, a
-# failure recorded its state). Trusting mtime there would mark the cache fresh
-# after a failed fetch and suppress the retry that was the whole point.
-cache_updated_at() {
+# How fresh ONE provider's NUMBERS are: its block's updated_at, which only a
+# successful fetch moves. Read from the file's own fields rather than its
+# mtime, because usage.json is rewritten for reasons that are not "these
+# numbers are new" (another provider succeeded, a failure recorded its state).
+# 0 when the provider has no numbers yet, which reads as stale.
+provider_updated_at() {
+  local provider="${1:-}" ts=''
   [[ -f "$CACHE_FILE" ]] || { printf '%s' 0; return 0; }
 
-  local ts=''
   if command -v jq >/dev/null 2>&1; then
-    ts="$(jq -r --argjson enabled "$(enabled_providers_json)" '
-      [ (.providers // {}) | to_entries[]
-        | select(.key as $k | $enabled | index($k))
-        | (.value.updated_at // 0) ] as $stamps
-      | (if ($stamps | length) > 0 then ($stamps | min) else (.updated_at // 0) end)
-      | floor
+    # A cache written before the providers map existed IS the primary's block.
+    ts="$(jq -r --arg p "$provider" --arg primary "$PROVIDER_PRIMARY" '
+      ( .providers[$p].updated_at
+        // (if (has("providers") | not) and $p == $primary then .updated_at else null end)
+        // 0 ) | floor
     ' "$CACHE_FILE" 2>/dev/null || true)"
   fi
-  if [[ "${ts:-}" =~ ^[0-9]+$ ]]; then
-    printf '%s' "$ts"
-    return 0
-  fi
+  [[ "${ts:-}" =~ ^[0-9]+$ ]] || ts=0
+  printf '%s' "$ts"
+}
 
-  ts="$(stat -f %m "$CACHE_FILE" 2>/dev/null || stat -c %Y "$CACHE_FILE" 2>/dev/null || true)"
-  if [[ "$ts" =~ ^[0-9]+$ ]]; then
-    printf '%s' "$ts"
-  else
-    printf '%s' 0
+# True when this provider is worth a network call right now: its numbers are
+# stale AND its own backoff ladder has run out.
+#
+# PER PROVIDER, NOT "OLDEST STALE + ANYONE ALLOWED". The gate used to take the
+# oldest provider's updated_at for staleness and then ask whether ANY ladder
+# was open. With Codex failing (stale for good) and Claude healthy (ladder
+# open), that pair was true on every status tick, so every tick re-fetched
+# Claude — five or six times inside ten seconds whenever its backoff cleared,
+# until the endpoint answered rate_limit_error and armed the ladder again. The
+# visible result was Claude's numbers sticking for minutes at a time, while
+# the provider that was actually stale never got anything from it.
+provider_refresh_due() {
+  local provider="${1:-}" now="${2:-}" ts age fc na saved="$ACTIVE_PROVIDER" due=1
+  [[ "$now" =~ ^[0-9]+$ ]] || now="$(now_epoch)"
+
+  ts="$(provider_updated_at "$provider")"
+  age=$(( now - ts ))
+  # A backward wall-clock step (e.g. NTP correction on wake) makes age
+  # negative; treat that as stale so the recovery refresh isn't suppressed.
+  if (( age < 0 || age >= STALE_AFTER_SECONDS )); then
+    select_provider "$provider"
+    read -r fc na < <(read_refresh_backoff)
+    (( now >= na )) && due=0
+    [[ -n "${saved:-}" ]] && select_provider "$saved"
   fi
+  return $due
+}
+
+any_provider_refresh_due() {
+  local now="${1:-}" p
+  [[ "$now" =~ ^[0-9]+$ ]] || now="$(now_epoch)"
+  for p in $USAGE_PROVIDERS; do
+    provider_refresh_due "$p" "$now" && return 0
+  done
+  return 1
 }
 
 strip_legacy_label_prefix() {
@@ -2792,10 +2807,13 @@ refresh_cache() {
     select_provider "$provider"
     now="$(now_epoch)"
 
+    # An unforced refresh also leaves a provider alone while its numbers are
+    # still fresh: this runs whenever SOME provider is due, and re-fetching
+    # the healthy one on every such run is what got Claude rate-limited.
     if [[ "${CODEXBAR_USAGE_FORCE_REFRESH:-}" != "1" ]]; then
-      read -r fc na < <(read_refresh_backoff)
-      if (( now < na )); then
-        log_debug "refresh[${provider}]: backoff until ${na} (fail_count=${fc})"
+      if ! provider_refresh_due "$provider" "$now"; then
+        read -r fc na < <(read_refresh_backoff)
+        log_debug "refresh[${provider}]: not due (updated_at=$(provider_updated_at "$provider") backoff_until=${na} fail_count=${fc})"
         continue
       fi
     fi
@@ -2888,7 +2906,12 @@ main() {
       # steady-state backoff behaviour is unchanged.
       if (( tick_marker_age >= WAKE_GAP_SECONDS )); then
         log_info "tick: wake/resume detected (gap=${tick_marker_age}s); resetting refresh backoff"
-        reset_refresh_backoff
+        # Every ladder, not just the displayed provider's: the one armed before
+        # sleep is as likely to be the provider nobody is looking at.
+        local wake_p
+        for wake_p in $USAGE_PROVIDERS; do
+          rm -f "$(backoff_file_for "$wake_p")" 2>/dev/null || true
+        done
       fi
 
       : >"$tick_marker" 2>/dev/null || true
@@ -2904,19 +2927,8 @@ main() {
         -mmin +5 -delete 2>/dev/null || true
 
       publish_to_tmux_opts || true
-      local tick_ts tick_now tick_age
-      tick_ts="$(cache_updated_at)"
-      tick_now="$(now_epoch)"
-      tick_age=$(( tick_now - tick_ts ))
-      # A backward wall-clock step (e.g. NTP correction on wake) makes tick_age
-      # negative; treat that as stale so the recovery refresh isn't suppressed.
-      if (( tick_age < 0 )); then
-        tick_age=$STALE_AFTER_SECONDS
-      fi
-      if [[ ! -f "$CACHE_FILE" ]] || (( tick_age >= STALE_AFTER_SECONDS )); then
-        if any_provider_refresh_allowed "$tick_now"; then
-          spawn_background_refresh_locked || true
-        fi
+      if any_provider_refresh_due "$(now_epoch)"; then
+        spawn_background_refresh_locked || true
       fi
       exit 0
       ;;
@@ -2942,26 +2954,8 @@ main() {
 
   print_value "$mode"
 
-  local ts now age
-  ts="$(cache_updated_at)"
-  now="$(now_epoch)"
-  age=$(( now - ts ))
-  # A backward wall-clock step (e.g. NTP correction on wake) makes age negative;
-  # treat that as stale so the recovery refresh isn't suppressed.
-  if (( age < 0 )); then
-    age=$STALE_AFTER_SECONDS
-  fi
-
-  if [[ ! -f "$CACHE_FILE" ]] || (( age >= STALE_AFTER_SECONDS )); then
+  if any_provider_refresh_due "$(now_epoch)"; then
     mkdir -p "$CACHE_DIR"
-
-    log_debug "stale: now=${now} ts=${ts} age=${age} threshold=${STALE_AFTER_SECONDS}"
-
-    if ! any_provider_refresh_allowed "$now"; then
-      log_debug "stale: every provider in backoff"
-      return 0
-    fi
-
     log_debug "stale: spawn refresh"
     spawn_background_refresh_locked || true
   fi
