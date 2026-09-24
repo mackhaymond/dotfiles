@@ -466,13 +466,16 @@ reset_refresh_backoff() {
   rm -f "$BACKOFF_FILE" 2>/dev/null || true
 }
 
+# $1 (optional): the lowest rung this failure may land on, for failures that
+# are known to need more than the 60s first step.
 record_refresh_backoff_failure() {
   mkdir -p "$CACHE_DIR" 2>/dev/null || true
 
-  local fail_count next_allowed now delay
+  local fail_count next_allowed now delay min_rung="${1:-0}"
   read -r fail_count next_allowed < <(read_refresh_backoff)
 
   fail_count=$(( fail_count + 1 ))
+  (( fail_count >= min_rung )) || fail_count=$min_rung
   delay="$(refresh_backoff_delay_seconds "$fail_count")"
   now="$(now_epoch)"
   next_allowed=$(( now + delay ))
@@ -2022,6 +2025,10 @@ FETCH_SCOPED_LOCKED=0
 # such breakdown, which is every provider but Claude today.
 FETCH_BREAKDOWN_JSON='[]'
 FETCH_AUTH_REQUIRED=0
+# The endpoint answered, but with rate_limit_error. Not a broken fetch: the
+# budget is per account token and shared with every Claude Code session on it,
+# so this happens under heavy use even at one request per poll interval.
+FETCH_RATE_LIMITED=0
 
 reset_fetch_outputs() {
   FETCH_SESSION_USED=''
@@ -2044,6 +2051,7 @@ reset_fetch_outputs() {
   FETCH_SCOPED_LOCKED=0
   FETCH_BREAKDOWN_JSON='[]'
   FETCH_AUTH_REQUIRED=0
+  FETCH_RATE_LIMITED=0
   CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED=0
 }
 
@@ -2279,6 +2287,12 @@ fetch_via_claude_oauth() {
       FETCH_AUTH_REQUIRED=1
       return 1
     fi
+  fi
+
+  if printf '%s' "$raw" | jq -e '(try .error.type catch null) == "rate_limit_error"' >/dev/null 2>&1; then
+    log_warn "refresh[claude]: rate limited by the usage endpoint"
+    FETCH_RATE_LIMITED=1
+    return 1
   fi
 
   if ! printf '%s' "$raw" | jq -e '.five_hour and .seven_day' >/dev/null 2>&1; then
@@ -2720,6 +2734,13 @@ refresh_one_provider() {
     claude)
       if fetch_via_claude_oauth; then
         fetch_ok=1
+      elif (( FETCH_RATE_LIMITED != 0 )); then
+        # Throttled, not broken: leave the block (and its state) exactly as
+        # the last good fetch wrote it, so readers show aging numbers rather
+        # than an error, and start the ladder at 5 minutes — the 60s first
+        # rung only ever bought another rate_limit_error.
+        record_refresh_backoff_failure 3
+        return 1
       elif (( FETCH_AUTH_REQUIRED != 0 )); then
         log_warn "refresh[claude]: authentication required"
         RENDER_BLOCK="$(provider_status_patch "$provider" auth_required "$now")"
@@ -2810,8 +2831,19 @@ refresh_cache() {
     # An unforced refresh also leaves a provider alone while its numbers are
     # still fresh: this runs whenever SOME provider is due, and re-fetching
     # the healthy one on every such run is what got Claude rate-limited.
+    # CODEXBAR_USAGE_EAGER_PROVIDERS names providers the caller KNOWS just
+    # moved (codexbar-usage-push.sh after a Claude Code turn): for those,
+    # freshness is waived and only the backoff ladder still applies.
+    local eager=" ${CODEXBAR_USAGE_EAGER_PROVIDERS:-} "
+    eager="${eager//,/ }"
     if [[ "${CODEXBAR_USAGE_FORCE_REFRESH:-}" != "1" ]]; then
-      if ! provider_refresh_due "$provider" "$now"; then
+      if [[ "$eager" == *" ${provider} "* ]]; then
+        read -r fc na < <(read_refresh_backoff)
+        if (( now < na )); then
+          log_debug "refresh[${provider}]: eager but in backoff until ${na} (fail_count=${fc})"
+          continue
+        fi
+      elif ! provider_refresh_due "$provider" "$now"; then
         read -r fc na < <(read_refresh_backoff)
         log_debug "refresh[${provider}]: not due (updated_at=$(provider_updated_at "$provider") backoff_until=${na} fail_count=${fc})"
         continue
@@ -2829,7 +2861,7 @@ refresh_cache() {
   done
 
   if [[ "$blocks" == '{}' ]]; then
-    log_debug "refresh: nothing attempted (every provider in backoff)"
+    log_debug "refresh: nothing written (every provider fresh, in backoff, or rate limited)"
     return 1
   fi
 

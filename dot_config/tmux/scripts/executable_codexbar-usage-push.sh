@@ -29,7 +29,11 @@ CACHE_DIR="$HOME/.cache/codexbar-tmux"
 CACHE_FILE="$CACHE_DIR/usage.json"
 LOCK="$CACHE_DIR/push.lock"
 PENDING="$CACHE_DIR/push.pending"
-MIN_GAP=20        # seconds between fetches, whatever the Stop rate
+# Seconds between fetches, whatever the Stop rate. Was 20: the usage
+# endpoint's budget is per account token and shared with every Claude Code
+# session on it, and under heavy use a fetch every 20s answered
+# rate_limit_error often enough to hold the numbers still for minutes.
+MIN_GAP=60
 LOCK_STALE=120    # a holder older than this is dead; take the lock
 
 [[ -x "$SRC" ]] || exit 0
@@ -101,7 +105,11 @@ for pass in 1 2; do
     rm -f "$PENDING"
   fi
 
-  CODEXBAR_USAGE_PROVIDER="$PROVIDER" "$SRC" --refresh >/dev/null 2>&1 || true
+  # EAGER: an unforced --refresh skips providers whose numbers are younger
+  # than the poll interval, which is exactly when this runs; this provider
+  # just moved, so waive that for it (its backoff still applies).
+  CODEXBAR_USAGE_PROVIDER="$PROVIDER" CODEXBAR_USAGE_EAGER_PROVIDERS="$PROVIDER" \
+    "$SRC" --refresh >/dev/null 2>&1 || true
   # --refresh already publishes the tmux user options; this makes the status
   # line redraw now rather than at its next status-interval.
   tmux refresh-client -S >/dev/null 2>&1 || true
