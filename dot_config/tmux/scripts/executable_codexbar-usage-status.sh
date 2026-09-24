@@ -37,6 +37,13 @@ LOCKDIR="${CACHE_FILE}.lock"
 # write_usage_cache.
 HISTORY_FILE="${CACHE_DIR}/usage-history.jsonl"
 HISTORY_MAX_LINES=120
+
+# Claude's session/weekly utilization as Claude Code itself last saw it,
+# written by codexbar-usage-live.sh from the status line (see that script),
+# and a copy of the sample most recently folded into usage.json — a tick
+# compares the two to catch a sample whose own --merge-live found the lock busy.
+LIVE_SAMPLE_FILE="${CACHE_DIR}/claude-live.json"
+LIVE_MERGED_MARKER="${CACHE_DIR}/claude-live.merged"
 HISTORY_RECENT_WINDOW_SECONDS=1800
 
 CODEXBAR_TMP_FILES=()
@@ -419,7 +426,7 @@ LOCK_STALE_SECONDS=120
 WAKE_GAP_SECONDS=60
 
 usage() {
-  printf '%s\n' "Usage: $0 {session|weekly|scoped|--refresh|--publish|--tick|--auth-required|--login|--debug-flash-tick <nonce>}" >&2
+  printf '%s\n' "Usage: $0 {session|weekly|scoped|--refresh|--publish|--merge-live|--tick|--auth-required|--login|--debug-flash-tick <nonce>}" >&2
 }
 
 now_epoch() {
@@ -732,11 +739,15 @@ color_for_window() {
   esac
 }
 
-# How fresh ONE provider's NUMBERS are: its block's updated_at, which only a
-# successful fetch moves. Read from the file's own fields rather than its
-# mtime, because usage.json is rewritten for reasons that are not "these
-# numbers are new" (another provider succeeded, a failure recorded its state).
-# 0 when the provider has no numbers yet, which reads as stale.
+# When ONE provider was last FETCHED from its endpoint: the block's fetched_at,
+# which only a successful fetch moves, falling back to updated_at for a block
+# written before fetched_at existed. Not updated_at itself: Claude's updated_at
+# also moves when Claude Code's live numbers are folded in (merge_live_claude),
+# and gating the poll on that would stop fetching the things only the endpoint
+# has (the scoped cap, severities, the breakdown) whenever a session is busy.
+# Read from the file's own fields rather than its mtime, because usage.json is
+# rewritten for reasons that are not "these numbers are new". 0 when the
+# provider has no numbers yet, which reads as stale.
 provider_updated_at() {
   local provider="${1:-}" ts=''
   [[ -f "$CACHE_FILE" ]] || { printf '%s' 0; return 0; }
@@ -744,7 +755,8 @@ provider_updated_at() {
   if command -v jq >/dev/null 2>&1; then
     # A cache written before the providers map existed IS the primary's block.
     ts="$(jq -r --arg p "$provider" --arg primary "$PROVIDER_PRIMARY" '
-      ( .providers[$p].updated_at
+      ( .providers[$p].fetched_at
+        // .providers[$p].updated_at
         // (if (has("providers") | not) and $p == $primary then .updated_at else null end)
         // 0 ) | floor
     ' "$CACHE_FILE" 2>/dev/null || true)"
@@ -2685,9 +2697,13 @@ render_provider_block() {
     --argjson breakdown "$breakdown" \
     --arg raw_file "$(basename "$(raw_file_for "$provider")")" \
     --arg history_file "$(basename "$(history_file_for "$provider")")" \
+    --argjson fetched_at "$(json_num_or_null "${RENDER_FETCHED_AT:-$updated_at}")" \
     '{
        provider: $provider, label: $label, state: "ok",
        updated_at: $updated_at, checked_at: $updated_at,
+       # updated_at: as of when the numbers are current (any source).
+       # fetched_at: the last endpoint fetch, which the poll gates on.
+       fetched_at: $fetched_at,
 
        session_used: $session_used, session_window_minutes: $session_window,
        session_resets_at: $session_resets, session_text: $session_text,
@@ -2717,6 +2733,202 @@ render_provider_block() {
      }' 2>/dev/null || true)"
 
   [[ -n "${RENDER_BLOCK:-}" ]] || return 1
+  return 0
+}
+
+# ── Claude Code's live numbers ──────────────────────────────────────────────
+#
+# BEST OF BOTH. The endpoint is the only source of the scoped cap, the
+# severities, the locked flags and the breakdown, and the only one that sees
+# usage Claude Code cannot (claude.ai, the phone) — but it is a poll, and its
+# budget is shared with every session. Claude Code's status line carries the
+# session and weekly utilization off every API response, free and live after
+# every turn. So the endpoint keeps its poll, the live sample fills the time
+# between polls, and for each window the two are reconciled by one rule:
+#
+#   same window (resets_at within 10 min)  the HIGHER reading — usage only
+#                                          rises inside a window, so the
+#                                          higher one is simply the newer one
+#   different windows                      the LATER window
+#   a live reading whose window has passed ignored; an endpoint reading is
+#                                          never dropped, it is what we have
+#
+# Applied to FETCH_SESSION_* / FETCH_WEEKLY_* in place. $1 is the sample JSON,
+# $2 the time the FETCH_* values are as of. LIVE_AS_OF becomes the newest
+# first-seen time among the readings kept (never older than $2).
+LIVE_AS_OF=0
+# The fetched_at render_provider_block stamps; empty means "this render IS a
+# fetch" (fetched_at = updated_at).
+RENDER_FETCHED_AT=''
+apply_claude_live_sample() {
+  local sample="${1:-}" base_t="${2:-0}" out
+  LIVE_AS_OF="$base_t"
+  [[ -n "${sample:-}" ]] || return 0
+  [[ "$base_t" =~ ^[0-9]+$ ]] || base_t=0
+
+  out="$(printf '%s' "$sample" | jq -r \
+    --argjson now "$(now_epoch)" --argjson base_t "$base_t" \
+    --arg su "${FETCH_SESSION_USED:-}" --arg sr "${FETCH_SESSION_RESETS_AT:-}" \
+    --arg wu "${FETCH_WEEKLY_USED:-}" --arg wr "${FETCH_WEEKLY_RESETS_AT:-}" '
+      def num($s): ($s | tonumber? // null);
+      def api($u; $r):
+        if num($u) == null then null
+        else {used: num($u), resets_at: num($r), t: $base_t} end;
+      def open($x):
+        if ($x | type) == "object" and ($x.used | type) == "number"
+           and ($x.resets_at // 0) > $now
+        then $x else null end;
+      def pick($a; $l):
+        if $l == null then $a
+        elif $a == null or $a.resets_at == null then $l
+        elif (($a.resets_at - $l.resets_at) | fabs) <= 600 then
+          (if $l.used > $a.used then $l else $a end)
+        elif $l.resets_at > $a.resets_at then $l
+        else $a end;
+      pick(api($su; $sr); open(.five_hour)) as $s
+      | pick(api($wu; $wr); open(.seven_day)) as $w
+      | if $s == null or $w == null then empty else
+          [ $s.used, ($s.resets_at // ""), $w.used, ($w.resets_at // ""),
+            ([$s.t, $w.t, $base_t] | max) ]
+          | map(tostring) | join(" ")
+        end
+    ' 2>/dev/null || true)"
+  [[ -n "${out:-}" ]] || return 0
+
+  local su sr wu wr as_of
+  read -r su sr wu wr as_of <<<"$out"
+  FETCH_SESSION_USED="$su"
+  FETCH_SESSION_RESETS_AT="$sr"
+  FETCH_WEEKLY_USED="$wu"
+  FETCH_WEEKLY_RESETS_AT="$wr"
+  [[ "$as_of" =~ ^[0-9]+$ ]] && LIVE_AS_OF="$as_of"
+  return 0
+}
+
+# Reload a provider's FETCH_* from its block in usage.json, so the block can
+# be re-rendered with some fields changed and everything else — the scoped
+# cap, labels, severities, breakdown — exactly as the last fetch left it.
+# Also sets BLOCK_STATE, BLOCK_UPDATED_AT and BLOCK_FETCHED_AT.
+BLOCK_STATE=''
+BLOCK_UPDATED_AT=0
+BLOCK_FETCHED_AT=0
+load_fetch_from_block() {
+  local provider="$1" line
+  reset_fetch_outputs
+  [[ -f "$CACHE_FILE" ]] || return 1
+
+  # \x1f, not a tab: tab is IFS whitespace, so `read` would merge the empty
+  # fields a null scoped window produces and shift everything after them.
+  line="$(jq -r --arg p "$provider" '
+    .providers[$p] // empty
+    | select(.session_used != null and .weekly_used != null)
+    | [ .session_used, .weekly_used, .scoped_used,
+        .session_window_minutes, .weekly_window_minutes, .scoped_window_minutes,
+        .session_resets_at, .weekly_resets_at, .scoped_resets_at,
+        .session_label, .weekly_label, .scoped_label,
+        .session_severity, .weekly_severity, .scoped_severity,
+        .session_locked, .weekly_locked, .scoped_locked,
+        .state, (.updated_at // 0), (.fetched_at // .updated_at // 0) ]
+    | map(if . == null then "" elif . == true then "1" elif . == false then "0"
+          else tostring end)
+    | join("\u001f")
+  ' "$CACHE_FILE" 2>/dev/null || true)"
+  [[ -n "${line:-}" ]] || return 1
+
+  IFS=$'\x1f' read -r \
+    FETCH_SESSION_USED FETCH_WEEKLY_USED FETCH_SCOPED_USED \
+    FETCH_SESSION_WINDOW_MINUTES FETCH_WEEKLY_WINDOW_MINUTES FETCH_SCOPED_WINDOW_MINUTES \
+    FETCH_SESSION_RESETS_AT FETCH_WEEKLY_RESETS_AT FETCH_SCOPED_RESETS_AT \
+    FETCH_SESSION_LABEL FETCH_WEEKLY_LABEL FETCH_SCOPED_LABEL \
+    FETCH_SESSION_SEVERITY FETCH_WEEKLY_SEVERITY FETCH_SCOPED_SEVERITY \
+    FETCH_SESSION_LOCKED FETCH_WEEKLY_LOCKED FETCH_SCOPED_LOCKED \
+    BLOCK_STATE BLOCK_UPDATED_AT BLOCK_FETCHED_AT <<<"$line"
+
+  [[ -n "${FETCH_SESSION_LABEL:-}" ]] || FETCH_SESSION_LABEL='Session'
+  [[ -n "${FETCH_WEEKLY_LABEL:-}" ]] || FETCH_WEEKLY_LABEL='Weekly'
+  local fam
+  for fam in SESSION WEEKLY SCOPED; do
+    local sev="FETCH_${fam}_SEVERITY" lck="FETCH_${fam}_LOCKED"
+    [[ -n "${!sev:-}" ]] || printf -v "$sev" '%s' 'normal'
+    [[ "${!lck:-}" == 1 ]] || printf -v "$lck" '%s' 0
+  done
+  [[ "$BLOCK_UPDATED_AT" =~ ^[0-9]+$ ]] || BLOCK_UPDATED_AT=0
+  [[ "$BLOCK_FETCHED_AT" =~ ^[0-9]+$ ]] || BLOCK_FETCHED_AT="$BLOCK_UPDATED_AT"
+
+  FETCH_BREAKDOWN_JSON="$(jq -c --arg p "$provider" '.providers[$p].breakdown // []' \
+    "$CACHE_FILE" 2>/dev/null || true)"
+  [[ -n "${FETCH_BREAKDOWN_JSON:-}" ]] || FETCH_BREAKDOWN_JSON='[]'
+  return 0
+}
+
+# Fold the live sample into Claude's block in usage.json. Run by
+# codexbar-usage-live.sh whenever the sample changes (--merge-live), and by the
+# tick for a sample that arrived while the lock was busy. Never touches the
+# network. Re-renders the block — text, colours and pace all follow the new
+# numbers — and leaves fetched_at alone, so the endpoint poll keeps its own
+# schedule for the things only it knows.
+merge_live_claude() {
+  provider_enabled claude || return 0
+  [[ -f "$LIVE_SAMPLE_FILE" && -f "$CACHE_FILE" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  # A refresh in flight folds the sample in itself; a sample that lands after
+  # it read the file is still newer than the marker, and the next tick has it.
+  if ! try_acquire_lock "$$"; then
+    log_debug "live[claude]: lock busy"
+    return 0
+  fi
+
+  local rc=0
+  merge_live_claude_locked || rc=$?
+  release_lock
+  return $rc
+}
+
+merge_live_claude_locked() {
+  local sample
+  sample="$(cat "$LIVE_SAMPLE_FILE" 2>/dev/null || true)"
+  [[ -n "${sample:-}" ]] || return 0
+  # The marker records what is being folded in, BEFORE the fold: a sample
+  # written meanwhile differs from it and the next tick picks it up.
+  printf '%s\n' "$sample" >"$LIVE_MERGED_MARKER" 2>/dev/null || true
+
+  select_provider claude
+  load_fetch_from_block claude || return 0
+
+  local before after now
+  before="$FETCH_SESSION_USED $FETCH_SESSION_RESETS_AT $FETCH_WEEKLY_USED $FETCH_WEEKLY_RESETS_AT"
+  apply_claude_live_sample "$sample" "$BLOCK_UPDATED_AT"
+  after="$FETCH_SESSION_USED $FETCH_SESSION_RESETS_AT $FETCH_WEEKLY_USED $FETCH_WEEKLY_RESETS_AT"
+  [[ "$before" != "$after" ]] || return 0
+
+  now="$(now_epoch)"
+  RENDER_FETCHED_AT="$BLOCK_FETCHED_AT"
+  render_provider_block claude "$LIVE_AS_OF" || return 1
+  RENDER_FETCHED_AT=''
+
+  # Live numbers do not clear a login problem — only a fetch proves the token
+  # works — but they do supersede an "error", which only ever meant the
+  # numbers had stopped moving.
+  if [[ "$BLOCK_STATE" == 'auth_required' ]]; then
+    RENDER_BLOCK="$(printf '%s' "$RENDER_BLOCK" | jq -c '.state = "auth_required"' 2>/dev/null || printf '%s' "$RENDER_BLOCK")"
+  fi
+
+  local blocks
+  blocks="$(jq -nc --argjson b "$RENDER_BLOCK" '{claude: $b}' 2>/dev/null || true)"
+  [[ -n "${blocks:-}" ]] || return 1
+  write_usage_cache "$blocks" || return 1
+
+  append_usage_history "$LIVE_AS_OF" "$RENDER_SESSION_USED" "$RENDER_WEEKLY_USED" \
+    "$RENDER_SESSION_RESETS" "$RENDER_WEEKLY_RESETS" \
+    "$RENDER_SCOPED_USED" "$RENDER_SCOPED_RESETS" || true
+
+  log_info "live[claude]: from Claude Code session=${RENDER_SESSION_USED}% weekly=${RENDER_WEEKLY_USED}% (endpoint fetched $(( now - BLOCK_FETCHED_AT ))s ago)"
+
+  publish_to_tmux_opts || true
+  if command -v tmux >/dev/null 2>&1; then
+    tmux refresh-client -S >/dev/null 2>&1 || true
+  fi
   return 0
 }
 
@@ -2766,7 +2978,17 @@ refresh_one_provider() {
     return 1
   fi
 
-  if ! render_provider_block "$provider" "$now"; then
+  # The endpoint and Claude Code's live numbers are two views of the same
+  # counters; whichever saw more usage in the current window is the newer one.
+  if [[ "$provider" == 'claude' && -f "$LIVE_SAMPLE_FILE" ]]; then
+    apply_claude_live_sample "$(cat "$LIVE_SAMPLE_FILE" 2>/dev/null || true)" "$now"
+  fi
+  RENDER_FETCHED_AT="$now"
+  local rendered=0
+  render_provider_block "$provider" "$now" && rendered=1
+  RENDER_FETCHED_AT=''
+
+  if (( rendered == 0 )); then
     log_warn "refresh[${provider}]: unusable numbers; keeping the previous block"
     RENDER_BLOCK="$(provider_status_patch "$provider" error "$now")"
     record_refresh_backoff_failure
@@ -2905,6 +3127,10 @@ main() {
       publish_to_tmux_opts || true
       exit 0
       ;;
+    --merge-live)
+      merge_live_claude || true
+      exit 0
+      ;;
     --auth-required)
       cache_auth_required
       exit $?
@@ -2959,6 +3185,10 @@ main() {
         -mmin +5 -delete 2>/dev/null || true
 
       publish_to_tmux_opts || true
+      # Backstop for a live sample whose own --merge-live found the lock busy.
+      if [[ -f "$LIVE_SAMPLE_FILE" ]] && ! cmp -s "$LIVE_SAMPLE_FILE" "$LIVE_MERGED_MARKER"; then
+        merge_live_claude || true
+      fi
       if any_provider_refresh_due "$(now_epoch)"; then
         spawn_background_refresh_locked || true
       fi
