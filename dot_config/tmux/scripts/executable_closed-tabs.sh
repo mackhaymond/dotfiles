@@ -177,11 +177,11 @@ do_close() {
 
     local info
     info=$(tmux display-message -p -t "$pane" \
-        '#{pane_id}|#{pane_pid}|#{session_name}|#{window_index}|#{pane_current_path}|#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}' 2>/dev/null)
+        '#{pane_id}|#{pane_pid}|#{session_name}|#{session_id}|#{session_created}|#{window_index}|#{pane_current_path}|#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}' 2>/dev/null)
     # display-message against a dead target can succeed with an empty
     # expansion — test the expansion, not the exit status.
-    local pane_id pane_pid sess widx cwd label
-    IFS='|' read -r pane_id pane_pid sess widx cwd label <<<"$info"
+    local pane_id pane_pid sess tsess tcreated widx cwd label
+    IFS='|' read -r pane_id pane_pid sess tsess tcreated widx cwd label <<<"$info"
     [ -n "$pane_id" ] || return 1
 
     local ts id
@@ -201,8 +201,10 @@ do_close() {
 
     local rec
     rec=$(jq -cn --arg id "$id" --arg ts "$ts" --arg sess "$sess" --arg widx "$widx" \
+        --arg tsess "$tsess" --arg tcreated "$tcreated" \
         --arg cwd "$cwd" --arg label "$label" --arg tool "$tool" --arg sid "$sid" --arg cmd "$cmd" \
-        '{id: $id, ts: ($ts|tonumber), session: $sess, index: ($widx|tonumber), cwd: $cwd,
+        '{id: $id, ts: ($ts|tonumber), session: $sess, tmux_session: $tsess,
+          session_created: $tcreated, index: ($widx|tonumber), cwd: $cwd,
           label: $label, tool: $tool, session_id: $sid, cmd: $cmd}')
 
     # Recorded BEFORE anything dies: once the agent exits, claude deletes the
@@ -236,14 +238,24 @@ do_close() {
 # Recreate one recorded tab. Prints the new window id.
 reopen_one() {
     local rec="$1" client_sess="$2"
-    local sess idx cwd cmd
+    local sess tsess tcreated idx cwd cmd
     sess=$(jq -r '.session' <<<"$rec"); idx=$(jq -r '.index' <<<"$rec")
     cwd=$(jq -r '.cwd' <<<"$rec");      cmd=$(jq -r '.cmd // empty' <<<"$rec")
+    tsess=$(jq -r '.tmux_session // empty' <<<"$rec")
+    tcreated=$(jq -r '.session_created // empty' <<<"$rec")
 
-    # Back in its own session if that still exists, else wherever you are.
-    if ! tmux has-session -t "=$sess" 2>/dev/null; then
+    # Back in its own session, found by identity first: the tmux id survives a
+    # rename, but ids are handed out again after a server restart, so the
+    # session's creation time has to match too. Then by name (a session
+    # resurrect recreated after a restart), then wherever you are.
+    local now_created=""
+    [ -n "$tsess" ] && now_created=$(tmux display-message -p -t "$tsess" '#{session_created}' 2>/dev/null)
+    if [ -n "$tcreated" ] && [ "$now_created" = "$tcreated" ]; then
+        sess=$(tmux display-message -p -t "$tsess" '#{session_name}' 2>/dev/null)
+    elif ! tmux has-session -t "=$sess" 2>/dev/null; then
         sess=$(tmux display-message -p -t "$client_sess" '#{session_name}' 2>/dev/null)
         [ -n "$sess" ] || return 1
+        msg "closed-tabs: its session is gone — reopened in $sess"
     fi
     [ -d "$cwd" ] || cwd="$HOME"
 
