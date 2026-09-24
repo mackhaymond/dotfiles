@@ -59,17 +59,23 @@ msg() { tmux display-message "$*" 2>/dev/null; }
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOGFILE" 2>/dev/null; }
 
 # mkdir is the atomic lock (macOS has no flock(1)). A lock older than 10s is a
-# crashed holder; it is broken with rename(2), not rm+mkdir, so two waiters
-# can't both win.
+# crashed holder; it is broken with rename(2), not rm+mkdir. The age is checked
+# AGAIN on what the rename actually took: two waiters can both judge the same
+# dead lock stale, and the slower one's rename would otherwise carry off the
+# fresh lock the faster one had just made. A fresh catch is put back.
+lock_age() { echo $(( $(date +%s) - $(stat -f %m "$1" 2>/dev/null || date +%s) )); }
 lock_acquire() {
     local i=0
     until mkdir "$LOCK" 2>/dev/null; do
-        if [ $((i % 20)) -eq 19 ]; then
-            local age=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || date +%s) ))
-            if [ "$age" -gt 10 ] && mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null; then
+        if [ $((i % 20)) -eq 19 ] && [ "$(lock_age "$LOCK")" -gt 10 ] \
+           && mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null; then
+            if [ "$(lock_age "$LOCK.stale.$$")" -gt 10 ]; then
                 rm -rf "$LOCK.stale.$$"
                 continue
             fi
+            # Guarded: mv onto an existing directory moves INTO it.
+            [ -e "$LOCK" ] || mv "$LOCK.stale.$$" "$LOCK" 2>/dev/null
+            rm -rf "$LOCK.stale.$$"
         fi
         i=$((i + 1))
         [ "$i" -ge 200 ] && return 1
@@ -92,7 +98,10 @@ ids_json() { printf '%s\n' "$@" | jq -R . | jq -sc .; }
 prune() {
     local cutoff=$(( $(date +%s) - RETAIN_DAYS * 86400 ))
     history_filter --argjson cut "$cutoff" 'select(.ts >= $cut)'
-    if [ "$(grep -c . "$HISTORY" 2>/dev/null || echo 0)" -gt "$MAX_ENTRIES" ]; then
+    # grep -c prints "0" AND exits 1 on an empty file, so `|| echo 0` would
+    # yield "0\n0"; wc -l always prints exactly one number.
+    local n; n=$(wc -l <"$HISTORY" 2>/dev/null | tr -d ' '); n=${n:-0}
+    if [ "$n" -gt "$MAX_ENTRIES" ]; then
         tail -n "$MAX_ENTRIES" "$HISTORY" >"$HISTORY.tmp" && mv "$HISTORY.tmp" "$HISTORY"
     fi
     local keep f id
@@ -276,7 +285,7 @@ do_reopen() {
     history_filter --argjson ids "$(ids_json $ids)" 'select(.id as $i | $ids | index($i) | not)'
     lock_release
 
-    local rec win first="" n=0 failed=0
+    local rec win first="" n=0 failed=0 lost=0
     while IFS= read -r rec; do
         [ -n "$rec" ] || continue
         if win=$(reopen_one "$rec" "$client_sess") && [ -n "$win" ]; then
@@ -287,12 +296,22 @@ do_reopen() {
         else
             # Put it back rather than lose it.
             failed=$((failed + 1))
-            lock_acquire && { printf '%s\n' "$rec" >>"$HISTORY"; lock_release; }
+            if lock_acquire; then
+                printf '%s\n' "$rec" >>"$HISTORY"; lock_release
+            else
+                lost=$((lost + 1))
+                log "reopen failed and history busy, dropped: $rec"
+            fi
         fi
-    done < <(jq -sc 'sort_by(-.ts) | .[]' <<<"$recs")
+    # Newest close first. Ties on .ts (two closes in the same second) fall
+    # back to file order, reversed — sort_by is stable, so -.ts alone would
+    # replay same-second closes oldest first and swap their slots.
+    done < <(jq -sc 'to_entries | sort_by(-.value.ts, -.key) | .[].value' <<<"$recs")
 
     [ -n "$client_tty" ] && [ -n "$first" ] && tmux switch-client -c "$client_tty" -t "$first" 2>/dev/null
-    if [ "$failed" -gt 0 ]; then
+    if [ "$lost" -gt 0 ]; then
+        msg "closed-tabs: reopened $n, couldn't recreate $failed ($lost lost: history busy, see log)"
+    elif [ "$failed" -gt 0 ]; then
         msg "closed-tabs: reopened $n, couldn't recreate $failed (kept in the history)"
     fi
 }
