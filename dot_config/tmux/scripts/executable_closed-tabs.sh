@@ -37,8 +37,15 @@
 
 set -uo pipefail
 
-SELF="$HOME/.config/tmux/scripts/closed-tabs.sh"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-closed-tabs"
+# Re-entry (popup, preview, hand-offs through `tmux run-shell`) goes through
+# SELF with STATE_HOME carried along explicitly: commands tmux runs get the
+# SERVER's environment, not this process's. With the installed path and an
+# inherited XDG_STATE_HOME, a scratch copy pointed at a test history handed its
+# reopen to the installed script, which reopened the REAL history — ten tabs
+# on 2026-09-24. Whatever copy and history started a flow now finish it.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+STATE_DIR="$STATE_HOME/tmux-closed-tabs"
 HISTORY="$STATE_DIR/history.jsonl"
 PREVIEWS="$STATE_DIR/previews"
 LOCK="$STATE_DIR/lock"
@@ -104,19 +111,57 @@ prune() {
     if [ "$n" -gt "$MAX_ENTRIES" ]; then
         tail -n "$MAX_ENTRIES" "$HISTORY" >"$HISTORY.tmp" && mv "$HISTORY.tmp" "$HISTORY"
     fi
+    # One jq for the live ids, then in-shell matching: a grep per snapshot
+    # was a fork per history entry on every close and every CMD+Z.
     local keep f id
-    keep=$(jq -r '.id' "$HISTORY" 2>/dev/null)
+    keep=$'\n'$(jq -r '.id' "$HISTORY" 2>/dev/null)$'\n'
     for f in "$PREVIEWS"/*.ansi; do
         [ -e "$f" ] || continue
-        id=$(basename "$f" .ansi)
-        grep -qxF -- "$id" <<<"$keep" || rm -f "$f"
+        id=${f##*/}; id=${id%.ansi}
+        [[ "$keep" == *$'\n'"$id"$'\n'* ]] || rm -f "$f"
     done
 }
 
-# Resolve the agent running in a pane, if any, into a resume command.
-# Prints "<tool>\x1f<session_id>\x1f<pid>\x1f<cmd>" or nothing.
-agent_resume() {
-    local pane="$1" pane_pid="$2" cwd="$3"
+# Where the plugin's own hooks keep per-pid state (claude-<pid>.json from its
+# SessionStart hook, opencode-<pid>.json from its plugin). Same expression as
+# save-assistant-sessions.sh.
+ASSISTANT_STATE_DIR="${TMUX_ASSISTANT_RESURRECT_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect}"
+
+# The part of the agent lookup that needs the agent ALIVE, kept as small as
+# possible because the tab stays on screen until it's done: find the agent
+# process and copy its state file somewhere safe (claude deletes its own as it
+# exits). Resolving the session id from that copy happens after the kill.
+# Prints "<tool>\x1f<pid>\x1f<args>\x1f<state copy dir>" or nothing.
+agent_snapshot() {
+    local pane_pid="$1" pane_tty="$2"
+    local lib; lib="$(dirname "$RESURRECT_SAVE")/lib-detect.sh"
+    [ -r "$lib" ] || return 0
+    (
+        # shellcheck source=/dev/null
+        source "$lib" 2>/dev/null || exit 0
+        # Only the processes on this pane's terminal: 2-3ms, against ~50ms for
+        # the whole-machine `ps -eo` the plugin takes by default. The agent and
+        # everything under it share the pane's tty, so the tree walk sees all
+        # it needs.
+        local snap; snap=$(ps -t "${pane_tty#/dev/}" -o pid=,ppid=,args= 2>/dev/null)
+        [ -n "$snap" ] || exit 0
+        local apid args tool
+        apid=$(pane_has_assistant "$pane_pid" "$snap") || exit 0
+        args=$(awk -v p="$apid" '$1 == p { sub(/^ *[0-9]+ +[0-9]+ /, ""); print; exit }' <<<"$snap")
+        tool=$(detect_tool "$args")
+        [ -n "$tool" ] || exit 0
+        local copy; copy=$(mktemp -d)
+        cp "$ASSISTANT_STATE_DIR/$tool-$apid.json" "$copy/" 2>/dev/null
+        printf '%s\x1f%s\x1f%s\x1f%s\n' "$tool" "$apid" "$args" "$copy"
+    )
+}
+
+# The session behind an agent, through the plugin's own resolver (emit_session).
+# With a state dir, reads that copy instead of the live one — which is what
+# lets this run after the agent is gone.
+# Prints "<session_id>\x1f<cli_args>\x1f<model>\x1f<env json>" or nothing.
+agent_session() {
+    local tool="$1" apid="$2" args="$3" cwd="$4" state="${5:-}"
     [ -r "$RESURRECT_SAVE" ] || return 0
     (
         # The save script turns on errexit/nounset when sourced; its functions
@@ -124,52 +169,52 @@ agent_resume() {
         # shellcheck source=/dev/null
         source "$RESURRECT_SAVE" 2>/dev/null || exit 0
         set +e
+        [ -n "$state" ] && STATE_DIR="$state"
         # Seed its per-process flag cache with its own fallback list. Otherwise
         # stripping the resume flags runs `claude --help` on every close, which
         # is ~300ms of the key feeling slow.
         _SESSION_FLAGS_claude="${SESSION_FLAGS_FALLBACK_claude:-}"
         _SESSION_FLAGS_opencode="${SESSION_FLAGS_FALLBACK_opencode:-}"
-        local apid args tool
-        apid=$(pane_has_assistant "$pane_pid") || exit 0
-        args=$(ps -o args= -p "$apid" 2>/dev/null)
-        tool=$(detect_tool "$args")
-        [ -n "$tool" ] || exit 0
-
         PARTS_FILE=$(mktemp)
-        emit_session "$pane" "$tool" "$apid" "$args" "$cwd" 1 0 >/dev/null 2>&1
-        local sid="" cli_args="" model="" env_json="{}"
-        IFS=$'\x1f' read -r sid cli_args model env_json < <(jq -r \
-            '[.session_id // "", .cli_args // "", .model // "", (.env // {} | tojson)] | join("\u001f")' \
-            "$PARTS_FILE" 2>/dev/null)
+        emit_session "-" "$tool" "$apid" "$args" "$cwd" 1 0 >/dev/null 2>&1
+        jq -r '[.session_id // "", .cli_args // "", .model // "", (.env // {} | tojson)] | join("\u001f")' \
+            "$PARTS_FILE" 2>/dev/null
         rm -f "$PARTS_FILE"
-        if [ -z "$sid" ]; then
-            printf '%s\x1f\x1f%s\x1f\n' "$tool" "$apid"
-            exit 0
-        fi
-
-        # Same command shape restore-assistant-sessions.sh builds.
-        local q_args="" a
-        set -f
-        for a in $cli_args; do q_args+=" $(posix_quote "$a")"; done
-        set +f
-        local env_prefix="" var val
-        for var in $(tmux show-option -gqv @assistant-resurrect-capture-env 2>/dev/null); do
-            [[ "$var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-            val=$(jq -r --arg k "$var" '.[$k] // empty' <<<"$env_json" 2>/dev/null)
-            [ -n "$val" ] && env_prefix+="$var=$(posix_quote "$val") "
-        done
-        local cmd
-        case "$tool" in
-        claude)
-            case "$cli_args" in *--model*) ;; *) [ -n "$model" ] && q_args+=" --model $(posix_quote "$model")" ;; esac
-            cmd="command claude${q_args} --resume $(posix_quote "$sid")" ;;
-        opencode) cmd="command opencode${q_args} -s $(posix_quote "$sid")" ;;
-        codex)    cmd="command codex${q_args} resume $(posix_quote "$sid")" ;;
-        esac
-        printf '%s\x1f%s\x1f%s\x1f%s\n' "$tool" "$sid" "$apid" "${env_prefix}${cmd}"
     )
 }
 
+# The same resume command restore-assistant-sessions.sh builds.
+build_cmd() {
+    local tool="$1" sid="$2" cli_args="$3" model="$4" env_json="$5"
+    [ -n "$sid" ] || return 0
+    # shellcheck source=/dev/null
+    source "$(dirname "$RESURRECT_SAVE")/lib-detect.sh" 2>/dev/null || return 0
+    local q_args="" a
+    set -f
+    for a in $cli_args; do q_args+=" $(posix_quote "$a")"; done
+    set +f
+    # Only the variables @assistant-resurrect-capture-env lists, as a prefix.
+    [ -n "$env_json" ] || env_json='{}'
+    local env_prefix="" var val
+    while IFS=$'\x1f' read -r var val; do
+        [[ "$var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && [ -n "$val" ] || continue
+        env_prefix+="$var=$(posix_quote "$val") "
+    done < <(jq -r --arg vars "$(tmux show-option -gqv @assistant-resurrect-capture-env 2>/dev/null)" \
+        '($vars | split(" ")) as $v | to_entries[] | select(.key as $k | $v | index($k))
+         | "\(.key)\u001f\(.value)"' <<<"$env_json" 2>/dev/null)
+    case "$tool" in
+    claude)
+        case "$cli_args" in *--model*) ;; *) [ -n "$model" ] && q_args+=" --model $(posix_quote "$model")" ;; esac
+        echo "${env_prefix}command claude${q_args} --resume $(posix_quote "$sid")" ;;
+    opencode) echo "${env_prefix}command opencode${q_args} -s $(posix_quote "$sid")" ;;
+    codex)    echo "${env_prefix}command codex${q_args} resume $(posix_quote "$sid")" ;;
+    esac
+}
+
+# Ordered for latency: everything that has to be read from the live pane (its
+# screen, its agent's session) comes first, then the pane dies, and only then
+# the bookkeeping — building the resume command, writing and pruning the
+# history. The tab is off the bar before any of that starts.
 do_close() {
     local pane="${1:-}"
     # An empty -t resolves to the CURRENT pane, not to nothing.
@@ -177,52 +222,36 @@ do_close() {
 
     local info
     info=$(tmux display-message -p -t "$pane" \
-        '#{pane_id}|#{pane_pid}|#{session_name}|#{session_id}|#{session_created}|#{window_index}|#{pane_current_path}|#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}' 2>/dev/null)
+        '#{pane_id}|#{pane_pid}|#{pane_tty}|#{session_name}|#{session_id}|#{session_created}|#{window_index}|#{pane_current_path}|#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}' 2>/dev/null)
     # display-message against a dead target can succeed with an empty
     # expansion — test the expansion, not the exit status.
-    local pane_id pane_pid sess tsess tcreated widx cwd label
-    IFS='|' read -r pane_id pane_pid sess tsess tcreated widx cwd label <<<"$info"
+    local pane_id pane_pid pane_tty sess tsess tcreated widx cwd label
+    IFS='|' read -r pane_id pane_pid pane_tty sess tsess tcreated widx cwd label <<<"$info"
     [ -n "$pane_id" ] || return 1
 
     local ts id
     ts=$(date +%s); id="$ts-$$"
 
-    # The screen as it is right now, for the picker. Trailing blank rows are
-    # dropped so the preview (which follows the bottom) lands on the last line
-    # of real output rather than on empty space under a shell prompt.
+    # The screen as it is right now, for the picker, captured alongside the
+    # agent lookup. Trailing blank rows are dropped so the preview (which
+    # follows the bottom) lands on the last line of real output rather than on
+    # empty space under a shell prompt.
     tmux capture-pane -ep -t "$pane_id" 2>/dev/null | perl -e '
         my @l = <STDIN>;
         while (@l && $l[-1] =~ /^(?:\e\[[0-9;:]*[A-Za-z]|\s)*$/) { pop @l }
-        print @l;' >"$PREVIEWS/$id.ansi"
+        print @l;' >"$PREVIEWS/$id.ansi" &
+    local cap_pid=$!
 
-    local tool="" sid="" apid="" cmd=""
-    local resolved; resolved=$(agent_resume "$pane_id" "$pane_pid" "$cwd")
-    [ -n "$resolved" ] && IFS=$'\x1f' read -r tool sid apid cmd <<<"$resolved"
+    local tool="" apid="" args="" copy="" snap
+    snap=$(agent_snapshot "$pane_pid" "$pane_tty")
+    [ -n "$snap" ] && IFS=$'\x1f' read -r tool apid args copy <<<"$snap"
 
-    local rec
-    rec=$(jq -cn --arg id "$id" --arg ts "$ts" --arg sess "$sess" --arg widx "$widx" \
-        --arg tsess "$tsess" --arg tcreated "$tcreated" \
-        --arg cwd "$cwd" --arg label "$label" --arg tool "$tool" --arg sid "$sid" --arg cmd "$cmd" \
-        '{id: $id, ts: ($ts|tonumber), session: $sess, tmux_session: $tsess,
-          session_created: $tcreated, index: ($widx|tonumber), cwd: $cwd,
-          label: $label, tool: $tool, session_id: $sid, cmd: $cmd}')
-
-    # Recorded BEFORE anything dies: once the agent exits, claude deletes the
-    # state files the session id was read from.
-    if lock_acquire; then
-        printf '%s\n' "$rec" >>"$HISTORY"
-        prune
-        lock_release
-    else
-        # Refuse rather than close something we could not remember.
-        rm -f "$PREVIEWS/$id.ansi"
-        msg "closed-tabs: history busy — tab left open"
-        return 1
-    fi
-    log "close $sess:$widx cwd=$cwd tool=${tool:--} sid=${sid:--}"
-    if [ -n "$tool" ] && [ -z "$sid" ]; then
-        msg "closed-tabs: couldn't find the $tool session id — reopening will give a plain shell"
-    fi
+    # codex is the exception that resolves BEFORE the kill: its fallbacks match
+    # threads against the live process's start time, which a dead pid no
+    # longer has.
+    local sid="" cli_args="" model="" env_json="" sess_info=""
+    [ "$tool" = codex ] && sess_info=$(agent_session "$tool" "$apid" "$args" "$cwd" "$copy")
+    wait "$cap_pid"
 
     # SIGTERM first so the agent starts its own shutdown, then take the pane at
     # once. Waiting for it to exit is ~2.2s (claude reaps every MCP child
@@ -232,6 +261,36 @@ do_close() {
         kill -TERM "$apid" 2>/dev/null
     fi
     tmux kill-pane -t "$pane_id" 2>/dev/null
+
+    if [ -n "$tool" ] && [ "$tool" != codex ]; then
+        sess_info=$(agent_session "$tool" "$apid" "$args" "$cwd" "$copy")
+    fi
+    [ -n "$copy" ] && rm -rf "$copy"
+    [ -n "$sess_info" ] && IFS=$'\x1f' read -r sid cli_args model env_json <<<"$sess_info"
+
+    local cmd; cmd=$(build_cmd "$tool" "$sid" "$cli_args" "$model" "$env_json")
+    local rec
+    rec=$(jq -cn --arg id "$id" --arg ts "$ts" --arg sess "$sess" --arg widx "$widx" \
+        --arg tsess "$tsess" --arg tcreated "$tcreated" \
+        --arg cwd "$cwd" --arg label "$label" --arg tool "$tool" --arg sid "$sid" --arg cmd "$cmd" \
+        '{id: $id, ts: ($ts|tonumber), session: $sess, tmux_session: $tsess,
+          session_created: $tcreated, index: ($widx|tonumber), cwd: $cwd,
+          label: $label, tool: $tool, session_id: $sid, cmd: $cmd}')
+
+    if lock_acquire; then
+        printf '%s\n' "$rec" >>"$HISTORY"
+        prune
+        lock_release
+    else
+        # The tab is already gone, so write it anyway: a lone O_APPEND line is
+        # safe next to other appends, and only a prune racing it could drop it.
+        printf '%s\n' "$rec" >>"$HISTORY"
+        log "history lock busy — appended unlocked"
+    fi
+    log "close $sess:$widx cwd=$cwd tool=${tool:--} sid=${sid:--}"
+    if [ -n "$tool" ] && [ -z "$sid" ]; then
+        msg "closed-tabs: couldn't find the $tool session id — reopening will give a plain shell"
+    fi
     return 0
 }
 
@@ -350,15 +409,16 @@ do_pick_popup() {
     local -a client=()
     [ -n "$client_tty" ] && client=(-c "$client_tty")
     tmux display-popup "${client[@]}" -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" \
-        -T ' closed tabs ' "'$SELF' pick '$client_sess' '$client_tty'"
+        -T ' closed tabs ' "XDG_STATE_HOME='$STATE_HOME' '$SELF' pick '$client_sess' '$client_tty'"
 }
 
+# Sets REPLY rather than printing: $(ago …) would fork once per entry.
 ago() {
-    local s=$(( $(date +%s) - $1 ))
-    if   [ "$s" -lt 60 ];    then echo "just now"
-    elif [ "$s" -lt 3600 ];  then echo "$((s / 60))m ago"
-    elif [ "$s" -lt 86400 ]; then echo "$((s / 3600))h ago"
-    else                          echo "$((s / 86400))d ago"
+    local s=$(( $2 - $1 ))
+    if   [ "$s" -lt 60 ];    then REPLY="just now"
+    elif [ "$s" -lt 3600 ];  then REPLY="$((s / 60))m ago"
+    elif [ "$s" -lt 86400 ]; then REPLY="$((s / 3600))h ago"
+    else                          REPLY="$((s / 86400))d ago"
     fi
 }
 
@@ -370,21 +430,22 @@ do_pick() {
     local client_sess="${1:-}" client_tty="${2:-}"
     local id ts tool label cwd
     local dim=$'\e[2m' mauve=$'\e[38;2;203;166;247m' teal=$'\e[38;2;148;226;213m' off=$'\e[0m'
-    local out
+    local out now; now=$(date +%s)
     out=$(jq -r '[.id, .ts, .tool, .label, .cwd] | join("\u001f")' "$HISTORY" 2>/dev/null \
         | tail -r \
         | while IFS=$'\x1f' read -r id ts tool label cwd; do
             [ -n "$id" ] || continue
             local c="$teal"; [ "$tool" = claude ] && c="$mauve"
+            ago "$ts" "$now"
             printf '%s\t%s%-9s%s %s%-9s%s %s\t%s%s%s\n' "$id" \
-                "$dim" "$(ago "$ts")" "$off" "$c" "${tool:-shell}" "$off" "$label" \
+                "$dim" "$REPLY" "$off" "$c" "${tool:-shell}" "$off" "$label" \
                 "$dim" "${cwd/#"$HOME"/\~}" "$off"
           done \
         | fzf --ansi --delimiter='\t' --with-nth=2.. --reverse --multi \
               --prompt='reopen > ' \
               --expect=ctrl-x \
               --bind 'shift-down:toggle+down,shift-up:toggle+up,ctrl-a:select-all,ctrl-d:deselect-all' \
-              --preview "'$SELF' preview {1}" \
+              --preview "XDG_STATE_HOME='$STATE_HOME' '$SELF' preview {1}" \
               --preview-window 'down,72%,border-top,follow' \
               --header '⏎ reopen · Tab or ⇧↑/⇧↓ to pick several · ⌃x forget')
     local key=${out%%$'\n'*}
@@ -393,9 +454,9 @@ do_pick() {
     # Hand off so the popup closes the moment you pick. The ids are
     # <epoch>-<pid>, nothing a shell would interpret, so unquoted is fine.
     if [ "$key" = "ctrl-x" ]; then
-        tmux run-shell -b "'$SELF' forget $ids"
+        tmux run-shell -b "XDG_STATE_HOME='$STATE_HOME' '$SELF' forget $ids"
     else
-        tmux run-shell -b "'$SELF' reopen '$client_sess' '$client_tty' $ids"
+        tmux run-shell -b "XDG_STATE_HOME='$STATE_HOME' '$SELF' reopen '$client_sess' '$client_tty' $ids"
     fi
 }
 
