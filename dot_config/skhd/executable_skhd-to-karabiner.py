@@ -146,6 +146,13 @@ def main():
         rules = profile.setdefault("complex_modifications", {}).setdefault("rules", [])
         for rule in rules:
             for manip in rule["manipulators"]:
+                # Hand-written shell_commands get the same env wrapper as the binds.
+                delayed = manip.get("to_delayed_action", {})
+                for events in (*(manip.get(k, []) for k in ("to", "to_if_alone", "to_if_held_down", "to_after_key_up")),
+                               *delayed.values()):
+                    for event in events:
+                        if "shell_command" in event:
+                            event["shell_command"] = shell_command(event["shell_command"])
                 to = manip.get("to", [])
                 if len(to) == 1 and set(to[0]) == {"key_code"} and to[0]["key_code"] in bare:
                     key = to[0]["key_code"]

@@ -92,6 +92,86 @@
                                 "type": "basic"
                             },
                             {
+                                "description": "WezTerm: second quick tap of caps_lock (hyper) flips to the previous tmux session/window (@double_tap_target). Arc gets the same double-tap from BTT.",
+                                "conditions": [
+                                    { "type": "frontmost_application_if", "bundle_identifiers": ["^com\\.github\\.wez\\.wezterm$"] },
+                                    { "type": "variable_if", "name": "hyper_tapped", "value": 1 }
+                                ],
+                                "from": {
+                                    "key_code": "caps_lock",
+                                    "modifiers": { "optional": ["any"] }
+                                },
+                                "to": [
+                                    { "set_variable": { "name": "hyper_tapped", "value": 0 } },
+                                    {
+                                        "key_code": "left_shift",
+                                        "modifiers": ["left_command", "left_control", "left_option"]
+                                    }
+                                ],
+                                "to_if_alone": [{ "shell_command": "$HOME/.config/tmux/scripts/double-tap-switch.sh" }],
+                                "type": "basic"
+                            },
+                            {
+                                "description": "WezTerm: first tap of caps_lock (hyper) arms the double-tap; any other key, or 400ms, disarms it.",
+                                "conditions": [
+                                    { "type": "frontmost_application_if", "bundle_identifiers": ["^com\\.github\\.wez\\.wezterm$"] }
+                                ],
+                                "from": {
+                                    "key_code": "caps_lock",
+                                    "modifiers": { "optional": ["any"] }
+                                },
+                                "to": [
+                                    { "set_variable": { "name": "hyper_tapped", "value": 1 } },
+                                    {
+                                        "key_code": "left_shift",
+                                        "modifiers": ["left_command", "left_control", "left_option"]
+                                    }
+                                ],
+                                "to_delayed_action": {
+                                    "to_if_invoked": [{ "set_variable": { "name": "hyper_tapped", "value": 0 } }],
+                                    "to_if_canceled": [{ "set_variable": { "name": "hyper_tapped", "value": 0 } }]
+                                },
+                                "parameters": { "basic.to_delayed_action_delay_milliseconds": 400 },
+                                "type": "basic"
+                            },
+                            {
+                                "description": "WezTerm: second quick tap of right_shift flips to the previous tmux session/window (@double_tap_target).",
+                                "conditions": [
+                                    { "type": "frontmost_application_if", "bundle_identifiers": ["^com\\.github\\.wez\\.wezterm$"] },
+                                    { "type": "variable_if", "name": "right_shift_tapped", "value": 1 }
+                                ],
+                                "from": {
+                                    "key_code": "right_shift",
+                                    "modifiers": { "optional": ["any"] }
+                                },
+                                "to": [
+                                    { "set_variable": { "name": "right_shift_tapped", "value": 0 } },
+                                    { "key_code": "right_shift" }
+                                ],
+                                "to_if_alone": [{ "shell_command": "$HOME/.config/tmux/scripts/double-tap-switch.sh" }],
+                                "type": "basic"
+                            },
+                            {
+                                "description": "WezTerm: first tap of right_shift arms the double-tap; any other key, or 400ms, disarms it.",
+                                "conditions": [
+                                    { "type": "frontmost_application_if", "bundle_identifiers": ["^com\\.github\\.wez\\.wezterm$"] }
+                                ],
+                                "from": {
+                                    "key_code": "right_shift",
+                                    "modifiers": { "optional": ["any"] }
+                                },
+                                "to": [
+                                    { "set_variable": { "name": "right_shift_tapped", "value": 1 } },
+                                    { "key_code": "right_shift" }
+                                ],
+                                "to_delayed_action": {
+                                    "to_if_invoked": [{ "set_variable": { "name": "right_shift_tapped", "value": 0 } }],
+                                    "to_if_canceled": [{ "set_variable": { "name": "right_shift_tapped", "value": 0 } }]
+                                },
+                                "parameters": { "basic.to_delayed_action_delay_milliseconds": 400 },
+                                "type": "basic"
+                            },
+                            {
                                 "description": "Change caps_lock to command+control+option+shift.",
                                 "from": {
                                     "key_code": "caps_lock",

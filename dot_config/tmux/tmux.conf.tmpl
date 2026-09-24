@@ -433,6 +433,13 @@ bind-key a display-popup -E -w 60% -h 75% "$HOME/.config/tmux/scripts/mru-sessio
 unbind-key C-a
 bind-key C-a display-popup -E -w 60% -h 75% "$HOME/.config/tmux/scripts/mru-session-switch.sh"
 
+# Double-tap hyper or right shift in WezTerm (Karabiner, karabiner-base.json) flips
+# back to the previous one of these, like the same double-tap does for Arc tabs:
+#   session  the top row of prefix+a, without the picker
+#   window   last-window
+# Change it live, no reload needed: tmux set -g @double_tap_target window
+set -g @double_tap_target 'session'
+
 set -g @plugin '27medkamal/tmux-session-wizard'
 set -g @session-wizard 'T'
 
