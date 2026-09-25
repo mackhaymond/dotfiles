@@ -1403,7 +1403,7 @@ do_sel_commit() {
 # The selection's other exit: m (or a, the prefix+a muscle memory) raises a
 # session picker shaped like prefix+a's, and the selected tabs MOVE there —
 # an existing session, or a new one named by typing it. ⏎ follows them over,
-# ⌥⏎ sends them off and stays put.
+# Tab sends them off and stays put.
 #
 # Three steps, each where it has to be. sel-send runs in the key binding's
 # foreground run-shell (a popup needs a client to raise on) and does nothing
@@ -1447,9 +1447,11 @@ do_send_pick() {
         | awk -F '\t' -v cur="$src" -v hold="$HOLD" '$2 != cur && $2 != "scratch" && $2 != "agents" && $2 != hold' \
         | sort -t $'\t' -k1,1nr | cut -f2-)
 
-    local fzf_cmd=(fzf --print-query --expect=alt-enter --reverse --ansi --info=hidden
+    # Tab for "stay", not ⌥⏎ or ⌃s: WezTerm's default bindings take Alt+Enter
+    # for ToggleFullScreen before fzf ever sees it, and C-s is the tmux prefix.
+    local fzf_cmd=(fzf --print-query --expect=tab --reverse --ansi --info=hidden
                    --prompt 'move to > '
-                   --header '⏎ move & follow · ⌥⏎ move & stay · no match ⏎ = new session')
+                   --header '⏎ move & go there · Tab move & stay here · no match = new session')
     local preview="$HOME/.config/tmux/scripts/preview_session.sh"
     [ -x "$preview" ] && fzf_cmd+=(--preview "'$preview' {}" --preview-window=down:70%:nowrap:noinfo)
 
@@ -1463,7 +1465,7 @@ do_send_pick() {
     key=$(printf '%s\n' "$out" | sed -n '2p')
     selection=$(printf '%s\n' "$out" | sed -n '3p')
     target="${selection:-$query}"
-    [ "$key" = "alt-enter" ] && mode=stay
+    [ "$key" = "tab" ] && mode=stay
 
     do_sel_cancel
     [ -n "$target" ] || return 0
@@ -1523,16 +1525,41 @@ do_send_many() {
         created=1
     fi
 
-    # Switch BEFORE moving when following: if the last move empties the source,
-    # the client must already be somewhere else or detach-on-destroy drops it
-    # to a shell.
-    [ "$mode" = follow ] && tmux switch-client ${client:+-c "$client"} -t "=$target" 2>/dev/null
+    # The client switches AFTER the tabs have landed and the placeholder is
+    # gone, so the first frame of the target session is the finished result.
+    # Switching first (the original order) painted the target mid-move — for a
+    # new session, its placeholder shell — and then repainted it tab by tab.
+    #
+    # The one exception: when the selection is every tab in the source, the
+    # last move destroys that session, and with detach-on-destroy on the client
+    # must already be elsewhere by then. So that last tab is held back until
+    # after the switch.
+    local moved=() failed=0 last=""
+    if [ "$mode" = follow ] && [ "$total" -le "${#wins[@]}" ]; then
+        last="${wins[${#wins[@]}-1]}"
+        unset 'wins[${#wins[@]}-1]'
+    fi
+    move_to_target() {
+        tmux set-option -uw -t "$1" @stash_sel 2>/dev/null
+        if tmux move-window -d -a -s "$1" -t "=$target:{end}" 2>/dev/null; then moved+=("$1"); else failed=$((failed + 1)); fi
+    }
+    for w in ${wins[@]+"${wins[@]}"}; do move_to_target "$w"; done
 
-    local moved=() failed=0
-    for w in "${wins[@]}"; do
-        tmux set-option -uw -t "$w" @stash_sel 2>/dev/null
-        if tmux move-window -s "$w" -t "=$target:" 2>/dev/null; then moved+=("$w"); else failed=$((failed + 1)); fi
-    done
+    # A placeholder may only go once something real is in the session.
+    if [ -n "$boot" ] && [ "${#moved[@]}" -gt 0 ]; then
+        tmux kill-window -t "$boot" 2>/dev/null; boot=""
+    fi
+    if [ "$mode" = follow ] && { [ "${#moved[@]}" -gt 0 ] || [ -n "$last" ]; }; then
+        [ "${#moved[@]}" -gt 0 ] && tmux select-window -t "${moved[0]}" 2>/dev/null
+        tmux switch-client ${client:+-c "$client"} -t "=$target" 2>/dev/null
+    fi
+    if [ -n "$last" ]; then
+        move_to_target "$last"
+        [ "$mode" = follow ] && tmux select-window -t "${moved[0]}" 2>/dev/null
+        if [ -n "$boot" ] && [ "${#moved[@]}" -gt 0 ]; then
+            tmux kill-window -t "$boot" 2>/dev/null; boot=""
+        fi
+    fi
 
     if [ "${#moved[@]}" -eq 0 ]; then
         [ "$created" = 1 ] && tmux kill-session -t "=$target" 2>/dev/null
@@ -1540,15 +1567,22 @@ do_send_many() {
         say "could not move them"
         return 0
     fi
-    [ -n "$boot" ] && tmux kill-window -t "$boot" 2>/dev/null
     renumber "$src" "$target"
-    [ "$mode" = follow ] && tmux select-window -t "${moved[0]}" 2>/dev/null
     lock_release
+    tmux refresh-client ${client:+-t "$client"} 2>/dev/null
 
+    # No message on a clean follow: you are looking at the result, and a
+    # display-message replaces the whole tab bar for display-time (4s here) —
+    # which read as the screen being broken right when you want to see where
+    # the tabs landed. Staying behind has nothing else to show, so it gets a
+    # SHORT one; failures always get one.
     local n="${#moved[@]}" report
     report="moved $n tab$([ "$n" -eq 1 ] || echo s) to $target$([ "$created" = 1 ] && echo ' (new)')"
-    [ "$failed" -gt 0 ] && report="$report — could not move $failed"
-    say "$report"
+    if [ "$failed" -gt 0 ]; then
+        say "$report — could not move $failed"
+    elif [ "$mode" = stay ]; then
+        tmux display-message ${client:+-c "$client"} -d 1500 "$report" 2>/dev/null
+    fi
 }
 
 # Windows that are NOT parked but still carry a suspended session — a resume

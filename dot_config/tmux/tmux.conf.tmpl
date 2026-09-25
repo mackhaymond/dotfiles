@@ -511,7 +511,7 @@ bind-key -T stash h switch-client -T stash \; run-shell "#{HOME}/.config/tmux/sc
 bind-key -T stash H     run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh sel-commit '#{window_id}'"
 bind-key -T stash Enter run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh sel-commit '#{window_id}'"
 # m (or a, like prefix+a) moves the selection to another session instead of
-# parking it: a prefix+a-style picker, ⏎ to follow the tabs there, ⌥⏎ to stay,
+# parking it: a prefix+a-style picker, ⏎ to follow the tabs there, Tab to stay,
 # or type a name that doesn't exist to create it. Foreground for the same
 # reason prefix+h is — the popup needs a client to raise on — and
 # '#{client_name}' because the moves happen in a backgrounded run-shell, which
