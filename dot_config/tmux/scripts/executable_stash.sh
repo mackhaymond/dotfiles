@@ -1420,6 +1420,8 @@ do_sel_send() {
     cur=$(sel_win "${1:-}"); [ -n "$cur" ] || return 0
     sess=$(sel_sess_of "$cur"); [ -n "$sess" ] || return 0
     case "$sess" in "$HOLD") return 0 ;; esac
+    # Its windows belong to tmux-pty-mcp, which tracks them by session.
+    case "$sess" in agents) do_sel_cancel; msg "agents windows belong to tmux-pty-mcp — not moving them"; return 0 ;; esac
     ids=$(sel_ids "$sess")
     [ -n "$ids" ] || ids="$cur"
     n=$(printf '%s\n' "$ids" | wc -l | tr -d ' ')
@@ -1469,10 +1471,12 @@ do_send_pick() {
 
     do_sel_cancel
     [ -n "$target" ] || return 0
-    # Validated before it goes anywhere near a command string — the same rule
-    # prefix+a applies to names it will create.
-    if ! [[ "$target" =~ ^[A-Za-z0-9._-]+$ ]]; then
-        tmux display-message ${client:+-c "$client"} "Invalid session name (allowed: A-Z a-z 0-9 . _ -): $target"
+    # Validated before it goes anywhere near a command string. No `.`: tmux
+    # silently turns it into `_` in a new session's name, and reads `=a.b` as
+    # session a, pane b — so the session got created as a_b, every move into
+    # "a.b" then failed, and the stray session was left behind.
+    if ! [[ "$target" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        tmux display-message ${client:+-c "$client"} "Invalid session name (allowed: A-Z a-z 0-9 _ -): $target"
         return 0
     fi
     tmux run-shell -b "'$SELF' send-many '$client' $mode '$target' $*"
@@ -1483,9 +1487,12 @@ do_send_many() {
     local w s src="" wins=() seen="" created=0 boot="" total
     say() { tmux display-message ${client:+-c "$client"} "$*" 2>/dev/null; }
 
+    # The picker hides these, but a typed name bypasses the list. `agents` is
+    # tmux-pty-mcp's: it owns windows there by @pty_* tags, and an untagged
+    # window is exactly what its sweep and agent-restore-prune.sh delete.
     case "$target" in
         "$HOLD")  say "that's the parking session — use H to hide tabs"; return 0 ;;
-        scratch)  return 0 ;;
+        scratch|agents) say "$target isn't a place to put tabs"; return 0 ;;
     esac
 
     lock_acquire || { say "stash: busy — try again"; return 0; }
@@ -1515,6 +1522,14 @@ do_send_many() {
         say "that's every tab in $src — leave one behind, or ⏎ to follow them"
         return 0
     fi
+    # ...and following only saves THIS client. Another terminal on the same
+    # session would be dropped to a shell when it is destroyed.
+    if [ "$total" -le "${#wins[@]}" ] &&
+       [ "$(tmux display-message -p -t "=$src:" '#{session_attached}' 2>/dev/null)" -gt 1 ] 2>/dev/null; then
+        lock_release
+        say "$src is open in another terminal — leave one tab behind"
+        return 0
+    fi
 
     # A session cannot be born empty: create it with a placeholder and kill
     # that once the real tabs are in (the ensure_hold pattern, -P -F for the
@@ -1534,40 +1549,58 @@ do_send_many() {
     # last move destroys that session, and with detach-on-destroy on the client
     # must already be elsewhere by then. So that last tab is held back until
     # after the switch.
-    local moved=() failed=0 last=""
+    local moved=() failed=0 last="" note="" left switched=0
     if [ "$mode" = follow ] && [ "$total" -le "${#wins[@]}" ]; then
         last="${wins[${#wins[@]}-1]}"
         unset 'wins[${#wins[@]}-1]'
     fi
     move_to_target() {
-        tmux set-option -uw -t "$1" @stash_sel 2>/dev/null
         if tmux move-window -d -a -s "$1" -t "=$target:{end}" 2>/dev/null; then moved+=("$1"); else failed=$((failed + 1)); fi
     }
-    for w in ${wins[@]+"${wins[@]}"}; do move_to_target "$w"; done
-
     # A placeholder may only go once something real is in the session.
-    if [ -n "$boot" ] && [ "${#moved[@]}" -gt 0 ]; then
+    drop_boot() {
+        [ -n "$boot" ] && [ "${#moved[@]}" -gt 0 ] || return 0
         tmux kill-window -t "$boot" 2>/dev/null; boot=""
-    fi
+    }
+    for w in ${wins[@]+"${wins[@]}"}; do
+        # Re-count per move unless emptying the source is the plan: an
+        # unselected tab's shell can exit mid-batch (the lock cannot hold it
+        # back), and the next move would then empty the session under an
+        # attached client — do_stash_many's "N of N+1" case.
+        if [ -z "$last" ]; then
+            left=$(tmux list-windows -t "=$src" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ')
+            case "$left" in ''|*[!0-9]*) left=0 ;; esac
+            if [ "$left" -le 1 ]; then note="stopped — the rest is all that's left in $src"; break; fi
+        fi
+        move_to_target "$w"
+    done
+    drop_boot
+
     if [ "$mode" = follow ] && { [ "${#moved[@]}" -gt 0 ] || [ -n "$last" ]; }; then
         [ "${#moved[@]}" -gt 0 ] && tmux select-window -t "${moved[0]}" 2>/dev/null
-        tmux switch-client ${client:+-c "$client"} -t "=$target" 2>/dev/null
+        tmux switch-client ${client:+-c "$client"} -t "=$target" 2>/dev/null && switched=1
     fi
     if [ -n "$last" ]; then
         move_to_target "$last"
-        [ "$mode" = follow ] && tmux select-window -t "${moved[0]}" 2>/dev/null
-        if [ -n "$boot" ] && [ "${#moved[@]}" -gt 0 ]; then
-            tmux kill-window -t "$boot" 2>/dev/null; boot=""
-        fi
+        drop_boot
+        [ "${#moved[@]}" -gt 0 ] && tmux select-window -t "${moved[0]}" 2>/dev/null
     fi
 
     if [ "${#moved[@]}" -eq 0 ]; then
+        # Nothing moved, so the source still exists: go back there BEFORE
+        # removing a session this call created, or the client would be
+        # destroyed along with it.
+        [ "$switched" = 1 ] && tmux switch-client ${client:+-c "$client"} -t "=$src" 2>/dev/null
         [ "$created" = 1 ] && tmux kill-session -t "=$target" 2>/dev/null
         lock_release
         say "could not move them"
         return 0
     fi
+    # Callers renumber, then publish (see renumber()): windows carrying a
+    # pending @stash_session are mirrored by session:index, and the
+    # window-unlinked publishes fired during the moves saw the old indexes.
     renumber "$src" "$target"
+    publish
     lock_release
     tmux refresh-client ${client:+-t "$client"} 2>/dev/null
 
@@ -1578,8 +1611,10 @@ do_send_many() {
     # SHORT one; failures always get one.
     local n="${#moved[@]}" report
     report="moved $n tab$([ "$n" -eq 1 ] || echo s) to $target$([ "$created" = 1 ] && echo ' (new)')"
-    if [ "$failed" -gt 0 ]; then
-        say "$report — could not move $failed"
+    if [ "$failed" -gt 0 ] || [ -n "$note" ]; then
+        [ "$failed" -gt 0 ] && report="$report — could not move $failed"
+        [ -n "$note" ]      && report="$report — $note"
+        say "$report"
     elif [ "$mode" = stay ]; then
         tmux display-message ${client:+-c "$client"} -d 1500 "$report" 2>/dev/null
     fi

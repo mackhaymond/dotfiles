@@ -4,8 +4,10 @@ set -euo pipefail
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# No `.`: tmux silently turns it into `_` when creating a session, so the
+# switch-client to the typed name then fails.
 is_valid_session_name() {
-  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]
 }
 
 main() {
@@ -65,7 +67,7 @@ main() {
   fi
 
   if ! is_valid_session_name "$target"; then
-    tmux display-message "Invalid session name (allowed: A-Z a-z 0-9 . _ -): $target"
+    tmux display-message "Invalid session name (allowed: A-Z a-z 0-9 _ -): $target"
     exit 0
   fi
 
