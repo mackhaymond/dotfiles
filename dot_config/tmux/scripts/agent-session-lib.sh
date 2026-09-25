@@ -89,8 +89,9 @@ resolve_session_bases() {
     [[ $raw =~ \"sessionId\":\"([^\"]+)\" ]] && sid="${BASH_REMATCH[1]}"
     [[ $raw =~ \"cwd\":\"([^\"]+)\" ]] && cwd="${BASH_REMATCH[1]}"
     { [ -n "$sid" ] && [ -n "$cwd" ]; } || return 1
-    # Claude munges the project dir name from cwd: '/' and '.' both become '-'.
-    proj="${cwd//\//-}"; proj="${proj//./-}"
+    # Claude munges the project dir name from cwd: every character that is not
+    # an ASCII letter or digit ('/', '.', '_', ...) becomes '-'.
+    proj="${cwd//[^A-Za-z0-9]/-}"
     SESSION_PROJ="$HOME/.claude/projects/$proj"
     key="$pid:$sid"
     printf -v now '%(%s)T' -1
