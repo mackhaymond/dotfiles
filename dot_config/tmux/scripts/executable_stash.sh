@@ -22,7 +22,7 @@
 # there is still no state file to go stale or be orphaned.
 #
 #   stash.sh stash   [<window>]   park it (default: current)
-#   stash.sh unstash [<window>]   bring one back; picker if several are parked
+#   stash.sh unstash [<window>]   bring one back (no <window>: picker)
 #   stash.sh stash-many <w>...    park a group in one transaction
 #   stash.sh unstash-many <w>...  bring a group back in one transaction
 #   stash.sh kill-many <w>...     destroy parked windows (⌃x in the picker);
@@ -1654,7 +1654,9 @@ do_unstash() {
     fi
 
     if [ -z "$win" ]; then
-        if [ "$(count)" -gt 1 ]; then
+        if [ "$(count)" -ge 1 ]; then
+            # Even for a single parked window: the popup's preview shows what is
+            # about to come back, and ⌃x kill is only reachable from here.
             # fzf needs a terminal, so the choosing happens inside a popup that
             # re-enters this script as `pick`. Deciding here rather than in an
             # if-shell in tmux.conf keeps the branch in one place and avoids a
