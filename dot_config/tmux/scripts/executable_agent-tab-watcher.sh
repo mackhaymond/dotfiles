@@ -486,7 +486,11 @@ EOF
                 # no status file to poll.
                 [ -n "$rp" ] && st=$(codex_status "$rp")
             fi
-            [ "$st" = "idle" ] && agent_idle=1
+            # "shell" is Claude Code's at-the-prompt status now (seen on every
+            # idle session, 2.1.278-2.1.284, 2026-09-29) - checking for "idle"
+            # alone left a tab that missed its Stop pinned at running.
+            # "waiting" (a gate on screen) and "busy" still never qualify.
+            case "$st" in idle|shell) agent_idle=1 ;; esac
         fi
         if [ "$agent_idle" = 1 ]; then
             n=0

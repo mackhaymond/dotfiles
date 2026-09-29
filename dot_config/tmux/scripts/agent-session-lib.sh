@@ -31,7 +31,11 @@
 #      running again), or when the user hit Esc on it (its last record is the
 #      interrupt marker — the parent is never notified for those), else it is
 #      running, for at most the one-hour age backstop a dead parent's agents
-#      are given. A workflow is in-flight iff its runtime dir
+#      are given. "Since" has SUBAGENT_NOTIFY_GRACE seconds of slack: the
+#      notice lands ~90ms before the agent's own last write (measured
+#      2026-09-29) and both sides are whole seconds here, so an exact test
+#      held every finished background agent "running" for the full hour.
+#      A workflow is in-flight iff its runtime dir
 #      subagents/workflows/wf_<id>/ exists without its completion file
 #      workflows/wf_<id>.json, with the same one-hour mtime backstop
 #      (transcripts go quiet during long stalls — worst measured gap 394s —
@@ -159,6 +163,8 @@ print(cut)')
     NOTIF_SIZE[$p]=$((have + consumed))
 }
 
+SUBAGENT_NOTIFY_GRACE=10   # see the header's point 2
+
 # True if the claude session owning PID has a background SUBAGENT (the Agent
 # tool) still out. The rules are the header's point 2; the order below is
 # notified → interrupted → running, each `continue` a way to be finished.
@@ -182,7 +188,7 @@ session_has_running_subagent() {
             for tok in ${NOTIF_IDS[$p]:-}; do
                 case "$tok" in "$id="*) when="${tok#*=}" ;; esac
             done
-            [ -n "$when" ] && [ "$when" -ge "$mt" ] && continue
+            [ -n "$when" ] && [ $((when + SUBAGENT_NOTIFY_GRACE)) -ge "$mt" ] && continue
             # 2. Interrupted by the user → finished. Cached by mtime+size.
             size=$(stat -f %z "$f" 2>/dev/null)
             v="${INT_CACHE[$f]:-}"
