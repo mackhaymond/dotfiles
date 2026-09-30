@@ -17,6 +17,19 @@ $line_break\
 $python\
 $character"""
 
+# Pure's `user@host` (grey). Only renders over SSH (or as root), so it never
+# shows on the Mac itself — without these, starship's defaults ("user in
+# 🌐 host in") leak into the prompt on remote boxes like seasnet.
+[username]
+style_user = "bright-black"
+style_root = "bold red"
+format = "[$user]($style)"
+
+[hostname]
+ssh_symbol = ""
+style = "bright-black"
+format = "[@$hostname]($style) "
+
 [directory]
 style = "blue"
 truncate_to_repo = false
