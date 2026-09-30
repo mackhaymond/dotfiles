@@ -9,6 +9,13 @@
 #   closed-tabs.sh reopen <session_id> <tty> [id…] reopen these (default: newest)
 #   closed-tabs.sh forget <id…>                    drop entries from the history
 #   closed-tabs.sh list                            print the history, newest first
+#   closed-tabs.sh describe <id>                   label an entry (close runs this)
+#   closed-tabs.sh summarize <tool> <sid> <cwd> <label> <screen>   print one
+#
+# After a close, a detached `describe` has gpt-6-luna (codex exec) read the
+# tab's transcript — or its screen, for a plain shell — and stores a one-line
+# summary on the entry, shown on its line in the picker. stash.sh labels
+# parked tabs through `summarize` the same way.
 #
 # Bound in tmux.conf: prefix x (CMD+W, asks y/n) and prefix C-l (CMD+SHIFT+W,
 # doesn't) close through here; prefix X (CMD+Z) opens the picker. Only closes
@@ -291,7 +298,136 @@ do_close() {
     if [ -n "$tool" ] && [ -z "$sid" ]; then
         msg "closed-tabs: couldn't find the $tool session id — reopening will give a plain shell"
     fi
+    # Fully detached: the model call takes seconds and the tab is already gone.
+    # Output to /dev/null so tmux isn't left holding the job's pipe open.
+    ( XDG_STATE_HOME="$STATE_HOME" "$SELF" describe "$id" </dev/null >/dev/null 2>&1 & )
     return 0
+}
+
+# The conversation behind a closed agent tab as plain "ROLE: text" lines —
+# messages and tool calls, no thinking, tool output or injected context.
+transcript_digest() {
+    local tool="$1" sid="$2" f
+    [ -n "$sid" ] || return 0
+    case "$tool" in
+    claude)
+        f=$(ls "$HOME"/.claude/projects/*/"$sid".jsonl 2>/dev/null | head -n 1)
+        [ -r "$f" ] || return 0
+        jq -r 'select((.type == "user" or .type == "assistant") and .isMeta != true and .isSidechain != true)
+            | .type as $t
+            | (.message.content | if type == "string" then [{type: "text", text: .}] else . end)[]
+            | if .type == "text" then "\($t | ascii_upcase): \(.text[0:800])"
+              elif .type == "tool_use" then "  [\(.name)] \(.input | (.description // .command // .file_path // .pattern // .prompt // "") | tostring | .[0:160])"
+              else empty end' "$f" 2>/dev/null ;;
+    codex)
+        f=$(find "$HOME/.codex/sessions" "$HOME/.codex/archived_sessions" -name "rollout-*$sid.jsonl" 2>/dev/null | head -n 1)
+        [ -r "$f" ] || return 0
+        jq -r 'select(.type == "response_item") | .payload
+            | if .type == "message" and (.role == "user" or .role == "assistant") then
+                .role as $r | .content[]? | select(.type == "input_text" or .type == "output_text")
+                | select(.text | test("^\\s*<(environment_context|user_instructions|permissions)|^# AGENTS\\.md") | not)
+                | "\($r | ascii_upcase): \(.text[0:800])"
+              elif .type == "function_call" or .type == "custom_tool_call" then
+                "  [\(.name)] \((.arguments // .input // "") | tostring | .[0:160])"
+              else empty end' "$f" 2>/dev/null ;;
+    opencode)
+        opencode export "$sid" 2>/dev/null | jq -r '.messages[] | .info.role as $r | .parts[]
+            | if .type == "text" then "\($r | ascii_upcase): \(.text[0:800])"
+              elif .type == "tool" then "  [\(.tool)]"
+              else empty end' 2>/dev/null ;;
+    esac
+}
+
+# Runs detached after a close: ask a small model for a one-line account of
+# what the tab was doing and store it on the entry as .desc, which the picker
+# shows on that entry's line. Agent tabs are read from their transcript, plain
+# shells from the screen snapshot. Any failure just leaves the entry without
+# one. The model call itself is `summarize`, which stash.sh uses too.
+DESCRIBE_MODEL=gpt-6-luna
+DESCRIBE_TIMEOUT=90
+do_describe() {
+    local id="${1:-}" rec
+    [ -n "$id" ] || return 0
+    rec=$(jq -c --arg id "$id" 'select(.id == $id)' "$HISTORY" 2>/dev/null)
+    [ -n "$rec" ] || return 0
+    local tool sid cwd label desc
+    tool=$(jq -r '.tool' <<<"$rec"); sid=$(jq -r '.session_id' <<<"$rec")
+    cwd=$(jq -r '.cwd' <<<"$rec");   label=$(jq -r '.label' <<<"$rec")
+
+    desc=$(do_summarize "$tool" "$sid" "$cwd" "$label" "$PREVIEWS/$id.ansi")
+    [ -n "$desc" ] || return 0
+    if lock_acquire; then
+        history_filter --arg id "$id" --arg d "$desc" 'if .id == $id then .desc = $d else . end'
+        lock_release
+        log "describe $id: $desc"
+    else
+        log "describe $id: history busy, dropped"
+    fi
+}
+
+# One line on what a tab was doing, from its agent transcript (if any) and a
+# screen capture. Prints nothing when there's nothing worth describing or the
+# call fails.
+#   summarize <tool> <session_id> <cwd> <label> <screen.ansi>
+do_summarize() {
+    local tool="${1:-}" sid="${2:-}" cwd="${3:-}" label="${4:-}" screen_file="${5:-}"
+    local codex; codex=$(command -v codex || echo "$HOME/.bun/bin/codex")
+    [ -x "$codex" ] || { log "summarize: no codex"; return 0; }
+
+    local convo screen=""
+    convo=$(transcript_digest "$tool" "$sid")
+    # Keep the opening (what was asked) and the end (where it stood).
+    if [ "${#convo}" -gt 24000 ]; then
+        convo="${convo:0:4000}"$'\n[…]\n'"${convo: -20000}"
+    fi
+    [ -s "$screen_file" ] && screen=$(perl -pe 's/\e\[[0-9;:?]*[A-Za-z]//g' "$screen_file" | tail -n 60)
+    # A bare prompt isn't worth a call.
+    if [ -z "$convo" ] && [ "$(grep -c '[^[:space:]]' <<<"$screen")" -lt 3 ]; then
+        return 0
+    fi
+
+    local work; work=$(mktemp -d)
+    {
+        cat <<'EOF'
+You label terminal tabs the user has put away, so they can pick the right one
+to bring back later. Below is what was happening in one tab. Write ONE line of
+at most 70 characters saying what was being worked on and where it stood.
+Be specific (name the feature, file, bug or command). No preamble, no quotes,
+no trailing period. Do not run any commands; answer from this text alone.
+
+EOF
+        printf 'Tab title: %s\nDirectory: %s\nProgram: %s\n' "$label" "$cwd" "${tool:-shell}"
+        [ -n "$convo" ] && printf '\n<transcript>\n%s\n</transcript>\n' "$convo"
+        [ -n "$screen" ] && printf '\n<screen>\n%s\n</screen>\n' "$screen"
+    } >"$work/prompt"
+
+    # --ephemeral keeps it out of codex's thread history and resume list;
+    # --ignore-user-config skips MCP servers and notify; hooks off so it
+    # doesn't show up in the tab indicator or notch as a running agent.
+    (
+        cd "$work" || exit 1
+        unset TMUX TMUX_PANE
+        exec "$codex" exec -m "$DESCRIBE_MODEL" -c model_reasoning_effort=low \
+            --ephemeral --skip-git-repo-check --ignore-user-config --ignore-rules \
+            --disable hooks -s read-only -o "$work/out" - <"$work/prompt" >"$work/log" 2>&1
+    ) &
+    local cpid=$!
+    ( sleep "$DESCRIBE_TIMEOUT"; kill "$cpid" ) 2>/dev/null &
+    local wd=$!
+    wait "$cpid"; local rc=$?
+    pkill -P "$wd" sleep 2>/dev/null; kill "$wd" 2>/dev/null
+
+    # First line, tabs and separators out (they delimit picker fields), and a
+    # word-boundary cut if the model ran long.
+    local desc=""
+    [ -s "$work/out" ] && desc=$(grep -m 1 '[^[:space:]]' "$work/out" \
+        | tr '\t\037' '  ' | sed -E 's/^[[:space:]"'\''`]+//; s/[[:space:]"'\''`.]+$//')
+    if [ "${#desc}" -gt 90 ]; then
+        desc="${desc:0:88}"; desc="${desc% *}…"
+    fi
+    [ -n "$desc" ] || log "summarize ${tool:-shell} ${sid:--}: failed (rc=$rc) $(tail -n 3 "$work/log" 2>/dev/null | tr '\n' ' ')"
+    rm -rf "$work"
+    printf '%s' "$desc"
 }
 
 # Recreate one recorded tab. Prints the new window id.
@@ -428,17 +564,21 @@ ago() {
 # gesture as the stash picker's kill.
 do_pick() {
     local client_sess="${1:-}" client_tty="${2:-}"
-    local id ts tool label cwd
+    local id ts tool label cwd desc
     local dim=$'\e[2m' mauve=$'\e[38;2;203;166;247m' teal=$'\e[38;2;148;226;213m' off=$'\e[0m'
+    local sub=$'\e[38;2;166;173;200m'
     local out now; now=$(date +%s)
-    out=$(jq -r '[.id, .ts, .tool, .label, .cwd] | join("\u001f")' "$HISTORY" 2>/dev/null \
+    # desc is the model's one-liner from do_describe; missing for a close that
+    # was just made (still being written) or where the call failed.
+    out=$(jq -r '[.id, .ts, .tool, .label, .cwd, (.desc // "")] | join("\u001f")' "$HISTORY" 2>/dev/null \
         | tail -r \
-        | while IFS=$'\x1f' read -r id ts tool label cwd; do
+        | while IFS=$'\x1f' read -r id ts tool label cwd desc; do
             [ -n "$id" ] || continue
             local c="$teal"; [ "$tool" = claude ] && c="$mauve"
             ago "$ts" "$now"
-            printf '%s\t%s%-9s%s %s%-9s%s %s\t%s%s%s\n' "$id" \
-                "$dim" "$REPLY" "$off" "$c" "${tool:-shell}" "$off" "$label" \
+            [ -n "$desc" ] && desc="  ${sub}— ${desc}${off}"
+            printf '%s\t%s%-9s%s %s%-9s%s %s%s\t%s%s%s\n' "$id" \
+                "$dim" "$REPLY" "$off" "$c" "${tool:-shell}" "$off" "$label" "$desc" \
                 "$dim" "${cwd/#"$HOME"/\~}" "$off"
           done \
         | fzf --ansi --delimiter='\t' --with-nth=2.. --reverse --multi \
@@ -467,7 +607,7 @@ do_preview() {
 
 do_list() {
     [ -s "$HISTORY" ] || { echo "(empty)"; return 0; }
-    jq -r '"\(.ts | strflocaltime("%m-%d %H:%M"))  \(.session):\(.index)  \(if .tool == "" then "-" else .tool end)\t\(.label)\t\(.cwd)"' "$HISTORY" | tail -r
+    jq -r '"\(.ts | strflocaltime("%m-%d %H:%M"))  \(.session):\(.index)  \(if .tool == "" then "-" else .tool end)\t\(.label)\t\(.cwd)\(if .desc then "\n    \(.desc)" else "" end)"' "$HISTORY" | tail -r
 }
 
 case "${1:-}" in
@@ -477,6 +617,8 @@ pick)       shift; do_pick "$@" ;;
 preview)    shift; do_preview "$@" ;;
 reopen)     shift; do_reopen "$@" ;;
 forget)     shift; do_forget "$@" ;;
+describe)   shift; do_describe "$@" ;;
+summarize)  shift; do_summarize "$@" ;;
 list)       do_list ;;
 *) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac

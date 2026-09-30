@@ -61,8 +61,11 @@ ACTIVE_SECS=15        # a transcript written this recently means a turn is in fl
 # numbers feeding both sides, so the snapshot is taken at the width the
 # preview will actually render it at. Snapshots are keyed by session id,
 # which survives a tmux restart; window ids do not.
-POPUP_W_PCT=80
-POPUP_H_PCT=60
+# Same popup as closed-tabs.sh's picker, so the two read alike: list on top,
+# preview UNDER it at (nearly) the full width.
+POPUP_W_PCT=94
+POPUP_H_PCT=85
+PREVIEW_PCT=72
 PREVIEW_DIR="$HOME/.local/state/tmux-stash/previews"
 
 # Records are delimited with the unit separator, NOT a tab: bash treats tab as
@@ -687,12 +690,12 @@ snapshot_pane() {
     case "$c" in ''|*[!0-9]*) c=0 ;; esac
     case "$r" in ''|*[!0-9]*) r=0 ;; esac
     if [ "$c" -gt 0 ] && [ "$r" -gt 0 ]; then
-        # Popup border takes 2 each way; fzf gives the preview half its width
-        # and border-left another column. Undershoot rather than clip: a
-        # missing column cuts through the composer's box border, a one-column
-        # gap is invisible.
-        cols=$(( (c * POPUP_W_PCT / 100 - 2) / 2 - 2 ))
-        lines=$(( r * POPUP_H_PCT / 100 - 3 ))
+        # Popup border takes 2 each way; fzf gives the preview PREVIEW_PCT of
+        # the height below the list and border-top another row. Undershoot
+        # rather than clip: a missing column cuts through the composer's box
+        # border, a one-column gap is invisible.
+        cols=$(( c * POPUP_W_PCT / 100 - 3 ))
+        lines=$(( (r * POPUP_H_PCT / 100 - 2) * PREVIEW_PCT / 100 - 2 ))
         if [ "$cols" -ge 20 ] && [ "$lines" -ge 5 ]; then
             # The redraw is asynchronous — give the TUI a beat to take the
             # SIGWINCH. This runs after the tab is already off the bar, so
@@ -984,6 +987,10 @@ park_one() {
     tmux set-option -w -t "$win" @stash_origin "$sess"
     label=$(tmux show -wqv -t "$win" @agent_summary 2>/dev/null)
     [ -n "$label" ] && tmux set-option -w -t "$win" @stash_label "$label"
+    # For the picker: when it was parked, and (written by `describe` shortly
+    # after) what it was doing. A description from an earlier park is stale.
+    tmux set-option -w -t "$win" @stash_ts "$(date +%s)"
+    tmux set-option -uw -t "$win" @stash_desc 2>/dev/null
 
     tmux move-window -s "$win" -t "$HOLD": 2>/dev/null && return 0
 
@@ -1195,6 +1202,13 @@ do_stash_many() {
         [ -n "$note" ]      && report="$report — $note"
         msg "$report"
     fi
+
+    # Detached, and started BEFORE the suspends: describe reads the agent's
+    # session id from its live session file, which the suspend is about to
+    # remove (it falls back to @stash_session, set just before the kill).
+    for w in "${parked[@]}"; do
+        ( "$SELF" describe "$w" </dev/null >/dev/null 2>&1 & )
+    done
 
     # After the moves, so the tabs disappear immediately and the (slower)
     # graceful shutdowns happen out of sight. Serial on purpose: each suspend
@@ -1662,7 +1676,7 @@ do_unstash() {
             # if-shell in tmux.conf keeps the branch in one place and avoids a
             # second layer of shell quoting inside a tmux command string.
             # Deliberately outside the lock: the popup waits on a human.
-            tmux display-popup -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" "'$SELF' pick"
+            tmux display-popup -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" -T ' stashed tabs ' "'$SELF' pick"
             return 0
         fi
     fi
@@ -1916,20 +1930,49 @@ do_preview() {
 # line for a plain Enter). ⌃x because fzf already means something by most
 # mnemonic keys (⌃k is line-up, ⌃d is deselect-all here) and ⌃x is unbound.
 #
-# The preview pane on the right is half the popup, matching the size
-# snapshot_pane captures at; border-left rather than the default box so no
-# rows are lost to a top/bottom border and the snapshot's height fits.
+# Laid out like closed-tabs.sh's picker — "when · what · label — description ·
+# where", newest first, preview underneath at the size snapshot_pane captures
+# at — so the two popups read the same. The description is @stash_desc,
+# written by `describe` a few seconds after the park.
+ago() {
+    local s=$(( $2 - $1 ))
+    if   [ "$s" -lt 60 ];    then REPLY="just now"
+    elif [ "$s" -lt 3600 ];  then REPLY="$((s / 60))m ago"
+    elif [ "$s" -lt 86400 ]; then REPLY="$((s / 3600))h ago"
+    else                          REPLY="$((s / 86400))d ago"
+    fi
+}
 do_pick() {
-    local out key wins
+    local out key wins now; now=$(date +%s)
+    local dim=$'\e[2m' mauve=$'\e[38;2;203;166;247m' teal=$'\e[38;2;148;226;213m' off=$'\e[0m'
+    local sub=$'\e[38;2;166;173;200m'
+    local id ts sid cmd label cwd desc tool c
     out=$(tmux list-windows -t "=$HOLD" \
-            -F '#{window_id}	#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}	#{pane_current_path}' \
-          | fzf --with-nth=2.. --delimiter='\t' --reverse --prompt='bring back > ' \
+            -F "#{window_id}${SEP}#{@stash_ts}${SEP}#{@stash_session}${SEP}#{pane_current_command}${SEP}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}${SEP}#{?#{@stash_cwd},#{@stash_cwd},#{pane_current_path}}${SEP}#{@stash_desc}" \
+          | sort -t "$SEP" -k2,2nr \
+          | while IFS="$SEP" read -r id ts sid cmd label cwd desc; do
+              [ -n "$id" ] || continue
+              # claude's process title is its version string.
+              case "$cmd" in
+                  [0-9]*.[0-9]*) tool=claude ;;
+                  zsh|bash|sh|fish|-zsh) tool=shell ;;
+                  *) tool=$cmd ;;
+              esac
+              [ -n "$sid" ] && tool=claude
+              c="$teal"; [ "$tool" = claude ] && c="$mauve"
+              if [ -n "$ts" ]; then ago "$ts" "$now"; else REPLY="?"; fi
+              [ -n "$desc" ] && desc="  ${sub}— ${desc}${off}"
+              printf '%s\t%s%-9s%s %s%-9s%s %s%s\t%s%s%s\n' "$id" \
+                  "$dim" "$REPLY" "$off" "$c" "$tool" "$off" "$label" "$desc" \
+                  "$dim" "${cwd/#"$HOME"/\~}" "$off"
+            done \
+          | fzf --ansi --with-nth=2.. --delimiter='\t' --reverse --prompt='bring back > ' \
                 --multi \
                 --expect=ctrl-x \
                 --bind 'shift-down:toggle+down,shift-up:toggle+up,ctrl-a:select-all,ctrl-d:deselect-all' \
                 --preview "'$SELF' preview {1}" \
-                --preview-window 'right,50%,border-left' \
-                --header '⇧↑/⇧↓ or Tab to pick several · ⌃a all · ⏎ bring back · ⌃x kill')
+                --preview-window "down,${PREVIEW_PCT}%,border-top,follow" \
+                --header '⏎ bring back · Tab or ⇧↑/⇧↓ to pick several · ⌃a all · ⌃x kill')
     key=${out%%$'\n'*}
     wins=$(printf '%s\n' "$out" | tail -n +2 | cut -f1 | tr '\n' ' ')
     # Hand off rather than doing the work here. the resume polls for up to
@@ -1948,10 +1991,45 @@ do_pick() {
     fi
 }
 
+# Detached, one per parked window (do_stash_many starts it): a one-line
+# account of what the window was doing, from gpt-6-luna via closed-tabs.sh's
+# `summarize`, stored as @stash_desc for the picker. Reads the claude
+# transcript when the window holds one, plus the screen either way.
+do_describe() {
+    local win="${1:-}" agent sid="" cwd label ts shot desc
+    [ -n "$win" ] || return 0
+    local summarize="$HOME/.config/tmux/scripts/closed-tabs.sh"
+    [ -x "$summarize" ] || return 0
+    ts=$(tmux show -wqv -t "$win" @stash_ts 2>/dev/null)
+    agent=$(window_agent "$win")
+    if [ -n "$agent" ]; then
+        sid=${agent#*"$SEP"}; sid=${sid%%"$SEP"*}
+    else
+        sid=$(tmux show -wqv -t "$win" @stash_session 2>/dev/null)
+    fi
+    label=$(tmux show -wqv -t "$win" @stash_label 2>/dev/null)
+    [ -n "$label" ] || label=$(tmux display-message -p -t "$win" '#{window_name}' 2>/dev/null)
+    cwd=$(tmux display-message -p -t "$win" '#{pane_current_path}' 2>/dev/null)
+    shot=$(mktemp)
+    # The window's active pane. An empty target is the CURRENT pane — never
+    # capture -t ''.
+    local pane; pane=$(tmux display-message -p -t "$win" '#{pane_id}' 2>/dev/null)
+    [ -n "$pane" ] && tmux capture-pane -ep -t "$pane" >"$shot" 2>/dev/null
+    desc=$("$summarize" summarize "${sid:+claude}" "$sid" "$cwd" "$label" "$shot")
+    rm -f "$shot"
+    [ -n "$desc" ] || return 0
+    # Only if it's still the same park: a window brought back (or re-parked,
+    # which re-describes) in the meantime shouldn't get this one.
+    [ "$(tmux display-message -p -t "$win" '#{session_name}' 2>/dev/null)" = "$HOLD" ] || return 0
+    [ "$(tmux show -wqv -t "$win" @stash_ts 2>/dev/null)" = "$ts" ] || return 0
+    tmux set-option -w -t "$win" @stash_desc "$desc" 2>/dev/null
+    log "described $win: $desc"
+}
+
 do_list() {
     if hold_exists; then
         tmux list-windows -t "=$HOLD" \
-            -F '  #{window_id}  from=#{?#{@stash_origin},#{@stash_origin},?}  #{?#{@stash_session},[suspended] ,}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}'
+            -F '  #{window_id}  from=#{?#{@stash_origin},#{@stash_origin},?}  #{?#{@stash_session},[suspended] ,}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}#{?#{@stash_desc},  — #{@stash_desc},}'
     else
         echo "  nothing parked"
     fi
@@ -1999,6 +2077,7 @@ case "${1:-}" in
     publish) publish ;;
     pick)    do_pick ;;
     preview) shift; do_preview "${1:-}" ;;
+    describe) shift; do_describe "${1:-}" ;;
     resume)  shift; resume_agent "${1:-}" ;;
     restore-state) do_restore_state ;;
     list)    do_list ;;
