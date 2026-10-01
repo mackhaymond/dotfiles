@@ -58,6 +58,19 @@ POLL_SECONDS=1
 
 command -v tmux >/dev/null 2>&1 || exit 0
 
+# DEFAULT SERVER ONLY. The singleton below is per-USER (one pidfile, a pgrep
+# sweep over every matching command line), but tmux.conf is loaded by every
+# server — and agents here routinely start scratch servers with `tmux -L
+# <name>` (notchlab, stashtest, ...) that source it. On 2026-10-01 a
+# `tmux -L notchlab` test server's run-shell spawned a watcher that reaped the
+# real one and then drove @agent_blink on the scratch server, so every working
+# tab on the user's server sat frozen on plain blue (= idle). run-shell and the
+# agent hooks both inherit TMUX="<socket>,<pid>,<session>"; anything not on the
+# default socket leaves BEFORE touching the pidfile or killing anything. Empty
+# TMUX means the tmux CLI targets the default server anyway, so that's allowed.
+_sock="${TMUX%%,*}"
+[ -z "$_sock" ] || [ "${_sock##*/}" = default ] || exit 0
+
 # Singleton: every tmux.conf reload (`prefix r`) re-runs the spawn line, so a
 # plain check-then-write leaks daemons (a transiently-exiting watcher with an
 # unconditional trap can delete a live sibling's pidfile, then the next reload
