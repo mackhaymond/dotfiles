@@ -170,7 +170,8 @@ built-in `ListAgents`/`SendMessage` for anything tmux-local — those name peers
 `mackhaymond.co` is the user's launchpad for everything they host. Whenever
 you deploy or stand up something with a URL — a new Worker/Pages custom
 domain, a tunnel hostname, a Vercel project, a self-hosted dashboard — or
-retire one, update the catalog as part of finishing the task. The procedure
+retire one, update the catalog as part of finishing the task. Creating a new
+repo or project folder counts too (`npm run catalog:sync` in that repo). The procedure
 lives in `~/code/projects/mackhaymond.co/CLAUDE.md`; follow it. The repo is
 PUBLIC: private entries go to KV, never into the repo. Mention the catalog
 update in your final summary. If you're unsure whether something belongs
