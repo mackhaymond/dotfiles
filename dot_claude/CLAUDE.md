@@ -164,3 +164,14 @@ built-in `ListAgents`/`SendMessage` for anything tmux-local — those name peers
 - `message_agent` and `send_keys` **type into live terminals**. Check
   `list_panes` before writing, and prefer `message_agent` (it refuses
   non-agent panes) over `send_keys` when talking to a Claude session.
+
+## Launchpad catalog (mackhaymond.co)
+
+`mackhaymond.co` is the user's launchpad for everything they host. Whenever
+you deploy or stand up something with a URL — a new Worker/Pages custom
+domain, a tunnel hostname, a Vercel project, a self-hosted dashboard — or
+retire one, update the catalog as part of finishing the task. The procedure
+lives in `~/code/projects/mackhaymond.co/CLAUDE.md`; follow it. The repo is
+PUBLIC: private entries go to KV, never into the repo. Mention the catalog
+update in your final summary. If you're unsure whether something belongs
+(a throwaway preview, a class project), ask in one line rather than skip.
