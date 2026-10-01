@@ -471,7 +471,7 @@ unbind -n M-y
 # Not `run-shell -b` for unstash: it may need to raise a popup for the picker,
 # and a backgrounded run-shell has no client to raise it on.
 bind-key H run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh stash '#{window_id}'"
-bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash"
+bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash '' '#{client_name}'"
 
 # ...and a range of adjacent tabs at once, vim-visual style. prefix+v enters
 # the mode with just the current tab selected (tinted); the client is then

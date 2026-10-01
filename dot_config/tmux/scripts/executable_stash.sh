@@ -22,9 +22,13 @@
 # there is still no state file to go stale or be orphaned.
 #
 #   stash.sh stash   [<window>]   park it (default: current)
-#   stash.sh unstash [<window>]   bring one back (no <window>: picker)
+#   stash.sh unstash [<window>] [<client>]
+#                                 bring one back (no <window>: picker), and
+#                                 take <client> to it if it went home to
+#                                 another session
 #   stash.sh stash-many <w>...    park a group in one transaction
-#   stash.sh unstash-many <w>...  bring a group back in one transaction
+#   stash.sh unstash-many [-c <client>] <w>...
+#                                 bring a group back in one transaction
 #   stash.sh kill-many <w>...     destroy parked windows (⌃x in the picker);
 #                                 discarded session ids land in the log with
 #                                 the command that resumes them by hand
@@ -1654,7 +1658,7 @@ pending_windows() {
 }
 
 do_unstash() {
-    local win="${1:-}"
+    local win="${1:-}" client="${2:-}"
     if ! hold_exists; then
         # Nothing parked, but a pending resume may still be waiting.
         local p; p=$(pending_windows | head -1)
@@ -1676,17 +1680,27 @@ do_unstash() {
             # if-shell in tmux.conf keeps the branch in one place and avoids a
             # second layer of shell quoting inside a tmux command string.
             # Deliberately outside the lock: the popup waits on a human.
-            tmux display-popup -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" -T ' stashed tabs ' "'$SELF' pick"
+            tmux display-popup ${client:+-c "$client"} -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" -T ' stashed tabs ' "'$SELF' pick '$client'"
             return 0
         fi
     fi
 
-    do_unstash_many "$win"
+    do_unstash_many ${client:+-c "$client"} "$win"
 }
 
 # Bring one or more parked windows back, in a single transaction for the same
 # reasons do_stash_many is one.
+#
+# `-c <client>` names the client to take to them. A window goes home to its
+# ORIGIN session, which is often not the one you are looking at when you pick
+# it — and select-window alone only changes that session's current window, so
+# the tab came back somewhere off-screen and you had to go and find it. The
+# client is passed in explicitly because this runs from a backgrounded
+# run-shell (see do_pick), which has no client of its own; same arrangement as
+# do_send_many.
 do_unstash_many() {
+    local client=""
+    if [ "${1:-}" = "-c" ]; then client="${2:-}"; shift 2; fi
     local w win origin origins=() ordered=() wanted=" $* "
 
     hold_exists || { msg "nothing is parked"; return 0; }
@@ -1775,6 +1789,15 @@ do_unstash_many() {
     # Land on the first of the group, so a multi-tab restore leaves you at the
     # left end of what just came back rather than on whichever one moved last.
     tmux select-window -t "${restored[0]}" 2>/dev/null
+    # ...and take the client there if that is another session. Skipped when it
+    # is already there, so a restore into the current session does not
+    # overwrite last-session (prefix+L) with itself.
+    if [ -n "$client" ]; then
+        local dest; dest=$(tmux display-message -p -t "${restored[0]}" '#{session_name}' 2>/dev/null)
+        if [ -n "$dest" ] && [ "$dest" != "$(tmux display-message -p -c "$client" '#{client_session}' 2>/dev/null)" ]; then
+            tmux switch-client -c "$client" -t "=$dest" 2>/dev/null
+        fi
+    fi
     renumber "$HOLD" ${origins[@]+"${origins[@]}"}
     publish
     lock_release
@@ -1943,7 +1966,7 @@ ago() {
     fi
 }
 do_pick() {
-    local out key wins now; now=$(date +%s)
+    local client="${1:-}" out key wins now; now=$(date +%s)
     local dim=$'\e[2m' mauve=$'\e[38;2;203;166;247m' teal=$'\e[38;2;148;226;213m' off=$'\e[0m'
     local sub=$'\e[38;2;166;173;200m'
     local id ts sid cmd label cwd desc tool c
@@ -1987,7 +2010,7 @@ do_pick() {
     if [ "$key" = "ctrl-x" ]; then
         tmux run-shell -b "'$SELF' kill-many $wins"
     else
-        tmux run-shell -b "'$SELF' unstash-many $wins"
+        tmux run-shell -b "'$SELF' unstash-many ${client:+-c '$client' }$wins"
     fi
 }
 
@@ -2062,7 +2085,7 @@ do_list() {
 
 case "${1:-}" in
     stash)   shift; do_stash "${1:-}" ;;
-    unstash) shift; do_unstash "${1:-}" ;;
+    unstash) shift; do_unstash "${1:-}" "${2:-}" ;;
     stash-many)   shift; do_stash_many "$@" ;;
     unstash-many) shift; do_unstash_many "$@" ;;
     kill-many)    shift; do_kill_many "$@" ;;
@@ -2075,7 +2098,7 @@ case "${1:-}" in
     send-many)  shift; do_send_many "$@" ;;
     count)   count ;;
     publish) publish ;;
-    pick)    do_pick ;;
+    pick)    shift; do_pick "${1:-}" ;;
     preview) shift; do_preview "${1:-}" ;;
     describe) shift; do_describe "${1:-}" ;;
     resume)  shift; resume_agent "${1:-}" ;;
