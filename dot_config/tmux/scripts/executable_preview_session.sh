@@ -15,7 +15,7 @@ session="${1:-}"
 # Mirror the validation in mru-session-switch.sh — never let an
 # attacker-controlled string into a tmux target.
 [[ "$session" =~ ^[A-Za-z0-9._-]+$ ]] || exit 0
-[[ "$session" == "scratch" ]] && exit 0
+[[ "$session" == "scratch" || "$session" == "tasks" ]] && exit 0
 
 tmux has-session -t "=$session" 2>/dev/null || exit 0
 

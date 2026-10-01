@@ -33,7 +33,7 @@ case "$(tmux show -gv @double_tap_target 2>/dev/null)" in
     # rest of the line, so a name with spaces still compares whole.
     target="$(tmux list-sessions -F '#{session_last_attached} #{session_name}' |
       awk -v cur="$current" '{ n = substr($0, index($0, " ") + 1) }
-        n != cur && n != "scratch" && n != "agents" && n != "stash"' |
+        n != cur && n != "scratch" && n != "agents" && n != "tasks" && n != "stash"' |
       sort -k1,1nr | head -1 | cut -d' ' -f2-)"
     if [[ -n "$target" ]]; then
       tmux switch-client -c "$client" -t "=$target"

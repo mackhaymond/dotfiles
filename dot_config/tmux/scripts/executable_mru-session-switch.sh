@@ -31,7 +31,7 @@ main() {
   local list
   list="$({
     tmux list-sessions -F $'#{session_last_attached}\t#{session_name}' 2>/dev/null \
-      | awk -F $'\t' -v cur="$current_session" '$2 != cur && $2 != "scratch" && $2 != "agents" && $2 != "stash"' \
+      | awk -F $'\t' -v cur="$current_session" '$2 != cur && $2 != "scratch" && $2 != "agents" && $2 != "tasks" && $2 != "stash"' \
       | sort -t $'\t' -k1,1nr \
       | cut -f2-
   } || true)"

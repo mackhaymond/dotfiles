@@ -574,6 +574,9 @@ set -g status-right-length 200
 
 # --- resurrect save guard (must stay BELOW the tpm line) ---
 set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/plugins/tmux-assistant-resurrect/scripts/save-assistant-sessions.sh'; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-guard.sh'"
+# The task broker (CuaNotch agentd) recreates this session and resumes tasks on
+# demand; resurrect must never relaunch its panes. Runs after the sidecar save.
+set -ag @resurrect-hook-post-save-all "; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/tasks-save-filter.sh'"
 
 # Parked windows come back parked on their own — resurrect saves the holding
 # session verbatim — but it does not save WINDOW OPTIONS, which is where the

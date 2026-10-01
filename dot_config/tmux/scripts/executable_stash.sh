@@ -1439,7 +1439,10 @@ do_sel_send() {
     sess=$(sel_sess_of "$cur"); [ -n "$sess" ] || return 0
     case "$sess" in "$HOLD") return 0 ;; esac
     # Its windows belong to tmux-pty-mcp, which tracks them by session.
-    case "$sess" in agents) do_sel_cancel; msg "agents windows belong to tmux-pty-mcp — not moving them"; return 0 ;; esac
+    case "$sess" in
+        agents) do_sel_cancel; msg "agents windows belong to tmux-pty-mcp — not moving them"; return 0 ;;
+        tasks) do_sel_cancel; msg "tasks windows belong to CuaNotch — not moving them"; return 0 ;;
+    esac
     ids=$(sel_ids "$sess")
     [ -n "$ids" ] || ids="$cur"
     n=$(printf '%s\n' "$ids" | wc -l | tr -d ' ')
@@ -1464,7 +1467,7 @@ do_send_pick() {
     # that are not places to put things.
     local list
     list=$(tmux list-sessions -F $'#{session_last_attached}\t#{session_name}' 2>/dev/null \
-        | awk -F '\t' -v cur="$src" -v hold="$HOLD" '$2 != cur && $2 != "scratch" && $2 != "agents" && $2 != hold' \
+        | awk -F '\t' -v cur="$src" -v hold="$HOLD" '$2 != cur && $2 != "scratch" && $2 != "agents" && $2 != "tasks" && $2 != hold' \
         | sort -t $'\t' -k1,1nr | cut -f2-)
 
     # Tab for "stay", not ⌥⏎ or ⌃s: WezTerm's default bindings take Alt+Enter
@@ -1510,7 +1513,7 @@ do_send_many() {
     # window is exactly what its sweep and agent-restore-prune.sh delete.
     case "$target" in
         "$HOLD")  say "that's the parking session — use H to hide tabs"; return 0 ;;
-        scratch|agents) say "$target isn't a place to put tabs"; return 0 ;;
+        scratch|agents|tasks) say "$target isn't a place to put tabs"; return 0 ;;
     esac
 
     lock_acquire || { say "stash: busy — try again"; return 0; }
@@ -1520,7 +1523,7 @@ do_send_many() {
     for w in "$@"; do
         [ -n "$w" ] || continue
         s=$(tmux display-message -p -t "$w" '#{session_name}' 2>/dev/null) || continue
-        [ -n "$s" ] && [ "$s" != "$HOLD" ] || continue
+        [ -n "$s" ] && [ "$s" != "$HOLD" ] && [ "$s" != "tasks" ] || continue
         [ -n "$src" ] || src="$s"
         [ "$s" = "$src" ] || continue
         case " $seen " in *" $w "*) continue ;; esac
