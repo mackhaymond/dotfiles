@@ -344,7 +344,11 @@ transcript_digest() {
 # shells from the screen snapshot. Any failure just leaves the entry without
 # one. The model call itself is `summarize`, which stash.sh uses too.
 DESCRIBE_MODEL=gpt-6-luna
-DESCRIBE_TIMEOUT=90
+DESCRIBE_TIMEOUT=180
+# The whole digest goes in, so the label reflects the thread's theme rather
+# than its last few turns. ~400k chars is ~120k tokens, well inside luna's
+# 272k window; past it, tool-call lines go first, then the middle.
+DESCRIBE_MAX_CHARS=400000
 do_describe() {
     local id="${1:-}" rec
     [ -n "$id" ] || return 0
@@ -376,11 +380,16 @@ do_summarize() {
 
     local convo screen=""
     convo=$(transcript_digest "$tool" "$sid")
-    # Keep the opening (what was asked) and the end (where it stood).
-    if [ "${#convo}" -gt 24000 ]; then
-        convo="${convo:0:4000}"$'\n[…]\n'"${convo: -20000}"
+    if [ "${#convo}" -gt "$DESCRIBE_MAX_CHARS" ]; then
+        convo=$(grep -v '^  \[' <<<"$convo")
     fi
-    [ -s "$screen_file" ] && screen=$(perl -pe 's/\e\[[0-9;:?]*[A-Za-z]//g' "$screen_file" | tail -n 60)
+    if [ "${#convo}" -gt "$DESCRIBE_MAX_CHARS" ]; then
+        local head=$((DESCRIBE_MAX_CHARS / 2)) tail=$((DESCRIBE_MAX_CHARS / 2))
+        convo="${convo:0:$head}"$'\n[…]\n'"${convo: -$tail}"
+    fi
+    # The screen only stands in for a missing transcript: next to one it's just
+    # the last turn again, which is what pulled labels toward the latest step.
+    [ -z "$convo" ] && [ -s "$screen_file" ] && screen=$(perl -pe 's/\e\[[0-9;:?]*[A-Za-z]//g' "$screen_file" | tail -n 60)
     # A bare prompt isn't worth a call.
     if [ -z "$convo" ] && [ "$(grep -c '[^[:space:]]' <<<"$screen")" -lt 3 ]; then
         return 0
@@ -391,9 +400,11 @@ do_summarize() {
         cat <<'EOF'
 You label terminal tabs the user has put away, so they can pick the right one
 to bring back later. Below is what was happening in one tab. Write ONE line of
-at most 70 characters saying what was being worked on and where it stood.
-Be specific (name the feature, file, bug or command). No preamble, no quotes,
-no trailing period. Do not run any commands; answer from this text alone.
+at most 70 characters naming what the session as a whole was about — the main
+goal or theme running through the entire conversation, not just its last few
+turns. If it wandered across topics, name the one it mostly served. Be
+specific (name the feature, project, file or bug). No preamble, no quotes, no
+trailing period. Do not run any commands; answer from this text alone.
 
 EOF
         printf 'Tab title: %s\nDirectory: %s\nProgram: %s\n' "$label" "$cwd" "${tool:-shell}"
