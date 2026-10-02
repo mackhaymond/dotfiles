@@ -103,6 +103,7 @@ These apps automatically appear on their designated space when launched:
 | Messages | messages |
 | ChatGPT | ai |
 | Claude | ai |
+| Muse | ai |
 | Conductor, Claudia, OpenChamber, OpenCode, Jean, T3 Code (Alpha) | agent |
 
 **`agent` (hyper+esc) — the generic coding-agent view.** Unlike every other label,
@@ -263,6 +264,7 @@ Move the focused window to a target space and **follow focus to it** (unless pin
 - Messages → messages
 - ChatGPT → ai
 - Claude → ai
+- Muse → ai
 - Conductor, Claudia, OpenChamber, OpenCode, Jean, T3 Code (Alpha) → agent
 - Arc → protected on `main`/`school` (any Arc window on either is shielded; rare Little-Arc-on-home included)
 
