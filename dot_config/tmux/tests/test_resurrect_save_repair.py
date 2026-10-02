@@ -153,6 +153,57 @@ class SaveRepairTests(unittest.TestCase):
             self.assertEqual(output.getnames(), ["pane_contents/pane-stash:1.1", "pane_contents/pane-other:1.1"])
             self.assertEqual(output.extractfile(output.getmembers()[0]).read(), b"screen")
 
+    def test_parked_shell_retains_recorded_cwd_after_restore_to_home(self):
+        intended = str(self.root / "parked project")
+        Path(intended).mkdir()
+        pane = dict(target="stash:1.1", cwd="/home", active="1", command="zsh", pid="201",
+                    stash_session="parked-id", stash_pane_idx="1", stash_cwd=intended)
+        self.panes["%201"] = pane
+        content, layout, _, report = self.repaired()
+        self.assertEqual(layout.decode().splitlines()[1].split("\t")[7], ":" + intended)
+        self.assertEqual(report["parked_cwds"], 1)
+        self.assertEqual(json.loads(content)["sessions"][0], self.claude)
+        # The blank-title format still requires the saved shell PID to match.
+        self.layout = self.row("main", 7) + "pane\tstash\t1\t0\t:\t1\t:/home\t1\tzsh\t201\t:\r\n"
+        _, layout, _, report = self.repaired()
+        self.assertTrue(layout.endswith(b"\r\n"))
+        self.assertEqual(layout.decode().splitlines()[1].split("\t")[7], ":" + intended)
+        self.assertEqual(report["repaired_panes"], 1)
+        pane["pid"] = "999"
+        with self.assertRaisesRegex(ValueError, "verified against its live shell"):
+            self.repaired()
+
+    def test_parked_cwd_never_applies_to_unverified_or_other_panes(self):
+        pane = dict(target="stash:1.1", cwd="/home", active="1", command="zsh", pid="201",
+                    stash_session="parked-id", stash_pane_idx="1", stash_cwd=str(self.root))
+        for changes in ({"stash_pane_idx": "2"}, {"stash_session": ""}, {"command": "claude"},
+                        {"stash_cwd": "relative"}, {"stash_cwd": str(self.root / "missing")}):
+            with self.subTest(changes=changes):
+                self.panes["%201"] = dict(pane, **changes)
+                _, layout, _, report = self.repaired()
+                self.assertEqual(layout.decode(), self.layout)
+                self.assertEqual(report["parked_cwds"], 0)
+        # Window options are shared by every split, but only the named pane
+        # receives the override even when both panes are idle shells.
+        self.panes["%201"] = pane
+        self.panes["%202"] = dict(pane, target="stash:1.2", pid="202")
+        sibling = self.row("stash", 1).replace("\t1\tTitle", "\t2\tTitle")
+        self.layout += sibling
+        _, layout, _, report = self.repaired()
+        self.assertTrue(layout.decode().endswith(sibling))
+        self.assertEqual(report["parked_cwds"], 1)
+
+    def test_snapshot_captures_optional_parked_metadata_from_same_pane(self):
+        line = f"%201\tstash:1.1\t/home\t1\tzsh\t201\t:parked-id\t:1\t:{self.root}"
+        with patch.object(repair, "run", return_value=line) as command:
+            panes = repair.pane_snapshot(self.socket)
+        self.assertEqual(panes["%201"]["stash_session"], "parked-id")
+        self.assertEqual(panes["%201"]["stash_pane_idx"], "1")
+        self.assertEqual(panes["%201"]["stash_cwd"], str(self.root))
+        self.assertIn("#{@stash_cwd}", command.call_args.args[0][-1])
+        with patch.object(repair, "run", return_value="%7\tmain:7.1\t/shared\t1\tzsh\t77"):
+            self.assertEqual(repair.pane_snapshot(self.socket)["%7"]["stash_session"], "")
+
     def test_dry_run_writes_nothing_and_apply_preserves_layout_symlink(self):
         sidecar, layout = self.root / "assistant-sessions.json", self.root / "save.txt"
         sidecar.write_text(self.sidecar)

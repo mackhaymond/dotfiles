@@ -32,13 +32,18 @@ def load_owner(path):
 
 
 def pane_snapshot(socket):
-    fields = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_path}\t#{pane_active}\t#{pane_current_command}\t#{pane_pid}"
+    fields = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_path}\t#{pane_active}\t#{pane_current_command}\t#{pane_pid}\t:#{@stash_session}\t:#{@stash_pane_idx}\t:#{@stash_cwd}"
     panes = {}
     for line in run(["tmux", "-S", socket, "list-panes", "-a", "-F", fields]).splitlines():
-        pane, target, cwd, active, command, pid = line.split("\t")
+        values = line.split("\t")
+        pane, target, cwd, active, command, pid = values[:6]
+        metadata = values[6:] or [":", ":", ":"]
+        if len(metadata) != 3 or any(not value.startswith(":") for value in metadata):
+            raise ValueError("Invalid live parked pane metadata")
         if not re.fullmatch(r"%\d+", pane) or not os.path.isabs(cwd) or active not in ("0", "1"):
             raise ValueError("Invalid live pane snapshot")
         panes[pane] = dict(target=target, cwd=cwd, active=active, command=command, pid=pid)
+        panes[pane].update(zip(("stash_session", "stash_pane_idx", "stash_cwd"), (value[1:] for value in metadata)))
     return panes
 
 
@@ -160,21 +165,33 @@ def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_d
         raise ValueError("Unresolved living Codex frontend PIDs: " + ",".join(map(str, sorted(set(unresolved)))))
     data["sessions"] = sessions + sorted(rebuilt, key=lambda entry: entry["pane"])
     current = {pane["target"]: pane for pane in panes.values()}
-    lines, fixed = [], 0
+    lines, fixed, parked_cwds = [], 0, 0
     for line in layout.splitlines(keepends=True):
         f = line.rstrip("\r\n").split("\t")
+        target = f"{f[1]}:{f[2]}.{f[5]}" if f[0] == "pane" and len(f) >= 6 else ""
+        pane, changed = current.get(target), False
         if f[0] == "pane" and (len(f) < 8 or not f[7].startswith(":")):
-            target = f"{f[1]}:{f[2]}.{f[5]}" if len(f) >= 6 else ""
-            pane = current.get(target)
             if (len(f) != 11 or not pane or f[9] != pane["pid"]
                     or f[8] != pane["command"] or pane["command"] not in SHELLS or f[10] != ":"):
                 raise ValueError("Malformed pane row cannot be verified against its live shell")
             f = f[:6] + [":", ":" + pane["cwd"], pane["active"], pane["command"], ":"]
-            line = "\t".join(f) + ("\n" if line.endswith("\n") else "")
+            changed = True
             fixed += 1
+        # Window metadata applies only to its recorded pane, never another
+        # split. A restored parked shell may currently be in HOME; retain the
+        # explicitly recorded resume directory once this shell is verified.
+        if (pane and len(f) == 11 and pane.get("stash_session", "").strip()
+                and pane.get("stash_pane_idx") == f[5] and f[9] == pane["command"]
+                and pane["command"] in SHELLS and f[10] == ":"
+                and os.path.isabs(cwd := pane.get("stash_cwd", "")) and Path(cwd).is_dir()
+                and f[7] != ":" + cwd):
+            f[7], changed = ":" + cwd, True
+            parked_cwds += 1
+        if changed:
+            line = "\t".join(f) + line[len(line.rstrip("\r\n")):]
         lines.append(line)
     report = dict(codex=len(rebuilt), preserved=len(sessions), invalid_bindings=invalid, repaired_panes=fixed,
-                  fallback_bindings=fallback)
+                  fallback_bindings=fallback, parked_cwds=parked_cwds)
     return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode(), "".join(lines).encode(), used, report
 
 
