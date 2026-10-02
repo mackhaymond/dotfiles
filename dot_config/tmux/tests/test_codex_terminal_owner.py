@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 SPEC = importlib.util.spec_from_file_location('terminal_owner', Path(__file__).resolve().parents[1] / 'scripts/codex-terminal-owner.py')
 owner = importlib.util.module_from_spec(SPEC)
@@ -247,6 +247,56 @@ class OwnershipTests(unittest.TestCase):
                      ['-p', 'work'], ['--profile', 'work'], ['--profile=work'], ['-pwork'],
                      ['resume', 'id', '-p', 'work'], ['fork', '--profile=work']):
             self.assertTrue(owner.interactive_args(args), args)
+
+    def test_new_session_directory_respects_options_and_resume(self):
+        cwd = '/launch/folder with spaces'
+        for args in ([], ['prompt'], ['--', 'resume'], ['-c', '--cd'],
+                     ['--model', '-Celsewhere'], ['-p', 'resume', 'prompt'],
+                     ['--', '--cd=/prompt']):
+            self.assertEqual(owner.new_session_args(args, cwd), ['--cd', cwd] + args, args)
+        for args in (['-C', '/chosen'], ['--cd', '/chosen'], ['--cd=/chosen'],
+                     ['-C/chosen'], ['-C=/chosen'], ['resume', 'id'], ['fork', 'id'],
+                     ['-m', 'model', 'resume', '--last'], ['-c', 'key=value', 'fork']):
+            self.assertEqual(owner.new_session_args(args, cwd), args, args)
+
+    def test_relay_launch_passes_frontend_directory_without_changing_transport(self):
+        parent, child, listener = MagicMock(), MagicMock(), MagicMock()
+        parent.recv.return_value = b'1'
+        with patch.object(owner, 'real_codex', return_value='/native/codex'), \
+             patch.object(owner.os, 'isatty', return_value=True), \
+             patch.object(owner, 'capture', return_value=self.identity), \
+             patch.object(owner.os, 'getcwd', return_value='/frontend/root with spaces'), \
+             patch.object(owner.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as start, \
+             patch.object(owner.tempfile, 'mkdtemp', return_value=str(self.root)), \
+             patch.object(owner.socket, 'socket', return_value=listener), \
+             patch.object(owner.socket, 'socketpair', return_value=(parent, child)), \
+             patch.object(owner.os, 'fork', return_value=123), \
+             patch.object(owner.os, 'execv', side_effect=SystemExit) as execute:
+            for args, expected in (([], ['--cd', '/frontend/root with spaces']),
+                                   (['prompt'], ['--cd', '/frontend/root with spaces', 'prompt']),
+                                   (['--cd', '/explicit'], ['--cd', '/explicit']),
+                                   (['resume', 'saved'], ['resume', 'saved']),
+                                   (['fork', 'saved'], ['fork', 'saved'])):
+                with self.assertRaises(SystemExit):
+                    owner.launch(args)
+                execute.assert_called_with('/native/codex', ['/native/codex', '--remote',
+                                           'unix://' + str(self.root) + '/s'] + expected)
+            self.assertEqual(start.call_count, 5)
+            for call in start.call_args_list:
+                self.assertEqual(call.args[0], ['/native/codex', 'app-server', 'daemon', 'start'])
+
+    def test_launch_passthrough_never_injects_directory(self):
+        with patch.object(owner, 'real_codex', return_value='/native/codex'), \
+             patch.object(owner.os, 'execv', side_effect=SystemExit) as execute, \
+             patch.object(owner.subprocess, 'run') as start, \
+             patch.object(owner.os, 'getcwd') as cwd:
+            for args in (['exec', 'prompt'], ['app-server', 'proxy'],
+                         ['--remote', 'unix:///explicit'], ['--no-daemon']):
+                with self.assertRaises(SystemExit):
+                    owner.launch(args)
+                execute.assert_called_with('/native/codex', ['/native/codex'] + args)
+            start.assert_not_called()
+            cwd.assert_not_called()
 
     def test_websocket_mask_fragment_ping_and_extended_lengths(self):
         message = {'id': 1, 'method': 'turn/start', 'params': {'threadId': 'a'}}

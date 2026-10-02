@@ -4,6 +4,7 @@
 The CLI wrapper relays Codex's Unix WebSocket transport without changing
 messages. Only that client's start/resume replies and turn/start requests claim
 a pane. Records contain identities, not prompts or protocol transcripts.
+New interactive sessions explicitly use the frontend's launch directory.
 """
 import contextlib
 import fcntl
@@ -29,6 +30,8 @@ ROOT = Path(os.environ.get("CODEX_TERMINAL_OWNER_DIR", str(Path.home() / ".cache
 SCRIPT = Path(__file__).resolve()
 SID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 MAX_AUXILIARY_THREADS = 4096
+OPTION_OPERANDS = {"-c", "--config", "--enable", "--disable", "-C", "--cd", "-m", "--model", "-p", "--profile",
+                   "-s", "--sandbox", "-a", "--ask-for-approval", "-i", "--image", "--add-dir", "--local-provider"}
 
 
 def run(args, **kwargs):
@@ -472,8 +475,6 @@ def real_codex():
 def interactive_args(args):
     # Skip known option operands when finding a subcommand. Quoted prompts are
     # positional strings; only the actual native command names bypass the bridge.
-    operands = {"-c", "--config", "--enable", "--disable", "-C", "--cd", "-m", "--model", "-p", "--profile",
-                "-s", "--sandbox", "-a", "--ask-for-approval", "-i", "--image", "--add-dir", "--local-provider"}
     commands = {"exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server", "remote-control", "app",
                 "completion", "update", "doctor", "sandbox", "debug", "apply", "queue", "archive", "delete",
                 "migrate-rollouts", "unarchive", "cloud", "exec-server", "features", "help"}
@@ -486,11 +487,31 @@ def interactive_args(args):
             break
         elif arg in ("--help", "-h", "--version", "-V", "--no-daemon", "--remote") or arg.startswith("--remote="):
             return False
-        elif arg in operands:
+        elif arg in OPTION_OPERANDS:
             skip = True
         elif not arg.startswith("-") and positional is None:
             positional = arg
     return positional not in commands
+
+
+def new_session_args(args, cwd):
+    """Pin new remote sessions to launch cwd; preserve explicit roots and resumes."""
+    skip = False
+    positional = None
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg == "--":
+            break
+        elif arg in ("-C", "--cd") or arg.startswith(("--cd=", "-C")):
+            return args
+        elif arg in OPTION_OPERANDS:
+            skip = True
+        elif not arg.startswith("-") and positional is None:
+            positional = arg
+    if positional in ("resume", "fork"):
+        return args
+    return ["--cd", cwd] + args
 
 
 def launch(args):
@@ -506,6 +527,8 @@ def launch(args):
     listener = parent = child = None
     pid = None
     try:
+        # Capture before the relay child detaches and changes its working root.
+        frontend_args = new_session_args(args, os.getcwd())
         started = subprocess.run([real, "app-server", "daemon", "start"], stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
         if started.returncode:
@@ -534,7 +557,7 @@ def launch(args):
         if parent.recv(1) != b"1":
             raise RuntimeError("terminal bridge did not start")
         parent.close()
-        os.execv(real, [real, "--remote", "unix://" + path] + args)
+        os.execv(real, [real, "--remote", "unix://" + path] + frontend_args)
     except (OSError, RuntimeError, subprocess.SubprocessError):
         if pid:
             with contextlib.suppress(OSError):
