@@ -2096,12 +2096,18 @@ fetch_via_codexbar_codex() {
 
   ensure_codex_cli_in_path
 
+  # Scope the legacy approval-policy adapter to this usage probe. Preserve an
+  # explicit executable override and leave the user's interactive CLI alone.
+  local codex_cli codex_compat
+  codex_cli="${CODEX_CLI_PATH:-$(command -v codex)}"
+  codex_compat="${BASH_SOURCE[0]%/*}/codexbar-codex-compat.sh"
+
   local fetch_out fetch_err fetch_status stderr_file
   stderr_file="$(mktemp "${CACHE_DIR}/codexbar.stderr.XXXXXX")"
   CODEXBAR_TMP_FILES+=("$stderr_file")
 
   set +e
-  fetch_out="$(codexbar --provider codex --format json --json-only --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
+  fetch_out="$(CODEXBAR_CODEX_REAL_CLI="$codex_cli" CODEX_CLI_PATH="$codex_compat" codexbar --provider codex --format json --json-only --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
   local fetch_status=$?
   set -e
   fetch_err="$(cat "$stderr_file" 2>/dev/null || true)"
@@ -2110,7 +2116,7 @@ fetch_via_codexbar_codex() {
     if [[ "$fetch_out" == *"Unknown option --json-only"* || "$fetch_err" == *"Unknown option --json-only"* ]]; then
       : >"$stderr_file" 2>/dev/null || true
       set +e
-      fetch_out="$(codexbar --provider codex --format json --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
+      fetch_out="$(CODEXBAR_CODEX_REAL_CLI="$codex_cli" CODEX_CLI_PATH="$codex_compat" codexbar --provider codex --format json --web-timeout "$WEB_TIMEOUT_SECONDS" 2>"$stderr_file")"
       fetch_status=$?
       set -e
       fetch_err="$(cat "$stderr_file" 2>/dev/null || true)"
