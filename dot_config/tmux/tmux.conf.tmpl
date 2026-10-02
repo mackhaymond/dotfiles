@@ -557,6 +557,13 @@ bind C-l run-shell -b "#{HOME}/.config/tmux/scripts/closed-tabs.sh close '#{pane
 # Initialize TMUX plugin manager (keep this line at the very bottom of tmux.conf)
 run '~/.tmux/plugins/tpm/tpm'
 
+# Keep bell/activity notifications from inverting the agent palette. tmux's
+# default `reverse` survives Catppuccin's fg/bg styles: green completion tabs
+# become dark with green text, and ambient tabs can turn white. The agent
+# state owns the tab colors; bell monitoring remains enabled.
+set -gw window-status-bell-style default
+set -gw window-status-activity-style default
+
 # After tpm, because catppuccin builds status-right while tpm sources it — this
 # prepends the stash indicator to the left end of it. See the script for why it
 # is not a catppuccin module.
