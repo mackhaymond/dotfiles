@@ -2036,6 +2036,7 @@ FETCH_SCOPED_LOCKED=0
 # reader gets it without opening the raw file. "[]" where the provider has no
 # such breakdown, which is every provider but Claude today.
 FETCH_BREAKDOWN_JSON='[]'
+FETCH_CREDITS_REMAINING='null'
 FETCH_AUTH_REQUIRED=0
 # The endpoint answered, but with rate_limit_error. Not a broken fetch: the
 # budget is per account token and shared with every Claude Code session on it,
@@ -2062,6 +2063,7 @@ reset_fetch_outputs() {
   FETCH_WEEKLY_LOCKED=0
   FETCH_SCOPED_LOCKED=0
   FETCH_BREAKDOWN_JSON='[]'
+  FETCH_CREDITS_REMAINING='null'
   FETCH_AUTH_REQUIRED=0
   FETCH_RATE_LIMITED=0
   CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED=0
@@ -2228,6 +2230,11 @@ fetch_via_codexbar_codex() {
 
   # The normalized object rather than the raw array: one provider payload per
   # file, the same shape Claude's raw file has.
+  # Credits are an absolute balance, not another percentage window. Keep
+  # missing/malformed data null; zero and negative balances are real readings.
+  FETCH_CREDITS_REMAINING="$(printf '%s' "$normalized" | jq -c '
+    (try .credits.remaining catch null) | if type == "number" then . else null end
+  ')"
   persist_raw_payload codex "$normalized"
 
   return 0
@@ -2701,6 +2708,7 @@ render_provider_block() {
     --argjson weekly_locked "$(json_bool "$FETCH_WEEKLY_LOCKED")" \
     --argjson scoped_locked "$(json_bool "$FETCH_SCOPED_LOCKED")" \
     --argjson breakdown "$breakdown" \
+    --argjson credits_remaining "$FETCH_CREDITS_REMAINING" \
     --arg raw_file "$(basename "$(raw_file_for "$provider")")" \
     --arg history_file "$(basename "$(history_file_for "$provider")")" \
     --argjson fetched_at "$(json_num_or_null "${RENDER_FETCHED_AT:-$updated_at}")" \
@@ -2730,6 +2738,7 @@ render_provider_block() {
        scoped_severity: $scoped_severity, scoped_locked: $scoped_locked,
 
        breakdown: $breakdown,
+       credits_remaining: $credits_remaining,
        raw_file: $raw_file, history_file: $history_file,
 
        # Retained spellings from the first version of this file. Cheap to
