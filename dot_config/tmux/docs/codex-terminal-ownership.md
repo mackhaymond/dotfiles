@@ -8,7 +8,12 @@ fallback could lead to an unrelated tool PTY.
 `~/.local/bin/codex` wraps interactive tmux launches with a private Unix socket
 relay to the native `codex app-server proxy`. It preserves the shared server and
 forwards the HTTP upgrade and WebSocket frames unchanged. Successful client start/resume/fork
-responses and explicit turn-start requests provide exact thread IDs. Broadcasts,
+responses and explicit turn-start requests provide exact thread IDs. Ephemeral
+threads, including Codex's own title generator, are excluded using request and
+response metadata; their later turns cannot replace the foreground binding.
+The exclusion survives relay reconnects. Its bounded cache never evicts active
+helpers: at capacity, unclassified turns need a foreground lifecycle reply
+before they can claim a pane. Broadcasts,
 thread reads, titles, directory names, and tool-created PTYs cannot claim panes.
 
 `codex-terminal-owner resolve THREAD_ID` returns a verified binding or `unbound`.

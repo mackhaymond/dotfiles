@@ -418,7 +418,20 @@ compose_summary() {
     # session (the real title hashes to a different key). The cache read above
     # keeps repeats — and every later turn — free.
     command -v copilot >/dev/null 2>&1 || return 0
-    ( nohup bash "$0" condense "$win" "$proj" "$raw" >/dev/null 2>&1 & ) 2>/dev/null || true
+    # Hooks may have their whole process group reaped after returning. Ask
+    # the tmux server to own this background job instead, carrying the exact
+    # socket/session identity rather than the server's launch environment.
+    local launch
+    printf -v launch '%q ' env "HOME=$HOME" "PATH=$PATH" "TMPDIR=${TMPDIR:-/tmp}" \
+        "TMUX=${TMUX:-}" "TMUX_PANE=${TMUX_PANE:-}" \
+        "AGENT_TAB_SOCKET=${AGENT_TAB_SOCKET:-}" \
+        "AGENT_TAB_OWNER_SESSION=${AGENT_TAB_OWNER_SESSION:-}" \
+        "AGENT_TAB_OWNER_TOKEN=${AGENT_TAB_OWNER_TOKEN:-}" \
+        "AGENT_TAB_OWNER_BINDING=${AGENT_TAB_OWNER_BINDING:-}" \
+        "AGENT_TAB_CONDENSE_MODEL=$CONDENSE_MODEL" \
+        bash "$0" condense "$win" "$proj" "$raw"
+    launch+=' >/dev/null 2>&1'
+    tmux run-shell -b "$launch" >/dev/null 2>&1 || true
 }
 
 # Conversation title, best source first. Emits "<src>\t<title>", where <src>
@@ -524,16 +537,34 @@ fi
 # update the tab. argv: condense <window_id> <project> <raw-title>. Never
 # invoked by hooks directly, so a slow/failed model call only delays the
 # title swap.
-if [ "$mode" = "condense" ]; then
+if [ "$mode" = "condense" ] || [ "$mode" = "condense-locked" ]; then
     win="${2:-}"; proj="${3:-}"; raw="${4:-}"
     { [ -n "$win" ] && [ -n "$raw" ]; } || exit 0
     key=$(title_key "$raw")
-    lock="${TMPDIR:-/tmp}/agent-tab-condense.$key.lock"
-    mkdir "$lock" 2>/dev/null || exit 0   # another condenser owns this title
-    # copilot's stderr is kept (not /dev/null'd) so a failure can be told
-    # apart from a rejected --model, which is recoverable.
-    ERRF="$lock/err"
-    trap 'rm -f "$ERRF" 2>/dev/null; rmdir "$lock" 2>/dev/null' EXIT INT TERM
+    if [ "$mode" = "condense" ]; then
+        # A mkdir lock survives SIGKILL and then rejects this title forever.
+        # Keep the advisory-lock inode permanently; the kernel releases its
+        # lock when the worker exits, even if no shell trap can run. The new
+        # suffix also bypasses orphaned legacy .lock directories safely.
+        exec python3 - "${TMPDIR:-/tmp}/agent-tab-condense.$key.flock" "$0" "$win" "$proj" "$raw" <<'PYLOCK'
+import fcntl
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(0)
+os.set_inheritable(fd, True)
+os.execvp("bash", ["bash", sys.argv[2], "condense-locked"] + sys.argv[3:])
+PYLOCK
+    fi
+    # Each worker owns its stderr file. A killed worker may leave diagnostics,
+    # but no stale directory can block the next attempt.
+    ERRF=$(mktemp "${TMPDIR:-/tmp}/agent-tab-condense.$key.err.XXXXXX")
+    trap 'rm -f "$ERRF" 2>/dev/null' EXIT
+    trap 'exit 0' INT TERM
 
     short=$(cached_short "$raw")
     if [ -z "$short" ]; then

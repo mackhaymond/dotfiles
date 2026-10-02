@@ -112,6 +112,82 @@ class OwnershipTests(unittest.TestCase):
         observer.server({'id': 'c', 'result': {'thread': {'id': 'stale'}}})
         self.assertEqual(binds, ['new', 'active'])
 
+    def test_native_title_helper_cannot_replace_real_foreground_or_title(self):
+        binds, titles = [], []
+        def claim(sid, identity):
+            binds.append(sid)
+            return owner.bind(sid, identity)
+        observer = owner.ProtocolObserver(self.identity, claim, lambda record, thread: titles.append(thread.get('name')))
+        with patch.object(owner, 'valid', return_value=True):
+            observer.client({'id': 1, 'method': 'thread/start'})
+            observer.server({'id': 1, 'result': {'thread': {'id': 'real', 'ephemeral': False, 'name': 'Fix Codex status'}}})
+            observer.client({'id': 2, 'method': 'turn/start', 'params': {'threadId': 'real'}})
+            foreground = owner.resolve('real')
+            observer.client({'id': 3, 'method': 'thread/start', 'params': {'ephemeral': True}})
+            observer.server({'id': 3, 'result': {'thread': {'id': 'title-helper', 'ephemeral': True}}})
+            observer.client({'id': 4, 'method': 'turn/start', 'params': {'threadId': 'title-helper'}})
+            observer.server({'method': 'turn/completed', 'params': {'threadId': 'title-helper', 'turn': {'status': 'completed'}}})
+            observer.server({'method': 'turn/completed', 'params': {'threadId': 'real', 'turn': {'status': 'completed'}}})
+            self.assertEqual(owner.resolve('real'), foreground)
+            self.assertEqual(owner.resolve('title-helper')['status'], 'unbound')
+        deadline = time.monotonic() + 1
+        while not titles and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(binds, ['real', 'real'])
+        self.assertEqual(titles, ['Fix Codex status'])
+
+    def test_auxiliary_metadata_does_not_invalidate_pending_resume(self):
+        for request_ephemeral in (False, True):
+            for helper_reply_first in (False, True):
+                with self.subTest(request_ephemeral=request_ephemeral, helper_reply_first=helper_reply_first):
+                    binds = []
+                    observer = owner.ProtocolObserver({}, lambda sid, _: binds.append(sid))
+                    observer.client({'id': 'real', 'method': 'thread/resume', 'params': {'threadId': 'real'}})
+                    observer.client({'id': 'aux', 'method': 'thread/start', 'params': {'ephemeral': request_ephemeral}})
+                    helper = {'id': 'aux', 'result': {'thread': {'id': 'aux', 'ephemeral': True}}}
+                    real = {'id': 'real', 'result': {'thread': {'id': 'real', 'ephemeral': False}}}
+                    for reply in ([helper, real] if helper_reply_first else [real, helper]):
+                        observer.server(reply)
+                    observer.client({'method': 'turn/start', 'params': {'threadId': 'aux'}})
+                    self.assertEqual(binds, ['real'])
+
+    def test_request_ephemeral_and_forks_stay_ignored_across_reconnect(self):
+        binds = []
+        observer = owner.ProtocolObserver({}, lambda sid, _: binds.append(sid))
+        observer.client({'id': 1, 'method': 'thread/fork', 'params': {'threadId': 'root', 'ephemeral': True}})
+        # Request metadata is sufficient even if the response omits the field.
+        observer.server({'id': 1, 'result': {'thread': {'id': 'aux'}}})
+        observer.client({'id': 'abandoned', 'method': 'thread/start'})
+        observer.reset_connection()
+        observer.server({'id': 'abandoned', 'result': {'thread': {'id': 'stale'}}})
+        observer.client({'method': 'turn/start', 'params': {'threadId': 'aux'}})
+        observer.client({'id': 1, 'method': 'thread/resume', 'params': {'threadId': 'aux'}})
+        observer.server({'id': 1, 'result': {'thread': {'id': 'aux', 'ephemeral': False}}})
+        observer.client({'id': 2, 'method': 'thread/fork', 'params': {'threadId': 'aux'}})
+        observer.server({'id': 2, 'result': {'thread': {'id': 'aux-child'}}})
+        observer.client({'method': 'turn/start', 'params': {'threadId': 'aux-child'}})
+        observer.client({'id': 3, 'method': 'thread/start'})
+        observer.server({'id': 3, 'result': {'thread': {'id': 'real-new', 'ephemeral': False}}})
+        observer.client({'method': 'turn/start', 'params': {'threadId': 'real-new'}})
+        self.assertEqual(binds, ['real-new', 'real-new'])
+
+    def test_auxiliary_cache_cap_never_reenables_uncached_helper_turns(self):
+        binds = []
+        observer = owner.ProtocolObserver({}, lambda sid, _: binds.append(sid))
+        observer.client({'method': 'turn/start', 'params': {'threadId': 'real'}})
+        with patch.object(owner, 'MAX_AUXILIARY_THREADS', 1):
+            for sid in ('aux-one', 'aux-overflow'):
+                observer.client({'id': sid, 'method': 'thread/start', 'params': {'ephemeral': True}})
+                observer.server({'id': sid, 'result': {'thread': {'id': sid, 'ephemeral': True}}})
+        self.assertEqual(observer.auxiliary_threads, {'aux-one'})
+        for sid in ('aux-one', 'aux-overflow'):
+            observer.client({'method': 'turn/start', 'params': {'threadId': sid}})
+        observer.client({'method': 'turn/start', 'params': {'threadId': 'real'}})
+        observer.client({'id': 'new', 'method': 'thread/start'})
+        observer.server({'id': 'new', 'result': {'thread': {'id': 'real-new', 'ephemeral': False}}})
+        observer.client({'method': 'turn/start', 'params': {'threadId': 'real-new'}})
+        self.assertEqual(binds, ['real', 'real', 'real-new', 'real-new'])
+
     def test_interrupt_updates_only_existing_same_client_binding(self):
         calls = []
         observer = owner.ProtocolObserver(self.identity, lambda *_: self.fail('must not bind'), lambda *args: calls.append(args))

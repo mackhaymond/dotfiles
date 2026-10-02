@@ -2,8 +2,10 @@
 
 No real tmux server, model call, watcher, or GUI is used. Run with unittest.
 """
+import hashlib
 import json
 import os
+import signal
 from pathlib import Path
 import shutil
 import sqlite3
@@ -17,7 +19,7 @@ SOURCE = Path(os.environ.get("AGENT_INDICATOR_SOURCE", str(Path.home() / ".local
 TRACKER = Path.home() / ".local/bin/codex-session-track"
 
 FAKE_TMUX = r'''#!/usr/bin/env python3
-import fcntl,json,os,sys
+import fcntl,json,os,subprocess,sys
 from pathlib import Path
 p=Path(os.environ['FAKE_TMUX_STATE'])
 a=sys.argv[1:]
@@ -40,6 +42,11 @@ with p.with_suffix('.lock').open('a') as lock:
   if '-uw' in a: s['windows'][target].pop(key,None)
   else: s['windows'][target][key]=a[-1]
  p.write_text(json.dumps(s))
+# Simulate only the title job, not the unrelated watcher watchdog request.
+if cmd=='run-shell' and ' condense ' in a[-1]:
+ subprocess.Popen(['bash','-c',a[-1]], env=os.environ.copy(),
+                  cwd=str(p.parent), start_new_session=True,
+                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 '''
 FAKE_OWNER = r'''#!/usr/bin/env python3
 import json,os,sys
@@ -52,6 +59,7 @@ import os,time
 from pathlib import Path
 r=Path(os.environ['FAKE_CONDENSER'])
 (r/'started').touch()
+with (r/'calls').open('a') as f: f.write(str(os.getpid())+'\n')
 while (r/'block').exists(): time.sleep(.02)
 print('Condensed title')
 (r/'finished').touch()
@@ -99,7 +107,7 @@ class IndicatorIntegrationTests(unittest.TestCase):
         env = dict(self.env)
         if agent == "claude": env.update(TMUX="/fake/owned,12,0", TMUX_PANE="%42")
         result = subprocess.run(["bash", str(self.script), mode, agent], input=json.dumps(data),
-                                text=True, capture_output=True, env=env, timeout=10)
+                                text=True, capture_output=True, env=env, cwd=self.root, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         return self.window()
 
@@ -210,6 +218,71 @@ class IndicatorIntegrationTests(unittest.TestCase):
         self.wait_for("finished")
         time.sleep(.25)
         self.assertEqual(self.window()["@agent_summary"], previous)
+
+    def condenser_env(self):
+        return dict(self.env, TMUX="/fake/owned,12,0", TMUX_PANE="%42",
+                    AGENT_TAB_SOCKET="/fake/owned", AGENT_TAB_OWNER_SESSION="aaaa",
+                    AGENT_TAB_OWNER_TOKEN="frontend-token", AGENT_TAB_OWNER_BINDING="binding-aaaa")
+
+    def condense(self, raw, background=False):
+        command = ["bash", str(self.script), "condense", "@7", "project", raw]
+        kwargs = dict(env=self.condenser_env(), cwd=self.root,
+                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if background:
+            return subprocess.Popen(command, start_new_session=True, **kwargs)
+        result = subprocess.run(command, timeout=8, **kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_legacy_orphan_directory_cannot_block_title(self):
+        self.hook("running")
+        raw = "Repair orphaned title"
+        key = hashlib.sha256(raw.encode()).hexdigest()[:16]
+        orphan = self.root / ("agent-tab-condense." + key + ".lock")
+        orphan.mkdir()
+        (orphan / "err").write_text("Previous model call finished")
+        self.condense(raw)
+        self.assertEqual(self.window()["@agent_summary"], "project/Condensed title")
+        self.assertTrue(orphan.is_dir())  # no unsafe legacy lock deletion
+        self.assertIn(key, (self.root / ".cache/agent-tab/titles.tsv").read_text())
+
+    def test_advisory_lock_excludes_live_worker_and_releases_after_kill(self):
+        self.hook("running")
+        raw = "Recover terminated condenser"
+        (self.cond / "block").touch()
+        worker = self.condense(raw, background=True)
+        try:
+            self.wait_for("started")
+            self.condense(raw)
+            self.assertEqual(len((self.cond / "calls").read_text().splitlines()), 1)
+            os.killpg(worker.pid, signal.SIGKILL)
+            worker.communicate(timeout=5)
+            (self.cond / "block").unlink()
+            self.condense(raw)
+            self.assertEqual(len((self.cond / "calls").read_text().splitlines()), 2)
+            self.assertEqual(self.window()["@agent_summary"], "project/Condensed title")
+            # A third worker reads the persisted cache, no new model call.
+            self.condense(raw)
+            self.assertEqual(len((self.cond / "calls").read_text().splitlines()), 2)
+        finally:
+            if worker.poll() is None:
+                os.killpg(worker.pid, signal.SIGKILL)
+                worker.communicate(timeout=5)
+
+    def test_tmux_launch_quotes_title_and_owner_environment(self):
+        self.bind("aaaa", token="frontend; touch TOKEN_INJECTED")
+        self.env["AGENT_TAB_CONDENSE_MODEL"] = "model' $(touch MODEL_INJECTED)"
+        self.hook("running", prompt="Say $(touch INJECTED) and `touch ALSO_INJECTED`")
+        self.wait_for("finished")
+        deadline = time.monotonic() + 5
+        while self.window().get("@agent_summary") != "project/Condensed title" and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertEqual(self.window()["@agent_summary"], "project/Condensed title")
+        calls = json.loads(self.state.read_text())["calls"]
+        jobs = [a for a in calls if a[0] == "run-shell" and " condense " in a[-1]]
+        self.assertTrue(jobs)
+        self.assertIn("-b", jobs[-1])
+        for name in ("INJECTED", "ALSO_INJECTED", "MODEL_INJECTED", "TOKEN_INJECTED"):
+            self.assertFalse((self.root / name).exists(), name)
 
     def test_tracker_end_cannot_remove_another_thread(self):
         # A verified new thread may bind before its registry row is created.

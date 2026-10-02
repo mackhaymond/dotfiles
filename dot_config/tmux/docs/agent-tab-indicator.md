@@ -177,15 +177,20 @@ failed/rejected condense writes a negative row that backs off retries for
 lands (or if `copilot` fails), the tab shows `project/<raw title>`
 (word-trimmed to 24 cells) as an interim.
 
-**One condense per session.** Only a `final` title is condensed. The prompt
-fallback was condensed too, which cost a *second* call every session for one
-turn of prettier tab: the agent writes its real title during turn 1, and that
-title hashes to a different cache key, so the prompt's label was thrown away
-almost immediately — and it was distilled from the weaker source. So turn 1
-now shows `project/<prompt>` verbatim and the short label lands once the real
-title exists (typically that same turn's `Stop`). The cache read still happens
-for interim titles, so a repeated prompt — or one condensed by an older
-version — is reused for free.
+**Condenser lifetime and locking.** Title jobs run through `tmux run-shell -b`,
+so hook process-group cleanup cannot kill them. The launch carries shell-quoted
+terminal ownership and runtime settings; job output stays off the user’s pane.
+A per-title `.flock` file uses an OS advisory lock held through the worker’s
+lifetime. The kernel releases it on exit, including SIGKILL; the file remains
+and is never unlinked. Old `.lock` directories are ignored, so an abandoned
+worker cannot permanently block that title. Each worker has a separate temporary
+stderr file for model-error handling.
+
+**Cache by source text.** Both the interim prompt and the agent's final title
+can be condensed, so the first turn can acquire a short label before the agent
+names the conversation. A changed title has a separate cache key; repeated
+hooks reuse cached labels. Raw text never overwrites an already condensed
+label while a newer title is being shortened.
 
 **Model pin is best-effort.** `--model` is set from `CONDENSE_MODEL`
 (default `claude-haiku-4.5`, override with `$AGENT_TAB_CONDENSE_MODEL`, empty

@@ -28,6 +28,7 @@ import uuid
 ROOT = Path(os.environ.get("CODEX_TERMINAL_OWNER_DIR", str(Path.home() / ".cache/codex-terminal-owners")))
 SCRIPT = Path(__file__).resolve()
 SID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+MAX_AUXILIARY_THREADS = 4096
 
 
 def run(args, **kwargs):
@@ -206,9 +207,19 @@ class ProtocolObserver:
         self.owner = owner
         self.pending = {}
         self.sequence = 0
+        self.selected_sequence = 0
+        self.selected_thread = None
+        self.auxiliary_threads = set()
+        self.auxiliary_overflow = False
         self.lock = threading.Lock()
         self.on_bind = on_bind
         self.notify = notify
+
+    def reset_connection(self):
+        # JSON-RPC request IDs may be reused after reconnect. Auxiliary thread
+        # identities remain valid for this terminal invocation across sockets.
+        with self.lock:
+            self.pending.clear()
 
     def client(self, message):
         method = message.get("method")
@@ -216,14 +227,22 @@ class ProtocolObserver:
         with self.lock:
             if method in ("thread/start", "thread/resume", "thread/fork") and "id" in message:
                 self.sequence += 1
-                self.pending[message["id"]] = self.sequence
+                auxiliary = params.get("ephemeral") is True or params.get("threadId") in self.auxiliary_threads
+                self.pending[message["id"]] = (self.sequence, auxiliary)
             elif method == "turn/start":
+                sid = params.get("threadId", "")
+                if sid in self.auxiliary_threads or (self.auxiliary_overflow and sid != self.selected_thread):
+                    return
                 self.sequence += 1
-                self.on_bind(params.get("threadId", ""), self.owner)
+                self.selected_sequence = self.sequence
+                self.selected_thread = sid
+                self.on_bind(sid, self.owner)
 
     def server(self, message):
         if message.get("method") == "turn/completed":
             params = message.get("params") or {}
+            if params.get("threadId") in self.auxiliary_threads:
+                return
             if (params.get("turn") or {}).get("status") == "interrupted":
                 record = resolve(params.get("threadId", ""))
                 # Broadcasts may describe other clients or subagents. They can
@@ -234,12 +253,32 @@ class ProtocolObserver:
         with self.lock:
             if "method" in message or message.get("id") not in self.pending:
                 return
-            sequence = self.pending.pop(message["id"])
-            # An older start/resume reply must not reclaim a newer selection.
-            if sequence != self.sequence or "error" in message:
+            sequence, auxiliary = self.pending.pop(message["id"])
+            if "error" in message:
                 return
             thread = (message.get("result") or {}).get("thread") or {}
-            record = self.on_bind(thread.get("id", ""), self.owner)
+            sid = thread.get("id", "")
+            if not SID.fullmatch(sid or ""):
+                return
+            # The native TUI also creates ephemeral title-generator threads on
+            # this connection. Their starts AND later turns are background work,
+            # even though both originate in the terminal client itself.
+            if auxiliary or thread.get("ephemeral") is True or sid in self.auxiliary_threads:
+                if len(self.auxiliary_threads) < MAX_AUXILIARY_THREADS:
+                    self.auxiliary_threads.add(sid)
+                else:
+                    # Never evict an active helper and accidentally permit its
+                    # later turn to claim the pane. At the cap, unknown turns
+                    # need a foreground lifecycle reply before they can bind.
+                    self.auxiliary_overflow = True
+                return
+            # Only a confirmed foreground selection supersedes earlier replies;
+            # a pending auxiliary start must not invalidate a real resume.
+            if sequence < self.selected_sequence:
+                return
+            self.selected_sequence = sequence
+            self.selected_thread = sid
+            record = self.on_bind(sid, self.owner)
         if record:
             threading.Thread(target=self.notify, args=(record, thread), daemon=True).start()
 
@@ -338,12 +377,13 @@ def relay_websocket(source, destination, observe):
         destination.flush()
 
 
-def serve_connection(client, real, owner):
+def serve_connection(client, real, owner, observer=None):
     with client:
         proxy = subprocess.Popen([real, "app-server", "proxy"], stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                  start_new_session=True)
-        observer = ProtocolObserver(owner)
+        observer = observer or ProtocolObserver(owner)
+        observer.reset_connection()
         reader = client.makefile("rb")
         writer = client.makefile("wb")
         stop_lock = threading.Lock()
@@ -403,6 +443,7 @@ def serve(listener, real, owner, ready):
             ready.sendall(b"1")
             ready.close()
             listener.settimeout(1)
+            observer = ProtocolObserver(owner)
             while True:
                 try:
                     client, _ = listener.accept()
@@ -410,7 +451,7 @@ def serve(listener, real, owner, ready):
                     if not frontend_alive(owner):
                         break
                     continue
-                serve_connection(client, real, owner)
+                serve_connection(client, real, owner, observer)
                 if not frontend_alive(owner):
                     break
     finally:
