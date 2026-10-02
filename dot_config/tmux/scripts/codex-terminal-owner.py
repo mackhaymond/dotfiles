@@ -429,9 +429,6 @@ def real_codex():
 
 
 def interactive_args(args):
-    if any(a in ("--help", "-h", "--version", "-V", "--no-daemon", "--remote")
-           or a.startswith("--remote=") for a in args):
-        return False
     # Skip known option operands when finding a subcommand. Quoted prompts are
     # positional strings; only the actual native command names bypass the bridge.
     operands = {"-c", "--config", "--enable", "--disable", "-C", "--cd", "-m", "--model", "-p", "--profile",
@@ -440,16 +437,19 @@ def interactive_args(args):
                 "completion", "update", "doctor", "sandbox", "debug", "apply", "queue", "archive", "delete",
                 "migrate-rollouts", "unarchive", "cloud", "exec-server", "features", "help"}
     skip = False
+    positional = None
     for arg in args:
         if skip:
             skip = False
-        elif arg in operands:
-            skip = True
         elif arg == "--":
             break
-        elif not arg.startswith("-"):
-            return arg not in commands
-    return True
+        elif arg in ("--help", "-h", "--version", "-V", "--no-daemon", "--remote") or arg.startswith("--remote="):
+            return False
+        elif arg in operands:
+            skip = True
+        elif not arg.startswith("-") and positional is None:
+            positional = arg
+    return positional not in commands
 
 
 def launch(args):

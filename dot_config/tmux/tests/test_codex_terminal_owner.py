@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import socket
 import struct
+import sys
 import sqlite3
 from types import SimpleNamespace
 import tempfile
@@ -160,6 +161,17 @@ class OwnershipTests(unittest.TestCase):
         for args in ([], ['resume', 'id'], ['fork', 'id'], ['-c', 'a=b', 'prompt'], ['--', 'exec']):
             self.assertTrue(owner.interactive_args(args), args)
 
+    def test_native_passthrough_flags_respect_option_positions(self):
+        for args in (['resume', 'id', '--remote', 'unix:///tmp/server'],
+                     ['fork', '--no-daemon'], ['prompt', '--help']):
+            self.assertFalse(owner.interactive_args(args), args)
+        for args in (['--', '-pwork'], ['--', '--profile=work'], ['--', '--remote=x'],
+                     ['--', '--help'], ['-c', 'key=-pwork'], ['-c', '--profile=work'],
+                     ['resume', '--', '-pwork'], ['-c', '--remote=x'],
+                     ['-p', 'work'], ['--profile', 'work'], ['--profile=work'], ['-pwork'],
+                     ['resume', 'id', '-p', 'work'], ['fork', '--profile=work']):
+            self.assertTrue(owner.interactive_args(args), args)
+
     def test_websocket_mask_fragment_ping_and_extended_lengths(self):
         message = {'id': 1, 'method': 'turn/start', 'params': {'threadId': 'a'}}
         raw = json.dumps(message).encode()
@@ -188,7 +200,7 @@ class OwnershipTests(unittest.TestCase):
     def test_socket_disconnect_stops_proxy_and_cleans_owner(self):
         # Executable fake proxy uses only stdio; no Codex or tmux process is run.
         fake = self.root / 'proxy'
-        fake.write_text('#!/usr/bin/env python3\nimport os\nwhile True:\n chunk=os.read(0,65536)\n if not chunk:break\n os.write(1,chunk)\n')
+        fake.write_text('#!' + sys.executable + '\nimport os\nwhile True:\n chunk=os.read(0,65536)\n if not chunk:break\n os.write(1,chunk)\n')
         fake.chmod(0o700)
         path = str(self.root / 'sock')
         listener = socket.socket(socket.AF_UNIX)
@@ -203,38 +215,46 @@ class OwnershipTests(unittest.TestCase):
             except BaseException:
                 import traceback
                 traceback.print_exc()
-            finally:
+                os._exit(1)
+            else:
                 os._exit(0)
         child.close()
         listener.close()
         parent.settimeout(3)
         self.assertEqual(parent.recv(1), b'1')
         parent.close()
-        with socket.socket(socket.AF_UNIX) as client:
-            client.settimeout(3)
-            client.connect(path)
-            wire = b'GET / HTTP/1.1\r\n\r\n' + frame({'id': 1, 'method': 'initialize', 'params': {}})
-            client.sendall(wire)
-            received = b''
-            while len(received) < len(wire):
-                received += client.recv(4096)
-            self.assertEqual(received, wire)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            done, status = os.waitpid(pid, os.WNOHANG)
-            if done:
-                self.assertEqual(status, 0)
-                self.assertFalse(Path(path).exists())
-                return
-            time.sleep(.02)
-        os.kill(pid, 15)
-        os.waitpid(pid, 0)
-        self.fail('proxy did not exit after client disconnected')
+        try:
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(3)
+                client.connect(path)
+                wire = b'GET / HTTP/1.1\r\n\r\n' + frame({'id': 1, 'method': 'initialize', 'params': {}})
+                client.sendall(wire)
+                received = b''
+                while len(received) < len(wire):
+                    chunk = client.recv(4096)
+                    self.assertTrue(chunk, "proxy closed before echoing its complete handshake/frame")
+                    received += chunk
+                self.assertEqual(received, wire)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                done, status = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    self.assertEqual(status, 0)
+                    self.assertFalse(Path(path).exists())
+                    return
+                time.sleep(.02)
+            self.fail('proxy did not exit after client disconnected')
+        finally:
+            try:
+                os.kill(pid, 15)
+                os.waitpid(pid, 0)
+            except ProcessLookupError:
+                pass
 
     def test_frontend_can_reconnect_after_upstream_disconnect(self):
         fake = self.root / 'proxy-reconnect'
         # Upstream exits after one websocket message, emulating daemon update.
-        fake.write_text('#!/usr/bin/env python3\nimport os\nwhile True:\n chunk=os.read(0,65536)\n if not chunk:break\n os.write(1,chunk)\n if b"upgrade-end" in chunk:break\n')
+        fake.write_text('#!' + sys.executable + '\nimport os\nwhile True:\n chunk=os.read(0,65536)\n if not chunk:break\n os.write(1,chunk)\n if b"upgrade-end" in chunk:break\n')
         fake.chmod(0o700)
         done = self.root / 'frontend-exited'
         path = str(self.root / 'reconnect.sock')
@@ -251,7 +271,8 @@ class OwnershipTests(unittest.TestCase):
             except BaseException:
                 import traceback
                 traceback.print_exc()
-            finally:
+                os._exit(1)
+            else:
                 os._exit(0)
         child.close()
         listener.close()

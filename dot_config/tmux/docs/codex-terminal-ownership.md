@@ -28,7 +28,9 @@ ID. The bridge reconciles ownership/title after the reply without downgrading
 newer status. No hook definitions are changed and no hook-trust bypass is used.
 
 Noninteractive commands, explicit `--remote` and `--no-daemon`, and launches
-outside tmux retain native argument handling. A failed bridge launch prints a
+outside tmux retain native argument handling. Explicit `-C`/`-c` overrides and
+profile approval/sandbox settings were verified through the relay without
+starting a model turn. A failed bridge launch prints a
 short warning and falls back to native Codex; unverified ownership stays unbound.
 The relay blocks on I/O while idle and does not add a polling daemon.
 
