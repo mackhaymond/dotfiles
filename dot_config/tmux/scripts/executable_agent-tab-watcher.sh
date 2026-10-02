@@ -533,6 +533,8 @@ EOF
                 tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_pending 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_rollout 2>/dev/null
+                tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null
+                tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null
                 changed=1
             else
                 gc_streak_next="${gc_streak_next}${win}=${n} "

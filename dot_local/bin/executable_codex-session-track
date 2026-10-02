@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Codex SessionStart/SessionEnd hook — pane→session record for tmux-mcp.
+
+The tmux-mcp server recognizes a pane as an AGENT pane iff a live record
+<resurrect-dir>/<kind>-<pid>.json maps the agent process pid to a tmux pane
+and a transcript. Claude's record is written by tmux-assistant-resurrect's
+claude-session-track.sh; this is the codex twin (kept out of that third-party
+plugin so its updates can't wipe it — invoked directly from ~/.codex/hooks.json).
+
+SessionStart: merge the hook payload with verified terminal ownership and
+write codex-<pid>.json, keyed by the terminal frontend pid. The shared daemon
+and its inherited environment do not identify the user's pane.
+SessionEnd: remove the record. Removal is best-effort — tmux-mcp ignores
+records whose pid is dead, so a SIGKILL'd session just goes stale harmlessly.
+
+Always exits 0: session tracking must never block the agent.
+"""
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+CODEX_HOME = os.path.realpath(os.path.expanduser("~/.codex"))
+CODEX_DB = os.path.join(CODEX_HOME, "state_5.sqlite")
+
+
+def under_codex_home(cwd):
+    """True for a path inside ~/.codex — codex's own state directory.
+
+    Codex 0.148 runs housekeeping threads (the memory writer, cwd
+    ~/.codex/memories) through the same SessionStart/SessionEnd hooks as the
+    interactive session. They are not the user's session and must never
+    touch the pane record: writing one CLOBBERS the real session's record
+    (same pid key, wrong session_id, no rollout path), and its SessionEnd
+    DELETES it.
+    """
+    if not cwd:
+        return False
+    try:
+        p = os.path.realpath(os.path.expanduser(cwd))
+    except Exception:
+        return False
+    return p == CODEX_HOME or p.startswith(CODEX_HOME + os.sep)
+
+
+def state_dir():
+    for d in (os.environ.get("TMUX_ASSISTANT_RESURRECT_DIR"),
+              os.environ.get("XDG_RUNTIME_DIR"),
+              os.environ.get("TMPDIR"),
+              "/tmp"):
+        if d:
+            base = d if d.endswith("tmux-assistant-resurrect") \
+                else os.path.join(d, "tmux-assistant-resurrect")
+            return base
+    return "/tmp/tmux-assistant-resurrect"
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return
+    sid = payload.get("session_id")
+    if not sid or payload.get("agent_id"):
+        return
+    # Codex's own housekeeping threads share the interactive session's pid,
+    # so they would write/erase ITS record. Checked before anything else —
+    # especially before the SessionEnd branch.
+    if under_codex_home(payload.get("cwd") or ""):
+        return
+    # Hooks may be children of a shared daemon. Its pid and TMUX_PANE are not
+    # this thread's terminal identity. Use the same verified binding as Notch.
+    try:
+        result = subprocess.run([os.path.expanduser('~/.local/bin/codex-terminal-owner'),
+                                 'resolve', sid], capture_output=True, text=True, timeout=3)
+        owner = json.loads(result.stdout)
+    except Exception:
+        return
+    if owner.get('status') != 'bound':
+        return
+    if payload.get('terminal_binding_id') not in (None, owner.get('binding_id')):
+        return
+    pid = owner['frontend_pid']
+    d = state_dir()
+    path = os.path.join(d, "codex-%d.json" % pid)
+    event = payload.get("hook_event_name", "")
+
+    try:
+        with open(path) as f:
+            cur = json.load(f)
+        cur = cur if isinstance(cur, dict) else {}
+    except Exception:
+        cur = {}
+
+    if event == "SessionEnd":
+        # Only the session that owns the record may retire it. A sub-rollout
+        # ending mid-session would otherwise take the live session's pane
+        # record with it, and tmux-mcp would stop seeing the pane as an agent.
+        if cur and cur.get("session_id") not in (None, sid):
+            return
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return
+
+    # Reconciliation can arrive after the full SessionStart hook. Keep its
+    # transcript and metadata instead of replacing them with the smaller
+    # bridge payload. On a first binding, recover the rollout from the DB.
+    if cur.get('session_id') == sid:
+        payload = dict(cur, **payload)
+    if not payload.get('transcript_path'):
+        try:
+            with sqlite3.connect('file:%s?mode=ro' % CODEX_DB, uri=True, timeout=0.5) as con:
+                row = con.execute('select rollout_path from threads where id=?', (sid,)).fetchone()
+            if row and row[0]:
+                payload['transcript_path'] = row[0]
+        except Exception:
+            pass
+    # Resolving a live binding again prevents delayed reconciliation from
+    # replacing a record after the terminal has selected another thread.
+    try:
+        current = json.loads(subprocess.run([os.path.expanduser('~/.local/bin/codex-terminal-owner'),
+            'resolve', sid], capture_output=True, text=True, timeout=3).stdout)
+    except Exception:
+        return
+    if current.get('status') != 'bound' or current.get('binding_id') != owner.get('binding_id'):
+        return
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    payload.update({
+        "tool": "codex",
+        "ppid": pid,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "env": {
+            "tmux_pane": owner['pane'],
+            "tmux_socket": owner['tmux_socket'],
+            "shell": os.environ.get("SHELL", ""),
+        },
+        "frontend_start": owner['frontend_start'],
+        "owner_token": owner['token'],
+    })
+    fd, tmp = tempfile.mkstemp(prefix='.codex-', dir=d)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

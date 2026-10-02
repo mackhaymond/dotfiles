@@ -39,8 +39,9 @@
 # Callers:
 #   Claude Code hooks (~/.claude/settings.json) and Codex hooks
 #   (~/.codex/hooks.json) invoke:  agent-tab-indicator.sh <mode> <agent>
-#   with the hook's JSON payload on stdin. Hook processes are children of
-#   the agent process, so TMUX/TMUX_PANE identify the agent's pane.
+#   with the hook's JSON payload on stdin. Claude uses inherited terminal
+#   identity; Codex resolves a verified frontend/thread binding because its
+#   hooks may run in a shared daemon.
 #
 #   tmux after-select-window hook invokes:  agent-tab-indicator.sh clear-current
 #   (no stdin, no TMUX_PANE → operates on the now-active window).
@@ -99,12 +100,58 @@
 set -euo pipefail
 
 command -v tmux >/dev/null 2>&1 || exit 0
-[ -n "${TMUX:-}" ] || exit 0
 
 mode="${1:-}"
 agent="${2:-}"
 
 JQ="$(command -v jq || true)"
+# Codex hooks run in a shared app-server. Its inherited TMUX_PANE belongs to
+# whoever originally started the daemon, not necessarily this conversation.
+# Resolve the exact client/thread binding before any tmux reads or mutations.
+payload=""
+if [ "$agent" = codex ]; then
+    [ -n "$JQ" ] || exit 0
+    payload=$(cat 2>/dev/null || true)
+    [ -z "$("$JQ" -r '.agent_id // empty' <<<"$payload" 2>/dev/null || true)" ] || exit 0
+    owner_sid=$("$JQ" -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)
+    owner=$("$HOME/.local/bin/codex-terminal-owner" resolve "$owner_sid" 2>/dev/null || true)
+    [ "$("$JQ" -r '.status // empty' <<<"$owner" 2>/dev/null || true)" = bound ] || exit 0
+    export AGENT_TAB_SOCKET=$("$JQ" -r '.tmux_socket' <<<"$owner")
+    export TMUX_PANE=$("$JQ" -r '.pane' <<<"$owner")
+    export TMUX="$AGENT_TAB_SOCKET,0,0"
+    export AGENT_TAB_OWNER_SESSION="$owner_sid"
+    export AGENT_TAB_OWNER_TOKEN=$("$JQ" -r '.token' <<<"$owner")
+    export AGENT_TAB_OWNER_BINDING=$("$JQ" -r '.binding_id' <<<"$owner")
+    reconcile_binding=$("$JQ" -r '.terminal_binding_id // empty' <<<"$payload" 2>/dev/null || true)
+    [ -z "$reconcile_binding" ] || [ "$reconcile_binding" = "$AGENT_TAB_OWNER_BINDING" ] || exit 0
+fi
+[ -n "${TMUX:-}" ] || exit 0
+
+# Detached condensers inherit the explicit socket too; a pane/window id by
+# itself is not unique across tmux servers.
+tmux() {
+    if [ -n "${AGENT_TAB_SOCKET:-}" ]; then
+        command tmux -S "$AGENT_TAB_SOCKET" "$@"
+    else
+        command tmux "$@"
+    fi
+}
+
+owns_window() {
+    [ -z "${AGENT_TAB_OWNER_SESSION:-}" ] && return 0
+    [ "$(tmux show-options -wqv -t "$1" @agent_session_id 2>/dev/null)" = "$AGENT_TAB_OWNER_SESSION" ] &&
+        [ "$(tmux show-options -wqv -t "$1" @agent_owner_token 2>/dev/null)" = "$AGENT_TAB_OWNER_TOKEN" ] &&
+        owner_current
+}
+
+owner_current() {
+    [ -z "${AGENT_TAB_OWNER_SESSION:-}" ] && return 0
+    local current
+    current=$("$HOME/.local/bin/codex-terminal-owner" resolve "$AGENT_TAB_OWNER_SESSION" 2>/dev/null || true)
+    [ "$("$JQ" -r '.status // empty' <<<"$current" 2>/dev/null)" = bound ] &&
+        [ "$("$JQ" -r '.binding_id // empty' <<<"$current" 2>/dev/null)" = "$AGENT_TAB_OWNER_BINDING" ] &&
+        [ "$("$JQ" -r '.token // empty' <<<"$current" 2>/dev/null)" = "$AGENT_TAB_OWNER_TOKEN" ]
+}
 # Shared with CuaNotch's cua-notch-agent-hook: the one implementation of "is
 # background work from this session still out?". See its header.
 BG_PENDING="$HOME/.local/bin/agent-bg-pending"
@@ -174,6 +221,7 @@ set_state() {
     # close between the read and the write, and a failed write must not make
     # the hook exit nonzero (codex treats hook exit status as a gate).
     local win="$1" new="$2" cur
+    owns_window "$win" || return 0
     cur=$(window_state "$win")
     [ "$cur" = "$new" ] && return 0
     tmux set-option -w -t "$win" @agent_state "$new" 2>/dev/null || true
@@ -189,6 +237,8 @@ clear_state() {
     tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_pending 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_rollout 2>/dev/null || true
+    tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null || true
+    tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null || true
     if [ -n "$cur" ]; then
         tmux refresh-client -S 2>/dev/null || true
     fi
@@ -222,6 +272,7 @@ sanitize_summary() {
 # string must still correct the flag.
 set_summary() {
     local win="$1" summary="$2" cond="${3:-0}" cur
+    owns_window "$win" || return 0
     [ -n "$summary" ] || return 0
     if [ "$cond" = 1 ]; then
         tmux set-option -w -t "$win" @agent_summary_cond 1 2>/dev/null || true
@@ -565,15 +616,27 @@ pane="${TMUX_PANE:-}"
 win=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null || true)
 [ -n "$win" ] || exit 0
 
-# Heartbeat is the hot path (every tool call): don't wait on stdin — the
+if [ "$agent" = codex ]; then
+    # Ownership may have changed since resolve (or while a detached title
+    # condenser was working). Never let an old hook reclaim the window.
+    owner_current || exit 0
+    previous_sid=$(tmux show-options -wqv -t "$win" @agent_session_id 2>/dev/null || true)
+    if [ "$previous_sid" != "$AGENT_TAB_OWNER_SESSION" ]; then
+        clear_state "$win"
+    fi
+    tmux set-option -w -t "$win" @agent_session_id "$AGENT_TAB_OWNER_SESSION" 2>/dev/null || exit 0
+    tmux set-option -w -t "$win" @agent_owner_token "$AGENT_TAB_OWNER_TOKEN" 2>/dev/null || exit 0
+fi
+
+# Claude heartbeat is the hot path (every tool call): don't wait on stdin — the
 # payload includes tool_response, which can be megabytes. A backgrounded
 # drain consumes the pipe so the writer never sees EPIPE (codex's tolerance
 # for a hook that abandons its stdin is undocumented), without blocking us.
 # Only re-arm running from running/needs-input — a late PostToolUse landing
-# after Stop's `done` (or a subagent tool firing past the turn boundary, which
-# bypasses the agent_id guard below) must NOT resurrect a finished tab.
+# after Stop's `done` must NOT resurrect a finished tab. Codex reads its
+# payload earlier to validate session ownership and reject subagents.
 if [ "$mode" = "heartbeat" ]; then
-    ( cat >/dev/null 2>&1 & ) 2>/dev/null
+    [ "$agent" = codex ] || ( cat >/dev/null 2>&1 & ) 2>/dev/null
     case "$(window_state "$win")" in
         running|needs-*|failed) set_state "$win" running ;;
         idle)
@@ -594,7 +657,7 @@ if [ "$mode" = "heartbeat" ]; then
     exit 0
 fi
 
-payload=$(cat 2>/dev/null || true)
+[ "$agent" = codex ] || payload=$(cat 2>/dev/null || true)
 
 # Hooks also fire inside subagent contexts (payload carries agent_id); a
 # subagent's Stop/PermissionRequest must not flip the main agent's tab.
@@ -602,6 +665,13 @@ if [ -n "$JQ" ] && [ -n "$payload" ]; then
     if [ -n "$("$JQ" -r '.agent_id // empty' <<<"$payload" 2>/dev/null || true)" ]; then
         exit 0
     fi
+fi
+
+if [ "$agent" = claude ]; then
+    # A new Claude session in the same window invalidates detached Codex
+    # title writers even if the previous frontend has not exited yet.
+    tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null || true
+    tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null || true
 fi
 
 # Codex background threads (subagents, review/guardian workers, the Memory
@@ -661,6 +731,25 @@ viewing_now() {
 }
 
 case "$mode" in
+    interrupt)
+        # The terminal bridge observes turn/completed with interrupted status.
+        # Keep the conversation label, but discharge working/attention state.
+        [ "$agent" = codex ] || exit 0
+        set_state "$win" idle
+        clear_pending "$win"
+        ;;
+    reconcile)
+        # A new thread's id reaches the terminal bridge after its first hook.
+        # Recover the title/presence without downgrading a newer event's state.
+        if [ -z "$(window_state "$win")" ]; then
+            if [ "$("$JQ" -r '.hook_event_name // empty' <<<"$payload")" = UserPromptSubmit ]; then
+                set_state "$win" running
+            else
+                set_state "$win" idle
+            fi
+        fi
+        compose_summary "$win" "$(extract_summary "$payload")" "$payload"
+        ;;
     idle)
         # SessionStart with source=compact fires mid-turn after auto-compaction;
         # don't downgrade a running turn.
@@ -767,7 +856,7 @@ case "$mode" in
         clear_state "$win"
         ;;
     *)
-        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|failed|done|clear|clear-current> [claude|codex]" >&2
+        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|failed|done|interrupt|clear|clear-current> [claude|codex]" >&2
         # exit 0, not 1: codex treats a hook's exit status as a GATE (see the
         # header), so a typo'd mode in hooks.json would block every codex
         # event rather than just failing to paint a tab. A silently inert

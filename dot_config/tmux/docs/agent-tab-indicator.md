@@ -3,6 +3,10 @@
 Each tmux tab (window) reflects the state of the AI agent (Claude Code or
 Codex CLI) running inside it, rendered through the Catppuccin status bar:
 
+For Codex 0.160 and newer shared-server launches, see
+[Codex terminal ownership](codex-terminal-ownership.md). Hooks use a verified
+thread-to-client binding; the server's inherited `TMUX_PANE` is not authoritative.
+
 Each tab carries **three independent channels**:
 
 | Channel | Surface | Says |
