@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Bind Codex threads to terminal clients, never the shared daemon's environment.
 
-The CLI wrapper relays Codex's Unix WebSocket transport without changing
-messages. Only that client's start/resume replies and turn/start requests claim
-a pane. Records contain identities, not prompts or protocol transcripts.
-New interactive sessions explicitly use the frontend's launch directory.
+The CLI wrapper forces --no-daemon. Hooks resolve the owning frontend through
+the actual CLI ancestor and matching TTY. The legacy relay helpers remain for
+compatibility with previously launched clients; new launches never start them.
 """
 import contextlib
 import fcntl
@@ -485,7 +484,7 @@ def interactive_args(args):
             skip = False
         elif arg == "--":
             break
-        elif arg in ("--help", "-h", "--version", "-V", "--no-daemon", "--remote") or arg.startswith("--remote="):
+        elif arg in ("--help", "-h", "--version", "-V", "--remote") or arg.startswith("--remote="):
             return False
         elif arg in OPTION_OPERANDS:
             skip = True
@@ -514,63 +513,29 @@ def new_session_args(args, cwd):
     return ["--cd", cwd] + args
 
 
+def local_session_args(args):
+    """Force interactive sessions onto their own backend, including resumes."""
+    skip = False
+    no_daemon = False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg == "--":
+            break
+        elif arg == "--remote" or arg.startswith("--remote="):
+            raise SystemExit("codex: shared/remote servers are disabled; remove --remote")
+        elif arg == "--no-daemon":
+            no_daemon = True
+        elif arg in OPTION_OPERANDS:
+            skip = True
+    if interactive_args(args) and not no_daemon:
+        return ["--no-daemon"] + args
+    return args
+
+
 def launch(args):
     real = real_codex()
-    if not interactive_args(args) or not os.isatty(0):
-        os.execv(real, [real] + args)
-    sock = os.environ.get("TMUX", "").split(",")[0]
-    owner = capture(os.getpid(), sock, os.environ.get("TMUX_PANE", ""))
-    if not owner:
-        os.execv(real, [real] + args)
-    # Native command is idempotent and never restarts a healthy shared daemon.
-    directory = None
-    listener = parent = child = None
-    pid = None
-    try:
-        # Capture before the relay child detaches and changes its working root.
-        frontend_args = new_session_args(args, os.getcwd())
-        started = subprocess.run([real, "app-server", "daemon", "start"], stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
-        if started.returncode:
-            raise RuntimeError("shared server unavailable")
-        directory = tempfile.mkdtemp(prefix="cx-tmux-", dir="/tmp")
-        path = directory + "/s"
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(path)
-        listener.listen(1)
-        parent, child = socket.socketpair()
-        pid = os.fork()
-        if pid == 0:
-            parent.close()
-            # Don't hold the terminal open or print transport errors into it.
-            with open(os.devnull, "r+b", buffering=0) as null:
-                for fd in (0, 1, 2):
-                    os.dup2(null.fileno(), fd)
-            try:
-                serve(listener, real, owner, child)
-            finally:
-                shutil.rmtree(directory, ignore_errors=True)
-                os._exit(0)
-        child.close()
-        listener.close()
-        parent.settimeout(3)
-        if parent.recv(1) != b"1":
-            raise RuntimeError("terminal bridge did not start")
-        parent.close()
-        os.execv(real, [real, "--remote", "unix://" + path] + frontend_args)
-    except (OSError, RuntimeError, subprocess.SubprocessError):
-        if pid:
-            with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGTERM)
-                os.waitpid(pid, 0)
-        for handle in (listener, parent, child):
-            if handle:
-                with contextlib.suppress(OSError):
-                    handle.close()
-        if directory:
-            shutil.rmtree(directory, ignore_errors=True)
-        print("codex: terminal ownership bridge unavailable; continuing with native Codex", file=sys.stderr)
-        os.execv(real, [real] + args)
+    os.execv(real, [real] + local_session_args(args))
 
 
 def main():

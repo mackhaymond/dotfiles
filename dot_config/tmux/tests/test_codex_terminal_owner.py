@@ -232,14 +232,14 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual(events[:2], ['bind', 'write'])
 
     def test_passthrough_subcommands_and_remote(self):
-        for args in (['exec', 'prompt'], ['--remote=unix:///tmp/a'], ['--no-daemon'], ['-m', 'model', 'mcp', 'list'], ['--help']):
+        for args in (['exec', 'prompt'], ['--remote=unix:///tmp/a'], ['-m', 'model', 'mcp', 'list'], ['--help']):
             self.assertFalse(owner.interactive_args(args), args)
-        for args in ([], ['resume', 'id'], ['fork', 'id'], ['-c', 'a=b', 'prompt'], ['--', 'exec']):
+        for args in ([], ['--no-daemon'], ['fork', '--no-daemon'], ['resume', 'id'], ['fork', 'id'], ['-c', 'a=b', 'prompt'], ['--', 'exec']):
             self.assertTrue(owner.interactive_args(args), args)
 
     def test_native_passthrough_flags_respect_option_positions(self):
         for args in (['resume', 'id', '--remote', 'unix:///tmp/server'],
-                     ['fork', '--no-daemon'], ['prompt', '--help']):
+                     ['prompt', '--help']):
             self.assertFalse(owner.interactive_args(args), args)
         for args in (['--', '-pwork'], ['--', '--profile=work'], ['--', '--remote=x'],
                      ['--', '--help'], ['-c', 'key=-pwork'], ['-c', '--profile=work'],
@@ -259,44 +259,31 @@ class OwnershipTests(unittest.TestCase):
                      ['-m', 'model', 'resume', '--last'], ['-c', 'key=value', 'fork']):
             self.assertEqual(owner.new_session_args(args, cwd), args, args)
 
-    def test_relay_launch_passes_frontend_directory_without_changing_transport(self):
-        parent, child, listener = MagicMock(), MagicMock(), MagicMock()
-        parent.recv.return_value = b'1'
-        with patch.object(owner, 'real_codex', return_value='/native/codex'), \
-             patch.object(owner.os, 'isatty', return_value=True), \
-             patch.object(owner, 'capture', return_value=self.identity), \
-             patch.object(owner.os, 'getcwd', return_value='/frontend/root with spaces'), \
-             patch.object(owner.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as start, \
-             patch.object(owner.tempfile, 'mkdtemp', return_value=str(self.root)), \
-             patch.object(owner.socket, 'socket', return_value=listener), \
-             patch.object(owner.socket, 'socketpair', return_value=(parent, child)), \
-             patch.object(owner.os, 'fork', return_value=123), \
-             patch.object(owner.os, 'execv', side_effect=SystemExit) as execute:
-            for args, expected in (([], ['--cd', '/frontend/root with spaces']),
-                                   (['prompt'], ['--cd', '/frontend/root with spaces', 'prompt']),
-                                   (['--cd', '/explicit'], ['--cd', '/explicit']),
-                                   (['resume', 'saved'], ['resume', 'saved']),
-                                   (['fork', 'saved'], ['fork', 'saved'])):
-                with self.assertRaises(SystemExit):
-                    owner.launch(args)
-                execute.assert_called_with('/native/codex', ['/native/codex', '--remote',
-                                           'unix://' + str(self.root) + '/s'] + expected)
-            self.assertEqual(start.call_count, 5)
-            for call in start.call_args_list:
-                self.assertEqual(call.args[0], ['/native/codex', 'app-server', 'daemon', 'start'])
-
-    def test_launch_passthrough_never_injects_directory(self):
+    def test_local_launch_never_starts_shared_server(self):
         with patch.object(owner, 'real_codex', return_value='/native/codex'), \
              patch.object(owner.os, 'execv', side_effect=SystemExit) as execute, \
              patch.object(owner.subprocess, 'run') as start, \
-             patch.object(owner.os, 'getcwd') as cwd:
-            for args in (['exec', 'prompt'], ['app-server', 'proxy'],
-                         ['--remote', 'unix:///explicit'], ['--no-daemon']):
+             patch.object(owner, 'capture') as capture:
+            for args in ([], ['prompt'], ['resume', 'saved'], ['fork', 'saved'],
+                         ['-c', 'model_context_window=872000', 'resume', '--last']):
+                with self.assertRaises(SystemExit):
+                    owner.launch(args)
+                execute.assert_called_with('/native/codex', ['/native/codex', '--no-daemon'] + args)
+            for args in (['exec', 'prompt'], ['app-server', 'proxy'], ['--no-daemon'],
+                         ['--no-daemon', 'resume', 'saved'], ['--help']):
                 with self.assertRaises(SystemExit):
                     owner.launch(args)
                 execute.assert_called_with('/native/codex', ['/native/codex'] + args)
             start.assert_not_called()
-            cwd.assert_not_called()
+            capture.assert_not_called()
+
+    def test_remote_is_disabled_without_mistaking_prompts_or_option_values(self):
+        for args in (['--remote', 'unix:///server'], ['resume', 'saved', '--remote=unix:///server']):
+            with self.assertRaisesRegex(SystemExit, 'servers are disabled'):
+                owner.local_session_args(args)
+        for args in (['--', '--remote=literal prompt'], ['-c', '--remote=literal'],
+                     ['-m', '--no-daemon'], ['--', '--no-daemon']):
+            self.assertEqual(owner.local_session_args(args), ['--no-daemon'] + args)
 
     def test_websocket_mask_fragment_ping_and_extended_lengths(self):
         message = {'id': 1, 'method': 'turn/start', 'params': {'threadId': 'a'}}
