@@ -106,6 +106,9 @@ def idle_watch():
                             (STATE / "idle.pid").unlink(missing_ok=True)
                             fcntl.flock(lock, fcntl.LOCK_UN)
                             return 0
+                        # Persistent Mutagen watchers are active use even when
+                        # no files are changing. Keep their transport alive;
+                        # idle expiry starts only after every transport closes.
                         if active_connections(clean=True):
                             touch_activity()
                         else:
@@ -516,7 +519,14 @@ def main():
     if command == "status" and len(sys.argv) == 2:
         pid = owned_pid()
         ready = bool(pid and listener_ready())
-        print(f"{'Connected' if ready else 'Disconnected'}: restricted forward to {TARGET}:22; idle timeout 15 minutes.")
+        print(f"{'Connected' if ready else 'Disconnected'}: restricted forward to {TARGET}:22.")
+        if ready:
+            count = active_connections()
+            if count:
+                print(f"{count} SSH transport(s) open, including any background sync; idle timer is held.")
+            else:
+                print("No SSH transports open; idle timer is running.")
+            print("Disconnects after 15 minutes with all SSH/Mutagen transports closed.")
         return 0 if ready else 1
     if command == "idle" and len(sys.argv) == 2:
         return idle_watch()
