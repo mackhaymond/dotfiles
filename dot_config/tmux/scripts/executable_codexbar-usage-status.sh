@@ -859,8 +859,9 @@ append_usage_history() {
   local scoped_used="${6:-}" scoped_resets="${7:-}"
 
   [[ "$now" =~ ^[0-9]+$ ]] || return 0
-  [[ "$session_used" =~ ^[0-9]+$ ]] || return 0
-  [[ "$weekly_used"  =~ ^[0-9]+$ ]] || return 0
+  [[ -z "$session_used" || "$session_used" =~ ^[0-9]+$ ]] || return 0
+  [[ -z "$weekly_used" || "$weekly_used" =~ ^[0-9]+$ ]] || return 0
+  [[ -n "$session_used$weekly_used$scoped_used" ]] || return 0
 
   mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
 
@@ -879,7 +880,7 @@ append_usage_history() {
 
   umask 077
   printf '{"t":%s,"s":%s,"w":%s,"sr":%s,"wr":%s,"sc":%s,"scr":%s}\n' \
-    "$now" "$session_used" "$weekly_used" "$sr_json" "$wr_json" "$sc_json" "$scr_json" \
+    "$now" "$(json_num_or_null "$session_used")" "$(json_num_or_null "$weekly_used")" "$sr_json" "$wr_json" "$sc_json" "$scr_json" \
     >>"$file" 2>/dev/null || return 0
 
   local line_count
@@ -2140,30 +2141,42 @@ fetch_via_codexbar_codex() {
 
   # CodexBar has changed/expanded its JSON a few times. Do not trust field
   # names alone: select the 5-hour/session and 7-day/weekly limits by their
-  # windowMinutes, falling back to primary/secondary only if needed.
-  if ! session_limit="$(printf '%s' "$normalized" | jq -cer '
+  # windowMinutes. Fall back to the ORIGINAL primary/secondary slots only
+  # when their duration is unknown. Filtering null slots before indexing
+  # promoted a weekly-only account's secondary into a fake session window.
+  # An absent window is normal and stays null through cache and history.
+  if ! session_limit="$(printf '%s' "$normalized" | jq -c '
+    . as $root
+    |
     [.usage.primary?, .usage.secondary?, .openaiDashboard.primaryLimit?, .openaiDashboard.secondaryLimit?]
     | map(select(type == "object" and (.usedPercent? != null)))
-    | (map(select(((.windowMinutes? // 0) | tonumber) > 0 and ((.windowMinutes? // 0) | tonumber) <= 360)) | first) // .[0] // empty
+    | (map(select(((.windowMinutes? // 0) | tonumber) > 0 and ((.windowMinutes? // 0) | tonumber) <= 360)) | first)
+      // (($root.usage.primary? // $root.openaiDashboard.primaryLimit?)
+        | select(type == "object" and (.usedPercent? != null) and .windowMinutes? == null)) // null
   ' 2>/dev/null)"; then
     log_warn "refresh[codex]: jq parse failure (session limit)"
     return 1
   fi
-
-  if ! weekly_limit="$(printf '%s' "$normalized" | jq -cer '
+  if ! weekly_limit="$(printf '%s' "$normalized" | jq -c '
+    . as $root
+    |
     [.usage.primary?, .usage.secondary?, .openaiDashboard.primaryLimit?, .openaiDashboard.secondaryLimit?]
     | map(select(type == "object" and (.usedPercent? != null)))
-    | (map(select(((.windowMinutes? // 0) | tonumber) >= 1000)) | first) // .[1] // empty
+    | (map(select(((.windowMinutes? // 0) | tonumber) >= 1000)) | first)
+      // (($root.usage.secondary? // $root.openaiDashboard.secondaryLimit?)
+        | select(type == "object" and (.usedPercent? != null) and .windowMinutes? == null)) // null
   ' 2>/dev/null)"; then
     log_warn "refresh[codex]: jq parse failure (weekly limit)"
     return 1
   fi
 
-  if ! session_raw="$(printf '%s' "$session_limit" | jq -er '.usedPercent | tonumber' 2>/dev/null)"; then
+  session_raw=''
+  weekly_raw=''
+  if [[ "$session_limit" != null ]] && ! session_raw="$(printf '%s' "$session_limit" | jq -er '.usedPercent | tonumber' 2>/dev/null)"; then
     log_warn "refresh[codex]: jq parse failure (session usedPercent)"
     return 1
   fi
-  if ! weekly_raw="$(printf '%s' "$weekly_limit" | jq -er '.usedPercent | tonumber' 2>/dev/null)"; then
+  if [[ "$weekly_limit" != null ]] && ! weekly_raw="$(printf '%s' "$weekly_limit" | jq -er '.usedPercent | tonumber' 2>/dev/null)"; then
     log_warn "refresh[codex]: jq parse failure (weekly usedPercent)"
     return 1
   fi
@@ -2617,31 +2630,41 @@ render_provider_block() {
   local provider="$1" updated_at="$2"
 
   RENDER_BLOCK=''
-  local session_used weekly_used scoped_used=''
-  session_used="$(clamp_0_100_int "$FETCH_SESSION_USED")" || return 1
-  weekly_used="$(clamp_0_100_int "$FETCH_WEEKLY_USED")" || return 1
+  local session_used='' weekly_used='' scoped_used=''
+  if [[ -n "${FETCH_SESSION_USED:-}" ]]; then
+    session_used="$(clamp_0_100_int "$FETCH_SESSION_USED")" || return 1
+  fi
+  if [[ -n "${FETCH_WEEKLY_USED:-}" ]]; then
+    weekly_used="$(clamp_0_100_int "$FETCH_WEEKLY_USED")" || return 1
+  fi
 
   # A missing scoped window is normal (other providers, other plans); it
   # blanks that one module instead of failing the refresh.
   if [[ -n "${FETCH_SCOPED_USED:-}" ]]; then
     scoped_used="$(clamp_0_100_int "$FETCH_SCOPED_USED" || true)"
   fi
+  [[ -n "$session_used$weekly_used$scoped_used" ]] || return 1
 
   local session_window="$FETCH_SESSION_WINDOW_MINUTES" weekly_window="$FETCH_WEEKLY_WINDOW_MINUTES"
   local scoped_window="$FETCH_SCOPED_WINDOW_MINUTES"
   local session_resets="$FETCH_SESSION_RESETS_AT" weekly_resets="$FETCH_WEEKLY_RESETS_AT"
   local scoped_resets="$FETCH_SCOPED_RESETS_AT"
 
-  local session_pace weekly_pace session_text weekly_text session_color weekly_color
-  session_pace="$(pace_suffix "$session_used" "$session_window" "$session_resets" "$updated_at")"
-  weekly_pace="$(pace_suffix  "$weekly_used"  "$weekly_window"  "$weekly_resets"  "$updated_at")"
-  session_text="${session_used}%${session_pace}"
-  weekly_text="${weekly_used}%${weekly_pace}"
-  session_color="$(color_for_window "$session_used" "$session_window" "$session_resets" "$updated_at")"
-  weekly_color="$(color_for_window "$weekly_used"  "$weekly_window"  "$weekly_resets"  "$updated_at")"
-  local session_pace_color weekly_pace_color
-  session_pace_color="$(pace_color_for_window "$session_used" "$session_window" "$session_resets" "$updated_at")"
-  weekly_pace_color="$(pace_color_for_window "$weekly_used"  "$weekly_window"  "$weekly_resets"  "$updated_at")"
+  local session_pace weekly_pace session_text='n/a' weekly_text='n/a'
+  local session_color='brightblack' weekly_color='brightblack'
+  local session_pace_color='brightblack' weekly_pace_color='brightblack'
+  if [[ -n "$session_used" ]]; then
+    session_pace="$(pace_suffix "$session_used" "$session_window" "$session_resets" "$updated_at")"
+    session_text="${session_used}%${session_pace}"
+    session_color="$(color_for_window "$session_used" "$session_window" "$session_resets" "$updated_at")"
+    session_pace_color="$(pace_color_for_window "$session_used" "$session_window" "$session_resets" "$updated_at")"
+  fi
+  if [[ -n "$weekly_used" ]]; then
+    weekly_pace="$(pace_suffix "$weekly_used" "$weekly_window" "$weekly_resets" "$updated_at")"
+    weekly_text="${weekly_used}%${weekly_pace}"
+    weekly_color="$(color_for_window "$weekly_used" "$weekly_window" "$weekly_resets" "$updated_at")"
+    weekly_pace_color="$(pace_color_for_window "$weekly_used" "$weekly_window" "$weekly_resets" "$updated_at")"
+  fi
 
   local scoped_text='' scoped_color='' scoped_pace_color=''
   if [[ -n "${scoped_used:-}" ]]; then
@@ -2660,7 +2683,7 @@ render_provider_block() {
   # resets_at — there is no window, so pacing is undefined and the reset time is
   # unknown. Say "idle" in gray instead of a bare green "0%", which is
   # indistinguishable from a live-but-unpaced reading or a stalled fetch.
-  if [[ -z "${session_resets:-}" ]] && (( session_used == 0 )); then
+  if [[ -n "$session_used" && -z "${session_resets:-}" ]] && (( session_used == 0 )); then
     session_text='idle'
     session_color='brightblack'
     session_pace_color='brightblack'
