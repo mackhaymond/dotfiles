@@ -1,0 +1,202 @@
+#!/opt/homebrew/bin/python3
+"""One userspace UCLA VPN forward, exclusively to cs35l.seas.ucla.edu:22."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+STATE = Path.home() / ".local/state/seasnet-vpn"
+PIDFILE = STATE / "openconnect.pid"
+BASELINE = STATE / "network-before.json"
+PORT = 42235
+TARGET = "cs35l.seas.ucla.edu"
+OPENCONNECT = "/opt/homebrew/bin/openconnect"
+OCPROXY = "/opt/homebrew/bin/ocproxy"
+
+
+def capture(args):
+    return subprocess.run(args, capture_output=True, text=True, timeout=15)
+
+
+def process(pid):
+    return capture(["/bin/ps", "-p", str(pid), "-o", "uid=,ppid=,comm=,args="]).stdout.strip()
+
+
+def owned_pid():
+    try:
+        pid = int(PIDFILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+    info = process(pid).split(None, 3)
+    if (len(info) == 4 and int(info[0]) == os.getuid()
+            and Path(info[2]).name == "openconnect"
+            and str(PIDFILE) in shlex.split(info[3])):
+        return pid
+    return None
+
+
+def listener_ready(pid):
+    output = capture(["/usr/sbin/lsof", "-nP", "-a", "-u", str(os.getuid()),
+                      f"-iTCP:{PORT}", "-sTCP:LISTEN", "-Fpnc"]).stdout
+    listener_pid = None
+    command = None
+    for line in output.splitlines():
+        if line.startswith("p"):
+            listener_pid = int(line[1:])
+            command = None
+        elif line.startswith("c"):
+            command = line[1:]
+        elif line.startswith("n") and line[1:] == f"127.0.0.1:{PORT}" and command == "ocproxy":
+            info = process(listener_pid).split(None, 3)
+            if len(info) == 4 and int(info[1]) == pid:
+                return True
+    return False
+
+
+def snapshot():
+    routes = {}
+    for family in ("inet", "inet6"):
+        result = capture(["/usr/sbin/netstat", "-rn", "-f", family])
+        result.check_returncode()
+        entries = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 4 and "U" in fields[2] and "L" not in fields[2]:
+                entries.append([fields[0], fields[1], fields[3]])
+        routes[family] = sorted(entries)
+    dns = capture(["/usr/sbin/scutil", "--dns"])
+    dns.check_returncode()
+    ip = capture(["/usr/bin/curl", "-4fsS", "--max-time", "10", "https://api.ipify.org"])
+    return {"routes": routes, "dns": dns.stdout,
+            "public_ipv4": ip.stdout.strip() if ip.returncode == 0 else None}
+
+
+def verify():
+    if not BASELINE.exists():
+        print("No connection baseline yet. Run seasnet-vpn start first.")
+        return 1
+    before = json.loads(BASELINE.read_text())
+    after = snapshot()
+    unchanged = True
+    for key in ("routes", "dns", "public_ipv4"):
+        if key == "public_ipv4" and (before[key] is None or after[key] is None):
+            print("Public IPv4: unavailable; routes and DNS still checked.")
+            continue
+        same = before[key] == after[key]
+        print(f"{key}: {'unchanged' if same else 'CHANGED'}")
+        unchanged &= same
+    if not unchanged:
+        print(f"Baseline saved at {BASELINE}; inspect changes before using the forward.")
+    return 0 if unchanged else 1
+
+
+def start(username=None):
+    pid = owned_pid()
+    if pid:
+        if listener_ready(pid):
+            print(f"Already connected: 127.0.0.1:{PORT} -> {TARGET}:22 (PID {pid}).")
+            return 0
+        print("VPN process exists but its forward is unavailable. Run seasnet-vpn stop first.", file=sys.stderr)
+        return 1
+    if not sys.stdin.isatty():
+        print("Start in your terminal for private UCLA login and Duo: seasnet-vpn start", file=sys.stderr)
+        return 1
+    with socket.socket() as check:
+        try:
+            check.bind(("127.0.0.1", PORT))
+        except OSError:
+            print(f"Port {PORT} is already occupied; refusing to reuse it.", file=sys.stderr)
+            return 1
+    BASELINE.write_text(json.dumps(snapshot(), indent=2) + "\n")
+    PIDFILE.unlink(missing_ok=True)
+    args = [OPENCONNECT, "--protocol=anyconnect", "--no-external-auth", "--disable-ipv6",
+            "--script-tun", "--script", f"{OCPROXY} -L {PORT}:{TARGET}:22 -k 30",
+            "--background", "--pid-file", str(PIDFILE), "--reconnect-timeout=60"]
+    if username:
+        args.extend(["--user", username])
+    args.append("https://ssl.vpn.ucla.edu")
+    print("Enter your UCLA Logon credentials and complete Duo when prompted.", flush=True)
+    result = subprocess.run(args)
+    if result.returncode:
+        return result.returncode
+    for _ in range(20):
+        pid = owned_pid()
+        if pid and listener_ready(pid):
+            print(f"Connected: 127.0.0.1:{PORT} -> {TARGET}:22 (PID {pid}).", flush=True)
+            result = verify()
+            if result:
+                print("Network comparison failed; stopping this VPN session.", file=sys.stderr)
+                stop()
+            return result
+        time.sleep(0.2)
+    print("VPN started but the restricted forward is unavailable; stopping it.", file=sys.stderr)
+    stop()
+    return 1
+
+
+def stop():
+    pid = owned_pid()
+    if not pid:
+        print("No owned seasnet VPN process is running.")
+        return 0
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(30):
+        if not owned_pid():
+            PIDFILE.unlink(missing_ok=True)
+            print("Disconnected.")
+            return 0
+        time.sleep(0.2)
+    print("Shutdown is still in progress; inspect seasnet-vpn status.", file=sys.stderr)
+    return 1
+
+
+def proxy(host, port):
+    if host != TARGET or port != "22":
+        print("This forward only accepts cs35l.seas.ucla.edu:22.", file=sys.stderr)
+        return 1
+    pid = owned_pid()
+    if not pid or not listener_ready(pid):
+        print("SEASnet VPN is unavailable. Run seasnet-vpn start in your terminal, then retry.", file=sys.stderr)
+        return 1
+    os.execv("/usr/bin/nc", ["nc", "127.0.0.1", str(PORT)])
+
+
+def main():
+    os.umask(0o077)
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if len(sys.argv) < 2:
+        print("Usage: seasnet-vpn {start [UCLA_LOGON]|stop|status|verify|proxy HOST PORT}")
+        return 2
+    command = sys.argv[1]
+    if command == "proxy" and len(sys.argv) == 4:
+        return proxy(*sys.argv[2:])
+    if command == "status" and len(sys.argv) == 2:
+        pid = owned_pid()
+        ready = bool(pid and listener_ready(pid))
+        print(f"{'Connected' if ready else 'Disconnected'}: restricted forward to {TARGET}:22.")
+        return 0 if ready else 1
+    if command == "verify" and len(sys.argv) == 2:
+        return verify()
+    if command in ("start", "stop") and len(sys.argv) <= (3 if command == "start" else 2):
+        with (STATE / "control.lock").open("w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("Another VPN start/stop is in progress.", file=sys.stderr)
+                return 1
+            return start(sys.argv[2] if len(sys.argv) == 3 else None) if command == "start" else stop()
+    print("Unknown command or invalid arguments.", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
