@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 STATE = Path.home() / ".local/state/seasnet-vpn"
 PIDFILE = STATE / "openconnect.pid"
@@ -25,7 +26,13 @@ def capture(args):
 
 
 def process(pid):
-    return capture(["/bin/ps", "-p", str(pid), "-o", "uid=,ppid=,comm=,args="]).stdout.strip()
+    # macOS truncates comm to 15 columns when args follows it. Request comm
+    # separately as the final wide column so the executable path stays intact.
+    executable = capture(["/bin/ps", "-ww", "-p", str(pid), "-o", "comm="]).stdout.strip()
+    info = capture(["/bin/ps", "-ww", "-p", str(pid), "-o", "uid=,ppid=,args="]).stdout.strip().split(None, 2)
+    if len(info) != 3 or not executable:
+        return ""
+    return " ".join([info[0], info[1], executable, info[2]])
 
 
 def owned_pid():
@@ -41,7 +48,7 @@ def owned_pid():
     return None
 
 
-def listener_ready(pid):
+def listener_ready():
     output = capture(["/usr/sbin/lsof", "-nP", "-a", "-u", str(os.getuid()),
                       f"-iTCP:{PORT}", "-sTCP:LISTEN", "-Fpnc"]).stdout
     listener_pid = None
@@ -54,8 +61,12 @@ def listener_ready(pid):
             command = line[1:]
         elif line.startswith("n") and line[1:] == f"127.0.0.1:{PORT}" and command == "ocproxy":
             info = process(listener_pid).split(None, 3)
-            if len(info) == 4 and int(info[1]) == pid:
-                return True
+            # OpenConnect's daemon fork can reparent ocproxy. Verify its actual
+            # executable, owner and fixed destination rather than its parent PID.
+            if len(info) == 4 and int(info[0]) == os.getuid() and Path(info[2]).name == "ocproxy":
+                args = shlex.split(info[3])
+                if args[1:] == ["-L", f"{PORT}:{TARGET}:22", "-k", "30"]:
+                    return True
     return False
 
 
@@ -96,10 +107,22 @@ def verify():
     return 0 if unchanged else 1
 
 
-def start(username=None):
+def browser_login(url):
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".ucla.edu"):
+        print("Refusing an unexpected browser-login URL.", file=sys.stderr)
+        return 1
+    # The user opens the link themselves; never launch or focus a GUI app.
+    print("\nOpen this link in your browser, complete UCLA login and Duo,\n"
+          "and leave this terminal running until it reports Connected:\n\n"
+          + url + "\n", file=sys.stderr, flush=True)
+    return 0
+
+
+def start(username=None, terminal_auth=False):
     pid = owned_pid()
     if pid:
-        if listener_ready(pid):
+        if listener_ready():
             print(f"Already connected: 127.0.0.1:{PORT} -> {TARGET}:22 (PID {pid}).")
             return 0
         print("VPN process exists but its forward is unavailable. Run seasnet-vpn stop first.", file=sys.stderr)
@@ -115,19 +138,26 @@ def start(username=None):
             return 1
     BASELINE.write_text(json.dumps(snapshot(), indent=2) + "\n")
     PIDFILE.unlink(missing_ok=True)
-    args = [OPENCONNECT, "--protocol=anyconnect", "--no-external-auth", "--disable-ipv6",
+    args = [OPENCONNECT, "--protocol=anyconnect", "--disable-ipv6",
             "--script-tun", "--script", f"{OCPROXY} -L {PORT}:{TARGET}:22 -k 30",
             "--background", "--pid-file", str(PIDFILE), "--reconnect-timeout=60"]
+    if terminal_auth:
+        args.append("--no-external-auth")
+    else:
+        args.extend(["--external-browser", str(Path(__file__).resolve())])
     if username:
         args.extend(["--user", username])
     args.append("https://ssl.vpn.ucla.edu")
-    print("Enter your UCLA Logon credentials and complete Duo when prompted.", flush=True)
+    if terminal_auth:
+        print("Enter your UCLA Logon credentials and Duo response as required by UCLA.", flush=True)
+    else:
+        print("Requesting UCLA browser login. Open the link that appears below to complete Duo.", flush=True)
     result = subprocess.run(args)
     if result.returncode:
         return result.returncode
     for _ in range(20):
         pid = owned_pid()
-        if pid and listener_ready(pid):
+        if pid and listener_ready():
             print(f"Connected: 127.0.0.1:{PORT} -> {TARGET}:22 (PID {pid}).", flush=True)
             result = verify()
             if result:
@@ -161,7 +191,7 @@ def proxy(host, port):
         print("This forward only accepts cs35l.seas.ucla.edu:22.", file=sys.stderr)
         return 1
     pid = owned_pid()
-    if not pid or not listener_ready(pid):
+    if not pid or not listener_ready():
         print("SEASnet VPN is unavailable. Run seasnet-vpn start in your terminal, then retry.", file=sys.stderr)
         return 1
     os.execv("/usr/bin/nc", ["nc", "127.0.0.1", str(PORT)])
@@ -171,26 +201,35 @@ def main():
     os.umask(0o077)
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     if len(sys.argv) < 2:
-        print("Usage: seasnet-vpn {start [UCLA_LOGON]|stop|status|verify|proxy HOST PORT}")
+        print("Usage: seasnet-vpn {start [--terminal] [UCLA_LOGON]|stop|status|verify|proxy HOST PORT}")
         return 2
     command = sys.argv[1]
+    if command.startswith("https://") and len(sys.argv) == 2:
+        return browser_login(command)
+    if command == "browser-login" and len(sys.argv) == 3:
+        return browser_login(sys.argv[2])
     if command == "proxy" and len(sys.argv) == 4:
         return proxy(*sys.argv[2:])
     if command == "status" and len(sys.argv) == 2:
         pid = owned_pid()
-        ready = bool(pid and listener_ready(pid))
+        ready = bool(pid and listener_ready())
         print(f"{'Connected' if ready else 'Disconnected'}: restricted forward to {TARGET}:22.")
         return 0 if ready else 1
     if command == "verify" and len(sys.argv) == 2:
         return verify()
-    if command in ("start", "stop") and len(sys.argv) <= (3 if command == "start" else 2):
+    remaining = sys.argv[2:]
+    terminal_auth = "--terminal" in remaining
+    if terminal_auth:
+        remaining.remove("--terminal")
+    if (command == "start" and len(remaining) <= 1
+            or command == "stop" and not remaining and not terminal_auth):
         with (STATE / "control.lock").open("w") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 print("Another VPN start/stop is in progress.", file=sys.stderr)
                 return 1
-            return start(sys.argv[2] if len(sys.argv) == 3 else None) if command == "start" else stop()
+            return start(remaining[0] if remaining else None, terminal_auth) if command == "start" else stop()
     print("Unknown command or invalid arguments.", file=sys.stderr)
     return 2
 
