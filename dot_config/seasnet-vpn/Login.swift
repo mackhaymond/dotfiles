@@ -2,12 +2,18 @@ import Cocoa
 import WebKit
 
 final class LoginApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate {
-    let state = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/state/seasnet-vpn")
+    let state: URL
     var window: NSWindow!
     var web: WKWebView!
     var requestID = ""
     var finished = false
+    var displayingError = false
     var timer: Timer?
+
+    init(state: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/state/seasnet-vpn")) {
+        self.state = state
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let menu = NSMenu()
@@ -49,44 +55,88 @@ final class LoginApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavig
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 
+    func write(_ name: String, _ value: [String: String]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: value) else { return }
+        let url = state.appendingPathComponent(name)
+        do {
+            try data.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            // Diagnostics are optional. A cancellation write failure cannot
+            // expose data or cause an authentication success to be reported.
+        }
+    }
+
+    func currentRequest() -> (id: String, url: URL)? {
+        guard let request = read("login-request.json"), let id = request["id"] as? String,
+              !id.isEmpty, let raw = request["url"] as? String,
+              let url = URL(string: raw), url.scheme == "https",
+              url.user == nil, url.password == nil,
+              url.host?.hasSuffix(".ucla.edu") == true else { return nil }
+        return (id, url)
+    }
+
+    func terminalResult(for id: String) -> Bool {
+        guard let result = read("login-result.json"), result["id"] as? String == id,
+              let outcome = result["result"] as? String else { return false }
+        return ["connected", "failed"].contains(outcome)
+    }
+
     func loadRequest() {
-        if let result = read("login-result.json"), result["id"] as? String == requestID {
+        guard let request = currentRequest() else { return }
+        // A running app may be reused by a later SSH attempt. Read that
+        // attempt first so an older completed result cannot close its window.
+        let changed = request.id != requestID
+        requestID = request.id
+        if terminalResult(for: requestID) {
             finished = true
             NSApp.terminate(nil)
             return
         }
-        guard let request = read("login-request.json"), let id = request["id"] as? String,
-              id != requestID, let raw = request["url"] as? String,
-              let url = URL(string: raw), url.scheme == "https",
-              url.host?.hasSuffix(".ucla.edu") == true else { return }
-        requestID = id
+        guard changed else { return }
         finished = false
-        web.load(URLRequest(url: url))
+        displayingError = false
+        window.subtitle = ""
+        web.load(URLRequest(url: request.url))
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard !displayingError else { return }
         let page: [String: String] = ["id": requestID, "state": "loaded",
                                      "title": webView.title ?? "", "host": webView.url?.host ?? ""]
-        if let data = try? JSONSerialization.data(withJSONObject: page) {
-            try? data.write(to: state.appendingPathComponent("login-page.json"), options: .atomic)
-        }
+        write("login-page.json", page)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        let page: [String: String] = ["id": requestID, "state": "failed", "code": String((error as NSError).code)]
-        if let data = try? JSONSerialization.data(withJSONObject: page) {
-            try? data.write(to: state.appendingPathComponent("login-page.json"), options: .atomic)
-        }
+        showNavigationError(error, in: webView)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        showNavigationError(error, in: webView)
+    }
+
+    func isCancelledNavigation(_ error: NSError) -> Bool {
+        (error.domain == NSURLErrorDomain && error.code == NSURLErrorCancelled)
+            || (error.domain == "WebKitErrorDomain" && error.code == 102)
+    }
+
+    func showNavigationError(_ error: Error, in webView: WKWebView) {
+        let failure = error as NSError
+        // Redirects, popup replacement, and declining an app handoff cancel
+        // the old load. An error page here would interrupt the current login.
+        guard !isCancelledNavigation(failure),
+              !displayingError, !terminalResult(for: requestID) else { return }
+        displayingError = true
+        write("login-page.json", ["id": requestID, "state": "failed", "code": String(failure.code)])
         webView.loadHTMLString("<html><body style='font:17px -apple-system;padding:36px'><h2>UCLA login couldn't load</h2><p>Close this window and retry <code>ssh seasnet</code>.</p></body></html>", baseURL: nil)
     }
 
     func cancel() {
-        guard !finished, !requestID.isEmpty else { return }
-        let result: [String: String] = ["id": requestID, "result": "cancelled"]
-        if let data = try? JSONSerialization.data(withJSONObject: result) {
-            let url = state.appendingPathComponent("login-result.json")
-            try? data.write(to: url, options: .atomic)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        guard !finished, let request = currentRequest() else { return }
+        // Closing the window cancels the latest request, including one that
+        // arrived between timer ticks. Never overwrite the helper's result.
+        if !terminalResult(for: request.id) {
+            write("login-cancel.json", ["id": request.id, "result": "cancelled"])
         }
         finished = true
     }
@@ -102,7 +152,13 @@ final class LoginApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavig
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.request.url else { decisionHandler(.cancel); return }
         let local = ["127.0.0.1", "localhost", "::1"].contains(url.host ?? "")
-        decisionHandler(url.scheme == "https" || (url.scheme == "http" && local) || url.scheme == "about" ? .allow : .cancel)
+        let allowed = url.scheme == "https" || (url.scheme == "http" && local) || url.scheme == "about"
+        if !allowed, let scheme = url.scheme, !["http", "file", "data", "javascript"].contains(scheme) {
+            // Embedded-browser authentication cannot safely foreground another
+            // app. Keep the current login usable for supported Duo methods.
+            window.subtitle = "Use Duo Push or a passcode to continue in this window."
+        }
+        decisionHandler(allowed ? .allow : .cancel)
     }
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,

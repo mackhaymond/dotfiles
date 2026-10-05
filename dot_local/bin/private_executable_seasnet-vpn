@@ -34,7 +34,7 @@ LOGIN_TIMEOUT = 5 * 60
 @contextmanager
 def control_lock(wait=False):
     with (STATE / "control.lock").open("w") as lock:
-        deadline = time.monotonic() + LOGIN_TIMEOUT + 30
+        deadline = time.monotonic() + LOGIN_TIMEOUT + 120
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -48,6 +48,18 @@ def control_lock(wait=False):
 
 def touch_activity():
     (STATE / "last-used").touch(mode=0o600)
+
+
+def write_json(path, data):
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x") as output:
+            os.chmod(temporary, 0o600)
+            json.dump(data, output)
+            output.write("\n")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def active_connections(clean=False):
@@ -85,9 +97,15 @@ def idle_watch():
             return 0
         (STATE / "idle.pid").write_text(str(os.getpid()) + "\n")
         try:
-            while owned_pid():
+            while True:
                 try:
                     with control_lock():
+                        if not owned_pid():
+                            # Release the watcher lock before startup can obtain
+                            # control.lock and launch its replacement watcher.
+                            (STATE / "idle.pid").unlink(missing_ok=True)
+                            fcntl.flock(lock, fcntl.LOCK_UN)
+                            return 0
                         if active_connections(clean=True):
                             touch_activity()
                         else:
@@ -95,13 +113,17 @@ def idle_watch():
                             if not activity.exists():
                                 touch_activity()
                             elif time.time() - activity.stat().st_mtime >= IDLE_SECONDS:
-                                stop()
-                                return 0
+                                if stop() == 0:
+                                    (STATE / "idle.pid").unlink(missing_ok=True)
+                                    fcntl.flock(lock, fcntl.LOCK_UN)
+                                    return 0
                 except RuntimeError:
                     pass
                 time.sleep(15)
         finally:
-            (STATE / "idle.pid").unlink(missing_ok=True)
+            path = STATE / "idle.pid"
+            if path.exists() and path.read_text().strip() == str(os.getpid()):
+                path.unlink(missing_ok=True)
     return 0
 
 
@@ -133,21 +155,42 @@ def build_login():
     stamp.write_text(digest + "\n")
 
 
-def write_login_result(result):
+def write_login_result(result, request_id=None, attempt=None):
     request = STATE / "login-request.json"
     if request.exists():
-        data = json.loads(request.read_text())
-        (STATE / "login-result.json").write_text(json.dumps({"id": data["id"], "result": result}) + "\n")
+        try:
+            data = json.loads(request.read_text())
+        except (ValueError, FileNotFoundError):
+            return
+        if request_id is not None and data.get("id") != request_id:
+            return
+        if attempt is not None and data.get("attempt") != attempt:
+            return
+        write_json(STATE / "login-result.json", {"id": data["id"], "result": result})
 
 
 def login_cancelled():
-    request, result = STATE / "login-request.json", STATE / "login-result.json"
-    if not request.exists() or not result.exists():
-        return False
+    request = STATE / "login-request.json"
     try:
-        a, b = json.loads(request.read_text()), json.loads(result.read_text())
-        return a["id"] == b["id"] and b["result"] in ("cancelled", "failed")
-    except (ValueError, KeyError):
+        a = json.loads(request.read_text())
+        for name in ("login-cancel.json", "login-result.json"):
+            try:
+                b = json.loads((STATE / name).read_text())
+                if a["id"] == b["id"] and b["result"] in ("cancelled", "failed"):
+                    return True
+            except (FileNotFoundError, ValueError, KeyError):
+                continue
+    except (FileNotFoundError, ValueError, KeyError):
+        return False
+    return False
+
+
+def attempt_current(attempt):
+    if attempt is None:  # Explicit browser-login diagnostic invocation.
+        return True
+    try:
+        return json.loads((STATE / "login-attempt.json").read_text()).get("id") == attempt
+    except (FileNotFoundError, ValueError):
         return False
 
 
@@ -239,22 +282,42 @@ def verify():
 
 def browser_login(url):
     parsed = urlsplit(url)
-    if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".ucla.edu"):
+    if (parsed.scheme != "https" or not (parsed.hostname or "").endswith(".ucla.edu")
+            or parsed.username is not None or parsed.password is not None):
         print("Refusing an unexpected browser-login URL.", file=sys.stderr)
         return 1
-    build_login()
-    (STATE / "login-request.json").write_text(json.dumps({"id": str(uuid.uuid4()), "url": url}) + "\n")
+    attempt = os.environ.get("SEASNET_VPN_LOGIN_ATTEMPT")
+    if not attempt_current(attempt):
+        print("Ignoring an expired UCLA login attempt.", file=sys.stderr)
+        return 1
+    request_id = str(uuid.uuid4())
+    write_json(STATE / "login-request.json", {"id": request_id, "url": url, "attempt": attempt})
     launcher = Path.home() / ".local/bin/cua-bg-launch"
     driver = Path.home() / ".local/bin/cua-driver"
     session = f"seasnet-login-{uuid.uuid4().hex[:10]}"
-    subprocess.run([str(driver), "start_session", json.dumps({"session": session, "capture_scope": "window"})],
-                   check=True, capture_output=True, timeout=15)
+    session_started = False
     try:
+        build_login()
+        if not attempt_current(attempt) or login_cancelled():
+            write_login_result("failed", request_id=request_id)
+            return 1
+        subprocess.run([str(driver), "start_session", json.dumps({"session": session, "capture_scope": "window"})],
+                       check=True, capture_output=True, timeout=15)
+        session_started = True
         result = subprocess.run([str(launcher), "SEASnet VPN Login"], capture_output=True, text=True, timeout=90)
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+        write_login_result("failed", request_id=request_id)
+        print("The login window could not be prepared safely. Check the diagnostic log and retry.",
+              file=sys.stderr, flush=True)
+        return 1
     finally:
-        subprocess.run([str(driver), "end_session", json.dumps({"session": session})], capture_output=True, timeout=15)
+        if session_started:
+            try:
+                subprocess.run([str(driver), "end_session", json.dumps({"session": session})], capture_output=True, timeout=15)
+            except (OSError, subprocess.SubprocessError):
+                pass
     if result.returncode not in (0, 2):
-        write_login_result("failed")
+        write_login_result("failed", request_id=request_id)
         print("The login window could not be opened safely. Check the diagnostic log and retry.",
               file=sys.stderr, flush=True)
         return 1
@@ -265,6 +328,17 @@ def browser_login(url):
         print("UCLA login opened in SEASnet VPN Login. Choose its window to complete Duo.",
               file=sys.stderr, flush=True)
     return 0
+
+
+def terminate_auth(auth):
+    if auth.poll() is None:
+        auth.terminate()
+        try:
+            auth.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # Only this authentication subprocess, never the login GUI.
+            auth.kill()
+            auth.wait(timeout=5)
 
 
 def start(username=None, terminal_auth=False):
@@ -290,6 +364,9 @@ def start(username=None, terminal_auth=False):
     PIDFILE.unlink(missing_ok=True)
     (STATE / "login-request.json").unlink(missing_ok=True)
     (STATE / "login-result.json").unlink(missing_ok=True)
+    (STATE / "login-cancel.json").unlink(missing_ok=True)
+    attempt = str(uuid.uuid4())
+    write_json(STATE / "login-attempt.json", {"id": attempt})
     args = [OPENCONNECT, "--protocol=anyconnect", "--disable-ipv6",
             "--script-tun", "--script", f"{OCPROXY} -L {PORT}:{TARGET}:22 -k 30",
             "--background", "--pid-file", str(PIDFILE), "--reconnect-timeout=60"]
@@ -307,61 +384,81 @@ def start(username=None, terminal_auth=False):
     # The daemon must not retain an SSH caller's stdout/stderr pipes after
     # login. Browser authentication and subsequent VPN logs stay in this file.
     log = None if terminal_auth else (STATE / "openconnect.log").open("w")
+    auth = None
+    connected = False
     try:
-        auth = subprocess.Popen(args, stdin=None if terminal_auth else subprocess.DEVNULL,
-                                stdout=log or sys.stderr, stderr=log or sys.stderr)
-    finally:
-        if log is not None:
-            log.close()
-    deadline = time.monotonic() + LOGIN_TIMEOUT
-    try:
+        try:
+            auth = subprocess.Popen(args, stdin=None if terminal_auth else subprocess.DEVNULL,
+                                    stdout=log or sys.stderr, stderr=log or sys.stderr,
+                                    env={**os.environ, "SEASNET_VPN_LOGIN_ATTEMPT": attempt},
+                                    start_new_session=not terminal_auth)
+        finally:
+            if log is not None:
+                log.close()
+        deadline = time.monotonic() + LOGIN_TIMEOUT
         while auth.poll() is None:
             if login_cancelled() or time.monotonic() >= deadline:
                 print("UCLA login cancelled or timed out.", file=sys.stderr)
-                auth.terminate()
-                auth.wait(timeout=10)
-                write_login_result("failed")
                 return 1
             time.sleep(0.2)
-    except BaseException:
-        if auth.poll() is None:
-            auth.terminate()
-            auth.wait(timeout=10)
-        write_login_result("failed")
-        raise
-    if auth.returncode:
-        write_login_result("failed")
-        print(f"VPN login failed. Diagnostic log: {STATE / 'openconnect.log'}", file=sys.stderr)
-        return auth.returncode
-    for _ in range(20):
-        pid = owned_pid()
-        if pid and listener_ready():
-            print(f"Connected: 127.0.0.1:{PORT} -> {TARGET}:22 (PID {pid}).", flush=True)
-            result = verify()
-            if result:
-                print("Network comparison failed; stopping this VPN session.", file=sys.stderr)
-                stop()
-            else:
+        if auth.returncode:
+            print(f"VPN login failed. Diagnostic log: {STATE / 'openconnect.log'}", file=sys.stderr)
+            return auth.returncode
+        for _ in range(20):
+            if login_cancelled():
+                print("UCLA login cancelled.", file=sys.stderr)
+                return 1
+            pid = owned_pid()
+            if pid and listener_ready():
+                print(f"Connected: 127.0.0.1:{PORT} -> {TARGET}:22 (PID {pid}).", flush=True)
+                result = verify()
+                if result:
+                    print("Network comparison failed; stopping this VPN session.", file=sys.stderr)
+                    return result
+                if login_cancelled():
+                    return 1
                 touch_activity()
                 ensure_idle_watch()
-            write_login_result("failed" if result else "connected")
-            return result
-        time.sleep(0.2)
-    print("VPN started but the restricted forward is unavailable; stopping it.", file=sys.stderr)
-    stop()
-    write_login_result("failed")
-    return 1
+                write_login_result("connected", attempt=attempt)
+                connected = True
+                return 0
+            time.sleep(0.2)
+        print("VPN started but the restricted forward is unavailable; stopping it.", file=sys.stderr)
+        return 1
+    finally:
+        if not connected:
+            try:
+                write_login_result("failed", attempt=attempt)
+            except (OSError, ValueError, KeyError):
+                # A diagnostic write must not prevent auth/daemon cleanup.
+                pass
+            try:
+                if attempt_current(attempt):
+                    (STATE / "login-attempt.json").unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                if auth is not None:
+                    terminate_auth(auth)
+            finally:
+                # Authentication may fork its daemon just before cancellation.
+                # This start had no prior owned VPN, and control.lock serializes
+                # other starts, so any daemon now in our pidfile is this attempt.
+                if owned_pid():
+                    stop()
 
 
 def stop():
     pid = owned_pid()
     if not pid:
+        (STATE / "login-attempt.json").unlink(missing_ok=True)
         print("No owned seasnet VPN process is running.")
         return 0
     os.kill(pid, signal.SIGTERM)
     for _ in range(30):
         if not owned_pid():
             PIDFILE.unlink(missing_ok=True)
+            (STATE / "login-attempt.json").unlink(missing_ok=True)
             print("Disconnected.")
             return 0
         time.sleep(0.2)
@@ -375,7 +472,8 @@ def proxy(host, port):
         return 1
     def interrupted(signum, frame):
         raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, interrupted)
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, interrupted)
     leases = STATE / "connections"
     leases.mkdir(exist_ok=True, mode=0o700)
     path = leases / str(os.getpid())
