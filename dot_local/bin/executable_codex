@@ -1,3 +1,3 @@
 #!/bin/sh
-# Preserve Codex's shared server while recording each terminal client's owner.
-exec python3 "$HOME/.config/tmux/scripts/codex-terminal-owner.py" launch "$@"
+# Use each model's advertised maximum, then preserve the shared terminal bridge.
+exec python3 "$HOME/.config/tmux/scripts/codex-max-context.py" launch "$@"
