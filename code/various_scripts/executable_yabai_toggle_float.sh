@@ -55,7 +55,7 @@ case "$app" in
   "Spark Mail")        home=mail ;;
   "Notion Calendar")   home=calendar ;;
   Messages)            home=messages ;;
-  ChatGPT|Claude|Muse) home=ai ;;
+  ChatGPT|Claude)       home=ai ;;
 esac
 yabai_is_agent_app "$app" && home="$YABAI_AGENT_LABEL"
 

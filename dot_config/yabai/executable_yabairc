@@ -108,7 +108,6 @@ yabai -m rule --add app="^Notion Calendar$" space=calendar
 yabai -m rule --add app="^Messages$" space=messages
 yabai -m rule --add app="^ChatGPT$" space=ai
 yabai -m rule --add app="^Claude$" space=ai
-yabai -m rule --add app="^Muse$" space=ai
 # `agent` (hyper+esc) is the generic coding-agent view -- NOT one pinned app. Its
 # app set lives in yabai_common.sh (YABAI_AGENT_APPS) and is sourced here so this
 # rule can never drift from the pinned-home guards in the yabai_* scripts.

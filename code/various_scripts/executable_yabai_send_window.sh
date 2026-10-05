@@ -37,7 +37,7 @@ case "$app" in
   "Spark Mail")        home=mail ;;
   "Notion Calendar")   home=calendar ;;
   Messages)            home=messages ;;
-  ChatGPT|Claude|Muse) home=ai ;;
+  ChatGPT|Claude)       home=ai ;;
 esac
 # The coding-agent apps (Conductor et al.) all home to `agent` -- one list, in
 # yabai_common.sh, rather than a case arm per app.

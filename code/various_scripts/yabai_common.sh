@@ -34,7 +34,7 @@ YABAI_LABELS="terminal main school todo schedule mail calendar messages ai agent
 # Add an app HERE and every consumer picks it up. Names are yabai's `.app` field
 # (the app's display name), `|`-separated.
 YABAI_AGENT_LABEL="agent"
-YABAI_AGENT_APPS="Conductor|Claudia|OpenChamber|OpenCode|Jean|T3 Code (Alpha)"
+YABAI_AGENT_APPS="Conductor|Claudia|OpenChamber|OpenCode|Jean|T3 Code (Alpha)|Muse"
 
 # The same list as a yabai `rule --add app=` regex: anchored, with the literal
 # parens of names like "T3 Code (Alpha)" escaped so they aren't read as a group.
@@ -51,7 +51,7 @@ YABAI_AGENT_APPS_RE="^($(printf '%s' "$YABAI_AGENT_APPS" | sed 's/[()]/\\&/g'))$
 # Consumed by: yabai_startup_reconcile.sh (the login-race + stray-float home map).
 # yabai_send_window{,_external}.sh and yabai_toggle_float.sh still carry their own
 # `case` copies; folding those in is a worthwhile follow-up, not a silent one.
-YABAI_PINNED_HOMES="wezterm-gui:terminal|WezTerm:terminal|Todoist:todo|Granola:schedule|Spark Mail:mail|Notion Calendar:calendar|Messages:messages|ChatGPT:ai|Claude:ai|Muse:ai"
+YABAI_PINNED_HOMES="wezterm-gui:terminal|WezTerm:terminal|Todoist:todo|Granola:schedule|Spark Mail:mail|Notion Calendar:calendar|Messages:messages|ChatGPT:ai|Claude:ai"
 
 # Every app the float sweep can act on -- the pinned map's app names plus the agent
 # apps -- as one anchored yabai regex, for the `window_focused` sweep signal's app=

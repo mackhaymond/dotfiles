@@ -205,10 +205,9 @@ assign_label_to_pinned_app_space schedule '^Granola$'
 assign_label_to_pinned_app_space mail '^Spark Mail$'
 assign_label_to_pinned_app_space calendar '^Notion Calendar$'
 assign_label_to_pinned_app_space messages '^Messages$'
-# ChatGPT, Claude, and Muse share the `ai` home space; whichever is running labels it.
+# ChatGPT and Claude share the `ai` home space; whichever is running labels it.
 assign_label_to_pinned_app_space ai '^ChatGPT$'
 assign_label_to_pinned_app_space ai '^Claude$'
-assign_label_to_pinned_app_space ai '^Muse$'
 # The coding-agent apps share the `agent` home space; whichever is running labels
 # it (one regex over the whole set -- see YABAI_AGENT_APPS in yabai_common.sh).
 assign_label_to_pinned_app_space agent "$YABAI_AGENT_APPS_RE"
