@@ -1,34 +1,66 @@
 #!/opt/homebrew/bin/python3
-"""One userspace UCLA VPN forward, exclusively to cs35l.seas.ucla.edu:22."""
+"""One userspace UCLA VPN forward, exclusively to cs35l.seas.ucla.edu:22.
+
+Who may start it: only a person at a terminal (`seasnet-vpn start`, or an
+interactive `ssh seasnet`), because UCLA login needs a person for Duo. Every
+other SSH -- Mutagen, agents, BatchMode, anything without a controlling
+terminal -- rides an existing tunnel or fails fast, and never opens the login
+window.
+
+When it stops: after idle_minutes (config.toml) with no SSH transport besides
+Mutagen's and no change to any file a running seasnet Mutagen session syncs.
+Mutagen's own transport and keepalives never count as use. Those Mutagen
+sessions are paused before the disconnect, and also when Mutagen finds the
+tunnel gone, so Mutagen never retries in a loop. The next start resumes exactly
+the sessions this helper paused.
+"""
 import fcntl
+import fnmatch
 from contextlib import contextmanager, redirect_stdout
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
+import re
 import shlex
 import signal
 import socket
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 from urllib.parse import urlsplit
 
-STATE = Path.home() / ".local/state/seasnet-vpn"
+HOME = Path.home()
+STATE = Path(os.environ.get("SEASNET_VPN_STATE") or HOME / ".local/state/seasnet-vpn")
 PIDFILE = STATE / "openconnect.pid"
 BASELINE = STATE / "network-before.json"
-PORT = 42235
+CONFIG = HOME / ".config/seasnet-vpn/config.toml"
+PORT = int(os.environ.get("SEASNET_VPN_PORT") or 42235)
 TARGET = "cs35l.seas.ucla.edu"
-OPENCONNECT = "/opt/homebrew/bin/openconnect"
-OCPROXY = "/opt/homebrew/bin/ocproxy"
-SELF = Path.home() / ".local/bin/seasnet-vpn"
-LOGIN_SOURCE = Path.home() / ".config/seasnet-vpn/Login.swift"
-LOGIN_APP = Path.home() / "Applications/SEASnet VPN Login.app"
+# Test rigs point this at stub binaries. Normal use never sets it.
+TEST_BIN = os.environ.get("SEASNET_VPN_TEST_BIN")
+OPENCONNECT = f"{TEST_BIN}/openconnect" if TEST_BIN else "/opt/homebrew/bin/openconnect"
+OCPROXY = f"{TEST_BIN}/ocproxy" if TEST_BIN else "/opt/homebrew/bin/ocproxy"
+LAUNCHER = Path(TEST_BIN or HOME / ".local/bin") / "cua-bg-launch"
+DRIVER = Path(TEST_BIN or HOME / ".local/bin") / "cua-driver"
+MUTAGEN = "/opt/homebrew/bin/mutagen"
+# Mutagen resolves ssh through MUTAGEN_SSH_PATH; ask the same ssh about routing.
+SSH = os.path.join(os.environ.get("MUTAGEN_SSH_PATH") or "/usr/bin", "ssh")
+TMUX = "/opt/homebrew/bin/tmux"
+AGENT_TMUX_SESSION = "agents"
+SELF = Path(__file__).resolve()
+LOGIN_SOURCE = HOME / ".config/seasnet-vpn/Login.swift"
+LOGIN_APP = HOME / "Applications/SEASnet VPN Login.app"
 LOGIN_BUNDLE = "co.mackhaymond.seasnet-vpn-login"
-IDLE_SECONDS = 15 * 60
+DEFAULT_IDLE_MINUTES = 30
+CHECK_SECONDS = int(os.environ.get("SEASNET_VPN_CHECK_SECONDS") or 60)
 LOGIN_TIMEOUT = 5 * 60
+LOGIN_COOLDOWN_MAX = 30 * 60
+SCAN_LIMIT = 50_000
 
 
 @contextmanager
@@ -46,88 +78,295 @@ def control_lock(wait=False):
         yield
 
 
+def idle_seconds():
+    minutes = os.environ.get("SEASNET_VPN_IDLE_MINUTES")
+    try:
+        minutes = float(minutes) if minutes else tomllib.loads(CONFIG.read_text()).get("idle_minutes")
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        minutes = None
+    if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or minutes <= 0:
+        minutes = DEFAULT_IDLE_MINUTES
+    return int(minutes * 60)
+
+
+def log_event(message):
+    path = STATE / "events.log"
+    try:
+        if path.exists() and path.stat().st_size > 256_000:
+            write_text_atomic(path, "\n".join(path.read_text().splitlines()[-1000:]) + "\n")
+        with path.open("a") as log:
+            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{os.getpid()}] {message}\n")
+    except OSError:
+        pass
+
+
 def touch_activity():
     (STATE / "last-used").touch(mode=0o600)
 
 
-def write_json(path, data):
+def write_text_atomic(path, text):
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("x") as output:
             os.chmod(temporary, 0o600)
-            json.dump(data, output)
-            output.write("\n")
+            output.write(text)
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def active_connections(clean=False):
-    busy = 0
+def write_json(path, data):
+    write_text_atomic(path, json.dumps(data) + "\n")
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        return default
+
+
+def open_lease(kind):
+    leases = STATE / "connections"
+    leases.mkdir(exist_ok=True, mode=0o700)
+    path = leases / str(os.getpid())
+    lease = path.open("w")
+    fcntl.flock(lease, fcntl.LOCK_EX)
+    lease.write(kind + "\n")
+    lease.flush()
+    return path, lease
+
+
+def transports(clean=False):
+    """Kinds of the SSH transports open over the forward, from their leases."""
+    kinds = []
     leases = STATE / "connections"
     leases.mkdir(exist_ok=True, mode=0o700)
     for path in leases.iterdir():
         try:
-            with path.open("a") as lease:
+            with path.open() as lease:
                 try:
                     fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
-                    busy += 1
+                    # A lease still being written is an unknown, so it holds.
+                    kinds.append(lease.read().strip() or "ssh")
                     continue
                 if clean:
                     path.unlink(missing_ok=True)
         except FileNotFoundError:
             pass
-    # Also protect connections opened before lease tracking was installed.
-    sockets = capture(["/usr/sbin/lsof", "-nP", "-a", "-u", str(os.getuid()),
-                       f"-iTCP:{PORT}", "-sTCP:ESTABLISHED", "-Fn"]).stdout
-    return max(busy, sum(line.startswith(f"n127.0.0.1:{PORT}->") for line in sockets.splitlines()))
+    return kinds
+
+
+def watcher_alive():
+    try:
+        with (STATE / "idle.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+    except BlockingIOError:
+        return True
 
 
 def ensure_idle_watch():
-    subprocess.Popen([str(SELF), "idle"], stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    if not watcher_alive():
+        subprocess.Popen([str(SELF), "idle"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
-def idle_watch():
-    with (STATE / "idle.lock").open("w") as lock:
+def mutagen(*args, timeout=30):
+    # Under a Mutagen-spawned ssh, MUTAGEN_PROMPTER turns the mutagen binary
+    # into an askpass helper that rejects every command, so drop it. Never
+    # autostart a daemon: a stopped daemon has no sessions to manage.
+    env = {key: value for key, value in os.environ.items()
+           if key not in ("MUTAGEN_PROMPTER", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE")}
+    return subprocess.run([MUTAGEN, *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          timeout=timeout, env={**env, "MUTAGEN_DISABLE_AUTOSTART": "1"})
+
+
+_routes = {}
+
+
+def routes_through_vpn(host):
+    if host not in _routes:
+        try:
+            config = capture([SSH, "-G", host]).stdout
+        except (OSError, subprocess.SubprocessError):
+            config = ""
+        _routes[host] = any(line.startswith("proxycommand ") and "seasnet-vpn proxy " in line
+                            for line in config.splitlines())
+    return _routes[host]
+
+
+def tunnel_sessions(attempts=1):
+    """Mutagen sessions whose remote endpoint is reached through this forward."""
+    data = None
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(2)  # Ride out a daemon restart.
+        try:
+            result = mutagen("sync", "list", "--template", "{{json .}}")
+            data = json.loads(result.stdout or "[]") if result.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            data = None
+        if isinstance(data, list):
+            break
+    if not isinstance(data, list):
+        return None
+    sessions = []
+    for session in data:
+        if not isinstance(session, dict):
+            continue
+        alpha, beta = session.get("alpha") or {}, session.get("beta") or {}
+        if (beta.get("protocol") == "ssh" and alpha.get("protocol") == "local"
+                and isinstance(beta.get("host"), str) and routes_through_vpn(beta["host"])):
+            sessions.append(session)
+    return sessions
+
+
+def ignored(relative, name, is_dir, patterns):
+    hit = False
+    for raw in patterns:
+        negate = raw.startswith("!")
+        pattern = raw[1:] if negate else raw
+        if pattern.endswith("/") and not is_dir:
+            continue
+        pattern = pattern.rstrip("/")
+        if "/" in pattern:
+            match = fnmatch.fnmatchcase(relative, pattern.lstrip("/"))
+        else:
+            match = fnmatch.fnmatchcase(name, pattern)
+        if match:
+            hit = not negate
+    return hit
+
+
+def newest_change(root, patterns):
+    """Newest mtime among synced entries. Directory mtimes cover deletions, and
+    Mutagen writes remote edits locally, so both sync directions register."""
+    try:
+        newest = os.stat(root).st_mtime
+    except OSError:
+        return 0.0
+    seen = 0
+    stack = [(root, "")]
+    while stack:
+        path, prefix = stack.pop()
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    relative = prefix + entry.name
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        if ignored(relative, entry.name, is_dir, patterns):
+                            continue
+                        newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
+                    except OSError:
+                        continue
+                    seen += 1
+                    if seen >= SCAN_LIMIT:
+                        return newest
+                    if is_dir:
+                        stack.append((entry.path, relative + "/"))
+        except OSError:
+            continue
+    return newest
+
+
+def idle_state():
+    """Seconds since the last real use, and the non-Mutagen transports holding it."""
+    holders = [kind for kind in transports(clean=True) if kind != "mutagen"]
+    if holders:
+        touch_activity()
+        return 0, holders
+    activity = STATE / "last-used"
+    if not activity.exists():
+        touch_activity()
+    last = activity.stat().st_mtime
+    for session in tunnel_sessions() or []:
+        if session.get("paused"):
+            continue  # Paused sessions sync nothing, so their edits cannot hold the tunnel.
+        root = (session.get("alpha") or {}).get("path")
+        patterns = [p for p in (session.get("ignore") or {}).get("paths") or [] if isinstance(p, str)]
+        if isinstance(root, str):
+            last = max(last, newest_change(root, patterns))
+    return max(0, time.time() - last), []
+
+
+def pause_sync(reason):
+    sessions = tunnel_sessions(attempts=3)
+    if sessions is None:
+        log_event(f"{reason}: could not list Mutagen sessions; nothing paused")
+        return
+    paused = set(read_json(STATE / "paused-sync.json", []))
+    for session in sessions:
+        if session.get("paused"):
+            continue
+        identifier, name = session.get("identifier"), session.get("name")
+        try:
+            result = mutagen("sync", "pause", identifier)
+        except (OSError, subprocess.SubprocessError) as error:
+            log_event(f"{reason}: pausing {name} failed: {error}")
+            continue
+        if result.returncode == 0:
+            paused.add(identifier)
+            log_event(f"{reason}: paused Mutagen session {name}")
+        else:
+            log_event(f"{reason}: pausing {name} failed: {result.stderr.strip()[:200]}")
+    write_json(STATE / "paused-sync.json", sorted(paused))
+
+
+def resume_sync():
+    """Resume the sessions this helper paused, and only those."""
+    paused = read_json(STATE / "paused-sync.json", [])
+    if not paused:
+        return
+    sessions = {s.get("identifier"): s for s in tunnel_sessions() or []}
+    for identifier in paused:
+        session = sessions.get(identifier)
+        if not session or not session.get("paused"):
+            continue
+        try:
+            result = mutagen("sync", "resume", identifier, timeout=30)
+            outcome = "resumed" if result.returncode == 0 else f"resume failed: {result.stderr.strip()[:200]}"
+        except (OSError, subprocess.SubprocessError) as error:
+            outcome = f"resume failed: {error}"
+        log_event(f"{outcome} Mutagen session {session.get('name')}")
+    (STATE / "paused-sync.json").unlink(missing_ok=True)
+
+
+def pause_after_refusal():
+    with (STATE / "pause.lock").open("w") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
-        (STATE / "idle.pid").write_text(str(os.getpid()) + "\n")
-        try:
-            while True:
-                try:
-                    with control_lock():
-                        if not owned_pid():
-                            # Release the watcher lock before startup can obtain
-                            # control.lock and launch its replacement watcher.
-                            (STATE / "idle.pid").unlink(missing_ok=True)
-                            fcntl.flock(lock, fcntl.LOCK_UN)
-                            return 0
-                        # Persistent Mutagen watchers are active use even when
-                        # no files are changing. Keep their transport alive;
-                        # idle expiry starts only after every transport closes.
-                        if active_connections(clean=True):
-                            touch_activity()
-                        else:
-                            activity = STATE / "last-used"
-                            if not activity.exists():
-                                touch_activity()
-                            elif time.time() - activity.stat().st_mtime >= IDLE_SECONDS:
-                                if stop() == 0:
-                                    (STATE / "idle.pid").unlink(missing_ok=True)
-                                    fcntl.flock(lock, fcntl.LOCK_UN)
-                                    return 0
-                except RuntimeError:
-                    pass
-                time.sleep(15)
-        finally:
-            path = STATE / "idle.pid"
-            if path.exists() and path.read_text().strip() == str(os.getpid()):
-                path.unlink(missing_ok=True)
+        time.sleep(1)  # Let the refused ssh exit before asking the daemon to pause.
+        if not tunnel_up():
+            pause_sync("tunnel down")
     return 0
+
+
+def record_login(connected):
+    path = STATE / "login-failures.json"
+    if connected:
+        path.unlink(missing_ok=True)
+        return
+    count = read_json(path, {}).get("count", 0) + 1
+    write_json(path, {"count": count, "last": time.time()})
+    log_event(f"VPN start failed or was cancelled ({count} in a row)")
+
+
+def login_cooldown():
+    data = read_json(STATE / "login-failures.json", {})
+    count, last = data.get("count", 0), data.get("last", 0)
+    if not count:
+        return None
+    remaining = last + min(60 * 2 ** (count - 1), LOGIN_COOLDOWN_MAX) - time.time()
+    if remaining <= 0:
+        return None
+    return (f"seasnet-vpn: the last {count} VPN login attempt(s) failed or were cancelled, so SSH "
+            f"will not reopen UCLA login for {math.ceil(remaining / 60)} more minute(s). "
+            "Run `seasnet-vpn start` to try now.")
 
 
 def build_login():
@@ -190,7 +429,7 @@ def login_cancelled():
 
 def attempt_current(attempt):
     if attempt is None:  # Explicit browser-login diagnostic invocation.
-        return True
+        return has_tty()
     try:
         return json.loads((STATE / "login-attempt.json").read_text()).get("id") == attempt
     except (FileNotFoundError, ValueError):
@@ -199,6 +438,53 @@ def attempt_current(attempt):
 
 def capture(args):
     return subprocess.run(args, capture_output=True, text=True, timeout=15)
+
+
+def has_tty():
+    try:
+        os.close(os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY))
+        return True
+    except OSError:
+        return False
+
+
+def agent_context():
+    """Commands from Claude/cua agents, including the pty MCP's tmux session."""
+    if os.environ.get("CLAUDECODE") or os.environ.get("CUA_AGENT_ID"):
+        return True
+    pane = os.environ.get("TMUX_PANE")
+    if not (pane and os.environ.get("TMUX")):
+        return False
+    try:
+        session = capture([TMUX, "display-message", "-p", "-t", pane, "#{session_name}"]).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return session == AGENT_TMUX_SESSION
+
+
+def caller_kind():
+    """How the ssh that ran this ProxyCommand was started."""
+    try:
+        parent = capture(["/bin/ps", "-ww", "-p", str(os.getppid()), "-o", "args="]).stdout
+    except (OSError, subprocess.SubprocessError):
+        parent = ""
+    if "mutagen-agent" in parent:
+        return "mutagen"
+    if re.search(r"batchmode\s*[= ]\s*yes", parent, re.IGNORECASE):
+        return "batch"
+    if agent_context():
+        return "agent"
+    return "interactive" if has_tty() else "batch"
+
+
+REFUSALS = {
+    "mutagen": "seasnet-vpn: the VPN is down. Background Mutagen sync never opens UCLA login, so its "
+               "seasnet sessions are paused until you run `seasnet-vpn start` or `ssh seasnet`.",
+    "agent": "seasnet-vpn: the VPN is down. This SSH came from an agent, so no UCLA login opens. "
+             "Ask Mack to run `seasnet-vpn start` in his terminal.",
+    "batch": "seasnet-vpn: the VPN is down. This SSH has no terminal (or uses BatchMode), so no UCLA "
+             "login opens. Run `seasnet-vpn start` in a terminal first.",
+}
 
 
 def process(pid):
@@ -211,17 +497,25 @@ def process(pid):
     return " ".join([info[0], info[1], executable, info[2]])
 
 
+def ours(pid):
+    """'openconnect' or 'ocproxy' when pid is this forward's daemon or proxy."""
+    info = process(pid).split(None, 3)
+    if len(info) != 4 or int(info[0]) != os.getuid():
+        return None
+    name, args = Path(info[2]).name, shlex.split(info[3])
+    if name == "openconnect" and str(PIDFILE) in args:
+        return name
+    if name == "ocproxy" and args[1:] == ["-L", f"{PORT}:{TARGET}:22", "-k", "30"]:
+        return name
+    return None
+
+
 def owned_pid():
     try:
         pid = int(PIDFILE.read_text().strip())
     except (FileNotFoundError, ValueError):
         return None
-    info = process(pid).split(None, 3)
-    if (len(info) == 4 and int(info[0]) == os.getuid()
-            and Path(info[2]).name == "openconnect"
-            and str(PIDFILE) in shlex.split(info[3])):
-        return pid
-    return None
+    return pid if ours(pid) == "openconnect" else None
 
 
 def listener_ready():
@@ -236,14 +530,43 @@ def listener_ready():
         elif line.startswith("c"):
             command = line[1:]
         elif line.startswith("n") and line[1:] == f"127.0.0.1:{PORT}" and command == "ocproxy":
-            info = process(listener_pid).split(None, 3)
             # OpenConnect's daemon fork can reparent ocproxy. Verify its actual
             # executable, owner and fixed destination rather than its parent PID.
-            if len(info) == 4 and int(info[0]) == os.getuid() and Path(info[2]).name == "ocproxy":
-                args = shlex.split(info[3])
-                if args[1:] == ["-L", f"{PORT}:{TARGET}:22", "-k", "30"]:
-                    return True
+            if ours(listener_pid) == "ocproxy":
+                return True
     return False
+
+
+def tunnel_up():
+    return bool(owned_pid() and listener_ready())
+
+
+def strays():
+    """This forward's openconnect/ocproxy processes that the pidfile lost track of."""
+    output = capture(["/bin/ps", "-x", "-ww", "-U", str(os.getuid()), "-o", "pid=,args="]).stdout
+    pids = []
+    for line in output.splitlines():
+        fields = line.split(None, 1)
+        if (len(fields) == 2 and ("openconnect" in fields[1] or "ocproxy" in fields[1])
+                and int(fields[0]) != os.getpid() and ours(int(fields[0]))):
+            pids.append(int(fields[0]))
+    return pids
+
+
+def kill_strays():
+    pids = strays()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    for _ in range(25):
+        if not any(ours(pid) for pid in pids):
+            break
+        time.sleep(0.2)
+    if pids:
+        log_event(f"terminated stray VPN processes {pids}")
+    return pids
 
 
 def snapshot():
@@ -295,8 +618,6 @@ def browser_login(url):
         return 1
     request_id = str(uuid.uuid4())
     write_json(STATE / "login-request.json", {"id": request_id, "url": url, "attempt": attempt})
-    launcher = Path.home() / ".local/bin/cua-bg-launch"
-    driver = Path.home() / ".local/bin/cua-driver"
     session = f"seasnet-login-{uuid.uuid4().hex[:10]}"
     session_started = False
     try:
@@ -304,10 +625,11 @@ def browser_login(url):
         if not attempt_current(attempt) or login_cancelled():
             write_login_result("failed", request_id=request_id)
             return 1
-        subprocess.run([str(driver), "start_session", json.dumps({"session": session, "capture_scope": "window"})],
+        subprocess.run([str(DRIVER), "start_session", json.dumps({"session": session, "capture_scope": "window"})],
                        check=True, capture_output=True, timeout=15)
         session_started = True
-        result = subprocess.run([str(launcher), "SEASnet VPN Login"], capture_output=True, text=True, timeout=90)
+        log_event("opening SEASnet VPN Login for an interactive start")
+        result = subprocess.run([str(LAUNCHER), "SEASnet VPN Login"], capture_output=True, text=True, timeout=90)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
         write_login_result("failed", request_id=request_id)
         print("The login window could not be prepared safely. Check the diagnostic log and retry.",
@@ -316,7 +638,7 @@ def browser_login(url):
     finally:
         if session_started:
             try:
-                subprocess.run([str(driver), "end_session", json.dumps({"session": session})], capture_output=True, timeout=15)
+                subprocess.run([str(DRIVER), "end_session", json.dumps({"session": session})], capture_output=True, timeout=15)
             except (OSError, subprocess.SubprocessError):
                 pass
     if result.returncode not in (0, 2):
@@ -350,19 +672,33 @@ def start(username=None, terminal_auth=False):
         if listener_ready():
             touch_activity()
             ensure_idle_watch()
+            resume_sync()
             print(f"Already connected: 127.0.0.1:{PORT} -> {TARGET}:22 (PID {pid}).")
             return 0
         print("VPN process exists but its forward is unavailable. Run seasnet-vpn stop first.", file=sys.stderr)
+        return 1
+    # The single gate in front of every UCLA login: a person at a terminal.
+    if not has_tty():
+        print("seasnet-vpn: refusing to open UCLA login without a terminal. Run `seasnet-vpn start` "
+              "in your terminal.", file=sys.stderr)
+        return 1
+    if agent_context() and not os.environ.get("SEASNET_VPN_ALLOW_AGENT_LOGIN"):
+        print("seasnet-vpn: refusing to open UCLA login for an agent. Ask Mack to run "
+              "`seasnet-vpn start` in his terminal.", file=sys.stderr)
         return 1
     if terminal_auth and not sys.stdin.isatty():
         print("Start in your terminal for private UCLA login and Duo: seasnet-vpn start", file=sys.stderr)
         return 1
     with socket.socket() as check:
+        # Without SO_REUSEADDR, closed connections in TIME_WAIT make a restart
+        # within ~30 s of a disconnect look like a foreign listener.
+        check.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             check.bind(("127.0.0.1", PORT))
         except OSError:
-            print(f"Port {PORT} is already occupied; refusing to reuse it.", file=sys.stderr)
-            return 1
+            if not kill_strays():
+                print(f"Port {PORT} is already occupied; refusing to reuse it.", file=sys.stderr)
+                return 1
     BASELINE.write_text(json.dumps(snapshot(), indent=2) + "\n")
     PIDFILE.unlink(missing_ok=True)
     (STATE / "login-request.json").unlink(missing_ok=True)
@@ -376,7 +712,7 @@ def start(username=None, terminal_auth=False):
     if terminal_auth:
         args.append("--no-external-auth")
     else:
-        args.extend(["--external-browser", str(Path(__file__).resolve())])
+        args.extend(["--external-browser", str(SELF)])
     if username:
         args.extend(["--user", username])
     args.append("https://ssl.vpn.ucla.edu")
@@ -424,6 +760,9 @@ def start(username=None, terminal_auth=False):
                 ensure_idle_watch()
                 write_login_result("connected", attempt=attempt)
                 connected = True
+                record_login(True)
+                log_event(f"connected (openconnect PID {pid})")
+                resume_sync()
                 return 0
             time.sleep(0.2)
         print("VPN started but the restricted forward is unavailable; stopping it.", file=sys.stderr)
@@ -432,6 +771,7 @@ def start(username=None, terminal_auth=False):
         if not connected:
             try:
                 write_login_result("failed", attempt=attempt)
+                record_login(False)
             except (OSError, ValueError, KeyError):
                 # A diagnostic write must not prevent auth/daemon cleanup.
                 pass
@@ -455,6 +795,7 @@ def stop():
     pid = owned_pid()
     if not pid:
         (STATE / "login-attempt.json").unlink(missing_ok=True)
+        kill_strays()
         print("No owned seasnet VPN process is running.")
         return 0
     os.kill(pid, signal.SIGTERM)
@@ -462,11 +803,51 @@ def stop():
         if not owned_pid():
             PIDFILE.unlink(missing_ok=True)
             (STATE / "login-attempt.json").unlink(missing_ok=True)
+            kill_strays()
+            log_event("disconnected")
             print("Disconnected.")
             return 0
         time.sleep(0.2)
     print("Shutdown is still in progress; inspect seasnet-vpn status.", file=sys.stderr)
     return 1
+
+
+def idle_watch():
+    with (STATE / "idle.lock").open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        (STATE / "idle.pid").write_text(str(os.getpid()) + "\n")
+        try:
+            while True:
+                try:
+                    with control_lock():
+                        if not owned_pid():
+                            # Release the watcher lock before startup can obtain
+                            # control.lock and launch its replacement watcher.
+                            (STATE / "idle.pid").unlink(missing_ok=True)
+                            fcntl.flock(lock, fcntl.LOCK_UN)
+                            return 0
+                        # Wall-clock comparison, so a sleep or hibernate longer
+                        # than the limit expires on the first check after wake.
+                        idle, _ = idle_state()
+                        if idle >= idle_seconds():
+                            log_event(f"idle {int(idle // 60)} min; pausing seasnet sync and disconnecting")
+                            pause_sync("idle")
+                            if (not any(kind != "mutagen" for kind in transports(clean=True))
+                                    and stop() == 0):
+                                (STATE / "idle.pid").unlink(missing_ok=True)
+                                fcntl.flock(lock, fcntl.LOCK_UN)
+                                return 0
+                except RuntimeError:
+                    pass
+                time.sleep(CHECK_SECONDS)
+        finally:
+            path = STATE / "idle.pid"
+            if path.exists() and path.read_text().strip() == str(os.getpid()):
+                path.unlink(missing_ok=True)
+    return 0
 
 
 def proxy(host, port):
@@ -477,30 +858,87 @@ def proxy(host, port):
         raise KeyboardInterrupt
     for signum in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, interrupted)
-    leases = STATE / "connections"
-    leases.mkdir(exist_ok=True, mode=0o700)
-    path = leases / str(os.getpid())
-    with control_lock(wait=True), redirect_stdout(sys.stderr):
-        if not owned_pid() or not listener_ready():
-            if owned_pid():
-                stop()
-            if start():
-                return 1
-        lease = path.open("w")
-        fcntl.flock(lease, fcntl.LOCK_EX)
-        touch_activity()
-        ensure_idle_watch()
+    kind = caller_kind()
+    if not tunnel_up():
+        if kind != "interactive":
+            print(REFUSALS[kind], file=sys.stderr)
+            log_event(f"refused {kind} SSH: VPN is down")
+            if kind == "mutagen":
+                # Pausing stops Mutagen's ~20 s retry loop. Detached, because the
+                # daemon is waiting on this very connection attempt.
+                subprocess.Popen([str(SELF), "pause-sync"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return 1
+        cooldown = login_cooldown()
+        if cooldown:
+            print(cooldown, file=sys.stderr)
+            return 1
+        with control_lock(wait=True), redirect_stdout(sys.stderr):
+            if not tunnel_up():
+                if owned_pid():
+                    stop()
+                if start():
+                    return 1
+    # Riding an open tunnel takes no lock, so Mutagen resumes during a start
+    # and connections never queue behind someone's pending login.
+    path, lease = open_lease(kind)
     client = None
     try:
+        if not owned_pid():  # The idle watcher disconnected before the lease existed.
+            print("seasnet-vpn: the VPN disconnected while this SSH was starting; retry.", file=sys.stderr)
+            return 1
+        if kind != "mutagen":
+            touch_activity()
+        ensure_idle_watch()
         client = subprocess.Popen(["/usr/bin/nc", "127.0.0.1", str(PORT)])
-        return client.wait()
+        while True:
+            try:
+                return client.wait(timeout=CHECK_SECONDS)
+            except subprocess.TimeoutExpired:
+                ensure_idle_watch()  # Replace a watcher that died (kill, crash) mid-session.
     finally:
         if client is not None and client.poll() is None:
             client.terminate()
             client.wait(timeout=5)
-        touch_activity()
+        if kind != "mutagen":
+            touch_activity()
         path.unlink(missing_ok=True)
         lease.close()
+
+
+def status():
+    pid = owned_pid()
+    ready = bool(pid and listener_ready())
+    limit = idle_seconds() // 60
+    print(f"{'Connected' if ready else 'Disconnected'}: restricted forward to {TARGET}:22.")
+    if ready:
+        kinds = transports()
+        idle, holders = idle_state()
+        if holders:
+            print(f"Held open by {len(holders)} SSH session(s); idle timer is reset while they stay open.")
+        else:
+            print(f"Idle {int(idle // 60)} of {limit} min "
+                  f"(Mutagen transports open: {kinds.count('mutagen')}; they do not count as use).")
+        print(f"Idle watcher: {'running' if watcher_alive() else 'NOT running'}.")
+    else:
+        stray = strays()
+        if stray:
+            print(f"Stray VPN processes without a pidfile: {stray}. `seasnet-vpn stop` cleans them up.")
+    print(f"Disconnects after {limit} min with no SSH session besides Mutagen and no synced file changes.")
+    paused = read_json(STATE / "paused-sync.json", [])
+    if paused:
+        names = {s.get("identifier"): s.get("name") for s in tunnel_sessions() or []}
+        print("Mutagen sessions paused by this helper (resume on next start): "
+              + ", ".join(names.get(i, i) for i in paused))
+    cooldown = login_cooldown()
+    if cooldown:
+        print(cooldown.removeprefix("seasnet-vpn: "))
+    events = STATE / "events.log"
+    if events.exists():
+        print("Recent events:")
+        for line in events.read_text().splitlines()[-5:]:
+            print(f"  {line}")
+    return 0 if ready else 1
 
 
 def main():
@@ -517,19 +955,11 @@ def main():
     if command == "proxy" and len(sys.argv) == 4:
         return proxy(*sys.argv[2:])
     if command == "status" and len(sys.argv) == 2:
-        pid = owned_pid()
-        ready = bool(pid and listener_ready())
-        print(f"{'Connected' if ready else 'Disconnected'}: restricted forward to {TARGET}:22.")
-        if ready:
-            count = active_connections()
-            if count:
-                print(f"{count} SSH transport(s) open, including any background sync; idle timer is held.")
-            else:
-                print("No SSH transports open; idle timer is running.")
-            print("Disconnects after 15 minutes with all SSH/Mutagen transports closed.")
-        return 0 if ready else 1
+        return status()
     if command == "idle" and len(sys.argv) == 2:
         return idle_watch()
+    if command == "pause-sync" and len(sys.argv) == 2:
+        return pause_after_refusal()
     if command == "build-login" and len(sys.argv) == 2:
         build_login()
         return 0
@@ -539,10 +969,14 @@ def main():
     terminal_auth = "--terminal" in remaining
     if terminal_auth:
         remaining.remove("--terminal")
-    if (command == "start" and len(remaining) <= 1
-            or command == "stop" and not remaining and not terminal_auth):
+    if command == "start" and len(remaining) <= 1:
         with control_lock():
-            return start(remaining[0] if remaining else None, terminal_auth) if command == "start" else stop()
+            return start(remaining[0] if remaining else None, terminal_auth)
+    if command == "stop" and not remaining and not terminal_auth:
+        with control_lock():
+            # Pause first, or Mutagen reconnects the moment the tunnel drops.
+            pause_sync("manual stop")
+            return stop()
     print("Unknown command or invalid arguments.", file=sys.stderr)
     return 2
 

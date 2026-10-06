@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -43,6 +44,9 @@ class LifecycleTests(unittest.TestCase):
 
     def auth_context(self, auth, owned=None):
         contexts = [patch.object(vpn, "snapshot", return_value={}),
+                    patch.object(vpn, "has_tty", return_value=True),
+                    patch.object(vpn, "agent_context", return_value=False),
+                    patch.object(vpn, "resume_sync"),
                     patch.object(vpn, "owned_pid", owned or Mock(return_value=None)),
                     patch.object(vpn.subprocess, "Popen", return_value=auth),
                     patch.object(vpn, "stop", return_value=0)]
@@ -181,57 +185,185 @@ class LifecycleTests(unittest.TestCase):
         self.assertLess(events.index("idle-unlock"), events.index("control-exit"))
         self.assertFalse((self.state / "idle.pid").exists())
 
-    def test_real_lease_protects_connection_then_cleans(self):
+    def hold_lease(self, kind):
         leases = self.state / "connections"
-        leases.mkdir()
-        lease = leases / "child"
-        script = "import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); sys.stdin.read()"
-        child = subprocess.Popen([sys.executable, "-c", script, str(lease)], stdin=subprocess.PIPE,
+        leases.mkdir(exist_ok=True)
+        lease = leases / kind
+        script = ("import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); "
+                  "f.write(sys.argv[2]+'\\n'); f.flush(); print('ready',flush=True); sys.stdin.read()")
+        child = subprocess.Popen([sys.executable, "-c", script, str(lease), kind], stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, text=True)
-        try:
-            self.assertEqual(child.stdout.readline().strip(), "ready")
-            with patch.object(vpn, "capture", return_value=Mock(stdout="")):
-                self.assertEqual(vpn.active_connections(clean=True), 1)
-                self.assertTrue(lease.exists())
-                child.communicate(timeout=5)
-                self.assertEqual(vpn.active_connections(clean=True), 0)
-                self.assertFalse(lease.exists())
-        finally:
-            if child.poll() is None:
-                child.terminate()
-                child.communicate(timeout=5)
+        self.addCleanup(lambda: child.poll() is None and (child.terminate(), child.communicate(timeout=5)))
+        self.assertEqual(child.stdout.readline().strip(), "ready")
+        return child, lease
 
-    def test_idle_expiry_retries_incomplete_shutdown(self):
+    def test_real_lease_protects_connection_then_cleans(self):
+        child, lease = self.hold_lease("ssh")
+        self.assertEqual(vpn.transports(clean=True), ["ssh"])
+        self.assertTrue(lease.exists())
+        child.communicate(timeout=5)
+        self.assertEqual(vpn.transports(clean=True), [])
+        self.assertFalse(lease.exists())
+
+    def test_mutagen_transport_does_not_hold_idle_timer(self):
+        self.hold_lease("mutagen")
         activity = self.state / "last-used"
         activity.touch()
         os.utime(activity, (0, 0))
-        clock = SimpleNamespace(time=lambda: 1000, sleep=Mock())
-        with patch.object(vpn, "owned_pid", return_value=88), \
-                patch.object(vpn, "active_connections", return_value=0), \
-                patch.object(vpn, "stop", side_effect=[1, 0]) as stop, \
-                patch.object(vpn, "control_lock", return_value=nullcontext()), \
-                patch.object(vpn, "time", clock):
-            self.assertEqual(vpn.idle_watch(), 0)
-        self.assertEqual(stop.call_count, 2)
-        clock.sleep.assert_called_once_with(15)
+        with patch.object(vpn, "tunnel_sessions", return_value=[]):
+            idle, holders = vpn.idle_state()
+        self.assertEqual(holders, [])
+        self.assertGreater(idle, 10**8)
+        self.hold_lease("interactive")
+        with patch.object(vpn, "tunnel_sessions", return_value=[]):
+            self.assertEqual(vpn.idle_state(), (0, ["interactive"]))
+        self.assertGreater(activity.stat().st_mtime, 0)
 
-    def test_active_lease_refreshes_idle_before_later_expiry(self):
+    def test_synced_file_change_is_activity_but_ignored_and_paused_are_not(self):
+        root = self.state / "project"
+        (root / ".git").mkdir(parents=True)
+        (root / "src").mkdir()
+        (root / "src/main.c").write_text("int main;")
         activity = self.state / "last-used"
         activity.touch()
-        os.utime(activity, (0, 0))
+        for path in (activity, root, root / ".git", root / "src", root / "src/main.c"):
+            os.utime(path, (0, 0))
+        (root / ".git/index").write_text("noise")  # ignored path, new mtime
+        session = {"alpha": {"path": str(root)}, "ignore": {"paths": [".git/"]}}
+        os.utime(root / ".git", (0, 0))
+        os.utime(root, (0, 0))
+        with patch.object(vpn, "tunnel_sessions", return_value=[session]):
+            self.assertGreater(vpn.idle_state()[0], 10**8)
+            os.utime(root / "src/main.c", None)
+            self.assertLess(vpn.idle_state()[0], 60)
+        with patch.object(vpn, "tunnel_sessions", return_value=[{**session, "paused": True}]):
+            self.assertGreater(vpn.idle_state()[0], 10**8)
 
-        def sleep(_):
-            self.assertGreater(activity.stat().st_mtime, 0)
-            os.utime(activity, (0, 0))
+    def test_ignore_patterns_follow_mutagen_shapes(self):
+        patterns = [".git/", "__pycache__/", ".DS_Store", "/build", "*.o", "!keep.o"]
+        self.assertTrue(vpn.ignored(".git", ".git", True, patterns))
+        self.assertFalse(vpn.ignored(".git", ".git", False, patterns))
+        self.assertTrue(vpn.ignored("a/b/__pycache__", "__pycache__", True, patterns))
+        self.assertTrue(vpn.ignored("x/.DS_Store", ".DS_Store", False, patterns))
+        self.assertTrue(vpn.ignored("build", "build", True, patterns))
+        self.assertFalse(vpn.ignored("src/build", "build", True, patterns))
+        self.assertTrue(vpn.ignored("src/a.o", "a.o", False, patterns))
+        self.assertFalse(vpn.ignored("src/keep.o", "keep.o", False, patterns))
 
-        clock = SimpleNamespace(time=lambda: 1000, sleep=sleep)
+    def test_idle_expiry_pauses_sync_then_retries_incomplete_shutdown(self):
+        events = []
+        clock = SimpleNamespace(time=lambda: 1000, strftime=time.strftime, sleep=Mock())
         with patch.object(vpn, "owned_pid", return_value=88), \
-                patch.object(vpn, "active_connections", side_effect=[1, 0]), \
-                patch.object(vpn, "stop", return_value=0) as stop, \
+                patch.object(vpn, "idle_state", return_value=(4000, [])), \
+                patch.object(vpn, "transports", return_value=["mutagen"]), \
+                patch.object(vpn, "pause_sync", side_effect=lambda reason: events.append("pause")), \
+                patch.object(vpn, "stop", side_effect=lambda: events.append("stop") or len(events) < 4), \
                 patch.object(vpn, "control_lock", return_value=nullcontext()), \
                 patch.object(vpn, "time", clock):
             self.assertEqual(vpn.idle_watch(), 0)
-        stop.assert_called_once()
+        self.assertEqual(events, ["pause", "stop", "pause", "stop"])
+        clock.sleep.assert_called_once_with(vpn.CHECK_SECONDS)
+
+    def test_active_session_is_not_stopped(self):
+        clock = SimpleNamespace(time=lambda: 1000, strftime=time.strftime, sleep=Mock(side_effect=[None, StopIteration]))
+        with patch.object(vpn, "owned_pid", return_value=88), \
+                patch.object(vpn, "idle_state", return_value=(0, ["interactive"])), \
+                patch.object(vpn, "pause_sync") as pause, patch.object(vpn, "stop") as stop, \
+                patch.object(vpn, "control_lock", return_value=nullcontext()), \
+                patch.object(vpn, "time", clock):
+            with self.assertRaises(StopIteration):
+                vpn.idle_watch()
+        pause.assert_not_called()
+        stop.assert_not_called()
+
+    def test_idle_minutes_config_and_env(self):
+        config = self.state / "config.toml"
+        with patch.object(vpn, "CONFIG", config), patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SEASNET_VPN_IDLE_MINUTES", None)
+            self.assertEqual(vpn.idle_seconds(), vpn.DEFAULT_IDLE_MINUTES * 60)
+            config.write_text("idle_minutes = 45\n")
+            self.assertEqual(vpn.idle_seconds(), 2700)
+            config.write_text("idle_minutes = -1\n")
+            self.assertEqual(vpn.idle_seconds(), vpn.DEFAULT_IDLE_MINUTES * 60)
+            os.environ["SEASNET_VPN_IDLE_MINUTES"] = "0.5"
+            self.assertEqual(vpn.idle_seconds(), 30)
+
+    def proxy_context(self, kind, up=False):
+        contexts = [patch.object(vpn, "caller_kind", return_value=kind),
+                    patch.object(vpn, "tunnel_up", return_value=up),
+                    patch.object(vpn.signal, "signal")]
+        mocks = [context.start() for context in contexts]
+        for context in contexts:
+            self.addCleanup(context.stop)
+        return mocks
+
+    def test_background_ssh_never_starts_login(self):
+        for kind in ("mutagen", "agent", "batch"):
+            self.proxy_context(kind)
+            errors = io.StringIO()
+            with patch.object(vpn, "start") as start, patch.object(vpn.subprocess, "Popen") as popen, \
+                    redirect_stderr(errors):
+                self.assertEqual(vpn.proxy(vpn.TARGET, "22"), 1)
+            start.assert_not_called()
+            self.assertIn("no UCLA login opens" if kind != "mutagen" else "never opens UCLA login",
+                          errors.getvalue())
+            if kind == "mutagen":  # Only Mutagen's sessions get paused, detached.
+                self.assertEqual(popen.call_args.args[0][1:], ["pause-sync"])
+                self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            else:
+                popen.assert_not_called()
+
+    def test_failed_logins_back_off_automatic_prompts(self):
+        self.proxy_context("interactive")
+        for _ in range(3):
+            vpn.record_login(False)
+        errors = io.StringIO()
+        with patch.object(vpn, "start") as start, redirect_stderr(errors):
+            self.assertEqual(vpn.proxy(vpn.TARGET, "22"), 1)
+        start.assert_not_called()
+        self.assertIn("seasnet-vpn start", errors.getvalue())
+        failures = json.loads((self.state / "login-failures.json").read_text())
+        self.assertEqual(failures["count"], 3)
+        vpn.write_json(self.state / "login-failures.json", {"count": 3, "last": failures["last"] - 241})
+        self.assertIsNone(vpn.login_cooldown())  # 4 min cooldown after three failures
+        vpn.record_login(True)
+        self.assertFalse((self.state / "login-failures.json").exists())
+
+    def test_start_refuses_without_terminal_or_for_agents(self):
+        with patch.object(vpn, "owned_pid", return_value=None), \
+                patch.object(vpn.subprocess, "Popen") as popen, redirect_stderr(io.StringIO()):
+            with patch.object(vpn, "has_tty", return_value=False):
+                self.assertEqual(vpn.start(), 1)
+            with patch.object(vpn, "has_tty", return_value=True), \
+                    patch.object(vpn, "agent_context", return_value=True), \
+                    patch.dict(os.environ, {"SEASNET_VPN_ALLOW_AGENT_LOGIN": ""}):
+                self.assertEqual(vpn.start(), 1)
+        popen.assert_not_called()
+        self.assertFalse((self.state / "login-attempt.json").exists())
+
+    def test_diagnostic_browser_login_needs_terminal(self):
+        with patch.object(vpn, "has_tty", return_value=False), patch.object(vpn, "build_login") as build, \
+                patch.dict(os.environ, {"SEASNET_VPN_LOGIN_ATTEMPT": ""}), redirect_stderr(io.StringIO()):
+            os.environ.pop("SEASNET_VPN_LOGIN_ATTEMPT")
+            self.assertEqual(vpn.browser_login("https://shb.ais.ucla.edu/login"), 1)
+        build.assert_not_called()
+
+    def test_pause_and_resume_touch_only_own_sessions(self):
+        sessions = [{"identifier": "a", "name": "mine"}, {"identifier": "b", "name": "manual", "paused": True}]
+        calls = []
+        ok = Mock(returncode=0, stderr="")
+        with patch.object(vpn, "tunnel_sessions", return_value=sessions), \
+                patch.object(vpn, "mutagen", side_effect=lambda *args, **kw: calls.append(args) or ok):
+            vpn.pause_sync("idle")
+        self.assertEqual(calls, [("sync", "pause", "a")])
+        self.assertEqual(json.loads((self.state / "paused-sync.json").read_text()), ["a"])
+        calls.clear()
+        paused = [{**sessions[0], "paused": True}, sessions[1]]
+        with patch.object(vpn, "tunnel_sessions", return_value=paused), \
+                patch.object(vpn, "mutagen", side_effect=lambda *args, **kw: calls.append(args) or ok):
+            vpn.resume_sync()
+        self.assertEqual(calls, [("sync", "resume", "a")])
+        self.assertFalse((self.state / "paused-sync.json").exists())
 
     def test_hangup_cleans_nc_and_lease_without_stdout_messages(self):
         handlers = {}
@@ -239,7 +371,9 @@ class LifecycleTests(unittest.TestCase):
         client.poll.return_value = None
         client.wait.side_effect = [KeyboardInterrupt, 0]
         output, errors = io.StringIO(), io.StringIO()
-        with patch.object(vpn, "owned_pid", return_value=None), \
+        with patch.object(vpn, "caller_kind", return_value="interactive"), \
+                patch.object(vpn, "tunnel_up", side_effect=[False, False]), \
+                patch.object(vpn, "owned_pid", side_effect=[None, 88]), \
                 patch.object(vpn, "start", side_effect=lambda: print("login progress") or 0), \
                 patch.object(vpn, "ensure_idle_watch"), patch.object(vpn.subprocess, "Popen", return_value=client), \
                 patch.object(vpn.signal, "signal", side_effect=lambda number, handler: handlers.update({number: handler})), \

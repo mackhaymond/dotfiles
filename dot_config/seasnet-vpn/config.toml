@@ -1,0 +1,7 @@
+# seasnet-vpn settings. Read on every idle check, so edits apply without a restart.
+
+# Disconnect after this many minutes with no SSH session besides Mutagen's and
+# no change to any file a running seasnet Mutagen session syncs. Each reconnect
+# costs a UCLA login plus Duo, so this is long enough to cover a pause to think
+# and short enough that a forgotten tunnel closes within the hour.
+idle_minutes = 30
