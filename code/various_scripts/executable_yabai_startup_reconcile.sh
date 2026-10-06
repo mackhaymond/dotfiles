@@ -463,10 +463,20 @@ if [ "$MODE" = float ]; then
   # Only on this event -- the sweep must stay ~40 ms on a space switch.
   [ "${YABAI_EVENT:-}" = window_focused ] && sleep 0.3
   # Common path: nothing pinned and eligible is floating -> one query, one jq, exit.
+  # The same jq also spots a pinned window yabai cannot act on at all (unresolved,
+  # see YABAI_JQ_PIN_UNRESOLVED) -- no un-float can touch that one, so it is handed,
+  # backgrounded, to yabai_pin_resolve.sh, whose remedy is a guarded yabai restart.
   win=$(yabai -m query --windows 2>/dev/null) || exit 0
-  printf '%s' "$win" | jq -e --argjson home "$PIN_HOMES" "
-      any(.[]; .\"is-floating\" and \$home[.app] != null and (($YABAI_JQ_PIN_ELIGIBLE) | true))
-    " >/dev/null 2>&1 || exit 0
+  flags=$(printf '%s' "$win" | jq -r --argjson home "$PIN_HOMES" "
+      (if any(.[]; .\"is-floating\" and \$home[.app] != null and (($YABAI_JQ_PIN_ELIGIBLE) | true))
+         then \"float\" else empty end),
+      (if any($YABAI_JQ_PIN_UNRESOLVED; \$home[.app] != null)
+         then \"unresolved\" else empty end)
+    " 2>/dev/null)
+  case "$flags" in
+    *unresolved*) "$SCRIPT_DIR/yabai_pin_resolve.sh" "${YABAI_EVENT:-float}" >/dev/null 2>&1 & ;;
+  esac
+  case "$flags" in *float*) ;; *) exit 0 ;; esac
   spaces=$(yabai_spaces_json) || { yabai_log $LOGN "float spaces-query-failed ev=${YABAI_EVENT:-}"; exit 0; }
   GAVE_UP=0
   unfloat_pins "$win" "$spaces"
@@ -516,3 +526,9 @@ while :; do
   sleep 2
 done
 yabai_log $LOGN "startup end passes=$passes elapsed=$(( $(date +%s) - t0 ))s reason=$reason pending=${PENDING_FLOATS:-0} gave_up=$GAVE_UP"
+
+# A pinned window this yabai never resolved (not AX-ready during its startup scan --
+# Claude Desktop at login) is invisible to everything above: pins_settled skips it as
+# a helper. Check for it once things have settled; the resolver restarts yabai only
+# if it is still stuck, and its guards stop a second restart from looping.
+"$SCRIPT_DIR/yabai_pin_resolve.sh" startup --delay 5 >/dev/null 2>&1 &

@@ -15,6 +15,9 @@ YABAI_DISPLAYS="${HOME}/code/various_scripts/yabai_displays.sh"
 YABAI_MOUSE_FOLLOW="${HOME}/code/various_scripts/yabai_mouse_follow.sh"
 YABAI_HEAL="${HOME}/code/various_scripts/yabai_heal.sh"
 YABAI_STARTUP_RECONCILE="${HOME}/code/various_scripts/yabai_startup_reconcile.sh"
+# Restarts yabai (guarded) when a pinned app's window is UNRESOLVED -- listed by
+# yabai but un-actionable, so no rule can home it. See yabai_pin_resolve.sh.
+YABAI_PIN_RESOLVE="${HOME}/code/various_scripts/yabai_pin_resolve.sh"
 # Draw a JankyBorders border around FLOATING windows only (scope = all is-floating,
 # incl. manage=off apps). `sync` reconciles the borders daemon to the current
 # floating set; no-op if `borders` isn't installed. See yabai_float_borders.sh.
@@ -155,6 +158,19 @@ yabai -m signal --add event=window_focused     label=float_sweep_focused app="$Y
 # Re-apply the space= rules (pins Todoist/Messages/etc.) AND re-pin the Arc main
 # windows (Hammerspoon) on every app launch -- one consistent "snap" moment.
 yabai -m signal --add event=application_launched action="yabai -m rule --apply; /opt/homebrew/bin/hs -c 'arcSync()' >/dev/null 2>&1"
+
+# Unresolved pinned window -> guarded yabai restart (yabai_pin_resolve.sh; log:
+# ~/Library/Logs/yabai/resolve.log). yabai brute-forces an app's other-space windows
+# only at yabai start and app launch; a window not AX-ready at that instant (Claude
+# Desktop at login and after its stealth update relaunch) stays listed-but-
+# unactionable on whatever space it opened on, and only a restart re-scans it. The
+# float sweep above already spots this on every space switch/pinned focus; these two
+# cover the moments it starts: a pinned app (re)launching (its window appears a few
+# seconds after the event, so watch up to 30s) and waking from sleep. The resolver
+# confirms the window is still stuck 2s later, never restarts more than once per 30s
+# or twice for the same window, and exits in one query when nothing is stuck.
+yabai -m signal --add event=application_launched label=pin_resolve_launched app="$YABAI_PINNED_APPS_RE" action="'$YABAI_PIN_RESOLVE' application_launched --watch 30"
+yabai -m signal --add event=system_woke label=pin_resolve_woke action="'$YABAI_PIN_RESOLVE' system_woke --delay 3"
 # Display hotplug -> debounced handler (non-destructive on connect; pull-home
 # on disconnect). Replaces the old "reset everything to the laptop" refresh.
 yabai -m signal --add event=display_added label=workspace_display_added action="$YABAI_DISPLAYS added"

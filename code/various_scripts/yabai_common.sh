@@ -104,6 +104,32 @@ YABAI_JQ_PIN_ELIGIBLE='
   | select(."is-sticky" == false and ."is-native-fullscreen" == false)
   | select((.scratchpad // "") == "")'
 
+# A pinned window yabai can SEE but cannot ACT ON -- the SINGLE copy of that filter
+# (yabai_pin_resolve.sh, and the float sweep's trigger in yabai_startup_reconcile.sh).
+# yabai resolves an app's windows on other spaces ONCE, by brute-forcing AX element
+# ids (window_manager_add_existing_application_windows, refresh_index -1), at yabai
+# start and at app launch. A window that is not AX-ready at that instant -- Claude
+# Desktop at login, or right after its stealth update relaunch -- stays unresolved:
+# `query --windows` still lists it (from SkyLight, with has-ax-reference:false, an
+# empty subrole and can-move:false) but every `window` command answers "could not
+# locate the window to act on!", so neither `rule --apply` nor the float sweep can
+# ever home it. yabai's own retries (on space change / app activation) only read
+# kAXWindows, which lists ACTIVE-space windows -- and the stuck window is by
+# definition on a space the user is not looking at. Only a yabai restart re-runs the
+# brute force. Seen 2026-10-05 and 2026-10-06 (Claude stranded on `agent`).
+# Takes the WHOLE windows array (not one window) and emits the stuck windows. Only an
+# app with NO resolved standard window qualifies: Electron apps (Claude Desktop ships
+# two) can publish hidden helper windows that may be unresolvable for good, and a
+# restart over one of those -- next to a perfectly healthy main window -- would buy
+# nothing. The size floor keeps tiny/offscreen helpers out too.
+# shellcheck disable=SC2034
+YABAI_JQ_PIN_UNRESOLVED='
+  ([ .[] | select(."has-ax-reference" and .subrole == "AXStandardWindow") | .app ] | unique) as $resolved_apps
+  | .[]
+  | select(."has-ax-reference" == false and ."root-window")
+  | select(.frame.w >= 300 and .frame.h >= 200)
+  | select(.app as $a | ($resolved_apps | any(. == $a)) | not)'
+
 # The same map as a JSON object, with the coding-agent apps folded in, for the jq
 # consumers. Emits nothing on failure so callers can test for an empty result.
 yabai_home_map_json() {
