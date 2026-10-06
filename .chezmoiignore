@@ -8,7 +8,6 @@ OPERATIONS.md
 .config/tmux/plugins/**
 .tmux/plugins/**
 .config/broot/launcher/**
-.config/fish/functions/br.fish
 .config/iterm2/**
 .config/wezterm/.git/**
 .config/tmux/.git/**
