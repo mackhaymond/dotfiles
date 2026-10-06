@@ -586,8 +586,9 @@ set -g status-right-length 200
 #
 # Same anatomy as the modules on the right: an accent cap and icon on the
 # accent colour, then the text on surface0.
-#   info    sky, centred, drawn OVER the bar (no fill) so tabs and modules
-#           stay visible around it
+#   info    sky, in the right corner like a toast, drawn OVER the bar (no
+#           fill): it covers the usage modules for display-time, and the
+#           window tabs stay visible
 #   error   red; there is no "this is an error" flag, so it is matched on
 #           tmux's own error wording (unknown/invalid/can't/no .../...)
 #   :       mauve, left. Prompts must be left-aligned with nothing after
@@ -603,8 +604,8 @@ set -g message-style 'fg=#cdd6f4,bg=#313244'
 set -g message-command-style 'fg=#cdd6f4,bg=#313244'
 set -g @message-chip-command '#[align=left,fill=#1e1e2e]#[fg=#cba6f7,bg=default]█#[fg=#1e1e2e,bg=#cba6f7] #[fg=#cdd6f4,bg=#313244] '
 set -g @message-chip-prompt '#[align=left,fill=#1e1e2e]#[fg=#f9e2af,bg=default]█#[fg=#1e1e2e,bg=#f9e2af] #[fg=#cdd6f4,bg=#313244] #{message}'
-set -g @message-chip-info '#[align=centre]#[fg=#89dceb,bg=default]█#[fg=#1e1e2e,bg=#89dceb]󰋽 #[fg=#cdd6f4,bg=#313244] #{message} '
-set -g @message-chip-error '#[align=centre]#[fg=#f38ba8,bg=default]█#[fg=#1e1e2e,bg=#f38ba8]󰅚 #[fg=#cdd6f4,bg=#313244] #{message} '
+set -g @message-chip-info '#[align=right]#[fg=#89dceb,bg=default]█#[fg=#1e1e2e,bg=#89dceb]󰋽 #[fg=#cdd6f4,bg=#313244] #{message} '
+set -g @message-chip-error '#[align=right]#[fg=#f38ba8,bg=default]█#[fg=#1e1e2e,bg=#f38ba8]󰅚 #[fg=#cdd6f4,bg=#313244] #{message} '
 set -g message-format '#{?#{==:#{message},:},#{E:@message-chip-command},#{?#{||:#{command_prompt},#{m/r:^[(]|[?):] $,#{message}}},#{E:@message-chip-prompt},#{?#{m/ri:^(unknown|invalid|can.t|cannot|no |not |ambiguous|bad |missing|error|failed|couldn),#{message}},#{E:@message-chip-error},#{E:@message-chip-info}}}}'
 
 # --- resurrect save/restore (everything here must stay BELOW the tpm line) ---
