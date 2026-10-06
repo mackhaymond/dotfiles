@@ -87,6 +87,26 @@ const MANAGED_FILE = STATE_DIR + "/managed.json"
 const MANAGED_REFRESH_LOCK = STATE_DIR + "/managed.refresh.lock"
 const LOG_FILE = STATE_DIR + "/chezmoi-guard.log"
 const LOG_ROTATE_BYTES = 1_000_000 // single rotation to chezmoi-guard.log.1
+// Exact-claims ledger SHARED by the Claude, codex and opencode guards: one
+// file per chezmoi source path a session wrote by name (Edit/Write, or a shell
+// write the text heuristics resolved). Time-based evidence never outranks
+// another session's exact claim — see dropForeignClaims.
+const CLAIMS_DIR = "/Users/mackhaymond/.local/state/chezmoi-guard/claims"
+const CLAIM_TTL_MS = 24 * 60 * 60 * 1000
+const CLAIM_OWNER = (sid: string) => `claude:${sid}`
+// The pty read-only classifier (the auto/plan-mode hook beside this one). A
+// command it calls read-only cannot have written anything, so it gets no
+// evidence attribution. Loaded lazily; a load failure means "not read-only".
+const READ_ONLY_CLASSIFIER = "/Users/mackhaymond/.claude/hooks/pty-read-only.ts"
+// Fallback window length when a PostToolUse finds no PreToolUse start stamp
+// (missing tool_use_id, stamp write failed): the pty's max run timeout.
+const UNSTAMPED_WINDOW_MS = 600_000
+// How long a command that OUTLIVES its tool call (spawn_pty, a timed-out or
+// interrupted run, `cmd &`, keys typed into a pty) keeps the session's
+// attribution continuous — see outlivesCall.
+const LINGER_MS = 60 * 60 * 1000
+// This invocation's claim owner, set once in main() from session_id.
+let OWNER = ""
 // Per-tool-call bookkeeping lines (pretool/posttool/userpromptsubmit) are
 // only written when CHEZMOI_GUARD_DEBUG=1; deny/continuation/refresh/error
 // lines are always written.
@@ -354,12 +374,19 @@ type SessionState = {
   continuationFiredAt: number
   continuationCount: number
   // Evidence-based attribution (see attributeSessionWrites): the end of the
-  // last PostToolUse we ran (window start for the next one), the source repo
-  // HEAD we last saw, and managed LIVE targets whose mtime landed inside one of
-  // this session's tool-call windows.
+  // last PostToolUse we ran, the source repo HEAD we last saw, and managed LIVE
+  // targets whose mtime landed inside one of this session's tool-call windows.
   lastSeenAt: number
   headSha: string
   liveTouched: string[]
+  // The subset of touchedPaths this session wrote BY NAME (not by time
+  // evidence). Only these are published to the claims ledger, and only the
+  // others can be suppressed in favour of another session's claim.
+  exactPaths: string[]
+  // While > now, something this session started may still be writing after
+  // its tool call returned: every hook event attributes [lastSeenAt, now]
+  // (the pre-2026-10-06 continuous window), instead of only shell run time.
+  lingerUntil: number
 }
 
 function emptySessionState(): SessionState {
@@ -370,6 +397,8 @@ function emptySessionState(): SessionState {
     lastSeenAt: 0,
     headSha: "",
     liveTouched: [],
+    exactPaths: [],
+    lingerUntil: 0,
   }
 }
 
@@ -402,6 +431,10 @@ function readSessionState(sessionId: string): SessionState {
       liveTouched: Array.isArray(j.liveTouched)
         ? j.liveTouched.filter((p: unknown) => typeof p === "string")
         : [],
+      exactPaths: Array.isArray(j.exactPaths)
+        ? j.exactPaths.filter((p: unknown) => typeof p === "string")
+        : [],
+      lingerUntil: typeof j.lingerUntil === "number" ? j.lingerUntil : 0,
     }
   } catch {
     return emptySessionState()
@@ -411,16 +444,21 @@ function readSessionState(sessionId: string): SessionState {
 function writeSessionState(sessionId: string, state: SessionState): void {
   try {
     mkdirSync(SESSIONS_DIR, { recursive: true })
+    const touched = new Set(state.touchedPaths)
     atomicWrite(
       sessionFile(sessionId),
       JSON.stringify({
         version: 1,
-        touchedPaths: [...new Set(state.touchedPaths)],
+        touchedPaths: [...touched],
         continuationFiredAt: state.continuationFiredAt,
         continuationCount: state.continuationCount,
         lastSeenAt: state.lastSeenAt,
         headSha: state.headSha,
         liveTouched: [...new Set(state.liveTouched)],
+        // exactPaths ⊆ touchedPaths: a pruned (committed + pushed) path drops
+        // out of both.
+        exactPaths: [...new Set(state.exactPaths)].filter((p) => touched.has(p)),
+        lingerUntil: state.lingerUntil,
         updatedAt: Date.now(),
       }),
     )
@@ -543,6 +581,8 @@ function withSessionLock(sessionId: string, fn: (state: SessionState) => void): 
       lastSeenAt: Math.max(latest.lastSeenAt, state.lastSeenAt),
       headSha: state.headSha || latest.headSha,
       liveTouched: [...liveMerged],
+      exactPaths: [...new Set([...latest.exactPaths, ...state.exactPaths])],
+      lingerUntil: Math.max(latest.lingerUntil, state.lingerUntil),
     }
     writeSessionState(sessionId, mergedState)
     debugLog("session lock acquire failed; union-merged", { sessionId })
@@ -552,7 +592,9 @@ function withSessionLock(sessionId: string, fn: (state: SessionState) => void): 
 }
 
 // rememberSourceWrites: union-add canonical chezmoi-source paths (verbatim
-// semantics; always runs - no exit_code skip).
+// semantics; always runs - no exit_code skip). Heuristic: a write-intent
+// segment contributes EVERY path token, reads included, so these are NOT
+// exact claims — see claimExactWrites for that.
 function rememberSourceWrites(state: SessionState, rawPaths: string[]): void {
   const set = new Set(state.touchedPaths)
   for (const raw of rawPaths) {
@@ -562,6 +604,153 @@ function rememberSourceWrites(state: SessionState, rawPaths: string[]): void {
     }
   }
   state.touchedPaths = [...set]
+}
+
+// claimExactWrites: paths this session certainly WROTE by name — an edit-class
+// tool's file_path, or a shell segment's parsed write target (never the
+// all-tokens fallback, so `cat <src>/x > /tmp/y` does not claim x). Tracked as
+// touched AND published to the shared claims ledger.
+function claimExactWrites(state: SessionState, rawPaths: string[]): void {
+  const set = new Set(state.touchedPaths)
+  const exact = new Set(state.exactPaths)
+  for (const raw of rawPaths) {
+    const p = normalizePath(raw)
+    if (isInChezmoiSource(p)) {
+      set.add(p)
+      exact.add(p)
+      writeClaim(p, OWNER)
+    }
+  }
+  state.touchedPaths = [...set]
+  state.exactPaths = [...exact]
+}
+
+// ---------------------------------------------------------------------------
+// Exact-claims ledger (shared across the three guards)
+//   CLAIMS_DIR/<sha256(path)[:32]>.json = { path, owner, at }   last writer wins
+// A claim says "owner wrote this file at `at`". It vouches only for that
+// write: once the file's mtime moves past `at` someone wrote it again, and the
+// claim no longer explains the change. Released when the owner's own path is
+// committed + pushed (pendingTouchedPaths); TTL is only the backstop.
+// ---------------------------------------------------------------------------
+
+const CLAIM_MTIME_SLACK_MS = 2000
+
+function claimFile(p: string): string {
+  return `${CLAIMS_DIR}/${createHash("sha256").update(p).digest("hex").slice(0, 32)}.json`
+}
+
+function writeClaim(p: string, owner: string): void {
+  if (!owner) return
+  try {
+    mkdirSync(CLAIMS_DIR, { recursive: true })
+    atomicWrite(claimFile(p), JSON.stringify({ path: p, owner, at: Date.now() }))
+  } catch {
+    /* best-effort: a lost claim only means a possible extra nag elsewhere */
+  }
+}
+
+function readClaim(p: string): { owner: string; at: number } | undefined {
+  try {
+    const j = JSON.parse(readFileSync(claimFile(p), "utf-8"))
+    if (j.path !== p || typeof j.owner !== "string" || typeof j.at !== "number") return undefined
+    if (Date.now() - j.at > CLAIM_TTL_MS) return undefined
+    return { owner: j.owner, at: j.at }
+  } catch {
+    return undefined
+  }
+}
+
+// Release OUR claim on a path we no longer track (committed + pushed).
+function releaseClaim(p: string): void {
+  if (!OWNER) return
+  try {
+    if (readClaim(p)?.owner === OWNER) unlinkSync(claimFile(p))
+  } catch {
+    /* already gone */
+  }
+}
+
+// foreignClaimed: paths this session holds only by TIME evidence whose current
+// content another session wrote BY NAME (its claim is fresh and the file has
+// not been written since). Those are suppressed from this session's report,
+// NOT deleted from its state — if the claim lapses or the file is written
+// again, the path reports again. Our own exact claims are never suppressed; a
+// deleted file (no mtime to compare) is never suppressed.
+function foreignClaimed(state: SessionState): Set<string> {
+  const out = new Set<string>()
+  const exact = new Set(state.exactPaths)
+  for (const p of state.touchedPaths) {
+    if (exact.has(p)) continue
+    const c = readClaim(p)
+    if (!c || c.owner === OWNER) continue
+    try {
+      if (lstatSync(p).mtimeMs <= c.at + CLAIM_MTIME_SLACK_MS) out.add(p)
+    } catch {
+      /* deleted: cannot tell whose deletion it was — keep reporting */
+    }
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Tool-call start stamps: PreToolUse records when each call began, so the
+// matching PostToolUse attributes only what changed while the tool RAN — not
+// model think-time, not the user's idle time between turns, not "since the
+// session started". Lock-free: one tiny file per in-flight call.
+//   SESSIONS_DIR/<key>.calls/<sanitized tool_use_id>   (content: start ms)
+// ---------------------------------------------------------------------------
+
+function callStampFile(input: any): string | undefined {
+  const sid = input?.session_id
+  const id = input?.tool_use_id
+  if (typeof sid !== "string" || !sid || typeof id !== "string" || !id) return undefined
+  return `${SESSIONS_DIR}/${sessionKey(sid)}.calls/${id.replace(/[^A-Za-z0-9._-]/g, "_")}`
+}
+
+function stampToolStart(input: any): void {
+  try {
+    const f = callStampFile(input)
+    if (!f) return
+    mkdirSync(dirname(f), { recursive: true })
+    writeFileSync(f, String(Date.now()))
+  } catch {
+    /* no stamp: PostToolUse falls back to UNSTAMPED_WINDOW_MS */
+  }
+}
+
+function takeToolStart(input: any): number | undefined {
+  const f = callStampFile(input)
+  if (!f) return undefined
+  try {
+    const t = Number(readFileSync(f, "utf-8"))
+    return Number.isFinite(t) && t > 0 ? t : undefined
+  } catch {
+    return undefined
+  } finally {
+    try {
+      unlinkSync(f)
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+let readOnlyClassifier: ((cmd: string) => boolean) | null | undefined
+function isReadOnlyShellCommand(cmd: string): boolean {
+  if (readOnlyClassifier === undefined) {
+    try {
+      const m = require(READ_ONLY_CLASSIFIER)
+      readOnlyClassifier = typeof m?.isReadOnlyCommand === "function" ? m.isReadOnlyCommand : null
+    } catch {
+      readOnlyClassifier = null
+    }
+  }
+  try {
+    return readOnlyClassifier ? readOnlyClassifier(cmd) === true : false
+  } catch {
+    return false
+  }
 }
 
 // unpushedRels: of the given session-touched rels, return the subset that
@@ -591,13 +780,6 @@ function unpushedRels(rels: string[]): Set<string> {
   return out
 }
 
-// pendingTouchedPaths: classify the session-touched rels into the work still
-// outstanding — `dirty` (uncommitted working-tree changes, via git status
-// --porcelain, incl. rename dests) and `unpushed` (committed but ahead of
-// upstream, via unpushedRels). PRUNES a path from tracking only once it is BOTH
-// clean in the working tree AND already pushed: the self-heal boundary moves
-// from "committed" to "committed AND pushed", so the guard keeps nagging until
-// the push lands. Mutates state in place.
 // ---------------------------------------------------------------------------
 // Evidence-based attribution.
 //
@@ -606,45 +788,133 @@ function unpushedRels(rels: string[]): Set<string> {
 // editor, or a relative path behind `cd $(chezmoi source-path) &&` (a command
 // substitution the hook cannot expand) is invisible to them — which is how a
 // session once left two commits unpushed and a source edit unapplied with the
-// Stop guard reporting "clean". So after EVERY tool call we also look at what
-// actually changed on disk during that call's window:
+// Stop guard reporting "clean". So we also look at what actually changed on
+// disk while something of ours could have been writing:
 //
-//   window = [lastSeenAt - slack, now], where lastSeenAt is the end of the
-//   previous PostToolUse for this session, falling back to the birth time of
-//   the session transcript (≈ session start) on the first call.
+//   - a write-capable shell call (shouldAttribute): [startedAt - slack, now],
+//     startedAt = this call's PreToolUse stamp (stampToolStart); without a
+//     stamp, the last UNSTAMPED_WINDOW_MS, never past the previous call;
+//   - while a command we started may still be running after its tool call
+//     returned (lingerUntil, see outlivesCall): every hook event covers
+//     [lastSeenAt - slack, now], i.e. continuously.
+//
+// (Until 2026-10-06 the window was ALWAYS the continuous one, from session
+// start on — it covered model think-time, the user's idle time between turns
+// and read-only commands, and every session got blamed for whatever other
+// agents wrote meanwhile.)
 //
 //   (a) source repo working tree: every `git status --porcelain` path whose
 //       mtime (or, for a deletion, its parent dir's mtime) is inside the window
-//   (b) source repo commits: if HEAD moved since we last looked, every path in
-//       old..new (the session committed; the push guard needs to know)
+//   (b) source repo commits made inside the window (the session committed;
+//       the push guard needs to know)
 //   (c) managed LIVE targets whose mtime is inside the window — the session
 //       wrote a live file some other way, or ran `chezmoi apply`; either way the
 //       Stop guard must check them against the source.
 //
-// Attribution is by TIME, so a concurrent agent writing the same repo inside
-// one of our tool-call windows is misattributed to us. The cost of that is one
-// extra nag (whose text says to leave unrelated paths alone), the cost of the
-// old blind spot was silently losing work — accepted.
+// Attribution is still by TIME, so a concurrent agent writing the same repo
+// inside one of our windows is misattributed to us — unless that agent wrote
+// the path BY NAME and nobody wrote it since, in which case its claim
+// suppresses it from our report (foreignClaimed). The residual cost is one
+// extra nag (whose text says to leave unrelated paths alone); the cost of a
+// blind spot is silently losing work — accepted.
 // ---------------------------------------------------------------------------
 
 const ATTRIB_SLACK_MS = 2000
 
-function attributionWindowStart(state: SessionState, input: any): number {
-  if (state.lastSeenAt > 0) return state.lastSeenAt
-  try {
-    if (typeof input?.transcript_path === "string" && input.transcript_path) {
-      const st = statSync(input.transcript_path)
-      return st.birthtimeMs > 0 ? st.birthtimeMs : st.mtimeMs
-    }
-  } catch {
-    /* no transcript: window unknown */
-  }
-  return 0
+// Only shell calls can write unseen: edit-class tools write exactly their
+// file_path (remembered by name), and a command the read-only classifier
+// accepts wrote nothing. A leading VAR=value makes any command suspect (it
+// can point git/a pager at an arbitrary program), so it never counts as read-only.
+function shouldAttribute(name: unknown, cmd: string): boolean {
+  if (!isShellTool(name) || !cmd.trim()) return false
+  if (/(^|[;&|(\n]\s*)[A-Za-z_][A-Za-z0-9_]*=\S*\s+\S/.test(cmd)) return true
+  return !isReadOnlyShellCommand(cmd)
 }
 
-function attributeSessionWrites(state: SessionState, input: any, managed: string[]): void {
+// Something that can matter for chezmoi: names chezmoi or its source tree,
+// opens an editor, or names a managed live path.
+function chezmoiRelevant(text: string): boolean {
+  if (/\bchezmoi\b/.test(text) || text.includes(CHEZMOI_SOURCE_DIR) || text.includes("~/.local/share/chezmoi")) return true
+  if (/(^|[\s;&|("'`])(n?vim?|vi|nano|emacs|hx|micro|code|subl)(\s|$|["'])/.test(text)) return true
+  const managed = readManagedCache().paths
+  return pathsFromBashCommand(text).some((p) => touchesManagedPath(normalizePath(p), managed))
+}
+
+// The tool result's own leading text (not the command's output, which may
+// legitimately contain anything): a string, or the first text block.
+function responseHead(input: any): string {
+  const r = input?.tool_response
+  try {
+    if (typeof r === "string") return r
+    const blocks = Array.isArray(r) ? r : Array.isArray(r?.content) ? r.content : []
+    const first = blocks.find((b: any) => typeof b?.text === "string")
+    return first ? first.text : ""
+  } catch {
+    return ""
+  }
+}
+
+// Quoted strings and heredoc bodies are data, not shell syntax: a `&` in a
+// commit message or a sed replacement must not read as backgrounding.
+function stripQuoted(cmd: string): string {
+  return cmd
+    .replace(/<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2\s*(?=\n|$)/g, " ")
+    .replace(/'[^']*'/g, "''")
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+}
+
+// outlivesCall: did this tool call leave something chezmoi-relevant running
+// that may write AFTER the call returned? Then attribution stays continuous
+// for LINGER_MS. Always gated on relevance — a timed-out build or a dev
+// server must not re-widen every window for an hour (the original complaint).
+//   - a pty run that TIMED OUT (the result header, not output text), or an
+//     interrupted shell call;
+//   - spawn_pty, `cmd &` / nohup / disown / setsid (outside quotes and
+//     heredocs), Bash run_in_background;
+//   - keys typed into a pty with send_keys.
+function outlivesCall(input: any, name: unknown, ti: any, cmd: string): boolean {
+  if (name === "mcp__pty__send_keys") {
+    let keys = ""
+    try {
+      keys = JSON.stringify(ti ?? {})
+    } catch {
+      return false
+    }
+    return chezmoiRelevant(keys)
+  }
+  if (!isShellTool(name) || !cmd.trim() || !shouldAttribute(name, cmd)) return false
+  const bare = stripQuoted(cmd)
+  const stillRunning =
+    responseHead(input).startsWith("TIMED OUT after") ||
+    (input?.hook_event_name === "PostToolUseFailure" && input?.is_interrupt === true) ||
+    name === "mcp__pty__spawn_pty" ||
+    ti?.run_in_background === true ||
+    /(^|[^&|>])&(?![&>])/.test(bare) ||
+    /(^|[\s;&|(])(nohup|disown|setsid)(\s|$)/.test(bare)
+  return stillRunning && chezmoiRelevant(cmd)
+}
+
+// A shell call that demonstrably failed (PostToolUseFailure, or a pty result
+// headed `exit N` with N != 0) may not have written its targets: no claims.
+function shellCallFailed(input: any): boolean {
+  if (input?.hook_event_name === "PostToolUseFailure") return true
+  const m = /^exit (\d+)/.exec(responseHead(input))
+  return !!m && m[1] !== "0"
+}
+
+// At UserPromptSubmit / Stop: while something we started may still be
+// running, attribute what changed since the previous hook event (a spawned
+// `chezmoi edit` saved between turns has no tool call of its own).
+function sweepLingering(state: SessionState): void {
+  if (state.lingerUntil <= 0) return
   const now = Date.now()
-  const start = attributionWindowStart(state, input)
+  if (state.lastSeenAt > 0) attributeSessionWrites(state, state.lastSeenAt, readManagedCache().paths)
+  state.lastSeenAt = now
+  if (now > state.lingerUntil) state.lingerUntil = 0
+}
+
+function attributeSessionWrites(state: SessionState, start: number, managed: string[]): void {
+  const now = Date.now()
   const since = start > 0 ? start - ATTRIB_SLACK_MS : 0
   const inWindow = (ms: number) => since > 0 && ms >= since && ms <= now + 1000
   const touched = new Set(state.touchedPaths)
@@ -681,7 +951,10 @@ function attributeSessionWrites(state: SessionState, input: any, managed: string
     /* git unavailable / not a repo: heuristics alone */
   }
 
-  // (b) commits since we last looked
+  // (b) commits made inside the window. HEAD is only sampled on attributing
+  // calls, so with no remembered HEAD (first write-capable call) or an
+  // unreachable one (rewritten history), fall back to the newest commits —
+  // the --since filter is what scopes them to this window either way.
   try {
     const head = execFileSync(GIT_BIN, ["-C", CHEZMOI_SOURCE_DIR, "rev-parse", "HEAD"], {
       encoding: "utf-8",
@@ -689,15 +962,19 @@ function attributeSessionWrites(state: SessionState, input: any, managed: string
       timeout: 3000,
       env: SUBPROC_ENV,
     }).trim()
-    if (state.headSha && head && head !== state.headSha) {
-      const args = ["-C", CHEZMOI_SOURCE_DIR, "log", `${state.headSha}..${head}`, "--name-only", "--pretty=format:"]
-      if (since > 0) args.push(`--since=${new Date(since).toISOString()}`)
-      const raw = execFileSync(GIT_BIN, args, {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "ignore"],
-        timeout: 3000,
-        env: SUBPROC_ENV,
-      })
+    if (since > 0 && head && head !== state.headSha) {
+      const gitLog = (range: string[]) =>
+        execFileSync(
+          GIT_BIN,
+          ["-C", CHEZMOI_SOURCE_DIR, "log", ...range, "--name-only", "--pretty=format:", `--since=${new Date(since).toISOString()}`],
+          { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000, env: SUBPROC_ENV },
+        )
+      let raw: string
+      try {
+        raw = state.headSha ? gitLog([`${state.headSha}..${head}`]) : gitLog([head, "--max-count=50"])
+      } catch {
+        raw = gitLog([head, "--max-count=50"])
+      }
       for (const line of raw.split("\n")) {
         const rel = line.trim()
         if (!rel) continue
@@ -729,7 +1006,6 @@ function attributeSessionWrites(state: SessionState, input: any, managed: string
 
   state.touchedPaths = [...touched]
   state.liveTouched = [...live]
-  state.lastSeenAt = now
   if (added > 0 && VERBOSE) debugLog("attributed by evidence", { added, since })
 }
 
@@ -821,6 +1097,14 @@ function driftedTargets(state: SessionState): { drifted: string[]; keepSources: 
   return { drifted: drifted.sort(), keepSources }
 }
 
+// pendingTouchedPaths: classify the session-touched rels into the work still
+// outstanding — `dirty` (uncommitted working-tree changes, via git status
+// --porcelain, incl. rename dests) and `unpushed` (committed but ahead of
+// upstream, via unpushedRels). PRUNES a path from tracking only once it is BOTH
+// clean in the working tree AND already pushed: the self-heal boundary moves
+// from "committed" to "committed AND pushed", so the guard keeps nagging until
+// the push lands. A pruned path's exact claim (if ours) is released. Mutates
+// state in place.
 function pendingTouchedPaths(
   state: SessionState,
   keep: Set<string> = new Set(),
@@ -866,7 +1150,10 @@ function pendingTouchedPaths(
   // applied is still unfinished work.
   for (const p of rels) {
     const abs = resolve(CHEZMOI_SOURCE_DIR, p)
-    if (!dirty.has(p) && !unpushed.has(p) && !keep.has(abs)) set.delete(abs)
+    if (!dirty.has(p) && !unpushed.has(p) && !keep.has(abs)) {
+      set.delete(abs)
+      releaseClaim(abs)
+    }
   }
   state.touchedPaths = [...set]
 
@@ -878,8 +1165,18 @@ function pendingTouchedPaths(
 // ---------------------------------------------------------------------------
 
 function uncommittedChezmoiComplaint(state: SessionState): string | undefined {
-  const { drifted, keepSources } = driftedTargets(state)
-  const { dirty, unpushed } = pendingTouchedPaths(state, keepSources)
+  // Report without the paths another session demonstrably wrote (see
+  // foreignClaimed); they stay in state and are re-checked every time.
+  const foreign = foreignClaimed(state)
+  if (foreign.size > 0 && VERBOSE) debugLog("suppressed foreign-claimed paths", { count: foreign.size })
+  state.touchedPaths = state.touchedPaths.filter((p) => !foreign.has(p))
+  let drifted: string[], keepSources: Set<string>, dirty: string[], unpushed: string[]
+  try {
+    ;({ drifted, keepSources } = driftedTargets(state))
+    ;({ dirty, unpushed } = pendingTouchedPaths(state, keepSources))
+  } finally {
+    state.touchedPaths = [...new Set([...state.touchedPaths, ...foreign])]
+  }
   if (dirty.length === 0 && unpushed.length === 0 && drifted.length === 0) return undefined
   const fmt = (paths: string[]) => {
     const shown = paths
@@ -1268,6 +1565,9 @@ function handlePreToolUse(input: any): void {
   const ti = input.tool_input ?? {}
   const name = input.tool_name
   if (VERBOSE) debugLog("pretool", { session_id: input.session_id, name })
+  // Start of this call's attribution window. Written before any deny below
+  // (a denied call never gets a PostToolUse; GC sweeps its stamp).
+  if (isShellTool(name)) stampToolStart(input)
 
   // STEP A: edit-class tools (Edit/Write/MultiEdit/NotebookEdit). EXACT managed
   // match (mirrors the opencode BLOCKED_TOOLS path — NOT prefix; prefix on
@@ -1338,6 +1638,9 @@ function handlePostToolUse(input: any): void {
   const name = input.tool_name
   const sid = input.session_id
   if (VERBOSE) debugLog("posttool", { session_id: sid, name })
+  // A failed edit-class call wrote nothing; a failed SHELL call may have.
+  const failed = input.hook_event_name === "PostToolUseFailure"
+  const startedAt = isShellTool(name) ? takeToolStart(input) : undefined
 
   // Managed-set TTL refresh lives here (non-blocking event): cheap when fresh,
   // one `chezmoi managed` spawn per 300s otherwise. PreToolUse never spawns.
@@ -1358,13 +1661,16 @@ function handlePostToolUse(input: any): void {
             : ""
       if (nb) editPaths.push(nb)
     }
+    let shellCmd = ""
     if (editPaths.length > 0) {
-      rememberSourceWrites(state, editPaths)
+      if (!failed) claimExactWrites(state, editPaths)
     } else if (isShellTool(name)) {
       const { cmd, workdir } = extractShell(ti)
+      shellCmd = cmd
       const resolvedWorkdir = workdir || input.cwd
       if (cmd) {
         const paths: string[] = []
+        const targets: string[] = []
         for (const seg of splitBashSegments(cmd)) {
           const targetPaths = pathsFromBashWriteTargets(seg)
           if (
@@ -1374,21 +1680,29 @@ function handlePostToolUse(input: any): void {
             continue
           }
           paths.push(...pathsFromBashCommand(seg), ...targetPaths)
+          targets.push(...targetPaths)
         }
-        if (resolvedWorkdir && isInChezmoiSource(resolvedWorkdir)) {
-          rememberSourceWrites(
-            state,
-            paths.map((p) => resolveAgainstWorkdir(p, resolvedWorkdir)),
-          )
-        } else {
-          rememberSourceWrites(state, paths)
-        }
+        const resolveAll = (ps: string[]) =>
+          resolvedWorkdir && isInChezmoiSource(resolvedWorkdir)
+            ? ps.map((p) => resolveAgainstWorkdir(p, resolvedWorkdir))
+            : ps
+        rememberSourceWrites(state, resolveAll(paths))
+        if (!shellCallFailed(input)) claimExactWrites(state, resolveAll(targets))
       }
     }
-    // STEP attribute by evidence: what actually changed on disk during this
-    // tool call (source tree, source commits, managed live targets) — catches
-    // every writer the text heuristics above cannot see.
-    attributeSessionWrites(state, input, readManagedCache().paths)
+    // STEP attribute by evidence: what actually changed on disk while this
+    // shell call ran — or, while something we started may still be running
+    // (lingerUntil), since the previous hook event (source tree, source
+    // commits, managed live targets). Catches every writer the text
+    // heuristics above cannot see.
+    const now = Date.now()
+    const starts: number[] = []
+    if (shouldAttribute(name, shellCmd)) starts.push(startedAt ?? Math.max(state.lastSeenAt, now - UNSTAMPED_WINDOW_MS))
+    if (state.lingerUntil > 0 && state.lastSeenAt > 0) starts.push(state.lastSeenAt)
+    if (starts.length > 0) attributeSessionWrites(state, Math.min(...starts), readManagedCache().paths)
+    if (state.lingerUntil > 0 && now > state.lingerUntil) state.lingerUntil = 0 // final sweep done
+    if (outlivesCall(input, name, ti, shellCmd)) state.lingerUntil = now + LINGER_MS
+    state.lastSeenAt = now
     // STEP recompute: prune + persist via the lock writer.
     pendingTouchedPaths(state)
     // DO NOT touch continuationFiredAt/continuationCount here (Stop backstop).
@@ -1403,6 +1717,7 @@ function handleUserPromptSubmit(input: any): void {
   refreshManagedIfStale()
   let complaint: string | undefined
   withSessionLock(sid, (state) => {
+    sweepLingering(state)
     complaint = uncommittedChezmoiComplaint(state) // calls pendingTouchedPaths -> prune + persist
   })
   if (!complaint) {
@@ -1435,6 +1750,7 @@ function handleStop(input: any): void {
   let lockedOk = true
   try {
     withSessionLock(sid, (state) => {
+      sweepLingering(state)
       const now = Date.now()
       // GUARD 2a: within the 2-min window -> allow stop.
       if (state.continuationFiredAt && now - state.continuationFiredAt < CONTINUATION_WINDOW_MS) {
@@ -1509,7 +1825,30 @@ function opportunisticGc(): void {
             unlinkSync(full)
           } else if (entry.endsWith(".json") && now - st.mtimeMs > sessionMaxAge) {
             unlinkSync(full)
+          } else if (entry.endsWith(".calls")) {
+            // Start stamps whose PostToolUse never came (denied / crashed
+            // calls). Nothing legitimately runs longer than a day.
+            for (const stamp of readdirSync(full)) {
+              try {
+                if (now - statSync(`${full}/${stamp}`).mtimeMs > CLAIM_TTL_MS) unlinkSync(`${full}/${stamp}`)
+              } catch {
+                /* ignore */
+              }
+            }
+            if (now - st.mtimeMs > sessionMaxAge) rmdirSync(full) // throws if non-empty: fine
           }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    // Expired exact claims (readClaimOwner already ignores them; this only
+    // keeps the shared dir small). Shared with the codex/opencode guards.
+    if (existsSync(CLAIMS_DIR)) {
+      for (const entry of readdirSync(CLAIMS_DIR)) {
+        const full = `${CLAIMS_DIR}/${entry}`
+        try {
+          if (now - statSync(full).mtimeMs > CLAIM_TTL_MS) unlinkSync(full)
         } catch {
           /* ignore */
         }
@@ -1553,12 +1892,14 @@ function main(): void {
   }
 
   const ev = input?.hook_event_name
+  if (typeof input?.session_id === "string" && input.session_id) OWNER = CLAIM_OWNER(input.session_id)
   try {
     switch (ev) {
       case "PreToolUse":
         handlePreToolUse(input)
         break
       case "PostToolUse":
+      case "PostToolUseFailure": // a failed command may still have written
         handlePostToolUse(input)
         break
       case "UserPromptSubmit":

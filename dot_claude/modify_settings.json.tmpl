@@ -97,7 +97,7 @@ FULL=$(cat <<'EOF'
     ],
     "PostToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__pty__run|mcp__pty__spawn_pty",
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__pty__run|mcp__pty__spawn_pty|mcp__pty__send_keys",
         "hooks": [
           {
             "type": "command",
@@ -120,6 +120,17 @@ FULL=$(cat <<'EOF'
             "command": "{{ .chezmoi.homeDir }}/.local/bin/cua-notch-agent-hook",
             "timeout": 10,
             "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__pty__run|mcp__pty__spawn_pty",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
           }
         ]
       }

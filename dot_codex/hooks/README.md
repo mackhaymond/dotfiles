@@ -180,10 +180,29 @@ PostToolUse/Stop.
 
 Same mechanism as the Claude Code hook — see `dot_claude/hooks/README.md`,
 "Evidence attribution". PostToolUse additionally attributes, by mtime inside
-the tool call's window (`lastSeenAt − 2s .. now`; first window from
-`transcript_path`'s birth time when codex supplies it, otherwise from the
-second tool call on), every changed source-tree path, every path in commits
-that moved HEAD, and every managed live target → `liveTouched`. Stop and
+the window while a write-capable shell call RAN (`startedAt − 2s .. now`,
+`startedAt` stamped by PreToolUse under `sessions/<key>.calls/<tool_use_id>`;
+without a stamp the last 10 min, never past the previous PostToolUse), every
+changed source-tree path, every path in commits that moved HEAD inside the
+window, and every managed live target → `liveTouched`. apply_patch never
+time-attributes (it writes exactly its patch paths), nor does a command the
+Claude-side pty read-only classifier accepts (`shell`'s
+`["bash","-lc",script]` argv is unwrapped to `script` first). Stop and
 UserPromptSubmit run `chezmoi status --recursive=false` over the session's
 targets and complain about live≠source drift alongside uncommitted/unpushed
-work. Session-state fields: `lastSeenAt`, `headSha`, `liveTouched`.
+work. Session-state fields: `lastSeenAt`, `headSha`, `liveTouched`,
+`exactPaths`, `lingerUntil`.
+
+A chezmoi-relevant command that outlives its call — an exec that yielded
+("Process running with session ID …"), `cmd &` / nohup / disown / setsid, a
+spawn_pty, or chezmoi-relevant `write_stdin` input — sets `lingerUntil`
+(1 h): meanwhile every hook event attributes continuously since the previous
+one. Yields are gated on relevance because codex yields long commands
+routinely.
+
+Since 2026-10-06 certain by-name writes (apply_patch paths, parsed shell
+write targets) are also published to the shared claims ledger
+`~/.local/state/chezmoi-guard/claims/` (owner `codex:<sid>`), and a path this
+session holds only by time evidence is suppressed from the report while
+another session's claim on it is fresh and the file has not been written
+since — see "Cross-session claims" in the Claude README.
