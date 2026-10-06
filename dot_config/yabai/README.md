@@ -1,6 +1,6 @@
 # Yabai + Skhd + Karabiner-Elements + WezTerm: Complete Setup Reference
 
-> *Docs audited & synced to config: **2026-08-21** — multi-agent review of the stray-float heal (`unfloat_pins`) for conventions, runtime interaction, and source-claim accuracy. Findings folded in: the repair is a view rebuild rather than a cross-space bounce, spaces are addressed by label, non-standard windows are excluded from both the repair and the settle predicate, and the pinned-home map moved into `yabai_common.sh`. Earlier audit 2026-06-06 covered the bsp keybind set + the event-driven self-heal (0 critical/high; no duplicate or BetterTouchTool-reserved `hyper+a`/`hyper+s` binds). Pinned-window guards intact — float direction only, since 2026-08-21.*
+> *Docs synced to config: **2026-10-06** — after the full-system review fixes (`452312d`) and the unresolved-pin resolver (`473a7e8`/`4f08c37`): labeled pin rules re-registered by refresh, conservative label-follows-app, fullscreen-aware positional labels, resolver guards + layout/float restore, startup lock ownership, `sudo -n --load-sa`; plus doc drift (Karabiner fires the binds, BetterTouchTool → Arc rules in `karabiner-base.json`, `signal --list` works, v7 SA flags, `com.asmvik.yabai`). Previous audit **2026-08-21** — multi-agent review of the stray-float heal (`unfloat_pins`) for conventions, runtime interaction, and source-claim accuracy. Findings folded in: the repair is a view rebuild rather than a cross-space bounce, spaces are addressed by label, non-standard windows are excluded from both the repair and the settle predicate, and the pinned-home map moved into `yabai_common.sh`. Earlier audit 2026-06-06 covered the bsp keybind set + the event-driven self-heal (0 critical/high; no duplicate or then-BetterTouchTool-reserved `hyper+a`/`hyper+s` binds). Pinned-window guards intact — float direction only, since 2026-08-21.*
 
 ## 1. Overview & Mental Model
 
@@ -21,9 +21,9 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | Source (Chezmoi) | Target (Deployed To) | Type | Purpose |
 |---|---|---|---|
 | `/Users/mackhaymond/.local/share/chezmoi/dot_config/yabai/executable_yabairc` | `~/.config/yabai/yabairc` | Executable shell script | Window manager core: signals, rules, app pinning, layout |
-| `/Users/mackhaymond/.local/share/chezmoi/dot_config/skhd/skhdrc.tmpl` | `~/.config/skhd/skhdrc` | Template config | Hotkey daemon: all keybindings (hyper+key → yabai commands) |
+| `/Users/mackhaymond/.local/share/chezmoi/dot_config/skhd/skhdrc.tmpl` | `~/.config/skhd/skhdrc` | Template config | Declarative bind list (hyper+key → yabai commands); compiled into `karabiner.json`, which fires them (the skhd daemon is retired) |
 | `/Users/mackhaymond/.local/share/chezmoi/dot_config/wezterm/wezterm.lua.tmpl` | `~/.config/wezterm/wezterm.lua` | Template config | Terminal emulator: startup, keybindings, tmux integration |
-| `/Users/mackhaymond/.local/share/chezmoi/dot_config/private_karabiner/private_karabiner.json` | `~/.config/karabiner/karabiner.json` | JSON config (git-ignored) | Key remapping: caps_lock→hyper, F-key aliases (F18/F19/F13/F14) |
+| `/Users/mackhaymond/.local/share/chezmoi/dot_config/private_karabiner/modify_private_karabiner.json.tmpl` | `~/.config/karabiner/karabiner.json` | chezmoi `modify_` template (owns the whole file) | Builds `karabiner.json` = hand-written `.chezmoitemplates/karabiner-base.json` (caps_lock→hyper, the F13/F14/F18/F19 chords, Arc's hyper+a/s/c) + the skhdrc binds compiled by `dot_config/skhd/executable_skhd-to-karabiner.py` |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_workspace.sh` | `~/code/various_scripts/yabai_workspace.sh` | Executable script | Focus workspace by label |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_send_window.sh` | `~/code/various_scripts/yabai_send_window.sh` | Executable script | Move focused window to space and follow focus (respects pinned homes) |
 | `…/code/various_scripts/executable_yabai_send_window_external.sh` | `~/code/various_scripts/yabai_send_window_external.sh` | Executable script | Fling the focused unpinned window to the external's on-demand `ext` scratch-work space (create + follow). See the "External scratch-work space" design note |
@@ -38,13 +38,14 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_prev.sh` | `~/code/various_scripts/yabai_skhd_stack_prev.sh` | Executable script | **`hyper+x`, layout-aware:** STACK → previous stack layer; BSP → mirror tree vertically (`--mirror y-axis`) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_mouse_follow.sh` | `~/code/various_scripts/yabai_mouse_follow.sh` | Executable script | Warp cursor to newly focused display |
 | `…/code/various_scripts/executable_yabai_heal.sh` | `~/code/various_scripts/yabai_heal.sh` | Executable script | **Debounced self-heal** — coalesce `space_destroyed` / `mission_control_exit` into one `yabai_workspace_refresh` (single-flight mkdir lock + settle) |
-| `…/code/various_scripts/executable_yabai_startup_reconcile.sh` | `~/code/various_scripts/yabai_startup_reconcile.sh` | Executable script | **Login-race + stray-float fix** — backgrounded at startup; re-loads the SA + polls (re-apply rules / re-pin Arc / un-float misclassified pinned windows) until pinned apps are on their home spaces **and tiled**, so they land correctly without a manual restart. Single-flighted |
+| `…/code/various_scripts/executable_yabai_startup_reconcile.sh` | `~/code/various_scripts/yabai_startup_reconcile.sh` | Executable script | **Login-race + stray-float fix** — `startup` (backgrounded from yabairc): clears stale locks, re-loads the SA + polls (re-apply rules / re-pin Arc / un-float misclassified pinned windows) until pinned apps are on their home spaces **and tiled**, restores bsp layouts + `hyper+t` floats after an automatic restart, then hands off to `yabai_pin_resolve.sh`. `float [--dry-run]`: the one-pass float sweep run by 3 signals. Single-flighted (pid-owned locks) |
+| `…/code/various_scripts/executable_yabai_pin_resolve.sh` | `~/code/various_scripts/yabai_pin_resolve.sh` | Executable script | **Unresolved-pin heal** — guarded `yabai --restart-service` when a pinned app's window is listed by yabai but un-actionable (see "Unresolved pinned windows"). Log `~/Library/Logs/yabai/resolve.log` |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_screen_flash.sh` | `~/code/various_scripts/yabai_screen_flash.sh` | Executable script | **DISABLED (dormant)** — was the external-display focus border flash; the signal was removed 2026-06-04 |
 | `…/code/various_scripts/yabai_screen_flash.js` | `~/code/various_scripts/yabai_screen_flash.js` | JXA helper | **DISABLED (dormant)** — drew the border overlay for `yabai_screen_flash.sh` |
 | `…/code/various_scripts/executable_yabai_reorder_spaces.sh` | `~/code/various_scripts/yabai_reorder_spaces.sh` | Executable script | Keep labeled spaces in canonical order per display |
 | `…/code/various_scripts/executable_yabai_fullscreen_focus.sh` | `~/code/various_scripts/yabai_fullscreen_focus.sh` | Executable script | Focus the Nth native-fullscreen app (`hyper+3-9`), WezTerm excluded |
 | `…/code/various_scripts/executable_yabai_terminal_follow.sh` | `~/code/various_scripts/yabai_terminal_follow.sh` | Executable script | Keep `terminal` label on WezTerm in/out of fullscreen; sweep husk spaces |
-| `…/code/various_scripts/yabai_common.sh` | `~/code/various_scripts/yabai_common.sh` | Sourced shell lib (not executable) | **Shared helper** — single source of the master-display UUID, the canonical `YABAI_LABELS` list, `yabai_master_index()` (UUID-then-area resolver), and `yabai_load_cache()`. Sourced by the workspace/display/move/refresh/reorder/displays scripts; required sibling |
+| `…/code/various_scripts/yabai_common.sh` | `~/code/various_scripts/yabai_common.sh` | Sourced shell lib (not executable) | **Shared helper** — single source of the master-display UUID, the canonical `YABAI_LABELS` list, the agent apps (`YABAI_AGENT_APPS`/`_RE`), the pinned-home map (`YABAI_PINNED_HOMES`, `YABAI_PINNED_APPS_RE`) and the rules generated from it (`yabai_pin_rules_add`), `yabai_home_map_json()`, `yabai_spaces_json()`, the jq filters `YABAI_JQ_PIN_ELIGIBLE` / `YABAI_JQ_PIN_UNRESOLVED`, the state/log dirs (`YABAI_STATE_DIR`, `YABAI_LOG_DIR`) + `yabai_log`, `yabai_master_index()` (UUID-then-area resolver), `yabai_load_cache()`, and the `ext` helpers. Sourced by yabairc and ~14 `yabai_*` scripts; required sibling |
 | `…/dot_hammerspoon/init.lua` | `~/.hammerspoon/init.lua` | Lua config | **Hammerspoon**: classify Arc windows via AXIdentifier; pin the two main windows to main/school (Little Arc left managed). Required dependency, launches at login |
 | (unmanaged) `~/code/projects/layerbar` → `~/Applications/LayerBar.app` | LaunchAgent `com.mackhaymond.layerbar` | Native menu bar app | **LayerBar** — the **live** status indicator. Shows current/total stack layer (e.g. `2 / 3`), or `BSP`/`FLOAT`. Refreshed instantly by the yabai signals poking `notifyutil -p com.mackhaymond.layerbar.refresh`; queries yabai over its unix socket. Read-only/passive (no window-manager effect) |
 | `…/swiftbar_plugins/executable_yabai_layers.30s.sh` | `~/swiftbar_plugins/yabai_layers.30s.sh` | Executable plugin | **Dormant/superseded** SwiftBar version of the layer indicator (ignored via `.swiftbarignore`). Kept as the fallback if LayerBar is ever uninstalled |
@@ -91,7 +92,7 @@ These applications do not participate in yabai's tiling; they float freely:
 
 #### App-to-Space Pinning Rules
 
-These apps automatically appear on their designated space when launched:
+These apps automatically appear on their designated space when launched. The rules are **generated**, not hand-written: `yabai_pin_rules_add` (in `yabai_common.sh`) registers one labeled rule per app (`pin_<app>`, e.g. `pin_Todoist`, plus `pin_agent`) from `YABAI_PINNED_HOMES` + `YABAI_AGENT_APPS`, so the rules and the pinned-home guards in the scripts can't drift apart.
 
 | App | Target Space |
 |-----|--------------|
@@ -108,8 +109,8 @@ These apps automatically appear on their designated space when launched:
 **`agent` (hyper+esc) — the generic coding-agent view.** Unlike every other label,
 `agent` is not one app's home: it is a *view* that whichever coding-agent GUI is
 running lands on (Conductor is the primary). The app set is defined ONCE, as
-`YABAI_AGENT_APPS` in `yabai_common.sh`, and is consumed by the `space=agent`
-rule (which sources it), the refresh script's label assignment, the pinned-home
+`YABAI_AGENT_APPS` in `yabai_common.sh`, and is consumed by the `pin_agent`
+rule (`yabai_pin_rules_add`), the refresh script's label assignment, the pinned-home
 guards in `yabai_send_window{,_external}.sh` / `yabai_toggle_float.sh` (two-way in
 the send scripts, float-direction-only in `yabai_toggle_float.sh`), and the startup
 reconciler's home map via `yabai_home_map_json()` — **add an app there and nowhere else.** Because the
@@ -125,18 +126,19 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 
 **Why label-based queries?** When yabai queries spaces, it uses labels (e.g., `yabai -m query --spaces --space terminal`) rather than indices. This makes all rules robust to index renumbering caused by Mission Control or display hotplug.
 
-> **Caveat — `space=` *rules* store a resolved index, not the label.** yabai resolves `space=terminal` to a numeric index at rule-add time (e.g. `space:1`) and keeps it frozen; `yabai -m rule --list` shows the number, not the label. This stays correct only while the reorder keeps the labeled space at that index — always true on a single display, and on dual-display while the label stays home. The authoritative, index-agnostic placement for WezTerm is the `window_created` nudge (which re-queries `--space terminal` live); the frozen rule is just a belt-and-suspenders re-pin for a missed `window_created` event. (The other `space=` apps share the freeze but their labels never roam, so it never bites them.)
+> **Caveat — `space=` *rules* bind to a space, not to the label.** yabai resolves `space=<label>` to that space's **ID** when the rule is *added* (`parse_space_selector` → `effects.sid`), not on each apply; `yabai -m rule --list` therefore shows a number, not the label. Because it's the space's ID (not its index), the rule follows that space through reorders and display moves. What used to break it: a labeled space destroyed (merged by a fullscreen collapse, Mission Control) and the label re-created by `yabai_workspace_refresh.sh` on *another* space — the rule kept pointing at the dead ID and that app silently stopped pinning until a yabai restart. Fixed 2026-10-06: the rules are labeled (`pin_<app>`, and `rule --add` replaces a same-label rule), and refresh calls `yabai_pin_rules_add` again after relabeling, then `rule --apply`. A rule whose label is missing at that moment fails to parse and leaves the old one in place. WezTerm additionally gets the `window_created` nudge, which re-queries `--space terminal` live.
 
 #### Signal Handlers
 
-**1. `dock_did_restart`** → `sudo yabai --load-sa`. Reloads the scripting addition (needed for native-fullscreen, space create/destroy, etc.) after the Dock restarts.
+**1. `dock_did_restart`** → `sudo -n yabai --load-sa`. Reloads the scripting addition (needed for native-fullscreen, space create/destroy, etc.) after the Dock restarts. `-n` (since 2026-10-06, also on the startup load): never prompt — a stale sudoers pin used to fall through to a Touch ID dialog that blocked the rest of yabairc; now it just fails fast.
 
 **2. `window_created`**
-- **WezTerm:** if a *normal* WezTerm lands on the wrong space, move it to terminal. A *fullscreen* WezTerm is left alone (guarded by `is-native-fullscreen`) so it isn't yanked out of fullscreen.
+- **All windows:** posts the LayerBar refresh (`notifyutil -p com.mackhaymond.layerbar.refresh`) — a new window may add a stack layer.
+- **WezTerm:** if a *normal* WezTerm lands on the wrong space, move it to terminal. A *fullscreen* WezTerm is left alone (guarded by `is-native-fullscreen`) so it isn't yanked out of fullscreen. *(That guard was dead until 2026-10-06: its single-quoted jq filter closed the single-quoted `action=` string, so it ran as a jq compile error. Now double-quoted.)*
 - **Arc:** call `hs -c "arcSync()"` (Hammerspoon re-pins the Arc main windows; Little Arc untouched).
 - **Other apps:** left wherever they land. The terminal space is **not** reserved — any window may share it with WezTerm (the old non-WezTerm "bounce" was removed).
 
-**3. `space_changed`** → `yabai_terminal_follow.sh` then re-activate WezTerm. The follow hook keeps the `terminal` label pinned to WezTerm wherever it roams (including in/out of a native-fullscreen Space), reorders, and sweeps surplus empty husk spaces. Cheap no-op when WezTerm hasn't moved.
+**3. `space_changed`** → posts the LayerBar refresh, then `yabai_terminal_follow.sh`. The follow hook keeps the `terminal` label pinned to WezTerm wherever it roams (including in/out of a native-fullscreen Space), reorders, and sweeps surplus empty husk spaces. Cheap no-op when WezTerm hasn't moved. (It no longer re-activates WezTerm — removed in `815fc8e`.)
 
 **4. `application_launched`** → `yabai -m rule --apply` (re-pins Todoist/Messages/etc.) **and** `hs -c "arcSync()"` (re-pins the Arc main windows) — one consistent "snap" moment.
 
@@ -152,9 +154,15 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 
 **10. `window_created` (label `border_sync_created`)** and **`window_destroyed` (label `border_sync_destroyed`)** → `yabai_float_borders.sh sync`. **Float-window borders** (2026-06-09): reconcile the JankyBorders (`borders`) daemon's `whitelist` to the set of apps that currently have a floating window — starting the daemon (subtle white: focused `0xffffffff` / unfocused `0xff5c6370`, round, width 2) when the first floater appears and killing it when the last one goes away (so it runs only while something floats — not a brew service). A plain `--toggle float` (hyper+t) emits **neither** event, so `yabai_toggle_float.sh` calls `sync` itself; a one-shot startup `sync` borders any floater macOS restored at login. **Scope = all `is-floating` windows**, which includes manage=off apps (Finder, System Settings, …) — yabai exposes no per-window "managed" flag to exclude them, so they're bordered whenever open. **Caveat (inherent to JankyBorders):** it borders by *app*, not *window*, so an app with both a floating and a tiled window gets the border on both. Requires `brew install felixkratz/formulae/borders`; the script degrades to a no-op if `borders` is absent.
 
+**11. Float sweep — `space_changed` (label `float_sweep_space_changed`), `window_deminimized` (`float_sweep_deminimized`), `window_focused` filtered to the pinned apps (`float_sweep_focused`, `app=$YABAI_PINNED_APPS_RE`)** → `YABAI_EVENT=<event> yabai_startup_reconcile.sh float`: one `unfloat_pins()` pass; also hands an unresolved pinned window to `yabai_pin_resolve.sh`. See "the float sweep" below.
+
+**12. `application_launched` filtered to the pinned apps (label `pin_resolve_launched`)** → `yabai_pin_resolve.sh application_launched --watch 30`, and **`system_woke` (label `pin_resolve_woke`)** → `yabai_pin_resolve.sh system_woke --delay 3`. See "Unresolved pinned windows" below.
+
+**13. `window_focused` (label `layers_refresh_focus`)** and **`window_destroyed` (label `layers_refresh_destroyed`)** → `$YABAI_LAYERS_REFRESH` (the LayerBar `notifyutil` post). Focus covers stack-layer cycling and focus landing on a window of a different float/stack type; destroy covers a close lowering the stack depth. Opens and space switches refresh inline in #2/#3; the bsp↔stack toggle has no signal, so `yabai_skhd_mode.sh` posts it itself.
+
 *(Also: a one-shot startup sync — `"$YABAI_WORKSPACE_REFRESH" startup` — runs near the **top** of yabairc, before the rules. Specific line numbers are intentionally omitted here — they drift; grep the signal name in `yabairc`.)*
 
-**Startup reconciliation** (`yabai_startup_reconcile.sh`, run **backgrounded** right after the startup `rule --apply`): fixes the **login race** where pinned apps land on the wrong space. At login, macOS restores app windows around when yabai starts, so windows created before the signals registered get no `window_created`/`application_launched` event, and the one-shot `rule --apply` can run *before* those windows exist (or before `--load-sa` finishes — window→space moves need the scripting addition). The reconcile re-loads the scripting addition once (`sudo -n`), then **polls until stable** — repeatedly re-applying the `space=` rules, re-pinning Arc, and un-floating misclassified pins until every *running* pinned app is on its home space **and not flagged FLOAT** (see the next section), or a hard cap (`YABAI_RECONCILE_CAP`, default ~90 s). This self-truncates on a fast login (exits in ≈0.2 s once everything's home) and self-extends for slow-launching apps (Electron: ChatGPT, Claude, Notion Calendar, Messages), so it's more robust than a fixed ramp that could miss an app finishing after the last pass. Backgrounded so it never blocks startup; single-flighted (mkdir lock, like `yabai_heal.sh`) so repeated restarts don't stack overlapping polls; idempotent. Supersedes the old workaround of manually restarting yabai after login.
+**Startup reconciliation** (`yabai_startup_reconcile.sh`, run **backgrounded** right after the startup `rule --apply`): fixes the **login race** where pinned apps land on the wrong space. At login, macOS restores app windows around when yabai starts, so windows created before the signals registered get no `window_created`/`application_launched` event, and the one-shot `rule --apply` can run *before* those windows exist (or before `--load-sa` finishes — window→space moves need the scripting addition). The reconcile re-loads the scripting addition once (`sudo -n`), then **polls until stable** — repeatedly re-applying the `space=` rules, re-pinning Arc, and un-floating misclassified pins until every *running* pinned app is on its home space **and not flagged FLOAT** (see the next section), or a hard cap (`YABAI_RECONCILE_CAP`, default ~90 s). This self-truncates on a fast login (exits in ≈0.2 s once everything's home) and self-extends for slow-launching apps (Electron ChatGPT, Claude, Notion Calendar; the native Messages), so it's more robust than a fixed ramp that could miss an app finishing after the last pass. Backgrounded so it never blocks startup; single-flighted (mkdir lock, like `yabai_heal.sh`) so repeated restarts don't stack overlapping polls; idempotent. Supersedes the old workaround of manually restarting yabai after login.
 
 The same poll also fixes a **second startup failure — a pinned app landing *floating*** (added 2026-08-21, after Claude came up floating on `ai` while ChatGPT tiled normally on the same space). yabai classifies every window it finds **before** the config runs (`window_manager_begin()` precedes `exec_config_file()`), so no rule can influence that pass, and it flags `WINDOW_FLOAT` on any window it momentarily cannot move — which a window still settling after a restore can be. Nothing clears that flag afterwards: `rule --apply` re-pins the *space* and leaves the window floating. Two traps make this harder than it looks, both verified live:
 
@@ -179,23 +187,27 @@ The fix moves the retry from "20 s at startup" to "every cheap, user-paced momen
 - **Only floaters already on their home space** are candidates in float mode: a pinned app floating elsewhere is either the user's own (`hyper+t` is only allowed off home) or one the next `application_launched` will re-home first. The user's own floats are additionally recorded by `yabai_toggle_float.sh` (`~/Library/Caches/yabai/keep-float/<id>`) so a later `rule --apply` re-home can't turn them into a "repair"; the startup poll purges the markers (a float that survives a yabai restart is never a choice — yabai re-classified from scratch).
 - **Backoff memo**: after 3 consecutive dropped un-floats a window is skipped for 10 min, except on a deminimize or a focus of a pinned app's window. A window whose cache never refreshes (never minimized) is the accepted residual — it's an upstream defect. Escape hatches: minimize/deminimize it; `yabai -m window <managed sibling id> --stack <stuck id>` (**sibling first** — the only single command that clears FLOAT *and* joins the home view regardless of the active space, `window_manager.c:1804-1816`); or restart yabai.
 - **The state dir is fixed** (`~/Library/Caches/yabai`, `YABAI_STATE_DIR` in `yabai_common.sh`), not `${TMPDIR:-/tmp}`: yabai's signal actions inherit yabai's `TMPDIR` (`/var/folders/…/T/`), skhd's keybind actions have none (verified 2026-08-29), so under `TMPDIR` a marker written by `hyper+t` was invisible to a sweep, and the heal/borders locks single-flighted nothing across the two callers. All of `yabai_heal.sh`, `yabai_float_borders.sh` and the reconcile now lock there.
-- **Locks**: the startup poll touches `alive` every pass, so a sweep defers to it only while that is < 30 s old and reaps an orphan otherwise (an orphan used to disable the repair for the whole login session, silently). A second `--restart-service` while a poll from the *previous* yabai is running is no longer dropped: the new poll asks the holder to stop between passes (`stop` file) and takes over. The flip pair runs under `trap '' TERM` so nothing can strand a space in bsp.
-- **Log**: `~/Library/Logs/yabai/reconcile.log`, one line per attempt/skip/give-up/exit with the window's pre-state (`cm` can-move, `cr` can-resize, `sr` subrole, `lvl` level, `ax` has-ax-reference) — the three questions this incident couldn't answer (did the repair run? which predicate blocked it? what finally fixed it?) are one `grep id=<wid>` next time. Trimmed to the last 2000 lines at startup once it passes 200 KB. `float --dry-run` prints what a sweep would do.
+- **Locks**: the startup poll touches `alive` every pass, so a sweep defers to it only while that is < 30 s old and reaps an orphan otherwise (an orphan used to disable the repair for the whole login session, silently). A second `--restart-service` while a poll from the *previous* yabai is running is no longer dropped: the new poll asks the holder to stop between passes (`stop` file), waits out a whole pass (~8 s), and takes over. Since 2026-10-06 the lock is **owned by pid** (`$LOCK/pid`): a holder releases it — and keeps polling — only while it still owns it, because the displaced poll's EXIT trap used to delete the *new* holder's lock, after which sweeps and the resolver no longer saw a live poll. The focus/deminimize sweeps wait up to 1.5 s for the sweep lock instead of losing it to the `space_changed` sweep that fired a moment earlier. The flip pair runs under `trap '' TERM` so nothing can strand a space in bsp.
+- **Stale locks at startup**: a restart kills yabai's whole process group, so any lock older than the running yabai (`pin_resolve`, `heal`, `float_sweep`, `float_borders`, and `yabai_displays.lock`) can't have a live holder; startup mode clears them (`startup cleared-stale-lock …`). A stale `heal.lock` used to force every sweep onto the flip route, and a stale displays lock disabled `yabai_terminal_follow.sh` until the next dock.
+- **Log**: `~/Library/Logs/yabai/reconcile.log`, one line per attempt/skip/give-up/exit with the window's pre-state (`cm` can-move, `cr` can-resize, `sr` subrole, `lvl` level, `ax` has-ax-reference) — the three questions this incident couldn't answer (did the repair run? which predicate blocked it? what finally fixed it?) are one `grep id=<wid>` next time. Trimmed to the last 2000 lines at startup once it passes 200 KB. `float --dry-run` prints what a sweep would do (startup mode has no dry run — it would still `rule --apply`, arcSync and wipe markers).
 - **Rejected**: an automated `rule --apply app=^X$ manage=on` escalation — per-*app*, sets `WINDOW_RULE_MANAGED` *before* the eligibility check, force-tiles every root window of the app (Electron helpers included) into the **active** view, permanently; an AX-gated launch wrapper (an unsigned AX probe under launchd has no TCC trust, so every restart would wait the full timeout); a `system_woke` trigger (wake alone never misclassifies, and 0.3 s after wake AX is exactly in the stalled state).
 
 Two bugs found while testing this, both pre-dating it and both fixed here:
 
 - **`pins_settled()` counted windows yabai can never move.** An Electron app publishes hidden helper windows with an *empty* subrole and `can-move: false` — Claude Desktop ships two, parked on whatever space it launched from. `rule --apply` cannot move them home, so the poll could never settle and burned its **entire 90 s cap at every login**, re-running `rule --apply` + `arcSync()` every 2 s. The off-home check now only counts `AXStandardWindow` root windows.
-- **`yabai -m query --spaces` intermittently returns a bare `[`** (seen 2026-08-20 and again 2026-08-21, persisting for minutes) while `--windows` and the *indexed* form `--spaces --space <sel>` keep working. Anything polling on the bulk form goes blind and spins to its cap. `yabai_common.sh` now has `yabai_spaces_json()`: retry briefly, then rebuild the array one canonical label at a time. Labeled spaces only, which is all any consumer wants.
+- **`yabai -m query --spaces` intermittently returns a bare `[`** (seen 2026-08-20 and again 2026-08-21, persisting for minutes) while `--windows` and the *indexed* form `--spaces --space <sel>` keep working. Anything polling on the bulk form goes blind and spins to its cap. `yabai_common.sh` now has `yabai_spaces_json()`: retry briefly, then rebuild the array one canonical label at a time. Labeled spaces only, which is all any consumer wants. `yabai_workspace_refresh.sh` can't use it (it needs the *unlabeled* spaces too, to reuse them), and until 2026-10-06 it only checked the exit code: a bare `[` read as "zero spaces", so it ran `space --create` once per label, twice per run — 20 spurious spaces. It now validates every bulk query (`type == "array" and length > 0`, 3 tries, else skip this run) and stops creating for the rest of a run once a `space --create` yields no new space.
 
 **Unresolved pinned windows → guarded yabai restart (`yabai_pin_resolve.sh`, added 2026-10-06).** A third failure, the one that *only* a manual `yabai --restart-service` used to fix: Claude Desktop stranded on a random space (`agent`, 2026-10-06 after login; also after its 2026-10-05 stealth update relaunch). The window was **listed** by `query --windows` but with `has-ax-reference: false`, empty subrole, `can-move: false` — and `window <id> --space ai` answered `could not locate the window to act on!`. The yabai source (v7.1.25) explains it: an app's windows on *other* spaces are resolved only by a brute force over AX element ids (`window_manager_add_existing_application_windows`, `refresh_index == -1`) that runs **only at yabai start** (`window_manager_begin`). At login, a window that isn't AX-ready at that instant goes on `applications_to_refresh`, whose later retries (space change, app activation) read only `kAXWindows` — which lists **active-space** windows, and the stuck window is by definition on a space the user isn't looking at. On an app (re)launch — Claude's stealth update relaunch — it's worse: the launch handler reads only `kAXWindows` and never queues a retry at all, so a window that comes up on an inactive space is never tracked (upstream issue #2833, unmerged patch: run the brute force on launch too). So no rule, no float sweep, nothing can reach it; `pins_settled()` even skipped it as a "helper" (empty subrole), so the startup poll declared success in 0 s. Only a restart re-runs the brute force. The resolver automates that restart:
 
-- **Detection** (`YABAI_JQ_PIN_UNRESOLVED` in `yabai_common.sh`): a pinned app's root window with `has-ax-reference: false`, at least 300×200, **and the app has no resolved standard window at all** — so an unresolvable Electron helper next to a healthy main window never triggers a restart.
+- **Detection** (`YABAI_JQ_PIN_UNRESOLVED` in `yabai_common.sh`): a pinned app's root window with `has-ax-reference: false`, at least 300×200, **and the app has no resolved standard window at all** — so an unresolvable Electron helper next to a healthy main window never triggers a restart. "The app" is matched by **pid**, not name: an unresolved window reports the *process* name, a resolved one the app name, and those differ for WezTerm (`wezterm-gui` vs `WezTerm`).
 - **Triggers**: the float sweep's existing single query (every `space_changed` / pinned `window_focused` / `window_deminimized` — zero extra forks unless something is stuck), `application_launched` for pinned apps (label `pin_resolve_launched`, `--watch 30`: the relaunched window appears ~6 s after the event), `system_woke` (label `pin_resolve_woke`, `--delay 3`), and the end of the startup poll (`--delay 5`).
-- **Guards**: the same window id must still be unresolved 2 s later; never during a live startup poll; ≤ 1 restart per 30 s; ≤ 2 restarts per window id (memo expires after a day) — then a single `gave-up` log line and it's left alone. Single-flighted (mkdir lock). Idle cost: none; a no-op run is ~30 ms.
-- **Log**: `~/Library/Logs/yabai/resolve.log` (`restart` / `defer` / `gave-up` lines with the stuck `id app space`). `yabai_pin_resolve.sh manual --dry-run` prints what it would do.
+- **Guards**: the same window id must still be unresolved 2 s later; never during a live startup poll; **never behind the lock screen** (right after wake AX is stalled, so the new yabai's discovery pass would fail for *every* other-space window — the first space switch after unlock re-triggers it via the sweep); ≤ 1 restart per 30 s — a check landing inside that gap (typically the startup check right after our own restart) **waits the gap out and looks once more** instead of dropping the retry; ≤ 2 restarts per window id (memo entries expire after a day; an expired count restarts at 0) — then a single `gave-up` log line and it's left alone. The memo is **scoped to the login session** (WindowServer pid): CGWindowIDs restart at every login in a deterministic order, so Claude tends to get the same small id each time and a memo outliving the login would spend this login's budget on last login's window. Single-flighted (mkdir lock). Idle cost: none; a no-op run is ~30 ms.
+- **Restore after restart**: a restart silently resets per-space layouts (every space comes back the global `stack`, so a `hyper+fn+b` bsp space reverts) and re-classifies floats (a `hyper+t` float comes back tiled). Right before restarting, the resolver snapshots non-`stack` labeled spaces and the `hyper+t` floats (non-pinned floating standard windows + `keep-float/` markers) to `~/Library/Caches/yabai/restore_after_restart`; the startup poll replays it after it settles, only if < 5 min old, toggling only windows that came back tiled. Hand-tuned bsp split ratios are not recoverable.
+- **Log**: `~/Library/Logs/yabai/resolve.log` (`restart` / `defer` / `gave-up` lines with the stuck `id app space`; the replay logs `startup restored-after-restart …` in `reconcile.log`). `yabai_pin_resolve.sh manual --dry-run` prints what it would do.
 
-> **Debugging signals:** there is no `yabai -m query --signals` in this yabai version (it errors `unknown command`). The authoritative list of registered signals is the `signal --add` lines in `yabairc` — grep them there.
+**Upstream context.** yabai #2833 (the launch path never brute-forces inactive-space windows; patch unmerged as of 2026-10-06) is why the resolver exists for the update-relaunch case — a yabai with that patch would make the `pin_resolve_launched` trigger redundant, not the login one. Separately, on macOS 26.6 the v7.1.25 scripting addition's `add_space` pattern no longer matches: `yabai -m space --create` returns 0 and silently does nothing (verified live 2026-10-06), and the `sa=FAIL` lines in `reconcile.log` were that, not the sudoers pin (which matches the current binary). Fixed on yabai master in `dd84572`; until a release carries it, refresh's create backstop (above) keeps a failed create from looping.
+
+> **Debugging signals:** `yabai -m signal --list` returns every registered signal as JSON (label, event, app filter, action) — `yabai -m signal --list | jq -r '.[] | "\(.label)\t\(.event)"'`. (There is no `query --signals`; it errors `unknown command`.) Unlabeled signals (`dock_did_restart`, the plain `window_created` / `space_changed` / `application_launched` handlers) show an empty label.
 
 #### Environment Variables Exported
 
@@ -205,10 +217,12 @@ Two bugs found while testing this, both pre-dating it and both fixed here:
 | `YABAI_DISPLAYS` | `${HOME}/code/various_scripts/yabai_displays.sh` | `display_added` / `display_removed` signals |
 | `YABAI_MOUSE_FOLLOW` | `${HOME}/code/various_scripts/yabai_mouse_follow.sh` | `display_changed` signal |
 | `YABAI_HEAL` | `${HOME}/code/various_scripts/yabai_heal.sh` | `space_destroyed` / `mission_control_exit` signals (debounced self-heal) |
-| `YABAI_STARTUP_RECONCILE` | `${HOME}/code/various_scripts/yabai_startup_reconcile.sh` | Backgrounded once at yabai startup (login-race + stray-float fix: polls — re-apply rules + Arc re-pin + un-float misclassified pinned windows — until pinned apps are home and tiled, capped by `YABAI_RECONCILE_CAP` ≈90 s) |
+| `YABAI_STARTUP_RECONCILE` | `${HOME}/code/various_scripts/yabai_startup_reconcile.sh` | Backgrounded once at yabai startup (login-race + stray-float fix: polls — re-apply rules + Arc re-pin + un-float misclassified pinned windows — until pinned apps are home and tiled, capped by `YABAI_RECONCILE_CAP` ≈90 s); also the action (`… float`) of the 3 float-sweep signals (`float_sweep_space_changed` / `_deminimized` / `_focused`) |
+| `YABAI_PIN_RESOLVE` | `${HOME}/code/various_scripts/yabai_pin_resolve.sh` | `pin_resolve_launched` (`application_launched`, pinned apps) / `pin_resolve_woke` (`system_woke`) signals — guarded restart for an unresolved pinned window |
+| `YABAI_LAYERS_REFRESH` | `/usr/bin/notifyutil -p com.mackhaymond.layerbar.refresh` | `layers_refresh_focus` / `layers_refresh_destroyed` signals (the `window_created` / `space_changed` handlers post the same notification inline) — instant LayerBar refresh |
 | `YABAI_FLOAT_BORDERS` | `${HOME}/code/various_scripts/yabai_float_borders.sh` | `window_created` / `window_destroyed` signals + a startup sync + the hyper+t toggle + `yabai_startup_reconcile.sh` after an un-float — draws a JankyBorders border around floating windows (daemon runs only while something floats) |
 
-### 3.2 Skhd Hotkey Daemon (skhdrc)
+### 3.2 Keybinds (skhdrc, fired by Karabiner)
 
 **File:** `~/.config/skhd/skhdrc`
 
@@ -229,7 +243,7 @@ All other keys referenced by character (e.g., `hyper - 1`, `hyper - z`).
 
 #### Focus Workspace (Hyper Layer)
 
-Move focus to a labeled space without moving it. Focus stays on the current display.
+Move focus to a labeled space without moving it — on whichever display the label lives (a label pushed to the external is focused there; the space never comes to you).
 
 | Keybinding | Key | Script | Workspace |
 |---|---|---|---|
@@ -297,7 +311,7 @@ Swap the focused window with its neighbor in a direction (bsp).
 
 #### Bsp Focus, Resize & Layout (Hyper)
 
-Bare-hyper bsp cluster: directional focus, resize, balance, split-orientation, and rotate. All are inline `yabai` commands (no script). No-ops / harmless in a stack space. Note `hyper - a` and `hyper - s` are **reserved by BetterTouchTool** — no skhd bind may use them.
+Bare-hyper bsp cluster: directional focus, resize, balance, split-orientation, and rotate. All are inline `yabai` commands (no script). No-ops / harmless in a stack space. Note `hyper - a`, `hyper - s` and `hyper - c` are **reserved for Arc** — no skhdrc bind may use them (see the §6 note).
 
 | Keybinding | Key | Command | Action |
 |---|---|---|---|
@@ -334,7 +348,7 @@ Bare-hyper bsp cluster: directional focus, resize, balance, split-orientation, a
 | `hyper - t` | T | `yabai_toggle_float.sh` | Toggle the focused window's float (works in **both** stack & bsp). **Directional guard:** refuses to *float* a pinned app on its home space (or Arc on main/school), but always allows *un*-floating one — that's the manual way back from a window yabai flagged FLOAT on its own. manage=off apps are not guarded |
 | `hyper + fn - m` | Fn+M | `yabai -m window --toggle native-fullscreen` | Toggle native fullscreen (global; **no-op on WezTerm** by design — see the "WezTerm is not fullscreenable" note) |
 | `hyper + fn - b` | Fn+B | `yabai_skhd_mode.sh` | Toggle space layout (bsp ↔ stack) |
-| `hyper + fn - s` | Fn+S | `display_sleep_lock.sh` | Sleep displays now (+ session locks via the immediate screen-lock policy). On the fn layer: bare `hyper-s` is BTT-reserved. Must always work, even over an agent-held display-awake assertion — forced sleep overrides idle assertions (cua v2 canaries this) |
+| `hyper + fn - s` | Fn+S | `display_sleep_lock.sh` | Sleep displays now (+ session locks via the immediate screen-lock policy). On the fn layer: bare `hyper-s` is reserved for Arc (was BetterTouchTool). Must always work, even over an agent-held display-awake assertion — forced sleep overrides idle assertions (cua v2 canaries this) |
 
 #### Native-Fullscreen App Access (Hyper)
 
@@ -348,9 +362,9 @@ Reach apps put into macOS native fullscreen — they live in their own Spaces ou
 
 ### 3.3 Karabiner-Elements Key Remapping
 
-**File:** `~/.config/karabiner/karabiner.json`
+**File:** `~/.config/karabiner/karabiner.json` (generated — edit `.chezmoitemplates/karabiner-base.json` or `skhdrc.tmpl`, see §2)
 
-Karabiner preprocesses keyboard input at the OS level, creating the hyper modifier and translating raw key presses to F-keys that skhd can bind.
+Karabiner handles keyboard input at the HID level: it creates the hyper modifier and, since 2026-09-23, **fires every skhdrc bind itself**. `skhd-to-karabiner.py` prepends one generated rule (one manipulator per bind, fn-layer binds first) to the hand-written base rules.
 
 #### Core Remapping: Caps Lock → Hyper
 
@@ -361,7 +375,9 @@ This single remapping enables nearly every downstream binding.
 
 #### Complex Modifications: F-Key Chords
 
-| From | To | Skhd Binding | Purpose |
+The base config writes these chords as "→ F13/F14/F18/F19" (the names skhdrc binds), but Karabiner never re-processes its own output, so the generator **rewrites each chord to run the matching skhdrc command directly** — no F-key is ever emitted. A bare-key bind with no chord producing it fails `chezmoi apply`.
+
+| From | Base output | skhdrc bind it runs | Purpose |
 |------|----|----|---------|
 | F1 + hyper | F13 | `f13 : yabai_display.sh master` | Focus master (laptop) display |
 | F2 + hyper | F14 | `f14 : yabai_display.sh external` | Focus external display |
@@ -369,6 +385,10 @@ This single remapping enables nearly every downstream binding.
 | Escape + hyper + fn | F19 | `f19 : yabai_send_window.sh agent` | Send window to agent workspace |
 | Caps_Lock + Escape (simultaneous) | F18 | `f18 : yabai_workspace.sh focus agent` | Alt ergonomic path to focus agent |
 | Fn + Caps_Lock + Escape (simultaneous) | F19 | `f19 : yabai_send_window.sh agent` | Alt ergonomic path to send to agent |
+
+#### Arc-only Shortcuts (were BetterTouchTool)
+
+BetterTouchTool is no longer running; its Arc shortcuts live in `karabiner-base.json`, active only while Arc is frontmost: `hyper+a` → `option+command+left_arrow`, `hyper+s` → `option+command+right_arrow`, `hyper+c` → `shift+command+c` (copy URL), plus the double-tap caps_lock / right_shift → `ctrl+tab`. **Trap:** the generated skhdrc rule is *prepended*, so an skhdrc bind on `hyper - a`/`s`/`c` would win over these and silently kill the Arc shortcuts — keep those three keys out of skhdrc.
 
 #### System FN Row Preservation
 
@@ -441,9 +461,12 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 | `yabai_display.sh` | `master` \| `external` | Focus the laptop or external display; no-op on single display |
 | `yabai_space_move.sh` | `push` \| `home-all` | Cross-display space movement: push focused space to other display (with follow), or pull all labels home |
 | `yabai_displays.sh` | `added` \| `removed` | Hotplug handler: dock = refresh cache (non-destructive); undock = pull home safety net |
-| `yabai_workspace_refresh.sh` | (none; on-demand) | Reconcile canonical labels on all displays; refresh display topology cache |
+| `yabai_workspace_refresh.sh` | (none; on-demand) | Reconcile canonical labels on all displays (validated queries; conservative label-follows-app; positional labels skip native-fullscreen Spaces); refresh display topology cache; re-register the pin rules (`yabai_pin_rules_add`) + `rule --apply`; reorder |
 | `yabai_heal.sh` | (none; signal handler) | Debounced self-heal — single-flight (mkdir lock) + settle, then `yabai_workspace_refresh.sh`. Bound to `space_destroyed` / `mission_control_exit` |
-| `yabai_startup_reconcile.sh` | (none; backgrounded at startup) | Login-race + stray-float fix — re-loads the SA (`sudo -n`) + **polls until stable** (re-apply rules + Arc re-pin + un-float misclassified pinned windows, until every running pinned app is home **and tiled**, ~90 s cap) so restored windows reach their pinned spaces without a manual yabai restart. Single-flighted (mkdir lock) |
+| `yabai_startup_reconcile.sh` | `[startup]` \| `float [--dry-run]` | **`startup`** (backgrounded from yabairc): clears locks older than this yabai, re-loads the SA (`sudo -n`) + **polls until stable** (re-apply rules + Arc re-pin + un-float misclassified pinned windows, until every running pinned app is home **and tiled**, ~90 s cap), restores bsp layouts + `hyper+t` floats after an automatic restart, then runs `yabai_pin_resolve.sh startup --delay 5`. **`float`**: one un-float pass, run by the 3 float-sweep signals. Single-flighted per mode (pid-owned mkdir locks) |
+| `yabai_pin_resolve.sh` | `<event> [--delay S] [--watch S] [--dry-run]` | Guarded `yabai --restart-service` for a pinned window yabai lists but can't act on (2 s confirm, ≤1/30 s, ≤2 per window, never during the startup poll or behind the lock screen); snapshots layouts/floats first. Log `resolve.log` |
+| `yabai_send_window_external.sh` | (none) | `hyper+fn+g`: fling the focused unpinned window to the external's on-demand `ext` space (create + follow); no-op with one display |
+| `restart-yabai.sh` | (none; Raycast) | `yabai --restart-service` from Raycast; not wired to any signal/bind |
 | `yabai_skhd_mode.sh` | (none) | Toggle focused space layout (bsp ↔ stack) |
 | `yabai_toggle_float.sh` | (none) | Toggle the focused window's float (`hyper+t`); works in both stack & bsp; **directional guard** — refuses to float a pinned app on its home space + Arc on main/school, always allows un-floating (manage=off apps not guarded); calls `yabai_float_borders.sh sync` after toggling |
 | `yabai_float_borders.sh` | `sync` | Reconcile the JankyBorders daemon to the current floating-window set — start it (subtle white, round, width 2) when ≥1 window floats, live-update its app `whitelist`, kill it when none. **Single-flight (mkdir lock + 0.15 s settle, mirrors `yabai_heal.sh`)** so concurrent syncs can't spawn duplicate daemons (`borders` is not a process-level singleton); a daemon count ≠ 1 is self-healed to one. Wired to `window_created`/`window_destroyed` + startup + the hyper+t toggle + `yabai_startup_reconcile.sh` after an un-float. No-op if `borders` isn't installed |
@@ -472,6 +495,7 @@ Readers (scripts that `. "$CACHE_FILE"` to resolve topology):
     ├── yabai_display.sh        (master/external focus)
     ├── yabai_space_move.sh     (push/home-all)
     ├── yabai_displays.sh       (hotplug; also re-writes it)
+    ├── yabai_send_window_external.sh (fling to `ext`)
     └── (yabai_screen_flash.sh was a cache reader too, but the flash is now disabled/dormant)
 
     Load pattern:
@@ -506,6 +530,20 @@ yabai -m space --focus main
 
 Labels persist through all these events, making the entire system stable and predictable.
 
+#### Label Repair (`yabai_workspace_refresh.sh`)
+
+When a label *is* lost (a destroyed/merged space, a yabai restart), refresh puts it back in two ways:
+
+- **Positional:** a missing label goes to its canonical position N = the **Nth regular space on the master**; native-fullscreen Spaces are not counted and never handed a label (counting them used to shift every later label by one). If that slot is taken it falls back to the first unlabeled regular space, and only then creates one.
+- **Label-follows-app:** each pinned app's label then moves onto the space where that app actually lives — the repair for labels handed out by position. Since 2026-10-06 this is **conservative**, because following *any* window of the app let a stray one drag the label along (a Claude window stranded on `todo` at a restart took `ai` there; Claude in native fullscreen pulled `ai` onto the fullscreen Space):
+  1. a label **stays** where it is if that space already hosts one of its apps;
+  2. it never takes a space whose **own** label's app lives there (that window is the stray, not the label);
+  3. it never lands on a **native-fullscreen** Space (`terminal` excepted — `yabai_terminal_follow.sh` deliberately puts it on a fullscreen WezTerm).
+
+  `ai` is one call for `^(ChatGPT|Claude)$`, so rule 1 keeps it wherever either app is (two calls flipped it to whichever ran second).
+
+After relabeling, refresh re-registers the pin rules (see the `space=` caveat in §3.1) and runs `rule --apply`, then the reorder.
+
 #### Dock/Undock Flow
 
 **On Plug (External Monitor Connected):**
@@ -519,7 +557,7 @@ Labels persist through all these events, making the entire system stable and pre
    - Ensures all 10 canonical labels exist on master.
    - **Does NOT move any spaces** (external comes up empty-and-ready).
    - Writes cache.
-6. User manually pushes workspaces via `hyper+\` (skhd → yabai_space_move.sh push) or pulls master workspaces to external display.
+6. User manually pushes workspaces via `hyper+\` (Karabiner → yabai_space_move.sh push) or pulls master workspaces to external display.
 
 **On Unplug (External Monitor Disconnected):**
 1. macOS emits `display_removed` signal.
@@ -586,19 +624,20 @@ This is a no-op in the common already-ordered case (no moves) and when focus hel
 
 ### Prerequisites & Bootstrap
 
-The single most fragile dependency in the whole system is the **scripting addition**, which yabai needs for native-fullscreen, space create/destroy, and the husk sweep. yabairc loads it on every (re)start via `sudo yabai --load-sa` (line ~3) and re-loads it from the `dock_did_restart` signal. For that `sudo` to run **non-interactively from a config/signal with no TTY**, three things must be in place — all currently satisfied on this machine, but required to reproduce on a new one:
+The single most fragile dependency in the whole system is the **scripting addition**, which yabai needs for native-fullscreen, space create/destroy, and the husk sweep. yabairc loads it on every (re)start via `sudo -n yabai --load-sa` (top of the file) and re-loads it from the `dock_did_restart` signal. For that `sudo` to run **non-interactively from a config/signal with no TTY**, these must be in place — all currently satisfied on this machine, but required to reproduce on a new one:
 
 1. **Partially-disabled SIP.** `csrutil status` must show a *Custom Configuration* with at least **Filesystem Protections: disabled** (set from Recovery with `csrutil enable --without fs` or equivalent). Full SIP blocks the scripting addition.
-2. **Scripting addition installed.** `sudo yabai --install-sa` puts `yabai.osax` under `/Library/ScriptingAdditions/`. Re-run after a yabai upgrade (the binary hash changes — see #3).
-3. **Passwordless sudoers entry**, hash-pinned to the yabai binary, at `/etc/sudoers.d/yabai` (mode `0440`, owned by root):
+2. **Scripting addition.** yabai v7 has no separate install step: `sudo yabai --load-sa` installs *and* loads it (the only SA options are `--load-sa` and `--uninstall-sa`), so the yabairc line covers it as long as #3 holds.
+3. **Passwordless sudoers entry**, hash-pinned to the yabai binary, at `/etc/sudoers.d/yabai` (mode `0440`, owned by root). Generate the line with:
+   ```bash
+   echo "$(whoami) ALL=(root) NOPASSWD: sha256:$(shasum -a 256 $(which yabai) | cut -d' ' -f1) $(which yabai) --load-sa"
    ```
-   <admin-user> ALL = (root) NOPASSWD: sha256:<hash-of-yabai-binary> /opt/homebrew/bin/yabai --load-sa
-   ```
-   Generate the current line with `yabai --check-sa` (newer yabai) or copy the hash yabai prints. **A yabai version bump changes the binary hash and silently invalidates this line** — `--load-sa` then fails quietly and SA-dependent features stop working with no error in the config.
+   (there is no `--check-sa`). **Regenerate it after EVERY binary change** (upgrade, reinstall, self-build) — a new hash silently invalidates the line; with `sudo -n` the load then fails fast (`sa=FAIL` in `reconcile.log`) and SA-dependent features stop working with no error in the config. Check without running it: `sudo -n -l $(which yabai) --load-sa`.
+4. **Accessibility grant follows the signature.** Release binaries are signed with upstream's self-signed `yabai-cert`; a self-built (`brew install --HEAD`) binary is ad-hoc signed. macOS ties the Accessibility (TCC) grant to the signature, so switching between the two needs Accessibility re-granted to yabai — on top of the sudoers line.
 
-**Symptom of a broken SA layer:** yabai starts and tiling/focus all work, but native-fullscreen toggling, space create/destroy, or the WezTerm husk sweep silently no-op. Fix = re-install the SA and regenerate the sudoers hash, not the config.
+**Symptom of a broken SA layer:** yabai starts and tiling/focus all work, but native-fullscreen toggling, space create/destroy, or the WezTerm husk sweep silently no-op. Fix = regenerate the sudoers hash and re-run `sudo yabai --load-sa`, not the config. (Exception: on macOS 26.6 with yabai 7.1.25, `space --create` no-ops however sudoers is set up — an upstream SA bug, see "Upstream context" in §3.1.)
 
-Other login-time dependencies: **Karabiner** (caps_lock→hyper, the F13/F14/F18/F19 chords) and **Hammerspoon** (`hs.autoLaunch(true)`, for Arc pinning — degrades gracefully if absent). `yabai` runs as a user LaunchAgent. The `skhd` daemon is retired (2026-09-23: `launchctl disable gui/501/com.koekeishiya.skhd`; Karabiner fires the skhdrc binds — see §3.2); re-enabling it would be harmless but pointless, since Karabiner consumes those keys first.
+Other login-time dependencies: **Karabiner** (caps_lock→hyper, the F13/F14/F18/F19 chords) and **Hammerspoon** (`hs.autoLaunch(true)`, for Arc pinning — degrades gracefully if absent). `yabai` runs as a user LaunchAgent. The `skhd` daemon is retired (2026-09-23: `launchctl disable gui/501/com.koekeishiya.skhd`; Karabiner fires the skhdrc binds — see §3.2/§3.3); re-enabling it would be harmless but pointless, since Karabiner consumes those keys first.
 
 ### Focus a Workspace
 
@@ -613,8 +652,8 @@ f18                    # Focus "agent" workspace (no-op if the space is empty)
 ```
 
 **What happens:**
-1. skhd captures the keybinding.
-2. skhd invokes `yabai_workspace.sh focus <label>`.
+1. Karabiner matches the keybinding (its compiled skhdrc rule).
+2. Karabiner runs `yabai_workspace.sh focus <label>`.
 3. Script loads display cache (single-display fast-path or multi-display topology).
 4. Script queries space's live index by label: `yabai -m query --spaces --space <label>`.
 5. Script focuses that index: `yabai -m space --focus <index>`.
@@ -634,8 +673,8 @@ f19                    # Send to "agent" and follow
 ```
 
 **What happens:**
-1. skhd captures the keybinding.
-2. skhd invokes `yabai_send_window.sh <label>`.
+1. Karabiner matches the keybinding (its compiled skhdrc rule).
+2. Karabiner runs `yabai_send_window.sh <label>`.
 3. Script checks if the window is pinned to a home space (wezterm → terminal, Todoist → todo, etc.).
 4. If pinned and already on home space, script exits (bound window cannot move; **focus stays put** — no jump to an empty space).
 5. Otherwise, script queries target space's index by label.
@@ -655,8 +694,8 @@ hyper - 0x2A (\)       # Push focused workspace to other display
 ```
 
 **What happens:**
-1. skhd captures the keybinding.
-2. skhd invokes `yabai_space_move.sh push`.
+1. Karabiner matches the keybinding (its compiled skhdrc rule).
+2. Karabiner runs `yabai_space_move.sh push`.
 3. Script loads cache; resolves MASTER_DISPLAY_INDEX and EXTERNAL_DISPLAY_INDEX.
 4. Script queries focused space (snapshot id, index, display).
 5. Script determines target: if on master → external; if on external → master.
@@ -679,7 +718,7 @@ hyper - 0              # Pull all labeled workspaces to laptop
 ```
 
 **What happens:**
-1. skhd invokes `yabai_space_move.sh home-all`.
+1. Karabiner runs `yabai_space_move.sh home-all`.
 2. Script loads cache.
 3. For each of the 10 canonical labels:
    - Script queries the space's current display.
@@ -696,12 +735,12 @@ hyper - 0              # Pull all labeled workspaces to laptop
 
 **Action:**
 ```bash
-# Press F14 (hyper+F2, remapped by Karabiner)
+# Press hyper+F2 (the chord skhdrc calls f14)
 f14                    # Focus external display
 ```
 
 **What happens:**
-1. skhd invokes `yabai_display.sh external`.
+1. Karabiner matches hyper+F2 and runs the `f14` bind, `yabai_display.sh external`.
 2. Script loads cache; resolves EXTERNAL_DISPLAY_INDEX.
 3. Script focuses the display: `yabai -m display --focus <external_idx>`.
 4. yabai's `display_changed` signal fires.
@@ -758,8 +797,9 @@ nano /Users/mackhaymond/.local/share/chezmoi/dot_config/yabai/executable_yabairc
 
 **Example: Change Karabiner key mapping**
 ```bash
-nano /Users/mackhaymond/.local/share/chezmoi/dot_config/private_karabiner/private_karabiner.json
-# Be careful with JSON syntax!
+nano /Users/mackhaymond/.local/share/chezmoi/.chezmoitemplates/karabiner-base.json
+# Be careful with JSON syntax! (karabiner.json itself is generated by
+# dot_config/private_karabiner/modify_private_karabiner.json.tmpl = this base + the compiled skhdrc binds)
 ```
 
 **Example: Add a new shell script**
@@ -806,10 +846,10 @@ chezmoi apply
 yabai --restart-service
 
 # Or hard restart (if soft fails)
-launchctl kickstart -k gui/$(id -u)/com.koekeishiya.yabai
+launchctl kickstart -k gui/$(id -u)/com.asmvik.yabai
 ```
 
-> On restart, yabairc re-runs `sudo yabai --load-sa` (the scripting addition). This depends on the passwordless-sudo entry described in **Prerequisites & Bootstrap**. If a restart *appears* to succeed but scripting-addition features (native fullscreen, space create/destroy, the husk sweep) quietly stop working, check the scripting addition and the sudoers entry — not the config diff.
+> On restart, yabairc re-runs `sudo -n yabai --load-sa` (the scripting addition). This depends on the passwordless-sudo entry described in **Prerequisites & Bootstrap**. If a restart *appears* to succeed but scripting-addition features (native fullscreen, space create/destroy, the husk sweep) quietly stop working, check the scripting addition and the sudoers entry — not the config diff.
 
 **For Karabiner:**
 - Auto-reloads (watch the Karabiner menu for confirmation).
@@ -896,7 +936,7 @@ git push origin main
 | `hyper - t` | T | Toggle window float | Both stack & bsp; `yabai_toggle_float.sh` — refuses to *float* pinned-on-home + Arc on main/school; *un*-floating always allowed |
 | `hyper + fn - m` | Fn+M | Toggle native fullscreen | Global; no-op on WezTerm by design |
 | `hyper + fn - b` | Fn+B | Toggle space layout (bsp ↔ stack) | |
-| `hyper - a` / `hyper - s` | A / S | *(reserved by BetterTouchTool)* | Not skhd binds — never assign |
+| `hyper - a` / `hyper - s` / `hyper - c` | A / S / C | *(reserved for Arc)* | Arc-frontmost-only rules in `karabiner-base.json` (were BetterTouchTool): `opt+cmd+←` / `opt+cmd+→` / `shift+cmd+c` copy URL. Never assign in skhdrc — the generated rule is prepended and would override them |
 | `hyper + fn - s` | Fn+S | Sleep displays + lock | `display_sleep_lock.sh`; forced sleep overrides agent display-awake assertions |
 | **Display & Cross-Display Movement** |
 | `f13` | Hyper+F1 | Focus master (laptop) display | Karabiner-mapped |
@@ -908,7 +948,7 @@ git push origin main
 | `hyper - 4` | 4 | Focus 2nd native-fullscreen app | ordinal 2 |
 | `hyper - 5` … `hyper - 9` | 5–9 | Focus 3rd … 7th native-fullscreen app | ordinals 3–7; no-op if absent |
 | **System / Help** |
-| `hyper + fn - 0x2C` | Fn+/ (`?`) | Toggle the on-screen keybind help overlay | Hammerspoon `yabaiHelpToggle` (`init.lua`); on the fn layer because bare `hyper+/` is swallowed by macOS's reserved `cmd+?` |
+| `hyper + fn - 0x2C` | Fn+/ (`?`) | Toggle the on-screen keybind help overlay | Hammerspoon `yabaiHelpToggle` (`init.lua`). On the fn layer for a historical reason: under the skhd daemon, bare `hyper+/` was swallowed by macOS's reserved `cmd+?` before skhd's event tap; Karabiner matches below that, so it may no longer apply |
 | `esc` | Escape | Close the help overlay | Active only while the overlay is showing |
 
 ## Notes & Key Design Decisions
@@ -918,7 +958,7 @@ git push origin main
 - **Non-destructive dock:** External monitor comes up empty; user manually pushes workspaces.
 - **Pull-home on undock:** Automatic safety net prevents orphaned windows on non-existent displays.
 - **Terminal space (not reserved):** WezTerm's home space, but other windows may land on it and stay — the old non-WezTerm bounce was removed. WezTerm itself is still nudged onto it on launch.
-- **Pinned apps:** Certain apps (Todoist, Granola, Spark Mail, etc.) are sticky and cannot be moved off their home spaces.
+- **Pinned apps:** Certain apps (Todoist, Granola, Spark Mail, etc.) are sticky: `hyper+fn+<space>` / `hyper+fn+g` won't send them off their home spaces, and the rules re-home them on every app launch. The one way off is **`hyper+fn+m` native fullscreen**, which moves the window onto its own fullscreen Space (reach it with `hyper+3-9`). Refresh no longer lets the app's label follow it there — only `terminal` may sit on a fullscreen Space.
 - **Stack layout:** Only one window visible at a time; navigate with hyper+z/x to cycle through stacked layers.
 - **Mouse follow:** Cursor automatically warps to newly focused display (reduced need for manual positioning).
 - **Screen flash:** *(disabled 2026-06-04)* — formerly an orange border confirming focus jumped to the external display; the helper remains dormant in-tree.

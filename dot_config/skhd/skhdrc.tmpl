@@ -35,7 +35,7 @@ hyper - e: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus 
 hyper - d: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus messages
 hyper - f: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus ai
 # `agent` is the GENERIC coding-agent view (Conductor, Claudia, OpenChamber,
-# OpenCode, Jean, T3 Code -- list in yabai_common.sh). No-op when the space is
+# OpenCode, Jean, T3 Code, Muse -- list in yabai_common.sh). No-op when the space is
 # empty, i.e. when no agent app is running.
 f18 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_workspace.sh focus agent # caps_lock+escape -> F18
 
@@ -51,8 +51,8 @@ hyper - 7 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_fullscreen_focus.s
 hyper - 8 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_fullscreen_focus.sh 6
 hyper - 9 : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_fullscreen_focus.sh 7
 
-# hyper+fn+<space>: send the focused window to that space, unless it's a pinned
-# app already on its home space (those stay put). Focus stays where you are.
+# hyper+fn+<space>: send the focused window to that space and FOLLOW it there, unless
+# it's a pinned app already on its home space (those stay put, and so does focus).
 hyper + fn - 0x32: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh terminal
 hyper + fn - 1: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh main
 hyper + fn - 2: {{ .chezmoi.homeDir }}/code/various_scripts/yabai_send_window.sh school
@@ -103,7 +103,7 @@ hyper - 0x27 : yabai -m window --resize bottom:0:60
 hyper - b : yabai -m space --balance
 
 # toggle the focused window's split orientation: horizontal <-> vertical (bsp)
-# (hyper+s is taken by BetterTouchTool; v = vertical)
+# (hyper+s is taken -- Arc's rule in karabiner-base.json, was BetterTouchTool; v = vertical)
 hyper - v : yabai -m window --toggle split
 
 # rotate the whole tree 90 deg clockwise (bsp); repeat to cycle 90/180/270/0
@@ -129,12 +129,16 @@ hyper + fn - b : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_skhd_mode.sh
 # sleep the displays now; immediate screen-lock policy locks the session with
 # them. Must ALWAYS work, even while an agent holds a display-awake assertion
 # (forced sleep overrides idle assertions — cua v2 canaries this). On the fn
-# layer because bare hyper-s is reserved by BetterTouchTool (see README §6).
+# layer because bare hyper-s is Arc's (-> option+command+right_arrow, in
+# karabiner-base.json -- was BetterTouchTool). hyper+a/s/c are Arc-only shortcuts there; a bind on any of
+# them here is compiled into the PREPENDED generated rule and would override Arc's
+# (see README §6).
 hyper + fn - s : {{ .chezmoi.homeDir }}/code/various_scripts/display_sleep_lock.sh
 
 # hyper+fn+? (hyper+fn + / , keycode 0x2C) : toggle the system-wide keybind help
-# overlay (Hammerspoon yabaiHelpToggle, see init.lua). On the fn layer because BARE
-# hyper+/ is swallowed before skhd — macOS reserves the cmd+? ("?") combo even with
-# the Help-menu shortcut disabled (verified: hyper+y fired, hyper+/ did not). Adding
-# fn changes the modifier set and dodges it. Esc also closes the overlay (init.lua).
+# overlay (Hammerspoon yabaiHelpToggle, see init.lua). Esc also closes the overlay.
+# Historical: it went on the fn layer when the skhd DAEMON fired binds -- bare hyper+/
+# was swallowed before skhd's event tap (macOS reserves cmd+? even with the Help-menu
+# shortcut disabled; verified then: hyper+y fired, hyper+/ did not). Karabiner now
+# matches below that, so the reason may no longer hold; the chord stayed as is.
 hyper + fn - 0x2C : /opt/homebrew/bin/hs -c "yabaiHelpToggle()"
