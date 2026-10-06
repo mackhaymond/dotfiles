@@ -44,11 +44,13 @@ YABAI_AGENT_APPS_RE="^($(printf '%s' "$YABAI_AGENT_APPS" | sed 's/[()]/\\&/g'))$
 # --- pinned apps: app -> home space label ---------------------------------------
 # The single SHELL-side source of the pinned-app home map, in the same `|`-delimited
 # no-eval-no-regex shape as YABAI_AGENT_APPS (so names with spaces need no quoting
-# care). yabairc's `space=` rules are the one unavoidable mirror -- yabai cannot read
-# a shell map -- and Arc is deliberately absent here: its two main windows are pinned
-# by Hammerspoon's arcSync(), not by a `space=` rule.
+# care). yabairc's `space=` rules are generated from it (yabai_pin_rules_add below),
+# and Arc is deliberately absent here: its two main windows are pinned by
+# Hammerspoon's arcSync(), not by a `space=` rule.
 #
-# Consumed by: yabai_startup_reconcile.sh (the login-race + stray-float home map).
+# Consumed by: yabai_pin_rules_add (yabairc + yabai_workspace_refresh.sh),
+# yabai_startup_reconcile.sh (the login-race + stray-float home map), and
+# yabai_workspace_refresh.sh (which label a pinned app's space should carry).
 # yabai_send_window{,_external}.sh and yabai_toggle_float.sh still carry their own
 # `case` copies; folding those in is a worthwhile follow-up, not a silent one.
 YABAI_PINNED_HOMES="wezterm-gui:terminal|WezTerm:terminal|Todoist:todo|Granola:schedule|Spark Mail:mail|Notion Calendar:calendar|Messages:messages|ChatGPT:ai|Claude:ai"
@@ -58,6 +60,28 @@ YABAI_PINNED_HOMES="wezterm-gui:terminal|WezTerm:terminal|Todoist:todo|Granola:s
 # filter (yabairc). Same escaping as YABAI_AGENT_APPS_RE.
 # shellcheck disable=SC2034
 YABAI_PINNED_APPS_RE="^($(printf '%s' "$YABAI_PINNED_HOMES" | sed 's/:[^|]*//g')|$(printf '%s' "$YABAI_AGENT_APPS" | sed 's/[()]/\\&/g'))$"
+
+# (Re)register the app -> space pinning rules from the map above, one LABELED rule per
+# app (`pin_<app>`, `pin_agent`). Labels matter because yabai resolves `space=<label>`
+# to a space ID when the rule is ADDED (message.c, parse_space_selector -> effects.sid),
+# not on each apply: when a labeled space is destroyed and yabai_workspace_refresh.sh
+# re-creates the label on another space, an unlabeled rule kept pointing at the dead
+# id and that app silently stopped pinning until a yabai restart. rule_add() replaces
+# a same-label rule, so refresh re-binds everything by calling this again. A rule
+# whose label is missing right now fails to parse and leaves the old one in place.
+# Called by yabairc (startup) and yabai_workspace_refresh.sh (after any relabel).
+yabai_pin_rules_add() {
+  local pair app label
+  local IFS='|'
+  for pair in $YABAI_PINNED_HOMES; do
+    app=${pair%%:*}; label=${pair#*:}
+    yabai -m rule --add label="pin_$(printf '%s' "$app" | tr -cd 'A-Za-z0-9')" \
+      app="^${app}\$" space="$label" >/dev/null 2>&1
+  done
+  yabai -m rule --add label=pin_agent app="$YABAI_AGENT_APPS_RE" \
+    space="${YABAI_AGENT_LABEL:-agent}" >/dev/null 2>&1
+  return 0
+}
 
 # --- shared state + logs ---------------------------------------------------------
 # One FIXED directory for every lock, marker and memo the yabai_* scripts share.
@@ -124,14 +148,17 @@ YABAI_JQ_PIN_ELIGIBLE='
 # app with NO resolved standard window qualifies: Electron apps (Claude Desktop ships
 # two) can publish hidden helper windows that may be unresolvable for good, and a
 # restart over one of those -- next to a perfectly healthy main window -- would buy
-# nothing. The size floor keeps tiny/offscreen helpers out too.
+# nothing. Compared by PID, not app name: an unresolved window reports the PROCESS
+# name (window_nonax_serialize -> proc_name), a resolved one the app name, and those
+# differ for WezTerm (`wezterm-gui` vs `WezTerm`). The size floor keeps tiny/offscreen
+# helpers out too.
 # shellcheck disable=SC2034
 YABAI_JQ_PIN_UNRESOLVED='
-  ([ .[] | select(."has-ax-reference" and .subrole == "AXStandardWindow") | .app ] | unique) as $resolved_apps
+  ([ .[] | select(."has-ax-reference" and .subrole == "AXStandardWindow") | .pid ] | unique) as $resolved_pids
   | .[]
   | select(."has-ax-reference" == false and ."root-window")
   | select(.frame.w >= 300 and .frame.h >= 200)
-  | select(.app as $a | ($resolved_apps | any(. == $a)) | not)'
+  | select(.pid as $p | ($resolved_pids | any(. == $p)) | not)'
 
 # The same map as a JSON object, with the coding-agent apps folded in, for the jq
 # consumers. Emits nothing on failure so callers can test for an empty result.

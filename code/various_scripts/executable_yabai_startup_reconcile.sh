@@ -83,6 +83,8 @@ MODE="${1:-startup}"
 DRY_RUN=0
 [ "${2:-}" = "--dry-run" ] && DRY_RUN=1
 case "$MODE" in startup|float) ;; *) echo "usage: $0 [startup|float [--dry-run]]" >&2; exit 64 ;; esac
+# Startup mode has no dry run: it would still `rule --apply`, arcSync and wipe markers.
+[ "$MODE" = startup ] && [ "$DRY_RUN" = 1 ] && { echo "--dry-run is float-mode only" >&2; exit 64; }
 
 CAP_SECONDS="${YABAI_RECONCILE_CAP:-90}"   # hard stop so a never-launching app can't poll forever
 
@@ -134,9 +136,21 @@ if [ "$MODE" = float ]; then
     yabai_log $LOGN "float reaped-orphan-startup-lock"
   fi
   if ! mkdir "$SWEEP_LOCK" 2>/dev/null; then
-    [ "$(lock_age "$SWEEP_LOCK")" -ge 30 ] || exit 0
-    rm -rf "$SWEEP_LOCK" 2>/dev/null
-    mkdir "$SWEEP_LOCK" 2>/dev/null || exit 0
+    got=0
+    # Switching to a pinned app's space fires space_changed THEN window_focused; the
+    # first sweep holds this lock for ~100-200ms while its toggle is still dropped
+    # (Claude at level -1), and the focus sweep -- the one that waits for the level
+    # restore and bypasses backoff -- used to lose the mkdir and exit silently. The
+    # bypass events wait briefly for the holder instead.
+    case "${YABAI_EVENT:-}" in
+      window_focused|window_deminimized)
+        for _ in $(seq 15); do sleep 0.1; mkdir "$SWEEP_LOCK" 2>/dev/null && { got=1; break; }; done ;;
+    esac
+    if [ "$got" = 0 ]; then
+      [ "$(lock_age "$SWEEP_LOCK")" -ge 30 ] || exit 0
+      rm -rf "$SWEEP_LOCK" 2>/dev/null
+      mkdir "$SWEEP_LOCK" 2>/dev/null || exit 0
+    fi
   fi
   LOCK="$SWEEP_LOCK"
 else
@@ -152,21 +166,30 @@ else
     if [ -n "$hp" ] && [ -n "$hy" ] && kill -0 "$hp" 2>/dev/null && [ "$hy" = "$(yabai_pid_now)" ]; then
       exit 0
     fi
+    # The holder checks `stop` once per pass, and a pass (2s sleep + rule --apply +
+    # arcSync + queries) is longer than 2s, so wait out a whole pass (~8s). Ownership
+    # (below) makes an old poll that still misses it harmless anyway: it sees the pid
+    # change, exits, and its EXIT trap no longer deletes the new holder's lock.
     : >"$STARTUP_LOCK/stop" 2>/dev/null
-    for _ in 1 2 3 4 5 6 7 8; do [ -d "$STARTUP_LOCK" ] || break; sleep 0.25; done
+    for _ in $(seq 32); do [ -d "$STARTUP_LOCK" ] || break; sleep 0.25; done
     rm -rf "$STARTUP_LOCK" 2>/dev/null
     mkdir "$STARTUP_LOCK" 2>/dev/null || exit 0
     yabai_log $LOGN "startup preempted-previous-holder pid=${hp:-?} yabai_pid=${hy:-?}"
   fi
   LOCK="$STARTUP_LOCK"
-  echo $$ >"$LOCK/pid"
   yabai_pid_now >"$LOCK/yabai_pid"
   # Post-restart float state is never the user's choice (yabai re-classified from
   # scratch), and CGWindowIDs are session-scoped, so stale markers only ever block
   # a repair. Same for the backoff memo.
   rm -rf "$KEEP_FLOAT" "$MEMO" 2>/dev/null
 fi
-trap 'rm -rf "$LOCK" 2>/dev/null || true' EXIT
+echo $$ >"$LOCK/pid"
+# Release only a lock we still OWN: a takeover (startup preempting a previous poll, or
+# an orphan reap) re-creates the same path, and an unconditional `rm -rf "$LOCK"` from
+# the displaced holder's EXIT trap deleted the NEW holder's lock -- after which sweeps
+# and yabai_pin_resolve.sh's startup_live() no longer saw the live poll.
+owns_lock() { [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ]; }
+trap 'owns_lock && rm -rf "$LOCK" 2>/dev/null; true' EXIT
 
 # The pinned app -> home space map (JSON) comes from yabai_common.sh, which is where
 # this codebase keeps lists that more than one script needs. Computed ONCE at startup,
@@ -253,8 +276,11 @@ pre_state() {
 # between the pass's snapshot and the toggle.
 focused_now() {
   yabai -m query --spaces --space 2>/dev/null \
-    | jq -r '"\(.label // "")\t\(.type // "")\t\(.display // "")"' 2>/dev/null
+    | jq -r '"\(.label // "")\u001f\(.type // "")\u001f\(.display // "")"' 2>/dev/null
 }
+# Unit-separated, not tab-separated: tab is IFS WHITESPACE, so `read` collapses an empty
+# leading field -- an unlabeled focused space (ext scratch, a native-fullscreen Space)
+# came back as label=stack type=<display>, which skipped every flip as "active-bsp".
 
 memo_get() { awk -v i="$1" '$1 == i { print $2, $3 }' "$MEMO" 2>/dev/null; }
 memo_set() {
@@ -393,7 +419,7 @@ unfloat_pins() {
 
     # Route, from the focus state as of right now (see focused_now). During a heal
     # (refresh/reorder focusing spaces transiently) never trust "focused": flip.
-    IFS=$'\t' read -r fl ft fd <<<"$(focused_now)"
+    IFS=$'\x1f' read -r fl ft fd <<<"$(focused_now)"
     if [ "$fl" = "$label" ] && [ "$fd" = "$disp" ] && [ ! -d "$YABAI_STATE_DIR/heal.lock" ]; then
       route=direct
     elif [ "$layout" = stack ] && [ "$ft" = stack ]; then
@@ -492,6 +518,24 @@ else
   yabai_log $LOGN "startup begin sa=FAIL yabai_pid=$(cat "$LOCK/yabai_pid" 2>/dev/null)"
 fi
 
+# Locks orphaned by the restart. launchd kills yabai's whole process group, which is
+# every signal handler, so a lock taken by the PREVIOUS yabai's handlers can't have a
+# live holder -- but most are only reaped by age on their next use, and some never
+# are: a stale heal.lock forced every float sweep off the direct route until the next
+# heal, and terminal_follow treats the displays lock as "hotplug in progress" with no
+# age check at all, so it stayed off until the next dock. Anything older than this
+# yabai's start goes; locks its own handlers took since are newer and kept.
+# etime is [[dd-]hh:]mm:ss. If the age can't be read, clear nothing (started=0).
+yabai_age=$(ps -o etime= -p "$(cat "$LOCK/yabai_pid" 2>/dev/null)" 2>/dev/null | tr -d ' ' \
+  | awk -F'[-:]' 'NF >= 2 { n = NF; t = $n + 60 * $(n - 1); if (n >= 3) t += 3600 * $(n - 2);
+                            if (n >= 4) t += 86400 * $(n - 3); print t }')
+case "$yabai_age" in ''|*[!0-9]*) yabai_started=0 ;; *) yabai_started=$(( $(date +%s) - yabai_age )) ;; esac
+for l in "$YABAI_STATE_DIR"/{pin_resolve,heal,float_sweep,float_borders}.lock "${TMPDIR:-/tmp}/yabai_displays.lock"; do
+  [ -d "$l" ] || continue
+  [ "$(stat -f %m "$l" 2>/dev/null || echo 0)" -lt "$yabai_started" ] || continue
+  rm -rf "$l" 2>/dev/null && yabai_log $LOGN "startup cleared-stale-lock $(basename "$l")"
+done
+
 # Re-assert pins until everything restored has landed home and tiled, or we hit the
 # cap. unfloat_pins runs AFTER `rule --apply` each pass so a window is already on its
 # home space before it is un-floated -- the space= move re-tiles on the destination
@@ -502,8 +546,8 @@ passes=0
 GAVE_UP=0
 reason=cap
 while :; do
+  { [ -e "$LOCK/stop" ] || ! owns_lock; } && { reason=preempted; break; }
   touch "$LOCK/alive" 2>/dev/null
-  [ -e "$LOCK/stop" ] && { reason=preempted; break; }
   passes=$((passes + 1))
 
   yabai -m rule --apply >/dev/null 2>&1 || true
@@ -526,6 +570,32 @@ while :; do
   sleep 2
 done
 yabai_log $LOGN "startup end passes=$passes elapsed=$(( $(date +%s) - t0 ))s reason=$reason pending=${PENDING_FLOATS:-0} gave_up=$GAVE_UP"
+
+# Restore what an AUTOMATIC restart (yabai_pin_resolve.sh) would otherwise silently
+# wipe: per-space layouts live only in yabai's memory (every space comes back the
+# global `stack`, so a hyper+fn+b bsp space reverts), and yabai re-classifies floats
+# from scratch (a hyper+t float comes back tiled). The resolver snapshots both right
+# before restarting; honoured only if fresh, so a stale file can't replay later.
+# Hand-tuned bsp split ratios are not recoverable -- the tree is rebuilt.
+RESTORE="$YABAI_STATE_DIR/restore_after_restart"
+if [ -f "$RESTORE" ] && [ $(( $(date +%s) - $(stat -f %m "$RESTORE" 2>/dev/null || echo 0) )) -lt 300 ]; then
+  restored=""
+  while read -r kind a b; do
+    case "$kind" in
+      layout) yabai -m space "$a" --layout "$b" >/dev/null 2>&1 && restored="$restored $a=$b" ;;
+      float)
+        # Only a window still around and now TILED; toggling an already-floating one
+        # (a manage=off app, a misclassified pin) would un-float it instead.
+        [ "$(yabai -m query --windows --window "$a" 2>/dev/null | jq -r '."is-floating"' 2>/dev/null)" = false ] || continue
+        yabai -m window "$a" --toggle float >/dev/null 2>&1 && restored="$restored float:$a"
+        [ "$b" = keep ] && mkdir -p "$KEEP_FLOAT" 2>/dev/null && : >"$KEEP_FLOAT/$a" ;;
+    esac
+  done <"$RESTORE"
+  yabai_log $LOGN "startup restored-after-restart${restored:- (nothing)}"
+  /usr/bin/notifyutil -p com.mackhaymond.layerbar.refresh 2>/dev/null
+  "$SCRIPT_DIR/yabai_float_borders.sh" sync >/dev/null 2>&1 || true
+fi
+rm -f "$RESTORE" 2>/dev/null
 
 # A pinned window this yabai never resolved (not AX-ready during its startup scan --
 # Claude Desktop at login) is invisible to everything above: pins_settled skips it as

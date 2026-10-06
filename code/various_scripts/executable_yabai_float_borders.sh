@@ -82,8 +82,11 @@ sleep "$SETTLE"
 
 # Distinct app names that currently have a floating window, comma-joined (empty if
 # none). manage=off apps are intentionally included (see header).
+# A failed or garbled query is "don't know", not "nothing floats": jq exits non-zero on
+# anything but an array, and we keep the daemon as it is rather than pkill it.
 apps=$(yabai -m query --windows 2>/dev/null \
-  | jq -r '[.[] | select(.["is-floating"] == true) | .app] | unique | join(",")' 2>/dev/null)
+  | jq -re 'if type == "array" then [.[] | select(.["is-floating"] == true) | .app] | unique | join(",") else error end' 2>/dev/null)
+case $? in 0|1) ;; *) exit 0 ;; esac
 
 n=$(pgrep -x borders | wc -l | tr -d ' ')
 

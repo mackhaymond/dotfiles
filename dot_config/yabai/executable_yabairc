@@ -1,6 +1,11 @@
 #vim:ft=bash
-yabai -m signal --add event=dock_did_restart action="sudo yabai --load-sa"
-sudo yabai --load-sa
+# `sudo -n`: never prompt. These run synchronously in launchd context, and sudo here
+# falls through to pam_tid (Touch ID) whenever the sudoers sha256 pin stops matching
+# the binary (every yabai upgrade) -- that blocked the rest of this config on a dialog,
+# and re-prompted on every Dock restart and every automatic restart. A stale pin now
+# just fails fast (reconcile.log: `sa=FAIL`); fix the pin, not the prompt.
+yabai -m signal --add event=dock_did_restart action="sudo -n yabai --load-sa"
+sudo -n yabai --load-sa
 
 yabai -m config layout stack
 yabai -m config window_origin_display focused
@@ -76,7 +81,10 @@ yabai -m signal --add event=window_created action='
       # is kept DEFENSIVELY: if a WezTerm window ever were fullscreen, never drag it
       # onto a fixed space -- that would yank it out. Only nudge a NORMAL WezTerm onto
       # the terminal space (the space=terminal rule is racy at launch).
-      nsfs=$(printf "%s" "$info" | jq -r '.["is-native-fullscreen"]' 2>/dev/null)
+      # (Double quotes: a single-quoted jq filter here closes the action= string --
+      # it ran as `jq -r .[is-native-fullscreen]`, a jq compile error, so this guard
+      # never fired.)
+      nsfs=$(printf "%s" "$info" | jq -r ".\"is-native-fullscreen\"" 2>/dev/null)
       [ "$nsfs" = "true" ] && exit 0
       wspace=$(printf "%s" "$info" | jq -r .space)
       wtidx=$(yabai -m query --spaces --space terminal 2>/dev/null | jq -r .index 2>/dev/null)
@@ -102,20 +110,16 @@ yabai -m signal --add event=space_changed action='
   exit 0
 '
 
-# App -> Space pinning
-yabai -m rule --add app="^(wezterm-gui|WezTerm)$" space=terminal
-yabai -m rule --add app="^Todoist$" space=todo
-yabai -m rule --add app="^Granola$" space=schedule
-yabai -m rule --add app="^Spark Mail$" space=mail
-yabai -m rule --add app="^Notion Calendar$" space=calendar
-yabai -m rule --add app="^Messages$" space=messages
-yabai -m rule --add app="^ChatGPT$" space=ai
-yabai -m rule --add app="^Claude$" space=ai
-# `agent` (hyper+esc) is the generic coding-agent view -- NOT one pinned app. Its
-# app set lives in yabai_common.sh (YABAI_AGENT_APPS) and is sourced here so this
-# rule can never drift from the pinned-home guards in the yabai_* scripts.
+# App -> Space pinning. The map lives in yabai_common.sh -- YABAI_PINNED_HOMES
+# (WezTerm->terminal, Todoist->todo, Granola->schedule, Spark Mail->mail, Notion
+# Calendar->calendar, Messages->messages, ChatGPT+Claude->ai) and YABAI_AGENT_APPS
+# (`agent`, hyper+esc: the generic coding-agent view, not one app) -- so the rules can
+# never drift from the pinned-home guards in the yabai_* scripts. yabai_pin_rules_add
+# registers them as LABELED rules (pin_<app>): `space=` binds to a space id when a rule
+# is added, so yabai_workspace_refresh.sh re-registers them after it re-creates a lost
+# label. Arc is pinned by Hammerspoon's arcSync(), not by a rule.
 . "${HOME}/code/various_scripts/yabai_common.sh"
-yabai -m rule --add app="$YABAI_AGENT_APPS_RE" space=agent
+yabai_pin_rules_add
 
 # Re-apply rules to currently-open windows on yabai (re)start.
 # Catches windows whose creation events were missed (login race, crash-restart).

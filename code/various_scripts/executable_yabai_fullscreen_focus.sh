@@ -31,6 +31,9 @@ idx=$(yabai -m query --windows 2>/dev/null \
         | select(.["is-native-fullscreen"] == true)
         | select((.app | test("^(wezterm-gui|WezTerm)$")) | not)
       ]
+      # One ordinal per fullscreen SPACE, not per window: a fullscreen Space holding two
+      # windows took two numbers, so two keys hit it and every later app shifted by one.
+      | unique_by(.space)
       | sort_by(.display, .space)
       | (.[$n - 1].space) // empty
     ' 2>/dev/null)

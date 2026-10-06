@@ -25,7 +25,9 @@
 #   - CONFIRM: the same window must still be unresolved CONFIRM_SECONDS later (a window
 #     yabai is mid-resolving via kAXWindowCreated is briefly unresolved too).
 #   - Never during a live startup poll (the poll calls this itself when it ends).
-#   - At most one restart per MIN_GAP seconds, machine-wide.
+#   - At most one restart per MIN_GAP seconds, machine-wide. A check that lands inside
+#     the gap (the startup check right after our own restart) waits it out and looks
+#     once more, rather than dropping the retry.
 #   - At most MAX_PER_WINDOW restarts per window id (CGWindowIDs survive yabai
 #     restarts; memo entries expire after a day): a window a restart cannot resolve
 #     -- an AX-invisible helper -- is logged once and left alone, never restart-looped.
@@ -44,8 +46,11 @@ WATCH=0
 DRY_RUN=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --delay)   DELAY="${2:-0}"; shift 2 ;;
-    --watch)   WATCH="${2:-0}"; shift 2 ;;
+    --delay|--watch)
+      # Whole seconds only; a missing value used to leave `shift 2` failing -> loop forever.
+      case "${2:-}" in ''|*[!0-9]*) echo "$0: $1 needs whole seconds" >&2; exit 64 ;; esac
+      if [ "$1" = --delay ]; then DELAY=$2; else WATCH=$2; fi
+      shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     *) echo "usage: $0 <event> [--delay S] [--watch S] [--dry-run]" >&2; exit 64 ;;
   esac
@@ -63,12 +68,23 @@ LAST="$YABAI_STATE_DIR/resolve_last_restart" # epoch of the last restart we issu
 mkdir -p "$YABAI_STATE_DIR" 2>/dev/null
 touch "$MEMO" 2>/dev/null
 
+# The memo is keyed by CGWindowID, and those restart at every login -- in a
+# deterministic order, so Claude tends to get the SAME small id each time. A memo that
+# outlived the login would spend this login's budget on last login's window. Scope it
+# to the WindowServer session (its pid changes on every login and reboot).
+SESSION="session $(pgrep -x WindowServer 2>/dev/null | head -n 1)"
+if [ "$(head -n 1 "$MEMO" 2>/dev/null)" != "$SESSION" ]; then
+  printf '%s\n' "$SESSION" >"$MEMO"
+  rm -f "$YABAI_STATE_DIR"/resolve_gaveup_* 2>/dev/null
+fi
+
 CONFIRM_SECONDS=2
 MIN_GAP=30
 MAX_PER_WINDOW=2
 
 # Single-flight: a burst of triggers (launch + focus + space change) runs one check.
-# A holder older than 120s is an orphan (a restart kills yabai's process group).
+# A holder older than 120s is an orphan (a restart kills yabai's process group); the
+# longest legitimate run is ~70s (watch 30 + delay 5 + confirm 2 + gap wait 30).
 if ! mkdir "$LOCK" 2>/dev/null; then
   m=$(stat -f %m "$LOCK" 2>/dev/null || echo 0)
   [ $(( $(date +%s) - m )) -ge 120 ] || exit 0
@@ -89,6 +105,14 @@ unresolved() {
   | awk -v max="$MAX_PER_WINDOW" -v now="$now" -v memo="$MEMO" '
       BEGIN { while ((getline l < memo) > 0) { split(l, f, " "); if (f[3] > now - 86400) n[f[1]] = f[2] } }
       { if (($1 in n) && n[$1] >= max) { print "SPENT " $0 } else print }'
+}
+
+# Never restart behind the lock screen: right after wake AX is stalled, so the new
+# yabai's discovery pass would fail for EVERY other-space window and strand them all.
+# Nothing is lost by waiting -- the float sweep re-triggers on the first space switch
+# after unlock, which is exactly when a missing window gets noticed.
+screen_locked() {
+  ioreg -n Root -d1 2>/dev/null | grep -q '"CGSSessionScreenIsLocked"=Yes'
 }
 
 startup_live() {
@@ -126,21 +150,38 @@ while :; do
 done
 
 startup_live && exit 0
+screen_locked && exit 0
+
+# Give-up markers outlive their window ids; drop day-old ones (memo entries expire then too).
+find "$YABAI_STATE_DIR" -maxdepth 1 -name 'resolve_gaveup_*' -mtime +0 -delete 2>/dev/null
+
+# Lines of $2 whose window id (field 1) is also in $1: "the same window, still stuck".
+still_stuck() {
+  printf '%s\n' "$2" | awk 'NR == FNR { seen[$1] = 1; next } ($1 in seen)' \
+    <(printf '%s\n' "$1") - 2>/dev/null
+}
 
 sleep "$CONFIRM_SECONDS"
-second=$(unresolved | actionable)
-# Still stuck = the same window id in both looks.
-stuck=$(printf '%s\n' "$second" | awk 'NR == FNR { seen[$1] = 1; next } ($1 in seen)' \
-  <(printf '%s\n' "$first") - 2>/dev/null)
+stuck=$(still_stuck "$first" "$(unresolved | actionable)")
 [ -n "$stuck" ] || exit 0
-summary=$(printf '%s' "$stuck" | tr '\n' ';')
 
 now=$(date +%s)
-last=$(cat "$LAST" 2>/dev/null || echo 0)
-if [ $((now - ${last:-0})) -lt "$MIN_GAP" ]; then
-  yabai_log $LOGN "defer ev=$EVENT reason=min-gap last=$((now - last))s-ago stuck=[$summary]"
-  exit 0
+last=$(cat "$LAST" 2>/dev/null)
+case "$last" in ''|*[!0-9]*) last=0 ;; esac
+wait=$((MIN_GAP - (now - last)))
+if [ "$wait" -gt 0 ] && [ "$DRY_RUN" = 0 ]; then
+  # Inside the gap -- typically the startup check right after a restart WE issued, for a
+  # window that restart did not resolve. Wait the gap out and look once more instead of
+  # dropping the retry until some later space switch happens to re-trigger it.
+  yabai_log $LOGN "defer ev=$EVENT reason=min-gap wait=${wait}s stuck=[$(printf '%s' "$stuck" | tr '\n' ';')]"
+  sleep "$wait"
+  startup_live && exit 0
+  screen_locked && exit 0
+  stuck=$(still_stuck "$stuck" "$(unresolved | actionable)")
+  [ -n "$stuck" ] || exit 0
+  now=$(date +%s)
 fi
+summary=$(printf '%s' "$stuck" | tr '\n' ';')
 
 if [ "$DRY_RUN" = 1 ]; then
   echo "would restart yabai for: $summary"
@@ -152,11 +193,27 @@ yabai_log_trim $LOGN
 # includes this script when a yabai signal launched it.
 awk -v now="$now" -v ids="$(printf '%s\n' "$stuck" | awk '{ printf "%s ", $1 }')" '
   BEGIN { k = split(ids, a, " "); for (i = 1; i <= k; i++) want[a[i]] = 1 }
-  ($1 in want) { cnt[$1] = $2; next }
+  $1 == "session" { print; next }
+  ($1 in want) { if ($3 > now - 86400) cnt[$1] = $2; next }   # an expired count restarts at 0
   $3 > now - 86400 { print }
   END { for (id in want) print id, cnt[id] + 1, now }' "$MEMO" >"$MEMO.tmp" 2>/dev/null \
   && mv "$MEMO.tmp" "$MEMO" 2>/dev/null
 echo "$now" >"$LAST"
+# Snapshot what a restart silently resets, for the startup poll to put back
+# (yabai_startup_reconcile.sh, "restore_after_restart"): every labeled space whose
+# layout isn't the global `stack` (a hyper+fn+b bsp space), and every hyper+t float --
+# floating standard windows of NON-pinned apps (a pinned app floating is a
+# misclassification the sweep repairs, not a choice) plus the pinned-off-home floats
+# marked in keep-float/. manage=off apps come back floating anyway and are skipped
+# at restore time.
+{
+  yabai -m query --spaces 2>/dev/null | jq -r '
+    .[]? | select((.label // "") != "" and .type != "stack") | "layout \(.label) \(.type)"' 2>/dev/null
+  yabai -m query --windows 2>/dev/null | jq -r --arg re "$YABAI_PINNED_APPS_RE" '
+    .[]? | select(."is-floating" and .subrole == "AXStandardWindow" and ."root-window")
+    | select(.app | test($re) | not) | "float \(.id) -"' 2>/dev/null
+  for f in "$YABAI_STATE_DIR"/keep-float/*; do [ -e "$f" ] && echo "float $(basename "$f") keep"; done
+} >"$YABAI_STATE_DIR/restore_after_restart" 2>/dev/null
 yabai_log $LOGN "restart ev=$EVENT stuck=[$summary]"
 rm -rf "$LOCK" 2>/dev/null
 yabai --restart-service >/dev/null 2>&1 || yabai_log $LOGN "restart-FAILED ev=$EVENT"

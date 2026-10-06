@@ -41,10 +41,12 @@ query_space_index() {
     head -n 1
 }
 
-# Window ids on space index $1 (empty output = the space is empty).
+# Ids of the windows you'd actually SEE on space index $1 (empty output = the space
+# looks empty). Hidden and minimized windows don't count: a hidden Notes window left on
+# `agent` made hyper+esc jump to what looked like an empty space.
 space_window_ids() {
   yabai -m query --windows --space "$1" 2>/dev/null |
-    jq -r '.[].id' 2>/dev/null
+    jq -r '.[] | select((."is-hidden" | not) and (."is-minimized" | not)) | .id' 2>/dev/null
 }
 
 focus_space() {

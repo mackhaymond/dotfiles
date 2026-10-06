@@ -91,7 +91,12 @@ case "$count" in
 esac
 
 # --- transition guard: ignore redundant fires that change nothing -----------
-if [ "$count" = "$(cached_count)" ]; then
+# `added` only. On undock macOS destroys the external's spaces, which fires
+# space_destroyed -> yabai_heal.sh -> a refresh that can rewrite the cache to
+# DISPLAY_COUNT=1 BEFORE this handler reads it; the guard then skipped the pull-home
+# safety net and the `ext` dissolve entirely. Both are idempotent no-ops when there is
+# nothing to do, and the lock above already coalesces duplicate fires.
+if [ "$ACTION" = added ] && [ "$count" = "$(cached_count)" ]; then
   exit 0
 fi
 

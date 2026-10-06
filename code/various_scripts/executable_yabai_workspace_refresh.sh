@@ -20,9 +20,30 @@ export USER="${USER:-$(id -un)}"
 . "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
 CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${HOME}/.cache/yabai/workspace_cache.env}"
 
-SPACES_JSON=$(yabai -m query --spaces 2>/dev/null) || exit 0
-WINDOWS_JSON=$(yabai -m query --windows 2>/dev/null || printf '[]')
-DISPLAYS_JSON=$(yabai -m query --displays 2>/dev/null) || exit 0
+# A VALIDATED bulk query, or nothing. `yabai -m query --spaces` intermittently answers a
+# bare "[" with exit 0 (space_manager_query_spaces_for_displays skips the closing "]"
+# when display_space_list() is NULL). Every helper below then sees zero spaces, decides
+# all ten labels are missing and finds no unlabeled space to reuse -- so the old
+# exit-code-only check ran `space --create` once per label, twice per run (20 spurious
+# spaces). Not yabai_spaces_json(): its label-by-label fallback drops UNLABELED spaces,
+# which this script needs to see to reuse them. Retry briefly, else give up this run.
+query_json_array() {
+  local out _try
+  for _try in 1 2 3; do
+    out=$(yabai -m query "$@" 2>/dev/null)
+    if jq -e 'type == "array" and length > 0' >/dev/null 2>&1 <<<"$out"; then
+      printf '%s' "$out"
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+SPACES_JSON=$(query_json_array --spaces) || exit 0
+WINDOWS_JSON=$(yabai -m query --windows 2>/dev/null)
+jq -e 'type == "array"' >/dev/null 2>&1 <<<"$WINDOWS_JSON" || WINDOWS_JSON='[]'
+DISPLAYS_JSON=$(query_json_array --displays) || exit 0
 DISPLAY_COUNT=$(jq -r 'length' <<<"$DISPLAYS_JSON")
 MASTER_DISPLAY_INDEX=$(yabai_master_index "$DISPLAYS_JSON")
 # Only meaningful once master is known; computing it against a placeholder master
@@ -39,8 +60,14 @@ else
 fi
 
 refresh_spaces_json() {
-  SPACES_JSON=$(yabai -m query --spaces 2>/dev/null) || exit 0
+  SPACES_JSON=$(query_json_array --spaces) || exit 0
 }
+
+# Backstop for the create path below: if a `space --create` does not yield a new
+# unlabeled master space (the scripting addition rejected it -- on yabai 7.1.25 /
+# macOS 26.6 create returns 0 and does nothing -- or the query lied), stop creating
+# for the rest of this run instead of retrying once per missing label.
+CREATE_OK=1
 
 space_index_for_label() {
   local label="$1"
@@ -66,12 +93,52 @@ space_display_for_index() {
   ' <<<"$SPACES_JSON"
 }
 
+# Native-fullscreen Spaces never carry a canonical label (except `terminal`, which
+# yabai_terminal_follow.sh deliberately moves onto a fullscreen WezTerm). They sit in
+# the master's space list like any other, so counting them shifted every label after
+# one by a position, and the first-unlabeled fallback could hand one a label.
 first_unlabeled_space_index_on_master() {
   [ -z "${MASTER_DISPLAY_INDEX:-}" ] && return 0
 
   jq -r --argjson master "$MASTER_DISPLAY_INDEX" '
-    ([.[] | select(.display == $master and .label == "") | .index][0]) // empty
+    ([.[] | select(.display == $master and .label == "" and (."is-native-fullscreen" | not))
+      | .index][0]) // empty
   ' <<<"$SPACES_JSON"
+}
+
+# Index of the Nth (1-based) regular -- non-fullscreen -- space on the master display.
+nth_regular_space_index_on_master() {
+  [ -z "${MASTER_DISPLAY_INDEX:-}" ] && return 0
+
+  jq -r --argjson master "$MASTER_DISPLAY_INDEX" --argjson n "$1" '
+    ([.[] | select(.display == $master and (."is-native-fullscreen" | not))]
+      | sort_by(.index) | .[$n - 1].index) // empty
+  ' <<<"$SPACES_JSON"
+}
+
+space_is_fullscreen() {
+  jq -e --argjson index "$1" 'any(.[]; .index == $index and ."is-native-fullscreen")' \
+    >/dev/null 2>&1 <<<"$SPACES_JSON"
+}
+
+# Pinned app -> home label (YABAI_PINNED_HOMES + the agent apps), for "whose space is it".
+HOME_MAP=$(yabai_home_map_json)
+[ -n "$HOME_MAP" ] || HOME_MAP='{}'
+
+# Does space $1 hold a window of an app matching regex $2?
+space_hosts_app() {
+  jq -e --argjson index "$1" --arg re "$2" 'any(.[]; .space == $index and (.app | test($re)))' \
+    >/dev/null 2>&1 <<<"$WINDOWS_JSON"
+}
+
+# Does space $1 hold a window of an app whose home is label $2? Arc counts for
+# main/school (arcSync pins its main windows there; it has no entry in the map).
+space_hosts_label_app() {
+  jq -e --argjson index "$1" --arg label "$2" --argjson home "$HOME_MAP" '
+    any(.[]; .space == $index
+             and ($home[.app] == $label
+                  or (.app == "Arc" and ($label == "main" or $label == "school"))))' \
+    >/dev/null 2>&1 <<<"$WINDOWS_JSON"
 }
 
 space_for_app() {
@@ -126,17 +193,34 @@ assign_label_to_space() {
   refresh_spaces_json
 }
 
+# Label-follows-app: move <label> onto the space where its pinned app lives. This is
+# the repair for labels handed out by POSITION (after a yabai restart, or a dropped
+# label re-created on a fresh space). It used to follow ANY window of the app, which
+# let a stray one drag the label along: Claude stranded on `todo` at a restart took
+# `ai` there and `todo` went to ChatGPT's space; Claude in native fullscreen pulled
+# `ai` onto the fullscreen Space; ChatGPT+Claude on different spaces flipped `ai` to
+# whichever was checked last. Now, conservatively:
+#   1. the label stays where it is if that space already hosts one of its apps;
+#   2. it never takes a space whose OWN label's app lives there (that window is the
+#      stray, not the label);
+#   3. it never lands on a native-fullscreen Space (terminal excepted, see above).
 assign_label_to_pinned_app_space() {
   local label="$1"
   local app_pattern="$2"
-  local index
+  local index current held
   local display_index
+
+  current=$(space_index_for_label "$label")
+  [ -n "$current" ] && space_hosts_app "$current" "$app_pattern" && return 0
 
   index=$(space_for_app "$app_pattern")
   [ -z "$index" ] && return 0
   display_index=$(space_display_for_index "$index")
   [ -n "${MASTER_DISPLAY_INDEX:-}" ] && [ "$display_index" != "$MASTER_DISPLAY_INDEX" ] && return 0
-  [ -n "$index" ] && assign_label_to_space "$label" "$index"
+  [ "$label" != terminal ] && space_is_fullscreen "$index" && return 0
+  held=$(space_label_for_index "$index")
+  [ -n "$held" ] && [ "$held" != "$label" ] && space_hosts_label_app "$index" "$held" && return 0
+  assign_label_to_space "$label" "$index"
 }
 
 assign_label_to_pinned_window_space() {
@@ -161,7 +245,9 @@ label_space_if_missing() {
     return 0
   fi
 
-  if [ -n "$(space_label_for_index "$index")" ] || [ "$(space_display_for_index "$index")" != "${MASTER_DISPLAY_INDEX:-}" ]; then
+  # Canonical position N = the Nth REGULAR space on the master (fullscreen Spaces don't count).
+  index=$(nth_regular_space_index_on_master "$index")
+  if [ -z "$index" ] || [ -n "$(space_label_for_index "$index")" ]; then
     index=$(first_unlabeled_space_index_on_master)
   fi
 
@@ -169,10 +255,15 @@ label_space_if_missing() {
     index=$(first_unlabeled_space_index_on_master)
   fi
 
-  if [ -z "$index" ] && [ -n "${MASTER_DISPLAY_INDEX:-}" ]; then
+  if [ -z "$index" ] && [ -n "${MASTER_DISPLAY_INDEX:-}" ] && [ "$CREATE_OK" = 1 ]; then
     yabai -m space --create "$MASTER_DISPLAY_INDEX" >/dev/null 2>&1 || true
     refresh_spaces_json
     index=$(first_unlabeled_space_index_on_master)
+    [ -n "$index" ] || CREATE_OK=0
+    # A new master space renumbers every space after it (the external's), so the
+    # window->space indices captured at the top are stale now.
+    WINDOWS_JSON=$(yabai -m query --windows 2>/dev/null)
+    jq -e 'type == "array"' >/dev/null 2>&1 <<<"$WINDOWS_JSON" || WINDOWS_JSON='[]'
   fi
 
   [ -n "$index" ] && assign_label_to_space "$label" "$index"
@@ -205,9 +296,9 @@ assign_label_to_pinned_app_space schedule '^Granola$'
 assign_label_to_pinned_app_space mail '^Spark Mail$'
 assign_label_to_pinned_app_space calendar '^Notion Calendar$'
 assign_label_to_pinned_app_space messages '^Messages$'
-# ChatGPT and Claude share the `ai` home space; whichever is running labels it.
-assign_label_to_pinned_app_space ai '^ChatGPT$'
-assign_label_to_pinned_app_space ai '^Claude$'
+# ChatGPT and Claude share the `ai` home space: ONE call with both, so rule 1 keeps
+# `ai` wherever either already is (two calls flipped it to whichever came second).
+assign_label_to_pinned_app_space ai '^(ChatGPT|Claude)$'
 # The coding-agent apps share the `agent` home space; whichever is running labels
 # it (one regex over the whole set -- see YABAI_AGENT_APPS in yabai_common.sh).
 assign_label_to_pinned_app_space agent "$YABAI_AGENT_APPS_RE"
@@ -222,6 +313,9 @@ mkdir -p "$(dirname "$CACHE_FILE")" 2>/dev/null || true
   printf 'MASTER_DISPLAY_UUID=%s\n' "$YABAI_MASTER_DISPLAY_UUID"
 } >"${CACHE_FILE}.$$" && mv "${CACHE_FILE}.$$" "$CACHE_FILE"
 
+# Re-bind the pinning rules to the labels as they stand NOW (space= resolves to a space
+# id at rule-add time; see yabai_pin_rules_add), then apply them.
+yabai_pin_rules_add
 yabai -m rule --apply >/dev/null 2>&1 || true
 
 # Keep the labeled spaces in their canonical order on each display.
