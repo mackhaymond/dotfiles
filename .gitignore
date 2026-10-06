@@ -12,3 +12,7 @@ chezmoistate.boltdb
 
 key.txt
 *.age.local
+
+# Python bytecode from running tests in the source tree
+__pycache__/
+*.pyc

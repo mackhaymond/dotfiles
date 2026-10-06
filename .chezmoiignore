@@ -119,3 +119,7 @@ code/various_scripts/.DS_Store
 .config/karabiner/**
 .config/raycast/**
 {{ end -}}
+
+# Python bytecode (tests run from the source tree leave it behind)
+**/__pycache__
+**/__pycache__/**
