@@ -106,16 +106,19 @@ YABAI_JQ_PIN_ELIGIBLE='
 
 # A pinned window yabai can SEE but cannot ACT ON -- the SINGLE copy of that filter
 # (yabai_pin_resolve.sh, and the float sweep's trigger in yabai_startup_reconcile.sh).
-# yabai resolves an app's windows on other spaces ONCE, by brute-forcing AX element
-# ids (window_manager_add_existing_application_windows, refresh_index -1), at yabai
-# start and at app launch. A window that is not AX-ready at that instant -- Claude
-# Desktop at login, or right after its stealth update relaunch -- stays unresolved:
-# `query --windows` still lists it (from SkyLight, with has-ax-reference:false, an
-# empty subrole and can-move:false) but every `window` command answers "could not
-# locate the window to act on!", so neither `rule --apply` nor the float sweep can
-# ever home it. yabai's own retries (on space change / app activation) only read
-# kAXWindows, which lists ACTIVE-space windows -- and the stuck window is by
-# definition on a space the user is not looking at. Only a yabai restart re-runs the
+# yabai resolves an app's windows on other spaces by brute-forcing AX element ids
+# (window_manager_add_existing_application_windows, refresh_index -1) ONLY at yabai
+# start (window_manager_begin). Two ways a window misses it:
+#   - login: the window exists but is not AX-ready when yabai starts -- the brute force
+#     fails and the app goes on applications_to_refresh, whose retries (space change /
+#     app activation) only read kAXWindows, i.e. ACTIVE-space windows;
+#   - app launch (Claude's stealth update relaunch): the launch handler reads ONLY
+#     kAXWindows (window_manager_add_application_windows) and never queues a retry, so
+#     a window that comes up on an inactive space is never tracked (upstream #2833).
+# Either way `query --windows` still lists it (from SkyLight, has-ax-reference:false,
+# empty subrole, can-move:false) but every `window` command answers "could not locate
+# the window to act on!", so neither `rule --apply` nor the float sweep can home it,
+# and it sits on a space the user is not looking at. Only a yabai restart re-runs the
 # brute force. Seen 2026-10-05 and 2026-10-06 (Claude stranded on `agent`).
 # Takes the WHOLE windows array (not one window) and emits the stuck windows. Only an
 # app with NO resolved standard window qualifies: Electron apps (Claude Desktop ships

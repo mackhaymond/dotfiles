@@ -161,8 +161,9 @@ yabai -m signal --add event=application_launched action="yabai -m rule --apply; 
 
 # Unresolved pinned window -> guarded yabai restart (yabai_pin_resolve.sh; log:
 # ~/Library/Logs/yabai/resolve.log). yabai brute-forces an app's other-space windows
-# only at yabai start and app launch; a window not AX-ready at that instant (Claude
-# Desktop at login and after its stealth update relaunch) stays listed-but-
+# only at yabai start; a window not AX-ready then (Claude Desktop at login), or one an
+# app (re)launch brings up on an inactive space (Claude's stealth update relaunch --
+# the launch path reads only active-space windows, upstream #2833), stays listed-but-
 # unactionable on whatever space it opened on, and only a restart re-scans it. The
 # float sweep above already spots this on every space switch/pinned focus; these two
 # cover the moments it starts: a pinned app (re)launching (its window appears a few
