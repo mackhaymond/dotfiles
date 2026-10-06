@@ -37,6 +37,11 @@ class LifecycleTests(unittest.TestCase):
             context = patch.object(vpn, name, value)
             context.start()
             self.addCleanup(context.stop)
+        # Never depend on whether the test runner has a controlling terminal.
+        for context in (patch.object(vpn, "has_tty", return_value=True),
+                        patch.object(vpn, "to_terminal", lambda: redirect_stdout(sys.stderr))):
+            context.start()
+            self.addCleanup(context.stop)
 
     def request(self, identity="current", attempt=None):
         vpn.write_json(self.state / "login-request.json",
@@ -249,6 +254,14 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(vpn.ignored("src/build", "build", True, patterns))
         self.assertTrue(vpn.ignored("src/a.o", "a.o", False, patterns))
         self.assertFalse(vpn.ignored("src/keep.o", "keep.o", False, patterns))
+        # Doublestar: * stays in one component, **/ may match nothing, {a,b} alternates.
+        self.assertFalse(vpn.ignored("src/deep/x.c", "x.c", False, ["src/*.c"]))
+        self.assertTrue(vpn.ignored("src/x.c", "x.c", False, ["src/*.c"]))
+        self.assertTrue(vpn.ignored("x.log", "x.log", False, ["**/x.log"]))
+        self.assertTrue(vpn.ignored("a/b/x.log", "x.log", False, ["**/x.log"]))
+        self.assertTrue(vpn.ignored("out/a/b", "b", True, ["out/**"]))
+        self.assertTrue(vpn.ignored("a.pyc", "a.pyc", False, ["*.{pyc,pyo}"]))
+        self.assertFalse(vpn.ignored("a.py", "a.py", False, ["*.{pyc,pyo}"]))
 
     def test_idle_expiry_pauses_sync_then_retries_incomplete_shutdown(self):
         events = []
@@ -290,6 +303,7 @@ class LifecycleTests(unittest.TestCase):
 
     def proxy_context(self, kind, up=False):
         contexts = [patch.object(vpn, "caller_kind", return_value=kind),
+                    patch.object(vpn, "parent_args", return_value="ssh seasnet"),
                     patch.object(vpn, "tunnel_up", return_value=up),
                     patch.object(vpn.signal, "signal")]
         mocks = [context.start() for context in contexts]
@@ -372,6 +386,7 @@ class LifecycleTests(unittest.TestCase):
         client.wait.side_effect = [KeyboardInterrupt, 0]
         output, errors = io.StringIO(), io.StringIO()
         with patch.object(vpn, "caller_kind", return_value="interactive"), \
+                patch.object(vpn, "parent_args", return_value="ssh seasnet"), \
                 patch.object(vpn, "tunnel_up", side_effect=[False, False]), \
                 patch.object(vpn, "owned_pid", side_effect=[None, 88]), \
                 patch.object(vpn, "start", side_effect=lambda: print("login progress") or 0), \
@@ -385,6 +400,101 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("login progress", errors.getvalue())
         client.terminate.assert_called_once()
         self.assertFalse(list((self.state / "connections").iterdir()))
+
+    def test_resume_keeps_record_when_nothing_was_resumed(self):
+        vpn.write_json(self.state / "paused-sync.json", ["a", "gone"])
+        with patch.object(vpn, "tunnel_sessions", return_value=None), \
+                patch.object(vpn, "mutagen") as mutagen:
+            vpn.resume_sync()  # daemon down: touch nothing
+        mutagen.assert_not_called()
+        self.assertEqual(json.loads((self.state / "paused-sync.json").read_text()), ["a", "gone"])
+        sessions = [{"identifier": "a", "name": "mine", "paused": True}]
+        for failure in (Mock(returncode=1, stderr="boom"), subprocess.TimeoutExpired("mutagen", 30)):
+            effect = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+            with patch.object(vpn, "tunnel_sessions", return_value=sessions), \
+                    patch.object(vpn, "mutagen", **effect):
+                vpn.resume_sync()
+            # The terminated session is dropped; the failed one is kept for next time.
+            self.assertEqual(json.loads((self.state / "paused-sync.json").read_text()), ["a"])
+
+    def test_idle_stop_cancelled_by_new_session_resumes_sync(self):
+        events = []
+        clock = SimpleNamespace(time=lambda: 1000, strftime=time.strftime, sleep=Mock(side_effect=StopIteration))
+        with patch.object(vpn, "owned_pid", return_value=88), \
+                patch.object(vpn, "idle_state", return_value=(4000, [])), \
+                patch.object(vpn, "transports", return_value=["mutagen", "interactive"]), \
+                patch.object(vpn, "pause_sync", side_effect=lambda reason: events.append("pause")), \
+                patch.object(vpn, "resume_sync", side_effect=lambda: events.append("resume")), \
+                patch.object(vpn, "stop") as stop, \
+                patch.object(vpn, "control_lock", return_value=nullcontext()), \
+                patch.object(vpn, "time", clock):
+            with self.assertRaises(StopIteration):
+                vpn.idle_watch()
+        self.assertEqual(events, ["pause", "resume"])
+        stop.assert_not_called()
+
+    def test_queued_caller_rechecks_backoff_under_lock(self):
+        self.proxy_context("interactive")
+        @contextmanager
+        def lock(wait=False):
+            vpn.record_login(False)  # the login ahead of us was cancelled meanwhile
+            yield
+        with patch.object(vpn, "control_lock", lock), patch.object(vpn, "start") as start, \
+                redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(vpn.proxy(vpn.TARGET, "22"), 1)
+        start.assert_not_called()
+        self.assertIn("will not reopen UCLA login", errors.getvalue())
+
+    def test_open_tunnel_resumes_sync_left_paused_for_people_not_mutagen(self):
+        client = Mock()
+        client.wait.return_value = 0
+        for kind, expected in (("mutagen", 0), ("interactive", 1)):
+            vpn.write_json(self.state / "paused-sync.json", ["a"])
+            self.proxy_context(kind, up=True)
+            with patch.object(vpn, "owned_pid", return_value=88), patch.object(vpn, "ensure_idle_watch"), \
+                    patch.object(vpn, "resume_sync") as resume, \
+                    patch.object(vpn.subprocess, "Popen", return_value=client), redirect_stderr(io.StringIO()):
+                self.assertEqual(vpn.proxy(vpn.TARGET, "22"), 0)
+            self.assertEqual(resume.call_count, expected)
+
+    def test_short_connect_timeout_refuses_instead_of_half_login(self):
+        self.proxy_context("interactive")
+        with patch.object(vpn, "parent_args", return_value="ssh -o ConnectTimeout=10 seasnet true"), \
+                patch.object(vpn, "start") as start, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(vpn.proxy(vpn.TARGET, "22"), 1)
+        start.assert_not_called()
+        self.assertIn("ConnectTimeout too short", errors.getvalue())
+
+    def test_caller_kind_from_parent_ssh(self):
+        with patch.object(vpn, "agent_context", return_value=False):
+            self.assertEqual(vpn.caller_kind("/usr/bin/ssh -oConnectTimeout=5 -oServerAliveInterval=10 seasnet "
+                                             ".mutagen/agents/0.18.1/mutagen-agent synchronizer"), "mutagen")
+            self.assertEqual(vpn.caller_kind("ssh -o BatchMode=true seasnet"), "batch")
+            self.assertEqual(vpn.caller_kind("ssh -oBatchMode=yes seasnet"), "batch")
+            self.assertEqual(vpn.caller_kind("ssh seasnet"), "interactive")
+            with patch.object(vpn, "has_tty", return_value=False):
+                self.assertEqual(vpn.caller_kind("ssh seasnet"), "batch")
+        with patch.object(vpn, "agent_context", return_value=True):
+            self.assertEqual(vpn.caller_kind("ssh seasnet"), "agent")
+
+    def test_agent_ancestor_walks_process_tree(self):
+        me, parent = os.getpid(), os.getppid()
+        table = f"{me} {parent} /opt/homebrew/bin/python3\n{parent} 500 /bin/zsh\n500 400 /Users/x/.codex/bin/codex\n400 1 launchd\n"
+        with patch.object(vpn, "capture", return_value=Mock(stdout=table)):
+            self.assertEqual(vpn.agent_ancestor(), "codex")
+        with patch.object(vpn, "capture", return_value=Mock(stdout=table.replace("codex", "tmux"))):
+            self.assertIsNone(vpn.agent_ancestor())
+
+    def test_ours_tolerates_unparseable_args(self):
+        with patch.object(vpn, "process", return_value=f"{os.getuid()} 1 /usr/bin/grep grep it's ocproxy"):
+            self.assertIsNone(vpn.ours(123))
+        with patch.object(vpn, "process", return_value=f"{os.getuid()} 1 /opt/homebrew/bin/ocproxy "
+                                                       f"/opt/homebrew/bin/ocproxy -L {vpn.PORT}:{vpn.TARGET}:22 -k 30"):
+            self.assertEqual(vpn.ours(123), "ocproxy")
+
+    def test_nonfinite_idle_minutes_fall_back(self):
+        with patch.dict(os.environ, {"SEASNET_VPN_IDLE_MINUTES": "nan"}):
+            self.assertEqual(vpn.idle_seconds(), vpn.DEFAULT_IDLE_MINUTES * 60)
 
 
 if __name__ == "__main__":

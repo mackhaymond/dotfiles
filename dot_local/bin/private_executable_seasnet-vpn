@@ -15,8 +15,7 @@ tunnel gone, so Mutagen never retries in a loop. The next start resumes exactly
 the sessions this helper paused.
 """
 import fcntl
-import fnmatch
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import hashlib
 import json
 import math
@@ -84,7 +83,8 @@ def idle_seconds():
         minutes = float(minutes) if minutes else tomllib.loads(CONFIG.read_text()).get("idle_minutes")
     except (OSError, ValueError, tomllib.TOMLDecodeError):
         minutes = None
-    if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or minutes <= 0:
+    if (isinstance(minutes, bool) or not isinstance(minutes, (int, float))
+            or not math.isfinite(minutes) or minutes <= 0):
         minutes = DEFAULT_IDLE_MINUTES
     return int(minutes * 60)
 
@@ -130,8 +130,17 @@ def open_lease(kind):
     leases = STATE / "connections"
     leases.mkdir(exist_ok=True, mode=0o700)
     path = leases / str(os.getpid())
-    lease = path.open("w")
-    fcntl.flock(lease, fcntl.LOCK_EX)
+    while True:
+        lease = path.open("w")
+        fcntl.flock(lease, fcntl.LOCK_EX)
+        # transports(clean=True) may have unlinked the file between open and
+        # flock; a lease on an orphaned inode would be invisible.
+        try:
+            if os.fstat(lease.fileno()).st_ino == path.stat().st_ino:
+                break
+        except FileNotFoundError:
+            pass
+        lease.close()
     lease.write(kind + "\n")
     lease.flush()
     return path, lease
@@ -159,6 +168,8 @@ def transports(clean=False):
 
 
 def watcher_alive():
+    # Briefly takes idle.lock when no watcher holds it; a watcher starting in
+    # that instant retries its own flock (see idle_watch).
     try:
         with (STATE / "idle.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -223,6 +234,53 @@ def tunnel_sessions(attempts=1):
     return sessions
 
 
+_globs = {}
+
+
+def glob_regex(pattern):
+    """Mutagen's doublestar globs: * and ? stay within one path component,
+    ** spans components (and `**/` may match nothing), {a,b} alternates."""
+    if pattern not in _globs:
+        out, i = [], 0
+        while i < len(pattern):
+            c = pattern[i]
+            if pattern.startswith("**/", i):
+                out.append("(?:.*/)?")
+                i += 3
+                continue
+            if pattern.startswith("**", i):
+                out.append(".*")
+                i += 2
+                continue
+            if c == "*":
+                out.append("[^/]*")
+            elif c == "?":
+                out.append("[^/]")
+            elif c == "[":
+                end = pattern.find("]", i + 1)
+                if end == -1:
+                    out.append(re.escape(c))
+                else:
+                    body = pattern[i + 1:end]
+                    out.append("[" + ("^" + body[1:] if body.startswith(("!", "^")) else body) + "]")
+                    i = end
+            elif c == "{":
+                end = pattern.find("}", i + 1)
+                if end == -1:
+                    out.append(re.escape(c))
+                else:
+                    out.append("(?:" + "|".join(glob_regex(part).pattern[:-2] for part in pattern[i + 1:end].split(",")) + ")")
+                    i = end
+            elif c == "\\" and i + 1 < len(pattern):
+                i += 1
+                out.append(re.escape(pattern[i]))
+            else:
+                out.append(re.escape(c))
+            i += 1
+        _globs[pattern] = re.compile("".join(out) + r"\Z")
+    return _globs[pattern]
+
+
 def ignored(relative, name, is_dir, patterns):
     hit = False
     for raw in patterns:
@@ -231,10 +289,12 @@ def ignored(relative, name, is_dir, patterns):
         if pattern.endswith("/") and not is_dir:
             continue
         pattern = pattern.rstrip("/")
+        # A pattern containing a slash is anchored at the root; otherwise it
+        # matches the entry's name at any depth.
         if "/" in pattern:
-            match = fnmatch.fnmatchcase(relative, pattern.lstrip("/"))
+            match = glob_regex(pattern.lstrip("/")).match(relative)
         else:
-            match = fnmatch.fnmatchcase(name, pattern)
+            match = glob_regex(pattern).match(name)
         if match:
             hit = not negate
     return hit
@@ -320,18 +380,32 @@ def resume_sync():
     paused = read_json(STATE / "paused-sync.json", [])
     if not paused:
         return
-    sessions = {s.get("identifier"): s for s in tunnel_sessions() or []}
+    sessions = tunnel_sessions(attempts=3)
+    if sessions is None:
+        log_event("could not list Mutagen sessions; paused sessions kept for the next start")
+        return
+    sessions = {s.get("identifier"): s for s in sessions}
+    remaining = []
     for identifier in paused:
         session = sessions.get(identifier)
         if not session or not session.get("paused"):
-            continue
+            continue  # Terminated, or resumed by someone else: nothing to do.
         try:
             result = mutagen("sync", "resume", identifier, timeout=30)
-            outcome = "resumed" if result.returncode == 0 else f"resume failed: {result.stderr.strip()[:200]}"
+            ok = result.returncode == 0
+            outcome = "resumed" if ok else f"resume failed: {result.stderr.strip()[:200]}"
+        except subprocess.TimeoutExpired:
+            # The daemon keeps connecting after the CLI gives up; check later.
+            ok, outcome = False, "resume still connecting after 30 s:"
         except (OSError, subprocess.SubprocessError) as error:
-            outcome = f"resume failed: {error}"
+            ok, outcome = False, f"resume failed: {error}"
         log_event(f"{outcome} Mutagen session {session.get('name')}")
-    (STATE / "paused-sync.json").unlink(missing_ok=True)
+        if not ok:
+            remaining.append(identifier)
+    if remaining:
+        write_json(STATE / "paused-sync.json", remaining)
+    else:
+        (STATE / "paused-sync.json").unlink(missing_ok=True)
 
 
 def pause_after_refusal():
@@ -341,8 +415,11 @@ def pause_after_refusal():
         except BlockingIOError:
             return 0
         time.sleep(1)  # Let the refused ssh exit before asking the daemon to pause.
-        if not tunnel_up():
-            pause_sync("tunnel down")
+        # Under control.lock, so a start that resumes sync cannot be undone by
+        # this late pause, and paused-sync.json has a single writer.
+        with control_lock(wait=True):
+            if not tunnel_up():
+                pause_sync("tunnel down")
     return 0
 
 
@@ -441,40 +518,102 @@ def capture(args):
 
 
 def has_tty():
+    """A controlling terminal with this process in its foreground job: someone
+    typed the command and is looking at it. Background jobs (`cmd &` under job
+    control) and daemons fail; ssh keeps ProxyCommand in its own group."""
     try:
-        os.close(os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY))
-        return True
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
     except OSError:
         return False
+    try:
+        return os.tcgetpgrp(fd) == os.getpgrp()
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+# Coding-agent CLIs that run commands on a terminal they share with a person.
+AGENT_PROGRAMS = {"claude", "codex", "opencode", "cursor-agent", "gemini", "aider", "goose", "amp"}
+
+
+def agent_ancestor():
+    try:
+        table = capture(["/bin/ps", "-axo", "pid=,ppid=,comm="]).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    parents, names = {}, {}
+    for line in table.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
+            parents[int(fields[0])], names[int(fields[0])] = int(fields[1]), Path(fields[2].strip()).name
+    pid, seen = os.getpid(), set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        if names.get(pid) in AGENT_PROGRAMS:
+            return names[pid]
+        pid = parents.get(pid, 1)
+    return None
 
 
 def agent_context():
-    """Commands from Claude/cua agents, including the pty MCP's tmux session."""
+    """Commands from coding agents: Claude/cua env markers, the pty MCP's tmux
+    session, or an agent CLI anywhere among this process's ancestors."""
     if os.environ.get("CLAUDECODE") or os.environ.get("CUA_AGENT_ID"):
         return True
     pane = os.environ.get("TMUX_PANE")
-    if not (pane and os.environ.get("TMUX")):
-        return False
-    try:
-        session = capture([TMUX, "display-message", "-p", "-t", pane, "#{session_name}"]).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return session == AGENT_TMUX_SESSION
+    if pane and os.environ.get("TMUX"):
+        try:
+            session = capture([TMUX, "display-message", "-p", "-t", pane, "#{session_name}"]).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            session = ""
+        if session == AGENT_TMUX_SESSION:
+            return True
+    return agent_ancestor() is not None
 
 
-def caller_kind():
-    """How the ssh that ran this ProxyCommand was started."""
+@contextmanager
+def to_terminal():
+    """Point this block's prints at the person's terminal. relayctl captures
+    ssh's stderr, so login progress and refusals would otherwise go unseen."""
+    tty = None
+    if not sys.stderr.isatty():
+        try:
+            tty = open("/dev/tty", "w")
+        except OSError:
+            pass
+    stream = tty or sys.stderr
     try:
-        parent = capture(["/bin/ps", "-ww", "-p", str(os.getppid()), "-o", "args="]).stdout
+        with redirect_stdout(stream), redirect_stderr(stream):
+            yield
+    finally:
+        if tty is not None:
+            tty.close()
+
+
+def parent_args():
+    try:
+        return capture(["/bin/ps", "-ww", "-p", str(os.getppid()), "-o", "args="]).stdout
     except (OSError, subprocess.SubprocessError):
-        parent = ""
+        return ""
+
+
+def caller_kind(parent):
+    """How the ssh that ran this ProxyCommand (args in `parent`) was started."""
     if "mutagen-agent" in parent:
         return "mutagen"
-    if re.search(r"batchmode\s*[= ]\s*yes", parent, re.IGNORECASE):
+    if re.search(r"batchmode\s*[= ]\s*(yes|true)\b", parent, re.IGNORECASE):
         return "batch"
     if agent_context():
         return "agent"
     return "interactive" if has_tty() else "batch"
+
+
+def login_timeout_too_short(parent):
+    """ssh's ConnectTimeout also bounds the banner wait behind a ProxyCommand,
+    so a short one kills the helper partway through UCLA login and Duo."""
+    match = re.search(r"connecttimeout\s*[= ]\s*(\d+)", parent, re.IGNORECASE)
+    return bool(match) and int(match.group(1)) < LOGIN_TIMEOUT
 
 
 REFUSALS = {
@@ -482,8 +621,10 @@ REFUSALS = {
                "seasnet sessions are paused until you run `seasnet-vpn start` or `ssh seasnet`.",
     "agent": "seasnet-vpn: the VPN is down. This SSH came from an agent, so no UCLA login opens. "
              "Ask Mack to run `seasnet-vpn start` in his terminal.",
-    "batch": "seasnet-vpn: the VPN is down. This SSH has no terminal (or uses BatchMode), so no UCLA "
-             "login opens. Run `seasnet-vpn start` in a terminal first.",
+    "batch": "seasnet-vpn: the VPN is down. This SSH is not a foreground terminal command (or uses "
+             "BatchMode), so no UCLA login opens. Run `seasnet-vpn start` in a terminal first.",
+    "timeout": "seasnet-vpn: the VPN is down. This SSH sets a ConnectTimeout too short to finish UCLA "
+               "login and Duo, so no login opens. Run `seasnet-vpn start` first, then retry.",
 }
 
 
@@ -502,7 +643,10 @@ def ours(pid):
     info = process(pid).split(None, 3)
     if len(info) != 4 or int(info[0]) != os.getuid():
         return None
-    name, args = Path(info[2]).name, shlex.split(info[3])
+    try:
+        name, args = Path(info[2]).name, shlex.split(info[3])
+    except ValueError:  # Unbalanced quotes in some unrelated process's args.
+        return None
     if name == "openconnect" and str(PIDFILE) in args:
         return name
     if name == "ocproxy" and args[1:] == ["-L", f"{PORT}:{TARGET}:22", "-k", "30"]:
@@ -760,6 +904,8 @@ def start(username=None, terminal_auth=False):
                 ensure_idle_watch()
                 write_login_result("connected", attempt=attempt)
                 connected = True
+                # A later external-browser callback must not pass as current.
+                (STATE / "login-attempt.json").unlink(missing_ok=True)
                 record_login(True)
                 log_event(f"connected (openconnect PID {pid})")
                 resume_sync()
@@ -814,10 +960,14 @@ def stop():
 
 def idle_watch():
     with (STATE / "idle.lock").open("w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return 0
+        for attempt in range(5):  # watcher_alive() probes hold the lock for an instant.
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if attempt == 4:
+                    return 0
+                time.sleep(0.1)
         (STATE / "idle.pid").write_text(str(os.getpid()) + "\n")
         try:
             while True:
@@ -835,8 +985,12 @@ def idle_watch():
                         if idle >= idle_seconds():
                             log_event(f"idle {int(idle // 60)} min; pausing seasnet sync and disconnecting")
                             pause_sync("idle")
-                            if (not any(kind != "mutagen" for kind in transports(clean=True))
-                                    and stop() == 0):
+                            if any(kind != "mutagen" for kind in transports(clean=True)):
+                                # Someone connected while we paused: the tunnel
+                                # stays, so sync must too.
+                                log_event("idle stop cancelled by a new SSH session")
+                                resume_sync()
+                            elif stop() == 0:
                                 (STATE / "idle.pid").unlink(missing_ok=True)
                                 fcntl.flock(lock, fcntl.LOCK_UN)
                                 return 0
@@ -858,10 +1012,14 @@ def proxy(host, port):
         raise KeyboardInterrupt
     for signum in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, interrupted)
-    kind = caller_kind()
+    parent = parent_args()
+    kind = caller_kind(parent)
     if not tunnel_up():
+        if kind == "interactive" and login_timeout_too_short(parent):
+            kind = "timeout"
         if kind != "interactive":
-            print(REFUSALS[kind], file=sys.stderr)
+            with to_terminal() if kind == "timeout" else redirect_stdout(sys.stderr):
+                print(REFUSALS[kind])
             log_event(f"refused {kind} SSH: VPN is down")
             if kind == "mutagen":
                 # Pausing stops Mutagen's ~20 s retry loop. Detached, because the
@@ -869,16 +1027,21 @@ def proxy(host, port):
                 subprocess.Popen([str(SELF), "pause-sync"], stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             return 1
-        cooldown = login_cooldown()
-        if cooldown:
-            print(cooldown, file=sys.stderr)
-            return 1
-        with control_lock(wait=True), redirect_stdout(sys.stderr):
-            if not tunnel_up():
-                if owned_pid():
-                    stop()
-                if start():
-                    return 1
+        with to_terminal():
+            if login_cooldown():
+                print(login_cooldown())
+                return 1
+            with control_lock(wait=True):
+                if not tunnel_up():
+                    # Re-checked under the lock: callers queued behind a login
+                    # that was just cancelled must not reopen it.
+                    if login_cooldown():
+                        print(login_cooldown())
+                        return 1
+                    if owned_pid():
+                        stop()
+                    if start():
+                        return 1
     # Riding an open tunnel takes no lock, so Mutagen resumes during a start
     # and connections never queue behind someone's pending login.
     path, lease = open_lease(kind)
@@ -889,6 +1052,16 @@ def proxy(host, port):
             return 1
         if kind != "mutagen":
             touch_activity()
+            if read_json(STATE / "paused-sync.json", []):
+                # Sync left paused while the tunnel stayed up (an idle stop that
+                # was cancelled, or a racing refusal): resume before relayctl
+                # flushes, since flushing a paused session fails.
+                try:
+                    with control_lock(), to_terminal():
+                        print("seasnet-vpn: resuming paused seasnet sync.")
+                        resume_sync()
+                except RuntimeError:
+                    pass
         ensure_idle_watch()
         client = subprocess.Popen(["/usr/bin/nc", "127.0.0.1", str(PORT)])
         while True:
@@ -921,9 +1094,13 @@ def status():
                   f"(Mutagen transports open: {kinds.count('mutagen')}; they do not count as use).")
         print(f"Idle watcher: {'running' if watcher_alive() else 'NOT running'}.")
     else:
-        stray = strays()
-        if stray:
-            print(f"Stray VPN processes without a pidfile: {stray}. `seasnet-vpn stop` cleans them up.")
+        try:
+            with control_lock():
+                stray = strays()
+            if stray:
+                print(f"Stray VPN processes without a pidfile: {stray}. `seasnet-vpn stop` cleans them up.")
+        except RuntimeError:
+            print("A VPN login or shutdown is in progress.")
     print(f"Disconnects after {limit} min with no SSH session besides Mutagen and no synced file changes.")
     paused = read_json(STATE / "paused-sync.json", [])
     if paused:
