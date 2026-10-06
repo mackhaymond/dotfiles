@@ -94,12 +94,32 @@ def codex_args(command):
     return " ".join(kept), resume, model
 
 
+def thread_row(codex_home, sid):
+    """Read-only lookup in Codex's WAL-mode state DB.
+
+    With no Codex process holding the DB open there is no -shm file, and a
+    plain mode=ro open cannot create one, so it fails with "unable to open
+    database file" — which made every check here silently False. No -shm means
+    no live writer and a fully checkpointed main file, so the retry reads that
+    file as immutable.
+    """
+    uri = (codex_home / "state_5.sqlite").as_uri()
+    query = "SELECT thread_source,source,agent_path,rollout_path FROM threads WHERE id=?"
+    try:
+        with sqlite3.connect(uri + "?mode=ro", uri=True, timeout=.3) as database:
+            return database.execute(query, (sid,)).fetchone()
+    except sqlite3.OperationalError:
+        if (codex_home / "state_5.sqlite-shm").exists():
+            raise
+        with sqlite3.connect(uri + "?mode=ro&immutable=1", uri=True, timeout=.3) as database:
+            return database.execute(query, (sid,)).fetchone()
+
+
 def persisted_root(codex_home, sid):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(sid or "")):
         return False
     try:
-        with sqlite3.connect((codex_home / "state_5.sqlite").as_uri() + "?mode=ro", uri=True, timeout=.3) as database:
-            row = database.execute("SELECT thread_source,source,agent_path,rollout_path FROM threads WHERE id=?", (sid,)).fetchone()
+        row = thread_row(codex_home, sid)
         if not row or row[0] != "user" or row[1] not in ("cli", "vscode") or row[2] or not row[3]:
             return False
         with Path(row[3]).open() as rollout:
@@ -124,6 +144,30 @@ def selected_session(record, sid, resume, codex_home, tracker_dir):
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return resume if persisted_root(codex_home, resume) else None
+
+
+def standalone_entry(entry, targets, used, codex_home):
+    """A living `--no-daemon` frontend whose own argv names its thread.
+
+    Since the wrapper forces --no-daemon (cfef2de), frontends get no relay
+    binding, so every living one used to abort the whole repair — and the
+    sidecar then kept the plugin's unverified rows for ALL Codex panes. A
+    standalone process is a descendant of the pane the plugin found it in, and
+    `resume <id>` in its own command line, naming a persisted root thread, is
+    the same evidence this file already accepts as a binding fallback. Anything
+    weaker still aborts.
+    """
+    try:
+        command = run(["ps", "-p", str(int(entry["pid"])), "-o", "command="])
+        arguments, resume, model = codex_args(command)
+    except (ValueError, KeyError, subprocess.SubprocessError):
+        return None
+    if ("--no-daemon" not in arguments.split() or not resume or resume != entry.get("session_id")
+            or entry.get("pane") not in targets or entry.get("pane") in used
+            or not persisted_root(codex_home, resume)):
+        return None
+    return dict(pane=entry["pane"], tool="codex", session_id=resume, cwd=entry.get("cwd", ""),
+                pid=str(entry["pid"]), model=model, cli_args=arguments, env=None)
 
 
 def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_dir):
@@ -156,10 +200,16 @@ def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_d
         rebuilt.append(dict(pane=pane["target"], tool="codex", session_id=selected, cwd=pane["cwd"],
                             pid=str(record["frontend_pid"]), model=model, cli_args=arguments, env=None))
     accepted = {int(entry["pid"]) for entry in rebuilt}
-    unresolved = []
+    unresolved, standalone = [], 0
     for entry in data["sessions"]:
         pid = str(entry.get("pid", ""))
         if entry.get("tool") == "codex" and pid.isdigit() and int(pid) not in accepted and owner.process_identity(int(pid)):
+            kept = standalone_entry(entry, targets, used, codex_home)
+            if kept:
+                rebuilt.append(kept)
+                used.add(kept["pane"])
+                standalone += 1
+                continue
             unresolved.append(int(pid))
     if unresolved:
         raise ValueError("Unresolved living Codex frontend PIDs: " + ",".join(map(str, sorted(set(unresolved)))))
@@ -191,7 +241,7 @@ def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_d
             line = "\t".join(f) + line[len(line.rstrip("\r\n")):]
         lines.append(line)
     report = dict(codex=len(rebuilt), preserved=len(sessions), invalid_bindings=invalid, repaired_panes=fixed,
-                  fallback_bindings=fallback, parked_cwds=parked_cwds)
+                  fallback_bindings=fallback, parked_cwds=parked_cwds, standalone_resumes=standalone)
     return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode(), "".join(lines).encode(), used, report
 
 

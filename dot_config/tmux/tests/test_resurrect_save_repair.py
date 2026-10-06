@@ -243,6 +243,27 @@ class SaveRepairTests(unittest.TestCase):
         content, *_ = self.repaired()
         self.assertEqual(json.loads(content)["sessions"], [self.claude])
 
+    def test_living_standalone_frontend_is_kept_only_on_its_own_resume_argument(self):
+        data = json.loads(self.sidecar)
+        data["sessions"][1].update(pid="123", pane="main:7.1", session_id="correct")
+        self.sidecar = json.dumps(data)
+        self.owner.valid.return_value = False  # no relay binding, as under --no-daemon
+        self.owner.process_identity.return_value = dict(frontend_pid=123, tty="ttys7")
+        content, *_, report = self.repaired(command="node /x/codex --no-daemon -c k=v resume correct")
+        codex = [entry for entry in json.loads(content)["sessions"] if entry["tool"] == "codex"]
+        self.assertEqual(codex, [dict(pane="main:7.1", tool="codex", session_id="correct", cwd="/shared",
+                                      pid="123", model="", cli_args="--no-daemon -c k=v", env=None)])
+        self.assertEqual(report["standalone_resumes"], 1)
+        # Its argv names a different thread, the thread is not a persisted root,
+        # or it is not standalone: still unresolved.
+        for command in ("codex --no-daemon resume other", "codex resume correct"):
+            with self.assertRaisesRegex(ValueError, "Unresolved living Codex frontend PIDs: 123"):
+                self.repaired(command=command)
+        data["sessions"][1]["session_id"] = "never-persisted"
+        self.sidecar = json.dumps(data)
+        with self.assertRaisesRegex(ValueError, "Unresolved living Codex frontend PIDs: 123"):
+            self.repaired(command="codex --no-daemon resume never-persisted")
+
     def test_unsafe_cli_arguments_leave_every_real_save_file_unchanged(self):
         sidecar, layout = self.root / "assistant-sessions.json", self.root / "save.txt"
         sidecar.write_text(self.sidecar)

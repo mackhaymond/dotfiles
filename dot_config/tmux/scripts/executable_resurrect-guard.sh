@@ -52,7 +52,14 @@ KEEP_ARCHIVES=30
 
 log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$LOG"; }
 
-pane_count() { grep -c '^pane' "$1" 2>/dev/null || echo 0; }
+# Sessions resurrect-save.sh never writes do not count, in either file: an
+# older save holding 70 `agents` panes is not 70 panes better, and comparing
+# raw counts made the first save after the exclusion look like a shrink.
+EXCLUDE="${RESURRECT_EXCLUDE:-$(tmux show-option -gqv @resurrect-exclude-sessions 2>/dev/null || true)}"
+EXCLUDE="${EXCLUDE:-agents tasks}"
+pane_count() {
+	awk -F'\t' -v ex=" $EXCLUDE " '$1 == "pane" && index(ex, " " $2 " ") == 0 { n++ } END { print n + 0 }' "$1" 2>/dev/null || echo 0
+}
 
 write_state() {
 	printf 'good_file=%s\nstreak=%s\n' "$1" "$2" >"$STATE"

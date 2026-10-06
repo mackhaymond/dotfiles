@@ -1,0 +1,46 @@
+--- a/server-client.c	2026-10-06 07:37:06
++++ b/server-client.c	2026-10-06 07:37:06
+@@ -1763,7 +1763,7 @@
+ 	struct window_pane	*wp = server_client_get_pane(c), *loop;
+ 	struct screen		*s = NULL;
+ 	struct options		*oo = c->session->options;
+-	int			 mode = 0, cursor, flags;
++	int			 mode = 0, cursor, flags, pane_sync = 0;
+ 	u_int			 cx = 0, cy = 0, ox, oy, sx, sy, n;
+ 	struct visible_ranges	*r;
+ 
+@@ -1808,6 +1808,11 @@
+ 		cx = c->prompt_cursor;
+ 	} else if (wp != NULL && c->overlay_draw == NULL) {
+ 		cursor = 0;
++		/*
++		 * Use the mode screen (s), not base: in copy mode the base may
++		 * be mid-sync while the cursor shown is the copy-mode one.
++		 */
++		pane_sync = (s->mode & MODE_SYNC);
+ 		tty_window_offset(tty, &ox, &oy, &sx, &sy);
+ 		if (wp->xoff + (int)s->cx >= (int)ox &&
+ 		    wp->xoff + (int)s->cx <= (int)ox + (int)sx &&
+@@ -1831,8 +1836,20 @@
+ 	} else if (c->overlay_mode == NULL || s == NULL)
+ 		mode &= ~MODE_CURSOR;
+ 
+-	log_debug("%s: cursor to %u,%u", __func__, cx, cy);
+-	tty_cursor(tty, cx, cy);
++	/*
++	 * While the pane is in a synchronized update its contents are frozen,
++	 * so do not let the cursor position or on/off state escape either:
++	 * leave the cursor where the last full redraw put it (backport of
++	 * upstream 57a13664 and 5e5e15f6).
++	 */
++	if (!pane_sync) {
++		log_debug("%s: cursor to %u,%u", __func__, cx, cy);
++		tty_cursor(tty, cx, cy);
++	} else {
++		mode &= ~CURSOR_MODES;
++		mode |= tty->mode & CURSOR_MODES;
++		s = NULL;
++	}
+ 
+ 	/*
+ 	 * Set mouse mode if requested. To support dragging, always use button

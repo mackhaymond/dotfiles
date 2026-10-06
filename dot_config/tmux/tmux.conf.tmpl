@@ -408,6 +408,8 @@ set-hook -g 'client-session-changed[1]' 'run-shell -b "#{HOME}/.local/bin/cua-no
 # Safe swap: resurrect self-registers @resurrect-{save,restore}-script-path from
 # its own $CURRENT_DIR, so continuum and tmux-assistant-resurrect (which couple
 # only through tmux options, not the plugin dir name) follow automatically.
+# (The SAVE path is then overridden below the tpm line by scripts/resurrect-save.sh;
+# restore stays the plugin's.)
 set -g @plugin 'trevin-j/tmux-resurrect-nvim'
 set -g @resurrect-dir '{{ .chezmoi.homeDir }}/.tmux/resurrect'
 set -g @resurrect-capture-pane-contents 'on'
@@ -579,31 +581,44 @@ run-shell "#{HOME}/.config/tmux/scripts/stash-statusline.sh"
 # strings (long weekday+date projections) plus the stash chip.
 set -g status-right-length 200
 
-# --- resurrect save validation (must stay BELOW the tpm line) ---
-# Resolve Codex from verified frontends rather than cwd guesses, remove the
-# old terminal relay's temporary socket, and repair blank-title pane rows.
-# Validate/filter BEFORE the guard archives sidecars alongside this save.
-set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/plugins/tmux-assistant-resurrect/scripts/save-assistant-sessions.sh' && python3 '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-save-repair.py'"
-# The task broker (CuaNotch agentd) recreates this session and resumes tasks on
-# demand; resurrect must never relaunch its panes. Runs after the sidecar save.
-set -ag @resurrect-hook-post-save-all " && bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/tasks-save-filter.sh' && bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-guard.sh'"
+# --- resurrect save/restore (everything here must stay BELOW the tpm line) ---
+# The plugins' .tmux files re-set the script paths, the C-s binding and both
+# hooks when tpm loads them, so anything above would be silently replaced.
 
-# Parked windows come back parked on their own — resurrect saves the holding
-# session verbatim — but it does not save WINDOW OPTIONS, which is where the
-# parked state lives, including the sessionId of a suspended agent (the only
-# surviving pointer to that conversation). This re-applies them afterwards.
-#
-# `set -ag` APPENDS: restore-assistant-sessions.sh is already on this hook and
-# must keep running. And this sits below the tpm line for the same reason the
-# guard above does — assistant-resurrect's .tmux re-sets these hooks when tpm
-# loads it, so anything above would be silently replaced.
-set -ag @resurrect-hook-post-restore-all "; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/stash.sh' restore-state"
+# Saving: scripts/resurrect-save.sh is a drop-in for the plugin's save.sh (same
+# file format; see its header for why — one ps snapshot instead of one per
+# pane, no column shift on blank titles, ~0.25s instead of seconds). continuum
+# runs whatever @resurrect-save-script-path names.
+set -g @resurrect-save-script-path '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-save.sh'
+bind-key C-s run-shell '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-save.sh'
 
-# The same options gap bites the `agents` session harder: tmux-pty-mcp owns
-# its windows by @pty_* options, so a restore brings back every agent shell as
-# an unownable idle zsh (80 of them on 2026-08-29). Prune those on arrival;
-# the server's own sweep is the backstop if this hook ever doesn't run.
-set -ag @resurrect-hook-post-restore-all "; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-restore-prune.sh'"
+# Never saved, so never restored:
+#   agents  tmux-pty-mcp shells. It owns windows by @pty_* window options, which
+#           resurrect cannot save, so a restored copy is an unownable idle zsh
+#           (80 at once on 2026-08-29; saves had reached 173 panes).
+#   tasks   the task broker (CuaNotch agentd) recreates it and resumes tasks
+#           on demand; resurrect must never relaunch its panes.
+set -g @resurrect-exclude-sessions 'agents tasks'
+
+# After every save:
+#   assistant-save.sh  the plugin's assistant detection with its --help parse
+#                      cached (it re-ran per pane), excluded sessions dropped
+#   repair             Codex from verified frontends rather than cwd guesses
+#   guard              reverts `last` if a save lost most of its panes
+# The guard is joined with `;`, not `&&`: it is what protects `last`, so a
+# failed repair must not be able to skip it.
+set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/assistant-save.sh' && python3 '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-save-repair.py'; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-guard.sh'"
+
+# After a restore:
+#   assistant-restore.sh  resumes every saved agent in parallel. Replaces the
+#                         plugin's hook, which waited ~7s per agent, serially.
+#   stash.sh restore-state  parked windows come back parked on their own, but
+#                         resurrect does not save WINDOW OPTIONS, which hold the
+#                         parked state — including a suspended agent's
+#                         sessionId, the only pointer to that conversation.
+#   agent-restore-prune   kills restored `agents` windows. Nothing saves them
+#                         any more; this cleans up after saves made before that.
+set -g @resurrect-hook-post-restore-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/assistant-restore.sh'; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/stash.sh' restore-state; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-restore-prune.sh'"
 
 # Keep the sidecar's key from going stale. It records windows by index, and
 # `renumber-windows on` means closing ANY window shifts its neighbours — so a
