@@ -1,4 +1,5 @@
 """Isolated transport/ownership regressions; never writes to a real tmux server."""
+import contextlib
 import importlib.util
 import io
 import json
@@ -216,6 +217,25 @@ class OwnershipTests(unittest.TestCase):
         with patch.dict(os.environ, CODEX_HOME=str(self.root)), patch.object(owner, 'run', return_value=SimpleNamespace(returncode=0, stdout='1 /x/codex app-server --listen unix:// --managed-daemon')), patch.object(owner, 'capture') as capture:
             self.assertIsNone(owner.direct_owner('root'))
             capture.assert_not_called()
+
+    def test_thread_lookup_survives_idle_wal_database_without_shm(self):
+        path = self.root / 'state_5.sqlite'
+        with contextlib.closing(sqlite3.connect(path)) as db:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('CREATE TABLE threads (id TEXT, thread_source TEXT, source TEXT, agent_path TEXT)')
+            db.execute("INSERT INTO threads VALUES ('root', 'user', 'cli', NULL)")
+            db.commit()
+        # Codex's SQLite removes -wal/-shm on a clean last close — the state an
+        # idle Codex leaves. Apple's system SQLite keeps them (persistent WAL),
+        # so remove them by hand; the close above already checkpointed.
+        for suffix in ('-wal', '-shm'):
+            (self.root / f'state_5.sqlite{suffix}').unlink(missing_ok=True)
+        with self.assertRaises(sqlite3.OperationalError):
+            sqlite3.connect(path.as_uri() + '?mode=ro', uri=True).execute('SELECT 1 FROM threads').fetchone()
+        self.assertEqual(owner.thread_row(self.root, 'thread_source, source', 'root'), ('user', 'cli'))
+        self.assertIsNone(owner.thread_row(self.root, 'thread_source', 'missing'))
+        with patch.dict(os.environ, CODEX_HOME=str(self.root)), patch.object(owner, 'run', return_value=SimpleNamespace(returncode=0, stdout='1 /x/codex --no-daemon')), patch.object(owner, 'capture', return_value=self.identity):
+            self.assertEqual(owner.direct_owner('root')['session_id'], 'root')
 
     def test_frames_unchanged_and_turn_bound_before_forward(self):
         events = []

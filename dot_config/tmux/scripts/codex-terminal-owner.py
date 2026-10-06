@@ -126,6 +126,27 @@ def resolve(sid):
     return direct_owner(sid) or empty
 
 
+def thread_row(home, columns, sid):
+    """One row of Codex's WAL-mode state DB, read-only.
+
+    When the last connection closes cleanly SQLite deletes state_5.sqlite-shm,
+    and a mode=ro open cannot recreate it: "unable to open database file". An
+    idle --no-daemon frontend holds no connection, so that state is ordinary
+    and made direct_owner() report unbound. No -shm means no live writer and a
+    fully checkpointed main file, so that one case reads it as immutable.
+    """
+    path = home / "state_5.sqlite"
+    query = f"SELECT {columns} FROM threads WHERE id=?"
+    try:
+        with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=.1) as db:
+            return db.execute(query, (sid,)).fetchone()
+    except sqlite3.OperationalError:
+        if not path.exists() or (home / "state_5.sqlite-shm").exists():
+            raise
+    with sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=.1) as db:
+        return db.execute(query, (sid,)).fetchone()
+
+
 def direct_owner(sid):
     """Keep explicit --no-daemon hooks working without trusting inherited PTYs.
 
@@ -136,8 +157,7 @@ def direct_owner(sid):
     """
     try:
         home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-        with sqlite3.connect((home / "state_5.sqlite").as_uri() + "?mode=ro", uri=True, timeout=.1) as db:
-            row = db.execute("SELECT thread_source, source, agent_path FROM threads WHERE id=?", (sid,)).fetchone()
+        row = thread_row(home, "thread_source, source, agent_path", sid)
         if not row or row[0] != "user" or row[1] not in ("cli", "vscode") or row[2]:
             return None
         pid = os.getppid()

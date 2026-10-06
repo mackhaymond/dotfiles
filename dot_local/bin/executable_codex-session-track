@@ -28,6 +28,26 @@ CODEX_HOME = os.path.realpath(os.path.expanduser("~/.codex"))
 CODEX_DB = os.path.join(CODEX_HOME, "state_5.sqlite")
 
 
+def rollout_path(sid):
+    """The thread's rollout file, read-only from Codex's WAL-mode state DB.
+
+    With no Codex connection open there is no state_5.sqlite-shm, and a
+    mode=ro open cannot create one ("unable to open database file"); no -shm
+    means no live writer and a checkpointed main file, so read it immutable.
+    Same rule as thread_row() in ~/.config/tmux/scripts/codex-terminal-owner.py.
+    """
+    query = 'select rollout_path from threads where id=?'
+    try:
+        with sqlite3.connect('file:%s?mode=ro' % CODEX_DB, uri=True, timeout=0.5) as con:
+            row = con.execute(query, (sid,)).fetchone()
+    except sqlite3.OperationalError:
+        if not os.path.exists(CODEX_DB) or os.path.exists(CODEX_DB + '-shm'):
+            raise
+        with sqlite3.connect('file:%s?mode=ro&immutable=1' % CODEX_DB, uri=True, timeout=0.5) as con:
+            row = con.execute(query, (sid,)).fetchone()
+    return row[0] if row and row[0] else None
+
+
 def under_codex_home(cwd):
     """True for a path inside ~/.codex — codex's own state directory.
 
@@ -115,10 +135,9 @@ def main():
         payload = dict(cur, **payload)
     if not payload.get('transcript_path'):
         try:
-            with sqlite3.connect('file:%s?mode=ro' % CODEX_DB, uri=True, timeout=0.5) as con:
-                row = con.execute('select rollout_path from threads where id=?', (sid,)).fetchone()
-            if row and row[0]:
-                payload['transcript_path'] = row[0]
+            path = rollout_path(sid)
+            if path:
+                payload['transcript_path'] = path
         except Exception:
             pass
     # Resolving a live binding again prevents delayed reconciliation from
