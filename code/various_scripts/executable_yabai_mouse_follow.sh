@@ -25,6 +25,12 @@ fdisp=$(yabai -m query --displays --display 2>/dev/null) || exit 0
 fidx=$(printf '%s' "$fdisp" | jq -r '.index // empty' 2>/dev/null)
 [ -z "$fidx" ] && exit 0
 
+# shellcheck source=/dev/null
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
+# Never warp onto a display that doesn't exist as far as he's concerned
+# (agent-chrome's virtual screen); cursor-fence would only throw it back.
+yabai_display_ignored "$fidx" && exit 0
+
 # Cursor already on the focused display -> leave it alone.
 midx=$(yabai -m query --displays --display mouse 2>/dev/null | jq -r '.index // empty' 2>/dev/null)
 [ -n "$midx" ] && [ "$midx" = "$fidx" ] && exit 0

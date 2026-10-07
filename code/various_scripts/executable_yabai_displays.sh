@@ -56,7 +56,7 @@ trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
 settle_count() {
   local prev="" cur="" i=0
   while [ "$i" -lt 20 ]; do
-    cur=$(yabai -m query --displays 2>/dev/null | jq -r 'length' 2>/dev/null)
+    cur=$(yabai_displays_json | jq -r 'length' 2>/dev/null)
     case "$cur" in ''|*[!0-9]*) cur="" ;; esac
     if [ -n "$cur" ] && [ "$cur" = "$prev" ]; then
       printf '%s' "$cur"
@@ -69,7 +69,7 @@ settle_count() {
   # Timed out (~3s) without two stable reads (very slow system); use one final
   # live query rather than aborting on a possibly-empty value.
   if [ -z "$cur" ]; then
-    cur=$(yabai -m query --displays 2>/dev/null | jq -r 'length' 2>/dev/null)
+    cur=$(yabai_displays_json | jq -r 'length' 2>/dev/null)
     case "$cur" in ''|*[!0-9]*) cur="" ;; esac
   fi
   printf '%s' "${cur:-}"
@@ -110,6 +110,10 @@ case "$ACTION" in
     :
     ;;
   removed)
+    # A real external is still attached, so what left was an ignored display
+    # (agent-chrome's virtual screen) -- never dissolve `ext` or pull home for that.
+    # (`count` is the FILTERED count: ignored displays are never in it.)
+    [ "$count" -gt 1 ] && exit 0
     # Safety net: ensure every label is on the remaining (master) display.
     # macOS normally reparents on disconnect, so this is usually a no-op; the
     # native move carries any stragglers (and their windows) home.

@@ -16,6 +16,39 @@
 # (a board swap changes the UUID). Defined once here -- nowhere else.
 : "${YABAI_MASTER_DISPLAY_UUID:=37D8832A-2D66-02CA-B9F7-8F30A301B230}"
 
+# Displays the workspace scripts must treat as if they don't exist, `|`-separated
+# UUIDs. Default: the BetterDisplay virtual screen agent-chrome parks agent browsers
+# on (cua-notch bin/agent-chrome VD_UUID). Counting it made caps+F2 (F14 ->
+# yabai_display.sh external) focus the agent display whenever it was attached.
+: "${YABAI_IGNORED_DISPLAY_UUIDS:=F573F4AB-DD26-4536-8012-F2BA4929E1F4}"
+
+# Live `yabai -m query --displays` minus the ignored displays. Indices are yabai's
+# own (unchanged), so they stay valid for `display --focus N` / `space --display N`.
+# Emits nothing (and returns 1) if the query fails or isn't a JSON array.
+yabai_displays_json() {
+  yabai -m query --displays 2>/dev/null | yabai_filter_displays
+}
+
+# Filter a displays-JSON array on stdin down to the real (non-ignored) displays.
+yabai_filter_displays() {
+  jq -c --arg ignored "$YABAI_IGNORED_DISPLAY_UUIDS" '
+    ($ignored | ascii_upcase | split("|")) as $ig
+    | if type == "array" then [.[] | select((.uuid // "" | ascii_upcase) as $u | $ig | index($u) | not)]
+      else error("not an array") end
+  ' 2>/dev/null
+}
+
+# True if display index $1 is an ignored display (live query).
+yabai_display_ignored() {
+  local uuid
+  uuid=$(yabai -m query --displays --display "$1" 2>/dev/null | jq -r '.uuid // empty' 2>/dev/null)
+  [ -n "$uuid" ] || return 1
+  case "|$(printf '%s' "$YABAI_IGNORED_DISPLAY_UUIDS" | tr '[:lower:]' '[:upper:]')|" in
+    *"|$(printf '%s' "$uuid" | tr '[:lower:]' '[:upper:]')|"*) return 0 ;;
+  esac
+  return 1
+}
+
 # Canonical labeled spaces, in stable display order. The single source of this list.
 # (Consumed by the sourcing scripts' `for label in $YABAI_LABELS` loops.)
 # shellcheck disable=SC2034
@@ -215,8 +248,8 @@ yabai_is_agent_app() {
 # choose live-vs-cache ordering by what they pass in.
 yabai_master_index() {
   local djson="${1:-}"
-  [ -n "$djson" ] || djson=$(yabai -m query --displays 2>/dev/null)
-  printf '%s' "$djson" | jq -r --arg uuid "$YABAI_MASTER_DISPLAY_UUID" '
+  [ -n "$djson" ] || djson=$(yabai_displays_json)
+  printf '%s' "$djson" | yabai_filter_displays | jq -r --arg uuid "$YABAI_MASTER_DISPLAY_UUID" '
     ([.[] | select(.uuid == $uuid) | .index][0]) // (min_by(.frame.w * .frame.h).index) // empty
   ' 2>/dev/null | head -n 1
 }

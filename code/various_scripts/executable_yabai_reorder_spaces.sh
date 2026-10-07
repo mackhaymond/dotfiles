@@ -19,7 +19,7 @@ export USER="${USER:-$(id -un)}"
 # shellcheck source=/dev/null
 . "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
 
-displays=$(yabai -m query --displays 2>/dev/null) || exit 0
+displays=$(yabai_displays_json) || exit 0
 
 master=$(yabai_master_index "$displays")
 

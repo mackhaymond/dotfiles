@@ -44,6 +44,9 @@ SPACES_JSON=$(query_json_array --spaces) || exit 0
 WINDOWS_JSON=$(yabai -m query --windows 2>/dev/null)
 jq -e 'type == "array"' >/dev/null 2>&1 <<<"$WINDOWS_JSON" || WINDOWS_JSON='[]'
 DISPLAYS_JSON=$(query_json_array --displays) || exit 0
+# Ignored displays (agent-chrome's virtual screen) don't exist for the cache: no
+# DISPLAY_COUNT bump, never EXTERNAL_DISPLAY_INDEX.
+DISPLAYS_JSON=$(yabai_filter_displays <<<"$DISPLAYS_JSON") || exit 0
 DISPLAY_COUNT=$(jq -r 'length' <<<"$DISPLAYS_JSON")
 MASTER_DISPLAY_INDEX=$(yabai_master_index "$DISPLAYS_JSON")
 # Only meaningful once master is known; computing it against a placeholder master
