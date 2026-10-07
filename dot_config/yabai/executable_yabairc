@@ -110,6 +110,14 @@ yabai -m signal --add event=space_changed action='
   exit 0
 '
 
+# Arriving on a pinned app's space and finding it EMPTY while that app runs with no
+# visible window -> send it the reopen event a Dock click sends (yabai_reopen_pin.sh;
+# log ~/Library/Logs/yabai/reopen.log). Claude Desktop's stealth update relaunch hides
+# the whole app and never shows its window when another app is fullscreen at that
+# moment, so there is no window for any rule or restart to place; its activate handler
+# shows it, on the space you are on. One query and out unless the space is empty.
+yabai -m signal --add event=space_changed label=reopen_pin action="$HOME/code/various_scripts/yabai_reopen_pin.sh"
+
 # App -> Space pinning. The map lives in yabai_common.sh -- YABAI_PINNED_HOMES
 # (WezTerm->terminal, Todoist->todo, Granola->schedule, Spark Mail->mail, Notion
 # Calendar->calendar, Messages->messages, ChatGPT+Claude->ai) and YABAI_AGENT_APPS

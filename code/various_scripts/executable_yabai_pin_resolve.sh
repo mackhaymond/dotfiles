@@ -81,13 +81,15 @@ fi
 CONFIRM_SECONDS=2
 MIN_GAP=30
 MAX_PER_WINDOW=2
+MIN_UPTIME=150
 
 # Single-flight: a burst of triggers (launch + focus + space change) runs one check.
-# A holder older than 120s is an orphan (a restart kills yabai's process group); the
-# longest legitimate run is ~70s (watch 30 + delay 5 + confirm 2 + gap wait 30).
+# A holder older than 300s is an orphan (a restart kills yabai's process group); the
+# longest legitimate run is ~220s (watch 30 + delay 5 + boot wait <=150 + confirm 2 +
+# gap wait 30).
 if ! mkdir "$LOCK" 2>/dev/null; then
   m=$(stat -f %m "$LOCK" 2>/dev/null || echo 0)
-  [ $(( $(date +%s) - m )) -ge 120 ] || exit 0
+  [ $(( $(date +%s) - m )) -ge 300 ] || exit 0
   rm -rf "$LOCK" 2>/dev/null
   mkdir "$LOCK" 2>/dev/null || exit 0
 fi
@@ -139,6 +141,12 @@ actionable() {
   done
 }
 
+# Lines of $2 whose window id (field 1) is also in $1: "the same window, still stuck".
+still_stuck() {
+  printf '%s\n' "$2" | awk 'NR == FNR { seen[$1] = 1; next } ($1 in seen)' \
+    <(printf '%s\n' "$1") - 2>/dev/null
+}
+
 [ "$DELAY" != 0 ] && sleep "$DELAY"
 deadline=$(( $(date +%s) + WATCH ))
 
@@ -152,14 +160,24 @@ done
 startup_live && exit 0
 screen_locked && exit 0
 
+# Not in the first minutes after boot. Apps restoring at login are not AX-ready yet,
+# and a restart then fails for the same reason the first discovery did: 2026-10-06
+# 14:00 it spent BOTH restarts on Granola within ~40s of boot and gave up, though the
+# window resolved later without one. Wait until the machine has been up MIN_UPTIME.
+boot=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\).*/\1/p')
+case "$boot" in ''|*[!0-9]*) boot=0 ;; esac
+early=$(( MIN_UPTIME - ($(date +%s) - boot) ))
+if [ "$early" -gt 0 ] && [ "$DRY_RUN" = 0 ]; then
+  yabai_log $LOGN "defer ev=$EVENT reason=just-booted wait=${early}s"
+  sleep "$early"
+  startup_live && exit 0
+  screen_locked && exit 0
+  first=$(still_stuck "$first" "$(unresolved | actionable)")
+  [ -n "$first" ] || exit 0
+fi
+
 # Give-up markers outlive their window ids; drop day-old ones (memo entries expire then too).
 find "$YABAI_STATE_DIR" -maxdepth 1 -name 'resolve_gaveup_*' -mtime +0 -delete 2>/dev/null
-
-# Lines of $2 whose window id (field 1) is also in $1: "the same window, still stuck".
-still_stuck() {
-  printf '%s\n' "$2" | awk 'NR == FNR { seen[$1] = 1; next } ($1 in seen)' \
-    <(printf '%s\n' "$1") - 2>/dev/null
-}
 
 sleep "$CONFIRM_SECONDS"
 stuck=$(still_stuck "$first" "$(unresolved | actionable)")
