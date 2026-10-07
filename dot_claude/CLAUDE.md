@@ -47,8 +47,10 @@ playbook when GUI work is detected; skills carry the mechanics
 (cua:drive-app, cua:browse, cua:arc, cua:electron-door). The always-true
 core, even if the plugin is absent:
 
-- Never `open`/`open -a`/`open <url>`, AppleScript activate, bring_to_front,
-  or `yabai --focus` — launch with `cua-bg-launch`, drive with `mcp__cua__*`
+- `open` is allowed, but it brings its target to the front: use it to show
+  the user something, not to launch an app you will drive in the background.
+- Never AppleScript activate, bring_to_front, or `yabai --focus` — launch
+  apps for background driving with `cua-bg-launch`, drive with `mcp__cua__*`
   (start_session first, end_session when done).
 - Browsers: `agent-browser` (headless) for web tasks; `agent-chrome` for
   bot-blocked sites; the user's Arc via cua AX tools only.
