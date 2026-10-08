@@ -13,6 +13,7 @@ now. 2e410003 and 88d5cc09 are real orphans and must survive everything here.
 Same harness as test_stash_restore_match.py (fake tmux, isolated HOME/TMPDIR,
 @resurrect-dir in a temp dir); nothing real is touched.
 """
+import json
 import os
 import shutil
 import subprocess
@@ -197,6 +198,122 @@ class Orphans(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.orphan_sids(), [BRUIN, OLD])
         self.assertEqual(list(e.rdir.glob("stash-orphans.tsv.pending.*")), [])
+
+
+class ResumedByHand(unittest.TestCase):
+    """An orphan typed back with `claude --resume <sid>` is running, not lost.
+
+    No window carries it in @stash_session, so the reconcile cannot see it;
+    only ~/.claude/sessions/<pid>.json says it is back. `list` shows it as
+    running again, but its row STAYS: that file vanishes when claude exits,
+    and the row is then once more the only pointer to the conversation."""
+
+    def setUp(self):
+        self.env = FakeEnv()
+        self.addCleanup(self.env.cleanup)
+        self.sessions = self.env.home / ".claude/sessions"
+        self.sessions.mkdir(parents=True)
+        self.env.orphans.write_text(
+            row("main", "3", "2.1.245", "1", "", "", OLD, U)
+            + row("stash", "1", "zsh", "1", "schedule", "~/BruinLearn contact", BRUIN, U))
+
+    def child(self):
+        p = subprocess.Popen(["sleep", "120"])
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        return p.pid
+
+    def dead_pid(self):
+        p = subprocess.Popen(["true"]); p.wait()
+        return p.pid
+
+    @staticmethod
+    def proc_start(pid, tz="UTC0"):
+        """As claude records it: `ps -o lstart=`, in UTC on this machine."""
+        return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
+                              text=True, env={**os.environ, **({"TZ": tz} if tz else {})}).stdout.strip()
+
+    def session_file(self, pid, sid, tmux=None, proc_start=None):
+        rec = {"pid": pid, "sessionId": sid, "cwd": U, "kind": "interactive", "status": "idle"}
+        if proc_start is not None:
+            rec["procStart"] = proc_start
+        if tmux is not None:
+            rec["tmux"] = tmux
+        (self.sessions / ("%d.json" % pid)).write_text(json.dumps(rec, separators=(",", ":")))
+
+    def server_with_pane(self, pid):
+        w = win("main", 1, "2.1.291", U, AUTO); w["panes"][0]["pid"] = pid
+        self.env.set_server({"@9": w, "@5": win("stash", 1, "zsh", U, AUTO)})
+
+    def sections(self):
+        out = self.env.run("list").stdout
+        lost, _, back = out.partition("running again:")
+        return out, lost, back
+
+    def test_list_shows_it_running_and_the_dead_one_still_lost(self):
+        alive = self.child()
+        self.session_file(alive, BRUIN, tmux="main:@9.%9", proc_start=self.proc_start(alive))
+        self.session_file(self.dead_pid(), OLD, tmux="main:@9.%9")    # a crash's leftover
+        self.server_with_pane(alive)
+        out, lost, back = self.sections()
+        self.assertIn("lost their window", lost, out)
+        self.assertIn("claude --resume " + OLD, lost, out)
+        self.assertNotIn(BRUIN, lost, out)
+        self.assertIn("~/BruinLearn contact", back, out)
+        self.assertIn("running again in main:1  (session %s)" % BRUIN, back, out)
+
+    def test_reconcile_keeps_the_row_until_a_window_carries_it(self):
+        alive = self.child()
+        self.session_file(alive, BRUIN, tmux="main:@9.%9", proc_start=self.proc_start(alive))
+        self.server_with_pane(alive)
+        before = self.env.orphans.read_bytes()
+        r = self.env.run("publish")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.env.orphans.read_bytes(), before)
+        self.assertNotIn("on a window again", self.env.log())
+        # Parked again, with the id on the window: now it goes.
+        self.env.set_server({"@9": win("main", 1, "zsh", U, AUTO),
+                             "@83": suspended(1, BRUIN, U, "~/BruinLearn contact", "1791300000")})
+        r = self.env.run("publish")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([l.split(SEP)[6] for l in self.env.orphans.read_text().splitlines()], [OLD])
+
+    def test_a_reused_pid_is_not_the_resumed_session(self):
+        """A stale sessions file whose pid now belongs to someone else."""
+        alive = self.child()
+        self.session_file(alive, BRUIN, tmux="main:@9.%9", proc_start="Mon Jan  1 00:00:00 2001")
+        self.server_with_pane(alive)
+        out, lost, back = self.sections()
+        self.assertIn("claude --resume " + BRUIN, lost, out)
+        self.assertNotIn("running again", out)
+
+    def test_local_time_proc_start_also_matches(self):
+        alive = self.child()
+        self.session_file(alive, BRUIN, proc_start=self.proc_start(alive, tz=None))   # the script's own zone
+        self.server_with_pane(alive)
+        out, lost, back = self.sections()
+        self.assertNotIn(BRUIN, lost, out)
+        self.assertIn(BRUIN, back, out)
+
+    def test_another_servers_window_id_is_not_trusted(self):
+        """No procStart (older claude): alive is enough. The "tmux" field names
+        @9, but the pid is not under @9's pane here — another server's @9."""
+        alive = self.child()
+        self.session_file(alive, BRUIN, tmux="main:@9.%9")
+        self.server_with_pane(self.dead_pid())
+        out, lost, back = self.sections()
+        self.assertIn("running again in pid %d  (session %s)" % (alive, BRUIN), back, out)
+
+    def test_all_running_prints_no_lost_header(self):
+        a, b = self.child(), self.child()
+        self.session_file(a, BRUIN)
+        self.session_file(b, OLD)
+        self.server_with_pane(a)
+        out = self.env.run("list").stdout
+        self.assertNotIn("lost their window", out)
+        self.assertNotIn("claude --resume", out)
+        self.assertIn("running again", out)
+        self.assertIn(str(self.env.orphans), out)       # the file is still there, and said so
 
 
 # Drives orphans_reconcile itself, extracted from the script, with `mv` or

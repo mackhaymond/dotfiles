@@ -663,6 +663,14 @@ orphan_file() { [ -n "$ORPHAN_FILE" ] || ORPHAN_FILE="$(resurrect_dir)/stash-orp
 # An orphan row is the last pointer to its conversation; it may only go when
 # another pointer demonstrably exists. Rows with no session id are left alone.
 #
+# A session the user resumed by hand (`claude --resume <sid>` in some pane) is
+# deliberately NOT a reason to drop its row, although `list` shows it as
+# running again (running_claude_sids). That process's sessions file is a
+# pointer only while it runs — claude deletes it on exit — and it carries no
+# origin or label; quit that claude without parking it and the row is once
+# more the only record tying the conversation to where it came from. Parking
+# that tab puts the id in @stash_session, and THAT retires the row here.
+#
 # The rewrite is read -> temp -> rename, and nothing else may be lost to it.
 # The lock should make it the only writer, but a lock can be broken out from
 # under a holder that outlives LOCK_STALE, and then an append landing between
@@ -958,6 +966,48 @@ live_sessions() {
         # an unplaced session and reads as empty, exactly as the python did.
         if [[ $t == *:*.* ]]; then win="${t#*:}"; pane="${win#*.}"; win="${win%%.*}"; fi
         printf '%s\n' "${pid}${SEP}${sid}${SEP}${status}${SEP}${win}${SEP}${pane}${SEP}${cwd}"
+    done
+}
+
+# Which of <sid>... a RUNNING claude process holds right now — an orphan the
+# user resumed by hand (`claude --resume <sid>` typed in some pane) carries no
+# @stash_session anywhere, so only its sessions file says it is back. One line
+# per hit: sid · pid · "session:index" of the local window it runs in, or empty.
+#
+# Verified, not trusted: a crash leaves its sessions file behind, so the pid
+# must be alive and — when the file records procStart — be the SAME process
+# (ps lstart; claude writes it in UTC here, local time is accepted too), or a
+# reused pid would pass a lost conversation off as running. A mismatch reads as
+# "not running", the safe direction: the row then just stays listed as lost.
+# The "tmux" field's window id is honoured only if that pid really is under a
+# local pane (other servers number windows from @0 too; see pid_in_window).
+# Bash builtins over the files, ps only for sessions that match — this runs
+# for `stash.sh list`, never on the park path.
+running_claude_sids() {   # <sid>...
+    [ "$#" -gt 0 ] || return 0
+    local want=" $* " f raw pid sid t start win where a b
+    for f in "$SESS_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        raw=$(<"$f") || continue
+        pid=""; sid=""; t=""; start=""; where=""
+        [[ $raw =~ \"pid\":([0-9]+) ]] && pid="${BASH_REMATCH[1]}"
+        [[ $raw =~ \"sessionId\":\"([^\"]*)\" ]] && sid="${BASH_REMATCH[1]}"
+        [ -n "$pid" ] && [ -n "$sid" ] || continue
+        case "$want" in *" $sid "*) ;; *) continue ;; esac
+        kill -0 "$pid" 2>/dev/null || continue
+        if [[ $raw =~ \"procStart\":\"([^\"]*)\" ]]; then
+            read -ra start <<< "${BASH_REMATCH[1]}"
+            read -ra a <<< "$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$pid" 2>/dev/null)"
+            read -ra b <<< "$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)"
+            [ "${a[*]-}" = "${start[*]-}" ] || [ "${b[*]-}" = "${start[*]-}" ] || continue
+        fi
+        [[ $raw =~ \"tmux\":\"([^\"]*)\" ]] && t="${BASH_REMATCH[1]}"
+        if [[ $t == *:@*.* ]]; then
+            win="${t#*:}"; win="${win%%.*}"
+            pid_in_window "$pid" "$win" \
+                && where=$(tmux display-message -p -t "$win" '#{session_name}:#{window_index}' 2>/dev/null)
+        fi
+        printf '%s\n' "${sid}${SEP}${pid}${SEP}${where}"
     done
 }
 
@@ -2571,19 +2621,43 @@ do_list() {
         [[ $p =~ \.pending\.[0-9]+$ ]] && [ -s "$p" ] && pend+=("$p")
     done
     if [ -s "$of" ] || [ "${#pend[@]}" -gt 0 ]; then
-        echo
-        echo "  Suspended sessions that lost their window (resume by hand):"
+        local orows; orows=$(cat "$of" ${pend[@]+"${pend[@]}"} 2>/dev/null)
+        # A row whose session the user already resumed by hand is not lost —
+        # it is running again, with no @stash_session on any window, so the
+        # reconcile cannot see it. It is listed apart, not hidden: its row is
+        # still in the file (and must stay — see orphans_reconcile), and the
+        # moment that claude exits it is lost again and goes back up there.
+        local running; running=$(running_claude_sids $(printf '%s\n' "$orows" | awk -F"$SEP" '$7 != "" { print $7 }'))
         # Trailing _ts/_icwd/_extra keep cwd clean on 9/10-field rows (see
         # save_state). The pane directory is the next-best guess when no cwd
         # was recorded — better than the `cd ?` that cannot be pasted.
-        local _ts _icwd _extra seen=" "
+        local _ts _icwd _extra seen=" " hit r_pid r_where lost="" back=""
         while IFS="$SEP" read -r sess idx name pidx origin label sid cwd _ts _icwd _extra; do
             [ -n "$sid" ] || continue
             case "$seen" in *" $sid "*) continue ;; esac
             seen="$seen$sid "
-            printf '    %-28s cd %s && claude --resume %s\n' "${label:-$name}" "${cwd:-${_icwd:-?}}" "$sid"
-        done < <(cat "$of" ${pend[@]+"${pend[@]}"} 2>/dev/null)
-        echo "  (delete $of once you have dealt with them)"
+            hit=$(printf '%s\n' "$running" | awk -F"$SEP" -v s="$sid" '$1 == s { print; exit }')
+            if [ -n "$hit" ]; then
+                IFS="$SEP" read -r _ r_pid r_where <<< "$hit"
+                printf -v hit '    %-28s running again in %s  (session %s)\n' "${label:-$name}" \
+                    "${r_where:-pid $r_pid}" "$sid"
+                back="$back$hit"
+            else
+                printf -v hit '    %-28s cd %s && claude --resume %s\n' "${label:-$name}" "${cwd:-${_icwd:-?}}" "$sid"
+                lost="$lost$hit"
+            fi
+        done <<< "$orows"
+        if [ -n "$lost" ]; then
+            echo
+            echo "  Suspended sessions that lost their window (resume by hand):"
+            printf '%s' "$lost"
+        fi
+        if [ -n "$back" ]; then
+            echo
+            echo "  Lost sessions resumed by hand, running again:"
+            printf '%s' "$back"
+        fi
+        echo "  (delete $of only once none of these is lost or running by hand)"
     fi
 }
 
