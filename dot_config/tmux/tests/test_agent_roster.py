@@ -1642,5 +1642,28 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(cmd.count("#{client_tty}"), 2)
 
 
+
+class OptionWTests(unittest.TestCase):
+    """Option-W opens the popup (a root tmux binding); pressed again inside
+    the popup it arrives as ESC w and must close it, in any mode."""
+
+    def test_parse(self):
+        self.assertEqual(R.parse_keys("\x1bw")[0], ["alt-w"])
+        self.assertEqual(R.parse_keys("\x1bW")[0], ["alt-w"])
+        self.assertEqual(R.parse_keys("\x1bj")[0], [])          # other Alt+keys still ignored
+
+    def test_closes_in_every_mode(self):
+        r = R.Roster("/dev/ttys999")
+        self.assertTrue(r.act("alt-w"))
+        r.filtering, r.query = True, "ab"
+        self.assertTrue(r.act("alt-w"))
+        r.filtering = False
+        r.peek = ["x"]
+        self.assertTrue(r.act("alt-w"))
+        r.peek = None
+        r.confirm = {"action": "park", "w": {"id": "@1"}}
+        self.assertTrue(r.act("alt-w"))
+
+
 if __name__ == "__main__":
     unittest.main()

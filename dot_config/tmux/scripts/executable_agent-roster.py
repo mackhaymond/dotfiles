@@ -528,7 +528,9 @@ def parse_keys(buf, final=False):
 
     Known CSI/SS3 sequences map to names; unknown ones (End/Home, Ctrl-arrows,
     paste brackets) are swallowed whole, or their ESC would read as "close
-    the popup". Alt+key (ESC + one char) is ignored for the same reason."""
+    the popup". Alt+key (ESC + one char) is ignored for the same reason -
+    except Option-W, which comes back as "alt-w": it opens the popup (a root
+    tmux binding), so pressing it again inside the popup closes it."""
     keys, i, n = [], 0, len(buf)
     while i < n:
         c = buf[i]
@@ -556,7 +558,9 @@ def parse_keys(buf, final=False):
         if nxt == "\x1b":                                # ESC ESC: the first one was a press
             keys.append("esc"); i += 1
             continue
-        i += 2                                           # Alt+key: ignored
+        if nxt in "wW":                                  # Option-W: the key that opened the
+            keys.append("alt-w")                         # popup also closes it (toggle)
+        i += 2                                           # any other Alt+key: ignored
     return keys, ""
 
 
@@ -952,6 +956,9 @@ class Roster:
 
     # actions; returning True closes the popup
     def act(self, key):
+        if key == "alt-w":                      # Option-W toggles the popup shut,
+            return True                          # whatever mode it is in (peek, confirm,
+                                                 # filter, half-typed number)
         if self.peek is not None:        # any key closes the peek, and only that
             self.peek = None
             return False
