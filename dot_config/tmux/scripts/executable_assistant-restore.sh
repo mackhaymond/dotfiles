@@ -77,12 +77,17 @@ def q: "'" + gsub("'"; "'\"'\"'") + "'";
     | select(. != "" and . != "null") | $v + "=" + q + " "] | join("")) as $envp
 | (if .tool == "claude" then "command claude" + $args + $model + " --resume " + (.session_id | q)
    elif .tool == "opencode" then "command opencode" + $args + " -s " + (.session_id | q)
-   elif .tool == "codex" then "command codex" + $args + " resume " + (.session_id | q)
+   elif .tool == "codex" then $codex + $args + " resume " + (.session_id | q)
    else "" end) as $cmd
 | [.pane, .tool, .session_id, (.cwd // ""), (if $cmd == "" then "" else $envp + $cmd end)]
 | join("\u001f")
 JQ
-rows="$(jq -r --argjson cap "$capture_json" "$JQ_PROG" "$INPUT_FILE")" || { log "could not parse $INPUT_FILE"; exit 0; }
+# Codex resumes through the ~/.local/bin wrapper by path: it adds --no-daemon,
+# which the tab/notch binding relies on, and a restored pane's PATH can put
+# ~/.bun/bin's raw CLI first.
+codex_cmd="command codex"
+[ -x "$HOME/.local/bin/codex" ] && codex_cmd="$(posix_quote "$HOME/.local/bin/codex")"
+rows="$(jq -r --argjson cap "$capture_json" --arg codex "$codex_cmd" "$JQ_PROG" "$INPUT_FILE")" || { log "could not parse $INPUT_FILE"; exit 0; }
 
 count="$(printf '%s\n' "$rows" | grep -c . || true)"
 [ "${count:-0}" -gt 0 ] || { log "no assistant sessions to restore"; exit 0; }

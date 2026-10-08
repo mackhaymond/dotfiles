@@ -214,7 +214,12 @@ build_cmd() {
         case "$cli_args" in *--model*) ;; *) [ -n "$model" ] && q_args+=" --model $(posix_quote "$model")" ;; esac
         echo "${env_prefix}command claude${q_args} --resume $(posix_quote "$sid")" ;;
     opencode) echo "${env_prefix}command opencode${q_args} -s $(posix_quote "$sid")" ;;
-    codex)    echo "${env_prefix}command codex${q_args} resume $(posix_quote "$sid")" ;;
+    codex)
+        # The wrapper adds --no-daemon, which the tab/notch binding relies
+        # on; name it so a pane PATH with ~/.bun/bin first can't skip it.
+        local codex="command codex"
+        [ -x "$HOME/.local/bin/codex" ] && codex=$(posix_quote "$HOME/.local/bin/codex")
+        echo "${env_prefix}${codex}${q_args} resume $(posix_quote "$sid")" ;;
     esac
 }
 

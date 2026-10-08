@@ -68,7 +68,7 @@ Two per-window tmux user options are the single source of truth:
 - `@agent_workflow` — `1` while a background Claude Workflow is in flight (else unset); set by the watcher, orthogonal to `@agent_state`
 - `@agent_cua` — `1` while the agent is driving an app through cua-driver (lingers up to `CUA_LIVE`, 60 s); set by the watcher
 - `@agent_rollout` — codex only: the thread's rollout path, stashed by the indicator so the watcher can tell a live turn from an interrupted one
-- `@agent_kind` — `claude | codex`: whose hooks drive the window. Written by any indicator hook that writes state or detail (in the same command list), unset with the state by `clear_state` and the watcher GC. Never written by the focus hook or a no-op heartbeat.
+- `@agent_kind` — `claude | codex`: whose hooks drive the window. Written by any indicator hook that writes state or detail (in the same command list), unset with the state by `clear_state` and the watcher GC. Never written by the focus hook or a no-op heartbeat. Before any hook has fired (Codex's first hook waits for the first prompt), the watcher seeds it from the agent process's own comm; it never overwrites a kind that is already set (see the watcher section).
 - `@agent_detail_kind` + `@agent_detail` — what the event that set the state was *about*, for the sidebar (not rendered in the tab bar):
 
   | Kind | Event | `@agent_detail` |
@@ -79,7 +79,7 @@ Two per-window tmux user options are the single source of truth:
   | `fail` | `StopFailure` | `<error>: <error_details>` (either half), else `turn failed` |
   | `done` | `Stop` | first non-empty line of `last_assistant_message` (Claude, verified 2.1.294; Codex sends the same field); Claude without the field falls back to the last assistant text in the transcript's last 64 KB; else `turn finished` |
 
-  Both are written by `set_state` in the **same tmux command list** as `@agent_state`/`@agent_since`, even when the state itself is unchanged, so a reader never pairs a new state with an older event's detail. Unset by `SessionStart` (except `source=compact`, which fires mid-turn), by `clear_state`, and by the watcher GC; never touched by the heartbeat (it stays fork-free) or the focus discharge. A `Notification` names no tool, so it never overwrites a `perm`/`ask` its `PermissionRequest` twin already wrote (one extra `show-options`, only on that event); landing first, it stands in as `perm <Tool>` parsed from "…permission to use <Tool>". The detail of a `Stop` held `running` by background work is still `done`. Text is untrusted and sanitized in the same jq call that extracts it (one fork per event): one line, no `#` `"` `%`, no control characters (C0, DEL, C1, U+2028/9) and no invisible/bidi controls (U+200B–200F, U+202A–202E, U+2060–2069, U+FEFF, U+061C), whitespace collapsed, leading/trailing `;`/space dropped (a tmux argv element ending in `;` terminates the command list), ≤ 80 code points with a trailing `…` when cut. Every value is sliced (4000, then 1000 code points) *before* any per-character work: unbounded, the sanitizer was quadratic (a 152 KB heredoc took 16 s), which blocks a permission dialog or prompt submission and gets a Codex hook killed at its 10 s timeout, state write included; bounded, a 1 MB payload costs ~20 ms of jq, and a jq failure yields the bare kind, never a lost state write. The detail rides in globals (`dkind`/`dtext`, consumed by the next `set_state`), so every call site stays `set_state "$win" <state>` — cua-notch's `dev/check-invariants` pins `        set_state "$win" failed` verbatim. Values reach tmux only as `set-option` argv: stored verbatim, and `list-windows -F '#{@agent_detail}'` expands them without re-parsing formats inside (checked on a scratch tmux 3.7c server).
+  Both are written by `set_state` in the **same tmux command list** as `@agent_state`/`@agent_since`, even when the state itself is unchanged, so a reader never pairs a new state with an older event's detail. Unset by `SessionStart` (except `source=compact`, which fires mid-turn), by `clear_state`, and by the watcher GC; the watcher's codex turn-end reconcile also writes them (`done`/`turn finished`, or unset after an abort; see the watcher section); never touched by the heartbeat (it stays fork-free) or the focus discharge. A `Notification` names no tool, so it never overwrites a `perm`/`ask` its `PermissionRequest` twin already wrote (one extra `show-options`, only on that event); landing first, it stands in as `perm <Tool>` parsed from "…permission to use <Tool>". The detail of a `Stop` held `running` by background work is still `done`. Text is untrusted and sanitized in the same jq call that extracts it (one fork per event): one line, no `#` `"` `%`, no control characters (C0, DEL, C1, U+2028/9) and no invisible/bidi controls (U+200B–200F, U+202A–202E, U+2060–2069, U+FEFF, U+061C), whitespace collapsed, leading/trailing `;`/space dropped (a tmux argv element ending in `;` terminates the command list), ≤ 80 code points with a trailing `…` when cut. Every value is sliced (4000, then 1000 code points) *before* any per-character work: unbounded, the sanitizer was quadratic (a 152 KB heredoc took 16 s), which blocks a permission dialog or prompt submission and gets a Codex hook killed at its 10 s timeout, state write included; bounded, a 1 MB payload costs ~20 ms of jq, and a jq failure yields the bare kind, never a lost state write. The detail rides in globals (`dkind`/`dtext`, consumed by the next `set_state`), so every call site stays `set_state "$win" <state>` — cua-notch's `dev/check-invariants` pins `        set_state "$win" failed` verbatim. Values reach tmux only as `set-option` argv: stored verbatim, and `list-windows -F '#{@agent_detail}'` expands them without re-parsing formats inside (checked on a scratch tmux 3.7c server).
 
 Three components maintain and render them:
 
@@ -256,14 +256,18 @@ version-named and `#{pane_current_command}` reports that, so formats can't
 detect presence). Reconciles:
 
 - agent present, no state → seed `idle`
+- agent present, no `@agent_kind` → the agent's comm (`codex`, else `claude`;
+  see "Kind at launch" below)
 - state `running` but the session says otherwise → back to `idle` (see below)
+- codex `needs-input`/`running` whose rollout ended the turn after the state
+  was stamped → `idle` or `done` (see "Codex turn ends" below)
 - no agent, state **or** summary set → unset both options (covers SIGKILL,
   `kill-pane`, crashes — SessionEnd is best-effort and codex has none; the
   summary is read separately so an orphaned title written by a slow
   condenser after the agent died is still reaped)
 
-Hook-set states are never overridden while the agent lives, with one
-exception:
+Hook-set states are never overridden while the agent lives, except by the
+agent's own record of its turn (the two reconciles below):
 
 **Stuck `running`** (fixed 2026-08-20, reported from the field: a tab pulsing
 for a session that wasn't doing anything, "when I hit esc a few times to
@@ -300,19 +304,70 @@ that Claude Code maintains itself. A `running` window whose session reads
   of the three is `task_started`. `agent-tab-indicator.sh` stashes the thread's
   `rollout_path` in `@agent_rollout` — it already reads that row on every codex
   hook to check `thread_source`, so the path costs one extra column — and the
-  watcher tails **256 KB** of it, never the whole file (rollouts reach 27 MB
-  here; p90 791 KB). Unknown status values and a missing/unset path are
-  deliberate no-ops.
+  watcher tails **64 KB** of it, never the whole file (rollouts reach 27 MB
+  here; p90 791 KB; across the 389 rollouts that end between turns, the last
+  turn end starts at most 29 KB from EOF). Unknown status values and a
+  missing/unset path are deliberate no-ops. (256 KB until 2026-10-08.)
 - **The last-marker scan is `awk`, not bash string ops.** The obvious
   `${chunk##*"$marker"}` idiom for finding a last occurrence is O(n²) on a
   256 KB string and hung the function outright on the first large rollout it
   met. One linear pass instead: 13 ms on a 6.4 MB file.
-- **Cost.** The tail read happens only for a codex window *already* showing
-  `running`, so a long live turn pays one read per tick until it ends — the
-  price of having no status file to poll. Claude's path stays fork-free. Known
+- **Cost.** The rollout is looked at only for a window *already* showing
+  `running` (or a codex `needs-input`, below), and READ only when it changed:
+  the last answer is cached per window with its path and reused while the
+  change stamps (builtin `-nt`; every doubt reads as changed) say the file has
+  not moved. A live turn, which writes constantly, still pays about one read
+  per tick; an open prompt, which writes nothing, pays one read in all. The
+  entry is dropped on any tick the window does not ask (it left those states,
+  lost its agent, or closed). Claude's path stays fork-free. Known
 limitation: a one-shot `claude -p` exits right after `Stop`, so its `done`
 tint is GC'd within ~1 s. Per-window state also means two agents in one
 window share a single state (last writer wins).
+
+**Codex turn ends** (2026-10-08). Esc on a codex approval prompt, or Esc
+mid-turn, fires no hook, so the tab stayed yellow after the prompt was gone
+(and a `running` tab waited for the rule above). The rollout records it:
+`turn_aborted` (reason `interrupted`) or `task_complete`. A codex window
+(by the agent's comm, in both states, never by `@agent_rollout` alone: a
+claude window can carry a stale path left by an earlier codex in the pane)
+in `needs-input` or
+`running` whose **last** turn marker is one of those two, timestamped
+**strictly after** the state's `@agent_since` stamp, ended the turn that state
+belongs to, so the watcher writes what the indicator would have:
+
+- `task_complete` = its `Stop`: `done` (`idle` if the window is viewed with
+  WezTerm frontmost, the Stop path's `viewing_now`), detail `done` /
+  `turn finished` (the Stop's fallback text: the reply itself would need the
+  indicator's jq sanitizer).
+- `turn_aborted` = its `interrupt` mode: `idle`, with the detail unset as
+  `SessionStart` and `clear_state` do.
+- Both unset `@agent_pending` and restamp `@agent_since`, all in **one tmux
+  call**. The event log records the transition once, a tick later, like any
+  watcher write.
+
+An open prompt is still inside its turn, so it has no turn end after its
+stamp; an older turn end (before the stamp, or in the stamp's own second,
+where a queued message can race the previous turn's end) is ignored, and a
+stamp that does not describe the current state is "don't know" for that
+tick. Same three-tick hysteresis as above, so a `Stop` hook or the terminal
+bridge's `interrupt` normally lands first. A `running` tab whose last turn
+end predates its stamp, or whose agent is not codex, keeps the older rule
+(`idle` after the streak, state only). Exact line shape matched (codex 0.160, every rollout on disk):
+`{"timestamp":"2026-10-04T21:53:53.001Z","ordinal":594,"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"…","reason":"interrupted",…}}`,
+with `"ordinal"` absent in older files. The line's own `timestamp` is
+compared rather than `payload.completed_at`, which 6 of 138 aborts and 21 of
+1468 completes lack. There is no rollout error event to map to `failed`:
+none appears anywhere on disk, so none is inferred.
+
+**Kind at launch** (2026-10-08). Codex's first hook (`SessionStart`) waits
+for the first prompt, so a freshly started codex was seeded `idle` with no
+`@agent_kind` and showed no ⬢ in the sidebar or menu. Discovery already runs
+one single-pid `ps` per new agent pid; it now also records that pid's kind
+(comm `codex`, else `claude`). A live agent window with a state and no kind
+gets it, riding in the `@agent_since` stamp's tmux call (the idle seed always
+stamps, so a fresh window costs no extra fork; a held state without a kind
+pays one call, once). A kind already set is never overwritten, and none is
+written without a live agent, so it cannot race the GC that unsets it.
 
 **Liveness.** The daemon is the single point of failure for the blink, the
 workflow gear and the GC, and its death is silent — a frozen pulse is the only

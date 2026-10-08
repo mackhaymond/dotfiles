@@ -3,6 +3,24 @@
 
 [[ -n "${ZSH_DEBUGRC+1}" ]] && zmodload zsh/zprof
 
+# ─── PATH order for non-login shells ──────────────────────────────────────
+# .zprofile ranks ~/.local/bin above every toolchain bin, but only login
+# shells read it. A pane started as plain `zsh` (resurrect restores run
+# `cat <contents>; exec zsh`) keeps tmux's global PATH, which can put
+# ~/.bun/bin first, and `codex` then skips the ~/.local/bin wrapper (and its
+# --no-daemon / max context). Put ~/.local/bin back where .zprofile has it:
+# only ~/bin, ~/userbin and the pyenv shims may come before it. Fork-free;
+# a no-op in login shells. Above the agent block so agent shells get it too.
+typeset -U path PATH
+() {
+  local i
+  for (( i = 1; i <= $#path; i++ )); do
+    [[ $path[i] == $HOME/.local/bin ]] && return
+    [[ $path[i] == ($HOME/bin|$HOME/userbin|${PYENV_ROOT:-$HOME/.pyenv}/shims) ]] || break
+  done
+  [[ -d $HOME/.local/bin ]] && path[i,i-1]=( $HOME/.local/bin )
+}
+
 # ─── Agent shells (tmux-pty-mcp) ──────────────────────────────────────────
 # AGENT_PTY=1 marks tmux windows driven by AI agents. Everything below this
 # block exists for a human — plugins, prompt, completions, history. Agents

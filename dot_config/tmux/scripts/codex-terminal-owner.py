@@ -2,8 +2,8 @@
 """Bind Codex threads to terminal clients, never the shared daemon's environment.
 
 The CLI wrapper forces --no-daemon. Hooks resolve the owning frontend through
-the actual CLI ancestor and matching TTY. The legacy relay helpers remain for
-compatibility with previously launched clients; new launches never start them.
+the nearest interactive Codex ancestor and its matching TTY; shared daemons
+never qualify. Explicit `bind` records cover clients that hooks cannot reach.
 """
 import contextlib
 import fcntl
@@ -12,23 +12,15 @@ import hashlib
 import os
 from pathlib import Path
 import re
-import shutil
-import shlex
-import signal
-import socket
-import struct
 import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import uuid
 
 ROOT = Path(os.environ.get("CODEX_TERMINAL_OWNER_DIR", str(Path.home() / ".cache/codex-terminal-owners")))
-SCRIPT = Path(__file__).resolve()
 SID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-MAX_AUXILIARY_THREADS = 4096
 OPTION_OPERANDS = {"-c", "--config", "--enable", "--disable", "-C", "--cd", "-m", "--model", "-p", "--profile",
                    "-s", "--sandbox", "-a", "--ask-for-approval", "-i", "--image", "--add-dir", "--local-provider"}
 
@@ -147,13 +139,79 @@ def thread_row(home, columns, sid):
         return db.execute(query, (sid,)).fetchone()
 
 
-def direct_owner(sid):
-    """Keep explicit --no-daemon hooks working without trusting inherited PTYs.
+def leading_args(args):
+    """(options before the first positional, that positional or None, the rest).
 
-    A direct CLI ancestor is evidence only for root user threads. Shared daemon
-    hooks and tool-created PTYs cannot claim its inherited terminal identity.
-    This fallback does not persist a selection: a delayed hook must not rebind
-    an old thread in the shared registry.
+    Only this prefix is trustworthy: after it come prompts, whose words (such
+    as "--managed-daemon" or "app-server") say nothing about the process.
+    """
+    skip = False
+    for index, arg in enumerate(args):
+        if skip:
+            skip = False
+        elif arg == "--":
+            return args[:index], None, args[index + 1:]
+        elif arg in OPTION_OPERANDS:
+            skip = True
+        elif not arg.startswith("-"):
+            return args[:index], arg, args[index + 1:]
+    return args, None, []
+
+
+def codex_role(args):
+    """Classify a codex process by its argv: "frontend", "helper" or None.
+
+    A frontend is an interactive TUI; its hooks carry its pane. A helper is a
+    private child of one (`sandbox`, a stdio `app-server` without its own
+    subcommand) and is walked through. Anything else, including a shared
+    daemon (`--managed-daemon`, an app-server listening on a socket) whose
+    inherited TMUX_PANE belongs to whoever started it, or a codex that cannot
+    be read with confidence, ends the walk: guessing past it could land on an
+    unrelated outer frontend.
+    """
+    options, positional, rest = leading_args(args)
+    if "--managed-daemon" in options:
+        return None
+    # The wrapper adds --no-daemon first and only to interactive launches, so
+    # in the leading options it marks a frontend whatever the prompt says.
+    if "--no-daemon" in options:
+        return "frontend"
+    if positional == "sandbox":
+        return "helper"
+    if positional == "app-server":
+        listen, skip = "stdio://", False
+        for index, arg in enumerate(rest):
+            if skip:
+                skip = False
+            elif arg == "--listen":
+                listen, skip = (rest[index + 1] if index + 1 < len(rest) else ""), True
+            elif arg.startswith("--listen="):
+                listen = arg.split("=", 1)[1]
+            elif arg == "--managed-daemon":
+                return None
+            elif arg in OPTION_OPERANDS or arg == "--code-mode-host":
+                skip = True
+            elif not arg.startswith("-"):
+                return None  # daemon, proxy, ...: never a private backend
+        return "helper" if listen == "stdio://" else None
+    return "frontend" if interactive_args(args) else None
+
+
+def direct_owner(sid):
+    """Bind a hook to the terminal frontend whose own backend ran it.
+
+    A frontend hosts its backend in-process when started with --no-daemon (the
+    wrapper always adds it) or when no shared daemon is running, as with a bare
+    `codex` that bypassed the wrapper. Either way the hook descends from the
+    TUI, which must sit on the pane's TTY. A bare `codex` attached to a running
+    daemon has its hooks run under the daemon instead; the walk meets that
+    daemon first and stays unbound rather than guess. Only known helpers
+    (`sandbox`, a private stdio app-server) are walked through; any other
+    codex ancestor that is not a frontend ends the walk unbound.
+
+    A direct ancestor is evidence only for root user threads; tool-created
+    PTYs fail the TTY check. This fallback does not persist a selection: a
+    delayed hook must not rebind an old thread in the shared registry.
     """
     try:
         home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
@@ -166,11 +224,14 @@ def direct_owner(sid):
             fields = result.stdout.strip().split(None, 1)
             if result.returncode or len(fields) != 2:
                 return None
-            parent, command = int(fields[0]), shlex.split(fields[1])
+            # ps prints argv space-joined, never shell-quoted: a prompt such as
+            # "don't" is not a syntax error, just words.
+            parent, command = int(fields[0]), fields[1].split()
             if command and os.path.basename(command[0]) == "codex":
-                if "--managed-daemon" in command or ("app-server" in command and "--listen" in command and "unix://" in command):
+                role = codex_role(command[1:])
+                if role is None:
                     return None
-                if "--no-daemon" in command:
+                if role == "frontend":
                     record = capture(pid, os.environ.get("TMUX", "").split(",")[0], os.environ.get("TMUX_PANE", ""))
                     if record:
                         identity = f'{pid}:{record["frontend_start"]}:{record["tmux_socket"]}:{record["pane"]}'
@@ -193,295 +254,6 @@ def release(token):
                 del records[sid]
 
 
-def notify_bound(record, thread=None, event=None):
-    """Recover SessionStart hooks that ran before thread/start returned its id."""
-    thread = thread or {}
-    sid = record["session_id"]
-    # A later turn/start or resume may already have replaced this selection.
-    now = resolve(sid)
-    if now.get("binding_id") != record["binding_id"]:
-        return
-    status = thread.get("status") or {}
-    active = status.get("type") == "active"
-    payload = {"session_id": sid, "hook_event_name": event or ("UserPromptSubmit" if active else "SessionStart"),
-               "source": "resume", "cwd": thread.get("cwd", ""), "terminal_reconcile": True,
-               "terminal_binding_id": record["binding_id"]}
-    raw = json.dumps(payload)
-    env = dict(os.environ, TMUX=record["tmux_socket"] + ",0,0", TMUX_PANE=record["pane"])
-    commands = [
-        ["bash", str(SCRIPT.with_name("agent-tab-indicator.sh")), "interrupt" if event == "Interrupt" else "reconcile", "codex"],
-        [str(Path.home() / ".local/bin/cua-notch-agent-hook"), "codex"],
-        [str(Path.home() / ".local/bin/codex-session-track")],
-    ]
-    for command in commands:
-        if resolve(sid).get("binding_id") != record["binding_id"]:
-            return
-        try:
-            subprocess.run(command, input=raw, text=True, env=env, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=4)
-        except (OSError, subprocess.SubprocessError):
-            pass
-
-
-class ProtocolObserver:
-    """Observe only correlated client actions. Unrelated broadcasts do nothing."""
-    def __init__(self, owner, on_bind=bind, notify=notify_bound):
-        self.owner = owner
-        self.pending = {}
-        self.sequence = 0
-        self.selected_sequence = 0
-        self.selected_thread = None
-        self.auxiliary_threads = set()
-        self.auxiliary_overflow = False
-        self.lock = threading.Lock()
-        self.on_bind = on_bind
-        self.notify = notify
-
-    def reset_connection(self):
-        # JSON-RPC request IDs may be reused after reconnect. Auxiliary thread
-        # identities remain valid for this terminal invocation across sockets.
-        with self.lock:
-            self.pending.clear()
-
-    def client(self, message):
-        method = message.get("method")
-        params = message.get("params") or {}
-        with self.lock:
-            if method in ("thread/start", "thread/resume", "thread/fork") and "id" in message:
-                self.sequence += 1
-                auxiliary = params.get("ephemeral") is True or params.get("threadId") in self.auxiliary_threads
-                self.pending[message["id"]] = (self.sequence, auxiliary)
-            elif method == "turn/start":
-                sid = params.get("threadId", "")
-                if sid in self.auxiliary_threads or (self.auxiliary_overflow and sid != self.selected_thread):
-                    return
-                self.sequence += 1
-                self.selected_sequence = self.sequence
-                self.selected_thread = sid
-                self.on_bind(sid, self.owner)
-
-    def server(self, message):
-        if message.get("method") == "turn/completed":
-            params = message.get("params") or {}
-            if params.get("threadId") in self.auxiliary_threads:
-                return
-            if (params.get("turn") or {}).get("status") == "interrupted":
-                record = resolve(params.get("threadId", ""))
-                # Broadcasts may describe other clients or subagents. They can
-                # update our existing binding, but can never claim a new one.
-                if record.get("token") == self.owner.get("token") and record.get("status") == "bound":
-                    threading.Thread(target=self.notify, args=(record, None, "Interrupt"), daemon=True).start()
-            return
-        with self.lock:
-            if "method" in message or message.get("id") not in self.pending:
-                return
-            sequence, auxiliary = self.pending.pop(message["id"])
-            if "error" in message:
-                return
-            thread = (message.get("result") or {}).get("thread") or {}
-            sid = thread.get("id", "")
-            if not SID.fullmatch(sid or ""):
-                return
-            # The native TUI also creates ephemeral title-generator threads on
-            # this connection. Their starts AND later turns are background work,
-            # even though both originate in the terminal client itself.
-            if auxiliary or thread.get("ephemeral") is True or sid in self.auxiliary_threads:
-                if len(self.auxiliary_threads) < MAX_AUXILIARY_THREADS:
-                    self.auxiliary_threads.add(sid)
-                else:
-                    # Never evict an active helper and accidentally permit its
-                    # later turn to claim the pane. At the cap, unknown turns
-                    # need a foreground lifecycle reply before they can bind.
-                    self.auxiliary_overflow = True
-                return
-            # Only a confirmed foreground selection supersedes earlier replies;
-            # a pending auxiliary start must not invalidate a real resume.
-            if sequence < self.selected_sequence:
-                return
-            self.selected_sequence = sequence
-            self.selected_thread = sid
-            record = self.on_bind(sid, self.owner)
-        if record:
-            threading.Thread(target=self.notify, args=(record, thread), daemon=True).start()
-
-
-def relay(source, destination, observe):
-    for line in iter(source.readline, b""):
-        try:
-            message = json.loads(line)
-            if isinstance(message, dict):
-                observe(message)
-        except (ValueError, TypeError, OSError, subprocess.SubprocessError):
-            # Ownership is advisory. Never change/drop a native protocol frame.
-            pass
-        destination.write(line)
-        destination.flush()
-
-
-def read_exact(source, length):
-    chunks = []
-    while length:
-        part = source.read(length)
-        if not part:
-            raise EOFError("transport closed")
-        chunks.append(part)
-        length -= len(part)
-    return b"".join(chunks)
-
-
-def relay_websocket(source, destination, observe):
-    """Pass HTTP upgrade and original frames; inspect uncompressed JSON text.
-
-    Codex's Unix transport uses WebSocket, unlike its JSONL stdio app-server.
-    app-server proxy preserves those raw bytes. Masking and fragmentation are
-    handled only for observation; bytes on the wire remain exactly unchanged.
-    """
-    while True:
-        line = source.readline()
-        if not line:
-            return
-        destination.write(line)
-        destination.flush()
-        if line in (b"\r\n", b"\n"):
-            break
-    fragments = None
-    while True:
-        try:
-            header = read_exact(source, 2)
-            final, opcode = bool(header[0] & 0x80), header[0] & 0x0f
-            masked, length = bool(header[1] & 0x80), header[1] & 0x7f
-            if length == 126:
-                extended = read_exact(source, 2)
-                header += extended
-                length = struct.unpack("!H", extended)[0]
-            elif length == 127:
-                extended = read_exact(source, 8)
-                header += extended
-                length = struct.unpack("!Q", extended)[0]
-            mask = read_exact(source, 4) if masked else b""
-            header += mask
-            # Observe up to the native advertised 16 MiB message limit. Larger
-            # or binary frames still pass through in bounded chunks unchanged.
-            limit = 16 * 1024 * 1024
-            inspect = opcode in (0, 1) and not (header[0] & 0x70) and length <= limit
-            if not inspect:
-                if opcode in (0, 1, 2):
-                    fragments = None
-                destination.write(header)
-                while length:
-                    chunk = read_exact(source, min(length, 65536))
-                    destination.write(chunk)
-                    destination.flush()
-                    length -= len(chunk)
-                destination.flush()
-                continue
-            payload = read_exact(source, length)
-        except EOFError:
-            return
-        decoded = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload)) if masked else payload
-        if opcode == 1:
-            fragments = bytearray(decoded)
-        elif fragments is not None:
-            if len(fragments) + len(decoded) <= limit:
-                fragments.extend(decoded)
-            else:
-                fragments = None
-        if final and fragments is not None:
-            try:
-                message = json.loads(fragments)
-                if isinstance(message, dict):
-                    observe(message)
-            except (ValueError, TypeError, OSError, subprocess.SubprocessError):
-                pass
-            fragments = None
-        destination.write(header)
-        destination.write(payload)
-        destination.flush()
-
-
-def serve_connection(client, real, owner, observer=None):
-    with client:
-        proxy = subprocess.Popen([real, "app-server", "proxy"], stdin=subprocess.PIPE,
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                 start_new_session=True)
-        observer = observer or ProtocolObserver(owner)
-        observer.reset_connection()
-        reader = client.makefile("rb")
-        writer = client.makefile("wb")
-        stop_lock = threading.Lock()
-        def stop_proxy():
-            # The npm launcher can have its own native child. Kill only
-            # this dedicated proxy process group, never the daemon.
-            with stop_lock:
-                if proxy.poll() is not None:
-                    return
-                with contextlib.suppress(OSError):
-                    os.killpg(proxy.pid, signal.SIGTERM)
-                try:
-                    proxy.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    with contextlib.suppress(OSError):
-                        os.killpg(proxy.pid, signal.SIGKILL)
-                    proxy.wait(timeout=2)
-        def upstream():
-            try:
-                relay_websocket(reader, proxy.stdin, observer.client)
-            except (OSError, ValueError):
-                pass
-            finally:
-                with contextlib.suppress(OSError, ValueError):
-                    proxy.stdin.close()
-                stop_proxy()
-        threading.Thread(target=upstream, daemon=True).start()
-        try:
-            relay_websocket(proxy.stdout, writer, observer.server)
-        except (OSError, ValueError):
-            pass
-        finally:
-            with contextlib.suppress(OSError):
-                client.shutdown(socket.SHUT_RDWR)
-            stop_proxy()
-            reader.close()
-            writer.close()
-            proxy.stdout.close()
-
-
-def frontend_alive(owner):
-    try:
-        current = process_identity(owner["frontend_pid"])
-        return bool(current and current["frontend_start"] == owner["frontend_start"])
-    except (KeyError, OSError, ValueError, subprocess.SubprocessError):
-        return False
-
-
-def serve(listener, real, owner, ready):
-    # The native TUI can reconnect after daemon restart. Keep this private
-    # endpoint while its original frontend process exists, including reconnects.
-    path = listener.getsockname()
-    os.setsid()
-    os.chdir("/")
-    try:
-        with listener:
-            ready.sendall(b"1")
-            ready.close()
-            listener.settimeout(1)
-            observer = ProtocolObserver(owner)
-            while True:
-                try:
-                    client, _ = listener.accept()
-                except socket.timeout:
-                    if not frontend_alive(owner):
-                        break
-                    continue
-                serve_connection(client, real, owner, observer)
-                if not frontend_alive(owner):
-                    break
-    finally:
-        release(owner["token"])
-        with contextlib.suppress(OSError):
-            os.unlink(path)
-
-
 def real_codex():
     this = str(Path.home() / ".local/bin/codex")
     for directory in os.get_exec_path():
@@ -494,7 +266,7 @@ def real_codex():
 def interactive_args(args):
     # Skip known option operands when finding a subcommand. Quoted prompts are
     # positional strings; only the actual native command names bypass the bridge.
-    commands = {"exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server", "remote-control", "app",
+    commands = {"agents", "exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server", "remote-control", "app",
                 "completion", "update", "doctor", "sandbox", "debug", "apply", "queue", "archive", "delete",
                 "migrate-rollouts", "unarchive", "cloud", "exec-server", "features", "help"}
     skip = False
@@ -511,26 +283,6 @@ def interactive_args(args):
         elif not arg.startswith("-") and positional is None:
             positional = arg
     return positional not in commands
-
-
-def new_session_args(args, cwd):
-    """Pin new remote sessions to launch cwd; preserve explicit roots and resumes."""
-    skip = False
-    positional = None
-    for arg in args:
-        if skip:
-            skip = False
-        elif arg == "--":
-            break
-        elif arg in ("-C", "--cd") or arg.startswith(("--cd=", "-C")):
-            return args
-        elif arg in OPTION_OPERANDS:
-            skip = True
-        elif not arg.startswith("-") and positional is None:
-            positional = arg
-    if positional in ("resume", "fork"):
-        return args
-    return ["--cd", cwd] + args
 
 
 def local_session_args(args):

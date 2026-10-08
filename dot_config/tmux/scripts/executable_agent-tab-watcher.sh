@@ -11,9 +11,12 @@
 # Every POLL_SECONDS this daemon matches agent processes to tmux windows by
 # TTY and reconciles the per-window @agent_state option:
 #   agent present + no state           → idle    (seed presence)
+#   agent present + no @agent_kind     → its comm's kind (codex|claude)
 #   no agent     + any state OR summary → unset @agent_state/@agent_summary (GC)
 # Hook-set states (running/needs-input/done) are never overridden while the
-# agent lives.
+# agent lives, except by the agent's own record of the turn: a `running` its
+# session/rollout says is over, and a codex `needs-input` or `running` whose
+# rollout ended the turn after the state was stamped (see the reconcile).
 #
 # It also makes tabs aware of background Claude WORKFLOWS. A backgrounded
 # Workflow keeps running after the main turn's Stop fires (so the tab would
@@ -285,37 +288,106 @@ session_status() {
     return 0
 }
 
-# Codex's answer to the same question, from its rollout stream: "busy" | "idle"
-# | "" (unknown). Codex has no ~/.claude/sessions equivalent and no pid→thread
-# mapping we could follow, so agent-tab-indicator.sh stashes the thread's
-# rollout_path in @agent_rollout (it already queries that row on every codex
-# hook) and this reads the tail of it.
+# Codex's answer to the same question, from its rollout stream, into the
+# caller's cx_mark = "started" | "complete" | "aborted" | "" (unknown) and
+# cx_ts = that event's own "timestamp", UTC to the second
+# ("2026-10-04T21:53:53"; "" for a start, or a line whose head the tail cut).
+# Codex has no ~/.claude/sessions equivalent and no pid→thread mapping we could
+# follow, so agent-tab-indicator.sh stashes the thread's rollout_path in
+# @agent_rollout (it already queries that row on every codex hook) and this
+# reads the tail of it.
 #
 # The stream records turn boundaries explicitly: event_msg task_started opens a
-# turn, task_complete closes it, and an INTERRUPT writes turn_aborted (verified
-# against the on-disk corpus: 51 starts, 41 completes, 8 aborts). So the turn is
+# turn, task_complete closes it, and an INTERRUPT - Esc mid-turn, or Esc on an
+# approval prompt - writes turn_aborted (reason "interrupted"). So the turn is
 # live iff the most recent of the three is task_started — real state, not an
-# inference from how recently the file was touched.
+# inference from how recently the file was touched. Matched as the exact line
+# shape codex 0.160 writes, checked against every rollout on disk (1661
+# starts, 1468 completes, 138 aborts, all of this form):
+#   {"timestamp":"2026-10-04T21:53:53.001Z","ordinal":594,"type":"event_msg",
+#    "payload":{"type":"turn_aborted","turn_id":"…","reason":"interrupted",…}}
+# "ordinal" is absent in older files; the key run from "type":"event_msg" on is
+# the same everywhere. "timestamp" is always the line's first key, and it is
+# used rather than payload.completed_at because 6 of the aborts (some as recent
+# as 2026-10-05) and 21 of the completes carry no completed_at. There is no
+# error event to match: none appears in any rollout here, so a failed turn is
+# not inferred from this stream.
 #
 # Bounded tail, never the whole file: rollouts run to 27MB here (p90 791KB).
-# If no marker falls in the tail the answer is "" and the caller does nothing,
-# which is the same conservative failure as not looking at all.
+# 64KB holds the end of a turn with room to spare: across the 389 rollouts here
+# that end between turns, the last turn end starts at most 29KB from EOF
+# (measured 2026-10-08). If no marker falls in the
+# tail the answer is "" and the caller does nothing, which is the same
+# conservative failure as not looking at all.
 #
 # awk, NOT bash string ops. The obvious `${chunk##*"$marker"}` trick to find a
 # last occurrence is O(n^2) on a 256KB string — it hung this function outright
 # on the first large rollout it met. One linear pass instead; records are
 # JSONL, one event per line, so the last line carrying any of the three
 # markers decides. A truncated first line from the byte-oriented tail is
-# harmless.
-CODEX_TAIL_BYTES=262144
-codex_status() {
-    local rp="$1"
+# harmless: at worst it is a marker with no timestamp, which never counts as
+# "after" anything (cx_after).
+CODEX_TAIL_BYTES=65536
+codex_tail() {
+    local rp="$1" out
+    cx_mark=""; cx_ts=""
     [ -n "$rp" ] && [ -f "$rp" ] || return 0
-    tail -c "$CODEX_TAIL_BYTES" "$rp" 2>/dev/null | awk '
-        /"type":"task_started"/                        { last = "busy" }
-        /"type":"task_complete"/ || /"type":"turn_aborted"/ { last = "idle" }
-        END { printf "%s", last }
-    '
+    out=$(tail -c "$CODEX_TAIL_BYTES" "$rp" 2>/dev/null | awk '
+        function ts(  t) {
+            if (substr($0, 1, 14) != "{\"timestamp\":\"") return ""
+            t = substr($0, 15, 19)
+            return (t ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/) ? t : ""
+        }
+        index($0, "\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"")  { m = "started";  t = "" }
+        index($0, "\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"") { m = "complete"; t = ts() }
+        index($0, "\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\"")  { m = "aborted";  t = ts() }
+        END { printf "%s %s", m, t }
+    ')
+    cx_mark="${out%% *}"; cx_ts="${out#* }"
+    return 0
+}
+# codex_tail for window $1 (rollout $2), re-read only when it can have changed.
+# A codex window sitting on an open prompt used to pay tail+awk (3 forks)
+# every second for as long as it waited, on a file nobody was writing. The
+# answer is a function of the file's bytes alone, so it is kept per window
+# with the path and the tick it was last vouched for, and reused while the
+# CHANGE STAMPS (below) say the file has not moved since: builtin -nt, and
+# every doubt - an expired or missing stamp, a tie - reads as changed, i.e. a
+# fresh read. A hit re-vouches at this tick: unchanged since stamp T means
+# unchanged since this tick's later stamp too, and a write racing this look is
+# newer than that stamp, so the next tick sees it. cx_after is NOT cached (the
+# window's own stamp moves independently). An entry a tick does not touch -
+# the window left running/needs-input, lost its agent, or is gone - is dropped
+# at the end of that tick (CX_USED).
+declare -A CX_PATH=() CX_TICK=() CX_MARK=() CX_TS=() CX_USED=()
+codex_tail_cached() {
+    local w="$1" rp="$2"
+    CX_USED[$w]=1
+    if [ "${CX_PATH[$w]:-}" = "$rp" ] && [ -f "$rp" ] \
+       && ! changed_since "${CX_TICK[$w]:-}" "$rp"; then
+        cx_mark="${CX_MARK[$w]}"; cx_ts="${CX_TS[$w]}"
+    else
+        codex_tail "$rp"
+        CX_PATH[$w]="$rp"; CX_MARK[$w]="$cx_mark"; CX_TS[$w]="$cx_ts"
+    fi
+    CX_TICK[$w]=$tick_no
+}
+# Did the turn end codex_tail found (cx_ts) land strictly AFTER this window's
+# current state was stamped? @agent_since must describe the state as read
+# ("<epoch> <state>"); a missing or mismatched stamp is "don't know" (the
+# backstop restamps it this tick, so the next tick can answer). The epoch is
+# rendered as the same UTC "YYYY-MM-DDTHH:MM:SS" and compared as a string,
+# builtin only. Strictly after, to the second: an event in the stamp's own
+# second could be the previous turn's end racing a new prompt (a queued
+# message is submitted the instant a turn completes), and missing a real one
+# only leaves the tab as it would have been without this check.
+cx_after() {
+    local e iso
+    [ -n "$cx_ts" ] && [ "${since#* }" = "$state" ] || return 1
+    e="${since%% *}"
+    case "$e" in ''|*[!0-9]*) return 1 ;; esac
+    TZ=UTC0 printf -v iso '%(%Y-%m-%dT%H:%M:%S)T' "$e" 2>/dev/null || return 1
+    [[ "$cx_ts" > "$iso" ]]
 }
 
 # Background-work detection — resolve_session_bases (the compaction-chain
@@ -611,9 +683,25 @@ FAIL_LIMIT=5
 fail_streak=0
 server_gone() { ! tmux list-sessions >/dev/null 2>&1; }
 
-# Consecutive-idle counters for the stuck-`running` reconcile, carried across
-# ticks as " @win=N @win=N " (see the hysteresis note in the loop).
+# Consecutive-idle counters for the stuck-`running` reconcile (and the codex
+# turn-end reconcile beside it), carried across ticks as " @win=N @win=N "
+# (see the hysteresis note in the loop).
 idle_streak=" "
+
+# Is a window with this #{window_active_clients} ($1) in front of the user:
+# active for a client AND WezTerm frontmost? The seen-it discharge's test, and
+# the indicator's viewing_now. The frontmost lookup forks twice, so it runs at
+# most once a tick (wez_front, reset per tick) and only when a watched window
+# asks.
+viewed_now() {
+    case "$1" in ''|0|*[!0-9]*) return 1 ;; esac
+    if [ -z "$wez_front" ]; then
+        wez_front=no
+        [ "$(lsappinfo info -only bundleid "$(lsappinfo front 2>/dev/null)" 2>/dev/null)" = \
+          '"CFBundleIdentifier"="com.github.wez.wezterm"' ] && wez_front=yes
+    fi
+    [ "$wez_front" = yes ]
+}
 
 # Consecutive agent-LESS ticks per window, same " @win=N " shape, for the GC
 # below. A window is only garbage-collected after GC_TICKS ticks in a row
@@ -636,11 +724,16 @@ gc_streak=" "
 # per window that was quadratic, ~20 ms a tick at load 200.
 AGENT_PAT='claude|codex|[0-9]+\.[0-9]+\.[0-9]+'
 declare -A PID_TTY=() PID_NEXT=() TTY_PID=()   # pid->tty|-, its rebuild, tty->lowest pid
+# pid -> codex|claude, for agent pids only: written by the same single-pid ps
+# that fills PID_TTY (no extra fork), dropped with it. A pid that leaves the
+# pgrep set and comes back is ps'd again, so this is overwritten with it.
+declare -A PID_KIND=()
 pid_cache_age=0
 PID_CACHE_TICKS=60
 # Per-window fields of the tick's one tmux read (see the ONE READ note).
 declare -A W_SEEN=() W_PID=() W_STATE=() W_WAC=() W_SINCE=() W_WF=() W_CUA=() W_ROLL=() W_SUM=() W_DET=()
 declare -A W_DK=() W_DTXT=() W_SESS=() W_IDX=() W_NAME=()   # event-log fields
+declare -A W_AK=()   # @agent_kind alone (W_DET is kind+detail kind, for the GC)
 wins=()
 
 # Tick trace (see TICK TRACE in the header). Tested once per tick, builtin.
@@ -848,7 +941,7 @@ while :; do
     [ "$rc" = 0 ] || cand=""
     pid_cache_age=$((pid_cache_age + 1))
     if [ "$pid_cache_age" -ge "$PID_CACHE_TICKS" ]; then
-        PID_TTY=()
+        PID_TTY=(); PID_KIND=()
         # The subagent verdict cache rides the same clock: dead pids drop
         # out, and every session gets one full look a minute regardless.
         SUB_KEY=(); SUB_TICK=(); SUB_V=()
@@ -881,8 +974,14 @@ while :; do
             [ -n "$pid" ] || continue
             if [ -n "$tty" ] && [ "$tty" != "??" ] && is_agent_comm "$comm"; then
                 PID_TTY[$pid]="$tty"
+                # is_agent_comm's names: codex, else claude (incl. N.N.N).
+                case "${comm##*/}" in
+                    codex) PID_KIND[$pid]=codex ;;
+                    *) PID_KIND[$pid]=claude ;;
+                esac
             else
                 PID_TTY[$pid]=-
+                unset 'PID_KIND[$pid]'
             fi
         done <<EOF
 $ps_out
@@ -932,7 +1031,7 @@ EOF
     # outlive @agent_state (a detached condenser may write one after the
     # agent died and the watcher GC'd its state), which is why the GC also
     # keys on it. @agent_since rides along: "<epoch> <state>", see the stamp
-    # below. Rollout paths (see codex_status) live under ~/.codex/sessions.
+    # below. Rollout paths (see codex_tail) live under ~/.codex/sessions.
     # @agent_kind / @agent_detail_kind (the sidebar's fields, written by the
     # indicator) are bare tokens, read only so a window holding nothing else
     # still leaves the fast path and gets collected (@agent_detail always
@@ -967,7 +1066,7 @@ EOF
     # gets the full path - seeded, stamped, and garbage-collected once it
     # exits, exactly like any other window.
     W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_SUM=(); W_DET=()
-    W_DK=(); W_DTXT=(); W_SESS=(); W_IDX=(); W_NAME=()
+    W_DK=(); W_DTXT=(); W_SESS=(); W_IDX=(); W_NAME=(); W_AK=()
     wins=()
     while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind sess widx wname dtxt summary; do
         case "$win" in @*) ;; *) continue ;; esac
@@ -978,7 +1077,7 @@ EOF
             if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${akind}${dkind}${summary}" ]; then
                 W_STATE[$win]="$state"; W_WAC[$win]="$wac"; W_SINCE[$win]="$since"
                 W_WF[$win]="$wf_opt"; W_CUA[$win]="$cua_opt"; W_ROLL[$win]="$roll"
-                W_SUM[$win]="$summary"; W_DET[$win]="${akind}${dkind}"
+                W_SUM[$win]="$summary"; W_DET[$win]="${akind}${dkind}"; W_AK[$win]="$akind"
                 W_DK[$win]="$dkind"; W_DTXT[$win]="$dtxt"
                 W_SESS[$win]="$sess"; W_IDX[$win]="$widx"; W_NAME[$win]="$wname"
             fi
@@ -1063,19 +1162,12 @@ EOF
         # tinted, watched window to ask about - almost never.
         case "$state" in
             done|needs-input)
-                case "$wac" in ''|0|*[!0-9]*) : ;; *)
-                    if [ -z "$wez_front" ]; then
-                        wez_front=no
-                        [ "$(lsappinfo info -only bundleid "$(lsappinfo front 2>/dev/null)" 2>/dev/null)" = \
-                          '"CFBundleIdentifier"="com.github.wez.wezterm"' ] && wez_front=yes
-                    fi
-                    if [ "$wez_front" = yes ]; then
-                        tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
-                        [ "$state" = needs-input ] && \
-                            tmux set-option -w -t "$win" @agent_pending "$(printf '%(%s)T' -1)" 2>/dev/null
-                        state=idle
-                    fi ;;
-                esac ;;
+                if viewed_now "$wac"; then
+                    tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
+                    [ "$state" = needs-input ] && \
+                        tmux set-option -w -t "$win" @agent_pending "$(printf '%(%s)T' -1)" 2>/dev/null
+                    state=idle
+                fi ;;
         esac
         has_agent=0; [ -n "$pid" ] && has_agent=1
         # A leftover sidebar kind/detail is collectable exactly like a summary.
@@ -1124,33 +1216,98 @@ EOF
         # back. Three consecutive idle ticks costs 3s of latency on a fix for
         # a tab that was previously stuck for the rest of the session, and
         # makes the race require three impossible coincidences in a row.
-        agent_idle=0
-        if [ "$state" = "running" ] && [ "$has_agent" = 1 ]; then
-            st=""
-            [ -n "$pid" ] && session_status "$pid"              # claude
-            if [ -z "$st" ]; then                               # codex
-                rp="${W_ROLL[$win]:-}"
-                # Only reached for a codex window ALREADY showing running, so
-                # the tail read is bounded to that case; a long live turn pays
-                # one read per tick until it ends, which is the price of having
-                # no status file to poll.
-                [ -n "$rp" ] && st=$(codex_status "$rp")
+        #
+        # CODEX TURN ENDS, including needs-input. Esc on a codex approval
+        # prompt, or Esc mid-turn, fires no hook either, so a codex tab sat
+        # yellow (or pulsing) after the turn was gone. Its rollout says so: a
+        # turn_aborted or task_complete whose own timestamp is AFTER the
+        # window's stamp (cx_after) ended the turn this state belongs to. That
+        # is the one ground truth that may clear needs-input: an open prompt is
+        # still inside its turn, so it has no turn end after its stamp, and an
+        # old turn end (before the stamp) is ignored. A turn end after the
+        # stamp is written the way the indicator would have: task_complete is
+        # its Stop (done, or idle while viewed_now; detail "done turn
+        # finished", the Stop's own fallback text, since the reply itself would
+        # need the indicator's jq sanitizer), turn_aborted its interrupt mode
+        # (idle); both unset @agent_pending, and an abort unsets the detail as
+        # SessionStart/clear_state do. One tmux call carries all of it plus the
+        # @agent_since stamp. Codex agents only (PID_KIND, from the agent's
+        # own comm, in both states), and the rollout is looked at only for a
+        # window ALREADY running or needs-input - one bounded read when it
+        # changes (codex_tail_cached), builtin -nt tests otherwise - and every
+        # other window none. A running tab whose last turn end predates its
+        # stamp, or whose agent is not codex, keeps the older rule (idle after
+        # the streak, state only).
+        fin=""        # the state this agent's own record says, if it disagrees
+        cx_full=0     # 1 = a codex turn end after the stamp: the full write
+        if [ "$has_agent" = 1 ]; then
+            case "$state" in
+                running)
+                    st=""
+                    [ -n "$pid" ] && session_status "$pid"          # claude
+                    if [ -z "$st" ] && [ -n "${W_ROLL[$win]:-}" ]; then   # codex
+                        codex_tail_cached "$win" "${W_ROLL[$win]}"
+                        # The full turn-end write is for a CODEX agent only: a
+                        # claude window with no session file and a stale
+                        # rollout path (left by an earlier codex in the pane)
+                        # keeps the older rule - idle, state only - never a
+                        # codex "done" it did not have.
+                        case "$cx_mark" in
+                            complete|aborted)
+                                if [ "${PID_KIND[$pid]:-}" = codex ] && cx_after; then
+                                    cx_full=1
+                                else
+                                    st=idle
+                                fi ;;
+                        esac
+                    fi
+                    # "shell" is Claude Code's at-the-prompt status now (seen
+                    # on every idle session, 2.1.278-2.1.284, 2026-09-29) -
+                    # checking for "idle" alone left a tab that missed its Stop
+                    # pinned at running. "waiting" (a gate on screen) and
+                    # "busy" still never qualify.
+                    case "$st" in idle|shell) fin=idle ;; esac
+                    ;;
+                needs-input)
+                    if [ "${PID_KIND[$pid]:-}" = codex ] && [ -n "${W_ROLL[$win]:-}" ]; then
+                        codex_tail_cached "$win" "${W_ROLL[$win]}"
+                        case "$cx_mark" in
+                            complete|aborted) cx_after && cx_full=1 ;;
+                        esac
+                    fi
+                    ;;
+            esac
+            if [ "$cx_full" = 1 ]; then
+                fin=idle
+                [ "$cx_mark" = complete ] && fin=done
             fi
-            # "shell" is Claude Code's at-the-prompt status now (seen on every
-            # idle session, 2.1.278-2.1.284, 2026-09-29) - checking for "idle"
-            # alone left a tab that missed its Stop pinned at running.
-            # "waiting" (a gate on screen) and "busy" still never qualify.
-            case "$st" in idle|shell) agent_idle=1 ;; esac
         fi
-        if [ "$agent_idle" = 1 ]; then
+        if [ -n "$fin" ]; then
             n=0
             for kv in $idle_streak; do
                 case "$kv" in "${win}="*) n="${kv#*=}"; break ;; esac
             done
             n=$((n + 1))
             if [ "$n" -ge 3 ]; then
-                tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
-                state=idle
+                if [ "$cx_full" = 1 ]; then
+                    # The Stop path's viewing_now: a finish the user is
+                    # looking at is not tinted.
+                    [ "$fin" = done ] && viewed_now "$wac" && fin=idle
+                    cx_cmd=(set-option -w -t "$win" @agent_state "$fin" \;
+                            set-option -w -t "$win" @agent_since "$tick_now $fin" \;
+                            set-option -uw -t "$win" @agent_pending \;)
+                    if [ "$cx_mark" = complete ]; then
+                        cx_cmd+=(set-option -w -t "$win" @agent_detail_kind done \;
+                                 set-option -w -t "$win" @agent_detail "turn finished")
+                    else
+                        cx_cmd+=(set-option -uw -t "$win" @agent_detail_kind \;
+                                 set-option -uw -t "$win" @agent_detail)
+                    fi
+                    tmux "${cx_cmd[@]}" 2>/dev/null && { changed=1; since="$tick_now $fin"; }
+                else
+                    tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
+                fi
+                state=$fin
             else
                 idle_streak_next="${idle_streak_next}${win}=${n} "
             fi
@@ -1200,10 +1357,29 @@ EOF
         # window nor loses a change made while no watcher was running. Up to
         # POLL_SECONDS late, which an elapsed column can't show anyway. Not a
         # rendered option, so it never sets `changed`.
+        #
+        # @agent_kind for a window whose agent has fired no hook yet. Codex's
+        # first hook (SessionStart) waits for the first PROMPT, so a freshly
+        # launched codex sat seeded `idle` with no kind - no ⬢ glyph in the
+        # sidebar or menu - until then. The agent's own comm (PID_KIND) says
+        # which it is, so a live agent window with no kind gets it here, riding
+        # in the stamp's call: the idle seed always stamps, so a fresh window
+        # pays no extra fork; a held state with no kind (rare: a seed from
+        # before this existed) pays one call, once. A kind already set - always
+        # by a hook - is never overwritten, and none is written without a live
+        # agent, so the GC (which unsets it with the state) never races this.
+        kind_cmd=()
+        if [ -n "$state" ] && [ "$has_agent" = 1 ] && [ -z "${W_AK[$win]:-}" ] \
+           && [ -n "${PID_KIND[$pid]:-}" ]; then
+            kind_cmd=(set-option -w -t "$win" @agent_kind "${PID_KIND[$pid]}")
+        fi
         if [ -z "$state" ]; then
             [ -n "$since" ] && tmux set-option -uw -t "$win" @agent_since 2>/dev/null
         elif [ "${since#* }" != "$state" ]; then
-            tmux set-option -w -t "$win" @agent_since "$tick_now $state" 2>/dev/null
+            tmux set-option -w -t "$win" @agent_since "$tick_now $state" \
+                ${kind_cmd[0]+\;} "${kind_cmd[@]}" 2>/dev/null
+        elif [ "${#kind_cmd[@]}" -gt 0 ]; then
+            tmux "${kind_cmd[@]}" 2>/dev/null
         fi
     done
     gc_streak="$gc_streak_next"
@@ -1215,6 +1391,13 @@ EOF
     EV_SEED=(); EV_SEED_AT=()
 
     idle_streak="$idle_streak_next"
+    # Rollout answers no window asked for this tick are dropped (see
+    # codex_tail_cached); a window that comes back reads afresh.
+    for win in "${!CX_PATH[@]}"; do
+        [ -n "${CX_USED[$win]:-}" ] && continue
+        unset 'CX_PATH[$win]' 'CX_TICK[$win]' 'CX_MARK[$win]' 'CX_TS[$win]'
+    done
+    CX_USED=()
 
     # The stale-save chip (see STALE-SAVE CHIP): a builtin clock compare on
     # almost every tick, a look at most once per STALE_EVERY seconds.

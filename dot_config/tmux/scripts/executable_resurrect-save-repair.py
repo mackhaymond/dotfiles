@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Repair save metadata from verified foreground owners, never cwd guesses."""
 import argparse
+import hashlib
 import importlib.util
 import io
 import json
@@ -10,6 +11,7 @@ import re
 import shlex
 import sqlite3
 import subprocess
+import sys
 import tarfile
 import tempfile
 
@@ -18,6 +20,12 @@ VALUE_FLAGS = {"-c", "--config", "--enable", "--disable", "-C", "--cd", "-m", "-
                "--add-dir", "--local-provider", "--remote"}
 PICKERS = {"--last", "--all", "--include-noninteractive", "--include-non-interactive"}
 SHELLS = {"zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh", "nu"}
+# Native subcommands (codex-terminal-owner.interactive_args()): a first
+# positional word naming one is not an interactive session's prompt.
+SUBCOMMANDS = {"exec", "e", "review", "login", "logout", "mcp", "mcp-server", "plugin", "app-server",
+               "remote-control", "app", "agents", "completion", "update", "doctor", "sandbox", "debug", "apply",
+               "queue", "archive", "delete", "migrate-rollouts", "unarchive", "cloud", "exec-server", "features",
+               "help"}
 
 
 def run(arguments):
@@ -47,8 +55,17 @@ def pane_snapshot(socket):
     return panes
 
 
-def codex_args(command):
-    words = shlex.split(command)
+def codex_args(command, drop_prompt=False):
+    """(restorable flags, `resume` id, model) from a frontend's command line.
+
+    drop_prompt: the thread is already known from evidence tied to the process,
+    so an initial prompt is left out (resuming must not send it again). ps
+    prints argv space-joined, never quoted, so the prompt is the first word
+    that is not an option, operand or resume/fork id, plus everything after it:
+    a later "-x" word may be prompt text, and a flag after a prompt is lost
+    rather than guessed. Only the words kept must be unambiguous.
+    """
+    words = command.split() if drop_prompt else shlex.split(command)
     if not words:
         raise ValueError("Verified frontend has no command line")
     if Path(words[0]).name == "node":
@@ -60,7 +77,8 @@ def codex_args(command):
         words = words[1:]
     # The upstream restore hook whitespace-splits cli_args, not shell-parses
     # them. Reject ambiguous quoting/spaces rather than change argument values.
-    if any(character in command for character in "'\"\\") or any(any(c.isspace() for c in word) for word in words):
+    if not drop_prompt and (any(character in command for character in "'\"\\")
+                            or any(any(c.isspace() for c in word) for word in words)):
         raise ValueError("Quoted/spaced Codex arguments require a token-aware restore hook")
     kept, resume, model, index = [], None, "", 0
     while index < len(words):
@@ -88,9 +106,15 @@ def codex_args(command):
                 model = value
         elif word.startswith("-") and word != "--":
             kept.append(word)
-        else:
+        elif not drop_prompt:
             raise ValueError("Positional Codex arguments cannot be restored safely")
+        elif word in SUBCOMMANDS:
+            raise ValueError("A Codex subcommand is not an interactive session")
+        else:
+            break
         index += 1
+    if drop_prompt and any(character in " ".join(words[:index]) for character in "'\"\\"):
+        raise ValueError("Quoted Codex arguments require a token-aware restore hook")
     return " ".join(kept), resume, model
 
 
@@ -146,28 +170,210 @@ def selected_session(record, sid, resume, codex_home, tracker_dir):
     return resume if persisted_root(codex_home, resume) else None
 
 
-def standalone_entry(entry, targets, used, codex_home):
-    """A living `--no-daemon` frontend whose own argv names its thread.
+ROLLOUT = re.compile(r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-"
+                     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl")
+
+
+def frontend_pids(pid):
+    """The saved process and its direct children.
+
+    The plugin saves the first Codex-looking process in the pane: for an npm
+    install that is the `node …/codex` launcher, which spawns the native
+    `codex` binary. Hooks resolve their owner to that child, so the tracker
+    record and the window token name the child's pid, not the saved one.
+    """
+    try:
+        return [pid] + [int(child) for child in run(["pgrep", "-P", str(pid)]).split()]
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return [pid]
+
+
+def direct_token(pid, frontend_start, socket, pane):
+    """codex-terminal-owner.direct_owner()'s token for a --no-daemon frontend."""
+    return hashlib.sha256(f"{pid}:{frontend_start}:{socket}:{pane}".encode()).hexdigest()
+
+
+def window_of(target):
+    return target.rsplit(".", 1)[0]
+
+
+def codex_free_siblings(pane, panes, window_panes):
+    """True when no other pane of `pane`'s window runs a Codex process.
+
+    The tab indicator writes @agent_session_id, @agent_owner_token and
+    @agent_rollout in separate tmux calls, so hooks from Codex frontends in two
+    splits can interleave and leave one pane's token beside the other's thread.
+    Window options can name this pane's thread only while it is the window's
+    sole Codex. Unknown means no: a snapshot that disagrees with the window's
+    pane count, or a process table that cannot be read.
+    """
+    window = window_of(panes[pane]["target"])
+    siblings = [values for key, values in panes.items() if key != pane and window_of(values["target"]) == window]
+    if len(siblings) + 1 != window_panes:
+        return False
+    if not siblings:
+        return True
+    children, commands = {}, {}
+    for line in run(["ps", "-axo", "pid=,ppid=,command="]).splitlines():
+        fields = line.split(None, 2)
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+            children.setdefault(int(fields[1]), []).append(int(fields[0]))
+            commands[int(fields[0])] = fields[2] if len(fields) > 2 else ""
+    for sibling in siblings:
+        if not str(sibling.get("pid", "")).isdigit():
+            return False
+        queue, seen = [int(sibling["pid"])], set()
+        while queue:
+            pid = queue.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            if any(Path(word).name in ("codex", "codex.js") for word in commands.get(pid, "").split()[:2]):
+                return False
+            queue.extend(children.get(pid, ()))
+    return True
+
+
+def live_owner(owner, pid, pane, panes, socket):
+    """This living process, verified on `pane`'s terminal right now."""
+    identity = owner.process_identity(pid)
+    if (not identity or not identity.get("frontend_start") or pane not in panes
+            or not str(panes[pane].get("pid", "")).isdigit()):
+        return None
+    record = dict(frontend_pid=pid, frontend_start=identity["frontend_start"], tty=identity.get("tty"),
+                  pane=pane, pane_pid=int(panes[pane]["pid"]), tmux_socket=socket)
+    return record if owner.valid(record) else None
+
+
+def tracker_session(live, tracker_dir, codex_home):
+    """codex-session-track's record, only if written for this very process.
+
+    The tracker keys it by the frontend pid that codex-terminal-owner verified
+    on the pane's tty; frontend_start rejects a pid since reused by another
+    process, and the pane/socket must be the one the process is on now.
+    """
+    try:
+        tracker = json.loads((tracker_dir / f"codex-{live['frontend_pid']}.json").read_text())
+        env = tracker.get("env") or {}
+        if (int(tracker["ppid"]) == live["frontend_pid"]
+                and tracker["frontend_start"] == live["frontend_start"]
+                and env.get("tmux_pane") == live["pane"]
+                and os.path.realpath(env.get("tmux_socket") or "") == live["tmux_socket"]
+                and persisted_root(codex_home, tracker.get("session_id"))):
+            return tracker["session_id"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def rollout_session(live, panes, codex_home):
+    """The thread in the window's @agent_rollout, only if this process put it there.
+
+    The tab indicator writes @agent_rollout/@agent_session_id beside
+    @agent_owner_token, the token of the owner it resolved. For a --no-daemon
+    frontend that is codex-terminal-owner.direct_owner()'s token, a hash of
+    pid, start time, socket and pane, so an option left by an earlier process
+    does not match. The three are separate writes, so a second Codex split in
+    the window can interleave its own: then none of them is trusted.
+    """
+    try:
+        count, token, sid, rollout = run(["tmux", "-S", live["tmux_socket"], "display-message", "-p", "-t",
+            live["pane"], "#{window_panes}\t#{@agent_owner_token}\t#{@agent_session_id}\t#{@agent_rollout}"]
+            ).split("\t", 3)
+        match = ROLLOUT.fullmatch(Path(rollout).name)
+        if (not match or token != direct_token(live["frontend_pid"], live["frontend_start"], live["tmux_socket"],
+                                               live["pane"])
+                or sid not in ("", match[1]) or not persisted_root(codex_home, match[1])
+                or not codex_free_siblings(live["pane"], panes, int(count))):
+            return None
+        row = thread_row(codex_home, match[1])
+        if row and os.path.realpath(row[3]) == os.path.realpath(rollout):
+            return match[1]
+    except (OSError, ValueError, TypeError, sqlite3.Error, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def rollout_mtime(codex_home, sid):
+    try:
+        return os.stat(thread_row(codex_home, sid)[3]).st_mtime
+    except (OSError, TypeError, IndexError, sqlite3.Error):
+        return float("-inf")
+
+
+def verified_session(entry, owner, panes, socket, tracker_dir, codex_home):
+    """The thread a living frontend holds now, from records tied to that process.
+
+    The tracker is rewritten only at SessionStart, which for /new arrives
+    before the new thread is persisted, so it can still name the previous
+    thread while the window options already name the new one. When both verify
+    and disagree, the thread whose rollout was written last is the current one.
+    Any failure to inspect the process leaves the row unverified (None).
+    """
+    try:
+        matches = [pane for pane, values in panes.items() if values["target"] == entry.get("pane")]
+        if len(matches) != 1:
+            return None
+        for pid in frontend_pids(int(entry["pid"])):
+            live = live_owner(owner, pid, matches[0], panes, socket)
+            if live:
+                tracked = tracker_session(live, tracker_dir, codex_home)
+                windowed = rollout_session(live, panes, codex_home)
+                if tracked and windowed and tracked != windowed:
+                    return max((windowed, tracked), key=lambda sid: rollout_mtime(codex_home, sid))
+                if tracked or windowed:
+                    return tracked or windowed
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def standalone_entry(entry, targets, used, codex_home, owner, panes, socket, tracker_dir, claimed, verified):
+    """A living frontend with no relay binding, kept only on evidence tied to it.
 
     Since the wrapper forces --no-daemon (cfef2de), frontends get no relay
     binding, so every living one used to abort the whole repair — and the
-    sidecar then kept the plugin's unverified rows for ALL Codex panes. A
-    standalone process is a descendant of the pane the plugin found it in, and
-    `resume <id>` in its own command line, naming a persisted root thread, is
-    the same evidence this file already accepts as a binding fallback. Anything
-    weaker still aborts.
+    sidecar then kept the plugin's unverified rows for ALL Codex panes.
+    repair() calls this twice per row, and every row's first pass runs before
+    any row's second, so a thread verified for one process is never taken by
+    another's weaker argv claim:
+      verified=True: codex-session-track's record for this process
+         (tracker_session) or the window's @agent_rollout owned by this
+         process (rollout_session). A launch prompt is left out of cli_args.
+      verified=False: `resume <id>` in its own --no-daemon command line, naming
+         the thread the plugin saved — the binding fallback's evidence. It is
+         last because argv names the launch thread, not one switched to later.
+    Each must name a persisted root thread no other pane claims. Returns
+    (row or None, whether this pass found a thread at all); a row nothing
+    resolves is dropped by repair() and its pane restores as a plain shell.
     """
+    if entry.get("pane") not in targets or entry.get("pane") in used:
+        return None, False
     try:
         command = run(["ps", "-p", str(int(entry["pid"])), "-o", "command="])
-        arguments, resume, model = codex_args(command)
-    except (ValueError, KeyError, subprocess.SubprocessError):
-        return None
-    if ("--no-daemon" not in arguments.split() or not resume or resume != entry.get("session_id")
-            or entry.get("pane") not in targets or entry.get("pane") in used
-            or not persisted_root(codex_home, resume)):
-        return None
-    return dict(pane=entry["pane"], tool="codex", session_id=resume, cwd=entry.get("cwd", ""),
-                pid=str(entry["pid"]), model=model, cli_args=arguments, env=None)
+    except (ValueError, KeyError, OSError, subprocess.SubprocessError):
+        return None, False
+    if verified:
+        selected = verified_session(entry, owner, panes, socket, tracker_dir, codex_home)
+    else:
+        selected = None
+        try:
+            arguments, resume, _ = codex_args(command)
+            if ("--no-daemon" in arguments.split() and resume and resume == entry.get("session_id")
+                    and persisted_root(codex_home, resume)):
+                selected = resume
+        except ValueError:
+            pass
+    if not selected:
+        return None, False
+    try:
+        arguments, _, model = codex_args(command, drop_prompt=verified)
+    except ValueError:
+        return None, True
+    if selected in claimed:
+        return None, True
+    return dict(pane=entry["pane"], tool="codex", session_id=selected, cwd=entry.get("cwd", ""),
+                pid=str(entry["pid"]), model=model, cli_args=arguments, env=None), True
 
 
 def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_dir):
@@ -200,19 +406,38 @@ def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_d
         rebuilt.append(dict(pane=pane["target"], tool="codex", session_id=selected, cwd=pane["cwd"],
                             pid=str(record["frontend_pid"]), model=model, cli_args=arguments, env=None))
     accepted = {int(entry["pid"]) for entry in rebuilt}
+    candidates = [entry for entry in data["sessions"]
+                  if entry.get("tool") == "codex" and str(entry.get("pid", "")).isdigit()
+                  and int(entry["pid"]) not in accepted and owner.process_identity(int(entry["pid"]))]
     unresolved, standalone = [], 0
-    for entry in data["sessions"]:
-        pid = str(entry.get("pid", ""))
-        if entry.get("tool") == "codex" and pid.isdigit() and int(pid) not in accepted and owner.process_identity(int(pid)):
-            kept = standalone_entry(entry, targets, used, codex_home)
+    for verified in (True, False):
+        pending = []
+        for entry in candidates:
+            # A pane already kept (through its binding, or an earlier row) is
+            # resolved even when the plugin saved another pid for it, e.g. the
+            # npm launcher rather than the bound native child: skip, unreported.
+            if entry.get("pane") in used:
+                continue
+            kept, found = standalone_entry(entry, targets, used, codex_home, owner, panes, socket, tracker_dir,
+                                           {row["session_id"] for row in rebuilt}, verified)
             if kept:
                 rebuilt.append(kept)
                 used.add(kept["pane"])
                 standalone += 1
-                continue
-            unresolved.append(int(pid))
+            elif found or not verified:
+                unresolved.append((int(entry["pid"]), str(entry.get("pane", ""))))
+            else:
+                pending.append(entry)
+        candidates = pending
+    # An unresolved living frontend (launched bare against the shared daemon,
+    # or fresh with no persisted thread yet) used to abort the whole repair,
+    # leaving every other pane, the archive and parked cwds unrepaired. Its row
+    # is dropped instead (`sessions` above holds no plugin Codex rows), so that
+    # pane restores as a plain shell rather than resuming a guessed thread.
+    # Corrupt input below still aborts.
     if unresolved:
-        raise ValueError("Unresolved living Codex frontend PIDs: " + ",".join(map(str, sorted(set(unresolved)))))
+        print("resurrect save repair: dropped unresolved living Codex frontends: "
+              + ", ".join(f"pid {pid} ({pane})" for pid, pane in sorted(set(unresolved))), file=sys.stderr)
     data["sessions"] = sessions + sorted(rebuilt, key=lambda entry: entry["pane"])
     current = {pane["target"]: pane for pane in panes.values()}
     lines, fixed, parked_cwds = [], 0, 0
@@ -241,7 +466,8 @@ def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_d
             line = "\t".join(f) + line[len(line.rstrip("\r\n")):]
         lines.append(line)
     report = dict(codex=len(rebuilt), preserved=len(sessions), invalid_bindings=invalid, repaired_panes=fixed,
-                  fallback_bindings=fallback, parked_cwds=parked_cwds, standalone_resumes=standalone)
+                  fallback_bindings=fallback, parked_cwds=parked_cwds, standalone_resumes=standalone,
+                  unresolved_dropped=len(set(unresolved)))
     return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode(), "".join(lines).encode(), used, report
 
 
