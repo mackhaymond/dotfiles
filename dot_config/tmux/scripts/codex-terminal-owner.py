@@ -234,8 +234,7 @@ def direct_owner(sid):
                 if role == "frontend":
                     record = capture(pid, os.environ.get("TMUX", "").split(",")[0], os.environ.get("TMUX_PANE", ""))
                     if record:
-                        identity = f'{pid}:{record["frontend_start"]}:{record["tmux_socket"]}:{record["pane"]}'
-                        token = hashlib.sha256(identity.encode()).hexdigest()
+                        token = direct_token(record)
                         return dict(record, session_id=sid, token=token, binding_id=token + ":" + sid,
                                     bound_at=0, direct=True)
                     return None
@@ -245,6 +244,30 @@ def direct_owner(sid):
     except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):
         pass
     return None
+
+
+def direct_token(record):
+    """direct_owner()'s token: a hash of the frontend's pid, start, socket and pane."""
+    identity = f'{record["frontend_pid"]}:{record["frontend_start"]}:{record["tmux_socket"]}:{record["pane"]}'
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def direct_valid(sid, token, record):
+    """A direct_owner() record still names `sid`'s frontend, live on its pane.
+
+    For callers that cannot re-run the ancestor walk, such as the tab
+    indicator's detached title condenser, a tmux-server child. The token is
+    re-derived from the record, so a record only vouches for the token of the
+    process it describes, and valid() checks that process (same start time) is
+    still on that pane's tty: an exited or replaced frontend fails.
+    """
+    try:
+        return bool(isinstance(record, dict) and record.get("direct") is True
+                    and SID.fullmatch(sid or "") and record.get("session_id") == sid
+                    and token and record.get("token") == token
+                    and direct_token(record) == token and valid(record))
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def release(token):
@@ -325,6 +348,14 @@ def main():
         print(json.dumps(record))
     elif mode == "release":
         release(args[0])
+    elif mode == "valid":
+        # valid <sid> <token>, the resolved record on stdin; exit 0 if it holds.
+        sid, token = args
+        try:
+            record = json.loads(sys.stdin.read())
+        except ValueError:
+            record = None
+        raise SystemExit(0 if direct_valid(sid, token, record) else 1)
 
 
 if __name__ == "__main__":

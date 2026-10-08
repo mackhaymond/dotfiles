@@ -133,6 +133,8 @@ if [ "$agent" = codex ]; then
     export AGENT_TAB_OWNER_SESSION="$owner_sid"
     export AGENT_TAB_OWNER_TOKEN=$("$JQ" -r '.token' <<<"$owner")
     export AGENT_TAB_OWNER_BINDING=$("$JQ" -r '.binding_id' <<<"$owner")
+    # The resolved record itself, for the detached condenser (owner_current).
+    export AGENT_TAB_OWNER_RECORD=$("$JQ" -c . <<<"$owner")
     reconcile_binding=$("$JQ" -r '.terminal_binding_id // empty' <<<"$payload" 2>/dev/null || true)
     [ -z "$reconcile_binding" ] || [ "$reconcile_binding" = "$AGENT_TAB_OWNER_BINDING" ] || exit 0
 fi
@@ -157,11 +159,24 @@ owns_window() {
 
 owner_current() {
     [ -z "${AGENT_TAB_OWNER_SESSION:-}" ] && return 0
-    local current
+    local current status
     current=$("$HOME/.local/bin/codex-terminal-owner" resolve "$AGENT_TAB_OWNER_SESSION" 2>/dev/null || true)
-    [ "$("$JQ" -r '.status // empty' <<<"$current" 2>/dev/null)" = bound ] &&
+    status=$("$JQ" -r '.status // empty' <<<"$current" 2>/dev/null || true)
+    if [ "$status" = bound ]; then
         [ "$("$JQ" -r '.binding_id // empty' <<<"$current" 2>/dev/null)" = "$AGENT_TAB_OWNER_BINDING" ] &&
-        [ "$("$JQ" -r '.token // empty' <<<"$current" 2>/dev/null)" = "$AGENT_TAB_OWNER_TOKEN" ]
+            [ "$("$JQ" -r '.token // empty' <<<"$current" 2>/dev/null)" = "$AGENT_TAB_OWNER_TOKEN" ]
+        return
+    fi
+    # A direct binding (direct_owner) is found by walking up from the hook to
+    # its Codex frontend. The detached condenser is a tmux-server child with
+    # no such ancestor, so resolve says unbound there and every condensed
+    # title was dropped. It carries the record the hook resolved instead:
+    # `valid` re-derives the token from that frontend's pid+start, socket and
+    # pane and checks the process is still alive on that pane's tty, so a
+    # stale condenser cannot vouch for a window another session now owns.
+    [ "$mode" = condense-locked ] && [ -n "${AGENT_TAB_OWNER_RECORD:-}" ] || return 1
+    "$HOME/.local/bin/codex-terminal-owner" valid "$AGENT_TAB_OWNER_SESSION" "$AGENT_TAB_OWNER_TOKEN" \
+        <<<"$AGENT_TAB_OWNER_RECORD" >/dev/null 2>&1
 }
 # Shared with CuaNotch's cua-notch-agent-hook: the one implementation of "is
 # background work from this session still out?". See its header.
@@ -486,6 +501,7 @@ compose_summary() {
         "AGENT_TAB_OWNER_SESSION=${AGENT_TAB_OWNER_SESSION:-}" \
         "AGENT_TAB_OWNER_TOKEN=${AGENT_TAB_OWNER_TOKEN:-}" \
         "AGENT_TAB_OWNER_BINDING=${AGENT_TAB_OWNER_BINDING:-}" \
+        "AGENT_TAB_OWNER_RECORD=${AGENT_TAB_OWNER_RECORD:-}" \
         "AGENT_TAB_CONDENSE_MODEL=$CONDENSE_MODEL" \
         bash "$0" condense "$win" "$proj" "$raw"
     launch+=' >/dev/null 2>&1'

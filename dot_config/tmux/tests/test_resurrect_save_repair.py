@@ -69,6 +69,29 @@ class SaveRepairTests(unittest.TestCase):
         self.assertEqual(report["codex"], 2)
         self.assertTrue(all(s["cli_args"] == "" for s in data["sessions"][1:]))
 
+    def test_one_unrestorable_bound_command_line_never_aborts_the_repair(self):
+        # A bound frontend launched with a prompt used to raise "Positional
+        # Codex arguments…" and abort the whole repair, so the plugin's rows
+        # (stale `-c model_context_window` copies included) went to restore.
+        self.persist("second")
+        second = dict(self.record, session_id="second", frontend_pid=124, pane="%8")
+        self.panes["%8"] = dict(self.panes["%7"], target="main:8.1", pid="78")
+        self.layout += self.row("main", 8)
+        for second_argv, rows, invalid in (
+                # The binding verifies the thread: the prompt is dropped, flags kept.
+                ("codex --no-daemon -c model_context_window=272000 -m o3 fix the bug",
+                 [("main:7.1", "correct", "--no-daemon"), ("main:8.1", "second", "--no-daemon -m o3")], 0),
+                # Not restorable even without the prompt: that row alone is invalid.
+                ("codex --no-daemon exec fix it", [("main:7.1", "correct", "--no-daemon")], 1),
+                ("codex --no-daemon --model", [("main:7.1", "correct", "--no-daemon")], 1)):
+            commands = {"123": "codex --no-daemon -c model_context_window=272000", "124": second_argv}
+            with self.subTest(argv=second_argv), patch.object(repair, "run", side_effect=lambda a: commands[a[2]]):
+                content, _, _, report = repair.repair(self.sidecar, self.layout, {"correct": self.record,
+                    "second": second}, self.panes, self.socket, self.owner, self.codex, self.tracker)
+                self.assertEqual([(s["pane"], s["session_id"], s["cli_args"])
+                                  for s in json.loads(content)["sessions"][1:]], rows)
+                self.assertEqual(report["invalid_bindings"], invalid)
+
     def test_ephemeral_binding_falls_back_only_to_matching_persisted_pid_tracker(self):
         self.record["session_id"] = "ephemeral"
         state = dict(session_id="correct", ppid=123, frontend_start="start", terminal_binding_id="old",
@@ -512,7 +535,7 @@ class SaveRepairTests(unittest.TestCase):
             session_id="correct", ppid=124, frontend_start="start-124",
             env=dict(tmux_pane="%7", tmux_socket=self.socket))))
         for argv, kept in (("node /x/codex --no-daemon -c model_context_window=272000 fix the bug",
-                            "--no-daemon -c model_context_window=272000"),
+                            "--no-daemon"),  # the wrapper re-adds a fresh context override
                            ("codex --no-daemon -m o3 don't break \"it\" -- --model x", "--no-daemon -m o3"),
                            ("codex --no-daemon fix it --sandbox danger-full-access", "--no-daemon")):
             with self.subTest(argv=argv):
@@ -648,7 +671,10 @@ class SaveRepairTests(unittest.TestCase):
         self.assertEqual(self.codex_rows(content), [("main:7.1", "switched", "123", "--no-daemon"),
                                                     ("main:8.1", "second", "133", "--no-daemon")])
 
-    def test_unsafe_cli_arguments_leave_every_real_save_file_unchanged(self):
+    def test_unsafe_cli_arguments_drop_only_their_own_row(self):
+        # Once this aborted the whole repair (every save file left as the
+        # plugin wrote it); now that binding alone is invalid, and its pane
+        # restores as a plain shell rather than with mangled arguments.
         sidecar, layout = self.root / "assistant-sessions.json", self.root / "save.txt"
         sidecar.write_text(self.sidecar)
         layout.write_text(self.layout)
@@ -660,13 +686,86 @@ class SaveRepairTests(unittest.TestCase):
         snapshot = "%7\tmain:7.1\t/shared\t1\tzsh\t77"
         def command(arguments):
             return snapshot if arguments[0] == "tmux" else "codex --add-dir '/tmp/with spaces'"
-        with patch.object(repair, "run", side_effect=command), patch.object(repair, "atomic_write") as write:
-            with self.assertRaisesRegex(ValueError, "Quoted/spaced"):
-                repair.main(["--resurrect-dir", str(self.root), "--bindings", str(bindings),
-                    "--socket", self.socket, "--owner-helper", str(helper), "--codex-home", str(self.codex)])
-            write.assert_not_called()
-        self.assertEqual(sidecar.read_text(), self.sidecar)
+        with patch.object(repair, "run", side_effect=command), patch.object(repair, "atomic_write") as write, \
+                patch("sys.stdout", new_callable=io.StringIO) as out:
+            repair.main(["--resurrect-dir", str(self.root), "--bindings", str(bindings),
+                "--socket", self.socket, "--owner-helper", str(helper), "--codex-home", str(self.codex)])
+        self.assertEqual(json.loads(out.getvalue())["invalid_bindings"], 1)
+        written = {path.name: content for (path, content), _ in write.call_args_list}
+        self.assertEqual(set(written), {"assistant-sessions.json"})  # the layout needed no repair
+        self.assertEqual(json.loads(written["assistant-sessions.json"])["sessions"], [self.claude])
+        self.assertNotIn(b"--add-dir", written["assistant-sessions.json"])
         self.assertEqual(layout.read_text(), self.layout)
+
+
+WRAPPER = Path(__file__).parents[1] / "scripts/codex-max-context.py"
+
+
+class Exec(Exception):
+    pass
+
+
+class ContextOverrideRoundTripTests(unittest.TestCase):
+    """Saved cli_args, resumed through the real wrapper, saved again: no pile-up.
+
+    The wrapper (codex-max-context.py launch, as ~/.local/bin/codex runs it)
+    prepends `-c model_context_window=<catalog max>`; a saved copy would sit
+    later in argv and win, one more per cycle, pinning the old maximum.
+    """
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="cx-ctx-")
+        self.addCleanup(temp.cleanup)
+        self.real = Path(temp.name) / "codex"
+        self.real.write_text("#!/bin/sh\nexit 0\n")
+        self.real.chmod(0o755)
+        spec = importlib.util.spec_from_file_location("codex_max_context_rt", WRAPPER)
+        self.wrapper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.wrapper)
+
+    def launch(self, args, maximum):
+        """The argv the wrapper execs (what ps then shows) for `codex <args>`."""
+        catalog = json.dumps({"models": [{"max_context_window": maximum}]})
+
+        def execv(path, argv):
+            raise Exec(argv)
+
+        with patch.dict("os.environ", {"PATH": str(self.real.parent)}), \
+                patch("subprocess.check_output", return_value=catalog), patch("os.execv", execv), \
+                patch("sys.argv", ["codex-max-context.py", "launch", *args]), \
+                patch("sys.dont_write_bytecode", True), self.assertRaises(Exec) as launched:
+            self.wrapper.main()
+        return launched.exception.args[0]
+
+    def test_three_save_restore_cycles_keep_one_fresh_context_override(self):
+        for first, drop_prompt in ((["-m", "o3", "-c", "model_reasoning_effort=high"], False),
+                                   (["-m", "o3", "fix", "the", "bug"], True)):
+            argv = self.launch(first, 272000)
+            for cycle, maximum in enumerate((400000, 872000, 1000000), 1):
+                with self.subTest(drop_prompt=drop_prompt, cycle=cycle):
+                    cli_args, _, model = repair.codex_args(" ".join(argv), drop_prompt=drop_prompt)
+                    self.assertNotIn("model_context_window", cli_args)
+                    self.assertEqual(cli_args.split().count("--no-daemon"), 1)
+                    self.assertEqual(model, "o3")
+                    argv = self.launch(cli_args.split() + ["resume", "sid-1"], maximum)
+                    self.assertEqual(sum("model_context_window" in arg for arg in argv), 1, argv)
+                    self.assertEqual(argv[:4], [str(self.real), "-c", f"model_context_window={maximum}",
+                                                "--no-daemon"])
+                    self.assertEqual(argv.count("--no-daemon"), 1)
+                    tail = ["-m", "o3"] + (["-c", "model_reasoning_effort=high"] if not drop_prompt else [])
+                    self.assertEqual(argv[4:], tail + ["resume", "sid-1"])
+
+    def test_every_spelling_of_the_override_is_dropped(self):
+        for spelling in ("-c model_context_window=1", "--config model_context_window=1",
+                         "-c=model_context_window=1", "--config=model_context_window=1",
+                         "-cmodel_context_window=1", "-c model_context_window=1 -c model_context_window=2"):
+            for drop_prompt in (False, True):
+                with self.subTest(spelling=spelling, drop_prompt=drop_prompt):
+                    flags, sid, _ = repair.codex_args(
+                        f"codex --no-daemon {spelling} -c model_reasoning_effort=high -cfoo=1 resume s-1",
+                        drop_prompt=drop_prompt)
+                    self.assertEqual((flags, sid), ("--no-daemon -c model_reasoning_effort=high -cfoo=1", "s-1"))
+        self.assertEqual(repair.codex_args("codex -c model_context_window_x=1")[0], "-c model_context_window_x=1")
 
 
 if __name__ == "__main__":

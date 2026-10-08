@@ -32,7 +32,7 @@ set -u
 mode=$1
 if [ "$mode" = closed-tabs ]; then
     eval "$(awk '/^build_cmd\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$SCRIPTS/executable_closed-tabs.sh")"
-    build_cmd codex s-1 "--no-daemon -c k=v" "" "{}"
+    build_cmd codex s-1 "${CLI_ARGS---no-daemon -c k=v}" "" "{}"
 else
     source "$LIB_DETECT"
     log() { echo "log: $*" >&2; }
@@ -65,12 +65,17 @@ class CodexLauncherTests(unittest.TestCase):
         self.write(bare / 'codex', '#!/bin/sh\nprintf "<bare>"; printf "<%s>" "$@"; echo\n')
         self.harness = root / 'harness.sh'
         self.harness.write_text(HARNESS)
-        sidecar = root / 'sessions.json'
-        sidecar.write_text(json.dumps({'sessions': [
-            {'pane': 's:1.1', 'tool': 'codex', 'session_id': 's-1', 'cli_args': '--no-daemon -c k=v'}]}))
+        self.sidecar = root / 'sessions.json'
         self.env = {'HOME': str(self.home), 'PATH': f'{fakes}:{bare}:/usr/bin:/bin', 'SCRIPTS': str(SCRIPTS),
-                    'LIB_DETECT': str(LIB_DETECT), 'INPUT_FILE': str(sidecar), 'JQ_PROG': '',
+                    'LIB_DETECT': str(LIB_DETECT), 'INPUT_FILE': str(self.sidecar), 'JQ_PROG': '',
                     'RESURRECT_SAVE': str(LIB_DETECT.with_name('save-assistant-sessions.sh'))}
+        self.saved('--no-daemon -c k=v')
+
+    def saved(self, cli_args, tool='codex'):
+        """The cli_args both scripts read: the sidecar row and build_cmd's argument."""
+        self.sidecar.write_text(json.dumps({'sessions': [
+            {'pane': 's:1.1', 'tool': tool, 'session_id': 's-1', 'cli_args': cli_args}]}))
+        self.env['CLI_ARGS'] = cli_args
 
     @staticmethod
     def write(path, text):
@@ -100,6 +105,51 @@ class CodexLauncherTests(unittest.TestCase):
             for shell in ('bash', 'zsh'):
                 with self.subTest(script=script, shell=shell):
                     self.assertEqual(self.run_typed(line, shell), expected)
+
+    def resumed(self, script, cli_args):
+        """argv the typed resume line runs, after checking bash and zsh agree."""
+        self.saved(cli_args)
+        line = self.command(script)
+        self.assertNotIn('command codex', line)
+        outputs = {shell: self.run_typed(line, shell) for shell in ('bash', 'zsh')}
+        self.assertEqual(outputs['bash'], outputs['zsh'])
+        return outputs['bash']
+
+    def test_resume_drops_stale_context_overrides_so_the_wrapper_adds_one(self):
+        # The wrapper prepends a fresh `-c model_context_window=<max>`; a saved
+        # copy would follow it and win, one more per close/reopen or (when the
+        # save repair could not rewrite the sidecar) per restore.
+        stale = ('--no-daemon -c model_context_window=272000 -c k=v --config=model_context_window=1 '
+                 '-cmodel_context_window=2 -c=model_context_window=3 --config model_context_window=4 '
+                 '-c model_context_window_x=5 -cfoo=1')
+        for script in ('closed-tabs', 'assistant-restore'):
+            for cli_args, kept in ((stale, '<--no-daemon><-c><k=v><-c><model_context_window_x=5><-cfoo=1>'),
+                                   ('-c model_context_window=1', ''), ('', '')):
+                with self.subTest(script=script, cli_args=cli_args):
+                    self.assertEqual(self.resumed(script, cli_args), f'<{self.wrapper}>{kept}<resume><s-1>')
+
+    def test_resume_filter_keeps_every_flag_operand_and_stops_at_double_dash(self):
+        # Value-taking flags (VALUE_FLAGS in resurrect-save-repair.py) keep
+        # their operand whatever it looks like; nothing after `--` is touched.
+        cases = (
+            # A dangling -c takes the next -c as its value: nothing swallows resume.
+            ('--no-daemon -c -c model_context_window=1', '<--no-daemon><-c><-c><model_context_window=1>'),
+            ('-m -c model_context_window=1 x', '<-m><-c><model_context_window=1><x>'),
+            ('--profile -cmodel_context_window=1 -c model_context_window=2', '<--profile><-cmodel_context_window=1>'),
+            ('--no-daemon -- -c model_context_window=1', '<--no-daemon><--><-c><model_context_window=1>'),
+            ('-c model_context_window=1 --add-dir --config=model_context_window=2',
+             '<--add-dir><--config=model_context_window=2>'),
+            ('--no-daemon -c', '<--no-daemon><-c>'),
+        )
+        for script in ('closed-tabs', 'assistant-restore'):
+            for cli_args, kept in cases:
+                with self.subTest(script=script, cli_args=cli_args):
+                    self.assertEqual(self.resumed(script, cli_args), f'<{self.wrapper}>{kept}<resume><s-1>')
+
+    def test_other_tools_keep_their_arguments(self):
+        # Only Codex rows are filtered (the closed-tabs harness builds Codex only).
+        self.saved('-c model_context_window=1', tool='opencode')
+        self.assertIn("command opencode '-c' 'model_context_window=1' -s", self.command('assistant-restore'))
 
     def test_resume_falls_back_to_path_lookup_without_the_wrapper(self):
         self.wrapper.unlink()

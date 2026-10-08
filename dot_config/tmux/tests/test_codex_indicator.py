@@ -47,8 +47,9 @@ with p.with_suffix('.lock').open('a') as lock:
    else: s['windows'][target][key]=a[-1]
  p.write_text(json.dumps(s))
 # Simulate only the title job, not the unrelated watcher watchdog request.
+# The job is a tmux-server child: it does not descend from the Codex frontend.
 if cmd=='run-shell' and ' condense ' in a[-1]:
- subprocess.Popen(['bash','-c',a[-1]], env=os.environ.copy(),
+ subprocess.Popen(['bash','-c',a[-1]], env={k:v for k,v in os.environ.items() if k!='FAKE_FRONTEND'},
                   cwd=str(p.parent), start_new_session=True,
                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 '''
@@ -56,7 +57,19 @@ FAKE_OWNER = r'''#!/usr/bin/env python3
 import json,os,sys
 from pathlib import Path
 s=json.loads(Path(os.environ['FAKE_OWNER_STATE']).read_text())
-print(json.dumps(s.get(sys.argv[-1],{'status':'unbound'})))
+if sys.argv[1]=='valid':
+ # The real one re-derives the token from pid/start/socket/pane and checks
+ # that process is still on the pane (test_codex_terminal_owner covers it).
+ sid,token=sys.argv[2:4]
+ r=json.loads(sys.stdin.read())
+ with open(os.environ['FAKE_OWNER_STATE']+'.valid','a') as f: f.write(sid+'\n')
+ sys.exit(0 if r.get('direct') is True and r.get('session_id')==sid and r.get('token')==token
+          and f"{r.get('frontend_pid')}:{r.get('frontend_start')}" in s.get('_live',[]) else 1)
+r=s.get(sys.argv[-1],{'status':'unbound'})
+# direct_owner() walks up from the hook to its frontend: outside that process
+# tree (FAKE_FRONTEND unset, e.g. a tmux run-shell job) it finds nothing.
+if r.get('direct') and not os.environ.get('FAKE_FRONTEND'): r={'status':'unbound'}
+print(json.dumps(r))
 '''
 FAKE_COPILOT = r'''#!/usr/bin/env python3
 import os,time
@@ -92,8 +105,10 @@ class IndicatorIntegrationTests(unittest.TestCase):
                         TMPDIR=str(self.root), TMUX="/fake/stale,12,0", TMUX_PANE="%999",
                         FAKE_TMUX_STATE=str(self.state), FAKE_OWNER_STATE=str(self.owners),
                         FAKE_CONDENSER=str(self.cond), AGENT_TAB_CONDENSE_MODEL="",
-                        TMUX_ASSISTANT_RESURRECT_DIR=str(self.root / "tmux-assistant-resurrect"))
-        for key in ("AGENT_TAB_SOCKET", "AGENT_TAB_OWNER_SESSION", "AGENT_TAB_OWNER_TOKEN", "AGENT_TAB_OWNER_BINDING"):
+                        TMUX_ASSISTANT_RESURRECT_DIR=str(self.root / "tmux-assistant-resurrect"),
+                        FAKE_FRONTEND="1")  # hooks descend from their Codex frontend
+        for key in ("AGENT_TAB_SOCKET", "AGENT_TAB_OWNER_SESSION", "AGENT_TAB_OWNER_TOKEN", "AGENT_TAB_OWNER_BINDING",
+                    "AGENT_TAB_OWNER_RECORD"):
             self.env.pop(key, None)
         self.bind("aaaa")
 
@@ -105,6 +120,28 @@ class IndicatorIntegrationTests(unittest.TestCase):
         self.owners.write_text(json.dumps({sid: {"status": "bound", "session_id": sid,
             "tmux_socket": "/fake/owned", "pane": "%42", "token": token, "binding_id": "binding-"+sid,
             "frontend_pid": 123, "frontend_start": "test start"}}))
+
+    def bind_direct(self, sid, token, pid, live=True):
+        """A direct_owner() record: resolvable only from the frontend's own tree."""
+        state = {sid: {"status": "bound", "session_id": sid, "tmux_socket": "/fake/owned", "pane": "%42",
+                       "token": token, "binding_id": token + ":" + sid, "frontend_pid": pid,
+                       "frontend_start": "test start", "tty": "ttys042", "pane_pid": 41,
+                       "term": "tmux", "bound_at": 0, "direct": True},
+                 "_live": [f"{pid}:test start"] if live else []}
+        self.owners.write_text(json.dumps(state))
+
+    def set_live(self, *pids):
+        state = json.loads(self.owners.read_text())
+        state["_live"] = [f"{pid}:test start" for pid in pids]
+        self.owners.write_text(json.dumps(state))
+
+    def summary_after(self, expected=None):
+        deadline = time.monotonic() + 5
+        while expected and self.window().get("@agent_summary") != expected and time.monotonic() < deadline:
+            time.sleep(.02)
+        if not expected:
+            time.sleep(.3)
+        return self.window().get("@agent_summary")
 
     def hook(self, mode, sid="aaaa", agent="codex", **payload):
         data = dict(session_id=sid, cwd="/work/project", **payload)
@@ -222,6 +259,90 @@ class IndicatorIntegrationTests(unittest.TestCase):
         self.wait_for("finished")
         time.sleep(.25)
         self.assertEqual(self.window()["@agent_summary"], previous)
+
+    def test_direct_binding_condensed_title_lands(self):
+        # A --no-daemon frontend has no registry record: resolve finds it only
+        # by walking up from the hook. The run-shell condenser is a tmux-server
+        # child, so it used to resolve unbound and drop every condensed title,
+        # leaving raw prompt text in the tab for the whole first turn.
+        self.bind_direct("aaaa", "direct-token", 123)
+        self.hook("running", prompt="Explain the direct binding regression please")
+        self.assertEqual(self.window()["@agent_owner_token"], "direct-token")
+        self.wait_for("finished")
+        self.assertEqual(self.summary_after("project/Condensed title"), "project/Condensed title")
+        self.assertEqual(self.window()["@agent_summary_cond"], "1")
+        jobs = [a for a in json.loads(self.state.read_text())["calls"]
+                if a[0] == "run-shell" and " condense " in a[-1]]
+        self.assertIn("AGENT_TAB_OWNER_RECORD=", jobs[-1][-1])
+        self.assertTrue(Path(str(self.owners) + ".valid").exists(), "condenser never proved ownership")
+
+    def test_direct_condenser_rejected_once_its_frontend_exits(self):
+        self.bind_direct("aaaa", "direct-token", 123)
+        (self.cond / "block").touch()
+        self.hook("running", prompt="Explain old conversation")
+        self.wait_for("started")
+        previous = self.window()["@agent_summary"]
+        self.set_live()  # the frontend exited (or its pid now names another start)
+        (self.cond / "block").unlink()
+        self.wait_for("finished")
+        self.assertEqual(self.summary_after(), previous)
+        self.assertNotEqual(self.window().get("@agent_summary_cond"), "1")
+
+    def test_direct_condenser_cannot_title_a_window_another_session_took(self):
+        self.bind_direct("aaaa", "direct-token", 123)
+        (self.cond / "block").touch()
+        self.hook("running", prompt="Explain old conversation")
+        self.wait_for("started")
+        # A new frontend (and thread) takes the window while the old one, still
+        # alive, has a condenser in flight.
+        self.bind_direct("bbbb", "other-token", 456)
+        self.set_live(123, 456)
+        self.assertEqual(self.hook("idle", sid="bbbb", source="startup")["@agent_summary"], "project/New Session")
+        (self.cond / "block").unlink()
+        self.wait_for("finished")
+        self.assertEqual(self.summary_after(), "project/New Session")
+        self.assertEqual(self.window()["@agent_owner_token"], "other-token")
+
+    def test_record_fallback_is_only_for_the_locked_condenser(self):
+        # Every other mode that checks ownership, given the full owner
+        # environment and a live frontend but an unbound resolve, stays inert
+        # and never even asks `valid`.
+        self.bind_direct("aaaa", "direct-token", 123)
+        self.hook("running")
+        self.assertEqual(self.hook("needs-approval")["@agent_state"], "needs-input")
+        record = json.loads(self.owners.read_text())["aaaa"]
+        env = dict(self.condenser_env(), AGENT_TAB_OWNER_TOKEN="direct-token",
+                   AGENT_TAB_OWNER_BINDING="direct-token:aaaa", AGENT_TAB_OWNER_RECORD=json.dumps(record))
+        env.pop("FAKE_FRONTEND")
+        before = self.state.read_text()
+        for argv in (["clear-current", "@7"], ["done", "opencode"], ["running", "opencode"]):
+            with self.subTest(argv=argv):
+                result = subprocess.run(["bash", str(self.script), *argv], input=json.dumps({"cwd": "/work/project"}),
+                                        env=env, cwd=self.root, capture_output=True, text=True, timeout=8)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.window()["@agent_state"], "needs-input")
+        self.assertFalse(Path(str(self.owners) + ".valid").exists())
+        windows = lambda text: json.loads(text)["windows"]
+        self.assertEqual(windows(self.state.read_text()), windows(before))
+        # Control: the locked condenser with the same environment does write.
+        result = subprocess.run(["bash", str(self.script), "condense", "@7", "project", "Locked condenser control"],
+                                env=env, cwd=self.root, capture_output=True, text=True, timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.window()["@agent_summary"], "project/Condensed title")
+        self.assertTrue(Path(str(self.owners) + ".valid").exists())
+
+    def test_condenser_outside_the_frontend_tree_needs_a_record(self):
+        # Hook-time code never takes the fallback: only the condenser, and only
+        # with the record its own hook resolved.
+        self.bind_direct("aaaa", "direct-token", 123)
+        self.hook("running")
+        env = dict(self.condenser_env(), AGENT_TAB_OWNER_TOKEN="direct-token",
+                   AGENT_TAB_OWNER_BINDING="direct-token:aaaa")
+        env.pop("FAKE_FRONTEND")
+        result = subprocess.run(["bash", str(self.script), "condense", "@7", "project", "No record given"],
+                                env=env, cwd=self.root, capture_output=True, text=True, timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(self.window().get("@agent_summary"), "project/Condensed title")
 
     def condenser_env(self):
         return dict(self.env, TMUX="/fake/owned,12,0", TMUX_PANE="%42",
@@ -356,6 +477,7 @@ class IndicatorIntegrationTests(unittest.TestCase):
         env = dict(self.env, PATH=os.environ["PATH"])
         env.pop("TMUX", None)
         env.pop("TMUX_PANE", None)
+        socket = None
         try:
             result = subprocess.run(command + ["new-session", "-d", "-s", "smoke", "-P", "-F",
                 "#{pane_id}|#{socket_path}", "/bin/sleep 30"], text=True, capture_output=True, env=env, timeout=5)
@@ -376,6 +498,8 @@ class IndicatorIntegrationTests(unittest.TestCase):
                 self.assertEqual(value, expected)
         finally:
             subprocess.run(command + ["kill-server"], capture_output=True, timeout=5)
+            if socket:  # kill-server can leave the socket file behind
+                Path(socket).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

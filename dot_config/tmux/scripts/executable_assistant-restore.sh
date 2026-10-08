@@ -66,11 +66,35 @@ capture_json="$(printf '%s\n' "${capture_env[@]+"${capture_env[@]}"}" | jq -Rsc 
 # jq forks per entry. q is posix_quote(). cli_args are whitespace-split and
 # quoted per token, so a glob like `claude-opus-5-5[1m]` stays literal. Fields
 # are \x1f-joined so an empty one survives `read`.
+#
+# Codex rows drop every saved `-c model_context_window=…` (ctxdrop): the wrapper
+# prepends a fresh one, and a saved copy later in argv would win and pile up
+# one more per save/restore. Same spellings as context_override() in
+# resurrect-save-repair.py; value-taking flags keep their operand (VALUE_FLAGS
+# there, also mirrored in closed-tabs.sh build_cmd) and nothing after `--` is
+# touched.
 read -r -d '' JQ_PROG <<'JQ'
 def q: "'" + gsub("'"; "'\"'\"'") + "'";
+def vflag: . as $w | any(("-c", "--config", "--enable", "--disable", "-C", "--cd", "-m", "--model",
+  "-p", "--profile", "-s", "--sandbox", "-a", "--ask-for-approval", "-i", "--image", "--add-dir",
+  "--local-provider", "--remote"); . == $w);
+def mcw: split("=")[0] == "model_context_window";
+def ctxdrop:
+  reduce .[] as $w ({out: [], pend: null, lit: false};
+    if .lit then .out += [$w]
+    elif .pend != null then
+      (if (.pend == "-c" or .pend == "--config") and ($w | mcw) then .out |= .[:-1] else .out += [$w] end)
+      | .pend = null
+    elif $w == "--" then .out += [$w] | .lit = true
+    elif ($w | vflag) then .out += [$w] | .pend = $w
+    elif ($w | test("^(-c|--config)=")) and ($w | sub("^[^=]*="; "") | mcw) then .
+    elif ($w | test("^-c[^-=]")) and ($w[2:] | mcw) then .
+    else .out += [$w] end)
+  | .out;
 (.sessions // [])[]
 | . as $e
-| ((.cli_args // "") | [splits("[ \t\n]+")] | map(select(length > 0)) | map(" " + q) | join("")) as $args
+| ((.cli_args // "") | [splits("[ \t\n]+")] | map(select(length > 0))
+   | if $e.tool == "codex" then ctxdrop else . end | map(" " + q) | join("")) as $args
 | (if (.model // "") != "" and .tool == "claude" and ((.cli_args // "") | contains("--model") | not)
    then " --model " + (.model | q) else "" end) as $model
 | ([$cap[] as $v | (($e.env // {})[$v] // "") | tostring

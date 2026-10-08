@@ -196,6 +196,10 @@ lands (or if `copilot` fails), the tab shows `project/<raw title>`
 **Condenser lifetime and locking.** Title jobs run through `tmux run-shell -b`,
 so hook process-group cleanup cannot kill them. The launch carries shell-quoted
 terminal ownership and runtime settings; job output stays off the user’s pane.
+For a Codex direct binding that includes the resolved owner record
+(`AGENT_TAB_OWNER_RECORD`): the job cannot re-resolve one from outside the
+frontend's process tree, so `owner_current` has `codex-terminal-owner valid`
+check that record instead (see codex-terminal-ownership.md).
 A per-title `.flock` file uses an OS advisory lock held through the worker’s
 lifetime. The kernel releases it on exit, including SIGKILL; the file remains
 and is never unlinked. Old `.lock` directories are ignored, so an abandoned

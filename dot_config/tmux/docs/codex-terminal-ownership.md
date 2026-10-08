@@ -57,7 +57,12 @@ wrapper forces `--no-daemon`. Unbound is safer than guessing a pane.
 
 The tmux indicator, CuaNotch hook and `codex-session-track` all consume the
 resolved binding and exit quietly when it is unbound. Detached title
-condensers check ownership again before writing. Notch navigation and
+condensers check ownership again before writing. A condenser runs under the
+tmux server, outside the frontend's process tree, so for a direct binding it
+passes the record its hook resolved to `codex-terminal-owner valid THREAD_ID
+TOKEN` (record on stdin): the token must hash from that record's pid, start
+time, socket and pane, and that process must still be live on the pane's TTY.
+Notch navigation and
 acknowledgment require the exact socket/pane for Codex; an unresolved session
 remains visible but cannot jump to a guessed terminal. No hook definitions are
 changed and no hook-trust bypass is used.

@@ -196,10 +196,46 @@ build_cmd() {
     [ -n "$sid" ] || return 0
     # shellcheck source=/dev/null
     source "$(dirname "$RESURRECT_SAVE")/lib-detect.sh" 2>/dev/null || return 0
-    local q_args="" a
+    local q_args="" a v i=0 n literal=0 words=()
     set -f
-    for a in $cli_args; do q_args+=" $(posix_quote "$a")"; done
+    words=($cli_args)
     set +f
+    n=${#words[@]}
+    while [ "$i" -lt "$n" ]; do
+        a=${words[i]}
+        i=$((i + 1))
+        # Codex: drop every saved `-c model_context_window=…` (the spellings
+        # resurrect-save-repair.py's context_override() drops). The wrapper
+        # prepends a fresh one; a saved copy sits later, wins, and each
+        # close/reopen used to add another, pinning the old catalog maximum.
+        # A value-taking flag keeps its operand whatever it looks like, and
+        # nothing after `--` is touched. Flag list = VALUE_FLAGS in
+        # resurrect-save-repair.py (also in assistant-restore.sh's JQ_PROG).
+        if [ "$tool" = codex ] && [ "$literal" = 0 ]; then
+            case "$a" in
+            --) literal=1 ;;
+            -c|--config)
+                if [ "$i" -lt "$n" ] && [ "${words[i]%%=*}" = model_context_window ]; then
+                    i=$((i + 1))
+                    continue
+                fi
+                if [ "$i" -lt "$n" ]; then
+                    q_args+=" $(posix_quote "$a") $(posix_quote "${words[i]}")"
+                    i=$((i + 1))
+                    continue
+                fi ;;
+            --enable|--disable|-C|--cd|-m|--model|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-i|--image|--add-dir|--local-provider|--remote)
+                if [ "$i" -lt "$n" ]; then
+                    q_args+=" $(posix_quote "$a") $(posix_quote "${words[i]}")"
+                    i=$((i + 1))
+                    continue
+                fi ;;
+            -c=*|--config=*) v=${a#*=}; [ "${v%%=*}" = model_context_window ] && continue ;;
+            -c[!-=]*) v=${a#-c}; [ "${v%%=*}" = model_context_window ] && continue ;;
+            esac
+        fi
+        q_args+=" $(posix_quote "$a")"
+    done
     # Only the variables @assistant-resurrect-capture-env lists, as a prefix.
     [ -n "$env_json" ] || env_json='{}'
     local env_prefix="" var val

@@ -55,8 +55,24 @@ def pane_snapshot(socket):
     return panes
 
 
+def context_override(value):
+    """True for a `-c` value that sets model_context_window.
+
+    The ~/.local/bin/codex wrapper (codex-max-context.py) prepends a fresh
+    `-c model_context_window=<catalog max>` to every interactive launch. A
+    saved copy would sit later in the restored argv and win, so each
+    save/restore cycle added another and kept the old maximum after a catalog
+    bump. Leaving it out lets the wrapper's fresh value stand alone.
+    """
+    return value.split("=", 1)[0].strip() == "model_context_window"
+
+
 def codex_args(command, drop_prompt=False):
     """(restorable flags, `resume` id, model) from a frontend's command line.
+
+    `-c model_context_window=…` is dropped in every spelling (context_override);
+    --no-daemon is kept, since the wrapper adds it only when absent and it is
+    the unverified fallback's evidence in standalone_entry().
 
     drop_prompt: the thread is already known from evidence tied to the process,
     so an initial prompt is left out (resuming must not send it again). ps
@@ -100,10 +116,14 @@ def codex_args(command, drop_prompt=False):
                 if index >= len(words):
                     raise ValueError("Missing Codex option operand")
                 value = words[index]
-            if flag != "--remote" or not re.fullmatch(r"unix:///tmp/cx-tmux-[^/]+/s", value):
+            if flag in ("-c", "--config") and context_override(value):
+                pass
+            elif flag != "--remote" or not re.fullmatch(r"unix:///tmp/cx-tmux-[^/]+/s", value):
                 kept.extend([word] if separator else [word, value])
             if flag in ("--model", "-m"):
                 model = value
+        elif re.fullmatch(r"-c[^-=].*", word) and context_override(word[2:]):
+            pass  # clap's attached short form, -cmodel_context_window=N
         elif word.startswith("-") and word != "--":
             kept.append(word)
         elif not drop_prompt:
@@ -394,7 +414,20 @@ def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_d
         if pane["target"] not in targets:
             invalid += 1
             continue
-        arguments, resume, model = codex_args(run(["ps", "-p", str(record["frontend_pid"]), "-o", "command="]))
+        command = run(["ps", "-p", str(record["frontend_pid"]), "-o", "command="])
+        # The verified binding ties this thread to the process, so a launch
+        # prompt is left out (as for a verified standalone row). A command
+        # line that still cannot be restored is one invalid row: raising here
+        # used to abort the whole repair, and the plugin's unrepaired rows then
+        # kept their stale `-c model_context_window` copies, among other things.
+        try:
+            arguments, resume, model = codex_args(command)
+        except ValueError:
+            try:
+                arguments, resume, model = codex_args(command, drop_prompt=True)
+            except ValueError:
+                invalid += 1
+                continue
         selected = selected_session(record, sid, resume, codex_home, tracker_dir)
         if not selected or not owner.valid(record):
             invalid += 1

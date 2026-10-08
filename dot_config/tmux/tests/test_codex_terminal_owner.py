@@ -1,6 +1,7 @@
 """Isolated transport/ownership regressions; never writes to a real tmux server."""
 import contextlib
 import importlib.util
+import io
 import os
 from pathlib import Path
 import sqlite3
@@ -94,6 +95,87 @@ class OwnershipTests(unittest.TestCase):
              patch.object(owner, 'capture', side_effect=capture):
             record = owner.direct_owner(sid)
         return record, (captured[0][0] if captured else None)
+
+    def test_real_direct_record_through_real_valid(self):
+        # No patched capture()/valid(): only the ps and tmux transport is fake.
+        with sqlite3.connect(self.root / 'state_5.sqlite') as db:
+            db.execute('CREATE TABLE threads (id TEXT, thread_source TEXT, source TEXT, agent_path TEXT)')
+            db.execute("INSERT INTO threads VALUES ('root', 'user', 'cli', NULL)")
+        world = dict(start='Thu Oct  8 12:00:00 2026', tty='ttys042', pane_tty='/dev/ttys042', pane_pid=41,
+                     alive=True)
+        tree = {300: '200 /bin/sh -c bash agent-tab-indicator.sh running codex',
+                200: '41 /opt/codex --no-daemon -c model_context_window=1', 41: '1 -zsh'}
+
+        def fake_run(args, **kwargs):
+            if args[:2] == ['ps', '-p'] and args[3:] == ['-o', 'ppid=,command=']:
+                line = tree.get(int(args[2]))
+                return SimpleNamespace(returncode=0 if line else 1, stdout=line or '')
+            if args[:2] == ['ps', '-p'] and args[3:] == ['-o', 'lstart=,tty=']:
+                ok = int(args[2]) == 200 and world['alive']
+                return SimpleNamespace(returncode=0 if ok else 1,
+                                       stdout=f"{world['start']} {world['tty']}" if ok else '')
+            if args[:3] == ['tmux', '-S', '/tmp/test-socket'] and args[3:7] == ['display-message', '-p', '-t', '%1']:
+                return SimpleNamespace(returncode=0, stdout=f"%1\t{world['pane_tty']}\t{world['pane_pid']}\t@3")
+            return SimpleNamespace(returncode=1, stdout='')
+
+        env = dict(CODEX_HOME=str(self.root), TMUX='/tmp/test-socket,1,0', TMUX_PANE='%1')
+        real_realpath = owner.os.path.realpath
+        with patch.dict(os.environ, env), patch.object(owner, 'run', side_effect=fake_run), \
+                patch.object(owner.os, 'getppid', return_value=300), \
+                patch.object(owner.os.path, 'realpath',
+                             side_effect=lambda p: p if p == '/tmp/test-socket' else real_realpath(p)):
+            record = owner.direct_owner('root')
+            self.assertIsNotNone(record)
+            self.assertEqual((record['frontend_pid'], record['tty'], record['pane_pid'], record['direct']),
+                             (200, 'ttys042', 41, True))
+            # The JSON round trip the indicator's env var takes.
+            record = owner.json.loads(owner.json.dumps(record))
+            token = record['token']
+            self.assertTrue(owner.direct_valid('root', token, record))
+            for change in (dict(start='Thu Oct  8 12:30:00 2026'),  # pid reused by a later process
+                           dict(alive=False),                       # frontend exited
+                           dict(tty='ttys043'),                     # process on another terminal
+                           dict(pane_tty='/dev/ttys043'),           # pane now on another tty
+                           dict(pane_pid=99)):                      # pane respawned
+                with self.subTest(change=change):
+                    saved = dict(world)
+                    world.update(change)
+                    self.assertFalse(owner.direct_valid('root', token, record))
+                    world.clear()
+                    world.update(saved)
+            self.assertTrue(owner.direct_valid('root', token, record))
+
+    def test_direct_record_vouches_only_for_its_own_live_frontend(self):
+        # The tab indicator's detached title condenser cannot re-run the
+        # ancestor walk, so it presents the record its hook resolved.
+        record, _ = self.walk({300: '200 sh', 200: '1 /x/codex --no-daemon'})
+        sid, token = record['session_id'], record['token']
+        with patch.object(owner, 'valid', return_value=True) as live:
+            self.assertTrue(owner.direct_valid(sid, token, record))
+            live.assert_called_with(record)
+            self.assertFalse(owner.direct_valid('other', token, record))
+            self.assertFalse(owner.direct_valid(sid, 'other-token', record))
+            # A record cannot claim a token its own identity does not hash to.
+            for forged in (dict(record, frontend_pid=201), dict(record, frontend_start='later'),
+                           dict(record, pane='%2'), dict(record, tmux_socket='/tmp/other')):
+                self.assertFalse(owner.direct_valid(sid, token, forged))
+            self.assertFalse(owner.direct_valid(sid, token, dict(record, direct=False)))
+            self.assertFalse(owner.direct_valid(sid, token, {k: v for k, v in record.items() if k != 'direct'}))
+            for garbage in (None, [], {}, dict(direct=True, session_id=sid, token=token)):
+                self.assertFalse(owner.direct_valid(sid, token, garbage))
+        # An exited or replaced frontend (valid() fails) never vouches.
+        with patch.object(owner, 'valid', return_value=False):
+            self.assertFalse(owner.direct_valid(sid, token, record))
+        # CLI: `valid <sid> <token>` with the record on stdin, exit status only.
+        for live, stdin, code in ((True, owner.json.dumps(record), 0), (False, owner.json.dumps(record), 1),
+                                  (True, '{', 1)):
+            with self.subTest(live=live, stdin=stdin[:5]), contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(owner, 'valid', return_value=live))
+                stack.enter_context(patch.object(owner.sys, 'argv', ['codex-terminal-owner', 'valid', sid, token]))
+                stack.enter_context(patch.object(owner.sys, 'stdin', io.StringIO(stdin)))
+                with self.assertRaises(SystemExit) as exited:
+                    owner.main()
+                self.assertEqual(exited.exception.code, code)
 
     def test_bare_bun_frontend_binds_its_native_child(self):
         # `codex` from ~/.bun/bin (no wrapper, no --no-daemon) with no daemon
