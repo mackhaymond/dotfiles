@@ -1,0 +1,68 @@
+#!/bin/bash
+# agent-ui: build the Rust agent sidebar (WezTerm CMD+B) and Option-W menu from
+# the crate in the chezmoi SOURCE tree, and install it as ~/.local/bin/agent-ui.
+# The crate itself never reaches ~/.config (.chezmoiignore), and target/ lives
+# in ~/.cache/agent-ui. Without the binary, tmux.conf and wezterm.lua fall back
+# to scripts/agent-roster.py, so a machine with no Rust still works.
+# Docs: ~/.config/tmux/docs/agent-roster.md "agent-ui".
+#
+# run_onchange: chezmoi re-runs this whenever the rendered text changes, i.e.
+# whenever the hash below does. It covers Cargo.toml, Cargo.lock and every file
+# under src/ (globbed at render time, so files added later count too), plus
+# where cargo is: a first apply on a machine without Rust records a run, and
+# installing Rust later changes this line, so the next apply builds.
+#
+# By hand (same thing, ignores the hash):
+#   chezmoi execute-template < ~/.local/share/chezmoi/.chezmoiscripts/run_onchange_after_zz-build-agent-ui.sh.tmpl | bash
+{{- $crate := joinPath .chezmoi.sourceDir "dot_config/tmux/agent-ui" }}
+{{- $files := list (joinPath $crate "Cargo.toml") (joinPath $crate "Cargo.lock") }}
+{{- range (glob (joinPath $crate "src/**")) }}
+{{-   if not (stat .).isDir }}{{ $files = append $files . }}{{ end }}
+{{- end }}
+{{- $sums := "" }}
+{{- range (sortAlpha $files) }}
+{{-   $sums = printf "%s%s  %s\n" $sums (include . | sha256sum) (trimPrefix $crate .) }}
+{{- end }}
+#
+# crate inputs: {{ len $files }} files, sha256 {{ $sums | sha256sum }}
+# cargo at render time: {{ lookPath "cargo" | default "(not on PATH)" }}
+set -euo pipefail
+
+CRATE={{ $crate | quote }}
+TARGET_DIR="$HOME/.cache/agent-ui/target"
+DEST="$HOME/.local/bin/agent-ui"
+
+# The user's PATH first; then the usual homes of cargo (rustup's proxies,
+# Homebrew) in case chezmoi was started with a thin PATH.
+export PATH="$PATH:${CARGO_HOME:-$HOME/.cargo}/bin:$HOME/.cargo/bin:{{ .homebrew_prefix }}/bin"
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "[agent-ui] cargo not found; not building (tmux/WezTerm use agent-roster.py instead)"
+    exit 0
+fi
+
+echo "[agent-ui] cargo build --release --locked in $CRATE"
+cd "$CRATE"
+if ! CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release --locked; then
+    echo "[agent-ui] build FAILED; $DEST left as it was" >&2
+    exit 1
+fi
+
+BIN="$TARGET_DIR/release/agent-ui"
+if [ -x "$DEST" ] && cmp -s "$BIN" "$DEST"; then
+    echo "[agent-ui] $DEST is up to date"
+    exit 0
+fi
+
+# Atomic replace: copy next to the destination, then rename over it. A running
+# sidebar or menu keeps executing the old inode; copying over the file in place
+# would change the pages under it (and on macOS invalidate its signature).
+mkdir -p "$(dirname "$DEST")"
+TMP="$(mktemp "$DEST.new.XXXXXX")"
+if cp "$BIN" "$TMP" && chmod 755 "$TMP" && mv -f "$TMP" "$DEST"; then
+    echo "[agent-ui] installed $DEST"
+else
+    rm -f "$TMP"
+    echo "[agent-ui] install FAILED; $DEST left as it was" >&2
+    exit 1
+fi

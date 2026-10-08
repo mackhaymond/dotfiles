@@ -483,6 +483,12 @@ bind-key D   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{cl
 # CMD+Z still undoes it), H park, / filter, a all windows, r restart the
 # watcher, esc closes. See the header of scripts/agent-roster.py.
 #
+# Two implementations: agent-ui (Rust, primary; re-bound below the Option-W
+# line when ~/.local/bin/agent-ui exists) and scripts/agent-roster.py, bound
+# right here as the FALLBACK. Keep these python lines as they are: the python
+# strip's ☰ button (roster_popup_argv) and tests/test_agent_roster.py
+# compare against `bind-key q`. docs/agent-roster.md "agent-ui".
+#
 # Through run-shell on purpose: display-popup does NOT expand formats in its
 # own command, and the roster has to be told which client opened it. -C makes
 # it a tmux command, not a shell one: no `zsh -c` (~20 ms, mostly .zshenv's
@@ -501,13 +507,36 @@ bind-key C-q run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T 
 # and Option-A (btop) on the left hand:  W above S, X below it.
 #   Option-S  next tab that needs you      (= prefix d)
 #   Option-X  back to where the jumps began (= prefix D)
-#   Option-W  the agent roster popup        (= prefix q)
+#   Option-W  the agent menu popup          (= prefix q; agent-ui, below)
 # Root-table bindings take these chords from whatever runs in the pane (zsh's
 # M-w/M-x, Claude Code's Meta keys) - deliberate. The prefix keys stay as
 # fallbacks.
 bind-key -n M-s run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
 bind-key -n M-x run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{client_tty}'"
 bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
+
+# agent-ui MENU (primary): when ~/.local/bin/agent-ui is installed, the same
+# three keys are re-bound to `agent-ui menu`; the python lines above stay as
+# the fallback. agent-ui is a Rust binary built from the crate in the chezmoi
+# source (dot_config/tmux/agent-ui) by the run_onchange_after_zz-build-agent-ui
+# script on `chezmoi apply`; docs/agent-roster.md "agent-ui".
+#
+# It draws its own rounded border and title, so the popup is -B and has no -T.
+# Same run-shell -C / argv-form launch as above, minus dash: the binary is
+# exec'd directly by the popup, no shell anywhere. Option-W inside the menu
+# closes it (it arrives as ESC w).
+#
+# The binary is checked ONCE, here, when the config is loaded (one /bin/sh,
+# ~2 ms per reload), not per keypress: tmux formats cannot test for a file,
+# and a per-press `if-shell 'test -x …'` costs a /bin/sh fork on every open
+# (numbers in docs/agent-roster.md). So after installing or removing the
+# binary, reload the config (prefix r) to switch. Force the python fallback:
+# `rm ~/.local/bin/agent-ui`, then prefix r.
+if-shell "test -x '{{ .chezmoi.homeDir }}/.local/bin/agent-ui'" {
+    bind-key q      run-shell -C "display-popup -c '#{client_tty}' -E -B -w 75% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
+    bind-key C-q    run-shell -C "display-popup -c '#{client_tty}' -E -B -w 75% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
+    bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -B -w 75% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
+}
 
 # Double-tap hyper or right shift in WezTerm (Karabiner, karabiner-base.json) flips
 # back to the previous one of these, like the same double-tap does for Arc tabs:

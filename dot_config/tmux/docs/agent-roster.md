@@ -5,6 +5,72 @@ It is a **reader**: everything it shows comes from the per-window options the
 hook pipeline already maintains (see [agent-tab-indicator.md](agent-tab-indicator.md)).
 It keeps no state and runs only while the popup is open.
 
+Two implementations exist. **agent-ui** (Rust, see [below](#agent-ui-primary-and-the-python-fallback))
+is the primary one for both the Option-W popup and the CMD+B sidebar.
+`scripts/agent-roster.py`, which most of this page describes, is the
+**fallback**, used when the binary is not installed.
+
+## agent-ui (primary) and the Python fallback
+
+`~/.local/bin/agent-ui` is one ratatui/crossterm binary for both surfaces:
+
+| Surface | Command |
+|---|---|
+| Option-W / `prefix q` / `prefix C-q` popup | `agent-ui menu --client <tty> [--tab all\|needs\|working\|idle\|parked]` |
+| CMD+B WezTerm sidebar | `agent-ui sidebar [--client <tty>]` (wezterm.lua also passes `--tmux-pane`, `--wezterm`) |
+| screenshot / test render | `agent-ui sidebar --once WxH`, `agent-ui menu --client <tty> --once WxH` |
+
+- **Source**: the crate lives only in the chezmoi source tree,
+  `~/.local/share/chezmoi/dot_config/tmux/agent-ui/` (`.chezmoiignore` keeps
+  it out of `~/.config`).
+- **Build**: `chezmoi apply` runs
+  `.chezmoiscripts/run_onchange_after_zz-build-agent-ui.sh.tmpl`, which runs
+  `cargo build --release --locked` with `CARGO_TARGET_DIR=~/.cache/agent-ui/target`
+  and installs the result to `~/.local/bin/agent-ui` atomically (copy to a
+  temp file beside it, then `mv`), so a running sidebar or menu keeps its old
+  inode. It re-runs whenever `Cargo.toml`, `Cargo.lock` or any file under
+  `src/` changes (a hash of all of them is rendered into the script), or when
+  cargo appears on PATH. No cargo: one line, exit 0, the fallback stays in use.
+  A failed build prints cargo's error and exits non-zero, so chezmoi reports
+  it; the installed binary is left alone.
+- **Rebuild by hand** (ignores the hash):
+  `chezmoi execute-template < ~/.local/share/chezmoi/.chezmoiscripts/run_onchange_after_zz-build-agent-ui.sh.tmpl | bash`.
+  It is idempotent: cargo is a no-op and an identical binary is not reinstalled.
+- **Which one runs**:
+  - tmux checks for the binary once, when tmux.conf is loaded: the python
+    bindings are written first, then an `if-shell "test -x …/agent-ui"` block
+    re-binds q, C-q and M-w to `display-popup -E -B -w 75% -h 75% …/agent-ui
+    menu --client '#{client_tty}'`. agent-ui draws its own rounded border and
+    title, hence `-B` and no `-T`. After installing or removing the binary,
+    `prefix r`.
+  - WezTerm checks at every CMD+B (`io.open`, no fork), so no reload is needed.
+- **Force the fallback**: `rm ~/.local/bin/agent-ui`, then `prefix r`. The next
+  `chezmoi apply` reinstalls it only if the crate changed. To get it back
+  sooner, rebuild by hand as above.
+
+Why the popup's choice is made at load time (keypress → first frame, private
+`tmux -L` server with `-f /dev/null`, one window, a real client in a pty,
+`send-keys -K M-w`, until the menu has drawn the window's name; send-keys
+round trip subtracted; 20-50 runs each at load 6-10, 2026-10-08):
+
+| Binding | median | min |
+|---|---|---|
+| python fallback (unchanged line) | ~41 ms | ~39 ms |
+| agent-ui, chosen at config load (**used**) | ~8-13 ms | ~7 ms |
+| agent-ui via `if-shell -F '#{@agent_ui}'`, option set at load | ~11-14 ms | ~6 ms |
+| agent-ui via `if-shell "test -x …"` on every press | ~11-17 ms | ~9-12 ms |
+| agent-ui via `run-shell "test -x … && tmux display-popup …"` | ~19-20 ms | ~15 ms |
+
+tmux 3.7 formats cannot test for a file, so a per-press check needs a fork:
+`if-shell` with a shell command costs a `/bin/sh` (+2-4 ms), and plain
+`run-shell` a `zsh -c` plus a tmux client (+~10 ms). `if-shell -F` on an
+option set at load is no cheaper than binding the right command at load, and
+just as stale. Binding at load also keeps the python `bind-key q` / `C-q`
+lines verbatim, which `BindingTests` and `roster_popup_argv` (the python
+strip's ☰ button) compare against. The test server has one window; on the
+real one (169 windows) the first tmux snapshot takes longer (~9 ms for the
+python), the same for every variant.
+
 | Key | Does |
 |---|---|
 | **Option-W**, or `prefix q` / `prefix C-q` | open the roster |
@@ -169,7 +235,10 @@ a digit back, any other key drops it and does its own thing.
 
 An always-visible, click-only agent list in a narrow WezTerm split to the
 left of the tmux pane. `CMD+B` (wezterm.lua) opens it, and closes it again if
-the tab already has one. It is this same program, `agent-roster.py --strip`.
+the tab already has one. It runs `agent-ui sidebar` when
+`~/.local/bin/agent-ui` exists (see [agent-ui](#agent-ui-primary-and-the-python-fallback));
+otherwise this same program, `agent-roster.py --strip`, which the rest of
+this section describes.
 
 - **Layout** (designed for 34-40 columns, any height, **never scrolls**):
 
@@ -313,15 +382,20 @@ the tab already has one. It is this same program, `agent-roster.py --strip`.
   var it sets on start (OSC 1337 `SetUserVar=agent_strip=1`), by its title
   `agent-strip`, or by the pane id recorded in `wezterm.GLOBAL` when it was
   split off (covers the ~30 ms before python paints, so a fast double CMD+B
-  cannot stack two). Open: `pane:split{direction="Left", size=34,
-  top_level=true, args=…}`, then the tmux pane is re-activated. Close:
-  `wezterm cli kill-pane` in the background (the Lua Pane has no kill, and
-  CloseCurrentPane would close the active pane, i.e. tmux); the strip exits
-  cleanly on the SIGHUP.
+  cannot stack two). agent-ui sets the same user var and title. Open:
+  `pane:split{direction="Left", size=34, top_level=true, args=strip_argv(pane)}`,
+  then the tmux pane is re-activated. `strip_argv` picks
+  `~/.local/bin/agent-ui sidebar` if `io.open` finds it, else the python
+  line below, and appends `--tmux-pane <id> --wezterm <exe>` to either.
+  Close: `wezterm cli kill-pane` in the background (the Lua Pane has no
+  kill, and CloseCurrentPane would close the active pane, i.e. tmux); either
+  implementation exits quietly on the SIGHUP.
 - **Absolute paths**: WezTerm launched from the Dock has a thin PATH, so the
-  split runs `/bin/dash -c` with the same python choice as prefix q (Homebrew
-  `python3 -I -S`, else `/usr/bin/python3 -S`), sets `PATH` to Homebrew's bin
-  + the system dirs (agent-jump.sh and stash.sh call `tmux`), and passes
+  split runs agent-ui by its full path, or `/bin/dash -c` with the same python
+  choice as prefix q (Homebrew `python3 -I -S`, else `/usr/bin/python3 -S`),
+  sets `PATH` to Homebrew's bin + the system dirs (agent-jump.sh and stash.sh
+  call `tmux`), sets `LANG` / `LC_CTYPE` to `en_US.UTF-8` (a Dock launch has
+  no locale, and the strip is all box-drawing and state glyphs), and passes
   `--wezterm <executable_dir>/wezterm`.
 - **Window size**: while the strip is open the tmux client is 35 columns
   narrower (34 + the split line); tmux resizes the window as for any terminal
@@ -379,16 +453,26 @@ through tmux command parsing, so it was left out.
 
 ## Troubleshooting
 
-- **Popup flashes and vanishes**: run it by hand in a pane to see the error:
+- **Which implementation is bound**: `tmux list-keys -T root M-w` shows
+  `…/agent-ui menu` or the python line. Not what you expect: check
+  `test -x ~/.local/bin/agent-ui`, then `prefix r`.
+- **agent-ui popup flashes and vanishes**: run it by hand in a pane,
+  `~/.local/bin/agent-ui menu --client "$(tmux display -p '#{client_tty}')"`
+  (same care as below: it really moves that client), or render one frame
+  with `--once 120x40`. If the binary was removed since the last config load,
+  `prefix r` switches back to python. A build that fails shows up in
+  `chezmoi apply`'s output; rebuild by hand to see cargo's error again.
+- **Popup flashes and vanishes** (python): run it by hand in a pane to see the error:
   `/opt/homebrew/bin/python3 -I -S ~/.config/tmux/scripts/agent-roster.py --client "$(tmux display -p '#{client_tty}')"`
   (or `/usr/bin/python3 -S …` when Homebrew's python is missing).
   Careful: Space/⏎/`g` in that copy really do move that client.
 - **Strip says `no tmux client`**: the other pane in its tab is not an
   attached tmux client (e.g. tmux was detached). It re-checks every 5 s.
 - **CMD+B does nothing**: `wezterm show-keys | grep -w b` should list
-  `SUPER b -> EmitEvent(...)`; run the strip by hand
-  (`/opt/homebrew/bin/python3 -I -S ~/.config/tmux/scripts/agent-roster.py --strip`
-  inside a WezTerm split) to see a traceback.
+  `SUPER b -> EmitEvent(...)`; run the strip by hand inside a WezTerm split
+  to see the error: `~/.local/bin/agent-ui sidebar` (or `agent-ui sidebar
+  --once 34x40` for one frame), or for the fallback
+  `/opt/homebrew/bin/python3 -I -S ~/.config/tmux/scripts/agent-roster.py --strip`.
 - **Red "client is gone" banner**: the tty passed in no longer matches an
   attached client (for example, the terminal was reattached). Close the popup and reopen it.
 - **Ages all read the same**: `@agent_since` ("<epoch> <state>") is stamped at

@@ -114,15 +114,23 @@ local quit_guard = wezterm.action_callback(function(window, pane)
 end)
 
 -- ── CMD+B: agent strip ─────────────────────────────────────────────────
--- An always-visible, click-only agent list in a narrow split LEFT of the tmux
--- pane: ~/.config/tmux/scripts/agent-roster.py --strip (the prefix q roster's
--- model in a 34-column layout; docs/agent-roster.md "WezTerm strip"). CMD+B
--- opens it, or closes it if this tab already has one.
+-- An always-visible agent list (the sidebar) in a narrow split LEFT of the
+-- tmux pane. CMD+B opens it, or closes it if this tab already has one.
+--
+-- Two implementations, chosen at each CMD+B (one io.open, no fork):
+--   ~/.local/bin/agent-ui sidebar   primary: the Rust binary, built from the
+--       chezmoi source crate dot_config/tmux/agent-ui on `chezmoi apply`
+--       (.chezmoiscripts/run_onchange_after_zz-build-agent-ui.sh.tmpl);
+--   ~/.config/tmux/scripts/agent-roster.py --strip   the fallback when the
+--       binary is missing (no Rust on this machine, or `rm` it to force this).
+-- Both take --tmux-pane / --wezterm and both mark their pane the same way, so
+-- everything below works for either. docs/agent-roster.md "agent-ui" and
+-- "WezTerm strip".
 --
 -- The strip is found by the user var it sets on start (OSC 1337 SetUserVar
--- agent_strip=1), by its title, or by the pane id recorded here when it was
--- split off (covers the ~30 ms before python has painted anything, so a fast
--- double CMD+B can never stack two strips).
+-- agent_strip=1), by its title (agent-strip), or by the pane id recorded here
+-- when it was split off (covers the moment before it has painted anything, so
+-- a fast double CMD+B can never stack two strips).
 --
 -- Focus: pane:split makes the new pane active, and every CMD shortcut above
 -- is a SendKey to the ACTIVE pane, so the tmux pane is re-activated at once;
@@ -130,13 +138,37 @@ end)
 -- shrinks by STRIP_COLS + 1 columns while the strip is open (tmux resizes the
 -- window to the client, as for any terminal resize).
 --
--- Absolute paths only: a WezTerm launched from the Dock has a thin PATH. The
--- python choice is the same as tmux's prefix q binding (Homebrew python3
--- -I -S, else /usr/bin/python3 -S, which must keep its pycache prefix).
+-- Absolute paths only: a WezTerm launched from the Dock has a thin PATH, and
+-- no LANG either: the split gets a UTF-8 locale explicitly, since the strip
+-- draws box-drawing and state glyphs. The python choice is the same as tmux's
+-- prefix q fallback (Homebrew python3 -I -S, else /usr/bin/python3 -S, which
+-- must keep its pycache prefix).
 local STRIP_COLS = 34
+local AGENT_UI = wezterm.home_dir .. "/.local/bin/agent-ui"
 local STRIP_SCRIPT = wezterm.home_dir .. "/.config/tmux/scripts/agent-roster.py"
 local STRIP_PY = '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S "$0" "$@"; '
     .. 'exec /usr/bin/python3 -S "$0" "$@"'
+
+-- agent-ui if it is installed, else the python strip. Checked per CMD+B, so
+-- installing or removing the binary takes effect without a config reload.
+local function strip_argv(tmux_pane)
+    local tail = {
+        "--tmux-pane", tostring(tmux_pane:pane_id()),
+        "--wezterm", wezterm.executable_dir .. "/wezterm",
+    }
+    local head
+    local f = io.open(AGENT_UI, "rb")
+    if f then
+        f:close()
+        head = { AGENT_UI, "sidebar" }
+    else
+        head = { "/bin/dash", "-c", STRIP_PY, STRIP_SCRIPT, "--strip" }
+    end
+    for _, a in ipairs(tail) do
+        table.insert(head, a)
+    end
+    return head
+end
 
 local function strip_key(tab)
     return "agent_strip_tab_" .. tostring(tab:tab_id())
@@ -172,13 +204,11 @@ local toggle_strip = wezterm.action_callback(function(window, pane)
         direction = "Left",
         size = STRIP_COLS,          -- >= 1: a cell count, not a fraction
         top_level = true,
-        args = {
-            "/bin/dash", "-c", STRIP_PY, STRIP_SCRIPT, "--strip",
-            "--tmux-pane", tostring(pane:pane_id()),
-            "--wezterm", wezterm.executable_dir .. "/wezterm",
-        },
+        args = strip_argv(pane),
         set_environment_variables = {
             PATH = "{{ .homebrew_prefix }}/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            LANG = "en_US.UTF-8",
+            LC_CTYPE = "en_US.UTF-8",
         },
     }
     if new then

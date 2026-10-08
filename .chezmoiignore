@@ -12,6 +12,12 @@ OPERATIONS.md
 .config/wezterm/.git/**
 .config/tmux/.git/**
 .config/tmux/.sisyphus/**
+# agent-ui is a Rust crate built FROM the source tree into ~/.local/bin by
+# .chezmoiscripts/run_onchange_after_zz-build-agent-ui.sh.tmpl; no copy of the
+# sources (or a stray target/) belongs in ~/.config. The bare line keeps the
+# empty directory out too.
+.config/tmux/agent-ui
+.config/tmux/agent-ui/**
 .tmux/resurrect/**
 .vim/**
 
