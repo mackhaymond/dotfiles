@@ -68,6 +68,18 @@ Two per-window tmux user options are the single source of truth:
 - `@agent_workflow` — `1` while a background Claude Workflow is in flight (else unset); set by the watcher, orthogonal to `@agent_state`
 - `@agent_cua` — `1` while the agent is driving an app through cua-driver (lingers up to `CUA_LIVE`, 60 s); set by the watcher
 - `@agent_rollout` — codex only: the thread's rollout path, stashed by the indicator so the watcher can tell a live turn from an interrupted one
+- `@agent_kind` — `claude | codex`: whose hooks drive the window. Written by any indicator hook that writes state or detail (in the same command list), unset with the state by `clear_state` and the watcher GC. Never written by the focus hook or a no-op heartbeat.
+- `@agent_detail_kind` + `@agent_detail` — what the event that set the state was *about*, for the sidebar (not rendered in the tab bar):
+
+  | Kind | Event | `@agent_detail` |
+  |---|---|---|
+  | `run` | `UserPromptSubmit` | first non-empty line of the prompt |
+  | `perm` | `PermissionRequest` (and `Notification`/`permission_prompt`) | tool name + its most identifying input: `command`, `file_path` (cwd-relative, else `~/…`), `url` (scheme/`www.` stripped), `pattern`, `path`, `query`, `description`… — e.g. `Bash git push origin main`, `Edit scripts/foo.py`, `WebFetch example.com` |
+  | `ask` | `PermissionRequest` with `tool_name=AskUserQuestion` | the first question's text |
+  | `fail` | `StopFailure` | `<error>: <error_details>` (either half), else `turn failed` |
+  | `done` | `Stop` | first non-empty line of `last_assistant_message` (Claude, verified 2.1.294; Codex sends the same field); Claude without the field falls back to the last assistant text in the transcript's last 64 KB; else `turn finished` |
+
+  Both are written by `set_state` in the **same tmux command list** as `@agent_state`/`@agent_since`, even when the state itself is unchanged, so a reader never pairs a new state with an older event's detail. Unset by `SessionStart` (except `source=compact`, which fires mid-turn), by `clear_state`, and by the watcher GC; never touched by the heartbeat (it stays fork-free) or the focus discharge. A `Notification` names no tool, so it never overwrites a `perm`/`ask` its `PermissionRequest` twin already wrote (one extra `show-options`, only on that event); landing first, it stands in as `perm <Tool>` parsed from "…permission to use <Tool>". The detail of a `Stop` held `running` by background work is still `done`. Text is untrusted and sanitized in the same jq call that extracts it (one fork per event): one line, no `#` `"` `%`, no control characters (C0, DEL, C1, U+2028/9) and no invisible/bidi controls (U+200B–200F, U+202A–202E, U+2060–2069, U+FEFF, U+061C), whitespace collapsed, leading/trailing `;`/space dropped (a tmux argv element ending in `;` terminates the command list), ≤ 80 code points with a trailing `…` when cut. Every value is sliced (4000, then 1000 code points) *before* any per-character work: unbounded, the sanitizer was quadratic (a 152 KB heredoc took 16 s), which blocks a permission dialog or prompt submission and gets a Codex hook killed at its 10 s timeout, state write included; bounded, a 1 MB payload costs ~20 ms of jq, and a jq failure yields the bare kind, never a lost state write. The detail rides in globals (`dkind`/`dtext`, consumed by the next `set_state`), so every call site stays `set_state "$win" <state>` — cua-notch's `dev/check-invariants` pins `        set_state "$win" failed` verbatim. Values reach tmux only as `set-option` argv: stored verbatim, and `list-windows -F '#{@agent_detail}'` expands them without re-parsing formats inside (checked on a scratch tmux 3.7c server).
 
 Three components maintain and render them:
 

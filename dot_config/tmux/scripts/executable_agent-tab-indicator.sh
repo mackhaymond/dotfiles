@@ -29,6 +29,14 @@
 #                   to answer its prompt). The next heartbeat consumes it to
 #                   restore `running` when the answered turn resumes; every
 #                   other lifecycle mode clears it so it can't go stale.
+#   @agent_kind     claude | codex — which agent's hooks drive this window;
+#                   written with any state/detail write a hook makes
+#   @agent_detail_kind  perm | ask | fail | done | run — what the last event
+#                   was about (see DETAIL_JQ); @agent_detail = one sanitized
+#                   line for it (≤80 chars). Both written in set_state's
+#                   command list, unset by SessionStart and clear_state, never
+#                   touched by the heartbeat. Not rendered in the tab bar —
+#                   they feed the sidebar (`list-windows -F '#{@agent_detail}'`).
 #
 # Rendering happens entirely in tmux.conf: the Catppuccin window formats
 # read these options via #{?…} conditionals (background tint per state,
@@ -103,6 +111,9 @@ command -v tmux >/dev/null 2>&1 || exit 0
 
 mode="${1:-}"
 agent="${2:-}"
+# The sidebar detail the next set_state writes (see set_state/take_detail).
+dkind=""
+dtext=""
 
 JQ="$(command -v jq || true)"
 # Codex hooks run in a shared app-server. Its inherited TMUX_PANE belongs to
@@ -231,14 +242,43 @@ set_state() {
     # ONE tmux invocation for both: the server runs a command list as a unit,
     # so the watcher's snapshot can't land between them and restamp the new
     # state against a stale stamp (and it saves a fork).
-    local win="$1" new="$2" cur ts
+    #
+    # The globals dkind/dtext (set by take_detail, or dkind=- to unset) are
+    # the @agent_detail_kind / @agent_detail for the event that caused this
+    # transition; empty dkind leaves them. CONSUMED here (reset on entry), so
+    # a detail is written by exactly the one set_state its mode meant it for.
+    # Globals rather than arguments so every call site keeps the plain
+    # `set_state "$win" <state>` shape — cua-notch's dev/check-invariants pins
+    # `        set_state "$win" failed` verbatim (its failure-state agree).
+    # They ride in the SAME command list, unconditionally (an unchanged state
+    # can still carry a new detail: a second gate, a new question), so a
+    # reader never pairs a new state with the previous event's detail.
+    # @agent_kind rides along on any write made by an agent hook. The
+    # heartbeat sets no detail, so its no-change call stays fork-free.
+    # The detail is never rendered by the status line: no refresh for it.
+    local win="$1" new="$2" dk="$dkind" dt="$dtext" cur ts
+    local -a cmd=()
+    dkind=""; dtext=""
     owns_window "$win" || return 0
     cur=$(window_state "$win")
-    [ "$cur" = "$new" ] && return 0
-    printf -v ts '%(%s)T' -1 2>/dev/null || ts=$(date +%s)
-    tmux set-option -w -t "$win" @agent_state "$new" \; \
-         set-option -w -t "$win" @agent_since "$ts $new" 2>/dev/null || true
-    tmux refresh-client -S 2>/dev/null || true
+    if [ "$cur" != "$new" ]; then
+        printf -v ts '%(%s)T' -1 2>/dev/null || ts=$(date +%s)
+        cmd=(set-option -w -t "$win" @agent_state "$new" \;
+             set-option -w -t "$win" @agent_since "$ts $new")
+    fi
+    if [ "$dk" = - ]; then
+        cmd+=(${cmd[0]+\;} set-option -uw -t "$win" @agent_detail_kind \;
+              set-option -uw -t "$win" @agent_detail)
+    elif [ -n "$dk" ]; then
+        cmd+=(${cmd[0]+\;} set-option -w -t "$win" @agent_detail_kind "$dk" \;
+              set-option -w -t "$win" @agent_detail "$dt")
+    fi
+    [ "${#cmd[@]}" -gt 0 ] || return 0
+    case "$agent" in
+        claude|codex) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
+    esac
+    tmux "${cmd[@]}" 2>/dev/null || true
+    [ "$cur" = "$new" ] || tmux refresh-client -S 2>/dev/null || true
 }
 
 clear_state() {
@@ -253,6 +293,10 @@ clear_state() {
     tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_since 2>/dev/null || true
+    # The sidebar's per-window fields (see set_state), one call for all three.
+    tmux set-option -uw -t "$win" @agent_kind \; \
+         set-option -uw -t "$win" @agent_detail_kind \; \
+         set-option -uw -t "$win" @agent_detail 2>/dev/null || true
     if [ -n "$cur" ]; then
         tmux refresh-client -S 2>/dev/null || true
     fi
@@ -517,6 +561,125 @@ extract_summary() {
     fi
     [ -n "$title" ] || return 0
     printf '%s\t%s' "$src" "$title"
+}
+
+# --- sidebar detail: @agent_detail_kind + @agent_detail ---------------------
+#
+# What the event that set the state was ABOUT, for a sidebar to show next to
+# it. Kinds: perm (a permission gate: tool + the identifying part of its
+# input), ask (AskUserQuestion: the first question), fail (StopFailure: the
+# error), done (Stop: first line of the final assistant message), run
+# (UserPromptSubmit: first line of the prompt). Written with the state in one
+# tmux command list by set_state; unset by SessionStart and clear_state.
+#
+# The text is untrusted (a prompt, a model reply, a tool input), and it only
+# ever reaches tmux as a set-option ARGV element: set-option stores it
+# verbatim and `#{@agent_detail}` expands it without re-parsing formats inside
+# it (verified on a scratch server, tmux 3.7c). The sanitizer still matches
+# @agent_summary's — one line, no '#', '"', '%', no control characters,
+# whitespace collapsed — plus one tmux-argv rule: an argument ENDING in ';'
+# terminates the command list (tmux strips it, and turns a trailing '\;' into
+# ';'), so trailing semicolons are dropped. Invisible/bidi controls (zero-
+# widths, LRE..RLO, LRI..PDI, BOM, ALM) become spaces, so a payload can't
+# reorder or hide sidebar text. Bounded to 80 characters with a trailing '…'.
+# Done in jq, which the payload already needs: it slices by code point (a
+# byte cut can split a UTF-8 sequence) and the whole extraction is ONE fork
+# per event.
+# EVERY value is sliced BEFORE any per-character work: str caps at 4000 code
+# points, clean at 1000. Unbounded, explode|map|implode|gsub was quadratic in
+# the input — a 152 KB heredoc Bash command took 16 s, 1 MB over five
+# minutes — and PermissionRequest/UserPromptSubmit block the user's dialog /
+# prompt (codex kills a hook at 10 s, losing the state write with it). Bounded,
+# the cost is jq's linear parse of the payload, which this hook already pays
+# in its other jq reads; a jq failure yields no output and take_detail falls
+# back to the bare kind, so a detail problem can never cost the state write.
+# Output: "<kind>\t<text>" — or "note\t<text>" for a Notification that names
+# no tool (see needs-approval).
+DETAIL_JQ='
+def invisible: (. >= 8203 and . <= 8207) or (. >= 8234 and . <= 8238)
+  or (. >= 8288 and . <= 8297) or . == 65279 or . == 1564 or . == 8232 or . == 8233;
+def clean:
+  tostring | .[0:1000] | explode
+  | map(if . < 32 or (. >= 127 and . < 160) or invisible then 32
+        elif . == 34 or . == 35 or . == 37 then empty else . end)
+  | implode | gsub("\\s+"; " ") | sub("^[ ;]+"; "") | sub("[ ;]+$"; "")
+  | if length > 80 then (.[0:79] | sub("[ ;]+$"; "")) + "…" else . end;
+def str: (if type == "string" then . elif type == "array" then .[0:200] | map(tostring) | join(" ")
+          elif . == null then "" else tostring end) | .[0:4000];
+def firstline: str | split("\n") | map(select(test("\\S"))) | (first // "");
+def rel($cwd): (env.HOME // "") as $h
+  | if $cwd != "" and startswith($cwd + "/") then .[($cwd | length) + 1:]
+    elif $h != "" and startswith($h + "/") then "~/" + .[($h | length) + 1:]
+    else . end;
+def toolarg($cwd):
+  if type != "object" then str
+  elif (.command // .cmd) != null then (.command // .cmd) | str
+  elif .file_path != null then .file_path | str | rel($cwd)
+  elif .notebook_path != null then .notebook_path | str | rel($cwd)
+  elif .url != null then .url | str | sub("^[A-Za-z][A-Za-z0-9+.-]*://"; "") | sub("^www\\."; "")
+  elif .pattern != null then .pattern | str
+  elif .path != null then .path | str | rel($cwd)
+  elif .query != null then .query | str
+  elif .description != null then .description | str
+  elif .skill != null then .skill | str
+  elif .prompt != null then .prompt | firstline
+  else [.[] | select(type == "string" and . != "")] | (first // "") end;
+def detail($mode):
+  (.cwd // "" | str) as $cwd
+  | if $mode == "running" then "run\t" + (.prompt | firstline | clean)
+    elif $mode == "needs-approval" then
+      (.tool_name // "" | str) as $tool
+      | if $tool == "AskUserQuestion" then
+          "ask\t" + (((try .tool_input.questions[0].question catch null)
+                      // (try .tool_input.question catch null) // "") | firstline | clean)
+        elif $tool != "" then
+          "perm\t" + ([$tool, (.tool_input | toolarg($cwd))] | map(select(. != "")) | join(" ") | clean)
+        else
+          "note\t" + (.message // "" | str
+                      | (capture("permission to use (?<t>.+)$").t // .) | clean)
+        end
+    elif $mode == "failed" then
+      "fail\t" + ([(.error | if type == "object" then (.message // .type // "") else str end),
+                   (.error_details | str)]
+                  | map(select(. != "")) | join(": ") | firstline | clean)
+    elif $mode == "done" then "done\t" + (.last_assistant_message | firstline | clean)
+    else empty end;
+'
+
+# Emits "<kind>\t<text>" for $1 from the global $payload (empty on no jq/
+# payload; the caller then falls back to the mode's bare kind). Claude's Stop
+# payload carries last_assistant_message (captured from 2.1.294; codex sends
+# the same field); an older Claude without it gets the transcript tail that
+# extract_summary already reads — bounded to 64KB, only on that fallback.
+detail_for() {
+    local mode="$1" out="" tp
+    if [ -n "$JQ" ] && [ -n "$payload" ]; then
+        out=$("$JQ" -r --arg mode "$mode" "$DETAIL_JQ"'detail($mode)' <<<"$payload" 2>/dev/null || true)
+    fi
+    if [ "$mode" = done ] && [ "$agent" = claude ] && [ -n "$JQ" ] && [ -z "${out#*$'\t'}" ]; then
+        tp=$("$JQ" -r '.transcript_path // empty' <<<"$payload" 2>/dev/null || true)
+        if [ -n "$tp" ] && [ -f "$tp" ]; then
+            out=$(tail -c 65536 "$tp" 2>/dev/null | grep -F '"type":"assistant"' \
+                | "$JQ" -Rrn "$DETAIL_JQ"'[inputs | fromjson?
+                    | [.message.content[]? | select(.type? == "text") | .text]
+                    | select(length > 0) | join("\n")]
+                  | {last_assistant_message: (last // "")} | detail("done")' 2>/dev/null || true)
+        fi
+    fi
+    printf '%s' "$out"
+}
+
+# Sets globals dkind/dtext for set_state: detail_for's answer, else $2 (the
+# mode's kind) with empty text; empty text falls back to $3.
+take_detail() {
+    local out
+    out=$(detail_for "$1")
+    if [ -n "$out" ]; then
+        dkind="${out%%$'\t'*}"; dtext="${out#*$'\t'}"
+    else
+        dkind="$2"; dtext=""
+    fi
+    [ -n "$dtext" ] || dtext="${3:-}"
 }
 
 # ------------------------------------------------------------ entry modes
@@ -803,6 +966,7 @@ case "$mode" in
             src=$("$JQ" -r '.source // empty' <<<"$payload" 2>/dev/null || true)
             [ "$src" = "compact" ] && exit 0
         fi
+        dkind=-   # SessionStart: a new conversation has no detail yet
         set_state "$win" idle
         clear_pending "$win"
         summary=$(extract_summary "$payload")
@@ -822,6 +986,7 @@ case "$mode" in
         fi
         ;;
     running)
+        take_detail running run
         set_state "$win" running
         clear_pending "$win"
         compose_summary "$win" "$(extract_summary "$payload")" "$payload"
@@ -845,6 +1010,20 @@ case "$mode" in
         # with @agent_pending stamped so the heartbeat re-arms `running`
         # once the answered turn resumes. Switching away first still gets
         # the yellow, so a prompt is never silently lost.
+        #
+        # Detail: PermissionRequest names the tool (perm, or ask for
+        # AskUserQuestion); the Notification half of the same gate names
+        # nothing ("note"), so it must not overwrite the richer detail its
+        # twin already wrote — one extra read, only on that event. If it lands
+        # first, its "needs your permission to use <Tool>" stands in until the
+        # PermissionRequest replaces it.
+        take_detail needs-approval perm
+        if [ "$dkind" = note ]; then
+            case "$(tmux show-options -wqv -t "$win" @agent_detail_kind 2>/dev/null || true)" in
+                perm|ask) dkind="" ;;
+                *) dkind=perm ;;
+            esac
+        fi
         if viewing_now; then
             set_state "$win" idle
             tmux set-option -w -t "$win" @agent_pending "$(now_epoch)" 2>/dev/null || true
@@ -855,6 +1034,7 @@ case "$mode" in
     failed)
         # The turn itself died (529, overloaded). RED, and red now means
         # exactly this — nothing is waiting on an answer, something broke.
+        take_detail failed fail "turn failed"
         set_state "$win" failed
         ;;
     done)
@@ -875,6 +1055,9 @@ case "$mode" in
                 bg_pending=1
             fi
         fi
+        # The detail is the Stop's either way: even a turn held `running` by
+        # background work has a final message worth showing.
+        take_detail done done "turn finished"
         if [ "$bg_pending" -eq 1 ]; then
             set_state "$win" running
             compose_summary "$win" "$(extract_summary "$payload")" "$payload"

@@ -604,7 +604,7 @@ declare -A PID_TTY=() PID_NEXT=() TTY_PID=()   # pid->tty|-, its rebuild, tty->l
 pid_cache_age=0
 PID_CACHE_TICKS=60
 # Per-window fields of the tick's one tmux read (see the ONE READ note).
-declare -A W_SEEN=() W_PID=() W_STATE=() W_WAC=() W_SINCE=() W_WF=() W_CUA=() W_ROLL=() W_SUM=()
+declare -A W_SEEN=() W_PID=() W_STATE=() W_WAC=() W_SINCE=() W_WF=() W_CUA=() W_ROLL=() W_SUM=() W_DET=()
 wins=()
 
 # Tick trace (see TICK TRACE in the header). Tested once per tick, builtin.
@@ -836,11 +836,15 @@ EOF
     # agent died and the watcher GC'd its state), which is why the GC also
     # keys on it. @agent_since rides along: "<epoch> <state>", see the stamp
     # below. Rollout paths (see codex_status) live under ~/.codex/sessions.
+    # @agent_kind / @agent_detail_kind (the sidebar's fields, written by the
+    # indicator) are bare tokens, read only so a window holding nothing else
+    # still leaves the fast path and gets collected; @agent_detail always
+    # travels with its kind, so the free text itself is never read here.
     #
     # A row only counts if it starts with a window id and carries a /dev/
     # tty, so a line that is not a pane row (a summary with an embedded
     # newline continues on its own line) can never be taken for a window.
-    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_summary}" 2>/dev/null); then
+    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_summary}" 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
@@ -862,18 +866,18 @@ EOF
     # pane that runs a headless `claude -p` has an agent pane (W_PID) and
     # gets the full path - seeded, stamped, and garbage-collected once it
     # exits, exactly like any other window.
-    W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_SUM=()
+    W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_SUM=(); W_DET=()
     wins=()
-    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll summary; do
+    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind summary; do
         case "$win" in @*) ;; *) continue ;; esac
         case "$tty" in /dev/?*) ;; *) continue ;; esac
         if [ -z "${W_SEEN[$win]+x}" ]; then
             W_SEEN[$win]=1
             wins+=("$win")
-            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${summary}" ]; then
+            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${akind}${dkind}${summary}" ]; then
                 W_STATE[$win]="$state"; W_WAC[$win]="$wac"; W_SINCE[$win]="$since"
                 W_WF[$win]="$wf_opt"; W_CUA[$win]="$cua_opt"; W_ROLL[$win]="$roll"
-                W_SUM[$win]="$summary"
+                W_SUM[$win]="$summary"; W_DET[$win]="${akind}${dkind}"
             fi
         fi
         tty="${tty#/dev/}"
@@ -956,7 +960,8 @@ EOF
                 esac ;;
         esac
         has_agent=0; [ -n "$pid" ] && has_agent=1
-        has_summary=0; [ -n "${W_SUM[$win]:-}" ] && has_summary=1
+        # A leftover sidebar kind/detail is collectable exactly like a summary.
+        has_summary=0; [ -n "${W_SUM[$win]:-}${W_DET[$win]:-}" ] && has_summary=1
         had_wf=0; [ -n "${W_WF[$win]:-}" ] && had_wf=1
         had_cua=0; [ -n "${W_CUA[$win]:-}" ] && had_cua=1
 
@@ -1050,6 +1055,9 @@ EOF
                 tmux set-option -uw -t "$win" @agent_rollout 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null
+                tmux set-option -uw -t "$win" @agent_kind \; \
+                     set-option -uw -t "$win" @agent_detail_kind \; \
+                     set-option -uw -t "$win" @agent_detail 2>/dev/null
                 changed=1
                 state=""
             else
