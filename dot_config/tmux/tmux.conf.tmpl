@@ -392,10 +392,18 @@ set -g @catppuccin_window_current_text "#{?#{@agent_workflow},#[fg=#{?#{||:#{@st
 # focus discharges a tab's attention state (needs-input/done → idle) the
 # moment you switch to it - and a yellow/green that lands while you are
 # already sitting on that tab with WezTerm frontmost never tints at all (the
-# hook and the watcher both test that). NOTE: this occupies after-select-window[0]; new
-# handlers must use explicit indices ([1]+) or they'll overwrite this one.
+# hook and the watcher both test that). NOTE: this occupies after-select-window[0]
+# and client-session-changed[0]; new handlers must use explicit indices ([1]+)
+# or they'll overwrite these.
+# Both hooks, because a cross-session jump (agent-jump.sh, Option-S) whose
+# target is ALREADY its session's current window makes select-window a no-op,
+# and tmux then expands the after-select-window #{window_id} against the
+# client's OLD session: the tab you land on never discharged until the
+# watcher's once-a-second seen-it backstop caught it. client-session-changed
+# expands #{window_id} in the session the client just arrived in.
 run-shell -b "bash #{HOME}/.config/tmux/scripts/agent-tab-watcher.sh"
 set-hook -g after-select-window 'run-shell -b "#{HOME}/.config/tmux/scripts/agent-tab-indicator.sh clear-current #{window_id}"'
+set-hook -g 'client-session-changed[0]' 'run-shell -b "#{HOME}/.config/tmux/scripts/agent-tab-indicator.sh clear-current #{window_id}"'
 # CuaNotch (notch glow indicator): instant visit acknowledgment — dismisses a
 # finished agent's green / subsides a needs-input blaze the moment its tab is
 # focused. Explicit [1] index to coexist with agent-tab-indicator above.

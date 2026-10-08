@@ -38,8 +38,12 @@
 # session, then the first linked session that is not excluded. A named session
 # must still hold the window, and is refused like any other if it is an
 # EXCLUDE session. The =<session>:<win> target keeps select and switch
-# in the same session. The hook's #{window_id} is the command's target, so
-# it discharges the right window even before the client arrives, and client-session-changed[1] then
+# in the same session. When the select CHANGES the session's window, the
+# hook's #{window_id} is the command's target, so it discharges the right
+# window even before the client arrives. When the target is already that
+# session's current window the select is a no-op and the hook expands
+# against the client's old session instead; client-session-changed[0] (the
+# same clear-current) covers that case, and client-session-changed[1] then
 # runs cua-notch-visit for the notch. The client is checked BEFORE the select:
 # a select whose switch then fails would discharge a tint nobody saw.
 #
