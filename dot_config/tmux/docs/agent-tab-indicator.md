@@ -212,9 +212,10 @@ re-probing the pin.
 
 Singleton, spawned from tmux.conf, polls every 1 s. The pulse is NOT
 driven by that loop any more (2026-10-07): a tick is 1 s of sleep *plus* its
-work (`ps -ax` ~250 ms, the subagent scan ~450 ms, a cold
-`resolve_session_bases` ~1.5 s per session every 60 s), so per-tick toggling
-gave 1.7 s phases with 4–6 s spikes. A forked child, `blink_loop`, owns
+work (`ps -ax` ~250 ms, then a per-file subagent scan ~450 ms and a cold
+compaction-lineage walk ~1.5 s per session every 60 s — both since cut, see
+"No compaction lineage walk" below), so per-tick toggling gave 1.7 s phases
+with 4–6 s spikes. A forked child, `blink_loop`, owns
 `@agent_blink` and flips it every second while the loop's flag file
 (`$TMPDIR/agent-tab-blink.$UID`) exists; the loop only raises or lowers the
 flag (any window `running`, a workflow, or cua). The child exits as soon as
@@ -398,16 +399,54 @@ mtime+size. CuaNotch's `tallyNotifications`/`subagentInterrupted` apply the
 same three rules; `check-invariants` pins the tag, the marker, the tail
 budget and the hour.
 
-**Compaction moves the runtime dir** (2026-08-25). After a compaction
-`~/.claude/sessions/<pid>.json` can go on reporting the *original* sessionId
-for a while, but the continued conversation gets a new id and its transcript,
-`subagents/` and `workflows/` all move under it — the watcher looked in the
-empty old dir, showed no gear, and a park SIGTERMed a session with two
-reviewers out. `resolve_session_bases` now follows the lineage: a descendant is
-a transcript whose `"isCompactSummary":true` record names the old transcript's
-path on the same line (a bare mention of the id is not enough — sessions quote
-ids in conversation all day), walked transitively and cached per pid+sid for
-a minute. Both subagent and workflow checks run over every dir in the chain.
+**Cost: one `stat` per session.** Sessions carry dozens of subagent
+transcripts, so the subagent check stats the parent transcript and every
+`agent-*.jsonl` in ONE `stat -f '%m %z %N'` call per session, reads the
+parent's notifications at most once, and forks `tail` only for a file whose
+mtime+size changed; the workflow check forks nothing unless a runtime dir
+lacks its completion file. The parent is read by a python that seeks to its
+last offset itself (BSD `tail -c +N` took 3.2 s on a 41 MB parent) and is
+the first non-shim `python3` on PATH (the pyenv shim the watcher inherits
+costs ~260 ms per call; re-resolved if it vanishes).
+
+The **first** read of a parent is bounded, not from byte 0: a notice older
+than now − 1 h − grace can never finish an in-window subagent, so it starts
+at the last assistant record stamped before that minus an hour. Assistant
+records are the anchor because transcript timestamps are not in file order —
+a queued `<task-notification>` is stamped when queued and written later
+(trailing by up to 70 min; hook attachments by up to 78 h), and an assistant
+record is stamped when its streaming started but written when it ended, so a
+notice written just before one can carry a later stamp (worst seen across 198
+parents on 2026-10-07: 788 s). Hence the hour of slack. No anchor found → it reads everything.
+Bounded and full reads gave identical answers for every live session.
+
+Transcript text is untrusted: notification ids must be `[A-Za-z0-9_-]+` and
+epochs all digits before anything reaches `$(( ))` — a crafted
+`<task-id>abc=a[$(cmd)]</task-id>` used to run `cmd` through bash
+arithmetic (fixed 2026-10-07; the unit test reproduces it).
+
+Measured 2026-10-07 at load average ~200, both checks, all 14 live sessions:
+cold (first tick) 213–279 ms total, warm 138–151 ms. The parts: a session
+with no `subagents/` dir costs under 1 ms, and one whose dir holds only
+stale transcripts still pays its one `stat` (5–15 ms at that load). A
+session with in-window subagents also pays a python run (~20 ms startup at
+best) on its first read and whenever its parent has grown: 40–90 ms cold,
+5–45 ms warm.
+
+**No compaction lineage walk** (removed 2026-10-07). On 2026-08-25 a
+compacted session's `subagents/` had moved under a new sessionId while
+`~/.claude/sessions/<pid>.json` still reported the old one, so the guards
+looked in an empty dir and a park SIGTERMed two live reviewers.
+`resolve_session_bases` then grew a transitive walk that grepped every
+transcript in the project for an `"isCompactSummary":true` record naming the
+old transcript — 643 MB, ~8 s per session, cached only 60 s, which made
+watcher ticks take tens of seconds. Measured 2026-10-07 across all 1.9 GB of
+`~/.claude/projects`: 6 transcripts carry a compaction summary and every one
+references only itself — current Claude Code compacts in place, so the
+sessions file's id is authoritative and the walk is gone. If Claude Code ever
+reverts to new-id compaction, that tab loses its gear and `stash.sh`'s park
+guard can't see that session's subagents; the signature is a compaction
+summary naming a *different* `<sid>.jsonl`.
 
 **Staleness rule** (changed 2026-08-19): a runtime dir counts as live iff one
 of its transcripts (`agent-*.jsonl` / `journal.jsonl`) moved in the **last

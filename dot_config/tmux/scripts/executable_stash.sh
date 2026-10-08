@@ -587,7 +587,8 @@ is_working() {
 # was missing on 2026-08-25). Both die with the process, so the kill path
 # must see them even when the watcher is dead.
 #
-# The detection — resolve_session_bases (the compaction-chain walk),
+# The detection — resolve_session_bases (the sessions file's own id; the
+# compaction-chain walk was removed 2026-10-07, see the lib's header),
 # session_has_running_subagent (finished = the parent was TOLD the result)
 # and session_has_running_workflow (live = runtime dir without its
 # completion file) — is SHARED with agent-tab-watcher.sh via this lib, so
