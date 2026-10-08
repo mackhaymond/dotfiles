@@ -82,6 +82,10 @@ and the time since `@agent_since`.
   Careful: Space/⏎/`g` in that copy really do move that client.
 - **Red "client is gone" banner**: the tty passed in no longer matches an
   attached client (for example, the terminal was reattached). Close the popup and reopen it.
-- **Ages all read the same**: `@agent_since` is stamped by the watcher, so
-  every window it found already running when it was first deployed shows that
-  moment. Ages become accurate from the next state change.
+- **Ages all read the same**: `@agent_since` ("<epoch> <state>") is stamped at
+  each transition by the hook's `set_state` (agent-tab-indicator.sh). The
+  watcher is the backstop: it stamps changes that bypass the hook (the seen-it
+  discharge, the stuck-running reconcile, the GC) and seeds windows it finds
+  with no stamp (the idle seed). So every window the watcher seeded at once,
+  for example on first deploy, shows that same moment. Ages become accurate
+  from the next state change.

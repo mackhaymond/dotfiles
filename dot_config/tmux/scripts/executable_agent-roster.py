@@ -148,7 +148,13 @@ def rank(w):
 
 def build_items(windows, needs, cur_win, show_all=False, parked_open=False, query=""):
     """The list as rows. Each item is a dict with kind in
-    label | sess | win | parked; only win and parked are selectable."""
+    label | sess | win | parked; only win and parked are selectable.
+
+    Selectable rows carry a POSITIONAL `key`, unique within the list. The same
+    window can appear twice (a NEEDS YOU row and its session-group row, or a
+    window linked into two sessions), so the window id alone cannot be the
+    selection: move() would always find the first copy and loop between
+    them. Actions still use it["w"]["id"]."""
     by_id = {w["id"]: w for w in windows}
     items = []
     q = query.lower()
@@ -156,12 +162,12 @@ def build_items(windows, needs, cur_win, show_all=False, parked_open=False, quer
         hits = [w for w in windows if w["session"] not in HIDDEN
                 and q in ("%s:%d %s" % (w["session"], w["index"], w["label"])).lower()]
         hits.sort(key=lambda w: (w["session"] == HOLD, -w["last_attached"], w["session"], w["index"]))
-        return [{"kind": "win", "w": w, "long": True} for w in hits]
+        return [{"kind": "win", "w": w, "long": True, "key": ("hit", w["session"], w["id"])} for w in hits]
 
-    need_rows = [by_id[i] for i in needs if i in by_id]
+    need_rows = [by_id[i] for i in dict.fromkeys(needs) if i in by_id]
     if need_rows:
         items.append({"kind": "label", "text": "NEEDS YOU"})
-        items.extend({"kind": "win", "w": w, "long": True} for w in need_rows)
+        items.extend({"kind": "win", "w": w, "long": True, "key": ("need", w["id"])} for w in need_rows)
 
     sessions = {}
     for w in windows:
@@ -177,16 +183,18 @@ def build_items(windows, needs, cur_win, show_all=False, parked_open=False, quer
             continue
         best = min(ws, key=rank)
         items.append({"kind": "sess", "name": s, "best": best if rank(best) < 9 else None})
-        items.extend({"kind": "win", "w": w, "long": False} for w in shown)
+        items.extend({"kind": "win", "w": w, "long": False, "key": ("sess", s, w["id"])} for w in shown)
 
     parked = sorted((w for w in windows if w["session"] == HOLD), key=lambda w: w["index"])
     if parked:
-        items.append({"kind": "parked", "n": len(parked), "attn": sum(1 for w in parked if is_attn(w))})
+        items.append({"kind": "parked", "n": len(parked), "attn": sum(1 for w in parked if is_attn(w)),
+                      "key": "parked-hdr"})
         # ALL of them, regardless of `a`: every parked tab was put there on
         # purpose, and a suspended agent has no @agent_state left to pass the
         # "is an agent" filter (that filter hid 4 of 5 here, 2026-10-07).
         if parked_open:
-            items.extend({"kind": "win", "w": w, "long": False, "parked": True} for w in parked)
+            items.extend({"kind": "win", "w": w, "long": False, "parked": True, "key": ("parked", w["id"])}
+                         for w in parked)
     return items
 
 
@@ -195,7 +203,13 @@ def selectable(items):
 
 
 def item_key(it):
-    return it["w"]["id"] if it["kind"] == "win" else ("parked" if it["kind"] == "parked" else None)
+    """The row's selection key (None for labels and session headers)."""
+    return it.get("key") if it["kind"] in ("win", "parked") else None
+
+
+def key_window(key):
+    """The window id a row key points at (the last element), else None."""
+    return key[-1] if isinstance(key, tuple) else None
 
 
 KEYSEQ = {"\x1b[A": "up", "\x1b[B": "down", "\x1bOA": "up", "\x1bOB": "down",
@@ -453,8 +467,18 @@ class Roster:
                                  self.parked_open, self.query)
         sel = selectable(self.items)
         keys = [item_key(self.items[i]) for i in sel]
-        if self.sel_key not in keys:
-            self.sel_key = self.cur_win if self.cur_win in keys else (keys[0] if keys else None)
+        if self.sel_key in keys:
+            return
+        # The row went away (filter typed/cleared, NEEDS YOU discharged, tab
+        # parked): another row for the same window, else the current window's
+        # session-group row, else the first row.
+        def row_for(wid):
+            if wid is None:
+                return None
+            rows = [k for k in keys if key_window(k) == wid]
+            return next((k for k in rows if k[0] == "sess"), rows[0] if rows else None)
+        self.sel_key = (row_for(key_window(self.sel_key)) or row_for(self.cur_win)
+                        or (keys[0] if keys else None))
 
     def selected(self):
         for it in self.items:
@@ -519,7 +543,9 @@ class Roster:
                 # SIGTERMs (suspends) the agent: behind y/n because the
                 # default selection is the window you are sitting on.
                 run_bg("'%s' stash '%s'" % (STASH, w["id"]))
-                self.say("parked %s" % w["label"])
+                # A request, not a fact: stash.sh refuses a busy agent, and
+                # says so on the status line, after this popup has moved on.
+                self.say("parking %s…" % w["label"])
             elif w["session"] == HOLD:
                 # A parked tab goes through stash.sh's own discard, which logs
                 # a suspended conversation's id (with the command that resumes

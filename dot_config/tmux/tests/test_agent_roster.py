@@ -226,7 +226,7 @@ class ActTests(unittest.TestCase):
         R.run_bg, R.agent_pane, R.subprocess.run, R.tmux = self.saved
 
     def test_park_needs_confirm(self):
-        self.assertEqual(self.r.sel_key, "@1")             # default: the window you are on
+        self.assertEqual(self.r.sel_key, ("sess", "main", "@1"))   # default: the window you are on
         self.assertFalse(self.r.act("H"))
         self.assertEqual(self.calls, [])                    # nothing parked yet
         self.assertEqual(self.r.confirm["action"], "park")
@@ -235,6 +235,7 @@ class ActTests(unittest.TestCase):
         self.r.act("H"); self.r.act("y")
         self.assertEqual(len(self.calls), 1)
         self.assertIn("stash '@1'", self.calls[0][1])
+        self.assertTrue(self.r.msg.startswith("parking "))  # a request: stash.sh may refuse a busy agent
 
     def test_typing_into_the_popup_parks_nothing(self):
         self.assertFalse(self.r.handle(list("Hello there")))
@@ -301,6 +302,77 @@ class ActTests(unittest.TestCase):
     def test_goto_closes_popup(self):
         self.assertTrue(self.r.act("enter"))
         self.assertEqual(self.calls[0][1][2:], ["goto", "/dev/ttys999", "@1"])
+
+
+class NavTests(unittest.TestCase):
+    """Selection keys are per ROW: a window listed twice must not trap move()."""
+    strip = staticmethod(lambda s: R.re.sub(r"\x1b\[[0-9;]*m", "", s))
+
+    def roster(self, text, needs, cur):
+        r = R.Roster("/dev/ttys999")
+        r.windows, r.needs, r.cur_win = R.parse_windows(text), needs, cur
+        r.rebuild()
+        return r
+
+    def walk(self, r, n):
+        seen = [r.sel_key]
+        for _ in range(n):
+            r.act("down")
+            seen.append(r.sel_key)
+        return seen
+
+    def highlighted(self, r):
+        return [l for l in r.render(80, 30, 1000) if R.bg("surface0") in l]   # the selection background
+
+    def test_down_passes_through_the_duplicate(self):
+        text = "\n".join([line("main", 1, "@1", "idle", "one"), line("main", 2, "@2", "needs-input", "two"),
+                          line("main", 3, "@3", "running", "three"), line("main", 4, "@4", "idle", "four")])
+        r = self.roster(text, ["@2"], "@1")
+        self.assertEqual(r.sel_key, ("sess", "main", "@1"))
+        r.sel_key = ("need", "@2")                           # top of the list
+        seen = self.walk(r, 8)
+        self.assertEqual(seen[:5], [("need", "@2"), ("sess", "main", "@1"), ("sess", "main", "@2"),
+                                    ("sess", "main", "@3"), ("sess", "main", "@4")])
+        self.assertEqual(set(seen[5:]), {("sess", "main", "@4")})   # stops at the bottom, no loop
+        for _ in range(8):
+            r.act("up")
+        self.assertEqual(r.sel_key, ("need", "@2"))
+        # Exactly one highlighted row, even on a window shown twice.
+        for key in (("need", "@2"), ("sess", "main", "@2")):
+            r.sel_key = key
+            hl = self.highlighted(r)
+            self.assertEqual(len(hl), 1, key)
+            self.assertIn("main:2" if key[0] == "need" else "  2", self.strip(hl[0]))
+            self.assertEqual(r.selected()["w"]["id"], "@2")
+
+    def test_linked_window_in_two_groups(self):
+        # list-windows -a reports a linked window once per session, same id.
+        text = "\n".join([line("a", 1, "@1", "idle", "one", attached=9),
+                          line("a", 2, "@5", "running", "shared", attached=9),
+                          line("b", 1, "@5", "running", "shared", attached=1),
+                          line("b", 2, "@6", "idle", "six", attached=1)])
+        r = self.roster(text, [], "@1")
+        seen = self.walk(r, 5)
+        self.assertEqual(seen[:4], [("sess", "a", "@1"), ("sess", "a", "@5"), ("sess", "b", "@5"),
+                                    ("sess", "b", "@6")])
+        r.sel_key = ("sess", "b", "@5")
+        self.assertEqual(len(self.highlighted(r)), 1)
+        self.assertEqual(r.selected()["w"]["id"], "@5")
+
+    def test_selection_survives_refresh_and_falls_back(self):
+        text = "\n".join([line("main", 1, "@1", "idle", "one"), line("main", 2, "@2", "needs-input", "two")])
+        r = self.roster(text, ["@2"], "@1")
+        r.sel_key = ("need", "@2")
+        r.rebuild()
+        self.assertEqual(r.sel_key, ("need", "@2"))          # same key kept across a tick
+        r.needs = []; r.rebuild()                            # discharged: same window's group row
+        self.assertEqual(r.sel_key, ("sess", "main", "@2"))
+        r.windows = R.parse_windows(line("main", 1, "@1", "idle", "one")); r.rebuild()
+        self.assertEqual(r.sel_key, ("sess", "main", "@1"))  # gone: the current window's row
+        r.query = "one"; r.rebuild()
+        self.assertEqual(r.sel_key, ("hit", "main", "@1"))
+        r.query = ""; r.rebuild()
+        self.assertEqual(r.sel_key, ("sess", "main", "@1"))
 
 
 class WidthTests(unittest.TestCase):
