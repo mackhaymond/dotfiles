@@ -178,3 +178,30 @@ lives in `~/code/projects/mackhaymond.co/CLAUDE.md`; follow it. The repo is
 PUBLIC: private entries go to KV, never into the repo. Mention the catalog
 update in your final summary. If you're unsure whether something belongs
 (a throwaway preview, a class project), ask in one line rather than skip.
+
+## Coding work: orchestrate, delegate, review continuously
+
+For any coding task bigger than a small single-file change, the main agent
+is the orchestrator, not the typist:
+
+- **Write plans for subagents to execute.** Break the work into units a
+  subagent can pick up cold: the goal, the files it owns, the interfaces it
+  must honor, and the postcondition (tests/commands) that proves it done.
+  Mark which units are independent (dispatch those together in one message)
+  and which wait on others. Parallel implementers must own disjoint files or
+  run with `isolation: "worktree"`, and each uses its own named pty.
+- **The main agent coordinates.** Dispatch units, read the diffs that come
+  back, integrate, resolve conflicts, keep the user posted. Don't take over
+  the bulk edits yourself; if a result is wrong, send it back to that agent
+  (SendMessage) with specifics, or re-dispatch.
+- **Review runs alongside the work, not after it.** As each unit lands, hand
+  its diff to a reviewer subagent (fresh context, never the author) to hunt
+  for bugs: correctness, edge cases, broken callers, error paths, races.
+  Reviewers check each finding against the code before reporting it
+  (`file:line` plus a concrete failing scenario) and drop what doesn't hold
+  up. Confirmed bugs get fixed before dependent units build on top of them.
+  Finish with one whole-change review pass before calling the task done.
+- **Scale it to the task.** A one-liner, a config tweak, or a question
+  doesn't need any of this; just do it. Run only as many concurrent agents
+  as the work needs (each costs battery and usage limit) and say in the plan
+  how many you intend to use.
