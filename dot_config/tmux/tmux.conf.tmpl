@@ -620,6 +620,12 @@ set -gw window-status-activity-style default
 # is not a catppuccin module.
 run-shell "#{HOME}/.config/tmux/scripts/stash-statusline.sh"
 
+# Also after tpm: re-assert continuum's autosave hook in status-right, which
+# continuum itself skips whenever a stray `tmux -L` test server is running
+# (that silently stopped every autosave for ~38 h; see the script's header).
+# Default server only, so test servers never autosave into ~/.tmux/resurrect.
+run-shell "#{HOME}/.config/tmux/scripts/continuum-ensure.sh"
+
 # Also after tpm, because catppuccin.tmux hardcodes status-right-length 100 and
 # would clobber an earlier setting. 100 cells fits the collapsed percent view
 # (~77) but not the prefix+u reset view: "S: 3h10m (3h15m) W: Mon 6pm in 6d4h
