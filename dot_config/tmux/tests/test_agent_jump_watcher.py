@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 
@@ -72,6 +73,10 @@ with p.with_suffix(".lock").open("a") as lock:
             for pn in s["panes"]:
                 v = wvars(s, pn["window"]); v["pane_tty"] = pn["tty"]
                 out.append(render(arg(c, "-F"), v))
+                # -a walks sessions, so a linked window's panes are listed once per link too.
+                for ls in s["windows"][pn["window"]].get("links", []):
+                    v = dict(v, session_name=ls)
+                    out.append(render(arg(c, "-F"), v))
         elif cmd == "list-clients":
             for cl in s["clients"]:
                 out.append(render(arg(c, "-F"), {"client_tty": cl["tty"], "session_name": cl["session"],
@@ -164,6 +169,13 @@ if [ $# = 4 ] && [ "$1" = -o ] && [ "$2" = tty=,pid=,comm= ] && [ "$3" = -p ]; t
 fi
 case " $* " in *" -ax "*|*" -A "*|*" -e "*) echo "fake ps: all-process listing: $*" >&2; exit 3 ;; esac
 exec /bin/ps "$@"
+"""
+
+# A pass-through `stat` that logs its argv, one line per call, so a test can
+# count the forks the watcher (and the session lib) still make.
+FAKE_STAT = r"""#!/bin/sh
+[ -n "$FAKE_STAT_LOG" ] && echo "$*" >> "$FAKE_STAT_LOG"
+exec /usr/bin/stat "$@"
 """
 
 
@@ -338,6 +350,211 @@ class WatcherTests(unittest.TestCase):
             epoch, ms = int(ln.split()[0]), int(ln.split()[1])
             self.assertTrue(t0 - 1 <= epoch <= time.time() + 1, ln)
             self.assertLess(ms, 10000, ln)
+
+    # --- the one-read tick, the idle fast path, and the change gates ---
+
+    def edit_state(self, fn):
+        s = self.f.read(); fn(s); self.f.state.write_text(json.dumps(s))
+
+    def tmux_reads(self, s):
+        return [c for c in s["calls"] if c[0] in ("list-windows", "list-panes")]
+
+    def stat_log(self):
+        p = self.f.dir / "stat.log"
+        return p.read_text().splitlines() if p.exists() else []
+
+    def with_fake_stat(self):
+        f = self.f.bin / "stat"; f.write_text(FAKE_STAT); f.chmod(0o755)
+        return {"FAKE_STAT_LOG": str(self.f.dir / "stat.log")}
+
+    def later(self, delay, fn):
+        t = threading.Timer(delay, fn); t.start()
+        self.addCleanup(t.cancel)
+
+    def test_one_read_keeps_spaced_summaries_and_empty_middle_fields(self):
+        # Every per-window field arrives in ONE US-separated read. Each of
+        # these windows has an EMPTY field before its one set field, so a
+        # read that dropped or merged empty fields would shift it into the
+        # wrong variable; the summary has runs of spaces and a tab.
+        def add(s):
+            s["windows"]["@5"] = W("main", 5, **{"@agent_summary": "fix  the login\tbug "})
+            s["windows"]["@6"] = W("main", 6, **{"@agent_workflow": "1"})
+            s["windows"]["@7"] = W("main", 7, **{"@agent_cua": "1", "@agent_summary": "a b"})
+            s["windows"]["@8"] = W("main", 8, **{"@agent_rollout": "/r/rollout-1.jsonl"})
+            s["panes"] += [{"window": w, "tty": "/dev/ttys80%s" % w[1:]} for w in ("@5", "@6", "@7", "@8")]
+        self.edit_state(add)
+        r = self.f.run("agent-tab-watcher.sh", timeout=20, AGENT_TAB_WATCHER_MAX_TICKS="6")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.f.read()
+        self.assertEqual(len(self.tmux_reads(s)), 6, self.tmux_reads(s))   # one read per tick
+        self.assertEqual({c[0] for c in self.tmux_reads(s)}, {"list-panes"})
+        # No agent anywhere here: a leftover workflow/cua flag is cleared on
+        # the first tick, and since @6 has no state or summary that is ALL
+        # that ever happens to it (it is on the idle fast path afterwards).
+        self.assertEqual(self.window_calls(s, "@6"), [["set-option", "-uw", "-t", "@6", "@agent_workflow"]])
+        self.assertNotIn("@agent_cua", s["windows"]["@7"]["opts"])
+        # A summary (spaces and all) is a summary: collected after GC_TICKS.
+        self.assertNotIn("@agent_summary", s["windows"]["@5"]["opts"])
+        self.assertNotIn("@agent_summary", s["windows"]["@7"]["opts"])
+        # A lone rollout path is neither state nor summary: nothing to collect.
+        self.assertFalse(self.window_calls(s, "@8"), s["calls"])
+
+    def test_idle_windows_cost_nothing_and_agents_panes_still_reconcile(self):
+        # 20 pty-MCP shells in `agents`: no agent, no options -> not one write.
+        # @150 is an `agents` pane running a headless `claude -p`: it must be
+        # seeded and stamped like any agent window, and collected once it
+        # exits. @1 is linked into stash as well: listed twice, reconciled once.
+        def add(s):
+            for i in range(20):
+                wid = "@%d" % (100 + i)
+                s["windows"][wid] = W("agents", i + 1)
+                s["panes"].append({"window": wid, "tty": "/dev/ttys%d" % (700 + i)})
+            s["windows"]["@150"] = W("agents", 50)
+            s["panes"].append({"window": "@150", "tty": "/dev/ttys950"})
+            s["windows"]["@1"]["links"] = ["stash"]
+        self.edit_state(add)
+        self.f.procs.write_text(DEFAULT_PROCS + "ttys950 5050 claude\n")
+        self.trace_path().write_text("")
+        r = self.f.run("agent-tab-watcher.sh", AGENT_TAB_WATCHER_MAX_TICKS="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.f.read()
+        for i in range(20):
+            self.assertFalse(self.window_calls(s, "@%d" % (100 + i)), s["calls"])
+        self.assertEqual(s["windows"]["@150"]["opts"].get("@agent_state"), "idle")
+        self.assertRegex(s["windows"]["@150"]["opts"].get("@agent_since", ""), r"^\d+ idle$")
+        seeds = [c for c in self.window_calls(s, "@1") if "@agent_state" in c]
+        self.assertEqual(seeds, [["set-option", "-w", "-t", "@1", "@agent_state", "idle"]])
+        # Windows are counted once each: 4 + 20 + 1, the link not again.
+        self.assertRegex(self.trace_path().read_text(), r"^\d+ \d+ 25 2\n$")
+        # The headless claude exits: collected after GC_TICKS, like any window.
+        self.f.procs.write_text(DEFAULT_PROCS)
+        r = self.f.run("agent-tab-watcher.sh", timeout=20, AGENT_TAB_WATCHER_MAX_TICKS="6")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        o = self.f.read()["windows"]["@150"]["opts"]
+        self.assertNotIn("@agent_state", o)
+        self.assertNotIn("@agent_since", o)
+
+    def make_session(self, pid=4242, sid="sid1"):
+        """A claude session for `pid` with one fresh background subagent."""
+        home = self.f.home
+        (home / ".claude/sessions").mkdir(parents=True, exist_ok=True)
+        (home / (".claude/sessions/%d.json" % pid)).write_text(json.dumps(
+            {"pid": pid, "sessionId": sid, "cwd": "/x/proj", "status": "busy"}, separators=(",", ":")))
+        proj = home / ".claude/projects/-x-proj"
+        (proj / sid / "subagents").mkdir(parents=True, exist_ok=True)
+        (proj / (sid + ".jsonl")).write_text('{"type":"user","message":"go"}\n')
+        agent = proj / sid / "subagents/agent-abc123.jsonl"
+        agent.write_text('{"type":"assistant","message":"working"}\n')
+        return agent
+
+    def lib_stats(self):
+        return [l for l in self.stat_log() if l.startswith("-f %m %z %N")]
+
+    def test_subagent_check_only_reruns_when_its_inputs_change(self):
+        self.make_session()
+        r = self.f.run("agent-tab-watcher.sh", timeout=20, AGENT_TAB_WATCHER_MAX_TICKS="4",
+                       **self.with_fake_stat())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.f.read()
+        # Running subagent -> gear, on both of 4242's windows (@1 and @3) ...
+        self.assertEqual(s["windows"]["@1"]["opts"].get("@agent_workflow"), "1")
+        self.assertEqual(s["windows"]["@3"]["opts"].get("@agent_workflow"), "1")
+        # ... from ONE look at the session over four ticks: nothing it reads moved.
+        self.assertEqual(len(self.lib_stats()), 1, self.stat_log())
+
+    def test_subagent_check_sees_a_change_mid_run(self):
+        agent = self.make_session()
+        def interrupt():
+            with agent.open("a") as fh:
+                fh.write('{"type":"user","message":{"role":"user","content":[{"type":"text",'
+                         '"text":"[Request interrupted by user]"}]}}\n')
+        self.later(2.0, interrupt)
+        r = self.f.run("agent-tab-watcher.sh", timeout=20, AGENT_TAB_WATCHER_MAX_TICKS="5",
+                       **self.with_fake_stat())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.f.read()
+        # The gear went up, and came down once the interrupt landed.
+        self.assertIn(["set-option", "-w", "-t", "@1", "@agent_workflow", "1"], s["calls"])
+        self.assertNotIn("@agent_workflow", s["windows"]["@1"]["opts"])
+        self.assertGreaterEqual(len(self.lib_stats()), 2, self.stat_log())
+
+    def test_subagent_check_new_session_behind_same_pid(self):
+        # /clear: same pid, new sessionId with no subagents -> no gear, at once,
+        # even though none of the NEW session's (absent) files "changed".
+        self.make_session()
+        def clear():
+            (self.f.home / ".claude/sessions/4242.json").write_text(json.dumps(
+                {"pid": 4242, "sessionId": "sid2", "cwd": "/x/proj", "status": "busy"}, separators=(",", ":")))
+        self.later(2.0, clear)
+        r = self.f.run("agent-tab-watcher.sh", timeout=20, AGENT_TAB_WATCHER_MAX_TICKS="5")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.f.read()
+        self.assertIn(["set-option", "-w", "-t", "@1", "@agent_workflow", "1"], s["calls"])
+        self.assertNotIn("@agent_workflow", s["windows"]["@1"]["opts"])
+
+    def activity(self, ts):
+        act = self.f.home / "Library/Application Support/CuaNotch/activity.json"
+        act.parent.mkdir(parents=True, exist_ok=True)
+        act.write_text(json.dumps({"sessions": {"s1": {"agent_pid": 4242, "ts": ts}}}))
+        return act
+
+    def test_cua_flag_follows_activity_stat_only_on_change(self):
+        act = self.activity(time.time())
+        # Mid-run the shim rewrites it with only a stale session: the flag
+        # must clear on the next tick (the change is seen via the stamps).
+        self.later(2.0, lambda: act.write_text(json.dumps(
+            {"sessions": {"s1": {"agent_pid": 4242, "ts": time.time() - 120}}})))
+        r = self.f.run("agent-tab-watcher.sh", timeout=20, AGENT_TAB_WATCHER_MAX_TICKS="5",
+                       **self.with_fake_stat())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.f.read()
+        self.assertIn(["set-option", "-w", "-t", "@1", "@agent_cua", "1"], s["calls"])
+        self.assertIn(["set-option", "-uw", "-t", "@1", "@agent_cua"], s["calls"])
+        self.assertNotIn("@agent_cua", s["windows"]["@1"]["opts"])
+        # Stat'ed at the cold start and once for the change, not once per tick.
+        self.assertEqual(len([l for l in self.stat_log() if "activity.json" in l]), 2, self.stat_log())
+
+    def test_cua_rename_with_an_old_mtime_is_seen(self):
+        # Writers replace activity.json by rename, and the new file keeps its
+        # temp file's mtime - here one that predates every stamp of the run.
+        # Python first answers "nobody" (cached); the rename must still be
+        # noticed (via the directory) and re-read.
+        act = self.activity(time.time() - 120)
+        def replace():
+            tmp = act.with_name(".activity.tmp")
+            tmp.write_text(json.dumps({"sessions": {"s1": {"agent_pid": 4242, "ts": time.time()}}}))
+            old = time.time() - 30
+            os.utime(tmp, (old, old))
+            os.replace(tmp, act)
+        self.later(2.0, replace)
+        r = self.f.run("agent-tab-watcher.sh", timeout=20, AGENT_TAB_WATCHER_MAX_TICKS="5")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.f.read()["windows"]["@1"]["opts"].get("@agent_cua"), "1")
+
+    def test_cua_failed_interpreter_is_not_cached_as_nobody(self):
+        # The first interpreter run fails (EAGAIN / jetsam stand-in); the
+        # next tick must ask again rather than cache " " for the 60 s window.
+        self.activity(time.time())
+        count = self.f.dir / "py.count"
+        fake = self.f.bin / "flaky-python3"
+        fake.write_text('#!/bin/sh\nn=$(cat "%s" 2>/dev/null || echo 0); echo $((n + 1)) > "%s"\n'
+                        'if [ "$n" = 0 ]; then cat >/dev/null; exit 1; fi\nexec /usr/bin/python3 "$@"\n'
+                        % (count, count))
+        fake.chmod(0o755)
+        w = self.f.scripts / "agent-tab-watcher.sh"
+        body = w.read_text()
+        anchor = '/usr/bin/python3 - "$ACTIVITY"'
+        self.assertIn(anchor, body)
+        w.write_text(body.replace(anchor, '%s - "$ACTIVITY"' % fake))
+        r = self.f.run("agent-tab-watcher.sh", timeout=20, AGENT_TAB_WATCHER_MAX_TICKS="3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertGreaterEqual(int(count.read_text()), 2)
+        self.assertEqual(self.f.read()["windows"]["@1"]["opts"].get("@agent_cua"), "1")
+
+    def test_stamps_are_cleaned_up(self):
+        r = self.f.run("agent-tab-watcher.sh", AGENT_TAB_WATCHER_MAX_TICKS="2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([p.name for p in self.f.tmp.iterdir() if ".stamp." in p.name], [])
 
 
 class JumpTests(unittest.TestCase):

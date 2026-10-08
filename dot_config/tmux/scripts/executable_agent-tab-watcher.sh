@@ -54,8 +54,9 @@
 # EXISTS at the start of a tick, the tick appends one line to it:
 #   <epoch> <tick_ms> <windows> <agents>
 # epoch = integer seconds at tick start, tick_ms = wall time from the top of
-# the tick to just before its sleep, windows = windows reconciled, agents =
-# tty-owning agent processes seen. `: > that-file` to start, `rm` it to stop
+# the tick to just before its sleep, windows = distinct windows reconciled
+# (a window linked into two sessions counts once; idle fast-path windows
+# count), agents = tty-owning agent processes seen. `: > that-file` to start, `rm` it to stop
 # (it is never truncated or rotated by the watcher). Ticks that bail out on
 # the failure path write no line. Needs $EPOCHREALTIME (bash 5); with tracing
 # off the cost is one builtin file test per tick, no fork.
@@ -73,6 +74,10 @@ US=$'\x1f'
 MAX_TICKS="${AGENT_TAB_WATCHER_MAX_TICKS:-}"
 
 command -v tmux >/dev/null 2>&1 || exit 0
+# Bash 4+ required (associative arrays here and in agent-session-lib.sh).
+# Under macOS /bin/bash 3.2 `declare -A` fails and the loop would die
+# mid-tick; leave before touching the pidfile or reaping anything.
+[ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || exit 0
 
 # DEFAULT SERVER ONLY. The singleton below is per-USER (one pidfile, a pgrep
 # sweep over every matching command line), but tmux.conf is loaded by every
@@ -94,6 +99,9 @@ _sock="${TMUX%%,*}"
 # pidfile, and only clean it up on exit if it's still ours.
 PIDFILE="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.pid"
 SELF="$HOME/.config/tmux/scripts/agent-tab-watcher.sh"
+# Per-tick mtime reference files (see CHANGE STAMPS below). Named with our
+# own pid so cleanup() only ever removes this instance's set.
+STAMPS="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.$$.stamp"
 
 # A PID IS NOT AN IDENTITY. cleanup() only unlinks the pidfile on a normal
 # EXIT, so a SIGKILLed watcher leaves a live-looking pid behind — and pid
@@ -149,6 +157,10 @@ write_pidfile() {
         || rm -f "$PIDFILE.$$" 2>/dev/null
 }
 write_pidfile
+# Stamp sets left by instances that never ran cleanup() (SIGKILL). Every
+# other instance has been reaped above, and a stamp that vanishes under a
+# live reader only ever reads as "changed" (see changed_since). Startup only.
+rm -f "${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}".*.stamp.* 2>/dev/null
 # Heartbeat restamp, builtin only. Called only when the file already reads
 # exactly "$$" (ours), so this rewrites the IDENTICAL bytes in place: `1<>`
 # opens read-write WITHOUT truncating, so a concurrent reader sees the same
@@ -185,6 +197,8 @@ cleanup() {
     BLINK_PID=""
     [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"
     [ -e "$PIDFILE.$$" ] && rm -f "$PIDFILE.$$"
+    # Guarded: an empty $STAMPS would make this `rm -f .*` in the cwd.
+    [ -n "${STAMPS:-}" ] && rm -f "$STAMPS".* 2>/dev/null
 }
 trap cleanup EXIT
 trap 'exit 0' INT TERM HUP
@@ -208,8 +222,11 @@ is_agent_comm() {
     [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
-# Claude Code's own view of whether the session is mid-turn, echoed as
-# "busy" | "idle" | "" (unknown/not a claude session).
+# Claude Code's own view of whether the session is mid-turn, stored in the
+# caller's `st` as "busy" | "idle" | "" (unknown/not a claude session).
+# Assigned, not echoed: `st=$(session_status ...)` was a comsub, i.e. a fork
+# per running claude window per tick, around a function that is otherwise
+# all builtins.
 #
 # ~/.claude/sessions/<pid>.json carries a "status" field that Claude maintains
 # itself, and it is the only GROUND TRUTH here — every other signal we have is
@@ -224,11 +241,13 @@ is_agent_comm() {
 # cause. Builtin read, no fork; unknown values are left alone deliberately.
 session_status() {
     local sf raw
+    st=""
     [ -n "$1" ] || return 0
     sf="$HOME/.claude/sessions/$1.json"
     [ -f "$sf" ] || return 0
     raw="$(<"$sf")"
-    [[ $raw =~ \"status\":\"([^\"]+)\" ]] && printf '%s' "${BASH_REMATCH[1]}"
+    [[ $raw =~ \"status\":\"([^\"]+)\" ]] && st="${BASH_REMATCH[1]}"
+    return 0
 }
 
 # Codex's answer to the same question, from its rollout stream: "busy" | "idle"
@@ -278,6 +297,7 @@ codex_status() {
 if ! . "$HOME/.config/tmux/scripts/agent-session-lib.sh" 2>/dev/null; then
     session_has_running_workflow() { return 1; }
     session_has_running_subagent() { return 1; }
+    resolve_session_bases() { return 1; }   # subagent_running's gate
 fi
 
 # Agent pids that have driven an app within CUA_LIVE seconds, space-delimited
@@ -290,23 +310,20 @@ ACTIVITY="$HOME/Library/Application Support/CuaNotch/activity.json"
 # dropped out and came back on every model turn while the notch stayed lit —
 # the two surfaces must light up and go dark together. Change both or neither.
 CUA_LIVE=60
+# The interpreter half: the live pid set straight from the file. Only ever
+# called through refresh_cua_pids' gates below. Exit status is part of the
+# answer: 0 = the set (possibly empty, " "), non-zero = NO answer (file
+# unreadable/unparseable, or the interpreter itself failed - EAGAIN, jetsam
+# under load), which the caller treats as empty for this tick only and never
+# caches as "nobody" (see refresh_cua_pids).
 live_cua_pids() {
-    [ -f "$ACTIVITY" ] || { printf ' '; return 0; }
-    # Cheap gate before starting an interpreter (~22ms, every second,
-    # forever): the shim rewrites this file on every driver call, so every
-    # session ts is <= its mtime — an untouched file cannot hold a live
-    # session, and the answer is the empty set without any python at all.
-    local _now _amt
-    printf -v _now '%(%s)T' -1
-    _amt=$(stat -f %m "$ACTIVITY" 2>/dev/null || echo 0)
-    [ $((_now - _amt)) -lt "$CUA_LIVE" ] || { printf ' '; return 0; }
-    /usr/bin/python3 - "$ACTIVITY" "$CUA_LIVE" <<'PY' 2>/dev/null || printf ' '
+    /usr/bin/python3 - "$ACTIVITY" "$CUA_LIVE" <<'PY' 2>/dev/null
 import json, sys, time
 try:
     with open(sys.argv[1]) as f:
         sessions = json.load(f).get("sessions", {}) or {}
 except Exception:
-    print(" "); raise SystemExit(0)
+    raise SystemExit(1)
 now, live = time.time(), float(sys.argv[2])
 pids = {int(d["agent_pid"]) for d in sessions.values()
         if isinstance(d, dict) and d.get("agent_pid")
@@ -318,6 +335,145 @@ pids = {int(d["agent_pid"]) for d in sessions.values()
 # in a caller when the producer can just not lie.
 print((" " + " ".join(str(p) for p in sorted(pids)) + " ") if pids else " ")
 PY
+}
+
+# CHANGE STAMPS: "has this file changed since tick T?" without a fork.
+# Bash cannot read an mtime without forking `stat` (~2-8 ms a call under
+# this machine's load, and the session checks paid one per claude session
+# per tick), but `[ a -nt b ]` compares two mtimes as a builtin. So every
+# tick begins by writing an empty stamp file (builtin redirect), and "F
+# changed since tick T began" is "F is NOT older than T's stamp". A ring of
+# STAMP_RING files bounds the set; a stamp is valid for STAMP_RING - 1 ticks
+# after its own, after which callers must recompute from scratch.
+#
+# Every doubt reads as CHANGED, i.e. as "do the full check, exactly as
+# before": a missing stamp (unwritable TMPDIR, swept by a successor), an
+# expired one, or a file whose mtime TIES the stamp (`! ref -nt f`, so any
+# granularity - bash 5.1+ compares nanoseconds, older bash whole seconds -
+# can only over-report). A file that does not exist is skipped: its parent
+# directory's mtime is what records it appearing or disappearing.
+#
+# This assumes IN-PLACE writes (appends, truncate+write), which is how the
+# transcripts the subagent gate watches are written. A file REPLACED by
+# rename keeps its temp file's mtime, set at close - which can fall just
+# before a stamp while the rename lands just after the look; activity.json
+# is written exactly that way, so refresh_cua_pids adds a directory check.
+STAMP_RING=10
+tick_no=0
+# changed_since T FILE...: true (0) if any existing FILE changed since tick
+# T's stamp, or the stamp can't vouch for it.
+changed_since() {
+    local t="$1" ref f
+    shift
+    [ -n "$t" ] && [ $((tick_no - t)) -lt "$STAMP_RING" ] || return 0
+    ref="$STAMPS.$((t % STAMP_RING))"
+    [ -e "$ref" ] || return 0
+    for f; do
+        [ -e "$f" ] || continue
+        [ "$ref" -nt "$f" ] || return 0
+    done
+    return 1
+}
+
+# Computer-use pids for this tick, into cua_pids (" 123 456 ", or a single
+# space when none). Called once per tick, no comsub (a $(...) is a fork).
+#
+# Two gates before the interpreter (~22 ms at rest, far more under load):
+#  1. The shim rewrites activity.json on every driver call, so every session
+#     ts is <= its mtime: a file untouched for CUA_LIVE seconds cannot hold a
+#     live session. This used to `stat` the file every tick; now it is only
+#     stat'ed when no stamp can vouch (first tick, after a gap) or when the
+#     file or its directory moved (see RENAMES), and cua_seen is advanced to
+#     the first tick that sees a change - never earlier than the real mtime,
+#     so the gate can only stay open a tick longer than the stat version,
+#     never close early.
+#  2. A live set only SHRINKS while the file is untouched (entries age out),
+#     so once python has CLEANLY answered "nobody" for the current contents
+#     (exit 0, " "), the answer stays "nobody" until the file changes again -
+#     which spares the python run every second of the CUA_LIVE tail after
+#     each drive. A failed run is never cached: it is " " for this tick and
+#     python is asked again next tick, so a transient interpreter failure
+#     costs one tick of glyph, not the rest of the 60 s window.
+#
+# RENAMES. Every writer of activity.json (cua-mcp-shim, cua_state_watch,
+# arc-cdp-client) replaces it by rename, and the new file carries its temp
+# file's mtime - set at close, which can land just before a tick's stamp
+# while the rename lands just after that tick looked: the -nt test alone
+# would then call the new file "unchanged" for good. A rename always bumps
+# the DIRECTORY's mtime, so the file OR its directory moving gets one exact
+# look: stat the file's inode and ns mtime and compare with the last ones
+# seen (a rename is a new inode; an in-place write a new mtime). Not the
+# directory alone as the change signal: CuaNotch renames agents.json and
+# friends into it every 1-6 s (measured 2026-10-07, activity.json idle for
+# 40 s meanwhile), which would hold the gate open and run python every
+# tick. The stat is a fork, but only on a tick where something there moved,
+# and python still runs only when activity.json itself is new.
+cua_seen=0       # epoch at/after activity.json's last change
+cua_tick=""      # tick that last looked at it
+cua_none=0       # 1 = python cleanly said "nobody" and the file hasn't changed since
+cua_id=""        # "<inode>.<ns mtime>" from the last exact look ("" = unknown)
+refresh_cua_pids() {
+    cua_pids=" "
+    [ -f "$ACTIVITY" ] || return 0
+    local st_out amt id
+    if [ -n "$cua_tick" ] && [ $((tick_no - cua_tick)) -lt "$STAMP_RING" ] \
+       && [ -e "$STAMPS.$((cua_tick % STAMP_RING))" ]; then
+        if changed_since "$cua_tick" "$ACTIVITY" "${ACTIVITY%/*}"; then
+            st_out=$(stat -f '%m %i.%Fm' "$ACTIVITY" 2>/dev/null)
+            id="${st_out#* }"
+            if [ -z "$st_out" ] || [ "$id" != "$cua_id" ]; then
+                cua_seen=$tick_now; cua_none=0; cua_id="$id"
+            fi
+        fi
+    else
+        st_out=$(stat -f '%m %i.%Fm' "$ACTIVITY" 2>/dev/null)
+        amt="${st_out%% *}"
+        case "$amt" in ''|*[!0-9]*) amt=0 ;; esac   # digits only before $(( ))
+        cua_seen=$amt; cua_none=0; cua_id="${st_out#* }"
+    fi
+    cua_tick=$tick_no
+    [ $((tick_now - cua_seen)) -lt "$CUA_LIVE" ] || return 0
+    [ "$cua_none" = 1 ] && return 0
+    if ! cua_pids=$(live_cua_pids); then
+        cua_pids=" "                       # no answer: empty now, ask again next tick
+    elif [ "$cua_pids" = " " ]; then
+        cua_none=1                         # a clean "nobody": holds until the file changes
+    fi
+    [ -n "$cua_pids" ] || cua_pids=" "
+    return 0
+}
+
+# session_has_running_subagent, skipped when nothing it reads has changed.
+# Its verdict is a function of the session's parent transcript, its
+# subagents/ dir and every agent-*.jsonl in it (mtime, size, contents) -
+# plus the clock, which can only move a subagent OUT of the age window
+# (running -> finished), never into it. So an unchanged input set keeps its
+# verdict, and the STAMP_RING-tick expiry bounds how late an age-out is seen
+# (seconds, on a one-hour backstop). Keyed by pid AND the resolved session
+# path, so /clear or /resume (a new sessionId behind the same pid) is a
+# fresh look. The rules themselves stay in agent-session-lib.sh; this only
+# decides whether to ask. One stat fork per session per tick (~6 ms each
+# here at load 200, 23 ms for a 312-transcript session) becomes a builtin
+# -nt walk (~2.5 ms for those 312) while nothing moves.
+declare -A SUB_KEY=() SUB_TICK=() SUB_V=()
+subagent_running() {
+    local pid="$1" key b v
+    local -a watch=()
+    resolve_session_bases "$pid" || return 1
+    key="$SESSION_PROJ/${SESSION_BASES[*]}"
+    if [ -n "${SUB_TICK[$pid]:-}" ] && [ "${SUB_KEY[$pid]:-}" = "$key" ]; then
+        for b in "${SESSION_BASES[@]}"; do
+            watch+=("$SESSION_PROJ/$b.jsonl" "$SESSION_PROJ/$b/subagents" \
+                    "$SESSION_PROJ/$b/subagents"/agent-*.jsonl)
+        done
+        if ! changed_since "${SUB_TICK[$pid]}" "${watch[@]}"; then
+            return "${SUB_V[$pid]}"
+        fi
+    fi
+    session_has_running_subagent "$pid"
+    v=$?
+    SUB_KEY[$pid]="$key"; SUB_TICK[$pid]=$tick_no; SUB_V[$pid]=$v
+    return "$v"
 }
 
 # A failed tmux command is NOT proof the server died — it can also be a
@@ -346,10 +502,19 @@ gc_streak=" "
 # Process discovery (see PROCESS DISCOVERY in the loop): the pgrep pattern
 # (is_agent_comm's names, -x anchors it), the per-pid tty cache, and how
 # often that cache is thrown away wholesale.
+#
+# ASSOCIATIVE ARRAYS for every per-tick lookup (bash 4+, which the lib's
+# caches already require). These used to be space-joined strings probed
+# with `case "$s" in *" ${key} "*`, a linear scan per probe; with ~165
+# windows (most of them pty-MCP shells in `agents`) and four such probes
+# per window that was quadratic, ~20 ms a tick at load 200.
 AGENT_PAT='claude|codex|[0-9]+\.[0-9]+\.[0-9]+'
-pid_cache=" "
+declare -A PID_TTY=() PID_NEXT=() TTY_PID=()   # pid->tty|-, its rebuild, tty->lowest pid
 pid_cache_age=0
 PID_CACHE_TICKS=60
+# Per-window fields of the tick's one tmux read (see the ONE READ note).
+declare -A W_SEEN=() W_PID=() W_STATE=() W_WAC=() W_SINCE=() W_WF=() W_CUA=() W_ROLL=() W_SUM=()
+wins=()
 
 # Tick trace (see TICK TRACE in the header). Tested once per tick, builtin.
 TRACE="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.trace"
@@ -422,20 +587,17 @@ BLINK_PID=$!
 
 while :; do
     # Tick trace: armed only if the file exists now (one stat, no fork) and
-    # this bash has EPOCHREALTIME (bash 5; /bin/bash 3.2 just never traces).
+    # this bash has EPOCHREALTIME (bash 5; a bash 4 just never traces - 3.2
+    # never gets this far, see the version check at the top).
     trace_t0=""
     if [ -e "$TRACE" ] && [ -n "${EPOCHREALTIME:-}" ]; then
         trace_t0=$EPOCHREALTIME
     fi
     n_windows=0
-
-    # window_id<space>pane_tty for every pane.
-    if ! panes=$(tmux list-panes -a -F '#{window_id} #{pane_tty}' 2>/dev/null); then
-        fail_streak=$((fail_streak + 1))
-        { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
-        sleep "$POLL_SECONDS"
-        continue
-    fi
+    # This tick's change stamp (see CHANGE STAMPS), written before anything
+    # is read so a change racing the reads below is "since" it. Builtin.
+    tick_no=$((tick_no + 1))
+    : > "$STAMPS.$((tick_no % STAMP_RING))" 2>/dev/null
 
     # PROCESS DISCOVERY: agent TTYs, plus tty=pid for every agent pane —
     # claude pids feed the workflow lookup (codex pids simply miss in
@@ -462,7 +624,7 @@ while :; do
     # skips its own ancestors, and ps never did. -x + the alternation is
     # anchored as a whole (^(...)$), same shape as is_agent_comm.
     #
-    # THE CACHE (" pid=tty pid=- ", "-" = not an agent / no tty) is rebuilt
+    # THE CACHE (PID_TTY[pid] = tty, "-" = not an agent / no tty) is rebuilt
     # from each tick's pgrep, so a pid drops out the tick it stops matching;
     # a stale entry would need an agent to die AND its pid to be reused by
     # another agent-named process within one tick (the pid space wraps in
@@ -498,15 +660,15 @@ while :; do
     [ "$rc" = 0 ] || cand=""
     pid_cache_age=$((pid_cache_age + 1))
     if [ "$pid_cache_age" -ge "$PID_CACHE_TICKS" ]; then
-        pid_cache=" "
+        PID_TTY=()
+        # The subagent verdict cache rides the same clock: dead pids drop
+        # out, and every session gets one full look a minute regardless.
+        SUB_KEY=(); SUB_TICK=(); SUB_V=()
         pid_cache_age=0
     fi
     new_pids=""
     for pid in $cand; do
-        case "$pid_cache" in
-            *" ${pid}="*) : ;;
-            *) new_pids="${new_pids} ${pid}" ;;
-        esac
+        [ -n "${PID_TTY[$pid]+x}" ] || new_pids="${new_pids} ${pid}"
     done
     if [ -n "$new_pids" ]; then
         # One write per ps (a ~30-byte line, under PIPE_BUF), so parallel
@@ -530,35 +692,41 @@ while :; do
         while IFS=' ' read -r tty pid comm; do
             [ -n "$pid" ] || continue
             if [ -n "$tty" ] && [ "$tty" != "??" ] && is_agent_comm "$comm"; then
-                pid_cache="${pid_cache}${pid}=${tty} "
+                PID_TTY[$pid]="$tty"
             else
-                pid_cache="${pid_cache}${pid}=- "
+                PID_TTY[$pid]=-
             fi
         done <<EOF
 $ps_out
 EOF
     fi
     # In pgrep's order: ascending pid. ps -ax sorted by tty, then pid, and
-    # the tty=pid lookup below only ever compares entries of ONE tty, so
+    # the tty->pid map below only ever keeps the FIRST pid seen on a tty, so
     # "first agent pane wins" still picks the lowest pid on it, as it did.
-    agent_ttys=" "
-    tty_pid=" "
-    next_cache=" "
+    TTY_PID=()
+    PID_NEXT=()
     n_agents=0
     for pid in $cand; do
-        case "$pid_cache" in
-            *" ${pid}="*) tty="${pid_cache#*" ${pid}="}"; tty="${tty%% *}" ;;
-            *) continue ;;   # exited between pgrep and its ps
-        esac
-        next_cache="${next_cache}${pid}=${tty} "
+        [ -n "${PID_TTY[$pid]+x}" ] || continue   # exited between pgrep and its ps
+        tty="${PID_TTY[$pid]}"
+        PID_NEXT[$pid]="$tty"
         [ "$tty" = - ] && continue
-        agent_ttys="${agent_ttys}${tty} "
-        tty_pid="${tty_pid}${tty}=${pid} "
+        [ -n "${TTY_PID[$tty]+x}" ] || TTY_PID[$tty]="$pid"
         n_agents=$((n_agents + 1))
     done
-    pid_cache="$next_cache"
+    PID_TTY=()
+    for pid in "${!PID_NEXT[@]}"; do PID_TTY[$pid]="${PID_NEXT[$pid]}"; done
 
-    # Current per-window state in one call (formats resolve window options).
+    # ONE READ. Every pane, carrying its window's fields, in a single tmux
+    # call. This used to be six: list-panes for the ttys, then five
+    # list-windows -a (state/clients/since, summary, workflow, cua, rollout),
+    # each a fork+exec of tmux plus a full walk of the server - ~15 ms apiece
+    # at load ~200 with 165 windows, i.e. ~75 ms of every tick for data one
+    # call returns. User options resolve pane -> window -> global in a pane
+    # format, and nothing sets @agent_* per pane, so these are exactly the
+    # window values list-windows printed (diffed against the live server,
+    # 2026-10-07: identical). Read AFTER discovery, as the states read always
+    # was, so the gap between reading a state and acting on it stays short.
     #
     # Fields are split on US (\x1f), NOT on spaces. `read` collapses runs of
     # IFS whitespace, and \t counts as whitespace too, so with a space here an
@@ -567,12 +735,21 @@ EOF
     # the watcher then misfired: an agent window with no state never got its
     # idle seed (state was "0"/"1", not empty), and every non-agent window read
     # as a stale agent and ran the 7-unset GC every GC_TICKS ticks, forever.
-    # US is not whitespace, so `read` keeps empty fields. Same idiom as
-    # stash.sh. The other list-windows reads below are `win rest` pairs: an
-    # empty rest is exactly what they test for, so they are safe as they are.
+    # US is not whitespace, so `read` keeps empty fields, middle ones
+    # included. Same idiom as stash.sh.
     #
-    # @agent_since rides along: "<epoch> <state>", see the stamp below.
-    if ! states=$(tmux list-windows -a -F "#{window_id}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}" 2>/dev/null); then
+    # The summary rides LAST: it is free text (spaces are fine; it never
+    # holds a US), and as the final variable it would absorb any stray
+    # separator rather than shift every field after it. A summary can
+    # outlive @agent_state (a detached condenser may write one after the
+    # agent died and the watcher GC'd its state), which is why the GC also
+    # keys on it. @agent_since rides along: "<epoch> <state>", see the stamp
+    # below. Rollout paths (see codex_status) live under ~/.codex/sessions.
+    #
+    # A row only counts if it starts with a window id and carries a /dev/
+    # tty, so a line that is not a pane row (a summary with an embedded
+    # newline continues on its own line) can never be taken for a window.
+    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_summary}" 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
@@ -580,66 +757,46 @@ EOF
     fi
     fail_streak=0
 
-    # Windows containing at least one agent pane, and the claude pid per window
-    # (first agent pane wins) for workflow lookup.
-    present=" "
-    win_pid=" "
-    while IFS=' ' read -r win tty; do
-        [ -n "$win" ] || continue
-        short_tty="${tty#/dev/}"
-        case "$agent_ttys" in
-            *" ${short_tty} "*)
-                present="${present}${win} "
-                case "$win_pid" in
-                    *" ${win}="*) : ;;   # already mapped
-                    *)
-                        for kv in $tty_pid; do
-                            case "$kv" in "${short_tty}="*) win_pid="${win_pid}${win}=${kv#*=} "; break ;; esac
-                        done
-                        ;;
-                esac
-                ;;
-        esac
+    # Fold pane rows into windows: the first row of a window records its
+    # fields (a window's panes all carry the same ones; a window linked into
+    # several sessions is listed once per link but reconciled ONCE - it used
+    # to run twice, writes and all), and any agent pane maps the window to
+    # its pid (first agent pane wins) for the workflow/cua/status lookups.
+    #
+    # THE IDLE FAST PATH. Most windows here are pty-MCP shells in `agents`
+    # (146 of 165 at the last count) with no agent and no @agent_* option at
+    # all. Such a window has nothing to seed, collect, stamp or clear, so it
+    # is recorded as SEEN and nothing else, and the loop below skips it on
+    # sight. This is decided by content, never by session name: an `agents`
+    # pane that runs a headless `claude -p` has an agent pane (W_PID) and
+    # gets the full path - seeded, stamped, and garbage-collected once it
+    # exits, exactly like any other window.
+    W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_SUM=()
+    wins=()
+    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll summary; do
+        case "$win" in @*) ;; *) continue ;; esac
+        case "$tty" in /dev/?*) ;; *) continue ;; esac
+        if [ -z "${W_SEEN[$win]+x}" ]; then
+            W_SEEN[$win]=1
+            wins+=("$win")
+            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${summary}" ]; then
+                W_STATE[$win]="$state"; W_WAC[$win]="$wac"; W_SINCE[$win]="$since"
+                W_WF[$win]="$wf_opt"; W_CUA[$win]="$cua_opt"; W_ROLL[$win]="$roll"
+                W_SUM[$win]="$summary"
+            fi
+        fi
+        tty="${tty#/dev/}"
+        if [ -n "${TTY_PID[$tty]+x}" ] && [ -z "${W_PID[$win]+x}" ]; then
+            W_PID[$win]="${TTY_PID[$tty]}"
+        fi
     done <<EOF
-$panes
+$rows
 EOF
 
-    # Windows with a non-empty @agent_summary (read separately — a summary can
-    # contain spaces, and it can outlive @agent_state: a detached condenser may
-    # write a summary after the agent died and the watcher GC'd its state).
-    with_summary=" "
-    while IFS=' ' read -r win rest; do
-        [ -n "$win" ] && [ -n "$rest" ] && with_summary="${with_summary}${win} "
-    done <<EOF
-$(tmux list-windows -a -F '#{window_id} #{@agent_summary}' 2>/dev/null)
-EOF
-
-    # Windows that currently carry @agent_workflow (to reconcile against).
-    wf_now=" "
-    while IFS=' ' read -r win rest; do
-        [ -n "$win" ] && [ -n "$rest" ] && wf_now="${wf_now}${win} "
-    done <<EOF
-$(tmux list-windows -a -F '#{window_id} #{@agent_workflow}' 2>/dev/null)
-EOF
-
-    # Same, for @agent_cua, plus this tick's live driver pids (one read).
-    cua_now=" "
-    while IFS=' ' read -r win rest; do
-        [ -n "$win" ] && [ -n "$rest" ] && cua_now="${cua_now}${win} "
-    done <<EOF
-$(tmux list-windows -a -F '#{window_id} #{@agent_cua}' 2>/dev/null)
-EOF
-    cua_pids=$(live_cua_pids)
-
-    # win=<rollout path> for codex windows (see codex_status). Paths live under
-    # ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl and contain no
-    # spaces, so the flat "win=value" encoding used elsewhere holds.
-    roll_map=" "
-    while IFS=' ' read -r win rest; do
-        [ -n "$win" ] && [ -n "$rest" ] && roll_map="${roll_map}${win}=${rest} "
-    done <<EOF
-$(tmux list-windows -a -F '#{window_id} #{@agent_rollout}' 2>/dev/null)
-EOF
+    # Not `now`: agent-session-lib.sh assigns a global of that name.
+    printf -v tick_now '%(%s)T' -1
+    # This tick's live driver pids, into cua_pids.
+    refresh_cua_pids
 
     changed=0
     any_workflow=0
@@ -649,14 +806,22 @@ EOF
     # silently depended on the separator being a space; a US separator would
     # have frozen every pulse at whatever phase it happened to be in.
     blink_active=0
-    # Not `now`: agent-session-lib.sh assigns a global of that name.
-    printf -v tick_now '%(%s)T' -1
     # Rebuilt each tick; a window that stops reading idle drops out, so the
-    # streak only ever counts CONSECUTIVE observations.
+    # streak only ever counts CONSECUTIVE observations. (Plain strings, not
+    # arrays: they only ever hold the few windows mid-hysteresis.)
     idle_streak_next=" "
     gc_streak_next=" "
     wez_front=""   # per tick, computed at most once, only if a tinted tab is watched
-    while IFS="$US" read -r win state wac since; do
+    for win in "${wins[@]}"; do
+        n_windows=$((n_windows + 1))
+        pid="${W_PID[$win]:-}"
+        # The idle fast path (see the fold above): no agent pane and no
+        # @agent_* option means every branch below is a no-op. No heartbeat
+        # either - a window that does nothing cannot be the slow one.
+        [ -n "$pid" ] || [ -n "${W_STATE[$win]+x}" ] || continue
+        state="${W_STATE[$win]:-}"
+        wac="${W_WAC[$win]:-}"
+        since="${W_SINCE[$win]:-}"
         # MID-TICK HEARTBEAT. The heartbeat means "the loop is turning", and a
         # slow tick turns slowly but does turn. A slow per-window call makes
         # the tick's length scale with the window count: it happened with a
@@ -667,7 +832,8 @@ EOF
         # first ticks past 35 s, so ensure_watcher's 30 s grace read a working
         # daemon as wedged, reaped it, and the respawn started cold again - a
         # restart every ~35 s with no reconcile ever finishing. Stamping once
-        # per window keeps any such slow tick alive while a truly blocked call
+        # per window that does any work (the idle fast path above skips this
+        # too) keeps any such slow tick alive while a truly blocked call
         # (one window stuck > 30 s) still goes stale. Builtins only (read +
         # in-place printf): no fork. Only while we still own the file - never
         # stamp over a successor.
@@ -698,37 +864,20 @@ EOF
                     fi ;;
                 esac ;;
         esac
-        [ -n "$win" ] || continue
-        n_windows=$((n_windows + 1))
-        case "$present" in
-            *" ${win} "*) has_agent=1 ;;
-            *) has_agent=0 ;;
-        esac
-        case "$with_summary" in
-            *" ${win} "*) has_summary=1 ;;
-            *) has_summary=0 ;;
-        esac
-        case "$wf_now" in
-            *" ${win} "*) had_wf=1 ;;
-            *) had_wf=0 ;;
-        esac
-        case "$cua_now" in
-            *" ${win} "*) had_cua=1 ;;
-            *) had_cua=0 ;;
-        esac
+        has_agent=0; [ -n "$pid" ] && has_agent=1
+        has_summary=0; [ -n "${W_SUM[$win]:-}" ] && has_summary=1
+        had_wf=0; [ -n "${W_WF[$win]:-}" ] && had_wf=1
+        had_cua=0; [ -n "${W_CUA[$win]:-}" ] && had_cua=1
 
         # Background-workflow + computer-use detection (both need a live agent
         # and share the one pane→pid lookup; workflows are claude-only).
         wf=0
         cua=0
         if [ "$has_agent" = 1 ]; then
-            pid=""
-            for kv in $win_pid; do
-                case "$kv" in "${win}="*) pid="${kv#*=}"; break ;; esac
-            done
-            # A workflow or a background subagent: one gear for both.
+            # A workflow or a background subagent: one gear for both. The
+            # subagent half goes through subagent_running's change gate.
             if [ -n "$pid" ] && { session_has_running_workflow "$pid" \
-                                  || session_has_running_subagent "$pid"; }; then
+                                  || subagent_running "$pid"; }; then
                 wf=1; any_workflow=1
             fi
             case "$cua_pids" in
@@ -764,12 +913,9 @@ EOF
         agent_idle=0
         if [ "$state" = "running" ] && [ "$has_agent" = 1 ]; then
             st=""
-            [ -n "$pid" ] && st=$(session_status "$pid")        # claude
+            [ -n "$pid" ] && session_status "$pid"              # claude
             if [ -z "$st" ]; then                               # codex
-                rp=""
-                for kv in $roll_map; do
-                    case "$kv" in "${win}="*) rp="${kv#*=}"; break ;; esac
-                done
+                rp="${W_ROLL[$win]:-}"
                 # Only reached for a codex window ALREADY showing running, so
                 # the tail read is bounded to that case; a long live turn pays
                 # one read per tick until it ends, which is the price of having
@@ -842,9 +988,7 @@ EOF
         elif [ "${since#* }" != "$state" ]; then
             tmux set-option -w -t "$win" @agent_since "$tick_now $state" 2>/dev/null
         fi
-    done <<EOF
-$states
-EOF
+    done
     gc_streak="$gc_streak_next"
 
     idle_streak="$idle_streak_next"
