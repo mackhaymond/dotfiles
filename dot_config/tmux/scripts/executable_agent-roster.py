@@ -74,7 +74,8 @@ ESC_WAIT = 0.025            # how long a trailing ESC / partial sequence waits f
 AGENT_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
 # THIRD SURFACE of the agent colour language: same hex values as the
-# @catppuccin_window_* formats in tmux.conf.tmpl and CuaNotch.swift.
+# @catppuccin_window_* formats in tmux.conf.tmpl and cua-notch Sources/Constants.swift;
+# cua-notch dev/check-invariants section 65 fails if they drift.
 HEX = {
     "red": "#f38ba8", "yellow": "#f9e2af", "green": "#a6e3a1", "pink": "#f5c2e7",
     "blue": "#89b4fa", "teal": "#94e2d5", "dimteal": "#659a91", "dimblue": "#5d7aaa",

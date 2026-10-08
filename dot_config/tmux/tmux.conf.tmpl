@@ -258,21 +258,24 @@ set -g @catppuccin_window_current_fill "number"
 #
 # SHARED PALETTE — these hues are the tab-bar half of one agent-state color
 # language; CuaNotch's glow renders the SAME state in the same hue, saturated
-# for light instead of pastel-on-dark (see the memory note / CuaNotch.swift):
+# for light instead of pastel-on-dark (cua-notch Sources/Constants.swift):
 #   idle/ready      grey   #6c7086  ·  notch: no glow at all
 #   working         pink   #f5c2e7  ·  notch magenta #FF4FD1  (subtle)
 #   computer use    blue   #89b4fa  ·  notch blue   #408CFF   (full)
-#   needs approval  red    #f38ba8  ·  notch red    #FF4740   (full)
-#   waiting input   yellow #f9e2af  ·  notch amber  #FF9E26   (full)
+#   failed (broke)  red    #f38ba8  ·  notch red    #FF4740   (full)
+#   needs-input     yellow #f9e2af  ·  notch amber  #FF9E26   (full)
+#                   (waiting on you: approvals AND questions, since 2026-08-21)
 #   done, unvisited green  #a6e3a1  ·  notch green  #33E673   (full→subtle)
 #   workflow        teal   #94e2d5  ·  notch: (none)
-# Emphasis tiers match too: the states that WANT YOU (approval/input/done)
+# Emphasis tiers match too: the states that WANT YOU (failed/needs-input/done)
 # fill the whole tab, exactly as they burn at full strength in the glow;
 # ambient states (working/cua/idle) never touch the body, as they glow subtly.
 # Motion means the same thing in both: pulsing = in flight, steady = waiting
 # on you. Don't reassign a hue in one surface without the others. There are
 # THREE now (2026-10-07): this tab bar, CuaNotch, and the HEX table in
 # scripts/agent-roster.py (prefix e), which renders the same states as dots.
+# Drift is machine-checked: cua-notch dev/check-invariants section 65 (roster
+# == tab bar exactly; notch nearest its own tab hue in OKLCH, within 35°).
 #
 # ONE EXCEPTION to "same hue everywhere": blue #89b4fa is BOTH catppuccin's
 # resting chip accent and the computer-use hue. On the chip, blue therefore
@@ -331,7 +334,7 @@ set -g @catppuccin_window_current_background "#{?#{@stash_sel},#cba6f7,#{?#{==:#
 # Priority: attention beats motion — needs-*/done force crust
 # regardless, because the digit's own fg is the bright body tint and needs a
 # dark chip to read at all. (A permission prompt raised while a background
-# workflow runs is therefore a red tab with a still chip and a gear glyph.)
+# workflow runs is therefore a yellow tab with a still chip and a gear glyph.)
 # done+workflow is not tinted, so it pulses like any other in-flight window.
 # The SELECTED tab never pulses: it is solid peach for every ambient state —
 # you are looking at it, the terminal itself is the progress indicator, and a
@@ -371,7 +374,7 @@ set -g @catppuccin_window_current_color "#{?#{@stash_sel},#11111b,#{?#{==:#{@age
 # between its hue and a ~68% BRIGHTNESS copy of that same hue (dim blue
 # #5d7aaa, dim teal #659a91). Never blink a GLYPH between two different hues:
 # mid-pulse it then reads as some other state (this is why the chip, whose
-# resting blue means "no agent working", can pulse mauve↔blue and a glyph
+# resting blue means "no agent working", can pulse pink↔blue and a glyph
 # cannot). On a TINTED tab the glyph goes crust #11111b and stops pulsing —
 # teal on yellow/red is unreadable, and a tab already at maximum urgency does
 # not need a second animation. Then a fg readable on the bright attention
