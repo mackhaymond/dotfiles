@@ -55,6 +55,13 @@
 # navigation in between starts a fresh chain from where you are), and `back`
 # acts only from that landing, and only if the origin still exists.
 #
+# SILENT SUCCESS. A `next` or `back` that lands says nothing. tmux stops
+# redrawing the status line while a display-message is up (display-time,
+# 4 s here), so a "→ main:5 …" chip kept the tab you landed on painted
+# green that long even though clear-current had already discharged it. The
+# landing is the feedback; the sidebar shows what is still queued. Only the
+# misses below (nothing needs you, gone, refused) speak.
+#
 # Messages are worded to stay info chips: message-format paints anything
 # starting "no …"/"not …"/"can't …" as an error.
 #
@@ -145,15 +152,6 @@ refused() {
 
 chain_key() { printf '@agent_jump_%s' "${tty//[^A-Za-z0-9]/_}"; }
 
-describe() {
-    case "$1" in
-        failed) printf 'failed' ;;
-        needs-input) printf 'waiting on you' ;;
-        done) printf 'done' ;;
-        *) printf '%s' "$1" ;;
-    esac
-}
-
 case "$mode" in
     list)
         list_needs
@@ -166,8 +164,7 @@ case "$mode" in
             say "nothing needs you"
             exit 0
         fi
-        IFS=$'\t' read -r twin tsess tidx tstate _ tlabel <<<"${queue%%$'\n'*}"
-        more=$(( $(printf '%s\n' "$queue" | wc -l) - 1 ))
+        IFS=$'\t' read -r twin tsess tidx _ <<<"${queue%%$'\n'*}"
         key=$(chain_key)
         chain=$(tmux show-options -gqv "$key" 2>/dev/null)
         origin="${chain%% *}"
@@ -178,9 +175,7 @@ case "$mode" in
         [ "$rc" -eq 2 ] && { refused; exit 0; }
         [ "$rc" -eq 0 ] || { say "agent-jump: $tsess:$tidx is gone"; exit 0; }
         tmux set-option -g "$key" "$origin $twin" 2>/dev/null
-        msg="→ $tsess:$tidx $tlabel · $(describe "$tstate")"
-        [ "$more" -gt 0 ] && msg="$msg · $more more"
-        say "$msg"
+        # A landed jump says nothing (see SILENT SUCCESS above).
         ;;
 
     back)
@@ -196,7 +191,6 @@ case "$mode" in
         go_to "$origin"; rc=$?
         [ "$rc" -eq 2 ] && { refused; exit 0; }
         [ "$rc" -eq 0 ] || { say "the window you jumped from is gone"; exit 0; }
-        say "← back"
         ;;
 
     goto)

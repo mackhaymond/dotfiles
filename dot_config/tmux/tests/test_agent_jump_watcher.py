@@ -592,7 +592,9 @@ class JumpTests(unittest.TestCase):
         self.assertEqual(moves, ["select-window", "switch-client"])
         self.assertEqual(s["clients"][0]["window"], "@13")
         self.assertEqual(s["globals"]["@agent_jump__dev_ttys000"], "@10 @13")
-        self.assertIn("· failed · 3 more", s["messages"][-1][1])
+        # A landed jump is silent: a display-message would freeze the tab
+        # bar (and the tint clear-current just lifted) for display-time.
+        self.assertEqual(s["messages"], [])
 
     def test_chain_and_back(self):
         f = self.make()
@@ -657,14 +659,15 @@ class JumpTests(unittest.TestCase):
         self.assertFalse([c for c in s["calls"] if c[0] in ("select-window", "switch-client")], s["calls"])
         self.assertEqual(s["clients"][0]["session"], "main")
 
-    def test_hash_in_label_is_escaped(self):
-        f = self.make(**{"@18": W("zz#{host}", 1, **{"@agent_state": "failed", "@agent_since": "1 failed",
-                                                   "@agent_summary": "fix #{pane_title} #[fg=red]"})})
-        f.run("agent-jump.sh", "next", self.TTY)
+    def test_hash_in_message_is_escaped(self):
+        # A landed jump is silent, so the escape is checked on a miss that
+        # names a session: goto with a session that does not hold the window.
+        f = self.make()
+        f.run("agent-jump.sh", "goto", self.TTY, "@13", "zz#{host}#[fg=red]")
         s = f.read()
-        self.assertEqual(s["clients"][0]["window"], "@18")
+        self.assertFalse([c for c in s["calls"] if c[0] in ("select-window", "switch-client")], s["calls"])
         msg = s["messages"][-1][1]
-        self.assertIn("zz##{host}:1 fix ##{pane_title} ##[fg=red]", msg)
+        self.assertIn("zz##{host}##[fg=red]", msg)
         self.assertNotRegex(msg, r"(?<!#)#[{\[]")
 
     def test_linked_windows_land_in_a_normal_session(self):
@@ -678,12 +681,12 @@ class JumpTests(unittest.TestCase):
         s = f.read()
         self.assertEqual([c for c in s["calls"] if c[0] == "select-window"][-1], ["select-window", "-t", "=bai:@19"])
         self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("bai", "@19"))
-        self.assertTrue(s["messages"][-1][1].startswith("→ bai:4 "), s["messages"][-1])
+        self.assertEqual(s["messages"], [])                 # landed: silent
 
         f.run("agent-jump.sh", "back", self.TTY)            # origin @10 is main + stash
         s = f.read()
         self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("main", "@10"))
-        self.assertEqual(s["messages"][-1][1], "← back")
+        self.assertEqual(s["messages"], [])
 
         f.run("agent-jump.sh", "goto", self.TTY, "@19")     # bai + stash, client in main
         s = f.read()
@@ -738,7 +741,9 @@ class JumpTests(unittest.TestCase):
         self.assertTrue(all(len(r) == 6 for r in rows), rows)
         self.assertNotEqual(rows[1][1], "stash")
         f.run("agent-jump.sh", "next", self.TTY)
-        self.assertIn("· failed · 3 more", f.read()["messages"][-1][1])
+        s = f.read()
+        self.assertEqual(s["clients"][0]["window"], "@13")
+        self.assertEqual(s["messages"], [])
 
 
 if __name__ == "__main__":
