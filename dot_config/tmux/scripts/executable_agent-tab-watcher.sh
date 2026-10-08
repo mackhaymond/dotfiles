@@ -121,14 +121,58 @@ if command -v pgrep >/dev/null 2>&1; then
         fi
     done
 fi
-echo $$ > "$PIDFILE"
+# ATOMIC WRITES ONLY. `echo $$ > "$PIDFILE"` is truncate-THEN-write, and in
+# that window a reader sees an empty file: measured ~22% empty reads in a
+# tight writer/reader loop. The pulse child reads this file every second and
+# used to treat an empty read as "I've been superseded" and exit, which froze
+# the pulse for good (~1-2 child deaths a day). A CLAIM (startup, or a tick
+# that finds the file empty/missing) writes a sibling temp file and renames it
+# over the pidfile: rename(2) within one directory is atomic, so a reader sees
+# the old complete inode or the new complete one, never a half-written one.
+# The per-tick restamp does not use this (see restamp_pidfile): an mv is a
+# fork, and the loop runs 86400 times a day.
+write_pidfile() {
+    printf '%s\n' "$$" > "$PIDFILE.$$" 2>/dev/null \
+        && mv -f "$PIDFILE.$$" "$PIDFILE" 2>/dev/null \
+        || rm -f "$PIDFILE.$$" 2>/dev/null
+}
+write_pidfile
+# Heartbeat restamp, builtin only. Called only when the file already reads
+# exactly "$$" (ours), so this rewrites the IDENTICAL bytes in place: `1<>`
+# opens read-write WITHOUT truncating, so a concurrent reader sees the same
+# complete content before, during and after, and the write() still advances
+# the mtime that ensure_watcher and the roster treat as the liveness clock.
+restamp_pidfile() {
+    printf '%s\n' "$$" 2>/dev/null 1<>"$PIDFILE" || write_pidfile
+}
+# Is $BLINK_PID still OUR running pulse child? Asked of bash's own job table,
+# never of the pid alone: once the child dies and bash reaps it, that number
+# is free for reuse (the pid space wraps in ~15 minutes here), and `kill -0`
+# would happily answer for a stranger. `jobs -r` lists only async children
+# this shell forked and has NOT yet reaped as dead - and an unreaped child's
+# pid cannot be reused - so membership is proof of identity. (A comsub fork,
+# so only where it is rare: cleanup, not the 1 Hz loop.)
+blink_is_ours() {
+    [ -n "${BLINK_PID:-}" ] || return 1
+    case " $(jobs -rp 2>/dev/null | tr '\n' ' ') " in
+        *" $BLINK_PID "*) return 0 ;;
+    esac
+    return 1
+}
 # Remove the pidfile on exit only if it's still ours. The signal traps must
 # EXIT (a bare cleanup trap on TERM/INT/HUP would run the handler and then
 # RESUME the loop — the daemon would survive `kill`, which is exactly how the
 # old version leaked); routing signals through `exit 0` fires the EXIT trap.
+# The pulse child is killed only after blink_is_ours re-verifies it: this used
+# to `kill "$BLINK_PID"` unconditionally, and a child that had died earlier
+# left a number that could, by now, be any unrelated process.
 cleanup() {
-    [ -n "${BLINK_PID:-}" ] && kill "$BLINK_PID" 2>/dev/null
+    if blink_is_ours; then
+        kill "$BLINK_PID" 2>/dev/null
+    fi
+    BLINK_PID=""
     [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"
+    [ -e "$PIDFILE.$$" ] && rm -f "$PIDFILE.$$"
 }
 trap cleanup EXIT
 trap 'exit 0' INT TERM HUP
@@ -299,8 +343,11 @@ gc_streak=" "
 #
 # One actor still owns @agent_blink (rule 1 in the doc): the parent never
 # toggles it any more, and the child retires itself the moment the parent is
-# gone OR no longer owns the pidfile - so a respawn can never leave two
-# togglers cancelling each other out. It is a forked subshell, so it shares
+# gone OR a different pid owns the pidfile - so a respawn can never leave two
+# togglers cancelling each other out. The parent re-forks it on the next tick
+# if it ever dies anyway (see the heartbeat), because nothing else would: a
+# dead child is a pulse frozen at whatever phase it stopped on, until the next
+# `prefix r`. It is a forked subshell, so it shares
 # the parent's argv: the startup pgrep sweep in a successor kills it like
 # any other straggler, and a `pgrep -f agent-tab-watcher` now legitimately
 # shows TWO matches (the second with the first as its ppid).
@@ -308,15 +355,34 @@ BLINK_FLAG="${TMPDIR:-/tmp}/agent-tab-blink.${UID:-$(id -u)}"
 rm -f "$BLINK_FLAG"
 WATCHER_PID=$$
 blink_loop() {
-    # $$ in a subshell is still the PARENT's pid, so the inherited EXIT trap
-    # would see "the pidfile is mine" and delete the live parent's pidfile.
+    # Belt-and-braces only: bash already resets caught traps in an `&`
+    # subshell, so this child never inherits cleanup() (if it did, $$ - still
+    # the PARENT's pid in a subshell - would read as "the pidfile is mine").
+    # Explicit so the child's exit can never depend on that rule.
     trap - EXIT
-    trap 'exit 0' INT TERM HUP
-    local owner
-    while sleep "$POLL_SECONDS"; do
+    # The nap is `sleep & wait`, not a foreground sleep: bash defers a trapped
+    # signal until the foreground command returns, so cleanup()'s TERM used to
+    # sit pending for up to POLL_SECONDS while a successor's child was already
+    # toggling. `wait` is interrupted by the trap at once (same one sleep fork
+    # per beat); the trap reaps the orphaned nap with the kill builtin.
+    local owner nap=""
+    trap '[ -n "$nap" ] && kill "$nap" 2>/dev/null; exit 0' INT TERM HUP
+    while :; do
+        sleep "$POLL_SECONDS" & nap=$!
+        wait "$nap" || exit 0
+        nap=""
         kill -0 "$WATCHER_PID" 2>/dev/null || exit 0
-        read -r owner < "$PIDFILE" 2>/dev/null || exit 0
-        [ "$owner" = "$WATCHER_PID" ] || exit 0
+        # Retire ONLY on positive evidence of a successor: a non-empty owner
+        # that is not our parent. An empty or unreadable pidfile is not
+        # evidence of anything (a tmp cleaner, a writer mid-swap) - it used to
+        # be read as "superseded", and that one misread killed the pulse
+        # permanently. It doesn't skip the beat either: the parent is alive
+        # (kill -0 above), so keep pulsing; it re-claims the file next tick.
+        owner=""
+        read -r owner < "$PIDFILE" 2>/dev/null
+        if [ -n "$owner" ] && [ "$owner" != "$WATCHER_PID" ]; then
+            exit 0
+        fi
         [ -e "$BLINK_FLAG" ] || continue
         if [ "$(tmux show-options -gqv @agent_blink 2>/dev/null)" = "1" ]; then
             tmux set-option -g @agent_blink 0 \; refresh-client -S 2>/dev/null
@@ -467,6 +533,20 @@ EOF
     gc_streak_next=" "
     wez_front=""   # per tick, computed at most once, only if a tinted tab is watched
     while IFS="$US" read -r win state wac since; do
+        # MID-TICK HEARTBEAT. The heartbeat means "the loop is turning", and a
+        # COLD tick turns slowly but does turn: resolve_session_bases' lineage
+        # walk greps every transcript in the project dir (643 MB under
+        # -Users-mackhaymond here, ~7 s per session), its cache lives in this
+        # process, and the first tick after any (re)start pays it for every
+        # claude window. Measured 2026-10-07: first ticks past 35 s, so
+        # ensure_watcher's 30 s grace read a working daemon as wedged, reaped
+        # it, and the respawn started cold again - a restart every ~35 s with
+        # no reconcile ever finishing. Stamping once per window keeps a slow
+        # tick alive while a truly blocked call (one window stuck > 30 s)
+        # still goes stale. Builtins only (read + in-place printf): no fork.
+        # Only while we still own the file - never stamp over a successor.
+        read -r _owner < "$PIDFILE" 2>/dev/null || _owner=""
+        [ "$_owner" = "$$" ] && restamp_pidfile
         # SEEN-IT, CONTINUOUSLY. The hook discharges a yellow/green that lands
         # while the user is sitting on the tab with WezTerm focused; this is
         # the other order - the tint landed while WezTerm was behind something,
@@ -617,10 +697,14 @@ EOF
 
         # @agent_since = "<epoch> <state>": when this window's state last
         # changed (the roster's elapsed column and the jump order read it).
-        # Stamped HERE, against the stored value, rather than in each writer:
-        # the hook's set_state, its clear_state, the seen-it discharge, the
+        # The hook's set_state stamps its own transitions at write time (a
+        # tick can take 4-6s, so a done->running->done inside one tick would
+        # otherwise keep the old stamp) and clear_state unsets it. This is
+        # the BACKSTOP for everyone else: the seen-it discharge, the
         # stuck-running reconcile, the idle seed and the GC all change state,
-        # and this one comparison sees every one of them within a tick. It is
+        # and this one comparison against the stored value sees every one of
+        # them within a tick (a hook stamp that already matches the live
+        # state is left alone). It is
         # compared with what is STORED, not with last tick's memory, so a
         # `prefix r` or an ensure_watcher respawn neither restamps every
         # window nor loses a change made while no watcher was running. Up to
@@ -661,14 +745,36 @@ EOF
     # working chip went pink↔blue a frozen blink renders as plain blue —
     # i.e. identical to idle, so the surface lies rather than merely going
     # quiet. Restamping the pidfile each tick makes the mtime a liveness
-    # clock that ensure_watcher can test. Builtin redirect: no fork.
+    # clock that ensure_watcher can test. The pulse child reads this file
+    # every second, so it is never truncated: already ours → identical bytes
+    # rewritten in place (restamp_pidfile, builtin, no fork); empty/missing →
+    # re-claimed with the atomic temp+mv (write_pidfile, rare).
     #
     # Reading it back first also settles a race the startup guard can't: if
     # a newer instance has claimed the file, WE are the stale one and should
     # go, rather than both of us toggling @agent_blink and cancelling out.
-    read -r _owner < "$PIDFILE" 2>/dev/null || _owner="$$"
-    [ "$_owner" = "$$" ] || exit 0
-    echo $$ > "$PIDFILE"
+    # Only a non-empty foreign pid counts as a successor.
+    _owner=""
+    read -r _owner < "$PIDFILE" 2>/dev/null
+    if [ "$_owner" = "$$" ]; then
+        restamp_pidfile
+    elif [ -z "$_owner" ]; then
+        write_pidfile
+    else
+        exit 0
+    fi
+
+    # PULSE CHILD WATCHDOG. Still ours past the check above, so the child has
+    # no reason to be gone - but if it is (killed, or it misread the pidfile
+    # under an older build), nothing else would ever restart it and the pulse
+    # would sit frozen. kill -0 is a builtin; a pid can only be reused after
+    # bash reaps it, and a reaped child fails this check within a second, long
+    # before a ~15-minute pid wrap could hand that number to a stranger.
+    if [ -z "${BLINK_PID:-}" ] || ! kill -0 "$BLINK_PID" 2>/dev/null; then
+        BLINK_PID=""
+        blink_loop &
+        BLINK_PID=$!
+    fi
 
     if [ -n "$MAX_TICKS" ]; then
         MAX_TICKS=$((MAX_TICKS - 1))

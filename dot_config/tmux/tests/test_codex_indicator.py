@@ -26,21 +26,25 @@ a=sys.argv[1:]
 sock=os.environ.get('TMUX','').split(',')[0]
 if a[:1]==['-S']: sock=a[1]; a=a[2:]
 if sock!='/fake/owned': sys.exit(91)
+cmds=[[]]
+for x in a: cmds.append([]) if x==';' else cmds[-1].append(x)  # tmux command lists
 with p.with_suffix('.lock').open('a') as lock:
  fcntl.flock(lock,fcntl.LOCK_EX)
- s=json.loads(p.read_text()); s['calls'].append(a)
- cmd=a[0]; target=a[a.index('-t')+1] if '-t' in a else ''
- if cmd=='display-message':
-  fmt=a[-1]
-  if target=='%42': print('@7' if fmt=='#{window_id}' else '/work/project')
-  elif target=='@7': print('0')
-  else: sys.exit(1)
- elif cmd=='show-options': print(s['windows'].get(target,{}).get(a[-1],''))
- elif cmd=='set-option':
-  if target not in s['windows']: sys.exit(1)
-  key=next(x for x in a[1:] if x.startswith('@agent_'))
-  if '-uw' in a: s['windows'][target].pop(key,None)
-  else: s['windows'][target][key]=a[-1]
+ s=json.loads(p.read_text())
+ for a in [c for c in cmds if c]:
+  s['calls'].append(a)
+  cmd=a[0]; target=a[a.index('-t')+1] if '-t' in a else ''
+  if cmd=='display-message':
+   fmt=a[-1]
+   if target=='%42': print('@7' if fmt=='#{window_id}' else '/work/project')
+   elif target=='@7': print('0')
+   else: sys.exit(1)
+  elif cmd=='show-options': print(s['windows'].get(target,{}).get(a[-1],''))
+  elif cmd=='set-option':
+   if target not in s['windows']: sys.exit(1)
+   key=next(x for x in a[1:] if x.startswith('@agent_'))
+   if '-uw' in a: s['windows'][target].pop(key,None)
+   else: s['windows'][target][key]=a[-1]
  p.write_text(json.dumps(s))
 # Simulate only the title job, not the unrelated watcher watchdog request.
 if cmd=='run-shell' and ' condense ' in a[-1]:

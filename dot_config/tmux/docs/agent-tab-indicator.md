@@ -63,7 +63,7 @@ test — a dead turn is not answered by being looked at — but focusing the tab
 Two per-window tmux user options are the single source of truth:
 
 - `@agent_state` — `idle | running | needs-input | failed | done` (unset = no agent)
-- `@agent_since` — `"<epoch> <state>"`: when the state last changed. Stamped by the watcher alone (it compares the live state with the stored one each tick, so every writer is covered and restarts lose nothing); unset with the state. Read by `agent-jump.sh` (oldest-first order) and the planned roster's elapsed column.
+- `@agent_since` — `"<epoch> <state>"`: when the state last changed. Stamped by the hook's `set_state` at the transition itself, in the same tmux command list as `@agent_state` so the watcher can never snapshot one without the other (and unset by `clear_state`), because a watcher tick can take 4–6 s and a `done→running→done` inside one tick otherwise kept the old stamp. The watcher stays the backstop for every other writer (seen-it discharge, stuck-running reconcile, idle seed, GC): it compares the live state with the stored stamp each tick, leaves a matching stamp alone, so restarts lose nothing; unset with the state. Read by `agent-jump.sh` (oldest-first order) and the `prefix e` roster's elapsed column.
 - `@agent_summary` — short conversation title
 - `@agent_workflow` — `1` while a background Claude Workflow is in flight (else unset); set by the watcher, orthogonal to `@agent_state`
 - `@agent_cua` — `1` while the agent is driving an app through cua-driver (lingers up to `CUA_LIVE`, 60 s); set by the watcher
@@ -218,8 +218,19 @@ gave 1.7 s phases with 4–6 s spikes. A forked child, `blink_loop`, owns
 `@agent_blink` and flips it every second while the loop's flag file
 (`$TMPDIR/agent-tab-blink.$UID`) exists; the loop only raises or lowers the
 flag (any window `running`, a workflow, or cua). The child exits as soon as
-the parent is gone or no longer owns the pidfile, and the parent kills it on
-exit, so there is still exactly one toggler. The singleton guard is
+the parent is gone or a *different, non-empty* pid owns the pidfile. An empty
+or unreadable pidfile is neither a reason to exit nor to skip the beat — the
+parent is alive, so the child keeps pulsing (an empty read used to mean
+"exit", and the truncate-then-write restamp made ~1–2 children a day misread
+themselves as superseded and freeze the pulse for good). The parent re-forks
+the child on any tick that finds it dead (`kill -0`), and on exit kills it
+only after checking bash's job table (`jobs -rp`) that `BLINK_PID` is still
+its own unreaped child — a bare `kill "$BLINK_PID"` could SIGTERM an unrelated
+process once a dead child's pid was reused. The child naps with
+`sleep & wait`, not a foreground `sleep`, so that kill lands at once instead
+of pending until the nap ends (bash defers trapped signals during a
+foreground command); its trap reaps the nap. So there is still exactly one
+toggler, and it cannot silently stay dead. The singleton guard is
 ownership-aware: each start reaps any prior instance (by PID file, plus a
 `pgrep` sweep for stragglers whose PID file was lost — two live daemons would
 both toggle `@agent_blink` per tick and cancel each other out) and only clears
@@ -303,7 +314,16 @@ here — the pidfile, `ensure_watcher`'s `kill -0`, the `ps` identity check —
 proves a *process* exists; none prove the *loop* is still going round, and a
 tmux call or the `live_cua_pids` python wedging would leave a healthy-looking
 daemon that quietly stopped reconciling. So the loop restamps its pidfile every
-tick (builtin redirect, no fork), making the mtime a liveness clock;
+tick, making the mtime a liveness clock. **It is never truncated**:
+`echo $$ > pidfile` truncates first, and a reader in that window sees an empty
+file (~22% of reads in a tight loop) — which is exactly what killed the pulse
+child above. A *claim* (startup, or a tick that finds the file empty/missing)
+writes a sibling temp file and `mv -f`s it over (atomic rename). The per-tick
+*restamp*, when the file already reads our pid, rewrites those identical bytes
+in place with `printf … 1<>pidfile` (open without truncation; builtin, no fork
+— an `mv` every second would be ~86k forks a day): readers see the same
+complete content throughout, and the write still advances the mtime that
+`ensure_watcher` and the roster read;
 `ensure_watcher` treats a stamp older than **30 s** as a wedge and reaps the
 daemon before respawning. The kill is `TERM` then `CONT`, because a wedge that
 is *stopped* rather than blocked leaves the TERM merely pending — it would hold

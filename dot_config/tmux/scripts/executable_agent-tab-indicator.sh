@@ -220,11 +220,24 @@ set_state() {
     # must not churn the status line. Writes are best-effort: the window can
     # close between the read and the write, and a failed write must not make
     # the hook exit nonzero (codex treats hook exit status as a gate).
-    local win="$1" new="$2" cur
+    #
+    # @agent_since ("<epoch> <state>", the roster's elapsed column and the
+    # jump order) is stamped HERE, at the transition, not only by the
+    # watcher: the watcher compares once per tick, and a tick can take 4-6s,
+    # so done->running->done inside one tick kept the OLD stamp. The watcher
+    # still stamps as the backstop for writers that bypass this function; a
+    # stamp written here already matches the live state, so it leaves it be.
+    # Change-only like the state write, so the no-op heartbeat stays fork-free.
+    # ONE tmux invocation for both: the server runs a command list as a unit,
+    # so the watcher's snapshot can't land between them and restamp the new
+    # state against a stale stamp (and it saves a fork).
+    local win="$1" new="$2" cur ts
     owns_window "$win" || return 0
     cur=$(window_state "$win")
     [ "$cur" = "$new" ] && return 0
-    tmux set-option -w -t "$win" @agent_state "$new" 2>/dev/null || true
+    printf -v ts '%(%s)T' -1 2>/dev/null || ts=$(date +%s)
+    tmux set-option -w -t "$win" @agent_state "$new" \; \
+         set-option -w -t "$win" @agent_since "$ts $new" 2>/dev/null || true
     tmux refresh-client -S 2>/dev/null || true
 }
 
@@ -239,6 +252,7 @@ clear_state() {
     tmux set-option -uw -t "$win" @agent_rollout 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null || true
+    tmux set-option -uw -t "$win" @agent_since 2>/dev/null || true
     if [ -n "$cur" ]; then
         tmux refresh-client -S 2>/dev/null || true
     fi
