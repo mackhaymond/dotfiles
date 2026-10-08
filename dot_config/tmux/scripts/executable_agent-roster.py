@@ -7,6 +7,16 @@ docs/agent-tab-indicator.md). It holds no state of its own and runs only while
 the popup is open: ONE tmux call a second (`list-windows -a \\; list-clients`).
 
     agent-roster.py --client <client_tty>
+    agent-roster.py --strip [--tmux-pane <id>] [--wezterm <path>]   (see Strip)
+
+NUMBER KEYS: every window row carries a hotkey in its index column, unique
+across the list (a window shown twice gets two). Pressing it goes there, the
+same path as Enter, and closes the popup: 1-9 always act on the first key;
+rows 10.. are 0 + a fixed-width number (01.., never a bare 0), so no label is
+a prefix of another and nothing ever waits on a timeout (hotkey_labels). A
+number is resolved against the frame on screen at its first digit, never a
+list rebuilt since, and one that matches nothing swallows further digits
+until another key (Roster.digit). Inside the / filter, digits type.
 
 The client tty has to be passed in: display-popup does not expand formats in
 its command, and `display -p` inside a popup resolves to tmux's "best" client,
@@ -234,7 +244,7 @@ def rank(w):
     return 4 if w["state"] else 9
 
 
-def build_items(windows, needs, cur_win, show_all=False, parked_open=False, query=""):
+def build_items(windows, needs, cur_win, show_all=False, parked_open=False, query="", stable=False):
     """The list as rows. Each item is a dict with kind in
     label | sess | win | parked; only win and parked are selectable.
 
@@ -263,7 +273,12 @@ def build_items(windows, needs, cur_win, show_all=False, parked_open=False, quer
             continue
         sessions.setdefault(w["session"], []).append(w)
     cur_sess = by_id[cur_win]["session"] if cur_win in by_id else None
-    order = sorted(sessions, key=lambda s: (s != cur_sess, -max(w["last_attached"] for w in sessions[s]), s))
+    if stable:
+        # The strip: a click moves the client, and "current session first"
+        # would then reshuffle the list under the mouse. By name instead.
+        order = sorted(sessions)
+    else:
+        order = sorted(sessions, key=lambda s: (s != cur_sess, -max(w["last_attached"] for w in sessions[s]), s))
     for s in order:
         ws = sorted(sessions[s], key=lambda w: w["index"])
         shown = [w for w in ws if show_all or w["state"] or w["id"] == cur_win]
@@ -284,6 +299,36 @@ def build_items(windows, needs, cur_win, show_all=False, parked_open=False, quer
             items.extend({"kind": "win", "w": w, "long": False, "parked": True, "key": ("parked", w["id"])}
                          for w in parked)
     return items
+
+
+def hotkey_labels(n):
+    """The digit labels for n numbered rows, in display order.
+
+    Rows 1-9 are always the single keys 1-9, however long the list: the top
+    of the list (NEEDS YOU, then the current session) is what gets pressed,
+    and it must never wait on a timeout. Rows 10.. are `0` plus a FIXED-width
+    number ("01".."09", or "001".."0NN" past 18 rows), so the label set is
+    prefix-free: every key sequence is complete the moment its last digit
+    lands, with no 350 ms wait and no Enter. The label shown on the row is
+    exactly what to type.
+
+    A bare `0` is NEVER a complete label (no "tenth row is 0" shortcut): when
+    the list shrinks under a half-read number (11 → 10 rows), a stale `01`
+    must stay inside the 0-namespace, not act on `0` and let the `1` fall
+    through into the agent pane the jump just focused (a permission menu,
+    where 1 = Yes)."""
+    if n <= 9:
+        return [str(i) for i in range(1, n + 1)]
+    w = len(str(n - 9))
+    return [str(i) for i in range(1, 10)] + ["0" + str(k).zfill(w) for k in range(1, n - 8)]
+
+
+def number_items(items):
+    """{item position: label} for every WINDOW row (NEEDS YOU, session-group,
+    expanded parked rows, filter hits), in display order. A window listed
+    twice gets two numbers; the parked header is not a window, no number."""
+    pos = [i for i, it in enumerate(items) if it["kind"] == "win"]
+    return dict(zip(pos, hotkey_labels(len(pos))))
 
 
 def selectable(items):
@@ -307,6 +352,8 @@ KEYCHR = {"\t": "tab", "\r": "enter", "\n": "enter", " ": "space",
 CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")       # ECMA-48: params, intermediates, final
 CSI_PART = re.compile(r"\x1b\[[0-?]*[ -/]*\Z")     # a CSI cut off by the end of the read
 SS3 = re.compile(r"\x1bO[ -~]")
+# SGR mouse report (DECSET 1006): ESC [ < button ; col ; row M (press) / m (release).
+MOUSE_SGR = re.compile(r"\x1b\[<([0-9]+);([0-9]+);([0-9]+)([Mm])\Z")
 
 
 def parse_keys(buf, final=False):
@@ -330,8 +377,11 @@ def parse_keys(buf, final=False):
         m = CSI.match(buf, i) or SS3.match(buf, i)
         if m:
             name = KEYSEQ.get(m.group())
+            mouse = None if name else MOUSE_SGR.match(m.group())
             if name:
                 keys.append(name)
+            elif mouse:                                  # "mouse:<button>:<col>:<row>:<M|m>"
+                keys.append("mouse:%s:%s:%s:%s" % mouse.groups())
             i = m.end()
             continue
         if i + 1 == n:                                   # ESC is the last byte
@@ -511,6 +561,47 @@ def agent_pane(win):
     return pick_agent_pane(r.stdout, ps_text)
 
 
+def pick_tmux_pane(panes, own, clients, hint=None):
+    """The strip's tmux client → (client_tty, wezterm pane_id) or (None, None).
+
+    panes: `wezterm cli list --format json`, parsed. own: the strip's own
+    pane id ($WEZTERM_PANE). clients: parse_clients() of the snapshot. The
+    tmux client is a pane in the strip's OWN tab, not the strip, whose tty is
+    an attached tmux client; with several, the pane CMD+B was pressed in
+    (`hint`), then the active one, then the first."""
+    own = str(own) if own is not None else None
+    me = next((p for p in panes or () if str(p.get("pane_id")) == own), None)
+    if me is None:
+        return None, None
+    cands = [p for p in panes if p.get("tab_id") == me.get("tab_id") and str(p.get("pane_id")) != own
+             and p.get("tty_name") in clients]
+    if not cands:
+        return None, None
+    best = (next((p for p in cands if str(p.get("pane_id")) == str(hint)), None)
+            or next((p for p in cands if p.get("is_active")), None) or cands[0])
+    return best["tty_name"], str(best["pane_id"])
+
+
+def wezterm_cli(exe, *args):
+    """`wezterm cli ...` → CompletedProcess or None. Only on a click, a stray
+    key, or while the strip has no client: never on the refresh tick."""
+    try:
+        return subprocess.run([exe, "cli", *args], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def wezterm_panes(exe):
+    r = wezterm_cli(exe, "list", "--format", "json")
+    if not r or r.returncode:
+        return None
+    import json                          # strip only, and only when (re)resolving
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return None
+
+
 def watcher_age():
     try:
         return time.time() - os.stat(PIDFILE).st_mtime
@@ -521,6 +612,8 @@ def watcher_age():
 # ── UI ─────────────────────────────────────────────────────────────────────
 
 class Roster:
+    STABLE_ORDER = False             # sessions: current first, then most recently used
+
     def __init__(self, client):
         self.client = client
         self.windows, self.needs, self.cur_win = [], [], None
@@ -531,6 +624,11 @@ class Roster:
         self.msg, self.msg_until = "", 0.0
         self.top = 0
         self.gone = False
+        self.labels = {}             # item position → hotkey label (number_items)
+        self.drawn = {}              # label → item, as on screen in the LAST frame drawn
+        self.digits, self.digit_map = "", {}   # a 0-prefixed number being typed, and its frame
+        self.digits_dead = False     # a number matched nothing: swallow digits until another key
+        self.last_frame = None       # what draw() last wrote: identical frames are not rewritten
 
     # data
     def refresh(self):
@@ -546,7 +644,8 @@ class Roster:
 
     def rebuild(self):
         self.items = build_items(self.windows, self.needs, self.cur_win, self.show_all,
-                                 self.parked_open, self.query)
+                                 self.parked_open, self.query, stable=self.STABLE_ORDER)
+        self.labels = number_items(self.items)
         sel = selectable(self.items)
         keys = [item_key(self.items[i]) for i in sel]
         if self.sel_key in keys:
@@ -591,7 +690,55 @@ class Roster:
             return False
         return True
 
-    def handle(self, keys):
+    def go(self, it):
+        """Go to a window row → True once the move ran (Enter, a number, a
+        click). `it` may come from a frame drawn before the latest refresh, so
+        the window is re-checked first: gone, or no longer in the session the
+        row showed (parked or unparked meanwhile) → nothing runs, the footer
+        says why. A parked row comes back through stash.sh unstash."""
+        w = it["w"]
+        now = [x for x in self.windows if x["id"] == w["id"]]
+        if not now:
+            self.say(PANE_GONE)
+            return False
+        if not any(x["session"] == w["session"] for x in now):
+            self.say("that tab moved · pick it again")
+            return False
+        if w["session"] == HOLD:
+            run_bg("'%s' unstash '%s' '%s'" % (STASH, w["id"], self.client))
+            return True
+        return self.jump("goto", w["id"])
+
+    def digit(self, key):
+        """A digit outside the filter → True to close the popup.
+
+        Resolved against self.drawn, the labels of the frame on screen when
+        the first digit was pressed, never against a list rebuilt since: a
+        number always means the row the user read it on. Labels are
+        prefix-free (hotkey_labels), so a complete label acts at once and an
+        incomplete one ("0" with ten rows or more) waits for the next digit,
+        with no timeout; esc drops it, backspace takes one digit back.
+
+        A sequence that matches nothing (a stale "005" typed after the list
+        shrank to "01".."09") swallows every further digit until a non-digit
+        key: its tail must never restart as a fresh single-digit jump ("5")
+        to some other window."""
+        if self.digits_dead:
+            return False
+        if not self.digits:
+            self.digit_map = dict(self.drawn)
+        self.digits += key
+        it = self.digit_map.get(self.digits)
+        if it is not None:
+            self.digits = ""
+            return self.go(it)
+        if any(l.startswith(self.digits) for l in self.digit_map):
+            return False
+        self.say("no row %s on screen · digits ignored until another key" % self.digits)
+        self.digits, self.digits_dead = "", True
+        return False
+
+    def handle(self, keys, raw=None):
         """One read's worth of keys → True to close the popup. A key that
         opens a y/n drops the rest of its batch, so the answer has to come in
         a later read: a paste or a fast "Hy" / "xy" must not confirm itself
@@ -659,6 +806,20 @@ class Roster:
             self.rebuild()
             return False
 
+        if len(key) == 1 and "0" <= key <= "9":
+            return self.digit(key)
+        if self.digits_dead:             # any non-digit ends the swallowing; esc/⏎/⌫ only that
+            self.digits_dead = False
+            if key in ("esc", "enter", "bs"):
+                return False
+        if self.digits:                  # any other key ends a half-typed number
+            if key == "bs":
+                self.digits = self.digits[:-1]
+                return False
+            self.digits = ""
+            if key in ("esc", "enter"):  # esc/⏎ only drop it
+                return False
+
         it = self.selected()
         if key in ("esc", "q", "ctrl-c"):
             if self.query:
@@ -677,11 +838,7 @@ class Roster:
                 return False
             if it["kind"] == "parked":
                 self.parked_open = not self.parked_open; self.rebuild(); return False
-            w = it["w"]
-            if w["session"] == HOLD:
-                run_bg("'%s' unstash '%s' '%s'" % (STASH, w["id"], self.client))
-                return True
-            return self.jump("goto", w["id"])
+            return self.go(it)
         elif key == "d":
             return self.jump("next")
         elif key == "x" and it and it["kind"] == "win":
@@ -719,7 +876,10 @@ class Roster:
             return fg("overlay" if is_attn(w) else ("blue" if blink else "dimblue")) + MOUSE + " "
         return ""
 
-    def row(self, it, width, blink, now, selected):
+    def row(self, it, width, blink, now, selected, label=None, label_w=0):
+        """One line. `label` is the row's hotkey (number_items), drawn in the
+        index column, right-aligned to label_w; NEEDS YOU and filter rows add
+        a dim session:index after it, since no session header names theirs."""
         base = bg("surface0") if selected else ""
         if it["kind"] == "label":
             return " " + fg("overlay") + it["text"]
@@ -734,7 +894,14 @@ class Roster:
         w = it["w"]
         cur = w["id"] == self.cur_win
         bar = (fg("peach") + "▌") if cur else " "
-        ix = ("%s:%d" % (w["session"], w["index"])) if it["long"] else ("  %d" % w["index"])
+        where = "%s:%d" % (w["session"], w["index"])
+        if label is not None:
+            num = label.rjust(label_w)
+            ix = (num + " " + where) if it["long"] else num
+            ixs = fg("sub") + BOLD + num + RESET + base + fg("overlay") + ix[len(num):]
+        else:
+            ix = where if it["long"] else ("  %d" % w["index"])
+            ixs = fg("overlay") + ix
         state = {"failed": "failed", "needs-input": "waiting on you", "done": "done",
                  "running": "working", "idle": "idle"}.get(w["state"], "")
         if w["state"] == "done" and w["workflow"]:
@@ -751,17 +918,28 @@ class Roster:
         title = clip(w["label"], max(4, title_w))
         pad = " " * max(0, title_w - dwidth(title))
         tcol = fg("text") if w["state"] or cur or w["session"] == HOLD else fg("overlay")
-        return (base + bar + self.dot(w, blink) + base + " " + fg("overlay") + ix + "  " + tcol + title + pad
+        return (base + bar + self.dot(w, blink) + base + " " + ixs + "  " + tcol + title + pad
                 + g + base + fg("overlay") + right)
 
+    DEFAULT_SIZE = (100, 30)
+
     def draw(self, out):
+        """Render and write the frame, unless it is byte-identical to the last
+        one written: an idle roster (the strip above all, open all day) then
+        costs the terminal no repaint at all. main() clears last_frame on
+        SIGWINCH, when the terminal may have reflowed what is on screen."""
         try:
             cols, rows = os.get_terminal_size(sys.stdout.fileno())
         except OSError:
-            cols, rows = 100, 30
+            cols, rows = self.DEFAULT_SIZE
         lines = self.render(cols, rows, time.time())
-        out.write("\x1b[H" + "\x1b[K\r\n".join(lines) + "\x1b[K")
+        frame = "\x1b[H" + "\x1b[K\r\n".join(lines) + "\x1b[K"
+        if frame == self.last_frame:
+            return False
+        out.write(frame)
         out.flush()
+        self.last_frame = frame
+        return True
 
     def render(self, cols, rows, now):
         """The frame as exactly `rows` lines, each at most cols-1 cells. The
@@ -796,8 +974,14 @@ class Roster:
             self.top = sel_pos - body_h + 1
         self.top = max(0, min(self.top, max(0, len(self.items) - body_h)))
         view = self.items[self.top:self.top + body_h]
-        for it in view:
-            lines.append(self.row(it, cols, blink, now, item_key(it) == self.sel_key and it["kind"] in ("win", "parked")))
+        label_w = max([len(l) for l in self.labels.values()] or [0])
+        self.drawn = {}
+        for pos, it in enumerate(view, self.top):
+            label = self.labels.get(pos)
+            if label is not None:
+                self.drawn[label] = it
+            lines.append(self.row(it, cols, blink, now, item_key(it) == self.sel_key and it["kind"] in ("win", "parked"),
+                                  label, label_w))
         if not self.items:
             lines.append(" " + fg("overlay") + ("no matches" if self.query else "no agents running"))
         while len(lines) < rows - 2:
@@ -809,11 +993,18 @@ class Roster:
             foot = fg("yellow") + " %s %s:%d %s? " % (verb, cw["session"], cw["index"], cw["label"]) + fg("text") + "y/n"
         elif self.filtering:
             foot = fg("peach") + " / " + fg("text") + self.query + "▏" + fg("overlay") + "   ⏎ keep · esc clear"
+        elif self.digits:
+            foot = fg("peach") + " " + self.digits + "▏" + fg("overlay") + "  next digit · esc cancel"
         elif self.msg and now < self.msg_until:
             foot = " " + fg("sky") + self.msg
+        elif self.digits_dead:
+            # Outlives the 3 s message on purpose: until another key ends it,
+            # every digit is swallowed, and a silent swallow reads as broken.
+            foot = fg("yellow") + " digits ignored until another key" + fg("overlay") + "  (esc clears)"
         else:
             q = (fg("peach") + " /" + self.query + fg("overlay") + " · ") if self.query else " "
-            foot = q + fg("overlay") + "tab/j/k move · space/⏎ go · d next · x close · H park · / filter · a all · esc"
+            foot = q + fg("overlay") + ("1-9/0 go · tab/j/k move · space/⏎ go · d next · x close · H park"
+                                        " · / filter · a all · esc")
         lines.append("")
         lines.append(foot)
 
@@ -842,15 +1033,222 @@ def clip_ansi(s, width):
     return "".join(out)
 
 
+STRIP_VAR = "agent_strip"            # the user var wezterm.lua's CMD+B looks for
+STRIP_TITLE = "agent-strip"
+RESOLVE_EVERY = 5.0                   # while there is no tmux client: one `wezterm cli list` per 5 s
+MOUSE_RAW = re.compile(rb"\x1b\[<[0-9;]*[Mm]")
+MOUSE_TAIL = re.compile(rb"\x1b\[<?[0-9;]*\Z")    # a report (or CSI) cut off at the end of a read
+MOUSE_HEAD = re.compile(rb"\A<?[0-9;]*[Mm]")       # ...and the rest of it, at the start of the next
+WHEEL_STEP = 3
+
+
+class Strip(Roster):
+    """--strip: the always-visible, click-only list in a narrow WezTerm split
+    left of the tmux pane (CMD+B in wezterm.lua toggles it).
+
+    Same model, same one tmux call a second, a ~34-column layout, and no
+    keyboard: a left click on a row goes there (agent-jump.sh goto, or
+    stash.sh unstash for a parked row), a click on `parked` folds it, the
+    wheel scrolls. A click makes WezTerm focus this pane, and every CMD
+    shortcut in wezterm.lua is a SendKey to the ACTIVE pane, so each click
+    hands focus straight back to the tmux pane (`wezterm cli activate-pane`),
+    before the move runs; a key that lands here anyway is forwarded to the
+    tmux pane (`wezterm cli send-text --no-paste`), so nothing is lost.
+
+    The tmux client is found, not passed: `wezterm cli list` → the other
+    pane in this tab → its tty → the tmux client with that client_tty. Done
+    at start and again (at most every RESOLVE_EVERY s) while the client is
+    missing; `--client` pins it instead (tests)."""
+    STABLE_ORDER = True              # sessions by name: a click must not reshuffle the list
+
+    def __init__(self, client=None, wezterm="wezterm", hint=None, own=None):
+        Roster.__init__(self, client)
+        self.fixed = client is not None
+        self.wezterm, self.hint, self.own = wezterm, hint, own
+        self.tmux_pane = hint if self.fixed else None
+        self.clients = {}
+        self.next_resolve = 0.0
+        self.stop = 0                 # first body row shown (the wheel moves it)
+        self.line_items = []          # screen line → item, as last drawn
+        self.cut_mouse = False        # the last read ended inside a mouse report
+
+    def load(self, text):
+        self.clients = parse_clients(text)
+        if not self.fixed and self.client not in self.clients and time.time() >= self.next_resolve:
+            self.resolve()
+        Roster.load(self, text)
+
+    def resolve(self):
+        self.next_resolve = time.time() + RESOLVE_EVERY
+        if self.fixed:
+            return
+        panes = wezterm_panes(self.wezterm)
+        if panes is None:             # `wezterm cli list` itself failed: keep what we had
+            return
+        self.client, self.tmux_pane = pick_tmux_pane(panes, self.own, self.clients, self.hint)
+
+    def focus_back(self, data=b""):
+        """Give the keyboard back to the tmux pane (and pass it `data`, the
+        keys that landed here). One re-resolve if the pane id went stale;
+        if that fails too, the strip says so (focus is still here)."""
+        for attempt in (0, 1):
+            if self.tmux_pane is None:
+                if attempt or self.fixed:
+                    break
+                self.resolve()
+                continue
+            ok = True
+            if data:
+                try:
+                    r = subprocess.run([self.wezterm, "cli", "send-text", "--pane-id", self.tmux_pane, "--no-paste"],
+                                       input=data, capture_output=True, timeout=3)
+                    ok = r.returncode == 0
+                except (OSError, subprocess.TimeoutExpired):
+                    ok = False
+            r = wezterm_cli(self.wezterm, "activate-pane", "--pane-id", self.tmux_pane)
+            if ok and r is not None and r.returncode == 0:
+                return
+            if attempt or self.fixed:
+                break
+            self.resolve()
+        if not (self.fixed and self.tmux_pane is None):   # --client without --tmux-pane: nothing to hand to
+            self.say("couldn't focus tmux · click it")
+
+    def stray_bytes(self, raw):
+        """The typed bytes of one read, minus mouse reports. A report cut off
+        by the ESC_WAIT flush (`ESC [ < 0 ; 5`) is dropped, and so is its
+        tail (`;7M`) at the start of the next read: neither is typing."""
+        if not raw:
+            return b""
+        if self.cut_mouse:
+            raw = MOUSE_HEAD.sub(b"", raw)
+        self.cut_mouse = bool(MOUSE_TAIL.search(raw))
+        return MOUSE_TAIL.sub(b"", MOUSE_RAW.sub(b"", raw))
+
+    def handle(self, keys, raw=None):
+        """Never closes (False). Left press: act on the row drawn at that
+        line. Wheel: scroll. Anything typed: forwarded to the tmux pane."""
+        clicked, stray = None, self.stray_bytes(raw)
+        for key in keys:
+            if not key.startswith("mouse:"):
+                continue
+            _, b, _x, y, kind = key.split(":")
+            b, y = int(b), int(y)
+            if kind != "M":
+                continue
+            if b in (64, 65):
+                self.stop += WHEEL_STEP if b == 65 else -WHEEL_STEP
+            elif (b & ~3) == 0 and b != 3:     # a plain press, no modifiers, not a drag
+                clicked = (b, y)
+        if clicked or stray:
+            self.focus_back(stray)
+        if clicked and clicked[0] == 0:
+            self.click(clicked[1])
+        return False
+
+    def click(self, y):
+        it = self.line_items[y - 1] if 0 < y <= len(self.line_items) else None
+        if it is None:
+            return
+        if it["kind"] == "parked":
+            self.parked_open = not self.parked_open
+            self.rebuild()
+        elif it["kind"] == "win":
+            if self.client is None:
+                self.say("no tmux client")
+                return
+            if self.go(it):
+                self.refresh()            # the peach bar follows the move now, not in a second
+
+    DEFAULT_SIZE = (34, 30)
+
+    def render(self, cols, rows, now):
+        """Exactly `rows` lines of at most cols-1 cells, like the popup's;
+        records which item each screen line shows (line_items) for clicks."""
+        rows = max(1, rows)
+        blink = bool(self.windows) and self.windows[0]["blink"] == "1"
+        ws = [w for w in self.windows if w["session"] not in HIDDEN]
+        n_work = sum(1 for w in ws if w["state"] and in_flight(w) and not is_attn(w))
+        n_need = len(self.needs)
+        head = (" " + fg("peach") + BOLD + "AGENTS" + RESET + "  " + fg("pink") + "%d work" % n_work
+                + fg("overlay") + " · " + (fg("yellow") if n_need else "") + "%d need" % n_need)
+        age = watcher_age()
+        if self.client is None or self.gone:
+            status = " " + fg("overlay") + "no tmux client"
+        elif age is None or age > WATCHER_STALE:
+            status = " " + bg("red") + fg("crust") + BOLD + " watcher %s " % ("off" if age is None else "stalled") + RESET
+        else:
+            status = ""
+        lines, self.line_items = [head, status], [None, None]
+        body_h = max(1, rows - 3)
+        self.stop = max(0, min(self.stop, max(0, len(self.items) - body_h)))
+        for it in self.items[self.stop:self.stop + body_h]:
+            lines.append(self.strip_row(it, cols - 1, blink, now))
+            self.line_items.append(it)
+        if not self.items:
+            lines.append(" " + fg("overlay") + "no agents running")
+        while len(lines) < rows - 1:
+            lines.append("")
+        lines.append((" " + fg("sky") + self.msg) if self.msg and now < self.msg_until else "")
+        lines = (lines + [""] * rows)[:rows]
+        self.line_items = (self.line_items + [None] * rows)[:rows]
+        return [clip_ansi(l, cols - 1) + RESET for l in lines]
+
+    def strip_row(self, it, width, blink, now):
+        if it["kind"] == "label":
+            return " " + fg("overlay") + it["text"]
+        if it["kind"] == "sess":
+            b = it["best"]
+            mark = (self.dot(b, blink) + " ") if b and rank(b) < 4 else ""
+            return " " + fg("sub") + BOLD + it["name"] + RESET + " " + mark
+        if it["kind"] == "parked":
+            extra = (fg("yellow") + " %d need" % it["attn"]) if it["attn"] else ""
+            return " " + fg("sub") + "%s parked (%d)" % ("▾" if self.parked_open else "▸", it["n"]) + extra
+        w = it["w"]
+        cur = w["id"] == self.cur_win
+        bar = (fg("peach") + "▌") if cur else " "
+        # NEEDS YOU rows have no session header above them: a short session.
+        ix = ("%s:%d" % (clip(w["session"], 8), w["index"])) if it["long"] else "%d" % w["index"]
+        when = (w["stash_t"] or w["since_t"]) if w["session"] == HOLD else w["since_t"]
+        right = " %3s" % ago(when, now) if when is not None else ""
+        g = self.glyph(w, blink)
+        gw = 2 if g else 0
+        title_w = width - 3 - dwidth(ix) - 1 - gw - len(right)
+        title = clip(w["label"], max(3, title_w))
+        pad = " " * max(0, title_w - dwidth(title))
+        tcol = fg("text") if w["state"] or cur or w["session"] == HOLD else fg("overlay")
+        return (bar + self.dot(w, blink) + " " + fg("overlay") + ix + " " + tcol + title + pad
+                + g + fg("overlay") + right)
+
+
+def arg_after(argv, flag):
+    if flag in argv:
+        i = argv.index(flag)
+        return argv[i + 1] if i + 1 < len(argv) else None
+    return None
+
+
+USAGE = ("usage: agent-roster.py --client <client_tty>\n"
+         "       agent-roster.py --strip [--tmux-pane <wezterm pane id>] [--wezterm <path>] [--client <tty>]")
+
+
 def main(argv):
-    client = None
-    if "--client" in argv:
-        i = argv.index("--client")
-        client = argv[i + 1] if i + 1 < len(argv) else None
-    if not client:
-        print("usage: agent-roster.py --client <client_tty>", file=sys.stderr)
+    client = arg_after(argv, "--client")
+    if "--strip" in argv:
+        exe = arg_after(argv, "--wezterm") or os.path.join(os.environ.get("WEZTERM_EXECUTABLE_DIR", ""), "wezterm")
+        if not os.path.isabs(exe) or not os.access(exe, os.X_OK):
+            exe = "wezterm"
+        roster = Strip(client, wezterm=exe, hint=arg_after(argv, "--tmux-pane"), own=os.environ.get("WEZTERM_PANE"))
+        # SGR mouse (1000 + 1006), the user var CMD+B finds this pane by, and a title as a second marker.
+        enter = ("\x1b]1337;SetUserVar=%s=MQ==\x07\x1b]2;%s\x07\x1b[?1049h\x1b[?25l\x1b[2J\x1b[?1000h\x1b[?1006h"
+                 % (STRIP_VAR, STRIP_TITLE))
+        leave = "\x1b[?1006l\x1b[?1000l"
+    elif client:
+        roster = Roster(client)
+        enter, leave = "\x1b[?1049h\x1b[?25l\x1b[2J", ""
+    else:
+        print(USAGE, file=sys.stderr)
         return 2
-    roster = Roster(client)
     reader = KeyReader()
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -858,10 +1256,15 @@ def main(argv):
     os.set_blocking(wpipe, False)
     signal.set_wakeup_fd(wpipe)
     signal.signal(signal.SIGWINCH, lambda *_: None)
+    if isinstance(roster, Strip):        # CMD+B's kill-pane: leave quietly, not with a traceback
+        def bye(*_):
+            raise SystemExit(0)
+        signal.signal(signal.SIGHUP, bye)
+        signal.signal(signal.SIGTERM, bye)
     out = sys.stdout
     try:
         tty.setraw(fd)
-        out.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+        out.write(enter)
         roster.refresh()
         next_refresh = time.time() + REFRESH
         roster.draw(out)
@@ -869,12 +1272,13 @@ def main(argv):
             timeout = max(0.0, next_refresh - time.time())
             ready, _, _ = select.select([fd, rpipe], [], [], timeout)
             if rpipe in ready:
-                os.read(rpipe, 64)               # SIGWINCH: just redraw
+                os.read(rpipe, 64)               # SIGWINCH: redraw in full
+                roster.last_frame = None
             if fd in ready:
                 data = os.read(fd, 256)
                 if not data:                     # the pty went away
                     return 0
-                keys = reader.feed(data)
+                keys, raw = reader.feed(data), data
                 # A read that ended mid-sequence (or on a bare ESC) waits
                 # ESC_WAIT for the rest; only silence makes a lone ESC "esc".
                 while reader.pending:
@@ -884,16 +1288,26 @@ def main(argv):
                         keys += reader.flush()
                         break
                     keys += reader.feed(data)
-                if roster.handle(keys):
+                    raw += data
+                if roster.handle(keys, raw):
                     return 0
             if time.time() >= next_refresh:
                 roster.refresh()
                 next_refresh = time.time() + REFRESH
+            # Input that arrived while we refreshed (or ran a move) was typed
+            # or clicked against the frame still on screen: handle it against
+            # THAT frame (drawn / line_items) before drawing a new one, or a
+            # digit or click would land on whatever row now sits there.
+            if select.select([fd], [], [], 0)[0]:
+                continue
             roster.draw(out)
     finally:
-        out.write("\x1b[0m\x1b[?25h\x1b[?1049l")
-        out.flush()
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        try:
+            out.write(leave + "\x1b[0m\x1b[?25h\x1b[?1049l")
+            out.flush()
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except (OSError, termios.error):     # the pane is already gone
+            pass
 
 
 if __name__ == "__main__":

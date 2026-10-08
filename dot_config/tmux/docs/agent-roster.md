@@ -8,6 +8,7 @@ It keeps no state and runs only while the popup is open.
 | Key | Does |
 |---|---|
 | `prefix q` / `prefix C-q` | open the roster |
+| `1`-`9`, then `01`, `02`, … from the tenth row | go to that row at once and close (see [Number keys](#number-keys)) |
 | Tab / Shift-Tab, `j` / `k`, arrows | move |
 | Space / ⏎ | go there (a parked tab comes back via `stash.sh unstash`) |
 | `d` | next tab that needs you (same as `prefix d`) |
@@ -48,9 +49,64 @@ Related keys: `prefix d` / `prefix C-d` jump to the next tab that needs you,
   without this row it would vanish from the list as well as from the tab.
 
 Each row shows: the peach bar (the window this client is on), a state dot in
-the tab bar's hues, `session:index` (NEEDS YOU) or the index, the title
+the tab bar's hues, the row's hotkey number (NEEDS YOU and filter rows add a
+dim `session:index`, since no session header names theirs), the title
 (`@agent_summary`, else the window name), the gear or mouse glyph, the state,
 and the time since `@agent_since`.
+
+## Number keys
+
+Every **window** row (NEEDS YOU, session-group rows, expanded parked rows,
+filter hits) carries a number, unique across the list and assigned in display
+order, so a window shown twice (in NEEDS YOU and in its session) has two.
+Session headers and the `parked (n)` line have none. Pressing a number does
+what ⏎ does on that row (`agent-jump.sh goto`, or `stash.sh unstash` for a
+parked row) and closes the popup.
+
+The labels (`hotkey_labels`):
+
+| rows | labels |
+|---|---|
+| 1-9 | `1` … `9`, every one a single key |
+| 10-18 | `1` … `9`, then `01` … `09` |
+| 19-108 | `1` … `9`, then `001` … `099`; and so on |
+
+A bare `0` is never a label, not even for exactly ten rows. If the list
+shrinks from 11 to 10 rows while you are reading, a stale `01` must stay a
+two-key label inside the `0…` namespace. If the `0` acted alone, the `1`
+would fall through into the agent pane the jump had just focused, often a
+permission menu where `1` means Yes.
+
+Why this and not "wait ~350 ms for a possible second digit": the first nine
+rows are NEEDS YOU and the current session, the ones actually pressed, and with
+a plain 1..N numbering `1` would have to wait whenever there are 10+ rows
+(the usual case here). Keeping 1-9 single and moving everything past nine
+behind a `0` prefix of FIXED width makes the label set prefix-free: every key
+sequence is complete the moment its last digit lands, nothing ever waits on a
+timer, ⏎ is never needed, and the label on the row is exactly what to type.
+While a `0…` is half typed the footer shows it; esc drops it, backspace takes
+a digit back, any other key drops it and does its own thing.
+
+- A number means **the row it was drawn on**: the whole sequence resolves
+  against the frame on screen at its FIRST digit (`Roster.drawn`, labels and
+  their width included), never a list rebuilt by a refresh since. Numbers
+  renumber when the list changes (a NEEDS YOU row appears, `a`, a parked
+  fold), which is fine because the screen changes with them. If the window
+  has gone, or left the session the row showed (parked/unparked meanwhile),
+  nothing runs and the footer says so.
+- **A number that matches nothing swallows its tail**: say row 14 read `005`
+  and the list shrank to 18 rows (`01`…`09`) before you typed. `00` is no
+  row, so the footer says so, and every further digit is ignored until a
+  non-digit key. Esc, ⏎ and backspace only end that state; any other key
+  ends it and does its own thing. Without this, the `5` would start over as
+  a single-digit jump to some other window.
+- **Input during a refresh**: a key or click that arrives while the snapshot
+  is being taken is handled against the frame still on screen, before the new
+  frame is drawn (main loop: a zero-timeout poll after `refresh()` skips the
+  draw when input is waiting).
+- Only rows on screen count: a number scrolled out of view does nothing.
+- Inside the `/` filter, digits type into the query. After ⏎ keeps a filter,
+  the hits are numbered from 1 and digits are hotkeys again.
 
 ## Mechanics
 
@@ -86,6 +142,65 @@ and the time since `@agent_since`.
 - Drawn with raw ANSI truecolour, not curses: inside tmux, curses only gets the
   256-colour palette, and these hues have to match the tab bar and CuaNotch
   exactly. The pulse reads `@agent_blink`, so it beats in step with the tabs.
+
+## WezTerm strip (`CMD+B`)
+
+An always-visible, click-only agent list in a narrow WezTerm split to the
+left of the tmux pane. `CMD+B` (wezterm.lua) opens it, and closes it again if
+the tab already has one. It is this same program, `agent-roster.py --strip`.
+
+- **Layout** (~34 columns): a counts line, a status line, NEEDS YOU, one
+  group per session, `parked (n)`. No numbers (it has no keyboard). Sessions
+  are ordered by **name**, not "current first": a click moves the client, and
+  the popup's order would then reshuffle the list under the mouse.
+- **Mouse only**: SGR mouse reporting (DECSET 1000 + 1006). A left press on a
+  window row goes there (`agent-jump.sh goto`, or `stash.sh unstash` for a
+  parked row); on `parked (n)` it folds/unfolds; the wheel scrolls. A click is
+  resolved against the line as last drawn, and re-checked like a number key.
+- **Focus**: clicking a pane makes WezTerm focus it (and, with the default
+  `swallow_mouse_click_on_pane_focus = false`, still delivers the click), and
+  every CMD shortcut in wezterm.lua is a `SendKey` to the ACTIVE pane. So each
+  click first hands focus back, `wezterm cli activate-pane --pane-id <tmux
+  pane>`, then moves. Any key that lands in the strip anyway is forwarded to
+  the tmux pane (`wezterm cli send-text --no-paste`) and focus handed back, so
+  a CMD+T typed at the wrong moment still reaches tmux. Mouse reports never
+  count as typing, not even one cut in two by the 25 ms ESC wait (both
+  halves are dropped). If focus cannot be handed back (two `activate-pane`
+  failures with a re-resolve between them), the strip says
+  `couldn't focus tmux · click it`.
+- **Which tmux client**: `wezterm cli list --format json` → the pane in the
+  strip's own tab (`$WEZTERM_PANE`) that is not the strip and whose `tty_name`
+  is an attached tmux `client_tty` (preferring the pane CMD+B was pressed in,
+  passed as `--tmux-pane`). Resolved at start; while there is no such client
+  (shown as a dim `no tmux client` line) it retries at most every 5 s, and an
+  `activate-pane` that fails re-resolves once. A failed `wezterm cli list`
+  keeps the client and pane it already had.
+- **Cost**: the same ONE tmux call per second as the popup; `wezterm cli`
+  runs only at start, on a click, on a stray key, or while unresolved. A
+  frame identical to the last one written is not written again (popup and
+  strip), so an idle strip makes WezTerm repaint nothing; SIGWINCH forces
+  a full redraw.
+- **Toggle** (wezterm.lua `toggle_strip`): the strip is recognized by the user
+  var it sets on start (OSC 1337 `SetUserVar=agent_strip=1`), by its title
+  `agent-strip`, or by the pane id recorded in `wezterm.GLOBAL` when it was
+  split off (covers the ~30 ms before python paints, so a fast double CMD+B
+  cannot stack two). Open: `pane:split{direction="Left", size=34,
+  top_level=true, args=…}`, then the tmux pane is re-activated. Close:
+  `wezterm cli kill-pane` in the background (the Lua Pane has no kill, and
+  CloseCurrentPane would close the active pane, i.e. tmux); the strip exits
+  cleanly on the SIGHUP.
+- **Absolute paths**: WezTerm launched from the Dock has a thin PATH, so the
+  split runs `/bin/dash -c` with the same python choice as prefix q (Homebrew
+  `python3 -I -S`, else `/usr/bin/python3 -S`), sets `PATH` to Homebrew's bin
+  + the system dirs (agent-jump.sh and stash.sh call `tmux`), and passes
+  `--wezterm <executable_dir>/wezterm`.
+- **Window size**: while the strip is open the tmux client is 35 columns
+  narrower (34 + the split line); tmux resizes the window as for any terminal
+  resize, and it grows back when the strip closes.
+- **Trying it by hand** without touching the real client:
+  `agent-roster.py --strip --client /dev/ttys999` pins a (fake) client and
+  never calls `wezterm cli list`; clicks still run agent-jump.sh, so point
+  `PATH` at a fake tmux (tests/test_agent_jump_watcher.py's `FakeEnv`) first.
 
 ## Launch speed
 
@@ -139,6 +254,12 @@ through tmux command parsing, so it was left out.
   `/opt/homebrew/bin/python3 -I -S ~/.config/tmux/scripts/agent-roster.py --client "$(tmux display -p '#{client_tty}')"`
   (or `/usr/bin/python3 -S …` when Homebrew's python is missing).
   Careful: Space/⏎/`g` in that copy really do move that client.
+- **Strip says `no tmux client`**: the other pane in its tab is not an
+  attached tmux client (e.g. tmux was detached). It re-checks every 5 s.
+- **CMD+B does nothing**: `wezterm show-keys | grep -w b` should list
+  `SUPER b -> EmitEvent(...)`; run the strip by hand
+  (`/opt/homebrew/bin/python3 -I -S ~/.config/tmux/scripts/agent-roster.py --strip`
+  inside a WezTerm split) to see a traceback.
 - **Red "client is gone" banner**: the tty passed in no longer matches an
   attached client (for example, the terminal was reattached). Close the popup and reopen it.
 - **Ages all read the same**: `@agent_since` ("<epoch> <state>") is stamped at

@@ -7,6 +7,7 @@ import locale
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import unittest
@@ -23,8 +24,11 @@ from test_agent_jump_watcher import JUMP, FakeEnv, W  # noqa: E402  (the fake tm
 
 TMUX_CONF = Path(os.environ.get(
     "AGENT_TMUX_CONF", str(Path.home() / ".local/share/chezmoi/dot_config/tmux/tmux.conf.tmpl")))
+WEZTERM_CONF = Path(os.environ.get(
+    "AGENT_WEZTERM_CONF", str(Path.home() / ".local/share/chezmoi/dot_config/wezterm/wezterm.lua.tmpl")))
 
 US = "\x1f"
+SAVED_WATCHER_AGE = R.watcher_age
 
 
 def line(session, index, wid, state="", summary="", workflow="", cua="", since="", attached=0, name="zsh",
@@ -355,7 +359,9 @@ class NavTests(unittest.TestCase):
             r.sel_key = key
             hl = self.highlighted(r)
             self.assertEqual(len(hl), 1, key)
-            self.assertIn("main:2" if key[0] == "need" else "  2", self.strip(hl[0]))
+            # The index column is the row's hotkey: NEEDS YOU row 1 (+ dim
+            # session:index), the same window's group row 3.
+            self.assertIn("1 main:2  two" if key[0] == "need" else " 3  two", self.strip(hl[0]))
             self.assertEqual(r.selected()["w"]["id"], "@2")
 
     def test_linked_window_in_two_groups(self):
@@ -386,6 +392,473 @@ class NavTests(unittest.TestCase):
         self.assertEqual(r.sel_key, ("hit", "main", "@1"))
         r.query = ""; r.rebuild()
         self.assertEqual(r.sel_key, ("sess", "main", "@1"))
+
+
+class HotkeyTests(unittest.TestCase):
+    """Number keys: one unique label per window row, acted on as displayed."""
+    strip = staticmethod(lambda s: R.re.sub(r"\x1b\[[0-9;]*m", "", s))
+
+    def setUp(self):
+        self.calls = []
+        self.saved = (R.run_bg, R.subprocess.run, R.tmux)
+        R.run_bg = lambda cmd: self.calls.append(("bg", cmd))
+        R.tmux = lambda *a: None
+
+        def fake_run(argv, **kw):
+            self.calls.append(("run", argv))
+            return None
+        R.subprocess.run = fake_run
+
+    def tearDown(self):
+        R.run_bg, R.subprocess.run, R.tmux = self.saved
+
+    def roster(self, text, needs, cur, rows=40):
+        r = R.Roster("/dev/ttys999")
+        r.windows, r.needs, r.cur_win = R.parse_windows(text), needs, cur
+        r.rebuild()
+        r.render(100, rows, 1000)                 # what the user sees: the numbers come from this frame
+        return r
+
+    def gotos(self):
+        return [c[1][-1] for c in self.calls if c[0] == "run" and "goto" in c[1]]
+
+    def many(self, n):
+        return "\n".join(line("main", i, "@%d" % i, "idle", "w%d" % i) for i in range(1, n + 1))
+
+    def test_labels_unique_and_prefix_free(self):
+        self.assertEqual(R.hotkey_labels(3), ["1", "2", "3"])
+        self.assertEqual(R.hotkey_labels(9), [str(i) for i in range(1, 10)])
+        self.assertEqual(R.hotkey_labels(10), [str(i) for i in range(1, 10)] + ["01"])   # never a bare 0
+        self.assertEqual(R.hotkey_labels(12)[8:], ["9", "01", "02", "03"])
+        self.assertEqual(R.hotkey_labels(19)[9:11], ["001", "002"])
+        self.assertEqual(R.hotkey_labels(19)[-1], "010")
+        for n in range(0, 250):
+            labels = R.hotkey_labels(n)
+            self.assertEqual(len(labels), n)
+            self.assertEqual(len(set(labels)), n, n)
+            self.assertEqual(labels[:9], [str(i) for i in range(1, min(n, 9) + 1)], n)   # 1-9: always one key
+            self.assertNotIn("0", labels, n)
+            self.assertEqual(len({len(l) for l in labels[9:]}), min(1, max(0, n - 9)), n)   # 0-labels: one width
+            for a in labels:
+                for b in labels:
+                    self.assertFalse(a != b and b.startswith(a), (n, a, b))
+
+    def test_window_shown_twice_gets_two_numbers(self):
+        text = "\n".join([line("main", 1, "@1", "idle", "one"), line("main", 2, "@2", "needs-input", "two")])
+        r = self.roster(text, ["@2"], "@1")
+        self.assertEqual({l: it["w"]["id"] for l, it in r.drawn.items()}, {"1": "@2", "2": "@1", "3": "@2"})
+        frame = [self.strip(l) for l in r.render(100, 40, 1000)]
+        self.assertTrue(any("1 main:2  two" in l for l in frame), frame)
+        self.assertTrue(any(l.startswith(" ● 3  two") or " 3  two" in l for l in frame), frame)
+        # the parked header carries no number; expanded parked rows do
+        r = self.roster(WINDOWS, ["@4"], "@1")
+        r.parked_open = True; r.rebuild(); r.render(100, 40, 1000)
+        parked = [l for l, it in r.drawn.items() if it["w"]["session"] == "stash"]
+        self.assertEqual(len(parked), 3)
+        self.assertEqual(len(r.drawn), len(set(r.drawn)))
+
+    def test_single_digit_goes_at_once(self):
+        r = self.roster(self.many(4), [], "@1")
+        self.assertTrue(r.handle(["3"]))          # closes the popup
+        self.assertEqual(self.gotos(), ["@3"])
+
+    def test_digit_on_parked_row_unstashes(self):
+        r = self.roster(WINDOWS, [], "@1")
+        r.parked_open = True; r.rebuild(); r.render(100, 40, 1000)
+        label = next(l for l, it in r.drawn.items() if it["w"]["id"] == "@9")
+        self.assertTrue(r.handle(list(label)))
+        self.assertEqual(self.calls, [("bg", "'%s' unstash '@9' '/dev/ttys999'" % R.STASH)])
+
+    def test_past_ten_rows(self):
+        r = self.roster(self.many(12), [], "@1")
+        self.assertTrue(r.handle(["1"]))          # 1 still acts on the first key
+        self.assertEqual(self.gotos(), ["@1"])
+        self.calls.clear()
+        self.assertFalse(r.handle(["0"]))         # 0 waits for the second digit, no timer
+        self.assertEqual((self.calls, r.digits), ([], "0"))
+        foot = self.strip(r.render(100, 40, 1000)[-1])
+        self.assertIn("0", foot); self.assertIn("next digit", foot)
+        self.assertTrue(r.handle(["2"]))
+        self.assertEqual(self.gotos(), ["@11"])   # "02": the 11th row
+        # a paste of both digits in one read works too
+        self.calls.clear()
+        r = self.roster(self.many(12), [], "@1")
+        self.assertTrue(r.handle(["0", "3"]))
+        self.assertEqual(self.gotos(), ["@12"])
+        # exactly ten rows: the tenth is 01, a bare 0 is never complete
+        self.calls.clear()
+        r = self.roster(self.many(10), [], "@1")
+        self.assertFalse(r.handle(["0"]))
+        self.assertEqual(self.calls, [])
+        self.assertTrue(r.handle(["1"]))
+        self.assertEqual(self.gotos(), ["@10"])
+
+    def test_half_typed_number_cancels(self):
+        r = self.roster(self.many(12), [], "@1")
+        r.handle(["0"])
+        self.assertFalse(r.handle(["esc"]))       # esc drops the digit, the popup stays
+        self.assertEqual((r.digits, self.calls), ("", []))
+        r.handle(["0"]); r.handle(["bs"])
+        self.assertEqual(r.digits, "")
+        r.handle(["0"]); r.handle(["9"])          # "09" is no row (only 01-03)
+        self.assertEqual(self.calls, [])
+        self.assertIn("no row 09", r.msg)
+        sel = r.sel_key
+        r.handle(["j"])                           # another key ends the swallowing and still moves
+        self.assertNotEqual(r.sel_key, sel)
+        r.handle(["0"]); r.handle(["j"])          # ... and ends a half-typed number the same way
+        self.assertEqual(r.digits, "")
+
+    def test_dead_number_swallows_its_tail(self):
+        """Probe: 19 rows, row 14 reads `005`; a row discharges and the frame
+        redraws with 18 rows (`01`-`09`) before the user types 0 0 5. `00`
+        matches nothing; the `5` must NOT then jump to row 5."""
+        nineteen = self.many(19)
+        r = self.roster(nineteen, [], "@1")
+        self.assertEqual(r.drawn["005"]["w"]["id"], "@14")
+        r.windows = R.parse_windows("\n".join(l for l in nineteen.splitlines() if "\x1f@3\x1f" not in l))
+        r.rebuild(); r.render(100, 40, 1000)     # the new frame: 18 rows
+        self.assertNotIn("005", r.drawn)
+        self.assertFalse(r.handle(["0", "0", "5"]))
+        self.assertEqual(self.calls, [])
+        self.assertIn("no row 00", r.msg)
+        self.assertFalse(r.handle(["5"]))         # still swallowed, in a later read too
+        self.assertEqual(self.calls, [])
+        r.handle(["esc"])                         # esc ends it without closing the popup
+        self.assertTrue(r.handle(["5"]))          # a fresh 5 is a jump again
+        self.assertEqual(self.gotos(), ["@6"])    # row 5 of the 18 (@3 gone)
+
+    def test_ten_rows_after_eleven(self):
+        """Probe: 11 rows (`01`, `02`), one discharges → 10 rows. A stale `01`
+        stays a two-key label: the `0` alone does nothing, so the `1` cannot
+        fall through into the agent pane a jump on `0` would have focused."""
+        eleven = self.many(11)
+        r = self.roster(eleven, [], "@1")
+        self.assertEqual(sorted(l for l in r.drawn if l.startswith("0")), ["01", "02"])
+        r.windows = R.parse_windows("\n".join(l for l in eleven.splitlines() if "\x1f@2\x1f" not in l))
+        r.rebuild(); r.render(100, 40, 1000)
+        self.assertEqual(sorted(l for l in r.drawn if l.startswith("0")), ["01"])
+        self.assertFalse(r.handle(["0"]))
+        self.assertEqual(self.calls, [])
+        self.assertTrue(r.handle(["1"]))          # both keys consumed by the popup, as one label
+        self.assertEqual(self.gotos(), ["@11"])
+
+    def test_sequence_resolves_against_the_first_keys_frame(self):
+        # 0 typed on the 19-row frame; a refresh redraws 18 rows mid-number.
+        nineteen = self.many(19)
+        r = self.roster(nineteen, [], "@1")
+        r.handle(["0"])
+        r.windows = R.parse_windows("\n".join(l for l in nineteen.splitlines() if "\x1f@3\x1f" not in l))
+        r.rebuild(); r.render(100, 40, 1000)
+        self.assertTrue(r.handle(["0", "5"]))
+        self.assertEqual(self.gotos(), ["@14"])   # what `005` said when the number was started
+
+    def test_digits_type_in_the_filter(self):
+        r = self.roster(self.many(12), [], "@1")
+        r.handle(["/"]); r.handle(["1"]); r.handle(["1"])
+        self.assertEqual((r.query, self.calls), ("11", []))
+        r.handle(["enter"]); r.render(100, 40, 1000)  # filter kept: digits are hotkeys again
+        self.assertEqual({l: it["w"]["id"] for l, it in r.drawn.items()}, {"1": "@11"})
+        self.assertTrue(r.handle(["1"]))
+        self.assertEqual(self.gotos(), ["@11"])
+
+    def test_number_means_the_row_as_displayed(self):
+        text = "\n".join([line("main", 1, "@1", "idle", "one"), line("main", 2, "@2", "idle", "two"),
+                          line("main", 3, "@3", "needs-input", "three")])
+        r = self.roster(text, [], "@1")           # drawn: 1=@1 2=@2 3=@3
+        r.needs = ["@3"]; r.rebuild()             # a refresh renumbers (NEEDS YOU on top), not yet drawn
+        self.assertTrue(r.handle(["1"]))
+        self.assertEqual(self.gotos(), ["@1"])    # the row that SAID 1, not the new first row
+        # A row whose window moved (parked) since it was drawn: refused.
+        self.calls.clear()
+        r = self.roster(text, [], "@1")
+        r.windows = R.parse_windows(text.replace(US.join(["main", "2", "@2"]), US.join(["stash", "1", "@2"])))
+        r.rebuild()                               # the refresh tick: fresh dicts, @2 now parked
+        self.assertFalse(r.handle(["2"]))
+        self.assertEqual(self.calls, [])
+        self.assertIn("moved", r.msg)
+        # A number not on screen (scrolled off) is not acted on.
+        r = self.roster(self.many(30), [], "@1", rows=10)
+        self.assertNotIn("9", r.drawn)
+        self.assertFalse(r.handle(["9"]))
+        self.assertEqual(self.calls, [])
+
+
+class StripTests(unittest.TestCase):
+    """--strip: clicks, focus hand-back, client resolution. All I/O stubbed."""
+    strip = staticmethod(lambda s: R.re.sub(r"\x1b\[[0-9;]*m", "", s))
+    TEXT = "\n".join([line("main", 1, "@1", "idle", "one", attached=5),
+                      line("main", 2, "@2", "needs-input", "two", since="5 needs-input", attached=5),
+                      line("stash", 1, "@7", "", "parked", stash_label="proj/Parked"),
+                      US.join(["", R.CLIENT_TAG, "/dev/ttys004", "@1"])])
+
+    def setUp(self):
+        self.calls = []
+        self.saved = (R.run_bg, R.subprocess.run, R.tmux, R.wezterm_panes)
+        R.run_bg = lambda cmd: self.calls.append(("bg", cmd))
+        R.tmux = lambda *a: None
+
+        class Ok:
+            returncode, stdout = 0, ""
+
+        def fake_run(argv, **kw):
+            self.calls.append(("run", list(argv)))
+            return Ok
+        R.subprocess.run = fake_run
+        self.panes = [{"pane_id": 7, "tab_id": 1, "tty_name": "/dev/ttys030", "is_active": False},   # the strip
+                      {"pane_id": 3, "tab_id": 1, "tty_name": "/dev/ttys004", "is_active": True},    # tmux
+                      {"pane_id": 9, "tab_id": 2, "tty_name": "/dev/ttys005", "is_active": True}]
+        R.wezterm_panes = lambda exe: (self.calls.append(("list", exe)), self.panes)[1]
+
+    def tearDown(self):
+        R.run_bg, R.subprocess.run, R.tmux, R.wezterm_panes = self.saved
+
+    def make(self, **kw):
+        s = R.Strip(wezterm="/x/wezterm", own="7", **kw)
+        s.load(self.TEXT)
+        self.lines = [self.strip(l) for l in s.render(34, 20, 1000)]
+        return s
+
+    def line_of(self, s, text):
+        return next(i + 1 for i, l in enumerate(self.lines) if text in l)
+
+    def test_mouse_keys(self):
+        self.assertEqual(R.parse_keys("\x1b[<0;5;7M\x1b[<0;5;7m\x1b[<65;1;2M"),
+                         (["mouse:0:5:7:M", "mouse:0:5:7:m", "mouse:65:1:2:M"], ""))
+        self.assertEqual(R.parse_keys("\x1b[<0;5"), ([], "\x1b[<0;5"))     # cut off: carried
+
+    def test_pick_tmux_pane(self):
+        clients = {"/dev/ttys004": "@1", "/dev/ttys005": "@9"}
+        self.assertEqual(R.pick_tmux_pane(self.panes, "7", clients), ("/dev/ttys004", "3"))
+        self.assertEqual(R.pick_tmux_pane(self.panes, 7, {"/dev/ttys005": "@9"}), (None, None))   # other tab only
+        self.assertEqual(R.pick_tmux_pane(self.panes, "42", clients), (None, None))   # not in the list
+        self.assertEqual(R.pick_tmux_pane(None, "7", clients), (None, None))          # wezterm cli failed
+        two = self.panes + [{"pane_id": 4, "tab_id": 1, "tty_name": "/dev/ttys006", "is_active": False}]
+        clients["/dev/ttys006"] = "@2"
+        self.assertEqual(R.pick_tmux_pane(two, "7", clients, hint="4"), ("/dev/ttys006", "4"))
+        self.assertEqual(R.pick_tmux_pane(two, "7", clients), ("/dev/ttys004", "3"))  # the active one
+
+    def test_resolves_client_once(self):
+        s = self.make()
+        self.assertEqual((s.client, s.tmux_pane, s.cur_win), ("/dev/ttys004", "3", "@1"))
+        s.load(self.TEXT); s.load(self.TEXT)
+        self.assertEqual(len([c for c in self.calls if c[0] == "list"]), 1)   # not per tick
+
+    def test_no_client_line(self):
+        self.panes = self.panes[:1]
+        s = self.make()
+        self.assertIsNone(s.client)
+        self.assertEqual(self.lines[1].strip(), "no tmux client")
+        s.load(self.TEXT)                                   # throttled: no second list within 5 s
+        self.assertEqual(len([c for c in self.calls if c[0] == "list"]), 1)
+
+    def test_click_hands_focus_back_then_goes(self):
+        s = self.make()
+        y = self.line_of(s, "two")                          # the NEEDS YOU row
+        self.assertFalse(s.handle(["mouse:0:4:%d:M" % y, "mouse:0:4:%d:m" % y], b"\x1b[<0;4;%dM" % y))
+        runs = [c[1] for c in self.calls if c[0] == "run"]
+        self.assertEqual(runs[0], ["/x/wezterm", "cli", "activate-pane", "--pane-id", "3"])
+        self.assertEqual(runs[1][2:], ["goto", "/dev/ttys004", "@2"])
+        self.assertEqual(len(runs), 2)                      # the release does nothing
+
+    def test_click_parked(self):
+        s = self.make()
+        s.handle(["mouse:0:2:%d:M" % self.line_of(s, "parked (1)")])
+        self.assertTrue(s.parked_open)
+        self.lines = [self.strip(l) for l in s.render(34, 20, 1000)]
+        s.handle(["mouse:0:2:%d:M" % self.line_of(s, "proj/Parked")])
+        self.assertIn(("bg", "'%s' unstash '@7' '/dev/ttys004'" % R.STASH), self.calls)
+
+    def test_click_on_blank_and_wheel(self):
+        s = self.make()
+        s.handle(["mouse:0:2:1:M"])                        # header line: focus back only
+        self.assertEqual([c[1][2] for c in self.calls if c[0] == "run"], ["activate-pane"])
+        self.calls.clear()
+        s.handle(["mouse:65:2:5:M"])                       # wheel: no focus change, no move
+        self.assertEqual(self.calls, [])
+
+    def test_stray_keys_are_forwarded(self):
+        sent = []
+        run = R.subprocess.run
+        R.subprocess.run = lambda argv, **kw: (sent.append(kw.get("input")), run(argv, **kw))[1]
+        s = self.make()
+        s.handle(["ctrl-s", "c"], b"\x13c\x1b[<0;1;1m")     # CMD+T while the strip had focus (+ a release)
+        runs = [c[1] for c in self.calls if c[0] == "run"]
+        self.assertEqual(runs[0], ["/x/wezterm", "cli", "send-text", "--pane-id", "3", "--no-paste"])
+        self.assertEqual(sent[0], b"\x13c")                 # the keys, never the mouse report
+        self.assertEqual(runs[1][2], "activate-pane")
+
+    def test_cut_mouse_report_is_not_typing(self):
+        # ESC_WAIT flushed in the middle of a report: neither half is forwarded.
+        s = self.make()
+        self.assertEqual(s.stray_bytes(b"\x1b[<0;5"), b"")
+        self.assertEqual(s.stray_bytes(b";7M"), b"")
+        self.assertEqual(s.stray_bytes(b"x\x1b[<0;5;7Mq\x1b[<"), b"xq")
+        self.assertEqual(s.stray_bytes(b"0;1Mab"), b"ab")
+        self.assertEqual(s.stray_bytes(b"\x1b"), b"\x1b")          # a real Esc still goes to tmux
+        s.handle([], b"\x1b[<0;4;2")                              # cut: no send-text at all
+        self.assertFalse(any("send-text" in c[1] for c in self.calls if c[0] == "run"))
+
+    def test_failed_list_keeps_the_client(self):
+        s = self.make()
+        R.wezterm_panes = lambda exe: None                         # `wezterm cli list` failed once
+        s.resolve()
+        self.assertEqual((s.client, s.tmux_pane), ("/dev/ttys004", "3"))
+
+    def test_focus_back_failure_is_said(self):
+        s = self.make()
+
+        class Fail:
+            returncode, stdout = 1, ""
+        R.subprocess.run = lambda argv, **kw: (self.calls.append(("run", list(argv))), Fail)[1]
+        s.handle(["mouse:0:2:1:M"])
+        acts = [c for c in self.calls if c[0] == "run" and "activate-pane" in c[1]]
+        self.assertEqual(len(acts), 2)                             # tried, re-resolved, tried again
+        self.assertIn("couldn't focus tmux", s.msg)
+
+    def test_identical_frames_are_not_rewritten(self):
+        class Out:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, s):
+                self.writes.append(s)
+
+            def flush(self):
+                pass
+        s, out = self.make(), Out()
+        R.watcher_age = lambda: 1.0
+        try:
+            self.assertTrue(s.draw(out))
+            self.assertFalse(s.draw(out))                          # nothing changed: no write, no repaint
+            self.assertEqual(len(out.writes), 1)
+            s.say("hello")
+            self.assertTrue(s.draw(out))
+            s.last_frame = None                                    # SIGWINCH
+            self.assertTrue(s.draw(out))
+        finally:
+            R.watcher_age = SAVED_WATCHER_AGE
+
+    def test_session_order_is_stable(self):
+        # The popup puts the client's session first; the strip must not
+        # reshuffle under the mouse when a click moves the client.
+        text = "\n".join([line("zeta", 1, "@1", "idle", "z", attached=1),
+                          line("alpha", 1, "@2", "idle", "a", attached=9)])
+        for cur in ("@1", "@2"):
+            s = R.Strip(client="/dev/ttys999")
+            s.load(text + "\n" + US.join(["", R.CLIENT_TAG, "/dev/ttys999", cur]))
+            self.assertEqual([it["name"] for it in s.items if it["kind"] == "sess"], ["alpha", "zeta"])
+        p = R.Roster("/dev/ttys999")
+        p.load(text + "\n" + US.join(["", R.CLIENT_TAG, "/dev/ttys999", "@1"]))
+        self.assertEqual([it["name"] for it in p.items if it["kind"] == "sess"], ["zeta", "alpha"])
+
+    def test_fixed_client_never_calls_wezterm_list(self):
+        s = self.make(client="/dev/ttys004")
+        self.assertEqual([c for c in self.calls if c[0] == "list"], [])
+        self.assertIsNone(s.tmux_pane)
+        s.handle(["mouse:0:4:%d:M" % self.line_of(s, "two")])
+        runs = [c[1] for c in self.calls if c[0] == "run"]
+        self.assertEqual(len(runs), 1)                      # goto only: no pane to hand focus to
+        self.assertIn("goto", runs[0])
+
+    def test_lines_fit(self):
+        labels = ["❤️❤️❤️❤️ love " * 6, "日本語のタイトル" * 6, "tab\there\x1bbad" * 6]
+        text = "\n".join(line("a-very-long-session-name", i, "@%d" % (30 + i), "needs-input", lab,
+                              workflow="1", since="1 x", attached=5) for i, lab in enumerate(labels))
+        s = R.Strip(client="/dev/ttys999")
+        s.load(text)
+        s.needs = ["@30", "@31"]; s.rebuild()
+        for cols in (12, 20, 34, 50):
+            out = s.render(cols, 12, 1000)
+            self.assertEqual(len(out), 12)
+            for l in out:
+                self.assertLessEqual(R.dwidth(self.strip(l)), cols - 1, (cols, l))
+
+
+FAKE_SLOW_TMUX = """#!/bin/sh
+# list-windows: the first call answers frame A at once; every later call
+# sleeps (a slow refresh) and answers frame B. Anything else is ignored.
+case "$1" in
+  list-windows)
+    n=$(cat "$D/count" 2>/dev/null || echo 0); echo $((n + 1)) > "$D/count"
+    if [ "$n" -ge 1 ]; then sleep 0.8; cat "$D/B"; else cat "$D/A"; fi ;;
+esac
+"""
+
+
+class MainLoopTests(unittest.TestCase):
+    """main() in a real pty: input typed while a refresh is in flight acts on
+    the frame that was on screen, not on the one the refresh is about to draw."""
+
+    def test_digit_during_refresh_uses_the_old_frame(self):
+        import pty
+        import select
+        import shutil
+        import tempfile
+        import time
+        d = Path(tempfile.mkdtemp(prefix="roster-main-"))
+        try:
+            (d / "bin").mkdir()
+            scripts = d / "home/.config/tmux/scripts"
+            scripts.mkdir(parents=True)
+            (d / "bin/tmux").write_text(FAKE_SLOW_TMUX); (d / "bin/tmux").chmod(0o755)
+            (scripts / "agent-jump.sh").write_text('echo "$@" >> "$D/jump.log"\n')
+            client = US.join(["", R.CLIENT_TAG, "/dev/ttys999", "@1"])
+            one = line("main", 1, "@1", "idle", "one")
+            # A: 1=@1 2=@2. B: @2 failed, so NEEDS YOU puts it on top: 1=@2 2=@1 3=@2.
+            (d / "A").write_text("\n".join([one, line("main", 2, "@2", "idle", "two"), client]) + "\n")
+            (d / "B").write_text("\n".join([one, line("main", 2, "@2", "failed", "two", since="1 failed"),
+                                            client]) + "\n")
+            env = {"PATH": "%s:/usr/bin:/bin" % (d / "bin"), "HOME": str(d / "home"), "TMPDIR": str(d) + "/",
+                   "D": str(d), "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"}
+            pid, fd = pty.fork()
+            if pid == 0:
+                import fcntl
+                import struct
+                import termios
+                fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))   # a real popup size
+                os.execve(sys.executable, [sys.executable, "-S", str(SRC), "--client", "/dev/ttys999"], env)
+            t0 = time.time()
+
+            def drain(until):
+                while time.time() < until:
+                    r, _, _ = select.select([fd], [], [], 0.05)
+                    if r:
+                        try:
+                            os.read(fd, 65536)
+                        except OSError:
+                            return
+            drain(t0 + 1.4)                       # first frame (A: 1=@1, 2=@2); the refresh at ~1 s is now sleeping
+            os.write(fd, b"1")                    # typed against frame A, during the slow refresh
+            status = None
+            while status is None and time.time() < t0 + 6:
+                drain(time.time() + 0.2)
+                done, st = os.waitpid(pid, os.WNOHANG)
+                status = st if done else None
+            if status is None:                    # never leave a roster running
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            os.close(fd)
+            log = (d / "jump.log").read_text() if (d / "jump.log").exists() else ""
+            self.assertEqual(log.split(), ["goto", "/dev/ttys999", "@1"], log)   # frame B's row 1 is @2
+            self.assertIsNotNone(status, "the popup did not close")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class WeztermBindingTests(unittest.TestCase):
+    """CMD+B in wezterm.lua.tmpl launches the strip the way prefix q launches the popup."""
+
+    def test_strip_binding(self):
+        src = WEZTERM_CONF.read_text()
+        self.assertIn('{ key = "b", mods = "CMD", action = toggle_strip }', src)
+        self.assertIn("[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S ", src)
+        self.assertIn("exec /usr/bin/python3 -S ", src)     # never -I/-E on the xcrun stub
+        self.assertIn('"/bin/dash", "-c", STRIP_PY, STRIP_SCRIPT, "--strip"', src)
+        self.assertIn("top_level = true", src)
+        self.assertIn('get_user_vars().agent_strip == "1"', src)
+        self.assertIn('"%s"' % R.STRIP_TITLE, src)
+        self.assertEqual(R.STRIP_VAR, "agent_strip")
 
 
 class WidthTests(unittest.TestCase):
