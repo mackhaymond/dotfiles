@@ -488,6 +488,19 @@ bind-key D   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{cl
 bind-key q   run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
 bind-key C-q run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
 
+# OPTION KEYS for the agent controls, no prefix (Mack, 2026-10-08: important
+# enough to deserve one chord). They sit around the existing Option-Q (floax)
+# and Option-A (btop) on the left hand:  W above S, X below it.
+#   Option-S  next tab that needs you      (= prefix d)
+#   Option-X  back to where the jumps began (= prefix D)
+#   Option-W  the agent roster popup        (= prefix q)
+# Root-table bindings take these chords from whatever runs in the pane (zsh's
+# M-w/M-x, Claude Code's Meta keys) - deliberate. The prefix keys stay as
+# fallbacks.
+bind-key -n M-s run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
+bind-key -n M-x run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{client_tty}'"
+bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
+
 # Double-tap hyper or right shift in WezTerm (Karabiner, karabiner-base.json) flips
 # back to the previous one of these, like the same double-tap does for Arc tabs:
 #   session  the top row of prefix+a, without the picker

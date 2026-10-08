@@ -7,7 +7,7 @@ It keeps no state and runs only while the popup is open.
 
 | Key | Does |
 |---|---|
-| `prefix q` / `prefix C-q` | open the roster |
+| **Option-W**, or `prefix q` / `prefix C-q` | open the roster |
 | `1`-`9`, then `01`, `02`, … from the tenth row | go to that row at once and close (see [Number keys](#number-keys)) |
 | Tab / Shift-Tab, `j` / `k`, arrows | move |
 | Space / ⏎ | go there (a parked tab comes back via `stash.sh unstash`) |
@@ -19,8 +19,8 @@ It keeps no state and runs only while the popup is open.
 | `r` | restart the watcher (only needed when the red banner says so) |
 | esc / `q` | close |
 
-Related keys: `prefix d` / `prefix C-d` jump to the next tab that needs you,
-`prefix D` jumps back (scripts/agent-jump.sh).
+Related keys: **Option-S** (or `prefix d` / `prefix C-d`) jumps to the next tab
+that needs you, **Option-X** (or `prefix D`) jumps back (scripts/agent-jump.sh).
 
 ## Layout
 
