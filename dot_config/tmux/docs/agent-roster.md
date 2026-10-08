@@ -11,8 +11,8 @@ It keeps no state and runs only while the popup is open.
 | Tab / Shift-Tab, `j` / `k`, arrows | move |
 | Space / ⏎ | go there (a parked tab comes back via `stash.sh unstash`) |
 | `g` | next tab that needs you (same as `prefix g`) |
-| `x` | close the agent's pane through `closed-tabs.sh`, after y/n; CMD+Z undoes it |
-| `H` | park the tab (`stash.sh stash`) |
+| `x` | close the agent's pane through `closed-tabs.sh`, after y/n; CMD+Z undoes it. On a parked row: discard it through `stash.sh kill-many` |
+| `H` | park the tab (`stash.sh stash`, which suspends the agent), after y/n |
 | `/` | filter by `session:index title`; ⏎ keeps it, esc clears it |
 | `a` | also show windows with no agent |
 | `r` | restart the watcher (only needed when the red banner says so) |
@@ -28,8 +28,9 @@ Related keys: `prefix g` / `prefix C-g` jump to the next tab that needs you,
   `@agent_since` first. The roster never sorts this itself, so it and
   `prefix g` cannot disagree.
 - Then one group per session, the client's own session first, then most
-  recently used. `agents`, `scratch` and `btop-popup` are never shown; `tasks`
-  is.
+  recently used. `agents`, `tasks` (CuaNotch's broker), `scratch` and
+  `btop-popup` are never shown, the same sessions `agent-jump.sh` and the
+  session pickers skip.
 - Then `parked (n)`, collapsed, with its own needs-you count.
 - Windows with no agent are hidden until `a`, **except the window the popup is
   covering**. A prompt that lands under the popup is discharged as "seen" by
@@ -50,6 +51,23 @@ and the time since `@agent_since`.
   and one `agent-jump.sh list`.
 - Moves go through `agent-jump.sh goto|next`: `select-window` then
   `switch-client`, so the visit discharges the tint like a tab click does.
+- `x` finds the agent's pane by TTY, the way the watcher does: `list-panes`
+  (`pane_id`, `pane_tty`, `pane_active`) plus one `ps -ax -o tty=,comm=`, run
+  only on `x` and only for a split window, matching a comm of `claude`,
+  `codex` or a bare version like `2.1.291`. `pane_current_command` is not
+  used: codex launched through npm shows there as `node`. A one-pane window
+  closes that pane; a split window where no pane runs an agent is refused
+  ("can't tell which pane is the agent · close it from the tab") rather than
+  guessed at.
+- Keys: a read that ends in a bare ESC or a cut-off sequence (`ESC [`,
+  `ESC [1;`) waits 25 ms for the rest; only silence makes a lone ESC close the
+  popup. Alt+key is ignored, and UTF-8 is decoded incrementally across reads.
+- The y/n after `x` / `H` has to come in a later read than the key that asked
+  (a paste or a fast "Hy" never confirms itself), and `y` re-checks the
+  window: if it was closed, parked or unparked in between, nothing runs and
+  the footer says so.
+- Every line is clipped to one cell short of the popup width (emoji and VS16
+  sequences count as two cells), so nothing autowraps.
 - Watcher health: the mtime of `$TMPDIR/agent-tab-watcher.$UID.pid`, which the
   watcher restamps every tick. Older than 30 s (ensure_watcher's grace) shows
   a red banner; `r` respawns the watcher the same way `prefix r` does.

@@ -16,7 +16,7 @@ through run-shell, which does expand them.
 
 Layout: NEEDS YOU on top, in agent-jump.sh's own order, so this list and
 prefix g can never disagree. Then one group per session, most recently used
-first (agents, scratch and btop-popup are never shown), then the parked tabs
+first (agents, tasks, scratch and btop-popup are never shown), then the parked tabs
 collapsed onto one line. Windows with no agent are hidden until `a`, except the
 one this popup is covering: a prompt that lands under the popup is discharged as
 "seen" by the watcher, so that row has to stay visible.
@@ -30,6 +30,7 @@ step with the tabs, and it freezes when they do.
 Every move goes through agent-jump.sh (`goto`/`next`): select-window THEN
 switch-client, so the visit discharges the tint the same way a tab click does.
 """
+import codecs
 import os
 import re
 import select
@@ -50,11 +51,17 @@ WATCHER = os.path.join(SCRIPTS, "agent-tab-watcher.sh")
 PIDFILE = os.path.join(os.environ.get("TMPDIR") or "/tmp", "agent-tab-watcher.%d.pid" % os.getuid())
 
 US = "\x1f"
-HIDDEN = {"agents", "scratch", "btop-popup"}
+# Same set agent-jump.sh's EXCLUDE (minus the stash, which gets its own
+# collapsed group here) and the session pickers skip. `tasks` is CuaNotch's
+# broker session: never a place the user goes.
+HIDDEN = {"agents", "tasks", "scratch", "btop-popup"}
 HOLD = "stash"
 WATCHER_STALE = 30          # same grace as ensure_watcher in agent-tab-indicator.sh
 REFRESH = 1.0
-AGENT_CMD = re.compile(r"^(claude|codex|opencode|\d+\.\d+\.\d+)$")
+ESC_WAIT = 0.025            # how long a trailing ESC / partial sequence waits for the rest
+# is_agent_comm in agent-tab-watcher.sh: ps comm basename claude or codex, or
+# Claude's version-named binary ("2.1.291"). Digits-only segments, anchored.
+AGENT_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
 # THIRD SURFACE of the agent colour language: same hex values as the
 # @catppuccin_window_* formats in tmux.conf.tmpl and CuaNotch.swift.
@@ -191,31 +198,76 @@ def item_key(it):
     return it["w"]["id"] if it["kind"] == "win" else ("parked" if it["kind"] == "parked" else None)
 
 
-def parse_keys(buf):
-    """Split raw input into key names. A lone ESC is only returned when the
-    caller has already waited for a following byte and none came."""
-    keys, i = [], 0
-    seqs = {"\x1b[A": "up", "\x1b[B": "down", "\x1bOA": "up", "\x1bOB": "down",
-            "\x1b[Z": "btab", "\x1b[5~": "pgup", "\x1b[6~": "pgdn"}
-    while i < len(buf):
-        if buf[i] == "\x1b":
-            for s, name in seqs.items():
-                if buf.startswith(s, i):
-                    keys.append(name); i += len(s); break
-            else:
-                # Unknown CSI (ESC [ … final) or SS3 (ESC O x, e.g. End/Home
-                # in application mode): swallow it whole, or its ESC would read
-                # as "close the popup".
-                m = re.match(r"\x1b\[[0-9;?]*[A-Za-z~]|\x1bO[A-Za-z]", buf[i:])
-                if m:
-                    i += m.end()
-                else:
-                    keys.append("esc"); i += 1
+KEYSEQ = {"\x1b[A": "up", "\x1b[B": "down", "\x1bOA": "up", "\x1bOB": "down",
+          "\x1b[Z": "btab", "\x1b[5~": "pgup", "\x1b[6~": "pgdn"}
+KEYCHR = {"\t": "tab", "\r": "enter", "\n": "enter", " ": "space",
+          "\x7f": "bs", "\x08": "bs", "\x03": "ctrl-c"}
+CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")       # ECMA-48: params, intermediates, final
+CSI_PART = re.compile(r"\x1b\[[0-?]*[ -/]*\Z")     # a CSI cut off by the end of the read
+SS3 = re.compile(r"\x1bO[ -~]")
+
+
+def parse_keys(buf, final=False):
+    """Split decoded input into key names → (keys, leftover).
+
+    A read can end mid-sequence (key repeat, a paste, a slow redraw): the
+    trailing "\\x1b", "\\x1b[" or "\\x1b[1;" comes back as `leftover` for the
+    caller to prepend to the next read, never as esc. `final=True` means the
+    caller already waited ESC_WAIT and nothing followed: a lone ESC is then
+    the esc key, and a still-incomplete sequence is dropped.
+
+    Known CSI/SS3 sequences map to names; unknown ones (End/Home, Ctrl-arrows,
+    paste brackets) are swallowed whole, or their ESC would read as "close
+    the popup". Alt+key (ESC + one char) is ignored for the same reason."""
+    keys, i, n = [], 0, len(buf)
+    while i < n:
+        c = buf[i]
+        if c != "\x1b":
+            keys.append(KEYCHR.get(c, c)); i += 1
             continue
-        c = buf[i]; i += 1
-        keys.append({"\t": "tab", "\r": "enter", "\n": "enter", " ": "space",
-                     "\x7f": "bs", "\x08": "bs", "\x03": "ctrl-c"}.get(c, c))
-    return keys
+        m = CSI.match(buf, i) or SS3.match(buf, i)
+        if m:
+            name = KEYSEQ.get(m.group())
+            if name:
+                keys.append(name)
+            i = m.end()
+            continue
+        if i + 1 == n:                                   # ESC is the last byte
+            if final:
+                keys.append("esc"); i += 1
+                continue
+            return keys, buf[i:]
+        nxt = buf[i + 1]
+        if (nxt == "[" and CSI_PART.match(buf, i)) or (nxt == "O" and i + 2 == n):
+            return keys, ("" if final else buf[i:])     # the rest is still on its way
+        if nxt == "\x1b":                                # ESC ESC: the first one was a press
+            keys.append("esc"); i += 1
+            continue
+        i += 2                                           # Alt+key: ignored
+    return keys, ""
+
+
+class KeyReader:
+    """Raw bytes → key names, across reads. Holds the UTF-8 decoder state (a
+    multi-byte char split between reads must not become U+FFFD) and the carry
+    of an incomplete escape sequence. No I/O: main() does the waiting."""
+
+    def __init__(self):
+        self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.carry = ""
+
+    def feed(self, data):
+        keys, self.carry = parse_keys(self.carry + self.dec.decode(data))
+        return keys
+
+    def flush(self):
+        """Nothing followed within ESC_WAIT: resolve the carry."""
+        keys, self.carry = parse_keys(self.carry, final=True)
+        return keys
+
+    @property
+    def pending(self):
+        return bool(self.carry)
 
 
 def ago(t, now):
@@ -231,21 +283,53 @@ def ago(t, now):
     return "%dd" % (s // 86400)
 
 
+# Pictographic blocks tmux draws two cells wide. east_asian_width already says
+# W for most of them, but this python (3.9, Unicode 13) reports every emoji
+# added since as N, so the blocks are listed outright. Over-counting a cell
+# only costs padding; under-counting overflows the row.
+EMOJI_WIDE = ((0x1F300, 0x1F64F), (0x1F680, 0x1F6FF), (0x1F900, 0x1F9FF), (0x1FA70, 0x1FAFF))
+VS16 = "️"
+
+
+def char_width(c):
+    o = ord(c)
+    if o == 0x200D or 0xFE00 <= o <= 0xFE0F or unicodedata.combining(c) \
+            or unicodedata.category(c) in ("Mn", "Me", "Cf"):
+        return 0
+    if unicodedata.east_asian_width(c) in "WF" or any(a <= o <= b for a, b in EMOJI_WIDE):
+        return 2
+    return 1
+
+
+def clusters(s):
+    """[(text, cells)]: zero-width marks ride on the char before them, and a
+    VS16 (emoji presentation, as in "❤️") makes that char two cells."""
+    out = []
+    for c in s:
+        w = char_width(c)
+        if w == 0 and out:
+            t, cw = out[-1]
+            out[-1] = (t + c, 2 if c == VS16 else cw)
+        else:
+            out.append((c, w))
+    return out
+
+
 def dwidth(s):
-    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+    return sum(w for _, w in clusters(s))
 
 
 def clip(s, width):
     if width <= 0:
         return ""
-    if dwidth(s) <= width:
+    cl = clusters(s)
+    if sum(w for _, w in cl) <= width:
         return s
     out, n = "", 0
-    for c in s:
-        cw = 2 if unicodedata.east_asian_width(c) in "WF" else 1
+    for t, cw in cl:
         if n + cw > width - 1:
             break
-        out += c; n += cw
+        out += t; n += cw
     return out + "…"
 
 
@@ -274,19 +358,60 @@ def client_window(client):
     return None
 
 
+def is_agent_comm(comm):
+    base = comm.rsplit("/", 1)[-1]
+    return base in ("claude", "codex") or bool(AGENT_VERSION.match(base))
+
+
+PANE_GONE = "that window is gone"
+PANE_UNSURE = "can't tell which pane is the agent · close it from the tab"
+
+
+def pick_agent_pane(panes_text, ps_text):
+    """The pane `x` closes → (pane_id, None) or (None, why).
+
+    panes_text: `list-panes -F pane_id US pane_tty US pane_active`.
+    ps_text: `ps -ax -o tty=,comm=` (None when not needed or it failed).
+
+    Matched by TTY, like the watcher, never by pane_current_command: codex
+    launched through npm shows up there as `node`, and falling back to the
+    active pane then closed the user's shell instead of the agent. A split
+    window where no pane (or more than one, none of them active) runs an
+    agent is refused rather than guessed at."""
+    rows = [l.split(US) for l in panes_text.splitlines() if l.count(US) == 2]
+    if not rows:
+        return None, PANE_GONE
+    if len(rows) == 1:
+        return rows[0][0], None
+    agent_ttys = set()
+    for l in (ps_text or "").splitlines():
+        parts = l.strip().split(None, 1)
+        if len(parts) == 2 and parts[0] != "??" and is_agent_comm(parts[1].strip()):
+            agent_ttys.add(parts[0])
+    hits = [(pid, active) for pid, t, active in rows
+            if t and (t[5:] if t.startswith("/dev/") else t) in agent_ttys]
+    if len(hits) == 1:
+        return hits[0][0], None
+    active = [pid for pid, a in hits if a == "1"]
+    if len(active) == 1:
+        return active[0], None
+    return None, PANE_UNSURE
+
+
 def agent_pane(win):
-    """The pane to close: the agent's own if the window is split."""
-    r = tmux("list-panes", "-t", win, "-F", US.join(["#{pane_id}", "#{pane_current_command}", "#{pane_active}"]))
+    """pick_agent_pane against the live server. Runs only on `x`, so its ps
+    costs nothing per tick, and only for a split window."""
+    r = tmux("list-panes", "-t", win, "-F", US.join(["#{pane_id}", "#{pane_tty}", "#{pane_active}"]))
     if not r or r.returncode:
-        return None
-    rows = [l.split(US) for l in r.stdout.splitlines() if l.count(US) == 2]
-    for pid, cmd, _ in rows:
-        if AGENT_CMD.match(cmd):
-            return pid
-    for pid, _, active in rows:
-        if active == "1":
-            return pid
-    return rows[0][0] if rows else None
+        return None, PANE_GONE
+    ps_text = None
+    if len([l for l in r.stdout.splitlines() if l.count(US) == 2]) > 1:
+        try:
+            ps_text = subprocess.run(["ps", "-ax", "-o", "tty=,comm="], capture_output=True,
+                                     text=True, errors="replace", timeout=5).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            ps_text = None
+    return pick_agent_pane(r.stdout, ps_text)
 
 
 def watcher_age():
@@ -305,7 +430,7 @@ class Roster:
         self.items, self.sel_key = [], None
         self.show_all = self.parked_open = False
         self.query, self.filtering = "", False
-        self.confirm = None          # window dict pending close
+        self.confirm = None          # {"action": close|park, "w": window} awaiting y/n
         self.msg, self.msg_until = "", 0.0
         self.top = 0
         self.gone = False
@@ -347,23 +472,67 @@ class Roster:
     def say(self, text):
         self.msg, self.msg_until = text, time.time() + 3
 
+    def jump(self, *args):
+        """agent-jump.sh goto|next. True (close the popup) once it ran; a hang
+        or a missing bash keeps the popup open with the reason in the footer."""
+        try:
+            subprocess.run(["bash", JUMP, args[0], self.client] + list(args[1:]), timeout=10)
+        except subprocess.TimeoutExpired:
+            self.say("agent-jump.sh %s timed out" % args[0])
+            return False
+        except OSError as e:
+            self.say("agent-jump.sh %s failed: %s" % (args[0], e.strerror or e))
+            return False
+        return True
+
+    def handle(self, keys):
+        """One read's worth of keys → True to close the popup. A key that
+        opens a y/n drops the rest of its batch, so the answer has to come in
+        a later read: a paste or a fast "Hy" / "xy" must not confirm itself
+        against the window the popup opened on."""
+        for key in keys:
+            asking = self.confirm is None
+            if self.act(key):
+                return True
+            if asking and self.confirm is not None:
+                return False
+        return False
+
     # actions; returning True closes the popup
     def act(self, key):
         if self.confirm is not None:
-            w, self.confirm = self.confirm, None
-            if key in ("y", "Y") and w["session"] == HOLD:
+            c, self.confirm = self.confirm, None
+            if key not in ("y", "Y"):
+                return False
+            # The dict in c is from when x/H was pressed; the refresh tick may
+            # have moved the window since. Act on the current one, and never
+            # silently switch action (a tab parked in between must go through
+            # kill-many, not closed-tabs).
+            w = next((x for x in self.windows if x["id"] == c["w"]["id"]), None)
+            if w is None:
+                self.say(PANE_GONE)
+                return False
+            if w["session"] != c["w"]["session"]:
+                self.say("that tab moved · press %s again" % ("H" if c["action"] == "park" else "x"))
+                return False
+            if c["action"] == "park":
+                # SIGTERMs (suspends) the agent: behind y/n because the
+                # default selection is the window you are sitting on.
+                run_bg("'%s' stash '%s'" % (STASH, w["id"]))
+                self.say("parked %s" % w["label"])
+            elif w["session"] == HOLD:
                 # A parked tab goes through stash.sh's own discard, which logs
                 # a suspended conversation's id (with the command that resumes
                 # it) and drops its sidecar row; closed-tabs knows neither.
                 run_bg("'%s' kill-many '%s'" % (STASH, w["id"]))
                 self.say("discarded %s · its session id is in the stash log" % w["label"])
-            elif key in ("y", "Y"):
-                pane = agent_pane(w["id"])
+            else:
+                pane, why = agent_pane(w["id"])
                 if pane:
                     run_bg("'%s' close '%s'" % (CLOSED, pane))
                     self.say("closed %s · ⌘Z brings it back" % w["label"])
                 else:
-                    self.say("that window is gone")
+                    self.say(why)
             return False
 
         if self.filtering:
@@ -403,20 +572,17 @@ class Roster:
             w = it["w"]
             if w["session"] == HOLD:
                 run_bg("'%s' unstash '%s' '%s'" % (STASH, w["id"], self.client))
-            else:
-                subprocess.run(["bash", JUMP, "goto", self.client, w["id"]], timeout=10)
-            return True
+                return True
+            return self.jump("goto", w["id"])
         elif key == "g":
-            subprocess.run(["bash", JUMP, "next", self.client], timeout=10)
-            return True
+            return self.jump("next")
         elif key == "x" and it and it["kind"] == "win":
-            self.confirm = it["w"]
+            self.confirm = {"action": "close", "w": it["w"]}
         elif key == "H" and it and it["kind"] == "win":
             if it["w"]["session"] == HOLD:
                 self.say("already parked")
             else:
-                run_bg("'%s' stash '%s'" % (STASH, it["w"]["id"]))
-                self.say("parked %s" % it["w"]["label"])
+                self.confirm = {"action": "park", "w": it["w"]}
         elif key == "a":
             self.show_all = not self.show_all; self.rebuild()
         elif key == "/":
@@ -485,7 +651,16 @@ class Roster:
             cols, rows = os.get_terminal_size(sys.stdout.fileno())
         except OSError:
             cols, rows = 100, 30
-        now = time.time()
+        lines = self.render(cols, rows, time.time())
+        out.write("\x1b[H" + "\x1b[K\r\n".join(lines) + "\x1b[K")
+        out.flush()
+
+    def render(self, cols, rows, now):
+        """The frame as exactly `rows` lines, each at most cols-1 cells. The
+        last column stays empty: a line that fills it leaves the cursor in the
+        pending-wrap state, where the \\x1b[K after it erases that last cell,
+        and anything wider than the screen autowraps and shifts the frame."""
+        rows = max(1, rows)
         blink = bool(self.windows) and self.windows[0]["blink"] == "1"   # a global option: same on every row
         ws = [w for w in self.windows if w["session"] not in HIDDEN]
         n_work = sum(1 for w in ws if w["state"] and in_flight(w) and not is_attn(w))
@@ -521,7 +696,9 @@ class Roster:
             lines.append("")
 
         if self.confirm is not None:
-            foot = fg("yellow") + " close %s:%d %s? " % (self.confirm["session"], self.confirm["index"], self.confirm["label"]) + fg("text") + "y/n"
+            cw = self.confirm["w"]
+            verb = "park" if self.confirm["action"] == "park" else ("discard" if cw["session"] == HOLD else "close")
+            foot = fg("yellow") + " %s %s:%d %s? " % (verb, cw["session"], cw["index"], cw["label"]) + fg("text") + "y/n"
         elif self.filtering:
             foot = fg("peach") + " / " + fg("text") + self.query + "▏" + fg("overlay") + "   ⏎ keep · esc clear"
         elif self.msg and now < self.msg_until:
@@ -532,25 +709,28 @@ class Roster:
         lines.append("")
         lines.append(foot)
 
-        frame = "\x1b[H" + "".join(clip_ansi(l, cols) + RESET + "\x1b[K\r\n" for l in lines[:rows - 1])
-        frame += clip_ansi(lines[rows - 1] if len(lines) >= rows else "", cols) + RESET + "\x1b[K"
-        out.write(frame)
-        out.flush()
+        lines = (lines + [""] * rows)[:rows]
+        return [clip_ansi(l, cols - 1) + RESET for l in lines]
+
+
+SGR = re.compile(r"\x1b\[[0-9;]*m")
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def clip_ansi(s, width):
-    """Truncate a string containing SGR escapes to `width` visible cells."""
-    out, n, i = [], 0, 0
-    while i < len(s):
-        if s[i] == "\x1b":
-            m = re.match(r"\x1b\[[0-9;]*m", s[i:])
-            if m:
-                out.append(m.group()); i += m.end(); continue
-        c = s[i]
-        cw = 2 if unicodedata.east_asian_width(c) in "WF" else 1
-        if n + cw > width:
-            break
-        out.append(c); n += cw; i += 1
+    """Truncate a string containing SGR escapes to `width` visible cells,
+    measured the way dwidth measures (emoji, VS16). Any other control char (a
+    stray ESC or tab in a window name) is drawn as a space, never sent raw."""
+    out, n, pos = [], 0, 0
+    width = max(0, width)
+    for m in list(SGR.finditer(s)) + [None]:
+        text = s[pos:m.start()] if m else s[pos:]
+        for t, cw in clusters(CONTROL.sub(" ", text)):
+            if n + cw > width:
+                return "".join(out)
+            out.append(t); n += cw
+        if m:
+            out.append(m.group()); pos = m.end()
     return "".join(out)
 
 
@@ -563,6 +743,7 @@ def main(argv):
         print("usage: agent-roster.py --client <client_tty>", file=sys.stderr)
         return 2
     roster = Roster(client)
+    reader = KeyReader()
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     rpipe, wpipe = os.pipe()
@@ -582,17 +763,20 @@ def main(argv):
             if rpipe in ready:
                 os.read(rpipe, 64)               # SIGWINCH: just redraw
             if fd in ready:
-                buf = os.read(fd, 256).decode("utf-8", "replace")
-                if buf == "\x1b":
-                    more, _, _ = select.select([fd], [], [], 0.025)
-                    if more:
-                        buf += os.read(fd, 256).decode("utf-8", "replace")
-                done = False
-                for key in parse_keys(buf):
-                    if roster.act(key):
-                        done = True
+                data = os.read(fd, 256)
+                if not data:                     # the pty went away
+                    return 0
+                keys = reader.feed(data)
+                # A read that ended mid-sequence (or on a bare ESC) waits
+                # ESC_WAIT for the rest; only silence makes a lone ESC "esc".
+                while reader.pending:
+                    more, _, _ = select.select([fd], [], [], ESC_WAIT)
+                    data = os.read(fd, 256) if more else b""
+                    if not data:
+                        keys += reader.flush()
                         break
-                if done:
+                    keys += reader.feed(data)
+                if roster.handle(keys):
                     return 0
             if time.time() >= next_refresh:
                 roster.refresh()
