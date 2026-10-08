@@ -4,18 +4,28 @@
 A READER of the state the hook pipeline already keeps on each window
 (@agent_state, @agent_summary, @agent_workflow, @agent_cua, @agent_since; see
 docs/agent-tab-indicator.md). It holds no state of its own and runs only while
-the popup is open: one `tmux list-windows` and one `agent-jump.sh list` a
-second.
+the popup is open: ONE tmux call a second (`list-windows -a \\; list-clients`).
 
     agent-roster.py --client <client_tty>
 
 The client tty has to be passed in: display-popup does not expand formats in
 its command, and `display -p` inside a popup resolves to tmux's "best" client,
 not necessarily the one that pressed the key. tmux.conf therefore binds this
-through run-shell, which does expand them.
+through `run-shell -C`, which does expand them.
+
+LAUNCH SPEED (prefix e should paint in well under 100 ms; docs/agent-roster.md
+has the per-stage numbers). The binding runs no shell and no tmux client: it
+execs a real python3 (Homebrew's, never the /usr/bin xcrun stub or a pyenv
+shim) with -I -S. Stays Python 3.9-compatible all the same, because 3.9 is the
+fallback. The first frame needs exactly one tmux round trip: NEEDS YOU is
+computed here, from the same list-windows rows (needs_order), instead of
+forking `agent-jump.sh list` (bash + tmux + awk + sort + awk + cut) each tick.
 
 Layout: NEEDS YOU on top, in agent-jump.sh's own order, so this list and
-prefix g can never disagree. Then one group per session, most recently used
+prefix g can never disagree: needs_order mirrors its `list` pipeline, and
+tests/test_agent_roster.py pins the two against each other by running the real
+script on the same fixtures. Moves still go through agent-jump.sh. Then one
+group per session, most recently used
 first (agents, tasks, scratch and btop-popup are never shown), then the parked tabs
 collapsed onto one line. Windows with no agent are hidden until `a`, except the
 one this popup is covering: a prompt that lands under the popup is discharged as
@@ -80,6 +90,18 @@ FMT = US.join(["#{session_name}", "#{window_index}", "#{window_id}", "#{window_n
                "#{@agent_state}", "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}",
                "#{@agent_since}", "#{session_last_attached}", "#{@agent_blink}",
                "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}"])
+# Rides in the same tmux call as FMT, after a `;`. Four fields where a window
+# row has fourteen, so parse_windows skips it and parse_clients takes only it.
+CLIENT_TAG = "client"
+CLIENT_FMT = US.join(["", CLIENT_TAG, "#{client_tty}", "#{window_id}"])
+
+# agent-jump.sh's EXCLUDE, byte for byte (a test compares it with the
+# script's), matched the way its awk does: index(ex, " " session " ").
+JUMP_EXCLUDE = " agents tasks stash scratch btop-popup "
+NEED_TIER = {"failed": 0, "needs-input": 1, "done": 2}
+NO_STAMP = 9999999999       # agent-jump.sh: a window with no stamp sorts last in its tier
+DIGITS = re.compile(r"[0-9]+\Z")
+AWK_BLANKS = re.compile(r"[ \t\n]+")
 
 
 def fg(name):
@@ -122,9 +144,74 @@ def parse_windows(text):
     return out
 
 
-def parse_needs(text):
-    """agent-jump.sh list → window ids, already in priority order."""
-    return [l.split("\t", 1)[0] for l in text.splitlines() if l.strip()]
+def parse_clients(text):
+    """The CLIENT_FMT rows of the same call → {client_tty: window_id}."""
+    out = {}
+    for line in text.splitlines():
+        parts = line.split(US)
+        if len(parts) == 4 and parts[0] == "" and parts[1] == CLIENT_TAG:
+            out[parts[2]] = parts[3]
+    return out
+
+
+_XFRM = None
+
+
+def collation(name=""):
+    """The collation agent-jump.sh's `sort` uses: the libc collation of the
+    environment's locale (LC_ALL > LC_COLLATE > LANG; "" = from the env), as
+    strxfrm. prefix g runs under en_US.UTF-8, where `_x` sorts before `a`
+    and `a` before `B`; a plain str sort would not. See needs_order for what
+    happens when it calls two strings equal."""
+    global _XFRM
+    import locale                       # first NEEDS YOU sort only: ~1 ms
+    try:
+        locale.setlocale(locale.LC_COLLATE, name)
+        _XFRM = locale.strxfrm
+    except locale.Error:                # unknown locale: sort falls back to C too
+        locale.setlocale(locale.LC_COLLATE, "C")
+        _XFRM = str
+    return _XFRM
+
+
+def needs_order(windows):
+    """agent-jump.sh `list`, in-process → window ids in priority order.
+
+    The same pipeline over the same list-windows rows: drop EXCLUDE sessions;
+    tier failed 0 > needs-input 1 > done-without-a-fleet 2 (anything else is
+    not in the queue); sort; a linked window (one row per session) keeps its
+    first sorted row. Pinned to the real script by tests/test_agent_roster.py's
+    NeedsOrderTests.
+
+    The sort is /usr/bin/sort's (2.3-Apple, FreeBSD's) exactly, for
+    `-k1,1n -k2,2n -k3,3 -k4,4` with no -s, over the awk's full line:
+      - tier and stamp numerically;
+      - each text key by wcscoll, and when that says equal, the SHORTER key
+        (in characters) first. Under en_US.UTF-8, emoji, Greek, Cyrillic and
+        CJK carry no collation weight, so "Ω" vs "日本" or "dev 🚀" vs
+        "dev 🔥" collate equal and length decides (not code points: "Ж本"
+        sorts before "ωΩ🚀Ж");
+      - all keys equal (e.g. "Ω":1 vs "ω":1): the WHOLE line by the same rule
+        (wcscoll, then length), so the window id after the keys decides.
+    Fuzzed against the real sort, 2400 random cases, under both locales."""
+    xfrm = _XFRM or collation()
+    keyed = []
+    for w in windows:
+        s = w["session"]
+        if (" %s " % s) in JUMP_EXCLUDE:
+            continue
+        tier = NEED_TIER.get(w["state"])
+        if tier is None or (tier == 2 and w["workflow"]):
+            continue
+        word = AWK_BLANKS.split(w["since"].strip(" \t\n"))[0]
+        stamp = word if DIGITS.match(word) else str(NO_STAMP)   # awk prints the digits as given
+        ix = "%09d" % w["index"]
+        label = (w["summary"] or w["name"]).replace("\t", " ")
+        line = "\t".join([str(tier), stamp, s, ix, w["id"], s, str(w["index"]), w["state"], stamp, label])
+        key = (tier, int(stamp), xfrm(s), len(s), xfrm(ix), len(ix), xfrm(line), len(line))
+        keyed.append((key, w["id"]))
+    keyed.sort(key=lambda kv: kv[0])
+    return list(dict.fromkeys(wid for _, wid in keyed))
 
 
 def is_attn(w):
@@ -361,15 +448,10 @@ def run_bg(cmd):
     tmux("run-shell", "-b", cmd)
 
 
-def client_window(client):
-    r = tmux("list-clients", "-F", US.join(["#{client_tty}", "#{window_id}"]))
-    if not r or r.returncode:
-        return None
-    for line in r.stdout.splitlines():
-        t, _, win = line.partition(US)
-        if t == client:
-            return win
-    return None
+def snapshot():
+    """Every window and every client in ONE tmux round trip → stdout or ""."""
+    r = tmux("list-windows", "-a", "-F", FMT, ";", "list-clients", "-F", CLIENT_FMT)
+    return r.stdout if r and r.returncode == 0 else ""
 
 
 def is_agent_comm(comm):
@@ -451,14 +533,13 @@ class Roster:
 
     # data
     def refresh(self):
-        r = tmux("list-windows", "-a", "-F", FMT)
-        self.windows = parse_windows(r.stdout) if r and r.returncode == 0 else []
-        try:
-            n = subprocess.run(["bash", JUMP, "list"], capture_output=True, text=True, timeout=5)
-            self.needs = parse_needs(n.stdout)
-        except (OSError, subprocess.TimeoutExpired):
-            self.needs = []
-        self.cur_win = client_window(self.client)
+        self.load(snapshot())
+
+    def load(self, text):
+        """One snapshot() → the model. Split from refresh() for the tests."""
+        self.windows = parse_windows(text)
+        self.needs = needs_order(self.windows)
+        self.cur_win = parse_clients(text).get(self.client)
         self.gone = self.cur_win is None
         self.rebuild()
 

@@ -1,7 +1,14 @@
-"""agent-roster.py's pure model: parsing, grouping, key decoding. No tmux, no terminal."""
+"""agent-roster.py's pure model: parsing, grouping, key decoding. No real tmux, no terminal.
+
+NeedsOrderTests runs the REAL agent-jump.sh against test_agent_jump_watcher's
+fake tmux, to pin the roster's in-process NEEDS YOU order to prefix g's."""
 import importlib.util
+import locale
 import os
 from pathlib import Path
+import re
+import subprocess
+import sys
 import unittest
 
 SRC = Path(os.environ.get(
@@ -10,6 +17,12 @@ SRC = Path(os.environ.get(
 spec = importlib.util.spec_from_file_location("agent_roster", SRC)
 R = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(R)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_agent_jump_watcher import JUMP, FakeEnv, W  # noqa: E402  (the fake tmux, shared)
+
+TMUX_CONF = Path(os.environ.get(
+    "AGENT_TMUX_CONF", str(Path.home() / ".local/share/chezmoi/dot_config/tmux/tmux.conf.tmpl")))
 
 US = "\x1f"
 
@@ -409,6 +422,210 @@ class WidthTests(unittest.TestCase):
             self.assertTrue(foot.startswith(" park main:0"), foot)
             self.assertLessEqual(R.dwidth(foot), cols - 1)
             r.confirm = None
+
+
+def ws(session, index, state="", since=None, workflow="", links=()):
+    opts = {"@agent_state": state} if state else {}
+    if since is not None:
+        opts["@agent_since"] = since
+    if workflow:
+        opts["@agent_workflow"] = workflow
+    w = W(session, index, **opts)
+    if links:
+        w["links"] = list(links)
+    return w
+
+
+# Every rule of agent-jump.sh's `list`, and the ties that need its exact sort.
+NEEDS_FIXTURE = {
+    # tiers, oldest stamp first within a tier
+    "@1": ws("main", 1, "done", "300 done"),
+    "@2": ws("main", 2, "needs-input", "200 needs-input"),
+    "@3": ws("work", 1, "failed", "400 failed"),
+    "@4": ws("work", 2, "done", "50 done", workflow="1"),       # fleet out: not queued
+    "@5": ws("work", 3, "running", "10 running"),               # not queued
+    "@6": ws("work", 4),                                        # plain shell
+    "@7": ws("main", 3, "needs-input"),                         # no stamp: last in its tier
+    "@8": ws("main", 4, "needs-input", ""),
+    "@9": ws("main", 5, "needs-input", "abc"),
+    "@10": ws("main", 6, "needs-input", "12a needs-input"),
+    "@11": ws("main", 7, "needs-input", "  150 needs-input"),   # awk split skips leading blanks
+    "@12": ws("main", 8, "needs-input", "0150\tneeds-input"),   # leading zero, tab separator
+    "@13": ws("main", 9, "failed", "99999999999 failed"),       # past the no-stamp sentinel
+    "@14": ws("main", 10, "done", "300 done", workflow="0"),    # any workflow value counts
+    # excluded sessions, and agent-jump's substring match on " name "
+    "@20": ws("agents", 1, "failed", "1 failed"),
+    "@21": ws("tasks", 1, "failed", "1 failed"),
+    "@22": ws("stash", 1, "failed", "1 failed"),
+    "@23": ws("scratch", 1, "failed", "1 failed"),
+    "@24": ws("btop-popup", 1, "failed", "1 failed"),
+    "@25": ws("tasks stash", 1, "failed", "1 failed"),
+    "@26": ws("stash2", 1, "failed", "1 failed"),               # not excluded
+    # equal stamps: session name in the locale's collation, then index as a number
+    "@30": ws("B", 1, "done", "500 done"),
+    "@31": ws("a", 1, "done", "500 done"),
+    "@32": ws("_x", 1, "done", "500 done"),
+    "@33": ws("Ä", 1, "done", "500 done"),
+    "@34": ws("aa", 1, "done", "500 done"),
+    "@35": ws("a-b", 1, "done", "500 done"),
+    "@36": ws("Z", 1, "done", "500 done"),
+    "@37": ws("10", 1, "done", "500 done"),
+    "@38": ws("9", 1, "done", "500 done"),
+    "@39": ws("a", 10, "done", "500 done"),
+    "@40": ws("a", 2, "done", "500 done"),
+    # No collation weight under en_US.UTF-8 (emoji, Greek, CJK): wcscoll calls
+    # these equal, so sort takes the SHORTER key, then the next key, then the
+    # whole line (where the window id decides). Not code point order.
+    "@60": ws("dev 🚀", 1, "done", "700 done"),
+    "@61": ws("dev 🔥", 1, "done", "700 done"),
+    "@62": ws("dev 🔥🔥", 1, "done", "700 done"),
+    "@71": ws("Ω", 9, "needs-input"),                          # the reviewer's repro: no stamps
+    "@72": ws("Ω", 7, "needs-input"),
+    "@73": ws("日本", 4, "needs-input"),
+    "@79": ws("ω", 1, "done", "800 done"),                     # Ω:1 vs ω:1: only the line differs
+    "@80": ws("Ω", 1, "done", "800 done"),
+    "@81": ws("Ж本", 1, "done", "900 done"),
+    "@82": ws("ωΩ🚀Ж", 1, "done", "900 done"),
+    # linked windows: queued once, from the first sorted row; excluded links never win
+    "@50": ws("zz", 1, "failed", "5 failed", links=("main", "stash")),
+    "@51": ws("stash", 2, "failed", "6 failed", links=("yy",)),
+}
+
+
+class NeedsOrderTests(unittest.TestCase):
+    """needs_order() must give exactly agent-jump.sh `list`'s order: NEEDS YOU
+    and prefix g agree only as long as these two do."""
+    TTY = "/dev/ttys999"
+
+    def setUp(self):
+        self.f = FakeEnv(NEEDS_FIXTURE, clients=[{"tty": self.TTY, "session": "main", "window": "@2"}])
+        self.saved = locale.setlocale(locale.LC_COLLATE)
+
+    def tearDown(self):
+        self.f.close()
+        locale.setlocale(locale.LC_COLLATE, self.saved)
+        R._XFRM = None
+
+    def jump_list(self, loc):
+        r = self.f.run("agent-jump.sh", "list", LC_ALL=loc)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return [l.split("\t")[0] for l in r.stdout.splitlines() if l]
+
+    def roster(self, loc):
+        """The roster's own snapshot call, answered by the same fake tmux."""
+        R.collation(loc)
+        r = subprocess.run([str(self.f.bin / "tmux"), "list-windows", "-a", "-F", R.FMT, ";",
+                            "list-clients", "-F", R.CLIENT_FMT],
+                           env=self.f.env(), capture_output=True, text=True, timeout=30)
+        roster = R.Roster(self.TTY)
+        roster.load(r.stdout)
+        return roster
+
+    def test_same_order_as_agent_jump(self):
+        for loc in ("en_US.UTF-8", "C"):
+            want = self.jump_list(loc)
+            self.assertGreater(len(want), 20, loc)
+            self.assertEqual(self.roster(loc).needs, want, loc)
+
+    def test_fixture_exercises_the_rules(self):
+        got = self.roster("en_US.UTF-8").needs
+        self.assertEqual(got[:3], ["@26", "@50", "@51"])   # failed, oldest first; linked rows once
+        self.assertNotIn("@4", got); self.assertNotIn("@14", got)
+        for wid in ("@20", "@21", "@22", "@23", "@24", "@25"):
+            self.assertNotIn(wid, got)
+        self.assertIn("@26", got)
+        self.assertLess(got.index("@40"), got.index("@39"))  # a:2 before a:10
+        self.assertLess(got.index("@11"), got.index("@12"))   # both 150: main:7 before main:8
+        self.assertLess(got.index("@12"), got.index("@2"))    # "0150" is 150, before 200
+        self.assertLess(got.index("@9"), got.index("@1"))     # no stamp: last of its tier, not of all
+
+    def test_locale_changes_ties(self):
+        # The reason for collation(): en_US puts `a` before `B`, C does not.
+        en, c = self.roster("en_US.UTF-8").needs, self.roster("C").needs
+        self.assertLess(en.index("@31"), en.index("@30"))
+        self.assertLess(c.index("@30"), c.index("@31"))
+
+    def test_weightless_names(self):
+        # What /usr/bin/sort does here (and the parity test holds us to):
+        # equal collation → shorter key first → next key → whole line.
+        got = self.roster("en_US.UTF-8").needs
+
+        def before(a, b):
+            self.assertLess(got.index(a), got.index(b), (a, b, got))
+        before("@72", "@71")                     # Ω:7 before Ω:9
+        before("@71", "@73")                     # Ω (1 char) before 日本 (2), whatever the index
+        before("@60", "@62"); before("@61", "@62")   # "dev 🔥🔥" is longer
+        before("@60", "@61")                     # equal keys: the line, i.e. the id, decides
+        before("@79", "@80")                     # ω:1 before Ω:1 by id, though Ω < ω in code points
+        before("@81", "@82")                     # shorter, though ω < Ж in code points
+
+    def test_exclude_matches_the_script(self):
+        m = re.search(r'^EXCLUDE="([^"]*)"$', JUMP.read_text(), re.M)
+        self.assertEqual(m.group(1), R.JUMP_EXCLUDE)
+
+    def test_snapshot_parses_the_client(self):
+        roster = self.roster("C")
+        self.assertEqual(roster.cur_win, "@2")
+        self.assertFalse(roster.gone)
+        self.assertEqual(len([w for w in roster.windows if w["id"] == "@50"]), 3)   # one row per link
+
+
+class RefreshTests(unittest.TestCase):
+    """The first frame waits on exactly ONE tmux call, and on no bash."""
+
+    def setUp(self):
+        self.saved = (R.tmux, R.subprocess.run)
+        self.calls = []
+        text = "\n".join([line("main", 1, "@1", "failed", "one", since="5 failed"),
+                          line("main", 2, "@2", "idle", "two"),
+                          US.join(["", R.CLIENT_TAG, "/dev/ttys999", "@2"]),
+                          US.join(["", R.CLIENT_TAG, "/dev/ttys001", "@1"])])
+
+        class Done:
+            returncode, stdout = 0, text
+        R.tmux = lambda *a: (self.calls.append(a), Done)[1]
+        R.subprocess.run = lambda *a, **k: self.fail("refresh forked %r" % (a,))
+
+    def tearDown(self):
+        R.tmux, R.subprocess.run = self.saved
+
+    def test_one_call(self):
+        r = R.Roster("/dev/ttys999")
+        r.refresh()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][:4], ("list-windows", "-a", "-F", R.FMT))
+        self.assertIn(";", self.calls[0])
+        self.assertEqual((r.cur_win, r.needs, r.gone), ("@2", ["@1"], False))
+        self.assertEqual(len(r.windows), 2)                      # client rows are not windows
+
+    def test_client_gone(self):
+        r = R.Roster("/dev/ttys555")
+        r.refresh()
+        self.assertTrue(r.gone)
+
+
+class BindingTests(unittest.TestCase):
+    """prefix e's launch path, as written in tmux.conf.tmpl."""
+
+    def lines(self):
+        return [l for l in TMUX_CONF.read_text().splitlines() if re.match(r"bind-key (e|C-e) ", l)]
+
+    def test_fast_launch(self):
+        ls = self.lines()
+        self.assertEqual(len(ls), 2)
+        self.assertEqual(ls[0].split(None, 2)[2], ls[1].split(None, 2)[2])   # e and C-e: same command
+        cmd = ls[0]
+        # No shell around display-popup, no tmux client process.
+        self.assertIn('run-shell -C "display-popup ', cmd)
+        self.assertNotIn("tmux display-popup", cmd)
+        # Argv form (several args: exec'd, no zsh -c); dash only picks python.
+        self.assertIn(" /bin/dash -c '", cmd)
+        self.assertIn("{{ .homebrew_prefix }}/bin/python3 -I -S ", cmd)
+        # The xcrun stub keeps its pycache prefix: -S, never -I or -E.
+        self.assertRegex(cmd, r"exec /usr/bin/python3 -S \\\"\\\$0\\\"")
+        self.assertNotIn("pyenv", cmd)
+        self.assertIn("/.config/tmux/scripts/agent-roster.py' '#{client_tty}'", cmd)
+        self.assertEqual(cmd.count("#{client_tty}"), 2)
 
 
 if __name__ == "__main__":

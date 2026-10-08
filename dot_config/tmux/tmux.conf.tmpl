@@ -458,9 +458,17 @@ bind-key G   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{cl
 # watcher, esc closes. See the header of scripts/agent-roster.py.
 #
 # Through run-shell on purpose: display-popup does NOT expand formats in its
-# own command, and the roster has to be told which client opened it.
-bind-key e   run-shell -b "tmux display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' '/usr/bin/python3 #{HOME}/.config/tmux/scripts/agent-roster.py --client #{client_tty}'"
-bind-key C-e run-shell -b "tmux display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' '/usr/bin/python3 #{HOME}/.config/tmux/scripts/agent-roster.py --client #{client_tty}'"
+# own command, and the roster has to be told which client opened it. -C makes
+# it a tmux command, not a shell one: no `zsh -c` (~20 ms, mostly .zshenv's
+# keychain lookup) and no `tmux` client process. display-popup given several
+# arguments execs them directly, again with no zsh. dash (~3 ms) only picks the
+# interpreter: Homebrew's python3 with -I -S (~35 ms to the first frame);
+# else the /usr/bin xcrun stub with -S only, since -I/-E would drop the
+# PYTHONPYCACHEPREFIX the stub sets and recompile the stdlib every launch
+# (-S is fine: the prefix comes from the stub, not site). Never a pyenv shim
+# (~140-260 ms). Numbers: docs/agent-roster.md.
+bind-key e   run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
+bind-key C-e run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
 
 # Double-tap hyper or right shift in WezTerm (Karabiner, karabiner-base.json) flips
 # back to the previous one of these, like the same double-tap does for Arc tabs:
