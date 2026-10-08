@@ -18,15 +18,22 @@
 #
 # NEVER INTO: agents (pty-MCP shells), tasks (CuaNotch's broker), stash (the
 # parked-tab holding session — switching there would land you inside the
-# park), scratch, btop-popup (toggle-btop-popup.sh's session).
+# park), scratch, btop-popup (toggle-btop-popup.sh's session). `list` drops
+# them; go_to refuses them too, because `back`'s origin (or a goto target) can
+# be parked AFTER the chain was recorded.
 #
 # SELECT FIRST, THEN SWITCH. The tint is discharged by after-select-window[0]
 # → `agent-tab-indicator.sh clear-current`, and a bare `switch-client` fires
 # no select hook — a cross-session jump would land on a tab still painted, and
 # `next` would keep cycling back to it. So every move is
-#   select-window -t <win> ; switch-client -c <tty> -t =<session>
-# The hook's #{window_id} is the command's target, so it discharges the right
-# window even before the client arrives, and client-session-changed[1] then
+#   select-window -t =<session>:<win> ; switch-client -c <tty> -t =<session>
+# The session is named explicitly because a window can be LINKED into several
+# sessions, and `display-message -t <win>` resolves it to whichever had the
+# latest activity (often stash). `next` uses the session from its list row;
+# back/goto prefer the client's own session, then the first linked session
+# that is not excluded. The =<session>:<win> target keeps select and switch
+# in the same session. The hook's #{window_id} is the command's target, so
+# it discharges the right window even before the client arrives, and client-session-changed[1] then
 # runs cua-notch-visit for the notch. The client is checked BEFORE the select:
 # a select whose switch then fails would discharge a tint nobody saw.
 #
@@ -40,6 +47,10 @@
 #
 # Messages are worded to stay info chips: message-format paints anything
 # starting "no …"/"not …"/"can't …" as an error.
+#
+# display-message takes its text as a FORMAT, so say() doubles every `#`:
+# a summary, window name or session name holding #{…}/#[…] is shown, not
+# expanded or styled. Nothing here uses formats in its own messages.
 
 set -uo pipefail
 
@@ -50,10 +61,11 @@ mode="${1:-}"
 tty="${2:-}"
 
 say() {
+    local m="${1//\#/##}"
     if [ -n "$tty" ]; then
-        tmux display-message -c "$tty" "$1" 2>/dev/null || tmux display-message "$1" 2>/dev/null
+        tmux display-message -c "$tty" "$m" 2>/dev/null || tmux display-message "$m" 2>/dev/null
     else
-        tmux display-message "$1" 2>/dev/null
+        tmux display-message "$m" 2>/dev/null
     fi
 }
 
@@ -72,6 +84,10 @@ list_needs() {
             printf "%d\t%s\t%s\t%09d\t%s\t%s\t%s\t%s\t%s\t%s\n", p, t, $2, $3, $1, $2, $3, $4, t, label
         }' |
     sort -t "$(printf '\t')" -k1,1n -k2,2n -k3,3 -k4,4 |
+    # `list-windows -a` prints a linked window once per session it is linked
+    # into; keep its first (sorted) row so it is queued and counted once.
+    # Excluded sessions were dropped above, so that row is never one of them.
+    awk -F '\t' '!seen[$5]++' |
     cut -f5-
 }
 
@@ -85,11 +101,36 @@ client_info() {
     IFS="$US" read -r _ cur_sess cur_win <<<"$line"
 }
 
+# go_to <win> [<session>]. Sets go_sess to the session it moves in: the one
+# given, else the client's own session if <win> is linked there, else the
+# first linked session not in EXCLUDE, else (all excluded) the first one.
+# Returns 1 if the window is gone, 2 if go_sess is an EXCLUDE session (e.g.
+# the origin was parked into stash mid-chain): never switch the client in
+# there — refused() explains instead.
 go_to() {
-    local win="$1" sess
-    sess=$(tmux display-message -p -t "$win" '#{session_name}' 2>/dev/null) || return 1
-    [ -n "$sess" ] || return 1
-    tmux select-window -t "$win" \; switch-client -c "$tty" -t "=$sess" 2>/dev/null
+    local win="$1"
+    go_sess="${2:-}"
+    if [ -z "$go_sess" ]; then
+        go_sess=$(tmux list-windows -a -F "#{window_id}${US}#{session_name}" 2>/dev/null |
+            awk -F "$US" -v w="$win" -v cur="${cur_sess:-}" -v ex="$EXCLUDE" '
+                $1 != w { next }
+                first == "" { first = $2 }
+                index(ex, " " $2 " ") { next }
+                $2 == cur { mine = $2 }
+                ok == "" { ok = $2 }
+                END { print (mine != "" ? mine : (ok != "" ? ok : first)) }')
+        [ -n "$go_sess" ] || return 1
+    fi
+    case "$EXCLUDE" in *" $go_sess "*) return 2 ;; esac
+    tmux select-window -t "=$go_sess:$win" \; switch-client -c "$tty" -t "=$go_sess" 2>/dev/null
+}
+
+refused() {
+    if [ "$go_sess" = stash ]; then
+        say "that tab was parked · prefix h brings it back"
+    else
+        say "that tab is in $go_sess · jumps skip that session"
+    fi
 }
 
 chain_key() { printf '@agent_jump_%s' "${tty//[^A-Za-z0-9]/_}"; }
@@ -123,7 +164,9 @@ case "$mode" in
         if [ -z "$chain" ] || [ "${chain##* }" != "$cur_win" ]; then
             origin="$cur_win"
         fi
-        go_to "$twin" || { say "agent-jump: $tsess:$tidx is gone"; exit 0; }
+        go_to "$twin" "$tsess"; rc=$?
+        [ "$rc" -eq 2 ] && { refused; exit 0; }
+        [ "$rc" -eq 0 ] || { say "agent-jump: $tsess:$tidx is gone"; exit 0; }
         tmux set-option -g "$key" "$origin $twin" 2>/dev/null
         msg="→ $tsess:$tidx $tlabel · $(describe "$tstate")"
         [ "$more" -gt 0 ] && msg="$msg · $more more"
@@ -139,16 +182,23 @@ case "$mode" in
             exit 0
         fi
         origin="${chain%% *}"
-        tmux set-option -gu "$key" 2>/dev/null
-        go_to "$origin" || { say "the window you jumped from is gone"; exit 0; }
+        tmux set-option -gu "$key" 2>/dev/null          # chain is spent either way
+        go_to "$origin"; rc=$?
+        [ "$rc" -eq 2 ] && { refused; exit 0; }
+        [ "$rc" -eq 0 ] || { say "the window you jumped from is gone"; exit 0; }
         say "← back"
         ;;
 
     goto)
+        # The roster sends parked windows through `stash.sh unstash`, not
+        # here; this guard only keeps a stray goto out of EXCLUDE sessions.
         win="${3:-}"
         [ -n "$win" ] || { say "agent-jump: goto needs a window"; exit 0; }
         client_info || { say "agent-jump: client $tty is not attached"; exit 0; }
-        go_to "$win" || say "agent-jump: window $win is gone"
+        go_to "$win"; rc=$?
+        if [ "$rc" -eq 2 ]; then refused
+        elif [ "$rc" -ne 0 ]; then say "agent-jump: window $win is gone"
+        fi
         ;;
 
     *)

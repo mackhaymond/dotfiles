@@ -42,8 +42,9 @@ def arg(c, f):
     return c[c.index(f) + 1] if f in c else None
 
 def render(fmt, v):
-    fmt = fmt.replace("#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}",
-                      v.get("@agent_summary") or v.get("window_name", ""))
+    # Substituted values are never re-expanded (as in tmux), so a label holding #{...} survives.
+    v = dict(v, __label=v.get("@agent_summary") or v.get("window_name", ""))
+    fmt = fmt.replace("#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}", "#{__label}")
     return re.sub(r"#\{([@\w]+)\}", lambda m: str(v.get(m.group(1), "")), fmt)
 
 def wvars(s, wid):
@@ -63,6 +64,10 @@ with p.with_suffix(".lock").open("a") as lock:
         if cmd == "list-windows":
             for wid in s["windows"]:
                 out.append(render(arg(c, "-F"), wvars(s, wid)))
+                # A linked window ("links": [sessions]) is listed once per session, like -a does.
+                for ls in s["windows"][wid].get("links", []):
+                    v = wvars(s, wid); v["session_name"] = ls
+                    out.append(render(arg(c, "-F"), v))
         elif cmd == "list-panes":
             for pn in s["panes"]:
                 v = wvars(s, pn["window"]); v["pane_tty"] = pn["tty"]
@@ -96,12 +101,21 @@ with p.with_suffix(".lock").open("a") as lock:
             if flag(c, "-p"):
                 t = arg(c, "-t")
                 if t not in s["windows"]: rc = 1; continue
-                out.append(render(c[-1], wvars(s, t)))
+                v = wvars(s, t)
+                # Real tmux resolves a linked window to its most recently active session; say the last link.
+                if s["windows"][t].get("links"): v["session_name"] = s["windows"][t]["links"][-1]
+                out.append(render(c[-1], v))
             else:
                 s["messages"].append([arg(c, "-c"), c[-1]])
         elif cmd == "select-window":
+            # A failed command aborts the rest of the list, as in tmux (no switch-client after it).
             t = arg(c, "-t")
-            if t not in s["windows"]: rc = 1; continue
+            if ":" in t:                                    # =session:@id: must be linked there
+                sess, t = t.lstrip("=").split(":", 1)
+                w = s["windows"].get(t)
+                if not w or sess not in [w["session"]] + w.get("links", []): rc = 1; break
+                s["active"][sess] = t; continue
+            if t not in s["windows"]: rc = 1; break
             s["active"][s["windows"][t]["session"]] = t
         elif cmd == "switch-client":
             tty, sess = arg(c, "-c"), arg(c, "-t").lstrip("=")
@@ -295,6 +309,80 @@ class JumpTests(unittest.TestCase):
         f = self.make()
         f.run("agent-jump.sh", "next", "/dev/ttys999")
         self.assertFalse([c for c in f.read()["calls"] if c[0] == "select-window"])
+
+    def test_back_refuses_an_origin_parked_in_stash(self):
+        f = self.make()
+        f.run("agent-jump.sh", "next", self.TTY)            # chain "@10 @13"
+        s = f.read(); s["windows"]["@10"]["session"] = "stash"; s["calls"] = []   # origin parked
+        f.state.write_text(json.dumps(s))
+        f.run("agent-jump.sh", "back", self.TTY)
+        s = f.read()
+        self.assertFalse([c for c in s["calls"] if c[0] in ("select-window", "switch-client")], s["calls"])
+        self.assertEqual(s["clients"][0]["session"], "work")
+        self.assertNotIn("@agent_jump__dev_ttys000", s["globals"])
+        msg = s["messages"][-1][1]
+        self.assertIn("parked", msg)
+        self.assertNotRegex(msg, r"^(no|not|can't|cannot|invalid|unknown|failed|error)\b")
+
+    def test_goto_refuses_excluded_session(self):
+        f = self.make()
+        f.run("agent-jump.sh", "goto", self.TTY, "@16")      # lives in `tasks`
+        s = f.read()
+        self.assertFalse([c for c in s["calls"] if c[0] in ("select-window", "switch-client")], s["calls"])
+        self.assertEqual(s["clients"][0]["session"], "main")
+
+    def test_hash_in_label_is_escaped(self):
+        f = self.make(**{"@18": W("zz#{host}", 1, **{"@agent_state": "failed", "@agent_since": "1 failed",
+                                                   "@agent_summary": "fix #{pane_title} #[fg=red]"})})
+        f.run("agent-jump.sh", "next", self.TTY)
+        s = f.read()
+        self.assertEqual(s["clients"][0]["window"], "@18")
+        msg = s["messages"][-1][1]
+        self.assertIn("zz##{host}:1 fix ##{pane_title} ##[fg=red]", msg)
+        self.assertNotRegex(msg, r"(?<!#)#[{\[]")
+
+    def test_linked_windows_land_in_a_normal_session(self):
+        # The fake's display-message -t @id reports the LAST link (stash), as tmux's activity pick can.
+        w19 = W("bai", 4, **{"@agent_state": "failed", "@agent_since": "1 failed"}); w19["links"] = ["stash"]
+        w20 = W("bai", 5); w20["links"] = ["main"]
+        f = self.make(**{"@19": w19, "@20": w20})
+        s = f.read(); s["windows"]["@10"]["links"] = ["stash"]; f.state.write_text(json.dumps(s))
+
+        f.run("agent-jump.sh", "next", self.TTY)
+        s = f.read()
+        self.assertEqual([c for c in s["calls"] if c[0] == "select-window"][-1], ["select-window", "-t", "=bai:@19"])
+        self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("bai", "@19"))
+        self.assertTrue(s["messages"][-1][1].startswith("→ bai:4 "), s["messages"][-1])
+
+        f.run("agent-jump.sh", "back", self.TTY)            # origin @10 is main + stash
+        s = f.read()
+        self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("main", "@10"))
+        self.assertEqual(s["messages"][-1][1], "← back")
+
+        f.run("agent-jump.sh", "goto", self.TTY, "@19")     # bai + stash, client in main
+        s = f.read()
+        self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("bai", "@19"))
+
+        f.run("agent-jump.sh", "goto", self.TTY, "@20")     # bai + main, client in bai: stay in bai
+        s = f.read()
+        self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("bai", "@20"))
+        s["clients"][0].update(session="main", window="@10"); f.state.write_text(json.dumps(s))
+        f.run("agent-jump.sh", "goto", self.TTY, "@20")     # from main: prefer the client's own session
+        s = f.read()
+        self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("main", "@20"))
+        self.assertFalse([c for c in s["calls"] if c[0] == "switch-client" and "=stash" in c], s["calls"])
+
+    def test_linked_window_listed_and_counted_once(self):
+        f = self.make()
+        s = f.read(); s["windows"]["@12"]["links"] = ["main", "stash"]
+        f.state.write_text(json.dumps(s))
+        out = f.run("agent-jump.sh", "list").stdout.split("\n")
+        rows = [l.split("\t") for l in out if l]
+        self.assertEqual([r[0] for r in rows], ["@13", "@12", "@17", "@11"])
+        self.assertTrue(all(len(r) == 6 for r in rows), rows)
+        self.assertNotEqual(rows[1][1], "stash")
+        f.run("agent-jump.sh", "next", self.TTY)
+        self.assertIn("· failed · 3 more", f.read()["messages"][-1][1])
 
 
 if __name__ == "__main__":
