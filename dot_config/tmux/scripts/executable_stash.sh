@@ -282,8 +282,15 @@ save_state() {
     # when the pane is busy and tells you to try again — and the old version
     # only mirrored windows inside HOLD, so that row was dropped at exactly the
     # moment the window option became the sole surviving pointer.
+    #
+    # Field 9, @stash_ts (when it was parked), is APPENDED rather than slotted
+    # in beside the others: a sidecar written before it existed has 8 fields,
+    # and every reader below reads it into its own trailing variable, so an
+    # old row simply yields an empty ts and restores everything else as before.
+    # Without it a restore brought parked tabs back with no park time, and the
+    # roster showed a blank age for every one of them.
     rows=$(tmux list-windows -a -F \
-        "#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@stash_pane_idx}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}" \
+        "#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@stash_pane_idx}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}${SEP}#{@stash_ts}" \
         2>/dev/null) || { lock_release "$SAVE_LOCKDIR"; return 0; }   # tmux unreachable: keep what is on disk
     rows=$(printf '%s\n' "$rows" | awk -F"$SEP" -v hold="$HOLD" '$1==hold || $7!=""')
 
@@ -305,14 +312,16 @@ save_state() {
     # `stash.sh list` prints the command to resume it by hand.
     local of; of=$(orphan_file)
     if [ -f "$sf" ]; then
-        local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd
+        local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_extra
         local fresh_sids; fresh_sids=$(printf '%s\n' "$rows" | awk -F"$SEP" '$7!=""{print $7}')
         # ONCE, not per row: live_sessions reads every session file, and this
         # ran inside the loop — O(rows) interpreter startups while holding a
         # lock, which after a restart (many rows, no options yet) is the slowest
         # thing in the file and was itself widening the race above.
         live=$(live_sessions)
-        while IFS="$SEP" read -r o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd; do
+        # o_extra soaks up any field a later format appends, so o_ts (and, for
+        # an 8-field row, o_cwd) never carries a stray separator.
+        while IFS="$SEP" read -r o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_extra; do
             [ -n "$o_sid" ] || continue
             printf '%s\n' "$fresh_sids" | grep -qx "$o_sid" && continue   # already represented
             # Still a live agent? Then it is not suspended and needs no record.
@@ -322,7 +331,7 @@ save_state() {
             # and carrying the row forward there is exactly how a suspended
             # session's id ends up stamped on someone else.
             if window_for_row "$o_sess" "$o_idx" "$o_name" "$o_cwd" "$o_pidx" >/dev/null; then
-                rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}"
+                rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}${SEP}${o_ts}"
                 log "carried forward suspended session ${o_sid%%-*} ($o_sess:$o_idx) — window exists but has no options yet"
             else
                 mkdir -p "$(dirname "$of")" 2>/dev/null
@@ -331,7 +340,7 @@ save_state() {
                 # every save turned one lost conversation into eight identical
                 # rows — noise that makes `stash.sh list` look like a disaster.
                 if ! grep -q "${SEP}${o_sid}${SEP}" "$of" 2>/dev/null; then
-                    printf '%s\n' "${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}" >> "$of" 2>/dev/null
+                    printf '%s\n' "${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}${SEP}${o_ts}" >> "$of" 2>/dev/null
                     log "suspended session ${o_sid%%-*} has no window any more — moved to $(basename "$of")"
                 fi
             fi
@@ -398,8 +407,10 @@ forget_sids() {
 do_restore_state() {
     local sf of; sf=$(state_file); of=$(orphan_file)
     [ -f "$sf" ] || return 0
-    local sess idx name pidx origin label sid cwd win wcwd existing kept=""
-    while IFS="$SEP" read -r sess idx name pidx origin label sid cwd; do
+    local sess idx name pidx origin label sid cwd ts extra win wcwd existing kept=""
+    # ts is field 9 and absent from sidecars written before it was mirrored;
+    # such a row reads ts="" and restores everything else unchanged.
+    while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts extra; do
         [ -n "$sess" ] && [ -n "$idx" ] || continue
 
         local ok=1
@@ -413,7 +424,7 @@ do_restore_state() {
         if [ "$ok" != 1 ]; then
             if [ -n "$sid" ]; then
                 # Keep the pointer somewhere durable, and say so loudly.
-                kept="${kept}${sess}${SEP}${idx}${SEP}${name}${SEP}${pidx}${SEP}${origin}${SEP}${label}${SEP}${sid}${SEP}${cwd}"$'\n'
+                kept="${kept}${sess}${SEP}${idx}${SEP}${name}${SEP}${pidx}${SEP}${origin}${SEP}${label}${SEP}${sid}${SEP}${cwd}${SEP}${ts}"$'\n'
                 log "could not place suspended session ${sid%%-*} ($sess:$idx) — kept in $(basename "$of"); \`stash.sh list\` shows how to resume it"
             else
                 log "skipped $sess:$idx — no matching window"
@@ -426,6 +437,9 @@ do_restore_state() {
         [ -n "$sid" ]    && tmux set-option -w -t "$win" @stash_session  "$sid"    2>/dev/null
         [ -n "$cwd" ]    && tmux set-option -w -t "$win" @stash_cwd      "$cwd"    2>/dev/null
         [ -n "$pidx" ]   && tmux set-option -w -t "$win" @stash_pane_idx "$pidx"   2>/dev/null
+        # Epoch seconds or nothing: the roster and the picker do arithmetic on
+        # it, and a hand-edited or torn row must not plant garbage there.
+        case "$ts" in ''|*[!0-9]*) ;; *) tmux set-option -w -t "$win" @stash_ts "$ts" 2>/dev/null ;; esac
         log "restored $sess:$idx${sid:+ — suspended session ${sid%%-*}}"
     done < "$sf"
 
@@ -2079,7 +2093,9 @@ do_list() {
     if [ -s "$of" ]; then
         echo
         echo "  Suspended sessions that lost their window (resume by hand):"
-        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd; do
+        # Trailing _ts/_extra keep cwd clean on 9-field rows (see save_state).
+        local _ts _extra
+        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd _ts _extra; do
             [ -n "$sid" ] || continue
             printf '    %-28s cd %s && claude --resume %s\n' "${label:-$name}" "${cwd:-?}" "$sid"
         done < "$of"
