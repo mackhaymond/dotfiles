@@ -46,7 +46,19 @@
 # version-string pattern is kept as a fallback in case a Claude build stops
 # setting its process title. Codex's npm wrapper spawns the native binary
 # vendor/<triple>/bin/codex → comm basename "codex" (plus a "node" parent we
-# don't match).
+# don't match). Candidates come from `pgrep` (cheap), and each one's tty+comm
+# from a single-pid ps, cached per pid — see PROCESS DISCOVERY in the loop.
+#
+# TICK TRACE (live measurement, no restart needed). If the file
+#   ${TMPDIR:-/tmp}/agent-tab-watcher.$UID.trace
+# EXISTS at the start of a tick, the tick appends one line to it:
+#   <epoch> <tick_ms> <windows> <agents>
+# epoch = integer seconds at tick start, tick_ms = wall time from the top of
+# the tick to just before its sleep, windows = windows reconciled, agents =
+# tty-owning agent processes seen. `: > that-file` to start, `rm` it to stop
+# (it is never truncated or rotated by the watcher). Ticks that bail out on
+# the failure path write no line. Needs $EPOCHREALTIME (bash 5); with tracing
+# off the cost is one builtin file test per tick, no fork.
 #
 # Singleton + lifecycle follow coffee-watcher.sh: PID-file guard, exits when
 # the tmux server goes away, writes only on change then refresh-client -S.
@@ -178,9 +190,11 @@ trap cleanup EXIT
 trap 'exit 0' INT TERM HUP
 
 is_agent_comm() {
-    # ${1##*/}, not basename: this runs for every tty-owning process on every
-    # 1s tick (~60 fork+exec per tick, ~5M/day) — measured 109ms/tick vs
-    # 9.5ms for the builtin. ps `comm` is never "/" or a trailing-slash path,
+    # ${1##*/}, not basename: this used to run for every tty-owning process
+    # on every 1s tick (~60 fork+exec per tick, ~5M/day) — measured
+    # 109ms/tick vs 9.5ms for the builtin. (Now it runs once per newly seen
+    # pgrep candidate, but there is still no reason to fork for it.) ps
+    # `comm` is never "/" or a trailing-slash path,
     # so the expansion is exactly equivalent here (and it doesn't choke on
     # comm values like "-zsh", which basename parses as an option).
     local base="${1##*/}"
@@ -329,14 +343,26 @@ idle_streak=" "
 GC_TICKS=5
 gc_streak=" "
 
+# Process discovery (see PROCESS DISCOVERY in the loop): the pgrep pattern
+# (is_agent_comm's names, -x anchors it), the per-pid tty cache, and how
+# often that cache is thrown away wholesale.
+AGENT_PAT='claude|codex|[0-9]+\.[0-9]+\.[0-9]+'
+pid_cache=" "
+pid_cache_age=0
+PID_CACHE_TICKS=60
+
+# Tick trace (see TICK TRACE in the header). Tested once per tick, builtin.
+TRACE="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.trace"
+
 # THE PULSE HAS ITS OWN CLOCK. @agent_blink used to be toggled once per loop
 # tick, so a pulse phase lasted POLL_SECONDS *plus the whole tick's work* -
-# and that work is not small: `ps -ax` alone is ~250ms here whatever flags
-# it gets, the background-subagent scan ~450ms over 9 claude windows, and
-# every 60s resolve_session_bases' cache expires and a cold walk costs ~1.5s
-# PER SESSION. Measured 2026-10-07: phases of 1.7s steady, with 4-6s spikes
-# ("inconsistent and pretty long" - Mack). No amount of trimming makes a
-# reconcile loop a metronome, so the toggling moved into this child, which
+# and that work was not small at the time: `ps -ax` alone was ~250ms
+# whatever flags it got, the background-subagent scan ~450ms over 9 claude
+# windows, and a cold compaction-lineage walk ~1.5s PER SESSION every 60s.
+# Measured 2026-10-07: phases of 1.7s steady, with 4-6s spikes
+# ("inconsistent and pretty long" - Mack). Those costs have since been cut,
+# but no amount of trimming makes a reconcile loop that forks tmux and reads
+# files a metronome, so the toggling moved into this child, which
 # does nothing else: the loop only raises or lowers BLINK_FLAG (builtin
 # redirect to raise, one rm on the falling edge), and the child flips the
 # option every POLL_SECONDS while the flag exists.
@@ -395,6 +421,14 @@ blink_loop &
 BLINK_PID=$!
 
 while :; do
+    # Tick trace: armed only if the file exists now (one stat, no fork) and
+    # this bash has EPOCHREALTIME (bash 5; /bin/bash 3.2 just never traces).
+    trace_t0=""
+    if [ -e "$TRACE" ] && [ -n "${EPOCHREALTIME:-}" ]; then
+        trace_t0=$EPOCHREALTIME
+    fi
+    n_windows=0
+
     # window_id<space>pane_tty for every pane.
     if ! panes=$(tmux list-panes -a -F '#{window_id} #{pane_tty}' 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
@@ -403,36 +437,126 @@ while :; do
         continue
     fi
 
-    # One ps for all TTYs: agent TTYs, plus tty=pid for every agent pane —
+    # PROCESS DISCOVERY: agent TTYs, plus tty=pid for every agent pane —
     # claude pids feed the workflow lookup (codex pids simply miss in
     # ~/.claude/sessions and fall through), and both kinds feed the
     # computer-use pid match (@agent_cua), which is agent-agnostic.
-    # GUARDED like the two tmux reads around it. This was the one data source
-    # in the loop that was not: a single empty/failed ps tick made has_agent=0
-    # for every window, the GC below unset every @agent_* option, and the next
-    # good tick reseeded them all to `idle` - which is TERMINAL for a mid-turn
+    #
+    # NOT `ps -ax`. That was one call per tick, but macOS ps gathers task
+    # info for EVERY process whatever -o asks for: ~250 ms wall on a quiet
+    # machine, 0.7-2.5 s under load, ~570 ms of CPU per call (measured
+    # 2026-10-07, ~1700 processes). And `ps -p a,b,c` is no way out: with
+    # more than one pid it takes the same all-process path (13 pids: ~1.3 s,
+    # vs ~6 ms for one). What is cheap is pgrep (~40 ms wall, ~7 ms CPU: a
+    # sysctl walk, no task info) and SINGLE-pid ps. So: pgrep for candidates,
+    # then a single-pid ps per pid NOT SEEN BEFORE, all in parallel (13 new
+    # pids: ~30 ms), and the answer cached per pid. Steady state is one pgrep
+    # per tick.
+    #
+    # pgrep matches the basename of the same argv[0]-derived name ps prints
+    # as comm (checked against every process on this machine: claude
+    # matches as "claude" though its p_comm is "2.1.291", vendor/.../codex as
+    # "codex", a path argv[0] by its basename) - but it is only a candidate
+    # filter: each new pid's comm is re-checked with is_agent_comm, exactly
+    # as before, and its tty must not be empty/"??". -a: pgrep otherwise
+    # skips its own ancestors, and ps never did. -x + the alternation is
+    # anchored as a whole (^(...)$), same shape as is_agent_comm.
+    #
+    # THE CACHE (" pid=tty pid=- ", "-" = not an agent / no tty) is rebuilt
+    # from each tick's pgrep, so a pid drops out the tick it stops matching;
+    # a stale entry would need an agent to die AND its pid to be reused by
+    # another agent-named process within one tick (the pid space wraps in
+    # ~15 min). A process's controlling tty and comm don't change under it
+    # short of exec/setsid; as belt and braces the whole cache is dropped
+    # every PID_CACHE_TICKS ticks (one cold refresh a minute, ~30 ms).
+    #
+    # FAILURE HANDLING. A failed or empty listing used to make has_agent=0 for
+    # every window, the GC unset every @agent_* option, and the next good
+    # tick reseeded them all to `idle` - which is TERMINAL for a mid-turn
     # agent, because the heartbeat only re-arms `running` from idle when
-    # @agent_pending is set, and the GC had just cleared it. An empty listing
-    # is never real (this very shell is in it), so it is treated as a failure.
-    if ! ps_out=$(ps -ax -o tty=,pid=,comm= 2>/dev/null) || [ -z "$ps_out" ]; then
+    # @agent_pending is set, and the GC had just cleared it. So a real error
+    # skips the tick (fail_streak), like the tmux reads around it: pgrep
+    # exit >= 2 (bad pattern / fatal; 127 = missing), or new candidates of
+    # which ps could describe NONE (all exiting in the ~ms between the two is
+    # possible but one skipped tick is cheap; a broken ps is not). pgrep exit
+    # 1 is NOT a failure: it means zero agent processes, a normal state (the
+    # GC_TICKS hysteresis still applies before any window is collected).
+    # LC_ALL=C: under the UTF-8 locale tmux hands us, macOS pgrep exits 3
+    # ("illegal byte sequence") if ANY process on the machine has a
+    # non-UTF-8 argv[0] - agent or not - and every tick would then fail
+    # until that process exits (reconcile and heartbeat both stop, and
+    # ensure_watcher reaps and respawns into the same wall). The pattern is
+    # ASCII, so the C locale matches exactly the same names.
+    cand=$(LC_ALL=C pgrep -ax "$AGENT_PAT" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -ge 2 ]; then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
         continue
     fi
-    agent_ttys=" "
-    tty_pid=" "
-    while IFS=' ' read -r tty pid comm; do
-        [ -n "$tty" ] && [ "$tty" != "??" ] || continue
-        if is_agent_comm "$comm"; then
-            agent_ttys="${agent_ttys}${tty} "
-            case "${comm##*/}" in
-                claude|codex|[0-9]*) tty_pid="${tty_pid}${tty}=${pid} " ;;
-            esac
+    [ "$rc" = 0 ] || cand=""
+    pid_cache_age=$((pid_cache_age + 1))
+    if [ "$pid_cache_age" -ge "$PID_CACHE_TICKS" ]; then
+        pid_cache=" "
+        pid_cache_age=0
+    fi
+    new_pids=""
+    for pid in $cand; do
+        case "$pid_cache" in
+            *" ${pid}="*) : ;;
+            *) new_pids="${new_pids} ${pid}" ;;
+        esac
+    done
+    if [ -n "$new_pids" ]; then
+        # One write per ps (a ~30-byte line, under PIPE_BUF), so parallel
+        # output never interleaves mid-line. The `&` jobs belong to this
+        # comsub's subshell, never to the watcher's own job table.
+        #
+        # NO `wait` in here. The comsub already reads its pipe to EOF, and
+        # every ps holds the write end until it exits, so all output is in
+        # before $(...) returns (the subshell exits at once; its ps children
+        # are reparented and reaped by launchd). And a bare `wait` here is a
+        # trap: bash 5.3.9 makes the comsub inherit the parent's job table,
+        # so `wait` tries the pulse child, gets "pid N is not a child of this
+        # shell", and spins on that error forever - a wedged tick.
+        ps_out=$(for pid in $new_pids; do ps -o tty=,pid=,comm= -p "$pid" 2>/dev/null & done)
+        if [ -z "$ps_out" ]; then
+            fail_streak=$((fail_streak + 1))
+            { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
+            sleep "$POLL_SECONDS"
+            continue
         fi
-    done <<EOF
+        while IFS=' ' read -r tty pid comm; do
+            [ -n "$pid" ] || continue
+            if [ -n "$tty" ] && [ "$tty" != "??" ] && is_agent_comm "$comm"; then
+                pid_cache="${pid_cache}${pid}=${tty} "
+            else
+                pid_cache="${pid_cache}${pid}=- "
+            fi
+        done <<EOF
 $ps_out
 EOF
+    fi
+    # In pgrep's order: ascending pid. ps -ax sorted by tty, then pid, and
+    # the tty=pid lookup below only ever compares entries of ONE tty, so
+    # "first agent pane wins" still picks the lowest pid on it, as it did.
+    agent_ttys=" "
+    tty_pid=" "
+    next_cache=" "
+    n_agents=0
+    for pid in $cand; do
+        case "$pid_cache" in
+            *" ${pid}="*) tty="${pid_cache#*" ${pid}="}"; tty="${tty%% *}" ;;
+            *) continue ;;   # exited between pgrep and its ps
+        esac
+        next_cache="${next_cache}${pid}=${tty} "
+        [ "$tty" = - ] && continue
+        agent_ttys="${agent_ttys}${tty} "
+        tty_pid="${tty_pid}${tty}=${pid} "
+        n_agents=$((n_agents + 1))
+    done
+    pid_cache="$next_cache"
 
     # Current per-window state in one call (formats resolve window options).
     #
@@ -534,17 +658,19 @@ EOF
     wez_front=""   # per tick, computed at most once, only if a tinted tab is watched
     while IFS="$US" read -r win state wac since; do
         # MID-TICK HEARTBEAT. The heartbeat means "the loop is turning", and a
-        # COLD tick turns slowly but does turn: resolve_session_bases' lineage
-        # walk greps every transcript in the project dir (643 MB under
-        # -Users-mackhaymond here, ~7 s per session), its cache lives in this
-        # process, and the first tick after any (re)start pays it for every
-        # claude window. Measured 2026-10-07: first ticks past 35 s, so
-        # ensure_watcher's 30 s grace read a working daemon as wedged, reaped
-        # it, and the respawn started cold again - a restart every ~35 s with
-        # no reconcile ever finishing. Stamping once per window keeps a slow
-        # tick alive while a truly blocked call (one window stuck > 30 s)
-        # still goes stale. Builtins only (read + in-place printf): no fork.
-        # Only while we still own the file - never stamp over a successor.
+        # slow tick turns slowly but does turn. A slow per-window call makes
+        # the tick's length scale with the window count: it happened with a
+        # compaction-lineage walk (since removed) that grepped every
+        # transcript in the project dir (643 MB, ~7 s per session) with a
+        # cache that lived in this process, so the first tick after any
+        # (re)start paid it for every claude window. Measured 2026-10-07:
+        # first ticks past 35 s, so ensure_watcher's 30 s grace read a working
+        # daemon as wedged, reaped it, and the respawn started cold again - a
+        # restart every ~35 s with no reconcile ever finishing. Stamping once
+        # per window keeps any such slow tick alive while a truly blocked call
+        # (one window stuck > 30 s) still goes stale. Builtins only (read +
+        # in-place printf): no fork. Only while we still own the file - never
+        # stamp over a successor.
         read -r _owner < "$PIDFILE" 2>/dev/null || _owner=""
         [ "$_owner" = "$$" ] && restamp_pidfile
         # SEEN-IT, CONTINUOUSLY. The hook discharges a yellow/green that lands
@@ -573,6 +699,7 @@ EOF
                 esac ;;
         esac
         [ -n "$win" ] || continue
+        n_windows=$((n_windows + 1))
         case "$present" in
             *" ${win} "*) has_agent=1 ;;
             *) has_agent=0 ;;
@@ -698,7 +825,7 @@ EOF
         # @agent_since = "<epoch> <state>": when this window's state last
         # changed (the roster's elapsed column and the jump order read it).
         # The hook's set_state stamps its own transitions at write time (a
-        # tick can take 4-6s, so a done->running->done inside one tick would
+        # tick has taken 4-6s, so a done->running->done inside one tick would
         # otherwise keep the old stamp) and clear_state unsets it. This is
         # the BACKSTOP for everyone else: the seen-it discharge, the
         # stuck-running reconcile, the idle seed and the GC all change state,
@@ -774,6 +901,16 @@ EOF
         BLINK_PID=""
         blink_loop &
         BLINK_PID=$!
+    fi
+
+    # Tick trace line: "<epoch> <tick_ms> <windows> <agents>". Digits-only
+    # microseconds (EPOCHREALTIME's radix follows the locale: "." or ","),
+    # and the file is re-tested so an `rm` mid-tick isn't undone by >>.
+    if [ -n "$trace_t0" ] && [ -e "$TRACE" ]; then
+        trace_t1=$EPOCHREALTIME
+        printf '%s %d %d %d\n' "${trace_t0%%[.,]*}" \
+            $(( (${trace_t1//[!0-9]/} - ${trace_t0//[!0-9]/}) / 1000 )) \
+            "$n_windows" "$n_agents" >> "$TRACE" 2>/dev/null
     fi
 
     if [ -n "$MAX_TICKS" ]; then

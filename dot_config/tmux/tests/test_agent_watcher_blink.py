@@ -1,8 +1,8 @@
 """agent-tab-watcher.sh pulse-child lifecycle + pidfile atomicity, and the
 indicator's @agent_since stamp at transition time.
 
-Isolated HOME and TMPDIR, a fake `tmux` (and a `ps` that fakes only the agent
-listing) on PATH. The watcher's singleton keys on
+Isolated HOME and TMPDIR, a fake `tmux` (and a `pgrep`/`ps` that fake only
+the agent discovery) on PATH. The watcher's singleton keys on
 $HOME/.config/tmux/scripts/agent-tab-watcher.sh, so the isolated HOME keeps it
 from ever seeing the real daemon. No real tmux server is touched.
 Run with unittest.
@@ -19,6 +19,7 @@ import time
 import unittest
 
 import test_codex_indicator as ci   # module, not the class: keeps its tests out of this module
+import test_agent_jump_watcher as jw   # same: module only, for the shared process fakes
 
 SCRIPTS = Path(os.environ.get(
     "AGENT_TMUX_SCRIPTS",
@@ -95,14 +96,12 @@ with p.with_suffix(".lock").open("a") as lock:
     sys.exit(rc)
 '''
 
-# Fake ONLY the agent listing; every other query (pid/ppid/command lookups)
-# goes to the real ps so identity checks see real processes.
-FAKE_PS = """#!/bin/sh
-case "$*" in
-    *tty=,pid=,comm=*) echo "ttys900 4242 claude"; echo "ttys901 4343 zsh" ;;
-    *) exec /bin/ps "$@" ;;
-esac
-"""
+# The agent-discovery fakes are shared with test_agent_jump_watcher.py: pgrep
+# and single-pid ps answer from a "tty pid comm" table; every other query
+# (pid/ppid/command lookups, the -f singleton sweep) goes to the real tools
+# so identity checks see real processes.
+FAKE_PGREP = jw.FAKE_PGREP
+FAKE_PS = jw.FAKE_PS
 
 UID = os.getuid()
 
@@ -122,8 +121,9 @@ class WatcherEnv:
             body = body.replace(old, new)
         self.script.write_text(body)
         shutil.copy(LIB, scripts / "agent-session-lib.sh")
-        for name, text in (("tmux", FAKE_TMUX), ("ps", FAKE_PS)):
+        for name, text in (("tmux", FAKE_TMUX), ("ps", FAKE_PS), ("pgrep", FAKE_PGREP)):
             f = self.bin / name; f.write_text(text); f.chmod(0o755)
+        self.procs = self.dir / "procs"; self.procs.write_text(jw.DEFAULT_PROCS)
         self.state = self.dir / "tmux.json"
         # One window running (raises the pulse flag), one plain shell.
         self.state.write_text(json.dumps({
@@ -137,7 +137,8 @@ class WatcherEnv:
 
     def env(self, **extra):
         e = {"HOME": str(self.home), "TMPDIR": str(self.tmp) + "/",
-             "PATH": f"{self.bin}:{BASH_DIR}:/usr/bin:/bin", "FAKE_TMUX_STATE": str(self.state)}
+             "PATH": f"{self.bin}:{BASH_DIR}:/usr/bin:/bin", "FAKE_TMUX_STATE": str(self.state),
+             "FAKE_PROCS": str(self.procs)}
         e.update(extra)
         return e
 

@@ -1,6 +1,6 @@
 """agent-tab-watcher.sh state parsing / @agent_since / pulse child, and agent-jump.sh.
 
-Isolated HOME and TMPDIR, a fake `tmux` and `ps` on PATH. No real tmux server,
+Isolated HOME and TMPDIR, a fake `tmux`, `pgrep` and `ps` on PATH. No real tmux server,
 watcher, or GUI is touched. Run with unittest.
 """
 import json
@@ -127,10 +127,43 @@ with p.with_suffix(".lock").open("a") as lock:
     sys.exit(rc)
 '''
 
-FAKE_PS = """#!/bin/sh
-# tty pid comm
-echo "ttys900 4242 claude"
-echo "ttys901 4343 zsh"
+# The process table both fakes read: "tty pid comm" lines in $FAKE_PROCS.
+DEFAULT_PROCS = "ttys900 4242 claude\nttys901 4343 zsh\n"
+
+# The watcher's agent discovery is `pgrep -ax PATTERN`, matched the way macOS
+# pgrep does: -x against the comm basename; exit 1 = nothing matched. Any -f
+# call (the startup singleton sweep) goes to the real pgrep. FAKE_PGREP_RC
+# forces an exit status (>= 2 = a real pgrep error).
+FAKE_PGREP = r"""#!/bin/sh
+for a in "$@"; do
+    case "$a" in -*f*) exec /usr/bin/pgrep "$@" ;; esac
+done
+[ -n "$FAKE_PGREP_RC" ] && exit "$FAKE_PGREP_RC"
+for pat; do :; done
+rc=1
+while read -r tty pid comm; do
+    [ -n "$pid" ] || continue
+    if printf '%s\n' "${comm##*/}" | grep -Eqx -- "$pat"; then
+        echo "$pid"; rc=0
+    fi
+done < "$FAKE_PROCS"
+exit $rc
+"""
+
+# Single-pid `ps -o tty=,pid=,comm= -p PID` answers from $FAKE_PROCS (and is
+# logged to $FAKE_PS_LOG); an all-process listing is refused loudly so a
+# regression to `ps -ax` fails the tests; anything else (the startup
+# identity check, `ps -o command= -p`) is the real ps.
+FAKE_PS = r"""#!/bin/sh
+if [ $# = 4 ] && [ "$1" = -o ] && [ "$2" = tty=,pid=,comm= ] && [ "$3" = -p ]; then
+    [ -n "$FAKE_PS_LOG" ] && echo "$4" >> "$FAKE_PS_LOG"
+    while read -r tty pid comm; do
+        [ "$pid" = "$4" ] && { echo "$tty $pid $comm"; exit 0; }
+    done < "$FAKE_PROCS"
+    exit 1
+fi
+case " $* " in *" -ax "*|*" -A "*|*" -e "*) echo "fake ps: all-process listing: $*" >&2; exit 3 ;; esac
+exec /bin/ps "$@"
 """
 
 
@@ -145,8 +178,10 @@ class FakeEnv:
         shutil.copy(LIB, scripts / "agent-session-lib.sh")
         shutil.copy(JUMP, scripts / "agent-jump.sh")
         self.scripts = scripts
-        for name, body in (("tmux", FAKE_TMUX), ("ps", FAKE_PS)):
+        for name, body in (("tmux", FAKE_TMUX), ("ps", FAKE_PS), ("pgrep", FAKE_PGREP)):
             f = self.bin / name; f.write_text(body); f.chmod(0o755)
+        self.procs = self.dir / "procs"; self.procs.write_text(DEFAULT_PROCS)
+        self.ps_log = self.dir / "ps.log"
         self.state = self.dir / "tmux.json"
         self.state.write_text(json.dumps({
             "windows": windows, "panes": list(panes), "clients": list(clients),
@@ -154,7 +189,8 @@ class FakeEnv:
 
     def env(self, **extra):
         e = {"HOME": str(self.home), "TMPDIR": str(self.tmp) + "/",
-             "PATH": f"{self.bin}:{BASH_DIR}:/usr/bin:/bin", "FAKE_TMUX_STATE": str(self.state)}
+             "PATH": f"{self.bin}:{BASH_DIR}:/usr/bin:/bin", "FAKE_TMUX_STATE": str(self.state),
+             "FAKE_PROCS": str(self.procs), "FAKE_PS_LOG": str(self.ps_log)}
         e.update(extra)
         return e
 
@@ -229,6 +265,79 @@ class WatcherTests(unittest.TestCase):
         left = subprocess.run(["pgrep", "-f", str(self.f.scripts / "agent-tab-watcher.sh")],
                               capture_output=True, text=True).stdout.strip()
         self.assertEqual(left, "")
+
+    def window_calls(self, s, wid):
+        return [c for c in s["calls"] if c[0] == "set-option" and wid in c]
+
+    def test_zero_agents_is_not_a_failed_tick(self):
+        # pgrep exits 1 when nothing matches: a normal tick, not a failure. A
+        # failed tick skips the MAX_TICKS countdown, so a misread would hang
+        # here instead of returning.
+        self.f.procs.write_text("ttys901 4343 zsh\n")
+        r = self.f.run("agent-tab-watcher.sh", timeout=15, AGENT_TAB_WATCHER_MAX_TICKS="3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.f.read()
+        # The ticks really reconciled (the stale stamp on @4 was removed) ...
+        self.assertNotIn("@agent_since", s["windows"]["@4"]["opts"])
+        # ... but nothing is seeded, and the running window is NOT collected
+        # before GC_TICKS agent-less ticks in a row.
+        self.assertNotIn("@agent_state", s["windows"]["@1"]["opts"])
+        self.assertEqual(s["windows"]["@3"]["opts"].get("@agent_state"), "running")
+        self.assertFalse(self.window_calls(s, "@2"), s["calls"])
+        # Past GC_TICKS it is collected: the agent really is gone.
+        r = self.f.run("agent-tab-watcher.sh", timeout=15, AGENT_TAB_WATCHER_MAX_TICKS="6")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("@agent_state", self.f.read()["windows"]["@3"]["opts"])
+
+    def test_pgrep_error_is_a_failed_tick(self):
+        # Exit >= 2 is a real error: the tick is skipped whole (no seed, no
+        # GC, no stamp edits), and it never counts toward MAX_TICKS.
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.f.run("agent-tab-watcher.sh", timeout=3, AGENT_TAB_WATCHER_MAX_TICKS="1",
+                       FAKE_PGREP_RC="2")
+        time.sleep(1.5)   # the orphaned pulse child retires once its parent is gone
+        s = self.f.read()
+        for wid in ("@1", "@2", "@3", "@4"):
+            self.assertFalse(self.window_calls(s, wid), s["calls"])
+
+    def test_tty_lookup_is_cached_per_pid(self):
+        # Steady state is one pgrep per tick: each agent pid gets ONE ps, ever
+        # (non-matching processes never get one at all).
+        r = self.f.run("agent-tab-watcher.sh", AGENT_TAB_WATCHER_MAX_TICKS="3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.f.ps_log.read_text().split(), ["4242"])
+        self.assertEqual(self.f.read()["windows"]["@1"]["opts"].get("@agent_state"), "idle")
+
+    def test_codex_by_path_basename(self):
+        # A path comm counts by its basename; a tty-less agent is skipped.
+        self.f.procs.write_text("ttys901 5151 /x/vendor/aarch64/bin/codex\n?? 6161 claude\n")
+        r = self.f.run("agent-tab-watcher.sh", AGENT_TAB_WATCHER_MAX_TICKS="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.f.read()
+        self.assertEqual(s["windows"]["@2"]["opts"].get("@agent_state"), "idle")
+        self.assertNotIn("@agent_state", s["windows"]["@1"]["opts"])
+
+    def trace_path(self):
+        return Path(str(self.f.tmp) + "/agent-tab-watcher." + str(os.getuid()) + ".trace")
+
+    def test_no_trace_unless_the_file_exists(self):
+        r = self.f.run("agent-tab-watcher.sh", AGENT_TAB_WATCHER_MAX_TICKS="2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.trace_path().exists())
+
+    def test_trace_one_line_per_tick(self):
+        self.trace_path().write_text("")
+        t0 = int(time.time())
+        r = self.f.run("agent-tab-watcher.sh", AGENT_TAB_WATCHER_MAX_TICKS="3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = self.trace_path().read_text().splitlines()
+        self.assertEqual(len(lines), 3, lines)
+        for ln in lines:
+            # <epoch> <tick_ms> <windows> <agents>: 4 windows, 1 tty-owning agent.
+            self.assertRegex(ln, r"^\d+ \d+ 4 1$")
+            epoch, ms = int(ln.split()[0]), int(ln.split()[1])
+            self.assertTrue(t0 - 1 <= epoch <= time.time() + 1, ln)
+            self.assertLess(ms, 10000, ln)
 
 
 class JumpTests(unittest.TestCase):
