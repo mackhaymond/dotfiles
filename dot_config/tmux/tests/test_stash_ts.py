@@ -236,7 +236,7 @@ class StashTsSidecar(unittest.TestCase):
         rows = [r for r in e.rows() if r[0] == "stash"]
         self.assertEqual(len(rows), 1, e.sidecar.read_text())
         row = rows[0]
-        self.assertEqual(len(row), 9, row)
+        self.assertEqual(len(row), 10, row)          # field 10: pane dir, identity only
         self.assertEqual(row[4], "main")             # origin
         self.assertEqual(row[5], "Fix the parser")   # label
         self.assertEqual(row[8], ts)                 # the new field, appended last

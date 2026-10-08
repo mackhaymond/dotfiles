@@ -217,8 +217,27 @@ state_file() { [ -n "$STATE_FILE" ] || STATE_FILE="$(resurrect_dir)/stash-state.
 # name nor cwd alone discriminates (every claude window is named for the
 # version string; most sessions sit in $HOME).
 # Echoes the window id on a match; returns 1 otherwise.
+#
+# <icwd> (field 10) is the window's pane directory at save time, and stands in
+# for <cwd> when there is no @stash_cwd — i.e. for every window parked WITHOUT
+# suspending its agent (busy, unsent input, a workflow...), plus plain shells.
+# Those rows used to have NO discriminator but the name, and the name of an
+# auto-renamed window is not identity (see below), so they could not match.
+#
+# The index must be CORROBORATED by at least one of those: a directory, or a
+# name somebody chose. A row with neither (written before field 10 existed,
+# for a window whose name is auto-derived) does not match at all — that would
+# be the bare index, and a renumber puts a different window in the slot.
+#
+# This is necessary, not sufficient: two parked windows in the same directory
+# are indistinguishable here. Rows WITHOUT a session id get the stricter
+# resolve_parked_rows on top, which refuses that ambiguity outright.
 window_for_row() {
-    local sess="$1" idx="$2" name="$3" cwd="$4" pidx="${5:-}" win pcwd
+    local sess="$1" idx="$2" name="$3" cwd="$4" pidx="${5:-}" icwd="${6:-}" win pcwd proved=0
+    if [ -z "$cwd" ] && [ -n "$icwd" ]; then
+        # An identity-only path is not the agent's pane: accept any pane there.
+        cwd="$icwd"; pidx=""
+    fi
     tmux has-session -t "=$sess" 2>/dev/null || return 1
     win=$(tmux list-windows -t "=$sess" -F '#{window_index} #{window_id}' 2>/dev/null \
           | awk -v i="$idx" '$1==i{print $2}')
@@ -241,11 +260,96 @@ window_for_row() {
             # No recorded pane (or it is gone): accept if ANY pane sits there.
             tmux list-panes -t "$win" -F '#{pane_current_path}' 2>/dev/null | grep -qxF "$cwd" || return 1
         fi
+        proved=1
     fi
+    # The name counts only when somebody CHOSE it. With automatic-rename on
+    # (the default here, format #{pane_current_command}) it is whatever the
+    # foreground process is called at this instant — for a live agent the
+    # claude VERSION STRING. That is not identity: it changes on every claude
+    # update, and at restore time the pane is still a shell, or a claude the
+    # assistant-restore pass started seconds ago that has not retitled itself
+    # yet. Comparing it is how stash:4 (a parked agent that was never
+    # suspended, so no cwd to fall back on) failed "no matching window" on
+    # every restore from 2026-10-01 on, and lost its origin, label and park
+    # time on the first one.
     if [ -n "$name" ]; then
-        [ "$(tmux display-message -p -t "$win" '#{window_name}' 2>/dev/null)" = "$name" ] || return 1
+        local ar_name ar
+        ar_name=$(tmux display-message -p -t "$win" "#{automatic-rename}${SEP}#{window_name}" 2>/dev/null)
+        ar="${ar_name%%"$SEP"*}"
+        case "$ar" in
+            1|on) : ;;
+            *) [ "${ar_name#*"$SEP"}" = "$name" ] || return 1; proved=1 ;;
+        esac
     fi
+    [ "$proved" = 1 ] || return 1
     printf '%s' "$win"
+}
+
+# Which window, if any, each parked-state row WITHOUT a session id belongs to.
+# Prints "<line number>SEP<window id>" per row it can place; silence otherwise.
+#
+# These rows (origin, label, park time) get a stricter test than window_for_row
+# alone, because nothing that survives a restart tells two parked windows in
+# the same directory apart — window and pane ids, pids and activity times are
+# all new on the restored server, and the auto-renamed name is the process
+# title. Index + directory therefore identifies a window only while the slots
+# have not moved, and nothing can prove that: an unpark or a kill renumbers the
+# holding session (A at 1 goes, B slides from 2 into 1), and so does a
+# resurrect snapshot that predates the last park. If A and B both sat in
+# $HOME, "stash:1 in $HOME" is B now, and A's origin and label would be
+# stamped on it. Mislabelling a tab is worse than losing its label (a parked
+# tab without an origin still comes back, to the attached session), so a row
+# is placed only when it is UNAMBIGUOUS:
+#   - window_for_row matches (same index, and a directory or chosen name agrees);
+#   - no other id-less row in the file has the same key (directory, else name);
+#   - the window carries no stash state yet (else something already owns it);
+#   - it is not the window a session-id row identifies;
+#   - no OTHER unclaimed, state-less parked window shares that key — if
+#     another one could equally be "the window in $HOME", neither is placed.
+# Rows WITH a session id keep window_for_row alone, as before: refusing those
+# would orphan a conversation, and they carry a recorded cwd and pane.
+resolve_parked_rows() {
+    local f="$1" n=0 claimed=" " w key
+    local sess idx name pidx origin label sid cwd ts icwd extra
+    [ -f "$f" ] || return 0
+    hold_exists || return 0
+
+    # Windows the session-id rows lay claim to.
+    while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd extra; do
+        [ -n "$sid" ] || continue
+        w=$(window_for_row "$sess" "$idx" "$name" "$cwd" "$pidx" "$icwd") && claimed="$claimed$w "
+    done < "$f"
+
+    # Keys of the id-less parked rows, to spot two rows describing lookalikes.
+    local keys
+    keys=$(awk -F"$SEP" -v hold="$HOLD" '$1==hold && $7=="" && ($5!="" || $6!="" || $9!="") {
+               k = ($8 != "") ? "d:" $8 : (($10 != "") ? "d:" $10 : "n:" $3); print k }' "$f")
+
+    # The parked windows nothing owns yet, with every key each could answer to.
+    local w_id w_state w_ar w_name pool="" p
+    while IFS="$SEP" read -r w_id w_state w_ar w_name; do
+        [ -n "$w_id" ] && [ -z "$w_state" ] || continue
+        case "$claimed" in *" $w_id "*) continue ;; esac
+        case "$w_ar" in 1|on) ;; *) pool="${pool}${w_id}${SEP}n:${w_name}"$'\n' ;; esac
+        while IFS= read -r p; do
+            pool="${pool}${w_id}${SEP}d:${p}"$'\n'
+        done < <(tmux list-panes -t "$w_id" -F '#{pane_current_path}' 2>/dev/null)
+    done < <(tmux list-windows -t "=$HOLD" -F "#{window_id}${SEP}#{@stash_origin}#{@stash_session}#{@stash_ts}${SEP}#{automatic-rename}${SEP}#{window_name}" 2>/dev/null)
+
+    while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd extra; do
+        n=$((n + 1))
+        [ "$sess" = "$HOLD" ] && [ -z "$sid" ] || continue
+        [ -n "${origin}${label}${ts}" ] || continue
+        if [ -n "$cwd" ]; then key="d:$cwd"; elif [ -n "$icwd" ]; then key="d:$icwd"; else key="n:$name"; fi
+        [ "$(printf '%s\n' "$keys" | grep -cxF -- "$key")" -eq 1 ] || continue
+        w=$(window_for_row "$sess" "$idx" "$name" "$cwd" "$pidx" "$icwd") || continue
+        case "$claimed" in *" $w "*) continue ;; esac
+        # In the pool means unclaimed AND state-less; anyone else there with
+        # this key is a lookalike.
+        printf '%s' "$pool" | awk -F"$SEP" -v w="$w" '$1==w{f=1} END{exit !f}' || continue
+        printf '%s' "$pool" | awk -F"$SEP" -v w="$w" -v k="$key" '$1!=w && substr($0, length($1)+2)==k{f=1} END{exit f}' || continue
+        printf '%s%s%s\n' "$n" "$SEP" "$w"
+    done < "$f"
 }
 
 # SERIALISED, and the tmux snapshot is taken INSIDE the lock.
@@ -289,10 +393,27 @@ save_state() {
     # old row simply yields an empty ts and restores everything else as before.
     # Without it a restore brought parked tabs back with no park time, and the
     # roster showed a blank age for every one of them.
+    #
+    # Field 10, the pane directory, is appended the same way and for the same
+    # reason, for EVERY window. It is what corroborates the index when there is
+    # no @stash_cwd — a window parked without suspending its agent, or a plain
+    # shell — because window_for_row no longer accepts an auto-renamed name as
+    # identity (see there), and resurrect can restore a hand-named window as
+    # auto-renamed. It is identity only, never re-applied as an option:
+    # @stash_cwd means "a suspended agent resumes here", and stamping it on a
+    # window whose agent was never suspended would lie to every reader of it.
     rows=$(tmux list-windows -a -F \
-        "#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@stash_pane_idx}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}${SEP}#{@stash_ts}" \
+        "#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@stash_pane_idx}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}${SEP}#{@stash_ts}${SEP}#{pane_current_path}" \
         2>/dev/null) || { lock_release "$SAVE_LOCKDIR"; return 0; }   # tmux unreachable: keep what is on disk
-    rows=$(printf '%s\n' "$rows" | awk -F"$SEP" -v hold="$HOLD" '$1==hold || $7!=""')
+    # Only windows that carry something to re-apply. A parked window with NO
+    # stash options used to be mirrored anyway, as a row of a bare index and
+    # name: re-applying it can restore nothing, and since the name it carried
+    # was an auto-renamed version string it never matched either — so it
+    # logged "skipped stash:N — no matching window" on every restore, forever,
+    # reporting a loss that had already happened. (pidx alone is meaningless
+    # without the session id it locates.)
+    rows=$(printf '%s\n' "$rows" | awk -F"$SEP" -v hold="$HOLD" \
+        '$7!="" || ($1==hold && ($5!="" || $6!="" || $8!="" || $9!=""))')
 
     # MERGE, never a blind rebuild.
     #
@@ -312,17 +433,35 @@ save_state() {
     # `stash.sh list` prints the command to resume it by hand.
     local of; of=$(orphan_file)
     if [ -f "$sf" ]; then
-        local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_extra
+        local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_extra
         local fresh_sids; fresh_sids=$(printf '%s\n' "$rows" | awk -F"$SEP" '$7!=""{print $7}')
         # ONCE, not per row: live_sessions reads every session file, and this
         # ran inside the loop — O(rows) interpreter startups while holding a
         # lock, which after a restart (many rows, no options yet) is the slowest
         # thing in the file and was itself widening the race above.
         live=$(live_sessions)
-        # o_extra soaks up any field a later format appends, so o_ts (and, for
-        # an 8-field row, o_cwd) never carries a stray separator.
-        while IFS="$SEP" read -r o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_extra; do
-            [ -n "$o_sid" ] || continue
+        # Id-less parked rows whose window is unambiguously still here.
+        local placed; placed=$(resolve_parked_rows "$sf")
+        local o_n=0
+        # o_extra soaks up any field a later format appends, so o_icwd (and,
+        # for older rows, o_ts or o_cwd) never carries a stray separator.
+        while IFS="$SEP" read -r o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_extra; do
+            o_n=$((o_n + 1))
+            if [ -z "$o_sid" ]; then
+                # A parked window's origin, label and park time. Not
+                # irreplaceable like a session id, but the same "options do not
+                # survive a restart" problem applies: a park after a restart and
+                # before restore-state rebuilt this file from live windows that
+                # had no options yet, and silently wiped every one of these
+                # rows — the tab then sat in the stash with no origin for good.
+                # Carry it only while resolve_parked_rows can say WHICH window
+                # it is (state-less, unclaimed, no lookalike); otherwise drop
+                # it silently — an unpark looks exactly like that and is not a
+                # loss, and a guess could put this tab's label on another.
+                printf '%s\n' "$placed" | awk -F"$SEP" -v n="$o_n" '$1==n{f=1} END{exit !f}' || continue
+                rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${SEP}${o_cwd}${SEP}${o_ts}${o_icwd:+${SEP}${o_icwd}}"
+                continue
+            fi
             printf '%s\n' "$fresh_sids" | grep -qx "$o_sid" && continue   # already represented
             # Still a live agent? Then it is not suspended and needs no record.
             printf '%s\n' "$live" | grep -q "${SEP}${o_sid}${SEP}" && continue
@@ -330,8 +469,8 @@ save_state() {
             # renumber-windows slides a DIFFERENT window into the vacated slot,
             # and carrying the row forward there is exactly how a suspended
             # session's id ends up stamped on someone else.
-            if window_for_row "$o_sess" "$o_idx" "$o_name" "$o_cwd" "$o_pidx" >/dev/null; then
-                rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}${SEP}${o_ts}"
+            if window_for_row "$o_sess" "$o_idx" "$o_name" "$o_cwd" "$o_pidx" "$o_icwd" >/dev/null; then
+                rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}${SEP}${o_ts}${o_icwd:+${SEP}${o_icwd}}"
                 log "carried forward suspended session ${o_sid%%-*} ($o_sess:$o_idx) — window exists but has no options yet"
             else
                 mkdir -p "$(dirname "$of")" 2>/dev/null
@@ -340,7 +479,7 @@ save_state() {
                 # every save turned one lost conversation into eight identical
                 # rows — noise that makes `stash.sh list` look like a disaster.
                 if ! grep -q "${SEP}${o_sid}${SEP}" "$of" 2>/dev/null; then
-                    printf '%s\n' "${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}${SEP}${o_ts}" >> "$of" 2>/dev/null
+                    printf '%s\n' "${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}${SEP}${o_ts}${o_icwd:+${SEP}${o_icwd}}" >> "$of" 2>/dev/null
                     log "suspended session ${o_sid%%-*} has no window any more — moved to $(basename "$of")"
                 fi
             fi
@@ -404,49 +543,101 @@ forget_sids() {
 # has to survive ALL of: the index exists, the cwd matches, and the window is
 # not already holding some other session id. Anything less unique is treated as
 # unidentifiable and preserved rather than guessed at.
+#
+# A window parked WITHOUT a suspend (its agent was busy, so it is still running)
+# has no recorded cwd; its pane directory (field 10) corroborates the index
+# instead, and window_for_row no longer accepts an auto-renamed name. Rows
+# without a session id are placed in a SECOND pass, through
+# resolve_parked_rows, once the session-id rows have claimed their windows —
+# a lookalike in the same directory makes such a row unplaceable rather than
+# a guess.
+apply_row() {   # <win> <origin> <label> <sid> <cwd> <pidx> <ts>
+    local win="$1"
+    [ -n "$2" ] && tmux set-option -w -t "$win" @stash_origin   "$2" 2>/dev/null
+    [ -n "$3" ] && tmux set-option -w -t "$win" @stash_label    "$3" 2>/dev/null
+    [ -n "$4" ] && tmux set-option -w -t "$win" @stash_session  "$4" 2>/dev/null
+    [ -n "$5" ] && tmux set-option -w -t "$win" @stash_cwd      "$5" 2>/dev/null
+    [ -n "$6" ] && tmux set-option -w -t "$win" @stash_pane_idx "$6" 2>/dev/null
+    # Epoch seconds or nothing: the roster and the picker do arithmetic on
+    # it, and a hand-edited or torn row must not plant garbage there.
+    case "$7" in ''|*[!0-9]*) ;; *) tmux set-option -w -t "$win" @stash_ts "$7" 2>/dev/null ;; esac
+    return 0
+}
+
 do_restore_state() {
     local sf of; sf=$(state_file); of=$(orphan_file)
-    [ -f "$sf" ] || return 0
-    local sess idx name pidx origin label sid cwd ts extra win wcwd existing kept=""
-    # ts is field 9 and absent from sidecars written before it was mirrored;
-    # such a row reads ts="" and restores everything else unchanged.
-    while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts extra; do
-        [ -n "$sess" ] && [ -n "$idx" ] || continue
+    local sess idx name pidx origin label sid cwd ts icwd extra win existing kept=""
+    # ts is field 9 and icwd field 10, each absent from sidecars written before
+    # it was mirrored; such a row reads them as "" and restores the rest.
+    if [ -f "$sf" ]; then
+        # Pass 1: rows carrying a session id.
+        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd extra; do
+            [ -n "$sess" ] && [ -n "$idx" ] && [ -n "$sid" ] || continue
 
-        local ok=1
-        win=$(window_for_row "$sess" "$idx" "$name" "$cwd" "$pidx") || ok=0
-        [ -n "$win" ] || ok=0
-        if [ "$ok" = 1 ]; then
-            existing=$(tmux show -wqv -t "$win" @stash_session 2>/dev/null)
-            [ -z "$existing" ] || [ "$existing" = "$sid" ] || ok=0
-        fi
-
-        if [ "$ok" != 1 ]; then
-            if [ -n "$sid" ]; then
-                # Keep the pointer somewhere durable, and say so loudly.
-                kept="${kept}${sess}${SEP}${idx}${SEP}${name}${SEP}${pidx}${SEP}${origin}${SEP}${label}${SEP}${sid}${SEP}${cwd}${SEP}${ts}"$'\n'
-                log "could not place suspended session ${sid%%-*} ($sess:$idx) — kept in $(basename "$of"); \`stash.sh list\` shows how to resume it"
-            else
-                log "skipped $sess:$idx — no matching window"
+            local ok=1
+            win=$(window_for_row "$sess" "$idx" "$name" "$cwd" "$pidx" "$icwd") || ok=0
+            [ -n "$win" ] || ok=0
+            if [ "$ok" = 1 ]; then
+                existing=$(tmux show -wqv -t "$win" @stash_session 2>/dev/null)
+                [ -z "$existing" ] || [ "$existing" = "$sid" ] || ok=0
             fi
-            continue
-        fi
+            if [ "$ok" != 1 ]; then
+                # Keep the pointer somewhere durable, and say so loudly.
+                kept="${kept}${sess}${SEP}${idx}${SEP}${name}${SEP}${pidx}${SEP}${origin}${SEP}${label}${SEP}${sid}${SEP}${cwd}${SEP}${ts}${icwd:+${SEP}${icwd}}"$'\n'
+                log "could not place suspended session ${sid%%-*} ($sess:$idx) — kept in $(basename "$of"); \`stash.sh list\` shows how to resume it"
+                continue
+            fi
+            apply_row "$win" "$origin" "$label" "$sid" "$cwd" "$pidx" "$ts"
+            log "restored $sess:$idx — suspended session ${sid%%-*}"
+        done < "$sf"
 
-        [ -n "$origin" ] && tmux set-option -w -t "$win" @stash_origin   "$origin" 2>/dev/null
-        [ -n "$label" ]  && tmux set-option -w -t "$win" @stash_label    "$label"  2>/dev/null
-        [ -n "$sid" ]    && tmux set-option -w -t "$win" @stash_session  "$sid"    2>/dev/null
-        [ -n "$cwd" ]    && tmux set-option -w -t "$win" @stash_cwd      "$cwd"    2>/dev/null
-        [ -n "$pidx" ]   && tmux set-option -w -t "$win" @stash_pane_idx "$pidx"   2>/dev/null
-        # Epoch seconds or nothing: the roster and the picker do arithmetic on
-        # it, and a hand-edited or torn row must not plant garbage there.
-        case "$ts" in ''|*[!0-9]*) ;; *) tmux set-option -w -t "$win" @stash_ts "$ts" 2>/dev/null ;; esac
-        log "restored $sess:$idx${sid:+ — suspended session ${sid%%-*}}"
-    done < "$sf"
+        # Pass 2: parked state without a session id. Resolved all at once,
+        # BEFORE any of it is applied, so one placement cannot change what
+        # the next row sees.
+        local placed n=0; placed=$(resolve_parked_rows "$sf")
+        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd extra; do
+            n=$((n + 1))
+            [ -n "$sess" ] && [ -n "$idx" ] && [ -z "$sid" ] || continue
+            # Nothing to re-apply (a bare index and name, as older versions
+            # wrote for every parked window): matching it can restore nothing,
+            # and failing to match it is not a loss. Ignore it rather than log a
+            # "skipped" on every restore for a row that never carried anything.
+            [ -n "${origin}${label}${ts}" ] || continue
+            win=$(printf '%s\n' "$placed" | awk -F"$SEP" -v n="$n" '$1==n{print $2; exit}')
+            if [ -z "$win" ]; then
+                # Already on its window (restore-state run with nothing lost,
+                # or a tab parked since the restart) — nothing to report.
+                win=$(window_for_row "$sess" "$idx" "$name" "$cwd" "$pidx" "$icwd") &&
+                    [ "$(tmux display-message -p -t "$win" "#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_ts}" 2>/dev/null)" \
+                      = "${origin}${SEP}${label}${SEP}${ts}" ] && continue
+                # Say WHAT is lost: the next save drops a row it cannot place,
+                # so this line is the last record of it.
+                log "could not re-apply parked state to $sess:$idx (from ${origin:-?}${label:+, \"$label\"}) — no window can be told apart as its own${icwd:+ (in $icwd)}; not re-applied"
+                continue
+            fi
+            apply_row "$win" "$origin" "$label" "" "$cwd" "$pidx" "$ts"
+            log "restored $sess:$idx"
+        done < "$sf"
+    fi
 
     if [ -n "$kept" ]; then
         mkdir -p "$(dirname "$of")" 2>/dev/null
         printf '%s' "$kept" >> "$of" 2>/dev/null
     fi
+
+    # Every parked window should now have an origin: park_one stamps it before
+    # the move. One without is either state lost to an earlier restore or a
+    # window moved in by something other than this script. It still works
+    # (unstash falls back to the attached session) but `list` shows from=?,
+    # and nothing ever said so — the bare-row "skipped" above was a misleading
+    # symptom of exactly this. Name it, once per restore.
+    local w_idx w_id w_name
+    while IFS="$SEP" read -r w_idx w_id w_name; do
+        [ -n "$w_id" ] || continue
+        [ -n "$(tmux show -wqv -t "$w_id" @stash_origin 2>/dev/null)" ] && continue
+        log "parked window $HOLD:$w_idx ($w_id, ${w_name}) has no recorded origin — its parked state was lost or it was moved in by hand; prefix+h will take it to the attached session"
+    done < <(hold_exists && tmux list-windows -t "=$HOLD" -F "#{window_index}${SEP}#{window_id}${SEP}#{window_name}" 2>/dev/null)
+
     tmux set-option -g @stash_count "$(count)" 2>/dev/null
 }
 
@@ -2093,11 +2284,13 @@ do_list() {
     if [ -s "$of" ]; then
         echo
         echo "  Suspended sessions that lost their window (resume by hand):"
-        # Trailing _ts/_extra keep cwd clean on 9-field rows (see save_state).
-        local _ts _extra
-        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd _ts _extra; do
+        # Trailing _ts/_icwd/_extra keep cwd clean on 9/10-field rows (see
+        # save_state). The pane directory is the next-best guess when no cwd
+        # was recorded — better than the `cd ?` that cannot be pasted.
+        local _ts _icwd _extra
+        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd _ts _icwd _extra; do
             [ -n "$sid" ] || continue
-            printf '    %-28s cd %s && claude --resume %s\n' "${label:-$name}" "${cwd:-?}" "$sid"
+            printf '    %-28s cd %s && claude --resume %s\n' "${label:-$name}" "${cwd:-${_icwd:-?}}" "$sid"
         done < "$of"
         echo "  (delete $of once you have dealt with them)"
     fi
