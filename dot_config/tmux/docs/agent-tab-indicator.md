@@ -579,6 +579,65 @@ Measured live: first tick after a restart ~250 ms, steady ~100 ms with
 ~175 windows and ~13 agents. It was tens of seconds before the lineage scan
 was dropped, and 279 ms average just after.
 
+### 5. Agent event log (the sidebar's "log" section)
+
+The watcher appends one line to `${TMPDIR:-/tmp}/agent-events.$UID.log` (a
+trailing `/` on `TMPDIR` is dropped) whenever a tick **reads** a window's
+`@agent_state` as different from what the previous tick read. Fields are
+separated by US (`\x1f`), and each line ends in `\n`:
+
+| # | Field | Value |
+|---|-------|-------|
+| 1 | `epoch` | integer seconds of the tick |
+| 2 | `window_id` | e.g. `@123` |
+| 3 | `session` | `#{session_name}` (first link, for a linked window) |
+| 4 | `window_index` | `#{window_index}` |
+| 5 | `state` | the new `@agent_state` |
+| 6 | `prev_state` | the state the previous tick read (empty for a window first seen with a state) |
+| 7 | `detail_kind` | `@agent_detail_kind` (empty on an `idle` line) |
+| 8 | `title` | `@agent_summary`, else the window name (the roster's fallback) |
+| 9 | `detail` | `@agent_detail` (empty on an `idle` line) |
+
+An `idle` line always has empty detail fields. The seen-it discharge, the
+stuck-`running` reconcile and a bare `SessionStart` change only the state, so
+the window still holds the previous event's detail. Without blanking, an idle
+line would repeat it ("idle, 3 tasks filed").
+
+US, `\n` and `\r` are stripped from every value. All the fields come from the
+tick's one `list-panes` read. Session, index, name and detail were added to that
+read for this log: there is no extra tmux call, and the idle fast path is
+unchanged.
+
+What gets logged:
+
+- **Restarts don't lose a transition.** A `prefix r` or ensure_watcher reap
+  could otherwise drop a change made while no watcher ran. To prevent that, the
+  watcher reads the file once at startup, and the first tick compares each
+  window with the state on its newest log line. That only applies while the
+  line's session and index still match the window id in the read, because ids
+  restart from `@0` with the tmux server. A window with no such line is a
+  silent baseline, so a restart never replays every window.
+- **Only non-empty new states are logged.** A window whose state is unset (GC,
+  `clear`) or that disappears writes nothing. If it later gets a state again,
+  that line has an empty `prev_state`.
+- **What the log compares is what tmux holds.** A change the watcher makes
+  itself (the idle seed, the seen-it discharge, the stuck-`running` reconcile)
+  is logged once, on the tick after it lands. A state that flips and flips back
+  within one tick is not seen at all.
+
+**Cap.** When an append takes the file past 2000 lines, it is rewritten to its
+newest 1000 lines. The write goes to a temp file in the same directory and is
+then `mv`'d into place. The watcher counts lines in memory, because it is the
+only writer, so the cap check costs nothing per tick. A temp file left behind
+by a killed instance (`agent-events.$UID.log.<pid>.tmp`) is swept at startup.
+The thresholds are `AGENT_TAB_WATCHER_EVENTS_MAX` / `_KEEP` (test hooks).
+
+**Only a regular file is written.** If the log path is anything else, nothing
+is logged: a FIFO would block the daemon on `open`, and a symlink would
+redirect its writes. A missing file is fine; the next append creates it.
+
+Tests: `tests/test_agent_events_log.py`.
+
 ## Troubleshooting
 
 - **How long is a tick?** `: > "$TMPDIR/agent-tab-watcher.$(id -u).trace"`

@@ -61,6 +61,36 @@
 # the failure path write no line. Needs $EPOCHREALTIME (bash 5); with tracing
 # off the cost is one builtin file test per tick, no fork.
 #
+# AGENT EVENT LOG (the sidebar's "log" section reads it). Every time a tick
+# reads a window's @agent_state as different from what the previous tick
+# read, one line is appended to
+#   ${TMPDIR:-/tmp}/agent-events.$UID.log     (a trailing / on TMPDIR is dropped)
+# as US (\x1f) separated fields, newline-terminated:
+#   epoch US window_id US session US window_index US state US prev_state US
+#   detail_kind US title US detail
+# epoch = integer seconds of the tick, state = the new @agent_state,
+# prev_state = the last one read ("" for a window first seen with a state),
+# title = @agent_summary, else the window name (the roster's fallback),
+# detail_kind/detail = @agent_detail_kind/@agent_detail as read with it, both
+# left EMPTY on an idle line (the discharge, the stuck-running reconcile and a
+# bare SessionStart change only the state, so the detail still describes the
+# event before). US, \n and \r are stripped from every value. Only non-empty
+# states are logged: a window whose state is unset (GC) or that disappears
+# writes nothing. It compares what tmux HOLDS, read once a tick, so a change
+# the watcher makes itself (the idle seed, the seen-it discharge) is logged
+# once, a tick later, like any other.
+# RESTARTS (`prefix r`, ensure_watcher's reap) must not lose a transition
+# that landed while no watcher ran: the first tick compares each window with
+# the state of its NEWEST log line instead of logging nothing - but only
+# while that line's session+index still match the window id in the read
+# (ids restart from @0 with the tmux server). A window without such a line is
+# a silent baseline.
+# Capped: past EV_MAX (2000) lines the file is rewritten to its newest
+# EV_KEEP (1000) via a temp file + mv in the same directory (stray temps are
+# swept at startup). Only a regular file (or none) is ever written: a FIFO
+# there would block the daemon, a symlink would redirect it. The watcher is
+# the only writer; appends are builtin printf, no fork.
+#
 # Singleton + lifecycle follow coffee-watcher.sh: PID-file guard, exits when
 # the tmux server goes away, writes only on change then refresh-client -S.
 # Spawned from tmux.conf via `run-shell -b`. set -u/-e relaxed: a daemon
@@ -102,6 +132,10 @@ SELF="$HOME/.config/tmux/scripts/agent-tab-watcher.sh"
 # Per-tick mtime reference files (see CHANGE STAMPS below). Named with our
 # own pid so cleanup() only ever removes this instance's set.
 STAMPS="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.$$.stamp"
+# The agent event log (see AGENT EVENT LOG); its rotation temps are
+# "$EVLOG.<pid>.tmp", swept with the stamps below.
+EVLOG="${TMPDIR:-/tmp}"
+EVLOG="${EVLOG%/}/agent-events.${UID:-$(id -u)}.log"
 
 # A PID IS NOT AN IDENTITY. cleanup() only unlinks the pidfile on a normal
 # EXIT, so a SIGKILLed watcher leaves a live-looking pid behind — and pid
@@ -160,7 +194,8 @@ write_pidfile
 # Stamp sets left by instances that never ran cleanup() (SIGKILL). Every
 # other instance has been reaped above, and a stamp that vanishes under a
 # live reader only ever reads as "changed" (see changed_since). Startup only.
-rm -f "${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}".*.stamp.* 2>/dev/null
+# Same for an event-log rotation temp a killed instance left mid-rewrite.
+rm -f "${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}".*.stamp.* "$EVLOG".*.tmp 2>/dev/null
 # Heartbeat restamp, builtin only. Called only when the file already reads
 # exactly "$$" (ours), so this rewrites the IDENTICAL bytes in place: `1<>`
 # opens read-write WITHOUT truncating, so a concurrent reader sees the same
@@ -605,10 +640,72 @@ pid_cache_age=0
 PID_CACHE_TICKS=60
 # Per-window fields of the tick's one tmux read (see the ONE READ note).
 declare -A W_SEEN=() W_PID=() W_STATE=() W_WAC=() W_SINCE=() W_WF=() W_CUA=() W_ROLL=() W_SUM=() W_DET=()
+declare -A W_DK=() W_DTXT=() W_SESS=() W_IDX=() W_NAME=()   # event-log fields
 wins=()
 
 # Tick trace (see TICK TRACE in the header). Tested once per tick, builtin.
 TRACE="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.trace"
+
+# Agent event log (see AGENT EVENT LOG in the header; EVLOG is defined with
+# the pidfile). EV_PREV holds last tick's read state per window that had one;
+# ev_base=0 until the first tick has recorded it. ev_lines counts the file's
+# lines (we are its only writer). EV_SEED/EV_SEED_AT: each window's newest
+# logged state and "session US index", consulted by the first tick only.
+EV_MAX="${AGENT_TAB_WATCHER_EVENTS_MAX:-2000}"     # test hooks, like STALE_EVERY
+EV_KEEP="${AGENT_TAB_WATCHER_EVENTS_KEEP:-1000}"
+declare -A EV_PREV=() EV_NEXT=() EV_SEED=() EV_SEED_AT=()
+ev_base=0
+ev_lines=0
+EV_STRIP=$'\x1f\n\r'
+# A regular file, or nothing yet: never a FIFO (an open would block the
+# daemon), a symlink (writes redirected) or anything else.
+ev_safe() { [ ! -L "$EVLOG" ] && { [ -f "$EVLOG" ] || [ ! -e "$EVLOG" ]; }; }
+# Startup, once: the line count and the restart seed, from one builtin
+# mapfile (<= EV_MAX lines). Only well-formed lines (8 separators) count
+# toward the seed; a later line for the same window overwrites an earlier one.
+if ev_safe && [ -f "$EVLOG" ]; then
+    ev_all=()
+    { mapfile -t ev_all < "$EVLOG"; } 2>/dev/null
+    ev_lines=${#ev_all[@]}
+    for ev_ln in "${ev_all[@]}"; do
+        ev_f="${ev_ln//[!$US]/}"
+        [ "${#ev_f}" = 8 ] || continue
+        ev_r="${ev_ln#*$US}"
+        ev_w="${ev_r%%$US*}"; ev_r="${ev_r#*$US}"
+        case "$ev_w" in @*) ;; *) continue ;; esac
+        ev_s="${ev_r%%$US*}"; ev_r="${ev_r#*$US}"
+        ev_i="${ev_r%%$US*}"; ev_r="${ev_r#*$US}"
+        EV_SEED[$ev_w]="${ev_r%%$US*}"; EV_SEED_AT[$ev_w]="$ev_s$US$ev_i"
+    done
+    unset ev_all ev_ln ev_f ev_r ev_w ev_s ev_i
+fi
+# log_event WIN STATE PREV: one line, fields from this tick's read. Builtins
+# only except the rare cap rewrite (one mv per EV_MAX - EV_KEEP events).
+log_event() {
+    local f line="$tick_now" dk="${W_DK[$1]:-}" dt="${W_DTXT[$1]:-}" ev_all
+    # Idle carries no event of its own (see the header): no stale detail.
+    [ "$2" = idle ] && { dk=""; dt=""; }
+    for f in "$1" "${W_SESS[$1]:-}" "${W_IDX[$1]:-}" "$2" "$3" \
+             "$dk" "${W_SUM[$1]:-${W_NAME[$1]:-}}" "$dt"; do
+        line+="$US${f//[$EV_STRIP]/}"
+    done
+    ev_safe || return 0
+    { printf '%s\n' "$line" >> "$EVLOG"; } 2>/dev/null || return 0
+    ev_lines=$((ev_lines + 1))
+    [ "$ev_lines" -gt "$EV_MAX" ] || return 0
+    ev_all=()
+    { mapfile -t ev_all < "$EVLOG"; } 2>/dev/null || return 0
+    ev_lines=${#ev_all[@]}
+    [ "$ev_lines" -gt "$EV_KEEP" ] || return 0
+    # rm first: a planted symlink at the temp path is unlinked, not followed.
+    rm -f "$EVLOG.$$.tmp" 2>/dev/null
+    if { printf '%s\n' "${ev_all[@]: -$EV_KEEP}" > "$EVLOG.$$.tmp"; } 2>/dev/null \
+       && ev_safe && mv -f "$EVLOG.$$.tmp" "$EVLOG" 2>/dev/null; then
+        ev_lines=$EV_KEEP
+    else
+        rm -f "$EVLOG.$$.tmp" 2>/dev/null
+    fi
+}
 
 # THE PULSE HAS ITS OWN CLOCK. @agent_blink used to be toggled once per loop
 # tick, so a pulse phase lasted POLL_SECONDS *plus the whole tick's work* -
@@ -838,13 +935,16 @@ EOF
     # below. Rollout paths (see codex_status) live under ~/.codex/sessions.
     # @agent_kind / @agent_detail_kind (the sidebar's fields, written by the
     # indicator) are bare tokens, read only so a window holding nothing else
-    # still leaves the fast path and gets collected; @agent_detail always
-    # travels with its kind, so the free text itself is never read here.
+    # still leaves the fast path and gets collected (@agent_detail always
+    # travels with its kind, so it never decides that). Session, index, name
+    # and @agent_detail ride along for the AGENT EVENT LOG only: free text,
+    # but the indicator strips controls from the detail, and session/window
+    # names hold no US in practice; the summary stays last regardless.
     #
     # A row only counts if it starts with a window id and carries a /dev/
     # tty, so a line that is not a pane row (a summary with an embedded
     # newline continues on its own line) can never be taken for a window.
-    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_summary}" 2>/dev/null); then
+    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
@@ -867,8 +967,9 @@ EOF
     # gets the full path - seeded, stamped, and garbage-collected once it
     # exits, exactly like any other window.
     W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_SUM=(); W_DET=()
+    W_DK=(); W_DTXT=(); W_SESS=(); W_IDX=(); W_NAME=()
     wins=()
-    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind summary; do
+    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind sess widx wname dtxt summary; do
         case "$win" in @*) ;; *) continue ;; esac
         case "$tty" in /dev/?*) ;; *) continue ;; esac
         if [ -z "${W_SEEN[$win]+x}" ]; then
@@ -878,6 +979,8 @@ EOF
                 W_STATE[$win]="$state"; W_WAC[$win]="$wac"; W_SINCE[$win]="$since"
                 W_WF[$win]="$wf_opt"; W_CUA[$win]="$cua_opt"; W_ROLL[$win]="$roll"
                 W_SUM[$win]="$summary"; W_DET[$win]="${akind}${dkind}"
+                W_DK[$win]="$dkind"; W_DTXT[$win]="$dtxt"
+                W_SESS[$win]="$sess"; W_IDX[$win]="$widx"; W_NAME[$win]="$wname"
             fi
         fi
         tty="${tty#/dev/}"
@@ -907,6 +1010,7 @@ EOF
     idle_streak_next=" "
     gc_streak_next=" "
     wez_front=""   # per tick, computed at most once, only if a tinted tab is watched
+    EV_NEXT=()
     for win in "${wins[@]}"; do
         n_windows=$((n_windows + 1))
         pid="${W_PID[$win]:-}"
@@ -915,6 +1019,20 @@ EOF
         # either - a window that does nothing cannot be the slow one.
         [ -n "$pid" ] || [ -n "${W_STATE[$win]+x}" ] || continue
         state="${W_STATE[$win]:-}"
+        # Event log: the state as READ, before this tick touches it (see
+        # AGENT EVENT LOG). A fast-path window has no state to log. The first
+        # tick compares with the window's newest log line instead, and only
+        # while that line's session+index still match this id (RESTARTS).
+        if [ -n "$state" ]; then
+            EV_NEXT[$win]="$state"
+            if [ "$ev_base" = 1 ]; then
+                [ "${EV_PREV[$win]:-}" != "$state" ] \
+                    && log_event "$win" "$state" "${EV_PREV[$win]:-}"
+            elif [ -n "${EV_SEED[$win]:-}" ] && [ "${EV_SEED[$win]}" != "$state" ] \
+                 && [ "${EV_SEED_AT[$win]}" = "${W_SESS[$win]:-}$US${W_IDX[$win]:-}" ]; then
+                log_event "$win" "$state" "${EV_SEED[$win]}"
+            fi
+        fi
         wac="${W_WAC[$win]:-}"
         since="${W_SINCE[$win]:-}"
         # MID-TICK HEARTBEAT. The heartbeat means "the loop is turning", and a
@@ -1089,6 +1207,12 @@ EOF
         fi
     done
     gc_streak="$gc_streak_next"
+    # This tick's reads become the next tick's "previous" (a window gone from
+    # the read, or now stateless, just drops out). The restart seed is done.
+    EV_PREV=()
+    for win in "${!EV_NEXT[@]}"; do EV_PREV[$win]="${EV_NEXT[$win]}"; done
+    ev_base=1
+    EV_SEED=(); EV_SEED_AT=()
 
     idle_streak="$idle_streak_next"
 
