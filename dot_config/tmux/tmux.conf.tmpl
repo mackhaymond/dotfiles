@@ -270,7 +270,9 @@ set -g @catppuccin_window_current_fill "number"
 # fill the whole tab, exactly as they burn at full strength in the glow;
 # ambient states (working/cua/idle) never touch the body, as they glow subtly.
 # Motion means the same thing in both: pulsing = in flight, steady = waiting
-# on you. Don't reassign a hue in one surface without the other.
+# on you. Don't reassign a hue in one surface without the others. There are
+# THREE now (2026-10-07): this tab bar, CuaNotch, and the HEX table in
+# scripts/agent-roster.py (prefix e), which renders the same states as dots.
 #
 # ONE EXCEPTION to "same hue everywhere": blue #89b4fa is BOTH catppuccin's
 # resting chip accent and the computer-use hue. On the chip, blue therefore
@@ -448,6 +450,17 @@ bind-key C-a display-popup -E -w 60% -h 75% "$HOME/.config/tmux/scripts/mru-sess
 bind-key g   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
 bind-key C-g run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
 bind-key G   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{client_tty}'"
+
+# prefix e (or C-e) → the agent roster: every agent in every session in one
+# popup, NEEDS YOU on top in prefix g's own order, parked tabs collapsed.
+# Tab/S-Tab or j/k move, Space/⏎ go, g next, x close (via closed-tabs, so
+# CMD+Z still undoes it), H park, / filter, a all windows, r restart the
+# watcher, esc closes. See the header of scripts/agent-roster.py.
+#
+# Through run-shell on purpose: display-popup does NOT expand formats in its
+# own command, and the roster has to be told which client opened it.
+bind-key e   run-shell -b "tmux display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' '/usr/bin/python3 #{HOME}/.config/tmux/scripts/agent-roster.py --client #{client_tty}'"
+bind-key C-e run-shell -b "tmux display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' '/usr/bin/python3 #{HOME}/.config/tmux/scripts/agent-roster.py --client #{client_tty}'"
 
 # Double-tap hyper or right shift in WezTerm (Karabiner, karabiner-base.json) flips
 # back to the previous one of these, like the same double-tap does for Arc tabs:
