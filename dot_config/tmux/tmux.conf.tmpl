@@ -435,6 +435,20 @@ bind-key a display-popup -E -w 60% -h 75% "$HOME/.config/tmux/scripts/mru-sessio
 unbind-key C-a
 bind-key C-a display-popup -E -w 60% -h 75% "$HOME/.config/tmux/scripts/mru-session-switch.sh"
 
+# prefix g → the next tab that needs you, across every session: red (failed),
+# then yellow (waiting on you), then green (done), oldest first. Repeated
+# presses walk the queue — each visit discharges the tint it lands on. prefix G
+# goes back to where the run of jumps started. prefix C-g is g with Ctrl still
+# held from the prefix. All left-hand keys, next to the C-s prefix (Mack's
+# ask, 2026-10-07). See scripts/agent-jump.sh for the order, the excluded
+# sessions and why every move is select-window THEN switch-client.
+#
+# Deliberately not `bind -r`: repeat-time (500ms) would turn the first `g`
+# typed into the pane right after a jump into a second jump.
+bind-key g   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
+bind-key C-g run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
+bind-key G   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{client_tty}'"
+
 # Double-tap hyper or right shift in WezTerm (Karabiner, karabiner-base.json) flips
 # back to the previous one of these, like the same double-tap does for Arc tabs:
 #   session  the top row of prefix+a, without the picker
