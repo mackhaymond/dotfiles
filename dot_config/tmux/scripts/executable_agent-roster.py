@@ -105,7 +105,11 @@ def parse_windows(text):
         # stash.sh's own label order. A parked agent is SIGTERMed (suspended)
         # and the watcher then GCs its @agent_* options, so @stash_label is
         # often the only title a parked tab still has.
-        w["label"] = w["stash_label"] or w["summary"] or w["name"]
+        # Only for windows actually IN the holding session: stash.sh clears
+        # @stash_label on unstash, but a window that left by any other route
+        # would otherwise wear a frozen label over its live summary.
+        parked = w["session"] == HOLD
+        w["label"] = (parked and w["stash_label"]) or w["summary"] or w["name"]
         w["stash_t"] = int(w["stash_ts"]) if w["stash_ts"].isdigit() else None
         out.append(w)
     return out
@@ -347,7 +351,13 @@ class Roster:
     def act(self, key):
         if self.confirm is not None:
             w, self.confirm = self.confirm, None
-            if key in ("y", "Y"):
+            if key in ("y", "Y") and w["session"] == HOLD:
+                # A parked tab goes through stash.sh's own discard, which logs
+                # a suspended conversation's id (with the command that resumes
+                # it) and drops its sidecar row; closed-tabs knows neither.
+                run_bg("'%s' kill-many '%s'" % (STASH, w["id"]))
+                self.say("discarded %s · its session id is in the stash log" % w["label"])
+            elif key in ("y", "Y"):
                 pane = agent_pane(w["id"])
                 if pane:
                     run_bg("'%s' close '%s'" % (CLOSED, pane))

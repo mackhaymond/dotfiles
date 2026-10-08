@@ -29,7 +29,9 @@ WINDOWS = "\n".join([
     line("agents", 1, "@6", "running", "pty"),                          # never shown
     line("stash", 1, "@7", "needs-input", "proj/Parked"),
     line("stash", 2, "@8"),                                             # plain parked shell
-    line("stash", 3, "@9", stash_label="proj/Suspended", stash_session="abc-123", stash_ts="500"),
+    line("stash", 3, "@9", summary="stale/summary", stash_label="proj/Suspended", stash_session="abc-123",
+         stash_ts="500"),
+    line("main", 4, "@10", summary="live/summary", stash_label="frozen/label"),   # left the stash some other way
 ])
 
 
@@ -49,7 +51,7 @@ class ModelTests(unittest.TestCase):
         return out
 
     def test_parse(self):
-        self.assertEqual(len(self.ws), 9)
+        self.assertEqual(len(self.ws), 10)
         one = self.ws[0]
         self.assertEqual((one["index"], one["since_t"], one["label"]), (1, 100, "proj/One"))
         self.assertEqual(self.ws[1]["label"], "zsh")
@@ -78,6 +80,17 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(opened[-4:], ["parked", "@7", "@8", "@9"])
         nine = [w for w in self.ws if w["id"] == "@9"][0]
         self.assertEqual((nine["label"], nine["stash_t"]), ("proj/Suspended", 500))
+        ten = [w for w in self.ws if w["id"] == "@10"][0]
+        self.assertEqual(ten["label"], "live/summary")          # @stash_label only counts while parked
+
+    def test_parked_rows_say_suspended_or_parked(self):
+        roster = R.Roster("/dev/ttys999")
+        strip = lambda s: R.re.sub(r"\x1b\[[0-9;]*m", "", s)
+        by = {w["id"]: w for w in self.ws}
+        eight = strip(roster.row({"kind": "win", "w": by["@8"], "long": False}, 120, False, 1000, False))
+        nine = strip(roster.row({"kind": "win", "w": by["@9"], "long": False}, 120, False, 1000, False))
+        self.assertRegex(eight, r"zsh\s+parked")
+        self.assertRegex(nine, r"proj/Suspended\s+suspended\s+8m")
 
     def test_done_with_fleet_out_is_not_attention(self):
         five = [w for w in self.ws if w["id"] == "@5"][0]
