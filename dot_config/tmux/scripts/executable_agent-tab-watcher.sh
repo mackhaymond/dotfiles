@@ -55,6 +55,10 @@
 
 # 1s: doubles as the blink interval for the running-glyph animation.
 POLL_SECONDS=1
+# Field separator for multi-field list-windows reads (see the states read).
+US=$'\x1f'
+# Tests only: exit after this many ticks (unset = run forever).
+MAX_TICKS="${AGENT_TAB_WATCHER_MAX_TICKS:-}"
 
 command -v tmux >/dev/null 2>&1 || exit 0
 
@@ -122,7 +126,10 @@ echo $$ > "$PIDFILE"
 # EXIT (a bare cleanup trap on TERM/INT/HUP would run the handler and then
 # RESUME the loop — the daemon would survive `kill`, which is exactly how the
 # old version leaked); routing signals through `exit 0` fires the EXIT trap.
-cleanup() { [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"; }
+cleanup() {
+    [ -n "${BLINK_PID:-}" ] && kill "$BLINK_PID" 2>/dev/null
+    [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"
+}
 trap cleanup EXIT
 trap 'exit 0' INT TERM HUP
 
@@ -278,6 +285,49 @@ idle_streak=" "
 GC_TICKS=5
 gc_streak=" "
 
+# THE PULSE HAS ITS OWN CLOCK. @agent_blink used to be toggled once per loop
+# tick, so a pulse phase lasted POLL_SECONDS *plus the whole tick's work* -
+# and that work is not small: `ps -ax` alone is ~250ms here whatever flags
+# it gets, the background-subagent scan ~450ms over 9 claude windows, and
+# every 60s resolve_session_bases' cache expires and a cold walk costs ~1.5s
+# PER SESSION. Measured 2026-10-07: phases of 1.7s steady, with 4-6s spikes
+# ("inconsistent and pretty long" - Mack). No amount of trimming makes a
+# reconcile loop a metronome, so the toggling moved into this child, which
+# does nothing else: the loop only raises or lowers BLINK_FLAG (builtin
+# redirect to raise, one rm on the falling edge), and the child flips the
+# option every POLL_SECONDS while the flag exists.
+#
+# One actor still owns @agent_blink (rule 1 in the doc): the parent never
+# toggles it any more, and the child retires itself the moment the parent is
+# gone OR no longer owns the pidfile - so a respawn can never leave two
+# togglers cancelling each other out. It is a forked subshell, so it shares
+# the parent's argv: the startup pgrep sweep in a successor kills it like
+# any other straggler, and a `pgrep -f agent-tab-watcher` now legitimately
+# shows TWO matches (the second with the first as its ppid).
+BLINK_FLAG="${TMPDIR:-/tmp}/agent-tab-blink.${UID:-$(id -u)}"
+rm -f "$BLINK_FLAG"
+WATCHER_PID=$$
+blink_loop() {
+    # $$ in a subshell is still the PARENT's pid, so the inherited EXIT trap
+    # would see "the pidfile is mine" and delete the live parent's pidfile.
+    trap - EXIT
+    trap 'exit 0' INT TERM HUP
+    local owner
+    while sleep "$POLL_SECONDS"; do
+        kill -0 "$WATCHER_PID" 2>/dev/null || exit 0
+        read -r owner < "$PIDFILE" 2>/dev/null || exit 0
+        [ "$owner" = "$WATCHER_PID" ] || exit 0
+        [ -e "$BLINK_FLAG" ] || continue
+        if [ "$(tmux show-options -gqv @agent_blink 2>/dev/null)" = "1" ]; then
+            tmux set-option -g @agent_blink 0 \; refresh-client -S 2>/dev/null
+        else
+            tmux set-option -g @agent_blink 1 \; refresh-client -S 2>/dev/null
+        fi
+    done
+}
+blink_loop &
+BLINK_PID=$!
+
 while :; do
     # window_id<space>pane_tty for every pane.
     if ! panes=$(tmux list-panes -a -F '#{window_id} #{pane_tty}' 2>/dev/null); then
@@ -319,7 +369,20 @@ $ps_out
 EOF
 
     # Current per-window state in one call (formats resolve window options).
-    if ! states=$(tmux list-windows -a -F '#{window_id} #{@agent_state} #{window_active_clients}' 2>/dev/null); then
+    #
+    # Fields are split on US (\x1f), NOT on spaces. `read` collapses runs of
+    # IFS whitespace, and \t counts as whitespace too, so with a space here an
+    # EMPTY @agent_state vanished and the client count slid into `state`
+    # (measured 2026-10-07: 104 of 115 windows, every tick). Both halves of
+    # the watcher then misfired: an agent window with no state never got its
+    # idle seed (state was "0"/"1", not empty), and every non-agent window read
+    # as a stale agent and ran the 7-unset GC every GC_TICKS ticks, forever.
+    # US is not whitespace, so `read` keeps empty fields. Same idiom as
+    # stash.sh. The other list-windows reads below are `win rest` pairs: an
+    # empty rest is exactly what they test for, so they are safe as they are.
+    #
+    # @agent_since rides along: "<epoch> <state>", see the stamp below.
+    if ! states=$(tmux list-windows -a -F "#{window_id}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}" 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
@@ -391,12 +454,19 @@ EOF
     changed=0
     any_workflow=0
     any_cua=0
+    # Decided per window inside the loop, from the PARSED state. It used to be
+    # a substring test on the raw list-windows output (`*" running"*`), which
+    # silently depended on the separator being a space; a US separator would
+    # have frozen every pulse at whatever phase it happened to be in.
+    blink_active=0
+    # Not `now`: agent-session-lib.sh assigns a global of that name.
+    printf -v tick_now '%(%s)T' -1
     # Rebuilt each tick; a window that stops reading idle drops out, so the
     # streak only ever counts CONSECUTIVE observations.
     idle_streak_next=" "
     gc_streak_next=" "
     wez_front=""   # per tick, computed at most once, only if a tinted tab is watched
-    while IFS=' ' read -r win state wac; do
+    while IFS="$US" read -r win state wac since; do
         # SEEN-IT, CONTINUOUSLY. The hook discharges a yellow/green that lands
         # while the user is sitting on the tab with WezTerm focused; this is
         # the other order - the tint landed while WezTerm was behind something,
@@ -521,6 +591,7 @@ EOF
 
         if [ "$has_agent" = 1 ] && [ -z "$state" ]; then
             tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
+            state=idle
         elif [ "$has_agent" = 0 ] && { [ -n "$state" ] || [ "$has_summary" = 1 ]; }; then
             n=0
             for kv in $gc_streak; do
@@ -536,9 +607,29 @@ EOF
                 tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null
                 changed=1
+                state=""
             else
                 gc_streak_next="${gc_streak_next}${win}=${n} "
             fi
+        fi
+
+        [ "$state" = running ] && blink_active=1
+
+        # @agent_since = "<epoch> <state>": when this window's state last
+        # changed (the roster's elapsed column and the jump order read it).
+        # Stamped HERE, against the stored value, rather than in each writer:
+        # the hook's set_state, its clear_state, the seen-it discharge, the
+        # stuck-running reconcile, the idle seed and the GC all change state,
+        # and this one comparison sees every one of them within a tick. It is
+        # compared with what is STORED, not with last tick's memory, so a
+        # `prefix r` or an ensure_watcher respawn neither restamps every
+        # window nor loses a change made while no watcher was running. Up to
+        # POLL_SECONDS late, which an elapsed column can't show anyway. Not a
+        # rendered option, so it never sets `changed`.
+        if [ -z "$state" ]; then
+            [ -n "$since" ] && tmux set-option -uw -t "$win" @agent_since 2>/dev/null
+        elif [ "${since#* }" != "$state" ]; then
+            tmux set-option -w -t "$win" @agent_since "$tick_now $state" 2>/dev/null
         fi
     done <<EOF
 $states
@@ -547,19 +638,15 @@ EOF
 
     idle_streak="$idle_streak_next"
 
-    # Blink driver: toggle while anything is running or has a workflow in
-    # flight; redraw covers both the toggle and any reconcile changes above.
-    blink_active=0
-    case "$states" in *" running"*) blink_active=1 ;; esac
+    # Pulse while anything is running (set in the loop), has a workflow in
+    # flight, or is driving an app. The toggling itself is blink_loop's job;
+    # this only raises/lowers its flag (no fork unless it actually falls).
     [ "$any_workflow" = 1 ] && blink_active=1
     [ "$any_cua" = 1 ] && blink_active=1
     if [ "$blink_active" = 1 ]; then
-        if [ "$(tmux show-options -gqv @agent_blink 2>/dev/null)" = "1" ]; then
-            tmux set-option -g @agent_blink 0 2>/dev/null
-        else
-            tmux set-option -g @agent_blink 1 2>/dev/null
-        fi
-        changed=1
+        [ -e "$BLINK_FLAG" ] || : > "$BLINK_FLAG"
+    elif [ -e "$BLINK_FLAG" ]; then
+        rm -f "$BLINK_FLAG"
     fi
 
     if [ "$changed" = 1 ]; then
@@ -583,5 +670,9 @@ EOF
     [ "$_owner" = "$$" ] || exit 0
     echo $$ > "$PIDFILE"
 
+    if [ -n "$MAX_TICKS" ]; then
+        MAX_TICKS=$((MAX_TICKS - 1))
+        [ "$MAX_TICKS" -gt 0 ] || exit 0
+    fi
     sleep "$POLL_SECONDS"
 done

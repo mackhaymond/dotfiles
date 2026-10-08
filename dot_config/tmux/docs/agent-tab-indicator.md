@@ -24,8 +24,8 @@ State by state (unselected tab):
 | `running` | agent mid-turn | **pink `#f5c2e7` ↔ blue `#89b4fa`, 1 s** | stock | — |
 | `running` + cua | agent driving an app | **pink ↔ blue** | stock | blue `󰍽` pulsing |
 | *background workflow* | a Claude Workflow, or a background subagent (the Agent tool), still running after the turn ended | **pink ↔ blue** | stock (green "done" tint suppressed — it isn't really finished) | teal `󰒓` pulsing |
-| `needs-input` | a question to answer / turn failed | crust (yellow digit) | yellow `#f9e2af` | — |
-| `needs-approval` | blocked on a permission decision | crust (red digit) | red `#f38ba8` | — |
+| `needs-input` | waiting on you: a permission gate or a question (`needs-approval` survives only as the hook MODE name) | crust (yellow digit) | yellow `#f9e2af` | — |
+| `failed` | the turn itself died (`StopFailure`: 529, overloaded) | crust (red digit) | red `#f38ba8` | — |
 | `done` | turn finished | crust (green digit) | green `#a6e3a1` | — |
 | any | agent has a conversation title | — | — | tab name = `project/short-title`, else `#W` |
 
@@ -54,15 +54,19 @@ does, so the heartbeat re-arms `running` when the answered turn resumes.
 Before this, `done` skipped its tint on the watched test alone — a watched
 window in a backgrounded terminal was the one way to miss a finish — and
 `needs-input` was always asserted. Switching away before the prompt lands
-still gets the yellow; red is never auto-discharged.
+still gets the yellow. Red is never discharged by the *watched-on-arrival*
+test — a dead turn is not answered by being looked at — but focusing the tab
+(`clear-current`, `needs-*|failed`) does discharge it like any other tint.
 
 ## Architecture
 
 Two per-window tmux user options are the single source of truth:
 
-- `@agent_state` — `idle | running | needs-input | done` (unset = no agent)
+- `@agent_state` — `idle | running | needs-input | failed | done` (unset = no agent)
+- `@agent_since` — `"<epoch> <state>"`: when the state last changed. Stamped by the watcher alone (it compares the live state with the stored one each tick, so every writer is covered and restarts lose nothing); unset with the state. Read by `agent-jump.sh` (oldest-first order) and the planned roster's elapsed column.
 - `@agent_summary` — short conversation title
 - `@agent_workflow` — `1` while a background Claude Workflow is in flight (else unset); set by the watcher, orthogonal to `@agent_state`
+- `@agent_cua` — `1` while the agent is driving an app through cua-driver (lingers up to `CUA_LIVE`, 60 s); set by the watcher
 - `@agent_rollout` — codex only: the thread's rollout path, stashed by the indicator so the watcher can tell a live turn from an interrupted one
 
 Three components maintain and render them:
@@ -206,9 +210,16 @@ re-probing the pin.
 
 ### 2. `scripts/agent-tab-watcher.sh` (presence daemon)
 
-Singleton, spawned from tmux.conf, polls every 1 s (doubling as the
-running-glyph blink driver — it toggles the global `@agent_blink` option
-each tick while any window is running). The singleton guard is
+Singleton, spawned from tmux.conf, polls every 1 s. The pulse is NOT
+driven by that loop any more (2026-10-07): a tick is 1 s of sleep *plus* its
+work (`ps -ax` ~250 ms, the subagent scan ~450 ms, a cold
+`resolve_session_bases` ~1.5 s per session every 60 s), so per-tick toggling
+gave 1.7 s phases with 4–6 s spikes. A forked child, `blink_loop`, owns
+`@agent_blink` and flips it every second while the loop's flag file
+(`$TMPDIR/agent-tab-blink.$UID`) exists; the loop only raises or lowers the
+flag (any window `running`, a workflow, or cua). The child exits as soon as
+the parent is gone or no longer owns the pidfile, and the parent kills it on
+exit, so there is still exactly one toggler. The singleton guard is
 ownership-aware: each start reaps any prior instance (by PID file, plus a
 `pgrep` sweep for stragglers whose PID file was lost — two live daemons would
 both toggle `@agent_blink` per tick and cancel each other out) and only clears
@@ -500,7 +511,8 @@ so stale summaries simply vanish.
   2026-08-20: the "second daemon" had the first as its ppid and `ps` showed it
   as a bare `(bash)`). Match count is *correlated* with daemon count, not equal
   to it. If you must look at processes, discard any whose `ps -o ppid=` is the
-  watcher. Any agent hook now respawns it
+  watcher. Since 2026-10-07 there is also one LEGITIMATE second match:
+  `blink_loop`, the pulse child, whose ppid is the watcher. Any agent hook now respawns it
   automatically (see *Liveness* above); to force it, `tmux run-shell -b "bash
   ~/.config/tmux/scripts/agent-tab-watcher.sh"` or reload with `prefix r`.
   Confirm it is driving the animation: `for i in 1 2 3 4; do tmux show -gv
