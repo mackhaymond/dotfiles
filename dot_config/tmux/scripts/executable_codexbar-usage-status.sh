@@ -46,6 +46,23 @@ LIVE_SAMPLE_FILE="${CACHE_DIR}/claude-live.json"
 LIVE_MERGED_MARKER="${CACHE_DIR}/claude-live.merged"
 HISTORY_RECENT_WINDOW_SECONDS=1800
 
+# Which Claude account is logged in (see "Which Claude account" below):
+# ~/.claude.json's oauthAccount; claude-swap's slot table, read only for an
+# alias; and the account the last tick saw, so a switch is noticed exactly once.
+#
+# ALWAYS $HOME/.claude.json, NEVER $CLAUDE_CONFIG_DIR's. The token this script
+# fetches with is the DEFAULT login's (the Keychain service "Claude
+# Code-credentials", unsuffixed), and the account has to be read from the file
+# that goes with that token. `cswap run N` starts Claude with CLAUDE_CONFIG_DIR
+# pointing at a profile dir whose settings.json is the shared one, so the Stop
+# hook (codexbar-usage-push.sh) inherits it: honouring it here stamped the
+# default account's numbers with the profile's account, flapped the switch
+# marker on every turn, and cleared the backoff each time. The callers strip
+# it too (env -u CLAUDE_CONFIG_DIR); this is the belt to their braces.
+CLAUDE_GLOBAL_CONFIG="${HOME}/.claude.json"
+CSWAP_SEQUENCE_FILE="${HOME}/.claude-swap-backup/sequence.json"
+CLAUDE_ACCOUNT_MARKER="${CACHE_DIR}/claude-account"
+
 CODEXBAR_TMP_FILES=()
 
 cleanup_tmp_files() {
@@ -142,6 +159,10 @@ SCOPED_MODEL_NAME="$(opt_or_env_or_default '@codexbar_scoped_model' 'CODEXBAR_US
 if [[ -z "${SCOPED_MODEL_NAME:-}" ]]; then
   SCOPED_MODEL_NAME="$(opt_or_env_or_default '@codexbar_fable_model' 'CODEXBAR_USAGE_FABLE_MODEL' 'Fable')"
 fi
+
+# Width of the account label in front of the session module (S:), in cells,
+# ellipsis included. 0 hides it.
+ACCOUNT_LABEL_MAX="$(clamp_int_range "$(opt_or_env_or_default '@codexbar_account_label_max' 'CODEXBAR_USAGE_ACCOUNT_LABEL_MAX' '10')" 0 40)"
 
 # ── Providers ───────────────────────────────────────────────────────────────
 #
@@ -255,6 +276,200 @@ select_provider() {
 }
 
 select_provider "$DISPLAY_PROVIDER"
+
+# ── Which Claude account ────────────────────────────────────────────────────
+#
+# Claude's numbers belong to ONE ACCOUNT, and the logged-in account can change
+# under this script: claude-swap (cswap, driven every 60s by the cswap-auto
+# LaunchAgent) fails over between accounts by rewriting the Keychain login
+# "Claude Code-credentials" AND ~/.claude.json's oauthAccount in one
+# transaction, under Claude Code's own credential and config locks
+# (claude_swap/switcher.py, _perform_switch). /login rewrites the same key. So
+# ~/.claude.json is the cheap, authoritative answer to "whose numbers are
+# these": one ~6 ms jq read on every status refresh, never the ~0.15 s Python
+# `cswap status`, and nothing at all to wait on when cswap is not installed.
+#
+# Before this, nothing that holds the numbers knew which account they were
+# for, and a switch could leave the bar on the OLD account's usage:
+#
+#   usage.json      only re-fetched once fetched_at aged past
+#                   @codexbar_stale_after_seconds, and not before the claude
+#                   backoff ladder ran out — a ladder the old account's
+#                   rate_limit_error had usually just armed at 5 minutes, and
+#                   that climbs to an hour. The token itself was never the
+#                   problem: every fetch re-reads it from the Keychain.
+#   claude-live.json  Claude Code's per-turn numbers, merged by "same window:
+#                   higher wins, else the later window wins". The old
+#                   account's 90% outranks the new account's 3% whenever the
+#                   two windows end within 10 minutes of each other or the old
+#                   one ends later, and the reading sticks until that window
+#                   ends — up to 7 days for the weekly one. An idle session
+#                   also repaints its last (old-account) reading forever.
+#
+# Now: the Claude block records the account it was fetched for (`account`,
+# `account_email`); a block for another account is due at once and is drawn
+# as "--%" rather than as the new account's usage; the first tick to see a
+# new account clears the claude backoff ladder, since that ladder was the old
+# token's (the usage endpoint's budget is per token); the live sample is
+# stamped with its account, and codexbar-usage-live.sh fences off the old
+# account's windows so an idle session cannot write them back.
+#
+# The key is the lower-cased email plus "/<organization uuid>": cswap tells
+# slots apart by both, and one email can hold two subscriptions. A missing or
+# unreadable ~/.claude.json gives an empty key, and with no key nothing is
+# keyed — the cache behaves exactly as it did before.
+CLAUDE_ACCOUNT_KEY=''
+CLAUDE_ACCOUNT_EMAIL=''
+CLAUDE_ACCOUNT_ORG=''
+CLAUDE_ACCOUNT_LOADED=0
+
+# The jq program that turns ~/.claude.json into "key<US>email<US>org".
+# codexbar-usage-live.sh computes the same key with the same expression;
+# change both or neither.
+CLAUDE_ACCOUNT_JQ='(.oauthAccount // {}) as $a
+  | (($a.emailAddress // "") | tostring) as $e
+  | (($a.organizationUuid // "") | tostring) as $o
+  | [ (if $e == "" then "" else ($e | ascii_downcase) + (if $o == "" then "" else "/" + $o end) end),
+      $e, $o ] | join("\u001f")'
+
+# Always re-reads the file. refresh_one_provider calls it on both sides of a
+# fetch to catch a switch that lands mid-request.
+read_claude_account() {
+  CLAUDE_ACCOUNT_KEY=''
+  CLAUDE_ACCOUNT_EMAIL=''
+  CLAUDE_ACCOUNT_ORG=''
+  CLAUDE_ACCOUNT_LOADED=1
+  [[ -f "$CLAUDE_GLOBAL_CONFIG" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local line
+  line="$(jq -r "$CLAUDE_ACCOUNT_JQ" "$CLAUDE_GLOBAL_CONFIG" 2>/dev/null || true)"
+  [[ -n "${line:-}" ]] || return 0
+  IFS=$'\x1f' read -r CLAUDE_ACCOUNT_KEY CLAUDE_ACCOUNT_EMAIL CLAUDE_ACCOUNT_ORG <<<"$line" || true
+  return 0
+}
+
+# Once per process; every reader inside one tick agrees on one answer.
+load_claude_account() {
+  (( CLAUDE_ACCOUNT_LOADED == 1 )) && return 0
+  read_claude_account
+}
+
+# The account Claude's block in usage.json was fetched for, in
+# CLAUDE_BLOCK_ACCOUNT: empty for a block written before blocks were keyed,
+# or when there is no block. Read once and remembered until write_usage_cache
+# rewrites the file (it resets CLAUDE_BLOCK_ACCOUNT_LOADED), since a tick asks
+# up to three times. A global, not stdout: a $(...) caller would cache in a
+# subshell and remember nothing.
+CLAUDE_BLOCK_ACCOUNT=''
+CLAUDE_BLOCK_ACCOUNT_LOADED=0
+load_claude_block_account() {
+  (( CLAUDE_BLOCK_ACCOUNT_LOADED == 1 )) && return 0
+  CLAUDE_BLOCK_ACCOUNT=''
+  CLAUDE_BLOCK_ACCOUNT_LOADED=1
+  [[ -f "$CACHE_FILE" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  CLAUDE_BLOCK_ACCOUNT="$(jq -r '.providers.claude.account // empty | strings' "$CACHE_FILE" 2>/dev/null || true)"
+  return 0
+}
+
+# True when Claude's block holds ANOTHER account's numbers: both sides known
+# and different. A block with no recorded account is not "another account" —
+# it is what every cache looked like before this, and drawing it as "--%"
+# until the first keyed fetch would blank the bar on upgrade for nothing.
+claude_block_is_other_account() {
+  load_claude_account
+  [[ -n "$CLAUDE_ACCOUNT_KEY" ]] || return 1
+  load_claude_block_account
+  [[ -n "$CLAUDE_BLOCK_ACCOUNT" && "$CLAUDE_BLOCK_ACCOUNT" != "$CLAUDE_ACCOUNT_KEY" ]]
+}
+
+# True when Claude's block should be re-fetched for the current account no
+# matter how fresh it is: another account's, or not keyed yet.
+claude_block_needs_account_refetch() {
+  load_claude_account
+  [[ -n "$CLAUDE_ACCOUNT_KEY" ]] || return 1
+  load_claude_block_account
+  [[ "$CLAUDE_BLOCK_ACCOUNT" != "$CLAUDE_ACCOUNT_KEY" ]]
+}
+
+# A live sample is usable when it is stamped with the current account, or not
+# stamped at all (written before stamping existed, or with no ~/.claude.json).
+live_sample_is_current_account() {
+  local sample="${1:-}" account
+  load_claude_account
+  [[ -n "$CLAUDE_ACCOUNT_KEY" ]] || return 0
+  account="$(printf '%s' "$sample" | jq -r '.account // empty | strings' 2>/dev/null || true)"
+  [[ -z "${account:-}" || "$account" == "$CLAUDE_ACCOUNT_KEY" ]]
+}
+
+# The short name drawn in front of S:. The cswap alias for this account when
+# one is set (sequence.json is cswap's own slot table, read directly — the
+# same data `cswap list --json` prints, without starting Python), else the
+# email's local part. Squeezed to [A-Za-z0-9._+-] — it lands in a tmux format,
+# where ',', '#', '}' and '%' all mean something — and cut to
+# ACCOUNT_LABEL_MAX cells with an ellipsis. Empty when there is no login, or
+# the label is turned off.
+claude_account_label() {
+  (( ACCOUNT_LABEL_MAX > 0 )) || return 0
+  load_claude_account
+  [[ -n "$CLAUDE_ACCOUNT_EMAIL" ]] || return 0
+
+  local label='' alias=''
+  if [[ -f "$CSWAP_SEQUENCE_FILE" ]] && command -v jq >/dev/null 2>&1; then
+    alias="$(jq -r --arg e "$CLAUDE_ACCOUNT_EMAIL" --arg o "$CLAUDE_ACCOUNT_ORG" '
+      [ (.accounts // {})[]? | objects
+        | select(((.email // "") | tostring | ascii_downcase) == ($e | ascii_downcase))
+        | select($o == "" or ((.organizationUuid // "") | tostring) == "" or .organizationUuid == $o)
+        | (.alias // "") | strings | select(length > 0) ] | first // empty
+    ' "$CSWAP_SEQUENCE_FILE" 2>/dev/null || true)"
+    alias="$(printf '%s' "$alias" | tr ' ' '-' | LC_ALL=C tr -cd 'A-Za-z0-9._+-')"
+  fi
+  label="$alias"
+  if [[ -z "$label" ]]; then
+    label="$(printf '%s' "${CLAUDE_ACCOUNT_EMAIL%%@*}" | LC_ALL=C tr -cd 'A-Za-z0-9._+-')"
+  fi
+  [[ -n "$label" ]] || return 0
+
+  if (( ${#label} > ACCOUNT_LABEL_MAX )); then
+    if (( ACCOUNT_LABEL_MAX >= 2 )); then
+      label="${label:0:$(( ACCOUNT_LABEL_MAX - 1 ))}…"
+    else
+      label="${label:0:$ACCOUNT_LABEL_MAX}"
+    fi
+  fi
+  printf '%s' "$label"
+}
+
+# Notice a switch ONCE: the first caller to see an account other than the one
+# recorded clears the claude backoff ladder (it was armed against the old
+# token, and the new one has its own budget) and records the new account.
+# The first sighting ever — a fresh install, or the upgrade to this — records
+# and resets nothing. Racing callers both clearing the ladder is harmless.
+note_claude_account_switch() {
+  provider_enabled claude || return 0
+  load_claude_account
+  [[ -n "$CLAUDE_ACCOUNT_KEY" ]] || return 0
+
+  local previous=''
+  previous="$(cat "$CLAUDE_ACCOUNT_MARKER" 2>/dev/null || true)"
+  [[ "$previous" == "$CLAUDE_ACCOUNT_KEY" ]] && return 0
+
+  mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
+  local tmp
+  tmp="$(mktemp "${CLAUDE_ACCOUNT_MARKER}.tmp.XXXXXX" 2>/dev/null)" || return 0
+  if printf '%s\n' "$CLAUDE_ACCOUNT_KEY" >"$tmp" 2>/dev/null && mv -f "$tmp" "$CLAUDE_ACCOUNT_MARKER" 2>/dev/null; then
+    :
+  else
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  fi
+
+  [[ -n "$previous" ]] || return 0
+  log_info "account[claude]: switched ${previous} -> ${CLAUDE_ACCOUNT_KEY}; clearing the claude backoff and re-fetching"
+  rm -f "$(backoff_file_for claude)" 2>/dev/null || true
+  return 0
+}
 
 USAGE_LOG_MAX_BYTES=$(( 256 * 1024 ))
 
@@ -782,9 +997,15 @@ provider_refresh_due() {
 
   ts="$(provider_updated_at "$provider")"
   age=$(( now - ts ))
+  # Claude's numbers are stale the moment they belong to another account,
+  # however young (see "Which Claude account").
+  local other_account=0
+  if [[ "$provider" == 'claude' ]] && claude_block_needs_account_refetch; then
+    other_account=1
+  fi
   # A backward wall-clock step (e.g. NTP correction on wake) makes age
   # negative; treat that as stale so the recovery refresh isn't suppressed.
-  if (( age < 0 || age >= STALE_AFTER_SECONDS )); then
+  if (( other_account == 1 || age < 0 || age >= STALE_AFTER_SECONDS )); then
     select_provider "$provider"
     read -r fc na < <(read_refresh_backoff)
     (( now >= na )) && due=0
@@ -1363,6 +1584,7 @@ load_cache_fields() {
   CACHE_SCOPED_USED=''
   CACHE_SCOPED_WINDOW_MINUTES=''
   CACHE_SCOPED_LABEL=''
+  CACHE_OTHER_ACCOUNT=0
 
   [[ -f "$CACHE_FILE" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
@@ -1379,6 +1601,16 @@ load_cache_fields() {
     "$CACHE_FILE" 2>/dev/null | tr '\t' '\037' || true)"
   [[ -n "$parsed" ]] || return 0
   IFS=$'\037' read -r CACHE_STATE CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES CACHE_SCOPED_TEXT CACHE_SCOPED_COLOR CACHE_SCOPED_RESETS CACHE_SCOPED_USED CACHE_SCOPED_WINDOW_MINUTES CACHE_SCOPED_LABEL <<<"$parsed"
+
+  # Another account's numbers are not this account's usage. Draw them as
+  # unknown, in gray, until a fetch (or a live sample) for the account that is
+  # logged in now replaces them — normally the very next tick.
+  if [[ "$provider" == 'claude' ]] && claude_block_is_other_account; then
+    CACHE_OTHER_ACCOUNT=1
+    CACHE_SESSION_COLOR='brightblack'
+    CACHE_WEEKLY_COLOR='brightblack'
+    CACHE_SCOPED_COLOR='brightblack'
+  fi
 }
 
 render_text_for_mode() {
@@ -1387,6 +1619,11 @@ render_text_for_mode() {
 
   if [[ "$CACHE_STATE" == "auth_required" ]]; then
     printf '%s%s' "$AUTH_REQUIRED_TEXT" "$debug_suffix"
+    return 0
+  fi
+
+  if (( ${CACHE_OTHER_ACCOUNT:-0} == 1 )); then
+    printf '%s%s' '--%' "$debug_suffix"
     return 0
   fi
 
@@ -1497,6 +1734,19 @@ publish_to_tmux_opts() {
   tmux set-option -gq @codex_provider "$DISPLAY_PROVIDER" >/dev/null 2>&1 || true
   tmux set-option -gq @codex_provider_label "$(provider_label_for "$DISPLAY_PROVIDER")" >/dev/null 2>&1 || true
   tmux set-option -gq @codex_scoped_icon "$(icon_for_label "$CACHE_SCOPED_LABEL")" >/dev/null 2>&1 || true
+
+  # Whose numbers these are: the codex_session module draws the label in
+  # front of "S:" when it is non-empty. Claude only — Codex has no accounts
+  # to switch between here — and always the account logged in NOW, even
+  # while the block still holds the previous one's numbers (drawn "--%").
+  local account_label='' account_email=''
+  if [[ "$DISPLAY_PROVIDER" == 'claude' ]]; then
+    load_claude_account
+    account_label="$(claude_account_label)"
+    account_email="$CLAUDE_ACCOUNT_EMAIL"
+  fi
+  tmux set-option -gq @codex_account_label "$account_label" >/dev/null 2>&1 || true
+  tmux set-option -gq @codex_account "$account_email" >/dev/null 2>&1 || true
 
   if [[ "$CACHE_STATE" == "auth_required" ]]; then
     publish_text_and_alias @codex_session_color '' "$AUTH_REQUIRED_COLOR"
@@ -2488,7 +2738,12 @@ login_claude_oauth() {
 #
 # A provider block carries the SAME key names as the root plus its own
 # label/severity/locked/breakdown/file pointers, so a reader written against
-# the root works against a block unchanged. A provider that is not configured
+# the root works against a block unchanged. Claude's block also says whose
+# numbers they are — `account` (the key "Which Claude account" describes) and
+# `account_email` — and a reader that wants to stay right across a cswap
+# switch compares `account` with ~/.claude.json the same way this script does;
+# a status patch leaves both alone, so a failed fetch never relabels the
+# previous account's numbers as the new one's. A provider that is not configured
 # has NO ENTRY — absence, not a state string, is how "draw nothing" is said.
 #
 # Merging, not replacing: a fetch failure for one provider must never blank
@@ -2604,6 +2859,7 @@ write_usage_cache() {
   local tmp
   tmp="$(mktemp "${CACHE_FILE}.tmp.XXXXXX")" || return 1
   if printf '%s\n' "$merged" >"$tmp" 2>/dev/null && mv -f "$tmp" "$CACHE_FILE" 2>/dev/null; then
+    CLAUDE_BLOCK_ACCOUNT_LOADED=0   # the block may now be another account's
     return 0
   fi
   rm -f "$tmp" 2>/dev/null || true
@@ -2699,6 +2955,15 @@ render_provider_block() {
   local breakdown="$FETCH_BREAKDOWN_JSON"
   printf '%s' "$breakdown" | jq -e 'type == "array"' >/dev/null 2>&1 || breakdown='[]'
 
+  # Whose numbers: see "Which Claude account". Null for Codex, and for Claude
+  # when no account could be read.
+  local account='' account_email=''
+  if [[ "$provider" == 'claude' ]]; then
+    load_claude_account
+    account="$CLAUDE_ACCOUNT_KEY"
+    account_email="$CLAUDE_ACCOUNT_EMAIL"
+  fi
+
   RENDER_BLOCK="$(jq -nc \
     --arg provider "$provider" \
     --arg label "$(provider_label_for "$provider")" \
@@ -2735,8 +3000,12 @@ render_provider_block() {
     --arg raw_file "$(basename "$(raw_file_for "$provider")")" \
     --arg history_file "$(basename "$(history_file_for "$provider")")" \
     --argjson fetched_at "$(json_num_or_null "${RENDER_FETCHED_AT:-$updated_at}")" \
+    --arg account "$account" \
+    --arg account_email "$account_email" \
     '{
        provider: $provider, label: $label, state: "ok",
+       account: (if $account == "" then null else $account end),
+       account_email: (if $account_email == "" then null else $account_email end),
        updated_at: $updated_at, checked_at: $updated_at,
        # updated_at: as of when the numbers are current (any source).
        # fetched_at: the last endpoint fetch, which the poll gates on.
@@ -2931,8 +3200,26 @@ merge_live_claude_locked() {
   # written meanwhile differs from it and the next tick picks it up.
   printf '%s\n' "$sample" >"$LIVE_MERGED_MARKER" 2>/dev/null || true
 
+  # A sample stamped for another account is that account's usage.
+  if ! live_sample_is_current_account "$sample"; then
+    log_debug "live[claude]: sample is for another account; ignored"
+    return 0
+  fi
+
   select_provider claude
-  load_fetch_from_block claude || return 0
+  if claude_block_is_other_account; then
+    # The block holds the previous account's numbers, and NOTHING in it may
+    # survive into this account's block — not the fetched numbers, not the
+    # scoped cap, labels, severities or breakdown. Start from empty; the live
+    # numbers alone make the block (scoped reads n/a), and fetched_at 0 keeps
+    # the endpoint poll due so it fills in the rest.
+    reset_fetch_outputs
+    BLOCK_STATE=''
+    BLOCK_UPDATED_AT=0
+    BLOCK_FETCHED_AT=0
+  else
+    load_fetch_from_block claude || return 0
+  fi
 
   local before after now
   before="$FETCH_SESSION_USED $FETCH_SESSION_RESETS_AT $FETCH_WEEKLY_USED $FETCH_WEEKLY_RESETS_AT"
@@ -2982,7 +3269,25 @@ refresh_one_provider() {
   local fetch_ok=0
   case "$provider" in
     claude)
-      if fetch_via_claude_oauth; then
+      # The account is read on both sides of the fetch. The token comes from
+      # the Keychain inside it, and cswap can swap both in between; numbers
+      # that cannot be pinned to one account are dropped rather than stamped
+      # with a guess. FAILURES TOO: a rate_limit_error or auth error answered
+      # to the old token says nothing about the new one, and arming the
+      # ladder for it would undo the reset note_claude_account_switch just
+      # made — five minutes to an hour of the new account showing "--%". So a
+      # switch during the fetch returns with no block, no patch and no
+      # backoff, and the next tick fetches for the new account.
+      local account_before fetched=0
+      read_claude_account
+      account_before="$CLAUDE_ACCOUNT_KEY"
+      fetch_via_claude_oauth && fetched=1
+      read_claude_account
+      if [[ "$CLAUDE_ACCOUNT_KEY" != "$account_before" ]]; then
+        log_info "refresh[claude]: account switched during the fetch (${account_before:-?} -> ${CLAUDE_ACCOUNT_KEY:-?}); discarding it"
+        return 1
+      fi
+      if (( fetched == 1 )); then
         fetch_ok=1
       elif (( FETCH_RATE_LIMITED != 0 )); then
         # Throttled, not broken: leave the block (and its state) exactly as
@@ -3018,8 +3323,13 @@ refresh_one_provider() {
 
   # The endpoint and Claude Code's live numbers are two views of the same
   # counters; whichever saw more usage in the current window is the newer one.
+  # Only a sample for the account just fetched (see "Which Claude account").
   if [[ "$provider" == 'claude' && -f "$LIVE_SAMPLE_FILE" ]]; then
-    apply_claude_live_sample "$(cat "$LIVE_SAMPLE_FILE" 2>/dev/null || true)" "$now"
+    local live_sample
+    live_sample="$(cat "$LIVE_SAMPLE_FILE" 2>/dev/null || true)"
+    if live_sample_is_current_account "$live_sample"; then
+      apply_claude_live_sample "$live_sample" "$now"
+    fi
   fi
   RENDER_FETCHED_AT="$now"
   local rendered=0
@@ -3078,6 +3388,10 @@ refresh_cache() {
     refresh_fail
     return 1
   fi
+
+  # Here too, not only on the tick: a refresh started by the Stop hook
+  # (codexbar-usage-push.sh) can be the first to see a switch.
+  note_claude_account_switch || true
 
   # Every configured provider, each behind its OWN backoff ladder: one that is
   # failing must neither be retried ahead of its ladder nor keep the others
@@ -3211,6 +3525,10 @@ main() {
       fi
 
       : >"$tick_marker" 2>/dev/null || true
+
+      # An account switch (cswap, /login) clears the claude backoff once, so
+      # the refresh due below goes out on THIS tick for the new account.
+      note_claude_account_switch || true
 
       # Best-effort reap of orphaned fetch temp files. The EXIT/INT/TERM/HUP
       # trap cannot run when a worker is SIGKILLed (tmux reports exit 137 /

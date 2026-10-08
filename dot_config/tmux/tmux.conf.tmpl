@@ -210,6 +210,13 @@ set -g @codexbar_auth_required_text "Need to log in"
 # this option has no effect there. Formerly @codexbar_fable_model, which is
 # still read when this is unset.
 set -g @codexbar_scoped_model "Fable"
+# Which Claude account the numbers are for, drawn in front of S: — the cswap
+# alias when one is set, else the login email's local part — cut to this many
+# cells with an ellipsis; 0 hides it. Read from ~/.claude.json, which cswap
+# rewrites on every switch, so the status line never runs cswap. A switch
+# also re-keys the cache: the old account's numbers read "--%" until the new
+# account's arrive, normally on the next tick.
+set -g @codexbar_account_label_max "10"
 
 # Ensure the old inline binding is removed on reload.
 unbind u
@@ -687,7 +694,8 @@ run-shell "#{HOME}/.config/tmux/scripts/continuum-ensure.sh"
 # RIGHT, so the overflow silently ate the trailing `session` module instead of
 # letting the bar grow leftward. The terminal is 272 columns, so there is no
 # real estate problem — only this cap. 200 leaves headroom for the widest reset
-# strings (long weekday+date projections) plus the stash chip.
+# strings (long weekday+date projections), the account label in front of S:
+# (@codexbar_account_label_max + 1), plus the stash chip.
 set -g status-right-length 200
 
 # Messages and prompts as status-bar chips (tmux 3.7 message-format). After

@@ -108,7 +108,11 @@ for pass in 1 2; do
   # EAGER: an unforced --refresh skips providers whose numbers are younger
   # than the poll interval, which is exactly when this runs; this provider
   # just moved, so waive that for it (its backoff still applies).
-  CODEXBAR_USAGE_PROVIDER="$PROVIDER" CODEXBAR_USAGE_EAGER_PROVIDERS="$PROVIDER" \
+  # Without CLAUDE_CONFIG_DIR: a `cswap run N` session hands this hook its
+  # profile dir, but the refresh fetches with the DEFAULT login's token and
+  # must name the account from the default ~/.claude.json to match it.
+  env -u CLAUDE_CONFIG_DIR \
+    CODEXBAR_USAGE_PROVIDER="$PROVIDER" CODEXBAR_USAGE_EAGER_PROVIDERS="$PROVIDER" \
     "$SRC" --refresh >/dev/null 2>&1 || true
   # --refresh already publishes the tmux user options; this makes the status
   # line redraw now rather than at its next status-interval.
