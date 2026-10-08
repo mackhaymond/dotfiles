@@ -11,6 +11,7 @@ It keeps no state and runs only while the popup is open.
 | `1`-`9`, then `01`, `02`, … from the tenth row | go to that row at once and close (see [Number keys](#number-keys)) |
 | Tab / Shift-Tab, `j` / `k`, arrows | move |
 | Space / ⏎ | go there (a parked tab comes back via `stash.sh unstash`) |
+| `p` | peek: the last 15 lines of the selected agent's pane, in a panel over the list; any key closes it (and does nothing else) |
 | `d` | next tab that needs you (same as `prefix d`) |
 | `x` | close the agent's pane through `closed-tabs.sh`, after y/n; CMD+Z undoes it. On a parked row: discard it through `stash.sh kill-many` |
 | `H` | park the tab (`stash.sh stash`, which suspends the agent), after y/n |
@@ -52,7 +53,25 @@ Each row shows: the peach bar (the window this client is on), a state dot in
 the tab bar's hues, the row's hotkey number (NEEDS YOU and filter rows add a
 dim `session:index`, since no session header names theirs), the title
 (`@agent_summary`, else the window name), the gear or mouse glyph, the state,
-and the time since `@agent_since`.
+and the time since `@agent_since`. A NEEDS YOU row whose window carries
+`@agent_detail` adds it after the title, dim, when there is room
+(`perm  Bash git push origin main`, `asks  Which deck…`, `fail  529
+overloaded`, `done  7 fixes applied`); `@agent_detail_kind` gives the word.
+Both options are set by agent-tab-indicator.sh and may be missing, in which
+case the row is as before.
+
+## Peek (`p`)
+
+`p` on a window row runs ONE `tmux capture-pane -p -J -S -15 -t <target>`,
+on demand only (never on the refresh tick), and shows the last 15
+non-blank-tailed lines in a rounded panel over the list (`peek_lines`,
+`Roster.peek_panel`). The target is the window (its active pane); a split
+window (`#{window_panes}` > 1) first asks `agent_pane` which pane runs the
+agent, the same TTY match `x` uses, and falls back to the active pane when it
+cannot tell. Any key closes the peek and does nothing else, and like the y/n
+of `x`/`H`, the key that opened it drops the rest of its read, so a fast `pq`
+leaves the peek open rather than closing the popup. The number labels of the
+list stay as they were last drawn.
 
 ## Number keys
 
@@ -115,8 +134,11 @@ a digit back, any other key drops it and does its own thing.
   (`--client #{client_tty}`). See [Launch speed](#launch-speed).
 - Once a second, while open, and before the first frame: ONE tmux call,
   `list-windows -a -F … \; list-clients -F …` (US-separated fields; client
-  rows are tagged and have 4 fields, window rows 14). NEEDS YOU and the
-  client's current window both come out of that one snapshot.
+  rows are tagged and have 4 fields, window rows 20). NEEDS YOU, the
+  client's current window, each session's current window and its active
+  pane's cwd (the strip's branch), and the `@agent_kind` /
+  `@agent_detail_kind` / `@agent_detail` options all come out of that one
+  snapshot.
 - Moves go through `agent-jump.sh goto|next`: `select-window` then
   `switch-client`, so the visit discharges the tint like a tab click does.
 - `x` finds the agent's pane by TTY, the way the watcher does: `list-panes`
@@ -149,14 +171,119 @@ An always-visible, click-only agent list in a narrow WezTerm split to the
 left of the tmux pane. `CMD+B` (wezterm.lua) opens it, and closes it again if
 the tab already has one. It is this same program, `agent-roster.py --strip`.
 
-- **Layout** (~34 columns): a counts line, a status line, NEEDS YOU, one
-  group per session, `parked (n)`. No numbers (it has no keyboard). Sessions
-  are ordered by **name**, not "current first": a click moves the client, and
-  the popup's order would then reshuffle the list under the mouse.
-- **Mouse only**: SGR mouse reporting (DECSET 1000 + 1006). A left press on a
-  window row goes there (`agent-jump.sh goto`, or `stash.sh unstash` for a
-  parked row); on `parked (n)` it folds/unfolds; the wheel scrolls. A click is
-  resolved against the line as last drawn, and re-checked like a number key.
+- **Layout** (designed for 34-40 columns, any height, **never scrolls**):
+
+  ```
+   AGENTS  ✕1 ◉1 ◐2 ○1                    count bar, zero counts hidden
+   ⏵ next  ☰ menu                         toolbar (or a status / message)
+  ╭ NEEDS YOU ✕1 ◉1 ──────────────────╮
+  │ ✕ ⬢ Prose extraction model    15m │   state · kind · [project/]title · age
+  │   fail  529 overloaded schedule:2 │   detail kind + @agent_detail · where
+  │ ◉ ✳ Notch Tasks Orchestrator   3m │
+  │   perm  Bash git push ori… main:1 │
+  ╰───────────────────────────────────╯
+  ╭ main ⎇ main ◉1 ◐2 ○1 ─────────────╮   session · branch · rollup
+  │ ◉ ✳ Notch Tasks Orchestrator   3m │
+  │ ◐ ✳ Handy.app Speech CLI    ◎  9m │
+  │ ◐ ✳ tmux/Tmux Agent Sidebar    6m │   the current window: a background
+  │ ○ ✳ ~/Lost suit jacket        12m │
+  ╰───────────────────────────────────╯
+  ╭ schedule ✕1 ──────────────────────╮
+  │ ✕ ⬢ Prose extraction model    15m │
+  ╰───────────────────────────────────╯
+                                         (spare rows)
+   ▸ parked 2 · 1 need you · ☰            always the bottom line
+  ```
+
+  NEEDS YOU on top, in `agent-jump.sh list` order (`needs_order`, the same
+  parity-tested list as the popup). Then one box per session, in **name**
+  order (not "current first": a click moves the client, and the popup's
+  order would reshuffle the list under the mouse); inside, agents sorted
+  attention (failed > needs-input > done) > working > idle, then window
+  index. A window that needs you is listed both in NEEDS YOU and in its
+  session, so a box does not change size when an agent asks something.
+  Sessions with no agent (and `agents`, `tasks`, `scratch`, `btop-popup`) are
+  not shown; parked tabs are the one bottom line. Spare rows sit between the
+  last box and `parked`.
+- **Shapes and colours** (shape and colour both carry the state, herdr's
+  rule): failed red `✕`, needs-input yellow `◉`, done green `✓` (finished and
+  unseen; a visit discharges it), working `◐` pulsing pink/blue on
+  `@agent_blink` (the window you are on stays blue), idle grey `○`; workflow
+  teal `⚙` and computer use blue `◎` pulse like the tab glyphs. The colours
+  are not chosen anywhere new: `Roster.shape()` is `dot()` with the glyph
+  swapped and `strip_glyph()` is `glyph()` with ⚙/◎ for the Nerd Font ones,
+  so cua-notch's palette check (section 65, which reads `dot()`/`glyph()`)
+  still covers the strip. A dim `✳` (Claude) or `⬢` (Codex) follows the
+  state when `@agent_kind` is set. Titles: `project/` is kept only if it fits
+  whole in a third of the width, else the title gets everything
+  (`fit_label`).
+- **Branch**: dim `⎇ name` after the session name, when it fits. Read from
+  the session's current window's active-pane cwd by walking up to `.git`:
+  a directory is the git dir, a file (worktree, submodule) points at it with
+  `gitdir:`; `HEAD` gives `ref: refs/heads/<name>`, or a detached sha (shown
+  as 7 chars). Pure file reads, no `git`; cached per cwd for 30 s
+  (`git_head`, `Strip.branch`). It can never stall the strip:
+  - nothing at or under `/Volumes`, `/Network`, `/net`, `/home` is read
+    (`REMOTE_PREFIXES`; an SMB share whose server dropped would hang a stat
+    for the network timeout). A local disk under `/Volumes` shows no branch
+    either; a mount table or `statvfs` check was not used because `statvfs`
+    itself can hang on a dead mount and `mount` is a fork;
+  - `.git` files and `HEAD` are read only if they are regular files, checked
+    with `fstat` on a descriptor opened `O_NONBLOCK` (`read_small`), so a
+    FIFO named HEAD is refused instead of blocking `open()` forever;
+  - each read runs on a daemon thread and a frame waits for it at most 50 ms
+    (`BRANCH_WAIT`). A read that takes longer finishes on its own; until
+    then, and for 10 minutes (`BRANCH_SLOW_TTL`), that cwd keeps its last
+    branch (or none) and starts no new read;
+  - the cache drops expired entries on every insert, so a day of `cd`s does
+    not grow it.
+- **Density ladder** (`LADDER`, `Strip.ladder`). Each frame takes the first
+  step whose plan fits the pane height; each step only removes lines, so a
+  taller pane never shows less:
+
+  | step | what changes |
+  |---|---|
+  | `rich` | full layout, plus a dim second line under a working agent with `@agent_detail_kind` `run` |
+  | `full` | no run lines. NEEDS YOU entries are 2 lines, every session its own box |
+  | `joined` | the boxes share borders: one box, sections split by `├ name ─┤` |
+  | `needs1` | NEEDS YOU entries 1 line each (the detail word, e.g. `perm`, moves before the age) |
+  | `fold` | in each box, 2+ idle agents (never the current window) become one `○○○ 3 idle` row |
+  | `collapseK` | the last K sessions, bottom up, shrink to their header line `├ ▸ bai ○2 ─┤` |
+  | `nobar` | the toolbar goes; a status or message moves onto line 1 |
+  | `cap` | NEEDS YOU keeps as many entries as fit while sessions keep 3 lines, the rest is `… N more · ☰ menu`; then sessions past what fits become `├ … N more sessions ─┤` |
+
+  Nothing is dropped silently: every hidden thing is counted on a line that
+  opens the popup. `StripLadderTests` renders every height 12-80 for 0-40
+  agents (34 columns; every third count at 40) and requires exactly `rows`
+  lines, no line wider than `cols - 1`, box lines exactly that wide, and
+  every NEEDS YOU window and session either on screen or counted. Below 12
+  rows the frame is still exactly the pane, just cut off.
+- **Mouse only**: SGR mouse reporting (DECSET 1000 + 1006). A left press acts
+  on what was drawn at that cell (`Strip.targets`, per line a list of
+  `(x0, x1, action)`):
+
+  | where | does |
+  |---|---|
+  | an agent row (and a run line) | go there (`agent-jump.sh goto`) |
+  | a NEEDS YOU entry, either line | go there |
+  | the `NEEDS YOU` header | `agent-jump.sh next` |
+  | a session header | that session's current window (`window_active`), via goto |
+  | `⏵ next` | `agent-jump.sh next` (prefix d) |
+  | `☰ menu`, `parked`, any `… more` / `idle` fold row | the prefix q popup on the strip's tmux client |
+  | `⟳ restart` (only while the watcher is dead) | respawn the watcher, like `r` in the popup |
+
+  The popup is `tmux display-popup -c <client>` with exactly `bind-key q`'s
+  `/bin/dash` line (`roster_popup_argv`; a test compares it with
+  tmux.conf.tmpl), started with `Popen` in its own session and reaped on the
+  refresh tick, since `display-popup -E` may hold its client until the popup
+  closes. The wheel does nothing. A click is resolved against the frame as
+  last drawn, and a goto re-checks the window like a number key.
+  Every goto (strip clicks, and popup ⏎ / numbers too) passes the session the
+  row belongs to: `agent-jump.sh goto <tty> <win> <session>`. Without it, a
+  window linked into two sessions resolves to the client's current one, so
+  clicking B's header (or B's row) would leave you in A. agent-jump.sh checks
+  that the window is still linked there ("has left … · pick it again"
+  otherwise) and still refuses EXCLUDE sessions.
 - **Focus**: clicking a pane makes WezTerm focus it (and, with the default
   `swallow_mouse_click_on_pane_focus = false`, still delivers the click), and
   every CMD shortcut in wezterm.lua is a `SendKey` to the ACTIVE pane. So each
@@ -176,7 +303,9 @@ the tab already has one. It is this same program, `agent-roster.py --strip`.
   `activate-pane` that fails re-resolves once. A failed `wezterm cli list`
   keeps the client and pane it already had.
 - **Cost**: the same ONE tmux call per second as the popup; `wezterm cli`
-  runs only at start, on a click, on a stray key, or while unresolved. A
+  runs only at start, on a click, on a stray key, or while unresolved; the
+  branch is a few `stat`s and one small read per session cwd every 30 s; a
+  frame (ladder included) renders in ~3 ms with 40 agents. A
   frame identical to the last one written is not written again (popup and
   strip), so an idle strip makes WezTerm repaint nothing; SIGWINCH forces
   a full redraw.

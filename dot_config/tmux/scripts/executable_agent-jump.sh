@@ -5,7 +5,10 @@
 #
 #   agent-jump.sh next <client_tty>          go to the next tab that needs you
 #   agent-jump.sh back <client_tty>          return to where the jumps started
-#   agent-jump.sh goto <client_tty> <win>    go to one window (roster ⏎, clicks)
+#   agent-jump.sh goto <client_tty> <win> [<session>]
+#                                            go to one window (roster ⏎, clicks);
+#                                            <session>: the one the row listed it
+#                                            under (a linked window has several)
 #   agent-jump.sh list                       the needs-you queue, in order:
 #                                            win<TAB>session<TAB>index<TAB>state<TAB>since<TAB>label
 #
@@ -29,9 +32,12 @@
 #   select-window -t =<session>:<win> ; switch-client -c <tty> -t =<session>
 # The session is named explicitly because a window can be LINKED into several
 # sessions, and `display-message -t <win>` resolves it to whichever had the
-# latest activity (often stash). `next` uses the session from its list row;
-# back/goto prefer the client's own session, then the first linked session
-# that is not excluded. The =<session>:<win> target keeps select and switch
+# latest activity (often stash). `next` uses the session from its list row,
+# and so does `goto` when the caller names one (the roster passes the session
+# of the row that was clicked); back and a bare goto prefer the client's own
+# session, then the first linked session that is not excluded. A named session
+# must still hold the window, and is refused like any other if it is an
+# EXCLUDE session. The =<session>:<win> target keeps select and switch
 # in the same session. The hook's #{window_id} is the command's target, so
 # it discharges the right window even before the client arrives, and client-session-changed[1] then
 # runs cua-notch-visit for the notch. The client is checked BEFORE the select:
@@ -193,16 +199,22 @@ case "$mode" in
         # The roster sends parked windows through `stash.sh unstash`, not
         # here; this guard only keeps a stray goto out of EXCLUDE sessions.
         win="${3:-}"
+        sess="${4:-}"
         [ -n "$win" ] || { say "agent-jump: goto needs a window"; exit 0; }
         client_info || { say "agent-jump: client $tty is not attached"; exit 0; }
-        go_to "$win"; rc=$?
+        if [ -n "$sess" ] && ! tmux list-windows -a -F "#{window_id}${US}#{session_name}" 2>/dev/null |
+                GOTO_SESS="$sess" awk -F "$US" -v w="$win" '$1 == w && $2 == ENVIRON["GOTO_SESS"] { f = 1 } END { exit !f }'; then
+            say "agent-jump: $win has left $sess · pick it again"
+            exit 0
+        fi
+        go_to "$win" "$sess"; rc=$?
         if [ "$rc" -eq 2 ]; then refused
         elif [ "$rc" -ne 0 ]; then say "agent-jump: window $win is gone"
         fi
         ;;
 
     *)
-        echo "usage: agent-jump.sh next|back <client_tty> | goto <client_tty> <window> | list" >&2
+        echo "usage: agent-jump.sh next|back <client_tty> | goto <client_tty> <window> [<session>] | list" >&2
         exit 2
         ;;
 esac

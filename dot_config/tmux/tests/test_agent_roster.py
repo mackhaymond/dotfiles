@@ -32,9 +32,10 @@ SAVED_WATCHER_AGE = R.watcher_age
 
 
 def line(session, index, wid, state="", summary="", workflow="", cua="", since="", attached=0, name="zsh",
-         stash_label="", stash_session="", stash_ts=""):
+         stash_label="", stash_session="", stash_ts="", active="0", panes="1", path="", kind="", detail_kind="",
+         detail=""):
     return US.join([session, str(index), wid, name, state, summary, workflow, cua, since, str(attached), "1",
-                    stash_label, stash_session, stash_ts])
+                    stash_label, stash_session, stash_ts, active, panes, path, kind, detail_kind, detail])
 
 
 WINDOWS = "\n".join([
@@ -318,7 +319,7 @@ class ActTests(unittest.TestCase):
 
     def test_goto_closes_popup(self):
         self.assertTrue(self.r.act("enter"))
-        self.assertEqual(self.calls[0][1][2:], ["goto", "/dev/ttys999", "@1"])
+        self.assertEqual(self.calls[0][1][2:], ["goto", "/dev/ttys999", "@1", "main"])
 
 
 class NavTests(unittest.TestCase):
@@ -420,7 +421,7 @@ class HotkeyTests(unittest.TestCase):
         return r
 
     def gotos(self):
-        return [c[1][-1] for c in self.calls if c[0] == "run" and "goto" in c[1]]
+        return [c[1][c[1].index("goto") + 2] for c in self.calls if c[0] == "run" and "goto" in c[1]]
 
     def many(self, n):
         return "\n".join(line("main", i, "@%d" % i, "idle", "w%d" % i) for i in range(1, n + 1))
@@ -658,16 +659,23 @@ class StripTests(unittest.TestCase):
         self.assertFalse(s.handle(["mouse:0:4:%d:M" % y, "mouse:0:4:%d:m" % y], b"\x1b[<0;4;%dM" % y))
         runs = [c[1] for c in self.calls if c[0] == "run"]
         self.assertEqual(runs[0], ["/x/wezterm", "cli", "activate-pane", "--pane-id", "3"])
-        self.assertEqual(runs[1][2:], ["goto", "/dev/ttys004", "@2"])
+        self.assertEqual(runs[1][2:], ["goto", "/dev/ttys004", "@2", "main"])
         self.assertEqual(len(runs), 2)                      # the release does nothing
 
-    def test_click_parked(self):
-        s = self.make()
-        s.handle(["mouse:0:2:%d:M" % self.line_of(s, "parked (1)")])
-        self.assertTrue(s.parked_open)
-        self.lines = [self.strip(l) for l in s.render(34, 20, 1000)]
-        s.handle(["mouse:0:2:%d:M" % self.line_of(s, "proj/Parked")])
-        self.assertIn(("bg", "'%s' unstash '@7' '/dev/ttys004'" % R.STASH), self.calls)
+    def test_click_parked_opens_the_popup(self):
+        popens = []
+        saved = R.subprocess.Popen
+        R.subprocess.Popen = lambda argv, **kw: (popens.append((argv, kw)), self)[1]
+        try:
+            s = self.make()
+            self.assertTrue(self.lines[-1].startswith(" ▸ parked 1"))     # anchored at the bottom
+            s.handle(["mouse:0:2:%d:M" % len(self.lines)])
+        finally:
+            R.subprocess.Popen = saved
+        self.assertEqual(popens[0][0], R.roster_popup_argv("/dev/ttys004"))
+        self.assertTrue(popens[0][1]["start_new_session"])
+        runs = [c[1] for c in self.calls if c[0] == "run"]
+        self.assertEqual([r[2] for r in runs], ["activate-pane"])        # focus back first, no goto
 
     def test_click_on_blank_and_wheel(self):
         s = self.make()
@@ -775,6 +783,539 @@ class StripTests(unittest.TestCase):
                 self.assertLessEqual(R.dwidth(self.strip(l)), cols - 1, (cols, l))
 
 
+def strip_plain(s):
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
+def fleet(n_agents, n_sessions=6, n_needs=None, now=100000, client_win=None, details=True):
+    """A synthetic snapshot: n_agents spread round-robin over n_sessions,
+    states cycling through every kind, the first n_needs of them needing you."""
+    states = ["running", "idle", "idle", "running", "done", "idle", "needs-input", "failed"]
+    rows = []
+    for i in range(n_agents):
+        s = "s%02d-%s" % (i % n_sessions, "x" * (i % 5))
+        st = states[i % len(states)]
+        if n_needs is not None:
+            st = ("needs-input", "failed", "done")[i % 3] if i < n_needs else ("running", "idle")[i % 2]
+        kw = {}
+        if details:
+            kw = {"kind": ("claude", "codex")[i % 2],
+                  "detail_kind": {"needs-input": "perm", "failed": "fail", "done": "done", "running": "run"}.get(st, ""),
+                  "detail": "detail text for agent %d, long enough to clip somewhere" % i}
+        rows.append(line(s, i // n_sessions + 1, "@%d" % (i + 1), st, "proj%d/Agent title number %d" % (i, i),
+                         workflow="1" if i % 11 == 5 else "", cua="1" if i % 13 == 3 else "",
+                         since="%d x" % (now - 37 * i), active="1" if i < n_sessions else "0",
+                         path="/nonexistent/%d" % i, **kw))
+    rows.append(line("stash", 1, "@900", "needs-input", "parked/one"))
+    rows.append(US.join(["", R.CLIENT_TAG, "/dev/ttys999", client_win or "@1"]))
+    return "\n".join(rows)
+
+
+class StripLadderTests(unittest.TestCase):
+    """The strip never scrolls: every frame is exactly the pane, at every
+    height, and whatever does not fit is counted, never silently dropped."""
+
+    def setUp(self):
+        self.saved = R.watcher_age
+        R.watcher_age = lambda: 1.0
+
+    def tearDown(self):
+        R.watcher_age = self.saved
+
+    def strip_for(self, text):
+        s = R.Strip(client="/dev/ttys999")
+        s.load(text)
+        return s
+
+    def check_frame(self, s, cols, rows, now=100000):
+        out = s.render(cols, rows, now)
+        ctx = (cols, rows, s.level)
+        self.assertEqual(len(out), rows, ctx)
+        self.assertEqual(len(s.targets), rows, ctx)
+        plain = [strip_plain(l) for l in out]
+        for l in plain:
+            self.assertNotIn("\x1b", l, ctx)
+            self.assertLessEqual(R.dwidth(l), cols - 1, ctx + (l,))
+            if l and l[0] in "│├╭╰":                       # box lines run exactly to the right border
+                self.assertEqual(R.dwidth(l), cols - 1, ctx + (l,))
+                self.assertIn(l[-1], "│┤╮╯", ctx + (l,))
+        return plain
+
+    def accounted(self, s, plain):
+        """Every NEEDS YOU window and every session is on screen or counted."""
+        needs, groups, _ = s.strip_model(100000)
+        acts = [a for row in s.targets for _, _, a in row]
+        shown_needs = []
+        in_needs = True
+        for i, row in enumerate(s.targets):
+            if plain[i].startswith("├") and "NEEDS YOU" not in plain[i] or plain[i].startswith("╰"):
+                in_needs = False
+            for _, _, a in row:
+                if in_needs and a[0] == "goto":
+                    shown_needs.append(a[1]["id"])
+        more = [int(m.group(1)) for l in plain for m in [re.search(r"… (\d+) more ·", l)] if m]
+        if needs and any("NEEDS YOU" in l for l in plain):
+            self.assertEqual(len(dict.fromkeys(shown_needs)) + sum(more), len(needs), plain)
+        sess = [a[1] for a in acts if a[0] == "session"]
+        smore = [int(m.group(1)) for l in plain for m in [re.search(r"… (\d+) more sessions", l)] if m]
+        self.assertEqual(len(sess) + sum(smore), len(groups), plain)
+        self.assertEqual(sess, sorted(sess))           # name order
+
+    def test_every_height_fits(self):
+        for cols in (34, 40):
+            for n in range(0, 41):
+                s = self.strip_for(fleet(n))
+                for rows in range(12, 81):
+                    plain = self.check_frame(s, cols, rows)
+                    self.accounted(s, plain)
+
+    def test_odd_widths_fit(self):
+        s = self.strip_for(fleet(40, n_needs=12))
+        for cols in (20, 28, 37, 38, 60):
+            for rows in (12, 24, 40, 74):
+                self.check_frame(s, cols, rows)
+
+    def test_tiny_heights_still_exact(self):
+        s = self.strip_for(fleet(30, n_needs=9))
+        for rows in range(1, 12):
+            self.assertEqual(len(s.render(34, rows, 100000)), rows)
+
+    def test_ladder_steps_in_order(self):
+        # Heavy: 15 agents, 6 sessions, 5 needing you. Taller never shows less.
+        s = self.strip_for(fleet(15, n_needs=5))
+        order = ["rich", "full", "joined", "needs1", "fold"]
+        seen = []
+        last_lines = None
+        for rows in range(80, 11, -1):
+            plain = self.check_frame(s, 38, rows)
+            seen.append(s.level)
+            content = sum(1 for l in plain if l.strip())
+            if last_lines is not None:
+                self.assertLessEqual(content, last_lines + 0, rows)   # shrinking the pane never adds content
+            last_lines = content
+        steps = list(dict.fromkeys(seen))
+        idx = [order.index(x) if x in order else len(order) for x in steps]
+        self.assertEqual(idx, sorted(idx), steps)
+        self.assertIn("cap", steps)
+
+    def test_needs_detail_two_lines_then_one(self):
+        s = self.strip_for(fleet(15, n_needs=5))
+        tall = self.check_frame(s, 38, 74)
+        self.assertIn(s.level, ("rich", "full"))
+        i = next(i for i, l in enumerate(tall) if "NEEDS YOU" in l)
+        self.assertRegex(tall[i + 2], r"│   (perm|fail|done)  detail text")
+        self.assertRegex(tall[i + 2], r"s\d\d-x*:\d │$")              # where it is, right-aligned
+        short = self.check_frame(s, 38, 24)
+        self.assertNotIn("detail text", "".join(short))
+        self.assertTrue(any(re.search(r"(perm|fail|done) +\d+[smhd] │", l) for l in short), short)
+
+    def test_overflow_says_how_many(self):
+        s = self.strip_for(fleet(40, n_needs=30))
+        plain = self.check_frame(s, 34, 14)
+        self.assertEqual(s.level, "cap")
+        self.assertTrue(any(re.search(r"… \d+ more · ☰ menu", l) for l in plain), plain)
+        self.assertTrue(any(re.search(r"… \d+ more sessions", l) for l in plain), plain)
+        self.accounted(s, plain)
+
+    def test_nothing_running(self):
+        s = self.strip_for(US.join(["", R.CLIENT_TAG, "/dev/ttys999", "@1"]))
+        plain = self.check_frame(s, 34, 20)
+        self.assertIn("no agents running", "".join(plain))
+        self.assertIn("no agents", plain[0])
+
+
+class StripLayoutTests(unittest.TestCase):
+    """Ordering, shapes, rollups and click targets of the strip's frame."""
+    TEXT = "\n".join([
+        line("zeta", 1, "@1", "idle", "z/idle one", since="900 idle", active="1"),
+        line("zeta", 2, "@2", "running", "z/working", since="950 running", kind="codex"),
+        line("zeta", 3, "@3", "needs-input", "z/asking", since="980 needs-input", kind="claude",
+             detail_kind="ask", detail="Which deck should I use?"),
+        line("alpha", 4, "@4", "idle", "a/four", since="10 idle"),
+        line("alpha", 2, "@5", "done", "a/done", since="20 done", active="1", detail_kind="done",
+             detail="7 fixes applied"),
+        line("alpha", 1, "@6", "failed", "a/failed", since="30 failed", detail_kind="fail", detail="529 overloaded"),
+        line("alpha", 3, "@7", "running", "a/flow", since="40 running", workflow="1"),
+        line("alpha", 5, "@8", "", "", name="zsh"),                         # plain shell: not shown
+        line("tasks", 1, "@9", "running", "broker"),                        # hidden session
+        line("stash", 1, "@10", "", "", stash_label="p/parked"),
+        US.join(["", R.CLIENT_TAG, "/dev/ttys999", "@2"])])
+
+    def setUp(self):
+        self.calls = []
+        self.saved = (R.run_bg, R.subprocess.run, R.subprocess.Popen, R.tmux, R.watcher_age)
+        R.run_bg = lambda cmd: self.calls.append(("bg", cmd))
+        R.watcher_age = lambda: 1.0
+
+        class Snap:                     # the refresh after a move: the same snapshot again
+            returncode, stdout = 0, self.TEXT
+        R.tmux = lambda *a: Snap
+
+        class Ok:
+            returncode, stdout = 0, ""
+
+            @staticmethod
+            def poll():
+                return 0
+        R.subprocess.run = lambda argv, **kw: (self.calls.append(("run", list(argv))), Ok)[1]
+        R.subprocess.Popen = lambda argv, **kw: (self.calls.append(("popen", list(argv))), Ok)[1]
+        self.s = R.Strip(client="/dev/ttys999")
+        self.s.load(self.TEXT)
+        self.plain = [strip_plain(l) for l in self.s.render(38, 40, 1000)]
+
+    def tearDown(self):
+        R.run_bg, R.subprocess.run, R.subprocess.Popen, R.tmux, R.watcher_age = self.saved
+
+    def at(self, text):
+        return next(i + 1 for i, l in enumerate(self.plain) if text in l)
+
+    def test_order(self):
+        needs, groups, parked = self.s.strip_model(1000)
+        self.assertEqual([w["id"] for w in needs], self.s.needs)            # needs_order, unchanged
+        self.assertEqual([w["id"] for w in needs], ["@6", "@3", "@5"])
+        self.assertEqual([g["name"] for g in groups], ["alpha", "zeta"])     # by name, tasks/stash never
+        self.assertEqual([w["id"] for w in groups[0]["rows"]], ["@6", "@5", "@7", "@4"])   # rank, then index
+        self.assertEqual([w["id"] for w in groups[1]["rows"]], ["@3", "@2", "@1"])
+        self.assertEqual([w["id"] for w in parked], ["@10"])
+        self.assertEqual(self.s.level, "rich")
+        self.assertLess(self.at("NEEDS YOU"), self.at("╰"))
+        self.assertLess(self.at("alpha"), self.at("zeta"))
+
+    def test_shapes_and_rollups(self):
+        self.assertIn("✕1 ◉1 ✓1 ◐2 ○2", self.plain[0])                     # global count bar
+        self.assertRegex(self.plain[self.at("alpha ") - 1], r"╭ alpha ✕1 ✓1 ◐1 ○1 ─+╮")
+        self.assertRegex(self.plain[self.at("zeta ") - 1], r"╭ zeta ◉1 ◐1 ○1 ─+╮")
+        self.assertRegex(self.plain[self.at("a/flow") - 1], r"│ ◐ a/flow +⚙ +\S+ │")
+        self.assertRegex(self.plain[self.at("z/working") - 1], r"│ ◐ ⬢ z/working")       # kind glyph
+        self.assertRegex(self.plain[self.at("z/asking") - 1], r"│ ◉ ✳ z/asking")
+        self.assertRegex(self.plain[self.at("z/asking")], r"^│   asks  Which deck should… +zeta:3 │$")
+        self.assertIn("│   fail  529 overloaded", self.plain[self.at("a/failed")])
+
+    def test_shape_colour_is_dots_colour(self):
+        # The palette is checked on dot()/glyph(); shape() must only swap the glyph.
+        for w in self.s.windows:
+            d, sh = self.s.dot(w, True), self.s.shape(w, True)
+            if R.cat(w):
+                self.assertEqual(sh[:-1], d[:-1], w["id"])
+                self.assertEqual(sh[-1], R.CAT_GLYPH[R.cat(w)])
+        r = R.Roster("/dev/ttys999")
+        for st, c in (("failed", "failed"), ("needs-input", "needs-input"), ("done", "done"), ("idle", "idle")):
+            w = R.parse_windows(line("m", 1, "@50", st, "x"))[0]
+            self.assertEqual(r.dot(w, True)[:-1], R.fg(R.CAT_HUE[c]))
+        w = R.parse_windows(line("m", 1, "@50", "running", "x"))[0]
+        self.assertEqual(r.dot(w, True)[:-1], R.fg(R.CAT_HUE["working"]))     # the pulse's pink half
+
+    def test_current_window_row_has_a_background(self):
+        raw = self.s.render(38, 40, 1000)
+        rows = [l for l in raw if "z/working" in strip_plain(l)]
+        self.assertTrue(rows and all(R.bg("surface0") in l for l in rows))
+        self.assertFalse(any(R.bg("surface0") in l for l in raw if "a/four" in strip_plain(l)))
+
+    def actions(self):
+        return {i + 1: [a for _, _, a in row] for i, row in enumerate(self.s.targets)}
+
+    def test_every_clickable_line_maps(self):
+        acts = self.actions()
+        for y, l in enumerate(self.plain, 1):
+            if not l.strip():
+                self.assertEqual(acts[y], [], y)
+            kinds = [a[0] for a in acts[y]]
+            if "NEEDS YOU" in l:
+                self.assertEqual(kinds, ["next"])
+            elif l.startswith(("╭", "├")):
+                self.assertEqual(acts[y], [("session", l.split()[1])], l)
+            elif l.startswith("│"):
+                self.assertEqual(kinds, ["goto"], l)
+                w = acts[y][0][1]
+                title = w["label"].split("/", 1)[1]
+                if not l.startswith("│   "):                         # a NEEDS YOU second line names no title
+                    self.assertIn(title, l)
+            elif "parked" in l:
+                self.assertEqual(kinds, ["menu"])
+        # the toolbar: two targets on one line
+        self.assertEqual(self.s.target(2, 2), ("next",))
+        self.assertEqual(self.s.target(11, 2), ("menu",))
+        self.assertIsNone(self.s.target(3, 1))                     # the count bar does nothing
+        # both lines of a NEEDS YOU entry go to it
+        y = self.at("z/asking")
+        self.assertEqual(self.s.target(5, y)[1]["id"], "@3")
+        self.assertEqual(self.s.target(5, y + 1)[1]["id"], "@3")
+
+    def click(self, x, y):
+        self.calls.clear()
+        self.s.handle(["mouse:0:%d:%d:M" % (x, y)], b"\x1b[<0;%d;%dM" % (x, y))
+
+    def test_clicks_run_the_right_thing(self):
+        self.click(5, self.at("a/four"))
+        self.assertEqual(self.calls[0][1][2:], ["goto", "/dev/ttys999", "@4", "alpha"])
+        self.click(5, self.at("alpha "))                          # header: that session's current window
+        self.assertEqual(self.calls[0][1][2:], ["goto", "/dev/ttys999", "@5", "alpha"])
+        self.click(3, 2)                                           # ⏵ next
+        self.assertEqual(self.calls[0][1][2:], ["next", "/dev/ttys999"])
+        self.click(12, 2)                                          # ☰ menu
+        self.assertEqual(self.calls, [("popen", R.roster_popup_argv("/dev/ttys999"))])
+        self.click(5, self.at("NEEDS YOU"))
+        self.assertEqual(self.calls[0][1][2:], ["next", "/dev/ttys999"])
+        self.click(5, len(self.plain))                             # parked
+        self.assertEqual(self.calls[0][0], "popen")
+        self.click(5, len(self.plain) - 1)                         # the blank gap: nothing
+        self.assertEqual(self.calls, [])
+
+    def test_linked_window_goes_to_the_session_clicked(self):
+        # @20 is linked into alpha AND zeta: each box's row and header name its own session.
+        text = "\n".join([line("alpha", 1, "@20", "running", "l/linked", active="1"),
+                          line("zeta", 7, "@20", "running", "l/linked", active="1"),
+                          US.join(["", R.CLIENT_TAG, "/dev/ttys999", "@20"])])
+        R.tmux = lambda *a: type("Snap", (), {"returncode": 0, "stdout": text})
+        self.s.load(text)
+        self.plain = [strip_plain(l) for l in self.s.render(38, 30, 1000)]
+        rows = [i + 1 for i, l in enumerate(self.plain) if "l/linked" in l]
+        self.click(5, rows[1])                                      # the row in zeta's box
+        self.assertEqual(self.calls[0][1][2:], ["goto", "/dev/ttys999", "@20", "zeta"])
+        self.click(5, rows[0])
+        self.assertEqual(self.calls[0][1][2:], ["goto", "/dev/ttys999", "@20", "alpha"])
+        self.click(5, self.at("zeta "))                             # zeta's header
+        self.assertEqual(self.calls[0][1][2:], ["goto", "/dev/ttys999", "@20", "zeta"])
+
+    def test_watcher_restart_is_clickable(self):
+        R.watcher_age = lambda: None
+        plain = [strip_plain(l) for l in self.s.render(38, 40, 1000)]
+        self.assertIn("watcher off", plain[1])
+        self.click(3, 2)
+        self.assertEqual(self.calls, [("bg", "bash '%s'" % R.WATCHER)])
+
+    def test_menu_is_the_prefix_q_binding(self):
+        cmd = next(l for l in TMUX_CONF.read_text().splitlines() if l.startswith("bind-key q "))
+        m = re.search(r"display-popup (.*) /bin/dash -c '(.*)' '\{\{ \.chezmoi\.homeDir \}\}/\.config/tmux/scripts/"
+                      r"agent-roster\.py' '#\{client_tty\}'\"$", cmd)
+        self.assertIsNotNone(m, cmd)
+        flags, script = m.group(1), m.group(2).replace('\\"', '"').replace("\\$", "$")
+        argv = R.roster_popup_argv("/dev/ttysX", prefix="/opt/homebrew")
+        self.assertEqual(argv[:4], ["tmux", "display-popup", "-c", "/dev/ttysX"])
+        self.assertEqual(" ".join(argv[4:11]), flags.replace("-c '#{client_tty}' ", "").replace("' agents '", " agents "))
+        self.assertEqual(argv[11:13], ["/bin/dash", "-c"])
+        self.assertEqual(argv[13], script.replace("{{ .homebrew_prefix }}", "/opt/homebrew"))
+        self.assertEqual(argv[14:], [os.path.join(R.SCRIPTS, "agent-roster.py"), "/dev/ttysX"])
+
+    def test_fold_and_collapse(self):
+        text = "\n".join([line("big", i, "@%d" % i, "idle", "p/idle %d" % i, active="1" if i == 1 else "0")
+                          for i in range(1, 11)] + [US.join(["", R.CLIENT_TAG, "/dev/ttys999", "@1"])])
+        s = R.Strip(client="/dev/ttys999")
+        s.load(text)
+        plain = [strip_plain(l) for l in s.render(34, 12, 1000)]
+        self.assertEqual(s.level, "fold")
+        self.assertTrue(any("○○○○○○ 9 idle" in l for l in plain), plain)   # the current window stays a row
+        self.assertEqual(s.target(5, next(i for i, l in enumerate(plain, 1) if "9 idle" in l)), ("menu",))
+        self.assertTrue(any("p/idle 1" in l for l in plain))
+
+
+class BranchTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.d = Path(tempfile.mkdtemp(prefix="roster-git-"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def repo(self, name, head):
+        g = self.d / name / ".git"
+        g.mkdir(parents=True)
+        (g / "HEAD").write_text(head)
+        return self.d / name
+
+    def test_branch_from_a_subdirectory(self):
+        r = self.repo("main", "ref: refs/heads/feat/strip\n")
+        (r / "a/b").mkdir(parents=True)
+        self.assertEqual(R.git_head(str(r / "a/b")), "feat/strip")
+
+    def test_worktree_git_file(self):
+        r = self.repo("main", "ref: refs/heads/main\n")
+        wt_git = r / ".git/worktrees/wt"
+        wt_git.mkdir(parents=True)
+        (wt_git / "HEAD").write_text("ref: refs/heads/wt-branch\n")
+        wt = self.d / "wt"
+        (wt / "sub").mkdir(parents=True)
+        (wt / ".git").write_text("gitdir: ../main/.git/worktrees/wt\n")            # relative
+        self.assertEqual(R.git_head(str(wt / "sub")), "wt-branch")
+        (wt / ".git").write_text("gitdir: %s\n" % wt_git)                           # absolute
+        self.assertEqual(R.git_head(str(wt)), "wt-branch")
+
+    def test_detached_and_none(self):
+        r = self.repo("det", "0123456789abcdef0123456789abcdef01234567\n")
+        self.assertEqual(R.git_head(str(r)), "0123456")
+        (self.d / "plain").mkdir()
+        self.assertEqual(R.git_head(str(self.d / "plain")) in ("", R.git_head(str(self.d))), True)
+        self.assertEqual(R.git_head(""), "")
+        self.assertEqual(R.git_head("relative/path"), "")
+        bad = self.d / "bad"
+        bad.mkdir()
+        (bad / ".git").write_text("not a gitdir line\n")
+        self.assertEqual(R.git_head(str(bad)), "")
+
+    def test_cached_per_cwd_for_30s(self):
+        r = self.repo("c", "ref: refs/heads/one\n")
+        s = R.Strip(client="/dev/ttys999")
+        self.assertEqual(s.branch(str(r), 1000), "one")
+        (r / ".git/HEAD").write_text("ref: refs/heads/two\n")
+        self.assertEqual(s.branch(str(r), 1029), "one")                # cached
+        self.assertEqual(s.branch(str(r), 1030), "two")                # 30 s on: read again
+
+    def test_fifo_head_never_blocks(self):
+        import threading
+        r = self.repo("fifo", "")
+        (r / ".git/HEAD").unlink()
+        os.mkfifo(str(r / ".git/HEAD"))                                  # open() on it would block forever
+        wt = self.d / "wt"
+        wt.mkdir()
+        os.mkfifo(str(wt / ".git"))                                      # a FIFO .git is not a gitdir file either
+        out = []
+        t = threading.Thread(target=lambda: out.extend([R.git_head(str(r)), R.git_head(str(wt))]), daemon=True)
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "git_head blocked on a FIFO")
+        self.assertEqual(out, ["", ""])
+
+    def test_remote_mounts_are_never_read(self):
+        reads = []
+        saved = R.git_head
+        R.git_head = lambda cwd: (reads.append(cwd), "x")[1]
+        try:
+            s = R.Strip(client="/dev/ttys999")
+            for p in ("/Volumes/share/repo", "/Network/Servers/x", "/net/host/x", "/Volumes"):
+                self.assertEqual(s.branch(p, 1000), "", p)
+        finally:
+            R.git_head = saved
+        self.assertEqual(reads, [])
+        self.assertEqual(R.git_head("/Volumes/share/repo"), "")         # git_head refuses them itself too
+
+    def test_slow_read_never_stalls_a_frame(self):
+        import threading
+        import time
+        gate, reads = threading.Event(), []
+        saved = R.git_head
+
+        def slow(cwd):
+            reads.append(cwd)
+            gate.wait(5)
+            return "late"
+        R.git_head = slow
+        try:
+            s = R.Strip(client="/dev/ttys999")
+            t0 = time.time()
+            self.assertEqual(s.branch("/slow/disk", 1000), "")
+            self.assertEqual(s.branch("/slow/disk", 1001), "")          # still reading: no second read
+            self.assertLess(time.time() - t0, 1.0)
+            self.assertEqual(len(reads), 1)
+            gate.set()
+            s.branch_reads["/slow/disk"][0].join(5)
+            self.assertEqual(s.branch("/slow/disk", 1002), "late")       # the late answer is used
+            self.assertEqual(len(reads), 1)
+        finally:
+            gate.set()
+            R.git_head = saved
+
+    def test_cache_is_pruned(self):
+        saved = R.git_head
+        R.git_head = lambda cwd: "b"
+        try:
+            s = R.Strip(client="/dev/ttys999")
+            for i in range(50):
+                s.branch("/d/%d" % i, 1000)
+            self.assertEqual(len(s.branches), 50)
+            s.branch("/d/new", 1000 + R.BRANCH_TTL)                      # every old entry expired
+            self.assertEqual(list(s.branches), ["/d/new"])
+        finally:
+            R.git_head = saved
+
+    def test_branch_shows_in_the_session_header(self):
+        r = self.repo("h", "ref: refs/heads/feature\n")
+        text = "\n".join([line("proj", 1, "@1", "running", "p/t", active="1", path=str(r)),
+                          US.join(["", R.CLIENT_TAG, "/dev/ttys999", "@1"])])
+        s = R.Strip(client="/dev/ttys999")
+        s.load(text)
+        saved = R.watcher_age
+        R.watcher_age = lambda: 1.0
+        try:
+            plain = [strip_plain(l) for l in s.render(38, 20, 1000)]
+        finally:
+            R.watcher_age = saved
+        self.assertTrue(any(re.match(r"╭ proj ⎇ feature ◐1 ─+╮$", l) for l in plain), plain)
+
+
+class FitLabelTests(unittest.TestCase):
+    def test_fit(self):
+        self.assertEqual(R.fit_label("proj/Title", 20), ("proj/", "Title"))
+        self.assertEqual(R.fit_label("~/Lost suit jacket here", 15), ("~/", "Lost suit ja…"))
+        self.assertEqual(R.fit_label("math_econ_sched/Prose extraction", 20), ("", "Prose extraction"))
+        self.assertEqual(R.fit_label("no slash at all", 8), ("", "no slas…"))
+        self.assertEqual(R.fit_label("/abs/path", 20), ("", "/abs/path"))
+        self.assertEqual(R.fit_label("a\tb/c", 20), ("a b/", "c"))
+
+
+class PeekTests(unittest.TestCase):
+    """`p` in the popup: one capture-pane on demand, any key closes it."""
+
+    def setUp(self):
+        self.calls = []
+        self.saved = (R.tmux, R.agent_pane, R.watcher_age)
+        R.watcher_age = lambda: 1.0
+
+        class Cap:
+            returncode = 0
+            stdout = "".join("line %d\n" % i for i in range(1, 31)) + "\n\n"
+        R.tmux = lambda *a: (self.calls.append(a), Cap)[1]
+        R.agent_pane = lambda win: (self.calls.append(("pane", win)), ("%42", None))[1]
+        self.r = R.Roster("/dev/ttys999")
+        self.r.windows = R.parse_windows("\n".join([
+            line("main", 1, "@1", "idle", "one"),
+            line("main", 2, "@2", "needs-input", "two", panes="2", detail_kind="perm", detail="Bash rm -rf build")]))
+        self.r.needs, self.r.cur_win = ["@2"], "@1"
+        self.r.rebuild()
+
+    def tearDown(self):
+        R.tmux, R.agent_pane, R.watcher_age = self.saved
+
+    def test_peek_one_pane_window(self):
+        self.assertFalse(self.r.handle(["p"]))
+        self.assertEqual(self.calls, [("capture-pane", "-p", "-J", "-S", "-15", "-t", "@1")])
+        self.assertEqual(self.r.peek["lines"], ["line %d" % i for i in range(16, 31)])   # trailing blanks gone
+        frame = [strip_plain(l) for l in self.r.render(80, 30, 1000)]
+        self.assertTrue(any(l.startswith("╭─ peek · main:1 one") for l in frame), frame)
+        self.assertIn("│ line 30", "\n".join(frame))
+        self.assertIn("any key closes the peek", frame[-1])
+        self.calls.clear()
+        self.assertFalse(self.r.handle(["enter"]))          # closes, and only closes
+        self.assertIsNone(self.r.peek)
+        self.assertEqual(self.calls, [])
+
+    def test_peek_split_window_finds_the_agent(self):
+        self.r.move(-10)                                     # top row: NEEDS YOU, @2 (two panes)
+        self.r.handle(["p"])
+        self.assertEqual(self.calls[0], ("pane", "@2"))
+        self.assertEqual(self.calls[1][-2:], ("-t", "%42"))
+
+    def test_peek_drops_the_rest_of_its_batch(self):
+        self.assertFalse(self.r.handle(["p", "q"]))          # a fast "pq" must not close the popup
+        self.assertIsNotNone(self.r.peek)
+        self.assertFalse(self.r.handle(["q"]))               # q closes the peek, not the popup
+        self.assertIsNone(self.r.peek)
+        self.assertTrue(self.r.handle(["q"]))
+
+    def test_capture_failure_is_said(self):
+        R.tmux = lambda *a: None
+        self.r.handle(["p"])
+        self.assertIsNone(self.r.peek)
+        self.assertIn("can't capture", self.r.msg)
+
+    def test_needs_row_shows_detail(self):
+        frame = [strip_plain(l) for l in self.r.render(120, 30, 1000)]
+        row = next(l for l in frame if "main:2" in l)
+        self.assertRegex(row, r"two  perm  Bash rm -rf build")
+        narrow = [strip_plain(l) for l in self.r.render(40, 30, 1000)]
+        self.assertFalse(any("perm" in l for l in narrow))   # no room: the title keeps it
+
+
 FAKE_SLOW_TMUX = """#!/bin/sh
 # list-windows: the first call answers frame A at once; every later call
 # sleeps (a slow refresh) and answers frame B. Anything else is ignored.
@@ -840,7 +1381,7 @@ class MainLoopTests(unittest.TestCase):
                 os.waitpid(pid, 0)
             os.close(fd)
             log = (d / "jump.log").read_text() if (d / "jump.log").exists() else ""
-            self.assertEqual(log.split(), ["goto", "/dev/ttys999", "@1"], log)   # frame B's row 1 is @2
+            self.assertEqual(log.split(), ["goto", "/dev/ttys999", "@1", "main"], log)   # frame B's row 1 is @2
             self.assertIsNotNone(status, "the popup did not close")
         finally:
             shutil.rmtree(d, ignore_errors=True)

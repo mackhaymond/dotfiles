@@ -2,9 +2,13 @@
 """agent-roster.py: prefix q, every agent across every tmux session in one popup.
 
 A READER of the state the hook pipeline already keeps on each window
-(@agent_state, @agent_summary, @agent_workflow, @agent_cua, @agent_since; see
-docs/agent-tab-indicator.md). It holds no state of its own and runs only while
-the popup is open: ONE tmux call a second (`list-windows -a \\; list-clients`).
+(@agent_state, @agent_summary, @agent_workflow, @agent_cua, @agent_since,
+@agent_kind, @agent_detail_kind, @agent_detail; see
+docs/agent-tab-indicator.md; the last three may be unset, and everything
+degrades to the old rows without them). It holds no state of its own and
+runs only while the popup is open: ONE tmux call a second (`list-windows -a
+\\; list-clients`). `p` peeks at the selected agent's pane (one capture-pane,
+on demand; any key closes it).
 
     agent-roster.py --client <client_tty>
     agent-roster.py --strip [--tmux-pane <id>] [--wezterm <path>]   (see Strip)
@@ -51,6 +55,7 @@ Every move goes through agent-jump.sh (`goto`/`next`): select-window THEN
 switch-client, so the visit discharges the tint the same way a tab click does.
 """
 import codecs
+import functools
 import os
 import re
 import select
@@ -96,13 +101,22 @@ GEAR = "\U000F0493"   # nf-md-cog: background workflow / subagent
 MOUSE = "\U000F037D"  # nf-md-mouse: driving an app through cua-driver
 
 FIELDS = ["session", "index", "id", "name", "state", "summary", "workflow", "cua",
-          "since", "last_attached", "blink", "stash_label", "stash_session", "stash_ts"]
+          "since", "last_attached", "blink", "stash_label", "stash_session", "stash_ts",
+          "active", "panes", "path", "kind", "detail_kind", "detail"]
+# The last six: window_active and pane_current_path (the window's active pane)
+# give the strip each session's current window and its git branch;
+# window_panes says whether a peek must look for the agent pane; @agent_kind
+# (claude|codex), @agent_detail_kind (perm|ask|fail|done|run) and @agent_detail
+# (one sanitized line, <= 80 chars) are set by agent-tab-indicator.sh and may
+# be empty on any window.
 FMT = US.join(["#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}",
                "#{@agent_state}", "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}",
                "#{@agent_since}", "#{session_last_attached}", "#{@agent_blink}",
-               "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}"])
+               "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}",
+               "#{window_active}", "#{window_panes}", "#{pane_current_path}",
+               "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}"])
 # Rides in the same tmux call as FMT, after a `;`. Four fields where a window
-# row has fourteen, so parse_windows skips it and parse_clients takes only it.
+# row has twenty, so parse_windows skips it and parse_clients takes only it.
 CLIENT_TAG = "client"
 CLIENT_FMT = US.join(["", CLIENT_TAG, "#{client_tty}", "#{window_id}"])
 
@@ -151,6 +165,7 @@ def parse_windows(text):
         parked = w["session"] == HOLD
         w["label"] = (parked and w["stash_label"]) or w["summary"] or w["name"]
         w["stash_t"] = int(w["stash_ts"]) if w["stash_ts"].isdigit() else None
+        w["panes"] = int(w["panes"]) if w["panes"].isdigit() else 1
         out.append(w)
     return out
 
@@ -242,6 +257,152 @@ def rank(w):
     if in_flight(w):
         return 3
     return 4 if w["state"] else 9
+
+
+# The strip's state SHAPES (herdr's idea: shape and colour both carry the
+# state). Colours are never chosen here: Roster.shape() takes dot()'s colour
+# and swaps the glyph, so the palette check (cua-notch section 65) still reads
+# the one mapping. CAT_HUE is only for the static count tokens; a test pins
+# it to dot()'s colours.
+CATS = ("failed", "needs-input", "done", "working", "idle")
+CAT_GLYPH = {"failed": "✕", "needs-input": "◉", "done": "✓", "working": "◐", "idle": "○"}
+CAT_HUE = {"failed": "red", "needs-input": "yellow", "done": "green", "working": "pink", "idle": "overlay"}
+KIND_GLYPH = {"claude": "✳", "codex": "⬢"}
+DETAIL_WORD = {"perm": "perm", "ask": "asks", "fail": "fail", "done": "done", "run": "run"}
+STATE_WORDS = {"failed": "failed", "needs-input": "waiting on you", "done": "done"}
+STRIP_GEAR, STRIP_MOUSE = "⚙", "◎"
+
+
+def cat(w):
+    """The count bucket a window falls in (CATS), or None for a plain shell."""
+    if is_attn(w):
+        return w["state"]
+    if in_flight(w):
+        return "working"
+    return "idle" if w["state"] else None
+
+
+def counts(ws):
+    """[(cat, n)] in CATS order, zero counts dropped. Each window id once."""
+    seen, n = set(), {}
+    for w in ws:
+        c = cat(w)
+        if c and w["id"] not in seen:
+            seen.add(w["id"])
+            n[c] = n.get(c, 0) + 1
+    return [(c, n[c]) for c in CATS if n.get(c)]
+
+
+def count_tokens(cs):
+    """counts() → (ansi, cells): `✕1 ◉2 ◐4`, coloured per state."""
+    parts = ["%s%s%d" % (fg(CAT_HUE[c]), CAT_GLYPH[c], k) for c, k in cs]
+    return " ".join(parts), sum(1 + len(str(k)) for _, k in cs) + max(0, len(cs) - 1)
+
+
+# Where a stat can hang for a network timeout (SMB/AFP/NFS mounts, autofs):
+# no branch is read under these at all. A local disk under /Volumes loses its
+# branch too; that is the price of never asking a dead share.
+REMOTE_PREFIXES = ("/Volumes/", "/Network/", "/net/", "/home/", "/System/Volumes/Data/home/")
+
+
+def maybe_remote(path):
+    """True for a path at or under REMOTE_PREFIXES (`/Volumes` itself too)."""
+    return (path.rstrip("/") + "/").startswith(REMOTE_PREFIXES)
+
+
+def read_small(path):
+    """The first line of a REGULAR file, read without blocking, else None.
+    A FIFO named HEAD would block open() forever; O_NONBLOCK plus the S_ISREG
+    check (on the open fd, so a swap in between cannot slip past) refuse it."""
+    import stat
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, 4096)
+    finally:
+        os.close(fd)
+    return data.decode("utf-8", "replace").split("\n", 1)[0].strip()
+
+
+def git_head(cwd):
+    """The branch checked out at `cwd` (or the short sha when detached), or
+    "". Pure file reads, no git fork: walk up to the first `.git`; a
+    directory is the git dir, a FILE (worktree, submodule) says
+    `gitdir: <path>`, relative to the directory holding it. Never under
+    REMOTE_PREFIXES; HEAD and the .git file only if regular files (read_small).
+    Can still be slow on a sick local disk: Strip.branch runs it off the UI
+    thread."""
+    if not cwd or maybe_remote(cwd):
+        return ""
+    d = cwd
+    for _ in range(64):
+        if not d or not os.path.isabs(d):
+            return ""
+        dot = os.path.join(d, ".git")
+        try:
+            if os.path.isdir(dot):
+                gitdir = dot
+            elif os.path.isfile(dot):
+                first = read_small(dot) or ""
+                if not first.startswith("gitdir:"):
+                    return ""
+                gitdir = first[len("gitdir:"):].strip()
+                if not os.path.isabs(gitdir):
+                    gitdir = os.path.normpath(os.path.join(d, gitdir))
+                if maybe_remote(gitdir):
+                    return ""
+            else:
+                up = os.path.dirname(d)
+                if up == d:
+                    return ""
+                d = up
+                continue
+            head = read_small(os.path.join(gitdir, "HEAD"))
+            if head is None:
+                return ""
+        except (OSError, ValueError):
+            # ValueError: a NUL in a corrupt/hostile `.git` gitdir line makes
+            # os.open raise "embedded null byte"; uncaught, the branch thread's
+            # traceback would print into the strip's raw-mode pane.
+            return ""
+        if head.startswith("ref:"):
+            ref = head[4:].strip()
+            return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+        return head[:7]
+    return ""
+
+
+def fit_label(label, width):
+    """`proj/Title` into `width` cells → (proj, title), title clipped.
+    The title wins: when both do not fit, the project (with its `/`) stays
+    only if it fits WHOLE in a third of the width; a half project
+    (`math_ec…`) says nothing the session box does not. No slash: all title."""
+    label = CONTROL.sub(" ", label)
+    proj, title = "", label
+    if "/" in label and not label.startswith("/"):
+        proj, title = label.split("/", 1)
+        proj += "/"
+    pw = dwidth(proj)
+    if pw + dwidth(title) <= width:
+        return proj, title
+    if pw > width // 3:
+        proj, pw = "", 0
+    return proj, clip(title, width - pw)
+
+
+def roster_popup_argv(client, prefix=None):
+    """prefix q's display-popup, for the strip's ☰: the same /bin/dash line
+    as tmux.conf.tmpl's `bind-key q` (a test compares the two), with the
+    template's homebrew prefix resolved here."""
+    if prefix is None:
+        prefix = next((p for p in ("/opt/homebrew", "/usr/local") if os.access(p + "/bin/python3", os.X_OK)),
+                      "/opt/homebrew")
+    py = prefix + "/bin/python3"
+    script = ('[ -x %s ] && exec %s -I -S "$0" --client "$1"; exec /usr/bin/python3 -S "$0" --client "$1"'
+              % (py, py))
+    return ["tmux", "display-popup", "-c", client, "-E", "-w", "75%", "-h", "75%", "-T", " agents ",
+            "/bin/dash", "-c", script, os.path.join(SCRIPTS, "agent-roster.py"), client]
 
 
 def build_items(windows, needs, cur_win, show_all=False, parked_open=False, query="", stable=False):
@@ -443,6 +604,7 @@ EMOJI_WIDE = ((0x1F300, 0x1F64F), (0x1F680, 0x1F6FF), (0x1F900, 0x1F9FF), (0x1FA
 VS16 = "️"
 
 
+@functools.lru_cache(maxsize=4096)    # box drawing and state glyphs, every line of every frame
 def char_width(c):
     o = ord(c)
     if o == 0x200D or 0xFE00 <= o <= 0xFE0F or unicodedata.combining(c) \
@@ -456,6 +618,8 @@ def char_width(c):
 def clusters(s):
     """[(text, cells)]: zero-width marks ride on the char before them, and a
     VS16 (emoji presentation, as in "❤️") makes that char two cells."""
+    if s.isascii():                     # every ASCII char is one cell (char_width), and most text is ASCII
+        return [(c, 1) for c in s]
     out = []
     for c in s:
         w = char_width(c)
@@ -468,7 +632,7 @@ def clusters(s):
 
 
 def dwidth(s):
-    return sum(w for _, w in clusters(s))
+    return len(s) if s.isascii() else sum(w for _, w in clusters(s))
 
 
 def clip(s, width):
@@ -561,6 +725,28 @@ def agent_pane(win):
     return pick_agent_pane(r.stdout, ps_text)
 
 
+PEEK_LINES = 15
+
+
+def peek_lines(w):
+    """`p`: the last PEEK_LINES non-blank-tailed lines of the agent's pane →
+    [str], or None when tmux could not capture it. One capture-pane against
+    the window (its active pane); only a split window first asks agent_pane
+    which pane runs the agent (and falls back to the active one if it
+    cannot tell)."""
+    target = w["id"]
+    if w.get("panes", 1) > 1:
+        pane, _ = agent_pane(w["id"])
+        target = pane or target
+    r = tmux("capture-pane", "-p", "-J", "-S", "-%d" % PEEK_LINES, "-t", target)
+    if not r or r.returncode:
+        return None
+    lines = [CONTROL.sub(" ", l).rstrip() for l in r.stdout.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines[-PEEK_LINES:]
+
+
 def pick_tmux_pane(panes, own, clients, hint=None):
     """The strip's tmux client → (client_tty, wezterm pane_id) or (None, None).
 
@@ -621,6 +807,7 @@ class Roster:
         self.show_all = self.parked_open = False
         self.query, self.filtering = "", False
         self.confirm = None          # {"action": close|park, "w": window} awaiting y/n
+        self.peek = None             # {"w": window, "lines": [...]}: `p`, closed by any key
         self.msg, self.msg_until = "", 0.0
         self.top = 0
         self.gone = False
@@ -695,7 +882,11 @@ class Roster:
         click). `it` may come from a frame drawn before the latest refresh, so
         the window is re-checked first: gone, or no longer in the session the
         row showed (parked or unparked meanwhile) → nothing runs, the footer
-        says why. A parked row comes back through stash.sh unstash."""
+        says why. A parked row comes back through stash.sh unstash.
+
+        The row's session is passed on: a window linked into two sessions
+        would otherwise land in the client's current one (agent-jump.sh
+        goto prefers it), not the one the row was listed under."""
         w = it["w"]
         now = [x for x in self.windows if x["id"] == w["id"]]
         if not now:
@@ -707,7 +898,7 @@ class Roster:
         if w["session"] == HOLD:
             run_bg("'%s' unstash '%s' '%s'" % (STASH, w["id"], self.client))
             return True
-        return self.jump("goto", w["id"])
+        return self.jump("goto", w["id"], w["session"])
 
     def digit(self, key):
         """A digit outside the filter → True to close the popup.
@@ -742,17 +933,28 @@ class Roster:
         """One read's worth of keys → True to close the popup. A key that
         opens a y/n drops the rest of its batch, so the answer has to come in
         a later read: a paste or a fast "Hy" / "xy" must not confirm itself
-        against the window the popup opened on."""
+        against the window the popup opened on. Opening a peek drops the rest
+        the same way, so the key that would close it has to be a new one."""
         for key in keys:
-            asking = self.confirm is None
+            asking = self.confirm is None and self.peek is None
             if self.act(key):
                 return True
-            if asking and self.confirm is not None:
+            if asking and (self.confirm is not None or self.peek is not None):
                 return False
         return False
 
+    def open_peek(self, w):
+        lines = peek_lines(w)
+        if lines is None:
+            self.say("can't capture %s:%d" % (w["session"], w["index"]))
+        else:
+            self.peek = {"w": w, "lines": lines}
+
     # actions; returning True closes the popup
     def act(self, key):
+        if self.peek is not None:        # any key closes the peek, and only that
+            self.peek = None
+            return False
         if self.confirm is not None:
             c, self.confirm = self.confirm, None
             if key not in ("y", "Y"):
@@ -848,6 +1050,8 @@ class Roster:
                 self.say("already parked")
             else:
                 self.confirm = {"action": "park", "w": it["w"]}
+        elif key == "p" and it and it["kind"] == "win":
+            self.open_peek(it["w"])
         elif key == "a":
             self.show_all = not self.show_all; self.rebuild()
         elif key == "/":
@@ -875,6 +1079,16 @@ class Roster:
         if w["cua"]:
             return fg("overlay" if is_attn(w) else ("blue" if blink else "dimblue")) + MOUSE + " "
         return ""
+
+    def shape(self, w, blink):
+        """The strip's state mark: dot()'s colour (the checked mapping, pulse
+        included) on a shape per state, ✕ ◉ ✓ ◐ ○ (CAT_GLYPH)."""
+        c = cat(w)
+        return self.dot(w, blink)[:-1] + CAT_GLYPH[c] if c else " "
+
+    def strip_glyph(self, w, blink):
+        """glyph()'s colour and pulse, with the strip's text glyphs ⚙ / ◎."""
+        return self.glyph(w, blink).replace(GEAR, STRIP_GEAR).replace(MOUSE, STRIP_MOUSE)
 
     def row(self, it, width, blink, now, selected, label=None, label_w=0):
         """One line. `label` is the row's hotkey (number_items), drawn in the
@@ -916,10 +1130,16 @@ class Roster:
         gw = 2 if g else 0
         title_w = width - 4 - dwidth(ix) - 2 - gw - len(right)
         title = clip(w["label"], max(4, title_w))
-        pad = " " * max(0, title_w - dwidth(title))
+        # NEEDS YOU rows: what it is asking / why it stopped, dim, when it fits.
+        detail = ""
+        if it["long"] and is_attn(w) and w.get("detail") and w.get("detail_kind") in DETAIL_WORD:
+            room = title_w - dwidth(title) - 2
+            if room >= 8:
+                detail = "  " + clip(CONTROL.sub(" ", "%s  %s" % (DETAIL_WORD[w["detail_kind"]], w["detail"])), room)
+        pad = " " * max(0, title_w - dwidth(title) - dwidth(detail))
         tcol = fg("text") if w["state"] or cur or w["session"] == HOLD else fg("overlay")
-        return (base + bar + self.dot(w, blink) + base + " " + ixs + "  " + tcol + title + pad
-                + g + base + fg("overlay") + right)
+        return (base + bar + self.dot(w, blink) + base + " " + ixs + "  " + tcol + title + fg("overlay") + detail
+                + pad + g + base + fg("overlay") + right)
 
     DEFAULT_SIZE = (100, 30)
 
@@ -973,21 +1193,26 @@ class Roster:
         elif sel_pos >= self.top + body_h:
             self.top = sel_pos - body_h + 1
         self.top = max(0, min(self.top, max(0, len(self.items) - body_h)))
-        view = self.items[self.top:self.top + body_h]
+        view = [] if self.peek else self.items[self.top:self.top + body_h]
         label_w = max([len(l) for l in self.labels.values()] or [0])
-        self.drawn = {}
+        if not self.peek:
+            self.drawn = {}           # under a peek the list (and its numbers) stays as last drawn
+        else:
+            lines.extend(self.peek_panel(cols - 1, body_h))
         for pos, it in enumerate(view, self.top):
             label = self.labels.get(pos)
             if label is not None:
                 self.drawn[label] = it
             lines.append(self.row(it, cols, blink, now, item_key(it) == self.sel_key and it["kind"] in ("win", "parked"),
                                   label, label_w))
-        if not self.items:
+        if not self.items and not self.peek:
             lines.append(" " + fg("overlay") + ("no matches" if self.query else "no agents running"))
         while len(lines) < rows - 2:
             lines.append("")
 
-        if self.confirm is not None:
+        if self.peek is not None:
+            foot = " " + fg("overlay") + "any key closes the peek"
+        elif self.confirm is not None:
             cw = self.confirm["w"]
             verb = "park" if self.confirm["action"] == "park" else ("discard" if cw["session"] == HOLD else "close")
             foot = fg("yellow") + " %s %s:%d %s? " % (verb, cw["session"], cw["index"], cw["label"]) + fg("text") + "y/n"
@@ -1003,13 +1228,31 @@ class Roster:
             foot = fg("yellow") + " digits ignored until another key" + fg("overlay") + "  (esc clears)"
         else:
             q = (fg("peach") + " /" + self.query + fg("overlay") + " · ") if self.query else " "
-            foot = q + fg("overlay") + ("1-9/0 go · tab/j/k move · space/⏎ go · d next · x close · H park"
-                                        " · / filter · a all · esc")
+            foot = q + fg("overlay") + ("1-9/0 go · tab/j/k move · space/⏎ go · p peek · d next · x close"
+                                        " · H park · / filter · a all · esc")
         lines.append("")
         lines.append(foot)
 
         lines = (lines + [""] * rows)[:rows]
         return [clip_ansi(l, cols - 1) + RESET for l in lines]
+
+    def peek_panel(self, width, height):
+        """The peek as a rounded box of at most `height` lines and `width`
+        cells: the agent's last lines, newest at the bottom."""
+        w, got = self.peek["w"], self.peek["lines"]
+        if height < 3 or width < 8:
+            return []
+        inner = width - 4
+        title = " peek · %s:%d " % (w["session"], w["index"])
+        title += clip(CONTROL.sub(" ", w["label"]), max(0, inner - dwidth(title) - 2)) + " "
+        top = fg("overlay") + "╭─" + fg("sub") + title + fg("overlay") + "─" * max(0, width - 3 - dwidth(title)) + "╮"
+        body = got[-(height - 2):] or ["(empty)"]
+        out = [top]
+        for l in body:
+            t = clip(l, inner)
+            out.append(fg("overlay") + "│ " + fg("text") + t + " " * (inner - dwidth(t)) + fg("overlay") + " │")
+        out.append(fg("overlay") + "╰" + "─" * (width - 2) + "╯")
+        return out
 
 
 SGR = re.compile(r"\x1b\[[0-9;]*m")
@@ -1039,21 +1282,52 @@ RESOLVE_EVERY = 5.0                   # while there is no tmux client: one `wezt
 MOUSE_RAW = re.compile(rb"\x1b\[<[0-9;]*[Mm]")
 MOUSE_TAIL = re.compile(rb"\x1b\[<?[0-9;]*\Z")    # a report (or CSI) cut off at the end of a read
 MOUSE_HEAD = re.compile(rb"\A<?[0-9;]*[Mm]")       # ...and the rest of it, at the start of the next
-WHEEL_STEP = 3
+BRANCH_TTL = 30.0                     # a cwd's .git/HEAD is re-read at most this often
+BRANCH_SLOW_TTL = 600.0               # a cwd whose read outlived BRANCH_WAIT: left alone this long
+BRANCH_WAIT = 0.05                    # the most one frame waits on a branch read (then it finishes alone)
+ANY = 1 << 30                         # a click target that runs to the end of its line
+UNBOLD = "\x1b[22m"
+UNBG = "\x1b[49m"
+
+# THE DENSITY LADDER (docs/agent-roster.md, "Strip layout"). The strip never
+# scrolls: each frame takes the first step whose plan fits the pane height.
+# Steps only ever REMOVE lines, so a taller pane never shows less.
+#   rich     full layout + a dim second line under working agents that
+#            report what they are doing (@agent_detail_kind run)
+#   full     NEEDS YOU entries 2 lines (title / detail), one rounded box per
+#            session, 1-line agent rows
+#   joined   the boxes share their borders: one box, sessions split by ├─┤
+#   needs1   NEEDS YOU entries 1 line each
+#   fold     a session's idle agents (2 or more, not the current window)
+#            fold into one `○○○ 3 idle` row
+#   collapseK  the last K sessions (bottom up) shrink to their header line
+#   nobar    the toolbar line goes (status/messages move onto line 1)
+#   cap      NEEDS YOU keeps as many entries as fit (sessions keep at least
+#            3 lines), the rest is one `… N more` row; then sessions past
+#            what fits are one `… N more` divider. Nothing is dropped
+#            silently, and every overflow row opens the popup.
+LADDER = ("rich", "full", "joined", "needs1", "fold", "collapse", "nobar", "cap")
 
 
 class Strip(Roster):
-    """--strip: the always-visible, click-only list in a narrow WezTerm split
-    left of the tmux pane (CMD+B in wezterm.lua toggles it).
+    """--strip: the always-visible, click-only agent list in a narrow WezTerm
+    split left of the tmux pane (CMD+B in wezterm.lua toggles it).
 
-    Same model, same one tmux call a second, a ~34-column layout, and no
-    keyboard: a left click on a row goes there (agent-jump.sh goto, or
-    stash.sh unstash for a parked row), a click on `parked` folds it, the
-    wheel scrolls. A click makes WezTerm focus this pane, and every CMD
-    shortcut in wezterm.lua is a SendKey to the ACTIVE pane, so each click
-    hands focus straight back to the tmux pane (`wezterm cli activate-pane`),
-    before the move runs; a key that lands here anyway is forwarded to the
-    tmux pane (`wezterm cli send-text --no-paste`), so nothing is lost.
+    Same model and the same one tmux call a second as the popup, laid out for
+    ~34-40 columns and ANY height without ever scrolling (LADDER): AGENTS and
+    a count bar, a ⏵ next / ☰ menu toolbar, NEEDS YOU (in agent-jump.sh's
+    order), then one box per session in name order (agents inside sorted
+    attention > working > idle, then index), then `parked` at the bottom.
+
+    No keyboard: a left click acts on what was drawn at that cell (targets):
+    an agent row or NEEDS YOU entry goes there (agent-jump.sh goto), a
+    session header goes to that session's current window, ⏵ next is
+    agent-jump.sh next, ☰ menu / parked / any `… more` opens the prefix q
+    popup on the strip's tmux client. A click makes WezTerm focus this pane,
+    and every CMD shortcut in wezterm.lua is a SendKey to the ACTIVE pane, so
+    each click hands focus straight back to the tmux pane (`wezterm cli
+    activate-pane`) before acting; a key that lands here anyway is forwarded
+    to the tmux pane (`wezterm cli send-text --no-paste`), so nothing is lost.
 
     The tmux client is found, not passed: `wezterm cli list` → the other
     pane in this tab → its tty → the tmux client with that client_tty. Done
@@ -1068,9 +1342,16 @@ class Strip(Roster):
         self.tmux_pane = hint if self.fixed else None
         self.clients = {}
         self.next_resolve = 0.0
-        self.stop = 0                 # first body row shown (the wheel moves it)
-        self.line_items = []          # screen line → item, as last drawn
+        self.targets = []             # screen line (0-based) → [(x0, x1, action)], as last drawn
+        self.level = ""               # the LADDER step the last frame used
+        self.branches = {}            # cwd → (read at, branch, ttl)
+        self.branch_reads = {}        # cwd → (thread, result box): reads that outlived BRANCH_WAIT
+        self.children = []            # ☰ display-popup clients, reaped on the refresh tick
         self.cut_mouse = False        # the last read ended inside a mouse report
+
+    def refresh(self):
+        self.children = [p for p in self.children if p.poll() is None]
+        Roster.refresh(self)
 
     def load(self, text):
         self.clients = parse_clients(text)
@@ -1126,99 +1407,417 @@ class Strip(Roster):
         return MOUSE_TAIL.sub(b"", MOUSE_RAW.sub(b"", raw))
 
     def handle(self, keys, raw=None):
-        """Never closes (False). Left press: act on the row drawn at that
-        line. Wheel: scroll. Anything typed: forwarded to the tmux pane."""
+        """Never closes (False). Left press: act on the target drawn at that
+        cell. The wheel does nothing (nothing scrolls). Anything typed:
+        forwarded to the tmux pane."""
         clicked, stray = None, self.stray_bytes(raw)
         for key in keys:
             if not key.startswith("mouse:"):
                 continue
-            _, b, _x, y, kind = key.split(":")
-            b, y = int(b), int(y)
-            if kind != "M":
+            _, b, x, y, kind = key.split(":")
+            b, x, y = int(b), int(x), int(y)
+            if kind != "M" or b & 64:          # releases, the wheel
                 continue
-            if b in (64, 65):
-                self.stop += WHEEL_STEP if b == 65 else -WHEEL_STEP
-            elif (b & ~3) == 0 and b != 3:     # a plain press, no modifiers, not a drag
-                clicked = (b, y)
+            if (b & ~3) == 0 and b != 3:       # a plain press, no modifiers, not a drag
+                clicked = (b, x, y)
         if clicked or stray:
             self.focus_back(stray)
         if clicked and clicked[0] == 0:
-            self.click(clicked[1])
+            self.click(clicked[1], clicked[2])
         return False
 
-    def click(self, y):
-        it = self.line_items[y - 1] if 0 < y <= len(self.line_items) else None
-        if it is None:
-            return
-        if it["kind"] == "parked":
-            self.parked_open = not self.parked_open
-            self.rebuild()
-        elif it["kind"] == "win":
-            if self.client is None:
-                self.say("no tmux client")
-                return
-            if self.go(it):
-                self.refresh()            # the peach bar follows the move now, not in a second
+    def target(self, x, y):
+        """The action drawn at column x, line y (both 1-based), or None."""
+        row = self.targets[y - 1] if 0 < y <= len(self.targets) else ()
+        return next((a for x0, x1, a in row if x0 <= x < x1), None)
 
+    def click(self, x, y):
+        a = self.target(x, y)
+        if a is None:
+            return
+        if a[0] == "restart":
+            run_bg("bash '%s'" % WATCHER)
+            self.say("watcher restarted")
+            return
+        if self.client is None:
+            self.say("no tmux client")
+            return
+        moved = False
+        if a[0] == "goto":
+            moved = self.go({"kind": "win", "w": a[1]})
+        elif a[0] == "session":
+            w = next((v for v in self.windows if v["session"] == a[1] and v["active"] == "1"), None)
+            if w is None:
+                self.say("session %s is gone" % a[1])
+                return
+            moved = self.jump("goto", w["id"], a[1])      # THIS session, even for a linked window
+        elif a[0] == "next":
+            moved = self.jump("next")
+        elif a[0] == "menu":
+            self.open_menu()
+        if moved:
+            self.refresh()            # the highlight follows the move now, not in a second
+
+    def open_menu(self):
+        """☰: prefix q's popup on the strip's tmux client. Popen, not run:
+        display-popup -E may hold its client until the popup closes."""
+        try:
+            self.children.append(subprocess.Popen(
+                roster_popup_argv(self.client), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True))
+        except OSError as e:
+            self.say("menu failed: %s" % (e.strerror or e))
+
+    # model
+    def branch(self, cwd, now):
+        """git_head(cwd), cached BRANCH_TTL, and never able to stall the UI
+        loop: the read runs on a daemon thread that the frame waits on for at
+        most BRANCH_WAIT (a local repo answers in well under 1 ms). One that
+        takes longer (a sick disk, a mount the prefix rule missed) finishes
+        on its own; until it does, and for BRANCH_SLOW_TTL after the timeout,
+        that cwd shows its last branch (or none) and starts no new read. A
+        thread stuck for good costs one parked thread, never a frozen strip."""
+        if not cwd or maybe_remote(cwd):
+            return ""
+        late = self.branch_reads.get(cwd)
+        if late is not None and not late[0].is_alive():
+            del self.branch_reads[cwd]
+            if late[1]:
+                self.cache_branch(cwd, now, late[1][0], BRANCH_TTL)
+        hit = self.branches.get(cwd)
+        if hit is not None and 0 <= now - hit[0] < hit[2]:
+            return hit[1]
+        if cwd in self.branch_reads:              # still reading: keep what we had
+            return hit[1] if hit else ""
+        import threading                          # the strip only, and only on a cache miss
+        box = []
+        t = threading.Thread(target=lambda: box.append(git_head(cwd)), daemon=True)
+        t.start()
+        t.join(BRANCH_WAIT)
+        if box:
+            return self.cache_branch(cwd, now, box[0], BRANCH_TTL)
+        self.branch_reads[cwd] = (t, box)
+        return self.cache_branch(cwd, now, hit[1] if hit else "", BRANCH_SLOW_TTL)
+
+    def cache_branch(self, cwd, now, branch, ttl):
+        """Store one entry, dropping every expired one (a day of cd's must not
+        grow the cache without bound)."""
+        self.branches = {k: v for k, v in self.branches.items() if 0 <= now - v[0] < v[2]}
+        self.branches[cwd] = (now, branch, ttl)
+        return branch
+
+    def strip_model(self, now):
+        """→ (needs, groups, parked). needs: windows in needs_order. groups:
+        one per session with something to show, by name; each {name, rows
+        (attention > working > idle, then index), active, branch, current}."""
+        by_id = {w["id"]: w for w in self.windows}
+        needs = [by_id[i] for i in dict.fromkeys(self.needs) if i in by_id]
+        by = {}
+        for w in self.windows:
+            if w["session"] not in HIDDEN and w["session"] != HOLD:
+                by.setdefault(w["session"], []).append(w)
+        groups = []
+        for s in sorted(by):
+            ws = by[s]
+            rows = sorted((w for w in ws if w["state"] or w["id"] == self.cur_win),
+                          key=lambda w: (rank(w), w["index"]))
+            if not rows:
+                continue
+            active = next((w for w in ws if w["active"] == "1"), None)
+            groups.append({"name": s, "rows": rows, "active": active,
+                           "branch": self.branch(active["path"] if active else "", now),
+                           "current": any(w["id"] == self.cur_win for w in ws)})
+        parked = [w for w in self.windows if w["session"] == HOLD]
+        return needs, groups, parked
+
+    def plan(self, needs, groups, parked, cfg):
+        """The frame as line specs, for one ladder config."""
+        P = [("head",)]
+        if cfg["bar"]:
+            P.append(("bar",))
+        joined, opened = cfg["joined"], [False]
+
+        def edge(what):
+            P.append(("edge", "div" if joined and opened[0] else "top", what))
+            opened[0] = True
+
+        def close():
+            if opened[0]:
+                P.append(("bottom",))
+                opened[0] = False
+        if needs:
+            nc = cfg["ncap"]
+            shown = needs if nc is None or nc >= len(needs) else needs[:nc]
+            edge(("needs",))
+            for w in shown:
+                P.append(("need", w))
+                if cfg["nlines"] == 2:
+                    P.append(("need2", w))
+            if len(shown) < len(needs):
+                P.append(("more", len(needs) - len(shown)))
+            if not joined:
+                close()
+        sc = cfg["scap"]
+        gs = groups if sc is None or sc >= len(groups) else groups[:sc]
+        for i, g in enumerate(gs):
+            boxed = i < cfg["boxed"]
+            edge(("sess", g, boxed))
+            if boxed:
+                fold = [w for w in g["rows"] if cfg["fold"] and cat(w) == "idle" and w["id"] != self.cur_win]
+                fold = fold if len(fold) >= 2 else []
+                folded = {w["id"] for w in fold}
+                for w in g["rows"]:
+                    if w["id"] in folded:
+                        continue
+                    P.append(("row", w))
+                    if cfg["rich"] and run_detail(w):
+                        P.append(("run", w))
+                if fold:
+                    P.append(("fold", len(fold)))
+            if not joined:
+                close()
+        if len(gs) < len(groups):
+            edge(("smore", len(groups) - len(gs)))
+        close()
+        if not needs and not groups:
+            P.append(("empty",))
+        if parked:
+            P.append(("parked",))
+        return P
+
+    def ladder(self, needs, groups, parked, rows):
+        """→ (step name, plan): the first LADDER step whose plan fits `rows`."""
+        S, N = len(groups), len(needs)
+        cfg = {"bar": True, "rich": True, "nlines": 2, "joined": False, "fold": False,
+               "boxed": S, "ncap": None, "scap": None}
+        steps = [("rich", {}), ("full", {"rich": False}), ("joined", {"joined": True}),
+                 ("needs1", {"nlines": 1}), ("fold", {"fold": True})]
+        steps += [("collapse%d" % (S - k), {"boxed": k}) for k in range(S - 1, -1, -1)]
+        steps.append(("nobar", {"bar": False}))
+        for name, step in steps:
+            cfg.update(step)
+            p = self.plan(needs, groups, parked, cfg)
+            if len(p) <= rows:
+                return name, p
+        # cap: NEEDS YOU first, sessions keep a floor of 3 lines (2 + `… more`)
+        cfg["scap"] = S if S <= 3 else 2
+        nc = N
+        while nc > 0:
+            cfg["ncap"] = nc
+            if len(self.plan(needs, groups, parked, cfg)) <= rows:
+                break
+            nc -= 1
+        cfg["ncap"] = nc
+        for sc in range(S, -1, -1):
+            cfg["scap"] = sc
+            p = self.plan(needs, groups, parked, cfg)
+            if len(p) <= rows:
+                break
+        return "cap", p
+
+    # drawing
     DEFAULT_SIZE = (34, 30)
 
-    def render(self, cols, rows, now):
-        """Exactly `rows` lines of at most cols-1 cells, like the popup's;
-        records which item each screen line shows (line_items) for clicks."""
-        rows = max(1, rows)
-        blink = bool(self.windows) and self.windows[0]["blink"] == "1"
-        ws = [w for w in self.windows if w["session"] not in HIDDEN]
-        n_work = sum(1 for w in ws if w["state"] and in_flight(w) and not is_attn(w))
-        n_need = len(self.needs)
-        head = (" " + fg("peach") + BOLD + "AGENTS" + RESET + "  " + fg("pink") + "%d work" % n_work
-                + fg("overlay") + " · " + (fg("yellow") if n_need else "") + "%d need" % n_need)
-        age = watcher_age()
+    def status(self, now):
+        """What the toolbar line says instead of the toolbar, or None: a
+        message (3 s), no client, or a dead watcher (clickable restart)."""
+        if self.msg and now < self.msg_until:
+            return fg("sky") + self.msg, None
         if self.client is None or self.gone:
-            status = " " + fg("overlay") + "no tmux client"
-        elif age is None or age > WATCHER_STALE:
-            status = " " + bg("red") + fg("crust") + BOLD + " watcher %s " % ("off" if age is None else "stalled") + RESET
-        else:
-            status = ""
-        lines, self.line_items = [head, status], [None, None]
-        body_h = max(1, rows - 3)
-        self.stop = max(0, min(self.stop, max(0, len(self.items) - body_h)))
-        for it in self.items[self.stop:self.stop + body_h]:
-            lines.append(self.strip_row(it, cols - 1, blink, now))
-            self.line_items.append(it)
-        if not self.items:
-            lines.append(" " + fg("overlay") + "no agents running")
-        while len(lines) < rows - 1:
-            lines.append("")
-        lines.append((" " + fg("sky") + self.msg) if self.msg and now < self.msg_until else "")
-        lines = (lines + [""] * rows)[:rows]
-        self.line_items = (self.line_items + [None] * rows)[:rows]
-        return [clip_ansi(l, cols - 1) + RESET for l in lines]
+            return fg("overlay") + "no tmux client", None
+        age = watcher_age()
+        if age is None or age > WATCHER_STALE:
+            return (bg("red") + fg("crust") + BOLD + " watcher %s " % ("off" if age is None else "stalled")
+                    + RESET + fg("sub") + " ⟳ restart", ("restart",))
+        return None
 
-    def strip_row(self, it, width, blink, now):
-        if it["kind"] == "label":
-            return " " + fg("overlay") + it["text"]
-        if it["kind"] == "sess":
-            b = it["best"]
-            mark = (self.dot(b, blink) + " ") if b and rank(b) < 4 else ""
-            return " " + fg("sub") + BOLD + it["name"] + RESET + " " + mark
-        if it["kind"] == "parked":
-            extra = (fg("yellow") + " %d need" % it["attn"]) if it["attn"] else ""
-            return " " + fg("sub") + "%s parked (%d)" % ("▾" if self.parked_open else "▸", it["n"]) + extra
-        w = it["w"]
-        cur = w["id"] == self.cur_win
-        bar = (fg("peach") + "▌") if cur else " "
-        # NEEDS YOU rows have no session header above them: a short session.
-        ix = ("%s:%d" % (clip(w["session"], 8), w["index"])) if it["long"] else "%d" % w["index"]
-        when = (w["stash_t"] or w["since_t"]) if w["session"] == HOLD else w["since_t"]
-        right = " %3s" % ago(when, now) if when is not None else ""
-        g = self.glyph(w, blink)
+    def render(self, cols, rows, now):
+        """Exactly `rows` lines of at most cols-1 cells, at every height
+        (LADDER; nothing scrolls). Records the click targets of each line."""
+        rows = max(1, rows)
+        W = max(1, cols - 1)
+        blink = bool(self.windows) and self.windows[0]["blink"] == "1"
+        needs, groups, parked = self.strip_model(now)
+        self.level, plan = self.ladder(needs, groups, parked, rows)
+        has_bar = ("bar",) in plan
+        st = self.status(now)
+        inner = W - 4
+        lines, targets = [], []
+        col = "surface1"
+        needs_col = ("red" if any(w["state"] == "failed" for w in needs)
+                     else "yellow" if any(w["state"] == "needs-input" for w in needs) else "green")
+
+        def boxed(content, cw, hl=False):
+            pad = " " * max(0, inner - cw)
+            b = bg("surface0") if hl else ""
+            return (fg(col) + "│" + b + " " + content + pad + " " + (UNBG if hl else "") + fg(col) + "│")
+
+        two_line = any(s[0] == "need2" for s in plan)
+        for spec in plan:
+            k = spec[0]
+            tg = []
+            if k == "head":
+                l = " " + fg("peach") + BOLD + "AGENTS" + UNBOLD
+                if st and not has_bar:
+                    l += "  " + st[0]
+                    tg = [(1, ANY, st[1])] if st[1] else []
+                else:
+                    toks, _ = count_tokens(counts([w for w in self.windows
+                                                   if w["session"] not in HIDDEN and w["session"] != HOLD]))
+                    l += "  " + (toks or fg("overlay") + "no agents")
+            elif k == "bar":
+                if st:
+                    l = " " + st[0]
+                    tg = [(1, ANY, st[1])] if st[1] else []
+                else:
+                    l = " " + fg("text") + "⏵ next" + "  " + fg("sub") + "☰ menu"
+                    tg = [(1, 9, ("next",)), (9, ANY, ("menu",))]
+            elif k == "edge":
+                what = spec[2]
+                left, right = ("╭", "╮") if spec[1] == "top" else ("├", "┤")
+                if what[0] == "needs":
+                    col = needs_col
+                    lab, lw = self.needs_label(needs, W - 5)
+                    tg = [(1, ANY, ("next",))]
+                elif what[0] == "sess":
+                    g = what[1]
+                    col = "overlay" if g["current"] else "surface1"
+                    lab, lw = self.sess_label(g, what[2], W - 5)
+                    tg = [(1, ANY, ("session", g["name"]))]
+                else:
+                    col = "surface1"
+                    t = clip("… %d more sessions" % what[1], W - 5)
+                    lab, lw = fg("overlay") + t, dwidth(t)
+                    tg = [(1, ANY, ("menu",))]
+                l = (fg(col) + left + " " + lab + " " + fg(col) + "─" * max(1, W - 4 - lw) + right)
+            elif k == "bottom":
+                l = fg(col) + "╰" + "─" * max(0, W - 2) + "╯"
+            elif k in ("need", "row"):
+                w = spec[1]
+                extra = None
+                if k == "need" and not two_line:
+                    word = detail_word(w)
+                    if word and inner >= 24:
+                        extra = (fg(CAT_HUE[cat(w)]) + " " + word, len(word) + 1)
+                c, cw = self.agent_content(w, inner, blink, now, extra)
+                l = boxed(c, cw, w["id"] == self.cur_win)
+                tg = [(1, ANY, ("goto", w))]
+            elif k == "need2":
+                w = spec[1]
+                c, cw = self.need_detail(w, inner)
+                l = boxed(c, cw, w["id"] == self.cur_win)
+                tg = [(1, ANY, ("goto", w))]
+            elif k == "run":
+                w = spec[1]
+                t = clip(CONTROL.sub(" ", w["detail"]), max(0, inner - 4))
+                l = boxed("    " + fg("overlay") + t, 4 + dwidth(t), w["id"] == self.cur_win)
+                tg = [(1, ANY, ("goto", w))]
+            elif k == "fold":
+                n = spec[1]
+                t = clip("%s %d idle" % ("○" * min(n, 6), n), inner)
+                l = boxed(fg("overlay") + t, dwidth(t))
+                tg = [(1, ANY, ("menu",))]
+            elif k == "more":
+                t = clip("… %d more · ☰ menu" % spec[1], inner)
+                l = boxed(fg("overlay") + t, dwidth(t))
+                tg = [(1, ANY, ("menu",))]
+            elif k == "empty":
+                l = " " + fg("overlay") + "no agents running"
+            elif k == "parked":
+                attn = sum(1 for w in parked if is_attn(w))
+                l = (" " + fg("sub") + "▸ parked %d" % len(parked)
+                     + ((fg("overlay") + " · " + fg("yellow") + "%d need you" % attn) if attn else "")
+                     + fg("overlay") + " · ☰")
+                tg = [(1, ANY, ("menu",))]
+            lines.append(l)
+            targets.append(tg)
+        if len(lines) < rows:                      # the gap sits above `parked`, which stays at the bottom
+            gap = rows - len(lines)
+            at = len(lines) - 1 if parked else len(lines)
+            lines[at:at] = [""] * gap
+            targets[at:at] = [[] for _ in range(gap)]
+        self.targets = targets[:rows]
+        return [clip_ansi(l, W) + RESET for l in lines[:rows]]
+
+    def needs_label(self, needs, budget):
+        t = "NEEDS YOU"
+        toks, tw = count_tokens(counts(needs))
+        if dwidth(t) + 1 + tw > budget:
+            toks, tw = "", 0
+        t = clip(t, budget)
+        return fg("yellow") + BOLD + t + UNBOLD + ((" " + toks) if toks else ""), dwidth(t) + (1 + tw if tw else 0)
+
+    def sess_label(self, g, boxed, budget):
+        """`▸ name ⎇ branch ◐3 ✓1` in `budget` cells: the branch goes first
+        (clipped to no less than 4 cells, else dropped), then the name is
+        clipped (to no less than 4), then the rollup goes."""
+        pre = "" if boxed else "▸ "
+        avail = budget - len(pre)
+        name, br = CONTROL.sub(" ", g["name"]), CONTROL.sub(" ", g["branch"])
+        ro, rw = count_tokens(counts(g["rows"]))
+        ro_w = rw + 1 if rw else 0
+        nw = dwidth(name)
+        if br and nw + 3 + dwidth(br) + ro_w > avail:
+            left = avail - nw - ro_w - 3
+            br = clip(br, left) if left >= 4 else ""
+        if nw + ro_w > avail:
+            if avail - ro_w >= 4:
+                name = clip(name, avail - ro_w)
+            else:
+                ro, ro_w = "", 0
+                name = clip(name, avail)
+        lab = (fg("sub") + pre + fg("peach" if g["current"] else "text") + BOLD + name + UNBOLD
+               + ((fg("overlay") + " ⎇ " + br) if br else "") + ((" " + ro) if ro else ""))
+        return lab, len(pre) + dwidth(name) + ((3 + dwidth(br)) if br else 0) + ro_w
+
+    def agent_content(self, w, width, blink, now, extra=None):
+        """One agent line inside a box → (ansi, cells): shape, kind glyph,
+        project/title, [extra], ⚙/◎, age right-aligned."""
+        k = KIND_GLYPH.get(w.get("kind", ""))
+        kind, kw = ((fg("overlay") + k + " "), 2) if k else ("", 0)
+        g = self.strip_glyph(w, blink)
+        if g:                             # its gap goes BEFORE it: a full title must not touch it
+            g = " " + g[:-1]
         gw = 2 if g else 0
-        title_w = width - 3 - dwidth(ix) - 1 - gw - len(right)
-        title = clip(w["label"], max(3, title_w))
-        pad = " " * max(0, title_w - dwidth(title))
-        tcol = fg("text") if w["state"] or cur or w["session"] == HOLD else fg("overlay")
-        return (bar + self.dot(w, blink) + " " + fg("overlay") + ix + " " + tcol + title + pad
-                + g + fg("overlay") + right)
+        age = ago(w["since_t"], now)
+        right = " %3s" % age if age else ""
+        ex, exw = extra or ("", 0)
+        tw = max(0, width - 2 - kw - gw - len(right) - exw)
+        proj, title = fit_label(w["label"], tw)
+        used = dwidth(proj) + dwidth(title)
+        s = (self.shape(w, blink) + " " + kind + fg("overlay") + proj + fg("text") + title
+             + " " * max(0, tw - used) + ex + g + fg("overlay") + right)
+        return s, 2 + kw + max(tw, used) + exw + gw + len(right)
+
+    def need_detail(self, w, width):
+        """A NEEDS YOU entry's second line → (ansi, cells): `  perm  Bash
+        git push…   main:2`, or the state in words when there is no detail."""
+        hue = fg(CAT_HUE[cat(w)])
+        dk, d = w.get("detail_kind", ""), CONTROL.sub(" ", w.get("detail", ""))
+        if dk in DETAIL_WORD and dk != "run" and d:
+            word, text = DETAIL_WORD[dk], d
+        else:
+            word, text = STATE_WORDS.get(w["state"], w["state"]), ""
+        where = clip("%s:%d" % (CONTROL.sub(" ", w["session"]), w["index"]), 12)
+        avail = width - 2 - dwidth(where) - 1
+        if avail < 8:
+            where, avail = "", width - 2
+        left = clip(word + ("  " + text if text else ""), avail)
+        wl = min(len(word), dwidth(left))
+        s = "  " + hue + left[:wl] + fg("overlay") + left[wl:]
+        pad = width - 2 - dwidth(left) - dwidth(where)
+        return s + " " * max(0, pad) + fg("overlay") + where, width if where else 2 + dwidth(left)
+
+
+def detail_word(w):
+    """The NEEDS YOU detail kind as a word (perm, asks, fail, done), or ""."""
+    dk = w.get("detail_kind", "")
+    return DETAIL_WORD[dk] if dk in DETAIL_WORD and dk != "run" and w.get("detail") else ""
+
+
+def run_detail(w):
+    """A working agent's own line of what it is doing (@agent_detail_kind run)."""
+    return cat(w) == "working" and w.get("detail_kind") == "run" and bool(w.get("detail"))
 
 
 def arg_after(argv, flag):
@@ -1296,7 +1895,7 @@ def main(argv):
                 next_refresh = time.time() + REFRESH
             # Input that arrived while we refreshed (or ran a move) was typed
             # or clicked against the frame still on screen: handle it against
-            # THAT frame (drawn / line_items) before drawing a new one, or a
+            # THAT frame (drawn / targets) before drawing a new one, or a
             # digit or click would land on whatever row now sits there.
             if select.select([fd], [], [], 0)[0]:
                 continue

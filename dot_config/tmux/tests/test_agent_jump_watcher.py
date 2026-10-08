@@ -698,6 +698,36 @@ class JumpTests(unittest.TestCase):
         self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("main", "@20"))
         self.assertFalse([c for c in s["calls"] if c[0] == "switch-client" and "=stash" in c], s["calls"])
 
+    def test_goto_named_session_wins_for_a_linked_window(self):
+        # The strip's `bai` header (or a row under it) for a window linked into
+        # main and bai: the client is in main, and must still land in bai.
+        w20 = W("bai", 5); w20["links"] = ["main"]
+        f = self.make(**{"@20": w20})
+        f.run("agent-jump.sh", "goto", self.TTY, "@20", "bai")
+        s = f.read()
+        moves = [c for c in s["calls"] if c[0] in ("select-window", "switch-client")]
+        self.assertEqual(moves[0], ["select-window", "-t", "=bai:@20"])            # select first
+        self.assertEqual(moves[1][0], "switch-client")
+        self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("bai", "@20"))
+        s["clients"][0].update(session="bai", window="@12"); f.state.write_text(json.dumps(s))
+        f.run("agent-jump.sh", "goto", self.TTY, "@20", "main")                    # and the other way
+        s = f.read()
+        self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("main", "@20"))
+
+    def test_goto_named_session_is_checked(self):
+        w20 = W("bai", 5); w20["links"] = ["stash"]
+        f = self.make(**{"@20": w20})
+        f.run("agent-jump.sh", "goto", self.TTY, "@20", "stash")    # holds it, but excluded: refused
+        s = f.read()
+        self.assertFalse([c for c in s["calls"] if c[0] in ("select-window", "switch-client")], s["calls"])
+        self.assertIn("parked", s["messages"][-1][1])
+        f.run("agent-jump.sh", "goto", self.TTY, "@20", "work")     # not linked there (any more)
+        s = f.read()
+        self.assertFalse([c for c in s["calls"] if c[0] in ("select-window", "switch-client")], s["calls"])
+        self.assertEqual(s["clients"][0]["session"], "main")
+        self.assertIn("has left work", s["messages"][-1][1])
+        self.assertNotRegex(s["messages"][-1][1], r"^(no|not|can't|cannot|invalid|unknown|failed|error)\b")
+
     def test_linked_window_listed_and_counted_once(self):
         f = self.make()
         s = f.read(); s["windows"]["@12"]["links"] = ["main", "stash"]
