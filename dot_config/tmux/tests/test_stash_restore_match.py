@@ -655,5 +655,41 @@ class PublishCost(unittest.TestCase):
         self.assertEqual(sorted(e.sidecar.read_text().splitlines()), sorted(before.splitlines()))
 
 
+class RedatedLast(unittest.TestCase):
+    """resurrect-save.sh re-dates `last`'s target on an UNCHANGED save (touch -c),
+    so the restored snapshot can carry an mtime after #{start_time} while its
+    name still says it was captured before. The inference must go by the stamp."""
+
+    def setUp(self):
+        self.env = FakeEnv()
+        self.addCleanup(self.env.cleanup)
+        self.s = StaleSnapshot()
+
+    def test_last_redated_after_start_but_stamped_before_is_still_used(self):
+        e = self.env
+        e.sidecar.write_text(self.s.a_row())                   # A parked at T1, after T0
+        e.snapshot(T0, mtime=T2 + 900)                         # unchanged save 15 min in
+        self.s.restored_server(e)
+        r = e.run("restore-state")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(e.server()["globals"].get("@stash_snapshot_ts"), str(T0))
+        self.assertEqual({k: v for k, v in e.opts("@30").items() if k.startswith("@stash")}, {})
+
+    def test_fallback_picks_by_name_stamp_not_mtime(self):
+        """`last` is a save of THIS server; the newest file STAMPED before the
+        start is the restored one, even though an unchanged save re-dated it
+        past the start (by mtime the pick would be the older T0 - 900)."""
+        e = self.env
+        e.sidecar.write_text(self.s.a_row())
+        e.snapshot(T0 - 900, last=False)                       # an older capture
+        e.snapshot(T0, mtime=T2 + 60, last=False)              # the restored one, re-dated
+        e.snapshot(T2 + 900)                                   # continuum on the new server
+        self.s.restored_server(e)
+        r = e.run("restore-state")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(e.server()["globals"].get("@stash_snapshot_ts"), str(T0))
+        self.assertEqual({k: v for k, v in e.opts("@30").items() if k.startswith("@stash")}, {})
+
+
 if __name__ == "__main__":
     unittest.main()

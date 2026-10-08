@@ -26,6 +26,9 @@
 #   * concurrent saves (continuum + prefix C-s) shared one scratch dir; now
 #     serialised by a lock.
 #   * hook output went to the active pane via run-shell; now to save.log.
+#   * DEFAULT SERVER ONLY (see the guard below): a `tmux -L <name>` test server
+#     that sources tmux.conf gets continuum's hook and prefix C-s too, and used
+#     to write a snapshot of ITSELF into ~/.tmux/resurrect and move `last`.
 
 set -uo pipefail
 
@@ -37,8 +40,12 @@ d=$'\t'
 US=$'\x1f'
 
 # One round-trip for every option this needs; user options read as formats.
-IFS="$US" read -r RESURRECT_DIR CAPTURE CONTENTS_AREA DELETE_AFTER EXCLUDE < <(
-	tmux display-message -p "#{@resurrect-dir}${US}#{@resurrect-capture-pane-contents}${US}#{@resurrect-pane-contents-area}${US}#{@resurrect-delete-backup-after}${US}#{@resurrect-exclude-sessions}" 2>/dev/null
+# #{socket_path} rides along: it is the server the tmux CLI ACTUALLY reaches,
+# which the guard below checks. @resurrect_stale is the watcher's stale-save
+# chip, cleared once this save lands.
+SOCKET="" STALE=""
+IFS="$US" read -r SOCKET RESURRECT_DIR CAPTURE CONTENTS_AREA DELETE_AFTER STALE EXCLUDE < <(
+	tmux display-message -p "#{socket_path}${US}#{@resurrect-dir}${US}#{@resurrect-capture-pane-contents}${US}#{@resurrect-pane-contents-area}${US}#{@resurrect-delete-backup-after}${US}#{@resurrect_stale}${US}#{@resurrect-exclude-sessions}" 2>/dev/null
 ) || true
 RESURRECT_DIR="${RESURRECT_DIR:-$HOME/.tmux/resurrect}"
 RESURRECT_DIR="${RESURRECT_DIR//\$HOME/$HOME}"
@@ -54,7 +61,6 @@ LAST="$RESURRECT_DIR/last"
 LOG="$RESURRECT_DIR/save.log"
 LOCK="$RESURRECT_DIR/.save.lock"
 SAVE_DIR="$RESURRECT_DIR/save/pane_contents"
-mkdir -p "$RESURRECT_DIR"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >>"$LOG"; }
 
@@ -62,6 +68,49 @@ message() {
 	[ "$SCRIPT_OUTPUT" = "quiet" ] && return 0
 	tmux display-message -d 5000 "$1" 2>/dev/null || true
 }
+
+# --- default server only ------------------------------------------------------
+# Every server that sources tmux.conf gets continuum's #(continuum_save.sh)
+# hook and the prefix C-s binding, and both run THIS script with that server's
+# environment: a `tmux -L <name>` test server would save a snapshot of itself
+# into the real @resurrect-dir and move `last` onto it (and its post-save hooks
+# would then "repair" and guard that snapshot). Two checks, both required:
+#   * TMUX="<socket>,<pid>,<session>" — run-shell and #() jobs inherit it from
+#     the server that launched them (same rule as agent-tab-watcher.sh and
+#     continuum-ensure.sh; empty means the CLI targets the default server);
+#   * #{socket_path} from the read above — whatever server the tmux CLI really
+#     talks to (TMUX could be empty while something else steers the CLI). Empty
+#     means tmux was unreachable, which proves nothing, so that refuses too.
+# Nothing below this — lock, snapshot, `last`, hooks, prune — runs on a refusal.
+# RESURRECT_SAVE_ALLOW_SOCKET=<exact socket path> admits one other server: the
+# test harness's opt-in for its throwaway servers. A server that merely
+# sources tmux.conf can never match it by accident.
+socket_ok() {
+	[ "${1##*/}" = default ] || { [ -n "${RESURRECT_SAVE_ALLOW_SOCKET:-}" ] && [ "$1" = "$RESURRECT_SAVE_ALLOW_SOCKET" ]; }
+}
+tmux_sock="${TMUX:-}"
+tmux_sock="${tmux_sock%%,*}"
+refused=""
+if [ -n "$tmux_sock" ] && ! socket_ok "$tmux_sock"; then
+	refused="TMUX names socket $tmux_sock"
+elif [ -z "$SOCKET" ]; then
+	refused="tmux unreachable (no #{socket_path})"
+elif ! socket_ok "$SOCKET"; then
+	refused="the tmux CLI reaches $SOCKET"
+fi
+if [ -n "$refused" ]; then
+	# Logged only where a save log already lives: a refused save creates nothing.
+	[ -d "$RESURRECT_DIR" ] && log "REFUSED: not the default tmux server — $refused; nothing saved, \`last\` untouched, no hooks run"
+	# Visible even when quiet (continuum's path, where message() is silent): a
+	# FALSE refusal would stop autosave as silently as the 38 h gap did. The
+	# stale-save chip renders this value as "save refused"; on a genuine test
+	# server it lands on that server and harms nothing. One tmux call, and only
+	# on a refusal; the next successful save clears it like any stale value.
+	tmux set-option -g @resurrect_stale refused \; refresh-client -S >/dev/null 2>&1 || true
+	message "Tmux save refused: not the default server ($refused)"
+	exit 0
+fi
+mkdir -p "$RESURRECT_DIR"
 
 # --- lock ---------------------------------------------------------------------
 # mkdir is atomic. A lock older than two minutes belongs to a save that died
@@ -223,6 +272,10 @@ run_hook post-save-layout "$FILE"
 if [ -L "$LAST" ] && cmp -s "$FILE" "$LAST"; then
 	rm -f "$FILE"
 	FILE="$(readlink "$LAST")"
+	# The kept snapshot is re-confirmed as of now: its mtime is the watcher's
+	# "last save" clock (@resurrect_stale), so an unchanged layout must not
+	# read as a stale save. Follows the symlink; -c never creates.
+	touch -c "$LAST" 2>/dev/null
 	changed=0
 else
 	ln -sfn "$(basename "$FILE")" "$LAST"
@@ -297,6 +350,12 @@ cleanup_tmp
 END=$EPOCHREALTIME
 elapsed="$(awk -v s="$START" -v e="$END" 'BEGIN { printf "%.2f", e - s }')"
 log "saved $(grep -c '^pane' "$RESURRECT_DIR/$(basename "$FILE")" 2>/dev/null || echo '?') panes in ${elapsed}s ($([ "$changed" = 1 ] && echo new || echo unchanged) $(basename "$FILE"))"
+
+# A save landed: drop the stale-save chip now rather than at the watcher's
+# next once-a-minute look (which would clear it too).
+if [ -n "$STALE" ]; then
+	tmux set-option -gu @resurrect_stale \; refresh-client -S >/dev/null 2>&1 || true
+fi
 
 # Keep the log short; this runs every 15 minutes forever.
 if [ "$(wc -l <"$LOG")" -gt 1000 ]; then

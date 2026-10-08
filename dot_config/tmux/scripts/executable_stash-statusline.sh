@@ -40,7 +40,23 @@ thm_gray=$(opt @thm_gray '#313244')
 # Commas inside #[...] are escaped as `#,` because this whole thing sits in a
 # #{?...} branch, and tmux splits those on commas — an unescaped #[fg=x,bg=y]
 # ends the branch at `fg=x` and the rest is dropped silently, rendering nothing.
-seg="#[fg=${color}#,bg=default#,nobold#,nounderscore#,noitalics]${sep}"
+red=$(opt @thm_red '#f38ba8')
+
+# STALE-SAVE CHIP, leftmost: "󰀦 last save 3h ago" in red while the global
+# @resurrect_stale is set. agent-tab-watcher.sh sets it (default server only)
+# when the newest resurrect snapshot is older than @resurrect-stale-minutes,
+# and resurrect-save.sh clears it as a save lands — continuum once went ~38 h
+# without saving and nothing on screen said so. Same anatomy as the stash chip
+# and the same chaining rule: whatever sits to its right draws its arc over
+# #313244 while it shows.
+stale_seg="#[fg=${red}#,bg=default#,nobold#,nounderscore#,noitalics]${sep}"
+stale_seg="${stale_seg}#[fg=${thm_bg}#,bg=${red}#,nobold#,nounderscore#,noitalics]󰀦 "
+# resurrect-save.sh sets the value `refused` when its default-server guard
+# turned a save away; that reads "save refused" instead of an age.
+stale_seg="${stale_seg}#[fg=${thm_fg}#,bg=${thm_gray}] #{?#{==:#{@resurrect_stale},refused},save refused,last save #{@resurrect_stale} ago} "
+stale_cond="#{?#{@resurrect_stale},${stale_seg},}"
+
+seg="#[fg=${color}#,bg=#{?#{@resurrect_stale},${thm_gray},default}#,nobold#,nounderscore#,noitalics]${sep}"
 seg="${seg}#[fg=${thm_bg}#,bg=${color}#,nobold#,nounderscore#,noitalics] "
 seg="${seg}#[fg=${thm_fg}#,bg=${thm_gray}] 󰒲 #{E:@stash_count} "
 
@@ -52,8 +68,11 @@ cond="#{?${showing},,${seg}}"
 
 # The first `bg=default` in catppuccin's string is the leading module's arc —
 # the only one drawn against the bare bar, and so the only one that has to
-# change when something sits to its left. Replacing just that one occurrence
-# leaves every other module's chaining exactly as catppuccin built it.
-patched="${cur/bg=default/bg=#{?${showing},default,${thm_gray}\}}"
+# change when something sits to its left (the stale chip or the stash chip).
+# Replacing just that one occurrence leaves every other module's chaining
+# exactly as catppuccin built it. The replacement is QUOTED: bash 5.2's
+# patsub_replacement would otherwise read any `&` in it as the matched text.
+dir_bg="bg=#{?#{@resurrect_stale},${thm_gray},#{?${showing},default,${thm_gray}}}"
+patched="${cur/bg=default/"$dir_bg"}"
 
-tmux set -g status-right "${cond}${patched}"
+tmux set -g status-right "${stale_cond}${cond}${patched}"

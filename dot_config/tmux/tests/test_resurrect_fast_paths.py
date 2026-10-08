@@ -41,6 +41,14 @@ class ThrowawayServer(unittest.TestCase):
                   "set", "-g", "@resurrect-capture-pane-contents", "on")
         path = self.tmux("display", "-p", "#{socket_path}").strip()
         self.env["TMUX"] = f"{path},0,0"
+        # resurrect-save.sh refuses any server but the default one; this is its opt-in.
+        self.env["RESURRECT_SAVE_ALLOW_SOCKET"] = path
+        # kill-server leaves the socket file behind. Cleanups run LIFO, so this
+        # one goes before the -L kill above: kill first, then remove the file.
+        def reap(p=path):
+            subprocess.run([TMUX, "-S", p, "kill-server"], capture_output=True)
+            Path(p).unlink(missing_ok=True)
+        self.addCleanup(reap)
 
     def tmux(self, *args):
         env = getattr(self, "env", dict(os.environ))

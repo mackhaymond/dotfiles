@@ -429,6 +429,10 @@ set -g @resurrect-processes 'nu'
 set -g @plugin 'tmux-plugins/tmux-continuum'
 set -g @continuum-save-interval '15'
 set -g @continuum-restore 'on'
+# Red "last save Nh ago" chip at the left of status-right once the newest
+# snapshot is older than this many minutes (0 = off). agent-tab-watcher.sh
+# checks once a minute; read at its start, so `prefix r` applies a change.
+set -g @resurrect-stale-minutes '60'
 
 # Persist and resume assistant CLI sessions with tmux-resurrect/continuum.
 set -g @plugin 'timvw/tmux-assistant-resurrect'

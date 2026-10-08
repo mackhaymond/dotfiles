@@ -476,6 +476,97 @@ subagent_running() {
     return "$v"
 }
 
+# STALE-SAVE CHIP. tmux-continuum once stopped autosaving for ~38 h without a
+# sound (a stray `tmux -L` test server tripped its another-server check; see
+# continuum-ensure.sh). So: when the newest snapshot - the mtime of the
+# `last` target under @resurrect-dir, which resurrect-save.sh refreshes even
+# on an unchanged save - is older than @resurrect-stale-minutes (default 60,
+# four continuum intervals; 0 = off), the global @resurrect_stale holds its
+# age ("75m", "3h", "2d") and stash-statusline.sh renders a red chip from it.
+# Unset otherwise. resurrect-save.sh clears it the moment a save lands; this
+# re-evaluates at most every STALE_EVERY seconds. It is DEFAULT-SERVER-ONLY by
+# construction: a watcher on any other server exits at the top.
+#
+# Fork-free while healthy. The options are read ONCE (the first look, a full
+# period after startup so tmux.conf has finished loading; `prefix r` respawns
+# this daemon, so a changed option is picked up). After that, stale_lb is a
+# LOWER bound on last's mtime: each look first asks the builtin `[ last -nt
+# STAMP ]` against a stamp written at the previous look (epoch stale_x), and a
+# yes moves the bound up to stale_x - a save every 15 min keeps the bound
+# within one period of the truth with no fork at all. Only when the bound
+# alone would say "stale" is there an exact `stat` (one fork a minute, and
+# only while actually stale or on the first look). The stamp is written BEFORE
+# that stat, so a save racing the two is seen by one or the other; every doubt
+# (missing stamp, a tie) falls through to the stat, never to a false chip.
+STALE_EVERY="${AGENT_TAB_WATCHER_STALE_EVERY:-60}"
+STALE_STAMP="$STAMPS.save"     # under $STAMPS.*: cleanup() and the startup sweep take it
+stale_due=""     # epoch of the next look ("" = not scheduled yet)
+stale_opts=0     # 1 = options read
+stale_dir=""     # resolved @resurrect-dir
+stale_secs=3600  # threshold, seconds (0 = off)
+stale_lb=0       # lower bound on last's mtime, epoch (0 = unknown)
+stale_x=""       # epoch the stamp was written at ("" = no stamp)
+stale_val="?"    # what @resurrect_stale holds as far as we know ("?" = unknown)
+check_stale_save() {
+    [ -n "$stale_due" ] || stale_due=$((tick_now + STALE_EVERY))
+    # BACKWARD CLOCK JUMPS (NTP step, a manual set). A due time more than one
+    # period ahead can only come from the old clock, and waiting for the new
+    # one to catch up would mute the chip for the size of the jump - so look
+    # now. Likewise a bound or stamp from the future: with stale_lb ahead of
+    # the clock every age reads negative ("fresh") until the clock passes it,
+    # and a save stamped by the new clock is never -nt a future stamp. Both
+    # are dropped, so this look takes the exact stat and re-learns from it.
+    # (Not exercised by the tests: tick_now is the builtin %(%s)T clock, which
+    # the fake harness cannot move. A forward jump needs nothing: ages only
+    # grow, and every "stale" verdict is confirmed by a stat first.)
+    [ "$tick_now" -ge "$stale_due" ] || [ $((stale_due - tick_now)) -gt "$STALE_EVERY" ] || return 0
+    stale_due=$((tick_now + STALE_EVERY))
+    if [ "$stale_lb" -gt "$tick_now" ] || { [ -n "$stale_x" ] && [ "$stale_x" -gt "$tick_now" ]; }; then
+        stale_lb=0; stale_x=""
+    fi
+    local opts mins last label="" mt age
+    if [ "$stale_opts" = 0 ]; then
+        opts=$(tmux display-message -p "#{@resurrect-dir}${US}#{@resurrect-stale-minutes}" 2>/dev/null) || return 0
+        IFS="$US" read -r stale_dir mins <<<"$opts"
+        stale_dir="${stale_dir:-$HOME/.tmux/resurrect}"
+        stale_dir="${stale_dir//\$HOME/$HOME}"
+        stale_dir="${stale_dir/#\~/$HOME}"
+        case "$mins" in ''|*[!0-9]*) mins=60 ;; esac
+        stale_secs=$((10#$mins * 60))
+        stale_opts=1
+    fi
+    last="$stale_dir/last"
+    # Off, or nothing to measure (never saved, or `last` dangles): no chip.
+    if [ "$stale_secs" -gt 0 ] && [ -e "$last" ]; then
+        if [ -n "$stale_x" ] && [ -e "$STALE_STAMP" ] && [ "$last" -nt "$STALE_STAMP" ]; then
+            [ "$stale_x" -gt "$stale_lb" ] && stale_lb=$stale_x
+            : > "$STALE_STAMP" 2>/dev/null && stale_x=$tick_now || stale_x=""
+        fi
+        age=$((tick_now - stale_lb))
+        if [ "$age" -ge "$stale_secs" ]; then
+            : > "$STALE_STAMP" 2>/dev/null && stale_x=$tick_now || stale_x=""
+            mt=$(stat -L -f %m "$last" 2>/dev/null)
+            case "$mt" in
+                ''|*[!0-9]*) age=0 ;;                 # vanished mid-look: no verdict
+                *) stale_lb=$mt; age=$((tick_now - mt)) ;;
+            esac
+        fi
+        if [ "$age" -ge "$stale_secs" ]; then
+            if [ "$age" -lt 7200 ]; then label="$((age / 60))m"
+            elif [ "$age" -lt 172800 ]; then label="$((age / 3600))h"
+            else label="$((age / 86400))d"; fi
+        fi
+    fi
+    [ "$label" = "$stale_val" ] && return 0
+    if [ -n "$label" ]; then
+        tmux set-option -g @resurrect_stale "$label" 2>/dev/null || return 0
+    else
+        tmux set-option -gu @resurrect_stale 2>/dev/null || return 0
+    fi
+    stale_val="$label"
+    changed=1
+}
+
 # A failed tmux command is NOT proof the server died — it can also be a
 # transient hiccup (server mid-reload, EINTR, fd pressure). Exiting on the
 # first one is how the daemon silently disappears after days of uptime, taking
@@ -992,6 +1083,10 @@ EOF
     gc_streak="$gc_streak_next"
 
     idle_streak="$idle_streak_next"
+
+    # The stale-save chip (see STALE-SAVE CHIP): a builtin clock compare on
+    # almost every tick, a look at most once per STALE_EVERY seconds.
+    check_stale_save
 
     # Pulse while anything is running (set in the loop), has a workflow in
     # flight, or is driving an app. The toggling itself is blink_loop's job;

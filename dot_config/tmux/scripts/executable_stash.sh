@@ -279,18 +279,35 @@ restored_snapshot_time() {
     t=$(tmux show -gqv @stash_snapshot_ts 2>/dev/null)
     case "$t" in ''|*[!0-9]*) inferred_snapshot_time ;; *) printf '%s' "$t" ;; esac
 }
+# The inference. Both of its tests ("is `last` of this server?" and "which
+# file is the newest before the start?") go by the CAPTURE time (the name stamp, see snapshot_file_time),
+# never by the raw mtime: resurrect-save.sh re-dates `last`'s target on an
+# unchanged save (touch -c, the stale-save chip's clock), so the snapshot that
+# was restored can carry an mtime after #{start_time} while its name still says
+# it was captured before. By mtime that read as "a save of this server", and
+# with nothing older on disk the inference came back empty — which turns the
+# park-time filter off (F3). The fallback picks the newest file STAMPED at or
+# before the start: stamps are fixed-width local time, so they compare as
+# strings and no file needs a stat or a date(1) of its own.
 inferred_snapshot_time() {
-    local dir start t f
+    local dir start t f g cut best=""
     dir=$(resurrect_dir)
     t=$(snapshot_file_time "$dir/last")
     case "$t" in ''|*[!0-9]*) return 0 ;; esac
     start=$(tmux display-message -p '#{start_time}' 2>/dev/null)
     case "$start" in ''|*[!0-9]*) start="" ;; esac
-    if [ -n "$start" ] && [ "$(stat -L -f %m "$dir/last" 2>/dev/null || echo 0)" -gt "$start" ]; then
-        # Chosen by mtime (a file written after the start is of this server);
-        # its time is then read like any other.
-        f=$(stat -f '%m %N' "$dir"/tmux_resurrect_*.txt 2>/dev/null \
-            | awk -v s="$start" '$1 <= s && $1 > m { m = $1; sub(/^[0-9]+ /, ""); n = $0 } END { if (m) print n }')
+    if [ -n "$start" ] && [ "$t" -gt "$start" ]; then
+        cut=$(date -r "$start" '+%Y%m%dT%H%M%S' 2>/dev/null)
+        f=""
+        if [ -n "$cut" ]; then
+            for g in "$dir"/tmux_resurrect_*.txt; do
+                [[ ${g##*/} =~ ^tmux_resurrect_([0-9]{8}T[0-9]{6})\.txt$ ]] || continue
+                [[ ${BASH_REMATCH[1]} > $cut ]] && continue
+                if [ -z "$best" ] || [[ ${BASH_REMATCH[1]} > $best ]]; then
+                    best="${BASH_REMATCH[1]}"; f="$g"
+                fi
+            done
+        fi
         t=""; [ -n "$f" ] && t=$(snapshot_file_time "$f")
     fi
     printf '%s' "$t"
