@@ -97,8 +97,12 @@ LOCK_STALE=30
 # main -> sidecar and never the reverse.
 SAVE_LOCKDIR="${TMPDIR:-/tmp}/tmux-stash-save.${UID:-$(id -u)}.lock"
 
+# `lock_acquire <dir> wait` never gives up while the lock is merely HELD: a
+# holder either releases it or, past LOCK_STALE, has it broken below, so the
+# wait is bounded by that. It still fails if the lock cannot be created at all
+# (100 tries with no directory there), since waiting cannot fix that.
 lock_acquire() {
-    local dir="${1:-$LOCKDIR}"
+    local dir="${1:-$LOCKDIR}" mode="${2:-}"
     local i=0 owner age
     while :; do
         if mkdir "$dir" 2>/dev/null; then
@@ -113,7 +117,17 @@ lock_acquire() {
             # it and the retry printed a scary path error on every race.
             { printf '%s' "$$" > "$dir/pid"; } 2>/dev/null && return 0
         fi
-        i=$((i + 1)); [ "$i" -gt 100 ] && { log "could not take the lock (${dir##*/})"; return 1; }
+        i=$((i + 1))
+        # In wait mode only CONSECUTIVE failures with no directory there
+        # count: a lock released between our mkdir and this test is just a
+        # retry, but 100 in a row means it cannot be created.
+        if [ "$mode" = wait ]; then
+            if [ -d "$dir" ]; then i=0; elif [ "$i" -gt 100 ]; then
+                log "could not create the lock (${dir##*/})"; return 1
+            fi
+        elif [ "$i" -gt 100 ]; then
+            log "could not take the lock (${dir##*/})"; return 1
+        fi
         owner=$(cat "$dir/pid" 2>/dev/null)
         age=$(( $(date +%s) - $(stat -f %m "$dir" 2>/dev/null || date +%s) ))
         if { [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; } || [ "$age" -ge "$LOCK_STALE" ]; then
@@ -203,9 +217,83 @@ publish() { tmux set-option -g @stash_count "$(count)" 2>/dev/null; save_state; 
 # beside the save it corresponds to, and a second tmux server on another socket
 # (which is how this gets tested) points that option somewhere else precisely so
 # it cannot touch the real one.
+#
+# Expanded the way tmux-resurrect and resurrect-save.sh expand it ($HOME and a
+# leading ~), so `last` below is looked up where the save actually wrote it.
 resurrect_dir() {
     local d; d=$(tmux show -gqv @resurrect-dir 2>/dev/null)
-    printf '%s' "${d:-$HOME/.tmux/resurrect}"
+    d="${d:-$HOME/.tmux/resurrect}"
+    d="${d//\$HOME/$HOME}"
+    printf '%s' "${d/#\~/$HOME}"
+}
+
+# When one resurrect snapshot's layout was captured (epoch seconds), or
+# nothing. <file> is `last` or a tmux_resurrect_*.txt.
+#
+# `last` is a symlink (resurrect-save.sh `ln -sfn`, like upstream) to a
+# BASENAME, and only its target describes a layout: an unchanged save deletes
+# its new file and leaves `last` on the older one, and resurrect-guard.sh can
+# repoint `last` BACK to an older good file, which gives the link itself a
+# fresh mtime describing nothing.
+#
+# The capture time is the stamp in the target's NAME — resurrect-save.sh sets
+# TS (`date +%Y%m%dT%H%M%S`, local time, the same format as upstream's
+# resurrect_file_path) before its list-panes, so it is a lower bound on when
+# the layout was read. The file's mtime is not: the post-save hook
+# (resurrect-save-repair.py) os.replace()s it seconds after the capture.
+# `date -j -f` reads the stamp in the local zone, as it was written; in the
+# repeated hour of a DST fall-back it may resolve an hour late, so the result
+# is the EARLIER of stamp and mtime — the mtime is never before the capture,
+# so that is still an upper bound, and erring early only refuses more.
+# A name without a stamp falls back to the mtime.
+snapshot_file_time() {
+    local f="$1" m t base
+    m=$(stat -L -f %m "$f" 2>/dev/null)
+    case "$m" in ''|*[!0-9]*) return 0 ;; esac
+    base=$(readlink "$f" 2>/dev/null) || base="$f"
+    base="${base##*/}"
+    if [[ $base =~ _([0-9]{8}T[0-9]{6})\.txt$ ]]; then
+        t=$(date -j -f '%Y%m%dT%H%M%S' "${BASH_REMATCH[1]}" '+%s' 2>/dev/null)
+        case "$t" in ''|*[!0-9]*) ;; *) [ "$t" -lt "$m" ] && m="$t" ;; esac
+    fi
+    printf '%s' "$m"
+}
+
+# When the resurrect snapshot this server's parked windows were rebuilt from
+# was taken (epoch seconds), or nothing if that cannot be known.
+#
+# restore-state records the one it was run for, as the server option
+# @stash_snapshot_ts (see do_restore_state); that is the answer whenever it
+# exists. Without it — the restore hook did not run — it has to be inferred,
+# because `last` keeps moving after the restore: every continuum save on this
+# server repoints it at a snapshot OF this server. The one that was restored
+# predates the server, so when `last` is newer than #{start_time}, the
+# snapshot is taken to be the newest save that is not. That inference is
+# fooled by a save resurrect-guard.sh REJECTED just before the restart (it is
+# never deleted, and is newer than the good one `last` was reverted to),
+# which is why the recorded value is preferred. A manual restore into a
+# running server also lands in the inference and picks an older snapshot than
+# it used — which only refuses more.
+restored_snapshot_time() {
+    local t
+    t=$(tmux show -gqv @stash_snapshot_ts 2>/dev/null)
+    case "$t" in ''|*[!0-9]*) inferred_snapshot_time ;; *) printf '%s' "$t" ;; esac
+}
+inferred_snapshot_time() {
+    local dir start t f
+    dir=$(resurrect_dir)
+    t=$(snapshot_file_time "$dir/last")
+    case "$t" in ''|*[!0-9]*) return 0 ;; esac
+    start=$(tmux display-message -p '#{start_time}' 2>/dev/null)
+    case "$start" in ''|*[!0-9]*) start="" ;; esac
+    if [ -n "$start" ] && [ "$(stat -L -f %m "$dir/last" 2>/dev/null || echo 0)" -gt "$start" ]; then
+        # Chosen by mtime (a file written after the start is of this server);
+        # its time is then read like any other.
+        f=$(stat -f '%m %N' "$dir"/tmux_resurrect_*.txt 2>/dev/null \
+            | awk -v s="$start" '$1 <= s && $1 > m { m = $1; sub(/^[0-9]+ /, ""); n = $0 } END { if (m) print n }')
+        t=""; [ -n "$f" ] && t=$(snapshot_file_time "$f")
+    fi
+    printf '%s' "$t"
 }
 STATE_FILE=""   # resolved per-call; the server this talks to decides it
 state_file() { [ -n "$STATE_FILE" ] || STATE_FILE="$(resurrect_dir)/stash-state.tsv"; printf '%s' "$STATE_FILE"; }
@@ -294,8 +382,7 @@ window_for_row() {
 # all new on the restored server, and the auto-renamed name is the process
 # title. Index + directory therefore identifies a window only while the slots
 # have not moved, and nothing can prove that: an unpark or a kill renumbers the
-# holding session (A at 1 goes, B slides from 2 into 1), and so does a
-# resurrect snapshot that predates the last park. If A and B both sat in
+# holding session (A at 1 goes, B slides from 2 into 1). If A and B both sat in
 # $HOME, "stash:1 in $HOME" is B now, and A's origin and label would be
 # stamped on it. Mislabelling a tab is worse than losing its label (a parked
 # tab without an origin still comes back, to the attached session), so a row
@@ -305,14 +392,45 @@ window_for_row() {
 #   - the window carries no stash state yet (else something already owns it);
 #   - it is not the window a session-id row identifies;
 #   - no OTHER unclaimed, state-less parked window shares that key — if
-#     another one could equally be "the window in $HOME", neither is placed.
+#     another one could equally be "the window in $HOME", neither is placed;
+#   - the row's park time PREDATES the resurrect snapshot the parked windows
+#     were rebuilt from (restored_snapshot_time).
+# That last one is not covered by the uniqueness tests, because a STALE
+# snapshot can leave exactly one candidate. Continuum saves every 15 minutes;
+# the sidecar is current to the second. Snapshot at T0 has X parked at stash:1
+# in $HOME; then X is unparked and A (also in $HOME) parked, renumber puts A at
+# stash:1, and the sidecar's slot-1 row is A's. Restart, T0 comes back:
+# stash:1 holds X, with no state; A's key is unique and X is the only pool
+# window — so without this test A's origin, label and park time land on X.
+# A window parked after the snapshot cannot be in its stash at all.
+# The time can only be compared when there is one: a row with no (or a
+# non-numeric) park time — sidecars from before field 9, and windows restored
+# from those — is NOT placed while a snapshot time is known, since nothing
+# shows it predates the snapshot. With no `last` at all, nothing was restored
+# from a snapshot and there is nothing to compare against; the other tests
+# still apply.
 # Rows WITH a session id keep window_for_row alone, as before: refusing those
 # would orphan a conversation, and they carry a recorded cwd and pane.
+#
+# COST. This runs on every publish — N+1 times per range park, under the main
+# lock — and the per-row work is ~4 tmux calls plus forks for EVERY sid row.
+# Yet it can only ever place a row on a parked window with no stash state, and
+# on a server that was not just restored there is none: park_one stamps
+# @stash_origin and @stash_ts before every move. So that list is built first,
+# in one tmux call, and an empty one ends it there.
 resolve_parked_rows() {
     local f="$1" n=0 claimed=" " w key
     local sess idx name pidx origin label sid cwd ts icwd extra
     [ -f "$f" ] || return 0
-    hold_exists || return 0
+
+    # The parked windows with no stash state — the only ones a row can land
+    # on. A missing holding session fails the call and leaves this empty.
+    local w_id w_state w_ar w_name bare=""
+    while IFS="$SEP" read -r w_id w_state w_ar w_name; do
+        [ -n "$w_id" ] && [ -z "$w_state" ] || continue
+        bare="${bare}${w_id}${SEP}${w_ar}${SEP}${w_name}"$'\n'
+    done < <(tmux list-windows -t "=$HOLD" -F "#{window_id}${SEP}#{@stash_origin}#{@stash_session}#{@stash_ts}${SEP}#{automatic-rename}${SEP}#{window_name}" 2>/dev/null)
+    [ -n "$bare" ] || return 0
 
     # Windows the session-id rows lay claim to.
     while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd extra; do
@@ -326,20 +444,29 @@ resolve_parked_rows() {
                k = ($8 != "") ? "d:" $8 : (($10 != "") ? "d:" $10 : "n:" $3); print k }' "$f")
 
     # The parked windows nothing owns yet, with every key each could answer to.
-    local w_id w_state w_ar w_name pool="" p
-    while IFS="$SEP" read -r w_id w_state w_ar w_name; do
-        [ -n "$w_id" ] && [ -z "$w_state" ] || continue
+    local pool="" p
+    while IFS="$SEP" read -r w_id w_ar w_name; do
+        [ -n "$w_id" ] || continue
         case "$claimed" in *" $w_id "*) continue ;; esac
         case "$w_ar" in 1|on) ;; *) pool="${pool}${w_id}${SEP}n:${w_name}"$'\n' ;; esac
         while IFS= read -r p; do
             pool="${pool}${w_id}${SEP}d:${p}"$'\n'
         done < <(tmux list-panes -t "$w_id" -F '#{pane_current_path}' 2>/dev/null)
-    done < <(tmux list-windows -t "=$HOLD" -F "#{window_id}${SEP}#{@stash_origin}#{@stash_session}#{@stash_ts}${SEP}#{automatic-rename}${SEP}#{window_name}" 2>/dev/null)
+    done <<< "$bare"
+
+    local snap; snap=$(restored_snapshot_time)
 
     while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd extra; do
         n=$((n + 1))
         [ "$sess" = "$HOLD" ] && [ -z "$sid" ] || continue
         [ -n "${origin}${label}${ts}" ] || continue
+        if [ -n "$snap" ]; then
+            # Strictly before: a park in the snapshot's own second may or may
+            # not have made it in. (The capture runs a second or two before the
+            # file's mtime; a park inside that gap is the residual.)
+            case "$ts" in ''|*[!0-9]*) continue ;; esac
+            [ "$ts" -lt "$snap" ] || continue
+        fi
         if [ -n "$cwd" ]; then key="d:$cwd"; elif [ -n "$icwd" ]; then key="d:$icwd"; else key="n:$name"; fi
         [ "$(printf '%s\n' "$keys" | grep -cxF -- "$key")" -eq 1 ] || continue
         w=$(window_for_row "$sess" "$idx" "$name" "$cwd" "$pidx" "$icwd") || continue
@@ -432,9 +559,11 @@ save_state() {
     # and is simply awaiting restore, otherwise in the orphans file where
     # `stash.sh list` prints the command to resume it by hand.
     local of; of=$(orphan_file)
+    # Session ids some window carries right now — from THIS snapshot, before
+    # the merge below adds carried-forward rows that no window holds yet.
+    local fresh_sids; fresh_sids=$(printf '%s\n' "$rows" | awk -F"$SEP" '$7!=""{print $7}')
     if [ -f "$sf" ]; then
         local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_extra
-        local fresh_sids; fresh_sids=$(printf '%s\n' "$rows" | awk -F"$SEP" '$7!=""{print $7}')
         # ONCE, not per row: live_sessions reads every session file, and this
         # ran inside the loop — O(rows) interpreter startups while holding a
         # lock, which after a restart (many rows, no options yet) is the slowest
@@ -488,6 +617,8 @@ save_state() {
 
     if [ -z "$rows" ]; then
         rm -f "$sf" 2>/dev/null
+        # Nothing on any window: this only folds repeats and merges pending rows.
+        orphans_reconcile "$of"
         lock_release "$SAVE_LOCKDIR"
         return 0
     fi
@@ -496,7 +627,14 @@ save_state() {
     # single failed list-windows used to leave an EMPTY sidecar and silently
     # drop every suspended conversation's off-server copy at once.
     tmp="${sf}.$$"
-    printf '%s\n' "$rows" > "$tmp" 2>/dev/null && mv -f "$tmp" "$sf" 2>/dev/null
+    if printf '%s\n' "$rows" > "$tmp" 2>/dev/null && mv -f "$tmp" "$sf" 2>/dev/null; then
+        # A session mirrored from a live window is not lost, whatever the
+        # orphans file says from an earlier restore. Only after the mirror is
+        # on disk, so a failed write never leaves a session in neither file.
+        # Unquoted on purpose: one uuid a word.
+        # shellcheck disable=SC2086
+        orphans_reconcile "$of" $fresh_sids
+    fi
     rm -f "$tmp" 2>/dev/null
     lock_release "$SAVE_LOCKDIR"
 }
@@ -508,6 +646,113 @@ save_state() {
 # state, so a skipped row was silently erased on the following park.
 ORPHAN_FILE=""
 orphan_file() { [ -n "$ORPHAN_FILE" ] || ORPHAN_FILE="$(resurrect_dir)/stash-orphans.tsv"; printf '%s' "$ORPHAN_FILE"; }
+
+# Take sessions that are on a window again OUT of the orphans file, fold any
+# repeated session id down to its first row, and merge in rows that were
+# parked in pending files (orphans_append's no-lock path). Caller holds
+# SAVE_LOCKDIR.
+#
+# Nothing used to remove an orphan once it was placed again — a restore that
+# matched it, or a save that found it mirrored from a live window — so
+# `stash.sh list` went on calling conversations "lost" that were sitting in
+# the stash with their ids on them (aa3db67d, bcf8d86e and 4664ef27, three
+# rows each, while @83/@84/@85 carried them).
+#
+# The arguments must be the ids carried in @stash_session by some window RIGHT
+# NOW, read from tmux — never what the sidecar says or what a match intended.
+# An orphan row is the last pointer to its conversation; it may only go when
+# another pointer demonstrably exists. Rows with no session id are left alone.
+#
+# The rewrite is read -> temp -> rename, and nothing else may be lost to it.
+# The lock should make it the only writer, but a lock can be broken out from
+# under a holder that outlives LOCK_STALE, and then an append landing between
+# the read and the rename would go to the inode being replaced. So:
+#   - the file is hard-linked aside and its inode+size recorded BEFORE the
+#     read, and read through that link;
+#   - if the file is no longer that inode at that size when the temp is ready,
+#     the rewrite is abandoned (the next save does it) — nothing is lost;
+#   - after the rename, anything appended to the old inode in the instant
+#     between that check and the rename is copied across from the link.
+# Only when something changes; an emptied file stays, empty (`list` tests -s).
+orphans_reconcile() {   # <orphans file> <sid>...
+    local of="$1" tmp prev sig size gone s p rc pend=(); shift
+    for p in "$of".pending.*; do
+        [[ $p =~ \.pending\.[0-9]+$ ]] && [ -f "$p" ] && pend+=("$p")
+    done
+    if [ "${#pend[@]}" -eq 0 ]; then
+        # The common case — the same real orphans, nothing to do — costs one
+        # read and no rewrite machinery.
+        [ -s "$of" ] || return 0
+        awk -F"$SEP" -v live=" $* " '$7 != "" && (index(live, " " $7 " ") || ($7 in seen)) { f = 1; exit }
+                                    { seen[$7] = 1 } END { exit !f }' "$of" 2>/dev/null || return 0
+    fi
+    [ -e "$of" ] || : >> "$of"
+    tmp="${of}.reconcile.$$"; prev="${of}.prev.$$"
+    ln -f "$of" "$prev" 2>/dev/null || return 0
+    sig=$(stat -f '%i %z' "$prev" 2>/dev/null)
+    : > "$tmp"
+    gone=$(awk -F"$SEP" -v live=" $* " -v out="$tmp" '
+            $7 != "" && index(live, " " $7 " ") { if (!($7 in g)) print $7; g[$7] = 1; d = 1; next }
+            $7 != "" && ($7 in seen)            { d = 1; next }
+            { if ($7 != "") seen[$7] = 1; print > out }
+            END { close(out); exit !d }' "$prev" ${pend[@]+"${pend[@]}"} 2>/dev/null)
+    rc=$?
+    # awk: 0 = rows dropped, 1 = nothing dropped (worth committing only to
+    # merge pending files), anything else = it FAILED (a read or write error
+    # - e.g. a full disk, the very condition that makes pending files exist)
+    # and $tmp may be truncated: never rename that over the file, and never
+    # delete pending rows it did not merge.
+    if { [ "$rc" = 0 ] || { [ "$rc" = 1 ] && [ "${#pend[@]}" -gt 0 ]; }; } && [ -n "$sig" ] \
+       && [ "$(stat -f '%i %z' "$of" 2>/dev/null)" = "$sig" ] \
+       && mv -f "$tmp" "$of" 2>/dev/null; then
+        size=${sig#* }
+        if [ "$(stat -f %z "$prev" 2>/dev/null || echo "$size")" -gt "$size" ]; then
+            tail -c +"$((size + 1))" "$prev" >> "$of" 2>/dev/null
+            log "rows appended during the orphans rewrite were carried over"
+        fi
+        [ "${#pend[@]}" -gt 0 ] && rm -f "${pend[@]}" 2>/dev/null
+        for s in $gone; do log "suspended session ${s%%-*} is on a window again — removed from ${of##*/}"; done
+    fi
+    rm -f "$tmp" "$prev" 2>/dev/null
+    return 0
+}
+
+# Append orphan rows, skipping any session id already recorded (or earlier in
+# this batch): the file is a hand-recovery list, and a repeat of the same
+# session reads in `stash.sh list` like another loss. <rows> is
+# newline-separated sidecar rows; <skip> optional space-separated ids to leave
+# out as well.
+#
+# With <locked> = 1 the caller holds SAVE_LOCKDIR and the rows go straight
+# into the file. Without it they must NOT: a concurrent orphans_reconcile
+# replaces the file by rename, and an append racing that is how a row ends up
+# in an unlinked inode. They go, complete, into a pending file of their own —
+# written aside, then renamed into view — which `list` reads and the next
+# locked reconcile merges.
+orphans_append() {   # <orphans file> <rows> [<skip>] [<locked>]
+    local of="$1" rows="$2" skip="${3:-}" locked="${4:-1}" line sid have dest out=""
+    [ -n "$rows" ] || return 0
+    mkdir -p "$(dirname "$of")" 2>/dev/null
+    have=" $skip $(cat "$of" "$of".pending.* 2>/dev/null | awk -F"$SEP" '$7 != "" { printf "%s ", $7 }')"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS="$SEP" read -r _ _ _ _ _ _ sid _ <<< "$line"
+        if [ -n "$sid" ]; then
+            case "$have" in *" $sid "*) continue ;; esac
+            have="$have$sid "
+        fi
+        out="$out$line"$'\n'
+    done <<< "$rows"
+    [ -n "$out" ] || return 0
+    if [ "$locked" = 1 ]; then
+        printf '%s' "$out" >> "$of" 2>/dev/null
+    else
+        dest="${of}.pending.$$"
+        { [ -f "$dest" ] && cat "$dest"; printf '%s' "$out"; } > "${dest}-w" 2>/dev/null \
+            && mv -f "${dest}-w" "$dest" 2>/dev/null
+        log "orphans file lock unavailable — $(printf '%s' "$out" | wc -l | tr -d ' ') row(s) kept in ${dest##*/} until the next save merges them"
+    fi
+}
 
 # Drop specific session ids from the sidecar. The kill path only: everywhere
 # else a sid that leaves live state must be PRESERVED — that is save_state's
@@ -567,6 +812,23 @@ apply_row() {   # <win> <origin> <label> <sid> <cwd> <pidx> <ts>
 do_restore_state() {
     local sf of; sf=$(state_file); of=$(orphan_file)
     local sess idx name pidx origin label sid cwd ts icwd extra win existing kept=""
+
+    # Which snapshot was just restored, for resolve_parked_rows (see
+    # restored_snapshot_time). As resurrect's post-restore hook this runs with
+    # `last` on exactly the file restore.sh read — the time inferred_snapshot_time
+    # gives whenever `last` predates the server, which a restart's restore
+    # always does. Recorded now, before a continuum save moves `last` on and
+    # the inference has to guess (and can guess a guard-rejected save). If
+    # `last` is already newer than the server — a manual restore into a
+    # running one, or this run by hand later — the inference's older answer
+    # stands, and so does any EARLIER value already recorded: an earlier time
+    # only refuses more.
+    local snap old
+    snap=$(inferred_snapshot_time)
+    old=$(tmux show -gqv @stash_snapshot_ts 2>/dev/null)
+    case "$old" in ''|*[!0-9]*) ;; *) { [ -z "$snap" ] || [ "$old" -lt "$snap" ]; } && snap="$old" ;; esac
+    [ -n "$snap" ] && tmux set-option -g @stash_snapshot_ts "$snap" 2>/dev/null
+
     # ts is field 9 and icwd field 10, each absent from sidecars written before
     # it was mirrored; such a row reads them as "" and restores the rest.
     if [ -f "$sf" ]; then
@@ -612,7 +874,7 @@ do_restore_state() {
                       = "${origin}${SEP}${label}${SEP}${ts}" ] && continue
                 # Say WHAT is lost: the next save drops a row it cannot place,
                 # so this line is the last record of it.
-                log "could not re-apply parked state to $sess:$idx (from ${origin:-?}${label:+, \"$label\"}) — no window can be told apart as its own${icwd:+ (in $icwd)}; not re-applied"
+                log "could not re-apply parked state to $sess:$idx (from ${origin:-?}${label:+, \"$label\"}) — no window can be told apart as its own${icwd:+ (in $icwd)}, or it was parked after the restored snapshot; not re-applied"
                 continue
             fi
             apply_row "$win" "$origin" "$label" "" "$cwd" "$pidx" "$ts"
@@ -620,9 +882,30 @@ do_restore_state() {
         done < "$sf"
     fi
 
-    if [ -n "$kept" ]; then
-        mkdir -p "$(dirname "$of")" 2>/dev/null
-        printf '%s' "$kept" >> "$of" 2>/dev/null
+    # The orphans file, under the sidecar's lock like every other writer of it
+    # (save_state appends to it while holding that lock, and this used to
+    # append unlocked and undeduplicated — a restore run twice doubled every
+    # row). First drop whatever this restore put back on a window: the ids are
+    # read back from tmux, not taken from what apply_row was asked to do, so an
+    # orphan only goes when a window demonstrably carries it. Then append what
+    # could not be placed, minus ids already recorded (and minus ids on a
+    # window — a second sidecar row for a session another row just placed is
+    # not a loss).
+    #
+    # The lock is WAITED for, with no cap: these rows may be the only pointer
+    # to their conversations, and a held lock always ends (released, or broken
+    # once stale). Only a lock that cannot be created at all gets past that,
+    # and then the rows go to a pending file of their own rather than into
+    # the orphans file unlocked — an unlocked append can land in the inode a
+    # concurrent rewrite is replacing, and vanish (see orphans_append).
+    if [ -n "$kept" ] || [ -s "$of" ]; then
+        local locked=0 on_windows
+        lock_acquire "$SAVE_LOCKDIR" wait && locked=1
+        on_windows=$(tmux list-windows -a -F '#{@stash_session}' 2>/dev/null | grep -v '^$' | tr '\n' ' ')
+        # shellcheck disable=SC2086
+        [ "$locked" = 1 ] && orphans_reconcile "$of" $on_windows
+        orphans_append "$of" "$kept" "$on_windows" "$locked"
+        [ "$locked" = 1 ] && lock_release "$SAVE_LOCKDIR"
     fi
 
     # Every parked window should now have an origin: park_one stamps it before
@@ -2281,17 +2564,25 @@ do_list() {
     # These are the ones with no tmux state left at all, so print the command
     # that gets them back — this listing is the only place the id still exists.
     local of; of=$(orphan_file)
-    if [ -s "$of" ]; then
+    # Plus rows still waiting in pending files (orphans_append's no-lock path)
+    # for the next save to merge.
+    local pend=() p
+    for p in "$of".pending.*; do
+        [[ $p =~ \.pending\.[0-9]+$ ]] && [ -s "$p" ] && pend+=("$p")
+    done
+    if [ -s "$of" ] || [ "${#pend[@]}" -gt 0 ]; then
         echo
         echo "  Suspended sessions that lost their window (resume by hand):"
         # Trailing _ts/_icwd/_extra keep cwd clean on 9/10-field rows (see
         # save_state). The pane directory is the next-best guess when no cwd
         # was recorded — better than the `cd ?` that cannot be pasted.
-        local _ts _icwd _extra
+        local _ts _icwd _extra seen=" "
         while IFS="$SEP" read -r sess idx name pidx origin label sid cwd _ts _icwd _extra; do
             [ -n "$sid" ] || continue
+            case "$seen" in *" $sid "*) continue ;; esac
+            seen="$seen$sid "
             printf '    %-28s cd %s && claude --resume %s\n' "${label:-$name}" "${cwd:-${_icwd:-?}}" "$sid"
-        done < "$of"
+        done < <(cat "$of" ${pend[@]+"${pend[@]}"} 2>/dev/null)
         echo "  (delete $of once you have dealt with them)"
     fi
 }

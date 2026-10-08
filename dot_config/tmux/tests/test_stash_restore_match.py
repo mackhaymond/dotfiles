@@ -21,6 +21,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 SCRIPTS = Path(os.environ.get(
@@ -130,7 +131,10 @@ with p.with_suffix(".lock").open("a") as lock:
                 if unset: o.pop(name, None)
                 else: o[name] = val
     elif cmd == "display-message":
-        if has_flag(c, "p"):
+        if has_flag(c, "p") and arg(c, "-t") is None:
+            # Server-wide formats only (#{start_time}); no current window here.
+            out = [render(c[-1], {"start_time": s.get("start_time", "")})]
+        elif has_flag(c, "p"):
             wid, pn = resolve(s, arg(c, "-t"))
             if wid is None: rc = 1
             else: out = [render(c[-1], wvars(s, wid, pn))]
@@ -192,11 +196,33 @@ class FakeEnv:
         self.orphans = self.rdir / "stash-orphans.tsv"
         self.logfile = self.home / "Library/Logs/tmux-stash.log"
 
-    def set_server(self, windows):
+    def set_server(self, windows, start_time=""):
         n = max([int(w[1:]) for w in windows] or [0]) + 100
         self.state.write_text(json.dumps({
             "windows": windows, "globals": {"@resurrect-dir": str(self.rdir)},
-            "calls": [], "messages": [], "next": n}))
+            "calls": [], "messages": [], "next": n, "start_time": str(start_time)}))
+
+    def snapshot(self, stamp, mtime=None, last=True):
+        """A resurrect save captured at <stamp>; `last` -> it, as resurrect-save.sh links it.
+
+        Named the way resurrect-save.sh names it (local-time `date
+        +%Y%m%dT%H%M%S`). <mtime> defaults to the stamp; the post-save hook
+        makes it later in real life. The link itself is created NOW, so its
+        own (lstat) mtime is not the snapshot's — as after an unchanged save
+        or a resurrect-guard revert."""
+        mtime = stamp if mtime is None else mtime
+        f = self.rdir / ("tmux_resurrect_%s.txt" % time.strftime("%Y%m%dT%H%M%S", time.localtime(stamp)))
+        f.write_text("pane\tstash\t1\n")
+        os.utime(f, (mtime, mtime))
+        if last:
+            link = self.rdir / "last"
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            os.symlink(f.name, link)
+        return f
+
+    def calls(self):
+        return self.server()["calls"]
 
     def server(self):
         return json.loads(self.state.read_text())
@@ -204,10 +230,12 @@ class FakeEnv:
     def opts(self, wid):
         return self.server()["windows"][wid].get("opts", {})
 
-    def run(self, *args):
-        env = {"HOME": str(self.home), "TMPDIR": str(self.tmp) + "/",
+    def run(self, *args, tmpdir=None):
+        env = {"HOME": str(self.home), "TMPDIR": (tmpdir or str(self.tmp)) + "/",
                "PATH": f"{self.bin}:{BASH_DIR}:/usr/bin:/bin",
                "FAKE_TMUX_STATE": str(self.state), "STASH_SELF": "/usr/bin/true"}
+        if "TZ" in os.environ:      # snapshot stamps are local time on both sides
+            env["TZ"] = os.environ["TZ"]
         r = subprocess.run(["bash", str(STASH), *args], env=env,
                            capture_output=True, text=True, timeout=60)
         unhandled = [l for l in r.stderr.splitlines() if "fake tmux: unhandled" in l]
@@ -451,6 +479,180 @@ class RestoreMatch(unittest.TestCase):
         self.assertEqual(o.get("@stash_origin"), "main")
         self.assertEqual(o.get("@stash_label"), "Bruincast")
         self.assertEqual(o.get("@stash_ts"), "1790796914")
+
+
+T0 = 1790900000          # the resurrect snapshot that gets restored
+T1 = T0 + 300            # A parked, inside the 15-minute continuum interval
+T2 = T0 + 600            # tmux restarts
+
+
+class StaleSnapshot(unittest.TestCase):
+    """F3: a stale snapshot can leave exactly ONE candidate window for a sid-less row.
+
+    Snapshot at T0 has X parked at stash:1 in $HOME. By T1, X was unparked and
+    busy agent A (also in $HOME, so not suspended) parked; renumber put A at
+    stash:1 and the sidecar's slot-1 row is A's. tmux restarts and restores T0:
+    stash:1 is X, with no state; A's key is unique and X is the only pool
+    window, so every uniqueness test passes — and A's origin/label/ts land on X.
+    """
+
+    def setUp(self):
+        self.env = FakeEnv()
+        self.addCleanup(self.env.cleanup)
+
+    def restored_server(self, e, start_time=T2):
+        e.set_server({
+            "@30": win("stash", 1, "zsh", "/Users/u", AUTO),        # X, from the T0 snapshot
+            "@31": win("main", 1, "zsh", "/Users/u/code", AUTO),
+        }, start_time=start_time)
+
+    def a_row(self, ts=str(T1)):
+        return row("stash", "1", "2.1.291", "", "work", "Tab A", "", "", ts, "/Users/u")
+
+    def assert_x_untouched(self, e):
+        self.assertEqual({k: v for k, v in e.opts("@30").items() if k.startswith("@stash")}, {})
+
+    def test_restore_does_not_put_a_later_park_on_the_snapshot_window(self):
+        e = self.env
+        e.sidecar.write_text(self.a_row())
+        # Started well after the link was made, so a script that read the
+        # LINK's own mtime (now) instead of its target's (T0) would place A.
+        e.snapshot(T0)
+        self.restored_server(e, start_time=int(time.time()) + 3600)
+        r = e.run("restore-state")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assert_x_untouched(e)
+        self.assertIn('could not re-apply parked state to stash:1 (from work, "Tab A")', e.log())
+
+    def test_save_time_merge_does_not_carry_it_either(self):
+        e = self.env
+        e.sidecar.write_text(self.a_row())
+        e.snapshot(T0)
+        self.restored_server(e)
+        r = e.run("publish")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Tab A", e.sidecar.read_text() if e.sidecar.exists() else "")
+        r = e.run("restore-state")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assert_x_untouched(e)
+
+    def test_a_save_after_the_restart_does_not_unlock_it(self):
+        """`last` moves on with every save of THIS server; the restored one predates it."""
+        e = self.env
+        e.sidecar.write_text(self.a_row())
+        e.snapshot(T0)
+        e.snapshot(T2 + 900)          # continuum, 15 minutes into the new server
+        self.restored_server(e)
+        r = e.run("restore-state")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assert_x_untouched(e)
+
+    def test_a_park_that_predates_the_snapshot_is_still_placed(self):
+        """The test is the park time, not a blanket refusal."""
+        e = self.env
+        e.sidecar.write_text(self.a_row(ts=str(T0 - 60)))
+        e.snapshot(T0)
+        e.snapshot(T2 + 900)
+        self.restored_server(e)
+        r = e.run("restore-state")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        o = e.opts("@30")
+        self.assertEqual(o.get("@stash_origin"), "work")
+        self.assertEqual(o.get("@stash_label"), "Tab A")
+        self.assertEqual(o.get("@stash_ts"), str(T0 - 60))
+
+    def test_a_row_without_a_park_time_is_not_placed_against_a_snapshot(self):
+        """Nothing shows it predates the snapshot, so it is refused."""
+        e = self.env
+        e.sidecar.write_text(self.a_row(ts=""))
+        e.snapshot(T0)
+        self.restored_server(e)
+        r = e.run("restore-state")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assert_x_untouched(e)
+
+    def test_the_capture_time_is_the_name_not_the_mtime(self):
+        """resurrect-save-repair.py os.replace()s the file seconds after the capture."""
+        e = self.env
+        e.sidecar.write_text(self.a_row(ts=str(T0 + 5)))      # parked just after the capture
+        e.snapshot(T0, mtime=T0 + 20)                          # file rewritten by the hook
+        self.restored_server(e)
+        r = e.run("restore-state")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assert_x_untouched(e)
+        self.assertEqual(e.server()["globals"].get("@stash_snapshot_ts"), str(T0))
+
+    def test_the_restored_snapshot_is_recorded_and_beats_a_guard_rejected_save(self):
+        """L2: a rejected save R is newer than the good G that `last` was reverted to."""
+        e = self.env
+        G, R = T0 - 900, T0
+        e.sidecar.write_text(self.a_row(ts=str(G + 300)))      # parked between G and R
+        e.snapshot(R)                                          # the rejected shrink save...
+        e.snapshot(G)                                          # ...and `last` reverted to G
+        self.restored_server(e)
+        r = e.run("restore-state")                             # the post-restore hook
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(e.server()["globals"].get("@stash_snapshot_ts"), str(G))
+        self.assert_x_untouched(e)
+        # Continuum moves `last` past the server start; inference alone would
+        # now pick R and let the save-time merge carry A's row onto X.
+        e.snapshot(T2 + 900)
+        r = e.run("publish")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Tab A", e.sidecar.read_text() if e.sidecar.exists() else "")
+
+    def test_a_rerun_of_restore_state_never_moves_the_recorded_time_later(self):
+        e = self.env
+        e.snapshot(T0)
+        self.restored_server(e)
+        e.run("restore-state")
+        e.snapshot(T2 + 900)
+        r = e.run("restore-state")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(e.server()["globals"].get("@stash_snapshot_ts"), str(T0))
+
+
+class PublishCost(unittest.TestCase):
+    """Every publish ran resolve_parked_rows' per-row work under the lock."""
+
+    def setUp(self):
+        self.env = FakeEnv()
+        self.addCleanup(self.env.cleanup)
+
+    def test_steady_state_publish_does_no_per_row_work(self):
+        e = self.env
+        sids = ["aa3db67d-0000-0000-0000-000000000001", "bcf8d86e-0000-0000-0000-000000000002",
+                "4664ef27-0000-0000-0000-000000000003"]
+        side = ""
+        windows = {"@9": win("main", 1, "zsh", "/Users/u", AUTO)}
+        for i, (wid, sid) in enumerate(zip(["@83", "@84", "@85"], sids), 1):
+            side += row("stash", str(i), "zsh", "0", "main", "Tab %d" % i, sid, "/Users/u", "179080000%d" % i, "/Users/u")
+            windows[wid] = win("stash", i, "zsh", "/Users/u",
+                               {**AUTO, "@stash_origin": "main", "@stash_label": "Tab %d" % i,
+                                "@stash_session": sid, "@stash_cwd": "/Users/u",
+                                "@stash_pane_idx": "0", "@stash_ts": "179080000%d" % i})
+        side += row("stash", "4", "claude", "", "main", "Tab 4", "", "", "1790800004", "/Users/u")
+        windows["@86"] = win("stash", 4, "claude", "/Users/u",
+                             {**AUTO, "@stash_origin": "main", "@stash_label": "Tab 4",
+                              "@stash_ts": "1790800004"})
+        e.sidecar.write_text(side)
+        e.snapshot(T0)
+        e.set_server(windows, start_time=T2)
+        before = e.sidecar.read_text()
+
+        r = e.run("publish")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = e.calls()
+        verbs = [c[0] for c in calls]
+        # window_for_row is has-session + list-windows + list-panes +
+        # display-message per row; the pool is a list-panes per window; the
+        # snapshot time is a display-message. None of it may run.
+        self.assertNotIn("list-panes", verbs, calls)
+        self.assertNotIn("display-message", verbs, calls)
+        self.assertEqual(verbs.count("has-session"), 1, calls)    # count()'s, nothing else
+        self.assertLessEqual(len(calls), 7, calls)
+        # ...and the mirror is unchanged.
+        self.assertEqual(sorted(e.sidecar.read_text().splitlines()), sorted(before.splitlines()))
 
 
 if __name__ == "__main__":
