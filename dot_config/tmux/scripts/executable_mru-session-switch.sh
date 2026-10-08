@@ -18,7 +18,10 @@ is_valid_session_name() {
 # sessions; fields split on US because an empty option must stay a field.
 decorate() {
   local us=$'\x1f'
-  awk -F '\t' 'NR == FNR { d[$1] = $2; next } { print $1 "\t" d[$1] }' \
+  # FILENAME, not NR == FNR: with no agent state anywhere the rollup input is
+  # EMPTY, NR == FNR then holds for the session list too, every row was
+  # swallowed into d[] and the picker showed nothing at all.
+  awk -F '\t' 'FILENAME == ARGV[1] { d[$1] = $2; next } { print $1 "\t" d[$1] }' \
     <(tmux list-windows -a -F "#{session_name}${us}#{@agent_state}${us}#{@agent_workflow}${us}#{@agent_cua}" 2>/dev/null |
       awk -F "$us" '
         function rank(st, wf, cua) {
