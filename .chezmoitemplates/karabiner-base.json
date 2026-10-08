@@ -155,7 +155,21 @@
                                 "type": "basic"
                             },
                             {
-                                "description": "WezTerm: second quick tap of right_shift flips to the previous tmux session/window (@double_tap_target).",
+                                "description": "Third quick tap of right_shift sends control+option+command+0, the camera preview (moved off right_command, which CuaNotch dictation now owns). One variable per stage: every manipulator's delayed-action cancel runs on every key-down, after the matching one, so a shared variable would be reset right after stage 2 set it.",
+                                "conditions": [{ "type": "variable_if", "name": "right_shift_tap2", "value": 1 }],
+                                "from": {
+                                    "key_code": "right_shift",
+                                    "modifiers": { "optional": ["any"] }
+                                },
+                                "to": [
+                                    { "set_variable": { "name": "right_shift_tap2", "value": 0 } },
+                                    { "key_code": "right_shift" }
+                                ],
+                                "to_if_alone": [{ "key_code": "0", "modifiers": ["left_control", "left_option", "left_command"] }],
+                                "type": "basic"
+                            },
+                            {
+                                "description": "WezTerm: second quick tap of right_shift flips to the previous tmux session/window (@double_tap_target), and arms the third tap.",
                                 "conditions": [
                                     { "type": "frontmost_application_if", "bundle_identifiers": ["^com\\.github\\.wez\\.wezterm$"] },
                                     { "type": "variable_if", "name": "right_shift_tapped", "value": 1 }
@@ -166,13 +180,19 @@
                                 },
                                 "to": [
                                     { "set_variable": { "name": "right_shift_tapped", "value": 0 } },
+                                    { "set_variable": { "name": "right_shift_tap2", "value": 1 } },
                                     { "key_code": "right_shift" }
                                 ],
                                 "to_if_alone": [{ "shell_command": "$HOME/.config/tmux/scripts/double-tap-switch.sh" }],
+                                "to_delayed_action": {
+                                    "to_if_invoked": [{ "set_variable": { "name": "right_shift_tap2", "value": 0 } }],
+                                    "to_if_canceled": [{ "set_variable": { "name": "right_shift_tap2", "value": 0 } }]
+                                },
+                                "parameters": { "basic.to_delayed_action_delay_milliseconds": 400 },
                                 "type": "basic"
                             },
                             {
-                                "description": "Arc: second quick tap of right_shift sends ctrl+tab (was BetterTouchTool).",
+                                "description": "Arc: second quick tap of right_shift sends ctrl+tab (was BetterTouchTool), and arms the third tap.",
                                 "conditions": [
                                     { "type": "frontmost_application_if", "bundle_identifiers": ["^company\\.thebrowser\\.Browser$"] },
                                     { "type": "variable_if", "name": "right_shift_tapped", "value": 1 }
@@ -183,16 +203,38 @@
                                 },
                                 "to": [
                                     { "set_variable": { "name": "right_shift_tapped", "value": 0 } },
+                                    { "set_variable": { "name": "right_shift_tap2", "value": 1 } },
                                     { "key_code": "right_shift" }
                                 ],
                                 "to_if_alone": [{ "key_code": "tab", "modifiers": ["left_control"] }],
+                                "to_delayed_action": {
+                                    "to_if_invoked": [{ "set_variable": { "name": "right_shift_tap2", "value": 0 } }],
+                                    "to_if_canceled": [{ "set_variable": { "name": "right_shift_tap2", "value": 0 } }]
+                                },
+                                "parameters": { "basic.to_delayed_action_delay_milliseconds": 400 },
                                 "type": "basic"
                             },
                             {
-                                "description": "WezTerm/Arc: first tap of right_shift arms the double-tap; any other key, or 400ms, disarms it.",
-                                "conditions": [
-                                    { "type": "frontmost_application_if", "bundle_identifiers": ["^com\\.github\\.wez\\.wezterm$", "^company\\.thebrowser\\.Browser$"] }
+                                "description": "Elsewhere: second quick tap of right_shift only arms the third tap; any other key, or 400ms, disarms it.",
+                                "conditions": [{ "type": "variable_if", "name": "right_shift_tapped", "value": 1 }],
+                                "from": {
+                                    "key_code": "right_shift",
+                                    "modifiers": { "optional": ["any"] }
+                                },
+                                "to": [
+                                    { "set_variable": { "name": "right_shift_tapped", "value": 0 } },
+                                    { "set_variable": { "name": "right_shift_tap2", "value": 1 } },
+                                    { "key_code": "right_shift" }
                                 ],
+                                "to_delayed_action": {
+                                    "to_if_invoked": [{ "set_variable": { "name": "right_shift_tap2", "value": 0 } }],
+                                    "to_if_canceled": [{ "set_variable": { "name": "right_shift_tap2", "value": 0 } }]
+                                },
+                                "parameters": { "basic.to_delayed_action_delay_milliseconds": 400 },
+                                "type": "basic"
+                            },
+                            {
+                                "description": "First tap of right_shift arms the second; any other key, or 400ms, disarms it.",
                                 "from": {
                                     "key_code": "right_shift",
                                     "modifiers": { "optional": ["any"] }
@@ -242,55 +284,6 @@
                                     "modifiers": { "mandatory": ["command", "control", "option", "shift"] }
                                 },
                                 "to": [{ "key_code": "c", "modifiers": ["left_shift", "left_command"] }],
-                                "type": "basic"
-                            },
-                            {
-                                "description": "Third quick tap of right_command sends control+option+command+0 (was BetterTouchTool). One variable per stage: every manipulator's delayed-action cancel runs on every key-down, after the matching one, so a shared variable would be reset right after stage 2 set it.",
-                                "conditions": [{ "type": "variable_if", "name": "right_command_tap2", "value": 1 }],
-                                "from": {
-                                    "key_code": "right_command",
-                                    "modifiers": { "optional": ["any"] }
-                                },
-                                "to": [
-                                    { "set_variable": { "name": "right_command_tap2", "value": 0 } },
-                                    { "key_code": "right_command" }
-                                ],
-                                "to_if_alone": [{ "key_code": "0", "modifiers": ["left_control", "left_option", "left_command"] }],
-                                "type": "basic"
-                            },
-                            {
-                                "description": "Second quick tap of right_command arms the third; any other key, or 400ms, disarms it.",
-                                "conditions": [{ "type": "variable_if", "name": "right_command_tap1", "value": 1 }],
-                                "from": {
-                                    "key_code": "right_command",
-                                    "modifiers": { "optional": ["any"] }
-                                },
-                                "to": [
-                                    { "set_variable": { "name": "right_command_tap2", "value": 1 } },
-                                    { "key_code": "right_command" }
-                                ],
-                                "to_delayed_action": {
-                                    "to_if_invoked": [{ "set_variable": { "name": "right_command_tap2", "value": 0 } }],
-                                    "to_if_canceled": [{ "set_variable": { "name": "right_command_tap2", "value": 0 } }]
-                                },
-                                "parameters": { "basic.to_delayed_action_delay_milliseconds": 400 },
-                                "type": "basic"
-                            },
-                            {
-                                "description": "First tap of right_command arms the second; any other key, or 400ms, disarms it.",
-                                "from": {
-                                    "key_code": "right_command",
-                                    "modifiers": { "optional": ["any"] }
-                                },
-                                "to": [
-                                    { "set_variable": { "name": "right_command_tap1", "value": 1 } },
-                                    { "key_code": "right_command" }
-                                ],
-                                "to_delayed_action": {
-                                    "to_if_invoked": [{ "set_variable": { "name": "right_command_tap1", "value": 0 } }],
-                                    "to_if_canceled": [{ "set_variable": { "name": "right_command_tap1", "value": 0 } }]
-                                },
-                                "parameters": { "basic.to_delayed_action_delay_milliseconds": 400 },
                                 "type": "basic"
                             },
                             {
