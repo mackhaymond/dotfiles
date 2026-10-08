@@ -134,10 +134,13 @@ def main():
     if cur.get('session_id') == sid:
         payload = dict(cur, **payload)
     if not payload.get('transcript_path'):
+        # NOT `path`: that name holds this pane's record file, which the
+        # os.replace() below writes. Reusing it (11b3dad) made a first binding
+        # write the record OVER Codex's own rollout transcript.
         try:
-            path = rollout_path(sid)
-            if path:
-                payload['transcript_path'] = path
+            rollout = rollout_path(sid)
+            if rollout:
+                payload['transcript_path'] = rollout
         except Exception:
             pass
     # Resolving a live binding again prevents delayed reconciliation from

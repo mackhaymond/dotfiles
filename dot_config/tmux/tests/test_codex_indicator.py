@@ -16,7 +16,7 @@ import unittest
 import uuid
 
 SOURCE = Path(os.environ.get("AGENT_INDICATOR_SOURCE", str(Path.home() / ".local/share/chezmoi/dot_config/tmux/scripts/executable_agent-tab-indicator.sh")))
-TRACKER = Path.home() / ".local/bin/codex-session-track"
+TRACKER = Path(os.environ.get("CODEX_SESSION_TRACK_SOURCE", str(Path.home() / ".local/bin/codex-session-track")))
 
 FAKE_TMUX = r'''#!/usr/bin/env python3
 import fcntl,json,os,subprocess,sys
@@ -323,6 +323,28 @@ class IndicatorIntegrationTests(unittest.TestCase):
         self.assertEqual(path.read_text(), before)
         track(agent_id="subagent", transcript_path="/wrong")
         self.assertEqual(path.read_text(), before)
+
+    def test_first_binding_never_overwrites_the_rollout(self):
+        # Regression for 11b3dad: the DB-resolved rollout path reused the
+        # name of the pane's record file, so a first binding (no
+        # transcript_path in the payload) os.replace()d the tracker's JSON
+        # record over Codex's own rollout transcript.
+        rollout = self.root / ".codex/sessions/2026/10/07/rollout-aaaa.jsonl"
+        rollout.parent.mkdir(parents=True)
+        original = (b'{"type":"session_meta","payload":{"id":"aaaa"}}\n'
+                    b'{"type":"response_item","payload":{"role":"user","content":"keep me"}}\n')
+        rollout.write_bytes(original)
+        with sqlite3.connect(self.root / ".codex/state_5.sqlite") as db:
+            db.execute("create table threads (id text, rollout_path text)")
+            db.execute("insert into threads values (?, ?)", ("aaaa", str(rollout)))
+        result = subprocess.run([str(TRACKER)], input=json.dumps({"hook_event_name": "SessionStart",
+            "session_id": "aaaa", "cwd": "/work/project"}), text=True, env=self.env,
+            capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(rollout.read_bytes(), original)
+        record = self.root / "tmux-assistant-resurrect/codex-123.json"
+        self.assertTrue(record.exists(), "tracker never wrote the pane record")
+        self.assertEqual(json.loads(record.read_text())["transcript_path"], str(rollout))
 
     @unittest.skipUnless(shutil.which("tmux"), "tmux executable required")
     def test_real_detached_server_state_lifecycle(self):
