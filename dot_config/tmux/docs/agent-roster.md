@@ -1,4 +1,4 @@
-# Agent roster (`prefix e`)
+# Agent roster (`prefix q`)
 
 A herdr-style list of every agent across every tmux session, in one popup.
 It is a **reader**: everything it shows comes from the per-window options the
@@ -7,10 +7,10 @@ It keeps no state and runs only while the popup is open.
 
 | Key | Does |
 |---|---|
-| `prefix e` / `prefix C-e` | open the roster |
+| `prefix q` / `prefix C-q` | open the roster |
 | Tab / Shift-Tab, `j` / `k`, arrows | move |
 | Space / ⏎ | go there (a parked tab comes back via `stash.sh unstash`) |
-| `g` | next tab that needs you (same as `prefix g`) |
+| `d` | next tab that needs you (same as `prefix d`) |
 | `x` | close the agent's pane through `closed-tabs.sh`, after y/n; CMD+Z undoes it. On a parked row: discard it through `stash.sh kill-many` |
 | `H` | park the tab (`stash.sh stash`, which suspends the agent), after y/n |
 | `/` | filter by `session:index title`; ⏎ keeps it, esc clears it |
@@ -18,8 +18,8 @@ It keeps no state and runs only while the popup is open.
 | `r` | restart the watcher (only needed when the red banner says so) |
 | esc / `q` | close |
 
-Related keys: `prefix g` / `prefix C-g` jump to the next tab that needs you,
-`prefix G` jumps back (scripts/agent-jump.sh).
+Related keys: `prefix d` / `prefix C-d` jump to the next tab that needs you,
+`prefix D` jumps back (scripts/agent-jump.sh).
 
 ## Layout
 

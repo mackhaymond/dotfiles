@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""agent-roster.py: prefix e, every agent across every tmux session in one popup.
+"""agent-roster.py: prefix q, every agent across every tmux session in one popup.
 
 A READER of the state the hook pipeline already keeps on each window
 (@agent_state, @agent_summary, @agent_workflow, @agent_cua, @agent_since; see
@@ -13,7 +13,7 @@ its command, and `display -p` inside a popup resolves to tmux's "best" client,
 not necessarily the one that pressed the key. tmux.conf therefore binds this
 through `run-shell -C`, which does expand them.
 
-LAUNCH SPEED (prefix e should paint in well under 100 ms; docs/agent-roster.md
+LAUNCH SPEED (prefix q should paint in well under 100 ms; docs/agent-roster.md
 has the per-stage numbers). The binding runs no shell and no tmux client: it
 execs a real python3 (Homebrew's, never the /usr/bin xcrun stub or a pyenv
 shim) with -I -S. Stays Python 3.9-compatible all the same, because 3.9 is the
@@ -22,7 +22,7 @@ computed here, from the same list-windows rows (needs_order), instead of
 forking `agent-jump.sh list` (bash + tmux + awk + sort + awk + cut) each tick.
 
 Layout: NEEDS YOU on top, in agent-jump.sh's own order, so this list and
-prefix g can never disagree: needs_order mirrors its `list` pipeline, and
+prefix d can never disagree: needs_order mirrors its `list` pipeline, and
 tests/test_agent_roster.py pins the two against each other by running the real
 script on the same fixtures. Moves still go through agent-jump.sh. Then one
 group per session, most recently used
@@ -161,7 +161,7 @@ _XFRM = None
 def collation(name=""):
     """The collation agent-jump.sh's `sort` uses: the libc collation of the
     environment's locale (LC_ALL > LC_COLLATE > LANG; "" = from the env), as
-    strxfrm. prefix g runs under en_US.UTF-8, where `_x` sorts before `a`
+    strxfrm. prefix d runs under en_US.UTF-8, where `_x` sorts before `a`
     and `a` before `B`; a plain str sort would not. See needs_order for what
     happens when it calls two strings equal."""
     global _XFRM
@@ -682,7 +682,7 @@ class Roster:
                 run_bg("'%s' unstash '%s' '%s'" % (STASH, w["id"], self.client))
                 return True
             return self.jump("goto", w["id"])
-        elif key == "g":
+        elif key == "d":
             return self.jump("next")
         elif key == "x" and it and it["kind"] == "win":
             self.confirm = {"action": "close", "w": it["w"]}
@@ -813,7 +813,7 @@ class Roster:
             foot = " " + fg("sky") + self.msg
         else:
             q = (fg("peach") + " /" + self.query + fg("overlay") + " · ") if self.query else " "
-            foot = q + fg("overlay") + "tab/j/k move · space/⏎ go · g next · x close · H park · / filter · a all · esc"
+            foot = q + fg("overlay") + "tab/j/k move · space/⏎ go · d next · x close · H park · / filter · a all · esc"
         lines.append("")
         lines.append(foot)
 

@@ -1,7 +1,7 @@
 """agent-roster.py's pure model: parsing, grouping, key decoding. No real tmux, no terminal.
 
 NeedsOrderTests runs the REAL agent-jump.sh against test_agent_jump_watcher's
-fake tmux, to pin the roster's in-process NEEDS YOU order to prefix g's."""
+fake tmux, to pin the roster's in-process NEEDS YOU order to prefix d's."""
 import importlib.util
 import locale
 import os
@@ -309,7 +309,7 @@ class ActTests(unittest.TestCase):
         def missing(argv, **kw):
             raise FileNotFoundError(2, "No such file or directory")
         R.subprocess.run = missing
-        self.assertFalse(self.r.act("g"))
+        self.assertFalse(self.r.act("d"))
         self.assertIn("failed", self.r.msg)
 
     def test_goto_closes_popup(self):
@@ -494,7 +494,7 @@ NEEDS_FIXTURE = {
 
 class NeedsOrderTests(unittest.TestCase):
     """needs_order() must give exactly agent-jump.sh `list`'s order: NEEDS YOU
-    and prefix g agree only as long as these two do."""
+    and prefix d agree only as long as these two do."""
     TTY = "/dev/ttys999"
 
     def setUp(self):
@@ -605,15 +605,15 @@ class RefreshTests(unittest.TestCase):
 
 
 class BindingTests(unittest.TestCase):
-    """prefix e's launch path, as written in tmux.conf.tmpl."""
+    """prefix q's launch path, as written in tmux.conf.tmpl."""
 
     def lines(self):
-        return [l for l in TMUX_CONF.read_text().splitlines() if re.match(r"bind-key (e|C-e) ", l)]
+        return [l for l in TMUX_CONF.read_text().splitlines() if re.match(r"bind-key (q|C-q) ", l)]
 
     def test_fast_launch(self):
         ls = self.lines()
         self.assertEqual(len(ls), 2)
-        self.assertEqual(ls[0].split(None, 2)[2], ls[1].split(None, 2)[2])   # e and C-e: same command
+        self.assertEqual(ls[0].split(None, 2)[2], ls[1].split(None, 2)[2])   # q and C-q: same command
         cmd = ls[0]
         # No shell around display-popup, no tmux client process.
         self.assertIn('run-shell -C "display-popup ', cmd)

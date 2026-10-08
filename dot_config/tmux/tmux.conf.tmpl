@@ -273,7 +273,7 @@ set -g @catppuccin_window_current_fill "number"
 # Motion means the same thing in both: pulsing = in flight, steady = waiting
 # on you. Don't reassign a hue in one surface without the others. There are
 # THREE now (2026-10-07): this tab bar, CuaNotch, and the HEX table in
-# scripts/agent-roster.py (prefix e), which renders the same states as dots.
+# scripts/agent-roster.py (prefix q), which renders the same states as dots.
 # Drift is machine-checked: cua-notch dev/check-invariants section 65 (roster
 # == tab bar exactly; notch nearest its own tab hue in OKLCH, within 35°).
 #
@@ -440,23 +440,34 @@ bind-key a display-popup -E -w 60% -h 75% "$HOME/.config/tmux/scripts/mru-sessio
 unbind-key C-a
 bind-key C-a display-popup -E -w 60% -h 75% "$HOME/.config/tmux/scripts/mru-session-switch.sh"
 
-# prefix g → the next tab that needs you, across every session: red (failed),
+# prefix d → the next tab that needs you, across every session: red (failed),
 # then yellow (waiting on you), then green (done), oldest first. Repeated
-# presses walk the queue — each visit discharges the tint it lands on. prefix G
-# goes back to where the run of jumps started. prefix C-g is g with Ctrl still
-# held from the prefix. All left-hand keys, next to the C-s prefix (Mack's
-# ask, 2026-10-07). See scripts/agent-jump.sh for the order, the excluded
-# sessions and why every move is select-window THEN switch-client.
+# presses walk the queue — each visit discharges the tint it lands on. prefix D
+# goes back to where the run of jumps started. prefix C-d is d with Ctrl still
+# held from the prefix. d sits on the home row right next to s, the prefix key
+# (Mack's ask, 2026-10-08: e/g were awkward). That displaces tmux's detach
+# (d) and choose-client (D), which don't matter here: WezTerm owns the window,
+# and closing it detaches anyway. Not `s` itself: with Ctrl still held that is
+# C-s C-s, the resurrect save below. See scripts/agent-jump.sh for the order,
+# the excluded sessions and why every move is select-window THEN switch-client.
 #
-# Deliberately not `bind -r`: repeat-time (500ms) would turn the first `g`
+# Deliberately not `bind -r`: repeat-time (500ms) would turn the first `d`
 # typed into the pane right after a jump into a second jump.
-bind-key g   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
-bind-key C-g run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
-bind-key G   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{client_tty}'"
+#
+# The unbinds clear the previous keys (g/C-g/G, e/C-e) on a live reload.
+unbind-key -q g
+unbind-key -q C-g
+unbind-key -q G
+unbind-key -q e
+unbind-key -q C-e
+bind-key d   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
+bind-key C-d run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
+bind-key D   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{client_tty}'"
 
-# prefix e (or C-e) → the agent roster: every agent in every session in one
-# popup, NEEDS YOU on top in prefix g's own order, parked tabs collapsed.
-# Tab/S-Tab or j/k move, Space/⏎ go, g next, x close (via closed-tabs, so
+# prefix q (or C-q) → the agent roster: every agent in every session in one
+# popup, NEEDS YOU on top in prefix d's own order, parked tabs collapsed.
+# Displaces tmux's display-panes (q), unused here. Tab/S-Tab or j/k move,
+# Space/⏎ go, d next, x close (via closed-tabs, so
 # CMD+Z still undoes it), H park, / filter, a all windows, r restart the
 # watcher, esc closes. See the header of scripts/agent-roster.py.
 #
@@ -470,8 +481,8 @@ bind-key G   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{cl
 # PYTHONPYCACHEPREFIX the stub sets and recompile the stdlib every launch
 # (-S is fine: the prefix comes from the stub, not site). Never a pyenv shim
 # (~140-260 ms). Numbers: docs/agent-roster.md.
-bind-key e   run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
-bind-key C-e run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
+bind-key q   run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
+bind-key C-q run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
 
 # Double-tap hyper or right shift in WezTerm (Karabiner, karabiner-base.json) flips
 # back to the previous one of these, like the same double-tap does for Arc tabs:

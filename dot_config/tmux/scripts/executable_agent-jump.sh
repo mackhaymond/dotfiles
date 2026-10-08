@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# agent-jump.sh — the ONE answer to "which tab wants me next?". prefix g /
-# prefix G use it today; the agent roster (and its WezTerm strip) are meant to
+# agent-jump.sh — the ONE answer to "which tab wants me next?". prefix d /
+# prefix D use it today; the agent roster (and its WezTerm strip) are meant to
 # call the same modes rather than grow a second ordering.
 #
 #   agent-jump.sh next <client_tty>          go to the next tab that needs you
