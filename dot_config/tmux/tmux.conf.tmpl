@@ -215,8 +215,10 @@ set -g @codexbar_scoped_model "Fable"
 # cells with an ellipsis; 0 hides it. Read from ~/.claude.json, which cswap
 # rewrites on every switch, so the status line never runs cswap. A switch
 # also re-keys the cache: the old account's numbers read "--%" until the new
-# account's arrive, normally on the next tick.
-set -g @codexbar_account_label_max "10"
+# account's arrive, normally on the next tick (that keying applies even with
+# the label hidden). Hidden: Mack wants the account in CuaNotch and UsageBar,
+# not the tmux bar.
+set -g @codexbar_account_label_max "0"
 
 # Ensure the old inline binding is removed on reload.
 unbind u
