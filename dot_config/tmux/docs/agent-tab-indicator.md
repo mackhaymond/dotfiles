@@ -555,7 +555,24 @@ truncation.
 name and that flag across restores. User options aren't saved by resurrect,
 so stale summaries simply vanish.
 
+### 4. Tick cost (2026-10-07)
+
+A tick is one `LC_ALL=C pgrep -ax 'claude|codex|N.N.N'` (a new pid gets one
+single-pid `ps` for its tty, cached per pid), one `tmux list-panes -a` read
+(US-separated, summary last), then the per-window loop. Windows with no
+agent pane and no `@agent_*` option take a fast path with no writes. The
+subagent verdict is reused until its inputs change, as judged by per-tick
+stamp files (`agent-tab-watcher.$UID.$$.stamp.N`, removed on exit).
+Measured live: first tick after a restart ~250 ms, steady ~100 ms with
+~175 windows and ~13 agents. It was tens of seconds before the lineage scan
+was dropped, and 279 ms average just after.
+
 ## Troubleshooting
+
+- **How long is a tick?** `: > "$TMPDIR/agent-tab-watcher.$(id -u).trace"`
+  makes the watcher append `<epoch> <tick_ms> <windows> <agents>` per tick;
+  `rm` the file to stop. No restart is needed, and when the file is absent
+  the cost is one builtin file test. Failed ticks write no line.
 
 - **Tab stuck in a state, running tabs never pulse (they just look idle) / the
   workflow gear never appears** → the watcher is dead. All three symptoms have
