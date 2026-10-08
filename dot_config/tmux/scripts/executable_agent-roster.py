@@ -68,10 +68,11 @@ GEAR = "\U000F0493"   # nf-md-cog: background workflow / subagent
 MOUSE = "\U000F037D"  # nf-md-mouse: driving an app through cua-driver
 
 FIELDS = ["session", "index", "id", "name", "state", "summary", "workflow", "cua",
-          "since", "last_attached", "blink"]
+          "since", "last_attached", "blink", "stash_label", "stash_session", "stash_ts"]
 FMT = US.join(["#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}",
                "#{@agent_state}", "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}",
-               "#{@agent_since}", "#{session_last_attached}", "#{@agent_blink}"])
+               "#{@agent_since}", "#{session_last_attached}", "#{@agent_blink}",
+               "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}"])
 
 
 def fg(name):
@@ -101,7 +102,11 @@ def parse_windows(text):
         w["last_attached"] = int(w["last_attached"]) if w["last_attached"].isdigit() else 0
         s = w["since"].split(" ", 1)[0]
         w["since_t"] = int(s) if s.isdigit() else None
-        w["label"] = w["summary"] or w["name"]
+        # stash.sh's own label order. A parked agent is SIGTERMed (suspended)
+        # and the watcher then GCs its @agent_* options, so @stash_label is
+        # often the only title a parked tab still has.
+        w["label"] = w["stash_label"] or w["summary"] or w["name"]
+        w["stash_t"] = int(w["stash_ts"]) if w["stash_ts"].isdigit() else None
         out.append(w)
     return out
 
@@ -166,9 +171,11 @@ def build_items(windows, needs, cur_win, show_all=False, parked_open=False, quer
     parked = sorted((w for w in windows if w["session"] == HOLD), key=lambda w: w["index"])
     if parked:
         items.append({"kind": "parked", "n": len(parked), "attn": sum(1 for w in parked if is_attn(w))})
+        # ALL of them, regardless of `a`: every parked tab was put there on
+        # purpose, and a suspended agent has no @agent_state left to pass the
+        # "is an agent" filter (that filter hid 4 of 5 here, 2026-10-07).
         if parked_open:
-            items.extend({"kind": "win", "w": w, "long": False, "parked": True}
-                         for w in parked if show_all or w["state"])
+            items.extend({"kind": "win", "w": w, "long": False, "parked": True} for w in parked)
     return items
 
 
@@ -448,13 +455,18 @@ class Roster:
                  "running": "working", "idle": "idle"}.get(w["state"], "")
         if w["state"] == "done" and w["workflow"]:
             state = "done · fleet out"
-        right = "%-16s %4s " % (state, ago(w["since_t"], now)) if w["state"] else ""
+        when = w["since_t"]
+        if w["session"] == HOLD:
+            if not w["state"]:
+                state = "suspended" if w["stash_session"] else "parked"
+            when = w["stash_t"] or when      # how long it has been parked
+        right = "%-16s %4s " % (state, ago(when, now)) if state else ""
         g = self.glyph(w, blink)
         gw = 2 if g else 0
         title_w = width - 4 - dwidth(ix) - 2 - gw - len(right)
         title = clip(w["label"], max(4, title_w))
         pad = " " * max(0, title_w - dwidth(title))
-        tcol = fg("text") if w["state"] or cur else fg("overlay")
+        tcol = fg("text") if w["state"] or cur or w["session"] == HOLD else fg("overlay")
         return (base + bar + self.dot(w, blink) + base + " " + fg("overlay") + ix + "  " + tcol + title + pad
                 + g + base + fg("overlay") + right)
 

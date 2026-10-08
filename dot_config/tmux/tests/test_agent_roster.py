@@ -14,8 +14,10 @@ spec.loader.exec_module(R)
 US = "\x1f"
 
 
-def line(session, index, wid, state="", summary="", workflow="", cua="", since="", attached=0, name="zsh"):
-    return US.join([session, str(index), wid, name, state, summary, workflow, cua, since, str(attached), "1"])
+def line(session, index, wid, state="", summary="", workflow="", cua="", since="", attached=0, name="zsh",
+         stash_label="", stash_session="", stash_ts=""):
+    return US.join([session, str(index), wid, name, state, summary, workflow, cua, since, str(attached), "1",
+                    stash_label, stash_session, stash_ts])
 
 
 WINDOWS = "\n".join([
@@ -26,7 +28,8 @@ WINDOWS = "\n".join([
     line("work", 2, "@5", "done", "proj/Five", workflow="1", attached=90),
     line("agents", 1, "@6", "running", "pty"),                          # never shown
     line("stash", 1, "@7", "needs-input", "proj/Parked"),
-    line("stash", 2, "@8"),
+    line("stash", 2, "@8"),                                             # plain parked shell
+    line("stash", 3, "@9", stash_label="proj/Suspended", stash_session="abc-123", stash_ts="500"),
 ])
 
 
@@ -46,7 +49,7 @@ class ModelTests(unittest.TestCase):
         return out
 
     def test_parse(self):
-        self.assertEqual(len(self.ws), 8)
+        self.assertEqual(len(self.ws), 9)
         one = self.ws[0]
         self.assertEqual((one["index"], one["since_t"], one["label"]), (1, 100, "proj/One"))
         self.assertEqual(self.ws[1]["label"], "zsh")
@@ -68,9 +71,13 @@ class ModelTests(unittest.TestCase):
     def test_parked(self):
         items = R.build_items(self.ws, [], cur_win="@1")
         parked = [it for it in items if it["kind"] == "parked"][0]
-        self.assertEqual((parked["n"], parked["attn"]), (2, 1))
+        self.assertEqual((parked["n"], parked["attn"]), (3, 1))
+        # Every parked tab is listed, `a` or not: a suspended agent has no
+        # @agent_state left, and a parked shell was parked on purpose too.
         opened = self.kinds(R.build_items(self.ws, [], cur_win="@1", parked_open=True))
-        self.assertEqual(opened[-2:], ["parked", "@7"])
+        self.assertEqual(opened[-4:], ["parked", "@7", "@8", "@9"])
+        nine = [w for w in self.ws if w["id"] == "@9"][0]
+        self.assertEqual((nine["label"], nine["stash_t"]), ("proj/Suspended", 500))
 
     def test_done_with_fleet_out_is_not_attention(self):
         five = [w for w in self.ws if w["id"] == "@5"][0]
@@ -81,7 +88,7 @@ class ModelTests(unittest.TestCase):
         items = R.build_items(self.ws, ["@4"], cur_win="@1", query="proj")
         ids = self.kinds(items)
         self.assertNotIn("@6", ids)
-        self.assertEqual(ids[-1], "@7")                         # parked sorts last
+        self.assertEqual(ids[-2:], ["@7", "@9"])               # parked sorts last
         self.assertTrue(all(it["kind"] == "win" for it in items))
 
     def test_keys(self):
