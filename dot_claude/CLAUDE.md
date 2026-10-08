@@ -193,13 +193,23 @@ is the orchestrator, not the typist:
 - **The main agent coordinates.** Dispatch units, read the diffs that come
   back, integrate, resolve conflicts, keep the user posted. Don't take over
   the bulk edits yourself; if a result is wrong, send it back to that agent
-  (SendMessage) with specifics, or re-dispatch.
+  (SendMessage) with specifics, or re-dispatch. A subagent's "done" or
+  "tests pass" is a claim, not evidence: run the unit's postcondition
+  yourself before accepting it.
+- **Only the orchestrator talks to the user and to git.** Subagents never
+  commit or push and never ask the user directly; questions route through
+  the main agent, which relays what matters from their reports. The main
+  agent commits after review, staging only the files the task touched.
 - **Review runs alongside the work, not after it.** As each unit lands, hand
-  its diff to a reviewer subagent (fresh context, never the author) to hunt
-  for bugs: correctness, edge cases, broken callers, error paths, races.
-  Reviewers check each finding against the code before reporting it
-  (`file:line` plus a concrete failing scenario) and drop what doesn't hold
-  up. Confirmed bugs get fixed before dependent units build on top of them.
+  its diff to a reviewer subagent (fresh context, never the author) along
+  with the unit's goal and plan, so it can catch code that correctly does
+  the wrong thing. It hunts for bugs: correctness, edge cases, broken
+  callers, error paths, races. Reviewers are read-only (fixes go back to
+  the implementer, so no two agents write one file) and check each finding
+  against the code before reporting it (`file:line` plus a concrete failing
+  scenario), dropping what doesn't hold up. Confirmed bugs get fixed before
+  dependent units build on top of them. Cap it at about two review/fix
+  rounds per unit; past that, the orchestrator rules or asks the user.
   Finish with one whole-change review pass before calling the task done.
 - **Scale it to the task.** A one-liner, a config tweak, or a question
   doesn't need any of this; just do it. Run only as many concurrent agents
