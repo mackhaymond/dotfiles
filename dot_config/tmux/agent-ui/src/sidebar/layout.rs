@@ -935,6 +935,10 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
     frame
 }
 
+/// The sidebar's ground: one step darker than the terminal's own `base`, so
+/// the split reads as a panel next to the tmux pane.
+pub const BG: &str = "mantle";
+
 /// Draw a frame into a ratatui buffer: each row's background across the
 /// whole line, then its segments at the cells the layout counted (a segment
 /// never spills into the next, whatever width ratatui gives a grapheme).
@@ -942,7 +946,7 @@ pub fn paint(frame: &Frame, buf: &mut Buffer) {
     let area = buf.area;
     for (y, row) in frame.rows.iter().enumerate().take(usize::from(area.height)) {
         let y = area.y + y as u16;
-        let row_bg = palette::color(row.bg.unwrap_or("base"));
+        let row_bg = palette::color(row.bg.unwrap_or(BG));
         buf.set_style(Rect::new(area.x, y, area.width, 1), Style::default().fg(palette::color("text")).bg(row_bg));
         let mut x = 0usize;
         for s in &row.segs {
@@ -1487,9 +1491,9 @@ mod tests {
         assert_eq!(buf[(16, 29)].symbol(), "═");
         assert_eq!(buf[(0, 29)].fg, palette::color("surface1"));
         assert_eq!(buf[(0, 4)].bg, palette::color("surface0")); // the needs card
-        assert_eq!(buf[(33, 57)].bg, palette::color("base"));
+        assert_eq!(buf[(33, 57)].bg, palette::color(BG));
         let ansi = to_ansi(buf);
         assert_eq!(ansi.lines().count(), 58);
-        assert!(ansi.starts_with("\x1b[0;38;2;205;214;244;48;2;30;30;46;1m agents"));
+        assert!(ansi.starts_with("\x1b[0;38;2;205;214;244;48;2;24;24;37;1m agents"));
     }
 }

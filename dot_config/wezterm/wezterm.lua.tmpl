@@ -17,6 +17,10 @@ end
 -- a gui-startup toggle_fullscreen here).
 
 config.color_scheme = "catppuccin-mocha"
+-- No dimming of the unfocused pane. WezTerm's default (0.9 sat / 0.8
+-- brightness) flashed the tmux pane on every CMD+B sidebar click: the click
+-- focuses the sidebar, then it hands focus straight back.
+config.inactive_pane_hsb = { saturation = 1.0, brightness = 1.0 }
 
 config.enable_tab_bar = false
 config.enable_kitty_graphics = true
