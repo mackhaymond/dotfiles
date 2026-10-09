@@ -175,18 +175,30 @@ fn once(s: &Server, args: &[&str]) -> String {
 fn once_renders_the_server_and_runs_nothing() {
     let s = Server::start("once");
     s.fixture();
+    // The default tab, Active: working ∪ needs you by space (main before
+    // work) and index, no NEEDS YOU section, no parked rows.
     let f = once(&s, &["--once", "110x34", "--client", FAKE_TTY]);
     let l: Vec<&str> = f.lines().collect();
     assert_eq!(l.len(), 34, "{f}");
     assert!(l[0].starts_with("╭─ agents"));
-    assert!(l[1].contains(" All 3 ") && l[1].contains(" Needs you 2 ") && l[1].contains(" Parked 1 "), "{}", l[1]);
+    assert!(l[1].contains(" Active 3 ") && l[1].contains(" All 3 ") && l[1].contains(" Needs you 2 ")
+        && l[1].contains(" Parked 1 "), "{}", l[1]);
+    assert!(l[3].starts_with("│ main ") && !f.contains("NEEDS YOU") && !f.contains("PARKED"), "{f}");
+    assert!(l[4].contains("1 ◉ Kua Yu focus timing"), "{f}");
+    assert!(l[5].contains("2 ◐ Tmux Agent Sidebar"), "{f}");
+    assert!(l[6].starts_with("│ work "), "{f}");
+    // The first need is selected in its fixed slot, its reason under it.
+    assert!(l[7].contains("3 ✕ Island resize") && l[8].contains("failed"), "{f}");
+    assert!(f.contains("⏎ go to it"));
+    // --tab all: the NEEDS YOU queue first.
+    let f = once(&s, &["--once", "110x34", "--client", FAKE_TTY, "--tab", "all"]);
+    let l: Vec<&str> = f.lines().collect();
     assert!(l[3].contains("NEEDS YOU"));
     assert!(l[4].contains("1 ✕ Island resize") && l[4].contains("work"), "{f}");
     assert!(f.contains("2 ◉ Kua Yu focus timing"));
     assert!(f.contains("PARKED 1") && f.contains("Pitch deck v2"));
-    assert!(f.contains("⏎ go to it"));
     // --select by label, another tab, the narrow layout.
-    let f = once(&s, &["--once", "110x34", "--select", "2"]);
+    let f = once(&s, &["--once", "110x34", "--select", "1"]);
     assert!(f.lines().nth(3).unwrap().contains("Kua Yu focus timing") && f.contains("asks Which deck?"), "{f}");
     let f = once(&s, &["--once", "80x24", "--tab", "needs"]);
     assert!(!f.contains("Tmux Agent Sidebar") && f.contains("Kua Yu") && !f.contains("┬"), "{f}");
@@ -204,7 +216,7 @@ fn interactive_menu_in_a_pane() {
     // Draw, search, clear, go: ⏎ on the first need runs agent-jump.sh goto and exits.
     let p = s.menu("");
     let f = s.wait_screen(&p, "╰");
-    assert!(f.contains("NEEDS YOU") && f.contains("Island resize"), "{f}");
+    assert!(f.contains(" Active 3 ") && !f.contains("NEEDS YOU") && f.contains("Island resize"), "{f}");
     let trace = std::fs::read_to_string(s.dir.join("trace")).unwrap();
     let us: u64 = trace.split_whitespace().nth(1).unwrap().parse().unwrap();
     eprintln!("first frame in a tmux pane: {us} µs");
@@ -225,10 +237,11 @@ fn interactive_menu_in_a_pane() {
     s.keys(&p, &["/", "M-w"]);
     s.wait_dead(&p);
 
-    // s asks first; n cancels; s y parks; q closes.
+    // s asks first; n cancels; s y parks; q closes. (Active opens on the
+    // failure, the last row: k k climbs to the question at the top.)
     let p = s.menu("");
     s.wait_screen(&p, "╰");
-    s.keys(&p, &["j", "s"]);
+    s.keys(&p, &["k", "k", "s"]);
     s.wait_screen(&p, "park Kua Yu focus timing? y/n");
     s.keys(&p, &["n"]);
     s.wait_screen(&p, "⌥W  close");
@@ -245,10 +258,11 @@ fn interactive_menu_in_a_pane() {
     s.keys(&p, &["q"]);
     s.wait_dead(&p);
 
-    // A digit jumps at once; Alt-s runs next.
+    // A digit jumps at once (Active's 1 is the question, first by place);
+    // Alt-s runs next.
     let p = s.menu("");
     s.wait_screen(&p, "╰");
-    s.keys(&p, &["2"]);
+    s.keys(&p, &["1"]);
     s.wait_dead(&p);
     let p = s.menu("");
     s.wait_screen(&p, "╰");

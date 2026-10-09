@@ -19,10 +19,11 @@
 //! What the new layout changes is listed on [`Menu::act`].
 
 use super::keys::{Key, Mouse};
-use super::rows::{build_rows, number_rows, Data, Row, RowKey, Tab, Target};
+use super::rows::{build_rows, need_of, number_rows, Data, Row, RowKey, Tab, Target};
 use crate::actions::TAB_MOVED;
 use crate::ansi::StyledLine;
 use crate::hotkeys::{match_digits, DigitMatch};
+use crate::view::Need;
 use ratatui::layout::Rect;
 use std::collections::HashMap;
 
@@ -173,6 +174,15 @@ pub struct Menu {
     /// no preview at this width).
     pub preview_rows: usize,
     pub full_rows: usize,
+    /// The selected row as the user last saw it drawn, or last chose it (a
+    /// move, a click, a search, a tab): ⏎ / Space / p / s / x / H act only
+    /// while that row is still listed. A refresh that drops it (an agent
+    /// gone idle off the Active tab) moves the selection, but a key typed
+    /// against the old frame is refused rather than retargeted.
+    pub drawn_sel: Option<Target>,
+    /// The tab `rows` was built for (the Active fallback walks the previous
+    /// rows of the same tab).
+    rows_tab: Tab,
 }
 
 impl Menu {
@@ -202,9 +212,17 @@ impl Menu {
             peeks: HashMap::new(),
             preview_rows: 0,
             full_rows: 0,
+            drawn_sel: None,
+            rows_tab: tab,
         };
         m.rebuild();
         m
+    }
+
+    /// The user picked the current selection (a move, a click, a search, a
+    /// tab switch): keys may act on it before the next draw.
+    fn chose(&mut self) {
+        self.drawn_sel = self.selected_target();
     }
 
     /// A new refresh's data (agent-roster.py `load`).
@@ -216,14 +234,24 @@ impl Menu {
     }
 
     /// agent-roster.py `rebuild`: the rows for the tab and query, and a
-    /// selection that survives it. On open the first NEEDS YOU row is
-    /// selected, else the window the client is on, else the first row. When
-    /// the selected row goes away (filter typed, need discharged, tab
-    /// parked, tab switched) the Python's fallback runs: another row of the
-    /// same window (its group row first), else the client's window, else the
-    /// first row.
+    /// selection that survives it. On open the first need in NEEDS order is
+    /// selected (its NEEDS YOU row; on the Active tab, which has none, that
+    /// agent's row, in the session agent-jump.sh would go to), else the
+    /// window the client is on, else the first row. The selection is a row
+    /// key (session, window), never a position, so a refresh that changes an
+    /// agent's state keeps it on that agent. When the selected row goes away
+    /// (filter typed, need discharged, an agent gone idle off the Active tab,
+    /// tab parked, tab switched) the Python's fallback runs: another row of
+    /// the same window (its group row first), else the client's window, else
+    /// the first row. On the Active tab the client's window is not the
+    /// fallback: the selection goes to the nearest row that survived, the
+    /// next one in the previous order, else the one before, so it stays
+    /// where the eye was.
     pub fn rebuild(&mut self) {
+        let old_keys: Vec<RowKey> =
+            if self.rows_tab == self.tab { self.rows.iter().filter_map(Row::key).collect() } else { Vec::new() };
         self.rows = build_rows(&self.data, self.tab, &self.query, self.show_all);
+        self.rows_tab = self.tab;
         self.labels = number_rows(&self.rows);
         let keys: Vec<RowKey> = self.rows.iter().filter_map(Row::key).collect();
         // An empty list (a blank snapshot, a search typo) keeps the selection
@@ -237,8 +265,27 @@ impl Menu {
         };
         let cur = self.data.view.cur_win.clone();
         let cur_row = || cur.as_deref().and_then(row_for);
+        // The first need in NEEDS order with a row here: its NEEDS YOU row
+        // when listed, else its group row (the queue's session first).
+        let first_need = || {
+            keys.iter().find(|k| matches!(k, RowKey::Need(_))).cloned().or_else(|| {
+                self.data.view.needs.iter().find_map(|n| {
+                    let a = &n.agent;
+                    let mine = RowKey::Agent(a.session.clone(), a.window_id.clone());
+                    keys.contains(&mine).then_some(mine).or_else(|| {
+                        keys.iter().find(|k| matches!(k, RowKey::Agent(_, w) if *w == a.window_id)).cloned()
+                    })
+                })
+            })
+        };
+        let active = self.tab == Tab::Active;
+        let neighbour = |old: &RowKey| -> Option<RowKey> {
+            let i = old_keys.iter().position(|k| k == old)?;
+            old_keys[i + 1..].iter().chain(old_keys[..i].iter().rev()).find(|k| keys.contains(k)).cloned()
+        };
         self.sel = match self.sel.take() {
-            None => keys.iter().find(|k| matches!(k, RowKey::Need(_))).cloned().or_else(cur_row),
+            None => first_need().or_else(cur_row),
+            Some(old) if active => row_for(old.window()).or_else(|| neighbour(&old)).or_else(cur_row),
             Some(old) => row_for(old.window()).or_else(cur_row),
         }
         .or_else(|| keys.first().cloned());
@@ -253,6 +300,17 @@ impl Menu {
 
     pub fn selected_target(&self) -> Option<Target> {
         self.selected().and_then(Row::target)
+    }
+
+    /// The need whose reason line a row shows when selected (and whose
+    /// reason word the preview shows): a NEEDS YOU row's own; on the Active
+    /// tab, which has no NEEDS YOU rows, an attention agent's queue entry.
+    pub fn reason_of<'a>(&'a self, row: &'a Row) -> Option<&'a Need> {
+        match row {
+            Row::Need(n) => Some(n),
+            Row::Agent(a) if self.tab == Tab::Active => need_of(&self.data.view, a),
+            _ => None,
+        }
     }
 
     /// The row is in the frame on screen (its number is drawn).
@@ -293,6 +351,7 @@ impl Menu {
         let i = self.sel.as_ref().and_then(|k| keys.iter().position(|x| x == k)).unwrap_or(0) as i64;
         self.sel = Some(keys[(i + d).clamp(0, keys.len() as i64 - 1) as usize].clone());
         self.follow = true;
+        self.chose();
     }
 
     pub fn set_tab(&mut self, tab: Tab) {
@@ -300,6 +359,7 @@ impl Menu {
             self.tab = tab;
             self.top = 0;
             self.rebuild();
+            self.chose();
         }
     }
 
@@ -414,6 +474,7 @@ impl Menu {
             _ => {}
         }
         self.rebuild();
+        self.chose();
         false
     }
 
@@ -480,6 +541,15 @@ impl Menu {
             _ => None,
         };
         if let (Some(b), Some(t)) = (row_key, t.clone()) {
+            // The row the user last saw selected went away in a refresh (the
+            // selection moved without a frame showing it): refuse, never act
+            // on the row that slid under it.
+            let gone = self.drawn_sel.as_ref().is_some_and(|d| !self.rows.iter().any(|r| r.key().as_ref() == Some(&d.key)));
+            if gone {
+                self.say(format!("{TAB_MOVED} · pick it again"));
+                self.follow = true;
+                return false;
+            }
             if !self.on_screen(&t.key) {
                 self.follow = true;
                 return false;
@@ -493,6 +563,7 @@ impl Menu {
                 }
                 self.query.clear();
                 self.rebuild();
+                self.chose();
             }
             Key::Down | Key::Char('j') | Key::CtrlN => self.move_by(1),
             Key::Up | Key::Char('k') | Key::CtrlP => self.move_by(-1),
@@ -507,6 +578,7 @@ impl Menu {
             Key::Char('a') => {
                 self.show_all = !self.show_all;
                 self.rebuild();
+                self.chose();
             }
             Key::Char('/') => self.searching = true,
             Key::Char('r') => {
@@ -553,6 +625,7 @@ impl Menu {
                 }
                 self.sel = Some(t.key);
                 self.follow = true;
+                self.chose();
             }
             Hit::Button(b, t) => {
                 // The row the button was drawn for, if it is still listed.
@@ -649,6 +722,7 @@ pub(crate) mod tests {
             }
         }
         m.drawn = (targets, labels);
+        m.drawn_sel = m.selected_target();
     }
 
     fn menu() -> Menu {
@@ -1042,10 +1116,164 @@ pub(crate) mod tests {
         assert_eq!(m.tab, Tab::Needs);
         m.act(BackTab, &mut NoEffects);
         m.act(BackTab, &mut NoEffects);
+        assert_eq!(m.tab, Tab::Active);
+        m.act(BackTab, &mut NoEffects);
         assert_eq!(m.tab, Tab::Parked);
         m.act(Char('/'), &mut NoEffects);
         m.act(Key::Tab, &mut NoEffects); // also from the search box
+        assert_eq!(m.tab, Tab::Active);
+        m.act(Key::Tab, &mut NoEffects);
         assert_eq!(m.tab, Tab::All);
+    }
+
+    /// `data()` with each (window, state) applied (every linked row).
+    fn with_states(set: &[(&str, &str)]) -> Data {
+        let mut snap = super::super::rows::tests::fixture();
+        for w in &mut snap.windows {
+            if let Some((_, st)) = set.iter().find(|(id, _)| w.id == *id) {
+                w.state = st.to_string();
+            }
+        }
+        Data::build(&snap, Some("/dev/ttys999"), 1000.0, &crate::Collator::new("en_US.UTF-8"), None, Some(1.0))
+    }
+
+    fn with_state(win: &str, state: &str) -> Data {
+        with_states(&[(win, state)])
+    }
+
+    fn active() -> Menu {
+        let mut m = Menu::new(data(), Tab::Active);
+        draw_all(&mut m);
+        m
+    }
+
+    fn row_keys(m: &Menu) -> Vec<RowKey> {
+        m.rows.iter().filter_map(Row::key).collect()
+    }
+
+    fn ak(s: &str, w: &str) -> RowKey {
+        RowKey::Agent(s.into(), w.into())
+    }
+
+    #[test]
+    fn active_default_selection() {
+        // Needs: the first in NEEDS order (@6 failed), on its own row.
+        let m = active();
+        assert_eq!(m.sel, Some(ak("work", "@6")));
+        // No needs: the client's window (@2, running).
+        let d = with_states(&[("@6", "idle"), ("@1", "idle")]);
+        assert!(d.view.needs.is_empty());
+        let m = Menu::new(d.clone(), Tab::Active);
+        assert_eq!(m.sel, Some(ak("main", "@2")));
+        let mut d3 = d.clone();
+        d3.view.cur_win = Some("@3".into()); // not the first row
+        assert_eq!(Menu::new(d3, Tab::Active).sel, Some(ak("main", "@3")));
+        // ...and the client's window not in the set (idle): the first row.
+        let mut d2 = d;
+        d2.view.cur_win = Some("@7".into());
+        let m = Menu::new(d2, Tab::Active);
+        assert_eq!(m.sel, m.rows.iter().find_map(Row::key));
+        assert_eq!(m.sel, Some(ak("main", "@2")));
+        // A need under the client's window still comes first.
+        let m = Menu::new(with_state("@2", "needs-input"), Tab::Active);
+        assert_eq!(m.sel, Some(ak("work", "@6"))); // failed outranks needs-input
+    }
+
+    /// The point of the tab: a state change never moves a row or the selection.
+    #[test]
+    fn active_state_flip_keeps_rows_and_selection() {
+        let mut m = active();
+        let before = row_keys(&m);
+        let pos = |m: &Menu, k: &RowKey| m.rows.iter().position(|r| r.key().as_ref() == Some(k));
+        m.sel = Some(ak("main", "@2"));
+        let p2 = pos(&m, &ak("main", "@2"));
+        // @2 running → needs-input: same rows, same place, same selection;
+        // only its glyph and colour change.
+        m.set_data(with_state("@2", "needs-input"));
+        assert_eq!(row_keys(&m), before);
+        assert_eq!(pos(&m, &ak("main", "@2")), p2);
+        assert_eq!(m.sel, Some(ak("main", "@2")));
+        let a = m.selected().and_then(Row::agent).unwrap();
+        assert_eq!((a.glyph, a.color), ("◉", Some("yellow")));
+        // The flipped row now carries a reason line (a need), in place.
+        assert_eq!(m.reason_of(m.selected().unwrap()).map(|n| n.reason_word.as_str()), Some("waiting on you"));
+        // Another agent flipping (needs-input → running) moves nothing either.
+        m.set_data(with_state("@1", "running"));
+        assert_eq!(row_keys(&m), before);
+        assert_eq!(m.sel, Some(ak("main", "@2")));
+        // Leaving the set (idle) takes the row out; the rest keep their order.
+        m.set_data(with_state("@1", "idle"));
+        assert_eq!(row_keys(&m), [ak("main", "@2"), ak("main", "@3"), ak("work", "@6"), ak("work", "@3")]);
+        assert_eq!(m.sel, Some(ak("main", "@2")));
+        // Joining (@4 idle → running) lands in its index slot.
+        m.set_data(with_state("@4", "running"));
+        assert_eq!(row_keys(&m), [ak("main", "@1"), ak("main", "@2"), ak("main", "@3"), ak("main", "@4"), ak("work", "@6"),
+            ak("work", "@3")]);
+        assert_eq!(m.sel, Some(ak("main", "@2")));
+    }
+
+    /// The selected agent leaves the Active set: the selection goes to the
+    /// nearest surviving row (the next, else the previous), never the
+    /// client's window or the top; and a key typed against the frame that
+    /// still showed the old row is refused, not retargeted.
+    #[test]
+    fn active_selection_leaving_the_set() {
+        let mut fx = Rec::default();
+        let mut m = active();
+        assert_eq!(m.sel, Some(ak("work", "@6")));
+        // @6 goes idle: the next row (work:@3), not the client's @2 or main:@1.
+        m.set_data(with_state("@6", "idle"));
+        assert_eq!(m.sel, Some(ak("work", "@3")));
+        // ⏎ / Space / x / s / H / p queued against the old frame: refused.
+        for k in [Enter, Char(' '), Char('x'), Char('s'), Char('H'), Char('p')] {
+            assert!(!m.handle(&[k], &mut fx), "{k:?}");
+            assert_eq!(m.msg, "that tab moved · pick it again", "{k:?}");
+        }
+        assert!(fx.calls.is_empty() && m.confirm.is_none() && m.peek_full.is_none());
+        // Once a frame shows the new selection, ⏎ goes there.
+        draw_all(&mut m);
+        assert!(m.handle(&[Enter], &mut fx));
+        assert_eq!(fx.calls, ["go @3 work"]);
+        // A move is a choice: j then ⏎ before any redraw acts on the new row.
+        let mut fx = Rec::default();
+        let mut m = active();
+        m.set_data(with_state("@6", "idle"));
+        assert!(m.handle(&[Key::Up, Enter], &mut fx));
+        assert_eq!(fx.calls, ["go @3 main"]);
+        // The last row leaving: the previous one.
+        let mut m = active();
+        m.act(End, &mut NoEffects);
+        draw_all(&mut m);
+        assert_eq!(m.sel, Some(ak("work", "@3")));
+        let mut snap = super::super::rows::tests::fixture();
+        for w in &mut snap.windows {
+            if w.id == "@3" {
+                w.state = "idle".into();
+                w.workflow.clear();
+            }
+        }
+        m.set_data(Data::build(&snap, Some("/dev/ttys999"), 1000.0, &crate::Collator::new("en_US.UTF-8"), None, Some(1.0)));
+        assert_eq!(m.sel, Some(ak("work", "@6")));
+        // Other tabs keep the Python's fallback (the client's window).
+        let mut m = Menu::new(data(), Tab::Working);
+        m.sel = Some(ak("work", "@3"));
+        m.set_data(Data::build(&snap, Some("/dev/ttys999"), 1000.0, &crate::Collator::new("en_US.UTF-8"), None, Some(1.0)));
+        assert_eq!(m.sel, Some(ak("main", "@2")));
+    }
+
+    /// Numbers resolve against the frame on screen, on the Active tab too:
+    /// a row that joined since the draw shifts nothing until the next draw.
+    #[test]
+    fn active_digits_resolve_against_the_drawn_frame() {
+        let mut fx = Rec::default();
+        let mut m = active();
+        assert_eq!(m.labels.values().filter(|l| l.as_str() == "4").count(), 1);
+        m.set_data(with_state("@4", "running")); // main:@4 is now row 4
+        assert!(m.handle(&[Char('4')], &mut fx));
+        assert_eq!(fx.calls, ["go @6 work"]); // what 4 said on screen
+        draw_all(&mut m);
+        assert!(m.handle(&[Char('4')], &mut fx));
+        assert_eq!(fx.calls[1], "go @4 main");
     }
 
     #[test]

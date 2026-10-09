@@ -2,6 +2,14 @@
 //! (agent-roster.py `build_items` / `selectable` / `number_items`, reshaped
 //! for the tabbed layout).
 //!
+//! The Active tab (the default) is every agent that is working or needs you,
+//! in a FIXED order: one group per space in the core's space order (the
+//! sidebar's AGENTS order, by name), then by window index. Nothing about a
+//! row's state or age moves it: an agent that goes from working to
+//! needs-input stays where it is and only changes glyph and colour (no NEEDS
+//! YOU section here; that section reorders). Agents leaving or joining the
+//! set make rows disappear or appear in their slot, never swap.
+//!
 //! The All tab is the Python popup's list: NEEDS YOU in agent-jump.sh order,
 //! then one group per session, the client's session first and the rest most
 //! recently attached first (the popup's order, not the sidebar's by-name
@@ -24,6 +32,8 @@ use std::collections::HashMap;
 /// The tab row's filters, in display (and Tab-cycle) order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
+    /// Working ∪ needs you, in fixed space/index order (the default).
+    Active,
     All,
     Needs,
     Working,
@@ -32,11 +42,12 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [Tab::All, Tab::Needs, Tab::Working, Tab::Idle, Tab::Parked];
+    pub const ALL: [Tab; 6] = [Tab::Active, Tab::All, Tab::Needs, Tab::Working, Tab::Idle, Tab::Parked];
 
     /// The chip's words.
     pub fn title(self) -> &'static str {
         match self {
+            Tab::Active => "Active",
             Tab::All => "All",
             Tab::Needs => "Needs you",
             Tab::Working => "Working",
@@ -45,19 +56,29 @@ impl Tab {
         }
     }
 
+    /// The chip's words when the full row does not fit.
+    pub fn short_title(self) -> &'static str {
+        match self {
+            Tab::Needs => "Needs",
+            Tab::Working => "Work",
+            t => t.title(),
+        }
+    }
+
     /// The colour of the chip's count when the chip is not active.
     pub fn hue(self) -> &'static str {
         match self {
-            Tab::All => "text",
+            Tab::Active | Tab::All => "text",
             Tab::Needs => "yellow",
             Tab::Working => "blue",
             Tab::Idle | Tab::Parked => "overlay",
         }
     }
 
-    /// `--tab parked|needs|working|idle|all`.
+    /// `--tab active|all|needs|working|idle|parked`.
     pub fn parse(s: &str) -> Option<Tab> {
         Some(match s {
+            "active" => Tab::Active,
             "all" => Tab::All,
             "needs" | "needs-you" => Tab::Needs,
             "working" => Tab::Working,
@@ -76,6 +97,11 @@ impl Tab {
     /// The chip's count.
     pub fn count(self, v: &ViewModel) -> usize {
         match self {
+            Tab::Active => {
+                let ids: std::collections::HashSet<&str> =
+                    v.agents().filter(|a| is_active(v, a)).map(|a| a.window_id.as_str()).collect();
+                ids.len()
+            }
             Tab::All => v.counts.total(),
             Tab::Needs => v.needs.len(),
             Tab::Working => v.counts.get(Cat::Working),
@@ -83,6 +109,21 @@ impl Tab {
             Tab::Parked => v.parked.len(),
         }
     }
+}
+
+/// The NEEDS YOU entry of `a`'s window: what the Needs you tab lists for it
+/// (by window id, so a linked window's row in any session finds it).
+pub fn need_of<'a>(v: &'a ViewModel, a: &Agent) -> Option<&'a Need> {
+    if !a.attention {
+        return None; // the queue holds attention states only: skip the scan
+    }
+    v.needs.iter().find(|n| n.agent.window_id == a.window_id)
+}
+
+/// The Active tab's set: in flight (the Working bucket: running, a workflow
+/// or cua out) or needs you (exactly what the Needs you tab counts).
+pub fn is_active(v: &ViewModel, a: &Agent) -> bool {
+    a.cat == Some(Cat::Working) || need_of(v, a).is_some()
 }
 
 /// A selectable row's identity (agent-roster.py `item_key`).
@@ -260,6 +301,20 @@ pub fn build_rows(d: &Data, tab: Tab, query: &str, show_all: bool) -> Vec<Row> {
     let mut rows = Vec::new();
     let ok = |a: &Agent| matches(a, query);
 
+    if tab == Tab::Active {
+        // The core's space order (by name, as the sidebar), never `d.order`
+        // (most recently attached), so switching sessions moves nothing.
+        for s in &v.spaces {
+            let mut shown: Vec<&Agent> = s.agents.iter().filter(|a| is_active(v, a) && ok(a)).collect();
+            shown.sort_by_key(|a| a.index);
+            if shown.is_empty() {
+                continue;
+            }
+            rows.push(Row::Group { name: s.name.clone(), branch: s.branch.clone(), counts: s.counts, current: s.is_current });
+            rows.extend(shown.into_iter().cloned().map(Row::Agent));
+        }
+    }
+
     if matches!(tab, Tab::All | Tab::Needs) {
         let needs: Vec<&Need> = v.needs.iter().filter(|n| ok(&n.agent)).collect();
         if !needs.is_empty() {
@@ -304,6 +359,7 @@ pub fn build_rows(d: &Data, tab: Tab, query: &str, show_all: bool) -> Vec<Row> {
             "no matches"
         } else {
             match tab {
+                Tab::Active => "nothing working or waiting · ⇥ for all",
                 Tab::All => "no agents running",
                 Tab::Needs => "nothing needs you",
                 Tab::Working => "nothing working",
@@ -414,7 +470,57 @@ pub(crate) mod tests {
         assert_eq!(parked.len(), 6); // header + all five, no "+k more"
         // Counts on the chips.
         let c: Vec<usize> = Tab::ALL.iter().map(|t| t.count(&d.view)).collect();
-        assert_eq!(c, [7, 2, 2, 3, 5]); // @3 once though linked; agents session hidden
+        assert_eq!(c, [4, 7, 2, 2, 3, 5]); // @3 once though linked; agents session hidden
+    }
+
+    /// Active: working ∪ needs you, by space (the core's by-name order, not
+    /// the All tab's most-recently-attached one), then window index; no
+    /// NEEDS YOU section, no parked rows.
+    #[test]
+    fn active_tab_layout() {
+        let d = data();
+        let rows = build_rows(&d, Tab::Active, "", false);
+        assert_eq!(shape(&rows), ["-- main", "main:@1", "main:@2", "main:@3", "-- work", "work:@6", "work:@3"]);
+        // Exactly working ∪ the Needs you queue, each linked row in its space.
+        let v = &d.view;
+        let mut want: Vec<String> = Vec::new();
+        for s in &v.spaces {
+            let mut ids: Vec<&Agent> = s.agents.iter()
+                .filter(|a| a.cat == Some(Cat::Working) || v.needs.iter().any(|n| n.agent.window_id == a.window_id))
+                .collect();
+            ids.sort_by_key(|a| a.index);
+            want.extend(ids.iter().map(|a| format!("{}:{}", a.session, a.window_id)));
+        }
+        let got: Vec<String> = shape(&rows).into_iter().filter(|s| !s.starts_with("--")).collect();
+        assert_eq!(got, want);
+        // The order ignores the client's session and attach recency: same rows
+        // with the client moved to Alpha and work attached last.
+        let mut snap = fixture();
+        for w in &mut snap.windows {
+            w.last_attached = if w.session == "work" { 99 } else { 1 };
+        }
+        snap.clients[0].window_id = "@8".into();
+        snap.clients[0].session = "Alpha".into();
+        let d2 = Data::build(&snap, Some("/dev/ttys999"), 1000.0, &Collator::new("en_US.UTF-8"), None, Some(1.0));
+        assert_eq!(shape(&build_rows(&d2, Tab::Active, "", false)), shape(&rows));
+        // The search narrows it like any tab.
+        assert_eq!(shape(&build_rows(&d, Tab::Active, "handy", false)), ["-- main", "main:@3", "-- work", "work:@3"]);
+        assert_eq!(shape(&build_rows(&d, Tab::Active, "zzz", false)), ["(no matches)"]);
+        // Labels follow the drawn rows.
+        let labels = number_rows(&rows);
+        assert_eq!((labels[&1].as_str(), labels[&6].as_str(), labels.len()), ("1", "5", 5));
+    }
+
+    #[test]
+    fn active_tab_empty() {
+        let rows = [
+            row("main", 1, "@1", &[("state", "idle")]),
+            "\x1fclient\x1f/dev/ttys999\x1f@1\x1fmain".into(),
+        ];
+        let d = Data::build(&Snapshot::parse(&rows.join("\n")), Some("/dev/ttys999"), 1000.0, &Collator::new("C"), None,
+            None);
+        assert_eq!(shape(&build_rows(&d, Tab::Active, "", false)), ["(nothing working or waiting · ⇥ for all)"]);
+        assert_eq!(Tab::Active.count(&d.view), 0);
     }
 
     #[test]
@@ -435,9 +541,15 @@ pub(crate) mod tests {
 
     #[test]
     fn tabs_cycle_and_parse() {
+        // Chip order: Active, All, Needs you, Working, Idle, Parked.
+        assert_eq!(Tab::ALL.map(Tab::title), ["Active", "All", "Needs you", "Working", "Idle", "Parked"]);
+        assert_eq!(Tab::Active.step(1), Tab::All);
         assert_eq!(Tab::All.step(1), Tab::Needs);
-        assert_eq!(Tab::All.step(-1), Tab::Parked);
-        assert_eq!(Tab::Parked.step(1), Tab::All);
+        assert_eq!(Tab::All.step(-1), Tab::Active);
+        assert_eq!(Tab::Active.step(-1), Tab::Parked);
+        assert_eq!(Tab::Parked.step(1), Tab::Active);
+        assert_eq!(Tab::parse("active"), Some(Tab::Active));
+        assert_eq!(Tab::parse("all"), Some(Tab::All));
         assert_eq!(Tab::parse("parked"), Some(Tab::Parked));
         assert_eq!(Tab::parse("bogus"), None);
     }

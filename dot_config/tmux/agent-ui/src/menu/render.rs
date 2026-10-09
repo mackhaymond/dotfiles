@@ -5,18 +5,22 @@
 //!
 //! ```text
 //! ╭─ agents ───────────────────────────────────────────── ⌥W ✕ ─╮   border, title, close
-//! │  All 11   Needs you 1   Working 2   Idle 8   … │ / search… │ │   chips + search
+//! │  Active 3   All 11   Needs you 1   Working 2  … │ / search… │ │   chips + search
 //! ├──────────────────────────┬───────────────────────────────────┤
-//! │ NEEDS YOU                │ Title               ◉ asks · 44m   │   list | preview
-//! │  1 ◉ Kua Yu focus…  main │ main:3 · ✳ claude · ⌥ main · ~/x   │
+//! │ main ⌥ main ───── ◉1 ◐2  │ Title               ◉ asks · 44m   │   list | preview
+//! │  1 ◉ Kua Yu focus…   44m │ main:3 · ✳ claude · ⌥ main · ~/x   │
 //! │      asks Which deck…    │ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  │
-//! │ main ⌥ main ───── ◉1 ◐2  │ (the pane's last lines, coloured)  │
-//! │  2 ◐ Handy.app ⚙     19m │                                    │
+//! │  2 ◐ Handy.app ⚙     19m │ (the pane's last lines, coloured)  │
+//! │ work ──────────── ✕1 ◐1  │                                    │
 //! │ …                       ▕│  ⏎ go to it   p full peek  …       │   buttons
 //! ├──────────────────────────┴───────────────────────────────────┤
 //! │  ⏎  go   1–9  jump   ⇥  filter  …                             │   key bar / prompts
 //! ╰──────────────────────────────────────────────────────────────╯
 //! ```
+//!
+//! (The default Active tab, drawn above: space groups in fixed order, the
+//! selected attention row's reason line under it. The All tab starts with a
+//! NEEDS YOU section instead.)
 //!
 //! Under [`PREVIEW_MIN_W`] columns the preview goes and the list takes the
 //! body. The full peek (`p`) takes the whole body (agent-roster.py
@@ -251,18 +255,81 @@ fn top_border(m: &mut Menu, buf: &mut Buffer, w: u16) {
     put(buf, rx, 0, w, " ─╮", s1);
 }
 
+/// How the chips are written: full or short titles, with or without their
+/// counts, with or without the padding inside each chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChipStyle {
+    pub short: bool,
+    pub counts: bool,
+    pub pad: bool,
+}
+
+impl ChipStyle {
+    /// From the roomiest to the most compact.
+    pub const LEVELS: [ChipStyle; 4] = [
+        ChipStyle { short: false, counts: true, pad: true },
+        ChipStyle { short: true, counts: true, pad: true },
+        ChipStyle { short: true, counts: false, pad: true },
+        ChipStyle { short: true, counts: false, pad: false },
+    ];
+
+    /// One chip's (title part, count part).
+    fn parts(self, t: Tab, n: usize) -> (String, String) {
+        let title = if self.short { t.short_title() } else { t.title() };
+        let p = if self.pad { " " } else { "" };
+        let count = if self.counts { format!("{n}{p}") } else { String::new() };
+        (format!("{p}{title}{p}"), count)
+    }
+
+    /// The whole chip row's width, from its first chip to its last.
+    fn width(self, counts: &[usize]) -> u16 {
+        let chips: u16 = Tab::ALL
+            .iter()
+            .zip(counts)
+            .map(|(&t, &n)| {
+                let (a, b) = self.parts(t, n);
+                cells(&a) + cells(&b)
+            })
+            .sum();
+        chips + Tab::ALL.len() as u16 - 1
+    }
+}
+
+/// The search field's narrowest useful width (else it is not drawn).
+pub const SEARCH_MIN_W: u16 = 10;
+
+/// The roomiest chip style that fits between x = 2 and `end`, and whether
+/// the search field still fits beside it. The search field gives way first
+/// (`/` opens it anyway), then the chips shorten; while a search is open
+/// the field stays and the chips shorten first.
+pub fn chip_style(counts: &[usize], end: u16, searching: bool) -> (ChipStyle, bool) {
+    let fits = |s: ChipStyle, search: bool| 2 + s.width(counts) + if search { 2 + SEARCH_MIN_W } else { 0 } <= end;
+    let mut order: Vec<(ChipStyle, bool)> = Vec::new();
+    if searching {
+        order.extend(ChipStyle::LEVELS.iter().map(|&s| (s, true)));
+        order.extend(ChipStyle::LEVELS.iter().map(|&s| (s, false)));
+    } else {
+        for s in ChipStyle::LEVELS {
+            order.extend([(s, true), (s, false)]);
+        }
+    }
+    order.into_iter().find(|&(s, se)| fits(s, se)).unwrap_or((ChipStyle::LEVELS[3], false))
+}
+
 fn tab_row(m: &mut Menu, buf: &mut Buffer, w: u16) {
     let y = 1;
     let end = w - 2;
     let mut x = 2;
-    for t in Tab::ALL {
-        let n = t.count(&m.data.view);
+    let counts: Vec<usize> = Tab::ALL.iter().map(|t| t.count(&m.data.view)).collect();
+    let (style, search) = chip_style(&counts, end, m.searching || !m.query.is_empty());
+    for (t, &n) in Tab::ALL.into_iter().zip(&counts) {
         let x0 = x;
+        let (title, count) = style.parts(t, n);
         if t == m.tab {
-            x = put(buf, x, y, end, &format!(" {} {n} ", t.title()), bold(on("crust", "blue")));
+            x = put(buf, x, y, end, &format!("{title}{count}"), bold(on("crust", "blue")));
         } else {
-            x = put(buf, x, y, end, &format!(" {} ", t.title()), on("sub", "surface0"));
-            x = put(buf, x, y, end, &format!("{n} "), on(if n > 0 { t.hue() } else { "overlay" }, "surface0"));
+            x = put(buf, x, y, end, &title, on("sub", "surface0"));
+            x = put(buf, x, y, end, &count, on(if n > 0 { t.hue() } else { "overlay" }, "surface0"));
         }
         m.clicks.push((Rect::new(x0, y, x - x0, 1), Hit::Tab(t)));
         x += 1;
@@ -270,7 +337,7 @@ fn tab_row(m: &mut Menu, buf: &mut Buffer, w: u16) {
     // The search field, flush right.
     let room = end.saturating_sub(x + 1);
     let sw = room.min(34);
-    if sw < 10 {
+    if !search || sw < SEARCH_MIN_W {
         return;
     }
     let sx = end - sw;
@@ -303,18 +370,30 @@ fn tab_row(m: &mut Menu, buf: &mut Buffer, w: u16) {
 fn list(m: &mut Menu, buf: &mut Buffer, r: Rect) {
     let lw = m.labels.values().map(|l| l.len()).max().unwrap_or(1);
     let mut sel_pos = m.sel.as_ref().and_then(|k| m.rows.iter().position(|r| r.key().as_ref() == Some(k)));
+    // Each row's reason line, shown under it while selected: (word, its
+    // colour, the reason text). NEEDS YOU rows, and the Active tab's
+    // attention rows (which stay in their fixed slot instead).
+    let reasons: Vec<Option<(String, &'static str, String)>> = m
+        .rows
+        .iter()
+        .map(|row| {
+            m.reason_of(row).map(|n| {
+                (n.reason_word.clone(), reason_color(&n.agent, !n.reason.is_empty()), n.reason.clone())
+            })
+        })
+        .collect();
     // Display lines: (row, is the reason line).
-    let expand = |rows: &[Row], sel: Option<usize>| -> Vec<(usize, bool)> {
+    let expand = |sel: Option<usize>| -> Vec<(usize, bool)> {
         let mut v = Vec::new();
-        for (i, row) in rows.iter().enumerate() {
+        for (i, r) in reasons.iter().enumerate() {
             v.push((i, false));
-            if Some(i) == sel && matches!(row, Row::Need(_)) {
+            if Some(i) == sel && r.is_some() {
                 v.push((i, true));
             }
         }
         v
     };
-    let mut lines = expand(&m.rows, sel_pos);
+    let mut lines = expand(sel_pos);
     let hgt = r.height as usize;
     let len = lines.len();
     if m.follow {
@@ -351,7 +430,7 @@ fn list(m: &mut Menu, buf: &mut Buffer, r: Rect) {
                 if let Some(&ri) = pick {
                     m.sel = m.rows[ri].key();
                     sel_pos = Some(ri);
-                    lines = expand(&m.rows, sel_pos);
+                    lines = expand(sel_pos);
                     // A need's reason line shifts what follows it: keep the
                     // new selection (both its lines) inside the window.
                     let f = lines.iter().position(|l| l.0 == ri).unwrap_or(0);
@@ -382,11 +461,10 @@ fn list(m: &mut Menu, buf: &mut Buffer, r: Rect) {
         }
         let label = m.labels.get(&ri).map(String::as_str);
         if detail {
-            if let Row::Need(n) = row {
+            if let Some((word, wcol, reason)) = &reasons[ri] {
                 let x = r.x + 1 + lw as u16 + 1 + 2;
-                let is_detail = !n.reason.is_empty();
-                let cx = put(buf, x, y, end, &n.reason_word, fg(reason_color(&n.agent, is_detail)));
-                let rest = clip(&plain(&n.reason), end.saturating_sub(cx + 1) as usize);
+                let cx = put(buf, x, y, end, word, fg(wcol));
+                let rest = clip(&plain(reason), end.saturating_sub(cx + 1) as usize);
                 put(buf, cx + 1, y, end, &rest, fg("sub"));
             }
         } else {
@@ -412,6 +490,9 @@ fn list(m: &mut Menu, buf: &mut Buffer, r: Rect) {
         }
     }
     m.drawn = (drawn, labels);
+    // What the selection is, as this frame shows it (keys act on it only
+    // while it is still listed).
+    m.drawn_sel = m.selected_target();
 }
 
 /// One list row (not the reason line).
@@ -518,9 +599,10 @@ fn preview(m: &mut Menu, buf: &mut Buffer, r: Rect) {
         return;
     };
     let Some(a) = row.agent() else { return };
-    let (word, wcol, age) = match &row {
-        Row::Need(n) => (n.reason_word.clone(), reason_color(a, !n.reason.is_empty()), a.age.clone()),
-        Row::Parked(p) => (p.state_words.clone(), "overlay", p.age.clone()),
+    let need = m.reason_of(&row).map(|n| (n.reason_word.clone(), !n.reason.is_empty()));
+    let (word, wcol, age) = match (&row, need) {
+        (_, Some((wd, is_detail))) => (wd, reason_color(a, is_detail), a.age.clone()),
+        (Row::Parked(p), None) => (p.state_words.clone(), "overlay", p.age.clone()),
         _ => (
             if a.state_words.is_empty() { "shell".to_string() } else { a.state_words.to_string() },
             a.color.unwrap_or("overlay"),
@@ -839,6 +921,83 @@ mod tests {
         assert!(dwidth(&f[22]) <= 80);
         // 18 body rows < 21 lines: it scrolls, with a scrollbar.
         assert!(f[3..21].iter().any(|l| l.contains('▕')));
+    }
+
+    /// The default tab: fixed groups, no NEEDS YOU section, the selected
+    /// attention row's reason line under it in place.
+    #[test]
+    fn active_tab_110x34() {
+        let mut m = Menu::new(data(), Tab::Active);
+        let f = frame(&mut m, 110, 34);
+        assert!(f[1].starts_with("│  Active 4   All 7 ") && f[1].contains(" Needs you 2 "), "{}", f[1]);
+        assert!(!f.iter().any(|l| l.contains("NEEDS YOU") || l.contains("PARKED")));
+        assert!(f[3].starts_with("│ main ") && f[3].contains("◉1 ◐2 ○1"), "{}", f[3]);
+        assert!(f[4].contains("1 ◉ Kua Yu focus timing"), "{}", f[4]);
+        assert!(f[5].contains("2 ◐ Tmux Agent Sidebar") && f[5].contains("here"), "{}", f[5]);
+        assert!(f[6].contains("3 ◐ Handy.app Speech ⚙"), "{}", f[6]);
+        assert!(f[7].starts_with("│ work "), "{}", f[7]);
+        // Selected: the first need (work:1), its reason line right under it.
+        assert!(f[8].contains("4 ✕ Island resize"), "{}", f[8]);
+        assert!(f[9].contains("failed") && !f[9].contains("Island"), "{}", f[9]);
+        assert!(f[10].contains("5 ◐ Handy.app Speech"), "{}", f[10]);
+        assert_eq!(cell_bg(&mut m, 110, 34, 3, 8), color("surface1"));
+        // The preview names the reason too.
+        assert!(f[3].contains("Island resize") && f[3].contains("✕ failed · 11m"), "{}", f[3]);
+        // Another attention row: its detail; a working row: no reason line.
+        m.sel = Some(RowKey::Agent("main".into(), "@1".into()));
+        let f = frame(&mut m, 110, 34);
+        assert!(f[5].contains("asks Which deck?"), "{}", f[5]);
+        assert!(f[3].contains("◉ asks"), "{}", f[3]);
+        m.sel = Some(RowKey::Agent("main".into(), "@2".into()));
+        let f = frame(&mut m, 110, 34);
+        assert!(f[6].contains("3 ◐ Handy.app"), "{}", f[6]);
+        // Labels on screen are the rows' labels.
+        assert_eq!(m.drawn.0.len(), 5);
+        assert_eq!(m.drawn.0[3].key, RowKey::Agent("work".into(), "@6".into()));
+        assert_eq!(m.drawn.1[&3], "4");
+        // The empty state.
+        let mut d = data();
+        d.view.needs.clear();
+        for a in d.view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()) {
+            a.cat = Some(crate::model::Cat::Idle);
+        }
+        m.set_data(d);
+        let f = frame(&mut m, 110, 34);
+        assert!(f[3].contains("│ nothing working or waiting · ⇥ for all"), "{}", f[3]);
+    }
+
+    /// Narrow popups: the search field gives way, then the chips shorten,
+    /// then lose their counts, then their padding; every chip stays whole.
+    #[test]
+    fn chip_row_fits_narrow_widths() {
+        for (w, want, search) in [
+            (110, &[" Active 4 ", " All 7 ", " Needs you 2 ", " Working 2 ", " Idle 3 ", " Parked 5 "][..], true),
+            (80, &[" Needs you 2 ", " Parked 5 "][..], true),
+            (72, &[" Needs you 2 ", " Working 2 ", " Parked 5 "][..], false),
+            (64, &[" Active 4 ", " Needs 2 ", " Work 2 ", " Idle 3 ", " Parked 5 "][..], false),
+            (58, &[" Active ", " All ", " Needs ", " Work ", " Idle ", " Parked "][..], false),
+            (40, &["Active", "All", "Needs", "Work", "Idle", "Parked"][..], false),
+        ] {
+            let mut m = Menu::new(data(), Tab::Active);
+            let f = frame(&mut m, w, 24);
+            for chip in want {
+                assert!(f[1].contains(chip), "{w}: {chip:?} in {:?}", f[1]);
+            }
+            assert_eq!(f[1].contains("search…"), search, "{w}: {:?}", f[1]);
+            if w <= 58 {
+                assert!(!f[1].chars().any(|c| c.is_ascii_digit()), "{w}: counts dropped: {:?}", f[1]);
+            }
+            // Every chip is clickable, whole, inside the border.
+            let chips: Vec<Rect> =
+                m.clicks.iter().filter(|(_, h)| matches!(h, Hit::Tab(_))).map(|(r, _)| *r).collect();
+            assert_eq!(chips.len(), 6);
+            assert!(chips.iter().all(|r| r.width > 0 && r.right() <= w - 2), "{w}: {chips:?}");
+        }
+        // An open search keeps its field; the chips shorten first.
+        let mut m = Menu::new(data(), Tab::Active);
+        m.searching = true;
+        let f = frame(&mut m, 64, 24);
+        assert!(f[1].contains(" Parked ") && f[1].contains(" / ") && f[1].contains('▏'), "{:?}", f[1]);
     }
 
     #[test]

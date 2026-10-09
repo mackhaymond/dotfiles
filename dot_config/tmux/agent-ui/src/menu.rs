@@ -2,9 +2,14 @@
 //! `agent-roster.py --client <tty>`.
 //!
 //! ```text
-//! agent-ui menu --client <tty> [--tab all|needs|working|idle|parked]
+//! agent-ui menu --client <tty> [--tab active|all|needs|working|idle|parked]
 //! agent-ui menu --once WxH [--client <tty>] [--tab x] [--select <label>] [--plain]
 //! ```
+//!
+//! It opens on the **Active** tab: every agent working or needing you, in a
+//! fixed space/index order that a state change never reshuffles (see
+//! [`rows`]). Tab / Shift-Tab cycle Active, All, Needs you, Working, Idle,
+//! Parked.
 //!
 //! The pieces: [`keys`] (raw bytes → keys, the Python's `parse_keys`),
 //! [`rows`] (tabs, search, the list), [`state`] (the `Roster` state machine
@@ -55,7 +60,7 @@ use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: agent-ui menu --client <tty> [--tab all|needs|working|idle|parked]
+const USAGE: &str = "usage: agent-ui menu --client <tty> [--tab active|all|needs|working|idle|parked]
        agent-ui menu --once WxH [--client <tty>] [--tab x] [--select <label>] [--plain]";
 
 /// A snapshot every half second (lib.rs: the steadier pulse).
@@ -79,7 +84,7 @@ pub struct Args {
 }
 
 pub fn parse_args(args: &[String]) -> Result<Args, String> {
-    let mut a = Args { client: None, tab: Tab::All, once: None, select: None, plain: false };
+    let mut a = Args { client: None, tab: Tab::Active, once: None, select: None, plain: false };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut val = || it.next().cloned().ok_or_else(|| format!("{arg} needs a value"));
@@ -484,6 +489,9 @@ mod tests {
         assert_eq!((a.client.as_deref(), a.tab, a.once), (Some("/dev/ttys004"), Tab::Parked, None));
         let a = parse_args(&s(&["--once", "110x34", "--select", "02", "--plain"])).unwrap();
         assert_eq!((a.once, a.select.as_deref(), a.plain), (Some((110, 34)), Some("02"), true));
+        assert_eq!(a.tab, Tab::Active); // the default
+        assert_eq!(parse_args(&s(&["--tab", "active"])).unwrap().tab, Tab::Active);
+        assert_eq!(parse_args(&s(&["--tab", "all"])).unwrap().tab, Tab::All);
         assert!(parse_args(&s(&["--tab", "nope"])).is_err());
         assert!(parse_args(&s(&["--once", "110"])).is_err());
         assert!(parse_args(&s(&["--client"])).is_err());

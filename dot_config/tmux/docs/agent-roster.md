@@ -16,10 +16,31 @@ is the primary one for both the Option-W popup and the CMD+B sidebar.
 
 | Surface | Command |
 |---|---|
-| Option-W / `prefix q` / `prefix C-q` popup | `agent-ui menu --client <tty> [--tab all\|needs\|working\|idle\|parked]` |
+| Option-W / `prefix q` / `prefix C-q` popup | `agent-ui menu --client <tty> [--tab active\|all\|needs\|working\|idle\|parked]` |
 | CMD+B WezTerm sidebar | `agent-ui sidebar [--client <tty>]` (wezterm.lua also passes `--tmux-pane`, `--wezterm`) |
 | screenshot / test render | `agent-ui sidebar --once WxH`, `agent-ui menu --client <tty> --once WxH` |
 
+- **Tabs** (agent-ui menu only; the Python has one list): a chip row,
+  cycled with Tab / Shift-Tab in the order Active, All, Needs you, Working,
+  Idle, Parked. The menu opens on **Active**: every agent that is working
+  (running, or a workflow/cua out) or needs you (the Needs you tab's queue),
+  grouped by space in the sidebar's fixed by-name order, then by window
+  index. Its order never depends on state or age: an agent going from
+  working to needs-input keeps its row and only changes glyph and colour;
+  an agent going idle leaves, a new one appears in its slot, but rows never
+  swap. There is no NEEDS YOU section on this tab; the selected attention
+  row shows its reason line (perm/asks/fail/done) under it instead. On open
+  the selection is the first need in `agent-jump.sh list` order (so ⏎ still
+  goes to the most urgent), else the current window, else the first row; a
+  state change never moves it. If the selected agent leaves the set, the
+  selection goes to the nearest surviving row (the next, else the previous),
+  and a key that acts on a row (⏎, Space, `p`, `s`, `x`, `H`) typed before a
+  frame showed that is refused ("that tab moved · pick it again"), never
+  retargeted. Empty: "nothing working or waiting · ⇥ for all". The sidebar's
+  idle fold opens the menu on Idle and its `… N more` rows on All. In a
+  narrow popup the search field goes first, then the chips shorten
+  ("Needs", "Work"), then drop their counts.
+  **All** is the layout described [below](#layout) (NEEDS YOU first).
 - **Source**: the crate lives only in the chezmoi source tree,
   `~/.local/share/chezmoi/dot_config/tmux/agent-ui/` (`.chezmoiignore` keeps
   it out of `~/.config`).

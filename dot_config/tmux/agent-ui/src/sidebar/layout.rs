@@ -699,7 +699,8 @@ fn fold_row(idle: &[&Agent], w: usize) -> Row {
         vec![],
         None,
     ))
-    .click(w, Target::Menu(None))
+    // The menu's Idle tab: the default (Active) does not list idle agents.
+    .click(w, Target::Menu(Some("idle")))
     .covering(idle.iter().copied())
 }
 
@@ -712,7 +713,8 @@ fn more_row(w: usize, agents: &[&Agent], spaces: usize) -> Row {
         1 => format!(" … {n} more"),
         _ => format!(" … {n} more in {spaces} spaces"),
     };
-    dim_line(w, &text).click(w, Target::Menu(None)).covering(agents.iter().copied())
+    // The menu's All tab: the hidden agents may be idle, which Active omits.
+    dim_line(w, &text).click(w, Target::Menu(Some("all"))).covering(agents.iter().copied())
 }
 
 /// An agent's identity across frames: (session, window id).
@@ -1291,6 +1293,12 @@ mod tests {
         assert_eq!((f.top_step, f.bottom_step), (5, 4), "{t:#?}");
         assert!(t.iter().any(|l| l.contains("more need you")), "{t:#?}");
         assert!(t.iter().any(|l| l.contains("more in")), "{t:#?}");
+        // `… N more` opens the menu on All (what it hides may be idle);
+        // `… N more need you` keeps the default tab.
+        let more = find(&f, "more in") as u16;
+        assert_eq!(f.target(3, more), Some(&Target::Menu(Some("all"))));
+        let needs_more = find(&f, "more need you") as u16;
+        assert_eq!(f.target(3, needs_more), Some(&Target::Menu(None)));
         check_accounting("extreme", &v, &f);
         // With more room the spaces collapse, quietest first; the
         // attention-heavy ones keep their rows.
@@ -1395,6 +1403,8 @@ mod tests {
         for h in 2u16..=4 {
             let f = layout(&quiet(), 34, h, &Opts::default());
             assert!(f.rows.iter().any(|r| r.text().starts_with(" … 11 agents")), "{h}: {:#?}", texts(&f));
+            let y = find(&f, " … 11 agents") as u16;
+            assert_eq!(f.target(3, y), Some(&Target::Menu(Some("all"))));
         }
         // Nothing pending in one row: never ` … 0 need you`.
         assert_eq!(needs_cut(&empty(), 34, 1).iter().map(Row::text).collect::<Vec<_>>(), [dim_line(34, " ✓ nothing needs you").text()]);
@@ -1440,6 +1450,10 @@ mod tests {
         let t = texts(&f);
         assert_eq!(f.bottom_step, 2, "{t:#?}");
         assert!(t.iter().any(|l| l.contains("○○○ 3 idle · ")), "{t:#?}");
+        // The fold opens the menu on its Idle tab (Active, the default,
+        // does not list idle agents).
+        let fold = find(&f, "○○○ 3 idle · ") as u16;
+        assert_eq!(f.target(5, fold), Some(&Target::Menu(Some("idle"))));
         // The client's window is never folded away.
         assert!(t.iter().any(|l| l.contains("Tmux Agent Sidebar")));
         // Squeezed further: whole spaces collapse, quietest first; main
