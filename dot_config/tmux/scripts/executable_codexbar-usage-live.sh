@@ -20,6 +20,16 @@
 # codexbar-usage-status.sh --merge-live, which folds it into usage.json; most
 # repaints end at the comparison.
 #
+# UNCHANGED IS STILL A READING. A repaint that brings exactly the numbers the
+# sample already holds says "still this, as of now", and the status script
+# uses that to move usage.json's updated_at (it confirms the block only when
+# both windows agree with it; see merge_live_claude_locked there). So the
+# sample carries `seen`, the last time a session repainted with a current
+# reading for this account (one at the frontier: none of its readings below
+# the sample's own), and an unchanged sample is still rewritten — and
+# --merge-live still woken — once `seen` is a minute old. That caps the extra
+# writes at one a minute however many sessions repaint.
+#
 # ONE ACCOUNT PER SAMPLE. Those rules hold within one account only. claude-swap
 # (cswap) can switch the login to another account at any minute, and then the
 # old account's 90% would outrank the new one's 3% — same window, or a window
@@ -41,12 +51,17 @@
 # Sample (claude-live.json):
 #   {"five_hour": {"used": 7, "resets_at": E, "t": E}, "seven_day": {...},
 #    "account": "me@example.com/<org uuid>",
-#    "fence": [{"a": "<previous account>", "r": E}, ...]}
+#    "fence": [{"a": "<previous account>", "r": E}, ...],
+#    "seen": E}
 #   used       percent, exactly as Claude Code reported it
 #   resets_at  epoch seconds
 #   t          when THIS value was first seen, not when it was last repainted
 #   account    whose numbers; absent when ~/.claude.json could not be read
 #   fence      earlier accounts' still-open windows; absent when empty
+#   seen       when a session last repainted with open, unfenced readings for
+#              this account, none lower than the sample's — refreshed at most
+#              once a minute while the numbers hold still; dropped with the
+#              readings on a switch
 
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
@@ -132,11 +147,34 @@ merged="$(jq -nc --argjson prev "$prev" --argjson in "$incoming" --argjson now "
       if $x == null then null
       elif any($fence[]; ((.r - $x.resets_at) | fabs) <= 600) then null
       else $x end;
-  { five_hour: pick(open($base.five_hour); unfenced(open(reading($in.five_hour)))),
-    seven_day: pick(open($base.seven_day); unfenced(open(reading($in.seven_day)))) }
+  unfenced(open(reading($in.five_hour))) as $i5
+  | unfenced(open(reading($in.seven_day))) as $i7
+  | { five_hour: pick(open($base.five_hour); $i5),
+      seven_day: pick(open($base.seven_day); $i7) }
   | with_entries(select(.value != null))
   | if $acct != "" then .account = $acct else . end
   | if ($fence | length) > 0 then .fence = $fence else . end
+  # `seen`. Only a session at the FRONTIER refreshes it: every reading it
+  # brought is in the same window as the merged one and at least as high. An
+  # idle session repainting an older, lower number is not news about now.
+  # The previous `seen` carries over unless the account changed under it.
+  | . as $m
+  | def frontier($i; $x):
+      $i == null
+      or ($x != null and (($i.resets_at - $x.resets_at) | fabs) <= 600 and $i.used >= $x.used);
+    (($i5 != null or $i7 != null)
+     and frontier($i5; $m.five_hour) and frontier($i7; $m.seven_day)) as $fresh
+  | (if $acct != "" and $pa != "" and $pa != $acct then null
+     elif ($prev.seen | type) == "number" then $prev.seen
+     else null end) as $pseen
+  | ($m == ($prev | del(.seen))) as $same
+  | if $fresh then
+      # Unchanged and confirmed less than a minute ago: nothing to write.
+      if $same and $pseen != null and $pseen <= $now and ($now - $pseen) < 60 then $prev
+      else $m + {seen: $now} end
+    elif $same then $prev
+    elif $pseen != null then $m + {seen: $pseen}
+    else $m end
 ' 2>/dev/null)" || exit 0
 [[ -n "$merged" ]] || exit 0
 [[ "$merged" == "$prev" ]] && exit 0

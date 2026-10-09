@@ -46,6 +46,13 @@ LIVE_SAMPLE_FILE="${CACHE_DIR}/claude-live.json"
 LIVE_MERGED_MARKER="${CACHE_DIR}/claude-live.merged"
 HISTORY_RECENT_WINDOW_SECONDS=1800
 
+# claude-swap's own usage cache: every account's last good endpoint reading,
+# which its cswap-auto LaunchAgent keeps current on its own poll (see
+# adopt_cswap_claude). The marker carries the mtime of the version a tick last
+# examined (`touch -r`), so a tick with nothing new costs one builtin -nt test.
+CSWAP_USAGE_CACHE_FILE="${HOME}/.claude-swap-backup/cache/usage.json"
+CSWAP_USAGE_CHECKED_MARKER="${CACHE_DIR}/cswap-usage.checked"
+
 # Which Claude account is logged in (see "Which Claude account" below):
 # ~/.claude.json's oauthAccount; claude-swap's slot table, read only for an
 # alias; and the account the last tick saw, so a switch is noticed exactly once.
@@ -140,6 +147,23 @@ STALE_AFTER_SECONDS="$(parse_int_with_default "$(opt_or_env_or_default '@codexba
 
 if (( CODEXBAR_USAGE_DEBUG == 0 && STALE_AFTER_SECONDS < 30 )); then
   STALE_AFTER_SECONDS=30
+fi
+
+# CLAUDE POLLS ON ITS OWN, SLOWER CLOCK. The usage endpoint answers about 28-30
+# requests per rolling hour per account (claude_swap/poll_policy.py), and that
+# budget is not ours alone: claude-swap's cswap-auto LaunchAgent polls the same
+# account every 3-5 minutes. At the shared 120s this script spent ~30 of them
+# an hour by itself, the two together ran past the cap, refreshes answered
+# rate_limit_error, and the backoff ladder (300 -> 600 -> 1800s) held the bar
+# still for up to half an hour. Claude no longer needs a fast poll to look
+# fresh: Claude Code's per-turn numbers (merge_live_claude) and cswap's own
+# readings (adopt_cswap_claude) both move updated_at for free. The poll is left
+# with what only it supplies — the scoped cap, severities, the breakdown — and
+# 15 minutes is plenty for those. Codex keeps @codexbar_stale_after_seconds.
+CLAUDE_STALE_AFTER_SECONDS="$(parse_int_with_default "$(opt_or_env_or_default '@codexbar_claude_stale_after_seconds' 'CODEXBAR_CLAUDE_STALE_AFTER_SECONDS' '900')" 900)"
+
+if (( CODEXBAR_USAGE_DEBUG == 0 && CLAUDE_STALE_AFTER_SECONDS < 30 )); then
+  CLAUDE_STALE_AFTER_SECONDS=30
 fi
 
 WEB_TIMEOUT_SECONDS="$(clamp_int_range "$(opt_or_env_or_default '@codexbar_web_timeout' 'CODEXBAR_USAGE_WEB_TIMEOUT' '2')" 1 30)"
@@ -292,8 +316,9 @@ select_provider "$DISPLAY_PROVIDER"
 # Before this, nothing that holds the numbers knew which account they were
 # for, and a switch could leave the bar on the OLD account's usage:
 #
-#   usage.json      only re-fetched once fetched_at aged past
-#                   @codexbar_stale_after_seconds, and not before the claude
+#   usage.json      only re-fetched once fetched_at aged past the poll
+#                   interval (@codexbar_stale_after_seconds then; Claude has
+#                   @codexbar_claude_stale_after_seconds now), and not before the claude
 #                   backoff ladder ran out — a ladder the old account's
 #                   rate_limit_error had usually just armed at 5 minutes, and
 #                   that climbs to an hour. The token itself was never the
@@ -995,6 +1020,10 @@ provider_refresh_due() {
   local provider="${1:-}" now="${2:-}" ts age fc na saved="$ACTIVE_PROVIDER" due=1
   [[ "$now" =~ ^[0-9]+$ ]] || now="$(now_epoch)"
 
+  # Claude's poll interval is its own (CLAUDE_STALE_AFTER_SECONDS, above).
+  local stale_after="$STALE_AFTER_SECONDS"
+  [[ "$provider" == 'claude' ]] && stale_after="$CLAUDE_STALE_AFTER_SECONDS"
+
   ts="$(provider_updated_at "$provider")"
   age=$(( now - ts ))
   # Claude's numbers are stale the moment they belong to another account,
@@ -1005,7 +1034,7 @@ provider_refresh_due() {
   fi
   # A backward wall-clock step (e.g. NTP correction on wake) makes age
   # negative; treat that as stale so the recovery refresh isn't suppressed.
-  if (( other_account == 1 || age < 0 || age >= STALE_AFTER_SECONDS )); then
+  if (( other_account == 1 || age < 0 || age >= stale_after )); then
     select_provider "$provider"
     read -r fc na < <(read_refresh_backoff)
     (( now >= na )) && due=0
@@ -3169,8 +3198,11 @@ load_fetch_from_block() {
 }
 
 # Fold the live sample into Claude's block in usage.json. Run by
-# codexbar-usage-live.sh whenever the sample changes (--merge-live), and by the
-# tick for a sample that arrived while the lock was busy. Never touches the
+# codexbar-usage-live.sh whenever it rewrites the sample (--merge-live) — new
+# numbers, or the same numbers with a fresher `seen`, which confirms the block
+# and moves its updated_at — and by the tick for a sample that arrived while
+# the lock was busy (the marker comparison sees a `seen`-only rewrite as a
+# change too). Never touches the
 # network. Re-renders the block — text, colours and pace all follow the new
 # numbers — and leaves fetched_at alone, so the endpoint poll keeps its own
 # schedule for the things only it knows.
@@ -3221,20 +3253,88 @@ merge_live_claude_locked() {
     load_fetch_from_block claude || return 0
   fi
 
-  local before after now
+  local before after now seen
   before="$FETCH_SESSION_USED $FETCH_SESSION_RESETS_AT $FETCH_WEEKLY_USED $FETCH_WEEKLY_RESETS_AT"
   apply_claude_live_sample "$sample" "$BLOCK_UPDATED_AT"
   after="$FETCH_SESSION_USED $FETCH_SESSION_RESETS_AT $FETCH_WEEKLY_USED $FETCH_WEEKLY_RESETS_AT"
-  [[ "$before" != "$after" ]] || return 0
-
   now="$(now_epoch)"
+
+  if [[ "$before" != "$after" ]]; then
+    commit_claude_rerender "$LIVE_AS_OF" || return 1
+    log_info "live[claude]: from Claude Code session=${RENDER_SESSION_USED}% weekly=${RENDER_WEEKLY_USED}% (endpoint fetched $(( now - BLOCK_FETCHED_AT ))s ago)"
+    return 0
+  fi
+
+  # SAME NUMBERS IS STILL NEWS. A session that repaints with exactly the
+  # numbers the block already shows is saying "still this, as of now" — and
+  # used to be dropped right here, so updated_at (the notch's "updated Xm ago")
+  # aged through an afternoon of busy sessions all reporting the same 31%.
+  # codexbar-usage-live.sh stamps the sample with `seen` (at most once a
+  # minute when nothing else changed); when that is newer than the block and
+  # BOTH open windows agree with the block, the block is re-rendered as of
+  # `seen`. fetched_at stays put, so the poll's schedule is untouched.
+  seen="$(live_sample_confirmed_at "$sample")" || return 0
+  [[ "$seen" =~ ^[0-9]+$ ]] || return 0
+  commit_claude_rerender "$seen" || return 1
+  log_info "live[claude]: confirmed by Claude Code session=${RENDER_SESSION_USED}% weekly=${RENDER_WEEKLY_USED}% (seen $(( now - seen ))s ago; endpoint fetched $(( now - BLOCK_FETCHED_AT ))s ago)"
+  return 0
+}
+
+# Prints the sample's `seen` when it CONFIRMS the FETCH_* numbers loaded from
+# the block, and fails otherwise. Confirming means: `seen` is newer than the
+# block's updated_at (and not in the future), and the five_hour AND seven_day
+# readings are both open and equal the block's used values for the same
+# window (resets_at within the usual 10 minutes; used compared after the
+# block's own truncation to an integer). One window agreeing proves nothing
+# about the other. A LOWER live reading never confirms: the endpoint saw usage
+# Claude Code did not (claude.ai, the phone, another machine), and the session
+# repainting its older number is not evidence the endpoint's is still current.
+live_sample_confirmed_at() {
+  local sample="${1:-}" out
+  [[ -n "${sample:-}" ]] || return 1
+  out="$(printf '%s' "$sample" | jq -r \
+    --argjson now "$(now_epoch)" --argjson updated "${BLOCK_UPDATED_AT:-0}" \
+    --arg su "${FETCH_SESSION_USED:-}" --arg sr "${FETCH_SESSION_RESETS_AT:-}" \
+    --arg wu "${FETCH_WEEKLY_USED:-}" --arg wr "${FETCH_WEEKLY_RESETS_AT:-}" '
+      def num($s): ($s | tonumber? // null);
+      def agrees($x; $u; $r):
+        ($x | type) == "object"
+        and ($x.used | type) == "number" and ($x.resets_at | type) == "number"
+        and $x.resets_at > $now
+        and num($u) != null and num($r) != null
+        and ($x.used | floor) == (num($u) | floor)
+        and (($x.resets_at - num($r)) | fabs) <= 600;
+      (.seen // null) as $seen
+      | if ($seen | type) == "number"
+           and ($seen | floor) > $updated and ($seen | floor) <= $now
+           and agrees(.five_hour; $su; $sr) and agrees(.seven_day; $wu; $wr)
+        then $seen | floor
+        else empty end
+    ' 2>/dev/null || true)"
+  [[ "${out:-}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$out"
+}
+
+# Re-render Claude's block from the FETCH_* in hand, as of $1, and commit it:
+# usage.json, a history sample, the tmux options, a redraw. Shared by every
+# path that refreshes the block WITHOUT a fetch (merge_live_claude_locked,
+# adopt_cswap_claude_locked); each first loads the block (load_fetch_from_block,
+# or the other-account reset) so BLOCK_STATE and BLOCK_FETCHED_AT are the
+# block's. fetched_at is carried over, never moved: it means "our own endpoint
+# poll", and only refresh_one_provider sets it.
+commit_claude_rerender() {
+  local as_of="${1:-0}"
+
   RENDER_FETCHED_AT="$BLOCK_FETCHED_AT"
-  render_provider_block claude "$LIVE_AS_OF" || return 1
+  if ! render_provider_block claude "$as_of"; then
+    RENDER_FETCHED_AT=''
+    return 1
+  fi
   RENDER_FETCHED_AT=''
 
-  # Live numbers do not clear a login problem — only a fetch proves the token
-  # works — but they do supersede an "error", which only ever meant the
-  # numbers had stopped moving.
+  # Numbers from elsewhere do not clear a login problem — only our own fetch
+  # proves OUR token works — but they do supersede an "error", which only ever
+  # meant the numbers had stopped moving.
   if [[ "$BLOCK_STATE" == 'auth_required' ]]; then
     RENDER_BLOCK="$(printf '%s' "$RENDER_BLOCK" | jq -c '.state = "auth_required"' 2>/dev/null || printf '%s' "$RENDER_BLOCK")"
   fi
@@ -3244,16 +3344,175 @@ merge_live_claude_locked() {
   [[ -n "${blocks:-}" ]] || return 1
   write_usage_cache "$blocks" || return 1
 
-  append_usage_history "$LIVE_AS_OF" "$RENDER_SESSION_USED" "$RENDER_WEEKLY_USED" \
+  append_usage_history "$as_of" "$RENDER_SESSION_USED" "$RENDER_WEEKLY_USED" \
     "$RENDER_SESSION_RESETS" "$RENDER_WEEKLY_RESETS" \
     "$RENDER_SCOPED_USED" "$RENDER_SCOPED_RESETS" || true
-
-  log_info "live[claude]: from Claude Code session=${RENDER_SESSION_USED}% weekly=${RENDER_WEEKLY_USED}% (endpoint fetched $(( now - BLOCK_FETCHED_AT ))s ago)"
 
   publish_to_tmux_opts || true
   if command -v tmux >/dev/null 2>&1; then
     tmux refresh-client -S >/dev/null 2>&1 || true
   fi
+  return 0
+}
+
+# ── claude-swap's readings ──────────────────────────────────────────────────
+#
+# claude-swap (cswap) polls the same usage endpoint for the same account — its
+# cswap-auto LaunchAgent, every 3-5 minutes for the active account — and keeps
+# every account's last good answer in ~/.claude-swap-backup/cache/usage.json
+# (schemaVersion 2):
+#
+#   .accounts["<slot>"] = {email, organizationUuid, fetchedAt: <epoch float>,
+#     lastGood: {five_hour: {pct, resets_at: "<ISO 8601, +00:00>"},
+#                seven_day: {pct, resets_at},
+#                scoped: [{name: "Fable", pct, resets_at}, ...]}, ...}
+#
+# That is the very reading our own fetch would have bought, already paid for
+# out of the account's shared ~30/hour budget. Re-fetching it is what kept the
+# two pollers over the cap. So the tick adopts it, for free, whenever it is
+# newer than the block:
+#
+#   - the slot is matched by the SAME key as CLAUDE_ACCOUNT_KEY (lower-cased
+#     email + "/<org uuid>"); another account's slot is never read
+#   - only when fetchedAt is newer than the block's updated_at, five_hour and
+#     seven_day both exist, and their windows are still open (a five_hour
+#     with no resets_at is accepted only at 0%: the endpoint's "between
+#     windows")
+#   - it replaces the session and weekly used/resets_at, and the scoped cap
+#     when cswap has one matching @codexbar_scoped_model by the fetch's own
+#     rule (case-insensitive prefix); labels, severities, locked flags and the
+#     breakdown stay as our last fetch left them — cswap keeps none of those
+#   - updated_at becomes floor(fetchedAt); fetched_at does NOT move, so our
+#     own poll (for everything cswap does not keep) holds its schedule
+#   - the live sample is then re-applied on top by the usual pick rules, so a
+#     newer Claude Code reading is never pushed back down
+#
+# Silent when the file is missing, unreadable, or holds nothing for this
+# account: cswap is optional, and this is a bonus, not a source of truth.
+adopt_cswap_claude() {
+  provider_enabled claude || return 0
+  [[ -f "$CSWAP_USAGE_CACHE_FILE" && -f "$CACHE_FILE" ]] || return 0
+  # The tick runs every few seconds, cswap writes about once a minute. With
+  # nothing new since the version last examined, this is the whole cost: one
+  # builtin mtime comparison, no fork.
+  if [[ -f "$CSWAP_USAGE_CHECKED_MARKER" && ! "$CSWAP_USAGE_CACHE_FILE" -nt "$CSWAP_USAGE_CHECKED_MARKER" ]]; then
+    return 0
+  fi
+  command -v jq >/dev/null 2>&1 || return 0
+
+  # Busy: a refresh or a live merge holds the lock. The marker has not moved,
+  # so the next tick tries again.
+  if ! try_acquire_lock "$$"; then
+    log_debug "cswap[claude]: lock busy"
+    return 0
+  fi
+
+  local rc=0
+  adopt_cswap_claude_locked || rc=$?
+  release_lock
+  return $rc
+}
+
+adopt_cswap_claude_locked() {
+  # Marked examined BEFORE the read, with the file's own mtime: a write that
+  # lands while this runs leaves the file newer than the marker, and the next
+  # tick reads it. Whatever this version holds, it is not read twice.
+  touch -r "$CSWAP_USAGE_CACHE_FILE" "$CSWAP_USAGE_CHECKED_MARKER" 2>/dev/null || true
+
+  load_claude_account
+  [[ -n "$CLAUDE_ACCOUNT_KEY" ]] || return 0
+
+  select_provider claude
+  if claude_block_is_other_account; then
+    # As in merge_live_claude_locked: nothing of the previous account's block
+    # survives. The poll is due at once for a switched account anyway; this
+    # only means the bar shows the new account's numbers before it lands.
+    reset_fetch_outputs
+    FETCH_SESSION_WINDOW_MINUTES=300
+    FETCH_WEEKLY_WINDOW_MINUTES=10080
+    BLOCK_STATE=''
+    BLOCK_UPDATED_AT=0
+    BLOCK_FETCHED_AT=0
+  else
+    load_fetch_from_block claude || return 0
+  fi
+
+  local now line
+  now="$(now_epoch)"
+  # resets_at is ISO 8601 with fractional seconds and "+00:00"; fromdateiso8601
+  # takes neither, so both are normalised first (the jq twin of
+  # iso_utc_to_epoch). \x1f-joined, like load_fetch_from_block, so empty
+  # fields survive `read`.
+  line="$(jq -r \
+    --arg key "$CLAUDE_ACCOUNT_KEY" --arg m "$SCOPED_MODEL_NAME" \
+    --argjson updated "$BLOCK_UPDATED_AT" --argjson now "$now" '
+      def epoch:
+        if type == "number" then floor
+        elif type == "string" then
+          (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | (fromdateiso8601? // null))
+        else null end;
+      # CLAUDE_ACCOUNT_JQ, applied to a cswap slot.
+      def slot_key:
+        ((.email // "") | tostring) as $e
+        | ((.organizationUuid // "") | tostring) as $o
+        | if $e == "" then "" else ($e | ascii_downcase) + (if $o == "" then "" else "/" + $o end) end;
+      def window($w):
+        if ($w | type) == "object" and ($w.pct | type) == "number"
+        then {used: ($w.pct | floor), resets_at: ($w.resets_at | epoch)}
+        else null end;
+
+      [ (.accounts // {})[]? | objects | select(slot_key == $key) ] | first // empty
+      | select((.fetchedAt | type) == "number")
+      | (.fetchedAt | floor) as $fetched
+      | select($fetched > $updated and $fetched <= $now)
+      | (.lastGood // {}) as $g
+      | window($g.five_hour) as $s
+      | window($g.seven_day) as $w
+      | select($s != null and $w != null)
+      | select(($w.resets_at // 0) > $now)
+      | select(($s.resets_at != null and $s.resets_at > $now)
+               or ($s.resets_at == null and $s.used == 0))
+      | ([ ($g.scoped // [])[]? | objects
+           | select(((.name // "") | tostring | ascii_downcase) | startswith($m | ascii_downcase))
+           | select((.pct | type) == "number")
+           | {name: (.name | tostring), used: (.pct | floor), resets_at: (.resets_at | epoch)}
+           | select(.resets_at != null and .resets_at > $now) ] | first) as $sc
+      | [ $fetched, $s.used, ($s.resets_at // ""), $w.used, $w.resets_at,
+          ($sc.used // ""), ($sc.resets_at // ""), ($sc.name // "") ]
+      | map(tostring) | join("\u001f")
+    ' "$CSWAP_USAGE_CACHE_FILE" 2>/dev/null || true)"
+  [[ -n "${line:-}" ]] || return 0
+
+  local fetched su sr wu wr scu scr scn
+  IFS=$'\x1f' read -r fetched su sr wu wr scu scr scn <<<"$line" || true
+  [[ "$fetched" =~ ^[0-9]+$ && "$su" =~ ^[0-9]+$ && "$wu" =~ ^[0-9]+$ ]] || return 0
+
+  FETCH_SESSION_USED="$su"
+  FETCH_SESSION_RESETS_AT="$sr"
+  FETCH_WEEKLY_USED="$wu"
+  FETCH_WEEKLY_RESETS_AT="$wr"
+  if [[ "${scu:-}" =~ ^[0-9]+$ ]]; then
+    FETCH_SCOPED_USED="$scu"
+    FETCH_SCOPED_RESETS_AT="$scr"
+    FETCH_SCOPED_WINDOW_MINUTES=10080
+    # The endpoint's own name for the window, exactly as the fetch stores it.
+    [[ -n "${scn:-}" ]] && FETCH_SCOPED_LABEL="$scn"
+  fi
+
+  local sample=''
+  if [[ -f "$LIVE_SAMPLE_FILE" ]]; then
+    sample="$(cat "$LIVE_SAMPLE_FILE" 2>/dev/null || true)"
+    live_sample_is_current_account "$sample" || sample=''
+  fi
+  apply_claude_live_sample "$sample" "$fetched"
+
+  commit_claude_rerender "$LIVE_AS_OF" || return 1
+
+  local shown=''
+  if [[ "$RENDER_SESSION_USED" != "$su" || "$RENDER_WEEKLY_USED" != "$wu" ]]; then
+    shown="; Claude Code's live numbers outrank it: session=${RENDER_SESSION_USED}% weekly=${RENDER_WEEKLY_USED}%"
+  fi
+  log_info "cswap[claude]: adopted session=${su}% weekly=${wu}% scoped=${scu:-n/a}% (fetched $(( now - fetched ))s ago${shown})"
   return 0
 }
 
@@ -3408,10 +3667,20 @@ refresh_cache() {
     # CODEXBAR_USAGE_EAGER_PROVIDERS names providers the caller KNOWS just
     # moved (codexbar-usage-push.sh after a Claude Code turn): for those,
     # freshness is waived and only the backoff ladder still applies.
+    #
+    # EXCEPT Claude. The push runs on every Claude Code Stop hook, and waiving
+    # freshness there fetched Claude about once a minute while any session was
+    # busy — on top of cswap's own polling of the same account, against the
+    # endpoint's ~30-per-hour budget. That is what kept tripping
+    # rate_limit_error and freezing the bar behind the backoff ladder
+    # (2026-10-09: 32 Claude fetches in one hour). The turn that just ended has
+    # already handed its numbers over through codexbar-usage-live.sh, and cswap
+    # adoption covers the rest, so Claude's eager push gets the ordinary
+    # CLAUDE_STALE_AFTER_SECONDS gate.
     local eager=" ${CODEXBAR_USAGE_EAGER_PROVIDERS:-} "
     eager="${eager//,/ }"
     if [[ "${CODEXBAR_USAGE_FORCE_REFRESH:-}" != "1" ]]; then
-      if [[ "$eager" == *" ${provider} "* ]]; then
+      if [[ "$provider" != 'claude' && "$eager" == *" ${provider} "* ]]; then
         read -r fc na < <(read_refresh_backoff)
         if (( now < na )); then
           log_debug "refresh[${provider}]: eager but in backoff until ${na} (fail_count=${fc})"
@@ -3541,6 +3810,10 @@ main() {
         -mmin +5 -delete 2>/dev/null || true
 
       publish_to_tmux_opts || true
+      # claude-swap's latest reading for this account, when it is newer than
+      # the block (see adopt_cswap_claude). Before the live backstop, so a
+      # live sample waiting to be merged is folded on top of it, not under.
+      adopt_cswap_claude || true
       # Backstop for a live sample whose own --merge-live found the lock busy.
       if [[ -f "$LIVE_SAMPLE_FILE" ]] && ! cmp -s "$LIVE_SAMPLE_FILE" "$LIVE_MERGED_MARKER"; then
         merge_live_claude || true
