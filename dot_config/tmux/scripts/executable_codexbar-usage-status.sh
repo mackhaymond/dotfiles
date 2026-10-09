@@ -160,11 +160,20 @@ fi
 # readings (adopt_cswap_claude) both move updated_at for free. The poll is left
 # with what only it supplies — the scoped cap, severities, the breakdown — and
 # 15 minutes is plenty for those. Codex keeps @codexbar_stale_after_seconds.
-CLAUDE_STALE_AFTER_SECONDS="$(parse_int_with_default "$(opt_or_env_or_default '@codexbar_claude_stale_after_seconds' 'CODEXBAR_CLAUDE_STALE_AFTER_SECONDS' '900')" 900)"
-
-if (( CODEXBAR_USAGE_DEBUG == 0 && CLAUDE_STALE_AFTER_SECONDS < 30 )); then
-  CLAUDE_STALE_AFTER_SECONDS=30
-fi
+#
+# Resolved LAZILY, by claude_stale_after_seconds, and cached for the rest of
+# the run: reading the option costs a `tmux show-option` fork plus subshells,
+# and every script start — each --tick, each status-module render — would pay
+# it up front, while only provider_refresh_due for claude ever needs it.
+CLAUDE_STALE_AFTER_SECONDS=''
+claude_stale_after_seconds() {
+  [[ -n "$CLAUDE_STALE_AFTER_SECONDS" ]] && return 0
+  CLAUDE_STALE_AFTER_SECONDS="$(parse_int_with_default "$(opt_or_env_or_default '@codexbar_claude_stale_after_seconds' 'CODEXBAR_CLAUDE_STALE_AFTER_SECONDS' '900')" 900)"
+  if (( CODEXBAR_USAGE_DEBUG == 0 && CLAUDE_STALE_AFTER_SECONDS < 30 )); then
+    CLAUDE_STALE_AFTER_SECONDS=30
+  fi
+  return 0
+}
 
 WEB_TIMEOUT_SECONDS="$(clamp_int_range "$(opt_or_env_or_default '@codexbar_web_timeout' 'CODEXBAR_USAGE_WEB_TIMEOUT' '2')" 1 30)"
 AUTH_REQUIRED_COLOR="$(opt_or_env_or_default '@codexbar_auth_required_color' 'CODEXBAR_USAGE_AUTH_REQUIRED_COLOR' '#cba6f7')"
@@ -1022,7 +1031,10 @@ provider_refresh_due() {
 
   # Claude's poll interval is its own (CLAUDE_STALE_AFTER_SECONDS, above).
   local stale_after="$STALE_AFTER_SECONDS"
-  [[ "$provider" == 'claude' ]] && stale_after="$CLAUDE_STALE_AFTER_SECONDS"
+  if [[ "$provider" == 'claude' ]]; then
+    claude_stale_after_seconds
+    stale_after="$CLAUDE_STALE_AFTER_SECONDS"
+  fi
 
   ts="$(provider_updated_at "$provider")"
   age=$(( now - ts ))
@@ -3029,6 +3041,7 @@ render_provider_block() {
     --arg raw_file "$(basename "$(raw_file_for "$provider")")" \
     --arg history_file "$(basename "$(history_file_for "$provider")")" \
     --argjson fetched_at "$(json_num_or_null "${RENDER_FETCHED_AT:-$updated_at}")" \
+    --argjson endpoint_at "$(json_num_or_null "${RENDER_ENDPOINT_AT:-${RENDER_FETCHED_AT:-$updated_at}}")" \
     --arg account "$account" \
     --arg account_email "$account_email" \
     '{
@@ -3039,6 +3052,9 @@ render_provider_block() {
        # updated_at: as of when the numbers are current (any source).
        # fetched_at: the last endpoint fetch, which the poll gates on.
        fetched_at: $fetched_at,
+       # endpoint_at: the newest endpoint reading the numbers rest on, our
+       # fetch or one adopted from claude-swap; live merges never move it.
+       endpoint_at: $endpoint_at,
 
        session_used: $session_used, session_window_minutes: $session_window,
        session_resets_at: $session_resets, session_text: $session_text,
@@ -3082,28 +3098,74 @@ render_provider_block() {
 # every turn. So the endpoint keeps its poll, the live sample fills the time
 # between polls, and for each window the two are reconciled by one rule:
 #
-#   same window (resets_at within 10 min)  the HIGHER reading — usage only
-#                                          rises inside a window, so the
-#                                          higher one is simply the newer one
+#   same window (resets_at within 10 min)  the HIGHER reading, EXCEPT that an
+#                                          endpoint reading more than 10 min
+#                                          newer than the live one's first
+#                                          sighting wins even when lower
 #   different windows                      the LATER window
 #   a live reading whose window has passed ignored; an endpoint reading is
 #                                          never dropped, it is what we have
 #
+# WHY HIGHER, AND WHY NOT ALWAYS. Idle sessions keep repainting the last
+# rate_limits they saw, so the live feed on its own cannot tell a genuine drop
+# from an idle session's stale, lower number: between the two, the higher one
+# is the safe bet. But usage does NOT only rise inside a window — on
+# 2026-10-09 the weekly utilization fell from 22% to 10% four days before its
+# window ended — and "higher wins" then kept a 22% first seen 17 hours earlier
+# over the endpoint's 10% until the window's end, a week at worst. The
+# endpoint is the authority. So a live reading loses to an endpoint reading
+# taken more than 10 minutes after the live value was FIRST seen (its `t`,
+# which repaints do not move), and is then retired from the sample
+# (retire_overridden_live_readings) so the sessions' current numbers can
+# refill it.
+#
+# That exception must never let a STALE block value beat a NEW live reading.
+# The endpoint side's time is $2 — our fetch's time (refresh_one_provider),
+# cswap's floor(fetchedAt) (adopt_cswap_claude_locked), or the block's
+# endpoint_at (merge_live_claude_locked: the newest of those two already in
+# the block) — and none of those is ever later than now. A new live reading
+# has t = the moment live.sh first saw it, and live.sh wakes --merge-live
+# right then (the tick backstops a busy lock within seconds), so it is folded
+# in while $2 <= now < t + 600 and higher wins. The only live reading the
+# exception can beat is one first seen 10+ minutes before the endpoint reading
+# in hand, which is exactly the stale case. (Not updated_at for the merge
+# path: live five_hour readings and `seen` confirmations move it, so it would
+# date the block's weekly figure later than any endpoint actually said it.)
+# The override only acts when the endpoint side is LOWER, so a block figure
+# that itself came from an earlier live reading (and so carries a borrowed
+# endpoint time) never overrides: the sample holds that same reading or a
+# newer, higher one.
+#
 # Applied to FETCH_SESSION_* / FETCH_WEEKLY_* in place. $1 is the sample JSON,
-# $2 the time the FETCH_* values are as of. LIVE_AS_OF becomes the newest
-# first-seen time among the readings kept (never older than $2).
+# $2 the time the endpoint-side FETCH_* values were read, $3 (default $2) the
+# time the block is already current as of. LIVE_AS_OF becomes the newest
+# first-seen time among the readings kept, never older than $3.
+# LIVE_OVERRIDDEN is "" or a JSON object, keyed five_hour / seven_day, of the
+# live readings the endpoint just overrode ({used, resets_at, t} exactly as in
+# the sample, plus `by`, the endpoint's used); the caller retires them once
+# the block is committed.
 LIVE_AS_OF=0
+LIVE_OVERRIDDEN=''
 # The fetched_at render_provider_block stamps; empty means "this render IS a
 # fetch" (fetched_at = updated_at).
 RENDER_FETCHED_AT=''
+# The endpoint_at it stamps: when the newest ENDPOINT reading behind the
+# numbers was taken — our fetch's time, or claude-swap's fetchedAt for an
+# adopted one — carried over unchanged by live merges. Empty means the same as
+# fetched_at. It is the endpoint side's time in the override rule above, and
+# the gate on adopting a cswap reading (adopt_cswap_claude_locked); updated_at
+# would be wrong for both, since live readings and `seen` move it.
+RENDER_ENDPOINT_AT=''
 apply_claude_live_sample() {
-  local sample="${1:-}" base_t="${2:-0}" out
-  LIVE_AS_OF="$base_t"
-  [[ -n "${sample:-}" ]] || return 0
+  local sample="${1:-}" base_t="${2:-0}" floor_t="${3:-${2:-0}}" out
   [[ "$base_t" =~ ^[0-9]+$ ]] || base_t=0
+  [[ "$floor_t" =~ ^[0-9]+$ ]] || floor_t="$base_t"
+  LIVE_AS_OF="$floor_t"
+  LIVE_OVERRIDDEN=''
+  [[ -n "${sample:-}" ]] || return 0
 
   out="$(printf '%s' "$sample" | jq -r \
-    --argjson now "$(now_epoch)" --argjson base_t "$base_t" \
+    --argjson now "$(now_epoch)" --argjson base_t "$base_t" --argjson floor_t "$floor_t" \
     --arg su "${FETCH_SESSION_USED:-}" --arg sr "${FETCH_SESSION_RESETS_AT:-}" \
     --arg wu "${FETCH_WEEKLY_USED:-}" --arg wr "${FETCH_WEEKLY_RESETS_AT:-}" '
       def num($s): ($s | tonumber? // null);
@@ -3114,40 +3176,135 @@ apply_claude_live_sample() {
         if ($x | type) == "object" and ($x.used | type) == "number"
            and ($x.resets_at // 0) > $now
         then $x else null end;
+      # {v: the reading kept, over: the live reading the endpoint overrode}.
       def pick($a; $l):
-        if $l == null then $a
-        elif $a == null or $a.resets_at == null then $l
+        if $l == null then {v: $a}
+        elif $a == null or $a.resets_at == null then {v: $l}
         elif (($a.resets_at - $l.resets_at) | fabs) <= 600 then
-          (if $l.used > $a.used then $l else $a end)
-        elif $l.resets_at > $a.resets_at then $l
-        else $a end;
-      pick(api($su; $sr); open(.five_hour)) as $s
-      | pick(api($wu; $wr); open(.seven_day)) as $w
+          (if $l.used <= $a.used then {v: $a}
+           elif ($l.t | type) == "number" and $a.t > $l.t + 600 then
+             {v: $a, over: ($l | {used, resets_at, t} + {by: $a.used})}
+           else {v: $l} end)
+        elif $l.resets_at > $a.resets_at then {v: $l}
+        else {v: $a} end;
+      pick(api($su; $sr); open(.five_hour)) as $ps
+      | pick(api($wu; $wr); open(.seven_day)) as $pw
+      | $ps.v as $s | $pw.v as $w
       | if $s == null or $w == null then empty else
-          [ $s.used, ($s.resets_at // ""), $w.used, ($w.resets_at // ""),
-            ([$s.t, $w.t, $base_t] | max) ]
+          ({} + (if $ps.over then {five_hour: $ps.over} else {} end)
+              + (if $pw.over then {seven_day: $pw.over} else {} end)) as $ov
+          | [ $s.used, ($s.resets_at // ""), $w.used, ($w.resets_at // ""),
+              ([$s.t, $w.t, $floor_t] | max),
+              (if $ov == {} then "-" else ($ov | tojson) end) ]
           | map(tostring) | join(" ")
         end
     ' 2>/dev/null || true)"
   [[ -n "${out:-}" ]] || return 0
 
-  local su sr wu wr as_of
-  read -r su sr wu wr as_of <<<"$out"
+  local su sr wu wr as_of ov
+  read -r su sr wu wr as_of ov <<<"$out"
   FETCH_SESSION_USED="$su"
   FETCH_SESSION_RESETS_AT="$sr"
   FETCH_WEEKLY_USED="$wu"
   FETCH_WEEKLY_RESETS_AT="$wr"
   [[ "$as_of" =~ ^[0-9]+$ ]] && LIVE_AS_OF="$as_of"
+  [[ "${ov:-}" == '{'* ]] && LIVE_OVERRIDDEN="$ov"
+  return 0
+}
+
+# Retire the live readings the endpoint overrode (LIVE_OVERRIDDEN, passed as
+# $1) from claude-live.json. Caller holds the lock and has committed the
+# block. Left in place, a retired reading would keep outranking every LOWER
+# reading the sessions now report (live.sh's own merge is higher-wins too), so
+# `seen` would never be stamped again and the sample could not move until the
+# window ends. Dropping it lets the current numbers refill the window.
+#
+# The drop is recorded as `retired` ({w, u, r}: window key, used, resets_at),
+# and live.sh refuses that exact number for that window until it closes. An
+# idle session still holding the old rate_limits repaints it word for word,
+# and without the record the very next repaint would put it straight back with
+# a fresh t, where higher-wins would show it again until the next endpoint
+# reading (10+ minutes) retired it again: a flap, forever. A genuine reading
+# that happens to equal the retired number is lost for as long as it holds —
+# the endpoint still supplies it — and the next one past it is accepted.
+#
+# Read-modify-write, removing ONLY a window that still holds exactly the
+# {used, resets_at, t} overridden. live.sh writes without the lock
+# (mktemp+mv), so the file is re-read right before the mv and the write is
+# abandoned if it moved; a write landing inside that last gap can still
+# resurrect the old reading once (it keeps its old t), and the next override
+# retires it again.
+#
+# LIVE_MERGED_MARKER: when it held the version just replaced (it was merged),
+# it is moved to the new one, which differs only by readings the block
+# already outranks; otherwise a newer sample is still waiting, and the tick's
+# backstop must still see it.
+retire_overridden_live_readings() {
+  local overridden="${1:-}" before out new now line w used t by age
+  [[ "$overridden" == '{'* && -f "$LIVE_SAMPLE_FILE" ]] || return 0
+  before="$(cat "$LIVE_SAMPLE_FILE" 2>/dev/null || true)"
+  [[ -n "${before:-}" ]] || return 0
+  now="$(now_epoch)"
+
+  # Line 1: the new sample; then "w used t by" per window dropped. Nothing
+  # when no window still matches.
+  out="$(printf '%s' "$before" | jq -r --argjson ov "$overridden" --argjson now "$now" '
+      . as $s
+      | [ $ov | to_entries[]
+          | select(.key == "five_hour" or .key == "seven_day")
+          | select(($s[.key] | type) == "object"
+                   and $s[.key].used == .value.used
+                   and $s[.key].resets_at == .value.resets_at
+                   and $s[.key].t == .value.t) ] as $hit
+      | if ($hit | length) == 0 then empty else
+          (reduce $hit[] as $h ($s; del(.[$h.key]))
+           | .retired = ([ (($s.retired // []) | if type == "array" then .[] else empty end)
+                           | objects | select((.r | type) == "number" and .r > $now) ]
+                         + [ $hit[] | {w: .key, u: .value.used, r: .value.resets_at} ]
+                         | unique)
+           | tojson),
+          ($hit[] | "\(.key) \(.value.used) \(.value.t) \(.value.by)")
+        end
+    ' 2>/dev/null || true)"
+  [[ -n "${out:-}" ]] || return 0
+  new="${out%%$'\n'*}"
+  [[ "$new" == '{'* ]] || return 0
+
+  local tmp
+  tmp="$(mktemp "${LIVE_SAMPLE_FILE}.tmp.XXXXXX" 2>/dev/null)" || return 0
+  if ! printf '%s\n' "$new" >"$tmp" 2>/dev/null \
+     || [[ "$(cat "$LIVE_SAMPLE_FILE" 2>/dev/null || true)" != "$before" ]] \
+     || ! mv -f "$tmp" "$LIVE_SAMPLE_FILE" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    log_debug "live[claude]: sample moved under the retire; left for the next override"
+    return 0
+  fi
+  if [[ -f "$LIVE_MERGED_MARKER" && "$(cat "$LIVE_MERGED_MARKER" 2>/dev/null || true)" == "$before" ]]; then
+    printf '%s\n' "$new" >"$LIVE_MERGED_MARKER" 2>/dev/null || true
+  fi
+
+  while IFS=' ' read -r w used t by; do
+    [[ -n "${w:-}" && "$t" =~ ^[0-9]+$ ]] || continue
+    case "$w" in five_hour) w='session' ;; seven_day) w='weekly' ;; esac
+    age=$(( now - t ))
+    if (( age >= 3600 )); then age="$(( age / 3600 ))h"
+    elif (( age >= 60 )); then age="$(( age / 60 ))m"
+    else age="${age}s"; fi
+    log_info "live[claude]: dropped stale ${w} ${used}% (first seen ${age} ago; endpoint says ${by}%)"
+  done <<<"${out#*$'\n'}"
   return 0
 }
 
 # Reload a provider's FETCH_* from its block in usage.json, so the block can
 # be re-rendered with some fields changed and everything else — the scoped
 # cap, labels, severities, breakdown — exactly as the last fetch left it.
-# Also sets BLOCK_STATE, BLOCK_UPDATED_AT and BLOCK_FETCHED_AT.
+# Also sets BLOCK_STATE, BLOCK_UPDATED_AT, BLOCK_FETCHED_AT and
+# BLOCK_ENDPOINT_AT (endpoint_at, else fetched_at for a block written before
+# endpoint_at existed).
 BLOCK_STATE=''
 BLOCK_UPDATED_AT=0
 BLOCK_FETCHED_AT=0
+BLOCK_ENDPOINT_AT=0
 load_fetch_from_block() {
   local provider="$1" line
   reset_fetch_outputs
@@ -3164,7 +3321,8 @@ load_fetch_from_block() {
         .session_label, .weekly_label, .scoped_label,
         .session_severity, .weekly_severity, .scoped_severity,
         .session_locked, .weekly_locked, .scoped_locked,
-        .state, (.updated_at // 0), (.fetched_at // .updated_at // 0) ]
+        .state, (.updated_at // 0), (.fetched_at // .updated_at // 0),
+        (.endpoint_at // .fetched_at // .updated_at // 0) ]
     | map(if . == null then "" elif . == true then "1" elif . == false then "0"
           else tostring end)
     | join("\u001f")
@@ -3178,7 +3336,7 @@ load_fetch_from_block() {
     FETCH_SESSION_LABEL FETCH_WEEKLY_LABEL FETCH_SCOPED_LABEL \
     FETCH_SESSION_SEVERITY FETCH_WEEKLY_SEVERITY FETCH_SCOPED_SEVERITY \
     FETCH_SESSION_LOCKED FETCH_WEEKLY_LOCKED FETCH_SCOPED_LOCKED \
-    BLOCK_STATE BLOCK_UPDATED_AT BLOCK_FETCHED_AT <<<"$line"
+    BLOCK_STATE BLOCK_UPDATED_AT BLOCK_FETCHED_AT BLOCK_ENDPOINT_AT <<<"$line"
 
   [[ -n "${FETCH_SESSION_LABEL:-}" ]] || FETCH_SESSION_LABEL='Session'
   [[ -n "${FETCH_WEEKLY_LABEL:-}" ]] || FETCH_WEEKLY_LABEL='Weekly'
@@ -3190,6 +3348,7 @@ load_fetch_from_block() {
   done
   [[ "$BLOCK_UPDATED_AT" =~ ^[0-9]+$ ]] || BLOCK_UPDATED_AT=0
   [[ "$BLOCK_FETCHED_AT" =~ ^[0-9]+$ ]] || BLOCK_FETCHED_AT="$BLOCK_UPDATED_AT"
+  [[ "$BLOCK_ENDPOINT_AT" =~ ^[0-9]+$ ]] || BLOCK_ENDPOINT_AT="$BLOCK_FETCHED_AT"
 
   FETCH_BREAKDOWN_JSON="$(jq -c --arg p "$provider" '.providers[$p].breakdown // []' \
     "$CACHE_FILE" 2>/dev/null || true)"
@@ -3249,21 +3408,36 @@ merge_live_claude_locked() {
     BLOCK_STATE=''
     BLOCK_UPDATED_AT=0
     BLOCK_FETCHED_AT=0
+    BLOCK_ENDPOINT_AT=0
   else
     load_fetch_from_block claude || return 0
   fi
 
   local before after now seen
   before="$FETCH_SESSION_USED $FETCH_SESSION_RESETS_AT $FETCH_WEEKLY_USED $FETCH_WEEKLY_RESETS_AT"
-  apply_claude_live_sample "$sample" "$BLOCK_UPDATED_AT"
+  # The block's numbers are the endpoint's as of endpoint_at (or a live
+  # reading's, which the override never touches; see apply_claude_live_sample),
+  # and the block is current as of updated_at.
+  apply_claude_live_sample "$sample" "$BLOCK_ENDPOINT_AT" "$BLOCK_UPDATED_AT"
   after="$FETCH_SESSION_USED $FETCH_SESSION_RESETS_AT $FETCH_WEEKLY_USED $FETCH_WEEKLY_RESETS_AT"
   now="$(now_epoch)"
+
+  # Captured now: commit_claude_rerender does not touch it, but the retire
+  # must see what THIS apply decided.
+  local overridden="$LIVE_OVERRIDDEN"
 
   if [[ "$before" != "$after" ]]; then
     commit_claude_rerender "$LIVE_AS_OF" || return 1
     log_info "live[claude]: from Claude Code session=${RENDER_SESSION_USED}% weekly=${RENDER_WEEKLY_USED}% (endpoint fetched $(( now - BLOCK_FETCHED_AT ))s ago)"
+    retire_overridden_live_readings "$overridden" || true
     return 0
   fi
+
+  # The block already shows the endpoint's number (a reading an earlier
+  # override retired, written back by a live.sh that read the sample just
+  # before): nothing to re-render, but the reading still goes. The `seen`
+  # check below then fails on the stale window, as it should.
+  retire_overridden_live_readings "$overridden" || true
 
   # SAME NUMBERS IS STILL NEWS. A session that repaints with exactly the
   # numbers the block already shows is saying "still this, as of now" — and
@@ -3322,15 +3496,21 @@ live_sample_confirmed_at() {
 # or the other-account reset) so BLOCK_STATE and BLOCK_FETCHED_AT are the
 # block's. fetched_at is carried over, never moved: it means "our own endpoint
 # poll", and only refresh_one_provider sets it.
+#
+# $2 is the block's new endpoint_at: an adoption passes cswap's fetchedAt; a
+# live merge passes nothing and the block's own carries over.
 commit_claude_rerender() {
-  local as_of="${1:-0}"
+  local as_of="${1:-0}" endpoint_at="${2:-$BLOCK_ENDPOINT_AT}"
 
   RENDER_FETCHED_AT="$BLOCK_FETCHED_AT"
+  RENDER_ENDPOINT_AT="$endpoint_at"
   if ! render_provider_block claude "$as_of"; then
     RENDER_FETCHED_AT=''
+    RENDER_ENDPOINT_AT=''
     return 1
   fi
   RENDER_FETCHED_AT=''
+  RENDER_ENDPOINT_AT=''
 
   # Numbers from elsewhere do not clear a login problem — only our own fetch
   # proves OUR token works — but they do supersede an "error", which only ever
@@ -3374,18 +3554,21 @@ commit_claude_rerender() {
 #
 #   - the slot is matched by the SAME key as CLAUDE_ACCOUNT_KEY (lower-cased
 #     email + "/<org uuid>"); another account's slot is never read
-#   - only when fetchedAt is newer than the block's updated_at, five_hour and
-#     seven_day both exist, and their windows are still open (a five_hour
-#     with no resets_at is accepted only at 0%: the endpoint's "between
-#     windows")
+#   - only when fetchedAt is newer than the block's endpoint_at (the newest
+#     endpoint reading it already has), five_hour and seven_day both exist,
+#     and their windows are still open (a five_hour with no resets_at is
+#     accepted only at 0%: the endpoint's "between windows")
 #   - it replaces the session and weekly used/resets_at, and the scoped cap
 #     when cswap has one matching @codexbar_scoped_model by the fetch's own
 #     rule (case-insensitive prefix); labels, severities, locked flags and the
 #     breakdown stay as our last fetch left them — cswap keeps none of those
-#   - updated_at becomes floor(fetchedAt); fetched_at does NOT move, so our
-#     own poll (for everything cswap does not keep) holds its schedule
+#   - endpoint_at becomes floor(fetchedAt), and so does updated_at unless it
+#     is already later; fetched_at does NOT move, so our own poll (for
+#     everything cswap does not keep) holds its schedule
 #   - the live sample is then re-applied on top by the usual pick rules, so a
-#     newer Claude Code reading is never pushed back down
+#     newer Claude Code reading is never pushed back down; a live reading
+#     first seen 10+ minutes before cswap's fetch loses to it even when
+#     higher, and is retired (see apply_claude_live_sample)
 #
 # Silent when the file is missing, unreadable, or holds nothing for this
 # account: cswap is optional, and this is a bonus, not a source of truth.
@@ -3433,10 +3616,18 @@ adopt_cswap_claude_locked() {
     BLOCK_STATE=''
     BLOCK_UPDATED_AT=0
     BLOCK_FETCHED_AT=0
+    BLOCK_ENDPOINT_AT=0
   else
     load_fetch_from_block claude || return 0
   fi
 
+  # GATED ON endpoint_at, NOT updated_at. Live merges and `seen` confirmations
+  # move updated_at every minute or so while sessions are busy, and the marker
+  # above was already moved: a cswap reading that landed just behind a live
+  # merge used to fail `fetchedAt > updated_at` and was never looked at again —
+  # and with it the scoped (Fable) cap, which only an endpoint reading carries.
+  # endpoint_at moves only with endpoint readings (our fetch, an adoption), so
+  # this admits exactly the readings newer than any the block already has.
   local now line
   now="$(now_epoch)"
   # resets_at is ISO 8601 with fractional seconds and "+00:00"; fromdateiso8601
@@ -3445,7 +3636,7 @@ adopt_cswap_claude_locked() {
   # fields survive `read`.
   line="$(jq -r \
     --arg key "$CLAUDE_ACCOUNT_KEY" --arg m "$SCOPED_MODEL_NAME" \
-    --argjson updated "$BLOCK_UPDATED_AT" --argjson now "$now" '
+    --argjson endpoint "$BLOCK_ENDPOINT_AT" --argjson now "$now" '
       def epoch:
         if type == "number" then floor
         elif type == "string" then
@@ -3464,7 +3655,7 @@ adopt_cswap_claude_locked() {
       [ (.accounts // {})[]? | objects | select(slot_key == $key) ] | first // empty
       | select((.fetchedAt | type) == "number")
       | (.fetchedAt | floor) as $fetched
-      | select($fetched > $updated and $fetched <= $now)
+      | select($fetched > $endpoint and $fetched <= $now)
       | (.lastGood // {}) as $g
       | window($g.five_hour) as $s
       | window($g.seven_day) as $w
@@ -3504,9 +3695,15 @@ adopt_cswap_claude_locked() {
     sample="$(cat "$LIVE_SAMPLE_FILE" 2>/dev/null || true)"
     live_sample_is_current_account "$sample" || sample=''
   fi
-  apply_claude_live_sample "$sample" "$fetched"
+  # updated_at never moves backwards: under the endpoint_at gate a cswap
+  # reading can be older than a live merge the block already shows.
+  local floor_t="$fetched"
+  (( BLOCK_UPDATED_AT > floor_t )) && floor_t="$BLOCK_UPDATED_AT"
+  apply_claude_live_sample "$sample" "$fetched" "$floor_t"
+  local overridden="$LIVE_OVERRIDDEN"
 
-  commit_claude_rerender "$LIVE_AS_OF" || return 1
+  commit_claude_rerender "$LIVE_AS_OF" "$fetched" || return 1
+  retire_overridden_live_readings "$overridden" || true
 
   local shown=''
   if [[ "$RENDER_SESSION_USED" != "$su" || "$RENDER_WEEKLY_USED" != "$wu" ]]; then
@@ -3581,8 +3778,12 @@ refresh_one_provider() {
   fi
 
   # The endpoint and Claude Code's live numbers are two views of the same
-  # counters; whichever saw more usage in the current window is the newer one.
+  # counters, reconciled by apply_claude_live_sample's rules (higher wins in a
+  # window, unless the live reading is 10+ minutes older than this fetch).
   # Only a sample for the account just fetched (see "Which Claude account").
+  # Any live reading this fetch overrode is retired by refresh_cache once the
+  # block is written.
+  LIVE_OVERRIDDEN=''
   if [[ "$provider" == 'claude' && -f "$LIVE_SAMPLE_FILE" ]]; then
     local live_sample
     live_sample="$(cat "$LIVE_SAMPLE_FILE" 2>/dev/null || true)"
@@ -3656,7 +3857,7 @@ refresh_cache() {
   # failing must neither be retried ahead of its ladder nor keep the others
   # off the network. A forced refresh (prefix+u, UsageBar's "Refresh now")
   # bypasses every ladder — it is the manual escape hatch.
-  local blocks='{}' provider block any_ok=0 now fc na
+  local blocks='{}' provider block any_ok=0 now fc na live_overridden=''
   for provider in $USAGE_PROVIDERS; do
     select_provider "$provider"
     now="$(now_epoch)"
@@ -3695,6 +3896,9 @@ refresh_cache() {
 
     if refresh_one_provider "$provider" "$now"; then
       any_ok=1
+      if [[ "$provider" == 'claude' ]]; then
+        live_overridden="$LIVE_OVERRIDDEN"
+      fi
     fi
     block="$RENDER_BLOCK"
     [[ -n "${block:-}" ]] || continue
@@ -3709,6 +3913,8 @@ refresh_cache() {
   fi
 
   write_usage_cache "$blocks" || return 1
+  # Only now that the endpoint's number is in usage.json (still under the lock).
+  retire_overridden_live_readings "$live_overridden" || true
 
   publish_to_tmux_opts || true
 

@@ -10,15 +10,33 @@
 # rate_limit_error under heavy use. ~/.claude/statusline.sh passes the object
 # here, backgrounded:
 #
-#   codexbar-usage-live.sh '{"five_hour":{"used_percentage":7,"resets_at":E},...}'
+#   codexbar-usage-live.sh '{"five_hour":{"used_percentage":7,"resets_at":E},...}' \
+#     [<session_id> <cost.total_api_duration_ms>]
+#
+# The last two are optional (see "ONLY A NEW API CALL IS NEWS" below); a
+# caller without them still feeds the numbers, it just never confirms them.
 #
 # ONE SAMPLE FILE FOR EVERY SESSION, MERGED, NEVER OVERWRITTEN. An idle
-# session repaints with whatever it last saw, so within one window (the same
-# resets_at) the HIGHER reading wins — usage only rises inside a window — and
-# across windows the later window wins. A window whose resets_at has passed is
-# dropped. Only a changed sample is written, and only a written sample wakes
-# codexbar-usage-status.sh --merge-live, which folds it into usage.json; most
-# repaints end at the comparison.
+# session repaints with whatever it last saw, so the live feed alone cannot
+# tell a genuine drop from a stale number: within one window (the same
+# resets_at) the HIGHER reading wins, and across windows the later window
+# wins. A window whose resets_at has passed is dropped. Only a changed sample
+# is written, and only a written sample wakes codexbar-usage-status.sh
+# --merge-live, which folds it into usage.json; most repaints end at the
+# comparison.
+#
+# THE ENDPOINT CAN RETIRE A READING. Usage does not only rise inside a window
+# (2026-10-09: the weekly fell from 22% to 10% mid-window), and higher-wins
+# alone then keeps the stale high number until the window ends. The usage
+# endpoint is the authority: when its reading, taken 10+ minutes after a live
+# value was first seen (`t`), is lower, the status script shows the endpoint's
+# number and deletes that window from this sample, under its lock, so the
+# sessions' current readings can refill it (see apply_claude_live_sample and
+# retire_overridden_live_readings there). It also records the dropped number
+# in `retired`, and this script refuses that exact number for that window
+# until the window closes: the idle sessions that still hold it would
+# otherwise repaint it straight back. A reading refused that way is not news
+# about now, so it does not refresh `seen` either.
 #
 # UNCHANGED IS STILL A READING. A repaint that brings exactly the numbers the
 # sample already holds says "still this, as of now", and the status script
@@ -29,6 +47,23 @@
 # the sample's own), and an unchanged sample is still rewritten — and
 # --merge-live still woken — once `seen` is a minute old. That caps the extra
 # writes at one a minute however many sessions repaint.
+#
+# ONLY A NEW API CALL IS NEWS. The status line hands over the session's LAST
+# rate_limits however old they are, so an idle session repainting a cached
+# 35%/22% says nothing about now: the account may have moved on (claude.ai,
+# the phone, another machine) since that session last talked to the API. Such
+# a repaint used to stamp `seen` and so advance usage.json's updated_at on
+# numbers hours old. So `seen` now needs proof of a fresh call: the session's
+# id and its cost.total_api_duration_ms (Claude Code's total time spent
+# waiting on API responses, which moves on every call and on nothing else),
+# compared with what that session reported last time. Kept in
+# claude-live-sessions.json, {"<session id>": {"ms": N, "at": E}}, the 20 most
+# recently moved sessions only. A session not in it (new, pruned, or from
+# before this map existed) is recorded but not believed on that repaint: its
+# rate_limits could be any age. That costs a new session's first turn its
+# confirmation, and the next turn confirms. The map is written only when a
+# session's figure moved — once per API call, never on an idle repaint — and
+# never wakes --merge-live itself. Without the two arguments, no `seen`.
 #
 # ONE ACCOUNT PER SAMPLE. Those rules hold within one account only. claude-swap
 # (cswap) can switch the login to another account at any minute, and then the
@@ -52,21 +87,26 @@
 #   {"five_hour": {"used": 7, "resets_at": E, "t": E}, "seven_day": {...},
 #    "account": "me@example.com/<org uuid>",
 #    "fence": [{"a": "<previous account>", "r": E}, ...],
+#    "retired": [{"w": "seven_day", "u": 22, "r": E}, ...],
 #    "seen": E}
 #   used       percent, exactly as Claude Code reported it
 #   resets_at  epoch seconds
 #   t          when THIS value was first seen, not when it was last repainted
 #   account    whose numbers; absent when ~/.claude.json could not be read
 #   fence      earlier accounts' still-open windows; absent when empty
-#   seen       when a session last repainted with open, unfenced readings for
-#              this account, none lower than the sample's — refreshed at most
-#              once a minute while the numbers hold still; dropped with the
-#              readings on a switch
+#   retired    readings the endpoint overrode (window key, used, resets_at),
+#              written by the status script; an incoming reading equal to one
+#              is dropped; lapses with its window, dropped on a switch
+#   seen       when a session that had just made an API call last repainted
+#              with open, unfenced, unretired readings for this account, none
+#              lower than the sample's — refreshed at most once a minute while
+#              the numbers hold still; dropped with the readings on a switch
 
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
 CACHE_DIR="$HOME/.cache/codexbar-tmux"
 SAMPLE="$CACHE_DIR/claude-live.json"
+SESSIONS="$CACHE_DIR/claude-live-sessions.json"
 SRC="$HOME/.config/tmux/scripts/codexbar-usage-status.sh"
 # The SESSION's own config, CLAUDE_CONFIG_DIR included: the rate_limits this
 # script is handed are that session's, so the stamp is that session's account
@@ -75,6 +115,8 @@ SRC="$HOME/.config/tmux/scripts/codexbar-usage-status.sh"
 CLAUDE_GLOBAL_CONFIG="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
 
 incoming="${1:-}"
+session_id="${2:-}"
+api_ms="${3:-}"
 [[ -n "$incoming" ]] || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
 mkdir -p "$CACHE_DIR" 2>/dev/null || exit 0
@@ -83,6 +125,14 @@ prev='{}'
 if [[ -f "$SAMPLE" ]]; then
   prev="$(jq -c . "$SAMPLE" 2>/dev/null)" || prev='{}'
   [[ -n "$prev" ]] || prev='{}'
+fi
+
+# The per-session API-call map, read with the `read` builtin (no fork: this
+# runs on every repaint of every session) and parsed inside the merge's jq, so
+# a damaged file reads as empty rather than failing the merge.
+sessions=''
+if [[ -n "$session_id" && -f "$SESSIONS" ]]; then
+  IFS= read -r -d '' sessions <"$SESSIONS" || true
 fi
 
 # The same key codexbar-usage-status.sh computes (CLAUDE_ACCOUNT_JQ there):
@@ -108,8 +158,9 @@ if [[ -z "$account" ]]; then
   [[ -z "$prev_account" ]] || exit 0
 fi
 
-merged="$(jq -nc --argjson prev "$prev" --argjson in "$incoming" --argjson now "$(date +%s)" \
-  --arg acct "$account" '
+# Two lines out: the merged sample, then the new session map (null: unchanged).
+out="$(jq -nc --argjson prev "$prev" --argjson in "$incoming" --argjson now "$(date +%s)" \
+  --arg acct "$account" --arg sid "$session_id" --arg ms "$api_ms" --arg smap_raw "$sessions" '
   def reading($r):
     if ($r | type) == "object"
        and ($r.used_percentage | type) == "number"
@@ -127,43 +178,74 @@ merged="$(jq -nc --argjson prev "$prev" --argjson in "$incoming" --argjson now "
     elif $b.resets_at > $a.resets_at then $b
     else $a end;
 
-  (($prev.account // "") | strings) as $pa
+  # The per-session API-call map ("ONLY A NEW API CALL IS NEWS" above).
+  # $called: this session is known and its API time moved since its last
+  # report. Any move counts, down too: a restarted session starts over.
+  (($smap_raw | fromjson? // {}) | if type == "object" then . else {} end) as $smap
+  | ($ms | tonumber? // null) as $msn
+  | ($sid != "" and $msn != null) as $has
+  | (if $has then $smap[$sid] else null end) as $last
+  | ($has and ($last | type) == "object" and $last.ms != $msn) as $called
+  | (if $has and (($last | type) != "object" or $last.ms != $msn) then
+       [ ($smap + {($sid): {ms: $msn, at: $now}}) | to_entries[]
+         | select((.value | type) == "object") ]
+       | sort_by(-(.value.at // 0)) | .[:20] | from_entries
+     else null end) as $newmap
+
+  | ((($prev.account // "") | strings) as $pa
   # Another account was logged in at the last write: drop its readings and
   # fence their windows. A sample with no stamp at all is adopted as it is.
   # That is what every sample looked like before stamping, and fencing it
   # would drop the live numbers of this very account until its windows end.
+  # The retired readings belong to this account: they go with its readings.
   | (if $acct != "" and $pa != "" and $pa != $acct then
        { five_hour: null, seven_day: null,
          fence: ([ ($prev.fence // [])[]? | objects | select(.a != $acct) ]
                  + [ $prev.five_hour, $prev.seven_day | objects
                      | select((.resets_at | type) == "number")
-                     | {a: $pa, r: .resets_at} ]) }
+                     | {a: $pa, r: .resets_at} ]),
+         retired: [] }
      else
        { five_hour: $prev.five_hour, seven_day: $prev.seven_day,
-         fence: [ ($prev.fence // [])[]? | objects ] }
+         fence: [ ($prev.fence // [])[]? | objects ],
+         retired: [ ($prev.retired // [])[]? | objects ] }
      end) as $base
   | [ $base.fence[] | select((.r | type) == "number" and .r > $now) ] as $fence
+  | [ $base.retired[] | select((.r | type) == "number" and .r > $now) ] as $retired
   | def unfenced($x):
       if $x == null then null
       elif any($fence[]; ((.r - $x.resets_at) | fabs) <= 600) then null
       else $x end;
-  unfenced(open(reading($in.five_hour))) as $i5
-  | unfenced(open(reading($in.seven_day))) as $i7
+    # The exact number the endpoint overrode for this window (see "THE
+    # ENDPOINT CAN RETIRE A READING" above).
+    def unretired($w; $x):
+      if $x == null then null
+      elif any($retired[]; .w == $w and .u == $x.used
+                           and ((.r - $x.resets_at) | fabs) <= 600) then null
+      else $x end;
+  unfenced(open(reading($in.five_hour))) as $r5
+  | unfenced(open(reading($in.seven_day))) as $r7
+  | unretired("five_hour"; $r5) as $i5
+  | unretired("seven_day"; $r7) as $i7
   | { five_hour: pick(open($base.five_hour); $i5),
       seven_day: pick(open($base.seven_day); $i7) }
   | with_entries(select(.value != null))
   | if $acct != "" then .account = $acct else . end
   | if ($fence | length) > 0 then .fence = $fence else . end
-  # `seen`. Only a session at the FRONTIER refreshes it: every reading it
-  # brought is in the same window as the merged one and at least as high. An
-  # idle session repainting an older, lower number is not news about now.
+  | if ($retired | length) > 0 then .retired = $retired else . end
+  # `seen`. Only a session that just CALLED the API ($called) and is at the
+  # FRONTIER refreshes it: every reading it brought is in the same window as
+  # the merged one and at least as high. An idle session repainting an older,
+  # lower number is not news about now, and neither is one repainting a
+  # retired number ($r kept, $i dropped).
   # The previous `seen` carries over unless the account changed under it.
   | . as $m
-  | def frontier($i; $x):
-      $i == null
-      or ($x != null and (($i.resets_at - $x.resets_at) | fabs) <= 600 and $i.used >= $x.used);
-    (($i5 != null or $i7 != null)
-     and frontier($i5; $m.five_hour) and frontier($i7; $m.seven_day)) as $fresh
+  | def frontier($r; $i; $x):
+      $r == null
+      or ($i != null and $x != null
+          and (($i.resets_at - $x.resets_at) | fabs) <= 600 and $i.used >= $x.used);
+    ($called and ($i5 != null or $i7 != null)
+     and frontier($r5; $i5; $m.five_hour) and frontier($r7; $i7; $m.seven_day)) as $fresh
   | (if $acct != "" and $pa != "" and $pa != $acct then null
      elif ($prev.seen | type) == "number" then $prev.seen
      else null end) as $pseen
@@ -174,9 +256,21 @@ merged="$(jq -nc --argjson prev "$prev" --argjson in "$incoming" --argjson now "
       else $m + {seen: $now} end
     elif $same then $prev
     elif $pseen != null then $m + {seen: $pseen}
-    else $m end
+    else $m end) as $merged
+  | $merged, $newmap
 ' 2>/dev/null)" || exit 0
-[[ -n "$merged" ]] || exit 0
+merged="${out%%$'\n'*}"
+newmap="${out#*$'\n'}"
+[[ "$merged" == '{'* ]] || exit 0
+
+# The map first: it moves on every API call, the sample far less often. Lost
+# to a concurrent write at worst, which costs that session one confirmation.
+if [[ "$newmap" == '{'* ]]; then
+  mtmp="$(mktemp "${SESSIONS}.tmp.XXXXXX" 2>/dev/null)" \
+    && { { printf '%s\n' "$newmap" >"$mtmp" && mv -f "$mtmp" "$SESSIONS"; } 2>/dev/null \
+         || rm -f "$mtmp" 2>/dev/null; }
+fi
+
 [[ "$merged" == "$prev" ]] && exit 0
 
 tmp="$(mktemp "${SAMPLE}.tmp.XXXXXX" 2>/dev/null)" || exit 0
