@@ -884,8 +884,14 @@ fi
 [ "$agent" = codex ] || payload=$(cat 2>/dev/null || true)
 
 # Hooks also fire inside subagent contexts (payload carries agent_id); a
-# subagent's Stop/PermissionRequest must not flip the main agent's tab.
-if [ -n "$JQ" ] && [ -n "$payload" ]; then
+# subagent's Stop/heartbeat/turn events must not flip the main agent's tab.
+# EXCEPT its PermissionRequest: a subagent's approval prompt is shown in the
+# main session and blocks on the user exactly like the main agent's own, so
+# it is the tab's needs-input. Dropping it left the tab on the Notification
+# half of the same gate, which Claude sends seconds later (CuaNotch, which
+# takes the PermissionRequest, went yellow ~5 s before the tab and
+# Option-S, 2026-10-09).
+if [ -n "$JQ" ] && [ -n "$payload" ] && [ "$mode" != needs-approval ]; then
     if [ -n "$("$JQ" -r '.agent_id // empty' <<<"$payload" 2>/dev/null || true)" ]; then
         exit 0
     fi

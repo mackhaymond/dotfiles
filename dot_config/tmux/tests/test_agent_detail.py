@@ -153,10 +153,23 @@ class DetailHookTests(ci.IndicatorIntegrationTests):
 
     def test_subagent_events_are_ignored(self):
         self.claude("running", prompt="main task")
-        before = self.window()
+        # State and detail only: running's detached title condenser may land
+        # on @agent_summary while these run, which is not a subagent's doing.
+        keys = ("@agent_state", "@agent_since", "@agent_detail_kind", "@agent_detail", "@agent_kind")
+        before = {k: self.window().get(k) for k in keys}
         self.claude("done", agent_id="child", last_assistant_message="subagent done")
-        self.claude("needs-approval", agent_id="child", tool_name="Bash", tool_input={"command": "x"})
-        self.assertEqual(self.window(), before)
+        self.claude("heartbeat", agent_id="child")
+        self.claude("failed", agent_id="child", error="boom")
+        self.assertEqual({k: self.window().get(k) for k in keys}, before)
+
+    def test_subagent_permission_prompt_is_the_tabs_needs_input(self):
+        # A subagent's approval is shown in the main session and blocks on the
+        # user: its PermissionRequest must turn the tab yellow at once, not
+        # wait for the Notification that follows seconds later.
+        self.claude("running", prompt="main task")
+        w = self.claude("needs-approval", agent_id="child", tool_name="Bash", tool_input={"command": "x"})
+        self.assertEqual(w["@agent_state"], "needs-input")
+        self.assertEqual(self.detail(w), ("perm", "Bash x"))
 
     def test_heartbeat_never_touches_detail(self):
         self.claude("needs-approval", tool_name="Bash", tool_input={"command": "ls"})
