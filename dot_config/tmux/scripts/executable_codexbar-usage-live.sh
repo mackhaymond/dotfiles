@@ -33,10 +33,13 @@
 # number and deletes that window from this sample, under its lock, so the
 # sessions' current readings can refill it (see apply_claude_live_sample and
 # retire_overridden_live_readings there). It also records the dropped number
-# in `retired`, and this script refuses that exact number for that window
-# until the window closes: the idle sessions that still hold it would
+# in `retired`, and this script refuses that exact number for that window and
+# account until the window closes: idle sessions that still hold it would
 # otherwise repaint it straight back. A reading refused that way is not news
-# about now, so it does not refresh `seen` either.
+# about now, so it does not refresh `seen` either. (Idle repaints are kept
+# out by "ONLY A NEW API CALL IS NEWS" below too; the record also covers a
+# caller that cannot prove a call, and one whose newest call still carries
+# the retired number.)
 #
 # UNCHANGED IS STILL A READING. A repaint that brings exactly the numbers the
 # sample already holds says "still this, as of now", and the status script
@@ -60,10 +63,26 @@
 # claude-live-sessions.json, {"<session id>": {"ms": N, "at": E}}, the 20 most
 # recently moved sessions only. A session not in it (new, pruned, or from
 # before this map existed) is recorded but not believed on that repaint: its
-# rate_limits could be any age. That costs a new session's first turn its
-# confirmation, and the next turn confirms. The map is written only when a
-# session's figure moved — once per API call, never on an idle repaint — and
-# never wakes --merge-live itself. Without the two arguments, no `seen`.
+# rate_limits could be any age. That costs a new session's first call its
+# say, and the next call counts. The map is written only when a session's
+# figure moved — once per API call, never on an idle repaint — and never
+# wakes --merge-live itself. Without the two arguments, no `seen`.
+#
+# The same proof gates the NUMBERS, not only `seen`: a repaint without a new
+# call is not merged at all — it may neither fill an empty window nor raise
+# one, in either window. Such a repaint is by construction a copy of an older
+# reading, so it can only be as current as what the calling sessions report,
+# or staler; admitting it can only make the sample worse. Narrower rules leave
+# holes: after the endpoint retires a stale number the window is empty, and
+# "higher wins" then hands it to whichever idle session repaints first — its
+# stale 21%, then once that is retired another's 18% — each holding the bar
+# for the 10+ minutes until the next endpoint reading, while the busy session
+# reporting the true 10% is outranked (2026-10-09 review). It also keeps an
+# idle session's reading for an account switched away from out of the
+# sample. The cost is one call's delay for a session the map does not know
+# yet. A caller with no evidence to give (no session id or API time) is
+# merged as before — the live feed must not die if the status line ever
+# loses those fields — and only the `retired` record protects that path.
 #
 # ONE ACCOUNT PER SAMPLE. Those rules hold within one account only. claude-swap
 # (cswap) can switch the login to another account at any minute, and then the
@@ -87,16 +106,17 @@
 #   {"five_hour": {"used": 7, "resets_at": E, "t": E}, "seven_day": {...},
 #    "account": "me@example.com/<org uuid>",
 #    "fence": [{"a": "<previous account>", "r": E}, ...],
-#    "retired": [{"w": "seven_day", "u": 22, "r": E}, ...],
+#    "retired": [{"w": "seven_day", "u": 22, "r": E, "a": "<account>"}, ...],
 #    "seen": E}
 #   used       percent, exactly as Claude Code reported it
 #   resets_at  epoch seconds
 #   t          when THIS value was first seen, not when it was last repainted
 #   account    whose numbers; absent when ~/.claude.json could not be read
 #   fence      earlier accounts' still-open windows; absent when empty
-#   retired    readings the endpoint overrode (window key, used, resets_at),
-#              written by the status script; an incoming reading equal to one
-#              is dropped; lapses with its window, dropped on a switch
+#   retired    readings the endpoint overrode (window key, used, resets_at,
+#              account), written by the status script; an incoming reading
+#              equal to one of the current account's is dropped; each lapses
+#              with its window and survives account switches
 #   seen       when a session that had just made an API call last repainted
 #              with open, unfenced, unretired readings for this account, none
 #              lower than the sample's — refreshed at most once a minute while
@@ -197,36 +217,46 @@ out="$(jq -nc --argjson prev "$prev" --argjson in "$incoming" --argjson now "$(d
   # fence their windows. A sample with no stamp at all is adopted as it is.
   # That is what every sample looked like before stamping, and fencing it
   # would drop the live numbers of this very account until its windows end.
-  # The retired readings belong to this account: they go with its readings.
+  # The retired readings are NOT dropped on a switch: each carries its account
+  # (`a`; one written before stamping belongs to the sample it sat in) and
+  # stays until its window closes, like the fence, so after A->B->A the idle
+  # sessions of A still cannot write the number retired for A back.
+  | [ ($prev.retired // [])[]? | objects | .a = (.a // $pa) ] as $pretired
   | (if $acct != "" and $pa != "" and $pa != $acct then
        { five_hour: null, seven_day: null,
          fence: ([ ($prev.fence // [])[]? | objects | select(.a != $acct) ]
                  + [ $prev.five_hour, $prev.seven_day | objects
                      | select((.resets_at | type) == "number")
                      | {a: $pa, r: .resets_at} ]),
-         retired: [] }
+         retired: $pretired }
      else
        { five_hour: $prev.five_hour, seven_day: $prev.seven_day,
          fence: [ ($prev.fence // [])[]? | objects ],
-         retired: [ ($prev.retired // [])[]? | objects ] }
+         retired: $pretired }
      end) as $base
   | [ $base.fence[] | select((.r | type) == "number" and .r > $now) ] as $fence
   | [ $base.retired[] | select((.r | type) == "number" and .r > $now) ] as $retired
+  | [ $retired[] | select(.a == $acct) ] as $mine
   | def unfenced($x):
       if $x == null then null
       elif any($fence[]; ((.r - $x.resets_at) | fabs) <= 600) then null
       else $x end;
-    # The exact number the endpoint overrode for this window (see "THE
-    # ENDPOINT CAN RETIRE A READING" above).
+    # The exact number the endpoint overrode for this window, for THIS
+    # account (see "THE ENDPOINT CAN RETIRE A READING" above).
     def unretired($w; $x):
       if $x == null then null
-      elif any($retired[]; .w == $w and .u == $x.used
-                           and ((.r - $x.resets_at) | fabs) <= 600) then null
+      elif any($mine[]; .w == $w and .u == $x.used
+                        and ((.r - $x.resets_at) | fabs) <= 600) then null
       else $x end;
+    # Admitted at all? See "ONLY A NEW API CALL IS NEWS" above: a session
+    # that brought evidence ($has) but has not called since its last report
+    # is repainting an old reading, and may neither fill nor raise any window.
+    # A caller with no evidence to give is admitted as before.
+    def admitted($x): if $has and ($called | not) then null else $x end;
   unfenced(open(reading($in.five_hour))) as $r5
   | unfenced(open(reading($in.seven_day))) as $r7
-  | unretired("five_hour"; $r5) as $i5
-  | unretired("seven_day"; $r7) as $i7
+  | admitted(unretired("five_hour"; $r5)) as $i5
+  | admitted(unretired("seven_day"; $r7)) as $i7
   | { five_hour: pick(open($base.five_hour); $i5),
       seven_day: pick(open($base.seven_day); $i7) }
   | with_entries(select(.value != null))

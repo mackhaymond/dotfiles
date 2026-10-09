@@ -3196,13 +3196,19 @@ apply_claude_live_sample() {
           | [ $s.used, ($s.resets_at // ""), $w.used, ($w.resets_at // ""),
               ([$s.t, $w.t, $floor_t] | max),
               (if $ov == {} then "-" else ($ov | tojson) end) ]
-          | map(tostring) | join(" ")
+          | map(tostring) | join("\u001f")
         end
     ' 2>/dev/null || true)"
   [[ -n "${out:-}" ]] || return 0
 
+  # \x1f, not a space: session resets_at is EMPTY between 5-hour windows (the
+  # endpoint answers five_hour 0% with resets_at null), and whitespace IFS
+  # collapses an empty field — every later field then slid one place left:
+  # weekly_used read the weekly resets epoch (clamped to 100%), weekly
+  # resets_at read as_of, and the override list was lost. The same separator
+  # as load_fetch_from_block and adopt_cswap_claude_locked.
   local su sr wu wr as_of ov
-  read -r su sr wu wr as_of ov <<<"$out"
+  IFS=$'\x1f' read -r su sr wu wr as_of ov <<<"$out" || true
   FETCH_SESSION_USED="$su"
   FETCH_SESSION_RESETS_AT="$sr"
   FETCH_WEEKLY_USED="$wu"
@@ -3219,14 +3225,19 @@ apply_claude_live_sample() {
 # `seen` would never be stamped again and the sample could not move until the
 # window ends. Dropping it lets the current numbers refill the window.
 #
-# The drop is recorded as `retired` ({w, u, r}: window key, used, resets_at),
-# and live.sh refuses that exact number for that window until it closes. An
-# idle session still holding the old rate_limits repaints it word for word,
-# and without the record the very next repaint would put it straight back with
-# a fresh t, where higher-wins would show it again until the next endpoint
-# reading (10+ minutes) retired it again: a flap, forever. A genuine reading
-# that happens to equal the retired number is lost for as long as it holds —
-# the endpoint still supplies it — and the next one past it is accepted.
+# The drop is recorded as `retired` ({w, u, r, a}: window key, used,
+# resets_at, and the sample's account), and live.sh refuses that exact number
+# for that window, for that account, until the window closes — kept across
+# account switches, so A->B->A does not let A's idle sessions write it back.
+# An idle session still holding the old rate_limits repaints it word for
+# word, and without the record the very next repaint would put it straight
+# back with a fresh t, where higher-wins would show it again until the next
+# endpoint reading (10+ minutes) retired it again: a flap, forever. (live.sh
+# also no longer lets a session that has not just called the API fill or
+# raise a window; the record covers callers that cannot say.) A genuine
+# reading that happens to equal the retired number is lost for as long as it
+# holds — the endpoint still supplies it — and the next one past it is
+# accepted.
 #
 # Read-modify-write, removing ONLY a window that still holds exactly the
 # {used, resets_at, t} overridden. live.sh writes without the lock
@@ -3246,8 +3257,8 @@ retire_overridden_live_readings() {
   [[ -n "${before:-}" ]] || return 0
   now="$(now_epoch)"
 
-  # Line 1: the new sample; then "w used t by" per window dropped. Nothing
-  # when no window still matches.
+  # Line 1: the new sample; then w, used, t, by (\x1f-joined) per window
+  # dropped. Nothing when no window still matches.
   out="$(printf '%s' "$before" | jq -r --argjson ov "$overridden" --argjson now "$now" '
       . as $s
       | [ $ov | to_entries[]
@@ -3260,10 +3271,12 @@ retire_overridden_live_readings() {
           (reduce $hit[] as $h ($s; del(.[$h.key]))
            | .retired = ([ (($s.retired // []) | if type == "array" then .[] else empty end)
                            | objects | select((.r | type) == "number" and .r > $now) ]
-                         + [ $hit[] | {w: .key, u: .value.used, r: .value.resets_at} ]
+                         + [ $hit[] | {w: .key, u: .value.used, r: .value.resets_at,
+                                       a: (($s.account // "") | tostring)} ]
                          | unique)
            | tojson),
-          ($hit[] | "\(.key) \(.value.used) \(.value.t) \(.value.by)")
+          ($hit[] | [.key, .value.used, .value.t, .value.by]
+                  | map(tostring) | join("\u001f"))
         end
     ' 2>/dev/null || true)"
   [[ -n "${out:-}" ]] || return 0
@@ -3283,7 +3296,7 @@ retire_overridden_live_readings() {
     printf '%s\n' "$new" >"$LIVE_MERGED_MARKER" 2>/dev/null || true
   fi
 
-  while IFS=' ' read -r w used t by; do
+  while IFS=$'\x1f' read -r w used t by; do
     [[ -n "${w:-}" && "$t" =~ ^[0-9]+$ ]] || continue
     case "$w" in five_hour) w='session' ;; seven_day) w='weekly' ;; esac
     age=$(( now - t ))
