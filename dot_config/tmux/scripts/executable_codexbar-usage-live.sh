@@ -13,7 +13,7 @@
 #   codexbar-usage-live.sh '{"five_hour":{"used_percentage":7,"resets_at":E},...}' \
 #     [<session_id> <cost.total_api_duration_ms>]
 #
-# The last two are optional (see "ONLY A NEW API CALL IS NEWS" below); a
+# The last two are optional (see "ONLY NEWS FROM THE API COUNTS" below); a
 # caller without them still feeds the numbers, it just never confirms them.
 #
 # ONE SAMPLE FILE FOR EVERY SESSION, MERGED, NEVER OVERWRITTEN. An idle
@@ -37,7 +37,7 @@
 # account until the window closes: idle sessions that still hold it would
 # otherwise repaint it straight back. A reading refused that way is not news
 # about now, so it does not refresh `seen` either. (Idle repaints are kept
-# out by "ONLY A NEW API CALL IS NEWS" below too; the record also covers a
+# out by "ONLY NEWS FROM THE API COUNTS" below too; the record also covers a
 # caller that cannot prove a call, and one whose newest call still carries
 # the retired number.)
 #
@@ -51,27 +51,64 @@
 # --merge-live still woken — once `seen` is a minute old. That caps the extra
 # writes at one a minute however many sessions repaint.
 #
-# ONLY A NEW API CALL IS NEWS. The status line hands over the session's LAST
+# ONLY NEWS FROM THE API COUNTS. The status line hands over the session's LAST
 # rate_limits however old they are, so an idle session repainting a cached
 # 35%/22% says nothing about now: the account may have moved on (claude.ai,
 # the phone, another machine) since that session last talked to the API. Such
 # a repaint used to stamp `seen` and so advance usage.json's updated_at on
-# numbers hours old. So `seen` now needs proof of a fresh call: the session's
-# id and its cost.total_api_duration_ms (Claude Code's total time spent
-# waiting on API responses, which moves on every call and on nothing else),
-# compared with what that session reported last time. Kept in
-# claude-live-sessions.json, {"<session id>": {"ms": N, "at": E}}, the 20 most
-# recently moved sessions only. A session not in it (new, pruned, or from
-# before this map existed) is recorded but not believed on that repaint: its
-# rate_limits could be any age. That costs a new session's first call its
-# say, and the next call counts. The map is written only when a session's
-# figure moved — once per API call, never on an idle repaint — and never
-# wakes --merge-live itself. Without the two arguments, no `seen`.
+# numbers hours old. So `seen` now needs evidence that the session heard from
+# the API since its last report, judged per session id against what that
+# session reported last time. Either of two things counts:
 #
-# The same proof gates the NUMBERS, not only `seen`: a repaint without a new
-# call is not merged at all — it may neither fill an empty window nor raise
-# one, in either window. Such a repaint is by construction a copy of an older
-# reading, so it can only be as current as what the calling sessions report,
+#   - its cost.total_api_duration_ms moved (Claude Code's total time waiting
+#     on API responses; moves on every SUCCESSFUL stream, any direction
+#     counts, a restarted session starts over), or
+#   - its own rate_limits changed: a window it reports now that it did not
+#     report before, or one whose used/resets_at differs. Claude Code takes
+#     rate_limits from a process-wide utilization that response headers
+#     update, but so do the quota probe and the error path of a 429 ("usage
+#     limit reached"), neither of which moves the API time. Without this, a
+#     session that hit the limit repainted 100% with its API time frozen, every
+#     repaint was dropped, and the bar sat at 97% until the next endpoint poll
+#     (2.1.296, 2026-10-09 review). A window merely DISAPPEARING does not
+#     count: Claude Code drops a window when its resets_at passes, and the
+#     idle session's other, stale window must not ride in on that.
+#
+# An idle session repaints identical numbers with identical API time, so it
+# still never counts. The evidence is kept in claude-live-sessions.json,
+# {"<session id>": {"ms": N, "r": {"five_hour": [used, resets_at], ...},
+# "at": E}}, `at` being that session's last REPORT (refreshed at most once a
+# minute while nothing else changes), and capped at the 64 most recently
+# reporting sessions, so a session that is painting is never the one evicted:
+# 64 is far above the sessions one machine runs at once, and a cap below that
+# number is a cliff (20 entries and 21 sessions calling in turn admitted 0 of
+# 84 readings: each evicted the next to report). A session not in the map
+# (new, evicted, or from before it existed) is recorded but not believed on
+# that report — its rate_limits could be any age — so a new session's first
+# report never counts, and its next change does.
+#
+# Costs, stated plainly. The map is written (mktemp + mv) on every report that
+# carries evidence and at most once a minute per painting session otherwise;
+# an idle repaint inside that minute writes nothing. It never wakes
+# --merge-live. It has NO lock — the status line must not wait on one — so
+# sessions reporting within a few milliseconds of each other overwrite each
+# other's entries, last writer wins: four sessions reporting at the same
+# instant, forty times over, kept only 40 of 160 updates (2026-10-09 review).
+# Real reports are far sparser — each session's status line is debounced and
+# fires around its own turns — but the cost of a lost update is what matters,
+# and it is bounded: that session's NEXT report is judged against an older
+# entry, so it counts as evidence even if the session has gone idle since
+# (its numbers are then those of the call whose update was lost, which was
+# genuine news a moment ago), or against no entry at all (a first sighting,
+# ignored once). One report misjudged per lost update, never a stuck state.
+# The cap is a cliff in the same way the old 20 was: 65+ sessions all
+# reporting in strict rotation would each evict the next. Without the two
+# arguments, no `seen`.
+#
+# The same evidence gates the NUMBERS, not only `seen`: a report without it
+# is not merged at all — it may neither fill an empty window nor raise one, in
+# either window. Such a repaint is by construction a copy of an older
+# reading, so it can only be as current as what the reporting sessions say,
 # or staler; admitting it can only make the sample worse. Narrower rules leave
 # holes: after the endpoint retires a stale number the window is empty, and
 # "higher wins" then hands it to whichever idle session repaints first — its
@@ -79,7 +116,7 @@
 # for the 10+ minutes until the next endpoint reading, while the busy session
 # reporting the true 10% is outranked (2026-10-09 review). It also keeps an
 # idle session's reading for an account switched away from out of the
-# sample. The cost is one call's delay for a session the map does not know
+# sample. The cost is one report's delay for a session the map does not know
 # yet. A caller with no evidence to give (no session id or API time) is
 # merged as before — the live feed must not die if the status line ever
 # loses those fields — and only the `retired` record protects that path.
@@ -117,7 +154,7 @@
 #              account), written by the status script; an incoming reading
 #              equal to one of the current account's is dropped; each lapses
 #              with its window and survives account switches
-#   seen       when a session that had just made an API call last repainted
+#   seen       when a session that had just heard from the API last repainted
 #              with open, unfenced, unretired readings for this account, none
 #              lower than the sample's — refreshed at most once a minute while
 #              the numbers hold still; dropped with the readings on a switch
@@ -198,18 +235,33 @@ out="$(jq -nc --argjson prev "$prev" --argjson in "$incoming" --argjson now "$(d
     elif $b.resets_at > $a.resets_at then $b
     else $a end;
 
-  # The per-session API-call map ("ONLY A NEW API CALL IS NEWS" above).
-  # $called: this session is known and its API time moved since its last
-  # report. Any move counts, down too: a restarted session starts over.
+  # The per-session evidence map ("ONLY NEWS FROM THE API COUNTS" above).
+  # $called: this session is known, and since its last report either its API
+  # time moved (any direction: a restarted session starts over) or one of its
+  # own readings appeared or changed (a 429 or the quota probe moves
+  # rate_limits without moving the API time). A window that merely vanished
+  # does not count. An entry from before `r` existed is judged on ms alone.
   (($smap_raw | fromjson? // {}) | if type == "object" then . else {} end) as $smap
   | ($ms | tonumber? // null) as $msn
   | ($sid != "" and $msn != null) as $has
   | (if $has then $smap[$sid] else null end) as $last
-  | ($has and ($last | type) == "object" and $last.ms != $msn) as $called
-  | (if $has and (($last | type) != "object" or $last.ms != $msn) then
-       [ ($smap + {($sid): {ms: $msn, at: $now}}) | to_entries[]
+  | (reduce ("five_hour", "seven_day") as $w ({};
+       ($in[$w]) as $x
+       | if ($x | type) == "object" and ($x.used_percentage | type) == "number"
+            and ($x.resets_at | type) == "number"
+         then . + {($w): [$x.used_percentage, $x.resets_at]} else . end)) as $rd
+  | (($last | type) == "object") as $known
+  | ($known and ($last.r | type) == "object"
+     and any($rd | to_entries[]; $last.r[.key] != .value)) as $moved
+  | ($has and $known and ($last.ms != $msn or $moved)) as $called
+  # Rewritten on evidence, on any change of the stored readings, and once a
+  # minute while the session keeps reporting (`at` = last REPORT, which is
+  # what eviction goes by); 64 most recent kept.
+  | (if $has and (($known | not) or $last.ms != $msn or $last.r != $rd
+                  or ($now - (($last.at | numbers) // 0)) >= 60) then
+       [ ($smap + {($sid): {ms: $msn, r: $rd, at: $now}}) | to_entries[]
          | select((.value | type) == "object") ]
-       | sort_by(-(.value.at // 0)) | .[:20] | from_entries
+       | sort_by(-((.value.at | numbers) // 0)) | .[:64] | from_entries
      else null end) as $newmap
 
   | ((($prev.account // "") | strings) as $pa
@@ -218,10 +270,17 @@ out="$(jq -nc --argjson prev "$prev" --argjson in "$incoming" --argjson now "$(d
   # That is what every sample looked like before stamping, and fencing it
   # would drop the live numbers of this very account until its windows end.
   # The retired readings are NOT dropped on a switch: each carries its account
-  # (`a`; one written before stamping belongs to the sample it sat in) and
-  # stays until its window closes, like the fence, so after A->B->A the idle
-  # sessions of A still cannot write the number retired for A back.
-  | [ ($prev.retired // [])[]? | objects | .a = (.a // $pa) ] as $pretired
+  # (`a`; one written before stamping, or with no usable `a`, belongs to the
+  # sample it sat in) and stays until its window closes, like the fence, so
+  # after A->B->A the idle sessions of A still cannot write the number
+  # retired for A back. One that belongs to an UNSTAMPED sample (a = "") is
+  # claimed by the account now logged in, exactly as the unstamped sample
+  # itself is adopted below; left at "", it would match no account ever and
+  # the retired number would come straight back.
+  | [ ($prev.retired // [])[]? | objects
+      | .a = (if (.a | type) == "string" then .a else $pa end)
+      | if .a == "" and $pa == "" and $acct != "" then .a = $acct else . end
+    ] as $pretired
   | (if $acct != "" and $pa != "" and $pa != $acct then
        { five_hour: null, seven_day: null,
          fence: ([ ($prev.fence // [])[]? | objects | select(.a != $acct) ]
@@ -248,10 +307,11 @@ out="$(jq -nc --argjson prev "$prev" --argjson in "$incoming" --argjson now "$(d
       elif any($mine[]; .w == $w and .u == $x.used
                         and ((.r - $x.resets_at) | fabs) <= 600) then null
       else $x end;
-    # Admitted at all? See "ONLY A NEW API CALL IS NEWS" above: a session
-    # that brought evidence ($has) but has not called since its last report
-    # is repainting an old reading, and may neither fill nor raise any window.
-    # A caller with no evidence to give is admitted as before.
+    # Admitted at all? See "ONLY NEWS FROM THE API COUNTS" above: a session
+    # that brought evidence ($has) but has heard nothing from the API since
+    # its last report is repainting an old reading, and may neither fill nor
+    # raise any window. A caller with no evidence to give is admitted as
+    # before.
     def admitted($x): if $has and ($called | not) then null else $x end;
   unfenced(open(reading($in.five_hour))) as $r5
   | unfenced(open(reading($in.seven_day))) as $r7
@@ -263,7 +323,7 @@ out="$(jq -nc --argjson prev "$prev" --argjson in "$incoming" --argjson now "$(d
   | if $acct != "" then .account = $acct else . end
   | if ($fence | length) > 0 then .fence = $fence else . end
   | if ($retired | length) > 0 then .retired = $retired else . end
-  # `seen`. Only a session that just CALLED the API ($called) and is at the
+  # `seen`. Only a session that just heard from the API ($called) and is at the
   # FRONTIER refreshes it: every reading it brought is in the same window as
   # the merged one and at least as high. An idle session repainting an older,
   # lower number is not news about now, and neither is one repainting a
@@ -293,8 +353,10 @@ merged="${out%%$'\n'*}"
 newmap="${out#*$'\n'}"
 [[ "$merged" == '{'* ]] || exit 0
 
-# The map first: it moves on every API call, the sample far less often. Lost
-# to a concurrent write at worst, which costs that session one confirmation.
+# The map first: it moves on every report with evidence (and once a minute
+# per painting session), the sample far less often. No lock (see "Costs,
+# stated plainly" above): a concurrent write can lose this update, which
+# costs that session at most one report believed or ignored wrongly.
 if [[ "$newmap" == '{'* ]]; then
   mtmp="$(mktemp "${SESSIONS}.tmp.XXXXXX" 2>/dev/null)" \
     && { { printf '%s\n' "$newmap" >"$mtmp" && mv -f "$mtmp" "$SESSIONS"; } 2>/dev/null \
