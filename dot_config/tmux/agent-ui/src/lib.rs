@@ -76,6 +76,7 @@ pub mod menu;
 pub mod model;
 pub mod palette;
 pub mod proc;
+pub mod sessions;
 pub mod sidebar;
 pub mod text;
 pub mod tmux;

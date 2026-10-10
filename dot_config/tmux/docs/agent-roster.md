@@ -18,7 +18,8 @@ is the primary one for both the Option-W popup and the CMD+B sidebar.
 |---|---|
 | Option-W / `prefix q` / `prefix C-q` popup | `agent-ui menu --client <tty> [--tab active\|all\|needs\|working\|idle\|parked]` |
 | CMD+B WezTerm sidebar | `agent-ui sidebar [--client <tty>]` (wezterm.lua also passes `--tmux-pane`, `--wezterm`) |
-| screenshot / test render | `agent-ui sidebar --once WxH`, `agent-ui menu --client <tty> --once WxH` |
+| `prefix a` / `prefix C-a` session picker | `agent-ui sessions --client <tty>` (see [below](#agent-ui-sessions-prefix-a)) |
+| screenshot / test render | `agent-ui sidebar --once WxH`, `agent-ui menu --client <tty> --once WxH`, `agent-ui sessions --once WxH [--client <tty>] [--query q] [--ansi]` |
 
 - **Tabs** (agent-ui menu only; the Python has one list): a chip row,
   cycled with Tab / Shift-Tab in the order Active, All, Needs you, Working,
@@ -109,6 +110,61 @@ python), the same for every variant.
 
 Related keys: **Option-S** (or `prefix d` / `prefix C-d`) jumps to the next tab
 that needs you, **Option-X** (or `prefix D`) jumps back (scripts/agent-jump.sh).
+
+## agent-ui sessions (`prefix a`)
+
+The session picker, a port of `scripts/mru-session-switch.sh` (bash + fzf,
+with `preview_session.sh`), which stays bound as the fallback the same way
+the python roster does (the agent-ui `if-shell` block re-binds `a` and
+`C-a`, `display-popup -E -B -w 60% -h 75%`).
+
+- **Rows**: sessions by `session_last_attached`, newest first (ties by name,
+  like the script's `sort -k1,1nr`), minus the client's own session and
+  `scratch`, `agents`, `tasks`, `stash`. Each row: the name, then the agent
+  rollup exactly as the script's `decorate()` computes it: a ● in the colour
+  of the most urgent window (failed red > needs-input yellow > done green,
+  not while `@agent_workflow` is set > in flight pink > idle overlay), then
+  `N needs you · M working` or `N idle`. The dot does not pulse (the
+  script's static colours, not the core's `dot_color`). Unit tests run the
+  script's own `decorate()` and list pipeline (tmux faked) and diff them.
+- **Filter**: typing matches the NAME only (never the rollup, so a new name
+  like `work` can't hit "2 working"), case-insensitive: exact, then prefix,
+  then substring, then subsequence; MRU order within each. The first match
+  is selected. ↑/↓, C-p/C-n, C-k/C-j move; Backspace, C-u (clear), C-w
+  (word). Esc or C-c closes (Backspace on an empty query does not: an extra
+  Backspace while fixing a typo shouldn't close the picker).
+- **⏎**: a match → `switch-client -c <tty> -t =<name>`. No match: an empty
+  query closes; `scratch` closes; an invalid name (not `^[A-Za-z0-9_-]+$`)
+  shows the script's message inline and stays open; an existing session
+  (typed in full, e.g. `stash`) is switched to; anything else asks inline,
+  "Create and go to [name]? Y/n": ⏎, y or Y runs `new-session -d -s <name>
+  -c ~` and switches, any other key goes back to the list.
+- **Preview**: the bottom rows of the selected session's active pane
+  (`capture-pane -ep -t =<name>:`), coloured, in the lower ~70%; captured on a
+  worker thread 40 ms after the selection settles, then every second.
+- **Speed and typed-ahead keys**: raw mode is entered first thing, with
+  `TCSANOW` (crossterm's `enable_raw_mode`; `TCSAFLUSH` would drop them), and
+  the reader thread starts at once, so nothing typed after the key that
+  opened the popup is lost. Bytes that arrived while the tty was still
+  cooked (counted with `FIONREAD` on entry) went through ICRNL, so their LF
+  is Enter. Then ONE tmux call (the core snapshot), the queued keys are
+  applied to the loaded list (an early ⏎ acts on the filtered rows), and the
+  first frame is drawn. `AGENT_UI_SESSIONS_TRACE=<file>` appends
+  `first_frame_us`, `done_us <outcome>` and `cooked_bytes` lines.
+
+Measured 2026-10-09 on a private `-L fastpick` server with a real client
+(4 sessions), F12 bound like `prefix a`:
+
+| | old (bash + fzf) | agent-ui sessions |
+|---|---|---|
+| key → list on the client's screen | 70-88 ms | 21-42 ms (the menu: 21-24 ms on the same harness) |
+| first frame, in-process | — | 5.5-13 ms |
+| "beta" ⏎ typed 1, 2, 5 ms apart (one control-mode client) | 0/10 landed each | 10/10 each |
+| "beta" ⏎ typed 5 / 15 ms apart (a `send-keys` process per key) | 20/20, 20/20 | 20/20, 20/20 |
+
+Keys that reach tmux before the popup exists at all (the same `send-keys`
+command as the opening key) still go to the pane underneath: tmux routes
+them before the binding's popup is created, for either picker.
 
 ## Layout
 

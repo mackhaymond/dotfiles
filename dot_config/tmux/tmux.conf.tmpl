@@ -455,6 +455,10 @@ set -g @resurrect-stale-minutes '60'
 set -g @plugin 'timvw/tmux-assistant-resurrect'
 set -g @assistant-resurrect-capture-env 'VIRTUAL_ENV NODE_ENV CONDA_DEFAULT_ENV OPENCODE_CONFIG'
 
+# prefix a (or C-a): the session picker. These bash + fzf lines are the
+# FALLBACK; with ~/.local/bin/agent-ui installed, `agent-ui sessions` is bound
+# in the agent-ui block below (its list is on screen 20-40 ms after the key,
+# this one's 70-90 ms; docs/agent-roster.md "agent-ui sessions").
 unbind-key a
 bind-key a display-popup -E -w 60% -h 75% "$HOME/.config/tmux/scripts/mru-session-switch.sh"
 
@@ -545,6 +549,11 @@ if-shell "test -x '{{ .chezmoi.homeDir }}/.local/bin/agent-ui'" {
     bind-key q      run-shell -C "display-popup -c '#{client_tty}' -E -B -w 75% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
     bind-key C-q    run-shell -C "display-popup -c '#{client_tty}' -E -B -w 75% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
     bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -B -w 75% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
+    # prefix a / C-a: `agent-ui sessions`, the session picker (the bash + fzf
+    # mru-session-switch.sh lines above stay as the fallback). Same launch
+    # as the menu; docs/agent-roster.md "agent-ui sessions".
+    bind-key a      run-shell -C "display-popup -c '#{client_tty}' -E -B -w 60% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' sessions --client '#{client_tty}'"
+    bind-key C-a    run-shell -C "display-popup -c '#{client_tty}' -E -B -w 60% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' sessions --client '#{client_tty}'"
 }
 
 # Double-tap hyper or right shift in WezTerm (Karabiner, karabiner-base.json) flips
