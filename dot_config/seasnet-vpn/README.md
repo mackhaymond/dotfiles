@@ -7,8 +7,9 @@ and system traffic use their normal connections.
 ## Who can start it
 
 Only you, typing in a terminal: `seasnet-vpn start`, or a foreground
-`ssh seasnet` / `relayctl …` when the VPN is down. That opens **SEASnet VPN
-Login** in the background for UCLA sign-in and Duo. Login progress and refusals
+`ssh seasnet` / `relayctl …` when the VPN is down. That opens UCLA sign-in in a
+**Little Arc** window, so 1Password fills it, then Duo. Ctrl-C in the terminal
+cancels; an unfinished login times out after 5 minutes. Login progress and refusals
 are written to your terminal even when the caller hides ssh's stderr, which
 relayctl does.
 

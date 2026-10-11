@@ -76,26 +76,32 @@ class LifecycleTests(unittest.TestCase):
         vpn.write_login_result("failed", attempt="old-attempt")
         self.assertFalse((self.state / "login-result.json").exists())
 
-    def test_build_failure_reports_cancellation_without_launch(self):
-        with patch.object(vpn, "build_login", side_effect=OSError("compiler unavailable")), \
-                patch.object(vpn.subprocess, "run") as run:
-            self.assertEqual(vpn.browser_login("https://shb.ais.ucla.edu/login"), 1)
-            self.assertTrue(vpn.login_cancelled())
-            run.assert_not_called()
+    def test_arc_opens_url_as_argv(self):
+        vpn.write_json(self.state / "login-attempt.json", {"id": "a"})
+        with patch.dict(os.environ, {"SEASNET_VPN_LOGIN_ATTEMPT": "a"}), \
+                patch.object(vpn.subprocess, "run", return_value=Mock(returncode=0)) as run, \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(vpn.browser_login('https://shb.ais.ucla.edu/login?x="end tell'), 0)
+        args = run.call_args.args[0]
+        self.assertEqual(args[-1], 'https://shb.ais.ucla.edu/login?x="end tell')
+        self.assertNotIn("shb.ais", " ".join(args[:-1]))
+        self.assertFalse(vpn.login_cancelled())
 
-    def test_driver_failure_reports_cancellation(self):
-        with patch.object(vpn, "build_login"), patch.object(vpn.subprocess, "run",
-                side_effect=subprocess.CalledProcessError(1, "cua-driver")) as run:
-            self.assertEqual(vpn.browser_login("https://shb.ais.ucla.edu/login"), 1)
-            self.assertTrue(vpn.login_cancelled())
-            self.assertEqual(run.call_count, 1)
+    def test_arc_failure_reports_cancellation(self):
+        vpn.write_json(self.state / "login-attempt.json", {"id": "a"})
+        for outcome in (Mock(returncode=1), OSError("no osascript")):
+            with self.subTest(outcome=outcome), patch.dict(os.environ, {"SEASNET_VPN_LOGIN_ATTEMPT": "a"}), \
+                    patch.object(vpn.subprocess, "run", side_effect=[outcome] if isinstance(outcome, Exception) else None,
+                                 return_value=outcome), redirect_stderr(io.StringIO()):
+                self.assertEqual(vpn.browser_login("https://shb.ais.ucla.edu/login"), 1)
+                self.assertTrue(vpn.login_cancelled())
 
-    def test_expired_callback_never_builds_or_launches(self):
+    def test_expired_callback_never_launches(self):
         vpn.write_json(self.state / "login-attempt.json", {"id": "new"})
         with patch.dict(os.environ, {"SEASNET_VPN_LOGIN_ATTEMPT": "old"}), \
-                patch.object(vpn, "build_login") as build:
+                patch.object(vpn.subprocess, "run") as run, redirect_stderr(io.StringIO()):
             self.assertEqual(vpn.browser_login("https://shb.ais.ucla.edu/login"), 1)
-            build.assert_not_called()
+            run.assert_not_called()
             self.assertFalse((self.state / "login-request.json").exists())
 
     def test_verification_exception_rolls_back_new_daemon(self):
@@ -356,11 +362,11 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse((self.state / "login-attempt.json").exists())
 
     def test_diagnostic_browser_login_needs_terminal(self):
-        with patch.object(vpn, "has_tty", return_value=False), patch.object(vpn, "build_login") as build, \
+        with patch.object(vpn, "has_tty", return_value=False), patch.object(vpn.subprocess, "run") as run, \
                 patch.dict(os.environ, {"SEASNET_VPN_LOGIN_ATTEMPT": ""}), redirect_stderr(io.StringIO()):
             os.environ.pop("SEASNET_VPN_LOGIN_ATTEMPT")
             self.assertEqual(vpn.browser_login("https://shb.ais.ucla.edu/login"), 1)
-        build.assert_not_called()
+        run.assert_not_called()
 
     def test_pause_and_resume_touch_only_own_sessions(self):
         sessions = [{"identifier": "a", "name": "mine"}, {"identifier": "b", "name": "manual", "paused": True}]

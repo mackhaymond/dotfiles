@@ -16,12 +16,10 @@ the sessions this helper paused.
 """
 import fcntl
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
-import hashlib
 import json
 import math
 import os
 from pathlib import Path
-import plistlib
 import re
 import shlex
 import signal
@@ -44,17 +42,13 @@ TARGET = "cs35l.seas.ucla.edu"
 TEST_BIN = os.environ.get("SEASNET_VPN_TEST_BIN")
 OPENCONNECT = f"{TEST_BIN}/openconnect" if TEST_BIN else "/opt/homebrew/bin/openconnect"
 OCPROXY = f"{TEST_BIN}/ocproxy" if TEST_BIN else "/opt/homebrew/bin/ocproxy"
-LAUNCHER = Path(TEST_BIN or HOME / ".local/bin") / "cua-bg-launch"
-DRIVER = Path(TEST_BIN or HOME / ".local/bin") / "cua-driver"
+OSASCRIPT = f"{TEST_BIN}/osascript" if TEST_BIN else "/usr/bin/osascript"
 MUTAGEN = "/opt/homebrew/bin/mutagen"
 # Mutagen resolves ssh through MUTAGEN_SSH_PATH; ask the same ssh about routing.
 SSH = os.path.join(os.environ.get("MUTAGEN_SSH_PATH") or "/usr/bin", "ssh")
 TMUX = "/opt/homebrew/bin/tmux"
 AGENT_TMUX_SESSION = "agents"
 SELF = Path(__file__).resolve()
-LOGIN_SOURCE = HOME / ".config/seasnet-vpn/Login.swift"
-LOGIN_APP = HOME / "Applications/SEASnet VPN Login.app"
-LOGIN_BUNDLE = "co.mackhaymond.seasnet-vpn-login"
 DEFAULT_IDLE_MINUTES = 30
 CHECK_SECONDS = int(os.environ.get("SEASNET_VPN_CHECK_SECONDS") or 60)
 LOGIN_TIMEOUT = 5 * 60
@@ -446,34 +440,6 @@ def login_cooldown():
             "Run `seasnet-vpn start` to try now.")
 
 
-def build_login():
-    digest = hashlib.sha256(LOGIN_SOURCE.read_bytes() + b"login-app-v1").hexdigest()
-    stamp = STATE / "login-build.sha256"
-    binary = LOGIN_APP / "Contents/MacOS/SEASnetVPNLogin"
-    if stamp.exists() and stamp.read_text().strip() == digest and binary.exists():
-        return
-    if LOGIN_APP.exists():
-        info = LOGIN_APP / "Contents/Info.plist"
-        if not info.exists() or plistlib.loads(info.read_bytes()).get("CFBundleIdentifier") != LOGIN_BUNDLE:
-            raise RuntimeError("An unrelated app already occupies the login-app path.")
-    binary.parent.mkdir(parents=True, exist_ok=True)
-    info = {"CFBundleIdentifier": LOGIN_BUNDLE, "CFBundleName": "SEASnet VPN Login",
-            "CFBundleDisplayName": "SEASnet VPN Login", "CFBundleExecutable": "SEASnetVPNLogin",
-            "CFBundlePackageType": "APPL", "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0",
-            "LSMinimumSystemVersion": "13.0", "NSHighResolutionCapable": True,
-            "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True, "NSAllowsArbitraryLoadsInWebContent": True}}
-    temporary = binary.with_suffix(".build")
-    subprocess.run(["/usr/bin/xcrun", "swiftc", "-O", "-framework", "Cocoa", "-framework", "WebKit",
-                    str(LOGIN_SOURCE), "-o", str(temporary)], check=True, timeout=120)
-    temporary.replace(binary)
-    (LOGIN_APP / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
-    subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(LOGIN_APP)],
-                   check=True, capture_output=True, timeout=30)
-    register = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-    subprocess.run([register, "-f", str(LOGIN_APP)], check=True, capture_output=True, timeout=30)
-    stamp.write_text(digest + "\n")
-
-
 def write_login_result(result, request_id=None, attempt=None):
     request = STATE / "login-request.json"
     if request.exists():
@@ -762,40 +728,25 @@ def browser_login(url):
         return 1
     request_id = str(uuid.uuid4())
     write_json(STATE / "login-request.json", {"id": request_id, "url": url, "attempt": attempt})
-    session = f"seasnet-login-{uuid.uuid4().hex[:10]}"
-    session_started = False
     try:
-        build_login()
-        if not attempt_current(attempt) or login_cancelled():
-            write_login_result("failed", request_id=request_id)
-            return 1
-        subprocess.run([str(DRIVER), "start_session", json.dumps({"session": session, "capture_scope": "window"})],
-                       check=True, capture_output=True, timeout=15)
-        session_started = True
-        log_event("opening SEASnet VPN Login for an interactive start")
-        result = subprocess.run([str(LAUNCHER), "SEASnet VPN Login"], capture_output=True, text=True, timeout=90)
-    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+        log_event("opening UCLA login in Little Arc for an interactive start")
+        # Arc's application-level tabs element creates Little Arc windows. A
+        # real Arc window carries 1Password; the SSO's final redirect lands on
+        # openconnect's localhost listener, which Arc reaches like any page.
+        # The URL travels as argv, never spliced into the script source.
+        result = subprocess.run([OSASCRIPT, "-e", "on run argv", "-e", 'tell application "Arc"',
+                                 "-e", "make new tab with properties {URL:item 1 of argv}",
+                                 "-e", "activate", "-e", "end tell", "-e", "end run", url],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    if result is None or result.returncode:
         write_login_result("failed", request_id=request_id)
-        print("The login window could not be prepared safely. Check the diagnostic log and retry.",
+        print("Little Arc could not be opened for UCLA login. Check that Arc is installed and retry.",
               file=sys.stderr, flush=True)
         return 1
-    finally:
-        if session_started:
-            try:
-                subprocess.run([str(DRIVER), "end_session", json.dumps({"session": session})], capture_output=True, timeout=15)
-            except (OSError, subprocess.SubprocessError):
-                pass
-    if result.returncode not in (0, 2):
-        write_login_result("failed", request_id=request_id)
-        print("The login window could not be opened safely. Check the diagnostic log and retry.",
-              file=sys.stderr, flush=True)
-        return 1
-    elif result.returncode == 2:
-        print("The login window started, but background placement could not be verified. Choose SEASnet VPN Login manually.",
-              file=sys.stderr, flush=True)
-    else:
-        print("UCLA login opened in SEASnet VPN Login. Choose its window to complete Duo.",
-              file=sys.stderr, flush=True)
+    print("UCLA login opened in Little Arc. Complete sign-in and Duo there; Ctrl-C here cancels.",
+          file=sys.stderr, flush=True)
     return 0
 
 
@@ -863,7 +814,7 @@ def start(username=None, terminal_auth=False):
     if terminal_auth:
         print("Enter your UCLA Logon credentials and Duo response as required by UCLA.", flush=True)
     else:
-        print("Opening UCLA login; complete sign-in and Duo in SEASnet VPN Login.", flush=True)
+        print("Opening UCLA login; complete sign-in and Duo in Little Arc.", flush=True)
     # The daemon must not retain an SSH caller's stdout/stderr pipes after
     # login. Browser authentication and subsequent VPN logs stay in this file.
     log = None if terminal_auth else (STATE / "openconnect.log").open("w")
@@ -1122,7 +1073,7 @@ def main():
     os.umask(0o077)
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     if len(sys.argv) < 2:
-        print("Usage: seasnet-vpn {start [--terminal] [UCLA_LOGON]|stop|status|verify|proxy HOST PORT|build-login}")
+        print("Usage: seasnet-vpn {start [--terminal] [UCLA_LOGON]|stop|status|verify|proxy HOST PORT}")
         return 2
     command = sys.argv[1]
     if command.startswith("https://") and len(sys.argv) == 2:
@@ -1137,9 +1088,6 @@ def main():
         return idle_watch()
     if command == "pause-sync" and len(sys.argv) == 2:
         return pause_after_refusal()
-    if command == "build-login" and len(sys.argv) == 2:
-        build_login()
-        return 0
     if command == "verify" and len(sys.argv) == 2:
         return verify()
     remaining = sys.argv[2:]
