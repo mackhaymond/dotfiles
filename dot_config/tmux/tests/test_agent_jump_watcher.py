@@ -386,12 +386,21 @@ class WatcherTests(unittest.TestCase):
         r = self.f.run("agent-tab-watcher.sh", timeout=20, AGENT_TAB_WATCHER_MAX_TICKS="6")
         self.assertEqual(r.returncode, 0, r.stderr)
         s = self.f.read()
-        self.assertEqual(len(self.tmux_reads(s)), 6, self.tmux_reads(s))   # one read per tick
-        self.assertEqual({c[0] for c in self.tmux_reads(s)}, {"list-panes"})
-        # No agent anywhere here: a leftover workflow/cua flag is cleared on
-        # the first tick, and since @6 has no state or summary that is ALL
-        # that ever happens to it (it is on the idle fast path afterwards).
-        self.assertEqual(self.window_calls(s, "@6"), [["set-option", "-uw", "-t", "@6", "@agent_workflow"]])
+        reads = self.tmux_reads(s)
+        self.assertEqual(len([c for c in reads if c[0] == "list-panes"]), 6, reads)   # one read per tick
+        # The only other read: the agent-slot pass's locked re-read, on a tick
+        # that changes a slot (@6/@7 hold their flags - Active - until the GC).
+        self.assertFalse([c for c in reads if c[0] != "list-panes"
+                          and not (c[:2] == ["list-windows", "-a"] and "#{@agent_slot}" in c[-1])], reads)
+        # No agent anywhere here: a leftover workflow/cua flag is HELD while
+        # the agent pane is missing (tmux-thumbs swaps it out for seconds;
+        # see test_agent_slots) and goes with the GC after GC_TICKS ticks.
+        # @6 has no state or summary, so apart from its agent slot (a held
+        # gear is Active) the GC's unsets are ALL that ever happens to it.
+        calls6 = [c for c in self.window_calls(s, "@6") if "@agent_slot" not in c]
+        self.assertIn(["set-option", "-uw", "-t", "@6", "@agent_workflow"], calls6)
+        self.assertFalse([c for c in calls6 if "-uw" not in c], calls6)
+        self.assertNotIn("@agent_workflow", s["windows"]["@6"]["opts"])
         self.assertNotIn("@agent_cua", s["windows"]["@7"]["opts"])
         # A summary (spaces and all) is a summary: collected after GC_TICKS.
         self.assertNotIn("@agent_summary", s["windows"]["@5"]["opts"])

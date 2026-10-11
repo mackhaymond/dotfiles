@@ -19,15 +19,150 @@
 //! - `log`: the newest events, newest first.
 //! - `counts`: the header's per-state counts over every shown session
 //!   (stash and HIDDEN excluded), each window id once.
+//! - every agent's `slot`: its sticky number key ([`assign_slots`]), and
+//!   `slot_width`, the digit count every label is padded to.
 
 use crate::collate::Collator;
 use crate::events::{Event, EventLog};
 use crate::git::{GitCache, GitStatus};
+use crate::hotkeys;
 use crate::json::Value;
 use crate::model::{self, Cat, Counts, Flag};
 use crate::obj;
 use crate::text;
 use crate::tmux::{Snapshot, Tmux, Window, HOLD};
+use std::collections::HashMap;
+
+/// The agents that hold a number key: the ACTIVE set, the menu's Active tab.
+/// In flight (running, a workflow or cua out), needing you (failed,
+/// needs-input, done without a workflow: agent-jump.sh's queue), or a prompt
+/// just answered at `now` ([`Window::answered`]: idle with a @agent_pending
+/// epoch at most 600 s old, its turn not resumed yet; going to answer a
+/// needs-input agent must not free its number). Other idle agents (a lapsed
+/// or junk stamp among them), plain shells and stateless windows hold none.
+pub fn holds_slot(w: &Window, now: f64) -> bool {
+    model::in_flight(w) || model::is_attn(w) || w.answered(now)
+}
+
+/// The provisional numbers this process has shown, by window id: an
+/// Active agent the watcher has not stamped yet keeps the number it was
+/// first shown with until it is stamped (the stamp wins) or leaves the
+/// Active set, so a later arrival that sorts before it can never take it.
+/// The menu and the sidebar each hold one ([`Core::slots`]) across frames.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SlotMemo {
+    held: HashMap<String, u32>,
+}
+
+impl SlotMemo {
+    /// The provisional number remembered for `window_id`.
+    pub fn get(&self, window_id: &str) -> Option<u32> {
+        self.held.get(window_id).copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+}
+
+/// The window id's number, `@12` → 12 (unparseable: last).
+fn id_num(id: &str) -> u64 {
+    id.strip_prefix('@').and_then(|n| n.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Every Active window's slot (window id → number), computed the way
+/// agent-tab-watcher.sh `reconcile_slots` does, from the same snapshot, so a
+/// UI never shows a new agent unnumbered for the watcher's tick (the watcher
+/// stamps the same numbers within about a second):
+///
+/// 1. Eligible: [`holds_slot`], and linked into at least one session outside
+///    agent-jump.sh's EXCLUDE ([`model::jump_excluded`]: agents, tasks,
+///    stash, scratch, btop-popup). Its VISIBLE link is the one with the
+///    byte-order SMALLEST session name (then the lower index). A parked or
+///    hidden-only window, and every non-Active one, gets nothing.
+/// 2. Keep stamps: an eligible window keeps its valid `@agent_slot`
+///    ([`crate::tmux::parse_slot`]). On a duplicate the lower NUMERIC window
+///    id keeps it. A stamp on a window that is no longer eligible is
+///    ignored: its number is free at once.
+/// 3. Remembered: every other eligible window (no stamp, junk, a
+///    duplicate's loser) that `memo` holds a number for keeps it, unless a
+///    stamp now holds that number (the stamp wins; rare once the hook stamps
+///    synchronously).
+/// 4. Fill: the rest take the LOWEST number free of both the stamps and the
+///    remembered numbers, in (visible session name in plain BYTE order,
+///    never the locale's collation, so "Zeta" < "alpha"; that link's window
+///    index; numeric window id) order. The watcher sorts the same way.
+///
+/// `memo` is then exactly the provisional numbers given (steps 3 and 4): a
+/// window stamped or no longer Active drops out of it. Nobody else's number
+/// changes, so a freed slot leaves a gap and the next agent to become
+/// active fills the lowest one. With an empty memo this is the watcher's
+/// assignment exactly. `now` (epoch seconds) dates answered prompts
+/// ([`holds_slot`]).
+pub fn assign_slots(windows: &[Window], now: f64, memo: &mut SlotMemo) -> HashMap<String, u32> {
+    /// A window's link: (session, window index), ordered as a tuple: the
+    /// session name by bytes (`str`'s `Ord`), then the index.
+    type Link<'a> = (&'a str, u32);
+    // Each window id once: its stamp and its visible link.
+    let mut seen: HashMap<&str, (&Window, Option<Link>)> = HashMap::new();
+    for w in windows {
+        let vis = (!model::jump_excluded(&w.session)).then_some((w.session.as_str(), w.index));
+        let e = seen.entry(w.id.as_str()).or_insert((w, None));
+        if let Some(v) = vis {
+            if e.1.is_none_or(|cur| v < cur) {
+                e.1 = Some(v);
+            }
+        }
+    }
+    let mut eligible: Vec<(&str, Link, Option<u32>)> = seen
+        .into_iter()
+        .filter_map(|(id, (w, vis))| Some((id, vis?, w.slot)).filter(|_| holds_slot(w, now)))
+        .collect();
+    // Deterministic: (visible link, window id), the fill order.
+    eligible.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| id_num(a.0).cmp(&id_num(b.0))).then_with(|| a.0.cmp(b.0)));
+    let mut held: HashMap<u32, &str> = HashMap::new();
+    let mut need: Vec<&str> = Vec::new();
+    for &(id, _, stamp) in &eligible {
+        match stamp {
+            Some(s) => match held.get(&s) {
+                None => {
+                    held.insert(s, id);
+                }
+                Some(&keep) if id_num(id) < id_num(keep) => {
+                    held.insert(s, id);
+                    need.push(keep);
+                }
+                Some(_) => need.push(id),
+            },
+            None => need.push(id),
+        }
+    }
+    // A duplicate's loser joins in fill order, not in discovery order.
+    let rank: HashMap<&str, usize> = eligible.iter().enumerate().map(|(i, e)| (e.0, i)).collect();
+    need.sort_by_key(|id| rank[id]);
+    let mut out: HashMap<String, u32> = held.iter().map(|(&s, &id)| (id.to_string(), s)).collect();
+    // Remembered provisional numbers first, so no newcomer can take one.
+    let mut fresh: Vec<&str> = Vec::new();
+    for id in need.iter().copied() {
+        match memo.get(id).filter(|n| !held.contains_key(n)) {
+            Some(n) => {
+                held.insert(n, id);
+                out.insert(id.to_string(), n);
+            }
+            None => fresh.push(id),
+        }
+    }
+    let mut next = 1;
+    for id in fresh {
+        while held.contains_key(&next) {
+            next += 1;
+        }
+        held.insert(next, id);
+        out.insert(id.to_string(), next);
+    }
+    memo.held = need.iter().map(|&id| (id.to_string(), out[id])).collect();
+    out
+}
 
 /// One window as a row: everything a UI needs to draw it, already decided.
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +216,13 @@ pub struct Agent {
     pub panes: u32,
     /// The active pane's cwd.
     pub path: String,
+    /// The sticky number key ([`assign_slots`]; set by [`ViewModel::build`],
+    /// None from [`Agent::from_window`] alone). None: not in the Active set
+    /// (idle, a plain shell, parked).
+    pub slot: Option<u32>,
+    /// A prompt just answered ([`Window::answered`]): idle, but still in the
+    /// Active set (the menu's Active tab, a slot) until its turn resumes.
+    pub answered: bool,
 }
 
 impl Agent {
@@ -127,6 +269,8 @@ impl Agent {
             active: w.active,
             panes: w.panes,
             path: w.path.clone(),
+            slot: None,
+            answered: w.answered(now),
         }
     }
 
@@ -151,7 +295,7 @@ impl Agent {
                 ("color", c)])),
             ("attention", self.attention), ("in_flight", self.in_flight), ("run_detail", self.run_detail),
             ("is_current", self.is_current), ("active", self.active), ("panes", self.panes),
-            ("path", &self.path),
+            ("path", &self.path), ("slot", self.slot), ("answered", self.answered),
         ]
     }
 }
@@ -344,6 +488,9 @@ pub struct ViewModel {
     pub watcher_age: Option<f64>,
     /// The collation `needs` was sorted with.
     pub locale: String,
+    /// Every number label's width: the digit count of the highest slot held
+    /// ([`hotkeys::slot_width`]); 0 when no agent holds one.
+    pub slot_width: usize,
 }
 
 /// Inputs to [`ViewModel::build`] besides the snapshot.
@@ -359,7 +506,15 @@ pub struct BuildArgs<'a> {
 }
 
 impl ViewModel {
+    /// A one-shot view: slots with no memory of earlier frames (a `--once`
+    /// render, a test). A UI that redraws uses [`build_with`](Self::build_with).
     pub fn build(snap: &Snapshot, args: BuildArgs<'_>) -> ViewModel {
+        ViewModel::build_with(snap, args, &mut SlotMemo::default())
+    }
+
+    /// The view, with `memo` keeping each provisional slot this process has
+    /// shown ([`SlotMemo`], [`assign_slots`]) and updated for the next frame.
+    pub fn build_with(snap: &Snapshot, args: BuildArgs<'_>, memo: &mut SlotMemo) -> ViewModel {
         let BuildArgs { client, now, collator, mut git, log, watcher_age } = args;
         let blink = snap.blink();
         let cl = client.and_then(|c| snap.client(c));
@@ -372,7 +527,8 @@ impl ViewModel {
             }
         });
         let cw = cur_win.as_deref();
-        let agent = |w: &Window| Agent::from_window(w, blink, cw, now);
+        let slots = assign_slots(&snap.windows, now, memo);
+        let agent = |w: &Window| Agent { slot: slots.get(&w.id).copied(), ..Agent::from_window(w, blink, cw, now) };
 
         let needs = model::needs_order(&snap.windows, collator)
             .into_iter()
@@ -449,7 +605,14 @@ impl ViewModel {
             log: log.into_iter().map(|e| LogEntry::new(e, now)).collect(),
             watcher_age,
             locale: collator.name().to_string(),
+            slot_width: hotkeys::slot_width(slots.values().copied().max()),
         }
+    }
+
+    /// `a`'s number label as drawn and typed (zero-padded to
+    /// `slot_width`), None when it holds no slot.
+    pub fn slot_label(&self, a: &Agent) -> Option<String> {
+        a.slot.map(|s| hotkeys::slot_label(s, self.slot_width))
     }
 
     /// Every agent row in sidebar order (space by space), for hit-testing
@@ -463,6 +626,7 @@ impl ViewModel {
             ("now", self.now), ("client", self.client.clone()), ("client_gone", self.client_gone),
             ("cur_win", self.cur_win.clone()), ("cur_session", self.cur_session.clone()),
             ("blink", self.blink), ("locale", &self.locale), ("watcher_age", self.watcher_age),
+            ("slot_width", self.slot_width),
             ("counts", counts_json(&self.counts)),
             ("needs", Value::Arr(self.needs.iter().map(Need::to_json).collect())),
             ("spaces", Value::Arr(self.spaces.iter().map(Space::to_json).collect())),
@@ -483,6 +647,8 @@ pub struct Core {
     pub log_limit: usize,
     /// The snapshot the last view was built from (actions re-check against it).
     pub snapshot: Snapshot,
+    /// The provisional slots this UI has shown, across frames.
+    pub slots: SlotMemo,
 }
 
 impl Core {
@@ -496,6 +662,7 @@ impl Core {
             collator: Collator::from_env(),
             log_limit: 50,
             snapshot: Snapshot::default(),
+            slots: SlotMemo::default(),
         }
     }
 
@@ -510,7 +677,7 @@ impl Core {
     pub fn rebuild(&mut self, client: Option<&str>) -> ViewModel {
         let now = text::now();
         let log = self.events.newest(self.log_limit);
-        ViewModel::build(
+        ViewModel::build_with(
             &self.snapshot,
             BuildArgs {
                 client,
@@ -520,6 +687,7 @@ impl Core {
                 log,
                 watcher_age: crate::actions::watcher_age(),
             },
+            &mut self.slots,
         )
     }
 }
@@ -609,6 +777,288 @@ mod tests {
         let back = crate::json::parse(&j).unwrap();
         assert_eq!(back.get("spaces").unwrap().as_array().unwrap().len(), 3);
         assert_eq!(back.get("counts").unwrap().get("working").unwrap().as_f64(), Some(2.0));
+    }
+
+    /// One frame with no memory (the watcher's own assignment).
+    fn slots_of(rows: &[String]) -> Vec<(String, u32)> {
+        slots_with(rows, &mut SlotMemo::default())
+    }
+
+    /// The slot tests' clock: @agent_pending "1700000000" is 0 s old.
+    const T_NOW: f64 = 1_700_000_000.0;
+
+    /// One frame of a UI that remembers what it showed in `memo`, at [`T_NOW`].
+    fn slots_with(rows: &[String], memo: &mut SlotMemo) -> Vec<(String, u32)> {
+        slots_at(rows, T_NOW, memo)
+    }
+
+    fn slots_at(rows: &[String], now: f64, memo: &mut SlotMemo) -> Vec<(String, u32)> {
+        let s = Snapshot::parse(&rows.join("\n"));
+        let mut v: Vec<(String, u32)> = assign_slots(&s.windows, now, memo).into_iter().collect();
+        v.sort_by_key(|(id, _)| id_num(id));
+        v
+    }
+
+    fn memo_of(m: &SlotMemo) -> Vec<(String, u32)> {
+        let mut v: Vec<(String, u32)> = m.held.iter().map(|(k, &n)| (k.clone(), n)).collect();
+        v.sort_by_key(|(id, _)| id_num(id));
+        v
+    }
+
+    fn ids(v: &[(&str, u32)]) -> Vec<(String, u32)> {
+        v.iter().map(|(i, s)| (i.to_string(), *s)).collect()
+    }
+
+    /// No stamps yet (the watcher has not ticked): every Active agent gets a
+    /// provisional number, lowest first in (session, index) order; idle,
+    /// plain, parked and hidden windows get none.
+    #[test]
+    fn slots_provisional_fill() {
+        let got = slots_of(&[
+            row("work", 2, "@1", &[("state", "running")]),
+            row("main", 3, "@2", &[("state", "needs-input")]),
+            row("main", 1, "@3", &[("state", "idle")]),
+            row("main", 2, "@4", &[("state", "done")]),                     // needs you
+            row("main", 4, "@5", &[("state", "done"), ("workflow", "1")]), // fleet out: working
+            row("main", 5, "@6", &[("cua", "1")]),                          // cua out, no state
+            row("main", 6, "@7", &[]),                                      // a plain shell
+            row("stash", 1, "@8", &[("state", "running")]),                 // parked
+            row("agents", 1, "@9", &[("state", "failed")]),                 // hidden
+            row("Alpha", 9, "@10", &[("state", "failed")]),
+        ]);
+        // Alpha:9, main:2, main:3, main:4, main:5, work:2.
+        assert_eq!(got, ids(&[("@1", 6), ("@2", 3), ("@4", 2), ("@5", 4), ("@6", 5), ("@10", 1)]));
+        // Through the view: the agents carry them, and the label width follows the highest.
+        let v = ViewModel::build(&snap(), BuildArgs { client: None, now: 1000.0, collator: &Collator::new("C"), git: None,
+            log: vec![], watcher_age: None });
+        let main = &v.spaces[1];
+        assert_eq!(main.agents.iter().map(|a| a.slot).collect::<Vec<_>>(), [Some(1), Some(2)]); // main:1, main:3
+        assert_eq!(v.needs.iter().map(|n| n.agent.slot).collect::<Vec<_>>(), [Some(3), Some(1)]); // work:1, main:1
+        assert!(v.parked.iter().all(|p| p.agent.slot.is_none()));
+        assert_eq!(v.spaces[0].agents[0].slot, None); // Alpha: idle
+        assert_eq!(v.slot_width, 1);
+        assert_eq!(v.slot_label(&main.agents[1]).as_deref(), Some("2"));
+    }
+
+    /// Stamps are kept; a stamp on an agent that left the Active set (idle,
+    /// parked, a plain shell) is ignored and its number is free at once.
+    #[test]
+    fn slots_stale_stamp_ignored() {
+        let got = slots_of(&[
+            row("main", 1, "@1", &[("state", "running"), ("slot", "2")]),
+            row("main", 2, "@2", &[("state", "idle"), ("slot", "1")]),   // went idle: 1 is free
+            row("main", 3, "@3", &[("state", "running")]),               // new: takes 1
+            row("stash", 1, "@4", &[("state", "running"), ("slot", "3")]), // parked: 3 is free
+            row("main", 4, "@5", &[("slot", "4")]),                      // agent exited
+            row("main", 5, "@6", &[("state", "failed")]),                // new: takes 3
+        ]);
+        assert_eq!(got, ids(&[("@1", 2), ("@3", 1), ("@6", 3)]));
+    }
+
+    /// 1–4 held; 3 goes idle: 1, 2, 4 keep theirs and the next agent to
+    /// become active takes 3. A later arrival that sorts before it takes 5:
+    /// the 3 already shown is never displaced (frames through one memo).
+    #[test]
+    fn slots_gap_filled_by_the_next_agent() {
+        let held = |three: &str| {
+            vec![
+                row("main", 1, "@1", &[("state", "running"), ("slot", "1")]),
+                row("main", 2, "@2", &[("state", "running"), ("slot", "2")]),
+                row("main", 3, "@3", &[("state", three), ("slot", "3")]),
+                row("main", 4, "@4", &[("state", "needs-input"), ("slot", "4")]),
+            ]
+        };
+        assert_eq!(slots_of(&held("running")), ids(&[("@1", 1), ("@2", 2), ("@3", 3), ("@4", 4)]));
+        assert_eq!(slots_of(&held("idle")), ids(&[("@1", 1), ("@2", 2), ("@4", 4)]));
+        let mut memo = SlotMemo::default();
+        let mut rows = held("idle");
+        assert_eq!(slots_with(&rows, &mut memo), ids(&[("@1", 1), ("@2", 2), ("@4", 4)]));
+        rows.push(row("zz", 9, "@7", &[("state", "running")])); // last in fill order, still the lowest gap
+        assert_eq!(slots_with(&rows, &mut memo), ids(&[("@1", 1), ("@2", 2), ("@4", 4), ("@7", 3)]));
+        rows.push(row("aa", 1, "@8", &[("state", "running")])); // sorts first, arrives later
+        assert_eq!(slots_with(&rows, &mut memo), ids(&[("@1", 1), ("@2", 2), ("@4", 4), ("@7", 3), ("@8", 5)]));
+        // Arriving in the same frame (nothing shown yet), fill order decides.
+        assert_eq!(slots_of(&rows), ids(&[("@1", 1), ("@2", 2), ("@4", 4), ("@7", 5), ("@8", 3)]));
+    }
+
+    /// The memo, frame by frame: a provisional number is stable across
+    /// frames and across earlier-sorting arrivals; a stamp always wins
+    /// (adopted even when it differs, and the memo drops the window); leaving
+    /// the Active set releases it; a newcomer takes the lowest number free of
+    /// stamps AND remembered numbers.
+    #[test]
+    fn slot_memo_across_frames() {
+        let mut memo = SlotMemo::default();
+        let run = |s: &str, i: u32, id: &str, slot: &str| {
+            let mut set = vec![("state", "running")];
+            if !slot.is_empty() {
+                set.push(("slot", slot));
+            }
+            row(s, i, id, &set)
+        };
+        // Frame 1: one stamped agent, one new one (provisional 2).
+        let mut rows = vec![run("main", 1, "@1", "1"), run("work", 5, "@5", "")];
+        assert_eq!(slots_with(&rows, &mut memo), ids(&[("@1", 1), ("@5", 2)]));
+        assert_eq!(memo_of(&memo), ids(&[("@5", 2)]));
+        // Frame 2: the same snapshot, the same numbers.
+        assert_eq!(slots_with(&rows, &mut memo), ids(&[("@1", 1), ("@5", 2)]));
+        // Frame 3: two unstamped arrivals that sort before @5 (aa < work):
+        // they take 3 and 4, never @5's 2.
+        rows.push(run("aa", 1, "@6", ""));
+        rows.push(run("main", 2, "@7", ""));
+        assert_eq!(slots_with(&rows, &mut memo), ids(&[("@1", 1), ("@5", 2), ("@6", 3), ("@7", 4)]));
+        assert_eq!(memo_of(&memo), ids(&[("@5", 2), ("@6", 3), ("@7", 4)]));
+        // Frame 4: the watcher stamps. @5 and @6 as shown; @7 differently
+        // (a race): the stamp is adopted, and stamped windows leave the memo.
+        rows = vec![run("main", 1, "@1", "1"), run("work", 5, "@5", "2"), run("aa", 1, "@6", "3"),
+            run("main", 2, "@7", "9")];
+        assert_eq!(slots_with(&rows, &mut memo), ids(&[("@1", 1), ("@5", 2), ("@6", 3), ("@7", 9)]));
+        assert!(memo.is_empty());
+        // A remembered number a stamp now claims: the stamp wins, the
+        // remembered window moves to the lowest free number.
+        let mut memo = SlotMemo::default();
+        assert_eq!(slots_with(&[run("main", 1, "@1", "")], &mut memo), ids(&[("@1", 1)]));
+        assert_eq!(slots_with(&[run("main", 1, "@1", ""), run("main", 2, "@2", "1")], &mut memo),
+            ids(&[("@1", 2), ("@2", 1)]));
+        // Leaving the set releases a remembered number at once: the next
+        // newcomer may take it.
+        let mut memo = SlotMemo::default();
+        assert_eq!(slots_with(&[run("main", 1, "@1", ""), run("main", 2, "@2", "")], &mut memo),
+            ids(&[("@1", 1), ("@2", 2)]));
+        let idle = row("main", 1, "@1", &[("state", "idle")]);
+        assert_eq!(slots_with(&[idle.clone(), run("main", 2, "@2", "")], &mut memo), ids(&[("@2", 2)]));
+        assert_eq!(memo_of(&memo), ids(&[("@2", 2)]));
+        assert_eq!(slots_with(&[idle, run("main", 2, "@2", ""), run("zz", 1, "@3", "")], &mut memo),
+            ids(&[("@2", 2), ("@3", 1)]));
+        // A window that closes is gone from the memo too.
+        assert_eq!(slots_with(&[run("zz", 1, "@3", "")], &mut memo), ids(&[("@3", 1)]));
+        assert_eq!(memo_of(&memo), ids(&[("@3", 1)]));
+    }
+
+    /// An answered prompt (idle + @agent_pending, its turn not resumed) is
+    /// still Active: it keeps its stamp (and a provisional number), and it is
+    /// in the Active set but NOT in the needs queue. Bare idle is not.
+    #[test]
+    fn slots_answered_prompt_keeps_its_number() {
+        let rows = [
+            row("main", 1, "@1", &[("state", "running"), ("slot", "1")]),
+            row("main", 2, "@2", &[("state", "idle"), ("pending", "1700000000"), ("slot", "2")]),
+            row("main", 3, "@3", &[("state", "idle"), ("slot", "3")]),
+            row("main", 4, "@4", &[("state", "idle"), ("pending", "1700000000")]),
+        ];
+        assert_eq!(slots_of(&rows), ids(&[("@1", 1), ("@2", 2), ("@4", 3)]));
+        let v = ViewModel::build(&Snapshot::parse(&rows.join("\n")), BuildArgs { client: None, now: T_NOW,
+            collator: &Collator::new("C"), git: None, log: vec![], watcher_age: None });
+        assert!(v.needs.is_empty()); // agent-jump.sh's queue: unchanged
+        let a = &v.spaces[0].agents;
+        assert_eq!(a.iter().map(|a| (a.answered, a.slot)).collect::<Vec<_>>(),
+            [(false, Some(1)), (true, Some(2)), (false, None), (true, Some(3))]);
+        assert_eq!(a[1].glyph, "○"); // drawn as what it is: idle
+        // Through a needs-input → answered → running round trip the number never moves.
+        let mut memo = SlotMemo::default();
+        for st in [("needs-input", ""), ("idle", "1700000000"), ("running", "")] {
+            let r = [row("main", 1, "@1", &[("state", "running")]), row("aa", 1, "@9", &[("state", st.0), ("pending", st.1)])];
+            assert_eq!(slots_with(&r, &mut memo), ids(&[("@1", 2), ("@9", 1)]), "{st:?}");
+        }
+    }
+
+    /// The pending stamp ages out: at 600 s the answered agent still holds
+    /// its number; at 601 s (an answer-by-No that never resumed, a seen
+    /// failure) it is plain idle and lets it go, stamped or remembered. A
+    /// junk stamp never held it.
+    #[test]
+    fn slots_answered_prompt_lapses_after_600s() {
+        let answered = |pending: &str, slot: &str| {
+            let mut set = vec![("state", "idle"), ("pending", pending)];
+            if !slot.is_empty() {
+                set.push(("slot", slot));
+            }
+            vec![row("main", 1, "@1", &[("state", "running"), ("slot", "1")]), row("main", 2, "@2", &set)]
+        };
+        let fresh = || SlotMemo::default();
+        assert_eq!(slots_at(&answered("1700000000", "2"), T_NOW + 600.0, &mut fresh()), ids(&[("@1", 1), ("@2", 2)]));
+        assert_eq!(slots_at(&answered("1700000000", "2"), T_NOW + 601.0, &mut fresh()), ids(&[("@1", 1)]));
+        assert_eq!(slots_at(&answered("1700000000", "2"), T_NOW + 600.9, &mut fresh()), ids(&[("@1", 1), ("@2", 2)]));
+        for junk in ["x", "17e8", " 1700000000", "-1"] {
+            assert_eq!(slots_at(&answered(junk, "2"), T_NOW, &mut fresh()), ids(&[("@1", 1)]), "{junk:?}");
+        }
+        // Remembered (never stamped): kept while fresh, released at 601 s, and
+        // the number is free for the next agent.
+        let mut memo = SlotMemo::default();
+        let r = answered("1700000000", "");
+        assert_eq!(slots_at(&r, T_NOW, &mut memo), ids(&[("@1", 1), ("@2", 2)]));
+        assert_eq!(slots_at(&r, T_NOW + 600.0, &mut memo), ids(&[("@1", 1), ("@2", 2)]));
+        assert_eq!(slots_at(&r, T_NOW + 601.0, &mut memo), ids(&[("@1", 1)]));
+        assert!(memo.is_empty());
+        let mut r2 = r.clone();
+        r2.push(row("zz", 1, "@3", &[("state", "running")]));
+        assert_eq!(slots_at(&r2, T_NOW + 602.0, &mut memo), ids(&[("@1", 1), ("@3", 2)]));
+        // Through the view: the flag follows the clock.
+        let snap = Snapshot::parse(&r.join("\n"));
+        for (now, want) in [(T_NOW + 600.0, (true, Some(2))), (T_NOW + 601.0, (false, None))] {
+            let v = ViewModel::build(&snap, BuildArgs { client: None, now, collator: &Collator::new("C"), git: None,
+                log: vec![], watcher_age: None });
+            let a = &v.spaces[0].agents[1];
+            assert_eq!((a.answered, a.slot), want, "{now}");
+        }
+    }
+
+    /// Duplicates: the lower window id keeps it, the loser fills like a new
+    /// agent. A linked window is one window: one slot, its visible link
+    /// deciding its place. Junk stamps are new agents.
+    #[test]
+    fn slots_duplicates_links_and_junk() {
+        let got = slots_of(&[
+            row("main", 1, "@9", &[("state", "running"), ("slot", "1")]),
+            row("main", 2, "@3", &[("state", "running"), ("slot", "1")]),
+            row("main", 3, "@5", &[("state", "running"), ("slot", "007")]),
+            row("zz", 1, "@6", &[("state", "running")]),
+            row("agents", 0, "@6", &[("state", "running")]), // its hidden link does not count
+            row("aa", 5, "@7", &[("state", "running"), ("slot", "12")]),
+        ]);
+        // @3 keeps 1; then by visible link: main:1 @9 → 2, main:3 @5 → 3, zz:1 @6 → 4.
+        assert_eq!(got, ids(&[("@3", 1), ("@5", 3), ("@6", 4), ("@7", 12), ("@9", 2)]));
+        let s = Snapshot::parse(&[row("main", 1, "@1", &[("state", "running"), ("slot", "12")]),
+            row("main", 2, "@2", &[("state", "running")])].join("\n"));
+        let v = ViewModel::build(&s, BuildArgs { client: None, now: 0.0, collator: &Collator::new("C"), git: None,
+            log: vec![], watcher_age: None });
+        assert_eq!(v.slot_width, 2);
+        let labels: Vec<_> = v.spaces[0].agents.iter().map(|a| v.slot_label(a)).collect();
+        assert_eq!(labels, [Some("12".to_string()), Some("01".to_string())]);
+    }
+
+    /// The fill order is plain BYTE order (the watcher's), never the locale's
+    /// collation: "Zeta" comes before "alpha" (en_US would say the opposite),
+    /// and "_x" after "Zeta" but before "alpha". A linked window sorts by its
+    /// byte-smallest non-hidden session and that link's index. The lower
+    /// numeric id wins a duplicate (@9 < @10 though "@10" < "@9" as text).
+    #[test]
+    fn slots_fill_in_byte_order() {
+        let got = slots_of(&[
+            row("alpha", 1, "@1", &[("state", "running")]),
+            row("Zeta", 1, "@2", &[("state", "running")]),
+            row("_x", 1, "@3", &[("state", "running")]),
+            row("beta", 9, "@4", &[("state", "running")]),
+            row("Beta", 7, "@4", &[("state", "running")]),   // linked: "Beta" < "beta", index 7
+            row("agents", 0, "@4", &[("state", "running")]), // hidden: never its sort key
+            row("Beta", 8, "@5", &[("state", "running")]),
+        ]);
+        // Byte order: "Beta":7 @4, "Beta":8 @5, "Zeta" @2, "_x" @3, "alpha" @1.
+        assert_eq!(got, ids(&[("@1", 5), ("@2", 3), ("@3", 4), ("@4", 1), ("@5", 2)]));
+        let got = slots_of(&[
+            row("main", 1, "@10", &[("state", "running"), ("slot", "1")]),
+            row("main", 2, "@9", &[("state", "running"), ("slot", "1")]),
+        ]);
+        assert_eq!(got, ids(&[("@9", 1), ("@10", 2)]));
+        // The collation the view is built with does not change any of it.
+        let snap = Snapshot::parse(&[row("alpha", 1, "@1", &[("state", "running")]),
+            row("Zeta", 1, "@2", &[("state", "running")])].join("\n"));
+        for loc in ["en_US.UTF-8", "C"] {
+            let v = ViewModel::build(&snap, BuildArgs { client: None, now: 0.0, collator: &Collator::new(loc), git: None,
+                log: vec![], watcher_age: None });
+            let slot = |id: &str| v.agents().find(|a| a.window_id == id).and_then(|a| a.slot);
+            assert_eq!((slot("@2"), slot("@1")), (Some(1), Some(2)), "{loc}");
+        }
     }
 
     #[test]

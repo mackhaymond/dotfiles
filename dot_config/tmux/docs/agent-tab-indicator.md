@@ -69,6 +69,7 @@ Two per-window tmux user options are the single source of truth:
 - `@agent_cua` — `1` while the agent is driving an app through cua-driver (lingers up to `CUA_LIVE`, 60 s); set by the watcher
 - `@agent_rollout` — codex only: the thread's rollout path, stashed by the indicator so the watcher can tell a live turn from an interrupted one
 - `@agent_kind` — `claude | codex`: whose hooks drive the window. Written by any indicator hook that writes state or detail (in the same command list), unset with the state by `clear_state` and the watcher GC. Never written by the focus hook or a no-op heartbeat. Before any hook has fired (Codex's first hook waits for the first prompt), the watcher seeds it from the agent process's own comm; it never overwrites a kind that is already set (see the watcher section).
+- `@agent_slot` — decimal integer ≥ 1: the window's sticky number in agent-ui's Option-W menu and sidebar. Held only while the window is in the Active set and visible. Stamped by the indicator's `set_state` when a window enters the Active set, and by the watcher as the backstop; released and repaired only by the watcher (see "Agent slots" in the watcher section).
 - `@agent_detail_kind` + `@agent_detail` — what the event that set the state was *about*, for the sidebar (not rendered in the tab bar):
 
   | Kind | Event | `@agent_detail` |
@@ -268,7 +269,9 @@ detect presence). Reconciles:
 - no agent, state **or** summary set → unset both options (covers SIGKILL,
   `kill-pane`, crashes — SessionEnd is best-effort and codex has none; the
   summary is read separately so an orphaned title written by a slow
-  condenser after the agent died is still reaped)
+  condenser after the agent died is still reaped). Collected only after
+  `GC_TICKS` agent-less ticks in a row; `@agent_workflow`/`@agent_cua` are
+  held until then too and dropped with the rest (see "Agent slots")
 
 Hook-set states are never overridden while the agent lives, except by the
 agent's own record of its turn (the two reconciles below):
@@ -372,6 +375,138 @@ gets it, riding in the `@agent_since` stamp's tmux call (the idle seed always
 stamps, so a fresh window costs no extra fork; a held state without a kind
 pays one call, once). A kind already set is never overwritten, and none is
 written without a live agent, so it cannot race the GC that unsets it.
+
+**Agent slots** (2026-10-10). The number labels in agent-ui's Option-W menu
+and sidebar are sticky: they are taken lowest first, and while an agent stays
+Active its number never changes. When it leaves, its number is freed and every
+other agent keeps its own. agent-ui reads the per-window option `@agent_slot`
+(decimal, ≥ 1). For an agent that has not been stamped yet, agent-ui computes
+the same assignment itself, so the rule below is a contract. Change every
+side or none.
+
+Two writers share one implementation, the **SLOT CORE**. It is a block that
+`agent-tab-watcher.sh` and `agent-tab-indicator.sh` carry byte for byte, and
+`tests/test_agent_slots.py` fails if the two copies drift.
+
+- **Eligible** means the window is in the **Active** set:
+  - `@agent_state` is `running`, `failed`, `needs-input` or `done`;
+  - or `@agent_state` is idle AND `@agent_pending` is an epoch no older than
+    600 s (`SLOT_PENDING_TTL`);
+  - or `@agent_workflow` is set;
+  - or `@agent_cua` is set.
+
+  This is agent-jump's queue plus working, i.e. the menu's Active tab, so a
+  `done` with a gear counts, as working. Idle with pending is an answered
+  prompt: clear-current discharges `needs-input` to idle and stamps
+  `@agent_pending`, and the heartbeat turns it back into `running`. The agent
+  keeps its number through that.
+
+  The 600 s bound exists because the stamp clears only on the next prompt,
+  SessionStart or SessionEnd. An approval answered with No or Esc fires no
+  resume hook, so without the bound an idle agent would hold its number
+  indefinitely. Past 600 s, or for a stamp that is not plain digits (at most
+  18 of them), the window is not Active, and the watcher unsets the stamp
+  itself so it does not linger. The heartbeat's own 3600 s re-arm gate is
+  unchanged, but the stamp no longer lives that long.
+
+  A seen `failed` gets no pending at all: a dead turn never resumes, and a
+  new prompt sets `running` by itself. A seen `done` (idle, no pending), no
+  state, and no agent are not Active either.
+
+  The window must also have at least one link in a session outside
+  agent-jump.sh's `EXCLUDE` (`agents tasks stash scratch btop-popup`). The core
+  keeps that list as `SLOT_EXCLUDE`, and the test pins it to agent-jump's byte
+  for byte. A window linked into several sessions has one window option, so it
+  holds one slot.
+- **Stamped at the source.** When `set_state` puts a window into the Active
+  set, the hook stamps the number in the same tmux call as the state write.
+  This applies to any state change into `running`, `needs-input`, `failed` or
+  `done`, and to idle with a pending stamp.
+  - A cheap look comes first: one `display-message`, no lock and no list. A
+    window that already holds a valid slot keeps it, and that is what makes it
+    sticky. A window whose session is hidden is left to the watcher.
+  - Otherwise the hook takes the slot lock and does one `list-windows -a`.
+    It then takes the lowest number that no *other* Active, visible window
+    holds.
+  - If a window that is no longer Active still carries that number (the tick
+    has not released it yet), the unset rides in the same call. The number
+    moves in one step, and two windows never both carry it.
+
+  The `@agent_pending` writes moved into `set_state`'s command list for the
+  same reason (`pend_op`): clear-current's idle + pending and the heartbeat's
+  running + unset each land as a unit. A stamp in between would read bare idle
+  and give the number away.
+- **The watcher is the backstop.** It stamps windows that became Active
+  without a hook (a gear, a robot), releases slots, and repairs. It decides
+  from the tick's one `list-panes` read, which carries `#{@agent_slot}` and
+  `#{@agent_pending}` ahead of the free-text fields. That decision is
+  fork-free. It is judged *after* the reconcile, so the tick's own writes
+  count at once: the stuck-`running` reconcile, the seen-it discharge (now
+  idle + pending in one call), and the GC. Only when something must change
+  does the tick take the lock and re-read (`list-windows -a`: a hook may have
+  stamped since). It then decides again from that read and writes in one
+  call.
+- **The slot lock** is a file, `$TMPDIR/agent-slot.$UID.lock`, created O_EXCL
+  (noclobber, a builtin) and holding `<pid> <epoch>`.
+  - **Not `tmux wait-for -L`.** Measured on tmux 3.7c on a private server: a
+    waiter that is killed stays queued as a ghost, and the ghost swallows the
+    next `-U`. After one killed waiter, "unlock, then lock" never acquired
+    again. A holder killed mid-section leaves the channel locked for good, and
+    every later hook and tick would block.
+  - **Stale holds.** A dead holder (`kill -0`) or a hold older than 2 s
+    (`SLOT_STALE`) is broken by the next waiter.
+  - **No queueing behind a live holder.** A section takes milliseconds, so a
+    waiter that sees the same live holder pid on 3 consecutive polls
+    (`SLOT_GIVEUP`, 25 ms apart) gives up. The hook skips its stamp, and the
+    watcher's next tick stamps the window. The watcher also retries next tick.
+    Measured on a private 175-window server: a hook blocked by a live holder
+    took 125–129 ms. An unblocked stamping hook took 76–77 ms, and the
+    previous ~1 s wait made the blocked hook take 1.30 s.
+  - **Release.** Holders release on every path, signals included: the hook
+    traps INT, TERM and HUP while it holds the lock, and the watcher's
+    cleanup releases it.
+  - **Worst case.** A racing break can at worst produce a duplicate, which the
+    tick repairs.
+- **Release.** A window that holds a slot but is not eligible has it unset.
+  That happens when the agent goes idle (a seen `done`), when it exits, and
+  when the window is parked into `stash`. A closed window just leaves the
+  read, and its number is free from that tick on. No other window's slot
+  changes. If 1–4 are held and 3 finishes and goes idle, 1, 2 and 4 stay where
+  they are, and the next window to become Active takes 3.
+- **A missing agent pane releases nothing early.** tmux-thumbs (prefix+Space)
+  swaps the agent pane out for the seconds its picker is up. This used to
+  force `@agent_workflow`/`@agent_cua` off at once, which flickered the gear
+  and, with the state idle, freed the slot. The agent came back with a new
+  number. Now both flags are held, like the state, until the GC streak
+  (`GC_TICKS`) expires, and only the GC drops them. A one-tick flicker of the
+  workflow/subagent detection *with* the pane present is not debounced.
+- **Keep.** An eligible window keeps a valid slot that no other eligible
+  window claims. Valid means `^[1-9][0-9]{0,8}$`, canonical decimal, so `0`,
+  `-1`, `x` and `007` are junk. When two windows claim the same slot (after a
+  restore, for example), the lower window id keeps it. Ids compare as numbers,
+  so `@12` beats `@100`.
+- **Assign (the watcher).** Every other eligible window gets the lowest
+  positive integer that no eligible window holds. That covers a window with no
+  slot, one with junk, and the loser of a duplicate.
+  - When several need a slot in one tick, they are filled in this order:
+    session name in **byte** order (as under `LC_ALL=C`, so `Zeta` comes
+    before `alpha`), then window index, then window id.
+  - A linked window sorts by its byte-smallest visible session and its index
+    in that session.
+  - The compare is bash's `[ \> ]` `test` builtin, which uses strcmp whatever
+    the locale. `[[ > ]]` would collate by tmux's UTF-8 locale.
+- **Stateless and restart-safe.** Every decision comes from what tmux holds.
+  A window that holds only a slot is skipped by the reconcile loop's fast
+  path, and its slot is released from the read. A restart re-reads the slots
+  and never renumbers them.
+- **Writes only on change.** A steady tick does not write, lock or fork. The
+  slot writes are one call. `refresh-client -S` for the tick's state changes
+  is its own call *after* that one. A set on a window closed since the read
+  fails, and a failure ends the rest of a tmux command list, so the redraw
+  must not ride behind it. It cannot go in front either: with no client
+  attached, refresh-client itself fails.
+
+Tests: `tests/test_agent_slots.py`, which also exercises the hook.
 
 **Liveness.** The daemon is the single point of failure for the blink, the
 workflow gear and the GC, and its death is silent — a frozen pulse is the only
@@ -636,7 +771,17 @@ subagent verdict is reused until its inputs change, as judged by per-tick
 stamp files (`agent-tab-watcher.$UID.$$.stamp.N`, removed on exit).
 Measured live: first tick after a restart ~250 ms, steady ~100 ms with
 ~175 windows and ~13 agents. It was tens of seconds before the lineage scan
-was dropped, and 279 ms average just after.
+was dropped, and 279 ms average just after. Agent slots (2026-10-10) added two fields to the read and a builtin pass.
+On a private benchmark server with 175 windows and 20 agent panes, 10 of
+them Active, I ran 40 ticks per run, with before and after interleaved.
+Median steady tick: before 46–47 ms, after 48–49 ms. That difference is
+inside the run-to-run noise. The first tick, which stamped all 10 slots
+under the lock with one extra `list-windows -a`, took 140 ms after against
+114 ms before. On the hook side, a state change into the Active set costs
++6–8 ms when the window already has its number (one `display-message`).
+When it has to stamp, it costs +19–26 ms (that read, the lock, one
+`list-windows -a` and an `rm`), against a 50–53 ms hook before. A
+heartbeat with no change is unaffected (25–28 ms both).
 
 ### 5. Agent event log (the sidebar's "log" section)
 

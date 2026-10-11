@@ -1,13 +1,18 @@
-//! Number-key labels (agent-roster.py `hotkey_labels` / `number_items`).
+//! Number-key labels: each agent's STICKY slot (`@agent_slot`).
 //!
-//! Rows 1-9 are always the single keys 1-9, however long the list: the top
-//! (NEEDS YOU, then the current session) is what gets pressed, and it must
-//! never wait on a timeout. Rows 10.. are `0` plus a FIXED-width number
-//! ("01".."09", or "001".."0NN" past 18 rows), so the set is prefix-free:
-//! every sequence is complete the moment its last digit lands. A bare `0` is
-//! NEVER a label: when the list shrinks under a half-typed number (11 → 10
-//! rows) a stale `01` stays inside the 0-namespace instead of acting on `0`
-//! and letting the `1` fall through into the agent pane just focused (a
+//! The watcher gives every agent window the lowest free number when it
+//! appears and frees it only when the agent goes (exits, closes, is parked);
+//! the others keep theirs. So `3` means the same agent for as long as it
+//! lives, in the menu and in the sidebar, whatever moves around it.
+//!
+//! Labels are FIXED-width: zero-padded to the digit count of the highest slot
+//! in use ([`slot_width`]). With slots up to 9 they are `1`..`9`; once any
+//! slot is 10 or more, every label is two digits (`03`, `12`). Equal widths
+//! make the set prefix-free, so a sequence is complete the moment its last
+//! digit lands and never waits on a timeout. A bare `0` is NEVER a label
+//! (slots start at 1): with two-digit labels it is a prefix that waits, and
+//! a stale `0` typed as the width shrinks stays a dead sequence instead of
+//! letting a following digit fall through to the agent pane just focused (a
 //! permission menu, where 1 = Yes).
 //!
 //! How a UI must consume them (Roster.digit): resolve a number against the
@@ -16,44 +21,53 @@
 //! (no timeout); one that matches nothing swallows further digits until a
 //! non-digit key. Inside a text filter, digits type.
 
-use std::collections::HashMap;
-
-/// The labels for `n` numbered rows, in display order.
-pub fn hotkey_labels(n: usize) -> Vec<String> {
-    if n <= 9 {
-        return (1..=n).map(|i| i.to_string()).collect();
-    }
-    let w = (n - 9).to_string().len();
-    (1..=9).map(|i| i.to_string()).chain((1..=n - 9).map(|k| format!("0{k:0w$}"))).collect()
+/// The label width for the highest slot in use: its digit count, 0 when no
+/// agent has a slot.
+pub fn slot_width(max_slot: Option<u32>) -> usize {
+    max_slot.map_or(0, |n| n.to_string().len())
 }
 
-/// number_items: {position: label} for every row `is_window` accepts, in
-/// order. A window listed twice gets two numbers; headers get none.
-pub fn number_items<T>(items: &[T], is_window: impl Fn(&T) -> bool) -> HashMap<usize, String> {
-    let pos: Vec<usize> = items.iter().enumerate().filter(|(_, it)| is_window(it)).map(|(i, _)| i).collect();
-    pos.iter().copied().zip(hotkey_labels(pos.len())).collect()
+/// A slot as drawn and typed: zero-padded to `width` digits.
+pub fn slot_label(slot: u32, width: usize) -> String {
+    format!("{slot:0width$}")
 }
 
 /// What a typed digit sequence means against a frame's labels.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DigitMatch {
-    /// A complete label: act on this row position.
-    Hit(usize),
+    /// A complete label: act on it.
+    Hit,
     /// A prefix of some label: wait for the next digit.
     Partial,
     /// Matches nothing: swallow digits until a non-digit key.
     Dead,
 }
 
-/// Resolve `typed` against `labels` ({position: label}, as drawn).
-pub fn match_digits(labels: &HashMap<usize, String>, typed: &str) -> DigitMatch {
-    if let Some((&p, _)) = labels.iter().find(|(_, l)| l.as_str() == typed) {
-        return DigitMatch::Hit(p);
+/// Resolve `typed` against `labels` (as drawn).
+pub fn match_digits<'a>(labels: impl IntoIterator<Item = &'a str>, typed: &str) -> DigitMatch {
+    let mut partial = false;
+    for l in labels {
+        if l == typed {
+            return DigitMatch::Hit;
+        }
+        partial |= l.starts_with(typed);
     }
-    if labels.values().any(|l| l.starts_with(typed)) {
+    if partial {
         DigitMatch::Partial
     } else {
         DigitMatch::Dead
+    }
+}
+
+/// The key bar's jump hint for a frame's labels: `3`, `1–7`, `01–12`.
+pub fn jump_hint<'a>(labels: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut v: Vec<&str> = labels.into_iter().collect();
+    v.sort_unstable(); // fixed width: string order is numeric order
+    v.dedup();
+    match v.as_slice() {
+        [] => None,
+        [one] => Some(one.to_string()),
+        [first, .., last] => Some(format!("{first}–{last}")),
     }
 }
 
@@ -62,43 +76,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn labels_unique_and_prefix_free() {
-        for n in 0..250 {
-            let ls = hotkey_labels(n);
-            assert_eq!(ls.len(), n);
-            let set: std::collections::HashSet<_> = ls.iter().collect();
-            assert_eq!(set.len(), n, "unique at {n}");
+    fn widths_and_labels() {
+        assert_eq!(slot_width(None), 0);
+        assert_eq!(slot_width(Some(1)), 1);
+        assert_eq!(slot_width(Some(9)), 1);
+        assert_eq!(slot_width(Some(10)), 2);
+        assert_eq!(slot_width(Some(99)), 2);
+        assert_eq!(slot_width(Some(100)), 3);
+        assert_eq!(slot_label(3, 1), "3");
+        assert_eq!(slot_label(3, 2), "03");
+        assert_eq!(slot_label(12, 2), "12");
+        assert_eq!(slot_label(7, 3), "007");
+        // Any set of slots at their width is prefix-free and has no bare 0.
+        for max in 1..=120u32 {
+            let w = slot_width(Some(max));
+            let ls: Vec<String> = (1..=max).map(|s| slot_label(s, w)).collect();
             for a in &ls {
                 assert_ne!(a, "0");
+                assert_eq!(a.len(), w);
                 for b in &ls {
-                    assert!(a == b || !b.starts_with(a.as_str()), "{a} prefixes {b} at n={n}");
+                    assert!(a == b || !b.starts_with(a.as_str()), "{a} prefixes {b} at max={max}");
                 }
             }
-            // Fixed width past 9.
-            if n > 9 {
-                let w = ls[9].len();
-                assert!(ls[9..].iter().all(|l| l.len() == w && l.starts_with('0')));
-            }
         }
-        assert_eq!(hotkey_labels(3), ["1", "2", "3"]);
-        assert_eq!(hotkey_labels(11)[9..], ["01", "02"]);
-        assert_eq!(hotkey_labels(18)[17], "09");
-        assert_eq!(hotkey_labels(19)[9..11], ["001", "002"]);
-        assert_eq!(hotkey_labels(19)[18], "010");
     }
 
     #[test]
-    fn numbering_and_matching() {
-        let items = ["hdr", "w", "w", "hdr", "w"];
-        let m = number_items(&items, |s| *s == "w");
-        assert_eq!(m.len(), 3);
-        assert_eq!((m[&1].as_str(), m[&2].as_str(), m[&4].as_str()), ("1", "2", "3"));
-        assert_eq!(match_digits(&m, "2"), DigitMatch::Hit(2));
-        assert_eq!(match_digits(&m, "7"), DigitMatch::Dead);
-        let many: Vec<&str> = vec!["w"; 12];
-        let m = number_items(&many, |_| true);
-        assert_eq!(match_digits(&m, "0"), DigitMatch::Partial);
-        assert_eq!(match_digits(&m, "03"), DigitMatch::Hit(11));
-        assert_eq!(match_digits(&m, "05"), DigitMatch::Dead);
+    fn matching() {
+        let one = ["1", "2", "4"];
+        assert_eq!(match_digits(one, "2"), DigitMatch::Hit);
+        assert_eq!(match_digits(one, "3"), DigitMatch::Dead); // a gap
+        assert_eq!(match_digits(one, "0"), DigitMatch::Dead);
+        let two = ["01", "04", "12"];
+        assert_eq!(match_digits(two, "0"), DigitMatch::Partial);
+        assert_eq!(match_digits(two, "1"), DigitMatch::Partial);
+        assert_eq!(match_digits(two, "04"), DigitMatch::Hit);
+        assert_eq!(match_digits(two, "12"), DigitMatch::Hit);
+        assert_eq!(match_digits(two, "03"), DigitMatch::Dead);
+        assert_eq!(match_digits(two, "4"), DigitMatch::Dead); // single digits are not labels at width 2
+        assert_eq!(match_digits([], "1"), DigitMatch::Dead);
+    }
+
+    #[test]
+    fn hints() {
+        assert_eq!(jump_hint([]), None);
+        assert_eq!(jump_hint(["3"]), Some("3".into()));
+        assert_eq!(jump_hint(["4", "1", "2"]), Some("1–4".into()));
+        assert_eq!(jump_hint(["12", "01", "04", "01"]), Some("01–12".into()));
     }
 }

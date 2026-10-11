@@ -37,6 +37,12 @@
 #                   command list, unset by SessionStart and clear_state, never
 #                   touched by the heartbeat. Not rendered in the tab bar —
 #                   they feed the sidebar (`list-windows -F '#{@agent_detail}'`).
+#   @agent_slot     the window's sticky agent number (agent-ui's number keys).
+#                   Stamped by set_state, under the slot lock and in the
+#                   state's own tmux call, when a window ENTERS the Active
+#                   set without a valid one; released and repaired only by
+#                   agent-tab-watcher.sh. Rules: SLOT CORE (shared verbatim
+#                   with the watcher) and docs/agent-tab-indicator.md.
 #
 # Rendering happens entirely in tmux.conf: the Catppuccin window formats
 # read these options via #{?…} conditionals (background tint per state,
@@ -114,6 +120,9 @@ agent="${2:-}"
 # The sidebar detail the next set_state writes (see set_state/take_detail).
 dkind=""
 dtext=""
+# set_state's @agent_pending op ("set" | "unset" | "") and its "wrote" flag.
+pend_op=""
+ss_wrote=0
 
 JQ="$(command -v jq || true)"
 # Codex hooks run in a shared app-server. Its inherited TMUX_PANE belongs to
@@ -234,6 +243,213 @@ ensure_watcher() {
 }
 ensure_watcher
 
+# ------------------------------------------------------------ agent slots
+# set_state STAMPS a window's @agent_slot the moment it puts the window in
+# the Active set (see SLOT CORE and slot_stamp), so a new agent has its
+# number before the watcher's next tick. The core needs bash 4+: under an
+# older bash the hook leaves all of it to the watcher's tick.
+SLOT_OK=0
+slot_locked=0
+if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ]; then
+SLOT_OK=1
+# >>> SLOT CORE >>> (byte-identical in agent-tab-watcher.sh and
+# agent-tab-indicator.sh; tests/test_agent_slots.py fails if they drift)
+# AGENT SLOTS: the sticky numbers agent-ui shows (docs/agent-tab-indicator.md,
+# "Agent slots"). A window holds @agent_slot while it is ACTIVE and VISIBLE:
+#   active  = @agent_state is running, failed, needs-input or done; OR
+#             @agent_state is idle AND @agent_pending is an epoch no older
+#             than 600 s (SLOT_PENDING_TTL: an answered prompt whose turn is
+#             about to resume - bounded, because a "No"/Esc answer fires no
+#             resume hook and the stamp would otherwise hold the number
+#             forever; a junk or empty stamp never counts); OR
+#             @agent_workflow is set; OR @agent_cua is set.
+#   visible = linked into at least one session outside SLOT_EXCLUDE (which is
+#             agent-jump.sh's EXCLUDE byte for byte).
+# Numbers are taken lowest first and never move while held. Bash 4+.
+SLOT_EXCLUDE=" agents tasks stash scratch btop-popup "
+SLOT_US=$'\x1f'
+# One `list-windows -a` row per window link, for slot_fold.
+SLOT_FMT="#{window_id}${SLOT_US}#{session_name}${SLOT_US}#{window_index}${SLOT_US}#{@agent_slot}${SLOT_US}#{@agent_state}${SLOT_US}#{@agent_pending}${SLOT_US}#{@agent_workflow}${SLOT_US}#{@agent_cua}"
+# S_SLOT = @agent_slot as read (set only), S_VIS = "session US index" of the
+# byte-smallest visible link (set = visible), S_ELIG = active.
+declare -A S_SLOT=() S_VIS=() S_ELIG=()
+slot_cmd=()
+slot_n=""
+SLOT_PENDING_TTL=600
+# slot_pending_fresh STAMP: an epoch (digits only, at most 18 of them) no
+# older than SLOT_PENDING_TTL. Builtin clock, no fork.
+slot_pending_fresh() {
+    local now
+    [[ $1 =~ ^[0-9]{1,18}$ ]] || return 1
+    printf -v now '%(%s)T' -1
+    [ $((now - 10#$1)) -le "$SLOT_PENDING_TTL" ]
+}
+# slot_active STATE PENDING WORKFLOW CUA
+slot_active() {
+    case "$1" in
+        running|failed|needs-input|done) return 0 ;;
+        idle) slot_pending_fresh "$2" && return 0 ;;
+    esac
+    [ -n "$3$4" ]
+}
+# A valid slot: canonical decimal 1..999999999 (no sign, no leading zero).
+slot_valid() { [[ $1 =~ ^[1-9][0-9]{0,8}$ ]]; }
+# slot_vis WIN SESSION INDEX: one link of WIN. Keeps the byte-order smallest
+# visible session (`[ \< ]` is strcmp whatever the locale; `[[ < ]]` would
+# collate) and the lower index on a tie.
+slot_vis() {
+    local v
+    case "$SLOT_EXCLUDE" in *" $2 "*) return 0 ;; esac
+    v="${S_VIS[$1]:-}"
+    if [ -z "$v" ] || [ "$2" \< "${v%%"$SLOT_US"*}" ] \
+       || { [ "$2" = "${v%%"$SLOT_US"*}" ] && [ "$3" -lt "${v#*"$SLOT_US"}" ] 2>/dev/null; }; then
+        S_VIS[$1]="$2$SLOT_US$3"
+    fi
+}
+# slot_fold ROWS: a `list-windows -a -F "$SLOT_FMT"` read into S_*.
+slot_fold() {
+    local w sess idx slot st pend wf cua
+    S_SLOT=(); S_VIS=(); S_ELIG=()
+    while IFS="$SLOT_US" read -r w sess idx slot st pend wf cua; do
+        case "$w" in @*) ;; *) continue ;; esac
+        [ -n "$slot" ] && S_SLOT[$w]="$slot"
+        slot_active "$st" "$pend" "$wf" "$cua" && S_ELIG[$w]=1
+        slot_vis "$w" "$sess" "$idx"
+    done <<<"$1"
+}
+# slot_after A B: does A fill after B? Session (bytes), index, window id.
+slot_after() {
+    local a="${S_VIS[$1]}" b="${S_VIS[$2]}" sa sb ia ib
+    sa="${a%%"$SLOT_US"*}"; ia="${a#*"$SLOT_US"}"; sb="${b%%"$SLOT_US"*}"; ib="${b#*"$SLOT_US"}"
+    [ "$sa" != "$sb" ] && { [ "$sa" \> "$sb" ]; return; }
+    case "$ia$ib" in
+        ''|*[!0-9]*) [ "$ia" != "$ib" ] && { [ "$ia" \> "$ib" ]; return; } ;;
+        *) [ "$ia" != "$ib" ] && { [ "$ia" -gt "$ib" ]; return; } ;;
+    esac
+    [ "${1#@}" -gt "${2#@}" ] 2>/dev/null
+}
+# reconcile_slots: into slot_cmd, the tmux command list (empty = nothing to
+# do) that makes every @agent_slot in S_* follow the rules: release a slot on
+# a window that is not active+visible; keep a valid one no other claims (on a
+# duplicate the lower window id, numerically, keeps it); give every other
+# active+visible window the lowest number nobody holds, in slot_after order.
+reconcile_slots() {
+    local w v keep i j
+    local -a need=()
+    local -A held=()
+    slot_cmd=()
+    for w in "${!S_SLOT[@]}"; do
+        [ -n "${S_ELIG[$w]:-}" ] && [ -n "${S_VIS[$w]:-}" ] && continue
+        slot_cmd+=(${slot_cmd[0]+\;} set-option -uw -t "$w" @agent_slot)
+    done
+    for w in "${!S_ELIG[@]}"; do
+        [ -n "${S_VIS[$w]:-}" ] || continue
+        v="${S_SLOT[$w]:-}"
+        if slot_valid "$v"; then
+            keep="${held[$v]:-}"
+            if [ -z "$keep" ]; then
+                held[$v]=$w
+            elif [ "${w#@}" -lt "${keep#@}" ] 2>/dev/null; then
+                held[$v]=$w; need+=("$keep")
+            else
+                need+=("$w")
+            fi
+        else
+            need+=("$w")
+        fi
+    done
+    [ "${#need[@]}" -gt 0 ] || return 0
+    for ((i = 1; i < ${#need[@]}; i++)); do
+        w="${need[i]}"; j=$((i - 1))
+        while [ "$j" -ge 0 ] && slot_after "${need[j]}" "$w"; do
+            need[j+1]="${need[j]}"; j=$((j - 1))
+        done
+        need[j+1]="$w"
+    done
+    v=1
+    for w in "${need[@]}"; do
+        while [ -n "${held[$v]:-}" ]; do v=$((v + 1)); done
+        held[$v]=$w
+        slot_cmd+=(${slot_cmd[0]+\;} set-option -w -t "$w" @agent_slot "$v")
+    done
+}
+# slot_take WIN: WIN is becoming active - into slot_n the lowest number no
+# OTHER active+visible window holds, and into slot_cmd the unsets that free it
+# on any window still carrying it stale (inactive or hidden, not yet released
+# by a tick), so the number moves in the same command as the stamp.
+slot_take() {
+    local w v
+    local -A held=()
+    slot_cmd=()
+    for w in "${!S_ELIG[@]}"; do
+        [ "$w" != "$1" ] && [ -n "${S_VIS[$w]:-}" ] || continue
+        v="${S_SLOT[$w]:-}"
+        slot_valid "$v" && held[$v]=1
+    done
+    slot_n=1
+    while [ -n "${held[$slot_n]:-}" ]; do slot_n=$((slot_n + 1)); done
+    for w in "${!S_SLOT[@]}"; do
+        [ "$w" != "$1" ] && [ "${S_SLOT[$w]}" = "$slot_n" ] || continue
+        slot_cmd+=(\; set-option -uw -t "$w" @agent_slot)
+    done
+}
+# THE SLOT LOCK: every read-decide-write of @agent_slot (a hook stamping its
+# window, a watcher tick repairing) runs under it, so two writers can never
+# hand out one number. A file created O_EXCL (noclobber, builtin) holding
+# "<pid> <epoch>". NOT `tmux wait-for -L`: measured on tmux 3.7c, a waiter
+# that is killed stays queued as a ghost that swallows a later -U, and a
+# holder killed mid-section leaves the channel locked for good - every later
+# hook and tick would block forever. Here a dead holder (kill -0) or a hold
+# past SLOT_STALE seconds is broken by the next waiter. A LIVE holder is not
+# waited out: a section takes milliseconds, so a waiter that sees the same
+# live pid on SLOT_GIVEUP consecutive polls (~50-75 ms) gives up - the hook
+# skips its stamp (the watcher's next tick stamps it), the watcher retries
+# next tick. If a break ever races, the worst case is a duplicate, which the
+# tick repairs.
+SLOT_LOCK="${TMPDIR:-/tmp}"
+SLOT_LOCK="${SLOT_LOCK%/}/agent-slot.${UID:-$(id -u)}.lock"
+SLOT_STALE=2
+SLOT_GIVEUP=3
+slot_lock() {
+    local i hp ht now last="" seen=0
+    for ((i = 0; i < 40; i++)); do
+        printf -v now '%(%s)T' -1
+        if { set -C; printf '%s %s\n' "$$" "$now" > "$SLOT_LOCK"; } 2>/dev/null; then
+            set +C
+            return 0
+        fi
+        set +C
+        hp=""; ht=""
+        # stderr first: a lock released since the create is a missing file
+        # (no message), and `|| true` keeps a set -e caller alive.
+        read -r hp ht 2>/dev/null < "$SLOT_LOCK" || true
+        case "$hp" in *[!0-9]*) hp="" ;; esac
+        case "$ht" in ''|*[!0-9]*) ht="$now" ;; esac
+        if { [ -n "$hp" ] && ! kill -0 "$hp" 2>/dev/null; } \
+           || { [ -z "$hp" ] && [ "$i" -ge 8 ]; } \
+           || [ $((now - 10#$ht)) -ge "$SLOT_STALE" ]; then
+            rm -f "$SLOT_LOCK" 2>/dev/null
+            last=""; seen=0
+            continue
+        fi
+        if [ -n "$hp" ]; then
+            if [ "$hp" = "$last" ]; then seen=$((seen + 1)); else last=$hp; seen=1; fi
+            [ "$seen" -ge "$SLOT_GIVEUP" ] && return 1
+        fi
+        sleep 0.025 2>/dev/null
+    done
+    return 1
+}
+# Release only our own hold (a breaker may have taken it from a stalled us).
+slot_unlock() {
+    local hp=""
+    read -r hp _ 2>/dev/null < "$SLOT_LOCK" || true
+    [ "$hp" != "$$" ] || rm -f "$SLOT_LOCK" 2>/dev/null
+    return 0
+}
+# <<< SLOT CORE <<<
+fi
+
 # ---------------------------------------------------------------- helpers
 
 window_state() {
@@ -271,9 +487,19 @@ set_state() {
     # @agent_kind rides along on any write made by an agent hook. The
     # heartbeat sets no detail, so its no-change call stays fork-free.
     # The detail is never rendered by the status line: no refresh for it.
-    local win="$1" new="$2" dk="$dkind" dt="$dtext" cur ts
+    #
+    # pend_op (global, consumed like dkind): "set" stamps @agent_pending,
+    # "unset" removes it, IN this command list. idle + pending holds the
+    # window's agent slot, so the pair must never be seen half-written: a
+    # stamp under the slot lock in between would read bare idle and give the
+    # number away. ss_wrote=1 says this call reached the write (callers fall
+    # back to their own pending write when it did not, as before).
+    #
+    # A change INTO the Active set stamps @agent_slot here (slot_stamp), in
+    # the same command list, when the window has no valid one.
+    local win="$1" new="$2" dk="$dkind" dt="$dtext" po="$pend_op" cur ts
     local -a cmd=()
-    dkind=""; dtext=""
+    dkind=""; dtext=""; pend_op=""; ss_wrote=0
     owns_window "$win" || return 0
     cur=$(window_state "$win")
     if [ "$cur" != "$new" ]; then
@@ -288,12 +514,58 @@ set_state() {
         cmd+=(${cmd[0]+\;} set-option -w -t "$win" @agent_detail_kind "$dk" \;
               set-option -w -t "$win" @agent_detail "$dt")
     fi
+    local pts=""   # the pending stamp this call writes (slot_active reads it)
+    case "$po" in
+        set) printf -v pts '%(%s)T' -1 2>/dev/null || pts=$(date +%s)
+             cmd+=(${cmd[0]+\;} set-option -w -t "$win" @agent_pending "$pts") ;;
+        unset) cmd+=(${cmd[0]+\;} set-option -uw -t "$win" @agent_pending) ;;
+    esac
     [ "${#cmd[@]}" -gt 0 ] || return 0
     case "$agent" in
         claude|codex) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
     esac
+    slot_locked=0
+    if [ "$SLOT_OK" = 1 ] && { [ "$cur" != "$new" ] || [ "$po" = set ]; } \
+       && slot_active "$new" "$pts" "" ""; then
+        slot_stamp "$win"
+    fi
     tmux "${cmd[@]}" 2>/dev/null || true
+    if [ "$slot_locked" = 1 ]; then
+        slot_unlock
+        slot_locked=0
+        trap - INT TERM HUP
+    fi
+    ss_wrote=1
     [ "$cur" = "$new" ] || tmux refresh-client -S 2>/dev/null || true
+}
+
+# slot_stamp WIN, from set_state: WIN is entering the Active set. Appends
+# `@agent_slot N` (plus the unsets that move N off any window still carrying
+# it stale) to set_state's cmd, so the number lands in the SAME tmux call as
+# the state. A cheap look first, no lock, no list: a window that already has a
+# valid slot keeps it (that is what makes it sticky), and one whose session is
+# hidden is left to the watcher (which finds a visible link if it has one).
+# Otherwise the slot lock (SLOT CORE) is taken and held until set_state has
+# written: one list-windows -a, the lowest number no other active window
+# holds. A lock not won in ~1 s skips the stamp; the watcher's tick does it.
+slot_stamp() {
+    local w="$1" pre s sess rows
+    pre=$(tmux display-message -p -t "$w" "#{@agent_slot}${SLOT_US}#{session_name}" 2>/dev/null || true)
+    s="${pre%%"$SLOT_US"*}"
+    slot_valid "$s" && return 0
+    sess=""
+    case "$pre" in *"$SLOT_US"*) sess="${pre#*"$SLOT_US"}" ;; esac
+    case "$SLOT_EXCLUDE" in *" $sess "*) return 0 ;; esac
+    slot_lock || return 0
+    slot_locked=1
+    # A signal mid-section exits through the unlock (set_state clears this).
+    trap 'slot_unlock; exit 0' INT TERM HUP
+    rows=$(tmux list-windows -a -F "$SLOT_FMT" 2>/dev/null || true)
+    slot_fold "$rows"
+    [ -n "${S_VIS[$w]:-}" ] || return 0           # gone, or hidden everywhere
+    slot_valid "${S_SLOT[$w]:-}" && return 0      # stamped since the look
+    slot_take "$w"
+    cmd+=(\; set-option -w -t "$w" @agent_slot "$slot_n" "${slot_cmd[@]}")
 }
 
 clear_state() {
@@ -711,16 +983,23 @@ if [ "$mode" = "clear-current" ]; then
     fi
     [ -n "$win" ] || exit 0
     case "$(window_state "$win")" in
-        needs-*|failed)
+        needs-*)
             # The user came to answer the prompt. Discharge the tint, but
             # stamp @agent_pending so the next heartbeat can restore
             # `running` once the answered turn resumes — the discharge
             # happens BEFORE any post-answer heartbeat, so heartbeat's own
-            # needs-input re-arm can never fire in this flow.
+            # needs-input re-arm can never fire in this flow. The stamp rides
+            # in set_state's own command (pend_op): idle + pending keeps the
+            # window's agent slot (for up to 600 s, see SLOT CORE), and must
+            # never be seen half-written.
+            pend_op=set
             set_state "$win" idle
-            tmux set-option -w -t "$win" @agent_pending "$(now_epoch)" 2>/dev/null || true
+            [ "$ss_wrote" = 1 ] || tmux set-option -w -t "$win" @agent_pending "$(now_epoch)" 2>/dev/null || true
             ;;
-        done) set_state "$win" idle ;;
+        # A seen FAILED gets no pending: a dead turn never resumes (no
+        # heartbeat follows it; a new prompt sets running by itself), and the
+        # stamp would only hold the window's agent slot for nothing.
+        failed|done) set_state "$win" idle ;;
     esac
     exit 0
 fi
@@ -868,12 +1147,18 @@ if [ "$mode" = "heartbeat" ]; then
             # resuming (see clear-current). Single-use and age-gated, so a
             # stray late tool call can't resurrect a tab that merely sat
             # idle; bare idle (no stamp) stays inert as before.
+            # The consume rides in set_state's command (pend_op): running and
+            # the unset land together, so the window's agent slot (held by
+            # idle + pending) is never seen free in between.
             pend=$(tmux show-options -wqv -t "$win" @agent_pending 2>/dev/null || true)
             if [ -n "$pend" ]; then
-                clear_pending "$win"
                 case "$pend" in *[!0-9]*) pend=0 ;; esac
                 if [ "$(( $(now_epoch) - pend ))" -lt 3600 ]; then
+                    pend_op=unset
                     set_state "$win" running
+                    [ "$ss_wrote" = 1 ] || clear_pending "$win"
+                else
+                    clear_pending "$win"
                 fi
             fi
             ;;
@@ -1047,8 +1332,9 @@ case "$mode" in
             esac
         fi
         if viewing_now; then
+            pend_op=set   # in the state's own command, as clear-current
             set_state "$win" idle
-            tmux set-option -w -t "$win" @agent_pending "$(now_epoch)" 2>/dev/null || true
+            [ "$ss_wrote" = 1 ] || tmux set-option -w -t "$win" @agent_pending "$(now_epoch)" 2>/dev/null || true
         else
             set_state "$win" needs-input
         fi

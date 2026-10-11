@@ -4,11 +4,24 @@
 //! tests can record instead of act.
 //!
 //! What the Python did and this keeps:
-//! - Numbers are resolved against the labels of the frame ON SCREEN when the
-//!   first digit was pressed ([`Menu::drawn`], set by the renderer), never a
-//!   list rebuilt since; a complete label acts at once, a prefix waits with
-//!   no timeout, and a number that matches nothing swallows every further
-//!   digit until another key (`Roster.digit`).
+//! - Numbers are resolved against the frame ON SCREEN when the first digit
+//!   was pressed ([`Menu::drawn`], set by the renderer), never a list
+//!   rebuilt since; a complete label acts at once, a prefix waits with no
+//!   timeout, and a number that matches nothing swallows every further digit
+//!   until another key (`Roster.digit`).
+//!
+//! What a number means changed: it is the agent's sticky SLOT, not a row
+//! position. The digit-resolution rule:
+//! - The drawn frame records every slot in the data it was drawn from
+//!   ([`Drawn::slots`], [`slot_targets`]), on screen or not, each with the
+//!   window that held it then. A slot scrolled off, filtered out by the
+//!   search or on another tab still jumps: `3` always means agent 3.
+//! - A slot that is in no agent's hands in that frame is a dead number.
+//! - The jump goes to the WINDOW ID recorded at draw time. If that agent
+//!   has gone since and the watcher handed its number to a new agent, the
+//!   number still means the old window (gone: the jump fails and says so),
+//!   never the newcomer; tmux never reuses a window id while the server
+//!   lives. The newcomer is reachable by its number once a frame shows it.
 //! - A key that opens a y/n or the peek drops the rest of its read, so a
 //!   paste or a fast "xy" never confirms itself (`Roster.handle`).
 //! - Option-W closes the menu in every mode (`Roster.act`).
@@ -19,13 +32,30 @@
 //! What the new layout changes is listed on [`Menu::act`].
 
 use super::keys::{Key, Mouse};
-use super::rows::{build_rows, need_of, number_rows, Data, Row, RowKey, Tab, Target};
+use super::rows::{build_rows, need_of, number_rows, slot_targets, Data, Row, RowKey, Tab, Target};
 use crate::actions::TAB_MOVED;
 use crate::ansi::StyledLine;
 use crate::hotkeys::{match_digits, DigitMatch};
 use crate::view::Need;
 use ratatui::layout::Rect;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+/// What the frame on screen offers the keys (set by the renderer).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Drawn {
+    /// The selectable rows on screen, in display order (numbered or not).
+    pub rows: Vec<Target>,
+    /// Number label → the row it goes to, for every slot in the frame's
+    /// data ([`slot_targets`]): what digits resolve against.
+    pub slots: BTreeMap<String, Target>,
+}
+
+impl Drawn {
+    /// The frame of `d` with `rows` on screen.
+    pub fn of(d: &Data, rows: Vec<Target>) -> Drawn {
+        Drawn { slots: slot_targets(d, &rows), rows }
+    }
+}
 
 /// Everything the menu can do to the outside world (the Python's `jump`,
 /// `run_bg` and `agent_pane` calls). `Err` carries the footer text.
@@ -141,7 +171,8 @@ pub struct Menu {
     /// `a`: plain windows too (the Python's `show_all`).
     pub show_all: bool,
     pub rows: Vec<Row>,
-    /// Row position → hotkey label, over the whole list.
+    /// Row position → its agent's slot label, over the whole list (rows
+    /// without a slot have none).
     pub labels: HashMap<usize, String>,
     pub sel: Option<RowKey>,
     /// First list line on screen, and whether the next draw must scroll the
@@ -158,14 +189,14 @@ pub struct Menu {
     pub peek_full: Option<Target>,
     pub msg: String,
     pub msg_until: f64,
-    /// A 0-prefixed number being typed, and the frame it is resolved against.
+    /// A number being typed, and the frame it is resolved against.
     pub digits: String,
-    digit_frame: (Vec<Target>, HashMap<usize, String>),
+    digit_frame: Drawn,
     /// A number matched nothing: swallow digits until another key.
     pub digits_dead: bool,
-    /// The rows on screen in the last frame with their labels (set by the
-    /// renderer): numbers resolve against this.
-    pub drawn: (Vec<Target>, HashMap<usize, String>),
+    /// The last frame's rows on screen and its slots (set by the renderer):
+    /// numbers resolve against this.
+    pub drawn: Drawn,
     /// The last frame's click map.
     pub clicks: Vec<(Rect, Hit)>,
     /// Captured panes by (window, session).
@@ -205,9 +236,9 @@ impl Menu {
             msg: String::new(),
             msg_until: 0.0,
             digits: String::new(),
-            digit_frame: (Vec::new(), HashMap::new()),
+            digit_frame: Drawn::default(),
             digits_dead: false,
-            drawn: (Vec::new(), HashMap::new()),
+            drawn: Drawn::default(),
             clicks: Vec::new(),
             peeks: HashMap::new(),
             preview_rows: 0,
@@ -252,7 +283,7 @@ impl Menu {
             if self.rows_tab == self.tab { self.rows.iter().filter_map(Row::key).collect() } else { Vec::new() };
         self.rows = build_rows(&self.data, self.tab, &self.query, self.show_all);
         self.rows_tab = self.tab;
-        self.labels = number_rows(&self.rows);
+        self.labels = number_rows(&self.rows, self.data.view.slot_width);
         let keys: Vec<RowKey> = self.rows.iter().filter_map(Row::key).collect();
         // An empty list (a blank snapshot, a search typo) keeps the selection
         // for when the rows come back.
@@ -315,7 +346,7 @@ impl Menu {
 
     /// The row is in the frame on screen (its number is drawn).
     pub fn on_screen(&self, key: &RowKey) -> bool {
-        self.drawn.0.iter().any(|t| t.key == *key)
+        self.drawn.rows.iter().any(|t| t.key == *key)
     }
 
     /// The frame just written to the terminal is the one `render` last drew:
@@ -404,7 +435,7 @@ impl Menu {
         false
     }
 
-    /// agent-roster.py `digit`.
+    /// agent-roster.py `digit`, by slot (see the module docs for the rule).
     fn digit(&mut self, c: char, fx: &mut dyn Effects) -> bool {
         if self.digits_dead {
             return false;
@@ -413,15 +444,15 @@ impl Menu {
             self.digit_frame = self.drawn.clone();
         }
         self.digits.push(c);
-        match match_digits(&self.digit_frame.1, &self.digits) {
-            DigitMatch::Hit(i) => {
+        match match_digits(self.digit_frame.slots.keys().map(String::as_str), &self.digits) {
+            DigitMatch::Hit => {
+                let t = self.digit_frame.slots[&self.digits].clone();
                 self.digits.clear();
-                let t = self.digit_frame.0[i].clone();
                 self.go(&t, fx)
             }
             DigitMatch::Partial => false,
             DigitMatch::Dead => {
-                self.say(format!("no row {} on screen · digits ignored until another key", self.digits));
+                self.say(format!("no agent {} · digits ignored until another key", self.digits));
                 self.digits.clear();
                 self.digits_dead = true;
                 false
@@ -713,15 +744,8 @@ pub(crate) mod tests {
 
     /// Mark every row as drawn (as a tall-enough frame would).
     pub fn draw_all(m: &mut Menu) {
-        let mut targets = Vec::new();
-        let mut labels = HashMap::new();
-        for (i, r) in m.rows.iter().enumerate() {
-            if let (Some(t), Some(l)) = (r.target(), m.labels.get(&i)) {
-                labels.insert(targets.len(), l.clone());
-                targets.push(t);
-            }
-        }
-        m.drawn = (targets, labels);
+        let targets = m.rows.iter().filter_map(Row::target).collect();
+        m.drawn = Drawn::of(&m.data, targets);
         m.drawn_sel = m.selected_target();
     }
 
@@ -765,19 +789,27 @@ pub(crate) mod tests {
         assert_eq!(m.sel, Some(RowKey::Agent("work".into(), "@6".into())));
     }
 
-    /// HotkeyTests: `n` idle windows main:1..n, the client on @1.
-    fn many(n: u32) -> Menu {
+    /// Running agents main:1..n (`@i` holding slot i, as the watcher would
+    /// have stamped), the client on @1.
+    fn agents(n: u32, extra: &[String]) -> Data {
         let mut rows: Vec<String> = (1..=n)
-            .map(|i| crate::tmux::tests::row("main", i, &format!("@{i}"), &[("state", "idle"), ("summary", &format!("w{i}"))]))
+            .map(|i| crate::tmux::tests::row("main", i, &format!("@{i}"),
+                &[("state", "running"), ("summary", &format!("w{i}")), ("slot", &i.to_string())]))
             .collect();
+        rows.extend(extra.iter().cloned());
         rows.push("\x1fclient\x1f/dev/ttys999\x1f@1\x1fmain".into());
         let snap = crate::tmux::Snapshot::parse(&rows.join("\n"));
-        let d = Data::build(&snap, Some("/dev/ttys999"), 1000.0, &crate::Collator::new("C"), None, Some(1.0));
-        let mut m = Menu::new(d, Tab::All);
+        Data::build(&snap, Some("/dev/ttys999"), 1000.0, &crate::Collator::new("C"), None, Some(1.0))
+    }
+
+    /// HotkeyTests: [`agents`] in a menu on the All tab, drawn.
+    fn many(n: u32) -> Menu {
+        let mut m = Menu::new(agents(n, &[]), Tab::All);
         draw_all(&mut m);
         m
     }
 
+    /// The same menu after `win` closed (its slot freed; nobody else's moves), redrawn.
     fn without(m: &mut Menu, win: &str) {
         let mut d = m.data.clone();
         for s in &mut d.view.spaces {
@@ -794,21 +826,24 @@ pub(crate) mod tests {
         assert_eq!(fx.calls, ["go @3 main"]);
     }
 
-    /// test_past_ten_rows.
+    /// Slots of 10+ make every label two digits: a single digit waits (no
+    /// timer), the second completes it.
     #[test]
-    fn past_ten_rows() {
+    fn past_slot_nine() {
         let mut fx = Rec::default();
         let mut m = many(12);
-        assert!(m.handle(&[Char('1')], &mut fx)); // 1 still acts on the first key
-        assert!(!m.handle(&[Char('0')], &mut fx)); // 0 waits, no timer
-        assert_eq!((fx.calls.len(), m.digits.as_str()), (1, "0"));
+        assert!(m.labels.values().all(|l| l.len() == 2));
+        assert!(!m.handle(&[Char('1')], &mut fx)); // 1 waits: 10, 11, 12
+        assert_eq!((fx.calls.len(), m.digits.as_str()), (0, "1"));
         assert!(m.handle(&[Char('2')], &mut fx));
-        assert_eq!(fx.calls[1], "go @11 main"); // "02": the 11th row
+        assert_eq!(fx.calls[0], "go @12 main");
         assert!(many(12).handle(&keys("03"), &mut fx)); // both digits in one read
-        assert_eq!(fx.calls[2], "go @12 main");
-        let mut m = many(10); // exactly ten: the tenth is 01, a bare 0 never completes
+        assert_eq!(fx.calls[1], "go @3 main");
+        let mut m = many(10); // exactly ten: two digits, a bare 0 never completes
         assert!(!m.handle(&[Char('0')], &mut fx));
         assert!(m.handle(&[Char('1')], &mut fx));
+        assert_eq!(fx.calls[2], "go @1 main");
+        assert!(many(10).handle(&keys("10"), &mut fx));
         assert_eq!(fx.calls[3], "go @10 main");
     }
 
@@ -823,9 +858,9 @@ pub(crate) mod tests {
         m.handle(&[Char('0')], &mut fx);
         m.handle(&[Backspace], &mut fx);
         assert!(m.digits.is_empty());
-        m.handle(&keys("09"), &mut fx); // no row 09 (only 01-03)
+        m.handle(&keys("13"), &mut fx); // no slot 13 (only 01-12)
         assert!(fx.calls.is_empty());
-        assert!(m.msg.contains("no row 09"));
+        assert!(m.msg.contains("no agent 13"), "{}", m.msg);
         let sel = m.sel.clone();
         m.handle(&[Char('j')], &mut fx); // another key ends the swallowing and still moves
         assert_ne!(m.sel, sel);
@@ -839,31 +874,40 @@ pub(crate) mod tests {
     #[test]
     fn dead_number_swallows_its_tail() {
         let mut fx = Rec::default();
-        let mut m = many(19);
-        let i = m.drawn.1.iter().find(|(_, l)| l.as_str() == "005").map(|(i, _)| *i).unwrap();
-        assert_eq!(m.drawn.0[i].win, "@14");
-        without(&mut m, "@3"); // the new frame: 18 rows, 01-09
-        assert!(!m.drawn.1.values().any(|l| l == "005"));
-        assert!(!m.handle(&keys("005"), &mut fx));
+        let mut m = many(12);
+        without(&mut m, "@5"); // 5 freed: a gap, everyone else keeps theirs
+        assert!(!m.drawn.slots.contains_key("05") && m.drawn.slots["06"].win == "@6");
+        assert!(!m.handle(&keys("05"), &mut fx));
         assert!(fx.calls.is_empty());
-        assert!(m.msg.contains("no row 00"));
-        assert!(!m.handle(&[Char('5')], &mut fx)); // still swallowed, in a later read too
+        assert!(m.msg.contains("no agent 05"), "{}", m.msg);
+        assert!(!m.handle(&[Char('0'), Char('6')], &mut fx)); // still swallowed, in a later read too
         assert!(fx.calls.is_empty());
         m.handle(&[Esc], &mut fx); // esc ends it without closing
-        assert!(m.handle(&[Char('5')], &mut fx)); // a fresh 5 is a jump again
+        assert!(m.handle(&keys("06"), &mut fx)); // a fresh 06 is a jump again
         assert_eq!(fx.calls, ["go @6 main"]);
+        // A first digit no label starts with is dead at once.
+        let mut m = many(12);
+        assert!(!m.handle(&keys("27"), &mut fx));
+        assert!(m.msg.contains("no agent 2") && m.digits_dead, "{}", m.msg);
     }
 
-    /// test_ten_rows_after_eleven.
+    /// The label width shrinks under a half-typed `0` (the agent holding 10
+    /// went): the `0` still resolves against the frame it was typed in; and
+    /// against the new one-digit frame a bare `0` is dead and swallows the
+    /// digit after it, which must never fall through into the agent pane.
     #[test]
-    fn ten_rows_after_eleven() {
+    fn width_shrinks_under_a_zero() {
         let mut fx = Rec::default();
-        let mut m = many(11);
-        without(&mut m, "@2");
-        assert!(!m.handle(&[Char('0')], &mut fx));
-        assert!(fx.calls.is_empty());
-        assert!(m.handle(&[Char('1')], &mut fx));
-        assert_eq!(fx.calls, ["go @11 main"]);
+        let mut m = many(10);
+        m.handle(&[Char('0')], &mut fx);
+        m.set_data(agents(9, &[]));
+        draw_all(&mut m);
+        assert_eq!(m.data.view.slot_width, 1);
+        assert!(m.handle(&[Char('1')], &mut fx)); // "01" of the first frame
+        assert_eq!(fx.calls, ["go @1 main"]);
+        assert!(!m.handle(&keys("01"), &mut fx)); // a fresh 0: dead, and its 1 swallowed
+        assert_eq!(fx.calls.len(), 1);
+        assert!(m.digits_dead);
     }
 
     /// test_sequence_resolves_against_the_first_keys_frame.
@@ -871,13 +915,14 @@ pub(crate) mod tests {
     fn sequence_resolves_against_the_first_keys_frame() {
         let mut fx = Rec::default();
         let mut m = many(19);
-        m.handle(&[Char('0')], &mut fx);
-        without(&mut m, "@3"); // redrawn mid-number
-        assert!(m.handle(&keys("05"), &mut fx));
-        assert_eq!(fx.calls, ["go @14 main"]); // what 005 said when the number was started
+        m.handle(&[Char('1')], &mut fx);
+        without(&mut m, "@15"); // redrawn mid-number: 15 freed
+        assert!(m.handle(&keys("5"), &mut fx));
+        assert_eq!(fx.calls, ["go @15 main"]); // what 15 said when the number was started
     }
 
-    /// test_digits_type_in_the_filter.
+    /// test_digits_type_in_the_filter; then digits are slots again, and a
+    /// slot the search filtered out still jumps.
     #[test]
     fn digits_type_in_the_search() {
         let mut fx = Rec::default();
@@ -889,20 +934,70 @@ pub(crate) mod tests {
         assert!(fx.calls.is_empty());
         m.handle(&[Enter], &mut fx);
         draw_all(&mut m);
-        assert_eq!(m.drawn.0.len(), 1);
-        assert!(m.handle(&[Char('1')], &mut fx));
+        assert_eq!(m.drawn.rows.len(), 1);
+        assert!(m.handle(&keys("11"), &mut fx));
         assert_eq!(fx.calls, ["go @11 main"]);
+        assert!(m.handle(&keys("03"), &mut fx)); // not listed under "11": goes anyway
+        assert_eq!(fx.calls[1], "go @3 main");
     }
 
-    /// test_number_means_the_row_as_displayed: not-drawn rows are not acted on.
+    /// A number means its agent wherever it is: scrolled off screen, on
+    /// another tab. But only the agents in the frame's data: one that
+    /// appeared since the last draw has no number until a frame shows it.
     #[test]
-    fn number_means_the_row_as_displayed() {
+    fn slots_jump_off_screen_but_not_ahead_of_the_frame() {
         let mut fx = Rec::default();
         let mut m = many(30);
-        m.drawn.0.truncate(5);
-        m.drawn.1.retain(|i, _| *i < 5);
-        assert!(!m.handle(&[Char('9')], &mut fx));
-        assert!(fx.calls.is_empty());
+        m.drawn = Drawn::of(&m.data, m.drawn.rows[..5].to_vec()); // a short frame: rows 1-5 on screen
+        assert!(m.handle(&keys("09"), &mut fx));
+        assert_eq!(fx.calls, ["go @9 main"]);
+        let mut m = Menu::new(agents(4, &[]), Tab::Needs); // nothing on this tab
+        draw_all(&mut m);
+        assert!(m.drawn.rows.is_empty());
+        assert!(m.handle(&[Char('2')], &mut fx));
+        assert_eq!(fx.calls[1], "go @2 main");
+        // @5 joins after the draw: 5 is not a number yet.
+        m.set_data(agents(5, &[]));
+        assert!(!m.handle(&[Char('5')], &mut fx));
+        assert_eq!(fx.calls.len(), 2);
+        m.handle(&[Esc], &mut fx);
+        draw_all(&mut m);
+        assert!(m.handle(&[Char('5')], &mut fx));
+        assert_eq!(fx.calls[2], "go @5 main");
+    }
+
+    /// The safety rule: a slot freed and handed to a new agent between frames
+    /// still means the window that held it when the frame was drawn.
+    #[test]
+    fn freed_slot_reassigned_between_frames() {
+        use crate::tmux::tests::row;
+        let build = |rows: Vec<String>| {
+            let mut rows = rows;
+            rows.push("\x1fclient\x1f/dev/ttys999\x1f@1\x1fmain".into());
+            Data::build(&crate::tmux::Snapshot::parse(&rows.join("\n")), Some("/dev/ttys999"), 1000.0,
+                &crate::Collator::new("C"), None, Some(1.0))
+        };
+        let stamped = |i: u32, state: &str| row("main", i, &format!("@{i}"), &[("state", state), ("slot", &i.to_string())]);
+        let mut fx = Rec::default();
+        let mut m = many(4);
+        assert_eq!(m.drawn.slots["3"].win, "@3");
+        // @3 closes; @9 appears unstamped and takes 3, the lowest free number.
+        let d = build(vec![stamped(1, "running"), stamped(2, "running"), stamped(4, "running"),
+            row("main", 9, "@9", &[("state", "running")])]);
+        assert_eq!(d.view.agents().find(|a| a.window_id == "@9").and_then(|a| a.slot), Some(3));
+        m.set_data(d); // no frame shows it yet
+        assert!(m.handle(&[Char('3')], &mut fx));
+        assert_eq!(fx.calls, ["go @3 main"]); // the old window (gone: the real go refuses), never @9
+        draw_all(&mut m);
+        assert!(m.handle(&[Char('3')], &mut fx));
+        assert_eq!(fx.calls[1], "go @9 main");
+        // The same when the old holder only went idle (its stamp is stale).
+        let mut fx = Rec::default();
+        let mut m = many(4);
+        m.set_data(build(vec![stamped(1, "running"), stamped(2, "running"), stamped(3, "idle"), stamped(4, "running"),
+            row("main", 9, "@9", &[("state", "failed")])]));
+        assert!(m.handle(&[Char('3')], &mut fx));
+        assert_eq!(fx.calls, ["go @3 main"]);
     }
 
     #[test]
@@ -1013,7 +1108,7 @@ pub(crate) mod tests {
     fn keys_refuse_a_row_off_screen() {
         let mut fx = Rec::default();
         let mut m = menu();
-        m.drawn.0.retain(|t| t.key != RowKey::Need("@6".into()));
+        m.drawn.rows.retain(|t| t.key != RowKey::Need("@6".into()));
         m.follow = false;
         for k in [Enter, Char('x'), Char('s'), Char('p'), Char(' ')] {
             assert!(!m.act(k, &mut fx));
@@ -1262,18 +1357,31 @@ pub(crate) mod tests {
     }
 
     /// Numbers resolve against the frame on screen, on the Active tab too:
-    /// a row that joined since the draw shifts nothing until the next draw.
+    /// an agent that joined since the draw has no number until the next
+    /// draw, and the joiner never moves anyone else's.
     #[test]
     fn active_digits_resolve_against_the_drawn_frame() {
+        use super::super::rows::tests::{data_of, stamped};
+        let held = [("@1", "1"), ("@2", "2"), ("@3", "3"), ("@6", "4")];
         let mut fx = Rec::default();
-        let mut m = active();
-        assert_eq!(m.labels.values().filter(|l| l.as_str() == "4").count(), 1);
-        m.set_data(with_state("@4", "running")); // main:@4 is now row 4
-        assert!(m.handle(&[Char('4')], &mut fx));
-        assert_eq!(fx.calls, ["go @6 work"]); // what 4 said on screen
+        let mut m = Menu::new(data_of(&stamped(&held)), Tab::Active);
         draw_all(&mut m);
+        assert_eq!(m.labels.values().filter(|l| l.as_str() == "3").count(), 2); // main:@3 and its linked work row
+        let mut snap = stamped(&held);
+        for w in snap.windows.iter_mut().filter(|w| w.id == "@4") {
+            w.state = "running".into(); // main:@4 joins the set: it takes 5
+        }
+        m.set_data(data_of(&snap));
+        assert_eq!(m.labels.values().filter(|l| l.as_str() == "4").count(), 1);
         assert!(m.handle(&[Char('4')], &mut fx));
+        assert_eq!(fx.calls, ["go @6 work"]); // 4 is still @6
+        assert!(!m.handle(&[Char('5')], &mut fx)); // not drawn yet
+        m.handle(&[Esc], &mut fx);
+        draw_all(&mut m);
+        assert!(m.handle(&[Char('5')], &mut fx));
         assert_eq!(fx.calls[1], "go @4 main");
+        assert!(m.handle(&[Char('3')], &mut fx)); // linked, both rows on screen: the first drawn (main)
+        assert_eq!(fx.calls[2], "go @3 main");
     }
 
     #[test]

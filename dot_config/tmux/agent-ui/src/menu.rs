@@ -145,8 +145,8 @@ impl Source {
 
     pub fn load(&mut self) -> Data {
         self.core.snapshot = self.core.tmux.snapshot();
-        Data::build(&self.core.snapshot, self.client.as_deref(), text::now(), &self.core.collator,
-            Some(&mut self.core.git), actions::watcher_age())
+        Data::build_with(&self.core.snapshot, self.client.as_deref(), text::now(), &self.core.collator,
+            Some(&mut self.core.git), actions::watcher_age(), &mut self.core.slots)
     }
 }
 
@@ -185,7 +185,9 @@ fn once(tmux: Tmux, a: &Args, w: u16, h: u16) -> ExitCode {
     src.core.git.branch_wait = Duration::from_millis(500); // a one-shot may wait for its branches
     let mut menu = Menu::new(src.load(), a.tab);
     if let Some(label) = &a.select {
-        let pos = menu.labels.iter().find(|(_, l)| *l == label).map(|(p, _)| *p);
+        // A slot label; an agent listed twice (NEEDS YOU and its group) is
+        // selected on its first row.
+        let pos = menu.labels.iter().filter(|(_, l)| *l == label).map(|(p, _)| *p).min();
         match pos.and_then(|p| menu.rows[p].key()) {
             Some(k) => menu.sel = Some(k),
             None => {

@@ -92,12 +92,17 @@ impl Server {
     }
 
     /// main: a question and a working agent; work: a failure; one parked tab.
+    /// The watcher never runs on a private server, so the fixture stamps
+    /// @agent_slot itself: 1, 2 and 4 (3 was freed), and a stale 3 on the
+    /// parked tab (parked agents hold no number).
     fn fixture(&self) -> [String; 4] {
         let ask = self.agent("main", "needs-input", "Kua Yu focus timing", &[("@agent_since", "100 needs-input"),
-            ("@agent_detail_kind", "ask"), ("@agent_detail", "Which deck?"), ("@agent_kind", "claude")]);
-        let run = self.agent("main", "running", "Tmux Agent Sidebar", &[("@agent_workflow", "1")]);
-        let fail = self.agent("work", "failed", "Island resize", &[("@agent_since", "50 failed")]);
-        let parked = self.agent("stash", "idle", "x", &[("@stash_label", "Pitch deck v2"), ("@stash_origin", "bai")]);
+            ("@agent_detail_kind", "ask"), ("@agent_detail", "Which deck?"), ("@agent_kind", "claude"),
+            ("@agent_slot", "1")]);
+        let run = self.agent("main", "running", "Tmux Agent Sidebar", &[("@agent_workflow", "1"), ("@agent_slot", "2")]);
+        let fail = self.agent("work", "failed", "Island resize", &[("@agent_since", "50 failed"), ("@agent_slot", "4")]);
+        let parked = self.agent("stash", "idle", "x", &[("@stash_label", "Pitch deck v2"), ("@stash_origin", "bai"),
+            ("@agent_slot", "3")]);
         [ask, run, fail, parked]
     }
 
@@ -174,7 +179,7 @@ fn once(s: &Server, args: &[&str]) -> String {
 #[test]
 fn once_renders_the_server_and_runs_nothing() {
     let s = Server::start("once");
-    s.fixture();
+    let [_, _, fail, _] = s.fixture();
     // The default tab, Active: working ∪ needs you by space (main before
     // work) and index, no NEEDS YOU section, no parked rows.
     let f = once(&s, &["--once", "110x34", "--client", FAKE_TTY]);
@@ -187,16 +192,18 @@ fn once_renders_the_server_and_runs_nothing() {
     assert!(l[4].contains("1 ◉ Kua Yu focus timing"), "{f}");
     assert!(l[5].contains("2 ◐ Tmux Agent Sidebar"), "{f}");
     assert!(l[6].starts_with("│ work "), "{f}");
-    // The first need is selected in its fixed slot, its reason under it.
-    assert!(l[7].contains("3 ✕ Island resize") && l[8].contains("failed"), "{f}");
-    assert!(f.contains("⏎ go to it"));
-    // --tab all: the NEEDS YOU queue first.
+    // The first need is selected in its fixed place, its reason under it.
+    // Numbers are the agents' slots: 4 stays 4 across the gap at 3.
+    assert!(l[7].contains("4 ✕ Island resize") && l[8].contains("failed"), "{f}");
+    assert!(f.contains("⏎ go to it") && l[32].contains(" 1–4  jump "), "{f}");
+    // --tab all: the NEEDS YOU queue first, with the same numbers.
     let f = once(&s, &["--once", "110x34", "--client", FAKE_TTY, "--tab", "all"]);
     let l: Vec<&str> = f.lines().collect();
     assert!(l[3].contains("NEEDS YOU"));
-    assert!(l[4].contains("1 ✕ Island resize") && l[4].contains("work"), "{f}");
-    assert!(f.contains("2 ◉ Kua Yu focus timing"));
-    assert!(f.contains("PARKED 1") && f.contains("Pitch deck v2"));
+    assert!(l[4].contains("4 ✕ Island resize") && l[4].contains("work"), "{f}");
+    assert_eq!(f.matches("│ 1 ◉ Kua Yu focus timing").count(), 2, "{f}"); // NEEDS YOU and main
+    // The parked tab's stale stamp is no number.
+    assert!(f.contains("PARKED 1") && f.contains("│   ▪ Pitch deck v2"), "{f}");
     // --select by label, another tab, the narrow layout.
     let f = once(&s, &["--once", "110x34", "--select", "1"]);
     assert!(f.lines().nth(3).unwrap().contains("Kua Yu focus timing") && f.contains("asks Which deck?"), "{f}");
@@ -204,6 +211,16 @@ fn once_renders_the_server_and_runs_nothing() {
     assert!(!f.contains("Tmux Agent Sidebar") && f.contains("Kua Yu") && !f.contains("┬"), "{f}");
     // A zero-height frame renders nothing, without a panic.
     assert_eq!(once(&s, &["--once", "10x0"]), "");
+    // A slot past nine: every label two digits; a new unstamped agent is
+    // numbered at once (the lowest free, 3), before any watcher tick.
+    s.tmux(&["set-option", "-w", "-t", &fail, "@agent_slot", "12"]);
+    s.agent("work", "running", "Fresh agent", &[]);
+    let f = once(&s, &["--once", "110x34", "--client", FAKE_TTY]);
+    for want in ["│ 01 ◉ Kua Yu", "│ 02 ◐ Tmux Agent", "│ 12 ✕ Island resize", "│ 03 ◐ Fresh agent", " 01–12  jump "] {
+        assert!(f.contains(want), "{want}: {f}");
+    }
+    let f = once(&s, &["--once", "110x34", "--select", "03"]);
+    assert!(f.lines().nth(3).unwrap().contains("Fresh agent"), "{f}");
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(s.calls(), "", "--once ran something");
 }

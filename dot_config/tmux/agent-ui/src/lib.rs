@@ -89,7 +89,7 @@ pub use events::{Event, EventLog};
 pub use git::{GitCache, GitStatus};
 pub use model::{needs_order, Cat, Counts, Flag};
 pub use tmux::{Client, Snapshot, Socket, Tmux, Window};
-pub use view::{Agent, Core, LogEntry, Need, Parked, Space, ViewModel};
+pub use view::{Agent, Core, LogEntry, Need, Parked, SlotMemo, Space, ViewModel};
 pub use wezterm::WeztermLink;
 
 /// agent-roster.py `REFRESH`: one snapshot a second.

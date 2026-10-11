@@ -224,13 +224,15 @@ class CodexParityTests(unittest.TestCase):
                           + ev(now - 300, "task_complete", last_agent_message="ok"))
         st = self.f.read()
         st["windows"] = {"@1": self.codex_window(1, "running", now - 60, rp, **{
-            "@agent_detail_kind": "run", "@agent_detail": "go", "@agent_pending": "7"})}
+            "@agent_detail_kind": "run", "@agent_detail": "go", "@agent_pending": str(now - 7)})}
         st["panes"] = [{"window": "@1", "tty": CODEX_TTY}]
         self.f.state.write_text(json.dumps(st))
         s = self.run_ticks(3)
         o = s["windows"]["@1"]["opts"]
         self.assertEqual(o["@agent_state"], "idle")
-        self.assertEqual((o["@agent_detail"], o["@agent_pending"]), ("go", "7"))
+        # A FRESH pending stamp: an expired one on an idle window is unset by
+        # the agent-slot rule (test_agent_slots), which is not this rule.
+        self.assertEqual((o["@agent_detail"], o["@agent_pending"]), ("go", str(now - 7)))
 
     def test_live_turn_and_non_codex_windows_are_untouched(self):
         now = int(time.time())
@@ -319,12 +321,14 @@ class CodexParityTests(unittest.TestCase):
         self.put({"@2": jw.W("main", 2, **{"@agent_state": "running", "@agent_kind": "claude",
                                            "@agent_since": "%d running" % (now - 60), "@agent_rollout": rp,
                                            "@agent_detail_kind": "run", "@agent_detail": "x",
-                                           "@agent_pending": "5"})},
+                                           "@agent_pending": str(now - 5)})},
                  [{"window": "@2", "tty": CLAUDE_TTY}])
         s = self.run_ticks(4)
         o = s["windows"]["@2"]["opts"]
         self.assertEqual(o["@agent_state"], "idle")
-        self.assertEqual((o["@agent_detail_kind"], o["@agent_detail"], o["@agent_pending"]), ("run", "x", "5"))
+        # Fresh pending, as in test_running_with_an_old_turn_end_keeps_the_older_rule.
+        self.assertEqual((o["@agent_detail_kind"], o["@agent_detail"], o["@agent_pending"]),
+                         ("run", "x", str(now - 5)))
         self.assertFalse([c for c in s["calls"] if "done" in c], s["calls"])
 
     def test_task_complete_while_viewed_is_idle(self):

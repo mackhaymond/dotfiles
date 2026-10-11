@@ -14,7 +14,7 @@
 //! │ work ──────────── ✕1 ◐1  │                                    │
 //! │ …                       ▕│  ⏎ go to it   p full peek  …       │   buttons
 //! ├──────────────────────────┴───────────────────────────────────┤
-//! │  ⏎  go   1–9  jump   ⇥  filter  …                             │   key bar / prompts
+//! │  ⏎  go   1–4  jump   ⇥  filter  …                             │   key bar / prompts
 //! ╰──────────────────────────────────────────────────────────────╯
 //! ```
 //!
@@ -31,14 +31,14 @@
 use super::rows::{Row, Tab, Target};
 use super::state::{Button, Hit, Menu};
 use crate::actions::watcher_problem;
-use crate::hotkeys::hotkey_labels;
+use super::state::Drawn;
+use crate::hotkeys::jump_hint;
 use crate::palette::color;
 use crate::text::{clip, dwidth, fit_label, plain, sanitize};
 use crate::view::{tilde, Agent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use std::collections::HashMap;
 
 /// Below this width the preview is hidden and the list takes the body.
 pub const PREVIEW_MIN_W: u16 = 90;
@@ -148,17 +148,6 @@ fn reason_color(a: &Agent, word_is_detail: bool) -> &'static str {
     } else {
         a.color.unwrap_or("overlay")
     }
-}
-
-/// The key-bar's jump keys: `1–7`, or `1–9 01–03` past nine rows.
-pub fn jump_keys(n: usize) -> Option<String> {
-    let labels = hotkey_labels(n);
-    let last = labels.last()?;
-    Some(match n {
-        1 => "1".into(),
-        2..=9 => format!("1–{n}"),
-        _ => format!("1–9 {}–{last}", labels[9]),
-    })
 }
 
 /// Draw the whole frame for `now`; records what is on screen in `m`.
@@ -368,7 +357,8 @@ fn tab_row(m: &mut Menu, buf: &mut Buffer, w: u16) {
 
 /// The left list: rows, the selected need's reason line, the scrollbar.
 fn list(m: &mut Menu, buf: &mut Buffer, r: Rect) {
-    let lw = m.labels.values().map(|l| l.len()).max().unwrap_or(1);
+    // The number column: the slot width, so it never shifts with what is listed.
+    let lw = m.data.view.slot_width.max(1);
     let mut sel_pos = m.sel.as_ref().and_then(|k| m.rows.iter().position(|r| r.key().as_ref() == Some(k)));
     // Each row's reason line, shown under it while selected: (word, its
     // colour, the reason text). NEEDS YOU rows, and the Active tab's
@@ -450,7 +440,6 @@ fn list(m: &mut Menu, buf: &mut Buffer, r: Rect) {
     let end = r.x + cw;
 
     let mut drawn: Vec<Target> = Vec::new();
-    let mut labels: HashMap<usize, String> = HashMap::new();
     for (k, &(ri, detail)) in lines.iter().skip(m.top).take(hgt).enumerate() {
         let y = r.y + k as u16;
         let row = &m.rows[ri];
@@ -469,8 +458,7 @@ fn list(m: &mut Menu, buf: &mut Buffer, r: Rect) {
             }
         } else {
             draw_row(buf, r.x, y, cw, row, label, lw, selected, m.tab);
-            if let (Some(t), Some(l)) = (row.target(), label) {
-                labels.insert(drawn.len(), l.to_string());
+            if let Some(t) = row.target() {
                 drawn.push(t);
             }
         }
@@ -489,7 +477,9 @@ fn list(m: &mut Menu, buf: &mut Buffer, r: Rect) {
             put(buf, x, r.y + k as u16, x + 1, "▕", st);
         }
     }
-    m.drawn = (drawn, labels);
+    // Every slot of this frame's data, the rows on screen first: what the
+    // number keys mean until the next frame (state.rs has the rule).
+    m.drawn = Drawn::of(&m.data, drawn);
     // What the selection is, as this frame shows it (keys act on it only
     // while it is still listed).
     m.drawn_sel = m.selected_target();
@@ -750,7 +740,7 @@ fn footer(m: &Menu, buf: &mut Buffer, w: u16, y: u16, now: f64) {
         return say(buf, &[seg("digits ignored until another key", fg("yellow")), seg("  (esc clears)", ov)]);
     } else {
         let mut v: Vec<(String, &str)> = vec![("⏎".into(), "go")];
-        if let Some(j) = jump_keys(m.labels.len()) {
+        if let Some(j) = jump_hint(m.drawn.slots.keys().map(String::as_str)) {
             v.push((j, "jump"));
         }
         v.extend([("⇥".into(), "filter"), ("/".into(), "search"), ("p".into(), "peek"), ("s".into(), "park"),
@@ -883,12 +873,13 @@ mod tests {
         assert!(f[2].starts_with("├") && f[2].contains("┬") && f[2].ends_with("┤"));
         assert!(f[3].starts_with("│ NEEDS YOU"));
         // The first need, selected: its reason line under it, and the preview.
-        assert!(f[4].contains("1 ✕ Island resize") && f[4].contains("work"), "{}", f[4]);
+        // Numbers are slots (the provisional fill: main:1 main:2 main:3 work:1).
+        assert!(f[4].contains("4 ✕ Island resize") && f[4].contains("work"), "{}", f[4]);
         assert!(f[5].contains("failed"), "{}", f[5]); // no detail: the state in words
         assert!(f[3].contains("Island resize") && f[3].contains("✕ failed · 11m"), "{}", f[3]);
         assert!(f[4].contains("work:1"));
         assert!(f[6].contains("529 overloaded") && f[7].contains("retry?"), "{}", f[6]);
-        assert!(f[6].contains("2 ◉ Kua Yu focus timing"), "{}", f[6]);
+        assert!(f[6].contains("1 ◉ Kua Yu focus timing"), "{}", f[6]);
         assert!(f[7].contains(" main ") && f[7].contains("◉1 ◐2 ○1"), "{}", f[7]);
         assert!(f.iter().any(|l| l.contains("Tmux Agent Sidebar") && l.contains("here")));
         assert!(f.iter().any(|l| l.contains("Handy.app Speech ⚙")));
@@ -896,7 +887,7 @@ mod tests {
         assert!(f.iter().any(|l| l.contains("+2 more · ⇥ Parked")));
         assert!(f[30].contains("⏎ go to it") && f[30].contains("x close agent"), "{}", f[30]);
         assert!(f[31].contains("┴"));
-        assert!(f[32].contains(" ⏎  go ") && f[32].contains("1–9 01–04  jump") && f[32].contains("⌥S  next  ⌥X  back  ⌥W  close"),
+        assert!(f[32].contains(" ⏎  go ") && f[32].contains(" 1–4  jump") && f[32].contains("⌥S  next  ⌥X  back  ⌥W  close"),
             "{}", f[32]);
         assert!(f[33].starts_with("╰") && f[33].ends_with("╯"));
         // The selected row's background.
@@ -939,7 +930,7 @@ mod tests {
         // Selected: the first need (work:1), its reason line right under it.
         assert!(f[8].contains("4 ✕ Island resize"), "{}", f[8]);
         assert!(f[9].contains("failed") && !f[9].contains("Island"), "{}", f[9]);
-        assert!(f[10].contains("5 ◐ Handy.app Speech"), "{}", f[10]);
+        assert!(f[10].contains("3 ◐ Handy.app Speech"), "{}", f[10]); // linked: the same agent, the same number
         assert_eq!(cell_bg(&mut m, 110, 34, 3, 8), color("surface1"));
         // The preview names the reason too.
         assert!(f[3].contains("Island resize") && f[3].contains("✕ failed · 11m"), "{}", f[3]);
@@ -951,10 +942,11 @@ mod tests {
         m.sel = Some(RowKey::Agent("main".into(), "@2".into()));
         let f = frame(&mut m, 110, 34);
         assert!(f[6].contains("3 ◐ Handy.app"), "{}", f[6]);
-        // Labels on screen are the rows' labels.
-        assert_eq!(m.drawn.0.len(), 5);
-        assert_eq!(m.drawn.0[3].key, RowKey::Agent("work".into(), "@6".into()));
-        assert_eq!(m.drawn.1[&3], "4");
+        // The rows on screen, and what each number means.
+        assert_eq!(m.drawn.rows.len(), 5);
+        assert_eq!(m.drawn.rows[3].key, RowKey::Agent("work".into(), "@6".into()));
+        assert_eq!(m.drawn.slots["4"].key, RowKey::Agent("work".into(), "@6".into()));
+        assert_eq!(m.drawn.slots["3"].key, RowKey::Agent("main".into(), "@3".into())); // the first drawn of two
         // The empty state.
         let mut d = data();
         d.view.needs.clear();
@@ -1006,8 +998,8 @@ mod tests {
         let f = frame(&mut m, 80, 24);
         assert!(f[1].contains(" Needs you 2 "));
         assert!(f[3].contains("NEEDS YOU"));
-        assert!(f[4].contains("1 ✕ Island resize"));
-        assert!(f[6].contains("2 ◉ Kua Yu"));
+        assert!(f[4].contains("4 ✕ Island resize"));
+        assert!(f[6].contains("1 ◉ Kua Yu"));
         assert!(!f.iter().any(|l| l.contains("Tmux Agent Sidebar")));
     }
 
@@ -1018,14 +1010,14 @@ mod tests {
             m.act(crate::menu::keys::Key::Down, &mut NoEffects);
             let f = frame(&mut m, 80, 14); // 8 body rows
             let t = m.selected_target().unwrap();
-            assert!(m.drawn.0.contains(&t), "{t:?} not drawn:\n{}", f.join("\n"));
+            assert!(m.drawn.rows.contains(&t), "{t:?} not drawn:\n{}", f.join("\n"));
         }
         assert_eq!(m.sel, Some(RowKey::Parked("@12".into())));
         assert!(m.top > 0);
         for _ in 0..30 {
             m.act(crate::menu::keys::Key::Up, &mut NoEffects);
             frame(&mut m, 80, 14);
-            assert!(m.drawn.0.contains(&m.selected_target().unwrap()));
+            assert!(m.drawn.rows.contains(&m.selected_target().unwrap()));
         }
         assert_eq!(m.top, 0);
         // The wheel moves the view; a selection scrolled off screen moves to
@@ -1035,12 +1027,12 @@ mod tests {
         frame(&mut m, 80, 14);
         assert!(m.top > 0);
         let t = m.selected_target().unwrap();
-        assert!(m.drawn.0.contains(&t));
+        assert!(m.drawn.rows.contains(&t));
         for _ in 0..5 {
             m.act(wheel(65), &mut NoEffects);
             frame(&mut m, 80, 14);
             let t = m.selected_target().unwrap();
-            assert!(m.drawn.0.contains(&t), "{t:?} off screen at top {}", m.top);
+            assert!(m.drawn.rows.contains(&t), "{t:?} off screen at top {}", m.top);
         }
         let mut fx = crate::menu::state::tests::Rec::default();
         let t = m.selected_target().unwrap();
@@ -1050,7 +1042,7 @@ mod tests {
         for _ in 0..6 {
             m.act(wheel(64), &mut NoEffects);
             frame(&mut m, 80, 14);
-            assert!(m.drawn.0.contains(&m.selected_target().unwrap()));
+            assert!(m.drawn.rows.contains(&m.selected_target().unwrap()));
         }
         assert_eq!(m.top, 0);
     }
@@ -1081,7 +1073,7 @@ mod tests {
         let mut m = menu();
         assert!(frame(&mut m, 10, 0).is_empty());
         assert_eq!(frame(&mut m, 0, 10).len(), 10);
-        assert!(m.drawn.0.is_empty() && m.clicks.is_empty());
+        assert!(m.drawn.rows.is_empty() && m.clicks.is_empty());
     }
 
     #[test]
@@ -1150,6 +1142,14 @@ mod tests {
         assert!(f[1].contains("/ k▏"), "{}", f[1]);
         assert!(f[32].contains("keep") && f[32].contains("clear"));
         m.act(crate::menu::keys::Key::Esc, &mut NoEffects);
+        // One-digit labels: a 0 is no number at all.
+        m.act(crate::menu::keys::Key::Char('0'), &mut NoEffects);
+        let f = frame(&mut m, 110, 34);
+        assert!(f[32].contains("no agent 0"), "{}", f[32]);
+        // Two-digit labels (a slot of 12): a 0 waits for the next digit.
+        use super::super::rows::tests::{data_of, stamped};
+        let mut m = Menu::new(data_of(&stamped(&[("@2", "12")])), Tab::All);
+        frame(&mut m, 110, 34);
         m.act(crate::menu::keys::Key::Char('0'), &mut NoEffects);
         let f = frame(&mut m, 110, 34);
         assert!(f[32].contains("0▏  next digit"), "{}", f[32]);
@@ -1181,13 +1181,92 @@ mod tests {
         assert!(frame(&mut m, 110, 34)[32].contains("close Commodities Job Tracker? y/n"));
     }
 
+    /// Watcher stamps with a gap and a slot past nine: two-digit labels on
+    /// every numbered row, idle / parked rows blank, the key bar's range.
     #[test]
-    fn jump_key_ranges() {
-        assert_eq!(jump_keys(0), None);
-        assert_eq!(jump_keys(1).as_deref(), Some("1"));
-        assert_eq!(jump_keys(7).as_deref(), Some("1–7"));
-        assert_eq!(jump_keys(12).as_deref(), Some("1–9 01–03"));
-        assert_eq!(jump_keys(30).as_deref(), Some("1–9 001–021"));
+    fn slot_labels_drawn() {
+        use super::super::rows::tests::{data_of, stamped};
+        let mut m = Menu::new(data_of(&stamped(&[("@1", "1"), ("@2", "12"), ("@3", "3"), ("@6", "4")])), Tab::All);
+        let f = frame(&mut m, 110, 34);
+        let line = |needle: &str| f.iter().filter(|l| l.contains(needle)).cloned().collect::<Vec<_>>();
+        assert_eq!(line("Island resize").iter().filter(|l| l.contains("│ 04 ✕ Island resize")).count(), 2, "{f:#?}"); // NEEDS YOU + group
+        assert_eq!(line("Kua Yu focus timing").iter().filter(|l| l.contains("│ 01 ◉ Kua Yu")).count(), 2, "{f:#?}");
+        assert!(line("Tmux Agent Sidebar")[0].contains("│ 12 ◐ Tmux Agent Sidebar"), "{f:#?}");
+        assert_eq!(line("Handy.app Speech").iter().filter(|l| l.contains("│ 03 ◐ Handy.app Speech")).count(), 2);
+        assert!(line("Commodities Job Tracker")[0].contains("│    ○ Commodities"), "{f:#?}"); // idle: no number
+        assert!(line("Pitch deck v2")[0].contains("│    ▪ Pitch deck v2"), "{f:#?}"); // parked: none
+        assert!(f[32].contains(" 01–12  jump "), "{}", f[32]);
+        assert_eq!(m.drawn.slots.keys().map(String::as_str).collect::<Vec<_>>(), ["01", "03", "04", "12"]);
+        // Nothing holds a slot: no numbers, no jump key.
+        let mut d = data();
+        for a in d.view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()).chain(d.view.needs.iter_mut().map(|n| &mut n.agent)) {
+            a.slot = None;
+        }
+        d.view.slot_width = 0;
+        let mut m = Menu::new(d, Tab::All);
+        let f = frame(&mut m, 110, 34);
+        assert!(f[4].contains("│   ✕ Island resize"), "{}", f[4]);
+        assert!(!f[32].contains("jump"), "{}", f[32]);
+    }
+
+    /// Two live frames through the menu's memo: a new agent that sorts first
+    /// (Alpha) gets the next free number and moves nobody's; the question the
+    /// user just answered (idle + @agent_pending) stays on the Active tab with
+    /// its number, out of NEEDS YOU.
+    #[test]
+    fn memo_and_answered_render() {
+        use super::super::rows::tests::fixture;
+        use super::super::rows::Data;
+        let mut memo = crate::view::SlotMemo::default();
+        let coll = crate::Collator::new("en_US.UTF-8");
+        let build = |snap: &crate::tmux::Snapshot, memo: &mut crate::view::SlotMemo| {
+            Data::build_with(snap, Some("/dev/ttys999"), 1000.0, &coll, None, Some(1.0), memo)
+        };
+        let mut m = Menu::new(build(&fixture(), &mut memo), Tab::Active);
+        let f = frame(&mut m, 110, 34);
+        for want in ["│ 1 ◉ Kua Yu", "│ 2 ◐ Tmux Agent Sidebar", "│ 3 ◐ Handy.app", "│ 4 ✕ Island resize"] {
+            assert!(f.iter().any(|l| l.contains(want)), "{want}: {f:#?}");
+        }
+        // Next frame: Alpha:0 starts running (unstamped, sorts first); @1
+        // answered 600 s ago (the frames' clock is 1000): still Active.
+        let mut snap = fixture();
+        for w in snap.windows.iter_mut().filter(|w| w.id == "@1") {
+            w.state = "idle".into();
+            w.pending = "400".into();
+        }
+        let early = crate::tmux::tests::row("Alpha", 0, "@20", &[("state", "running"), ("summary", "Early bird")]);
+        snap.windows.push(crate::tmux::Window::parse(&early).unwrap());
+        m.set_data(build(&snap, &mut memo));
+        let f = frame(&mut m, 110, 34);
+        assert!(f[1].contains(" Active 5 ") && f[1].contains(" Needs you 1 "), "{}", f[1]);
+        for want in ["│ 5 ◐ Early bird", "│ 1 ○ Kua Yu", "│ 2 ◐ Tmux Agent Sidebar", "│ 3 ◐ Handy.app", "│ 4 ✕ Island resize"] {
+            assert!(f.iter().any(|l| l.contains(want)), "{want}: {f:#?}");
+        }
+        assert!(m.drawn.slots["1"].win == "@1" && m.drawn.slots["5"].win == "@20");
+        // All: NEEDS YOU is agent-jump.sh's queue (the failure only); Kua is
+        // in its group, numbered.
+        m.set_tab(Tab::All);
+        let f = frame(&mut m, 110, 34);
+        let needs_end = f.iter().position(|l| l.contains("│ main ")).unwrap();
+        assert!(!f[..needs_end].iter().any(|l| l.contains("Kua Yu") && l.contains("│ 1 ")), "{f:#?}");
+        assert!(f[needs_end..].iter().any(|l| l.contains("│ 1 ○ Kua Yu")), "{f:#?}");
+        // Without the memo the newcomer would have taken 1 and pushed the rest up.
+        let d = Data::build(&snap, Some("/dev/ttys999"), 1000.0, &coll, None, Some(1.0));
+        assert_eq!(d.view.agents().find(|a| a.window_id == "@20").and_then(|a| a.slot), Some(1));
+        // The stamp lapses (601 s: answered by No, never resumed): Kua is
+        // plain idle, off the Active tab, its number gone; nobody else's moves.
+        for w in snap.windows.iter_mut().filter(|w| w.id == "@1") {
+            w.pending = "399".into();
+        }
+        m.set_data(build(&snap, &mut memo));
+        m.set_tab(Tab::Active);
+        let f = frame(&mut m, 110, 34);
+        assert!(f[1].contains(" Active 4 "), "{}", f[1]);
+        assert!(!f.iter().any(|l| l.contains("Kua Yu")), "{f:#?}");
+        assert!(!m.drawn.slots.contains_key("1") && m.drawn.slots["5"].win == "@20", "{:?}", m.drawn.slots.keys());
+        m.set_tab(Tab::All);
+        let f = frame(&mut m, 110, 34);
+        assert!(f.iter().any(|l| l.contains("│   ○ Kua Yu")), "{f:#?}");
     }
 
     #[test]

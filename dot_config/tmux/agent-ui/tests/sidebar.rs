@@ -58,11 +58,14 @@ impl Server {
         }
     }
 
+    /// The watcher never runs here, so the fixture stamps `@agent_slot`
+    /// itself: 2 and 5 held, a stale 1 on the idle agent (ignored), and the
+    /// failure not stamped yet (numbered at once: the lowest free, 1).
     fn fixture(&self) {
         self.agent("work", 1, &[("state", "needs-input"), ("summary", "proj/Which deck"), ("detail_kind", "ask"),
-            ("detail", "pick one"), ("kind", "claude")]);
-        self.agent("work", 2, &[("state", "running"), ("summary", "Long running build"), ("workflow", "1")]);
-        self.agent("work", 3, &[("state", "idle"), ("summary", "Quiet one")]);
+            ("detail", "pick one"), ("kind", "claude"), ("slot", "2")]);
+        self.agent("work", 2, &[("state", "running"), ("summary", "Long running build"), ("workflow", "1"), ("slot", "5")]);
+        self.agent("work", 3, &[("state", "idle"), ("summary", "Quiet one"), ("slot", "1")]);
         self.agent("zeta", 1, &[("state", "failed"), ("summary", "Broken thing")]);
     }
 
@@ -123,13 +126,16 @@ fn once_renders_the_fixture() {
     }
     assert!(lines[0].starts_with(" agents") && lines[0].contains("✕1 ◉1 ◐1"), "{lines:#?}");
     assert!(lines[2..].iter().find(|l| !l.trim().is_empty()).unwrap().starts_with(" needs you"));
-    // Needs in agent-jump.sh order: failed first.
-    let fail = lines.iter().position(|l| l.starts_with("▌✕ Broken thing")).expect("failed card");
-    let ask = lines.iter().position(|l| l.starts_with("▌◉ proj/Which deck")).expect("ask card");
+    // Needs in agent-jump.sh order: failed first; each card starts with the
+    // agent's number.
+    let fail = lines.iter().position(|l| l.starts_with("▌1 ✕ Broken thing")).expect("failed card");
+    let ask = lines.iter().position(|l| l.starts_with("▌2 ◉ proj/Which deck")).expect("ask card");
     assert!(fail < ask);
     assert_eq!(lines[15], "────────────────═─────────────────");
-    for t in ["Long running build ⚙", "Quiet one", " work ", " zeta ", "   asks pick one"] {
-        assert!(lines[16..].iter().any(|l| l.contains(t)), "{t}: {lines:#?}");
+    for t in [" 5 ◐ Long running build ⚙", "   ○ Quiet one", " work ", " zeta ", "     asks pick one", " 2 ◉ Which deck",
+        " 1 ✕ Broken thing"] {
+        assert!(lines[16..].iter().any(|l| l.starts_with(t) || (t.starts_with(" work") || t.starts_with(" zeta")) && l.contains(t)),
+            "{t}: {lines:#?}");
     }
     // The split comes from the tmux option, or --split.
     s.tmux(&["set-option", "-g", "@agent_sidebar_split", "0.4"]);

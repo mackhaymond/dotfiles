@@ -157,7 +157,7 @@ fn build_view(core: &mut Core, client: Option<&str>, git_spaces: &[String]) -> V
     let now = text::now();
     let log = core.events.newest(core.log_limit);
     let args = BuildArgs { client, now, collator: &core.collator, git: None, log, watcher_age: watcher_age() };
-    let mut view = ViewModel::build(&core.snapshot, args);
+    let mut view = ViewModel::build_with(&core.snapshot, args, &mut core.slots);
     for sp in view.spaces.iter_mut().filter(|s| !s.agents.is_empty()) {
         sp.branch = core.git.branch(&sp.path, now);
         if git_spaces.contains(&sp.name) {

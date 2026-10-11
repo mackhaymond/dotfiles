@@ -183,20 +183,23 @@ impl Tmux {
 }
 
 /// agent-roster.py `FIELDS`, plus `stash_origin` (stash.sh's `@stash_origin`,
-/// the session a parked tab came from; the menu shows it).
-pub const FIELDS: [&str; 21] = [
+/// the session a parked tab came from; the menu shows it), `slot` (the
+/// watcher's `@agent_slot`, the agent's sticky number key) and `pending`
+/// (agent-tab-indicator.sh's `@agent_pending`: a needs-input prompt the user
+/// went to answer, whose turn has not resumed yet).
+pub const FIELDS: [&str; 23] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
-    "detail", "stash_origin",
+    "detail", "stash_origin", "slot", "pending",
 ];
 
 /// The tmux format of each FIELDS entry, in order.
-pub const FORMATS: [&str; 21] = [
+pub const FORMATS: [&str; 23] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
     "#{window_panes}", "#{pane_current_path}", "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}",
-    "#{@stash_origin}",
+    "#{@stash_origin}", "#{@agent_slot}", "#{@agent_pending}",
 ];
 
 /// Stand-ins tmux writes for a newline / US inside a field value (Unicode
@@ -207,6 +210,8 @@ pub const LF_STANDIN: char = '\u{E00A}';
 pub const US_STANDIN: char = '\u{E01F}';
 
 /// Fields that are always tmux-generated digits / ids, never free text.
+/// (`@agent_slot` is a user option, so anyone can set it to anything: it is
+/// guarded like free text and parsed strictly, [`parse_slot`].)
 const PLAIN_FIELDS: [&str; 5] = ["#{window_index}", "#{window_id}", "#{session_last_attached}", "#{window_active}", "#{window_panes}"];
 
 /// `#{name}` → `#{s/<LF>/<LF_STANDIN>/:#{s/<US>/<US_STANDIN>/:name}}`.
@@ -238,7 +243,7 @@ pub fn fmt() -> String {
 
 /// Client rows ride in the same call. agent-roster.py `CLIENT_FMT` plus the
 /// client's session: `"" US client US tty US window_id US session`. Starts
-/// with an empty field and has 5 fields where a window row has 21, so the two
+/// with an empty field and has 5 fields where a window row has 23, so the two
 /// parsers can never take each other's rows.
 pub const CLIENT_TAG: &str = "client";
 
@@ -291,10 +296,29 @@ pub struct Window {
     /// agent-roster.py `label`: @stash_label (parked rows only), else the
     /// summary, else the window name.
     pub label: String,
+    /// @agent_slot as stamped by the watcher, when valid ([`parse_slot`]).
+    /// Only a stamp: the number a UI shows is [`crate::view::assign_slots`]'s,
+    /// which drops stale stamps and fills agents the watcher has not reached.
+    pub slot: Option<u32>,
+    /// Raw @agent_pending ("" = unset): with state `idle` and a fresh epoch,
+    /// a prompt the user just answered whose turn has not resumed
+    /// ([`Window::answered`]).
+    pub pending: String,
 }
 
 fn digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// An @agent_slot value → the slot, when it is VALID by the watcher's rule
+/// (agent-tab-watcher.sh `^[1-9][0-9]{0,8}$`): 1 to 9 decimal digits, no
+/// leading zero. Empty, 0, `007`, signs, spaces and junk are all None (the
+/// watcher reassigns such a window, so we must not keep its number either).
+pub fn parse_slot(s: &str) -> Option<u32> {
+    if !digits(s) || s.len() > 9 || s.starts_with('0') {
+        return None;
+    }
+    s.parse::<u32>().ok()
 }
 
 impl Window {
@@ -341,6 +365,8 @@ impl Window {
             detail_kind: p[18].into(),
             detail: p[19].into(),
             stash_origin: p[20].into(),
+            slot: parse_slot(p[21]),
+            pending: p[22].into(),
             label: label.into(),
             session,
         })
@@ -349,7 +375,29 @@ impl Window {
     pub fn is_parked(&self) -> bool {
         self.session == HOLD
     }
+
+    /// A prompt the user just answered, at `now` (epoch seconds): "idle AND
+    /// @agent_pending is an epoch no older than 600 s" (the watcher's rule,
+    /// [`ANSWERED_TTL`]). Its turn has not resumed yet, so the agent still
+    /// counts as Active and keeps its slot. Age is whole seconds, as the
+    /// watcher's `$(( now - pend ))`; a stamp from the future counts as
+    /// fresh. Empty or junk (anything but digits) is never answered, and an
+    /// old stamp (an answer-by-No that never resumed, a seen failure) has
+    /// lapsed, so that agent lets its number go.
+    pub fn answered(&self, now: f64) -> bool {
+        if self.state != "idle" || !digits(&self.pending) {
+            return false;
+        }
+        match self.pending.parse::<i64>() {
+            Ok(t) => (now.floor() as i64).saturating_sub(t) <= ANSWERED_TTL,
+            Err(_) => false,
+        }
+    }
 }
+
+/// How long an answered prompt (`@agent_pending`) keeps an idle agent
+/// Active, in seconds (agent-tab-watcher.sh uses the same 600).
+pub const ANSWERED_TTL: i64 = 600;
 
 /// One `list-clients` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,10 +570,28 @@ pub(crate) mod tests {
     #[test]
     fn empty_fields_and_garbage() {
         // Every field empty: still a row, with the Python's defaults.
-        let empty = vec![""; 21].join("\x1f");
+        let empty = vec![""; FIELDS.len()].join("\x1f");
         let w = Window::parse(&empty).unwrap();
-        assert_eq!((w.index, w.panes, w.since_t, w.last_attached, w.active), (0, 1, None, 0, false));
+        assert_eq!((w.index, w.panes, w.since_t, w.last_attached, w.active, w.slot), (0, 1, None, 0, false, None));
+        // The rows of an older format are not rows.
+        assert!(Window::parse(&vec![""; 21].join("\x1f")).is_none());
+        assert!(Window::parse(&vec![""; 22].join("\x1f")).is_none());
         assert_eq!(w.label, "");
+        // Answered: idle with a @agent_pending epoch at most 600 s old.
+        let now = 1_700_000_000.0;
+        let ans = |st: &str, p: &str, now: f64| {
+            Window::parse(&row("s", 1, "@1", &[("state", st), ("pending", p)])).unwrap().answered(now)
+        };
+        assert!(ans("idle", "1700000000", now)); // 0 s
+        assert!(ans("idle", "1699999400", now)); // 600 s: holds
+        assert!(!ans("idle", "1699999399", now)); // 601 s: lapsed
+        assert!(ans("idle", "1699999400", now + 0.9)); // whole seconds, as the watcher's $(( ))
+        assert!(ans("idle", "1700000100", now)); // from the future: fresh
+        // Junk or empty is never answered; other states never are.
+        for junk in ["", "x", "1700000000x", " 1700000000", "-5", "1.5", "99999999999999999999"] {
+            assert!(!ans("idle", junk, now), "{junk:?}");
+        }
+        assert!(!ans("running", "1700000000", now) && !ans("", "1700000000", now) && !ans("needs-input", "1700000000", now));
         // Non-numeric numbers.
         let w = Window::parse(&row("s", 0, "@1", &[("index", "x1"), ("panes", "-2"), ("since", "abc 5"),
             ("last_attached", "1.5"), ("stash_ts", "12a")])).unwrap();
@@ -545,6 +611,22 @@ pub(crate) mod tests {
         // Non-UTF-8 never gets here (decoded lossily), but odd text is fine.
         let w = Window::parse(&row("日本", 2, "@3", &[("summary", "🫠 x\tz")])).unwrap();
         assert_eq!((w.session.as_str(), w.label.as_str()), ("日本", "🫠 x\tz"));
+    }
+
+    #[test]
+    fn slots() {
+        assert!(fmt().contains(&guarded("#{@agent_slot}")) && fmt().ends_with(&guarded("#{@agent_pending}")));
+        for (raw, want) in [("1", Some(1)), ("7", Some(7)), ("12", Some(12)), ("999999999", Some(999_999_999)),
+            ("007", None), ("1000000000", None), ("", None), ("0", None), ("00", None), ("-3", None), ("+3", None),
+            (" 3", None), ("3 ", None), ("3a", None), ("x", None), ("1.5", None), ("4294967296", None), ("٣", None)] {
+            assert_eq!(parse_slot(raw), want, "{raw:?}");
+            let w = Window::parse(&row("main", 1, "@1", &[("slot", raw)])).unwrap();
+            assert_eq!(w.slot, want, "{raw:?}");
+        }
+        // A newline in the option is a stand-in in the row: junk, never a split row.
+        let lf = LF_STANDIN.to_string();
+        let s = Snapshot::parse(&row("main", 1, "@1", &[("slot", &format!("3{lf}4"))]));
+        assert_eq!((s.windows.len(), s.windows[0].slot), (1, None));
     }
 
     #[test]

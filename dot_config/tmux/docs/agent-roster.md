@@ -96,7 +96,7 @@ python), the same for every variant.
 | Key | Does |
 |---|---|
 | **Option-W**, or `prefix q` / `prefix C-q` | open the roster |
-| `1`-`9`, then `01`, `02`, … from the tenth row | go to that row at once and close (see [Number keys](#number-keys)) |
+| an agent's number (`1`-`9`, or `01`…`12` once any slot reaches 10) | agent-ui: go to that agent at once and close; the number is its sticky slot, the same in the sidebar (see [Number keys](#number-keys)). Python fallback: row positions, `1`-`9` then `01`, `02`, … |
 | Tab / Shift-Tab, `j` / `k`, arrows | move |
 | Space / ⏎ | go there (a parked tab comes back via `stash.sh unstash`) |
 | `p` | peek: the last 15 lines of the selected agent's pane, in a panel over the list; any key closes it (and does nothing else) |
@@ -193,7 +193,8 @@ them before the binding's popup is created, for either picker.
   without this row it would vanish from the list as well as from the tab.
 
 Each row shows: the peach bar (the window this client is on), a state dot in
-the tab bar's hues, the row's hotkey number (NEEDS YOU and filter rows add a
+the tab bar's hues, the row's number key (in agent-ui the agent's slot, see
+[Number keys](#number-keys)) (NEEDS YOU and filter rows add a
 dim `session:index`, since no session header names theirs), the title
 (`@agent_summary`, else the window name), the gear or mouse glyph, the state,
 and the time since `@agent_since`. A NEEDS YOU row whose window carries
@@ -217,6 +218,92 @@ leaves the peek open rather than closing the popup. The number labels of the
 list stay as they were last drawn.
 
 ## Number keys
+
+### agent-ui: sticky slots
+
+In agent-ui every number is an agent's **slot**, not a row position, and it
+sticks to the agent: the menu and the CMD+B sidebar show the same number for
+it on every tab, in every search, wherever its row moves.
+
+- **Who has one**: the ACTIVE set only, exactly the menu's Active tab:
+  working (running, a workflow or cua out), needing you (failed,
+  needs-input, done without a workflow: agent-jump.sh's queue), or a prompt
+  just answered ("idle AND @agent_pending is an epoch no older than 600 s",
+  the watcher's rule: you went to answer it and its turn has not resumed
+  yet; a junk or empty stamp never counts, and once the stamp is 601 s old,
+  say after answering No, the agent is plain idle and lets its number go),
+  in a session outside agent-jump.sh's `EXCLUDE` (agents, tasks,
+  stash, scratch, btop-popup). The answered agent stays on the Active tab
+  with its number (drawn as idle `○`) and is never folded into the
+  sidebar's idle line, so jumping to a question never costs it its number;
+  it is NOT in NEEDS YOU, which stays byte-identical to `agent-jump.sh
+  list`. Other idle agents, parked tabs and plain windows have none and
+  show no number.
+- **How numbers are given** (agent-tab-watcher.sh stamps `@agent_slot`;
+  agent-ui computes the same thing from the same snapshot, `view::assign_slots`,
+  so a new agent is numbered in its first frame instead of up to a second
+  later): an Active agent keeps its valid stamp (`^[1-9][0-9]{0,8}$`; on a
+  duplicate the lower numeric window id keeps it); a stamp on an agent that
+  is no longer Active is ignored, its number free at once; every Active agent
+  without one takes the LOWEST free number, in (session name in plain BYTE
+  order, so `Zeta` before `alpha`; window index; numeric window id) order. A
+  window linked into several sessions sorts by its byte-smallest non-hidden
+  session and that link's index. The watcher sorts exactly the same way, so
+  the two always agree. Nobody else's number ever changes: with 1-4 held, 3
+  going idle frees 3, and 1, 2 and 4 stay put; the next agent to become
+  active takes 3.
+- **Provisional numbers stick** (`view::SlotMemo`, one per menu / sidebar
+  process): an Active agent shown before the watcher stamped it keeps the
+  number it was first shown with until it is stamped or leaves the Active
+  set. A later arrival that sorts before it takes the next number free of
+  both the stamps and those remembered numbers, never its number. A valid
+  stamp always wins over the memory (if it differs, the stamp is adopted;
+  rare, since the hook stamps synchronously). `--once` renders have no
+  memory and show the watcher's assignment exactly.
+- **Labels**: zero-padded to the digit count of the HIGHEST slot held,
+  across everything, not just the rows on screen. Up to 9: one digit
+  (`1`…`9`). Once any slot is 10 or more, every label is two digits (`01`,
+  `03`, `12`) and a number is complete after two keys. Equal widths keep the
+  set prefix-free, so nothing waits on a timer; a bare `0` is never a label.
+  The same agent listed twice (its NEEDS YOU row and its group row, or a
+  window linked into two sessions) shows the same number on both. The key
+  bar shows the range in play, e.g. `1–7  jump` or `01–12  jump`.
+- **What a number resolves against** (the safety rule): the frame on screen
+  when its FIRST digit was pressed. That frame records every slot in the
+  data it was drawn from, on screen or not, each with the window that held
+  it then. So a number whose row is scrolled off, filtered out by the search,
+  or on another tab still jumps (`3` always means agent 3), going to its
+  first row on screen, else its NEEDS YOU entry (the session agent-jump.sh
+  would pick), else its group row. A number nobody held in that frame is
+  dead, including an agent that appeared since the last draw: it is
+  numbered once a frame shows it. The jump goes to the WINDOW recorded at
+  draw time: if that agent closed and the watcher gave its number to a new
+  agent before the next frame, the key still means the old window (gone: the
+  jump fails and says so), never the newcomer. tmux never reuses a window id
+  while the server lives.
+- Dead numbers swallow their tail as below ("no agent 13 · digits ignored
+  until another key"); esc drops a half-typed number, backspace takes a
+  digit back, any other key drops it and does its own thing.
+- Inside the `/` search, digits type into the query; after ⏎ keeps it,
+  digits are slots again.
+- `menu --once … --select <label>` selects by slot label too.
+
+**Sidebar**: each agent row in the AGENTS half and each NEEDS YOU card
+starts with the same zero-padded number (` 3 ◉ Title`, `▌3 ◉ Title`),
+display only (the sidebar takes no number keys; press Option-W and the
+number). Agents without a slot leave the column blank so titles stay
+aligned; with no slot anywhere the column is not drawn. The folded idle line
+(`○○○ 3 idle · …`) has no numbers, since the idle agents it folds hold none
+(an answered prompt is never folded); collapsed space rules and `… N more`
+lines stand for many agents and have none either. The column costs
+`width + 1` cells of title room and nothing else: the never-scroll and fit
+guarantees hold (every size 24-60 × 2-70 is tested).
+
+Known limit: two unstamped agents that first appear in the SAME frame are
+numbered together in fill order; the watcher numbers them the same way.
+Once a number is shown, it stays (above).
+
+### Python fallback: row positions
 
 Every **window** row (NEEDS YOU, session-group rows, expanded parked rows,
 filter hits) carries a number, unique across the list and assigned in display
@@ -315,7 +402,9 @@ left of the tmux pane. `CMD+B` (wezterm.lua) opens it, and closes it again if
 the tab already has one. It runs `agent-ui sidebar` when
 `~/.local/bin/agent-ui` exists (see [agent-ui](#agent-ui-primary-and-the-python-fallback));
 otherwise this same program, `agent-roster.py --strip`, which the rest of
-this section describes.
+this section describes. agent-ui's sidebar starts each agent row and NEEDS
+YOU card with the agent's sticky number, the Option-W menu's key for it (see
+[Number keys](#agent-ui-sticky-slots)).
 
 - **Layout** (designed for 34-40 columns, any height, **never scrolls**):
 

@@ -9,9 +9,9 @@
 //!  ⏵ next ⌥S  ⤺ back ⌥X  ≡ ⌥W       toolbar (Actions next/back, the menu)
 //!
 //!  needs you                    1    agent-jump.sh `list` order, cards
-//! ▌◉ Kua Yu focus timing     44m
-//! ▌  asks Which deck should…
-//! ▌  main:3 · ✳ claude      ⏎ go
+//! ▌1 ◉ Kua Yu focus timing   44m    (1: the agent's slot, its menu key)
+//! ▌    asks Which deck should…
+//! ▌    main:3 · ✳ claude    ⏎ go
 //!
 //!  spaces                            one per session, fixed (name) order
 //!  ● main            ◉1 ◐2 ○4
@@ -22,8 +22,8 @@
 //! ────────────────═─────────────────  the divider: a FIXED row (split ratio)
 //!  agents                  by space
 //!  main ⌥ main ──────── ◉1 ◐2 ○4     one rule per space with agents
-//!  ◉ Kua Yu focus timing             each agent: title (full width) …
-//!    asks Which deck should…  44m    … and what it does / waits on
+//!  1 ◉ Kua Yu focus timing           each agent: number, title …
+//!      asks Which deck should… 44m   … and what it does / waits on
 //!
 //!  ▸ parked 5                         the stash; a watcher problem in red
 //! ```
@@ -50,8 +50,20 @@
 //!
 //! Every bottom row records the agents it stands for ([`Row::covers`]), so a
 //! test can prove each agent is shown, folded, collapsed or counted.
+//!
+//! ## Numbers
+//!
+//! Every agent row and NEEDS YOU card starts with the agent's sticky slot
+//! ([`crate::view::assign_slots`]), zero-padded like the Option-W menu's, so
+//! the same agent has the same number in both. Display only: the sidebar
+//! takes no number keys. Rows of agents without one (idle, the client's
+//! plain window) leave the column blank, so titles stay aligned; with no
+//! slot anywhere the column is not drawn at all. The folded idle line has
+//! no numbers (idle agents hold none), and collapsed rules and `… N more`
+//! stand for many agents, so neither does.
 
 use crate::actions::watcher_problem;
+use crate::hotkeys::slot_label;
 use crate::model::{Cat, Counts, Flag, HIDDEN};
 use crate::palette;
 use crate::text::{clip, dwidth, fit_label, plain, sanitize};
@@ -338,28 +350,47 @@ fn toolbar_row(w: usize) -> Row {
     Row { targets, ..Row::new(fit(w, segs, vec![], None)) }
 }
 
+/// The number column of an agent's first line: its slot label (zero-padded
+/// to `sw`, the view's [`ViewModel::slot_width`]) and a space, blank when it
+/// holds no slot; None when no agent holds one (`sw` 0: no column at all).
+/// Display only: the sidebar has no number keys, these are the menu's.
+fn num_seg(a: &Agent, sw: usize) -> Option<Seg> {
+    (sw > 0).then(|| match a.slot {
+        Some(s) => seg(format!("{} ", slot_label(s, sw)), "sub"),
+        None => seg(" ".repeat(sw + 1), "text"),
+    })
+}
+
+/// The cells [`num_seg`] takes: what the lines under it indent by.
+fn num_w(sw: usize) -> usize {
+    if sw > 0 {
+        sw + 1
+    } else {
+        0
+    }
+}
+
 /// A NEEDS YOU card: 3, 2 or 1 lines on `surface0`, a left bar in the state
-/// colour (Strip.need_detail's reason on line 2).
-fn need_rows(n: &Need, w: usize, lines: u8) -> Vec<Row> {
+/// colour (Strip.need_detail's reason on line 2), the agent's number first.
+fn need_rows(n: &Need, w: usize, lines: u8, sw: usize) -> Vec<Row> {
     let a = &n.agent;
     let hue = a.color.unwrap_or("overlay");
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
     let card = |segs: Vec<Seg>| Row::new(segs).bg(Some("surface0")).click(w, go.clone());
     let bar = || seg("▌", hue);
+    let indent = " ".repeat(num_w(sw));
     let age = if a.age.is_empty() { String::new() } else { format!("{} ", a.age) };
-    let (proj, title) = fit_label(no_home(&a.title), w.saturating_sub(3 + dwidth(&age)));
-    let mut rows = vec![card(fit(
-        w,
-        vec![bar(), seg(format!("{} ", a.glyph), hue), seg(proj, "overlay"), bold(title, "text")],
-        vec![seg(age, "sub")],
-        None,
-    ))];
+    let (proj, title) = fit_label(no_home(&a.title), w.saturating_sub(3 + num_w(sw) + dwidth(&age)));
+    let mut first = vec![bar()];
+    first.extend(num_seg(a, sw));
+    first.extend([seg(format!("{} ", a.glyph), hue), seg(proj, "overlay"), bold(title, "text")]);
+    let mut rows = vec![card(fit(w, first, vec![seg(age, "sub")], None))];
     if lines >= 2 {
         rows.push(card(fit(
             w,
             vec![
                 bar(),
-                seg(format!("  {} ", n.reason_word), word_hue(&n.reason_word, hue)),
+                seg(format!("{indent}  {} ", n.reason_word), word_hue(&n.reason_word, hue)),
                 seg(plain(&n.reason), "sub"),
             ],
             vec![],
@@ -373,7 +404,7 @@ fn need_rows(n: &Need, w: usize, lines: u8) -> Vec<Row> {
         };
         rows.push(card(fit(
             w,
-            vec![bar(), seg(format!("  {}{kind}", sanitize(&a.place())), "overlay")],
+            vec![bar(), seg(format!("{indent}  {}{kind}", sanitize(&a.place())), "overlay")],
             vec![seg("⏎ go ", "blue")],
             None,
         )));
@@ -395,7 +426,7 @@ fn needs_block(view: &ViewModel, w: usize, lines: u8) -> Vec<Row> {
         rows.push(dim_line(w, " ✓ nothing needs you"));
     }
     for n in &view.needs {
-        rows.extend(need_rows(n, w, lines));
+        rows.extend(need_rows(n, w, lines, view.slot_width));
     }
     rows
 }
@@ -612,11 +643,12 @@ fn short_title(a: &Agent) -> String {
     sanitize(if a.short_title.is_empty() { no_home(&a.title) } else { &a.short_title })
 }
 
-/// One agent: 2 lines (title / what it does + age) or 1 (title + age). The
-/// window the client is on gets the `sel` background and `here`. Line 2 of
-/// a working agent is its run detail or `working` + path; of any other, its
-/// last outcome (`done …`, `fail …`) or its path.
-fn agent_rows(a: &Agent, w: usize, two: bool) -> Vec<Row> {
+/// One agent: 2 lines (title / what it does + age) or 1 (title + age),
+/// its number first ([`num_seg`]). The window the client is on gets the
+/// `sel` background and `here`. Line 2 of a working agent is its run detail
+/// or `working` + path; of any other, its last outcome (`done …`, `fail …`)
+/// or its path.
+fn agent_rows(a: &Agent, w: usize, two: bool, sw: usize) -> Vec<Row> {
     let hue = a.color.unwrap_or("overlay");
     let quiet = matches!(a.cat, None | Some(Cat::Idle));
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
@@ -632,10 +664,14 @@ fn agent_rows(a: &Agent, w: usize, two: bool) -> Vec<Row> {
     };
     // The title gets every cell the glyph, the flag and the right side leave.
     let gap = usize::from(!right.is_empty() && !right[0].text.starts_with(' '));
-    let room = w.saturating_sub(3 + flag.as_ref().map_or(0, |f| dwidth(&f.text)) + width(&right) + gap);
+    let room = w.saturating_sub(3 + num_w(sw) + flag.as_ref().map_or(0, |f| dwidth(&f.text)) + width(&right) + gap);
     let title = clip(&short_title(a), room);
     let title = if quiet { seg(title, "sub") } else if two { bold(title, "text") } else { seg(title, "text") };
-    let mut left = vec![seg(format!(" {} ", a.glyph), hue), title];
+    // ` 3 ◉ Title`: the number in the space before the glyph's.
+    let mut left = match num_seg(a, sw) {
+        Some(n) => vec![seg(" ", "text"), n, seg(format!("{} ", a.glyph), hue), title],
+        None => vec![seg(format!(" {} ", a.glyph), hue), title],
+    };
     left.extend(flag);
     let first = Row::new(fit(w, left, right, None)).bg(bg).click(w, go.clone()).covering([a]);
     if !two {
@@ -645,7 +681,7 @@ fn agent_rows(a: &Agent, w: usize, two: bool) -> Vec<Row> {
     // A detail that is nothing but markup (a truncated `<agent-message …>`)
     // counts as none.
     let detail = plain(&a.detail);
-    let mut l2 = vec![seg("   ", "text")];
+    let mut l2 = vec![seg(" ".repeat(3 + num_w(sw)), "text")];
     if a.in_flight {
         // Working: what it runs now, never the last turn's outcome.
         if a.detail_kind == "run" && !detail.is_empty() {
@@ -689,13 +725,15 @@ fn rule_row(sp: &Space, w: usize, collapsed: bool) -> Row {
     }
 }
 
-/// `   ○○○ 3 idle · Name, Name…`: a space's idle agents in one line.
-fn fold_row(idle: &[&Agent], w: usize) -> Row {
+/// `   ○○○ 3 idle · Name, Name…`: a space's idle agents in one line, its
+/// circles under the titles above. No numbers: idle agents hold no slot.
+fn fold_row(idle: &[&Agent], w: usize, sw: usize) -> Row {
     let k = idle.len();
     let names: Vec<String> = idle.iter().map(|a| short_title(a)).collect();
+    let indent = " ".repeat(3 + num_w(sw));
     Row::new(fit(
         w,
-        vec![seg(format!("   {} {k} idle · ", "○".repeat(k.min(4))), "overlay"), seg(names.join(", "), "overlay")],
+        vec![seg(format!("{indent}{} {k} idle · ", "○".repeat(k.min(4))), "overlay"), seg(names.join(", "), "overlay")],
         vec![],
         None,
     ))
@@ -724,10 +762,11 @@ fn key(a: &Agent) -> Key<'_> {
     (&a.session, &a.window_id)
 }
 
-/// With `fold`, a space's idle agents (never the client's window) go into
-/// one line, when there are 2+ of them → (shown in place, folded).
+/// With `fold`, a space's idle agents (never the client's window, never one
+/// whose prompt was just answered: it is still Active and shows its number)
+/// go into one line, when there are 2+ of them → (shown in place, folded).
 fn split_idle(sp: &Space, fold: bool) -> (Vec<&Agent>, Vec<&Agent>) {
-    let foldable = |a: &Agent| fold && a.cat == Some(Cat::Idle) && !a.is_current;
+    let foldable = |a: &Agent| fold && a.cat == Some(Cat::Idle) && !a.is_current && !a.answered;
     let (idle, shown): (Vec<&Agent>, Vec<&Agent>) = sp.agents.iter().partition(|a| foldable(a));
     if idle.len() >= 2 {
         (shown, idle)
@@ -738,11 +777,11 @@ fn split_idle(sp: &Space, fold: bool) -> (Vec<&Agent>, Vec<&Agent>) {
 
 /// A space's agent rows in window-index order (the folded line last); the
 /// agents in `two` get their second line.
-fn group_rows(sp: &Space, w: usize, two: &[Key], fold: bool) -> Vec<Row> {
+fn group_rows(sp: &Space, w: usize, two: &[Key], fold: bool, sw: usize) -> Vec<Row> {
     let (shown, idle) = split_idle(sp, fold);
-    let mut rows: Vec<Row> = shown.iter().flat_map(|a| agent_rows(a, w, two.contains(&key(a)))).collect();
+    let mut rows: Vec<Row> = shown.iter().flat_map(|a| agent_rows(a, w, two.contains(&key(a)), sw)).collect();
     if !idle.is_empty() {
-        rows.push(fold_row(&idle, w));
+        rows.push(fold_row(&idle, w, sw));
     }
     rows
 }
@@ -750,15 +789,15 @@ fn group_rows(sp: &Space, w: usize, two: &[Key], fold: bool) -> Vec<Row> {
 /// A space's agents in `room` rows: all of them one line each if they fit,
 /// else the `room - 1` that matter most ([`promotion_rank`], kept in list
 /// order) and a `… N more` line for the rest.
-fn partial_rows(sp: &Space, w: usize, room: usize) -> Vec<Row> {
+fn partial_rows(sp: &Space, w: usize, room: usize, sw: usize) -> Vec<Row> {
     if sp.agents.len() <= room {
-        return sp.agents.iter().flat_map(|a| agent_rows(a, w, false)).collect();
+        return sp.agents.iter().flat_map(|a| agent_rows(a, w, false, sw)).collect();
     }
     let mut ranked: Vec<usize> = (0..sp.agents.len()).collect();
     ranked.sort_by_key(|&k| promotion_rank(&sp.agents[k]));
     let mut keep = ranked[..room - 1].to_vec();
     keep.sort_unstable();
-    let mut rows: Vec<Row> = keep.iter().flat_map(|&k| agent_rows(&sp.agents[k], w, false)).collect();
+    let mut rows: Vec<Row> = keep.iter().flat_map(|&k| agent_rows(&sp.agents[k], w, false, sw)).collect();
     let rest: Vec<&Agent> = (0..sp.agents.len()).filter(|k| !keep.contains(k)).map(|k| &sp.agents[k]).collect();
     rows.push(more_row(w, &rest, 1));
     rows
@@ -792,6 +831,7 @@ fn bottom_rows(view: &ViewModel, w: usize, budget: usize) -> (Vec<Row>, u8) {
     if budget == 0 {
         return (vec![], 0);
     }
+    let sw = view.slot_width;
     let groups: Vec<&Space> = view.spaces.iter().filter(|s| !s.agents.is_empty()).collect();
     let header = section(w, "agents", "sub", vec![seg("by space ", "overlay")]);
     if groups.is_empty() {
@@ -804,7 +844,7 @@ fn bottom_rows(view: &ViewModel, w: usize, budget: usize) -> (Vec<Row>, u8) {
         for (sp, &c) in groups.iter().zip(collapsed) {
             rows.push(rule_row(sp, w, c));
             if !c {
-                rows.extend(group_rows(sp, w, two, fold));
+                rows.extend(group_rows(sp, w, two, fold, sw));
             }
         }
         rows
@@ -858,11 +898,11 @@ fn bottom_rows(view: &ViewModel, w: usize, budget: usize) -> (Vec<Row>, u8) {
         // The space whose collapse made it fit keeps the rows that frees:
         // its most important agents, one line each, and `… N more`.
         let at = 1 + (0..i)
-            .map(|j| 1 + if collapsed[j] { 0 } else { group_rows(groups[j], w, &[], true).len() })
+            .map(|j| 1 + if collapsed[j] { 0 } else { group_rows(groups[j], w, &[], true, sw).len() })
             .sum::<usize>();
         let mut rows = base;
         rows[at] = rule_row(groups[i], w, false);
-        rows.splice(at + 1..at + 1, partial_rows(groups[i], w, spare));
+        rows.splice(at + 1..at + 1, partial_rows(groups[i], w, spare, sw));
         return (rows, 3);
     }
     // More spaces than rows: the first ones as rules, the rest counted.
@@ -1049,6 +1089,11 @@ mod tests {
 
     /// Window ids are assigned in order; the client sits on `here` (an id).
     fn view(agents: Vec<A>, here: Option<&str>, log: Vec<Event>) -> ViewModel {
+        view_with(agents, here, log, &mut crate::view::SlotMemo::default())
+    }
+
+    /// [`view`], one frame of a sidebar that remembers its slots in `memo`.
+    fn view_with(agents: Vec<A>, here: Option<&str>, log: Vec<Event>, memo: &mut crate::view::SlotMemo) -> ViewModel {
         let mut rows: Vec<String> = agents
             .iter()
             .enumerate()
@@ -1068,7 +1113,7 @@ mod tests {
         }
         let c = Collator::new("en_US.UTF-8");
         let args = BuildArgs { client: Some(CLIENT), now: NOW as f64, collator: &c, git: None, log, watcher_age: Some(1.0) };
-        ViewModel::build(&Snapshot::parse(&rows.join("\n")), args)
+        ViewModel::build_with(&Snapshot::parse(&rows.join("\n")), args, memo)
     }
 
     fn ev(min_ago: i64, id: &str, state: &str, title: &str, detail: &str) -> Event {
@@ -1113,6 +1158,10 @@ mod tests {
 
     /// A busy day: 24 agents, 4 needs (the mockup's second frame).
     fn busy() -> ViewModel {
+        view(busy_agents(), Some("@4"), vec![ev(1, "@1", "failed", "Handy.app", "529 overloaded")])
+    }
+
+    fn busy_agents() -> Vec<A<'static>> {
         let mut v = vec![
             a("main", 1, "failed", "Handy.app Speech Commands").with("workflow", "1"),
             a("main", 2, "needs-input", "Kua Yu focus timing").with("detail_kind", "ask").with("detail", "Which deck?"),
@@ -1136,7 +1185,7 @@ mod tests {
                 v.push(a(s, i, "idle", "Some idle thing"));
             }
         }
-        view(v, Some("@4"), vec![ev(1, "@1", "failed", "Handy.app", "529 overloaded")])
+        v
     }
 
     /// 90 agents, 12 needs, 9 spaces.
@@ -1164,8 +1213,25 @@ mod tests {
         view(vec![], None, vec![])
     }
 
+    /// `busy()` with watcher stamps: a gap (3 free), one past nine (two-digit
+    /// labels everywhere), and agents not stamped yet (filled into the gap
+    /// and above).
+    fn numbered() -> ViewModel {
+        // Window ids follow list order: @1 Handy.app, @2 Kua Yu, @4 Tmux, @5 Notch Tasks.
+        let stamps = [(0, "1"), (1, "2"), (3, "4"), (4, "12"), (5, "7")]; // @6 is idle: its 7 is stale
+        let v = busy_agents()
+            .into_iter()
+            .enumerate()
+            .map(|(k, x)| match stamps.iter().find(|(i, _)| *i == k) {
+                Some((_, s)) => x.with("slot", s),
+                None => x,
+            })
+            .collect();
+        view(v, Some("@4"), vec![])
+    }
+
     fn all() -> Vec<(&'static str, ViewModel)> {
-        vec![("quiet", quiet()), ("busy", busy()), ("extreme", extreme()), ("empty", empty())]
+        vec![("quiet", quiet()), ("busy", busy()), ("extreme", extreme()), ("empty", empty()), ("numbered", numbered())]
     }
 
     fn texts(f: &Frame) -> Vec<String> {
@@ -1249,10 +1315,11 @@ mod tests {
         assert!(t[0].starts_with(" agents") && t[0].ends_with("◉1 ◐2 ○8 "), "{:?}", t[0]);
         assert_eq!(t[1], "  ⏵ next ⌥S   ⤺ back ⌥X   ≡ ⌥W    ");
         assert!(t[2].trim().is_empty() && t[3].starts_with(" needs you"));
-        // The card: title + age, reason, place + kind.
-        assert!(t[4].starts_with("▌◉ Kua Yu focus timing") && t[4].ends_with("3m "), "{:?}", t[4]);
-        assert!(t[5].starts_with("▌  asks Which deck"));
-        assert!(t[6].starts_with("▌  main:3 · ✳ claude") && t[6].ends_with("⏎ go "));
+        // The card: number + title + age, reason, place + kind. (Slots: the
+        // provisional fill, main:1 main:2 main:3; idle agents hold none.)
+        assert!(t[4].starts_with("▌3 ◉ Kua Yu focus timing") && t[4].ends_with("3m "), "{:?}", t[4]);
+        assert!(t[5].starts_with("▌    asks Which deck"), "{:?}", t[5]);
+        assert!(t[6].starts_with("▌    main:3 · ✳ claude") && t[6].ends_with("⏎ go "), "{:?}", t[6]);
         // The log soaks up the rest of the top half, right up to the divider.
         let log = find(&f, " log");
         assert!(log < 29 && t[28].contains("Kua Yu: asked"), "{t:#?}");
@@ -1266,9 +1333,12 @@ mod tests {
         // Agents get two lines and the whole width for their title.
         let r = find(&f, "Tmux Agent Sidebar");
         assert!(r > 29 && t[r].ends_with("here ") && f.rows[r].bg == Some("sel"));
-        assert!(t[r + 1].starts_with("   run Edit agent-roster.py"));
+        assert!(t[r].starts_with(" 2 ◐ Tmux Agent Sidebar"), "{:?}", t[r]);
+        assert!(t[r + 1].starts_with("     run Edit agent-roster.py"), "{:?}", t[r + 1]);
         let h = find(&f, "Handy.app Speech Commands ⚙");
-        assert!(t[h + 1].starts_with("   run Bash swift build"));
+        assert!(t[h].starts_with(" 1 ◐ Handy.app") && t[h + 1].starts_with("     run Bash swift build"), "{t:#?}");
+        // An idle agent: a blank number column, its title still aligned.
+        assert!(t[find(&f, "Commodities Job Tracker")].starts_with("   ○ Commodities Job Tracker"), "{t:#?}");
         assert_eq!(t[57], " ▸ parked 1                       ");
     }
 
@@ -1324,7 +1394,7 @@ mod tests {
         let r = find(&f, "Tmux Agent Sidebar") as u16;
         assert_eq!(f.target(5, r).cloned(), go("@2"));
         assert_eq!(f.target(33, r + 1).cloned(), go("@2"));
-        let card = find(&f, "▌◉ Kua Yu") as u16;
+        let card = find(&f, "▌3 ◉ Kua Yu") as u16;
         for y in card..card + 3 {
             assert_eq!(f.target(0, y).cloned(), go("@3"));
         }
@@ -1383,17 +1453,17 @@ mod tests {
         assert!(below("Tmux Agent Sidebar").is_some_and(|i| !t[i].contains("tmux/")));
         assert!(below(" ○ Lost suit jacket").is_some());
         // Working: never the last turn's outcome.
-        assert!(t[c + 1].starts_with("   working /nonexistent/main"), "{:?}", t[c + 1]);
+        assert!(t[c + 1].starts_with("     working /nonexistent/main"), "{:?}", t[c + 1]);
         let r = below("Tmux Agent Sidebar").unwrap();
-        assert!(t[r + 1].starts_with("   run cargo test "), "{:?}", t[r + 1]);
+        assert!(t[r + 1].starts_with("     run cargo test "), "{:?}", t[r + 1]);
         let m = below("Markup only").unwrap();
-        assert!(t[m + 1].starts_with("   working /nonexistent/main"), "{:?}", t[m + 1]);
+        assert!(t[m + 1].starts_with("     working /nonexistent/main"), "{:?}", t[m + 1]);
         // Idle keeps its outcome, as plain text.
         let l = below("Lost suit jacket").unwrap();
-        assert!(t[l + 1].starts_with("   done Found it "), "{:?}", t[l + 1]);
+        assert!(t[l + 1].starts_with("     done Found it "), "{:?}", t[l + 1]);
         // Needs cards and log lines: no `~/`, plain reasons and details.
-        assert!(t.iter().any(|l| l.starts_with("▌◉ Kua Yu focus timing")), "{t:#?}");
-        assert!(t.iter().any(|l| l.starts_with("▌  asks Which deck?")), "{t:#?}");
+        assert!(t.iter().any(|l| l.starts_with("▌3 ◉ Kua Yu focus timing")), "{t:#?}");
+        assert!(t.iter().any(|l| l.starts_with("▌    asks Which deck?")), "{t:#?}");
         assert!(t.iter().any(|l| l.contains("✓ Commodities Job Tracker: 7 fixes app")), "{t:#?}");
     }
 
@@ -1462,6 +1532,118 @@ mod tests {
         let t = texts(&f);
         assert_eq!(f.bottom_step, 3, "{t:#?}");
         assert!(t.iter().any(|l| l.contains("Kua Yu focus timing")), "{t:#?}");
+    }
+
+    /// Two frames through the sidebar's memo: a newcomer that sorts first
+    /// (session `aa`) takes the next free number and moves nobody's; the
+    /// question just answered (idle + @agent_pending) keeps its number, is no
+    /// longer a NEEDS YOU card, and is never folded into the idle line.
+    #[test]
+    fn memo_and_answered_render() {
+        let base = || {
+            vec![
+                a("main", 1, "running", "One"),
+                a("main", 2, "needs-input", "Two").with("detail_kind", "ask").with("detail", "which?"),
+                a("main", 3, "idle", "Q3"),
+                a("main", 4, "idle", "Q4"),
+                a("main", 5, "idle", "Q5"),
+                a("work", 2, "running", "Late sorter"),
+            ]
+        };
+        let mut memo = crate::view::SlotMemo::default();
+        let v = view_with(base(), None, vec![], &mut memo);
+        let f = layout(&v, 34, 58, &Opts::default());
+        for want in ["▌2 ◉ Two", " 1 ◐ One", " 2 ◉ Two", " 3 ◐ Late sorter"] {
+            find(&f, want);
+        }
+        // Next frame: Two answered 600 s ago (still Active); `aa` starts (id
+        // @7, sorts before main).
+        let answered = |pending: &str| {
+            let mut next = base();
+            next[1] = a("main", 2, "idle", "Two").with("pending", pending);
+            next.push(a("aa", 1, "running", "Early bird"));
+            next
+        };
+        let mut next = base();
+        next[1] = a("main", 2, "idle", "Two").with("pending", &(NOW - 600).to_string());
+        next.push(a("aa", 1, "running", "Early bird"));
+        let v = view_with(next, None, vec![], &mut memo);
+        assert!(v.needs.is_empty());
+        let f = layout(&v, 34, 58, &Opts::default());
+        let t = texts(&f);
+        assert!(t.iter().any(|l| l.starts_with(" ✓ nothing needs you")), "{t:#?}");
+        for want in [" 4 ◐ Early bird", " 1 ◐ One", " 2 ○ Two", " 3 ◐ Late sorter", "   ○ Q3"] {
+            assert!(t.iter().any(|l| l.starts_with(want)), "{want}: {t:#?}");
+        }
+        // Squeezed until idle agents fold: Two stays on its own numbered row.
+        let f = (12..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.bottom_step == 2).unwrap();
+        let t = texts(&f);
+        let fold = t.iter().find(|l| l.contains(" idle · ")).unwrap_or_else(|| panic!("{t:#?}"));
+        assert!(fold.contains("3 idle · Q3, Q4, Q5"), "{fold:?}");
+        assert!(t.iter().any(|l| l.starts_with(" 2 ○ Two")), "{t:#?}");
+        // Without the memo the newcomer would have taken 1.
+        let v = view(answered(&(NOW - 600).to_string()), None, vec![]);
+        assert_eq!(v.agents().find(|x| x.title == "Early bird").and_then(|x| x.slot), Some(1));
+        // The stamp lapses (601 s): Two is plain idle, its number gone (a
+        // blank column), folded with the others; nobody else's number moves.
+        let v = view_with(answered(&(NOW - 601).to_string()), None, vec![], &mut memo);
+        let f = layout(&v, 34, 58, &Opts::default());
+        let t = texts(&f);
+        for want in ["   ○ Two", " 4 ◐ Early bird", " 1 ◐ One", " 3 ◐ Late sorter"] {
+            assert!(t.iter().any(|l| l.starts_with(want)), "{want}: {t:#?}");
+        }
+        assert!(!t.iter().any(|l| l.starts_with(" 2 ")), "{t:#?}");
+        let f = (12..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.bottom_step == 2).unwrap();
+        let t = texts(&f);
+        assert!(t.iter().any(|l| l.contains("4 idle · Two, Q3, Q4, Q5")), "{t:#?}");
+        // A junk stamp never counted.
+        let v = view(answered("soon"), None, vec![]);
+        assert_eq!(v.agents().find(|x| x.title == "Two").map(|x| (x.answered, x.slot)), Some((false, None)));
+    }
+
+    /// Slots on cards and rows: kept stamps (with a gap and one past nine),
+    /// a stale stamp on an idle agent ignored, unstamped agents filled into
+    /// the gap; two-digit labels everywhere; idle rows and the fold blank.
+    #[test]
+    fn numbers_on_cards_and_rows() {
+        let v = numbered();
+        assert_eq!(v.slot_width, 2);
+        let slot = |title: &str| v.agents().find(|a| a.title == title).and_then(|a| a.slot);
+        assert_eq!([slot("Handy.app Speech Commands"), slot("Kua Yu focus timing"), slot("Tmux Agent Sidebar"),
+            slot("Notch Tasks Orchestrator"), slot("Lost suit jacket"), slot("Notch hover animation"),
+            slot("Island resize spring"), slot("Commodities Job Tracker")],
+            [Some(1), Some(2), Some(4), Some(12), None, Some(3), Some(5), Some(8)]);
+        let f = layout(&v, 34, 58, &Opts::default());
+        let t = texts(&f);
+        let split = usize::from(f.split);
+        // Cards: the bar, then the number.
+        for card in ["▌01 ✕ Handy.app", "▌02 ◉ Kua Yu", "▌03 ◉ Notch hover", "▌08 ✓ Commodities"] {
+            assert!(t[..split].iter().any(|l| l.starts_with(card)), "{card}: {t:#?}");
+        }
+        // Rows: the same numbers, the titles aligned behind a 3-cell column.
+        let bottom = &t[split + 1..];
+        for row in [" 01 ✕ Handy.app", " 02 ◉ Kua Yu", " 04 ◐ Tmux Agent Sidebar", " 12 ◐ Notch Tasks"] {
+            assert!(bottom.iter().any(|l| l.starts_with(row)), "{row}: {t:#?}");
+        }
+        assert!(bottom.iter().all(|l| !l.contains("○ Lost suit") || l.starts_with("    ○ Lost suit")), "{t:#?}");
+        // Wider and taller: every agent on its own two lines, second lines indented past the number.
+        let f = layout(&v, 60, 120, &Opts::default());
+        let t = texts(&f);
+        assert_eq!(f.bottom_step, 0, "{t:#?}");
+        let r = find(&f, " 04 ◐ Tmux Agent Sidebar");
+        assert!(t[r + 1].starts_with("      working "), "{:?}", t[r + 1]);
+        assert!(t.iter().any(|l| l.starts_with("    ○ Lost suit jacket")), "{t:#?}");
+        let card = find(&f, "▌02 ◉ Kua Yu");
+        assert!(t[card + 1].starts_with("▌     asks Which deck?") && t[card + 2].starts_with("▌     main:2 · ✳ claude"),
+            "{t:#?}");
+        // Squeezed until idle agents fold: the fold line has no numbers and
+        // its circles sit under the titles.
+        let f = (20..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.bottom_step == 2).unwrap();
+        let fold = texts(&f).into_iter().find(|l| l.contains(" idle · ")).unwrap();
+        assert!(fold.starts_with("      ○○"), "{fold:?}");
+        // One digit when no slot reaches 10.
+        let f = layout(&quiet(), 34, 58, &Opts::default());
+        assert!(texts(&f).iter().any(|l| l.starts_with(" 2 ◐ Tmux Agent Sidebar")));
     }
 
     #[test]
