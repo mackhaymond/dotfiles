@@ -6,8 +6,9 @@ and system traffic use their normal connections.
 
 ## Who can start it
 
-Only you, typing in a terminal: `seasnet-vpn start`, or a foreground
-`ssh seasnet` / `relayctl …` when the VPN is down. That opens UCLA sign-in in a
+A foreground command on a terminal, typed by you or run by an agent in its pty:
+`seasnet-vpn start`, or `ssh seasnet` / `relayctl …` when the VPN is down. That
+opens UCLA sign-in in a
 **Little Arc** window, so 1Password fills it, then Duo. Ctrl-C in the terminal
 cancels; an unfinished login times out after 5 minutes. Login progress and refusals
 are written to your terminal even when the caller hides ssh's stderr, which
@@ -17,16 +18,14 @@ Everything else rides an existing tunnel or fails at once with a one-line
 reason, and never opens the login window. That covers:
 
 - Mutagen
-- agents: the `agents` tmux session, `CLAUDECODE`/`CUA_AGENT_ID`, or a claude,
-  codex, opencode or cursor-agent process among the caller's ancestors
 - background jobs (`ssh seasnet &`)
 - BatchMode
 - anything with no controlling terminal
 
 An ssh whose `ConnectTimeout` is shorter than a login is refused too, rather
-than killed halfway through Duo; run `seasnet-vpn start` first. An agent may run
-`seasnet-vpn start` only with `SEASNET_VPN_ALLOW_AGENT_LOGIN=1`, meaning you
-said yes.
+than killed halfway through Duo; run `seasnet-vpn start` first. An agent whose
+shell has no terminal (a plain subprocess rather than a pty) falls under "no
+controlling terminal" and is refused.
 
 After a failed or cancelled login, SSH stops reopening the login for 1, 2, 4,
 … up to 30 minutes. `seasnet-vpn start` always tries right away.

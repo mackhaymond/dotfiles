@@ -50,7 +50,6 @@ class LifecycleTests(unittest.TestCase):
     def auth_context(self, auth, owned=None):
         contexts = [patch.object(vpn, "snapshot", return_value={}),
                     patch.object(vpn, "has_tty", return_value=True),
-                    patch.object(vpn, "agent_context", return_value=False),
                     patch.object(vpn, "resume_sync"),
                     patch.object(vpn, "owned_pid", owned or Mock(return_value=None)),
                     patch.object(vpn.subprocess, "Popen", return_value=auth),
@@ -318,7 +317,7 @@ class LifecycleTests(unittest.TestCase):
         return mocks
 
     def test_background_ssh_never_starts_login(self):
-        for kind in ("mutagen", "agent", "batch"):
+        for kind in ("mutagen", "batch"):
             self.proxy_context(kind)
             errors = io.StringIO()
             with patch.object(vpn, "start") as start, patch.object(vpn.subprocess, "Popen") as popen, \
@@ -349,14 +348,10 @@ class LifecycleTests(unittest.TestCase):
         vpn.record_login(True)
         self.assertFalse((self.state / "login-failures.json").exists())
 
-    def test_start_refuses_without_terminal_or_for_agents(self):
+    def test_start_refuses_without_terminal(self):
         with patch.object(vpn, "owned_pid", return_value=None), \
                 patch.object(vpn.subprocess, "Popen") as popen, redirect_stderr(io.StringIO()):
-            with patch.object(vpn, "has_tty", return_value=False):
-                self.assertEqual(vpn.start(), 1)
-            with patch.object(vpn, "has_tty", return_value=True), \
-                    patch.object(vpn, "agent_context", return_value=True), \
-                    patch.dict(os.environ, {"SEASNET_VPN_ALLOW_AGENT_LOGIN": ""}):
+            with patch.object(vpn, "has_tty", return_value=False), patch.dict(os.environ, {"CLAUDECODE": "1"}):
                 self.assertEqual(vpn.start(), 1)
         popen.assert_not_called()
         self.assertFalse((self.state / "login-attempt.json").exists())
@@ -472,24 +467,17 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("ConnectTimeout too short", errors.getvalue())
 
     def test_caller_kind_from_parent_ssh(self):
-        with patch.object(vpn, "agent_context", return_value=False):
+        with patch.object(vpn, "has_tty", return_value=True):
             self.assertEqual(vpn.caller_kind("/usr/bin/ssh -oConnectTimeout=5 -oServerAliveInterval=10 seasnet "
                                              ".mutagen/agents/0.18.1/mutagen-agent synchronizer"), "mutagen")
             self.assertEqual(vpn.caller_kind("ssh -o BatchMode=true seasnet"), "batch")
             self.assertEqual(vpn.caller_kind("ssh -oBatchMode=yes seasnet"), "batch")
             self.assertEqual(vpn.caller_kind("ssh seasnet"), "interactive")
-            with patch.object(vpn, "has_tty", return_value=False):
-                self.assertEqual(vpn.caller_kind("ssh seasnet"), "batch")
-        with patch.object(vpn, "agent_context", return_value=True):
-            self.assertEqual(vpn.caller_kind("ssh seasnet"), "agent")
-
-    def test_agent_ancestor_walks_process_tree(self):
-        me, parent = os.getpid(), os.getppid()
-        table = f"{me} {parent} /opt/homebrew/bin/python3\n{parent} 500 /bin/zsh\n500 400 /Users/x/.codex/bin/codex\n400 1 launchd\n"
-        with patch.object(vpn, "capture", return_value=Mock(stdout=table)):
-            self.assertEqual(vpn.agent_ancestor(), "codex")
-        with patch.object(vpn, "capture", return_value=Mock(stdout=table.replace("codex", "tmux"))):
-            self.assertIsNone(vpn.agent_ancestor())
+            # An agent's foreground pty command is interactive like Mack's.
+            with patch.dict(os.environ, {"CLAUDECODE": "1"}):
+                self.assertEqual(vpn.caller_kind("ssh seasnet"), "interactive")
+        with patch.object(vpn, "has_tty", return_value=False):
+            self.assertEqual(vpn.caller_kind("ssh seasnet"), "batch")
 
     def test_ours_tolerates_unparseable_args(self):
         with patch.object(vpn, "process", return_value=f"{os.getuid()} 1 /usr/bin/grep grep it's ocproxy"):

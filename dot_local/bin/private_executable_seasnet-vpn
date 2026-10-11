@@ -1,11 +1,11 @@
 #!/opt/homebrew/bin/python3
 """One userspace UCLA VPN forward, exclusively to cs35l.seas.ucla.edu:22.
 
-Who may start it: only a person at a terminal (`seasnet-vpn start`, or an
-interactive `ssh seasnet`), because UCLA login needs a person for Duo. Every
-other SSH -- Mutagen, agents, BatchMode, anything without a controlling
-terminal -- rides an existing tunnel or fails fast, and never opens the login
-window.
+Who may start it: a foreground command on a terminal (`seasnet-vpn start`, or
+an interactive `ssh seasnet`), typed by Mack or run by an agent in its pty;
+either way Mack finishes UCLA login and Duo in Little Arc. Every other SSH --
+Mutagen, BatchMode, background jobs, anything without a controlling terminal --
+rides an existing tunnel or fails fast, and never opens the login window.
 
 When it stops: after idle_minutes (config.toml) with no SSH transport besides
 Mutagen's and no change to any file a running seasnet Mutagen session syncs.
@@ -46,8 +46,6 @@ OSASCRIPT = f"{TEST_BIN}/osascript" if TEST_BIN else "/usr/bin/osascript"
 MUTAGEN = "/opt/homebrew/bin/mutagen"
 # Mutagen resolves ssh through MUTAGEN_SSH_PATH; ask the same ssh about routing.
 SSH = os.path.join(os.environ.get("MUTAGEN_SSH_PATH") or "/usr/bin", "ssh")
-TMUX = "/opt/homebrew/bin/tmux"
-AGENT_TMUX_SESSION = "agents"
 SELF = Path(__file__).resolve()
 DEFAULT_IDLE_MINUTES = 30
 CHECK_SECONDS = int(os.environ.get("SEASNET_VPN_CHECK_SECONDS") or 60)
@@ -499,45 +497,6 @@ def has_tty():
         os.close(fd)
 
 
-# Coding-agent CLIs that run commands on a terminal they share with a person.
-AGENT_PROGRAMS = {"claude", "codex", "opencode", "cursor-agent", "gemini", "aider", "goose", "amp"}
-
-
-def agent_ancestor():
-    try:
-        table = capture(["/bin/ps", "-axo", "pid=,ppid=,comm="]).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    parents, names = {}, {}
-    for line in table.splitlines():
-        fields = line.split(None, 2)
-        if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
-            parents[int(fields[0])], names[int(fields[0])] = int(fields[1]), Path(fields[2].strip()).name
-    pid, seen = os.getpid(), set()
-    while pid > 1 and pid not in seen:
-        seen.add(pid)
-        if names.get(pid) in AGENT_PROGRAMS:
-            return names[pid]
-        pid = parents.get(pid, 1)
-    return None
-
-
-def agent_context():
-    """Commands from coding agents: Claude/cua env markers, the pty MCP's tmux
-    session, or an agent CLI anywhere among this process's ancestors."""
-    if os.environ.get("CLAUDECODE") or os.environ.get("CUA_AGENT_ID"):
-        return True
-    pane = os.environ.get("TMUX_PANE")
-    if pane and os.environ.get("TMUX"):
-        try:
-            session = capture([TMUX, "display-message", "-p", "-t", pane, "#{session_name}"]).stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            session = ""
-        if session == AGENT_TMUX_SESSION:
-            return True
-    return agent_ancestor() is not None
-
-
 @contextmanager
 def to_terminal():
     """Point this block's prints at the person's terminal. relayctl captures
@@ -570,8 +529,8 @@ def caller_kind(parent):
         return "mutagen"
     if re.search(r"batchmode\s*[= ]\s*(yes|true)\b", parent, re.IGNORECASE):
         return "batch"
-    if agent_context():
-        return "agent"
+    # Agents count as interactive: they run commands in a foreground pty, and
+    # the Little Arc login they open still needs Mack for 1Password and Duo.
     return "interactive" if has_tty() else "batch"
 
 
@@ -585,8 +544,6 @@ def login_timeout_too_short(parent):
 REFUSALS = {
     "mutagen": "seasnet-vpn: the VPN is down. Background Mutagen sync never opens UCLA login, so its "
                "seasnet sessions are paused until you run `seasnet-vpn start` or `ssh seasnet`.",
-    "agent": "seasnet-vpn: the VPN is down. This SSH came from an agent, so no UCLA login opens. "
-             "Ask Mack to run `seasnet-vpn start` in his terminal.",
     "batch": "seasnet-vpn: the VPN is down. This SSH is not a foreground terminal command (or uses "
              "BatchMode), so no UCLA login opens. Run `seasnet-vpn start` in a terminal first.",
     "timeout": "seasnet-vpn: the VPN is down. This SSH sets a ConnectTimeout too short to finish UCLA "
@@ -776,10 +733,6 @@ def start(username=None, terminal_auth=False):
     if not has_tty():
         print("seasnet-vpn: refusing to open UCLA login without a terminal. Run `seasnet-vpn start` "
               "in your terminal.", file=sys.stderr)
-        return 1
-    if agent_context() and not os.environ.get("SEASNET_VPN_ALLOW_AGENT_LOGIN"):
-        print("seasnet-vpn: refusing to open UCLA login for an agent. Ask Mack to run "
-              "`seasnet-vpn start` in his terminal.", file=sys.stderr)
         return 1
     if terminal_auth and not sys.stdin.isatty():
         print("Start in your terminal for private UCLA login and Duo: seasnet-vpn start", file=sys.stderr)
