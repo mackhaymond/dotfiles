@@ -4,7 +4,11 @@
 <dict>
   <key>Label</key><string>com.mackhaymond.claude-sleep-guard</string>
   <key>ProgramArguments</key>
-  <array><string>{{ .chezmoi.homeDir }}/.local/bin/claude-sleep-guard</string><string>daemon</string></array>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>{{ .chezmoi.homeDir }}/.local/state/claude-sleep-guard/versions/{{ include "dot_config/claude-sleep-guard/guard.py" | sha256sum }}/guard.py</string>
+    <string>daemon</string>
+  </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>

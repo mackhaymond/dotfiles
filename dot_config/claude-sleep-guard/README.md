@@ -1,35 +1,74 @@
 Claude sleep guard
 =================
 
-The `com.mackhaymond.claude-sleep-guard` LaunchAgent receives IOKit
-`SystemWillSleep` notifications and sends SIGSTOP to local Claude Code CLI
-processes before acknowledging sleep. A background wake without the IOKit
-graphics capability leaves them suspended. Full wake sends SIGCONT only to
-processes this guard suspended, checking PID and process start time first.
-Subagents inside those CLI processes pause with their parent. Existing tool
-processes can continue during wake windows; this does not cancel shell jobs.
+The `com.mackhaymond.claude-sleep-guard` LaunchAgent controls local native
+Claude Code and Codex CLI processes and their provably owned descendants.
+It uses native target-capability notifications to suspend work before an
+unwanted transition is acknowledged, plus lid notifications and periodic
+reconciliation. A public sleep-notification backend is available if the
+target-capability SPI is unavailable; status/readiness identifies the backend.
 
-Screen locking and display sleep do not change system graphics capability
-and do not trigger a pause. The guard never changes Mac sleep settings,
-account selection, cswap thresholds, or quota policies. It never signals the
-Claude desktop GUI. It recognizes the installed native CLI binaries under
-`~/.local/share/claude/versions/` and Homebrew `Cellar/claude-code/`.
+The admission rule is shared by the daemon and Claude hooks:
 
-UserPromptSubmit and PostToolBatch hooks also stop a new agent loop if a CLI
-starts during DarkWake. Already-running sessions are protected by the native
-process suspension; hook configuration may need a session restart to load.
+| State | Coding work |
+| --- | --- |
+| Lid open, CPU and graphics available | Allowed, including display sleep/lock |
+| Lid closed, Awake OFF | Paused, including full notification wakes |
+| Lid closed, Awake ON and closed-lid mode enabled, above its battery floor or on AC, with a live hold and effective override | Allowed even without graphics |
+| CPU unavailable or required native state unknown | Paused |
 
-An API request already accepted by the server can finish there while the
-client is suspended. This prevents further local requests, not retroactive
-cancellation of server work. A real sleep/DarkWake cycle must be inspected
-after use; automated tests simulate transitions with an isolated child.
+Wireless DarkWake, SleepService, Maintenance and incidental full wakes cannot
+override closed-lid OFF intent. Awake intent comes from live native assertions
+owned by the Awake executable; a saved "engaged" preference is never proof.
+Current settings and battery checks also prevent stale kernel metadata from
+allowing work after Awake disables its override at the configured floor.
+
+The guard never changes Mac sleep settings, Awake settings, account selection,
+cswap thresholds, or quota policies. It never signals GUI app processes or
+shared tmux servers. CLI identification uses executable paths; identity checks
+include native process start seconds/microseconds and executable path before
+each signal. Children are rescanned until the owned family is suspended,
+including tools that outlive their agent root. Manually stopped processes
+are not claimed or resumed.
+
+UserPromptSubmit and PostToolBatch hooks also stop a new Claude loop when the
+same admission rule denies work. Existing sessions are protected by native
+process suspension; hook changes may need a session restart to load. Polling
+reconciles new CLI processes and Awake assertion/settings changes every five
+seconds. This is not a kernel-level veto of every new process spawn.
+
+An API request already accepted by the server can finish while its client is
+suspended. Detached jobs launched through a shared tmux/MCP server have no
+provable descendant relationship and remain outside suspension; pausing a
+shared server would affect other sessions. Remote/cloud agents are also
+outside this local guard. A real lid-close/Awake cycle must still be inspected
+after use; tests exercise real isolated process suspension and native observer
+registration without changing the user's power state.
+
+Ownership is written durably to two validated journals before STOP. Restart
+recovers from either intact copy. If both are corrupt, the guard refuses to
+guess ownership; preserve them for manual inspection. On graceful shutdown it
+releases owned work only when the current admission rule permits it.
+
+The installer pins each daemon to a verified immutable runtime, waits for
+native listener readiness (matching PID and runtime), and restores a prior
+runtime if startup fails. The initial legacy migration requires lid-open full
+wake and no owned pauses. It pins the legacy source before replacement. A
+legacy rollback cannot start while incompatible new ownership remains: it
+releases those stops only when policy permits, otherwise preserves the
+journals and removes the unsafe auto-load plist for explicit recovery.
 
 Inspect: `claude-sleep-guard status`
 Log: `~/Library/Logs/claude-sleep-guard.log`
-Test: `python3 ~/.config/claude-sleep-guard/test_guard.py`
+Test: `/usr/bin/python3 ~/.config/claude-sleep-guard/test_guard.py`
+Installer/settings tests (source tree):
+`/usr/bin/python3 ~/.local/share/chezmoi/dot_config/claude-sleep-guard/test_install.py`
 
-To uninstall: boot out `gui/$(id -u)/com.mackhaymond.claude-sleep-guard`,
-resume any owned PIDs listed in its state file only after confirming their
-start times, remove the two managed hooks and the LaunchAgent, and remove
-the guard's chezmoi files/install script. Unloading alone deliberately does
-not thaw paused work during DarkWake.
+To uninstall during a normal awake session:
+`launchctl bootout gui/$(id -u)/com.mackhaymond.claude-sleep-guard`, then
+`claude-sleep-guard release`. Release/recover acquires the daemon lock and
+resumes only owned matching identities; it is an explicit override of the
+sleep policy, so do not use it to resume work unintentionally while asleep.
+Remove the two managed hooks, LaunchAgent, and chezmoi guard/install files.
+Unloading alone deliberately does not thaw work while the admission rule
+denies it. Fix/reinstall after a blocked legacy rollback before the next sleep.

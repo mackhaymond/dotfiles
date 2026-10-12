@@ -378,6 +378,6 @@ jq -s --argjson full "$FULL" --argjson managed "$MANAGED" '
   (.[0] // {}) as $live
   | ($full | with_entries(select(.key as $k | $managed | index($k)))) as $m
   | ($full | with_entries(select(.key as $k | $managed | index($k) | not))) as $d
-  | ($live * $m)
+  | ($live + $m)
   | . + ($d | with_entries(select(.key as $k | $live | has($k) | not)))
 '
