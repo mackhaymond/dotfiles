@@ -54,6 +54,17 @@ FULL=$(cat <<'EOF'
   },
   "model": "opus[1m]",
   "hooks": {
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.local/bin/claude-sleep-guard hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "Notification": [
       {
         "matcher": "permission_prompt",
@@ -300,6 +311,15 @@ FULL=$(cat <<'EOF'
       }
     ],
     "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.local/bin/claude-sleep-guard hook",
+            "timeout": 5
+          }
+        ]
+      },
       {
         "hooks": [
           {

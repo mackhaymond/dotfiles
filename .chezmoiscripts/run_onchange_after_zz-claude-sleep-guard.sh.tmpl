@@ -1,0 +1,13 @@
+#!/bin/sh
+# guard: {{ include "dot_config/claude-sleep-guard/guard.py" | sha256sum }}
+# launchagent: {{ include "dot_config/claude-sleep-guard/launchagent.plist.tmpl" | sha256sum }}
+set -eu
+{{ if eq .chezmoi.os "darwin" -}}
+label=com.mackhaymond.claude-sleep-guard
+domain="gui/$(id -u)"
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+cp "$HOME/.config/claude-sleep-guard/launchagent.plist" "$HOME/Library/LaunchAgents/$label.plist"
+chmod 644 "$HOME/Library/LaunchAgents/$label.plist"
+launchctl bootout "$domain/$label" 2>/dev/null || true
+launchctl bootstrap "$domain" "$HOME/Library/LaunchAgents/$label.plist"
+{{ end -}}
