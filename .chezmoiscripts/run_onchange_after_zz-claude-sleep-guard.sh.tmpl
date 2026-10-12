@@ -37,6 +37,16 @@ if ! plutil -lint "$guard_candidate" >/dev/null; then
 fi
 guard_old_exists=false
 guard_had_service=false
+guard_wait_removed() {
+    for guard_removal_attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        if ! launchctl print "$guard_domain/$guard_label" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    echo "Sleep guard service is still exiting; bootstrap deferred" >&2
+    return 1
+}
 if [ -f "$guard_plist" ]; then
     cp "$guard_plist" "$guard_previous"
     guard_old_exists=true
@@ -44,6 +54,10 @@ fi
 if launchctl print "$guard_domain/$guard_label" >/dev/null 2>&1; then
     guard_had_service=true
     if ! launchctl bootout "$guard_domain/$guard_label"; then
+        rm -f "$guard_candidate" "$guard_previous"
+        exit 1
+    fi
+    if ! guard_wait_removed; then
         rm -f "$guard_candidate" "$guard_previous"
         exit 1
     fi
@@ -74,6 +88,10 @@ fi
 if ! "$guard_started"; then
     echo "New sleep guard failed startup; restoring previous service" >&2
     launchctl bootout "$guard_domain/$guard_label" 2>/dev/null || true
+    if ! guard_wait_removed; then
+        rm -f "$guard_previous"
+        exit 1
+    fi
     if "$guard_old_exists"; then
         if ! /usr/bin/python3 - "$guard_previous" "$guard_runtime/guard.py" "$guard_home" <<'PY'
 import fcntl, importlib.util, json, sys
@@ -90,7 +108,7 @@ if (runtime.parent / '.legacy').exists():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         journal = guard.Ownership(guard.STATE)
         if journal.value['held']:
-            if not guard.allowed(guard.Power().snapshot()):
+            if not guard.allowed(guard.Power().snapshot(), journal.value):
                 raise RuntimeError('Legacy rollback cannot resume coding work while current policy denies it')
             controller = guard.Guard(None)
             controller.release()

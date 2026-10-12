@@ -1,8 +1,8 @@
-"""Hold local Claude/Codex CLI work when the Mac is not intentionally awake.
+"""Pause local coding-agent trees only across actual system sleep.
 
-Lid closed requires a live, verified Awake hold and the kernel clamshell
-sleep override. Lid open requires CPU and graphics capability. No GUI control,
-settings changes, arguments, credentials, network requests or quota checks.
+CPU-target loss arms a durable hold before acknowledging sleep. Incidental
+wakes retain it until generic OS metadata identifies an interactive full wake.
+Display-off/headless operation without system sleep never arms the guard.
 """
 import argparse
 import ctypes as C
@@ -21,30 +21,69 @@ CPU, GRAPHICS = 1, 2  # Shared by registry and IOPMConnection capability masks.
 WILL_SLEEP, HAS_POWERED_ON, WILL_NOT_SLEEP = 0xe0000280, 0xe0000300, 0xe0000290
 
 
-def allowed(snapshot):
-    """Shared daemon/hook policy. Unknown native state fails closed."""
-    if snapshot.get('cpu') is not True:
+INTERACTIVE_WAKE_TYPES = {'User', 'HID Activity', 'Lid Open'}
+BACKGROUND_WAKE_TYPES = {'SleepService', 'Maintenance', 'SleepTimer', 'Network', 'Notification', 'Alarm', 'LowBattery'}
+
+
+def valid_epoch(value):
+    if not isinstance(value, str):
         return False
-    if snapshot.get('lidClosed') is True:
-        return snapshot.get('liveAwakeHold') is True and snapshot.get('clamshellOverride') is True
-    return snapshot.get('lidClosed') is False and snapshot.get('graphics') is True
+    parts = value.split(':')
+    return len(parts) == 2 and all(part.isdigit() for part in parts) and int(parts[0]) > 0 and int(parts[1]) < 1000000
 
 
-def awake_lid_preferences(enabled, floor):
-    # Mirror Awake defaults; malformed enable values fail closed. Floor values
-    # outside its settings choices use Awake's own default of 20 percent.
-    enabled = True if enabled is None else enabled is True or type(enabled) is int and enabled == 1
-    floor = floor if type(floor) is int and floor in (10, 20, 30, 50) else 20
-    return enabled, floor
+class TimeVal(C.Structure):
+    _fields_ = [('seconds', C.c_long), ('microseconds', C.c_int32)]
 
 
-def headless_eligible(enabled, floor, status):
-    if enabled is not True:
+def wake_epoch():
+    """Kernel's actual wake timestamp; no subprocess or wall-clock timeout."""
+    libc = C.CDLL('/usr/lib/libSystem.B.dylib')
+    libc.sysctlbyname.argtypes = [C.c_char_p, C.c_void_p, C.POINTER(C.c_size_t), C.c_void_p, C.c_size_t]
+    value, length = TimeVal(), C.c_size_t(C.sizeof(TimeVal))
+    if libc.sysctlbyname(b'kern.waketime', C.byref(value), C.byref(length), None, 0) != 0 or length.value != C.sizeof(value):
+        return None
+    epoch = '%d:%d' % (value.seconds, value.microseconds)
+    return epoch if valid_epoch(epoch) else None
+
+
+def interactive(snapshot):
+    return (snapshot.get('cpu') is True and snapshot.get('graphics') is True and
+            (snapshot.get('userTriggeredFullWake') is True or snapshot.get('wakeType') in INTERACTIVE_WAKE_TYPES))
+
+
+def policy_state(state, snapshot):
+    """Read-only interpretation shared by hooks/status and daemon startup."""
+    result = state.copy()
+    if 'sleepHold' not in result:
+        background = snapshot.get('wakeType') in BACKGROUND_WAKE_TYPES and snapshot.get('userTriggeredFullWake') is not True
+        result['sleepHold'] = bool(result.get('held')) or snapshot.get('cpu') is False or background
+        result['sleepPhase'] = 'waking' if snapshot.get('cpu') is True else 'sleeping'
+    epoch = snapshot.get('wakeEpoch')
+    if result.get('sleepPhase') == 'armed':
+        baseline = result.get('sleepWakeEpoch')
+        if valid_epoch(epoch) and valid_epoch(baseline) and epoch != baseline:
+            result['sleepPhase'] = 'waking'
+            result.pop('preSleepHold', None)
+    else:
+        previous = result.get('lastWakeEpoch')
+        if valid_epoch(epoch) and valid_epoch(previous) and epoch != previous:
+            result.update(sleepHold=True, sleepPhase='waking')
+            result.pop('preSleepHold', None)
+    if snapshot.get('cpu') is False:
+        result.update(sleepHold=True, sleepPhase='sleeping')
+    elif result.get('sleepHold') and result.get('sleepPhase') == 'sleeping' and snapshot.get('cpu') is True:
+        result['sleepPhase'] = 'waking'
+    return result
+
+
+def allowed(snapshot, state=None):
+    state = policy_state({} if state is None else state, snapshot)
+    if snapshot.get('cpu') is False:
         return False
-    if status.get('onAC') is True:
-        return True
-    percent = status.get('batteryPercent')
-    return status.get('onAC') is False and type(percent) is int and 0 <= percent <= 100 and percent > floor
+    if not state['sleepHold']:
+        return True  # Graphics loss alone never means system sleep.
+    return state.get('sleepPhase') == 'waking' and interactive(snapshot)
 
 
 def save_json(path, value):
@@ -72,6 +111,10 @@ def valid_state(value):
     if not isinstance(value, dict) or not isinstance(value.get('held'), dict):
         return False
     if not isinstance(value.get('generation', 0), int) or isinstance(value.get('generation', 0), bool):
+        return False
+    if 'sleepHold' in value and type(value['sleepHold']) is not bool:
+        return False
+    if 'sleepPhase' in value and value['sleepPhase'] not in ('awake', 'armed', 'sleeping', 'waking'):
         return False
     for pid, entry in value['held'].items():
         if not isinstance(pid, str) or not pid.isdigit() or int(pid) <= 1 or not isinstance(entry, dict):
@@ -213,30 +256,6 @@ def same_identity(entry, proc):
     return bool(proc and entry.get('start') == proc.get('start') and entry.get('path') == proc.get('path'))
 
 
-def qualified_awake(assertions, path_for_pid):
-    if not isinstance(assertions, dict):
-        return False
-    for pid, entries in assertions.items():
-        try:
-            owner = path_for_pid(int(pid))
-        except (ValueError, TypeError, OSError):
-            continue
-        if not owner.endswith('/Awake.app/Contents/MacOS/Awake') or not isinstance(entries, list):
-            continue
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            name = entry.get('AssertName', '')
-            level = entry.get('AssertLevel', 0)
-            kind = entry.get('AssertType')
-            if (isinstance(name, str) and
-                (name == 'com.mackhaymond.Awake: Manual hold' or name.startswith('com.mackhaymond.Awake: Timed hold (')) and
-                isinstance(level, (int, float)) and level > 0 and
-                kind in ('PreventUserIdleSystemSleep', 'PreventSystemSleep', 'NoIdleSleepAssertion', 'NoSystemSleepAssertion', 'PreventUserIdleDisplaySleep', 'NoDisplaySleepAssertion')):
-                return True
-    return False
-
-
 class Power:
     """Native read-only power state and acknowledged target-capability events."""
     def __init__(self):
@@ -249,20 +268,11 @@ class Power:
             'IOObjectRelease': (C.c_int, [C.c_uint]),
             'IOAllowPowerChange': (C.c_int, [C.c_uint, C.c_long]),
             'IONotificationPortGetRunLoopSource': (C.c_void_p, [C.c_void_p]),
-            'IOPMCopyAssertionsByProcess': (C.c_int, [C.POINTER(C.c_void_p)]),
-            'IOPSCopyPowerSourcesInfo': (C.c_void_p, []),
-            'IOPSGetProvidingPowerSourceType': (C.c_void_p, [C.c_void_p]),
-            'IOPSCopyPowerSourcesList': (C.c_void_p, [C.c_void_p]),
-            'IOPSGetPowerSourceDescription': (C.c_void_p, [C.c_void_p, C.c_void_p]),
         }
         for name, (ret, args) in signatures.items():
             fn = getattr(self.io, name); fn.restype = ret; fn.argtypes = args
         for name, ret, args in (
             ('CFStringCreateWithCString', C.c_void_p, [C.c_void_p, C.c_char_p, C.c_uint]),
-            ('CFPreferencesCopyAppValue', C.c_void_p, [C.c_void_p, C.c_void_p]),
-            ('CFPreferencesAppSynchronize', C.c_bool, [C.c_void_p]),
-            ('CFArrayGetCount', C.c_long, [C.c_void_p]),
-            ('CFArrayGetValueAtIndex', C.c_void_p, [C.c_void_p, C.c_long]),
             ('CFRelease', None, [C.c_void_p]),
             ('CFRunLoopGetCurrent', C.c_void_p, []),
             ('CFRunLoopAddSource', None, [C.c_void_p, C.c_void_p, C.c_void_p]),
@@ -274,11 +284,9 @@ class Power:
             raise RuntimeError('IOPMrootDomain unavailable')
         self.connection = None
         self.loop = None
-        self.backend = "legacy"
+        self.backend = "connection"
 
     def decode(self, value):
-        # Assertion dictionaries have CFNumber PID keys, so they cannot be
-        # serialized as a property list (plist dictionary keys must be strings).
         if not value:
             return None
         cf = self.cf
@@ -288,14 +296,10 @@ class Power:
             'CFNumberGetValue': (C.c_bool, [C.c_void_p, C.c_int, C.c_void_p]),
             'CFStringGetLength': (C.c_long, [C.c_void_p]),
             'CFStringGetCString': (C.c_bool, [C.c_void_p, C.c_void_p, C.c_long, C.c_uint]),
-            'CFArrayGetCount': (C.c_long, [C.c_void_p]),
-            'CFArrayGetValueAtIndex': (C.c_void_p, [C.c_void_p, C.c_long]),
-            'CFDictionaryGetCount': (C.c_long, [C.c_void_p]),
-            'CFDictionaryGetKeysAndValues': (None, [C.c_void_p, C.c_void_p, C.c_void_p]),
         }
         for name, (ret, args) in signatures.items():
             fn = getattr(cf, name); fn.restype = ret; fn.argtypes = args
-        for name in ('CFBooleanGetTypeID', 'CFNumberGetTypeID', 'CFStringGetTypeID', 'CFArrayGetTypeID', 'CFDictionaryGetTypeID'):
+        for name in ('CFBooleanGetTypeID', 'CFNumberGetTypeID', 'CFStringGetTypeID'):
             getattr(cf, name).restype = C.c_ulong
         kind = cf.CFGetTypeID(value)
         if kind == cf.CFBooleanGetTypeID():
@@ -306,13 +310,6 @@ class Power:
         if kind == cf.CFStringGetTypeID():
             buf = C.create_string_buffer(cf.CFStringGetLength(value) * 4 + 1)
             return buf.value.decode(errors='replace') if cf.CFStringGetCString(value, buf, len(buf), 0x08000100) else None
-        if kind == cf.CFArrayGetTypeID():
-            return [self.decode(cf.CFArrayGetValueAtIndex(value, index)) for index in range(cf.CFArrayGetCount(value))]
-        if kind == cf.CFDictionaryGetTypeID():
-            count = cf.CFDictionaryGetCount(value)
-            keys, values = (C.c_void_p * count)(), (C.c_void_p * count)()
-            cf.CFDictionaryGetKeysAndValues(value, keys, values)
-            return {self.decode(keys[index]): self.decode(values[index]) for index in range(count)}
         return None
 
     def property(self, name):
@@ -326,85 +323,21 @@ class Power:
                 self.cf.CFRelease(prop)
             self.cf.CFRelease(key)
 
-    def awake_preferences(self):
-        app = self.cf.CFStringCreateWithCString(None, b'com.mackhaymond.Awake', 0x08000100)
-        values = []
-        try:
-            # Refresh this process's cached preferences after user changes.
-            if not self.cf.CFPreferencesAppSynchronize(app):
-                return False, 20
-            for name in ('awake.lidClosedStaysAwake', 'awake.lidClosedBatteryFloor'):
-                key = self.cf.CFStringCreateWithCString(None, name.encode(), 0x08000100)
-                value = None
-                try:
-                    value = self.cf.CFPreferencesCopyAppValue(key, app)
-                    values.append(self.decode(value))
-                finally:
-                    if value:
-                        self.cf.CFRelease(value)
-                    self.cf.CFRelease(key)
-        finally:
-            self.cf.CFRelease(app)
-        return awake_lid_preferences(*values)
-
-    def power_status(self):
-        info = self.io.IOPSCopyPowerSourcesInfo()
-        status = {'onAC': None, 'batteryPercent': None}
-        if not info:
-            return status
-        sources = None
-        try:
-            providing = self.decode(self.io.IOPSGetProvidingPowerSourceType(info))
-            if providing == 'AC Power':
-                status['onAC'] = True
-            elif providing == 'Battery Power':
-                status['onAC'] = False
-            sources = self.io.IOPSCopyPowerSourcesList(info)
-            if sources:
-                for index in range(self.cf.CFArrayGetCount(sources)):
-                    source = self.cf.CFArrayGetValueAtIndex(sources, index)
-                    desc = self.decode(self.io.IOPSGetPowerSourceDescription(info, source))
-                    if not isinstance(desc, dict) or desc.get('Type') != 'InternalBattery':
-                        continue
-                    current, maximum = desc.get('Current Capacity'), desc.get('Max Capacity')
-                    if type(current) is int and type(maximum) is int and maximum > 0 and 0 <= current <= maximum:
-                        status['batteryPercent'] = current * 100 // maximum
-        finally:
-            if sources:
-                self.cf.CFRelease(sources)
-            self.cf.CFRelease(info)
-        return status
-
     def snapshot(self):
         caps = self.property('System Capabilities')
-        assertions = C.c_void_p()
-        own_hold = False
-        try:
-            if self.io.IOPMCopyAssertionsByProcess(C.byref(assertions)) == 0 and assertions.value:
-                own_hold = qualified_awake(self.decode(assertions), native().path)
-        finally:
-            if assertions.value:
-                self.cf.CFRelease(assertions)
-        enabled, floor = self.awake_preferences()
-        status = self.power_status()
-        eligible = headless_eligible(enabled, floor, status)
-        published_override = self.property('AppleClamshellCausesSleep') is False
-        return {'cpu': isinstance(caps, int) and bool(caps & CPU),
-                'graphics': isinstance(caps, int) and bool(caps & GRAPHICS),
-                'lidClosed': self.property('AppleClamshellState'),
-                'clamshellOverride': published_override and eligible,
-                'clamshellPublishedOverride': published_override,
-                'headlessEligible': eligible, 'lidClosedEnabled': enabled,
-                'batteryFloor': floor, **status,
-                'liveAwakeHold': own_hold}
-
-    def full_wake(self):
-        return allowed(self.snapshot())
+        return {'cpu': bool(caps & CPU) if type(caps) is int else None,
+                'graphics': bool(caps & GRAPHICS) if type(caps) is int else None,
+                'wakeType': self.property('Wake Type'),
+                'userTriggeredFullWake': self.property('IOPMUserTriggeredFullWake'),
+                'wakeEpoch': wake_epoch()}
 
     def target_event(self, guard, token, caps, acknowledge):
         """Freeze before acknowledging a disallowed target; ack even on errors."""
         try:
-            snapshot = self.snapshot()
+            try:
+                snapshot = self.snapshot()
+            except Exception:
+                snapshot = {'wakeEpoch': wake_epoch()}
             snapshot.update(cpu=bool(caps & CPU), graphics=bool(caps & GRAPHICS))
             guard.transition(snapshot)
         except Exception as exc:
@@ -414,13 +347,12 @@ class Power:
 
     def legacy_event(self, guard, kind, arg, acknowledge):
         try:
-            if kind == WILL_SLEEP and getattr(self, 'backend', 'legacy') != 'connection':
-                snapshot = self.snapshot()
-                snapshot.update(cpu=False, graphics=False)
-                guard.transition(snapshot)
-            elif kind in (HAS_POWERED_ON, WILL_NOT_SLEEP):
-                guard.clear_transition()
-                guard.tick()
+            if kind == WILL_NOT_SLEEP:
+                guard.cancel_sleep()
+            elif kind == HAS_POWERED_ON:
+                guard.woke()
+            # Legacy WillSleep includes graphics-only full->dark transitions.
+            # It is acknowledged, but only target CPU loss can arm the hold.
         except Exception as exc:
             print('sleep guard power callback: ' + type(exc).__name__, file=sys.stderr, flush=True)
         finally:
@@ -468,8 +400,8 @@ class Power:
             if self.connection:
                 self.io.IOPMConnectionRelease(self.connection)
                 self.connection = None
-            print('Using public sleep listener fallback: ' + type(exc).__name__, flush=True)
-        # Always keep legacy sleep/cancel notifications; no sticky WillSleep flag.
+            raise RuntimeError('CPU-target observer unavailable; refusing ambiguous legacy sleep policy') from exc
+        # Public cancellation/wake notifications supplement CPU target events.
         legacytype = C.CFUNCTYPE(None, C.c_void_p, C.c_uint, C.c_uint, C.c_void_p)
         port = C.c_void_p(); notifier = C.c_uint(); root_connection = C.c_uint(0)
         def legacy(ref, service, kind, arg):
@@ -543,33 +475,70 @@ class Power:
 
 
 class Guard:
-    def __init__(self, power, state_path=None, scanner=processes, lookup=process, kill=os.kill, clock=time.monotonic):
+    def __init__(self, power, state_path=None, scanner=processes, lookup=process, kill=os.kill):
         self.power = power
         self.journal = Ownership(STATE if state_path is None else state_path)
         self.state = self.journal.value
-        self.scanner, self.lookup, self.kill, self.clock = scanner, lookup, kill, clock
-        self.target = None
-        self.target_until = 0
+        self.scanner, self.lookup, self.kill = scanner, lookup, kill
         self.shutting_down = False
 
-    def clear_transition(self):
-        self.target = None
-
     def transition(self, snapshot):
-        self.target = snapshot
-        self.target_until = self.clock() + 10
+        try:
+            current = self.power.snapshot()
+        except Exception:
+            current = {**snapshot, 'cpu': None, 'graphics': None}
+        if snapshot.get('cpu') is False:
+            if self.state.get('sleepPhase') != 'armed':
+                self.state['preSleepHold'] = policy_state(self.state, current)['sleepHold']
+            self.state.update(sleepHold=True, sleepPhase='armed', targetCPU=False, sleepWakeEpoch=current.get('wakeEpoch'))
+            self.journal.save()  # Durable before stopping work and acknowledging.
+        elif snapshot.get('cpu') is True:
+            if self.state.get('targetCPU') is False and self.state.get('sleepHold'):
+                self._finish_attempt(current)
+            self.state['targetCPU'] = True
+            self.journal.save()
+        self.tick(snapshot=current)
+
+    def _finish_attempt(self, snapshot):
+        epoch, baseline = snapshot.get('wakeEpoch'), self.state.get('sleepWakeEpoch')
+        # Native CPU gain without a physical wake is sleep cancellation. It
+        # must restore continuous headless work, including dark clients that
+        # do not receive the public WillNotSleep notification.
+        canceled = valid_epoch(epoch) and valid_epoch(baseline) and epoch == baseline
+        prior = self.state.pop('preSleepHold', self.state.get('sleepHold', False))
+        hold = prior if canceled else self.state.get('sleepHold', False)
+        self.state.update(sleepHold=hold, sleepPhase='waking' if hold else 'awake')
+
+    def cancel_sleep(self):
+        if 'preSleepHold' in self.state:
+            hold = self.state.pop('preSleepHold')
+            self.state.update(sleepHold=hold, sleepPhase='waking' if hold else 'awake', targetCPU=True)
+            self.journal.save()
+        self.tick()
+
+    def woke(self):
+        if self.state.get('sleepHold'):
+            self._finish_attempt(self.power.snapshot())
+            self.journal.save()
         self.tick()
 
     def policy(self, snapshot):
-        # Target caps are only a short transition fence. Canceled/missed events
-        # cannot leave a permanent sleep_pending lockout.
-        if self.target is not None:
-            if self.clock() >= self.target_until or (
-                    snapshot.get('cpu') == self.target.get('cpu') and snapshot.get('graphics') == self.target.get('graphics')):
-                self.target = None
-            elif not allowed(self.target):
-                return False
-        return allowed(snapshot)
+        return allowed(snapshot, self.state)
+
+    def _reconcile_phase(self, snapshot):
+        new = policy_state(self.state, snapshot)
+        epoch = snapshot.get('wakeEpoch')
+        if valid_epoch(epoch):
+            new['lastWakeEpoch'] = epoch
+        if snapshot.get('cpu') is False:
+            new.update(sleepHold=True, sleepPhase='sleeping')
+        if allowed(snapshot, new) and new.get('sleepHold'):
+            new.update(sleepHold=False, sleepPhase='awake')
+            new.pop('preSleepHold', None)
+        if new != self.state:
+            self.state.clear()
+            self.state.update(new)
+            self.journal.save()
 
     def _migrate(self, table):
         changed = False
@@ -637,6 +606,15 @@ class Guard:
         table = self.scanner()
         self._migrate(table)
         self._release()
+        # Explicit recovery also resolves a pending attempt whose cancel event
+        # was lost while the daemon was down. Capture the current OS wake epoch
+        # so a stale wake label cannot immediately recreate that cleared hold.
+        self.state.update(sleepHold=False, sleepPhase='awake', targetCPU=True)
+        self.state.pop('preSleepHold', None)
+        epoch = wake_epoch() if self.power is None else self.power.snapshot().get('wakeEpoch')
+        if valid_epoch(epoch):
+            self.state['lastWakeEpoch'] = epoch
+        self.journal.save()
 
     def terminate(self):
         self.shutting_down = True
@@ -645,11 +623,12 @@ class Guard:
         else:
             self.journal.save()  # Restart must recover these owned stops.
 
-    def tick(self, sleeping=False, snapshot=None):
+    def tick(self, snapshot=None):
         if self.shutting_down:
             return
         snapshot = self.power.snapshot() if snapshot is None else snapshot
-        permit = not sleeping and self.policy(snapshot)
+        self._reconcile_phase(snapshot)
+        permit = self.policy(snapshot)
         table = self.scanner()
         self._migrate(table)
         if permit:
@@ -686,10 +665,10 @@ class Guard:
                     break
             else:
                 raise RuntimeError('Owned process tree did not settle; retrying next reconciliation')
-        reason = ('allowed' if permit else 'system-sleep' if sleeping else
-                  'cpu-unavailable' if not snapshot.get('cpu') else
-                  'closed-lid-without-live-Awake-override' if snapshot.get('lidClosed') is True else
-                  'graphics-or-lid-state-unavailable')
+        reason = ('awake-without-system-sleep' if permit else
+                  'system-sleep-pending' if self.state.get('sleepPhase') == 'armed' else
+                  'cpu-unavailable' if snapshot.get('cpu') is not True else
+                  'waiting-for-interactive-wake')
         if self.state.get('allowed') != permit or self.state.get('reason') != reason:
             self.state['allowed'] = permit
             self.state['reason'] = reason
@@ -699,12 +678,17 @@ class Guard:
 
 def hook():
     try:
-        permit = allowed(Power().snapshot())
+        state = Ownership(STATE, repair=False).value
+        try:
+            snapshot = Power().snapshot()
+        except Exception:
+            snapshot = {'cpu': None, 'wakeEpoch': wake_epoch()}
+        permit = allowed(snapshot, state)
     except Exception:
-        permit = False
+        permit = False  # Unreadable ownership cannot safely discard a hold.
     if not permit:
         print(json.dumps({'continue': False,
-                          'stopReason': 'Coding work is paused until a full wake with the lid open, or an active Awake hold with the closed-lid override.'}))
+                          'stopReason': 'Coding work is held after system sleep until an interactive wake.'}))
 
 
 def main():
@@ -717,7 +701,8 @@ def main():
     if args.command == 'status':
         snapshot = Power().snapshot()
         table = processes()
-        print(json.dumps({'state': Ownership(STATE, repair=False).value, 'power': snapshot, 'allowed': allowed(snapshot),
+        state = policy_state(Ownership(STATE, repair=False).value, snapshot)
+        print(json.dumps({'state': state, 'power': snapshot, 'allowed': allowed(snapshot, state),
                           'agentProcesses': {pid: agent_kind(proc['path']) for pid, proc in table.items() if agent_kind(proc['path'])},
                           'limitation': 'Shared tmux tools outside the CLI descendant tree are not suspended.'}, indent=2))
         return

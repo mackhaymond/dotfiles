@@ -10,6 +10,7 @@ from pathlib import Path
 import plistlib
 import subprocess
 import tempfile
+import time
 
 guard_home = Path({{ .chezmoi.homeDir | quote }})
 guard_plist = guard_home / 'Library/LaunchAgents/com.mackhaymond.claude-sleep-guard.plist'
@@ -25,7 +26,7 @@ if guard_plist.exists() and guard_source.exists():
     guard_loaded = subprocess.run(['launchctl', 'print', 'gui/%d/com.mackhaymond.claude-sleep-guard' % os.getuid()],
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     guard_loaded_wrapper = guard_loaded.returncode == 0 and guard_wrapper in guard_loaded.stdout
-    if guard_wrapper_service or (guard_already_pinned and guard_loaded_wrapper):
+    if guard_wrapper_service or (guard_already_pinned and (guard_loaded_wrapper or guard_loaded.returncode != 0)):
         guard_read_source = guard_source if guard_wrapper_service else Path(guard_arguments[1])
         guard_spec = importlib.util.spec_from_file_location('legacy_sleep_guard', guard_read_source)
         guard_module = importlib.util.module_from_spec(guard_spec)
@@ -63,11 +64,20 @@ if guard_plist.exists() and guard_source.exists():
             guard_stream.write(plistlib.dumps(guard_service))
         os.chmod(guard_temporary, 0o644)
         os.replace(guard_temporary, guard_plist)
-        if guard_loaded_wrapper:
+        if guard_loaded_wrapper or guard_loaded.returncode != 0:
             # launchd caches ProgramArguments. Pin the loaded job as well as
             # its plist before the mutable wrapper source is overwritten.
             guard_domain = 'gui/%d' % os.getuid()
-            subprocess.run(['launchctl', 'bootout', guard_domain + '/com.mackhaymond.claude-sleep-guard'], check=True)
+            if guard_loaded_wrapper:
+                subprocess.run(['launchctl', 'bootout', guard_domain + '/com.mackhaymond.claude-sleep-guard'], check=True)
+            for guard_attempt in range(20):
+                guard_check = subprocess.run(['launchctl', 'print', guard_domain + '/com.mackhaymond.claude-sleep-guard'],
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if guard_check.returncode != 0:
+                    break
+                time.sleep(0.25)
+            else:
+                raise RuntimeError('Legacy sleep guard is still exiting; retry the migration after it exits')
             subprocess.run(['launchctl', 'bootstrap', guard_domain, str(guard_plist)], check=True)
         print('Pinned the previous legacy sleep guard runtime for safe rollback')
 {{ end -}}

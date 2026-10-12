@@ -25,12 +25,24 @@ root = pathlib.Path(os.environ['GUARD_TEST_ROOT'])
 marker = root / 'running'
 action = sys.argv[1]
 if action == 'print':
+    retiring = root / 'retiring'
+    if retiring.exists():
+        count = int(retiring.read_text())
+        if count:
+            retiring.write_text(str(count - 1))
+            print('state = SIGTERMed\\npid = 12345')
+            sys.exit(0)
+        retiring.unlink()
+        sys.exit(1)
     if not marker.exists(): sys.exit(1)
     print('state = running\\npid = 12345\\nprogram = ' + marker.read_text())
 elif action == 'bootout':
     if not marker.exists(): sys.exit(1)
     marker.unlink()
+    if os.environ.get('GUARD_TEST_SLOW_EXIT'):
+        (root / 'retiring').write_text('2')
 elif action == 'bootstrap':
+    if (root / 'retiring').exists(): sys.exit(5)
     plist = plistlib.loads(pathlib.Path(sys.argv[3]).read_bytes())
     runtime = plist['ProgramArguments'][1]
     previous = '/previous/' in runtime
@@ -94,6 +106,12 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(runtime.read_bytes()).hexdigest(), runtime.parent.name)
         self.assertEqual((self.root / 'running').read_text(), str(runtime))
 
+    def test_waits_for_asynchronous_launchd_removal_before_bootstrap(self):
+        self.env['GUARD_TEST_SLOW_EXIT'] = '1'
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / 'retiring').exists())
+
     def test_bootstrap_failure_restores_previous_runtime(self):
         result = self.run_install('bootstrap')
         self.assertNotEqual(result.returncode, 0)
@@ -155,7 +173,7 @@ class InstallTests(unittest.TestCase):
 
     def test_legacy_rollback_releases_candidate_owned_child_when_allowed(self):
         child, module = self.legacy_owned_child()
-        self.script = self.script.replace('if not guard.allowed(guard.Power().snapshot()):', 'if False:')
+        self.script = self.script.replace('if not guard.allowed(guard.Power().snapshot(), journal.value):', 'if False:')
         self.assertNotEqual(self.run_install('bootstrap').returncode, 0)
         self.assertEqual((self.root / 'running').read_text(), self.previous_runtime)
         state = self.root / '.local/state/claude-sleep-guard/state.json'
@@ -164,7 +182,7 @@ class InstallTests(unittest.TestCase):
 
     def test_legacy_rollback_preserves_hold_and_removes_autoload_when_denied(self):
         child, module = self.legacy_owned_child()
-        self.script = self.script.replace('if not guard.allowed(guard.Power().snapshot()):', 'if True:')
+        self.script = self.script.replace('if not guard.allowed(guard.Power().snapshot(), journal.value):', 'if True:')
         result = self.run_install('bootstrap')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Legacy rollback blocked', result.stderr)
@@ -179,6 +197,21 @@ class InstallTests(unittest.TestCase):
                    'ProgramArguments':[str(self.root / '.local/bin/claude-sleep-guard'),'daemon']}
         self.plist.write_bytes(plistlib.dumps(wrapper))
         (self.root / 'running').write_text(str(self.root / '.local/bin/claude-sleep-guard'))
+        # Model the historical API in isolation. Installer tests must not
+        # depend on whether the user currently has the laptop lid open.
+        legacy_source = self.root / '.config/claude-sleep-guard/guard.py'
+        legacy_source.write_text('''from types import SimpleNamespace
+class Function:
+    def __init__(self, result): self.result = result
+    def __call__(self, *args): return self.result
+class Power:
+    def __init__(self):
+        self.domain = 1
+        self.cf = SimpleNamespace(CFStringCreateWithCString=Function(1),
+            CFBooleanGetValue=Function(False), CFRelease=Function(None))
+        self.io = SimpleNamespace(IORegistryEntryCreateCFProperty=Function(1))
+    def full_wake(self): return True
+''')
         original = (self.root / '.config/claude-sleep-guard/guard.py').read_bytes()
         script = render('.chezmoiscripts/run_once_before_zz-pin-legacy-sleep-guard.py.tmpl').replace(str(Path.home()),str(self.root))
         result = subprocess.run(['/usr/bin/python3', '-c', script], text=True,
@@ -189,6 +222,10 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(runtime.read_bytes(), original)
         self.assertTrue(runtime.with_name('.legacy').exists())
         self.assertEqual((self.root / 'running').read_text(), str(runtime))
+
+    def test_legacy_pinning_waits_for_asynchronous_launchd_removal(self):
+        self.env['GUARD_TEST_SLOW_EXIT'] = '1'
+        self.test_legacy_wrapper_is_pinned_before_live_source_changes()
 
 
 class SettingsTests(unittest.TestCase):
