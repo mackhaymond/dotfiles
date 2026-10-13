@@ -221,3 +221,20 @@ only appear with `CHEZMOI_GUARD_DEBUG=1`.
 
 Changing a hook's **matcher** in `settings.json` (e.g. adding `mcp__pty__run`)
 is subject to the same hold-for-review: approve via `/hooks` or restart.
+
+# agent-gate.sh (unattended-usage gate)
+
+Plain `sh`, wired as `PreToolUse` (no matcher, `timeout: 86400`) and
+`UserPromptSubmit` (`timeout: 5`). Fails open on any unreadable input and never
+signals a process (its predecessor, claude-sleep-guard, SIGSTOPped agents and
+broke tabs; removed in 8154d44).
+
+- **DarkWake hold** (`pre-tool`): while `pmset -g systemstate` lacks
+  `Graphics` (a DarkWake), loop on `sleep 5` so the agent sleeps with the Mac
+  instead of re-sending a ~450k-token context on every background wake
+  (2026-10-11: 29% of a week in 15.6 awake minutes). Releases within ~5 s of a
+  real wake.
+- **Weekly reserve**: when this session's account (`.claude.json`
+  `oauthAccount`) is mackhaymond@gmail.com and `~/.cache/codexbar-tmux/claude-live.json`
+  shows it at >=90% weekly before `resets_at`, return `continue:false`.
+  `touch ~/.claude/reserve-override` bypasses until the next reset.

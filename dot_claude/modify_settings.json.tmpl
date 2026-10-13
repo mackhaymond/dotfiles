@@ -154,6 +154,15 @@ FULL=$(cat <<'EOF'
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/agent-gate.sh pre-tool",
+            "timeout": 86400
+          }
+        ]
       }
     ],
     "SessionEnd": [
@@ -300,6 +309,15 @@ FULL=$(cat <<'EOF'
       }
     ],
     "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/agent-gate.sh prompt",
+            "timeout": 5
+          }
+        ]
+      },
       {
         "hooks": [
           {
