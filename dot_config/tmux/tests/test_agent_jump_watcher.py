@@ -202,7 +202,8 @@ class FakeEnv:
     def env(self, **extra):
         e = {"HOME": str(self.home), "TMPDIR": str(self.tmp) + "/",
              "PATH": f"{self.bin}:{BASH_DIR}:/usr/bin:/bin", "FAKE_TMUX_STATE": str(self.state),
-             "FAKE_PROCS": str(self.procs), "FAKE_PS_LOG": str(self.ps_log)}
+             "FAKE_PROCS": str(self.procs), "FAKE_PS_LOG": str(self.ps_log),
+             "AGENT_STATE_NOTICE": ""}
         e.update(extra)
         return e
 

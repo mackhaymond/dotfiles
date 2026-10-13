@@ -167,7 +167,7 @@ class IndicatorIntegrationTests(unittest.TestCase):
         self.assertEqual(self.hook("heartbeat")["@agent_state"], "running")
         self.assertEqual(self.hook("done")["@agent_state"], "done")
         self.assertEqual(self.hook("heartbeat")["@agent_state"], "done")
-        self.assertEqual(self.hook("clear"), {})
+        self.assertEqual(set(self.hook("clear")), {"@agent_seen_at"})
         state = json.loads(self.state.read_text())
         self.assertEqual(state["windows"]["@99"], {"@agent_state": "unrelated"})
         self.assertFalse(any("%999" in call for call in state["calls"]))

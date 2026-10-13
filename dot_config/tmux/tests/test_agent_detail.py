@@ -191,7 +191,7 @@ class DetailHookTests(ci.IndicatorIntegrationTests):
         self.assertNotIn("@agent_detail_kind", w)
         self.assertNotIn("@agent_detail", w)
         self.claude("done", last_assistant_message="ok")
-        self.assertEqual(self.claude("clear"), {})
+        self.assertEqual(set(self.claude("clear")), {"@agent_seen_at"})
         # compact SessionStart fires mid-turn: the turn's detail survives it.
         self.claude("running", prompt="long turn")
         w = self.claude("idle", source="compact")
@@ -217,7 +217,7 @@ class DetailHookTests(ci.IndicatorIntegrationTests):
         self.assertEqual(self.detail(w), ("perm", "Bash bash -lc cargo build"))
         w = self.hook("done", last_assistant_message="Ported.\nNotes...")
         self.assertEqual(self.detail(w), ("done", "Ported."))
-        self.assertEqual(self.hook("clear"), {})
+        self.assertEqual(set(self.hook("clear")), {"@agent_seen_at"})
 
     def test_codex_background_thread_is_ignored(self):
         (self.root / ".codex").mkdir()

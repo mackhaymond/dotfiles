@@ -1350,7 +1350,7 @@ class MainLoopTests(unittest.TestCase):
             (d / "A").write_text("\n".join([one, line("main", 2, "@2", "idle", "two"), client]) + "\n")
             (d / "B").write_text("\n".join([one, line("main", 2, "@2", "failed", "two", since="1 failed"),
                                             client]) + "\n")
-            env = {"PATH": "%s:/usr/bin:/bin" % (d / "bin"), "HOME": str(d / "home"), "TMPDIR": str(d) + "/",
+            env = {"AGENT_STATE_NOTICE": "", "PATH": "%s:/usr/bin:/bin" % (d / "bin"), "HOME": str(d / "home"), "TMPDIR": str(d) + "/",
                    "D": str(d), "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"}
             pid, fd = pty.fork()
             if pid == 0:

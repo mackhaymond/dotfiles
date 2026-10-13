@@ -138,7 +138,7 @@ class WatcherEnv:
     def env(self, **extra):
         e = {"HOME": str(self.home), "TMPDIR": str(self.tmp) + "/",
              "PATH": f"{self.bin}:{BASH_DIR}:/usr/bin:/bin", "FAKE_TMUX_STATE": str(self.state),
-             "FAKE_PROCS": str(self.procs)}
+             "FAKE_PROCS": str(self.procs), "AGENT_STATE_NOTICE": ""}
         e.update(extra)
         return e
 
@@ -359,7 +359,7 @@ class SinceStampTests(unittest.TestCase):
         w = self.hook("heartbeat")
         self.assertEqual(w["@agent_state"], "done")
         self.assertFalse([c for c in self.calls()[n:] if c[0] == "set-option" and "@agent_since" in c])
-        self.assertEqual(self.hook("clear"), {})
+        self.assertEqual(set(self.hook("clear")), {"@agent_seen_at"})
 
 
 if __name__ == "__main__":

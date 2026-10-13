@@ -123,6 +123,8 @@ dtext=""
 # set_state's @agent_pending op ("set" | "unset" | "") and its "wrote" flag.
 pend_op=""
 ss_wrote=0
+# set_state's discharge flag: 1 stamps @agent_seen_at (see set_state).
+seen_op=""
 
 JQ="$(command -v jq || true)"
 # Codex hooks run in a shared app-server. Its inherited TMUX_PANE belongs to
@@ -157,6 +159,19 @@ tmux() {
     else
         command tmux "$@"
     fi
+}
+
+# STATE NOTICE. A write that changes a window's @agent_state posts the Darwin
+# notification com.mackhaymond.tmux.agent-state (no payload; it means
+# "re-read"). CuaNotch listens and re-checks its tmux rows against tmux, so a
+# tab cleared here (a visit, an ⌥S landing, the watcher's discharge) clears
+# in the notch at the same moment: for tmux rows, tmux's verdict wins. The
+# watcher posts the same name. AGENT_STATE_NOTICE overrides the name; set it
+# empty to post nothing (tests).
+notify_state() {
+    local name="${AGENT_STATE_NOTICE-com.mackhaymond.tmux.agent-state}"
+    [ -n "$name" ] || return 0
+    notifyutil -p "$name" >/dev/null 2>&1 || true
 }
 
 owns_window() {
@@ -497,9 +512,16 @@ set_state() {
     #
     # A change INTO the Active set stamps @agent_slot here (slot_stamp), in
     # the same command list, when the window has no valid one.
-    local win="$1" new="$2" dk="$dkind" dt="$dtext" po="$pend_op" cur ts
+    #
+    # seen_op (global, consumed like dkind): 1 = this write DISCHARGES the
+    # window (the user saw it: viewing_now, clear-current), so it stamps
+    # @agent_seen_at "<epoch>" in the same command list and posts the STATE
+    # NOTICE even when the state itself was already idle (the hooks race).
+    # CuaNotch's contract: never unset, always the latest discharge; it acks
+    # a done/input row whose stamp is no earlier than 1 s before the row's.
+    local win="$1" new="$2" dk="$dkind" dt="$dtext" po="$pend_op" so="$seen_op" cur ts
     local -a cmd=()
-    dkind=""; dtext=""; pend_op=""; ss_wrote=0
+    dkind=""; dtext=""; pend_op=""; seen_op=""; ss_wrote=0
     owns_window "$win" || return 0
     cur=$(window_state "$win")
     if [ "$cur" != "$new" ]; then
@@ -520,6 +542,10 @@ set_state() {
              cmd+=(${cmd[0]+\;} set-option -w -t "$win" @agent_pending "$pts") ;;
         unset) cmd+=(${cmd[0]+\;} set-option -uw -t "$win" @agent_pending) ;;
     esac
+    if [ "$so" = 1 ]; then
+        [ -n "${ts:-}" ] || { printf -v ts '%(%s)T' -1 2>/dev/null || ts=$(date +%s); }
+        cmd+=(${cmd[0]+\;} set-option -w -t "$win" @agent_seen_at "$ts")
+    fi
     [ "${#cmd[@]}" -gt 0 ] || return 0
     case "$agent" in
         claude|codex) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
@@ -537,6 +563,8 @@ set_state() {
     fi
     ss_wrote=1
     [ "$cur" = "$new" ] || tmux refresh-client -S 2>/dev/null || true
+    { [ "$cur" != "$new" ] || [ "$so" = 1 ]; } && notify_state
+    return 0
 }
 
 # slot_stamp WIN, from set_state: WIN is entering the Active set. Appends
@@ -585,7 +613,11 @@ clear_state() {
          set-option -uw -t "$win" @agent_detail_kind \; \
          set-option -uw -t "$win" @agent_detail 2>/dev/null || true
     if [ -n "$cur" ]; then
+        # A discharge too (see seen_op in set_state): @agent_seen_at is the
+        # one mark that survives the unsets, and is never unset itself.
+        tmux set-option -w -t "$win" @agent_seen_at "$(now_epoch)" 2>/dev/null || true
         tmux refresh-client -S 2>/dev/null || true
+        notify_state
     fi
 }
 
@@ -992,14 +1024,14 @@ if [ "$mode" = "clear-current" ]; then
             # in set_state's own command (pend_op): idle + pending keeps the
             # window's agent slot (for up to 600 s, see SLOT CORE), and must
             # never be seen half-written.
-            pend_op=set
+            pend_op=set; seen_op=1
             set_state "$win" idle
             [ "$ss_wrote" = 1 ] || tmux set-option -w -t "$win" @agent_pending "$(now_epoch)" 2>/dev/null || true
             ;;
         # A seen FAILED gets no pending: a dead turn never resumes (no
         # heartbeat follows it; a new prompt sets running by itself), and the
         # stamp would only hold the window's agent slot for nothing.
-        failed|done) set_state "$win" idle ;;
+        failed|done) seen_op=1; set_state "$win" idle ;;
     esac
     exit 0
 fi
@@ -1332,7 +1364,7 @@ case "$mode" in
             esac
         fi
         if viewing_now; then
-            pend_op=set   # in the state's own command, as clear-current
+            pend_op=set; seen_op=1   # in the state's own command, as clear-current
             set_state "$win" idle
             [ "$ss_wrote" = 1 ] || tmux set-option -w -t "$win" @agent_pending "$(now_epoch)" 2>/dev/null || true
         else
@@ -1375,6 +1407,7 @@ case "$mode" in
         # Watched AND WezTerm frontmost (see viewing_now): a watched window
         # in a backgrounded terminal was the one way to miss a finish.
         if viewing_now; then
+            seen_op=1
             set_state "$win" idle
         else
             set_state "$win" "done"

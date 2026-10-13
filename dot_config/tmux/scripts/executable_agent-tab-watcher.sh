@@ -185,6 +185,14 @@ STAMPS="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.$$.stamp"
 EVLOG="${TMPDIR:-/tmp}"
 EVLOG="${EVLOG%/}/agent-events.${UID:-$(id -u)}.log"
 
+# STATE NOTICE (see agent-tab-indicator.sh, which posts the same name): this
+# tick changed some window's @agent_state, so CuaNotch should re-read tmux.
+notify_state() {
+    local name="${AGENT_STATE_NOTICE-com.mackhaymond.tmux.agent-state}"
+    [ -n "$name" ] || return 0
+    notifyutil -p "$name" >/dev/null 2>&1 || true
+}
+
 # A PID IS NOT AN IDENTITY. cleanup() only unlinks the pidfile on a normal
 # EXIT, so a SIGKILLed watcher leaves a live-looking pid behind — and pid
 # churn on this machine is ~1000/10s, so the space wraps in ~15 minutes. By
@@ -1360,6 +1368,7 @@ EOF
     refresh_cua_pids
 
     changed=0
+    state_moved=0   # an @agent_state write this tick: post the STATE NOTICE
     any_workflow=0
     any_cua=0
     # Decided per window inside the loop, from the PARSED state. It used to be
@@ -1427,7 +1436,9 @@ EOF
         # A needs-input discharge stamps @agent_pending in the SAME tmux call
         # as the idle: idle + pending holds the window's slot (AGENT SLOTS),
         # and a hook stamping under the slot lock between two calls would
-        # read bare idle and hand that number to someone else.
+        # read bare idle and hand that number to someone else. Every discharge
+        # also stamps @agent_seen_at in that call (CuaNotch's ack, see
+        # seen_op in agent-tab-indicator.sh's set_state).
         pending="${W_PEND[$win]:-}"
         case "$state" in
             done|needs-input)
@@ -1435,9 +1446,11 @@ EOF
                     if [ "$state" = needs-input ]; then
                         pending=$tick_now
                         tmux set-option -w -t "$win" @agent_state idle \; \
-                             set-option -w -t "$win" @agent_pending "$pending" 2>/dev/null && changed=1
+                             set-option -w -t "$win" @agent_pending "$pending" \; \
+                             set-option -w -t "$win" @agent_seen_at "$tick_now" 2>/dev/null && { changed=1; state_moved=1; }
                     else
-                        tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
+                        tmux set-option -w -t "$win" @agent_state idle \; \
+                             set-option -w -t "$win" @agent_seen_at "$tick_now" 2>/dev/null && { changed=1; state_moved=1; }
                     fi
                     state=idle
                 fi ;;
@@ -1577,10 +1590,12 @@ EOF
                 if [ "$cx_full" = 1 ]; then
                     # The Stop path's viewing_now: a finish the user is
                     # looking at is not tinted.
-                    [ "$fin" = done ] && viewed_now "$wac" && fin=idle
+                    cx_seen=0
+                    [ "$fin" = done ] && viewed_now "$wac" && { fin=idle; cx_seen=1; }
                     cx_cmd=(set-option -w -t "$win" @agent_state "$fin" \;
                             set-option -w -t "$win" @agent_since "$tick_now $fin" \;
                             set-option -uw -t "$win" @agent_pending \;)
+                    [ "$cx_seen" = 1 ] && cx_cmd+=(set-option -w -t "$win" @agent_seen_at "$tick_now" \;)
                     if [ "$cx_mark" = complete ]; then
                         cx_cmd+=(set-option -w -t "$win" @agent_detail_kind done \;
                                  set-option -w -t "$win" @agent_detail "turn finished")
@@ -1588,9 +1603,9 @@ EOF
                         cx_cmd+=(set-option -uw -t "$win" @agent_detail_kind \;
                                  set-option -uw -t "$win" @agent_detail)
                     fi
-                    tmux "${cx_cmd[@]}" 2>/dev/null && { changed=1; since="$tick_now $fin"; pending=""; }
+                    tmux "${cx_cmd[@]}" 2>/dev/null && { changed=1; state_moved=1; since="$tick_now $fin"; pending=""; }
                 else
-                    tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
+                    tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && { changed=1; state_moved=1; }
                 fi
                 state=$fin
             else
@@ -1599,7 +1614,7 @@ EOF
         fi
 
         if [ "$has_agent" = 1 ] && [ -z "$state" ]; then
-            tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
+            tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && { changed=1; state_moved=1; }
             state=idle
         elif [ "$has_agent" = 0 ] && { [ -n "$state" ] || [ "$has_summary" = 1 ] \
                                        || [ "$wf$cua" != 00 ]; }; then
@@ -1626,6 +1641,11 @@ EOF
                 tmux set-option -uw -t "$win" @agent_kind \; \
                      set-option -uw -t "$win" @agent_detail_kind \; \
                      set-option -uw -t "$win" @agent_detail 2>/dev/null
+                # A discharge, as clear_state's: the stamp outlives the unsets.
+                if [ -n "$state" ]; then
+                    tmux set-option -w -t "$win" @agent_seen_at "$tick_now" 2>/dev/null
+                    state_moved=1
+                fi
                 changed=1
                 state=""; pending=""
             else
@@ -1745,6 +1765,9 @@ EOF
     if [ "$changed" = 1 ]; then
         tmux refresh-client -S 2>/dev/null
     fi
+    # After every write of the tick, @agent_since stamps included, so a reader
+    # woken by it sees the whole tick (STATE NOTICE, agent-tab-indicator.sh).
+    [ "$state_moved" = 1 ] && notify_state
 
     # HEARTBEAT. Being alive is not the same as turning: every check on this
     # daemon (the pidfile, ensure_watcher's kill -0 + ps) proves a PROCESS

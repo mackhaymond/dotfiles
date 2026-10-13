@@ -97,6 +97,32 @@ Renaming a detail kind or changing the `@agent_since` format breaks that ack
 silently: CuaNotch just falls back to its flare-and-poll. Tell the CuaNotch
 team first.
 
+**tmux is the truth for tmux rows, all the time** (agreed 2026-10-13). That
+ack only looked within seconds of a transition, so a tab cleared later (a
+visit, an ⌥S landing, the watcher's discharge) stayed lit in the notch, and the
+notch's ⌥S then found tmux's queue empty and did nothing. Two marks now carry
+tmux's verdict:
+- **STATE NOTICE.** Every write that changes a window's `@agent_state` posts
+  the Darwin notification `com.mackhaymond.tmux.agent-state` (no payload; it
+  means "re-read"). The indicator posts from `set_state`/`clear_state`, and the
+  watcher posts once per tick after all of that tick's writes. A no-op
+  heartbeat posts nothing. `AGENT_STATE_NOTICE` overrides the name, and an
+  empty value turns the notice off; the tests set it empty in
+  `tests/conftest.py`.
+- **`@agent_seen_at "<epoch>"`.** It is stamped in the same tmux command as
+  every **discharge**, meaning the user saw the window. That covers the
+  `viewing_now` idle of done and needs-approval, `clear-current` (focus, visit,
+  `agent-jump.sh jump`), `clear_state`, the watcher's viewed discharge and codex
+  viewed done→idle, and its GC. It is never unset, so it outlives
+  `clear_state`'s unsets. Non-discharge idles never stamp it: SessionStart, the
+  codex interrupt, and the watcher's running→idle un-stick. A missed Stop must
+  not read as seen.
+
+CuaNotch reconciles on the notice (debounced), on wake and unlock, at launch,
+and on an ⌥S press it can't explain. It acks a done or input row whose pane is
+idle or unset with `@agent_seen_at` no earlier than 1 s before the row's
+`state_ts`.
+
 Three components maintain and render them:
 
 ### 1. `scripts/agent-tab-indicator.sh` (event-driven)
