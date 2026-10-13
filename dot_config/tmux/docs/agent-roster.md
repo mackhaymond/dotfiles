@@ -16,32 +16,47 @@ is the primary one for both the Option-W popup and the CMD+B sidebar.
 
 | Surface | Command |
 |---|---|
-| Option-W / `prefix q` / `prefix C-q` popup | `agent-ui menu --client <tty> [--tab active\|all\|needs\|working\|idle\|parked]` |
+| Option-W / `prefix q` / `prefix C-q` popup | `agent-ui menu --client <tty> [--tab all\|active\|needs\|working\|idle\|parked]` |
 | CMD+B WezTerm sidebar | `agent-ui sidebar [--client <tty>]` (wezterm.lua also passes `--tmux-pane`, `--wezterm`) |
 | `prefix a` / `prefix C-a` session picker | `agent-ui sessions --client <tty>` (see [below](#agent-ui-sessions-prefix-a)) |
-| screenshot / test render | `agent-ui sidebar --once WxH`, `agent-ui menu --client <tty> --once WxH`, `agent-ui sessions --once WxH [--client <tty>] [--query q] [--ansi]` |
+| screenshot / test render | `agent-ui sidebar --once WxH`, `agent-ui menu --once WxH [--client <tty>] [--tab x] [--select <letter>] [--preview] [--plain]` (read-only: never writes `@agent_key`), `agent-ui sessions --once WxH [--client <tty>] [--query q] [--ansi]` |
 
-- **Tabs** (agent-ui menu only; the Python has one list): a chip row,
-  cycled with Tab / Shift-Tab in the order Active, All, Needs you, Working,
-  Idle, Parked. The menu opens on **Active**: every agent that is working
-  (running, or a workflow/cua out) or needs you (the Needs you tab's queue),
-  grouped by space in the sidebar's fixed by-name order, then by window
-  index. Its order never depends on state or age: an agent going from
-  working to needs-input keeps its row and only changes glyph and colour;
-  an agent going idle leaves, a new one appears in its slot, but rows never
-  swap. There is no NEEDS YOU section on this tab; the selected attention
-  row shows its reason line (perm/asks/fail/done) under it instead. On open
-  the selection is the first need in `agent-jump.sh list` order (so ⏎ still
-  goes to the most urgent), else the current window, else the first row; a
-  state change never moves it. If the selected agent leaves the set, the
-  selection goes to the nearest surviving row (the next, else the previous),
-  and a key that acts on a row (⏎, Space, `p`, `s`, `x`, `H`) typed before a
-  frame showed that is refused ("that tab moved · pick it again"), never
-  retargeted. Empty: "nothing working or waiting · ⇥ for all". The sidebar's
-  idle fold opens the menu on Idle and its `… N more` rows on All. In a
-  narrow popup the search field goes first, then the chips shorten
-  ("Needs", "Work"), then drop their counts.
-  **All** is the layout described [below](#layout) (NEEDS YOU first).
+- **The agent-ui menu** (the Python fallback keeps the older layout described
+  [below](#layout)) opens on **All**: every agent, grouped by space in the
+  sidebar's fixed by-name order, then by window index. The order never
+  depends on state, age or which session you were last in: an agent going
+  from working to needs-input keeps its row and only changes glyph and
+  colour; rows appear or disappear only when windows do. There is no NEEDS
+  YOU section and no duplicate row (only a window linked into two spaces is
+  listed under both): a needs-you agent stays in place, its title turns the
+  needs colour (yellow; red failed, green done) and its reason shows inline
+  (`asks Which deck?`, `perm Bash git push`, `failed`). Parked tabs fold
+  into one row at the end, `▪ N parked ⇥`, which opens the Parked filter.
+- **Header**: one status line in the top border, `agents · ◉ 1 need you ·
+  ◐ 4 working · ○ 6 idle · ▪ 6 parked` (zero counts dropped; when narrow the
+  last ones drop whole), plus the filter's name when it is not All
+  (`Working ⇥`, click to cycle). A red banner there flags a stalled watcher
+  or a gone client.
+- **Rows**: `[letter] glyph Title  reason  · here ·  project  age`. The
+  letter badge is reverse video on the agent's state colour (needs yellow,
+  failed red, working blue, done green, idle overlay); a `project/` prefix
+  of the title moves to the dim tag on the right (a bare `~/` is dropped);
+  `· here ·` marks the window the popup is covering; idle titles are dimmer
+  but readable. Short of room the project tag goes first, then `here`.
+- **Filters** (Tab / Shift-Tab): All, Active (working or needing you, or a
+  prompt just answered), Needs you (agent-jump.sh's queue, in its order),
+  Working, Idle, Parked (every parked tab). The sidebar's idle fold opens
+  the menu on Idle, its `… N more` rows on All.
+- **Initial cursor**: the oldest agent that needs you (the first in
+  `agent-jump.sh list` order), else the last agent (where ⌥W would go), else
+  the window the popup covers, else the first row. A state change never
+  moves it; if the selected row goes away it moves to the nearest surviving
+  row, and ⏎ / Space typed before a frame showed that are refused ("that tab
+  moved · pick it again"), never retargeted.
+- **Preview**: off by default. Space p turns on a strip of up to 10 lines
+  under the list, full width, its rule naming `title · session:index · ✳
+  claude · ⌥ branch · ~/path`; the pane's tail is captured on a worker
+  thread only while it is on.
 - **Source**: the crate lives only in the chezmoi source tree,
   `~/.local/share/chezmoi/dot_config/tmux/agent-ui/` (`.chezmoiignore` keeps
   it out of `~/.config`).
@@ -61,10 +76,15 @@ is the primary one for both the Option-W popup and the CMD+B sidebar.
 - **Which one runs**:
   - tmux checks for the binary once, when tmux.conf is loaded: the python
     bindings are written first, then an `if-shell "test -x …/agent-ui"` block
-    re-binds q, C-q and M-w to `display-popup -E -B -w 75% -h 75% …/agent-ui
+    re-binds q, C-q and M-w to `display-popup -E -B -w <cap> -h 75% …/agent-ui
     menu --client '#{client_tty}'`. agent-ui draws its own rounded border and
-    title, hence `-B` and no `-T`. After installing or removing the binary,
-    `prefix r`.
+    title, hence `-B` and no `-T`. The width is capped at 100 columns (the
+    whole client when narrower) so a row's title, project tag and age stay in
+    one glance: `-w '#{?#{e|<:#{client_width},100},#{client_width},100}'`,
+    expanded by the binding's `run-shell -C` (display-popup itself neither
+    expands formats in `-w` nor accepts a width wider than the client; the
+    sidebar's ≡ button asks for `#{client_width}` and applies the same cap).
+    After installing or removing the binary, `prefix r`.
   - WezTerm checks at every CMD+B (`io.open`, no fork), so no reload is needed.
 - **Force the fallback**: `rm ~/.local/bin/agent-ui`, then `prefix r`. The next
   `chezmoi apply` reinstalls it only if the crate changed. To get it back
@@ -93,10 +113,27 @@ strip's ☰ button) compare against. The test server has one window; on the
 real one (169 windows) the first tmux snapshot takes longer (~9 ms for the
 python), the same for every variant.
 
+agent-ui menu keys:
+
+| Key | Does |
+|---|---|
+| **Option-W**, or `prefix q` / `prefix C-q` | open the menu |
+| an agent's **letter** (`a s d f g h j k l q w e r t y u i o p z x c v b n m`, capitals too) | go to that agent at once and close; the letter is its lifetime `@agent_key` (see [Letter keys](#agent-ui-menu-letter-keys)) |
+| **Option-W** inside the menu | go to the [last agent](#last-agent) (so ⌥W ⌥W flips between two agents); with none, close |
+| ↑ / ↓, C-p / C-n, PgUp / PgDn, Home / End, wheel | move (`j` / `k` are letters now) |
+| ⏎ | go to the selected row (a parked tab comes back via `stash.sh unstash`; the `▪ N parked` row opens the Parked filter); a click selects, a second click goes |
+| Tab / Shift-Tab | cycle the filter: All, Active, Needs you, Working, Idle, Parked |
+| `/` | search title, session, `session:index`, detail and path as you type (letters and digits type); ⏎ goes to the selected match; Esc leaves and clears it (a second Esc closes); Backspace on an empty query leaves it |
+| Space | the actions strip for the selected row, in the footer; the next key runs one, Esc cancels: `p` preview strip on/off, `s` park (`stash.sh stash`, after y/n), `x` close the agent's pane through `closed-tabs.sh` after y/n (CMD+Z undoes it; on a parked row: discard via `stash.sh kill-many`), `r` restart the watcher, ⏎ go |
+| Option-S / Option-X | next tab that needs you / back (agent-jump.sh), and close |
+| Esc / C-c | close |
+
+Python fallback keys:
+
 | Key | Does |
 |---|---|
 | **Option-W**, or `prefix q` / `prefix C-q` | open the roster |
-| an agent's number (`1`-`9`, or `01`…`12` once any slot reaches 10) | agent-ui: go to that agent at once and close; the number is its sticky slot, the same in the sidebar (see [Number keys](#number-keys)). Python fallback: row positions, `1`-`9` then `01`, `02`, … |
+| a row number | row positions, `1`-`9` then `01`, `02`, … (see [Number keys](#python-fallback-row-positions)) |
 | Tab / Shift-Tab, `j` / `k`, arrows | move |
 | Space / ⏎ | go there (a parked tab comes back via `stash.sh unstash`) |
 | `p` | peek: the last 15 lines of the selected agent's pane, in a panel over the list; any key closes it (and does nothing else) |
@@ -219,11 +256,55 @@ list stay as they were last drawn.
 
 ## Number keys
 
-### agent-ui: sticky slots
+### agent-ui menu: letter keys
+
+The agent-ui menu takes no number keys any more: every listed agent owns a
+home-row-first **letter** for its whole life, drawn as a badge at the start
+of its row, and pressing it goes there at once (no second key, no wait).
+
+- **Who has one**: every agent window the menu lists (an `@agent_state`, in
+  a shown session: not parked, not in `agents`/`tasks`/`scratch`/
+  `btop-popup`), idle ones included. Parked tabs and plain shells have none.
+  A window linked into two sessions is one agent (one letter, keyed by
+  window id).
+- **Alphabet**, in hand-out order: `a s d f g h j k l q w e r t y u i o p z
+  x c v b n m` (26). Past 26 agents a row has no badge but is still
+  navigable.
+- **Stored** on the window as the tmux user option `@agent_key`, read in the
+  same snapshot as everything else (no extra tmux call). On each refresh
+  (`menu::letters::assign`): an agent whose `@agent_key` is a valid letter
+  keeps it, unless another listed agent holds it too, where the lower
+  numeric window id wins and the other is reassigned; every agent without a
+  valid letter takes the lowest free one in alphabet order, agents taken in
+  display order. A letter whose holder is no longer listed (closed, parked,
+  exited) is free at once; if an unlisted window still carries a letter a
+  listed agent now holds, its stale `@agent_key` is unset, so it gets a free
+  letter (not its old one back) when it returns. A parked agent whose letter
+  nobody took gets it back on unpark.
+- **Writes**: the frame shows the assignment immediately (in memory); only
+  when it differs from what tmux stores does the menu send ONE batched
+  command (`set-option -w -t @id @agent_key x \; set-option -wu -t @id2
+  @agent_key …`) from a background thread, never blocking a frame. A write
+  in flight is remembered (`KeyMemo`): it counts as the window's key until a
+  snapshot shows it, and is never re-sent each tick. `--once` never writes.
+- **What a letter resolves against**: the frame ON SCREEN. Each letter maps
+  to the window that held it when the frame was drawn (its first row on
+  screen, else its first row in the All order, so a letter whose row is
+  scrolled off or on another filter still goes). If that agent closed and a
+  newcomer took its letter before the next frame, the key still means the
+  old window (the jump fails and says so), never the newcomer. A letter
+  nobody holds says "no agent on k".
+- The key bar shows the range in play in alphabet order, e.g. `a–j  go`.
+- `menu --once … --select <letter>` selects that agent's row.
+
+The menu no longer draws the sticky slot numbers below; the sidebar does.
+
+### agent-ui sidebar: sticky slots
 
 In agent-ui every number is an agent's **slot**, not a row position, and it
-sticks to the agent: the menu and the CMD+B sidebar show the same number for
-it on every tab, in every search, wherever its row moves.
+sticks to the agent: the CMD+B sidebar shows it on every row wherever its
+row moves (the menu used to show and take the same numbers; it now uses the
+letters above).
 
 - **Who has one**: the ACTIVE set only, exactly the menu's Active tab:
   working (running, a workflow or cua out), needing you (failed,
@@ -265,33 +346,12 @@ it on every tab, in every search, wherever its row moves.
   (`1`…`9`). Once any slot is 10 or more, every label is two digits (`01`,
   `03`, `12`) and a number is complete after two keys. Equal widths keep the
   set prefix-free, so nothing waits on a timer; a bare `0` is never a label.
-  The same agent listed twice (its NEEDS YOU row and its group row, or a
-  window linked into two sessions) shows the same number on both. The key
-  bar shows the range in play, e.g. `1–7  jump` or `01–12  jump`.
-- **What a number resolves against** (the safety rule): the frame on screen
-  when its FIRST digit was pressed. That frame records every slot in the
-  data it was drawn from, on screen or not, each with the window that held
-  it then. So a number whose row is scrolled off, filtered out by the search,
-  or on another tab still jumps (`3` always means agent 3), going to its
-  first row on screen, else its NEEDS YOU entry (the session agent-jump.sh
-  would pick), else its group row. A number nobody held in that frame is
-  dead, including an agent that appeared since the last draw: it is
-  numbered once a frame shows it. The jump goes to the WINDOW recorded at
-  draw time: if that agent closed and the watcher gave its number to a new
-  agent before the next frame, the key still means the old window (gone: the
-  jump fails and says so), never the newcomer. tmux never reuses a window id
-  while the server lives.
-- Dead numbers swallow their tail as below ("no agent 13 · digits ignored
-  until another key"); esc drops a half-typed number, backspace takes a
-  digit back, any other key drops it and does its own thing.
-- Inside the `/` search, digits type into the query; after ⏎ keeps it,
-  digits are slots again.
-- `menu --once … --select <label>` selects by slot label too.
+  A window linked into two sessions shows the same number on both rows.
 
 **Sidebar**: each agent row in the AGENTS half and each NEEDS YOU card
 starts with the same zero-padded number (` 3 ◉ Title`, `▌3 ◉ Title`),
-display only (the sidebar takes no number keys; press Option-W and the
-number). Agents without a slot leave the column blank so titles stay
+display only (the sidebar takes no number keys, and the menu now goes by
+[letters](#agent-ui-menu-letter-keys)). Agents without a slot leave the column blank so titles stay
 aligned; with no slot anywhere the column is not drawn. The folded idle line
 (`○○○ 3 idle · …`) has no numbers, since the idle agents it folds hold none
 (an answered prompt is never folded); collapsed space rules and `… N more`
@@ -395,6 +455,59 @@ a digit back, any other key drops it and does its own thing.
   256-colour palette, and these hues have to match the tab bar and CuaNotch
   exactly. The pulse reads `@agent_blink`, so it beats in step with the tabs.
 
+### Last agent
+
+The data behind "Option-W Option-W jumps to the last agent" (a Cmd-Tab tap).
+tmux keeps two GLOBAL options, each a window id (`@12`) or empty:
+
+| option | meaning |
+|---|---|
+| `@agent_mru_cur` | the agent window a client most recently landed on |
+| `@agent_mru_prev` | the agent window landed on before that; never equal to cur |
+
+- **Agent window** = `@agent_state` is set. It is the one marker present on
+  every live Claude/Codex window, idle ones included: the hooks write it and
+  the watcher seeds `idle` for any agent process it finds without one, and its
+  GC unsets it when the agent is gone (the same field the roster and
+  agent-jump.sh filter on). `@agent_kind` would mostly work too, but it is a
+  side field, never the presence test.
+- **Landing** on agent window W: if W differs from cur, prev := cur and
+  cur := W. Landing on a non-agent window changes nothing, so
+  agent → shell → agent still pairs the two agents.
+- **Landed** means W is now some client's current window
+  (`#{window_active_clients}` non-zero). A `select-window` in a session no
+  client is looking at records nothing until a client switches there.
+- **The window being left is handled first.** A window can become an agent
+  while the client sits on it (claude started in a shell tab), so landing on
+  it recorded nothing. The internal option `@agent_mru_here` holds the window
+  of the last landing, agent or not. On every landing, if `here` is now an
+  agent and isn't cur, it is pushed first (prev := cur, cur := here), and
+  then the landing rule runs. So B → shell → (claude starts) → B gives cur=B,
+  prev=that window, however you leave it (the menu, Cmd-N, switch-client).
+  `@agent_mru_left` holds that step's intermediate value. Readers ignore both
+  options. `window_last_flag` / `client_last_session` are not used, because
+  after kill-window, or agent-jump's select in a session the client isn't
+  on, they name windows the client never looked at.
+- A burst of selects in one command list runs the hooks after the whole list,
+  so the windows passed through record nothing and the chain stays
+  consistent. A killed `here` is simply not found, so it is never pushed.
+- Kept by `session-window-changed[2]` and `client-session-changed[2]` in
+  tmux.conf.tmpl, one identical `{ … }` block of `set -gF` commands each: no fork, no
+  watcher tick, so it is current the instant the client moves. Not
+  `after-select-window`: that one also fires for a no-op select and then
+  expands `#{window_id}` against the client's OLD session (the trap noted at
+  the clear-current hooks). `session-window-changed` fires only on a real
+  change of a session's current window (select / next / previous /
+  last-window, a tab click, Cmd-N) and `client-session-changed` covers a
+  `switch-client` (agent-jump.sh, the menu's go) into a session whose current
+  window stays put.
+- A closed window's id can linger in either option; the reader treats an id
+  that isn't a listed agent as absent.
+- Tests: `tests/test_agent_last.py` (throwaway `-L` server with `-f
+  /dev/null`, sources only these two hook blocks, attaches one client from a
+  pty it opens itself).
+- Check it live: `tmux show -gv @agent_mru_cur; tmux show -gv @agent_mru_prev`.
+
 ## WezTerm strip (`CMD+B`)
 
 An always-visible, click-only agent list in a narrow WezTerm split to the
@@ -403,8 +516,9 @@ the tab already has one. It runs `agent-ui sidebar` when
 `~/.local/bin/agent-ui` exists (see [agent-ui](#agent-ui-primary-and-the-python-fallback));
 otherwise this same program, `agent-roster.py --strip`, which the rest of
 this section describes. agent-ui's sidebar starts each agent row and NEEDS
-YOU card with the agent's sticky number, the Option-W menu's key for it (see
-[Number keys](#agent-ui-sticky-slots)).
+YOU card with the agent's sticky number (see
+[Number keys](#agent-ui-sticky-slots)); the Option-W menu uses per-agent
+letters instead.
 
 - **Layout** (designed for 34-40 columns, any height, **never scrolls**):
 

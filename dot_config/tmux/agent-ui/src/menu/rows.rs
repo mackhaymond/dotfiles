@@ -1,40 +1,39 @@
-//! What the menu's list shows: the tabs, the search filter, and the rows
-//! (agent-roster.py `build_items` / `selectable` / `number_items`, reshaped
-//! for the tabbed layout).
+//! What the menu's list shows: the filters, the search, and the rows.
 //!
-//! The Active tab (the default) is every agent that is working or needs you,
-//! in a FIXED order: one group per space in the core's space order (the
-//! sidebar's AGENTS order, by name), then by window index. Nothing about a
-//! row's state or age moves it: an agent that goes from working to
-//! needs-input stays where it is and only changes glyph and colour (no NEEDS
-//! YOU section here; that section reorders). Agents leaving or joining the
-//! set make rows disappear or appear in their slot, never swap.
+//! The menu opens on **All**, in a FIXED order: one group per space in the
+//! core's space order (the sidebar's AGENTS order, by name), each group's
+//! agents by window index. Nothing about a row's state or age moves it: an
+//! agent that goes from working to needs-input stays where it is and only
+//! changes glyph and colour (its title takes the needs colour and its reason
+//! shows inline). There is no NEEDS YOU section and no duplicate row (only a
+//! window linked into two spaces is listed in both). Parked tabs collapse to
+//! ONE row at the end, `▪ N parked ⇥`, that opens the Parked filter. Rows
+//! appear or disappear only when windows do.
 //!
-//! The All tab is the Python popup's list: NEEDS YOU in agent-jump.sh order,
-//! then one group per session, the client's session first and the rest most
-//! recently attached first (the popup's order, not the sidebar's by-name
-//! one), then the parked tabs. The other tabs narrow it: Needs you (the
-//! queue alone), Working and Idle (the groups' agents in that bucket), and
-//! Parked (every parked tab; the All tab shows only the first few).
+//! The other filters (cycled with ⇥ / ⇧⇥) narrow it: Active (working or
+//! needing you, the old default), Needs you (agent-jump.sh's queue, in its
+//! order), Working, Idle (the same fixed groups), Parked (every parked tab).
+//! Every row passes the search query.
 //!
-//! Selectable rows carry a positional [`RowKey`], unique within the list:
-//! the same window can be listed twice (a NEEDS YOU row and its group row,
-//! or a window linked into two sessions), so the window id alone cannot be
-//! the selection (the Python's `item_key`).
+//! Selectable rows carry a [`RowKey`], unique within the list: a window
+//! linked into two sessions is listed under both, so the window id alone
+//! cannot be the selection.
 
+use super::letters::{self, KeyMemo, Write};
 use crate::collate::Collator;
 use crate::git::GitCache;
 use crate::model::{Cat, Counts};
 use crate::tmux::{Snapshot, HOLD};
 use crate::view::{Agent, BuildArgs, Need, Parked, SlotMemo, ViewModel};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
 
-/// The tab row's filters, in display (and Tab-cycle) order.
+/// The list's filters, in ⇥-cycle order (All first: the default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
-    /// Working ∪ needs you, in fixed space/index order (the default).
-    Active,
+    /// Every listed agent in fixed space/index order, parked folded (the default).
     All,
+    /// Working ∪ needs you, in the same fixed order.
+    Active,
     Needs,
     Working,
     Idle,
@@ -42,13 +41,13 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [Tab::Active, Tab::All, Tab::Needs, Tab::Working, Tab::Idle, Tab::Parked];
+    pub const ALL: [Tab; 6] = [Tab::All, Tab::Active, Tab::Needs, Tab::Working, Tab::Idle, Tab::Parked];
 
-    /// The chip's words.
+    /// The filter's name in the header.
     pub fn title(self) -> &'static str {
         match self {
-            Tab::Active => "Active",
             Tab::All => "All",
+            Tab::Active => "Active",
             Tab::Needs => "Needs you",
             Tab::Working => "Working",
             Tab::Idle => "Idle",
@@ -56,30 +55,11 @@ impl Tab {
         }
     }
 
-    /// The chip's words when the full row does not fit.
-    pub fn short_title(self) -> &'static str {
-        match self {
-            Tab::Needs => "Needs",
-            Tab::Working => "Work",
-            t => t.title(),
-        }
-    }
-
-    /// The colour of the chip's count when the chip is not active.
-    pub fn hue(self) -> &'static str {
-        match self {
-            Tab::Active | Tab::All => "text",
-            Tab::Needs => "yellow",
-            Tab::Working => "blue",
-            Tab::Idle | Tab::Parked => "overlay",
-        }
-    }
-
-    /// `--tab active|all|needs|working|idle|parked`.
+    /// `--tab all|active|needs|working|idle|parked`.
     pub fn parse(s: &str) -> Option<Tab> {
         Some(match s {
-            "active" => Tab::Active,
             "all" => Tab::All,
+            "active" => Tab::Active,
             "needs" | "needs-you" => Tab::Needs,
             "working" => Tab::Working,
             "idle" => Tab::Idle,
@@ -88,31 +68,15 @@ impl Tab {
         })
     }
 
-    /// Tab / Shift-Tab: the next (`d` = 1) or previous (-1) chip, wrapping.
+    /// ⇥ / ⇧⇥: the next (`d` = 1) or previous (-1) filter, wrapping.
     pub fn step(self, d: i32) -> Tab {
         let i = Tab::ALL.iter().position(|&t| t == self).unwrap_or(0) as i32;
         Tab::ALL[(i + d).rem_euclid(Tab::ALL.len() as i32) as usize]
     }
-
-    /// The chip's count.
-    pub fn count(self, v: &ViewModel) -> usize {
-        match self {
-            Tab::Active => {
-                let ids: std::collections::HashSet<&str> =
-                    v.agents().filter(|a| is_active(v, a)).map(|a| a.window_id.as_str()).collect();
-                ids.len()
-            }
-            Tab::All => v.counts.total(),
-            Tab::Needs => v.needs.len(),
-            Tab::Working => v.counts.get(Cat::Working),
-            Tab::Idle => v.counts.get(Cat::Idle),
-            Tab::Parked => v.parked.len(),
-        }
-    }
 }
 
-/// The NEEDS YOU entry of `a`'s window: what the Needs you tab lists for it
-/// (by window id, so a linked window's row in any session finds it).
+/// The NEEDS YOU entry of `a`'s window (by window id, so a linked window's
+/// row in any session finds it): its reason shows inline on the row.
 pub fn need_of<'a>(v: &'a ViewModel, a: &Agent) -> Option<&'a Need> {
     if !a.attention {
         return None; // the queue holds attention states only: skip the scan
@@ -120,34 +84,32 @@ pub fn need_of<'a>(v: &'a ViewModel, a: &Agent) -> Option<&'a Need> {
     v.needs.iter().find(|n| n.agent.window_id == a.window_id)
 }
 
-/// The Active tab's set: in flight (the Working bucket: running, a workflow
-/// or cua out), needs you (exactly what the Needs you tab counts), or a
-/// prompt just answered (idle with @agent_pending, its turn not resumed).
-/// The last keeps the agent you just went to answer in place, with its
-/// number, instead of dropping it for the moment between your answer and
-/// its next turn: this is exactly who holds a slot
-/// ([`crate::view::holds_slot`]). It is NOT in the Needs you queue, which
-/// stays byte-identical to `agent-jump.sh list`.
+/// The Active filter's set: in flight (the Working bucket), needs you
+/// (exactly the Needs you queue), or a prompt just answered (idle with
+/// @agent_pending, its turn not resumed: [`crate::view::holds_slot`]).
 pub fn is_active(v: &ViewModel, a: &Agent) -> bool {
     a.cat == Some(Cat::Working) || need_of(v, a).is_some() || a.answered
 }
 
-/// A selectable row's identity (agent-roster.py `item_key`).
+/// A selectable row's identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RowKey {
-    /// A NEEDS YOU row: the window.
+    /// A Needs you filter row: the window.
     Need(String),
     /// A group row: (session, window).
     Agent(String, String),
     /// A parked row: the window.
     Parked(String),
+    /// The All list's `▪ N parked ⇥` row.
+    Fold,
 }
 
 impl RowKey {
-    /// The window id the row points at (agent-roster.py `key_window`).
+    /// The window id the row points at ("" for the fold).
     pub fn window(&self) -> &str {
         match self {
             RowKey::Need(w) | RowKey::Parked(w) | RowKey::Agent(_, w) => w,
+            RowKey::Fold => "",
         }
     }
 }
@@ -155,15 +117,14 @@ impl RowKey {
 /// One list row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
-    /// "NEEDS YOU" / "PARKED 5": a bold section title; `rule` draws a ─ fill.
-    Section { title: String, color: &'static str, rule: bool },
     /// A space's rule line: name, branch, counts.
     Group { name: String, branch: String, counts: Counts, current: bool },
+    /// A Needs you filter row (the queue's order).
     Need(Need),
     Agent(Agent),
     Parked(Parked),
-    /// "+k more · ⇥ Parked" under the All tab's parked rows (clickable).
-    More(usize),
+    /// `▪ N parked ⇥` at the end of All: selectable, opens Parked.
+    Fold(usize),
     /// "no agents running", "no matches", ...
     Empty(String),
 }
@@ -175,11 +136,12 @@ impl Row {
             Row::Need(n) => Some(RowKey::Need(n.agent.window_id.clone())),
             Row::Agent(a) => Some(RowKey::Agent(a.session.clone(), a.window_id.clone())),
             Row::Parked(p) => Some(RowKey::Parked(p.agent.window_id.clone())),
+            Row::Fold(_) => Some(RowKey::Fold),
             _ => None,
         }
     }
 
-    /// The agent behind a selectable row.
+    /// The agent behind a window row.
     pub fn agent(&self) -> Option<&Agent> {
         match self {
             Row::Need(n) => Some(&n.agent),
@@ -189,24 +151,14 @@ impl Row {
         }
     }
 
-    /// What a number, a click or a confirm remembers of a row: enough to
-    /// act on it after the list was rebuilt (the Python kept the item dict).
+    /// What a key, a click or a confirm remembers of a window row: enough
+    /// to act on it after the list was rebuilt. None for the fold.
     pub fn target(&self) -> Option<Target> {
         Some(Target::of(self.key()?, self.agent()?))
     }
-
-    /// The row's slot: an agent row's or a NEEDS YOU row's (the same agent,
-    /// the same number). Parked rows never show one.
-    pub fn slot(&self) -> Option<u32> {
-        match self {
-            Row::Need(n) => n.agent.slot,
-            Row::Agent(a) => a.slot,
-            _ => None,
-        }
-    }
 }
 
-/// A row as it was on screen.
+/// A window row as it was on screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub key: RowKey,
@@ -215,15 +167,12 @@ pub struct Target {
     pub session: String,
     pub index: u32,
     pub title: String,
-    /// The agent's slot as the row was built (None for a parked row).
-    pub slot: Option<u32>,
 }
 
 impl Target {
     /// `a` as listed under `key`.
     pub fn of(key: RowKey, a: &Agent) -> Target {
-        let slot = if matches!(key, RowKey::Parked(_)) { None } else { a.slot };
-        Target { key, win: a.window_id.clone(), session: a.session.clone(), index: a.index, title: a.title.clone(), slot }
+        Target { key, win: a.window_id.clone(), session: a.session.clone(), index: a.index, title: a.title.clone() }
     }
 
     pub fn parked(&self) -> bool {
@@ -235,39 +184,54 @@ impl Target {
     }
 }
 
-/// How many parked rows the All tab shows before "+k more" (all of them
-/// when only one more would be hidden).
-pub const PARKED_PREVIEW: usize = 3;
+/// Every LISTED agent row in display order (the All list's order): the
+/// spaces' windows with an agent state, by space then window index. A
+/// window linked into two spaces appears under both.
+pub fn listed(v: &ViewModel) -> impl Iterator<Item = &Agent> {
+    v.spaces.iter().flat_map(|s| s.agents.iter()).filter(|a| !a.state.is_empty())
+}
 
-/// One refresh's data for the menu: the shared view model plus the two
-/// things only the menu wants.
+/// One refresh's data for the menu: the shared view model plus what only
+/// the menu wants.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Data {
     pub view: ViewModel,
-    /// Indices into `view.spaces` in the menu's group order:
-    /// agent-roster.py `build_items` (the client's session first, then the
-    /// most recently attached, then by name).
-    pub order: Vec<usize>,
     /// cwd → branch for every listed agent's path (the preview's meta line).
     pub branches: HashMap<String, String>,
+    /// window id → its lifetime letter ([`letters::assign`]).
+    pub letters: HashMap<String, char>,
+    /// The window ⌥W goes to: the agent the client was on before this one
+    /// (`@agent_mru_cur` / `@agent_mru_prev`; see [`last_agent`]).
+    pub last: Option<String>,
+    /// `@agent_key` writes this frame needs persisted. Taken (and sent) by
+    /// the live [`super::Source`]; never sent by `--once` or tests.
+    pub key_writes: Vec<Write>,
+}
+
+/// ⌥W's target: `@agent_mru_cur` when it is a listed agent other than the
+/// client's current window, else `@agent_mru_prev` on the same terms, else
+/// none. Ids that are not listed agents are ignored.
+pub fn last_agent(listed: &HashSet<&str>, cur_win: Option<&str>, mru: (&str, &str)) -> Option<String> {
+    let ok = |id: &str| !id.is_empty() && listed.contains(id) && Some(id) != cur_win;
+    [mru.0, mru.1].into_iter().find(|id| ok(id)).map(String::from)
 }
 
 impl Data {
-    /// The view for `client`, WITHOUT git status (the menu never shows it,
-    /// so it never forks `git status`) and without the event log (it never
-    /// shows that either). Branches come from `git` when given: pure file
-    /// reads, cached, never waiting longer than its `branch_wait`. Slots
-    /// with no memory of earlier frames (`--once`, tests): the live menu
-    /// uses [`build_with`](Self::build_with).
+    /// A one-shot build (`--once`, tests): no slot memory, no key memory.
     pub fn build(snap: &Snapshot, client: Option<&str>, now: f64, coll: &Collator, git: Option<&mut GitCache>,
         watcher_age: Option<f64>) -> Data {
-        Data::build_with(snap, client, now, coll, git, watcher_age, &mut SlotMemo::default())
+        Data::build_with(snap, client, now, coll, git, watcher_age, &mut SlotMemo::default(), None)
     }
 
-    /// [`build`](Self::build), keeping the provisional slots this menu has
-    /// shown in `memo` ([`SlotMemo`]).
+    /// The view for `client`, WITHOUT git status (the menu never shows it)
+    /// and without the event log. Branches come from `git` when given: pure
+    /// file reads, cached, never waiting longer than its `branch_wait`.
+    /// `keys`: the live menu's in-flight `@agent_key` writes ([`KeyMemo`]):
+    /// with it, [`key_writes`](Self::key_writes) holds only what was not
+    /// sent yet, and is recorded as sent.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_with(snap: &Snapshot, client: Option<&str>, now: f64, coll: &Collator, git: Option<&mut GitCache>,
-        watcher_age: Option<f64>, memo: &mut SlotMemo) -> Data {
+        watcher_age: Option<f64>, memo: &mut SlotMemo, keys: Option<&mut KeyMemo>) -> Data {
         let mut view = ViewModel::build_with(
             snap,
             BuildArgs { client, now, collator: coll, git: None, log: Vec::new(), watcher_age },
@@ -282,7 +246,7 @@ impl Data {
                 .needs
                 .iter()
                 .map(|n| &n.agent)
-                .chain(view.spaces.iter().flat_map(|s| s.agents.iter().chain(s.plain.iter())))
+                .chain(view.spaces.iter().flat_map(|s| s.agents.iter()))
                 .chain(view.parked.iter().map(|p| &p.agent))
                 .map(|a| a.path.clone())
                 .collect::<Vec<_>>();
@@ -293,24 +257,58 @@ impl Data {
                 }
             }
         }
-        let mut last: HashMap<&str, i64> = HashMap::new();
-        for w in &snap.windows {
-            let e = last.entry(w.session.as_str()).or_insert(0);
-            *e = (*e).max(w.last_attached);
+
+        // Letters: from each window's @agent_key (or a write still in flight).
+        let mut keys = keys;
+        if let Some(k) = keys.as_deref_mut() {
+            k.settle(snap.windows.iter().map(|w| (w.id.as_str(), w.key.as_str())));
         }
-        let cur = view.cur_session.clone();
-        let mut order: Vec<usize> = (0..view.spaces.len()).collect();
-        order.sort_by(|&a, &b| {
-            let (sa, sb) = (&view.spaces[a], &view.spaces[b]);
-            let key = |s: &str| (Some(s) != cur.as_deref(), -last.get(s).copied().unwrap_or(0));
-            key(&sa.name).cmp(&key(&sb.name)).then_with(|| sa.name.cmp(&sb.name))
-        });
-        Data { view, order, branches }
+        let mut raw: HashMap<&str, &str> = HashMap::new();
+        for w in &snap.windows {
+            raw.entry(w.id.as_str()).or_insert(w.key.as_str());
+        }
+        let eff = |id: &str| {
+            let r = raw.get(id).copied().unwrap_or("");
+            keys.as_deref().map_or_else(|| r.to_string(), |k| k.effective(id, r))
+        };
+        let shown: Vec<(String, String)> = listed(&view).map(|a| (a.window_id.clone(), eff(&a.window_id))).collect();
+        let ids: HashSet<&str> = shown.iter().map(|(id, _)| id.as_str()).collect();
+        let mut others: Vec<(String, String)> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for w in &snap.windows {
+            if !ids.contains(w.id.as_str()) && seen.insert(w.id.as_str()) {
+                others.push((w.id.clone(), eff(&w.id)));
+            }
+        }
+        let a = letters::assign(&shown, &others);
+        let key_writes = match keys {
+            Some(k) => {
+                // New writes, then any still unseen past RESEND_AFTER (once).
+                let now = std::time::Instant::now();
+                let mut w = k.fresh(a.writes, now);
+                w.extend(k.due(now));
+                w
+            }
+            None => a.writes,
+        };
+        let last = last_agent(&ids, view.cur_win.as_deref(), snap.mru());
+        Data { view, branches, letters: a.letters, last, key_writes }
+    }
+
+    /// The letter of `win`, if it holds one.
+    pub fn letter(&self, win: &str) -> Option<char> {
+        self.letters.get(win).copied()
+    }
+
+    /// `win`'s first row in display order (the All list), as a target.
+    pub fn first_row(&self, win: &str) -> Option<Target> {
+        let a = listed(&self.view).find(|a| a.window_id == win)?;
+        Some(Target::of(RowKey::Agent(a.session.clone(), a.window_id.clone()), a))
     }
 }
 
-/// Case-insensitive substring match over what the search box searches:
-/// title, session (and `session:index`), detail and path.
+/// Case-insensitive substring match over what the search searches: title,
+/// session (and `session:index`), detail and path.
 pub fn matches(a: &Agent, q: &str) -> bool {
     if q.is_empty() {
         return true;
@@ -321,21 +319,28 @@ pub fn matches(a: &Agent, q: &str) -> bool {
         .any(|s| s.to_lowercase().contains(&q))
 }
 
-/// The list for one tab: agent-roster.py `build_items`, by tab.
-///
-/// `show_all` (the Python's `a`) adds each space's plain windows to its
-/// group on the All tab. Every row passes the search `query`.
-pub fn build_rows(d: &Data, tab: Tab, query: &str, show_all: bool) -> Vec<Row> {
+/// The list for one filter and search query (see the module docs).
+pub fn build_rows(d: &Data, tab: Tab, query: &str) -> Vec<Row> {
     let v = &d.view;
     let mut rows = Vec::new();
     let ok = |a: &Agent| matches(a, query);
-
-    if tab == Tab::Active {
-        // The core's space order (by name, as the sidebar), never `d.order`
-        // (most recently attached), so switching sessions moves nothing.
+    let keep = |a: &Agent| -> bool {
+        ok(a)
+            && match tab {
+                // The client's own window is listed even without an agent:
+                // the "here" row (a prompt that lands under the popup).
+                Tab::All => true,
+                Tab::Active => is_active(v, a),
+                Tab::Working => a.cat == Some(Cat::Working),
+                Tab::Idle => a.cat == Some(Cat::Idle),
+                Tab::Needs | Tab::Parked => false,
+            }
+    };
+    if matches!(tab, Tab::All | Tab::Active | Tab::Working | Tab::Idle) {
+        // The core's space order (by name, as the sidebar), never the
+        // attach recency, so switching sessions moves nothing.
         for s in &v.spaces {
-            let mut shown: Vec<&Agent> = s.agents.iter().filter(|a| is_active(v, a) && ok(a)).collect();
-            shown.sort_by_key(|a| a.index);
+            let shown: Vec<&Agent> = s.agents.iter().filter(|a| keep(a)).collect();
             if shown.is_empty() {
                 continue;
             }
@@ -343,53 +348,23 @@ pub fn build_rows(d: &Data, tab: Tab, query: &str, show_all: bool) -> Vec<Row> {
             rows.extend(shown.into_iter().cloned().map(Row::Agent));
         }
     }
-
-    if matches!(tab, Tab::All | Tab::Needs) {
-        let needs: Vec<&Need> = v.needs.iter().filter(|n| ok(&n.agent)).collect();
-        if !needs.is_empty() {
-            rows.push(Row::Section { title: "NEEDS YOU".into(), color: "yellow", rule: false });
-            rows.extend(needs.into_iter().cloned().map(Row::Need));
-        }
+    if tab == Tab::Needs {
+        rows.extend(v.needs.iter().filter(|n| ok(&n.agent)).cloned().map(Row::Need));
     }
-
-    if matches!(tab, Tab::All | Tab::Working | Tab::Idle) {
-        for &i in &d.order {
-            let s = &v.spaces[i];
-            let mut shown: Vec<&Agent> = match tab {
-                Tab::Working => s.agents.iter().filter(|a| a.cat == Some(Cat::Working)).collect(),
-                Tab::Idle => s.agents.iter().filter(|a| a.cat == Some(Cat::Idle)).collect(),
-                _ if show_all => s.agents.iter().chain(s.plain.iter()).collect(),
-                _ => s.agents.iter().collect(),
-            };
-            shown.retain(|a| ok(a));
-            shown.sort_by_key(|a| a.index);
-            if shown.is_empty() {
-                continue;
-            }
-            rows.push(Row::Group { name: s.name.clone(), branch: s.branch.clone(), counts: s.counts, current: s.is_current });
-            rows.extend(shown.into_iter().cloned().map(Row::Agent));
-        }
+    let parked: Vec<&Parked> = v.parked.iter().filter(|p| ok(&p.agent)).collect();
+    if tab == Tab::All && !parked.is_empty() {
+        rows.push(Row::Fold(parked.len()));
     }
-
-    if matches!(tab, Tab::All | Tab::Parked) {
-        let parked: Vec<&Parked> = v.parked.iter().filter(|p| ok(&p.agent)).collect();
-        if !parked.is_empty() {
-            rows.push(Row::Section { title: format!("PARKED {}", parked.len()), color: "overlay", rule: true });
-            let cap = if tab == Tab::All && parked.len() > PARKED_PREVIEW + 1 { PARKED_PREVIEW } else { parked.len() };
-            rows.extend(parked[..cap].iter().map(|p| Row::Parked((*p).clone())));
-            if cap < parked.len() {
-                rows.push(Row::More(parked.len() - cap));
-            }
-        }
+    if tab == Tab::Parked {
+        rows.extend(parked.into_iter().cloned().map(Row::Parked));
     }
-
     if rows.is_empty() {
         let why = if !query.is_empty() {
             "no matches"
         } else {
             match tab {
-                Tab::Active => "nothing working or waiting · ⇥ for all",
                 Tab::All => "no agents running",
+                Tab::Active => "nothing working or waiting",
                 Tab::Needs => "nothing needs you",
                 Tab::Working => "nothing working",
                 Tab::Idle => "nothing idle",
@@ -399,42 +374,6 @@ pub fn build_rows(d: &Data, tab: Tab, query: &str, show_all: bool) -> Vec<Row> {
         rows.push(Row::Empty(why.into()));
     }
     rows
-}
-
-/// {row position: label} for every row whose agent holds a slot: its slot,
-/// zero-padded to the view's width ([`crate::hotkeys`]). The same agent
-/// listed twice (its NEEDS YOU row and its group row, or a window linked
-/// into two sessions) shows the same number on both; a row without a slot
-/// (an idle agent, a parked tab, a plain window) shows none.
-pub fn number_rows(rows: &[Row], width: usize) -> HashMap<usize, String> {
-    rows.iter()
-        .enumerate()
-        .filter_map(|(i, r)| r.slot().map(|s| (i, crate::hotkeys::slot_label(s, width))))
-        .collect()
-}
-
-/// What each number key means in a frame drawn from `d`: label → the row it
-/// goes to. Every slot in the frame's data is here, on screen or not (slots
-/// are global and sticky, so `3` means agent 3 on every tab, through any
-/// search). The target is the first row ON SCREEN showing that number
-/// (`on_screen`, in display order), else its NEEDS YOU entry (the session
-/// agent-jump.sh would go to), else its row in the menu's group order.
-/// Slots are unique per window ([`crate::view::assign_slots`]).
-pub fn slot_targets(d: &Data, on_screen: &[Target]) -> BTreeMap<String, Target> {
-    let v = &d.view;
-    let needs = v.needs.iter().map(|n| Target::of(RowKey::Need(n.agent.window_id.clone()), &n.agent));
-    let groups = d
-        .order
-        .iter()
-        .flat_map(|&i| v.spaces[i].agents.iter().chain(v.spaces[i].plain.iter()))
-        .map(|a| Target::of(RowKey::Agent(a.session.clone(), a.window_id.clone()), a));
-    let mut out = BTreeMap::new();
-    for t in on_screen.iter().cloned().chain(needs).chain(groups) {
-        if let Some(s) = t.slot {
-            out.entry(crate::hotkeys::slot_label(s, v.slot_width)).or_insert(t);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -476,204 +415,209 @@ pub(crate) mod tests {
     }
 
     pub fn data() -> Data {
-        Data::build(&fixture(), Some("/dev/ttys999"), 1000.0, &Collator::new("en_US.UTF-8"), None, Some(1.0))
-    }
-
-    fn shape(rows: &[Row]) -> Vec<String> {
-        rows.iter()
-            .map(|r| match r {
-                Row::Section { title, .. } => format!("# {title}"),
-                Row::Group { name, .. } => format!("-- {name}"),
-                Row::Need(n) => format!("need {}", n.agent.window_id),
-                Row::Agent(a) => format!("{}:{}", a.session, a.window_id),
-                Row::Parked(p) => format!("parked {}", p.agent.window_id),
-                Row::More(k) => format!("+{k}"),
-                Row::Empty(s) => format!("({s})"),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn all_tab_layout() {
-        let d = data();
-        // The client's session first, then most recently attached.
-        let names: Vec<&str> = d.order.iter().map(|&i| d.view.spaces[i].name.as_str()).collect();
-        assert_eq!(names, ["main", "work", "Alpha"]);
-        let rows = build_rows(&d, Tab::All, "", false);
-        assert_eq!(shape(&rows), [
-            "# NEEDS YOU", "need @6", "need @1",
-            "-- main", "main:@1", "main:@2", "main:@3", "main:@4",
-            "-- work", "work:@6", "work:@7", "work:@3",
-            "-- Alpha", "Alpha:@8",
-            "# PARKED 5", "parked @10", "parked @11", "parked @12", "+2",
-        ]);
-        // Labels: each Active agent's slot (no stamps here: the provisional
-        // fill, main:1 main:2 main:3 work:1), the same number on its NEEDS YOU
-        // row, its group row and a linked row; idle, parked and headers none.
-        let labels = number_rows(&rows, d.view.slot_width);
-        let mut got: Vec<(usize, &str)> = labels.iter().map(|(&i, l)| (i, l.as_str())).collect();
-        got.sort_unstable();
-        assert_eq!(got, [(1, "4"), (2, "1"), (4, "1"), (5, "2"), (6, "3"), (9, "4"), (11, "3")]);
-        // `a`: the plain window joins its group, in index order.
-        let rows = build_rows(&d, Tab::All, "", true);
-        assert!(shape(&rows).contains(&"main:@5".to_string()));
-    }
-
-    #[test]
-    fn tab_filters() {
-        let d = data();
-        assert_eq!(shape(&build_rows(&d, Tab::Needs, "", false)), ["# NEEDS YOU", "need @6", "need @1"]);
-        assert_eq!(shape(&build_rows(&d, Tab::Working, "", false)),
-            ["-- main", "main:@2", "main:@3", "-- work", "work:@3"]);
-        assert_eq!(shape(&build_rows(&d, Tab::Idle, "", false)),
-            ["-- main", "main:@4", "-- work", "work:@7", "-- Alpha", "Alpha:@8"]);
-        let parked = shape(&build_rows(&d, Tab::Parked, "", false));
-        assert_eq!(parked.len(), 6); // header + all five, no "+k more"
-        // Counts on the chips.
-        let c: Vec<usize> = Tab::ALL.iter().map(|t| t.count(&d.view)).collect();
-        assert_eq!(c, [4, 7, 2, 2, 3, 5]); // @3 once though linked; agents session hidden
-    }
-
-    /// Active: working ∪ needs you, by space (the core's by-name order, not
-    /// the All tab's most-recently-attached one), then window index; no
-    /// NEEDS YOU section, no parked rows.
-    #[test]
-    fn active_tab_layout() {
-        let d = data();
-        let rows = build_rows(&d, Tab::Active, "", false);
-        assert_eq!(shape(&rows), ["-- main", "main:@1", "main:@2", "main:@3", "-- work", "work:@6", "work:@3"]);
-        // Exactly working ∪ the Needs you queue, each linked row in its space.
-        let v = &d.view;
-        let mut want: Vec<String> = Vec::new();
-        for s in &v.spaces {
-            let mut ids: Vec<&Agent> = s.agents.iter()
-                .filter(|a| a.cat == Some(Cat::Working) || v.needs.iter().any(|n| n.agent.window_id == a.window_id))
-                .collect();
-            ids.sort_by_key(|a| a.index);
-            want.extend(ids.iter().map(|a| format!("{}:{}", a.session, a.window_id)));
-        }
-        let got: Vec<String> = shape(&rows).into_iter().filter(|s| !s.starts_with("--")).collect();
-        assert_eq!(got, want);
-        // The order ignores the client's session and attach recency: same rows
-        // with the client moved to Alpha and work attached last.
-        let mut snap = fixture();
-        for w in &mut snap.windows {
-            w.last_attached = if w.session == "work" { 99 } else { 1 };
-        }
-        snap.clients[0].window_id = "@8".into();
-        snap.clients[0].session = "Alpha".into();
-        let d2 = Data::build(&snap, Some("/dev/ttys999"), 1000.0, &Collator::new("en_US.UTF-8"), None, Some(1.0));
-        assert_eq!(shape(&build_rows(&d2, Tab::Active, "", false)), shape(&rows));
-        // The search narrows it like any tab.
-        assert_eq!(shape(&build_rows(&d, Tab::Active, "handy", false)), ["-- main", "main:@3", "-- work", "work:@3"]);
-        assert_eq!(shape(&build_rows(&d, Tab::Active, "zzz", false)), ["(no matches)"]);
-        // Labels are the agents' slots, not row positions: work:@3 is @3 = 3.
-        let labels = number_rows(&rows, d.view.slot_width);
-        assert_eq!((labels[&1].as_str(), labels[&5].as_str(), labels[&6].as_str(), labels.len()), ("1", "4", "3", 5));
-    }
-
-    /// The fixture with watcher stamps: `(window, slot)` on every row of it.
-    pub fn stamped(slots: &[(&str, &str)]) -> Snapshot {
-        let mut snap = fixture();
-        for w in &mut snap.windows {
-            w.slot = slots.iter().find(|(id, _)| w.id == *id).and_then(|(_, s)| crate::tmux::parse_slot(s));
-        }
-        snap
+        data_of(&fixture())
     }
 
     pub fn data_of(snap: &Snapshot) -> Data {
         Data::build(snap, Some("/dev/ttys999"), 1000.0, &Collator::new("en_US.UTF-8"), None, Some(1.0))
     }
 
-    /// Gaps stay gaps; a missing stamp is filled with the lowest free number;
-    /// a slot of 10+ makes every label two digits; slot targets cover the
-    /// whole frame's data, on screen first.
-    #[test]
-    fn stamped_slots_label_rows() {
-        // 1, 2, 4 held (3 was freed); @3 (linked) has no stamp yet: it takes 3.
-        let d = data_of(&stamped(&[("@1", "1"), ("@2", "2"), ("@6", "4")]));
-        let rows = build_rows(&d, Tab::Active, "", false);
-        let labels = number_rows(&rows, d.view.slot_width);
-        let shown: Vec<String> = rows.iter().enumerate()
-            .filter_map(|(i, r)| r.key().map(|k| format!("{}={}", k.window(), labels.get(&i).map_or("-", String::as_str))))
-            .collect();
-        assert_eq!(shown, ["@1=1", "@2=2", "@3=3", "@6=4", "@3=3"]);
-        // A gap with nobody to fill it: 1, 2, 4 and @3 idle.
-        let mut snap = stamped(&[("@1", "1"), ("@2", "2"), ("@6", "4")]);
-        for w in snap.windows.iter_mut().filter(|w| w.id == "@3") {
-            w.state = "idle".into();
-            w.workflow.clear();
-        }
+    /// `snap` with every listed agent's letter stored in @agent_key, as the
+    /// live menu would have written it.
+    pub fn stored(mut snap: Snapshot) -> Snapshot {
         let d = data_of(&snap);
-        let rows = build_rows(&d, Tab::All, "", false);
-        let mut labels: Vec<String> = number_rows(&rows, d.view.slot_width).into_values().collect();
-        labels.sort();
-        assert_eq!(labels, ["1", "1", "2", "4", "4"]); // @1 and @6 twice: NEEDS YOU and group
-        // A slot of 12: every label is two digits, wherever it is drawn.
-        let d = data_of(&stamped(&[("@1", "1"), ("@2", "12"), ("@3", "3"), ("@6", "4")]));
-        assert_eq!(d.view.slot_width, 2);
-        let rows = build_rows(&d, Tab::Needs, "", false); // @2 is not even listed here
-        let labels = number_rows(&rows, d.view.slot_width);
-        assert_eq!((labels[&1].as_str(), labels[&2].as_str()), ("04", "01"));
-        // Slot targets: every slot of the data, the on-screen row first.
-        let on_screen: Vec<Target> = rows.iter().filter_map(Row::target).collect();
-        let st = slot_targets(&d, &on_screen);
-        assert_eq!(st.keys().map(String::as_str).collect::<Vec<_>>(), ["01", "03", "04", "12"]);
-        assert_eq!(st["01"].key, RowKey::Need("@1".into())); // its NEEDS YOU row, on screen
-        assert_eq!(st["12"].key, RowKey::Agent("main".into(), "@2".into())); // off this tab: its group row
-        assert_eq!(st["03"].key, RowKey::Agent("main".into(), "@3".into())); // linked: the menu's group order (main first)
-        // Nothing on screen: needs first, then groups.
-        let st = slot_targets(&d, &[]);
-        assert_eq!(st["04"].key, RowKey::Need("@6".into()));
+        for w in &mut snap.windows {
+            w.key = d.letter(&w.id).map(String::from).unwrap_or_default();
+        }
+        snap
     }
 
-    #[test]
-    fn active_tab_empty() {
-        let rows = [
-            row("main", 1, "@1", &[("state", "idle")]),
-            "\x1fclient\x1f/dev/ttys999\x1f@1\x1fmain".into(),
-        ];
-        let d = Data::build(&Snapshot::parse(&rows.join("\n")), Some("/dev/ttys999"), 1000.0, &Collator::new("C"), None,
-            None);
-        assert_eq!(shape(&build_rows(&d, Tab::Active, "", false)), ["(nothing working or waiting · ⇥ for all)"]);
-        assert_eq!(Tab::Active.count(&d.view), 0);
+    /// The fixture with each (window, state) applied (every linked row).
+    pub fn with_states(set: &[(&str, &str)]) -> Snapshot {
+        let mut snap = fixture();
+        for w in &mut snap.windows {
+            if let Some((_, st)) = set.iter().find(|(id, _)| w.id == *id) {
+                w.state = st.to_string();
+            }
+        }
+        snap
     }
 
+    pub fn shape(rows: &[Row]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                Row::Group { name, .. } => format!("-- {name}"),
+                Row::Need(n) => format!("need {}", n.agent.window_id),
+                Row::Agent(a) => format!("{}:{}", a.session, a.window_id),
+                Row::Parked(p) => format!("parked {}", p.agent.window_id),
+                Row::Fold(k) => format!("▪{k}"),
+                Row::Empty(s) => format!("({s})"),
+            })
+            .collect()
+    }
+
+    /// All: spaces by name (Alpha, main, work: the core's order, not the
+    /// client's session first), rows by index, no NEEDS YOU section, parked
+    /// folded into one row at the end.
     #[test]
-    fn search_filters_every_section() {
+    fn all_layout() {
         let d = data();
-        // Case-insensitive, over title...
-        assert_eq!(shape(&build_rows(&d, Tab::All, "handy", false)),
-            ["-- main", "main:@3", "-- work", "work:@3"]);
-        // ...detail, path and session:index.
-        assert_eq!(shape(&build_rows(&d, Tab::All, "WHICH deck", false)), ["# NEEDS YOU", "need @1", "-- main", "main:@1"]);
-        assert_eq!(shape(&build_rows(&d, Tab::All, "/nonexistent/k", false)).len(), 4);
-        assert_eq!(shape(&build_rows(&d, Tab::All, "work:2", false)), ["-- work", "work:@7"]);
-        // Parked rows too, under the same cap.
-        assert_eq!(shape(&build_rows(&d, Tab::All, "sync", false)), ["# PARKED 2", "parked @13", "parked @14"]);
-        assert_eq!(shape(&build_rows(&d, Tab::All, "zzz", false)), ["(no matches)"]);
-        assert_eq!(shape(&build_rows(&d, Tab::Needs, "zzz", false)), ["(no matches)"]);
+        let rows = build_rows(&d, Tab::All, "");
+        assert_eq!(shape(&rows), [
+            "-- Alpha", "Alpha:@8",
+            "-- main", "main:@1", "main:@2", "main:@3", "main:@4",
+            "-- work", "work:@6", "work:@7", "work:@3",
+            "▪5",
+        ]);
+        // No duplicate rows: every key once (a linked window has two keys, one per space).
+        let keys: Vec<RowKey> = rows.iter().filter_map(Row::key).collect();
+        assert_eq!(keys.iter().collect::<HashSet<_>>().len(), keys.len());
+        // The client moved and work attached last: the same list.
+        let mut snap = fixture();
+        for w in &mut snap.windows {
+            w.last_attached = if w.session == "work" { 99 } else { 1 };
+        }
+        snap.clients[0].window_id = "@8".into();
+        snap.clients[0].session = "Alpha".into();
+        assert_eq!(shape(&build_rows(&data_of(&snap), Tab::All, "")), shape(&rows));
+    }
+
+    /// The point of the fixed order: a state flip moves nothing.
+    #[test]
+    fn all_order_survives_state_flips() {
+        let before = shape(&build_rows(&data(), Tab::All, ""));
+        for flips in [&[("@2", "needs-input")][..], &[("@1", "running"), ("@6", "idle")], &[("@4", "failed"), ("@8", "done")],
+            &[("@3", "needs-input")]] {
+            let d = data_of(&with_states(flips));
+            assert_eq!(shape(&build_rows(&d, Tab::All, "")), before, "{flips:?}");
+        }
+        // Only windows appearing / disappearing change it.
+        let mut snap = fixture();
+        snap.windows.retain(|w| w.id != "@4");
+        let after = shape(&build_rows(&data_of(&snap), Tab::All, ""));
+        let mut want = before.clone();
+        want.retain(|s| s != "main:@4");
+        assert_eq!(after, want);
+    }
+
+    #[test]
+    fn filters() {
+        let d = data();
+        assert_eq!(shape(&build_rows(&d, Tab::Needs, "")), ["need @6", "need @1"]); // agent-jump.sh order
+        assert_eq!(shape(&build_rows(&d, Tab::Working, "")), ["-- main", "main:@2", "main:@3", "-- work", "work:@3"]);
+        assert_eq!(shape(&build_rows(&d, Tab::Idle, "")), ["-- Alpha", "Alpha:@8", "-- main", "main:@4", "-- work", "work:@7"]);
+        assert_eq!(shape(&build_rows(&d, Tab::Active, "")),
+            ["-- main", "main:@1", "main:@2", "main:@3", "-- work", "work:@6", "work:@3"]);
+        let parked = shape(&build_rows(&d, Tab::Parked, ""));
+        assert_eq!(parked, ["parked @10", "parked @11", "parked @12", "parked @13", "parked @14"]);
+    }
+
+    #[test]
+    fn search_filters_every_row() {
+        let d = data();
+        assert_eq!(shape(&build_rows(&d, Tab::All, "handy")), ["-- main", "main:@3", "-- work", "work:@3"]);
+        assert_eq!(shape(&build_rows(&d, Tab::All, "WHICH deck")), ["-- main", "main:@1"]);
+        assert_eq!(shape(&build_rows(&d, Tab::All, "work:2")), ["-- work", "work:@7"]);
+        // Parked tabs that match fold into the count.
+        assert_eq!(shape(&build_rows(&d, Tab::All, "sync")), ["▪2"]);
+        assert_eq!(shape(&build_rows(&d, Tab::Parked, "sync")), ["parked @13", "parked @14"]);
+        assert_eq!(shape(&build_rows(&d, Tab::All, "zzz")), ["(no matches)"]);
+        assert_eq!(shape(&build_rows(&d, Tab::Needs, "zzz")), ["(no matches)"]);
     }
 
     #[test]
     fn tabs_cycle_and_parse() {
-        // Chip order: Active, All, Needs you, Working, Idle, Parked.
-        assert_eq!(Tab::ALL.map(Tab::title), ["Active", "All", "Needs you", "Working", "Idle", "Parked"]);
-        assert_eq!(Tab::Active.step(1), Tab::All);
-        assert_eq!(Tab::All.step(1), Tab::Needs);
-        assert_eq!(Tab::All.step(-1), Tab::Active);
-        assert_eq!(Tab::Active.step(-1), Tab::Parked);
-        assert_eq!(Tab::Parked.step(1), Tab::Active);
-        assert_eq!(Tab::parse("active"), Some(Tab::Active));
-        assert_eq!(Tab::parse("all"), Some(Tab::All));
-        assert_eq!(Tab::parse("parked"), Some(Tab::Parked));
+        assert_eq!(Tab::ALL.map(Tab::title), ["All", "Active", "Needs you", "Working", "Idle", "Parked"]);
+        assert_eq!(Tab::All.step(1), Tab::Active);
+        assert_eq!(Tab::All.step(-1), Tab::Parked);
+        assert_eq!(Tab::Parked.step(1), Tab::All);
+        for (s, t) in [("all", Tab::All), ("active", Tab::Active), ("needs", Tab::Needs), ("parked", Tab::Parked)] {
+            assert_eq!(Tab::parse(s), Some(t));
+        }
         assert_eq!(Tab::parse("bogus"), None);
     }
 
     #[test]
     fn empty_server() {
         let d = Data::build(&Snapshot::default(), None, 0.0, &Collator::new("C"), None, None);
-        assert_eq!(shape(&build_rows(&d, Tab::All, "", false)), ["(no agents running)"]);
-        assert_eq!(shape(&build_rows(&d, Tab::Parked, "", false)), ["(nothing parked)"]);
+        assert_eq!(shape(&build_rows(&d, Tab::All, "")), ["(no agents running)"]);
+        assert_eq!(shape(&build_rows(&d, Tab::Parked, "")), ["(nothing parked)"]);
+        assert!(d.letters.is_empty() && d.last.is_none() && d.key_writes.is_empty());
+    }
+
+    /// Letters in display order (Alpha:@8 a, main:@1 s, @2 d, @3 f, @4 g,
+    /// work:@6 h, @7 j); the linked @3 once; the plain @5 and the hidden
+    /// @9 none; parked tabs none.
+    #[test]
+    fn letters_from_the_snapshot() {
+        let d = data();
+        let got: Vec<(&str, char)> = ["@8", "@1", "@2", "@3", "@4", "@6", "@7"].iter().map(|w| (*w, d.letter(w).unwrap())).collect();
+        assert_eq!(got, [("@8", 'a'), ("@1", 's'), ("@2", 'd'), ("@3", 'f'), ("@4", 'g'), ("@6", 'h'), ("@7", 'j')]);
+        assert_eq!(d.letters.len(), 7);
+        assert_eq!(d.key_writes.len(), 7);
+        // Stored: the same letters, nothing to write; a stored letter wins
+        // over display order.
+        let mut snap = fixture();
+        for w in &mut snap.windows {
+            w.key = d.letter(&w.id).map(String::from).unwrap_or_default();
+        }
+        for w in snap.windows.iter_mut().filter(|w| w.id == "@8") {
+            w.key.clear(); // Alpha:@8 lost its key: a is taken by nobody now...
+        }
+        for w in snap.windows.iter_mut().filter(|w| w.id == "@7") {
+            w.key = "a".into(); // ...and @7 claims a
+        }
+        let d2 = data_of(&snap);
+        assert_eq!((d2.letter("@7"), d2.letter("@8"), d2.letter("@1")), (Some('a'), Some('j'), Some('s')));
+        assert_eq!(d2.key_writes, [("@8".to_string(), Some('j'))]);
+    }
+
+    /// The live memo: a write in flight is not sent again, and its letter
+    /// holds even if the next snapshot does not show it yet.
+    #[test]
+    fn key_memo_through_build() {
+        let snap = fixture();
+        let mut keys = KeyMemo::default();
+        let coll = Collator::new("en_US.UTF-8");
+        let b = |s: &Snapshot, k: &mut KeyMemo| {
+            Data::build_with(s, Some("/dev/ttys999"), 1000.0, &coll, None, None, &mut SlotMemo::default(), Some(k))
+        };
+        let d1 = b(&snap, &mut keys);
+        assert_eq!(d1.key_writes.len(), 7);
+        // tmux has not applied them; @8 (a) closes meanwhile: nobody moves.
+        let mut s2 = snap.clone();
+        s2.windows.retain(|w| w.id != "@8");
+        let d2 = b(&s2, &mut keys);
+        assert!(d2.key_writes.is_empty(), "{:?}", d2.key_writes);
+        assert_eq!((d2.letter("@1"), d2.letter("@7")), (Some('s'), Some('j')));
+        // A newcomer takes the freed a.
+        s2.windows.push(crate::tmux::Window::parse(&row("work", 9, "@30", &[("state", "running")])).unwrap());
+        let d3 = b(&s2, &mut keys);
+        assert_eq!(d3.letter("@30"), Some('a'));
+        assert_eq!(d3.key_writes, [("@30".to_string(), Some('a'))]);
+    }
+
+    #[test]
+    fn last_agent_rules() {
+        let listed: HashSet<&str> = ["@1", "@2", "@3"].into_iter().collect();
+        let cur = Some("@2");
+        assert_eq!(last_agent(&listed, cur, ("@1", "@3")), Some("@1".into()));
+        assert_eq!(last_agent(&listed, cur, ("@2", "@3")), Some("@3".into())); // cur is where we are: prev
+        assert_eq!(last_agent(&listed, cur, ("@9", "@3")), Some("@3".into())); // not listed: ignored
+        assert_eq!(last_agent(&listed, cur, ("@2", "@2")), None);
+        assert_eq!(last_agent(&listed, cur, ("@2", "@10")), None); // parked / gone
+        assert_eq!(last_agent(&listed, cur, ("", "")), None);
+        assert_eq!(last_agent(&listed, None, ("@2", "")), Some("@2".into()));
+        // From the snapshot's global options.
+        let mut snap = fixture();
+        for w in &mut snap.windows {
+            w.mru_cur = "@2".into(); // the client is on @2
+            w.mru_prev = "@6".into();
+        }
+        assert_eq!(data_of(&snap).last.as_deref(), Some("@6"));
+        for w in &mut snap.windows {
+            w.mru_prev = "@10".into(); // parked: not listed
+        }
+        assert_eq!(data_of(&snap).last, None);
     }
 }

@@ -54,9 +54,9 @@
 //! ## Numbers
 //!
 //! Every agent row and NEEDS YOU card starts with the agent's sticky slot
-//! ([`crate::view::assign_slots`]), zero-padded like the Option-W menu's, so
-//! the same agent has the same number in both. Display only: the sidebar
-//! takes no number keys. Rows of agents without one (idle, the client's
+//! ([`crate::view::assign_slots`]), zero-padded once any slot reaches 10.
+//! Display only: the sidebar takes no number keys, and the Option-W menu
+//! uses per-agent letters instead. Rows of agents without one (idle, the client's
 //! plain window) leave the column blank, so titles stay aligned; with no
 //! slot anywhere the column is not drawn at all. The folded idle line has
 //! no numbers (idle agents hold none), and collapsed rules and `… N more`
@@ -353,7 +353,7 @@ fn toolbar_row(w: usize) -> Row {
 /// The number column of an agent's first line: its slot label (zero-padded
 /// to `sw`, the view's [`ViewModel::slot_width`]) and a space, blank when it
 /// holds no slot; None when no agent holds one (`sw` 0: no column at all).
-/// Display only: the sidebar has no number keys, these are the menu's.
+/// Display only: the sidebar has no number keys.
 fn num_seg(a: &Agent, sw: usize) -> Option<Seg> {
     (sw > 0).then(|| match a.slot {
         Some(s) => seg(format!("{} ", slot_label(s, sw)), "sub"),
@@ -737,7 +737,7 @@ fn fold_row(idle: &[&Agent], w: usize, sw: usize) -> Row {
         vec![],
         None,
     ))
-    // The menu's Idle tab: the default (Active) does not list idle agents.
+    // The menu's Idle tab: just the idle agents.
     .click(w, Target::Menu(Some("idle")))
     .covering(idle.iter().copied())
 }

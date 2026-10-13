@@ -186,20 +186,25 @@ impl Tmux {
 /// the session a parked tab came from; the menu shows it), `slot` (the
 /// watcher's `@agent_slot`, the agent's sticky number key) and `pending`
 /// (agent-tab-indicator.sh's `@agent_pending`: a needs-input prompt the user
-/// went to answer, whose turn has not resumed yet).
-pub const FIELDS: [&str; 23] = [
+/// went to answer, whose turn has not resumed yet), `key` (the menu's
+/// `@agent_key`, the agent's lifetime letter) and `mru_cur` / `mru_prev`
+/// (the GLOBAL `@agent_mru_cur` / `@agent_mru_prev`: the agent windows a
+/// client last landed on, for the menu's ⌥W "last agent"; like
+/// `@agent_blink`, every row carries the same value).
+pub const FIELDS: [&str; 26] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
-    "detail", "stash_origin", "slot", "pending",
+    "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev",
 ];
 
 /// The tmux format of each FIELDS entry, in order.
-pub const FORMATS: [&str; 23] = [
+pub const FORMATS: [&str; 26] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
     "#{window_panes}", "#{pane_current_path}", "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}",
-    "#{@stash_origin}", "#{@agent_slot}", "#{@agent_pending}",
+    "#{@stash_origin}", "#{@agent_slot}", "#{@agent_pending}", "#{@agent_key}", "#{@agent_mru_cur}",
+    "#{@agent_mru_prev}",
 ];
 
 /// Stand-ins tmux writes for a newline / US inside a field value (Unicode
@@ -304,6 +309,14 @@ pub struct Window {
     /// a prompt the user just answered whose turn has not resumed
     /// ([`Window::answered`]).
     pub pending: String,
+    /// Raw @agent_key: the menu's lifetime letter for this window ("" =
+    /// none yet). Only a stamp: the letter shown is
+    /// [`crate::menu::letters::assign`]'s.
+    pub key: String,
+    /// Raw @agent_mru_cur / @agent_mru_prev (global options: the same on
+    /// every row): window ids like `@12`, or "".
+    pub mru_cur: String,
+    pub mru_prev: String,
 }
 
 fn digits(s: &str) -> bool {
@@ -367,6 +380,9 @@ impl Window {
             stash_origin: p[20].into(),
             slot: parse_slot(p[21]),
             pending: p[22].into(),
+            key: p[23].into(),
+            mru_cur: p[24].into(),
+            mru_prev: p[25].into(),
             label: label.into(),
             session,
         })
@@ -456,6 +472,12 @@ impl Snapshot {
     /// value is everyone's (agent-roster.py `render`).
     pub fn blink(&self) -> bool {
         self.windows.first().is_some_and(|w| w.blink == "1")
+    }
+
+    /// @agent_mru_cur and @agent_mru_prev (global options, so the first
+    /// row's values are everyone's); "" = unset.
+    pub fn mru(&self) -> (&str, &str) {
+        self.windows.first().map_or(("", ""), |w| (w.mru_cur.trim(), w.mru_prev.trim()))
     }
 
     /// Every row of a window id (one per session it is linked into).
@@ -576,6 +598,8 @@ pub(crate) mod tests {
         // The rows of an older format are not rows.
         assert!(Window::parse(&vec![""; 21].join("\x1f")).is_none());
         assert!(Window::parse(&vec![""; 22].join("\x1f")).is_none());
+        assert!(Window::parse(&vec![""; 23].join("\x1f")).is_none());
+        assert!(Window::parse(&vec![""; 25].join("\x1f")).is_none());
         assert_eq!(w.label, "");
         // Answered: idle with a @agent_pending epoch at most 600 s old.
         let now = 1_700_000_000.0;
@@ -615,7 +639,14 @@ pub(crate) mod tests {
 
     #[test]
     fn slots() {
-        assert!(fmt().contains(&guarded("#{@agent_slot}")) && fmt().ends_with(&guarded("#{@agent_pending}")));
+        assert!(fmt().contains(&guarded("#{@agent_slot}")) && fmt().contains(&guarded("#{@agent_pending}")));
+        assert!(fmt().contains(&guarded("#{@agent_key}")) && fmt().ends_with(&guarded("#{@agent_mru_prev}")));
+        // The menu's letter and the global MRU pair ride in the same rows.
+        let s = Snapshot::parse(&[row("main", 1, "@1", &[("key", "f"), ("mru_cur", "@4"), ("mru_prev", " @2 ")]),
+            row("main", 2, "@2", &[("mru_cur", "@4"), ("mru_prev", "@2")])].join("\n"));
+        assert_eq!((s.windows[0].key.as_str(), s.windows[1].key.as_str()), ("f", ""));
+        assert_eq!(s.mru(), ("@4", "@2"));
+        assert_eq!(Snapshot::default().mru(), ("", ""));
         for (raw, want) in [("1", Some(1)), ("7", Some(7)), ("12", Some(12)), ("999999999", Some(999_999_999)),
             ("007", None), ("1000000000", None), ("", None), ("0", None), ("00", None), ("-3", None), ("+3", None),
             (" 3", None), ("3 ", None), ("3a", None), ("x", None), ("1.5", None), ("4294967296", None), ("٣", None)] {

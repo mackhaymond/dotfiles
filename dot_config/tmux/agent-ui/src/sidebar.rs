@@ -174,13 +174,25 @@ pub fn log_target_live(snap: &Snapshot, win: &str, session: &str, index: u32) ->
     snap.row_in(win, session).is_some_and(|w| w.index == index)
 }
 
+/// The menu popup's `-w`: tmux.conf's Option-W cap (at most 100 columns, the
+/// whole client when narrower). display-popup neither expands formats in
+/// `-w` nor clamps a width wider than the client (it fails), so the client's
+/// width is asked for first; unknown → the old 75%.
+pub fn popup_width(client_cols: Option<u16>) -> String {
+    match client_cols {
+        Some(c) if c > 0 => c.min(100).to_string(),
+        _ => "75%".into(),
+    }
+}
+
 /// ≡ / parked / `… more`: the Option-W menu as a popup on the sidebar's
 /// client (Strip.open_menu → `roster_popup_argv`). This binary's `menu` when
 /// its path is known (pointed at the same server; `-B`, since it draws its
 /// own border and title), else the Python popup with tmux's ` agents ` title.
-pub fn menu_command(tmux: &Tmux, client: &str, exe: Option<&std::path::Path>, tab: Option<&str>) -> Command {
+/// `width` is [`popup_width`]'s.
+pub fn menu_command(tmux: &Tmux, client: &str, exe: Option<&std::path::Path>, tab: Option<&str>, width: &str) -> Command {
     let mut c = tmux.command();
-    c.args(["display-popup", "-c", client, "-E", "-w", "75%", "-h", "75%"]);
+    c.args(["display-popup", "-c", client, "-E", "-w", width, "-h", "75%"]);
     match exe {
         Some(exe) => {
             // The Rust menu draws its own rounded border and title: no popup border.
@@ -394,7 +406,14 @@ impl App {
             Target::Next => self.actions.next(&client).map(|_| true),
             Target::Back => self.actions.back(&client).map(|_| true),
             Target::Menu(tab) => {
-                let cmd = menu_command(&self.core.tmux, &client, self.exe.as_deref(), tab);
+                let cols = self
+                    .core
+                    .tmux
+                    .run(&["display-message", "-p", "-c", &client, "#{client_width}"])
+                    .ok()
+                    .filter(|o| o.ok())
+                    .and_then(|o| o.stdout.trim().parse::<u16>().ok());
+                let cmd = menu_command(&self.core.tmux, &client, self.exe.as_deref(), tab, &popup_width(cols));
                 match proc::spawn_detached(cmd) {
                     Ok(child) => {
                         self.children.push(child);
@@ -521,14 +540,15 @@ mod tests {
     #[test]
     fn menu_popup_argv() {
         let t = Tmux::with_socket(Some(Socket::Name("priv".into())));
-        let c = menu_command(&t, "/dev/ttys999", Some(std::path::Path::new("/x/agent-ui")), Some("parked"));
+        assert_eq!((popup_width(Some(272)), popup_width(Some(80)), popup_width(None)), ("100".into(), "80".into(), "75%".into()));
+        let c = menu_command(&t, "/dev/ttys999", Some(std::path::Path::new("/x/agent-ui")), Some("parked"), "100");
         assert_eq!(
             args(&c),
-            ["-u", "-L", "priv", "display-popup", "-c", "/dev/ttys999", "-E", "-w", "75%", "-h", "75%", "-B",
+            ["-u", "-L", "priv", "display-popup", "-c", "/dev/ttys999", "-E", "-w", "100", "-h", "75%", "-B",
                 "/x/agent-ui", "--socket", "priv", "menu", "--client", "/dev/ttys999", "--tab", "parked"]
         );
         // No binary path: the Python popup (prefix q's line, with its title).
-        let c = menu_command(&Tmux::default(), "/dev/ttys999", None, None);
+        let c = menu_command(&Tmux::default(), "/dev/ttys999", None, None, "75%");
         let a = args(&c);
         assert_eq!(&a[a.len() - 7..a.len() - 3], ["-T", " agents ", "/bin/dash", "-c"]);
         assert!(!a.contains(&"-B".to_string()));

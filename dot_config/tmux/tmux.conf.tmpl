@@ -419,6 +419,55 @@ set-hook -g 'client-session-changed[0]' 'run-shell -b "#{HOME}/.config/tmux/scri
 set-hook -g 'after-select-window[1]' 'run-shell -b "#{HOME}/.local/bin/cua-notch-visit"'
 set-hook -g 'after-select-pane[1]' 'run-shell -b "#{HOME}/.local/bin/cua-notch-visit"'
 set-hook -g 'client-session-changed[1]' 'run-shell -b "#{HOME}/.local/bin/cua-notch-visit"'
+# Last agent (agent-ui menu's Option-W Option-W; docs/agent-roster.md "Last
+# agent"). Two GLOBAL options, each a window id or empty: @agent_mru_cur = the
+# agent window a client last landed on, @agent_mru_prev = the agent window
+# before it (never equal to cur). Agent window = @agent_state is set: hooks and
+# the watcher's presence seed write it for every live claude/codex window,
+# idle included, and the GC unsets it. Landed = the window is now some
+# client's current window (#{window_active_clients} non-zero), so a
+# select-window in a session nobody is looking at (a script; agent-jump's
+# select half when it runs as its own tmux call) records nothing until the
+# client arrives. Landing on a non-agent window changes nothing.
+# THE WINDOW BEING LEFT is accounted first, because a window can become an
+# agent while the client sits on it (claude started in a shell tab): its
+# landing recorded nothing, and without this the chain would never hold it.
+# @agent_mru_here = the window (agent or not) of the last landing these hooks
+# saw; on each landing, if here is NOW an agent and isn't cur, it is pushed
+# (prev := cur, cur := here) before the landing rule runs. Its agent test is
+# an S/W loop over all windows (a format can't read an arbitrary window's
+# option by id); a window linked twice yields "11", still true; a killed one
+# yields nothing. @agent_mru_left is that step's scratch result. Not
+# window_last_flag / client_last_session: after kill-window or agent-jump's
+# select-in-another-session, those name windows the client never looked at.
+# A burst of selects in ONE command list runs these hooks after the whole list
+# (window_active_clients is read at run time), so the windows passed through
+# record nothing and the chain stays consistent.
+# Why these two hooks and not after-select-window: session-window-changed
+# fires only on a REAL change of a session's current window (select/next/
+# previous/last-window, a tab click, Cmd-N, closing the current window) and
+# expands #{window_id} in that session; after-select-window also fires for a
+# no-op select and then expands #{window_id} against the client's OLD session
+# (the trap above). client-session-changed covers a switch-client into a
+# session whose current window does not change. Pure set -gF, no fork. The two
+# hook bodies must stay identical (tests/test_agent_last.py checks). A closed
+# window's id may linger here; the reader ignores ids that aren't listed agents.
+set-hook -g 'session-window-changed[2]' {
+  set -gF @agent_mru_left "#{?#{&&:#{window_active_clients},#{&&:#{!=:#{@agent_mru_here},#{@agent_mru_cur}},#{S:#{W:#{?#{&&:#{==:#{window_id},#{@agent_mru_here}},#{n:#{@agent_state}}},1,}}}}},#{@agent_mru_here},}"
+  set -gF @agent_mru_prev "#{?#{@agent_mru_left},#{@agent_mru_cur},#{@agent_mru_prev}}"
+  set -gF @agent_mru_cur "#{?#{@agent_mru_left},#{@agent_mru_left},#{@agent_mru_cur}}"
+  set -gF @agent_mru_prev "#{?#{&&:#{n:#{@agent_state}},#{&&:#{window_active_clients},#{!=:#{window_id},#{@agent_mru_cur}}}},#{@agent_mru_cur},#{@agent_mru_prev}}"
+  set -gF @agent_mru_cur "#{?#{&&:#{n:#{@agent_state}},#{window_active_clients}},#{window_id},#{@agent_mru_cur}}"
+  set -gF @agent_mru_here "#{?#{window_active_clients},#{window_id},#{@agent_mru_here}}"
+}
+set-hook -g 'client-session-changed[2]' {
+  set -gF @agent_mru_left "#{?#{&&:#{window_active_clients},#{&&:#{!=:#{@agent_mru_here},#{@agent_mru_cur}},#{S:#{W:#{?#{&&:#{==:#{window_id},#{@agent_mru_here}},#{n:#{@agent_state}}},1,}}}}},#{@agent_mru_here},}"
+  set -gF @agent_mru_prev "#{?#{@agent_mru_left},#{@agent_mru_cur},#{@agent_mru_prev}}"
+  set -gF @agent_mru_cur "#{?#{@agent_mru_left},#{@agent_mru_left},#{@agent_mru_cur}}"
+  set -gF @agent_mru_prev "#{?#{&&:#{n:#{@agent_state}},#{&&:#{window_active_clients},#{!=:#{window_id},#{@agent_mru_cur}}}},#{@agent_mru_cur},#{@agent_mru_prev}}"
+  set -gF @agent_mru_cur "#{?#{&&:#{n:#{@agent_state}},#{window_active_clients}},#{window_id},#{@agent_mru_cur}}"
+  set -gF @agent_mru_here "#{?#{window_active_clients},#{window_id},#{@agent_mru_here}}"
+}
 
 # Fork of tmux-plugins/tmux-resurrect. Its ONLY functional change is
 # strategies/nvim_session.sh: upstream looks for a `Session.vim` in the pane's
@@ -546,9 +595,11 @@ bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% 
 # binary, reload the config (prefix r) to switch. Force the python fallback:
 # `rm ~/.local/bin/agent-ui`, then prefix r.
 if-shell "test -x '{{ .chezmoi.homeDir }}/.local/bin/agent-ui'" {
-    bind-key q      run-shell -C "display-popup -c '#{client_tty}' -E -B -w 75% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
-    bind-key C-q    run-shell -C "display-popup -c '#{client_tty}' -E -B -w 75% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
-    bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -B -w 75% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
+    # Width: at most 100 columns (narrower clients get the whole width), so a
+    # row's title, project tag and age stay within one glance.
+    bind-key q      run-shell -C "display-popup -c '#{client_tty}' -E -B -w '#{?#{e|<:#{client_width},100},#{client_width},100}' -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
+    bind-key C-q    run-shell -C "display-popup -c '#{client_tty}' -E -B -w '#{?#{e|<:#{client_width},100},#{client_width},100}' -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
+    bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -B -w '#{?#{e|<:#{client_width},100},#{client_width},100}' -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
     # prefix a / C-a: `agent-ui sessions`, the session picker (the bash + fzf
     # mru-session-switch.sh lines above stay as the fallback). Same launch
     # as the menu; docs/agent-roster.md "agent-ui sessions".

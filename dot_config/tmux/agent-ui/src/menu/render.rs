@@ -1,52 +1,48 @@
 //! Drawing one frame of the menu into a ratatui [`Buffer`], plus the frame's
-//! click map, the labels on screen, and the `--once` ANSI dump.
-//!
-//! The layout is the approved mockup's ("Option-W menu", agent-ui-v4):
+//! click map, what is on screen for the keys, and the `--once` ANSI dump.
 //!
 //! ```text
-//! ╭─ agents ───────────────────────────────────────────── ⌥W ✕ ─╮   border, title, close
-//! │  Active 3   All 11   Needs you 1   Working 2  … │ / search… │ │   chips + search
-//! ├──────────────────────────┬───────────────────────────────────┤
-//! │ main ⌥ main ───── ◉1 ◐2  │ Title               ◉ asks · 44m   │   list | preview
-//! │  1 ◉ Kua Yu focus…   44m │ main:3 · ✳ claude · ⌥ main · ~/x   │
-//! │      asks Which deck…    │ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  │
-//! │  2 ◐ Handy.app ⚙     19m │ (the pane's last lines, coloured)  │
-//! │ work ──────────── ✕1 ◐1  │                                    │
-//! │ …                       ▕│  ⏎ go to it   p full peek  …       │   buttons
-//! ├──────────────────────────┴───────────────────────────────────┤
-//! │  ⏎  go   1–4  jump   ⇥  filter  …                             │   key bar / prompts
-//! ╰──────────────────────────────────────────────────────────────╯
+//! ╭─ agents · ◉ 1 need you · ◐ 4 working · ○ 6 idle · ▪ 6 parked ─── ⌥W ✕ ─╮   header
+//! │ main ⌥ main ─────────────────────────────────────────────── ◉1 ◐2 ○1 │   a space
+//! │  s  ◉ Kua Yu focus timing  asks Which deck?               kua   44m  │   letter · glyph · title · reason · tag · age
+//! │  d  ◐ Tmux Agent Sidebar                         · here ·  tmux  19m  │
+//! │  g  ○ Commodities Job Tracker                                   3h  │   idle: dimmer title
+//! │ work ──────────────────────────────────────────────────────── ✕1 ○1 │
+//! │     ▪ 6 parked ⇥                                                    │   the fold
+//! ├─ Kua Yu focus timing · main:1 · ✳ claude · ⌥ main · ~/x ────────────┤   preview strip (Space p)
+//! │ (the pane's last lines, coloured)                                   │
+//! ├─────────────────────────────────────────────────────────────────────┤
+//! │  a–j  go   ⌥W  last   ⏎  open   /  search   ␣  actions   ⇥  filter  │   key bar / search / strip / y/n
+//! ╰─────────────────────────────────────────────────────────────────────╯
 //! ```
 //!
-//! (The default Active tab, drawn above: space groups in fixed order, the
-//! selected attention row's reason line under it. The All tab starts with a
-//! NEEDS YOU section instead.)
-//!
-//! Under [`PREVIEW_MIN_W`] columns the preview goes and the list takes the
-//! body. The full peek (`p`) takes the whole body (agent-roster.py
-//! `peek_panel`). The footer shows, first match wins, the Python's order:
-//! the peek hint, a y/n, the search hints, a half-typed number, a message,
-//! the dead-number warning, else the key bar.
+//! The header is ONE status line: the non-zero counts in the state hues,
+//! and the filter's name when it is not All (`Working ⇥`, clickable). Each
+//! agent row leads with its letter in reverse video, the background its
+//! state's colour (needs yellow, failed red, done green, working blue, idle
+//! overlay). A needs-you row's title takes the needs colour and its reason
+//! shows inline. The preview is OFF by default; Space p turns on a strip of
+//! up to 10 lines under the list, full width. The footer shows, first match
+//! wins: a y/n, the search line, the actions strip, a message, else the key
+//! bar.
 
+use super::letters::ALPHABET;
 use super::rows::{Row, Tab, Target};
-use super::state::{Button, Hit, Menu};
+use super::state::{strip, Drawn, Hit, Menu};
 use crate::actions::watcher_problem;
-use super::state::Drawn;
-use crate::hotkeys::jump_hint;
+use crate::model::Cat;
 use crate::palette::color;
-use crate::text::{clip, dwidth, fit_label, plain, sanitize};
+use crate::text::{clip, dwidth, plain, sanitize};
 use crate::view::{tilde, Agent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
-/// Below this width the preview is hidden and the list takes the body.
-pub const PREVIEW_MIN_W: u16 = 90;
-/// The list's narrowest width beside a preview.
-pub const LIST_MIN_W: u16 = 44;
 /// Smaller than this, the frame is one line saying so.
 pub const MIN_W: u16 = 30;
 pub const MIN_H: u16 = 8;
+/// The preview strip's height: its rule line plus up to this many lines.
+pub const PREVIEW_LINES: u16 = 10;
 
 fn fg(name: &str) -> Style {
     Style::new().fg(color(name))
@@ -107,36 +103,42 @@ fn line(buf: &mut Buffer, x: u16, y: u16, w: u16, left: &[Seg], right: &[Seg], f
 /// The frame's geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Geo {
-    /// The body: between the two separators, inside the side borders.
+    /// Between the header and the footer's rule, inside the side borders.
     pub body: Rect,
     pub list: Rect,
-    /// The preview, and the x of the │ before it (None: hidden).
+    /// The preview strip (its rule line first), when it is on and fits.
     pub preview: Option<Rect>,
-    pub split: Option<u16>,
 }
 
 impl Geo {
-    pub fn new(w: u16, h: u16) -> Geo {
-        let body = Rect::new(1, 3, w.saturating_sub(2), h.saturating_sub(6));
-        if w < PREVIEW_MIN_W {
-            return Geo { body, list: body, preview: None, split: None };
+    pub fn new(w: u16, h: u16, preview: bool) -> Geo {
+        let body = Rect::new(1, 1, w.saturating_sub(2), h.saturating_sub(4));
+        if !preview || body.height < 8 {
+            return Geo { body, list: body, preview: None };
         }
-        let lw = ((w - 3) * 47 / 100).max(LIST_MIN_W);
-        let split = 1 + lw;
-        let list = Rect::new(1, 3, lw, body.height);
-        let preview = Rect::new(split + 1, 3, w - 2 - lw - 1, body.height);
-        Geo { body, list, preview: Some(preview), split: Some(split) }
+        let ph = (PREVIEW_LINES + 1).min(body.height / 2);
+        let list = Rect::new(body.x, body.y, body.width, body.height - ph);
+        Geo { body, list, preview: Some(Rect::new(body.x, list.bottom(), body.width, ph)) }
     }
 }
 
-/// A title as shown: a bare `~/` project prefix (an agent started in $HOME)
-/// says nothing, so it goes; a real `project/` prefix stays.
+/// A title as shown: a bare `~/` project prefix says nothing, so it goes.
 pub fn shown_title(t: &str) -> &str {
     t.strip_prefix("~/").unwrap_or(t)
 }
 
-/// The colour of a NEEDS YOU reason word: the detail kind's, else the
-/// agent's own (the state in words).
+/// A row's title and its project tag: `proj/Title` → ("Title", "proj"); a
+/// bare `~/` (an agent started in $HOME) is no project.
+pub fn title_and_tag(a: &Agent) -> (String, String) {
+    let p = a.project.trim_end_matches('/');
+    if p.is_empty() || p == "~" {
+        (sanitize(shown_title(&a.title)), String::new())
+    } else {
+        (sanitize(&a.short_title), sanitize(p))
+    }
+}
+
+/// The colour of a reason word: the detail kind's, else the agent's own.
 fn reason_color(a: &Agent, word_is_detail: bool) -> &'static str {
     if word_is_detail {
         match a.detail_kind.as_str() {
@@ -150,6 +152,17 @@ fn reason_color(a: &Agent, word_is_detail: bool) -> &'static str {
     }
 }
 
+/// The background of an agent's letter badge: its state's colour.
+pub fn badge_color(a: &Agent) -> &'static str {
+    match a.cat {
+        Some(Cat::Failed) => "red",
+        Some(Cat::NeedsInput) => "yellow",
+        Some(Cat::Done) => "green",
+        Some(Cat::Working) => "blue",
+        Some(Cat::Idle) | None => "overlay",
+    }
+}
+
 /// Draw the whole frame for `now`; records what is on screen in `m`.
 pub fn render(m: &mut Menu, buf: &mut Buffer, now: f64) {
     let area = buf.area;
@@ -157,7 +170,6 @@ pub fn render(m: &mut Menu, buf: &mut Buffer, now: f64) {
     if area.width == 0 || area.height == 0 {
         m.drawn = Default::default();
         m.preview_rows = 0;
-        m.full_rows = 0;
         return;
     }
     for c in buf.content.iter_mut() {
@@ -169,236 +181,106 @@ pub fn render(m: &mut Menu, buf: &mut Buffer, now: f64) {
         put(buf, 0, 0, w, "agents · too small", fg("overlay"));
         m.drawn = Default::default();
         m.preview_rows = 0;
-        m.full_rows = 0;
         return;
     }
-    let geo = Geo::new(w, h);
+    let geo = Geo::new(w, h, m.preview);
     let s1 = fg("surface1");
-    let split = if m.peek_full.is_some() { None } else { geo.split };
 
-    // Borders and separators.
-    top_border(m, buf, w);
+    // Borders and the footer's rule.
+    header(m, buf, w);
     for y in 1..h - 1 {
         put(buf, 0, y, w, "│", s1);
         put(buf, w - 1, y, w, "│", s1);
     }
-    for (y, mid) in [(2, "┬"), (h - 3, "┴")] {
-        put(buf, 0, y, w, "├", s1);
-        for x in 1..w - 1 {
-            put(buf, x, y, w, "─", s1);
-        }
-        put(buf, w - 1, y, w, "┤", s1);
-        if let Some(sx) = split {
-            put(buf, sx, y, w, mid, s1);
-        }
+    put(buf, 0, h - 3, w, "├", s1);
+    for x in 1..w - 1 {
+        put(buf, x, h - 3, w, "─", s1);
     }
-    if let Some(sx) = split {
-        for y in geo.body.y..geo.body.bottom() {
-            put(buf, sx, y, w, "│", s1);
-        }
-    }
+    put(buf, w - 1, h - 3, w, "┤", s1);
     put(buf, 0, h - 1, w, "╰", s1);
     for x in 1..w - 1 {
         put(buf, x, h - 1, w, "─", s1);
     }
     put(buf, w - 1, h - 1, w, "╯", s1);
 
-    tab_row(m, buf, w);
-    m.full_rows = geo.body.height.saturating_sub(2) as usize;
-    if let Some(t) = m.peek_full.clone() {
-        full_peek(m, buf, geo.body, &t);
-        // The list (and its numbers) stays as last drawn under a peek.
-        m.preview_rows = 0;
-    } else {
-        list(m, buf, geo.list);
-        match geo.preview {
-            Some(r) => preview(m, buf, r),
-            None => m.preview_rows = 0,
-        }
+    list(m, buf, geo.list);
+    match geo.preview {
+        Some(r) => preview(m, buf, r, w),
+        None => m.preview_rows = 0,
     }
     footer(m, buf, w, h - 2, now);
 }
 
-fn top_border(m: &mut Menu, buf: &mut Buffer, w: u16) {
+/// The top border, which is the header: `agents`, a watcher banner, the
+/// filter when it is not All, the non-zero counts, then ⌥W ✕.
+fn header(m: &mut Menu, buf: &mut Buffer, w: u16) {
     let s1 = fg("surface1");
+    let ov = fg("overlay");
+    let right_w = 8; // " ⌥W ✕ ─╮"
+    let end = w - right_w;
     let mut x = put(buf, 0, 0, w, "╭─ ", s1);
-    x = put(buf, x, 0, w, "agents", bold(fg("text")));
-    x = put(buf, x, 0, w, " ", s1);
+    x = put(buf, x, 0, end, "agents", bold(fg("text")));
     let v = &m.data.view;
     let banner = match watcher_problem(v.watcher_age) {
-        Some(why) => Some(format!(" watcher {why} · r restarts it ")),
+        Some(why) => Some(format!(" watcher {why} · ␣ r restarts it ")),
         None if v.client_gone => Some(" this menu's client is gone · esc closes ".to_string()),
         None => None,
     };
-    let right_w = 8; // " ⌥W ✕ ─╮"
     if let Some(b) = banner {
-        x = put(buf, x, 0, w.saturating_sub(right_w + 1), &b, bold(on("crust", "red")));
-        x = put(buf, x, 0, w, " ", s1);
+        x = put(buf, x, 0, end, " ", s1);
+        x = put(buf, x, 0, end.saturating_sub(1), &b, bold(on("crust", "red")));
     }
-    while x < w - right_w {
-        x = put(buf, x, 0, w - right_w, "─", s1);
+    if m.tab != Tab::All {
+        x = put(buf, x, 0, end, " · ", ov);
+        let x0 = x;
+        x = put(buf, x, 0, end, &format!("{} ⇥", m.tab.title()), bold(fg("blue")));
+        m.clicks.push((Rect::new(x0, 0, x - x0, 1), Hit::Filter));
     }
-    let mut rx = put(buf, w - right_w, 0, w, " ⌥W ", fg("overlay"));
+    let counts: Vec<(String, &str)> = [
+        (v.needs.len(), "◉", "need you", "yellow"),
+        (v.counts.get(Cat::Working), "◐", "working", "blue"),
+        (v.counts.get(Cat::Idle), "○", "idle", "overlay"),
+        (v.parked.len(), "▪", "parked", "overlay"),
+    ]
+    .into_iter()
+    .filter(|c| c.0 > 0)
+    .map(|(n, g, words, c)| (format!("{g} {n} {words}"), c))
+    .collect();
+    for (t, c) in counts {
+        // Each count whole or not at all (the last ones give way first).
+        if x + 3 + cells(&t) + 1 > end {
+            break;
+        }
+        x = put(buf, x, 0, end, " · ", ov);
+        x = put(buf, x, 0, end, &t, fg(c));
+    }
+    if x < end {
+        x = put(buf, x, 0, end, " ", s1);
+    }
+    while x < end {
+        x = put(buf, x, 0, end, "─", s1);
+    }
+    let mut rx = put(buf, end, 0, w, " ⌥W ", ov);
     m.clicks.push((Rect::new(rx.saturating_sub(1), 0, 3, 1), Hit::Close));
     rx = put(buf, rx, 0, w, "✕", fg("red"));
     put(buf, rx, 0, w, " ─╮", s1);
 }
 
-/// How the chips are written: full or short titles, with or without their
-/// counts, with or without the padding inside each chip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChipStyle {
-    pub short: bool,
-    pub counts: bool,
-    pub pad: bool,
-}
-
-impl ChipStyle {
-    /// From the roomiest to the most compact.
-    pub const LEVELS: [ChipStyle; 4] = [
-        ChipStyle { short: false, counts: true, pad: true },
-        ChipStyle { short: true, counts: true, pad: true },
-        ChipStyle { short: true, counts: false, pad: true },
-        ChipStyle { short: true, counts: false, pad: false },
-    ];
-
-    /// One chip's (title part, count part).
-    fn parts(self, t: Tab, n: usize) -> (String, String) {
-        let title = if self.short { t.short_title() } else { t.title() };
-        let p = if self.pad { " " } else { "" };
-        let count = if self.counts { format!("{n}{p}") } else { String::new() };
-        (format!("{p}{title}{p}"), count)
-    }
-
-    /// The whole chip row's width, from its first chip to its last.
-    fn width(self, counts: &[usize]) -> u16 {
-        let chips: u16 = Tab::ALL
-            .iter()
-            .zip(counts)
-            .map(|(&t, &n)| {
-                let (a, b) = self.parts(t, n);
-                cells(&a) + cells(&b)
-            })
-            .sum();
-        chips + Tab::ALL.len() as u16 - 1
-    }
-}
-
-/// The search field's narrowest useful width (else it is not drawn).
-pub const SEARCH_MIN_W: u16 = 10;
-
-/// The roomiest chip style that fits between x = 2 and `end`, and whether
-/// the search field still fits beside it. The search field gives way first
-/// (`/` opens it anyway), then the chips shorten; while a search is open
-/// the field stays and the chips shorten first.
-pub fn chip_style(counts: &[usize], end: u16, searching: bool) -> (ChipStyle, bool) {
-    let fits = |s: ChipStyle, search: bool| 2 + s.width(counts) + if search { 2 + SEARCH_MIN_W } else { 0 } <= end;
-    let mut order: Vec<(ChipStyle, bool)> = Vec::new();
-    if searching {
-        order.extend(ChipStyle::LEVELS.iter().map(|&s| (s, true)));
-        order.extend(ChipStyle::LEVELS.iter().map(|&s| (s, false)));
-    } else {
-        for s in ChipStyle::LEVELS {
-            order.extend([(s, true), (s, false)]);
-        }
-    }
-    order.into_iter().find(|&(s, se)| fits(s, se)).unwrap_or((ChipStyle::LEVELS[3], false))
-}
-
-fn tab_row(m: &mut Menu, buf: &mut Buffer, w: u16) {
-    let y = 1;
-    let end = w - 2;
-    let mut x = 2;
-    let counts: Vec<usize> = Tab::ALL.iter().map(|t| t.count(&m.data.view)).collect();
-    let (style, search) = chip_style(&counts, end, m.searching || !m.query.is_empty());
-    for (t, &n) in Tab::ALL.into_iter().zip(&counts) {
-        let x0 = x;
-        let (title, count) = style.parts(t, n);
-        if t == m.tab {
-            x = put(buf, x, y, end, &format!("{title}{count}"), bold(on("crust", "blue")));
-        } else {
-            x = put(buf, x, y, end, &title, on("sub", "surface0"));
-            x = put(buf, x, y, end, &count, on(if n > 0 { t.hue() } else { "overlay" }, "surface0"));
-        }
-        m.clicks.push((Rect::new(x0, y, x - x0, 1), Hit::Tab(t)));
-        x += 1;
-    }
-    // The search field, flush right.
-    let room = end.saturating_sub(x + 1);
-    let sw = room.min(34);
-    if !search || sw < SEARCH_MIN_W {
-        return;
-    }
-    let sx = end - sw;
-    let field = on("overlay", "surface0");
-    buf.set_style(Rect::new(sx, y, sw, 1), field);
-    let mut cx = put(buf, sx, y, end, " / ", field);
-    if m.query.is_empty() && !m.searching {
-        put(buf, cx, y, end, "search…", field);
-    } else {
-        let room = (end - cx).saturating_sub(2) as usize;
-        let q = sanitize(&m.query);
-        // The tail of a long query, so the cursor end stays visible.
-        let mut shown: Vec<char> = Vec::new();
-        for c in q.chars().rev() {
-            if dwidth(&shown.iter().rev().collect::<String>()) + dwidth(&c.to_string()) > room {
-                break;
-            }
-            shown.push(c);
-        }
-        let shown: String = shown.into_iter().rev().collect();
-        cx = put(buf, cx, y, end, &shown, on("text", "surface0"));
-        if m.searching {
-            put(buf, cx, y, end, "▏", on("peach", "surface0"));
-        }
-    }
-    m.clicks.push((Rect::new(sx, y, sw, 1), Hit::Search));
-}
-
-/// The left list: rows, the selected need's reason line, the scrollbar.
+/// The list: one line per row, the scrollbar in its last column.
 fn list(m: &mut Menu, buf: &mut Buffer, r: Rect) {
-    // The number column: the slot width, so it never shifts with what is listed.
-    let lw = m.data.view.slot_width.max(1);
     let mut sel_pos = m.sel.as_ref().and_then(|k| m.rows.iter().position(|r| r.key().as_ref() == Some(k)));
-    // Each row's reason line, shown under it while selected: (word, its
-    // colour, the reason text). NEEDS YOU rows, and the Active tab's
-    // attention rows (which stay in their fixed slot instead).
-    let reasons: Vec<Option<(String, &'static str, String)>> = m
-        .rows
-        .iter()
-        .map(|row| {
-            m.reason_of(row).map(|n| {
-                (n.reason_word.clone(), reason_color(&n.agent, !n.reason.is_empty()), n.reason.clone())
-            })
-        })
-        .collect();
-    // Display lines: (row, is the reason line).
-    let expand = |sel: Option<usize>| -> Vec<(usize, bool)> {
-        let mut v = Vec::new();
-        for (i, r) in reasons.iter().enumerate() {
-            v.push((i, false));
-            if Some(i) == sel && r.is_some() {
-                v.push((i, true));
-            }
-        }
-        v
-    };
-    let mut lines = expand(sel_pos);
     let hgt = r.height as usize;
-    let len = lines.len();
+    let len = m.rows.len();
     if m.follow {
         if let Some(sp) = sel_pos {
-            let first = lines.iter().position(|l| l.0 == sp).unwrap_or(0);
-            let last = lines.iter().rposition(|l| l.0 == sp).unwrap_or(first);
-            if first < m.top {
-                // Scrolling up onto a row: bring the headers right above it
-                // too (a section, a group rule), while the row still fits.
-                m.top = first;
-                while m.top > 0 && m.rows[lines[m.top - 1].0].key().is_none() && last < m.top - 1 + hgt {
+            if sp < m.top {
+                // Scrolling up onto a row: bring its group rule into view too.
+                m.top = sp;
+                while m.top > 0 && m.rows[m.top - 1].key().is_none() && sp < m.top - 1 + hgt {
                     m.top -= 1;
                 }
-            } else if last >= m.top + hgt {
-                m.top = last + 1 - hgt;
+            } else if sp >= m.top + hgt {
+                m.top = sp + 1 - hgt;
             }
         }
     }
@@ -407,65 +289,34 @@ fn list(m: &mut Menu, buf: &mut Buffer, r: Rect) {
         // After a wheel scroll: a selection scrolled off screen moves to the
         // nearest row still on it, so keys never act on a row out of sight.
         if let Some(sp) = sel_pos {
-            let first = lines.iter().position(|l| l.0 == sp).unwrap_or(0);
-            let visible: Vec<usize> = lines
-                .iter()
-                .skip(m.top)
-                .take(hgt)
-                .filter(|l| !l.1 && m.rows[l.0].key().is_some())
-                .map(|l| l.0)
-                .collect();
-            let pick = if first < m.top { visible.first() } else { visible.last() };
-            if !(m.top..m.top + hgt).contains(&first) {
+            if !(m.top..m.top + hgt).contains(&sp) {
+                let visible: Vec<usize> =
+                    (m.top..(m.top + hgt).min(len)).filter(|&i| m.rows[i].key().is_some()).collect();
+                let pick = if sp < m.top { visible.first() } else { visible.last() };
                 if let Some(&ri) = pick {
                     m.sel = m.rows[ri].key();
                     sel_pos = Some(ri);
-                    lines = expand(sel_pos);
-                    // A need's reason line shifts what follows it: keep the
-                    // new selection (both its lines) inside the window.
-                    let f = lines.iter().position(|l| l.0 == ri).unwrap_or(0);
-                    let l = lines.iter().rposition(|l| l.0 == ri).unwrap_or(f);
-                    if f < m.top {
-                        m.top = f;
-                    } else if l >= m.top + hgt {
-                        m.top = l + 1 - hgt;
-                    }
                 }
             }
         }
     }
-    let len = lines.len();
     m.page = hgt.saturating_sub(1).max(1);
     let cw = r.width.saturating_sub(1); // the last column is the scrollbar's
-    let end = r.x + cw;
-
     let mut drawn: Vec<Target> = Vec::new();
-    for (k, &(ri, detail)) in lines.iter().skip(m.top).take(hgt).enumerate() {
+    for (k, ri) in (m.top..len).take(hgt).enumerate() {
         let y = r.y + k as u16;
-        let row = &m.rows[ri];
+        let row = m.rows[ri].clone();
         let selected = Some(ri) == sel_pos;
         let rect = Rect::new(r.x, y, cw, 1);
         if selected {
             buf.set_style(rect, Style::new().bg(color("surface1")));
         }
-        let label = m.labels.get(&ri).map(String::as_str);
-        if detail {
-            if let Some((word, wcol, reason)) = &reasons[ri] {
-                let x = r.x + 1 + lw as u16 + 1 + 2;
-                let cx = put(buf, x, y, end, word, fg(wcol));
-                let rest = clip(&plain(reason), end.saturating_sub(cx + 1) as usize);
-                put(buf, cx + 1, y, end, &rest, fg("sub"));
-            }
-        } else {
-            draw_row(buf, r.x, y, cw, row, label, lw, selected, m.tab);
-            if let Some(t) = row.target() {
-                drawn.push(t);
-            }
-        }
+        draw_row(m, buf, r.x, y, cw, &row, selected);
         if let Some(t) = row.target() {
+            drawn.push(t.clone());
             m.clicks.push((rect, Hit::Row(t)));
-        } else if matches!(row, Row::More(_)) {
-            m.clicks.push((rect, Hit::More));
+        } else if matches!(row, Row::Fold(_)) {
+            m.clicks.push((rect, Hit::Fold));
         }
     }
     if len > hgt && hgt > 0 {
@@ -477,24 +328,19 @@ fn list(m: &mut Menu, buf: &mut Buffer, r: Rect) {
             put(buf, x, r.y + k as u16, x + 1, "▕", st);
         }
     }
-    // Every slot of this frame's data, the rows on screen first: what the
-    // number keys mean until the next frame (state.rs has the rule).
+    // What the letters and ⌥W mean until the next frame (state.rs has the rule).
     m.drawn = Drawn::of(&m.data, drawn);
-    // What the selection is, as this frame shows it (keys act on it only
-    // while it is still listed).
     m.drawn_sel = m.selected_target();
 }
 
-/// One list row (not the reason line).
-#[allow(clippy::too_many_arguments)]
-fn draw_row(buf: &mut Buffer, x0: u16, y: u16, cw: u16, row: &Row, label: Option<&str>, lw: usize, sel: bool,
-    tab: Tab) {
+/// The letter badge's cells: ` a ` (or blank, keeping titles aligned).
+const BADGE_W: u16 = 3;
+
+/// One list row.
+fn draw_row(m: &Menu, buf: &mut Buffer, x0: u16, y: u16, cw: u16, row: &Row, sel: bool) {
     let ov = fg("overlay");
+    let lead = x0 + 1 + BADGE_W + 1; // where the glyph goes
     match row {
-        Row::Section { title, color: c, rule } => {
-            let left = [seg(format!(" {title} "), bold(fg(c)))];
-            line(buf, x0, y, cw, &left, &[], rule.then(|| ("─", fg("surface0"))));
-        }
         Row::Group { name, branch, counts, .. } => {
             let mut left = vec![seg(format!(" {} ", sanitize(name)), bold(fg("text")))];
             if !branch.is_empty() {
@@ -504,31 +350,24 @@ fn draw_row(buf: &mut Buffer, x0: u16, y: u16, cw: u16, row: &Row, label: Option
             let right = [seg(format!(" {} ", toks.join(" ")), ov)];
             line(buf, x0, y, cw, &left, &right, Some(("─", fg("surface0"))));
         }
-        Row::Need(n) => {
-            let a = &n.agent;
-            let age = format!("{:>4}", a.age);
-            let right = [seg(sanitize(&a.session), ov), seg(format!(" {age}"), ov)];
-            window_row(buf, x0, y, cw, label, lw, a, a.glyph, a.color.unwrap_or("overlay"), &right, sel, false);
-        }
-        Row::Agent(a) => {
-            let mut right = Vec::new();
-            if a.is_current {
-                right.push(seg("here", fg("blue")));
-            }
-            right.push(seg(format!(" {:>4}", a.age), ov));
-            window_row(buf, x0, y, cw, label, lw, a, a.glyph, a.color.unwrap_or("overlay"), &right, sel, false);
-        }
+        Row::Agent(a) => agent_row(m, buf, x0, y, cw, a, None, sel),
+        Row::Need(n) => agent_row(m, buf, x0, y, cw, &n.agent, Some(&n.agent.session), sel),
         Row::Parked(p) => {
-            let mut words = String::new();
-            if tab == Tab::Parked && cw >= 60 {
-                words = format!("{} · ", p.state_words);
+            let a = &p.agent;
+            let end = x0 + cw;
+            let x = put(buf, lead, y, end, "▪ ", ov);
+            let mut right = String::new();
+            if m.tab == Tab::Parked && cw >= 60 {
+                right = format!("{} · ", p.state_words);
             }
-            let right = [seg(format!("{words}{}", sanitize(&p.origin)), ov), seg(format!(" {:>4}", p.age), ov)];
-            window_row(buf, x0, y, cw, label, lw, &p.agent, "▪", "overlay", &right, sel, true);
+            right.push_str(&format!("{} {:>4}", sanitize(&p.origin), p.age));
+            let rw = cells(&right);
+            let room = end.saturating_sub(x + rw + 2) as usize;
+            put(buf, x, y, end, &clip(&sanitize(shown_title(&a.title)), room), if sel { bold(fg("text")) } else { ov });
+            put(buf, end.saturating_sub(rw), y, end, &right, ov);
         }
-        Row::More(k) => {
-            let x = x0 + 1 + lw as u16 + 1 + 2;
-            put(buf, x, y, x0 + cw, &format!("+{k} more · ⇥ Parked"), ov);
+        Row::Fold(k) => {
+            put(buf, lead, y, x0 + cw, &format!("▪ {k} parked ⇥"), if sel { bold(fg("text")) } else { ov });
         }
         Row::Empty(why) => {
             put(buf, x0 + 1, y, x0 + cw, why, ov);
@@ -536,15 +375,22 @@ fn draw_row(buf: &mut Buffer, x0: u16, y: u16, cw: u16, row: &Row, label: Option
     }
 }
 
-/// A window row: label, state glyph, title (+ flag), and `right` flush right.
+/// An agent row: `[badge] glyph Title (flag)  reason …  · here ·  tag  age`.
+/// `place`: a Needs filter row names its session (no group rule above it).
 #[allow(clippy::too_many_arguments)]
-fn window_row(buf: &mut Buffer, x0: u16, y: u16, cw: u16, label: Option<&str>, lw: usize, a: &Agent, glyph: &str,
-    gcol: &str, right: &[Seg], sel: bool, parked: bool) {
+fn agent_row(m: &Menu, buf: &mut Buffer, x0: u16, y: u16, cw: u16, a: &Agent, place: Option<&str>, sel: bool) {
+    let ov = fg("overlay");
     let end = x0 + cw;
-    let lab = format!("{:>lw$}", label.unwrap_or(""));
-    let mut x = put(buf, x0 + 1, y, end, &lab, if sel { bold(fg("text")) } else { fg("overlay") });
-    x = put(buf, x + 1, y, end, glyph, fg(gcol));
-    x += 1;
+    let mut x = x0 + 1;
+    if let Some(c) = m.data.letter(&a.window_id) {
+        put(buf, x, y, end, &format!(" {c} "), bold(on("crust", badge_color(a))));
+    }
+    x += BADGE_W + 1;
+    x = put(buf, x, y, end, a.glyph, fg(a.color.unwrap_or("overlay")));
+    x = put(buf, x, y, end, " ", ov);
+
+    let need = m.reason_of_agent(a);
+    let (title, tag) = title_and_tag(a);
     let flag = a.flag.map(|(f, c)| {
         let g = match f {
             crate::model::Flag::Workflow => crate::model::STRIP_GEAR,
@@ -553,66 +399,91 @@ fn window_row(buf: &mut Buffer, x0: u16, y: u16, cw: u16, label: Option<&str>, l
         (format!(" {g}"), c)
     });
     let fw = flag.as_ref().map_or(0, |(s, _)| cells(s));
-    let rw = segs_w(right);
-    let room = end.saturating_sub(x + rw + fw + 1) as usize;
-    // `proj/Title`: the project dim, and dropped first when room is short
-    // (agent-roster.py `fit_label`, as the strip drew it).
-    let (proj, title) = match a.title.strip_prefix("~/") {
-        Some(rest) => (String::new(), clip(&sanitize(rest), room)),
-        None => fit_label(&a.title, room),
+    // The right-hand tags, dropped (project, then here) when the title would
+    // get too little room.
+    let age = format!(" {:>4}", a.age);
+    let mut tag = tag;
+    if let Some(p) = place {
+        tag = if tag.is_empty() { sanitize(p) } else { format!("{tag} · {}", sanitize(p)) };
+    }
+    let mut here = a.is_current;
+    let right_w = |tag: &str, here: bool| -> u16 {
+        cells(&age) + if tag.is_empty() { 0 } else { cells(tag) + 2 } + if here { cells("· here ·") + 2 } else { 0 }
     };
-    x = put(buf, x, y, end, &proj, fg("overlay"));
-    let tcol = if parked || (a.cat.is_none() && !a.is_current) {
+    let room = |rw: u16| end.saturating_sub(x + rw + fw + 1);
+    let want = cells(&title).min(16);
+    if room(right_w(&tag, here)) < want {
+        tag.clear();
+    }
+    if room(right_w(&tag, here)) < want {
+        here = false;
+    }
+    let avail = room(right_w(&tag, here)) as usize;
+    let reason = need.map(|n| {
+        let text = plain(&n.reason);
+        (n.reason_word.clone(), reason_color(a, !n.reason.is_empty()), text)
+    });
+    let tw = dwidth(&title);
+    let title_room = match &reason {
+        Some((wd, _, text)) => {
+            let rlen = dwidth(wd) + if text.is_empty() { 0 } else { 1 + dwidth(text) } + 2;
+            tw.min((avail / 2).max(avail.saturating_sub(rlen)))
+        }
+        None => avail,
+    };
+    let tcol = if a.attention && need.is_some() {
+        a.cat.map(Cat::hue).unwrap_or("yellow")
+    } else if a.cat.is_none() && !a.is_current {
         "overlay"
-    } else if a.cat == Some(crate::model::Cat::Idle) {
+    } else if a.cat == Some(Cat::Idle) {
         "sub"
     } else {
         "text"
     };
-    let tst = if sel { bold(fg(if parked { "text" } else { tcol })) } else { fg(tcol) };
-    x = put(buf, x, y, end, &title, tst);
-    if let Some((s, c)) = flag {
-        put(buf, x, y, end, &s, fg(c));
+    let tst = if sel { bold(fg(tcol)) } else { fg(tcol) };
+    let rx = end.saturating_sub(right_w(&tag, here));
+    x = put(buf, x, y, rx, &clip(&title, title_room), tst);
+    if let Some((s, c)) = &flag {
+        x = put(buf, x, y, rx, s, fg(c));
     }
-    let mut rx = end.saturating_sub(rw);
-    for s in right {
-        rx = put(buf, rx, y, end, &s.0, s.1);
+    if let Some((wd, wcol, text)) = reason {
+        let stop = rx.saturating_sub(1);
+        x = put(buf, x, y, stop, "  ", ov);
+        x = put(buf, x, y, stop, &clip(&wd, stop.saturating_sub(x) as usize), fg(wcol));
+        if !text.is_empty() && x + 2 < stop {
+            x = put(buf, x, y, stop, " ", ov);
+            put(buf, x, y, stop, &clip(&text, stop.saturating_sub(x) as usize), fg("sub"));
+        }
     }
+    let mut cx = rx;
+    if here {
+        cx = put(buf, cx, y, end, "· here ·", ov);
+        cx = put(buf, cx, y, end, "  ", ov);
+    }
+    if !tag.is_empty() {
+        put(buf, cx, y, end, &tag, ov);
+    }
+    put(buf, end.saturating_sub(cells(&age)), y, end, &age, ov);
 }
 
-/// The right column: title, meta, the live tail, the buttons.
-fn preview(m: &mut Menu, buf: &mut Buffer, r: Rect) {
-    m.preview_rows = r.height.saturating_sub(4) as usize;
+/// The preview strip: a rule naming the selected row, then its pane's tail.
+fn preview(m: &mut Menu, buf: &mut Buffer, r: Rect, w: u16) {
+    let s1 = fg("surface1");
     let ov = fg("overlay");
-    let Some(row) = m.selected().cloned() else {
-        put(buf, r.x + 1, r.y, r.right(), "nothing selected", ov);
+    m.preview_rows = r.height.saturating_sub(1) as usize;
+    put(buf, 0, r.y, w, "├", s1);
+    put(buf, w - 1, r.y, w, "┤", s1);
+    let sel = m.selected().cloned();
+    let Some(a) = sel.as_ref().and_then(Row::agent).cloned() else {
+        line(buf, r.x, r.y, r.width, &[seg("─ nothing selected ", ov)], &[], Some(("─", s1)));
         return;
     };
-    let Some(a) = row.agent() else { return };
-    let need = m.reason_of(&row).map(|n| (n.reason_word.clone(), !n.reason.is_empty()));
-    let (word, wcol, age) = match (&row, need) {
-        (_, Some((wd, is_detail))) => (wd, reason_color(a, is_detail), a.age.clone()),
-        (Row::Parked(p), None) => (p.state_words.clone(), "overlay", p.age.clone()),
-        _ => (
-            if a.state_words.is_empty() { "shell".to_string() } else { a.state_words.to_string() },
-            a.color.unwrap_or("overlay"),
-            a.age.clone(),
-        ),
-    };
-    let glyph = if matches!(row, Row::Parked(_)) { "▪" } else { a.glyph };
-    let mut right = vec![seg(format!("{glyph} {} ", clip(&plain(&word), 24)), fg(wcol))];
-    if !age.is_empty() {
-        right.push(seg(format!("· {age} "), ov));
-    }
-    let title_room = r.width.saturating_sub(segs_w(&right) + 2) as usize;
-    let title = clip(&sanitize(shown_title(&a.title)), title_room);
-    line(buf, r.x, r.y, r.width, &[seg(format!(" {title}"), bold(fg("text")))], &right, None);
-
-    // session:index · ✳ claude · ⌥ branch · path
-    let mut meta = vec![seg(format!(" {}", a.place()), ov)];
-    if let Row::Parked(p) = &row {
+    // title · session:index · ✳ claude · ⌥ branch · ~/path
+    let mut meta = vec![seg("─ ", s1), seg(clip(&sanitize(shown_title(&a.title)), 40), bold(fg("text"))),
+        seg(format!(" · {}", a.place()), ov)];
+    if let Some(Row::Parked(p)) = &sel {
         if !p.origin.is_empty() {
-            meta.push(seg(format!(" · from {}", p.origin), ov));
+            meta.push(seg(format!(" · from {}", sanitize(&p.origin)), ov));
         }
     }
     if let Some(g) = a.kind_glyph {
@@ -626,35 +497,10 @@ fn preview(m: &mut Menu, buf: &mut Buffer, r: Rect) {
     if !a.path.is_empty() {
         meta.push(seg(format!(" · {}", sanitize(&tilde(&a.path))), ov));
     }
-    line(buf, r.x, r.y + 1, r.width.saturating_sub(1), &meta, &[], None);
-    let rule: String = "╌".repeat(r.width.saturating_sub(2) as usize);
-    put(buf, r.x + 1, r.y + 2, r.right(), &rule, fg("surface0"));
-
-    let key = (a.window_id.clone(), a.session.clone());
-    let body = Rect::new(r.x + 1, r.y + 3, r.width.saturating_sub(2), m.preview_rows as u16);
-    peek_lines(m, buf, body, &key, &a.place());
-
-    // The buttons, each bound to this row.
-    let Some(target) = row.target() else { return };
-    let parked = matches!(row, Row::Parked(_));
-    let mut btns = vec![(Button::Go, if parked { "⏎ unpark" } else { "⏎ go to it" }, "text"),
-        (Button::Peek, "p full peek", "sub")];
-    if !parked {
-        btns.push((Button::Park, "s park", "sub"));
-    }
-    btns.push((Button::Close, if parked { "x discard" } else { "x close agent" }, "red"));
-    let y = r.bottom() - 1;
-    let mut x = r.x + 1;
-    for (b, t, c) in btns {
-        let s = format!(" {t} ");
-        let bw = cells(&s);
-        if x + bw > r.right() {
-            break;
-        }
-        put(buf, x, y, r.right(), &s, on(c, "surface0"));
-        m.clicks.push((Rect::new(x, y, bw, 1), Hit::Button(b, target.clone())));
-        x += bw + 1;
-    }
+    meta.push(seg(" ", ov));
+    line(buf, r.x, r.y, r.width, &meta, &[], Some(("─", s1)));
+    let body = Rect::new(r.x + 1, r.y + 1, r.width.saturating_sub(2), m.preview_rows as u16);
+    peek_lines(m, buf, body, &(a.window_id.clone(), a.session.clone()), &a.place());
 }
 
 /// The captured tail of a pane inside `r` (top-aligned, its own colours).
@@ -685,84 +531,96 @@ fn peek_lines(m: &Menu, buf: &mut Buffer, r: Rect, key: &(String, String), place
     }
 }
 
-/// `p`: the selected pane over the whole body (agent-roster.py `peek_panel`).
-fn full_peek(m: &mut Menu, buf: &mut Buffer, b: Rect, t: &Target) {
-    let ov = fg("overlay");
-    let end = b.right();
-    let shown = clip(&sanitize(shown_title(&t.title)), b.width.saturating_sub(20) as usize);
-    let title = format!(" peek · {} {shown} ", t.place());
-    let mut x = put(buf, b.x, b.y, end, "╭─", ov);
-    x = put(buf, x, b.y, end - 1, &title, fg("sub"));
-    while x < end - 1 {
-        x = put(buf, x, b.y, end - 1, "─", ov);
+/// The letters in play, as the key bar says them: `a`, `a–j` (alphabet
+/// order: the range from the first held letter to the last).
+pub fn letter_hint(drawn: &Drawn) -> Option<String> {
+    let held: Vec<char> = ALPHABET.iter().copied().filter(|c| drawn.letters.contains_key(c)).collect();
+    match held.as_slice() {
+        [] => None,
+        [one] => Some(one.to_string()),
+        [first, .., last] => Some(format!("{first}–{last}")),
     }
-    put(buf, end - 1, b.y, end, "╮", ov);
-    for y in b.y + 1..b.bottom() - 1 {
-        put(buf, b.x, y, end, "│", ov);
-        put(buf, end - 1, y, end, "│", ov);
+}
+
+/// Key items (`key`, `words`) drawn as ` key  words ` chips, dropping the
+/// words in `drop_order` until they fit.
+fn key_items(buf: &mut Buffer, x: u16, y: u16, end: u16, items: Vec<(String, String)>, drop_order: &[&str]) -> u16 {
+    let item_w = |k: &str, wd: &str| cells(k) + 2 + cells(wd) + 2;
+    let total = |v: &[(String, String)]| v.iter().map(|(k, wd)| item_w(k, wd)).sum::<u16>();
+    let mut shown = items;
+    for d in drop_order {
+        if total(&shown) <= end.saturating_sub(x) {
+            break;
+        }
+        shown.retain(|(_, wd)| wd != d);
     }
-    put(buf, b.x, b.bottom() - 1, end, "╰", ov);
-    for x in b.x + 1..end - 1 {
-        put(buf, x, b.bottom() - 1, end, "─", ov);
+    let mut cx = x;
+    for (k, wd) in shown {
+        cx = put(buf, cx, y, end, &format!(" {k} "), on("text", "surface0"));
+        cx = put(buf, cx, y, end, &format!(" {wd} "), fg("overlay"));
     }
-    put(buf, end - 1, b.bottom() - 1, end, "╯", ov);
-    let inner = Rect::new(b.x + 2, b.y + 1, b.width.saturating_sub(4), b.height.saturating_sub(2));
-    peek_lines(m, buf, inner, &(t.win.clone(), t.session.clone()), &t.place());
+    cx
 }
 
 /// The key bar, or what replaces it.
 fn footer(m: &Menu, buf: &mut Buffer, w: u16, y: u16, now: f64) {
     let x = 2;
     let end = w - 2;
-    let ov = fg("overlay");
-    let text = fg("text");
-    let say = |buf: &mut Buffer, parts: &[Seg]| {
-        let mut cx = x;
-        for p in parts {
-            cx = put(buf, cx, y, end, &p.0, p.1);
-        }
-    };
-    if m.peek_full.is_some() {
-        return say(buf, &[seg("any key closes the peek", ov)]);
-    }
     if let Some(c) = &m.confirm {
         let room = (end - x).saturating_sub(cells(c.verb()) + 8) as usize;
-        return say(buf, &[seg(format!("{} {}? ", c.verb(), clip(&sanitize(shown_title(&c.target.title)), room)), fg("yellow")),
-            seg("y/n", text)]);
+        let mut cx = put(buf, x, y, end,
+            &format!("{} {}? ", c.verb(), clip(&sanitize(shown_title(&c.target.title)), room)), fg("yellow"));
+        cx = put(buf, cx, y, end, "y", bold(fg("text")));
+        put(buf, cx, y, end, "/n", fg("text"));
+        return;
     }
-    let keys: Vec<(String, &str)> = if m.searching {
-        vec![("⏎".into(), "keep"), ("esc".into(), "clear"), ("↑↓".into(), "move"), ("⇥".into(), "filter")]
-    } else if !m.digits.is_empty() {
-        return say(buf, &[seg(format!("{}▏", m.digits), fg("peach")), seg("  next digit · esc cancel", ov)]);
-    } else if !m.msg.is_empty() && now < m.msg_until {
-        return say(buf, &[seg(sanitize(&m.msg), fg("sky"))]);
-    } else if m.digits_dead {
-        return say(buf, &[seg("digits ignored until another key", fg("yellow")), seg("  (esc clears)", ov)]);
-    } else {
-        let mut v: Vec<(String, &str)> = vec![("⏎".into(), "go")];
-        if let Some(j) = jump_hint(m.drawn.slots.keys().map(String::as_str)) {
-            v.push((j, "jump"));
+    if m.searching {
+        let mut cx = put(buf, x, y, end, "/ ", bold(fg("peach")));
+        let hints: Vec<(String, String)> =
+            [("⏎", "go"), ("esc", "clear"), ("↑↓", "move")].map(|(k, v)| (k.to_string(), v.to_string())).to_vec();
+        let hint_w: u16 = 4 + hints.iter().map(|(k, v)| cells(k) + cells(v) + 4).sum::<u16>();
+        let room = end.saturating_sub(cx + 1 + hint_w.min(end.saturating_sub(cx) / 2)) as usize;
+        let q = sanitize(&m.query);
+        // The tail of a long query, so the cursor end stays visible.
+        let mut shown: Vec<char> = Vec::new();
+        let mut used = 0;
+        for c in q.chars().rev() {
+            let cw = dwidth(&c.to_string());
+            if used + cw > room {
+                break;
+            }
+            used += cw;
+            shown.push(c);
         }
-        v.extend([("⇥".into(), "filter"), ("/".into(), "search"), ("p".into(), "peek"), ("s".into(), "park"),
-            ("x".into(), "close"), ("⌥S".into(), "next"), ("⌥X".into(), "back"), ("⌥W".into(), "close")]);
-        v
-    };
-    // Drop the least needed keys until the bar fits (go and ⌥W stay).
-    let item_w = |k: &str, wd: &str| cells(k) + 2 + cells(wd) + 2;
-    let mut shown = keys;
-    let drop_order = ["back", "next", "filter", "park", "search", "peek", "close", "jump", "move"];
-    let total = |v: &[(String, &str)]| v.iter().map(|(k, wd)| item_w(k, wd)).sum::<u16>();
-    for d in drop_order {
-        if total(&shown) <= end - x {
-            break;
-        }
-        shown.retain(|(_, wd)| *wd != d);
+        let shown: String = shown.into_iter().rev().collect();
+        cx = put(buf, cx, y, end, &shown, fg("text"));
+        cx = put(buf, cx, y, end, "▏", fg("peach"));
+        key_items(buf, cx + 3, y, end, hints, &["move", "clear"]);
+        return;
     }
-    let mut cx = x;
-    for (k, wd) in shown {
-        cx = put(buf, cx, y, end, &format!(" {k} "), on("text", "surface0"));
-        cx = put(buf, cx, y, end, &format!(" {wd} "), ov);
+    if let Some(t) = &m.actions {
+        let title = clip(&sanitize(shown_title(&t.title)), 24);
+        let cx = put(buf, x, y, end, &format!("{title} "), bold(fg("text")));
+        let mut items: Vec<(String, String)> =
+            strip(t).into_iter().map(|(k, _, wd)| (k.to_string(), wd.to_string())).collect();
+        items.push(("⏎".into(), "go".into()));
+        items.push(("esc".into(), "cancel".into()));
+        key_items(buf, cx, y, end, items, &["cancel", "go"]);
+        return;
     }
+    if !m.msg.is_empty() && now < m.msg_until {
+        put(buf, x, y, end, &sanitize(&m.msg), fg("sky"));
+        return;
+    }
+    let mut v: Vec<(String, String)> = Vec::new();
+    if let Some(l) = letter_hint(&m.drawn) {
+        v.push((l, "go".into()));
+    }
+    v.push(("⌥W".into(), if m.drawn.last.is_some() { "last" } else { "close" }.into()));
+    for (k, wd) in [("⏎", "open"), ("/", "search"), ("␣", "actions"), ("⇥", "filter"), ("⌥S", "next"), ("⌥X", "back")] {
+        v.push((k.into(), wd.into()));
+    }
+    key_items(buf, x, y, end, v, &["back", "next", "filter", "actions", "search", "open"]);
 }
 
 fn sgr_color(c: Color, bg: bool) -> Option<String> {
@@ -833,9 +691,10 @@ pub fn dump(buf: &Buffer, ansi: bool) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::rows::tests::data;
-    use super::super::rows::RowKey;
-    use super::super::state::{Menu, NoEffects, PeekData};
+    use super::super::keys::{Key, Mouse};
+    use super::super::rows::tests::{data, data_of, fixture};
+    use super::super::rows::{Data, RowKey};
+    use super::super::state::{tests::Rec, Menu, NoEffects, PeekData};
     use super::*;
     use crate::ansi::parse_line;
 
@@ -845,440 +704,270 @@ mod tests {
         dump(&buf, false)
     }
 
+    fn buffer(m: &mut Menu, w: u16, h: u16) -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+        render(m, &mut buf, 1000.0);
+        buf
+    }
+
     fn menu() -> Menu {
         Menu::new(data(), Tab::All)
     }
 
-    fn cell_bg(m: &mut Menu, w: u16, h: u16, x: u16, y: u16) -> Color {
-        let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
-        render(m, &mut buf, 1000.0);
-        buf[(x, y)].bg
+    fn at(f: &[String], needle: &str) -> usize {
+        f.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle:?} not in\n{}", f.join("\n")))
+    }
+
+    fn click(col: u16, row: u16) -> Key {
+        Key::Mouse(Mouse { button: 0, col, row, press: true })
     }
 
     #[test]
     fn layout_110x34() {
         let mut m = menu();
-        m.peeks.insert(("@6".into(), "work".into()), PeekData {
-            lines: Some(vec![parse_line("\x1b[31m529 overloaded\x1b[0m"), parse_line("retry?")]),
-            n: 10,
-        });
         let f = frame(&mut m, 110, 34);
         assert_eq!(f.len(), 34);
         for l in &f {
             assert!(dwidth(l) <= 110, "{l}");
         }
-        assert!(f[0].starts_with("╭─ agents ─") && f[0].ends_with(" ⌥W ✕ ─╮"), "{}", f[0]);
-        assert!(f[1].contains(" All 7 ") && f[1].contains(" Needs you 2 ") && f[1].contains(" Parked 5 "));
-        assert!(f[1].contains("/ search…"));
-        assert!(f[2].starts_with("├") && f[2].contains("┬") && f[2].ends_with("┤"));
-        assert!(f[3].starts_with("│ NEEDS YOU"));
-        // The first need, selected: its reason line under it, and the preview.
-        // Numbers are slots (the provisional fill: main:1 main:2 main:3 work:1).
-        assert!(f[4].contains("4 ✕ Island resize") && f[4].contains("work"), "{}", f[4]);
-        assert!(f[5].contains("failed"), "{}", f[5]); // no detail: the state in words
-        assert!(f[3].contains("Island resize") && f[3].contains("✕ failed · 11m"), "{}", f[3]);
-        assert!(f[4].contains("work:1"));
-        assert!(f[6].contains("529 overloaded") && f[7].contains("retry?"), "{}", f[6]);
-        assert!(f[6].contains("1 ◉ Kua Yu focus timing"), "{}", f[6]);
-        assert!(f[7].contains(" main ") && f[7].contains("◉1 ◐2 ○1"), "{}", f[7]);
-        assert!(f.iter().any(|l| l.contains("Tmux Agent Sidebar") && l.contains("here")));
-        assert!(f.iter().any(|l| l.contains("Handy.app Speech ⚙")));
-        assert!(f.iter().any(|l| l.contains("PARKED 5")));
-        assert!(f.iter().any(|l| l.contains("+2 more · ⇥ Parked")));
-        assert!(f[30].contains("⏎ go to it") && f[30].contains("x close agent"), "{}", f[30]);
-        assert!(f[31].contains("┴"));
-        assert!(f[32].contains(" ⏎  go ") && f[32].contains(" 1–4  jump") && f[32].contains("⌥S  next  ⌥X  back  ⌥W  close"),
-            "{}", f[32]);
+        // One header line: the non-zero counts; no chips, no NEEDS YOU, no PARKED section.
+        assert!(f[0].starts_with("╭─ agents · ◉ 2 need you · ◐ 2 working · ○ 3 idle · ▪ 5 parked ─"), "{}", f[0]);
+        assert!(f[0].ends_with(" ⌥W ✕ ─╮"), "{}", f[0]);
+        let all = f.join("\n");
+        assert!(!all.contains("NEEDS YOU") && !all.contains("PARKED") && !all.contains("Active"), "{all}");
+        // Fixed groups by name; letter badge, glyph, title first.
+        assert!(f[1].starts_with("│ Alpha ─") && f[1].contains("○1"), "{}", f[1]);
+        assert_eq!(f[2], format!("│  a  ○ Application link{}│", " ".repeat(107 - 22)));
+        assert!(f[3].starts_with("│ main ─") && f[3].contains("◉1 ◐2 ○1"), "{}", f[3]);
+        // A need: its reason inline; the client's window: · here ·; ages flush right.
+        assert!(f[4].starts_with("│  s  ◉ Kua Yu focus timing  asks Which deck?") && f[4].ends_with("15m │"), "{}", f[4]);
+        assert!(f[5].starts_with("│  d  ◐ Tmux Agent Sidebar") && f[5].contains("· here ·"), "{}", f[5]);
+        assert!(f[6].starts_with("│  f  ◐ Handy.app Speech ⚙"), "{}", f[6]);
+        assert!(f[7].starts_with("│  g  ○ Commodities Job Tracker"), "{}", f[7]);
+        assert!(f[8].starts_with("│ work ─"), "{}", f[8]);
+        assert!(f[9].starts_with("│  h  ✕ Island resize  failed"), "{}", f[9]);
+        assert!(f[10].starts_with("│  j  ○ Census AX sweep"), "{}", f[10]);
+        assert!(f[11].starts_with("│  f  ◐ Handy.app Speech ⚙"), "{}", f[11]); // linked: the same letter
+        assert!(f[12].starts_with("│     ▪ 5 parked ⇥"), "{}", f[12]);
+        assert!(f[31].starts_with("├─") && f[31].ends_with("─┤"));
+        assert!(f[32].starts_with("│  a–j  go  ⌥W  close  ⏎  open  /  search  ␣  actions  ⇥  filter"), "{}", f[32]);
         assert!(f[33].starts_with("╰") && f[33].ends_with("╯"));
-        // The selected row's background.
-        assert_eq!(cell_bg(&mut m, 110, 34, 3, 4), color("surface1"));
-        assert_eq!(cell_bg(&mut m, 110, 34, 3, 7), color("base"));
-        assert_eq!(m.preview_rows, 24);
-    }
-
-    #[test]
-    fn layout_80x24_hides_the_preview() {
-        let mut m = menu();
-        let f = frame(&mut m, 80, 24);
-        assert_eq!(f.len(), 24);
-        assert!(!f[2].contains("┬"));
-        assert!(f.iter().all(|l| !l.contains("go to it")));
+        // Badges: the letter in reverse video on its state's colour.
+        let b = buffer(&mut m, 110, 34);
+        for (y, c) in [(2, "overlay"), (4, "yellow"), (5, "blue"), (9, "red"), (10, "overlay")] {
+            assert_eq!((b[(3, y)].bg, b[(3, y)].fg), (color(c), color("crust")), "row {y}");
+            assert!(b[(3, y)].modifier.contains(Modifier::BOLD));
+        }
+        // The needs title in the needs colour; idle dimmer but readable; selected bold on surface1.
+        assert_eq!(b[(8, 4)].fg, color("yellow"));
+        assert_eq!(b[(8, 7)].fg, color("sub"));
+        assert_eq!(b[(8, 5)].fg, color("text"));
+        assert_eq!((b[(8, 9)].bg, b[(8, 9)].fg), (color("surface1"), color("red")));
+        assert_eq!(b[(30, 6)].bg, color("base"));
+        // What the keys mean in this frame.
+        assert_eq!(m.drawn.letters.keys().collect::<String>(), "adfghjs");
+        assert_eq!(m.drawn.letters[&'f'].key, RowKey::Agent("main".into(), "@3".into()));
+        assert_eq!(m.drawn.rows.len(), 8);
         assert_eq!(m.preview_rows, 0);
         assert_eq!(m.peek_want(), None);
-        // The list takes the full width: ages flush right before the scrollbar.
-        assert!(f[4].ends_with("work  11m▕│"), "{:?}", f[4]);
-        // Key bar fits, dropping keys from the right of the drop order.
-        assert!(f[22].contains("⏎  go") && f[22].contains("⌥W  close"), "{}", f[22]);
-        assert!(dwidth(&f[22]) <= 80);
-        // 18 body rows < 21 lines: it scrolls, with a scrollbar.
-        assert!(f[3..21].iter().any(|l| l.contains('▕')));
     }
 
-    /// The default tab: fixed groups, no NEEDS YOU section, the selected
-    /// attention row's reason line under it in place.
+    /// The filter's name shows (and cycles on a click) when it is not All.
     #[test]
-    fn active_tab_110x34() {
-        let mut m = Menu::new(data(), Tab::Active);
+    fn header_filter_and_narrow_counts() {
+        let mut m = Menu::new(data(), Tab::Working);
         let f = frame(&mut m, 110, 34);
-        assert!(f[1].starts_with("│  Active 4   All 7 ") && f[1].contains(" Needs you 2 "), "{}", f[1]);
-        assert!(!f.iter().any(|l| l.contains("NEEDS YOU") || l.contains("PARKED")));
-        assert!(f[3].starts_with("│ main ") && f[3].contains("◉1 ◐2 ○1"), "{}", f[3]);
-        assert!(f[4].contains("1 ◉ Kua Yu focus timing"), "{}", f[4]);
-        assert!(f[5].contains("2 ◐ Tmux Agent Sidebar") && f[5].contains("here"), "{}", f[5]);
-        assert!(f[6].contains("3 ◐ Handy.app Speech ⚙"), "{}", f[6]);
-        assert!(f[7].starts_with("│ work "), "{}", f[7]);
-        // Selected: the first need (work:1), its reason line right under it.
-        assert!(f[8].contains("4 ✕ Island resize"), "{}", f[8]);
-        assert!(f[9].contains("failed") && !f[9].contains("Island"), "{}", f[9]);
-        assert!(f[10].contains("3 ◐ Handy.app Speech"), "{}", f[10]); // linked: the same agent, the same number
-        assert_eq!(cell_bg(&mut m, 110, 34, 3, 8), color("surface1"));
-        // The preview names the reason too.
-        assert!(f[3].contains("Island resize") && f[3].contains("✕ failed · 11m"), "{}", f[3]);
-        // Another attention row: its detail; a working row: no reason line.
-        m.sel = Some(RowKey::Agent("main".into(), "@1".into()));
-        let f = frame(&mut m, 110, 34);
-        assert!(f[5].contains("asks Which deck?"), "{}", f[5]);
-        assert!(f[3].contains("◉ asks"), "{}", f[3]);
-        m.sel = Some(RowKey::Agent("main".into(), "@2".into()));
-        let f = frame(&mut m, 110, 34);
-        assert!(f[6].contains("3 ◐ Handy.app"), "{}", f[6]);
-        // The rows on screen, and what each number means.
-        assert_eq!(m.drawn.rows.len(), 5);
-        assert_eq!(m.drawn.rows[3].key, RowKey::Agent("work".into(), "@6".into()));
-        assert_eq!(m.drawn.slots["4"].key, RowKey::Agent("work".into(), "@6".into()));
-        assert_eq!(m.drawn.slots["3"].key, RowKey::Agent("main".into(), "@3".into())); // the first drawn of two
-        // The empty state.
+        assert!(f[0].starts_with("╭─ agents · Working ⇥ · ◉ 2 need you · ◐ 2 working"), "{}", f[0]);
+        let (r, _) = m.clicks.iter().find(|(_, h)| *h == Hit::Filter).cloned().unwrap();
+        m.act(click(r.x + 1, 0), &mut NoEffects);
+        assert_eq!(m.tab, Tab::Idle);
+        // Narrow: counts drop whole, from the end.
+        let mut m = menu();
+        let f = frame(&mut m, 60, 20);
+        assert!(f[0].contains("○ 3 idle") && !f[0].contains("parked"), "{}", f[0]);
+        let f = frame(&mut m, 40, 20);
+        assert!(f[0].starts_with("╭─ agents · ◉ 2 need you ─"), "{}", f[0]);
+        for l in &f {
+            assert!(dwidth(l) <= 40, "{l}");
+        }
+        // Zero counts are dropped.
+        let d = Data::build(&crate::tmux::Snapshot::parse(&crate::tmux::tests::row("main", 1, "@1",
+            &[("state", "running")])), None, 1000.0, &crate::Collator::new("C"), None, Some(1.0));
+        let f = frame(&mut Menu::new(d, Tab::All), 80, 20);
+        assert!(f[0].starts_with("╭─ agents · ◐ 1 working ─"), "{}", f[0]);
+    }
+
+    /// `proj/Title`: the title first, the project a dim tag on the right; a
+    /// bare `~/` is no project.
+    #[test]
+    fn project_tags() {
         let mut d = data();
-        d.view.needs.clear();
         for a in d.view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()) {
-            a.cat = Some(crate::model::Cat::Idle);
+            match a.window_id.as_str() {
+                "@4" => (a.title, a.project, a.short_title) = ("~/Commodities".into(), "~/".into(), "Commodities".into()),
+                "@2" => (a.title, a.project, a.short_title) = ("tmux/Agent Sidebar".into(), "tmux/".into(), "Agent Sidebar".into()),
+                _ => {}
+            }
         }
-        m.set_data(d);
+        let mut m = Menu::new(d, Tab::All);
         let f = frame(&mut m, 110, 34);
-        assert!(f[3].contains("│ nothing working or waiting · ⇥ for all"), "{}", f[3]);
+        let l = &f[at(&f, "Agent Sidebar")];
+        assert!(l.starts_with("│  d  ◐ Agent Sidebar ") && l.contains("· here ·  tmux ") && l.ends_with(" 1m │"), "{l}");
+        let l = &f[at(&f, "Commodities")];
+        assert!(l.starts_with("│  g  ○ Commodities ") && !l.contains('~'), "{l}");
+        // Short of room the tag goes first, then here; the title stays.
+        let f = frame(&mut m, 44, 34);
+        let l = &f[at(&f, "Agent Sidebar")];
+        assert!(!l.contains("tmux") && l.contains("Agent Sidebar"), "{l}");
     }
 
-    /// Narrow popups: the search field gives way, then the chips shorten,
-    /// then lose their counts, then their padding; every chip stays whole.
+    /// Space p: a strip under the list, full width, with the pane's tail.
     #[test]
-    fn chip_row_fits_narrow_widths() {
-        for (w, want, search) in [
-            (110, &[" Active 4 ", " All 7 ", " Needs you 2 ", " Working 2 ", " Idle 3 ", " Parked 5 "][..], true),
-            (80, &[" Needs you 2 ", " Parked 5 "][..], true),
-            (72, &[" Needs you 2 ", " Working 2 ", " Parked 5 "][..], false),
-            (64, &[" Active 4 ", " Needs 2 ", " Work 2 ", " Idle 3 ", " Parked 5 "][..], false),
-            (58, &[" Active ", " All ", " Needs ", " Work ", " Idle ", " Parked "][..], false),
-            (40, &["Active", "All", "Needs", "Work", "Idle", "Parked"][..], false),
-        ] {
-            let mut m = Menu::new(data(), Tab::Active);
-            let f = frame(&mut m, w, 24);
-            for chip in want {
-                assert!(f[1].contains(chip), "{w}: {chip:?} in {:?}", f[1]);
-            }
-            assert_eq!(f[1].contains("search…"), search, "{w}: {:?}", f[1]);
-            if w <= 58 {
-                assert!(!f[1].chars().any(|c| c.is_ascii_digit()), "{w}: counts dropped: {:?}", f[1]);
-            }
-            // Every chip is clickable, whole, inside the border.
-            let chips: Vec<Rect> =
-                m.clicks.iter().filter(|(_, h)| matches!(h, Hit::Tab(_))).map(|(r, _)| *r).collect();
-            assert_eq!(chips.len(), 6);
-            assert!(chips.iter().all(|r| r.width > 0 && r.right() <= w - 2), "{w}: {chips:?}");
+    fn preview_strip() {
+        let mut m = menu();
+        frame(&mut m, 110, 34);
+        m.peeks.insert(("@6".into(), "work".into()), PeekData {
+            lines: Some(vec![parse_line("\x1b[31m529 overloaded\x1b[0m"), parse_line("retry?")]),
+            n: 10,
+        });
+        m.handle(&[Key::Char(' '), Key::Char('p')], &mut NoEffects);
+        assert!(m.preview);
+        let f = frame(&mut m, 110, 34);
+        // Body 30 rows: the list keeps 19, the strip 11 (its rule + 10 lines).
+        assert!(f[20].starts_with("├─ Island resize · work:1 ─"), "{}", f[20]);
+        assert!(f[21].starts_with("│ 529 overloaded") && f[22].starts_with("│ retry?"), "{}", f[21]);
+        assert_eq!(m.preview_rows, 10);
+        assert_eq!(m.peek_want().map(|w| (w.target.win, w.n)), Some(("@6".into(), 10)));
+        assert!(f[12].contains("▪ 5 parked"), "{}", f[12]);
+        // A short popup: no room, no strip.
+        let f = frame(&mut m, 110, 11);
+        assert!(!f.iter().any(|l| l.contains("Island resize ·")));
+        assert_eq!(m.peek_want(), None);
+        m.handle(&[Key::Char(' '), Key::Char('p')], &mut NoEffects);
+        let f = frame(&mut m, 110, 34);
+        assert!(!f.iter().any(|l| l.contains("529")));
+    }
+
+    #[test]
+    fn footer_modes() {
+        let mut m = menu();
+        frame(&mut m, 110, 34);
+        m.handle(&[Key::Char('/'), Key::Char('k'), Key::Char('u')], &mut NoEffects);
+        let f = frame(&mut m, 110, 34);
+        assert!(f[32].starts_with("│ / ku▏") && f[32].contains("⏎  go") && f[32].contains("esc  clear"), "{}", f[32]);
+        m.act(Key::Esc, &mut NoEffects); // the search moved the selection to Kua; it stays
+        m.act(Key::Char(' '), &mut NoEffects);
+        let f = frame(&mut m, 110, 34);
+        assert!(f[32].starts_with("│ Kua Yu focus timing  p  preview  s  park  x  close  r  restart watcher  ⏎  go  esc  cancel"),
+            "{}", f[32]);
+        m.act(Key::Char('x'), &mut NoEffects);
+        let f = frame(&mut m, 110, 34);
+        assert!(f[32].contains("close Kua Yu focus timing? y/n"), "{}", f[32]);
+        m.act(Key::Char('n'), &mut NoEffects);
+        m.act(Key::Char('k'), &mut NoEffects); // nobody's letter
+        let mut buf = Buffer::empty(Rect::new(0, 0, 110, 34));
+        render(&mut m, &mut buf, crate::text::now());
+        assert!(dump(&buf, false)[32].contains("no agent on k"));
+        // ⌥W says where it goes.
+        let mut snap = fixture();
+        for w in &mut snap.windows {
+            w.mru_cur = "@7".into();
         }
-        // An open search keeps its field; the chips shorten first.
-        let mut m = Menu::new(data(), Tab::Active);
-        m.searching = true;
-        let f = frame(&mut m, 64, 24);
-        assert!(f[1].contains(" Parked ") && f[1].contains(" / ") && f[1].contains('▏'), "{:?}", f[1]);
+        let mut m = Menu::new(data_of(&snap), Tab::All);
+        let f = frame(&mut m, 110, 34);
+        assert!(f[32].contains("⌥W  last"), "{}", f[32]);
+        // Narrow: the least needed keys go first; go and ⌥W stay.
+        let f = frame(&mut m, 40, 20);
+        assert!(f[18].contains("a–j  go") && f[18].contains("⌥W  last") && !f[18].contains("back"), "{}", f[18]);
     }
 
+    /// Past 26 agents: no badge, the row still drawn and navigable.
     #[test]
-    fn needs_tab_80x24() {
-        let mut m = Menu::new(data(), Tab::Needs);
-        let f = frame(&mut m, 80, 24);
-        assert!(f[1].contains(" Needs you 2 "));
-        assert!(f[3].contains("NEEDS YOU"));
-        assert!(f[4].contains("4 ✕ Island resize"));
-        assert!(f[6].contains("1 ◉ Kua Yu"));
-        assert!(!f.iter().any(|l| l.contains("Tmux Agent Sidebar")));
+    fn past_26_agents() {
+        let rows: Vec<String> = (1..=28)
+            .map(|i| crate::tmux::tests::row("main", i, &format!("@{i}"), &[("state", "running"), ("summary", &format!("w{i}"))]))
+            .collect();
+        let d = Data::build(&crate::tmux::Snapshot::parse(&rows.join("\n")), None, 1000.0, &crate::Collator::new("C"), None,
+            Some(1.0));
+        let mut m = Menu::new(d, Tab::All);
+        m.act(Key::End, &mut NoEffects);
+        let f = frame(&mut m, 80, 40);
+        assert!(f.iter().any(|l| l.starts_with("│  m  ◐ w26 ")), "{f:#?}");
+        assert!(f.iter().any(|l| l.starts_with("│     ◐ w28 ")), "{f:#?}");
+        assert!(f[38].contains("a–m  go"), "{}", f[38]);
+        assert_eq!(m.selected_target().map(|t| t.win), Some("@28".into()));
     }
 
     #[test]
     fn selection_stays_visible_when_scrolling() {
         let mut m = menu();
-        for _ in 0..30 {
-            m.act(crate::menu::keys::Key::Down, &mut NoEffects);
-            let f = frame(&mut m, 80, 14); // 8 body rows
-            let t = m.selected_target().unwrap();
-            assert!(m.drawn.rows.contains(&t), "{t:?} not drawn:\n{}", f.join("\n"));
+        m.act(Key::Home, &mut NoEffects);
+        for _ in 0..12 {
+            m.act(Key::Down, &mut NoEffects);
+            frame(&mut m, 80, 10); // 6 body rows
+            let k = m.sel.clone().unwrap();
+            assert!(k == RowKey::Fold || m.drawn.rows.iter().any(|t| t.key == k), "{k:?} not drawn");
         }
-        assert_eq!(m.sel, Some(RowKey::Parked("@12".into())));
+        assert_eq!(m.sel, Some(RowKey::Fold));
         assert!(m.top > 0);
-        for _ in 0..30 {
-            m.act(crate::menu::keys::Key::Up, &mut NoEffects);
-            frame(&mut m, 80, 14);
-            assert!(m.drawn.rows.contains(&m.selected_target().unwrap()));
+        for _ in 0..12 {
+            m.act(Key::Up, &mut NoEffects);
+            frame(&mut m, 80, 10);
         }
-        assert_eq!(m.top, 0);
-        // The wheel moves the view; a selection scrolled off screen moves to
-        // the nearest row still on it, so ⏎ always means a visible row.
-        let wheel = |d: u16| crate::menu::keys::Key::Mouse(crate::menu::keys::Mouse { button: d, col: 5, row: 5, press: true });
-        m.act(wheel(65), &mut NoEffects);
-        frame(&mut m, 80, 14);
-        assert!(m.top > 0);
-        let t = m.selected_target().unwrap();
-        assert!(m.drawn.rows.contains(&t));
-        for _ in 0..5 {
+        assert_eq!(m.top, 0); // the group rule above the first row comes back too
+        // The wheel moves the view; a selection scrolled off moves onto it.
+        let wheel = |d: u16| Key::Mouse(Mouse { button: d, col: 5, row: 5, press: true });
+        for _ in 0..3 {
             m.act(wheel(65), &mut NoEffects);
-            frame(&mut m, 80, 14);
-            let t = m.selected_target().unwrap();
-            assert!(m.drawn.rows.contains(&t), "{t:?} off screen at top {}", m.top);
+            frame(&mut m, 80, 10);
+            let t = m.selected_target();
+            assert!(t.is_none_or(|t| m.drawn.rows.contains(&t)), "off screen at top {}", m.top);
         }
-        let mut fx = crate::menu::state::tests::Rec::default();
-        let t = m.selected_target().unwrap();
-        assert!(m.act(crate::menu::keys::Key::Enter, &mut fx));
-        assert_eq!(fx.calls, [format!("go {} {}", t.win, t.session)]);
-        // Scrolling back up pulls it down from the bottom edge the same way.
-        for _ in 0..6 {
-            m.act(wheel(64), &mut NoEffects);
-            frame(&mut m, 80, 14);
-            assert!(m.drawn.rows.contains(&m.selected_target().unwrap()));
+        assert!(m.top > 0);
+        let mut fx = Rec::default();
+        if let Some(t) = m.selected_target() {
+            assert!(m.act(Key::Enter, &mut fx));
+            assert_eq!(fx.calls, [format!("go {} {}", t.win, t.session)]);
         }
-        assert_eq!(m.top, 0);
-    }
-
-    /// A preview button acts on the row it was drawn for, not on whatever
-    /// the selection became since; a row gone since says so.
-    #[test]
-    fn buttons_act_on_their_drawn_row() {
-        let mut fx = crate::menu::state::tests::Rec::default();
-        let mut m = menu();
-        frame(&mut m, 110, 34); // buttons drawn for @6 (the first need)
-        let (r, _) = m.clicks.iter().find(|(_, h)| matches!(h, Hit::Button(Button::Go, _))).cloned().unwrap();
-        m.act(crate::menu::keys::Key::Char('j'), &mut fx); // selection moves; no redraw yet
-        let click = crate::menu::keys::Key::Mouse(crate::menu::keys::Mouse { button: 0, col: r.x, row: r.y, press: true });
-        assert!(m.act(click, &mut fx));
-        assert_eq!(fx.calls, ["go @6 work"]);
-        // The row went away before the click.
-        let mut d = data();
-        d.view.needs.clear();
-        m.set_data(d);
-        assert!(!m.act(click, &mut fx));
-        assert_eq!(m.msg, "that tab moved · pick it again");
-        assert_eq!(fx.calls.len(), 1);
-    }
-
-    #[test]
-    fn zero_sized_frames() {
-        let mut m = menu();
-        assert!(frame(&mut m, 10, 0).is_empty());
-        assert_eq!(frame(&mut m, 0, 10).len(), 10);
-        assert!(m.drawn.rows.is_empty() && m.clicks.is_empty());
     }
 
     #[test]
     fn click_map() {
-        let mut fx = crate::menu::state::tests::Rec::default();
+        let mut fx = Rec::default();
         let mut m = menu();
-        frame(&mut m, 110, 34);
-        let click = |col, row| crate::menu::keys::Key::Mouse(crate::menu::keys::Mouse { button: 0, col, row, press: true });
-        // Chips.
-        let (r, _) = m.clicks.iter().find(|(_, h)| *h == Hit::Tab(Tab::Parked)).cloned().unwrap();
-        assert!(!m.act(click(r.x + 1, r.y), &mut fx));
-        assert_eq!(m.tab, Tab::Parked);
-        let (r, _) = m.clicks.iter().find(|(_, h)| *h == Hit::Tab(Tab::All)).cloned().unwrap();
-        m.act(click(r.x, r.y), &mut fx);
-        frame(&mut m, 110, 34);
-        // The search field.
-        let (r, _) = m.clicks.iter().find(|(_, h)| *h == Hit::Search).cloned().unwrap();
-        m.act(click(r.x + 2, 1), &mut fx);
-        assert!(m.searching);
-        m.act(crate::menu::keys::Key::Esc, &mut fx);
-        // A row: the first click selects, the second goes.
         let f = frame(&mut m, 110, 34);
-        let y = f.iter().position(|l| l.contains("Kua Yu focus timing") && l.contains("main")).unwrap() as u16;
+        // A row: the first click selects, the second goes.
+        let y = at(&f, "Kua Yu focus timing") as u16;
         assert!(!m.act(click(10, y), &mut fx));
-        assert_eq!(m.sel, Some(RowKey::Need("@1".into())));
-        assert!(fx.calls.is_empty());
+        assert_eq!(m.sel, Some(RowKey::Agent("main".into(), "@1".into())));
         frame(&mut m, 110, 34);
         assert!(m.act(click(10, y), &mut fx));
         assert_eq!(fx.calls, ["go @1 main"]);
-        // Buttons: park asks first; any click cancels the y/n.
-        let (r, _) = m.clicks.iter().find(|(_, h)| matches!(h, Hit::Button(Button::Park, _))).cloned().unwrap();
-        m.act(click(r.x, r.y), &mut fx);
-        assert!(m.confirm.is_some());
-        m.act(click(0, 0), &mut fx);
-        assert!(m.confirm.is_none());
-        let (r, _) = m.clicks.iter().find(|(_, h)| matches!(h, Hit::Button(Button::Peek, _))).cloned().unwrap();
-        m.act(click(r.x, r.y), &mut fx);
-        assert!(m.peek_full.is_some());
-        let f = frame(&mut m, 110, 34);
-        assert!(f[3].contains("╭─ peek · main:1 Kua Yu focus timing"), "{}", f[3]);
-        assert!(f[32].contains("any key closes the peek"));
-        m.act(click(50, 10), &mut fx); // a click closes it
-        assert!(m.peek_full.is_none());
-        frame(&mut m, 110, 34);
-        // "+k more" opens the Parked tab; ✕ closes.
-        let (r, _) = m.clicks.iter().find(|(_, h)| *h == Hit::More).cloned().unwrap();
-        m.act(click(r.x + 3, r.y), &mut fx);
+        // A click cancels the actions strip (and only that).
+        m.act(Key::Char(' '), &mut fx);
+        assert!(!m.act(click(10, y), &mut fx) && m.actions.is_none());
+        // The fold opens Parked; ✕ closes; nothing does nothing.
+        let y = at(&f, "▪ 5 parked ⇥") as u16;
+        m.act(click(10, y), &mut fx);
         assert_eq!(m.tab, Tab::Parked);
-        frame(&mut m, 110, 34);
+        let f = frame(&mut m, 110, 34);
+        assert!(f[1].starts_with("│     ▪ Pitch deck v2") && f[1].contains("bai  ") && f[1].ends_with("8m │"), "{}", f[1]);
         assert!(m.act(click(110 - 4, 0), &mut fx));
-        // A click on nothing does nothing.
-        assert!(!m.act(click(1, 1), &mut fx));
+        assert!(!m.act(click(1, 33), &mut fx));
     }
 
     #[test]
-    fn footer_prompts() {
+    fn zero_and_tiny_frames() {
         let mut m = menu();
-        frame(&mut m, 110, 34);
-        m.act(crate::menu::keys::Key::Char('x'), &mut NoEffects);
-        let f = frame(&mut m, 110, 34);
-        assert!(f[32].contains("close Island resize? y/n"), "{}", f[32]);
-        m.act(crate::menu::keys::Key::Char('n'), &mut NoEffects);
-        m.act(crate::menu::keys::Key::Char('/'), &mut NoEffects);
-        m.act(crate::menu::keys::Key::Char('k'), &mut NoEffects);
-        let f = frame(&mut m, 110, 34);
-        assert!(f[1].contains("/ k▏"), "{}", f[1]);
-        assert!(f[32].contains("keep") && f[32].contains("clear"));
-        m.act(crate::menu::keys::Key::Esc, &mut NoEffects);
-        // One-digit labels: a 0 is no number at all.
-        m.act(crate::menu::keys::Key::Char('0'), &mut NoEffects);
-        let f = frame(&mut m, 110, 34);
-        assert!(f[32].contains("no agent 0"), "{}", f[32]);
-        // Two-digit labels (a slot of 12): a 0 waits for the next digit.
-        use super::super::rows::tests::{data_of, stamped};
-        let mut m = Menu::new(data_of(&stamped(&[("@2", "12")])), Tab::All);
-        frame(&mut m, 110, 34);
-        m.act(crate::menu::keys::Key::Char('0'), &mut NoEffects);
-        let f = frame(&mut m, 110, 34);
-        assert!(f[32].contains("0▏  next digit"), "{}", f[32]);
-    }
-
-    #[test]
-    fn home_prefix_and_markdown() {
-        let mut d = data();
-        for a in d.view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()) {
-            match a.window_id.as_str() {
-                "@4" => a.title = "~/Commodities Job Tracker".into(),
-                "@3" => a.title = "cua-notch/Notch Tasks".into(),
-                _ => {}
-            }
-        }
-        d.view.needs[1].reason = "**Which** `deck`?\n- <agent-message from=x>[the v3](http://x) one</agent-message>".into();
-        let mut m = Menu::new(d, Tab::All);
-        m.sel = Some(RowKey::Need("@1".into()));
-        let all = frame(&mut m, 110, 34).join("\n");
-        // A bare ~/ goes; a real project prefix stays.
-        assert!(all.contains("○ Commodities Job Tracker") && !all.contains("~/Commodities"), "{all}");
-        assert!(all.contains("◐ cua-notch/Notch Tasks"), "{all}");
-        // The reason line is plain words.
-        assert!(all.contains("asks Which deck? the v3 one"), "{all}");
-        m.sel = Some(RowKey::Agent("main".into(), "@4".into()));
-        let f = frame(&mut m, 110, 34);
-        assert!(f[3].contains("│ Commodities Job Tracker"), "{}", f[3]);
-        m.act(crate::menu::keys::Key::Char('x'), &mut NoEffects);
-        assert!(frame(&mut m, 110, 34)[32].contains("close Commodities Job Tracker? y/n"));
-    }
-
-    /// Watcher stamps with a gap and a slot past nine: two-digit labels on
-    /// every numbered row, idle / parked rows blank, the key bar's range.
-    #[test]
-    fn slot_labels_drawn() {
-        use super::super::rows::tests::{data_of, stamped};
-        let mut m = Menu::new(data_of(&stamped(&[("@1", "1"), ("@2", "12"), ("@3", "3"), ("@6", "4")])), Tab::All);
-        let f = frame(&mut m, 110, 34);
-        let line = |needle: &str| f.iter().filter(|l| l.contains(needle)).cloned().collect::<Vec<_>>();
-        assert_eq!(line("Island resize").iter().filter(|l| l.contains("│ 04 ✕ Island resize")).count(), 2, "{f:#?}"); // NEEDS YOU + group
-        assert_eq!(line("Kua Yu focus timing").iter().filter(|l| l.contains("│ 01 ◉ Kua Yu")).count(), 2, "{f:#?}");
-        assert!(line("Tmux Agent Sidebar")[0].contains("│ 12 ◐ Tmux Agent Sidebar"), "{f:#?}");
-        assert_eq!(line("Handy.app Speech").iter().filter(|l| l.contains("│ 03 ◐ Handy.app Speech")).count(), 2);
-        assert!(line("Commodities Job Tracker")[0].contains("│    ○ Commodities"), "{f:#?}"); // idle: no number
-        assert!(line("Pitch deck v2")[0].contains("│    ▪ Pitch deck v2"), "{f:#?}"); // parked: none
-        assert!(f[32].contains(" 01–12  jump "), "{}", f[32]);
-        assert_eq!(m.drawn.slots.keys().map(String::as_str).collect::<Vec<_>>(), ["01", "03", "04", "12"]);
-        // Nothing holds a slot: no numbers, no jump key.
-        let mut d = data();
-        for a in d.view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()).chain(d.view.needs.iter_mut().map(|n| &mut n.agent)) {
-            a.slot = None;
-        }
-        d.view.slot_width = 0;
-        let mut m = Menu::new(d, Tab::All);
-        let f = frame(&mut m, 110, 34);
-        assert!(f[4].contains("│   ✕ Island resize"), "{}", f[4]);
-        assert!(!f[32].contains("jump"), "{}", f[32]);
-    }
-
-    /// Two live frames through the menu's memo: a new agent that sorts first
-    /// (Alpha) gets the next free number and moves nobody's; the question the
-    /// user just answered (idle + @agent_pending) stays on the Active tab with
-    /// its number, out of NEEDS YOU.
-    #[test]
-    fn memo_and_answered_render() {
-        use super::super::rows::tests::fixture;
-        use super::super::rows::Data;
-        let mut memo = crate::view::SlotMemo::default();
-        let coll = crate::Collator::new("en_US.UTF-8");
-        let build = |snap: &crate::tmux::Snapshot, memo: &mut crate::view::SlotMemo| {
-            Data::build_with(snap, Some("/dev/ttys999"), 1000.0, &coll, None, Some(1.0), memo)
-        };
-        let mut m = Menu::new(build(&fixture(), &mut memo), Tab::Active);
-        let f = frame(&mut m, 110, 34);
-        for want in ["│ 1 ◉ Kua Yu", "│ 2 ◐ Tmux Agent Sidebar", "│ 3 ◐ Handy.app", "│ 4 ✕ Island resize"] {
-            assert!(f.iter().any(|l| l.contains(want)), "{want}: {f:#?}");
-        }
-        // Next frame: Alpha:0 starts running (unstamped, sorts first); @1
-        // answered 600 s ago (the frames' clock is 1000): still Active.
-        let mut snap = fixture();
-        for w in snap.windows.iter_mut().filter(|w| w.id == "@1") {
-            w.state = "idle".into();
-            w.pending = "400".into();
-        }
-        let early = crate::tmux::tests::row("Alpha", 0, "@20", &[("state", "running"), ("summary", "Early bird")]);
-        snap.windows.push(crate::tmux::Window::parse(&early).unwrap());
-        m.set_data(build(&snap, &mut memo));
-        let f = frame(&mut m, 110, 34);
-        assert!(f[1].contains(" Active 5 ") && f[1].contains(" Needs you 1 "), "{}", f[1]);
-        for want in ["│ 5 ◐ Early bird", "│ 1 ○ Kua Yu", "│ 2 ◐ Tmux Agent Sidebar", "│ 3 ◐ Handy.app", "│ 4 ✕ Island resize"] {
-            assert!(f.iter().any(|l| l.contains(want)), "{want}: {f:#?}");
-        }
-        assert!(m.drawn.slots["1"].win == "@1" && m.drawn.slots["5"].win == "@20");
-        // All: NEEDS YOU is agent-jump.sh's queue (the failure only); Kua is
-        // in its group, numbered.
-        m.set_tab(Tab::All);
-        let f = frame(&mut m, 110, 34);
-        let needs_end = f.iter().position(|l| l.contains("│ main ")).unwrap();
-        assert!(!f[..needs_end].iter().any(|l| l.contains("Kua Yu") && l.contains("│ 1 ")), "{f:#?}");
-        assert!(f[needs_end..].iter().any(|l| l.contains("│ 1 ○ Kua Yu")), "{f:#?}");
-        // Without the memo the newcomer would have taken 1 and pushed the rest up.
-        let d = Data::build(&snap, Some("/dev/ttys999"), 1000.0, &coll, None, Some(1.0));
-        assert_eq!(d.view.agents().find(|a| a.window_id == "@20").and_then(|a| a.slot), Some(1));
-        // The stamp lapses (601 s: answered by No, never resumed): Kua is
-        // plain idle, off the Active tab, its number gone; nobody else's moves.
-        for w in snap.windows.iter_mut().filter(|w| w.id == "@1") {
-            w.pending = "399".into();
-        }
-        m.set_data(build(&snap, &mut memo));
-        m.set_tab(Tab::Active);
-        let f = frame(&mut m, 110, 34);
-        assert!(f[1].contains(" Active 4 "), "{}", f[1]);
-        assert!(!f.iter().any(|l| l.contains("Kua Yu")), "{f:#?}");
-        assert!(!m.drawn.slots.contains_key("1") && m.drawn.slots["5"].win == "@20", "{:?}", m.drawn.slots.keys());
-        m.set_tab(Tab::All);
-        let f = frame(&mut m, 110, 34);
-        assert!(f.iter().any(|l| l.contains("│   ○ Kua Yu")), "{f:#?}");
-    }
-
-    #[test]
-    fn tiny_and_test_backend() {
-        let mut m = menu();
-        let f = frame(&mut m, 20, 5);
-        assert_eq!(f[0], "agents · too small");
+        assert!(frame(&mut m, 10, 0).is_empty());
+        assert_eq!(frame(&mut m, 0, 10).len(), 10);
+        assert!(m.drawn.rows.is_empty() && m.clicks.is_empty());
+        assert_eq!(frame(&mut m, 20, 5)[0], "agents · too small");
         // Through ratatui's own TestBackend, as the live loop draws.
         let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 34)).unwrap();
         t.draw(|fr| render(&mut m, fr.buffer_mut(), 1000.0)).unwrap();
         let b = t.backend().buffer().clone();
-        assert!(dump(&b, false)[3].contains("NEEDS YOU"));
+        assert!(dump(&b, false)[2].contains("Application link"));
         assert!(dump(&b, true)[0].contains("\x1b[0;38;2;69;71;90;48;2;30;30;46m╭─ "));
     }
 }

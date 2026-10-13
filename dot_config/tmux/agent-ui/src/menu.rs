@@ -2,53 +2,65 @@
 //! `agent-roster.py --client <tty>`.
 //!
 //! ```text
-//! agent-ui menu --client <tty> [--tab active|all|needs|working|idle|parked]
-//! agent-ui menu --once WxH [--client <tty>] [--tab x] [--select <label>] [--plain]
+//! agent-ui menu --client <tty> [--tab all|active|needs|working|idle|parked]
+//! agent-ui menu --once WxH [--client <tty>] [--tab x] [--select <letter>] [--preview] [--plain]
 //! ```
 //!
-//! It opens on the **Active** tab: every agent working or needing you, in a
-//! fixed space/index order that a state change never reshuffles (see
-//! [`rows`]). Tab / Shift-Tab cycle Active, All, Needs you, Working, Idle,
-//! Parked.
+//! It opens on **All**: every agent in a fixed space/index order that a
+//! state change never reshuffles, parked tabs folded into one row (see
+//! [`rows`]). Each agent owns a lifetime LETTER (`@agent_key`, see
+//! [`letters`]): pressing it goes there at once. ⌥W, the key that opened
+//! the menu, goes to the last agent. ⇥ / ⇧⇥ cycle the filters (All, Active,
+//! Needs you, Working, Idle, Parked); `/` searches; Space opens the row's
+//! actions.
 //!
-//! The pieces: [`keys`] (raw bytes → keys, the Python's `parse_keys`),
-//! [`rows`] (tabs, search, the list), [`state`] (the `Roster` state machine
-//! behind an [`Effects`] trait) and [`render`] (one frame into a ratatui
-//! buffer, with its click map). This file is the I/O around them.
+//! The pieces: [`keys`] (raw bytes → keys), [`rows`] (filters, search, the
+//! list, the letters and the last agent of one refresh), [`letters`] (the
+//! letter assignment), [`state`] (the `Menu` state machine behind an
+//! [`Effects`] trait) and [`render`] (one frame into a ratatui buffer, with
+//! its click map). This file is the I/O around them.
 //!
 //! ## The loop
 //!
-//! - **First frame.** One tmux call (`Core`'s snapshot), git branches only
-//!   if already cached (`branch_wait` 0 for that frame), no event log, no
-//!   `git status` ever (the menu does not show it), no peek: then draw.
+//! - **First frame.** One tmux call (`Core`'s snapshot, which carries every
+//!   window's `@agent_key` and the global `@agent_mru_cur/prev`), git
+//!   branches only if already cached (`branch_wait` 0 for that frame), no
+//!   event log, no `git status` ever, no peek: then draw.
 //!   `AGENT_UI_MENU_TRACE=<file>` appends `first_frame_us N` to that file.
+//! - **Letters** are shown from the frame's own assignment at once; when it
+//!   changed what tmux stores, ONE batched `set-option` command is sent from
+//!   a background thread (fire-and-forget, never re-sent while in flight:
+//!   [`letters::KeyMemo`]). `--once` never writes.
 //! - **Cadence.** A snapshot every [`REFRESH`] (0.5 s, so the pulse steps in
 //!   phase with `@agent_blink`); the terminal is written only when the frame
 //!   differs from the one on screen.
 //! - **Input** comes from a reader thread over a channel. A read that ends
-//!   inside an escape sequence waits [`keys::ESC_WAIT`] for the rest (the
-//!   Python's main loop). Input that arrived while refreshing is handled
-//!   against the frame ON SCREEN before the next draw (labels, clicks).
-//! - **Peeks** (the preview's live tail) run on a worker thread: requested
-//!   [`PEEK_DEBOUNCE`] after the selection settles, then every
-//!   [`PEEK_EVERY`]; the worker only ever runs the newest request, so the
-//!   UI never waits on `capture-pane`.
+//!   inside an escape sequence waits [`keys::ESC_WAIT`] for the rest. Input
+//!   that arrived while refreshing is handled against the frame ON SCREEN
+//!   before the next draw (letters, clicks).
+//! - **Peeks** (the preview strip's live tail, only while it is on) run on a
+//!   worker thread: requested [`PEEK_DEBOUNCE`] after the selection
+//!   settles, then every [`PEEK_EVERY`]; the worker only ever runs the
+//!   newest request, so the UI never waits on `capture-pane`.
 //! - **Mouse:** SGR reports with DECSET 1000 + 1006 only (clicks and the
 //!   wheel; never 1003 all-motion).
 //!
 //! `--once` renders one frame of the live server to stdout (truecolour SGR,
 //! or `--plain`) and exits. It is read-only: one snapshot, the branch reads,
-//! and one capture-pane of the selected row for the preview. No action runs.
+//! and (with `--preview`) one capture-pane of the selected row. No action
+//! runs and no `@agent_key` is written.
 
 pub mod keys;
+pub mod letters;
 pub mod render;
 pub mod rows;
 pub mod state;
 
 use self::keys::{KeyReader, ESC_WAIT};
 use self::render::{dump, render};
-use self::rows::{Data, Tab};
-use self::state::{Effects, Menu, PeekData, PeekWant};
+use self::letters::{KeyMemo, Write as KeyWrite};
+use self::rows::{Data, Row, Tab};
+use self::state::{letter_key, Effects, Menu, PeekData, PeekWant};
 use crate::actions::{self, Actions};
 use crate::tmux::{Snapshot, Window};
 use crate::{text, Core, Tmux};
@@ -60,8 +72,8 @@ use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: agent-ui menu --client <tty> [--tab active|all|needs|working|idle|parked]
-       agent-ui menu --once WxH [--client <tty>] [--tab x] [--select <label>] [--plain]";
+const USAGE: &str = "usage: agent-ui menu --client <tty> [--tab all|active|needs|working|idle|parked]
+       agent-ui menu --once WxH [--client <tty>] [--tab x] [--select <letter>] [--preview] [--plain]";
 
 /// A snapshot every half second (lib.rs: the steadier pulse).
 pub const REFRESH: Duration = Duration::from_millis(500);
@@ -80,11 +92,13 @@ pub struct Args {
     pub tab: Tab,
     pub once: Option<(u16, u16)>,
     pub select: Option<String>,
+    /// `--once` with the preview strip on.
+    pub preview: bool,
     pub plain: bool,
 }
 
 pub fn parse_args(args: &[String]) -> Result<Args, String> {
-    let mut a = Args { client: None, tab: Tab::Active, once: None, select: None, plain: false };
+    let mut a = Args { client: None, tab: Tab::All, once: None, select: None, preview: false, plain: false };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut val = || it.next().cloned().ok_or_else(|| format!("{arg} needs a value"));
@@ -101,6 +115,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
                 a.once = Some((n(w)?, n(h)?));
             }
             "--select" => a.select = Some(val()?),
+            "--preview" => a.preview = true,
             "--plain" => a.plain = true,
             _ => return Err(format!("unknown argument {arg:?}")),
         }
@@ -132,22 +147,45 @@ pub fn run(tmux: Tmux, args: &[String]) -> ExitCode {
     }
 }
 
-/// The read side: one snapshot → the menu's [`Data`].
+/// The read side: one snapshot → the menu's [`Data`], and (when
+/// `persist`) the letters it assigned stored back on the windows.
 pub struct Source {
     pub core: Core,
     pub client: Option<String>,
+    /// Store new letters in `@agent_key` (the live menu); false: read-only
+    /// (`--once`).
+    pub persist: bool,
+    /// The `@agent_key` writes in flight.
+    pub keys: KeyMemo,
 }
 
 impl Source {
     pub fn new(tmux: Tmux, client: Option<String>) -> Source {
-        Source { core: Core::new(tmux), client }
+        Source { core: Core::new(tmux), client, persist: false, keys: KeyMemo::default() }
     }
 
     pub fn load(&mut self) -> Data {
         self.core.snapshot = self.core.tmux.snapshot();
-        Data::build_with(&self.core.snapshot, self.client.as_deref(), text::now(), &self.core.collator,
-            Some(&mut self.core.git), actions::watcher_age(), &mut self.core.slots)
+        let keys = if self.persist { Some(&mut self.keys) } else { None };
+        let mut d = Data::build_with(&self.core.snapshot, self.client.as_deref(), text::now(), &self.core.collator,
+            Some(&mut self.core.git), actions::watcher_age(), &mut self.core.slots, keys);
+        let writes = std::mem::take(&mut d.key_writes);
+        if self.persist && !writes.is_empty() {
+            store_keys(&self.core.tmux, writes);
+        }
+        d
     }
+}
+
+/// Store `writes` with ONE tmux command, from a thread: a frame never
+/// waits on it, and a failure only means the letters are assigned again
+/// next time (the same way, from the same snapshot).
+pub fn store_keys(tmux: &Tmux, writes: Vec<KeyWrite>) {
+    let tmux = tmux.clone();
+    let args = letters::command(&writes);
+    std::thread::spawn(move || {
+        let _ = tmux.run(&args);
+    });
 }
 
 /// The real effects: the core's [`Actions`] against the latest snapshot
@@ -184,14 +222,17 @@ fn once(tmux: Tmux, a: &Args, w: u16, h: u16) -> ExitCode {
     let mut src = Source::new(tmux.clone(), a.client.clone());
     src.core.git.branch_wait = Duration::from_millis(500); // a one-shot may wait for its branches
     let mut menu = Menu::new(src.load(), a.tab);
-    if let Some(label) = &a.select {
-        // A slot label; an agent listed twice (NEEDS YOU and its group) is
-        // selected on its first row.
-        let pos = menu.labels.iter().filter(|(_, l)| *l == label).map(|(p, _)| *p).min();
-        match pos.and_then(|p| menu.rows[p].key()) {
+    menu.preview = a.preview;
+    if let Some(sel) = &a.select {
+        // A letter: the agent's first row in the list.
+        let mut cs = sel.chars();
+        let l = cs.next().and_then(letter_key).filter(|_| cs.next().is_none());
+        let win = menu.data.letters.iter().find(|(_, &c)| Some(c) == l).map(|(w, _)| w.clone());
+        let key = win.and_then(|w| menu.rows.iter().filter_map(Row::key).find(|k| k.window() == w));
+        match key {
             Some(k) => menu.sel = Some(k),
             None => {
-                eprintln!("agent-ui menu: no row {label}");
+                eprintln!("agent-ui menu: no agent on {sel}");
                 return ExitCode::from(2);
             }
         }
@@ -364,6 +405,7 @@ pub fn usable(new: &Snapshot, last: &Snapshot) -> bool {
 fn interactive(tmux: Tmux, client: String, tab: Tab) -> io::Result<()> {
     let t0 = Instant::now();
     let mut src = Source::new(tmux.clone(), Some(client.clone()));
+    src.persist = true;
     src.core.git.branch_wait = Duration::ZERO; // the first frame never waits on git
     let data = src.load();
     src.core.git.branch_wait = crate::git::BRANCH_WAIT;
@@ -489,9 +531,9 @@ mod tests {
     fn args() {
         let a = parse_args(&s(&["--client", "/dev/ttys004", "--tab", "parked"])).unwrap();
         assert_eq!((a.client.as_deref(), a.tab, a.once), (Some("/dev/ttys004"), Tab::Parked, None));
-        let a = parse_args(&s(&["--once", "110x34", "--select", "02", "--plain"])).unwrap();
-        assert_eq!((a.once, a.select.as_deref(), a.plain), (Some((110, 34)), Some("02"), true));
-        assert_eq!(a.tab, Tab::Active); // the default
+        let a = parse_args(&s(&["--once", "110x34", "--select", "s", "--plain", "--preview"])).unwrap();
+        assert_eq!((a.once, a.select.as_deref(), a.plain, a.preview), (Some((110, 34)), Some("s"), true, true));
+        assert_eq!(a.tab, Tab::All); // the default
         assert_eq!(parse_args(&s(&["--tab", "active"])).unwrap().tab, Tab::Active);
         assert_eq!(parse_args(&s(&["--tab", "all"])).unwrap().tab, Tab::All);
         assert!(parse_args(&s(&["--tab", "nope"])).is_err());
