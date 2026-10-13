@@ -593,6 +593,18 @@ class JumpTests(unittest.TestCase):
         wins = [l.split("\t")[0] for l in out if l]
         self.assertEqual(wins, ["@13", "@12", "@17", "@11"])
 
+    def test_forces_a_utf8_locale_for_callers_outside_tmux(self):
+        # CuaNotch runs the script from a LaunchAgent env (no LANG/LC_*, no
+        # $TMUX): a non-UTF-8 tmux client turns the US separator into `_`,
+        # and `list` silently printed nothing. The fake tmux can't model that,
+        # so check the guard itself: it must run before any tmux call.
+        src = JUMP.read_text()
+        guard = src.index("export LC_CTYPE=en_US.UTF-8")
+        self.assertLess(guard, src.index("list_needs() {"))
+        self.assertIn("unset LC_ALL", src[guard - 60:guard])
+        out = self.make().run("agent-jump.sh", "list", LC_ALL="C").stdout
+        self.assertTrue(out.startswith("@13\t"))
+
     def test_next_selects_before_switching(self):
         f = self.make()
         f.run("agent-jump.sh", "next", self.TTY)

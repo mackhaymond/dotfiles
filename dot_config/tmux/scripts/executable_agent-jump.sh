@@ -120,6 +120,17 @@
 
 set -uo pipefail
 
+# A UTF-8 locale, always. Outside tmux ($TMUX unset: CuaNotch, launchd, cron)
+# a tmux client whose locale is not UTF-8 rewrites control bytes in format
+# output as `_` (the US separator included), so `list` would print nothing,
+# read as "nothing needs you", and the client lookup would never match
+# (`jump` → 5). agent-ui's Tmux::command passes -u for the same reason;
+# exporting the locale also covers the awk/sort below.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) ;;
+    *) unset LC_ALL; export LC_CTYPE=en_US.UTF-8 ;;
+esac
+
 US=$'\x1f'
 EXCLUDE=" agents tasks stash scratch btop-popup "
 
