@@ -852,3 +852,12 @@ set -g @resurrect-hook-post-restore-all "bash '{{ .chezmoi.homeDir }}/.config/tm
 # a conversation. save_state now takes its own lock and snapshots inside it,
 # which is what actually makes this safe.
 set-hook -g 'window-unlinked[1]' 'run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh publish"'
+
+# STATE NOTICE on a window changing sessions (see agent-tab-indicator.sh and
+# docs/agent-tab-indicator.md). CuaNotch mutes tmux rows whose every session is
+# one agent-jump.sh excludes (stash, agents, ...), so a park or an unpark, a
+# move-window, or a link/unlink changes what it should light without any
+# @agent_state write. move-window fires both hooks, so CuaNotch's 150 ms
+# debounce folds them into one re-read. Rare events: one fork each.
+set-hook -g 'window-linked[1]' 'run-shell -b "notifyutil -p com.mackhaymond.tmux.agent-state"'
+set-hook -g 'window-unlinked[2]' 'run-shell -b "notifyutil -p com.mackhaymond.tmux.agent-state"'
