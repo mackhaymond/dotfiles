@@ -1,2 +1,0 @@
-#!/bin/sh
-exec /usr/bin/python3 "$HOME/.config/claude-sleep-guard/guard.py" "$@"
