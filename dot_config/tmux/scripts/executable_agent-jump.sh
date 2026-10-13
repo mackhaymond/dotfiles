@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # agent-jump.sh — the ONE answer to "which tab wants me next?". prefix d /
-# prefix D use it today; the agent roster (and its WezTerm strip) are meant to
-# call the same modes rather than grow a second ordering.
+# prefix D, ⌥S / ⌥X (tmux's ⌥S being the fallback when CuaNotch owns ⌥S), the
+# agent roster, agent-ui and CuaNotch all call these modes rather than grow a
+# second ordering.
 #
 #   agent-jump.sh next <client_tty>          go to the next tab that needs you
 #   agent-jump.sh back <client_tty>          return to where the jumps started
@@ -9,8 +10,46 @@
 #                                            go to one window (roster ⏎, clicks);
 #                                            <session>: the one the row listed it
 #                                            under (a linked window has several)
-#   agent-jump.sh list                       the needs-you queue, in order:
-#                                            win<TAB>session<TAB>index<TAB>state<TAB>since<TAB>label
+#   agent-jump.sh jump <client_tty> <win> <session>
+#                                            one `next` step onto a window the
+#                                            CALLER picked (CuaNotch's ⌥S); exit
+#                                            code says what happened (below)
+#   agent-jump.sh list                       the needs-you queue, in order
+#
+# LIST FORMAT v1: win_id<TAB>session<TAB>index<TAB>state<TAB>since_epoch<TAB>label (columns only ever appended)
+#   one row per window, best first; since_epoch is 9999999999 when unstamped;
+#   label is @agent_summary, else the window name, with tabs turned to spaces.
+#
+# JUMP EXIT CODES (only `jump` uses them; next/back/goto always exit 0
+# because tmux's run-shell turns a nonzero exit into a "returned N" view-mode
+# pane over the user's window, and the human gets the chip instead):
+#   0  landed, or the client was already on <win> (its tint is then
+#      discharged as the focus hooks would); silent
+#   2  usage (missing <win> or <session>)
+#   3  gone: <win> no longer exists, or <session> no longer holds it
+#   4  refused: <session> is an EXCLUDE session, or <win> was parked
+#   5  client not attached: no client with that tty, or it detached during
+#      the move; silent
+#
+# CUANOTCH CONTRACT. When CuaNotch's keyJumpToNeedy is opt+s (this machine's
+# setting), CuaNotch owns ⌥S globally and tmux's `bind -n M-s` is the
+# fallback. CuaNotch merges this queue with its own rows (Codex/Claude
+# desktop):
+#   - queue:   `agent-jump.sh list`, parsed by position (LIST FORMAT v1). The
+#              list INCLUDES the client's own window; CuaNotch decides: if
+#              WezTerm is frontmost, it drops rows whose window is the chosen
+#              client's current window (`tmux list-clients -F '#{client_tty}
+#              #{window_id}'`); otherwise it `jump`s there too, which returns
+#              0 and clears that window's tint.
+#   - landing: `agent-jump.sh jump <tty> <win_id> <session>` with <tty> exactly
+#              as `tmux list-clients -F '#{client_tty}'` prints it and <win_id>
+#              / <session> from the chosen list row; then it activates WezTerm.
+#              On 3 it re-lists once and tries the next row; on 4 it skips the
+#              row; 3 and 4 also show the usual chip on that client (never on
+#              another one).
+#   - back:    ⌥X (`back`) still works after CuaNotch's jumps, because `jump`
+#              records THE CHAIN exactly as `next` does, two jumps racing
+#              each other included.
 #
 # ORDER. failed (red) > needs-input (yellow) > done (green), then the oldest
 # @agent_since first, then session name and window index so equal stamps
@@ -47,15 +86,25 @@
 # runs cua-notch-visit for the notch. The client is checked BEFORE the select:
 # a select whose switch then fails would discharge a tint nobody saw.
 #
-# THE CHAIN. `back` undoes a run of `next`s. tmux has no client-scoped user
+# THE CHAIN. `back` undoes a run of `next`s (and `jump`s: both are one
+# step(), the only code that writes the chain). tmux has no client-scoped user
 # options, so the chain lives in a global keyed by the client's tty:
 #   @agent_jump_<tty> = "<origin window> <window we last landed on>"
-# It resets lazily, with no hook of its own: `next` keeps the origin only
+# It resets lazily, with no hook of its own: a step keeps the origin only
 # while the client is still on the window it last landed on (any other
 # navigation in between starts a fresh chain from where you are), and `back`
-# acts only from that landing, and only if the origin still exists.
+# acts only from that landing, and only if the origin still exists. A `jump`
+# onto the client's current window is no step at all (as `next` never picks
+# that window): it leaves the chain alone.
+# The chain is written by the move's OWN tmux command list (select ; switch ;
+# set-option), which the server runs without interleaving another client's
+# commands. Two jumps fired at once (⌥S twice, CuaNotch and a key) both start
+# from the same origin, and whichever list runs last sets both where the
+# client is and the landing the chain names, so ⌥X still goes home. A
+# select-switch-then-record in separate calls raced (13 of 40); a `wait-for
+# -L` lock would wedge every later jump if its holder died.
 #
-# SILENT SUCCESS. A `next` or `back` that lands says nothing. tmux stops
+# SILENT SUCCESS. A `next`, `jump` or `back` that lands says nothing. tmux stops
 # redrawing the status line while a display-message is up (display-time,
 # 4 s here), so a "→ main:5 …" chip kept the tab you landed on painted
 # green that long even though clear-current had already discharged it. The
@@ -77,10 +126,15 @@ EXCLUDE=" agents tasks stash scratch btop-popup "
 mode="${1:-}"
 tty="${2:-}"
 
+# say_strict (set by `jump`): only ever on <tty>. The untargeted fallback
+# would land on whichever client tmux picks, which for an outside caller
+# (CuaNotch) is nobody in particular; a client that is gone hears nothing.
+say_strict=
 say() {
     local m="${1//\#/##}"
     if [ -n "$tty" ]; then
-        tmux display-message -c "$tty" "$m" 2>/dev/null || tmux display-message "$m" 2>/dev/null
+        tmux display-message -c "$tty" "$m" 2>/dev/null ||
+            { [ -n "$say_strict" ] || tmux display-message "$m" 2>/dev/null; }
     else
         tmux display-message "$m" 2>/dev/null
     fi
@@ -118,14 +172,16 @@ client_info() {
     IFS="$US" read -r _ cur_sess cur_win <<<"$line"
 }
 
-# go_to <win> [<session>]. Sets go_sess to the session it moves in: the one
-# given, else the client's own session if <win> is linked there, else the
-# first linked session not in EXCLUDE, else (all excluded) the first one.
-# Returns 1 if the window is gone, 2 if go_sess is an EXCLUDE session (e.g.
-# the origin was parked into stash mid-chain): never switch the client in
-# there — refused() explains instead.
+# go_to <win> [<session>] [<chain>]. Sets go_sess to the session it moves in:
+# the one given, else the client's own session if <win> is linked there, else
+# the first linked session not in EXCLUDE, else (all excluded) the first one.
+# Returns 1 if the window is gone (or the move failed), 2 if go_sess is an
+# EXCLUDE session (e.g. the origin was parked into stash mid-chain): never
+# switch the client in there — refused() explains instead. <chain>, when
+# given, is stored as the client's chain IN THE SAME COMMAND LIST as the move
+# (see THE CHAIN: why that, not a lock).
 go_to() {
-    local win="$1"
+    local win="$1" chain="${3:-}"
     go_sess="${2:-}"
     if [ -z "$go_sess" ]; then
         go_sess=$(tmux list-windows -a -F "#{window_id}${US}#{session_name}" 2>/dev/null |
@@ -139,7 +195,12 @@ go_to() {
         [ -n "$go_sess" ] || return 1
     fi
     case "$EXCLUDE" in *" $go_sess "*) return 2 ;; esac
-    tmux select-window -t "=$go_sess:$win" \; switch-client -c "$tty" -t "=$go_sess" 2>/dev/null
+    if [ -n "$chain" ]; then
+        tmux select-window -t "=$go_sess:$win" \; switch-client -c "$tty" -t "=$go_sess" \
+            \; set-option -g "$(chain_key)" "$chain" 2>/dev/null
+    else
+        tmux select-window -t "=$go_sess:$win" \; switch-client -c "$tty" -t "=$go_sess" 2>/dev/null
+    fi
 }
 
 refused() {
@@ -151,6 +212,31 @@ refused() {
 }
 
 chain_key() { printf '@agent_jump_%s' "${tty//[^A-Za-z0-9]/_}"; }
+
+# step <win> <session> <where>: ONE jump onto <win> in <session> — what `next`
+# does with its pick and `jump` with the caller's. client_info must have run
+# (cur_win is the window the client is on). Keeps the chain's origin while
+# the client is still on the chain's last landing, else starts a fresh one
+# from cur_win; records "<origin> <win>" in the move's own command list, so
+# only a move that landed records. <where> names the window in the "gone"
+# chip. Returns 0 landed (silent), 3 gone, 4 refused, 5 the client detached
+# during the move (silent: nobody to tell).
+step() {
+    local win="$1" sess="$2" where="$3" chain origin rc
+    chain=$(tmux show-options -gqv "$(chain_key)" 2>/dev/null)
+    origin="${chain%% *}"
+    if [ -z "$chain" ] || [ "${chain##* }" != "$cur_win" ]; then
+        origin="$cur_win"
+    fi
+    go_to "$win" "$sess" "$origin $win"; rc=$?
+    [ "$rc" -eq 2 ] && { refused; return 4; }
+    if [ "$rc" -ne 0 ]; then
+        client_info || return 5                # the switch failed because the client left
+        say "agent-jump: $where is gone"
+        return 3
+    fi
+    return 0                                   # landed: says nothing (SILENT SUCCESS)
+}
 
 case "$mode" in
     list)
@@ -165,17 +251,62 @@ case "$mode" in
             exit 0
         fi
         IFS=$'\t' read -r twin tsess tidx _ <<<"${queue%%$'\n'*}"
-        key=$(chain_key)
-        chain=$(tmux show-options -gqv "$key" 2>/dev/null)
-        origin="${chain%% *}"
-        if [ -z "$chain" ] || [ "${chain##* }" != "$cur_win" ]; then
-            origin="$cur_win"
+        step "$twin" "$tsess" "$tsess:$tidx"
+        exit 0                                 # run-shell: never a nonzero exit
+        ;;
+
+    jump)
+        # CuaNotch's landing (see CUANOTCH CONTRACT): exit codes, not just chips.
+        win="${3:-}"
+        sess="${4:-}"
+        if [ -z "$tty" ] || [ -z "$win" ] || [ -z "$sess" ]; then
+            echo "usage: agent-jump.sh jump <client_tty> <window_id> <session>" >&2
+            exit 2
         fi
-        go_to "$twin" "$tsess"; rc=$?
-        [ "$rc" -eq 2 ] && { refused; exit 0; }
-        [ "$rc" -eq 0 ] || { say "agent-jump: $tsess:$tidx is gone"; exit 0; }
-        tmux set-option -g "$key" "$origin $twin" 2>/dev/null
-        # A landed jump says nothing (see SILENT SUCCESS above).
+        say_strict=1
+        client_info || exit 5                  # no client: nobody to tell
+        if [ "$win" = "$cur_win" ]; then
+            # Already there (CuaNotch picked the client's own window because
+            # WezTerm wasn't frontmost): landed, chain untouched. No select
+            # runs, so no focus hook fires: discharge the tint the way the
+            # after-select-window[0] / client-session-changed[0] hooks do.
+            tmux run-shell -b "#{HOME}/.config/tmux/scripts/agent-tab-indicator.sh clear-current $win" 2>/dev/null
+            exit 0
+        fi
+        # Where is <win> now? "held <index>" if <session> still holds it, else
+        # "parked <excluded session>" when every session holding it is an
+        # EXCLUDE one (parked into stash since the caller listed it), else
+        # "left" (it lives elsewhere now) or nothing (gone).
+        where=$(tmux list-windows -a -F "#{window_id}${US}#{session_name}${US}#{window_index}" 2>/dev/null |
+            JUMP_SESS="$sess" awk -F "$US" -v w="$win" -v ex="$EXCLUDE" '
+                $1 != w { next }
+                $2 == ENVIRON["JUMP_SESS"] { held = $3 }
+                index(ex, " " $2 " ") { if (exs == "" || $2 == "stash") exs = $2; next }
+                { other = 1 }
+                END {
+                    if (held != "") print "held " held
+                    else if (other) print "left"
+                    else if (exs != "") print "parked " exs
+                }')
+        case "$where" in
+            held\ *)
+                step "$win" "$sess" "$sess:${where#held }"
+                exit $?                        # 0 landed, 3 gone, 4 refused, 5 detached
+                ;;
+            parked\ *)
+                go_sess="${where#parked }"
+                refused
+                exit 4
+                ;;
+            left)
+                say "agent-jump: $win has left $sess · pick it again"
+                exit 3
+                ;;
+            *)
+                say "agent-jump: window $win is gone"
+                exit 3
+                ;;
+        esac
         ;;
 
     back)
@@ -212,7 +343,7 @@ case "$mode" in
         ;;
 
     *)
-        echo "usage: agent-jump.sh next|back <client_tty> | goto <client_tty> <window> [<session>] | list" >&2
+        echo "usage: agent-jump.sh next|back <client_tty> | goto <client_tty> <window> [<session>] | jump <client_tty> <window_id> <session> | list" >&2
         exit 2
         ;;
 esac

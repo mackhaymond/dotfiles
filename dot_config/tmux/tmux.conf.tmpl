@@ -573,6 +573,16 @@ bind-key C-q run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T 
 # Root-table bindings take these chords from whatever runs in the pane (zsh's
 # M-w/M-x, Claude Code's Meta keys) - deliberate. The prefix keys stay as
 # fallbacks.
+#
+# Option-S can be GLOBAL: when CuaNotch's keyJumpToNeedy is opt+s (this
+# machine's setting), CuaNotch (the notch app) owns ⌥S as a macOS hotkey and
+# the M-s line below is the fallback (it fires only when CuaNotch isn't
+# running or hasn't claimed the key). CuaNotch's ⌥S is "the next thing that
+# needs you" across tmux agents AND external apps (Codex/Claude desktop): it
+# reads `agent-jump.sh list`, picks one target, lands a tmux one with
+# `agent-jump.sh jump <tty> <win> <session>` and activates WezTerm. Option-X
+# still works after CuaNotch's tmux jumps, because `jump` records the same
+# back-chain as `next`.
 bind-key -n M-s run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
 bind-key -n M-x run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{client_tty}'"
 bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"

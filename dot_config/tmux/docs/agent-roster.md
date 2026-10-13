@@ -125,8 +125,15 @@ agent-ui menu keys:
 | Tab / Shift-Tab | cycle the filter: All, Active, Needs you, Working, Idle, Parked |
 | `/` | search title, session, `session:index`, detail and path as you type (letters and digits type); ⏎ goes to the selected match; Esc leaves and clears it (a second Esc closes); Backspace on an empty query leaves it |
 | Space | the actions strip for the selected row, in the footer; the next key runs one, Esc cancels: `p` preview strip on/off, `s` park (`stash.sh stash`, after y/n), `x` close the agent's pane through `closed-tabs.sh` after y/n (CMD+Z undoes it; on a parked row: discard via `stash.sh kill-many`), `r` restart the watcher, ⏎ go |
-| Option-S / Option-X | next tab that needs you / back (agent-jump.sh), and close |
+| Option-S / Option-X | next tab that needs you / back (agent-jump.sh), and close. When CuaNotch's `keyJumpToNeedy` is opt+s (this machine's setting), CuaNotch owns Option-S, so while it runs only Option-X reaches the menu |
 | Esc / C-c | close |
+
+The menu also closes by itself when the client is moved to another window
+by someone else while it is open (CuaNotch's Option-S jump, a tab click):
+a refresh that finds the client's row on a different window than at open
+ends it rather than leave the popup stale over the new window. A missing
+client row never counts, and the menu's own park/close of the client's
+window is followed, not closed on.
 
 Python fallback keys:
 
@@ -145,8 +152,20 @@ Python fallback keys:
 | `r` | restart the watcher (only needed when the red banner says so) |
 | esc / `q` | close |
 
-Related keys: **Option-S** (or `prefix d` / `prefix C-d`) jumps to the next tab
-that needs you, **Option-X** (or `prefix D`) jumps back (scripts/agent-jump.sh).
+Related keys: **Option-S** jumps to the next thing that needs you, **Option-X**
+(or `prefix D`) jumps back (scripts/agent-jump.sh). When CuaNotch's
+`keyJumpToNeedy` is opt+s (this machine's setting), CuaNotch owns Option-S as
+a global macOS hotkey and tmux's `bind -n M-s` (`agent-jump.sh next`) is the
+fallback, firing only when CuaNotch isn't running or hasn't claimed the key.
+CuaNotch merges tmux's queue (`agent-jump.sh list`, which includes the
+client's own window) with its own rows (Codex / Claude desktop) and picks one.
+It skips the client's current window only while WezTerm is frontmost. For a
+tmux target it runs `agent-jump.sh jump <client_tty> <win> <session>` (exit
+codes and the full contract are in the script header) and activates WezTerm.
+A `jump` onto the window the client already shows returns 0 and clears its
+tint. `jump` records the same back-chain as `next`, even when two jumps race,
+so Option-X still returns to where the jumps began. `prefix d` /
+`prefix C-d` are always tmux's `next`.
 
 ## agent-ui sessions (`prefix a`)
 

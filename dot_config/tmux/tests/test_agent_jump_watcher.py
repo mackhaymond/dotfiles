@@ -754,6 +754,197 @@ class JumpTests(unittest.TestCase):
         self.assertEqual(s["clients"][0]["window"], "@13")
         self.assertEqual(s["messages"], [])
 
+    # --- jump: CuaNotch's landing (exit codes 0 landed, 2 usage, 3 gone,
+    #     4 refused, 5 client not attached) ---
+
+    def moves(self, s):
+        return [c for c in s["calls"] if c[0] in ("select-window", "switch-client")]
+
+    def test_jump_lands_and_records_the_chain(self):
+        f = self.make()
+        r = f.run("agent-jump.sh", "jump", self.TTY, "@12", "bai")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = f.read()
+        self.assertEqual(self.moves(s)[0], ["select-window", "-t", "=bai:@12"])   # select first
+        self.assertEqual(self.moves(s)[1][0], "switch-client")
+        self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("bai", "@12"))
+        self.assertEqual(s["globals"]["@agent_jump__dev_ttys000"], "@10 @12")
+        self.assertEqual(s["messages"], [])                 # landed: silent
+
+    def test_back_after_two_jumps_returns_to_the_origin(self):
+        f = self.make()
+        self.assertEqual(f.run("agent-jump.sh", "jump", self.TTY, "@13", "work").returncode, 0)
+        self.assertEqual(f.run("agent-jump.sh", "jump", self.TTY, "@12", "bai").returncode, 0)
+        self.assertEqual(f.read()["globals"]["@agent_jump__dev_ttys000"], "@10 @12")
+        self.assertEqual(f.run("agent-jump.sh", "back", self.TTY).returncode, 0)
+        s = f.read()
+        self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("main", "@10"))
+        self.assertNotIn("@agent_jump__dev_ttys000", s["globals"])
+
+    def test_jump_and_next_share_one_chain(self):
+        f = self.make()
+        f.run("agent-jump.sh", "jump", self.TTY, "@17", "bai")
+        f.run("agent-jump.sh", "next", self.TTY)           # still on @17's landing: origin kept
+        self.assertEqual(f.read()["globals"]["@agent_jump__dev_ttys000"], "@10 @13")
+
+    def test_jump_after_manual_navigation_starts_a_fresh_chain(self):
+        f = self.make()
+        f.run("agent-jump.sh", "jump", self.TTY, "@13", "work")
+        s = f.read(); s["clients"][0].update(session="main", window="@11")   # the user moved
+        f.state.write_text(json.dumps(s))
+        self.assertEqual(f.run("agent-jump.sh", "jump", self.TTY, "@12", "bai").returncode, 0)
+        self.assertEqual(f.read()["globals"]["@agent_jump__dev_ttys000"], "@11 @12")
+
+    def test_jump_onto_the_current_window_discharges_and_leaves_the_chain(self):
+        # CuaNotch jumps to the client's own needy window when WezTerm isn't
+        # frontmost: no select runs (no focus hook), so jump discharges the
+        # tint itself, the way the hooks call clear-current.
+        f = self.make()
+        s = f.read(); s["clients"][0].update(session="work", window="@13")
+        s["globals"]["@agent_jump__dev_ttys000"] = "@11 @13"; f.state.write_text(json.dumps(s))
+        r = f.run("agent-jump.sh", "jump", self.TTY, "@13", "work")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = f.read()
+        self.assertEqual(self.moves(s), [])
+        self.assertIn(["run-shell", "-b",
+                       "#{HOME}/.config/tmux/scripts/agent-tab-indicator.sh clear-current @13"], s["calls"])
+        self.assertEqual(s["globals"]["@agent_jump__dev_ttys000"], "@11 @13")
+        self.assertEqual(s["messages"], [])
+        # The discharge is the same command the focus hooks run.
+        conf = (SCRIPTS.parent / "tmux.conf.tmpl").read_text()
+        self.assertIn('"#{HOME}/.config/tmux/scripts/agent-tab-indicator.sh clear-current #{window_id}"', conf)
+        # A real landing leaves the discharge to those hooks.
+        r = f.run("agent-jump.sh", "jump", self.TTY, "@12", "bai")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len([c for c in f.read()["calls"] if c[0] == "run-shell"]), 1)
+
+    def test_concurrent_jumps_still_go_back_to_the_origin(self):
+        # ⌥S twice in a row (or CuaNotch and a key): both jumps start from
+        # @10. Whichever lands last, the chain must name it, so back returns
+        # to @10 instead of "nothing to go back to".
+        for i in range(8):
+            f = self.make()
+            try:
+                procs = [subprocess.Popen(["bash", str(f.scripts / "agent-jump.sh"), "jump", self.TTY, w, ss],
+                                          env=f.env(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                         for w, ss in (("@13", "work"), ("@12", "bai"))]
+                self.assertEqual([p.wait(timeout=30) for p in procs], [0, 0], i)
+                for p in procs:
+                    p.stderr.close()
+                s = f.read()
+                chain = s["globals"]["@agent_jump__dev_ttys000"]
+                self.assertEqual(chain, "@10 " + s["clients"][0]["window"], i)
+                self.assertEqual(f.run("agent-jump.sh", "back", self.TTY).returncode, 0)
+                s = f.read()
+                self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("main", "@10"), i)
+                self.assertEqual(s["messages"], [], i)
+            finally:
+                f.close()
+
+    def test_jump_client_detaching_mid_move_is_5_and_silent(self):
+        # The select runs, then the switch fails because the client has gone:
+        # 5, not 3, no chain, and no chip on some other client.
+        f = self.make()
+        fake = f.bin / "tmux"
+        body = fake.read_text().replace(
+            '        elif cmd == "switch-client":\n',
+            '        elif cmd == "switch-client":\n'
+            '            s["clients"] = []; rc = 1; break\n')
+        self.assertNotEqual(body, fake.read_text())
+        fake.write_text(body)
+        r = f.run("agent-jump.sh", "jump", self.TTY, "@12", "bai")
+        self.assertEqual(r.returncode, 5)
+        s = f.read()
+        self.assertNotIn("@agent_jump__dev_ttys000", s["globals"])
+        self.assertEqual(s["messages"], [])
+
+    def test_jump_chips_never_fall_back_to_another_client(self):
+        # display-message -c <tty> failing (the client went away between
+        # checks) must not become an untargeted message on whoever tmux picks.
+        f = self.make()
+        fake = f.bin / "tmux"
+        body = fake.read_text().replace(
+            '            else:\n                s["messages"].append([arg(c, "-c"), c[-1]])',
+            '            elif flag(c, "-c"):\n                rc = 1\n'
+            '            else:\n                s["messages"].append([arg(c, "-c"), c[-1]])')
+        self.assertNotEqual(body, fake.read_text())
+        fake.write_text(body)
+        self.assertEqual(f.run("agent-jump.sh", "jump", self.TTY, "@99", "main").returncode, 3)
+        self.assertEqual(f.read()["messages"], [])
+        # goto keeps its fallback (a human pressed a key on some client).
+        f.run("agent-jump.sh", "goto", self.TTY, "@99")
+        self.assertEqual(len(f.read()["messages"]), 1)
+
+    def test_jump_refused_is_4(self):
+        w20 = W("stash", 5)                                 # parked since the caller listed it
+        f = self.make(**{"@20": w20})
+        for args in (("@15", "stash"), ("@16", "tasks"), ("@20", "main")):
+            r = f.run("agent-jump.sh", "jump", self.TTY, *args)
+            self.assertEqual(r.returncode, 4, args)
+        s = f.read()
+        self.assertEqual(self.moves(s), [])
+        self.assertEqual((s["clients"][0]["session"], s["clients"][0]["window"]), ("main", "@10"))
+        self.assertNotIn("@agent_jump__dev_ttys000", s["globals"])
+        msgs = [m[1] for m in s["messages"]]
+        self.assertIn("parked", msgs[0])
+        self.assertIn("tasks", msgs[1])
+        self.assertIn("parked", msgs[2])
+        for m in msgs:
+            self.assertNotRegex(m, r"^(no|not|can't|cannot|invalid|unknown|failed|error)\b")
+
+    def test_jump_gone_or_left_is_3(self):
+        f = self.make()
+        r = f.run("agent-jump.sh", "jump", self.TTY, "@99", "main")         # no such window
+        self.assertEqual(r.returncode, 3)
+        r = f.run("agent-jump.sh", "jump", self.TTY, "@13", "main")         # lives in work now
+        self.assertEqual(r.returncode, 3)
+        s = f.read()
+        self.assertEqual(self.moves(s), [])
+        self.assertIn("is gone", s["messages"][0][1])
+        self.assertIn("has left main", s["messages"][1][1])
+        self.assertNotIn("@agent_jump__dev_ttys000", s["globals"])
+
+    def test_jump_select_failure_is_3_and_records_nothing(self):
+        # The window vanishes between the check and the select (the fake's
+        # select fails when the session no longer holds it): gone, no chain.
+        f = self.make()
+        fake = f.bin / "tmux"
+        body = fake.read_text().replace('if not w or sess not in', 'if True or sess not in')
+        fake.write_text(body)
+        r = f.run("agent-jump.sh", "jump", self.TTY, "@12", "bai")
+        self.assertEqual(r.returncode, 3)
+        s = f.read()
+        self.assertIn("bai:2 is gone", s["messages"][-1][1])
+        self.assertNotIn("@agent_jump__dev_ttys000", s["globals"])
+
+    def test_jump_unattached_client_is_5(self):
+        f = self.make()
+        r = f.run("agent-jump.sh", "jump", "/dev/ttys999", "@13", "work")
+        self.assertEqual(r.returncode, 5)
+        s = f.read()
+        self.assertEqual(self.moves(s), [])
+        self.assertEqual(s["messages"], [])                 # nobody to tell, never an untargeted chip
+
+    def test_jump_usage_is_2(self):
+        f = self.make()
+        for args in ((), (self.TTY,), (self.TTY, "@13")):
+            r = f.run("agent-jump.sh", "jump", *args)
+            self.assertEqual(r.returncode, 2, args)
+            self.assertIn("usage", r.stderr)
+        self.assertEqual(self.moves(f.read()), [])
+
+    def test_next_back_goto_misses_still_exit_0(self):
+        # tmux's run-shell turns a nonzero exit into a "returned N" pane, so
+        # the human-facing modes keep exit 0 on every miss.
+        f = self.make()
+        self.assertEqual(f.run("agent-jump.sh", "next", "/dev/ttys999").returncode, 0)
+        self.assertEqual(f.run("agent-jump.sh", "back", self.TTY).returncode, 0)       # no chain
+        self.assertEqual(f.run("agent-jump.sh", "goto", self.TTY, "@99").returncode, 0)
+        self.assertEqual(f.run("agent-jump.sh", "goto", self.TTY, "@16").returncode, 0)  # refused
+        e = FakeEnv({"@1": W("main", 1)}, clients=[{"tty": self.TTY, "session": "main", "window": "@1"}])
+        self.addCleanup(e.close)
+        self.assertEqual(e.run("agent-jump.sh", "next", self.TTY).returncode, 0)        # nothing needs you
+
 
 if __name__ == "__main__":
     unittest.main()

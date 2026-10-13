@@ -19,7 +19,9 @@
 //! - Alt+key (ESC + one char) is ignored, except Option-W ([`Key::AltW`], the
 //!   key that opened the popup closes it) and NEW: Option-S / Option-X
 //!   ([`Key::AltS`] / [`Key::AltX`]: next / back). ESC ESC is one Esc press
-//!   followed by whatever the second ESC starts.
+//!   followed by whatever the second ESC starts. When CuaNotch's
+//!   keyJumpToNeedy is opt+s, CuaNotch consumes ⌥S globally while it runs, so
+//!   AltS only arrives without it.
 //! - SGR mouse reports (DECSET 1006) become [`Key::Mouse`].
 //! - UTF-8 split across reads is reassembled (the Python's incremental
 //!   decoder); invalid bytes become U+FFFD.

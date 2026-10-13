@@ -33,7 +33,9 @@
 //!   [`letters::KeyMemo`]). `--once` never writes.
 //! - **Cadence.** A snapshot every [`REFRESH`] (0.5 s, so the pulse steps in
 //!   phase with `@agent_blink`); the terminal is written only when the frame
-//!   differs from the one on screen.
+//!   differs from the one on screen. A refresh that finds the client moved
+//!   to another window by someone else (CuaNotch's ⌥S) closes the menu
+//!   ([`Menu::moved_away`](state::Menu::moved_away)).
 //! - **Input** comes from a reader thread over a channel. A read that ends
 //!   inside an escape sequence waits [`keys::ESC_WAIT`] for the rest. Input
 //!   that arrived while refreshing is handled against the frame ON SCREEN
@@ -485,6 +487,9 @@ fn interactive(tmux: Tmux, client: String, tab: Tab) -> io::Result<()> {
             if usable(&src.core.snapshot, &live.snap) {
                 live.snap = src.core.snapshot.clone();
                 menu.set_data(d);
+                if menu.moved_away {
+                    return Ok(()); // the client went elsewhere: don't sit stale over it
+                }
             } else {
                 src.core.snapshot = live.snap.clone(); // keep the last good frame
             }

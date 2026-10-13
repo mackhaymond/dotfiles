@@ -6,7 +6,9 @@
 //!   (no second key, no wait); ↑/↓, C-n/C-p, PgUp/PgDn, Home/End and the
 //!   wheel move; ⏎ goes to the selected row (the `▪ N parked` row opens the
 //!   Parked filter); ⇥/⇧⇥ cycle the filter; `/` searches; Space opens the
-//!   actions strip; ⌥S / ⌥X go next / back; Esc / C-c close.
+//!   actions strip; ⌥S / ⌥X go next / back; Esc / C-c close. (When CuaNotch's
+//!   keyJumpToNeedy is opt+s it owns ⌥S globally, so the popup's ⌥S only
+//!   fires while CuaNotch isn't running.)
 //! - **Search** (`/`): typed characters (letters and digits included) filter
 //!   the list; ⏎ goes to the selected match; Esc leaves the search and clears
 //!   it (a second Esc closes); Backspace on an empty query leaves it.
@@ -33,6 +35,12 @@
 //!   neither confirms nor cancels.
 //! - A confirm acts on the window as it is NOW: gone, or moved to another
 //!   session meanwhile, refuses with the reason (the core's re-check).
+//! - Moved out from under: when a refresh shows the client on another
+//!   window than at open and the menu did not cause it (CuaNotch's ⌥S jump,
+//!   anything external), [`Menu::moved_away`] is set and the loop closes the
+//!   popup rather than leave it stale over the new window. A missing client
+//!   row never counts; the menu's own go/next/back close it anyway, and its
+//!   own park/close of the client's window is followed, not closed on.
 
 use super::keys::{Key, Mouse};
 use super::letters::ALPHABET;
@@ -227,6 +235,16 @@ pub struct Menu {
     /// The filter `rows` was built for (the fallback walks the previous
     /// rows of the same filter).
     rows_tab: Tab,
+    /// The client's window (its snapshot client row) when the menu opened,
+    /// or the first frame that had the row: see [`Menu::moved_away`].
+    home_win: Option<String>,
+    /// Windows this menu parked or closed: the client leaving one of them
+    /// is the menu's own doing, so the menu follows instead of closing.
+    acted_on: Vec<String>,
+    /// The client's window changed under the open menu and the menu did not
+    /// cause it (CuaNotch's ⌥S jump, a click on the tab bar, any outside
+    /// switch): the popup is stale over the new window, so the loop closes.
+    pub moved_away: bool,
 }
 
 impl Menu {
@@ -253,9 +271,30 @@ impl Menu {
             preview_rows: 0,
             drawn_sel: None,
             rows_tab: tab,
+            home_win: None,
+            acted_on: Vec::new(),
+            moved_away: false,
         };
+        m.track_client();
         m.rebuild();
         m
+    }
+
+    /// Follow the client's window. The first frame only records it; a
+    /// missing client row (a snapshot that timed out, the client between
+    /// sessions) changes nothing. Only a row that is present and names
+    /// another window counts: after the menu's own park/close of the home
+    /// window the new window becomes home, anything else sets
+    /// [`moved_away`](Self::moved_away). The menu's go / next / back never
+    /// get here: a move that ran closes the menu on the spot.
+    fn track_client(&mut self) {
+        let Some(cur) = self.data.view.cur_win.clone().filter(|w| !w.is_empty()) else { return };
+        match &self.home_win {
+            None => self.home_win = Some(cur),
+            Some(h) if *h == cur => {}
+            Some(h) if self.acted_on.contains(h) => self.home_win = Some(cur),
+            Some(_) => self.moved_away = true,
+        }
     }
 
     /// The user picked the current selection: keys may act on it before
@@ -264,10 +303,11 @@ impl Menu {
         self.drawn_sel = self.selected_target();
     }
 
-    /// A new refresh's data.
+    /// A new refresh's data. Check [`moved_away`](Self::moved_away) after.
     pub fn set_data(&mut self, data: Data) {
         if data != self.data {
             self.data = data;
+            self.track_client();
             self.rebuild();
         }
     }
@@ -471,7 +511,11 @@ impl Menu {
             Action::Close => fx.close(&t.win, &t.session),
         };
         match r {
-            Ok(m) => self.say(m),
+            Ok(m) => {
+                // Parking or closing the client's own window moves the client.
+                self.acted_on.push(t.win.clone());
+                self.say(m)
+            }
             Err(e) if e == TAB_MOVED => {
                 let k = if c.action == Action::Park { "s" } else { "x" };
                 self.say(format!("{TAB_MOVED} · press ␣ {k} again"));
@@ -1116,6 +1160,53 @@ pub(crate) mod tests {
         assert_eq!(m.sel, sel);
         m.handle(&[Esc], &mut NoEffects);
         assert_eq!(m.sel, sel);
+    }
+
+    /// The client moved under the open menu (CuaNotch's ⌥S, a tab click):
+    /// close. The first frame, a missing client row, and the menu's own
+    /// park/close of the client's window never count.
+    #[test]
+    fn closes_when_moved_out_from_under() {
+        let at = |w: Option<&str>| {
+            let mut d = data();
+            d.view.cur_win = w.map(String::from);
+            d
+        };
+        let mut m = menu_of(at(Some("@2"))); // the first frame only records
+        assert!(!m.moved_away);
+        for w in [None, Some(""), Some("@2")] {
+            m.set_data(at(w)); // a missing row is transient; @2 is home
+            assert!(!m.moved_away, "{w:?}");
+        }
+        m.set_data(at(Some("@6")));
+        assert!(m.moved_away);
+        // Opened while the row was missing: the first present one is home.
+        let mut m = menu_of(at(None));
+        m.set_data(at(Some("@6")));
+        assert!(!m.moved_away);
+        m.set_data(at(Some("@7")));
+        assert!(m.moved_away);
+        // The menu parked the client's own window: follow, don't close...
+        let mut fx = Rec::default();
+        let mut m = menu_of(at(Some("@6")));
+        m.handle(&keys(" s"), &mut fx);
+        m.frame_shown();
+        m.act(Char('y'), &mut fx);
+        assert_eq!(fx.calls, ["park @6 work"]);
+        m.set_data(at(Some("@7")));
+        assert!(!m.moved_away);
+        // ...but a move after that is someone else's.
+        m.set_data(at(Some("@3")));
+        assert!(m.moved_away);
+        // Parking ANOTHER window doesn't excuse a move off home.
+        let mut fx = Rec::default();
+        let mut m = menu_of(at(Some("@2")));
+        m.handle(&keys(" s"), &mut fx);
+        m.frame_shown();
+        m.act(Char('y'), &mut fx);
+        assert_eq!(fx.calls, ["park @6 work"]);
+        m.set_data(at(Some("@7")));
+        assert!(m.moved_away);
     }
 
     #[test]
