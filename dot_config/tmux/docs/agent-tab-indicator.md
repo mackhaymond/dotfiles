@@ -119,9 +119,18 @@ tmux's verdict:
   not read as seen.
 
 CuaNotch reconciles on the notice (debounced), on wake and unlock, at launch,
-and on an ⌥S press it can't explain. It acks a done or input row whose pane is
-idle or unset with `@agent_seen_at` no earlier than 1 s before the row's
-`state_ts`.
+and on an ⌥S press it can't explain (cua-notch b8d191a). It acks a done or
+input row whose pane is idle or unset, according to when `@agent_seen_at` falls
+against the row's `state_ts`:
+- **a later second:** acked, whatever the kind;
+- **the same second, or the second before:** acked only if `@agent_detail_kind`
+  names this event (`done` for a done row, `perm`/`ask`/`note` for an input
+  row). A gate seen a moment before an unseen finish must not ack the finish.
+  That also means a `clear_state` within about 1 s of the event can't ack,
+  because it unsets the kind.
+
+Changing the stamp's units (whole epoch seconds) or the detail kinds breaks
+this. Tell the CuaNotch team first.
 
 Three components maintain and render them:
 
