@@ -82,6 +82,21 @@ Two per-window tmux user options are the single source of truth:
 
   Both are written by `set_state` in the **same tmux command list** as `@agent_state`/`@agent_since`, even when the state itself is unchanged, so a reader never pairs a new state with an older event's detail. Unset by `SessionStart` (except `source=compact`, which fires mid-turn), by `clear_state`, and by the watcher GC; the watcher's codex turn-end reconcile also writes them (`done`/`turn finished`, or unset after an abort; see the watcher section); never touched by the heartbeat (it stays fork-free) or the focus discharge. A `Notification` names no tool, so it never overwrites a `perm`/`ask` its `PermissionRequest` twin already wrote (one extra `show-options`, only on that event); landing first, it stands in as `perm <Tool>` parsed from "…permission to use <Tool>". The detail of a `Stop` held `running` by background work is still `done`. Text is untrusted and sanitized in the same jq call that extracts it (one fork per event): one line, no `#` `"` `%`, no control characters (C0, DEL, C1, U+2028/9) and no invisible/bidi controls (U+200B–200F, U+202A–202E, U+2060–2069, U+FEFF, U+061C), whitespace collapsed, leading/trailing `;`/space dropped (a tmux argv element ending in `;` terminates the command list), ≤ 80 code points with a trailing `…` when cut. Every value is sliced (4000, then 1000 code points) *before* any per-character work: unbounded, the sanitizer was quadratic (a 152 KB heredoc took 16 s), which blocks a permission dialog or prompt submission and gets a Codex hook killed at its 10 s timeout, state write included; bounded, a 1 MB payload costs ~20 ms of jq, and a jq failure yields the bare kind, never a lost state write. The detail rides in globals (`dkind`/`dtext`, consumed by the next `set_state`), so every call site stays `set_state "$win" <state>` — cua-notch's `dev/check-invariants` pins `        set_state "$win" failed` verbatim. Values reach tmux only as `set-option` argv: stored verbatim, and `list-windows -F '#{@agent_detail}'` expands them without re-parsing formats inside (checked on a scratch tmux 3.7c server).
 
+**External reader: CuaNotch's tmux-seen ack** (cua-notch 2b0a2ec). When an
+agent finishes or asks while the user is looking at its tab, the indicator's
+`viewing_now` branch writes `idle` instead of tinting. CuaNotch then
+acknowledges its own row at the same moment instead of after its flare grace,
+by reading `#{@agent_state} #{@agent_pending} #{@agent_detail_kind}
+#{pane_pid} #{@agent_since}` for the row's pane. It relies on these values
+staying as they are:
+- `@agent_detail_kind` `done` with `@agent_since` `"<epoch> idle"` for a seen
+  finish;
+- `perm`/`ask`/`note` with `@agent_pending` set for a seen question.
+
+Renaming a detail kind or changing the `@agent_since` format breaks that ack
+silently: CuaNotch just falls back to its flare-and-poll. Tell the CuaNotch
+team first.
+
 Three components maintain and render them:
 
 ### 1. `scripts/agent-tab-indicator.sh` (event-driven)
