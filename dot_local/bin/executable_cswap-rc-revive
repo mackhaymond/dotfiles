@@ -1,0 +1,252 @@
+#!/usr/bin/python3 -I
+"""Turn Remote Control back on in Claude sessions after a cswap account switch.
+
+Claude Code binds a session's Remote Control bridge to the account it was
+opened under. When cswap swaps the shared Keychain credential, the bridge
+tears down, and its auth-revive watcher deliberately disarms on a
+different-account credential, so RC stays off until someone runs
+/remote-control in that session again.
+
+This runs right after `cswap auto --once` on the same launchd tick
+(com.mackhaymond.cswap-auto). Each tick it:
+  1. records which live sessions have RC on (bridgeSessionId in
+     ~/.claude/sessions/<pid>.json),
+  2. notices an account change (cswap's sequence.json, read locally; no
+     usage-endpoint calls),
+  3. for sessions that had RC on before the change and have since lost it,
+     types /remote-control into their tmux pane, but only when the input box
+     is verifiably empty and the user isn't typing in that pane.
+/remote-control is an immediate command, so it runs even mid-turn without
+interrupting the turn. Sessions where RC was off before the switch are left
+alone.
+"""
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
+SEQUENCE = os.path.join(HOME, ".claude-swap-backup", "sequence.json")
+STATE_DIR = os.path.join(HOME, ".local", "state", "cswap-rc-revive")
+STATE = os.path.join(STATE_DIR, "state.json")
+
+PENDING_TTL = 60 * 60      # give up on a switch's revivals after this long
+MAX_ATTEMPTS = 2           # /remote-control injections per session per switch
+RETRY_GAP = 150            # seconds between injections into the same session
+TYPING_GRACE = 20          # skip the pane the user is focused on if active this recently
+
+RULE = "─"            # ─ border above/below the prompt box
+DIM_PLACEHOLDER = re.compile(r"^(\x1b\[[0-9;]*m)*\x1b\[2m[^\x1b]*\x1b\[0m\s*$")
+SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def log(msg):
+    print(time.strftime("%H:%M:%S") + "  rc-revive: " + msg, flush=True)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def live_sessions():
+    """pid -> session record for live interactive tmux-hosted sessions."""
+    out = {}
+    try:
+        names = os.listdir(SESSIONS_DIR)
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        rec = read_json(os.path.join(SESSIONS_DIR, name))
+        if not isinstance(rec, dict):
+            continue
+        pid = rec.get("pid")
+        if not isinstance(pid, int) or rec.get("kind") != "interactive":
+            continue
+        if not rec.get("tmux") or not pid_alive(pid):
+            continue
+        out[str(pid)] = rec
+    return out
+
+
+def current_account():
+    seq = read_json(SEQUENCE, {}) or {}
+    num = seq.get("activeAccountNumber")
+    acct = (seq.get("accounts") or {}).get(str(num)) or {}
+    return acct.get("uuid") or (str(num) if num is not None else None)
+
+
+def tmux(*args):
+    r = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=5)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "tmux exit %d" % r.returncode)
+    return r.stdout
+
+
+def ppid_of(pid):
+    r = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                       capture_output=True, text=True, timeout=5)
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def pane_ready(pane, pid):
+    """Return (ok, reason). ok means the prompt box is empty and
+    nobody is typing there."""
+    fmt = "#{pane_pid}\t#{pane_in_mode}\t#{cursor_x}\t#{cursor_y}\t#{session_name}\t#{window_active}\t#{pane_active}\t#{session_attached}"
+    info = tmux("display-message", "-p", "-t", pane, fmt).rstrip("\n").split("\t")
+    pane_pid, in_mode, cx, cy, sess, win_active, pane_active, attached = info
+    pid = int(pid)
+    if int(pane_pid) != pid and ppid_of(pid) != int(pane_pid):
+        return False, "pane no longer hosts this session"
+    if in_mode != "0":
+        return False, "pane in copy mode"
+    if attached != "0" and win_active == "1" and pane_active == "1":
+        now = time.time()
+        for line in tmux("list-clients", "-F", "#{client_session}\t#{client_activity}").splitlines():
+            csess, act = line.split("\t")
+            if csess == sess and act.isdigit() and now - int(act) < TYPING_GRACE:
+                return False, "user active in this pane"
+
+    lines = tmux("capture-pane", "-p", "-e", "-t", pane).split("\n")
+    cy = int(cy)
+    if cy < 1 or cy + 1 >= len(lines):
+        return False, "cursor off the prompt box"
+    plain = [SGR.sub("", l) for l in lines]
+    above, cur, below = plain[cy - 1], plain[cy], plain[cy + 1]
+    if not (above.strip().startswith(RULE * 4) and below.strip().startswith(RULE * 4)):
+        return False, "no single-line prompt box at cursor (dialog or draft?)"
+    if not cur.startswith("❯") or cx != "2":
+        return False, "cursor not at an empty prompt"
+    rest = lines[cy]
+    rest = rest[rest.index("❯") + 1:].lstrip("  ")
+    if SGR.sub("", rest).strip() and not DIM_PLACEHOLDER.match(rest):
+        return False, "prompt has a draft"
+    # Vim mode draws "-- INSERT --"/"-- VISUAL --" below the box but nothing in
+    # NORMAL, so only a positive INSERT is safe to type into. (No Escape/i
+    # here: Escape interrupts a running turn.)
+    if vim_mode() and "-- INSERT --" not in "\n".join(plain[cy + 2:]):
+        return False, "vim mode not INSERT"
+    return True, ""
+
+
+def vim_mode():
+    settings = read_json(os.path.join(HOME, ".claude", "settings.json"), {}) or {}
+    return settings.get("editorMode") == "vim"
+
+
+def inject(pane):
+    tmux("send-keys", "-t", pane, "-l", "/remote-control")
+    time.sleep(0.6)  # let the slash-command menu settle before Enter
+    tmux("send-keys", "-t", pane, "Enter")
+
+
+def main():
+    now = time.time()
+    state = read_json(STATE, {}) or {}
+    sessions = live_sessions()
+    rc_on = {pid: rec["bridgeSessionId"] for pid, rec in sessions.items()
+             if isinstance(rec.get("bridgeSessionId"), str)}
+
+    acct = current_account()
+    prev_acct = state.get("account")
+    pending = state.get("pending") or {}
+
+    if acct and prev_acct and acct != prev_acct:
+        # Sessions may already have dropped RC by now (a manual switch up to a
+        # tick ago), so trust last tick's snapshot as well as this one.
+        before = dict(state.get("rc_on") or {})
+        before.update(rc_on)
+        for pid, bsid in before.items():
+            pending[pid] = {"bsid": bsid, "since": now, "attempts": 0, "last": 0}
+        log("account changed; watching %d session(s) for a Remote Control drop" % len(before))
+
+    for pid in list(pending):
+        p = pending[pid]
+        rec = sessions.get(pid)
+        if rec is None:
+            del pending[pid]
+            continue
+        bsid = rec.get("bridgeSessionId")
+        # Done once RC is up under a new id, or at all after we injected: a
+        # later disconnect is the user's, not the switch's.
+        if isinstance(bsid, str) and (bsid != p["bsid"] or p["attempts"] > 0):
+            log("pid %s: Remote Control back on (%s)" % (pid, bsid))
+            del pending[pid]
+            continue
+        if now - p["since"] > PENDING_TTL:
+            if not isinstance(bsid, str):
+                log("pid %s: gave up after %d attempt(s); RC still off" % (pid, p["attempts"]))
+            del pending[pid]
+            continue
+        if isinstance(bsid, str):
+            continue  # bridge not torn down (yet)
+        if p["attempts"] >= MAX_ATTEMPTS or now - p["last"] < RETRY_GAP:
+            continue
+        pane = "?"
+        try:
+            pane = rec["tmux"].rsplit(".", 1)[-1]
+            ok, why = pane_ready(pane, pid)
+            if not ok:
+                if p.get("why") != why:  # log each new reason once, not every tick
+                    log("pid %s (%s): waiting, %s" % (pid, pane, why))
+                    p["why"] = why
+                continue
+            # Count the attempt durably before typing, so a crash mid-inject
+            # can't let the next tick bypass RETRY_GAP / MAX_ATTEMPTS.
+            p["attempts"] += 1
+            p["last"] = now
+            save(acct or prev_acct, rc_on, pending, now)
+            inject(pane)
+            log("pid %s (%s): sent /remote-control (attempt %d)" % (pid, pane, p["attempts"]))
+        except Exception as e:  # tmux gone, pane closed, etc.
+            log("pid %s (%s): %s" % (pid, pane, e))
+
+    save(acct or prev_acct, rc_on, pending, now)
+
+
+def save(acct, rc_on, pending, now):
+    write_state({"account": acct, "rc_on": rc_on, "pending": pending, "at": now})
+
+
+if __name__ == "__main__":
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock = open(os.path.join(STATE_DIR, "lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(0)  # another run holds it
+    try:
+        main()
+    except Exception as e:
+        log("error: %r" % (e,))
+        sys.exit(0)
