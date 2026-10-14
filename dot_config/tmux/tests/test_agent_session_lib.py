@@ -126,6 +126,20 @@ class LibCase(unittest.TestCase):
         self.notify("a1", self.now - 100)
         self.assertEqual(self.rc("session_has_running_subagent"), "rc=1")
 
+    def test_undated_copy_does_not_unnotify(self):
+        # Claude Code 2.1.300 logs each API request as an "api-request-blob"
+        # (no timestamp) repeating the notification text. Read as epoch 0,
+        # the copy won "latest wins" and a finished subagent read as out.
+        self.subagent("a1", 100)
+        self.notify("a1", self.now - 100)
+        with self.parent.open("a") as fh:
+            fh.write(json.dumps({"type": "api-request-blob", "sessionId": SID, "hash": "h",
+                                 "message": {"role": "user", "content": [{"type": "text", "text":
+                                     "<task-notification><task-id>a1</task-id>"
+                                     "<status>completed</status></task-notification>"}]}},
+                                separators=(",", ":")) + "\n")
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=1")
+
     def test_incremental_parent_read_in_one_process(self):
         self.subagent("a1", 100)
         script = (f'session_has_running_subagent {PID}; echo "rc=$?"; '

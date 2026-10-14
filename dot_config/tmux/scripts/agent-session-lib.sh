@@ -244,7 +244,13 @@ for line in candidates(TAG.encode()):
         continue
     t = TS.search(line)
     ep = epoch(t.group(1)) if t else None
-    ids.append("%s=%d" % (m.group(1).decode(), ep or 0))
+    # Undated copies are not notifications: Claude Code 2.1.300 also logs
+    # each API request as an "api-request-blob" record (no timestamp) that
+    # repeats the notification text, and as "latest wins" its 0 overwrote
+    # the real one - a finished subagent read as still out (gear stuck on).
+    if not ep:
+        continue
+    ids.append("%s=%d" % (m.group(1).decode(), ep))
 print(begin - off + cut)
 print(" ".join(ids))' "$p" "$have" "$horizon" "${NOTIF_FIRST_CHUNK:-1048576}" 2>/dev/null)
     # Nothing at all = the interpreter failed (or the file is unreadable):
