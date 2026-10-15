@@ -1,0 +1,142 @@
+#!/bin/bash
+# kill-guard: build the tmux PATH shim (~/.local/bin/tmux) and the Touch ID
+# helper (~/.local/bin/tmux-touchid) from dot_config/tmux/kill-guard/ in the
+# chezmoi SOURCE tree. Docs: ~/.config/tmux/docs/kill-guard.md
+#
+# run_onchange: chezmoi re-runs this whenever the rendered text changes, i.e.
+# whenever a source hash below (or the Homebrew prefix / home) does. The guard
+# script itself (scripts/kill-guard.sh) is an ordinary managed file; the shim
+# finds it at run time, so editing it needs no rebuild.
+#
+# Failure policy:
+#   * Every binary is compiled to a temp file in ~/.local/bin and renamed over
+#     the old one only after it built (and, for the shim, after `tmux -V`
+#     through it prints a tmux version). A half-written binary is never live.
+#   * Shim build/smoke failure: keep the previous shim IF it still passes the
+#     same smoke test, else REMOVE it. A missing shim only drops the CLI
+#     kill-session guard (plain tmux resolves to Homebrew's, the server-side
+#     kill-server alias still guards); a broken shim would break every tmux
+#     call: status line, scripts, agents. Unguarded-but-working beats broken.
+#   * Helper build failure: keep the previous helper, warn loudly, and still
+#     exit 0, so `chezmoi apply` doesn't fail on every run and later run_
+#     scripts (zz-build-agent-ui) still get to run. With no helper at all the
+#     guard treats Touch ID as unavailable and REFUSES protected kills (fails
+#     closed); docs/kill-guard.md has the emergency bypass.
+#   * Only a shim failure makes this script exit non-zero.
+#
+# By hand (same thing, ignores the hashes):
+#   chezmoi execute-template < ~/.local/share/chezmoi/.chezmoiscripts/run_onchange_after_build-tmux-kill-guard.sh.tmpl | bash
+{{- $src := joinPath .chezmoi.sourceDir "dot_config/tmux/kill-guard" }}
+#
+# tmux-shim.c   sha256 {{ include (joinPath $src "tmux-shim.c") | sha256sum }}
+# touchid.swift sha256 {{ include (joinPath $src "touchid.swift") | sha256sum }}
+# homebrew prefix {{ .homebrew_prefix }}, home {{ .chezmoi.homeDir }}
+{{- if ne .chezmoi.os "darwin" }}
+echo "[kill-guard] not macOS; nothing to build"
+exit 0
+{{- end }}
+set -uo pipefail
+
+SRC={{ $src | quote }}
+REAL_TMUX={{ printf "%s/bin/tmux" .homebrew_prefix | quote }}
+GUARD="$HOME/.config/tmux/scripts/kill-guard.sh"
+BIN="$HOME/.local/bin"
+SHIM="$BIN/tmux"
+HELPER="$BIN/tmux-touchid"
+status=0
+
+mkdir -p "$BIN"
+
+# shim_ok PATH: the binary execs the real tmux (fast path) and gets a version.
+shim_ok() {
+    local out
+    out="$("$1" -V 2>/dev/null)" || return 1
+    case "$out" in tmux\ *) return 0 ;; esac
+    return 1
+}
+
+drop_broken_shim() {
+    if [ -e "$SHIM" ] && ! shim_ok "$SHIM"; then
+        rm -f "$SHIM"
+        echo "[kill-guard] removed broken $SHIM (tmux now resolves to $REAL_TMUX, CLI guard OFF)" >&2
+    fi
+}
+
+# --- shim ---------------------------------------------------------------------
+if [ ! -x "$REAL_TMUX" ]; then
+    echo "[kill-guard] $REAL_TMUX not found; not installing the tmux shim" >&2
+    drop_broken_shim
+    status=1
+elif ! command -v clang >/dev/null 2>&1; then
+    echo "[kill-guard] clang not found (xcode-select --install); tmux shim not built" >&2
+    drop_broken_shim
+    status=1
+else
+    tmp="$(mktemp "$BIN/.tmux-shim.new.XXXXXX")"
+    # Link under the final name in a scratch dir: the linker's ad-hoc signature
+    # takes its identifier from the output file name, so linking straight to
+    # the random temp name would make every build differ (and cmp never match).
+    work="$(mktemp -d "${TMPDIR:-/tmp}/kill-guard-build.XXXXXX")"
+    if clang -O2 -Wall -Werror \
+            -DREAL_TMUX="\"$REAL_TMUX\"" -DKILL_GUARD="\"$GUARD\"" \
+            -o "$work/tmux" "$SRC/tmux-shim.c" &&
+       cp "$work/tmux" "$tmp" && chmod 755 "$tmp" && shim_ok "$tmp"; then
+        if [ -x "$SHIM" ] && cmp -s "$tmp" "$SHIM"; then
+            rm -f "$tmp"
+            echo "[kill-guard] $SHIM is up to date"
+        elif mv -f "$tmp" "$SHIM"; then
+            echo "[kill-guard] installed $SHIM -> $REAL_TMUX (guard: $GUARD)"
+        else
+            rm -f "$tmp"
+            echo "[kill-guard] could not install $SHIM" >&2
+            drop_broken_shim
+            status=1
+        fi
+    else
+        rm -f "$tmp"
+        echo "[kill-guard] tmux shim build or smoke test FAILED" >&2
+        drop_broken_shim
+        status=1
+    fi
+    rm -rf "$work"
+fi
+
+# --- Touch ID helper ------------------------------------------------------------
+# Failures here WARN and leave $status alone (see the policy above).
+helper_warn() {
+    echo "" >&2
+    echo "[kill-guard] !!! WARNING: $1" >&2
+    if [ -x "$HELPER" ]; then
+        echo "[kill-guard] !!! the previous $HELPER stays in use" >&2
+    else
+        echo "[kill-guard] !!! there is NO Touch ID helper: kill-server and protected kill-session on the" >&2
+        echo "[kill-guard] !!! default server will be REFUSED (bypass: $REAL_TMUX kill-ser; docs/kill-guard.md)" >&2
+    fi
+    echo "" >&2
+}
+if ! command -v swiftc >/dev/null 2>&1; then
+    helper_warn "swiftc not found (xcode-select --install); $HELPER not built"
+else
+    tmp="$(mktemp "$BIN/.tmux-touchid.new.XXXXXX")"
+    # Compile in a scratch dir: swiftc drops intermediates next to its output.
+    work="$(mktemp -d "${TMPDIR:-/tmp}/kill-guard-build.XXXXXX")"
+    if (cd "$work" && swiftc -O -o "$work/tmux-touchid" "$SRC/touchid.swift") &&
+       cp "$work/tmux-touchid" "$tmp" && chmod 755 "$tmp"; then
+        # Never RUN the helper here: it would pop a real Touch ID prompt.
+        if [ -x "$HELPER" ] && cmp -s "$tmp" "$HELPER"; then
+            rm -f "$tmp"
+            echo "[kill-guard] $HELPER is up to date"
+        elif mv -f "$tmp" "$HELPER"; then
+            echo "[kill-guard] installed $HELPER"
+        else
+            rm -f "$tmp"
+            helper_warn "could not install $HELPER"
+        fi
+    else
+        rm -f "$tmp"
+        helper_warn "Touch ID helper build FAILED"
+    fi
+    rm -rf "$work"
+fi
+
+exit "$status"
