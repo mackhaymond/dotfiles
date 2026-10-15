@@ -93,11 +93,13 @@ commands with the `pty` MCP server instead (`mcp__pty__*`):
   rather than many small invocations — each call is a tool round-trip plus
   tmux client forks, and batching avoids queueing behind the per-pty
   serialization.
-- **One command per pty at a time.** Concurrent `run`s on one pty are
-  serialized (they queue), and a busy pty refuses new runs. Parallel work
-  — especially concurrent subagents, which share this session's ptys —
-  must each use their own named pty: pass `pty: "<name>"` to `run`
-  (auto-creates). Never `send_keys` a command line into a busy pane.
+- **One shell per session by default.** Sequential work goes in the
+  default `main` pty. Open a named pty (`pty: "<name>"` on `run`,
+  auto-created) only for work that truly runs in parallel — concurrent
+  subagents, which share this session's ptys, each use their own name —
+  or when you need a clean shell context. Concurrent `run`s on one pty
+  queue, and a busy pty refuses new runs. Never `send_keys` a command line
+  into a busy pane.
 - `spawn_pty(name, command?)` — for anything long-lived (dev servers,
   watchers, REPLs); never `run` a command that doesn't exit. Check on it
   with `read_pty`, interact via `send_keys` (tmux key names like `C-c`),
@@ -118,18 +120,25 @@ commands with the `pty` MCP server instead (`mcp__pty__*`):
   `launchctl kickstart -k gui/501/com.mackhaymond.tmux-pty-mcp`.
 - **Lifecycle — resume beats cleanup.** The user usually ends Claude
   sessions by closing the tmux tab, so PTYs are NOT torn down on session
-  death: every window lingers for a ~1h grace period, and if the user
+  death: every window lingers for a ~1h grace period (idle named ptys are
+  reaped sooner, see below), and if the user
   resumes the session (`claude --resume`) within it, ALL its PTYs are
   adopted back automatically — the main shell with its cwd/env intact,
   plus any spawned ones. **Check `list_ptys` at the start of any session
   that might be a resume** — adoption can take a few seconds after session
   start, so if prior shell state is expected and the list is empty, wait
   briefly and check once more before creating new state.
-- **Cleanup is still your job while working**: when a spawned process is no
-  longer needed — task done, server no longer under test — `kill_pty` it
-  right away; the grace sweep is a slow backstop (orphans reaped after ~1h),
-  not your cleanup plan, and every live PTY clutters the user's
-  `tmux attach -t agents` view.
+- **Idle named ptys clean themselves up.** The server reaps a named,
+  non-persist pty once it has sat at an idle prompt (no command in flight,
+  no background processes) for ~10 min, even while your session lives.
+  Using the name again gives a fresh shell in the same cwd, and the result
+  starts with a `[note]` that earlier env vars, functions and aliases are
+  gone. `kill_pty` is still the fastest way to free a pty you're done
+  with (a stopped server, a finished subagent task), but forgetting no
+  longer leaks a shell. Each session has a soft cap of 12 named ptys
+  (idle ones are evicted first), and new ptys are refused with an
+  explicit error above 90% of the machine's pty limit — if you hit it,
+  kill your idle ptys and tell the user which sessions the error names.
 - `spawn_pty(..., persist: true)` opts a PTY out of reaping entirely —
   it survives indefinitely until someone kills it. Use it only for
   processes genuinely worth keeping (a dev server mid-debugging), and
