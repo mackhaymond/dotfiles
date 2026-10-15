@@ -167,8 +167,16 @@ command -v tmux >/dev/null 2>&1 || exit 0
 # agent hooks both inherit TMUX="<socket>,<pid>,<session>"; anything not on the
 # default socket leaves BEFORE touching the pidfile or killing anything. Empty
 # TMUX means the tmux CLI targets the default server anyway, so that's allowed.
+# The FULL path, not the basename: a server under a private TMUX_TMPDIR is also
+# called "default" (how agents isolate tests), and it must not reap the real one.
+# Same rule as kill-guard.sh / resurrect-save.sh.
 _sock="${TMUX%%,*}"
-[ -z "$_sock" ] || [ "${_sock##*/}" = default ] || exit 0
+if [ -n "$_sock" ]; then
+    case "$_sock" in
+        "/private/tmp/tmux-${UID:-$(id -u)}/default"|"/tmp/tmux-${UID:-$(id -u)}/default") ;;
+        *) exit 0 ;;
+    esac
+fi
 
 # Singleton: every tmux.conf reload (`prefix r`) re-runs the spawn line, so a
 # plain check-then-write leaks daemons (a transiently-exiting watcher with an
