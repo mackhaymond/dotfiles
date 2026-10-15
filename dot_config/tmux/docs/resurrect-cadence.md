@@ -106,9 +106,13 @@ The hooks are all at index `[9]`:
 
 - `session-created`, `session-closed`, `session-renamed`
 - `window-linked`, `window-unlinked`
-- `after-split-window`, `after-join-pane`, `pane-exited`, `after-kill-pane`
+- `after-split-window`, `pane-exited`, `after-kill-pane`
 - `after-rename-window`
 - `client-detached`, which passes `full`
+
+tmux 3.7c has no `after-join-pane` or `after-move-pane` hook ("invalid option"),
+so a join-pane is picked up by the 1-minute fingerprint poll instead. tmux lists
+`pane-exited` under `show-hooks -gw`, not `-g`.
 
 The first caller becomes the owner by creating a mkdir lock under `$TMPDIR`
 that holds its pid. It sleeps `RESURRECT_SAVE_SOON_DELAY` (5s) and then runs
