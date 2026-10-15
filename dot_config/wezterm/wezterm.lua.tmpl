@@ -118,8 +118,9 @@ local quit_guard = wezterm.action_callback(function(window, pane)
 end)
 
 -- ── CMD+B: agent strip ─────────────────────────────────────────────────
--- An always-visible agent list (the sidebar) in a narrow split LEFT of the
--- tmux pane. CMD+B opens it, or closes it if this tab already has one.
+-- An always-visible agent list (the sidebar) in a narrow split beside the
+-- tmux pane, on the side STRIP_SIDE names. CMD+B opens it, or closes it if
+-- this tab already has one.
 --
 -- Two implementations, chosen at each CMD+B (one io.open, no fork):
 --   ~/.local/bin/agent-ui sidebar   primary: the Rust binary, built from the
@@ -148,6 +149,9 @@ end)
 -- prefix q fallback (Homebrew python3 -I -S, else /usr/bin/python3 -S, which
 -- must keep its pycache prefix).
 local STRIP_COLS = 34
+-- Which side of the tmux pane the sidebar opens on: "Right" or "Left".
+-- Takes effect at the next CMD+B (an open sidebar stays where it is).
+local STRIP_SIDE = "Right"
 local AGENT_UI = wezterm.home_dir .. "/.local/bin/agent-ui"
 local STRIP_SCRIPT = wezterm.home_dir .. "/.config/tmux/scripts/agent-roster.py"
 local STRIP_PY = '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S "$0" "$@"; '
@@ -205,7 +209,7 @@ local toggle_strip = wezterm.action_callback(function(window, pane)
         return
     end
     local new = pane:split {
-        direction = "Left",
+        direction = (STRIP_SIDE == "Left") and "Left" or "Right",
         size = STRIP_COLS,          -- >= 1: a cell count, not a fraction
         top_level = true,
         args = strip_argv(pane),

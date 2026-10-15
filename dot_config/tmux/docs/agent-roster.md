@@ -529,8 +529,9 @@ tmux keeps two GLOBAL options, each a window id (`@12`) or empty:
 
 ## WezTerm strip (`CMD+B`)
 
-An always-visible, click-only agent list in a narrow WezTerm split to the
-left of the tmux pane. `CMD+B` (wezterm.lua) opens it, and closes it again if
+An always-visible, click-only agent list in a narrow WezTerm split beside the
+tmux pane: on the right by default, or the left with `STRIP_SIDE = "Left"`
+in wezterm.lua. `CMD+B` (wezterm.lua) opens it, and closes it again if
 the tab already has one. It runs `agent-ui sidebar` when
 `~/.local/bin/agent-ui` exists (see [agent-ui](#agent-ui-primary-and-the-python-fallback));
 otherwise this same program, `agent-roster.py --strip`, which the rest of
