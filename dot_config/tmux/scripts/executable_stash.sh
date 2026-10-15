@@ -43,6 +43,22 @@
 #   stash.sh restore-state        re-apply parked state after a resurrect restore
 set -uo pipefail
 
+# A UTF-8 locale, ALWAYS. A tmux client whose locale is not UTF-8 prints every
+# control character of a -F format as "_" — and every record this script reads
+# from tmux is split on \x1f (SEP, below). Without it a publish parses no rows
+# at all; before save_state's server tests (2026-10-15) that orphaned every
+# suspended session and deleted the sidecar. Callers outside tmux (launchd,
+# the kill guard, `env -i`) need not have one, so it is fixed here, the way
+# tmux itself decides: the first non-empty of LC_ALL, LC_CTYPE, LANG.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) ;;
+    *)
+        if [ -n "${LC_ALL:-}" ]; then export LC_ALL=en_US.UTF-8
+        elif [ -n "${LC_CTYPE:-}" ]; then export LC_CTYPE=en_US.UTF-8
+        else export LANG=en_US.UTF-8
+        fi ;;
+esac
+
 HOLD=stash          # the detached holding session
 
 # Absolute, because this script re-enters itself inside a popup and
@@ -390,6 +406,25 @@ window_for_row() {
     printf '%s' "$win"
 }
 
+# Line numbers of the session-id rows in <file> that a LATER park superseded.
+#
+# A slot can be named by two rows: a session id kept for a restore that had
+# not happened (save_state keeps those until a server adopts the file), and a
+# tab parked later that took the same slot in the same directory. Both match
+# the restored window on index and cwd, and stamping the old id there would
+# resume a dead conversation in the wrong tab and cost that tab its own origin
+# and label. The slot belongs to the most recent park: a session row whose
+# park time is older than another row's for the same slot AND directory (so
+# the other row would match the very same window) is superseded. A newer row
+# in another directory cannot match that window, so it does not count; a row
+# with no park time is never superseded and never supersedes.
+superseded_sid_rows() {
+    awk -F"$SEP" '{ k[NR] = $1 FS $2 FS (($8 != "") ? $8 : $10); t[NR] = $9; s[NR] = $7
+                    if ($9 ~ /^[0-9]+$/ && (!(k[NR] in m) || $9 + 0 > m[k[NR]] + 0)) m[k[NR]] = $9 }
+                  END { for (i = 1; i <= NR; i++)
+                            if (s[i] != "" && t[i] ~ /^[0-9]+$/ && m[k[i]] + 0 > t[i] + 0) print i }' "$1" 2>/dev/null
+}
+
 # Which window, if any, each parked-state row WITHOUT a session id belongs to.
 # Prints "<line number>SEP<window id>" per row it can place; silence otherwise.
 #
@@ -449,9 +484,15 @@ resolve_parked_rows() {
     done < <(tmux list-windows -t "=$HOLD" -F "#{window_id}${SEP}#{@stash_origin}#{@stash_session}#{@stash_ts}${SEP}#{automatic-rename}${SEP}#{window_name}" 2>/dev/null)
     [ -n "$bare" ] || return 0
 
-    # Windows the session-id rows lay claim to.
+    # Windows the session-id rows lay claim to — except rows a later park
+    # superseded, which restore-state will not place either, so their old
+    # slot is free for the row that took it.
+    local stale ln=0
+    stale=$'\n'$(superseded_sid_rows "$f")$'\n'
     while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd extra; do
+        ln=$((ln + 1))
         [ -n "$sid" ] || continue
+        case "$stale" in *$'\n'"$ln"$'\n'*) continue ;; esac
         w=$(window_for_row "$sess" "$idx" "$name" "$cwd" "$pidx" "$icwd") && claimed="$claimed$w "
     done < "$f"
 
@@ -519,120 +560,461 @@ resolve_parked_rows() {
 # writer either sees the option or predates the whole thing; either way the id
 # survives. Failing to get the lock is safe to skip: whoever holds it is about
 # to write, and their snapshot is newer than ours.
+#
+# NEVER JUDGE A LOSS ON A SERVER THAT HAS NOT ADOPTED THE SIDECAR.
+#
+# 2026-10-15 09:40:37 Mack's tmux server was killed. Between 09:40:38 and :42
+# backgrounded `publish`es (the window-unlinked hook) merged the sidecar
+# against a server with no `stash` session and no live claude for any of the
+# four suspended sessions, logged "has no window any more — moved to
+# stash-orphans.tsv" for all four, found nothing left to write and DELETED
+# stash-state.tsv. At 09:41:06 the post-restore restore-state found no file,
+# and all four stash windows came back "no recorded origin".
+#
+# The obvious story — the dying server answered with half its windows torn
+# down — is not what tmux does, and was tested (tmux 3.7c, a -L test server
+# with this hook and attached clients): on kill-server or SIGTERM it destroys
+# every session in one go, runs NONE of the queued window-unlinked hooks, and
+# SIGTERMs run-shell jobs still in flight (the "broke stale lock (owner dead,
+# age 0s)" lines at 09:40:38 are those victims). A job that outlives it gets
+# "no server running", which the snapshot below already treats as "keep what
+# is on disk". So the publishes that did the damage were answered by a
+# DIFFERENT, healthy server: the pty-mcp shells of the killed server all exit
+# at 09:40:37 and a second batch with fresh pane ids (%1, %2, %5, %15) at
+# 09:40:51 — a server that lived in between, started with this config and so
+# with this hook, never restored. To it the parked windows really did not
+# exist. Nothing was half-read; the server was the wrong one.
+#
+# ADOPTION. The sidecar describes the server that last owned it, and only a
+# server that has ADOPTED it may call one of its rows lost — move a session id
+# to the orphans file, or drop a parked row's origin/label/park time because
+# no window answers to it. A server has adopted the file when:
+#   a. restore-state ran on it (it sets @stash_adopted to #{start_time}): the
+#      rows were reconciled against this server's windows; or
+#   b. the file had no rows when this server came to write it: there was
+#      nothing on disk to misjudge; or
+#   c. stash-state.tsv.owner names this server (#{pid}/#{start_time}). Every
+#      save of an adopted server writes it; or
+#   d. there is no .owner at all — a sidecar from before adoption existed —
+#      and the file was last written after this server started. An
+#      unadopted server that writes the file first creates a .owner of
+#      "none", so its own writes can never pass this test later.
+# The first to apply sets @stash_adopted, which rides in the list-windows call
+# save_state already makes: an adopted server pays nothing per publish.
+#
+# Before adoption every old row the merge cannot account for is KEPT and the
+# live rows are mirrored on top: the server can only add. That covers the
+# incident's server, a server mid-restore (resurrect builds the windows before
+# restore-state puts the options back), and the same damage by another route
+# — a tab parked on a restarted server before anyone restored, after which an
+# "is anything parked here?" test would have judged every old row against
+# windows that were never brought back. `stash.sh list` shows what is kept as
+# awaiting a restore. After adoption losses orphan as they always did: a
+# suspended window closed by hand, or a resumed agent that came back under a
+# new session id, leaves no stale id behind to be stamped on another tab.
+#
+# Also, after adoption:
+#   - $TMUX names a server pid that is not the one answering: this process
+#     was started by a server that has since died, and is talking to its
+#     replacement. Nothing is judged; the disk stays as it is.
+#   - @kill_guard_shutdown holds a fresh epoch stamp (the kill guard sets it
+#     to `date +%s` just before a deliberate kill-server, then runs its own
+#     synchronous `publish`; stale or garbage stamps are ignored): the merge
+#     keeps rows as if unadopted — that publish is the final mirror — except
+#     that a parked row whose slot or key a live parked window now holds is
+#     superseded and goes; and the file is never deleted.
+#   - Otherwise an orphaning is believed only if it survives SAVE_SETTLE
+#     seconds and a re-read of the SAME server (#{pid} and #{start_time}
+#     both unchanged): a teardown in progress, a server swap or a tmux that
+#     stops answering in that window all abort with the disk untouched.
+#     That covers kills which bypass the guard. Dropped parked rows without
+#     a session id do not pay it: an unpark drops one every time.
+# A tmux that cannot report #{start_time} cannot tell one server from the next
+# at all, and gets the merge as it was before adoption existed (in practice:
+# the unit tests' fake tmux).
+SAVE_SETTLE=1.5
+GUARD_FRESH=120       # seconds a @kill_guard_shutdown stamp stays in force
+
+# --- only the DEFAULT server writes the sidecar and the orphans file ---------
+# Every server that sources tmux.conf gets the window-unlinked publish hook and
+# reads the real @resurrect-dir, so a spare `tmux -L agents` (up since Oct 13,
+# real config loaded) mirrored ITS windows over Mack's sidecar on every window
+# close: the incident's damage, from a server that is not even the one that
+# gets restored. Both checks required, each against the same test:
+#   * TMUX="<socket>,<pid>,<session>": jobs inherit it from the server that
+#     ran them. Empty means the CLI targets the default server;
+#   * #{socket_path}: whatever server the tmux CLI really talks to.
+# "The default server" is the EXACT path /tmp/tmux-$UID/default (as tmux
+# reports it, through realpath: /private/tmp/...), never "any socket named
+# default": every agent's private server under its own TMUX_TMPDIR is
+# <dir>/tmux-$UID/default too, and one that loads tmux.conf would otherwise
+# pass and write the real sidecar. A string compare — nothing to stat.
+# STASH_ALLOW_SOCKET=<exact socket path> admits one other server: the test
+# harness's opt-in for its private servers. A server that merely sources
+# tmux.conf can never match it by accident.
+# Any other server may still park and unpark (window options live on the
+# server), but writes neither file and logs nothing; that is not news.
+# A #{socket_path} that comes back EMPTY from a call that SUCCEEDED is a tmux
+# that cannot render it (only the unit tests' fake does that) and is let
+# through, like a missing #{start_time} in save_state; a call that failed
+# refuses.
+socket_ok() {
+    case "$1" in "/private/tmp/tmux-${UID}/default"|"/tmp/tmux-${UID}/default") return 0 ;; esac
+    [ -n "${STASH_ALLOW_SOCKET:-}" ] && [ "$1" = "$STASH_ALLOW_SOCKET" ]
+}
+tmux_env_socket_ok() { local t="${TMUX:-}"; t="${t%%,*}"; [ -z "$t" ] || socket_ok "$t"; }
+sidecar_socket_ok() { tmux_env_socket_ok && { [ -z "$1" ] || socket_ok "$1"; }; }
+# For a writer with no list-windows call of its own to ride on: one call.
+# list-windows, not `display-message -p`, which with no current client or
+# target needs a session to resolve; every window reports the same socket.
+server_writes_sidecar() {
+    tmux_env_socket_ok || return 1
+    local sp; sp=$(tmux list-windows -a -F '#{socket_path}' 2>/dev/null) || return 1
+    sidecar_socket_ok "${sp%%$'\n'*}"
+}
+
 save_state() {
-    local sf tmp rows live
+    local sf tmp rows live raw
+    # Not this server's file to write (see socket_ok): out before the lock, so
+    # a foreign server's publishes do not even contend for it. The
+    # #{socket_path} half rides on the snapshot below.
+    tmux_env_socket_ok || return 0
     sf=$(state_file)
 
     lock_acquire "$SAVE_LOCKDIR" || { log "sidecar busy — skipped this mirror"; return 0; }
 
-    # Every window that matters, not just the parked ones. A window can leave
-    # the holding session still carrying @stash_session — resume_agent declines
-    # when the pane is busy and tells you to try again — and the old version
-    # only mirrored windows inside HOLD, so that row was dropped at exactly the
-    # moment the window option became the sole surviving pointer.
-    #
-    # Field 9, @stash_ts (when it was parked), is APPENDED rather than slotted
-    # in beside the others: a sidecar written before it existed has 8 fields,
-    # and every reader below reads it into its own trailing variable, so an
-    # old row simply yields an empty ts and restores everything else as before.
-    # Without it a restore brought parked tabs back with no park time, and the
-    # roster showed a blank age for every one of them.
-    #
-    # Field 10, the pane directory, is appended the same way and for the same
-    # reason, for EVERY window. It is what corroborates the index when there is
-    # no @stash_cwd — a window parked without suspending its agent, or a plain
-    # shell — because window_for_row no longer accepts an auto-renamed name as
-    # identity (see there), and resurrect can restore a hand-named window as
-    # auto-renamed. It is identity only, never re-applied as an option:
-    # @stash_cwd means "a suspended agent resumes here", and stamping it on a
-    # window whose agent was never suspended would lie to every reader of it.
-    rows=$(tmux list-windows -a -F \
-        "#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@stash_pane_idx}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}${SEP}#{@stash_ts}${SEP}#{pane_current_path}" \
-        2>/dev/null) || { lock_release "$SAVE_LOCKDIR"; return 0; }   # tmux unreachable: keep what is on disk
-    # Only windows that carry something to re-apply. A parked window with NO
-    # stash options used to be mirrored anyway, as a row of a bare index and
-    # name: re-applying it can restore nothing, and since the name it carried
-    # was an auto-renamed version string it never matched either — so it
-    # logged "skipped stash:N — no matching window" on every restore, forever,
-    # reporting a loss that had already happened. (pidx alone is meaningless
-    # without the session id it locates.)
-    rows=$(printf '%s\n' "$rows" | awk -F"$SEP" -v hold="$HOLD" \
-        '$7!="" || ($1==hold && ($5!="" || $6!="" || $8!="" || $9!=""))')
-
-    # MERGE, never a blind rebuild.
-    #
-    # This used to regenerate the file purely from live state, so any sid the
-    # current server does not know about was simply not written back — and an
-    # empty result deleted the file outright. That erased every suspended
-    # conversation on the first park after a restart, because window options do
-    # not survive a restart and the post-restore hook had not repopulated them
-    # yet. Worse, on this machine the hook usually never runs at all: continuum
-    # skips auto-restore whenever a second tmux server exists, and there are
-    # always agent sockets around. So "restore did not run" is the normal case
-    # and the first prefix+H was destroying the file permanently.
-    #
-    # A sid in the old file that live state cannot account for is therefore
-    # kept, not dropped: in the sidecar if its window still plausibly exists
-    # and is simply awaiting restore, otherwise in the orphans file where
-    # `stash.sh list` prints the command to resume it by hand.
     local of; of=$(orphan_file)
-    # Session ids some window carries right now — from THIS snapshot, before
-    # the merge below adds carried-forward rows that no window holds yet.
-    local fresh_sids; fresh_sids=$(printf '%s\n' "$rows" | awk -F"$SEP" '$7!=""{print $7}')
-    if [ -f "$sf" ]; then
-        local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_extra
-        # ONCE, not per row: live_sessions reads every session file, and this
-        # ran inside the loop — O(rows) interpreter startups while holding a
-        # lock, which after a restart (many rows, no options yet) is the slowest
-        # thing in the file and was itself widening the race above.
-        live=$(live_sessions)
-        # Id-less parked rows whose window is unambiguously still here.
-        local placed; placed=$(resolve_parked_rows "$sf")
-        local o_n=0
-        # o_extra soaks up any field a later format appends, so o_icwd (and,
-        # for older rows, o_ts or o_cwd) never carries a stray separator.
-        while IFS="$SEP" read -r o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_extra; do
-            o_n=$((o_n + 1))
-            if [ -z "$o_sid" ]; then
-                # A parked window's origin, label and park time. Not
-                # irreplaceable like a session id, but the same "options do not
-                # survive a restart" problem applies: a park after a restart and
-                # before restore-state rebuilt this file from live windows that
-                # had no options yet, and silently wiped every one of these
-                # rows — the tab then sat in the stash with no origin for good.
-                # Carry it only while resolve_parked_rows can say WHICH window
-                # it is (state-less, unclaimed, no lookalike); otherwise drop
-                # it silently — an unpark looks exactly like that and is not a
-                # loss, and a guess could put this tab's label on another.
-                printf '%s\n' "$placed" | awk -F"$SEP" -v n="$o_n" '$1==n{f=1} END{exit !f}' || continue
-                rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${SEP}${o_cwd}${SEP}${o_ts}${o_icwd:+${SEP}${o_icwd}}"
-                continue
-            fi
-            printf '%s\n' "$fresh_sids" | grep -qx "$o_sid" && continue   # already represented
-            # Still a live agent? Then it is not suspended and needs no record.
-            printf '%s\n' "$live" | grep -q "${SEP}${o_sid}${SEP}" && continue
-            # Identity, not "some window has that index": after a close,
-            # renumber-windows slides a DIFFERENT window into the vacated slot,
-            # and carrying the row forward there is exactly how a suspended
-            # session's id ends up stamped on someone else.
-            if window_for_row "$o_sess" "$o_idx" "$o_name" "$o_cwd" "$o_pidx" "$o_icwd" >/dev/null; then
-                rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}${SEP}${o_ts}${o_icwd:+${SEP}${o_icwd}}"
-                log "carried forward suspended session ${o_sid%%-*} ($o_sess:$o_idx) — window exists but has no options yet"
-            else
-                mkdir -p "$(dirname "$of")" 2>/dev/null
-                # Append only if this sid is not already parked here. The file is
-                # a hand-recovery list, and re-appending the same session on
-                # every save turned one lost conversation into eight identical
-                # rows — noise that makes `stash.sh list` look like a disaster.
-                if ! grep -q "${SEP}${o_sid}${SEP}" "$of" 2>/dev/null; then
-                    printf '%s\n' "${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}${SEP}${o_ts}${o_icwd:+${SEP}${o_icwd}}" >> "$of" 2>/dev/null
-                    log "suspended session ${o_sid%%-*} has no window any more — moved to $(basename "$of")"
+    local pass=1 first_ident="" s_pid s_start s_adopt s_sock guard adopted keep fresh_sids fresh_keys
+    local notes orphan_rows n_orph n_kept lost_idless line key own m row
+    local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_extra
+    while :; do
+        # Every window that matters, not just the parked ones. A window can
+        # leave the holding session still carrying @stash_session —
+        # resume_agent declines when the pane is busy and tells you to try
+        # again — and the old version only mirrored windows inside HOLD, so
+        # that row was dropped at exactly the moment the window option became
+        # the sole surviving pointer.
+        #
+        # Field 9, @stash_ts (when it was parked), is APPENDED rather than
+        # slotted in beside the others: a sidecar written before it existed has
+        # 8 fields, and every reader below reads it into its own trailing
+        # variable, so an old row simply yields an empty ts and restores
+        # everything else as before. Without it a restore brought parked tabs
+        # back with no park time, and the roster showed a blank age for every
+        # one of them.
+        #
+        # Field 10, the pane directory, is appended the same way and for the
+        # same reason, for EVERY window. It is what corroborates the index when
+        # there is no @stash_cwd — a window parked without suspending its
+        # agent, or a plain shell — because window_for_row no longer accepts an
+        # auto-renamed name as identity (see there), and resurrect can restore
+        # a hand-named window as auto-renamed. It is identity only, never
+        # re-applied as an option: @stash_cwd means "a suspended agent resumes
+        # here", and stamping it on a window whose agent was never suspended
+        # would lie to every reader of it.
+        #
+        # The five leading fields are not row data: the answering server's
+        # #{pid} and #{start_time} (its identity, for adoption, the settle
+        # and the $TMUX test in the header), @kill_guard_shutdown,
+        # @stash_adopted and #{socket_path} (default server only). Carried on
+        # every line of the call this already made, so they cost no tmux
+        # call; the filter below strips them before anything is written.
+        raw=$(tmux list-windows -a -F \
+            "#{pid}${SEP}#{start_time}${SEP}#{@kill_guard_shutdown}${SEP}#{@stash_adopted}${SEP}#{socket_path}${SEP}#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@stash_pane_idx}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}${SEP}#{@stash_ts}${SEP}#{pane_current_path}" \
+            2>/dev/null) || { lock_release "$SAVE_LOCKDIR"; return 0; }   # tmux unreachable: keep what is on disk
+        s_pid=""; s_start=""; s_adopt=""; s_sock=""
+        IFS="$SEP" read -r s_pid s_start _ s_adopt s_sock _ <<< "$raw"
+        # Not the default server (socket_ok), or no window to say which server
+        # this is: nothing is written and nothing logged.
+        if [ -z "$raw" ] || ! sidecar_socket_ok "$s_sock"; then
+            lock_release "$SAVE_LOCKDIR"; return 0
+        fi
+
+        # Adopted? (see the header). The flag answers for free; the rest is
+        # paid once per server, by the save that establishes it — a .owner
+        # read, at most one stat and the one set-option that records it.
+        # An answer with no windows at all is never trusted to be the owner.
+        adopted=""
+        if [ -z "$raw" ]; then
+            :
+        else
+            case "$s_start" in
+                ''|*[!0-9]*) adopted=1 ;;          # cannot tell servers apart
+                *) [ "$s_adopt" = "$s_start" ] && adopted=1 ;;
+            esac
+            if [ -z "$adopted" ]; then
+                if [ ! -s "$sf" ]; then
+                    adopted=1
+                elif [ -f "$sf.owner" ]; then
+                    own=""; IFS= read -r own < "$sf.owner"
+                    [ "$own" = "${s_pid}/${s_start}" ] && adopted=1
+                else
+                    m=$(stat -f %m "$sf" 2>/dev/null)
+                    # Strictly AFTER: a file stamped in the server's own first
+                    # second may be the predecessor's last write.
+                    case "$m" in ''|*[!0-9]*) ;; *) [ "$m" -gt "$s_start" ] && adopted=1 ;; esac
                 fi
+                [ -n "$adopted" ] && tmux set-option -g @stash_adopted "$s_start" 2>/dev/null
             fi
-        done < "$sf"
+        fi
+        # Only windows that carry something to re-apply. A parked window with
+        # NO stash options used to be mirrored anyway, as a row of a bare index
+        # and name: re-applying it can restore nothing, and since the name it
+        # carried was an auto-renamed version string it never matched either —
+        # so it logged "skipped stash:N — no matching window" on every restore,
+        # forever, reporting a loss that had already happened. (pidx alone is
+        # meaningless without the session id it locates.)
+        # The same awk reports the guard flag through its exit status (3), so
+        # it costs no fork either; any other awk failure also reads as "set",
+        # which only makes this save more careful.
+        #
+        # The flag is the EPOCH the guard set it at (`set -g
+        # @kill_guard_shutdown "$(date +%s)"`), and it counts only while it is
+        # numeric and under GUARD_FRESH seconds old. A guard that dies between
+        # setting it and the kill leaves it behind on a server that lives on,
+        # and a bare "1" would then switch off orphaning on that server for
+        # good. A few seconds in the future is tolerated (same clock, but the
+        # set and this read race); garbage or anything older is "not set".
+        # $EPOCHSECONDS is a bash 5 builtin — no fork; date(1) only on an
+        # older bash.
+        guard=0
+        rows=$(printf '%s\n' "$raw" | awk -F"$SEP" -v hold="$HOLD" -v now="${EPOCHSECONDS:-$(date +%s)}" -v fresh="$GUARD_FRESH" '
+            $3 ~ /^[0-9]+$/ && now - $3 < fresh && now - $3 >= -5 { g = 1 }
+            { $0 = substr($0, length($1) + length($2) + length($3) + length($4) + length($5) + 6) }
+            $7!="" || ($1==hold && ($5!="" || $6!="" || $8!="" || $9!="")) { print }
+            END { exit g ? 3 : 0 }') || guard=1
+        # Rows the merge cannot account for are kept, not judged (header).
+        keep=""; { [ -z "$adopted" ] || [ "$guard" = 1 ]; } && keep=1
+
+        # MERGE, never a blind rebuild.
+        #
+        # This used to regenerate the file purely from live state, so any sid
+        # the current server does not know about was simply not written back —
+        # and an empty result deleted the file outright. That erased every
+        # suspended conversation on the first park after a restart, because
+        # window options do not survive a restart and the post-restore hook had
+        # not repopulated them yet. Worse, on this machine the hook usually
+        # never runs at all: continuum skips auto-restore whenever a second
+        # tmux server exists, and there are always agent sockets around. So
+        # "restore did not run" is the normal case and the first prefix+H was
+        # destroying the file permanently.
+        #
+        # A sid in the old file that live state cannot account for is
+        # therefore kept, not dropped: in the sidecar if its window still
+        # plausibly exists and is simply awaiting restore, otherwise in the
+        # orphans file where `stash.sh list` prints the command to resume it
+        # by hand — but only by a server that has adopted the file (header);
+        # before that it stays in the sidecar. Even then the merge only
+        # COLLECTS what it would orphan; nothing is appended, logged or written
+        # before the decision below.
+        #
+        # Session ids some window carries right now — from THIS snapshot,
+        # before the merge below adds carried-forward rows that no window holds
+        # yet.
+        fresh_sids=$(printf '%s\n' "$rows" | awk -F"$SEP" '$7!=""{print $7}')
+        notes=""; orphan_rows=""; n_orph=0; n_kept=0; lost_idless=0
+        if [ -f "$sf" ]; then
+            # ONCE, not per row: live_sessions reads every session file, and
+            # this ran inside the loop — O(rows) interpreter startups while
+            # holding a lock, which after a restart (many rows, no options yet)
+            # is the slowest thing in the file and was itself widening the race
+            # above.
+            live=$(live_sessions)
+            # Id-less parked rows whose window is unambiguously still here.
+            local placed; placed=$(resolve_parked_rows "$sf")
+            # What the live rows already say, as newline-framed records for a
+            # fork-free `case` lookup: K = origin/label/park time (a parked
+            # window still mirrored under its own row), L = the slot of every
+            # window that carries stash state of its own, and for parked
+            # windows D = their identity key, the same key resolve_parked_rows
+            # uses (directory, else name).
+            fresh_keys=$'\n'$(printf '%s\n' "$rows" | awk -F"$SEP" -v hold="$HOLD" '$1 != "" {
+                print "K" FS $5 FS $6 FS $9
+                print "L" FS $1 FS $2
+                if ($1 == hold)
+                    print "D" FS (($8 != "") ? "d:" $8 : (($10 != "") ? "d:" $10 : "n:" $3))
+                }')$'\n'
+            local o_n=0
+            # o_extra soaks up any field a later format appends, so o_icwd
+            # (and, for older rows, o_ts or o_cwd) never carries a stray
+            # separator.
+            while IFS="$SEP" read -r o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_extra; do
+                o_n=$((o_n + 1))
+                if [ -z "$o_sid" ]; then
+                    # A parked window's origin, label and park time. Not
+                    # irreplaceable like a session id, but the same "options do
+                    # not survive a restart" problem applies: a park after a
+                    # restart and before restore-state rebuilt this file from
+                    # live windows that had no options yet, and silently wiped
+                    # every one of these rows — the tab then sat in the stash
+                    # with no origin for good. Carry it while
+                    # resolve_parked_rows can say WHICH window it is
+                    # (state-less, unclaimed, no lookalike).
+                    if printf '%s\n' "$placed" | awk -F"$SEP" -v n="$o_n" '$1==n{f=1} END{exit !f}'; then
+                        rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${SEP}${o_cwd}${SEP}${o_ts}${o_icwd:+${SEP}${o_icwd}}"
+                        continue
+                    fi
+                    # Otherwise it is dropped, which is NOT a loss when it
+                    # carried nothing, or when its window is still parked and
+                    # mirrored by its own live row.
+                    [ -n "${o_origin}${o_label}${o_ts}" ] || continue
+                    case "$fresh_keys" in *$'\n'"K${SEP}${o_origin}${SEP}${o_label}${SEP}${o_ts}"$'\n'*) continue ;; esac
+                    # Not judged here (unadopted, or the guard is up): it stays
+                    # for restore-state, whose resolve_parked_rows refuses any
+                    # ambiguity — except when a live parked window WITH state
+                    # now holds its slot or its key (directory, else name).
+                    # Then this row is a stale copy: on an unadopted server
+                    # typically a tab unparked (or killed) since, whose row
+                    # nothing on this server will ever account for, and a tab
+                    # parked later from the same directory. Kept, the two rows
+                    # share the key d:<dir>, resolve_parked_rows refuses both
+                    # at the next restore, and the LIVE tab loses its origin
+                    # and label for good.
+                    #
+                    # Dropping the stale row, rather than teaching the restore
+                    # to prefer the newest park among duplicate keys: the
+                    # newest row is not always the live one (park X, park Y,
+                    # unpark Y — Y's stale row is the newest, and X's slot can
+                    # be Y's old one after a renumber), so "newest wins" can
+                    # put one tab's label on another, and this file's rule is
+                    # that mislabelling a tab is worse than losing a label.
+                    # Here the live window proves which row is current. The
+                    # cost: a row from an earlier server, for a tab not yet
+                    # restored, goes if a tab parked here from the same
+                    # directory takes its key — a label, never a session id.
+                    if [ -n "$keep" ]; then
+                        if [ -n "$o_cwd" ]; then key="d:$o_cwd"; elif [ -n "$o_icwd" ]; then key="d:$o_icwd"; else key="n:$o_name"; fi
+                        case "$fresh_keys" in
+                            *$'\n'"L${SEP}${o_sess}${SEP}${o_idx}"$'\n'*|*$'\n'"D${SEP}${key}"$'\n'*) continue ;;
+                        esac
+                        rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${SEP}${o_cwd}${SEP}${o_ts}${o_icwd:+${SEP}${o_icwd}}"
+                        n_kept=$((n_kept + 1))
+                        continue
+                    fi
+                    # An unpark looks exactly like this and is not a loss, and
+                    # a guess could put this tab's label on another — so it is
+                    # dropped silently (counted only for the $TMUX test).
+                    lost_idless=$((lost_idless + 1))
+                    continue
+                fi
+                printf '%s\n' "$fresh_sids" | grep -qx "$o_sid" && continue   # already represented
+                # Still a live agent? Then it is not suspended and needs no
+                # record. Dropped even under the guard: the conversation is
+                # running in a pane that resurrect saves and assistant-restore
+                # resumes, and a row kept for it would let restore-state stamp
+                # the same id on a parked window too — one conversation resumed
+                # in two places.
+                printf '%s\n' "$live" | grep -q "${SEP}${o_sid}${SEP}" && continue
+                row="${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}${SEP}${o_ts}${o_icwd:+${SEP}${o_icwd}}"
+                # Identity, not "some window has that index": after a close,
+                # renumber-windows slides a DIFFERENT window into the vacated
+                # slot, and carrying the row forward there is exactly how a
+                # suspended session's id ends up stamped on someone else. And
+                # only onto a window with no stash state of its own (the slot
+                # is not held by a live row): a tab parked busy in the same
+                # directory, landing in a dead session's old slot, matches on
+                # index and cwd alike — carried there, restore-state would
+                # stamp the dead id on it and it would lose its own origin.
+                # Nor onto a window with a live agent in it: that is the very
+                # tab an unpark resumed, whose agent came back under a NEW id
+                # (a compaction) — S1 is dead, and carrying it would re-stamp
+                # it there on the next restore, forever. A window awaiting
+                # restore-state holds a shell, not an agent. (That check
+                # forks, so it runs only for a row that got this far.)
+                local c_win=""
+                if c_win=$(window_for_row "$o_sess" "$o_idx" "$o_name" "$o_cwd" "$o_pidx" "$o_icwd") \
+                   && case "$fresh_keys" in *$'\n'"L${SEP}${o_sess}${SEP}${o_idx}"$'\n'*) false ;; *) true ;; esac \
+                   && [ -z "$(agent_pid_in_window "$c_win")" ]; then
+                    rows="${rows}"$'\n'"${row}"
+                    notes="${notes}carried forward suspended session ${o_sid%%-*} ($o_sess:$o_idx) — window exists but has no options yet"$'\n'
+                elif [ -n "$keep" ]; then
+                    # Kept where it is, for restore-state to place (or orphan,
+                    # by its own rules) once a server has adopted the file.
+                    rows="${rows}"$'\n'"${row}"
+                    n_kept=$((n_kept + 1))
+                    [ -n "$adopted" ] && notes="${notes}kept suspended session ${o_sid%%-*} ($o_sess:$o_idx) in $(basename "$sf") although no window has it — @kill_guard_shutdown is set, so this server is going down and cannot judge it lost"$'\n'
+                else
+                    orphan_rows="${orphan_rows}${row}"$'\n'
+                    n_orph=$((n_orph + 1))
+                fi
+            done < "$sf"
+        fi
+
+        # The header's after-adoption tests. Only a save that would LOSE
+        # something gets past the first `if` (an unadopted or guarded one
+        # never does); the common publish falls straight through.
+        if [ "$n_orph" -gt 0 ] || [ "$lost_idless" -gt 0 ]; then
+            local t_pid="${TMUX:-}"
+            t_pid="${t_pid#*,}"; t_pid="${t_pid%%,*}"
+            case "$t_pid" in
+                ''|*[!0-9]*) ;;
+                *)
+                    if [ -n "$s_pid" ] && [ "$t_pid" != "$s_pid" ]; then
+                        log "started by tmux server pid $t_pid but answered by pid $s_pid — that server is gone; not judging ${n_orph} suspended session(s) and ${lost_idless} parked row(s) lost, $(basename "$sf") left as it is"
+                        lock_release "$SAVE_LOCKDIR"; return 0
+                    fi ;;
+            esac
+        fi
+        if [ "$pass" = 2 ] && [ "${s_pid}/${s_start}" != "$first_ident" ]; then
+            log "tmux server changed while confirming (${first_ident} -> ${s_pid}/${s_start}); $(basename "$sf") left as it is"
+            lock_release "$SAVE_LOCKDIR"; return 0
+        fi
+        if [ "$n_orph" -gt 0 ] && [ "$pass" = 1 ]; then
+            # Test 4. Still holding the sidecar lock: the decision and the
+            # write must be one cycle (see above).
+            first_ident="${s_pid}/${s_start}"
+            pass=2
+            sleep "$SAVE_SETTLE"
+            continue
+        fi
+        break
+    done
+
+    # Decided. Orphans first, sidecar second, so a failed write never leaves a
+    # session in neither file: a row the orphans file would not take goes
+    # back into the sidecar instead.
+    if [ -n "$orphan_rows" ]; then
+        mkdir -p "$(dirname "$of")" 2>/dev/null
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            IFS="$SEP" read -r _ _ _ _ _ _ o_sid _ <<< "$line"
+            # Append only if this sid is not already parked here. The file is
+            # a hand-recovery list, and re-appending the same session on
+            # every save turned one lost conversation into eight identical
+            # rows — noise that makes `stash.sh list` look like a disaster.
+            grep -q "${SEP}${o_sid}${SEP}" "$of" 2>/dev/null && continue
+            # Braces: a failing `>>` is reported by the shell, not printf.
+            if { printf '%s\n' "$line" >> "$of"; } 2>/dev/null; then
+                log "suspended session ${o_sid%%-*} has no window any more — moved to $(basename "$of")"
+            else
+                rows="${rows}"$'\n'"${line}"
+                log "suspended session ${o_sid%%-*} has no window any more, but $(basename "$of") could not be written — kept it in $(basename "$sf")"
+            fi
+        done <<< "$orphan_rows"
     fi
+    while IFS= read -r line; do
+        [ -n "$line" ] && log "$line"
+    done <<< "$notes"
+    # Once per server, not per publish: an unrestored server keeps these on
+    # every save until restore-state runs, and each window close is a save.
+    if [ -z "$adopted" ] && [ "$n_kept" -gt 0 ]; then
+        own=""; [ -f "$sf.noted" ] && IFS= read -r own < "$sf.noted"
+        if [ "$own" != "${s_pid}/${s_start}" ]; then
+            log "this tmux server (pid $s_pid) has not adopted $(basename "$sf") — restore-state has not run on it — so $n_kept row(s) with no window here are kept for the restore, not judged lost; \`stash.sh list\` shows them"
+            { printf '%s\n' "${s_pid}/${s_start}" > "$sf.noted"; } 2>/dev/null
+        fi
+    fi
+    # The live rows went in first; with none, the kept ones start with a
+    # newline that would become an empty first line on disk.
+    while [[ $rows == $'\n'* ]]; do rows=${rows#$'\n'}; done
 
     if [ -z "$rows" ]; then
+        # Never while the guard is up: a server about to die is the one
+        # place an empty answer means nothing.
+        if [ "$guard" = 1 ]; then
+            lock_release "$SAVE_LOCKDIR"
+            return 0
+        fi
         rm -f "$sf" 2>/dev/null
         # Nothing on any window: this only folds repeats and merges pending rows.
         orphans_reconcile "$of"
@@ -651,6 +1033,20 @@ save_state() {
         # Unquoted on purpose: one uuid a word.
         # shellcheck disable=SC2086
         orphans_reconcile "$of" $fresh_sids
+        # Who wrote it (header, c and d): this server if it has adopted the
+        # file; otherwise "none" the first time, so that a later stat cannot
+        # mistake an unadopted server's own write for adoption. Rewritten only
+        # when it changes. Not with a tmux that has no #{start_time}.
+        case "$s_start" in
+            ''|*[!0-9]*) ;;
+            *)
+                own=""; [ -f "$sf.owner" ] && IFS= read -r own < "$sf.owner"
+                if [ -n "$adopted" ]; then m="${s_pid}/${s_start}"; else m="${own:-none}"; fi
+                if [ "$own" != "$m" ]; then
+                    { printf '%s\n' "$m" > "$sf.owner.$$"; } 2>/dev/null && mv -f "$sf.owner.$$" "$sf.owner" 2>/dev/null
+                    rm -f "$sf.owner.$$" 2>/dev/null
+                fi ;;
+        esac
     fi
     rm -f "$tmp" 2>/dev/null
     lock_release "$SAVE_LOCKDIR"
@@ -790,6 +1186,7 @@ forget_sids() {
     local sf tmp
     sf=$(state_file)
     [ -f "$sf" ] && [ "$#" -gt 0 ] || return 0
+    server_writes_sidecar || return 0      # the default server's file only
     lock_acquire "$SAVE_LOCKDIR" || { log "sidecar busy — could not forget discarded sids"; return 0; }
     tmp="${sf}.forget.$$"
     awk -F"$SEP" -v drop=" $* " 'index(drop, " " $7 " ") == 0' "$sf" > "$tmp" 2>/dev/null \
@@ -835,6 +1232,11 @@ apply_row() {   # <win> <origin> <label> <sid> <cwd> <pidx> <ts>
 }
 
 do_restore_state() {
+    # The sidecar and the orphans file are the DEFAULT server's (socket_ok):
+    # another server that sourced tmux.conf runs this hook too, and would
+    # stamp the real sidecar's ids on its own windows and write the real
+    # orphans file. It gets nothing, silently.
+    server_writes_sidecar || return 0
     local sf of; sf=$(state_file); of=$(orphan_file)
     local sess idx name pidx origin label sid cwd ts icwd extra win existing kept=""
 
@@ -857,16 +1259,43 @@ do_restore_state() {
     # ts is field 9 and icwd field 10, each absent from sidecars written before
     # it was mirrored; such a row reads them as "" and restores the rest.
     if [ -f "$sf" ]; then
-        # Pass 1: rows carrying a session id.
+        # Pass 1: rows carrying a session id. Not one superseded by a later
+        # park (superseded_sid_rows), and not onto a window that is already
+        # somebody's (below).
+        local stale n1=0
+        stale=$'\n'$(superseded_sid_rows "$sf")$'\n'
         while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd extra; do
+            n1=$((n1 + 1))
             [ -n "$sess" ] && [ -n "$idx" ] && [ -n "$sid" ] || continue
 
             local ok=1
-            win=$(window_for_row "$sess" "$idx" "$name" "$cwd" "$pidx" "$icwd") || ok=0
-            [ -n "$win" ] || ok=0
+            case "$stale" in *$'\n'"$n1"$'\n'*) ok=0 ;; esac
+            [ "$ok" = 1 ] && { win=$(window_for_row "$sess" "$idx" "$name" "$cwd" "$pidx" "$icwd") || ok=0; }
+            [ "$ok" = 1 ] && { [ -n "$win" ] || ok=0; }
             if [ "$ok" = 1 ]; then
-                existing=$(tmux show -wqv -t "$win" @stash_session 2>/dev/null)
-                [ -z "$existing" ] || [ "$existing" = "$sid" ] || ok=0
+                # Not onto a window that already carries stash state of its
+                # own — another session id, or the origin/park time of a tab
+                # parked on this server (a restore-state run by hand) — nor
+                # one with a live agent in it: a restored window that awaits
+                # its options holds a shell; one running an agent is that
+                # agent's — UNLESS the agent is this very session:
+                # assistant-restore runs first and resumes `claude --resume S`
+                # wherever the snapshot caught S before its SIGTERM finished,
+                # and that tab is exactly where S's row belongs. window_agent
+                # is "pid SEP sid SEP cwd", and empty unless exactly one agent
+                # is verified under the window's panes.
+                existing=$(tmux display-message -p -t "$win" "#{@stash_session}${SEP}#{@stash_origin}#{@stash_ts}" 2>/dev/null)
+                if [ -n "${existing%%"$SEP"*}" ]; then
+                    [ "${existing%%"$SEP"*}" = "$sid" ] || ok=0
+                elif [ -n "${existing#*"$SEP"}" ]; then
+                    ok=0
+                else
+                    local w_agent; w_agent=$(window_agent "$win")
+                    if [ -n "$w_agent" ]; then
+                        w_agent="${w_agent#*"$SEP"}"
+                        [ "${w_agent%%"$SEP"*}" = "$sid" ] || ok=0
+                    fi
+                fi
             fi
             if [ "$ok" != 1 ]; then
                 # Keep the pointer somewhere durable, and say so loudly.
@@ -945,6 +1374,12 @@ do_restore_state() {
         [ -n "$(tmux show -wqv -t "$w_id" @stash_origin 2>/dev/null)" ] && continue
         log "parked window $HOLD:$w_idx ($w_id, ${w_name}) has no recorded origin — its parked state was lost or it was moved in by hand; prefix+h will take it to the attached session"
     done < <(hold_exists && tmux list-windows -t "=$HOLD" -F "#{window_index}${SEP}#{window_id}${SEP}#{window_name}" 2>/dev/null)
+
+    # This server has now reconciled the sidecar against its own windows, so
+    # it may judge losses from here on (save_state's ADOPTION). Keyed to
+    # #{start_time} like everything else that must not outlive the server.
+    local st; st=$(tmux display-message -p '#{start_time}' 2>/dev/null)
+    case "$st" in ''|*[!0-9]*) ;; *) tmux set-option -g @stash_adopted "$st" 2>/dev/null ;; esac
 
     tmux set-option -g @stash_count "$(count)" 2>/dev/null
 }
@@ -2675,6 +3110,30 @@ do_list() {
             printf '%s' "$back"
         fi
         echo "  (delete $of only once none of these is lost or running by hand)"
+    fi
+
+    # Suspended sessions the sidecar is holding for a restore: save_state
+    # keeps a row no window carries until a server has ADOPTED the file
+    # (restore-state ran on it), rather than calling it lost. Until then they
+    # are in neither list above, so name them here with the same hand-resume
+    # command. Ids on a window or already in the orphans file are not
+    # repeated.
+    local sf; sf=$(state_file)
+    if [ -s "$sf" ]; then
+        local known waiting="" w_seen=" "
+        known=" $(tmux list-windows -a -F '#{@stash_session}' 2>/dev/null | tr '\n' ' ') $(cat "$of" "$of".pending.* 2>/dev/null | awk -F"$SEP" '$7 != "" { printf "%s ", $7 }') "
+        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd _ts _icwd _extra; do
+            [ -n "$sid" ] || continue
+            case "$known$w_seen" in *" $sid "*) continue ;; esac
+            w_seen="$w_seen$sid "
+            printf -v hit '    %-28s cd %s && claude --resume %s\n' "${label:-$name}" "${cwd:-${_icwd:-?}}" "$sid"
+            waiting="$waiting$hit"
+        done < "$sf"
+        if [ -n "$waiting" ]; then
+            echo
+            echo "  Suspended sessions awaiting a restore (a resurrect restore brings their tabs back; or by hand):"
+            printf '%s' "$waiting"
+        fi
     fi
 }
 
