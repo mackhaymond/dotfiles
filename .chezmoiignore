@@ -4,6 +4,16 @@ OPERATIONS.md
 
 .config/aerc/accounts.conf
 
+{{/* Agent shells can't render op:// templates: the 1Password service-account
+     token is never exported (see dot_zshenv). Without this, an agent's plain
+     `chezmoi apply` stops partway at the first one. Mack applies these three.
+     Markers match dot_zshenv's agent-shell check. */}}
+{{- if or (env "AGENT_PTY") (env "AGENT_SHELL") (env "OPENCODE") (env "OPENCODE_TERMINAL") (env "CLAUDECODE") }}
+.gitconfig
+.tmate.conf
+.config/raycast/config.json
+{{- end }}
+
 .config/nvim/**
 .config/tmux/plugins/**
 .tmux/plugins/**

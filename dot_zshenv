@@ -23,11 +23,16 @@ export PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
 # The unset drops a copy inherited from a parent started before the change.
 # Keychain entry: `security add-generic-password -s op-service-account-token`.
 unset OP_SERVICE_ACCOUNT_TOKEN
-# Agent shells (tmux-pty-mcp sets AGENT_PTY) never reach 1Password through the
-# desktop app either. With CLI integration on and the app unlocked, a bare
-# `op` (or chezmoi's onepassword* calls) there reached Mack's whole account,
-# Personal vault included, with no prompt (verified 2026-10-14).
-[[ -n "$AGENT_PTY" ]] && export OP_BIOMETRIC_UNLOCK_ENABLED=false
+# Agent shells never reach 1Password through the desktop app either. With CLI
+# integration on and the app unlocked, a bare `op` in an agent pty reached
+# Mack's whole account, Personal vault included, with no prompt (verified
+# 2026-10-14). Markers: AGENT_PTY (tmux-pty-mcp), AGENT_SHELL (set in Codex's
+# shell_environment_policy), OPENCODE / OPENCODE_TERMINAL (OpenCode),
+# CLAUDECODE (Claude Code's own Bash and `!` commands). Keep this list in sync
+# with .chezmoiignore.
+if [[ -n "$AGENT_PTY$AGENT_SHELL$OPENCODE$OPENCODE_TERMINAL$CLAUDECODE" ]]; then
+  export OP_BIOMETRIC_UNLOCK_ENABLED=false
+fi
 
 # OpenCode beta background subagents
 export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=1
