@@ -9,10 +9,11 @@
 //                       and destructive/history-rewriting git ops on the chezmoi
 //                       source repo. Emits a permissionDecision:deny JSON.
 //   PostToolUse       - remember source-repo writes this session made: by
-//                       command-text heuristics AND by evidence (anything in the
-//                       source tree, source commits, or managed live targets
-//                       whose mtime landed inside this tool call's window — see
-//                       attributeSessionWrites). Recompute the dirty set (git
+//                       command-text heuristics AND by evidence (source-tree
+//                       paths whose content changed, source commits, or managed
+//                       live targets whose mtime landed, inside the window of a
+//                       write-capable shell call that could reach chezmoi files
+//                       — see attributeSessionWrites). Recompute the dirty set (git
 //                       status self-heals). Also the managed-set TTL refresh.
 //   UserPromptSubmit  - inject the "uncommitted/unpushed/drifted chezmoi changes"
 //                       complaint as additionalContext.
@@ -45,6 +46,8 @@
 // the hook's top-level `cwd` (the Claude session cwd), exactly as for Bash, so
 // a relative write issued after a `cd` inside the pty may be misattributed.
 // Absolute / ~-prefixed paths and `cd <dir> && ...` chains are unaffected.
+// (Evidence attribution does ask tmux for the pty's cwd — see shellCwds — but
+// only to decide whether a call could reach chezmoi files at all.)
 //
 // Uses only node:child_process / node:fs / node:path, so the command may be
 // swapped from bun to node without code changes.
@@ -62,6 +65,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmdirSync,
@@ -81,7 +85,40 @@ const COLD_TTL_MS = 15_000 // cold-start retry window
 const MAX_CONTINUATIONS = 3
 const CONTINUATION_WINDOW_MS = 2 * 60 * 1000 // 120000
 
-const STATE_DIR = "/Users/mackhaymond/.claude/.chezmoi-guard"
+// TEST-ONLY overrides: chezmoi-guard.test.ts points the guard at a temp state
+// dir / claims dir / source repo / chezmoi stub / classifier / tmux stub so it
+// never reads or writes the real ones. Absent in every real hook run, where
+// each falls back to the hard-coded production value.
+//
+// They come ONLY from a command-line argument, `--test-env=<abs path to a JSON
+// file>` ({"STATE_DIR": "/…", …}), never from environment variables: bun
+// auto-loads `.env` from its cwd — the session's project directory, i.e. any
+// repo an agent happens to be working in — so an env override would let an
+// untrusted repo point SOURCE_DIR elsewhere (switching off the git-hazard hard
+// blocks) or CHEZMOI_BIN / READ_ONLY_CLASSIFIER at its own code (executed /
+// require()d). A `.env` can set variables, not the hook's argv, which comes
+// from settings.json. Every value must also be an absolute path (TMUX_SESSION:
+// a plain session name); anything else is ignored.
+const TEST_OVERRIDES: Record<string, string> = (() => {
+  const out: Record<string, string> = {}
+  const arg = process.argv.slice(2).find((a) => a.startsWith("--test-env="))
+  if (!arg) return out
+  try {
+    const file = arg.slice("--test-env=".length)
+    if (!file.startsWith("/")) return out
+    const j = JSON.parse(readFileSync(file, "utf-8"))
+    for (const [k, v] of Object.entries(j ?? {})) {
+      if (typeof v !== "string") continue
+      if (k === "TMUX_SESSION" ? /^[A-Za-z0-9_-]+$/.test(v) : v.startsWith("/")) out[k] = v
+    }
+  } catch {
+    /* unreadable: no overrides */
+  }
+  return out
+})()
+const ENV = (k: string): string | undefined => TEST_OVERRIDES[k]
+
+const STATE_DIR = ENV("STATE_DIR") ?? "/Users/mackhaymond/.claude/.chezmoi-guard"
 const SESSIONS_DIR = STATE_DIR + "/sessions"
 // Full Stop-continuation text, one file per session (see handleStop).
 const CONTINUATIONS_DIR = STATE_DIR + "/continuations"
@@ -93,13 +130,20 @@ const LOG_ROTATE_BYTES = 1_000_000 // single rotation to chezmoi-guard.log.1
 // file per chezmoi source path a session wrote by name (Edit/Write, or a shell
 // write the text heuristics resolved). Time-based evidence never outranks
 // another session's exact claim — see dropForeignClaims.
-const CLAIMS_DIR = "/Users/mackhaymond/.local/state/chezmoi-guard/claims"
+const CLAIMS_DIR = ENV("CLAIMS_DIR") ?? "/Users/mackhaymond/.local/state/chezmoi-guard/claims"
 const CLAIM_TTL_MS = 24 * 60 * 60 * 1000
 const CLAIM_OWNER = (sid: string) => `claude:${sid}`
 // The pty read-only classifier (the auto/plan-mode hook beside this one). A
 // command it calls read-only cannot have written anything, so it gets no
 // evidence attribution. Loaded lazily; a load failure means "not read-only".
-const READ_ONLY_CLASSIFIER = "/Users/mackhaymond/.claude/hooks/pty-read-only.ts"
+const READ_ONLY_CLASSIFIER = ENV("READ_ONLY_CLASSIFIER") ?? "/Users/mackhaymond/.claude/hooks/pty-read-only.ts"
+// The tmux session the pty MCP server keeps its shells in. Each window is
+// tagged @pty_claude_sid (the session_id hooks receive) and @pty_name; its
+// pane_current_path is the pty shell's cwd — see shellCwds. PTY_CWDS_FILE
+// (tests only) replaces the tmux query with a file in the same
+// `sid;;name;;path` line format.
+const TMUX_SESSION = ENV("TMUX_SESSION") ?? "agents"
+const PTY_CWDS_FILE = ENV("PTY_CWDS_FILE")
 // Fallback window length when a PostToolUse finds no PreToolUse start stamp
 // (missing tool_use_id, stamp write failed): the pty's max run timeout.
 const UNSTAMPED_WINDOW_MS = 600_000
@@ -125,6 +169,8 @@ function isShellTool(name: unknown): boolean {
 // Homebrew path and fall back to a PATH lookup of `chezmoi` (NEVER the shell
 // function). GIT_BIN is the system git.
 const GIT_BIN = "/usr/bin/git"
+// For git reads whose output scales with the dirty set (`status -uall`, logs).
+const GIT_MAX_BUFFER = 16 * 1024 * 1024
 const SUBPROC_ENV = {
   HOME: process.env.HOME ?? "",
   PATH: "/opt/homebrew/bin:/usr/bin:/bin",
@@ -139,9 +185,10 @@ function isExecutable(p: string): boolean {
   }
 }
 
-const CHEZMOI_BIN = isExecutable("/opt/homebrew/bin/chezmoi")
-  ? "/opt/homebrew/bin/chezmoi"
-  : "chezmoi"
+const CHEZMOI_BIN =
+  ENV("CHEZMOI_BIN") ??
+  (isExecutable("/opt/homebrew/bin/chezmoi") ? "/opt/homebrew/bin/chezmoi" : "chezmoi")
+const TMUX_BIN = isExecutable("/opt/homebrew/bin/tmux") ? "/opt/homebrew/bin/tmux" : "tmux"
 
 // ---------------------------------------------------------------------------
 // Path normalization (verbatim from source, HOME-based realpath/expansion)
@@ -162,7 +209,7 @@ function normalizePath(p: string): string {
   }
 }
 
-const CHEZMOI_SOURCE_DIR = normalizePath("~/.local/share/chezmoi")
+const CHEZMOI_SOURCE_DIR = normalizePath(ENV("SOURCE_DIR") ?? "~/.local/share/chezmoi")
 
 // ---------------------------------------------------------------------------
 // Debug log (best-effort, never throws; identical signature for verbatim reuse)
@@ -699,9 +746,18 @@ function foreignClaimed(state: SessionState): Set<string> {
 // Tool-call start stamps: PreToolUse records when each call began, so the
 // matching PostToolUse attributes only what changed while the tool RAN — not
 // model think-time, not the user's idle time between turns, not "since the
-// session started". Lock-free: one tiny file per in-flight call.
-//   SESSIONS_DIR/<key>.calls/<sanitized tool_use_id>   (content: start ms)
+// session started". Lock-free: one small file per in-flight call.
+//   SESSIONS_DIR/<key>.calls/<sanitized tool_use_id>
+//     {"v":2, "start":<ms>, "cwds":[...]|null, "snap":[[rel, fp], ...]}
+// `start` opens the window; `cwds` is where the shell stood when the call
+// began (null = unknown) and `snap` the source repo's dirty set with a content
+// fingerprint per path (see snapshotSourceDirty) — both only for a call that
+// can time-attribute. A bare number (pre-v2 stamp, mid-rollout) is `start`
+// alone. Consumed (unlinked) by the matching PostToolUse; a call that never
+// gets one (denied, crashed) leaves its file for opportunisticGc (24h).
 // ---------------------------------------------------------------------------
+
+type CallStamp = { start: number; cwds: string[] | null; snap?: Map<string, string> }
 
 function callStampFile(input: any): string | undefined {
   const sid = input?.session_id
@@ -710,23 +766,65 @@ function callStampFile(input: any): string | undefined {
   return `${SESSIONS_DIR}/${sessionKey(sid)}.calls/${id.replace(/[^A-Za-z0-9._-]/g, "_")}`
 }
 
-function stampToolStart(input: any): void {
+function stampToolStart(input: any, name: unknown, ti: any): void {
   try {
+    const start = Date.now()
     const f = callStampFile(input)
     if (!f) return
+    const rec: Record<string, unknown> = { v: 2, start, cwds: null }
+    const { cmd } = extractShell(ti)
+    if (shouldAttribute(name, cmd)) {
+      const cwds = shellCwds(input, name, ti)
+      rec.cwds = cwds
+      // The snapshot (one `git status` + hashing the dirty files) is only
+      // worth taking when PostToolUse will attribute this call; a call that
+      // starts somewhere that cannot reach chezmoi files and only gets there
+      // by a hop this text can't see falls back to mtime-only, as before.
+      let reach = true // a gate error fails toward attributing
+      try {
+        reach = chezmoiRelevant(cmd) || shellReachesChezmoi(cmd, cwds)
+      } catch {
+        /* keep true */
+      }
+      if (reach) {
+        const snap = snapshotSourceDirty()
+        if (snap) rec.snap = [...snap]
+      }
+    }
     mkdirSync(dirname(f), { recursive: true })
-    writeFileSync(f, String(Date.now()))
+    writeFileSync(f, JSON.stringify(rec))
   } catch {
     /* no stamp: PostToolUse falls back to UNSTAMPED_WINDOW_MS */
   }
 }
 
-function takeToolStart(input: any): number | undefined {
+function takeToolStart(input: any): CallStamp | undefined {
   const f = callStampFile(input)
   if (!f) return undefined
   try {
-    const t = Number(readFileSync(f, "utf-8"))
-    return Number.isFinite(t) && t > 0 ? t : undefined
+    const raw = readFileSync(f, "utf-8").trim()
+    if (!raw.startsWith("{")) {
+      const t = Number(raw)
+      return Number.isFinite(t) && t > 0 ? { start: t, cwds: null } : undefined
+    }
+    const j = JSON.parse(raw)
+    if (typeof j.start !== "number" || !Number.isFinite(j.start) || j.start <= 0) return undefined
+    const cwds =
+      Array.isArray(j.cwds) && j.cwds.length > 0 && j.cwds.every((c: unknown) => typeof c === "string")
+        ? (j.cwds as string[])
+        : null
+    let snap: Map<string, string> | undefined
+    if (Array.isArray(j.snap)) {
+      snap = new Map()
+      for (const e of j.snap) {
+        if (!Array.isArray(e) || typeof e[0] !== "string" || typeof e[1] !== "string") {
+          snap = undefined // malformed: no content filter rather than a partial one
+          break
+        }
+        snap.set(e[0], e[1])
+      }
+    }
+    return { start: j.start, cwds, snap }
   } catch {
     return undefined
   } finally {
@@ -769,12 +867,26 @@ function unpushedRels(rels: string[]): Set<string> {
   try {
     const raw = execFileSync(
       GIT_BIN,
-      ["-C", CHEZMOI_SOURCE_DIR, "log", "@{u}..HEAD", "--name-only", "--pretty=format:", "--", ...rels],
-      { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000, env: SUBPROC_ENV },
+      // quotePath off: a non-ASCII name must come back as the same string as
+      // its rel; literal pathspecs: a `*`/`[` in a name is not a glob.
+      [
+        "--no-optional-locks",
+        "--literal-pathspecs",
+        "-c",
+        "core.quotePath=false",
+        "-C",
+        CHEZMOI_SOURCE_DIR,
+        "log",
+        "@{u}..HEAD",
+        "--name-only",
+        "--pretty=format:",
+        "--",
+        ...rels,
+      ],
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000, env: SUBPROC_ENV, maxBuffer: GIT_MAX_BUFFER },
     )
-    for (const line of raw.split("\n")) {
-      const t = line.trim()
-      if (t && relsSet.has(t)) out.add(t)
+    for (const t of raw.split("\n")) {
+      if (t && relsSet.has(t)) out.add(t) // exact: a name may end in a space
     }
   } catch {
     // No upstream / detached HEAD / git error: fail quiet (nothing unpushed).
@@ -807,6 +919,8 @@ function unpushedRels(rels: string[]): Set<string> {
 //
 //   (a) source repo working tree: every `git status --porcelain` path whose
 //       mtime (or, for a deletion, its parent dir's mtime) is inside the window
+//       AND whose CONTENT differs from what it was when the call began (see
+//       below)
 //   (b) source repo commits made inside the window (the session committed;
 //       the push guard needs to know)
 //   (c) managed LIVE targets whose mtime is inside the window — the session
@@ -819,9 +933,332 @@ function unpushedRels(rels: string[]): Set<string> {
 // suppresses it from our report (foreignClaimed). The residual cost is one
 // extra nag (whose text says to leave unrelated paths alone); the cost of a
 // blind spot is silently losing work — accepted.
+//
+// 2026-10-15: two ways that residual got large, from one session that only
+// ever edited two files and was nagged about ~8 it never touched:
+//
+//   1. `git commit` in the source repo runs pre-commit, which stashes every
+//      UNSTAGED change in the tree and restores it ("Stashing unstaged files
+//      … Restored changes"). That rewrites every other agent's dirty file —
+//      same bytes, fresh mtime — inside our commit's window. Deterministic:
+//      every commit while anyone else had work in progress.
+//   2. A long shell call that has nothing to do with chezmoi but that the
+//      read-only classifier (rightly) won't vouch for — a 4-minute `for … do
+//      tmux …; sleep 5; done` poll, `sleep 70; launchctl print … | grep` —
+//      opened a multi-minute window and collected whatever anyone else wrote
+//      in the repo meanwhile.
+//
+// So, two filters, both only ever dropping what demonstrably isn't ours:
+//
+//   CONTENT, not mtime. The PreToolUse of a call that can time-attribute
+//   snapshots the source repo's dirty set (`git status -uall`) with a content
+//   fingerprint per path (snapshotSourceDirty: sha1 of the bytes; a symlink's
+//   target; "-" for deleted; a size+mtime stand-in for anything over
+//   MAX_HASH_BYTES or past the per-snapshot hashing budget, which degrades to
+//   the old mtime test for that path) and stores it in the call's start stamp.
+//   PostToolUse then attributes a dirty path only if it is newly dirty since
+//   the snapshot or its fingerprint changed — mtime stays as the cheap
+//   prefilter, so only paths that moved get re-hashed. Same bytes back
+//   (pre-commit's stash/restore, `touch`, an editor's no-op save) attribute
+//   nothing. Only dirty files are hashed, never the repo. No snapshot (an
+//   unstamped or pre-v2 stamp, git failed, > SNAPSHOT_MAX_ENTRIES dirty
+//   paths) or a lingering window (whose start predates the snapshot) →
+//   mtime-only, as before.
+//
+//   REACHABILITY. A shell call time-attributes only if it could plausibly
+//   write chezmoi files: chezmoiRelevant (names chezmoi, the source tree, an
+//   editor, a managed path), OR its shell stood somewhere that reaches them,
+//   sampled at PreToolUse AND PostToolUse (shellCwds: Bash's cwd; for a pty,
+//   tmux's pane_current_path of the session's window with that @pty_name;
+//   spawn_pty's cwd param, default $HOME), plus every `cd`/`pushd` target,
+//   absolute / ~ path, and `..` path in the command (shellReachesChezmoi). A
+//   directory reaches chezmoi files if it is inside the source tree, contains
+//   it or a managed target (so $HOME and above always do), or lies inside a
+//   directory that directly holds a managed target other than $HOME
+//   (~/.config/tmux/**, ~/.claude/**). Unknown anywhere counts as reachable:
+//   no tmux, no tagged window, a path word or write target built from an
+//   expansion (`"$DOTS/b.txt"` after an earlier `export DOTS=…` in the
+//   persistent pty, `$PWD/..`, `$(…)/x`, `cp x "$DEST"`), a zoxide hop (`z`,
+//   `\cd`, or — since `cd` is `alias cd=z` in Claude's Bash — a cd target
+//   that isn't an existing directory where we resolved it), `cd -`, bare
+//   `cd`, `popd`, an empty managed cache, any error in the gate itself. It
+//   fails toward the old behavior, never toward a blind spot. A bare
+//   expansion elsewhere (`-t $w`, `sleep $n`) is not a path, so a polling loop
+//   stays gated. What it does accept: a program started from an unrelated
+//   directory that writes chezmoi files by paths in its OWN code or its
+//   environment, not on its command line, is not attributed by time.
+//
+//   (c) keeps the mtime test (behind the reachability gate): fingerprinting
+//   every managed target on every write-capable call would mean hashing
+//   hundreds of files per call, and a content-identical rewrite of a live
+//   target already self-corrects — driftedTargets prunes liveTouched entries
+//   that `chezmoi status` calls clean, so it can only nag about a target that
+//   was ALREADY drifted, which the session should hear about if it worked on it.
 // ---------------------------------------------------------------------------
 
 const ATTRIB_SLACK_MS = 2000
+// Snapshot bounds (snapshotSourceDirty). Hashing is skipped above these and
+// the path falls back to a size+mtime fingerprint, i.e. the old mtime test.
+const MAX_HASH_BYTES = 5 * 1024 * 1024
+const SNAPSHOT_HASH_BUDGET = 32 * 1024 * 1024
+const SNAPSHOT_MAX_ENTRIES = 2000
+
+// The source repo's dirty paths (repo-relative): one `git status`, NUL-
+// separated (no quoting to undo) and without optional locks, so this
+// background read never takes index.lock out from under another agent's
+// `git add`/`commit` in the same tree. undefined = git failed.
+function sourceDirtyRels(): string[] | undefined {
+  try {
+    const out = execFileSync(
+      GIT_BIN,
+      ["--no-optional-locks", "-C", CHEZMOI_SOURCE_DIR, "status", "--porcelain", "-z", "-uall", "--no-renames"],
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000, env: SUBPROC_ENV, maxBuffer: GIT_MAX_BUFFER },
+    )
+    return parsePorcelainZ(out)
+  } catch {
+    return undefined
+  }
+}
+
+// `git status --porcelain -z` -> paths, exactly as on disk (no quoting to
+// undo). A rename/copy entry is `XY <dest>\0<orig>\0`: keep the destination
+// (what remains uncommitted), skip the origin.
+function parsePorcelainZ(out: string): string[] {
+  const entries = out.split("\0")
+  const paths: string[] = []
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i]
+    if (e.length <= 3) continue
+    paths.push(e.slice(3))
+    if (e[0] === "R" || e[0] === "C" || e[1] === "R" || e[1] === "C") i++
+  }
+  return paths
+}
+
+// Content fingerprint of one path: "h:<sha1>" for a regular file we are
+// allowed to hash, "l:<target>" for a symlink, "-" when gone, otherwise a
+// "s:<size>:<mtime>" stand-in (big file, budget spent, a directory such as a
+// nested repo) that changes whenever the mtime does — the old test.
+function fingerprint(abs: string, hashOk: (size: number) => boolean = (n) => n <= MAX_HASH_BYTES): string {
+  let st
+  try {
+    st = lstatSync(abs)
+  } catch {
+    return "-"
+  }
+  try {
+    if (st.isSymbolicLink()) return "l:" + readlinkSync(abs)
+    if (st.isFile() && hashOk(st.size)) return "h:" + createHash("sha1").update(readFileSync(abs)).digest("hex")
+  } catch {
+    /* unreadable: fall through to the stat stand-in */
+  }
+  return `s:${st.size}:${st.mtimeMs}`
+}
+
+// PreToolUse half of the content filter: rel -> fingerprint for every dirty
+// path. undefined (git failed, absurdly many dirty paths) = no filter.
+function snapshotSourceDirty(): Map<string, string> | undefined {
+  const rels = sourceDirtyRels()
+  if (!rels || rels.length > SNAPSHOT_MAX_ENTRIES) return undefined
+  let budget = SNAPSHOT_HASH_BUDGET
+  const snap = new Map<string, string>()
+  for (const rel of rels) {
+    snap.set(
+      rel,
+      fingerprint(resolve(CHEZMOI_SOURCE_DIR, rel), (n) => {
+        if (n > MAX_HASH_BYTES || n > budget) return false
+        budget -= n
+        return true
+      }),
+    )
+  }
+  return snap
+}
+
+// PostToolUse half: did this dirty path change since the snapshot? Newly
+// dirty counts as changed; a stand-in fingerprint is recomputed as a stand-in
+// (so it compares size+mtime, never a hash against a stat).
+function changedSinceSnapshot(abs: string, prev: string | undefined): boolean {
+  if (prev === undefined) return true
+  return fingerprint(abs, prev.startsWith("h:") ? undefined : () => false) !== prev
+}
+
+// Where a shell tool call's shell stands. null = unknown (and unknown counts
+// as reachable — see shellReachesChezmoi).
+//   - Bash: the hook's cwd (Claude Code tracks the Bash shell's cwd).
+//   - mcp__pty__run: the pty shell is persistent and the hook's cwd is the
+//     SESSION's, so ask tmux for the pane_current_path of this session's
+//     window with that pty name (tool_input.pty / .name, default "main").
+//   - mcp__pty__spawn_pty: its cwd parameter, else the server's default, $HOME.
+function shellCwds(input: any, name: unknown, ti: any): string[] | null {
+  const { workdir } = extractShell(ti)
+  if (name === "mcp__pty__spawn_pty") {
+    const d = workdir || process.env.HOME
+    return d ? [d] : null
+  }
+  const out: string[] = workdir ? [workdir] : []
+  if (name === "mcp__pty__run") {
+    const pty =
+      typeof ti?.pty === "string" && ti.pty ? ti.pty : typeof ti?.name === "string" && ti.name ? ti.name : "main"
+    const cwds = ptyWindowCwds(input?.session_id, pty)
+    if (!cwds) return null
+    out.push(...cwds)
+  } else {
+    if (typeof input?.cwd !== "string" || !input.cwd) return null
+    out.push(input.cwd)
+  }
+  return out
+}
+
+// pane_current_path of the agents-session windows tagged with this Claude
+// session and pty name (format puts the free-text path LAST). undefined on
+// any failure or no match. argv, no shell: `=agents` needs no quoting here.
+function ptyWindowCwds(sid: unknown, pty: string): string[] | undefined {
+  if (typeof sid !== "string" || !sid) return undefined
+  let out: string
+  try {
+    out = PTY_CWDS_FILE
+      ? readFileSync(PTY_CWDS_FILE, "utf-8")
+      : execFileSync(
+          TMUX_BIN,
+          ["list-windows", "-t", `=${TMUX_SESSION}`, "-F", "#{@pty_claude_sid};;#{@pty_name};;#{pane_current_path}"],
+          {
+            encoding: "utf-8",
+            stdio: ["pipe", "pipe", "ignore"],
+            timeout: 1500,
+            // Default socket only: no TMUX/TMUX_TMPDIR passthrough, which a
+            // project's `.env` could set to a fake server answering any cwd.
+            env: SUBPROC_ENV,
+          },
+        )
+  } catch {
+    return undefined
+  }
+  const cwds: string[] = []
+  for (const line of out.split("\n")) {
+    const parts = line.split(";;")
+    if (parts.length < 3 || parts[0] !== sid || parts[1] !== pty) continue
+    const p = parts.slice(2).join(";;")
+    if (p.startsWith("/")) cwds.push(p)
+  }
+  return cwds.length > 0 ? cwds : undefined
+}
+
+// Can a directory's shell reach chezmoi files with paths that don't climb
+// out of it? Inside the source tree; containing the source tree or a managed
+// target ($HOME and its ancestors always do); or inside a directory that
+// directly holds a managed target, other than $HOME itself (~/.config/tmux,
+// ~/.claude). An empty managed cache (cold start) cannot rule anything out.
+function dirReachesChezmoi(dir: string, managed: string[]): boolean {
+  const d = normalizePath(dir)
+  if (managed.length === 0 || d === "/") return true
+  if (isInChezmoiSource(d) || CHEZMOI_SOURCE_DIR.startsWith(d + "/")) return true
+  if (touchesManagedPath(d, managed)) return true
+  const home = normalizePath(process.env.HOME || "/")
+  for (const t of managed) {
+    const parent = dirname(t)
+    if (parent === "/" || parent === home || home.startsWith(parent + "/")) continue
+    if (d === parent || d.startsWith(parent + "/")) return true
+  }
+  return false
+}
+
+// The command text with single-quoted strings blanked out: what's inside
+// them is literal, never an expansion. Backslash escapes outside single quotes
+// are kept as-is (an escaped quote doesn't toggle anything).
+function outsideSingleQuotes(s: string): string {
+  let out = ""
+  let q = ""
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (q === "'") {
+      if (c === "'") q = ""
+      out += c === "'" ? "'" : " "
+      continue
+    }
+    if (c === "\\" && i + 1 < s.length) {
+      out += c + s[++i]
+      continue
+    }
+    if (q === '"') {
+      if (c === '"') q = ""
+    } else if (c === "'" || c === '"') {
+      q = c
+    }
+    out += c
+  }
+  return out
+}
+
+function isDirectory(p: string): boolean {
+  try {
+    return statSync(p).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+// The reachability gate for time attribution (see the section comment):
+// could a write-capable shell command that ran from `cwds` (null = unknown)
+// have written chezmoi files? Besides the cwds themselves it checks every
+// `cd`/`pushd` hop (resolved against every directory seen so far — an
+// over-approximation of the order), every absolute / ~ path the command
+// names, and every relative path that climbs with `..`. Unknown at any step
+// -> true: a path word built from a shell expansion (`$DOTS/x`, `${D}/x`,
+// `$(…)/x`, `$PWD/..`, or an expansion as a write target: `cp x "$DEST"`), a
+// zoxide hop (`z`, `zi`, `\cd` — Claude's Bash has `alias cd=z`, so a cd to a
+// directory that doesn't exist where we think we are goes who-knows-where),
+// `cd -`, bare `cd`, `popd`. A bare expansion in a non-path, non-target spot
+// (`tmux capture-pane -t $w`, `sleep $n`) is NOT unknown — the polling loops
+// of incident 2 must stay gated.
+function shellReachesChezmoi(cmd: string, cwds: string[] | null): boolean {
+  if (!cwds || cwds.length === 0) return true
+  const managed = readManagedCache().paths
+  const text = expandHomeVars(cmd) // $HOME / ${HOME} forms become absolute paths
+  const live = outsideSingleQuotes(text)
+  const reaches = (p: string) => isInChezmoiSource(p) || touchesManagedPath(p, managed) || dirReachesChezmoi(p, managed)
+
+  // Expansions used as paths, or as a write target.
+  if (/(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[^}]*\}|`)\//.test(live)) return true
+  if (live.includes("$(") && /\)\//.test(live)) return true
+  for (const seg of splitBashSegments(cmd)) {
+    if (pathsFromBashWriteTargets(seg).some((t) => /[$`]/.test(t))) return true
+  }
+  // Directory hops this text can't follow.
+  if (/(^|[\s;&|({])popd(?=$|[\s;&|)])/.test(text)) return true
+  if (/(?:^|[;&|({\n]|\b(?:then|do|else))[ \t]*(?:\\cd|z|zi|__zoxide_zi?)(?=$|[\s;&|)])/.test(text)) return true
+
+  const dirs = cwds.map(normalizePath)
+  const at = (target: string): string[] =>
+    target.startsWith("/") || target.startsWith("~") ? [normalizePath(target)] : dirs.map((d) => normalizePath(resolve(d, target)))
+  // [ \t], not \s: `cd\n./gen.sh` is a bare cd ($HOME), not `cd ./gen.sh`.
+  const cdRe = /(?:^|[\s;&|({])(?:cd|pushd)(?=$|[\s;&|)])((?:[ \t]+-[A-Za-z@]+(?=[ \t]))*)(?:[ \t]+(?:'([^']*)'|"([^"]*)"|([^\s;&|()]+)))?/g
+  let m: RegExpExecArray | null
+  while ((m = cdRe.exec(text)) !== null) {
+    const target = m[2] ?? m[3] ?? m[4]
+    // bare `cd` (incl. `cd # …`) -> $HOME; `cd -` -> $OLDPWD; `~user`,
+    // anything unexpanded -> unknown
+    if (target === undefined || target === "" || target.startsWith("#") || target.startsWith("-")) return true
+    if (/[$`*?[]/.test(target)) return true
+    if (target.startsWith("~") && target !== "~" && !target.startsWith("~/")) return true
+    const hops = at(target)
+    // `cd` is zoxide here: a target that isn't a directory where we resolved
+    // it is a database query, i.e. anywhere.
+    if (hops.some((h) => !isDirectory(h))) return true
+    dirs.push(...hops)
+    if (dirs.length > 64) return true // a cd chain this long: stop guessing
+  }
+  if (dirs.some((d) => dirReachesChezmoi(d, managed))) return true
+  // Absolute / ~ paths named anywhere (`make -C ~/.config/tmux/scripts`,
+  // `git -C`, `--prefix=/…`): a directory argument is a cwd too.
+  for (const p of pathsFromBashCommand(text)) if (reaches(normalizePath(p))) return true
+  for (const tok of text.split(/[\s'"|;&()<>`=:]+/)) {
+    if (!tok || tok.startsWith("/") || tok.startsWith("~") || tok.startsWith("$")) continue
+    if (!tok.split("/").includes("..")) continue
+    for (const p of at(tok)) if (reaches(p)) return true
+  }
+  return false
+}
 
 // Only shell calls can write unseen: edit-class tools write exactly their
 // file_path (remembered by name), and a command the read-only classifier
@@ -915,42 +1352,46 @@ function sweepLingering(state: SessionState): void {
   if (now > state.lingerUntil) state.lingerUntil = 0
 }
 
-function attributeSessionWrites(state: SessionState, start: number, managed: string[]): void {
+// `snap` (the call's PreToolUse dirty-set snapshot) turns on the content
+// filter for (a); without it (a) is the plain mtime test.
+function attributeSessionWrites(
+  state: SessionState,
+  start: number,
+  managed: string[],
+  snap?: Map<string, string>,
+): void {
   const now = Date.now()
   const since = start > 0 ? start - ATTRIB_SLACK_MS : 0
   const inWindow = (ms: number) => since > 0 && ms >= since && ms <= now + 1000
   const touched = new Set(state.touchedPaths)
   const live = new Set(state.liveTouched)
   let added = 0
+  let sameContent = 0
 
-  // (a) working tree
-  try {
-    const out = execFileSync(
-      GIT_BIN,
-      ["-C", CHEZMOI_SOURCE_DIR, "status", "--porcelain", "-uall", "--no-renames"],
-      { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000, env: SUBPROC_ENV },
-    )
-    for (const line of out.split("\n")) {
-      if (!line.trim()) continue
-      const rel = line.slice(3).replace(/^"|"$/g, "")
-      const abs = resolve(CHEZMOI_SOURCE_DIR, rel)
-      let t: number | undefined
+  // (a) working tree. git unavailable / not a repo: heuristics alone.
+  for (const rel of sourceDirtyRels() ?? []) {
+    const abs = resolve(CHEZMOI_SOURCE_DIR, rel)
+    if (touched.has(abs)) continue
+    let t: number | undefined
+    try {
+      t = lstatSync(abs).mtimeMs
+    } catch {
       try {
-        t = lstatSync(abs).mtimeMs
+        t = statSync(dirname(abs)).mtimeMs // deleted: the dir entry changed
       } catch {
-        try {
-          t = statSync(dirname(abs)).mtimeMs // deleted: the dir entry changed
-        } catch {
-          /* gone entirely */
-        }
-      }
-      if (t !== undefined && inWindow(t) && !touched.has(abs)) {
-        touched.add(abs)
-        added++
+        /* gone entirely */
       }
     }
-  } catch {
-    /* git unavailable / not a repo: heuristics alone */
+    if (t === undefined || !inWindow(t)) continue
+    // Moved inside the window but holds the bytes it held when the call
+    // began (pre-commit's stash/restore of someone else's work, a `touch`):
+    // nothing of ours to commit there.
+    if (snap && !changedSinceSnapshot(abs, snap.get(rel))) {
+      sameContent++
+      continue
+    }
+    touched.add(abs)
+    added++
   }
 
   // (b) commits made inside the window. HEAD is only sampled on attributing
@@ -968,8 +1409,9 @@ function attributeSessionWrites(state: SessionState, start: number, managed: str
       const gitLog = (range: string[]) =>
         execFileSync(
           GIT_BIN,
-          ["-C", CHEZMOI_SOURCE_DIR, "log", ...range, "--name-only", "--pretty=format:", `--since=${new Date(since).toISOString()}`],
-          { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000, env: SUBPROC_ENV },
+          // quotePath off: a non-ASCII name comes back as itself, not "\303…"
+          ["--no-optional-locks", "-c", "core.quotePath=false", "-C", CHEZMOI_SOURCE_DIR, "log", ...range, "--name-only", "--pretty=format:", `--since=${new Date(since).toISOString()}`],
+          { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000, env: SUBPROC_ENV, maxBuffer: GIT_MAX_BUFFER },
         )
       let raw: string
       try {
@@ -1008,7 +1450,7 @@ function attributeSessionWrites(state: SessionState, start: number, managed: str
 
   state.touchedPaths = [...touched]
   state.liveTouched = [...live]
-  if (added > 0 && VERBOSE) debugLog("attributed by evidence", { added, since })
+  if ((added > 0 || sameContent > 0) && VERBOSE) debugLog("attributed by evidence", { added, sameContent, since })
 }
 
 // Fresh `chezmoi managed` list (files, dirs, symlinks; absolute). NOT the TTL
@@ -1120,19 +1562,17 @@ function pendingTouchedPaths(
 
   const dirty = new Set<string>()
   try {
+    // -z: porcelain v1 without it QUOTES a path with a space or non-ASCII
+    // byte, which then never matched its rel — the path was pruned as clean
+    // and its claim released. -uall: an untracked file inside an untracked
+    // directory is listed as itself, not as `dir/`. Renames: parsePorcelainZ
+    // keeps the destination, which is what remains uncommitted.
     const out = execFileSync(
       GIT_BIN,
-      ["-C", CHEZMOI_SOURCE_DIR, "status", "--porcelain", "--", ...rels],
-      { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000, env: SUBPROC_ENV },
+      ["--no-optional-locks", "--literal-pathspecs", "-C", CHEZMOI_SOURCE_DIR, "status", "--porcelain", "-z", "-uall", "--", ...rels],
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000, env: SUBPROC_ENV, maxBuffer: GIT_MAX_BUFFER },
     )
-    for (const line of out.split("\n")) {
-      if (!line.trim()) continue
-      // Porcelain v1 is `XY path` or `XY old -> new`. For renames, track the
-      // destination path because that is what remains uncommitted.
-      const raw = line.slice(3)
-      const renamed = raw.includes(" -> ") ? raw.split(" -> ").pop() : raw
-      if (renamed) dirty.add(renamed)
-    }
+    for (const p of parsePorcelainZ(out)) dirty.add(p)
   } catch {
     // If status fails, fail quiet rather than blame the agent for stale or
     // unverifiable state, and do NOT prune. The normal hard guards still run.
@@ -1568,8 +2008,10 @@ function handlePreToolUse(input: any): void {
   const name = input.tool_name
   if (VERBOSE) debugLog("pretool", { session_id: input.session_id, name })
   // Start of this call's attribution window. Written before any deny below
-  // (a denied call never gets a PostToolUse; GC sweeps its stamp).
-  if (isShellTool(name)) stampToolStart(input)
+  // (a denied call never gets a PostToolUse; GC sweeps its stamp). For a call
+  // that can time-attribute it also carries the shell's cwd and the source
+  // repo's dirty-set snapshot (see the attribution section).
+  if (isShellTool(name)) stampToolStart(input, name, ti)
 
   // STEP A: edit-class tools (Edit/Write/MultiEdit/NotebookEdit). EXACT managed
   // match (mirrors the opencode BLOCKED_TOOLS path — NOT prefix; prefix on
@@ -1642,11 +2084,31 @@ function handlePostToolUse(input: any): void {
   if (VERBOSE) debugLog("posttool", { session_id: sid, name })
   // A failed edit-class call wrote nothing; a failed SHELL call may have.
   const failed = input.hook_event_name === "PostToolUseFailure"
-  const startedAt = isShellTool(name) ? takeToolStart(input) : undefined
+  const stamp = isShellTool(name) ? takeToolStart(input) : undefined
 
   // Managed-set TTL refresh lives here (non-blocking event): cheap when fresh,
   // one `chezmoi managed` spawn per 300s otherwise. PreToolUse never spawns.
   refreshManagedIfStale()
+
+  // Does this call time-attribute? Write-capable shell call AND it could
+  // reach chezmoi files: named them, or its shell stood somewhere that
+  // reaches them at the call's start (stamp) or end (sampled now; outside
+  // the session lock — it may ask tmux). No stamp -> start unknown -> yes.
+  let callAttributes = false
+  const attribCmd = isShellTool(name) ? extractShell(ti).cmd : ""
+  if (shouldAttribute(name, attribCmd)) {
+    const pre = stamp ? stamp.cwds : null
+    try {
+      callAttributes =
+        chezmoiRelevant(attribCmd) ||
+        shellReachesChezmoi(attribCmd, pre) ||
+        shellReachesChezmoi(attribCmd, shellCwds(input, name, ti))
+    } catch (e) {
+      callAttributes = true // the gate fails toward attributing, never toward a blind spot
+      debugLog("attribution gate error (attributing)", { session_id: sid, error: String(e) })
+    }
+    if (!callAttributes && VERBOSE) debugLog("attribution gated: cwd cannot reach chezmoi", { session_id: sid, cwds: pre })
+  }
 
   withSessionLock(sid, (state) => {
     // STEP remember (always; no exit_code skip — git status self-heals).
@@ -1696,12 +2158,19 @@ function handlePostToolUse(input: any): void {
     // shell call ran — or, while something we started may still be running
     // (lingerUntil), since the previous hook event (source tree, source
     // commits, managed live targets). Catches every writer the text
-    // heuristics above cannot see.
+    // heuristics above cannot see. Gated on reachability (the shell named
+    // chezmoi, or stood somewhere it could reach chezmoi files from, at the
+    // call's start or end), and filtered by content against the PreToolUse
+    // snapshot — see the attribution section.
     const now = Date.now()
     const starts: number[] = []
-    if (shouldAttribute(name, shellCmd)) starts.push(startedAt ?? Math.max(state.lastSeenAt, now - UNSTAMPED_WINDOW_MS))
-    if (state.lingerUntil > 0 && state.lastSeenAt > 0) starts.push(state.lastSeenAt)
-    if (starts.length > 0) attributeSessionWrites(state, Math.min(...starts), readManagedCache().paths)
+    if (callAttributes) starts.push(stamp?.start ?? Math.max(state.lastSeenAt, now - UNSTAMPED_WINDOW_MS))
+    const lingering = state.lingerUntil > 0 && state.lastSeenAt > 0
+    if (lingering) starts.push(state.lastSeenAt)
+    // A lingering window starts before this call's snapshot was taken, so the
+    // snapshot can't vouch for it: mtime-only then.
+    const snap = callAttributes && !lingering ? stamp?.snap : undefined
+    if (starts.length > 0) attributeSessionWrites(state, Math.min(...starts), readManagedCache().paths, snap)
     if (state.lingerUntil > 0 && now > state.lingerUntil) state.lingerUntil = 0 // final sweep done
     if (outlivesCall(input, name, ti, shellCmd)) state.lingerUntil = now + LINGER_MS
     state.lastSeenAt = now

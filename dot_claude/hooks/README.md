@@ -42,7 +42,9 @@ without a stamp, the last 10 min, never reaching back past the previous
 PostToolUse):
 
 1. source working tree: `git status --porcelain -uall` paths whose mtime (for a
-   deletion, the parent dir's mtime) is inside the window;
+   deletion, the parent dir's mtime) is inside the window AND whose content
+   differs from the call's PreToolUse snapshot (see *Content and reachability*
+   below);
 2. source commits: if HEAD moved since last look, every path in `old..new`
    committed inside the window;
 3. managed **live** targets whose mtime is inside the window → `liveTouched`.
@@ -98,6 +100,37 @@ running at the same moment another agent writes a path it never names (e.g.
 via its own opaque heredoc). Claude Code itself offers no
 per-command file list (as of 2.1.291: PostToolUse carries only stdout,
 checkpoints exclude Bash writes, `FileChanged` has no writer attribution).
+
+**Content and reachability (2026-10-15).** A session that only edited two
+files was nagged about ~8 others: (1) its `git commit` ran pre-commit, which
+stashes and restores every unstaged file in the tree — other agents' dirty
+files, same bytes, fresh mtime, inside the commit's window; (2) long
+non-chezmoi shell calls the read-only classifier won't vouch for (a 4-minute
+tmux polling loop) collected whatever anyone else wrote meanwhile. Now:
+
+- The PreToolUse of a write-capable shell call snapshots the source repo's
+  dirty set with a content fingerprint per path (sha1; symlink target; `-` for
+  deleted; size+mtime above 5 MB or past a 32 MB per-snapshot budget) into the
+  call's stamp file, `{"v":2,"start","cwds","snap":[[rel,fp],…]}`.
+  PostToolUse attributes a working-tree path only if it is newly dirty or its
+  fingerprint changed (mtime stays as the prefilter). No snapshot (old stamp,
+  git failure, >2000 dirty paths) or a lingering window → mtime only.
+- A shell call time-attributes only if it names chezmoi (`chezmoiRelevant`)
+  or its shell stood, at PreToolUse or PostToolUse, somewhere that reaches
+  chezmoi files: inside the source tree, containing it or a managed target
+  (`$HOME` and above), or inside a directory that directly holds a managed
+  target other than `$HOME` (`~/.config/tmux/**`, `~/.claude/**`). `cd` /
+  `pushd` hops and `..` paths in the command count too. The cwd is Bash's
+  hook `cwd`, a pty's tmux `pane_current_path` (window in session `agents`
+  tagged `@pty_claude_sid` = session_id and `@pty_name`), or spawn_pty's
+  `cwd` (default `$HOME`). Unknown anywhere → reachable. Live targets (3)
+  keep the mtime test behind this gate.
+
+Tests: `bun test ~/.local/share/chezmoi/dot_claude/hooks/` runs the guard as
+a subprocess against a temp repo/state. Its overrides (state/claims/source
+dir, chezmoi binary, classifier, tmux stub) are accepted ONLY from a
+`--test-env=<abs json path>` argument with absolute-path values — never from
+env vars, because bun auto-loads `.env` from the session's project dir.
 
 ### Block detail
 

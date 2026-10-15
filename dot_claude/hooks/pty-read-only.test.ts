@@ -202,4 +202,6 @@ check(decide({ permission_mode: "bypassPermissions", tool_input: { command: "ls"
 
 const total = ALLOW.length + DENY.length + AUTO_SENSITIVE.length + AUTO_ALLOW.length + 3;
 console.log(fail ? `\n${fail} FAILURES` : `\nALL PASS (${total} cases)`);
-process.exit(fail ? 1 : 0);
+// Exit only on failure: an unconditional process.exit would end a `bun test`
+// run over the whole directory before the other test files ran.
+if (fail) process.exit(1);
