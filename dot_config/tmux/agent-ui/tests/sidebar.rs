@@ -169,7 +169,7 @@ fn once_renders_the_fixture() {
     let spaces = at(&lines, " spaces");
     assert_eq!(&lines[spaces + 1..29].iter().map(|l| l.split_whitespace().nth(1).unwrap()).collect::<Vec<_>>(),
         &["main", "work", "zeta"], "{lines:#?}");
-    assert!(lines[29].starts_with(" ▸ parked 0"));
+    assert!(lines[29].starts_with(" ⏸ 0 parked"));
     assert!(!lines.iter().any(|l| l.starts_with(" log") || l.contains('═')), "{lines:#?}");
     // `--split` (gone) is ignored, not an error.
     assert_eq!(plain(&s.sidebar(&["--once", "34x30", "--client", CLIENT, "--split", "0.7"])), lines);
@@ -216,6 +216,80 @@ fn once_follows_the_scope_options() {
     let lines = once();
     assert!(!lines.iter().any(|l| l.contains("home")), "{lines:#?}");
     assert!(lines.iter().any(|l| l.starts_with(" ● work")), "{lines:#?}");
+}
+
+/// The spaces list reads each session's @space_index and @space_hidden off
+/// the window rows (session options through the window format): ⌃N labels,
+/// index order, hidden sessions left out.
+#[test]
+fn once_lists_spaces_by_space_index() {
+    let s = Server::start("idx", 80, 24);
+    s.fixture();
+    for (sess, n) in [("main", "1"), ("zeta", "2"), ("work", "3")] {
+        s.tmux(&["set-option", "-t", sess, "@space_index", n]);
+    }
+    s.tmux(&["new-session", "-d", "-s", "secret", LIFE]);
+    s.tmux(&["set-option", "-t", "secret", "@space_hidden", "1"]);
+    let lines = plain(&s.sidebar(&["--once", "34x30", "--client", CLIENT]));
+    let sp = at(&lines, " spaces");
+    let rows: Vec<&str> = lines[sp + 1..29].iter().map(|l| l.trim_end()).collect();
+    assert_eq!(rows.len(), 3, "{lines:#?}");
+    for (r, want) in rows.iter().zip([" ⌃1 ○ main", " ⌃2 ○ zeta", " ⌃3 ○ work"]) {
+        assert!(r.starts_with(want), "{want}: {lines:#?}");
+    }
+    assert!(!lines.iter().any(|l| l.contains("secret")), "{lines:#?}");
+}
+
+/// Right-click → park, end to end, with a FAKE stash.sh (`AGENT_UI_SCRIPTS`):
+/// the sidebar hands `run-shell -b` the script with `stash <win>`, the fake
+/// moves the window into `stash` like the real one, and the footer says
+/// `parked …`; a click on `⏸ N parked` runs prefix h's `unstash '' <client>`.
+#[test]
+fn right_click_parks_through_stash_sh() {
+    let s = Server::start("park", 34, 30);
+    s.fixture();
+    s.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
+    let dir = std::env::temp_dir().join(format!("agentui-park-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("log");
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> '{}'\n[ \"$1\" = stash ] || exit 0\n\
+         tmux set-option -w -t \"$2\" @stash_origin \"$(tmux display-message -p -t \"$2\" '#{{session_name}}')\"\n\
+         tmux new-session -d -s stash -n boot 'sleep 600'\ntmux move-window -s \"$2\" -t stash:\ntmux kill-window -t stash:boot\n",
+        log.display()
+    );
+    let path = dir.join("stash.sh");
+    std::fs::write(&path, script).unwrap();
+    assert!(Command::new("chmod").args(["+x", path.to_str().unwrap()]).status().unwrap().success());
+    let (state, focus) = notice_names("park");
+    let cmd = format!("env AGENT_UI_SCRIPTS={} AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}",
+        dir.display(), s.name);
+    s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
+    let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
+    wait_for("the first frame", || screen().contains("needs you"));
+    std::thread::sleep(Duration::from_millis(300));
+    let send = |bytes: &str| {
+        let hex: Vec<String> = bytes.bytes().map(|b| format!("{b:02x}")).collect();
+        let mut a = vec!["send-keys", "-t", "main:9", "-H"];
+        a.extend(hex.iter().map(String::as_str));
+        s.tmux(&a);
+    };
+    let lines: Vec<String> = screen().lines().map(String::from).collect();
+    let body = at(&lines, " agents ");
+    let y = body + lines[body..].iter().position(|l| l.contains("○ Quiet one")).unwrap() + 1;
+    let win = s.tmux(&["display-message", "-p", "-t", "work:3", "#{window_id}"]).trim().to_string();
+    send(&format!("\x1b[<2;6;{y}M\x1b[<2;6;{y}m"));
+    wait_for("the park", || s.tmux(&["list-windows", "-a", "-F", "#{session_name} #{window_id}"]).contains(&format!("stash {win}")));
+    assert_eq!(s.tmux(&["show-options", "-wqv", "-t", &win, "@stash_origin"]).trim(), "work");
+    post(&state); // tmux's window-unlinked hook does this for real
+    wait_for("the footer", || screen().contains("parked Quiet one") && screen().contains("⏸ 1 parked"));
+    // The parked line: prefix h's command, the sidebar's client in it.
+    let lines: Vec<String> = screen().lines().map(String::from).collect();
+    let last = lines.iter().rposition(|l| l.starts_with(" ⏸ ")).unwrap() + 1;
+    send(&format!("\x1b[<0;3;{last}M\x1b[<0;3;{last}m"));
+    wait_for("the unstash", || std::fs::read_to_string(&log).unwrap_or_default().contains(&format!("unstash  {CLIENT}")));
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().next(), Some(format!("stash {win}").as_str()));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Test-only notice names, so nothing real wakes (and real posts do not

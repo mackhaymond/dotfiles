@@ -20,7 +20,10 @@
 //!   resolved, a `wezterm cli list` that finds the CMD+B pane gone, or
 //!   nothing else in the tab, ends it too ([`wezterm::alone_in`]).
 //! - **Clicks only.** A left press acts on what was drawn at that cell
-//!   ([`Target`]), resolved against the frame ON SCREEN. Every click hands
+//!   ([`Target`]), resolved against the frame ON SCREEN; a plain RIGHT
+//!   press on an agent row or NEEDS YOU card parks that window (`stash.sh
+//!   stash <win>`), and `⏸ N parked` opens prefix h's stash picker
+//!   ([`stash_command`]). Every click hands
 //!   focus straight back to the tmux pane first (Strip.handle → focus_back),
 //!   and any key that lands here is forwarded there. The wheel does nothing:
 //!   nothing scrolls.
@@ -55,7 +58,7 @@ pub use layout::{layout, Frame, Opts, Row, Seg, Target};
 use crate::actions::{scripts_dir, sh_quote, watcher_age, Actions};
 use crate::proc;
 use crate::text;
-use crate::tmux::{Snapshot, Socket, Tmux};
+use crate::tmux::{Snapshot, Socket, Tmux, HOLD};
 use crate::view::BuildArgs;
 use crate::view::{Core, ViewModel};
 use crate::wezterm::{self, WeztermLink, MOUSE_OFF, MOUSE_ON};
@@ -211,7 +214,7 @@ pub fn popup_width(client_cols: Option<u16>) -> String {
     }
 }
 
-/// ≡ / parked / `… more`: the Option-W menu as a popup on the sidebar's
+/// ≡ / `… more` / `+K more`: the Option-W menu as a popup on the sidebar's
 /// client (Strip.open_menu → `roster_popup_argv`). This binary's `menu` when
 /// its path is known (pointed at the same server; `-B`, since it draws its
 /// own border and title), else the Python popup with tmux's ` agents ` title.
@@ -251,6 +254,22 @@ pub fn menu_command(tmux: &Tmux, client: &str, exe: Option<&std::path::Path>, ta
     c
 }
 
+/// `⏸ N parked`: exactly what prefix h runs (tmux.conf.tmpl `bind-key h
+/// run-shell "…/stash.sh unstash '' '#{client_name}'"`), with the sidebar's
+/// client in place of `#{client_name}`. A foreground run-shell, as there: the
+/// script raises the picker with `display-popup -c <client>` and returns when
+/// it closes, so the sidebar spawns it detached and reaps it on refresh.
+pub fn stash_command(tmux: &Tmux, client: &str, scripts: &std::path::Path) -> Command {
+    let stash = scripts.join("stash.sh");
+    let mut c = tmux.command();
+    c.args(["run-shell", &format!("{} unstash '' {}", sh_quote(&stash.to_string_lossy()), sh_quote(client))]);
+    c
+}
+
+/// How long a right-click park waits to see its window reach the stash
+/// before the footer stops tracking it.
+const PARK_WATCH: f64 = 15.0;
+
 /// The live sidebar: everything Strip holds between frames.
 struct App {
     core: Core,
@@ -267,6 +286,11 @@ struct App {
     /// (observable state for the tests).
     focus_backs: u32,
     last_act: Option<Target>,
+    /// The last right-click park asked for, (window id, session).
+    last_park: Option<(String, String)>,
+    /// A park in flight: (window id, label, give up at). Once a snapshot
+    /// shows the window in the stash, the footer says `parked <label>`.
+    parking: Option<(String, String, f64)>,
     /// Roster.say: the footer message and when it expires.
     msg: Option<(String, f64)>,
     /// display-popup clients, reaped on refresh (Strip.children).
@@ -299,6 +323,8 @@ impl App {
             force: false,
             focus_backs: 0,
             last_act: None,
+            last_park: None,
+            parking: None,
             msg: None,
             children: Vec::new(),
             reader: input::Reader::default(),
@@ -325,6 +351,37 @@ impl App {
         self.link.on_snapshot(&self.core.snapshot, text::now());
         self.view = build_view(&mut self.core, self.link.client.as_deref());
         self.check_client();
+        self.check_park();
+    }
+
+    /// A park in flight that a snapshot now shows in the stash: say so
+    /// (stash.sh refuses some, a working agent or a session's last tab, and
+    /// says why on the status line; then the `parking …` note just lapses).
+    fn check_park(&mut self) {
+        let Some((win, label, until)) = self.parking.clone() else { return };
+        if self.core.snapshot.row_in(&win, HOLD).is_some() {
+            self.parking = None;
+            self.say(format!("parked {label}"));
+        } else if text::now() > until {
+            self.parking = None;
+        }
+    }
+
+    /// A right-click on an agent row or NEEDS YOU card: park that window
+    /// (`stash.sh stash <win>`, which records @stash_origin, so unparking
+    /// puts it back in its space). The move fires tmux's window-unlinked
+    /// hook, whose agent-state notice redraws every sidebar at once.
+    fn park(&mut self, t: &Target) {
+        let Target::Go { win, session } = t else { return };
+        self.last_park = Some((win.clone(), session.clone()));
+        match self.actions.park(&self.core.snapshot, win, session) {
+            Ok(m) => {
+                let label = self.core.snapshot.row_in(win, session).map(|w| w.label.clone()).unwrap_or_default();
+                self.parking = Some((win.clone(), label, text::now() + PARK_WATCH));
+                self.say(m);
+            }
+            Err(m) => self.say(m),
+        }
     }
 
     /// Track the client process: watch the pid a snapshot shows (its exit
@@ -371,21 +428,30 @@ impl App {
         inp.stray = stray;
         let mut focus = toggles > 0 || !inp.stray.is_empty();
         let mut act = None;
+        let mut park = None;
         for m in &inp.mice {
             if m.b & 64 != 0 || m.b & 32 != 0 || !m.press {
                 continue; // the wheel, motion, releases: nothing
             }
             focus = true;
-            if m.b != 0 {
-                continue; // right/middle, or a modifier held: focus only
+            let t = self.shown.target(m.x.saturating_sub(1), m.y.saturating_sub(1)).cloned();
+            match m.b {
+                0 => act = t,
+                // A plain right press (SGR button 2; WezTerm has no right-click
+                // binding of its own, so it reaches a mouse-reporting pane):
+                // park, on an agent row or card only.
+                2 => park = t.filter(|t| matches!(t, Target::Go { .. })),
+                _ => {} // middle, or a modifier held: focus only
             }
-            act = self.shown.target(m.x.saturating_sub(1), m.y.saturating_sub(1)).cloned();
         }
         if focus {
             self.focus_back(&inp.stray);
         }
         if let Some(t) = act {
             self.click(t);
+        }
+        if let Some(t) = park {
+            self.park(&t);
         }
         for _ in 0..toggles {
             self.toggle_scope();
@@ -449,6 +515,13 @@ impl App {
                     Err(e) => Err(format!("menu failed: {e}")),
                 }
             }
+            Target::Stash => match proc::spawn_detached(stash_command(&self.core.tmux, &client, &self.actions.scripts)) {
+                Ok(child) => {
+                    self.children.push(child);
+                    Ok(false)
+                }
+                Err(e) => Err(format!("stash failed: {e}")),
+            },
             Target::Restart | Target::Scope => Ok(false),
         };
         match moved {
@@ -632,11 +705,60 @@ mod tests {
         let mut a = app();
         // A click on the parked row (the last one) acts on the release-less press.
         a.handle(b"\x1b[<0;3;30M\x1b[<0;3;30m");
-        assert_eq!((a.focus_backs, a.last_act.clone()), (1, Some(Target::Menu(Some("parked")))));
+        assert_eq!((a.focus_backs, a.last_act.clone()), (1, Some(Target::Stash)));
         // Motion and releases alone do nothing.
         a.last_act = None;
         a.handle(b"\x1b[<32;3;20M\x1b[<0;3;20m");
         assert_eq!((a.focus_backs, a.last_act.clone()), (1, None));
+    }
+
+    /// `⏸ N parked` runs exactly prefix h's line (tmux.conf.tmpl, read when
+    /// the source tree is there), the client in place of `#{client_name}`.
+    #[test]
+    fn stash_click_is_prefix_h() {
+        let t = Tmux::with_socket(Some(Socket::Name("priv".into())));
+        let c = stash_command(&t, "/dev/ttys999", std::path::Path::new("/s"));
+        assert_eq!(args(&c), ["-u", "-L", "priv", "run-shell", "'/s/stash.sh' unstash '' '/dev/ttys999'"]);
+        let conf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tmux.conf.tmpl");
+        if let Ok(conf) = std::fs::read_to_string(conf) {
+            let bind = conf.lines().find(|l| l.starts_with("bind-key h ")).expect("prefix h");
+            assert_eq!(bind, "bind-key h run-shell \"#{HOME}/.config/tmux/scripts/stash.sh unstash '' '#{client_name}'\"");
+        }
+    }
+
+    /// A plain right press on an agent row parks that window: `stash.sh
+    /// stash <win>` through run-shell -b (the line unit-tested here; the
+    /// server is missing, so nothing runs), `parking <label>…` in the
+    /// footer, then `parked <label>` once a snapshot shows it in the stash.
+    /// Anywhere else, or with a modifier, a right press only hands focus back.
+    #[test]
+    fn right_click_parks_an_agent_row() {
+        let mut a = app();
+        a.core.snapshot = Snapshot::parse(&[
+            row("main", 1, "@1", &[("state", "idle"), ("summary", "Quiet one")]),
+            row("main", 2, "@2", &[]),
+            "\x1fclient\x1f/dev/ttys999\x1f@2\x1fmain".into(),
+        ].join("\n"));
+        a.view = build_view(&mut a.core, Some("/dev/ttys999"));
+        a.shown = layout(&a.view, 34, 30, &Opts::default());
+        let y = a.shown.agents.start + a.shown.rows[a.shown.agents.clone()].iter().position(|r| r.text().contains("Quiet one")).unwrap();
+        let (x, y1) = (5, y + 1);
+        a.handle(format!("\x1b[<2;{x};{y1}M\x1b[<2;{x};{y1}m").as_bytes());
+        assert_eq!(a.focus_backs, 1);
+        assert_eq!((a.last_act.clone(), a.last_park.clone()), (None, Some(("@1".into(), "main".into()))));
+        assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("parking Quiet one…"));
+        let stash = a.actions.scripts.join("stash.sh");
+        assert_eq!(a.actions.park_line("@1"), format!("{} 'stash' '@1'", sh_quote(&stash.to_string_lossy())));
+        // The window shows up in the stash: said so, and no longer tracked.
+        a.core.snapshot = Snapshot::parse(&row("stash", 1, "@1", &[("stash_origin", "main")]));
+        a.check_park();
+        assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("parked Quiet one"));
+        assert!(a.parking.is_none());
+        // Right on the parked line, ctrl-right on the row: focus only.
+        a.last_park = None;
+        a.handle(b"\x1b[<2;3;30M\x1b[<2;3;30m");
+        a.handle(format!("\x1b[<18;{x};{y1}M").as_bytes());
+        assert_eq!((a.focus_backs, a.last_park.clone(), a.last_act.clone()), (3, None, None));
     }
 
     #[test]

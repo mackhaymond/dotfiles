@@ -18,11 +18,11 @@
 //!  1 ◉ Kua Yu focus timing           each agent: number, title …
 //!      asks Which deck should… 44m   … and what it does / waits on
 //!                                    (spare rows)
-//!  spaces                            one line per session, by name,
-//!  ● main            ◉1 ◐2 ○4        anchored just above the last row
-//!  ○ bai                   ○2
-//!  ▸ parked 5                        the stash; a watcher problem in red
-//! ```
+//!  spaces                            THE list of spaces (the status bar has
+//!  ⌃1 ● main         ◉1 ◐2 ○4        none): ⌃N, name, counts, @space_index
+//!  ⌃2 ○ bai                ○2        order; anchored above the last row
+//!  ⏸ 5 parked                        the stash (click: prefix h's picker);
+//! ```                                a watcher problem in red
 //!
 //! There is no event log and no divider any more: NEEDS YOU takes the rows
 //! its cards need, the agents section starts right under it, and the spaces
@@ -33,9 +33,11 @@
 //! The agents section is the body. A frame takes the first step at which
 //! every agent still gets its full two lines ([`STEPS`]):
 //!
-//! 1. the spaces list only ever gets the rows left over: all of it, then the
-//!    client's space and those with an agent needing you plus `… N more
-//!    spaces`, then nothing (it is dropped first);
+//! 1. the spaces list gets the rows left over: all of it, else FOLDED to
+//!    the client's space and those with an attention agent, `+K more` on
+//!    its header. The folded form ([`spaces_min`]) is held back before
+//!    anything else is laid out, so the section never disappears (above 6
+//!    rows) and agents lose detail before it does;
 //! 2. the blank gaps between sections go;
 //! 3. NEEDS YOU cards go from 3 lines to 2, then to 1;
 //! 4. only then do the agents compress (below), NEEDS YOU kept to the rows
@@ -167,8 +169,11 @@ pub enum Target {
     /// The toolbar: agent-jump.sh next / back.
     Next,
     Back,
-    /// The Option-W menu (Strip.open_menu), optionally on a tab ("parked").
+    /// The Option-W menu (Strip.open_menu), optionally on a tab ("all", "idle").
     Menu(Option<&'static str>),
+    /// The `⏸ N parked` line: the stash picker, exactly prefix h's
+    /// `stash.sh unstash '' <client>`.
+    Stash,
     /// The red watcher warning: restart it (the strip's ⟳, Strip.click "restart").
     Restart,
     /// The header title: flip the scope (space / all) and persist it in
@@ -366,17 +371,26 @@ impl Num {
     }
 }
 
+/// THE agent label: what an agent row's (and card's) label column shows,
+/// at most `n.w` cells. Today the 1-9 ordinal (space scope) or the sticky
+/// slot. One swappable field: to show the ⌥W menu's lifetime letter
+/// instead, return the window's `@agent_key` stamp here (`Agent` would carry
+/// it from `Window::key`, read through `menu::letters::parse_key`; the
+/// sidebar only reads it, the menu owns the writes) and make `Num.w` 1.
+fn agent_label(a: &Agent, n: Num) -> Option<String> {
+    if n.ordinal {
+        a.ordinal.filter(|&o| o <= 9).map(|o| o.to_string())
+    } else {
+        a.slot.map(|s| slot_label(s, n.w))
+    }
+}
+
 /// The number column of an agent's first line: its slot label (zero-padded
 /// to `n.w`) or, in space scope, its ordinal, and a space; blank when it has
 /// none; None when there is no column (`n.w` 0). Display only: the sidebar
 /// has no number keys (the ordinals are tmux's M-1..M-9).
 fn num_seg(a: &Agent, n: Num) -> Option<Seg> {
-    let label = if n.ordinal {
-        a.ordinal.filter(|&o| o <= 9).map(|o| o.to_string())
-    } else {
-        a.slot.map(|s| slot_label(s, n.w))
-    };
-    (n.w > 0).then(|| match label {
+    (n.w > 0).then(|| match agent_label(a, n) {
         Some(l) => seg(format!("{l} "), "sub"),
         None => seg(" ".repeat(n.w + 1), "text"),
     })
@@ -479,59 +493,130 @@ fn needs_cut(view: &ViewModel, w: usize, room: usize) -> Vec<Row> {
     }
 }
 
-/// A space, one line: `●`/`○`, name and counts. The client's one on
-/// `surface0` (where you are); one with no agents dim.
-fn space_row(sp: &Space, w: usize) -> Row {
+/// THE space label: what a space row's label column shows, at most
+/// [`SPACE_LABEL_W`] cells. Today `⌃N` for `@space_index` 1-9 (Ctrl+N
+/// switches to it), None past 9 or without an index. One swappable field:
+/// a Shift+letter scheme changes only this (and the width).
+fn space_label(sp: &Space) -> Option<String> {
+    sp.index.filter(|n| (1..=9).contains(n)).map(|n| format!("⌃{n}"))
+}
+
+/// The cells [`space_label`] takes (its column is drawn only when some
+/// listed space has a label).
+const SPACE_LABEL_W: usize = 2;
+
+/// The spaces the list shows, in `@space_index` order (spaces without one
+/// after, by name): every session the view holds except `@space_hidden`
+/// ones. The status bar no longer lists spaces, so this is where they are.
+fn space_list(view: &ViewModel) -> Vec<&Space> {
+    let mut v: Vec<&Space> = view.spaces.iter().filter(|s| !s.hidden).collect();
+    v.sort_by_key(|s| (s.index.is_none(), s.index)); // stable: name order within
+    v
+}
+
+/// The label column's width for this list (0: no space has a label).
+fn space_label_w(list: &[&Space]) -> usize {
+    if list.iter().any(|s| space_label(s).is_some()) {
+        SPACE_LABEL_W
+    } else {
+        0
+    }
+}
+
+/// A space has an agent needing attention (failed, needs you, done).
+fn space_alert(sp: &Space) -> bool {
+    sp.agents.iter().any(|a| a.attention)
+}
+
+/// A space, one line: its label (`⌃N`), `●`/`○`, name and counts. The
+/// client's one on `surface0` (where you are); one with no agents dim. A
+/// click switches the client to it (its active window).
+fn space_row(sp: &Space, w: usize, lw: usize) -> Row {
     let empty = sp.counts.total() == 0 && !sp.is_current;
     let name = sanitize(&sp.name);
+    let mut left = vec![seg(" ", "text")];
+    if lw > 0 {
+        let label = space_label(sp).unwrap_or_default();
+        let pad = " ".repeat(lw.saturating_sub(dwidth(&label)) + 1);
+        left.push(seg(format!("{label}{pad}"), if sp.is_current { "blue" } else { "overlay" }));
+    }
     let (mark, name) = if sp.is_current {
-        (seg(" ● ", "blue"), bold(name, "text"))
+        (seg("● ", "blue"), bold(name, "text"))
     } else if empty {
-        (seg(" ○ ", "overlay"), seg(name, "overlay"))
+        (seg("○ ", "overlay"), seg(name, "overlay"))
     } else {
-        (seg(" ○ ", "overlay"), seg(name, "sub"))
+        (seg("○ ", "overlay"), seg(name, "sub"))
     };
+    left.extend([mark, name]);
     let mut right = count_segs(&sp.counts, true);
     right.push(seg(" ", "text"));
-    Row::new(fit(w, vec![mark, name], right, None))
+    Row::new(fit(w, left, right, None))
         .bg(sp.is_current.then_some("surface0"))
         .click(w, Target::Session(sp.name.clone()))
 }
 
-fn spaces_block(view: &ViewModel, w: usize) -> Vec<Row> {
-    let mut rows = vec![section(w, "spaces", "sub", vec![])];
-    rows.extend(view.spaces.iter().map(|sp| space_row(sp, w)));
+/// The section's header: ` spaces`, and `+K more` on the right when K
+/// spaces are folded away (a click: the menu's All tab).
+fn spaces_header(w: usize, more: usize) -> Row {
+    if more == 0 {
+        return section(w, "spaces", "sub", vec![]);
+    }
+    section(w, "spaces", "sub", vec![seg(format!("+{more} more "), "overlay")]).click(w, Target::Menu(Some("all")))
+}
+
+/// SPACES in exactly `room` rows (`room` >= 2) when it does not fit whole:
+/// the header carries `+K more`, the rows kept are the client's space, then
+/// those with an agent needing attention, then `@space_index` order; shown
+/// in list order.
+fn spaces_cut(view: &ViewModel, w: usize, room: usize) -> Vec<Row> {
+    let list = space_list(view);
+    let lw = space_label_w(&list);
+    let n = list.len();
+    if n < room {
+        let mut rows = vec![spaces_header(w, 0)];
+        rows.extend(list.iter().map(|sp| space_row(sp, w, lw)));
+        return rows;
+    }
+    let keep = room.saturating_sub(1).min(n);
+    let mut ranked: Vec<usize> = (0..n).collect();
+    ranked.sort_by_key(|&i| (!list[i].is_current, !space_alert(list[i])));
+    let mut kept = ranked[..keep].to_vec();
+    kept.sort_unstable();
+    let mut rows = vec![spaces_header(w, n - keep)];
+    rows.extend(kept.iter().map(|&i| space_row(list[i], w, lw)));
     rows
 }
 
-/// SPACES in at most `room` rows (`room` >= 3), the rest counted. The ones
-/// kept: the client's space, then those with an agent needing attention,
-/// then name order; shown in name order.
-fn spaces_cut(view: &ViewModel, w: usize, room: usize) -> Vec<Row> {
-    let rows = spaces_block(view, w);
-    if rows.len() <= room {
-        return rows;
+fn spaces_block(view: &ViewModel, w: usize) -> Vec<Row> {
+    spaces_cut(view, w, usize::MAX)
+}
+
+/// The rows the spaces list keeps however short the frame (reserved before
+/// anything else gives up a row, agents included): its header (with
+/// `+K more`) and the client's space plus every space with an attention
+/// agent, at least one space, at most `max(2, avail / 4)`. 0 with no
+/// spaces, or when `avail` leaves NEEDS YOU and the agents under 2 rows.
+fn spaces_min(view: &ViewModel, avail: usize) -> usize {
+    let list = space_list(view);
+    if list.is_empty() {
+        return 0;
     }
-    let n = view.spaces.len();
-    let keep = room.saturating_sub(2).min(n);
-    let mut ranked: Vec<usize> = (0..n).collect();
-    ranked.sort_by_key(|&i| {
-        let sp = &view.spaces[i];
-        (!sp.is_current, !sp.agents.iter().any(|a| a.attention))
-    });
-    let mut kept = ranked[..keep].to_vec();
-    kept.sort_unstable();
-    let mut rows = vec![section(w, "spaces", "sub", vec![])];
-    rows.extend(kept.iter().map(|&i| space_row(&view.spaces[i], w)));
-    rows.push(dim_line(w, &format!(" … {} more spaces", n - keep)).click(w, Target::Menu(Some("all"))));
-    rows
+    let want = list.iter().filter(|s| s.is_current || space_alert(s)).count();
+    let rows = 1 + want.max(1).min(list.len()).min((avail / 4).max(2));
+    // Short of room: fewer kept spaces (the client's first), down to one.
+    let rows = rows.min(avail.saturating_sub(2));
+    if rows >= 2 {
+        rows
+    } else {
+        0
+    }
 }
 
 /// The spaces list in the `room` rows the sections above left: with a gap
-/// before it if `gap` and it fits, whole if it fits, else cut (3+ rows),
+/// before it if `gap` and it fits, whole if it fits, else folded (2+ rows),
 /// else not at all → (a gap row leads, rows).
 fn spaces_fit(view: &ViewModel, w: usize, room: usize, gap: bool) -> (bool, Vec<Row>) {
-    if view.spaces.is_empty() {
+    if space_list(view).is_empty() {
         return (false, vec![]);
     }
     let full = spaces_block(view, w);
@@ -541,10 +626,9 @@ fn spaces_fit(view: &ViewModel, w: usize, room: usize, gap: bool) -> (bool, Vec<
             return (g == 1, with_gap(g, w, full));
         }
     }
-    for &g in gaps {
-        if room >= g + 3 {
-            return (g == 1, with_gap(g, w, spaces_cut(view, w, room - g)));
-        }
+    // Folded, every row is a space: no gap.
+    if room >= 2 {
+        return (false, spaces_cut(view, w, room));
     }
     (false, vec![])
 }
@@ -899,10 +983,12 @@ fn agents_section(view: &ViewModel, w: usize, budget: usize) -> (Vec<Row>, u8) {
     (rows, 4)
 }
 
-/// The last row: ` ▸ parked N` (the menu's parked tab), and on the right a
-/// message (Roster.say) or the watcher's problem in red (click: restart).
+/// The last row: the stash in one line, ` ⏸ N parked` (a click opens the
+/// same popup as prefix h, [`Target::Stash`]), and on the right a message
+/// (Roster.say) or the watcher's problem in red (click: restart).
 fn last_row(view: &ViewModel, w: usize, msg: Option<&str>) -> Row {
-    let left = vec![seg(format!(" ▸ parked {}", view.parked.len()), "overlay")];
+    let n = view.parked.len();
+    let left = vec![seg(format!(" ⏸ {n} parked"), if n > 0 { "sub" } else { "overlay" })];
     let (right, restart) = match (msg, watcher_problem(view.watcher_age)) {
         (Some(m), _) => (vec![seg(format!("{} ", sanitize(m)), "sub")], false),
         (None, Some(p)) => (vec![seg(format!("watcher {p} "), "red")], true),
@@ -912,7 +998,7 @@ fn last_row(view: &ViewModel, w: usize, msg: Option<&str>) -> Row {
     let rw = width(&clip_segs(right, w)) as u16;
     let w16 = w as u16;
     let mut row = Row::new(segs);
-    row.targets.push((0, w16 - rw, Target::Menu(Some("parked"))));
+    row.targets.push((0, w16 - rw, Target::Stash));
     if restart && rw > 0 {
         row.targets.push((w16 - rw, w16, Target::Restart));
     }
@@ -942,6 +1028,9 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
         frame.step = STEPS.len() as u8;
         return frame;
     }
+    // The folded spaces list is held back first: spaces are listed nowhere
+    // else, so the section never goes before the agents lose detail.
+    let avail = avail - spaces_min(view, avail);
     let full = agents_section(view, w, usize::MAX).0;
     let fits = STEPS.iter().enumerate().find_map(|(i, &(gaps, lines))| {
         let needs = needs_block(view, w, lines);
@@ -1272,7 +1361,7 @@ mod tests {
             assert!(t[f.spaces.start].starts_with(" spaces"), "{name}: {t:#?}");
             assert_eq!(f.spaces.end, h - 1, "{name}: spaces sit on the last row {t:#?}");
         }
-        assert!(t[h - 1].starts_with(" ▸ parked"), "{name}: {t:#?}");
+        assert!(t[h - 1].starts_with(" ⏸ "), "{name}: {t:#?}");
         // No log, no divider, ever.
         assert!(!t.iter().any(|l| l.starts_with(" log") || l.contains('═')), "{name}: {t:#?}");
     }
@@ -1366,7 +1455,7 @@ mod tests {
             " ● main                  ◉1 ◐2 ○4 ", " ○ schedule                    ○2 "]);
         assert!(t[f.agents.end..52].iter().all(|l| l.trim().is_empty()) && t[52].trim().is_empty(), "{t:#?}");
         assert_eq!(f.rows[55].bg, Some("surface0")); // where the client is
-        assert_eq!(t[57], " ▸ parked 1                       ");
+        assert_eq!(t[57], " ⏸ 1 parked                       ");
         // No event log, whatever happened.
         assert!(!t.iter().any(|l| l.contains(" log")), "{t:#?}");
     }
@@ -1401,14 +1490,21 @@ mod tests {
     #[test]
     fn extreme_cuts_and_counts() {
         let v = extreme();
-        // 34x20: NEEDS YOU keeps a third (3 cards and a count); every space
-        // collapses but the first, which shows what it can and counts the rest.
-        let f = layout(&v, 34, 20, &Opts::default());
+        // 34x26: NEEDS YOU keeps a third (cards and a count); every space
+        // collapses but the first, which shows what it can and counts the
+        // rest. The spaces list is folded to the client's space and the
+        // alert ones (capped), `+K more` on its header.
+        let f = layout(&v, 34, 26, &Opts::default());
         let t = texts(&f);
         assert_eq!((f.step, f.agents_step), (STEPS.len() as u8, 3), "{t:#?}");
-        assert_eq!(f.needs.len(), 5, "{t:#?}");
-        assert!(t[f.needs.clone()].last().unwrap().contains("… 9 more need you"), "{t:#?}");
-        assert!(t[f.agents.clone()].iter().any(|l| l.starts_with(" … 9 more ")), "{t:#?}");
+        assert!(t[f.needs.clone()].last().unwrap().contains("more need you"), "{t:#?}");
+        assert!(t[f.agents.clone()].iter().any(|l| l.starts_with(" … ") && l.contains(" more ")), "{t:#?}");
+        assert!(t[f.spaces.start].ends_with("+5 more ") && t[f.spaces.start + 1].starts_with(" ● alpha"), "{t:#?}");
+        check_accounting("extreme", &v, &f);
+        // 34x20: the folded spaces hold; the agents give up rows first.
+        let f = layout(&v, 34, 20, &Opts::default());
+        let t = texts(&f);
+        assert_eq!((f.step, f.agents_step, f.spaces.len()), (STEPS.len() as u8, 4, 5), "{t:#?}");
         check_accounting("extreme", &v, &f);
         // Shorter: more spaces than rows, the rest counted.
         let f = layout(&v, 34, 13, &Opts::default());
@@ -1423,8 +1519,8 @@ mod tests {
         let needs_more = find(&f, "more need you") as u16;
         assert_eq!(f.target(3, needs_more), Some(&Target::Menu(None)));
         check_accounting("extreme", &v, &f);
-        // No room for spaces at all.
-        assert!(f.spaces.is_empty(), "{t:#?}");
+        // The spaces section never goes: header and the client's space at least.
+        assert!(f.spaces.len() >= 2 && t[f.spaces.start + 1].starts_with(" ● alpha"), "{t:#?}");
         // With more room the spaces collapse, quietest first.
         let f = layout(&v, 34, 70, &Opts::default());
         assert!(f.agents_step >= 3, "{:#?}", texts(&f));
@@ -1466,7 +1562,7 @@ mod tests {
         assert_eq!(f.target(26, 1), Some(&Target::Menu(None)));
         assert_eq!(f.target(12, 1), None);
         // Parked opens the menu; blank rows do nothing.
-        assert_eq!(f.target(2, 57), Some(&Target::Menu(Some("parked"))));
+        assert_eq!(f.target(2, 57), Some(&Target::Stash));
         assert_eq!(f.target(2, 2), None);
         assert_eq!(f.target(2, 50), None);
         // A watcher problem is a restart button.
@@ -1479,7 +1575,7 @@ mod tests {
         let f = layout(&v, 34, 58, &Opts { msg: Some("no tmux client".into()) });
         assert!(f.rows[57].text().ends_with("no tmux client "));
         assert_eq!(f.target(30, 57), None);
-        assert_eq!(f.target(2, 57), Some(&Target::Menu(Some("parked"))));
+        assert_eq!(f.target(2, 57), Some(&Target::Stash));
     }
 
     #[test]
@@ -1541,16 +1637,68 @@ mod tests {
         }
         let mut v = view(v, Some("@12"));
         v.scope.session = Some("zz".into());
-        let f = (10..40).map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.spaces.len() >= 3 && f.spaces.len() < 13)
-            .expect("a cut spaces list");
+        // Every height from 7 rows up keeps the section: folded, it is the
+        // header with `+K more`, the client's space and the alert one, in
+        // list order; it never vanishes before the agents lose detail.
+        for h in 7u16..=40 {
+            let f = layout(&v, 34, h, &Opts::default());
+            let t = texts(&f);
+            let part = &t[f.spaces.clone()];
+            let names: Vec<&str> = part.iter().filter_map(|l| l.strip_prefix(" ○ ").or(l.strip_prefix(" ● "))).collect();
+            let (s07, zz) = (names.iter().position(|n| n.starts_with("s07")), names.iter().position(|n| n.starts_with("zz")));
+            // 6-7 rows: the client's space alone; from 8, the alert one too.
+            assert!(zz.is_some(), "{h}: {t:#?}");
+            assert!(h < 8 || (s07.is_some() && s07 < zz), "{h}: {t:#?}");
+            // 13 spaces: the twelve and the fixture's plain `main`.
+            if names.len() < 13 {
+                assert!(part[0].starts_with(" spaces") && part[0].ends_with(&format!("+{} more ", 13 - names.len())), "{h}: {t:#?}");
+                assert_eq!(f.target(30, f.spaces.start as u16), Some(&Target::Menu(Some("all"))));
+            } else {
+                assert_eq!(part[0].trim(), "spaces");
+            }
+            check_accounting(&format!("cut {h}"), &v, &f);
+        }
+    }
+
+    /// The spaces section with `@space_index`: rows in index order (not name
+    /// order), each starting with its `⌃N` (past 9 or unset: a blank label,
+    /// unindexed spaces last), `@space_hidden` sessions left out; a click on
+    /// a row switches the client to that space.
+    #[test]
+    fn spaces_carry_their_ctrl_number_in_index_order() {
+        let v = view(
+            vec![
+                a("main", 1, "running", "M").with("space_index", "1"),
+                a("bai", 1, "idle", "B").with("space_index", "3"),
+                a("cua-notch", 1, "needs-input", "C").with("space_index", "2"),
+                a("zeta", 1, "idle", "Z").with("space_index", "12"),
+                a("aaa", 1, "idle", "A"),
+                a("hidden", 1, "idle", "H").with("space_hidden", "1"),
+            ],
+            Some("@1"),
+        );
+        let f = layout(&v, 34, 58, &Opts::default());
         let t = texts(&f);
         let part = &t[f.spaces.clone()];
-        let names: Vec<&str> = part.iter().filter_map(|l| l.strip_prefix(" ○ ").or(l.strip_prefix(" ● "))).collect();
-        assert!(names.iter().any(|n| n.starts_with("zz")), "{t:#?}");
-        assert!(part.last().unwrap().contains("more spaces"), "{t:#?}");
-        if part.len() >= 4 {
-            assert!(names.iter().any(|n| n.starts_with("s07")), "{t:#?}");
-        }
+        assert_eq!(part, [
+            " spaces                           ",
+            " ⌃1 ● main                     ◐1 ",
+            " ⌃2 ○ cua-notch                ◉1 ",
+            " ⌃3 ○ bai                      ○1 ",
+            "    ○ zeta                     ○1 ",
+            "    ○ aaa                      ○1 ",
+        ], "{t:#?}");
+        // Click: that space (Actions::goto_session: agent-jump.sh goto on
+        // its active window, in that session).
+        let y = f.spaces.start as u16 + 2;
+        assert_eq!(f.target(3, y), Some(&Target::Session("cua-notch".into())));
+        assert_eq!(f.target(33, y), Some(&Target::Session("cua-notch".into())));
+        // The current space is tinted, its label blue.
+        assert_eq!(f.rows[f.spaces.start + 1].bg, Some("surface0"));
+        assert_eq!(f.rows[f.spaces.start + 1].segs[1], seg("⌃1 ", "blue"));
+        // No index anywhere: no label column at all.
+        let f = layout(&quiet(), 34, 58, &Opts::default());
+        assert!(texts(&f)[f.spaces.clone()].iter().skip(1).all(|l| l.starts_with(" ○ ") || l.starts_with(" ● ")));
     }
 
     #[test]
@@ -1882,7 +2030,7 @@ mod tests {
 
     /// Squeezed hard, no row goes to waste: one row left over under a
     /// collapsed space shows its most important agent (the rule counts the
-    /// rest), never a blank row above `▸ parked`.
+    /// rest), never a blank row above `⏸ N parked`.
     #[test]
     fn a_last_spare_row_shows_an_agent() {
         let mut fleet = busy_agents();
@@ -1898,18 +2046,21 @@ mod tests {
             }
             check_accounting(&format!("fleet {h}"), &v, &f);
         }
-        let f = layout(&v, 34, 8, &Opts::default());
+        // 11 rows: 3 go to the folded spaces (main, and cua-notch needing
+        // you); the one spare row under main's rule is its failed agent.
+        let f = layout(&v, 34, 11, &Opts::default());
         let t = texts(&f);
         let rule = find(&f, " main ─");
         assert!(t[rule + 1].starts_with(" 1 ✕ Handy.app"), "{t:#?}");
-        assert!(t[7].starts_with(" ▸ parked"), "{t:#?}");
+        assert_eq!(f.spaces.len(), 3, "{t:#?}");
+        assert!(t[10].starts_with(" ⏸ "), "{t:#?}");
     }
 
     #[test]
     fn glyph_widths_agree_with_ratatui() {
         // Every fixed glyph the sidebar draws: the layout's cell count
         // (text::dwidth) must be ratatui's (unicode-width over the grapheme).
-        let bad: Vec<(char, usize, usize)> = "⏵⤺≡⌥▌◉✓✕◐○●─↑↓✎⚙◎▸…✳⬢⏎"
+        let bad: Vec<(char, usize, usize)> = "⏵⤺≡⌥▌◉✓✕◐○●─↑↓✎⚙◎▸…✳⬢⏎⏸⌃"
             .chars()
             .map(|c| (c, dwidth(&c.to_string()), c.to_string().width()))
             .filter(|(_, a, b)| a != b || *a != 1)

@@ -369,6 +369,11 @@ pub struct Space {
     pub agents: Vec<Agent>,
     /// The other (plain) windows, by window index.
     pub plain: Vec<Agent>,
+    /// The session's `@space_index` (space.sh numbers the visible spaces:
+    /// main = 1, ⌃N), None when unset.
+    pub index: Option<u32>,
+    /// The session has `@space_hidden` "1": not a space (agents, scratch…).
+    pub hidden: bool,
 }
 
 impl Space {
@@ -377,6 +382,7 @@ impl Space {
             ("name", &self.name), ("is_current", self.is_current), ("counts", counts_json(&self.counts)),
             ("active_window", self.active_window.clone()), ("active_index", self.active_index),
             ("path", &self.path), ("path_short", &self.path_short), ("branch", &self.branch),
+            ("index", self.index), ("hidden", self.hidden),
             ("git", self.git.as_ref().map(|g| obj![
                 ("head", &g.head), ("upstream", g.upstream.clone()), ("ahead", g.ahead),
                 ("behind", g.behind), ("changed", g.changed), ("untracked", g.untracked),
@@ -623,6 +629,9 @@ impl ViewModel {
                 git: status,
                 agents: agents.into_iter().map(agent).collect(),
                 plain: plain.into_iter().map(agent).collect(),
+                // Session options: every row of the session carries the same.
+                index: ws.first().and_then(|w| w.space_index),
+                hidden: ws.first().is_some_and(|w| w.space_hidden),
             });
         }
 

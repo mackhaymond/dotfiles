@@ -784,21 +784,51 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
    1 ◉ Sidebar sync            here     like M-1..9, two lines per agent
        asks Hook slot 50 OK?     2m
                                         spare rows collect here
-   spaces                               compact: one line per session, by name,
-   ○ bai                         ○1     anchored above the last row
-   ● main               ◉1 ✓1 ◐1 ○2
-   ▸ parked 0                           parked; a watcher problem in red
+   spaces                               THE list of spaces, @space_index order
+   ⌃1 ● main            ◉1 ✓1 ◐1 ○2     ⌃N, name, counts; click: go there
+   ⌃2 ○ bai                      ○1
+   ⏸ 4 parked                           the stash; a watcher problem in red
   ```
 
   There is no event log and no divider any more (`@agent_sidebar_split` is
   no longer read; `--split` is accepted and ignored). The spaces list has no
   git line, so the sidebar never runs `git status`; the branch still shows on
   each rule.
-- **Density ladder**: agents lose detail last. A frame takes the first
-  step at which every agent still gets two lines: (1) the spaces list only
-  ever gets leftover rows (whole, then the client's space and those needing
-  you plus `… N more spaces`, then nothing); (2) the gaps go; (3) NEEDS YOU
-  cards go to 2 lines, then 1. Only then do agents compress (one line each
+- **Spaces** (the status bar shows only the current space's chip, so this
+  list is where every space is seen): one row per session, sessions with
+  `@space_hidden` 1 left out, ordered by the session option `@space_index`
+  (space.sh's number: main = 1, then the registry), unnumbered ones last by
+  name. Each row starts with its label `⌃N` (Ctrl+N, WezTerm's `\e[911N~`
+  → space N; blank past 9, no column at all when no space has an index),
+  then `●`/`○`, the name and its state counts. A click switches the client
+  to that space (`agent-jump.sh goto` on its active window, in that
+  session). The index and hidden mark are SESSION options read through the
+  window-row format (`#{@space_index}`, `#{@space_hidden}`, fields 28-29),
+  so they cost no extra tmux call. Labels are one swappable function each
+  (`space_label`, and `agent_label` for agent rows) should the keys change.
+- **Stash**: the last row is ` ⏸ N parked`. A click runs exactly prefix h's
+  command, `tmux run-shell "stash.sh unstash '' <client>"` (the sidebar's
+  client for `#{client_name}`; a unit test compares it with tmux.conf.tmpl's
+  `bind-key h`), so the same picker popup opens on that client. A plain
+  **right-click** (SGR button 2; wezterm.lua binds no right-click, so it
+  reaches the pane) on an agent row or NEEDS YOU card parks that window:
+  `run-shell -b "stash.sh stash <win>"`, prefix H's command for one window,
+  which records `@stash_origin` so unparking puts it back in its space. The
+  footer says `parking <name>…`, then `parked <name>` once a snapshot shows
+  the window in `stash` (stash.sh's refusals, a working agent or a session's
+  last tab, show on the status line as before). The move fires the
+  `window-unlinked` hook's agent-state notice, so every sidebar redraws at
+  once. A right press anywhere else, or with a modifier, only hands focus
+  back.
+- **Density ladder**: agents lose detail last, but after the spaces list
+  folds. Before anything else, the FOLDED spaces list is held back: its
+  header (carrying `+K more`, click: the menu's All tab), the client's space
+  and every space with an attention agent (at most `max(2, rows/4)` spaces;
+  with very little room, just the client's). So the section never
+  disappears above 6 rows. A frame then takes the first step at which every
+  agent still gets two lines: (1) the spaces list grows into leftover rows
+  (whole when it fits, else folded to fill them); (2) the gaps go; (3) NEEDS
+  YOU cards go to 2 lines, then 1. Only then do agents compress (one line each
   with spare rows handed back as second lines to the ones needing you, then
   idle folded into `○○○ 3 idle`, then spaces collapsed to their rule, then
   `… N more`), with NEEDS YOU held to at least 2 rows and a third of the

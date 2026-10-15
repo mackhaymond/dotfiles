@@ -132,6 +132,17 @@ pub fn pick_agent_pane(panes_text: &str, ps_text: Option<&str>) -> Result<String
     Err(PANE_UNSURE)
 }
 
+/// stash.sh `agent_running`'s refusal, from the tab's own options: a state
+/// other than "", idle, done, needs-*, failed (`running`, or anything
+/// unknown), or `@agent_workflow` / `@agent_cua` set. stash.sh then lets a
+/// flagged window park anyway when no live agent is registered in it (a
+/// stale flag left by a dead watcher); that check reads session files, so
+/// it is not mirrored here: such a window is refused here, parkable by H.
+pub fn park_refused_busy(w: &Window) -> bool {
+    let quiet = matches!(w.state.as_str(), "" | "idle" | "done" | "failed") || w.state.starts_with("needs-");
+    !quiet || !w.workflow.is_empty() || !w.cua.is_empty()
+}
+
 /// The action runner. Cheap to clone; holds no state.
 #[derive(Debug, Clone)]
 pub struct Actions {
@@ -148,13 +159,24 @@ impl Actions {
         self.scripts.join(name)
     }
 
-    fn run_bg_script(&self, name: &str, args: &[&str]) {
+    /// The shell line `run-shell -b` gets for `<scripts>/<name> <args…>`.
+    fn script_line(&self, name: &str, args: &[&str]) -> String {
         let mut cmd = sh_quote(&self.script(name).to_string_lossy());
         for a in args {
             cmd.push(' ');
             cmd.push_str(&sh_quote(a));
         }
-        self.tmux.run_bg(&cmd);
+        cmd
+    }
+
+    fn run_bg_script(&self, name: &str, args: &[&str]) {
+        self.tmux.run_bg(&self.script_line(name, args));
+    }
+
+    /// What [`park`](Self::park) hands `run-shell -b`: `stash.sh stash <win>`
+    /// (prefix H's command for one given window; it records @stash_origin).
+    pub fn park_line(&self, win: &str) -> String {
+        self.script_line("stash.sh", &["stash", win])
     }
 
     /// agent-roster.py `Roster.jump`: `bash agent-jump.sh <mode> <tty> [args]`.
@@ -232,7 +254,13 @@ impl Actions {
         if w.session == HOLD {
             return Err("already parked".into());
         }
-        self.run_bg_script("stash.sh", &["stash", &w.id]);
+        if w.space_hidden || crate::model::HIDDEN.contains(&w.session.as_str()) {
+            return Err(format!("{} isn't in a space, can't park", w.label));
+        }
+        if park_refused_busy(w) {
+            return Err(format!("{} is working, can't park", w.label));
+        }
+        self.tmux.run_bg(&self.park_line(&w.id));
         Ok(format!("parking {}…", w.label))
     }
 
@@ -370,6 +398,36 @@ mod tests {
         let got = peek_from_capture(out, 2);
         assert_eq!(got.iter().map(|l| l.plain()).collect::<Vec<_>>(), ["two", "three"]);
         assert!(peek_from_capture("\n\n", 5).is_empty());
+    }
+
+    /// Park refuses up front what stash.sh would refuse (a working agent,
+    /// stash.sh agent_running) and any hidden session (in every scope); the
+    /// server here does not exist, so an accepted park runs nothing.
+    #[test]
+    fn park_refuses_busy_and_hidden() {
+        use crate::tmux::tests::row;
+        let snap = Snapshot::parse(&[
+            row("main", 1, "@1", &[("state", "running"), ("summary", "Busy")]),
+            row("main", 2, "@2", &[("state", "idle"), ("summary", "Gear"), ("workflow", "1")]),
+            row("main", 3, "@3", &[("state", "idle"), ("summary", "Eyes"), ("cua", "1")]),
+            row("main", 4, "@4", &[("state", "weird"), ("summary", "Odd")]),
+            row("main", 5, "@5", &[("state", "needs-input"), ("summary", "Asks")]),
+            row("main", 6, "@6", &[("state", "idle"), ("summary", "Quiet")]),
+            row("main", 7, "@7", &[("state", "failed"), ("summary", "Broke")]),
+            row("main", 8, "@8", &[("state", "done"), ("summary", "Done")]),
+            row("scratch", 1, "@9", &[("state", "idle"), ("summary", "Scr")]),
+            row("mine", 1, "@10", &[("state", "idle"), ("summary", "Hid"), ("space_hidden", "1")]),
+        ].join("\n"));
+        let a = Actions::new(Tmux::with_socket(Some(crate::tmux::Socket::Name(format!("agentui-park-none-{}", std::process::id())))));
+        for (win, s, label) in [("@1", "main", "Busy"), ("@2", "main", "Gear"), ("@3", "main", "Eyes"), ("@4", "main", "Odd")] {
+            assert_eq!(a.park(&snap, win, s), Err(format!("{label} is working, can't park")));
+        }
+        for (win, s, label) in [("@9", "scratch", "Scr"), ("@10", "mine", "Hid")] {
+            assert_eq!(a.park(&snap, win, s), Err(format!("{label} isn't in a space, can't park")));
+        }
+        for (win, label) in [("@5", "Asks"), ("@6", "Quiet"), ("@7", "Broke"), ("@8", "Done")] {
+            assert_eq!(a.park(&snap, win, "main"), Ok(format!("parking {label}…")));
+        }
     }
 
     #[test]

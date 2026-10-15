@@ -192,21 +192,26 @@ impl Tmux {
 /// client last landed on, for the menu's ⌥W "last agent"; like
 /// `@agent_blink`, every row carries the same value), and `home`
 /// (spaces' `@space_home` "1": a space's landing window, never an agent row
-/// nor counted in the sidebar).
-pub const FIELDS: [&str; 27] = [
+/// nor counted in the sidebar), and the SESSION options `space_index`
+/// (`@space_index`, space.sh's number for a visible space: its ⌃N) and
+/// `space_hidden` (`@space_hidden` "1"): a window row's format resolves a
+/// user option through its session, so every row of a session carries its
+/// session's values and the sidebar's spaces list costs no extra call.
+pub const FIELDS: [&str; 29] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
-    "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home",
+    "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home", "space_index",
+    "space_hidden",
 ];
 
 /// The tmux format of each FIELDS entry, in order.
-pub const FORMATS: [&str; 27] = [
+pub const FORMATS: [&str; 29] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
     "#{window_panes}", "#{pane_current_path}", "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}",
     "#{@stash_origin}", "#{@agent_slot}", "#{@agent_pending}", "#{@agent_key}", "#{@agent_mru_cur}",
-    "#{@agent_mru_prev}", "#{@space_home}",
+    "#{@agent_mru_prev}", "#{@space_home}", "#{@space_index}", "#{@space_hidden}",
 ];
 
 /// Stand-ins tmux writes for a newline / US inside a field value (Unicode
@@ -328,6 +333,11 @@ pub struct Window {
     pub mru_prev: String,
     /// @space_home is "1": a space's home (landing) window, never an agent.
     pub home: bool,
+    /// The window's SESSION's @space_index (1-based, digits only; None when
+    /// unset or junk): the space's number, ⌃N.
+    pub space_index: Option<u32>,
+    /// The window's SESSION has @space_hidden "1" (not a space).
+    pub space_hidden: bool,
 }
 
 fn digits(s: &str) -> bool {
@@ -395,6 +405,8 @@ impl Window {
             mru_cur: p[24].into(),
             mru_prev: p[25].into(),
             home: p[26] == "1",
+            space_index: parse_slot(p[27]),
+            space_hidden: p[28] == "1",
             label: label.into(),
             session,
         })
@@ -650,6 +662,7 @@ pub(crate) mod tests {
         assert!(Window::parse(&vec![""; 23].join("\x1f")).is_none());
         assert!(Window::parse(&vec![""; 25].join("\x1f")).is_none());
         assert!(Window::parse(&vec![""; 26].join("\x1f")).is_none());
+        assert!(Window::parse(&vec![""; 27].join("\x1f")).is_none());
         assert_eq!(w.label, "");
         // Answered: idle with a @agent_pending epoch at most 600 s old.
         let now = 1_700_000_000.0;
@@ -691,9 +704,15 @@ pub(crate) mod tests {
     fn slots() {
         assert!(fmt().contains(&guarded("#{@agent_slot}")) && fmt().contains(&guarded("#{@agent_pending}")));
         assert!(fmt().contains(&guarded("#{@agent_key}")) && fmt().contains(&guarded("#{@agent_mru_prev}")));
-        assert!(fmt().ends_with(&guarded("#{@space_home}")));
+        assert!(fmt().contains(&guarded("#{@space_home}")));
+        assert!(fmt().ends_with(&format!("{}\x1f{}", guarded("#{@space_index}"), guarded("#{@space_hidden}"))));
         let s = Snapshot::parse(&[row("main", 1, "@1", &[("home", "1")]), row("main", 2, "@2", &[("home", "0")])].join("\n"));
         assert_eq!((s.windows[0].home, s.windows[1].home), (true, false));
+        // The session's space number and hidden mark, on each of its rows.
+        let s = Snapshot::parse(&[row("a", 1, "@1", &[("space_index", "3")]), row("b", 1, "@2", &[("space_index", "x")]),
+            row("c", 1, "@3", &[("space_hidden", "1")])].join("\n"));
+        let got: Vec<_> = s.windows.iter().map(|w| (w.space_index, w.space_hidden)).collect();
+        assert_eq!(got, [(Some(3), false), (None, false), (None, true)]);
         // The menu's letter and the global MRU pair ride in the same rows.
         let s = Snapshot::parse(&[row("main", 1, "@1", &[("key", "f"), ("mru_cur", "@4"), ("mru_prev", " @2 ")]),
             row("main", 2, "@2", &[("mru_cur", "@4"), ("mru_prev", "@2")])].join("\n"));
