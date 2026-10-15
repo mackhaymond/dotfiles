@@ -638,6 +638,39 @@ subagent_running() {
     return "$v"
 }
 
+# BACKGROUND TASKS HOLD A TAB RUNNING (Mack, 2026-10-14: "an agent ending
+# generation ... but still waiting on something, e.g. a background test/build
+# run ... treated the same as ... still having subagents"). A turn that ends
+# with a background task it launched still out (a pty/run moved to the
+# background, a Bash run_in_background) has not finished. The Stop hook
+# already asks agent-bg-pending and leaves such a tab running, but Claude's
+# own status then reads "shell" (a pending SUBAGENT keeps it "busy", which is
+# why those always held), and the un-stick below idled the tab 3 s later.
+# So a running claude window whose status reads idle/shell asks the same
+# program - one algorithm for both surfaces, CuaNotch's - and a yes holds the
+# tab running and lights the gear, as a subagent does. Only on that path, and
+# cached: asked again when the parent transcript moves (the task's
+# notification lands there) or once STAMP_RING ticks pass (its age backstop).
+BG_PENDING="$HOME/.local/bin/agent-bg-pending"
+declare -A BG_KEY=() BG_TICK=() BG_V=()
+bg_task_pending() {
+    local pid="$1" tp raw cwd="" v
+    [ -x "$BG_PENDING" ] || return 1
+    resolve_session_bases "$pid" || return 1
+    tp="$SESSION_PROJ/${SESSION_BASES[0]}.jsonl"
+    if [ -n "${BG_TICK[$pid]:-}" ] && [ "${BG_KEY[$pid]:-}" = "$tp" ] \
+       && ! changed_since "${BG_TICK[$pid]}" "$tp"; then
+        return "${BG_V[$pid]}"
+    fi
+    raw="$(<"$HOME/.claude/sessions/$pid.json")"
+    [[ $raw =~ \"cwd\":\"([^\"]+)\" ]] && cwd="${BASH_REMATCH[1]}"
+    "$BG_PENDING" "$tp" "${SESSION_BASES[0]}" "$cwd" >/dev/null 2>&1
+    v=$?
+    [ "$v" = 0 ] || v=1
+    BG_KEY[$pid]="$tp"; BG_TICK[$pid]=$tick_no; BG_V[$pid]=$v
+    return "$v"
+}
+
 # STALE-SAVE CHIP. tmux-continuum once stopped autosaving for ~38 h without a
 # sound (a stray `tmux -L` test server tripped its another-server check; see
 # continuum-ensure.sh). So: when the newest snapshot - the mtime of the
@@ -1202,6 +1235,7 @@ while :; do
         # The subagent verdict cache rides the same clock: dead pids drop
         # out, and every session gets one full look a minute regardless.
         SUB_KEY=(); SUB_TICK=(); SUB_V=()
+        BG_KEY=(); BG_TICK=(); BG_V=()     # the background-task verdicts too
         pid_cache_age=0
     fi
     new_pids=""
@@ -1465,12 +1499,25 @@ EOF
         # and share the one pane→pid lookup; workflows are claude-only).
         wf=0
         cua=0
+        bg_held=0
         if [ "$has_agent" = 1 ]; then
             # A workflow or a background subagent: one gear for both. The
             # subagent half goes through subagent_running's change gate.
             if [ -n "$pid" ] && { session_has_running_workflow "$pid" \
                                   || subagent_running "$pid"; }; then
                 wf=1; any_workflow=1
+            fi
+            # A background task the ended turn is waiting on: gear on, and
+            # bg_held keeps the un-stick below from idling the tab (see
+            # BACKGROUND TASKS HOLD A TAB RUNNING).
+            if [ "$wf" = 0 ] && [ "$state" = running ] && [ -n "$pid" ] \
+               && [ "${PID_KIND[$pid]:-}" != codex ]; then
+                st=""
+                session_status "$pid"
+                case "$st" in
+                    idle|shell)
+                        bg_task_pending "$pid" && { bg_held=1; wf=1; any_workflow=1; } ;;
+                esac
             fi
             case "$cua_pids" in
                 *" ${pid} "*) [ -n "$pid" ] && { cua=1; any_cua=1; } ;;
@@ -1564,7 +1611,7 @@ EOF
                     # checking for "idle" alone left a tab that missed its Stop
                     # pinned at running. "waiting" (a gate on screen) and
                     # "busy" still never qualify.
-                    case "$st" in idle|shell) fin=idle ;; esac
+                    case "$st" in idle|shell) [ "$bg_held" = 1 ] || fin=idle ;; esac
                     ;;
                 needs-input)
                     if [ "${PID_KIND[$pid]:-}" = codex ] && [ -n "${W_ROLL[$win]:-}" ]; then

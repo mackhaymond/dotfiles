@@ -1327,7 +1327,7 @@ suspend_agent() {
     # lives in. (@agent_workflow is one gear for workflows AND subagents, so
     # the first line's tab check covers both while the watcher is alive.)
     if [ -n "$(tmux show -wqv -t "$win" @agent_workflow 2>/dev/null)" ] || session_has_running_workflow "$a_pid"; then
-        log "background workflow still in flight — left running"; return 0
+        log "background work (workflow, subagent or task) still in flight — left running"; return 0
     fi
     if session_has_running_subagent "$a_pid"; then
         log "background subagent still running — left running"; return 0
