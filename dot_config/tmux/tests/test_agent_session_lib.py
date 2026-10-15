@@ -140,11 +140,67 @@ class LibCase(unittest.TestCase):
                                 separators=(",", ":")) + "\n")
         self.assertEqual(self.rc("session_has_running_subagent"), "rc=1")
 
+    def append(self, rec):
+        with self.parent.open("a") as fh:
+            fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+    def test_dated_quotes_are_not_notices(self):
+        # Only real notification records count (the rule CuaNotch shares):
+        # a dated record merely QUOTING the id, after the subagent's last
+        # write, must not read as its notice.
+        self.subagent("a1", 100)
+        at = iso(self.now - 100)
+        note = "<task-notification><task-id>a1</task-id><status>completed</status></task-notification>"
+        quotes = [
+            {"type": "user", "timestamp": at, "message": {"content": [
+                {"type": "tool_result", "content": "saw " + note}]}},
+            {"type": "assistant", "timestamp": at, "message": {"content": [
+                {"type": "text", "text": note}]}},
+            {"type": "user", "timestamp": at, "isSidechain": True, "message": {"content": note}},
+            {"type": "user", "timestamp": at, "message": {"content": "Another session sent: " + note}},
+            {"type": "queue-operation", "operation": "remove", "timestamp": at, "content": note},
+            {"type": "attachment", "timestamp": at, "attachment": {
+                "type": "queued_command", "commandMode": "prompt", "prompt": note}},
+            {"type": "api-request-blob", "timestamp": at, "message": {"content": note}},
+        ]
+        for rec in quotes:
+            self.append(rec)
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=0")
+
+    def test_odd_record_does_not_lose_later_notices(self):
+        # A RecursionError (or any other) on one record must not kill the
+        # read: the notice after it still counts.
+        self.subagent("a1", 100)
+        deep = "[" * 5000 + "]" * 5000
+        with self.parent.open("a") as fh:
+            fh.write('{"type":"assistant","timestamp":"%s","x":%s,"t":"<task-id>a1</task-id>"}\n'
+                     % (iso(self.now - 100), deep))
+            fh.write('{"type":"user","timestamp":"%s","message":"<task-id>a1</task-id>"}\n'
+                     % iso(self.now - 100))
+        self.notify("a1", self.now - 100)
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=1")
+
+    def test_every_real_notice_shape_counts(self):
+        at = iso(self.now - 100)
+        note = "<task-notification><task-id>a1</task-id><status>completed</status></task-notification>"
+        for rec in [
+            {"type": "user", "timestamp": at, "message": {"content": note}},
+            {"type": "user", "timestamp": at, "message": {"content": [{"type": "text", "text": note}]}},
+            {"type": "attachment", "timestamp": at, "attachment": {
+                "type": "queued_command", "commandMode": "task-notification", "prompt": note}},
+            {"type": "queue-operation", "operation": "enqueue", "timestamp": at, "content": note},
+        ]:
+            with self.subTest(shape=rec["type"]):
+                self.parent.write_text("")
+                self.subagent("a1", 100)
+                self.append(rec)
+                self.assertEqual(self.rc("session_has_running_subagent"), "rc=1")
+
     def test_incremental_parent_read_in_one_process(self):
         self.subagent("a1", 100)
         script = (f'session_has_running_subagent {PID}; echo "rc=$?"; '
                   f'printf "%s\\n" \'{{"type":"user","timestamp":"{iso(self.now - 100)}",'
-                  f'"message":{{"content":"<task-id>a1</task-id>"}}}}\' >> "{self.parent}"; '
+                  f'"message":{{"content":"<task-notification><task-id>a1</task-id></task-notification>"}}}}\' >> "{self.parent}"; '
                   f'session_has_running_subagent {PID}; echo "rc=$?"')
         self.assertEqual(self.bash(script).split(), ["rc=0", "rc=1"])
 
@@ -213,7 +269,7 @@ class LibCase(unittest.TestCase):
 
     def note(self, aid, at):
         return json.dumps({"type": "attachment", "attachment": {"type": "queued_command",
-                           "prompt": f"<task-notification><task-id>{aid}</task-id>"},
+                           "commandMode": "task-notification", "prompt": f"<task-notification><task-id>{aid}</task-id>"},
                            "timestamp": iso(at)}, separators=(",", ":"))
 
     def test_bounded_first_read_matches_full_read(self):

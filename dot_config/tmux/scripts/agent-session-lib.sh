@@ -190,12 +190,11 @@ notified_ids() {
     [ -x "$_SL_PY" ] || _SL_PY=""
     _sl_python
     out=$("$_SL_PY" -I -S -c '
-import sys, re, datetime
+import sys, re, datetime, json
 # THE notification tag, defined once, on the line check-invariants pins
 # against CuaNotch (it greps the quoted text): change it there too.
 TAG = """if "<task-id>" not in line""".split("\"")[1]
 ID = re.compile(re.escape(TAG.encode()) + rb"([A-Za-z0-9_-]+)" + re.escape(TAG.replace("<", "</", 1).encode()))
-TS = re.compile(rb"\"timestamp\":\"([^\"]+)\"")
 ANCHOR = re.compile(rb"\"type\":\"assistant\",\"uuid\":\"[^\"]*\",\"timestamp\":\"([^\"]+)\"")
 def epoch(raw):
     try:
@@ -237,17 +236,54 @@ def candidates(tag):                   # whole \n-terminated lines holding tag
         e = data.find(b"\n", i, cut)   # found: data[cut - 1] is the newline
         yield data[s:e]
         i = data.find(tag, e, cut)
+# ONLY REAL NOTIFICATION RECORDS count, by structure - the same rule as
+# the CuaNotch reader (agreed 2026-10-14; no apostrophes in here, this is
+# inside a single-quoted bash string). A transcript quotes task ids
+# everywhere: tool results, assistant text, peer messages, queued prompts,
+# and (Claude Code 2.1.300) undated "api-request-blob" copies of each API
+# request. A quote dated after the last write of a resumed subagent read as its
+# notice (gear off while it ran); an undated one read as epoch 0 and, latest
+# wins, erased the real notice (gear stuck on after it finished). Counted:
+#   - a non-sidechain user record whose string content, or a text block,
+#     STARTS with the notification tag;
+#   - an attachment whose commandMode is "task-notification";
+#   - a queue-operation enqueue whose content starts with the tag.
+# api-request* and everything else: ignored. Dated, or not counted.
+NOTE = TAG.replace("task-id", "task-notification")
+def notice(d):
+    t = d.get("type")
+    if t == "user":
+        if d.get("isSidechain"):
+            return False
+        c = (d.get("message") or {}).get("content")
+        if isinstance(c, str):
+            return c.startswith(NOTE)
+        return isinstance(c, list) and any(
+            isinstance(b, dict) and b.get("type") == "text"
+            and isinstance(b.get("text"), str) and b["text"].startswith(NOTE) for b in c)
+    if t == "attachment":
+        a = d.get("attachment")
+        return isinstance(a, dict) and a.get("commandMode") == "task-notification"
+    if t == "queue-operation":
+        c = d.get("content")
+        return d.get("operation") == "enqueue" and isinstance(c, str) and c.startswith(NOTE)
+    return False
 ids = []
 for line in candidates(TAG.encode()):
     m = ID.search(line)
-    if not m:
+    if not m or line.startswith(b"{\"type\":\"api-request"):   # skip big blobs unparsed
         continue
-    t = TS.search(line)
-    ep = epoch(t.group(1)) if t else None
-    # Undated copies are not notifications: Claude Code 2.1.300 also logs
-    # each API request as an "api-request-blob" record (no timestamp) that
-    # repeats the notification text, and as "latest wins" its 0 overwrote
-    # the real one - a finished subagent read as still out (gear stuck on).
+    # Any odd record (deep nesting is a RecursionError, a non-dict message,
+    # a bad timestamp) is skipped: one crash here prints nothing, so the
+    # offset never advances and EVERY notice in this parent is lost.
+    try:
+        d = json.loads(line)
+        if not isinstance(d, dict) or not notice(d):
+            continue
+        ts = d.get("timestamp")
+        ep = epoch(ts.encode()) if isinstance(ts, str) else None
+    except Exception:
+        continue
     if not ep:
         continue
     ids.append("%s=%d" % (m.group(1).decode(), ep))
