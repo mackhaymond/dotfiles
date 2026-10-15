@@ -918,6 +918,9 @@ set-hook -g 'session-closed[50]' 'run-shell -b "notifyutil -p com.mackhaymond.tm
 # kill-guard (docs/kill-guard.md): kill-server on the real default server needs Touch ID + a verified save first
 set -s 'command-alias[90]' "kill-server=run-shell '[ -x {{ .chezmoi.homeDir }}/.config/tmux/scripts/kill-guard.sh ] && exec {{ .chezmoi.homeDir }}/.config/tmux/scripts/kill-guard.sh server #{q:socket_path}; case #{q:socket_path} in */default) echo \"kill-guard: kill-guard.sh missing; refusing to kill the default server (bypass: {{ .homebrew_prefix }}/bin/tmux kill-ser)\"; exit 1;; esac; exec {{ .homebrew_prefix }}/bin/tmux -S #{q:socket_path} kill-ser'"
 
+# Pause key (docs/agent-pause.md): prefix P pauses the working agents before the lid closes, again resumes them
+source-file -qF "#{d:current_file}/agent-pause.conf"
+
 # SPACES — keep LAST. A separate file because `%if` is decided at parse time:
 # here it would still see the previous load's @spaces. By the time this
 # source-file runs, the `set -g @spaces` near the top has. Last, so no plugin
