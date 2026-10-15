@@ -30,7 +30,8 @@ class ScratchServer(unittest.TestCase):
     file behind)."""
 
     def socket_path(self):
-        return Path(f"/private/tmp/tmux-{os.getuid()}/u2test-{os.getpid()}-{id(self)}")
+        prefix = os.environ.get("RESURRECT_TEST_SOCKET_PREFIX", "u2test")
+        return Path(f"/private/tmp/tmux-{os.getuid()}/{prefix}-{os.getpid()}-{id(self)}")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir="/tmp")   # short: a unix socket path caps at 104
@@ -43,7 +44,8 @@ class ScratchServer(unittest.TestCase):
         (self.root / "zdot").mkdir()
         (self.root / "zdot/.zshrc").write_text("PS1='$ '\n")
         self.env = dict(os.environ, HOME=str(self.root), ZDOTDIR=str(self.root / "zdot"))
-        self.env.pop("TMUX", None)
+        self.env.pop("TMUX", None)        # never inherit the caller's server
+        self.env.pop("TMUX_PANE", None)
         self.env.pop("RESURRECT_SAVE_ALLOW_SOCKET", None)
         self.tmux("-f", "/dev/null", "new-session", "-d", "-s", "main", "-x", "80", "-y", "20")
         self.addCleanup(self.sock.unlink, missing_ok=True)
@@ -54,6 +56,7 @@ class ScratchServer(unittest.TestCase):
         self.tmux("set", "-g", "exit-empty", "off", ";",
                   "set", "-g", "@resurrect-dir", str(self.dir), ";",
                   "set", "-g", "@resurrect-capture-pane-contents", "off", ";",
+                  "set", "-g", "@resurrect-startup-grace-seconds", "0", ";",   # servers here are seconds old
                   "set", "-g", "@resurrect-hook-post-save-layout", f"touch '{self.layout_marker}'", ";",
                   "set", "-g", "@resurrect-hook-post-save-all", f"touch '{self.all_marker}'")
         self.path = self.tmux("display", "-p", "#{socket_path}").strip()
@@ -123,43 +126,355 @@ class SaveGuardTests(ScratchServer):
         self.assertTrue((self.dir / "last").is_symlink())
 
 
-class DefaultNamedServerSaves(ScratchServer):
-    """The ALLOWED path, with no opt-in: a server whose socket is named
-    `default` (here under a scratch TMUX_TMPDIR) must save, both as run-shell /
-    continuum run it (TMUX set) and from a plain shell (TMUX unset). A broken
-    `${1##*/} = default` branch would otherwise pass every other test (they
-    all opt in) while real autosave was refused.
-
-    Known gap, by design: the rule is the socket's NAME, so any socket called
-    `default` under another TMUX_TMPDIR (or via -S .../default) is accepted —
-    the same rule as agent-tab-watcher.sh and continuum-ensure.sh. Stray test
-    servers use `-L <name>`, which this does catch."""
+class PrivateDefaultServerRefused(ScratchServer):
+    """A PRIVATE server whose socket is named `default` — what every agent's
+    server is under its own TMUX_TMPDIR — is not the real default server, and
+    with no opt-in nothing may save it into @resurrect-dir: not the save (TMUX
+    set, as run-shell/continuum run it, or unset with the CLI steered there by
+    TMUX_TMPDIR), not resurrect-save-soon.sh, and continuum-ensure.sh must not
+    add the autosave hook. Until 2026-10-15 all three matched the socket's
+    basename and accepted it. (The real default socket is only ever named by
+    path in the scripts; no test may touch it.)"""
 
     def socket_path(self):
         return Path(self.temp.name).resolve() / f"tmux-{os.getuid()}" / "default"
 
-    def assert_saved(self, r):
+    def assert_refused(self, r, reason):
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue((self.dir / "last").resolve().is_file())
-        self.assertTrue(self.all_marker.exists())
-        log = (self.dir / "save.log").read_text()
-        self.assertNotIn("REFUSED", log)
-        self.assertIn("saved ", log)
-        self.assertEqual(self.tmux("show", "-gqv", "@resurrect_stale").strip(), "")
+        self.assertEqual(list(self.dir.glob("tmux_resurrect_*")), [])
+        self.assertFalse((self.dir / "last").exists())
+        self.assertFalse(self.all_marker.exists())
+        self.assertIn(f"REFUSED: not the default tmux server — {reason}", (self.dir / "save.log").read_text())
 
-    def test_saves_with_TMUX_set(self):
-        self.assertTrue(self.path.endswith("/default"), self.path)
-        self.assert_saved(self.save(TMUX=f"{self.path},0,0"))
-
-    def test_saves_with_TMUX_unset(self):
+    def unset_env(self):
         env = dict(TMUX_TMPDIR=str(self.root))
         # Safety first: this env must reach the SCRATCH server, never the
-        # user's default one, before anything is allowed to save through it.
+        # user's default one.
         probe = subprocess.run([TMUX, "display", "-p", "#{socket_path}"],
                                env={k: v for k, v in dict(self.env, **env).items() if k != "TMUX"},
                                capture_output=True, text=True)
         self.assertEqual(probe.stdout.strip(), self.path, "would not reach the scratch server")
-        self.assert_saved(self.save(**env))
+        return env
+
+    def test_save_refused_with_TMUX_set(self):
+        self.assertTrue(self.path.endswith(f"/tmux-{os.getuid()}/default"), self.path)
+        self.assert_refused(self.save(TMUX=f"{self.path},0,0"), f"TMUX names socket {self.path}")
+
+    def test_save_refused_with_TMUX_unset(self):
+        self.assert_refused(self.save(**self.unset_env()), f"the tmux CLI reaches {self.path}")
+
+    def test_final_refused(self):
+        r = subprocess.run(["bash", str(SAVE), "final"], env=dict(self.env, TMUX=f"{self.path},0,0"),
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 2)
+
+    def test_save_soon_does_nothing(self):
+        tmp = self.root / "tmp"
+        tmp.mkdir()
+        env = dict(self.env, TMUX=f"{self.path},0,0", TMPDIR=str(tmp), RESURRECT_SAVE_SOON_DELAY="0.1",
+                   RESURRECT_SAVE_SCRIPT=str(SAVE))
+        r = subprocess.run(["bash", str(SCRIPTS / "executable_resurrect-save-soon.sh"), "full"], env=env,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        self.assertEqual(list(tmp.iterdir()), [])
+        self.assertFalse((self.dir / "save.log").exists())
+        self.assertEqual(list(self.dir.glob("tmux_resurrect_*")), [])
+
+    def test_continuum_ensure_adds_no_autosave_hook(self):
+        fake = self.root / ".config/tmux/plugins/tmux-continuum/scripts/continuum_save.sh"
+        fake.parent.mkdir(parents=True)
+        fake.write_text("#!/bin/sh\n")
+        fake.chmod(0o755)
+        self.tmux("set", "-g", "status-right", "untouched")
+        ensure = SCRIPTS / "executable_continuum-ensure.sh"
+        for env in (dict(TMUX=f"{self.path},0,0"), self.unset_env()):
+            # self.env never holds TMUX; the unset case reaches the scratch
+            # server through TMUX_TMPDIR (unset_env() proved it).
+            r = subprocess.run(["bash", str(ensure)], env=dict(self.env, **env), capture_output=True,
+                               text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.tmux("show", "-gv", "status-right").strip(), "untouched", env)
+
+
+class FinalSaveRefusal(ScratchServer):
+    def test_a_refused_final_save_fails_loudly(self):
+        # kill-guard's go/no-go: a refusal must never read as "saved".
+        r = subprocess.run(["bash", str(SAVE), "final"], env=dict(self.env, TMUX=f"{self.path},0,0"),
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(list(self.dir.glob("tmux_resurrect_*")), [])
+        self.assertIn("REFUSED", (self.dir / "save.log").read_text())
+
+
+GUARD = SCRIPTS / "executable_resurrect-guard.sh"
+
+
+class ResurrectGuardTests(unittest.TestCase):
+    """resurrect-guard.sh on its own, against scratch save files. RESURRECT_DIR
+    and RESURRECT_EXCLUDE come from the env, so it never asks tmux; TMUX names
+    a socket that does not exist, so a call that slipped through would fail
+    rather than reach a real server."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name)
+        # Server facts resurrect-save.sh passes in. Set-but-empty = unknown
+        # (no tmux query): the guard then never treats the server as a
+        # replacement, its behaviour before replacement detection existed.
+        self.env = dict(os.environ, RESURRECT_DIR=str(self.dir), RESURRECT_EXCLUDE="agents tasks",
+                        TMUX="/nonexistent/unitA-guard-sock,0,0", RESURRECT_SERVER_START="",
+                        RESURRECT_RESTORED="", RESURRECT_RESTORING="")
+        self.env.pop("RESURRECT_SAVE_MODE", None)
+        self.env.pop("TMUX_PANE", None)
+        self.n = 0
+        # Snapshot names carry their capture time; these start 6h ago.
+        self.base = int(time.time()) - 6 * 3600
+        (self.dir / "assistant-sessions.json").write_text("{}")
+
+    def write(self, panes, session="main", extra=()):
+        self.n += 1
+        name = "tmux_resurrect_%s.txt" % time.strftime("%Y%m%dT%H%M%S", time.localtime(self.base + self.n))
+        rows = "".join(f"pane\t{session}\t{i}\t1\t:*\t0\tt\t:/\t1\tzsh\t:\n" for i in range(panes))
+        rows += "".join(f"pane\t{s}\t{i}\t1\t:*\t0\tt\t:/\t1\tzsh\t:\n" for s, n in extra for i in range(n))
+        (self.dir / name).write_text(rows + "state\tmain\t\n")
+        return name
+
+    def run_guard(self, *args, mode=None, **extra):
+        env = dict(self.env, **({"RESURRECT_SAVE_MODE": mode} if mode else {}), **extra)
+        return subprocess.run(["bash", str(GUARD), *args], env=env, capture_output=True, text=True, timeout=30)
+
+    def save(self, panes, mode=None, extra=(), **server):
+        """Write a snapshot of `panes` panes, point `last` at it, run the guard."""
+        name = self.write(panes, extra=extra)
+        last = self.dir / "last"
+        last.unlink(missing_ok=True)
+        last.symlink_to(name)
+        r = self.run_guard(mode=mode, **server)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return name
+
+    def capture_epoch(self, name):
+        return int(time.mktime(time.strptime(name[len("tmux_resurrect_"):-4], "%Y%m%dT%H%M%S")))
+
+    def replacement(self, good, uptime=600, **more):
+        """Server facts for a server started AFTER `good` was captured."""
+        start = max(self.capture_epoch(good) + 60, int(time.time()) - uptime)
+        return dict(RESURRECT_SERVER_START=str(start), **more)
+
+    def last(self):
+        return os.readlink(self.dir / "last")
+
+    def state(self):
+        return dict(line.split("=", 1) for line in (self.dir / ".guard-state").read_text().splitlines())
+
+    def test_two_shrunk_saves_seconds_apart_never_confirm_a_crash(self):
+        good = self.save(10)
+        self.save(1)
+        self.save(1)
+        self.save(1)
+        self.assertEqual(self.last(), good)
+        st = self.state()
+        self.assertEqual(st["good_file"], good)
+        self.assertEqual(st["streak"], "3")
+        self.assertTrue(st["first_reject"].isdigit())
+        self.assertIn("shrunk for", (self.dir / "guard.log").read_text())
+
+    def test_a_shrink_held_for_ten_minutes_is_accepted(self):
+        good = self.save(10)
+        self.save(1)
+        st = self.state()
+        (self.dir / ".guard-state").write_text(
+            f"good_file={good}\nstreak={st['streak']}\nfirst_reject={int(st['first_reject']) - 601}\n")
+        shrunk = self.save(1)
+        self.assertEqual(self.last(), shrunk)
+        self.assertEqual(self.state(), dict(good_file=shrunk, streak="0", first_reject=""))
+        self.assertIn("shrink confirmed 2x over", (self.dir / "guard.log").read_text())
+
+    def test_time_alone_is_not_enough(self):
+        # One rejected save, however old, is still one: the streak must hold too.
+        good = self.save(10)
+        (self.dir / ".guard-state").write_text(f"good_file={good}\nstreak=0\nfirst_reject={int(time.time()) - 3600}\n")
+        self.save(1)
+        self.assertEqual(self.last(), good)
+
+    def test_old_state_file_without_first_reject_starts_the_clock_now(self):
+        good = self.save(10)
+        (self.dir / ".guard-state").write_text(f"good_file={good}\nstreak=1\n")
+        self.save(1)
+        self.assertEqual(self.last(), good)
+        st = self.state()
+        self.assertEqual(st["streak"], "2")
+        self.assertLess(abs(int(st["first_reject"]) - time.time()), 30)
+
+    def test_recovery_resets_the_streak_and_the_clock(self):
+        self.save(10)
+        self.save(1)
+        back = self.save(10)
+        self.assertEqual(self.last(), back)
+        self.assertEqual(self.state(), dict(good_file=back, streak="0", first_reject=""))
+
+    def test_a_final_save_is_never_reverted(self):
+        self.save(10)
+        self.save(1)                      # rejected: last reverted
+        final = self.save(1, mode="final")
+        self.assertEqual(self.last(), final)
+        self.assertEqual(self.state()["good_file"], final)
+        self.assertIn("final save before a deliberate kill", (self.dir / "guard.log").read_text())
+
+    # --- replacement servers (review round 1, MED-2) ---------------------------
+
+    def held_too_long(self, good):
+        """State as if the shrink had been rejected many times over an hour."""
+        (self.dir / ".guard-state").write_text(
+            f"good_file={good}\nstreak=9\nfirst_reject={int(time.time()) - 3600}\n")
+
+    def test_a_replacement_server_never_confirms_a_shrink_however_long(self):
+        good = self.save(10)
+        self.held_too_long(good)
+        self.save(1, **self.replacement(good, uptime=3600))
+        self.assertEqual(self.last(), good)
+        self.assertIn("replacement server never restored", (self.dir / "guard.log").read_text())
+
+    def trust_state(self, good, run, ago, streak=9, held=4 * 3600):
+        """A hold streak whose last counted hold was `ago` seconds back."""
+        now = int(time.time())
+        (self.dir / ".guard-state").write_text(
+            f"good_file={good}\nstreak={streak}\nfirst_reject={now - held}\n"
+            f"trust_run={run}\ntrust_at={now - ago}\nlast_hold={now - ago}\n")
+
+    def test_uptime_alone_never_trusts_a_replacement_server(self):
+        # Round 2: wall-clock uptime (like wall-clock `held`) proves nothing.
+        good = self.save(10)
+        self.held_too_long(good)
+        self.save(1, **self.replacement(good, uptime=5 * 3600))
+        self.assertEqual(self.last(), good)
+        self.assertEqual(self.state()["trust_run"], "1")
+
+    def test_laptop_sleep_restarts_the_trust_count(self):
+        # Crash at 18:00, restore skipped, lid closed; first save at 08:00:
+        # 14h of uptime and of `held`, but the previous hold was 14h ago.
+        self.base = int(time.time()) - 20 * 3600
+        good = self.save(10)
+        self.trust_state(good, run=15, ago=14 * 3600, held=14 * 3600)
+        self.save(1, **self.replacement(good, uptime=14 * 3600))
+        self.assertEqual(self.last(), good)
+        st = self.state()
+        self.assertEqual((st["trust_run"], st["last_hold"]), ("1", st["trust_at"]))
+        self.assertIn("1/16 holds in a row", (self.dir / "guard.log").read_text())
+
+    def test_holds_closer_than_the_rejudge_interval_count_once(self):
+        good = self.save(10)
+        self.trust_state(good, run=5, ago=60)
+        self.save(1, **self.replacement(good, uptime=5 * 3600))
+        self.assertEqual(self.state()["trust_run"], "5")
+
+    def test_sixteen_holds_fifteen_minutes_apart_trust_a_fresh_server(self):
+        good = self.save(10)
+        server = self.replacement(good, uptime=5 * 3600)
+        shrunk = None
+        for i in range(1, 17):
+            if i > 1:   # as if the previous hold ran 15 minutes ago
+                self.trust_state(good, run=int(self.state()["trust_run"]), ago=900,
+                                 streak=int(self.state()["streak"]))
+            shrunk = self.save(1, **server)
+            if i < 16:
+                self.assertEqual(self.last(), good, f"accepted after only {i} holds")
+                self.assertEqual(self.state()["trust_run"], str(i))
+        self.assertEqual(self.last(), shrunk)
+        self.assertEqual(self.state(), dict(good_file=shrunk, streak="0", first_reject=""))
+        self.assertIn("16 holds in a row", (self.dir / "guard.log").read_text())
+
+    def test_an_ordinary_server_keeps_streak_and_ten_minutes(self):
+        # Not a replacement: no trust count, the old rule, three-line state.
+        good = self.save(10)
+        self.save(1)
+        self.assertNotIn("trust_run", self.state())
+        self.held_too_long(good)
+        shrunk = self.save(1)
+        self.assertEqual(self.last(), shrunk)
+
+    def test_a_restored_replacement_server_follows_the_normal_rule(self):
+        good = self.save(10)
+        server = self.replacement(good, RESURRECT_RESTORED=str(int(time.time()) - 60))
+        self.save(1, **server)
+        self.assertEqual(self.last(), good)        # streak 1: still held
+        self.held_too_long(good)
+        shrunk = self.save(1, **server)
+        self.assertEqual(self.last(), shrunk)
+
+    def test_the_servers_own_good_save_is_not_a_replacement(self):
+        good = self.save(10)
+        start = dict(RESURRECT_SERVER_START=str(self.capture_epoch(good) - 60))
+        self.held_too_long(good)
+        shrunk = self.save(1, **start)
+        self.assertEqual(self.last(), shrunk)
+
+    # --- check mode: the verdict before `last` moves (MED-3) -------------------
+
+    def test_check_rejects_without_touching_last_and_counts_once(self):
+        good = self.save(10)
+        shrunk = self.write(1)
+        r = self.run_guard("check", shrunk)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        held_on, reason = r.stdout.rstrip("\n").split("\x1f")
+        self.assertEqual((held_on, self.last()), (good, good))
+        self.assertIn("1 pane(s) vs 10", reason)
+        self.assertEqual(self.state()["streak"], "1")
+        self.assertEqual(self.run_guard("check", self.write(1)).returncode, 2)
+        self.assertEqual(self.state()["streak"], "2")
+
+    def test_check_accepts_without_writing_state_and_the_bookkeeping_run_agrees(self):
+        good = self.save(10)
+        (self.dir / ".guard-state").write_text(f"good_file={good}\nstreak=1\nfirst_reject={int(time.time()) - 601}\n")
+        before = (self.dir / ".guard-state").read_text()
+        shrunk = self.write(1)
+        r = self.run_guard("check", shrunk)
+        self.assertEqual((r.returncode, r.stdout), (0, ""), r.stderr)
+        self.assertEqual((self.dir / ".guard-state").read_text(), before)
+        (self.dir / "last").unlink()
+        (self.dir / "last").symlink_to(shrunk)
+        self.assertEqual(self.run_guard().returncode, 0)
+        self.assertEqual(self.last(), shrunk)
+        self.assertEqual(self.state(), dict(good_file=shrunk, streak="0", first_reject=""))
+        self.assertEqual(self.run_guard().returncode, 0)              # idempotent
+        self.assertEqual(self.state(), dict(good_file=shrunk, streak="0", first_reject=""))
+
+    def test_check_holds_a_final_save_on_a_replacement_that_never_restored(self):
+        good = self.save(1)
+        r = self.run_guard("check", self.write(5), mode="final", **self.replacement(good))
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stdout.split("\x1f")[1].strip(), "replacement server never restored")
+        restored = self.replacement(good, RESURRECT_RESTORED=str(int(time.time())))
+        self.assertEqual(self.run_guard("check", self.write(1), mode="final", **restored).returncode, 0)
+
+    def test_check_holds_a_final_save_mid_restore(self):
+        self.save(10)
+        live = dict(RESURRECT_RESTORING=str(int(time.time()) - 5))
+        r = self.run_guard("check", self.write(10), mode="final", **live)
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stdout.split("\x1f")[1].strip(), "restore in progress")
+        for stale in (str(int(time.time()) - 901), str(int(time.time()) + 3600), "x"):
+            self.assertEqual(self.run_guard("check", self.write(10), mode="final",
+                                            RESURRECT_RESTORING=stale).returncode, 0, stale)
+
+    # --- MED-4 / LOW-7 ---------------------------------------------------------
+
+    def test_a_save_identical_to_the_good_one_resets_the_hold(self):
+        good = self.save(10)
+        self.save(1)
+        self.assertEqual(self.state()["streak"], "1")
+        # resurrect-save.sh kept `last` on the good file (identical content).
+        self.assertEqual(self.last(), good)
+        self.assertEqual(self.run_guard().returncode, 0)
+        self.assertEqual(self.state(), dict(good_file=good, streak="0", first_reject=""))
+
+    def test_exclusions_are_shell_patterns(self):
+        self.env["RESURRECT_EXCLUDE"] = "agents tasks ptymcp-*"
+        self.save(10, extra=(("ptymcp-1", 20), ("ptymcp-two", 5)))
+        same = self.save(10)        # the throwaways went away: not a shrink
+        self.assertEqual(self.last(), same)
+        self.assertEqual(self.state()["streak"], "0")
 
 
 # The shared fake tmux has no target-less `display-message -p`; this wrapper

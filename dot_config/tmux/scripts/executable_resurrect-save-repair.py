@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Repair save metadata from verified foreground owners, never cwd guesses."""
 import argparse
+import fnmatch
 import hashlib
 import importlib.util
 import io
@@ -39,19 +40,72 @@ def load_owner(path):
     return owner
 
 
-def pane_snapshot(socket):
+def excluded_sessions(socket):
+    """@resurrect-exclude-sessions, as resurrect-save.sh reads it: a set of
+    shell `case` patterns (`ptymcp-*`), matched against whole session names.
+
+    resurrect-save.sh exports it as RESURRECT_EXCLUDE before running this hook;
+    run by hand, tmux is asked. Unset means "agents tasks", like the save.
+    """
+    value = os.environ.get("RESURRECT_EXCLUDE")
+    if value is None:
+        try:
+            value = run(["tmux", "-S", socket, "show-option", "-gqv", "@resurrect-exclude-sessions"])
+        except (OSError, subprocess.SubprocessError):
+            value = ""
+    return set((value or "agents tasks").split())
+
+
+def is_excluded(session, patterns):
+    """resurrect-save.sh's `case "$session" in $pattern)`; fnmatch is the same
+    glob language for these (* ? [...] [!...]), case-sensitive."""
+    return any(fnmatch.fnmatchcase(session, pattern) for pattern in patterns)
+
+
+class Snapshot(dict):
+    """pane_snapshot()'s result: live panes by id, plus `invalid`, the targets
+    (session:window.pane) of NON-excluded panes whose live row could not be
+    read. Those panes are unknown, not absent: repair() keeps their plugin rows
+    exactly as saved rather than dropping or rebuilding them."""
+    invalid = frozenset()
+
+
+def pane_snapshot(socket, exclude=()):
+    """Live panes by id, minus excluded sessions and rows that cannot be trusted.
+
+    Panes of sessions the save never writes (@resurrect-exclude-sessions) are
+    left out silently: nothing here can apply to them. A row that fails
+    validation is SKIPPED and reported on stderr, not fatal: on 2026-10-15 one
+    tmux-pty-mcp shell in the excluded `agents` session reported an empty cwd,
+    and that one row failed every save's repair, leaving the Codex sidecar
+    unrepaired for all panes. A skipped pane's target is kept in `.invalid`.
+    """
     fields = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_path}\t#{pane_active}\t#{pane_current_command}\t#{pane_pid}\t:#{@stash_session}\t:#{@stash_pane_idx}\t:#{@stash_cwd}"
-    panes = {}
+    panes, skipped, invalid = Snapshot(), [], set()
     for line in run(["tmux", "-S", socket, "list-panes", "-a", "-F", fields]).splitlines():
         values = line.split("\t")
+        if len(values) < 6:
+            skipped.append((values[0], "short row"))
+            continue
         pane, target, cwd, active, command, pid = values[:6]
+        # Session names cannot contain ':' (tmux rewrites it), so this is exact.
+        if is_excluded(target.split(":", 1)[0], exclude):
+            continue
         metadata = values[6:] or [":", ":", ":"]
         if len(metadata) != 3 or any(not value.startswith(":") for value in metadata):
-            raise ValueError("Invalid live parked pane metadata")
+            skipped.append((pane, f"{target}: invalid parked pane metadata"))
+            invalid.add(target)
+            continue
         if not re.fullmatch(r"%\d+", pane) or not os.path.isabs(cwd) or active not in ("0", "1"):
-            raise ValueError("Invalid live pane snapshot")
+            skipped.append((pane, f"{target}: invalid pane id, cwd or active flag"))
+            invalid.add(target)
+            continue
         panes[pane] = dict(target=target, cwd=cwd, active=active, command=command, pid=pid)
         panes[pane].update(zip(("stash_session", "stash_pane_idx", "stash_cwd"), (value[1:] for value in metadata)))
+    if skipped:
+        print("resurrect save repair: skipped invalid live pane row(s): "
+              + ", ".join(f"{pane} ({why})" for pane, why in skipped), file=sys.stderr)
+    panes.invalid = frozenset(invalid)
     return panes
 
 
@@ -399,7 +453,13 @@ def standalone_entry(entry, targets, used, codex_home, owner, panes, socket, tra
 def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_dir):
     socket = os.path.realpath(socket)
     data = json.loads(sidecar)
-    sessions = [entry for entry in data["sessions"] if entry.get("tool") != "codex"]
+    # A pane whose live row was unreadable (Snapshot.invalid) can be neither
+    # verified nor ruled out: its plugin Codex row stays exactly as saved, and
+    # nothing below rebuilds or drops it.
+    unknown = set(getattr(panes, "invalid", ()))
+    kept_unverified = [entry for entry in data["sessions"]
+                       if entry.get("tool") == "codex" and entry.get("pane") in unknown]
+    sessions = [entry for entry in data["sessions"] if entry.get("tool") != "codex"] + kept_unverified
     targets = {f"{f[1]}:{f[2]}.{f[5]}" for line in layout.splitlines()
                if (f := line.split("\t"))[0] == "pane" and len(f) >= 6}
     rebuilt, used, invalid, fallback = [], set(), 0, 0
@@ -441,6 +501,7 @@ def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_d
     accepted = {int(entry["pid"]) for entry in rebuilt}
     candidates = [entry for entry in data["sessions"]
                   if entry.get("tool") == "codex" and str(entry.get("pid", "")).isdigit()
+                  and entry.get("pane") not in unknown
                   and int(entry["pid"]) not in accepted and owner.process_identity(int(entry["pid"]))]
     unresolved, standalone = [], 0
     for verified in (True, False):
@@ -500,7 +561,7 @@ def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_d
         lines.append(line)
     report = dict(codex=len(rebuilt), preserved=len(sessions), invalid_bindings=invalid, repaired_panes=fixed,
                   fallback_bindings=fallback, parked_cwds=parked_cwds, standalone_resumes=standalone,
-                  unresolved_dropped=len(set(unresolved)))
+                  unresolved_dropped=len(set(unresolved)), kept_unverified=len(kept_unverified))
     return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode(), "".join(lines).encode(), used, report
 
 
@@ -548,7 +609,7 @@ def main(argv=None):
     sidecar, layout = args.resurrect_dir / "assistant-sessions.json", (args.resurrect_dir / "last").resolve(strict=True)
     records = json.loads(args.bindings.read_text()) if args.bindings.exists() else {}
     revised, repaired, targets, report = repair(sidecar.read_text(), layout.read_text(), records,
-        pane_snapshot(socket), socket, load_owner(args.owner_helper), args.codex_home.resolve(), args.tracker_dir)
+        pane_snapshot(socket, excluded_sessions(socket)), socket, load_owner(args.owner_helper), args.codex_home.resolve(), args.tracker_dir)
     archive = args.resurrect_dir / "pane_contents.tar.gz"
     contents, removed = stripped_archive(archive, targets)
     report.update(stripped_contents=removed, dry_run=args.dry_run)

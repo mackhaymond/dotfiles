@@ -227,6 +227,83 @@ class SaveRepairTests(unittest.TestCase):
         with patch.object(repair, "run", return_value="%7\tmain:7.1\t/shared\t1\tzsh\t77"):
             self.assertEqual(repair.pane_snapshot(self.socket)["%7"]["stash_session"], "")
 
+    def test_snapshot_skips_excluded_sessions_and_invalid_rows_instead_of_aborting(self):
+        # 2026-10-15: one `agents` pane with an empty cwd failed every save's repair.
+        rows = "\n".join([
+            "%7\tmain:7.1\t/shared\t1\tzsh\t77",
+            "%90\tagents:3.1\t\t1\tzsh\t90",          # excluded session, empty cwd
+            "%91\ttasks:1.1\trelative\t1\tzsh\t91",   # excluded session
+            "%8\twork:2.1\t\t0\tzsh\t78",             # NOT excluded, empty cwd: skipped, reported
+            "%9\twork:3.1\t/w\t0\tzsh\t79\t:a\tb\t:c",  # bad parked metadata: skipped, reported
+            "junk",
+        ])
+        with patch.object(repair, "run", return_value=rows), patch("sys.stderr", new=io.StringIO()) as err:
+            panes = repair.pane_snapshot(self.socket, {"agents", "tasks"})
+        self.assertEqual(set(panes), {"%7"})
+        self.assertNotIn("%90", err.getvalue())
+        self.assertNotIn("%91", err.getvalue())
+        for pane in ("%8 (work:2.1", "%9 (work:3.1", "junk (short row)"):
+            self.assertIn(pane, err.getvalue())
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+
+    def test_main_repairs_despite_an_excluded_pane_with_no_cwd(self):
+        sidecar, layout = self.root / "assistant-sessions.json", self.root / "save.txt"
+        sidecar.write_text(self.sidecar)
+        layout.write_text(self.layout)
+        (self.root / "last").symlink_to(layout.name)
+        bindings = self.root / "bindings.json"
+        bindings.write_text(json.dumps({"correct": self.record}))
+        helper = self.root / "owner.py"
+        helper.write_text("def valid(record): return True\ndef process_identity(pid): return None\n")
+        snapshot = "%7\tmain:7.1\t/shared\t1\tzsh\t77\n%90\tagents:3.1\t\t1\tzsh\t90"
+        def command(arguments):
+            if arguments[0] == "tmux":
+                self.assertIn("list-panes", arguments)  # the exclusion came from the env, not tmux
+                return snapshot
+            return "codex --remote unix:///tmp/cx-tmux-xx/s"
+        with patch.object(repair, "run", side_effect=command), patch("sys.stdout", new=io.StringIO()) as out, \
+                patch.dict(repair.os.environ, RESURRECT_EXCLUDE="agents tasks"):
+            repair.main(["--resurrect-dir", str(self.root), "--bindings", str(bindings), "--socket", self.socket,
+                         "--owner-helper", str(helper), "--codex-home", str(self.codex),
+                         "--tracker-dir", str(self.tracker)])
+        self.assertEqual(json.loads(out.getvalue())["codex"], 1)
+        self.assertEqual(json.loads(sidecar.read_text())["sessions"][1]["session_id"], "correct")
+
+    def test_an_unreadable_live_row_keeps_that_panes_plugin_row(self):
+        # LOW-12: a NON-excluded pane whose live row is invalid cannot be
+        # verified either way, so its plugin row stays exactly as saved.
+        sidecar, layout = self.root / "assistant-sessions.json", self.root / "save.txt"
+        sidecar.write_text(self.sidecar)
+        layout.write_text(self.layout + self.row("main", 4))
+        (self.root / "last").symlink_to(layout.name)
+        helper = self.root / "owner.py"
+        helper.write_text("def valid(record): return True\ndef process_identity(pid): return None\n")
+        snapshot = "%7\tmain:7.1\t/shared\t1\tzsh\t77\n%4\tmain:4.1\t\t1\tzsh\t44\n%90\tptymcp-3:1.1\t\t1\tzsh\t90"
+        def command(arguments):
+            return snapshot if arguments[0] == "tmux" else "codex --remote unix:///tmp/cx-tmux-xx/s"
+        with patch.object(repair, "run", side_effect=command), patch("sys.stdout", new=io.StringIO()) as out, \
+                patch("sys.stderr", new=io.StringIO()) as err, \
+                patch.dict(repair.os.environ, RESURRECT_EXCLUDE="agents tasks ptymcp-*"):
+            repair.main(["--resurrect-dir", str(self.root), "--bindings", str(self.root / "none.json"),
+                         "--socket", self.socket, "--owner-helper", str(helper), "--codex-home", str(self.codex),
+                         "--tracker-dir", str(self.tracker)])
+        original = json.loads(self.sidecar)["sessions"][1]
+        self.assertIn(original, json.loads(sidecar.read_text())["sessions"])
+        self.assertEqual(json.loads(out.getvalue())["kept_unverified"], 1)
+        self.assertIn("%4 (main:4.1", err.getvalue())
+        self.assertNotIn("ptymcp", err.getvalue())   # glob-excluded: skipped silently
+
+    def test_exclusion_list_defaults_like_the_save(self):
+        with patch.dict(repair.os.environ, RESURRECT_EXCLUDE=""):
+            self.assertEqual(repair.excluded_sessions(self.socket), {"agents", "tasks"})
+        with patch.dict(repair.os.environ, RESURRECT_EXCLUDE="none"):
+            self.assertEqual(repair.excluded_sessions(self.socket), {"none"})
+        with patch.dict(repair.os.environ, clear=False) as env, \
+                patch.object(repair, "run", return_value="agents scratch") as command:
+            env.pop("RESURRECT_EXCLUDE", None)
+            self.assertEqual(repair.excluded_sessions(self.socket), {"agents", "scratch"})
+        self.assertIn("@resurrect-exclude-sessions", command.call_args.args[0])
+
     def test_dry_run_writes_nothing_and_apply_preserves_layout_symlink(self):
         sidecar, layout = self.root / "assistant-sessions.json", self.root / "save.txt"
         sidecar.write_text(self.sidecar)

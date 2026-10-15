@@ -32,6 +32,18 @@ INPUT_FILE="$RESURRECT_DIR/assistant-sessions.json"
 LOG_FILE="$RESURRECT_DIR/assistant-restore.log"
 EXCLUDE="$(tmux show-option -gqv @resurrect-exclude-sessions 2>/dev/null)"
 EXCLUDE="${EXCLUDE:-agents tasks}"
+# Entries are shell `case` patterns (`ptymcp-*`), as in resurrect-save.sh; an
+# exact name is its own pattern.
+is_excluded() {
+	local p IFS=$' \t\n'
+	set -f
+	for p in $EXCLUDE; do
+		# shellcheck disable=SC2254 # a pattern on purpose
+		case "$1" in $p) set +f; return 0 ;; esac
+	done
+	set +f
+	return 1
+}
 CLIENT_WAIT="$(tmux show-option -gqv @assistant-resurrect-client-wait 2>/dev/null)"
 CLIENT_WAIT="${CLIENT_WAIT:-3}" # seconds, once per restore
 SHELL_WAIT=20                   # seconds, once per restore
@@ -136,7 +148,7 @@ first="" rest=""
 while IFS="$US" read -r pane tool sid cwd cmd; do
 	[ -n "$pane" ] || continue
 	sess="${pane%%:*}"
-	case " $EXCLUDE " in *" $sess "*) log "session '$sess' is excluded, skipping $pane"; continue ;; esac
+	if is_excluded "$sess"; then log "session '$sess' is excluded, skipping $pane"; continue; fi
 	if [ -z "$cmd" ]; then
 		log "unknown tool '$tool' for pane $pane, skipping"
 		continue

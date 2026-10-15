@@ -91,9 +91,26 @@ main "$@"
 
 EXCLUDE="$(tmux show-option -gqv @resurrect-exclude-sessions 2>/dev/null || true)"
 EXCLUDE="${EXCLUDE:-agents tasks}"
+# Entries are shell `case` patterns (`ptymcp-*`), as in resurrect-save.sh,
+# resurrect-guard.sh and the repair; an exact name is its own pattern. The
+# sessions they match are handed to jq by exact name, newline-delimited.
+is_excluded() {
+	local p IFS=$' \t\n'
+	set -f
+	for p in $EXCLUDE; do
+		# shellcheck disable=SC2254 # a pattern on purpose
+		case "$1" in $p) set +f; return 0 ;; esac
+	done
+	set +f
+	return 1
+}
 if [ -s "$OUTPUT_FILE" ]; then
-	filtered="$(jq --arg ex " $EXCLUDE " '
-		.sessions |= map(select(((.pane // "") | split(":")[0]) as $s | ($ex | contains(" " + $s + " ")) | not))
+	ex=$'\n'
+	while IFS= read -r s; do
+		if is_excluded "$s"; then ex+="$s"$'\n'; fi
+	done < <(jq -r '.sessions[]? | (.pane // "") | split(":")[0]' "$OUTPUT_FILE" 2>/dev/null || true)
+	filtered="$(jq --arg ex "$ex" '
+		.sessions |= map(select(((.pane // "") | split(":")[0]) as $s | ($ex | contains("\n" + $s + "\n")) | not))
 	' "$OUTPUT_FILE")" || exit 0
 	if [ -n "$filtered" ] && [ "$filtered" != "$(jq . "$OUTPUT_FILE")" ]; then
 		printf '%s\n' "$filtered" >"$OUTPUT_FILE.$$" && mv -f "$OUTPUT_FILE.$$" "$OUTPUT_FILE"
