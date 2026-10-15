@@ -119,7 +119,7 @@ FULL=$(cat <<'EOF'
         "hooks": [
           {
             "type": "command",
-            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun --no-env-file {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
           }
         ]
       },
@@ -148,7 +148,7 @@ FULL=$(cat <<'EOF'
         "hooks": [
           {
             "type": "command",
-            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun --no-env-file {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
           }
         ]
       }
@@ -159,7 +159,7 @@ FULL=$(cat <<'EOF'
         "hooks": [
           {
             "type": "command",
-            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun --no-env-file {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
           }
         ]
       },
@@ -168,7 +168,7 @@ FULL=$(cat <<'EOF'
         "hooks": [
           {
             "type": "command",
-            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/pty-read-only.ts",
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun --no-env-file {{ .chezmoi.homeDir }}/.claude/hooks/pty-read-only.ts",
             "timeout": 10
           }
         ]
@@ -273,7 +273,7 @@ FULL=$(cat <<'EOF'
         "hooks": [
           {
             "type": "command",
-            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun --no-env-file {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
           }
         ]
       },
@@ -340,7 +340,7 @@ FULL=$(cat <<'EOF'
         "hooks": [
           {
             "type": "command",
-            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun --no-env-file {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
           }
         ]
       },
