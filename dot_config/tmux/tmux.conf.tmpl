@@ -604,8 +604,8 @@ bind-key C-q run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T 
 # needs you" across tmux agents AND external apps (Codex/Claude desktop): it
 # reads `agent-jump.sh list`, picks one target, lands a tmux one with
 # `agent-jump.sh jump <tty> <win> <session>` and activates WezTerm. Option-X
-# still works after CuaNotch's tmux jumps, because `jump` records the same
-# back-chain as `next`.
+# steps back from those jumps like any other move (nav.sh records every
+# switch); prefix D still unwinds the whole Option-S chain at once.
 bind-key -n M-s run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
 # Browser-style history per client (nav.sh): the hooks only say which client
 # may have moved; nav.sh reads where it is now and records it.

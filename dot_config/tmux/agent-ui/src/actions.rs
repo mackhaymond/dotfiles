@@ -6,7 +6,8 @@
 //! |-------------------|----------------------------------------------------------|-------------------|
 //! | go to a window    | `bash agent-jump.sh goto <tty> <win> <session>` (10 s)   | `Roster.go/jump`  |
 //! | go to a parked one| `tmux run-shell -b "stash.sh unstash <win> <tty>"`       | `Roster.go`       |
-//! | next / back       | `bash agent-jump.sh next|back <tty>`                     | `Roster.jump`     |
+//! | next              | `bash agent-jump.sh next <tty>`                          | `Roster.jump`     |
+//! | back (⌥X)         | `bash nav.sh back <tty>` (docs/nav.md)                   | (none)            |
 //! | go to a session   | goto on that session's ACTIVE window, in that session    | `Strip.click`     |
 //! | park              | `run-shell -b "stash.sh stash <win>"`                    | `Roster.act` H    |
 //! | close             | `run-shell -b "closed-tabs.sh close <pane>"` (agent pane)| `Roster.act` x    |
@@ -221,9 +222,19 @@ impl Actions {
         self.jump("next", client, &[])
     }
 
-    /// agent-jump.sh back: undo a run of `next`s.
+    /// nav.sh back: Option-X everywhere (the root key, this menu, the
+    /// sidebar's back button) is the one browser-style history, one step
+    /// back through every tab the client was on (docs/nav.md). The client is
+    /// the tty the popup was opened for, which is the client's name too.
     pub fn back(&self, client: &str) -> Result<(), String> {
-        self.jump("back", client, &[])
+        let mut c = Command::new("bash");
+        c.arg(self.script("nav.sh")).arg("back").arg(client);
+        self.tmux.script_env(&mut c);
+        match proc::run(c, None, JUMP_TIMEOUT) {
+            Ok(_) => Ok(()),
+            Err(RunError::Timeout) => Err("nav.sh back timed out".into()),
+            Err(RunError::Spawn(e)) => Err(format!("nav.sh back failed: {e}")),
+        }
     }
 
     /// Strip.click on a session header: goto that session's ACTIVE window,

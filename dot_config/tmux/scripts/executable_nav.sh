@@ -37,6 +37,11 @@
 # so a writer that read stale history (a hook racing a key) changes nothing
 # and retries from a fresh read. tmux runs one command list at a time, so
 # check-and-write is atomic; nothing can be left locked by a dead process.
+# A lost race retries for as long as other writers keep winning (up to
+# MAX_RACES in a row, so a burst of Option-X presses all land); a retry re-reads
+# only the client and the history, not the window table. Only a move that
+# FAILED (its window vanished after the listing) re-lists the windows, at most
+# MAX_FAILS times.
 #
 # back/forward first catch up with a move whose hook has not run yet (moved,
 # then pressed Option-X at once), then pop. They skip, and drop, entries whose
@@ -45,7 +50,9 @@
 # a tab parked into stash). A window moved to another visible session is
 # followed there. Never into a hidden session; across spaces is fine
 # (select-window, then switch-client: the order agent-jump.sh uses so the
-# after-select-window tint discharge fires). A client sitting in a hidden
+# after-select-window tint discharge fires; the switch only when the target
+# session differs from the client's, since a same-session switch-client would
+# fire every client-session-changed hook for nothing). A client sitting in a hidden
 # session (a popup client, say) records nothing; back from there returns to
 # <cur>. The sidebar's focus notification is already posted by the
 # session-window-changed[50] / client-session-changed[50] hooks the move fires.
@@ -63,7 +70,10 @@ US=$'\x1f'
 NL=$'\n'
 CAP="${NAV_CAP:-50}"
 HIDDEN='#{?#{||:#{@space_hidden},#{m:* #{session_name} *, #{@space_hidden_sessions} }},1,0}'
-TRIES=5
+MAX_RACES=50                           # lost compare-and-sets in a row
+MAX_FAILS=3                            # moves that failed (target vanished)
+TRIES=5                                # attach's reset
+ROWS=$NL
 
 mode="${1:-}"
 
@@ -75,20 +85,21 @@ usage() {
 # display-message takes a format: double every # so nothing expands.
 say() { tmux display-message -c "$client" "${1//\#/##}" 2>/dev/null; }
 
-win_of() { printf '%s' "${1#*:}"; }
-
 # load [windows]: ONE tmux call. Sets act (the client's "<session>:<window>"
 # now), act_hidden, seq, state, cur, back[], fwd[]; with `windows`, also
-# ROWS: "\n<session>:<window> <hidden>\n..." for every linked window.
-# Fails if the client is not attached.
+# ROWS: "\n<session>:<window> <hidden>\n..." for every linked window
+# (without it, ROWS keeps its last listing). Fails if the client is not
+# attached.
 load() {
     local args out tag a b c
     args=(list-clients -F "C${US}#{client_name}${US}#{session_id}:#{window_id}${US}${HIDDEN}"
           \; display-message -p "S${US}#{@nav_seq_${K}}${US}#{@nav_${K}}")
-    [ "${1:-}" = windows ] &&
+    if [ "${1:-}" = windows ]; then
         args+=(\; list-windows -a -F "W${US}#{session_id}:#{window_id} ${HIDDEN}")
+        ROWS=$NL
+    fi
     out=$(tmux "${args[@]}" 2>/dev/null) || return 1
-    act= act_hidden=1 seq= state= ROWS=$NL
+    act= act_hidden=1 seq= state=
     while IFS="$US" read -r tag a b c; do
         case "$tag" in
             C) [ "$a" = "$client" ] && { act=$b; act_hidden=$c; } ;;
@@ -106,25 +117,33 @@ load() {
 }
 
 # commit [moves]: compare-and-set the history, running <moves> (a tmux command
-# list ending in " ; ") first, in the same list. 0 written, 1 lost the race or
-# the move failed (re-read and try again).
+# list ending in " ; ") first, in the same list. 0 written; 1 lost the race
+# (another writer bumped the counter: re-read the history and try again);
+# 2 the list failed (the move's target vanished, or the client left).
 commit() {
     local IFS=' ' new next r
     new="$cur|${back[*]}|${fwd[*]}"
     case "$seq" in '' | *[!0-9]*) next=1 ;; *) next=$((seq + 1)) ;; esac
     r=$(tmux if-shell -F "#{==:#{@nav_seq_${K}},${seq}}" \
         "${1:-}set-option -g @nav_${K} '${new}' ; set-option -g @nav_seq_${K} ${next}" \
-        "display-message -p NAV-CAS-FAIL" 2>&1) || return 1
+        "display-message -p NAV-CAS-FAIL" 2>&1) || return 2
     case "$r" in *NAV-CAS-FAIL*) return 1 ;; esac
     return 0
+}
+
+# moves_to <entry>: the tmux command list that lands the client on <entry>.
+# Select first, then switch (see the header), and switch only across sessions.
+moves_to() {
+    moves="select-window -t '$1' ; "
+    [ "${1%%:*}" = "${act%%:*}" ] || moves+="switch-client -c '$client' -t '${1%%:*}' ; "
 }
 
 # push_back <entry>: onto back's end, collapsing a repeat of its last window,
 # capped at CAP (oldest dropped). Same for push_fwd.
 push_back() {
     [ -n "$1" ] || return 0
-    local n=${#back[@]}
-    if [ "$n" -gt 0 ] && [ "$(win_of "${back[n-1]}")" = "$(win_of "$1")" ]; then return 0; fi
+    local n=${#back[@]} last
+    if [ "$n" -gt 0 ]; then last=${back[n-1]}; [ "${last#*:}" = "${1#*:}" ] && return 0; fi
     back+=("$1")
     n=${#back[@]}
     [ "$n" -gt "$CAP" ] && back=("${back[@]:n-CAP}")
@@ -132,8 +151,8 @@ push_back() {
 }
 push_fwd() {
     [ -n "$1" ] || return 0
-    local n=${#fwd[@]}
-    if [ "$n" -gt 0 ] && [ "$(win_of "${fwd[n-1]}")" = "$(win_of "$1")" ]; then return 0; fi
+    local n=${#fwd[@]} last
+    if [ "$n" -gt 0 ]; then last=${fwd[n-1]}; [ "${last#*:}" = "${1#*:}" ] && return 0; fi
     fwd+=("$1")
     n=${#fwd[@]}
     [ "$n" -gt "$CAP" ] && fwd=("${fwd[@]:n-CAP}")
@@ -144,7 +163,7 @@ push_fwd() {
 catch_up() {
     [ "$act_hidden" = 0 ] || return 1
     [ "$act" = "$cur" ] && return 1
-    if [ "$(win_of "$act")" != "$(win_of "$cur")" ]; then
+    if [ "${act#*:}" != "${cur#*:}" ]; then
         push_back "$cur"
         fwd=()
     fi
@@ -157,8 +176,7 @@ catch_up() {
 # client's session if it holds it, else the first visible session that does.
 # Fails if the window is gone or only lives in hidden sessions. Needs ROWS.
 resolve() {
-    local w s row
-    w=$(win_of "$1")
+    local w=${1#*:} s row
     case "$ROWS" in *"$NL$1 0$NL"*) go=$1; return 0 ;; esac
     s=${act%%:*}
     case "$ROWS" in *"$NL$s:$w 0$NL"*) go="$s:$w"; return 0 ;; esac
@@ -169,30 +187,27 @@ resolve() {
 }
 
 record_one() {
-    local i
-    for ((i = 0; i < TRIES; i++)); do
-        load || return 0
+    local races=0
+    while load; do
         catch_up || return 0
-        commit && return 0
+        commit
+        [ $? -eq 1 ] || return 0       # written, or tmux refused: done either way
+        ((++races < MAX_RACES)) || return 0
     done
 }
 
 move() {                               # move back|forward
-    local dir=$1 i e n found
-    for ((i = 0; i < TRIES; i++)); do
-        load windows || return 0
+    local dir=$1 e n found rc races=0 fails=0 list=windows
+    while load $list; do
+        list=                          # retries after a lost race keep ROWS
+        found=
         if [ "$act_hidden" = 1 ]; then
             # In a hidden session: back (or forward) means "out of here".
-            if [ -n "$cur" ] && resolve "$cur"; then
-                cur=$go
-                commit "select-window -t '$go' ; switch-client -c '$client' -t '${go%%:*}' ; " && return 0
-                continue
-            fi
+            [ -n "$cur" ] && resolve "$cur" && found=here
         else
             catch_up
         fi
-        found=
-        while :; do
+        while [ -z "$found" ]; do
             if [ "$dir" = back ]; then n=${#back[@]}; else n=${#fwd[@]}; fi
             [ "$n" -gt 0 ] || break
             if [ "$dir" = back ]; then
@@ -200,17 +215,26 @@ move() {                               # move back|forward
             else
                 e=${fwd[n-1]}; fwd=("${fwd[@]:0:n-1}")
             fi
-            [ "$(win_of "$e")" = "$(win_of "$cur")" ] && continue
-            resolve "$e" && { found=1; break; }
+            [ "${e#*:}" = "${cur#*:}" ] && continue
+            resolve "$e" && found=1
         done
         if [ -z "$found" ]; then
             commit                     # keep the catch-up and the dropped entries
+            if [ $? -eq 1 ] && ((++races < MAX_RACES)); then continue; fi
             if [ "$dir" = back ]; then say "nothing to go back to"; else say "nothing to go forward to"; fi
             return 0
         fi
-        if [ "$dir" = back ]; then push_fwd "$cur"; else push_back "$cur"; fi
+        if [ "$found" = 1 ]; then
+            if [ "$dir" = back ]; then push_fwd "$cur"; else push_back "$cur"; fi
+        fi
         cur=$go
-        commit "select-window -t '$go' ; switch-client -c '$client' -t '${go%%:*}' ; " && return 0
+        moves_to "$go"
+        commit "$moves"; rc=$?
+        case $rc in
+            0) return 0 ;;
+            1) ((++races < MAX_RACES)) || return 0 ;;
+            *) ((++fails < MAX_FAILS)) || return 0; list=windows ;;
+        esac
     done
 }
 
@@ -224,12 +248,11 @@ case "$mode" in
                 record_one
                 ;;
             session)
-                tmux list-clients -F "#{client_name}${US}#{session_id}" 2>/dev/null |
                 while IFS="$US" read -r c s; do
                     [ "$s" = "$target" ] || continue
                     client=$c K=${client//[^A-Za-z0-9]/_}
                     record_one
-                done
+                done <<<"$(tmux list-clients -F "#{client_name}${US}#{session_id}" 2>/dev/null)"
                 ;;
             *) usage ;;
         esac

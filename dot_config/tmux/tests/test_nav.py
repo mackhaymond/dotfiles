@@ -247,6 +247,33 @@ class Nav(unittest.TestCase):
             self.assertFalse(any(a == b for a, b in zip(wins, wins[1:])), seq)
         self.back(c, *(("main", h["back"][-1].split(":")[1]) if h["back"] else ("main", h["cur"].split(":")[1])))
 
+    def test_a_burst_of_back_presses_all_land(self):
+        c = self.attach()
+        for w in self.main[1:] + self.other:
+            self.go(c, "other" if w in self.other else "main", w)
+        # six presses at once: each its own run-shell, all racing for the CAS
+        self.t("send-keys", "-K", "-c", c, *["M-x"] * 6)
+        self.wait(lambda: self.on(c), self.e("main", self.main[0]), timeout=10)
+        self.settle(c)
+        self.assertEqual(self.hist(c)["back"], [])
+        self.assertEqual(len(self.hist(c)["fwd"]), 6)
+
+    def test_back_within_a_session_does_not_switch_client(self):
+        c = self.attach()
+        self.go(c, "main", self.main[1])
+        self.go(c, "other", self.other[0])
+        self.go(c, "main", self.main[2])
+        self.t("set", "-g", "@csc", "0")
+        self.t("set-hook", "-g", "client-session-changed[99]", "set -gF @csc '#{e|+:#{@csc},1}'")
+        self.back(c, "other", self.other[0])            # across sessions: one switch
+        self.wait(lambda: self.t("show", "-gv", "@csc"), "1")
+        self.go(c, "main", self.main[3])                  # a switch of the test's own: 2
+        self.wait(lambda: self.t("show", "-gv", "@csc"), "2")
+        self.go(c, "main", self.main[4])
+        self.back(c, "main", self.main[3])                # same session: no switch
+        self.settle(c)
+        self.assertEqual(self.t("show", "-gv", "@csc"), "2")
+
     def test_dead_and_hidden_entries_are_skipped(self):
         c = self.attach()
         a, dead, parked, d = self.main[0], self.main[1], self.main[2], self.main[3]

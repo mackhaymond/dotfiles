@@ -41,16 +41,28 @@ to the start of the chain in one step.
 
 - **Recording.** The hooks only say who may have moved. The script reads
   where that client is now, so a late or reordered `run-shell -b` hook can
-  only record the truth. That costs one fork per focus change, gated in-server
-  so that hidden and unwatched sessions cost nothing.
+  only record the truth.
+- **Cost.** Each hook that fires runs `run-shell -b` once: `sh`, then `bash
+  nav.sh`, then one tmux call to read where the client is and its history. A
+  second tmux call writes, but only when the client really moved.
+  `record session` (the session-window-changed hook) first spends one more
+  tmux call on `list-clients`. A switch to another space can fire both hooks,
+  and so both runs. Nothing else forks: no subshells beyond capturing those
+  tmux outputs. The gates run in the server, so a window change in a hidden
+  session or one nobody is looking at runs nothing.
 - **Back/forward are not navigations.** The new history (cur = target) is
   written in the same tmux command list as the move
-  (`select-window ; switch-client ; set-option`). When the move's own hooks
+  (`select-window ; [switch-client ;] set-option`; the switch only when the
+  target is in another session). When the move's own hooks
   run, they find the client already on `cur` and do nothing. `cur` is the
   per-client marker.
 - **No lock.** Every write is a compare-and-set on the counter
   (`if -F "#{==:#{@nav_seq_<key>},<read>}" {...}`). tmux runs one command list
-  at a time. A writer that read stale state changes nothing and retries.
+  at a time. A writer that read stale state changes nothing. It retries for as
+  long as other writers keep winning (up to 50 in a row), so a burst of
+  Option-X presses all land. A retry re-reads only the client and its history.
+  The window table is listed again only after a move failed because its target
+  vanished (at most 3 times).
 - Back first catches up with a move whose hook hasn't run yet, for example a
   click followed at once by Option-X.
 

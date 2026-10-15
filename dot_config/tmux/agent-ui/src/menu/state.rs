@@ -6,7 +6,8 @@
 //!   (no second key, no wait); ↑/↓, C-n/C-p, PgUp/PgDn, Home/End and the
 //!   wheel move; ⏎ goes to the selected row (the `▪ N parked` row opens the
 //!   Parked filter); ⇥/⇧⇥ cycle the filter; `/` searches; Space opens the
-//!   actions strip; ⌥S / ⌥X go next / back; Esc / C-c close. (When CuaNotch's
+//!   actions strip; ⌥S goes next, ⌥X back (nav.sh's history, the same
+//!   ⌥X as everywhere else: docs/nav.md); Esc / C-c close. (When CuaNotch's
 //!   keyJumpToNeedy is opt+s it owns ⌥S globally, so the popup's ⌥S only
 //!   fires while CuaNotch isn't running.)
 //! - **Search** (`/`): typed characters (letters and digits included) filter
@@ -78,8 +79,9 @@ impl Drawn {
 pub trait Effects {
     /// Go to `win` as listed under `session` (a parked row unstashes).
     fn go(&mut self, win: &str, session: &str) -> Result<(), String>;
-    /// agent-jump.sh next / back.
+    /// agent-jump.sh next.
     fn next(&mut self) -> Result<(), String>;
+    /// nav.sh back: one step back through the client's history (⌥X).
     fn back(&mut self) -> Result<(), String>;
     /// After the y: park / close (or discard a parked tab). Ok = footer text.
     fn park(&mut self, win: &str, session: &str) -> Result<String, String>;
