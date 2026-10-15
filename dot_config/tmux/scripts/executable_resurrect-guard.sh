@@ -51,14 +51,18 @@
 #     says nothing about it — neither `held` nor uptime: a crash at 18:00, a
 #     skipped restore and a closed lid read as 14h of both at 08:00, and a
 #     server pty-mcp starts headless burns hours before Mack ever attaches.
+#     There EVERY save that differs from `good` is held, not only a shrink — a
+#     fresh server that grew to half the old pane count used to take `last`
+#     over, and C-r could then never bring the old tabs back — except a
+#     manual C-s that is not a shrink (Mack saving what he sees, on purpose).
 #     So "Mack genuinely living on a fresh server" is measured in saves that
-#     actually RAN: a shrink there is held until TRUST_RUN consecutive holds
+#     actually RAN: such a save is held until TRUST_RUN consecutive holds
 #     (TRUST_FRESH_HOURS * 4 — the held fingerprint re-judges an unchanged
 #     layout every ~15 minutes) each at most TRUST_GAP seconds after the one
 #     before — a longer gap (sleep, a stopped clock) restarts that count — and
 #     counted at most once per TRUST_EVERY seconds (minute-cadence holds while
 #     tabs come and go must not race it), AND uptime >= TRUST_FRESH_HOURS,
-#     AND the ordinary streak and 10 minutes.
+#     AND (for a shrink) the ordinary streak and 10 minutes.
 #     A restored replacement server follows the ordinary rule.
 #   * `final` (RESURRECT_SAVE_MODE=final: kill-guard's save right before a
 #     deliberate kill) is accepted — the live layout is real, and reverting
@@ -283,9 +287,25 @@ decide() { # <cur_file>
 		return 0
 	fi
 
-	if [ "$cur_panes" -ge "$good_panes" ] ||
-		[ "$good_panes" -lt "$MIN_PANES" ] ||
-		[ $((cur_panes * SHRINK_RATIO)) -ge "$good_panes" ]; then
+	local shrunk=0
+	if [ "$cur_panes" -lt "$good_panes" ] && [ "$good_panes" -ge "$MIN_PANES" ] &&
+		[ $((cur_panes * SHRINK_RATIO)) -lt "$good_panes" ]; then
+		shrunk=1
+	fi
+	# On a replacement server that never restored, EVERY save that differs from
+	# the good one is held, not just a shrink: continuum skips its auto-restore
+	# whenever any other `^tmux` process runs (the normal case here), and a
+	# fresh server that merely grew to half the old pane count used to take
+	# `last` over — after which C-r could no longer bring the old tabs back.
+	# The exits: a restore on this server (@resurrect_restored), the trust
+	# count below, or a manual C-s that is not a shrink — Mack saving the
+	# layout in front of him on purpose. A manual SHRINK stays held: the
+	# 2026-08-22 loss was exactly a C-s on a near-empty post-reboot server.
+	if [ "$REPLACEMENT" = 1 ] && [ "$MODE" = manual ] && [ "$shrunk" = 0 ]; then
+		REASON="manual save on a replacement server that never restored (${good_panes} -> ${cur_panes} panes)"
+		return 0
+	fi
+	if [ "$REPLACEMENT" = 0 ] && [ "$shrunk" = 0 ]; then
 		return 0
 	fi
 
@@ -300,9 +320,11 @@ decide() { # <cur_file>
 	trust_count
 	if [ "$REPLACEMENT" = 1 ]; then
 		uptime=$((NOW - SERVER_START))
-		if [ "$confirmed" = 1 ] && [ "$uptime" -ge $((TRUST_FRESH_HOURS * 3600)) ] &&
+		# A non-shrink needs only the trust count (16 holds already span the
+		# streak and the 10 minutes); a shrink needs both.
+		if { [ "$shrunk" = 0 ] || [ "$confirmed" = 1 ]; } && [ "$uptime" -ge $((TRUST_FRESH_HOURS * 3600)) ] &&
 			[ "$TRUST_RUN_NOW" -ge "$TRUST_RUN" ]; then
-			REASON="shrink confirmed ${STREAK}x over ${held}s on a fresh server up ${uptime}s, ${TRUST_RUN_NOW} holds in a row (${good_panes} -> ${cur_panes} panes)"
+			REASON="fresh server trusted: up ${uptime}s, ${TRUST_RUN_NOW} holds in a row, streak ${STREAK} over ${held}s (${good_panes} -> ${cur_panes} panes)"
 			return 0
 		fi
 		VERDICT=hold HOLD_AT="$NOW"

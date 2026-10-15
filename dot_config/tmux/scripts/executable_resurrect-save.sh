@@ -128,12 +128,12 @@ GUARD="${RESURRECT_GUARD_SCRIPT:-$HERE/resurrect-guard.sh}"
 # re-sizes every window it visits; a resized split restores with its old
 # proportions until the next 15-minute full save, which is the whole loss).
 FP_FORMAT="#{session_name}${US}#{window_index}${US}#{window_name}${US}#{pane_index}${US}#{pane_pid}${US}#{pane_current_command}${US}#{pane_current_path}${US}#{pane_title}"
-SOCKET="" STALE="" START_TIME="" GRACE="" FULL_EVERY="" RESTORING="" SHUTDOWN="" RESTORED=""
-OUT="$(tmux display-message -p "#{socket_path}${US}#{@resurrect-dir}${US}#{@resurrect-capture-pane-contents}${US}#{@resurrect-pane-contents-area}${US}#{@resurrect-delete-backup-after}${US}#{@resurrect_stale}${US}#{@resurrect-exclude-sessions}${US}#{start_time}${US}#{@resurrect-startup-grace-seconds}${US}#{@resurrect-full-every-minutes}${US}#{@resurrect_restoring}${US}#{@kill_guard_shutdown}${US}#{@resurrect_restored}" ";" \
+SOCKET="" STALE="" START_TIME="" GRACE="" FULL_EVERY="" RESTORING="" SHUTDOWN="" RESTORED="" NOTICED=""
+OUT="$(tmux display-message -p "#{socket_path}${US}#{@resurrect-dir}${US}#{@resurrect-capture-pane-contents}${US}#{@resurrect-pane-contents-area}${US}#{@resurrect-delete-backup-after}${US}#{@resurrect_stale}${US}#{@resurrect-exclude-sessions}${US}#{start_time}${US}#{@resurrect-startup-grace-seconds}${US}#{@resurrect-full-every-minutes}${US}#{@resurrect_restoring}${US}#{@kill_guard_shutdown}${US}#{@resurrect_restored}${US}#{@resurrect_replacement_noticed}" ";" \
 	list-panes -a -F "$FP_FORMAT" 2>/dev/null)" || true
 LIVE=""
 case "$OUT" in *$'\n'*) LIVE="${OUT#*$'\n'}" ;; esac
-IFS="$US" read -r SOCKET RESURRECT_DIR CAPTURE CONTENTS_AREA DELETE_AFTER STALE EXCLUDE START_TIME GRACE FULL_EVERY RESTORING SHUTDOWN RESTORED <<<"${OUT%%$'\n'*}" || true
+IFS="$US" read -r SOCKET RESURRECT_DIR CAPTURE CONTENTS_AREA DELETE_AFTER STALE EXCLUDE START_TIME GRACE FULL_EVERY RESTORING SHUTDOWN RESTORED NOTICED <<<"${OUT%%$'\n'*}" || true
 RESURRECT_DIR="${RESURRECT_DIR:-$HOME/.tmux/resurrect}"
 RESURRECT_DIR="${RESURRECT_DIR//\$HOME/$HOME}"
 RESURRECT_DIR="${RESURRECT_DIR/#\~/$HOME}"
@@ -213,8 +213,10 @@ fresh() { # <epoch> <max seconds>
 # into the real @resurrect-dir and move `last` onto it (and its post-save hooks
 # would then "repair" and guard that snapshot). Two checks, both required:
 #   * TMUX="<socket>,<pid>,<session>" — run-shell and #() jobs inherit it from
-#     the server that launched them (same rule as agent-tab-watcher.sh and
-#     continuum-ensure.sh; empty means the CLI targets the default server);
+#     the server that launched them; empty means no server named one, and the
+#     next check decides. Its socket must be THE default by exact path, the
+#     same rule as agent-tab-watcher.sh, continuum-ensure.sh and
+#     resurrect-save-soon.sh;
 #   * #{socket_path} from the read above — whatever server the tmux CLI really
 #     talks to (TMUX could be empty while something else steers the CLI). Empty
 #     means tmux was unreachable, which proves nothing, so that refuses too.
@@ -496,6 +498,16 @@ if ! grep -q '^pane' "$TMP"; then
 	# Only excluded sessions: record that empty layout, so the next minutes
 	# fast-path instead of re-trying (and re-logging) every minute.
 	[ -z "$FP" ] && record_fp
+	if [ "$FINAL" = 1 ]; then
+		# A server holding only excluded sessions (after a crash, pty-mcp can
+		# bring up a default server with just `agents`) has nothing to lose,
+		# and `last` already holds the last real layout: re-date it and say
+		# so, in the "saved N panes in" form the kill guard verifies, or such
+		# a server could never be killed through the guard.
+		touch -c "$LAST" 2>/dev/null
+		log "saved 0 panes in $(awk -v s="$START" -v e="$EPOCHREALTIME" 'BEGIN { printf "%.2f", e - s }')s (nothing to save; kept last)"
+		exit 0
+	fi
 	message "Tmux save skipped: nothing to save"
 	fail 1 "save produced no pane rows (all sessions excluded?) — keeping last"
 fi
@@ -576,6 +588,23 @@ if [ -n "$held" ]; then
 	elapsed="$(awk -v s="$START" -v e="$EPOCHREALTIME" 'BEGIN { printf "%.2f", e - s }')"
 	log "saved $(grep -c '^pane' "$FILE" 2>/dev/null || echo '?') panes in ${elapsed}s (kept last on ${held_on} (${held}); evidence ${FILE##*/})"
 	message "Tmux save held back: kept the last good save (${held})"
+	# Tell Mack ONCE per server (server options die with it) that autosave is
+	# holding the pre-crash layout for him: otherwise the only sign is a
+	# stale-save chip an hour later. The chip cannot say it — any value but
+	# `refused` renders as "last save <value> ago", and agent-tab-watcher.sh
+	# rewrites it from `last`'s age — so a 10s message on every attached client.
+	case "$held" in "replacement server never restored"*)
+		if [ -z "$NOTICED" ]; then
+			notice="tmux: this server started after the last good save and was never restored; autosave keeps that layout. prefix C-r restores it."
+			targets=(set-option -g @resurrect_replacement_noticed "$NOW")
+			while IFS= read -r c; do
+				[ -n "$c" ] && targets+=(";" display-message -c "$c" -d 10000 "$notice")
+			done < <(tmux list-clients -F '#{client_name}' 2>/dev/null)
+			tmux "${targets[@]}" >/dev/null 2>&1
+			log "notice: replacement server never restored; told $(((${#targets[@]} - 4) / 7)) client(s)"
+		fi
+		;;
+	esac
 	exit 0
 fi
 

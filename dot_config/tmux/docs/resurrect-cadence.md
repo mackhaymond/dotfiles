@@ -160,17 +160,39 @@ any hold: the streak and its clock reset.
 - **A shrink on an ordinary server:** held until it has been seen twice in a
   row AND 10 minutes have passed since the first hold. On 2026-10-06, the old
   streak-only rule confirmed 87 → 19 panes in 20 seconds.
-- **A replacement server.** A server whose `#{start_time}` is after the known-good
-  save's capture time (the stamp in its name) never had that layout: it is a
-  crash or kill replacement. If no restore has completed on it
-  (`@resurrect_restored` is unset), its small layout is not Mack closing tabs.
-  Wall-clock time held says nothing here, because after a laptop sleep it is
-  already huge. A shrink on such a server is held until server uptime is at
-  least 4 hours AND the streak and the 10 minutes are also met, which means
-  Mack is genuinely living on the fresh server. A replacement server that has
-  restored follows the ordinary rule. Once any save from the new server is
-  accepted, it stops being a replacement, because the known-good save was then
-  captured on it.
+- **A replacement server.** A server whose `#{start_time}` is after the
+  known-good save's capture time (the stamp in its name) never had that
+  layout: it is a crash or kill replacement. If no restore has completed on it
+  (`@resurrect_restored` is unset), **every** save that differs from the good
+  one is held, not just a shrink. continuum skips its auto-restore whenever
+  any other `^tmux` process runs, which is the normal case here. Before this
+  rule, a fresh server that grew to half the old pane count took `last` over,
+  and C-r could no longer bring the old tabs back.
+- **Exits from a replacement-server hold:**
+  - **A restore on this server** sets `@resurrect_restored`. After that the
+    server follows the ordinary rule.
+  - **A manual C-s that is not a shrink** is accepted: it is Mack saving the
+    layout in front of him, on purpose. A manual shrink stays held, because
+    the 2026-08-22 loss was exactly a C-s on a near-empty post-reboot server.
+  - **The trust count: 16 consecutive holds.** Holds come about every 15
+    minutes, since the held fingerprint re-judges an unchanged layout that
+    often. A gap of more than 20 minutes (sleep, a stopped clock) restarts the
+    count, and holds less than 12 minutes apart count once. Uptime must also
+    be at least 4 hours, and a shrink also needs the streak and the 10
+    minutes. Wall-clock uptime or time held alone proves nothing: a crash at
+    18:00, a skipped restore and a closed lid read as 14 hours of both at
+    08:00, and a server pty-mcp starts headless burns hours before Mack
+    attaches.
+- **When a replacement server stops being one:** once any of its saves is
+  accepted, because the known-good save was then captured on it.
+- **The one-time notice.** The first hold of this kind on a server shows a
+  10-second message on every attached client:
+  `this server started after the last good save and was never restored;
+  autosave keeps that layout. prefix C-r restores it.` The server option
+  `@resurrect_replacement_noticed` limits it to once per server.
+  - It can't go in the stale chip. Any value other than `refused` renders as
+    "last save <value> ago", and agent-tab-watcher.sh rewrites the chip from
+    `last`'s age.
 - **`final`** is accepted, even when it shrank: a pre-kill layout is real.
   The exceptions are a replacement server that never restored, or a restore in
   progress (`@resurrect_restoring` live). In those cases it is held, `last`
@@ -185,7 +207,8 @@ it waits up to 20s for the save lock (`RESURRECT_FINAL_LOCK_WAIT`).
 | Status | Meaning |
 |---|---|
 | 0 | `last` points at this save's snapshot (new, or identical and re-dated), or the save was held as above. In every case `last`'s target mtime is at least the save's start time and save.log gains a `saved N panes in Xs (` line. |
-| 1 | No panes listed, or nothing to save because every session is excluded. |
+| 0, all excluded | A server holding only excluded sessions (for example pty-mcp's `agents` after a crash). Nothing is saved, `last` is re-dated, and save.log gets `saved 0 panes in Xs (nothing to save; kept last)`, so such a server can still be killed through the guard. quiet and auto keep exiting 0 with nothing saved. |
+| 1 | No panes listed (tmux unreachable). |
 | 2 | Refused: not the default server. |
 | 3 | The lock was still held after the wait. |
 | 4 | After the hooks, `last` does not point at the snapshot. |
@@ -206,9 +229,8 @@ ignores the status.
   entries such as `ptymcp-*` are matched as `case` patterns against whole
   session names. This applies in resurrect-save.sh (fingerprint, snapshot,
   pane capture), resurrect-guard.sh (pane counts) and resurrect-save-repair.py
-  (`fnmatch`). Two scripts this change did not touch still compare exact names
-  and need the same treatment: `assistant-save.sh` (its jq filter) and
-  `assistant-restore.sh`.
+  (`fnmatch`), and in assistant-save.sh (bash picks the excluded sessions and
+  passes their names to its jq filter) and assistant-restore.sh.
 - **Locale.** A tmux client without a UTF-8 locale prints `\x1f` and tab as `_`.
   If no UTF-8 locale is in effect, the save exports `LANG=en_US.UTF-8` and its
   hooks inherit it.
@@ -255,6 +277,18 @@ time, outside the broker's bookkeeping.
 - **Startup restore.** The pre-restore marker hook sits above the tpm line, so
   continuum's background restore sees it. The 120s startup gate covers the same
   window regardless.
+- **The restore markers may never clear.** If continuum's restore finishes
+  before tmux.conf applies the post-restore-all hook that sits below the tpm
+  line, the plugin's own hook runs instead. Then `@resurrect_restored` is never
+  set and `@resurrect_restoring` is never cleared. `@resurrect_restoring`
+  expires on its own after 15 minutes. A replacement server whose restore
+  went unrecorded stays held until the trust count (about 4 hours of holds)
+  or a manual non-shrink C-s.
+- **Default server, by path.** Every default-server check accepts only
+  `/private/tmp/tmux-$UID/default` or `/tmp/tmux-$UID/default`, not any socket
+  named `default`. That covers resurrect-save.sh, resurrect-save-soon.sh,
+  continuum-ensure.sh and agent-tab-watcher.sh. Agents' private servers live at
+  `$TMUX_TMPDIR/tmux-$UID/default`.
 - **Changes the fingerprint cannot see** (a `/clear` that keeps its title, or a
   change of active window) wait for the 15-minute full save, a structural
   event, or a quit.

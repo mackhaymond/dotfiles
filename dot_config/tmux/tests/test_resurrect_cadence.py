@@ -267,10 +267,25 @@ class FinalTests(Cadence):
         # The other modes keep exiting 0 on a held lock.
         self.assertEqual(self.run_save("auto").returncode, 0)
 
-    def test_final_fails_when_nothing_could_be_saved(self):
+    def test_final_on_an_all_excluded_server_keeps_last_and_succeeds(self):
+        # Post-integration: a server holding only excluded sessions (pty-mcp's
+        # `agents` after a crash) must still be killable through the guard:
+        # rc 0, `last` re-dated, and the "saved N panes in" line it checks.
+        self.assertEqual(self.run_save().returncode, 0)
+        good = (self.dir / "last").resolve()
+        old = time.time() - 3600
+        os.utime(good, (old, old))
         self.tmux("set", "-g", "@resurrect-exclude-sessions", "main")
-        self.assertEqual(self.final().returncode, 1)
+        start = time.time()
+        r = self.final()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.dir / "last").resolve(), good)
+        self.assertGreaterEqual(good.stat().st_mtime, int(start))
+        self.assertRegex((self.dir / "save.log").read_text(),
+                         r"saved 0 panes in [0-9.]+s \(nothing to save; kept last\)")
+        # quiet/auto are unchanged: nothing saved, still exit 0.
         self.assertEqual(self.run_save("auto").returncode, 0)
+        self.assertEqual(len(self.snapshots()), 1)
 
     def test_saves_in_the_same_second_never_overwrite_each_other(self):
         self.assertEqual(self.run_save().returncode, 0)
@@ -470,6 +485,64 @@ class ReviewRound1Tests(Cadence):
         for _ in range(3):
             self.auto()
         self.assertEqual((self.dir / "save.log").read_text(), log)
+
+
+class ReplacementServerTests(Cadence):
+    """Post-integration: a server started after the good save was captured and
+    never restored holds EVERY differing save, not only a shrink."""
+
+    fake_old_good = ReviewRound1Tests.fake_old_good
+    windows = ReviewRound1Tests.windows
+
+    def test_growth_to_half_is_held_until_a_restore(self):
+        good = self.fake_old_good(panes=4)
+        self.windows(2)                     # 3 panes: not a shrink of 4
+        self.auto()
+        self.assertEqual((self.dir / "last").resolve(), good.resolve())
+        self.assertEqual(self.hook_runs(), 0)
+        self.assertIn("(replacement server never restored", (self.dir / "save.log").read_text())
+        # A restore on this server lifts it: the next save takes `last`.
+        self.tmux("set", "-g", "@resurrect_restored", str(int(time.time())))
+        self.auto("auto-full")
+        self.assertNotEqual((self.dir / "last").resolve(), good.resolve())
+
+    def test_manual_save_takes_a_non_shrink_but_not_a_shrink(self):
+        good = self.fake_old_good(panes=10)
+        self.assertEqual(self.run_save().returncode, 0)       # 1 pane of 10: held
+        self.assertEqual((self.dir / "last").resolve(), good.resolve())
+        self.windows(5)                                        # 6 of 10: not a shrink
+        self.assertEqual(self.run_save().returncode, 0)
+        self.assertNotEqual((self.dir / "last").resolve(), good.resolve())
+        self.assertIn("manual save on a replacement server", (self.dir / "guard.log").read_text())
+
+    def test_the_notice_comes_once_per_server(self):
+        self.fake_old_good(panes=10)
+        self.auto()
+        self.windows(1)
+        self.auto()
+        log = (self.dir / "save.log").read_text()
+        self.assertEqual(log.count("notice: replacement server never restored"), 1, log)
+        self.assertTrue(self.tmux("show", "-gqv", "@resurrect_replacement_noticed").strip().isdigit())
+
+    def test_the_notice_reaches_an_attached_client(self):
+        import pty
+        self.fake_old_good(panes=10)
+        master, slave = pty.openpty()
+        env = {k: v for k, v in self.env.items() if k not in ("TMUX", "TMUX_PANE")}
+        env["TERM"] = "xterm-256color"
+        client = subprocess.Popen([TMUX_BIN, "-L", self.socket, "attach", "-t", "main"], env=env,
+                                  stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+        os.close(slave)
+        def reap():
+            client.kill(); client.wait()
+            os.close(master)
+        self.addCleanup(reap)
+        for _ in range(100):
+            if self.tmux("list-clients", "-F", "x").strip():
+                break
+            time.sleep(0.05)
+        self.auto()
+        self.assertIn("told 1 client(s)", (self.dir / "save.log").read_text())
 
 
 class SaveSoonTests(Cadence):
