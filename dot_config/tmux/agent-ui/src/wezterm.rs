@@ -106,6 +106,18 @@ pub fn pick_tmux_pane(panes: &[Value], own: Option<&str>, snap: &Snapshot, hint:
     Some((best.get("tty_name")?.as_str()?.to_string(), field(best, "pane_id")?))
 }
 
+/// The sidebar has nothing to sit beside: per a good `wezterm cli list`,
+/// the pane CMD+B split it from (`hint`) is gone, or no other pane is left
+/// in its tab. False when its own pane is not listed (nothing is known).
+pub fn alone_in(panes: &[Value], own: Option<&str>, hint: Option<&str>) -> bool {
+    let Some(own) = own else { return false };
+    let Some(me) = panes.iter().find(|p| field(p, "pane_id").as_deref() == Some(own)) else { return false };
+    let tab = me.get("tab_id");
+    let hint_gone = hint.is_some_and(|h| !panes.iter().any(|p| field(p, "pane_id").as_deref() == Some(h)));
+    let others = panes.iter().any(|p| p.get("tab_id") == tab && field(p, "pane_id").as_deref() != Some(own));
+    hint_gone || !others
+}
+
 /// The strip's link to its tmux client and WezTerm pane (Strip.__init__ /
 /// load / resolve / focus_back).
 #[derive(Debug, Clone)]
@@ -119,13 +131,17 @@ pub struct WeztermLink {
     pub fixed: bool,
     pub client: Option<String>,
     pub tmux_pane: Option<String>,
+    /// The last good resolve found the sidebar alone in its tab
+    /// ([`alone_in`]): time to go. Never set when pinned.
+    pub alone: bool,
     next_resolve: f64,
 }
 
 impl WeztermLink {
     pub fn new(exe: String, client: Option<String>, hint: Option<String>, own: Option<String>) -> WeztermLink {
         let fixed = client.is_some();
-        WeztermLink { exe, own, tmux_pane: if fixed { hint.clone() } else { None }, hint, fixed, client, next_resolve: 0.0 }
+        let tmux_pane = if fixed { hint.clone() } else { None };
+        WeztermLink { exe, own, tmux_pane, hint, fixed, client, alone: false, next_resolve: 0.0 }
     }
 
     /// Strip.load: after each snapshot, re-resolve if our client is gone
@@ -144,6 +160,7 @@ impl WeztermLink {
             return;
         }
         let Some(panes) = wezterm_panes(&self.exe) else { return };
+        self.alone = alone_in(&panes, self.own.as_deref(), self.hint.as_deref());
         match pick_tmux_pane(&panes, self.own.as_deref(), snap, self.hint.as_deref()) {
             Some((c, p)) => {
                 self.client = Some(c);
@@ -217,6 +234,14 @@ mod tests {
         assert_eq!(got(Some("13"), None), None); // nothing in that tab is a client
         assert_eq!(got(None, None), None);
         assert_eq!(got(Some("99"), None), None);
+        // Alone: the hint pane gone, or nothing else in the tab; unknown
+        // (own pane unlisted, or no own id) is never alone.
+        assert!(!alone_in(panes, Some("10"), Some("11")));
+        assert!(!alone_in(panes, Some("10"), None));
+        assert!(alone_in(panes, Some("10"), Some("77")));
+        assert!(alone_in(panes, Some("13"), None));
+        assert!(!alone_in(panes, Some("99"), Some("77")));
+        assert!(!alone_in(panes, None, Some("77")));
     }
 
     #[test]

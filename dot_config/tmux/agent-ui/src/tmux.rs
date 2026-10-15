@@ -190,21 +190,23 @@ impl Tmux {
 /// `@agent_key`, the agent's lifetime letter) and `mru_cur` / `mru_prev`
 /// (the GLOBAL `@agent_mru_cur` / `@agent_mru_prev`: the agent windows a
 /// client last landed on, for the menu's ⌥W "last agent"; like
-/// `@agent_blink`, every row carries the same value).
-pub const FIELDS: [&str; 26] = [
+/// `@agent_blink`, every row carries the same value), and `home`
+/// (spaces' `@space_home` "1": a space's landing window, never an agent row
+/// nor counted in the sidebar).
+pub const FIELDS: [&str; 27] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
-    "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev",
+    "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home",
 ];
 
 /// The tmux format of each FIELDS entry, in order.
-pub const FORMATS: [&str; 26] = [
+pub const FORMATS: [&str; 27] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
     "#{window_panes}", "#{pane_current_path}", "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}",
     "#{@stash_origin}", "#{@agent_slot}", "#{@agent_pending}", "#{@agent_key}", "#{@agent_mru_cur}",
-    "#{@agent_mru_prev}",
+    "#{@agent_mru_prev}", "#{@space_home}",
 ];
 
 /// Stand-ins tmux writes for a newline / US inside a field value (Unicode
@@ -246,19 +248,20 @@ pub fn fmt() -> String {
     FORMATS.iter().map(|f| guarded(f)).collect::<Vec<_>>().join(&US.to_string())
 }
 
-/// Client rows ride in the same call. agent-roster.py `CLIENT_FMT` plus one:
+/// Client rows ride in the same call. agent-roster.py `CLIENT_FMT` plus two:
 /// `"" US client US tty US window_id US session US @spaces US @strip_scope
-/// US @space_hidden`. `@spaces` and `@strip_scope` are GLOBAL options and
-/// `@space_hidden` the client's session's (the sidebar's scope,
+/// US @space_hidden US client_pid`. `@spaces` and `@strip_scope` are GLOBAL
+/// options and `@space_hidden` the client's session's (the sidebar's scope,
 /// [`crate::view::Scope`]): a client-context format resolves them through
 /// the client's session (to the global value), so they cost no extra call.
-/// Starts with an empty field and has 8 fields where a window row has 26,
+/// `client_pid` lets the sidebar watch its client process exit.
+/// Starts with an empty field and has 9 fields where a window row has 27,
 /// so the two parsers can never take each other's rows.
 pub const CLIENT_TAG: &str = "client";
 
 pub fn client_fmt() -> String {
     ["", CLIENT_TAG, "#{client_tty}", "#{window_id}", &guarded("#{session_name}"), &guarded("#{@spaces}"),
-        &guarded("#{@strip_scope}"), &guarded("#{@space_hidden}")]
+        &guarded("#{@strip_scope}"), &guarded("#{@space_hidden}"), "#{client_pid}"]
         .join(&US.to_string())
 }
 
@@ -323,6 +326,8 @@ pub struct Window {
     /// every row): window ids like `@12`, or "".
     pub mru_cur: String,
     pub mru_prev: String,
+    /// @space_home is "1": a space's home (landing) window, never an agent.
+    pub home: bool,
 }
 
 fn digits(s: &str) -> bool {
@@ -389,6 +394,7 @@ impl Window {
             key: p[23].into(),
             mru_cur: p[24].into(),
             mru_prev: p[25].into(),
+            home: p[26] == "1",
             label: label.into(),
             session,
         })
@@ -435,17 +441,20 @@ pub struct Client {
     /// The client's session has `@space_hidden` "1" (spaces.conf marks the
     /// hidden sessions so).
     pub space_hidden: bool,
+    /// The client process (`#{client_pid}`): the sidebar leaves when it exits.
+    pub pid: Option<i32>,
 }
 
 impl Client {
     /// agent-roster.py `parse_client_rows`, one row:
-    /// `"" US client US tty US win [US session [US spaces US scope [US space_hidden]]]`.
+    /// `"" US client US tty US win [US session [US spaces US scope [US space_hidden [US pid]]]]`.
     pub fn parse(line: &str) -> Option<Client> {
         let p: Vec<&str> = line.split(US).collect();
-        if matches!(p.len(), 4 | 5 | 7 | 8) && p[0].is_empty() && p[1] == CLIENT_TAG {
+        if matches!(p.len(), 4 | 5 | 7 | 8 | 9) && p[0].is_empty() && p[1] == CLIENT_TAG {
             let f = |i: usize| restore(p.get(i).unwrap_or(&""));
+            let pid = p.get(8).filter(|s| digits(s)).and_then(|s| s.parse::<i32>().ok()).filter(|&n| n > 0);
             Some(Client { tty: p[2].into(), window_id: p[3].into(), session: f(4), spaces: f(5), strip_scope: f(6),
-                space_hidden: f(7) == "1" })
+                space_hidden: f(7) == "1", pid })
         } else {
             None
         }
@@ -609,10 +618,10 @@ pub(crate) mod tests {
     fn client_rows_carry_the_scope_options() {
         // (A guarded format holds a US itself, so compare it whole.)
         let want = ["", CLIENT_TAG, "#{client_tty}", "#{window_id}", &guarded("#{session_name}"), &guarded("#{@spaces}"),
-            &guarded("#{@strip_scope}"), &guarded("#{@space_hidden}")].join("\x1f");
+            &guarded("#{@strip_scope}"), &guarded("#{@space_hidden}"), "#{client_pid}"].join("\x1f");
         assert_eq!(client_fmt(), want);
         let s = Snapshot::parse(&[
-            "\x1fclient\x1f/dev/a\x1f@3\x1fmain\x1fon\x1fall\x1f",
+            "\x1fclient\x1f/dev/a\x1f@3\x1fmain\x1fon\x1fall\x1f\x1f4242",
             "\x1fclient\x1f/dev/b\x1f@4\x1fwork",
             "\x1fclient\x1f/dev/c\x1f@5",
             "\x1fclient\x1f/dev/d\x1f@6\x1fmain\x1fon", // 6 fields: no format ever printed that
@@ -625,6 +634,8 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(got, [("/dev/a", "main", "on", "all", false), ("/dev/b", "work", "", "", false),
             ("/dev/c", "", "", "", false), ("/dev/e", "scratch", "on", "", true), ("/dev/f", "main", "on", "all", false)]);
+        let pids: Vec<_> = s.clients.iter().map(|c| c.pid).collect();
+        assert_eq!(pids, [Some(4242), None, None, None, None]);
     }
 
     #[test]
@@ -638,6 +649,7 @@ pub(crate) mod tests {
         assert!(Window::parse(&vec![""; 22].join("\x1f")).is_none());
         assert!(Window::parse(&vec![""; 23].join("\x1f")).is_none());
         assert!(Window::parse(&vec![""; 25].join("\x1f")).is_none());
+        assert!(Window::parse(&vec![""; 26].join("\x1f")).is_none());
         assert_eq!(w.label, "");
         // Answered: idle with a @agent_pending epoch at most 600 s old.
         let now = 1_700_000_000.0;
@@ -678,7 +690,10 @@ pub(crate) mod tests {
     #[test]
     fn slots() {
         assert!(fmt().contains(&guarded("#{@agent_slot}")) && fmt().contains(&guarded("#{@agent_pending}")));
-        assert!(fmt().contains(&guarded("#{@agent_key}")) && fmt().ends_with(&guarded("#{@agent_mru_prev}")));
+        assert!(fmt().contains(&guarded("#{@agent_key}")) && fmt().contains(&guarded("#{@agent_mru_prev}")));
+        assert!(fmt().ends_with(&guarded("#{@space_home}")));
+        let s = Snapshot::parse(&[row("main", 1, "@1", &[("home", "1")]), row("main", 2, "@2", &[("home", "0")])].join("\n"));
+        assert_eq!((s.windows[0].home, s.windows[1].home), (true, false));
         // The menu's letter and the global MRU pair ride in the same rows.
         let s = Snapshot::parse(&[row("main", 1, "@1", &[("key", "f"), ("mru_cur", "@4"), ("mru_prev", " @2 ")]),
             row("main", 2, "@2", &[("mru_cur", "@4"), ("mru_prev", "@2")])].join("\n"));

@@ -29,7 +29,10 @@
 //!   Draw from [`ViewModel::blink`] only: every colour in the view
 //!   ([`Agent::color`], [`Agent::flag`]) already has the phase applied, and
 //!   the window the client is on never pulses. The pulse freezes when the
-//!   watcher stops (it stops flipping), exactly like the tab bar.
+//!   watcher stops (it stops flipping), exactly like the tab bar. The
+//!   sidebar does not poll for changes: it wakes on Darwin notices
+//!   ([`sidebar::notice`]) and keeps the 0.5 s tick only while something it
+//!   draws pulses.
 //! - **Input between refreshes** must be resolved against the frame ON
 //!   SCREEN (the Python handles queued input before redrawing): keep the
 //!   last drawn [`ViewModel`]/labels/click targets until the next draw.

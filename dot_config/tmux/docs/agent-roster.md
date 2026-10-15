@@ -538,7 +538,11 @@ otherwise this same program, `agent-roster.py --strip`, which the rest of
 this section describes. agent-ui's sidebar starts each agent row and NEEDS
 YOU card with the agent's sticky number (see
 [Number keys](#agent-ui-sticky-slots)); the Option-W menu uses per-agent
-letters instead.
+letters instead. agent-ui's sidebar has its own layout (NEEDS YOU, agents,
+spaces; no log), its own sync (Darwin notices, not a poll) and leaves when
+its tmux client does: see [agent-ui sidebar](#agent-ui-sidebar-layout-sync-lifecycle).
+**The Python fallback (`--strip`) keeps the older layout and the 1 s poll
+described in the rest of this section; it was not changed.**
 
 - **Layout** (designed for 34-40 columns, any height, **never scrolls**):
 
@@ -613,11 +617,13 @@ letters instead.
   same Option-V / title toggle (`set-option -g @strip_scope`, the old scope
   kept and `couldn't set @strip_scope` shown on failure). In its own layout:
   the header reads ` space` (that session's counts) or ` agents`, the
-  bottom half (`agents · this space`) holds only the client's session's
+  agents section (`agents  this space`) holds only the client's session's
   rule and rows, numbered by ordinal (1-digit column, blank past 9, dropped
   when the title would keep under 4 cells) instead of slots; NEEDS YOU cards
   lose their numbers in space scope, and NEEDS YOU, the spaces list and
-  parked stay global. Its client row carries one more field than the
+  parked stay global. A `@strip_scope` set from outside (tmux's `M-v`)
+  shows at once when the binding posts the focus notice (see
+  [agent-ui sidebar](#agent-ui-sidebar-layout-sync-lifecycle)). Its client row carries one more field than the
   Python's, `#{@space_hidden}` (the client's session's), for the hidden
   test. Spaces off and `@strip_scope` unset: frames byte-identical to before
   (`tests/sidebar.rs` `once_follows_the_scope_options` checks unset → set →
@@ -754,6 +760,90 @@ letters instead.
   `agent-roster.py --strip --client /dev/ttys999` pins a (fake) client and
   never calls `wezterm cli list`; clicks still run agent-jump.sh, so point
   `PATH` at a fake tmux (tests/test_agent_jump_watcher.py's `FakeEnv`) first.
+
+## agent-ui sidebar: layout, sync, lifecycle
+
+What `agent-ui sidebar` (CMD+B, when installed) does differently from the
+Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
+`src/sidebar/notice.rs`.
+
+- **Layout** (top to bottom; `agent-ui sidebar --once 34x40 --client <tty>`
+  renders one frame):
+
+  ```
+   space                ◉1 ✓1 ◐1 ○2     header: scope title (click flips it) + counts
+    ⏵ next ⌥S   ⤺ back ⌥X   ≡ ⌥W        toolbar
+                                        gap
+   needs you                      3     NEEDS YOU, agent-jump.sh order, as before
+  ▌✕ Notch hover animation       1m     3-line cards: title, reason, place · kind
+  ▌  fail 529 overloaded
+  ▌  cua-notch:1 · ✳ claude    ⏎ go
+                                        gap
+   agents                this space     THE BODY: the client's space (or every
+   main ⌥ main ──────── ◉1 ✓1 ◐1 ○2     space in `all` scope), numbered 1-9
+   1 ◉ Sidebar sync            here     like M-1..9, two lines per agent
+       asks Hook slot 50 OK?     2m
+                                        spare rows collect here
+   spaces                               compact: one line per session, by name,
+   ○ bai                         ○1     anchored above the last row
+   ● main               ◉1 ✓1 ◐1 ○2
+   ▸ parked 0                           parked; a watcher problem in red
+  ```
+
+  There is no event log and no divider any more (`@agent_sidebar_split` is
+  no longer read; `--split` is accepted and ignored). The spaces list has no
+  git line, so the sidebar never runs `git status`; the branch still shows on
+  each rule.
+- **Density ladder**: agents lose detail last. A frame takes the first
+  step at which every agent still gets two lines: (1) the spaces list only
+  ever gets leftover rows (whole, then the client's space and those needing
+  you plus `… N more spaces`, then nothing); (2) the gaps go; (3) NEEDS YOU
+  cards go to 2 lines, then 1. Only then do agents compress (one line each
+  with spare rows handed back as second lines to the ones needing you, then
+  idle folded into `○○○ 3 idle`, then spaces collapsed to their rule, then
+  `… N more`), with NEEDS YOU held to at least 2 rows and a third of the
+  body (`… N more need you`). Nothing is dropped silently; tests prove every
+  agent is shown, folded, collapsed or counted at every size 2-70 rows.
+- **Colour**: no background colour on any cell (`Color::Reset`, `--once`
+  writes no `48;` code), so the sidebar is WezTerm's own background. Tints
+  kept only where they say where you are: the agent row of the client's
+  window (`sel`) and its space's row in the spaces list (`surface0`). NEEDS
+  YOU cards (their `▌` bar carries the state) and the toolbar buttons lost
+  theirs.
+- **Sync (told, not polling)**: the loop sleeps in `poll(2)` on stdin, the
+  signal pipe, one Darwin-notification fd (`notify_register_file_descriptor`,
+  libc FFI, no crate) and the client's exit watch. Two notice names:
+  `com.mackhaymond.tmux.agent-state` (already posted by the indicator, the
+  watcher and the window-linked/unlinked hooks on every state change) and
+  `com.mackhaymond.tmux.focus` (posted by tmux hooks on session / window
+  switches, session rename / close, and by the `M-v` scope binding; the
+  sidebar posts it itself after its own scope toggle so other sidebars
+  follow). `$AGENT_STATE_NOTICE` / `$AGENT_FOCUS_NOTICE` rename them (tests).
+  A notice schedules one snapshot 12 ms later (a burst is one refresh). The
+  timer is only a safety net: 5 s, or 0.5 s while a drawn agent pulses with
+  `@agent_blink` (in flight, workflow or cua) or when notify(3) is missing.
+  Measured on a private `-L` server (2026-10-15): window switch → sidebar
+  shows `here` on the new row in ~40 ms, a state write + notice → card in
+  ~37 ms (was 300-500 ms with the 0.5 s tick). Idle CPU over 60 s with
+  nothing pulsing: 0.05 s sidebar (+children) and 0.02 s tmux server, down
+  from 0.56 s and 0.12 s; with an agent pulsing, unchanged (~0.54 s + 0.13 s).
+- **Never alone**: once the sidebar has seen its client (`#{client_pid}` in
+  the snapshot's client rows), it exits (status 0, so the pane closes) the
+  moment that process exits: a kqueue `EVFILT_PROC`/`NOTE_EXIT` fd in the
+  same poll, free until it fires (detach, `tmux` exit, or the tmux pane
+  closed). A client missing from the snapshot proves nothing by itself
+  (tmux 3.7 leaves suspended, prefix C-z, and locked clients out of
+  `list-clients`): it counts as gone only if its pid is dead. While no client was ever resolved, a `wezterm cli list` (at most one
+  per 5 s, as before) that finds the CMD+B pane gone or nothing else in the
+  tab ends it too. A pinned fake `--client` never exits this way.
+- **Home windows**: a window with `@space_home` 1 (a space's landing
+  screen) is never an agent row and never counted, in any scope, with
+  `@spaces` on or off (its agent options are ignored; its space still shows
+  as the client's).
+- **Tests**: `tests/sidebar.rs` drives the live loop with test-only notice
+  names (state and focus notices reflected in well under the 5 s net, scope
+  set from outside, a window switch) and checks that detaching a real nested
+  client ends the sidebar within 1.5 s.
 
 ## Launch speed
 

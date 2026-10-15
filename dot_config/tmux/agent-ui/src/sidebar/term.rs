@@ -113,15 +113,19 @@ impl Signals {
         Fired { exit: f & ((1 << SIGHUP) | (1 << SIGTERM)) != 0, resize: f & (1 << SIGWINCH) != 0 }
     }
 
-    /// Wait up to `timeout` for `fd` or a signal → `fd` has something to
-    /// read (data, EOF or an error: the read tells which).
-    pub fn wait(&self, fd: RawFd, timeout: Duration) -> io::Result<bool> {
+    /// Wait up to `timeout` for `fd`, the `extra` fds (the notice fd, the
+    /// client's exit watch) or a signal → (`fd` has something to read (data,
+    /// EOF or an error: the read tells which), which `extra` fds are ready).
+    pub fn wait(&self, fd: RawFd, extra: [Option<RawFd>; 2], timeout: Duration) -> io::Result<(bool, [bool; 2])> {
         let mut fds = [
             PollFd { fd, events: POLLIN, revents: 0 },
             PollFd { fd: self.rx.as_raw_fd(), events: POLLIN, revents: 0 },
+            // poll(2) skips a negative fd.
+            PollFd { fd: extra[0].unwrap_or(-1), events: POLLIN, revents: 0 },
+            PollFd { fd: extra[1].unwrap_or(-1), events: POLLIN, revents: 0 },
         ];
         poll_fds(&mut fds, timeout)?;
-        Ok(ready(&fds[0]))
+        Ok((ready(&fds[0]), [extra[0].is_some() && ready(&fds[2]), extra[1].is_some() && ready(&fds[3])]))
     }
 }
 
@@ -137,6 +141,109 @@ pub fn readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
     let mut fds = [PollFd { fd, events: POLLIN, revents: 0 }];
     poll_fds(&mut fds, timeout)?;
     Ok(ready(&fds[0]))
+}
+
+/// `pid` is still a live process (kill(pid, 0): an EPERM still means alive).
+pub fn alive(pid: i32) -> bool {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the process exists.
+    let ok = unsafe { kill(pid, 0) == 0 };
+    ok || io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
+/// A pollable fd that turns readable when one process exits: a kqueue with
+/// EVFILT_PROC / NOTE_EXIT on it (macOS; kqueue fds work in poll(2)). Costs
+/// nothing until the exit. The sidebar watches its tmux client with it.
+#[derive(Debug)]
+pub struct ProcWatch {
+    pub pid: i32,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    kq: RawFd,
+}
+
+#[cfg(target_os = "macos")]
+mod kq {
+    #[repr(C)]
+    pub struct KEvent {
+        pub ident: usize,
+        pub filter: i16,
+        pub flags: u16,
+        pub fflags: u32,
+        pub data: isize,
+        pub udata: *mut std::ffi::c_void,
+    }
+    #[repr(C)]
+    pub struct Timespec {
+        pub sec: i64,
+        pub nsec: i64,
+    }
+    pub const EVFILT_PROC: i16 = -5;
+    pub const EV_ADD: u16 = 0x1;
+    pub const EV_ONESHOT: u16 = 0x10;
+    pub const NOTE_EXIT: u32 = 0x8000_0000;
+    extern "C" {
+        pub fn kqueue() -> i32;
+        pub fn kevent(kq: i32, ch: *const KEvent, nch: i32, ev: *mut KEvent, nev: i32, t: *const Timespec) -> i32;
+        pub fn close(fd: i32) -> i32;
+    }
+}
+
+impl ProcWatch {
+    /// Watch `pid`. None if it cannot be watched here, or is already gone
+    /// (check [`alive`] to tell which).
+    #[cfg(target_os = "macos")]
+    pub fn new(pid: i32) -> Option<ProcWatch> {
+        use kq::*;
+        if pid <= 0 {
+            return None;
+        }
+        // SAFETY: plain syscalls on a fresh kqueue and a stack-allocated event.
+        unsafe {
+            let fd = kqueue();
+            if fd < 0 {
+                return None;
+            }
+            let ev = KEvent {
+                ident: pid as usize,
+                filter: EVFILT_PROC,
+                flags: EV_ADD | EV_ONESHOT,
+                fflags: NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let zero = Timespec { sec: 0, nsec: 0 };
+            if kevent(fd, &ev, 1, std::ptr::null_mut(), 0, &zero) < 0 {
+                close(fd);
+                return None;
+            }
+            Some(ProcWatch { pid, kq: fd })
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn new(_pid: i32) -> Option<ProcWatch> {
+        None
+    }
+
+    /// The fd to poll.
+    pub fn fd(&self) -> RawFd {
+        self.kq
+    }
+}
+
+impl Drop for ProcWatch {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        // SAFETY: our own kqueue fd, closed once.
+        unsafe {
+            kq::close(self.kq);
+        }
+    }
 }
 
 /// One raw read of stdin (unbuffered: poll must see everything not yet
@@ -159,13 +266,20 @@ pub fn read_stdin() -> io::Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn signals_wake_the_wait() {
         let s = Signals::install().unwrap();
         let (a, _b) = UnixStream::pair().unwrap();
         // Nothing ready: times out.
-        assert!(!s.wait(a.as_raw_fd(), Duration::from_millis(10)).unwrap());
+        assert_eq!(s.wait(a.as_raw_fd(), [None, None], Duration::from_millis(10)).unwrap(), (false, [false, false]));
+        // An extra fd wakes it, and is told apart from the others.
+        let (c, d) = UnixStream::pair().unwrap();
+        let (e, _f) = UnixStream::pair().unwrap();
+        (&d).write_all(b"x").unwrap();
+        assert_eq!(s.wait(a.as_raw_fd(), [Some(e.as_raw_fd()), Some(c.as_raw_fd())], Duration::from_secs(2)).unwrap(),
+            (false, [false, true]));
         // SIGWINCH to ourselves: the wait returns early and reports it.
         extern "C" {
             fn raise(sig: i32) -> i32;
@@ -173,9 +287,27 @@ mod tests {
         // SAFETY: SIGWINCH has our handler installed above.
         unsafe { raise(SIGWINCH) };
         let t = std::time::Instant::now();
-        let _ = s.wait(a.as_raw_fd(), Duration::from_secs(5)).unwrap();
+        let _ = s.wait(a.as_raw_fd(), [None, None], Duration::from_secs(5)).unwrap();
         assert!(t.elapsed() < Duration::from_secs(2));
         assert_eq!(s.take(), Fired { exit: false, resize: true });
         assert_eq!(s.take(), Fired::default());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_watched_process_exit_wakes_poll() {
+        let mut child = std::process::Command::new("/bin/sleep").arg("0.3").spawn().unwrap();
+        let pid = child.id() as i32;
+        assert!(alive(pid));
+        let w = ProcWatch::new(pid).expect("watch");
+        assert!(!readable(w.fd(), Duration::from_millis(20)).unwrap());
+        let t = std::time::Instant::now();
+        assert!(readable(w.fd(), Duration::from_secs(5)).unwrap());
+        assert!(t.elapsed() < Duration::from_secs(2));
+        child.wait().unwrap();
+        assert!(!alive(pid));
+        // Gone already: no watch (the caller checks `alive`).
+        assert!(ProcWatch::new(pid).is_none());
+        assert!(!alive(0) && !alive(-1));
     }
 }

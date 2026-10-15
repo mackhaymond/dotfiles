@@ -873,6 +873,14 @@ set-hook -g 'window-unlinked[1]' 'run-shell -b "#{HOME}/.config/tmux/scripts/sta
 set-hook -g 'window-linked[1]' 'run-shell -b "notifyutil -p com.mackhaymond.tmux.agent-state"'
 set-hook -g 'window-unlinked[2]' 'run-shell -b "notifyutil -p com.mackhaymond.tmux.agent-state"'
 
+# Where Mack IS moved: the agent-ui sidebar (CMD+B) waits on this notice
+# instead of polling, so its "here" row follows a switch in ~10 ms
+# (docs/agent-roster.md "agent-ui sidebar: layout, sync, lifecycle").
+set-hook -g 'client-session-changed[50]' 'run-shell -b "notifyutil -p com.mackhaymond.tmux.focus"'
+set-hook -g 'session-window-changed[50]' 'run-shell -b "notifyutil -p com.mackhaymond.tmux.focus"'
+set-hook -g 'session-renamed[50]' 'run-shell -b "notifyutil -p com.mackhaymond.tmux.focus"'
+set-hook -g 'session-closed[50]' 'run-shell -b "notifyutil -p com.mackhaymond.tmux.focus"'
+
 # SPACES — keep LAST. A separate file because `%if` is decided at parse time:
 # here it would still see the previous load's @spaces. By the time this
 # source-file runs, the `set -g @spaces` near the top has. Last, so no plugin
