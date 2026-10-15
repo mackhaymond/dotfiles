@@ -15,18 +15,19 @@ export LC_ALL=en_US.UTF-8
 export PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
 [[ -d "$PYENV_ROOT/shims" ]] && export PATH="$PYENV_ROOT/shims:$PATH"
 
-# 1Password service-account token from macOS Keychain. Used by chezmoi
-# templating (op:// references) and by the drift indicator's background
-# `chezmoi verify` call — both need non-interactive auth in subprocess
-# contexts (opencode, cron, IDE terminals, &! subshells) where biometric
-# / desktop-app prompts can't reach a TTY. Keychain entry is created
-# manually via `security add-generic-password -s op-service-account-token`.
-# Lookup is ~10ms; the `-z` guard keeps child shells free since they
-# inherit from parent.
-if [[ -z "$OP_SERVICE_ACCOUNT_TOKEN" ]] && command -v security >/dev/null 2>&1; then
-  export OP_SERVICE_ACCOUNT_TOKEN="$(security find-generic-password \
-    -s op-service-account-token -a "$USER" -w 2>/dev/null)"
-fi
+# 1Password service-account token: never exported. It used to be, from the
+# Keychain into every zsh, which put it in every agent pty, every Claude
+# process and every MCP server started from a terminal (removed 2026-10-14).
+# Its only consumer is chezmoi's op:// templating, which now gets it per call
+# from the `chezmoi` wrapper and the drift check in .zshrc (human shells only).
+# The unset drops a copy inherited from a parent started before the change.
+# Keychain entry: `security add-generic-password -s op-service-account-token`.
+unset OP_SERVICE_ACCOUNT_TOKEN
+# Agent shells (tmux-pty-mcp sets AGENT_PTY) never reach 1Password through the
+# desktop app either. With CLI integration on and the app unlocked, a bare
+# `op` (or chezmoi's onepassword* calls) there reached Mack's whole account,
+# Personal vault included, with no prompt (verified 2026-10-14).
+[[ -n "$AGENT_PTY" ]] && export OP_BIOMETRIC_UNLOCK_ENABLED=false
 
 # OpenCode beta background subagents
 export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=1

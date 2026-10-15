@@ -581,7 +581,7 @@ _chezmoi_drift_check() {
     if (( degraded )); then
       # Degraded: couldn't enumerate/split targets, fall back to a whole-tree
       # verify. No fast/secret split → a single publish; last-full untouched.
-      "$chezmoi_bin" verify >/dev/null 2>&1 || drifted+="~"
+      OP_SERVICE_ACCOUNT_TOKEN="$(_op_sa_token)" "$chezmoi_bin" verify >/dev/null 2>&1 || drifted+="~"
       _publish "$drifted$git_glyphs"
     else
       # Stage 1 (every cycle, ~150ms): fast verify + git glyphs + the PREVIOUS
@@ -601,7 +601,7 @@ _chezmoi_drift_check() {
       if (( need_full )); then
         secret_drift=0
         if (( ${#secret_tgt} )); then
-          "$chezmoi_bin" verify "${secret_tgt[@]}" >/dev/null 2>&1 || secret_drift=1
+          OP_SERVICE_ACCOUNT_TOKEN="$(_op_sa_token)" "$chezmoi_bin" verify "${secret_tgt[@]}" >/dev/null 2>&1 || secret_drift=1
         fi
         # Plain write (not atomic): the only reader is this same lock-held job.
         print -n "$secret_drift $fp" >| "$full_marker"
@@ -735,6 +735,13 @@ typeset -ga preexec_functions
 [[ -z "${preexec_functions[(r)_chezmoi_prompt_busy]}" ]] && \
   preexec_functions+=(_chezmoi_prompt_busy)
 
+# The 1Password service-account token, for chezmoi's op:// templates only.
+# Never exported (see .zshenv): each chezmoi call that may render a template
+# reads it from the Keychain (~10ms) into that one process's environment.
+_op_sa_token() {
+  security find-generic-password -s op-service-account-token -a "$USER" -w 2>/dev/null
+}
+
 # Wrap chezmoi to keep the drift indicator in sync with reality. Drift
 # detection is done by `chezmoi verify` (run from precmd), so the wrapper
 # only needs to invalidate the result cache after subcommands that could
@@ -788,7 +795,7 @@ chezmoi() {
       --dry-run|-n) dry_run=1; break ;;
     esac
   done
-  command chezmoi "$@"
+  OP_SERVICE_ACCOUNT_TOKEN="$(_op_sa_token)" command chezmoi "$@"
   local rc=$?
   # Dry-run mutates nothing — leave the indicator cache alone.
   (( dry_run )) && return $rc
