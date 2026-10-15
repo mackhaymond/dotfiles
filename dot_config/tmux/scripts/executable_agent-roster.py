@@ -102,21 +102,24 @@ MOUSE = "\U000F037D"  # nf-md-mouse: driving an app through cua-driver
 
 FIELDS = ["session", "index", "id", "name", "state", "summary", "workflow", "cua",
           "since", "last_attached", "blink", "stash_label", "stash_session", "stash_ts",
-          "active", "panes", "path", "kind", "detail_kind", "detail"]
-# The last six: window_active and pane_current_path (the window's active pane)
+          "active", "panes", "path", "kind", "detail_kind", "detail", "space_home"]
+# Then six: window_active and pane_current_path (the window's active pane)
 # give the strip each session's current window and its git branch;
 # window_panes says whether a peek must look for the agent pane; @agent_kind
 # (claude|codex), @agent_detail_kind (perm|ask|fail|done|run) and @agent_detail
 # (one sanitized line, <= 80 chars) are set by agent-tab-indicator.sh and may
-# be empty on any window.
+# be empty on any window. Last, @space_home: a space's home shell
+# (docs/spaces.md), not shown here; parse_windows drops it unless an agent
+# runs in it (non-empty @agent_state: then it is an agent like any other). Rows
+# without it (the tests' 20-field fixtures) still parse.
 FMT = US.join(["#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}",
                "#{@agent_state}", "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}",
                "#{@agent_since}", "#{session_last_attached}", "#{@agent_blink}",
                "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}",
                "#{window_active}", "#{window_panes}", "#{pane_current_path}",
-               "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}"])
+               "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}", "#{@space_home}"])
 # Rides in the same tmux call as FMT, after a `;`. Seven fields where a window
-# row has twenty, so parse_windows skips it and parse_clients takes only it.
+# row has twenty-one, so parse_windows skips it and parse_clients takes only it.
 # The last three are for the strip's scope (Strip.load): the client's session
 # and the two global options, which a client-context format resolves through
 # the session's options to the global ones, so they cost no extra call.
@@ -155,7 +158,11 @@ def parse_windows(text):
     out = []
     for line in text.splitlines():
         parts = line.split(US)
+        if len(parts) == len(FIELDS) - 1:
+            parts.append("")
         if len(parts) != len(FIELDS):
+            continue
+        if parts[-1] == "1" and not parts[4]:   # a space's home shell, unless an agent runs in it
             continue
         w = dict(zip(FIELDS, parts))
         w["index"] = int(w["index"]) if w["index"].isdigit() else 0

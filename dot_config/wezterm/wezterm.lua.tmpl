@@ -368,13 +368,30 @@ config.keys = {
 
 }
 
+-- The digit rows (tmux SPACES, ~/.config/tmux/docs/spaces.md):
+--   CTRL+1-9  prefix + digit     space N   (spaces off: window N, tmux's stock)
+--   CMD+1-9   prefix + M-digit   agent N of this space (spaces off: window N)
+--   OPT+1-9   (not bound here)   reaches tmux as M-digit: shell N
+-- Plain CTRL, not left Control only: WezTerm matches key assignments on
+-- CTRL/ALT/SHIFT/SUPER, with no left/right-only variants. Ctrl+digit is free
+-- here (no WezTerm default; macOS "Switch to Desktop N" is off; Karabiner
+-- only claims digits with all four modifiers). The prefix is C-s; M-digit
+-- goes out as ESC + digit, which is how tmux reads Meta.
 for i = 1, 9 do
+    table.insert(config.keys, {
+        key = tostring(i),
+        mods = "CTRL",
+        action = wezterm.action.Multiple {
+            wezterm.action.SendKey { key = "s", mods = "CTRL" },
+            wezterm.action.SendKey { key = tostring(i) }
+        }
+    })
     table.insert(config.keys, {
         key = tostring(i),
         mods = "CMD",
         action = wezterm.action.Multiple {
             wezterm.action.SendKey { key = "s", mods = "CTRL" },
-            wezterm.action.SendKey { key = tostring(i) }
+            wezterm.action.SendString("\x1b" .. tostring(i))
         }
     })
 end

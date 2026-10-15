@@ -62,8 +62,10 @@ seg="${seg}#[fg=${thm_fg}#,bg=${thm_gray}] 󰒲 #{E:@stash_count} "
 
 # Empty when nothing is parked — a hidden tab is the only thing this reports,
 # so at zero it should not cost a cell. Unset counts as zero (before the first
-# publish).
-showing="#{||:#{==:#{E:@stash_count},0},#{==:#{E:@stash_count},}}"
+# publish). Also empty while tmux SPACES are on (@spaces, docs/spaces.md): the
+# stash summary lives in the sidebar then. Despite its name, `showing` is true
+# when the chip is HIDDEN; directory's arc below follows it either way.
+showing="#{||:#{==:#{@spaces},on},#{||:#{==:#{E:@stash_count},0},#{==:#{E:@stash_count},}}}"
 cond="#{?${showing},,${seg}}"
 
 # The first `bg=default` in catppuccin's string is the leading module's arc —
