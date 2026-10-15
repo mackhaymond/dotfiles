@@ -504,8 +504,12 @@ set -g @resurrect-strategy-nvim 'session'
 # for nvim/less/htop/etc. are preserved.
 set -g @resurrect-processes 'nu'
 set -g @plugin 'tmux-plugins/tmux-continuum'
-set -g @continuum-save-interval '15'
+# Every minute: resurrect-save.sh's fast path skips the full save when the
+# layout fingerprint hasn't moved (docs/kill-guard.md, "save cadence").
+set -g @continuum-save-interval '1'
 set -g @continuum-restore 'on'
+# Above tpm on purpose: continuum starts its restore while tpm loads.
+set -g @resurrect-hook-pre-restore-all 'tmux set-option -g @resurrect_restoring $(date +%s)'
 # Red "last save Nh ago" chip at the left of status-right once the newest
 # snapshot is older than this many minutes (0 = off). agent-tab-watcher.sh
 # checks once a minute; read at its start, so `prefix r` applies a change.
@@ -825,16 +829,16 @@ bind-key C-s run-shell '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-sa
 #           (80 at once on 2026-08-29; saves had reached 173 panes).
 #   tasks   the task broker (CuaNotch agentd) recreates it and resumes tasks
 #           on demand; resurrect must never relaunch its panes.
-set -g @resurrect-exclude-sessions 'agents tasks'
+set -g @resurrect-exclude-sessions 'agents tasks ptymcp-*'
 
 # After every save:
 #   assistant-save.sh  the plugin's assistant detection with its --help parse
 #                      cached (it re-ran per pane), excluded sessions dropped
 #   repair             Codex from verified frontends rather than cwd guesses
-#   guard              reverts `last` if a save lost most of its panes
-# The guard is joined with `;`, not `&&`: it is what protects `last`, so a
-# failed repair must not be able to skip it.
-set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/assistant-save.sh' && python3 '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-save-repair.py'; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-guard.sh'"
+# The guard (reverts `last` if a save lost most of its panes) now runs inside
+# resurrect-save.sh itself, before `last` is linked, so `final` saves can
+# report a failure.
+set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/assistant-save.sh' && python3 '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-save-repair.py'"
 
 # After a restore:
 #   assistant-restore.sh  resumes every saved agent in parallel. Replaces the
@@ -845,7 +849,22 @@ set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/
 #                         sessionId, the only pointer to that conversation.
 #   agent-restore-prune   kills restored `agents` windows. Nothing saves them
 #                         any more; this cleans up after saves made before that.
-set -g @resurrect-hook-post-restore-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/assistant-restore.sh'; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/stash.sh' restore-state; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-restore-prune.sh'"
+#   @resurrect_restored / @resurrect_restoring  restore markers: saves hold off
+#                         while a restore is in flight (docs/kill-guard.md)
+set -g @resurrect-hook-post-restore-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/assistant-restore.sh'; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/stash.sh' restore-state; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-restore-prune.sh'; tmux set-option -g @resurrect_restored \$(date +%s); tmux set-option -gu @resurrect_restoring"
+
+# Structure changed: a debounced save soon after (resurrect-save-soon.sh), so a
+# crash loses at most about a minute of layout. Detach takes a full save.
+set-hook -g 'session-created[9]' 'run-shell -b "#{HOME}/.config/tmux/scripts/resurrect-save-soon.sh"'
+set-hook -g 'session-closed[9]' 'run-shell -b "#{HOME}/.config/tmux/scripts/resurrect-save-soon.sh"'
+set-hook -g 'session-renamed[9]' 'run-shell -b "#{HOME}/.config/tmux/scripts/resurrect-save-soon.sh"'
+set-hook -g 'window-linked[9]' 'run-shell -b "#{HOME}/.config/tmux/scripts/resurrect-save-soon.sh"'
+set-hook -g 'window-unlinked[9]' 'run-shell -b "#{HOME}/.config/tmux/scripts/resurrect-save-soon.sh"'
+set-hook -g 'after-split-window[9]' 'run-shell -b "#{HOME}/.config/tmux/scripts/resurrect-save-soon.sh"'
+set-hook -g 'after-kill-pane[9]' 'run-shell -b "#{HOME}/.config/tmux/scripts/resurrect-save-soon.sh"'
+set-hook -g 'pane-exited[9]' 'run-shell -b "#{HOME}/.config/tmux/scripts/resurrect-save-soon.sh"'
+set-hook -g 'after-rename-window[9]' 'run-shell -b "#{HOME}/.config/tmux/scripts/resurrect-save-soon.sh"'
+set-hook -g 'client-detached[9]' 'run-shell -b "#{HOME}/.config/tmux/scripts/resurrect-save-soon.sh full"'
 
 # Keep the sidecar's key from going stale. It records windows by index, and
 # `renumber-windows on` means closing ANY window shifts its neighbours — so a
