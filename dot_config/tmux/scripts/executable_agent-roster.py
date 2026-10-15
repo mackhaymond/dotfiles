@@ -115,10 +115,16 @@ FMT = US.join(["#{session_name}", "#{window_index}", "#{window_id}", "#{window_n
                "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}",
                "#{window_active}", "#{window_panes}", "#{pane_current_path}",
                "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}"])
-# Rides in the same tmux call as FMT, after a `;`. Four fields where a window
+# Rides in the same tmux call as FMT, after a `;`. Seven fields where a window
 # row has twenty, so parse_windows skips it and parse_clients takes only it.
+# The last three are for the strip's scope (Strip.load): the client's session
+# and the two global options, which a client-context format resolves through
+# the session's options to the global ones, so they cost no extra call.
+# Older 4-field rows (the tests' fixtures) still parse: no session, options unset.
 CLIENT_TAG = "client"
-CLIENT_FMT = US.join(["", CLIENT_TAG, "#{client_tty}", "#{window_id}"])
+CLIENT_FMT = US.join(["", CLIENT_TAG, "#{client_tty}", "#{window_id}",
+                      "#{session_name}", "#{@spaces}", "#{@strip_scope}"])
+CLIENT_FIELDS = ("win", "session", "spaces", "scope")
 
 # agent-jump.sh's EXCLUDE, byte for byte (a test compares it with the
 # script's), matched the way its awk does: index(ex, " " session " ").
@@ -172,11 +178,18 @@ def parse_windows(text):
 
 def parse_clients(text):
     """The CLIENT_FMT rows of the same call → {client_tty: window_id}."""
+    return {tty: c["win"] for tty, c in parse_client_rows(text).items()}
+
+
+def parse_client_rows(text):
+    """The CLIENT_FMT rows → {client_tty: {win, session, spaces, scope}}
+    (missing trailing fields are "")."""
     out = {}
     for line in text.splitlines():
         parts = line.split(US)
-        if len(parts) == 4 and parts[0] == "" and parts[1] == CLIENT_TAG:
-            out[parts[2]] = parts[3]
+        if len(parts) in (4, 4 + len(CLIENT_FIELDS) - 1) and parts[0] == "" and parts[1] == CLIENT_TAG:
+            vals = parts[3:] + [""] * (len(CLIENT_FIELDS) - len(parts[3:]))
+            out[parts[2]] = dict(zip(CLIENT_FIELDS, vals))
     return out
 
 
@@ -1293,6 +1306,15 @@ BRANCH_TTL = 30.0                     # a cwd's .git/HEAD is re-read at most thi
 BRANCH_SLOW_TTL = 600.0               # a cwd whose read outlived BRANCH_WAIT: left alone this long
 BRANCH_WAIT = 0.05                    # the most one frame waits on a branch read (then it finishes alone)
 ANY = 1 << 30                         # a click target that runs to the end of its line
+# SCOPE (Strip.scope): "space" = the client's current session only, "all" =
+# every session. Global option @strip_scope; unset → "space" when @spaces is
+# on, else "all" (today's strip, byte for byte). Option-V ("view") typed into
+# the strip (ESC v / ESC V) or a click on the header title toggles and persists
+# it. Not Option-S: that is tmux's root M-s (agent-jump next), and a stray one
+# landing in the strip must keep reaching tmux.
+SCOPES = ("space", "all")
+SCOPE_KEY = re.compile(rb"\x1b[vV]")
+SCOPE_TITLE = {"space": "SPACE", "all": "AGENTS"}
 UNBOLD = "\x1b[22m"
 UNBG = "\x1b[49m"
 
@@ -1335,6 +1357,9 @@ class Strip(Roster):
     each click hands focus straight back to the tmux pane (`wezterm cli
     activate-pane`) before acting; a key that lands here anyway is forwarded
     to the tmux pane (`wezterm cli send-text --no-paste`), so nothing is lost.
+    The one exception is Option-V, the scope toggle (SCOPE_KEY, scope()):
+    "space" shows only the client's current session, numbered by agent
+    ordinal; "all" is the classic every-session layout.
 
     The tmux client is found, not passed: `wezterm cli list` → the other
     pane in this tab → its tty → the tmux client with that client_tty. Done
@@ -1355,6 +1380,10 @@ class Strip(Roster):
         self.branch_reads = {}        # cwd → (thread, result box): reads that outlived BRANCH_WAIT
         self.children = []            # ☰ display-popup clients, reaped on the refresh tick
         self.cut_mouse = False        # the last read ended inside a mouse report
+        self.spaces = False           # global @spaces is "on"
+        self.scope_opt = ""           # global @strip_scope as read (SCOPES, or "" / junk = unset)
+        self.cur_sess = None          # the client's current session
+        self.ordinals = None          # space scope: window id → "1".."9" / "" (strip_model)
 
     def refresh(self):
         self.children = [p for p in self.children if p.poll() is None]
@@ -1365,6 +1394,51 @@ class Strip(Roster):
         if not self.fixed and self.client not in self.clients and time.time() >= self.next_resolve:
             self.resolve()
         Roster.load(self, text)
+        # Scope inputs ride on the client rows of the same call (CLIENT_FMT).
+        # The options are global, so any client's row will do when ours is
+        # missing; the session falls back to the current window's.
+        rows = parse_client_rows(text)
+        me = rows.get(self.client)
+        row = me or next(iter(rows.values()), None)
+        self.spaces = bool(row) and row["spaces"] == "on"      # exactly "on", as spaces.conf tests it
+        self.scope_opt = row["scope"] if row else ""
+        sess = me["session"] if me else ""
+        if not sess and self.cur_win is not None:
+            sess = next((w["session"] for w in self.windows if w["id"] == self.cur_win), "")
+        self.cur_sess = sess or None
+
+    def chosen_scope(self):
+        """"space" or "all" as configured: @strip_scope if set, else by
+        @spaces. What the toggle flips."""
+        if self.scope_opt in SCOPES:
+            return self.scope_opt
+        return "space" if self.spaces else "all"
+
+    def scope(self):
+        """The scope in effect: chosen_scope(), except "all" while the
+        client's session is unknown, hidden (HIDDEN) or the stash, which are
+        not spaces; title, counts and body all follow this one answer."""
+        s = self.cur_sess
+        if s is None or s in HIDDEN or s == HOLD:
+            return "all"
+        return self.chosen_scope()
+
+    def scope_shown(self):
+        """Whether the title is the scope toggle: only once the scope is a
+        thing (spaces on, or @strip_scope set), so the classic strip is
+        unchanged."""
+        return self.spaces or self.scope_opt in SCOPES
+
+    def toggle_scope(self):
+        """Flip the scope and persist it (`set -g @strip_scope`), so it
+        survives CMD+B and is the same in every strip."""
+        new = "all" if self.chosen_scope() == "space" else "space"
+        r = tmux("set-option", "-g", "@strip_scope", new)
+        if r is None or r.returncode != 0:
+            self.say("couldn't set @strip_scope")
+            return
+        self.scope_opt = new
+        self.say("showing this space" if new == "space" else "showing every space")
 
     def resolve(self):
         self.next_resolve = time.time() + RESOLVE_EVERY
@@ -1416,8 +1490,14 @@ class Strip(Roster):
     def handle(self, keys, raw=None):
         """Never closes (False). Left press: act on the target drawn at that
         cell. The wheel does nothing (nothing scrolls). Anything typed:
-        forwarded to the tmux pane."""
+        forwarded to the tmux pane, except Option-V (SCOPE_KEY), which
+        toggles the scope."""
         clicked, stray = None, self.stray_bytes(raw)
+        toggles = len(SCOPE_KEY.findall(stray))
+        if toggles:
+            stray = SCOPE_KEY.sub(b"", stray)
+            for _ in range(toggles):
+                self.toggle_scope()
         for key in keys:
             if not key.startswith("mouse:"):
                 continue
@@ -1427,7 +1507,7 @@ class Strip(Roster):
                 continue
             if (b & ~3) == 0 and b != 3:       # a plain press, no modifiers, not a drag
                 clicked = (b, x, y)
-        if clicked or stray:
+        if clicked or stray or toggles:
             self.focus_back(stray)
         if clicked and clicked[0] == 0:
             self.click(clicked[1], clicked[2])
@@ -1445,6 +1525,9 @@ class Strip(Roster):
         if a[0] == "restart":
             run_bg("bash '%s'" % WATCHER)
             self.say("watcher restarted")
+            return
+        if a[0] == "scope":
+            self.toggle_scope()
             return
         if self.client is None:
             self.say("no tmux client")
@@ -1516,19 +1599,29 @@ class Strip(Roster):
     def strip_model(self, now):
         """→ (needs, groups, parked). needs: windows in needs_order. groups:
         one per session with something to show, by name; each {name, rows
-        (attention > working > idle, then index), active, branch, current}."""
+        (attention > working > idle, then index), active, branch, current}.
+
+        Scope "space" (Strip.scope): only the client's current session, its
+        box shown even with no agent in it, rows in window-index order, and
+        self.ordinals numbers them (agent_ordinals). NEEDS YOU and parked stay
+        global in both scopes. With @spaces on, a plain shell is never a row;
+        with it off, the current window stays one even without an agent (the
+        popup's rule: a prompt landing under the strip must stay visible)."""
         by_id = {w["id"]: w for w in self.windows}
         needs = [by_id[i] for i in dict.fromkeys(self.needs) if i in by_id]
+        space = self.scope() == "space"
+        self.ordinals = agent_ordinals(self.windows, self.cur_sess) if space else None
         by = {}
         for w in self.windows:
-            if w["session"] not in HIDDEN and w["session"] != HOLD:
+            if w["session"] not in HIDDEN and w["session"] != HOLD and (not space or w["session"] == self.cur_sess):
                 by.setdefault(w["session"], []).append(w)
+        keep_cur = not self.spaces
+        order = (lambda w: w["index"]) if space else (lambda w: (rank(w), w["index"]))
         groups = []
         for s in sorted(by):
             ws = by[s]
-            rows = sorted((w for w in ws if w["state"] or w["id"] == self.cur_win),
-                          key=lambda w: (rank(w), w["index"]))
-            if not rows:
+            rows = sorted((w for w in ws if w["state"] or (keep_cur and w["id"] == self.cur_win)), key=order)
+            if not rows and not space:
                 continue
             active = next((w for w in ws if w["active"] == "1"), None)
             groups.append({"name": s, "rows": rows, "active": active,
@@ -1581,6 +1674,8 @@ class Strip(Roster):
                         P.append(("run", w))
                 if fold:
                     P.append(("fold", len(fold)))
+                if not g["rows"]:             # scope "space": the box of a session with no agent
+                    P.append(("none",))
             if not joined:
                 close()
         if len(gs) < len(groups):
@@ -1664,13 +1759,18 @@ class Strip(Roster):
             k = spec[0]
             tg = []
             if k == "head":
-                l = " " + fg("peach") + BOLD + "AGENTS" + UNBOLD
+                space = self.ordinals is not None
+                title = SCOPE_TITLE["space" if space else "all"]
+                l = " " + fg("peach") + BOLD + title + UNBOLD
+                hot = [(1, 2 + len(title), ("scope",))] if self.scope_shown() else []
                 if st and not has_bar:
                     l += "  " + st[0]
-                    tg = [(1, ANY, st[1])] if st[1] else []
+                    tg = hot + ([(1, ANY, st[1])] if st[1] else [])
                 else:
+                    tg = hot
                     toks, _ = count_tokens(counts([w for w in self.windows
-                                                   if w["session"] not in HIDDEN and w["session"] != HOLD]))
+                                                   if (w["session"] == self.cur_sess if space else
+                                                       w["session"] not in HIDDEN and w["session"] != HOLD)]))
                     l += "  " + (toks or fg("overlay") + "no agents")
             elif k == "bar":
                 if st:
@@ -1706,7 +1806,8 @@ class Strip(Roster):
                     word = detail_word(w)
                     if word and inner >= 24:
                         extra = (fg(CAT_HUE[cat(w)]) + " " + word, len(word) + 1)
-                c, cw = self.agent_content(w, inner, blink, now, extra)
+                num = self.ordinals.get(w["id"], "") if k == "row" and self.ordinals is not None else None
+                c, cw = self.agent_content(w, inner, blink, now, extra, num)
                 l = boxed(c, cw, w["id"] == self.cur_win)
                 tg = [(1, ANY, ("goto", w))]
             elif k == "need2":
@@ -1730,6 +1831,9 @@ class Strip(Roster):
                 tg = [(1, ANY, ("menu",))]
             elif k == "empty":
                 l = " " + fg("overlay") + "no agents running"
+            elif k == "none":
+                t = clip("no agents in this space", inner)
+                l = boxed(fg("overlay") + t, dwidth(t))
             elif k == "parked":
                 attn = sum(1 for w in parked if is_attn(w))
                 l = (" " + fg("sub") + "▸ parked %d" % len(parked)
@@ -1777,9 +1881,11 @@ class Strip(Roster):
                + ((fg("overlay") + " ⎇ " + br) if br else "") + ((" " + ro) if ro else ""))
         return lab, len(pre) + dwidth(name) + ((3 + dwidth(br)) if br else 0) + ro_w
 
-    def agent_content(self, w, width, blink, now, extra=None):
-        """One agent line inside a box → (ansi, cells): shape, kind glyph,
-        project/title, [extra], ⚙/◎, age right-aligned."""
+    def agent_content(self, w, width, blink, now, extra=None, num=None):
+        """One agent line inside a box → (ansi, cells): [agent number],
+        shape, kind glyph, project/title, [extra], ⚙/◎, age right-aligned.
+        `num` (scope "space" only: "1".."9", or "" past 9) takes a 2-cell
+        column before the shape, and only while the title keeps 4 cells."""
         k = KIND_GLYPH.get(w.get("kind", ""))
         kind, kw = ((fg("overlay") + k + " "), 2) if k else ("", 0)
         g = self.strip_glyph(w, blink)
@@ -1790,11 +1896,15 @@ class Strip(Roster):
         right = " %3s" % age if age else ""
         ex, exw = extra or ("", 0)
         tw = max(0, width - 2 - kw - gw - len(right) - exw)
+        nums, nw = "", 0
+        if num is not None and tw - 2 >= 4:
+            nums, nw = fg("sub") + BOLD + (num or " ") + UNBOLD + " ", 2
+            tw -= 2
         proj, title = fit_label(w["label"], tw)
         used = dwidth(proj) + dwidth(title)
-        s = (self.shape(w, blink) + " " + kind + fg("overlay") + proj + fg("text") + title
+        s = (nums + self.shape(w, blink) + " " + kind + fg("overlay") + proj + fg("text") + title
              + " " * max(0, tw - used) + ex + g + fg("overlay") + right)
-        return s, 2 + kw + max(tw, used) + exw + gw + len(right)
+        return s, nw + 2 + kw + max(tw, used) + exw + gw + len(right)
 
     def need_detail(self, w, width):
         """A NEEDS YOU entry's second line → (ansi, cells): `  perm  Bash
@@ -1813,13 +1923,25 @@ class Strip(Roster):
         wl = min(len(word), dwidth(left))
         s = "  " + hue + left[:wl] + fg("overlay") + left[wl:]
         pad = width - 2 - dwidth(left) - dwidth(where)
-        return s + " " * max(0, pad) + fg("overlay") + where, width if where else 2 + dwidth(left)
+        # The cells actually written (the pad runs to `width` with or without
+        # `where`; counting only 2 + left when `where` was dropped made boxed()
+        # pad twice and push the right border off narrow strips).
+        return s + " " * max(0, pad) + fg("overlay") + where, 2 + dwidth(left) + max(0, pad) + dwidth(where)
 
 
 def detail_word(w):
     """The NEEDS YOU detail kind as a word (perm, asks, fail, done), or ""."""
     dk = w.get("detail_kind", "")
     return DETAIL_WORD[dk] if dk in DETAIL_WORD and dk != "run" and w.get("detail") else ""
+
+
+def agent_ordinals(windows, session):
+    """{window id: "1".."9" or ""}: the AGENT NUMBER of each agent window in
+    `session` = its position among that session's windows with a non-empty
+    @agent_state, by window_index, 1-based; past 9 there is none (""). The
+    interface tmux.conf's M-1..M-9 jump by: change both or neither."""
+    agents = sorted((w for w in windows if w["session"] == session and w["state"]), key=lambda w: w["index"])
+    return {w["id"]: (str(n) if n <= 9 else "") for n, w in enumerate(agents, 1)}
 
 
 def run_detail(w):

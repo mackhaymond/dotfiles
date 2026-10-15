@@ -27,6 +27,17 @@ set-option -g renumber-windows on
 
 set -g pane-border-lines heavy
 
+# SPACES (docs/spaces.md): sessions as project spaces, a two-line status (spaces
+# on top, this space's shells below), prefix 1-9 → space N, Option-1..9 →
+# agent N of this space. Everything it changes lives in spaces.conf, sourced
+# at the very bottom of this file. `off` + prefix r gives back exactly the
+# pre-spaces keys and status line.
+set -g @spaces on
+# Sessions that are never spaces: no tab, no number, never looped by the
+# status line (agents alone has hundreds of windows). Marked @space_hidden 1
+# whatever @spaces says. The ONE list; spaces.conf and space.sh read it.
+set -g @space_hidden_sessions 'agents tasks stash scratch btop-popup'
+
 #### end general setup ####
 
 
@@ -861,3 +872,9 @@ set-hook -g 'window-unlinked[1]' 'run-shell -b "#{HOME}/.config/tmux/scripts/sta
 # debounce folds them into one re-read. Rare events: one fork each.
 set-hook -g 'window-linked[1]' 'run-shell -b "notifyutil -p com.mackhaymond.tmux.agent-state"'
 set-hook -g 'window-unlinked[2]' 'run-shell -b "notifyutil -p com.mackhaymond.tmux.agent-state"'
+
+# SPACES — keep LAST. A separate file because `%if` is decided at parse time:
+# here it would still see the previous load's @spaces. By the time this
+# source-file runs, the `set -g @spaces` near the top has. Last, so no plugin
+# or later line re-binds a key it owns (prefix 1-9, c, C-t, k, C-k, mouse).
+source-file -F "#{d:current_file}/spaces.conf"

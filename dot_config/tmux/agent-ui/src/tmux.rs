@@ -246,14 +246,20 @@ pub fn fmt() -> String {
     FORMATS.iter().map(|f| guarded(f)).collect::<Vec<_>>().join(&US.to_string())
 }
 
-/// Client rows ride in the same call. agent-roster.py `CLIENT_FMT` plus the
-/// client's session: `"" US client US tty US window_id US session`. Starts
-/// with an empty field and has 5 fields where a window row has 23, so the two
-/// parsers can never take each other's rows.
+/// Client rows ride in the same call. agent-roster.py `CLIENT_FMT` plus one:
+/// `"" US client US tty US window_id US session US @spaces US @strip_scope
+/// US @space_hidden`. `@spaces` and `@strip_scope` are GLOBAL options and
+/// `@space_hidden` the client's session's (the sidebar's scope,
+/// [`crate::view::Scope`]): a client-context format resolves them through
+/// the client's session (to the global value), so they cost no extra call.
+/// Starts with an empty field and has 8 fields where a window row has 26,
+/// so the two parsers can never take each other's rows.
 pub const CLIENT_TAG: &str = "client";
 
 pub fn client_fmt() -> String {
-    ["", CLIENT_TAG, "#{client_tty}", "#{window_id}", &guarded("#{session_name}")].join(&US.to_string())
+    ["", CLIENT_TAG, "#{client_tty}", "#{window_id}", &guarded("#{session_name}"), &guarded("#{@spaces}"),
+        &guarded("#{@strip_scope}"), &guarded("#{@space_hidden}")]
+        .join(&US.to_string())
 }
 
 /// The holding session for parked tabs (agent-roster.py `HOLD`).
@@ -420,16 +426,26 @@ pub const ANSWERED_TTL: i64 = 600;
 pub struct Client {
     pub tty: String,
     pub window_id: String,
-    /// "" when a 4-field (Python-format) row was parsed.
+    /// "" when a 4-field (old Python-format) row was parsed.
     pub session: String,
+    /// The global `@spaces` and `@strip_scope` as this row printed them ("":
+    /// unset, or a row of an older, shorter format).
+    pub spaces: String,
+    pub strip_scope: String,
+    /// The client's session has `@space_hidden` "1" (spaces.conf marks the
+    /// hidden sessions so).
+    pub space_hidden: bool,
 }
 
 impl Client {
-    /// agent-roster.py `parse_clients`, one row: `"" US client US tty US win [US session]`.
+    /// agent-roster.py `parse_client_rows`, one row:
+    /// `"" US client US tty US win [US session [US spaces US scope [US space_hidden]]]`.
     pub fn parse(line: &str) -> Option<Client> {
         let p: Vec<&str> = line.split(US).collect();
-        if (p.len() == 4 || p.len() == 5) && p[0].is_empty() && p[1] == CLIENT_TAG {
-            Some(Client { tty: p[2].into(), window_id: p[3].into(), session: restore(p.get(4).unwrap_or(&"")) })
+        if matches!(p.len(), 4 | 5 | 7 | 8) && p[0].is_empty() && p[1] == CLIENT_TAG {
+            let f = |i: usize| restore(p.get(i).unwrap_or(&""));
+            Some(Client { tty: p[2].into(), window_id: p[3].into(), session: f(4), spaces: f(5), strip_scope: f(6),
+                space_hidden: f(7) == "1" })
         } else {
             None
         }
@@ -587,6 +603,28 @@ pub(crate) mod tests {
         assert_eq!(s.client("/dev/ttys001").unwrap().session, "main");
         assert_eq!(s.client("/dev/ttys002").unwrap().session, "");
         assert!(s.blink());
+    }
+
+    #[test]
+    fn client_rows_carry_the_scope_options() {
+        // (A guarded format holds a US itself, so compare it whole.)
+        let want = ["", CLIENT_TAG, "#{client_tty}", "#{window_id}", &guarded("#{session_name}"), &guarded("#{@spaces}"),
+            &guarded("#{@strip_scope}"), &guarded("#{@space_hidden}")].join("\x1f");
+        assert_eq!(client_fmt(), want);
+        let s = Snapshot::parse(&[
+            "\x1fclient\x1f/dev/a\x1f@3\x1fmain\x1fon\x1fall\x1f",
+            "\x1fclient\x1f/dev/b\x1f@4\x1fwork",
+            "\x1fclient\x1f/dev/c\x1f@5",
+            "\x1fclient\x1f/dev/d\x1f@6\x1fmain\x1fon", // 6 fields: no format ever printed that
+            "\x1fclient\x1f/dev/e\x1f@7\x1fscratch\x1fon\x1f\x1f1",
+            "\x1fclient\x1f/dev/f\x1f@8\x1fmain\x1fon\x1fall", // agent-roster.py's 7-field row
+        ]
+        .join("\n"));
+        let got: Vec<_> = s.clients.iter()
+            .map(|c| (c.tty.as_str(), c.session.as_str(), c.spaces.as_str(), c.strip_scope.as_str(), c.space_hidden))
+            .collect();
+        assert_eq!(got, [("/dev/a", "main", "on", "all", false), ("/dev/b", "work", "", "", false),
+            ("/dev/c", "", "", "", false), ("/dev/e", "scratch", "on", "", true), ("/dev/f", "main", "on", "all", false)]);
     }
 
     #[test]

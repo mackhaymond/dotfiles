@@ -573,6 +573,54 @@ letters instead.
   Sessions with no agent (and `agents`, `tasks`, `scratch`, `btop-popup`) are
   not shown; parked tabs are the one bottom line. Spare rows sit between the
   last box and `parked`.
+- **Scope** (`Strip.scope`, global option `@strip_scope` = `space` | `all`).
+  `all` is the layout above. `space` shows only the client's current session
+  (a "space"): its one box, titled `SPACE` with that session's counts
+  instead of `AGENTS` and the global ones, shown even when it holds no agent
+  (`no agents in this space`), rows in window-index order, each starting with
+  its **agent number** (`agent_ordinals`): the position among the session's
+  windows with a non-empty `@agent_state`, by `window_index`, 1-based, shown
+  for 1-9 only (10+ keep the blank column). That is the number tmux.conf's
+  `M-1`..`M-9` jump by, so the two must change together. The number takes a
+  2-cell column only while the title keeps 4 cells, so narrow strips lose it
+  first. NEEDS YOU and `parked` stay global in both scopes: an agent needing
+  you in another space still surfaces. Unset, the scope is `space` when
+  `@spaces` is `on`, else `all`; with `@spaces` off and `@strip_scope` unset
+  the strip is byte-for-byte the classic one (tests/test_strip_scope.py
+  `TodayTests` pins it). **Option-V** ("view"; not Option-S, which is tmux's
+  root `M-s` = agent-jump next and must still reach tmux from the strip)
+  typed into the strip, or a click on the
+  title (only once `@spaces` is on or `@strip_scope` is set), flips the scope
+  and persists it with `set -g @strip_scope`, so every strip and the next
+  CMD+B agree; one set elsewhere shows up on the next tick.
+  **Shells**: with `@spaces` on, a window without `@agent_state` is never an
+  agent row, in either scope (the tab bar lists shells). With it off, the
+  current window stays a row even as a plain shell (the popup's rule).
+  The inputs cost no extra call: `CLIENT_FMT` carries `#{session_name}`,
+  `#{@spaces}` and `#{@strip_scope}` on each client row of the one
+  `list-windows \; list-clients` call (a client-context format falls back to
+  the global session options); any client's row supplies the options when the
+  strip's own client is missing. `@spaces` counts as on only when it is
+  exactly `on` (spaces.conf's test). The scope in effect (`Strip.scope`) is
+  `all` whenever the client's session is unknown, one of the hidden ones
+  (`agents`, `tasks`, `scratch`, `btop-popup`) or `stash`, none of which is a
+  space; title, counts and body follow it, and the toggle still flips the
+  chosen `@strip_scope` (`chosen_scope`).
+  **agent-ui's sidebar** (used instead when installed) implements the same
+  scope (`view::Scope`, `ViewModel::apply_scope`): same options, same
+  resolution, same hidden/stash fallback, same shell rule, same ordinals,
+  same Option-V / title toggle (`set-option -g @strip_scope`, the old scope
+  kept and `couldn't set @strip_scope` shown on failure). In its own layout:
+  the header reads ` space` (that session's counts) or ` agents`, the
+  bottom half (`agents · this space`) holds only the client's session's
+  rule and rows, numbered by ordinal (1-digit column, blank past 9, dropped
+  when the title would keep under 4 cells) instead of slots; NEEDS YOU cards
+  lose their numbers in space scope, and NEEDS YOU, the spaces list and
+  parked stay global. Its client row carries one more field than the
+  Python's, `#{@space_hidden}` (the client's session's), for the hidden
+  test. Spaces off and `@strip_scope` unset: frames byte-identical to before
+  (`tests/sidebar.rs` `once_follows_the_scope_options` checks unset → set →
+  unset).
 - **Shapes and colours** (shape and colour both carry the state, herdr's
   rule): failed red `✕`, needs-input yellow `◉`, done green `✓` (finished and
   unseen; a visit discharges it), working `◐` pulsing pink/blue on
@@ -639,6 +687,7 @@ letters instead.
   | `⏵ next` | `agent-jump.sh next` (prefix d) |
   | `☰ menu`, `parked`, any `… more` / `idle` fold row | the prefix q popup on the strip's tmux client |
   | `⟳ restart` (only while the watcher is dead) | respawn the watcher, like `r` in the popup |
+  | the `AGENTS` / `SPACE` title (once a scope is in play, see Scope) | flip `@strip_scope` |
 
   The popup is `tmux display-popup -c <client>` with exactly `bind-key q`'s
   `/bin/dash` line (`roster_popup_argv`; a test compares it with
@@ -658,7 +707,8 @@ letters instead.
   click first hands focus back, `wezterm cli activate-pane --pane-id <tmux
   pane>`, then moves. Any key that lands in the strip anyway is forwarded to
   the tmux pane (`wezterm cli send-text --no-paste`) and focus handed back, so
-  a CMD+T typed at the wrong moment still reaches tmux. Mouse reports never
+  a CMD+T typed at the wrong moment still reaches tmux. The one key kept is
+  Option-V (`ESC v`/`ESC V`, `SCOPE_KEY`), the scope toggle. Mouse reports never
   count as typing, not even one cut in two by the 25 ms ESC wait (both
   halves are dropped). If focus cannot be handed back (two `activate-pane`
   failures with a re-resolve between them), the strip says

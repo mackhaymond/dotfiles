@@ -223,6 +223,10 @@ pub struct Agent {
     /// A prompt just answered ([`Window::answered`]): idle, but still in the
     /// Active set (the menu's Active tab, a slot) until its turn resumes.
     pub answered: bool,
+    /// The AGENT NUMBER in the sidebar's space scope ([`ViewModel::apply_scope`]):
+    /// its 1-based position among its session's windows with an agent state,
+    /// by window index. None outside space scope and for a plain shell.
+    pub ordinal: Option<u32>,
 }
 
 impl Agent {
@@ -271,6 +275,7 @@ impl Agent {
             path: w.path.clone(),
             slot: None,
             answered: w.answered(now),
+            ordinal: None,
         }
     }
 
@@ -491,6 +496,59 @@ pub struct ViewModel {
     /// Every number label's width: the digit count of the highest slot held
     /// ([`hotkeys::slot_width`]); 0 when no agent holds one.
     pub slot_width: usize,
+    /// The sidebar's scope ([`apply_scope`](Self::apply_scope)); the classic
+    /// every-session view until that is called.
+    pub scope: Scope,
+}
+
+/// The sidebar's SCOPE (agent-roster.py `Strip.scope`): `"space"` shows only
+/// the client's current session, numbered by agent ordinal; `"all"` is the
+/// classic every-session view. The inputs are the global options `@spaces`
+/// and `@strip_scope`, read from the client rows of the per-tick snapshot.
+/// With `@spaces` off and `@strip_scope` unset, nothing changes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Scope {
+    /// `@spaces` is exactly "on" (spaces.conf's value): a plain shell is
+    /// never an agent row.
+    pub spaces: bool,
+    /// `@strip_scope` as read: "space", "all", or anything else (unset, junk).
+    pub opt: String,
+    /// Space scope in effect: the client's current session. None: every
+    /// session (scope "all", or the client's session is unknown, hidden or
+    /// the stash). The header and the bottom half both follow this.
+    pub session: Option<String>,
+    /// That session's counts, each window id once (the header's, in space scope).
+    pub counts: Counts,
+}
+
+/// The values `@strip_scope` takes.
+pub const SCOPES: [&str; 2] = ["space", "all"];
+
+impl Scope {
+    /// `"space"` or `"all"`: `@strip_scope` if set, else by `@spaces`.
+    pub fn name(&self) -> &'static str {
+        match self.opt.as_str() {
+            "space" => "space",
+            "all" => "all",
+            _ if self.spaces => "space",
+            _ => "all",
+        }
+    }
+
+    /// The header title is the scope toggle only once the scope is a thing
+    /// (`@spaces` on, or `@strip_scope` set), so the classic sidebar is unchanged.
+    pub fn toggles(&self) -> bool {
+        self.spaces || SCOPES.contains(&self.opt.as_str())
+    }
+
+    /// The scope a toggle sets.
+    pub fn flipped(&self) -> &'static str {
+        if self.name() == "space" {
+            "all"
+        } else {
+            "space"
+        }
+    }
 }
 
 /// Inputs to [`ViewModel::build`] besides the snapshot.
@@ -606,7 +664,54 @@ impl ViewModel {
             watcher_age,
             locale: collator.name().to_string(),
             slot_width: hotkeys::slot_width(slots.values().copied().max()),
+            scope: Scope::default(),
         }
+    }
+
+    /// The sidebar's scope (agent-roster.py `Strip.load` + `strip_model`),
+    /// from the snapshot this view was built from. The options ride on the
+    /// client rows: this view's client's, else any client's (they are global).
+    ///
+    /// - `@spaces` on: the client's window is an agent row only when it has
+    ///   an agent state (it moves to `plain`), in either scope.
+    /// - Space scope with the client's session known: `scope.session` and
+    ///   its counts are set, and that session's agents get their
+    ///   [`Agent::ordinal`]. Which rows show is the layout's business: NEEDS
+    ///   YOU, spaces and parked stay global.
+    pub fn apply_scope(&mut self, snap: &Snapshot) {
+        let me = self.client.as_deref().and_then(|c| snap.client(c));
+        let row = me.or(snap.clients.first());
+        let mut scope = Scope {
+            spaces: row.is_some_and(|c| c.spaces == "on"),
+            opt: row.map(|c| c.strip_scope.clone()).unwrap_or_default(),
+            ..Scope::default()
+        };
+        // A hidden session (spaces.conf's @space_hidden, else the crate's
+        // HIDDEN list) or the stash has no space of its own: scope "all".
+        let hidden = |s: &str| {
+            me.is_some_and(|c| c.space_hidden) || model::HIDDEN.contains(&s) || s == HOLD
+        };
+        if scope.spaces {
+            for sp in &mut self.spaces {
+                if let Some(k) = sp.agents.iter().position(|a| a.state.is_empty()) {
+                    sp.plain.push(sp.agents.remove(k));
+                    sp.plain.sort_by_key(|a| a.index);
+                }
+            }
+        }
+        if scope.name() == "space" {
+            if let Some(s) = self.cur_session.clone().filter(|s| !hidden(s)) {
+                scope.counts = Counts::of(snap.windows.iter().filter(|w| w.session == s));
+                for sp in self.spaces.iter_mut().filter(|sp| sp.name == s) {
+                    // `agents` is already in window-index order.
+                    for (n, a) in sp.agents.iter_mut().filter(|a| !a.state.is_empty()).enumerate() {
+                        a.ordinal = Some(n as u32 + 1);
+                    }
+                }
+                scope.session = Some(s);
+            }
+        }
+        self.scope = scope;
     }
 
     /// `a`'s number label as drawn and typed (zero-padded to
@@ -1059,6 +1164,56 @@ mod tests {
             let slot = |id: &str| v.agents().find(|a| a.window_id == id).and_then(|a| a.slot);
             assert_eq!((slot("@2"), slot("@1")), (Some(1), Some(2)), "{loc}");
         }
+    }
+
+    /// The scope's inputs ride on the client rows; ordinals count agents by
+    /// window index, shells skipped; @spaces "on" (only) drops the client's shell.
+    #[test]
+    fn scope_from_client_rows() {
+        let base = [
+            row("proj", 1, "@1", &[]),
+            row("proj", 2, "@2", &[("state", "idle")]),
+            row("proj", 3, "@3", &[]),
+            row("proj", 5, "@5", &[("state", "failed")]),
+            row("proj", 4, "@4", &[("state", "running")]),
+            row("proj", 9, "@9", &[]),
+            row("proj", 12, "@12", &[("state", "needs-input")]),
+            row("other", 1, "@50", &[("state", "running")]),
+        ];
+        let at = |clients: &[&str], client: &str| {
+            let mut rows: Vec<String> = base.to_vec();
+            rows.extend(clients.iter().map(|c| c.to_string()));
+            let snap = Snapshot::parse(&rows.join("\n"));
+            let mut v = ViewModel::build(&snap, BuildArgs { client: Some(client), now: 0.0, collator: &Collator::new("C"),
+                git: None, log: vec![], watcher_age: None });
+            v.apply_scope(&snap);
+            v
+        };
+        let proj = |v: &ViewModel| -> Vec<(String, Option<u32>)> {
+            v.spaces.iter().find(|s| s.name == "proj").unwrap().agents.iter()
+                .map(|a| (a.window_id.clone(), a.ordinal)).collect()
+        };
+        let o = |v: &[(&str, Option<u32>)]| -> Vec<(String, Option<u32>)> { v.iter().map(|(i, n)| (i.to_string(), *n)).collect() };
+        let v = at(&["\x1fclient\x1f/dev/me\x1f@1\x1fproj\x1fon\x1f\x1f"], "/dev/me");
+        assert_eq!((v.scope.name(), v.scope.session.as_deref(), v.scope.counts.total()), ("space", Some("proj"), 4));
+        assert_eq!(proj(&v), o(&[("@2", Some(1)), ("@4", Some(2)), ("@5", Some(3)), ("@12", Some(4))]));
+        assert_eq!(v.spaces.iter().find(|s| s.name == "proj").unwrap().plain.iter().map(|a| a.index).collect::<Vec<_>>(),
+            [1, 3, 9]);
+        // @spaces "1" is not on: classic, the client's shell kept, no ordinals.
+        let v = at(&["\x1fclient\x1f/dev/me\x1f@1\x1fproj\x1f1\x1f\x1f"], "/dev/me");
+        assert_eq!((v.scope.spaces, v.scope.session.as_deref()), (false, None));
+        assert_eq!(proj(&v)[0], ("@1".to_string(), None));
+        // Our own row wins (as agent-roster.py): an old 5-field one has no options.
+        let v = at(&["\x1fclient\x1f/dev/me\x1f@50\x1fother", "\x1fclient\x1f/dev/x\x1f@1\x1fproj\x1fon\x1fspace\x1f"],
+            "/dev/me");
+        assert_eq!((v.scope.spaces, v.scope.session.as_deref()), (false, None));
+        // Our client is gone: another client's row carries the (global)
+        // options, but the session is unknown: every session.
+        let v = at(&["\x1fclient\x1f/dev/x\x1f@1\x1fproj\x1fon\x1fspace\x1f"], "/dev/me");
+        assert_eq!((v.scope.name(), v.scope.session.as_deref(), v.scope.toggles()), ("space", None, true));
+        // Toggling flips the option-level scope.
+        assert_eq!(v.scope.flipped(), "all");
+        assert_eq!(Scope::default().flipped(), "space");
     }
 
     #[test]

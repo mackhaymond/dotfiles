@@ -143,6 +143,47 @@ fn once_renders_the_fixture() {
     assert_eq!(plain(&s.sidebar(&["--once", "34x30", "--split", "0.7"]))[21], "────────────────═─────────────────");
 }
 
+/// The scope end to end: a REAL client (a nested `tmux attach` running in a
+/// pane of the same private server, so its tty is that pane's) gives the
+/// sidebar its session and the global @spaces / @strip_scope in the one
+/// snapshot call.
+#[test]
+fn once_follows_the_scope_options() {
+    let s = Server::start("scope", 80, 30);
+    s.fixture();
+    let attach = format!("env -u TMUX -u TMUX_PANE tmux -L {} -f /dev/null attach -t work", s.name);
+    s.tmux(&["new-window", "-d", "-t", "main:8", &attach]);
+    let mut tty = String::new();
+    wait_for("the nested client", || {
+        tty = s.tmux(&["list-clients", "-F", "#{client_tty} #{session_name}"])
+            .lines()
+            .find_map(|l| l.strip_suffix(" work").map(String::from))
+            .unwrap_or_default();
+        !tty.is_empty()
+    });
+    let once = || plain(&s.sidebar(&["--once", "34x30", "--client", &tty]));
+    // Classic until an option says otherwise.
+    let classic = once();
+    assert!(classic[0].starts_with(" agents") && classic.iter().any(|l| l.starts_with(" zeta ")), "{classic:#?}");
+    s.tmux(&["set-option", "-g", "@spaces", "on"]);
+    let lines = once();
+    assert!(lines[0].starts_with(" space") && lines[0].contains("◉1 ◐1 ○1") && !lines[0].contains('✕'), "{lines:#?}");
+    let bottom = &lines[16..];
+    for t in [" 1 ◉ Which deck", " 2 ◐ Long running build ⚙", " 3 ○ Quiet one"] {
+        assert!(bottom.iter().any(|l| l.starts_with(t)), "{t}: {lines:#?}");
+    }
+    assert!(!bottom.iter().any(|l| l.contains("zeta") || l.contains("Broken")), "{lines:#?}");
+    // NEEDS YOU stays global, unnumbered.
+    assert!(lines[..15].iter().any(|l| l.starts_with("▌✕ Broken thing")), "{lines:#?}");
+    s.tmux(&["set-option", "-g", "@strip_scope", "all"]);
+    let lines = once();
+    assert!(lines[0].starts_with(" agents") && lines[16..].iter().any(|l| l.starts_with(" zeta ")), "{lines:#?}");
+    // Back to classic: byte for byte what it drew before any option was set.
+    s.tmux(&["set-option", "-gu", "@strip_scope"]);
+    s.tmux(&["set-option", "-gu", "@spaces"]);
+    assert_eq!(once(), classic);
+}
+
 #[test]
 fn live_loop_draws_drags_and_exits_quietly() {
     let s = Server::start("live", 34, 30);
@@ -183,6 +224,10 @@ fn live_loop_draws_drags_and_exits_quietly() {
     std::thread::sleep(Duration::from_millis(300));
     assert!(screen().lines().nth(10).is_some_and(|l| l.starts_with("────────────────═")));
     assert_eq!(s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_dead}"]).trim(), "0");
+    // Option-V: the scope toggle, persisted in the global @strip_scope
+    // (nothing set yet: scope "all", so it flips to "space").
+    send("\x1bv");
+    wait_for("the scope option", || s.tmux(&["show-options", "-gqv", "@strip_scope"]).trim() == "space");
 
     // SIGTERM (CMD+B's kill-pane): a quiet exit, status 0, screen restored.
     let pid = s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_pid}"]);

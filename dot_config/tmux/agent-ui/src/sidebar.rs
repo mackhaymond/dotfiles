@@ -17,6 +17,11 @@
 //!   and any key that lands here is forwarded there. The wheel does nothing:
 //!   nothing scrolls. The divider is dragged (DECSET 1002 button-motion,
 //!   never 1003) and its ratio is kept in tmux's global `@agent_sidebar_split`.
+//! - **Scope.** `@spaces` / `@strip_scope` (globals, read in the same tick
+//!   call): "space" shows only the client's session, numbered by agent
+//!   ordinal (tmux's M-1..M-9); "all" every session ([`crate::view::Scope`]).
+//!   Option-V (ESC v / V), the one key NOT forwarded, or a click on the
+//!   header title (once the scope is a thing) flips and persists it.
 //! - **Cadence.** A snapshot every [`TICK`] (one tmux call), a redraw only
 //!   when the rendered buffer changed, an immediate refresh after a move.
 //!   Idle, it sleeps in poll(2).
@@ -53,6 +58,8 @@ use std::time::{Duration, Instant};
 pub const TICK: Duration = Duration::from_millis(500);
 /// The tmux global holding the divider's ratio.
 pub const SPLIT_OPTION: &str = "@agent_sidebar_split";
+/// The tmux global holding the scope (`space` | `all`; unset: by `@spaces`).
+pub const SCOPE_OPTION: &str = "@strip_scope";
 /// agent-roster.py `ESC_WAIT`: how long a cut-off report waits for its rest.
 const ESC_WAIT: Duration = Duration::from_millis(25);
 /// How long a footer message stays.
@@ -68,6 +75,23 @@ const USAGE: &str = "usage: agent-ui sidebar [--client <tty>] [--tmux-pane <id>]
 fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let i = args.iter().position(|a| a == flag)?;
     args.get(i + 1).map(String::as_str)
+}
+
+/// agent-roster.py `SCOPE_KEY` (`\x1b[vV]`): typed bytes with every Option-V
+/// (ESC v / ESC V) taken out → (the rest, how many). CSI `ESC [ v` is not
+/// one, and neither is Option-S (tmux's M-s): those are forwarded.
+fn take_scope_keys(stray: &[u8]) -> (Vec<u8>, usize) {
+    let (mut out, mut n, mut i) = (Vec::with_capacity(stray.len()), 0, 0);
+    while i < stray.len() {
+        if stray[i] == 0x1b && matches!(stray.get(i + 1), Some(b'v' | b'V')) {
+            n += 1;
+            i += 2;
+        } else {
+            out.push(stray[i]);
+            i += 1;
+        }
+    }
+    (out, n)
 }
 
 /// `34x58` → (34, 58).
@@ -158,7 +182,9 @@ fn build_view(core: &mut Core, client: Option<&str>, git_spaces: &[String]) -> V
     let log = core.events.newest(core.log_limit);
     let args = BuildArgs { client, now, collator: &core.collator, git: None, log, watcher_age: watcher_age() };
     let mut view = ViewModel::build_with(&core.snapshot, args, &mut core.slots);
-    for sp in view.spaces.iter_mut().filter(|s| !s.agents.is_empty()) {
+    view.apply_scope(&core.snapshot);
+    let scoped = view.scope.session.clone();
+    for sp in view.spaces.iter_mut().filter(|s| !s.agents.is_empty() || scoped.as_ref() == Some(&s.name)) {
         sp.branch = core.git.branch(&sp.path, now);
         if git_spaces.contains(&sp.name) {
             sp.git = core.git.status(&sp.path, now);
@@ -314,8 +340,22 @@ impl App {
     /// hands focus back. A press while a drag is open (its release was lost)
     /// drops that drag unsaved.
     fn handle(&mut self, data: &[u8]) {
-        let inp = self.reader.feed(data);
-        let mut focus = !inp.stray.is_empty();
+        let mut inp = self.reader.feed(data);
+        // Option-V (ESC v / ESC V) is the one key the sidebar keeps: the
+        // scope toggle. It is never forwarded, but focus still goes back;
+        // it acts after that, so its message is the one shown.
+        let (stray, toggles) = take_scope_keys(&inp.stray);
+        inp.stray = stray;
+        self.handle_input(&inp, toggles > 0);
+        for _ in 0..toggles {
+            self.toggle_scope();
+        }
+    }
+
+    /// [`handle`](Self::handle) minus the scope keys; `focus`: hand focus
+    /// back even with nothing else to forward.
+    fn handle_input(&mut self, inp: &input::Input, focus: bool) {
+        let mut focus = focus || !inp.stray.is_empty();
         let mut act = None;
         for m in &inp.mice {
             if m.b & 64 != 0 {
@@ -372,6 +412,21 @@ impl App {
         self.split = layout::ratio_for_row(y1.saturating_sub(1), self.shown.height);
     }
 
+    /// Strip.toggle_scope: flip the scope and persist it (`set-option -g
+    /// @strip_scope`), so it survives CMD+B and is the same in every
+    /// sidebar; then redraw from a fresh snapshot (which reads it back). A
+    /// failed set keeps the old scope and says so.
+    fn toggle_scope(&mut self) {
+        let new = self.view.scope.flipped();
+        match self.core.tmux.run(&["set-option", "-g", SCOPE_OPTION, new]) {
+            Ok(o) if o.ok() => {
+                self.say(if new == "space" { "showing this space" } else { "showing every space" });
+                self.refresh();
+            }
+            _ => self.say(format!("couldn't set {SCOPE_OPTION}")),
+        }
+    }
+
     /// Remember the divider in `@agent_sidebar_split`.
     fn save_split(&mut self) {
         let v = format!("{:.4}", self.split);
@@ -386,6 +441,10 @@ impl App {
         if t == Target::Restart {
             let m = self.actions.restart_watcher();
             self.say(m);
+            return;
+        }
+        if t == Target::Scope {
+            self.toggle_scope();
             return;
         }
         let Some(client) = self.link.client.clone() else {
@@ -422,7 +481,7 @@ impl App {
                     Err(e) => Err(format!("menu failed: {e}")),
                 }
             }
-            Target::Divider | Target::Restart => Ok(false),
+            Target::Divider | Target::Restart | Target::Scope => Ok(false),
         };
         match moved {
             Ok(true) => self.refresh(),
@@ -608,6 +667,36 @@ mod tests {
         assert_eq!(a.focus_backs, 6);
         a.handle(b"x");
         assert_eq!(a.focus_backs, 7);
+    }
+
+    #[test]
+    fn option_v_is_taken_out_of_typing() {
+        assert_eq!(take_scope_keys(b"c\x1bvd\x1b[v\x1bs\x1bV"), (b"cd\x1b[v\x1bs".to_vec(), 2));
+        assert_eq!(take_scope_keys(b"\x1b\x1bv"), (b"\x1b".to_vec(), 1));
+        assert_eq!(take_scope_keys(b"v\x1b"), (b"v\x1b".to_vec(), 0));
+    }
+
+    /// Option-V and a title click toggle; the set fails here (no server),
+    /// so the scope stays and the footer says why. Focus still goes back.
+    #[test]
+    fn scope_toggle_failure_keeps_the_scope() {
+        let mut a = app();
+        a.handle(b"\x1bv");
+        assert_eq!(a.focus_backs, 1);
+        assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("couldn't set @strip_scope"));
+        assert_eq!(a.view.scope.name(), "all");
+        // CSI v is not the toggle: plain typing.
+        a.msg = None;
+        a.handle(b"\x1b[v");
+        assert_eq!(a.focus_backs, 2);
+        assert!(a.msg.as_ref().is_none_or(|(m, _)| !m.contains("strip_scope")), "{:?}", a.msg);
+        // The title is a toggle only once the scope is a thing.
+        assert_eq!(a.shown.target(2, 0), None);
+        a.view.scope.spaces = true;
+        a.shown = layout(&a.view, 34, 30, &Opts::default());
+        a.handle(b"\x1b[<0;3;1M\x1b[<0;3;1m");
+        assert_eq!((a.last_act.clone(), a.focus_backs), (Some(Target::Scope), 3));
+        assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("couldn't set @strip_scope"));
     }
 
     #[test]

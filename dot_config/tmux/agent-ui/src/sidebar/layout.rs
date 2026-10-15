@@ -61,6 +61,18 @@
 //! slot anywhere the column is not drawn at all. The folded idle line has
 //! no numbers (idle agents hold none), and collapsed rules and `… N more`
 //! stand for many agents, so neither does.
+//!
+//! ## Scope
+//!
+//! [`crate::view::Scope`] (`@spaces` / `@strip_scope`): in SPACE scope the
+//! header reads ` space` with that session's counts, the bottom half shows
+//! only the client's session (its rule and ` no agents in this space` when
+//! it has none), and its rows carry AGENT ORDINALS instead of slots: "1".."9"
+//! by window index among the session's agents, blank past 9, dropped when
+//! the title would keep fewer than 4 cells. NEEDS YOU (unnumbered there),
+//! the spaces list and parked stay global. The header title is the toggle
+//! once the scope is a thing. With `@spaces` off and `@strip_scope` unset,
+//! every frame is the classic one.
 
 use crate::actions::watcher_problem;
 use crate::hotkeys::slot_label;
@@ -161,6 +173,9 @@ pub enum Target {
     Divider,
     /// The red watcher warning: restart it (the strip's ⟳, Strip.click "restart").
     Restart,
+    /// The header title: flip the scope (space / all) and persist it in
+    /// `@strip_scope` (Strip.toggle_scope).
+    Scope,
 }
 
 /// One screen line.
@@ -320,11 +335,23 @@ fn dim_line(w: usize, text: &str) -> Row {
     Row::new(fit(w, vec![seg(text, "overlay")], vec![], None))
 }
 
-/// Row 0: ` agents` and the per-state counts over every shown space.
+/// Row 0: ` agents` and the per-state counts over every shown space; in
+/// space scope ` space` and that session's counts. The title is the scope
+/// toggle ([`Target::Scope`]) once the scope is a thing
+/// ([`crate::view::Scope::toggles`]).
 fn header_row(view: &ViewModel, w: usize) -> Row {
-    let mut right = count_segs(&view.counts, true);
+    let (title, counts) = match view.scope.session {
+        Some(_) => (" space", &view.scope.counts),
+        None => (" agents", &view.counts),
+    };
+    let mut right = count_segs(counts, true);
     right.push(seg(" ", "text"));
-    Row::new(fit(w, vec![bold(" agents", "text")], right, None))
+    let mut row = Row::new(fit(w, vec![bold(title, "text")], right, None));
+    let end = dwidth(title).min(w) as u16;
+    if view.scope.toggles() && end > 1 {
+        row.targets.push((1, end, Target::Scope));
+    }
+    row
 }
 
 /// Row 1: the three buttons (⌥ hints dropped when they do not fit).
@@ -350,21 +377,47 @@ fn toolbar_row(w: usize) -> Row {
     Row { targets, ..Row::new(fit(w, segs, vec![], None)) }
 }
 
+/// Which number a row's number column shows, and how wide it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Num {
+    /// The label's width in cells; 0: no column at all.
+    w: usize,
+    /// Space scope: the agent's [`Agent::ordinal`] ("1".."9", blank past 9),
+    /// not its sticky slot.
+    ordinal: bool,
+}
+
+impl Num {
+    const NONE: Num = Num { w: 0, ordinal: false };
+    /// Space scope's column: one digit.
+    const ORDINAL: Num = Num { w: 1, ordinal: true };
+
+    /// The classic column: slots, zero-padded to `sw` ([`ViewModel::slot_width`]).
+    fn slots(sw: usize) -> Num {
+        Num { w: sw, ordinal: false }
+    }
+}
+
 /// The number column of an agent's first line: its slot label (zero-padded
-/// to `sw`, the view's [`ViewModel::slot_width`]) and a space, blank when it
-/// holds no slot; None when no agent holds one (`sw` 0: no column at all).
-/// Display only: the sidebar has no number keys.
-fn num_seg(a: &Agent, sw: usize) -> Option<Seg> {
-    (sw > 0).then(|| match a.slot {
-        Some(s) => seg(format!("{} ", slot_label(s, sw)), "sub"),
-        None => seg(" ".repeat(sw + 1), "text"),
+/// to `n.w`) or, in space scope, its ordinal, and a space; blank when it has
+/// none; None when there is no column (`n.w` 0). Display only: the sidebar
+/// has no number keys (the ordinals are tmux's M-1..M-9).
+fn num_seg(a: &Agent, n: Num) -> Option<Seg> {
+    let label = if n.ordinal {
+        a.ordinal.filter(|&o| o <= 9).map(|o| o.to_string())
+    } else {
+        a.slot.map(|s| slot_label(s, n.w))
+    };
+    (n.w > 0).then(|| match label {
+        Some(l) => seg(format!("{l} "), "sub"),
+        None => seg(" ".repeat(n.w + 1), "text"),
     })
 }
 
 /// The cells [`num_seg`] takes: what the lines under it indent by.
-fn num_w(sw: usize) -> usize {
-    if sw > 0 {
-        sw + 1
+fn num_w(n: Num) -> usize {
+    if n.w > 0 {
+        n.w + 1
     } else {
         0
     }
@@ -372,7 +425,7 @@ fn num_w(sw: usize) -> usize {
 
 /// A NEEDS YOU card: 3, 2 or 1 lines on `surface0`, a left bar in the state
 /// colour (Strip.need_detail's reason on line 2), the agent's number first.
-fn need_rows(n: &Need, w: usize, lines: u8, sw: usize) -> Vec<Row> {
+fn need_rows(n: &Need, w: usize, lines: u8, sw: Num) -> Vec<Row> {
     let a = &n.agent;
     let hue = a.color.unwrap_or("overlay");
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
@@ -419,14 +472,17 @@ fn needs_header(view: &ViewModel, w: usize) -> Row {
 }
 
 /// The whole NEEDS YOU section. Never empty: with nothing pending it says so,
-/// so nothing below it jumps when the first need arrives.
+/// so nothing below it jumps when the first need arrives. Its cards carry
+/// slots, except in space scope, where numbers are ordinals of one session
+/// and NEEDS YOU is global: no numbers there.
 fn needs_block(view: &ViewModel, w: usize, lines: u8) -> Vec<Row> {
     let mut rows = vec![needs_header(view, w)];
     if view.needs.is_empty() {
         rows.push(dim_line(w, " ✓ nothing needs you"));
     }
+    let num = if view.scope.session.is_some() { Num::NONE } else { Num::slots(view.slot_width) };
     for n in &view.needs {
-        rows.extend(need_rows(n, w, lines, view.slot_width));
+        rows.extend(need_rows(n, w, lines, num));
     }
     rows
 }
@@ -648,7 +704,7 @@ fn short_title(a: &Agent) -> String {
 /// `sel` background and `here`. Line 2 of a working agent is its run detail
 /// or `working` + path; of any other, its last outcome (`done …`, `fail …`)
 /// or its path.
-fn agent_rows(a: &Agent, w: usize, two: bool, sw: usize) -> Vec<Row> {
+fn agent_rows(a: &Agent, w: usize, two: bool, sw: Num) -> Vec<Row> {
     let hue = a.color.unwrap_or("overlay");
     let quiet = matches!(a.cat, None | Some(Cat::Idle));
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
@@ -664,7 +720,11 @@ fn agent_rows(a: &Agent, w: usize, two: bool, sw: usize) -> Vec<Row> {
     };
     // The title gets every cell the glyph, the flag and the right side leave.
     let gap = usize::from(!right.is_empty() && !right[0].text.starts_with(' '));
-    let room = w.saturating_sub(3 + num_w(sw) + flag.as_ref().map_or(0, |f| dwidth(&f.text)) + width(&right) + gap);
+    let fixed = 3 + flag.as_ref().map_or(0, |f| dwidth(&f.text)) + width(&right) + gap;
+    // An ordinal only while the title keeps 4 cells (agent-roster.py
+    // agent_content): on a very narrow sidebar the number goes, not the title.
+    let sw = if sw.ordinal && w.saturating_sub(fixed + num_w(sw)) < 4 { Num::NONE } else { sw };
+    let room = w.saturating_sub(fixed + num_w(sw));
     let title = clip(&short_title(a), room);
     let title = if quiet { seg(title, "sub") } else if two { bold(title, "text") } else { seg(title, "text") };
     // ` 3 ◉ Title`: the number in the space before the glyph's.
@@ -727,7 +787,7 @@ fn rule_row(sp: &Space, w: usize, collapsed: bool) -> Row {
 
 /// `   ○○○ 3 idle · Name, Name…`: a space's idle agents in one line, its
 /// circles under the titles above. No numbers: idle agents hold no slot.
-fn fold_row(idle: &[&Agent], w: usize, sw: usize) -> Row {
+fn fold_row(idle: &[&Agent], w: usize, sw: Num) -> Row {
     let k = idle.len();
     let names: Vec<String> = idle.iter().map(|a| short_title(a)).collect();
     let indent = " ".repeat(3 + num_w(sw));
@@ -777,7 +837,7 @@ fn split_idle(sp: &Space, fold: bool) -> (Vec<&Agent>, Vec<&Agent>) {
 
 /// A space's agent rows in window-index order (the folded line last); the
 /// agents in `two` get their second line.
-fn group_rows(sp: &Space, w: usize, two: &[Key], fold: bool, sw: usize) -> Vec<Row> {
+fn group_rows(sp: &Space, w: usize, two: &[Key], fold: bool, sw: Num) -> Vec<Row> {
     let (shown, idle) = split_idle(sp, fold);
     let mut rows: Vec<Row> = shown.iter().flat_map(|a| agent_rows(a, w, two.contains(&key(a)), sw)).collect();
     if !idle.is_empty() {
@@ -789,7 +849,7 @@ fn group_rows(sp: &Space, w: usize, two: &[Key], fold: bool, sw: usize) -> Vec<R
 /// A space's agents in `room` rows: all of them one line each if they fit,
 /// else the `room - 1` that matter most ([`promotion_rank`], kept in list
 /// order) and a `… N more` line for the rest.
-fn partial_rows(sp: &Space, w: usize, room: usize, sw: usize) -> Vec<Row> {
+fn partial_rows(sp: &Space, w: usize, room: usize, sw: Num) -> Vec<Row> {
     if sp.agents.len() <= room {
         return sp.agents.iter().flat_map(|a| agent_rows(a, w, false, sw)).collect();
     }
@@ -820,6 +880,15 @@ fn promotion_rank(a: &Agent) -> u8 {
     }
 }
 
+/// The spaces the bottom half draws: those with agents; in space scope, just
+/// the client's session, agents or not.
+fn groups(view: &ViewModel) -> Vec<&Space> {
+    match &view.scope.session {
+        Some(s) => view.spaces.iter().filter(|sp| &sp.name == s).collect(),
+        None => view.spaces.iter().filter(|s| !s.agents.is_empty()).collect(),
+    }
+}
+
 /// The bottom half's content (between the divider and the last row), at
 /// most `budget` rows → (rows, ladder step).
 ///
@@ -831,9 +900,18 @@ fn bottom_rows(view: &ViewModel, w: usize, budget: usize) -> (Vec<Row>, u8) {
     if budget == 0 {
         return (vec![], 0);
     }
-    let sw = view.slot_width;
-    let groups: Vec<&Space> = view.spaces.iter().filter(|s| !s.agents.is_empty()).collect();
-    let header = section(w, "agents", "sub", vec![seg("by space ", "overlay")]);
+    let groups = groups(view);
+    let space = view.scope.session.is_some();
+    let sw = if space { Num::ORDINAL } else { Num::slots(view.slot_width) };
+    let header = section(w, "agents", "sub", vec![seg(if space { "this space " } else { "by space " }, "overlay")]);
+    if space && groups.iter().all(|g| g.agents.is_empty()) {
+        // The space's rule even with no agent in it, so the half says whose it is.
+        let mut rows = vec![header];
+        rows.extend(groups.iter().map(|g| rule_row(g, w, false)));
+        rows.push(dim_line(w, " no agents in this space"));
+        rows.truncate(budget);
+        return (rows, 0);
+    }
     if groups.is_empty() {
         let mut rows = vec![header, dim_line(w, " no agents running")];
         rows.truncate(budget);
@@ -950,7 +1028,7 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
     let split_n = usize::from(split);
     let (mut rows, top_step) = top_rows(view, w, split_n);
     let body = h.saturating_sub(split_n + 2);
-    let all: Vec<&Agent> = view.agents().collect();
+    let all: Vec<&Agent> = groups(view).into_iter().flat_map(|s| s.agents.iter()).collect();
     if body == 0 && !all.is_empty() {
         // Too short for a bottom half: one row still counts every agent
         // (in place of the divider; the parked row follows if there is room).
@@ -1644,6 +1722,218 @@ mod tests {
         // One digit when no slot reaches 10.
         let f = layout(&quiet(), 34, 58, &Opts::default());
         assert!(texts(&f).iter().any(|l| l.starts_with(" 2 ◐ Tmux Agent Sidebar")));
+    }
+
+    /// A scoped view: `agents` plus the usual noise, the client on `here` in
+    /// `session`, with `@spaces` / `@strip_scope` / `@space_hidden` on its
+    /// client row, scope applied as the sidebar does.
+    fn scoped(agents: Vec<A>, here: &str, session: &str, spaces: &str, scope: &str, hidden: &str) -> ViewModel {
+        let mut rows: Vec<String> = agents
+            .iter()
+            .enumerate()
+            .map(|(n, x)| {
+                let mut set: Vec<(&str, &str)> = vec![("state", x.st), ("summary", x.title)];
+                set.extend(x.set.iter().map(|(k, v)| (*k, v.as_str())));
+                row(x.s, x.i, &format!("@{}", n + 1), &set)
+            })
+            .collect();
+        rows.push(row("agents", 1, "@900", &[("state", "failed"), ("summary", "hidden")]));
+        rows.push(row("stash", 1, "@901", &[("summary", "x"), ("stash_label", "Parked one"), ("stash_ts", "5")]));
+        rows.push(format!("\x1fclient\x1f{CLIENT}\x1f{here}\x1f{session}\x1f{spaces}\x1f{scope}\x1f{hidden}"));
+        let c = Collator::new("en_US.UTF-8");
+        let snap = Snapshot::parse(&rows.join("\n"));
+        let args = BuildArgs { client: Some(CLIENT), now: NOW as f64, collator: &c, git: None, log: vec![], watcher_age: Some(1.0) };
+        let mut v = ViewModel::build(&snap, args);
+        v.apply_scope(&snap);
+        v
+    }
+
+    /// agent-roster tests' OrdinalTests fixture: agents interleaved with
+    /// shells, out of index order, and another session. Ids follow the list:
+    /// @1 shell (the client's), @2 idle, @3 shell, @4 failed (index 5),
+    /// @5 running (index 4), @6 shell, @7 needs-input (index 12), @8 other.
+    fn proj() -> Vec<A<'static>> {
+        vec![
+            a("proj", 1, "", "zsh"),
+            a("proj", 2, "idle", "p/two"),
+            a("proj", 3, "", "zsh"),
+            a("proj", 5, "failed", "p/five"),
+            a("proj", 4, "running", "p/four"),
+            a("proj", 9, "", "zsh"),
+            a("proj", 12, "needs-input", "p/twelve"),
+            a("other", 1, "running", "o/one"),
+        ]
+    }
+
+    /// The bottom half's text.
+    fn bottom(f: &Frame) -> Vec<String> {
+        texts(f)[usize::from(f.split) + 1..].to_vec()
+    }
+
+    #[test]
+    fn space_scope_shows_one_session_numbered_by_ordinal() {
+        let v = scoped(proj(), "@1", "proj", "on", "", "");
+        assert_eq!(v.scope.session.as_deref(), Some("proj"));
+        let ord: Vec<_> = v.spaces.iter().find(|s| s.name == "proj").unwrap().agents.iter()
+            .map(|a| (a.window_id.as_str(), a.ordinal)).collect();
+        // By window index, shells skipped (and, @spaces on, the client's shell is no row).
+        assert_eq!(ord, [("@2", Some(1)), ("@5", Some(2)), ("@4", Some(3)), ("@7", Some(4))]);
+        let f = layout(&v, 34, 58, &Opts::default());
+        let t = texts(&f);
+        // The header: this space's counts only (other's ◐ not counted).
+        assert!(t[0].starts_with(" space ") && t[0].ends_with("✕1 ◉1 ◐1 ○1 "), "{:?}", t[0]);
+        let b = bottom(&f);
+        assert!(b[0].starts_with(" agents") && b[0].ends_with("this space "), "{b:#?}");
+        assert!(b[1].starts_with(" proj ─"), "{b:#?}");
+        let numbered: Vec<&str> = b.iter().filter(|l| l.starts_with(" 1 ") || l.starts_with(" 2 ")
+            || l.starts_with(" 3 ") || l.starts_with(" 4 ")).map(|l| l.trim_end()).collect();
+        assert_eq!(numbered.len(), 4, "{b:#?}");
+        for (k, want) in [" 1 ○ two", " 2 ◐ four", " 3 ✕ five", " 4 ◉ twelve"].iter().enumerate() {
+            assert!(numbered[k].starts_with(want), "{want}: {b:#?}");
+        }
+        // Only this session below the divider; no shell rows; NEEDS YOU stays
+        // global (and unnumbered), as does the spaces list.
+        assert!(!b.iter().any(|l| l.contains("other") || l.contains("o/one") || l.contains("zsh")), "{b:#?}");
+        let top = &t[..usize::from(f.split)];
+        assert!(top.iter().any(|l| l.starts_with("▌✕ p/five")) && top.iter().any(|l| l.starts_with("▌◉ p/twelve")),
+            "{top:#?}");
+        assert!(top.iter().any(|l| l.contains("○ other")), "{top:#?}");
+        // The title toggles; the counts do not.
+        assert_eq!((f.target(0, 0), f.target(1, 0), f.target(5, 0), f.target(6, 0), f.target(30, 0)),
+            (None, Some(&Target::Scope), Some(&Target::Scope), None, None));
+    }
+
+    #[test]
+    fn explicit_space_scope_without_spaces_keeps_the_current_shell() {
+        let v = scoped(proj(), "@1", "proj", "", "space", "");
+        assert_eq!(v.scope.session.as_deref(), Some("proj"));
+        let f = layout(&v, 34, 58, &Opts::default());
+        let b = bottom(&f);
+        // The client's shell is a row (the classic rule), blank in the number column.
+        assert!(b.iter().any(|l| l.starts_with("     zsh")), "{b:#?}");
+        assert!(b.iter().any(|l| l.starts_with(" 1 ○ two")) && b.iter().any(|l| l.starts_with(" 4 ◉ twelve")), "{b:#?}");
+    }
+
+    #[test]
+    fn all_scope_with_spaces_drops_shells_and_toggles() {
+        let v = scoped(proj(), "@1", "proj", "on", "all", "");
+        assert_eq!(v.scope.session, None);
+        let f = layout(&v, 34, 58, &Opts::default());
+        let t = texts(&f);
+        assert!(t[0].starts_with(" agents ") && t[0].ends_with("✕1 ◉1 ◐2 ○1 "), "{:?}", t[0]);
+        assert_eq!(f.target(3, 0), Some(&Target::Scope));
+        let b = bottom(&f);
+        assert!(b.iter().any(|l| l.starts_with(" other ─")) && b.iter().any(|l| l.starts_with(" proj ─")), "{b:#?}");
+        assert!(!b.iter().any(|l| l.contains("zsh")), "{b:#?}");
+        // Slots (other:1 took 1), not ordinals, in this scope; idle holds none.
+        assert!(b.iter().any(|l| l.starts_with(" 3 ✕ five")) && b.iter().any(|l| l.starts_with("   ○ two")), "{b:#?}");
+        // A space with nothing but shells is no group at all.
+        let mut only_shell = proj();
+        only_shell.push(a("plain", 1, "", "zsh"));
+        let v = scoped(only_shell, "@9", "plain", "on", "all", "");
+        assert!(!bottom(&layout(&v, 34, 58, &Opts::default())).iter().any(|l| l.contains(" plain ")));
+    }
+
+    #[test]
+    fn classic_when_spaces_off_and_scope_unset() {
+        // "1", "off" or junk is not on; junk @strip_scope is unset.
+        for (spaces, scope) in [("", ""), ("off", ""), ("1", ""), ("", "bogus")] {
+            let v = scoped(proj(), "@1", "proj", spaces, scope, "");
+            assert_eq!((v.scope.session.as_ref(), v.scope.toggles(), v.scope.name()), (None, false, "all"), "{spaces} {scope}");
+            let f = layout(&v, 34, 58, &Opts::default());
+            assert!(f.rows[0].targets.is_empty());
+            // The client's shell still shows: the classic rule.
+            assert!(bottom(&f).iter().any(|l| l.contains("zsh")), "{spaces} {scope}");
+        }
+        for (spaces, scope, want) in [("on", "", "space"), ("on", "all", "all"), ("", "space", "space"),
+            ("on", "bogus", "space"), ("1", "", "all")] {
+            assert_eq!(scoped(proj(), "@1", "proj", spaces, scope, "").scope.name(), want, "{spaces} {scope}");
+        }
+    }
+
+    #[test]
+    fn hidden_sessions_fall_back_to_all() {
+        // spaces.conf marks it, or the crate's own list, or the stash: header and body agree.
+        let mut ws = proj();
+        ws.push(a("scratch", 1, "running", "s/one"));
+        for (session, here, hidden) in [("proj", "@2", "1"), ("scratch", "@9", ""), ("stash", "@901", "")] {
+            let v = scoped(ws.iter().map(|x| A { set: x.set.clone(), ..*x }).collect(), here, session, "on", "", hidden);
+            assert_eq!((v.scope.name(), v.scope.session.as_ref()), ("space", None), "{session}");
+            let f = layout(&v, 34, 58, &Opts::default());
+            assert!(texts(&f)[0].starts_with(" agents "), "{session}");
+            let b = bottom(&f);
+            assert!(b[0].ends_with("by space ") && b.iter().any(|l| l.starts_with(" other ─")), "{session}: {b:#?}");
+        }
+    }
+
+    #[test]
+    fn empty_space_still_has_its_box() {
+        let mut ws = proj();
+        ws.push(a("empty", 1, "", "zsh"));
+        let v = scoped(ws, "@9", "empty", "on", "", "");
+        let f = layout(&v, 34, 30, &Opts::default());
+        let t = texts(&f);
+        assert_eq!(t[0].trim_end(), " space"); // no counts: nothing in it
+        let b = bottom(&f);
+        assert!(b[1].starts_with(" empty ─") && b[2].starts_with(" no agents in this space"), "{b:#?}");
+        assert!(t[..usize::from(f.split)].iter().any(|l| l.starts_with(" needs you")));
+        assert_eq!(f.target(4, f.split + 2), Some(&Target::Session("empty".into())));
+    }
+
+    #[test]
+    fn ordinals_stop_at_nine_and_go_when_narrow() {
+        let ws: Vec<A> = (1..=11).map(|i| a("big", i, "running", ["b/n1", "b/n2", "b/n3", "b/n4", "b/n5", "b/n6",
+            "b/n7", "b/n8", "b/n9", "b/n10", "b/n11"][i as usize - 1])).collect();
+        let v = scoped(ws, "@1", "big", "on", "", "");
+        let f = layout(&v, 34, 70, &Opts::default());
+        let b = bottom(&f);
+        assert!(b.iter().any(|l| l.starts_with(" 9 ◐ n9 ")), "{b:#?}");
+        assert!(b.iter().any(|l| l.starts_with("   ◐ n10 ")) && b.iter().any(|l| l.starts_with("   ◐ n11 ")), "{b:#?}");
+        // Narrow: the number only while the title keeps 4 cells. A one-line
+        // row has 3 cells of glyph and ` 1m ` (age) fixed, 2 for the number.
+        let r = &v.spaces[0].agents[0];
+        assert_eq!(r.age, "1m");
+        for (w, shown) in [(10, false), (12, false), (13, true), (30, true)] {
+            let row = &agent_rows(r, w, false, Num::ORDINAL)[0];
+            assert_eq!(width(&row.segs), w, "{w}");
+            assert_eq!(row.text().starts_with(" 1 ◐"), shown, "{w}: {:?}", row.text());
+        }
+    }
+
+    #[test]
+    fn scoped_views_fit_every_size() {
+        let mut fleet = busy_agents();
+        for i in 1..=12 {
+            fleet.push(a("main", 10 + i, if i % 3 == 0 { "" } else { "idle" }, "Filler"));
+        }
+        let views = [
+            scoped(proj(), "@1", "proj", "on", "", ""),
+            scoped(proj(), "@1", "proj", "", "space", ""),
+            scoped(proj(), "@1", "proj", "on", "all", ""),
+            scoped(fleet.iter().map(|x| A { set: x.set.clone(), ..*x }).collect(), "@4", "main", "on", "", ""),
+        ];
+        for v in &views {
+            let want: Vec<(String, String)> =
+                groups(v).iter().flat_map(|s| s.agents.iter().map(|a| (a.session.clone(), a.window_id.clone()))).collect();
+            for w in [16u16, 24, 34, 60] {
+                for h in 2u16..=70 {
+                    let f = layout(v, w, h, &Opts::default());
+                    assert_eq!(f.rows.len(), usize::from(h));
+                    for r in &f.rows {
+                        assert_eq!(width(&r.segs), usize::from(w), "{w}x{h}: {:?}", r.text());
+                        assert!(r.targets.iter().all(|(a, b, _)| a < b && *b <= w), "{w}x{h}");
+                    }
+                    // Every agent of the scope is covered exactly once.
+                    let mut got: Vec<(String, String)> = f.rows.iter().flat_map(|r| r.covers.clone()).collect();
+                    let mut exp = want.clone();
+                    got.sort();
+                    exp.sort();
+                    if h > 4 {
+                        assert_eq!(got, exp, "{w}x{h}: {:#?}", texts(&f));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
