@@ -179,9 +179,17 @@ the step in its own process group and, on the deadline or when the guard is
 signalled, sends the whole group TERM and then KILL, so post-save hooks don't
 linger. macOS has no `timeout(1)`. The guard waits on the supervisor in the
 background, so a signal is handled at once rather than after the step ends.
+The scripts need bash 4 or later (`declare -A`, `EPOCHREALTIME`), and their
+`#!/usr/bin/env bash` shebang would pick macOS's 3.2 for a caller whose PATH
+lacks Homebrew. So the guard runs them with an explicit bash:
+`/opt/homebrew/bin/bash` if present, else the first bash on PATH that reports
+`BASH_VERSINFO >= 4`. If there is none, the kill is refused.
 
 **Environment for the steps.** The children run with `TMUX=<that socket>`, no
-`TMUX_PANE`, and a UTF-8 locale. The locale is forced to `LANG`/`LC_CTYPE`
+`TMUX_PANE`, and a UTF-8 locale. The socket is given by its canonical path:
+`/private/tmp/tmux-$UID/default` for the real server even when the caller used
+`-S ~/link-to-default`, because the scripts check for the default server by
+path. The locale is forced to `LANG`/`LC_CTYPE`
 `en_US.UTF-8` unless `LC_ALL`/`LC_CTYPE`/`LANG` already give UTF-8, because a
 non-UTF-8 client prints the `\x1f` separators in `-F` output as `_`. They save
 the server that is being killed, whatever the caller's environment said. Their

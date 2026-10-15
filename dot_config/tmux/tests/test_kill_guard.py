@@ -125,7 +125,7 @@ class KillGuardBase(unittest.TestCase):
         stub_save = self.root / f"{name}-save.sh"
         flag = f'$(/opt/homebrew/bin/tmux -L {name} show -gqv @kill_guard_shutdown)'
         stub_publish.write_text(
-            f'echo "STUB publish flag={flag} lang=$LANG ctype=$LC_CTYPE" >>"$KILL_GUARD_LOG"\n'
+            f'echo "STUB publish flag={flag} lang=$LANG ctype=$LC_CTYPE tmux=$TMUX sock=$KILL_GUARD_SOCKET" >>"$KILL_GUARD_LOG"\n'
             f'exit {0 if publish_ok else 3}\n')
         stub_save.write_text(
             f'echo "STUB save flag={flag} pid=$$" >>"$KILL_GUARD_LOG"\n'
@@ -472,6 +472,47 @@ class Shim(KillGuardBase):
         self.assertEqual(self.sessions(name), ["other"])
         self.assertEqual(self.flag(name), "")                 # unset again: server alive
         self.assert_order(SAVE_ORDER + [r"decision=approved", r"step=flag-unset"])
+
+    def test_symlinked_socket_children_get_canonical_path(self):
+        """`-S <symlink>` matched by inode: the save/publish children are
+        handed the canonical socket path, which the scripts' own
+        default-server checks compare by path."""
+        name, sock, env = self.start_server(auth="approve", sessions=("main", "other"))
+        link = self.root / "link"
+        link.symlink_to(sock)
+        r = self.shim_run("-S", str(link), "kill-session", "-t", "main", env=env)
+        self.assertEqual(r.returncode, 0, r)
+        self.assertEqual(self.sessions(name), ["other"])
+        line = next(l for l in self.log_lines() if "STUB publish" in l)
+        self.assertIn(f"tmux={sock} sock={sock}", line)
+
+    @unittest.skipUnless(os.path.exists("/opt/homebrew/bin/bash"), "needs Homebrew bash")
+    def test_save_scripts_run_with_bash4_despite_thin_path(self):
+        """No stubs: the real script slots (in the temp HOME) run under bash
+        >= 4 even with a 3.2 shebang and a PATH without Homebrew."""
+        name, sock, env = self.start_server(auth="approve", sessions=("main", "other"))
+        scripts = self.home / ".config/tmux/scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "stash.sh").write_text(
+            '#!/bin/bash\ndeclare -A x=([a]=1)\n'
+            'echo "FAKE stash $1 bash=${BASH_VERSINFO[0]} x=${x[a]} tmux=$TMUX" >>"$KILL_GUARD_LOG"\n')
+        (scripts / "resurrect-save.sh").write_text(
+            '#!/bin/bash\ndeclare -A x=([a]=1)\n'
+            'echo "FAKE save $1 bash=${BASH_VERSINFO[0]} x=${x[a]}" >>"$KILL_GUARD_LOG"\n'
+            f'f="{self.resdir}/snap-$$.txt"; echo x >"$f"; ln -sfn "$(basename "$f")" "{self.resdir}/last"\n'
+            f'echo "[now] saved 2 panes" >>"{self.resdir}/save.log"\n')
+        for f in scripts.iterdir():
+            f.chmod(0o755)
+        e = {k: v for k, v in env.items() if k not in ("KILL_GUARD_SAVE_CMD", "KILL_GUARD_PUBLISH_CMD")}
+        e["PATH"] = "/usr/bin:/bin"
+        r = self.shim_run("-L", name, "kill-session", "-t", "main", env=e)
+        self.assertEqual(r.returncode, 0, (r, self.log_lines()))
+        self.assertEqual(self.sessions(name), ["other"])
+        lines = self.log_lines()
+        stash = next(l for l in lines if l.startswith("FAKE stash"))
+        save = next(l for l in lines if l.startswith("FAKE save"))
+        self.assertRegex(stash, r"^FAKE stash publish bash=([4-9]|\d\d) x=1 ")
+        self.assertRegex(save, r"^FAKE save final bash=([4-9]|\d\d) x=1$")
 
     def test_kill_session_save_failure_refuses(self):
         name, sock, env = self.start_server(auth="approve", save_ok=False, sessions=("main", "other"))

@@ -290,10 +290,39 @@ script_cmd() {
     if [ -x "$SCRIPTS/$1" ]; then echo "$SCRIPTS/$1"; else echo ""; fi
 }
 
+# bash4: a bash >= 4 to run stash.sh / resurrect-save.sh with (they need
+# declare -A, EPOCHREALTIME...). Their `#!/usr/bin/env bash` shebang would pick
+# macOS's 3.2 for a caller whose PATH lacks Homebrew. Homebrew's bash first,
+# then the first bash on PATH that reports BASH_VERSINFO >= 4.
+bash4() {
+    local d IFS=:
+    for d in /opt/homebrew/bin $PATH; do
+        [ -n "$d" ] && [ -x "$d/bash" ] || continue
+        if "$d/bash" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null; then
+            echo "$d/bash"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# child_socket SOCKET: the path the save/publish children get as $TMUX. The
+# scripts check for the real default by PATH, so a symlink (-S ~/link) that
+# same_socket matched is replaced by the canonical path it stands for.
+child_socket() {
+    if is_real_default "$1"; then
+        canon "/tmp/tmux-$UID/default"
+    elif [ -n "${KILL_GUARD_PROTECT_SOCKET:-}" ] && same_socket "$1" "$KILL_GUARD_PROTECT_SOCKET"; then
+        canon "$KILL_GUARD_PROTECT_SOCKET"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
 # save_first SOCKET -> 0 when state is safely on disk (flag left SET, trap
 # armed), 1 otherwise (flag unset again, SAVE_WHY says why).
 save_first() {
-    local sock="$1" publish_cmd="" save_cmd="" resdir start size now left rc mt tgt
+    local sock="$1" publish_cmd="" save_cmd="" resdir start size now left rc mt tgt csock bash
     # Test stubs: honoured only off the real default server, like KILL_GUARD_AUTH.
     if ! is_real_default "$sock"; then
         publish_cmd="${KILL_GUARD_PUBLISH_CMD:-}"
@@ -307,16 +336,24 @@ save_first() {
     resdir="${resdir:-$HOME/.tmux/resurrect}"
     resdir="${resdir//\$HOME/$HOME}"
     resdir="${resdir/#\~/$HOME}"
-    # Children talk to THIS server whatever the caller's environment said.
-    export TMUX="$sock" KILL_GUARD_SOCKET="$sock" KILL_GUARD_LOG="$LOG"
+    # Children talk to THIS server whatever the caller's environment said, by
+    # its canonical path (see child_socket).
+    csock="$(child_socket "$sock")"
+    export TMUX="$csock" KILL_GUARD_SOCKET="$csock" KILL_GUARD_LOG="$LOG"
     unset TMUX_PANE
     ensure_utf8
+    if [ -z "$publish_cmd" ] || [ -z "$save_cmd" ]; then
+        if ! bash="$(bash4)"; then
+            fail_save "no bash >= 4 found (/opt/homebrew/bin/bash or on PATH) to run the save scripts"
+            return 1
+        fi
+    fi
 
     start="$(/bin/date +%s)"
     if [ -n "$publish_cmd" ]; then
         capped 10 /bin/bash -c "$publish_cmd"
     elif [ -n "$(script_cmd stash.sh)" ]; then
-        capped 10 "$SCRIPTS/stash.sh" publish
+        capped 10 "$bash" "$SCRIPTS/stash.sh" publish
     else
         fail_save "$SCRIPTS/stash.sh is not installed"; return 1
     fi
@@ -336,7 +373,7 @@ save_first() {
     if [ -n "$save_cmd" ]; then
         capped "$left" /bin/bash -c "$save_cmd"
     elif [ -n "$(script_cmd resurrect-save.sh)" ]; then
-        capped "$left" "$SCRIPTS/resurrect-save.sh" final
+        capped "$left" "$bash" "$SCRIPTS/resurrect-save.sh" final
     else
         fail_save "$SCRIPTS/resurrect-save.sh is not installed"; return 1
     fi
