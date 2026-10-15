@@ -83,6 +83,8 @@ const CONTINUATION_WINDOW_MS = 2 * 60 * 1000 // 120000
 
 const STATE_DIR = "/Users/mackhaymond/.claude/.chezmoi-guard"
 const SESSIONS_DIR = STATE_DIR + "/sessions"
+// Full Stop-continuation text, one file per session (see handleStop).
+const CONTINUATIONS_DIR = STATE_DIR + "/continuations"
 const MANAGED_FILE = STATE_DIR + "/managed.json"
 const MANAGED_REFRESH_LOCK = STATE_DIR + "/managed.refresh.lock"
 const LOG_FILE = STATE_DIR + "/chezmoi-guard.log"
@@ -1787,7 +1789,21 @@ function handleStop(input: any): void {
     process.exit(0) // defensive: never block with empty reason
   }
   debugLog("stop blocking continuation", { session_id: sid })
-  process.stdout.write(JSON.stringify({ decision: "block", reason: prompt }))
+  // Claude Code renders a Stop block's `reason` in the user's chat (as "Stop
+  // hook feedback"), and no documented field hides it. So the visible reason is
+  // one line pointing at a file holding the full instructions, which Claude
+  // reads. If that file can't be written, fall back to the full text inline:
+  // Claude seeing the instructions matters more than keeping the chat quiet.
+  let reason = prompt
+  try {
+    mkdirSync(CONTINUATIONS_DIR, { recursive: true })
+    const f = `${CONTINUATIONS_DIR}/${sessionKey(sid)}.md`
+    atomicWrite(f, prompt)
+    reason = `chezmoi-guard: unfinished dotfile work — read ${f} and act on it.`
+  } catch (e) {
+    debugLog("continuation file write failed (inline fallback)", { session_id: sid, error: String(e) })
+  }
+  process.stdout.write(JSON.stringify({ decision: "block", reason }))
   process.exit(0)
 }
 
