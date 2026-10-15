@@ -360,6 +360,28 @@ class LibCase(unittest.TestCase):
             (self.proj / SID / "workflows").mkdir(parents=True, exist_ok=True)
             (self.proj / SID / "workflows" / f"wf_{wid}.json").write_text("{}")
 
+    def started(self, at):
+        """This Claude process started at epoch `at` (sessions file startedAt, ms)."""
+        (self.home / ".claude/sessions" / f"{PID}.json").write_text(json.dumps(
+            {"pid": int(PID), "sessionId": SID, "cwd": CWD, "status": "idle",
+             "startedAt": at * 1000 + 706}, separators=(",", ":")))
+
+    def test_process_start_floor_subagent(self):
+        # Last written before this process started: an earlier process's
+        # (crashed, or exited and resumed) - not running, though fresh.
+        self.subagent("a1", 300)
+        self.started(self.now - 120)
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=1")
+        self.started(self.now - 600)            # this process wrote it
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=0")
+
+    def test_process_start_floor_workflow(self):
+        self.workflow("run", 300, completed=False)
+        self.started(self.now - 120)
+        self.assertEqual(self.rc("session_has_running_workflow"), "rc=1")
+        self.started(self.now - 600)
+        self.assertEqual(self.rc("session_has_running_workflow"), "rc=0")
+
     def test_workflow_running(self):
         self.workflow("run", 60, completed=False)
         self.assertEqual(self.rc("session_has_running_workflow"), "rc=0")

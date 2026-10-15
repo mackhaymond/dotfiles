@@ -1510,7 +1510,9 @@ EOF
             # A background task the ended turn is waiting on: gear on, and
             # bg_held keeps the un-stick below from idling the tab (see
             # BACKGROUND TASKS HOLD A TAB RUNNING).
-            if [ "$wf" = 0 ] && [ "$state" = running ] && [ -n "$pid" ] \
+            # Asked whatever wf says: a stale gear (the lib's verdict after a
+            # crash and resume) must not stop a real task from holding.
+            if [ "$state" = running ] && [ -n "$pid" ] \
                && [ "${PID_KIND[$pid]:-}" != codex ]; then
                 st=""
                 session_status "$pid"

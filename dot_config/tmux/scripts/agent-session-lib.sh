@@ -87,10 +87,18 @@
 # Kept an array so callers need not change if a lineage ever comes back.
 SESSION_PROJ=""
 SESSION_BASES=()
+# PROCESS-START FLOOR (agreed with CuaNotch's agent-bg-pending, 2026-10-14):
+# the epoch this Claude process started (sessions/<pid>.json startedAt, ms,
+# floored to s; 0 = unknown, no floor). A subagent or workflow last written
+# before it belongs to an EARLIER process of the session - crashed, or exited
+# and resumed - and is not running, whatever its age: without the floor the
+# gear stayed lit for up to the hour backstop after a resume.
+SESSION_STARTED=0
 resolve_session_bases() {
     local pid="$1" sf sid="" cwd="" proj raw
     SESSION_PROJ=""
     SESSION_BASES=()
+    SESSION_STARTED=0
     [ -n "$pid" ] || return 1
     sf="$HOME/.claude/sessions/$pid.json"
     [ -f "$sf" ] || return 1
@@ -102,6 +110,7 @@ resolve_session_bases() {
     raw="$(<"$sf")"
     [[ $raw =~ \"sessionId\":\"([^\"]+)\" ]] && sid="${BASH_REMATCH[1]}"
     [[ $raw =~ \"cwd\":\"([^\"]+)\" ]] && cwd="${BASH_REMATCH[1]}"
+    [[ $raw =~ \"startedAt\":([0-9]{4,}) ]] && SESSION_STARTED=$(( BASH_REMATCH[1] / 1000 ))
     { [ -n "$sid" ] && [ -n "$cwd" ]; } || return 1
     # Claude munges the project dir name from cwd: every character that is not
     # an ASCII letter or digit ('/', '.', '_', ...) becomes '-'.
@@ -334,6 +343,7 @@ session_has_running_subagent() {
             if [ "$f" = "$p" ]; then psize="$size"; continue; fi
             age=$((now - mt))
             [ "$age" -lt 3600 ] || continue
+            [ "$mt" -ge "$SESSION_STARTED" ] || continue   # an earlier process's
             id="${f##*/agent-}"; id="${id%.jsonl}"
             # 1. Notified since it last moved → finished.
             if [ -z "$asked" ]; then
@@ -397,7 +407,9 @@ session_has_running_workflow() {
         # session. CuaNotch's runningWorkflows() must keep the same rule.
         mt=$(stat -f %m "$d"/agent-*.jsonl "$d/journal.jsonl" 2>/dev/null | sort -rn | head -1)
         case "$mt" in *[!0-9]*) mt="" ;; esac   # digits only before $(( ))
-        [ -n "$mt" ] && [ $((now - mt)) -lt 3600 ] && return 0
+        # The age backstop AND the process-start floor (SESSION_STARTED): a
+        # run last written before this process started is an earlier one's.
+        [ -n "$mt" ] && [ "$mt" -ge "$SESSION_STARTED" ] && [ $((now - mt)) -lt 3600 ] && return 0
     done
     done
     return 1
