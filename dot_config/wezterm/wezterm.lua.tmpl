@@ -368,32 +368,37 @@ config.keys = {
 
 }
 
--- The digit rows (tmux SPACES, ~/.config/tmux/docs/spaces.md):
---   CTRL+1-9  prefix + digit     space N   (spaces off: window N, tmux's stock)
---   CMD+1-9   prefix + M-digit   agent N of this space (spaces off: window N)
---   OPT+1-9   (not bound here)   reaches tmux as M-digit: shell N
--- Plain CTRL, not left Control only: WezTerm matches key assignments on
--- CTRL/ALT/SHIFT/SUPER, with no left/right-only variants. Ctrl+digit is free
--- here (no WezTerm default; macOS "Switch to Desktop N" is off; Karabiner
--- only claims digits with all four modifiers). The prefix is C-s; M-digit
--- goes out as ESC + digit, which is how tmux reads Meta.
+-- The digit rows (tmux SPACES, ~/.config/tmux/docs/spaces.md). Each chord
+-- sends ONE private escape sequence, which tmux reads as one key (its
+-- user-keys, set in spaces.conf; no real terminal sends CSI 9111-9139 ~):
+--   CTRL+1-9  \e[911N~  User0-8    space N   (spaces off: window N)
+--   OPT+1-9   \e[912N~  User9-17   shell N   (spaces off: M-N to the pane)
+--   CMD+1-9   \e[913N~  User18-26  agent N   (spaces off: window N)
+-- Exact chords, nothing timing-dependent: CMD+N used to send the prefix and
+-- then ESC N, the same bytes as OPT+N, so a dropped prefix or a touched
+-- Option landed on shell N. The mixed chords (CMD+OPT, CMD+CTRL, CTRL+OPT,
+-- CMD+SHIFT + digit) do nothing at all, so a sloppy press never picks the
+-- wrong row. Each is bound by the mapped digit and by the physical key, and
+-- CMD+SHIFT also by the shifted character (US layout: 1 -> !), however
+-- WezTerm reports a shifted digit.
+-- WezTerm matches CTRL/ALT/SHIFT/SUPER with no left/right-only variants, so
+-- ALT is either Option (left Option sends Meta here anyway). Ctrl+digit is
+-- free (no WezTerm default; macOS "Switch to Desktop N" is off; Karabiner
+-- only claims digits with all four modifiers).
 for i = 1, 9 do
-    table.insert(config.keys, {
-        key = tostring(i),
-        mods = "CTRL",
-        action = wezterm.action.Multiple {
-            wezterm.action.SendKey { key = "s", mods = "CTRL" },
-            wezterm.action.SendKey { key = tostring(i) }
-        }
-    })
-    table.insert(config.keys, {
-        key = tostring(i),
-        mods = "CMD",
-        action = wezterm.action.Multiple {
-            wezterm.action.SendKey { key = "s", mods = "CTRL" },
-            wezterm.action.SendString("\x1b" .. tostring(i))
-        }
-    })
+    local d = tostring(i)
+    for _, row in ipairs({ { "CTRL", "1" }, { "ALT", "2" }, { "CMD", "3" } }) do
+        table.insert(config.keys, {
+            key = d,
+            mods = row[1],
+            action = wezterm.action.SendString("\x1b[91" .. row[2] .. d .. "~"),
+        })
+    end
+    for _, mods in ipairs({ "CMD|ALT", "CMD|CTRL", "CTRL|ALT", "CMD|SHIFT" }) do
+        table.insert(config.keys, { key = d, mods = mods, action = wezterm.action.Nop })
+        table.insert(config.keys, { key = "phys:" .. d, mods = mods, action = wezterm.action.Nop })
+    end
+    table.insert(config.keys, { key = ("!@#$%^&*("):sub(i, i), mods = "CMD|SHIFT", action = wezterm.action.Nop })
 end
 
 return config

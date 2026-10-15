@@ -27,11 +27,13 @@ set-option -g renumber-windows on
 
 set -g pane-border-lines heavy
 
-# SPACES (docs/spaces.md): sessions as project spaces, a two-line status (spaces
-# on top, this space's shells below), prefix 1-9 → space N, Option-1..9 →
-# agent N of this space. Everything it changes lives in spaces.conf, sourced
-# at the very bottom of this file. `off` + prefix r gives back exactly the
-# pre-spaces keys and status line.
+# SPACES (docs/spaces.md): sessions as project spaces with an uncloseable home
+# shell; one status line (this space's ⌃N chip, alert chips for other spaces,
+# this space's shells); Ctrl+N space, Option+N shell, Cmd+N agent (WezTerm
+# user-keys). The full spaces list lives in the CMD+B sidebar. Everything it
+# changes lives in spaces.conf, sourced at the very bottom of this file.
+# `off` + prefix r gives back the pre-spaces keys and status line (the
+# documented differences are listed in docs/spaces.md).
 set -g @spaces on
 # Sessions that are never spaces: no tab, no number, never looped by the
 # status line (agents alone has hundreds of windows). Marked @space_hidden 1
@@ -247,7 +249,11 @@ run-shell -b "bash #{HOME}/.config/tmux/scripts/codexbar-usage-status.sh --tick"
 # set -g @catppuccin_status_modules_right "application session battery date_time"
 # Coffee (caffeinate) and battery modules disabled.
 # set -g @catppuccin_status_modules_right "directory codex_session codex_weekly codex_fable session coffee battery"
-set -g @catppuccin_status_modules_right "directory codex_session codex_weekly codex_scoped session"
+# No `session` module while SPACES are on (docs/spaces.md): the space tab at
+# the left of the one status line names the session, and turns red on the
+# prefix as this module did. Expanded now, after `set -g @spaces` above; tpm
+# rebuilds status-right from this list on every load (prefix r).
+set -gF @catppuccin_status_modules_right "directory codex_session codex_weekly codex_scoped#{?#{==:#{@spaces},on},, session}"
 set -g @catppuccin_date_time_text "%I:%M %p | %m-%d-%y"
 set -g @catppuccin_status_left_separator "█"
 
@@ -583,7 +589,9 @@ bind-key C-q run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T 
 # enough to deserve one chord). They sit around the existing Option-Q (floax)
 # and Option-A (btop) on the left hand:  W above S, X below it.
 #   Option-S  next tab that needs you      (= prefix d)
-#   Option-X  back to where the jumps began (= prefix D)
+#   Option-X  BACK one step in this client's history, any move (nav.sh,
+#             docs/nav.md); Option-C forward. prefix D still unwinds a whole
+#             Option-S chain in one step (agent-jump.sh back).
 #   Option-W  the agent menu popup          (= prefix q; agent-ui, below)
 # Root-table bindings take these chords from whatever runs in the pane (zsh's
 # M-w/M-x, Claude Code's Meta keys) - deliberate. The prefix keys stay as
@@ -599,7 +607,14 @@ bind-key C-q run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T 
 # still works after CuaNotch's tmux jumps, because `jump` records the same
 # back-chain as `next`.
 bind-key -n M-s run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh next '#{client_tty}'"
-bind-key -n M-x run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{client_tty}'"
+# Browser-style history per client (nav.sh): the hooks only say which client
+# may have moved; nav.sh reads where it is now and records it.
+set-hook -g 'client-attached[30]' { run-shell -b "#{HOME}/.config/tmux/scripts/nav.sh attach '#{hook_client}'" }
+set-hook -g 'client-detached[30]' { run-shell -b "#{HOME}/.config/tmux/scripts/nav.sh forget '#{hook_client}'" }
+set-hook -g 'client-session-changed[30]' { if-shell -F "#{?#{@space_hidden},,1}" { run-shell -b "#{HOME}/.config/tmux/scripts/nav.sh record client '#{hook_client}'" } }
+set-hook -g 'session-window-changed[30]' { if-shell -F "#{&&:#{session_attached},#{?#{@space_hidden},0,1}}" { run-shell -b "#{HOME}/.config/tmux/scripts/nav.sh record session '#{hook_session}'" } }
+bind-key -n M-x run-shell -b "#{HOME}/.config/tmux/scripts/nav.sh back '#{client_name}'"
+bind-key -n M-c run-shell -b "#{HOME}/.config/tmux/scripts/nav.sh forward '#{client_name}'"
 bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
 
 # agent-ui MENU (primary): when ~/.local/bin/agent-ui is installed, the same

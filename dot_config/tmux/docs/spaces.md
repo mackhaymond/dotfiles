@@ -29,11 +29,13 @@ Keys, hooks and popups always have `$TMUX`; the tests set it.
 ## The flag
 
 `set -g @spaces off` + `prefix r` gives back the pre-spaces config: same
-`list-keys` (notes included), same `status`/`status-format`, with ONE
-deliberate difference: prefix M-1..M-9 select window N (tmux's stock prefix
-M-1..M-7 layout presets are gone in both modes). WezTerm's CMD+1-9 send
-prefix M-digit whatever the flag says, and off they must keep meaning what
-CMD+1-9 always meant. Every other `%else` line undoes its `%if` twin:
+`list-keys` (notes included), same `status`/`status-format`, with two
+deliberate differences, both about WezTerm's digit chords, which reach tmux
+whatever the flag says and must keep meaning what they always meant: prefix
+M-1..M-9 select window N (tmux's stock prefix M-1..M-7 layout presets are
+gone in both modes), and the chord keys `User0`-`User26` (below) do what
+their chords did before spaces: CTRL+N and CMD+N select window N, OPT+N
+`send-keys M-N` to the pane. Every other `%else` line undoes its `%if` twin:
 `set -gu status-format` restores tmux's default array (the default format plus
 catppuccin's window formats), prefix 1-9 get back `select-window -t :=N` with
 their default notes, the root keys are unbound, and the rebound keys (c, C-t,
@@ -42,8 +44,9 @@ lines). prefix a / C-a (the session picker) are unbound when on; the off
 branch leaves them alone because `prefix r` re-runs tmux.conf, which binds
 them, before spaces.conf. The test checks cold `off`, and `on → off`.
 
-Not gated: the hidden marker and `@space_index` numbering (session options
-nothing else reads), and the `pane-died[20]` hook that respawns a home shell.
+Not gated: the hidden marker, the `@space_index` numbering and its
+`@space_key` label (session options nothing else reads), the `user-keys`
+(the WezTerm chords), and the `pane-died[20]` hook that respawns a home shell.
 A home made while on stays a home when the flag goes off (an ordinary shell
 then, closable with prefix x, still respawning if its shell exits). With the
 flag off, sync makes no homes and writes no registry.
@@ -60,7 +63,7 @@ them — `agents` alone holds hundreds of windows.
 
 Every visible space has exactly one home: a normal interactive shell at the
 space folder, the space's LOWEST window, named `home`, shell 1 (󰋜 on its
-line-1 tab). It is what keeps a space alive: closing the last other tab lands
+shell tab). It is what keeps a space alive: closing the last other tab lands
 you on home, still in the space. It cannot be closed by hand:
 
 The WINDOW carries `@space_home`; the home shell's PANE carries
@@ -121,28 +124,46 @@ the registry or overwrite its folders, since they may run before the
 load-time reconcile. Resurrect saves home windows like any other; they come
 back as shells named `home` and are adopted.
 
-## Status (flag on: `status 2`)
+## Status (flag on: ONE line)
 
-**Line 0 — spaces.** The visible spaces by `@space_index` (main = 1, then the
-registry's order). `S:` loops can sort only by id, name or time, so the line
-has one `S:` loop per number 1-9 (each a cheap test per session) plus one for
-anything past 9. A space tab is a catppuccin window tab whose state is the
-space's **rollup**, with the same colour language as the window tabs:
+```
+█⌃1█ main█ ⌃3● █1█ 󰋜 ~██2█ ~█ [+]                       … status-right
+```
 
-- chip: the space number; peach when current, pulsing pink↔blue while any
-  agent is in flight (running / computer use / workflow), crust under a tint
+The full list of spaces, with their ⌃N keys, is in the sidebar. The status
+line shows, left to right:
+
+**This space's tab**, `⌃N name`. The label is the session option
+`@space_key` (the key that reaches the space; `space.sh sync` sets it next to
+`@space_index`, `⌃N` for now), so a new key scheme is one line of the script.
+Spaces past 9 have no key: `@space_key` is unset, the chip is a bare block
+and their alert shows the name (`proj●`). Its state is the space's **rollup**, in the window tabs' colour language:
+
+- chip: peach; crust under a tint; red while the prefix is pressed (what
+  catppuccin's `session` module showed, see below)
 - body: red failed > yellow needs-* > green done (done+workflow does not
   count) > stock
 - glyph: 󰒓 any background workflow, else 󰍽 any computer use
 
-Each tab is `#[range=session|$id]`, so tmux's own `MouseDown1Status`
-(`switch-client -t =`) switches on click. Inside a hidden session its name is
-shown dimmed after the tabs. `status-right` stays on the right, unchanged
-(except that the stash chip is hidden while spaces are on:
-`stash-statusline.sh` folds `@spaces` into its "nothing parked" test; the
-stash summary moves to the sidebar).
+Inside a hidden session its name (`[agents]`) stands in for the tab: dimmed,
+or crust on red while the prefix is pressed, like the chip.
 
-**Line 1 — shells of this space**, each `#[range=window|N]` (click selects),
+**Other spaces that need you**: `⌃N●` in red / yellow / green for each other
+visible space whose rollup is failed / needs-* / done (the states prefix d
+walks). In-flight and idle spaces never show, so this is usually empty. One
+`S:` loop, in name order. Each is `#[range=session|$id]`, so tmux's own
+`MouseDown1Status` (`switch-client -t =`) switches on click.
+
+**The shells of this space** (below), then `status-right` on the right:
+today's, minus catppuccin's `session` module while spaces are on
+(`tmux.conf.tmpl` builds `@catppuccin_status_modules_right` with `set -gF`
+from `@spaces`, and tpm rebuilds status-right from it on every load, so the
+flag still takes a `prefix r`). The stash chip is hidden while spaces are on
+(`stash-statusline.sh` folds `@spaces` into its "nothing parked" test; the
+stash summary moves to the sidebar); continuum's `#()` autosave hook and the
+stale-save chip are untouched.
+
+**Shells of this space**, each `#[range=window|N]` (click selects),
 numbered by their ORDINAL among the space's shells (home = 1, agents skipped,
 so the numbers never jump), labelled with the folder while a shell sits at
 the prompt, else the command (nvim, nu…); peach chip on the one you're on.
@@ -152,22 +173,22 @@ first pass bakes the outer index in and turns `##` into `#`. Then `[+]`
 (`#[range=user|space-new]`): the `MouseDown1Status` binding opens a shell at
 the space folder for that range and falls back to `switch-client -t =`.
 
-**During a stash range selection** (prefix v; `stash.sh sel-*`) line 1 shows
-*every* window of the space as today's catppuccin tab
+**During a stash range selection** (prefix v; `stash.sh sel-*`) the shells
+give way to *every* window of the space as today's catppuccin tab
 (`window-status-format`/`-current-format`, `@stash_sel` mauve tint included),
 since the selection's only feedback is that tint and agents have no tab
 otherwise. The trigger is any window of the space carrying `@stash_sel`.
 
-No `#()` in either line. Cost measured at ~1 ms per line-0 expansion with 7
-spaces × 8 windows.
+No `#()` in the line, one `S:` loop, and hidden sessions are skipped before
+any `W:` runs inside them.
 
 ## Keys (flag on)
 
 | key | tmux | does |
 |---|---|---|
-| Control-1-9 | prefix 1-9 | space N, tab order. No fork: an `S:` loop finds the session whose `@space_index` is N |
-| Option-1-9 | M-1..M-9 | shell N of this space (home = 1) |
-| Command-1-9 | prefix M-1..M-9 | agent N of this space |
+| Control-1-9 | User0-8 (also prefix 1-9) | space N, tab order. No fork: an `S:` loop finds the session whose `@space_index` is N |
+| Option-1-9 | User9-17 (also M-1..M-9) | shell N of this space (home = 1) |
+| Command-1-9 | User18-26 (also prefix M-1..M-9) | agent N of this space |
 | ⌥L / ⌥H | M-l / M-h | kind-aware: on an agent, next / previous agent; on a shell, next / previous shell; wrapping |
 | ⌥\` | M-\` | agent → last-visited shell of this space (a new shell at the space folder if there is none); shell → last-visited agent |
 | ⌥M | M-m | move this tab to another space: a menu of the spaces (number = key); the tab goes to the end of that space, you stay here. Not home, not from a hidden session |
@@ -177,11 +198,20 @@ spaces × 8 windows.
 | CMD+W, CMD+SHIFT+W | prefix x, C-l | as tmux.conf, except on home (refuse) |
 | — | c, C-t, k, C-k | in a project space (path ≠ `~`, not hidden) the new tab starts in the space folder; elsewhere unchanged |
 
-WezTerm (wezterm.lua.tmpl, the last loop): CTRL+N sends `C-s N`, CMD+N sends
-`C-s` then `ESC N`; OPT+N reaches tmux as M-N on its own (left Option is
-Meta). WezTerm matches CTRL/ALT/SHIFT/SUPER without left/right variants, so
-it is any Control. Ctrl+digit is free: no WezTerm default, macOS "Switch to
-Desktop N" is off, Karabiner only claims digits with all four modifiers.
+WezTerm (wezterm.lua.tmpl, the last loop) sends each digit chord as ONE
+private escape sequence, which tmux reads as one key through its
+`user-keys` (set in spaces.conf above the `%if`, so in both modes): CTRL+N
+`\e[911N~` = `User(N-1)`, OPT+N `\e[912N~` = `User(8+N)`, CMD+N `\e[913N~` =
+`User(17+N)`. No real terminal sends CSI 9111-9139 `~`. Nothing depends on
+timing or on a stray modifier: CMD+N used to send `C-s` then `ESC N`, the
+very bytes of OPT+N, so a dropped prefix or a touched Option landed on a
+shell. The mixed chords (CMD+OPT, CMD+CTRL, CTRL+OPT, CMD+SHIFT + digit) are
+`Nop` in WezTerm. The prefix 1-9, M-1..9 and prefix M-1..9 bindings stay for
+other terminals (ssh, a nested client). The User keys work from copy mode too
+(tmux falls back to the root table). WezTerm matches CTRL/ALT/SHIFT/SUPER
+without left/right variants, so it is any Control or Option. Ctrl+digit is
+free: no WezTerm default, macOS "Switch to Desktop N" is off, Karabiner only
+claims digits with all four modifiers.
 
 In a hidden session the agent/shell/next/prev/toggle/move keys only say "not
 a space" (an `if -F` on `@space_hidden`, no fork); `space.sh` refuses hidden
@@ -221,3 +251,8 @@ different folder, or is one of `@space_hidden_sessions` (a folder called
 absolute (`cd && pwd`) before matching or creating, so a typed `../x` or `.`
 works. Without zoxide the picker offers this tab's folder, `~`, and the
 folders under `~/code/projects` and `~/code`.
+
+## Rollout
+
+Reload tmux (`prefix r`) BEFORE WezTerm picks up the new wezterm.lua: until
+tmux has the `user-keys`, the digit chords type a raw `\e[91xN~` into panes.

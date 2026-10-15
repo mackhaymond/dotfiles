@@ -6,8 +6,8 @@
 # window, which cannot be closed and respawns when its shell exits, so a space
 # outlives its last tab. This script holds the logic behind
 # the spaces keys that a tmux format cannot do on its own (counting, wrapping,
-# validating a remembered window, the registry). The keys and the two status
-# lines live in spaces.conf; the hidden-session list lives in tmux.conf
+# validating a remembered window, the registry). The keys and the status
+# line live in spaces.conf; the hidden-session list lives in tmux.conf
 # (@space_hidden_sessions).
 #
 #   sync [load|reconcile]     mark hidden sessions (@space_hidden 1) and number
@@ -23,7 +23,7 @@
 #                             among windows with @agent_state, by window_index;
 #                             the agent sidebar numbers agents the same way)
 #   shell N SID               go to shell N of SID (same ordinal, among shells,
-#                             home = 1; line 1 of the status shows them)
+#                             home = 1; the status line shows them)
 #   next|prev SID             on an agent: next / previous agent; on a shell:
 #                             next / previous shell; wrapping
 #   respawn-home PANE         the pane-died hook: a home shell that exited
@@ -193,16 +193,16 @@ cmd_sync() {
   ((struct)) && { reg_lock || struct=0; }
 
   local srows
-  srows="$(t list-sessions -F "#{session_id}${US}#{@space_hidden}${US}#{@space_index}${US}#{session_windows}${US}#{@space_closing}${US}#{@space_reg}${US}#{session_path}${US}#{session_name}")" || return 0
+  srows="$(t list-sessions -F "#{session_id}${US}#{@space_hidden}${US}#{@space_index}${US}#{@space_key}${US}#{session_windows}${US}#{@space_closing}${US}#{@space_reg}${US}#{session_path}${US}#{session_name}")" || return 0
   local clients
   clients="$(t list-clients -F '#{client_name}' 2>/dev/null)"
   # Sessions by numeric id (= creation order; renames are matched in this
   # order, so a renamed main is seen before a new one takes its name).
-  local -a S_ID=() S_HID=() S_IDX=() S_NWIN=() S_CLOSING=() S_REG=() S_PATH=() S_NAME=()
-  local id hid idx nwin closing reg path name
-  while IFS="$US" read -r id hid idx nwin closing reg path name; do
+  local -a S_ID=() S_HID=() S_IDX=() S_KEY=() S_NWIN=() S_CLOSING=() S_REG=() S_PATH=() S_NAME=()
+  local id hid idx key nwin closing reg path name
+  while IFS="$US" read -r id hid idx key nwin closing reg path name; do
     [[ -n "$id" ]] || continue
-    S_ID+=("$id") S_HID+=("$hid") S_IDX+=("$idx") S_NWIN+=("$nwin") S_CLOSING+=("$closing") S_REG+=("$reg") S_PATH+=("$path") S_NAME+=("$name")
+    S_ID+=("$id") S_HID+=("$hid") S_IDX+=("$idx") S_KEY+=("$key") S_NWIN+=("$nwin") S_CLOSING+=("$closing") S_REG+=("$reg") S_PATH+=("$path") S_NAME+=("$name")
   done < <(printf '%s\n' "$srows" | awk -F"$US" 'NF { print substr($1, 2) + 0 FS $0 }' | sort -t"$US" -k1,1n | cut -d"$US" -f2-)
 
   local -a args=()
@@ -260,7 +260,7 @@ cmd_sync() {
   fi
 
   # Numbers: main first, then registry order, then anything unregistered by
-  # id. The status line's S: loops pick tabs by these numbers.
+  # id. prefix 1-9 / the Ctrl+N chords pick spaces by these numbers.
   local n=2 rn2 k
   local -a order=()
   for i in "${!S_ID[@]}"; do
@@ -280,13 +280,22 @@ cmd_sync() {
     if is_hidden_name "${S_NAME[i]}"; then
       [[ "${S_HID[i]}" == "1" ]] || add set-option -t "${S_ID[i]}" @space_hidden 1
       [[ -z "${S_IDX[i]}" ]] || add set-option -u -t "${S_ID[i]}" @space_index
+      [[ -z "${S_KEY[i]}" ]] || add set-option -u -t "${S_ID[i]}" @space_key
     else
       [[ -z "${S_HID[i]}" ]] || add set-option -u -t "${S_ID[i]}" @space_hidden
     fi
   done
+  # @space_key: the label the status line draws for the space (its tab and
+  # its alert chip): the key that reaches it. Ctrl+N today, so only spaces
+  # 1-9 have one; past 9 it is unset (no key to show).
   n=1
   for k in "${order[@]+"${order[@]}"}"; do
     [[ "${S_IDX[k]}" == "$n" ]] || add set-option -t "${S_ID[k]}" @space_index "$n"
+    if ((n <= 9)); then
+      [[ "${S_KEY[k]}" == "⌃$n" ]] || add set-option -t "${S_ID[k]}" @space_key "⌃$n"
+    else
+      [[ -z "${S_KEY[k]}" ]] || add set-option -u -t "${S_ID[k]}" @space_key
+    fi
     n=$((n + 1))
   done
 
