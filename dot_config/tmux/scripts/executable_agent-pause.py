@@ -86,12 +86,14 @@ CALL_TIMEOUT = float(os.environ.get("AGENT_PAUSE_CALL_TIMEOUT") or 60)
 MISS_DROP, MISS_AGE = 2, 60
 
 PAUSE_MSG = (
-    "[pause key] PAUSE: Mack is closing his laptop. Stop at the next safe point: "
-    "finish or abandon the current edit so no file is half-written, stop any dev "
-    "servers or long jobs you started (kill_pty), tell your running subagents/"
-    "workflows to stop at a safe point, don't start new work, and reply in 2-3 "
-    "lines with where you stopped and what's next. Don't commit or push unless "
-    "that was already your next step. Wait for a RESUME message before continuing.")
+    "[pause key] PAUSE NOW: Mack is shutting the laptop right now. Drop your work "
+    "immediately: don't finish the task, the step or the current thought. Clean up "
+    "only what would be left broken, and fast: if you are mid-edit, finish or undo "
+    "that one edit so no file is half-written; stop dev servers and long jobs you "
+    "started (kill_pty); tell running subagents/workflows to stop now. Start "
+    "nothing else: no new edits, tests, builds, commits or pushes. Then reply in "
+    "2-3 lines with where you stopped and what's next, and stay stopped. Do not "
+    "continue for any reason until a RESUME message arrives.")
 RESUME_MSG = (
     "[pause key] RESUME: Mack is back. Pick up where you paused, using the next "
     "steps you noted, and restart any servers, jobs or subagents you stopped if "

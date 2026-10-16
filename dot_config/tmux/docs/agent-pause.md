@@ -1,7 +1,7 @@
 # Pause key (`prefix P`)
 
 Before Mack closes the laptop, `prefix P` tells every agent that is **actually
-working** to stop at a safe point, and saves exactly which agents it told.
+working** to drop its work now and clean up, and saves exactly which agents it told.
 Pressing `prefix P` again tells **that saved set** to resume. It does not scan
 again, because by then states have moved on: some paused agents went idle and
 some idle agents started up. Idle agents are never messaged (Mack's
@@ -52,10 +52,13 @@ tmux-mcp has a **draft guard**: if a target's prompt box holds a half-typed
 draft or a dialog, the message is held and delivered once the box is clear. A
 held message therefore counts as delivered.
 
-- **PAUSE**: stop at the next safe point. That means no half-written file,
-  stopping your own dev servers and long jobs, telling subagents and workflows
-  to stop, starting nothing new, and replying in 2-3 lines with where you
-  stopped and what's next. Wait for RESUME before continuing.
+- **PAUSE**: urgent. The lid is closing now, so drop the work immediately
+  rather than finishing the task or step (Mack's call). Clean up only what
+  would be left broken: finish or undo the one edit in flight so no file is
+  half-written, stop your own dev servers and long jobs, and tell subagents and
+  workflows to stop now. Start nothing else (no edits, tests, builds, commits
+  or pushes), reply in 2-3 lines with where you stopped and what's next, and
+  stay stopped until RESUME.
 - **RESUME**: pick up from the noted next steps, and restart anything you
   stopped if you still need it.
 
