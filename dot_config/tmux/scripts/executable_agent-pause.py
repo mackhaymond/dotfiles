@@ -42,7 +42,8 @@ once the box is clear. "held" therefore counts as delivered.
 
 This file is the keybind path: it never exits non-zero and never prints in
 toggle mode (run-shell would open a view pane over Mack's window); every
-outcome is a display-message on the pressing client and a line in the log.
+outcome is a notify.sh message on the pressing client (a sidebar toast, else
+a display-message) and a line in the log.
 """
 import concurrent.futures
 import fcntl
@@ -109,6 +110,10 @@ PANE_FIELDS = ("pane_id", "window_id", "session_name", "window_index", "pane_ind
                "@agent_workflow", "@agent_cua", "@agent_kind", "@agent_summary")
 PANE_FMT = US.join("#{%s}" % f for f in PANE_FIELDS)
 DISPLAY_MS = "6000"
+# Messages go through notify.sh: a toast in the agent-ui sidebar when one
+# shows the client (a display-message would bring the hidden status line
+# back), tmux's own message otherwise.
+NOTIFY = Path(os.environ.get("AGENT_PAUSE_NOTIFY") or HOME / ".config/tmux/scripts/notify.sh")
 
 
 # ---------------------------------------------------------------- tmux
@@ -137,11 +142,24 @@ def list_panes():
     return out
 
 
-def display(client, msg):
-    """One line on the pressing client. display-message expands formats, so
-    every '#' in the text is doubled. A vanished client falls back to tmux's
-    current one; nothing at all is fine (the log has it)."""
+def display(client, msg, kind="info"):
+    """One line on the pressing client: notify.sh (a sidebar toast, or the
+    display-message line when no sidebar shows that client). Both expand
+    formats, so every '#' in the text is doubled. A vanished client falls
+    back to none (notify: every sidebar, else tmux's current client); no
+    notify.sh, the plain display-message; nothing at all is fine (the log
+    has it)."""
     msg = msg.replace("#", "##")
+    if os.access(NOTIFY, os.X_OK):
+        if client:
+            names = subprocess.run(["tmux", "list-clients", "-F", "#{client_name}"],
+                                   capture_output=True, text=True, timeout=10).stdout.split("\n")
+            if client not in names:
+                client = ""
+        cmd = [str(NOTIFY)] + (["-c", client] if client else [])
+        subprocess.run(cmd + ["-k", kind, "-t", str(int(DISPLAY_MS) / 1000), "--", msg],
+                       capture_output=True, timeout=10)
+        return
     if client:
         r = subprocess.run(["tmux", "display-message", "-c", client, "-d", DISPLAY_MS, msg],
                            capture_output=True, timeout=10)
@@ -816,7 +834,7 @@ def toggle(client):
         try:
             fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            display(client, "⏸ pause key busy — the last press is still sending")
+            display(client, "⏸ pause key busy — the last press is still sending", "warn")
             log({"mode": "busy", "client": client})
             return
         st = load_state()
@@ -1566,7 +1584,7 @@ def main(argv):
             msg = "⏸ pause key error: %s: %s" % (type(e).__name__, e)
             log({"mode": "error", "client": client, "message": msg})
             try:
-                display(client, msg)
+                display(client, msg, "error")
             except Exception:
                 pass
         return 0
