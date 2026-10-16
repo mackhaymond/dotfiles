@@ -194,6 +194,26 @@ class Home:
                     value = line[len(prefix):]
         return value
 
+    def pace_opts(self):
+        """The @codex_<w>_{used,expected,delta,resets,members} options, from the
+        LAST tmux invocation that set them, asserting that every invocation
+        setting any of them set all fifteen at once."""
+        names = [f'@codex_{w}_{f}' for w in ('session', 'weekly', 'scoped')
+                 for f in ('used', 'expected', 'delta', 'resets', 'members')]
+        found = None
+        for line in self.tmux_log.read_text().splitlines():
+            if not any(f' {n} ' in f'{line} ' for n in names):
+                continue
+            opts = {}
+            for part in line.split(' ; '):
+                cmd, flags, name, value = (part.split(' ', 3) + [''])[:4]
+                assert (cmd, flags) == ('set-option', '-gq'), part
+                opts[name] = value
+            assert sorted(opts) == sorted(names), (line, sorted(opts))
+            found = opts
+        assert found is not None, 'pace options never published'
+        return found
+
 
 class PoolPaceTestCase(unittest.TestCase):
     def setUp(self):
@@ -234,12 +254,13 @@ class WorkedExampleTests(PoolPaceTestCase):
             ]})
         self.assertEqual(reference_delta([(90, A1_WEEKLY_RESETS), (27, A2_WEEKLY_RESETS)],
                                          WEEK_W), 16)
-        # The number is still the active account's; the delta is the pool's.
+        # The text is the pool's level and delta; weekly_used stays the
+        # active account's own reading.
         self.assertEqual(block['weekly_used'], 27)
-        self.assertEqual(block['weekly_text'], '27% (Σ+16%)')
+        self.assertEqual(block['weekly_text'], '59% (+16%)')
         self.assertEqual(block['weekly_pace_color'], 'red')       # +16 > 15
         self.assertEqual(block['weekly_color'], 'red')
-        self.assertEqual(self.home.published('@codex_weekly_text'), '27% (Σ+16%)')
+        self.assertEqual(self.home.published('@codex_weekly_text'), '59% (+16%)')
         self.assertEqual(self.home.published('@codex_weekly_color'), 'red')
 
         # Session: account 1 is idle (0%, no reset) and counts as a fresh window.
@@ -254,7 +275,8 @@ class WorkedExampleTests(PoolPaceTestCase):
                           {'at': NOW + SESSION_W, 'avail': 288}])
         self.assertEqual(session['delta'], -14)
         self.assertEqual(session['used'], 6)
-        self.assertEqual(block['session_text'], '12% (Σ-14%)')
+        self.assertEqual(block['session_used'], 12)
+        self.assertEqual(block['session_text'], '6% (-14%)')
         self.assertEqual(block['session_pace_color'], 'green')
 
         scoped = block['scoped_pace']
@@ -263,7 +285,20 @@ class WorkedExampleTests(PoolPaceTestCase):
                          [('1', 2), ('2', 2)])
         self.assertEqual(scoped['delta'],
                          reference_delta([(2, A1_WEEKLY_RESETS), (2, A2_WEEKLY_RESETS)], WEEK_W))
-        self.assertTrue(block['scoped_text'].startswith('2% (Σ'))
+        self.assertEqual(block['scoped_text'], f"2% ({scoped['delta']:+d}%)")
+
+        # The plain-number options, all fifteen in one tmux invocation.
+        self.assertEqual(self.home.pace_opts(), {
+            '@codex_session_used': '6', '@codex_session_expected': '20',
+            '@codex_session_delta': '-14', '@codex_session_resets': str(A2_SESSION_RESETS),
+            '@codex_session_members': '1:0:0,2:12:1',
+            '@codex_weekly_used': '59', '@codex_weekly_expected': '43',
+            '@codex_weekly_delta': '+16', '@codex_weekly_resets': str(A2_WEEKLY_RESETS),
+            '@codex_weekly_members': '1:90:0,2:27:1',
+            '@codex_scoped_used': '2', '@codex_scoped_expected': '42',
+            '@codex_scoped_delta': '-40', '@codex_scoped_resets': str(A2_WEEKLY_RESETS),
+            '@codex_scoped_members': '1:2:0,2:2:1',
+        })
 
     def test_scoped_member_without_a_matching_entry_is_left_out(self):
         slot1 = {'fetchedAt': NOW - 60,
@@ -277,7 +312,12 @@ class WorkedExampleTests(PoolPaceTestCase):
         self.assertAccountScope(block['scoped_pace'], 2, A2_WEEKLY_RESETS,
                                 old_pace_delta(2, WEEK_W, A2_WEEKLY_RESETS))
         self.assertEqual(block['scoped_pace']['members'][0]['slot'], '2')
-        self.assertNotIn('Σ', block['scoped_text'])
+        d = old_pace_delta(2, WEEK_W, A2_WEEKLY_RESETS)
+        self.assertEqual(block['scoped_text'], f'2% ({d:+d}%)')
+        opts = self.home.pace_opts()
+        self.assertEqual((opts['@codex_scoped_used'], opts['@codex_scoped_delta'],
+                          opts['@codex_scoped_members']), ('2', f'{d:+d}', ''))
+        self.assertEqual(opts['@codex_weekly_members'], '1:90:0,2:27:1')
 
 
 class SingleAccountTests(PoolPaceTestCase):
@@ -318,6 +358,15 @@ class SingleAccountTests(PoolPaceTestCase):
                 # The slot is known whenever cswap was read.
                 self.assertEqual(lone['weekly_pace']['members'][0]['slot'], '2')
                 self.assertIsNone(bare['weekly_pace']['members'][0]['slot'])
+                # Plain numbers in account scope: the account's own, no members.
+                opts = self.home.pace_opts()
+                self.assertEqual(
+                    (opts['@codex_weekly_used'], opts['@codex_weekly_delta'],
+                     opts['@codex_weekly_expected'], opts['@codex_weekly_resets'],
+                     opts['@codex_weekly_members']),
+                    (str(weekly), '' if delta is None else f'{delta:+d}',
+                     '' if delta is None else str(min(100, max(0, weekly - delta))),
+                     str(resets), ''))
 
 
 class MemberTests(PoolPaceTestCase):
@@ -345,15 +394,18 @@ class MemberTests(PoolPaceTestCase):
         self.assertEqual(session['delta'], -14)
         self.assertEqual(session['delta'],
                          reference_delta([(0, NOW + SESSION_W), (12, A2_SESSION_RESETS)], SESSION_W))
-        self.assertEqual(block['session_text'], '12% (Σ-14%)')
+        self.assertEqual(block['session_text'], '6% (-14%)')
 
-        # The same for the ACTIVE account's own passed session reset.
+        # The same for the ACTIVE account's own passed session reset — and
+        # with both accounts' windows over, the pool has none open: "idle".
         self.home.endpoint(session=50, session_resets=NOW - HOUR)
-        session = self.home.refresh()['session_pace']
+        block = self.home.refresh()
+        session = block['session_pace']
         self.assertEqual(session['members'][1],
                          {'slot': '2', 'email': A2_EMAIL, 'used': 0,
                           'resets_at': NOW + SESSION_W, 'active': True, 'as_of': NOW})
         self.assertEqual(session['delta'], 0)
+        self.assertEqual(block['session_text'], 'idle')
 
     def test_tied_reset_times_make_one_horizon(self):
         slot1 = {'fetchedAt': NOW - 60,
@@ -381,7 +433,7 @@ class MemberTests(PoolPaceTestCase):
         block = self.home.refresh()
         self.assertEqual(block['weekly_pace']['horizons'], [{'at': mid, 'avail': 129}])
         self.assertEqual(block['weekly_pace']['delta'], -15)
-        self.assertEqual(block['weekly_text'], '27% (Σ-15%)')
+        self.assertEqual(block['weekly_text'], '36% (-15%)')       # mean 35.5 -> 36
         self.assertEqual(round(-14.5), -14)        # the trap this guards against
 
     def test_active_account_at_its_limit_is_red(self):
@@ -451,6 +503,33 @@ class MemberTests(PoolPaceTestCase):
                          [(0, NOW + SESSION_W), (0, NOW + SESSION_W)])
         self.assertEqual(session['horizons'], [{'at': NOW + SESSION_W, 'avail': 200}])
         self.assertEqual(session['delta'], 0)
+        # An idle window publishes no numbers; the others still do.
+        opts = self.home.pace_opts()
+        self.assertEqual([opts[f'@codex_session_{f}'] for f in
+                          ('used', 'expected', 'delta', 'resets', 'members')], [''] * 5)
+        self.assertEqual(opts['@codex_weekly_used'], '59')
+
+    def test_idle_active_next_to_a_busy_account_shows_the_pool(self):
+        # The active account is idle, account 1 is 20% into an open window:
+        # the pool has a window open, so it is a number, not "idle".
+        slot1 = {'fetchedAt': NOW - 60,
+                 'lastGood': {'five_hour': {'pct': 20.0, 'resets_at': iso_cswap(NOW + 2 * HOUR)},
+                              'seven_day': {'pct': 90.0, 'resets_at': iso_cswap(A1_WEEKLY_RESETS)},
+                              'scoped': []}}
+        self.home.cswap(slot1=slot1)
+        self.home.endpoint(session=0, session_resets=None)
+        block = self.home.refresh()
+        session = block['session_pace']
+        self.assertEqual(session['used'], 10)
+        self.assertEqual(block['session_used'], 0)              # the active account's own
+        delta = reference_delta([(20, NOW + 2 * HOUR), (0, NOW + SESSION_W)], SESSION_W)
+        self.assertEqual(session['delta'], delta)
+        self.assertEqual(block['session_text'], f'10% ({delta:+d}%)')
+        self.assertNotEqual(block['session_color'], 'brightblack')
+        opts = self.home.pace_opts()
+        self.assertEqual((opts['@codex_session_used'], opts['@codex_session_resets'],
+                          opts['@codex_session_members']),
+                         ('10', '', '1:20:0,2:0:1'))     # the active account has no reset
 
     def test_matched_by_account_not_by_slot_number(self):
         # cswap's usage cache keyed the other way round: still matched by account.
@@ -500,11 +579,93 @@ class RenderPathTests(PoolPaceTestCase):
                                               {'at': A2_WEEKLY_RESETS, 'avail': 180}])
         delta = reference_delta([(90, A1_WEEKLY_RESETS), (30, A2_WEEKLY_RESETS)], WEEK_W, now)
         self.assertEqual(weekly['delta'], delta)
-        self.assertEqual(block['weekly_text'], f'30% (Σ{delta:+d}%)')
+        self.assertEqual(block['weekly_text'], f'60% ({delta:+d}%)')      # mean of 90, 30
         self.assertEqual(block['session_pace']['scope'], 'pool')
         # The tick publishes before it adopts; the adopted text reaches tmux
-        # through commit_claude_rerender's own publish.
-        self.assertEqual(self.home.published('@codex_weekly_text'), f'30% (Σ{delta:+d}%)')
+        # through commit_claude_rerender's own publish, and so do the numbers.
+        self.assertEqual(self.home.published('@codex_weekly_text'), f'60% ({delta:+d}%)')
+        opts = self.home.pace_opts()
+        self.assertEqual((opts['@codex_weekly_used'], opts['@codex_weekly_delta'],
+                          opts['@codex_weekly_members']),
+                         ('60', f'{delta:+d}', '1:90:0,2:30:1'))
+
+
+class PublishTests(PoolPaceTestCase):
+    def tick(self, at):
+        """One --tick at FAKE_NOW=at; returns how many tmux calls set the pace options."""
+        (self.home.cache / 'last_tick').unlink(missing_ok=True)      # its debounce
+        self.home.tmux_log.unlink(missing_ok=True)
+        env = self.home.env(FAKE_NOW=str(at))
+        env.pop('CODEXBAR_USAGE_FORCE_REFRESH')
+        result = subprocess.run(['/bin/bash', str(STATUS), '--tick'], capture_output=True,
+                                text=True, timeout=30, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = self.home.tmux_log.read_text().splitlines() if self.home.tmux_log.exists() else []
+        # The text options are published on every tick regardless.
+        self.assertIsNotNone(self.home.published('@codex_weekly_text'))
+        return sum(1 for line in lines if '@codex_weekly_used' in line)
+
+    def test_tick_skips_the_pace_options_until_something_changes(self):
+        self.home.cswap()
+        self.home.refresh()                         # a render: publishes, stamps the marker
+        marker = self.home.cache / 'pace-opts.published'
+        self.assertTrue(marker.exists())
+        self.assertEqual(self.tick(NOW + 60), 0)    # cache unchanged: no jq, no tmux
+        self.assertEqual(self.tick(NOW + 65), 0)
+
+        # No marker (first run, or it was lost): the tick publishes, once.
+        marker.unlink()
+        self.assertEqual(self.tick(NOW + 70), 1)
+        self.assertEqual(self.home.pace_opts()['@codex_weekly_used'], '59')
+        self.assertEqual(self.tick(NOW + 75), 0)
+
+        # A cswap switch with no cache rewrite: the block is now another
+        # account's ("--%"), so the numbers empty on the very next tick.
+        self.home.login(A1_EMAIL, A1_ORG)
+        self.assertEqual(self.tick(NOW + 80), 1)
+        self.assertEqual(set(self.home.pace_opts().values()), {''})
+        self.assertEqual(self.tick(NOW + 85), 0)
+        # And back.
+        self.home.login(A2_EMAIL, A2_ORG)
+        self.assertEqual(self.tick(NOW + 90), 1)
+        self.assertEqual(self.home.pace_opts()['@codex_weekly_used'], '59')
+
+        # A cache rewrite that published nothing itself: the tick catches it.
+        later = time.time() + 30
+        os.utime(self.home.usage, (later, later))
+        self.assertEqual(self.tick(NOW + 95), 1)
+        self.assertEqual(self.tick(NOW + 100), 0)
+
+    def test_restarted_tmux_server_gets_them_back(self):
+        self.home.cswap()
+        self.home.refresh()
+        # A server that lists its options but has no @codex_weekly_used: the
+        # tick republishes even though the cache has not changed.
+        stub = self.home.bin / 'tmux'
+        stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >>"$FAKE_TMUX_LOG"\n'
+                        'case "$1" in show-options) printf \'%s\\n\' "$FAKE_TMUX_OPTS" ;; esac\n')
+        os.environ['FAKE_TMUX_OPTS'] = 'status on'
+        try:
+            self.assertEqual(self.tick(NOW + 60), 1)
+            os.environ['FAKE_TMUX_OPTS'] = 'status on\n@codex_weekly_used 59'
+            self.assertEqual(self.tick(NOW + 65), 0)
+            os.environ['FAKE_TMUX_OPTS'] = 'status on\n@codex_weekly_used ""'
+            self.assertEqual(self.tick(NOW + 70), 0)        # set, if empty
+        finally:
+            os.environ.pop('FAKE_TMUX_OPTS', None)
+
+    def test_another_accounts_block_publishes_no_numbers(self):
+        self.home.cswap()
+        self.home.refresh()
+        self.assertEqual(self.home.pace_opts()['@codex_weekly_used'], '59')
+        # cswap switched to account 1; the block is still account 2's ("--%").
+        self.home.login(A1_EMAIL, A1_ORG)
+        self.home.tmux_log.unlink()
+        result = subprocess.run(['/bin/bash', str(STATUS), '--publish'], capture_output=True,
+                                text=True, timeout=30, env=self.home.env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.home.published('@codex_weekly_text'), '--%')
+        self.assertEqual(set(self.home.pace_opts().values()), {''})
 
 
 class ToggleAndFailureTests(PoolPaceTestCase):

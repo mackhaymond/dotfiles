@@ -1535,16 +1535,26 @@ load_print_context() {
   PRINT_PREVIEW_UNTIL='0'
   PRINT_VIEW_SCOPE='both'
   PRINT_DEBUG_COUNTER='0'
+  # Whether the server listed its options at all, and whether the pace
+  # numbers are among them: a restarted server has lost them, and
+  # publish_pace_opts must not skip on its marker then. Read off this same
+  # listing, so the check costs no fork of its own.
+  PRINT_OPTS_LISTED=0
+  PRINT_PACE_OPTS_SET=0
 
   command -v tmux >/dev/null 2>&1 || return 0
 
   local opts
   opts="$(tmux show-options -g 2>/dev/null || true)"
   [[ -n "${opts:-}" ]] || return 0
+  PRINT_OPTS_LISTED=1
 
   local line key val
   while IFS= read -r line; do
     case "$line" in
+      "@codex_weekly_used"|"@codex_weekly_used "*)
+        PRINT_PACE_OPTS_SET=1
+        ;;
       "@codexbar_view "*)
         val="${line#@codexbar_view }"
         val="${val#\"}"; val="${val%\"}"
@@ -1812,6 +1822,107 @@ publish_to_tmux_opts() {
       publish_text_and_alias @codex_scoped_color @codex_fable_color "$CACHE_SCOPED_COLOR"
     fi
   fi
+
+  publish_pace_opts || true
+}
+
+# Plain numbers for the display provider's windows, for readers that draw
+# their own gauge (the agent sidebar) rather than the status-line text. Per
+# window <w> in session, weekly, scoped:
+#
+#   @codex_<w>_used      the level drawn: <w>_pace.used — the pool's mean
+#                        used% in pool scope, the account's own otherwise
+#   @codex_<w>_expected  where pace says the level should be now:
+#                        used − delta, clamped to 0..100
+#   @codex_<w>_delta     signed pace delta, "+17" / "-4"
+#   @codex_<w>_resets    the logged-in account's next reset (epoch), as the
+#                        block has it
+#   @codex_<w>_members   "slot:used:active,..." ("1:90:0,2:27:1") in pool
+#                        scope; empty in account scope
+#
+# Each is empty when not known, and all five are empty for a window with no
+# data, one drawn as "idle", or another account's block (drawn "--%").
+#
+# ALL IN ONE tmux INVOCATION (set-option ... \; set-option ...): a reader
+# polling between separate calls could pair a new `used` with an old
+# `expected`. The text/color options above keep their own calls — readers of
+# those pair nothing — and this costs the tick one jq and one tmux fork.
+# Read with its own jq rather than through load_cache_fields: that line's
+# field list is a contract of its own (see there).
+#
+# GATED ON THE TICK. The tick publishes every status-interval (seconds), but
+# these values only change when usage.json is rewritten — and every render
+# path that rewrites it publishes ungated right after. So, like
+# adopt_cswap_claude, the tick compares usage.json against a marker stamped
+# with the cache's own mtime (touch -r) at the last publish, and skips — no
+# jq, no tmux — when nothing is newer. Two things change the values WITHOUT
+# a rewrite, and both are checked fork-free: which provider is displayed and
+# whether the block is another account's (a cswap switch draws "--%", and
+# the numbers must empty at once), recorded as the marker's content; and a
+# restarted tmux server, which has lost the options (load_print_context
+# saw the listing without @codex_weekly_used). The one blind spot is the
+# 1-second resolution of bash's -nt: a rewrite in the same second as the
+# last publish, by a path that does not publish itself, waits for the next.
+PACE_OPTS_MARKER="${CACHE_DIR}/pace-opts.published"
+PACE_OPTS_GATED=0
+publish_pace_opts() {
+  command -v tmux >/dev/null 2>&1 || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local state="${DISPLAY_PROVIDER}:${CACHE_OTHER_ACCOUNT:-0}"
+  if (( PACE_OPTS_GATED == 1 )) \
+     && [[ -f "$CACHE_FILE" && -f "$PACE_OPTS_MARKER" && ! "$CACHE_FILE" -nt "$PACE_OPTS_MARKER" ]] \
+     && ! (( ${PRINT_OPTS_LISTED:-0} == 1 && ${PRINT_PACE_OPTS_SET:-0} == 0 )); then
+    local recorded=''
+    { IFS= read -r recorded <"$PACE_OPTS_MARKER"; } 2>/dev/null || true
+    [[ "$recorded" == "$state" ]] && return 0
+  fi
+
+  local line=''
+  if [[ -f "$CACHE_FILE" && "${CACHE_OTHER_ACCOUNT:-0}" != 1 ]]; then
+    line="$(jq -r --arg p "$DISPLAY_PROVIDER" --arg primary "$PROVIDER_PRIMARY" '
+      def signed: if . >= 0 then "+\(.)" else "\(.)" end;
+      ((.providers[$p]? // (if $p == $primary then . else {} end)) // {}) as $b
+      | [ "session", "weekly", "scoped" ]
+      | map(. as $k | ($b[$k + "_pace"]) as $pc
+            | if ($pc | type) != "object" or ($pc.used | type) != "number"
+                 or $b[$k + "_text"] == "idle"
+              then ["", "", "", "", ""]
+              else
+                ($pc.delta | if type == "number" then . else null end) as $d
+                | [ ($pc.used | tostring),
+                    (if $d == null then "" else ([[($pc.used - $d), 0] | max, 100] | min | tostring) end),
+                    (if $d == null then "" else ($d | signed) end),
+                    ($b[$k + "_resets_at"] | if type == "number" then tostring else "" end),
+                    (if $pc.scope == "pool"
+                     then [ ($pc.members // [])[]
+                            | "\(.slot // "")" + ":" + "\(.used)" + ":" + (if .active then "1" else "0" end) ]
+                          | join(",")
+                     else "" end) ]
+              end)
+      | add | join("\u001f")
+    ' "$CACHE_FILE" 2>/dev/null || true)"
+  fi
+
+  # Fields by position; an empty line (no cache, other account) leaves every
+  # one empty, which is what gets published.
+  local v=()
+  IFS=$'\x1f' read -r -a v <<<"$line" || true
+  local args=() w f n=0
+  for w in session weekly scoped; do
+    for f in used expected delta resets members; do
+      (( ${#args[@]} > 0 )) && args+=(';')
+      args+=(set-option -gq "@codex_${w}_${f}" "${v[$n]:-}")
+      n=$(( n + 1 ))
+    done
+  done
+  tmux "${args[@]}" >/dev/null 2>&1 || return 0
+  # Stamped with the cache's own mtime, so the next rewrite (whenever it
+  # lands) is newer; a failed publish leaves the marker and is retried.
+  if [[ -f "$CACHE_FILE" ]]; then
+    { printf '%s\n' "$state" >"$PACE_OPTS_MARKER" && touch -r "$CACHE_FILE" "$PACE_OPTS_MARKER"; } 2>/dev/null || true
+  fi
+  return 0
 }
 
 print_value() {
@@ -2932,9 +3043,10 @@ json_int_or_null() {
 # "is THIS account burning faster than its window allows" stopped being the
 # question: running one account dry early just hands the work to the next.
 # What matters is whether the quota of ALL the connected accounts lasts. So
-# the pace of each Claude window (session, weekly, scoped) is computed over
-# the pool, and the bar's number stays the active account's own used% — that
-# is still what the next request is charged against.
+# the pace of each Claude window (session, weekly, scoped) — and the percent
+# the bar draws — is computed over the pool. The block's <family>_used stays
+# the active account's own reading (the history, the live merge and the reset
+# view key on it); the pooled level is <family>_pace.used and the text.
 #
 # THE MATH, generalising pace_delta exactly. For one window kind of length W,
 # n members with used u_i and reset t_i, at `now` (the block's updated_at, as
@@ -2983,7 +3095,9 @@ json_int_or_null() {
 #    level>, horizons: [{at, avail}], delta: <int or null, at updated_at>,
 #    members: [{slot, email, used, resets_at, active, as_of}]}
 #
-# and in the pool case <family>_text reads "27% (Σ+16%)", <family>_pace_color
+# and in the pool case <family>_text is the pool's level and delta,
+# "59% (+16%)" (a pooled session reads "idle" only when every member is
+# idle), <family>_pace_color
 # is the pooled delta's color, and <family>_color runs the pooled level and
 # pace through color_for_level_and_pace — red regardless when the ACTIVE
 # account itself is at 100% or critical (pool_window_color). @codexbar_pool_pace /
@@ -2999,7 +3113,8 @@ json_int_or_null() {
 # POOL_SLOT, the active member's slot ("" when not a member), and per family
 # POOL_<FAMILY>_JSON (the pool object, "" when the pool does not apply),
 # POOL_<FAMILY>_DELTA (signed, "+16"; "" when not computable) and
-# POOL_<FAMILY>_USED.
+# POOL_<FAMILY>_USED, plus POOL_SESSION_IDLE ("1" when no member has a
+# session window open).
 POOL_PACE_ENABLED=''
 pool_pace_enabled() {
   if [[ -z "$POOL_PACE_ENABLED" ]]; then
@@ -3052,6 +3167,9 @@ POOL_PACE_JQ='
        then {used: 0, resets_at: (.resets_at + (((($now - .resets_at) / $W) | floor) + 1) * $W)}
        else {used: 0, resets_at: ($now + $W)} end)
     else . end;
+  # No window open at $now: no reset at all, or (for the 5-hour session) one
+  # that has passed. Read off the reading BEFORE roll.
+  def idle($fixed): .resets_at == null or (($fixed | not) and .resets_at <= $now);
   # Half away from zero, as pace_delta rounds. (0 - x, not -x: older jq has
   # no unary minus on an expression.)
   def round_away: if . < 0 then 0 - (((0 - .) + 0.5) | floor) else ((. + 0.5) | floor) end;
@@ -3077,10 +3195,12 @@ POOL_PACE_JQ='
           [ $members[]
             | . as $mem
             | if $mem.slot == $active.slot then
-                ({used: $a.used, resets_at: $a.resets} | roll($W; $fixed)) as $r
+                {used: $a.used, resets_at: $a.resets} as $raw
+                | ($raw | roll($W; $fixed)) as $r
                 | select($r != null)
                 | {slot: $mem.slot, email: ($mem.acct.email // null), used: $r.used,
-                   resets_at: $r.resets_at, active: true, as_of: $now}
+                   resets_at: $r.resets_at, active: true, as_of: $now,
+                   _idle: ($raw | idle($fixed))}
               else
                 ((($UA[$mem.slot] // null) | select(type == "object" and same_acct(.; $mem.acct)))
                   // ([ $UA[]? | objects | select(same_acct(.; $mem.acct)) ] | first)
@@ -3089,9 +3209,9 @@ POOL_PACE_JQ='
                 | ($u.fetchedAt | floor) as $f
                 | select($now - $f <= $max_age)
                 | (pick(($u.lastGood | obj); $kind) // null)
-                | select(. != null) | roll($W; $fixed) | select(. != null)
+                | select(. != null) | . as $raw | roll($W; $fixed) | select(. != null)
                 | {slot: $mem.slot, email: ($mem.acct.email // $u.email // null), used,
-                   resets_at, active: false, as_of: $f}
+                   resets_at, active: false, as_of: $f, _idle: ($raw | idle($fixed))}
               end ] as $ms
           | if ($ms | length) < 2 or ([ $ms[] | select(.active) ] | length) != 1 then null else
               ($ms | length) as $n
@@ -3104,14 +3224,19 @@ POOL_PACE_JQ='
                  delta: ([ $hz[] | select(.at - $now > 0 and .at - $now <= $W)
                            | (100 * (.at - $now) / $W) - (.avail / $n) ]
                          | if length == 0 then null else (max | round_away) end),
-                 members: $ms}
+                 members: ($ms | map(del(._idle))),
+                 # Internal (not published): no member has a window open.
+                 _idle: ($ms | all(._idle))}
             end
         end;
+    # Per family: the published object, the signed delta, the pooled level,
+    # and "1" when every member is idle (render_provider_block says "idle").
     [ ($active.slot // "") ]
     + ([ "session", "weekly", "scoped" ]
        | map(pool(.) as $p
-             | if $p == null then ["", "", ""]
-               else [($p | tojson), ($p.delta | signed), ($p.used | tostring)] end)
+             | if $p == null then ["", "", "", ""]
+               else [($p | del(._idle) | tojson), ($p.delta | signed), ($p.used | tostring),
+                     (if $p._idle then "1" else "0" end)] end)
        | add)
     | join("\u001f")
 '
@@ -3119,13 +3244,13 @@ POOL_PACE_JQ='
 # $1 provider, $2 now (updated_at), then used / window minutes / resets_at
 # for session, weekly and scoped, exactly as render_provider_block has them.
 POOL_SLOT=''
-POOL_SESSION_JSON='' POOL_SESSION_DELTA='' POOL_SESSION_USED=''
+POOL_SESSION_JSON='' POOL_SESSION_DELTA='' POOL_SESSION_USED='' POOL_SESSION_IDLE=''
 POOL_WEEKLY_JSON=''  POOL_WEEKLY_DELTA=''  POOL_WEEKLY_USED=''
 POOL_SCOPED_JSON=''  POOL_SCOPED_DELTA=''  POOL_SCOPED_USED=''
 pool_pace_read() {
   local provider="$1" now="$2"
   POOL_SLOT=''
-  POOL_SESSION_JSON='' POOL_SESSION_DELTA='' POOL_SESSION_USED=''
+  POOL_SESSION_JSON='' POOL_SESSION_DELTA='' POOL_SESSION_USED='' POOL_SESSION_IDLE=''
   POOL_WEEKLY_JSON=''  POOL_WEEKLY_DELTA=''  POOL_WEEKLY_USED=''
   POOL_SCOPED_JSON=''  POOL_SCOPED_DELTA=''  POOL_SCOPED_USED=''
 
@@ -3154,14 +3279,17 @@ pool_pace_read() {
     "$POOL_PACE_JQ" 2>/dev/null || true)"
   [[ -n "${line:-}" ]] || return 0
 
+  # Only the session's all-idle flag is used: weekly and scoped windows are
+  # always open (an account at 0% of them is unused, not idle).
+  local weekly_idle scoped_idle
   IFS=$'\x1f' read -r POOL_SLOT \
-    POOL_SESSION_JSON POOL_SESSION_DELTA POOL_SESSION_USED \
-    POOL_WEEKLY_JSON POOL_WEEKLY_DELTA POOL_WEEKLY_USED \
-    POOL_SCOPED_JSON POOL_SCOPED_DELTA POOL_SCOPED_USED <<<"$line" || true
+    POOL_SESSION_JSON POOL_SESSION_DELTA POOL_SESSION_USED POOL_SESSION_IDLE \
+    POOL_WEEKLY_JSON POOL_WEEKLY_DELTA POOL_WEEKLY_USED weekly_idle \
+    POOL_SCOPED_JSON POOL_SCOPED_DELTA POOL_SCOPED_USED scoped_idle <<<"$line" || true
 
   # Anything that is not an object from the program above is not trusted
   # into the block's --argjson (a bad one would fail the whole render).
-  [[ "$POOL_SESSION_JSON" == '{'* && "$POOL_SESSION_USED" =~ ^[0-9]+$ ]] || { POOL_SESSION_JSON=''; POOL_SESSION_DELTA=''; POOL_SESSION_USED=''; }
+  [[ "$POOL_SESSION_JSON" == '{'* && "$POOL_SESSION_USED" =~ ^[0-9]+$ ]] || { POOL_SESSION_JSON=''; POOL_SESSION_DELTA=''; POOL_SESSION_USED=''; POOL_SESSION_IDLE=''; }
   [[ "$POOL_WEEKLY_JSON" == '{'* && "$POOL_WEEKLY_USED" =~ ^[0-9]+$ ]]   || { POOL_WEEKLY_JSON='';  POOL_WEEKLY_DELTA='';  POOL_WEEKLY_USED=''; }
   [[ "$POOL_SCOPED_JSON" == '{'* && "$POOL_SCOPED_USED" =~ ^[0-9]+$ ]]   || { POOL_SCOPED_JSON='';  POOL_SCOPED_DELTA='';  POOL_SCOPED_USED=''; }
   return 0
@@ -3263,25 +3391,27 @@ render_provider_block() {
     scoped_pace_color='brightblack'
   fi
 
-  # Pooled pace (see "Pooled pace"): where the pool applies, the text keeps
-  # the active account's used% and takes the pool's delta, marked Σ, and both
-  # colors are the pool's. Everything else stays the one-account answer above.
+  # Pooled pace (see "Pooled pace"): where the pool applies, the text is the
+  # POOL's — its level (the members' mean used%) and its delta — and so are
+  # both colors. <family>_used stays the active account's own reading: the
+  # history, the live merge and the reset view all key on it. Everything
+  # else stays the one-account answer above.
   pool_pace_read "$provider" "$updated_at" \
     "$session_used" "$session_window" "$session_resets" \
     "$weekly_used" "$weekly_window" "$weekly_resets" \
     "$scoped_used" "$scoped_window" "$scoped_resets"
   if [[ -n "$POOL_SESSION_JSON" ]]; then
-    session_text="${session_used}%${POOL_SESSION_DELTA:+ (Σ${POOL_SESSION_DELTA}%)}"
+    session_text="${POOL_SESSION_USED}%${POOL_SESSION_DELTA:+ (${POOL_SESSION_DELTA}%)}"
     session_pace_color="$(pool_pace_color "$POOL_SESSION_USED" "$POOL_SESSION_DELTA")"
     session_color="$(pool_window_color "$session_used" "$POOL_SESSION_USED" "$session_pace_color")"
   fi
   if [[ -n "$POOL_WEEKLY_JSON" ]]; then
-    weekly_text="${weekly_used}%${POOL_WEEKLY_DELTA:+ (Σ${POOL_WEEKLY_DELTA}%)}"
+    weekly_text="${POOL_WEEKLY_USED}%${POOL_WEEKLY_DELTA:+ (${POOL_WEEKLY_DELTA}%)}"
     weekly_pace_color="$(pool_pace_color "$POOL_WEEKLY_USED" "$POOL_WEEKLY_DELTA")"
     weekly_color="$(pool_window_color "$weekly_used" "$POOL_WEEKLY_USED" "$weekly_pace_color")"
   fi
   if [[ -n "$POOL_SCOPED_JSON" ]]; then
-    scoped_text="${scoped_used}%${POOL_SCOPED_DELTA:+ (Σ${POOL_SCOPED_DELTA}%)}"
+    scoped_text="${POOL_SCOPED_USED}%${POOL_SCOPED_DELTA:+ (${POOL_SCOPED_DELTA}%)}"
     scoped_pace_color="$(pool_pace_color "$POOL_SCOPED_USED" "$POOL_SCOPED_DELTA")"
     scoped_color="$(pool_window_color "$scoped_used" "$POOL_SCOPED_USED" "$scoped_pace_color")"
   fi
@@ -3290,7 +3420,16 @@ render_provider_block() {
   # resets_at — there is no window, so pacing is undefined and the reset time is
   # unknown. Say "idle" in gray instead of a bare green "0%", which is
   # indistinguishable from a live-but-unpaced reading or a stalled fetch.
-  if [[ -n "$session_used" && -z "${session_resets:-}" ]] && (( session_used == 0 )); then
+  # With a pooled session the number is the pool's, so "idle" means the
+  # POOL has no window open — every member idle. One idle account next to a
+  # busy one is just a low pooled number ("10% (-30%)").
+  local session_idle=0
+  if [[ -n "$POOL_SESSION_JSON" ]]; then
+    [[ "$POOL_SESSION_IDLE" == '1' ]] && session_idle=1
+  elif [[ -n "$session_used" && -z "${session_resets:-}" ]] && (( session_used == 0 )); then
+    session_idle=1
+  fi
+  if (( session_idle == 1 )); then
     session_text='idle'
     session_color='brightblack'
     session_pace_color='brightblack'
@@ -4362,7 +4501,11 @@ main() {
         \( -name 'codexbar.stderr.*' -o -name 'curl.cfg.*' -o -name 'oauth.body.*' \) \
         -mmin +5 -delete 2>/dev/null || true
 
+      # Gated for this one call only (see publish_pace_opts): a render below
+      # that rewrites the cache publishes ungated, as every render path does.
+      PACE_OPTS_GATED=1
       publish_to_tmux_opts || true
+      PACE_OPTS_GATED=0
       # claude-swap's latest reading for this account, when it is newer than
       # the block (see adopt_cswap_claude). Before the live backstop, so a
       # live sample waiting to be merged is folded on top of it, not under.
