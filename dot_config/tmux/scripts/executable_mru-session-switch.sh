@@ -4,6 +4,34 @@ set -euo pipefail
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Messages go through notify.sh: a toast in the agent sidebar when one is open
+# for the client, else tmux's own display-message (its header has the rest).
+# NOTIFY_SH names another (tests); beside this script it is notify.sh
+# (executable_notify.sh in the chezmoi source); with none, display-message.
+#   notify_user [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [--] TEXT
+notify_user() {
+  local n="${NOTIFY_SH:-}" d="${BASH_SOURCE[0]%/*}" c=
+  [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+  if [ -z "$n" ]; then
+    for n in "$d/notify.sh" "$d/executable_notify.sh" "$HOME/.config/tmux/scripts/notify.sh"; do
+      [ -f "$n" ] && break
+    done
+  fi
+  if [ -x "$n" ]; then "$n" "$@"
+  elif [ -f "$n" ]; then zsh -f "$n" "$@"
+  else
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -c|-k|-t) [ "$1" = -c ] && c="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+        --) shift; break ;;
+        *) break ;;
+      esac
+    done
+    ${NOTIFY_TMUX:-tmux} display-message ${c:+-c "$c"} -- "$*" 2>/dev/null
+  fi
+  return 0
+}
+
 # No `.`: tmux silently turns it into `_` when creating a session, so the
 # switch-client to the typed name then fails.
 is_valid_session_name() {
@@ -56,7 +84,7 @@ decorate() {
 
 main() {
   if ! command -v fzf >/dev/null 2>&1; then
-    tmux display-message "mru-session-switch: fzf not found in PATH"
+    notify_user -k error -- "mru-session-switch: fzf not found in PATH"
     exit 1
   fi
 
@@ -125,7 +153,7 @@ main() {
   fi
 
   if ! is_valid_session_name "$target"; then
-    tmux display-message "Invalid session name (allowed: A-Z a-z 0-9 _ -): $target"
+    notify_user -k warn -- "Invalid session name (allowed: A-Z a-z 0-9 _ -): $target"
     exit 0
   fi
 

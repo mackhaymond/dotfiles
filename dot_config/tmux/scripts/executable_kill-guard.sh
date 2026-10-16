@@ -180,9 +180,39 @@ server_alive() {
     [ "$("$REAL_TMUX" -S "$1" display -p x 2>/dev/null)" = x ]
 }
 
-# tell SOCKET MESSAGE: a status-line message on the server (best effort).
+# Messages go through notify.sh: a toast in the agent sidebar when one is open
+# for the client, else tmux's own display-message (its header has the rest).
+# NOTIFY_SH names another (tests); beside this script it is notify.sh
+# (executable_notify.sh in the chezmoi source); with none, display-message.
+#   notify_user [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [--] TEXT
+notify_user() {
+    local n="${NOTIFY_SH:-}" d="${BASH_SOURCE[0]%/*}" c=
+    [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+    if [ -z "$n" ]; then
+        for n in "$d/notify.sh" "$d/executable_notify.sh" "$HOME/.config/tmux/scripts/notify.sh"; do
+            [ -f "$n" ] && break
+        done
+    fi
+    if [ -x "$n" ]; then "$n" "$@"
+    elif [ -f "$n" ]; then zsh -f "$n" "$@"
+    else
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -c|-k|-t) [ "$1" = -c ] && c="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+                --) shift; break ;;
+                *) break ;;
+            esac
+        done
+        ${NOTIFY_TMUX:-tmux} display-message ${c:+-c "$c"} -- "$*" 2>/dev/null
+    fi
+    return 0
+}
+
+# tell SOCKET MESSAGE: a 10 s message on the server (best effort), through
+# the REAL tmux (never this shim) on that socket.
 tell() {
-    "$REAL_TMUX" -S "$1" display-message -d 10000 "$2" 2>/dev/null
+    # %q: notify.sh splits NOTIFY_TMUX like a shell, so a path with spaces holds.
+    NOTIFY_TMUX="$REAL_TMUX -S $(printf %q "$1")" notify_user -k error -t 10 -- "$2"
 }
 
 # ---------------------------------------------------------------- save first

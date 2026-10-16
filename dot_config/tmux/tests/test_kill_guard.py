@@ -59,8 +59,11 @@ def render_alias(guard_path):
 
 
 def _clean_env():
-    return {k: v for k, v in os.environ.items()
-            if not k.startswith("KILL_GUARD_") and k not in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR")}
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("KILL_GUARD_") and k not in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR")}
+    # The guard's refusals go through notify.sh: never the real log or notice.
+    env.update(NOTIFY_LOG=os.devnull, AGENT_FOCUS_NOTICE="")
+    return env
 
 
 def _pid_alive(pid):

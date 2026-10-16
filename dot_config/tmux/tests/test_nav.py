@@ -52,6 +52,9 @@ class Nav(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
         self.env["TERM"] = "xterm-256color"
+        # nav.sh's chips go through notify.sh: never the real log or notice.
+        self.env["NOTIFY_LOG"] = os.path.join(self.tmp, "notify.log")
+        self.env["AGENT_FOCUS_NOTICE"] = ""
         self.path = None
         self.children = []
         self.addCleanup(self.reap)

@@ -19,6 +19,7 @@ SCRIPTS = Path(os.environ.get(
 WATCHER = SCRIPTS / "executable_agent-tab-watcher.sh"
 LIB = SCRIPTS / "agent-session-lib.sh"
 JUMP = SCRIPTS / "executable_agent-jump.sh"
+NOTIFY = SCRIPTS / "executable_notify.sh"
 BASH_DIR = str(Path(shutil.which("bash") or "/opt/homebrew/bin/bash").parent)
 
 FAKE_TMUX = r'''#!/usr/bin/env python3
@@ -189,6 +190,9 @@ class FakeEnv:
         shutil.copy(WATCHER, scripts / "agent-tab-watcher.sh")
         shutil.copy(LIB, scripts / "agent-session-lib.sh")
         shutil.copy(JUMP, scripts / "agent-jump.sh")
+        # The jump's chips go through notify.sh (to the fake tmux on PATH;
+        # no sidebar there, so its display-message fallback is what lands).
+        shutil.copy(NOTIFY, scripts / "notify.sh")
         self.scripts = scripts
         for name, body in (("tmux", FAKE_TMUX), ("ps", FAKE_PS), ("pgrep", FAKE_PGREP)):
             f = self.bin / name; f.write_text(body); f.chmod(0o755)
@@ -203,7 +207,7 @@ class FakeEnv:
         e = {"HOME": str(self.home), "TMPDIR": str(self.tmp) + "/",
              "PATH": f"{self.bin}:{BASH_DIR}:/usr/bin:/bin", "FAKE_TMUX_STATE": str(self.state),
              "FAKE_PROCS": str(self.procs), "FAKE_PS_LOG": str(self.ps_log),
-             "AGENT_STATE_NOTICE": ""}
+             "AGENT_STATE_NOTICE": "", "AGENT_FOCUS_NOTICE": ""}
         e.update(extra)
         return e
 
@@ -884,8 +888,17 @@ class JumpTests(unittest.TestCase):
         fake.write_text(body)
         self.assertEqual(f.run("agent-jump.sh", "jump", self.TTY, "@99", "main").returncode, 3)
         self.assertEqual(f.read()["messages"], [])
-        # goto keeps its fallback (a human pressed a key on some client).
+        # goto keeps its fallback (a human pressed a key on some client): a
+        # <tty> tmux no longer lists gets the untargeted chip. (notify.sh never
+        # fails, so "gone" is what list-clients says, not a failed -c.)
+        s = f.read(); s["clients"] = []; f.state.write_text(json.dumps(s))
         f.run("agent-jump.sh", "goto", self.TTY, "@99")
+        msgs = f.read()["messages"]
+        self.assertEqual(len(msgs), 1, msgs)
+        self.assertIsNone(msgs[0][0])                       # no -c: whoever tmux picks
+        self.assertIn("is not attached", msgs[0][1])
+        # jump never does: a gone client hears nothing.
+        self.assertEqual(f.run("agent-jump.sh", "jump", self.TTY, "@99", "main").returncode, 5)
         self.assertEqual(len(f.read()["messages"]), 1)
 
     def test_jump_refused_is_4(self):

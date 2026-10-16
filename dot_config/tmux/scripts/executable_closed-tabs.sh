@@ -69,7 +69,39 @@ RESURRECT_SAVE="$HOME/.config/tmux/plugins/tmux-assistant-resurrect/scripts/save
 
 mkdir -p "$STATE_DIR" "$PREVIEWS"
 
-msg() { tmux display-message "$*" 2>/dev/null; }
+# Messages go through notify.sh: a toast in the agent sidebar when one is open
+# for the client, else tmux's own display-message (its header has the rest).
+# NOTIFY_SH names another (tests); beside this script it is notify.sh
+# (executable_notify.sh in the chezmoi source); with none, display-message.
+#   notify_user [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [--] TEXT
+notify_user() {
+    local n="${NOTIFY_SH:-}" d="${BASH_SOURCE[0]%/*}" c=
+    [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+    if [ -z "$n" ]; then
+        for n in "$d/notify.sh" "$d/executable_notify.sh" "$HOME/.config/tmux/scripts/notify.sh"; do
+            [ -f "$n" ] && break
+        done
+    fi
+    if [ -x "$n" ]; then "$n" "$@"
+    elif [ -f "$n" ]; then zsh -f "$n" "$@"
+    else
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -c|-k|-t) [ "$1" = -c ] && c="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+                --) shift; break ;;
+                *) break ;;
+            esac
+        done
+        ${NOTIFY_TMUX:-tmux} display-message ${c:+-c "$c"} -- "$*" 2>/dev/null
+    fi
+    return 0
+}
+# msg [-k KIND] TEXT: to the client tmux resolves.
+msg() {
+    local k=info
+    [ "${1:-}" = -k ] && { k="$2"; shift 2; }
+    notify_user -k "$k" -- "$*"
+}
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOGFILE" 2>/dev/null; }
 
 # mkdir is the atomic lock (macOS has no flock(1)). A lock older than 10s is a
@@ -266,7 +298,7 @@ build_cmd() {
 do_close() {
     local pane="${1:-}"
     # An empty -t resolves to the CURRENT pane, not to nothing.
-    [ -n "$pane" ] || { msg "closed-tabs: no pane given"; return 1; }
+    [ -n "$pane" ] || { msg -k error "closed-tabs: no pane given"; return 1; }
 
     local info
     info=$(tmux display-message -p -t "$pane" \
@@ -337,7 +369,7 @@ do_close() {
     fi
     log "close $sess:$widx cwd=$cwd tool=${tool:--} sid=${sid:--}"
     if [ -n "$tool" ] && [ -z "$sid" ]; then
-        msg "closed-tabs: couldn't find the $tool session id — reopening will give a plain shell"
+        msg -k warn "closed-tabs: couldn't find the $tool session id — reopening will give a plain shell"
     fi
     # Fully detached: the model call takes seconds and the tab is already gone.
     # Output to /dev/null so tmux isn't left holding the job's pipe open.
@@ -546,7 +578,7 @@ do_reopen() {
     local client_sess="${1:-}" client_tty="${2:-}"
     shift 2 2>/dev/null
     local recs
-    lock_acquire || { msg "closed-tabs: history busy"; return 1; }
+    lock_acquire || { msg -k warn "closed-tabs: history busy"; return 1; }
     if [ "$#" -gt 0 ]; then
         recs=$(jq -c --argjson ids "$(ids_json "$@")" 'select(.id as $i | $ids | index($i))' "$HISTORY" 2>/dev/null)
     else
@@ -554,7 +586,7 @@ do_reopen() {
     fi
     if [ -z "$recs" ]; then
         lock_release
-        msg "closed-tabs: nothing to reopen"
+        msg -k warn "closed-tabs: nothing to reopen"
         return 0
     fi
     local ids; ids=$(jq -r '.id' <<<"$recs")
@@ -587,9 +619,9 @@ do_reopen() {
 
     [ -n "$client_tty" ] && [ -n "$first" ] && tmux switch-client -c "$client_tty" -t "$first" 2>/dev/null
     if [ "$lost" -gt 0 ]; then
-        msg "closed-tabs: reopened $n, couldn't recreate $failed ($lost lost: history busy, see log)"
+        msg -k error "closed-tabs: reopened $n, couldn't recreate $failed ($lost lost: history busy, see log)"
     elif [ "$failed" -gt 0 ]; then
-        msg "closed-tabs: reopened $n, couldn't recreate $failed (kept in the history)"
+        msg -k error "closed-tabs: reopened $n, couldn't recreate $failed (kept in the history)"
     fi
 }
 
@@ -599,7 +631,7 @@ do_forget() {
     history_filter --argjson ids "$(ids_json "$@")" 'select(.id as $i | $ids | index($i) | not)'
     local id; for id in "$@"; do rm -f "$PREVIEWS/$id.ansi"; done
     lock_release
-    msg "closed-tabs: forgot $# tab(s)"
+    msg -k ok "closed-tabs: forgot $# tab(s)"
 }
 
 # fzf needs a terminal, so the picker runs inside a popup that re-enters this
@@ -609,7 +641,7 @@ do_pick_popup() {
     local client_sess="${1:-}" client_tty="${2:-}"
     if lock_acquire; then prune; lock_release; fi
     if [ ! -s "$HISTORY" ]; then
-        msg "closed-tabs: nothing to reopen"
+        msg -k warn "closed-tabs: nothing to reopen"
         return 0
     fi
     local -a client=()

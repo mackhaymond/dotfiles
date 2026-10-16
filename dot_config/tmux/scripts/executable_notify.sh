@@ -15,9 +15,14 @@
 #   -c CLIENT  a client as `display-message -c` takes it. Without it: the
 #              calling context's client as tmux resolves it (`#{client_name}`;
 #              in a binding's run-shell, the client that pressed it), else
-#              none, which toasts in every open sidebar.
+#              none, which toasts in every open sidebar. `-c '*'`: EVERY
+#              client — one toast in every live sidebar, and tmux's own
+#              message on each client without one (one toast exists at a
+#              time, so a per-client loop would leave only the last).
 #   -k KIND    info (default), ok, warn, error: the toast's glyph and colour.
-#   -t SECONDS how long the toast shows (default 4; error 8).
+#   -t SECONDS how long the toast shows (default 4; error 8). Given (and
+#              valid), the display-message fallback shows that long too
+#              (`-d`); without it, display-time as before.
 #   TEXT       the words, joined by spaces; tabs and newlines become spaces.
 #              tmux formats in it are expanded as display-message would.
 #              Empty: nothing is shown.
@@ -68,8 +73,13 @@ case $kind in
     info|ok|warn|error) ;;
     *) kind=info ;;
 esac
+dopt=()
 if [[ ! $ttl =~ '^[0-9]+([.][0-9]+)?$' ]] || (( ttl <= 0 )); then
     if [[ $kind == error ]]; then ttl=8; else ttl=4; fi
+else
+    # An explicit duration holds for tmux's own message too (milliseconds).
+    integer dms=$(( ttl * 1000 ))
+    (( dms > 0 )) && dopt=(-d $dms)
 fi
 
 # One line: tabs, CRs and newlines → spaces.
@@ -77,9 +87,12 @@ text="$*"
 text=${text//[$'\t\r\n']/ }
 [[ -z ${text//[[:space:]]/} ]] && exit 0
 
-tmux_cmd=(${(z)${NOTIFY_TMUX:-tmux}})
-copt=() topt=()
-if [[ -n $client ]]; then
+# Split like a shell would (a quoted or escaped socket path keeps its spaces).
+tmux_cmd=(${(Q)${(z)${NOTIFY_TMUX:-tmux}}})
+copt=() topt=() all=0
+if [[ $client == '*' ]]; then
+    all=1 client=
+elif [[ -n $client ]]; then
     copt=(-c "$client")
     # -t too: display -p's formats follow -t's session (with only -c they
     # name the best client of the current session). A client tmux does not
@@ -103,6 +116,8 @@ if (( read_ok == 0 )) && [[ $out == *$US*$US*$US*$US* ]]; then
     clients=${out%%$US*}; out=${out#*$US}
     seq=${out%%$US*}; shown=${out#*$US}
     shown=${shown//[$'\t\r\n']/ }
+    (( all )) && target=
+
     [[ $seq == <-> ]] || seq=0
     # Formats that expand to nothing leave nothing to say.
     [[ -z ${shown//[[:space:]]/} ]] && exit 0
@@ -111,13 +126,16 @@ fi
 # Only a LIVE sidebar counts: a SIGKILLed one stays listed until something
 # repairs the registry, and a toast for it would be swallowed. Word i of
 # @sidebar_clients belongs to pid i of @sidebar_pids; `kill -0` is a builtin.
-toast=0
+toast=0 live=()
 if (( read_ok == 0 )); then
     pid_list=(${=pids}) client_list=(${=clients})
     for (( i = 1; i <= $#pid_list; i++ )); do
         p=${pid_list[i]}
         [[ $p == <1-> ]] && kill -0 "$p" 2>/dev/null || continue
-        if [[ -n $target ]]; then
+        if (( all )); then
+            # Every client: note each live sidebar's client, toast once.
+            toast=1; live+=("${client_list[i]-}")
+        elif [[ -n $target ]]; then
             # A sidebar for exactly this client.
             [[ ${client_list[i]-} == "$target" ]] && { toast=1; break; }
         elif [[ -z $client ]]; then
@@ -142,9 +160,17 @@ if (( toast )); then
     if [[ -n $notice ]]; then
         notifyutil -p "$notice" </dev/null >/dev/null 2>&1 &!
     fi
-else
-    # No sidebar for it: tmux's own message, exactly as before.
-    "${tmux_cmd[@]}" display-message "${copt[@]}" -- "$text" </dev/null >/dev/null 2>&1
+fi
+if (( all )); then
+    # Every client without a live sidebar: tmux's own message, on it.
+    for c in ${(f)"$("${tmux_cmd[@]}" list-clients -F '#{client_name}' 2>/dev/null)"}; do
+        (( ${live[(Ie)$c]} )) && continue
+        "${tmux_cmd[@]}" display-message -c "$c" "${dopt[@]}" -- "$text" </dev/null >/dev/null 2>&1
+    done
+elif (( ! toast )); then
+    # No sidebar for it: tmux's own message, exactly as before (with -d when
+    # the caller gave -t, as its old display-message -d did).
+    "${tmux_cmd[@]}" display-message "${copt[@]}" "${dopt[@]}" -- "$text" </dev/null >/dev/null 2>&1
 fi
 
 # The log, bounded.

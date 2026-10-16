@@ -199,7 +199,39 @@ count() {
     case "$n" in ''|*[!0-9]*) n=0 ;; esac
     printf '%s' "$n"
 }
-msg()         { tmux display-message "stash: $*" 2>/dev/null; }
+# Messages go through notify.sh: a toast in the agent sidebar when one is open
+# for the client, else tmux's own display-message (its header has the rest).
+# NOTIFY_SH names another (tests); beside this script it is notify.sh
+# (executable_notify.sh in the chezmoi source); with none, display-message.
+#   notify_user [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [--] TEXT
+notify_user() {
+    local n="${NOTIFY_SH:-}" d="${BASH_SOURCE[0]%/*}" c=
+    [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+    if [ -z "$n" ]; then
+        for n in "$d/notify.sh" "$d/executable_notify.sh" "$HOME/.config/tmux/scripts/notify.sh"; do
+            [ -f "$n" ] && break
+        done
+    fi
+    if [ -x "$n" ]; then "$n" "$@"
+    elif [ -f "$n" ]; then zsh -f "$n" "$@"
+    else
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -c|-k|-t) [ "$1" = -c ] && c="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+                --) shift; break ;;
+                *) break ;;
+            esac
+        done
+        ${NOTIFY_TMUX:-tmux} display-message ${c:+-c "$c"} -- "$*" 2>/dev/null
+    fi
+    return 0
+}
+# msg [-k KIND] TEXT: "stash: TEXT", to the client tmux resolves.
+msg() {
+    local k=info
+    [ "${1:-}" = -k ] && { k="$2"; shift 2; }
+    notify_user -k "$k" -- "stash: $*"
+}
 
 # Notes about what suspension decided go to a file, not over the tab bar. They
 # explain a non-event ("parked, but left the agent running because…") which is
@@ -1877,7 +1909,7 @@ resume_agent() {
     # `2.1.241` and keeps reading it briefly after the process is gone.
     pane_pid=$(tmux display-message -p -t "$pane" '#{pane_pid}' 2>/dev/null)
     if [ -z "$pane_pid" ] || pgrep -P "$pane_pid" >/dev/null 2>&1; then
-        msg "pane is busy — agent not resumed (prefix+h again once it's at a prompt)"
+        msg -k warn "pane is busy — agent not resumed (prefix+h again once it's at a prompt)"
         return 1
     fi
 
@@ -1885,7 +1917,7 @@ resume_agent() {
     # under the project dir it was recorded in, so guessing $HOME produces a
     # confusing "no such session" instead of an honest refusal.
     if [ -z "$cwd" ]; then
-        msg "no working directory recorded — resume by hand: claude --resume $sid"
+        msg -k warn "no working directory recorded — resume by hand: claude --resume $sid"
         return 1
     fi
     # Whoever owns this sid right now — normally nobody, but if we are racing a
@@ -1940,7 +1972,7 @@ resume_agent() {
         [ "$waited" -ge "$RESUME_WAIT" ] && break
         sleep 0.25; waited=$((waited + 1))
     done
-    msg "agent did not come back — its session id is still on the tab (stash.sh list)"
+    msg -k error "agent did not come back — its session id is still on the tab (stash.sh list)"
     return 1
 }
 
@@ -2072,7 +2104,7 @@ do_stash_many() {
     # Everything from here to the moves reads tmux state and then acts on it, so
     # it runs under the lock. Released before the suspends, which are slow and
     # touch only windows that are already parked.
-    lock_acquire || { msg "busy — try again"; return 0; }   # 0: see the note on the refusal below
+    lock_acquire || { msg -k warn "busy — try again"; return 0; }   # 0: see the note on the refusal below
 
     # Resolve membership UNDER the lock. These ids come from a keypress that may
     # be seconds old by now, so in between a window can have been closed, parked
@@ -2104,11 +2136,11 @@ do_stash_many() {
     if [ "${#wins[@]}" -eq 0 ]; then
         lock_release
         if [ "$busy" -eq 1 ]; then
-            msg "that agent is still working — not hiding it"
+            msg -k warn "that agent is still working — not hiding it"
         elif [ "$busy" -gt 1 ]; then
-            msg "all $busy of those agents are still working — not hiding them"
+            msg -k warn "all $busy of those agents are still working — not hiding them"
         else
-            msg "already parked"
+            msg -k warn "already parked"
         fi
         return 0
     fi
@@ -2122,11 +2154,11 @@ do_stash_many() {
     if [ "$total" -le "${#wins[@]}" ]; then
         lock_release
         if [ "${#wins[@]}" -eq 1 ]; then
-            msg "that's the only tab in this session — not parking it"
+            msg -k warn "that's the only tab in this session — not parking it"
         else
             # Refused rather than quietly parking all but one: a partial result
             # nobody asked for is worse than a clear no.
-            msg "that's every tab in this session — leave one out and try again"
+            msg -k warn "that's every tab in this session — leave one out and try again"
         fi
         # 0, NOT 1. `run-shell` displays the exit status of a failed command IN
         # THE PANE — which puts it into view-mode, so every subsequent keystroke
@@ -2169,11 +2201,11 @@ do_stash_many() {
         # tabs were deliberately left working and the third refused to move is
         # both incomplete and, in the stopped case, simply wrong.
         if [ -n "$note" ]; then
-            msg "nothing hidden: $note"
+            msg -k warn "nothing hidden: $note"
         elif [ "$busy" -gt 0 ]; then
-            msg "could not park it — and left $busy still working"
+            msg -k error "could not park it — and left $busy still working"
         else
-            msg "could not park it"
+            msg -k error "could not park it"
         fi
         return 0
     fi
@@ -2195,7 +2227,7 @@ do_stash_many() {
         [ "$busy" -gt 0 ]   && report="$report — left $busy still working"
         [ "$failed" -gt 0 ] && report="$report — could not park $failed"
         [ -n "$note" ]      && report="$report — $note"
-        msg "$report"
+        if [ "$failed" -gt 0 ]; then msg -k error "$report"; else msg -k warn "$report"; fi
     fi
 
     # Detached, and started BEFORE the suspends: describe reads the agent's
@@ -2443,8 +2475,8 @@ do_sel_send() {
     case "$sess" in "$HOLD") return 0 ;; esac
     # Its windows belong to tmux-pty-mcp, which tracks them by session.
     case "$sess" in
-        agents) do_sel_cancel; msg "agents windows belong to tmux-pty-mcp — not moving them"; return 0 ;;
-        tasks) do_sel_cancel; msg "tasks windows belong to CuaNotch — not moving them"; return 0 ;;
+        agents) do_sel_cancel; msg -k warn "agents windows belong to tmux-pty-mcp — not moving them"; return 0 ;;
+        tasks) do_sel_cancel; msg -k warn "tasks windows belong to CuaNotch — not moving them"; return 0 ;;
     esac
     ids=$(sel_ids "$sess")
     [ -n "$ids" ] || ids="$cur"
@@ -2463,7 +2495,7 @@ do_send_pick() {
     src=$(sel_sess_of "${1:-}")
     [ -n "$src" ] || { do_sel_cancel; return 0; }
 
-    command -v fzf >/dev/null 2>&1 || { do_sel_cancel; tmux display-message ${client:+-c "$client"} "stash: fzf not found"; return 0; }
+    command -v fzf >/dev/null 2>&1 || { do_sel_cancel; notify_user ${client:+-c "$client"} -k error -- "stash: fzf not found"; return 0; }
 
     # Same list and order as prefix+a (mru-session-switch.sh): most recently
     # attached first, minus the session the tabs are already in and the ones
@@ -2500,7 +2532,7 @@ do_send_pick() {
     # session a, pane b — so the session got created as a_b, every move into
     # "a.b" then failed, and the stray session was left behind.
     if ! [[ "$target" =~ ^[A-Za-z0-9_-]+$ ]]; then
-        tmux display-message ${client:+-c "$client"} "Invalid session name (allowed: A-Z a-z 0-9 _ -): $target"
+        notify_user ${client:+-c "$client"} -k warn -- "Invalid session name (allowed: A-Z a-z 0-9 _ -): $target"
         return 0
     fi
     tmux run-shell -b "'$SELF' send-many '$client' $mode '$target' $*"
@@ -2509,17 +2541,24 @@ do_send_pick() {
 do_send_many() {
     local client="$1" mode="$2" target="$3"; shift 3
     local w s src="" wins=() seen="" created=0 boot="" total
-    say() { tmux display-message ${client:+-c "$client"} "$*" 2>/dev/null; }
+    # say [-k KIND] [-t SECONDS] TEXT: to $client (a backgrounded run-shell
+    # has no client of its own), as is (no "stash: ").
+    say() {
+        local k=info t=
+        [ "${1:-}" = -k ] && { k="$2"; shift 2; }
+        [ "${1:-}" = -t ] && { t="$2"; shift 2; }
+        notify_user ${client:+-c "$client"} -k "$k" ${t:+-t "$t"} -- "$*"
+    }
 
     # The picker hides these, but a typed name bypasses the list. `agents` is
     # tmux-pty-mcp's: it owns windows there by @pty_* tags, and an untagged
     # window is exactly what its sweep and agent-restore-prune.sh delete.
     case "$target" in
-        "$HOLD")  say "that's the parking session — use H to hide tabs"; return 0 ;;
-        scratch|agents|tasks) say "$target isn't a place to put tabs"; return 0 ;;
+        "$HOLD")  say -k warn "that's the parking session — use H to hide tabs"; return 0 ;;
+        scratch|agents|tasks) say -k warn "$target isn't a place to put tabs"; return 0 ;;
     esac
 
-    lock_acquire || { say "stash: busy — try again"; return 0; }
+    lock_acquire || { say -k warn "stash: busy — try again"; return 0; }
 
     # Re-resolve under the lock: the picker may have sat open a while, and in
     # the meantime a tab can have closed, been parked, or moved elsewhere.
@@ -2533,8 +2572,8 @@ do_send_many() {
         seen="$seen $w"; wins+=("$w")
     done
 
-    if [ "${#wins[@]}" -eq 0 ]; then lock_release; say "nothing to move"; return 0; fi
-    if [ "$src" = "$target" ]; then lock_release; say "already in $target"; return 0; fi
+    if [ "${#wins[@]}" -eq 0 ]; then lock_release; say -k warn "nothing to move"; return 0; fi
+    if [ "$src" = "$target" ]; then lock_release; say -k warn "already in $target"; return 0; fi
 
     total=$(tmux list-windows -t "=$src" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ')
     case "$total" in ''|*[!0-9]*) total=0 ;; esac
@@ -2543,7 +2582,7 @@ do_send_many() {
     # staying behind would mean staying in a session that no longer exists.
     if [ "$mode" = stay ] && [ "$total" -le "${#wins[@]}" ]; then
         lock_release
-        say "that's every tab in $src — leave one behind, or ⏎ to follow them"
+        say -k warn "that's every tab in $src — leave one behind, or ⏎ to follow them"
         return 0
     fi
     # ...and following only saves THIS client. Another terminal on the same
@@ -2551,7 +2590,7 @@ do_send_many() {
     if [ "$total" -le "${#wins[@]}" ] &&
        [ "$(tmux display-message -p -t "=$src:" '#{session_attached}' 2>/dev/null)" -gt 1 ] 2>/dev/null; then
         lock_release
-        say "$src is open in another terminal — leave one tab behind"
+        say -k warn "$src is open in another terminal — leave one tab behind"
         return 0
     fi
 
@@ -2560,7 +2599,7 @@ do_send_many() {
     # same reason — only ever kill the window THIS call created).
     if ! tmux has-session -t "=$target" 2>/dev/null; then
         boot=$(tmux new-session -d -s "$target" -c "$HOME" -P -F '#{window_id}' 2>/dev/null) || boot=""
-        [ -n "$boot" ] || { lock_release; say "could not create session $target"; return 0; }
+        [ -n "$boot" ] || { lock_release; say -k error "could not create session $target"; return 0; }
         created=1
     fi
 
@@ -2617,7 +2656,7 @@ do_send_many() {
         [ "$switched" = 1 ] && tmux switch-client ${client:+-c "$client"} -t "=$src" 2>/dev/null
         [ "$created" = 1 ] && tmux kill-session -t "=$target" 2>/dev/null
         lock_release
-        say "could not move them"
+        say -k error "could not move them"
         return 0
     fi
     # Callers renumber, then publish (see renumber()): windows carrying a
@@ -2638,9 +2677,9 @@ do_send_many() {
     if [ "$failed" -gt 0 ] || [ -n "$note" ]; then
         [ "$failed" -gt 0 ] && report="$report — could not move $failed"
         [ -n "$note" ]      && report="$report — $note"
-        say "$report"
+        if [ "$failed" -gt 0 ]; then say -k error "$report"; else say -k warn "$report"; fi
     elif [ "$mode" = stay ]; then
-        tmux display-message ${client:+-c "$client"} -d 1500 "$report" 2>/dev/null
+        say -k ok -t 1.5 "$report"
     fi
 }
 
@@ -2673,7 +2712,7 @@ do_unstash() {
             tmux run-shell -b "'$SELF' resume '$p'"
             return 0
         fi
-        msg "nothing is parked"
+        msg -k warn "nothing is parked"
         return 0
     fi
 
@@ -2709,9 +2748,9 @@ do_unstash_many() {
     if [ "${1:-}" = "-c" ]; then client="${2:-}"; shift 2; fi
     local w win origin origins=() ordered=() wanted=" $* "
 
-    hold_exists || { msg "nothing is parked"; return 0; }
+    hold_exists || { msg -k warn "nothing is parked"; return 0; }
 
-    lock_acquire || { msg "busy — try again"; return 0; }   # 0: see the note on the refusal below
+    lock_acquire || { msg -k warn "busy — try again"; return 0; }   # 0: see the note on the refusal below
 
     # Re-resolve under the lock. Picking "the only parked window" before taking
     # it meant two unstashes could select the same window, and the second
@@ -2731,7 +2770,7 @@ do_unstash_many() {
 
     if [ "${#ordered[@]}" -eq 0 ]; then
         lock_release
-        msg "nothing is parked"
+        msg -k warn "nothing is parked"
         return 0
     fi
 
@@ -2790,7 +2829,7 @@ do_unstash_many() {
     done
 
     if [ "${#restored[@]}" -eq 0 ]; then
-        lock_release; msg "could not bring it back"; return 0
+        lock_release; msg -k error "could not bring it back"; return 0
     fi
     # Land on the first of the group, so a multi-tab restore leaves you at the
     # left end of what just came back rather than on whichever one moved last.
@@ -2807,7 +2846,7 @@ do_unstash_many() {
     renumber "$HOLD" ${origins[@]+"${origins[@]}"}
     publish
     lock_release
-    [ "$failed" -gt 0 ] && msg "brought back ${#restored[@]}, could not bring back $failed"
+    [ "$failed" -gt 0 ] && msg -k error "brought back ${#restored[@]}, could not bring back $failed"
 
     # Handed to a BACKGROUNDED run-shell, never called inline. prefix+h is a
     # foreground run-shell (it has to be — the picker needs a client to raise a
@@ -2850,8 +2889,8 @@ do_unstash_many() {
 #    already holds the pointer, so no window exists where it is nowhere.
 do_kill_many() {
     local w win sid cwd lbl pidx apid i killed=0 nsids=0
-    hold_exists || { msg "nothing is parked"; return 0; }
-    lock_acquire || { msg "busy — try again"; return 0; }
+    hold_exists || { msg -k warn "nothing is parked"; return 0; }
+    lock_acquire || { msg -k warn "busy — try again"; return 0; }
 
     local ordered=() wanted=" $* "
     while read -r w; do
@@ -2859,7 +2898,7 @@ do_kill_many() {
         case "$wanted" in *" $w "*) ordered+=("$w") ;; esac
     done < <(tmux list-windows -t "=$HOLD" -F '#{window_id}' 2>/dev/null)
     if [ "${#ordered[@]}" -eq 0 ]; then
-        lock_release; msg "nothing to kill — not parked any more"; return 0
+        lock_release; msg -k warn "nothing to kill — not parked any more"; return 0
     fi
 
     for win in "${ordered[@]}"; do
@@ -2910,12 +2949,12 @@ do_kill_many() {
     lock_release
     if [ "$killed" -gt 0 ]; then
         if [ "$nsids" -gt 0 ]; then
-            msg "killed $killed — $nsids suspended session(s) discarded, resume commands in $(basename "$LOGFILE")"
+            msg -k ok "killed $killed — $nsids suspended session(s) discarded, resume commands in $(basename "$LOGFILE")"
         else
-            msg "killed $killed"
+            msg -k ok "killed $killed"
         fi
     else
-        msg "could not kill it"
+        msg -k error "could not kill it"
     fi
 }
 

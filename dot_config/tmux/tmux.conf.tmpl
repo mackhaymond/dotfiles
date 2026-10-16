@@ -148,8 +148,10 @@ set -g @plugin 'fcsonline/tmux-thumbs'
 # opens -- the shift goes on the RUNE, not the trigger, which is the only place
 # it can go: see the C-Space note below.
 set -g @thumbs-key Space
-set -g @thumbs-command 'echo -n "{}" | pbcopy && tmux set-buffer -- "{}" && tmux display-message "copied {}"'
-set -g @thumbs-upcase-command 'open "{}" && tmux display-message "opened {}"'
+# The confirmations go through scripts/notify.sh (a sidebar toast when the
+# agent sidebar is open, else tmux's own display-message).
+set -g @thumbs-command 'echo -n "{}" | pbcopy && tmux set-buffer -- "{}" && "$HOME/.config/tmux/scripts/notify.sh" -k ok -- "copied {}"'
+set -g @thumbs-upcase-command 'open "{}" && "$HOME/.config/tmux/scripts/notify.sh" -k ok -- "opened {}"'
 
 # Same palette as WezTerm's quick_select_* colors (catppuccin-mocha): loud
 # peach-on-crust rune, quieter surface1 band under the match. The binary reads

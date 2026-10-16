@@ -70,9 +70,39 @@ CLIENT=""
 # The Rust sidebar redraws at once on this Darwin notification; posted after
 # anything it shows changes (a space closed, created or recreated, a tab moved).
 notify() { command -v notifyutil >/dev/null 2>&1 && notifyutil -p com.mackhaymond.tmux.focus >/dev/null 2>&1; return 0; }
+# Messages go through notify.sh: a toast in the agent sidebar when one is open
+# for the client, else tmux's own display-message (its header has the rest).
+# NOTIFY_SH names another (tests); beside this script it is notify.sh
+# (executable_notify.sh in the chezmoi source); with none, display-message.
+#   notify_user [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [--] TEXT
+notify_user() {
+  local n="${NOTIFY_SH:-}" d="${BASH_SOURCE[0]%/*}" c=
+  [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+  if [ -z "$n" ]; then
+    for n in "$d/notify.sh" "$d/executable_notify.sh" "$HOME/.config/tmux/scripts/notify.sh"; do
+      [ -f "$n" ] && break
+    done
+  fi
+  if [ -x "$n" ]; then "$n" "$@"
+  elif [ -f "$n" ]; then zsh -f "$n" "$@"
+  else
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -c|-k|-t) [ "$1" = -c ] && c="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+        --) shift; break ;;
+        *) break ;;
+      esac
+    done
+    ${NOTIFY_TMUX:-tmux} display-message ${c:+-c "$c"} -- "$*" 2>/dev/null
+  fi
+  return 0
+}
+# msg [-k KIND] TEXT: "space: TEXT" to CLIENT (else tmux's pick), through
+# SPACE_TMUX_BIN's tmux.
 msg() {
-  if [[ -n "$CLIENT" ]]; then t display-message -c "$CLIENT" "space: $*" 2>/dev/null
-  else t display-message "space: $*" 2>/dev/null; fi
+  local k=info
+  [[ "${1:-}" == -k ]] && { k="$2"; shift 2; }
+  NOTIFY_TMUX="${NOTIFY_TMUX:-$TMUX_BIN}" notify_user ${CLIENT:+-c "$CLIENT"} -k "$k" -- "space: $*"
 }
 
 # ── globals, registry, lock ────────────────────────────────────────────────
@@ -647,7 +677,7 @@ load_session() {
   # backstop for any other caller. Never select or create windows in agents,
   # stash, tasks, ... (status 2 = refused).
   if [[ "${out##*|}" == "1" ]]; then
-    msg "not a space (hidden session)"
+    msg -k warn "not a space (hidden session)"
     return 2
   fi
   while IFS='|' read -r id active kind la ls sp hid; do
@@ -667,10 +697,10 @@ contains() {
 
 cmd_agent() {
   local n="$1" sid="$2"
-  [[ "$n" =~ ^[1-9][0-9]*$ ]] || { msg "bad agent number '$n'"; return 1; }
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || { msg -k warn "bad agent number '$n'"; return 1; }
   load_session "$sid" || return 1
   if ((n > ${#AGENTS[@]})); then
-    msg "no agent $n here (${#AGENTS[@]} in this space)"
+    msg -k warn "no agent $n here (${#AGENTS[@]} in this space)"
     return 0
   fi
   t select-window -t "${AGENTS[n - 1]}"
@@ -678,10 +708,10 @@ cmd_agent() {
 
 cmd_shell() {
   local n="$1" sid="$2"
-  [[ "$n" =~ ^[1-9][0-9]*$ ]] || { msg "bad shell number '$n'"; return 1; }
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || { msg -k warn "bad shell number '$n'"; return 1; }
   load_session "$sid" || return 1
   if ((n > ${#SHELLS[@]})); then
-    msg "no shell $n here (${#SHELLS[@]} in this space)"
+    msg -k warn "no shell $n here (${#SHELLS[@]} in this space)"
     return 0
   fi
   t select-window -t "${SHELLS[n - 1]}"
@@ -696,7 +726,7 @@ cmd_step() {
   if [[ "$CUR_KIND" == "s" ]]; then ring=("${SHELLS[@]}") what=shells
   else ring=("${AGENTS[@]}") what=agents; fi
   local count=${#ring[@]}
-  ((count)) || { msg "no $what in this space"; return 0; }
+  ((count)) || { msg -k warn "no $what in this space"; return 0; }
   local i target=""
   for i in "${!ring[@]}"; do
     [[ "${ring[i]}" == "$CUR" ]] || continue
@@ -727,7 +757,7 @@ cmd_toggle() {
     elif ((${#AGENTS[@]})); then
       t select-window -t "${AGENTS[0]}"
     else
-      msg "no agents in this space"
+      msg -k warn "no agents in this space"
     fi
   fi
 }
@@ -736,19 +766,19 @@ cmd_toggle() {
 cmd_close() {
   local sid="$1"
   read_opts || return 1
-  [[ "$SPACES_ON" == "on" ]] || { msg "spaces are off"; return 1; }
+  [[ "$SPACES_ON" == "on" ]] || { msg -k warn "spaces are off"; return 1; }
   local info name hid
   info="$(t display-message -p -t "$sid" "#{@space_hidden}${US}#{session_name}" 2>/dev/null)"
   IFS="$US" read -r hid name <<<"$info"
-  [[ -n "$name" ]] || { msg "no such space"; return 1; }
-  if [[ "$name" == "main" ]]; then msg "main is never closed"; return 1; fi
-  if [[ "$hid" == "1" ]] || is_hidden_name "$name"; then msg "not a space (hidden session)"; return 1; fi
+  [[ -n "$name" ]] || { msg -k warn "no such space"; return 1; }
+  if [[ "$name" == "main" ]]; then msg -k warn "main is never closed"; return 1; fi
+  if [[ "$hid" == "1" ]] || is_hidden_name "$name"; then msg -k warn "not a space (hidden session)"; return 1; fi
 
   # Marked first, so no sync re-registers it or gives it a new home while its
   # tabs close; then unregistered under the lock, which is NOT held across the
   # closers (they can take many seconds, past the lock's stale age).
   t set-option -t "$sid" @space_closing 1 2>/dev/null
-  reg_lock || { t set-option -u -t "$sid" @space_closing 2>/dev/null; msg "registry busy, try again"; return 1; }
+  reg_lock || { t set-option -u -t "$sid" @space_closing 2>/dev/null; msg -k warn "registry busy, try again"; return 1; }
   reg_load
   local ri; ri="$(reg_find "$name")"
   ((ri >= 0)) && { reg_del "$ri"; reg_save; }
@@ -776,7 +806,7 @@ cmd_close() {
   fi
   t kill-session -t "$sid" 2>/dev/null
   notify
-  msg "closed $name"
+  msg -k ok "closed $name"
 }
 
 # ── move a tab to another space ────────────────────────────────────────────
@@ -790,8 +820,8 @@ cmd_move_menu() {
   local wid="$1" info sid home hid nwin
   info="$(t display-message -p -t "$wid" "#{session_id}${US}#{@space_home}${US}#{@space_hidden}${US}#{session_windows}")" || return 1
   IFS="$US" read -r sid home hid nwin <<<"$info"
-  [[ "$hid" == "1" ]] && { msg "not a space (hidden session)"; return 1; }
-  [[ "$home" == "1" ]] && { msg "home stays in its space"; return 1; }
+  [[ "$hid" == "1" ]] && { msg -k warn "not a space (hidden session)"; return 1; }
+  [[ "$home" == "1" ]] && { msg -k warn "home stays in its space"; return 1; }
   local -a args=(display-menu -T "#[align=centre] move tab to space ")
   [[ -n "$CLIENT" ]] && args+=(-c "$CLIENT")
   # "--": a disabled item starts with "-", which would read as a flag.
@@ -818,14 +848,14 @@ cmd_move_to() {
   [[ "$dst" =~ ^[0-9]+$ ]] && dst="\$$dst"
   info="$(t display-message -p -t "$wid" "#{session_id}${US}#{@space_home}${US}#{@space_hidden}${US}#{session_windows}")" || return 1
   IFS="$US" read -r sid home hid nwin <<<"$info"
-  [[ "$hid" == "1" ]] && { msg "not a space (hidden session)"; return 1; }
-  [[ "$home" == "1" ]] && { msg "home stays in its space"; return 1; }
-  ((nwin > 1)) || { msg "the last window would end this space"; return 1; }
+  [[ "$hid" == "1" ]] && { msg -k warn "not a space (hidden session)"; return 1; }
+  [[ "$home" == "1" ]] && { msg -k warn "home stays in its space"; return 1; }
+  ((nwin > 1)) || { msg -k warn "the last window would end this space"; return 1; }
   [[ "$sid" == "$dst" ]] && return 0
-  info="$(t display-message -p -t "$dst" "#{@space_hidden}${US}#{session_name}")" || { msg "no such space"; return 1; }
+  info="$(t display-message -p -t "$dst" "#{@space_hidden}${US}#{session_name}")" || { msg -k warn "no such space"; return 1; }
   IFS="$US" read -r dhid dname <<<"$info"
-  [[ "$dhid" == "1" ]] && { msg "not a space: $dname"; return 1; }
-  t move-window -d -a -s "$wid" -t "$dst:{end}" && { notify; msg "moved to $dname"; }
+  [[ "$dhid" == "1" ]] && { msg -k warn "not a space: $dname"; return 1; }
+  t move-window -d -a -s "$wid" -t "$dst:{end}" && { notify; msg -k ok "moved to $dname"; }
 }
 
 # ── new space ──────────────────────────────────────────────────────────────
@@ -867,12 +897,12 @@ open_dir() {
 
 cmd_open_dir() {
   local dir="$1" client="${2:-}" sid
-  [[ -d "$dir" ]] || { msg "not a directory: $dir"; return 1; }
+  [[ -d "$dir" ]] || { msg -k warn "not a directory: $dir"; return 1; }
   # Absolute before the reuse match and before it becomes a session_path: a
   # typed "../foo" or "." is relative to the popup's cwd, not to tmux's.
-  dir="$(cd -- "$dir" 2>/dev/null && pwd)" || { msg "cannot enter: $1"; return 1; }
-  sid="$(open_dir "$dir")" || { msg "could not open a space for $dir"; return 1; }
-  [[ -n "$sid" ]] || { msg "could not open a space for $dir"; return 1; }
+  dir="$(cd -- "$dir" 2>/dev/null && pwd)" || { msg -k error "cannot enter: $1"; return 1; }
+  sid="$(open_dir "$dir")" || { msg -k error "could not open a space for $dir"; return 1; }
+  [[ -n "$sid" ]] || { msg -k error "could not open a space for $dir"; return 1; }
   notify
   if [[ -n "$client" ]]; then t switch-client -c "$client" -t "$sid"; else t switch-client -t "$sid"; fi
 }
@@ -880,7 +910,7 @@ cmd_open_dir() {
 cmd_new_space() {
   local client="${1:-}"
   CLIENT="$client"
-  command -v fzf >/dev/null 2>&1 || { msg "fzf not found in PATH"; return 1; }
+  command -v fzf >/dev/null 2>&1 || { msg -k error "fzf not found in PATH"; return 1; }
   local pane_path list out status query selection target
   if [[ -n "$client" ]]; then pane_path="$(t display-message -c "$client" -p '#{pane_current_path}')"
   else pane_path="$(t display-message -p '#{pane_current_path}')"; fi

@@ -82,8 +82,36 @@ usage() {
     exit 2
 }
 
-# display-message takes a format: double every # so nothing expands.
-say() { tmux display-message -c "$client" "${1//\#/##}" 2>/dev/null; }
+# Messages go through notify.sh: a toast in the agent sidebar when one is open
+# for the client, else tmux's own display-message (its header has the rest).
+# NOTIFY_SH names another (tests); beside this script it is notify.sh
+# (executable_notify.sh in the chezmoi source); with none, display-message.
+#   notify_user [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [--] TEXT
+notify_user() {
+    local n="${NOTIFY_SH:-}" d="${BASH_SOURCE[0]%/*}" c=
+    [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+    if [ -z "$n" ]; then
+        for n in "$d/notify.sh" "$d/executable_notify.sh" "$HOME/.config/tmux/scripts/notify.sh"; do
+            [ -f "$n" ] && break
+        done
+    fi
+    if [ -x "$n" ]; then "$n" "$@"
+    elif [ -f "$n" ]; then zsh -f "$n" "$@"
+    else
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -c|-k|-t) [ "$1" = -c ] && c="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+                --) shift; break ;;
+                *) break ;;
+            esac
+        done
+        ${NOTIFY_TMUX:-tmux} display-message ${c:+-c "$c"} -- "$*" 2>/dev/null
+    fi
+    return 0
+}
+# The text is a format (as display-message's): double every # so nothing
+# expands.
+say() { notify_user -c "$client" -k warn -- "${1//\#/##}"; }
 
 # load [windows]: ONE tmux call. Sets act (the client's "<session>:<window>"
 # now), act_hidden, seq, state, cur, back[], fwd[]; with `windows`, also

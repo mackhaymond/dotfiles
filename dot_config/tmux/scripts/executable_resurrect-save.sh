@@ -163,9 +163,48 @@ SAVE_DIR="$RESURRECT_DIR/save/pane_contents"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >>"$LOG"; }
 
+# Messages go through notify.sh: a toast in the agent sidebar when one is open
+# for the client, else tmux's own display-message (its header has the rest).
+# NOTIFY_SH names another (tests); beside this script it is notify.sh
+# (executable_notify.sh in the chezmoi source); with none, display-message.
+#   notify_user [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [--] TEXT
+notify_user() {
+	local n="${NOTIFY_SH:-}" d="${BASH_SOURCE[0]%/*}" c=
+	[ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+	if [ -z "$n" ]; then
+		for n in "$d/notify.sh" "$d/executable_notify.sh" "$HOME/.config/tmux/scripts/notify.sh"; do
+			[ -f "$n" ] && break
+		done
+	fi
+	if [ -x "$n" ]; then "$n" "$@"
+	elif [ -f "$n" ]; then zsh -f "$n" "$@"
+	else
+		while [ $# -gt 0 ]; do
+			case "$1" in
+				-c|-k|-t) [ "$1" = -c ] && c="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+				--) shift; break ;;
+				*) break ;;
+			esac
+		done
+		if [ "$c" = '*' ]; then
+			# Every client (notify.sh's -c '*').
+			local cl
+			while IFS= read -r cl; do
+				[ -n "$cl" ] && ${NOTIFY_TMUX:-tmux} display-message -c "$cl" -- "$*" 2>/dev/null
+			done < <(${NOTIFY_TMUX:-tmux} list-clients -F '#{client_name}' 2>/dev/null)
+		else
+			${NOTIFY_TMUX:-tmux} display-message ${c:+-c "$c"} -- "$*" 2>/dev/null
+		fi
+	fi
+	return 0
+}
+
+# message [-k KIND] TEXT: 5 s, unless QUIET.
 message() {
+	local k=info
+	[ "${1:-}" = -k ] && { k="$2"; shift 2; }
 	[ "$QUIET" = 1 ] && return 0
-	tmux display-message -d 5000 "$1" 2>/dev/null || true
+	notify_user -k "$k" -t 5 -- "$1"
 }
 
 # `final`'s exit status is the kill guard's go/no-go; every other mode exits 0
@@ -257,7 +296,7 @@ if [ -n "$refused" ]; then
 	# server it lands on that server and harms nothing. One tmux call, and only
 	# on a refusal; the next successful save clears it like any stale value.
 	tmux set-option -g @resurrect_stale refused \; refresh-client -S >/dev/null 2>&1 || true
-	message "Tmux save refused: not the default server ($refused)"
+	message -k warn "Tmux save refused: not the default server ($refused)"
 	[ "$FINAL" = 1 ] && exit 2
 	exit 0
 fi
@@ -272,7 +311,7 @@ if [ "$AUTO" = 1 ]; then
 	fresh "$START_TIME" "$GRACE" && exit 0
 	fresh "$RESTORING" "$RESTORE_MAX_SECONDS" && exit 0
 elif [ "$FINAL" = 0 ] && fresh "$RESTORING" "$RESTORE_MAX_SECONDS"; then
-	message "Tmux save refused: a restore is in progress"
+	message -k warn "Tmux save refused: a restore is in progress"
 	exit 0
 fi
 [ -d "$RESURRECT_DIR" ] || mkdir -p "$RESURRECT_DIR"
@@ -301,7 +340,7 @@ if ! take_lock; then
 		LIVE="$(tmux list-panes -a -F "$FP_FORMAT" 2>/dev/null)"
 		NOW="${EPOCHSECONDS:-$(date +%s)}"
 	else
-		message "Tmux save already running"
+		message -k warn "Tmux save already running"
 		exit 0
 	fi
 fi
@@ -390,7 +429,7 @@ ps -axo ppid=,pid=,args= >"$PS_SNAP" 2>/dev/null
 if [ ! -s "$PANES" ]; then
 	log "no panes listed — tmux unreachable? nothing saved"
 	cleanup_tmp
-	message "Tmux save failed: no panes"
+	message -k error "Tmux save failed: no panes"
 	exit 1
 fi
 
@@ -508,12 +547,12 @@ if ! grep -q '^pane' "$TMP"; then
 		log "saved 0 panes in $(awk -v s="$START" -v e="$EPOCHREALTIME" 'BEGIN { printf "%.2f", e - s }')s (nothing to save; kept last)"
 		exit 0
 	fi
-	message "Tmux save skipped: nothing to save"
+	message -k warn "Tmux save skipped: nothing to save"
 	fail 1 "save produced no pane rows (all sessions excluded?) — keeping last"
 fi
 if ! mv -f "$TMP" "$FILE"; then
 	cleanup_tmp
-	message "Tmux save failed: could not write the snapshot"
+	message -k error "Tmux save failed: could not write the snapshot"
 	fail 5 "could not write $FILE — nothing linked, \`last\` untouched, no hooks run"
 fi
 
@@ -587,7 +626,7 @@ if [ -n "$held" ]; then
 	cleanup_tmp
 	elapsed="$(awk -v s="$START" -v e="$EPOCHREALTIME" 'BEGIN { printf "%.2f", e - s }')"
 	log "saved $(grep -c '^pane' "$FILE" 2>/dev/null || echo '?') panes in ${elapsed}s (kept last on ${held_on} (${held}); evidence ${FILE##*/})"
-	message "Tmux save held back: kept the last good save (${held})"
+	message -k warn "Tmux save held back: kept the last good save (${held})"
 	# Tell Mack ONCE per server (server options die with it) that autosave is
 	# holding the pre-crash layout for him: otherwise the only sign is a
 	# stale-save chip an hour later. The chip cannot say it — any value but
@@ -596,12 +635,12 @@ if [ -n "$held" ]; then
 	case "$held" in "replacement server never restored"*)
 		if [ -z "$NOTICED" ]; then
 			notice="tmux: this server started after the last good save and was never restored; autosave keeps that layout. prefix C-r restores it."
-			targets=(set-option -g @resurrect_replacement_noticed "$NOW")
-			while IFS= read -r c; do
-				[ -n "$c" ] && targets+=(";" display-message -c "$c" -d 10000 "$notice")
-			done < <(tmux list-clients -F '#{client_name}' 2>/dev/null)
-			tmux "${targets[@]}" >/dev/null 2>&1
-			log "notice: replacement server never restored; told $(((${#targets[@]} - 4) / 7)) client(s)"
+			tmux set-option -g @resurrect_replacement_noticed "$NOW" >/dev/null 2>&1
+			# One call for every client (`-c '*'`): one toast exists at a
+			# time, so a toast per client would leave only the last one.
+			told=$(tmux list-clients -F x 2>/dev/null | grep -c x)
+			notify_user -c '*' -k warn -t 10 -- "$notice" </dev/null
+			log "notice: replacement server never restored; told $told client(s)"
 		fi
 		;;
 	esac
@@ -729,8 +768,8 @@ if [ "$FINAL" = 1 ]; then
 fi
 
 if [ "$hook_rc" -ne 0 ]; then
-	message "Tmux saved, but a post-save hook failed (see $LOG)"
+	message -k error "Tmux saved, but a post-save hook failed (see $LOG)"
 else
-	message "Tmux environment saved! (${elapsed}s)"
+	message -k ok "Tmux environment saved! (${elapsed}s)"
 fi
 exit 0

@@ -163,6 +163,14 @@ class NotifyTests(unittest.TestCase):
         self.assertIsNone(self.toast())
         self.assertEqual(self.notices_posted(wait=0.3), [])
 
+    def test_an_explicit_duration_carries_to_display_message(self):
+        """Callers that used `display-message -d` pass -t: with no sidebar the
+        message still shows that long; without -t, display-time as before."""
+        self.assertEqual(self.notify("-t", "1.5", "short")[-1], ["display-message", "-d", "1500", "--", "short"])
+        self.assertEqual(self.notify("-k", "error", "-t", "10", "x")[-1], ["display-message", "-d", "10000", "--", "x"])
+        for junk in ("0", "junk"):
+            self.assertEqual(self.notify("-t", junk, "y")[-1], ["display-message", "--", "y"])
+
     def test_open_sidebar_without_a_client_toasts_everywhere(self):
         self.open_sidebar()
         before = int(time.time() * 1000)
@@ -207,6 +215,25 @@ class NotifyTests(unittest.TestCase):
         while not self.said(tty, "for you"):
             self.assertLess(time.time(), t)
             time.sleep(0.02)
+
+    def test_every_client_one_toast_and_a_message_where_no_sidebar(self):
+        """-c '*': one toast for every live sidebar (a toast per client would
+        leave only the last), tmux's own message on each client without
+        one; with no live sidebar, a message on every client."""
+        tty = self.attach("work")
+        other = self.attach("zeta")
+        self.open_sidebar(f"{tty}")
+        calls = self.notify("-c", "*", "-k", "warn", "-t", "10", "server notice")
+        seq, _, kind, ttl, client, text = self.toast()
+        self.assertEqual((kind, ttl, client, text), ("warn", "10", "", "server notice"))
+        self.assertEqual([c for c in calls if c[0] == "display-message" and "-p" not in c],
+                         [["display-message", "-c", other, "-d", "10000", "--", "server notice"]])
+        self.tmux("set-option", "-gu", "@toast")
+        self.open_sidebar(f"{tty}", pids=[self.dead_pid()])
+        calls = self.notify("-c", "*", "all of you")
+        self.assertIsNone(self.toast())
+        said = sorted(c[2] for c in calls if c[0] == "display-message" and "-p" not in c)
+        self.assertEqual(said, sorted([tty, other]))
 
     def test_a_crashed_sidebar_is_never_toasted(self):
         """A SIGKILLed sidebar stays listed until a repair: its pid is dead,

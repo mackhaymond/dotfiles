@@ -36,6 +36,7 @@ CONF = HERE / "tmux.conf.tmpl"
 SPACES = HERE / "spaces.conf"
 SCRIPT = HERE / "scripts" / "executable_space.sh"
 DASH = HERE / "scripts" / "executable_space-dash.sh"
+NOTIFY = HERE / "scripts" / "executable_notify.sh"
 ROSTER = HERE / "scripts" / "executable_agent-roster.py"
 WEZTERM = HERE.parent / "wezterm" / "wezterm.lua.tmpl"
 TMUX = shutil.which("tmux")
@@ -172,7 +173,8 @@ class Server(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
         self.env["TERM"] = "xterm-256color"
-        self.env["XDG_STATE_HOME"] = os.path.join(self.tmp, "state")
+        self.env["XDG_STATE_HOME"] = os.path.join(self.tmp, "state")   # notify.sh's log too
+        self.env["AGENT_FOCUS_NOTICE"] = ""                             # notify.sh posts nothing
         self.home_dir = os.path.realpath(self.tmp)
         self.registry = os.path.join(self.tmp, "spaces.tsv")
         self.path = None
@@ -191,6 +193,7 @@ class Server(unittest.TestCase):
         self.t("set", "-g", "@space_sh", f"bash {SCRIPT}")
         self.t("set", "-g", "@space_dash", f"bash {DASH}")
         self.t("set", "-g", "@space_agent_ui", os.path.join(self.tmp, "no-agent-ui"))   # never the real one
+        self.t("set", "-g", "@notify_sh", f"zsh -f {NOTIFY}")                          # the source copy
         self.t("set", "-g", "@space_registry", self.registry)
         self.t("set", "-g", "@space_closer", "none")
         self.t("set", "-g", "@spaces", self.flag)
@@ -1125,6 +1128,11 @@ class Spaces(Server):
         self.chord("CTRL", 1); self.wait(lambda: self.on("#{session_name}"), "main")
         self.chord("CTRL", 7); time.sleep(0.3)                          # no space 7: stays
         self.assertEqual(self.on("#{session_name}"), "main")
+        # ...and says so through notify.sh, to this client (its log line:
+        # epoch, kind, client, text).
+        log = os.path.join(self.env["XDG_STATE_HOME"], "tmux-notify", "log")
+        said = lambda: [l.split("\t")[1:] for l in Path(log).read_text().splitlines()] if os.path.exists(log) else []
+        self.wait(lambda: ["warn", self.client, "no space 7"] in said(), True)
         self.t("copy-mode", "-t", self.M1)                              # also from copy mode
         self.wait(lambda: self.on("#{pane_in_mode}"), "1")
         self.chord("CTRL", 3); self.wait(lambda: self.on("#{session_name}"), "zed")

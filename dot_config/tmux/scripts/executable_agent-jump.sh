@@ -137,17 +137,56 @@ EXCLUDE=" agents tasks stash scratch btop-popup "
 mode="${1:-}"
 tty="${2:-}"
 
-# say_strict (set by `jump`): only ever on <tty>. The untargeted fallback
-# would land on whichever client tmux picks, which for an outside caller
-# (CuaNotch) is nobody in particular; a client that is gone hears nothing.
+# Messages go through notify.sh: a toast in the agent sidebar when one is open
+# for the client, else tmux's own display-message (its header has the rest).
+# NOTIFY_SH names another (tests); beside this script it is notify.sh
+# (executable_notify.sh in the chezmoi source); with none, display-message.
+#   notify_user [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [--] TEXT
+notify_user() {
+    local n="${NOTIFY_SH:-}" d="${BASH_SOURCE[0]%/*}" c=
+    [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+    if [ -z "$n" ]; then
+        for n in "$d/notify.sh" "$d/executable_notify.sh" "$HOME/.config/tmux/scripts/notify.sh"; do
+            [ -f "$n" ] && break
+        done
+    fi
+    if [ -x "$n" ]; then "$n" "$@"
+    elif [ -f "$n" ]; then zsh -f "$n" "$@"
+    else
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -c|-k|-t) [ "$1" = -c ] && c="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+                --) shift; break ;;
+                *) break ;;
+            esac
+        done
+        ${NOTIFY_TMUX:-tmux} display-message ${c:+-c "$c"} -- "$*" 2>/dev/null
+    fi
+    return 0
+}
+
+# say [-k KIND] TEXT: on <tty> while it is attached (tty_ok, from
+# client_info). A <tty> that is not attached gets the untargeted fallback
+# instead, unless say_strict (set by `jump`): that fallback would land on
+# whichever client tmux picks, which for an outside caller (CuaNotch) is
+# nobody in particular; a client that is gone hears nothing. (notify.sh never
+# fails, so whether <tty> is attached is asked up front, not read off a
+# failed display-message as before.)
 say_strict=
+tty_ok=
 say() {
+    local k=info
+    [ "${1:-}" = -k ] && { k="$2"; shift 2; }
     local m="${1//\#/##}"
     if [ -n "$tty" ]; then
-        tmux display-message -c "$tty" "$m" 2>/dev/null ||
-            { [ -n "$say_strict" ] || tmux display-message "$m" 2>/dev/null; }
+        [ -n "$tty_ok" ] || client_info || :
+        if [ "$tty_ok" = 1 ]; then
+            notify_user -c "$tty" -k "$k" -- "$m"
+        elif [ -z "$say_strict" ]; then
+            notify_user -k "$k" -- "$m"
+        fi
     else
-        tmux display-message "$m" 2>/dev/null
+        notify_user -k "$k" -- "$m"
     fi
 }
 
@@ -173,13 +212,16 @@ list_needs() {
     cut -f5-
 }
 
-# Sets cur_sess / cur_win for $tty. Fails if that client is not attached.
+# Sets cur_sess / cur_win for $tty, and tty_ok (1 attached, else 0). Fails if
+# that client is not attached.
 client_info() {
     local line
+    tty_ok=0
     [ -n "$tty" ] || return 1
     line=$(tmux list-clients -F "#{client_tty}${US}#{session_name}${US}#{window_id}" 2>/dev/null |
            awk -F "$US" -v t="$tty" '$1 == t { print; exit }')
     [ -n "$line" ] || return 1
+    tty_ok=1
     IFS="$US" read -r _ cur_sess cur_win <<<"$line"
 }
 
@@ -216,9 +258,9 @@ go_to() {
 
 refused() {
     if [ "$go_sess" = stash ]; then
-        say "that tab was parked · prefix h brings it back"
+        say -k warn "that tab was parked · prefix h brings it back"
     else
-        say "that tab is in $go_sess · jumps skip that session"
+        say -k warn "that tab is in $go_sess · jumps skip that session"
     fi
 }
 
@@ -243,7 +285,7 @@ step() {
     [ "$rc" -eq 2 ] && { refused; return 4; }
     if [ "$rc" -ne 0 ]; then
         client_info || return 5                # the switch failed because the client left
-        say "agent-jump: $where is gone"
+        say -k warn "agent-jump: $where is gone"
         return 3
     fi
     return 0                                   # landed: says nothing (SILENT SUCCESS)
@@ -255,7 +297,7 @@ case "$mode" in
         ;;
 
     next)
-        client_info || { say "agent-jump: client $tty is not attached"; exit 0; }
+        client_info || { say -k warn "agent-jump: client $tty is not attached"; exit 0; }
         queue=$(list_needs | awk -F '\t' -v c="$cur_win" '$1 != c')
         if [ -z "$queue" ]; then
             say "nothing needs you"
@@ -310,29 +352,29 @@ case "$mode" in
                 exit 4
                 ;;
             left)
-                say "agent-jump: $win has left $sess · pick it again"
+                say -k warn "agent-jump: $win has left $sess · pick it again"
                 exit 3
                 ;;
             *)
-                say "agent-jump: window $win is gone"
+                say -k warn "agent-jump: window $win is gone"
                 exit 3
                 ;;
         esac
         ;;
 
     back)
-        client_info || { say "agent-jump: client $tty is not attached"; exit 0; }
+        client_info || { say -k warn "agent-jump: client $tty is not attached"; exit 0; }
         key=$(chain_key)
         chain=$(tmux show-options -gqv "$key" 2>/dev/null)
         if [ -z "$chain" ] || [ "${chain##* }" != "$cur_win" ]; then
-            say "nothing to go back to"
+            say -k warn "nothing to go back to"
             exit 0
         fi
         origin="${chain%% *}"
         tmux set-option -gu "$key" 2>/dev/null          # chain is spent either way
         go_to "$origin"; rc=$?
         [ "$rc" -eq 2 ] && { refused; exit 0; }
-        [ "$rc" -eq 0 ] || { say "the window you jumped from is gone"; exit 0; }
+        [ "$rc" -eq 0 ] || { say -k warn "the window you jumped from is gone"; exit 0; }
         ;;
 
     goto)
@@ -340,16 +382,16 @@ case "$mode" in
         # here; this guard only keeps a stray goto out of EXCLUDE sessions.
         win="${3:-}"
         sess="${4:-}"
-        [ -n "$win" ] || { say "agent-jump: goto needs a window"; exit 0; }
-        client_info || { say "agent-jump: client $tty is not attached"; exit 0; }
+        [ -n "$win" ] || { say -k error "agent-jump: goto needs a window"; exit 0; }
+        client_info || { say -k warn "agent-jump: client $tty is not attached"; exit 0; }
         if [ -n "$sess" ] && ! tmux list-windows -a -F "#{window_id}${US}#{session_name}" 2>/dev/null |
                 GOTO_SESS="$sess" awk -F "$US" -v w="$win" '$1 == w && $2 == ENVIRON["GOTO_SESS"] { f = 1 } END { exit !f }'; then
-            say "agent-jump: $win has left $sess · pick it again"
+            say -k warn "agent-jump: $win has left $sess · pick it again"
             exit 0
         fi
         go_to "$win" "$sess"; rc=$?
         if [ "$rc" -eq 2 ]; then refused
-        elif [ "$rc" -ne 0 ]; then say "agent-jump: window $win is gone"
+        elif [ "$rc" -ne 0 ]; then say -k warn "agent-jump: window $win is gone"
         fi
         ;;
 

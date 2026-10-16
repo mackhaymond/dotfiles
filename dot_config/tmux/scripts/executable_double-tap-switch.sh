@@ -18,13 +18,44 @@ client="$(tmux list-clients -F '#{client_activity} #{client_flags} #{client_name
   sort -k1,1nr -k2,2nr | head -1 | cut -d' ' -f3-)"
 [[ -n "$client" ]] || exit 0
 
-# display-message: -t <client> resolves formats against that client's session,
-# -c <client> shows the message on that client.
+# Messages go through notify.sh: a toast in the agent sidebar when one is open
+# for the client, else tmux's own display-message (its header has the rest).
+# NOTIFY_SH names another (tests); beside this script it is notify.sh
+# (executable_notify.sh in the chezmoi source); with none, display-message.
+#   notify_user [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [--] TEXT
+notify_user() {
+  local n="${NOTIFY_SH:-}" d="${BASH_SOURCE[0]%/*}" c=
+  [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+  if [ -z "$n" ]; then
+    for n in "$d/notify.sh" "$d/executable_notify.sh" "$HOME/.config/tmux/scripts/notify.sh"; do
+      [ -f "$n" ] && break
+    done
+  fi
+  if [ -x "$n" ]; then "$n" "$@"
+  elif [ -f "$n" ]; then zsh -f "$n" "$@"
+  else
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -c|-k|-t) [ "$1" = -c ] && c="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+        --) shift; break ;;
+        *) break ;;
+      esac
+    done
+    ${NOTIFY_TMUX:-tmux} display-message ${c:+-c "$c"} -- "$*" 2>/dev/null
+  fi
+  return 0
+}
+# A UTF-8 locale for it: in Karabiner's bare env tmux would print notify.sh's
+# separator byte as `_` and it could never find the client's sidebar.
+say() { LC_ALL= LC_CTYPE=en_US.UTF-8 notify_user -c "$client" -k warn -- "$1"; }
+
+# display-message: -t <client> resolves formats against that client's session;
+# say's -c <client> shows the message on that client.
 case "$(tmux show -gv @double_tap_target 2>/dev/null)" in
   window)
     session="$(tmux display-message -t "$client" -p '#{session_id}')"
     tmux last-window -t "$session" 2>/dev/null ||
-      tmux display-message -c "$client" "No previous window"
+      say "No previous window"
     ;;
   *)
     current="$(tmux display-message -t "$client" -p '#S')"
@@ -38,7 +69,7 @@ case "$(tmux show -gv @double_tap_target 2>/dev/null)" in
     if [[ -n "$target" ]]; then
       tmux switch-client -c "$client" -t "=$target"
     else
-      tmux display-message -c "$client" "No other session"
+      say "No other session"
     fi
     ;;
 esac

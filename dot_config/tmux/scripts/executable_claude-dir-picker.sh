@@ -33,10 +33,38 @@ if [[ "${1:-}" == "--preview" ]]; then
   exit 0
 fi
 
+# Messages go through notify.sh: a toast in the agent sidebar when one is open
+# for the client, else tmux's own display-message (its header has the rest).
+# NOTIFY_SH names another (tests); beside this script it is notify.sh
+# (executable_notify.sh in the chezmoi source); with none, display-message.
+#   notify_user [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [--] TEXT
+notify_user() {
+  local n="${NOTIFY_SH:-}" d="${BASH_SOURCE[0]%/*}" c=
+  [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+  if [ -z "$n" ]; then
+    for n in "$d/notify.sh" "$d/executable_notify.sh" "$HOME/.config/tmux/scripts/notify.sh"; do
+      [ -f "$n" ] && break
+    done
+  fi
+  if [ -x "$n" ]; then "$n" "$@"
+  elif [ -f "$n" ]; then zsh -f "$n" "$@"
+  else
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -c|-k|-t) [ "$1" = -c ] && c="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+        --) shift; break ;;
+        *) break ;;
+      esac
+    done
+    ${NOTIFY_TMUX:-tmux} display-message ${c:+-c "$c"} -- "$*" 2>/dev/null
+  fi
+  return 0
+}
+
 # stderr is thrown away with the popup, so anything worth seeing goes to the
-# status line of the session underneath it.
+# client underneath it (notify.sh: its sidebar, else its status line).
 die() {
-  tmux display-message "claude-dir-picker: $*"
+  notify_user -k error -- "claude-dir-picker: $*"
   exit 1
 }
 
