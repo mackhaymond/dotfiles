@@ -52,9 +52,10 @@ def conf_line(prefix):
 
 # tmux.conf lines spaces.conf rebinds when on and restores verbatim when off.
 TODAY_BINDS = [conf_line(p) for p in ("bind c ", "bind C-t ", "bind k ", "bind C-k ", "bind x ", "bind C-l ")]
-# The session picker: tmux.conf binds it on every load, spaces.conf unbinds it
-# when on and leaves it alone when off (prefix r re-runs tmux.conf first).
-PICKER_BINDS = [conf_line(p) for p in ("bind-key a ", "bind-key C-a ")]
+# The session picker and the Option-W menu: tmux.conf binds them on every
+# load; spaces.conf unbinds the picker / gives M-w to the agent leader when on,
+# and leaves them alone when off (prefix r re-runs tmux.conf first).
+PICKER_BINDS = [conf_line(p) for p in ("bind-key a ", "bind-key C-a ", "bind-key -n M-w ")]
 
 
 def else_branch():
@@ -110,7 +111,10 @@ class ConfigShape(unittest.TestCase):
         user = {f"User{i}" for i in range(27)}
         on = set(re.findall(r"^bind -n (\S+)", on_branch(), re.M)) - {"MouseDown1Status"}
         off = set(re.findall(r"^unbind -q -n (\S+)", else_branch(), re.M))
-        self.assertEqual(on - user, off)
+        # M-w: tmux.conf's menu comes back on reload (PICKER_BINDS). M-f: the
+        # leader's first key, unbound in both modes so a reload drops it.
+        self.assertEqual(on - user - {"M-w"}, off - {"M-f"})
+        self.assertNotIn("M-f", on)
         # The WezTerm chords are bound in both branches (off: the old thing).
         self.assertEqual(on & user, user)
         self.assertEqual(set(re.findall(r"^bind -n (User\d+) ", else_branch(), re.M)), user)
@@ -398,6 +402,7 @@ class FlagOff(Server):
 
     def test_off_has_no_jump_key_and_keeps_the_status_line(self):
         self.assertEqual(self.t("list-keys", "-T", "root", "M-f", check=False), "")
+        self.assertNotIn("jump", self.t("list-keys", "-T", "root", "M-w", check=False))
         self.assertEqual(self.t("list-keys", "-T", "jump", check=False), "")
         self.t("set", "-g", "@sidebar_open", "1")
         self.source()
@@ -699,7 +704,7 @@ class Spaces(Server):
         self.assertIn("3 agents · 1 shell · 1 parked", text)
         self.assertIn("◐ ⌘1", text)                                    # running
         self.assertIn("○ ⌘3", text)                                    # idle
-        self.assertIn("⌥F jump", text)
+        self.assertIn("⌥W jump", text)
 
     def test_dashboard_never_takes_the_focus(self):
         d = self.dash("main")
@@ -862,42 +867,43 @@ class Spaces(Server):
         self.wait(calls, ["sidebar --repair"] * 2)                        # client-attached[21]
         self.wait(lambda: self.t("show", "-gv", "@sidebar_open"), "0")
 
-    # -- Option-F: jump to an agent by its letter -------------------------------
+    # -- Option-W: jump to an agent by its letter -------------------------------
     def table(self):
         return self.on("#{client_key_table}")
 
-    def test_option_f_jumps_to_the_agent_with_that_letter_in_any_space(self):
+    def test_option_w_jumps_to_the_agent_with_that_letter_in_any_space(self):
         self.t("set", "-w", "-t", self.P2, "@agent_key", "p")
         self.t("set", "-w", "-t", self.M5, "@agent_key", "m")
         hid = self.t("list-windows", "-t", "agents", "-F", "#{window_id}").split()[0]
         self.t("set", "-w", "-t", hid, "@agent_key", "h")               # in a hidden session: never
-        self.key("M-f")
+        self.assertEqual(self.t("list-keys", "-T", "root", "M-f", check=False), "")  # back to the pane
+        self.key("M-w")
         self.wait(self.table, "jump")
         self.key("p")
         self.wait(self.on, f"proj:{self.P2}")                            # across spaces
         self.assertEqual(self.table(), "root")
-        self.key("M-f", "m")
+        self.key("M-w", "m")
         self.wait(self.on, f"main:{self.M5}")
         here = self.on()
         for k in ("h", "z"):                                             # hidden, unknown: stays
-            self.key("M-f", k)
+            self.key("M-w", k)
             time.sleep(0.3)
             self.assertEqual(self.on(), here)
             self.assertEqual(self.table(), "root")
 
-    def test_option_f_escape_or_another_key_cancels_and_is_swallowed(self):
+    def test_option_w_escape_or_another_key_cancels_and_is_swallowed(self):
         w = self.new_window("main", path=self.env["HOME"])
         self.t("respawn-pane", "-k", "-t", w, "cat -v")
         self.t("select-window", "-t", w)
         self.wait(lambda: self.on("#{window_id}"), w)
         self.t("set", "-w", "-t", self.M5, "@agent_key", "m")
-        self.key("M-f")
+        self.key("M-w")
         self.wait(self.table, "jump")
         self.key("Escape")
         self.wait(self.table, "root")
-        self.key("M-f", "5")                                             # not a letter: cancels
+        self.key("M-w", "5")                                             # not a letter: cancels
         self.wait(self.table, "root")
-        self.key("M-f", "M")                                             # uppercase: cancels
+        self.key("M-w", "M")                                             # uppercase: cancels
         self.wait(self.table, "root")
         self.key("m")                                                    # jump mode is over: typed
         self.wait(lambda: "m" in self.t("capture-pane", "-p", "-t", w), True)

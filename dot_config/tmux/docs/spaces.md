@@ -53,7 +53,7 @@ the focus off a dashboard. A home made while on stays a home when the flag
 goes off (an ordinary shell then, closable with prefix x, still respawning if
 its shell exits; its dashboard likewise). With the flag off, sync makes no
 homes or dashboards and writes no registry. `status` is always on, and there
-is no M-f / `jump` table.
+is no `jump` table (M-w is tmux.conf's ⌥W menu again).
 
 ## Hidden sessions
 
@@ -114,7 +114,7 @@ focused pane and keeps Option-1.
   ◉ ⌘2 d  tmux/home dashboard  Allow Bash(notifyutil -p ...)?
   ✓ ⌘3 f  tmux/resurrect guard  Everything is live on your server
   ○ ⌘4    tmux/Canvas syllabus
-  ⌥1 home · ⌥2-9 shells · ⌘1-9 agents · ⌥` agent↔shell · ⌥F jump · ⌥N new space · prefix Q close
+  ⌥1 home · ⌥2-9 shells · ⌘1-9 agents · ⌥` agent↔shell · ⌥W jump · ⌥N new space · prefix Q close
 ```
 
 Idle cost, measured on a test server over 60 s: 0.00-0.02 s of CPU (under
@@ -128,7 +128,7 @@ narrow), in the space's colour; its ⌃N key and folder; git branch, dirty
 count (`±N`, or `clean`) and ahead/behind; the agent / shell / parked counts
 (parked = windows in `stash` whose `@stash_origin` is this space); one line
 per agent, by ordinal (⌘N), with its state shape (✕ ◉ ✓ ◐ ○, colours as the
-roster), its ⌥F letter (`@agent_key`), its summary and detail (as many as
+roster), its ⌥W letter (`@agent_key`), its summary and detail (as many as
 fit, then `+N more`); a key hint.
 
 - **Redraws** on `com.mackhaymond.tmux.agent-state` and
@@ -311,7 +311,7 @@ a key table, so the sidebar re-reads `#{client_key_table}` after the next key.
 | ⌥M | M-m | move this tab to another space: a menu of the spaces (number = key); the tab goes to the end of that space, you stay here. Not home, not from a hidden session |
 | ⌥N | M-n | new space: zoxide/fzf folder picker (as `prefix K`), then reuse the session already on that folder, else `new-session -d -s <basename> -c <dir>`; switch to it. `~` → main |
 | ⌥V | M-v | sidebar scope, this space ↔ all spaces (posts `com.mackhaymond.tmux.focus` so the Rust sidebar redraws at once) |
-| ⌥F *letter* | M-f, then key table `jump` | the agent whose window option `@agent_key` is that letter, in any space (`switch-client -t '$S:@W'`, one step); hidden sessions never. Escape, or any other key (`Any`), cancels and is swallowed. Entering and leaving post `com.mackhaymond.tmux.focus` so the sidebar can show "jump mode" (`#{client_key_table}` = `jump`). The sidebar assigns the letters; this only reads them. No fork: an `S:`/`W:` loop, `#{s/ .*//:}` keeps the first match, the letter rides in the global `@space_jump_key` |
+| ⌥W *letter* | M-w, then key table `jump` | the agent whose window option `@agent_key` is that letter, in any space (`switch-client -t '$S:@W'`, one step); hidden sessions never. Escape, or any other key (`Any`), cancels and is swallowed. Entering and leaving post `com.mackhaymond.tmux.focus` so the sidebar can show "jump mode" (`#{client_key_table}` = `jump`). The sidebar assigns the letters; this only reads them. No fork: an `S:`/`W:` loop, `#{s/ .*//:}` keeps the first match, the letter rides in the global `@space_jump_key` |
 | — | prefix Q | close this space: `confirm-before` "close space bai: 2 agents, 1 shell? (y/n)", then `space.sh close`: it is marked `@space_closing` (no sync re-registers it or rebuilds its home meanwhile) and unregistered, clients on it move to main (detach-on-destroy would close them), every pane goes through `closed-tabs.sh close` (snapshot + agent session id, so CMD+Z can bring each back; `@space_closer` overrides, `none` skips), the session is killed and unregistered. Never main, never a hidden session |
 | CMD+W, CMD+SHIFT+W | prefix x, C-l | as tmux.conf, except on home (refuse) |
 | — | c, C-t, k, C-k | in a project space (path ≠ `~`, not hidden) the new tab starts in the space folder; elsewhere unchanged |
@@ -352,12 +352,13 @@ id is still a shell/agent of the session before using it.
 Claude Code binds `meta+j` to `app:toggleTerminal` (Global). ⌥H/⌥L are free
 in Claude Code, zsh (vi keymap: no `^[` bindings in viins) and nvim (only
 `<A-e>`, `<A-o>`, `<A-g>` are mapped). ⌥1-9, ⌥M, ⌥N, ⌥\` are free in all
-three. Already-taken root keys (M-s M-x M-w M-a M-q) are untouched.
+three. Already-taken root keys (M-s M-x M-a M-q) are untouched; M-w is the leader (below).
 
-⌥F (M-f) was unbound in tmux and WezTerm, and nvim maps no `<A-f>`; the
-root binding takes it from the pane, as ⌥X / ⌥C took theirs: zsh's emacs-mode
-`forward-word` and Claude Code's meta+f (word forward in its prompt) are
-lost. With spaces off there is no M-f binding and no `jump` table.
+⌥W (M-w) was tmux.conf's agent menu; with spaces on the leader takes it
+(2026-10-15: the menu is on hold, prefix q still opens it). It was ⌥F at
+first; M-f is unbound again, so zsh's `forward-word` and Claude Code's meta+f
+work in the pane. With spaces off tmux.conf's ⌥W menu binding stands and
+there is no `jump` table.
 
 ## For the Rust sidebar (agent-ui)
 

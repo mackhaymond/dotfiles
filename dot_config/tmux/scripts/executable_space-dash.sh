@@ -232,7 +232,7 @@ render() {
   done
   while ((rows > 0)); do emit; rows=$((rows - 1)); done
   seg "" "  "
-  seg "$C_DIM" "⌥1 home · ⌥2-9 shells · ⌘1-9 agents · ⌥\` agent↔shell · ⌥F jump · ⌥N new space · prefix Q close"
+  seg "$C_DIM" "⌥1 home · ⌥2-9 shells · ⌘1-9 agents · ⌥\` agent↔shell · ⌥W jump · ⌥N new space · prefix Q close"
   emit
   # Draw: home, each line cleared to its end, the rest of the pane cleared.
   local buf="$E[H" k
