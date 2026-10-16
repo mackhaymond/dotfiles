@@ -842,6 +842,10 @@ STILL_AFTER = 180                             # s before "still working: …"
 RESUME_CLOSE = 4                              # s the prefix-P RESUMED popup stays up
 RESUMED_AFTER_PAUSE = 3                       # s the RESUMED view stays after Enter / a remote resume
 PAUSE_FOOT = "⏎ Enter  resume all now   ·   Esc  close (resume later with prefix P)"
+# A spinner while anything is still stopping, so the view reads as loading
+# rather than frozen. It repaints at SPIN_HZ only until the banner flips (then
+# back to one tick a second for the sleep); tmux is still polled once a second.
+SPINNER, SPIN_HZ = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", 8
 
 
 def block(text):
@@ -894,11 +898,11 @@ def fit(s, n):
     return s if len(s) <= n else (s[:max(0, n - 1)] + "…" if n > 0 else "")
 
 
-def build_frame(mode, items, cols, rows, elapsed, close_in=None, note=""):
+def build_frame(mode, items, cols, rows, elapsed, close_in=None, note="", spin=0):
     """-> (background hex, exactly `rows` lines of exactly `cols` chars).
     mode: pause | resume; items: [(label, location, status)]; close_in: the
-    RESUMED view's countdown (s); note: one extra line (an Enter that failed).
-    Pure."""
+    RESUMED view's countdown (s); note: one extra line (an Enter that failed);
+    spin: the spinner frame for rows still stopping. Pure."""
     cols, rows = max(cols, 10), max(rows, 3)
     statuses = [s for _, _, s in items]
     if mode == "pause":
@@ -906,9 +910,11 @@ def build_frame(mode, items, cols, rows, elapsed, close_in=None, note=""):
         title, bg = ("SAFE TO CLOSE", GREEN) if done else ("PAUSING", PEACH)
         waiting = [lab for lab, _, s in items if s not in SETTLED]
         stopped = sum(s == STOPPED for s in statuses)
-        sub = ("all %d stopped — safe to close the lid" % len(items) if done and stopped == len(items)
-               else "nothing still working — safe to close the lid" if done
-               else "%d of %d stopped — waiting for the rest" % (stopped, len(items)))
+        sp = SPINNER[spin % len(SPINNER)]
+        sub = ("✓ all %d stopped — safe to close the lid" % len(items) if done and stopped == len(items)
+               else "✓ nothing still working — safe to close the lid" if done
+               else "%s stopping all agents… %d of %d stopped" % (sp, stopped, len(items)))
+        items = [(l, loc, s if s in SETTLED else sp + " " + s) for l, loc, s in items]
         sub += " · %d:%02d" % (elapsed // 60, elapsed % 60)
         foot = PAUSE_FOOT
     elif mode == "dropped":   # a resume that reached nobody: never green
@@ -1146,10 +1152,12 @@ def watch(mode, demo=False):
                 paint(*build_frame({"resumed": "resume"}.get(phase, phase), items, size.columns,
                                    size.lines, int(now - t0),
                                    close_in=None if close_at is None else close_at - now + 0.999,
-                                   note=note))
+                                   note=note, spin=int((now - t0) * SPIN_HZ)))
             if close_at is not None and now >= close_at:
                 return
             wait = 1.0 if close_at is None else max(0.05, min(1.0, close_at - now))
+            if phase == "pause" and items and any(s not in SETTLED for _, _, s in items):
+                wait, flag["dirty"] = min(wait, 1.0 / SPIN_HZ), True   # spinner frame
             ready, _, _ = select.select([fd], [], [], wait)
             if not ready:
                 continue
