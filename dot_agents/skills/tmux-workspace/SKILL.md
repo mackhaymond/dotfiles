@@ -98,16 +98,22 @@ tmux server (default socket)
 A WezTerm split on the right (⌘B toggles it). While it is open it is the
 whole UI and the tmux status line is off. Top to bottom:
 
-- a card with usage meters, and a red `prefix` / peach `⌥W jump` mark while a
-  key table is armed; toasts appear in its bottom border;
+- a usage panel (meters), with a red `prefix` / peach `⌥W jump` tab while a
+  key table is armed; toasts (`notify.sh`) appear as stacked cards over the
+  top of the sidebar, newest lowest, until they expire or are clicked;
 - **NEEDS YOU**: agents in `failed` > `needs-input` > `done` (finished and
   not seen yet), oldest first, the order `agent-jump.sh list` prints. Each
   card starts with the agent's letter badge;
 - **AGENTS**, grouped by space (scope "all spaces"), or only the current
-  space ("this space", ⌥V toggles). Each row has its letter badge;
+  space ("this space", ⌥V toggles). Each agent is a two-line tile with its
+  letter badge; a working agent's second line is a live activity blurb
+  (`› Running cargo test`, `› Editing layout.rs`, read from its transcript),
+  after it finishes the start of its reply;
 - **SHELLS** of the current space: `⌥1 ⌂ ~`, `⌥2 nvim`…;
-- the spaces as pills in ⌃N order, the current one filled in its colour;
-- `⏸ N parked` (the stash; a click opens the unpark picker).
+- **SPACES**: one row per space in ⌃N order (`N name`, its agent counts), the
+  current one a solid chip in its colour (red while the prefix is armed);
+- **PARKED** and its count (the stash; a click opens the unpark picker), with
+  up to 3 parked tabs listed when there is room.
 
 A right-click on an agent row parks it. "It's in needs-you" means
 `@agent_state` is `needs-input`, `failed` or `done` and the window is in a
@@ -133,7 +139,7 @@ parked. It has no letter, isn't messageable, and isn't listed by
 | "my shell", "the shell I'm in" | the window their client shows, if it's a shell | recipe **where is Mack** |
 | "it's in needs-you", "it's waiting on me" | state `needs-input`/`failed`/`done` | `agent-jump.sh list` |
 | "park it", "stash it" | prefix H on that tab (or right-click it in the sidebar) | they do it; you don't, unless asked |
-| "unpark", "bring it back" | prefix h (picker), or the sidebar's `⏸ N parked` | `stash.sh list` shows what's parked |
+| "unpark", "bring it back" | prefix h (picker), or the sidebar's PARKED section | `stash.sh list` shows what's parked |
 | "close the space" | prefix Q (y/n; every tab goes through closed-tabs, ⌘Z reopens) | never main, never hidden ones |
 | "this space" / "all spaces" (sidebar) | the scope, ⌥V | `tmux show -gv @strip_scope` |
 | "the menu" | the agent menu: prefix q | |

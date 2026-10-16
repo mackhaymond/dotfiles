@@ -233,6 +233,10 @@ pub struct Agent {
     pub letter: Option<char>,
     /// stash.sh's `@stash_sel`: in prefix v's range selection.
     pub selected: bool,
+    /// What a WORKING agent is doing right now, in a few words, from its
+    /// transcript (the sidebar's `activity::Activity`); None otherwise and
+    /// from [`Agent::from_window`] alone.
+    pub blurb: Option<String>,
 }
 
 impl Agent {
@@ -284,6 +288,7 @@ impl Agent {
             ordinal: None,
             letter: None,
             selected: w.stash_sel,
+            blurb: None,
         }
     }
 

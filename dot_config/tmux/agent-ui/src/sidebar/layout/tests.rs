@@ -159,10 +159,10 @@ fn is_pad(l: &str) -> bool {
     !t.is_empty() && t.chars().all(|c| c == '▀' || c == '▄')
 }
 
-/// A row's text with the pills' rounded caps as spaces (` main ` reads the
-/// same as it did before the caps).
+/// A row's text as words: the arrow a space, runs of spaces one, padded
+/// (` 1 main `, ` 2 cua-notch ` read as they would in prose).
 fn uncapped(l: &str) -> String {
-    l.replace(CAP_L, " ").replace(CAP_R, " ")
+    format!(" {} ", l.replace(ARROW, " ").split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" "))
 }
 
 /// The cell column `needle` starts at in `l` (every glyph here is one cell).
@@ -178,7 +178,7 @@ fn body(l: &str) -> &str {
 
 /// The parked row as drawn: a rounded button.
 fn parked(n: usize) -> String {
-    format!(" {CAP_L}⏸ {n} parked{CAP_R}")
+    if n == 0 { " PARKED none".to_string() } else { format!(" PARKED  {n} ") }
 }
 
 /// Every agent is covered exactly once, and `… N more` says N. (Rows a
@@ -227,11 +227,18 @@ fn check_order(name: &str, f: &Frame) {
     }
     if !f.spaces.is_empty() {
         assert!(!shown(f.spaces.start) || t[f.spaces.start].trim().is_empty(), "{name}: the gap first {t:#?}");
-        assert!(f.spaces.len() >= 2, "{name}: a gap and pills {t:#?}");
-        assert_eq!(f.spaces.end, h - 1, "{name}: spaces sit on the last row {t:#?}");
+        assert!(f.spaces.len() >= 2, "{name}: a gap and spaces {t:#?}");
+        assert_eq!(f.spaces.end, f.parked.start, "{name}: PARKED right under the spaces {t:#?}");
+        let vertical = t[f.spaces.start + 1].starts_with(" SPACES");
+        assert!(!vertical || f.parked.len() >= 2, "{name}: a gap above PARKED under the SPACES list {t:#?}");
+    }
+    // PARKED last, its header always there (the stash, messages, the watcher).
+    assert_eq!(f.parked.end, h, "{name}: {t:#?}");
+    if f.toast.end <= f.parked.start {
+        let header = f.parked.clone().find(|&y| t[y].starts_with(" PARKED")).unwrap_or_else(|| panic!("{name}: no PARKED {t:#?}"));
+        assert!(f.parked.clone().take_while(|&y| y < header).all(|y| t[y].trim().is_empty()), "{name}: {t:#?}");
     }
     assert!(f.toast.end < h, "{name}: {t:#?}");
-    assert!(t[h - 1].starts_with(&format!(" {CAP_L}⏸ ")), "{name}: {t:#?}");
     assert!(!t.iter().any(|l| l.starts_with(" log") || l.contains('═')), "{name}: {t:#?}");
     for (y, l) in t.iter().enumerate().filter(|(y, _)| shown(*y)) {
         assert!(!l.contains(['─', '│', '╭', '╮', '╰', '╯']), "{name}: line art at {y}: {t:#?}");
@@ -388,13 +395,13 @@ fn spare_rows_buy_spacing_back() {
         }
     }
     assert!(bought > 0, "spacing never bought back");
-    // A frame that asked for it (34x40, the shells in one line, two rows
-    // left over): the gaps above AGENTS and SHELLS are back, nothing blank
-    // at the bottom; the agents keep their shape (no pads, zebra).
+    // A frame that asked for it (34x40, the shells in one line, rows left
+    // over): the gap above AGENTS is back and the one above PARKED, nothing
+    // blank at the bottom; the agents keep their shape (no pads, zebra).
     let f = layout(&lettered(quiet()), 34, 40, &with_bar(demo_bar()));
     let t = texts(&f);
     assert_eq!((f.step, f.agents_step, f.shells.len()), (STEPS.len() as u8 - 1, 0, 1), "{t:#?}");
-    assert!(is_blank(&f.rows[f.agents.start - 1]) && is_blank(&f.rows[f.shells.start - 1]), "{t:#?}");
+    assert!(is_blank(&f.rows[f.agents.start - 1]) && is_blank(&f.rows[f.parked.start]), "{t:#?}");
     assert!(f.shells.end == f.spaces.start && !t[f.agents.clone()].iter().any(|l| is_pad(l)), "{t:#?}");
 }
 
@@ -465,7 +472,7 @@ fn quiet_is_roomy() {
     assert_eq!((f.step, f.agents_step), (0, 0), "{t:#?}");
     assert!(t[0].starts_with(" agents") && t[0].ends_with("◉1 ◐2 ○8 "), "{:?}", t[0]);
     // The count: a small yellow pill.
-    assert!(t[1].trim().is_empty() && t[2].starts_with(" NEEDS YOU") && t[2].ends_with(&format!("{CAP_L}1{CAP_R} ")), "{t:#?}");
+    assert!(t[1].trim().is_empty() && t[2].starts_with(" NEEDS YOU") && t[2].ends_with(" 1  "), "{t:#?}");
     // The card: a tile tinted in its state's colour with a yellow stripe;
     // title, glyph and age; then the question; then its pad.
     assert!(t[3].starts_with(" ▌ Kua Yu focus timing") && t[3].ends_with("◉ 3m  "), "{:?}", t[3]);
@@ -517,13 +524,20 @@ fn quiet_is_roomy() {
     // name) order.
     let bai = find(&f, " ● bai");
     assert!(t[main - 1].trim().is_empty() && is_pad(&t[main - 2]) && bai < main, "{t:#?}");
-    // The spaces: a gap and the pills right above the parked row; spare
-    // rows above them.
-    assert_eq!(f.spaces, 55..57, "{t:#?}");
-    assert!(t[55].trim().is_empty(), "{t:#?}");
-    assert!(t[56].starts_with(&format!(" {CAP_L}bai{CAP_R} {CAP_L}main ◉{CAP_R} {CAP_L}schedule{CAP_R}")), "{t:#?}");
-    assert!(t[f.agents.end..55].iter().all(|l| l.trim().is_empty()), "{t:#?}");
-    assert_eq!(t[57].trim_end(), parked(1));
+    // SPACES: a gap, its header and a row per space in ⌃N (here: name)
+    // order, each with its counts; then a gap and PARKED with its count and
+    // the parked tab. Spare rows above them.
+    assert_eq!((f.spaces.clone(), f.parked.clone()), (50..55, 55..58), "{t:#?}");
+    assert!(t[50].trim().is_empty() && t[51].trim_end() == " SPACES", "{t:#?}");
+    assert!(t[52].contains(" bai ") && t[52].ends_with("○2  ") && t[54].contains(" schedule "), "{t:#?}");
+    // The client's space: `@space_here`, one chip (peach: no colour of its
+    // own) ending in the arrow.
+    let peach = Ink::Pal("peach");
+    assert!(f.rows[53].segs.contains(&block(" main ", "crust", peach)) && f.rows[53].segs.contains(&seg(ARROW, peach)), "{:?}", f.rows[53].segs);
+    assert!(t[53].ends_with("◉1 ◐2 ○4  "), "{t:#?}");
+    assert!(t[f.agents.end..50].iter().all(|l| l.trim().is_empty()), "{t:#?}");
+    assert!(t[55].trim().is_empty() && t[56].starts_with(&parked(1)), "{t:#?}");
+    assert!(t[57].contains("⏸ Parked one"), "{t:#?}");
     assert!(!f.spin || t.iter().any(|l| l.contains('⠋')));
 }
 
@@ -568,7 +582,8 @@ fn busy_squeezes_spaces_and_cards_before_agents() {
     sv.scope.session = Some("main".into());
     let f = layout(&sv, 34, 46, &Opts::default());
     assert_eq!((f.step, f.agents_step), (0, 0), "{:#?}", texts(&f));
-    assert_eq!(f.spaces.len(), 1 + pill_lines(&sv, 34));
+    // Every space a row of SPACES (after its gap and header).
+    assert_eq!(f.spaces.len(), 2 + space_list(&sv).len(), "{:#?}", texts(&f));
 }
 
 #[test]
@@ -612,8 +627,9 @@ fn empty_still_has_every_section() {
     assert!(t[n].ends_with("✓ all clear "), "{:?}", t[n]);
     assert!(t.iter().any(|l| l.starts_with("   no agents running")));
     assert_eq!(t[0], " agents                           ");
-    // The plain `main` session is still a space: its pill.
-    assert_eq!(t[f.spaces.clone()][1].trim_end(), format!(" {CAP_L}main{CAP_R}"));
+    // The plain `main` session is still a space: its row.
+    let s = &t[f.spaces.clone()];
+    assert!(s[1].trim_end() == " SPACES" && s[2].contains(" main "), "{t:#?}");
 }
 
 #[test]
@@ -634,34 +650,32 @@ fn click_targets() {
         assert_eq!(f.target(33, y).cloned(), go("@3"));
     }
     assert_eq!(f.target(5, card + 2), None);
-    // Space headers and pills go to the session; the gap between pills does nothing.
+    // Space headers and SPACES rows (anywhere on them) go to the session.
     let hd = find(&f, " ● bai") as u16;
     assert_eq!(f.target(20, hd).cloned(), Some(Target::Session("bai".into())));
-    let pills = f.spaces.start as u16 + 1;
-    let line = f.rows[pills as usize].text();
-    assert_eq!(f.target(col(&line, "main"), pills), Some(&Target::Session("main".into())));
-    // The caps are the button's too.
-    assert_eq!(f.target(1, pills), Some(&Target::Session("bai".into())));
-    let gap = col(&line, &format!("{CAP_L}main")) - 1;
-    assert_eq!(f.target(gap, pills), None, "{line:?}");
-    assert_eq!(f.target(0, pills), None);
-    // The spaces' gap, the section headers and blank rows do nothing.
-    assert_eq!(f.target(5, f.spaces.start as u16), None);
+    let s = f.spaces.start as u16;
+    for (y, name) in [(s + 2, "bai"), (s + 3, "main"), (s + 4, "schedule")] {
+        assert_eq!((f.target(0, y), f.target(33, y)), (Some(&Target::Session(name.into())), Some(&Target::Session(name.into()))));
+    }
+    // The gaps, the section headers and blank rows do nothing.
+    assert_eq!(f.target(5, s), None);
+    assert_eq!(f.target(5, s + 1), None);
     assert_eq!(f.target(2, find(&f, " NEEDS YOU") as u16), None);
     assert_eq!(f.target(2, 1), None);
-    // Parked opens the stash picker.
-    assert_eq!(f.target(2, 57), Some(&Target::Stash));
-    // A watcher problem is a restart button.
+    // PARKED (its header and its tabs) opens the stash picker.
+    assert_eq!((f.target(2, 56), f.target(20, 57)), (Some(&Target::Stash), Some(&Target::Stash)));
+    // A watcher problem is a restart button, on the PARKED header.
     let mut v = quiet();
     v.watcher_age = Some(99.0);
     let f = layout(&v, 34, 58, &Opts::default());
-    assert!(f.rows[57].text().ends_with("watcher stalled 99s "));
-    assert_eq!(f.target(30, 57), Some(&Target::Restart));
+    let p = find(&f, " PARKED") as u16;
+    assert!(f.rows[p as usize].text().ends_with("watcher stalled 99s "));
+    assert_eq!(f.target(30, p), Some(&Target::Restart));
     // A message wins the corner (and is not a button).
     let f = layout(&v, 34, 58, &Opts { msg: Some("no tmux client".into()), ..Opts::default() });
-    assert!(f.rows[57].text().ends_with("no tmux client "));
-    assert_eq!(f.target(30, 57), None);
-    assert_eq!(f.target(2, 57), Some(&Target::Stash));
+    assert!(f.rows[p as usize].text().ends_with("no tmux client "));
+    assert_eq!(f.target(30, p), None);
+    assert_eq!(f.target(2, p), Some(&Target::Stash));
 }
 
 /// The second line: the latest message only for working, asking and
@@ -739,7 +753,7 @@ fn cut_pills_keep_the_current_and_attention_spaces() {
         let pills = uncapped(&t[f.spaces.start + 1..f.spaces.end].join("|"));
         assert!(pills.contains(" zz "), "{h}: {t:#?}");
         assert!(h < 8 || pills.contains(" s07 "), "{h}: {t:#?}");
-        let shown = pills.matches(" s").count() + pills.matches(" zz ").count() + pills.matches(" main ").count();
+        let shown = pills.matches(" s0").count() + pills.matches(" s1").count() + pills.matches(" zz ").count() + pills.matches(" main ").count();
         if shown < 13 {
             // The rest as `+K`, which opens the menu on All.
             let k: usize = pills.split(" +").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
@@ -789,7 +803,7 @@ fn groups_and_pills_share_the_space_order() {
     // The ⌃N digit leads each indexed pill; past 9 or unset, none.
     assert!(pills.contains(" 1 main ") && pills.contains(" 2 cua-notch ") && pills.contains(" 3 bai "), "{pills:?}");
     assert!(!pills.contains("12") && pills.contains(" zeta "), "{pills:?}");
-    let y = (f.spaces.start + 1) as u16;
+    let y = f.spaces.clone().find(|&y| t[y].contains("cua-notch")).unwrap() as u16;
     assert_eq!(f.target(col(&t[y as usize], "cua-notch"), y), Some(&Target::Session("cua-notch".into())));
     // The same holds for the real fleet in its real (live) registry order.
     let order = |v: &ViewModel| groups(v).iter().filter(|s| !s.hidden).map(|s| s.name.clone()).collect::<Vec<_>>();
@@ -808,24 +822,27 @@ fn spaces_wear_their_colour() {
         Some("@1"),
     );
     let f = layout(&v, 34, 40, &Opts::default());
-    let p = &f.rows[f.spaces.start + 1];
-    // The client's space: a rounded button filled with its colour, dark ink.
+    let row = |f: &Frame, name: &str| f.rows[f.spaces.clone().find(|&y| f.rows[y].text().contains(&format!(" {name} "))).unwrap()].clone();
+    // The client's space: `@space_here`, one chip in its colour, dark ink,
+    // the arrow tail.
     let yellow = Ink::Rgb(0xf9, 0xe2, 0xaf);
-    assert!(p.segs.contains(&block("1 main", "crust", yellow)), "{:?}", p.segs);
-    assert!(p.segs.contains(&seg(CAP_L, yellow)) && p.segs.contains(&seg(CAP_R, yellow)), "{:?}", p.segs);
-    // Another: its digit in its colour, on surface0.
-    assert!(p.segs.contains(&Seg { bold: true, ..on("2 ", Ink::Idx(24), "surface0") }), "{:?}", p.segs);
-    assert!(p.segs.contains(&Seg { bold: true, ..on("3 ", "overlay2", "surface0") }), "{:?}", p.segs);
+    let p = row(&f, "main");
+    assert!(p.segs.contains(&block(" 1 main ", "crust", yellow)) && p.segs.contains(&seg(ARROW, yellow)), "{:?}", p.segs);
+    // Another: a status-line module, its digit on its colour (dark ink on a
+    // light one, light on a dark one; peach for a colour tmux cannot read).
+    assert!(row(&f, "bai").segs.contains(&block(" 2 ", "text", Ink::Idx(24))), "{:?}", row(&f, "bai").segs);
+    assert!(row(&f, "zeta").segs.contains(&block(" 3 ", "crust", "peach")), "{:?}", row(&f, "zeta").segs);
     // Space headers: the dot in the space's colour.
     let hd = &f.rows[find(&f, " ● bai")];
     assert_eq!(hd.segs[1], seg("● ", Ink::Idx(24)));
-    // An alert space's pill carries the state glyph; a current space with
-    // no colour is lavender.
+    // An alert space's row counts it; a current space with no colour is
+    // peach (the status line's), red while the prefix is armed.
     let v = view(vec![a("main", 1, "running", "M"), a("bai", 1, "needs-input", "B")], Some("@1"));
     let f = layout(&v, 34, 40, &Opts::default());
-    let p = &f.rows[f.spaces.start + 1];
-    assert!(p.text().contains("bai ◉"), "{:?}", p.text());
-    assert!(p.segs.contains(&block("main", "crust", "lavender")), "{:?}", p.segs);
+    assert!(row(&f, "bai").text().contains("◉1"), "{:?}", row(&f, "bai").text());
+    assert!(row(&f, "main").segs.contains(&block(" main ", "crust", "peach")), "{:?}", row(&f, "main").segs);
+    let f = layout(&v, 34, 40, &with_bar(Bar { prefix: true, ..Bar::default() }));
+    assert!(row(&f, "main").segs.contains(&block(" main ", "crust", "red")), "{:?}", row(&f, "main").segs);
 }
 
 #[test]
@@ -1028,7 +1045,7 @@ fn the_panel_replaces_the_status_line() {
 #[test]
 fn shells_list_under_the_agents() {
     let v = lettered(quiet());
-    let f = layout(&v, 34, 58, &with_bar(demo_bar()));
+    let f = layout(&v, 34, 62, &with_bar(demo_bar()));
     let t = texts(&f);
     assert!(f.shells.start >= f.agents.end, "{t:#?}");
     let s = f.shells.start;
@@ -1089,8 +1106,8 @@ fn shells_line_counts_what_does_not_fit() {
         assert!(w < 20 || text.contains("sh7"), "{w}: {text:?}");
     }
     let t = shells_line(&bar, 200)[0].text();
-    assert!(t.starts_with(&format!(" SHELLS {CAP_L}⌥1 ⌂sh1{CAP_R} {CAP_L}⌥2 sh2{CAP_R}")), "{t:?}");
-    assert!(t.contains(&format!("{CAP_L}⌥9 sh9{CAP_R} {CAP_L}sh10{CAP_R} {CAP_L}sh11{CAP_R}")), "{t:?}");
+    assert!(t.starts_with(" SHELLS  ⌥1  ⌂sh1   ⌥2  sh2 "), "{t:?}");
+    assert!(t.contains(" ⌥9  sh9   sh10   sh11 "), "{t:?}");
     assert!(shells_line(&Bar::default(), 34).is_empty() && shells_section(&Bar::default(), 34, true).is_empty());
 }
 
@@ -1277,7 +1294,7 @@ fn space_scope_shows_one_session() {
     assert!(t[0].starts_with(" space ") && t[0].ends_with("✕1 ◉1 ◐1 ○1 "), "{:?}", t[0]);
     let b = agents_part(&f);
     // The scope: a rounded button.
-    assert!(b[0].starts_with(" AGENTS") && b[0].ends_with(&format!("{CAP_L}this space{CAP_R} ")), "{b:#?}");
+    assert!(b[0].starts_with(" AGENTS") && b[0].ends_with(" ⌥V  this space  "), "{b:#?}");
     assert!(b[1].starts_with(" ● proj"), "{b:#?}");
     // Window-index order; no shell rows.
     let rows: Vec<&str> = b[2..].iter().filter_map(|l| row_title(l)).collect();
@@ -1492,7 +1509,7 @@ fn the_spinner_turns_only_working_rows() {
 fn glyph_widths_agree_with_ratatui() {
     // Every fixed glyph the sidebar draws: the layout's cell count
     // (text::dwidth) must be ratatui's (unicode-width over the grapheme).
-    let glyphs = "⏵⤺≡⌥▌▎▄▀◉✓✕•◐○●─━┃│╭╮╰╯↻Σ−±↑↓✎⚙◎▸…✳⬢⏎⏸⌃⌂\u{e0a0}\u{e0b6}\u{e0b4}\u{f05a}\u{f058}\u{f071}\u{f057}".to_string() + &SPIN.concat();
+    let glyphs = "⏵⤺≡⌥▌▎▄▀◉✓✕•◐○●─━┃│╭╮╰╯↻Σ−±↑↓✎⚙◎▸…✳⬢⏎⏸⌃⌂\u{e0a0}\u{e0b0}›\u{f05a}\u{f058}\u{f071}\u{f057}".to_string() + &SPIN.concat();
     let bad: Vec<(char, usize, usize)> = glyphs
         .chars()
         .map(|c| (c, dwidth(&c.to_string()), c.to_string().width()))
@@ -1719,11 +1736,15 @@ fn renders_through_ratatui_on_the_terminal_background() {
     let buf = term.backend().buffer();
     let here = find(&f, "Tmux Agent Sidebar") as u16;
     let card = find(&f, "▌ Kua Yu") as u16;
-    let pills = (f.spaces.start + 1) as u16..f.spaces.end as u16;
+    // (SPACES and PARKED carry the status line's coloured chips.)
+    let pills = f.spaces.start as u16..f.parked.end as u16;
     for y in 0..58u16 {
         for x in 0..34u16 {
             let bg = buf[(x, y)].bg;
             let inside = (1..33).contains(&x);
+            if pills.contains(&y) {
+                continue;
+            }
             if (y == here || y == here + 1) && inside {
                 assert_eq!(bg, palette::color("tile_hi"), "({x},{y})");
             } else if (y == card || y == card + 1) && inside {
@@ -1743,4 +1764,109 @@ fn renders_through_ratatui_on_the_terminal_background() {
     // No background code at all on an untinted row.
     assert!(ansi.starts_with("\x1b[0;38;2;205;214;244;1m agents"), "{:?}", &ansi[..60]);
     assert!(!ansi.lines().next().unwrap().contains(";48;"));
+}
+
+/// A working agent's second line is its live activity blurb (from its
+/// transcript, `activity`), a blue `›` in the key-cap's column; without
+/// one, the run detail as before; an agent that is not working never shows
+/// one. Every agent row stays two lines.
+#[test]
+fn a_working_agent_shows_its_activity() {
+    let mut v = lettered(quiet());
+    for a in v.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()) {
+        a.blurb = Some(format!("Running {}", a.window_id));
+    }
+    let f = layout(&v, 34, 58, &Opts::default());
+    let t = texts(&f);
+    let r = find(&f, "Tmux Agent Side");
+    assert!(t[r + 1].starts_with(" ▌  › Running @2") && t[r + 1].ends_with(" 2m  "), "{:?}", t[r + 1]);
+    assert!(f.rows[r + 1].segs.contains(&seg("› ", "blue")) && f.rows[r + 1].segs.contains(&seg("Running @2", "sub")));
+    // Not working (idle, asking): their own second lines.
+    let n = find(&f, "Lost suit jacket");
+    let k = find(&f, "▎ g  Kua Yu");
+    assert!(!t[n + 1].contains("Running") && t[k + 1].contains("Which deck"), "{t:#?}");
+    let (firsts, seconds) = agent_lines(&f);
+    assert_eq!(firsts, seconds);
+    // No blurb: what it runs, as before.
+    let f = layout(&lettered(quiet()), 34, 58, &Opts::default());
+    let r = find(&f, "Tmux Agent Side");
+    assert!(texts(&f)[r + 1].starts_with(" ▌    Edit agent-roster.py"), "{:#?}", texts(&f));
+}
+
+/// The bottom gives way in order as rows run short: PARKED's tabs first
+/// (its header and count stay), then SPACES collapses to the client's
+/// space and the attention ones (`+K more spaces`), then to chips; the
+/// PARKED header is always there.
+#[test]
+fn the_bottom_gives_way_in_order() {
+    let mut v = quiet();
+    let p = v.parked[0].clone();
+    v.parked = (1..=5)
+        .map(|k| {
+            let mut q = p.clone();
+            q.agent.short_title = format!("Parked {k}");
+            q.origin = "bai".into();
+            q
+        })
+        .collect();
+    let mut forms = Vec::new();
+    for h in (8u16..=90).rev() {
+        let f = layout(&v, 34, h, &Opts::default());
+        let t = texts(&f);
+        check_order(&format!("bottom {h}"), &f);
+        let tabs = f.parked.clone().filter(|&y| t[y].contains("⏸ Parked")).count();
+        let spaces = &t[f.spaces.clone()];
+        let form = match spaces.get(1) {
+            Some(l) if l.starts_with(" SPACES") => usize::from(spaces.iter().any(|l| l.contains("more spaces"))),
+            Some(_) => 2,
+            None => 3,
+        };
+        if tabs > 0 {
+            // Three tabs and the count of the rest, beside the full list.
+            assert_eq!((form, tabs), (0, 3), "{h}: {t:#?}");
+            assert!(t[f.parked.end - 1].contains("+2 more") && t[f.parked.end - 2].ends_with("bai "), "{h}: {t:#?}");
+            assert_eq!(f.target(5, (f.parked.end - 1) as u16), Some(&Target::Stash));
+        }
+        if form == 1 {
+            // The client's space (main, which needs you too) and `+2`.
+            let more = f.spaces.clone().find(|&y| t[y].contains("+2  more spaces")).unwrap_or_else(|| panic!("{h}: {t:#?}"));
+            assert!(spaces.iter().any(|l| l.contains(" main ")) && !spaces.iter().any(|l| l.contains(" bai ")), "{h}: {t:#?}");
+            assert_eq!(f.target(5, more as u16), Some(&Target::Menu(Some("all"))));
+        }
+        forms.push((form, tabs > 0));
+    }
+    for want in [(0, true), (0, false), (1, false), (2, false)] {
+        assert!(forms.contains(&want), "{want:?} never seen: {forms:?}");
+    }
+}
+
+/// An asking agent with a workflow or cua flag is "in flight", but not
+/// working: its row shows its question, never a stale activity blurb.
+#[test]
+fn an_asking_agent_never_shows_a_blurb() {
+    let mut v = view(vec![a("main", 1, "needs-input", "Ask").with("cua", "1").with("detail_kind", "ask")
+        .with("detail", "Which deck should I use?")], None);
+    for x in v.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()) {
+        assert!(x.in_flight, "the repro needs an in-flight agent");
+        x.blurb = Some("Running stale tool".into());
+    }
+    let f = layout(&v, 34, 40, &Opts::default());
+    let t = texts(&f);
+    let r = f.agents.start + agents_part(&f).iter().position(|l| l.contains("Ask")).unwrap();
+    assert!(t[r + 1].contains("Which deck should I use?") && !t.iter().any(|l| l.contains("stale tool")), "{t:#?}");
+}
+
+/// The client's space chip keeps its arrow when its name is long: the name
+/// gives way, clipped with `…`, and the counts stay.
+#[test]
+fn a_long_space_name_keeps_the_arrow() {
+    let v = view(vec![a("a-very-long-space-name-indeed", 1, "running", "T").with("space_index", "1")], Some("@1"));
+    for w in [24u16, 30, 38] {
+        let f = layout(&v, w, 40, &Opts::default());
+        let y = f.spaces.clone().find(|&y| f.rows[y].text().contains(ARROW)).unwrap_or_else(|| panic!("{w}: {:#?}", texts(&f)));
+        let t = f.rows[y].text();
+        assert!(t.contains(&format!("… {ARROW}")) && t.starts_with("  1 a-very"), "{w}: {t:?}");
+        assert!(t.trim_end().ends_with("◐1"), "{w}: {t:?}");
+        assert_eq!(width(&f.rows[y].segs), usize::from(w));
+    }
 }

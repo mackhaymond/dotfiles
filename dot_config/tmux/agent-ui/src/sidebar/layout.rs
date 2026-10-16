@@ -13,12 +13,15 @@
 //! ([`PAD_BELOW`]): a header sits right on its first tile, and half a row of
 //! canvas parts one tile from the next. Without room for pads, tiles sit edge
 //! to edge in two alternating shades ([`shade`]: `tile` / `tile_alt`).
-//! Buttons on the canvas (spaces, the parked line, the scope, shells in one
-//! line, the NEEDS YOU count) are pills with Nerd Font half-circle caps
-//! ([`pill`], U+E0B6 / U+E0B4). Section and space headers are text on the
-//! canvas. The only line art left is a toast card's rounded border.
+//! Chips take a page out of the tmux status line (its catppuccin blocks,
+//! square ends): a [`module`] is ` key ` bold in dark ink on a colour, then
+//! ` label ` on `surface0` (the spaces, the shells in one line, the scope
+//! toggle ` ⌥V `, the NEEDS YOU and PARKED counts, `+K`); the client's space
+//! is `@space_here`, one chip in its colour ending in the powerline arrow
+//! ([`ARROW`]). Section and space headers are text on the canvas. The only
+//! line art left is a toast card's rounded border.
 //!
-//! ## Shape: the usage panel, NEEDS YOU, the agents (the body), the shells, the spaces
+//! ## Shape: the usage panel, NEEDS YOU, the agents (the body), the shells, SPACES, PARKED
 //!
 //! ```text
 //!  ▄ prefix ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄   the usage panel: a tile; the key
@@ -26,36 +29,53 @@
 //!   W ━━━━━━━━━━━━━┃━━━━━━  60% (+17%)   one meter per window (fill = used,
 //!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ┃ = where the pace expects it)
 //!
-//!  NEEDS YOU                       (1)
+//!  NEEDS YOU                        1   (the count a square chip)
 //!  ▌ g  1Password Sign-ins      ✓ 4m    cards: tiles tinted in the state's
 //!  ▌    Your four calls are done        colour, a ▌ stripe in it
 //!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 //!
-//!  AGENTS                (all spaces)   (the scope: a button once it toggles)
+//!  AGENTS            ⌥V  all spaces     (the scope: a module once it toggles)
 //!  ● main                     ◐2 ○3     space header: dot in @space_color
 //!  ▌ d  Tmux Agent Sidebar ⠹ working    the client's agent: `tile_hi`, a wide
-//!  ▌    run cargo test            26s   stripe; every agent two lines: a dim
-//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   second line (the message; for idle,
-//!  ▎ q  Pause Resume Agents    ✓ done   its last outcome; maybe blank), the
-//!  ▎    Merged the pause key       2m   age at its end; a `▎` stripe in the
-//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   state's colour (idle: none)
-//!     h  Canvas Syllabus         idle
-//!        Synced 4 assignments      1h
+//!  ▌  › Running cargo test        26s   stripe; every agent two lines: working,
+//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   its live activity (`›`, from its
+//!  ▎ q  Pause Resume Agents    ✓ done   transcript, see `activity`); else a
+//!  ▎    Merged the pause key       2m   dim message (for idle, its last
+//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   outcome; maybe blank), the age at its
+//!     h  Canvas Syllabus         idle   end; a `▎` stripe in the state's
+//!        Synced 4 assignments      1h   colour (idle: none)
 //!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 //!
 //!  SHELLS                               the client's space's shells, one-row
 //!     ⌥1  ⌂ ~                           buttons (⌥N); the active one lifted;
-//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   one line of buttons when short
-//!  ▌ ⌥2  nvim
-//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+//!  ▌ ⌥2  nvim                           one line of modules when short
 //!
-//!  (1 main) (2 bai) (3 cs35l) (4 s…)    spaces as rounded buttons (current
-//!  (⏸ 4 parked)                         filled), ⌃N order, wrapping; the stash
+//!  SPACES                               one row per space, ⌃N order: ` N ` on
+//!   1 main ▶               ◐2 ○3        its colour, the name, its counts; the
+//!   2  bai                    ○2        client's `@space_here` (red while the
+//!   3  cs35l                            prefix is armed)
+//!
+//!  PARKED  4                            the stash (a click: its picker); a
+//!    ⏸ Canvas export          main      message or the watcher on the right;
+//!     +1 more                           up to 3 parked tabs when rows allow
 //! ```
 //!
-//! (`( )`: the half-circle caps.) Without a [`Bar`] (no client space, no
-//! usage, nothing selected) the top is the classic ` agents` / ` space`
-//! title with the counts.
+//! (`▶`: the arrow.) Without a [`Bar`] (no client space, no usage, nothing
+//! selected) the top is the classic ` agents` / ` space` title with the
+//! counts.
+//!
+//! ## The bottom: SPACES and PARKED
+//!
+//! Spaces are listed nowhere else, so their gap and one line of chips are
+//! held back before anything else is laid out ([`spaces_min`]), with the
+//! PARKED header (the old last row). The steps that keep decoration (gaps,
+//! pads) must also leave the SPACES list its rows ([`spaces_listed`]); then
+//! the bottom takes the rows left over, the richest form that fits
+//! ([`bottom`]): every space a row; else the client's space and those with
+//! an attention agent and `+K more spaces`; else chips on as few as one
+//! line; the gap above PARKED last. Spare rows then buy spacing back (the
+//! section gaps, the cards' pads, the gaps between spaces in AGENTS) and,
+//! last, PARKED's tabs (beside the full SPACES list only).
 //!
 //! ## Toasts: nvim-notify cards over the top, so nothing moves
 //!
@@ -88,10 +108,8 @@
 //! The agents section is the body. A frame takes the first step at which
 //! every agent still gets its full detail ([`STEPS`]):
 //!
-//! 1. the spaces section gets the rows left over: all its button lines, else
-//!    fewer (the client's space and those with an attention agent kept,
-//!    `+K` for the rest). Its gap and one line are held back before
-//!    anything else is laid out ([`spaces_min`]);
+//! 1. SPACES and PARKED get the rows left over (above: "The bottom"); their
+//!    minimum is held back before anything else is laid out;
 //! 2. the blank gaps go (between sections, between spaces);
 //! 3. the pads go: the NEEDS YOU cards' and shell buttons' first, then the
 //!    agents' (pure decoration goes before anything that says something);
@@ -147,7 +165,7 @@
 //! `tile_hi` (the client's agent, the active shell), NEEDS YOU cards and
 //! toast cards (their colour mixed over the canvas, [`Ink::Mix`]), the stash
 //! selection (mauve, mixed), and the solid chips (key-caps, the key-table
-//! marks, pills). Dim text on a surface is `overlay2`.
+//! marks, the status-line modules). Dim text on a surface is `overlay2`.
 
 use super::status::{ink_on, tmux_colour, Bar, Kind, Shell, Toast, ToastId, Usage};
 use crate::actions::watcher_problem;
@@ -352,18 +370,32 @@ fn pad_with(w: usize, bg: Ink, glyph: char, chips: Vec<Seg>) -> Row {
     Row::new(segs.into_iter().filter(|s| !s.text.is_empty()).collect())
 }
 
-/// A pill's rounded ends (Nerd Font half circles), drawn in its colour on
-/// whatever it sits on.
-const CAP_L: &str = "\u{e0b6}";
-const CAP_R: &str = "\u{e0b4}";
+/// The status line's arrow tail (Nerd Font powerline U+E0B0): the client's
+/// space chip ends in it, as `@space_here` does.
+const ARROW: &str = "\u{e0b0}";
 
-/// `segs` as a rounded button: each on `bg` (unless it has its own), a
-/// half-circle cap either side.
-fn pill(segs: Vec<Seg>, bg: impl Into<Ink>) -> Vec<Seg> {
-    let bg = bg.into();
-    let mut out = vec![seg(CAP_L, bg)];
-    out.extend(segs.into_iter().map(|s| Seg { bg: s.bg.or(Some(bg)), ..s }));
-    out.push(seg(CAP_R, bg));
+/// A status-line module, the tmux bar's catppuccin blocks (square ends, no
+/// caps): ` key ` bold in dark ink on its colour, then ` label ` on
+/// `surface0` (no label: the key alone). Segments of the label without a
+/// background of their own sit on `surface0`.
+fn module(key: &str, key_bg: impl Into<Ink>, label: Vec<Seg>) -> Vec<Seg> {
+    let bg = key_bg.into();
+    let mut out = vec![block(format!(" {key} "), ink_on(bg), bg)];
+    if !label.is_empty() {
+        let s0 = Ink::Pal("surface0");
+        out.push(on(" ", "text", s0));
+        out.extend(label.into_iter().map(|s| Seg { bg: s.bg.or(Some(s0)), ..s }));
+        out.push(on(" ", "text", s0));
+    }
+    out
+}
+
+/// A label alone as a module's `surface0` half (no key): ` label `.
+fn label_module(label: Vec<Seg>) -> Vec<Seg> {
+    let s0 = Ink::Pal("surface0");
+    let mut out = vec![on(" ", "text", s0)];
+    out.extend(label.into_iter().map(|s| Seg { bg: s.bg.or(Some(s0)), ..s }));
+    out.push(on(" ", "text", s0));
     out
 }
 
@@ -379,7 +411,7 @@ pub enum Target {
     /// An agent row or a needs card: agent-jump.sh goto (`Actions::go`,
     /// Strip.click "goto").
     Go { win: String, session: String },
-    /// A space pill or header: that session's active window (Strip.click "session").
+    /// A SPACES row, chip or space header: that session's active window (Strip.click "session").
     Session(String),
     /// One of this space's shells in the SHELLS section (⌥N): that window, like an
     /// agent row, but never parked by a right-click.
@@ -390,7 +422,7 @@ pub enum Target {
     Back,
     /// The agents menu (Strip.open_menu), optionally on a tab ("all", "idle").
     Menu(Option<&'static str>),
-    /// The `⏸ N parked` line: the stash picker, exactly prefix h's
+    /// PARKED (its header or a parked tab): the stash picker, exactly prefix h's
     /// `stash.sh unstash '' <client>`.
     Stash,
     /// The red watcher warning: restart it (the strip's ⟳, Strip.click "restart").
@@ -482,10 +514,16 @@ pub struct Frame {
     /// The rows of each section, header included (empty: not drawn).
     pub needs: Range<usize>,
     pub agents: Range<usize>,
-    /// This space's shells: the section, or one line of pills.
+    /// This space's shells: the section, or one line of modules.
     pub shells: Range<usize>,
-    /// The rule and the space pills.
+    /// The SPACES section: its gap, then its header and one row per space
+    /// (or the client's and the attention ones and `+K more`), or, short
+    /// of rows, the spaces as chips.
     pub spaces: Range<usize>,
+    /// The PARKED section, at the very bottom: its gap (when room), its
+    /// header (the stash's count, the message or watcher problem on the
+    /// right) and, with rows to spare, up to 3 parked tabs.
+    pub parked: Range<usize>,
     /// A spinner is on screen: the sidebar redraws it every
     /// [`crate::sidebar::SPIN_EVERY`] (and only then).
     pub spin: bool,
@@ -694,31 +732,31 @@ fn shell_key(s: &Shell) -> Option<String> {
     (s.n <= 9).then(|| format!("⌥{}", s.n))
 }
 
-/// A shell as a rounded button: `⌥2 nvim` between half-circle caps. The
-/// active one lifted (`surface1`, a peach key, bold), a selected one
-/// (`@stash_sel`) on the stash's mauve.
+/// A shell as the status line's `@space_shell` module: ` ⌥2 ` on blue
+/// (peach for the active one, the stash's mauve for a selected one), then
+/// ` nvim ` on `surface0`, square ends.
 fn shell_pill(s: &Shell) -> Item {
     let label = format!("{}{}", if s.home { "⌂" } else { "" }, clip(&s.label, 12));
-    let (bg, kf, lf) = if s.selected {
-        ("mauve", "crust", "crust")
+    let key = if s.selected {
+        "mauve"
     } else if s.active {
-        ("surface1", "peach", "text")
+        "peach"
     } else {
-        ("surface0", "overlay2", "sub")
+        "blue"
     };
-    let mut segs = Vec::new();
-    if let Some(k) = shell_key(s) {
-        segs.push(seg(format!("{k} "), kf));
-    }
-    segs.push(Seg { bold: s.active, ..seg(label, lf) });
-    item(pill(segs, bg), Some(Target::Shell { win: s.win.clone(), session: s.session.clone() }))
+    let label = vec![Seg { bold: s.active, ..seg(label, if s.active { "text" } else { "sub" }) }];
+    let segs = match shell_key(s) {
+        Some(k) => module(&k, key, label),
+        None => label_module(label),
+    };
+    item(segs, Some(Target::Shell { win: s.win.clone(), session: s.session.clone() }))
 }
 
 /// The key-table marks, solid chips: a red ` prefix ` while the client's key
 /// table is `prefix`; a peach ` ⌥W jump ` and `type a letter` while it is
 /// `jump`. They sit as a tab on the usage panel's top pad, so arming a
 /// table never changes the panel's height; a frame too short for the panel
-/// gives them a row of their own. No space chip: the spaces' pills at the
+/// gives them a row of their own. No space chip: the SPACES section at the
 /// bottom already mark the client's space.
 fn marks(bar: &Bar) -> Vec<Seg> {
     if bar.prefix {
@@ -1219,11 +1257,23 @@ fn message(a: &Agent, now: f64) -> Option<String> {
     show.then_some(m)
 }
 
-/// What a two-line agent row says under its title: the [`message`]; else,
-/// for an idle agent, its last turn's outcome (what it last said is still
-/// true of it); else nothing (a working agent's old outcome never reads as
-/// what it does now). Every agent row is two lines either way.
+/// A working agent's live activity blurb ([`Agent::blurb`], from its
+/// transcript), when it has one.
+fn live_blurb(a: &Agent) -> Option<&str> {
+    // Working by its state alone (`in_flight` is also an asking agent's with
+    // a workflow or cua flag: its line says what it needs).
+    (a.cat == Some(Cat::Working)).then_some(a.blurb.as_deref()).flatten().filter(|b| !b.trim().is_empty())
+}
+
+/// What a two-line agent row says under its title: a working agent's live
+/// activity blurb ([`live_blurb`]); else the [`message`]; else, for an
+/// idle agent, its last turn's outcome (what it last said is still true of
+/// it); else nothing (a working agent's old outcome never reads as what it
+/// does now). Every agent row is two lines either way.
 fn second_line(a: &Agent, now: f64) -> String {
+    if let Some(b) = live_blurb(a) {
+        return sanitize(b);
+    }
     message(a, now)
         .or_else(|| (!a.in_flight && a.cat != Some(Cat::Working)).then(|| plain(&a.detail)))
         .unwrap_or_default()
@@ -1331,12 +1381,18 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, base: Ink) -> Vec<Row> {
     };
     // Under the title (past the key-cap); without letters, indented anyway,
     // so a message never reads as another agent.
-    let l2 = vec![edge, seg(" ".repeat(lead.max(4) - 1), "text"), seg(m, dimc)];
+    let indent = lead.max(4) - 1;
+    let l2 = if live_blurb(a).is_some() {
+        // Live: a `›` in the key-cap's column, the words under the title.
+        vec![edge, seg(" ".repeat(indent - 2), "text"), seg("› ", "blue"), seg(m, "sub")]
+    } else {
+        vec![edge, seg(" ".repeat(indent), "text"), seg(m, dimc)]
+    };
     let second = tile_row(cx.w, bg, l2, r2).click(cx.w, go);
     vec![first, second]
 }
 
-/// THE space order, everywhere (the agents' groups, the spaces pills):
+/// THE space order, everywhere (the agents' groups, SPACES):
 /// `@space_index` (⌃N) first, spaces without one after (by name: the view's
 /// order, kept by a stable sort).
 pub fn space_order(sp: &Space) -> (bool, Option<u32>) {
@@ -1528,12 +1584,12 @@ fn spaced_groups(rows: Vec<Row>, w: usize) -> Vec<Row> {
 }
 
 /// ` AGENTS` and the scope on the right (`this space` / `all spaces`): a
-/// rounded button once the scope is a thing (a click flips it), else dim
-/// text.
+/// status-line module once the scope is a thing (` ⌥V ` on blue, its key;
+/// a click flips it too), else dim text.
 fn agents_header(view: &ViewModel, w: usize) -> Row {
     let word = if view.scope.session.is_some() { "this space" } else { "all spaces" };
-    let toggles = view.scope.toggles() && w > dwidth(word) + 12;
-    let mut right = if toggles { pill(vec![seg(word, "sub")], "surface0") } else { vec![seg(word, "overlay")] };
+    let toggles = view.scope.toggles() && w > dwidth(word) + 16;
+    let mut right = if toggles { module("⌥V", "blue", vec![seg(word, "sub")]) } else { vec![seg(word, "overlay")] };
     right.push(seg(" ", "text"));
     let ww = width(&right);
     let mut row = Row::new(fit(w, vec![bold(" AGENTS", "overlay")], right, None));
@@ -1703,11 +1759,11 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: u8, pad: bool) -> Vec<Row> {
     padded(rows, w, bg, pad)
 }
 
-/// ` NEEDS YOU` and the count as a small yellow pill, or `✓ all clear`
+/// ` NEEDS YOU` and the count as a square yellow chip, or `✓ all clear`
 /// with nothing pending.
 fn needs_header(view: &ViewModel, w: usize) -> Row {
     let n = view.needs.len();
-    let mut right = if n > 0 { pill(vec![bold(n.to_string(), "crust")], "yellow") } else { vec![seg("✓ all clear", "overlay")] };
+    let mut right = if n > 0 { module(&n.to_string(), "yellow", vec![]) } else { vec![seg("✓ all clear", "overlay")] };
     right.push(seg(" ", "text"));
     Row::new(fit(w, vec![bold(" NEEDS YOU", if n > 0 { "yellow" } else { "overlay" })], right, None))
 }
@@ -1748,7 +1804,7 @@ fn needs_cut(view: &ViewModel, cx: Cx, room: usize) -> Vec<Row> {
 
 // ---------------------------------------------------------------- spaces
 
-/// The spaces the pills show, in [`space_order`]: every session the view
+/// The spaces SPACES lists, in [`space_order`]: every session the view
 /// holds except `@space_hidden` ones.
 fn space_list(view: &ViewModel) -> Vec<&Space> {
     let mut v: Vec<&Space> = view.spaces.iter().filter(|s| !s.hidden).collect();
@@ -1761,65 +1817,91 @@ fn space_alert(sp: &Space) -> bool {
     sp.agents.iter().any(|a| a.attention)
 }
 
-/// A space as a rounded button: `2 bai` between half-circle caps, its ⌃N
-/// digit (1-9) in its `@space_color`. The client's space is FILLED with
-/// that colour (lavender without one), dark ink; the others sit on
-/// `surface0`, dim when they hold no agent. A space with an agent needing
-/// attention carries that state's glyph. A click switches the client to it.
-fn space_pill(sp: &Space) -> Item {
-    let name = clip(&sanitize(&sp.name), 12);
-    let col = tmux_colour(&sp.color);
-    let num = sp.index.filter(|n| (1..=9).contains(n));
-    let alert = sp.agents.iter().filter(|a| a.attention).min_by_key(|a| a.rank).and_then(|a| a.cat).map(|c| (c.glyph(), cat_hue(c)));
-    let mut segs = Vec::new();
-    let bg = if sp.is_current {
-        let bg = col.unwrap_or(Ink::Pal("lavender"));
-        let ink = ink_on(bg);
-        let label = match num {
-            Some(n) => format!("{n} {name}"),
-            None => name,
-        };
-        segs.push(block(label, ink, bg));
-        if let Some((g, _)) = alert {
-            segs.push(block(format!(" {g}"), ink, bg));
-        }
-        bg
-    } else {
-        let bg = Ink::Pal("surface0");
-        let quiet = sp.counts.total() == 0;
-        if let Some(n) = num {
-            segs.push(Seg { bold: true, ..on(format!("{n} "), col.unwrap_or(Ink::Pal(dim(true))), bg) });
-        }
-        segs.push(on(name, if quiet { dim(true) } else { "sub" }, bg));
-        if let Some((g, hue)) = alert {
-            segs.push(on(format!(" {g}"), hue, bg));
-        }
-        bg
-    };
-    item(pill(segs, bg), Some(Target::Session(sp.name.clone())))
+/// A space's colour: its `@space_color`, else the status line's default
+/// (`@space_col`: peach).
+fn space_colour(sp: &Space) -> Ink {
+    tmux_colour(&sp.color).unwrap_or(Ink::Pal("peach"))
 }
 
-/// The pills in at most `lines` rows: all of them, else the client's space,
-/// those with an attention agent, then ⌃N order, kept (shown in list
-/// order), and a `+K` pill (the menu's All tab) for the rest.
-fn pill_rows(view: &ViewModel, w: usize, lines: usize) -> Vec<Row> {
+/// The client's space's chip colour: red while the prefix is armed (the
+/// status line's `@space_chip`), else the space's own.
+fn chip_colour(sp: &Space, prefix: bool) -> Ink {
+    if prefix {
+        Ink::Pal("red")
+    } else {
+        space_colour(sp)
+    }
+}
+
+/// The client's space as the status line's `@space_here`: one solid chip in
+/// its colour, ` N name ` in bold dark ink, ending in the powerline arrow.
+fn here_chip(sp: &Space, prefix: bool, room: usize) -> Vec<Seg> {
+    // The name gives way (clipped with `…`) so the chip keeps its arrow in
+    // `room` cells.
+    let num = sp.index.filter(|n| (1..=9).contains(n)).map_or(0, |n| n.to_string().len() + 1);
+    let name = clip(&sanitize(&sp.name), room.saturating_sub(num + 3).max(1));
+    let chip = chip_colour(sp, prefix);
+    let label = match sp.index.filter(|n| (1..=9).contains(n)) {
+        Some(n) => format!(" {n} {name} "),
+        None => format!(" {name} "),
+    };
+    vec![block(label, ink_on(chip), chip), seg(ARROW, chip)]
+}
+
+/// The state glyph of a space's most urgent attention agent, in its colour.
+fn alert_of(sp: &Space) -> Option<(&'static str, Hue)> {
+    sp.agents.iter().filter(|a| a.attention).min_by_key(|a| a.rank).and_then(|a| a.cat).map(|c| (c.glyph(), cat_hue(c)))
+}
+
+/// A space as a status-line chip, for the one-line fallback: the client's
+/// space as [`here_chip`]; another as a module, ` N ` on its colour then its
+/// name on `surface0` (dim when it holds no agent), an attention agent's
+/// glyph after it. A click switches the client to it.
+fn space_pill(sp: &Space, prefix: bool) -> Item {
+    let mut segs = if sp.is_current {
+        // (A 12-cell name at most, like the others.)
+        here_chip(sp, prefix, 17)
+    } else {
+        let quiet = sp.counts.total() == 0;
+        let mut label = vec![seg(clip(&sanitize(&sp.name), 12), if quiet { dim(true) } else { "sub" })];
+        if let Some((g, hue)) = alert_of(sp) {
+            label.push(seg(format!(" {g}"), hue));
+        }
+        match sp.index.filter(|n| (1..=9).contains(n)) {
+            Some(n) => module(&n.to_string(), space_colour(sp), label),
+            None => label_module(label),
+        }
+    };
+    if sp.is_current {
+        if let Some((g, hue)) = alert_of(sp) {
+            segs.push(seg(format!(" {g}"), hue));
+        }
+    }
+    item(segs, Some(Target::Session(sp.name.clone())))
+}
+
+/// The spaces as chips in at most `lines` rows (the bottom's last resort):
+/// all of them, else the client's space, those with an attention agent,
+/// then ⌃N order, kept (shown in list order), and a `+K` module (the menu's
+/// All tab) for the rest.
+fn pill_rows(view: &ViewModel, w: usize, lines: usize, prefix: bool) -> Vec<Row> {
     let list = space_list(view);
-    let items: Vec<Item> = list.iter().map(|sp| space_pill(sp)).collect();
+    let items: Vec<Item> = list.iter().map(|sp| space_pill(sp, prefix)).collect();
     let mut rank: Vec<usize> = (0..list.len()).collect();
     rank.sort_by_key(|&i| (!list[i].is_current, !space_alert(list[i])));
-    let more = |k: usize| item(pill(vec![on(format!("+{k}"), "sub", "surface0")], "surface0"), Some(Target::Menu(Some("all"))));
+    let more = |k: usize| item(module(&format!("+{k}"), "overlay2", vec![]), Some(Target::Menu(Some("all"))));
     pack(&[], &items, &rank, w, lines, &more).0
 }
 
-/// How many pill lines every space needs (at most 3).
+/// How many chip lines every space needs (at most 3).
 fn pill_lines(view: &ViewModel, w: usize) -> usize {
-    let items: Vec<Item> = space_list(view).iter().map(|sp| space_pill(sp)).collect();
+    let items: Vec<Item> = space_list(view).iter().map(|sp| space_pill(sp, false)).collect();
     place(&items, w, usize::MAX).map_or(1, |r| r.len()).clamp(1, 3)
 }
 
-/// The rows the spaces section keeps however short the frame (held back
-/// before anything else is laid out, agents included): its gap and one
-/// pill line. 0 with no spaces, or when `avail` is under 4.
+/// The rows the spaces keep however short the frame (held back before
+/// anything else is laid out, agents included): a gap and one line of
+/// chips. 0 with no spaces, or when `avail` is under 4.
 fn spaces_min(view: &ViewModel, avail: usize) -> usize {
     if space_list(view).is_empty() || avail < 4 {
         0
@@ -1828,17 +1910,182 @@ fn spaces_min(view: &ViewModel, avail: usize) -> usize {
     }
 }
 
-/// The spaces section in the `room` rows the sections above left: a blank
-/// gap and as many pill lines as it needs and fit (at least one), else
-/// nothing.
-fn spaces_fit(view: &ViewModel, w: usize, room: usize) -> Vec<Row> {
-    if space_list(view).is_empty() || room < 2 {
+/// How many spaces the SPACES section lists whole before it prefers its
+/// collapsed form when reserving rows ([`spaces_listed`]).
+const SPACES_LISTED: usize = 6;
+
+/// The rows the SPACES section stood on end needs, with the gap above
+/// PARKED: every space a row (up to [`SPACES_LISTED`] of them), else the
+/// collapsed form. What the steps that keep decoration leave it.
+fn spaces_listed(view: &ViewModel, w: usize) -> usize {
+    let n = space_list(view).len();
+    if n == 0 {
+        return 0;
+    }
+    let form = if n <= SPACES_LISTED { SpacesForm::Full } else { SpacesForm::Collapsed };
+    spaces_rows(view, w, form, false).len() + 1
+}
+
+/// One space as a row of the SPACES section, the status line's modules
+/// stood on end: ` N ` on the space's colour (dark bold digit), then its
+/// name on the row's tile, its branch dim when there is room, its agents'
+/// counts on the right (the AGENTS headers' glyphs). The client's space is
+/// `@space_here`: one chip in its colour (red while the prefix is armed)
+/// across number and name, ending in the arrow. A click switches to it.
+fn space_row(sp: &Space, w: usize, k: usize, prefix: bool) -> Row {
+    let bg = shade(k, false);
+    let name = sanitize(&sp.name);
+    let mut right: Vec<Seg> =
+        count_segs(&sp.counts).into_iter().map(|s| if s.fg == Ink::Pal("overlay") { Seg { fg: Ink::Pal(dim(true)), ..s } } else { s }).collect();
+    right.push(seg(" ", "text"));
+    let mut left = if sp.is_current {
+        // The counts stay; the name gives way, the arrow kept.
+        here_chip(sp, prefix, inner(w).saturating_sub(width(&right) + 1))
+    } else {
+        let quiet = sp.counts.total() == 0;
+        let num = sp.index.filter(|n| (1..=9).contains(n)).map_or(" ".to_string(), |n| n.to_string());
+        vec![block(format!(" {num} "), ink_on(space_colour(sp)), space_colour(sp)), seg(" ", "text"), seg(name, if quiet { dim(true) } else { "sub" })]
+    };
+    if !sp.branch.is_empty() {
+        let br = format!("  \u{e0a0} {}", sanitize(&sp.branch));
+        if width(&left) + dwidth(&br) + width(&right) < inner(w) {
+            left.push(seg(br, dim(true)));
+        }
+    }
+    tile_row(w, bg, left, right).click(w, Target::Session(sp.name.clone()))
+}
+
+/// ` SPACES`: the section's header (nothing on the right: the scope lives
+/// in AGENTS).
+fn spaces_header(w: usize) -> Row {
+    Row::new(fit(w, vec![bold(" SPACES", "overlay")], vec![], None))
+}
+
+/// `+K more spaces`: the ones a collapsed SPACES section leaves out (the
+/// menu's All tab).
+fn spaces_more(k: usize, w: usize, shade_k: usize) -> Row {
+    tile_row(w, shade(shade_k, false), [module(&format!("+{k}"), "overlay2", vec![]), vec![seg(" more spaces", dim(true))]].concat(), vec![])
+        .click(w, Target::Menu(Some("all")))
+}
+
+/// The SPACES section's forms, richest first: every space a row (`full`);
+/// the client's space and those with an attention agent, then `+K more`;
+/// else (the last resort) the chips in `lines` lines. Each starts with its
+/// gap.
+fn spaces_rows(view: &ViewModel, w: usize, form: SpacesForm, prefix: bool) -> Vec<Row> {
+    let list = space_list(view);
+    if list.is_empty() {
         return Vec::new();
     }
-    let lines = pill_lines(view, w).min(room - 1);
     let mut rows = vec![Row::blank(w)];
-    rows.extend(pill_rows(view, w, lines));
+    match form {
+        SpacesForm::Full => {
+            rows.push(spaces_header(w));
+            rows.extend(list.iter().enumerate().map(|(k, sp)| space_row(sp, w, k, prefix)));
+        }
+        SpacesForm::Collapsed => {
+            rows.push(spaces_header(w));
+            let kept: Vec<&&Space> = list.iter().filter(|sp| sp.is_current || space_alert(sp)).collect();
+            rows.extend(kept.iter().enumerate().map(|(k, sp)| space_row(sp, w, k, prefix)));
+            rows.push(spaces_more(list.len() - kept.len(), w, kept.len()));
+        }
+        SpacesForm::Chips(lines) => rows.extend(pill_rows(view, w, lines.max(1), prefix)),
+    }
     rows
+}
+
+/// How the SPACES section is drawn ([`spaces_rows`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpacesForm {
+    Full,
+    Collapsed,
+    Chips(usize),
+}
+
+/// ` PARKED` and its count as a square mauve chip (the stash's colour; dim
+/// with none): a click opens the same popup as prefix h ([`Target::Stash`]).
+/// On the right a message (Roster.say) or the watcher's problem in red
+/// (click: restart).
+fn parked_header(view: &ViewModel, w: usize, msg: Option<&str>) -> Row {
+    let n = view.parked.len();
+    let mut left = vec![bold(" PARKED", "overlay"), seg(" ", "text")];
+    if n > 0 {
+        left.extend(module(&n.to_string(), "mauve", vec![]));
+    } else {
+        left.push(seg("none", "overlay"));
+    }
+    let (right, restart) = match (msg, watcher_problem(view.watcher_age)) {
+        (Some(m), _) => (vec![seg(format!("{} ", sanitize(m)), "sub")], false),
+        (None, Some(p)) => (vec![seg(format!("watcher {p} "), "red")], true),
+        (None, None) => (vec![], false),
+    };
+    let segs = fit(w, left, right.clone(), None);
+    let rw = width(&clip_segs(right, w)) as u16;
+    let w16 = w as u16;
+    let mut row = Row::new(segs);
+    row.targets.push((0, w16 - rw, Target::Stash));
+    if restart && rw > 0 {
+        row.targets.push((w16 - rw, w16, Target::Restart));
+    }
+    row
+}
+
+/// How many parked tabs the PARKED section lists at most.
+const PARKED_SHOWN: usize = 3;
+
+/// The parked tabs under ` PARKED`: up to [`PARKED_SHOWN`], dim, each its
+/// title and, on the right, the space it came from; `+N more` for the
+/// rest. Every row opens the unpark picker.
+fn parked_rows(view: &ViewModel, w: usize) -> Vec<Row> {
+    let mut rows: Vec<Row> = view
+        .parked
+        .iter()
+        .take(PARKED_SHOWN)
+        .map(|p| {
+            let right = vec![seg(sanitize(&p.origin), "overlay"), seg(" ", "text")];
+            Row::new(fit(w, vec![seg("   ⏸ ", "overlay"), seg(sanitize(&p.agent.short_title), "overlay")], right, None)).click(w, Target::Stash)
+        })
+        .collect();
+    let rest = view.parked.len().saturating_sub(PARKED_SHOWN);
+    if rest > 0 {
+        rows.push(dim_line(w, &format!("     +{rest} more")).click(w, Target::Stash));
+    }
+    rows
+}
+
+/// The bottom of the frame in `room` rows (at least 1): the SPACES section
+/// and the PARKED section's header, the richest form that fits. As rows run
+/// short the spaces collapse to the client's space and the attention ones
+/// (`+K more`), then to chips on as few as one line, the gap above PARKED
+/// last. (The parked tabs under the header are spare rows' business:
+/// [`parked_rows`], only beside the full SPACES section.) → (the spaces
+/// rows, the parked rows: its gap and header, whether the spaces are full).
+fn bottom(view: &ViewModel, w: usize, room: usize, prefix: bool, msg: Option<&str>) -> (Vec<Row>, Vec<Row>, bool) {
+    let header = parked_header(view, w, msg);
+    let parked = |gap: bool| -> Vec<Row> { if gap { vec![Row::blank(w), header.clone()] } else { vec![header.clone()] } };
+    let list = space_list(view);
+    if list.is_empty() {
+        return (Vec::new(), parked(room >= 2), true);
+    }
+    if room < 3 {
+        return (Vec::new(), parked(false), false);
+    }
+    let chips = pill_lines(view, w);
+    let collapsible = list.iter().any(|sp| !sp.is_current && !space_alert(sp));
+    let mut forms: Vec<(SpacesForm, bool)> = vec![(SpacesForm::Full, true)];
+    if collapsible {
+        forms.push((SpacesForm::Collapsed, true));
+    }
+    forms.extend((1..=chips).rev().map(|l| (SpacesForm::Chips(l), true)));
+    forms.extend((1..=chips).rev().map(|l| (SpacesForm::Chips(l), false)));
+    for (form, gap) in forms {
+        let s = spaces_rows(view, w, form, prefix);
+        let p = parked(gap);
+        if s.len() + p.len() <= room {
+            return (s, p, form == SpacesForm::Full);
+        }
+    }
+    (Vec::new(), parked(false), false)
 }
 
 /// One step at which agents keep full detail ([`STEPS`]).
@@ -1866,29 +2113,6 @@ pub const STEPS: [Step; 5] = [
     Step { gaps: false, pads: false, card_pads: false, lines: 2 },
     Step { gaps: false, pads: false, card_pads: false, lines: 1 },
 ];
-
-/// The last row: the stash as a rounded button, `⏸ N parked` (a click
-/// opens the same popup as prefix h, [`Target::Stash`]), and on the right a
-/// message (Roster.say) or the watcher's problem in red (click: restart).
-fn last_row(view: &ViewModel, w: usize, msg: Option<&str>) -> Row {
-    let n = view.parked.len();
-    let mut left = vec![seg(" ", "text")];
-    left.extend(pill(vec![seg(format!("⏸ {n} parked"), if n > 0 { "sub" } else { "overlay2" })], "surface0"));
-    let (right, restart) = match (msg, watcher_problem(view.watcher_age)) {
-        (Some(m), _) => (vec![seg(format!("{} ", sanitize(m)), "sub")], false),
-        (None, Some(p)) => (vec![seg(format!("watcher {p} "), "red")], true),
-        (None, None) => (vec![], false),
-    };
-    let segs = fit(w, left, right.clone(), None);
-    let rw = width(&clip_segs(right, w)) as u16;
-    let w16 = w as u16;
-    let mut row = Row::new(segs);
-    row.targets.push((0, w16 - rw, Target::Stash));
-    if restart && rw > 0 {
-        row.targets.push((w16 - rw, w16, Target::Restart));
-    }
-    row
-}
 
 /// The whole screen: the panel, NEEDS YOU, agents, shells, spare rows, the
 /// spaces, the last row; then the live toasts as cards over its top. Always
@@ -1921,9 +2145,9 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
 fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     let (w, h) = (cx.w, usize::from(frame.height));
     let bar = &opts.bar;
-    let last = last_row(view, w, opts.msg.as_deref());
     let Top { rows: top, status, card, keep } = top_rows(view, bar, w, h, cx.now);
-    // The rows between the top and the last row.
+    // The rows between the top and the PARKED header (held back like the
+    // old last row: it carries the stash, the messages and the watcher).
     let avail = h.saturating_sub(top.len() + 1);
     if avail == 0 {
         // No room for sections: one row still counts every agent of the
@@ -1931,17 +2155,20 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
         let all: Vec<&Agent> = groups(view).into_iter().flat_map(|s| s.agents.iter()).collect();
         let mut rows = vec![top.into_iter().next().unwrap_or_else(|| Row::blank(w))];
         rows.push(if all.is_empty() { Row::blank(w) } else { more_row(w, &all, 0) });
-        rows.push(last);
+        rows.push(parked_header(view, w, opts.msg.as_deref()));
         rows.truncate(h);
+        // (Its header is the third row: empty when the frame cut it.)
+        frame.parked = if rows.len() == 3 { 2..3 } else { rows.len()..rows.len() };
         frame.rows = rows;
         frame.step = STEPS.len() as u8;
         frame.status = 0..0;
         return keep.min(1);
     }
-    // The spaces' gap and first pill line are held back first: spaces are
+    // The spaces' gap and one line of chips are held back first: spaces are
     // listed nowhere else, so the section never goes before the agents
     // lose detail.
-    let avail = avail - spaces_min(view, avail);
+    let min = spaces_min(view, avail);
+    let avail = avail - min;
     // Every step with the shells' whole section (each button with its pad
     // while the gaps last, then edge to edge), then the last step with their
     // one line: one ladder, so as the frame shrinks neither the step nor the
@@ -1949,11 +2176,16 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     let (padded, full, line) = (shells_section(bar, w, true), shells_section(bar, w, false), shells_line(bar, w));
     let end = STEPS.len() - 1;
     let tries = STEPS.iter().enumerate().map(|(i, s)| (i, *s, if s.card_pads { &padded } else { &full })).chain([(end, STEPS[end], &line)]);
+    // The SPACES list stood on end says something (each space's counts):
+    // the steps that keep decoration (gaps, pads) must leave it its rows
+    // too; the plain steps only its held-back minimum.
+    let listed = if min == 0 { 0 } else { spaces_listed(view, w).saturating_sub(min) };
     let fits = tries.into_iter().find_map(|(i, Step { gaps, pads, card_pads, lines }, shells)| {
         let needs = needs_block(view, cx, lines, card_pads);
         let agents = agents_section(view, cx, usize::MAX, gaps, pads).0;
         let gap_rows = usize::from(gaps) * (2 + usize::from(!shells.is_empty()));
-        (needs.len() + agents.len() + shells.len() + gap_rows <= avail).then(|| (i as u8, gaps, lines, needs, agents, shells.clone()))
+        let room = if gaps || pads || card_pads { avail.saturating_sub(listed) } else { avail };
+        (needs.len() + agents.len() + shells.len() + gap_rows <= room).then(|| (i as u8, gaps, lines, needs, agents, shells.clone()))
     });
     let (step, gaps, lines, mut needs, (mut agents, agents_step), shells) = match fits {
         Some((i, gaps, lines, needs, agents, shells)) => (i, gaps, lines, needs, (agents, 0), shells),
@@ -1977,14 +2209,14 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     let mut gap_needs = gaps && !top.is_empty();
     let mut gap_agents = gaps && !agents.is_empty();
     let mut gap_shells = gaps && !shells.is_empty();
-    // The spaces take the rows left over (their pill lines are content);
-    // what they leave buys spacing back, never detail: the agents' shape
-    // (and so the ladder's steps) is already settled, and their pads never
-    // come back.
+    // The SPACES and PARKED sections take the rows left over (the richest
+    // form that fits: they are content); what they leave buys spacing back,
+    // never detail: the agents' shape (and so the ladder's steps) is
+    // already settled, and their pads never come back.
     let used = |n: &[Row], a: &[Row], g: [bool; 3]| top.len() + n.len() + a.len() + shells.len() + g.iter().filter(|x| **x).count();
-    let room = (h - 1).saturating_sub(used(&needs, &agents, [gap_needs, gap_agents, gap_shells]));
-    let spaces = spaces_fit(view, w, room);
-    let mut spare = room - spaces.len();
+    let room = h.saturating_sub(used(&needs, &agents, [gap_needs, gap_agents, gap_shells]));
+    let (spaces, mut parked, full) = bottom(view, w, room, bar.prefix, opts.msg.as_deref());
+    let mut spare = room.saturating_sub(spaces.len() + parked.len());
     // 1. The gap above each section header: AGENTS, SHELLS, NEEDS YOU.
     for (gap, there) in [(&mut gap_agents, !agents.is_empty()), (&mut gap_shells, !shells.is_empty()), (&mut gap_needs, !top.is_empty())] {
         if there && !*gap && spare > 0 {
@@ -2008,7 +2240,11 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
         agents = spaced_groups(agents, w);
         spare -= missing;
     }
-    let _ = spare;
+    // 4. The parked tabs under their header (beside the full SPACES list).
+    let tabs = parked_rows(view, w);
+    if full && !tabs.is_empty() && tabs.len() <= spare {
+        parked.extend(tabs);
+    }
     let mut rows = top;
     frame.status = status;
     frame.card = card;
@@ -2030,16 +2266,18 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     let at = rows.len();
     rows.extend(shells);
     frame.shells = at..rows.len();
-    // Spare rows collect here (what spacing could not use); the spaces sit
-    // right above the last row.
-    while rows.len() + spaces.len() < h - 1 {
+    // Spare rows collect here (what spacing could not use); SPACES and
+    // PARKED sit at the bottom.
+    while rows.len() + spaces.len() + parked.len() < h {
         rows.push(Row::blank(w));
     }
     let at = rows.len();
     rows.extend(spaces);
     frame.spaces = at.min(rows.len())..rows.len();
-    rows.push(last);
+    let at = rows.len();
+    rows.extend(parked);
     rows.truncate(h);
+    frame.parked = at.min(rows.len())..rows.len();
     frame.rows = rows;
     frame.step = step;
     frame.agents_step = agents_step;

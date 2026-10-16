@@ -788,36 +788,68 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
     S ━━━━━┃━━━━━━━━━  21% (-4%)       half-block pad above and below, no
     W ━━━━━━━━━┃━━━━━  60% (+17%)      border); the key table's mark a solid
    ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀    tab on its top pad; one meter per window
-   NEEDS YOU                    (2)    NEEDS YOU, agent-jump.sh order: cards are
+   NEEDS YOU                      2    NEEDS YOU, agent-jump.sh order: cards are
    ▌ a  Slides export          ✕ 3m    tiles tinted in the state colour, a ▌
    ▌    failed                         stripe (letter, title; reason)
    ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-   AGENTS               (all spaces)   THE BODY: every space (or the client's
+   AGENTS          ⌥V  all spaces      THE BODY: every space (or the client's
    ● main   main          ◉1 ◐1 ○1    in space scope); every agent a 2-line
-   ▌ d  Sidebar status ⠹ working      tile (message, or an idle agent's last
-   ▌    run cargo test          26s    outcome, or blank; the age at its end),
-   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀    a state stripe at its left edge, a
-     h  Canvas Syllabus        idle    half-block pad under it while there is
-        Synced 4 assignments     1h    room (else edge to edge, zebra-shaded)
+   ▌ d  Sidebar status ⠹ working      tile; the second line (below), the age
+   ▌  › Running cargo test     26s     at its end; a state stripe at its left
+   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀    edge, a half-block pad under it while
+     h  Canvas Syllabus        idle    there is room (else edge to edge,
+        Synced 4 assignments     1h    zebra-shaded)
    ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
    SHELLS                              the client's space's shells, one-row
    ▌ ⌥1  ⌂ ~                           button tiles (⌥N; click: go there),
                                        the active one lifted
                                        spare rows collect here
-   (1 main) (2 bai) (3 cs35l)          the spaces as rounded buttons, ⌃N
-   (⏸ 0 parked)                        order; the stash; a watcher problem red
+   SPACES                              one row per space, ⌃N order: ` N ` on
+    1 main ▶            ◐1 ○3          its colour, the name, its counts; the
+    2  bai                 ○2          client's as @space_here (red on prefix)
+   PARKED  3                           the stash's count; a message or the
+     ⏸ Canvas export        main       watcher on the right; up to 3 parked
   ```
 
-  (`( )` here: the Nerd Font half-circle caps U+E0B6 / U+E0B4 drawn in the
-  button's colour.) Every tile and button leaves one canvas column at each
-  side of the sidebar; section and space headers are text on the canvas.
-  Palette: `tile` (#282839), `tile_alt` (the zebra's other shade),
-  `tile_hi` (the client's agent, the active shell), key-caps on `surface1`.
-  The panel shows no space chip (the filled pill at the bottom says which
-  space the client is in) and no shells (their own section). Under pressure
-  every agent row stays the same height: idle agents fold first, then every
-  agent goes to one line at once; the SHELLS section becomes one line of
-  buttons (` SHELLS (⌥1 ⌂~) (⌥2 nvim) +1`) before any agent loses detail.
+  Chips take a page out of the tmux status line (its catppuccin blocks,
+  square ends, no caps): a module is ` key ` bold in dark ink on a colour,
+  then ` label ` on `surface0` — the NEEDS YOU and PARKED counts, the scope
+  toggle ` ⌥V `, the shells in one line (`@space_shell`: ` ⌥N ` on blue,
+  peach when active), the spaces as chips, `+K`. The client's space is
+  `@space_here`: one chip in its colour (peach without one, red while the
+  prefix is armed) ending in the powerline arrow U+E0B0 (`▶` above). Every
+  tile and button leaves one canvas column at each side of the sidebar;
+  section and space headers are text on the canvas. Palette: `tile`
+  (#282839), `tile_alt` (the zebra's other shade), `tile_hi` (the client's
+  agent, the active shell), key-caps on `surface1`. The panel shows no
+  space chip (SPACES says which space the client is in) and no shells
+  (their own section). Under pressure every agent row stays the same
+  height: idle agents fold first, then every agent goes to one line at
+  once; the SHELLS section becomes one line of modules before any agent
+  loses detail.
+
+- **The second line** (`layout::second_line`): a WORKING agent's live
+  activity, a few words of what it does right now, after a blue `›`
+  (`Running cargo test`, `Editing layout.rs`, a Bash or Agent call's own
+  `description`, an in-progress todo's `activeForm`, `Thinking…` before its
+  first tool call), changing as the turn goes on, like Claude's subagent
+  names; without one, its run detail as before. Every other agent as
+  before: an asking or failed agent's message, a finished one's reply
+  (`done` detail), an idle one's last outcome. The blurb comes from the
+  agent's own transcript (`sidebar::activity`; no hook, no fork):
+  `~/.claude/sessions/<pid>.json` maps the tmux window (its `tmux` field)
+  to the session id and cwd (a live pid's file only), the transcript is
+  `~/.claude/projects/<cwd slug>/<sid>.jsonl` (else found once by a scan,
+  then cached). Only for agents whose state is working (an asking agent
+  with a workflow or cua flag shows its question), only when the file's
+  (len, mtime) changed, at most its last 64 KB (nothing usable there: the
+  run detail), walked back from the end through the current turn (to the
+  last real prompt; a tool result is none): the in-progress todo first (a
+  task a later update closed no longer counts), else the latest tool call
+  phrased (a hashed file name by what it is, `a transcript`, `tool output`;
+  never a word that looks like a secret), else `Thinking…`. Codex agents keep the run
+  detail (their rollout is `@agent_rollout`, not in the snapshot yet).
+  `AGENT_UI_CLAUDE_DIR` points it elsewhere (tests).
 
 - **Letters**: every agent tile (both scopes) and every NEEDS YOU card
   starts, after its stripe, with a ` a ` key-cap (a raised `surface1` chip):
@@ -868,21 +900,28 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   no longer read; `--split` is accepted and ignored). The spaces list has no
   git line, so the sidebar never runs `git status`; the branch still shows on
   each rule.
-- **Spaces** (the status bar is hidden, so these buttons are where every
-  space is seen): one rounded button per session above the last row (after
-  a blank gap), sessions with `@space_hidden` 1 left out, ordered by the
-  session option `@space_index` (space.sh's number: main = 1, then the
-  registry), unnumbered ones last by name; the agents section's groups use
-  the same order. Each reads `N name` (`N` = ⌃N, Ctrl+N, blank past 9) and
-  an attention agent's glyph; the client's space is filled with its
-  `@space_color` (lavender without one), the others sit on `surface0` with
-  the digit in their colour. Too many for the rows left: the client's space
-  and the attention ones are kept, `+K` (click: the menu's All tab) for the
-  rest. A click switches the client to that space (`agent-jump.sh goto` on
-  its active window, in that session). The index, hidden mark and colour
-  are SESSION options read through the window-row format, so they cost no
-  extra tmux call.
-- **Stash**: the last row is a ` ⏸ N parked` button. A click runs exactly prefix h's
+- **SPACES** (the status bar is hidden, so this is where every space is
+  seen): a section under SHELLS, after a gap: ` SPACES`, then one row per
+  session, sessions with `@space_hidden` 1 left out, ordered by the session
+  option `@space_index` (space.sh's number: main = 1, then the registry),
+  unnumbered ones last by name; the agents section's groups use the same
+  order. A row is the status line's module stood on end: ` N ` (⌃N, Ctrl+N;
+  blank past 9) bold in dark ink on the space's `@space_color` (peach
+  without one), its name on the row's tile, its branch dim when there is
+  room, its agents' counts on the right (the AGENTS headers' glyphs). The
+  client's space is `@space_here`: one chip across number and name in its
+  colour, red while the prefix is armed, ending in the U+E0B0 arrow. As
+  rows run short: the client's space and those with an attention agent and
+  `+K more spaces` (click: the menu's All tab), then chips on as few as one
+  line (`@space_here` and modules). A click switches the client to that
+  space (`agent-jump.sh goto` on its active window, in that session). The
+  index, hidden mark and colour are SESSION options read through the
+  window-row format, so they cost no extra tmux call.
+- **Stash** (PARKED, the last section, after a gap): ` PARKED` and the
+  count as a square mauve chip (`none` dim with nothing parked), a message
+  or the watcher's problem on the right; with rows to spare (beside the
+  full SPACES list), up to 3 parked tabs one row each (dim: the title, the
+  space it came from) and `+N more`. A click on any of it runs exactly prefix h's
   command, `tmux run-shell "stash.sh unstash '' <client>"` (the sidebar's
   client for `#{client_name}`; a unit test compares it with tmux.conf.tmpl's
   `bind-key h`), so the same picker popup opens on that client. A plain
@@ -897,9 +936,12 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   once. A right press anywhere else, or with a modifier, only hands focus
   back.
 - **Density ladder** (`layout::STEPS`): agents lose detail last. Before
-  anything else the spaces' gap and one line of buttons are held back
-  (`+K` for the rest). A frame then takes the first step at which every
-  agent still gets two lines: (1) the spaces grow into leftover rows; (2)
+  anything else the spaces' gap and one line of chips are held back, with
+  the PARKED header; the steps that keep decoration (gaps, pads) must also
+  leave the SPACES list its rows. A frame then takes the first step at
+  which every agent still gets two lines: (1) SPACES and PARKED take the
+  leftover rows, the richest form that fits (every space a row, else the
+  client's and the attention ones, else chips); (2)
   the blank gaps go; (3) the pads go, the cards' and shell buttons' first,
   then the agents' (tiles edge to edge, alternating `tile` / `tile_alt`);
   (4) NEEDS YOU cards go to 1 line; (5) the shells to one line of buttons.
@@ -915,7 +957,10 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   The surfaces are tiles and buttons in solid fills (no box-drawing lines
   around anything but a toast card): `tile` / `tile_alt` / `tile_hi`,
   NEEDS YOU cards in their state colour mixed over the canvas (`Ink::Mix`),
-  the stash selection's mauve, the key-caps and pills. Dim text on any
+  the stash selection's mauve, the key-caps and the status-line modules.
+  Rows left over after all that buy spacing back: the gaps above AGENTS,
+  SHELLS and NEEDS YOU, the cards' pads, the gaps between spaces in
+  AGENTS, then PARKED's tabs. Dim text on any
   surface is `overlay2` (`overlay` there is under 3:1).
 - **Sync (told, not polling)**: the loop sleeps in `poll(2)` on stdin, the
   signal pipe, one Darwin-notification fd (`notify_register_file_descriptor`,

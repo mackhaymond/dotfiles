@@ -75,6 +75,8 @@ impl Server {
             .args(["--socket", &self.name, "sidebar"])
             .args(args)
             .env_remove("WEZTERM_PANE")
+            // (Never the real transcripts: no activity blurbs here.)
+            .env("AGENT_UI_CLAUDE_DIR", "/nonexistent")
             .output()
             .expect("run agent-ui");
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -139,20 +141,27 @@ fn at(lines: &[String], p: &str) -> usize {
     lines.iter().position(|l| l.starts_with(p)).unwrap_or_else(|| panic!("{p:?} not in {lines:#?}"))
 }
 
-/// A pill's rounded caps (Nerd Font half circles).
-const CAP_L: char = '\u{e0b6}';
-const CAP_R: char = '\u{e0b4}';
+/// The status line's arrow (U+E0B0) the client's space chip ends in.
+const ARROW: char = '\u{e0b0}';
 
-/// `l` with the pills' caps as spaces (` main ` reads as a word).
+/// `l` as words: the arrow a space, runs of spaces one, padded (` 1 main `).
 fn uncapped(l: &str) -> String {
-    l.replace([CAP_L, CAP_R], " ")
+    format!(" {} ", l.replace(ARROW, " ").split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" "))
 }
 
-/// The first line of space pills: the first that starts with a cap (the
-/// parked button, last, is one too).
-fn first_pills(lines: &[String]) -> usize {
-    let cap = format!(" {CAP_L}");
-    lines.iter().position(|l| l.starts_with(&cap)).unwrap_or_else(|| panic!("no pills: {lines:#?}"))
+/// Where the SPACES section starts (its header, else the gap above its
+/// chips) → (that line, the PARKED header's line).
+fn spaces_at(lines: &[String]) -> (usize, usize) {
+    let p = at(lines, " PARKED");
+    let s = lines[..p].iter().rposition(|l| l.starts_with(" SPACES"));
+    let s = s.unwrap_or_else(|| lines[..p - 1].iter().rposition(|l| l.trim().is_empty()).unwrap_or_else(|| panic!("no spaces: {lines:#?}")));
+    (s, p)
+}
+
+/// The SPACES section's text, as words.
+fn spaces_text(lines: &[String]) -> String {
+    let (s, p) = spaces_at(lines);
+    uncapped(&lines[s..p].join(" "))
 }
 
 #[test]
@@ -192,11 +201,11 @@ fn once_renders_the_fixture() {
     for t in [" ● work", " ● zeta"] {
         assert!(lines[agents..].iter().any(|l| l.starts_with(t) && !l.contains('─')), "{t}: {lines:#?}");
     }
-    // The spaces as rounded pills after a gap, then parked.
-    let pills = uncapped(&lines[first_pills(&lines)..29].join(" "));
+    // The spaces (each a row, or chips), then PARKED with nothing parked.
+    let pills = spaces_text(&lines);
     let pos: Vec<usize> = [" main ", " work ", " zeta "].iter().map(|n| pills.find(n).unwrap_or_else(|| panic!("{n}: {lines:#?}"))).collect();
     assert!(pos.windows(2).all(|p| p[0] < p[1]), "{lines:#?}");
-    assert!(lines[29].starts_with(" \u{e0b6}⏸ 0 parked"), "{lines:#?}");
+    assert!(lines[29].starts_with(" PARKED none"), "{lines:#?}");
     assert!(!lines.iter().any(|l| l.starts_with(" log") || l.contains('═')), "{lines:#?}");
     // `--split` (gone) is ignored, not an error.
     assert_eq!(plain(&s.sidebar(&["--once", "34x30", "--client", CLIENT, "--split", "0.7"])), lines);
@@ -213,7 +222,7 @@ fn once_follows_the_scope_options() {
     let agents_part = |lines: &[String]| {
         let start = lines.iter().position(|l| l.starts_with(" AGENTS"));
         let end = lines.iter().position(|l| l.starts_with(" SHELLS"));
-        let end = end.or_else(|| Some(first_pills(lines))).expect("the spaces");
+        let end = end.or_else(|| Some(spaces_at(lines).0)).expect("the spaces");
         lines[start.expect("the agents section")..end].to_vec()
     };
     // Classic until an option says otherwise (no usage here, so no card and
@@ -226,7 +235,7 @@ fn once_follows_the_scope_options() {
     s.tmux(&["set-option", "-g", "@spaces", "on"]);
     let lines = once();
     let body = agents_part(&lines);
-    assert!(body[0].ends_with("this space\u{e0b4} ") && body[1].starts_with(" ● work") && body[1].contains("◉1 ◐1 ○1"), "{lines:#?}");
+    assert!(body[0].ends_with(" ⌥V  this space  ") && body[1].starts_with(" ● work") && body[1].contains("◉1 ◐1 ○1"), "{lines:#?}");
     // (The client sits on work:1: its row is the highlighted one.)
     for t in [" ▌ a  Which deck", " ▎ s  Long running", "   d  Quiet one"] {
         assert!(body.iter().any(|l| l.starts_with(t)), "{t}: {lines:#?}");
@@ -269,7 +278,7 @@ fn once_lists_spaces_by_space_index() {
     s.tmux(&["new-session", "-d", "-s", "secret", LIFE]);
     s.tmux(&["set-option", "-t", "secret", "@space_hidden", "1"]);
     let lines = plain(&s.sidebar(&["--once", "34x30", "--client", CLIENT]));
-    let pills = uncapped(&lines[first_pills(&lines)..29].join(" "));
+    let pills = spaces_text(&lines);
     let pos: Vec<usize> = [" 1 main ", " 2 zeta ", " 3 work "].iter().map(|n| pills.find(n).unwrap_or_else(|| panic!("{n}: {lines:#?}"))).collect();
     assert!(pos.windows(2).all(|p| p[0] < p[1]), "{lines:#?}");
     assert!(!lines.iter().any(|l| l.contains("secret")), "{lines:#?}");
@@ -299,7 +308,7 @@ fn right_click_parks_through_stash_sh() {
     std::fs::write(&path, script).unwrap();
     assert!(Command::new("chmod").args(["+x", path.to_str().unwrap()]).status().unwrap().success());
     let (state, focus) = notice_names("park");
-    let cmd = format!("env AGENT_UI_SCRIPTS={} AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}",
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_UI_SCRIPTS={} AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}",
         dir.display(), s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
@@ -319,10 +328,10 @@ fn right_click_parks_through_stash_sh() {
     wait_for("the park", || s.tmux(&["list-windows", "-a", "-F", "#{session_name} #{window_id}"]).contains(&format!("stash {win}")));
     assert_eq!(s.tmux(&["show-options", "-wqv", "-t", &win, "@stash_origin"]).trim(), "work");
     post(&state); // tmux's window-unlinked hook does this for real
-    wait_for("the footer", || screen().contains("parked Quiet one") && screen().contains("⏸ 1 parked"));
+    wait_for("the footer", || screen().contains("parked Quiet one") && screen().contains("PARKED  1"));
     // The parked line: prefix h's command, the sidebar's client in it.
     let lines: Vec<String> = screen().lines().map(String::from).collect();
-    let last = lines.iter().rposition(|l| l.starts_with(" \u{e0b6}⏸ ")).unwrap() + 1;
+    let last = lines.iter().rposition(|l| l.starts_with(" PARKED")).unwrap() + 1;
     send(&format!("\x1b[<0;3;{last}M\x1b[<0;3;{last}m"));
     wait_for("the unstash", || std::fs::read_to_string(&log).unwrap_or_default().contains(&format!("unstash  {CLIENT}")));
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().next(), Some(format!("stash {win}").as_str()));
@@ -374,7 +383,7 @@ fn the_dashboard_pane_is_never_a_target() {
     let jump = dir.join("agent-jump.sh");
     std::fs::write(&jump, "#!/bin/sh\n[ \"$1\" = goto ] && tmux switch-client -c \"$2\" -t \"$3\"\nexit 0\n").unwrap();
     let (state, focus) = notice_names("dash");
-    let cmd = format!("env AGENT_UI_SCRIPTS={} AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}",
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_UI_SCRIPTS={} AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}",
         dir.display(), s.name);
     s.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
@@ -410,7 +419,7 @@ fn key_table_marks_clear_without_a_notice() {
     s.tmux(&["bind-key", "-T", "jump", "a", "display-message", "a"]);
     let tty = s.nested_client("work", "main:8");
     let (state, focus) = notice_names("keys");
-    let cmd = format!("env AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
     wait_for("the first frame", || screen().contains("NEEDS YOU"));
@@ -469,7 +478,7 @@ fn notify_toasts_in_the_sidebar_and_falls_back_without_one() {
     std::fs::create_dir_all(&dir).unwrap();
     let log = dir.join("log");
     let (state, focus) = notice_names("toast");
-    let cmd = format!("env AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
     let opt = |o: &str| s.tmux(&["show-options", "-gqv", o]).trim().to_string();
@@ -578,7 +587,7 @@ fn live_loop_draws_follows_notices_and_exits_quietly() {
     s.tmux(&["set-option", "-w", "-t", "work:2", "@agent_state", "idle"]);
     s.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
     let (state, focus) = notice_names("live");
-    let cmd = format!("env AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}", s.name);
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
     wait_for("the first frame", || screen().contains("NEEDS YOU"));
@@ -639,7 +648,7 @@ fn the_sidebar_leaves_with_its_client() {
     s.tmux(&["set-option", "-g", "status-interval", "1"]);
     s.tmux(&["set-option", "-g", "status-right", &format!("#(touch '{}')x", job.display())]);
     let (state, focus) = notice_names("alone");
-    let cmd = format!("env AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
     wait_for("the first frame", || screen().contains("NEEDS YOU"));
@@ -732,7 +741,7 @@ fn status_jobs_run_quietly() {
     s.tmux(&["set-option", "-g", "status-interval", "1"]);
     s.tmux(&["set-option", "-g", "status-right", &format!("#(date +%S)#(echo oops >&2; false)#(touch '{}')x", job.display())]);
     let (state, focus) = notice_names("quiet");
-    let cmd = format!("env AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     wait_for("the status job", || job.exists());
     std::fs::remove_file(&job).unwrap();
@@ -754,7 +763,7 @@ fn the_registry_counts_sidebars_and_repairs_crashes() {
     let opt = |o: &str| s.tmux(&["show-options", "-gqv", o]).trim().to_string();
     let (state, focus) = notice_names("reg");
     let start = |win: &str| -> String {
-        let cmd = format!("env AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}", s.name);
+        let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}", s.name);
         s.tmux(&["new-window", "-d", "-t", win, "-n", "sb", &cmd]);
         wait_for("a first frame", || s.tmux(&["capture-pane", "-p", "-t", win]).contains("NEEDS YOU"));
         s.tmux(&["display-message", "-p", "-t", win, "#{pane_pid}"]).trim().to_string()

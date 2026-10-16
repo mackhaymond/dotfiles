@@ -74,6 +74,7 @@
 //! - **`--once WxH`** prints one frame in ANSI colour and exits: no
 //!   alternate screen, no marker, no mouse (screenshots, tests).
 
+pub mod activity;
 mod input;
 pub mod layout;
 pub mod notice;
@@ -202,7 +203,8 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
     let bar = Bar::build(&core.snapshot, client.as_deref());
     hide_homes(&mut core.snapshot);
     // Letters as the live sidebar would assign them; `--once` never writes.
-    let (view, _) = build_view(&mut core, client.as_deref(), None);
+    let (mut view, _) = build_view(&mut core, client.as_deref(), None);
+    activity::Activity::home().apply(&mut view);
     let frame = layout(&view, w, h, &Opts { msg: None, bar, spin: 0, now: None });
     let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
     layout::paint(&frame, &mut buf);
@@ -385,6 +387,8 @@ struct App {
     /// drawn again. Only ids `@toast` still holds are kept (at most
     /// [`DISMISSED_MAX`]).
     dismissed: Vec<status::ToastId>,
+    /// The working agents' activity blurbs ([`activity`]), cached.
+    activity: activity::Activity,
 }
 
 /// How many dismissed toast ids a sidebar remembers at most.
@@ -425,6 +429,8 @@ impl App {
             key_reads: 0,
             started: Instant::now(),
             dismissed: Vec::new(),
+            // (Unit tests never read the real transcripts.)
+            activity: if cfg!(test) { activity::Activity::new("/nonexistent".into()) } else { activity::Activity::home() },
         }
     }
 
@@ -495,7 +501,10 @@ impl App {
         self.keypoll.seen(&table, Instant::now());
         hide_homes(&mut self.core.snapshot);
         let keys = if self.persist { Some(&mut self.keys) } else { None };
-        let (view, writes) = build_view(&mut self.core, self.link.client.as_deref(), keys);
+        let (mut view, writes) = build_view(&mut self.core, self.link.client.as_deref(), keys);
+        // The working agents' live activity, from their transcripts (cached;
+        // a file is read only when it changed).
+        self.activity.apply(&mut view);
         self.view = view;
         if !writes.is_empty() {
             crate::menu::store_keys(&self.core.tmux, writes);
