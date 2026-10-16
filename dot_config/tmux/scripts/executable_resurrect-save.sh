@@ -636,8 +636,8 @@ if [ -n "$held" ]; then
 		if [ -z "$NOTICED" ]; then
 			notice="tmux: this server started after the last good save and was never restored; autosave keeps that layout. prefix C-r restores it."
 			tmux set-option -g @resurrect_replacement_noticed "$NOW" >/dev/null 2>&1
-			# One call for every client (`-c '*'`): one toast exists at a
-			# time, so a toast per client would leave only the last one.
+			# One call for every client (`-c '*'`): one toast for every
+			# sidebar, so a toast per client would stack n copies of it.
 			told=$(tmux list-clients -F x 2>/dev/null | grep -c x)
 			notify_user -c '*' -k warn -t 10 -- "$notice" </dev/null
 			log "notice: replacement server never restored; told $told client(s)"

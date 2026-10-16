@@ -374,8 +374,9 @@ pub const STATUS_FORMATS: [&str; 31] = [
     "#{@codex_weekly_members}",
     "#{@codex_scoped_used}", "#{@codex_scoped_expected}", "#{@codex_scoped_delta}", "#{@codex_scoped_resets}",
     "#{@codex_scoped_members}",
-    // notify.sh's toast (`seq TAB epoch_ms TAB kind TAB ttl TAB client TAB
-    // text`) and the open sidebars' clients, beside `@sidebar_pids`.
+    // notify.sh's toasts (up to 4 RS-separated records, each `seq TAB
+    // epoch_ms TAB kind TAB ttl TAB client TAB text [TAB title]`) and the
+    // open sidebars' clients, beside `@sidebar_pids`.
     "#{@toast}", "#{@sidebar_clients}",
 ];
 
@@ -427,7 +428,7 @@ pub struct Status {
     pub status_line: String,
     /// The meters' numbers: session, weekly, scoped.
     pub meters: [Meter; 3],
-    /// `@toast`: notify.sh's latest toast, raw (`status::Toast::parse`).
+    /// `@toast`: notify.sh's recent toasts, raw (`status::Toast::parse_all`).
     pub toast: String,
     /// `@sidebar_clients`: the open sidebars' clients, word for word beside
     /// `@sidebar_pids` (`-`: none resolved yet).

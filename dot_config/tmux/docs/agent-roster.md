@@ -784,51 +784,57 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   renders one frame):
 
   ```
-  ╭─ prefix ───────────────────────╮   the card: the key table's mark in its
-  │ S ━━━━━┃━━────────  21% (-4%)  │   top border (prefix / ⌥W jump), one
-  │ W ━━━━━━━━━┃━─────  60% (+17%) │   usage meter per window, the stale save
-  ╰────────────────────────────────╯
-   NEEDS YOU                      2    NEEDS YOU, agent-jump.sh order: tinted
-  ▌ a  Slides export            ✕ 3m   2-line cards (letter, title; reason)
-  ▌    failed
-   AGENTS                all spaces    THE BODY: every space (or the client's
-   ● main   main          ◉1 ◐1 ○1    in space scope); every agent row two
-  ▎ d  Sidebar status   ⠹ working     lines (message, or an idle agent's last
-  ▎    run cargo test           26s    outcome, or blank; the age at its end),
-    ──────────────────────────────     a hairline between one agent and the
-    h  Canvas Syllabus          idle   next while there is room
-       Synced 4 assignments       1h
-   SHELLS                              the client's space's shells, one row
-    ⌥1  ⌂ ~                            each (⌥N; click: go there), the active
-  ▎ ⌥2  nvim                           one lifted
+   ▄ prefix ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄    the usage panel: a TILE (filled, a
+    S ━━━━━┃━━━━━━━━━  21% (-4%)       half-block pad above and below, no
+    W ━━━━━━━━━┃━━━━━  60% (+17%)      border); the key table's mark a solid
+   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀    tab on its top pad; one meter per window
+   NEEDS YOU                    (2)    NEEDS YOU, agent-jump.sh order: cards are
+   ▌ a  Slides export          ✕ 3m    tiles tinted in the state colour, a ▌
+   ▌    failed                         stripe (letter, title; reason)
+   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   AGENTS               (all spaces)   THE BODY: every space (or the client's
+   ● main   main          ◉1 ◐1 ○1    in space scope); every agent a 2-line
+   ▌ d  Sidebar status ⠹ working      tile (message, or an idle agent's last
+   ▌    run cargo test          26s    outcome, or blank; the age at its end),
+   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀    a state stripe at its left edge, a
+     h  Canvas Syllabus        idle    half-block pad under it while there is
+        Synced 4 assignments     1h    room (else edge to edge, zebra-shaded)
+   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   SHELLS                              the client's space's shells, one-row
+   ▌ ⌥1  ⌂ ~                           button tiles (⌥N; click: go there),
+                                       the active one lifted
                                        spare rows collect here
-   ────────────────────────────────    the spaces as pills, ⌃N order, the
-    1 main   2 bai   3 cs35l           client's filled in its @space_color
-   ⏸ 0 parked                          the stash; a watcher problem in red
+   (1 main) (2 bai) (3 cs35l)          the spaces as rounded buttons, ⌃N
+   (⏸ 0 parked)                        order; the stash; a watcher problem red
   ```
 
-  The card no longer shows a space chip (the filled pill at the bottom says
-  which space the client is in) or the shells (their own section). Under
-  pressure every agent row stays the same height: idle agents fold first,
-  then every agent goes to one line at once; the SHELLS section becomes one
-  line of pills (` SHELLS ⌥1 ⌂~ ⌥2 nvim +1`) before any agent loses detail.
+  (`( )` here: the Nerd Font half-circle caps U+E0B6 / U+E0B4 drawn in the
+  button's colour.) Every tile and button leaves one canvas column at each
+  side of the sidebar; section and space headers are text on the canvas.
+  Palette: `tile` (#282839), `tile_alt` (the zebra's other shade),
+  `tile_hi` (the client's agent, the active shell), key-caps on `surface1`.
+  The panel shows no space chip (the filled pill at the bottom says which
+  space the client is in) and no shells (their own section). Under pressure
+  every agent row stays the same height: idle agents fold first, then every
+  agent goes to one line at once; the SHELLS section becomes one line of
+  buttons (` SHELLS (⌥1 ⌂~) (⌥2 nvim) +1`) before any agent loses detail.
 
-- **Letters**: every agent row (both scopes) and every NEEDS YOU card starts
-  with a solid ` a ` badge, dark ink on the agent's state colour (the
-  menu's `badge_color`), at the far left: the agent's lifetime letter, from
+- **Letters**: every agent tile (both scopes) and every NEEDS YOU card
+  starts, after its stripe, with a ` a ` key-cap (a raised `surface1` chip):
+  the agent's lifetime letter, from
   the menu's own assignment (`menu::letters::of_view`, see
   [letter keys](#agent-ui-menu-letter-keys)). A live sidebar persists the
   letters it assigns to `@agent_key` exactly like the menu (one batched
   background write, `KeyMemo`), so UB's ⌥W table, the menu and every
   sidebar agree; `--once` never writes. While the client's key table is
-  `jump` (⌥W armed) every badge turns peach and the card's top border
-  reads `⌥W jump  type a letter`. No letter (past 26): a blank badge; no letter
+  `jump` (⌥W armed) every badge turns peach and the panel's top pad carries
+  a `⌥W jump │ type a letter` tab. No letter (past 26): a blank badge; no letter
   anywhere: no column. The 1-9 ordinals and slot numbers are gone.
 - **Status block** (`status::Bar`, built from the one per-tick snapshot,
   before home windows are hidden; no script runs per frame):
-  - in the card's top border: a red ` prefix ` block while
-    `#{client_key_table}` is `prefix`, a peach ` ⌥W jump ` and `type a
-    letter` while it is `jump` (no card: a row of their own);
+  - a tab on the usage panel's top pad: a red ` prefix ` chip while
+    `#{client_key_table}` is `prefix`, a peach ` ⌥W jump ` chip and a
+    ` type a letter ` one while it is `jump` (no panel: a row of their own);
   - this space's shells, in the SHELLS section under the agents (windows
     without `@agent_state`, window-index order, so the home window is shell
     1, exactly space.sh's `SHELLS`), each `⌥N` plus its label (spaces.conf's
@@ -838,19 +844,23 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   - usage meters: `@codex_<w>_used` / `_expected` / `_delta` / `_resets`
     (`<w>` = `session` / `weekly` / `scoped`, falling back to `_text`) with
     their `_color`; the pace as the status bar wrote it, `60% (+17%)`, no
-    `Σ` for a pooled one; `--` while one is unset;
+    `Σ` for a pooled one; `--` while one is unset. A meter is Textual's
+    progress bar: `━` in the label's colour over a `surface1` `━` track, `┃`
+    where the pace expects it. `_members` (`slot:used:active[:cap],…`, the
+    optional cap = 100 − the account's reserve, 100 when absent) is parsed
+    into `status::Member` (not drawn yet);
   - `@resurrect_stale` as ` ! last save 2h ago` / `save refused`, red;
   - prefix v's range selection (below).
   All of it rides on the client row of the same `list-clients` call
   (`tmux::STATUS_FORMATS`) and the window rows (`@space_color`,
-  `@stash_sel`). Shorter frames give up, in order: the card's border (under
-  16 rows), the meters for one usage line (under 30), usage and the stale
-  save (under 12), the selection hint (under 6); a card with nothing in it
-  is not drawn.
+  `@stash_sel`). Shorter frames give up, in order: the meters for one usage
+  line (under 30), the panel itself (under 16 rows or 20 columns: its
+  content then sits on the canvas), usage and the stale save (under 12),
+  the selection hint (under 6); a panel with nothing in it is not drawn.
 - **Stash selection** (prefix v, stash.sh `sel-start` / `sel-move`): live
   while the client is in the `stash` key table or any window still has
-  `@stash_sel`. Every selected agent row (both lines) and shell row is
-  drawn on a mauve tint with a mauve edge, and the card's first row reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
+  `@stash_sel`. Every selected agent tile (both lines) and shell button is
+  drawn on a mauve tint with a mauve stripe, and the panel's first row reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
   many keys as fit). stash.sh posts the focus notice after sel-start,
   sel-move, sel-cancel and the park, so it shows at once.
 
@@ -858,20 +868,21 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   no longer read; `--split` is accepted and ignored). The spaces list has no
   git line, so the sidebar never runs `git status`; the branch still shows on
   each rule.
-- **Spaces** (the status bar shows only the current space's chip, so this
-  list is where every space is seen): one row per session, sessions with
-  `@space_hidden` 1 left out, ordered by the session option `@space_index`
-  (space.sh's number: main = 1, then the registry), unnumbered ones last by
-  name. Each row starts with its label `⌃N` (Ctrl+N, WezTerm's `\e[911N~`
-  → space N; blank past 9, no column at all when no space has an index),
-  then `●`/`○`, the name and its state counts. A click switches the client
-  to that space (`agent-jump.sh goto` on its active window, in that
-  session). The index and hidden mark are SESSION options read through the
-  window-row format (`#{@space_index}`, `#{@space_hidden}`,
-  `#{@space_color}`), so they cost no extra tmux call. The `⌃N` label is a
-  solid chip in the space's `@space_color` when it has one. `space_label`
-  is one swappable function should the keys change.
-- **Stash**: the last row is ` ⏸ N parked`. A click runs exactly prefix h's
+- **Spaces** (the status bar is hidden, so these buttons are where every
+  space is seen): one rounded button per session above the last row (after
+  a blank gap), sessions with `@space_hidden` 1 left out, ordered by the
+  session option `@space_index` (space.sh's number: main = 1, then the
+  registry), unnumbered ones last by name; the agents section's groups use
+  the same order. Each reads `N name` (`N` = ⌃N, Ctrl+N, blank past 9) and
+  an attention agent's glyph; the client's space is filled with its
+  `@space_color` (lavender without one), the others sit on `surface0` with
+  the digit in their colour. Too many for the rows left: the client's space
+  and the attention ones are kept, `+K` (click: the menu's All tab) for the
+  rest. A click switches the client to that space (`agent-jump.sh goto` on
+  its active window, in that session). The index, hidden mark and colour
+  are SESSION options read through the window-row format, so they cost no
+  extra tmux call.
+- **Stash**: the last row is a ` ⏸ N parked` button. A click runs exactly prefix h's
   command, `tmux run-shell "stash.sh unstash '' <client>"` (the sidebar's
   client for `#{client_name}`; a unit test compares it with tmux.conf.tmpl's
   `bind-key h`), so the same picker popup opens on that client. A plain
@@ -885,26 +896,27 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   `window-unlinked` hook's agent-state notice, so every sidebar redraws at
   once. A right press anywhere else, or with a modifier, only hands focus
   back.
-- **Density ladder**: agents lose detail last, but after the spaces list
-  folds. Before anything else, the FOLDED spaces list is held back: its
-  header (carrying `+K more`, click: the menu's All tab), the client's space
-  and every space with an attention agent (at most `max(2, rows/4)` spaces;
-  with very little room, just the client's). So the section never
-  disappears above 6 rows. A frame then takes the first step at which every
-  agent still gets two lines: (1) the spaces list grows into leftover rows
-  (whole when it fits, else folded to fill them); (2) the gaps go; (3) NEEDS
-  YOU cards go to 2 lines, then 1. Only then do agents compress (one line each
-  with spare rows handed back as second lines to the ones needing you, then
-  idle folded into `○○○ 3 idle`, then spaces collapsed to their rule, then
-  `… N more`), with NEEDS YOU held to at least 2 rows and a third of the
-  body (`… N more need you`). Nothing is dropped silently; tests prove every
-  agent is shown, folded, collapsed or counted at every size 2-70 rows.
-- **Colour**: no background colour on any cell (`Color::Reset`, `--once`
-  writes no `48;` code), so the sidebar is WezTerm's own background. Tints
-  kept only where they say where you are: the agent row of the client's
-  window (`sel`) and its space's row in the spaces list (`surface0`). NEEDS
-  YOU cards (their `▌` bar carries the state) and the toolbar buttons lost
-  theirs.
+- **Density ladder** (`layout::STEPS`): agents lose detail last. Before
+  anything else the spaces' gap and one line of buttons are held back
+  (`+K` for the rest). A frame then takes the first step at which every
+  agent still gets two lines: (1) the spaces grow into leftover rows; (2)
+  the blank gaps go; (3) the pads go, the cards' and shell buttons' first,
+  then the agents' (tiles edge to edge, alternating `tile` / `tile_alt`);
+  (4) NEEDS YOU cards go to 1 line; (5) the shells to one line of buttons.
+  Only then do agents compress (idle folded into a `○○○ 3 idle · …` tile,
+  every agent one line, folded again, spaces collapsed to their header,
+  then `… N more`), with NEEDS YOU held to at least 2 rows and a third of
+  the body (`… N more need you`). Never two heights of agent row in one
+  frame. Nothing is dropped silently: every agents-section row records the
+  agents it stands for (`Row::covers`), and tests prove each is shown,
+  folded, collapsed or counted at every size 2-110 rows.
+- **Colour**: the canvas is the terminal's own background (`Color::Reset`,
+  `--once` writes no `48;` code on it), so the split is WezTerm's colour.
+  The surfaces are tiles and buttons in solid fills (no box-drawing lines
+  around anything but a toast card): `tile` / `tile_alt` / `tile_hi`,
+  NEEDS YOU cards in their state colour mixed over the canvas (`Ink::Mix`),
+  the stash selection's mauve, the key-caps and pills. Dim text on any
+  surface is `overlay2` (`overlay` there is under 3:1).
 - **Sync (told, not polling)**: the loop sleeps in `poll(2)` on stdin, the
   signal pipe, one Darwin-notification fd (`notify_register_file_descriptor`,
   libc FFI, no crate) and the client's exit watch. Two notice names:
@@ -956,35 +968,47 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   with the status line off, `tmux display-message` draws on the client's
   bottom line, which reads as the status line coming back. Scripts say
   things through `notify.sh [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS]
-  [--] TEXT...` instead. One tmux read (`display -p` of the client's name,
-  `@sidebar_pids`, `@sidebar_clients`, `@toast_seq` and the text expanded
-  as display-message would) decides: a LIVE sidebar (its paired pid passes
-  `kill -0`, so a SIGKILLed one still listed never swallows a message) open
-  for that client (or, with no client resolved, any live sidebar) → a
-  TOAST: one tmux write of `@toast_seq` (+1) and `@toast` =
-  `seq⇥epoch_ms⇥kind⇥ttl⇥client⇥text` (client empty = every sidebar; a
-  trailing `;` escaped so tmux keeps it, matching display-message), then
-  the focus notice (`notifyutil`, in the background). Otherwise exactly the old `display-message [-c CLIENT]
-  -- TEXT`. Every message is logged to `~/.local/state/tmux-notify/log`
-  (`epoch⇥kind⇥client⇥text`, trimmed to 500 lines past 1000). The
+  [-T TITLE] [--] TEXT...` instead. One tmux read (`display -p` of the
+  client's name, `@sidebar_pids`, `@sidebar_clients`, `@toast_seq`, the
+  current `@toast` and the text expanded as display-message would) decides:
+  a LIVE sidebar (its paired pid passes `kill -0`, so a SIGKILLed one still
+  listed never swallows a message) open for that client (or, with no client
+  resolved, any live sidebar) → a TOAST: one tmux write of `@toast_seq`
+  (+1) and `@toast` = up to 4 records separated by RS (U+001E), oldest
+  first, each `seq⇥epoch_ms⇥kind⇥ttl⇥client⇥text⇥title` (client empty =
+  every sidebar, title empty = the kind's; expired records dropped, the
+  newest 3 kept beside the new one; a trailing `;` escaped so tmux keeps
+  it), then the focus notice (`notifyutil`, in the background). 6-field
+  records (from before `-T`) still parse. Otherwise exactly the old
+  `display-message [-c CLIENT] -- TEXT`. Every message is logged to
+  `~/.local/state/tmux-notify/log` (`epoch⇥kind⇥client⇥text`, `⇥title`
+  appended when `-T` gave one; trimmed to 500 lines past 1000). The
   sidebar reads `@toast` in its one snapshot (a `STATUS_FORMATS` field),
-  keeps it for its client or every sidebar, and draws it in the usage
-  card's BOTTOM border, no row moving:
+  keeps the records for its client or every sidebar, and draws the live
+  ones as nvim-notify cards OVER the top of the frame (no row moves; the
+  rows beneath keep what they stand for), oldest on top, at most 3:
 
   ```
-  ╭────────────────────────────────╮
-  │ S ━━━━━┃━━────────  21% (-4%)  │   ok ✓ green · info • blue
-  ╰─ ✓ parked Canvas Syllabus ─────╯   warn ! peach · error ✕ red
+   ╭─  Done ──────────────── 10:02 ─╮    info  Info blue · ok  Done green
+   │ parked Canvas Syllabus           │    warn  Warning peach
+   ╰──────────────────────────────────╯    error  Error red
   ```
 
-  Clipped with `…` (the corner kept); a text that loses more than 4 cells
-  also shows whole, wrapped into up to 2 rows inside the card above the
-  border. No card (a short frame, or nothing in it): a tinted row of its
-  own at the very top. It shows until `epoch + ttl` (default 4 s, error
-  8 s): the loop wakes once at the deadline to draw it away (no polling); a
-  newer one replaces it at once; a left click on it dismisses it in that
-  sidebar only, by its (seq, epoch_ms) id (the seq is read then written,
-  so two racing posts can share one; never their posting time too).
+  A rounded border in the kind's colour over a fill of it (12% over the
+  canvas), a canvas margin each side; the Nerd icon and title (`-T`'s, else
+  the kind's) bold in the top border, the local time it was posted
+  (`HH:MM`, libc `localtime_r`) right-aligned in it, dropped when narrow;
+  the text word-wrapped into at most 3 lines, `…` on the last when more is
+  left. Short frames drop the oldest card first, then body lines; a card
+  never covers the last row, nor the key-table marks and the selection
+  hint (the cards start under them). Under 16 columns or 4 free rows the
+  newest toast is one compact row instead, down to 2 free rows. Each shows
+  until `epoch + ttl` (default 4 s, error 8 s): the loop wakes at the
+  earliest deadline on screen to draw that one away (no polling); a left
+  click anywhere on a card dismisses THAT toast in that sidebar only, by
+  its (seq, epoch_ms) id (the seq is read then written, so two racing
+  posts can share one; never their posting time too). The dismissed ids
+  are bounded (8) and forgotten once `@toast` no longer holds them.
 - **Status jobs** (`status::Keeper`): with the line hidden tmux runs none of
   status-right's `#()` jobs, and two of them must keep running:
   continuum's autosave (`continuum_save.sh`) and the usage tick
@@ -1005,11 +1029,12 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   refresh and by `--repair`), the status job kept running, and that
   detaching a real nested client ends the sidebar within 1.5 s with the
   status line back on. `notify_toasts_in_the_sidebar_and_falls_back_without_one`
-  runs notify.sh against the test server (`NOTIFY_TMUX`): the toast on
-  screen in under 1 s, gone at its ttl, dismissed by a click, and
-  `display-message` for a client without a sidebar and after the sidebar
-  closes; `tests/test_notify.py` covers the script's CLI, sanitising,
-  decision and log.
+  runs notify.sh against the test server (`NOTIFY_TMUX`): the card on
+  screen in under 1 s, gone at its ttl, dismissed by a click, two stacked
+  (a `-T` title on the older), and `display-message` for a client without
+  a sidebar and after the sidebar closes; `tests/test_notify.py` covers the
+  script's CLI, sanitising, decision, the record stack (at most 4, expired
+  dropped, 6-field records kept, the title field) and log.
 
 ## Launch speed
 

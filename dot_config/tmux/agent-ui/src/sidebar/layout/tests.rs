@@ -152,20 +152,50 @@ fn agents_part(f: &Frame) -> Vec<String> {
     texts(f)[f.agents.clone()].to_vec()
 }
 
-/// Every agent is covered exactly once, and `… N more` says N.
+/// A tile's half-block pad row (`▀` below a list tile, `▄` / `▀` around
+/// the usage panel).
+fn is_pad(l: &str) -> bool {
+    let t = l.trim();
+    !t.is_empty() && t.chars().all(|c| c == '▀' || c == '▄')
+}
+
+/// A row's text with the pills' rounded caps as spaces (` main ` reads the
+/// same as it did before the caps).
+fn uncapped(l: &str) -> String {
+    l.replace(CAP_L, " ").replace(CAP_R, " ")
+}
+
+/// The cell column `needle` starts at in `l` (every glyph here is one cell).
+fn col(l: &str, needle: &str) -> u16 {
+    let i = l.find(needle).unwrap_or_else(|| panic!("{needle:?} not in {l:?}"));
+    l[..i].chars().count() as u16
+}
+
+/// What an agent row says past its margin and state stripe.
+fn body(l: &str) -> &str {
+    l.trim_start_matches([' ', '▎', '▌']).trim_end()
+}
+
+/// The parked row as drawn: a rounded button.
+fn parked(n: usize) -> String {
+    format!(" {CAP_L}⏸ {n} parked{CAP_R}")
+}
+
+/// Every agent is covered exactly once, and `… N more` says N. (Rows a
+/// toast card is drawn over still stand for their agents.)
 fn check_accounting(name: &str, v: &ViewModel, f: &Frame) {
     let mut want: HashMap<(String, String), usize> = HashMap::new();
     for a in groups(v).iter().flat_map(|s| s.agents.iter()) {
         *want.entry((a.session.clone(), a.window_id.clone())).or_default() += 1;
     }
     let mut got: HashMap<(String, String), usize> = HashMap::new();
-    for r in &f.rows {
+    for (y, r) in f.rows.iter().enumerate() {
         for c in &r.covers {
             *got.entry(c.clone()).or_default() += 1;
         }
         let t = r.text();
         let counted = t.contains(" more") || t.contains(" agents");
-        if let Some(i) = t.find("… ").filter(|_| counted && !r.covers.is_empty()) {
+        if let Some(i) = t.find("… ").filter(|_| counted && !r.covers.is_empty() && !f.toast.contains(&y)) {
             let n: usize = t[i + "… ".len()..].split(' ').next().unwrap().parse().unwrap();
             assert_eq!(n, r.covers.len(), "{name} {}x{}: {t:?}", f.width, f.height);
         }
@@ -173,32 +203,39 @@ fn check_accounting(name: &str, v: &ViewModel, f: &Frame) {
     assert_eq!(got, want, "{name} {}x{}: {:#?}", f.width, f.height, texts(f));
 }
 
-/// The order every frame keeps: the card (or title; nothing when the card
+/// The order every frame keeps: the panel (or title; nothing when the panel
 /// would be empty), NEEDS YOU, agents, shells, spare rows, the spaces, the
-/// parked row; sections never overlap.
+/// parked row; sections never overlap; no line art anywhere but the toast
+/// cards (drawn over the top, never over the last row).
 fn check_order(name: &str, f: &Frame) {
     let h = usize::from(f.height);
     if h < 4 {
         return;
     }
     let t = texts(f);
+    let shown = |y: usize| !f.toast.contains(&y);
     assert!(f.needs.end <= f.agents.start, "{name}: {:?} {:?} {t:#?}", f.needs, f.agents);
     assert!(f.agents.end <= f.spaces.start && f.spaces.end < h, "{name}: {:?} {:?} {t:#?}", f.agents, f.spaces);
     if !f.shells.is_empty() {
         assert!(f.agents.end <= f.shells.start && f.shells.end <= f.spaces.start, "{name}: shells {:?} {t:#?}", f.shells);
-        assert!(t[f.shells.start].starts_with(" SHELLS"), "{name}: {t:#?}");
+        assert!(!shown(f.shells.start) || t[f.shells.start].starts_with(" SHELLS"), "{name}: {t:#?}");
     }
     if !f.card.is_empty() {
         assert!(f.card.start == 0 && f.card.end <= f.needs.start, "{name}: card {:?} {t:#?}", f.card);
         assert!(f.status.start > f.card.start && f.status.end < f.card.end, "{name}");
+        assert!(!shown(f.card.end - 1) || is_pad(&t[f.card.end - 1]), "{name}: the panel's bottom pad {t:#?}");
     }
     if !f.spaces.is_empty() {
-        assert!(t[f.spaces.start].contains('─'), "{name}: the rule first {t:#?}");
-        assert!(f.spaces.len() >= 2, "{name}: a rule and pills {t:#?}");
+        assert!(!shown(f.spaces.start) || t[f.spaces.start].trim().is_empty(), "{name}: the gap first {t:#?}");
+        assert!(f.spaces.len() >= 2, "{name}: a gap and pills {t:#?}");
         assert_eq!(f.spaces.end, h - 1, "{name}: spaces sit on the last row {t:#?}");
     }
-    assert!(t[h - 1].starts_with(" ⏸ "), "{name}: {t:#?}");
+    assert!(f.toast.end < h, "{name}: {t:#?}");
+    assert!(t[h - 1].starts_with(&format!(" {CAP_L}⏸ ")), "{name}: {t:#?}");
     assert!(!t.iter().any(|l| l.starts_with(" log") || l.contains('═')), "{name}: {t:#?}");
+    for (y, l) in t.iter().enumerate().filter(|(y, _)| shown(*y)) {
+        assert!(!l.contains(['─', '│', '╭', '╮', '╰', '╯']), "{name}: line art at {y}: {t:#?}");
+    }
 }
 
 #[test]
@@ -206,20 +243,21 @@ fn every_size_fits_and_accounts_for_every_agent() {
     let mut sel = demo_bar();
     sel.selecting = Some(3);
     sel.prefix = true;
-    // Toasts: a short one in the card, a long one (wrapped rows) with the
-    // marks, and one with no card at all.
-    let long = Bar { toast: Some(toast(Kind::Error, LONG)), ..sel.clone() };
-    let toasted = Bar { toast: Some(toast(Kind::Ok, "parked Canvas Syllabus")), ..demo_bar() };
-    let bare = Bar { toast: Some(toast(Kind::Warn, LONG)), ..Bar::default() };
+    // Toasts: a stack of three over the panel, a long one with the marks,
+    // and a stack with no panel at all.
+    let stack = vec![toast_n(1, Kind::Ok, "parked Canvas Syllabus"), toast_n(2, Kind::Error, LONG), toast_n(3, Kind::Warn, "hi")];
+    let long = Bar { toasts: vec![toast(Kind::Error, LONG)], ..sel.clone() };
+    let toasted = Bar { toasts: stack.clone(), ..demo_bar() };
+    let bare = Bar { toasts: stack, ..Bar::default() };
     let bars = [Bar::default(), demo_bar(), sel, toasted, long, bare];
     let cases = |lettered: bool| -> Vec<(&Bar, u16)> {
         if lettered {
-            // (The toasts at the border's narrowest and a wide width; the
-            // short one at the usual one too.)
-            let widths = |b: &Bar| match &b.toast {
-                Some(t) if t.text == LONG => vec![20u16, 60],
-                Some(_) => vec![20u16, 34, 60],
-                None => vec![24u16, 30, 38, 60],
+            // (The toasts at a card's narrowest and a wide width; the
+            // stack at the usual one too.)
+            let widths = |b: &Bar| match b.toasts.len() {
+                1 => vec![16u16, 60],
+                0 => vec![24u16, 30, 38, 60],
+                _ => vec![16u16, 34, 60],
             };
             bars.iter().flat_map(|b| widths(b).into_iter().map(move |w| (b, w))).collect()
         } else {
@@ -239,15 +277,22 @@ fn every_size_fits_and_accounts_for_every_agent() {
                 check_order(&format!("{name} {w}x{h}"), &f);
                 let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
                 paint(&f, &mut buf);
-                // A toast drawn is a toast clickable, and the card keeps its corners.
+                // A toast drawn is a toast clickable, and every one that
+                // fits is drawn: a card from 4 rows, its corners in place.
+                let t = texts(&f);
                 for y in f.toast.clone() {
-                    assert!(f.rows[y].targets.iter().any(|t| matches!(t.2, Target::Toast(TOAST_ID))), "{name} {w}x{h}: {y}");
+                    assert!(f.rows[y].targets.iter().any(|t| matches!(t.2, Target::Toast(_))), "{name} {w}x{h}: {y}");
                 }
                 assert_eq!(f.toast.is_empty(), f.toast_until.is_none(), "{name} {w}x{h}");
-                if !f.card.is_empty() {
-                    let y = f.card.end as u16 - 1;
-                    assert_eq!((buf[(0, y)].symbol(), buf[(w - 1, y)].symbol(), buf[(w - 2, y)].symbol()), ("╰", "╯", "─"),
-                        "{name} {w}x{h}");
+                // (Under the marks and the hint, which stay on top.)
+                let free = usize::from(h) - f.toast.start;
+                assert_eq!(f.toast.is_empty(), bar.toasts.is_empty() || free < 2, "{name} {w}x{h}: {t:#?}");
+                if f.toast.len() > 1 {
+                    let (a, b) = (&t[f.toast.start], &t[f.toast.end - 1]);
+                    assert!(a.starts_with(" ╭─") && a.ends_with("─╮ ") && b.starts_with(" ╰─"), "{name} {w}x{h}: {t:#?}");
+                }
+                if bar.prefix && !f.toast.is_empty() {
+                    assert!(t[..f.toast.start].iter().any(|l| l.contains("prefix")), "{name} {w}x{h}: {t:#?}");
                 }
             }
         }
@@ -266,22 +311,24 @@ fn needs_come_first() {
 }
 
 /// Agents lose detail last: as the height shrinks, the spaces give up pill
-/// lines first, then the gaps, then card lines; agents keep their full
-/// detail until all of that is gone, and their step only grows.
+/// lines first, then the gaps, the pads and the card lines; agents keep
+/// their full detail until all of that is gone, and their step only grows.
 #[test]
 fn agents_lose_detail_last() {
     for (name, v) in all() {
         let mut last = (0u8, 0u8);
         // (Under 8 rows the spaces' reserve itself gives way: not a ladder.)
-        for h in (8u16..=90).rev() {
+        for h in (8u16..=110).rev() {
             let f = layout(&v, 34, h, &Opts::default());
             let now = (f.step, f.agents_step);
             assert!(now >= last, "{name} {h}: {now:?} after {last:?}");
             if f.agents_step > 0 {
-                // Compressed agents: no gaps, one-line cards.
+                // Compressed agents: no agent pads, one-line cards (spare
+                // rows may still buy gaps and the cards' pads back).
                 assert_eq!(f.step, STEPS.len() as u8, "{name} {h}");
                 let cards = f.rows[f.needs.clone()].iter().filter(|r| r.bg.is_some()).count();
                 assert!(cards <= v.needs.len(), "{name} {h}: {:#?}", texts(&f));
+                assert!(!texts(&f)[f.agents.clone()].iter().any(|l| is_pad(l)), "{name} {h}: {:#?}", texts(&f));
             }
             if f.step == 0 && f.spaces.len() < 1 + pill_lines(&v, 34) {
                 // Rows short at step 0: the spaces gave them up first.
@@ -290,6 +337,65 @@ fn agents_lose_detail_last() {
             last = now;
         }
     }
+}
+
+/// Rows a frame's step leaves over are spent on spacing, never on detail:
+/// while blank rows sit unused above the spaces, no section gap is missing
+/// (above AGENTS, SHELLS, NEEDS YOU), the NEEDS YOU cards have their pads
+/// unless they cost more than is left, and so do the gaps between spaces.
+/// The agents' pads never come back past the step that dropped them, and
+/// every agent row keeps one shape.
+#[test]
+fn spare_rows_buy_spacing_back() {
+    let bars = [Bar::default(), demo_bar(), Bar { prefix: true, ..demo_bar() }];
+    let mut bought = 0;
+    for (name, v) in all().into_iter().flat_map(|(n, v)| [(n, v.clone()), (n, lettered(v))]) {
+        for bar in &bars {
+            for w in [30u16, 34, 38] {
+                for h in 8u16..=100 {
+                    let f = layout(&v, w, h, &with_bar(bar.clone()));
+                    let t = texts(&f);
+                    let ctx = format!("{name} {w}x{h}");
+                    let end = f.needs.end.max(f.agents.end).max(f.shells.end);
+                    let stop = if f.spaces.is_empty() { usize::from(h) - 1 } else { f.spaces.start };
+                    assert!(f.rows[end..stop].iter().all(is_blank), "{ctx}: {t:#?}");
+                    let spare = stop - end;
+                    let gap_above = |r: &std::ops::Range<usize>| r.is_empty() || r.start == 0 || is_blank(&f.rows[r.start - 1]);
+                    let gaps = [gap_above(&f.needs), gap_above(&f.agents), gap_above(&f.shells)];
+                    if spare > 0 {
+                        assert_eq!(gaps, [true; 3], "{ctx}: a blank run at the bottom, a section gap missing: {t:#?}");
+                    }
+                    // The cards: all padded, or the pads cost more than is left.
+                    let cards = f.rows[f.needs.clone()].iter().filter(|r| r.covers.is_empty() && r.target_at(0).is_some()).count();
+                    let cut = t[f.needs.clone()].iter().any(|l| l.contains("need you"));
+                    let pads = t[f.needs.clone()].iter().filter(|l| is_pad(l)).count();
+                    let n = v.needs.len();
+                    assert!(pads == 0 || pads == n, "{ctx}: {t:#?}");
+                    if n > 0 && !cut && pads == 0 {
+                        assert!(spare < n, "{ctx}: {cards} card rows unpadded with {spare} spare: {t:#?}");
+                    }
+                    // The spaces: a gap above every header but the first, or not enough left for all.
+                    let missing = group_gaps(&f.rows[f.agents.clone()], usize::from(w));
+                    if missing > 0 {
+                        assert!(spare < missing, "{ctx}: {t:#?}");
+                    }
+                    // Never the agents' pads past the step that dropped them.
+                    let agent_pads = t[f.agents.clone()].iter().any(|l| is_pad(l));
+                    assert!(!agent_pads || STEPS.get(usize::from(f.step)).is_some_and(|s| s.pads), "{ctx}: {t:#?}");
+                    bought += usize::from(f.step > 0 && gaps == [true; 3]);
+                }
+            }
+        }
+    }
+    assert!(bought > 0, "spacing never bought back");
+    // A frame that asked for it (34x40, the shells in one line, two rows
+    // left over): the gaps above AGENTS and SHELLS are back, nothing blank
+    // at the bottom; the agents keep their shape (no pads, zebra).
+    let f = layout(&lettered(quiet()), 34, 40, &with_bar(demo_bar()));
+    let t = texts(&f);
+    assert_eq!((f.step, f.agents_step, f.shells.len()), (STEPS.len() as u8 - 1, 0, 1), "{t:#?}");
+    assert!(is_blank(&f.rows[f.agents.start - 1]) && is_blank(&f.rows[f.shells.start - 1]), "{t:#?}");
+    assert!(f.shells.end == f.spaces.start && !t[f.agents.clone()].iter().any(|l| is_pad(l)), "{t:#?}");
 }
 
 /// The agents section's (first lines, second lines): a row that clicks
@@ -307,7 +413,7 @@ fn agent_lines(f: &Frame) -> (usize, usize) {
 fn agent_rows_are_one_height() {
     for (name, v) in all() {
         for w in [24u16, 30, 34, 44] {
-            for h in 2u16..=90 {
+            for h in 2u16..=110 {
                 let f = layout(&v, w, h, &Opts::default());
                 let (firsts, seconds) = agent_lines(&f);
                 assert!(seconds == 0 || seconds == firsts, "{name} {w}x{h}: {:#?}", texts(&f));
@@ -319,10 +425,10 @@ fn agent_rows_are_one_height() {
     }
 }
 
-/// With a card and shells too, a shrinking frame only ever gives detail
+/// With a panel and shells too, a shrinking frame only ever gives detail
 /// up: the step, the agents' step and the shells' form (section → one
-/// line → none) never come back while the card keeps its size (the card
-/// has its own ladder: the meters, then the border, then usage go, and the
+/// line → none) never come back while the panel keeps its size (the panel
+/// has its own ladder: the meters, then the panel, then usage go, and the
 /// rows that frees may well buy the sections detail back).
 #[test]
 fn shrinking_never_brings_detail_back() {
@@ -332,7 +438,7 @@ fn shrinking_never_brings_detail_back() {
             for w in [30u16, 34, 44] {
                 let mut last = (0u8, 0u8, 0u8);
                 let mut top = usize::MAX;
-                for h in (12u16..=100).rev() {
+                for h in (12u16..=110).rev() {
                     let f = layout(&v, w, h, &with_bar(bar.clone()));
                     if f.status.end + f.card.len() != top {
                         (top, last) = (f.status.end + f.card.len(), (0, 0, 0));
@@ -358,69 +464,93 @@ fn quiet_is_roomy() {
     let t = texts(&f);
     assert_eq!((f.step, f.agents_step), (0, 0), "{t:#?}");
     assert!(t[0].starts_with(" agents") && t[0].ends_with("◉1 ◐2 ○8 "), "{:?}", t[0]);
-    assert!(t[1].trim().is_empty() && t[2].starts_with(" NEEDS YOU") && t[2].ends_with("1 "), "{t:#?}");
-    // The card: a tinted surface with a yellow edge; title, glyph and age;
-    // then the question.
-    assert!(t[3].starts_with("▌ Kua Yu focus timing") && t[3].ends_with("◉ 3m "), "{:?}", t[3]);
-    assert!(t[4].starts_with("▌ Which deck should I pull"), "{:?}", t[4]);
+    // The count: a small yellow pill.
+    assert!(t[1].trim().is_empty() && t[2].starts_with(" NEEDS YOU") && t[2].ends_with(&format!("{CAP_L}1{CAP_R} ")), "{t:#?}");
+    // The card: a tile tinted in its state's colour with a yellow stripe;
+    // title, glyph and age; then the question; then its pad.
+    assert!(t[3].starts_with(" ▌ Kua Yu focus timing") && t[3].ends_with("◉ 3m  "), "{:?}", t[3]);
+    assert!(t[4].starts_with(" ▌ Which deck should I pull"), "{:?}", t[4]);
     assert_eq!((f.rows[3].bg, f.rows[4].bg), (Some(Ink::Mix("yellow", 14)), Some(Ink::Mix("yellow", 14))));
-    assert_eq!(f.rows[3].segs[0], seg("▌", "yellow"));
+    assert_eq!((f.rows[3].segs[0].clone(), f.rows[3].segs[1].clone()), (bare(1), seg("▌", "yellow")));
+    assert_eq!(t[5], format!(" {} ", "▀".repeat(32)));
+    assert!(f.rows[5].segs.contains(&seg("▀".repeat(32), Ink::Mix("yellow", 14))) && f.rows[5].bg.is_none());
     // Then a gap, and the agents right under it.
-    assert!(t[5].trim().is_empty() && t[6].starts_with(" AGENTS") && t[6].ends_with("all spaces "), "{t:#?}");
-    assert_eq!(f.agents.start, 6);
-    // Space headers: a dot and the name, the counts on the right, no rule.
+    assert!(t[6].trim().is_empty() && t[7].starts_with(" AGENTS") && t[7].ends_with("all spaces "), "{t:#?}");
+    assert_eq!(f.agents.start, 7);
+    // Space headers: on the canvas, a dot and the name, the counts on the right.
     let main = find(&f, " ● main");
-    assert!(t[main].ends_with("◉1 ◐2 ○4 ") && !t[main].contains('─'), "{:?}", t[main]);
-    // The client's agent: highlighted, a blue edge, the spinner and its
-    // word; its message under it with the age.
+    assert!(t[main].ends_with("◉1 ◐2 ○4 ") && f.rows[main].bg.is_none(), "{:?}", t[main]);
+    // The client's agent: lifted (`tile_hi`), a wide stripe in its state's
+    // colour, the spinner and its word; its message under it with the age;
+    // its pad under that, in its colour. A canvas margin either side.
     let r = find(&f, "Tmux Agent Sidebar");
-    assert!(t[r].starts_with("▎ Tmux Agent Sidebar") && t[r].ends_with("⠋ working "), "{:?}", t[r]);
-    assert!(t[r + 1].starts_with("▎   Edit agent-roster.py") && t[r + 1].ends_with(" 2m "), "{:?}", t[r + 1]);
-    assert_eq!((f.rows[r].bg, f.rows[r + 1].bg), (Some(Ink::Pal("surface0")), Some(Ink::Pal("surface0"))));
-    // A title gives way to the state word (and the flag stays).
-    let h = find(&f, "Handy.app Speech C… ⚙");
-    assert!(t[h].ends_with("⠋ working ") && t[h + 1].starts_with("    Bash swift build"), "{t:#?}");
-    assert!(f.rows[h].bg.is_none());
-    // Recently done: the word, and its message.
-    let c = find(&f, "Commodities Job Tracker");
-    assert!(t[c].ends_with("✓ done ") && t[c + 1].starts_with("    7 fixes applied"), "{t:#?}");
-    // Idle: two lines like every agent, the word on the first, the age
-    // under it; then a hairline (no target) before the next agent.
+    assert!(t[r].starts_with(" ▌ Tmux Agent Sidebar") && t[r].ends_with("⠋ working  "), "{:?}", t[r]);
+    assert!(t[r + 1].starts_with(" ▌   Edit agent-roster.py") && t[r + 1].ends_with(" 2m  "), "{:?}", t[r + 1]);
+    assert_eq!((f.rows[r].bg, f.rows[r + 1].bg), (Some(Ink::Pal("tile_hi")), Some(Ink::Pal("tile_hi"))));
+    assert_eq!(f.rows[r].segs[1], seg("▌", "blue"));
+    assert_eq!((f.rows[r].segs[0].clone(), f.rows[r].segs.last().cloned()), (bare(1), Some(bare(1))));
+    assert!(is_pad(&t[r + 2]) && f.rows[r + 2].segs.contains(&seg("▀".repeat(32), "tile_hi")), "{t:#?}");
+    // A title gives way to the state word (and the flag stays); working:
+    // a blue stripe on a plain tile.
+    let h = find(&f, "Handy.app Speech… ⚙");
+    assert!(t[h].ends_with("⠋ working  ") && t[h + 1].starts_with(" ▎   Bash swift build"), "{t:#?}");
+    assert_eq!((f.rows[h].bg, f.rows[h].segs[1].clone()), (Some(Ink::Pal("tile")), seg("▎", "blue")));
+    // Recently done: the word, its message, a green stripe.
+    let c = find(&f, "Commodities Job Track");
+    assert!(t[c].ends_with("✓ done  ") && t[c + 1].starts_with(" ▎   7 fixes applied"), "{t:#?}");
+    assert_eq!(f.rows[c].segs[1], seg("▎", "green"));
+    // Idle: two lines like every agent, no stripe, the word on the first,
+    // the age under it; then its pad (no target, stands for no one).
     let n = find(&f, "Lost suit jacket");
-    assert!(t[n].ends_with(" idle ") && t[n + 1].ends_with(" 6m ") && is_sep(&t[n + 2]), "{t:#?}");
-    assert_eq!(t[n + 2], format!("  {}  ", "─".repeat(30)));
+    assert!(t[n].starts_with("   Lost suit") && t[n].ends_with(" idle  ") && t[n + 1].ends_with(" 6m  "), "{t:#?}");
+    assert_eq!(t[n + 2], format!(" {} ", "▀".repeat(32)));
     assert!(f.rows[n + 2].targets.is_empty() && f.rows[n + 2].covers.is_empty() && f.rows[n + 3].covers.len() == 1, "{t:#?}");
-    // No hairline after a space's last agent: its next row is a gap.
-    let last = f.agents.end - 1;
-    assert!(!t[f.agents.clone()].iter().zip(&t[f.agents.start + 1..=last]).any(|(a, b)| is_sep(a) && (b.trim().is_empty() || b.starts_with(" ●"))), "{t:#?}");
-    assert!(t[find(&f, "Notch Tasks Orchestrator")].ends_with(" idle "), "{t:#?}");
-    // A blank row between groups, in ⌃N (here: name) order.
+    // Every tile has its pad: the section is headers, tiles and pads (and
+    // the gaps between spaces), nothing else.
+    for y in f.agents.clone().skip(1) {
+        let r = &f.rows[y];
+        assert!(r.text().trim().is_empty() || is_pad(&t[y]) || r.bg == Some(Ink::Pal("tile")) || r.bg == Some(Ink::Pal("tile_hi"))
+            || t[y].starts_with(" ● "), "{y}: {t:#?}");
+    }
+    assert!(t[find(&f, "Notch Tasks Orchestrator")].ends_with(" idle  "), "{t:#?}");
+    // A blank row between groups (after the last tile's pad), in ⌃N (here:
+    // name) order.
     let bai = find(&f, " ● bai");
-    assert!(t[main - 1].trim().is_empty() && bai < main, "{t:#?}");
-    // The spaces: rule and pills right above the parked row; spare rows above them.
+    assert!(t[main - 1].trim().is_empty() && is_pad(&t[main - 2]) && bai < main, "{t:#?}");
+    // The spaces: a gap and the pills right above the parked row; spare
+    // rows above them.
     assert_eq!(f.spaces, 55..57, "{t:#?}");
-    assert!(t[55].starts_with(" ────") && t[56].starts_with("  bai   main ◉   schedule"), "{t:#?}");
+    assert!(t[55].trim().is_empty(), "{t:#?}");
+    assert!(t[56].starts_with(&format!(" {CAP_L}bai{CAP_R} {CAP_L}main ◉{CAP_R} {CAP_L}schedule{CAP_R}")), "{t:#?}");
     assert!(t[f.agents.end..55].iter().all(|l| l.trim().is_empty()), "{t:#?}");
-    assert_eq!(t[57], " ⏸ 1 parked                       ");
+    assert_eq!(t[57].trim_end(), parked(1));
     assert!(!f.spin || t.iter().any(|l| l.contains('⠋')));
 }
 
 #[test]
 fn busy_squeezes_spaces_and_cards_before_agents() {
     let v = busy();
-    // 24 agents, two lines each and hairlines between: full detail in 110
+    let at = |h: u16| layout(&v, 34, h, &Opts::default());
+    let first = |p: &dyn Fn(&Frame) -> bool| (20..120).rev().map(at).find(|f| p(f)).unwrap();
+    // 24 agents, two lines each and a pad under each: full detail in 120
     // rows, gaps and all.
-    let f = layout(&v, 34, 110, &Opts::default());
-    assert!(f.step == 0 && texts(&f).iter().any(|l| is_sep(l)), "{:#?}", texts(&f));
-    // Shorter: the cards lose their second line before any agent loses
-    // detail; then the hairlines go, the agents still two lines.
-    let f = (20..110).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.step > 0).unwrap();
+    let f = at(120);
+    assert!(f.step == 0 && texts(&f).iter().any(|l| is_pad(l)), "{:#?}", texts(&f));
+    // Shorter: the gaps go, then the cards' pads, then the agents' (the
+    // cards still two lines), all before any agent loses detail.
+    let f = first(&|f| f.step > 0);
     assert_eq!(f.agents_step, 0, "{:#?}", texts(&f));
-    let f = (20..110).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| !texts(f).iter().any(|l| is_sep(l))).unwrap();
-    assert_eq!((f.step, f.agents_step), (STEPS.len() as u8, 0), "{:#?}", texts(&f));
+    let f = first(&|f| !texts(f)[f.needs.clone()].iter().any(|l| is_pad(l)));
+    assert!(texts(&f)[f.agents.clone()].iter().any(|l| is_pad(l)) && f.agents_step == 0, "{:#?}", texts(&f));
+    let f = first(&|f| !texts(f)[f.agents.clone()].iter().any(|l| is_pad(l)));
+    let card_lines = f.rows[f.needs.clone()].iter().filter(|r| r.bg.is_some()).count();
+    assert_eq!((f.step, f.agents_step, card_lines), (3, 0, 2 * v.needs.len()), "{:#?}", texts(&f));
+    // Without pads, adjacent tiles alternate the zebra's two shades.
+    let bgs: Vec<Option<Ink>> = f.rows[f.agents.clone()].iter().filter(|r| r.covers.len() == 1).map(|r| r.bg).collect();
+    assert!(bgs.contains(&Some(Ink::Pal("tile"))) && bgs.contains(&Some(Ink::Pal("tile_alt"))), "{bgs:?}");
     // Shorter still: the agents compress, every one of them the same height.
     for step in [1, 2, 3] {
-        let f = (20..90).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == step).unwrap();
+        let f = (20..90).rev().map(at).find(|f| f.agents_step == step).unwrap();
         let t = texts(&f);
         assert_eq!(f.step, STEPS.len() as u8, "{t:#?}");
         // All four needs still on screen, in agent-jump.sh order (failed first).
@@ -436,7 +566,7 @@ fn busy_squeezes_spaces_and_cards_before_agents() {
     // full cards and every pill.
     let mut sv = busy();
     sv.scope.session = Some("main".into());
-    let f = layout(&sv, 34, 40, &Opts::default());
+    let f = layout(&sv, 34, 46, &Opts::default());
     assert_eq!((f.step, f.agents_step), (0, 0), "{:#?}", texts(&f));
     assert_eq!(f.spaces.len(), 1 + pill_lines(&sv, 34));
 }
@@ -452,7 +582,7 @@ fn extreme_cuts_and_counts() {
     assert_eq!((f.step, f.agents_step), (STEPS.len() as u8, 4), "{t:#?}");
     assert!(t[f.needs.clone()].last().unwrap().contains("more need you"), "{t:#?}");
     assert!(t[f.agents.clone()].iter().any(|l| l.starts_with(" … ") && l.contains(" more")), "{t:#?}");
-    let pills = &t[f.spaces.start + 1..f.spaces.end];
+    let pills: Vec<String> = t[f.spaces.start + 1..f.spaces.end].iter().map(|l| uncapped(l)).collect();
     assert!(pills.iter().any(|l| l.contains(" alpha ")) && pills.iter().any(|l| l.contains(" +")), "{t:#?}");
     check_accounting("extreme", &v, &f);
     // Shorter: more spaces than rows, the rest counted.
@@ -467,8 +597,8 @@ fn extreme_cuts_and_counts() {
     let needs_more = find(&f, "more need you") as u16;
     assert_eq!(f.target(3, needs_more), Some(&Target::Menu(None)));
     check_accounting("extreme", &v, &f);
-    // The spaces never go: the rule and a pill line with the client's space.
-    assert!(f.spaces.len() >= 2 && t[f.spaces.start + 1].contains(" alpha "), "{t:#?}");
+    // The spaces never go: the gap and a pill line with the client's space.
+    assert!(f.spaces.len() >= 2 && uncapped(&t[f.spaces.start + 1]).contains(" alpha "), "{t:#?}");
     // With more room the spaces collapse, quietest first.
     let f = layout(&v, 34, 70, &Opts::default());
     assert!(f.agents_step >= 4, "{:#?}", texts(&f));
@@ -483,7 +613,7 @@ fn empty_still_has_every_section() {
     assert!(t.iter().any(|l| l.starts_with("   no agents running")));
     assert_eq!(t[0], " agents                           ");
     // The plain `main` session is still a space: its pill.
-    assert_eq!(&t[f.spaces.clone()][1].trim_end(), &"  main");
+    assert_eq!(t[f.spaces.clone()][1].trim_end(), format!(" {CAP_L}main{CAP_R}"));
 }
 
 #[test]
@@ -491,28 +621,31 @@ fn click_targets() {
     let v = quiet();
     let f = layout(&v, 34, 58, &Opts::default());
     let go = |win: &str| Some(Target::Go { win: win.into(), session: "main".into() });
-    // Both lines of an agent row, anywhere, and both lines of the card.
+    // Both lines of an agent tile, anywhere (its margins too), and both
+    // lines of the card; never their pads.
     let r = find(&f, "Tmux Agent Sidebar") as u16;
     assert_eq!(f.target(5, r).cloned(), go("@2"));
     assert_eq!(f.target(0, r + 1).cloned(), go("@2"));
     assert_eq!(f.target(33, r + 1).cloned(), go("@2"));
+    assert_eq!(f.target(5, r + 2), None);
     let card = find(&f, "▌ Kua Yu") as u16;
     for y in card..card + 2 {
         assert_eq!(f.target(0, y).cloned(), go("@3"));
         assert_eq!(f.target(33, y).cloned(), go("@3"));
     }
+    assert_eq!(f.target(5, card + 2), None);
     // Space headers and pills go to the session; the gap between pills does nothing.
     let hd = find(&f, " ● bai") as u16;
     assert_eq!(f.target(20, hd).cloned(), Some(Target::Session("bai".into())));
     let pills = f.spaces.start as u16 + 1;
     let line = f.rows[pills as usize].text();
-    let x = line.find(" main ").unwrap() as u16 + 2;
-    assert_eq!(f.target(x, pills), Some(&Target::Session("main".into())));
+    assert_eq!(f.target(col(&line, "main"), pills), Some(&Target::Session("main".into())));
+    // The caps are the button's too.
     assert_eq!(f.target(1, pills), Some(&Target::Session("bai".into())));
-    let gap = line.find(" main ").unwrap() as u16 - 1;
+    let gap = col(&line, &format!("{CAP_L}main")) - 1;
     assert_eq!(f.target(gap, pills), None, "{line:?}");
     assert_eq!(f.target(0, pills), None);
-    // The rule, the section headers and blank rows do nothing.
+    // The spaces' gap, the section headers and blank rows do nothing.
     assert_eq!(f.target(5, f.spaces.start as u16), None);
     assert_eq!(f.target(2, find(&f, " NEEDS YOU") as u16), None);
     assert_eq!(f.target(2, 1), None);
@@ -555,26 +688,26 @@ fn titles_and_second_lines() {
     let t = texts(&f);
     let at = |s: &str| f.agents.start + agents_part(&f).iter().position(|l| l.contains(s)).unwrap_or_else(|| panic!("{s}: {t:#?}"));
     // Working with last turn's outcome: a second line with just the age,
-    // never the old outcome.
+    // never the old outcome; then its pad, then the next agent.
     let c = at("Commodities Job Tracker");
-    assert!(!t[c].contains("~/") && t[c + 1].trim() == "1m" && is_sep(&t[c + 2]) && f.rows[c + 3].covers.len() == 1, "{t:#?}");
+    assert!(!t[c].contains("~/") && body(&t[c + 1]) == "1m" && is_pad(&t[c + 2]) && f.rows[c + 3].covers.len() == 1, "{t:#?}");
     // Working with what it runs: plain text under it; `project/` dropped.
     let r = at("Tmux Agent Sidebar");
-    assert!(!t[r].contains("tmux/") && t[r + 1].starts_with("    cargo test "), "{:?}", t[r + 1]);
+    assert!(!t[r].contains("tmux/") && t[r + 1].starts_with(" ▎   cargo test "), "{:?}", t[r + 1]);
     let m = at("Markup only");
-    assert!(t[m + 1].trim() == "5m", "{t:#?}");
+    assert!(body(&t[m + 1]) == "5m", "{t:#?}");
     // Recently done (idle, 4 min): its outcome as plain text.
     let l = at("Lost suit jacket");
-    assert!(t[l].contains("✓ done") && t[l + 1].starts_with("    Found it "), "{:?}", t[l + 1]);
-    // Long done: idle, its last outcome under it with the age.
+    assert!(t[l].contains("✓ done") && t[l + 1].starts_with(" ▎   Found it "), "{:?}", t[l + 1]);
+    // Long done: idle, no stripe, its last outcome under it with the age.
     let g = at("Long ago");
-    assert!(t[g].ends_with(" idle ") && t[g + 1].starts_with("    Old news") && t[g + 1].ends_with(" 1h "), "{t:#?}");
+    assert!(t[g].ends_with(" idle  ") && t[g + 1].starts_with("     Old news") && t[g + 1].ends_with(" 1h  "), "{t:#?}");
     // Asking: the question.
     let k = at("Kua Yu");
-    assert!(t[k].contains("◉ asks") && t[k + 1].starts_with("    Which deck?"), "{t:#?}");
+    assert!(t[k].contains("◉ asks") && t[k + 1].starts_with(" ▎   Which deck?"), "{t:#?}");
     // Needs cards: no `~/`, plain reasons.
-    assert!(t.iter().any(|l| l.starts_with("▌ Kua Yu focus timing")), "{t:#?}");
-    assert!(t.iter().any(|l| l.starts_with("▌ Which deck?")), "{t:#?}");
+    assert!(t.iter().any(|l| l.starts_with(" ▌ Kua Yu focus timing")), "{t:#?}");
+    assert!(t.iter().any(|l| l.starts_with(" ▌ Which deck?")), "{t:#?}");
 }
 
 #[test]
@@ -603,7 +736,7 @@ fn cut_pills_keep_the_current_and_attention_spaces() {
     for h in 7u16..=40 {
         let f = layout(&v, 34, h, &Opts::default());
         let t = texts(&f);
-        let pills = t[f.spaces.start + 1..f.spaces.end].join("|");
+        let pills = uncapped(&t[f.spaces.start + 1..f.spaces.end].join("|"));
         assert!(pills.contains(" zz "), "{h}: {t:#?}");
         assert!(h < 8 || pills.contains(" s07 "), "{h}: {t:#?}");
         let shown = pills.matches(" s").count() + pills.matches(" zz ").count() + pills.matches(" main ").count();
@@ -611,9 +744,8 @@ fn cut_pills_keep_the_current_and_attention_spaces() {
             // The rest as `+K`, which opens the menu on All.
             let k: usize = pills.split(" +").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
             assert_eq!(shown + k, 13, "{h}: {pills:?}");
-            let y = (f.spaces.start + 1..f.spaces.end).find(|&y| t[y].contains(" +")).unwrap();
-            let x = t[y].find(" +").unwrap() as u16 + 1;
-            assert_eq!(f.target(x, y as u16), Some(&Target::Menu(Some("all"))));
+            let y = (f.spaces.start + 1..f.spaces.end).find(|&y| t[y].contains('+')).unwrap();
+            assert_eq!(f.target(col(&t[y], "+"), y as u16), Some(&Target::Menu(Some("all"))));
         }
         check_accounting(&format!("cut {h}"), &v, &f);
     }
@@ -641,7 +773,7 @@ fn groups_and_pills_share_the_space_order() {
         .iter()
         .filter_map(|l| l.strip_prefix(" ● ").map(|r| r.split_whitespace().next().unwrap().to_string()))
         .collect();
-    let pills = t[f.spaces.start + 1..f.spaces.end].join(" ");
+    let pills = uncapped(&t[f.spaces.start + 1..f.spaces.end].join(" "));
     let pill_order: Vec<&str> = ["main", "bai", "cua-notch", "zeta", "aaa", "hidden"]
         .into_iter()
         .filter(|n| pills.contains(&format!(" {n} ")))
@@ -658,8 +790,7 @@ fn groups_and_pills_share_the_space_order() {
     assert!(pills.contains(" 1 main ") && pills.contains(" 2 cua-notch ") && pills.contains(" 3 bai "), "{pills:?}");
     assert!(!pills.contains("12") && pills.contains(" zeta "), "{pills:?}");
     let y = (f.spaces.start + 1) as u16;
-    let x = t[y as usize].find(" cua-notch").unwrap() as u16 + 2;
-    assert_eq!(f.target(x, y), Some(&Target::Session("cua-notch".into())));
+    assert_eq!(f.target(col(&t[y as usize], "cua-notch"), y), Some(&Target::Session("cua-notch".into())));
     // The same holds for the real fleet in its real (live) registry order.
     let order = |v: &ViewModel| groups(v).iter().filter(|s| !s.hidden).map(|s| s.name.clone()).collect::<Vec<_>>();
     let pills = |v: &ViewModel| space_list(v).iter().filter(|s| !s.agents.is_empty()).map(|s| s.name.clone()).collect::<Vec<_>>();
@@ -678,18 +809,23 @@ fn spaces_wear_their_colour() {
     );
     let f = layout(&v, 34, 40, &Opts::default());
     let p = &f.rows[f.spaces.start + 1];
-    // The client's space: filled with its colour, dark ink.
-    assert!(p.segs.contains(&block(" 1 main ", "crust", Ink::Rgb(0xf9, 0xe2, 0xaf))), "{:?}", p.segs);
+    // The client's space: a rounded button filled with its colour, dark ink.
+    let yellow = Ink::Rgb(0xf9, 0xe2, 0xaf);
+    assert!(p.segs.contains(&block("1 main", "crust", yellow)), "{:?}", p.segs);
+    assert!(p.segs.contains(&seg(CAP_L, yellow)) && p.segs.contains(&seg(CAP_R, yellow)), "{:?}", p.segs);
     // Another: its digit in its colour, on surface0.
-    assert!(p.segs.contains(&Seg { bold: true, ..on(" 2", Ink::Idx(24), "surface0") }), "{:?}", p.segs);
-    assert!(p.segs.contains(&Seg { bold: true, ..on(" 3", "overlay2", "surface0") }), "{:?}", p.segs);
+    assert!(p.segs.contains(&Seg { bold: true, ..on("2 ", Ink::Idx(24), "surface0") }), "{:?}", p.segs);
+    assert!(p.segs.contains(&Seg { bold: true, ..on("3 ", "overlay2", "surface0") }), "{:?}", p.segs);
     // Space headers: the dot in the space's colour.
     let hd = &f.rows[find(&f, " ● bai")];
     assert_eq!(hd.segs[1], seg("● ", Ink::Idx(24)));
-    // An alert space's pill carries the state glyph.
+    // An alert space's pill carries the state glyph; a current space with
+    // no colour is lavender.
     let v = view(vec![a("main", 1, "running", "M"), a("bai", 1, "needs-input", "B")], Some("@1"));
     let f = layout(&v, 34, 40, &Opts::default());
-    assert!(f.rows[f.spaces.start + 1].text().contains(" bai ◉ "), "{:?}", f.rows[f.spaces.start + 1].text());
+    let p = &f.rows[f.spaces.start + 1];
+    assert!(p.text().contains("bai ◉"), "{:?}", p.text());
+    assert!(p.segs.contains(&block("main", "crust", "lavender")), "{:?}", p.segs);
 }
 
 #[test]
@@ -699,9 +835,10 @@ fn folding_and_collapsing() {
     let f = (20..90).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 1).unwrap();
     let t = texts(&f);
     assert!(t.iter().any(|l| l.contains("○○○ 3 idle · ")), "{t:#?}");
-    // The fold opens the menu on its Idle tab.
-    let fold = find(&f, "○○○ 3 idle · ") as u16;
-    assert_eq!(f.target(5, fold), Some(&Target::Menu(Some("idle"))));
+    // The fold: a one-row tile that opens the menu on its Idle tab.
+    let fold = find(&f, "○○○ 3 idle · ");
+    assert_eq!(f.target(5, fold as u16), Some(&Target::Menu(Some("idle"))));
+    assert!(matches!(f.rows[fold].bg, Some(Ink::Pal("tile" | "tile_alt"))), "{:?}", f.rows[fold].bg);
     // The client's window is never folded away.
     assert!(t.iter().any(|l| l.contains("Tmux Agent Sidebar")));
     // Squeezed further: whole spaces collapse, quietest first; main keeps its rows longest.
@@ -729,7 +866,7 @@ fn answered_is_never_folded() {
     let f = (8..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 1).unwrap();
     let t = texts(&f);
     assert!(t.iter().any(|l| l.contains("3 idle · Q3, Q4, Q5")), "{t:#?}");
-    assert!(t.iter().any(|l| l.starts_with("  Two")), "{t:#?}");
+    assert!(t.iter().any(|l| l.starts_with("   Two")), "{t:#?}");
 }
 
 /// `v` with letters as the sidebar gives them (`letters::of_view`'s
@@ -746,7 +883,7 @@ fn lettered(mut v: ViewModel) -> ViewModel {
     v
 }
 
-/// A card like the live one: main (⌃1, yellow), three shells (home first,
+/// A bar like the live one: main (⌃1, yellow), three shells (home first,
 /// the second active), usage meters (the weekly one from its numbers, the
 /// session one from its text) and a stale save.
 fn demo_bar() -> Bar {
@@ -771,7 +908,7 @@ fn demo_bar() -> Bar {
                 expected: Some(51.0), delta: Some(-38), ..Usage::default() },
             Usage { label: "W".into(), text: "60% (+17%)".into(), color: Some(Ink::Pal("red")), used: Some(60.0),
                 expected: Some(43.0), delta: Some(17), resets: Some(NOW + 3 * 3600), pooled: true,
-                members: vec![Member { slot: Some(1), used: 90, active: false }, Member { slot: Some(2), used: 30, active: true }],
+                members: vec![Member { slot: Some(1), used: 90, active: false, cap: 90 }, Member { slot: Some(2), used: 30, active: true, cap: 100 }],
                 ..Usage::default() },
             Usage { label: "F".into(), text: "--%".into(), color: Some(Ink::Idx(239)), ..Usage::default() },
         ],
@@ -784,67 +921,60 @@ fn with_bar(bar: Bar) -> Opts {
     Opts { bar, ..Opts::default() }
 }
 
-/// Every agent row and NEEDS YOU card shows its letter as a key-cap, in
-/// both scopes; peach while ⌥W's jump table is armed; blank past 26.
+/// Every agent row and NEEDS YOU card shows its letter as a key-cap (a
+/// raised chip on its tile), in both scopes; peach while ⌥W's jump table
+/// is armed; blank past 26.
 #[test]
 fn letter_key_caps_lead_every_agent_row_and_card() {
     let v = lettered(quiet());
     let f = layout(&v, 34, 58, &Opts::default());
     let t = texts(&f);
-    let r = find(&f, "Tmux Agent Sidebar");
-    assert!(t[r].starts_with("▎ f  Tmux Agent Sidebar"), "{:?}", t[r]);
-    assert!(t[r + 1].starts_with("▎    Edit agent-roster.py"), "{:?}", t[r + 1]);
-    // On the lifted row the cap is lifted too.
-    assert_eq!(f.rows[r].segs[1], on(" f ", "sub", "surface1"));
+    let r = find(&f, "Tmux Agent Side");
+    assert!(t[r].starts_with(" ▌ f  Tmux Agent Side"), "{:?}", t[r]);
+    assert!(t[r + 1].starts_with(" ▌    Edit agent-roster.py"), "{:?}", t[r + 1]);
+    assert_eq!(f.rows[r].segs[2], on(" f ", "sub", "surface1"));
     let c = find(&f, "▌ g  Kua Yu focus timing");
-    assert_eq!(f.rows[c].segs[1], on(" g ", "sub", "surface1"));
-    assert!(t[c + 1].starts_with("▌    Which deck"), "{t:#?}");
-    let i = find(&f, "  h  Commodities Job");
-    assert_eq!(f.rows[i].segs[1], on(" h ", "sub", "surface0"));
+    assert_eq!(f.rows[c].segs[2], on(" g ", "sub", "surface1"));
+    assert!(t[c + 1].starts_with(" ▌    Which deck"), "{t:#?}");
+    let i = find(&f, "▎ h  Commodities Job");
+    assert_eq!(f.rows[i].segs[2], on(" h ", "sub", "surface1"));
     // Space scope: the same letters.
     let mut sv = lettered(quiet());
     sv.scope.session = Some("main".into());
     let f = layout(&sv, 34, 58, &Opts::default());
-    find(&f, " f  Tmux Agent Sidebar");
+    find(&f, " f  Tmux Agent Side");
     find(&f, "▌ g  Kua Yu");
-    // ⌥W armed (key table `jump`): every cap peach; the mark and the hint
-    // in the card's top border, the card no taller for it.
+    // ⌥W armed (key table `jump`): every cap peach; the mark and the hint a
+    // tab on the panel's top pad, the panel no taller for it.
     let f = layout(&v, 34, 58, &with_bar(Bar { jump: true, ..demo_bar() }));
-    assert!(f.card_title.contains(&block(" ⌥W jump ", "crust", "peach")), "{:?}", f.card_title);
-    assert_eq!(top_border(&f), "╭─ ⌥W jump  type a letter ───────╮");
+    let top = &f.rows[f.card.start];
+    assert!(top.segs.contains(&block(" ⌥W jump ", "crust", "peach")), "{:?}", top.segs);
+    assert_eq!(top.text(), format!(" ▄ ⌥W jump  type a letter {} ", "▄".repeat(7)));
     assert_eq!(f.card, layout(&v, 34, 58, &with_bar(demo_bar())).card);
-    let r = find(&f, "Tmux Agent Sidebar");
-    assert_eq!(f.rows[r].segs[1], block(" f ", "crust", "peach"));
+    let r = find(&f, "Tmux Agent Side");
+    assert_eq!(f.rows[r].segs[2], block(" f ", "crust", "peach"));
     let c = find(&f, "▌ g  Kua Yu");
-    assert_eq!(f.rows[c].segs[1], block(" g ", "crust", "peach"));
-    // Narrow: the hint gives way, the mark stays whole, the corner too.
+    assert_eq!(f.rows[c].segs[2], block(" g ", "crust", "peach"));
+    // Narrow: the hint gives way, the mark stays whole, the pad's ends too.
     let f = layout(&v, 22, 58, &with_bar(Bar { jump: true, ..demo_bar() }));
-    let top = top_border(&f);
-    assert!(top.starts_with("╭─ ⌥W jump  type") && top.ends_with("─╮") && dwidth(&top) == 22, "{top:?}");
+    let top = f.rows[f.card.start].text();
+    assert!(top.starts_with(" ▄ ⌥W jump  type") && top.ends_with("▄ ") && dwidth(&top) == 22, "{top:?}");
     // Past 26 agents: a blank cap, the title still aligned.
     let x = lettered(extreme());
     let none = x.agents().find(|a| a.letter.is_none()).expect("an agent past 26");
     let f = layout(&x, 60, 400, &Opts::default());
     let k = f.rows.iter().position(|r| r.covers.iter().any(|(s, id)| *s == none.session && *id == none.window_id)).unwrap();
-    assert_eq!(f.rows[k].segs[1].text, "   ", "{:?}", f.rows[k].text());
-    assert!(f.rows[k].text().starts_with("     An agent"), "{:?}", f.rows[k].text());
+    assert_eq!(f.rows[k].segs[2].text, "   ", "{:?}", f.rows[k].text());
+    assert!(f.rows[k].text().chars().skip(2).collect::<String>().starts_with("    An agent"), "{:?}", f.rows[k].text());
 }
 
-/// The card's top border as painted, the key-table marks in it.
-fn top_border(f: &Frame) -> String {
-    let mut buf = Buffer::empty(Rect::new(0, 0, f.width, f.height));
-    paint(f, &mut buf);
-    let y = f.card.start as u16;
-    (0..f.width).map(|x| buf[(x, y)].symbol().to_string()).collect()
-}
-
-/// The status line's content, in the sidebar's card: a rounded Block, the
-/// red prefix mark in its top border, one meter per usage window, the
-/// stale save; no space chip and no shells (the pills at the bottom and the
-/// SHELLS section say those). Shorter frames give up the meters for one
-/// line, then the border.
+/// The status line's content, in the sidebar's usage panel: a tile with a
+/// half-block pad above and below (no border), the red prefix mark a tab
+/// on its top pad, one meter per usage window, the stale save; no space
+/// chip and no shells (the pills at the bottom and the SHELLS section say
+/// those). Shorter frames give up the meters for one line, then the panel.
 #[test]
-fn the_card_replaces_the_status_line() {
+fn the_panel_replaces_the_status_line() {
     let v = lettered(quiet());
     let f = layout(&v, 34, 40, &with_bar(demo_bar()));
     let t = texts(&f);
@@ -856,27 +986,29 @@ fn the_card_replaces_the_status_line() {
     assert!(t[2].starts_with("  W ━") && t[2].contains(" 60% (+17%) "), "{:?}", t[2]);
     assert!(!t.iter().any(|l| l.contains('Σ')), "{t:#?}");
     assert!(f.rows[2].segs.iter().any(|s| s.text.contains("(+17%)") && s.fg == Ink::Pal("peach")), "over pace: peach");
-    assert!(t[3].starts_with("  F ─") && t[3].contains("   -- "), "{:?}", t[3]);
+    assert!(t[3].starts_with("  F ━") && t[3].contains("   -- "), "{:?}", t[3]);
     assert!(t[4].contains(" ! ") && t[4].contains("last save 2h ago"), "{:?}", t[4]);
-    // The card's border is ratatui's rounded Block, painted over the rows
-    // (no row's own text carries it); nothing in it while no table is armed.
+    // A tile: its pads, the content on `tile` between canvas margins, no line art.
+    assert_eq!((t[0].clone(), t[5].clone()), (format!(" {} ", "▄".repeat(32)), format!(" {} ", "▀".repeat(32))));
+    for y in 1..5 {
+        let r = &f.rows[y];
+        assert_eq!((r.bg, r.segs[0].clone(), r.segs.last().cloned()), (Some(Ink::Pal("tile")), bare(1), Some(bare(1))), "{y}");
+    }
+    assert!(f.rows[0].segs.contains(&seg("▄".repeat(32), "tile")) && f.rows[0].bg.is_none());
     let mut buf = Buffer::empty(Rect::new(0, 0, 34, 40));
     paint(&f, &mut buf);
-    assert_eq!((buf[(0, 0)].symbol(), buf[(33, 0)].symbol(), buf[(0, 5)].symbol(), buf[(33, 5)].symbol()), ("╭", "╮", "╰", "╯"));
-    assert_eq!((buf[(0, 2)].symbol(), buf[(33, 2)].symbol()), ("│", "│"));
-    assert_eq!(buf[(0, 2)].fg, palette::color("surface1"));
-    assert!(t[0].trim().is_empty() && t[5].trim().is_empty() && !t[2].contains('│'));
-    assert_eq!(top_border(&f), format!("╭{}╮", "─".repeat(32)));
-    // The red prefix mark, keyed on the client's key table: in the border.
+    assert_eq!((buf[(0, 2)].bg, buf[(1, 2)].bg, buf[(32, 2)].bg, buf[(33, 2)].bg),
+        (Color::Reset, palette::color("tile"), palette::color("tile"), Color::Reset));
+    // The red prefix mark, keyed on the client's key table: a tab on the top pad.
     let p = layout(&v, 34, 40, &with_bar(Bar { prefix: true, ..demo_bar() }));
-    assert_eq!(p.card_title, vec![block(" prefix ", "crust", "red")]);
-    assert_eq!(top_border(&p), format!("╭─ prefix {}╮", "─".repeat(23)));
-    assert_eq!((p.card.clone(), texts(&p)), (f.card.clone(), t.clone()), "the card keeps its rows");
-    // 34x20: still a card, usage in one line.
+    assert_eq!(texts(&p)[0], format!(" ▄ prefix {} ", "▄".repeat(23)));
+    assert!(p.rows[0].segs.contains(&block(" prefix ", "crust", "red")));
+    assert_eq!((p.card.clone(), texts(&p)[1..].to_vec()), (f.card.clone(), t[1..].to_vec()), "the panel keeps its rows");
+    // 34x20: still a panel, usage in one line.
     let f = layout(&v, 34, 20, &with_bar(demo_bar()));
     let t = texts(&f);
     assert!(!f.card.is_empty() && t.iter().any(|l| l.contains("S 13%  W 60%  F --")), "{t:#?}");
-    // 34x14: no border, the prefix mark on a row of its own; 34x11: no
+    // 34x14: no panel, the prefix mark on a row of its own; 34x11: no
     // usage either, nothing on top but the mark.
     let f = layout(&v, 34, 14, &with_bar(Bar { prefix: true, ..demo_bar() }));
     let t = texts(&f);
@@ -890,42 +1022,46 @@ fn the_card_replaces_the_status_line() {
     assert!(!t.iter().any(|l| l.contains("⏵ next") || l.contains("≡")), "{t:#?}");
 }
 
-/// The client's space's shells: a SHELLS section under the agents, one row
-/// each (⌥N key-cap, ⌂ on the home, the label), the active one lifted, each
-/// clicking through to its shell.
+/// The client's space's shells: a SHELLS section under the agents, one
+/// button tile each (⌥N key-cap, ⌂ on the home, the label), the active one
+/// lifted, each clicking through to its shell.
 #[test]
 fn shells_list_under_the_agents() {
     let v = lettered(quiet());
     let f = layout(&v, 34, 58, &with_bar(demo_bar()));
     let t = texts(&f);
-    assert!(f.shells.start > f.agents.end, "{t:#?}");
+    assert!(f.shells.start >= f.agents.end, "{t:#?}");
     let s = f.shells.start;
-    assert_eq!(f.shells.len(), 4, "{t:#?}");
+    // Each button with its pad.
+    assert_eq!(f.shells.len(), 7, "{t:#?}");
     assert_eq!(t[s].trim_end(), " SHELLS");
-    assert_eq!(t[s + 1].trim_end(), "  ⌥1  ⌂ ~");
-    assert_eq!(t[s + 2].trim_end(), "▎ ⌥2  nvim");
-    assert_eq!(t[s + 3].trim_end(), "  ⌥3  proj");
-    assert_eq!(f.rows[s + 2].bg, Some(Ink::Pal("surface0")));
-    assert!(f.rows[s + 2].segs.iter().any(|x| x.text == "nvim" && x.bold));
-    assert_eq!(f.rows[s + 1].bg, None);
+    assert_eq!(t[s + 1].trim_end(), "   ⌥1  ⌂ ~");
+    assert_eq!(t[s + 3].trim_end(), " ▌ ⌥2  nvim");
+    assert_eq!(t[s + 5].trim_end(), "   ⌥3  proj");
+    assert!([s + 2, s + 4, s + 6].iter().all(|&y| is_pad(&t[y]) && f.rows[y].targets.is_empty()), "{t:#?}");
+    assert_eq!((f.rows[s + 1].bg, f.rows[s + 3].bg), (Some(Ink::Pal("tile")), Some(Ink::Pal("tile_hi"))));
+    assert_eq!(f.rows[s + 3].segs[1], seg("▌", "blue"));
+    assert!(f.rows[s + 3].segs.iter().any(|x| x.text == "nvim" && x.bold));
     let shell = |win: &str| Some(Target::Shell { win: win.into(), session: "main".into() });
-    for (k, win) in ["@901", "@902", "@903"].iter().enumerate() {
-        let y = (s + 1 + k) as u16;
+    for (y, win) in [(s + 1, "@901"), (s + 3, "@902"), (s + 5, "@903")] {
+        let y = y as u16;
         assert_eq!((f.target(0, y).cloned(), f.target(33, y).cloned()), (shell(win), shell(win)));
     }
     assert_eq!(f.target(3, s as u16), None);
-    // A blank row between the agents and the shells while the gaps last.
-    assert!(t[s - 1].trim().is_empty(), "{t:#?}");
+    // Under the last agent's pad; a blank row before it too while the gaps last.
+    assert!(is_pad(&t[s - 1]), "{t:#?}");
+    let tall = layout(&v, 34, 80, &with_bar(demo_bar()));
+    assert!(tall.step == 0 && texts(&tall)[tall.shells.start - 1].trim().is_empty(), "{:#?}", texts(&tall));
     // No shells, no section.
     let f = layout(&v, 34, 58, &with_bar(Bar { shells: vec![], ..demo_bar() }));
     assert!(f.shells.is_empty() && !texts(&f).iter().any(|l| l.contains("SHELLS")));
-    // Short: one line of pills before the agents lose any detail, then
-    // kept in one line while they compress.
+    // Short: the pads go, then one line of buttons before the agents lose
+    // any detail, then kept in one line while they compress.
     let v = busy();
-    for h in 12u16..=90 {
+    for h in 12u16..=120 {
         let f = layout(&v, 34, h, &with_bar(demo_bar()));
         let t = texts(&f);
-        assert!(f.shells.len() == 4 || f.shells.len() == 1, "{h}: {t:#?}");
+        assert!([7, 4, 1].contains(&f.shells.len()), "{h}: {t:#?}");
         if f.shells.len() == 1 {
             assert!(t[f.shells.start].starts_with(" SHELLS ") && t[f.shells.start].contains("nvim"), "{h}: {t:#?}");
         } else {
@@ -953,11 +1089,19 @@ fn shells_line_counts_what_does_not_fit() {
         assert!(w < 20 || text.contains("sh7"), "{w}: {text:?}");
     }
     let t = shells_line(&bar, 200)[0].text();
-    assert!(t.starts_with(" SHELLS  ⌥1 ⌂sh1   ⌥2 sh2") && t.contains(" ⌥9 sh9   sh10   sh11 "), "{t:?}");
-    assert!(shells_line(&Bar::default(), 34).is_empty() && shells_section(&Bar::default(), 34).is_empty());
+    assert!(t.starts_with(&format!(" SHELLS {CAP_L}⌥1 ⌂sh1{CAP_R} {CAP_L}⌥2 sh2{CAP_R}")), "{t:?}");
+    assert!(t.contains(&format!("{CAP_L}⌥9 sh9{CAP_R} {CAP_L}sh10{CAP_R} {CAP_L}sh11{CAP_R}")), "{t:?}");
+    assert!(shells_line(&Bar::default(), 34).is_empty() && shells_section(&Bar::default(), 34, true).is_empty());
 }
 
-/// A meter: filled to the used percent, the tick where the pace expects
+/// A meter's bar as (glyph, ink) cells: from its fourth cell, the `━` and
+/// `┃` run.
+fn bar_cells(r: &Row) -> Vec<(char, Ink)> {
+    r.segs.iter().flat_map(|s| s.text.chars().map(move |c| (c, s.fg))).skip(3).take_while(|(c, _)| "━┃".contains(*c)).collect()
+}
+
+/// A meter: Textual's progress bar, filled (the label's colour) to the
+/// used percent over a `surface1` track, the tick where the pace expects
 /// it, the reset hint only when the bar keeps its length.
 #[test]
 fn meters_fill_and_tick() {
@@ -966,34 +1110,36 @@ fn meters_fill_and_tick() {
     let r = meter_row(&u, 40, NOW as f64);
     let t = r.text();
     assert_eq!(dwidth(&t), 40);
-    let bar: String = t.chars().skip(3).take_while(|c| "━─┃".contains(*c)).collect();
-    let bw = bar.chars().count();
-    let tick = bar.chars().position(|c| c == '┃').unwrap();
+    let bar = bar_cells(&r);
+    let bw = bar.len();
+    let tick = bar.iter().position(|(c, _)| *c == '┃').unwrap();
     assert_eq!(tick, (0.43 * bw as f64).round() as usize, "{t:?}");
-    let filled = bar.chars().filter(|&c| c == '━').count() + usize::from(tick < (0.6 * bw as f64).round() as usize);
+    let filled = bar.iter().filter(|(_, ink)| *ink == Ink::Pal("red")).count() + usize::from(tick < (0.6 * bw as f64).round() as usize);
     assert_eq!(filled, (0.6 * bw as f64).round() as usize, "{t:?}");
+    assert!(bar.iter().all(|(c, ink)| *c == '┃' || *ink == Ink::Pal("red") || *ink == Ink::Pal("surface1")), "{bar:?}");
     assert!(t.ends_with(" 60% (+17%) ") || t.ends_with("↻3h "), "{t:?}");
     // Wide: the reset hint too.
     assert!(meter_row(&u, 60, NOW as f64).text().ends_with(" 60% (+17%)  ↻3h "), "{:?}", meter_row(&u, 60, NOW as f64).text());
     // Under pace: dim; on pace: `±0%`; idle: an empty bar and `idle`; no number: `--`.
     let under = Usage { delta: Some(-4), ..u.clone() };
-    assert!(meter_row(&under, 40, 0.0).segs.iter().any(|s| s.text.contains(" (-4%)") && s.fg == Ink::Pal("overlay")));
+    assert!(meter_row(&under, 40, 0.0).segs.iter().any(|s| s.text.contains(" (-4%)") && s.fg == Ink::Pal("overlay2")));
     let even = Usage { delta: Some(0), pooled: true, ..u.clone() };
     assert!(meter_row(&even, 40, 0.0).text().contains(" 60%  (±0%) "), "{:?}", meter_row(&even, 40, 0.0).text());
     let idle = Usage { label: "S".into(), idle: true, ..Usage::default() };
-    let t = meter_row(&idle, 34, 0.0).text();
-    assert!(t.contains("─────") && !t.contains('━') && !t.contains('┃') && t.ends_with("idle "), "{t:?}");
+    let r = meter_row(&idle, 34, 0.0);
+    let bar = bar_cells(&r);
+    assert!(bar.len() > 5 && bar.iter().all(|x| *x == ('━', Ink::Pal("surface1"))) && r.text().ends_with("idle "), "{:?}", r.text());
     // Narrow: the delta goes before the bar does.
     let t = meter_row(&u, 16, NOW as f64).text();
     assert!(!t.contains("+17") && t.contains("60%") && dwidth(&t) == 16, "{t:?}");
     // Over the window: the real number, the bar full, the tick on its last cell.
     let over = Usage { used: Some(104.0), expected: Some(112.0), delta: Some(-8), ..u.clone() };
-    let t = meter_row(&over, 40, NOW as f64).text();
-    let bar: String = t.chars().skip(3).take_while(|c| "━─┃".contains(*c)).collect();
-    assert!(t.contains("104%") && !bar.contains('─') && bar.ends_with('┃'), "{t:?}");
+    let r = meter_row(&over, 40, NOW as f64);
+    let bar = bar_cells(&r);
+    assert!(r.text().contains("104%") && !bar.iter().any(|(_, ink)| *ink == Ink::Pal("surface1")) && bar.last().unwrap().0 == '┃', "{bar:?}");
     let under = Usage { used: Some(-3.0), expected: Some(-10.0), ..u.clone() };
-    let bar: String = meter_row(&under, 40, NOW as f64).text().chars().skip(3).take_while(|c| "━─┃".contains(*c)).collect();
-    assert!(bar.starts_with('┃') && !bar.contains('━'), "{bar:?}");
+    let bar = bar_cells(&meter_row(&under, 40, NOW as f64));
+    assert!(bar[0].0 == '┃' && !bar.iter().any(|(_, ink)| *ink == Ink::Pal("red")), "{bar:?}");
 }
 
 /// Ages are formatted at the frame's clock, not frozen at the snapshot's:
@@ -1007,26 +1153,31 @@ fn ages_follow_the_frame_clock() {
         (t[find(&f, "Lost suit jacket") + 1].clone(), t[find(&f, "Edit agent-roster.py")].clone(), t[find(&f, "▌ Kua Yu")].clone())
     };
     let (idle, msg, card) = at(None);
-    assert!(idle.ends_with(" 6m ") && msg.ends_with(" 2m ") && card.ends_with("◉ 3m "), "{idle:?} {msg:?} {card:?}");
+    assert!(idle.ends_with(" 6m  ") && msg.ends_with(" 2m  ") && card.ends_with("◉ 3m  "), "{idle:?} {msg:?} {card:?}");
     let (idle, msg, card) = at(Some(NOW as f64 + 60.0));
-    assert!(idle.ends_with(" 7m ") && msg.ends_with(" 3m ") && card.ends_with("◉ 4m "), "{idle:?} {msg:?} {card:?}");
+    assert!(idle.ends_with(" 7m  ") && msg.ends_with(" 3m  ") && card.ends_with("◉ 4m  "), "{idle:?} {msg:?} {card:?}");
 }
 
-/// Dim text on a surface (a pill, a card, a lifted row) is `overlay2`,
-/// never `overlay` (under 3:1 there).
+/// Dim text on a surface (a pill, a card, a tile) is `overlay2`, never
+/// `overlay` (under 3:1 there).
 #[test]
 fn dim_text_on_surfaces_is_overlay2() {
-    let f = layout(&lettered(quiet()), 34, 58, &with_bar(demo_bar()));
-    for r in &f.rows {
-        for s in &r.segs {
-            let surface = s.bg.is_some() || r.bg.is_some();
-            assert!(!(surface && s.fg == Ink::Pal("overlay") && !s.text.trim().is_empty()), "{:?} in {:?}", s, r.text());
+    let bars = [demo_bar(), Bar { toasts: vec![toast(Kind::Warn, "hi")], ..demo_bar() }];
+    for (v, bar) in [lettered(quiet()), busy()].into_iter().flat_map(|v| bars.clone().map(move |b| (v.clone(), b))) {
+        for h in [20u16, 40, 58] {
+            let f = layout(&v, 34, h, &with_bar(bar.clone()));
+            for r in &f.rows {
+                for s in &r.segs {
+                    let surface = s.bg.is_some_and(|b| b != Ink::Canvas) || r.bg.is_some();
+                    assert!(!(surface && s.fg == Ink::Pal("overlay") && !s.text.trim().is_empty()), "{:?} in {:?}", s, r.text());
+                }
+            }
         }
     }
 }
 
-/// prefix v's selection: every selected agent row (both lines) and shell
-/// row on a mauve tint with a mauve edge; the hint.
+/// prefix v's selection: every selected agent tile (both lines) and shell
+/// button on a mauve tint with a mauve stripe; the hint.
 #[test]
 fn the_stash_selection_tints_rows_and_shows_its_keys() {
     let v = lettered(view(
@@ -1044,15 +1195,15 @@ fn the_stash_selection_tints_rows_and_shows_its_keys() {
     let r = find(&f, "Sel one");
     for row in &f.rows[r..r + 2] {
         assert_eq!(row.bg, Some(Ink::Mix("mauve", 18)), "{:?}", row.text());
-        assert_eq!(row.segs[0], seg("▌", "mauve"));
+        assert_eq!(row.segs[1], seg("▌", "mauve"));
     }
     let p = find(&f, "Plain");
-    assert_eq!(f.rows[p].bg, None);
-    let sh = f.shells.start + 2;
-    assert!(t[sh].starts_with("▌ ⌥2  nvim"), "{t:#?}");
-    assert_eq!((f.rows[sh].bg, f.rows[sh].segs[0].clone()), (Some(Ink::Mix("mauve", 18)), seg("▌", "mauve")));
-    assert_eq!(f.rows[sh + 1].bg, None);
-    // The hint, first in the card: as many of the keys as fit.
+    assert_ne!(f.rows[p].bg, Some(Ink::Mix("mauve", 18)));
+    let sh = find(&f, "⌥2  nvim");
+    assert!(t[sh].starts_with(" ▌ ⌥2  nvim"), "{t:#?}");
+    assert_eq!((f.rows[sh].bg, f.rows[sh].segs[1].clone()), (Some(Ink::Mix("mauve", 18)), seg("▌", "mauve")));
+    assert_ne!(f.rows[find(&f, "⌥3  proj")].bg, Some(Ink::Mix("mauve", 18)));
+    // The hint, first in the panel: as many of the keys as fit.
     assert_eq!(find(&f, " selected "), f.status.start);
     let hint = find(&f, " selected ");
     assert!(t[hint].contains(" 2 selected  h/l ⏎ park esc"), "{:?}", t[hint]);
@@ -1104,16 +1255,16 @@ fn proj() -> Vec<A<'static>> {
     ]
 }
 
-/// An agent row's title, when `l` is one (no letters in these views).
+/// An agent row's title, when `l` is one (no letters in these views): past
+/// the margin, the stripe and a space.
 fn row_title(l: &str) -> Option<&str> {
-    let rest = l.strip_prefix("  ").or_else(|| l.strip_prefix("▎ "))?;
-    (!rest.starts_with(' ') && !is_sep(l)).then(|| rest.split("  ").next().unwrap().trim())
-}
-
-/// A hairline between two agents (from the third cell; the spaces' rule
-/// starts at the second).
-fn is_sep(l: &str) -> bool {
-    l.starts_with("  ─") && l.trim().chars().all(|c| c == '─')
+    let rest = l.strip_prefix(' ')?;
+    let mut cs = rest.chars();
+    if !matches!(cs.next()?, ' ' | '▎' | '▌') {
+        return None;
+    }
+    let rest = cs.as_str().strip_prefix(' ')?;
+    (!rest.starts_with(' ') && !is_pad(l)).then(|| rest.split("  ").next().unwrap().trim())
 }
 
 #[test]
@@ -1125,7 +1276,8 @@ fn space_scope_shows_one_session() {
     // The title: this space's counts only (other's ◐ not counted).
     assert!(t[0].starts_with(" space ") && t[0].ends_with("✕1 ◉1 ◐1 ○1 "), "{:?}", t[0]);
     let b = agents_part(&f);
-    assert!(b[0].starts_with(" AGENTS") && b[0].ends_with("this space "), "{b:#?}");
+    // The scope: a rounded button.
+    assert!(b[0].starts_with(" AGENTS") && b[0].ends_with(&format!("{CAP_L}this space{CAP_R} ")), "{b:#?}");
     assert!(b[1].starts_with(" ● proj"), "{b:#?}");
     // Window-index order; no shell rows.
     let rows: Vec<&str> = b[2..].iter().filter_map(|l| row_title(l)).collect();
@@ -1133,13 +1285,13 @@ fn space_scope_shows_one_session() {
     assert!(!b.iter().any(|l| l.contains("other") || l.contains("o/one") || l.contains("zsh")), "{b:#?}");
     // NEEDS YOU stays global, as do the spaces.
     let needs = &t[f.needs.clone()];
-    assert!(needs.iter().any(|l| l.starts_with("▌ p/five")) && needs.iter().any(|l| l.starts_with("▌ p/twelve")), "{needs:#?}");
-    assert!(t[f.spaces.clone()].iter().any(|l| l.contains(" other ")), "{t:#?}");
-    // The title toggles, and so does the scope word; the counts do not.
+    assert!(needs.iter().any(|l| l.starts_with(" ▌ p/five")) && needs.iter().any(|l| l.starts_with(" ▌ p/twelve")), "{needs:#?}");
+    assert!(t[f.spaces.clone()].iter().any(|l| l.contains("other")), "{t:#?}");
+    // The title toggles, and so does the scope button; the counts do not.
     assert_eq!((f.target(0, 0), f.target(1, 0), f.target(5, 0), f.target(6, 0), f.target(30, 0)),
         (None, Some(&Target::Scope), Some(&Target::Scope), None, None));
     let y = f.agents.start as u16;
-    assert_eq!((f.target(28, y), f.target(3, y)), (Some(&Target::Scope), None));
+    assert_eq!((f.target(21, y), f.target(32, y), f.target(33, y), f.target(3, y)), (Some(&Target::Scope), Some(&Target::Scope), None, None));
 }
 
 #[test]
@@ -1148,9 +1300,9 @@ fn explicit_space_scope_without_spaces_keeps_the_current_shell() {
     assert_eq!(v.scope.session.as_deref(), Some("proj"));
     let f = layout(&v, 34, 58, &Opts::default());
     let b = agents_part(&f);
-    // The client's shell is a row (the classic rule), no state word.
+    // The client's shell is a tile (the classic rule), no state word.
     let z = b.iter().find(|l| l.contains("zsh")).unwrap_or_else(|| panic!("{b:#?}"));
-    assert!(z.starts_with("▎ zsh") && z.trim_end().ends_with("zsh"), "{z:?}");
+    assert!(z.starts_with(" ▌ zsh") && z.trim_end().ends_with("zsh"), "{z:?}");
     assert!(b.iter().any(|l| row_title(l) == Some("two")) && b.iter().any(|l| row_title(l) == Some("twelve")), "{b:#?}");
 }
 
@@ -1163,7 +1315,7 @@ fn all_scope_with_spaces_drops_shells_and_toggles() {
     assert!(t[0].starts_with(" agents ") && t[0].ends_with("✕1 ◉1 ◐2 ○1 "), "{:?}", t[0]);
     assert_eq!(f.target(3, 0), Some(&Target::Scope));
     let b = agents_part(&f);
-    assert!(b[0].ends_with("all spaces "), "{b:#?}");
+    assert!(b[0].contains("all spaces"), "{b:#?}");
     assert!(b.iter().any(|l| l.starts_with(" ● other")) && b.iter().any(|l| l.starts_with(" ● proj")), "{b:#?}");
     assert!(!b.iter().any(|l| l.contains("zsh")), "{b:#?}");
     assert!(b.iter().any(|l| row_title(l) == Some("five")) && b.iter().any(|l| row_title(l) == Some("two")), "{b:#?}");
@@ -1181,6 +1333,8 @@ fn classic_when_spaces_off_and_scope_unset() {
         assert_eq!((v.scope.session.as_ref(), v.scope.toggles(), v.scope.name()), (None, false, "all"), "{spaces} {scope}");
         let f = layout(&v, 34, 58, &Opts::default());
         assert!(f.rows[0].targets.is_empty() && f.rows[f.agents.start].targets.is_empty());
+        // Not a button: plain dim text.
+        assert!(texts(&f)[f.agents.start].ends_with("all spaces "), "{spaces} {scope}");
         // The client's shell still shows: the classic rule.
         assert!(agents_part(&f).iter().any(|l| l.contains("zsh")), "{spaces} {scope}");
     }
@@ -1199,7 +1353,7 @@ fn hidden_sessions_fall_back_to_all() {
         let f = layout(&v, 34, 58, &Opts::default());
         assert!(texts(&f)[0].starts_with(" agents "), "{session}");
         let b = agents_part(&f);
-        assert!(b[0].ends_with("all spaces ") && b.iter().any(|l| l.starts_with(" ● other")), "{session}: {b:#?}");
+        assert!(b[0].contains("all spaces") && b.iter().any(|l| l.starts_with(" ● other")), "{session}: {b:#?}");
     }
 }
 
@@ -1269,7 +1423,7 @@ fn a_last_spare_row_shows_an_agent() {
     let hd = find(&f, " ● main");
     assert!(t[hd + 1].contains("Handy.app"), "{t:#?}");
     assert_eq!(f.spaces.len(), 2, "{t:#?}");
-    assert!(t[10].starts_with(" ⏸ "), "{t:#?}");
+    assert!(t[10].starts_with(&parked(0)[..4]), "{t:#?}");
 }
 
 /// Narrow widths degrade in order: the age first (under 30), then the
@@ -1286,7 +1440,7 @@ fn narrow_widths_degrade_gracefully() {
         let f = layout(&v, w, 58, &with_bar(demo_bar()));
         let t = texts(&f);
         let rows: Vec<&Row> = f.rows[f.needs.start..f.agents.end].iter().filter(|r| r.target_at(0).is_some_and(|x| matches!(x, Target::Go { .. }))).collect();
-        let seconds = rows.iter().filter(|r| r.covers.is_empty() && r.bg != Some(Ink::Mix("yellow", 14))).count();
+        let seconds = rows.iter().filter(|r| r.covers.is_empty() && !matches!(r.bg, Some(Ink::Mix("yellow", _)))).count();
         if w < 30 {
             assert!(!rows.iter().any(|r| age(&r.text())), "{w}: {t:#?}");
         }
@@ -1303,7 +1457,7 @@ fn narrow_widths_degrade_gracefully() {
         }
         // Every agent's title starts where it should (clipped, never shifted).
         let r = find(&f, "Tmux");
-        assert!(t[r].starts_with("▎ f  Tmux"), "{w}: {:?}", t[r]);
+        assert!(t[r].starts_with(" ▌ f  Tmux"), "{w}: {:?}", t[r]);
     }
 }
 
@@ -1326,13 +1480,19 @@ fn the_spinner_turns_only_working_rows() {
     // Nothing working: no spinner.
     let idle = view(vec![a("main", 1, "idle", "Calm"), a("main", 2, "needs-input", "Ask")], None);
     assert!(!layout(&idle, 34, 30, &Opts::default()).spin);
+    // A toast card over a working row: that row's spinner is not drawn, so
+    // it never asks for a redraw.
+    let one = view(vec![a("main", 1, "running", "Busy")], None);
+    let f = layout(&one, 34, 14, &Opts { bar: Bar { toasts: vec![toast(Kind::Info, "hi")], ..Bar::default() }, ..Opts::default() });
+    let busy_row = f.rows.iter().position(|r| r.covers.len() == 1).unwrap();
+    assert_eq!(f.spin, !f.toast.contains(&busy_row), "{:#?}", texts(&f));
 }
 
 #[test]
 fn glyph_widths_agree_with_ratatui() {
     // Every fixed glyph the sidebar draws: the layout's cell count
     // (text::dwidth) must be ratatui's (unicode-width over the grapheme).
-    let glyphs = "⏵⤺≡⌥▌▎◉✓✕•◐○●─━┃│╭╮╰╯↻Σ−±↑↓✎⚙◎▸…✳⬢⏎⏸⌃⌂\u{e0a0}".to_string() + &SPIN.concat();
+    let glyphs = "⏵⤺≡⌥▌▎▄▀◉✓✕•◐○●─━┃│╭╮╰╯↻Σ−±↑↓✎⚙◎▸…✳⬢⏎⏸⌃⌂\u{e0a0}\u{e0b6}\u{e0b4}\u{f05a}\u{f058}\u{f071}\u{f057}".to_string() + &SPIN.concat();
     let bad: Vec<(char, usize, usize)> = glyphs
         .chars()
         .map(|c| (c, dwidth(&c.to_string()), c.to_string().width()))
@@ -1343,129 +1503,132 @@ fn glyph_widths_agree_with_ratatui() {
 
 /// A toast posted at the fixtures' clock (seq 7, 4 s), for every sidebar.
 fn toast(kind: Kind, text: &str) -> Toast {
-    Toast { seq: 7, at_ms: NOW * 1000, kind, ttl: 4.0, client: String::new(), text: text.into() }
+    Toast { seq: 7, at_ms: NOW * 1000, kind, ttl: 4.0, client: String::new(), text: text.into(), title: None }
+}
+
+/// Toast `seq`, posted `seq` ms after the fixtures' clock.
+fn toast_n(seq: u64, kind: Kind, text: &str) -> Toast {
+    Toast { seq, at_ms: NOW * 1000 + seq as i64, ..toast(kind, text) }
 }
 
 /// Its id: what a click on it dismisses.
 const TOAST_ID: ToastId = (7, NOW * 1000);
 
-/// A toast too long for any border.
+/// A toast too long for one line.
 const LONG: &str = "couldn't park Canvas Syllabus: it is still working on the export";
 
-/// The card's bottom border as painted, a toast in it.
-fn bottom_border(f: &Frame) -> String {
-    let mut buf = Buffer::empty(Rect::new(0, 0, f.width, f.height));
-    paint(f, &mut buf);
-    let y = f.card.end as u16 - 1;
-    (0..f.width).map(|x| buf[(x, y)].symbol().to_string()).collect()
-}
-
-/// A toast sits in the card's bottom border, as the key-table marks sit in
-/// its top one: no row moves, the glyph bold in the kind's colour, a click
-/// on its cells dismisses it, and it says when it expires.
+/// A toast is a card over the top of the frame (nvim-notify's): a rounded
+/// border in its kind's colour over a fill of it, the icon and title and
+/// the time it was posted in the top border, the text inside. Nothing
+/// beneath moves, a click anywhere on it dismisses it, and it says when it
+/// expires.
 #[test]
-fn toasts_sit_in_the_cards_bottom_border() {
+fn a_toast_is_a_card_over_the_top() {
     let v = lettered(quiet());
     let plain = layout(&v, 34, 40, &with_bar(demo_bar()));
-    let f = layout(&v, 34, 40, &with_bar(Bar { toast: Some(toast(Kind::Ok, "parked Canvas Syllabus")), ..demo_bar() }));
-    assert_eq!(bottom_border(&f), "╰─ ✓ parked Canvas Syllabus ─────╯");
-    assert_eq!(bottom_border(&plain), format!("╰{}╯", "─".repeat(32)));
-    assert_eq!((f.card.clone(), f.status.clone(), texts(&f)), (plain.card.clone(), plain.status.clone(), texts(&plain)));
-    assert_eq!(top_border(&f), format!("╭{}╮", "─".repeat(32)));
-    assert!(f.card_footer.contains(&bold("✓", "green")) && f.card_footer.contains(&seg("parked Canvas Syllabus", "text")));
+    let ok = toast(Kind::Ok, "parked Canvas Syllabus");
+    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![ok.clone()], ..demo_bar() }));
+    let t = texts(&f);
+    let time = posted_at(&ok);
+    assert_eq!(f.toast, 0..3, "{t:#?}");
+    assert_eq!(t[0], format!(" ╭─ \u{f058} Done {} {time} ─╮ ", "─".repeat(13)));
+    assert_eq!(t[1], format!(" │ parked Canvas Syllabus{} │ ", " ".repeat(6)));
+    assert_eq!(t[2], format!(" ╰{}╯ ", "─".repeat(30)));
+    // Nothing beneath moves; the rows under it still stand for theirs.
+    assert_eq!((&f.rows[3..], f.card.clone(), f.status.clone(), f.needs.clone()), (&plain.rows[3..], plain.card.clone(), plain.status.clone(), plain.needs.clone()));
+    assert!(f.rows[..3].iter().zip(&plain.rows[..3]).all(|(a, b)| a.covers == b.covers));
+    // The look: the fill (green over the canvas), the border and the title
+    // in green, the title bold, the time dim, the text plain; a canvas
+    // margin either side.
+    for y in 0..3 {
+        let r = &f.rows[y];
+        assert_eq!((r.bg, r.segs[0].clone(), r.segs.last().cloned()), (Some(Ink::Mix("green", 12)), bare(1), Some(bare(1))), "{y}");
+    }
+    assert!(f.rows[0].segs.contains(&bold("\u{f058} Done", "green")) && f.rows[0].segs.contains(&seg(time.clone(), "overlay2")));
+    assert!(f.rows[1].segs.contains(&seg("parked Canvas Syllabus", "text")) && f.rows[1].segs.contains(&seg("│ ", "green")));
     let mut buf = Buffer::empty(Rect::new(0, 0, 34, 40));
     paint(&f, &mut buf);
-    let y = f.card.end as u16 - 1;
-    assert_eq!((buf[(3, y)].fg, buf[(3, y)].modifier.contains(Modifier::BOLD)), (palette::color("green"), true));
-    assert_eq!((buf[(5, y)].fg, buf[(5, y)].bg), (palette::color("text"), Color::Reset));
-    // A click on its cells (not the rule after them) dismisses it.
-    assert_eq!(f.toast, y as usize..y as usize + 1);
-    assert_eq!((f.target(2, y), f.target(27, y), f.target(28, y), f.target(1, y)), (Some(&Target::Toast(TOAST_ID)), Some(&Target::Toast(TOAST_ID)), None, None));
+    assert_eq!((buf[(0, 1)].bg, buf[(1, 1)].bg, buf[(1, 1)].fg), (Color::Reset, palette::mix("green", 12), palette::color("green")));
+    // A click anywhere on it dismisses it.
+    for y in 0..3u16 {
+        assert_eq!((f.target(0, y), f.target(20, y), f.target(33, y)), (Some(&Target::Toast(TOAST_ID)), Some(&Target::Toast(TOAST_ID)), Some(&Target::Toast(TOAST_ID))));
+    }
     assert_eq!(f.toast_until, Some((NOW + 4) * 1000));
     assert_eq!(plain.toast_until, None);
-    // Each kind: its glyph and colour.
-    for (k, g, hue) in [(Kind::Info, "•", "blue"), (Kind::Ok, "✓", "green"), (Kind::Warn, "!", "peach"), (Kind::Error, "✕", "red")] {
-        let f = layout(&v, 34, 40, &with_bar(Bar { toast: Some(toast(k, "hi")), ..demo_bar() }));
-        assert_eq!(f.card_footer[1], bold(g, hue), "{k:?}");
-        assert!(bottom_border(&f).starts_with(&format!("╰─ {g} hi ─")), "{k:?}");
+    // Each kind: its icon, title and colour.
+    for (k, icon, title, hue) in [(Kind::Info, "\u{f05a}", "Info", "blue"), (Kind::Ok, "\u{f058}", "Done", "green"),
+        (Kind::Warn, "\u{f071}", "Warning", "peach"), (Kind::Error, "\u{f057}", "Error", "red")] {
+        let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![toast(k, "hi")], ..demo_bar() }));
+        assert!(texts(&f)[0].starts_with(&format!(" ╭─ {icon} {title} ─")), "{k:?}: {:?}", texts(&f)[0]);
+        assert!(f.rows[0].segs.contains(&bold(format!("{icon} {title}"), hue)) && f.rows[1].bg == Some(Ink::Mix(hue, 12)), "{k:?}");
     }
-    // With the prefix mark up top: both borders carry theirs.
-    let f = layout(&v, 34, 40, &with_bar(Bar { prefix: true, toast: Some(toast(Kind::Info, "hi")), ..demo_bar() }));
-    assert!(top_border(&f).starts_with("╭─ prefix ") && bottom_border(&f).starts_with("╰─ • hi "));
+    // notify.sh -T: the title instead of the kind's.
+    let titled = Toast { title: Some("Stash".into()), ..ok.clone() };
+    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![titled], ..demo_bar() }));
+    assert!(texts(&f)[0].starts_with(" ╭─ \u{f058} Stash ─"), "{:?}", texts(&f)[0]);
+    // Narrow: the time goes before the title is cut; the corners stay.
+    let f = layout(&v, 18, 40, &with_bar(Bar { toasts: vec![ok], ..demo_bar() }));
+    let top = texts(&f)[0].clone();
+    assert!(top.starts_with(" ╭─ \u{f058} Done ─") && top.ends_with("─╮ ") && !top.contains(':'), "{top:?}");
 }
 
-/// Narrow cards clip the toast with `…` and keep a rule cell and the
-/// corner; a text that loses only a little stays in the border alone.
+/// Up to three cards at once, stacked from the top like nvim-notify's:
+/// oldest on top, the newest below it; each its own to dismiss; the frame
+/// wakes at the earliest deadline. Short frames drop the oldest first, then
+/// body lines, and never cover the last row.
 #[test]
-fn a_toast_clips_to_keep_the_corner() {
+fn toasts_stack_oldest_on_top() {
     let v = lettered(quiet());
-    let text = "parked Canvas Syllabus";
-    let plain = layout(&v, 30, 40, &with_bar(demo_bar()));
-    let f = layout(&v, 30, 40, &with_bar(Bar { toast: Some(toast(Kind::Warn, text)), ..demo_bar() }));
-    let b = bottom_border(&f);
-    assert!(b.starts_with("╰─ ! parked Canvas Sy") && b.ends_with("… ──╯") && dwidth(&b) == 30, "{b:?}");
-    assert_eq!((f.card.clone(), texts(&f)), (plain.card.clone(), texts(&plain)), "a little clipped: nothing moves");
-    for w in [20u16, 22, 26] {
-        let f = layout(&v, w, 40, &with_bar(Bar { toast: Some(toast(Kind::Warn, text)), ..demo_bar() }));
-        let b = bottom_border(&f);
-        assert!(b.starts_with("╰─ ! ") && b.contains('…') && b.ends_with("──╯") && dwidth(&b) == usize::from(w), "{w}: {b:?}");
+    let stack = vec![toast_n(1, Kind::Ok, "one"), toast_n(2, Kind::Warn, "two"), toast_n(3, Kind::Error, "three"), toast_n(4, Kind::Info, "four")];
+    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: stack.clone(), ..demo_bar() }));
+    let t = texts(&f);
+    assert_eq!(f.toast, 0..9, "{t:#?}");
+    assert!(t[1].contains("two") && t[4].contains("three") && t[7].contains("four") && !t.iter().any(|l| l.contains(" one ")), "{t:#?}");
+    let id = |s: u64| Some(Target::Toast((s, NOW * 1000 + s as i64)));
+    assert_eq!((f.target(5, 1).cloned(), f.target(5, 3).cloned(), f.target(5, 8).cloned()), (id(2), id(3), id(4)));
+    // By posting time, whatever order `@toast` gave them in.
+    let mut rev = stack.clone();
+    rev.reverse();
+    assert_eq!(layout(&v, 34, 40, &with_bar(Bar { toasts: rev, ..demo_bar() })).rows, f.rows);
+    // The earliest deadline among those drawn; an expired one is not drawn.
+    let short = Toast { ttl: 2.0, ..toast_n(5, Kind::Ok, "short") };
+    let pair = vec![short.clone(), toast_n(6, Kind::Ok, "long")];
+    let at = |now: f64| layout(&v, 34, 40, &Opts { now: Some(now), ..with_bar(Bar { toasts: pair.clone(), ..demo_bar() }) });
+    assert_eq!((at(NOW as f64).toast.clone(), at(NOW as f64).toast_until), (0..6, Some(until_ms(&short))));
+    let later = at(NOW as f64 + 3.0);
+    assert_eq!((later.toast.clone(), later.toast_until), (0..3, Some(until_ms(&pair[1]))));
+    assert!(texts(&later)[1].contains("long"));
+    // Short frames: never the last row; the newest always there when any is.
+    for h in 2u16..=12 {
+        let f = layout(&v, 34, h, &with_bar(Bar { toasts: stack.clone(), ..demo_bar() }));
+        let t = texts(&f);
+        assert!(f.toast.len() < usize::from(h) && !f.toast.is_empty(), "{h}: {t:#?}");
+        assert!(t.iter().any(|l| l.contains("four")), "{h}: {t:#?}");
+        assert!(h >= 4 || f.toast.len() == 1, "{h}: a compact row {t:#?}");
     }
+    // Too narrow for a card: the newest as a compact row.
+    let f = layout(&v, 15, 40, &with_bar(Bar { toasts: stack, ..demo_bar() }));
+    assert!(f.toast == (0..1) && texts(&f)[0].contains("four"), "{:#?}", texts(&f));
 }
 
-/// A long toast also shows whole (wrapped, at most 2 rows, the rest cut)
-/// inside the card just above its bottom border; those rows dismiss it too.
+/// A long toast wraps inside its card, at most three lines, the rest cut
+/// with `…`; every line dismisses it.
 #[test]
-fn a_long_toast_wraps_inside_the_card() {
+fn a_long_toast_wraps_inside_its_card() {
     let v = lettered(quiet());
-    let plain = layout(&v, 34, 40, &with_bar(demo_bar()));
-    let f = layout(&v, 34, 40, &with_bar(Bar { toast: Some(toast(Kind::Error, LONG)), ..demo_bar() }));
+    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![toast(Kind::Error, LONG)], ..demo_bar() }));
     let t = texts(&f);
-    assert_eq!(f.card.len(), plain.card.len() + 2, "{t:#?}");
-    let r = f.card.end - 3;
-    assert_eq!(f.toast, r..f.card.end);
-    assert_eq!(t[r].trim_end(), "  ✕ couldn't park Canvas", "{t:#?}");
-    assert_eq!(t[r + 1].trim_end(), "    Syllabus: it is still worki…", "{t:#?}");
-    assert!(f.rows[r].segs.contains(&bold("✕", "red")));
-    for y in [r, r + 1] {
-        assert_eq!((f.target(1, y as u16), f.target(0, y as u16), f.target(33, y as u16)), (Some(&Target::Toast(TOAST_ID)), None, None));
-    }
-    let b = bottom_border(&f);
-    assert!(b.starts_with("╰─ ✕ couldn't park Canvas") && b.ends_with("… ──╯"), "{b:?}");
-    // The rows sit inside the card's border.
-    let mut buf = Buffer::empty(Rect::new(0, 0, 34, 40));
-    paint(&f, &mut buf);
-    assert_eq!((buf[(0, r as u16)].symbol(), buf[(33, r as u16)].symbol()), ("│", "│"));
-    // Two short lines: all of it, nothing cut.
-    let f = layout(&v, 34, 40, &with_bar(Bar { toast: Some(toast(Kind::Info, "a fairly long note that wraps once")), ..demo_bar() }));
+    assert_eq!(f.toast, 0..5, "{t:#?}");
+    assert!(t[1].starts_with(" │ couldn't park Canvas ") && t[2].starts_with(" │ Syllabus: it is still ") && t[3].starts_with(" │ working on the export "), "{t:#?}");
+    assert!((1..4).all(|y| t[y].ends_with(" │ ") && f.target(1, y as u16) == Some(&Target::Toast(TOAST_ID))), "{t:#?}");
+    let huge = format!("{LONG} {LONG}");
+    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![toast(Kind::Error, &huge)], ..demo_bar() }));
     let t = texts(&f);
-    let r = f.toast.start;
-    assert_eq!((t[r].trim_end(), t[r + 1].trim_end()), ("  • a fairly long note that", "    wraps once"), "{t:#?}");
+    assert_eq!(f.toast, 0..5, "{t:#?}");
+    assert!(t[3].trim_end_matches([' ', '│']).ends_with('…'), "{t:#?}");
     assert_eq!(wrap("aaaa bbbb cccccccccccc dd", 6, 3), ["aaaa", "bbbb", "ccccc…"]);
     assert_eq!(wrap("xxxxxxxxxx yy", 4, 3), ["xxx…", "yy"]);
     assert_eq!(wrap("one", 6, 2), ["one"]);
-}
-
-/// No card to carry it (no Bar, a short frame, nothing in the card): a
-/// tinted row of its own at the very top; none in a tiny frame.
-#[test]
-fn a_toast_without_a_card_takes_the_top_row() {
-    let v = lettered(quiet());
-    let classic = layout(&v, 34, 30, &with_bar(Bar { toast: Some(toast(Kind::Info, "hello there")), ..Bar::default() }));
-    let t = texts(&classic);
-    assert!(t[0].starts_with(" • hello there") && t[1].starts_with(" agents"), "{t:#?}");
-    assert_eq!((classic.rows[0].bg, classic.toast.clone(), classic.card.clone()), (Some(Ink::Mix("blue", 14)), 0..1, 0..0));
-    assert_eq!(classic.target(20, 0), Some(&Target::Toast(TOAST_ID)));
-    // A frame too short for the border: first, then the prefix mark, then usage.
-    let f = layout(&v, 34, 14, &with_bar(Bar { prefix: true, toast: Some(toast(Kind::Warn, "hello")), ..demo_bar() }));
-    let t = texts(&f);
-    assert!(f.card.is_empty() && t[0].starts_with(" ! hello") && t[1].starts_with("  prefix ") && t[2].starts_with(" S 13%"), "{t:#?}");
-    assert_eq!(f.rows[0].bg, Some(Ink::Mix("peach", 14)));
-    // A long one is clipped on its row.
-    let f = layout(&v, 34, 30, &with_bar(Bar { toast: Some(toast(Kind::Error, LONG)), ..Bar::default() }));
-    assert!(texts(&f)[0].ends_with("… "), "{:?}", texts(&f)[0]);
-    // Under 6 rows: no room for it.
-    let f = layout(&v, 34, 5, &with_bar(Bar { toast: Some(toast(Kind::Info, "hello")), ..Bar::default() }));
-    assert!(f.toast.is_empty() && f.toast_until.is_none() && !texts(&f).iter().any(|l| l.contains("hello")));
 }
 
 /// A toast lives until its deadline by the frame's clock, then the frame is
@@ -1473,22 +1636,79 @@ fn a_toast_without_a_card_takes_the_top_row() {
 #[test]
 fn a_toast_expires_by_the_frame_clock() {
     let v = lettered(quiet());
-    let bar = Bar { toast: Some(toast(Kind::Ok, "parked")), ..demo_bar() };
+    let bar = Bar { toasts: vec![toast(Kind::Ok, "stashed it")], ..demo_bar() };
     let at = |bar: &Bar, now: f64| layout(&v, 34, 40, &Opts { now: Some(now), ..with_bar(bar.clone()) });
     let t0 = NOW as f64;
-    assert!(bottom_border(&at(&bar, t0 + 3.99)).contains("parked"));
+    assert!(texts(&at(&bar, t0 + 3.99)).iter().any(|l| l.contains("stashed it")));
     for now in [t0 + 4.0, t0 + 60.0] {
         let f = at(&bar, now);
-        assert_eq!((f.card_footer.is_empty(), f.toast.is_empty(), f.toast_until), (true, true, None));
+        assert_eq!((f.toast.is_empty(), f.toast_until), (true, None));
         assert_eq!(f, at(&demo_bar(), now));
     }
-    // The same for one on its own row (it gives the row back).
-    let bare = Bar { toast: Some(toast(Kind::Ok, "parked")), ..Bar::default() };
+    // The same with no panel under it.
+    let bare = Bar { toasts: vec![toast(Kind::Ok, "stashed it")], ..Bar::default() };
     assert_eq!(at(&bare, t0 + 4.0), at(&Bar::default(), t0 + 4.0));
 }
 
-/// The terminal's own background everywhere but the surfaces: the
-/// client's agent, the NEEDS YOU card, the pills.
+/// The card's clock: local time, `HH:MM`, the event log's own
+/// ([`crate::text::clock_hm`]), at the second the toast was posted.
+#[test]
+fn the_toast_clock_is_local_hh_mm() {
+    let mins = |s: &str| -> u32 {
+        assert!(s.len() == 5 && s.as_bytes()[2] == b':', "{s:?}");
+        s[..2].parse::<u32>().unwrap() * 60 + s[3..].parse::<u32>().unwrap()
+    };
+    let at = posted_at(&toast(Kind::Ok, "x"));
+    assert_eq!(at, crate::text::clock_hm(NOW));
+    let later = posted_at(&Toast { at_ms: (NOW + 3660) * 1000 + 999, ..toast(Kind::Ok, "x") });
+    assert_eq!((mins(&later) + 1440 - mins(&at)) % 1440, 61);
+}
+
+/// The key-table marks and the selection hint are what a key press is
+/// waiting on: toast cards start under them, never over them.
+#[test]
+fn toasts_never_cover_the_marks_or_the_hint() {
+    let v = lettered(busy());
+    let up = vec![toast(Kind::Ok, "parked it")];
+    let bar = Bar { prefix: true, selecting: Some(2), toasts: up.clone(), ..demo_bar() };
+    for (w, h) in [(34u16, 40u16), (34, 14), (38, 50), (24, 30)] {
+        let f = layout(&v, w, h, &with_bar(bar.clone()));
+        let t = texts(&f);
+        let above = t[..f.toast.start].join("\n");
+        assert!(above.contains("prefix") && above.contains("2 selected"), "{w}x{h}: {t:#?}");
+        assert!(t[f.toast.clone()].iter().any(|l| l.contains("parked it")), "{w}x{h}: {t:#?}");
+    }
+    // ⌥W armed: the tab stays, the card under it.
+    let f = layout(&v, 34, 40, &with_bar(Bar { jump: true, toasts: up.clone(), ..demo_bar() }));
+    assert_eq!(f.toast, 1..4, "{:#?}", texts(&f));
+    assert!(texts(&f)[0].contains("⌥W jump"), "{:#?}", texts(&f));
+    // Nothing waiting: from the very top.
+    assert_eq!(layout(&v, 34, 40, &with_bar(Bar { toasts: up, ..demo_bar() })).toast, 0..3);
+}
+
+/// A sidebar too small for a card still shows the newest toast, as one
+/// compact row (icon and text on the card's fill, a click dismisses it),
+/// down to 2 rows: notify.sh chose a toast, so it must be seen.
+#[test]
+fn a_small_sidebar_still_shows_a_toast() {
+    let v = lettered(quiet());
+    let stack = vec![toast_n(1, Kind::Ok, "older"), toast_n(2, Kind::Warn, "newest")];
+    for (w, h) in [(15u16, 40u16), (12, 10), (6, 8), (34, 3), (34, 2), (20, 2)] {
+        let f = layout(&v, w, h, &with_bar(Bar { toasts: stack.clone(), ..demo_bar() }));
+        let t = texts(&f);
+        assert_eq!(f.toast.len(), 1, "{w}x{h}: {t:#?}");
+        let y = f.toast.start;
+        assert!(t[y].contains('\u{f071}') && !t.iter().any(|l| l.contains("older")) && y + 1 < usize::from(h), "{w}x{h}: {t:#?}");
+        assert!(w < 10 || t[y].contains("newest"), "{w}x{h}: {t:#?}");
+        assert_eq!((f.rows[y].bg, f.target(0, y as u16)), (Some(Ink::Mix("peach", TOAST_TINT)), Some(&Target::Toast((2, NOW * 1000 + 2)))));
+        assert_eq!(f.toast_until, Some(until_ms(&stack[1])));
+    }
+    // One row: nothing (the last row is the parked one).
+    assert!(layout(&v, 34, 1, &with_bar(Bar { toasts: stack, ..demo_bar() })).toast.is_empty());
+}
+
+/// The terminal's own background everywhere but the surfaces: the tiles
+/// (inside their canvas margins), the NEEDS YOU card, the pills.
 #[test]
 fn renders_through_ratatui_on_the_terminal_background() {
     use ratatui::backend::TestBackend;
@@ -1503,15 +1723,21 @@ fn renders_through_ratatui_on_the_terminal_background() {
     for y in 0..58u16 {
         for x in 0..34u16 {
             let bg = buf[(x, y)].bg;
-            if y == here || y == here + 1 {
-                assert_eq!(bg, palette::color("surface0"), "({x},{y})");
-            } else if y == card || y == card + 1 {
+            let inside = (1..33).contains(&x);
+            if (y == here || y == here + 1) && inside {
+                assert_eq!(bg, palette::color("tile_hi"), "({x},{y})");
+            } else if (y == card || y == card + 1) && inside {
                 assert_eq!(bg, palette::mix("yellow", 14), "({x},{y})");
-            } else if !pills.contains(&y) {
+            } else if f.rows[y as usize].bg.is_some() && inside {
+                assert_eq!(bg, palette::color("tile"), "({x},{y}) {:?}", f.rows[y as usize].text());
+            } else if !pills.contains(&y) && y != 57 && !(y == 2 && x > 28) {
                 assert_eq!(bg, Color::Reset, "({x},{y}) {:?}", f.rows[y as usize].text());
             }
         }
     }
+    // A pad: the tile's colour as the half block's ink, on the canvas.
+    let pad = here + 2;
+    assert_eq!((buf[(5, pad)].symbol(), buf[(5, pad)].fg, buf[(5, pad)].bg), ("▀", palette::color("tile_hi"), Color::Reset));
     let ansi = to_ansi(buf);
     assert_eq!(ansi.lines().count(), 58);
     // No background code at all on an untinted row.

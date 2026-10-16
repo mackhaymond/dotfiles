@@ -34,10 +34,11 @@
 //! scripts/notify.sh posts a message as a toast instead of tmux's
 //! `display-message` (which, with the status line off, would draw on the
 //! client's bottom line and bring the line back) whenever a sidebar is open
-//! for its client: it writes `@toast_seq` and `@toast` ([`Toast`]) in one
-//! tmux call and posts the focus notice. The sidebar reads `@toast` in the
-//! same per-tick snapshot as everything here; [`Bar::toast`] keeps it only
-//! for this sidebar's client (or every sidebar's).
+//! for its client: it writes `@toast_seq` and `@toast` (up to 4 RS-separated
+//! records, oldest first, [`Toast`]) in one tmux call and posts the focus
+//! notice. The sidebar reads `@toast` in the same per-tick snapshot as
+//! everything here; [`Bar::toasts`] keeps the records for this sidebar's
+//! client (or every sidebar's).
 
 use super::layout::Ink;
 use super::term;
@@ -108,6 +109,7 @@ pub fn ink_on(bg: Ink) -> Ink {
         Ink::Idx(n) => xterm(n),
         Ink::Pal(p) => crate::palette::rgb(p),
         Ink::Mix(p, pct) => crate::palette::mix_rgb(p, pct),
+        Ink::Canvas => crate::palette::rgb(crate::palette::CANVAS),
     };
     let lum = (0.2126 * f64::from(r) + 0.7152 * f64::from(g) + 0.0722 * f64::from(b)) / 255.0;
     Ink::Pal(if lum > 0.45 { "crust" } else { "text" })
@@ -164,7 +166,7 @@ pub struct Usage {
     /// When the window resets (epoch seconds).
     pub resets: Option<i64>,
     /// The accounts pooled into this window (`@codex_<w>_members`,
-    /// `slot:used:active,…`; empty for a single account).
+    /// `slot:used:active[:cap],…`; empty for a single account).
     pub members: Vec<Member>,
     /// The pace is a pool's (`Σ` in the text, or 2+ members).
     pub pooled: bool,
@@ -173,17 +175,24 @@ pub struct Usage {
 }
 
 /// One account of a pooled window: its claude-swap slot, its own used
-/// percent, and whether it is the logged-in one.
+/// percent, whether it is the logged-in one, and its cap (100 − its
+/// reserve: the percent it may be used to).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Member {
     /// None: the script knows the account but not its slot (`:27:1`).
     pub slot: Option<u32>,
     pub used: u32,
     pub active: bool,
+    /// 100 when the entry has no 4th field (or a junk one).
+    pub cap: u32,
 }
 
-/// `1:90:0,2:30:1` → the members (an empty slot allowed; junk entries
-/// dropped).
+/// A member's cap when the entry gives none.
+pub const FULL_CAP: u32 = 100;
+
+/// `1:90:0,2:30:1` or `1:90:0:90,2:32:1:100` → the members (an empty slot
+/// allowed; the optional 4th field is the cap, [`FULL_CAP`] when absent or
+/// junk; junk entries dropped).
 pub fn parse_members(raw: &str) -> Vec<Member> {
     raw.split(',')
         .filter_map(|m| {
@@ -193,8 +202,9 @@ pub fn parse_members(raw: &str) -> Vec<Member> {
                 s => Some(s.parse().ok()?),
             };
             let used = p.next()?.trim().parse().ok()?;
-            let active = p.next()? == "1";
-            Some(Member { slot, used, active })
+            let active = p.next()?.trim() == "1";
+            let cap = p.next().and_then(|c| c.trim().parse().ok()).unwrap_or(FULL_CAP);
+            Some(Member { slot, used, active, cap })
         })
         .collect()
 }
@@ -256,9 +266,10 @@ pub struct Bar {
     /// v, left by ⏎ / H / m / a / esc / q / C-c / space) or while any window
     /// still carries `@stash_sel` (sel_clear's "never leak a tint" rule).
     pub selecting: Option<usize>,
-    /// notify.sh's latest toast, when it is for this sidebar's client (or
-    /// for every sidebar). Expiry is the layout's business (its clock).
-    pub toast: Option<Toast>,
+    /// notify.sh's recent toasts (oldest first), those for this sidebar's
+    /// client or for every sidebar. Expiry is the layout's business (its
+    /// clock): it draws only the live ones.
+    pub toasts: Vec<Toast>,
 }
 
 // ---------------------------------------------------------------- toasts
@@ -291,9 +302,13 @@ pub type ToastId = (u64, i64);
 pub const TOAST: &str = "@toast";
 pub const TOAST_SEQ: &str = "@toast_seq";
 
+/// What separates the records in `@toast` (ASCII RS).
+pub const TOAST_RS: char = '\u{1e}';
+
 /// One toast from notify.sh, as `@toast` holds it (a GLOBAL option, read in
-/// the per-tick snapshot): `seq TAB epoch_ms TAB kind TAB ttl_s TAB client
-/// TAB text`. Only the latest toast exists: a newer one replaces it at once.
+/// the per-tick snapshot): up to 4 records separated by RS (U+001E), oldest
+/// first, each `seq TAB epoch_ms TAB kind TAB ttl_s TAB client TAB text
+/// [TAB title]` (6-field records, from before titles, still parse).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Toast {
     /// `@toast_seq` when it was posted.
@@ -307,17 +322,29 @@ pub struct Toast {
     pub client: String,
     /// One line, controls made spaces, never empty.
     pub text: String,
+    /// `notify.sh -T`: the card's title instead of the kind's own; None
+    /// when not given (or blank).
+    pub title: Option<String>,
+}
+
+/// One line: controls made spaces, runs of spaces one.
+fn one_line(s: &str) -> String {
+    sanitize(s).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl Toast {
-    /// `@toast` → the toast; None when unset, malformed or empty.
+    /// One `@toast` record → the toast; None when malformed or empty.
     pub fn parse(raw: &str) -> Option<Toast> {
-        let f: Vec<&str> = raw.trim_end_matches('\n').splitn(6, '\t').collect();
-        let [seq, at, kind, ttl, client, text] = f[..] else { return None };
-        let text = sanitize(text).split_whitespace().collect::<Vec<_>>().join(" ");
+        // The 7th field is the title (notify.sh never writes a tab into
+        // the text, so a 6-field record is one from before titles).
+        let f: Vec<&str> = raw.trim_matches(|c| c == '\n' || c == TOAST_RS).splitn(7, '\t').collect();
+        let [seq, at, kind, ttl, client, text] = f.get(..6).unwrap_or(&[])[..] else { return None };
+        let title = f.get(6);
+        let text = one_line(text);
         if text.is_empty() {
             return None;
         }
+        let title = title.map(|t| one_line(t)).filter(|t| !t.is_empty());
         let ttl = ttl.trim().parse::<f64>().ok().filter(|t| t.is_finite() && *t > 0.0).unwrap_or(4.0).min(3600.0);
         Some(Toast {
             seq: seq.trim().parse().ok()?,
@@ -326,7 +353,13 @@ impl Toast {
             ttl,
             client: client.trim().to_string(),
             text,
+            title,
         })
+    }
+
+    /// All of `@toast`: every well-formed record, oldest first.
+    pub fn parse_all(raw: &str) -> Vec<Toast> {
+        raw.split(TOAST_RS).filter_map(Toast::parse).collect()
     }
 
     /// Which toast this is, for a dismissal: notify.sh reads `@toast_seq`
@@ -390,7 +423,7 @@ impl Bar {
                 "refused" => Some("save refused".into()),
                 v => Some(format!("last save {} ago", sanitize(v))),
             };
-            bar.toast = Toast::parse(&st.toast).filter(|t| t.for_client(client));
+            bar.toasts = Toast::parse_all(&st.toast).into_iter().filter(|t| t.for_client(client)).collect();
         }
         let mut flagged: Vec<&str> = snap.windows.iter().filter(|w| w.stash_sel).map(|w| w.id.as_str()).collect();
         flagged.sort_unstable();
@@ -1018,10 +1051,15 @@ mod tests {
             members: "1:90:0,2:30:1".into() };
         let u = Usage::read("W".into(), "60% (+17%)".into(), None, &m);
         assert_eq!((u.used, u.expected, u.delta, u.resets, u.pooled), (Some(60.0), Some(43.0), Some(17), Some(1_792_569_600), true));
-        assert_eq!(u.members, [Member { slot: Some(1), used: 90, active: false }, Member { slot: Some(2), used: 30, active: true }]);
+        assert_eq!(u.members, [Member { slot: Some(1), used: 90, active: false, cap: 100 },
+            Member { slot: Some(2), used: 30, active: true, cap: 100 }]);
         // An account the script has no slot for (`:27:1`) still counts: the pool stays a pool.
-        assert_eq!(parse_members("1:90:0,:27:1"), [Member { slot: Some(1), used: 90, active: false },
-            Member { slot: None, used: 27, active: true }]);
+        assert_eq!(parse_members("1:90:0,:27:1"), [Member { slot: Some(1), used: 90, active: false, cap: 100 },
+            Member { slot: None, used: 27, active: true, cap: 100 }]);
+        // The optional 4th field: the cap (100 − the reserve); junk or blank is 100.
+        assert_eq!(parse_members("1:90:0:90,2:32:1:100"), [Member { slot: Some(1), used: 90, active: false, cap: 90 },
+            Member { slot: Some(2), used: 32, active: true, cap: 100 }]);
+        assert_eq!(parse_members("1:90:0:x,2:32:1:").iter().map(|m| m.cap).collect::<Vec<_>>(), [100, 100]);
         let pool = crate::tmux::Meter { used: "58".into(), members: "1:90:0,:27:1".into(), ..Default::default() };
         assert!(Usage::read("W".into(), "58%".into(), None, &pool).pooled);
         let one = crate::tmux::Meter { used: "27".into(), members: ":27:1".into(), ..Default::default() };
@@ -1141,9 +1179,14 @@ mod tests {
     /// `@toast` as notify.sh writes it; junk is no toast.
     #[test]
     fn toasts_parse() {
-        let t = Toast::parse("12\t1792000000250\tok\t4\t/dev/ttys001\tparked  Canvas\tSyllabus\n").unwrap();
+        // A 6-field record (from before titles): no title.
+        let t = Toast::parse("12\t1792000000250\tok\t4\t/dev/ttys001\tparked  Canvas \u{7}Syllabus\n").unwrap();
         assert_eq!(t, Toast { seq: 12, at_ms: 1_792_000_000_250, kind: Kind::Ok, ttl: 4.0, client: "/dev/ttys001".into(),
-            text: "parked Canvas Syllabus".into() });
+            text: "parked Canvas Syllabus".into(), title: None });
+        // The 7th field: the title (blank is none).
+        let titled = Toast::parse("12\t1792000000250\tok\t4\t\tparked\tStash  \tx").unwrap();
+        assert_eq!((titled.text.as_str(), titled.title.as_deref()), ("parked", Some("Stash x")));
+        assert_eq!(Toast::parse("12\t1\tok\t4\t\tparked\t  ").unwrap().title, None);
         assert_eq!(t.id(), (12, 1_792_000_000_250));
         assert_eq!((t.until(), t.live(1_792_000_004.0), t.live(1_792_000_004.25)), (1_792_000_004.25, true, false));
         assert!(t.for_client(Some("/dev/ttys001")) && !t.for_client(Some("/dev/ttys002")) && !t.for_client(None));
@@ -1158,6 +1201,11 @@ mod tests {
         for junk in ["", "1\t0\tok\t4\t", "1\t0\tok\t4\t\t  ", "x\t0\tok\t4\t\thi", "1\tnow\tok\t4\t\thi", "1\t0\tok\t4"] {
             assert_eq!(Toast::parse(junk), None, "{junk:?}");
         }
+        // The stack: RS-separated records, oldest first, junk ones skipped.
+        let all = Toast::parse_all("1\t10\tok\t4\t\tone\u{1e}junk\u{1e}2\t20\twarn\t4\t\ttwo\tTitled\u{1e}");
+        assert_eq!(all.iter().map(|t| (t.seq, t.text.as_str(), t.title.as_deref())).collect::<Vec<_>>(),
+            [(1, "one", None), (2, "two", Some("Titled"))]);
+        assert!(Toast::parse_all("").is_empty());
     }
 
     /// The snapshot's toast reaches the bar only for this sidebar's client,
@@ -1169,15 +1217,20 @@ mod tests {
             st[29] = raw;
             Snapshot::parse(&[row("main", 1, "@2", &[]), client("main", "@2", &st)].join("\n"))
         };
+        let seqs = |b: Bar| b.toasts.iter().map(|t| t.seq).collect::<Vec<_>>();
         let mine = with("5\t1000\tok\t4\t/dev/ttys999\thi");
-        assert_eq!(Bar::build(&mine, Some("/dev/ttys999")).toast.map(|t| t.seq), Some(5));
-        assert_eq!(Bar::build(&mine, Some("/dev/ttys001")).toast, None);
-        assert_eq!(Bar::build(&mine, None).toast, None);
+        assert_eq!(seqs(Bar::build(&mine, Some("/dev/ttys999"))), [5]);
+        assert!(Bar::build(&mine, Some("/dev/ttys001")).toasts.is_empty());
+        assert!(Bar::build(&mine, None).toasts.is_empty());
         let every = with("6\t1000\terror\t8\t\thi");
         for c in [Some("/dev/ttys999"), Some("/dev/ttys001"), None] {
-            assert_eq!(Bar::build(&every, c).toast.map(|t| (t.seq, t.kind)), Some((6, Kind::Error)), "{c:?}");
+            assert_eq!(Bar::build(&every, c).toasts.iter().map(|t| (t.seq, t.kind)).collect::<Vec<_>>(), [(6, Kind::Error)], "{c:?}");
         }
-        assert_eq!(Bar::build(&with(""), Some("/dev/ttys999")).toast, None);
+        assert!(Bar::build(&with(""), Some("/dev/ttys999")).toasts.is_empty());
+        // A stack: each record kept or not by its own client.
+        let stack = with("5\t1000\tok\t4\t/dev/ttys999\ta\u{1e}6\t1001\tok\t4\t/dev/ttys001\tb\u{1e}7\t1002\twarn\t4\t\tc\tT");
+        assert_eq!(seqs(Bar::build(&stack, Some("/dev/ttys999"))), [5, 7]);
+        assert_eq!(seqs(Bar::build(&stack, Some("/dev/ttys001"))), [6, 7]);
     }
 
     #[test]

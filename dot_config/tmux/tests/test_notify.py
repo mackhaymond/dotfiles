@@ -100,11 +100,18 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
         if not self.calls.exists():
             return []
-        return [l.split("\x1f")[:-1] for l in self.calls.read_text().splitlines()]
+        # (Lines on "\n" only: str.splitlines would also cut at @toast's RS.)
+        return [l.split("\x1f")[:-1] for l in self.calls.read_text().split("\n") if l]
+
+    def records(self):
+        """@toast's records, oldest first, each split into its fields."""
+        raw = self.opt("@toast")
+        return [r.split("\t") for r in raw.split("\x1e")] if raw else []
 
     def toast(self):
-        raw = self.opt("@toast")
-        return raw.split("\t") if raw else None
+        """The newest record's fields."""
+        recs = self.records()
+        return recs[-1] if recs else None
 
     def log_lines(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
@@ -179,8 +186,8 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(len(calls), 2, calls)     # one read, one write
         self.assertEqual(calls[1][:4], ["set-option", "-gq", "@toast_seq", "1"])
         self.assertEqual(calls[1][4:7], [";", "set-option", "-gq"])
-        seq, ms, kind, ttl, client, text = self.toast()
-        self.assertEqual((seq, kind, ttl, client, text), ("1", "ok", "4", "", "parked Canvas Syllabus"))
+        seq, ms, kind, ttl, client, text, title = self.toast()
+        self.assertEqual((seq, kind, ttl, client, text, title), ("1", "ok", "4", "", "parked Canvas Syllabus", ""))
         self.assertTrue(before <= int(ms) <= after, (before, ms, after))
         self.assertEqual(self.opt("@toast_seq"), "1")
         self.assertEqual(self.notices_posted(), [f"-p {self.notice}"])
@@ -199,7 +206,7 @@ class NotifyTests(unittest.TestCase):
         tty = self.attach("work")
         self.open_sidebar(f"- {tty}")
         self.notify("-c", tty, "-k", "warn", "#{session_name} saved")
-        seq, _, kind, ttl, client, text = self.toast()
+        seq, _, kind, ttl, client, text, _ = self.toast()
         # The text expanded in that client's context, as display-message would.
         self.assertEqual((kind, ttl, client, text), ("warn", "4", tty, "work saved"))
         self.assertFalse(self.said(tty, "saved"))
@@ -224,7 +231,7 @@ class NotifyTests(unittest.TestCase):
         other = self.attach("zeta")
         self.open_sidebar(f"{tty}")
         calls = self.notify("-c", "*", "-k", "warn", "-t", "10", "server notice")
-        seq, _, kind, ttl, client, text = self.toast()
+        seq, _, kind, ttl, client, text, _ = self.toast()
         self.assertEqual((kind, ttl, client, text), ("warn", "10", "", "server notice"))
         self.assertEqual([c for c in calls if c[0] == "display-message" and "-p" not in c],
                          [["display-message", "-c", other, "-d", "10000", "--", "server notice"]])
@@ -261,7 +268,7 @@ class NotifyTests(unittest.TestCase):
         tty = self.attach("work")
         self.open_sidebar(f"- {tty}", pids=[dead, os.getpid()])
         self.notify("-c", tty, "alive")
-        self.assertEqual(self.toast()[4:], [tty, "alive"])
+        self.assertEqual(self.toast()[4:6], [tty, "alive"])
 
     def test_a_trailing_semicolon_shows_as_display_message_would(self):
         """tmux reads an argument ending in `;` as a separator and one ending
@@ -285,6 +292,101 @@ class NotifyTests(unittest.TestCase):
         calls = self.notify("-c", "/dev/nonexistent", "lost")
         self.assertIsNone(self.toast())
         self.assertEqual(calls[-1], ["display-message", "-c", "/dev/nonexistent", "--", "lost"])
+
+    # -- the stack --------------------------------------------------------
+
+    def test_toasts_stack_up_to_four_oldest_first(self):
+        """Each post keeps the newest 3 live records and appends its own:
+        @toast never holds more than 4, oldest first, RS-separated; still
+        one read and one write."""
+        self.open_sidebar()
+        for i in range(1, 7):
+            calls = self.notify("-t", "60", f"msg {i}")
+            self.assertEqual(len(calls), 2, calls)
+            self.assertEqual(calls[1][:4], ["set-option", "-gq", "@toast_seq", str(i)])
+            self.assertLessEqual(len(self.records()), 4)
+        recs = self.records()
+        self.assertEqual([(r[0], r[5]) for r in recs], [("3", "msg 3"), ("4", "msg 4"), ("5", "msg 5"), ("6", "msg 6")])
+        self.assertTrue(all(len(r) == 7 for r in recs), recs)
+
+    def test_expired_records_are_dropped(self):
+        """A post drops the records past their deadline (epoch_ms + ttl * 1000
+        <= now) and malformed ones; a stray US in one never splits the read."""
+        self.open_sidebar()
+        now = int(time.time() * 1000)
+        self.tmux("set-option", "-g", "@toast", "\x1e".join([
+            f"1\t{now - 10_000}\tok\t4\t\tlong gone",
+            f"2\t{now - 3_000}\tinfo\t60\t\tstill\x1fhere\tKept",
+            "junk",
+            f"3\t{now - 1_500}\twarn\t1.5\t\tjust expired",
+        ]))
+        self.notify("new one")
+        recs = self.records()
+        self.assertEqual([r[5] for r in recs], ["still here", "new one"], recs)
+        self.assertEqual(recs[0][6], "Kept")
+
+    def test_ttls_are_capped_and_future_records_dropped(self):
+        """ttl is capped at 3600 like the sidebar caps it (the new record's
+        and when judging the carried ones); a record stamped more than 60 s
+        in the future (a clock jump) is dropped."""
+        self.open_sidebar()
+        now = int(time.time() * 1000)
+        self.tmux("set-option", "-g", "@toast", "\x1e".join([
+            f"1\t{now - 2 * 3600 * 1000}\tok\t99999\t\tcapped away",
+            f"2\t{now + 120_000}\tok\t60\t\tfrom the future",
+            f"3\t{now + 30_000}\tok\t60\t\tslightly ahead",
+        ]))
+        self.notify("-t", "99999", "long one")
+        recs = self.records()
+        self.assertEqual([r[5] for r in recs], ["slightly ahead", "long one"], recs)
+        self.assertEqual(recs[-1][3], "3600")
+        # tmux's own message (no sidebar) still takes -t as given.
+        self.tmux("set-option", "-gu", "@sidebar_pids")
+        self.assertEqual(self.notify("-t", "99999", "x")[-1], ["display-message", "-d", "99999000", "--", "x"])
+
+    def test_an_expanded_separator_never_splits_a_record(self):
+        """A format in the text can expand to a US / RS / tab: made a space."""
+        self.open_sidebar()
+        self.tmux("set-option", "-g", "@weird", "a\x1fb\x1ec\td")
+        self.notify("#{@weird} done")
+        self.assertEqual(self.toast()[5:], ["a b c d done", ""])
+
+    def test_six_field_records_are_carried_along(self):
+        """Records from before titles (6 fields) stay as they are."""
+        self.open_sidebar()
+        now = int(time.time() * 1000)
+        self.tmux("set-option", "-g", "@toast", f"5\t{now}\tok\t60\t\tolder format")
+        self.notify("-T", "Stash", "newer")
+        recs = self.records()
+        self.assertEqual(recs[0], ["5", str(now), "ok", "60", "", "older format"])
+        self.assertEqual(recs[1][5:], ["newer", "Stash"])
+
+    def test_a_title_rides_in_the_seventh_field(self):
+        self.open_sidebar()
+        self.notify("-k", "warn", "-T", "Usage\tpace", "slow down")
+        self.assertEqual(self.toast()[2:], ["warn", "4", "", "slow down", "Usage pace"])
+        self.notify("no title")
+        self.assertEqual(self.toast()[5:], ["no title", ""])
+        self.notify("-T", "  ", "blank title")
+        self.assertEqual(self.toast()[6], "")
+        # Taken literally (no formats), its own trailing `;` kept.
+        self.notify("-T", "#{session_name};", "x")
+        self.assertEqual(self.toast()[6], "#{session_name};")
+        # The separators in a text or title never split a record.
+        self.notify("-T", "a\x1eb", "c\x1fd\x1ee")
+        self.assertEqual(self.toast()[5:], ["c d e", "a b"])
+        self.assertTrue(all(len(r) == 7 for r in self.records()), self.records())
+        # No sidebar: tmux's own message, the text alone, as before.
+        self.tmux("set-option", "-gu", "@sidebar_pids")
+        calls = self.notify("-T", "Ignored", "plain")
+        self.assertEqual(calls[-1], ["display-message", "--", "plain"])
+
+    def test_the_log_carries_a_title(self):
+        self.open_sidebar()
+        self.notify("-T", "Stash", "parked")
+        self.notify("untitled")
+        self.assertEqual([l.split("\t")[1:] for l in self.log_lines()],
+                         [["info", "", "parked", "Stash"], ["info", "", "untitled"]])
 
     # -- the CLI ----------------------------------------------------------
 

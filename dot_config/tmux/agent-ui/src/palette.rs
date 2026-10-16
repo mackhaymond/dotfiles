@@ -27,10 +27,17 @@ pub const HEX: [(&str, &str); 16] = [
 /// `overlay2` is the dim text for a SURFACE (a pill, a card tint, a lifted
 /// row): `overlay` there is under 3:1, overlay2 about 4-4.5:1, and still
 /// below `sub`, so the hierarchy holds.
-pub const UI: [(&str, &str); 7] = [
+///
+/// The sidebar's raised surfaces (its "tiles": agent rows, the usage panel,
+/// shell buttons): `tile` sits between the canvas (`base`) and `surface0`;
+/// `tile_alt` is its zebra partner (adjacent tiles with no gap between them
+/// alternate the two); `tile_hi` (a blue-tinted lift, about `blue` at 18%
+/// over the canvas) marks the client's own agent and the active shell.
+pub const UI: [(&str, &str); 10] = [
     ("base", "#1e1e2e"), ("mantle", "#181825"), ("surface2", "#585b70"),
     ("mauve", "#cba6f7"), ("lavender", "#b4befe"), ("sel", "#2a2b3d"),
-    ("overlay2", "#9399b2"),
+    ("overlay2", "#9399b2"), ("tile", "#282839"), ("tile_alt", "#33344a"),
+    ("tile_hi", "#31394f"),
 ];
 
 /// The `#rrggbb` for a palette name ([`HEX`] first, then [`UI`]). Panics on
@@ -121,7 +128,8 @@ mod tests {
     /// stays below `sub` (the hierarchy); `overlay` there did not.
     #[test]
     fn dim_text_on_surfaces_reads() {
-        let bgs = [rgb("surface0"), mix_rgb("yellow", 14), mix_rgb("red", 14), mix_rgb("green", 14), mix_rgb("mauve", 18)];
+        let bgs = [rgb("surface0"), mix_rgb("yellow", 14), mix_rgb("red", 14), mix_rgb("green", 14), mix_rgb("mauve", 18),
+            rgb("tile"), rgb("tile_alt"), rgb("tile_hi")];
         for bg in bgs {
             let c = contrast(rgb("overlay2"), bg);
             assert!(c >= 3.9, "{bg:?}: {c:.2}");

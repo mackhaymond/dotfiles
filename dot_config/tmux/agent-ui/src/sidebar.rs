@@ -56,18 +56,19 @@
 //!   before the alternate screen; SIGHUP / SIGTERM (CMD+B's kill-pane) or a
 //!   closed tty end it quietly, with the terminal restored.
 //! - **The whole UI.** While any sidebar is open the tmux status line is
-//!   hidden and its content drawn here ([`status`]: the card with the space
-//!   chip, shells, usage meters, the stale save, the prefix / ⌥W /
-//!   selection marks); the
+//!   hidden and its content drawn here ([`status`]: the usage panel with
+//!   the meters, the stale save, the prefix / ⌥W / selection marks; the
+//!   SHELLS section; the spaces buttons); the
 //!   registry behind `@sidebar_open` restores it when the last one leaves.
 //!   Agent rows carry their lifetime letters (`@agent_key`, shared with the
 //!   menu and persisted like it).
 //! - **Toasts.** scripts/notify.sh, the replacement for `tmux
 //!   display-message` while a sidebar is open, writes `@toast` and posts the
 //!   focus notice; the refresh that follows reads it in the one snapshot and
-//!   draws it in the card's bottom border ([`layout`]'s Toasts). It stays
-//!   until its deadline, when the loop wakes once to draw the frame without
-//!   it (no polling); a click on it dismisses it here only. The registry
+//!   draws the live ones as cards stacked over the top of the frame
+//!   ([`layout`]'s Toasts). Each stays until its deadline; the loop wakes
+//!   at the earliest one to draw the frame without it (no polling); a click
+//!   on a card dismisses that toast here only. The registry
 //!   also keeps `@sidebar_clients` (which clients have a sidebar), so the
 //!   script knows when to fall back to `display-message`.
 //! - **`--once WxH`** prints one frame in ANSI colour and exits: no
@@ -380,10 +381,14 @@ struct App {
     key_reads: u32,
     /// The spinner's clock: its frame is the [`SPIN_EVERY`]s since this.
     started: Instant,
-    /// The toast a click dismissed here ([`status::Toast::id`]): never
-    /// drawn again.
-    dismissed: Option<status::ToastId>,
+    /// The toasts a click dismissed here ([`status::Toast::id`]): never
+    /// drawn again. Only ids `@toast` still holds are kept (at most
+    /// [`DISMISSED_MAX`]).
+    dismissed: Vec<status::ToastId>,
 }
+
+/// How many dismissed toast ids a sidebar remembers at most.
+const DISMISSED_MAX: usize = 8;
 
 impl App {
     fn new(tmux: Tmux, link: WeztermLink, notices: Notices) -> App {
@@ -419,20 +424,40 @@ impl App {
             keypoll: KeyPoll::default(),
             key_reads: 0,
             started: Instant::now(),
-            dismissed: None,
+            dismissed: Vec::new(),
         }
     }
 
-    /// The bar to draw: the snapshot's, less a toast dismissed here.
+    /// The bar to draw: the snapshot's, less the toasts dismissed here.
     fn shown_bar(&self) -> Bar {
         let mut bar = self.bar.clone();
-        if bar.toast.as_ref().is_some_and(|t| Some(t.id()) == self.dismissed) {
-            bar.toast = None;
-        }
+        bar.toasts.retain(|t| !self.dismissed.contains(&t.id()));
         bar
     }
 
-    /// When the toast on screen expires (a redraw then, without it).
+    /// A toast dismissed here: never drawn again in this sidebar.
+    fn dismiss(&mut self, id: status::ToastId) {
+        if !self.dismissed.contains(&id) {
+            self.dismissed.push(id);
+        }
+        // Bounded however the snapshot goes (notify.sh keeps 4 records).
+        let excess = self.dismissed.len().saturating_sub(DISMISSED_MAX);
+        self.dismissed.drain(..excess);
+    }
+
+    /// Drop the dismissals of toasts `@toast` no longer holds: only against
+    /// what the snapshot actually read (its first client row carries the
+    /// global option; a failed or timed-out snapshot has none, so it forgets
+    /// nothing), every record unfiltered (a client briefly unresolved must
+    /// not bring a dismissed toast back).
+    fn forget_gone_toasts(&mut self) {
+        let Some(st) = self.core.snapshot.clients.first().map(|c| &c.status) else { return };
+        let held = status::Toast::parse_all(&st.toast);
+        self.dismissed.retain(|id| held.iter().any(|t| t.id() == *id));
+    }
+
+    /// When the first toast on screen expires (a redraw then, without it;
+    /// the next one's deadline is that frame's).
     fn toast_due(&self, now: Instant) -> Option<Instant> {
         let left = self.shown.toast_until? as f64 / 1000.0 - text::now();
         Some(now + Duration::from_secs_f64(left.max(0.0)) + Duration::from_millis(5))
@@ -465,6 +490,7 @@ impl App {
         self.core.snapshot = self.core.tmux.snapshot();
         self.link.on_snapshot(&self.core.snapshot, text::now());
         self.bar = Bar::build(&self.core.snapshot, self.link.client.as_deref());
+        self.forget_gone_toasts();
         let table = self.client_key_table();
         self.keypoll.seen(&table, Instant::now());
         hide_homes(&mut self.core.snapshot);
@@ -659,7 +685,7 @@ impl App {
         }
         if let Target::Toast(id) = t {
             // Here only: the other sidebars keep showing it.
-            self.dismissed = Some(id);
+            self.dismiss(id);
             return;
         }
         let Some(client) = self.link.client.clone() else {
@@ -1210,39 +1236,89 @@ mod tests {
         assert!(build_view(&mut a.core, Some(cl), None).1.is_empty());
     }
 
-    /// A left click on a toast dismisses it in this sidebar only (no tmux
-    /// call; focus still goes back); a newer toast shows again. While one
-    /// is on screen the loop wakes at its deadline, and only then.
+    /// A left click on a toast card dismisses THAT toast in this sidebar
+    /// only (no tmux call; focus still goes back); a newer toast shows
+    /// again. While cards are on screen the loop wakes at the earliest
+    /// deadline, and only then. The dismissals are bounded and forget the
+    /// toasts `@toast` no longer holds.
     #[test]
     fn a_click_dismisses_the_toast_here() {
         use status::{Kind, Toast};
         let mut a = app();
         let t0 = (text::now() * 1000.0) as i64;
-        let toast = |seq: u64| Toast { seq, at_ms: t0, kind: Kind::Ok, ttl: 60.0, client: String::new(), text: "parked x".into() };
-        a.bar.toast = Some(toast(3));
+        let toast = |seq: u64, at_ms: i64, ttl: f64| Toast {
+            seq,
+            at_ms,
+            kind: Kind::Ok,
+            ttl,
+            client: String::new(),
+            text: format!("parked {seq}"),
+            title: None,
+        };
+        let seqs = |a: &App| a.shown_bar().toasts.iter().map(|t| t.seq).collect::<Vec<_>>();
+        let left = |a: &App| a.toast_due(Instant::now()).expect("a wakeup").saturating_duration_since(Instant::now());
+        a.bar.toasts = vec![toast(3, t0, 60.0)];
         let frame = |a: &App| layout(&a.view, 34, 30, &Opts { bar: a.shown_bar(), now: Some(text::now()), ..Opts::default() });
         a.shown = frame(&a);
-        assert_eq!(a.shown.toast, 0..1);
-        let due = a.toast_due(Instant::now()).expect("a wakeup");
-        let left = due.saturating_duration_since(Instant::now());
-        assert!(left > Duration::from_secs(55) && left <= Duration::from_secs(61), "{left:?}");
-        a.handle(b"\x1b[<0;5;1M\x1b[<0;5;1m");
-        assert_eq!((a.focus_backs, a.last_act.clone(), a.dismissed), (1, Some(Target::Toast((3, t0))), Some((3, t0))));
+        // One card: its top border, one line of text, its bottom border.
+        assert_eq!(a.shown.toast, 0..3);
+        let l = left(&a);
+        assert!(l > Duration::from_secs(55) && l <= Duration::from_secs(61), "{l:?}");
+        a.handle(b"\x1b[<0;5;2M\x1b[<0;5;2m");
+        assert_eq!((a.focus_backs, a.last_act.clone(), a.dismissed.clone()), (1, Some(Target::Toast((3, t0))), vec![(3, t0)]));
         a.shown = frame(&a);
-        assert!(a.shown.toast.is_empty() && a.shown_bar().toast.is_none() && a.toast_due(Instant::now()).is_none());
-        assert!(a.bar.toast.is_some(), "only the drawing forgets it");
-        // A newer one: shown at once.
-        a.bar.toast = Some(toast(4));
+        assert!(a.shown.toast.is_empty() && seqs(&a).is_empty() && a.toast_due(Instant::now()).is_none());
+        assert_eq!(a.bar.toasts.len(), 1, "only the drawing forgets it");
+        // A newer one: shown at once, the dismissed one still not.
+        a.bar.toasts = vec![toast(3, t0, 60.0), toast(4, t0 + 1, 60.0)];
         a.shown = frame(&a);
-        assert_eq!((a.shown.toast.clone(), a.shown_bar().toast.map(|t| t.seq)), (0..1, Some(4)));
+        assert_eq!((a.shown.toast.clone(), seqs(&a)), (0..3, vec![4]));
         // Two racing posts that took the same seq: dismissing one never
         // hides the other.
-        a.dismissed = Some((4, t0));
-        a.bar.toast = Some(Toast { at_ms: t0 + 3, ..toast(4) });
+        a.dismissed = vec![(4, t0 + 1)];
+        a.bar.toasts = vec![toast(4, t0 + 3, 60.0)];
         a.shown = frame(&a);
-        assert_eq!(a.shown.toast, 0..1);
+        assert_eq!(a.shown.toast, 0..3);
+        // Stacked, oldest on top: the wakeup is the earliest deadline; a
+        // click on the second card dismisses that one alone.
+        a.dismissed.clear();
+        a.bar.toasts = vec![toast(5, t0, 60.0), toast(6, t0 + 5, 20.0)];
+        a.shown = frame(&a);
+        assert_eq!(a.shown.toast, 0..6);
+        let l = left(&a);
+        assert!(l > Duration::from_secs(20) && l <= Duration::from_secs(26), "{l:?}");
+        a.handle(b"\x1b[<0;20;5M\x1b[<0;20;5m");
+        assert_eq!((a.focus_backs, a.dismissed.clone()), (2, vec![(6, t0 + 5)]));
+        a.shown = frame(&a);
+        assert_eq!((a.shown.toast.clone(), seqs(&a)), (0..3, vec![5]));
+        // A refresh forgets the dismissals of toasts gone from `@toast`, as
+        // the snapshot read it: not on a failed snapshot (no client row),
+        // not while the bar's filtered list is empty (a client briefly
+        // unresolved); only when the option itself no longer holds it.
+        let snap_with = |raw: &str| {
+            let mut st = vec![String::new(); crate::tmux::STATUS_FORMATS.len()];
+            st[29] = raw.to_string();
+            let head = ["", "client", "/dev/ttys999", "@2", "main", "", "", "", "4242"].map(String::from);
+            Snapshot::parse(&head.into_iter().chain(st).collect::<Vec<_>>().join("\x1f"))
+        };
+        a.bar.toasts = vec![];
+        a.core.snapshot = Snapshot::parse("");
+        a.forget_gone_toasts();
+        assert_eq!(a.dismissed, vec![(6, t0 + 5)], "a failed snapshot forgets nothing");
+        a.core.snapshot = snap_with(&format!("5\t{t0}\tok\t60\t\tparked 5\u{1e}6\t{}\tok\t20\t/dev/ttys001\tparked 6", t0 + 5));
+        a.forget_gone_toasts();
+        assert_eq!(a.dismissed, vec![(6, t0 + 5)], "still held (for another client): kept");
+        a.core.snapshot = snap_with(&format!("5\t{t0}\tok\t60\t\tparked 5"));
+        a.forget_gone_toasts();
+        assert!(a.dismissed.is_empty());
+        for i in 0..20 {
+            a.dismiss((i, 0));
+        }
+        a.dismiss((19, 0));
+        assert_eq!((a.dismissed.len(), a.dismissed.last()), (DISMISSED_MAX, Some(&(19, 0))));
         // Expired: the wakeup is now (to draw it away), then none.
-        a.bar.toast = Some(Toast { at_ms: t0 - 61_000, ..toast(5) });
+        a.dismissed.clear();
+        a.bar.toasts = vec![toast(7, t0 - 61_000, 60.0)];
         a.shown.toast_until = Some(((text::now() - 1.0) * 1000.0) as i64);
         let now = Instant::now();
         assert!(a.toast_due(now).unwrap() <= now + Duration::from_millis(5));
