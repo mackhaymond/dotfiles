@@ -62,13 +62,72 @@ held message therefore counts as delivered.
 ## The popup
 
 A line at the bottom of the screen is too easy to miss with the lid half
-shut (Mack's call), so any press that sent something opens a big **centred
-popup** on the client that pressed the key. It is border-less, about 70% wide
-and 60% tall, never smaller than 60x16 (or the whole client when that is
-smaller), on a solid tint with dark text. The toggle sends everything and
-writes the state **before** opening it, after the lock is released, so the
-popup never blocks a later press. The view is `agent-pause.py watch
-pause|resume`, which reads `paused.json` or `paused.last.json` itself.
+shut (Mack's call), so any press with someone to message opens a big popup on
+the client that pressed the key. It is border-less, about 70% wide and 60%
+tall, never smaller than 60x16 (or the whole client when that is smaller), on
+a solid tint with dark text.
+
+**It opens at once, before delivery.** Under the lock, the toggle:
+
+1. makes the cheap plan (reads tmux and the session records);
+2. writes `progress.json`, with every target's result set to `sending`;
+3. launches the popup with `Popen(..., start_new_session=True)`, without
+   waiting (display-popup blocks until the popup closes, and the popup must
+   outlive the toggle);
+4. delivers, rewriting `progress.json` as each result lands;
+5. writes the final state, then releases the lock.
+
+The popup is `agent-pause.py watch pause|resume --press <id>`. While its press
+is in flight it shows rows reading `<spinner> sending…` and the line
+`sending PAUSE to N agents… K of N done`. **Enter is ignored while it is
+sending**, so it cannot race the delivery; the footer says so. Esc still
+closes it, and then the toggle also shows the outcome as a message line once
+delivery ends. Whenever the popup is not still up when delivery finishes, the
+line is shown, so an Esc'd popup never hides a failed pause. When
+`progress.json` says done, the popup moves to the view for the outcome:
+
+| press | outcome | view |
+|---|---|---|
+| pause | reached anyone (`paused.json` written) | the live PAUSE view below |
+| pause | reached nobody (no `paused.json`) | peach **NOT PAUSED**, "nothing is paused", plus the error; stays up until any key |
+| resume | reached anyone | green **RESUMED** with the results; closes after 4 s |
+| resume | reached nobody, or tmux-mcp down | peach **NOT RESUMED** with the message line (what is still paused, what was dropped); closes after 4 s |
+
+A second press while delivery runs finds the lock held and shows "busy". It is
+never read as a resume, because `paused.json` does not exist until the pause
+has reached someone.
+
+**The popup never spins forever.** If the slow half of a press raises (for
+example, `paused.json` cannot be written), `finished()` first marks the press
+done with the error and then re-raises it to the usual handler (log plus line).
+The popup then shows NOT PAUSED / NOT RESUMED with that error. A pause whose
+`paused.json` did get written still counts as paused. If the toggle process
+dies without marking the press done, the popup notices within a second (the
+press id is `<ms>-<pid>`) and shows "the pause key crashed: see …/log".
+
+**Position: centred on the WezTerm window, not just the tmux client.** Mack's
+WezTerm can hold the sidebar as a native split beside the tmux pane (the strip
+in `wezterm.lua`). A tmux popup centres on the tmux client only, so it looked
+off-centre, and WezTerm has no floating panes. So `popup_geometry` shifts the
+popup instead:
+
+- It runs `wezterm cli --no-auto-start list --format json` (0.5 s timeout;
+  `wezterm` from PATH, else `/Applications/WezTerm.app/Contents/MacOS/wezterm`)
+  and finds the pane whose `tty_name` is the client's `#{client_tty}`.
+  `--no-auto-start` matters: without a GUI to find (ssh, WezTerm quit, a stale
+  socket), plain `cli list` would spawn a wezterm-mux-server daemon.
+- It takes the bounding box of every pane in that tab and puts the popup's
+  centre at the tab's centre, as far as it can while staying inside the
+  client.
+- The width becomes 70% of the tab, but no wider than twice the room on the
+  nearer side of that centre, and never below the usual minimum.
+- `-x` is the left column. Vertical centring is `-y C`, unless panes are
+  stacked vertically too; then the same maths runs, giving a numeric `-y`,
+  which tmux 3.7c reads as the popup's **bottom** row (measured: `-y N` puts
+  the top at `N - h`).
+- If there is no wezterm, it is slow, the tty isn't found, or the data is odd,
+  you get the plain centred popup. Nothing is cached.
+- Each press logs its `geometry` in a `popup` log line.
 
 - **PAUSE popup** (peach `#fab387`). A block-letter **PAUSING** banner sits
   over one live row per agent: its label, its location, and one of
@@ -109,8 +168,8 @@ pause|resume`, which reads `paused.json` or `paused.last.json` itself.
   `@agent_state` is running again), `held (draft in box)`, `sent (no reply)`,
   `gone` or `failed`, plus the retry line when some agents are still paused.
   It closes by itself after 4 s, or on any key. A resume that reached nobody
-  opens no popup, only the message line, so nothing claims a resume that did
-  not happen.
+  shows the peach NOT RESUMED view instead, so nothing claims a resume that
+  did not happen.
 
 The one-line `display-message` is now only the fallback: no client name, a
 popup that would not open, or a press that sent nothing ("nothing paused",
@@ -133,7 +192,8 @@ Everything lives in `~/.local/state/agent-pause/` (override:
 |---|---|
 | `paused.json` | while paused: `paused_at` plus `targets`, one entry per agent the PAUSE reached (`pane_id`, `window_id`, `location`, `label` (= `@agent_summary`), `kind`, `session_id`, `pid`, `why`, `result`, and after a resume miss `miss_count` and `first_miss_at`). Also `resume_attempts`, plus `failed` and `unidentified` (kept for the record). Written atomically. |
 | `paused.last.json` | the latest resume attempt: the saved state it started from, plus `resumed_at`, `resume` (every target's result), `still_paused` (how many stayed in `paused.json`) and `resume_attempts` |
-| `log` | one JSON line per press (mode, the message shown, every target and its result). Rolled to `log.1` at 1 MB. |
+| `progress.json` | the press in flight, or the last one, for the popup: `press`, `mode`, `done`, `outcome` (`paused`/`failed`, or `resumed`/`not_resumed`/`failed`), `message`, and `targets` with `result` (`sending` until it lands). **Display data only**: the toggle never reads it. |
+| `log` | one JSON line per press (mode, the message shown, every target and its result), plus a `popup` line with the geometry. Rolled to `log.1` at 1 MB. |
 | `lock` | `flock`ed for the whole press |
 
 The tmux global option `@agents_paused` holds the number of agents still saved
@@ -189,6 +249,8 @@ press resumes. Otherwise it pauses.
 | double press | `pause key busy` (the second press sends nothing) | untouched |
 | an error before delivery | `pause key error: …` | untouched |
 | an error during delivery | each agent still gets a result (unexpected errors count as *unknown*) | written from the results |
+| an error after delivery (writing state) | the popup's NOT PAUSED / NOT RESUMED view with `pause key error: …`, plus the line | whatever was written before the error |
+| popup closed with Esc while sending | the outcome as a message line once delivery ends | as usual |
 
 The key path never exits non-zero and never prints, because `run-shell` would
 open a view pane over the window. Every outcome is either the popup or a
@@ -208,9 +270,12 @@ MCP connection and writes nothing.
 
 Tests use a private tmux server under its own `TMUX_TMPDIR`, a stub MCP
 server, and a private HOME and state dir, never the live server or port 7998.
-The frame builder, the key handling (`on_key`, `state_gone`) and the popup size
-are pure functions with unit tests. The `Popup` tests open real popups, but
-only on the private server, on a client attached from a pty the test owns.
+The frame builder, the key handling (`on_key`, `state_gone`), the popup size
+and `popup_geometry` are pure functions with unit tests. The `Popup` tests open
+real popups, but only on the private server, on a client attached from a pty
+the test owns. The wezterm CLI is never run from tests:
+`AGENT_PAUSE_WEZTERM=off` skips it, and a file path there is read in its place
+(that is how a sidebar layout is injected).
 
 ```sh
 cd ~/.local/share/chezmoi/dot_config/tmux

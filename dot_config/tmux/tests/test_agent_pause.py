@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import shlex
 import shutil
 import signal
 import struct
@@ -110,9 +111,9 @@ class StubMcp:
                 how = stub.reply.get(args["pane"], "sent")
                 p = args["pane"]
                 # Failures AFTER the request arrived (tmux-mcp would deliver):
-                if how == "slow":            # replies after the client gave up
+                if how in ("slow", "slowrefuse"):   # a slow reply (sent / refused)
                     time.sleep(stub.slow)
-                    how = "sent"
+                    how = "sent" if how == "slow" else "refuse"
                 elif how == "drop":          # hangs up: RemoteDisconnected
                     self.close_connection = True
                     return
@@ -165,6 +166,7 @@ class Harness(unittest.TestCase):
             "TMUX_MCP_URL": self.stub.url,
             "TMUX_MCP_TOKEN_FILE": str(self.dir / "token"),
             "TMUX_ASSISTANT_RESURRECT_DIR": str(self.dir / "rec"),
+            "AGENT_PAUSE_WEZTERM": "off",      # never the real wezterm CLI
             "TERM": "xterm-256color",
         })
         self.sock = None
@@ -542,8 +544,9 @@ class PauseKey(Harness):
 class Popup(Harness):
     """The real popup, end to end, on the PRIVATE server only: one client
     attached from a pty this process opens (display-popup needs a client),
-    keys typed into that pty. The press runs in the background because
-    display-popup waits for the popup to close."""
+    keys typed into that pty. The toggle launches the popup and returns once
+    delivery is done; the popup lives on in its own session, so "is it still
+    up" is a pgrep for its press id (unique per press)."""
 
     def setUp(self):
         super().setUp()
@@ -597,10 +600,25 @@ class Popup(Harness):
         log = self.dir / "state" / "log"
         self.fail("timed out waiting for %s\nlog: %s" % (what, log.read_text()[-3000:] if log.exists() else "-"))
 
+    def progress(self):
+        p = self.dir / "state" / "progress.json"
+        try:
+            return json.loads(p.read_text())
+        except (OSError, ValueError):
+            return {}
+
     def press_with_popup(self):
         self.out.clear()
+        before = self.progress().get("press")
         self.press_proc = subprocess.Popen([sys.executable, str(SCRIPT), "toggle", self.client],
                                            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.press_id = self.wait_for(
+            lambda: self.progress().get("press") not in (None, before) and self.progress()["press"],
+            "this press's progress.json")
+
+    def popup_alive(self):
+        return subprocess.run(["pgrep", "-f", "press " + self.press_id],
+                              capture_output=True).returncode == 0
 
     def popup_up(self, text):
         return text.encode() in bytes(self.out)
@@ -609,10 +627,12 @@ class Popup(Harness):
         os.write(self.fd, b)
 
     def press_done(self, timeout=10):
+        """The toggle finished and the popup closed."""
         try:
             self.press_proc.wait(timeout)
         except subprocess.TimeoutExpired:
-            self.fail("the popup did not close")
+            self.fail("the toggle never finished")
+        self.wait_for(lambda: not self.popup_alive(), "the popup to close", timeout)
 
     def test_pause_popup_ignores_stray_keys_and_esc_keeps_the_set(self):
         a = self.window("running")
@@ -621,7 +641,7 @@ class Popup(Harness):
         self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [a])
         self.key(b"x")
         time.sleep(1.5)
-        self.assertIsNone(self.press_proc.poll(), "a stray key closed the popup")
+        self.assertTrue(self.popup_alive(), "a stray key closed the popup")
         self.key(b"\x1b")
         self.press_done()
         self.assertIsNotNone(self.state())                 # still paused for prefix P
@@ -668,7 +688,7 @@ class Popup(Harness):
         self.key(b"\r")
         self.wait_for(lambda: self.popup_up("press prefix P again"), "the retry note")
         time.sleep(1.5)
-        self.assertIsNone(self.press_proc.poll(), "the popup claimed a resume and closed")
+        self.assertTrue(self.popup_alive(), "the popup claimed a resume and closed")
         self.assertIsNotNone(self.state())
         self.assertEqual(self.paused_opt(), "1")
         self.stub.reply = {}
@@ -708,6 +728,114 @@ class Popup(Harness):
         self.assertIn(b"no paused agent could be reached", screen)
         self.assertIsNone(self.state())
         self.assertEqual(self.stub.panes(AP.RESUME_MSG), [])
+
+    # -- the popup opens BEFORE delivery ----------------------------------
+    def test_popup_is_up_while_delivery_runs(self):
+        a = self.window("running")
+        self.stub.reply = {a: "slow"}                      # tmux-mcp takes 2.5 s
+        t0 = time.time()
+        self.press_with_popup()
+        self.wait_for(lambda: self.popup_up("sending PAUSE to 1 agent"), "the popup while sending", 2)
+        self.assertLess(time.time() - t0, self.stub.slow)  # up before the reply
+        self.assertIsNone(self.press_proc.poll())          # still delivering
+        self.assertIsNone(self.state())                    # nothing resumable mid-flight
+        self.assertEqual(self.run_script("toggle", "").returncode, 0)
+        self.assertEqual(self.last_log()["mode"], "busy")  # a 2nd press is never a resume
+        self.key(b"\r")                                    # Enter mid-delivery: ignored
+        self.wait_for(lambda: self.popup_up("resume all now"), "the PAUSE view")
+        time.sleep(0.5)
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [])
+        self.assertEqual([t["pane_id"] for t in self.state()["targets"]], [a])
+        self.assertTrue(self.progress()["done"])
+        self.key(b"\x1b")
+        self.press_done()
+
+    def test_pause_that_reaches_nobody_shows_not_paused(self):
+        a = self.window("running")
+        self.stub.reply = {a: "refuse"}
+        self.press_with_popup()
+        self.wait_for(lambda: self.popup_up("nothing is paused"), "the NOT PAUSED view")
+        self.assertIsNone(self.state())
+        self.assertEqual(self.progress()["outcome"], "failed")
+        time.sleep(1.5)
+        self.assertTrue(self.popup_alive(), "NOT PAUSED must wait for a key")
+        self.key(b"x")
+        self.press_done()
+
+    def test_prefix_p_resume_reaching_nobody_shows_not_resumed(self):
+        a = self.window("running")
+        self.press()                                       # paused, no popup
+        self.stub.reply = {a: "refuse"}
+        self.press_with_popup()
+        self.wait_for(lambda: self.popup_up("no paused agent could be reached"), "the NOT RESUMED view")
+        self.press_done()                                  # closes by itself
+        self.assertNotIn(b"told to pick up", bytes(self.out))
+        self.assertEqual([t["pane_id"] for t in self.state()["targets"]], [a])
+
+    def test_esc_while_sending_still_reports_the_outcome(self):
+        a = self.window("running")
+        self.stub.reply = {a: "slowrefuse"}                # slow, then refused
+        self.press_with_popup()
+        self.wait_for(lambda: self.popup_up("sending PAUSE"), "the popup while sending", 2)
+        self.key(b"\x1b")                                  # Esc still works mid-delivery
+        self.wait_for(lambda: not self.popup_alive(), "the popup to close")
+        self.out.clear()
+        self.press_done()                                  # the toggle finishes delivering...
+        self.assertIsNone(self.state())
+        # ...and, the popup being gone, says how it went on the status line.
+        self.wait_for(lambda: self.popup_up("pause failed"), "the outcome line")
+
+    def test_error_in_delivery_finish_ends_the_sending_view(self):
+        self.window("running")
+        (self.dir / "state" / "paused.json").mkdir()       # write_json(paused.json) will fail
+        self.press_with_popup()
+        self.wait_for(lambda: self.popup_up("nothing is paused"), "the NOT PAUSED view")
+        self.wait_for(lambda: self.popup_up("pause key error"), "the error in the popup")
+        prog = self.progress()
+        self.assertTrue(prog["done"])
+        self.assertEqual(prog["outcome"], "failed")
+        self.press_proc.wait(10)                           # main's handler: log + line
+        modes = [json.loads(l)["mode"] for l in (self.dir / "state" / "log").read_text().splitlines()]
+        self.assertIn("error", modes)
+        self.key(b"x")
+        self.wait_for(lambda: not self.popup_alive(), "the popup to close")
+
+    def test_popup_stops_sending_when_the_toggle_died(self):
+        dead = subprocess.Popen(["/usr/bin/true"])
+        dead.wait()                                        # reaped: its pid is free
+        self.press_id = "1-%d" % dead.pid
+        (self.dir / "state" / "progress.json").write_text(json.dumps({
+            "press": self.press_id, "mode": "pause", "done": False, "outcome": "", "message": "",
+            "targets": [{"label": "proj/a", "location": "main:1.0", "pane_id": "%1",
+                         "result": "sending"}]}))
+        cmd = " ".join(shlex.quote(c) for c in
+                       [sys.executable, str(SCRIPT), "watch", "pause", "--press", self.press_id])
+        popup = subprocess.Popen([TMUX, "display-popup", "-c", self.client, "-E", "-w", "100",
+                                  "-h", "24", cmd], env=self.env)
+        self.addCleanup(lambda: popup.poll() is None and popup.kill())
+        self.wait_for(lambda: self.popup_up("the pause key crashed"), "the crash note")
+        self.assertIn(b"nothing is paused", bytes(self.out))   # NOT PAUSED, not a spinner
+        self.key(b"x")
+        popup.wait(10)
+
+    def test_popup_centres_on_the_wezterm_tab(self):
+        self.window("running")
+        tty = self.t("list-clients", "-F", "#{client_tty}")
+        wez = self.dir / "wez.json"
+        wez.write_text(json.dumps([
+            {"window_id": 0, "tab_id": 0, "pane_id": 0, "tty_name": tty, "left_col": 0, "top_row": 0,
+             "size": {"cols": 140, "rows": 40}},
+            {"window_id": 0, "tab_id": 0, "pane_id": 1, "tty_name": "/dev/ttys999", "left_col": 141,
+             "top_row": 0, "size": {"cols": 59, "rows": 40}}]))
+        self.env["AGENT_PAUSE_WEZTERM"] = str(wez)
+        self.press_with_popup()
+        self.wait_for(lambda: self.popup_up("resume all now"), "the PAUSE popup")
+        geo = [json.loads(l) for l in (self.dir / "state" / "log").read_text().splitlines()
+               if '"popup"' in l][-1]["geometry"]
+        self.assertEqual(geo, [80, 24, 60, "C"])           # tab centre x=100: flush right
+        self.assertRegex(bytes(self.out), rb"\x1b\[\d+;61H")  # drawn from column 61 (1-based)
+        self.key(b"\x1b")
+        self.press_done()
 
 
 class Units(unittest.TestCase):
@@ -870,6 +998,137 @@ class Units(unittest.TestCase):
         self.assertEqual(AP.popup_size(200, 50), (140, 30))
         self.assertEqual(AP.popup_size(80, 24), (60, 16))
         self.assertEqual(AP.popup_size(50, 12), (50, 12))
+
+    # -- popup_geometry: centre on the WezTerm tab ------------------------------
+    @staticmethod
+    def pane(tty, left, cols, top=0, rows=74, tab=0, window=0):
+        return {"window_id": window, "tab_id": tab, "pane_id": left, "tty_name": tty,
+                "left_col": left, "top_row": top, "size": {"cols": cols, "rows": rows}}
+
+    def test_geometry_sidebar_right(self):
+        # The live layout: tmux 0..236, divider 237, sidebar 238..271.
+        wez = [self.pane("/dev/ttys000", 0, 237), self.pane("/dev/ttys018", 238, 34)]
+        w, h, x, y = AP.popup_geometry(237, 74, "/dev/ttys000", wez)
+        self.assertEqual((w, x, y), (190, 41, "C"))        # tab centre 136
+        self.assertEqual(x + w / 2, 136)
+        self.assertEqual(h, AP.popup_size(237, 74)[1])
+
+    def test_geometry_sidebar_left(self):
+        wez = [self.pane("/dev/ttys018", 0, 34), self.pane("/dev/ttys000", 35, 237)]
+        w, h, x, y = AP.popup_geometry(237, 74, "/dev/ttys000", wez)
+        self.assertEqual((w, x, y), (190, 6, "C"))         # 136 - 35 = 101 in client coords
+        self.assertEqual(x + w / 2, 101)
+
+    def test_geometry_no_sidebar_or_other_tabs_is_centred(self):
+        alone = [self.pane("/dev/ttys000", 0, 237),
+                 self.pane("/dev/ttys018", 0, 100, tab=1)]   # another tab does not count
+        self.assertEqual(AP.popup_geometry(237, 74, "/dev/ttys000", alone),
+                         AP.popup_size(237, 74) + ("C", "C"))
+
+    def test_geometry_too_wide_sidebar_stays_inside(self):
+        wez = [self.pane("/dev/ttys000", 0, 100), self.pane("/dev/ttys018", 101, 199)]
+        w, h, x, y = AP.popup_geometry(100, 74, "/dev/ttys000", wez)
+        self.assertEqual((w, x), (60, 40))                 # minimum width, flush right
+        self.assertLessEqual(x + w, 100)
+
+    def test_geometry_client_not_found_or_bad_data_is_centred(self):
+        centred = AP.popup_size(237, 74) + ("C", "C")
+        wez = [self.pane("/dev/ttys018", 238, 34)]
+        self.assertEqual(AP.popup_geometry(237, 74, "/dev/ttys000", wez), centred)
+        self.assertEqual(AP.popup_geometry(237, 74, "/dev/ttys000", []), centred)
+        broken = [{"tty_name": "/dev/ttys000", "window_id": 0, "tab_id": 0}]
+        self.assertEqual(AP.popup_geometry(237, 74, "/dev/ttys000", broken), centred)
+        self.assertEqual(AP.popup_geometry(237, 74, "/dev/ttys000", [None, "x"]), centred)
+
+    def test_geometry_stacked_vertically(self):
+        wez = [self.pane("/dev/ttys000", 0, 140, top=0, rows=40),
+               self.pane("/dev/ttys018", 0, 140, top=41, rows=20)]
+        w, h, x, y = AP.popup_geometry(140, 40, "/dev/ttys000", wez)
+        self.assertEqual(x, "C")
+        self.assertEqual((h, y), (19, 40))                 # top 21, numeric -y = bottom
+        self.assertLessEqual(y, 40)
+
+    def test_wezterm_cli_never_auto_starts_a_mux(self):
+        from unittest import mock
+        seen = []
+
+        def fake_run(argv, **kw):
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
+        env = {k: v for k, v in os.environ.items() if k != "AGENT_PAUSE_WEZTERM"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch("shutil.which", return_value="/fake/wezterm"), \
+             mock.patch.object(AP.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(AP.wezterm_panes(), [])
+        self.assertEqual(seen, [["/fake/wezterm", "cli", "--no-auto-start", "list", "--format", "json"]])
+
+    def test_press_alive(self):
+        self.assertTrue(AP.press_alive("1-%d" % os.getpid()))
+        dead = subprocess.Popen(["/usr/bin/true"])
+        dead.wait()
+        self.assertFalse(AP.press_alive("1-%d" % dead.pid))
+        self.assertTrue(AP.press_alive("garbage"))         # unparseable: assume alive
+
+    def test_wezterm_panes_reads_an_injected_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump([self.pane("/dev/ttys000", 0, 10)], f)
+        self.addCleanup(os.unlink, f.name)
+        old = os.environ.get("AGENT_PAUSE_WEZTERM")
+        try:
+            os.environ["AGENT_PAUSE_WEZTERM"] = f.name
+            self.assertEqual(AP.wezterm_panes()[0]["tty_name"], "/dev/ttys000")
+            os.environ["AGENT_PAUSE_WEZTERM"] = "off"
+            self.assertIsNone(AP.wezterm_panes())
+        finally:
+            if old is None:
+                os.environ.pop("AGENT_PAUSE_WEZTERM", None)
+            else:
+                os.environ["AGENT_PAUSE_WEZTERM"] = old
+
+    # -- sending: progress rows and what follows -------------------------------
+    def test_progress_items_and_after_sending(self):
+        row = {"agent_state": "running", "agent_workflow": "", "agent_cua": ""}
+        prog = {"mode": "pause", "targets": [
+            {"label": "a", "location": "m:1.0", "pane_id": "%1", "result": "sending"},
+            {"label": "b", "location": "m:2.0", "pane_id": "%2", "result": "sent"},
+            {"label": "c", "location": "m:3.0", "pane_id": "%3", "result": "failed"},
+            {"label": "d", "location": "m:4.0", "result": "unidentified"}]}
+        self.assertEqual([s for _, _, s in AP.progress_items(prog, {"%2": row})],
+                         [AP.SENDING, AP.PAUSING, AP.FAILED, AP.NOT_SENT])
+        rprog = {"mode": "resume", "targets": [
+            {"label": "a", "resume_pane": "%1", "result": "sending"},
+            {"label": "b", "resume_pane": None, "result": "gone"}]}
+        self.assertEqual([s for _, _, s in AP.progress_items(rprog, {})], [AP.SENDING, AP.GONE])
+        self.assertEqual(AP.after_sending({"mode": "pause", "outcome": "paused"}), "pause")
+        self.assertEqual(AP.after_sending({"mode": "pause", "outcome": "failed"}), "notpaused")
+        self.assertEqual(AP.after_sending({"mode": "resume", "outcome": "resumed"}), "resumed")
+        self.assertEqual(AP.after_sending({"mode": "resume", "outcome": "not_resumed"}), "dropped")
+        self.assertEqual(AP.after_sending({"mode": "resume", "outcome": "failed"}), "dropped")
+
+    def test_sending_and_not_paused_frames(self):
+        items = [("a", "m:1.0", AP.SENDING), ("b", "m:2.0", AP.PAUSING)]
+        bg, lines = AP.build_frame("pause", items, 100, 24, 3, sending=True, spin=1)
+        text = "\n".join(lines)
+        self.assertEqual(bg, AP.PEACH)
+        self.assertIn("sending PAUSE to 2 agents… 1 of 2 done", text)
+        self.assertIn(AP.SPINNER[1] + " " + AP.SENDING, text)
+        self.assertEqual(lines[-1].strip(), AP.SENDING_FOOT)
+        bg, lines = AP.build_frame("resume", [("a", "m:1.0", AP.SENDING)], 100, 24, 0, sending=True)
+        self.assertEqual(bg, AP.GREEN)
+        self.assertIn("sending RESUME to 1 agent… 0 of 1 done", "\n".join(lines))
+        self.assertIn(AP.SPINNER[0] + " " + AP.SENDING, "\n".join(lines))
+        bg, lines = AP.build_frame("notpaused", [("a", "m:1.0", AP.FAILED)], 100, 24, 0,
+                                   note="pause failed: no agent took the message")
+        text = "\n".join(lines)
+        self.assertEqual(bg, AP.PEACH)
+        self.assertTrue(all(r in text for r in AP.block("NOT PAUSED")))
+        self.assertIn("nothing is paused", text)
+        self.assertIn("no agent took the message", text)
+        self.assertEqual(lines[-1].strip(), "any key to close")
+        self.assertEqual(AP.on_key("sending", b"\r"), None)    # Enter would race delivery
+        self.assertEqual(AP.on_key("sending", b"x"), None)
+        self.assertEqual(AP.on_key("sending", b"\x1b"), "close")
+        self.assertEqual(AP.on_key("notpaused", b"x"), "close")
 
     def test_popup_cmd_carries_overrides_not_the_token(self):
         old = dict(os.environ)

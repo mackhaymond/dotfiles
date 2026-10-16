@@ -10,9 +10,11 @@ reach the agents that were paused, not whatever happens to be running now.
     agent-pause.py toggle <client_name>   the key: pause, or resume a saved set
     agent-pause.py status                 print the saved set, or "not paused"
     agent-pause.py dry-run                print who WOULD be paused/resumed; sends nothing
-    agent-pause.py watch pause|resume [--demo]
+    agent-pause.py watch pause|resume [--demo] [--press <id>]
                                           the popup's view (see FEEDBACK below);
-                                          --demo plays it with fake agents
+                                          --demo plays it with fake agents;
+                                          --press: follow that press's delivery
+                                          (progress.json) first
 
 WORKING (Mack's correction: idle agents are never messaged) is read from the
 per-window options the tab indicator hooks and agent-tab-watcher.sh keep:
@@ -66,6 +68,7 @@ STATE = STATE_DIR / "paused.json"
 LAST = STATE_DIR / "paused.last.json"
 LOG = STATE_DIR / "log"
 LOCK = STATE_DIR / "lock"
+PROGRESS = STATE_DIR / "progress.json"
 MCP_URL = os.environ.get("TMUX_MCP_URL") or (
     "http://127.0.0.1:%s/mcp" % (os.environ.get("TMUX_MCP_PORT") or "7998"))
 TOKEN_FILE = Path(os.environ.get("TMUX_MCP_TOKEN_FILE") or HOME / ".local/state/tmux-mcp/token")
@@ -149,11 +152,15 @@ def display(client, msg):
 
 def set_paused_option(n):
     """@agents_paused (global): the count while paused, unset otherwise. For a
-    status indicator; nothing renders it yet."""
-    if n:
-        tmux("set-option", "-g", "@agents_paused", str(n), check=False)
-    else:
-        tmux("set-option", "-gu", "@agents_paused", check=False)
+    status indicator; nothing renders it yet. Cosmetic, so it never raises: a
+    tmux timeout here must not cost the press its outcome."""
+    try:
+        if n:
+            tmux("set-option", "-g", "@agents_paused", str(n), check=False)
+        else:
+            tmux("set-option", "-gu", "@agents_paused", check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 # ------------------------------------------------------ agent identity
@@ -487,11 +494,12 @@ def classify(resp):
 REACHED = ("sent", "held", "unknown")   # "unknown" = no reply, probably delivered
 
 
-def deliver(mcp, jobs, msg):
+def deliver(mcp, jobs, msg, on_result=None):
     """jobs [(key, pane_id)] -> {key: (status, detail)}, concurrently: each
     delivery spends ~400 ms in tmux-mcp's draft guard. Never raises: every
     job gets a status - sent | held | failed | unknown (see McpUncertain;
-    anything unexpected counts as unknown too, since it may have gone out)."""
+    anything unexpected counts as unknown too, since it may have gone out).
+    on_result(key, (status, detail)) is called as each one lands (progress)."""
     def one(pane):
         try:
             return classify(mcp.call("message_agent", {"pane": pane, "message": msg, "raw": True}))
@@ -507,6 +515,11 @@ def deliver(mcp, jobs, msg):
             futs = {ex.submit(one, pane): key for key, pane in jobs}
             for f in concurrent.futures.as_completed(futs):
                 out[futs[f]] = f.result()
+                if on_result:
+                    try:
+                        on_result(futs[f], out[futs[f]])
+                    except Exception:
+                        pass   # progress is display only
     except Exception as e:   # e.g. no threads: whatever did not report may have gone out
         for key, _ in jobs:
             out.setdefault(key, ("unknown", "%s: %s" % (type(e).__name__, e)))
@@ -586,27 +599,83 @@ def names(items, n=4):
 
 # ---------------------------------------------------------------- modes
 
-def do_pause(client):
-    panes = list_panes()
-    recs = agent_records()
-    targets, _idle, unidentified = scan(panes, recs)
-    entry = {"mode": "pause", "client": client,
-             "unidentified": unidentified}
-    noid = (" · %d working window%s had no agent pane: %s" % (
+# PROGRESS (progress.json): what the press in flight is doing, for the popup
+# that opens BEFORE delivery starts (Mack: it must appear at once, not after
+# the seconds tmux-mcp takes). One record per press, rewritten as each result
+# lands: {press, mode, done, outcome, message, targets[] with "result"}, the
+# result "sending" until that target's delivery returns. It is display data
+# only: paused.json alone still decides the toggle, and is written only once
+# a pause has reached someone, so a pause in flight (lock held) or one that
+# reached nobody never reads as "a resumable set exists". outcome, set with
+# done: paused | failed (pause), resumed | not_resumed | failed (resume).
+
+def new_press():
+    return "%d-%d" % (int(time.time() * 1000), os.getpid())
+
+
+class Progress:
+    """Writes progress.json for one press; thread-safe (results land from the
+    delivery threads)."""
+
+    def __init__(self, press, mode, targets, extra=()):
+        self.press, self.mode, self.targets, self.extra = press, mode, targets, list(extra)
+        self.lock = threading.Lock()
+        self.write()
+
+    def write(self, done=False, outcome="", message=""):
+        with self.lock:
+            try:
+                write_json(PROGRESS, {"press": self.press, "mode": self.mode, "done": done,
+                                      "outcome": outcome, "message": message,
+                                      "targets": self.targets + self.extra})
+            except OSError:
+                pass   # display data only: never let it cost a delivery
+
+    def result(self, i, res):
+        with self.lock:
+            self.targets[i]["result"], self.targets[i]["detail"] = res
+        self.write()
+
+
+def read_progress():
+    try:
+        d = json.loads(PROGRESS.read_text())
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def noid_text(unidentified):
+    return (" · %d working window%s had no agent pane: %s" % (
         len(unidentified), "" if len(unidentified) == 1 else "s", names(unidentified))
         if unidentified else "")
-    if not targets:
-        msg = "⏸ no agents are working — nothing paused" + noid
-        log(dict(entry, message=msg, targets=[]))
-        return msg, None
+
+
+def plan_pause():
+    """The cheap half of a pause (tmux + record reads): -> (targets, unidentified)."""
+    targets, _idle, unidentified = scan(list_panes(), agent_records())
+    for t in targets:
+        t["result"], t["detail"] = "sending", ""
+    return targets, unidentified
+
+
+def finish_pause(client, prog, targets, unidentified):
+    """The slow half: deliver PAUSE, write paused.json (reached targets only)
+    and the final progress. -> (message line, paused?)."""
+    entry = {"mode": "pause", "client": client, "unidentified": unidentified}
+    noid = noid_text(unidentified)
     try:
         mcp = open_mcp()
     except McpError as e:
+        for t in targets:
+            t["result"], t["detail"] = "failed", str(e)
         msg = "⏸ pause failed, nothing sent: %s" % e
+        prog.write(True, "failed", msg)
         log(dict(entry, message=msg, targets=targets))
-        return msg, None
+        return msg, False
     try:
-        res = deliver(mcp, [(i, t["pane_id"]) for i, t in enumerate(targets)], PAUSE_MSG)
+        res = deliver(mcp, [(i, t["pane_id"]) for i, t in enumerate(targets)], PAUSE_MSG,
+                      on_result=prog.result)
     finally:
         mcp.close()
     for i, t in enumerate(targets):
@@ -619,8 +688,10 @@ def do_pause(client):
     if not ok:
         msg = "⏸ pause failed: no agent took the message (%s: %s)%s" % (
             short(bad[0]["label"]), bad[0]["detail"], noid)
+        prog.write(True, "failed", msg)
         log(dict(entry, message=msg, targets=targets))
-        return msg, None
+        return msg, False
+    # paused.json BEFORE the final progress: the popup reads it on "done".
     write_json(STATE, {"version": 1, "paused_at": now_iso(), "targets": ok, "failed": bad,
                        "unidentified": unidentified})
     set_paused_option(len(ok))
@@ -632,36 +703,57 @@ def do_pause(client):
     if bad:
         msg += " · FAILED %d: %s" % (len(bad), names(bad))
     msg += noid
+    prog.write(True, "paused", msg)
     log(dict(entry, message=msg, targets=targets))
-    return msg, "pause"
+    return msg, True
+
+
+def plan_resume(st):
+    """The cheap half of a resume: where each saved agent is now.
+    -> (live, gone), copies of the saved targets with resume_pane/note."""
+    panes, recs = list_panes(), agent_records()
+    live, gone = [], []
+    for t in st["targets"]:
+        pane, note = locate(t, panes, recs)
+        t = dict(t, resume_pane=pane, resume_note=note)
+        if pane:
+            t["result"], t["detail"] = "sending", ""
+            live.append(t)
+        else:
+            t["result"], t["detail"] = "gone", note
+            gone.append(t)
+    return live, gone
 
 
 def do_resume(client, st):
+    """A whole resume (Enter in the PAUSE popup). -> (message, "resume" | None)."""
+    live, gone = plan_resume(st)
+    msg, reached = finish_resume(client, Progress(new_press(), "resume", live, gone), st, live, gone)
+    return msg, ("resume" if reached else None)
+
+
+def finish_resume(client, prog, st, live, gone):
+    """The slow half of a resume. -> (message line, reached anyone?)."""
     saved = st["targets"]
-    panes = list_panes()
-    recs = agent_records()
-    live, gone = [], []
-    for t in saved:
-        pane, note = locate(t, panes, recs)
-        t = dict(t, resume_pane=pane, resume_note=note)
-        (live if pane else gone).append(t)
     entry = {"mode": "resume", "client": client, "paused_at": st.get("paused_at")}
     if live:
         try:
             mcp = open_mcp()
         except McpError as e:
             # Nothing was sent: keep the saved set so the next press retries.
+            for t in live:
+                t["result"], t["detail"] = "failed", str(e)
             msg = "▶ resume failed, still paused (%d): %s" % (len(saved), e)
+            prog.write(True, "failed", msg)
             log(dict(entry, message=msg, targets=live + gone))
-            return msg, None
+            return msg, False
         try:
-            res = deliver(mcp, [(i, t["resume_pane"]) for i, t in enumerate(live)], RESUME_MSG)
+            res = deliver(mcp, [(i, t["resume_pane"]) for i, t in enumerate(live)], RESUME_MSG,
+                          on_result=prog.result)
         finally:
             mcp.close()
         for i, t in enumerate(live):
             t["result"], t["detail"] = res.get(i, ("unknown", "no result"))
-    for t in gone:
-        t["result"], t["detail"] = "gone", t["resume_note"]
     ok = [t for t in live if t["result"] in REACHED]
     bad = [t for t in live if t["result"] not in REACHED]
     # Only the agents the RESUME reached leave the saved set, so a resume that
@@ -706,15 +798,20 @@ def do_resume(client, st):
         msg += " · FAILED %d: %s" % (len(bad), names(bad))
     if keep:
         msg += " · %d still paused — press prefix P again to retry" % len(keep)
+    # Nobody reached: the open popup shows NOT RESUMED, never a green claim.
+    prog.write(True, "resumed" if ok else "not_resumed", msg)
     log(dict(entry, message=msg, targets=live + gone))
-    # Nobody reached: no RESUMED popup (it would claim a resume); the line
-    # says what is still paused.
-    return msg, ("resume" if ok else None)
+    return msg, bool(ok)
 
 
 def toggle(client):
+    """The key. Under the lock: the cheap plan, progress.json, the popup
+    (launched, not waited for), then delivery and the final state. A second
+    press while this one delivers finds the lock held ("busy"), so it can
+    never read a half-made pause as a resumable set."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     lf = open(LOCK, "a")
+    popup = None
     try:
         try:
             fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -723,39 +820,70 @@ def toggle(client):
             log({"mode": "busy", "client": client})
             return
         st = load_state()
+        press = new_press()
         if st and st["targets"]:
-            msg, popup = do_resume(client, st)
+            live, gone = plan_resume(st)
+            prog = Progress(press, "resume", live, gone)
+            popup = open_popup(client, "resume", press)
+            msg = finished(prog, lambda: finish_resume(client, prog, st, live, gone))
         else:
-            msg, popup = do_pause(client)
+            targets, unidentified = plan_pause()
+            if not targets:
+                msg = "⏸ no agents are working — nothing paused" + noid_text(unidentified)
+                log({"mode": "pause", "client": client, "unidentified": unidentified,
+                     "message": msg, "targets": []})
+            else:
+                prog = Progress(press, "pause", targets,
+                                [dict(u, result="unidentified") for u in unidentified])
+                popup = open_popup(client, "pause", press)
+                msg = finished(prog, lambda: finish_pause(client, prog, targets, unidentified))
     finally:
         lf.close()   # releases the flock
-    # Feedback only AFTER the lock is free: the pause popup stays up until a
-    # key, and a held lock would turn the next press into "busy".
-    feedback(client, msg, popup)
+    # The line too whenever the popup is NOT still up: it never opened, or
+    # Mack pressed Esc while it was sending - then nothing else would tell him.
+    if not popup_still_up(popup):
+        display(client, msg)
+
+
+def finished(prog, finish):
+    """Run a press's slow half. If it raises, mark the press done first, so
+    the open popup stops spinning "sending" and shows the error (a pause
+    whose paused.json did get written still counts as paused), then let the
+    error reach main's handler (log + message line)."""
+    try:
+        return finish()[0]
+    except BaseException as e:
+        err = "pause key error: %s: %s (log: %s)" % (type(e).__name__, e, LOG)
+        outcome = "paused" if prog.mode == "pause" and load_state() else "failed"
+        prog.write(True, outcome, err)
+        raise
 
 
 # ------------------------------------------------------------- feedback
 # A display-message line is too easy to miss with the lid half shut (Mack's
-# call), so a press that sent anything opens a border-less FULL-SCREEN popup
-# running `watch <mode>`: a block-letter banner (PAUSING → SAFE TO CLOSE, or
-# RESUMED) over one live row per agent. display-message is the fallback for
-# no client or a popup that will not open.
+# call), so a press with anyone to message opens a big border-less popup
+# running `watch <mode> --press <id>`, AT ONCE, before delivery: rows read
+# "sending…" until progress.json fills them in, then a block-letter banner
+# (PAUSING → SAFE TO CLOSE, RESUMED, or the peach NOT PAUSED / NOT RESUMED
+# when nobody was reached) over one live row per agent. display-message is
+# the fallback for no client or a popup that will not open.
 
 PEACH, GREEN, INK = "#fab387", "#a6e3a1", "#11111b"
 OVERRIDES = ("AGENT_PAUSE_STATE_DIR", "TMUX_MCP_URL", "TMUX_MCP_PORT", "TMUX_MCP_TOKEN_FILE",
              "TMUX_ASSISTANT_RESURRECT_DIR")
 
 
-def popup_cmd(mode):
+def popup_cmd(mode, press=None):
     """The shell command the popup runs. The popup's environment is the tmux
     server's, not ours, so our overrides ride along explicitly (Enter in the
     popup resumes, which needs the same state dir, tmux-mcp and records).
     Paths and a URL only: the token itself never goes on a command line."""
     import shlex
     env = ["%s=%s" % (k, os.environ[k]) for k in OVERRIDES if os.environ.get(k)]
-    return "exec %s%s %s watch %s" % (
+    return "exec %s%s %s watch %s%s" % (
         ("env %s " % " ".join(shlex.quote(e) for e in env)) if env else "",
-        shlex.quote(sys.executable), shlex.quote(str(Path(__file__).resolve())), mode)
+        shlex.quote(sys.executable), shlex.quote(str(Path(__file__).resolve())), mode,
+        " --press %s" % shlex.quote(press) if press else "")
 
 
 def popup_size(cw, ch):
@@ -764,35 +892,127 @@ def popup_size(cw, ch):
     return (min(cw, max(60, round(cw * 0.7))), min(ch, max(16, round(ch * 0.6))))
 
 
-def open_popup(client, mode):
-    """True if the popup opened. display-popup waits until it closes, which
-    is fine: the lock is already released and run-shell -b backgrounds us.
-    Centred and border-less on a solid tint, so it reads as a big card."""
+def _span(lo_hi_list):
+    return min(a for a, _ in lo_hi_list), max(b for _, b in lo_hi_list)
+
+
+def popup_geometry(cw, ch, client_tty, wez):
+    """-> (w, h, x, y) for display-popup on a cw x ch client. Pure.
+
+    WezTerm can hold Mack's sidebar as a native split BESIDE the tmux pane
+    (wezterm.lua's strip), and a tmux popup centres on the tmux client only,
+    so it sat off-centre in the window. WezTerm has no floating panes, so the
+    popup is shifted instead: its centre goes to the centre of the WezTerm
+    TAB (the bounding box of every pane in the tab holding this client's tty,
+    from `wezterm cli list`), as far as it can while staying inside the
+    client; the width shrinks to keep that centre where it can (to 70% of the
+    tab, but no wider than twice the room on the nearer side), never below the
+    usual minimum. x is the left column; y is "C", or, when panes are stacked
+    vertically too, a number that tmux 3.7c reads as the popup's BOTTOM row
+    (measured: -y N puts the top at N - h). Anything unexpected - no wezterm
+    data, tty not found, odd JSON - gives the plain centred popup."""
+    w, h = popup_size(cw, ch)
+    try:
+        me = next(p for p in wez if isinstance(p, dict) and p.get("tty_name") == client_tty)
+        tab = [p for p in wez if isinstance(p, dict)
+               and p.get("window_id") == me["window_id"] and p.get("tab_id") == me["tab_id"]]
+        ml, mt = int(me["left_col"]), int(me["top_row"])
+        left, right = _span([(int(p["left_col"]), int(p["left_col"]) + int(p["size"]["cols"])) for p in tab])
+        top, bottom = _span([(int(p["top_row"]), int(p["top_row"]) + int(p["size"]["rows"])) for p in tab])
+    except (StopIteration, KeyError, TypeError, ValueError):
+        return w, h, "C", "C"
+
+    def place(span_lo, span_hi, mine, size, pct, minimum):
+        cx = (span_lo + span_hi) / 2.0 - mine        # tab centre, client coords
+        want = min(round((span_hi - span_lo) * pct), int(2 * min(cx, size - cx)))
+        n = min(size, max(want, min(minimum, size)))
+        return n, int(max(0, min(size - n, round(cx - n / 2.0))))
+
+    x, y = "C", "C"
+    if (left, right) != (ml, ml + cw):           # panes beside the client
+        w, x = place(left, right, ml, cw, 0.7, 60)
+    if (top, bottom) != (mt, mt + ch):           # panes above/below it
+        h, t = place(top, bottom, mt, ch, 0.6, 16)
+        y = t + h                                # tmux's numeric -y is the bottom
+    return w, h, x, y
+
+
+WEZTERM_APP = "/Applications/WezTerm.app/Contents/MacOS/wezterm"
+
+
+def wezterm_panes():
+    """`wezterm cli list --format json`, or None. AGENT_PAUSE_WEZTERM=off
+    skips it; a path there is read instead of running the CLI (tests: the real
+    CLI is never run from them). Half a second at most: the popup is waiting."""
+    import shutil
+    src = os.environ.get("AGENT_PAUSE_WEZTERM", "")
+    try:
+        if src == "off":
+            return None
+        if src:
+            return json.loads(Path(src).read_text())
+        exe = shutil.which("wezterm") or (WEZTERM_APP if os.access(WEZTERM_APP, os.X_OK) else None)
+        if not exe:
+            return None
+        # --no-auto-start: with no GUI to find (ssh, WezTerm quit, a stale
+        # socket) plain `cli list` would spawn a wezterm-mux-server daemon.
+        r = subprocess.run([exe, "cli", "--no-auto-start", "list", "--format", "json"],
+                           capture_output=True, text=True, timeout=0.5)
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def open_popup(client, mode, press):
+    """Launch the popup for this press and return its process, without
+    waiting: display-popup blocks until the popup closes, and the popup must
+    be up while delivery runs. Its own session, so it outlives the toggle.
+    Big, border-less, on a solid tint; positioned by popup_geometry."""
+    if not client:
+        return None
     bg = PEACH if mode == "pause" else GREEN
     try:
-        size = subprocess.run(["tmux", "display-message", "-p", "-c", client,
-                               "#{client_width} #{client_height}"],
-                              capture_output=True, text=True, timeout=10)
-        cw, ch = (int(x) for x in size.stdout.split())
-        w, h = popup_size(cw, ch)
+        q = subprocess.run(["tmux", "display-message", "-p", "-c", client,
+                            "#{client_width} #{client_height} #{client_tty}"],
+                           capture_output=True, text=True, timeout=10)
+        cw, ch, tty = q.stdout.split()
+        w, h, x, y = popup_geometry(int(cw), int(ch), tty, wezterm_panes() or [])
+        log({"mode": "popup", "client": client, "press": press, "geometry": [w, h, x, y]})
         # tmux 3.7c draws almost nothing of a popup's content while a status
         # message is up on that client (measured: two rows, until the message
         # expires), so replace any message with an empty 1 ms one first.
         subprocess.run(["tmux", "display-message", "-c", client, "-d", "1", ""],
                        capture_output=True, timeout=10)
         time.sleep(0.1)
-        r = subprocess.run(["tmux", "display-popup", "-c", client, "-E", "-B",
-                            "-w", str(w), "-h", str(h), "-s", "bg=%s,fg=%s" % (bg, INK),
-                            popup_cmd(mode)], capture_output=True, text=True)
+        return subprocess.Popen(["tmux", "display-popup", "-c", client, "-E", "-B",
+                                 "-w", str(w), "-h", str(h), "-x", str(x), "-y", str(y),
+                                 "-s", "bg=%s,fg=%s" % (bg, INK), popup_cmd(mode, press)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
     except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def popup_still_up(p):
+    """Is that popup on screen now? A failed display-popup exits at once
+    (given 0.3 s to do so); one Mack closed has exited too (0). Only a
+    running one counts: anything else and the toggle shows the line."""
+    if p is None:
         return False
-    return r.returncode == 0
+    try:
+        p.wait(timeout=0.3)
+        return False
+    except subprocess.TimeoutExpired:
+        return True
 
 
-def feedback(client, msg, popup):
-    if popup and client and open_popup(client, popup):
-        return
-    display(client, msg)
+def press_alive(press):
+    """Is the toggle that owns this press id ("<ms>-<pid>") still running?
+    An id it cannot parse counts as alive."""
+    try:
+        return alive(int(str(press).rsplit("-", 1)[1]))
+    except (IndexError, ValueError):
+        return True
 
 
 # ---------------------------------------------------------------- watch
@@ -837,6 +1057,8 @@ FONT = {
 PAUSING, HELD, STOPPED = "pausing…", "held (draft in box)", "stopped ✓"
 RESUMED, WORKING, UNCONFIRMED = "resumed ✓", "working", "sent (no reply)"
 FAILED, GONE, NOT_SENT = "failed", "gone", "not messaged (no agent pane)"
+SENDING = "sending…"                          # delivery in flight (progress.json)
+SENDING_FOOT = "sending… Enter works once every agent has it   ·   Esc  close"
 SETTLED = {STOPPED, FAILED, GONE, NOT_SENT}   # a pause row that needs nothing more
 STILL_AFTER = 180                             # s before "still working: …"
 RESUME_CLOSE = 4                              # s the prefix-P RESUMED popup stays up
@@ -898,36 +1120,56 @@ def fit(s, n):
     return s if len(s) <= n else (s[:max(0, n - 1)] + "…" if n > 0 else "")
 
 
-def build_frame(mode, items, cols, rows, elapsed, close_in=None, note="", spin=0):
+def build_frame(mode, items, cols, rows, elapsed, close_in=None, note="", spin=0, sending=False):
     """-> (background hex, exactly `rows` lines of exactly `cols` chars).
-    mode: pause | resume; items: [(label, location, status)]; close_in: the
-    RESUMED view's countdown (s); note: one extra line (an Enter that failed);
-    spin: the spinner frame for rows still stopping. Pure."""
+    mode: pause | resume | dropped (NOT RESUMED) | notpaused (NOT PAUSED);
+    items: [(label, location, status)]; close_in: a brief view's countdown
+    (s); note: one extra line; spin: the spinner frame for rows still in
+    flight; sending: delivery is still running (rows read SENDING until their
+    result lands). Pure."""
     cols, rows = max(cols, 10), max(rows, 3)
     statuses = [s for _, _, s in items]
-    if mode == "pause":
+    sp = SPINNER[spin % len(SPINNER)]
+    landed = sum(s != SENDING for s in statuses)
+    plural = "" if len(items) == 1 else "s"
+    if mode == "pause" and sending:
+        title, bg, waiting = "PAUSING", PEACH, []
+        sub = "%s sending PAUSE to %d agent%s… %d of %d done · %d:%02d" % (
+            sp, len(items), plural, landed, len(items), elapsed // 60, elapsed % 60)
+        items = [(l, loc, s if s in SETTLED else sp + " " + s) for l, loc, s in items]
+        foot = SENDING_FOOT
+    elif mode == "pause":
         done = all(s in SETTLED for s in statuses)
         title, bg = ("SAFE TO CLOSE", GREEN) if done else ("PAUSING", PEACH)
         waiting = [lab for lab, _, s in items if s not in SETTLED]
         stopped = sum(s == STOPPED for s in statuses)
-        sp = SPINNER[spin % len(SPINNER)]
         sub = ("✓ all %d stopped — safe to close the lid" % len(items) if done and stopped == len(items)
                else "✓ nothing still working — safe to close the lid" if done
                else "%s stopping all agents… %d of %d stopped" % (sp, stopped, len(items)))
         items = [(l, loc, s if s in SETTLED else sp + " " + s) for l, loc, s in items]
         sub += " · %d:%02d" % (elapsed // 60, elapsed % 60)
         foot = PAUSE_FOOT
+    elif mode == "notpaused":   # a pause that reached nobody: nothing is saved
+        title, bg, waiting = "NOT PAUSED", PEACH, []
+        sub = "the PAUSE reached no agent — nothing is paused"
+        foot = "any key to close"
     elif mode == "dropped":   # a resume that reached nobody: never green
         title, bg, waiting = "NOT RESUMED", PEACH, []
         sub = "no paused agent could be reached"
         left = 0 if close_in is None else int(close_in)
         foot = "closes in %ds · any key to close" % max(0, left)
+    elif sending:             # resume, delivery still running
+        title, bg, waiting = "RESUMED", GREEN, []
+        sub = "%s sending RESUME to %d agent%s… %d of %d done" % (sp, len(items), plural, landed, len(items))
+        foot = SENDING_FOOT
     else:
         title, bg, waiting = "RESUMED", GREEN, []
         ok = sum(s in (RESUMED, WORKING, HELD, UNCONFIRMED) for s in statuses)
         sub = "%d of %d agents told to pick up where they left off" % (ok, len(items))
         left = RESUME_CLOSE - int(elapsed) if close_in is None else int(close_in)
         foot = "closes in %ds · any key to close" % max(0, left)
+    if mode != "pause":
+        items = [(l, loc, sp + " " + s if s == SENDING else s) for l, loc, s in items]
     body = banner_lines(title, cols) + ["", fit(sub, cols - 2)]
     body += ([fit(note, cols - 2)] if note else []) + [""]
     # Item rows, left-aligned as one block that is centred as a whole.
@@ -1003,7 +1245,9 @@ def on_key(phase, data):
     function key or focus report and is ignored like any other stray key."""
     if not data:
         return None
-    if phase != "pause":   # resumed / dropped: brief views, any key closes
+    if phase == "sending":   # delivery in flight: Enter would race it
+        return "close" if data == b"\x1b" else None
+    if phase != "pause":     # resumed / dropped / notpaused: any key closes
         return "close"
     if data in (b"\r", b"\n", b"\r\n"):
         return "resume"
@@ -1077,19 +1321,47 @@ def locked_resume(wait=3.0):
         lf.close()
 
 
-def watch(mode, demo=False):
+def progress_items(prog, panes):
+    """progress.json's rows -> [(label, location, status)]: SENDING until a
+    row's result lands, then the mode's own status. Pure."""
+    out = []
+    for t in prog.get("targets") or []:
+        if t.get("result") == "sending":
+            st = SENDING
+        elif prog.get("mode") == "resume":
+            st = resume_status(t, panes.get(t.get("resume_pane")))
+        else:
+            st = pause_status(t, panes.get(t.get("pane_id")))
+        out.append((t.get("label", "?"), t.get("location", ""), st))
+    return out
+
+
+def after_sending(prog):
+    """The view a finished press's popup moves to. Pure.
+      pause:  paused -> "pause" (the live view)   failed -> "notpaused"
+      resume: resumed -> "resumed"   not_resumed / failed -> "dropped" (NOT RESUMED)"""
+    if prog.get("mode") == "resume":
+        return "resumed" if prog.get("outcome") == "resumed" else "dropped"
+    return "pause" if prog.get("outcome") == "paused" else "notpaused"
+
+
+def watch(mode, demo=False, press=None):
     import select
     import shutil
     import signal
     import termios
     import tty
     t0 = time.time()
-    phase = "pause" if mode == "pause" else "resumed"
+    # With a press id the popup opened before delivery: "sending" until that
+    # press's progress.json says done (see after_sending).
+    sending = bool(press) and not demo
+    phase = "sending" if sending else ("pause" if mode == "pause" else "resumed")
     items_now = watch_items(mode, demo, t0)
-    close_at = None if mode == "pause" else t0 + RESUME_CLOSE
-    first = None if (demo or mode != "pause") else load_state()
+    close_at = None if (mode == "pause" or sending) else t0 + RESUME_CLOSE
+    first = None if (demo or mode != "pause" or sending) else load_state()
     base = baseline(first) if first else None   # None: nothing to watch for
-    note = "" if (demo or mode == "pause") else resume_note(last_resume())
+    note = "" if (demo or mode == "pause" or sending) else resume_note(last_resume())
+    panes_seen = {}
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd) if os.isatty(fd) else None
     flag = {"dirty": True}
@@ -1131,6 +1403,32 @@ def watch(mode, demo=False):
             note = dropped_note(last)
         flag["dirty"] = True
 
+    def sent(now, prog=None):
+        """This press's delivery is done (or its record was replaced by a
+        later press, which only happens after ours finished): move on."""
+        nonlocal phase, items_now, items, note, close_at, base
+        prog = prog or read_progress()
+        if not prog or prog.get("press") != press:
+            prog = {"mode": mode, "outcome": "paused" if mode == "pause" else "resumed"}
+            if mode == "pause" and not load_state():
+                prog["outcome"] = "failed"
+        nxt = after_sending(prog)
+        msg = (prog.get("message") or "").lstrip("⏸▶ ")
+        if nxt == "pause":
+            phase = "pause"
+            st = load_state()
+            base = baseline(st) if st else None
+            items_now = watch_items("pause", demo, t0)
+            items = items_now()
+        elif nxt == "resumed":
+            to_resumed(now)
+            close_at = now + RESUME_CLOSE
+        else:   # notpaused (any key) / dropped (closes itself)
+            phase, note = nxt, msg
+            close_at = None if nxt == "notpaused" else now + RESUME_CLOSE
+            items = progress_items(prog, panes_seen) if prog.get("targets") else items
+        flag["dirty"] = True
+
     sys.stdout.write("\x1b[?1049h\x1b[?25l")
     try:
         if saved is not None:
@@ -1138,25 +1436,51 @@ def watch(mode, demo=False):
         items, polled = None, 0.0
         while True:
             now = time.time()
+            if phase == "sending":
+                # progress.json every frame (a small file); tmux, and whether
+                # the toggle is still alive, once a second.
+                dead = False
+                if now - polled >= 1:
+                    polled = now
+                    try:
+                        panes_seen = list_panes()
+                    except Exception:
+                        pass
+                    dead = not press_alive(press)
+                prog = read_progress()
+                if prog and prog.get("press") == press and not prog.get("done"):
+                    if dead and not (read_progress() or {}).get("done"):
+                        # Killed without marking done (finished() covers any
+                        # exception): never spin "sending" forever.
+                        sent(now, dict(prog, done=True, message="the pause key crashed: see %s" % LOG,
+                                       outcome="paused" if mode == "pause" and load_state() else "failed"))
+                    else:
+                        items = progress_items(prog, panes_seen)
+                else:
+                    sent(now)
+                flag["dirty"] = True
             # One tick a second at most: this view sits open across a sleep.
-            if items is None or now - polled >= 1:
+            elif items is None or now - polled >= 1:
                 polled = now
                 if phase == "pause" and base is not None and state_gone(base, load_state()):
                     changed(now, "a resume from another client reached nobody — still paused")
-                else:
+                elif phase in ("pause", "resumed"):
                     items = items_now()
                 flag["dirty"] = True
             if flag["dirty"]:
                 flag["dirty"] = False
                 size = shutil.get_terminal_size((80, 24))
-                paint(*build_frame({"resumed": "resume"}.get(phase, phase), items, size.columns,
+                view = {"resumed": "resume", "sending": mode}.get(phase, phase)
+                paint(*build_frame(view, items or [], size.columns,
                                    size.lines, int(now - t0),
                                    close_in=None if close_at is None else close_at - now + 0.999,
-                                   note=note, spin=int((now - t0) * SPIN_HZ)))
+                                   note=note, spin=int((now - t0) * SPIN_HZ),
+                                   sending=phase == "sending"))
             if close_at is not None and now >= close_at:
                 return
             wait = 1.0 if close_at is None else max(0.05, min(1.0, close_at - now))
-            if phase == "pause" and items and any(s not in SETTLED for _, _, s in items):
+            if phase == "sending" or (phase == "pause" and items
+                                      and any(s not in SETTLED for _, _, s in items)):
                 wait, flag["dirty"] = min(wait, 1.0 / SPIN_HZ), True   # spinner frame
             ready, _, _ = select.select([fd], [], [], wait)
             if not ready:
@@ -1254,7 +1578,9 @@ def main(argv):
         return 0
     if cmd == "watch" and len(argv) > 2 and argv[2] in ("pause", "resume"):
         try:
-            watch(argv[2], demo="--demo" in argv[3:])
+            rest = argv[3:]
+            press = rest[rest.index("--press") + 1] if "--press" in rest[:-1] else None
+            watch(argv[2], demo="--demo" in rest, press=press)
         except Exception as e:   # a crash would just blink the popup shut
             log({"mode": "error", "message": "watch: %s: %s" % (type(e).__name__, e)})
             print("pause key: the %s view failed (%s: %s); the agents were messaged anyway.\n"
@@ -1264,7 +1590,7 @@ def main(argv):
             select.select([sys.stdin], [], [], 30)
         return 0
     sys.stderr.write("usage: agent-pause.py toggle <client_name> | status | dry-run"
-                     " | watch pause|resume [--demo]\n")
+                     " | watch pause|resume [--demo] [--press <id>]\n")
     return 2
 
 
