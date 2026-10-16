@@ -1088,30 +1088,42 @@ cmd_pick_tab() {
   IFS="$US" read -r cur pane_path <<<"$where"
   [[ -d "$pane_path" ]] || pane_path="$HOME"
 
+  # No fork per row: zoxide easily lists hundreds of folders, and a
+  # $(norm_dir) plus a sed for each made the popup take over a second to
+  # open. The space rows are built in bash, the folder rows by one awk, and
+  # both stream into fzf, so it opens at once.
   local -a s_id=() s_label=() s_name=() s_path=()
-  local idx id name h key path w=4 i
+  local idx id name h key path p w=4 i
   while IFS="$US" read -r idx id name h key path; do
     [[ -n "$id" ]] || continue
-    s_id+=("$id") s_label+=("${key:-$idx}") s_name+=("$name") s_path+=("$(norm_dir "$path")")
+    p="$path"; while [[ "$p" == */ && "$p" != / ]]; do p="${p%/}"; done   # norm_dir, inline
+    s_id+=("$id") s_label+=("${key:-$idx}") s_name+=("$name") s_path+=("${p:-/}")
     ((${#name} > w)) && w=${#name}
   done < <(spaces_in_order)
-  local list="" short here
+  local list="" short here row taken=""
   for i in "${!s_id[@]}"; do
-    short="$(printf '%s\n' "${s_path[i]}" | tilde_paths)"
+    p="${s_path[i]}"
+    if [[ "$p" == "$HOME" ]]; then short="~"
+    elif [[ "$p" == "$HOME"/* ]]; then short="~${p#"$HOME"}"
+    else short="$p"; fi
     here=""; [[ "${s_id[i]}" == "$cur" ]] && here="  (here)"
-    list+="$(printf 's:%s\t%-3s %-*s  %s%s' "${s_id[i]#\$}" "${s_label[i]}" "$w" "${s_name[i]}" "$short" "$here")"$'\n'
+    printf -v row 's:%s\t%-3s %-*s  %s%s\n' "${s_id[i]#\$}" "${s_label[i]}" "$w" "${s_name[i]}" "$short" "$here"
+    list+="$row" taken+="$p$US"
   done
-  local d taken nd
-  while IFS= read -r d; do
-    taken=0 nd="$(norm_dir "$d")"
-    for i in "${!s_path[@]}"; do [[ "${s_path[i]}" == "$nd" ]] && { taken=1; break; }; done
-    ((taken)) && continue
-    list+="d:$d"$'\t'"$(printf '%s\n' "$d" | tilde_paths)"$'\n'
-  done < <(dir_candidates "$pane_path")
+  # Folder rows: drop the ones that already are a space's folder (both sides
+  # normalized as norm_dir does), ~-shorten the label as tilde_paths does.
+  # The taken list is $US-joined: macOS awk refuses a newline in a -v value.
+  local -a folder_rows=(awk -v home="$HOME" -v taken="$taken" '
+    BEGIN { n = split(taken, t, "\037"); for (i = 1; i <= n; i++) if (t[i] != "") seen[t[i]] = 1 }
+    { p = $0; while (p ~ /.\/$/) sub(/\/$/, "", p); if (p in seen) next
+      l = p; if (l == home) l = "~"; else if (index(l, home "/") == 1) l = "~" substr(l, length(home) + 1)
+      print "d:" $0 "\t" l }')
 
   local what=shell; [[ "$kind" == agent ]] && what=claude
   local out status query selection target
-  out="$(printf '%s' "$list" | fzf \
+  # pipefail off in here: a pick made before every row has streamed in
+  # leaves the feeder dying of SIGPIPE, and that 141 must not read as a cancel.
+  out="$(set +o pipefail; { printf '%s' "$list"; dir_candidates "$pane_path" | "${folder_rows[@]}"; } | fzf \
     --reverse --info=inline --print-query --tiebreak=index \
     --delimiter=$'\t' --with-nth=2 \
     --prompt="new $what in: " \
