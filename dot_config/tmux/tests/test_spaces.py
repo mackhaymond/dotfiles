@@ -35,6 +35,7 @@ HERE = Path(__file__).resolve().parents[1]
 CONF = HERE / "tmux.conf.tmpl"
 SPACES = HERE / "spaces.conf"
 SCRIPT = HERE / "scripts" / "executable_space.sh"
+DASH = HERE / "scripts" / "executable_space-dash.sh"
 ROSTER = HERE / "scripts" / "executable_agent-roster.py"
 WEZTERM = HERE.parent / "wezterm" / "wezterm.lua.tmpl"
 TMUX = shutil.which("tmux")
@@ -72,6 +73,8 @@ def on_branch():
 OFF_META = [l for l in else_branch().splitlines()
             if re.match(r'bind -N "Select window \d" M-\d |bind -n User\d+ ', l)]
 # WezTerm's digit chords: row (CTRL space, ALT shell, CMD agent) -> sequence.
+# This space's chip, as text: █⌃N name, then the powerline edge.
+CHIP_RE = "█⌃(\\d) ([\\w-]+)\ue0b0"
 CHORD = {(row, n): f"\x1b[91{r}{n}~" for r, row in ((1, "CTRL"), (2, "ALT"), (3, "CMD")) for n in range(1, 10)}
 
 
@@ -182,6 +185,8 @@ class Server(unittest.TestCase):
         self.t("move-window", "-s", "main:0", "-t", "main:1")
         self.t("set", "-g", "@space_hidden_sessions", HIDDEN)
         self.t("set", "-g", "@space_sh", f"bash {SCRIPT}")
+        self.t("set", "-g", "@space_dash", f"bash {DASH}")
+        self.t("set", "-g", "@space_agent_ui", os.path.join(self.tmp, "no-agent-ui"))   # never the real one
         self.t("set", "-g", "@space_registry", self.registry)
         self.t("set", "-g", "@space_closer", "none")
         self.t("set", "-g", "@spaces", self.flag)
@@ -209,6 +214,10 @@ class Server(unittest.TestCase):
 
     def homes(self, session):
         return self.t("list-windows", "-t", session, "-F", "#{?#{@space_home},#{window_id},}").split()
+
+    def dash_panes(self, session):
+        """The dashboard panes of `session` (its home window's top pane)."""
+        return self.t("list-panes", "-s", "-t", session, "-f", "#{@space_dash_pane}", "-F", "#{pane_id}").split()
 
     def wait_home(self, session):
         """Until `session` has its home (the sync runs in the background)."""
@@ -377,6 +386,23 @@ class FlagOff(Server):
         self.new_session("agents", "/")
         self.wait(lambda: self.t("show", "-t", "agents", "-v", "@space_hidden"), "1")
 
+    def test_off_never_runs_the_sidebar_repair(self):
+        log = os.path.join(self.tmp, "agent-ui.log")
+        f = os.path.join(self.tmp, "agent-ui")
+        Path(f).write_text(f'#!/bin/sh\necho "$*" >> {log}\n')
+        os.chmod(f, 0o755)
+        self.t("set", "-g", "@space_agent_ui", f)
+        self.source()
+        self.assertNotIn("run-shell", self.t("show-hooks", "-g", "client-attached[21]", check=False))
+        self.assertFalse(os.path.exists(log))
+
+    def test_off_has_no_jump_key_and_keeps_the_status_line(self):
+        self.assertEqual(self.t("list-keys", "-T", "root", "M-f", check=False), "")
+        self.assertEqual(self.t("list-keys", "-T", "jump", check=False), "")
+        self.t("set", "-g", "@sidebar_open", "1")
+        self.source()
+        self.assertEqual(self.t("show", "-gv", "status"), "on")
+
     def test_no_home_windows_or_registry_when_off(self):
         self.new_session("proj", "/usr")
         self.wait(lambda: self.t("show", "-t", "proj", "-qv", "@space_index"), "2")
@@ -453,8 +479,10 @@ class Spaces(Server):
             rows = self.t("list-windows", "-t", s, "-F", "#{@space_home}|#{window_name}").splitlines()
             self.assertEqual(rows[0], "1|home", s)
             self.assertEqual([r for r in rows if r.startswith("1|")], [rows[0]], s)
-            # remain-on-exit is the home PANE's, not the window's.
-            self.assertEqual(self.t("list-panes", "-t", f"{s}:^", "-F", "#{@space_home_pane}|#{remain-on-exit}"), "1|on")
+            # remain-on-exit is the home PANE's, not the window's; above it,
+            # the dashboard pane.
+            self.wait(lambda: self.t("list-panes", "-t", f"{s}:^", "-F", "#{@space_home_pane}|#{@space_dash_pane}|#{remain-on-exit}").split(),
+                      ["|1|on", "1||on"])
             self.assertEqual(self.t("show", "-wqv", "-t", f"{s}:^", "remain-on-exit"), "")
         for s in ("agents", "scratch"):
             self.assertEqual(self.homes(s), [], s)
@@ -492,15 +520,16 @@ class Spaces(Server):
         # Its shell exiting closes it (no remain-on-exit, no respawn); the
         # home pane stays, untouched.
         self.t("send-keys", "-t", split, "exit", "Enter")
-        self.wait(lambda: self.t("list-panes", "-t", self.M1, "-F", "#{pane_id}"), home_pane)
+        shells = lambda f: self.t("list-panes", "-t", self.M1, "-f", "#{!:#{@space_dash_pane}}", "-F", f)
+        self.wait(lambda: shells("#{pane_id}"), home_pane)
         time.sleep(0.5)
-        self.assertEqual(self.t("list-panes", "-t", self.M1, "-F", "#{pane_id}|#{pane_dead}"), f"{home_pane}|0")
+        self.assertEqual(shells("#{pane_id}|#{pane_dead}"), f"{home_pane}|0")
 
     def test_x_and_cmd_shift_w_refuse_only_on_the_home_pane(self):
         keys = self.t("list-keys", "-T", "prefix").splitlines()
         for k in ("x", "C-l"):
             line = next(l for l in keys if re.match(rf"bind-key +-T prefix +{k} ", l))
-            self.assertTrue(line.split(None, 4)[4].startswith('if-shell -F "#{@space_home_pane}"'), line)
+            self.assertTrue(line.split(None, 4)[4].startswith('if-shell -F "#{||:#{@space_home_pane},#{@space_dash_pane}}"'), line)
 
     def test_home_moves_back_in_front_when_a_window_lands_before_it(self):
         w = self.t("new-window", "-d", "-b", "-t", self.M1, "-P", "-F", "#{window_id}")   # as closed-tabs reopens
@@ -542,7 +571,8 @@ class Spaces(Server):
         rec = os.path.join(self.tmp, "rec.sh")
         Path(rec).write_text(f'echo "$1" >> {log}\ntmux kill-pane -t "$1"\n')
         self.t("set", "-g", "@space_closer", f"bash {rec}")
-        panes = sorted(self.t("list-panes", "-s", "-t", "proj", "-F", "#{pane_id}").split())
+        self.wait(lambda: len(self.dash_panes("proj")), 1)
+        panes = sorted(self.t("list-panes", "-s", "-t", "proj", "-f", "#{!:#{@space_dash_pane}}", "-F", "#{pane_id}").split())   # no dashboard
         self.wait(lambda: [r[0] for r in self.registered()], ["main", "proj", "zed"])
         self.t("switch-client", "-c", self.client, "-t", "proj")
         self.wait(lambda: self.on("#{session_name}"), "proj")
@@ -586,12 +616,327 @@ class Spaces(Server):
         self.assertEqual(self.t("display", "-t", "zed", "-p", "#{session_path}"), self.home_dir)  # registry's folder
         self.wait(self.indexes, "gone=2 main=1 proj=4 zed=3")
         self.t("switch-client", "-c", self.client, "-t", "proj")
-        self.wait(lambda: re.findall(r"█⌃(\d)█ (\w+)█", self.status()[1]), [("4", "proj")])
+        self.wait(lambda: re.findall(CHIP_RE, self.status()[1]), [("4", "proj")])
 
     def test_renamed_space_keeps_its_place_in_the_registry(self):
         self.wait(lambda: [r[0] for r in self.registered()], ["main", "proj", "zed"])
         self.t("rename-session", "-t", "proj", "pro2")
         self.wait(lambda: [r[0] for r in self.registered()], ["main", "pro2", "zed"])
+        self.assertEqual(self.registered()[1][2], "#cba6f7")                  # and its colour
+        self.assertEqual(self.t("show", "-t", "pro2", "-qv", "@space_color"), "#cba6f7")
+
+    # -- colours --------------------------------------------------------------
+    def colors(self):
+        rows = self.t("list-sessions", "-F", "#{session_name}=#{@space_color}")
+        return dict(r.split("=", 1) for r in rows.split())
+
+    def test_each_space_gets_a_stable_colour_kept_in_the_registry(self):
+        # main is lavender; the others the least-used palette colour, in order.
+        self.wait(self.registered, [["main", self.env["HOME"], "#b4befe"], ["proj", self.proj, "#cba6f7"],
+                                    ["zed", "/usr", "#94e2d5"]])
+        self.wait(self.colors, {"main": "#b4befe", "proj": "#cba6f7", "zed": "#94e2d5",
+                                "agents": "", "scratch": ""})   # hidden: none
+        self.new_session("n4", "/usr")
+        self.wait(lambda: self.colors().get("n4"), "#f5c2e7")
+        # A freed colour is the next one handed out.
+        self.assertEqual(self.script("close", self.sid("proj"), self.client).returncode, 0)
+        self.wait(lambda: [r[0] for r in self.registered()], ["main", "zed", "n4"])
+        self.new_session("n5", "/usr")
+        self.wait(lambda: self.colors().get("n5"), "#cba6f7")
+        self.assertEqual(self.colors()["zed"], "#94e2d5")                    # nobody else moved
+
+    def test_colours_survive_a_restart_and_old_lines_get_one(self):
+        self.wait(lambda: [r[0] for r in self.registered()], ["main", "proj", "zed"])
+        gone = os.path.realpath(os.path.join(self.tmp, "gone"))
+        os.mkdir(gone)
+        # gone: a colour from the registry (a restart); zed: a line from before
+        # the colour column; main: a wrong colour (main's is fixed).
+        Path(self.registry).write_text(
+            f"main\t{self.env['HOME']}\t#f5e0dc\nproj\t{self.proj}\t#cba6f7\ngone\t{gone}\t#74c7ec\nzed\t/usr\n")
+        self.assertEqual(self.script("sync", "load").returncode, 0)
+        self.wait(lambda: self.colors().get("gone"), "#74c7ec")
+        self.wait(lambda: [r[2] for r in self.registered()], ["#b4befe", "#cba6f7", "#74c7ec", "#94e2d5"])
+        self.wait(self.colors, {"main": "#b4befe", "proj": "#cba6f7", "gone": "#74c7ec", "zed": "#94e2d5",
+                                "agents": "", "scratch": ""})
+
+    # -- the home dashboard ---------------------------------------------------
+    def dash(self, session):
+        self.wait(lambda: len(self.dash_panes(session)), 1)
+        return self.dash_panes(session)[0]
+
+    def dash_text(self, pane):
+        return self.t("capture-pane", "-p", "-t", pane)
+
+    def test_home_is_a_dashboard_above_the_home_shell(self):
+        for s in ("main", "proj", "zed"):
+            d = self.dash(s)
+            home = self.homes(s)[0]
+            self.wait(lambda: self.t("display", "-t", d, "-p", "#{pane_height}"), "9")
+            rows = self.t("list-panes", "-t", home, "-F",
+                          "#{pane_id}|#{@space_dash_pane}|#{@space_home_pane}|#{pane_active}|#{pane_top}|#{pane_height}|#{pane_title}").splitlines()
+            self.assertEqual(len(rows), 2, s)
+            self.assertEqual(rows[0].split("|")[:7], [d, "1", "", "0", "0", "9", "space-dash"], s)  # top, 9 rows
+            # (kept at 9 when the window is resized: the dashboard resizes itself)
+            self.assertEqual(rows[1].split("|")[1:4], ["", "1", "1"], s)    # the shell: focused
+            self.assertIn("space-dash", self.t("display", "-t", d, "-p", "#{pane_start_command}"))
+            self.assertEqual(self.t("show", "-p", "-t", d, "-v", "remain-on-exit"), "on")
+        # Not a shell, not a tab: shells and the close prompt count windows.
+        self.assertEqual(self.t("display", "-t", "main:", "-p", "#{E:@space_close_prompt}"),
+                         "close space main: 3 agents, 2 shells? (y/n)")
+        self.assertEqual([int(i) for i in re.findall(r"█(\d+)█", self.status()[1])], [1, 2])
+        # Its content: the name (large), key, folder, git, agents, counts, hint.
+        d = self.dash("main")
+        self.t("set", "-w", "-t", self.M4, "@agent_summary", "tmux/fix the bar")
+        self.t("set", "-w", "-t", self.M4, "@agent_key", "q")
+        self.new_session("stash", "/")
+        self.t("move-window", "-s", self.M3, "-t", "stash:")          # parked from main
+        self.t("set", "-w", "-t", self.M3, "@stash_origin", "main")
+        self.t("respawn-pane", "-k", "-t", d, f"bash {DASH}")          # a fresh draw (no notice needed)
+        self.wait(lambda: "◉ ⌘2 q  tmux/fix the bar" in self.dash_text(d), True, timeout=6)
+        text = self.dash_text(d)
+        self.assertIn("█▄█", text)                                      # "main", large: half blocks
+        self.assertIn("⌃1  ~", text)
+        self.assertIn("3 agents · 1 shell · 1 parked", text)
+        self.assertIn("◐ ⌘1", text)                                    # running
+        self.assertIn("○ ⌘3", text)                                    # idle
+        self.assertIn("⌥F jump", text)
+
+    def test_dashboard_never_takes_the_focus(self):
+        d = self.dash("main")
+        shell = self.t("list-panes", "-t", self.M1, "-f", "#{@space_home_pane}", "-F", "#{pane_id}")
+        self.t("select-pane", "-t", d)
+        self.wait(lambda: self.t("display", "-t", self.M1, "-p", "#{pane_id}"), shell)
+        self.key("C-b", "Up")                                           # select-pane -U from the shell
+        time.sleep(0.3)
+        self.assertEqual(self.t("display", "-t", self.M1, "-p", "#{pane_id}"), shell)
+        # A split closing does not leave it focused either.
+        split = self.t("split-window", "-t", shell, "-P", "-F", "#{pane_id}")
+        self.t("kill-pane", "-t", split)
+        self.wait(lambda: self.t("display", "-t", self.M1, "-p", "#{pane_id}"), shell)
+        # x / C-l refuse it like the home shell.
+        self.key("C-b", "x")
+        time.sleep(0.2)
+        self.key("y")
+        time.sleep(0.4)
+        self.assertEqual(self.dash_panes("main"), [d])
+
+    def test_dashboard_respawns_and_sync_never_adds_a_second(self):
+        d = self.dash("proj")
+        self.t("respawn-pane", "-k", "-t", d, "exit 0")                 # its process ends
+        self.wait(lambda: "space-dash" in self.t("display", "-t", d, "-p", "#{pane_start_command}"), True)
+        self.wait(lambda: self.t("display", "-t", d, "-p", "#{pane_dead}"), "0")
+        for _ in range(3):
+            self.assertEqual(self.script("sync").returncode, 0)
+        self.assertEqual(self.dash_panes("proj"), [d])
+        self.assertEqual(len(self.t("list-panes", "-t", self.P1).splitlines()), 2)
+
+    def test_dashboard_whose_pane_is_gone_exits(self):
+        # Its pane (or server) gone without the SIGHUP reaching it: it must
+        # not linger as an orphan.
+        env = dict(self.script_env(), TMUX_PANE="%999")
+        r = subprocess.run(["bash", str(DASH)], env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+        self.assertEqual(r.returncode, 0)
+
+    def test_a_failing_command_never_puts_a_dashboard_in_an_agent_window(self):
+        # A tmux command list stops at its first failing command (a pane that
+        # vanished between sync's read and its write). A tmux stand-in makes
+        # EVERY multi-command call fail that way, first thing.
+        wrap = os.path.join(self.tmp, "tmux-failing")
+        Path(wrap).write_text("#!/bin/sh\n"
+                              'for a in "$@"; do [ "$a" = ";" ] && exec ' + TMUX + ' kill-pane -t %99999 \\; "$@"; done\n'
+                              "exec " + TMUX + ' "$@"\n')
+        os.chmod(wrap, 0o755)
+        env = dict(self.script_env(), SPACE_TMUX_BIN=wrap)
+        subprocess.run([wrap, "set", "-g", "@probe_a", "1", ";", "set", "-g", "@probe_b", "1"], env=env, capture_output=True)
+        self.assertEqual(self.t("show", "-gqv", "@probe_b"), "")         # the stand-in does fail them
+        # A space whose only window is an agent, its home gone: sync must
+        # make a new home (lowest) and put the dashboard THERE.
+        self.new_session("ag", "/usr")
+        home = self.wait_home("ag")
+        self.dash("ag")
+        self.t("set", "-g", "@space_sh", "true")                         # no hook syncs meanwhile
+        self.wait(lambda: subprocess.run(["pgrep", "-f", f"{SCRIPT} sync"], capture_output=True).returncode, 1,
+                  timeout=10)                                            # nor any still in flight
+        A = self.new_window("ag", "running")
+        self.t("kill-window", "-t", home)
+        self.assertEqual(self.t("display", "-t", "ag:^", "-p", "#{window_id}"), A)   # the agent is lowest
+        r = subprocess.run(["bash", str(SCRIPT), "sync"], env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.t("set", "-g", "@space_sh", f"bash {SCRIPT}")
+        self.assertEqual(self.t("list-panes", "-t", A, "-F", "x#{@space_dash_pane}").split(), ["x"])   # one pane, no dashboard
+        new = self.homes("ag")
+        self.assertEqual(len(new), 1)
+        self.assertEqual(self.t("display", "-t", "ag:^", "-p", "#{window_id}"), new[0])    # the home made anyway
+        self.assertEqual(len(self.dash_panes("ag")), 1)
+        # Wherever a dashboard is, it is in a home.
+        self.assertEqual(set(self.t("list-panes", "-a", "-f", "#{@space_dash_pane}", "-F", "#{@space_home}").split()), {"1"})
+
+    def test_sync_adds_the_dashboard_to_an_old_home_once(self):
+        # A home from before the dashboard: one pane.
+        d = self.dash("zed")
+        self.t("kill-pane", "-t", d)
+        home = self.homes("zed")[0]
+        # (a sync still running from setUp's window hooks may already be adding
+        # it back: that is fine, the point is that it never adds two)
+        runs =[subprocess.Popen(["bash", str(SCRIPT), "sync"], env=self.script_env()) for _ in range(3)]
+        for r in runs:
+            r.wait(timeout=20)                                          # three at once: the lock
+        self.wait(lambda: len(self.dash_panes("zed")), 1)
+        self.assertEqual(len(self.t("list-panes", "-t", home).splitlines()), 2)
+        self.assertEqual(self.t("list-panes", "-t", home, "-F", "#{pane_top}:#{@space_dash_pane}|#{@space_home_pane}").split(),
+                         ["0:1|", "10:|1"])                             # dashboard on top, shell below
+        self.assertEqual(self.t("display", "-t", home, "-p", "#{@space_home_pane}"), "1")   # focus on the shell
+
+    def test_a_restored_home_window_gets_its_dashboard_back_not_a_second_shell(self):
+        # What resurrect brings back: a window NAMED home, its old dashboard a
+        # plain shell that kept only its title, the shell below; no options.
+        self.new_session("rest", "/usr")
+        self.wait_home("rest")
+        home = self.homes("rest")[0]
+        old = self.dash("rest")
+        self.t("set", "-wu", "-t", home, "@space_home")
+        self.t("set", "-pu", "-t", old, "@space_dash_pane")
+        self.t("respawn-pane", "-k", "-t", old)                         # a shell now, title kept
+        self.t("select-pane", "-t", old, "-T", "space-dash")
+        shell = self.t("list-panes", "-t", home, "-f", "#{@space_home_pane}", "-F", "#{pane_id}")
+        self.t("set", "-pu", "-t", shell, "@space_home_pane")
+        self.assertEqual(self.script("sync").returncode, 0)
+        self.wait(lambda: self.dash_panes("rest"), [old])
+        self.assertIn("space-dash", self.t("display", "-t", old, "-p", "#{pane_start_command}"))
+        self.assertEqual(self.t("list-panes", "-t", home, "-f", "#{@space_home_pane}", "-F", "#{pane_id}"), shell)
+        self.assertEqual(len(self.t("list-panes", "-t", home).splitlines()), 2)
+
+    # -- the sidebar's status line -------------------------------------------
+    def test_reload_keeps_the_status_line_off_while_a_sidebar_is_open(self):
+        f = os.path.join(self.tmp, "agent-ui-alive")                   # its repair finds them alive
+        Path(f).write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(f, 0o755)
+        self.t("set", "-g", "@space_agent_ui", f)
+        self.t("set", "-g", "@sidebar_open", "2")
+        self.source()
+        self.assertEqual(self.t("show", "-gv", "status"), "off")
+        self.t("set", "-g", "@sidebar_open", "0")
+        self.source()
+        self.assertEqual(self.t("show", "-gv", "status"), "on")
+        self.t("set", "-g", "@sidebar_open", "1")
+        self.t("set", "-g", "@spaces", "off")
+        self.source()
+        self.assertEqual(self.t("show", "-gv", "status"), "on")          # off: always on
+
+    def fake_agent_ui(self):
+        """A stand-in agent-ui: logs its arguments, and `sidebar --repair`
+        does what the real one does with no sidebar alive (count 0, line on)."""
+        log = os.path.join(self.tmp, "agent-ui.log")
+        f = os.path.join(self.tmp, "agent-ui")
+        Path(f).write_text(f'#!/bin/sh\necho "$*" >> {log}\n'
+                           'tmux set -g @sidebar_open 0 \\; set -g status on\necho 0\n')
+        os.chmod(f, 0o755)
+        self.t("set", "-g", "@space_agent_ui", f)
+        return lambda: Path(log).read_text().splitlines() if os.path.exists(log) else []
+
+    def test_a_stale_sidebar_count_is_repaired_before_the_gate(self):
+        calls = self.fake_agent_ui()
+        self.t("set", "-g", "@sidebar_open", "2")      # sidebars that died by SIGKILL
+        self.t("set", "-g", "status", "off")
+        self.source()
+        self.assertEqual(calls(), ["sidebar --repair"])
+        self.assertEqual(self.t("show", "-gv", "@sidebar_open"), "0")
+        self.assertEqual(self.t("show", "-gv", "status"), "on")
+
+    def test_no_agent_ui_binary_means_no_sidebar(self):
+        self.t("set", "-g", "@space_agent_ui", os.path.join(self.tmp, "missing"))
+        self.t("set", "-g", "@sidebar_open", "2")
+        self.source()
+        self.assertEqual(self.t("show", "-gqv", "@sidebar_open"), "")
+        self.assertEqual(self.t("show", "-gv", "status"), "on")
+
+    def test_a_client_attaching_repairs_the_sidebar_count(self):
+        calls = self.fake_agent_ui()
+        self.source()
+        self.assertEqual(calls(), ["sidebar --repair"])                   # the load
+        self.t("set", "-g", "@sidebar_open", "1")
+        os.kill(self.child, signal.SIGTERM)
+        os.waitpid(self.child, 0)
+        self.child = None
+        self.attach()
+        self.wait(calls, ["sidebar --repair"] * 2)                        # client-attached[21]
+        self.wait(lambda: self.t("show", "-gv", "@sidebar_open"), "0")
+
+    # -- Option-F: jump to an agent by its letter -------------------------------
+    def table(self):
+        return self.on("#{client_key_table}")
+
+    def test_option_f_jumps_to_the_agent_with_that_letter_in_any_space(self):
+        self.t("set", "-w", "-t", self.P2, "@agent_key", "p")
+        self.t("set", "-w", "-t", self.M5, "@agent_key", "m")
+        hid = self.t("list-windows", "-t", "agents", "-F", "#{window_id}").split()[0]
+        self.t("set", "-w", "-t", hid, "@agent_key", "h")               # in a hidden session: never
+        self.key("M-f")
+        self.wait(self.table, "jump")
+        self.key("p")
+        self.wait(self.on, f"proj:{self.P2}")                            # across spaces
+        self.assertEqual(self.table(), "root")
+        self.key("M-f", "m")
+        self.wait(self.on, f"main:{self.M5}")
+        here = self.on()
+        for k in ("h", "z"):                                             # hidden, unknown: stays
+            self.key("M-f", k)
+            time.sleep(0.3)
+            self.assertEqual(self.on(), here)
+            self.assertEqual(self.table(), "root")
+
+    def test_option_f_escape_or_another_key_cancels_and_is_swallowed(self):
+        w = self.new_window("main", path=self.env["HOME"])
+        self.t("respawn-pane", "-k", "-t", w, "cat -v")
+        self.t("select-window", "-t", w)
+        self.wait(lambda: self.on("#{window_id}"), w)
+        self.t("set", "-w", "-t", self.M5, "@agent_key", "m")
+        self.key("M-f")
+        self.wait(self.table, "jump")
+        self.key("Escape")
+        self.wait(self.table, "root")
+        self.key("M-f", "5")                                             # not a letter: cancels
+        self.wait(self.table, "root")
+        self.key("M-f", "M")                                             # uppercase: cancels
+        self.wait(self.table, "root")
+        self.key("m")                                                    # jump mode is over: typed
+        self.wait(lambda: "m" in self.t("capture-pane", "-p", "-t", w), True)
+        text = self.t("capture-pane", "-p", "-t", w)
+        self.assertNotIn("5", text)
+        self.assertNotIn("M", text)
+        self.assertEqual(self.on("#{window_id}"), w)
+
+    # -- the prefix: a root binding, so pressing it can post a notice ---------
+    def test_prefix_as_a_root_binding_keeps_every_prefix_use(self):
+        lines = [conf_line("set -g prefix "), conf_line("bind -n C-s ")]
+        self.assertEqual(lines[0], "set -g prefix None")
+        self.assertIn("switch-client -T prefix", lines[1])
+        self.assertIn('notifyutil -p com.mackhaymond.tmux.focus', lines[1])
+        f = os.path.join(self.tmp, "prefix.conf")
+        Path(f).write_text("\n".join(lines + [
+            "bind C-s set -g @saved 1",                                  # stands in for the resurrect save
+            "bind -r Up set -gF @ups '#{@ups}x'"]) + "\n")
+        self.t("source-file", f)
+        C_S = b"\x13"
+        os.write(self.fd, C_S)
+        self.wait(self.table, "prefix")
+        self.assertEqual(self.on("#{client_prefix}"), "1")              # the chip still sees it
+        os.write(self.fd, b"3")                                          # prefix 3: space 3
+        self.wait(lambda: self.on("#{session_name}"), "zed")
+        os.write(self.fd, C_S); time.sleep(0.15); os.write(self.fd, C_S)  # C-s C-s
+        self.wait(lambda: self.t("show", "-gqv", "@saved"), "1")
+        os.write(self.fd, C_S); time.sleep(0.15)
+        os.write(self.fd, b"\x1b[A"); time.sleep(0.15); os.write(self.fd, b"\x1b[A")   # repeat
+        self.wait(lambda: self.t("show", "-gqv", "@ups"), "xx")
+        self.assertEqual(self.table(), "prefix")
+        time.sleep(0.7)                                                  # past repeat-time
+        self.wait(self.table, "root")
+        self.t("copy-mode", "-t", "zed:")                                # from copy mode too
+        self.wait(lambda: self.on("#{pane_in_mode}"), "1")
+        os.write(self.fd, C_S)
+        self.wait(self.table, "prefix")
+        os.write(self.fd, b"1")
+        self.wait(lambda: self.on("#{session_name}"), "main")
 
     # -- status ------------------------------------------------------------
     def status(self):
@@ -605,15 +950,19 @@ class Spaces(Server):
         return raw[raw.index("#[range=session|"):].split("#[norange default]")[0]
 
     def alerts(self):
-        """[(N, colour)] of the other-space alert chips, left to right."""
-        return re.findall(r"#\[fg=(#\w+)\]⌃(\d+)●", self.status()[0])
+        """[(state colour, N)] of the other-space alert chips, left to right."""
+        return [(dot, n) for _, n, dot in self.alert_chips()]
+
+    def alert_chips(self):
+        """[(space colour, N, state colour)]: ⌃N in its space's colour, ● in the state's."""
+        return re.findall(r"#\[fg=(#\w+)\]⌃(\d+)#\[fg=(#\w+)\]●", self.status()[0])
 
     def sid(self, name):
         return self.t("display", "-t", name, "-p", "#{session_id}")
 
     def test_one_line_this_space_alerts_shells_status_right(self):
         raw, text = self.status()
-        self.assertEqual(re.findall(r"█⌃(\d)█ (\w+)█", text), [("1", "main")])   # this space only
+        self.assertEqual(re.findall(CHIP_RE, text), [("1", "main")])            # this space only
         self.assertIn(f"range=session|{self.sid('main')}]", raw)
         for other in ("zed", "agents", "scratch", "stash"):                     # no tab, no alert
             self.assertNotIn(other, text)
@@ -632,25 +981,41 @@ class Spaces(Server):
         self.assertLess(text.index("⌃1"), text.index("⌃2●"))
         self.assertLess(text.index("⌃2●"), text.index("█1█ 󰋜"))
 
-    def test_this_space_tab_tints(self):
-        self.assertIn("bg=#f9e2af", self.here())                 # main: needs-input beats running
+    def state(self):
+        """The raw tail after this space's chip: its rollup ● and glyph."""
+        raw, _ = self.status()
+        return raw[raw.index("#[range=session|"):].split("#[norange default]")[1].split("#[range=")[0]
+
+    def test_this_space_chip_is_its_colour_and_the_rollup_follows_it(self):
+        # A solid chip in the space's colour, bold crust text, a powerline edge.
+        self.assertIn("#[fg=#b4befe,bg=default]█#[fg=#11111b,bg=#b4befe,bold]⌃1 main#[fg=#b4befe,bg=default,nobold]",
+                      self.here())                                # main: lavender
+        self.assertIn("#[fg=#f9e2af]●", self.state())             # needs-input beats running
         self.t("set", "-w", "-t", self.M4, "@agent_state", "idle")
-        self.assertIn("]#[fg=#fab387,bg=default]█", self.here())  # quiet: peach chip, stock body
-        self.assertIn("bg=#1e1e2e", self.here())
+        self.assertNotIn("●", self.state())                       # quiet: no dot
         self.t("switch-client", "-c", self.client, "-t", "proj")
-        self.wait(lambda: "⌃2█" in self.status()[1], True)
-        self.assertIn("bg=#a6e3a1", self.here())                 # done
+        self.wait(lambda: "⌃2 proj" in self.status()[1], True)
+        self.assertIn("bg=#cba6f7,bold]⌃2 proj", self.here())     # proj: the first palette colour
+        self.assertIn("#[fg=#a6e3a1]●", self.state())             # done
         self.t("set", "-w", "-t", self.P1, "@agent_state", "failed")
-        self.assertIn("bg=#f38ba8", self.here())                 # failed beats done
+        self.assertIn("#[fg=#f38ba8]●", self.state())             # failed beats done
         self.t("set", "-w", "-t", self.P1, "@agent_workflow", "1")
-        self.assertIn("󰒓", self.here())
+        self.assertIn("󰒓", self.state())
+        # Set off from the shells: edge, state, a two-cell gap.
+        self.assertTrue(self.status()[1].startswith("█⌃2 proj ● 󰒓   [+]"), self.status()[1])   # P1 is an agent now
 
     def test_prefix_turns_the_chip_red(self):
         self.t("set", "-w", "-t", self.M4, "@agent_state", "idle")
         self.key("C-b")
-        self.wait(lambda: "#[fg=#f38ba8,bg=default]█#[fg=#11111b,bg=#f38ba8]⌃1" in self.here(), True)
+        self.wait(lambda: "#[fg=#f38ba8,bg=default]█#[fg=#11111b,bg=#f38ba8,bold]⌃1 main" in self.here(), True)
         self.key("Escape")
-        self.wait(lambda: "#[fg=#fab387,bg=default]█" in self.here(), True)
+        self.wait(lambda: "#[fg=#b4befe,bg=default]█#[fg=#11111b,bg=#b4befe,bold]⌃1 main" in self.here(), True)
+
+    def test_alert_number_in_its_space_colour_dot_in_the_state_colour(self):
+        Z = self.new_window("zed", "needs-input")
+        self.assertEqual(self.alert_chips(), [("#cba6f7", "2", "#a6e3a1"), ("#94e2d5", "3", "#f9e2af")])
+        self.t("set", "-w", "-t", Z, "@agent_state", "failed")
+        self.assertEqual(self.alert_chips()[1], ("#94e2d5", "3", "#f38ba8"))
 
     def test_hidden_session_name_turns_red_on_prefix(self):
         self.t("switch-client", "-c", self.client, "-t", "agents")
@@ -669,7 +1034,7 @@ class Spaces(Server):
         self.new_window("s10", "needs-input")
         self.wait(lambda: "s10●" in self.status()[1], True)              # alert: the name, no key
         self.t("switch-client", "-c", self.client, "-t", "s10")
-        self.wait(lambda: self.status()[1].startswith("██ s10█"), True)   # bare chip, no ⌃10
+        self.wait(lambda: self.status()[1].startswith("█s10\ue0b0"), True)   # the name alone, no ⌃10
 
     def test_alerts_only_for_other_spaces_that_need_you(self):
         self.assertEqual(self.alerts(), [("#a6e3a1", "2")])     # proj done; main (here) never
@@ -711,7 +1076,7 @@ class Spaces(Server):
                 if "[+]" in lines[-1]:
                     break
                 time.sleep(0.1)
-            self.assertRegex(lines[-1], r"^█⌃1█ main█ ⌃2● █1█ 󰋜 ~██2█ ~█ \[\+\] +RIGHT$")
+            self.assertRegex(lines[-1], r"^█⌃1 main\ue0b0 ●  ⌃2● █1█ 󰋜 ~██2█ ~█ \[\+\] +RIGHT$")
             self.assertNotIn("[+]", lines[-2])   # one status line
         finally:
             run("kill-server")
@@ -890,11 +1255,11 @@ class Spaces(Server):
         run("sel-start", "here", self.M2)                          # = prefix v
         self.wait(lambda: " W1C2W3W4W5RIGHT" in self.status()[1], True)   # every window, agents too
         self.assertNotIn("[+]", self.status()[1])
-        self.assertTrue(self.status()[1].startswith("█⌃1█ main█"))       # this space's tab stays
-        self.assertEqual(self.status()[0].count("#cba6f7"), 1)
+        self.assertTrue(self.status()[1].startswith("█⌃1 main\ue0b0"))   # this space's tab stays
+        self.assertEqual(self.status()[0].count("bg=#cba6f7"), 1)   # (fg=: proj's colour)
         self.assertIn("range=window|2", self.status()[0])
         run("sel-move", "right", self.M2)                          # = l
-        self.wait(lambda: self.status()[0].count("#cba6f7"), 2)
+        self.wait(lambda: self.status()[0].count("bg=#cba6f7"), 2)
         run("sel-cancel")
         self.wait(lambda: "[+]" in self.status()[1], True)         # back to shells only
         self.assertEqual([int(i) for i in re.findall(r"█(\d+)█", self.status()[1])], [1, 2])

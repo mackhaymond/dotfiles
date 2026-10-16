@@ -288,9 +288,16 @@ of its row, and pressing it goes there at once (no second key, no wait).
 
 - **Who has one**: every agent window the menu lists (an `@agent_state`, in
   a shown session: not parked, not in `agents`/`tasks`/`scratch`/
-  `btop-popup`), idle ones included. Parked tabs and plain shells have none.
-  A window linked into two sessions is one agent (one letter, keyed by
-  window id).
+  `btop-popup`), idle ones included. Parked tabs, plain shells and spaces'
+  home windows (`@space_home`) have none. A window linked into two sessions
+  is one agent (one letter, keyed by window id).
+- **One assignment, two UIs**: the menu and the CMD+B sidebar both call
+  `menu::letters::of_view` (snapshot + unscoped view + their own in-flight
+  `KeyMemo`), so every open menu and sidebar shows and writes the same
+  letters from the same snapshot; a write tmux already shows is never sent
+  again, and two writers that raced converge on the next refresh (a
+  duplicate goes to the lower window id). UB's ⌥F table reads the same
+  `@agent_key`.
 - **Alphabet**, in hand-out order: `a s d f g h j k l q w e r t y u i o p z
   x c v b n m` (26). Past 26 agents a row has no badge but is still
   navigable.
@@ -306,7 +313,8 @@ of its row, and pressing it goes there at once (no second key, no wait).
   letter (not its old one back) when it returns. A parked agent whose letter
   nobody took gets it back on unpark.
 - **Writes**: the frame shows the assignment immediately (in memory); only
-  when it differs from what tmux stores does the menu send ONE batched
+  when it differs from what tmux stores does the menu (or a live sidebar)
+  send ONE batched
   command (`set-option -w -t @id @agent_key x \; set-option -wu -t @id2
   @agent_key …`) from a background thread, never blocking a frame. A write
   in flight is remembered (`KeyMemo`): it counts as the window's key until a
@@ -321,13 +329,16 @@ of its row, and pressing it goes there at once (no second key, no wait).
 - The key bar shows the range in play in alphabet order, e.g. `a–j  go`.
 - `menu --once … --select <letter>` selects that agent's row.
 
-The menu no longer draws the sticky slot numbers below; the sidebar does.
+Neither the menu nor the sidebar draws the sticky slot numbers below any
+more: the sidebar shows the letters too (see
+[agent-ui sidebar](#agent-ui-sidebar-layout-sync-lifecycle)). The slots are
+still computed (the watcher stamps `@agent_slot`, `view::assign_slots`) and
+documented here because `agent-ui dump` carries them.
 
-### agent-ui sidebar: sticky slots
+### agent-ui: sticky slots
 
 In agent-ui every number is an agent's **slot**, not a row position, and it
-sticks to the agent: the CMD+B sidebar shows it on every row wherever its
-row moves (the menu used to show and take the same numbers; it now uses the
+sticks to the agent (no UI draws it now; the sidebar and the menu use the
 letters above).
 
 - **Who has one**: the ACTIVE set only, exactly the menu's Active tab:
@@ -372,16 +383,9 @@ letters above).
   set prefix-free, so nothing waits on a timer; a bare `0` is never a label.
   A window linked into two sessions shows the same number on both rows.
 
-**Sidebar**: each agent row in the AGENTS half and each NEEDS YOU card
-starts with the same zero-padded number (` 3 ◉ Title`, `▌3 ◉ Title`),
-display only (the sidebar takes no number keys, and the menu now goes by
-[letters](#agent-ui-menu-letter-keys)). Agents without a slot leave the column blank so titles stay
-aligned; with no slot anywhere the column is not drawn. The folded idle line
-(`○○○ 3 idle · …`) has no numbers, since the idle agents it folds hold none
-(an answered prompt is never folded); collapsed space rules and `… N more`
-lines stand for many agents and have none either. The column costs
-`width + 1` cells of title room and nothing else: the never-scroll and fit
-guarantees hold (every size 24-60 × 2-70 is tested).
+**Sidebar**: no longer draws slots (nor the space-scope 1-9 ordinals;
+Command-N still goes by position): every agent row and NEEDS YOU card
+starts with the agent's [letter](#agent-ui-menu-letter-keys) badge instead.
 
 Known limit: two unstamped agents that first appear in the SAME frame are
 numbered together in fill order; the watcher numbers them the same way.
@@ -541,10 +545,10 @@ the tab already has one. It runs `agent-ui sidebar` when
 `~/.local/bin/agent-ui` exists (see [agent-ui](#agent-ui-primary-and-the-python-fallback));
 otherwise this same program, `agent-roster.py --strip`, which the rest of
 this section describes. agent-ui's sidebar starts each agent row and NEEDS
-YOU card with the agent's sticky number (see
-[Number keys](#agent-ui-sticky-slots)); the Option-W menu uses per-agent
-letters instead. agent-ui's sidebar has its own layout (NEEDS YOU, agents,
-spaces; no log), its own sync (Darwin notices, not a poll) and leaves when
+YOU card with the agent's lifetime letter, the same one the Option-W menu
+uses (see [letter keys](#agent-ui-menu-letter-keys)), and replaces the tmux
+status line while it is open. agent-ui's sidebar has its own layout (status
+block, NEEDS YOU, agents, spaces; no log), its own sync (Darwin notices, not a poll) and leaves when
 its tmux client does: see [agent-ui sidebar](#agent-ui-sidebar-layout-sync-lifecycle).
 **The Python fallback (`--strip`) keeps the older layout and the 1 s poll
 described in the rest of this section; it was not changed.**
@@ -620,13 +624,13 @@ described in the rest of this section; it was not changed.**
   scope (`view::Scope`, `ViewModel::apply_scope`): same options, same
   resolution, same hidden/stash fallback, same shell rule, same ordinals,
   same Option-V / title toggle (`set-option -g @strip_scope`, the old scope
-  kept and `couldn't set @strip_scope` shown on failure). In its own layout:
-  the header reads ` space` (that session's counts) or ` agents`, the
-  agents section (`agents  this space`) holds only the client's session's
-  rule and rows, numbered by ordinal (1-digit column, blank past 9, dropped
-  when the title would keep under 4 cells) instead of slots; NEEDS YOU cards
-  lose their numbers in space scope, and NEEDS YOU, the spaces list and
-  parked stay global. A `@strip_scope` set from outside (tmux's `M-v`)
+  kept and `couldn't set @strip_scope` shown on failure; the toggle is the
+  space chip once a client is known, else the ` agents` / ` space` title).
+  In its own layout: the header's counts are that session's in space scope,
+  the agents section (`agents  this space`, else `by space`) holds only the
+  client's session's rule and rows; every row keeps its letter badge (no
+  ordinals any more), and NEEDS YOU, the spaces list and parked stay
+  global. A `@strip_scope` set from outside (tmux's `M-v`)
   shows at once when the binding posts the focus notice (see
   [agent-ui sidebar](#agent-ui-sidebar-layout-sync-lifecycle)). Its client row carries one more field than the
   Python's, `#{@space_hidden}` (the client's session's), for the hidden
@@ -770,30 +774,78 @@ described in the rest of this section; it was not changed.**
 
 What `agent-ui sidebar` (CMD+B, when installed) does differently from the
 Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
-`src/sidebar/notice.rs`.
+`src/sidebar/status.rs`, `src/sidebar/notice.rs`.
 
+- **The sidebar is the whole UI**: while any sidebar is open the tmux status
+  line is hidden (`set -g status off`) and everything it showed is drawn in
+  the sidebar's status block (below). See **Status line** further down.
 - **Layout** (top to bottom; `agent-ui sidebar --once 34x40 --client <tty>`
   renders one frame):
 
   ```
-   space                ◉1 ✓1 ◐1 ○2     header: scope title (click flips it) + counts
-    ⏵ next ⌥S   ⤺ back ⌥X   ≡ ⌥W        toolbar
-                                        gap
-   needs you                      3     NEEDS YOU, agent-jump.sh order, as before
-  ▌✕ Notch hover animation       1m     3-line cards: title, reason, place · kind
-  ▌  fail 529 overloaded
-  ▌  cua-notch:1 · ✳ claude    ⏎ go
-                                        gap
-   agents                this space     THE BODY: the client's space (or every
-   main ⌥ main ──────── ◉1 ✓1 ◐1 ○2     space in `all` scope), numbered 1-9
-   1 ◉ Sidebar sync            here     like M-1..9, two lines per agent
-       asks Hook slot 50 OK?     2m
-                                        spare rows collect here
-   spaces                               THE list of spaces, @space_index order
-   ⌃1 ● main            ◉1 ✓1 ◐1 ○2     ⌃N, name, counts; click: go there
-   ⌃2 ○ bai                      ○1
-   ⏸ 4 parked                           the stash; a watcher problem in red
+    ⌃1 main   prefix     ◉1 ◐1 ○1      space chip (@space_color), red `prefix` mark
+   ⌥1 ⌂~  ⌥2 nvim  ⌥3 tmp              this space's shells (⌥N; click: go there)
+    S  71%  W  19%  F  0%              usage (status-right's modules)
+    !  last save 2h ago                the stale-save chip, when set
+    ⏵ next ⌥S   ⤺ back ⌥X   ≡ ⌥W       toolbar (gone under 20 rows)
+                                       gap
+   needs you                      2    NEEDS YOU, agent-jump.sh order, as before
+  ▌ a ✕ Slides export                  3-line cards: letter, title, reason,
+  ▌     failed                         place · kind
+  ▌     bai:1 · ⬢ codex        ⏎ go
+                                       gap
+   agents                this space    THE BODY: the client's space (or every
+   main ⌥ main ─────────── ◉1 ◐1 ○1    space in `all` scope), two lines per
+   d ◐ Sidebar status block    here    agent, its LETTER badge first
+       run cargo test
+                                       spare rows collect here
+   spaces                              THE list of spaces, @space_index order
+   ⌃1 ● main               ◉1 ◐1 ○1    ⌃N chip in @space_color; click: go there
+   ⌃2 ○ bai                      ✕1
+   ⏸ 0 parked                          the stash; a watcher problem in red
   ```
+
+- **Letters**: every agent row (both scopes) and every NEEDS YOU card starts
+  with a solid ` a ` badge, dark ink on the agent's state colour (the
+  menu's `badge_color`), at the far left: the agent's lifetime letter, from
+  the menu's own assignment (`menu::letters::of_view`, see
+  [letter keys](#agent-ui-menu-letter-keys)). A live sidebar persists the
+  letters it assigns to `@agent_key` exactly like the menu (one batched
+  background write, `KeyMemo`), so UB's ⌥F table, the menu and every
+  sidebar agree; `--once` never writes. While the client's key table is
+  `jump` (⌥F armed) every badge turns peach and the header's right side
+  reads `⌥F · type a letter`. No letter (past 26): a blank badge; no letter
+  anywhere: no column. The 1-9 ordinals and slot numbers are gone.
+- **Status block** (`status::Bar`, built from the one per-tick snapshot,
+  before home windows are hidden; no script runs per frame):
+  - the header's space chip: ` ⌃N name ` as a solid block in the session's
+    `@space_color` (`#rrggbb`, `colourN` or a colour name; the neutral
+    `surface1` when unset or junk), `[name]` dim in a hidden session; a red
+    ` prefix ` block while `#{client_key_table}` is `prefix`;
+  - this space's shells (windows without `@agent_state`, window-index order,
+    so the home window is shell 1, exactly space.sh's `SHELLS`), each `⌥N`
+    plus its label (spaces.conf's rule: a shell shows `~` or its cwd's last
+    part, anything else its window name; `⌂` marks home), the active one
+    bold peach; a click goes there (`Target::Shell`, agent-jump.sh goto; a
+    right-click never parks it). Up to 2 lines, then `+K`;
+  - usage: `@codex_session_text` / `_weekly_` / `_scoped_` with their
+    `_color` and `@codex_scoped_icon` (codexbar-usage-status.sh keeps them;
+    they hold the display provider's numbers, Claude's), `--%` while one is
+    unset, the deltas dropped when the three do not fit;
+  - `@resurrect_stale` as ` ! last save 2h ago` / `save refused`, red;
+  - prefix v's range selection (below).
+  All of it rides on the client row of the same `list-clients` call
+  (`tmux::STATUS_FORMATS`) and the window rows (`@space_color`,
+  `@stash_sel`). Shorter frames give up, in order: the toolbar (under 20
+  rows), the second shells line (under 24), usage and the stale save
+  (under 12), the shells (under 10), the selection hint (under 6).
+- **Stash selection** (prefix v, stash.sh `sel-start` / `sel-move`): live
+  while the client is in the `stash` key table or any window still has
+  `@stash_sel`. Every selected agent row (both lines) and shell chip is
+  drawn on mauve with dark ink (catppuccin's tab tint), and a row under the
+  header reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
+  many keys as fit). stash.sh posts the focus notice after sel-start,
+  sel-move, sel-cancel and the park, so it shows at once.
 
   There is no event log and no divider any more (`@agent_sidebar_split` is
   no longer read; `--split` is accepted and ignored). The spaces list has no
@@ -808,9 +860,10 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   then `●`/`○`, the name and its state counts. A click switches the client
   to that space (`agent-jump.sh goto` on its active window, in that
   session). The index and hidden mark are SESSION options read through the
-  window-row format (`#{@space_index}`, `#{@space_hidden}`, fields 28-29),
-  so they cost no extra tmux call. Labels are one swappable function each
-  (`space_label`, and `agent_label` for agent rows) should the keys change.
+  window-row format (`#{@space_index}`, `#{@space_hidden}`,
+  `#{@space_color}`), so they cost no extra tmux call. The `⌃N` label is a
+  solid chip in the space's `@space_color` when it has one. `space_label`
+  is one swappable function should the keys change.
 - **Stash**: the last row is ` ⏸ N parked`. A click runs exactly prefix h's
   command, `tmux run-shell "stash.sh unstash '' <client>"` (the sidebar's
   client for `#{client_name}`; a unit test compares it with tmux.conf.tmpl's
@@ -871,14 +924,43 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   `list-clients`): it counts as gone only if its pid is dead. While no client was ever resolved, a `wezterm cli list` (at most one
   per 5 s, as before) that finds the CMD+B pane gone or nothing else in the
   tab ends it too. A pinned fake `--client` never exits this way.
+- **Status line** (`status::Registry`): `@sidebar_pids` lists the open
+  sidebars' pids and `@sidebar_open` is its length (UB's bindings read the
+  count). A live sidebar registers on start and unregisters on every exit
+  path (a guard dropped on a normal return, the never-alone exit, SIGHUP /
+  SIGTERM, an error, or a panic unwinding). Each change runs under a
+  `flock` (one lock file per tmux socket, in `$TMPDIR`), drops every listed
+  pid that is no longer a live `agent-ui` process (`kill 0` +
+  `proc_pidpath`, so a reused pid does not count), and writes the list, the
+  count and `status off` (count > 0) or `status on` (count 0) in ONE tmux
+  command. Crash repair (a SIGKILLed sidebar leaves its pid behind): the
+  next sidebar to start drops it; a live sidebar's refresh repairs at once
+  (at most every 2 s) when its own pid is missing, a dead one is listed,
+  the count disagrees, or the status line is on again (a config reload);
+  and `agent-ui sidebar --repair` (one read, one write; prints the count)
+  does it with no sidebar open, turning the line back on, and leaves
+  `status` alone when there was nothing to repair. Hook it wherever a
+  cheap check fits (e.g. `client-attached`).
+- **Status jobs** (`status::Keeper`): with the line hidden tmux runs none of
+  status-right's `#()` jobs, and two of them must keep running:
+  continuum's autosave (`continuum_save.sh`) and the usage tick
+  (`codexbar-usage-status.sh --tick`). So the open sidebar with the lowest
+  live pid reads `status-interval` and status-right (every 60 s) and runs
+  each distinct `#()` command through `run-shell -b` once per interval (one
+  tmux call), formats expanded as the line would. Needs a client row in the
+  snapshot (no attached client: the line would not run them either).
 - **Home windows**: a window with `@space_home` 1 (a space's landing
   screen) is never an agent row and never counted, in any scope, with
   `@spaces` on or off (its agent options are ignored; its space still shows
-  as the client's).
+  as the client's). It is the space's shell 1 in the status block.
 - **Tests**: `tests/sidebar.rs` drives the live loop with test-only notice
   names (state and focus notices reflected in well under the 5 s net, scope
-  set from outside, a window switch) and checks that detaching a real nested
-  client ends the sidebar within 1.5 s.
+  set from outside, a window switch, the prefix / jump / stash key tables, a
+  stray `@stash_sel`), checks the letters land in `@agent_key`, the
+  registry (count, status line, crash repair by the next start, by a
+  refresh and by `--repair`), the status job kept running, and that
+  detaching a real nested client ends the sidebar within 1.5 s with the
+  status line back on.
 
 ## Launch speed
 

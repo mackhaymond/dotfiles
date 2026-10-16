@@ -258,41 +258,12 @@ impl Data {
             }
         }
 
-        // Letters: from each window's @agent_key (or a write still in flight).
-        let mut keys = keys;
-        if let Some(k) = keys.as_deref_mut() {
-            k.settle(snap.windows.iter().map(|w| (w.id.as_str(), w.key.as_str())));
-        }
-        let mut raw: HashMap<&str, &str> = HashMap::new();
-        for w in &snap.windows {
-            raw.entry(w.id.as_str()).or_insert(w.key.as_str());
-        }
-        let eff = |id: &str| {
-            let r = raw.get(id).copied().unwrap_or("");
-            keys.as_deref().map_or_else(|| r.to_string(), |k| k.effective(id, r))
-        };
-        let shown: Vec<(String, String)> = listed(&view).map(|a| (a.window_id.clone(), eff(&a.window_id))).collect();
-        let ids: HashSet<&str> = shown.iter().map(|(id, _)| id.as_str()).collect();
-        let mut others: Vec<(String, String)> = Vec::new();
-        let mut seen: HashSet<&str> = HashSet::new();
-        for w in &snap.windows {
-            if !ids.contains(w.id.as_str()) && seen.insert(w.id.as_str()) {
-                others.push((w.id.clone(), eff(&w.id)));
-            }
-        }
-        let a = letters::assign(&shown, &others);
-        let key_writes = match keys {
-            Some(k) => {
-                // New writes, then any still unseen past RESEND_AFTER (once).
-                let now = std::time::Instant::now();
-                let mut w = k.fresh(a.writes, now);
-                w.extend(k.due(now));
-                w
-            }
-            None => a.writes,
-        };
+        // Letters: the one shared assignment ([`letters::of_view`]), from each
+        // window's @agent_key (or a write still in flight).
+        let a = letters::of_view(snap, &view, keys);
+        let ids: HashSet<&str> = listed(&view).map(|a| a.window_id.as_str()).collect();
         let last = last_agent(&ids, view.cur_win.as_deref(), snap.mru());
-        Data { view, branches, letters: a.letters, last, key_writes }
+        Data { view, branches, letters: a.letters, last, key_writes: a.writes }
     }
 
     /// The letter of `win`, if it holds one.

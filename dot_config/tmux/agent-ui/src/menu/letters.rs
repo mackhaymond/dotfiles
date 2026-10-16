@@ -24,6 +24,8 @@
 //! same write is not re-sent every tick while tmux catches up, yet is sent
 //! once more if a snapshot still hasn't shown it after [`RESEND_AFTER`].
 
+use crate::tmux::Snapshot;
+use crate::view::ViewModel;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -118,6 +120,62 @@ pub fn assign(listed: &[(String, String)], unlisted: &[(String, String)]) -> Ass
         }
     }
     Assigned { letters, writes }
+}
+
+/// THE assignment for one snapshot, shared by the ⌥W menu and the CMD+B
+/// sidebar so the two (and every open copy of either) always agree and
+/// never fight over a letter: both call this with the snapshot and the
+/// UNSCOPED view built from it ([`crate::view::ViewModel::build_with`]; the
+/// sidebar's scope only renumbers, it never drops an agent from the view).
+///
+/// - Listed: [`super::rows::listed`] (every shown space's agent windows, in
+///   display order), minus spaces' home windows (`@space_home`), which are
+///   never agents. Every other window of the snapshot is unlisted.
+/// - `keys`: the caller's in-flight writes ([`KeyMemo`]): settled against
+///   this snapshot, used as each window's key while unseen, and the writes
+///   returned are only those not already in flight (plus any due a resend),
+///   recorded as sent. None (`--once`, tests): every write the frame needs.
+///
+/// Idempotent: the same snapshot gives the same letters and the same writes
+/// in any process, and a write that tmux already shows is never re-sent.
+pub fn of_view(snap: &Snapshot, view: &ViewModel, keys: Option<&mut KeyMemo>) -> Assigned {
+    let mut keys = keys;
+    if let Some(k) = keys.as_deref_mut() {
+        k.settle(snap.windows.iter().map(|w| (w.id.as_str(), w.key.as_str())));
+    }
+    let mut raw: HashMap<&str, &str> = HashMap::new();
+    let mut homes: HashSet<&str> = HashSet::new();
+    for w in &snap.windows {
+        raw.entry(w.id.as_str()).or_insert(w.key.as_str());
+        if w.home {
+            homes.insert(w.id.as_str());
+        }
+    }
+    let eff = |id: &str| {
+        let r = raw.get(id).copied().unwrap_or("");
+        keys.as_deref().map_or_else(|| r.to_string(), |k| k.effective(id, r))
+    };
+    let shown: Vec<(String, String)> = super::rows::listed(view)
+        .filter(|a| !homes.contains(a.window_id.as_str()))
+        .map(|a| (a.window_id.clone(), eff(&a.window_id)))
+        .collect();
+    let ids: HashSet<&str> = shown.iter().map(|(id, _)| id.as_str()).collect();
+    let mut others: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for w in &snap.windows {
+        if !ids.contains(w.id.as_str()) && seen.insert(w.id.as_str()) {
+            others.push((w.id.clone(), eff(&w.id)));
+        }
+    }
+    let mut a = assign(&shown, &others);
+    if let Some(k) = keys {
+        // New writes, then any still unseen past RESEND_AFTER (once).
+        let now = Instant::now();
+        let mut w = k.fresh(std::mem::take(&mut a.writes), now);
+        w.extend(k.due(now));
+        a.writes = w;
+    }
+    a
 }
 
 /// The ONE tmux command line (`;`-separated) that stores `writes`. Every

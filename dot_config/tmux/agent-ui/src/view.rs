@@ -227,6 +227,12 @@ pub struct Agent {
     /// its 1-based position among its session's windows with an agent state,
     /// by window index. None outside space scope and for a plain shell.
     pub ordinal: Option<u32>,
+    /// The agent's lifetime LETTER (`@agent_key`, [`crate::menu::letters`]):
+    /// set by the sidebar (the menu keeps its own map); None from
+    /// [`Agent::from_window`] alone, and past 26 agents.
+    pub letter: Option<char>,
+    /// stash.sh's `@stash_sel`: in prefix v's range selection.
+    pub selected: bool,
 }
 
 impl Agent {
@@ -276,6 +282,8 @@ impl Agent {
             slot: None,
             answered: w.answered(now),
             ordinal: None,
+            letter: None,
+            selected: w.stash_sel,
         }
     }
 
@@ -374,6 +382,8 @@ pub struct Space {
     pub index: Option<u32>,
     /// The session has `@space_hidden` "1": not a space (agents, scratch…).
     pub hidden: bool,
+    /// The session's `@space_color` as set (`#rrggbb`; "" when unset).
+    pub color: String,
 }
 
 impl Space {
@@ -632,6 +642,7 @@ impl ViewModel {
                 // Session options: every row of the session carries the same.
                 index: ws.first().and_then(|w| w.space_index),
                 hidden: ws.first().is_some_and(|w| w.space_hidden),
+                color: ws.first().map(|w| w.space_color.clone()).unwrap_or_default(),
             });
         }
 

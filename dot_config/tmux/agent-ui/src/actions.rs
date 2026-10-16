@@ -97,12 +97,29 @@ pub fn is_agent_comm(comm: &str) -> bool {
     parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// The `list-panes` format [`pick_agent_pane`] reads: id, tty, active, and
+/// the dashboard mark ([`crate::tmux::DASH_OPTION`]).
+pub fn pane_rows_format() -> String {
+    ["#{pane_id}", "#{pane_tty}", "#{pane_active}", "#{@space_dash_pane}"].join(&US.to_string())
+}
+
+/// The rows of a `list-panes` ([`pane_rows_format`], or the Python's three
+/// fields) that can be the agent: a space's DASHBOARD pane never is.
+fn pane_rows(panes_text: &str) -> Vec<Vec<&str>> {
+    panes_text
+        .lines()
+        .filter(|l| matches!(l.matches(US).count(), 2 | 3))
+        .map(|l| l.split(US).collect::<Vec<_>>())
+        .filter(|r| r.get(3).is_none_or(|d| d.is_empty() || *d == "0"))
+        .collect()
+}
+
 /// agent-roster.py `pick_agent_pane`: the pane `x` closes → Ok(pane_id) or
-/// Err(why). `panes_text`: `list-panes -F pane_id US pane_tty US pane_active`;
+/// Err(why). `panes_text`: `list-panes -F pane_id US pane_tty US pane_active
+/// [US @space_dash_pane]` (dashboard panes are left out first);
 /// `ps_text`: `ps -ax -o tty=,comm=` (None when not needed or it failed).
 pub fn pick_agent_pane(panes_text: &str, ps_text: Option<&str>) -> Result<String, &'static str> {
-    let rows: Vec<Vec<&str>> =
-        panes_text.lines().filter(|l| l.matches(US).count() == 2).map(|l| l.split(US).collect()).collect();
+    let rows = pane_rows(panes_text);
     if rows.is_empty() {
         return Err(PANE_GONE);
     }
@@ -202,14 +219,31 @@ impl Actions {
         if snap.rows(win).next().is_none() {
             return Err(PANE_GONE.into());
         }
-        if snap.row_in(win, session).is_none() {
+        let Some(w) = snap.row_in(win, session) else {
             return Err(format!("{TAB_MOVED} · pick it again"));
-        }
+        };
         if session == HOLD {
             self.unstash(client, win);
             return Ok(());
         }
-        self.jump("goto", client, &[win, session])
+        self.jump("goto", client, &[win, session])?;
+        self.focus_shell(w);
+        Ok(())
+    }
+
+    /// The tmux command that moves focus off a space home's DASHBOARD pane
+    /// to the shell under it, when the dashboard is the active pane
+    /// ([`Window::focus_pane`]); None when focus is already right.
+    pub fn focus_shell_command(w: &Window) -> Option<Vec<String>> {
+        w.focus_pane().map(|p| vec!["select-pane".into(), "-t".into(), p.to_string()])
+    }
+
+    /// After landing on `w`: focus on its shell, never its dashboard. A
+    /// failure (the pane went meanwhile) changes nothing.
+    fn focus_shell(&self, w: &Window) {
+        if let Some(cmd) = Self::focus_shell_command(w) {
+            let _ = self.tmux.run(&cmd);
+        }
     }
 
     /// `stash.sh unstash <win> <client>` on the tmux server (outlives us).
@@ -246,7 +280,9 @@ impl Actions {
             .iter()
             .find(|w| w.session == session && w.active)
             .ok_or_else(|| format!("session {session} is gone"))?;
-        self.jump("goto", client, &[&w.id, session])
+        self.jump("goto", client, &[&w.id, session])?;
+        self.focus_shell(w);
+        Ok(())
     }
 
     /// The current row of `win` in `session`, or the Python's refusal text.
@@ -300,12 +336,11 @@ impl Actions {
     /// agent-roster.py `agent_pane`: pick_agent_pane against the live
     /// server; `ps` only runs for a split window.
     pub fn agent_pane(&self, win: &str) -> Result<String, String> {
-        let f = ["#{pane_id}", "#{pane_tty}", "#{pane_active}"].join(&US.to_string());
-        let out = match self.tmux.run(&["list-panes", "-t", win, "-F", &f]) {
+        let out = match self.tmux.run(&["list-panes", "-t", win, "-F", &pane_rows_format()]) {
             Ok(o) if o.ok() => o.stdout,
             _ => return Err(PANE_GONE.into()),
         };
-        let n = out.lines().filter(|l| l.matches(US).count() == 2).count();
+        let n = pane_rows(&out).len();
         let ps = if n > 1 {
             let mut c = Command::new("ps");
             c.args(["-ax", "-o", "tty=,comm="]);
@@ -321,7 +356,7 @@ impl Actions {
     /// capture it. A split window asks [`agent_pane`](Self::agent_pane) first
     /// and falls back to the window's active pane when it can't tell.
     pub fn peek(&self, w: &Window, n: usize) -> Option<Vec<StyledLine>> {
-        let mut target = w.id.clone();
+        let mut target = w.capture_target();
         if w.panes > 1 {
             if let Ok(p) = self.agent_pane(&w.id) {
                 target = p;
@@ -385,6 +420,30 @@ mod tests {
         // Two agents, neither active.
         let p = "%1\x1f/dev/ttys001\x1f0\n%2\x1f/dev/ttys002\x1f0\n%3\x1f/dev/ttys003\x1f1";
         assert_eq!(pick_agent_pane(p, Some("ttys001 claude\nttys002 codex\n")), Err(PANE_UNSURE));
+    }
+
+    /// A space home's dashboard pane is never the agent pane, never counted
+    /// as a split, and never where a click leaves focus.
+    #[test]
+    fn dashboard_panes_are_never_targets() {
+        use crate::tmux::tests::row;
+        assert!(pane_rows_format().ends_with("\x1f#{@space_dash_pane}"));
+        // Dashboard + shell: the shell is the window's one pane, no ps asked.
+        let home = "%3\x1f/dev/ttys003\x1f1\x1f1\n%4\x1f/dev/ttys004\x1f0\x1f";
+        assert_eq!(pane_rows(home).len(), 1);
+        assert_eq!(pick_agent_pane(home, None), Ok("%4".into()));
+        // An agent split with a dashboard: the dashboard's tty never matches.
+        let split = "%3\x1f/dev/ttys003\x1f0\x1f1\n%4\x1f/dev/ttys004\x1f1\x1f0\n%5\x1f/dev/ttys005\x1f0\x1f";
+        assert_eq!(pick_agent_pane(split, Some("ttys003 claude\nttys005 claude\n")), Ok("%5".into()));
+        // Only a dashboard: nothing to close.
+        assert_eq!(pick_agent_pane("%3\x1f/dev/ttys003\x1f1\x1f1", None), Err(PANE_GONE));
+        // Focus: moved to the shell only while the dashboard is active.
+        let w = Window::parse(&row("main", 0, "@1", &[("home", "1"), ("pane_flags", "D0%3 p1%4 ")])).unwrap();
+        assert_eq!(Actions::focus_shell_command(&w), Some(vec!["select-pane".into(), "-t".into(), "%4".into()]));
+        let w = Window::parse(&row("main", 0, "@1", &[("home", "1"), ("pane_flags", "d0%3 A1%4 ")])).unwrap();
+        assert_eq!(Actions::focus_shell_command(&w), None);
+        let w = Window::parse(&row("main", 1, "@2", &[])).unwrap();
+        assert_eq!(Actions::focus_shell_command(&w), None);
     }
 
     #[test]

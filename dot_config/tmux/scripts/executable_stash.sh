@@ -2346,6 +2346,16 @@ sel_apply() {
     # status-interval is 5s, so without this the tab bar keeps showing the
     # previous selection until the next tick and the arrow key feels dead.
     tmux refresh-client -S 2>/dev/null
+    sel_notice
+}
+
+# The agent-ui sidebar (CMD+B) shows the selection while the status line is
+# hidden; the focus notice makes it redraw at once instead of on its 5 s net.
+# AGENT_FOCUS_NOTICE renames it (tests); set but empty turns it off.
+sel_notice() {
+    local name="${AGENT_FOCUS_NOTICE-com.mackhaymond.tmux.focus}"
+    [ -n "$name" ] && command -v notifyutil >/dev/null 2>&1 && notifyutil -p "$name" >/dev/null 2>&1
+    return 0
 }
 
 do_sel_start() {
@@ -2391,6 +2401,7 @@ do_sel_cancel() {
     tmux set-option -gu @stash_anchor 2>/dev/null
     tmux set-option -gu @stash_cursor 2>/dev/null
     tmux refresh-client -S 2>/dev/null
+    sel_notice
 }
 
 do_sel_commit() {
@@ -2405,6 +2416,7 @@ do_sel_commit() {
     do_sel_cancel
     [ -n "$ids" ] || return 0
     do_stash_many $ids
+    sel_notice
 }
 
 # --- sending a selection to another session -----------------------------------

@@ -28,8 +28,8 @@
 //!   and any key that lands here is forwarded there. The wheel does nothing:
 //!   nothing scrolls.
 //! - **Scope.** `@spaces` / `@strip_scope` (globals, read in the same
-//!   snapshot call): "space" shows only the client's session, numbered by
-//!   agent ordinal (tmux's M-1..M-9); "all" every session
+//!   snapshot call): "space" shows only the client's session; "all" every
+//!   session
 //!   ([`crate::view::Scope`]). Option-V (ESC v / V), the one key NOT
 //!   forwarded, or a click on the header title (once the scope is a thing)
 //!   flips and persists it, then posts [`notice::FOCUS_NOTICE`] so every
@@ -42,20 +42,34 @@
 //!   normally, [`TICK`] (0.5 s) while a drawn agent pulses with
 //!   `@agent_blink` (the watcher flips it each second) or when there is no
 //!   notice fd. A redraw happens only when the rendered buffer changed.
+//!   The one exception: tmux posts the focus notice on ENTERING a key table
+//!   (prefix, ⌥F's `jump`) but nothing on leaving it, so while a refresh
+//!   shows the client outside `root` the sidebar re-reads just
+//!   `#{client_key_table}` every 150 ms, for at most 10 s per table entered
+//!   (later notices in the same table never extend it), and refreshes once
+//!   when it changes ([`status::KeyPoll`]). In `root`: no polling.
 //! - **Lifecycle.** The marker CMD+B finds the pane by is written once,
 //!   before the alternate screen; SIGHUP / SIGTERM (CMD+B's kill-pane) or a
 //!   closed tty end it quietly, with the terminal restored.
+//! - **The whole UI.** While any sidebar is open the tmux status line is
+//!   hidden and its content drawn here ([`status`]: the space chip, shells,
+//!   usage, the stale save, the prefix / ⌥F / selection marks); the
+//!   registry behind `@sidebar_open` restores it when the last one leaves.
+//!   Agent rows carry their lifetime letters (`@agent_key`, shared with the
+//!   menu and persisted like it).
 //! - **`--once WxH`** prints one frame in ANSI colour and exits: no
 //!   alternate screen, no marker, no mouse (screenshots, tests).
 
 mod input;
 pub mod layout;
 pub mod notice;
+pub mod status;
 mod term;
 
 pub use layout::{layout, Frame, Opts, Row, Seg, Target};
 
 use crate::actions::{scripts_dir, sh_quote, watcher_age, Actions};
+use crate::menu::letters::{self, KeyMemo, Write as KeyWrite};
 use crate::proc;
 use crate::text;
 use crate::tmux::{Snapshot, Socket, Tmux, HOLD};
@@ -63,6 +77,7 @@ use crate::view::BuildArgs;
 use crate::view::{Core, ViewModel};
 use crate::wezterm::{self, WeztermLink, MOUSE_OFF, MOUSE_ON};
 use notice::Notices;
+use status::{Bar, Keeper, KeyPoll, Registry};
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -86,7 +101,8 @@ const ESC_WAIT: Duration = Duration::from_millis(25);
 const SAY_FOR: f64 = 4.0;
 
 const USAGE: &str = "usage: agent-ui sidebar [--client <tty>] [--tmux-pane <id>] [--wezterm <path>]
-       agent-ui sidebar --once <W>x<H> [--client <tty>]";
+       agent-ui sidebar --once <W>x<H> [--client <tty>]
+       agent-ui sidebar --repair [-v]";
 
 fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let i = args.iter().position(|a| a == flag)?;
@@ -122,6 +138,18 @@ pub fn run(tmux: Tmux, args: &[String]) -> ExitCode {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
+    if args.iter().any(|a| a == "--repair") {
+        // Dead sidebars out of @sidebar_pids / @sidebar_open; the status line
+        // hidden while any is open (again, after a reload's `status on`),
+        // back once none is. For tmux hooks (client-attached, a reload): two
+        // tmux calls, no output, always status 0, since a run-shell hook shows
+        // output or a failure in view mode. `-v` prints the count.
+        let n = Registry::new(&tmux).repair();
+        if args.iter().any(|a| a == "-v") {
+            println!("{}", n.map_or("?".into(), |n| n.to_string()));
+        }
+        return ExitCode::SUCCESS;
+    }
     if args.iter().any(|a| a == "--once") {
         let Some(size) = arg_after(args, "--once").and_then(parse_size) else {
             eprintln!("{USAGE}");
@@ -143,7 +171,6 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
     let mut core = Core::new(tmux.clone());
     core.git.branch_wait = Duration::from_millis(500);
     core.snapshot = tmux.snapshot();
-    hide_homes(&mut core.snapshot);
     let client = match arg_after(args, "--client") {
         Some(c) => Some(c.to_string()),
         None => {
@@ -156,8 +183,12 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
             link.client
         }
     };
-    let view = build_view(&mut core, client.as_deref());
-    let frame = layout(&view, w, h, &Opts::default());
+    // The status block from the RAW snapshot (a space's home is its shell 1).
+    let bar = Bar::build(&core.snapshot, client.as_deref());
+    hide_homes(&mut core.snapshot);
+    // Letters as the live sidebar would assign them; `--once` never writes.
+    let (view, _) = build_view(&mut core, client.as_deref(), None);
+    let frame = layout(&view, w, h, &Opts { msg: None, bar });
     let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
     layout::paint(&frame, &mut buf);
     let mut out = io::stdout().lock();
@@ -180,10 +211,20 @@ fn hide_homes(snap: &mut Snapshot) {
 /// agents section draws a rule for; never `git status` (the compact spaces
 /// list has no git line). No event log. A home window the client sits on is
 /// never an agent row (with `@spaces` off it would be the classic one).
-fn build_view(core: &mut Core, client: Option<&str>) -> ViewModel {
+///
+/// Letters: [`letters::of_view`], THE assignment the ⌥W menu runs too, on
+/// the unscoped view; every agent row and NEEDS YOU card gets its letter.
+/// `keys`: the live sidebar's in-flight `@agent_key` writes; the writes
+/// returned are the ones to send (None: `--once`, nothing to send).
+fn build_view(core: &mut Core, client: Option<&str>, keys: Option<&mut KeyMemo>) -> (ViewModel, Vec<KeyWrite>) {
     let now = text::now();
     let args = BuildArgs { client, now, collator: &core.collator, git: None, log: Vec::new(), watcher_age: watcher_age() };
     let mut view = ViewModel::build_with(&core.snapshot, args, &mut core.slots);
+    let persist = keys.is_some();
+    let assigned = letters::of_view(&core.snapshot, &view, keys);
+    let letter = |a: &mut crate::view::Agent| a.letter = assigned.letters.get(&a.window_id).copied();
+    view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()).for_each(letter);
+    view.needs.iter_mut().for_each(|n| letter(&mut n.agent));
     view.apply_scope(&core.snapshot);
     let homes: HashSet<&str> = core.snapshot.windows.iter().filter(|w| w.home).map(|w| w.id.as_str()).collect();
     let scoped = view.scope.session.clone();
@@ -200,7 +241,7 @@ fn build_view(core: &mut Core, client: Option<&str>) -> ViewModel {
             sp.branch = core.git.branch(&sp.path, now);
         }
     }
-    view
+    (view, if persist { assigned.writes } else { Vec::new() })
 }
 
 /// The menu popup's `-w`: tmux.conf's Option-W cap (at most 100 columns, the
@@ -307,12 +348,28 @@ struct App {
     client_pid: Option<i32>,
     /// The client is gone (or the sidebar is alone in its tab): exit.
     gone: bool,
+    /// What the hidden status line showed, from the last snapshot.
+    bar: Bar,
+    /// The `@agent_key` writes in flight (the live sidebar persists the
+    /// letters it assigns, exactly as the menu does).
+    keys: KeyMemo,
+    persist: bool,
+    /// The open-sidebar registry (`@sidebar_open`), once this sidebar is in it.
+    registry: Option<Registry>,
+    /// When the registry was last repaired from a refresh (at most every 2 s).
+    repaired_at: Option<Instant>,
+    /// Runs the status line's `#()` jobs while it is hidden.
+    keeper: Keeper,
+    /// Re-reads the client's key table while it is not `root` ([`KeyPoll`]).
+    keypoll: KeyPoll,
+    /// How many cheap key-table reads ran (observable state for the tests).
+    key_reads: u32,
 }
 
 impl App {
     fn new(tmux: Tmux, link: WeztermLink, notices: Notices) -> App {
         let mut core = Core::new(tmux.clone());
-        let view = build_view(&mut core, None);
+        let (view, _) = build_view(&mut core, None, None);
         App {
             core,
             actions: Actions::new(tmux),
@@ -334,6 +391,14 @@ impl App {
             watch: None,
             client_pid: None,
             gone: false,
+            bar: Bar::default(),
+            keys: KeyMemo::default(),
+            persist: false,
+            registry: None,
+            repaired_at: None,
+            keeper: Keeper::default(),
+            keypoll: KeyPoll::default(),
+            key_reads: 0,
         }
     }
 
@@ -343,15 +408,68 @@ impl App {
 
     /// Strip.refresh / load: reap popups, one snapshot, re-resolve the
     /// client if it went missing, then the view; then whether the client
-    /// (or the tab) is gone.
+    /// (or the tab) is gone. The key table seen starts or stops the
+    /// key-table poll ([`KeyPoll::seen`]).
     fn refresh(&mut self) {
         self.children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
         self.core.snapshot = self.core.tmux.snapshot();
-        hide_homes(&mut self.core.snapshot);
         self.link.on_snapshot(&self.core.snapshot, text::now());
-        self.view = build_view(&mut self.core, self.link.client.as_deref());
+        self.bar = Bar::build(&self.core.snapshot, self.link.client.as_deref());
+        let table = self.client_key_table();
+        self.keypoll.seen(&table, Instant::now());
+        hide_homes(&mut self.core.snapshot);
+        let keys = if self.persist { Some(&mut self.keys) } else { None };
+        let (view, writes) = build_view(&mut self.core, self.link.client.as_deref(), keys);
+        self.view = view;
+        if !writes.is_empty() {
+            crate::menu::store_keys(&self.core.tmux, writes);
+        }
+        self.check_registry();
         self.check_client();
         self.check_park();
+    }
+
+    /// The client's key table as the last snapshot shows it ("" unknown).
+    fn client_key_table(&self) -> String {
+        let row = self.link.client.as_deref().and_then(|c| self.core.snapshot.client(c));
+        row.map(|c| c.status.key_table.clone()).unwrap_or_default()
+    }
+
+    /// The key-table poll's read, when due: ONE `display-message` of
+    /// `#{client_key_table}`; a change (back to `root`, say) refreshes once.
+    fn poll_key_table(&mut self, now: Instant) {
+        if self.keypoll.due().is_none_or(|d| now < d) {
+            return;
+        }
+        self.key_reads += 1;
+        let got = self.link.client.as_deref().and_then(|c| {
+            let o = self.core.tmux.run(&status::key_table_command(c)).ok().filter(|o| o.ok())?;
+            Some(o.stdout.trim().to_string())
+        });
+        if self.keypoll.read(got.as_deref(), now) == status::KeyStep::Refresh {
+            self.refresh();
+        }
+    }
+
+    /// The cheap check on every refresh: a registry out of step (this pid
+    /// missing, a dead one listed, a count that disagrees) is repaired at
+    /// once (re-registering this sidebar), at most every 2 s; and the
+    /// status line's jobs run if this sidebar is the one that runs them
+    /// ([`Keeper`]). Needs a client row to read the options from.
+    fn check_registry(&mut self) {
+        let Some(reg) = &self.registry else { return };
+        let me = std::process::id() as i32;
+        let Some(st) = self.core.snapshot.clients.first().map(|c| c.status.clone()) else { return };
+        let now = Instant::now();
+        if status::needs_repair(&st, me, &status::is_sidebar)
+            && self.repaired_at.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2))
+        {
+            self.repaired_at = Some(now);
+            reg.open(me);
+        }
+        let live = status::parse_pids(&st.sidebar_pids).into_iter().filter(|&p| p == me || status::is_sidebar(p)).min();
+        let leader = live.is_none_or(|p| p == me);
+        self.keeper.tick(&self.core.tmux, leader, now);
     }
 
     /// A park in flight that a snapshot now shows in the stash: say so
@@ -494,7 +612,9 @@ impl App {
         };
         let snap = &self.core.snapshot;
         let moved = match t {
-            Target::Go { win, session } => self.actions.go(snap, &client, &win, &session).map(|_| true),
+            Target::Go { win, session } | Target::Shell { win, session } => {
+                self.actions.go(snap, &client, &win, &session).map(|_| true)
+            }
             Target::Session(s) => self.actions.goto_session(snap, &client, &s).map(|_| true),
             Target::Next => self.actions.next(&client).map(|_| true),
             Target::Back => self.actions.back(&client).map(|_| true),
@@ -551,7 +671,7 @@ impl App {
         let size = term.size()?;
         let now = text::now();
         let msg = self.msg.as_ref().filter(|(_, until)| *until > now).map(|(m, _)| m.clone());
-        let frame = layout(&self.view, size.width, size.height, &Opts { msg });
+        let frame = layout(&self.view, size.width, size.height, &Opts { msg, bar: self.bar.clone() });
         let mut buf = Buffer::empty(Rect::new(0, 0, size.width, size.height));
         layout::paint(&frame, &mut buf);
         if !self.force && self.buf.as_ref() == Some(&buf) {
@@ -591,6 +711,10 @@ impl App {
             if let Some(left) = self.msg_left() {
                 wake = wake.min(now + left + Duration::from_millis(5));
             }
+            // Only while the client is in a key table other than root.
+            if let Some(k) = self.keypoll.due() {
+                wake = wake.min(k);
+            }
             let fds = [self.notices.fd(), self.watch.as_ref().map(term::ProcWatch::fd)];
             let (has_input, [noticed, exited]) = sig.wait(0, fds, wake.saturating_duration_since(now))?;
             let fired = sig.take();
@@ -621,6 +745,8 @@ impl App {
                 self.refresh();
                 due = None;
                 next = Instant::now() + self.cadence();
+            } else {
+                self.poll_key_table(now);
             }
             if self.gone {
                 return Ok(());
@@ -634,6 +760,28 @@ impl App {
     }
 }
 
+/// This sidebar's place in the registry: listed (`@sidebar_open` up, the
+/// status line hidden) on creation, unlisted (and the status line back once
+/// no sidebar is open) on drop.
+struct Open {
+    reg: Registry,
+    me: i32,
+}
+
+impl Open {
+    fn new(reg: Registry) -> Open {
+        let me = std::process::id() as i32;
+        reg.open(me);
+        Open { reg, me }
+    }
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.reg.close(self.me);
+    }
+}
+
 /// Set up the terminal, run, and restore it whatever happened. Errors once
 /// running (the pane is gone: EIO, EPIPE) end it quietly, like the Python.
 fn live(tmux: Tmux, args: &[String]) -> io::Result<()> {
@@ -643,8 +791,14 @@ fn live(tmux: Tmux, args: &[String]) -> io::Result<()> {
         arg_after(args, "--tmux-pane").map(String::from),
         std::env::var("WEZTERM_PANE").ok().filter(|s| !s.is_empty()),
     );
-    let mut app = App::new(tmux, link, Notices::register(&notice::names()));
+    let mut app = App::new(tmux.clone(), link, Notices::register(&notice::names()));
+    app.persist = true;
     let sig = term::Signals::install()?;
+    // In the registry (status line hidden) from here until every exit path
+    // drops the guard: a normal return, the never-alone exit, SIGHUP/SIGTERM
+    // (the loop returns), an error, or a panic unwinding.
+    let _open = Open::new(Registry::new(&tmux));
+    app.registry = Some(Registry::new(&tmux));
     let mut out = io::stdout();
     out.write_all(wezterm::strip_marker().as_bytes())?;
     out.flush()?;
@@ -739,7 +893,7 @@ mod tests {
             row("main", 2, "@2", &[]),
             "\x1fclient\x1f/dev/ttys999\x1f@2\x1fmain".into(),
         ].join("\n"));
-        a.view = build_view(&mut a.core, Some("/dev/ttys999"));
+        a.view = build_view(&mut a.core, Some("/dev/ttys999"), None).0;
         a.shown = layout(&a.view, 34, 30, &Opts::default());
         let y = a.shown.agents.start + a.shown.rows[a.shown.agents.clone()].iter().position(|r| r.text().contains("Quiet one")).unwrap();
         let (x, y1) = (5, y + 1);
@@ -825,6 +979,25 @@ mod tests {
         assert_eq!(a.cadence(), TICK);
     }
 
+    /// The loop's side of the key-table poll: nothing read while the poll is
+    /// idle or not yet due; a due read that fails (no client here) refreshes
+    /// once, which sees no table and stops it: no further reads.
+    #[test]
+    fn the_key_table_poll_reads_only_when_due() {
+        let mut a = app();
+        let t0 = Instant::now();
+        a.poll_key_table(t0);
+        assert_eq!((a.key_reads, a.keypoll.polling()), (0, false));
+        a.keypoll.seen("prefix", t0);
+        a.poll_key_table(t0);
+        assert_eq!(a.key_reads, 0); // not due yet
+        let due = a.keypoll.due().unwrap();
+        a.poll_key_table(due);
+        assert_eq!((a.key_reads, a.keypoll.polling()), (1, false));
+        a.poll_key_table(due + Duration::from_secs(1));
+        assert_eq!(a.key_reads, 1);
+    }
+
     /// The client process: a pid seen, then unlisted, ends the sidebar only
     /// once the process is dead. tmux 3.7 drops suspended (prefix C-z) and
     /// locked clients from list-clients while they live: those stay. A
@@ -890,7 +1063,7 @@ mod tests {
         hide_homes(&mut a.core.snapshot);
         for scope in ["", "all", "space"] {
             a.core.snapshot.clients[0].strip_scope = scope.into();
-            let v = build_view(&mut a.core, Some("/dev/ttys999"));
+            let v = build_view(&mut a.core, Some("/dev/ttys999"), None).0;
             assert_eq!(v.counts.total(), 1, "{scope}");
             assert!(v.agents().all(|x| x.window_id != "@9"), "{scope}");
             let f = layout(&v, 34, 30, &Opts::default());
@@ -898,6 +1071,55 @@ mod tests {
             // Its space is still the client's.
             assert!(v.spaces.iter().any(|s| s.name == "main" && s.is_current));
         }
+    }
+
+    /// The sidebar and the ⌥W menu assign the SAME letters from the same
+    /// snapshot (one shared function, `letters::of_view`): unique, home
+    /// windows never lettered, a duplicate going to the lower window id, a
+    /// parked window's stale claim unset. The writes are the menu's, sent
+    /// once, and never again once tmux shows them.
+    #[test]
+    fn letters_are_shared_with_the_menu_and_persisted_once() {
+        let cl = "/dev/ttys999";
+        let raw = Snapshot::parse(&[
+            row("main", 0, "@9", &[("home", "1"), ("state", "running")]),
+            row("main", 1, "@1", &[("state", "idle"), ("key", "s")]),
+            row("main", 2, "@2", &[("state", "running")]),
+            row("main", 3, "@6", &[]),
+            row("work", 1, "@3", &[("state", "needs-input")]),
+            row("work", 2, "@4", &[("state", "idle"), ("key", "s")]),
+            row("stash", 1, "@5", &[("state", "idle"), ("key", "a")]),
+            format!("\x1fclient\x1f{cl}\x1f@2\x1fmain"),
+        ].join("\n"));
+        let menu = crate::menu::rows::Data::build(&raw, Some(cl), 0.0, &crate::collate::Collator::new("C"), None, None);
+        let mut a = app();
+        a.core.snapshot = raw.clone();
+        hide_homes(&mut a.core.snapshot);
+        let mut keys = KeyMemo::default();
+        let (v, writes) = build_view(&mut a.core, Some(cl), Some(&mut keys));
+        let got: Vec<(String, Option<char>)> = v.agents().map(|x| (x.window_id.clone(), x.letter)).collect();
+        assert_eq!(got, [("@1".into(), Some('s')), ("@2".into(), Some('a')), ("@3".into(), Some('d')), ("@4".into(), Some('f'))]);
+        for (id, l) in &got {
+            assert_eq!(*l, menu.letter(id), "{id}: the menu agrees");
+        }
+        assert_eq!((menu.letter("@9"), menu.letter("@6"), menu.letter("@5")), (None, None, None));
+        // NEEDS YOU cards carry the same letter.
+        assert_eq!(v.needs.iter().map(|n| n.agent.letter).collect::<Vec<_>>(), [Some('d')]);
+        let want: Vec<KeyWrite> = vec![("@2".into(), Some('a')), ("@3".into(), Some('d')), ("@4".into(), Some('f')), ("@5".into(), None)];
+        assert_eq!((&writes, &menu.key_writes), (&want, &want));
+        // Idempotent: the same snapshot again sends nothing (in flight)...
+        assert!(build_view(&mut a.core, Some(cl), Some(&mut keys)).1.is_empty());
+        // ...and once tmux shows the writes, nothing either, the memo settled.
+        for w in a.core.snapshot.windows.iter_mut() {
+            if let Some((_, k)) = want.iter().find(|(id, _)| *id == w.id) {
+                w.key = k.map(String::from).unwrap_or_default();
+            }
+        }
+        let (v2, again) = build_view(&mut a.core, Some(cl), Some(&mut keys));
+        assert!(again.is_empty() && keys.is_empty());
+        assert_eq!(v2.agents().map(|x| x.letter).collect::<Vec<_>>(), [Some('s'), Some('a'), Some('d'), Some('f')]);
+        // `--once` (no memo) computes them but returns nothing to send.
+        assert!(build_view(&mut a.core, Some(cl), None).1.is_empty());
     }
 
     #[test]

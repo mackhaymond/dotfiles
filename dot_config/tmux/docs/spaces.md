@@ -13,6 +13,7 @@ is a **shell**. One shell per space is its **home** (`@space_home 1`).
 | `tmux.conf.tmpl` | `set -g @spaces on` (the one flag) and `@space_hidden_sessions` (the one hidden list), near the top; `source-file -F "#{d:current_file}/spaces.conf"` as the last line |
 | `spaces.conf` | everything else: hooks, status lines, keys. `%if @spaces on … %else … %endif` |
 | `scripts/space.sh` | the logic a format can't do: `sync`, `agent`/`shell N`, `next`/`prev`, `toggle`, `close`, `move-menu`/`move-to`, `respawn-home`, `new-space`, `open-dir` |
+| `scripts/space-dash.sh` | the home dashboard (below); `--once` draws one frame |
 | `tests/test_spaces.py` | real `-L` servers, keys sent with `send-keys -K`, clicks as SGR reports |
 | `wezterm.lua.tmpl` | the digit rows: CTRL+N and CMD+N send prefix keys (below) |
 
@@ -45,11 +46,14 @@ branch leaves them alone because `prefix r` re-runs tmux.conf, which binds
 them, before spaces.conf. The test checks cold `off`, and `on → off`.
 
 Not gated: the hidden marker, the `@space_index` numbering and its
-`@space_key` label (session options nothing else reads), the `user-keys`
-(the WezTerm chords), and the `pane-died[20]` hook that respawns a home shell.
-A home made while on stays a home when the flag goes off (an ordinary shell
-then, closable with prefix x, still respawning if its shell exits). With the
-flag off, sync makes no homes and writes no registry.
+`@space_key` label, `@space_color` from the registry (session options), the
+`user-keys` (the WezTerm chords), the `pane-died[20]` hook that respawns a
+home shell or dashboard, and the `window-pane-changed[20]` hook that keeps
+the focus off a dashboard. A home made while on stays a home when the flag
+goes off (an ordinary shell then, closable with prefix x, still respawning if
+its shell exits; its dashboard likewise). With the flag off, sync makes no
+homes or dashboards and writes no registry. `status` is always on, and there
+is no M-f / `jump` table.
 
 ## Hidden sessions
 
@@ -95,10 +99,93 @@ inserted as the lowest window. Homes without an agent are dropped from the
 agent roster and the Python strip (`@space_home` is the last field of
 agent-roster.py's FMT).
 
+## Home: the dashboard
+
+The home window is two panes: on top, full width and 9 rows, the
+**dashboard** (`space-dash.sh`); below it the home shell, which stays the
+focused pane and keeps Option-1.
+
+```
+  ▀█▀ █▄█ █ █ █ █   ⌃2  ~/.local/share/chezmoi
+   █  █▀█ █ █ ▄▀▄    main  ±16
+   ▀  ▀ ▀ ▀▀▀ ▀ ▀   4 agents · 2 shells · 1 parked
+
+  ◐ ⌘1 a  tmux/Tmux Agent Sidebar  Two implementers are running in parallel
+  ◉ ⌘2 d  tmux/home dashboard  Allow Bash(notifyutil -p ...)?
+  ✓ ⌘3 f  tmux/resurrect guard  Everything is live on your server
+  ○ ⌘4    tmux/Canvas syllabus
+  ⌥1 home · ⌥2-9 shells · ⌘1-9 agents · ⌥` agent↔shell · ⌥F jump · ⌥N new space · prefix Q close
+```
+
+Idle cost, measured on a test server over 60 s: 0.00-0.02 s of CPU (under
+0.04%) for the dashboard's bash, its reader and its `notifyutil`, wakes for
+the live server's notices included. A dashboard whose pane is gone (tmux
+answers a missing target with empty fields, not an error, so it checks its
+own `#{pane_id}` comes back) exits at its next draw, at most 60 s later.
+
+The name, large (a 3x5 font in half blocks; plain bold when the pane is too
+narrow), in the space's colour; its ⌃N key and folder; git branch, dirty
+count (`±N`, or `clean`) and ahead/behind; the agent / shell / parked counts
+(parked = windows in `stash` whose `@stash_origin` is this space); one line
+per agent, by ordinal (⌘N), with its state shape (✕ ◉ ✓ ◐ ○, colours as the
+roster), its ⌥F letter (`@agent_key`), its summary and detail (as many as
+fit, then `+N more`); a key hint.
+
+- **Redraws** on `com.mackhaymond.tmux.agent-state` and
+  `com.mackhaymond.tmux.focus`: one long-lived `notifyutil -w` per dashboard,
+  read in a background `read -t 60` that the loop `wait`s for (a trapped
+  SIGWINCH interrupts `wait`, not `read`, so a resize redraws at once). Idle
+  is a blocked `wait`: no polling, no forks; the 60 s timeout is the
+  fallback refresh. A burst of notices is drawn once (0.15 s settle). Each
+  redraw is one tmux call; git (`--no-optional-locks status`) runs only
+  while the dashboard can be seen (session attached, home window current),
+  at most every 3 s.
+- **Height**: a window resize shares the change among panes, so a redraw
+  that finds the pane not 9 rows resizes it back (not while zoomed, not in a
+  window under 15 rows).
+- **Never focused**: `window-pane-changed[20]` (not gated) hands the focus
+  to the pane below it, whatever made it active (a click, prefix Up,
+  vim-tmux-navigator, the pane below closing). Pure tmux, no fork.
+- **Not a shell, not a tab**: shells are windows, so it is never counted or
+  listed as one; `close` sends no dashboard through the closer.
+- **Cannot be closed**: the pane carries `@space_dash_pane` and
+  `remain-on-exit on`; when it dies `pane-died[20]` respawns it (as the home
+  shell, at most every 2 s); prefix x / C-l refuse it. Splits in home close
+  normally.
+- **sync** keeps exactly one per home: a home without one (from before the
+  dashboard) gets one, after its other commands, under the registry lock (so
+  concurrent syncs never add two); a dead one, or one not running the
+  dashboard, is respawned; a second marked one is killed. It also has the
+  title `space-dash`, which resurrect restores (it restores titles, not
+  options or this command): a restored home window's `space-dash` pane is
+  respawned as the dashboard, never adopted as the home shell. A home left
+  with only its dashboard gets a new shell below it.
+  A new home window is made in a tmux call of its own, and a dashboard is
+  split only into a window read back as `@space_home` just before, never by
+  position (`$sid:^`): a tmux command list stops at its first failing
+  command (a pane gone between sync's read and its write), which could drop
+  the new home and leave the lowest window, an agent's, to get the
+  dashboard. sync's batched commands rerun one by one when the batch fails.
+- `last-pane` (prefix ;) in a home window: right after a bounce the "last"
+  pane is the dashboard, so prefix ; then stays put. tmux has no way to
+  restore the last-pane marker; it only matters with your own splits in
+  home, and only after something tried to focus the dashboard.
+
+## Colours
+
+Each space has a stable colour, the session option `@space_color` (hex),
+which the sidebar reads too. main is always lavender `#b4befe`; the others
+get, when registered, the palette colour the fewest registered spaces use
+(ties in palette order): mauve, teal, pink, sapphire, peach, flamingo, sky,
+rosewater, blue. No red, yellow or green: those are states. Kept in the
+registry's third column, so it survives a restart and a rename; a line from
+before the column (or with a bad value) gets one at the next sync. Hidden
+sessions have none.
+
 ## Registry: spaces survive a restart
 
 `@space_registry` (default `~/.local/state/tmux-spaces/spaces.tsv`): one
-`name<TAB>folder` line per space, in tab order, main included. Written only
+`name<TAB>folder<TAB>colour` line per space, in tab order, main included. Written only
 with the flag on, under a mkdir lock (held only briefly; a holder removes it
 only while it still holds its own token), by `sync` (a new space is appended, a
 renamed one keeps its line, one renamed into the hidden list is dropped, one
@@ -127,30 +214,33 @@ back as shells named `home` and are adopted.
 ## Status (flag on: ONE line)
 
 ```
-█⌃1█ main█ ⌃3● █1█ 󰋜 ~██2█ ~█ [+]                       … status-right
+█⌃1 main ●  ⌃3● █1█ 󰋜 ~██2█ ~█ [+]                       … status-right
 ```
 
 The full list of spaces, with their ⌃N keys, is in the sidebar. The status
 line shows, left to right:
 
-**This space's tab**, `⌃N name`. The label is the session option
+**This space's chip**, `⌃N name`: a solid block in the space's colour
+(`@space_color`, peach until it has one), bold crust text, ended by a
+powerline edge (U+E0B0, which WezTerm draws itself) and a gap, so it never
+reads as a shell tab. Red while the prefix is pressed (what catppuccin's
+`session` module showed, see below). The label is the session option
 `@space_key` (the key that reaches the space; `space.sh sync` sets it next to
 `@space_index`, `⌃N` for now), so a new key scheme is one line of the script.
-Spaces past 9 have no key: `@space_key` is unset, the chip is a bare block
-and their alert shows the name (`proj●`). Its state is the space's **rollup**, in the window tabs' colour language:
+Spaces past 9 have no key: `@space_key` is unset, the chip shows the name
+alone and their alert shows the name (`proj●`). After the edge, the space's
+**rollup**, in the window tabs' colour language:
 
-- chip: peach; crust under a tint; red while the prefix is pressed (what
-  catppuccin's `session` module showed, see below)
-- body: red failed > yellow needs-* > green done (done+workflow does not
-  count) > stock
+- a ●: red failed > yellow needs-* > green done (done+workflow does not
+  count); nothing otherwise
 - glyph: 󰒓 any background workflow, else 󰍽 any computer use
 
 Inside a hidden session its name (`[agents]`) stands in for the tab: dimmed,
 or crust on red while the prefix is pressed, like the chip.
 
-**Other spaces that need you**: `⌃N●` in red / yellow / green for each other
-visible space whose rollup is failed / needs-* / done (the states prefix d
-walks). In-flight and idle spaces never show, so this is usually empty. One
+**Other spaces that need you**: `⌃N●`, the ⌃N in that space's colour and the
+● red / yellow / green, for each other visible space whose rollup is failed /
+needs-* / done (the states prefix d walks). In-flight and idle spaces never show, so this is usually empty. One
 `S:` loop, in name order. Each is `#[range=session|$id]`, so tmux's own
 `MouseDown1Status` (`switch-client -t =`) switches on click.
 
@@ -182,6 +272,33 @@ otherwise. The trigger is any window of the space carrying `@stash_sel`.
 No `#()` in the line, one `S:` loop, and hidden sessions are skipped before
 any `W:` runs inside them.
 
+**While the sidebar is open.** The agent sidebar (agent-ui) keeps the global
+`@sidebar_open` (how many sidebars are open) and turns `status` off while any
+is. A reload honours it: with spaces on, `status` is off when
+`@sidebar_open` > 0, else on. With spaces off it is always on.
+A sidebar killed outright (SIGKILL) never counts itself out, so with spaces
+on `agent-ui sidebar --repair` (`@space_agent_ui`, default
+`~/.local/bin/agent-ui`) recounts: synchronously at load, before that gate,
+and on every `client-attached[21]`. No binary means no sidebar: the count is
+unset and the line stays on.
+
+## The prefix: a root binding (tmux.conf.tmpl)
+
+`set -g prefix None` and `bind -n C-s switch-client -T prefix \; run-shell -b
+"notifyutil -p com.mackhaymond.tmux.focus"`, so arming the prefix posts the
+focus notice and the sidebar can show it at once (it reads
+`#{client_key_table}`; the status line, hidden then, no longer can). The
+`prefix` option has to be None: tmux checks it before any root binding, so a
+root binding of the prefix key never runs. Checked on a test server
+(`test_prefix_as_a_root_binding_keeps_every_prefix_use`): C-s <key>, C-s C-s
+(the resurrect save), the `-r` repeat keys (C-s during a repeat re-arms), C-s
+from copy mode (copy-mode-vi has no C-s, so tmux falls back to the root
+table) all behave as before; `#{client_prefix}` still means "in the prefix
+table", so the chip still turns red. `send-prefix` would send nothing; nothing
+binds it (C-s C-s is the save; tmux-sensible's own `bind None …` attempts
+fail silently). Only the arming edge is posted: tmux has no hook for leaving
+a key table, so the sidebar re-reads `#{client_key_table}` after the next key.
+
 ## Keys (flag on)
 
 | key | tmux | does |
@@ -194,6 +311,7 @@ any `W:` runs inside them.
 | ⌥M | M-m | move this tab to another space: a menu of the spaces (number = key); the tab goes to the end of that space, you stay here. Not home, not from a hidden session |
 | ⌥N | M-n | new space: zoxide/fzf folder picker (as `prefix K`), then reuse the session already on that folder, else `new-session -d -s <basename> -c <dir>`; switch to it. `~` → main |
 | ⌥V | M-v | sidebar scope, this space ↔ all spaces (posts `com.mackhaymond.tmux.focus` so the Rust sidebar redraws at once) |
+| ⌥F *letter* | M-f, then key table `jump` | the agent whose window option `@agent_key` is that letter, in any space (`switch-client -t '$S:@W'`, one step); hidden sessions never. Escape, or any other key (`Any`), cancels and is swallowed. Entering and leaving post `com.mackhaymond.tmux.focus` so the sidebar can show "jump mode" (`#{client_key_table}` = `jump`). The sidebar assigns the letters; this only reads them. No fork: an `S:`/`W:` loop, `#{s/ .*//:}` keeps the first match, the letter rides in the global `@space_jump_key` |
 | — | prefix Q | close this space: `confirm-before` "close space bai: 2 agents, 1 shell? (y/n)", then `space.sh close`: it is marked `@space_closing` (no sync re-registers it or rebuilds its home meanwhile) and unregistered, clients on it move to main (detach-on-destroy would close them), every pane goes through `closed-tabs.sh close` (snapshot + agent session id, so CMD+Z can bring each back; `@space_closer` overrides, `none` skips), the session is killed and unregistered. Never main, never a hidden session |
 | CMD+W, CMD+SHIFT+W | prefix x, C-l | as tmux.conf, except on home (refuse) |
 | — | c, C-t, k, C-k | in a project space (path ≠ `~`, not hidden) the new tab starts in the space folder; elsewhere unchanged |
@@ -236,11 +354,20 @@ in Claude Code, zsh (vi keymap: no `^[` bindings in viins) and nvim (only
 `<A-e>`, `<A-o>`, `<A-g>` are mapped). ⌥1-9, ⌥M, ⌥N, ⌥\` are free in all
 three. Already-taken root keys (M-s M-x M-w M-a M-q) are untouched.
 
+⌥F (M-f) was unbound in tmux and WezTerm, and nvim maps no `<A-f>`; the
+root binding takes it from the pane, as ⌥X / ⌥C took theirs: zsh's emacs-mode
+`forward-word` and Claude Code's meta+f (word forward in its prompt) are
+lost. With spaces off there is no M-f binding and no `jump` table.
+
 ## For the Rust sidebar (agent-ui)
 
 Home windows have no `@agent_state`, so with spaces on they are never agent
 rows already. Anywhere it lists plain windows (show-all, spaces off), it
-should drop `@space_home` windows the way agent-roster.py does.
+should drop `@space_home` windows the way agent-roster.py does. Anywhere it
+lists PANES, it should drop `@space_dash_pane` ones (the home dashboard).
+It reads `@space_color` (each space's colour), keeps `@sidebar_open` (the
+status line follows it), and shows "prefix armed" / "jump mode" from
+`#{client_key_table}` (`prefix` / `jump`) on the focus notice.
 
 ## Session names
 

@@ -2,27 +2,33 @@
 //! (each exactly `width` cells, with what a click on each cell does) out. No
 //! I/O, so every density rule is unit-tested.
 //!
-//! ## Shape: NEEDS YOU, then agents (the body), then spaces
+//! ## Shape: status block, NEEDS YOU, then agents (the body), then spaces
 //!
 //! ```text
-//!  space               ◉1 ◐2 ○8      header + counts (the title flips the scope)
+//!   ⌃1 main   prefix    ◉1 ◐2 ○8     the space chip (@space_color), counts
+//!  ⌥1 ⌂~  ⌥2 nvim  ⌥3 src            this space's shells (status block,
+//!   S  71%  W  19%  F  0%            usage, the stale save: what the
+//!   !  last save 2h ago              hidden tmux status line showed)
 //!  ⏵ next ⌥S  ⤺ back ⌥X  ≡ ⌥W       toolbar (Actions next/back, the menu)
 //!
 //!  needs you                    1    agent-jump.sh `list` order, cards
-//! ▌ ◉ Kua Yu focus timing     44m
-//! ▌    asks Which deck should…
-//! ▌    main:3 · ✳ claude    ⏎ go
+//! ▌ g ◉ Kua Yu focus timing   44m    the letter badge first
+//! ▌      asks Which deck should…
+//! ▌      main:3 · ✳ claude  ⏎ go
 //!
 //!  agents                this space  the main body
 //!  main ⌥ main ──────── ◉1 ◐2 ○4     one rule per space with agents
-//!  1 ◉ Kua Yu focus timing           each agent: number, title …
+//!  g ◉ Kua Yu focus timing           each agent: letter, title …
 //!      asks Which deck should… 44m   … and what it does / waits on
 //!                                    (spare rows)
-//!  spaces                            THE list of spaces (the status bar has
-//!  ⌃1 ● main         ◉1 ◐2 ○4        none): ⌃N, name, counts, @space_index
-//!  ⌃2 ○ bai                ○2        order; anchored above the last row
+//!  spaces                            THE list of spaces: ⌃N (a chip in the
+//!  ⌃1 ● main         ◉1 ◐2 ○4        space's colour), name, counts,
+//!  ⌃2 ○ bai                ○2        @space_index order
 //!  ⏸ 5 parked                        the stash (click: prefix h's picker);
 //! ```                                a watcher problem in red
+//!
+//! Without a [`Bar`] (no client space, no usage, nothing selected) the top
+//! is the classic ` agents` / ` space` title and the toolbar.
 //!
 //! There is no event log and no divider any more: NEEDS YOU takes the rows
 //! its cards need, the agents section starts right under it, and the spaces
@@ -55,40 +61,38 @@
 //! ([`Row::covers`]), so a test can prove each agent is shown, folded,
 //! collapsed or counted.
 //!
-//! ## Numbers
+//! ## Letters
 //!
-//! Every agent row and NEEDS YOU card starts with the agent's sticky slot
-//! ([`crate::view::assign_slots`]), zero-padded once any slot reaches 10.
-//! Display only: the sidebar takes no number keys, and the Option-W menu
-//! uses per-agent letters instead. Rows of agents without one (idle, the client's
-//! plain window) leave the column blank, so titles stay aligned; with no
-//! slot anywhere the column is not drawn at all. The folded idle line has
-//! no numbers (idle agents hold none), and collapsed rules and `… N more`
-//! stand for many agents, so neither does.
+//! Every agent row and NEEDS YOU card starts with the agent's lifetime
+//! letter (`@agent_key`, assigned by [`crate::menu::letters::of_view`], the
+//! menu's own function) as a solid badge on its state colour ([`Badge`]);
+//! peach while ⌥F is armed. Agents without one leave it blank; with no
+//! letter anywhere the column is not drawn. The folded idle line and
+//! collapsed rules stand for many agents and have none.
 //!
 //! ## Scope
 //!
 //! [`crate::view::Scope`] (`@spaces` / `@strip_scope`): in SPACE scope the
-//! header reads ` space` with that session's counts, the agents section shows
-//! only the client's session (its rule and ` no agents in this space` when
-//! it has none), and its rows carry AGENT ORDINALS instead of slots: "1".."9"
-//! by window index among the session's agents, blank past 9, dropped when
-//! the title would keep fewer than 4 cells. NEEDS YOU (unnumbered there),
-//! the spaces list and parked stay global. The header title is the toggle
-//! once the scope is a thing.
+//! header's counts are that session's, the agents section shows only the
+//! client's session (its rule and ` no agents in this space` when it has
+//! none). NEEDS YOU, the spaces list and parked stay global. The header's
+//! chip (or title) is the toggle once the scope is a thing.
 //!
 //! ## Colour
 //!
 //! No row has a background of its own: every cell is the terminal's default
 //! background ([`Color::Reset`]), so the split is WezTerm's own colour. The
 //! only tints left mark where the client is: the agent row of its window
-//! (`sel`) and its space's row in the spaces list (`surface0`).
+//! (`sel`) and its space's row in the spaces list (`surface0`); plus the
+//! stash selection's mauve (prefix v) and the solid chips (letters, the
+//! space chip, ⌃N, usage).
 
+use super::status::{ink_on, tmux_colour, Bar, Shell};
 use crate::actions::watcher_problem;
-use crate::hotkeys::slot_label;
 use crate::model::{Cat, Counts, Flag};
 use crate::palette;
 use crate::text::{clip, dwidth, fit_label, plain, sanitize};
+use crate::menu::render::badge_color;
 use crate::view::{tilde, Agent, Need, Space, ViewModel};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -100,22 +104,52 @@ use unicode_width::UnicodeWidthStr;
 /// A palette colour name ([`palette::HEX`] or [`palette::UI`]).
 pub type Hue = &'static str;
 
+/// A colour a segment is drawn in: a palette name, or one a tmux option
+/// spelled (`@space_color`'s `#rrggbb`, the usage modules' `colour239`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ink {
+    Pal(Hue),
+    Rgb(u8, u8, u8),
+    Idx(u8),
+}
+
+impl Ink {
+    pub fn color(self) -> Color {
+        match self {
+            Ink::Pal(p) => palette::color(p),
+            Ink::Rgb(r, g, b) => Color::Rgb(r, g, b),
+            Ink::Idx(n) => Color::Indexed(n),
+        }
+    }
+}
+
+impl From<Hue> for Ink {
+    fn from(h: Hue) -> Ink {
+        Ink::Pal(h)
+    }
+}
+
 /// A run of text in one style.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seg {
     pub text: String,
-    pub fg: Hue,
+    pub fg: Ink,
     /// None: the row's background.
-    pub bg: Option<Hue>,
+    pub bg: Option<Ink>,
     pub bold: bool,
 }
 
-fn seg(text: impl Into<String>, fg: Hue) -> Seg {
-    Seg { text: text.into(), fg, bg: None, bold: false }
+fn seg(text: impl Into<String>, fg: impl Into<Ink>) -> Seg {
+    Seg { text: text.into(), fg: fg.into(), bg: None, bold: false }
 }
 
-fn bold(text: impl Into<String>, fg: Hue) -> Seg {
+fn bold(text: impl Into<String>, fg: impl Into<Ink>) -> Seg {
     Seg { bold: true, ..seg(text, fg) }
+}
+
+/// A solid block: `text` in `fg` on `bg`, bold.
+fn block(text: impl Into<String>, fg: impl Into<Ink>, bg: impl Into<Ink>) -> Seg {
+    Seg { bg: Some(bg.into()), ..bold(text, fg) }
 }
 
 fn width(segs: &[Seg]) -> usize {
@@ -166,6 +200,9 @@ pub enum Target {
     Go { win: String, session: String },
     /// A space row or rule: that session's active window (Strip.click "session").
     Session(String),
+    /// One of this space's shells in the status block (⌥N): that window,
+    /// like an agent row, but never parked by a right-click.
+    Shell { win: String, session: String },
     /// The toolbar: agent-jump.sh next / back.
     Next,
     Back,
@@ -243,6 +280,9 @@ pub struct Frame {
     pub step: u8,
     /// The agents section's own ladder step (0 = two lines each).
     pub agents_step: u8,
+    /// The status block under the header (shells, usage, the stale save,
+    /// the selection hint): empty without a [`Bar`].
+    pub status: Range<usize>,
     /// The rows of each section, header included (empty: not drawn).
     pub needs: Range<usize>,
     pub agents: Range<usize>,
@@ -261,6 +301,9 @@ impl Frame {
 pub struct Opts {
     /// A transient message for the last row (Roster.say).
     pub msg: Option<String>,
+    /// What the hidden tmux status line showed ([`Bar`]); the default (no
+    /// client space) draws the classic header and no status block.
+    pub bar: Bar,
 }
 
 /// A state's colour in the sidebar: CAT_HUE, except working is the steady
@@ -308,23 +351,228 @@ fn dim_line(w: usize, text: &str) -> Row {
     Row::new(fit(w, vec![seg(text, "overlay")], vec![], None))
 }
 
-/// Row 0: ` agents` and the per-state counts over every shown space; in
-/// space scope ` space` and that session's counts. The title is the scope
-/// toggle ([`Target::Scope`]) once the scope is a thing
+/// Row 0: the client's SPACE CHIP (the status line's, which is hidden while
+/// a sidebar is open): a solid block in the space's `@space_color` (the
+/// neutral `surface1` without one), ` ⌃N name `, then a red ` prefix `
+/// while the client's key table is `prefix`; on the right the per-state
+/// counts (every shown space's, or in space scope that session's). While
+/// ⌥F is armed (key table `jump`) a peach ` ⌥F jump ` mark takes the
+/// prefix mark's place and the right side is the hint `type a letter`
+/// instead (`⌥F · type a letter` without a chip). Without a client space (no [`Bar`]): the classic `
+/// agents` / ` space` title. The chip (or title) is the scope toggle
+/// ([`Target::Scope`]) once the scope is a thing
 /// ([`crate::view::Scope::toggles`]).
-fn header_row(view: &ViewModel, w: usize) -> Row {
+fn header_row(view: &ViewModel, bar: &Bar, w: usize) -> Row {
     let (title, counts) = match view.scope.session {
         Some(_) => (" space", &view.scope.counts),
         None => (" agents", &view.counts),
     };
-    let mut right = count_segs(counts, true);
-    right.push(seg(" ", "text"));
-    let mut row = Row::new(fit(w, vec![bold(title, "text")], right, None));
-    let end = dwidth(title).min(w) as u16;
+    let left = match &bar.space {
+        None => vec![bold(title, "text")],
+        Some(chip) => {
+            let name = sanitize(&chip.name);
+            let mut left = vec![seg(" ", "text")];
+            if chip.hidden {
+                left.push(seg(format!("[{name}]"), "overlay"));
+            } else {
+                let label = match chip.index.filter(|n| (1..=9).contains(n)) {
+                    Some(n) => format!(" ⌃{n} {name} "),
+                    None => format!(" {name} "),
+                };
+                let bg = chip.color.unwrap_or(Ink::Pal("surface1"));
+                left.push(block(label, ink_on(bg), bg));
+            }
+            if bar.prefix {
+                left.extend([seg(" ", "text"), block(" prefix ", "crust", "red")]);
+            } else if bar.jump {
+                left.extend([seg(" ", "text"), block(" ⌥F jump ", "crust", "peach")]);
+            }
+            left
+        }
+    };
+    let right = if bar.jump {
+        // With a chip the ⌥F is in the mark beside it, and the hint gives
+        // way to it when both do not fit.
+        let hint = if bar.space.is_some() { "type a letter " } else { "⌥F · type a letter " };
+        if bar.space.is_some() && width(&left) + dwidth(hint) > w {
+            Vec::new()
+        } else {
+            vec![bold(hint, "yellow")]
+        }
+    } else {
+        let mut r = count_segs(counts, true);
+        r.push(seg(" ", "text"));
+        r
+    };
+    // The title, or the chip after its leading space.
+    let end = match bar.space {
+        None => dwidth(title),
+        Some(_) => 1 + left.get(1).map_or(0, |s| dwidth(&s.text)),
+    };
+    let mut row = Row::new(fit(w, left, right, None));
+    let end = end.min(w) as u16;
     if view.scope.toggles() && end > 1 {
         row.targets.push((1, end, Target::Scope));
     }
     row
+}
+
+/// Whether there is a status block at all (a client space, usage, a stale
+/// save or a selection to show). Without one the frame is the classic one.
+fn bar_shown(bar: &Bar) -> bool {
+    bar.space.is_some() || !bar.usage.is_empty() || bar.stale.is_some() || bar.selecting.is_some()
+}
+
+/// The stash tint (catppuccin's `@stash_sel` tab colour): the row on mauve,
+/// every segment without its own block in dark ink.
+fn stash_tint(mut row: Row) -> Row {
+    row.bg = Some("mauve");
+    for s in row.segs.iter_mut().filter(|s| s.bg.is_none()) {
+        s.fg = Ink::Pal("crust");
+    }
+    row
+}
+
+/// prefix v's range selection is live: ` N selected ` on mauve and stash.sh's
+/// real keys (tmux.conf.tmpl's `stash` table), as many as fit.
+fn hint_row(n: usize, w: usize) -> Row {
+    let chip = block(format!(" {n} selected "), "crust", "mauve");
+    let room = w.saturating_sub(1 + dwidth(&chip.text));
+    let keys = ["h/l extend · ⏎ park · m move · esc cancel", "h/l · ⏎ park · m move · esc", "h/l ⏎ park esc", "h/l ⏎ esc"]
+        .into_iter()
+        .find(|k| dwidth(k) < room)
+        .unwrap_or("");
+    Row::new(fit(w, vec![seg(" ", "text"), chip, seg(format!(" {keys}"), "sub")], vec![], None))
+}
+
+/// THE shell label: `⌥N` (Option+N, space.sh's `shell N`; blank past 9).
+fn shell_key(s: &Shell) -> Option<String> {
+    (s.n <= 9).then(|| format!("⌥{}", s.n))
+}
+
+/// This space's shells, numbered ⌥1..N (home first), flowed over at most
+/// `lines` rows; each chip clicks through to its window ([`Target::Shell`]).
+/// The active one is bold peach (the status line's active tab), a selected
+/// one (`@stash_sel`) on the stash's mauve. What does not fit is `+K`.
+fn shell_rows(bar: &Bar, w: usize, lines: usize) -> Vec<Row> {
+    if lines == 0 || bar.shells.is_empty() || w < 6 {
+        return Vec::new();
+    }
+    let chip = |s: &Shell| -> Vec<Seg> {
+        let label = format!("{}{}", if s.home { "⌂" } else { "" }, clip(&s.label, 12));
+        let (kf, lf) = if s.selected { (Ink::Pal("crust"), Ink::Pal("crust")) } else if s.active {
+            (Ink::Pal("peach"), Ink::Pal("peach"))
+        } else {
+            (Ink::Pal("overlay"), Ink::Pal("sub"))
+        };
+        let mut v = Vec::new();
+        if let Some(k) = shell_key(s) {
+            v.push(seg(format!("{k} "), kf));
+        }
+        v.push(Seg { bold: s.active, ..seg(label, lf) });
+        if s.selected {
+            for x in &mut v {
+                x.bg = Some(Ink::Pal("mauve"));
+            }
+        }
+        v
+    };
+    type Line = (Vec<Seg>, Vec<(u16, u16, Target)>, usize);
+    let fresh = || -> Line { (vec![seg(" ", "text")], vec![], 1) };
+    let mut out: Vec<Line> = vec![fresh()];
+    let total = bar.shells.len();
+    let mut i = 0;
+    while i < total {
+        let s = &bar.shells[i];
+        let c = chip(s);
+        let cw = width(&c);
+        let on_last = out.len() == lines;
+        let line = out.last_mut().expect("a line");
+        let sep = if line.2 > 1 { 2 } else { 0 };
+        let after = total - i - 1;
+        // On the last line, keep room for ` +K` when more follow.
+        let tail = if on_last && after > 0 { 2 + after.to_string().len() } else { 0 };
+        let x0 = line.2 + sep;
+        if x0 + cw + tail <= w || line.2 == 1 {
+            // It fits (a chip wider than a whole empty line is clipped).
+            if sep > 0 {
+                line.0.push(seg("  ", "text"));
+            }
+            line.0.extend(c);
+            let x1 = (x0 + cw).min(w);
+            line.1.push((x0 as u16, x1 as u16, Target::Shell { win: s.win.clone(), session: s.session.clone() }));
+            line.2 = x1;
+            i += 1;
+        } else if !on_last {
+            out.push(fresh());
+        } else {
+            line.0.push(seg(format!(" +{}", total - i), "overlay"));
+            break;
+        }
+    }
+    out.into_iter()
+        .map(|(segs, targets, _)| Row { targets: targets.into_iter().filter(|(a, b, _)| a < b).collect(), ..Row::new(fit(w, segs, vec![], None)) })
+        .collect()
+}
+
+/// status-right's usage modules: ` S ` on its colour then ` 71% (-1%) `,
+/// `W`, the scoped one; the parenthesised deltas go when all three do not
+/// fit. None without usage options.
+fn usage_row(bar: &Bar, w: usize) -> Option<Row> {
+    if bar.usage.is_empty() {
+        return None;
+    }
+    let build = |short: bool| -> Vec<Seg> {
+        let mut v = vec![seg(" ", "text")];
+        for (i, u) in bar.usage.iter().enumerate() {
+            if i > 0 {
+                v.push(seg(" ", "text"));
+            }
+            let bg = u.color.unwrap_or(Ink::Pal("surface1"));
+            v.push(block(format!(" {} ", u.label), ink_on(bg), bg));
+            let text = if short { u.text.split(" (").next().unwrap_or("").to_string() } else { u.text.clone() };
+            v.push(seg(format!(" {text}"), "sub"));
+        }
+        v
+    };
+    let full = build(false);
+    let segs = if width(&full) <= w { full } else { build(true) };
+    Some(Row::new(fit(w, segs, vec![], None)))
+}
+
+/// The red stale-save chip of status-right (`@resurrect_stale`).
+fn stale_row(bar: &Bar, w: usize) -> Option<Row> {
+    let s = bar.stale.as_ref()?;
+    Some(Row::new(fit(w, vec![seg(" ", "text"), block(" ! ", "crust", "red"), seg(format!(" {s}"), "red")], vec![], None)))
+}
+
+/// The top of the frame: the header, the status block (the selection hint,
+/// the shells, usage, the stale save) and the toolbar → (rows, the status
+/// block's rows). Shorter frames give up, in order: the toolbar (under 20
+/// rows), the second shells line (under 24), usage and the stale save
+/// (under 12), the shells (under 10), the hint (under 6). Without a status
+/// block: the classic header and toolbar.
+fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize) -> (Vec<Row>, Range<usize>) {
+    let mut rows = vec![header_row(view, bar, w)];
+    if !bar_shown(bar) {
+        rows.push(toolbar_row(w));
+        return (rows, 1..1);
+    }
+    let s0 = rows.len();
+    if let Some(n) = bar.selecting.filter(|_| h >= 6) {
+        rows.push(hint_row(n, w));
+    }
+    let lines = if h >= 24 { 2 } else if h >= 10 { 1 } else { 0 };
+    rows.extend(shell_rows(bar, w, lines));
+    if h >= 12 {
+        rows.extend(usage_row(bar, w));
+        rows.extend(stale_row(bar, w));
+    }
+    let s1 = rows.len();
+    if h >= 20 {
+        rows.push(toolbar_row(w));
+    }
+    (rows, s0..s1)
 }
 
 /// Row 1: the three buttons (⌥ hints dropped when they do not fit).
@@ -350,74 +598,73 @@ fn toolbar_row(w: usize) -> Row {
     Row { targets, ..Row::new(fit(w, segs, vec![], None)) }
 }
 
-/// Which number a row's number column shows, and how wide it is.
+/// The agents' LETTER column: each agent row and NEEDS YOU card starts with
+/// its lifetime letter ([`crate::menu::letters`], the same `@agent_key` the
+/// ⌥W menu and UB's ⌥F table go by) as a solid ` a ` badge on its state's
+/// colour (the menu's [`badge_color`]), dark ink, bold. While ⌥F is armed
+/// (`loud`) every badge turns peach. Agents without a letter (past 26, the
+/// client's plain window) leave it blank so titles stay aligned; with no
+/// letter anywhere the column is not drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Num {
-    /// The label's width in cells; 0: no column at all.
-    w: usize,
-    /// Space scope: the agent's [`Agent::ordinal`] ("1".."9", blank past 9),
-    /// not its sticky slot.
-    ordinal: bool,
+struct Badge {
+    on: bool,
+    loud: bool,
 }
 
-impl Num {
-    const NONE: Num = Num { w: 0, ordinal: false };
-    /// Space scope's column: one digit.
-    const ORDINAL: Num = Num { w: 1, ordinal: true };
+/// A badge's cells (` a `).
+const BADGE_W: usize = 3;
 
-    /// The classic column: slots, zero-padded to `sw` ([`ViewModel::slot_width`]).
-    fn slots(sw: usize) -> Num {
-        Num { w: sw, ordinal: false }
+impl Badge {
+    #[cfg(test)]
+    const OFF: Badge = Badge { on: false, loud: false };
+
+    fn of(view: &ViewModel, bar: &Bar) -> Badge {
+        let on = view.agents().chain(view.needs.iter().map(|n| &n.agent)).any(|a| a.letter.is_some());
+        Badge { on, loud: bar.jump }
     }
-}
 
-/// THE agent label: what an agent row's (and card's) label column shows,
-/// at most `n.w` cells. Today the 1-9 ordinal (space scope) or the sticky
-/// slot. One swappable field: to show the ⌥W menu's lifetime letter
-/// instead, return the window's `@agent_key` stamp here (`Agent` would carry
-/// it from `Window::key`, read through `menu::letters::parse_key`; the
-/// sidebar only reads it, the menu owns the writes) and make `Num.w` 1.
-fn agent_label(a: &Agent, n: Num) -> Option<String> {
-    if n.ordinal {
-        a.ordinal.filter(|&o| o <= 9).map(|o| o.to_string())
-    } else {
-        a.slot.map(|s| slot_label(s, n.w))
+    /// The cells before an agent row's title: badge + glyph + space, or ` ◉ `.
+    fn lead(self) -> usize {
+        if self.on {
+            BADGE_W + 2
+        } else {
+            3
+        }
     }
-}
 
-/// The number column of an agent's first line: its slot label (zero-padded
-/// to `n.w`) or, in space scope, its ordinal, and a space; blank when it has
-/// none; None when there is no column (`n.w` 0). Display only: the sidebar
-/// has no number keys (the ordinals are tmux's M-1..M-9).
-fn num_seg(a: &Agent, n: Num) -> Option<Seg> {
-    (n.w > 0).then(|| match agent_label(a, n) {
-        Some(l) => seg(format!("{l} "), "sub"),
-        None => seg(" ".repeat(n.w + 1), "text"),
-    })
-}
+    /// The cells the badge column takes on a card (after its `▌`).
+    fn col(self) -> usize {
+        if self.on {
+            BADGE_W
+        } else {
+            0
+        }
+    }
 
-/// The cells [`num_seg`] takes: what the lines under it indent by.
-fn num_w(n: Num) -> usize {
-    if n.w > 0 {
-        n.w + 1
-    } else {
-        0
+    /// `a`'s badge (blank when it holds no letter).
+    fn seg(self, a: &Agent) -> Seg {
+        match a.letter {
+            Some(c) => block(format!(" {c} "), "crust", if self.loud { "peach" } else { badge_color(a) }),
+            None => seg(" ".repeat(BADGE_W), "text"),
+        }
     }
 }
 
 /// A NEEDS YOU card: 3, 2 or 1 lines, a left bar in the state colour
-/// (Strip.need_detail's reason on line 2), the agent's number first.
-fn need_rows(n: &Need, w: usize, lines: u8, sw: Num) -> Vec<Row> {
+/// (Strip.need_detail's reason on line 2), the agent's letter badge first.
+fn need_rows(n: &Need, w: usize, lines: u8, b: Badge) -> Vec<Row> {
     let a = &n.agent;
     let hue = a.color.unwrap_or("overlay");
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
     let card = |segs: Vec<Seg>| Row::new(segs).click(w, go.clone());
     let bar = || seg("▌", hue);
-    let indent = " ".repeat(num_w(sw));
+    let indent = " ".repeat(b.col());
     let age = if a.age.is_empty() { String::new() } else { format!("{} ", a.age) };
-    let (proj, title) = fit_label(no_home(&a.title), w.saturating_sub(3 + num_w(sw) + dwidth(&age)));
+    let (proj, title) = fit_label(no_home(&a.title), w.saturating_sub(3 + b.col() + dwidth(&age)));
     let mut first = vec![bar()];
-    first.extend(num_seg(a, sw));
+    if b.on {
+        first.push(b.seg(a));
+    }
     first.extend([seg(format!("{} ", a.glyph), hue), seg(proj, "overlay"), bold(title, "text")]);
     let mut rows = vec![card(fit(w, first, vec![seg(age, "sub")], None))];
     if lines >= 2 {
@@ -454,27 +701,25 @@ fn needs_header(view: &ViewModel, w: usize) -> Row {
 }
 
 /// The whole NEEDS YOU section. Never empty: with nothing pending it says so.
-/// Its cards carry slots, except in space scope, where numbers are ordinals
-/// of one session and NEEDS YOU is global: no numbers there.
-fn needs_block(view: &ViewModel, w: usize, lines: u8) -> Vec<Row> {
+/// Its cards carry the agents' letter badges, in both scopes.
+fn needs_block(view: &ViewModel, w: usize, lines: u8, b: Badge) -> Vec<Row> {
     let mut rows = vec![needs_header(view, w)];
     if view.needs.is_empty() {
         rows.push(dim_line(w, " ✓ nothing needs you"));
     }
-    let num = if view.scope.session.is_some() { Num::NONE } else { Num::slots(view.slot_width) };
     for n in &view.needs {
-        rows.extend(need_rows(n, w, lines, num));
+        rows.extend(need_rows(n, w, lines, b));
     }
     rows
 }
 
 /// NEEDS YOU in at most `room` rows: 1-line cards, the rest counted.
-fn needs_cut(view: &ViewModel, w: usize, room: usize) -> Vec<Row> {
+fn needs_cut(view: &ViewModel, w: usize, room: usize, b: Badge) -> Vec<Row> {
     let n = view.needs.len();
     let more = |k: usize, words: &str| {
         Row::new(fit(w, vec![seg(format!(" … {k} {words}"), "yellow")], vec![], None)).click(w, Target::Menu(None))
     };
-    let mut rows = needs_block(view, w, 1);
+    let mut rows = needs_block(view, w, 1, b);
     if rows.len() <= room {
         return rows;
     }
@@ -538,7 +783,11 @@ fn space_row(sp: &Space, w: usize, lw: usize) -> Row {
     if lw > 0 {
         let label = space_label(sp).unwrap_or_default();
         let pad = " ".repeat(lw.saturating_sub(dwidth(&label)) + 1);
-        left.push(seg(format!("{label}{pad}"), if sp.is_current { "blue" } else { "overlay" }));
+        match tmux_colour(&sp.color).filter(|_| !label.is_empty()) {
+            // The space's own colour (space.sh's @space_color): a solid chip.
+            Some(bg) => left.extend([block(format!("{label}{}", &pad[1..]), ink_on(bg), bg), seg(" ", "text")]),
+            None => left.push(seg(format!("{label}{pad}"), if sp.is_current { "blue" } else { "overlay" })),
+        }
     }
     let (mark, name) = if sp.is_current {
         (seg("● ", "blue"), bold(name, "text"))
@@ -655,11 +904,11 @@ fn short_title(a: &Agent) -> String {
 }
 
 /// One agent: 2 lines (title / what it does + age) or 1 (title + age),
-/// its number first ([`num_seg`]). The window the client is on gets the
+/// its letter badge first ([`Badge`]). The window the client is on gets the
 /// `sel` background and `here`. Line 2 of a working agent is its run detail
 /// or `working` + path; of any other, its last outcome (`done …`, `fail …`)
 /// or its path.
-fn agent_rows(a: &Agent, w: usize, two: bool, sw: Num) -> Vec<Row> {
+fn agent_rows(a: &Agent, w: usize, two: bool, b: Badge) -> Vec<Row> {
     let hue = a.color.unwrap_or("overlay");
     let quiet = matches!(a.cat, None | Some(Cat::Idle));
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
@@ -675,20 +924,20 @@ fn agent_rows(a: &Agent, w: usize, two: bool, sw: Num) -> Vec<Row> {
     };
     // The title gets every cell the glyph, the flag and the right side leave.
     let gap = usize::from(!right.is_empty() && !right[0].text.starts_with(' '));
-    let fixed = 3 + flag.as_ref().map_or(0, |f| dwidth(&f.text)) + width(&right) + gap;
-    // An ordinal only while the title keeps 4 cells (agent-roster.py
-    // agent_content): on a very narrow sidebar the number goes, not the title.
-    let sw = if sw.ordinal && w.saturating_sub(fixed + num_w(sw)) < 4 { Num::NONE } else { sw };
-    let room = w.saturating_sub(fixed + num_w(sw));
+    let fixed = b.lead() + flag.as_ref().map_or(0, |f| dwidth(&f.text)) + width(&right) + gap;
+    let room = w.saturating_sub(fixed);
     let title = clip(&short_title(a), room);
     let title = if quiet { seg(title, "sub") } else if two { bold(title, "text") } else { seg(title, "text") };
-    // ` 3 ◉ Title`: the number in the space before the glyph's.
-    let mut left = match num_seg(a, sw) {
-        Some(n) => vec![seg(" ", "text"), n, seg(format!("{} ", a.glyph), hue), title],
-        None => vec![seg(format!(" {} ", a.glyph), hue), title],
+    // `[ a ]◉ Title`: the letter badge at the far left, then the state glyph.
+    let mut left = if b.on {
+        vec![b.seg(a), seg(format!("{} ", a.glyph), hue), title]
+    } else {
+        vec![seg(format!(" {} ", a.glyph), hue), title]
     };
     left.extend(flag);
-    let first = Row::new(fit(w, left, right, None)).bg(bg).click(w, go.clone()).covering([a]);
+    // In prefix v's selection: the stash tint (both lines).
+    let tint = |r: Row| if a.selected { stash_tint(r) } else { r };
+    let first = tint(Row::new(fit(w, left, right, None)).bg(bg).click(w, go.clone()).covering([a]));
     if !two {
         return vec![first];
     }
@@ -696,7 +945,7 @@ fn agent_rows(a: &Agent, w: usize, two: bool, sw: Num) -> Vec<Row> {
     // A detail that is nothing but markup (a truncated `<agent-message …>`)
     // counts as none.
     let detail = plain(&a.detail);
-    let mut l2 = vec![seg(" ".repeat(3 + num_w(sw)), "text")];
+    let mut l2 = vec![seg(" ".repeat(b.lead()), "text")];
     if a.in_flight {
         // Working: what it runs now, never the last turn's outcome.
         if a.detail_kind == "run" && !detail.is_empty() {
@@ -712,7 +961,7 @@ fn agent_rows(a: &Agent, w: usize, two: bool, sw: Num) -> Vec<Row> {
         }
         l2.push(seg(detail, "sub"));
     }
-    let second = Row::new(fit(w, l2, vec![seg(age, "overlay")], None)).bg(bg).click(w, go);
+    let second = tint(Row::new(fit(w, l2, vec![seg(age, "overlay")], None)).bg(bg).click(w, go));
     vec![first, second]
 }
 
@@ -741,11 +990,11 @@ fn rule_row(sp: &Space, w: usize, collapsed: bool) -> Row {
 }
 
 /// `   ○○○ 3 idle · Name, Name…`: a space's idle agents in one line, its
-/// circles under the titles above. No numbers: idle agents hold no slot.
-fn fold_row(idle: &[&Agent], w: usize, sw: Num) -> Row {
+/// circles under the titles above. No letters: it stands for several agents.
+fn fold_row(idle: &[&Agent], w: usize, b: Badge) -> Row {
     let k = idle.len();
     let names: Vec<String> = idle.iter().map(|a| short_title(a)).collect();
-    let indent = " ".repeat(3 + num_w(sw));
+    let indent = " ".repeat(b.lead());
     Row::new(fit(
         w,
         vec![seg(format!("{indent}{} {k} idle · ", "○".repeat(k.min(4))), "overlay"), seg(names.join(", "), "overlay")],
@@ -792,11 +1041,11 @@ fn split_idle(sp: &Space, fold: bool) -> (Vec<&Agent>, Vec<&Agent>) {
 
 /// A space's agent rows in window-index order (the folded line last); the
 /// agents in `two` get their second line.
-fn group_rows(sp: &Space, w: usize, two: &[Key], fold: bool, sw: Num) -> Vec<Row> {
+fn group_rows(sp: &Space, w: usize, two: &[Key], fold: bool, b: Badge) -> Vec<Row> {
     let (shown, idle) = split_idle(sp, fold);
-    let mut rows: Vec<Row> = shown.iter().flat_map(|a| agent_rows(a, w, two.contains(&key(a)), sw)).collect();
+    let mut rows: Vec<Row> = shown.iter().flat_map(|a| agent_rows(a, w, two.contains(&key(a)), b)).collect();
     if !idle.is_empty() {
-        rows.push(fold_row(&idle, w, sw));
+        rows.push(fold_row(&idle, w, b));
     }
     rows
 }
@@ -804,15 +1053,15 @@ fn group_rows(sp: &Space, w: usize, two: &[Key], fold: bool, sw: Num) -> Vec<Row
 /// A space's agents in `room` rows: all of them one line each if they fit,
 /// else the `room - 1` that matter most ([`promotion_rank`], kept in list
 /// order) and a `… N more` line for the rest.
-fn partial_rows(sp: &Space, w: usize, room: usize, sw: Num) -> Vec<Row> {
+fn partial_rows(sp: &Space, w: usize, room: usize, b: Badge) -> Vec<Row> {
     if sp.agents.len() <= room {
-        return sp.agents.iter().flat_map(|a| agent_rows(a, w, false, sw)).collect();
+        return sp.agents.iter().flat_map(|a| agent_rows(a, w, false, b)).collect();
     }
     let mut ranked: Vec<usize> = (0..sp.agents.len()).collect();
     ranked.sort_by_key(|&k| promotion_rank(&sp.agents[k]));
     let mut keep = ranked[..room - 1].to_vec();
     keep.sort_unstable();
-    let mut rows: Vec<Row> = keep.iter().flat_map(|&k| agent_rows(&sp.agents[k], w, false, sw)).collect();
+    let mut rows: Vec<Row> = keep.iter().flat_map(|&k| agent_rows(&sp.agents[k], w, false, b)).collect();
     let rest: Vec<&Agent> = (0..sp.agents.len()).filter(|k| !keep.contains(k)).map(|k| &sp.agents[k]).collect();
     rows.push(more_row(w, &rest, 1));
     rows
@@ -869,13 +1118,12 @@ fn agents_one_line(view: &ViewModel) -> usize {
 /// rows a shape leaves over go back to second lines for the agents that
 /// matter most ([`promotion_rank`]), so a section that just misses two lines
 /// each is not left mostly empty.
-fn agents_section(view: &ViewModel, w: usize, budget: usize) -> (Vec<Row>, u8) {
+fn agents_section(view: &ViewModel, w: usize, budget: usize, b: Badge) -> (Vec<Row>, u8) {
     if budget == 0 {
         return (vec![], 0);
     }
     let groups = groups(view);
     let space = view.scope.session.is_some();
-    let sw = if space { Num::ORDINAL } else { Num::slots(view.slot_width) };
     let header = section(w, "agents", "sub", vec![seg(if space { "this space " } else { "by space " }, "overlay")]);
     if space && groups.iter().all(|g| g.agents.is_empty()) {
         // The space's rule even with no agent in it, so the section says whose it is.
@@ -895,7 +1143,7 @@ fn agents_section(view: &ViewModel, w: usize, budget: usize) -> (Vec<Row>, u8) {
         for (sp, &c) in groups.iter().zip(collapsed) {
             rows.push(rule_row(sp, w, c));
             if !c {
-                rows.extend(group_rows(sp, w, two, fold, sw));
+                rows.extend(group_rows(sp, w, two, fold, b));
             }
         }
         rows
@@ -944,7 +1192,7 @@ fn agents_section(view: &ViewModel, w: usize, budget: usize) -> (Vec<Row>, u8) {
         }
         let spare = budget - base.len();
         let at = 1 + (0..i)
-            .map(|j| 1 + if collapsed[j] { 0 } else { group_rows(groups[j], w, &[], true, sw).len() })
+            .map(|j| 1 + if collapsed[j] { 0 } else { group_rows(groups[j], w, &[], true, b).len() })
             .sum::<usize>();
         if spare < 2 {
             let rows = promoted(true, &collapsed).unwrap_or_else(|| base.clone());
@@ -960,14 +1208,14 @@ fn agents_section(view: &ViewModel, w: usize, budget: usize) -> (Vec<Row>, u8) {
             let mut rows = base;
             let gone = key(&g.agents[top]);
             rows[at].covers.retain(|(s, id)| (s.as_str(), id.as_str()) != gone);
-            rows.insert(at + 1, agent_rows(&g.agents[top], w, false, sw).remove(0));
+            rows.insert(at + 1, agent_rows(&g.agents[top], w, false, b).remove(0));
             return (rows, 3);
         }
         // The space whose collapse made it fit keeps the rows that frees:
         // its most important agents, one line each, and `… N more`.
         let mut rows = base;
         rows[at] = rule_row(groups[i], w, false);
-        rows.splice(at + 1..at + 1, partial_rows(groups[i], w, spare, sw));
+        rows.splice(at + 1..at + 1, partial_rows(groups[i], w, spare, b));
         return (rows, 3);
     }
     // More spaces than rows: the first ones as rules, the rest counted.
@@ -1005,22 +1253,26 @@ fn last_row(view: &ViewModel, w: usize, msg: Option<&str>) -> Row {
     row
 }
 
-/// The whole screen: header, toolbar, NEEDS YOU, agents, spare rows, spaces,
-/// last row. Always exactly `height` rows of exactly `width` cells.
+/// The whole screen: header, status block, toolbar, NEEDS YOU, agents,
+/// spare rows, spaces, last row. Always exactly `height` rows of exactly
+/// `width` cells.
 pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
     let (w, h) = (usize::from(width), usize::from(height));
     let mut frame = Frame { width, height, ..Frame::default() };
     if w == 0 || h == 0 {
         return frame;
     }
+    let bar = &opts.bar;
+    let b = Badge::of(view, bar);
     let last = last_row(view, w, opts.msg.as_deref());
-    // The rows between the toolbar and the last row.
-    let avail = h.saturating_sub(3);
+    let (top, status) = top_rows(view, bar, w, h);
+    // The rows between the top and the last row.
+    let avail = h.saturating_sub(top.len() + 1);
     if avail == 0 {
         // No room for sections: one row still counts every agent of the
         // scope (in place of the toolbar), then the parked row.
         let all: Vec<&Agent> = groups(view).into_iter().flat_map(|s| s.agents.iter()).collect();
-        let mut rows = vec![header_row(view, w)];
+        let mut rows = vec![header_row(view, bar, w)];
         rows.push(if all.is_empty() { toolbar_row(w) } else { more_row(w, &all, 0) });
         rows.push(last);
         rows.truncate(h);
@@ -1031,9 +1283,9 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
     // The folded spaces list is held back first: spaces are listed nowhere
     // else, so the section never goes before the agents lose detail.
     let avail = avail - spaces_min(view, avail);
-    let full = agents_section(view, w, usize::MAX).0;
+    let full = agents_section(view, w, usize::MAX, b).0;
     let fits = STEPS.iter().enumerate().find_map(|(i, &(gaps, lines))| {
-        let needs = needs_block(view, w, lines);
+        let needs = needs_block(view, w, lines, b);
         (needs.len() + full.len() + 2 * usize::from(gaps) <= avail).then_some((i as u8, gaps, needs))
     });
     let (step, gaps, needs, (agents, agents_step)) = match fits {
@@ -1042,15 +1294,16 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
             // The agents compress. NEEDS YOU gets what their one-line shape
             // leaves (up to the whole, at least 2 rows and a third of the
             // body), and always leaves the agents a row.
-            let n1 = needs_block(view, w, 1).len();
+            let n1 = needs_block(view, w, 1, b).len();
             let floor = (avail / 3).max(2);
             let room = n1.min(avail.saturating_sub(agents_one_line(view)).max(floor)).min(avail - 1);
-            let needs = needs_cut(view, w, room);
-            let agents = agents_section(view, w, avail - needs.len());
+            let needs = needs_cut(view, w, room, b);
+            let agents = agents_section(view, w, avail - needs.len(), b);
             (STEPS.len() as u8, false, needs, agents)
         }
     };
-    let mut rows = vec![header_row(view, w), toolbar_row(w)];
+    let mut rows = top;
+    frame.status = status;
     if gaps {
         rows.push(Row::blank(w));
     }
@@ -1094,7 +1347,7 @@ pub fn paint(frame: &Frame, buf: &mut Buffer) {
             let sw = dwidth(&s.text);
             let room = usize::from(area.width).saturating_sub(x);
             if sw > 0 && room > 0 {
-                let mut st = Style::default().fg(palette::color(s.fg)).bg(s.bg.map_or(row_bg, palette::color));
+                let mut st = Style::default().fg(s.fg.color()).bg(s.bg.map_or(row_bg, Ink::color));
                 if s.bold {
                     st = st.add_modifier(Modifier::BOLD);
                 }
@@ -1108,11 +1361,15 @@ pub fn paint(frame: &Frame, buf: &mut Buffer) {
 
 fn sgr(fg: Color, bg: Color, m: Modifier) -> String {
     let mut s = String::from("\x1b[0");
-    if let Color::Rgb(r, g, b) = fg {
-        s.push_str(&format!(";38;2;{r};{g};{b}"));
+    match fg {
+        Color::Rgb(r, g, b) => s.push_str(&format!(";38;2;{r};{g};{b}")),
+        Color::Indexed(n) => s.push_str(&format!(";38;5;{n}")),
+        _ => {}
     }
-    if let Color::Rgb(r, g, b) = bg {
-        s.push_str(&format!(";48;2;{r};{g};{b}"));
+    match bg {
+        Color::Rgb(r, g, b) => s.push_str(&format!(";48;2;{r};{g};{b}")),
+        Color::Indexed(n) => s.push_str(&format!(";48;5;{n}")),
+        _ => {}
     }
     if m.contains(Modifier::BOLD) {
         s.push_str(";1");
@@ -1355,7 +1612,7 @@ mod tests {
             return;
         }
         let t = texts(f);
-        assert!(f.needs.start >= 2 && f.needs.end <= f.agents.start, "{name}: {:?} {:?} {t:#?}", f.needs, f.agents);
+        assert!(f.needs.start >= 1 && f.needs.end <= f.agents.start, "{name}: {:?} {:?} {t:#?}", f.needs, f.agents);
         assert!(f.agents.end <= f.spaces.start && f.spaces.end < h, "{name}: {:?} {:?} {t:#?}", f.agents, f.spaces);
         if !f.spaces.is_empty() {
             assert!(t[f.spaces.start].starts_with(" spaces"), "{name}: {t:#?}");
@@ -1368,10 +1625,21 @@ mod tests {
 
     #[test]
     fn every_size_fits_and_accounts_for_every_agent() {
-        for (name, v) in all() {
-            for w in [24u16, 30, 34, 45, 60] {
+        let mut sel = demo_bar();
+        sel.selecting = Some(3);
+        sel.prefix = true;
+        let bars = [Bar::default(), demo_bar(), sel];
+        let cases = |lettered: bool| -> Vec<(&Bar, u16)> {
+            if lettered {
+                bars.iter().flat_map(|b| [24u16, 34, 60].map(|w| (b, w))).collect()
+            } else {
+                [24u16, 30, 34, 45, 60].map(|w| (&bars[0], w)).to_vec()
+            }
+        };
+        for (name, v, l) in all().into_iter().flat_map(|(n, v)| [(n, v.clone(), false), (n, lettered(v), true)]) {
+            for (bar, w) in cases(l) {
                 for h in 2u16..=70 {
-                    let f = layout(&v, w, h, &Opts::default());
+                    let f = layout(&v, w, h, &with_bar(bar.clone()));
                     assert_eq!(f.rows.len(), usize::from(h), "{name} {w}x{h}");
                     for r in &f.rows {
                         assert_eq!(width(&r.segs), usize::from(w), "{name} {w}x{h}: {:?}", r.text());
@@ -1431,23 +1699,22 @@ mod tests {
         assert!(t[0].starts_with(" agents") && t[0].ends_with("◉1 ◐2 ○8 "), "{:?}", t[0]);
         assert_eq!(t[1], "  ⏵ next ⌥S   ⤺ back ⌥X   ≡ ⌥W    ");
         assert!(t[2].trim().is_empty() && t[3].starts_with(" needs you"));
-        // The card: number + title + age, reason, place + kind. (Slots: the
-        // provisional fill, main:1 main:2 main:3; idle agents hold none.)
-        assert!(t[4].starts_with("▌3 ◉ Kua Yu focus timing") && t[4].ends_with("3m "), "{:?}", t[4]);
-        assert!(t[5].starts_with("▌    asks Which deck"), "{:?}", t[5]);
-        assert!(t[6].starts_with("▌    main:3 · ✳ claude") && t[6].ends_with("⏎ go "), "{:?}", t[6]);
+        // The card: title + age, reason, place + kind (no letters in this
+        // view: no badge column).
+        assert!(t[4].starts_with("▌◉ Kua Yu focus timing") && t[4].ends_with("3m "), "{:?}", t[4]);
+        assert!(t[5].starts_with("▌  asks Which deck"), "{:?}", t[5]);
+        assert!(t[6].starts_with("▌  main:3 · ✳ claude") && t[6].ends_with("⏎ go "), "{:?}", t[6]);
         // Then a gap, and the agents right under it.
         assert!(t[7].trim().is_empty() && t[8].starts_with(" agents") && t[8].ends_with("by space "), "{t:#?}");
         assert_eq!(f.agents.start, 8);
         // Agents get two lines and the whole width for their title.
         let r = find(&f, "Tmux Agent Sidebar");
         assert!(t[r].ends_with("here ") && f.rows[r].bg == Some("sel"));
-        assert!(t[r].starts_with(" 2 ◐ Tmux Agent Sidebar"), "{:?}", t[r]);
-        assert!(t[r + 1].starts_with("     run Edit agent-roster.py"), "{:?}", t[r + 1]);
+        assert!(t[r].starts_with(" ◐ Tmux Agent Sidebar"), "{:?}", t[r]);
+        assert!(t[r + 1].starts_with("   run Edit agent-roster.py"), "{:?}", t[r + 1]);
         let h = find(&f, "Handy.app Speech Commands ⚙");
-        assert!(t[h].starts_with(" 1 ◐ Handy.app") && t[h + 1].starts_with("     run Bash swift build"), "{t:#?}");
-        // An idle agent: a blank number column, its title still aligned.
-        assert!(t[find(&f, "Commodities Job Tracker")].starts_with("   ○ Commodities Job Tracker"), "{t:#?}");
+        assert!(t[h].starts_with(" ◐ Handy.app") && t[h + 1].starts_with("   run Bash swift build"), "{t:#?}");
+        assert!(t[find(&f, "Commodities Job Tracker")].starts_with(" ○ Commodities Job Tracker"), "{t:#?}");
         // The spaces list: whole, one line each, right above the parked row;
         // spare rows between it and the agents.
         assert_eq!(f.spaces, 53..57, "{t:#?}");
@@ -1546,7 +1813,7 @@ mod tests {
         let r = find(&f, "Tmux Agent Sidebar") as u16;
         assert_eq!(f.target(5, r).cloned(), go("@2"));
         assert_eq!(f.target(33, r + 1).cloned(), go("@2"));
-        let card = find(&f, "▌3 ◉ Kua Yu") as u16;
+        let card = find(&f, "▌◉ Kua Yu") as u16;
         for y in card..card + 3 {
             assert_eq!(f.target(0, y).cloned(), go("@3"));
         }
@@ -1572,7 +1839,7 @@ mod tests {
         assert!(f.rows[57].text().ends_with("watcher stalled 99s "));
         assert_eq!(f.target(30, 57), Some(&Target::Restart));
         // A message wins the corner (and is not a button).
-        let f = layout(&v, 34, 58, &Opts { msg: Some("no tmux client".into()) });
+        let f = layout(&v, 34, 58, &Opts { msg: Some("no tmux client".into()), ..Opts::default() });
         assert!(f.rows[57].text().ends_with("no tmux client "));
         assert_eq!(f.target(30, 57), None);
         assert_eq!(f.target(2, 57), Some(&Target::Stash));
@@ -1601,17 +1868,17 @@ mod tests {
         assert!(below("Tmux Agent Sidebar").is_some_and(|i| !t[i].contains("tmux/")));
         assert!(below(" ○ Lost suit jacket").is_some());
         // Working: never the last turn's outcome.
-        assert!(t[c + 1].starts_with("     working /nonexistent/main"), "{:?}", t[c + 1]);
+        assert!(t[c + 1].starts_with("   working /nonexistent/main"), "{:?}", t[c + 1]);
         let r = below("Tmux Agent Sidebar").unwrap();
-        assert!(t[r + 1].starts_with("     run cargo test "), "{:?}", t[r + 1]);
+        assert!(t[r + 1].starts_with("   run cargo test "), "{:?}", t[r + 1]);
         let m = below("Markup only").unwrap();
-        assert!(t[m + 1].starts_with("     working /nonexistent/main"), "{:?}", t[m + 1]);
+        assert!(t[m + 1].starts_with("   working /nonexistent/main"), "{:?}", t[m + 1]);
         // Idle keeps its outcome, as plain text.
         let l = below("Lost suit jacket").unwrap();
-        assert!(t[l + 1].starts_with("     done Found it "), "{:?}", t[l + 1]);
+        assert!(t[l + 1].starts_with("   done Found it "), "{:?}", t[l + 1]);
         // Needs cards: no `~/`, plain reasons.
-        assert!(t.iter().any(|l| l.starts_with("▌3 ◉ Kua Yu focus timing")), "{t:#?}");
-        assert!(t.iter().any(|l| l.starts_with("▌    asks Which deck?")), "{t:#?}");
+        assert!(t.iter().any(|l| l.starts_with("▌◉ Kua Yu focus timing")), "{t:#?}");
+        assert!(t.iter().any(|l| l.starts_with("▌  asks Which deck?")), "{t:#?}");
     }
 
     #[test]
@@ -1624,7 +1891,7 @@ mod tests {
             assert_eq!(f.target(3, y), Some(&Target::Menu(Some("all"))));
         }
         // Nothing pending in one row: never ` … 0 need you`.
-        assert_eq!(needs_cut(&empty(), 34, 1).iter().map(Row::text).collect::<Vec<_>>(), [dim_line(34, " ✓ nothing needs you").text()]);
+        assert_eq!(needs_cut(&empty(), 34, 1, Badge::OFF).iter().map(Row::text).collect::<Vec<_>>(), [dim_line(34, " ✓ nothing needs you").text()]);
     }
 
     #[test]
@@ -1721,112 +1988,249 @@ mod tests {
         assert!(t[f.agents.clone()].iter().any(|l| l.contains("Kua Yu focus timing")), "{t:#?}");
     }
 
-    /// Two frames through the sidebar's memo: a newcomer that sorts first
-    /// (session `aa`) takes the next free number and moves nobody's; the
-    /// question just answered (idle + @agent_pending) keeps its number, is no
+    /// A question just answered (idle + a fresh @agent_pending) is no
     /// longer a NEEDS YOU card, and is never folded into the idle line.
     #[test]
-    fn memo_and_answered_render() {
-        let base = || {
+    fn answered_is_never_folded() {
+        let pending = (NOW - 600).to_string();
+        let v = view(
             vec![
                 a("main", 1, "running", "One"),
-                a("main", 2, "needs-input", "Two").with("detail_kind", "ask").with("detail", "which?"),
+                a("main", 2, "idle", "Two").with("pending", &pending),
                 a("main", 3, "idle", "Q3"),
                 a("main", 4, "idle", "Q4"),
                 a("main", 5, "idle", "Q5"),
-                a("work", 2, "running", "Late sorter"),
-            ]
-        };
-        let mut memo = crate::view::SlotMemo::default();
-        let v = view_with(base(), None, &mut memo);
-        let f = layout(&v, 34, 58, &Opts::default());
-        for want in ["▌2 ◉ Two", " 1 ◐ One", " 2 ◉ Two", " 3 ◐ Late sorter"] {
-            find(&f, want);
-        }
-        // Next frame: Two answered 600 s ago (still Active); `aa` starts (id
-        // @7, sorts before main).
-        let answered = |pending: &str| {
-            let mut next = base();
-            next[1] = a("main", 2, "idle", "Two").with("pending", pending);
-            next.push(a("aa", 1, "running", "Early bird"));
-            next
-        };
-        let v = view_with(answered(&(NOW - 600).to_string()), None, &mut memo);
+            ],
+            None,
+        );
         assert!(v.needs.is_empty());
-        let f = layout(&v, 34, 58, &Opts::default());
-        let t = texts(&f);
-        assert!(t.iter().any(|l| l.starts_with(" ✓ nothing needs you")), "{t:#?}");
-        for want in [" 4 ◐ Early bird", " 1 ◐ One", " 2 ○ Two", " 3 ◐ Late sorter", "   ○ Q3"] {
-            assert!(t.iter().any(|l| l.starts_with(want)), "{want}: {t:#?}");
-        }
-        // Squeezed until idle agents fold: Two stays on its own numbered row.
         let f = (8..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 2).unwrap();
         let t = texts(&f);
-        let fold = t.iter().find(|l| l.contains(" idle · ")).unwrap_or_else(|| panic!("{t:#?}"));
-        assert!(fold.contains("3 idle · Q3, Q4, Q5"), "{fold:?}");
-        assert!(t.iter().any(|l| l.starts_with(" 2 ○ Two")), "{t:#?}");
-        // Without the memo the newcomer would have taken 1.
-        let v = view(answered(&(NOW - 600).to_string()), None);
-        assert_eq!(v.agents().find(|x| x.title == "Early bird").and_then(|x| x.slot), Some(1));
-        // The stamp lapses (601 s): Two is plain idle, its number gone (a
-        // blank column), folded with the others; nobody else's number moves.
-        let v = view_with(answered(&(NOW - 601).to_string()), None, &mut memo);
-        let f = layout(&v, 34, 58, &Opts::default());
-        let t = texts(&f);
-        for want in ["   ○ Two", " 4 ◐ Early bird", " 1 ◐ One", " 3 ◐ Late sorter"] {
-            assert!(t.iter().any(|l| l.starts_with(want)), "{want}: {t:#?}");
-        }
-        assert!(!t.iter().any(|l| l.starts_with(" 2 ")), "{t:#?}");
-        let f = (8..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 2).unwrap();
-        let t = texts(&f);
-        assert!(t.iter().any(|l| l.contains("4 idle · Two, Q3, Q4, Q5")), "{t:#?}");
-        // A junk stamp never counted.
-        let v = view(answered("soon"), None);
-        assert_eq!(v.agents().find(|x| x.title == "Two").map(|x| (x.answered, x.slot)), Some((false, None)));
+        assert!(t.iter().any(|l| l.contains("3 idle · Q3, Q4, Q5")), "{t:#?}");
+        assert!(t.iter().any(|l| l.starts_with(" ○ Two")), "{t:#?}");
     }
 
-    /// Slots on cards and rows: kept stamps (with a gap and one past nine),
-    /// a stale stamp on an idle agent ignored, unstamped agents filled into
-    /// the gap; two-digit labels everywhere; idle rows and the fold blank.
+    /// `v` with letters as the sidebar gives them (`letters::of_view`'s
+    /// assignment, nothing stored yet): the listed agents in display order.
+    fn lettered(mut v: ViewModel) -> ViewModel {
+        let listed: Vec<(String, String)> =
+            crate::menu::rows::listed(&v).map(|a| (a.window_id.clone(), String::new())).collect();
+        let got = crate::menu::letters::assign(&listed, &[]).letters;
+        for x in v.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()) {
+            x.letter = got.get(&x.window_id).copied();
+        }
+        for n in v.needs.iter_mut() {
+            n.agent.letter = got.get(&n.agent.window_id).copied();
+        }
+        v
+    }
+
+    /// A status block like the live one: main (⌃1, yellow), three shells
+    /// (home first, the second active), usage and a stale save.
+    fn demo_bar() -> Bar {
+        use super::super::status::{Chip, Usage};
+        Bar {
+            space: Some(Chip { index: Some(1), name: "main".into(), color: Some(Ink::Rgb(0xf9, 0xe2, 0xaf)), hidden: false }),
+            shells: ["~", "nvim", "proj"]
+                .iter()
+                .enumerate()
+                .map(|(k, l)| Shell {
+                    n: k as u32 + 1,
+                    label: l.to_string(),
+                    home: k == 0,
+                    active: k == 1,
+                    selected: false,
+                    win: format!("@{}", 901 + k),
+                    session: "main".into(),
+                })
+                .collect(),
+            usage: vec![
+                Usage { label: "S".into(), text: "71% (-1%)".into(), color: Some(Ink::Pal("green")) },
+                Usage { label: "W".into(), text: "19% (-2%)".into(), color: Some(Ink::Idx(239)) },
+                Usage { label: "F".into(), text: "0% (-21%)".into(), color: Some(Ink::Pal("green")) },
+            ],
+            stale: Some("last save 2h ago".into()),
+            ..Bar::default()
+        }
+    }
+
+    fn with_bar(bar: Bar) -> Opts {
+        Opts { bar, ..Opts::default() }
+    }
+
+    /// Every agent row and NEEDS YOU card starts with its letter: a solid
+    /// ` a ` on its state's colour at the far left, in both scopes; louder
+    /// (peach) while ⌥F is armed; blank past 26.
     #[test]
-    fn numbers_on_cards_and_rows() {
-        let v = numbered();
-        assert_eq!(v.slot_width, 2);
-        let slot = |title: &str| v.agents().find(|a| a.title == title).and_then(|a| a.slot);
-        assert_eq!([slot("Handy.app Speech Commands"), slot("Kua Yu focus timing"), slot("Tmux Agent Sidebar"),
-            slot("Notch Tasks Orchestrator"), slot("Lost suit jacket"), slot("Notch hover animation"),
-            slot("Island resize spring"), slot("Commodities Job Tracker")],
-            [Some(1), Some(2), Some(4), Some(12), None, Some(3), Some(5), Some(8)]);
+    fn letter_badges_lead_every_agent_row_and_card() {
+        // Listed order: bai (a s), main (d f g h j k l), schedule (q w).
+        let v = lettered(quiet());
         let f = layout(&v, 34, 58, &Opts::default());
         let t = texts(&f);
-        // Cards: the bar, then the number.
-        for card in ["▌01 ✕ Handy.app", "▌02 ◉ Kua Yu", "▌03 ◉ Notch hover", "▌08 ✓ Commodities"] {
-            assert!(t[f.needs.clone()].iter().any(|l| l.starts_with(card)), "{card}: {t:#?}");
-        }
-        // Rows: the same numbers, the titles aligned behind a 3-cell column.
-        let body = agents_part(&f);
-        for row in [" 01 ✕ Handy.app", " 02 ◉ Kua Yu", " 04 ◐ Tmux Agent Sidebar", " 12 ◐ Notch Tasks"] {
-            assert!(body.iter().any(|l| l.starts_with(row)), "{row}: {t:#?}");
-        }
-        assert!(body.iter().all(|l| !l.contains("○ Lost suit") || l.starts_with("    ○ Lost suit")), "{t:#?}");
-        // Wider and taller: every agent on its own two lines, second lines indented past the number.
-        let f = layout(&v, 60, 120, &Opts::default());
+        let r = find(&f, "Tmux Agent Sidebar");
+        assert!(t[r].starts_with(" f ◐ Tmux Agent Sidebar") && t[r].ends_with("here "), "{:?}", t[r]);
+        assert!(t[r + 1].starts_with("     run Edit agent-roster.py"), "{:?}", t[r + 1]);
+        assert_eq!(f.rows[r].segs[0], block(" f ", "crust", "blue"));
+        let c = find(&f, "▌ g ◉ Kua Yu focus timing");
+        assert_eq!(f.rows[c].segs[1], block(" g ", "crust", "yellow"));
+        assert!(t[c + 1].starts_with("▌     asks Which deck") && t[c + 2].starts_with("▌     main:3 · ✳ claude"), "{t:#?}");
+        let i = find(&f, " h ○ Commodities Job Tracker");
+        assert_eq!(f.rows[i].segs[0].bg, Some(Ink::Pal("overlay")));
+        // Space scope: the same letters (no ordinals any more).
+        let mut sv = lettered(quiet());
+        sv.scope.session = Some("main".into());
+        let f = layout(&sv, 34, 58, &Opts::default());
+        find(&f, " f ◐ Tmux Agent Sidebar");
+        find(&f, "▌ g ◉ Kua Yu");
+        // ⌥F armed (key table `jump`): every badge peach, the header hint.
+        let f = layout(&v, 34, 58, &with_bar(Bar { jump: true, ..demo_bar() }));
+        assert!(f.rows[0].text().ends_with(" type a letter "), "{:?}", f.rows[0].text());
+        assert!(f.rows[0].segs.contains(&block(" ⌥F jump ", "crust", "peach")), "{:?}", f.rows[0].segs);
+        assert!(f.rows[0].text().starts_with("  ⌃1 main   ⌥F jump "), "{:?}", f.rows[0].text());
+        // No chip: no mark, the whole hint on the right.
+        let f = layout(&v, 34, 58, &with_bar(Bar { jump: true, ..Bar::default() }));
+        assert!(f.rows[0].text().ends_with("⌥F · type a letter ") && !f.rows[0].text().contains("jump"));
+        // A long space name: the hint gives way, the mark stays whole.
+        let mut bar = Bar { jump: true, ..demo_bar() };
+        bar.space.as_mut().unwrap().name = "commodities".into();
+        let f = layout(&v, 34, 58, &with_bar(bar));
+        assert!(f.rows[0].text().starts_with("  ⌃1 commodities   ⌥F jump ") && !f.rows[0].text().contains("letter"),
+            "{:?}", f.rows[0].text());
+        let r = find(&f, "Tmux Agent Sidebar");
+        assert_eq!(f.rows[r].segs[0], block(" f ", "crust", "peach"));
+        let c = find(&f, "▌ g ◉ Kua Yu");
+        assert_eq!(f.rows[c].segs[1], block(" g ", "crust", "peach"));
+        // Past 26 agents: a blank badge, the title still aligned.
+        let x = lettered(extreme());
+        let none = x.agents().find(|a| a.letter.is_none()).expect("an agent past 26");
+        let f = layout(&x, 60, 400, &Opts::default());
+        let k = f.rows.iter().position(|r| r.covers.iter().any(|(s, id)| *s == none.session && *id == none.window_id)).unwrap();
+        assert_eq!(f.rows[k].segs[0].text, "   ", "{:?}", f.rows[k].text());
+        assert!(f.rows[k].text().starts_with(&format!("   {} An agent", none.glyph)), "{:?}", f.rows[k].text());
+    }
+
+    /// The status line's content, in the sidebar: the space chip in its
+    /// colour (+ the red prefix mark), the shells (⌥N, clickable), usage,
+    /// the stale save; shorter frames give up the toolbar first.
+    #[test]
+    fn the_status_block_replaces_the_status_line() {
+        let v = lettered(quiet());
+        let f = layout(&v, 34, 40, &with_bar(demo_bar()));
         let t = texts(&f);
-        assert_eq!(f.agents_step, 0, "{t:#?}");
-        let r = find(&f, " 04 ◐ Tmux Agent Sidebar");
-        assert!(t[r + 1].starts_with("      working "), "{:?}", t[r + 1]);
-        assert!(t.iter().any(|l| l.starts_with("    ○ Lost suit jacket")), "{t:#?}");
-        let card = find(&f, "▌02 ◉ Kua Yu");
-        assert!(t[card + 1].starts_with("▌     asks Which deck?") && t[card + 2].starts_with("▌     main:2 · ✳ claude"),
-            "{t:#?}");
-        // Squeezed until idle agents fold: the fold line has no numbers and
-        // its circles sit under the titles.
-        let f = (20..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 2).unwrap();
-        let fold = texts(&f).into_iter().find(|l| l.contains(" idle · ")).unwrap();
-        assert!(fold.starts_with("      ○○"), "{fold:?}");
-        // One digit when no slot reaches 10.
-        let f = layout(&quiet(), 34, 58, &Opts::default());
-        assert!(texts(&f).iter().any(|l| l.starts_with(" 2 ◐ Tmux Agent Sidebar")));
+        assert!(t[0].starts_with("  ⌃1 main ") && t[0].ends_with("◉1 ◐2 ○8 "), "{:?}", t[0]);
+        assert_eq!(f.rows[0].segs[1], block(" ⌃1 main ", "crust", Ink::Rgb(0xf9, 0xe2, 0xaf)));
+        assert_eq!(t[1].trim_end(), " ⌥1 ⌂~  ⌥2 nvim  ⌥3 proj");
+        let shell = |win: &str| Some(Target::Shell { win: win.into(), session: "main".into() });
+        assert_eq!((f.target(1, 1).cloned(), f.target(9, 1).cloned(), f.target(20, 1).cloned()),
+            (shell("@901"), shell("@902"), shell("@903")));
+        assert_eq!(f.target(7, 1), None); // between chips
+        // The active shell is bold peach.
+        assert!(f.rows[1].segs.iter().any(|s| s.text == "nvim" && s.bold && s.fg == Ink::Pal("peach")));
+        // Usage: S on its colour, the deltas dropped when all three do not fit.
+        assert_eq!(t[2].trim_end(), "  S  71%  W  19%  F  0%");
+        assert_eq!(f.rows[2].segs[1], block(" S ", "crust", "green"));
+        assert_eq!(f.rows[2].segs[4].bg, Some(Ink::Idx(239)));
+        assert!(t[3].contains("last save 2h ago"), "{t:#?}");
+        assert!(t[4].contains("⏵ next"), "{t:#?}");
+        assert_eq!(f.status, 1..4);
+        // Wide enough: the deltas stay.
+        let f = layout(&v, 60, 40, &with_bar(demo_bar()));
+        assert!(f.rows[2].text().contains("71% (-1%)"), "{:?}", f.rows[2].text());
+        // The red prefix mark, keyed on the client's key table.
+        let f = layout(&v, 34, 40, &with_bar(Bar { prefix: true, ..demo_bar() }));
+        assert!(f.rows[0].segs.contains(&block(" prefix ", "crust", "red")), "{:?}", f.rows[0].segs);
+        assert!(!layout(&v, 34, 40, &with_bar(demo_bar())).rows[0].text().contains("prefix"));
+        // No colour: the neutral chip. A hidden session: `[name]`, dim.
+        let mut bar = demo_bar();
+        bar.space.as_mut().unwrap().color = None;
+        assert_eq!(layout(&v, 34, 40, &with_bar(bar.clone())).rows[0].segs[1], block(" ⌃1 main ", "text", "surface1"));
+        bar.space.as_mut().unwrap().hidden = true;
+        assert!(layout(&v, 34, 40, &with_bar(bar)).rows[0].text().starts_with(" [main]"));
+        // The chip toggles the scope once the scope is a thing.
+        let mut sv = v.clone();
+        sv.scope.spaces = true;
+        assert_eq!(layout(&sv, 34, 40, &with_bar(demo_bar())).target(3, 0), Some(&Target::Scope));
+        // 34x16: no toolbar; the block keeps one shells line, usage, the stale save.
+        let f = layout(&v, 34, 16, &with_bar(demo_bar()));
+        let t = texts(&f);
+        assert!(!t.iter().any(|l| l.contains("⏵ next")), "{t:#?}");
+        assert_eq!(f.status, 1..4, "{t:#?}");
+        assert!(t[4].starts_with(" needs you"), "{t:#?}");
+    }
+
+    #[test]
+    fn shells_flow_and_count_what_does_not_fit() {
+        let shells: Vec<Shell> = (1..=12)
+            .map(|n| Shell { n, label: format!("sh{n}"), home: n == 1, active: false, selected: false, win: format!("@{n}"),
+                session: "main".into() })
+            .collect();
+        let bar = Bar { shells, ..demo_bar() };
+        for (w, lines) in [(34usize, 2usize), (34, 1), (24, 2), (60, 2), (12, 1)] {
+            let rows = shell_rows(&bar, w, lines);
+            assert!(rows.len() <= lines, "{w} {lines}");
+            let shown: usize = rows.iter().map(|r| r.targets.len()).sum();
+            let last = rows.last().unwrap().text();
+            let more = last.split(" +").nth(1).map_or(0, |k| k.trim().parse::<usize>().unwrap());
+            assert_eq!(shown + more, 12, "{w} {lines}: {:?}", rows.iter().map(Row::text).collect::<Vec<_>>());
+            for r in &rows {
+                assert_eq!(width(&r.segs), w);
+            }
+        }
+        let rows = shell_rows(&bar, 200, 1);
+        let t = rows[0].text();
+        assert!(t.starts_with(" ⌥1 ⌂sh1  ⌥2 sh2") && t.contains("⌥9 sh9  sh10  sh11"), "{t:?}");
+        assert!(shell_rows(&bar, 34, 0).is_empty() && shell_rows(&Bar::default(), 34, 2).is_empty());
+    }
+
+    /// prefix v's selection: every selected agent row (both lines) and
+    /// shell chip on the stash's mauve, dark ink; a hint with the real keys.
+    #[test]
+    fn the_stash_selection_tints_rows_and_shows_its_keys() {
+        let v = lettered(view(vec![a("main", 1, "running", "Sel one").with("stash_sel", "1"), a("main", 2, "idle", "Plain")], Some("@1")));
+        let mut bar = demo_bar();
+        bar.shells[1].selected = true;
+        bar.selecting = Some(2);
+        let f = layout(&v, 34, 40, &with_bar(bar.clone()));
+        let t = texts(&f);
+        let r = find(&f, "Sel one");
+        for row in &f.rows[r..r + 2] {
+            assert_eq!(row.bg, Some("mauve"), "{:?}", row.text());
+            assert!(row.segs.iter().all(|s| s.bg.is_some() || s.fg == Ink::Pal("crust")), "{:?}", row.segs);
+        }
+        assert_eq!(f.rows[r].segs[0], block(" a ", "crust", "blue")); // the badge stays itself
+        let p = find(&f, "Plain");
+        assert_ne!(f.rows[p].bg, Some("mauve"));
+        let sh = find(&f, "⌥2 nvim");
+        assert!(f.rows[sh].segs.iter().filter(|s| s.text.contains("nvim") || s.text.contains("⌥2")).all(|s| s.bg == Some(Ink::Pal("mauve"))));
+        assert!(f.rows[sh].segs.iter().filter(|s| s.text.contains("proj")).all(|s| s.bg.is_none()));
+        // The hint, right under the header: as many of the keys as fit.
+        assert_eq!(t[1].trim_end(), "  2 selected  h/l ⏎ park esc");
+        assert_eq!(f.rows[1].segs[1], block(" 2 selected ", "crust", "mauve"));
+        let f = layout(&v, 60, 40, &with_bar(bar));
+        assert!(f.rows[1].text().contains(" 2 selected  h/l extend · ⏎ park · m move · esc cancel"), "{:?}", f.rows[1].text());
+        // No selection: no hint.
+        assert!(!texts(&layout(&v, 34, 40, &with_bar(demo_bar()))).iter().any(|l| l.contains("selected")));
+    }
+
+    /// The spaces list: each `⌃N` a solid chip in the space's @space_color;
+    /// the neutral label without one.
+    #[test]
+    fn spaces_wear_their_colour() {
+        let v = view(
+            vec![
+                a("main", 1, "running", "M").with("space_index", "1").with("space_color", "#f9e2af"),
+                a("bai", 1, "idle", "B").with("space_index", "2").with("space_color", "colour24"),
+                a("zeta", 1, "idle", "Z").with("space_index", "3").with("space_color", "bogus"),
+            ],
+            Some("@1"),
+        );
+        let f = layout(&v, 34, 40, &Opts::default());
+        let sp = f.spaces.start;
+        let t = texts(&f);
+        assert!(t[sp + 1].starts_with(" ⌃1 ● main") && t[sp + 2].starts_with(" ⌃2 ○ bai") && t[sp + 3].starts_with(" ⌃3 ○ zeta"), "{t:#?}");
+        assert_eq!(&f.rows[sp + 1].segs[1..3], [block("⌃1", "crust", Ink::Rgb(0xf9, 0xe2, 0xaf)), seg(" ", "text")]);
+        assert_eq!(f.rows[sp + 2].segs[1], block("⌃2", "text", Ink::Idx(24)));
+        assert_eq!(f.rows[sp + 3].segs[1], seg("⌃3 ", "overlay"));
     }
 
     /// A scoped view: `agents` plus the usual noise, the client on `here` in
@@ -1885,11 +2289,12 @@ mod tests {
         let b = agents_part(&f);
         assert!(b[0].starts_with(" agents") && b[0].ends_with("this space "), "{b:#?}");
         assert!(b[1].starts_with(" proj ─"), "{b:#?}");
-        let numbered: Vec<&str> = b.iter().filter(|l| l.starts_with(" 1 ") || l.starts_with(" 2 ")
-            || l.starts_with(" 3 ") || l.starts_with(" 4 ")).map(|l| l.trim_end()).collect();
-        assert_eq!(numbered.len(), 4, "{b:#?}");
-        for (k, want) in [" 1 ○ two", " 2 ◐ four", " 3 ✕ five", " 4 ◉ twelve"].iter().enumerate() {
-            assert!(numbered[k].starts_with(want), "{want}: {b:#?}");
+        // Window-index order; no number column any more (letters replace it).
+        let rows: Vec<&str> = b.iter().filter(|l| l.starts_with(" ○ ") || l.starts_with(" ◐ ") || l.starts_with(" ✕ ")
+            || l.starts_with(" ◉ ")).map(|l| l.trim_end()).collect();
+        assert_eq!(rows.len(), 4, "{b:#?}");
+        for (k, want) in [" ○ two", " ◐ four", " ✕ five", " ◉ twelve"].iter().enumerate() {
+            assert!(rows[k].starts_with(want), "{want}: {b:#?}");
         }
         // Only this session in the agents section; no shell rows; NEEDS YOU
         // stays global (and unnumbered), as does the spaces list.
@@ -1909,9 +2314,9 @@ mod tests {
         assert_eq!(v.scope.session.as_deref(), Some("proj"));
         let f = layout(&v, 34, 58, &Opts::default());
         let b = agents_part(&f);
-        // The client's shell is a row (the classic rule), blank in the number column.
-        assert!(b.iter().any(|l| l.starts_with("     zsh")), "{b:#?}");
-        assert!(b.iter().any(|l| l.starts_with(" 1 ○ two")) && b.iter().any(|l| l.starts_with(" 4 ◉ twelve")), "{b:#?}");
+        // The client's shell is a row (the classic rule), a blank glyph.
+        assert!(b.iter().any(|l| l.starts_with("   zsh")), "{b:#?}");
+        assert!(b.iter().any(|l| l.starts_with(" ○ two")) && b.iter().any(|l| l.starts_with(" ◉ twelve")), "{b:#?}");
     }
 
     #[test]
@@ -1925,8 +2330,7 @@ mod tests {
         let b = agents_part(&f);
         assert!(b.iter().any(|l| l.starts_with(" other ─")) && b.iter().any(|l| l.starts_with(" proj ─")), "{b:#?}");
         assert!(!b.iter().any(|l| l.contains("zsh")), "{b:#?}");
-        // Slots (other:1 took 1), not ordinals, in this scope; idle holds none.
-        assert!(b.iter().any(|l| l.starts_with(" 3 ✕ five")) && b.iter().any(|l| l.starts_with("   ○ two")), "{b:#?}");
+        assert!(b.iter().any(|l| l.starts_with(" ✕ five")) && b.iter().any(|l| l.starts_with(" ○ two")), "{b:#?}");
         // A space with nothing but shells is no group at all.
         let mut only_shell = proj();
         only_shell.push(a("plain", 1, "", "zsh"));
@@ -1981,26 +2385,6 @@ mod tests {
     }
 
     #[test]
-    fn ordinals_stop_at_nine_and_go_when_narrow() {
-        let ws: Vec<A> = (1..=11).map(|i| a("big", i, "running", ["b/n1", "b/n2", "b/n3", "b/n4", "b/n5", "b/n6",
-            "b/n7", "b/n8", "b/n9", "b/n10", "b/n11"][i as usize - 1])).collect();
-        let v = scoped(ws, "@1", "big", "on", "", "");
-        let f = layout(&v, 34, 70, &Opts::default());
-        let b = agents_part(&f);
-        assert!(b.iter().any(|l| l.starts_with(" 9 ◐ n9 ")), "{b:#?}");
-        assert!(b.iter().any(|l| l.starts_with("   ◐ n10 ")) && b.iter().any(|l| l.starts_with("   ◐ n11 ")), "{b:#?}");
-        // Narrow: the number only while the title keeps 4 cells. A one-line
-        // row has 3 cells of glyph and ` 1m ` (age) fixed, 2 for the number.
-        let r = &v.spaces[0].agents[0];
-        assert_eq!(r.age, "1m");
-        for (w, shown) in [(10, false), (12, false), (13, true), (30, true)] {
-            let row = &agent_rows(r, w, false, Num::ORDINAL)[0];
-            assert_eq!(width(&row.segs), w, "{w}");
-            assert_eq!(row.text().starts_with(" 1 ◐"), shown, "{w}: {:?}", row.text());
-        }
-    }
-
-    #[test]
     fn scoped_views_fit_every_size() {
         let mut fleet = busy_agents();
         for i in 1..=12 {
@@ -2051,7 +2435,7 @@ mod tests {
         let f = layout(&v, 34, 11, &Opts::default());
         let t = texts(&f);
         let rule = find(&f, " main ─");
-        assert!(t[rule + 1].starts_with(" 1 ✕ Handy.app"), "{t:#?}");
+        assert!(t[rule + 1].starts_with(" ✕ Handy.app"), "{t:#?}");
         assert_eq!(f.spaces.len(), 3, "{t:#?}");
         assert!(t[10].starts_with(" ⏸ "), "{t:#?}");
     }

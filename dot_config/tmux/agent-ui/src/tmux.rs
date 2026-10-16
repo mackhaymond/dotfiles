@@ -197,22 +197,110 @@ impl Tmux {
 /// `space_hidden` (`@space_hidden` "1"): a window row's format resolves a
 /// user option through its session, so every row of a session carries its
 /// session's values and the sidebar's spaces list costs no extra call.
-pub const FIELDS: [&str; 29] = [
+/// `space_color` (the session's `@space_color`, space.sh's `#rrggbb` for the
+/// space) rides the same way, and `stash_sel` (stash.sh's `@stash_sel`: the
+/// window is in prefix v's range selection), and `pane_flags` ([`PANE_FLAGS`]:
+/// one token per pane, so a space's DASHBOARD pane (`@space_dash_pane`) is
+/// never counted, captured, closed or focused).
+pub const FIELDS: [&str; 32] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
     "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home", "space_index",
-    "space_hidden",
+    "space_hidden", "space_color", "stash_sel", "pane_flags",
 ];
 
-/// The tmux format of each FIELDS entry, in order.
-pub const FORMATS: [&str; 29] = [
+/// The pane option space.sh sets (to 1) on a space home's dashboard pane
+/// (space-dash.sh, the 9-row pane above the shell). Such a pane is never an
+/// agent, a shell, a count, or a click / capture / close target.
+pub const DASH_OPTION: &str = "@space_dash_pane";
+
+/// Every pane of the window as `<flag><pane_index><pane_id> `: flag `A` /
+/// `p` for the active / another pane, `D` / `d` for a dashboard pane
+/// ([`DASH_OPTION`]) that is / is not active. Only `[ADdp%0-9 ]` is printed,
+/// so it needs no guard. Verified on tmux 3.7: a `#{P:}` loop in a
+/// `list-windows` format resolves pane options per pane. The loop's order
+/// is tmux's internal one (pane creation, not `pane_index`), so the index
+/// rides along and [`parse_pane_flags`] sorts by it.
+pub const PANE_FLAGS: &str =
+    "#{P:#{?#{@space_dash_pane},#{?pane_active,D,d},#{?pane_active,A,p}}#{pane_index}#{pane_id} }";
+
+/// The tmux format of each FIELDS entry, in order. (`#{pane_current_path}`
+/// is printed by [`path_format`], dashboard-aware.)
+pub const FORMATS: [&str; 32] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
     "#{window_panes}", "#{pane_current_path}", "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}",
     "#{@stash_origin}", "#{@agent_slot}", "#{@agent_pending}", "#{@agent_key}", "#{@agent_mru_cur}",
-    "#{@agent_mru_prev}", "#{@space_home}", "#{@space_index}", "#{@space_hidden}",
+    "#{@agent_mru_prev}", "#{@space_home}", "#{@space_index}", "#{@space_hidden}", "#{@space_color}", "#{@stash_sel}",
+    PANE_FLAGS,
 ];
+
+/// Ends each path in the dashboard case of [`path_format`] (a private-use
+/// code point, like the stand-ins).
+pub const PATH_SEP: char = '\u{E01E}';
+
+/// The `path` field: the active pane's cwd, unless the active pane is a
+/// dashboard; then every other pane's `<pane_index> <cwd>`, each ended by
+/// [`PATH_SEP`], of which [`dash_path`] keeps the lowest index's (the
+/// shell under the dashboard, where spaces.conf's hook puts focus).
+pub fn path_format() -> String {
+    let g = guarded("#{pane_current_path}");
+    format!("#{{?#{{{DASH_OPTION}}},#{{P:#{{?#{{{DASH_OPTION}}},,#{{pane_index}} {g}{PATH_SEP}}}}},{g}}}")
+}
+
+/// The printed `path` field → the path: as is, or in the dashboard case
+/// ([`PATH_SEP`] present) the lowest-indexed other pane's.
+pub fn dash_path(field: &str) -> String {
+    if !field.contains(PATH_SEP) {
+        return field.to_string();
+    }
+    field
+        .split(PATH_SEP)
+        .filter_map(|e| e.split_once(' '))
+        .filter_map(|(i, p)| i.parse::<u32>().ok().map(|i| (i, p)))
+        .min_by_key(|(i, _)| *i)
+        .map(|(_, p)| p.to_string())
+        .unwrap_or_default()
+}
+
+/// One pane of a window row ([`PANE_FLAGS`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pane {
+    /// `%N`.
+    pub id: String,
+    /// `pane_index`.
+    pub index: u32,
+    pub active: bool,
+    /// A dashboard pane ([`DASH_OPTION`]).
+    pub dash: bool,
+}
+
+/// [`PANE_FLAGS`]' output → the panes in `pane_index` order; tokens that
+/// are not `<flag><digits>%<digits>` are skipped.
+pub fn parse_pane_flags(s: &str) -> Vec<Pane> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut v: Vec<Pane> = s
+        .split_whitespace()
+        .filter_map(|t| {
+            let (flag, rest) = (t.chars().next()?, t.get(1..)?);
+            let (index, num) = rest.split_once('%')?;
+            if !digits(index) || !digits(num) {
+                return None;
+            }
+            let (active, dash) = match flag {
+                'A' => (true, false),
+                'p' => (false, false),
+                'D' => (true, true),
+                'd' => (false, true),
+                _ => return None,
+            };
+            Some(Pane { id: format!("%{num}"), index: index.parse().ok()?, active, dash })
+        })
+        .collect();
+    v.sort_by_key(|p| p.index);
+    v
+}
 
 /// Stand-ins tmux writes for a newline / US inside a field value (Unicode
 /// private-use code points), so free text can never split a row or add a
@@ -224,7 +312,8 @@ pub const US_STANDIN: char = '\u{E01F}';
 /// Fields that are always tmux-generated digits / ids, never free text.
 /// (`@agent_slot` is a user option, so anyone can set it to anything: it is
 /// guarded like free text and parsed strictly, [`parse_slot`].)
-const PLAIN_FIELDS: [&str; 5] = ["#{window_index}", "#{window_id}", "#{session_last_attached}", "#{window_active}", "#{window_panes}"];
+const PLAIN_FIELDS: [&str; 6] =
+    ["#{window_index}", "#{window_id}", "#{session_last_attached}", "#{window_active}", "#{window_panes}", PANE_FLAGS];
 
 /// `#{name}` → `#{s/<LF>/<LF_STANDIN>/:#{s/<US>/<US_STANDIN>/:name}}`.
 /// Verified on tmux 3.7: the `s/` modifier matches raw control bytes.
@@ -250,7 +339,11 @@ pub fn restore(field: &str) -> String {
 /// lost any window whose summary, label, detail or cwd held a newline or US,
 /// while agent-jump.sh still listed it.
 pub fn fmt() -> String {
-    FORMATS.iter().map(|f| guarded(f)).collect::<Vec<_>>().join(&US.to_string())
+    FORMATS
+        .iter()
+        .map(|f| if *f == "#{pane_current_path}" { path_format() } else { guarded(f) })
+        .collect::<Vec<_>>()
+        .join(&US.to_string())
 }
 
 /// Client rows ride in the same call. agent-roster.py `CLIENT_FMT` plus two:
@@ -260,14 +353,77 @@ pub fn fmt() -> String {
 /// [`crate::view::Scope`]): a client-context format resolves them through
 /// the client's session (to the global value), so they cost no extra call.
 /// `client_pid` lets the sidebar watch its client process exit.
-/// Starts with an empty field and has 9 fields where a window row has 27,
-/// so the two parsers can never take each other's rows.
+/// Then [`STATUS_FORMATS`]: the client's key table (`prefix` / `jump`) and
+/// the GLOBAL options the sidebar's status block shows in place of the
+/// hidden status line (usage, the stale-save mark, the open-sidebar count).
+/// Starts with an empty field and has 9 + [`STATUS_FORMATS`] fields where a
+/// window row has 31, so the two parsers can never take each other's rows.
 pub const CLIENT_TAG: &str = "client";
 
+/// The client row's tail, in [`Status`] field order: what the sidebar draws
+/// instead of status-right, read in the same one call (no script runs).
+pub const STATUS_FORMATS: [&str; 14] = [
+    "#{client_key_table}", "#{@sidebar_open}", "#{@sidebar_pids}", "#{@resurrect_stale}",
+    "#{@codex_session_text}", "#{@codex_session_color}", "#{@codex_weekly_text}", "#{@codex_weekly_color}",
+    "#{@codex_scoped_icon}", "#{@codex_scoped_text}", "#{@codex_scoped_color}", "#{@codex_account_label}",
+    "#{@codex_provider_label}", "#{status}",
+];
+
+/// A full client row's field count.
+pub const CLIENT_FIELDS: usize = 9 + STATUS_FORMATS.len();
+
 pub fn client_fmt() -> String {
-    ["", CLIENT_TAG, "#{client_tty}", "#{window_id}", &guarded("#{session_name}"), &guarded("#{@spaces}"),
-        &guarded("#{@strip_scope}"), &guarded("#{@space_hidden}"), "#{client_pid}"]
-        .join(&US.to_string())
+    let mut v: Vec<String> = ["", CLIENT_TAG, "#{client_tty}", "#{window_id}"].map(String::from).to_vec();
+    v.extend(["#{session_name}", "#{@spaces}", "#{@strip_scope}", "#{@space_hidden}"].map(guarded));
+    v.push("#{client_pid}".into());
+    v.extend(STATUS_FORMATS.map(guarded));
+    v.join(&US.to_string())
+}
+
+/// The status-line values a client row carries ([`STATUS_FORMATS`]), raw
+/// ("" = unset, or an older, shorter row).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Status {
+    /// `#{client_key_table}`: "root", "prefix", "jump" (UB's ⌥F table), ...
+    pub key_table: String,
+    /// `@sidebar_open`: how many sidebars are open (the sidebar keeps it).
+    pub sidebar_open: String,
+    /// `@sidebar_pids`: the open sidebars' pids, space-separated.
+    pub sidebar_pids: String,
+    /// `@resurrect_stale`: "2h" (the last save's age), "refused", or "".
+    pub resurrect_stale: String,
+    pub session_text: String,
+    pub session_color: String,
+    pub weekly_text: String,
+    pub weekly_color: String,
+    pub scoped_icon: String,
+    pub scoped_text: String,
+    pub scoped_color: String,
+    pub account_label: String,
+    pub provider_label: String,
+    /// The `status` option as the client's session sees it ("on", "off", "2"…).
+    pub status_line: String,
+}
+
+impl Status {
+    fn from_fields(f: &dyn Fn(usize) -> String) -> Status {
+        Status {
+            key_table: f(0),
+            sidebar_open: f(1),
+            sidebar_pids: f(2),
+            resurrect_stale: f(3),
+            session_text: f(4),
+            session_color: f(5),
+            weekly_text: f(6),
+            weekly_color: f(7),
+            scoped_icon: f(8),
+            scoped_text: f(9),
+            scoped_color: f(10),
+            account_label: f(11),
+            provider_label: f(12),
+            status_line: f(13),
+        }
+    }
 }
 
 /// The holding session for parked tabs (agent-roster.py `HOLD`).
@@ -303,10 +459,17 @@ pub struct Window {
     pub stash_origin: String,
     /// window_active == "1".
     pub active: bool,
-    /// window_panes; 1 when unparseable.
+    /// How many panes, dashboard panes ([`DASH_OPTION`]) NOT counted: from
+    /// [`PANE_FLAGS`] when the row has them, else window_panes (1 when
+    /// unparseable).
     pub panes: u32,
-    /// pane_current_path of the window's active pane.
+    /// pane_current_path of the window's active pane; when that is a
+    /// dashboard, of its lowest-indexed other pane ([`path_format`]).
     pub path: String,
+    /// Every pane ([`PANE_FLAGS`]) in `pane_index` order, dashboards
+    /// included and marked; empty for a row without the field's tokens
+    /// (tests, junk).
+    pub pane_list: Vec<Pane>,
     /// @agent_kind: claude | codex | "".
     pub kind: String,
     /// @agent_detail_kind: perm | ask | fail | done | run | "".
@@ -338,6 +501,10 @@ pub struct Window {
     pub space_index: Option<u32>,
     /// The window's SESSION has @space_hidden "1" (not a space).
     pub space_hidden: bool,
+    /// The window's SESSION's @space_color (space.sh's `#rrggbb`), raw.
+    pub space_color: String,
+    /// @stash_sel is set: in stash.sh's range selection (prefix v).
+    pub stash_sel: bool,
 }
 
 fn digits(s: &str) -> bool {
@@ -369,6 +536,12 @@ impl Window {
         let session = p[0].to_string();
         let parked = session == HOLD;
         let (summary, name, stash_label) = (p[5], p[3], p[11]);
+        let pane_list = parse_pane_flags(p[31]);
+        let panes = if pane_list.is_empty() {
+            num(p[15]).and_then(|n| u32::try_from(n).ok()).unwrap_or(1)
+        } else {
+            pane_list.iter().filter(|q| !q.dash).count() as u32
+        };
         let label = if parked && !stash_label.is_empty() {
             stash_label
         } else if !summary.is_empty() {
@@ -393,8 +566,9 @@ impl Window {
             stash_ts: p[13].into(),
             stash_t: num(p[13]),
             active: p[14] == "1",
-            panes: num(p[15]).and_then(|n| u32::try_from(n).ok()).unwrap_or(1),
-            path: p[16].into(),
+            panes,
+            path: dash_path(p[16]),
+            pane_list,
             kind: p[17].into(),
             detail_kind: p[18].into(),
             detail: p[19].into(),
@@ -407,6 +581,8 @@ impl Window {
             home: p[26] == "1",
             space_index: parse_slot(p[27]),
             space_hidden: p[28] == "1",
+            space_color: p[29].trim().into(),
+            stash_sel: !p[30].is_empty(),
             label: label.into(),
             session,
         })
@@ -414,6 +590,35 @@ impl Window {
 
     pub fn is_parked(&self) -> bool {
         self.session == HOLD
+    }
+
+    /// The window has a dashboard pane ([`DASH_OPTION`]).
+    pub fn has_dash(&self) -> bool {
+        self.pane_list.iter().any(|p| p.dash)
+    }
+
+    /// The pane focus must move to when this window is selected: its
+    /// lowest-indexed non-dashboard pane (the shell under the dashboard,
+    /// as spaces.conf's `{down-of}`), but only while a DASHBOARD is the active pane
+    /// (None otherwise: the active pane is already right, or there is no
+    /// other pane).
+    pub fn focus_pane(&self) -> Option<&str> {
+        if !self.pane_list.iter().any(|p| p.dash && p.active) {
+            return None;
+        }
+        self.pane_list.iter().find(|p| !p.dash).map(|p| p.id.as_str())
+    }
+
+    /// What a capture of "the window" targets: the window id (its active
+    /// pane) unless it has a dashboard; then its active non-dashboard pane,
+    /// else its lowest-indexed one (the window id when it has none).
+    pub fn capture_target(&self) -> String {
+        if !self.has_dash() {
+            return self.id.clone();
+        }
+        let mut real = self.pane_list.iter().filter(|p| !p.dash);
+        let first = real.clone().next();
+        real.find(|p| p.active).or(first).map_or_else(|| self.id.clone(), |p| p.id.clone())
     }
 
     /// A prompt the user just answered, at `now` (epoch seconds): "idle AND
@@ -455,6 +660,8 @@ pub struct Client {
     pub space_hidden: bool,
     /// The client process (`#{client_pid}`): the sidebar leaves when it exits.
     pub pid: Option<i32>,
+    /// The key table and the global status options ([`STATUS_FORMATS`]).
+    pub status: Status,
 }
 
 impl Client {
@@ -462,11 +669,12 @@ impl Client {
     /// `"" US client US tty US win [US session [US spaces US scope [US space_hidden [US pid]]]]`.
     pub fn parse(line: &str) -> Option<Client> {
         let p: Vec<&str> = line.split(US).collect();
-        if matches!(p.len(), 4 | 5 | 7 | 8 | 9) && p[0].is_empty() && p[1] == CLIENT_TAG {
+        if matches!(p.len(), 4 | 5 | 7 | 8 | 9 | CLIENT_FIELDS) && p[0].is_empty() && p[1] == CLIENT_TAG {
             let f = |i: usize| restore(p.get(i).unwrap_or(&""));
             let pid = p.get(8).filter(|s| digits(s)).and_then(|s| s.parse::<i32>().ok()).filter(|&n| n > 0);
+            let status = Status::from_fields(&|i| f(9 + i));
             Some(Client { tty: p[2].into(), window_id: p[3].into(), session: f(4), spaces: f(5), strip_scope: f(6),
-                space_hidden: f(7) == "1", pid })
+                space_hidden: f(7) == "1", pid, status })
         } else {
             None
         }
@@ -631,7 +839,17 @@ pub(crate) mod tests {
         // (A guarded format holds a US itself, so compare it whole.)
         let want = ["", CLIENT_TAG, "#{client_tty}", "#{window_id}", &guarded("#{session_name}"), &guarded("#{@spaces}"),
             &guarded("#{@strip_scope}"), &guarded("#{@space_hidden}"), "#{client_pid}"].join("\x1f");
-        assert_eq!(client_fmt(), want);
+        let tail: Vec<String> = STATUS_FORMATS.iter().map(|f| guarded(f)).collect();
+        assert_eq!(client_fmt(), format!("{want}\x1f{}", tail.join("\x1f")));
+        // A full row: the key table and the status options, in order.
+        let mut full: Vec<String> = ["", "client", "/dev/g", "@9", "main", "on", "", "", "77"].map(String::from).to_vec();
+        full.extend((0..STATUS_FORMATS.len()).map(|i| format!("v{i}")));
+        let c = Client::parse(&full.join("\x1f")).unwrap();
+        assert_eq!((c.pid, c.status.key_table.as_str(), c.status.sidebar_open.as_str(), c.status.provider_label.as_str()),
+            (Some(77), "v0", "v1", "v12"));
+        assert_eq!(c.status.status_line, "v13");
+        // One field short or long: not a client row.
+        assert!(Client::parse(&full[..full.len() - 1].join("\x1f")).is_none());
         let s = Snapshot::parse(&[
             "\x1fclient\x1f/dev/a\x1f@3\x1fmain\x1fon\x1fall\x1f\x1f4242",
             "\x1fclient\x1f/dev/b\x1f@4\x1fwork",
@@ -663,6 +881,9 @@ pub(crate) mod tests {
         assert!(Window::parse(&vec![""; 25].join("\x1f")).is_none());
         assert!(Window::parse(&vec![""; 26].join("\x1f")).is_none());
         assert!(Window::parse(&vec![""; 27].join("\x1f")).is_none());
+        assert!(Window::parse(&vec![""; 29].join("\x1f")).is_none());
+        assert!(Window::parse(&vec![""; 30].join("\x1f")).is_none());
+        assert!(Window::parse(&vec![""; 31].join("\x1f")).is_none());
         assert_eq!(w.label, "");
         // Answered: idle with a @agent_pending epoch at most 600 s old.
         let now = 1_700_000_000.0;
@@ -705,7 +926,10 @@ pub(crate) mod tests {
         assert!(fmt().contains(&guarded("#{@agent_slot}")) && fmt().contains(&guarded("#{@agent_pending}")));
         assert!(fmt().contains(&guarded("#{@agent_key}")) && fmt().contains(&guarded("#{@agent_mru_prev}")));
         assert!(fmt().contains(&guarded("#{@space_home}")));
-        assert!(fmt().ends_with(&format!("{}\x1f{}", guarded("#{@space_index}"), guarded("#{@space_hidden}"))));
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{PANE_FLAGS}", guarded("#{@space_index}"),
+            guarded("#{@space_hidden}"), guarded("#{@space_color}"), guarded("#{@stash_sel}"))));
+        let s = Snapshot::parse(&row("main", 1, "@1", &[("space_color", " #f9e2af "), ("stash_sel", "1")]));
+        assert_eq!((s.windows[0].space_color.as_str(), s.windows[0].stash_sel), ("#f9e2af", true));
         let s = Snapshot::parse(&[row("main", 1, "@1", &[("home", "1")]), row("main", 2, "@2", &[("home", "0")])].join("\n"));
         assert_eq!((s.windows[0].home, s.windows[1].home), (true, false));
         // The session's space number and hidden mark, on each of its rows.
@@ -730,6 +954,48 @@ pub(crate) mod tests {
         let lf = LF_STANDIN.to_string();
         let s = Snapshot::parse(&row("main", 1, "@1", &[("slot", &format!("3{lf}4"))]));
         assert_eq!((s.windows.len(), s.windows[0].slot), (1, None));
+    }
+
+    /// A space home's dashboard pane (`@space_dash_pane`): never counted;
+    /// the path is the shell's even while the dashboard is active; focus
+    /// and captures go to the shell pane.
+    #[test]
+    fn dashboard_panes_are_filtered() {
+        assert_eq!(guarded(PANE_FLAGS), PANE_FLAGS);
+        assert!(fmt().contains(&path_format()) && path_format().contains(&guarded("#{pane_current_path}")));
+        // Sorted by pane_index (tmux loops in creation order); junk skipped.
+        assert_eq!(parse_pane_flags("p2%9 D0%3 p1%4 x3%5 A4% p5%x A%6 p%7"), [
+            Pane { id: "%3".into(), index: 0, active: true, dash: true },
+            Pane { id: "%4".into(), index: 1, active: false, dash: false },
+            Pane { id: "%9".into(), index: 2, active: false, dash: false },
+        ]);
+        let sep = PATH_SEP.to_string();
+        assert_eq!(dash_path("/plain path"), "/plain path");
+        assert_eq!(dash_path(&format!("2 /b c{sep}1 /a b{sep}")), "/a b");
+        assert_eq!(dash_path(&format!("x /a{sep}")), "");
+        // The home: dashboard on top (active), the shell below.
+        let w = Window::parse(&row("main", 0, "@1", &[("home", "1"), ("panes", "2"), ("pane_flags", "D0%3 p1%4 "),
+            ("path", &format!("1 /shell/cwd{sep}"))])).unwrap();
+        assert_eq!((w.panes, w.path.as_str(), w.has_dash()), (1, "/shell/cwd", true));
+        assert_eq!((w.focus_pane(), w.capture_target().as_str()), (Some("%4"), "%4"));
+        // The shell active: nothing to move; captures still skip the dashboard.
+        let w = Window::parse(&row("main", 0, "@1", &[("panes", "3"), ("pane_flags", "d0%3 p1%4 A2%5 "), ("path", "/b")]))
+            .unwrap();
+        assert_eq!((w.panes, w.path.as_str(), w.focus_pane(), w.capture_target().as_str()), (2, "/b", None, "%5"));
+        // Several shells under an active dashboard, a newer pane at the
+        // lower index (split above): the lowest-indexed one's path and pane.
+        let w = Window::parse(&row("main", 0, "@1", &[("pane_flags", "D0%3 p2%4 p1%5 "),
+            ("path", &format!("2 /old{sep}1 /new{sep}"))])).unwrap();
+        assert_eq!((w.panes, w.path.as_str(), w.focus_pane()), (2, "/new", Some("%5")));
+        // Only a dashboard: no pane counted, no other pane to go to.
+        let w = Window::parse(&row("main", 0, "@1", &[("pane_flags", "D0%3 "), ("path", "")])).unwrap();
+        assert_eq!((w.panes, w.focus_pane(), w.capture_target().as_str()), (0, None, "@1"));
+        // No dashboard: window_panes stands, the window is its own target.
+        let w = Window::parse(&row("main", 0, "@1", &[("panes", "2"), ("pane_flags", "A0%1 p1%2 ")])).unwrap();
+        assert_eq!((w.panes, w.has_dash(), w.focus_pane(), w.capture_target().as_str()), (2, false, None, "@1"));
+        // A row without the tokens: window_panes, as before.
+        let w = Window::parse(&row("main", 0, "@1", &[("panes", "4")])).unwrap();
+        assert_eq!((w.panes, w.pane_list.len()), (4, 0));
     }
 
     #[test]

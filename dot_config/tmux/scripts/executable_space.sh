@@ -14,7 +14,9 @@
 #                             the visible ones (@space_index: main = 1, then
 #                             registry order). With @spaces on it also gives
 #                             every visible space exactly one live home shell
-#                             and keeps the registry in step. `load` (config
+#                             with its dashboard pane above it (space-dash.sh)
+#                             and keeps the registry (and each space's colour,
+#                             @space_color) in step. `load` (config
 #                             load) and `reconcile` also recreate registered
 #                             spaces that are missing and restore their folder.
 #   (agent/shell/next/prev/toggle take an optional trailing CLIENT, for
@@ -26,8 +28,8 @@
 #                             home = 1; the status line shows them)
 #   next|prev SID             on an agent: next / previous agent; on a shell:
 #                             next / previous shell; wrapping
-#   respawn-home PANE         the pane-died hook: a home shell that exited
-#                             comes back in place (at most every 2 s)
+#   respawn-home PANE         the pane-died hook: a home shell (or dashboard)
+#                             that exited comes back in place (at most every 2 s)
 #   toggle SID                agent <-> last-visited shell of this space (a
 #                             new shell at the space folder if there is none);
 #                             from a shell, back to the last-visited agent
@@ -44,8 +46,8 @@
 # there reaches the DEFAULT server, whatever server the caller had in mind.
 #
 # REGISTRY (@spaces on only): @space_registry, default
-# ~/.local/state/tmux-spaces/spaces.tsv, one "name<TAB>folder" line per space
-# in tab order. It is what survives a server restart that resurrect does not
+# ~/.local/state/tmux-spaces/spaces.tsv, one "name<TAB>folder<TAB>colour" line
+# per space in tab order (a two-column line from before the colour gets one). It is what survives a server restart that resurrect does not
 # cover: empty spaces, the order, the folder. Written under a mkdir lock.
 #
 # Cost: every key is one bash fork plus one list call and one action call to
@@ -78,21 +80,47 @@ msg() {
 # runs before the first session exists).
 read_opts() {
   local o
-  o="$(t display-message -p "#{@space_hidden_sessions}${US}#{@spaces}${US}#{@space_registry}${US}#{@space_restore_pending}${US}#{start_time}${US}#{@continuum-restore}${US}#{@space_closer}")" || return 1
-  IFS="$US" read -r HIDDEN_LIST SPACES_ON REG_OPT PENDING START_T CONT_RESTORE CLOSER_OPT <<<"$o"
+  o="$(t display-message -p "#{@space_hidden_sessions}${US}#{@spaces}${US}#{@space_registry}${US}#{@space_restore_pending}${US}#{start_time}${US}#{@continuum-restore}${US}#{@space_closer}${US}#{@space_dash}")" || return 1
+  IFS="$US" read -r HIDDEN_LIST SPACES_ON REG_OPT PENDING START_T CONT_RESTORE CLOSER_OPT DASH_OPT <<<"$o"
   REG="${REG_OPT:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-spaces/spaces.tsv}"
+  DASH_CMD="${DASH_OPT:-$HOME/.config/tmux/scripts/space-dash.sh}"
 }
 
 is_hidden_name() { [[ " $HIDDEN_LIST " == *" $1 "* ]]; }
 
-R_NAME=() R_PATH=()
+# ── colours ────────────────────────────────────────────────────────────────
+# Every space has a stable colour (@space_color, a hex string), kept in the
+# registry's third column so it survives a restart. main is always lavender;
+# the others get the palette colour fewest registered spaces use, first in
+# palette order on a tie, when they are registered. Catppuccin mocha accents
+# that read on the dark theme, minus the state colours (red failed, yellow
+# needs-*, green done), so a space's colour never reads as a state.
+SPACE_MAIN_COLOR="#b4befe"
+SPACE_PALETTE=("#cba6f7" "#94e2d5" "#f5c2e7" "#74c7ec" "#fab387" "#f2cdcd" "#89dceb" "#f5e0dc" "#89b4fa")
+# mauve teal pink sapphire peach flamingo sky rosewater blue
+is_color() { [[ "$1" =~ ^#[0-9a-fA-F]{6}$ ]]; }
+# The colour for registry entry $1 (its name; main is fixed), from the others'.
+pick_color() {
+  [[ "$1" == "main" ]] && { printf '%s' "$SPACE_MAIN_COLOR"; return 0; }
+  local best="" bestn=-1 c k n
+  for c in "${SPACE_PALETTE[@]}"; do
+    n=0
+    for k in "${!R_NAME[@]}"; do
+      [[ "${R_NAME[k]}" != "$1" && "${R_COLOR[k]:-}" == "$c" ]] && n=$((n + 1))
+    done
+    if ((bestn < 0 || n < bestn)); then best="$c" bestn=$n; fi
+  done
+  printf '%s' "$best"
+}
+
+R_NAME=() R_PATH=() R_COLOR=()
 reg_load() {
-  R_NAME=() R_PATH=()
+  R_NAME=() R_PATH=() R_COLOR=()
   [[ -r "$REG" ]] || return 0
-  local n p
-  while IFS=$'\t' read -r n p; do
+  local n p c
+  while IFS=$'\t' read -r n p c; do
     [[ -n "$n" ]] || continue
-    R_NAME+=("$n") R_PATH+=("$p")
+    R_NAME+=("$n") R_PATH+=("$p") R_COLOR+=("$c")
   done <"$REG"
 }
 reg_find() {
@@ -102,17 +130,17 @@ reg_find() {
 }
 reg_del() {
   local i="$1" k
-  local -a n=() p=()
+  local -a n=() p=() c=()
   for k in "${!R_NAME[@]}"; do
     ((k == i)) && continue
-    n+=("${R_NAME[k]}") p+=("${R_PATH[k]}")
+    n+=("${R_NAME[k]}") p+=("${R_PATH[k]}") c+=("${R_COLOR[k]:-}")
   done
-  R_NAME=("${n[@]+"${n[@]}"}") R_PATH=("${p[@]+"${p[@]}"}")
+  R_NAME=("${n[@]+"${n[@]}"}") R_PATH=("${p[@]+"${p[@]}"}") R_COLOR=("${c[@]+"${c[@]}"}")
 }
 reg_save() {
   local tmp="$REG.tmp.$$" i
   {
-    for i in "${!R_NAME[@]}"; do printf '%s\t%s\n' "${R_NAME[i]}" "${R_PATH[i]}"; done
+    for i in "${!R_NAME[@]}"; do printf '%s\t%s\t%s\n' "${R_NAME[i]}" "${R_PATH[i]}" "${R_COLOR[i]:-}"; done
   } >"$tmp" && mv -f "$tmp" "$REG"
 }
 
@@ -156,15 +184,28 @@ reg_unlock() {
 # remain-on-exit an earlier version set is cleared.
 home_opts() {
   local w="$1" p="$2"
-  args+=(";" set -w -t "$w" @space_home 1 ";" set -w -t "$w" automatic-rename off
-    ";" set -w -t "$w" allow-rename off ";" set -wu -t "$w" remain-on-exit ";" rename-window -t "$w" home)
+  add set -w -t "$w" @space_home 1 ";" set -w -t "$w" automatic-rename off \
+    ";" set -w -t "$w" allow-rename off ";" set -wu -t "$w" remain-on-exit ";" rename-window -t "$w" home
   home_pane_opts "$p"
 }
 home_pane_opts() {
-  args+=(";" set -p -t "$1" @space_home_pane 1 ";" set -p -t "$1" remain-on-exit on)
+  add set -p -t "$1" @space_home_pane 1 ";" set -p -t "$1" remain-on-exit on
 }
 # Live, and a shell rather than the landing screen an earlier home ran.
 home_ok() { [[ "$1" == "0" && "$2" != *space*home* ]]; }   # pane_dead, pane_start_command
+
+# The DASHBOARD (space-dash.sh): the home window's top pane, full width,
+# DASH_ROWS high, above the home shell. It carries @space_dash_pane, a
+# pane-level remain-on-exit (the pane-died hook respawns it, as the home
+# shell) and the title space-dash, which is what resurrect brings back (it
+# restores titles, not options or this command): a restored home window's
+# space-dash pane is respawned as the dashboard, never adopted as the shell.
+# It is never the active pane: spaces.conf's window-pane-changed hook hands
+# focus straight back to the pane below it.
+DASH_TITLE=space-dash
+DASH_ROWS=9
+dash_pane_opts() { add set -p -t "$1" @space_dash_pane 1 ";" set -p -t "$1" remain-on-exit on ";" select-pane -t "$1" -T "$DASH_TITLE"; }
+dash_ok() { [[ "$1" == "0" && ( "$2" == *space-dash* || "$2" == "$DASH_CMD" ) ]]; }   # pane_dead, pane_start_command
 
 # ── sync ────────────────────────────────────────────────────────────────────
 cmd_sync() {
@@ -193,16 +234,16 @@ cmd_sync() {
   ((struct)) && { reg_lock || struct=0; }
 
   local srows
-  srows="$(t list-sessions -F "#{session_id}${US}#{@space_hidden}${US}#{@space_index}${US}#{@space_key}${US}#{session_windows}${US}#{@space_closing}${US}#{@space_reg}${US}#{session_path}${US}#{session_name}")" || return 0
+  srows="$(t list-sessions -F "#{session_id}${US}#{@space_hidden}${US}#{@space_index}${US}#{@space_key}${US}#{session_windows}${US}#{@space_closing}${US}#{@space_reg}${US}#{@space_color}${US}#{session_path}${US}#{session_name}")" || return 0
   local clients
   clients="$(t list-clients -F '#{client_name}' 2>/dev/null)"
   # Sessions by numeric id (= creation order; renames are matched in this
   # order, so a renamed main is seen before a new one takes its name).
-  local -a S_ID=() S_HID=() S_IDX=() S_KEY=() S_NWIN=() S_CLOSING=() S_REG=() S_PATH=() S_NAME=()
-  local id hid idx key nwin closing reg path name
-  while IFS="$US" read -r id hid idx key nwin closing reg path name; do
+  local -a S_ID=() S_HID=() S_IDX=() S_KEY=() S_NWIN=() S_CLOSING=() S_REG=() S_COLOR=() S_PATH=() S_NAME=()
+  local id hid idx key nwin closing reg color path name
+  while IFS="$US" read -r id hid idx key nwin closing reg color path name; do
     [[ -n "$id" ]] || continue
-    S_ID+=("$id") S_HID+=("$hid") S_IDX+=("$idx") S_KEY+=("$key") S_NWIN+=("$nwin") S_CLOSING+=("$closing") S_REG+=("$reg") S_PATH+=("$path") S_NAME+=("$name")
+    S_ID+=("$id") S_HID+=("$hid") S_IDX+=("$idx") S_KEY+=("$key") S_NWIN+=("$nwin") S_CLOSING+=("$closing") S_REG+=("$reg") S_COLOR+=("$color") S_PATH+=("$path") S_NAME+=("$name")
   done < <(printf '%s\n' "$srows" | awk -F"$US" 'NF { print substr($1, 2) + 0 FS $0 }' | sort -t"$US" -k1,1n | cut -d"$US" -f2-)
 
   local -a args=()
@@ -230,7 +271,8 @@ cmd_sync() {
       fi
       ri="$(reg_find "$name")"
       if ((ri < 0)); then
-        R_NAME+=("$name") R_PATH+=("${S_PATH[i]}"); changed=1
+        R_NAME+=("$name") R_PATH+=("${S_PATH[i]}") R_COLOR+=("")
+        R_COLOR[${#R_NAME[@]} - 1]="$(pick_color "$name")"; changed=1
       elif [[ "${R_PATH[ri]}" != "${S_PATH[i]}" ]]; then
         # Normally the live folder wins; after a restart the registry does
         # (resurrect recreates a session with its first pane's folder), and
@@ -256,6 +298,15 @@ cmd_sync() {
         reg_del "$ri"; changed=1
       fi
     done
+    # Colours: a line from before the colour column (or a hand edit) gets
+    # one now, in registry order; main's is fixed.
+    for ri in "${!R_NAME[@]}"; do
+      if [[ "${R_NAME[ri]}" == "main" ]]; then
+        [[ "${R_COLOR[ri]:-}" == "$SPACE_MAIN_COLOR" ]] || { R_COLOR[ri]="$SPACE_MAIN_COLOR"; changed=1; }
+      elif ! is_color "${R_COLOR[ri]:-}"; then
+        R_COLOR[ri]="$(pick_color "${R_NAME[ri]}")"; changed=1
+      fi
+    done
     ((changed)) && reg_save
   fi
 
@@ -276,13 +327,22 @@ cmd_sync() {
     (($(reg_find "${S_NAME[i]}") >= 0)) && continue
     order+=("$i")
   done
+  local want ri2
   for i in "${!S_ID[@]}"; do
     if is_hidden_name "${S_NAME[i]}"; then
       [[ "${S_HID[i]}" == "1" ]] || add set-option -t "${S_ID[i]}" @space_hidden 1
       [[ -z "${S_IDX[i]}" ]] || add set-option -u -t "${S_ID[i]}" @space_index
       [[ -z "${S_KEY[i]}" ]] || add set-option -u -t "${S_ID[i]}" @space_key
+      [[ -z "${S_COLOR[i]}" ]] || add set-option -u -t "${S_ID[i]}" @space_color
     else
       [[ -z "${S_HID[i]}" ]] || add set-option -u -t "${S_ID[i]}" @space_hidden
+      # @space_color: the registry's (an unregistered space keeps what it
+      # has until it is registered; main's is fixed).
+      want=""
+      ri2="$(reg_find "${S_NAME[i]}")"
+      ((ri2 >= 0)) && is_color "${R_COLOR[ri2]:-}" && want="${R_COLOR[ri2]}"
+      [[ "${S_NAME[i]}" == "main" ]] && want="$SPACE_MAIN_COLOR"
+      [[ -n "$want" && "${S_COLOR[i]}" != "$want" ]] && add set-option -t "${S_ID[i]}" @space_color "$want"
     fi
   done
   # @space_key: the label the status line draws for the space (its tab and
@@ -307,9 +367,10 @@ cmd_sync() {
   if ((${#args[@]})); then
     local c
     while IFS= read -r c; do [[ -n "$c" ]] && add refresh-client -S -t "$c"; done <<<"$clients"
-    t "${args[@]}" >/dev/null 2>&1
+    run_args
   fi
   if ((struct)); then
+    add_panes
     # One call each: a failing command ends a tmux command list.
     for ((i = 0; i < ${#recreate[@]}; i += 2)); do
       local d="${recreate[i + 1]}"
@@ -348,76 +409,208 @@ renumber_after_recreate() {
 #   3. else the session's only window, if it is not an agent: a new space's
 #      first shell becomes its home rather than gaining a second one
 #   4. else a new shell at the space folder, inserted as the lowest window
+#   Each home also has exactly one dashboard pane (DASH_TITLE above): a pane
+#   marked @space_dash_pane, else one titled space-dash (a resurrect restore)
+#   is it, respawned as the dashboard if it is not running one; a second
+#   marked one is killed; a home without one gets one (DASH_ADD, after the
+#   caller has run `args`, since a new pane's id is needed to mark it). The
+#   dashboard is never the home shell: the home pane is the first pane that
+#   is not the dashboard; a home left with only its dashboard gets a new
+#   shell below it (SHELL_ADD).
 # One row per PANE (list-panes -a, in window then pane order), so the first
 # row of a window is its first pane.
+DASH_ADD=() SHELL_ADD=()
 sync_homes() {
   local hrows
+  DASH_ADD=() SHELL_ADD=() HOME_NEW=()
   hrows="$(t list-panes -a -f '#{||:#{@space_home},#{||:#{==:#{window_name},home},#{==:#{session_windows},1}}}' \
-    -F "#{session_id}${US}#{window_id}${US}#{@space_home}${US}#{?#{@agent_state},a,}${US}#{pane_dead}${US}#{?#{==:#{window_name},home},n,}${US}#{window_start_flag}${US}#{@space_home_pane}${US}#{pane_current_command}${US}#{pane_id}${US}#{session_path}${US}#{pane_start_command}" 2>/dev/null)"
-  local i s sid wid home agent dead named first hpane cmd pane spath start
-  local keep keepfirst kp kpstate hp hpstate cand cfirst cpane cstate only ofirst opane ostate lastw
+    -F "#{session_id}${US}#{window_id}${US}#{@space_home}${US}#{?#{@agent_state},a,}${US}#{pane_dead}${US}#{?#{==:#{window_name},home},n,}${US}#{window_start_flag}${US}#{@space_home_pane}${US}#{pane_current_command}${US}#{pane_id}${US}#{@space_dash_pane}${US}#{?#{==:#{pane_title},$DASH_TITLE},t,}${US}#{pane_start_command}" 2>/dev/null)"
+  local i s sid wid home agent dead named first hpane cmd pane dpane titled start spath
+  # The window being read (w_*), and what it turned out to be.
+  local lastw w_home w_agent w_named w_first fp fpstate fpcmd hp hpstate dp dpstate dpmarked
+  local -a w_xdash=() w_xhome=()
+  local keep keepfirst k_hp k_hpstate k_fp k_fpstate k_dp k_dpstate k_dpmarked
+  local cand cfirst cpane cstate c_dp c_dpstate c_dpmarked
+  local only ofirst opane ostate o_dp o_dpstate o_dpmarked
+  local -a kill_dash=()
+  # Classify the window just read; see the list above.
+  finish_window() {
+    [[ -n "$lastw" ]] || return 0
+    if [[ "$w_home" == "1" ]]; then
+      if [[ -z "$keep" ]]; then
+        keep="$lastw" keepfirst="$w_first" k_hp="$hp" k_hpstate="$hpstate" k_fp="$fp" k_fpstate="$fpstate"
+        k_dp="$dp" k_dpstate="$dpstate" k_dpmarked="$dpmarked"
+        local x
+        for x in "${w_xhome[@]+"${w_xhome[@]}"}"; do add set -pu -t "$x" @space_home_pane ";" set -pu -t "$x" remain-on-exit; done
+        kill_dash+=("${w_xdash[@]+"${w_xdash[@]}"}")
+      else
+        # A second home (two syncs raced): it loses the markers, keeps its
+        # shells, and its dashboard goes.
+        add set -wu -t "$lastw" @space_home ";" set -wu -t "$lastw" remain-on-exit ";" set -wu -t "$lastw" allow-rename \
+          ";" set -wu -t "$lastw" automatic-rename
+        [[ -n "$hp" ]] && add set -pu -t "$hp" @space_home_pane ";" set -pu -t "$hp" remain-on-exit
+        local x
+        for x in "${w_xhome[@]+"${w_xhome[@]}"}"; do add set -pu -t "$x" @space_home_pane ";" set -pu -t "$x" remain-on-exit; done
+        [[ "$dpmarked" == "1" ]] && kill_dash+=("$dp")
+        kill_dash+=("${w_xdash[@]+"${w_xdash[@]}"}")
+      fi
+    elif [[ -z "$w_agent" && -n "$w_named" && -z "$cand" && -n "$fp" ]] && [[ "${fpstate:0:1}" == "1" || "$fpcmd" =~ ^-?(zsh|bash|sh|fish|nu)$ ]]; then
+      cand="$lastw" cfirst="$w_first" cpane="$fp" cstate="$fpstate" c_dp="$dp" c_dpstate="$dpstate" c_dpmarked="$dpmarked"
+    elif [[ -z "$w_agent" && "${S_NWIN[i]}" == "1" && -n "$fp" ]]; then
+      only="$lastw" ofirst="$w_first" opane="$fp" ostate="$fpstate" o_dp="$dp" o_dpstate="$dpstate" o_dpmarked="$dpmarked"
+    fi
+  }
+  # The dashboard of home window $1 (pane $2, "dead+start" $3, marked $4):
+  # make sure it is marked and running, or have one added.
+  ensure_dash() {
+    local w="$1" p="$2" st="$3" marked="$4"
+    if [[ -z "$p" ]]; then DASH_ADD+=("$w" "${S_PATH[i]:-$HOME}"); return 0; fi
+    [[ "$marked" == "1" ]] || dash_pane_opts "$p"
+    dash_ok "${st:0:1}" "${st:1}" || add respawn-pane -k -t "$p" -c "${S_PATH[i]:-$HOME}" "$DASH_CMD"
+  }
   for i in "${!S_ID[@]}"; do
     is_hidden_name "${S_NAME[i]}" && continue
     [[ "${S_CLOSING[i]}" == "1" ]] && continue
-    sid="${S_ID[i]}" keep="" keepfirst="" kp="" kpstate="" hp="" hpstate="" cand="" cfirst="" cpane="" cstate=""
-    only="" ofirst="" opane="" ostate="" lastw=""
-    while IFS="$US" read -r s wid home agent dead named first hpane cmd pane spath start; do
+    sid="${S_ID[i]}" lastw=""
+    keep="" keepfirst="" k_hp="" k_hpstate="" k_fp="" k_fpstate="" k_dp="" k_dpstate="" k_dpmarked=""
+    cand="" cfirst="" cpane="" cstate="" c_dp="" c_dpstate="" c_dpmarked=""
+    only="" ofirst="" opane="" ostate="" o_dp="" o_dpstate="" o_dpmarked=""
+    kill_dash=()
+    while IFS="$US" read -r s wid home agent dead named first hpane cmd pane dpane titled start; do
       [[ "$s" == "$sid" ]] || continue
-      local newwin=0
-      [[ "$wid" != "$lastw" ]] && newwin=1 && lastw="$wid"
-      if [[ "$home" == "1" ]]; then
-        [[ -z "$keep" ]] && keep="$wid" keepfirst="$first"
-        if [[ "$wid" == "$keep" ]]; then
-          ((newwin)) && kp="$pane" kpstate="$dead$start"
-          if [[ "$hpane" == "1" && -z "$hp" ]]; then hp="$pane" hpstate="$dead$start"
-          elif [[ "$hpane" == "1" ]]; then add set -pu -t "$pane" @space_home_pane ";" set -pu -t "$pane" remain-on-exit
-          fi
-        else
-          ((newwin)) && add set -wu -t "$wid" @space_home ";" set -wu -t "$wid" remain-on-exit ";" set -wu -t "$wid" allow-rename \
-            ";" set -wu -t "$wid" automatic-rename
-          [[ "$hpane" == "1" ]] && add set -pu -t "$pane" @space_home_pane ";" set -pu -t "$pane" remain-on-exit
-        fi
-      elif ((newwin)) && [[ -z "$agent" && -n "$named" && -z "$cand" ]] && [[ "$dead" == "1" || "$cmd" =~ ^-?(zsh|bash|sh|fish|nu)$ ]]; then
-        cand="$wid" cfirst="$first" cpane="$pane" cstate="$dead$start"
-      elif ((newwin)) && [[ -z "$agent" && "${S_NWIN[i]}" == "1" ]]; then
-        only="$wid" ofirst="$first" opane="$pane" ostate="$dead$start"
+      if [[ "$wid" != "$lastw" ]]; then
+        finish_window
+        lastw="$wid" w_home="$home" w_agent="$agent" w_named="$named" w_first="$first"
+        fp="" fpstate="" fpcmd="" hp="" hpstate="" dp="" dpstate="" dpmarked="" w_xdash=() w_xhome=()
+      fi
+      if [[ "$dpane" == "1" ]]; then
+        # Marked dashboards: the first is it (a titled one found earlier
+        # yields), any other goes.
+        if [[ "$dpmarked" != "1" ]]; then dp="$pane" dpstate="$dead$start" dpmarked=1
+        else w_xdash+=("$pane"); fi
+        continue
+      fi
+      if [[ -n "$titled" && "$hpane" != "1" && -z "$dp" ]]; then
+        dp="$pane" dpstate="$dead$start" dpmarked=""
+        continue
+      fi
+      [[ -z "$fp" ]] && fp="$pane" fpstate="$dead$start" fpcmd="$cmd"
+      if [[ "$hpane" == "1" ]]; then
+        if [[ -z "$hp" ]]; then hp="$pane" hpstate="$dead$start"; else w_xhome+=("$pane"); fi
       fi
     done <<<"$hrows"
+    finish_window
     if [[ -n "$keep" ]]; then
-      if [[ -z "$hp" ]]; then
+      if [[ -z "$k_hp" && -n "$k_fp" ]]; then
         # No pane marked (a home from before panes were marked): its first.
-        hp="$kp" hpstate="$kpstate"
-        home_pane_opts "$hp"
+        k_hp="$k_fp" k_hpstate="$k_fpstate"
+        home_pane_opts "$k_hp"
         add set -wu -t "$keep" remain-on-exit
       fi
-      # hpstate is pane_dead then the start command: "0..." is a live pane.
-      home_ok "${hpstate:0:1}" "${hpstate:1}" || add respawn-pane -k -t "$hp" -c "${S_PATH[i]:-$HOME}"
+      if [[ -n "$k_hp" ]]; then
+        # hpstate is pane_dead then the start command: "0..." is a live pane.
+        home_ok "${k_hpstate:0:1}" "${k_hpstate:1}" || add respawn-pane -k -t "$k_hp" -c "${S_PATH[i]:-$HOME}"
+      elif [[ -n "$k_dp" ]]; then
+        SHELL_ADD+=("$k_dp" "${S_PATH[i]:-$HOME}")
+      fi
+      ensure_dash "$keep" "$k_dp" "$k_dpstate" "$k_dpmarked"
+      local x
+      for x in "${kill_dash[@]+"${kill_dash[@]}"}"; do add kill-pane -t "$x"; done
       [[ "$keepfirst" == "1" ]] || add move-window -b -s "$keep" -t "$sid:^"
       continue
     fi
-    [[ -z "$cand" && -n "$only" ]] && cand="$only" cfirst="$ofirst" cpane="$opane" cstate="$ostate"
+    if [[ -z "$cand" && -n "$only" ]]; then
+      cand="$only" cfirst="$ofirst" cpane="$opane" cstate="$ostate" c_dp="$o_dp" c_dpstate="$o_dpstate" c_dpmarked="$o_dpmarked"
+    fi
     if [[ -n "$cand" ]]; then
       home_ok "${cstate:0:1}" "${cstate:1}" || add respawn-pane -k -t "$cpane" -c "${S_PATH[i]:-$HOME}"
       home_opts "$cand" "$cpane"
+      ensure_dash "$cand" "$c_dp" "$c_dpstate" "$c_dpmarked"
       [[ "$cfirst" == "1" ]] || add move-window -b -s "$cand" -t "$sid:^"
     else
-      add new-window -d -b -t "$sid:^" -n home -c "${S_PATH[i]:-$HOME}"
-      home_opts "$sid:^" "$sid:^"
+      # Made after `args` ran (add_panes), on its own: a command list stops at
+      # its first failing command, and a home must not depend on the rest.
+      HOME_NEW+=("$sid" "${S_PATH[i]:-$HOME}")
     fi
+  done
+}
+
+# Run `args` (run_list: its arguments) as one tmux call. A command list stops at its first failing
+# command (say a kill-pane or respawn-pane -k on a pane that vanished since
+# it was read), and the rest must not be lost with it: on a failure, every
+# command runs again on its own. They are all idempotent (options, renames,
+# moves to the front, respawns, kills), so the ones that did run are harmless
+# the second time.
+run_args() { ((${#args[@]})) || return 0; run_list "${args[@]}"; }
+run_list() {
+  t "$@" >/dev/null 2>&1 && return 0
+  local -a one=()
+  local a
+  for a in "$@"; do
+    if [[ "$a" == ";" ]]; then
+      ((${#one[@]})) && t "${one[@]}" >/dev/null 2>&1
+      one=()
+    else
+      one+=("$a")
+    fi
+  done
+  ((${#one[@]})) && t "${one[@]}" >/dev/null 2>&1
+  return 0
+}
+
+# After `args` ran: the new homes, then the dashboards and shells sync_homes
+# asked for. One call per window or pane (its id is needed to mark it); still
+# under the registry lock, so no other sync adds a second. A dashboard is
+# split only into a window that IS a home (@space_home, read back by id just
+# before): a target that turned out to be some other window, an agent's, is
+# never given one (no later sync would take it away). A window too small to
+# split is left for the next sync.
+HOME_NEW=()
+add_panes() {
+  local i p w
+  local -a args=()
+  for ((i = 0; i < ${#HOME_NEW[@]}; i += 2)); do
+    w="$(t new-window -d -b -t "${HOME_NEW[i]}:^" -n home -c "${HOME_NEW[i + 1]}" -P -F '#{window_id}' 2>/dev/null)" || continue
+    [[ "$w" == @* ]] || continue
+    args=()
+    home_opts "$w" "$w"
+    run_args
+    DASH_ADD+=("$w" "${HOME_NEW[i + 1]}")
+  done
+  HOME_NEW=()
+  for ((i = 0; i < ${#DASH_ADD[@]}; i += 2)); do
+    # (tmux answers a missing target with empty fields, not an error)
+    w="$(t display-message -p -t "${DASH_ADD[i]}" '#{window_id}|#{@space_home}' 2>/dev/null)"
+    [[ "$w" == @*"|1" ]] || continue
+    p="$(t split-window -d -f -b -v -l "$DASH_ROWS" -t "${w%|*}" -c "${DASH_ADD[i + 1]}" -P -F '#{pane_id}' "$DASH_CMD" 2>/dev/null)" || continue
+    [[ "$p" == %* ]] || continue
+    run_list set -p -t "$p" @space_dash_pane 1 ";" set -p -t "$p" remain-on-exit on ";" select-pane -t "$p" -T "$DASH_TITLE"
+  done
+  for ((i = 0; i < ${#SHELL_ADD[@]}; i += 2)); do
+    # Below a dashboard of a home, nowhere else.
+    w="$(t display-message -p -t "${SHELL_ADD[i]}" '#{pane_id}|#{@space_dash_pane}|#{@space_home}' 2>/dev/null)"
+    [[ "$w" == "${SHELL_ADD[i]}|1|1" ]] || continue
+    p="$(t split-window -d -v -t "${SHELL_ADD[i]}" -c "${SHELL_ADD[i + 1]}" -P -F '#{pane_id}' 2>/dev/null)" || continue
+    [[ "$p" == %* ]] || continue
+    run_list set -p -t "$p" @space_home_pane 1 ";" set -p -t "$p" remain-on-exit on ";" select-pane -t "$p"
   done
 }
 
 # The pane-died hook (spaces.conf) for a home pane: back in place, in the space
 # folder. Never more than once every 2 s, so a shell that dies at once cannot
 # spin the server.
+# The dashboard pane (@space_dash_pane) comes back the same way, running the
+# dashboard again.
 cmd_respawn_home() {
-  local pane="$1" info home dead last path now
-  info="$(t display-message -p -t "$pane" "#{@space_home_pane}${US}#{pane_dead}${US}#{@space_respawned}${US}#{session_path}" 2>/dev/null)" || return 0
-  IFS="$US" read -r home dead last path <<<"$info"
-  [[ "$home" == "1" && "$dead" == "1" ]] || return 0
+  local pane="$1" info home dash dead last path dcmd now
+  info="$(t display-message -p -t "$pane" "#{@space_home_pane}${US}#{@space_dash_pane}${US}#{pane_dead}${US}#{@space_respawned}${US}#{session_path}${US}#{@space_dash}" 2>/dev/null)" || return 0
+  IFS="$US" read -r home dash dead last path dcmd <<<"$info"
+  [[ ("$home" == "1" || "$dash" == "1") && "$dead" == "1" ]] || return 0
   now="$(date +%s)"
   [[ "$last" =~ ^[0-9]+$ ]] && ((now - last < 2)) && sleep 2
-  t set -p -t "$pane" @space_respawned "$(date +%s)" ";" respawn-pane -t "$pane" -c "${path:-$HOME}" 2>/dev/null
+  local -a cmd=()
+  [[ "$dash" == "1" ]] && cmd=("${dcmd:-$HOME/.config/tmux/scripts/space-dash.sh}")
+  t set -p -t "$pane" @space_respawned "$(date +%s)" ";" respawn-pane -t "$pane" -c "${path:-$HOME}" "${cmd[@]+"${cmd[@]}"}" 2>/dev/null
   return 0
 }
 
@@ -578,7 +771,7 @@ cmd_close() {
     while IFS= read -r p; do
       [[ -n "$p" ]] || continue
       bash -c "$closer \"\$1\"" _ "$p" </dev/null >/dev/null 2>&1 &
-    done < <(t list-panes -s -t "$sid" -F '#{pane_id}')
+    done < <(t list-panes -s -t "$sid" -f '#{!:#{@space_dash_pane}}' -F '#{pane_id}')   # a dashboard is not a tab
     wait
   fi
   t kill-session -t "$sid" 2>/dev/null

@@ -11,7 +11,19 @@ unbind r
 bind r source-file ~/.config/tmux/tmux.conf
 
 unbind C-b
-set -g prefix C-s
+# The prefix is C-s, armed by a root binding rather than the `prefix` option,
+# so pressing it can post com.mackhaymond.tmux.focus: the agent sidebar
+# (which hides the status line) redraws its "prefix armed" cue at once,
+# reading #{client_key_table}. The option would win over any root binding of
+# the same key, so it is None. Everything else is as before (checked on a
+# test server, tests/test_spaces.py): C-s <key>, C-s C-s (the resurrect
+# save), the -r repeat keys (C-s during a repeat re-arms), C-s from copy mode
+# (copy-mode-vi has no C-s, so tmux falls back to root). #{client_prefix}
+# still means "in the prefix table". send-prefix would send nothing with the
+# option None; no binding uses it (C-s C-s is the save). Only the arming edge
+# is posted: tmux has no hook for leaving a key table.
+set -g prefix None
+bind -n C-s switch-client -T prefix \; run-shell -b "notifyutil -p com.mackhaymond.tmux.focus"
 set -g mouse on
 
 set -g default-terminal "tmux-256color"

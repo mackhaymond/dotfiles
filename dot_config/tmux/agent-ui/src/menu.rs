@@ -322,8 +322,9 @@ impl PaneCache {
     /// the window's pane count changed or the entry is older than PANE_TTL.
     pub fn target(&mut self, w: &Window, resolve: impl FnOnce(&str) -> Option<String>) -> String {
         if w.panes <= 1 {
+            // One pane besides any dashboard: that pane, never the dashboard.
             self.panes.remove(&w.id);
-            return w.id.clone();
+            return w.capture_target();
         }
         if let Some((n, p, at)) = self.panes.get(&w.id) {
             if *n == w.panes && at.elapsed() < PANE_TTL {
@@ -331,7 +332,7 @@ impl PaneCache {
             }
         }
         // Can't tell which pane is the agent: the window's active pane, as the core does.
-        let p = resolve(&w.id).unwrap_or_else(|| w.id.clone());
+        let p = resolve(&w.id).unwrap_or_else(|| w.capture_target());
         self.panes.insert(w.id.clone(), (w.panes, p.clone(), Instant::now()));
         p
     }
@@ -574,6 +575,10 @@ mod tests {
         assert_eq!(get(&mut c, &w, Some("%2")), "%2");
         w.panes = 1; // one pane: the window itself, never asked
         assert_eq!(get(&mut c, &w, Some("%7")), "@5");
+        assert_eq!(asked.get(), 3);
+        // A dashboard (active) over the one shell: the shell, never asked.
+        let home = Window::parse(&crate::tmux::tests::row("main", 0, "@6", &[("pane_flags", "D0%3 p1%4 ")])).unwrap();
+        assert_eq!(get(&mut c, &home, Some("%3")), "%4");
         assert_eq!(asked.get(), 3);
     }
 }
