@@ -36,7 +36,20 @@
 #   new-space CLIENT          folder picker (run inside display-popup), then
 #                             create or reuse a session for that folder and
 #                             switch CLIENT to it
-#   close SID CLIENT          close a space for good: every tab through
+#   open-dir DIR [CLIENT]     the same without the picker
+#   pick-tab shell|agent CLIENT
+#                             which space? (run inside display-popup): the
+#                             spaces in ⌃N order, then zoxide's folders; a
+#                             pick (or a typed folder) runs new-tab
+#   new-tab shell|agent TARGET [CLIENT]
+#                             a new shell / claude tab at the END of space
+#                             TARGET (a session id, $N or N) at its folder,
+#                             and switch CLIENT to it. TARGET may be a folder:
+#                             its space (open-dir's create-or-reuse); a shell
+#                             in a space made just now is its home, no extra
+#                             tab. Never renames, closes or reorders a space
+#   preview-tab KEY           pick-tab's preview of one row
+#   close SID CLIENT         close a space for good: every tab through
 #                             @space_closer (closed-tabs.sh, so CMD+Z can bring
 #                             it back), unregister, kill the session. Never main
 #   move-menu WID CLIENT      menu of spaces; picking one runs move-to
@@ -572,6 +585,8 @@ sync_homes() {
 # moves to the front, respawns, kills), so the ones that did run are harmless
 # the second time.
 run_args() { ((${#args[@]})) || return 0; run_list "${args[@]}"; }
+# Append one command to the caller's `args` list (cmd_sync defines the same).
+add() { ((${#args[@]})) && args+=(";"); args+=("$@"); }
 run_list() {
   t "$@" >/dev/null 2>&1 && return 0
   local -a one=()
@@ -810,9 +825,10 @@ cmd_close() {
 }
 
 # ── move a tab to another space ────────────────────────────────────────────
-# Spaces in tab order: "index<US>session_id<US>name", visible ones only.
+# Spaces in tab order, visible ones only:
+# "index<US>session_id<US>name<US>hidden<US>key<US>folder" (key: @space_key).
 spaces_in_order() {
-  t list-sessions -F "#{@space_index}${US}#{session_id}${US}#{session_name}${US}#{@space_hidden}" \
+  t list-sessions -F "#{@space_index}${US}#{session_id}${US}#{session_name}${US}#{@space_hidden}${US}#{@space_key}${US}#{session_path}" \
     | awk -F"$US" '$4 != "1" && $1 != ""' | sort -t"$US" -k1,1n
 }
 
@@ -868,19 +884,37 @@ sanitize() {
   printf '%s' "${s:-space}"
 }
 
+# A folder as the reuse matches compare it: no trailing /, but / stays /.
+norm_dir() {
+  local d="$1"
+  while [[ "$d" == */ && "$d" != / ]]; do d="${d%/}"; done
+  printf '%s' "${d:-/}"
+}
+
+# The space already on DIR (absolute): print its session id, or nothing. ~ is
+# main's. Hidden sessions never count.
+space_for_dir() {
+  local dir rows id name path hid
+  dir="$(norm_dir "$1")"
+  [[ "$dir" == "$HOME" ]] && { t list-sessions -F '#{session_id}|#{session_name}' | awk -F'|' '$2=="main"{print $1; exit}'; return 0; }
+  rows="$(t list-sessions -F '#{session_id}|#{session_name}|#{session_path}|#{@space_hidden}')" || return 1
+  while IFS='|' read -r id name path hid; do
+    [[ "$hid" == "1" ]] && continue
+    if [[ "$(norm_dir "$path")" == "$dir" ]]; then printf '%s\n' "$id"; return 0; fi
+  done <<<"$rows"
+  return 0
+}
+
 # Create-or-reuse for DIR, print the session id to switch to. Pure tmux, no
 # picker, so tests can drive it: `space.sh open-dir DIR`.
 # DIR must already be absolute (cmd_open_dir makes it so).
 open_dir() {
-  local dir="${1%/}" rows id name path base
+  local dir="${1%/}" rows name base sid
   [[ -n "$dir" ]] || dir="/"
-  [[ "$dir" == "$HOME" ]] && { t list-sessions -F '#{session_id}|#{session_name}' | awk -F'|' '$2=="main"{print $1; exit}'; return 0; }
+  sid="$(space_for_dir "$dir")" || return 1
+  [[ -n "$sid" || "$dir" == "$HOME" ]] && { printf '%s\n' "$sid"; return 0; }
   rows="$(t list-sessions -F '#{session_id}|#{session_name}|#{session_path}|#{@space_hidden}')" || return 1
-  local hid hidden
-  while IFS='|' read -r id name path hid; do
-    [[ "$hid" == "1" ]] && continue
-    if [[ "${path%/}" == "$dir" ]]; then printf '%s\n' "$id"; return 0; fi
-  done <<<"$rows"
+  local hidden
   # Every hidden name counts as taken even with no such session yet: a folder
   # called stash/tasks/agents/... must become stash-2, never a hidden session.
   hidden=" $(t show -gqv @space_hidden_sessions 2>/dev/null) "
@@ -907,6 +941,38 @@ cmd_open_dir() {
   if [[ -n "$client" ]]; then t switch-client -c "$client" -t "$sid"; else t switch-client -t "$sid"; fi
 }
 
+# The folder candidates the pickers offer, best first, one absolute path a
+# line: PANE_PATH (the tab's cwd), then zoxide by frecency — or, without
+# zoxide, ~ and the folders under ~/code/projects and ~/code — deduped, dead
+# dirs dropped. Same list as claude-dir-picker.sh. tilde_paths ~-shortens it.
+dir_candidates() {
+  local d
+  {
+    printf '%s\n' "$1"
+    if command -v zoxide >/dev/null 2>&1; then
+      zoxide query -l 2>/dev/null || true
+    else
+      printf '%s\n' "$HOME"
+      for d in "$HOME"/code/projects/*/ "$HOME"/code/*/; do [[ -d "$d" ]] && printf '%s\n' "${d%/}"; done
+    fi
+  } | awk 'NF && !seen[$0]++' \
+    | while IFS= read -r d; do [[ -d "$d" ]] && printf '%s\n' "$d"; done
+}
+tilde_paths() { sed "s|^$HOME\$|~|; s|^$HOME/|~/|"; }
+
+# The client's session id and pane folder, as "sid<US>path". list-clients
+# expands each row in THAT client's session (display-message -c does not: -c
+# only picks where to display). CLIENT may be its name or its tty.
+client_where() {
+  local c="${1:-}" row
+  if [[ -n "$c" ]]; then
+    row="$(t list-clients -F "#{client_name}${US}#{client_tty}${US}#{session_id}${US}#{pane_current_path}" 2>/dev/null \
+      | awk -F"$US" -v c="$c" '$1 == c || $2 == c { print $3 FS $4; exit }')"
+    [[ -n "$row" ]] && { printf '%s\n' "$row"; return 0; }
+  fi
+  t display-message -p "#{session_id}${US}#{pane_current_path}"
+}
+
 cmd_new_space() {
   local client="${1:-}"
   CLIENT="$client"
@@ -915,23 +981,9 @@ cmd_new_space() {
   if [[ -n "$client" ]]; then pane_path="$(t display-message -c "$client" -p '#{pane_current_path}')"
   else pane_path="$(t display-message -p '#{pane_current_path}')"; fi
   [[ -d "$pane_path" ]] || pane_path="$HOME"
-  # Same candidate list as claude-dir-picker.sh: this tab's cwd, then zoxide
-  # by frecency — or, without zoxide, ~ and the folders under ~/code/projects
-  # and ~/code — deduped, dead dirs dropped, ~-shortened. A typed path that is
-  # not listed still works (--print-query).
-  list="$(
-    {
-      printf '%s\n' "$pane_path"
-      if command -v zoxide >/dev/null 2>&1; then
-        zoxide query -l 2>/dev/null || true
-      else
-        printf '%s\n' "$HOME"
-        for d in "$HOME"/code/projects/*/ "$HOME"/code/*/; do [[ -d "$d" ]] && printf '%s\n' "${d%/}"; done
-      fi
-    } | awk 'NF && !seen[$0]++' \
-      | while IFS= read -r d; do [[ -d "$d" ]] && printf '%s\n' "$d"; done \
-      | sed "s|^$HOME\$|~|; s|^$HOME/|~/|"
-  )"
+  # dir_candidates, ~-shortened. A typed path that is not listed still works
+  # (--print-query).
+  list="$(dir_candidates "$pane_path" | tilde_paths)"
   out="$(printf '%s\n' "$list" | fzf \
     --reverse --info=inline --print-query --tiebreak=index \
     --prompt='new space in: ' \
@@ -946,6 +998,181 @@ cmd_new_space() {
   [[ -n "$target" ]] || return 0
   target="${target/#\~/$HOME}"
   cmd_open_dir "$target" "$client"
+}
+
+# ── new tab in a chosen space ──────────────────────────────────────────────
+# CMD+SHIFT+T / CMD+SHIFT+R (prefix C-t / K, spaces.conf) ask WHICH SPACE:
+# pick-tab is the popup, new-tab the pure-tmux half tests drive.
+#
+# new-tab KIND TARGET: KIND shell or agent (a claude tab). TARGET is a
+# session id ($N, or a bare N as move-to takes) or a folder. A folder's space
+# is reused, else made (open_dir). The tab goes at the END of the space, at
+# its folder, and CLIENT is switched to it. The space itself is never renamed,
+# closed or reordered. A shell in a space made just now is that space's only
+# window, which its sync makes home: CLIENT lands there and no second shell is
+# added. A claude tab is an agent from birth: @agent_birth runs in the SAME
+# command list as its new-window (agent-birth.conf), so it never counts as a
+# shell, even for a moment.
+cmd_new_tab() {
+  local kind="$1" target="$2" client="${3:-}" sid dir="" created=0 info hid name spath wid
+  CLIENT="$client"
+  [[ "$kind" == shell || "$kind" == agent ]] || { msg -k warn "new-tab: shell or agent, not '$kind'"; return 1; }
+  [[ -n "$target" ]] || { msg -k warn "new-tab: no space or folder"; return 1; }
+  read_opts || return 1
+  if [[ "$target" =~ ^\$?[0-9]+$ ]]; then
+    sid="\$${target#\$}"
+  else
+    [[ -d "$target" ]] || { msg -k warn "not a directory: $target"; return 1; }
+    # Absolute, as cmd_open_dir: a typed "../foo" is relative to the popup.
+    dir="$(cd -- "$target" 2>/dev/null && pwd)" || { msg -k error "cannot enter: $target"; return 1; }
+    sid="$(space_for_dir "$dir")" || { msg -k error "could not open a space for $dir"; return 1; }
+    if [[ -z "$sid" ]]; then
+      sid="$(open_dir "$dir")"
+      [[ "$sid" == \$* ]] || { msg -k error "could not open a space for $dir"; return 1; }
+      created=1
+    fi
+  fi
+  info="$(t display-message -p -t "$sid" "#{session_id}${US}#{@space_hidden}${US}#{session_name}${US}#{session_path}" 2>/dev/null)"
+  IFS="$US" read -r sid hid name spath <<<"$info"
+  [[ "$sid" == \$* && -n "$name" ]] || { msg -k warn "no such space"; return 1; }
+  if [[ "$hid" == "1" ]] || is_hidden_name "$name"; then msg -k warn "not a space (hidden session)"; return 1; fi
+
+  if ((created)) && [[ "$kind" == shell ]]; then
+    notify
+    t switch-client ${client:+-c "$client"} -t "$sid"
+    return 0
+  fi
+  # A claude tab in a space made just now: its first shell must be home
+  # before a second window lands beside it, or the sync (which adopts a
+  # space's ONLY window) would add a home shell of its own. One sync here,
+  # under the registry lock, does what the session-created one would (home
+  # and its dashboard at once). A sync that does nothing structural (a
+  # restore pending, the lock busy) makes no home, so then the window gets
+  # the home marks here, exactly the ones sync's adoption sets (home_opts);
+  # the next structural sync keeps it as home (a marked window wins) and adds
+  # its dashboard (ensure_dash, add_panes), and never a second home.
+  if ((created)); then
+    cmd_sync normal; reg_unlock
+    local fw fp fh
+    IFS="$US" read -r fw fp fh <<<"$(t display-message -p -t "$sid:^" "#{window_id}${US}#{pane_id}${US}#{@space_home}" 2>/dev/null)"
+    if [[ "$fw" == @* && "$fp" == %* && "$fh" != 1 ]]; then
+      local -a args=()
+      home_opts "$fw" "$fp"
+      run_args
+    fi
+  fi
+
+  local -a cmd=(new-window -a -t "$sid:{end}" -c "${spath:-$HOME}" -P -F '#{window_id}')
+  [[ "$kind" == agent ]] && cmd+=(-e ZSH_AUTOSTART=claude ";" run-shell -C '#{?@agent_birth,#{@agent_birth} claude,}')
+  wid="$(t "${cmd[@]}" 2>/dev/null)"
+  wid="${wid%%$'\n'*}"
+  [[ "$wid" == @* ]] || { msg -k error "could not open a tab in $name"; return 1; }
+  notify
+  t switch-client ${client:+-c "$client"} -t "$sid:$wid"
+}
+
+# pick-tab KIND CLIENT (inside display-popup): the spaces in ⌃N order, the
+# client's own marked (here) but still a pick, then the folder candidates
+# (dir_candidates) that are not already a space's folder. Each row is
+# "KEY<TAB>label"; fzf shows and filters the label only (--with-nth=2) and
+# hands back the whole row, so a pick is read from KEY (s:N for space $N,
+# d:/abs/path for a folder), never from the label. A typed path that matches
+# no row is taken as a folder (--print-query). Esc / ^C: nothing.
+cmd_pick_tab() {
+  local kind="$1" client="${2:-}"
+  CLIENT="$client"
+  [[ "$kind" == shell || "$kind" == agent ]] || { msg -k warn "pick-tab: shell or agent, not '$kind'"; return 1; }
+  command -v fzf >/dev/null 2>&1 || { msg -k error "fzf not found in PATH"; return 1; }
+  local where cur pane_path
+  where="$(client_where "$client")"
+  IFS="$US" read -r cur pane_path <<<"$where"
+  [[ -d "$pane_path" ]] || pane_path="$HOME"
+
+  local -a s_id=() s_label=() s_name=() s_path=()
+  local idx id name h key path w=4 i
+  while IFS="$US" read -r idx id name h key path; do
+    [[ -n "$id" ]] || continue
+    s_id+=("$id") s_label+=("${key:-$idx}") s_name+=("$name") s_path+=("$(norm_dir "$path")")
+    ((${#name} > w)) && w=${#name}
+  done < <(spaces_in_order)
+  local list="" short here
+  for i in "${!s_id[@]}"; do
+    short="$(printf '%s\n' "${s_path[i]}" | tilde_paths)"
+    here=""; [[ "${s_id[i]}" == "$cur" ]] && here="  (here)"
+    list+="$(printf 's:%s\t%-3s %-*s  %s%s' "${s_id[i]#\$}" "${s_label[i]}" "$w" "${s_name[i]}" "$short" "$here")"$'\n'
+  done
+  local d taken nd
+  while IFS= read -r d; do
+    taken=0 nd="$(norm_dir "$d")"
+    for i in "${!s_path[@]}"; do [[ "${s_path[i]}" == "$nd" ]] && { taken=1; break; }; done
+    ((taken)) && continue
+    list+="d:$d"$'\t'"$(printf '%s\n' "$d" | tilde_paths)"$'\n'
+  done < <(dir_candidates "$pane_path")
+
+  local what=shell; [[ "$kind" == agent ]] && what=claude
+  local out status query selection target
+  out="$(printf '%s' "$list" | fzf \
+    --reverse --info=inline --print-query --tiebreak=index \
+    --delimiter=$'\t' --with-nth=2 \
+    --prompt="new $what in: " \
+    --header="enter: new $what tab at the end of that space (a folder: its space, made if new) · esc: cancel" \
+    --preview "bash '${BASH_SOURCE[0]}' preview-tab {1}" \
+    --preview-window=right:50%:nowrap:noinfo)"
+  status=$?
+  [[ $status -eq 0 || $status -eq 1 ]] || return 0
+  query="$(printf '%s\n' "$out" | sed -n '1p')"
+  selection="$(printf '%s\n' "$out" | sed -n '2p')"
+  if [[ -n "$selection" ]]; then
+    key="${selection%%$'\t'*}"
+    case "$key" in
+      s:*) target="\$${key#s:}" ;;
+      d:/*) target="${key#d:}" ;;
+      *) return 0 ;;
+    esac
+  else
+    [[ -n "$query" ]] || return 0
+    target="${query/#\~/$HOME}"
+    # Never a bare number (new-tab would read it as a session id).
+    [[ "$target" == /* ]] || target="$PWD/$target"
+  fi
+  cmd_new_tab "$kind" "$target" "$client"
+}
+
+# A folder's listing, for the pickers' previews (~ allowed).
+preview_dir() {
+  local d="${1:-}"
+  d="${d/#\~/$HOME}"
+  ls -1p -- "$d" 2>/dev/null | head -200
+}
+
+# pick-tab's preview of row KEY: a space's tabs (shells in tab order, home
+# first, then the agents with their ⌥W letter and summary), or a folder's
+# listing.
+cmd_preview_tab() {
+  local key="${1:-}"
+  case "$key" in
+    s:*) ;;
+    d:*) preview_dir "${key#d:}"; return 0 ;;
+    *) return 0 ;;
+  esac
+  local sid="\$${key#s:}" rows k home letter summary state wname cmd path
+  rows="$(t list-windows -t "$sid" -F "#{?#{@agent_state},a,s}${US}#{@space_home}${US}#{@agent_key}${US}#{@agent_summary}${US}#{@agent_state}${US}#{window_name}${US}#{pane_current_command}${US}#{pane_current_path}" 2>/dev/null)" || return 0
+  local n=0
+  printf 'shells\n'
+  while IFS="$US" read -r k home letter summary state wname cmd path; do
+    [[ "$k" == s ]] || continue
+    n=$((n + 1))
+    [[ "$home" == 1 ]] && cmd=home
+    printf '  %d  %-10s %s\n' "$n" "$cmd" "$(printf '%s\n' "$path" | tilde_paths)"
+  done <<<"$rows"
+  printf '\nagents\n'
+  n=0
+  while IFS="$US" read -r k home letter summary state wname cmd path; do
+    [[ "$k" == a ]] || continue
+    n=$((n + 1))
+    printf '  %s  %s  (%s)\n' "${letter:--}" "${summary:-$wname}" "$state"
+  done <<<"$rows"
+  ((n)) || printf '  none\n'
 }
 
 main() {
@@ -971,13 +1198,12 @@ main() {
     move-to) CLIENT="${3:-}"; cmd_move_to "${1:-}" "${2:-}" ;;
     new-space) cmd_new_space "${1:-}" ;;
     open-dir) CLIENT="${2:-}"; cmd_open_dir "${1:-}" "${2:-}" ;;
-    preview)
-      local d="${1:-}"
-      d="${d/#\~/$HOME}"
-      ls -1p -- "$d" 2>/dev/null | head -200
-      ;;
+    pick-tab) cmd_pick_tab "${1:-}" "${2:-}" ;;
+    new-tab) cmd_new_tab "${1:-}" "${2:-}" "${3:-}" ;;
+    preview-tab) cmd_preview_tab "${1:-}" ;;
+    preview) preview_dir "${1:-}" ;;
     *)
-      echo "usage: space.sh sync [load|reconcile] | agent|shell N SID [CLIENT] | next|prev SID [CLIENT] | toggle SID [CLIENT] | close SID [CLIENT] | move-menu WID [CLIENT] | move-to WID SID [CLIENT] | respawn-home PANE | new-space CLIENT | open-dir DIR [CLIENT]" >&2
+      echo "usage: space.sh sync [load|reconcile] | agent|shell N SID [CLIENT] | next|prev SID [CLIENT] | toggle SID [CLIENT] | close SID [CLIENT] | move-menu WID [CLIENT] | move-to WID SID [CLIENT] | respawn-home PANE | new-space CLIENT | open-dir DIR [CLIENT] | pick-tab shell|agent CLIENT | new-tab shell|agent SID|DIR [CLIENT] | preview-tab KEY" >&2
       return 2
       ;;
   esac

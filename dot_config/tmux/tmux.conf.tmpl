@@ -60,6 +60,8 @@ bind % split-window -h -c "#{pane_current_path}"
 bind c new-window -a -c "#{pane_current_path}"
 
 # CMD+SHIFT+T (wezterm) → new tab at the end of all tabs, starting in $HOME.
+# With @spaces on, spaces.conf rebinds it to the space picker (which space
+# gets the new shell; space.sh pick-tab), and restores this line when off.
 bind C-t new-window -a -t '{end}' -c "#{HOME}"
 
 # CMD+OPT+T (wezterm) → recreate current tab in place, same cwd. (Was
@@ -96,6 +98,9 @@ bind k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude \; run-sh
 # shell-command, so a '#{session_name}' passed here would reach the script as
 # 14 literal characters and the new-window would fail with the popup already
 # gone. The script asks tmux itself instead.
+#
+# With @spaces on, spaces.conf rebinds K to the space picker (which space gets
+# the claude tab; space.sh pick-tab), and restores this binding when off.
 bind K display-popup -E -w 80% -h 70% -d "#{pane_current_path}" \
   "$HOME/.config/tmux/scripts/claude-dir-picker.sh"
 

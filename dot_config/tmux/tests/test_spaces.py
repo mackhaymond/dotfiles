@@ -45,14 +45,21 @@ COLS, ROWS = 140, 20
 
 
 def conf_line(prefix):
-    """The one tmux.conf.tmpl line starting with `prefix`."""
-    hits = [l for l in CONF.read_text().splitlines() if l.startswith(prefix)]
-    assert len(hits) == 1, (prefix, hits)
-    return hits[0]
+    """The one tmux.conf.tmpl line starting with `prefix`, with the lines it
+    continues onto (a trailing backslash) joined back on by newlines."""
+    lines = CONF.read_text().splitlines()
+    hits = [i for i, l in enumerate(lines) if l.startswith(prefix)]
+    assert len(hits) == 1, (prefix, [lines[i] for i in hits])
+    i = hits[0]
+    out = [lines[i]]
+    while out[-1].endswith("\\"):
+        i += 1
+        out.append(lines[i])
+    return "\n".join(out)
 
 
 # tmux.conf lines spaces.conf rebinds when on and restores verbatim when off.
-TODAY_BINDS = [conf_line(p) for p in ("bind c ", "bind C-t ", "bind k ", "bind C-k ", "bind x ", "bind C-l ")]
+TODAY_BINDS = [conf_line(p) for p in ("bind c ", "bind C-t ", "bind k ", "bind K ", "bind C-k ", "bind x ", "bind C-l ")]
 # The session picker and the Option-W menu: tmux.conf binds them on every
 # load; spaces.conf unbinds the picker / gives M-w to the agent leader when on,
 # and leaves them alone when off (prefix r re-runs tmux.conf first).
@@ -82,9 +89,23 @@ CHORD = {(row, n): f"\x1b[91{r}{n}~" for r, row in ((1, "CTRL"), (2, "ALT"), (3,
 
 class ConfigShape(unittest.TestCase):
     def test_else_branch_restores_todays_rebound_keys_verbatim(self):
-        lines = else_branch().splitlines()
+        text = else_branch() + "\n"
         for b in TODAY_BINDS:
-            self.assertIn(b, lines)
+            self.assertIn("\n" + b + "\n", text)   # whole lines (bind K spans two)
+
+    def test_shift_tab_keys_ask_which_space_when_on(self):
+        # CMD+SHIFT+T / CMD+SHIFT+R: the space picker in a popup, opened as
+        # Option-N's is; tmux.conf's own C-t / K are gone from the on branch.
+        on = on_branch().splitlines()
+        popup = ("bind {key} run-shell -C \"display-popup -c '#{{client_tty}}' -E -w 80% -h 70% "
+                 "-d '#{{pane_current_path}}' \\\"#{{@space_sh}} pick-tab {kind} '#{{client_tty}}'\\\"\"")
+        self.assertIn(popup.format(key="C-t", kind="shell"), on)
+        self.assertIn(popup.format(key="K", kind="agent"), on)
+        self.assertEqual([l for l in on if l.startswith(("bind C-t ", "bind K "))],
+                         [popup.format(key="C-t", kind="shell"), popup.format(key="K", kind="agent")])
+        # The off copies are tmux.conf's: $HOME and claude-dir-picker.
+        self.assertIn("claude-dir-picker.sh", conf_line("bind K "))
+        self.assertTrue(conf_line("bind C-t ").endswith('-c "#{HOME}"'))
 
     def test_flag_and_hidden_list_live_in_tmux_conf(self):
         text = CONF.read_text()
@@ -351,10 +372,12 @@ class FlagOff(Server):
         self.assertNotIn("status-format[1] \"#[align=left]#{?#{@space_hidden}", self.t("show", "-g", "status-format"))
         self.assertEqual(self.t("list-keys", "-T", "prefix", "a", check=False), "")    # picker gone
         self.assertEqual(self.t("list-keys", "-T", "prefix", "C-a", check=False), "")
-        bound = lambda table: next(l for l in self.t("list-keys", "-T", table).splitlines()
-                                   if re.match(rf"bind-key +-T {table} +M-1 ", l))
+        bound = lambda table, key="M-1": next(l for l in self.t("list-keys", "-T", table).splitlines()
+                                              if re.match(rf"bind-key +-T {table} +{key} ", l))
         self.assertIn(" agent 1 ", bound("prefix"))
         self.assertIn(" shell 1 ", bound("root"))
+        self.assertIn(" pick-tab shell ", bound("prefix", "C-t"))   # CMD+SHIFT+T: which space?
+        self.assertIn(" pick-tab agent ", bound("prefix", "K"))     # CMD+SHIFT+R
 
         self.t("set", "-g", "@spaces", "off")
         self.t("source-file", today_conf)   # prefix r re-runs tmux.conf, then spaces.conf
@@ -1189,9 +1212,7 @@ class Spaces(Server):
         self.wait(lambda: self.on("#{pane_current_path}"), self.home_dir)
         self.key("C-b", "c")
         self.wait(lambda: self.on("#{pane_current_path}"), self.proj)
-        self.key("C-b", "C-t")
-        self.wait(lambda: self.on("#{window_index}"), self.t("display", "-t", "proj:{end}", "-p", "#{window_index}"))
-        self.wait(lambda: self.on("#{pane_current_path}"), self.proj)
+        # (C-t asks which space: test_new_tab_*.)
         # main is not a project space: today's cwd rule.
         self.t("switch-client", "-c", self.client, "-t", "main")
         self.t("send-keys", "-t", self.M1, f"cd {self.home_dir}", "Enter")
@@ -1232,6 +1253,202 @@ class Spaces(Server):
         names = self.t("list-sessions", "-F", "#{session_name}").split()
         self.assertNotIn("stash", names)
         self.assertNotIn("tasks", names)
+
+    # -- new tab in a chosen space (CMD+SHIFT+T / CMD+SHIFT+R) ----------------
+    def no_real_shells(self):
+        """New windows run a recorder, never zsh (ZSH_AUTOSTART=claude would
+        start a real claude): it writes what the window was told to autostart
+        into autostart.<pane id>, then sleeps."""
+        self.t("set", "-g", "default-shell", "/bin/sh")
+        self.t("set", "-g", "default-command",
+               f'echo "${{ZSH_AUTOSTART:-none}}" > {self.tmp}/autostart.$TMUX_PANE; exec sleep 600')
+
+    def autostart(self, wid):
+        pane = self.t("display", "-t", wid, "-p", "#{pane_id}")
+        f = os.path.join(self.tmp, "autostart." + pane)
+        self.wait(lambda: os.path.exists(f) and Path(f).read_text().strip() != "", True)
+        return Path(f).read_text().strip()
+
+    def windows(self, session):
+        """[(window_id, a|s, home?, folder)] of `session`, in tab order."""
+        rows = self.t("list-windows", "-t", session, "-F",
+                      "#{window_id}|#{?#{@agent_state},a,s}|#{@space_home}|#{pane_current_path}")
+        return [tuple(r.split("|")) for r in rows.splitlines()]
+
+    def test_new_tab_shell_goes_at_the_end_of_that_space_at_its_folder(self):
+        self.no_real_shells()
+        before = self.windows("proj")
+        name = self.t("display", "-t", "proj", "-p", "#{session_name}|#{@space_index}")
+        r = self.script("new-tab", "shell", self.sid("proj"), self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        after = self.windows("proj")
+        self.assertEqual(after[:-1], before)                               # nothing else moved
+        wid, kind, home, path = after[-1]
+        self.assertEqual((kind, home, path), ("s", "", self.proj))         # a shell, at the space folder
+        self.assertEqual(self.autostart(wid), "none")
+        self.wait(lambda: self.on("#{session_name}:#{window_id}"), f"proj:{wid}")   # client went there
+        self.assertEqual(self.t("display", "-t", "proj", "-p", "#{session_name}|#{@space_index}"), name)
+
+    def test_new_tab_agent_is_an_agent_from_birth(self):
+        self.no_real_shells()
+        before = [w[0] for w in self.windows("zed")]
+        # A bare N, as move-to takes.
+        r = self.script("new-tab", "agent", self.sid("zed").lstrip("$"), self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        new = [w for w in self.windows("zed") if w[0] not in before]
+        self.assertEqual(len(new), 1, new)
+        wid, kind, home, path = new[0]
+        self.assertEqual(self.windows("zed")[-1][0], wid)                  # at the end
+        self.assertEqual((kind, path), ("a", "/usr"))
+        self.assertEqual(self.t("display", "-t", wid, "-p", "#{@agent_state}|#{@agent_kind}|#{@agent_summary}"),
+                         "idle|claude|usr/New Session")
+        self.assertEqual(self.autostart(wid), "claude")
+        self.wait(lambda: self.on("#{session_name}:#{window_id}"), f"zed:{wid}")
+
+    def test_new_tab_shell_in_a_new_folder_lands_on_its_home(self):
+        self.no_real_shells()
+        d = os.path.join(self.home_dir, "fresh")
+        os.mkdir(d)
+        r = self.script("new-tab", "shell", d, self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait(lambda: self.on("#{session_name}|#{session_path}"), f"fresh|{d}")
+        self.wait_home("fresh")
+        time.sleep(0.3)                                                     # any late sync
+        wins = self.windows("fresh")
+        self.assertEqual([(k, h) for _, k, h, _ in wins], [("s", "1")])     # home only, no extra shell
+        self.assertEqual(self.on("#{window_id}"), wins[0][0])
+        # Again: the space exists now, so a new shell at its end.
+        r = self.script("new-tab", "shell", d + "/", self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        wins = self.windows("fresh")
+        self.assertEqual([(k, h) for _, k, h, _ in wins], [("s", "1"), ("s", "")])
+        self.wait(lambda: self.on("#{window_id}"), wins[-1][0])
+        self.assertEqual(len([s for s in self.t("list-sessions", "-F", "#{session_path}").split() if s == d]), 1)
+
+    def test_new_tab_agent_in_a_new_folder_adds_it_beside_home(self):
+        self.no_real_shells()
+        d = os.path.join(self.home_dir, "fresh2")
+        os.mkdir(d)
+        r = self.script("new-tab", "agent", d, self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait(lambda: self.on("#{session_name}"), "fresh2")
+        self.script("sync")
+        time.sleep(0.3)
+        wins = self.windows("fresh2")
+        self.assertEqual([(k, h, p) for _, k, h, p in wins], [("s", "1", d), ("a", "", d)])   # home + the agent
+        self.assertEqual(self.on("#{window_id}"), wins[1][0])
+        self.assertEqual(self.autostart(wins[1][0]), "claude")
+
+    def test_new_tab_agent_in_a_new_folder_while_a_restore_is_pending(self):
+        # A pending restore makes every sync non-structural (no home is made):
+        # the new space's shell must still be home before the agent lands, so
+        # the sync after the restore adds only its dashboard, never a 2nd home.
+        self.no_real_shells()
+        self.t("set", "-g", "@space_restore_pending", str(int(time.time())))
+        # setUp's syncs read the options before the flag and may still be
+        # queued on the registry lock (they would run structurally): let them
+        # drain, until the lock has been free for a while.
+        lock, free, deadline = self.registry + ".lock", 0, time.time() + 10
+        while free < 10 and time.time() < deadline:
+            free = 0 if os.path.exists(lock) else free + 1
+            time.sleep(0.05)
+        self.assertEqual(free, 10)
+        d = os.path.join(self.home_dir, "fresh3")
+        os.mkdir(d)
+        r = self.script("new-tab", "agent", d, self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait(lambda: self.on("#{session_name}"), "fresh3")
+        time.sleep(0.3)
+        shape = lambda: [(k, h) for _, k, h, _ in self.windows("fresh3")]
+        self.assertEqual(shape(), [("s", "1"), ("a", "")])
+        self.assertEqual(self.dash_panes("fresh3"), [])                     # nothing structural yet
+        self.t("set", "-g", "@space_restore_pending", "done")
+        self.assertEqual(self.script("sync").returncode, 0)
+        self.wait(lambda: len(self.dash_panes("fresh3")), 1)
+        time.sleep(0.3)
+        self.assertEqual(shape(), [("s", "1"), ("a", "")])
+
+    def test_open_dir_reuses_a_space_at_root(self):
+        # "/" stays "/" when trailing slashes are dropped (it once became "",
+        # so every "/" made space, space-2, ...). agents (hidden) is at / too.
+        for _ in range(2):
+            self.assertEqual(self.script("open-dir", "/", self.client).returncode, 0)
+            self.wait(lambda: self.on("#{session_path}|#{@space_hidden}"), "/|")
+        at_root = [r for r in self.t("list-sessions", "-F", "#{session_path}|#{@space_hidden}|#{session_name}").splitlines()
+                   if r.startswith("/|") and r.split("|")[1] != "1"]
+        self.assertEqual(len(at_root), 1, at_root)
+        r = self.script("new-tab", "shell", "/", self.client)               # the same space
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.on("#{session_name}"), at_root[0].split("|")[2])
+
+    def test_new_tab_reuses_the_space_on_that_folder(self):
+        self.no_real_shells()
+        sessions = self.t("list-sessions", "-F", "#{session_id}")
+        n = len(self.windows("proj"))
+        r = self.script("new-tab", "agent", self.proj, self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.t("list-sessions", "-F", "#{session_id}"), sessions)
+        wins = self.windows("proj")
+        self.assertEqual(len(wins), n + 1)
+        self.assertEqual(wins[-1][1], "a")
+        self.wait(lambda: self.on("#{session_name}:#{window_id}"), f"proj:{wins[-1][0]}")
+
+    def test_new_tab_refuses_a_hidden_session(self):
+        self.no_real_shells()
+        here = self.on()
+        for target in (self.sid("agents"), self.sid("scratch")):
+            before = self.t("list-windows", "-a", "-F", "#{window_id}")
+            for kind in ("shell", "agent"):
+                r = self.script("new-tab", kind, target, self.client)
+                self.assertNotEqual(r.returncode, 0, (kind, target))
+            self.assertEqual(self.t("list-windows", "-a", "-F", "#{window_id}"), before)
+        self.assertNotEqual(self.script("new-tab", "shell", "$999", self.client).returncode, 0)
+        self.assertNotEqual(self.script("new-tab", "bogus", self.sid("proj"), self.client).returncode, 0)
+        self.assertEqual(self.on(), here)
+
+    def popup_keys(self, key, *typed):
+        """Press prefix KEY, then type into the popup it opens (the client's
+        terminal is the popup's while it is up)."""
+        self.key("C-b", key)
+        time.sleep(1.0)                                                     # fzf up
+        for s in typed:
+            os.write(self.fd, s.encode())
+            time.sleep(0.4)
+
+    @unittest.skipUnless(shutil.which("fzf"), "fzf not installed")
+    def test_shift_tab_popup_picks_a_space_or_a_typed_folder(self):
+        self.no_real_shells()
+        self.t("set-environment", "-g", "_ZO_DATA_DIR", self.tmp)          # an empty zoxide
+        n = len(self.windows("zed"))
+        self.popup_keys("C-t", "zed", "\r")                                 # CMD+SHIFT+T, "zed"
+        self.wait(lambda: len(self.windows("zed")), n + 1, timeout=6)
+        wid, kind, _, path = self.windows("zed")[-1]
+        self.assertEqual((kind, path), ("s", "/usr"))
+        self.wait(lambda: self.on("#{session_name}:#{window_id}"), f"zed:{wid}")
+        d = os.path.join(self.home_dir, "typed")
+        os.mkdir(d)
+        self.popup_keys("K", d, "\r")                                       # CMD+SHIFT+R, a typed folder
+        self.wait(lambda: self.on("#{session_name}"), "typed", timeout=6)
+        self.wait(lambda: [k for _, k, _, _ in self.windows("typed")], ["s", "a"])
+        before = self.t("list-windows", "-a", "-F", "#{window_id}")
+        self.popup_keys("C-t", "proj", "\x1b")                              # esc: nothing
+        time.sleep(0.5)
+        self.assertEqual(self.t("list-windows", "-a", "-F", "#{window_id}"), before)
+        self.assertEqual(self.on("#{session_name}"), "typed")
+
+    def test_pick_tab_preview_lists_a_space_and_a_folder(self):
+        self.t("set", "-w", "-t", self.M4, "@agent_key", "d")
+        self.t("set", "-w", "-t", self.M4, "@agent_summary", "my.proj/Fix it")
+        r = self.script("preview-tab", "s:" + self.sid("main").lstrip("$"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        shells, agents = r.stdout.split("\nagents\n")
+        self.assertEqual(len(re.findall(r"(?m)^  \d  ", shells)), 2)        # home + M3
+        self.assertIn("  1  home", shells)
+        self.assertIn("  d  my.proj/Fix it  (needs-input)", agents)
+        self.assertEqual(len(agents.strip().splitlines()), 3)
+        Path(self.proj, "README").write_text("")
+        r = self.script("preview-tab", "d:" + self.proj)
+        self.assertEqual(r.stdout.strip(), "README")
 
     def test_agent_keys_do_nothing_in_hidden_sessions(self):
         self.t("switch-client", "-c", self.client, "-t", "agents")

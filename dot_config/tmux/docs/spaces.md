@@ -12,7 +12,7 @@ is a **shell**. One shell per space is its **home** (`@space_home 1`).
 |---|---|
 | `tmux.conf.tmpl` | `set -g @spaces on` (the one flag) and `@space_hidden_sessions` (the one hidden list), near the top; `source-file -F "#{d:current_file}/spaces.conf"` as the last line |
 | `spaces.conf` | everything else: hooks, status lines, keys. `%if @spaces on … %else … %endif` |
-| `scripts/space.sh` | the logic a format can't do: `sync`, `agent`/`shell N`, `next`/`prev`, `toggle`, `close`, `move-menu`/`move-to`, `respawn-home`, `new-space`, `open-dir` |
+| `scripts/space.sh` | the logic a format can't do: `sync`, `agent`/`shell N`, `next`/`prev`, `toggle`, `close`, `move-menu`/`move-to`, `respawn-home`, `new-space`, `open-dir`, `pick-tab`/`new-tab` |
 | `scripts/space-dash.sh` | the home dashboard (below); `--once` draws one frame |
 | `tests/test_spaces.py` | real `-L` servers, keys sent with `send-keys -K`, clicks as SGR reports |
 | `wezterm.lua.tmpl` | the digit rows: CTRL+N and CMD+N send prefix keys (below) |
@@ -40,8 +40,8 @@ their chords did before spaces: CTRL+N and CMD+N select window N, OPT+N
 `set -gu status-format` restores tmux's default array (the default format plus
 catppuccin's window formats), prefix 1-9 get back `select-window -t :=N` with
 their default notes, the root keys are unbound, and the rebound keys (c, C-t,
-k, C-k, x, C-l) are re-bound verbatim (the test pins them to tmux.conf's
-lines). prefix a / C-a (the session picker) are unbound when on; the off
+k, K, C-k, x, C-l) are re-bound verbatim (the test pins them to tmux.conf's
+lines; K's spans two). prefix a / C-a (the session picker) are unbound when on; the off
 branch leaves them alone because `prefix r` re-runs tmux.conf, which binds
 them, before spaces.conf. The test checks cold `off`, and `on → off`.
 
@@ -309,12 +309,13 @@ a key table, so the sidebar re-reads `#{client_key_table}` after the next key.
 | ⌥L / ⌥H | M-l / M-h | kind-aware: on an agent, next / previous agent; on a shell, next / previous shell; wrapping |
 | ⌥\` | M-\` | agent → last-visited shell of this space (a new shell at the space folder if there is none); shell → last-visited agent |
 | ⌥M | M-m | move this tab to another space: a menu of the spaces (number = key); the tab goes to the end of that space, you stay here. Not home, not from a hidden session |
-| ⌥N | M-n | new space: zoxide/fzf folder picker (as `prefix K`), then reuse the session already on that folder, else `new-session -d -s <basename> -c <dir>`; switch to it. `~` → main |
+| ⌥N | M-n | new space: zoxide/fzf folder picker (as `prefix K` with spaces off), then reuse the session already on that folder, else `new-session -d -s <basename> -c <dir>`; switch to it. `~` → main |
 | ⌥V | M-v | sidebar scope, this space ↔ all spaces (posts `com.mackhaymond.tmux.focus` so the Rust sidebar redraws at once) |
 | ⌥W *letter* | M-w, then key table `jump` | the agent whose window option `@agent_key` is that letter, in any space (`switch-client -t '$S:@W'`, one step); hidden sessions never. Escape, or any other key (`Any`), cancels and is swallowed. Entering and leaving post `com.mackhaymond.tmux.focus` so the sidebar can show "jump mode" (`#{client_key_table}` = `jump`). The sidebar assigns the letters; this only reads them. No fork: an `S:`/`W:` loop, `#{s/ .*//:}` keeps the first match, the letter rides in the global `@space_jump_key` |
 | — | prefix Q | close this space: `confirm-before` "close space bai: 2 agents, 1 shell? (y/n)", then `space.sh close`: it is marked `@space_closing` (no sync re-registers it or rebuilds its home meanwhile) and unregistered, clients on it move to main (detach-on-destroy would close them), every pane goes through `closed-tabs.sh close` (snapshot + agent session id, so CMD+Z can bring each back; `@space_closer` overrides, `none` skips), the session is killed and unregistered. Never main, never a hidden session |
 | CMD+W, CMD+SHIFT+W | prefix x, C-l | as tmux.conf, except on home (refuse) |
-| — | c, C-t, k, C-k | in a project space (path ≠ `~`, not hidden) the new tab starts in the space folder; elsewhere unchanged |
+| CMD+T, CMD+R, CMD+OPT+R | prefix c, k, C-k | in a project space (path ≠ `~`, not hidden) the new tab starts in the space folder; elsewhere unchanged |
+| CMD+SHIFT+T, CMD+SHIFT+R | prefix C-t, K | which space? A popup (`space.sh pick-tab shell\|agent`, opened as ⌥N's is): the spaces in ⌃N order (`⌃N  name  folder`, this one marked "(here)" but still a pick), then the zoxide folders (⌥N's candidate list) that are not a space's folder yet; typing filters both, and a typed path that matches no row is taken as a folder. A space gets a new shell / claude tab at its END (`new-window -a -t '$S:{end}' -c <its folder>`) and you are switched to it; the space is never renamed, closed or reordered. A folder goes through `open-dir` first (reuse, else create): a shell in a space made just now lands on its home (its only window, no second shell), otherwise it is as picking that space; claude always adds its tab. The claude tab is born an agent (`@agent_birth` in the same command list as its `new-window`). Esc / ^C: nothing. The preview shows a space's shells, then its agents with their ⌥W letter and summary; a folder's listing. Rows carry a hidden key column (`s:N` / `d:/path`, `--with-nth=2`), so a pick is never parsed from its label. `space.sh new-tab shell\|agent SID\|DIR [CLIENT]` is the same without the popup |
 
 WezTerm (wezterm.lua.tmpl, the last loop) sends each digit chord as ONE
 private escape sequence, which tmux reads as one key through its
@@ -377,8 +378,9 @@ status line follows it), and shows "prefix armed" / "jump mode" from
 different folder, or is one of `@space_hidden_sessions` (a folder called
 `stash` becomes `stash-2`, never a hidden session). The folder is made
 absolute (`cd && pwd`) before matching or creating, so a typed `../x` or `.`
-works. Without zoxide the picker offers this tab's folder, `~`, and the
-folders under `~/code/projects` and `~/code`.
+works. Without zoxide the pickers (⌥N, and the folder rows of CMD+SHIFT+T /
+CMD+SHIFT+R) offer this tab's folder, `~`, and the folders under
+`~/code/projects` and `~/code`.
 
 ## Rollout
 

@@ -273,7 +273,8 @@ Prefix is **⌃S**. ⌘ chords come from WezTerm.
 | prefix H / prefix h | park this tab / unpark (picker) |
 | prefix v | select a range of tabs (h/l extend, H or ⏎ park, m move, Esc) |
 | prefix Q | close this space (y/n; never main) |
-| ⌘T / ⌘R | new shell tab / new claude tab (prefix c / prefix k), in the space folder |
+| ⌘T / ⌘R | new shell tab / new claude tab (prefix c / prefix k) in THIS space, in its folder |
+| ⌘⇧T / ⌘⇧R | picker: which space gets a new shell / claude tab (at its end; prefix C-t / prefix K). Type a folder to open or reuse a space for it |
 | ⌘⌥R | replace this tab with a claude tab (prefix C-k; on home it adds one) |
 | ⌘W / ⌘Z | close tab (refused on home) / reopen the last closed tab, agent resumed |
 | prefix P | pause every working agent before closing the laptop; again to resume that set |
