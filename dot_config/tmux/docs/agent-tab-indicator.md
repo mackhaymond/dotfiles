@@ -322,6 +322,35 @@ detect presence). Reconciles:
   condenser after the agent died is still reaped). Collected only after
   `GC_TICKS` agent-less ticks in a row; `@agent_workflow`/`@agent_cua` are
   held until then too and dropped with the rest (see "Agent slots")
+- no agent yet, fresh `@agent_born` → left alone; agent present + `@agent_born`
+  → the mark is dropped (see "Born an agent" below)
+
+**Born an agent** (2026-10-15, Mack: "make sure new agent tabs aren't briefly
+new shells, they go right being agents"). A claude tab is a plain zsh that
+`.zshrc` turns into claude (`ZSH_AUTOSTART`), so for the 1–3 s before
+claude's `SessionStart` hook nothing marked it: it counted as a shell (the
+⌥N shell numbering, the sidebar's SHELLS, the tab name `zsh`), then flipped.
+Now every place that opens one (`prefix k` / `C-k` in tmux.conf and
+spaces.conf, `claude-dir-picker.sh`, `closed-tabs.sh` reopening a claude/codex
+tab) follows its `new-window` with `run-shell -C "#{@agent_birth} <kind>"` in
+the SAME command list. `@agent_birth` (agent-birth.conf) sets what
+`SessionStart` would set first — `@agent_state idle`, `@agent_since`,
+`@agent_kind`, the `<project>/New Session` summary (closed-tabs then puts the
+tab's old name back) — plus `@agent_born <epoch>`. tmux runs a command list as
+a unit and draws after it, so no client ever sees the window as a shell.
+It is an option run through `run-shell -C`, not a `command-alias`: tmux parses
+a whole config file before running any of it and expands aliases while
+parsing, so an alias would be unknown to tmux.conf's own `bind` lines on a cold
+start, and one unknown command fails the entire file.
+
+The mark exists for the GC above, which would otherwise collect the window as
+an agent that died (no claude process yet). `BIRTH_GRACE` (30 s): while the
+mark is that fresh and no agent pane is found, the window gets no GC streak at
+all. The first tick that finds the agent unsets the mark, and from then on it
+is an ordinary agent window (quitting claude clears it through `SessionEnd` as
+before; `clear_state` unsets the mark too). If claude never starts, the mark
+expires and the window is collected like any leftover — a shell again after
+`BIRTH_GRACE` + `GC_TICKS` seconds. Tests: `tests/test_agent_birth.py`.
 
 Hook-set states are never overridden while the agent lives, except by the
 agent's own record of its turn (the two reconciles below):

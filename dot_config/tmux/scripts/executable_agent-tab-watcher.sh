@@ -13,6 +13,10 @@
 #   agent present + no state           → idle    (seed presence)
 #   agent present + no @agent_kind     → its comm's kind (codex|claude)
 #   no agent     + any state OR summary → unset @agent_state/@agent_summary (GC)
+#   no agent     + fresh @agent_born    → left alone (BIRTH GRACE: a claude tab
+#                                         marked an agent at creation, before
+#                                         claude itself is running)
+#   agent        + @agent_born          → unset @agent_born (it arrived)
 # Hook-set states (running/needs-input/done) are never overridden while the
 # agent lives, except by the agent's own record of the turn: a `running` its
 # session/rollout says is over, and a codex `needs-input` or `running` whose
@@ -809,6 +813,27 @@ viewed_now() {
 GC_TICKS=5
 gc_streak=" "
 
+# BIRTH GRACE. A claude tab is marked an agent the instant it is created
+# (agent-birth.conf: @agent_state idle + @agent_born "<epoch>", in the
+# new-window's own command list), seconds before claude itself is running in
+# it - zsh has to start first. Without this the GC above would collect that
+# window as an agent that died, and the tab would flicker shell -> agent. So a
+# window holding a FRESH birth mark (an epoch less than BIRTH_GRACE seconds
+# from now) and no agent pane yet is left alone: no GC streak at all. The first
+# tick that sees its agent drops the mark (from then on it is an ordinary
+# agent window), and a mark past the grace - claude never started, or exited
+# before any tick saw it - is just another leftover: the GC streak starts and
+# collects it with everything else, mark included. So a birth that never
+# becomes an agent is a shell again after BIRTH_GRACE + GC_TICKS seconds.
+BIRTH_GRACE=30
+# birth_fresh EPOCH: digits only, within BIRTH_GRACE of tick_now either way (a
+# mark from the future - a clock step - is not trusted beyond the grace).
+birth_fresh() {
+    [[ $1 =~ ^[0-9]{1,18}$ ]] || return 1
+    local age=$((tick_now - 10#$1))
+    [ "$age" -lt "$BIRTH_GRACE" ] && [ "$age" -gt "-$BIRTH_GRACE" ]
+}
+
 # Process discovery (see PROCESS DISCOVERY in the loop): the pgrep pattern
 # (is_agent_comm's names, -x anchors it), the per-pid tty cache, and how
 # often that cache is thrown away wholesale.
@@ -831,6 +856,7 @@ declare -A W_SEEN=() W_PID=() W_STATE=() W_WAC=() W_SINCE=() W_WF=() W_CUA=() W_
 declare -A W_DK=() W_DTXT=() W_SESS=() W_IDX=() W_NAME=()   # event-log fields
 declare -A W_AK=()   # @agent_kind alone (W_DET is kind+detail kind, for the GC)
 declare -A W_PEND=() # @agent_pending (agent slots: idle + pending is active)
+declare -A W_BORN=() # @agent_born (BIRTH GRACE)
 wins=()
 
 # AGENT SLOTS (see the header). In the tick, the fold fills S_SLOT/S_VIS
@@ -1340,12 +1366,12 @@ EOF
     # names hold no US in practice; the summary stays last regardless.
     # @agent_slot and @agent_pending (AGENT SLOTS) ride before them all:
     # digits only, and ahead of the free text a stray US in a detail can
-    # never shift into them.
+    # never shift into them. So does @agent_born (BIRTH GRACE), digits too.
     #
     # A row only counts if it starts with a window id and carries a /dev/
     # tty, so a line that is not a pane row (a summary with an embedded
     # newline continues on its own line) can never be taken for a window.
-    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
+    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
@@ -1369,21 +1395,21 @@ EOF
     # exits, exactly like any other window.
     W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_SUM=(); W_DET=()
     W_DK=(); W_DTXT=(); W_SESS=(); W_IDX=(); W_NAME=(); W_AK=()
-    W_PEND=(); S_SLOT=(); S_VIS=(); S_ELIG=()
+    W_PEND=(); W_BORN=(); S_SLOT=(); S_VIS=(); S_ELIG=()
     wins=()
-    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind slot pend sess widx wname dtxt summary; do
+    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind slot pend born sess widx wname dtxt summary; do
         case "$win" in @*) ;; *) continue ;; esac
         case "$tty" in /dev/?*) ;; *) continue ;; esac
         if [ -z "${W_SEEN[$win]+x}" ]; then
             W_SEEN[$win]=1
             wins+=("$win")
-            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${akind}${dkind}${summary}" ]; then
+            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${akind}${dkind}${born}${summary}" ]; then
                 W_STATE[$win]="$state"; W_WAC[$win]="$wac"; W_SINCE[$win]="$since"
                 W_WF[$win]="$wf_opt"; W_CUA[$win]="$cua_opt"; W_ROLL[$win]="$roll"
                 W_SUM[$win]="$summary"; W_DET[$win]="${akind}${dkind}"; W_AK[$win]="$akind"
                 W_DK[$win]="$dkind"; W_DTXT[$win]="$dtxt"
                 W_SESS[$win]="$sess"; W_IDX[$win]="$widx"; W_NAME[$win]="$wname"
-                W_PEND[$win]="$pend"
+                W_PEND[$win]="$pend"; W_BORN[$win]="$born"
             fi
             # Not part of the fast-path test above: a window holding only a
             # slot (or only a pending stamp) has nothing for the loop to do,
@@ -1498,6 +1524,18 @@ EOF
                 fi ;;
         esac
         has_agent=0; [ -n "$pid" ] && has_agent=1
+        # BIRTH GRACE (see its note): a fresh mark with no agent yet holds the
+        # window off the GC; the agent arriving retires the mark.
+        born="${W_BORN[$win]:-}"
+        birth_hold=0
+        if [ -n "$born" ]; then
+            if [ "$has_agent" = 1 ]; then
+                tmux set-option -uw -t "$win" @agent_born 2>/dev/null
+                born=""
+            elif birth_fresh "$born"; then
+                birth_hold=1
+            fi
+        fi
         # A leftover sidebar kind/detail is collectable exactly like a summary.
         has_summary=0; [ -n "${W_SUM[$win]:-}${W_DET[$win]:-}" ] && has_summary=1
         had_wf=0; [ -n "${W_WF[$win]:-}" ] && had_wf=1
@@ -1673,10 +1711,12 @@ EOF
         if [ "$has_agent" = 1 ] && [ -z "$state" ]; then
             tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && { changed=1; state_moved=1; }
             state=idle
-        elif [ "$has_agent" = 0 ] && { [ -n "$state" ] || [ "$has_summary" = 1 ] \
-                                       || [ "$wf$cua" != 00 ]; }; then
+        elif [ "$has_agent" = 0 ] && [ "$birth_hold" = 0 ] \
+             && { [ -n "$state" ] || [ "$has_summary" = 1 ] \
+                  || [ "$wf$cua" != 00 ] || [ -n "$born" ]; }; then
             # The held @agent_workflow / @agent_cua (see NO AGENT PANE above)
-            # ride this streak too and go with the rest.
+            # ride this streak too and go with the rest, as does an expired
+            # birth mark (BIRTH GRACE).
             n=0
             for kv in $gc_streak; do
                 case "$kv" in "${win}="*) n="${kv#*=}"; break ;; esac
@@ -1697,7 +1737,8 @@ EOF
                 tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_kind \; \
                      set-option -uw -t "$win" @agent_detail_kind \; \
-                     set-option -uw -t "$win" @agent_detail 2>/dev/null
+                     set-option -uw -t "$win" @agent_detail \; \
+                     set-option -uw -t "$win" @agent_born 2>/dev/null
                 # A discharge, as clear_state's: the stamp outlives the unsets.
                 if [ -n "$state" ]; then
                     tmux set-option -w -t "$win" @agent_seen_at "$tick_now" 2>/dev/null

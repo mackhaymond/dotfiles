@@ -37,6 +37,11 @@
 #                   command list, unset by SessionStart and clear_state, never
 #                   touched by the heartbeat. Not rendered in the tab bar —
 #                   they feed the sidebar (`list-windows -F '#{@agent_detail}'`).
+#   @agent_born     epoch: set (with idle, kind, since and a "New Session"
+#                   summary) by agent-birth.conf in the new-window that opens
+#                   a claude tab, so the tab is an agent before claude runs.
+#                   The watcher honours it as a grace and drops it once the
+#                   agent shows up; clear_state unsets it.
 #   @agent_slot     the window's sticky agent number (agent-ui's number keys).
 #                   Stamped by set_state, under the slot lock and in the
 #                   state's own tmux call, when a window ENTERS the Active
@@ -608,10 +613,13 @@ clear_state() {
     tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_since 2>/dev/null || true
-    # The sidebar's per-window fields (see set_state), one call for all three.
+    # The sidebar's per-window fields (see set_state), one call for all three,
+    # plus the birth mark (agent-birth.conf): an agent that came and went
+    # before the watcher ever saw it must not leave the window held.
     tmux set-option -uw -t "$win" @agent_kind \; \
          set-option -uw -t "$win" @agent_detail_kind \; \
-         set-option -uw -t "$win" @agent_detail 2>/dev/null || true
+         set-option -uw -t "$win" @agent_detail \; \
+         set-option -uw -t "$win" @agent_born 2>/dev/null || true
     if [ -n "$cur" ]; then
         # A discharge too (see seen_op in set_state): @agent_seen_at is the
         # one mark that survives the unsets, and is never unset itself.

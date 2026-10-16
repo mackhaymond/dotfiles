@@ -101,7 +101,11 @@ main() {
   # Mirrors `bind K`'s old body. claude is NOT the window command (quitting it
   # would close the tab); ZSH_AUTOSTART tells .zshrc to launch it as a child of
   # the login shell, and -e scopes the variable to this window's first process.
+  # @agent_birth (agent-birth.conf) marks it an agent in the same command
+  # list, so it is never briefly a shell; guarded, so a server without the
+  # option still opens the tab.
   tmux new-window -a -t "${session}:{end}" -c "$target" -e ZSH_AUTOSTART=claude \
+    \; run-shell -C '#{?@agent_birth,#{@agent_birth} claude,}' \
     || die "could not open a tab in $target"
 }
 

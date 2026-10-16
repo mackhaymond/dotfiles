@@ -485,9 +485,10 @@ EOF
 # Recreate one recorded tab. Prints the new window id.
 reopen_one() {
     local rec="$1" client_sess="$2"
-    local sess tsess tcreated idx cwd cmd
+    local sess tsess tcreated idx cwd cmd tool label
     sess=$(jq -r '.session' <<<"$rec"); idx=$(jq -r '.index' <<<"$rec")
     cwd=$(jq -r '.cwd' <<<"$rec");      cmd=$(jq -r '.cmd // empty' <<<"$rec")
+    tool=$(jq -r '.tool // empty' <<<"$rec"); label=$(jq -r '.label // empty' <<<"$rec")
     tsess=$(jq -r '.tmux_session // empty' <<<"$rec")
     tcreated=$(jq -r '.session_created // empty' <<<"$rec")
 
@@ -515,9 +516,26 @@ reopen_one() {
     else
         where=(-t "=$sess:")
     fi
-    local -a autostart=()
+    local -a autostart=() birth=()
     [ -n "$cmd" ] && autostart=(-e "ZSH_AUTOSTART=$cmd")
-    tmux new-window -P -F '#{window_id}' "${where[@]}" -c "$cwd" "${autostart[@]}" 2>/dev/null
+    # A claude/codex tab comes back AS an agent, in the new-window's own
+    # command list (agent-birth.conf; guarded, so a server without
+    # @agent_birth still reopens it), wearing the name it had when it closed
+    # until the resumed session's hooks retitle it. The name is a set-option
+    # argument: one ending in ';' would end the command list, and one starting
+    # with '-' would read as a flag, so those are trimmed / skipped.
+    case "$tool" in
+    claude|codex)
+        if [ -n "$cmd" ]; then
+            birth=(\; run-shell -C "#{?@agent_birth,#{@agent_birth} $tool,}")
+            label="${label%"${label##*[!; ]}"}"
+            case "$label" in
+            ''|-*) ;;
+            *) birth+=(\; set-option -w @agent_summary "$label") ;;
+            esac
+        fi ;;
+    esac
+    tmux new-window -P -F '#{window_id}' "${where[@]}" -c "$cwd" "${autostart[@]}" "${birth[@]}" 2>/dev/null
 }
 
 # Reopen the given entries (default: the newest). Several at once go back

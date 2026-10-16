@@ -79,7 +79,12 @@ bind R new-window -a -c "#{pane_current_path}" \; kill-window -t -
 # it drops back to a zsh prompt in the same tab. `-e` scopes the variable to
 # this window's first process only; .zshrc unsets it before running the command,
 # so it never leaks into claude or into `exec zsh`.
-bind k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude
+#
+# `run-shell -C "#{@agent_birth} claude"` (agent-birth.conf) marks the new
+# window as an idle agent in the same command list, so it is never briefly a
+# shell while zsh and claude start up.
+source-file -F "#{d:current_file}/agent-birth.conf"
+bind k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude \; run-shell -C "#{?@agent_birth,#{@agent_birth} claude,}"
 
 # K is the one that asks where first: a popup fuzzy-picker over zoxide's
 # frecency list (plus this tab's cwd and $HOME, the key's old destination).
@@ -94,7 +99,7 @@ bind k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude
 bind K display-popup -E -w 80% -h 70% -d "#{pane_current_path}" \
   "$HOME/.config/tmux/scripts/claude-dir-picker.sh"
 
-bind C-k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude \; kill-window -t -
+bind C-k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude \; run-shell -C "#{?@agent_birth,#{@agent_birth} claude,}" \; kill-window -t -
 
 # CTRL+CMD+T (wezterm) → new tab running nushell, same cwd. The data tab:
 # JSON/yabai introspection, config surgery, API poking. $SHELL is untouched
