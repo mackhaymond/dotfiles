@@ -3056,8 +3056,11 @@ json_int_or_null() {
 # "is THIS account burning faster than its window allows" stopped being the
 # question: running one account dry early just hands the work to the next.
 # What matters is whether the quota of ALL the connected accounts lasts. So
-# the pace of each Claude window (session, weekly, scoped) — and the percent
-# the bar draws — is computed over the pool. The block's <family>_used stays
+# the pace of each weekly Claude window (weekly, scoped) — and the percent
+# the bar draws — is computed over the pool. The 5-hour session is NOT: it
+# is short enough that a stretch of work rarely spans two accounts' sessions,
+# so it stays the active account's own (scope "account"). pool() below still
+# knows a session's rules (idle roll); only the family map at its end skips it. The block's <family>_used stays
 # the active account's own reading (the history, the live merge and the reset
 # view key on it); the pooled level is <family>_pace.used and the text.
 #
@@ -3235,9 +3238,11 @@ POOL_PACE_JQ='
             end
         end;
     # Per family: the published object, the signed delta, the pooled level.
+    # The 5-hour session is never pooled (see "WHY A POOL"): it stays the
+    # active account alone, so its slot is always empty here.
     [ ($active.slot // "") ]
     + ([ "session", "weekly", "scoped" ]
-       | map(pool(.) as $p
+       | map((if . == "session" then null else pool(.) end) as $p
              | if $p == null then ["", "", ""]
                else [($p | tojson), ($p.delta | signed), ($p.used | tostring)] end)
        | add)

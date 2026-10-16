@@ -263,20 +263,13 @@ class WorkedExampleTests(PoolPaceTestCase):
         self.assertEqual(self.home.published('@codex_weekly_text'), '59% (+16%)')
         self.assertEqual(self.home.published('@codex_weekly_color'), 'red')
 
-        # Session: account 1 is idle (0%, no reset) and counts as a fresh window.
-        session = block['session_pace']
-        self.assertEqual(session['scope'], 'pool')
-        self.assertEqual(session['window_minutes'], 300)
-        self.assertEqual(session['members'][0],
-                         {'slot': '1', 'email': A1_EMAIL, 'used': 0,
-                          'resets_at': NOW + SESSION_W, 'active': False, 'as_of': NOW - 600})
-        self.assertEqual(session['horizons'],
-                         [{'at': A2_SESSION_RESETS, 'avail': 188},
-                          {'at': NOW + SESSION_W, 'avail': 288}])
-        self.assertEqual(session['delta'], -14)
-        self.assertEqual(session['used'], 6)
+        # Session: never pooled — the active account's own 12%, paced alone.
+        session_delta = old_pace_delta(12, SESSION_W, A2_SESSION_RESETS)
+        self.assertEqual(session_delta, -8)
+        self.assertAccountScope(block['session_pace'], 12, A2_SESSION_RESETS, session_delta)
+        self.assertEqual(block['session_pace']['members'][0]['slot'], '2')
         self.assertEqual(block['session_used'], 12)
-        self.assertEqual(block['session_text'], '6% (-14%)')
+        self.assertEqual(block['session_text'], '12% (-8%)')
         self.assertEqual(block['session_pace_color'], 'green')
 
         scoped = block['scoped_pace']
@@ -289,9 +282,9 @@ class WorkedExampleTests(PoolPaceTestCase):
 
         # The plain-number options, all fifteen in one tmux invocation.
         self.assertEqual(self.home.pace_opts(), {
-            '@codex_session_used': '6', '@codex_session_expected': '20',
-            '@codex_session_delta': '-14', '@codex_session_resets': str(A2_SESSION_RESETS),
-            '@codex_session_members': '1:0:0,2:12:1',
+            '@codex_session_used': '12', '@codex_session_expected': '20',
+            '@codex_session_delta': '-8', '@codex_session_resets': str(A2_SESSION_RESETS),
+            '@codex_session_members': '',
             '@codex_weekly_used': '59', '@codex_weekly_expected': '43',
             '@codex_weekly_delta': '+16', '@codex_weekly_resets': str(A2_WEEKLY_RESETS),
             '@codex_weekly_members': '1:90:0,2:27:1',
@@ -383,29 +376,11 @@ class MemberTests(PoolPaceTestCase):
         self.assertEqual(weekly['members'][0]['resets_at'], passed + WEEK_W)
         self.assertEqual(weekly['delta'],
                          reference_delta([(0, passed + WEEK_W), (27, A2_WEEKLY_RESETS)], WEEK_W))
-        # A passed SESSION reset is not rolled forward: 5-hour windows are not
-        # on a fixed cycle, so the account is idle (a fresh window from now).
-        session = block['session_pace']
-        m1 = session['members'][0]
-        self.assertEqual((m1['used'], m1['resets_at']), (0, NOW + SESSION_W))
-        self.assertEqual(session['horizons'],
-                         [{'at': A2_SESSION_RESETS, 'avail': 188},
-                          {'at': NOW + SESSION_W, 'avail': 288}])
-        self.assertEqual(session['delta'], -14)
-        self.assertEqual(session['delta'],
-                         reference_delta([(0, NOW + SESSION_W), (12, A2_SESSION_RESETS)], SESSION_W))
-        self.assertEqual(block['session_text'], '6% (-14%)')
-
-        # The same for the ACTIVE account's own passed session reset — and
-        # with both accounts' windows over, the pool has none open: "idle".
-        self.home.endpoint(session=50, session_resets=NOW - HOUR)
-        block = self.home.refresh()
-        session = block['session_pace']
-        self.assertEqual(session['members'][1],
-                         {'slot': '2', 'email': A2_EMAIL, 'used': 0,
-                          'resets_at': NOW + SESSION_W, 'active': True, 'as_of': NOW})
-        self.assertEqual(session['delta'], 0)
-        self.assertEqual(block['session_text'], 'idle')
+        # The other account's session (passed or not) never reaches the
+        # session: that window is the active account's alone.
+        self.assertAccountScope(block['session_pace'], 12, A2_SESSION_RESETS,
+                                old_pace_delta(12, SESSION_W, A2_SESSION_RESETS))
+        self.assertEqual(block['session_text'], '12% (-8%)')
 
     def test_tied_reset_times_make_one_horizon(self):
         slot1 = {'fetchedAt': NOW - 60,
@@ -493,25 +468,19 @@ class MemberTests(PoolPaceTestCase):
         self.home.cswap()
         self.home.endpoint(session=0, session_resets=None)
         block = self.home.refresh()
-        # The text still says idle, in gray; the pool still has a pace object,
-        # with the idle account counted as a fresh, full window.
+        # The text says idle, in gray; the session is the account's own.
         self.assertEqual(block['session_text'], 'idle')
         self.assertEqual(block['session_color'], 'brightblack')
-        session = block['session_pace']
-        self.assertEqual(session['scope'], 'pool')
-        self.assertEqual([(m['used'], m['resets_at']) for m in session['members']],
-                         [(0, NOW + SESSION_W), (0, NOW + SESSION_W)])
-        self.assertEqual(session['horizons'], [{'at': NOW + SESSION_W, 'avail': 200}])
-        self.assertEqual(session['delta'], 0)
+        self.assertEqual(block['session_pace']['scope'], 'account')
         # An idle window publishes no numbers; the others still do.
         opts = self.home.pace_opts()
         self.assertEqual([opts[f'@codex_session_{f}'] for f in
                           ('used', 'expected', 'delta', 'resets', 'members')], [''] * 5)
         self.assertEqual(opts['@codex_weekly_used'], '59')
 
-    def test_idle_active_next_to_a_busy_account_shows_the_pool(self):
+    def test_session_is_never_pooled(self):
         # The active account is idle, account 1 is 20% into an open window:
-        # the pool has a window open, so it is a number, not "idle".
+        # the session is still the active account's own, so it is "idle".
         slot1 = {'fetchedAt': NOW - 60,
                  'lastGood': {'five_hour': {'pct': 20.0, 'resets_at': iso_cswap(NOW + 2 * HOUR)},
                               'seven_day': {'pct': 90.0, 'resets_at': iso_cswap(A1_WEEKLY_RESETS)},
@@ -519,55 +488,22 @@ class MemberTests(PoolPaceTestCase):
         self.home.cswap(slot1=slot1)
         self.home.endpoint(session=0, session_resets=None)
         block = self.home.refresh()
-        session = block['session_pace']
-        self.assertEqual(session['used'], 10)
-        self.assertEqual(block['session_used'], 0)              # the active account's own
-        delta = reference_delta([(20, NOW + 2 * HOUR), (0, NOW + SESSION_W)], SESSION_W)
-        self.assertEqual(session['delta'], delta)
-        self.assertEqual(block['session_text'], f'10% ({delta:+d}%)')
-        self.assertNotEqual(block['session_color'], 'brightblack')
-        opts = self.home.pace_opts()
-        self.assertEqual((opts['@codex_session_used'], opts['@codex_session_resets'],
-                          opts['@codex_session_members']),
-                         ('10', '', '1:20:0,2:0:1'))     # the active account has no reset
-
-    def test_idle_rule_matches_the_apps(self):
-        """'idle' iff the ACTIVE session is idle AND the pooled level is 0
-        (the apps: activeIdle && pool.used <= 0)."""
-        def session(other_pct, other_resets, active_used, active_resets):
-            slot1 = {'fetchedAt': NOW - 60,
-                     'lastGood': {'five_hour': {'pct': other_pct,
-                                                'resets_at': other_resets and iso_cswap(other_resets)},
-                                  'seven_day': {'pct': 90.0, 'resets_at': iso_cswap(A1_WEEKLY_RESETS)},
-                                  'scoped': []}}
-            self.home.cswap(slot1=slot1)
-            self.home.endpoint(session=active_used, session_resets=active_resets)
-            block = self.home.refresh()
-            self.assertEqual(block['session_pace']['scope'], 'pool')
-            return block
-
-        # Active idle, the other account's window just opened at 0%: the pool
-        # is at 0, so "idle" — with no numbers published for it.
-        block = session(0.0, NOW + 4 * HOUR, 0, None)
-        self.assertEqual(block['session_pace']['used'], 0)
+        self.assertEqual(block['session_pace']['scope'], 'account')
         self.assertEqual(block['session_text'], 'idle')
         self.assertEqual(block['session_color'], 'brightblack')
+        self.assertEqual(block['weekly_pace']['scope'], 'pool')
         opts = self.home.pace_opts()
         self.assertEqual({opts[f'@codex_session_{f}'] for f in
                           ('used', 'expected', 'delta', 'resets', 'members')}, {''})
-        # Active idle by a PASSED reset, the other at 0%: idle too.
-        block = session(0.0, NOW + 4 * HOUR, 30, NOW - HOUR)
-        self.assertEqual(block['session_text'], 'idle')
-        # The ACTIVE account's window is open (at 0%), the other is idle: the
-        # pool is at 0 but the active account is not idle, so it is a number.
-        block = session(0.0, None, 0, NOW + 4 * HOUR)
-        delta = reference_delta([(0, NOW + SESSION_W), (0, NOW + 4 * HOUR)], SESSION_W)
-        self.assertEqual(block['session_text'], f'0% ({delta:+d}%)')
-        self.assertEqual(self.home.pace_opts()['@codex_session_used'], '0')
-        # Active idle, the other at 1%: rounds to 1, not 0 — a number.
-        block = session(1.0, NOW + 4 * HOUR, 0, None)
-        self.assertEqual(block['session_pace']['used'], 1)       # 0.5 rounds away to 1
-        self.assertTrue(block['session_text'].startswith('1% ('))
+        # The active account busy: its own number and pace, never the mean.
+        self.home.endpoint(session=30, session_resets=NOW + 4 * HOUR)
+        block = self.home.refresh()
+        delta = old_pace_delta(30, SESSION_W, NOW + 4 * HOUR)
+        self.assertAccountScope(block['session_pace'], 30, NOW + 4 * HOUR, delta)
+        self.assertEqual(block['session_text'], f'30% ({delta:+d}%)')
+        opts = self.home.pace_opts()
+        self.assertEqual((opts['@codex_session_used'], opts['@codex_session_delta'],
+                          opts['@codex_session_members']), ('30', f'{delta:+d}', ''))
 
     def test_matched_by_account_not_by_slot_number(self):
         # cswap's usage cache keyed the other way round: still matched by account.
@@ -618,7 +554,7 @@ class RenderPathTests(PoolPaceTestCase):
         delta = reference_delta([(90, A1_WEEKLY_RESETS), (30, A2_WEEKLY_RESETS)], WEEK_W, now)
         self.assertEqual(weekly['delta'], delta)
         self.assertEqual(block['weekly_text'], f'60% ({delta:+d}%)')      # mean of 90, 30
-        self.assertEqual(block['session_pace']['scope'], 'pool')
+        self.assertEqual(block['session_pace']['scope'], 'account')
         # The tick publishes before it adopts; the adopted text reaches tmux
         # through commit_claude_rerender's own publish, and so do the numbers.
         self.assertEqual(self.home.published('@codex_weekly_text'), f'60% ({delta:+d}%)')
