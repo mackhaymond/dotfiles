@@ -13,9 +13,9 @@
 //!   tmux session first, then the newest `updatedAt`). The transcript is
 //!   `~/.claude/projects/<cwd, every non-alphanumeric as ->/<sid>.jsonl`,
 //!   else found once by a scan of `~/.claude/projects/*/<sid>.jsonl`; the
-//!   path is cached per session id. Codex agents get no blurb (their rollout
-//!   path is `@agent_rollout`, not in the snapshot yet): they keep the run
-//!   detail.
+//!   path is cached per session id. A Codex agent's is its rollout, whose
+//!   path the window carries (`@agent_rollout`, which agent-tab-indicator.sh
+//!   sets; a snapshot field, `Agent::rollout`).
 //! - **How much.** Only for working agents; only when the transcript's (len,
 //!   mtime) changed since the last read (the blurb is cached per file); at
 //!   most its last [`TAIL`] bytes, parsed line by line from the end, the
@@ -29,6 +29,18 @@
 //!   `Running cargo test`, `Editing layout.rs`, a Bash or Agent
 //!   `description`); else `Thinking…`. One line, capitalized, no trailing
 //!   period; the layout clips it to the tile.
+//! - **Codex** ([`codex_blurb`]): the same walk back to the turn's
+//!   `task_started`: the in-progress `update_plan` step, else the latest
+//!   call ([`codex_call`]: a `function_call`'s JSON arguments; a
+//!   `custom_tool_call` — `apply_patch`'s patch, or `exec`'s code-mode
+//!   JavaScript, whose last `tools.<name>(…)` call that says something is
+//!   read, each from its own argument span; a `local_shell_call`; a
+//!   `web_search_call`): a shell → `Running <head>` (an argv's `-lc` script
+//!   unwrapped), a patch → `Editing <first file>`, MCP (a name, or a
+//!   `mcp__<server>__` namespace) → `<server>: <tool>`, the web, images,
+//!   other agents; reasoning only → `Thinking…`; a turn already over
+//!   (`task_complete`, `turn_aborted`) → nothing (the run detail). The same
+//!   scrubbing of secrets and hashed names.
 
 use super::term;
 use crate::json::{self, Value};
@@ -110,7 +122,14 @@ impl Activity {
         }
         self.scan_sessions();
         for a in view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()).chain(view.needs.iter_mut().map(|n| &mut n.agent)) {
-            a.blurb = if working(a) && a.kind != "codex" { self.blurb_for(&a.session, &a.window_id) } else { None };
+            a.blurb = if !working(a) {
+                None
+            } else if a.kind == "codex" {
+                // Its rollout path rides on the window (`@agent_rollout`).
+                (!a.rollout.is_empty()).then(|| self.read(Path::new(&a.rollout), codex_blurb)).flatten()
+            } else {
+                self.blurb_for(&a.session, &a.window_id)
+            };
         }
     }
 
@@ -186,6 +205,12 @@ impl Activity {
     /// The blurb from one transcript: read only when its (len, mtime)
     /// changed since the last read.
     pub fn blurb_of(&mut self, path: &Path) -> Option<String> {
+        self.read(path, blurb)
+    }
+
+    /// A transcript's blurb by `parse` (Claude's [`blurb`] or Codex's
+    /// [`codex_blurb`]): read only when its (len, mtime) changed.
+    pub fn read(&mut self, path: &Path, parse: fn(&str, bool) -> Option<String>) -> Option<String> {
         let st = stamp(path)?;
         if let Some((s, b)) = self.blurbs.get(path) {
             if *s == st {
@@ -193,7 +218,7 @@ impl Activity {
             }
         }
         self.reads += 1;
-        let b = read_tail(path, TAIL).and_then(|(t, whole)| blurb(&t, whole));
+        let b = read_tail(path, TAIL).and_then(|(t, whole)| parse(&t, whole));
         self.blurbs.insert(path.to_path_buf(), (st, b.clone()));
         b
     }
@@ -351,8 +376,10 @@ fn secret(w: &str) -> bool {
     if ["sk-", "token", "key=", "password", "secret"].iter().any(|p| l.contains(p)) {
         return true;
     }
-    let long = w.len() >= 20 && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    let kinds = [w.chars().any(|c| c.is_ascii_uppercase()), w.chars().any(|c| c.is_ascii_lowercase()), w.chars().any(|c| c.is_ascii_digit())];
+    // (A dot suffix does not hide one: `AbCd…XYZ.sh`'s stem is checked.)
+    let stem = w.split('.').next().unwrap_or(w);
+    let long = stem.len() >= 20 && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    let kinds = [stem.chars().any(|c| c.is_ascii_uppercase()), stem.chars().any(|c| c.is_ascii_lowercase()), stem.chars().any(|c| c.is_ascii_digit())];
     long && kinds.iter().filter(|k| **k).count() >= 2
 }
 
@@ -362,9 +389,18 @@ fn secret(w: &str) -> bool {
 /// that may be a secret ([`secret`]: the head stops before it). A shell
 /// loop is `a loop`, an `if` / `case` `a script`.
 pub fn command_head(cmd: &str) -> String {
+    // `zsh -fc '…'`, `bash -lc "…"`: the script's own head.
+    if let Some(script) = shell_script(cmd) {
+        return command_head(&script);
+    }
     const SKIP: [&str; 12] = ["cd", "export", "unset", "set", "source", ".", "pushd", "popd", "true", ":", "local", "sleep"];
     const PREFIX: [&str; 6] = ["env", "sudo", "time", "exec", "nohup", "command"];
     for part in cmd.split(['\n', ';', '|', '&']) {
+        // (`cd x && zsh -c '…'`: the script from here on, quotes and all.)
+        let at = part.as_ptr() as usize - cmd.as_ptr() as usize;
+        if let Some(script) = shell_script(&cmd[at..]) {
+            return command_head(&script);
+        }
         let mut words = part.split_whitespace().map(|w| w.trim_start_matches(['(', '{'])).filter(|w| !w.is_empty()).peekable();
         while let Some(w) = words.peek() {
             let assign = w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
@@ -387,6 +423,36 @@ pub fn command_head(cmd: &str) -> String {
         if secret(name) {
             return "a command".into();
         }
+        // An interpreter running a script file: the script (`zsh -f
+        // /x/clean.zsh` → `clean.zsh`). Inline code or a module (`-c`, `-e`,
+        // `-m`, `--eval`) is the interpreter alone; a flag's own value
+        // (`-r x.js`) is never the script; a name that is not plain, or
+        // whose stem may be a secret, is the interpreter alone too.
+        const INTERP: [&str; 12] = ["sh", "bash", "zsh", "fish", "dash", "python", "python3", "node", "ruby", "perl", "bun", "deno"];
+        if INTERP.contains(&name) {
+            let mut look = words.clone();
+            while let Some(w) = look.next() {
+                let short = w.starts_with('-') && !w.starts_with("--");
+                if matches!(w, "--eval" | "--print" | "--command") || (short && w.len() >= 2 && w.ends_with(['c', 'e', 'm', 'p'])) {
+                    return name.to_string();
+                }
+                if matches!(w, "-r" | "--require" | "--import" | "--loader" | "-W" | "-X") {
+                    look.next();
+                    continue;
+                }
+                if w.starts_with('-') {
+                    continue;
+                }
+                let base = w.trim_matches(['\'', '"']).trim_end_matches('/');
+                let base = base.rsplit('/').next().unwrap_or(base);
+                let stem = base.split('.').next().unwrap_or(base);
+                let plain = !base.is_empty() && base.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+                if (w.contains('/') || w.contains('.')) && plain && !secret(base) && !secret(stem) {
+                    return base.to_string();
+                }
+                break;
+            }
+        }
         let mut head = vec![name.to_string()];
         for w in words.take(2) {
             let plain = !w.starts_with('-') && w.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:".contains(c));
@@ -402,6 +468,48 @@ pub fn command_head(cmd: &str) -> String {
         Some(_) => "a command".into(),
         None => String::new(),
     }
+}
+
+/// The script of a shell run as `sh|bash|zsh|fish|dash -…c SCRIPT` (one
+/// level of quotes taken off), when `cmd` is one.
+fn shell_script(cmd: &str) -> Option<String> {
+    let cmd = cmd.trim_start();
+    let first = cmd.split_whitespace().next()?;
+    if !matches!(first.rsplit('/').next(), Some("sh" | "bash" | "zsh" | "fish" | "dash")) {
+        return None;
+    }
+    let rest = cmd[first.len()..].trim_start();
+    let flag = rest.split_whitespace().next()?;
+    if !(flag.starts_with('-') && flag.ends_with('c') && flag[1..].chars().all(|c| c.is_ascii_alphabetic())) {
+        return None;
+    }
+    let script = rest[flag.len()..].trim_start();
+    let script = match script.chars().next() {
+        // Up to the matching quote (a double-quoted one's escapes read),
+        // never what follows it (`| tail`, `&& echo ok`).
+        Some(q @ ('\'' | '"')) => {
+            let mut out = String::new();
+            let mut esc = false;
+            for c in script[1..].chars() {
+                if esc {
+                    if !matches!(c, '"' | '\\' | '$' | '`') {
+                        out.push('\\');
+                    }
+                    out.push(c);
+                    esc = false;
+                } else if c == '\\' && q == '"' {
+                    esc = true;
+                } else if c == q {
+                    break;
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+        _ => script.to_string(),
+    };
+    (!script.trim().is_empty()).then_some(script)
 }
 
 /// A tool name as words: CamelCase split (`ScheduleWakeup` → `Schedule
@@ -538,6 +646,308 @@ pub fn tidy(s: &str) -> String {
         Some(c) => c.to_uppercase().chain(cs).collect(),
         None => String::new(),
     }
+}
+
+// ---------------------------------------------------------------- codex
+
+/// The blurb from a Codex rollout's tail (JSONL, `@agent_rollout`):
+/// walking back from the end to the current turn's `task_started`, the
+/// in-progress plan step (`update_plan`), else the latest tool call phrased
+/// ([`codex_call`]), else [`THINKING`] when the turn's start is in the tail
+/// (reasoning and messages only). None when the tail holds nothing to go
+/// by, or when its newest turn event says the turn is over
+/// (`task_complete`, `turn_aborted`): the row keeps the run detail.
+pub fn codex_blurb(tail: &str, whole: bool) -> Option<String> {
+    const CALLS: [&str; 5] = ["function_call", "custom_tool_call", "local_shell_call", "web_search_call", "tool_search_call"];
+    let event = |line: &str, t: &str| line.contains("\"type\":\"event_msg\"") && line.contains(&format!("\"payload\":{{\"type\":\"{t}\""));
+    let mut tool: Option<String> = None;
+    let mut plan: Option<Option<String>> = None;
+    let mut start = false;
+    for line in tail.lines().rev() {
+        if event(line, "task_started") {
+            start = true;
+            break;
+        }
+        if event(line, "task_complete") || event(line, "turn_aborted") {
+            return None;
+        }
+        // Cheap tests first: a call's own record, never its (big) output.
+        if !line.contains("\"type\":\"response_item\"") || !CALLS.iter().any(|c| line.contains(&format!("\"payload\":{{\"type\":\"{c}\""))) {
+            continue;
+        }
+        let Ok(v) = json::parse(line) else { continue };
+        let Some(p) = v.get("payload") else { continue };
+        match codex_call(p) {
+            Codex::Plan(step) => {
+                plan.get_or_insert(step);
+            }
+            Codex::Said(s) => {
+                if tool.is_none() {
+                    tool = Some(s);
+                }
+            }
+            Codex::Nothing => {}
+        }
+        if plan.as_ref().is_some_and(Option::is_some) {
+            break;
+        }
+    }
+    let said = plan.flatten().or(tool).or_else(|| (start || whole).then(|| THINKING.to_string()));
+    said.map(|s| tidy(&s)).filter(|s| !s.is_empty())
+}
+
+/// What one Codex call says.
+#[derive(Debug, PartialEq)]
+enum Codex {
+    /// A plan (`update_plan`): its in-progress step, if any.
+    Plan(Option<String>),
+    Said(String),
+    Nothing,
+}
+
+/// One rollout call record's payload → what it says. The shapes: a
+/// `function_call` (`name`, maybe a `namespace` — `mcp__<server>__` makes
+/// it an MCP call — JSON `arguments`), a `custom_tool_call` (`name`,
+/// free-text `input`: `apply_patch`'s patch, or `exec`'s code-mode
+/// JavaScript calling `tools.<name>(…)`), a `local_shell_call`
+/// (`action.command` argv), a `web_search_call` (`action.query`, or the
+/// first of `action.queries`).
+fn codex_call(p: &Value) -> Codex {
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let name = s(p, "name").unwrap_or_default();
+    match p.get("type").and_then(Value::as_str) {
+        Some("function_call") => {
+            let args = s(p, "arguments").and_then(|a| json::parse(&a).ok()).unwrap_or(Value::Null);
+            let ns = s(p, "namespace").unwrap_or_default();
+            let full = match ns.strip_prefix("mcp__") {
+                Some(server) if !name.is_empty() => format!("mcp__{}__{name}", server.trim_end_matches('_')),
+                _ => name,
+            };
+            codex_function(&full, &args)
+        }
+        Some("custom_tool_call") => {
+            let input = s(p, "input").unwrap_or_default();
+            match name.as_str() {
+                "exec" => js_calls(&input),
+                "apply_patch" => Codex::Said(patch_phrase(&input)),
+                _ => Codex::Said(words_of(&name)),
+            }
+        }
+        Some("local_shell_call") => {
+            let cmd = p.get("action").and_then(|a| a.get("command")).map(argv_script).unwrap_or_default();
+            if cmd.trim().is_empty() {
+                return Codex::Nothing;
+            }
+            Codex::Said(format!("Running {}", command_head(&cmd)))
+        }
+        Some("web_search_call") => {
+            let action = p.get("action");
+            let q = action
+                .and_then(|a| a.get("query"))
+                .and_then(Value::as_str)
+                .or_else(|| action.and_then(|a| a.get("queries")).and_then(Value::as_array).and_then(|qs| qs.iter().find_map(Value::as_str)))
+                .map(str::trim)
+                .filter(|q| !q.is_empty());
+            Codex::Said(q.map_or_else(|| "Searching the web".to_string(), |q| format!("Searching the web for {q}")))
+        }
+        Some("tool_search_call") => Codex::Said("Loading tools".into()),
+        _ => Codex::Nothing,
+    }
+}
+
+/// A command as Codex passes it: an argv (`["bash", "-lc", "cargo test"]`:
+/// the `-c` / `-lc` script unwrapped; else the words joined) or a string.
+fn argv_script(v: &Value) -> String {
+    match v {
+        Value::Str(s) => s.clone(),
+        Value::Arr(a) => {
+            let words: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+            match words.iter().position(|w| matches!(*w, "-c" | "-lc" | "-ic" | "-lic")) {
+                Some(i) if i + 1 < words.len() => words[i + 1].to_string(),
+                _ => words.join(" "),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// A `function_call` (or a code-mode `tools.<name>(…)` call, its arguments
+/// read the same way) → what it says.
+fn codex_function(name: &str, args: &Value) -> Codex {
+    let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+    let said = |t: String| Codex::Said(t);
+    match name {
+        "shell" | "container.exec" | "exec_command" | "shell_command" | "local_shell" => {
+            let cmd = args.get("command").or_else(|| args.get("cmd")).map(argv_script).unwrap_or_default();
+            if cmd.trim().is_empty() {
+                // (A command it does not spell out says nothing.)
+                return Codex::Nothing;
+            }
+            said(format!("Running {}", command_head(&cmd)))
+        }
+        "apply_patch" => said(patch_phrase(&s("input").or_else(|| s("patch")).unwrap_or_default())),
+        "update_plan" => {
+            let steps = args.get("plan").and_then(Value::as_array).unwrap_or(&[]);
+            let cur = steps.iter().find(|st| st.get("status").and_then(Value::as_str) == Some("in_progress"));
+            Codex::Plan(cur.and_then(|st| st.get("step").and_then(Value::as_str)).map(str::to_string))
+        }
+        "view_image" => said("Viewing an image".into()),
+        "write_stdin" | "wait" => said("Waiting on a command".into()),
+        "spawn_agent" => said(s("task_name").map_or_else(|| "Starting an agent".into(), |t| format!("Starting agent {}", t.replace('_', " ")))),
+        "send_message" => said(s("target").map_or_else(|| "Messaging an agent".into(), |t| format!("Messaging {t}"))),
+        "followup_task" => said(s("target").map_or_else(|| "Following up".into(), |t| format!("Following up with {t}"))),
+        "wait_agent" => said("Waiting on agents".into()),
+        "list_agents" => said("Checking agents".into()),
+        "interrupt_agent" => said(s("target").map_or_else(|| "Interrupting an agent".into(), |t| format!("Interrupting {t}"))),
+        "sleep" => said("Waiting".into()),
+        "request_user_input" | "request_user_input_async" => said("Asking you".into()),
+        "clock__curr_time" | "curr_time" => Codex::Nothing,
+        "web__run" | "web_search" => said(s("q").or_else(|| s("query")).map_or_else(|| "Searching the web".into(), |q| format!("Searching the web for {q}"))),
+        _ if name.starts_with("mcp__") => phrase(name, args).map_or(Codex::Nothing, Codex::Said),
+        "" => Codex::Nothing,
+        _ => said(words_of(&name.replace("__", "_"))),
+    }
+}
+
+/// Code mode: the JavaScript an `exec` call runs. Every `tools.<name>(…)`
+/// call is read (a `tools.<word>` not called is skipped), each its own
+/// argument span only ([`call_span`]) for the fields the phrasing needs
+/// (`cmd`, a patch string, `step` + `status`, `q`); the LAST that says
+/// something speaks (a cell runs its calls in order). A plan with nothing
+/// in progress says nothing here.
+fn js_calls(src: &str) -> Codex {
+    let mut last = Codex::Nothing;
+    let mut rest = src;
+    while let Some(i) = rest.find("tools.") {
+        let after = &rest[i + "tools.".len()..];
+        let name: String = after.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        let tail = &after[name.len()..];
+        let Some(body) = tail.strip_prefix('(') else {
+            rest = tail;
+            continue;
+        };
+        let span = call_span(body);
+        rest = &body[span.len()..];
+        if name.is_empty() {
+            continue;
+        }
+        let got = match name.as_str() {
+            "apply_patch" => js_string(span.trim_start()).map_or(Codex::Nothing, |p| Codex::Said(patch_phrase(&p))),
+            "update_plan" => js_plan_step(span).map_or(Codex::Nothing, |s| Codex::Plan(Some(s))),
+            _ => {
+                // The fields the phrasing reads, as a JSON object.
+                let mut kv: Vec<(String, Value)> = Vec::new();
+                for k in ["cmd", "command", "q", "query", "target", "task_name", "pattern", "file_path", "path"] {
+                    if let Some(v) = js_field(span, k) {
+                        kv.push((k.to_string(), Value::Str(v)));
+                    }
+                }
+                codex_function(&name, &Value::Obj(kv))
+            }
+        };
+        if got != Codex::Nothing {
+            last = got;
+        }
+    }
+    last
+}
+
+/// A call's argument source: `body` (just past its `(`) up to the matching
+/// `)`, strings and nested brackets skipped; all of it when unclosed.
+fn call_span(body: &str) -> &str {
+    let mut depth = 1usize;
+    let mut quote: Option<char> = None;
+    let mut esc = false;
+    for (i, c) in body.char_indices() {
+        if let Some(q) = quote {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &body[..i];
+                }
+            }
+            _ => {}
+        }
+    }
+    body
+}
+
+/// The string value of `key` in JS / JSON object source (`key:"…"`,
+/// `"key":"…"`, `'key':'…'`).
+fn js_field(src: &str, key: &str) -> Option<String> {
+    for pat in [format!("\"{key}\":"), format!("'{key}':"), format!("{key}:")] {
+        let mut from = 0;
+        while let Some(i) = src[from..].find(&pat) {
+            let at = from + i;
+            // A whole key, not the tail of a longer one (`xcmd:`).
+            let ok = at == 0 || !src[..at].chars().next_back().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            if ok {
+                if let Some(v) = js_string(src[at + pat.len()..].trim_start()) {
+                    return Some(v);
+                }
+            }
+            from = at + pat.len();
+        }
+    }
+    None
+}
+
+/// A JS / JSON string literal at the start of `src` (`"…"`, `'…'`, `` `…` ``)
+/// → its value (escapes read; an unterminated one: what there is).
+fn js_string(src: &str) -> Option<String> {
+    let mut cs = src.chars();
+    let q = cs.next().filter(|c| "\"'`".contains(*c))?;
+    let mut out = String::new();
+    let mut esc = false;
+    for c in cs {
+        if esc {
+            out.push(match c {
+                'n' => '\n',
+                't' => '\t',
+                x => x,
+            });
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == q {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+/// The in-progress step of a code-mode `update_plan({plan:[…]})` (its
+/// argument span).
+fn js_plan_step(span: &str) -> Option<String> {
+    span.split('{').filter(|item| item.contains("in_progress")).find_map(|item| js_field(item, "step"))
+}
+
+/// An `apply_patch` patch → `Editing <file>` (its first `*** Update
+/// File:`, `Add File:` → `Writing`, `Delete File:` → `Deleting`), the file
+/// named as [`file_label`] names it.
+fn patch_phrase(patch: &str) -> String {
+    for line in patch.lines() {
+        for (head, verb) in [("*** Update File:", "Editing"), ("*** Add File:", "Writing"), ("*** Delete File:", "Deleting")] {
+            if let Some(path) = line.trim().strip_prefix(head) {
+                return format!("{verb} {}", file_label(path.trim()));
+            }
+        }
+    }
+    "Editing files".into()
 }
 
 #[cfg(test)]

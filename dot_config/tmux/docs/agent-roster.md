@@ -847,9 +847,22 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   last real prompt; a tool result is none): the in-progress todo first (a
   task a later update closed no longer counts), else the latest tool call
   phrased (a hashed file name by what it is, `a transcript`, `tool output`;
-  never a word that looks like a secret), else `Thinking…`. Codex agents keep the run
-  detail (their rollout is `@agent_rollout`, not in the snapshot yet).
-  `AGENT_UI_CLAUDE_DIR` points it elsewhere (tests).
+  never a word that looks like a secret), else `Thinking…`. A Codex
+  agent's comes from its rollout, whose path the window carries
+  (`@agent_rollout`, set by agent-tab-indicator.sh; a field of the
+  sidebar's one snapshot): the same 64 KB tail and caching, walked back to
+  the turn's `task_started` — the in-progress `update_plan` step, else the
+  latest call (`function_call`, `custom_tool_call` — `apply_patch`, or
+  `exec`'s code-mode JavaScript, its last `tools.<name>(…)` call that says
+  something —
+  `local_shell_call`, `web_search_call`): a shell `Running cargo test` (an
+  argv's `bash -lc` script unwrapped), a patch `Editing <first file>`, MCP
+  `<server>: <tool>`, `Searching the web for …`, `Messaging <agent>`;
+  reasoning only `Thinking…`; a turn already over (`task_complete`,
+  `turn_aborted`) nothing, so the run detail shows. Inline code (`-c`,
+  `-e`, `-m`) is shown as just the interpreter; a script file only by a
+  plain, not secret-looking name. `AGENT_UI_CLAUDE_DIR` points the Claude side
+  elsewhere (tests; Codex needs no directory).
 
 - **Letters**: every agent tile (both scopes) and every NEEDS YOU card
   starts, after its stripe, with a ` a ` key-cap (a raised `surface1` chip):

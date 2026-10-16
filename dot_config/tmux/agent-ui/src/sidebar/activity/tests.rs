@@ -270,3 +270,243 @@ fn only_a_live_session_speaks() {
     assert_eq!(a.blurb_for("work", "@7"), None);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------- codex
+//
+// Fixtures in the shapes real rollouts have (~/.codex/sessions, read once to
+// write these; the tests never touch it).
+
+/// A JSON string's escaping of `s`.
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
+/// The turn's start.
+fn started() -> String {
+    r#"{"timestamp":"t","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_attribution":{"turn_id":"x"}}}"#.to_string()
+}
+
+fn user_msg(text: &str) -> String {
+    format!(r#"{{"timestamp":"t","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{}"}}]}}}}"#, esc(text))
+}
+
+/// A `function_call` with JSON `args`, maybe in a namespace.
+fn fc(name: &str, ns: Option<&str>, args: &str) -> String {
+    let ns = ns.map_or(String::new(), |n| format!(r#","namespace":"{n}""#));
+    format!(r#"{{"timestamp":"t","type":"response_item","payload":{{"type":"function_call","name":"{name}"{ns},"arguments":"{}","call_id":"c"}}}}"#, esc(args))
+}
+
+/// A `custom_tool_call` with free-text `input` (a patch, code-mode JS).
+fn ctc(name: &str, input: &str) -> String {
+    format!(r#"{{"timestamp":"t","type":"response_item","payload":{{"type":"custom_tool_call","status":"completed","call_id":"c","name":"{name}","input":"{}"}}}}"#, esc(input))
+}
+
+/// A call's output (big in real life; never read).
+fn out() -> String {
+    format!(r#"{{"timestamp":"t","type":"response_item","payload":{{"type":"function_call_output","call_id":"c","output":"{}"}}}}"#, "x".repeat(200))
+}
+
+fn reasoning() -> String {
+    r#"{"timestamp":"t","type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"gAAAA"}}"#.to_string()
+}
+
+fn cx(lines: &[String]) -> Option<String> {
+    codex_blurb(&(lines.join("\n") + "\n"), true)
+}
+
+#[test]
+fn codex_calls_phrased() {
+    let go = || vec![started(), user_msg("go"), reasoning()];
+    let with = |l: String| [go(), vec![l, out()]].concat();
+    // The shell: an argv, its `-lc` script unwrapped; or a cmd string.
+    assert_eq!(cx(&with(fc("shell", None, r#"{"command":["bash","-lc","cd /x && cargo test --release"]}"#))).as_deref(), Some("Running cargo test"));
+    assert_eq!(cx(&with(fc("exec_command", None, r#"{"cmd":"git status --short","workdir":"/x"}"#))).as_deref(), Some("Running git status"));
+    let local = r#"{"timestamp":"t","type":"response_item","payload":{"type":"local_shell_call","status":"completed","action":{"type":"exec","command":["zsh","-lc","make all"]}}}"#;
+    assert_eq!(cx(&with(local.to_string())).as_deref(), Some("Running make all"));
+    // Code mode: `exec` runs JavaScript calling tools.<name>(…).
+    let js = "const r = await Promise.allSettled([\n  tools.exec_command({cmd:\"rg -n 'toast' /x/src\",max_output_tokens:1200}),\n  tools.exec_command({cmd:\"ls\"})\n]);";
+    assert_eq!(cx(&with(ctc("exec", js))).as_deref(), Some("Running ls"), "the last call speaks");
+    let js = "text(await tools.exec_command({\"cmd\":\"cargo build --release\",\"workdir\":load(\"p\"),yield_time_ms:1000}));";
+    assert_eq!(cx(&with(ctc("exec", js))).as_deref(), Some("Running cargo build"));
+    // The time asked for says nothing: the next call does.
+    let js = "const t = await tools.clock__curr_time({}); text(await tools.exec_command({cmd:\"date\"}));";
+    assert_eq!(cx(&with(ctc("exec", js))).as_deref(), Some("Running date"));
+    // Patches: the first file (Update → Editing, Add → Writing), plain or in code mode.
+    let patch = "*** Begin Patch\n*** Update File: /Users/me/x/src/layout.rs\n@@\n-a\n+b\n*** End Patch";
+    assert_eq!(cx(&with(ctc("apply_patch", patch))).as_deref(), Some("Editing layout.rs"));
+    let js = "text(await tools.apply_patch(\"*** Begin Patch\\n*** Add File: /x/docs/new.md\\n+hi\\n*** End Patch\"));";
+    assert_eq!(cx(&with(ctc("exec", js))).as_deref(), Some("Writing new.md"));
+    // MCP, the web, images, other agents.
+    let js = "text(await tools.mcp__codegraph__codegraph_context({task:\"sidebar layout\"}));";
+    assert_eq!(cx(&with(ctc("exec", js))).as_deref(), Some("Codegraph: context"));
+    let js = "text(await tools.web__run({search_query:[{q:\"nvim-notify layout\"}]}));";
+    assert_eq!(cx(&with(ctc("exec", js))).as_deref(), Some("Searching the web for nvim-notify layout"));
+    let ws = r#"{"timestamp":"t","type":"response_item","payload":{"type":"web_search_call","status":"completed","action":{"type":"search","query":"textual buttons"}}}"#;
+    assert_eq!(cx(&with(ws.to_string())).as_deref(), Some("Searching the web for textual buttons"));
+    let js = "image((await tools.view_image({path:\"/tmp/a.png\"})).image_url);";
+    assert_eq!(cx(&with(ctc("exec", js))).as_deref(), Some("Viewing an image"));
+    assert_eq!(cx(&with(fc("send_message", Some("collaboration"), r#"{"target":"popup_ui","message":"gAAAA"}"#))).as_deref(),
+        Some("Messaging popup_ui"));
+    assert_eq!(cx(&with(fc("spawn_agent", Some("collaboration"), r#"{"task_name":"swap_backend","message":"x"}"#))).as_deref(),
+        Some("Starting agent swap backend"));
+    assert_eq!(cx(&with(fc("wait_agent", Some("collaboration"), r#"{"timeout_ms":10000}"#))).as_deref(), Some("Waiting on agents"));
+    assert_eq!(cx(&with(fc("request_user_input_async", None, r#"{"questions":[]}"#))).as_deref(), Some("Asking you"));
+    assert_eq!(cx(&with(fc("SomethingNew", None, "{}"))).as_deref(), Some("Something new"));
+    // Secrets never shown.
+    let js = "text(await tools.exec_command({cmd:\"deploy --to prod ghp_AbCdEf0123456789XYZabc\"}));";
+    assert_eq!(cx(&with(ctc("exec", js))).as_deref(), Some("Running deploy"));
+}
+
+#[test]
+fn codex_turns_and_plans() {
+    // Reasoning only, this turn: Thinking. The last turn's call says nothing.
+    let lines = [started(), user_msg("first"), fc("shell", None, r#"{"command":["bash","-lc","make"]}"#), out(),
+        started(), user_msg("second"), reasoning()];
+    assert_eq!(cx(&lines).as_deref(), Some(THINKING));
+    // A plan's in-progress step wins over later calls; a plan with none
+    // in progress gives way to the latest call.
+    let plan = r#"{"plan":[{"step":"Read the layout","status":"completed"},{"step":"Wire the codex blurb","status":"in_progress"}]}"#;
+    let lines = [started(), user_msg("go"), fc("update_plan", None, plan), out(), ctc("exec", "tools.exec_command({cmd:\"ls\"})"), out()];
+    assert_eq!(cx(&lines).as_deref(), Some("Wire the codex blurb"));
+    let done = r#"{"plan":[{"step":"Wire the codex blurb","status":"completed"}]}"#;
+    let mut later = lines.to_vec();
+    later.extend([fc("update_plan", None, done), out(), ctc("exec", "tools.exec_command({cmd:\"cargo test\"})")]);
+    assert_eq!(cx(&later).as_deref(), Some("Running cargo test"));
+    let js = "tools.update_plan({plan:[{step:\"Check the tests\",status:\"in_progress\"},{step:\"Ship\",status:\"pending\"}]})";
+    assert_eq!(cx(&[started(), ctc("exec", js), out()]).as_deref(), Some("Check the tests"));
+    // Nothing to go by in a cut tail: nothing said.
+    assert_eq!(codex_blurb(&(reasoning() + "\n"), false), None);
+}
+
+/// Through the view: a working Codex agent reads its `@agent_rollout`,
+/// only when it changed; its row shows the blurb.
+#[test]
+fn a_working_codex_agent_shows_its_activity() {
+    use crate::collate::Collator;
+    use crate::sidebar::layout::{layout, Opts};
+    use crate::tmux::tests::row;
+    use crate::tmux::Snapshot;
+    use crate::view::BuildArgs;
+    let dir = std::env::temp_dir().join(format!("agentui-codex-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let roll = dir.join("rollout-2026-10-16T10-00-00-01a1.jsonl");
+    let body = [started(), user_msg("go"), fc("shell", None, r#"{"command":["bash","-lc","cargo test --release"]}"#)].join("\n") + "\n";
+    std::fs::write(&roll, body).unwrap();
+    let path = roll.to_str().unwrap();
+    let rows = [
+        row("work", 1, "@7", &[("state", "running"), ("summary", "Codex job"), ("kind", "codex"), ("rollout", path)]),
+        row("work", 2, "@8", &[("state", "idle"), ("summary", "Codex calm"), ("kind", "codex"), ("rollout", path)]),
+    ];
+    let c = Collator::new("C");
+    let build = || {
+        let args = BuildArgs { client: None, now: 0.0, collator: &c, git: None, log: vec![], watcher_age: Some(1.0) };
+        ViewModel::build(&Snapshot::parse(&rows.join("\n")), args)
+    };
+    // (No Claude directory at all: never the real one.)
+    let mut a = Activity::new(dir.join("no-claude"));
+    let mut v = build();
+    a.apply(&mut v);
+    let got: Vec<_> = v.agents().map(|x| x.blurb.clone()).collect();
+    assert_eq!(got, [Some("Running cargo test".to_string()), None]);
+    let f = layout(&v, 38, 30, &Opts::default());
+    let t: Vec<String> = f.rows.iter().map(|r| r.text()).collect();
+    let r = t.iter().position(|l| l.contains("Codex job")).unwrap();
+    assert!(t[r + 1].contains("› Running cargo test"), "{t:#?}");
+    // Unchanged rollout: no read again.
+    let mut v = build();
+    a.apply(&mut v);
+    assert_eq!(a.reads, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A shell run with `-c`: its script's head.
+#[test]
+fn shell_scripts_unwrap() {
+    assert_eq!(command_head("zsh -fc 'cd /x && cargo test --release'"), "cargo test");
+    assert_eq!(command_head("/bin/bash -lc \"make all\""), "make all");
+    assert_eq!(command_head("zsh -f"), "zsh");
+    assert_eq!(command_head("sh -c 'ghp_AbCdEf0123456789XYZabc go'"), "a command");
+}
+
+#[test]
+fn shell_scripts_unwrap_after_cd() {
+    assert_eq!(command_head("cd /x && zsh -fc 'git log --oneline | head'"), "git log");
+}
+
+/// An interpreter running a script file: the script by name.
+#[test]
+fn scripts_by_name() {
+    assert_eq!(command_head("zsh -f /tmp/s/sockets-clean.zsh; tmux ls"), "sockets-clean.zsh");
+    assert_eq!(command_head("python3 -I /x/ansi2html.py in out"), "ansi2html.py");
+    assert_eq!(command_head("python3 -m unittest"), "python3");
+    assert_eq!(command_head("bash run.sh"), "run.sh");
+}
+
+/// Inline code, modules and flag values are never taken for a script; a
+/// script's name is shown only when plain and not secret-looking.
+#[test]
+fn interpreter_scripts_never_leak() {
+    assert_eq!(command_head("python3 -c \"requests.get('https://x.io/y?t=ghp_ABCdef1234567890abcdefXYZ')\""), "python3");
+    // Built at run time so the repo's secret scanner never sees a key-shaped literal.
+    let fake = ["AbCdEf", "1234567890", "abcdefGHIJ"].concat();
+    assert_eq!(command_head(&format!("node -e \"fetch('https://h/p?auth={fake}')\"")), "node");
+    assert_eq!(command_head("bash /tmp/AbCdEf1234567890abcdefGHIJ.sh"), "bash");
+    assert_eq!(command_head("bash AbCdEf1234567890abcdefGHIJ.sh"), "bash");
+    assert_eq!(command_head("python3 -c \"print(open('/Users/me/.env').read())\""), "python3");
+    assert_eq!(command_head("node --require ./x.js app.js"), "app.js");
+    assert_eq!(command_head("python3 -m http.server 8000"), "python3");
+    assert!(secret("AbCdEf1234567890abcdefGHIJ.sh") && !secret("sockets-clean.zsh"));
+}
+
+/// A `-c` script is cut at its matching quote, escapes read, nested ones too.
+#[test]
+fn shell_scripts_stop_at_their_quote() {
+    assert_eq!(command_head("bash -c 'make' | tail"), "make");
+    assert_eq!(command_head("bash -lc \"cargo test\" 2>&1 | tail -30"), "cargo test");
+    assert_eq!(command_head("cd /x && bash -lc 'cargo test' && echo ok"), "cargo test");
+    assert_eq!(command_head("sh -c \"sh -c 'sh -c \\\"cargo build\\\"'\""), "cargo build");
+    assert_eq!(command_head("bash -c make | tail"), "make");
+}
+
+#[test]
+fn codex_mcp_namespaces_and_queries() {
+    let go = || vec![started(), user_msg("go")];
+    let with = |l: String| [go(), vec![l]].concat();
+    assert_eq!(cx(&with(fc("codegraph_explore", Some("mcp__codegraph__"), r#"{"query":"x"}"#))).as_deref(), Some("Codegraph: explore"));
+    assert_eq!(cx(&with(fc("list_events", Some("mcp__google_calendar"), "{}"))).as_deref(), Some("Google calendar: list events"));
+    let ws = r#"{"timestamp":"t","type":"response_item","payload":{"type":"web_search_call","status":"completed","action":{"type":"search","queries":["tmux 3.7 popups","x"]}}}"#;
+    assert_eq!(cx(&with(ws.to_string())).as_deref(), Some("Searching the web for tmux 3.7 popups"));
+}
+
+#[test]
+fn code_mode_reads_each_call_in_its_own_span() {
+    let go = || vec![started(), user_msg("go")];
+    let js = |src: &str| cx(&[go(), vec![ctc("exec", src)]].concat());
+    // (a) the last call that says something.
+    assert_eq!(js("tools.exec_command({cmd:\"/bin/zsh -f\",tty:true}); tools.exec_command({cmd:\"cargo test\"})").as_deref(), Some("Running cargo test"));
+    // (b) a shorthand `{cmd}` says nothing: the one before speaks.
+    assert_eq!(js("await tools.exec_command({cmd:\"make\"}); await tools.exec_command({cmd})").as_deref(), Some("Running make"));
+    // (c) `tools.md` is not a call.
+    assert_eq!(js("// notes in tools.md\nawait tools.exec_command({cmd:\"cargo test\"})").as_deref(), Some("Running cargo test"));
+    // (d) a plan with nothing in progress says nothing.
+    assert_eq!(js("tools.exec_command({cmd:\"ls\"}); tools.update_plan({plan:[{step:\"Ship\",status:\"completed\"}]})").as_deref(), Some("Running ls"));
+    // (e) a field of one call never comes from the next.
+    assert_eq!(js("tools.exec_command({cmd}); tools.web__run({q:\"rust\"})").as_deref(), Some("Searching the web for rust"));
+    assert_eq!(js("tools.send_message({message:\"x\"}); tools.exec_command({cmd:\"git log\"})").as_deref(), Some("Running git log"));
+    assert_eq!(js("tools.send_message({message:\"hi (there)\"})").as_deref(), Some("Messaging an agent"));
+}
+
+/// A turn that is over says nothing: the row keeps the run detail.
+#[test]
+fn a_finished_codex_turn_says_nothing() {
+    let complete = r#"{"timestamp":"t","type":"event_msg","payload":{"type":"task_complete","turn_id":"x","last_agent_message":"done"}}"#;
+    let aborted = r#"{"timestamp":"t","type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#;
+    for end in [complete, aborted] {
+        let lines = [started(), user_msg("go"), fc("shell", None, r#"{"command":["bash","-lc","make"]}"#), out(), end.to_string()];
+        assert_eq!(cx(&lines), None, "{end}");
+    }
+    // A new turn after it: that one speaks.
+    let lines = [started(), complete.to_string(), started(), user_msg("again"), fc("shell", None, r#"{"cmd":"cargo test"}"#)];
+    assert_eq!(cx(&lines).as_deref(), Some("Running cargo test"));
+}

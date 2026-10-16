@@ -201,12 +201,14 @@ impl Tmux {
 /// space) rides the same way, and `stash_sel` (stash.sh's `@stash_sel`: the
 /// window is in prefix v's range selection), and `pane_flags` ([`PANE_FLAGS`]:
 /// one token per pane, so a space's DASHBOARD pane (`@space_dash_pane`) is
-/// never counted, captured, closed or focused).
-pub const FIELDS: [&str; 32] = [
+/// never counted, captured, closed or focused), and `rollout`
+/// (`@agent_rollout`: a Codex agent's rollout path, which the sidebar reads
+/// for its live activity blurb).
+pub const FIELDS: [&str; 33] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
     "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home", "space_index",
-    "space_hidden", "space_color", "stash_sel", "pane_flags",
+    "space_hidden", "space_color", "stash_sel", "pane_flags", "rollout",
 ];
 
 /// The pane option space.sh sets (to 1) on a space home's dashboard pane
@@ -226,14 +228,14 @@ pub const PANE_FLAGS: &str =
 
 /// The tmux format of each FIELDS entry, in order. (`#{pane_current_path}`
 /// is printed by [`path_format`], dashboard-aware.)
-pub const FORMATS: [&str; 32] = [
+pub const FORMATS: [&str; 33] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
     "#{window_panes}", "#{pane_current_path}", "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}",
     "#{@stash_origin}", "#{@agent_slot}", "#{@agent_pending}", "#{@agent_key}", "#{@agent_mru_cur}",
     "#{@agent_mru_prev}", "#{@space_home}", "#{@space_index}", "#{@space_hidden}", "#{@space_color}", "#{@stash_sel}",
-    PANE_FLAGS,
+    PANE_FLAGS, "#{@agent_rollout}",
 ];
 
 /// Ends each path in the dashboard case of [`path_format`] (a private-use
@@ -541,6 +543,9 @@ pub struct Window {
     pub space_color: String,
     /// @stash_sel is set: in stash.sh's range selection (prefix v).
     pub stash_sel: bool,
+    /// @agent_rollout: a Codex agent's rollout (its transcript) path, as
+    /// agent-tab-indicator.sh stashes it; "" for any other.
+    pub rollout: String,
 }
 
 fn digits(s: &str) -> bool {
@@ -619,6 +624,7 @@ impl Window {
             space_hidden: p[28] == "1",
             space_color: p[29].trim().into(),
             stash_sel: !p[30].is_empty(),
+            rollout: p[32].trim().into(),
             label: label.into(),
             session,
         })
@@ -962,13 +968,25 @@ pub(crate) mod tests {
         assert_eq!((w.session.as_str(), w.label.as_str()), ("日本", "🫠 x\tz"));
     }
 
+    /// A row from an older format (32 fields, before `rollout`) or one with
+    /// a field too many is no window: never misread by position.
+    #[test]
+    fn rows_of_the_wrong_length_are_rejected() {
+        assert_eq!(FIELDS.len(), 33);
+        assert!(Window::parse(&vec!["x"; 32].join("\x1f")).is_none());
+        assert!(Window::parse(&vec!["x"; 34].join("\x1f")).is_none());
+        assert!(Window::parse(&vec!["x"; 33].join("\x1f")).is_some());
+    }
+
     #[test]
     fn slots() {
         assert!(fmt().contains(&guarded("#{@agent_slot}")) && fmt().contains(&guarded("#{@agent_pending}")));
         assert!(fmt().contains(&guarded("#{@agent_key}")) && fmt().contains(&guarded("#{@agent_mru_prev}")));
         assert!(fmt().contains(&guarded("#{@space_home}")));
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{PANE_FLAGS}", guarded("#{@space_index}"),
-            guarded("#{@space_hidden}"), guarded("#{@space_color}"), guarded("#{@stash_sel}"))));
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{PANE_FLAGS}\x1f{}", guarded("#{@space_index}"),
+            guarded("#{@space_hidden}"), guarded("#{@space_color}"), guarded("#{@stash_sel}"), guarded("#{@agent_rollout}"))));
+        let s = Snapshot::parse(&row("main", 1, "@1", &[("rollout", "/x/rollout-1.jsonl")]));
+        assert_eq!(s.windows[0].rollout, "/x/rollout-1.jsonl");
         let s = Snapshot::parse(&row("main", 1, "@1", &[("space_color", " #f9e2af "), ("stash_sel", "1")]));
         assert_eq!((s.windows[0].space_color.as_str(), s.windows[0].stash_sel), ("#f9e2af", true));
         let s = Snapshot::parse(&[row("main", 1, "@1", &[("home", "1")]), row("main", 2, "@2", &[("home", "0")])].join("\n"));

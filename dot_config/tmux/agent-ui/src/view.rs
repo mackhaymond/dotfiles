@@ -237,6 +237,9 @@ pub struct Agent {
     /// transcript (the sidebar's `activity::Activity`); None otherwise and
     /// from [`Agent::from_window`] alone.
     pub blurb: Option<String>,
+    /// A Codex agent's rollout (transcript) path (`@agent_rollout`), "" for
+    /// any other: where its blurb comes from.
+    pub rollout: String,
 }
 
 impl Agent {
@@ -289,6 +292,7 @@ impl Agent {
             letter: None,
             selected: w.stash_sel,
             blurb: None,
+            rollout: w.rollout.clone(),
         }
     }
 
