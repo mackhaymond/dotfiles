@@ -206,10 +206,22 @@ fn every_size_fits_and_accounts_for_every_agent() {
     let mut sel = demo_bar();
     sel.selecting = Some(3);
     sel.prefix = true;
-    let bars = [Bar::default(), demo_bar(), sel];
+    // Toasts: a short one in the card, a long one (wrapped rows) with the
+    // marks, and one with no card at all.
+    let long = Bar { toast: Some(toast(Kind::Error, LONG)), ..sel.clone() };
+    let toasted = Bar { toast: Some(toast(Kind::Ok, "parked Canvas Syllabus")), ..demo_bar() };
+    let bare = Bar { toast: Some(toast(Kind::Warn, LONG)), ..Bar::default() };
+    let bars = [Bar::default(), demo_bar(), sel, toasted, long, bare];
     let cases = |lettered: bool| -> Vec<(&Bar, u16)> {
         if lettered {
-            bars.iter().flat_map(|b| [24u16, 30, 38, 60].map(|w| (b, w))).collect()
+            // (The toasts at the border's narrowest and a wide width; the
+            // short one at the usual one too.)
+            let widths = |b: &Bar| match &b.toast {
+                Some(t) if t.text == LONG => vec![20u16, 60],
+                Some(_) => vec![20u16, 34, 60],
+                None => vec![24u16, 30, 38, 60],
+            };
+            bars.iter().flat_map(|b| widths(b).into_iter().map(move |w| (b, w))).collect()
         } else {
             [24u16, 26, 30, 34, 45].map(|w| (&bars[0], w)).to_vec()
         }
@@ -227,6 +239,16 @@ fn every_size_fits_and_accounts_for_every_agent() {
                 check_order(&format!("{name} {w}x{h}"), &f);
                 let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
                 paint(&f, &mut buf);
+                // A toast drawn is a toast clickable, and the card keeps its corners.
+                for y in f.toast.clone() {
+                    assert!(f.rows[y].targets.iter().any(|t| matches!(t.2, Target::Toast(TOAST_ID))), "{name} {w}x{h}: {y}");
+                }
+                assert_eq!(f.toast.is_empty(), f.toast_until.is_none(), "{name} {w}x{h}");
+                if !f.card.is_empty() {
+                    let y = f.card.end as u16 - 1;
+                    assert_eq!((buf[(0, y)].symbol(), buf[(w - 1, y)].symbol(), buf[(w - 2, y)].symbol()), ("╰", "╯", "─"),
+                        "{name} {w}x{h}");
+                }
             }
         }
     }
@@ -1310,13 +1332,159 @@ fn the_spinner_turns_only_working_rows() {
 fn glyph_widths_agree_with_ratatui() {
     // Every fixed glyph the sidebar draws: the layout's cell count
     // (text::dwidth) must be ratatui's (unicode-width over the grapheme).
-    let glyphs = "⏵⤺≡⌥▌▎◉✓✕◐○●─━┃│╭╮╰╯↻Σ−±↑↓✎⚙◎▸…✳⬢⏎⏸⌃⌂\u{e0a0}".to_string() + &SPIN.concat();
+    let glyphs = "⏵⤺≡⌥▌▎◉✓✕•◐○●─━┃│╭╮╰╯↻Σ−±↑↓✎⚙◎▸…✳⬢⏎⏸⌃⌂\u{e0a0}".to_string() + &SPIN.concat();
     let bad: Vec<(char, usize, usize)> = glyphs
         .chars()
         .map(|c| (c, dwidth(&c.to_string()), c.to_string().width()))
         .filter(|(_, a, b)| a != b || *a != 1)
         .collect();
     assert!(bad.is_empty(), "{bad:?}");
+}
+
+/// A toast posted at the fixtures' clock (seq 7, 4 s), for every sidebar.
+fn toast(kind: Kind, text: &str) -> Toast {
+    Toast { seq: 7, at_ms: NOW * 1000, kind, ttl: 4.0, client: String::new(), text: text.into() }
+}
+
+/// Its id: what a click on it dismisses.
+const TOAST_ID: ToastId = (7, NOW * 1000);
+
+/// A toast too long for any border.
+const LONG: &str = "couldn't park Canvas Syllabus: it is still working on the export";
+
+/// The card's bottom border as painted, a toast in it.
+fn bottom_border(f: &Frame) -> String {
+    let mut buf = Buffer::empty(Rect::new(0, 0, f.width, f.height));
+    paint(f, &mut buf);
+    let y = f.card.end as u16 - 1;
+    (0..f.width).map(|x| buf[(x, y)].symbol().to_string()).collect()
+}
+
+/// A toast sits in the card's bottom border, as the key-table marks sit in
+/// its top one: no row moves, the glyph bold in the kind's colour, a click
+/// on its cells dismisses it, and it says when it expires.
+#[test]
+fn toasts_sit_in_the_cards_bottom_border() {
+    let v = lettered(quiet());
+    let plain = layout(&v, 34, 40, &with_bar(demo_bar()));
+    let f = layout(&v, 34, 40, &with_bar(Bar { toast: Some(toast(Kind::Ok, "parked Canvas Syllabus")), ..demo_bar() }));
+    assert_eq!(bottom_border(&f), "╰─ ✓ parked Canvas Syllabus ─────╯");
+    assert_eq!(bottom_border(&plain), format!("╰{}╯", "─".repeat(32)));
+    assert_eq!((f.card.clone(), f.status.clone(), texts(&f)), (plain.card.clone(), plain.status.clone(), texts(&plain)));
+    assert_eq!(top_border(&f), format!("╭{}╮", "─".repeat(32)));
+    assert!(f.card_footer.contains(&bold("✓", "green")) && f.card_footer.contains(&seg("parked Canvas Syllabus", "text")));
+    let mut buf = Buffer::empty(Rect::new(0, 0, 34, 40));
+    paint(&f, &mut buf);
+    let y = f.card.end as u16 - 1;
+    assert_eq!((buf[(3, y)].fg, buf[(3, y)].modifier.contains(Modifier::BOLD)), (palette::color("green"), true));
+    assert_eq!((buf[(5, y)].fg, buf[(5, y)].bg), (palette::color("text"), Color::Reset));
+    // A click on its cells (not the rule after them) dismisses it.
+    assert_eq!(f.toast, y as usize..y as usize + 1);
+    assert_eq!((f.target(2, y), f.target(27, y), f.target(28, y), f.target(1, y)), (Some(&Target::Toast(TOAST_ID)), Some(&Target::Toast(TOAST_ID)), None, None));
+    assert_eq!(f.toast_until, Some((NOW + 4) * 1000));
+    assert_eq!(plain.toast_until, None);
+    // Each kind: its glyph and colour.
+    for (k, g, hue) in [(Kind::Info, "•", "blue"), (Kind::Ok, "✓", "green"), (Kind::Warn, "!", "peach"), (Kind::Error, "✕", "red")] {
+        let f = layout(&v, 34, 40, &with_bar(Bar { toast: Some(toast(k, "hi")), ..demo_bar() }));
+        assert_eq!(f.card_footer[1], bold(g, hue), "{k:?}");
+        assert!(bottom_border(&f).starts_with(&format!("╰─ {g} hi ─")), "{k:?}");
+    }
+    // With the prefix mark up top: both borders carry theirs.
+    let f = layout(&v, 34, 40, &with_bar(Bar { prefix: true, toast: Some(toast(Kind::Info, "hi")), ..demo_bar() }));
+    assert!(top_border(&f).starts_with("╭─ prefix ") && bottom_border(&f).starts_with("╰─ • hi "));
+}
+
+/// Narrow cards clip the toast with `…` and keep a rule cell and the
+/// corner; a text that loses only a little stays in the border alone.
+#[test]
+fn a_toast_clips_to_keep_the_corner() {
+    let v = lettered(quiet());
+    let text = "parked Canvas Syllabus";
+    let plain = layout(&v, 30, 40, &with_bar(demo_bar()));
+    let f = layout(&v, 30, 40, &with_bar(Bar { toast: Some(toast(Kind::Warn, text)), ..demo_bar() }));
+    let b = bottom_border(&f);
+    assert!(b.starts_with("╰─ ! parked Canvas Sy") && b.ends_with("… ──╯") && dwidth(&b) == 30, "{b:?}");
+    assert_eq!((f.card.clone(), texts(&f)), (plain.card.clone(), texts(&plain)), "a little clipped: nothing moves");
+    for w in [20u16, 22, 26] {
+        let f = layout(&v, w, 40, &with_bar(Bar { toast: Some(toast(Kind::Warn, text)), ..demo_bar() }));
+        let b = bottom_border(&f);
+        assert!(b.starts_with("╰─ ! ") && b.contains('…') && b.ends_with("──╯") && dwidth(&b) == usize::from(w), "{w}: {b:?}");
+    }
+}
+
+/// A long toast also shows whole (wrapped, at most 2 rows, the rest cut)
+/// inside the card just above its bottom border; those rows dismiss it too.
+#[test]
+fn a_long_toast_wraps_inside_the_card() {
+    let v = lettered(quiet());
+    let plain = layout(&v, 34, 40, &with_bar(demo_bar()));
+    let f = layout(&v, 34, 40, &with_bar(Bar { toast: Some(toast(Kind::Error, LONG)), ..demo_bar() }));
+    let t = texts(&f);
+    assert_eq!(f.card.len(), plain.card.len() + 2, "{t:#?}");
+    let r = f.card.end - 3;
+    assert_eq!(f.toast, r..f.card.end);
+    assert_eq!(t[r].trim_end(), "  ✕ couldn't park Canvas", "{t:#?}");
+    assert_eq!(t[r + 1].trim_end(), "    Syllabus: it is still worki…", "{t:#?}");
+    assert!(f.rows[r].segs.contains(&bold("✕", "red")));
+    for y in [r, r + 1] {
+        assert_eq!((f.target(1, y as u16), f.target(0, y as u16), f.target(33, y as u16)), (Some(&Target::Toast(TOAST_ID)), None, None));
+    }
+    let b = bottom_border(&f);
+    assert!(b.starts_with("╰─ ✕ couldn't park Canvas") && b.ends_with("… ──╯"), "{b:?}");
+    // The rows sit inside the card's border.
+    let mut buf = Buffer::empty(Rect::new(0, 0, 34, 40));
+    paint(&f, &mut buf);
+    assert_eq!((buf[(0, r as u16)].symbol(), buf[(33, r as u16)].symbol()), ("│", "│"));
+    // Two short lines: all of it, nothing cut.
+    let f = layout(&v, 34, 40, &with_bar(Bar { toast: Some(toast(Kind::Info, "a fairly long note that wraps once")), ..demo_bar() }));
+    let t = texts(&f);
+    let r = f.toast.start;
+    assert_eq!((t[r].trim_end(), t[r + 1].trim_end()), ("  • a fairly long note that", "    wraps once"), "{t:#?}");
+    assert_eq!(wrap("aaaa bbbb cccccccccccc dd", 6, 3), ["aaaa", "bbbb", "ccccc…"]);
+    assert_eq!(wrap("xxxxxxxxxx yy", 4, 3), ["xxx…", "yy"]);
+    assert_eq!(wrap("one", 6, 2), ["one"]);
+}
+
+/// No card to carry it (no Bar, a short frame, nothing in the card): a
+/// tinted row of its own at the very top; none in a tiny frame.
+#[test]
+fn a_toast_without_a_card_takes_the_top_row() {
+    let v = lettered(quiet());
+    let classic = layout(&v, 34, 30, &with_bar(Bar { toast: Some(toast(Kind::Info, "hello there")), ..Bar::default() }));
+    let t = texts(&classic);
+    assert!(t[0].starts_with(" • hello there") && t[1].starts_with(" agents"), "{t:#?}");
+    assert_eq!((classic.rows[0].bg, classic.toast.clone(), classic.card.clone()), (Some(Ink::Mix("blue", 14)), 0..1, 0..0));
+    assert_eq!(classic.target(20, 0), Some(&Target::Toast(TOAST_ID)));
+    // A frame too short for the border: first, then the prefix mark, then usage.
+    let f = layout(&v, 34, 14, &with_bar(Bar { prefix: true, toast: Some(toast(Kind::Warn, "hello")), ..demo_bar() }));
+    let t = texts(&f);
+    assert!(f.card.is_empty() && t[0].starts_with(" ! hello") && t[1].starts_with("  prefix ") && t[2].starts_with(" S 13%"), "{t:#?}");
+    assert_eq!(f.rows[0].bg, Some(Ink::Mix("peach", 14)));
+    // A long one is clipped on its row.
+    let f = layout(&v, 34, 30, &with_bar(Bar { toast: Some(toast(Kind::Error, LONG)), ..Bar::default() }));
+    assert!(texts(&f)[0].ends_with("… "), "{:?}", texts(&f)[0]);
+    // Under 6 rows: no room for it.
+    let f = layout(&v, 34, 5, &with_bar(Bar { toast: Some(toast(Kind::Info, "hello")), ..Bar::default() }));
+    assert!(f.toast.is_empty() && f.toast_until.is_none() && !texts(&f).iter().any(|l| l.contains("hello")));
+}
+
+/// A toast lives until its deadline by the frame's clock, then the frame is
+/// the one without it.
+#[test]
+fn a_toast_expires_by_the_frame_clock() {
+    let v = lettered(quiet());
+    let bar = Bar { toast: Some(toast(Kind::Ok, "parked")), ..demo_bar() };
+    let at = |bar: &Bar, now: f64| layout(&v, 34, 40, &Opts { now: Some(now), ..with_bar(bar.clone()) });
+    let t0 = NOW as f64;
+    assert!(bottom_border(&at(&bar, t0 + 3.99)).contains("parked"));
+    for now in [t0 + 4.0, t0 + 60.0] {
+        let f = at(&bar, now);
+        assert_eq!((f.card_footer.is_empty(), f.toast.is_empty(), f.toast_until), (true, true, None));
+        assert_eq!(f, at(&demo_bar(), now));
+    }
+    // The same for one on its own row (it gives the row back).
+    let bare = Bar { toast: Some(toast(Kind::Ok, "parked")), ..Bar::default() };
+    assert_eq!(at(&bare, t0 + 4.0), at(&Bar::default(), t0 + 4.0));
 }
 
 /// The terminal's own background everywhere but the surfaces: the

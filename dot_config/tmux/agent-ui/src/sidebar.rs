@@ -62,6 +62,14 @@
 //!   registry behind `@sidebar_open` restores it when the last one leaves.
 //!   Agent rows carry their lifetime letters (`@agent_key`, shared with the
 //!   menu and persisted like it).
+//! - **Toasts.** scripts/notify.sh, the replacement for `tmux
+//!   display-message` while a sidebar is open, writes `@toast` and posts the
+//!   focus notice; the refresh that follows reads it in the one snapshot and
+//!   draws it in the card's bottom border ([`layout`]'s Toasts). It stays
+//!   until its deadline, when the loop wakes once to draw the frame without
+//!   it (no polling); a click on it dismisses it here only. The registry
+//!   also keeps `@sidebar_clients` (which clients have a sidebar), so the
+//!   script knows when to fall back to `display-message`.
 //! - **`--once WxH`** prints one frame in ANSI colour and exits: no
 //!   alternate screen, no marker, no mouse (screenshots, tests).
 
@@ -372,6 +380,9 @@ struct App {
     key_reads: u32,
     /// The spinner's clock: its frame is the [`SPIN_EVERY`]s since this.
     started: Instant,
+    /// The toast a click dismissed here ([`status::Toast::id`]): never
+    /// drawn again.
+    dismissed: Option<status::ToastId>,
 }
 
 impl App {
@@ -408,7 +419,23 @@ impl App {
             keypoll: KeyPoll::default(),
             key_reads: 0,
             started: Instant::now(),
+            dismissed: None,
         }
+    }
+
+    /// The bar to draw: the snapshot's, less a toast dismissed here.
+    fn shown_bar(&self) -> Bar {
+        let mut bar = self.bar.clone();
+        if bar.toast.as_ref().is_some_and(|t| Some(t.id()) == self.dismissed) {
+            bar.toast = None;
+        }
+        bar
+    }
+
+    /// When the toast on screen expires (a redraw then, without it).
+    fn toast_due(&self, now: Instant) -> Option<Instant> {
+        let left = self.shown.toast_until? as f64 / 1000.0 - text::now();
+        Some(now + Duration::from_secs_f64(left.max(0.0)) + Duration::from_millis(5))
     }
 
     /// The spinner frame at `now`.
@@ -484,11 +511,12 @@ impl App {
         let me = std::process::id() as i32;
         let Some(st) = self.core.snapshot.clients.first().map(|c| c.status.clone()) else { return };
         let now = Instant::now();
-        if status::needs_repair(&st, me, &status::is_sidebar)
+        let client = self.link.client.as_deref();
+        if status::needs_repair(&st, me, &status::client_word(client), &status::is_sidebar)
             && self.repaired_at.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2))
         {
             self.repaired_at = Some(now);
-            reg.open(me);
+            reg.open(me, client);
         }
         let live = status::parse_pids(&st.sidebar_pids).into_iter().filter(|&p| p == me || status::is_sidebar(p)).min();
         let leader = live.is_none_or(|p| p == me);
@@ -629,6 +657,11 @@ impl App {
             self.toggle_scope();
             return;
         }
+        if let Target::Toast(id) = t {
+            // Here only: the other sidebars keep showing it.
+            self.dismissed = Some(id);
+            return;
+        }
         let Some(client) = self.link.client.clone() else {
             self.say("no tmux client");
             return;
@@ -665,7 +698,7 @@ impl App {
                 }
                 Err(e) => Err(format!("stash failed: {e}")),
             },
-            Target::Restart | Target::Scope => Ok(false),
+            Target::Restart | Target::Scope | Target::Toast(_) => Ok(false),
         };
         match moved {
             Ok(true) => self.refresh(),
@@ -697,7 +730,7 @@ impl App {
         let spin = self.spin_at(Instant::now());
         // Ages at this frame's clock (no tmux call), so a spinner frame
         // between snapshots never shows a stale one.
-        let opts = Opts { msg, bar: self.bar.clone(), spin, now: Some(now) };
+        let opts = Opts { msg, bar: self.shown_bar(), spin, now: Some(now) };
         let frame = layout(&self.view, size.width, size.height, &opts);
         let mut buf = Buffer::empty(Rect::new(0, 0, size.width, size.height));
         layout::paint(&frame, &mut buf);
@@ -745,6 +778,10 @@ impl App {
             // Only while a spinner is on screen: its next frame.
             if let Some(s) = self.spin_due(now) {
                 wake = wake.min(s);
+            }
+            // Only while a toast is on screen: its expiry.
+            if let Some(t) = self.toast_due(now) {
+                wake = wake.min(t);
             }
             let fds = [self.notices.fd(), self.watch.as_ref().map(term::ProcWatch::fd)];
             let (has_input, [noticed, exited]) = sig.wait(0, fds, wake.saturating_duration_since(now))?;
@@ -800,9 +837,11 @@ struct Open {
 }
 
 impl Open {
-    fn new(reg: Registry) -> Open {
+    /// `client`: the pinned one (`--client`), if any; a found one is
+    /// recorded on the first refresh that sees it.
+    fn new(reg: Registry, client: Option<&str>) -> Open {
         let me = std::process::id() as i32;
-        reg.open(me);
+        reg.open(me, client);
         Open { reg, me }
     }
 }
@@ -828,7 +867,7 @@ fn live(tmux: Tmux, args: &[String]) -> io::Result<()> {
     // In the registry (status line hidden) from here until every exit path
     // drops the guard: a normal return, the never-alone exit, SIGHUP/SIGTERM
     // (the loop returns), an error, or a panic unwinding.
-    let _open = Open::new(Registry::new(&tmux));
+    let _open = Open::new(Registry::new(&tmux), arg_after(args, "--client"));
     app.registry = Some(Registry::new(&tmux));
     let mut out = io::stdout();
     out.write_all(wezterm::strip_marker().as_bytes())?;
@@ -1169,6 +1208,46 @@ mod tests {
         assert_eq!(v2.agents().map(|x| x.letter).collect::<Vec<_>>(), [Some('s'), Some('a'), Some('d'), Some('f')]);
         // `--once` (no memo) computes them but returns nothing to send.
         assert!(build_view(&mut a.core, Some(cl), None).1.is_empty());
+    }
+
+    /// A left click on a toast dismisses it in this sidebar only (no tmux
+    /// call; focus still goes back); a newer toast shows again. While one
+    /// is on screen the loop wakes at its deadline, and only then.
+    #[test]
+    fn a_click_dismisses_the_toast_here() {
+        use status::{Kind, Toast};
+        let mut a = app();
+        let t0 = (text::now() * 1000.0) as i64;
+        let toast = |seq: u64| Toast { seq, at_ms: t0, kind: Kind::Ok, ttl: 60.0, client: String::new(), text: "parked x".into() };
+        a.bar.toast = Some(toast(3));
+        let frame = |a: &App| layout(&a.view, 34, 30, &Opts { bar: a.shown_bar(), now: Some(text::now()), ..Opts::default() });
+        a.shown = frame(&a);
+        assert_eq!(a.shown.toast, 0..1);
+        let due = a.toast_due(Instant::now()).expect("a wakeup");
+        let left = due.saturating_duration_since(Instant::now());
+        assert!(left > Duration::from_secs(55) && left <= Duration::from_secs(61), "{left:?}");
+        a.handle(b"\x1b[<0;5;1M\x1b[<0;5;1m");
+        assert_eq!((a.focus_backs, a.last_act.clone(), a.dismissed), (1, Some(Target::Toast((3, t0))), Some((3, t0))));
+        a.shown = frame(&a);
+        assert!(a.shown.toast.is_empty() && a.shown_bar().toast.is_none() && a.toast_due(Instant::now()).is_none());
+        assert!(a.bar.toast.is_some(), "only the drawing forgets it");
+        // A newer one: shown at once.
+        a.bar.toast = Some(toast(4));
+        a.shown = frame(&a);
+        assert_eq!((a.shown.toast.clone(), a.shown_bar().toast.map(|t| t.seq)), (0..1, Some(4)));
+        // Two racing posts that took the same seq: dismissing one never
+        // hides the other.
+        a.dismissed = Some((4, t0));
+        a.bar.toast = Some(Toast { at_ms: t0 + 3, ..toast(4) });
+        a.shown = frame(&a);
+        assert_eq!(a.shown.toast, 0..1);
+        // Expired: the wakeup is now (to draw it away), then none.
+        a.bar.toast = Some(Toast { at_ms: t0 - 61_000, ..toast(5) });
+        a.shown.toast_until = Some(((text::now() - 1.0) * 1000.0) as i64);
+        let now = Instant::now();
+        assert!(a.toast_due(now).unwrap() <= now + Duration::from_millis(5));
+        a.shown = frame(&a);
+        assert_eq!((a.shown.toast.clone(), a.toast_due(now)), (0..0, None));
     }
 
     #[test]

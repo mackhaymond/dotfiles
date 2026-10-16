@@ -22,6 +22,22 @@
 //! - a cheap check on each refresh of a live sidebar ([`needs_repair`]: its
 //!   own pid missing, a dead pid listed, or a count that disagrees), and
 //! - `agent-ui sidebar --repair` (one read, one write) for a hook to call.
+//!
+//! `@sidebar_clients` rides beside `@sidebar_pids` in the same writes, word
+//! for word: the client each open sidebar sits beside (`-` until it has
+//! one). A sidebar whose client resolves or changes re-registers on its
+//! next refresh ([`needs_repair`]). notify.sh reads it to choose between a
+//! toast and tmux's own `display-message`.
+//!
+//! ## Toasts (`@toast`)
+//!
+//! scripts/notify.sh posts a message as a toast instead of tmux's
+//! `display-message` (which, with the status line off, would draw on the
+//! client's bottom line and bring the line back) whenever a sidebar is open
+//! for its client: it writes `@toast_seq` and `@toast` ([`Toast`]) in one
+//! tmux call and posts the focus notice. The sidebar reads `@toast` in the
+//! same per-tick snapshot as everything here; [`Bar::toast`] keeps it only
+//! for this sidebar's client (or every sidebar's).
 
 use super::layout::Ink;
 use super::term;
@@ -240,6 +256,101 @@ pub struct Bar {
     /// v, left by ⏎ / H / m / a / esc / q / C-c / space) or while any window
     /// still carries `@stash_sel` (sel_clear's "never leak a tint" rule).
     pub selecting: Option<usize>,
+    /// notify.sh's latest toast, when it is for this sidebar's client (or
+    /// for every sidebar). Expiry is the layout's business (its clock).
+    pub toast: Option<Toast>,
+}
+
+// ---------------------------------------------------------------- toasts
+
+/// A toast's kind (`notify.sh -k`): its glyph and colour in the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Info,
+    Ok,
+    Warn,
+    Error,
+}
+
+impl Kind {
+    /// `ok` / `warn` / `error`; anything else is info.
+    pub fn parse(s: &str) -> Kind {
+        match s.trim() {
+            "ok" => Kind::Ok,
+            "warn" => Kind::Warn,
+            "error" => Kind::Error,
+            _ => Kind::Info,
+        }
+    }
+}
+
+/// A toast's identity: (seq, epoch ms) ([`Toast::id`]).
+pub type ToastId = (u64, i64);
+
+/// The option notify.sh writes a toast to, and the counter beside it.
+pub const TOAST: &str = "@toast";
+pub const TOAST_SEQ: &str = "@toast_seq";
+
+/// One toast from notify.sh, as `@toast` holds it (a GLOBAL option, read in
+/// the per-tick snapshot): `seq TAB epoch_ms TAB kind TAB ttl_s TAB client
+/// TAB text`. Only the latest toast exists: a newer one replaces it at once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Toast {
+    /// `@toast_seq` when it was posted.
+    pub seq: u64,
+    /// When it was posted (epoch milliseconds).
+    pub at_ms: i64,
+    pub kind: Kind,
+    /// How long it shows (seconds).
+    pub ttl: f64,
+    /// The client it is for ("" = every sidebar).
+    pub client: String,
+    /// One line, controls made spaces, never empty.
+    pub text: String,
+}
+
+impl Toast {
+    /// `@toast` → the toast; None when unset, malformed or empty.
+    pub fn parse(raw: &str) -> Option<Toast> {
+        let f: Vec<&str> = raw.trim_end_matches('\n').splitn(6, '\t').collect();
+        let [seq, at, kind, ttl, client, text] = f[..] else { return None };
+        let text = sanitize(text).split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            return None;
+        }
+        let ttl = ttl.trim().parse::<f64>().ok().filter(|t| t.is_finite() && *t > 0.0).unwrap_or(4.0).min(3600.0);
+        Some(Toast {
+            seq: seq.trim().parse().ok()?,
+            at_ms: at.trim().parse().ok()?,
+            kind: Kind::parse(kind),
+            ttl,
+            client: client.trim().to_string(),
+            text,
+        })
+    }
+
+    /// Which toast this is, for a dismissal: notify.sh reads `@toast_seq`
+    /// and writes it +1 in two calls, so two racing posts can share a seq;
+    /// with the posting time they do not.
+    pub fn id(&self) -> ToastId {
+        (self.seq, self.at_ms)
+    }
+
+    /// When it stops showing (epoch seconds).
+    pub fn until(&self) -> f64 {
+        self.at_ms as f64 / 1000.0 + self.ttl
+    }
+
+    /// Showing at `now` (epoch seconds).
+    pub fn live(&self, now: f64) -> bool {
+        now < self.until()
+    }
+
+    /// For the sidebar beside `client`: for every sidebar, or for that one.
+    /// A sidebar with no client yet shows only the former.
+    pub fn for_client(&self, client: Option<&str>) -> bool {
+        self.client.is_empty() || Some(self.client.as_str()) == client
+    }
 }
 
 /// A shell's label, as spaces.conf's `@space_shell_label`: a shell process
@@ -279,6 +390,7 @@ impl Bar {
                 "refused" => Some("save refused".into()),
                 v => Some(format!("last save {} ago", sanitize(v))),
             };
+            bar.toast = Toast::parse(&st.toast).filter(|t| t.for_client(client));
         }
         let mut flagged: Vec<&str> = snap.windows.iter().filter(|w| w.stash_sel).map(|w| w.id.as_str()).collect();
         flagged.sort_unstable();
@@ -469,44 +581,82 @@ pub fn parse_pids(raw: &str) -> Vec<i32> {
     raw.split_whitespace().filter_map(|p| p.parse::<i32>().ok()).filter(|&p| p > 0).collect()
 }
 
+/// The open sidebars' clients, word for word beside [`PIDS`] (word i is pid
+/// i's client; [`NO_CLIENT`] while it has none): notify.sh reads it to know
+/// whether a client has a sidebar to toast in.
+pub const CLIENTS: &str = "@sidebar_clients";
+/// The [`CLIENTS`] word of a sidebar whose client is not known (yet).
+pub const NO_CLIENT: &str = "-";
+
+/// One open sidebar: its pid and its client's word in [`CLIENTS`].
+pub type Entry = (i32, String);
+
+/// A client as its [`CLIENTS`] word: the name, or [`NO_CLIENT`] for none
+/// (or one no word could hold).
+pub fn client_word(client: Option<&str>) -> String {
+    match client.map(str::trim) {
+        Some(c) if !c.is_empty() && !c.contains(char::is_whitespace) => c.to_string(),
+        _ => NO_CLIENT.into(),
+    }
+}
+
+/// `@sidebar_pids` and `@sidebar_clients` → the entries (junk pids dropped,
+/// a missing client word read as [`NO_CLIENT`]).
+pub fn parse_entries(pids: &str, clients: &str) -> Vec<Entry> {
+    let words: Vec<&str> = clients.split_whitespace().collect();
+    pids.split_whitespace()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let pid = p.parse::<i32>().ok().filter(|&p| p > 0)?;
+            Some((pid, words.get(i).copied().unwrap_or(NO_CLIENT).to_string()))
+        })
+        .collect()
+}
+
 /// The list after a change: `prev` without dead pids (`live`) and without
-/// `remove`, plus `add`; each pid once, in order.
-pub fn next_pids(prev: &[i32], live: &dyn Fn(i32) -> bool, add: Option<i32>, remove: Option<i32>) -> Vec<i32> {
-    let mut out: Vec<i32> = Vec::new();
-    for &p in prev.iter().chain(add.iter()) {
-        if Some(p) != remove && !out.contains(&p) && (Some(p) == add || live(p)) {
-            out.push(p);
+/// `remove`, plus `add` (whose client replaces any listed for its pid);
+/// each pid once, in order.
+pub fn next_entries(prev: &[Entry], live: &dyn Fn(i32) -> bool, add: Option<&Entry>, remove: Option<i32>) -> Vec<Entry> {
+    let mut out: Vec<Entry> = Vec::new();
+    for e in prev.iter().chain(add) {
+        let mine = add.filter(|a| a.0 == e.0);
+        if Some(e.0) != remove && !out.iter().any(|o| o.0 == e.0) && (mine.is_some() || live(e.0)) {
+            out.push(mine.unwrap_or(e).clone());
         }
     }
     out
 }
 
-/// The ONE tmux command line storing `pids`: the list, the count, and the
-/// status line (hidden while any sidebar is open, back once none is).
-pub fn write_command(pids: &[i32]) -> Vec<String> {
-    let list = pids.iter().map(i32::to_string).collect::<Vec<_>>().join(" ");
+/// The ONE tmux command line storing `entries`: the pids, their clients,
+/// the count, and the status line (hidden while any sidebar is open, back
+/// once none is).
+pub fn write_command(entries: &[Entry]) -> Vec<String> {
+    let pids = entries.iter().map(|e| e.0.to_string()).collect::<Vec<_>>().join(" ");
+    let clients = entries.iter().map(|e| e.1.as_str()).collect::<Vec<_>>().join(" ");
     let mut a: Vec<String> = Vec::new();
-    if pids.is_empty() {
-        a.extend(["set-option", "-gqu", PIDS].map(String::from));
+    if entries.is_empty() {
+        a.extend(["set-option", "-gqu", PIDS, ";", "set-option", "-gqu", CLIENTS].map(String::from));
     } else {
-        a.extend(["set-option", "-gq", PIDS, &list].map(String::from));
+        a.extend(["set-option", "-gq", PIDS, &pids, ";", "set-option", "-gq", CLIENTS, &clients].map(String::from));
     }
     a.push(";".into());
-    a.extend(["set-option", "-gq", OPEN, &pids.len().to_string()].map(String::from));
+    a.extend(["set-option", "-gq", OPEN, &entries.len().to_string()].map(String::from));
     a.push(";".into());
-    a.extend(["set-option", "-gq", "status", if pids.is_empty() { "on" } else { "off" }].map(String::from));
+    a.extend(["set-option", "-gq", "status", if entries.is_empty() { "on" } else { "off" }].map(String::from));
     a
 }
 
 /// Whether a live sidebar's snapshot shows the registry out of step: its own
-/// pid missing (a repair elsewhere, a restarted server), a listed pid that
-/// is dead, a count that is not the list's length, or the status line shown
-/// (a config reload's `set -g status on`) while this sidebar is open.
-pub fn needs_repair(st: &crate::tmux::Status, me: i32, live: &dyn Fn(i32) -> bool) -> bool {
-    let pids = parse_pids(&st.sidebar_pids);
-    !pids.contains(&me)
-        || pids.iter().any(|&p| p != me && !live(p))
-        || st.sidebar_open.trim() != pids.len().to_string()
+/// pid missing (a repair elsewhere, a restarted server) or listed with
+/// another client than `client` (its [`client_word`]: resolved since it
+/// opened, or moved), a listed pid that is dead, a count that is not the
+/// list's length, or the status line shown (a config reload's `set -g
+/// status on`) while this sidebar is open.
+pub fn needs_repair(st: &crate::tmux::Status, me: i32, client: &str, live: &dyn Fn(i32) -> bool) -> bool {
+    let entries = parse_entries(&st.sidebar_pids, &st.sidebar_clients);
+    entries.iter().find(|e| e.0 == me).is_none_or(|e| e.1 != client)
+        || entries.iter().any(|e| e.0 != me && !live(e.0))
+        || st.sidebar_open.trim() != entries.len().to_string()
         || st.status_line.trim() != "off"
 }
 
@@ -570,20 +720,23 @@ impl Registry {
         Registry { tmux: tmux.clone(), lock }
     }
 
-    /// The list as tmux holds it; None when tmux could not be asked.
-    fn read(&self) -> Option<Vec<i32>> {
-        let o = self.tmux.run(&["show-options", "-gqv", PIDS]).ok().filter(|o| o.ok())?;
-        Some(parse_pids(&o.stdout))
+    /// The list as tmux holds it, both options in one call; None when tmux
+    /// could not be asked.
+    fn read(&self) -> Option<Vec<Entry>> {
+        let fmt = format!("#{{{PIDS}}}\x1f#{{{CLIENTS}}}");
+        let o = self.tmux.run(&["display-message", "-p", &fmt]).ok().filter(|o| o.ok())?;
+        let (pids, clients) = o.stdout.trim_end_matches('\n').split_once('\x1f').unwrap_or((o.stdout.as_str(), ""));
+        Some(parse_entries(pids, clients))
     }
 
     /// Read, change and write under the lock → the new count (None: tmux
     /// failed, nothing written).
-    fn update(&self, add: Option<i32>, remove: Option<i32>, force: bool) -> Option<usize> {
+    fn update(&self, add: Option<Entry>, remove: Option<i32>, force: bool) -> Option<usize> {
         // Only a start creates the lock file; a leaving or repairing one
         // whose server (and file) is gone runs unlocked.
         let _guard = FileLock::take(&self.lock, add.is_some());
         let prev = self.read()?;
-        let next = next_pids(&prev, &is_sidebar, add, remove);
+        let next = next_entries(&prev, &is_sidebar, add.as_ref(), remove);
         if !force && next.is_empty() && prev.is_empty() {
             // Nothing open and nothing to repair: leave the status line
             // alone (off for another reason stays off), make the count agree.
@@ -595,9 +748,10 @@ impl Registry {
         Some(next.len())
     }
 
-    /// A sidebar starts: listed (dead ones dropped), the status line hidden.
-    pub fn open(&self, me: i32) -> Option<usize> {
-        self.update(Some(me), None, true)
+    /// A sidebar starts (or re-registers, its client resolved or changed):
+    /// listed with its client (dead ones dropped), the status line hidden.
+    pub fn open(&self, me: i32, client: Option<&str>) -> Option<usize> {
+        self.update(Some((me, client_word(client))), None, true)
     }
 
     /// A sidebar leaves: unlisted; the status line back once none is open.
@@ -984,33 +1138,91 @@ mod tests {
         assert_eq!(shells.len(), 2);
     }
 
+    /// `@toast` as notify.sh writes it; junk is no toast.
+    #[test]
+    fn toasts_parse() {
+        let t = Toast::parse("12\t1792000000250\tok\t4\t/dev/ttys001\tparked  Canvas\tSyllabus\n").unwrap();
+        assert_eq!(t, Toast { seq: 12, at_ms: 1_792_000_000_250, kind: Kind::Ok, ttl: 4.0, client: "/dev/ttys001".into(),
+            text: "parked Canvas Syllabus".into() });
+        assert_eq!(t.id(), (12, 1_792_000_000_250));
+        assert_eq!((t.until(), t.live(1_792_000_004.0), t.live(1_792_000_004.25)), (1_792_000_004.25, true, false));
+        assert!(t.for_client(Some("/dev/ttys001")) && !t.for_client(Some("/dev/ttys002")) && !t.for_client(None));
+        let all = Toast::parse("3\t1000\twarn\t1.5\t\tx\u{1b}[31m").unwrap();
+        assert_eq!((all.kind, all.ttl, all.client.as_str(), all.text.as_str()), (Kind::Warn, 1.5, "", "x [31m"));
+        assert!(all.for_client(None) && all.for_client(Some("/dev/ttys001")));
+        // Kinds: anything unknown is info; a junk ttl is the default, a huge one capped.
+        assert_eq!([Kind::parse("error"), Kind::parse("info"), Kind::parse("nope")], [Kind::Error, Kind::Info, Kind::Info]);
+        assert_eq!(Toast::parse("1\t0\tok\tjunk\t\tx").unwrap().ttl, 4.0);
+        assert_eq!(Toast::parse("1\t0\tok\t-3\t\tx").unwrap().ttl, 4.0);
+        assert_eq!(Toast::parse("1\t0\tok\t99999\t\tx").unwrap().ttl, 3600.0);
+        for junk in ["", "1\t0\tok\t4\t", "1\t0\tok\t4\t\t  ", "x\t0\tok\t4\t\thi", "1\tnow\tok\t4\t\thi", "1\t0\tok\t4"] {
+            assert_eq!(Toast::parse(junk), None, "{junk:?}");
+        }
+    }
+
+    /// The snapshot's toast reaches the bar only for this sidebar's client,
+    /// or for every sidebar.
+    #[test]
+    fn the_bar_takes_only_its_clients_toast() {
+        let with = |raw: &str| {
+            let mut st = vec![""; crate::tmux::STATUS_FORMATS.len()];
+            st[29] = raw;
+            Snapshot::parse(&[row("main", 1, "@2", &[]), client("main", "@2", &st)].join("\n"))
+        };
+        let mine = with("5\t1000\tok\t4\t/dev/ttys999\thi");
+        assert_eq!(Bar::build(&mine, Some("/dev/ttys999")).toast.map(|t| t.seq), Some(5));
+        assert_eq!(Bar::build(&mine, Some("/dev/ttys001")).toast, None);
+        assert_eq!(Bar::build(&mine, None).toast, None);
+        let every = with("6\t1000\terror\t8\t\thi");
+        for c in [Some("/dev/ttys999"), Some("/dev/ttys001"), None] {
+            assert_eq!(Bar::build(&every, c).toast.map(|t| (t.seq, t.kind)), Some((6, Kind::Error)), "{c:?}");
+        }
+        assert_eq!(Bar::build(&with(""), Some("/dev/ttys999")).toast, None);
+    }
+
     #[test]
     fn registry_math() {
         let live = |p: i32| p != 13;
+        let e = |p: i32, c: &str| (p, c.to_string());
         assert_eq!(parse_pids(" 12 x 13  -4 0 99 "), [12, 13, 99]);
-        // Start: dead ones dropped, me added once.
-        assert_eq!(next_pids(&[12, 13, 99], &live, Some(50), None), [12, 99, 50]);
-        assert_eq!(next_pids(&[50, 50], &live, Some(50), None), [50]);
+        // The clients ride word for word beside the pids (junk keeps its
+        // place; a missing word is no client).
+        assert_eq!(parse_entries(" 12 x 13 ", "/dev/a /dev/x"), [e(12, "/dev/a"), e(13, "-")]);
+        assert_eq!(parse_entries("12 13", "/dev/a - /dev/c"), [e(12, "/dev/a"), e(13, "-")]);
+        assert_eq!((client_word(Some(" /dev/a ")), client_word(None), client_word(Some("")), client_word(Some("a b"))),
+            ("/dev/a".into(), "-".into(), "-".into(), "-".into()));
+        // Start: dead ones dropped, me added once, with my client.
+        let prev = [e(12, "/dev/a"), e(13, "/dev/b"), e(99, "-")];
+        assert_eq!(next_entries(&prev, &live, Some(&e(50, "/dev/c")), None), [e(12, "/dev/a"), e(99, "-"), e(50, "/dev/c")]);
+        assert_eq!(next_entries(&[e(50, "-"), e(50, "-")], &live, Some(&e(50, "/dev/c")), None), [e(50, "/dev/c")]);
+        // Re-registering (the client resolved): same place, new client.
+        assert_eq!(next_entries(&[e(50, "-"), e(12, "/dev/a")], &live, Some(&e(50, "/dev/c")), None),
+            [e(50, "/dev/c"), e(12, "/dev/a")]);
         // Exit: me removed, dead ones dropped.
-        assert_eq!(next_pids(&[12, 13, 50], &live, None, Some(50)), [12]);
-        assert_eq!(next_pids(&[13], &live, None, None), Vec::<i32>::new());
-        assert_eq!(write_command(&[12, 50]), ["set-option", "-gq", "@sidebar_pids", "12 50", ";", "set-option", "-gq",
+        assert_eq!(next_entries(&[e(12, "/dev/a"), e(13, "-"), e(50, "/dev/c")], &live, None, Some(50)), [e(12, "/dev/a")]);
+        assert_eq!(next_entries(&[e(13, "-")], &live, None, None), Vec::<Entry>::new());
+        assert_eq!(write_command(&[e(12, "/dev/a"), e(50, "-")]), ["set-option", "-gq", "@sidebar_pids", "12 50", ";",
+            "set-option", "-gq", "@sidebar_clients", "/dev/a -", ";", "set-option", "-gq",
             "@sidebar_open", "2", ";", "set-option", "-gq", "status", "off"]);
-        assert_eq!(write_command(&[]), ["set-option", "-gqu", "@sidebar_pids", ";", "set-option", "-gq", "@sidebar_open",
-            "0", ";", "set-option", "-gq", "status", "on"]);
+        assert_eq!(write_command(&[]), ["set-option", "-gqu", "@sidebar_pids", ";", "set-option", "-gqu", "@sidebar_clients", ";",
+            "set-option", "-gq", "@sidebar_open", "0", ";", "set-option", "-gq", "status", "on"]);
         // The cheap check.
-        let st = |pids: &str, open: &str| crate::tmux::Status {
+        let st = |pids: &str, clients: &str, open: &str| crate::tmux::Status {
             sidebar_pids: pids.into(),
+            sidebar_clients: clients.into(),
             sidebar_open: open.into(),
             status_line: "off".into(),
             ..Default::default()
         };
-        assert!(!needs_repair(&st("12 50", "2"), 50, &live));
-        assert!(needs_repair(&st("12", "1"), 50, &live)); // me missing (server restarted, say)
-        assert!(needs_repair(&st("13 50", "2"), 50, &live)); // a crashed one
-        assert!(needs_repair(&st("50", "3"), 50, &live)); // the count disagrees
-        let shown = crate::tmux::Status { status_line: "on".into(), ..st("50", "1") };
-        assert!(needs_repair(&shown, 50, &live)); // a config reload showed the line again
+        assert!(!needs_repair(&st("12 50", "/dev/a /dev/c", "2"), 50, "/dev/c", &live));
+        assert!(needs_repair(&st("12", "/dev/a", "1"), 50, "/dev/c", &live)); // me missing (server restarted, say)
+        assert!(needs_repair(&st("12 50", "/dev/a -", "2"), 50, "/dev/c", &live)); // my client resolved since
+        assert!(needs_repair(&st("12 50", "/dev/a", "2"), 50, "/dev/c", &live)); // the clients cut short
+        assert!(!needs_repair(&st("12 50", "/dev/a", "2"), 50, "-", &live)); // ...but none to tell
+        assert!(needs_repair(&st("13 50", "- /dev/c", "2"), 50, "/dev/c", &live)); // a crashed one
+        assert!(needs_repair(&st("50", "/dev/c", "3"), 50, "/dev/c", &live)); // the count disagrees
+        let shown = crate::tmux::Status { status_line: "on".into(), ..st("50", "/dev/c", "1") };
+        assert!(needs_repair(&shown, 50, "/dev/c", &live)); // a config reload showed the line again
         // This test process is alive but not agent-ui.
         assert!(term::alive(std::process::id() as i32));
     }

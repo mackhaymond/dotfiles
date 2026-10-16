@@ -35,6 +35,25 @@
 //! Without a [`Bar`] (no client space, no usage, nothing selected) the top
 //! is the classic ` agents` / ` space` title with the counts.
 //!
+//! ## Toasts: in the card's bottom border, so nothing moves
+//!
+//! notify.sh's messages (`@toast`, [`Toast`]) are drawn where the tmux
+//! status line would have shown them, without bringing it back: in the
+//! card's BOTTOM border, the way the key-table marks sit in its top one
+//! ([`Frame::card_footer`]), glyph and colour by kind:
+//!
+//! ```text
+//! ╰─ ✓ parked Canvas Syllabus ───────╯   ok ✓ green, info • blue,
+//!                                        warn ! peach, error ✕ red
+//! ```
+//!
+//! Clipped with `…`, the corner kept. A text that would lose more than a
+//! few cells also shows whole, wrapped into up to 2 rows inside the card
+//! just above the border (the one case that moves rows). No card (a short
+//! frame, nothing in it): a tinted row of its own at the very top. A click
+//! on it dismisses it in this sidebar ([`Target::Toast`]); it expires at
+//! its deadline ([`Frame::toast_until`]) by the frame's clock.
+//!
 //! ## Density ladder: agents lose detail last; never scroll, never drop an agent silently
 //!
 //! The agents section is the body. A frame takes the first step at which
@@ -100,7 +119,7 @@
 //! canvas, [`Ink::Mix`]), the stash selection (mauve, mixed), and the solid
 //! chips (key-caps, the key-table marks, pills).
 
-use super::status::{ink_on, tmux_colour, Bar, Shell, Usage};
+use super::status::{ink_on, tmux_colour, Bar, Kind, Shell, Toast, ToastId, Usage};
 use crate::actions::watcher_problem;
 use crate::model::{Cat, Counts, Flag};
 use crate::palette;
@@ -239,6 +258,8 @@ pub enum Target {
     /// The scope word (or the classic title): flip the scope (space / all) and
     /// persist it in `@strip_scope` (Strip.toggle_scope).
     Scope,
+    /// A toast ([`Toast::id`]): dismissed, in this sidebar only.
+    Toast(ToastId),
 }
 
 /// One screen line.
@@ -314,6 +335,15 @@ pub struct Frame {
     /// What [`paint`] writes into the card's top border from its third
     /// cell: the key-table marks ([`marks`]).
     pub card_title: Vec<Seg>,
+    /// What [`paint`] writes into the card's BOTTOM border from its third
+    /// cell: a toast ([`toast_footer`]).
+    pub card_footer: Vec<Seg>,
+    /// The rows a toast is drawn on: the card's bottom border (and the rows
+    /// a long one wraps into above it), or its own row at the top.
+    pub toast: Range<usize>,
+    /// When the toast on screen expires (epoch milliseconds, rounded up):
+    /// the sidebar wakes then to draw the frame without it.
+    pub toast_until: Option<i64>,
     /// The rows of each section, header included (empty: not drawn).
     pub needs: Range<usize>,
     pub agents: Range<usize>,
@@ -696,14 +726,136 @@ fn inset(row: Row, w: usize) -> Row {
     Row { segs: fit(w, segs, vec![], None), targets, ..row }
 }
 
-/// The top of the frame → (rows, the content rows, the card's rows, the
-/// card's border title). With a [`Bar`]: the card. Its border needs 16
+// ---------------------------------------------------------------- toasts
+
+/// A toast's glyph and colour: ok `✓` green, info `•` blue, warn `!`
+/// peach, error `✕` red.
+fn toast_look(k: Kind) -> (&'static str, Hue) {
+    match k {
+        Kind::Ok => ("✓", "green"),
+        Kind::Info => ("•", "blue"),
+        Kind::Warn => ("!", "peach"),
+        Kind::Error => ("✕", "red"),
+    }
+}
+
+/// How many cells a toast's text may lose to the border's `…` before it
+/// also gets rows of its own ([`toast_rows`]).
+const TOAST_SLACK: usize = 4;
+
+/// The toast in the bottom border of a card `w` wide: ` ✓ text ` from its
+/// third cell (the glyph bold in the kind's colour, the text in `text`),
+/// clipped with `…` so a rule cell and the corner stay: `╰─ ✓ parked Canvas
+/// Syllabus ─────╯` → (segs, the text lost more than [`TOAST_SLACK`] cells).
+fn toast_footer(t: &Toast, w: usize) -> (Vec<Seg>, bool) {
+    let (glyph, hue) = toast_look(t.kind);
+    let room = w.saturating_sub(5 + 4);
+    let segs = vec![seg(" ", "text"), bold(glyph, hue), seg(" ", "text"), seg(clip(&t.text, room), "text"), seg(" ", "text")];
+    (clip_segs(segs, w.saturating_sub(5)), dwidth(&t.text) > room + TOAST_SLACK)
+}
+
+/// `text` in lines of at most `width` cells, broken at spaces (a word
+/// longer than a line is cut); at most `max` lines, the last ending in `…`
+/// when text is left over.
+fn wrap(text: &str, width: usize, max: usize) -> Vec<String> {
+    let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    while i < words.len() {
+        if lines.len() + 1 >= max.max(1) {
+            // The last line: everything left, cut.
+            let rest = words[i..].join(" ");
+            lines.push(clip(&if cur.is_empty() { rest } else { format!("{cur} {rest}") }, width));
+            return lines;
+        }
+        let next = if cur.is_empty() { words[i].to_string() } else { format!("{cur} {}", words[i]) };
+        if dwidth(&next) <= width {
+            cur = next;
+            i += 1;
+        } else if cur.is_empty() {
+            lines.push(clip(words[i], width));
+            i += 1;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// A long toast's whole text inside the card, just above its bottom border
+/// (rows `w` wide, for [`inset`]): the glyph, then the text wrapped into at
+/// most 2 rows. Each row dismisses it.
+fn toast_rows(t: &Toast, w: usize) -> Vec<Row> {
+    let (glyph, hue) = toast_look(t.kind);
+    wrap(&t.text, w.saturating_sub(4), 2)
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let mut left = if i == 0 { vec![seg(" ", "text"), bold(glyph, hue), seg(" ", "text")] } else { vec![seg("   ", "text")] };
+            left.push(seg(l, "text"));
+            Row::new(fit(w, left, vec![], None)).click(w, Target::Toast(t.id()))
+        })
+        .collect()
+}
+
+/// A toast on a row of its own, when there is no card to carry it: the
+/// glyph and the text on the kind's colour mixed over the canvas (like a
+/// NEEDS YOU card). The row dismisses it.
+fn toast_line(t: &Toast, w: usize) -> Row {
+    let (glyph, hue) = toast_look(t.kind);
+    let left = vec![seg(" ", "text"), bold(glyph, hue), seg(" ", "text"), seg(t.text.clone(), "text")];
+    Row::new(fit(w, left, vec![seg(" ", "text")], None)).bg(Some(Ink::Mix(hue, 14))).click(w, Target::Toast(t.id()))
+}
+
+/// The top of the frame ([`top_rows`]).
+struct Top {
+    rows: Vec<Row>,
+    /// The content rows.
+    status: Range<usize>,
+    /// The card's rows (empty: no card).
+    card: Range<usize>,
+    /// The card's top and bottom border texts.
+    title: Vec<Seg>,
+    footer: Vec<Seg>,
+    /// The toast's rows, and when it expires (None: none drawn).
+    toast: Range<usize>,
+    toast_until: Option<i64>,
+}
+
+/// A toast's deadline as [`Frame::toast_until`] holds it.
+fn until_ms(t: &Toast) -> i64 {
+    (t.until() * 1000.0).ceil() as i64
+}
+
+/// The top of the frame. With a [`Bar`]: the card. Its border needs 16
 /// rows and 20 columns; one meter per window 30 rows (else usage in one
 /// line, from 12; the stale save from 12 too); the selection hint 6.
 /// Without one: the classic title.
-fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> (Vec<Row>, Range<usize>, Range<usize>, Vec<Seg>) {
+///
+/// A live toast ([`Toast::live`] at `now`) sits in the card's bottom border
+/// (no row moves), plus up to 2 rows above it when its text is long; with
+/// no card, on a row of its own at the very top (from 6 rows).
+fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
+    let toast = bar.toast.as_ref().filter(|t| t.live(now));
+    let mut top = Top { rows: Vec::new(), status: 0..0, card: 0..0, title: Vec::new(), footer: Vec::new(), toast: 0..0, toast_until: None };
+    // No card to carry it: the toast on a row of its own, first.
+    let alone = |top: &mut Top| {
+        if let Some(t) = toast.filter(|_| h >= 6) {
+            top.rows.push(toast_line(t, w));
+            top.toast = 0..1;
+            top.toast_until = Some(until_ms(t));
+        }
+    };
     if !bar_shown(bar) {
-        return (vec![title_row(view, w)], 1..1, 0..0, Vec::new());
+        alone(&mut top);
+        top.rows.push(title_row(view, w));
+        let n = top.rows.len();
+        top.status = n..n;
+        return top;
     }
     let bordered = w >= 20 && h >= 16;
     let iw = if bordered { w - 2 } else { w };
@@ -721,23 +873,38 @@ fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> (Vec<R
         content.extend(stale_row(bar, iw));
     }
     // Nothing to put in a card (or no room for its border): the marks on a
-    // row of their own, first.
+    // row of their own, first (after a toast).
     let marks_row = |w: usize| Row::new(fit(w, [vec![seg(" ", "text")], marks.clone()].concat(), vec![], None));
     if content.is_empty() || !bordered {
-        let mut rows = Vec::new();
+        alone(&mut top);
         if !marks.is_empty() {
-            rows.push(marks_row(w));
+            top.rows.push(marks_row(w));
         }
-        rows.extend(content);
-        let n = rows.len();
-        return (rows, 0..n, 0..0, Vec::new());
+        top.rows.extend(content);
+        top.status = 0..top.rows.len();
+        return top;
     }
-    let mut rows = vec![Row::blank(w)];
-    rows.extend(content.into_iter().map(|r| inset(r, w)));
-    rows.push(Row::blank(w));
-    let n = rows.len();
+    top.rows.push(Row::blank(w));
+    top.rows.extend(content.into_iter().map(|r| inset(r, w)));
+    let mut bottom = Row::blank(w);
+    if let Some(t) = toast {
+        let (footer, long) = toast_footer(t, w);
+        let at = top.rows.len();
+        if long {
+            top.rows.extend(toast_rows(t, iw).into_iter().map(|r| inset(r, w)));
+        }
+        bottom.targets.push((2, (2 + width(&footer)) as u16, Target::Toast(t.id())));
+        top.footer = footer;
+        top.toast = at..top.rows.len() + 1;
+        top.toast_until = Some(until_ms(t));
+    }
+    top.rows.push(bottom);
+    let n = top.rows.len();
+    top.status = 1..n - 1;
+    top.card = 0..n;
     // In the top border from its third cell, one corner and a rule cell left at the end.
-    (rows, 1..n - 1, 0..n, clip_segs(marks, w.saturating_sub(5)))
+    top.title = clip_segs(marks, w.saturating_sub(5));
+    top
 }
 
 // ---------------------------------------------------------------- shells
@@ -1501,13 +1668,18 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
     let bar = &opts.bar;
     let cx = Cx { w, b: Badge::of(view, bar), now: opts.now.unwrap_or(view.now), spin: opts.spin };
     let last = last_row(view, w, opts.msg.as_deref());
-    let (top, status, card, card_title) = top_rows(view, bar, w, h, cx.now);
+    let Top { rows: top, status, card, title: card_title, footer: card_footer, toast, toast_until } = top_rows(view, bar, w, h, cx.now);
     // The rows between the top and the last row.
     let avail = h.saturating_sub(top.len() + 1);
     if avail == 0 {
         // No room for sections: one row still counts every agent of the
         // scope, then the parked row.
         let all: Vec<&Agent> = groups(view).into_iter().flat_map(|s| s.agents.iter()).collect();
+        if toast.start == 0 && !toast.is_empty() {
+            // The first row is the toast's own.
+            frame.toast = 0..1;
+            frame.toast_until = toast_until;
+        }
         let mut rows = vec![top.into_iter().next().unwrap_or_else(|| Row::blank(w))];
         rows.push(if all.is_empty() { Row::blank(w) } else { more_row(w, &all, 0) });
         rows.push(last);
@@ -1554,6 +1726,9 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
     frame.status = status;
     frame.card = card;
     frame.card_title = card_title;
+    frame.card_footer = card_footer;
+    frame.toast = toast;
+    frame.toast_until = toast_until;
     // (No gap above NEEDS YOU when nothing is on top.)
     if gaps && !rows.is_empty() {
         rows.push(Row::blank(w));
@@ -1611,6 +1786,7 @@ pub fn paint(frame: &Frame, buf: &mut Buffer) {
             .border_style(Style::default().fg(palette::color("surface1")))
             .render(rect, buf);
         put(buf, 2, area.y + card.start as u16, &frame.card_title, Color::Reset);
+        put(buf, 2, area.y + card.end as u16 - 1, &frame.card_footer, Color::Reset);
     }
 }
 

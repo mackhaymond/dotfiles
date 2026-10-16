@@ -418,6 +418,121 @@ fn key_table_marks_clear_without_a_notice() {
     assert_eq!(s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_dead}"]).trim(), "0");
 }
 
+/// scripts/notify.sh end to end, pointed at this server (`NOTIFY_TMUX`), its
+/// notice under this test's name and its log in a scratch dir → its status.
+fn notify(s: &Server, focus: &str, log: &std::path::Path, args: &[&str]) -> std::process::ExitStatus {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/executable_notify.sh");
+    let o = Command::new("/bin/zsh")
+        .arg("-f")
+        .arg(script)
+        .args(args)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env("NOTIFY_TMUX", format!("tmux -L {} -f /dev/null", s.name))
+        .env("AGENT_FOCUS_NOTICE", focus)
+        .env("NOTIFY_LOG", log)
+        .output()
+        .expect("run notify.sh");
+    assert!(o.stdout.is_empty() && o.stderr.is_empty(), "{o:?}");
+    o.status
+}
+
+/// notify.sh with a sidebar open for the client: a toast in the card's
+/// bottom border within moments (the status line stays off and tmux shows
+/// no message), gone at its deadline with no notice; a click dismisses
+/// one. A client with no sidebar gets tmux's own display-message, and so
+/// does every client once the sidebar has gone.
+#[test]
+fn notify_toasts_in_the_sidebar_and_falls_back_without_one() {
+    let s = Server::start("toast", 34, 40);
+    s.fixture();
+    s.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
+    s.tmux(&["set-option", "-g", "@codex_session_text", "21%"]); // usage: the card
+    let tty = s.nested_client("work", "main:8");
+    let dir = std::env::temp_dir().join(format!("agentui-toast-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("log");
+    let (state, focus) = notice_names("toast");
+    let cmd = format!("env AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
+    s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
+    let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
+    let opt = |o: &str| s.tmux(&["show-options", "-gqv", o]).trim().to_string();
+    wait_for("the first frame", || screen().contains("NEEDS YOU") && screen().contains('╰'));
+    // The registry says which client has a sidebar.
+    assert_eq!((opt("@sidebar_clients"), opt("status")), (tty.clone(), "off".into()));
+    // tmux's message log (commands are logged too): a display-message shows
+    // up as `<client> message: <text>`.
+    let said = |c: &str, text: &str| {
+        s.tmux(&["show-messages"]).lines().any(|l| l.contains(&format!("{c} message: ")) && l.ends_with(text))
+    };
+    // A toast for this client.
+    let t = Instant::now();
+    assert!(notify(&s, &focus, &log, &["-c", &tty, "-k", "ok", "-t", "2", "--", "parked", "Canvas\tSyllabus"]).success());
+    wait_for("the toast", || screen().contains("╰─ ✓ parked Canvas Syllabus ─"));
+    assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
+    let raw = opt("@toast");
+    let f: Vec<&str> = raw.split('\t').collect();
+    assert_eq!((f.len(), f[0], f[2], f[3], f[4], f[5]), (6, opt("@toast_seq").as_str(), "ok", "2", tty.as_str(), "parked Canvas Syllabus"));
+    assert_eq!((opt("status"), said(&tty, "Syllabus")), ("off".into(), false), "no status line, no tmux message");
+    // Gone at its deadline: no notice, the sidebar's own wakeup.
+    wait_for("the toast to expire", || !screen().contains("parked Canvas"));
+    let gone = t.elapsed();
+    assert!(gone >= Duration::from_millis(1900) && gone < Duration::from_millis(3500), "{gone:?}");
+    // A click on a long-lived one dismisses it (here).
+    assert!(notify(&s, &focus, &log, &["-c", &tty, "-t", "60", "click me"]).success());
+    wait_for("the second toast", || screen().contains("╰─ • click me ─"));
+    let y = screen().lines().position(|l| l.starts_with("╰─ • click me")).unwrap() + 1;
+    let click = format!("\x1b[<0;6;{y}M\x1b[<0;6;{y}m");
+    let hex: Vec<String> = click.bytes().map(|b| format!("{b:02x}")).collect();
+    let mut a = vec!["send-keys", "-t", "main:9", "-H"];
+    a.extend(hex.iter().map(String::as_str));
+    s.tmux(&a);
+    wait_for("the dismissal", || !screen().contains("click me"));
+    // No -c: the calling context's client (here the only one) → a toast too.
+    assert!(notify(&s, &focus, &log, &["-k", "warn", "no client given"]).success());
+    wait_for("the context's toast", || screen().contains("╰─ ! no client given"));
+    // A second client, with no sidebar: tmux's own message, no toast.
+    let other = s.nested_client("zeta", "main:7");
+    let seq = opt("@toast_seq");
+    assert!(notify(&s, &focus, &log, &["-c", &other, "-k", "error", "for the other one"]).success());
+    wait_for("the other client's message", || said(&other, "for the other one"));
+    assert_eq!(opt("@toast_seq"), seq);
+    // The sidebar gone: the old display-message for its client too.
+    let pid = s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_pid}"]);
+    Command::new("kill").args(["-TERM", pid.trim()]).status().unwrap();
+    wait_for("the exit", || opt("@sidebar_open") == "0");
+    assert_eq!(opt("@sidebar_clients"), "");
+    assert!(notify(&s, &focus, &log, &["-c", &tty, "back to tmux"]).success());
+    wait_for("the client's message", || said(&tty, "back to tmux"));
+    assert_eq!(opt("@toast_seq"), seq);
+    assert!(!s.tmux(&["show-messages"]).lines().any(|l| l.contains(" message: ") && (l.contains("click me") || l.contains("no client"))));
+    // A crashed sidebar (SIGKILL: nothing unlists it) stays in the registry,
+    // but notify.sh checks its pid: tmux's own message, never a lost toast.
+    s.tmux(&["new-window", "-d", "-t", "main:6", "-n", "sb2", &cmd]);
+    wait_for("the second sidebar", || opt("@sidebar_clients") == tty);
+    assert!(notify(&s, &focus, &log, &["-c", &tty, "-t", "60", "alive"]).success());
+    wait_for("its toast", || s.tmux(&["capture-pane", "-p", "-t", "main:6"]).contains("╰─ • alive"));
+    let pid = s.tmux(&["display-message", "-p", "-t", "main:6", "#{pane_pid}"]);
+    Command::new("kill").args(["-KILL", pid.trim()]).status().unwrap();
+    wait_for("the crash", || s.tmux(&["display-message", "-p", "-t", "main:6", "#{pane_dead}"]).trim() == "1");
+    assert_eq!((opt("@sidebar_clients"), opt("@sidebar_open")), (tty.clone(), "1".into()), "still listed");
+    let seq = opt("@toast_seq");
+    assert!(notify(&s, &focus, &log, &["-c", &tty, "after the crash"]).success());
+    wait_for("the crash fallback", || said(&tty, "after the crash"));
+    assert_eq!(opt("@toast_seq"), seq);
+    // Every message logged: epoch, kind, client, text.
+    let lines: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().map(String::from).collect();
+    let want = [("ok", &tty, "parked Canvas Syllabus"), ("info", &tty, "click me"), ("warn", &tty, "no client given"),
+        ("error", &other, "for the other one"), ("info", &tty, "back to tmux"), ("info", &tty, "alive"),
+        ("info", &tty, "after the crash")];
+    assert_eq!(lines.len(), want.len(), "{lines:#?}");
+    for (l, (k, c, t)) in lines.iter().zip(want) {
+        let f: Vec<&str> = l.split('\t').collect();
+        assert!(f.len() == 4 && f[0].parse::<u64>().is_ok() && (f[1], f[2], f[3]) == (k, c.as_str(), t), "{lines:#?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Test-only notice names, so nothing real wakes (and real posts do not
 /// wake the test's sidebar).
 fn notice_names(tag: &str) -> (String, String) {

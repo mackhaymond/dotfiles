@@ -947,7 +947,44 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   and `agent-ui sidebar --repair` (one read, one write; prints the count)
   does it with no sidebar open, turning the line back on, and leaves
   `status` alone when there was nothing to repair. Hook it wherever a
-  cheap check fits (e.g. `client-attached`).
+  cheap check fits (e.g. `client-attached`). `@sidebar_clients` rides in
+  the same writes, word for word beside `@sidebar_pids`: each open
+  sidebar's client (`-` until one is resolved); a sidebar whose client
+  resolves or changes re-registers on its next refresh (the same repair
+  check).
+- **Toasts** (`scripts/notify.sh`, `status::Toast`, layout.rs "Toasts"):
+  with the status line off, `tmux display-message` draws on the client's
+  bottom line, which reads as the status line coming back. Scripts say
+  things through `notify.sh [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS]
+  [--] TEXT...` instead. One tmux read (`display -p` of the client's name,
+  `@sidebar_pids`, `@sidebar_clients`, `@toast_seq` and the text expanded
+  as display-message would) decides: a LIVE sidebar (its paired pid passes
+  `kill -0`, so a SIGKILLed one still listed never swallows a message) open
+  for that client (or, with no client resolved, any live sidebar) → a
+  TOAST: one tmux write of `@toast_seq` (+1) and `@toast` =
+  `seq⇥epoch_ms⇥kind⇥ttl⇥client⇥text` (client empty = every sidebar; a
+  trailing `;` escaped so tmux keeps it, matching display-message), then
+  the focus notice (`notifyutil`, in the background). Otherwise exactly the old `display-message [-c CLIENT]
+  -- TEXT`. Every message is logged to `~/.local/state/tmux-notify/log`
+  (`epoch⇥kind⇥client⇥text`, trimmed to 500 lines past 1000). The
+  sidebar reads `@toast` in its one snapshot (a `STATUS_FORMATS` field),
+  keeps it for its client or every sidebar, and draws it in the usage
+  card's BOTTOM border, no row moving:
+
+  ```
+  ╭────────────────────────────────╮
+  │ S ━━━━━┃━━────────  21% (-4%)  │   ok ✓ green · info • blue
+  ╰─ ✓ parked Canvas Syllabus ─────╯   warn ! peach · error ✕ red
+  ```
+
+  Clipped with `…` (the corner kept); a text that loses more than 4 cells
+  also shows whole, wrapped into up to 2 rows inside the card above the
+  border. No card (a short frame, or nothing in it): a tinted row of its
+  own at the very top. It shows until `epoch + ttl` (default 4 s, error
+  8 s): the loop wakes once at the deadline to draw it away (no polling); a
+  newer one replaces it at once; a left click on it dismisses it in that
+  sidebar only, by its (seq, epoch_ms) id (the seq is read then written,
+  so two racing posts can share one; never their posting time too).
 - **Status jobs** (`status::Keeper`): with the line hidden tmux runs none of
   status-right's `#()` jobs, and two of them must keep running:
   continuum's autosave (`continuum_save.sh`) and the usage tick
@@ -967,7 +1004,12 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   registry (count, status line, crash repair by the next start, by a
   refresh and by `--repair`), the status job kept running, and that
   detaching a real nested client ends the sidebar within 1.5 s with the
-  status line back on.
+  status line back on. `notify_toasts_in_the_sidebar_and_falls_back_without_one`
+  runs notify.sh against the test server (`NOTIFY_TMUX`): the toast on
+  screen in under 1 s, gone at its ttl, dismissed by a click, and
+  `display-message` for a client without a sidebar and after the sidebar
+  closes; `tests/test_notify.py` covers the script's CLI, sanitising,
+  decision and log.
 
 ## Launch speed
 

@@ -362,7 +362,7 @@ pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
 /// instead of status-right, read in the same one call (no script runs).
-pub const STATUS_FORMATS: [&str; 29] = [
+pub const STATUS_FORMATS: [&str; 31] = [
     "#{client_key_table}", "#{@sidebar_open}", "#{@sidebar_pids}", "#{@resurrect_stale}",
     "#{@codex_session_text}", "#{@codex_session_color}", "#{@codex_weekly_text}", "#{@codex_weekly_color}",
     "#{@codex_scoped_icon}", "#{@codex_scoped_text}", "#{@codex_scoped_color}", "#{@codex_account_label}",
@@ -374,6 +374,9 @@ pub const STATUS_FORMATS: [&str; 29] = [
     "#{@codex_weekly_members}",
     "#{@codex_scoped_used}", "#{@codex_scoped_expected}", "#{@codex_scoped_delta}", "#{@codex_scoped_resets}",
     "#{@codex_scoped_members}",
+    // notify.sh's toast (`seq TAB epoch_ms TAB kind TAB ttl TAB client TAB
+    // text`) and the open sidebars' clients, beside `@sidebar_pids`.
+    "#{@toast}", "#{@sidebar_clients}",
 ];
 
 /// One usage window's numeric options (`@codex_<w>_used`, `_expected`,
@@ -424,6 +427,11 @@ pub struct Status {
     pub status_line: String,
     /// The meters' numbers: session, weekly, scoped.
     pub meters: [Meter; 3],
+    /// `@toast`: notify.sh's latest toast, raw (`status::Toast::parse`).
+    pub toast: String,
+    /// `@sidebar_clients`: the open sidebars' clients, word for word beside
+    /// `@sidebar_pids` (`-`: none resolved yet).
+    pub sidebar_clients: String,
 }
 
 impl Status {
@@ -447,6 +455,8 @@ impl Status {
                 let at = 14 + 5 * k;
                 Meter { used: f(at), expected: f(at + 1), delta: f(at + 2), resets: f(at + 3), members: f(at + 4) }
             }),
+            toast: f(29),
+            sidebar_clients: f(30),
         }
     }
 }
@@ -877,6 +887,7 @@ pub(crate) mod tests {
         assert_eq!(c.status.meters[0], Meter { used: "v14".into(), expected: "v15".into(), delta: "v16".into(),
             resets: "v17".into(), members: "v18".into() });
         assert_eq!((c.status.meters[1].used.as_str(), c.status.meters[2].members.as_str()), ("v19", "v28"));
+        assert_eq!((c.status.toast.as_str(), c.status.sidebar_clients.as_str()), ("v29", "v30"));
         // One field short or long: not a client row.
         assert!(Client::parse(&full[..full.len() - 1].join("\x1f")).is_none());
         let s = Snapshot::parse(&[
