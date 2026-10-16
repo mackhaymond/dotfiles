@@ -95,6 +95,38 @@ Debug logs for this behavior are written to
 refreshes and errors; rotated to `.1` at 1 MB; set `CHEZMOI_GUARD_DEBUG=1` in
 opencode's environment for per-tool-call trace lines).
 
+## Mack's tmux workspace: spaces, shells, agents
+
+One tmux server, seen through WezTerm with the agent sidebar on the right
+(⌘B). Mack talks in these terms, not tmux's; the `tmux-workspace` skill
+(`~/.agents/skills/tmux-workspace/SKILL.md`) has the full vocabulary table,
+read-only recipes and keys, so load it whenever they name a space, shell,
+agent, letter, parked tab or NEEDS YOU.
+
+- **Space** = a tmux session not marked `@space_hidden`, numbered ⌃N by
+  `@space_index` (main = 1); it lasts until closed (prefix Q). Hidden
+  sessions (agents, tasks, stash, scratch, btop-popup) are never spaces;
+  `stash` holds parked tabs.
+- **Shell** = a window of a space without `@agent_state`, numbered ⌥N per
+  space in window order among shells; shell 1 is the uncloseable **home**.
+  Written `<space>:<N>`: `cua-notch:2` is shell 2, not tmux window 2.
+- **Agent** = a window with `@agent_state` (idle/running/needs-input/failed/
+  done; Claude and Codex tabs, while an OpenCode tab counts as a shell). Its
+  **letter** (`@agent_key`, valid only while `@agent_state` is set) is
+  global and stable for its life: "agent D" = key d, any space (⌥W d). ⌘N
+  is the Nth agent of the current space and shifts, so name agents by
+  letter. Parked agents have no letter.
+- **Reach a peer** through the shared tmux MCP server (pane `"d"` /
+  `tmux://d/<handle>` for an agent, `"cua-notch:2"` for a shell). It is not
+  wired into OpenCode, so call it from the shell:
+  `python3 ~/.agents/skills/tmux-workspace/scripts/tmux-mcp-call.py
+  read_pane '{"pane": "d"}'` (also `list_panes`, `message_agent`). Read-only
+  `tmux list-windows -a -F …` always works. Never type into an agent's pane.
+- Don't close, kill, park, move or rename tabs or spaces you don't own.
+  User-facing messages go through `~/.config/tmux/scripts/notify.sh`, never
+  `tmux display-message`. Test tmux only on a private `-L` server
+  (`unset TMUX`, `-f /dev/null`).
+
 <!-- CODEGRAPH_START -->
 ## CodeGraph
 
