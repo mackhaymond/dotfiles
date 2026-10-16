@@ -593,9 +593,9 @@ class Spaces(Server):
     # -- close a space --------------------------------------------------------
     def test_close_prompt_counts_agents_and_shells(self):
         self.assertEqual(self.t("display", "-t", "main:", "-p", "#{E:@space_close_prompt}"),
-                         "close space main: 3 agents, 2 shells? (y/n)")
+                         "close space main: 3 agents, 2 shells?")
         self.assertEqual(self.t("display", "-t", "proj:", "-p", "#{E:@space_close_prompt}"),
-                         "close space proj: 1 agent, 1 shell? (y/n)")
+                         "close space proj: 1 agent, 1 shell?")
 
     def test_close_key_closes_through_the_closer_and_unregisters(self):
         log = os.path.join(self.tmp, "closed.log")
@@ -713,7 +713,7 @@ class Spaces(Server):
             self.assertEqual(self.t("show", "-p", "-t", d, "-v", "remain-on-exit"), "on")
         # Not a shell, not a tab: shells and the close prompt count windows.
         self.assertEqual(self.t("display", "-t", "main:", "-p", "#{E:@space_close_prompt}"),
-                         "close space main: 3 agents, 2 shells? (y/n)")
+                         "close space main: 3 agents, 2 shells?")
         self.assertEqual([int(i) for i in re.findall(r"█(\d+)█", self.status()[1])], [1, 2])
         # Its content: the name (large), key, folder, git, agents, counts, hint.
         d = self.dash("main")

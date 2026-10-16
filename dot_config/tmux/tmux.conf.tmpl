@@ -119,8 +119,8 @@ bind C-k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude \; run-
 # running under one.
 bind N new-window -a -c "#{pane_current_path}" nu
 
-# CMD+W (wezterm) → prefix x: close the pane, same y/n prompt as tmux's stock
-# `x`, but through closed-tabs.sh, which first records the tab in a history of
+# CMD+W (wezterm) → prefix x: close the pane after a y/n, through
+# closed-tabs.sh, which first records the tab in a history of
 # recently closed ones (kept a week): cwd, position in the bar, a snapshot of
 # the screen, and any claude / codex / opencode session running in it.
 # CMD+Z (wezterm) → prefix X: fzf over that history, newest first, previewing
@@ -128,7 +128,15 @@ bind N new-window -a -c "#{pane_current_path}" nu
 # with the agent resumed (`claude --resume <id>` etc.) as a child of zsh via
 # ZSH_AUTOSTART, exactly like a CMD+R tab. So CMD+Z ⏎ undoes the last close.
 # NOT run-shell -b: the popup needs the key press's client to appear on.
-bind x confirm-before -p "kill-pane #P? (y/n)" "run-shell -b '#{HOME}/.config/tmux/scripts/closed-tabs.sh close #{pane_id}'"
+#
+# The y/n is a small menu box in the middle of the window, not
+# confirm-before: that prompt draws on the status line, which is off while
+# the agent sidebar is open (it would bring the line back). The box names
+# what closes (@close_title: an agent by its letter and title, else the tab
+# or pane by its command); Cancel is the first item, so ⏎ / n / Esc / q keep
+# it and only y closes, as before. prefix Q (spaces.conf) asks the same way.
+set -g @close_title '#[align=centre]#{?#{@agent_state}, close agent #{?#{@agent_key},#{@agent_key} · ,}#{=/30/…:#{?#{@agent_summary},#{s|^[^/]*/||:@agent_summary},#{window_name}}} , close #{?#{==:#{window_panes},1},tab,pane} #{=/24/…:pane_current_command} }'
+bind x display-menu -b rounded -s 'bg=#1e1e2e,fg=#cdd6f4' -S 'fg=#f38ba8' -H 'bg=#45475a,fg=#cdd6f4,bold' -T "#{E:@close_title}" -x C -y C "Cancel" n "" "Close" y "run-shell -b '#{HOME}/.config/tmux/scripts/closed-tabs.sh close #{pane_id}'"
 bind X run-shell "#{HOME}/.config/tmux/scripts/closed-tabs.sh pick-popup '#{session_id}' '#{client_tty}'"
 
 set -g status-position bottom
