@@ -1830,15 +1830,19 @@ publish_to_tmux_opts() {
 # their own gauge (the agent sidebar) rather than the status-line text. Per
 # window <w> in session, weekly, scoped:
 #
-#   @codex_<w>_used      the level drawn: <w>_pace.used — the pool's mean
-#                        used% in pool scope, the account's own otherwise
+#   @codex_<w>_used      the level drawn: <w>_pace.used — the pool's level
+#                        (share of its capacity used) in pool scope, the
+#                        account's own otherwise
 #   @codex_<w>_expected  where pace says the level should be now:
 #                        used − delta, clamped to 0..100
 #   @codex_<w>_delta     signed pace delta, "+17" / "-4"
 #   @codex_<w>_resets    the logged-in account's next reset (epoch), as the
 #                        block has it
-#   @codex_<w>_members   "slot:used:active,..." ("1:90:0,2:27:1") in pool
-#                        scope; empty in account scope
+#   @codex_<w>_members   "slot:used:active:cap,..." ("1:90:0:90,2:32:1:100")
+#                        in pool scope, cap being the member's limit (100
+#                        minus its weekly reserve; 100 for no reserve and
+#                        for a cache written before caps); empty in account
+#                        scope
 #
 # Each is empty when not known, and all five are empty for a window with no
 # data, one drawn as "idle", another account's block (drawn "--%"), or a
@@ -1909,7 +1913,8 @@ publish_pace_opts() {
                     ($b[$k + "_resets_at"] | if type == "number" then tostring else "" end),
                     (if $pc.scope == "pool"
                      then [ ($pc.members // [])[]
-                            | "\(.slot // "")" + ":" + "\(.used)" + ":" + (if .active then "1" else "0" end) ]
+                            | "\(.slot // "")" + ":" + "\(.used)" + ":" + (if .active then "1" else "0" end)
+                              + ":" + "\(.cap | if type == "number" then . else 100 end)" ]
                           | join(",")
                      else "" end) ]
               end)
@@ -3064,9 +3069,19 @@ json_int_or_null() {
 # the active account's own reading (the history, the live merge and the reset
 # view key on it); the pooled level is <family>_pace.used and the text.
 #
+# CAPS: THE WEEKLY RESERVE. An account may keep the last part of its 7-day
+# (all-models) window back: sequence.json's accounts["<n>"].weeklyReservePct,
+# a number in [0, 50] (absent, null or anything else = no reserve; cswap
+# reserve writes it). That account's cap is 100 − reserve, and the pool
+# counts only up to the cap — cswap never fails over INTO an account inside
+# its reserve, so those last points are not part of the budget. Two accounts
+# at cap 90 and cap 100 are a 190-point week: "main at 90, second at 100 =
+# done". The reserve is the weekly window's only: the scoped (model) weekly
+# window and the session keep cap 100.
+#
 # THE MATH, generalising pace_delta exactly. For one window kind of length W,
-# n members with used u_i and reset t_i, at `now` (the block's updated_at, as
-# for pace_delta):
+# n members with used u_i, cap c_i and reset t_i, at `now` (the block's
+# updated_at, as for pace_delta):
 #
 #   roll forward  a weekly or scoped window whose reset is already past has
 #                 reset: u_i = 0, t_i += k*W until it is in the future (those
@@ -3075,22 +3090,31 @@ json_int_or_null() {
 #                 session whose reset has passed, since 5-hour windows are NOT
 #                 on a fixed cycle: after one ends the account sits idle until
 #                 it is next used, and the next window opens then.
-#   base          Σ(100 − u_i), what the pool has left right now
+#   capacity      C = Σ c_i, the whole pool's budget for one window
+#   level         used = 100 · Σ min(u_i, c_i) / C, rounded half away from
+#                 zero: the share of the capacity spent (a member past its
+#                 cap — someone used the reserve by hand — counts as full)
+#   base          Σ max(0, c_i − u_i), what the pool has left right now
 #   horizons      one per distinct reset T, ascending:
-#                   avail(T) = base + 100 × #{j : t_j < T}
-#                 (every window that resets before T refills by a whole 100)
+#                   avail(T) = base + Σ_{j : t_j < T} c_j
+#                 (a window that resets before T refills by its CAP, not 100)
 #   delta         max over horizons with 0 < T − now ≤ W of
-#                   100·(T − now)/W − avail(T)/n
+#                   100·(T − now)/W − 100·avail(T)/C
 #                 rounded half away from zero. Positive = over pace.
 #
-# For n = 1 the single horizon gives 100·(t−now)/W − (100−u) = u − 100·
-# elapsed/W, which is pace_delta. The one-account path still goes through
-# pace_delta itself, guards and all, so nothing about it changes.
+# With every cap 100, C = 100·n, the level is the members' mean and the
+# delta's second term is avail(T)/n: exactly the pool before reserves. For
+# n = 1 the single horizon gives 100·(t−now)/W − (100−u) = u − 100·elapsed/W,
+# which is pace_delta. The one-account path still goes through pace_delta
+# itself, guards and all, so nothing about it changes (no cap, no capacity).
 #
-# Today's numbers, as a check: account 1 at 90% resetting in ~4.04 days,
-# account 2 at 27% in ~5.33 days, W = 7 days. Horizon 1: avail 83, so
-# 100·4.04/7 − 41.5 ≈ +16. Horizon 2: avail 183, ≈ −15. Delta +16: the pool
-# is ahead of pace, because the 90% account cannot carry its half to its reset.
+# A worked example: account 1 at 90% with a 10% reserve (cap 90) resetting
+# in ~4.04 days, account 2 at 32% (cap 100) in ~5.33 days, W = 7 days.
+# C = 190; level 100·(90 + 32)/190 = 64.2 → 64. Horizon 1: avail 0 + 68 = 68,
+# so 100·4.04/7 − 100·68/190 = 57.7 − 35.8 ≈ +22. Horizon 2: avail 68 + 90 =
+# 158, 76.1 − 83.2 ≈ −7. Delta +22: the pool is ahead of pace, because
+# account 1 is already at its cap with four days to its reset. (Without the
+# reserve the same readings are level 61, delta +19.)
 #
 # MEMBERS are the slots in sequence.json's `sequence` that are not disabled.
 # The ACTIVE one is matched to the logged-in account (email, case-insensitive,
@@ -3107,16 +3131,31 @@ json_int_or_null() {
 # UsageBar read; they evaluate delta(now) live from the horizons, so the
 # horizons are exact rather than rounded):
 #
-#   {scope: "pool"|"account", accounts: n, window_minutes: W, used: <pool
-#    level>, horizons: [{at, avail}], delta: <int or null, at updated_at>,
-#    members: [{slot, email, used, resets_at, active, as_of}]}
+#   {scope: "pool"|"account", accounts: n, capacity: C (pool only),
+#    window_minutes: W, used: <pool level>, horizons: [{at, avail}],
+#    delta: <int or null, at updated_at>,
+#    members: [{slot, email, used, resets_at, active, as_of, cap (pool only)}]}
+#
+# A member's used is its own reading, not clamped to its cap (90% at cap 90
+# reads 90, and 93% after a deliberate switch into the reserve reads 93).
+# The scoped pool publishes capacity and caps too, all 100. Readers live-
+# evaluating delta(now) take C = capacity when it is a number with
+# 0 < C <= 100·accounts, else 100·accounts (a cache from before caps).
+#
+# The worked example above publishes, as weekly_pace:
+#
+#   {scope: "pool", accounts: 2, capacity: 190, window_minutes: 10080,
+#    used: 64, horizons: [{at: t1, avail: 68}, {at: t2, avail: 158}],
+#    delta: 22, members: [{slot: "1", used: 90, cap: 90, active: false, …},
+#                         {slot: "2", used: 32, cap: 100, active: true, …}]}
 #
 # and in the pool case <family>_text is the pool's level and delta,
-# "59% (+16%)" (a pooled session reads "idle" when the active account is
+# "64% (+22%)" (a pooled session reads "idle" when the active account is
 # idle and the pooled level rounds to 0 — the apps' rule), <family>_pace_color
 # is the pooled delta's color, and <family>_color runs the pooled level and
 # pace through color_for_level_and_pace — red regardless when the ACTIVE
-# account itself is at 100% or critical (pool_window_color). @codexbar_pool_pace /
+# account itself is at its cap or critical (pool_window_color): at 90 with a
+# 10% reserve it is red, since cswap is about to leave it. @codexbar_pool_pace /
 # CODEXBAR_USAGE_POOL_PACE = off puts everything back to one account (the
 # pace objects are still published, as scope "account").
 #
@@ -3128,8 +3167,9 @@ json_int_or_null() {
 # Answers in globals (see render_provider_block on why not stdout):
 # POOL_SLOT, the active member's slot ("" when not a member), and per family
 # POOL_<FAMILY>_JSON (the pool object, "" when the pool does not apply),
-# POOL_<FAMILY>_DELTA (signed, "+16"; "" when not computable) and
-# POOL_<FAMILY>_USED.
+# POOL_<FAMILY>_DELTA (signed, "+16"; "" when not computable),
+# POOL_<FAMILY>_USED and POOL_<FAMILY>_CAP (the active member's cap, 100
+# when unknown).
 POOL_PACE_ENABLED=''
 pool_pace_enabled() {
   if [[ -z "$POOL_PACE_ENABLED" ]]; then
@@ -3186,6 +3226,14 @@ POOL_PACE_JQ='
   # no unary minus on an expression.)
   def round_away: if . < 0 then 0 - (((0 - .) + 0.5) | floor) else ((. + 0.5) | floor) end;
   def signed: if . == null then "" elif . >= 0 then "+\(.)" else "\(.)" end;
+  # A sequence.json account entry: its weekly cap, 100 minus its
+  # weeklyReservePct. Only a whole number in [0, 50] counts as a reserve (cswap
+  # accepts no other); absent, null, fractional, out of range or not a number
+  # is no reserve (cap 100).
+  def weekly_cap:
+    (.weeklyReservePct // null) as $r
+    | if ($r | type) == "number" and $r >= 0 and $r <= 50 and $r == ($r | floor)
+      then 100 - $r else 100 end;
 
   ($seq | fromjson? // {} | obj) as $S
   | ($usage | fromjson? // {} | obj) as $U
@@ -3206,11 +3254,14 @@ POOL_PACE_JQ='
       | if $active == null or ($a.used | type) != "number" then null else
           [ $members[]
             | . as $mem
+            # The reserve is the 7-day all-models window only: every other
+            # kind keeps a cap of 100.
+            | (if $kind == "weekly" then ($mem.acct | weekly_cap) else 100 end) as $cap
             | if $mem.slot == $active.slot then
                 ({used: $a.used, resets_at: $a.resets} | roll($W; $fixed)) as $r
                 | select($r != null)
                 | {slot: $mem.slot, email: ($mem.acct.email // null), used: $r.used,
-                   resets_at: $r.resets_at, active: true, as_of: $now}
+                   resets_at: $r.resets_at, active: true, as_of: $now, cap: $cap}
               else
                 ((($UA[$mem.slot] // null) | select(type == "object" and same_acct(.; $mem.acct)))
                   // ([ $UA[]? | objects | select(same_acct(.; $mem.acct)) ] | first)
@@ -3221,30 +3272,35 @@ POOL_PACE_JQ='
                 | (pick(($u.lastGood | obj); $kind) // null)
                 | select(. != null) | roll($W; $fixed) | select(. != null)
                 | {slot: $mem.slot, email: ($mem.acct.email // $u.email // null), used,
-                   resets_at, active: false, as_of: $f}
+                   resets_at, active: false, as_of: $f, cap: $cap}
               end ] as $ms
           | if ($ms | length) < 2 or ([ $ms[] | select(.active) ] | length) != 1 then null else
               ($ms | length) as $n
-              | ([ $ms[] | 100 - .used ] | add) as $base
+              | ([ $ms[].cap ] | add) as $C
+              | ([ $ms[] | [.cap - .used, 0] | max ] | add) as $base
               | [ ([ $ms[].resets_at ] | unique)[] as $T
-                  | {at: $T, avail: ($base + 100 * ([ $ms[] | select(.resets_at < $T) ] | length))} ] as $hz
-              | {scope: "pool", accounts: $n, window_minutes: $Wm,
-                 used: (([ $ms[].used ] | add) / $n | round_away),
+                  | {at: $T, avail: ($base + ([ $ms[] | select(.resets_at < $T) | .cap ] | add // 0))} ] as $hz
+              | {scope: "pool", accounts: $n, capacity: $C, window_minutes: $Wm,
+                 used: (100 * ([ $ms[] | [.used, .cap] | min ] | add) / $C | round_away),
                  horizons: $hz,
                  delta: ([ $hz[] | select(.at - $now > 0 and .at - $now <= $W)
-                           | (100 * (.at - $now) / $W) - (.avail / $n) ]
+                           | (100 * (.at - $now) / $W) - (100 * .avail / $C) ]
                          | if length == 0 then null else (max | round_away) end),
                  members: $ms}
             end
         end;
-    # Per family: the published object, the signed delta, the pooled level.
-    # The 5-hour session is never pooled (see "WHY A POOL"): it stays the
-    # active account alone, so its slot is always empty here.
+    # Per family: the published object, the signed delta, the pooled level,
+    # and the active member cap rounded up to a whole percent (used is a
+    # whole percent, so used >= cap and used >= ceil(cap) agree), for
+    # pool_window_color. The 5-hour session is never pooled (see "WHY A
+    # POOL"): it stays the active account alone, so its slot is always empty.
     [ ($active.slot // "") ]
     + ([ "session", "weekly", "scoped" ]
        | map((if . == "session" then null else pool(.) end) as $p
-             | if $p == null then ["", "", ""]
-               else [($p | tojson), ($p.delta | signed), ($p.used | tostring)] end)
+             | if $p == null then ["", "", "", ""]
+               else [($p | tojson), ($p.delta | signed), ($p.used | tostring),
+                     ([ $p.members[] | select(.active) | .cap ] | first // 100
+                      | (if . == floor then . else floor + 1 end) | tostring)] end)
        | add)
     | join("\u001f")
 '
@@ -3252,15 +3308,15 @@ POOL_PACE_JQ='
 # $1 provider, $2 now (updated_at), then used / window minutes / resets_at
 # for session, weekly and scoped, exactly as render_provider_block has them.
 POOL_SLOT=''
-POOL_SESSION_JSON='' POOL_SESSION_DELTA='' POOL_SESSION_USED=''
-POOL_WEEKLY_JSON=''  POOL_WEEKLY_DELTA=''  POOL_WEEKLY_USED=''
-POOL_SCOPED_JSON=''  POOL_SCOPED_DELTA=''  POOL_SCOPED_USED=''
+POOL_SESSION_JSON='' POOL_SESSION_DELTA='' POOL_SESSION_USED='' POOL_SESSION_CAP=''
+POOL_WEEKLY_JSON=''  POOL_WEEKLY_DELTA=''  POOL_WEEKLY_USED=''  POOL_WEEKLY_CAP=''
+POOL_SCOPED_JSON=''  POOL_SCOPED_DELTA=''  POOL_SCOPED_USED=''  POOL_SCOPED_CAP=''
 pool_pace_read() {
   local provider="$1" now="$2"
   POOL_SLOT=''
-  POOL_SESSION_JSON='' POOL_SESSION_DELTA='' POOL_SESSION_USED=''
-  POOL_WEEKLY_JSON=''  POOL_WEEKLY_DELTA=''  POOL_WEEKLY_USED=''
-  POOL_SCOPED_JSON=''  POOL_SCOPED_DELTA=''  POOL_SCOPED_USED=''
+  POOL_SESSION_JSON='' POOL_SESSION_DELTA='' POOL_SESSION_USED='' POOL_SESSION_CAP=''
+  POOL_WEEKLY_JSON=''  POOL_WEEKLY_DELTA=''  POOL_WEEKLY_USED=''  POOL_WEEKLY_CAP=''
+  POOL_SCOPED_JSON=''  POOL_SCOPED_DELTA=''  POOL_SCOPED_USED=''  POOL_SCOPED_CAP=''
 
   [[ "$provider" == 'claude' ]] || return 0
   [[ "$now" =~ ^[0-9]+$ ]] || return 0
@@ -3287,27 +3343,37 @@ pool_pace_read() {
     "$POOL_PACE_JQ" 2>/dev/null || true)"
   [[ -n "${line:-}" ]] || return 0
 
+  # One field per line position. The separator is a non-whitespace IFS
+  # character, so an EMPTY field (a family the pool does not apply to) still
+  # takes its own position instead of collapsing into the next.
   IFS=$'\x1f' read -r POOL_SLOT \
-    POOL_SESSION_JSON POOL_SESSION_DELTA POOL_SESSION_USED \
-    POOL_WEEKLY_JSON POOL_WEEKLY_DELTA POOL_WEEKLY_USED \
-    POOL_SCOPED_JSON POOL_SCOPED_DELTA POOL_SCOPED_USED <<<"$line" || true
+    POOL_SESSION_JSON POOL_SESSION_DELTA POOL_SESSION_USED POOL_SESSION_CAP \
+    POOL_WEEKLY_JSON POOL_WEEKLY_DELTA POOL_WEEKLY_USED POOL_WEEKLY_CAP \
+    POOL_SCOPED_JSON POOL_SCOPED_DELTA POOL_SCOPED_USED POOL_SCOPED_CAP <<<"$line" || true
 
   # Anything that is not an object from the program above is not trusted
-  # into the block's --argjson (a bad one would fail the whole render).
-  [[ "$POOL_SESSION_JSON" == '{'* && "$POOL_SESSION_USED" =~ ^[0-9]+$ ]] || { POOL_SESSION_JSON=''; POOL_SESSION_DELTA=''; POOL_SESSION_USED=''; }
-  [[ "$POOL_WEEKLY_JSON" == '{'* && "$POOL_WEEKLY_USED" =~ ^[0-9]+$ ]]   || { POOL_WEEKLY_JSON='';  POOL_WEEKLY_DELTA='';  POOL_WEEKLY_USED=''; }
-  [[ "$POOL_SCOPED_JSON" == '{'* && "$POOL_SCOPED_USED" =~ ^[0-9]+$ ]]   || { POOL_SCOPED_JSON='';  POOL_SCOPED_DELTA='';  POOL_SCOPED_USED=''; }
+  # into the block's --argjson (a bad one would fail the whole render). A
+  # cap that is not a whole number falls back to 100, the no-reserve rule.
+  [[ "$POOL_SESSION_JSON" == '{'* && "$POOL_SESSION_USED" =~ ^[0-9]+$ ]] || { POOL_SESSION_JSON=''; POOL_SESSION_DELTA=''; POOL_SESSION_USED=''; POOL_SESSION_CAP=''; }
+  [[ "$POOL_WEEKLY_JSON" == '{'* && "$POOL_WEEKLY_USED" =~ ^[0-9]+$ ]]   || { POOL_WEEKLY_JSON='';  POOL_WEEKLY_DELTA='';  POOL_WEEKLY_USED='';  POOL_WEEKLY_CAP=''; }
+  [[ "$POOL_SCOPED_JSON" == '{'* && "$POOL_SCOPED_USED" =~ ^[0-9]+$ ]]   || { POOL_SCOPED_JSON='';  POOL_SCOPED_DELTA='';  POOL_SCOPED_USED='';  POOL_SCOPED_CAP=''; }
+  [[ -z "$POOL_SESSION_JSON" || "$POOL_SESSION_CAP" =~ ^[0-9]+$ ]] || POOL_SESSION_CAP=100
+  [[ -z "$POOL_WEEKLY_JSON" || "$POOL_WEEKLY_CAP" =~ ^[0-9]+$ ]]   || POOL_WEEKLY_CAP=100
+  [[ -z "$POOL_SCOPED_JSON" || "$POOL_SCOPED_CAP" =~ ^[0-9]+$ ]]   || POOL_SCOPED_CAP=100
   return 0
 }
 
 # A pooled window's <family>_color: the pool's level and pace through
-# color_for_level_and_pace, EXCEPT that the active account at 100% (or past
+# color_for_level_and_pace, EXCEPT that the active account at its cap (or past
 # the critical level) is red whatever the pool says. The pool may have plenty
 # left, but the login in use is blocked — or about to be — until cswap moves
-# to another account, and that is what the next request runs into.
+# to another account, and that is what the next request runs into. The cap
+# ($4, a whole percent; 100 when absent) is the active member's: 100 minus
+# its weekly reserve, so an account that keeps 10% back is at its limit at 90.
 pool_window_color() {
-  local active_used="$1" pool_used="$2" pace_color="$3"
-  if [[ "$active_used" =~ ^[0-9]+$ ]] && (( active_used >= 100 || active_used >= LEVEL_CRITICAL_PERCENT )); then
+  local active_used="$1" pool_used="$2" pace_color="$3" active_cap="${4:-100}"
+  [[ "$active_cap" =~ ^[0-9]+$ ]] || active_cap=100
+  if [[ "$active_used" =~ ^[0-9]+$ ]] && (( active_used >= active_cap || active_used >= LEVEL_CRITICAL_PERCENT )); then
     printf '%s' 'red'
     return 0
   fi
@@ -3397,7 +3463,7 @@ render_provider_block() {
   fi
 
   # Pooled pace (see "Pooled pace"): where the pool applies, the text is the
-  # POOL's — its level (the members' mean used%) and its delta — and so are
+  # POOL's — its level (the share of its capacity used) and its delta — and so are
   # both colors. <family>_used stays the active account's own reading: the
   # history, the live merge and the reset view all key on it. Everything
   # else stays the one-account answer above.
@@ -3408,17 +3474,17 @@ render_provider_block() {
   if [[ -n "$POOL_SESSION_JSON" ]]; then
     session_text="${POOL_SESSION_USED}%${POOL_SESSION_DELTA:+ (${POOL_SESSION_DELTA}%)}"
     session_pace_color="$(pool_pace_color "$POOL_SESSION_USED" "$POOL_SESSION_DELTA")"
-    session_color="$(pool_window_color "$session_used" "$POOL_SESSION_USED" "$session_pace_color")"
+    session_color="$(pool_window_color "$session_used" "$POOL_SESSION_USED" "$session_pace_color" "$POOL_SESSION_CAP")"
   fi
   if [[ -n "$POOL_WEEKLY_JSON" ]]; then
     weekly_text="${POOL_WEEKLY_USED}%${POOL_WEEKLY_DELTA:+ (${POOL_WEEKLY_DELTA}%)}"
     weekly_pace_color="$(pool_pace_color "$POOL_WEEKLY_USED" "$POOL_WEEKLY_DELTA")"
-    weekly_color="$(pool_window_color "$weekly_used" "$POOL_WEEKLY_USED" "$weekly_pace_color")"
+    weekly_color="$(pool_window_color "$weekly_used" "$POOL_WEEKLY_USED" "$weekly_pace_color" "$POOL_WEEKLY_CAP")"
   fi
   if [[ -n "$POOL_SCOPED_JSON" ]]; then
     scoped_text="${POOL_SCOPED_USED}%${POOL_SCOPED_DELTA:+ (${POOL_SCOPED_DELTA}%)}"
     scoped_pace_color="$(pool_pace_color "$POOL_SCOPED_USED" "$POOL_SCOPED_DELTA")"
-    scoped_color="$(pool_window_color "$scoped_used" "$POOL_SCOPED_USED" "$scoped_pace_color")"
+    scoped_color="$(pool_window_color "$scoped_used" "$POOL_SCOPED_USED" "$scoped_pace_color" "$POOL_SCOPED_CAP")"
   fi
 
   # Between 5-hour windows the endpoint reports utilization 0 with a null

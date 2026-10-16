@@ -64,15 +64,37 @@ def round_away(x):
     return -math.floor(-x + 0.5) if x < 0 else math.floor(x + 0.5)
 
 
+def _with_caps(members):
+    """[(used, resets_at)] or [(used, resets_at, cap)] -> [(used, resets_at, cap)]."""
+    return [(m[0], m[1], m[2] if len(m) > 2 else 100) for m in members]
+
+
+def reference_horizons(members):
+    """The contract's horizons: avail(T) = sum max(0, cap - u) + sum of the caps
+    of the windows that reset strictly before T."""
+    ms = _with_caps(members)
+    base = sum(max(0, c - u) for u, _, c in ms)
+    return [{'at': T, 'avail': base + sum(c for _, t, c in ms if t < T)}
+            for T in sorted({t for _, t, _ in ms})]
+
+
+def reference_level(members):
+    """The contract's level: 100 * sum min(u, cap) / C, half away from zero."""
+    ms = _with_caps(members)
+    return round_away(100 * sum(min(u, c) for u, _, c in ms) / sum(c for _, _, c in ms))
+
+
 def reference_delta(members, window_seconds, now=NOW):
-    """The contract's formula, independently: members = [(used, resets_at)]."""
-    n = len(members)
-    base = sum(100 - u for u, _ in members)
+    """The contract's formula, independently: members = [(used, resets_at[, cap])],
+    cap 100 when not given. With every cap 100 this is the pre-reserve formula
+    (C = 100 n, so 100 avail / C = avail / n)."""
+    ms = _with_caps(members)
+    C = sum(c for _, _, c in ms)
     best = None
-    for T in sorted({t for _, t in members}):
-        avail = base + 100 * sum(1 for _, t in members if t < T)
+    for h in reference_horizons(ms):
+        T = h['at']
         if 0 < T - now <= window_seconds:
-            v = 100 * (T - now) / window_seconds - avail / n
+            v = 100 * (T - now) / window_seconds - 100 * h['avail'] / C
             best = v if best is None else max(best, v)
     return None if best is None else round_away(best)
 
@@ -127,10 +149,12 @@ class Home:
             'seven_day': {'utilization': weekly, 'resets_at': iso_z(weekly_resets)},
             'limits': limits}))
 
-    def cswap(self, slot1=None, slot2=None, seq_extra=None, sequence=(1, 2), disabled=()):
+    def cswap(self, slot1=None, slot2=None, seq_extra=None, sequence=(1, 2), disabled=(),
+              reserves=None):
         """sequence.json and cache/usage.json as claude-swap writes them.
 
-        slot1/slot2 override the lastGood readings (None keeps today's)."""
+        slot1/slot2 override the lastGood readings (None keeps today's).
+        reserves: {slot: weeklyReservePct value, written as given}."""
         self.cswap_usage.parent.mkdir(parents=True, exist_ok=True)
         accounts = {
             '1': {'email': A1_EMAIL, 'organizationUuid': A1_ORG, 'organizationName': 'One',
@@ -141,6 +165,8 @@ class Home:
         accounts.update(seq_extra or {})
         for s in disabled:
             accounts[str(s)]['disabled'] = True
+        for s, pct in (reserves or {}).items():
+            accounts[str(s)]['weeklyReservePct'] = pct
         self.seq_file.write_text(json.dumps({'sequence': list(sequence),
                                              'activeAccountNumber': 2,
                                              'accounts': accounts}))
@@ -242,15 +268,16 @@ class WorkedExampleTests(PoolPaceTestCase):
 
         weekly = block['weekly_pace']
         self.assertEqual(weekly, {
-            'scope': 'pool', 'accounts': 2, 'window_minutes': 10080, 'used': 59,
+            'scope': 'pool', 'accounts': 2, 'capacity': 200, 'window_minutes': 10080,
+            'used': 59,
             'horizons': [{'at': A1_WEEKLY_RESETS, 'avail': 83},
                          {'at': A2_WEEKLY_RESETS, 'avail': 183}],
             'delta': 16,
             'members': [
                 {'slot': '1', 'email': A1_EMAIL, 'used': 90, 'resets_at': A1_WEEKLY_RESETS,
-                 'active': False, 'as_of': NOW - 600},
+                 'active': False, 'as_of': NOW - 600, 'cap': 100},
                 {'slot': '2', 'email': A2_EMAIL, 'used': 27, 'resets_at': A2_WEEKLY_RESETS,
-                 'active': True, 'as_of': NOW},
+                 'active': True, 'as_of': NOW, 'cap': 100},
             ]})
         self.assertEqual(reference_delta([(90, A1_WEEKLY_RESETS), (27, A2_WEEKLY_RESETS)],
                                          WEEK_W), 16)
@@ -274,8 +301,9 @@ class WorkedExampleTests(PoolPaceTestCase):
 
         scoped = block['scoped_pace']
         self.assertEqual(scoped['scope'], 'pool')
-        self.assertEqual([(m['slot'], m['used']) for m in scoped['members']],
-                         [('1', 2), ('2', 2)])
+        self.assertEqual(scoped['capacity'], 200)
+        self.assertEqual([(m['slot'], m['used'], m['cap']) for m in scoped['members']],
+                         [('1', 2, 100), ('2', 2, 100)])
         self.assertEqual(scoped['delta'],
                          reference_delta([(2, A1_WEEKLY_RESETS), (2, A2_WEEKLY_RESETS)], WEEK_W))
         self.assertEqual(block['scoped_text'], f"2% ({scoped['delta']:+d}%)")
@@ -287,10 +315,10 @@ class WorkedExampleTests(PoolPaceTestCase):
             '@codex_session_members': '',
             '@codex_weekly_used': '59', '@codex_weekly_expected': '43',
             '@codex_weekly_delta': '+16', '@codex_weekly_resets': str(A2_WEEKLY_RESETS),
-            '@codex_weekly_members': '1:90:0,2:27:1',
+            '@codex_weekly_members': '1:90:0:100,2:27:1:100',
             '@codex_scoped_used': '2', '@codex_scoped_expected': '42',
             '@codex_scoped_delta': '-40', '@codex_scoped_resets': str(A2_WEEKLY_RESETS),
-            '@codex_scoped_members': '1:2:0,2:2:1',
+            '@codex_scoped_members': '1:2:0:100,2:2:1:100',
         })
 
     def test_scoped_member_without_a_matching_entry_is_left_out(self):
@@ -310,7 +338,7 @@ class WorkedExampleTests(PoolPaceTestCase):
         opts = self.home.pace_opts()
         self.assertEqual((opts['@codex_scoped_used'], opts['@codex_scoped_delta'],
                           opts['@codex_scoped_members']), ('2', f'{d:+d}', ''))
-        self.assertEqual(opts['@codex_weekly_members'], '1:90:0,2:27:1')
+        self.assertEqual(opts['@codex_weekly_members'], '1:90:0:100,2:27:1:100')
 
 
 class SingleAccountTests(PoolPaceTestCase):
@@ -516,6 +544,161 @@ class MemberTests(PoolPaceTestCase):
         self.assertEqual(block['weekly_pace']['members'][0]['used'], 90)
 
 
+class ReserveTests(PoolPaceTestCase):
+    """sequence.json accounts["<n>"].weeklyReservePct: the weekly pool is measured
+    against the caps (100 - reserve), not 100 per account."""
+
+    def test_reserve_on_slot_1(self):
+        self.home.cswap(reserves={1: 10})
+        block = self.home.refresh()
+        weekly = block['weekly_pace']
+        members = [(90, A1_WEEKLY_RESETS, 90), (27, A2_WEEKLY_RESETS, 100)]
+        self.assertEqual(weekly['scope'], 'pool')
+        self.assertEqual(weekly['capacity'], 190)
+        self.assertEqual([(m['slot'], m['used'], m['cap']) for m in weekly['members']],
+                         [('1', 90, 90), ('2', 27, 100)])
+        # Level: 100 * (90 + 27) / 190 = 61.58 -> 62 (the cap-100 pool says 59).
+        self.assertEqual(weekly['used'], 62)
+        self.assertEqual(weekly['used'], reference_level(members))
+        # Slot 1 is at its cap: nothing left before its reset, and at its reset
+        # it refills by 90, not 100.
+        self.assertEqual(weekly['horizons'], [{'at': A1_WEEKLY_RESETS, 'avail': 73},
+                                              {'at': A2_WEEKLY_RESETS, 'avail': 163}])
+        self.assertEqual(weekly['horizons'], reference_horizons(members))
+        # 100*4.04/7 - 100*73/190 = 57.71 - 38.42 = +19.29
+        self.assertEqual(weekly['delta'], 19)
+        self.assertEqual(weekly['delta'], reference_delta(members, WEEK_W))
+        self.assertEqual(block['weekly_text'], '62% (+19%)')
+        self.assertEqual(block['weekly_used'], 27)       # still the account's own
+        opts = self.home.pace_opts()
+        self.assertEqual(opts['@codex_weekly_members'], '1:90:0:90,2:27:1:100')
+        self.assertEqual((opts['@codex_weekly_used'], opts['@codex_weekly_delta']),
+                         ('62', '+19'))
+
+        # The reserve is the 7-day window only: scoped and session as before.
+        self.home.cswap()
+        plain = self.home.refresh()
+        for key in ('scoped_pace', 'scoped_text', 'scoped_color', 'session_pace',
+                    'session_text', 'session_color'):
+            self.assertEqual(block[key], plain[key], key)
+        self.assertEqual(block['scoped_pace']['capacity'], 200)
+        self.assertEqual({m['cap'] for m in block['scoped_pace']['members']}, {100})
+        self.assertNotIn('capacity', block['session_pace'])
+
+    def test_contract_example(self):
+        # The published shape for: slot 1 at 90% (cap 90) resetting in ~3.3
+        # days, slot 2 (active) at 33% resetting in ~4.6 days.
+        t1, t2 = NOW + int(3.3 * DAY), NOW + int(4.6 * DAY)
+        slot1 = {'fetchedAt': NOW - 60,
+                 'lastGood': {'five_hour': {'pct': 0.0, 'resets_at': None},
+                              'seven_day': {'pct': 90.0, 'resets_at': iso_cswap(t1)},
+                              'scoped': []}}
+        self.home.cswap(slot1=slot1, reserves={1: 10})
+        self.home.endpoint(weekly=33, weekly_resets=t2)
+        block = self.home.refresh()
+        members = [(90, t1, 90), (33, t2, 100)]
+        weekly = block['weekly_pace']
+        self.assertEqual({k: weekly[k] for k in
+                          ('scope', 'accounts', 'capacity', 'used', 'horizons', 'delta')},
+                         {'scope': 'pool', 'accounts': 2, 'capacity': 190, 'used': 65,
+                          'horizons': [{'at': t1, 'avail': 67}, {'at': t2, 'avail': 157}],
+                          'delta': 12})
+        self.assertEqual(weekly['used'], reference_level(members))
+        self.assertEqual(weekly['delta'], reference_delta(members, WEEK_W))
+        self.assertEqual(block['weekly_text'], '65% (+12%)')
+        self.assertEqual(self.home.pace_opts()['@codex_weekly_members'], '1:90:0:90,2:33:1:100')
+
+    def test_caps_all_100_is_todays_pool(self):
+        self.home.cswap()
+        baseline = self.home.refresh()
+        for reserves in ({1: 0, 2: 0}, {1: None}, {1: 0.0}):
+            with self.subTest(reserves=reserves):
+                self.home.cswap(reserves=reserves)
+                block = self.home.refresh()
+                for key in ('weekly_pace', 'weekly_text', 'weekly_color', 'weekly_pace_color',
+                            'scoped_pace', 'session_pace'):
+                    self.assertEqual(block[key], baseline[key], key)
+                self.assertEqual(self.home.pace_opts()['@codex_weekly_members'],
+                                 '1:90:0:100,2:27:1:100')
+
+    def test_invalid_reserve_values_are_ignored(self):
+        self.home.cswap()
+        baseline = self.home.refresh()
+        for bad in (-5, 7.5, 50.5, 51, 100, '10', True, [10], {'pct': 10}):
+            with self.subTest(bad=bad):
+                self.home.cswap(reserves={1: bad})
+                block = self.home.refresh()
+                self.assertEqual(block['weekly_pace'], baseline['weekly_pace'])
+                self.assertEqual(block['weekly_text'], '59% (+16%)')
+        # 50 is the largest reserve honoured: cap 50.
+        self.home.cswap(reserves={1: 50})
+        weekly = self.home.refresh()['weekly_pace']
+        self.assertEqual(weekly['capacity'], 150)
+        self.assertEqual(weekly['members'][0]['cap'], 50)
+        members = [(90, A1_WEEKLY_RESETS, 50), (27, A2_WEEKLY_RESETS, 100)]
+        self.assertEqual(weekly['used'], reference_level(members))          # 77/150 -> 51
+        self.assertEqual(weekly['horizons'], reference_horizons(members))
+        self.assertEqual(weekly['delta'], reference_delta(members, WEEK_W))
+
+    def test_member_over_its_cap_clamps(self):
+        # Slot 1 was switched into its reserve by hand and is at 95% of a cap
+        # of 90: it counts as full (90), never as more, and has nothing left.
+        slot1 = {'fetchedAt': NOW - 60,
+                 'lastGood': {'five_hour': {'pct': 0.0, 'resets_at': None},
+                              'seven_day': {'pct': 95.0, 'resets_at': iso_cswap(A1_WEEKLY_RESETS)},
+                              'scoped': []}}
+        self.home.cswap(slot1=slot1, reserves={1: 10})
+        block = self.home.refresh()
+        weekly = block['weekly_pace']
+        members = [(95, A1_WEEKLY_RESETS, 90), (27, A2_WEEKLY_RESETS, 100)]
+        self.assertEqual(weekly['members'][0]['used'], 95)        # its own reading
+        self.assertEqual(weekly['used'], 62)                       # as at exactly 90
+        self.assertEqual(weekly['used'], reference_level(members))
+        self.assertEqual(weekly['horizons'], [{'at': A1_WEEKLY_RESETS, 'avail': 73},
+                                              {'at': A2_WEEKLY_RESETS, 'avail': 163}])
+        self.assertEqual(weekly['delta'], reference_delta(members, WEEK_W))
+        self.assertEqual(weekly['delta'], 19)
+        self.assertEqual(self.home.pace_opts()['@codex_weekly_members'], '1:95:0:90,2:27:1:100')
+
+    def test_active_account_at_its_cap_is_red(self):
+        # The active slot 2 keeps 10% back; slot 1 is untouched, so the pool's
+        # own pace is green throughout.
+        slot1 = {'fetchedAt': NOW - 60,
+                 'lastGood': {'five_hour': {'pct': 0.0, 'resets_at': None},
+                              'seven_day': {'pct': 0.0, 'resets_at': iso_cswap(NOW + 6 * DAY)},
+                              'scoped': []}}
+        for reserve, active, expected in ((10, 92, 'red'), (10, 90, 'red'), (10, 89, 'green'),
+                                          (None, 90, 'green'), (15, 85, 'red'), (15, 84, 'green')):
+            with self.subTest(reserve=reserve, active=active):
+                self.home.cswap(slot1=slot1, reserves={2: reserve})
+                self.home.endpoint(weekly=active, weekly_resets=NOW + HOUR)
+                block = self.home.refresh()
+                weekly = block['weekly_pace']
+                cap = 100 - (reserve or 0)
+                self.assertEqual(weekly['scope'], 'pool')
+                self.assertEqual(weekly['members'][1]['cap'], cap)
+                self.assertEqual(weekly['delta'],
+                                 reference_delta([(0, NOW + 6 * DAY), (active, NOW + HOUR, cap)],
+                                                 WEEK_W))
+                self.assertEqual(block['weekly_pace_color'], 'green')
+                self.assertEqual(block['weekly_color'], expected)
+        # The scoped window has no reserve: the active account at 90% there
+        # is not at its cap.
+        self.home.cswap(slot1={'fetchedAt': NOW - 60,
+                               'lastGood': {'five_hour': {'pct': 0.0, 'resets_at': None},
+                                            'seven_day': {'pct': 0.0,
+                                                          'resets_at': iso_cswap(NOW + 6 * DAY)},
+                                            'scoped': [{'name': 'Fable', 'pct': 0.0,
+                                                        'resets_at': iso_cswap(NOW + 6 * DAY)}]}},
+                        reserves={2: 10})
+        self.home.endpoint(weekly=10, weekly_resets=NOW + HOUR, scoped=(90, NOW + HOUR))
+        block = self.home.refresh()
+        self.assertEqual(block['scoped_pace']['scope'], 'pool')
+        self.assertEqual(block['scoped_pace']['members'][1]['cap'], 100)
+        self.assertEqual(block['scoped_pace_color'], 'green')
+        self.assertEqual(block['scoped_color'], 'green')
+
+
 class RenderPathTests(PoolPaceTestCase):
     def test_cswap_adoption_renders_the_pool(self):
         # A fetched block with no pool in it (toggle off for that render)...
@@ -561,7 +744,7 @@ class RenderPathTests(PoolPaceTestCase):
         opts = self.home.pace_opts()
         self.assertEqual((opts['@codex_weekly_used'], opts['@codex_weekly_delta'],
                           opts['@codex_weekly_members']),
-                         ('60', f'{delta:+d}', '1:90:0,2:30:1'))
+                         ('60', f'{delta:+d}', '1:90:0:100,2:30:1:100'))
 
 
 class PublishTests(PoolPaceTestCase):
