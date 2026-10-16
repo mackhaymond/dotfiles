@@ -91,6 +91,7 @@ pub fn ink_on(bg: Ink) -> Ink {
         Ink::Rgb(r, g, b) => (r, g, b),
         Ink::Idx(n) => xterm(n),
         Ink::Pal(p) => crate::palette::rgb(p),
+        Ink::Mix(p, pct) => crate::palette::mix_rgb(p, pct),
     };
     let lum = (0.2126 * f64::from(r) + 0.7152 * f64::from(g) + 0.0722 * f64::from(b)) / 255.0;
     Ink::Pal(if lum > 0.45 { "crust" } else { "text" })
@@ -126,12 +127,94 @@ pub struct Shell {
     pub session: String,
 }
 
-/// One usage chip of status-right (`S` / `W` / the scoped one).
-#[derive(Debug, Clone, PartialEq)]
+/// One usage window of status-right (`S` / `W` / the scoped one), drawn as
+/// a meter: the numbers come from `@codex_<w>_used` / `_expected` /
+/// `_delta` / `_resets` / `_members` when set, else from the text
+/// (`60% (+17%)`, `22% (Σ-87%)`, `21%`, `idle`, `--%`).
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Usage {
     pub label: String,
+    /// `@codex_<w>_text` as the status line showed it (`--%` when unset).
     pub text: String,
     pub color: Option<Ink>,
+    /// Percent used, as reported (it can pass 100); None: unknown (`--%`,
+    /// `idle`).
+    pub used: Option<f64>,
+    /// Where the pace says it should be by now (percent, unclamped): the
+    /// meter's tick.
+    pub expected: Option<f64>,
+    /// used − expected, signed percentage points (status-right's `(+17%)`).
+    pub delta: Option<i32>,
+    /// When the window resets (epoch seconds).
+    pub resets: Option<i64>,
+    /// The accounts pooled into this window (`@codex_<w>_members`,
+    /// `slot:used:active,…`; empty for a single account).
+    pub members: Vec<Member>,
+    /// The pace is a pool's (`Σ` in the text, or 2+ members).
+    pub pooled: bool,
+    /// No window open (`idle`).
+    pub idle: bool,
+}
+
+/// One account of a pooled window: its claude-swap slot, its own used
+/// percent, and whether it is the logged-in one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Member {
+    /// None: the script knows the account but not its slot (`:27:1`).
+    pub slot: Option<u32>,
+    pub used: u32,
+    pub active: bool,
+}
+
+/// `1:90:0,2:30:1` → the members (an empty slot allowed; junk entries
+/// dropped).
+pub fn parse_members(raw: &str) -> Vec<Member> {
+    raw.split(',')
+        .filter_map(|m| {
+            let mut p = m.trim().split(':');
+            let slot = match p.next()?.trim() {
+                "" => None,
+                s => Some(s.parse().ok()?),
+            };
+            let used = p.next()?.trim().parse().ok()?;
+            let active = p.next()? == "1";
+            Some(Member { slot, used, active })
+        })
+        .collect()
+}
+
+impl Usage {
+    /// Fill the numbers: the numeric options first, the text for the rest.
+    pub fn read(label: String, text: String, color: Option<Ink>, m: &crate::tmux::Meter) -> Usage {
+        let num = |s: &str| s.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+        let int = |s: &str| s.trim().trim_start_matches('+').parse::<i32>().ok();
+        let t = text.trim();
+        let idle = t == "idle";
+        // `60% (+17%)`: the level before the first `%`, the delta in the brackets.
+        let text_used = if t.contains('%') { t.split('%').next().and_then(num) } else { None };
+        let inner = t.split_once('(').and_then(|(_, r)| r.split_once(')')).map(|(i, _)| i.trim());
+        let sigma = inner.is_some_and(|i| i.starts_with('Σ'));
+        let text_delta = inner.map(|i| i.trim_start_matches('Σ').trim_end_matches('%')).and_then(int);
+        // The real numbers (a window can be over 100%): the meter clamps
+        // only its fill and tick.
+        let used = num(&m.used).or(text_used);
+        let delta = int(&m.delta).or(text_delta);
+        let expected = num(&m.expected).or_else(|| Some(used? - f64::from(delta?)));
+        let members = parse_members(&m.members);
+        let resets = m.resets.trim().parse::<i64>().ok().filter(|&r| r > 0);
+        Usage {
+            label,
+            text,
+            color,
+            used,
+            expected,
+            delta,
+            resets,
+            pooled: sigma || members.len() >= 2,
+            members,
+            idle,
+        }
+    }
 }
 
 /// Everything the status block draws (besides the counts, which the view
@@ -144,8 +227,8 @@ pub struct Bar {
     pub space: Option<Chip>,
     /// `#{client_key_table}` is `prefix`: the red mark.
     pub prefix: bool,
-    /// It is `jump` (⌥F armed): the letter badges get louder and the
-    /// header says `⌥F · type a letter`.
+    /// It is `jump` (⌥W armed): the letter key-caps turn peach and the
+    /// card says `⌥W jump · type a letter`.
     pub jump: bool,
     pub shells: Vec<Shell>,
     /// Empty when no usage option is set at all (no usage line).
@@ -256,14 +339,11 @@ fn usage(st: &crate::tmux::Status) -> Vec<Usage> {
     let account = sanitize(st.account_label.trim());
     let s_label = if account.is_empty() { "S".to_string() } else { format!("{account} S") };
     let icon = sanitize(st.scoped_icon.trim().trim_end_matches(':'));
+    let [m0, m1, m2] = &st.meters;
     vec![
-        Usage { label: s_label, text: text(&st.session_text), color: tmux_colour(&st.session_color) },
-        Usage { label: "W".into(), text: text(&st.weekly_text), color: tmux_colour(&st.weekly_color) },
-        Usage {
-            label: if icon.is_empty() { "F".into() } else { icon },
-            text: text(&st.scoped_text),
-            color: tmux_colour(&st.scoped_color),
-        },
+        Usage::read(s_label, text(&st.session_text), tmux_colour(&st.session_color), m0),
+        Usage::read("W".into(), text(&st.weekly_text), tmux_colour(&st.weekly_color), m1),
+        Usage::read(if icon.is_empty() { "F".into() } else { icon }, text(&st.scoped_text), tmux_colour(&st.scoped_color), m2),
     ]
 }
 
@@ -293,7 +373,7 @@ pub enum KeyStep {
     Stop,
 }
 
-/// The prefix / ⌥F mark must not stick: tmux posts the focus notice when a
+/// The prefix / ⌥W mark must not stick: tmux posts the focus notice when a
 /// key table is ENTERED (the root binding that switches to it does), but
 /// nothing when the next key leaves it. So while a refresh shows the
 /// client in any table but `root`, the sidebar re-reads ONLY
@@ -755,6 +835,56 @@ mod tests {
         // No client: no chip (the classic header), the global options still read.
         let bar = Bar::build(&snap, Some("/dev/nope"));
         assert_eq!((bar.space.is_none(), bar.stale.as_deref()), (true, Some("save refused")));
+    }
+
+    /// The meters' numbers: the numeric options when set, else the text
+    /// (with or without a delta, a pooled `Σ`, `idle`, `--%`); the pace
+    /// tick is used − delta when `_expected` is unset.
+    #[test]
+    fn usage_meters_read_numbers_then_text() {
+        let m = crate::tmux::Meter::default();
+        let u = Usage::read("W".into(), "60% (+17%)".into(), None, &m);
+        assert_eq!((u.used, u.delta, u.expected, u.pooled, u.idle), (Some(60.0), Some(17), Some(43.0), false, false));
+        let u = Usage::read("S".into(), "22% (Σ-87%)".into(), None, &m);
+        // Unclamped: the pace says 109% (the meter clamps its tick, not the number).
+        assert_eq!((u.used, u.delta, u.expected, u.pooled), (Some(22.0), Some(-87), Some(109.0), true));
+        // Over the window: the real level stays, from the text or the option.
+        let u = Usage::read("W".into(), "104% (+30%)".into(), None, &m);
+        assert_eq!((u.used, u.expected), (Some(104.0), Some(74.0)));
+        let over = crate::tmux::Meter { used: "104".into(), ..Default::default() };
+        assert_eq!(Usage::read("W".into(), "--%".into(), None, &over).used, Some(104.0));
+        let u = Usage::read("S".into(), "21%".into(), None, &m);
+        assert_eq!((u.used, u.delta, u.expected), (Some(21.0), None, None));
+        for t in ["idle", "--%", "junk"] {
+            let u = Usage::read("S".into(), t.into(), None, &m);
+            assert_eq!((u.used, u.expected, u.idle), (None, None, t == "idle"), "{t}");
+        }
+        // The numeric options win over the text.
+        let m = crate::tmux::Meter { used: "60".into(), expected: "43".into(), delta: "+17".into(), resets: "1792569600".into(),
+            members: "1:90:0,2:30:1".into() };
+        let u = Usage::read("W".into(), "60% (+17%)".into(), None, &m);
+        assert_eq!((u.used, u.expected, u.delta, u.resets, u.pooled), (Some(60.0), Some(43.0), Some(17), Some(1_792_569_600), true));
+        assert_eq!(u.members, [Member { slot: Some(1), used: 90, active: false }, Member { slot: Some(2), used: 30, active: true }]);
+        // An account the script has no slot for (`:27:1`) still counts: the pool stays a pool.
+        assert_eq!(parse_members("1:90:0,:27:1"), [Member { slot: Some(1), used: 90, active: false },
+            Member { slot: None, used: 27, active: true }]);
+        let pool = crate::tmux::Meter { used: "58".into(), members: "1:90:0,:27:1".into(), ..Default::default() };
+        assert!(Usage::read("W".into(), "58%".into(), None, &pool).pooled);
+        let one = crate::tmux::Meter { used: "27".into(), members: ":27:1".into(), ..Default::default() };
+        assert!(!Usage::read("W".into(), "27%".into(), None, &one).pooled);
+        // The numbers beat the text; a single account (no members) is no pool.
+        let m = crate::tmux::Meter { used: "13".into(), expected: "51".into(), delta: "-38".into(), ..Default::default() };
+        let u = Usage::read("S".into(), "99% (+1%)".into(), None, &m);
+        assert_eq!((u.used, u.expected, u.delta, u.pooled), (Some(13.0), Some(51.0), Some(-38), false));
+        assert!(parse_members("junk,3:x:1,4:5").is_empty());
+        // Through the snapshot: the weekly window's five fields; the
+        // session's empty (no data yet), so its text.
+        let mut st = vec!["root", "", "", "", "21%", "green", "60% (+17%)", "red", "", "", "", "", "", "off"];
+        st.extend(["", "", "", "", "", "61", "44", "+17", "1792569600", "1:90:0,2:30:1"]);
+        let snap = Snapshot::parse(&[row("main", 1, "@2", &[]), client("main", "@2", &st)].join("\n"));
+        let bar = Bar::build(&snap, Some("/dev/ttys999"));
+        assert_eq!((bar.usage[1].used, bar.usage[1].expected, bar.usage[1].members.len()), (Some(61.0), Some(44.0), 2));
+        assert_eq!((bar.usage[0].used, bar.usage[0].expected), (Some(21.0), None));
     }
 
     /// The key-table poll: nothing at all in root; started when a refresh

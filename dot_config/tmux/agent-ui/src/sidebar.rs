@@ -38,12 +38,16 @@
 //!   the signal pipe, the Darwin notice fd ([`notice`]: agent-state and focus
 //!   notices) and the client's exit watch. A notice schedules one snapshot
 //!   [`notice::DEBOUNCE`] later (a burst is one refresh); a click that moves
-//!   refreshes at once. The timer is only a safety net: [`FALLBACK`] (5 s)
-//!   normally, [`TICK`] (0.5 s) while a drawn agent pulses with
-//!   `@agent_blink` (the watcher flips it each second) or when there is no
-//!   notice fd. A redraw happens only when the rendered buffer changed.
-//!   The one exception: tmux posts the focus notice on ENTERING a key table
-//!   (prefix, ⌥F's `jump`) but nothing on leaving it, so while a refresh
+//!   refreshes at once. The timer is only a safety net: [`FALLBACK`] (5 s),
+//!   or [`TICK`] (0.5 s) when there is no notice fd. A redraw happens only
+//!   when the rendered buffer changed.
+//! - **The spinner.** While the frame on screen shows a working agent's
+//!   spinner ([`Frame::spin`]) the loop also wakes every [`SPIN_EVERY`]
+//!   (8 fps) to lay the SAME view out again with the next frame: no
+//!   snapshot, no tmux call, and ratatui's diff writes only the spinner
+//!   cells. Nothing working on screen: no such wakeup at all.
+//! - **Key tables.** tmux posts the focus notice on ENTERING a key table
+//!   (prefix, ⌥W's `jump`) but nothing on leaving it, so while a refresh
 //!   shows the client outside `root` the sidebar re-reads just
 //!   `#{client_key_table}` every 150 ms, for at most 10 s per table entered
 //!   (later notices in the same table never extend it), and refreshes once
@@ -52,8 +56,9 @@
 //!   before the alternate screen; SIGHUP / SIGTERM (CMD+B's kill-pane) or a
 //!   closed tty end it quietly, with the terminal restored.
 //! - **The whole UI.** While any sidebar is open the tmux status line is
-//!   hidden and its content drawn here ([`status`]: the space chip, shells,
-//!   usage, the stale save, the prefix / ⌥F / selection marks); the
+//!   hidden and its content drawn here ([`status`]: the card with the space
+//!   chip, shells, usage meters, the stale save, the prefix / ⌥W /
+//!   selection marks); the
 //!   registry behind `@sidebar_open` restores it when the last one leaves.
 //!   Agent rows carry their lifetime letters (`@agent_key`, shared with the
 //!   menu and persisted like it).
@@ -88,9 +93,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant};
 
-/// The fast tick: while a drawn agent pulses (`@agent_blink` flips each
-/// second, so half a second never aliases), or with no notice fd at all.
+/// The fast safety-net tick, with no notice fd at all.
 pub const TICK: Duration = Duration::from_millis(500);
+/// The spinner's frame time (8 fps), only while one is on screen.
+pub const SPIN_EVERY: Duration = Duration::from_millis(125);
 /// The safety-net poll when notices tell us about every change.
 pub const FALLBACK: Duration = Duration::from_secs(5);
 /// The tmux global holding the scope (`space` | `all`; unset: by `@spaces`).
@@ -188,7 +194,7 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
     hide_homes(&mut core.snapshot);
     // Letters as the live sidebar would assign them; `--once` never writes.
     let (view, _) = build_view(&mut core, client.as_deref(), None);
-    let frame = layout(&view, w, h, &Opts { msg: None, bar });
+    let frame = layout(&view, w, h, &Opts { msg: None, bar, spin: 0, now: None });
     let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
     layout::paint(&frame, &mut buf);
     let mut out = io::stdout().lock();
@@ -212,7 +218,7 @@ fn hide_homes(snap: &mut Snapshot) {
 /// list has no git line). No event log. A home window the client sits on is
 /// never an agent row (with `@spaces` off it would be the classic one).
 ///
-/// Letters: [`letters::of_view`], THE assignment the ⌥W menu runs too, on
+/// Letters: [`letters::of_view`], THE assignment the agents menu runs too, on
 /// the unscoped view; every agent row and NEEDS YOU card gets its letter.
 /// `keys`: the live sidebar's in-flight `@agent_key` writes; the writes
 /// returned are the ones to send (None: `--once`, nothing to send).
@@ -244,7 +250,7 @@ fn build_view(core: &mut Core, client: Option<&str>, keys: Option<&mut KeyMemo>)
     (view, if persist { assigned.writes } else { Vec::new() })
 }
 
-/// The menu popup's `-w`: tmux.conf's Option-W cap (at most 100 columns, the
+/// The menu popup's `-w`: tmux.conf's menu cap (at most 100 columns, the
 /// whole client when narrower). display-popup neither expands formats in
 /// `-w` nor clamps a width wider than the client (it fails), so the client's
 /// width is asked for first; unknown → the old 75%.
@@ -255,7 +261,7 @@ pub fn popup_width(client_cols: Option<u16>) -> String {
     }
 }
 
-/// ≡ / `… more` / `+K more`: the Option-W menu as a popup on the sidebar's
+/// `… more` / `+K` / the idle fold: the agents menu (prefix q's) as a popup on the sidebar's
 /// client (Strip.open_menu → `roster_popup_argv`). This binary's `menu` when
 /// its path is known (pointed at the same server; `-B`, since it draws its
 /// own border and title), else the Python popup with tmux's ` agents ` title.
@@ -364,6 +370,8 @@ struct App {
     keypoll: KeyPoll,
     /// How many cheap key-table reads ran (observable state for the tests).
     key_reads: u32,
+    /// The spinner's clock: its frame is the [`SPIN_EVERY`]s since this.
+    started: Instant,
 }
 
 impl App {
@@ -399,7 +407,22 @@ impl App {
             keeper: Keeper::default(),
             keypoll: KeyPoll::default(),
             key_reads: 0,
+            started: Instant::now(),
         }
+    }
+
+    /// The spinner frame at `now`.
+    fn spin_at(&self, now: Instant) -> usize {
+        (now.saturating_duration_since(self.started).as_millis() / SPIN_EVERY.as_millis()) as usize
+    }
+
+    /// When the spinner next turns, if the frame on screen shows one.
+    fn spin_due(&self, now: Instant) -> Option<Instant> {
+        if !self.shown.spin {
+            return None;
+        }
+        let next = self.spin_at(now) as u32 + 1;
+        Some(self.started + SPIN_EVERY * next)
     }
 
     fn say(&mut self, text: impl Into<String>) {
@@ -653,7 +676,7 @@ impl App {
 
     /// The safety-net poll interval ([`TICK`] / [`FALLBACK`]).
     fn cadence(&self) -> Duration {
-        if self.notices.fd().is_none() || layout::pulses(&self.view) {
+        if self.notices.fd().is_none() {
             TICK
         } else {
             FALLBACK
@@ -671,7 +694,11 @@ impl App {
         let size = term.size()?;
         let now = text::now();
         let msg = self.msg.as_ref().filter(|(_, until)| *until > now).map(|(m, _)| m.clone());
-        let frame = layout(&self.view, size.width, size.height, &Opts { msg, bar: self.bar.clone() });
+        let spin = self.spin_at(Instant::now());
+        // Ages at this frame's clock (no tmux call), so a spinner frame
+        // between snapshots never shows a stale one.
+        let opts = Opts { msg, bar: self.bar.clone(), spin, now: Some(now) };
+        let frame = layout(&self.view, size.width, size.height, &opts);
         let mut buf = Buffer::empty(Rect::new(0, 0, size.width, size.height));
         layout::paint(&frame, &mut buf);
         if !self.force && self.buf.as_ref() == Some(&buf) {
@@ -714,6 +741,10 @@ impl App {
             // Only while the client is in a key table other than root.
             if let Some(k) = self.keypoll.due() {
                 wake = wake.min(k);
+            }
+            // Only while a spinner is on screen: its next frame.
+            if let Some(s) = self.spin_due(now) {
+                wake = wake.min(s);
             }
             let fds = [self.notices.fd(), self.watch.as_ref().map(term::ProcWatch::fd)];
             let (has_input, [noticed, exited]) = sig.wait(0, fds, wake.saturating_duration_since(now))?;
@@ -959,24 +990,42 @@ mod tests {
         assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("couldn't set @strip_scope"));
     }
 
-    /// The cadence: the fast tick only while something drawn pulses (or
-    /// with no notice fd); the safety net otherwise.
+    /// The cadence: the fast tick only with no notice fd, the safety net
+    /// otherwise, working agents or not. The spinner's own wakeup exists
+    /// only while the frame on screen draws one, at the next 125 ms step,
+    /// and each step is the next spinner frame.
     #[test]
-    fn cadence_follows_the_pulse() {
+    fn cadence_and_the_spinner() {
         let mut a = app();
         assert_eq!(a.cadence(), TICK); // no notice fd: poll
-        a.notices = Notices::register(&[format!("com.mackhaymond.agent-ui.test.{}.cad", std::process::id())]);
-        if a.notices.fd().is_none() {
-            return; // no notify(3) here
-        }
-        assert_eq!(a.cadence(), FALLBACK);
-        let snap = Snapshot::parse(&[row("main", 1, "@1", &[("state", "running")]),
+        assert_eq!(a.spin_due(Instant::now()), None); // nothing on screen spins
+        let snap = Snapshot::parse(&[row("main", 1, "@1", &[("state", "running"), ("summary", "Busy")]),
             "\x1fclient\x1f/dev/ttys999\x1f@2\x1fmain".into(), row("main", 2, "@2", &[])].join("\n"));
         let c = crate::collate::Collator::new("C");
         let args = BuildArgs { client: Some("/dev/ttys999"), now: 0.0, collator: &c, git: None, log: vec![], watcher_age: None };
         a.view = ViewModel::build(&snap, args);
-        assert!(layout::pulses(&a.view));
-        assert_eq!(a.cadence(), TICK);
+        a.shown = layout(&a.view, 34, 30, &Opts::default());
+        assert!(a.shown.spin);
+        let now = a.started + Duration::from_millis(300);
+        assert_eq!(a.spin_at(now), 2);
+        assert_eq!(a.spin_due(now), Some(a.started + Duration::from_millis(375)));
+        let frame = |spin| layout(&a.view, 34, 30, &Opts { spin, ..Opts::default() });
+        let (f0, f1) = (frame(0), frame(1));
+        let y = f0.rows.iter().position(|r| r.text().contains("Busy")).unwrap();
+        assert!(f0.rows[y].text().contains("⠋ working") && f1.rows[y].text().contains("⠙ working"));
+        // Only the spinner changed.
+        let diff: Vec<usize> = (0..f0.rows.len()).filter(|&k| f0.rows[k] != f1.rows[k]).collect();
+        assert_eq!(diff, [y]);
+        a.notices = Notices::register(&[format!("com.mackhaymond.agent-ui.test.{}.cad", std::process::id())]);
+        if a.notices.fd().is_some() {
+            assert_eq!(a.cadence(), FALLBACK);
+        }
+        // Idle again: no spinner, no wakeup.
+        let snap = Snapshot::parse(&[row("main", 1, "@1", &[("state", "idle"), ("summary", "Busy")])].join("\n"));
+        let args = BuildArgs { client: None, now: 0.0, collator: &c, git: None, log: vec![], watcher_age: None };
+        a.view = ViewModel::build(&snap, args);
+        a.shown = layout(&a.view, 34, 30, &Opts::default());
+        assert_eq!((a.shown.spin, a.spin_due(now)), (false, None));
     }
 
     /// The loop's side of the key-table poll: nothing read while the poll is
@@ -1073,7 +1122,7 @@ mod tests {
         }
     }
 
-    /// The sidebar and the ⌥W menu assign the SAME letters from the same
+    /// The sidebar and the agents menu assign the SAME letters from the same
     /// snapshot (one shared function, `letters::of_view`): unique, home
     /// windows never lettered, a duplicate going to the lower window id, a
     /// parked window's stale claim unset. The writes are the menu's, sent

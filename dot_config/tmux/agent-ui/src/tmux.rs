@@ -362,12 +362,31 @@ pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
 /// instead of status-right, read in the same one call (no script runs).
-pub const STATUS_FORMATS: [&str; 14] = [
+pub const STATUS_FORMATS: [&str; 29] = [
     "#{client_key_table}", "#{@sidebar_open}", "#{@sidebar_pids}", "#{@resurrect_stale}",
     "#{@codex_session_text}", "#{@codex_session_color}", "#{@codex_weekly_text}", "#{@codex_weekly_color}",
     "#{@codex_scoped_icon}", "#{@codex_scoped_text}", "#{@codex_scoped_color}", "#{@codex_account_label}",
     "#{@codex_provider_label}", "#{status}",
+    // The usage meters' numbers ([`Meter`]), per window: session, weekly, scoped.
+    "#{@codex_session_used}", "#{@codex_session_expected}", "#{@codex_session_delta}", "#{@codex_session_resets}",
+    "#{@codex_session_members}",
+    "#{@codex_weekly_used}", "#{@codex_weekly_expected}", "#{@codex_weekly_delta}", "#{@codex_weekly_resets}",
+    "#{@codex_weekly_members}",
+    "#{@codex_scoped_used}", "#{@codex_scoped_expected}", "#{@codex_scoped_delta}", "#{@codex_scoped_resets}",
+    "#{@codex_scoped_members}",
 ];
+
+/// One usage window's numeric options (`@codex_<w>_used`, `_expected`,
+/// `_delta`, `_resets`, `_members`), raw; "" when unset (the sidebar then
+/// parses `@codex_<w>_text`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Meter {
+    pub used: String,
+    pub expected: String,
+    pub delta: String,
+    pub resets: String,
+    pub members: String,
+}
 
 /// A full client row's field count.
 pub const CLIENT_FIELDS: usize = 9 + STATUS_FORMATS.len();
@@ -384,7 +403,7 @@ pub fn client_fmt() -> String {
 /// ("" = unset, or an older, shorter row).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Status {
-    /// `#{client_key_table}`: "root", "prefix", "jump" (UB's ⌥F table), ...
+    /// `#{client_key_table}`: "root", "prefix", "jump" (UB's ⌥W table), ...
     pub key_table: String,
     /// `@sidebar_open`: how many sidebars are open (the sidebar keeps it).
     pub sidebar_open: String,
@@ -403,6 +422,8 @@ pub struct Status {
     pub provider_label: String,
     /// The `status` option as the client's session sees it ("on", "off", "2"…).
     pub status_line: String,
+    /// The meters' numbers: session, weekly, scoped.
+    pub meters: [Meter; 3],
 }
 
 impl Status {
@@ -422,6 +443,10 @@ impl Status {
             account_label: f(11),
             provider_label: f(12),
             status_line: f(13),
+            meters: [0, 1, 2].map(|k| {
+                let at = 14 + 5 * k;
+                Meter { used: f(at), expected: f(at + 1), delta: f(at + 2), resets: f(at + 3), members: f(at + 4) }
+            }),
         }
     }
 }
@@ -848,6 +873,10 @@ pub(crate) mod tests {
         assert_eq!((c.pid, c.status.key_table.as_str(), c.status.sidebar_open.as_str(), c.status.provider_label.as_str()),
             (Some(77), "v0", "v1", "v12"));
         assert_eq!(c.status.status_line, "v13");
+        // The meters' numbers: five per window, session then weekly then scoped.
+        assert_eq!(c.status.meters[0], Meter { used: "v14".into(), expected: "v15".into(), delta: "v16".into(),
+            resets: "v17".into(), members: "v18".into() });
+        assert_eq!((c.status.meters[1].used.as_str(), c.status.meters[2].members.as_str()), ("v19", "v28"));
         // One field short or long: not a client row.
         assert!(Client::parse(&full[..full.len() - 1].join("\x1f")).is_none());
         let s = Snapshot::parse(&[

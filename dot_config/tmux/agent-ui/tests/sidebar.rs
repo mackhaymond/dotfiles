@@ -144,33 +144,42 @@ fn once_renders_the_fixture() {
     let s = Server::start("once", 80, 24);
     s.fixture();
     let out = s.sidebar(&["--once", "34x30", "--client", CLIENT]);
-    // The terminal's own background: no background colour anywhere but the
-    // six letter badges (no client here, so no row is tinted).
-    assert_eq!(out.matches(";48;").count(), 6, "{out:?}");
+    let raw: Vec<&str> = out.lines().collect();
     let lines = plain(&out);
     assert_eq!(lines.len(), 30);
     for l in &lines {
         assert_eq!(l.chars().count(), 34, "{l:?}");
     }
+    // No client here: the classic title, no card.
     assert!(lines[0].starts_with(" agents") && lines[0].contains("✕1 ◉1 ◐1"), "{lines:#?}");
-    assert!(lines[2..].iter().find(|l| !l.trim().is_empty()).unwrap().starts_with(" needs you"));
+    assert!(lines[1..].iter().find(|l| !l.trim().is_empty()).unwrap().starts_with(" NEEDS YOU"));
     // Needs in agent-jump.sh order: failed first; each card starts with the
-    // agent's letter (display order: work a s d, zeta f).
-    let fail = at(&lines, "▌ f ✕ Broken thing");
-    let ask = at(&lines, "▌ a ◉ proj/Which deck");
+    // agent's letter key-cap (display order: work a s d, zeta f).
+    let fail = at(&lines, "▌ f  Broken thing");
+    let ask = at(&lines, "▌ a  proj/Which deck");
     assert!(fail < ask);
-    // Then the agents, then the spaces list at the bottom, then parked.
-    let agents = ask + at(&lines[ask..], " agents ");
-    assert!(lines[agents].ends_with("by space "), "{lines:#?}");
-    for t in [" s ◐ Long running build ⚙", " d ○ Quiet one", " a ◉ Which deck", " f ✕ Broken thing"] {
+    // Cards are tinted surfaces; the canvas is the terminal's own background
+    // (no background code at all) on the title and section headers.
+    assert!(raw[fail].contains(";48;2;"), "{:?}", raw[fail]);
+    // Then the agents, grouped by space under a dot and the name (no rule).
+    let agents = at(&lines, " AGENTS");
+    assert!(lines[agents].ends_with("all spaces "), "{lines:#?}");
+    for y in [0, agents] {
+        assert!(!raw[y].contains(";48;"), "{:?}", raw[y]);
+    }
+    for t in ["  s  Long running", "  d  Quiet one", "  a  Which deck", "  f  Broken thing"] {
         assert!(lines[agents..].iter().any(|l| l.starts_with(t)), "{t}: {lines:#?}");
     }
-    for t in [" work ", " zeta "] {
-        assert!(lines[agents..].iter().any(|l| l.starts_with(t) && l.contains('─')), "{t}: {lines:#?}");
+    let s_row = lines.iter().find(|l| l.starts_with("  s  Long running")).unwrap();
+    assert!(s_row.contains(" ⚙ ") && s_row.ends_with("⠋ working "), "{s_row:?}");
+    for t in [" ● work", " ● zeta"] {
+        assert!(lines[agents..].iter().any(|l| l.starts_with(t) && !l.contains('─')), "{t}: {lines:#?}");
     }
-    let spaces = at(&lines, " spaces");
-    assert_eq!(&lines[spaces + 1..29].iter().map(|l| l.split_whitespace().nth(1).unwrap()).collect::<Vec<_>>(),
-        &["main", "work", "zeta"], "{lines:#?}");
+    // The spaces as pills under a rule, then parked.
+    let rule = lines.iter().rposition(|l| l.contains("────")).unwrap();
+    let pills = lines[rule + 1..29].join(" ");
+    let pos: Vec<usize> = [" main ", " work ", " zeta "].iter().map(|n| pills.find(n).unwrap_or_else(|| panic!("{n}: {lines:#?}"))).collect();
+    assert!(pos.windows(2).all(|p| p[0] < p[1]), "{lines:#?}");
     assert!(lines[29].starts_with(" ⏸ 0 parked"));
     assert!(!lines.iter().any(|l| l.starts_with(" log") || l.contains('═')), "{lines:#?}");
     // `--split` (gone) is ignored, not an error.
@@ -186,29 +195,30 @@ fn once_follows_the_scope_options() {
     let tty = s.nested_client("work", "main:8");
     let once = || plain(&s.sidebar(&["--once", "34x30", "--client", &tty]));
     let agents_part = |lines: &[String]| {
-        let start = lines.iter().position(|l| l.starts_with(" agents ") && (l.ends_with("by space ") || l.ends_with("this space ")));
-        lines[start.expect("the agents section")..at(lines, " spaces")].to_vec()
+        let start = lines.iter().position(|l| l.starts_with(" AGENTS"));
+        let end = lines.iter().rposition(|l| l.contains("────")).expect("the spaces");
+        lines[start.expect("the agents section")..end].to_vec()
     };
-    // Classic until an option says otherwise (the header is the client's
-    // space chip now; the agents section says which scope).
+    // Classic until an option says otherwise (the card shows the client's
+    // space chip; the agents section says which scope).
     let classic = once();
-    assert!(classic[0].starts_with("  work ") && classic[0].contains('✕'), "{classic:#?}");
-    assert!(agents_part(&classic)[0].ends_with("by space ") && agents_part(&classic).iter().any(|l| l.starts_with(" zeta ")),
+    assert!(classic[0].starts_with("╭") && classic[1].contains(" work "), "{classic:#?}");
+    assert!(agents_part(&classic)[0].ends_with("all spaces ") && agents_part(&classic).iter().any(|l| l.starts_with(" ● zeta")),
         "{classic:#?}");
     s.tmux(&["set-option", "-g", "@spaces", "on"]);
     let lines = once();
-    assert!(lines[0].starts_with("  work ") && lines[0].contains("◉1 ◐1 ○1") && !lines[0].contains('✕'), "{lines:#?}");
     let body = agents_part(&lines);
-    assert!(body[0].ends_with("this space "), "{lines:#?}");
-    for t in [" a ◉ Which deck", " s ◐ Long running build ⚙", " d ○ Quiet one"] {
+    assert!(body[0].ends_with("this space ") && body[1].starts_with(" ● work") && body[1].contains("◉1 ◐1 ○1"), "{lines:#?}");
+    // (The client sits on work:1: its row is the highlighted one.)
+    for t in ["▎ a  Which deck", "  s  Long running", "  d  Quiet one"] {
         assert!(body.iter().any(|l| l.starts_with(t)), "{t}: {lines:#?}");
     }
     assert!(!body.iter().any(|l| l.contains("zeta") || l.contains("Broken")), "{lines:#?}");
     // NEEDS YOU stays global, with the same letters.
-    assert!(lines.iter().any(|l| l.starts_with("▌ f ✕ Broken thing")), "{lines:#?}");
+    assert!(lines.iter().any(|l| l.starts_with("▌ f  Broken thing")), "{lines:#?}");
     s.tmux(&["set-option", "-g", "@strip_scope", "all"]);
     let lines = once();
-    assert!(lines[0].contains('✕') && agents_part(&lines).iter().any(|l| l.starts_with(" zeta ")), "{lines:#?}");
+    assert!(agents_part(&lines).iter().any(|l| l.starts_with(" ● zeta")), "{lines:#?}");
     // Back to classic: byte for byte what it drew before any option was set.
     s.tmux(&["set-option", "-gu", "@strip_scope"]);
     s.tmux(&["set-option", "-gu", "@spaces"]);
@@ -220,14 +230,15 @@ fn once_follows_the_scope_options() {
     s.tmux(&["switch-client", "-c", &tty, "-t", "work:0"]);
     let lines = once();
     assert!(!agents_part(&lines).iter().any(|l| l.contains("home")), "{lines:#?}");
-    // ...it is the space's shell 1 in the status block (⌥1, ⌂).
-    assert!(lines[1].starts_with(" ⌥1 ⌂home"), "{lines:#?}");
+    // ...it is the space's shell 1 on the card (⌥1, ⌂).
+    assert!(lines[1].contains(" work ") && lines[1].contains("⌥1 ⌂home"), "{lines:#?}");
     assert!(lines.iter().any(|l| l.starts_with(" ● work")), "{lines:#?}");
 }
 
-/// The spaces list reads each session's @space_index and @space_hidden off
-/// the window rows (session options through the window format): ⌃N labels,
-/// index order, hidden sessions left out.
+/// The spaces read each session's @space_index and @space_hidden off the
+/// window rows (session options through the window format): ⌃N digits on
+/// the pills, index order, hidden sessions left out; and the agents' groups
+/// follow the same order.
 #[test]
 fn once_lists_spaces_by_space_index() {
     let s = Server::start("idx", 80, 24);
@@ -238,13 +249,13 @@ fn once_lists_spaces_by_space_index() {
     s.tmux(&["new-session", "-d", "-s", "secret", LIFE]);
     s.tmux(&["set-option", "-t", "secret", "@space_hidden", "1"]);
     let lines = plain(&s.sidebar(&["--once", "34x30", "--client", CLIENT]));
-    let sp = at(&lines, " spaces");
-    let rows: Vec<&str> = lines[sp + 1..29].iter().map(|l| l.trim_end()).collect();
-    assert_eq!(rows.len(), 3, "{lines:#?}");
-    for (r, want) in rows.iter().zip([" ⌃1 ○ main", " ⌃2 ○ zeta", " ⌃3 ○ work"]) {
-        assert!(r.starts_with(want), "{want}: {lines:#?}");
-    }
+    let rule = lines.iter().rposition(|l| l.contains("────")).unwrap();
+    let pills = lines[rule + 1..29].join(" ");
+    let pos: Vec<usize> = [" 1 main ", " 2 zeta ", " 3 work "].iter().map(|n| pills.find(n).unwrap_or_else(|| panic!("{n}: {lines:#?}"))).collect();
+    assert!(pos.windows(2).all(|p| p[0] < p[1]), "{lines:#?}");
     assert!(!lines.iter().any(|l| l.contains("secret")), "{lines:#?}");
+    // The groups: ⌃N order too (zeta before work, unlike by name).
+    assert!(at(&lines, " ● zeta") < at(&lines, " ● work"), "{lines:#?}");
 }
 
 /// Right-click → park, end to end, with a FAKE stash.sh (`AGENT_UI_SCRIPTS`):
@@ -273,7 +284,7 @@ fn right_click_parks_through_stash_sh() {
         dir.display(), s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
-    wait_for("the first frame", || screen().contains("needs you"));
+    wait_for("the first frame", || screen().contains("NEEDS YOU"));
     std::thread::sleep(Duration::from_millis(300));
     let send = |bytes: &str| {
         let hex: Vec<String> = bytes.bytes().map(|b| format!("{b:02x}")).collect();
@@ -282,8 +293,8 @@ fn right_click_parks_through_stash_sh() {
         s.tmux(&a);
     };
     let lines: Vec<String> = screen().lines().map(String::from).collect();
-    let body = at(&lines, " agents ");
-    let y = body + lines[body..].iter().position(|l| l.contains("○ Quiet one")).unwrap() + 1;
+    let body = at(&lines, " AGENTS");
+    let y = body + lines[body..].iter().position(|l| l.contains("Quiet one")).unwrap() + 1;
     let win = s.tmux(&["display-message", "-p", "-t", "work:3", "#{window_id}"]).trim().to_string();
     send(&format!("\x1b[<2;6;{y}M\x1b[<2;6;{y}m"));
     wait_for("the park", || s.tmux(&["list-windows", "-a", "-F", "#{session_name} #{window_id}"]).contains(&format!("stash {win}")));
@@ -335,7 +346,7 @@ fn the_dashboard_pane_is_never_a_target() {
     // The status block: shell 1 is the home, labelled by the SHELL's cwd.
     let tty = s.nested_client("work", "main:8");
     let lines = plain(&s.sidebar(&["--once", "34x30", "--client", &tty]));
-    assert!(lines[1].starts_with(" ⌥1 ⌂tmp"), "{lines:#?}");
+    assert!(lines[1].contains("⌥1 ⌂tmp"), "{lines:#?}");
     // The live sidebar, with a fake agent-jump.sh that just switches the
     // client: a click on ⌥1 lands on the home with the shell focused.
     let dir = std::env::temp_dir().join(format!("agentui-dash-{}", std::process::id()));
@@ -348,11 +359,17 @@ fn the_dashboard_pane_is_never_a_target() {
     s.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
-    wait_for("the first frame", || screen().lines().nth(1).is_some_and(|l| l.starts_with(" ⌥1 ⌂tmp")));
+    wait_for("the first frame", || screen().lines().nth(1).is_some_and(|l| l.contains("⌥1 ⌂tmp")));
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(s.tmux(&["display-message", "-p", "-t", "work:0", "#{pane_id}"]).trim(), dash);
-    s.tmux(&["send-keys", "-t", "main:9", "-H", "1b", "5b", "3c", "30", "3b", "33", "3b", "32", "4d", "1b", "5b", "3c", "30",
-        "3b", "33", "3b", "32", "6d"]); // ESC[<0;3;2M ESC[<0;3;2m: a click on ⌥1
+    // A click on the ⌥1 pill, wherever the card put it.
+    let line = screen().lines().nth(1).unwrap().to_string();
+    let x = line[..line.find("⌥1").unwrap()].chars().count() + 1;
+    let click = format!("\x1b[<0;{x};2M\x1b[<0;{x};2m");
+    let hex: Vec<String> = click.bytes().map(|b| format!("{b:02x}")).collect();
+    let mut a = vec!["send-keys", "-t", "main:9", "-H"];
+    a.extend(hex.iter().map(String::as_str));
+    s.tmux(&a);
     wait_for("the client on the home", || {
         s.tmux(&["list-clients", "-F", "#{client_tty} #{window_index}"]).lines().any(|l| l == format!("{tty} 0"))
     });
@@ -360,7 +377,7 @@ fn the_dashboard_pane_is_never_a_target() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The prefix / ⌥F marks clear with NO notice: tmux posts one on entering
+/// The prefix / ⌥W marks clear with NO notice: tmux posts one on entering
 /// a key table but none on leaving it, so the sidebar re-reads the table
 /// while it is not root (well inside the 5 s safety net, which is all
 /// that runs here: nothing pulses).
@@ -376,18 +393,19 @@ fn key_table_marks_clear_without_a_notice() {
     let cmd = format!("env AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
-    wait_for("the first frame", || screen().contains("needs you"));
+    wait_for("the first frame", || screen().contains("NEEDS YOU"));
     std::thread::sleep(Duration::from_millis(300));
-    for (table, want) in [("prefix", " prefix "), ("jump", "⌥F jump")] {
+    let card = || screen().lines().take(4).collect::<Vec<_>>().join("\n");
+    for (table, want) in [("prefix", " prefix "), ("jump", "⌥W jump")] {
         // Entering the table posts the notice (the root binding does)...
         s.tmux(&["switch-client", "-c", &tty, "-T", table]);
         post(&focus);
-        wait_for(table, || screen().lines().next().is_some_and(|l| l.contains(want)));
+        wait_for(table, || card().contains(want));
         // ...leaving it posts nothing: the poll sees root and redraws.
         std::thread::sleep(Duration::from_millis(400));
         s.tmux(&["switch-client", "-c", &tty, "-T", "root"]);
         let t = Instant::now();
-        wait_for("the mark to clear", || !screen().lines().next().unwrap_or("").contains(want));
+        wait_for("the mark to clear", || !card().contains(want));
         assert!(t.elapsed() < Duration::from_millis(1500), "{table}: {:?}", t.elapsed());
     }
     assert_eq!(s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_dead}"]).trim(), "0");
@@ -416,7 +434,7 @@ fn live_loop_draws_follows_notices_and_exits_quietly() {
     let cmd = format!("env AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
-    wait_for("the first frame", || screen().contains("needs you"));
+    wait_for("the first frame", || screen().contains("NEEDS YOU"));
     // The marker CMD+B finds the pane by: the title.
     assert_eq!(s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_title}"]).trim(), "agent-strip");
     std::thread::sleep(Duration::from_millis(300));
@@ -425,7 +443,7 @@ fn live_loop_draws_follows_notices_and_exits_quietly() {
     s.tmux(&["set-option", "-w", "-t", "work:3", "@agent_state", "needs-input"]);
     let t = Instant::now();
     post(&state);
-    wait_for("the state notice", || screen().contains("▌3 ◉ Quiet one") || screen().contains("◉ Quiet one"));
+    wait_for("the state notice", || screen().lines().any(|l| l.starts_with("▌") && l.contains("Quiet one")));
     assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
     // A rename with the focus notice, the same.
     s.tmux(&["rename-session", "-t", "zeta", "omega"]);
@@ -434,9 +452,8 @@ fn live_loop_draws_follows_notices_and_exits_quietly() {
     wait_for("the focus notice", || screen().contains(" omega"));
     assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
 
-    // The wheel scrolls nothing; a toolbar click runs `next` on the fake
-    // client (refused by agent-jump.sh, never reaching a real one) and the
-    // sidebar keeps running.
+    // The wheel scrolls nothing; a click on a blank cell only hands focus
+    // back, and the sidebar keeps running.
     let send = |bytes: &str| {
         let hex: Vec<String> = bytes.bytes().map(|b| format!("{b:02x}")).collect();
         let mut a = vec!["send-keys", "-t", "main:9", "-H"];
@@ -478,9 +495,9 @@ fn the_sidebar_leaves_with_its_client() {
     let cmd = format!("env AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
-    wait_for("the first frame", || screen().contains("needs you"));
+    wait_for("the first frame", || screen().contains("NEEDS YOU"));
     std::thread::sleep(Duration::from_millis(300));
-    assert!(screen().starts_with("  work "), "{}", screen());
+    assert!(screen().starts_with("╭") && screen().lines().nth(1).unwrap().contains(" work "), "{}", screen());
     // Open: counted, the status line hidden; its job still runs.
     let opt = |o: &str| s.tmux(&["show-options", "-gqv", o]).trim().to_string();
     let pid = s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_pid}"]).trim().to_string();
@@ -488,13 +505,13 @@ fn the_sidebar_leaves_with_its_client() {
     wait_for("the status job", || job.exists());
     // Letters persisted to @agent_key, as the menu would (work a s d, zeta f).
     wait_for("the letters", || s.tmux(&["show-options", "-wqv", "-t", "work:3", "@agent_key"]).trim() == "d");
-    assert!(screen().lines().any(|l| l.starts_with(" d ○ Quiet one")), "{}", screen());
+    assert!(screen().lines().any(|l| l.starts_with("  d  Quiet one")), "{}", screen());
     // The client's key table, told by the focus notice: the prefix mark, the
-    // ⌥F hint, prefix v's selection.
-    // (UB's ⌥F table and stash.sh's, here with one key each so they exist.)
+    // ⌥W hint, prefix v's selection.
+    // (UB's ⌥W table and stash.sh's, here with one key each so they exist.)
     s.tmux(&["bind-key", "-T", "jump", "a", "display-message", "a"]);
     s.tmux(&["bind-key", "-T", "stash", "Escape", "display-message", "esc"]);
-    for (table, want) in [("prefix", " prefix "), ("jump", "⌥F jump"), ("stash", "0 selected")] {
+    for (table, want) in [("prefix", " prefix "), ("jump", "⌥W jump"), ("stash", "0 selected")] {
         s.tmux(&["switch-client", "-c", &tty, "-T", table]);
         post(&focus);
         wait_for(table, || screen().contains(want));
@@ -518,18 +535,18 @@ fn the_sidebar_leaves_with_its_client() {
     wait_for("the line hidden again", || opt("status") == "off");
     // @strip_scope set from outside (tmux's M-v) plus the focus notice: the
     // agents section follows at once, and back.
-    for (scope, title) in [("space", "this space"), ("all", "by space")] {
+    for (scope, title) in [("space", "this space"), ("all", "all spaces")] {
         s.tmux(&["set-option", "-g", "@strip_scope", scope]);
         let t = Instant::now();
         post(&focus);
-        wait_for("the scope from outside", || screen().lines().any(|l| l.starts_with(" agents") && l.trim_end().ends_with(title)));
+        wait_for("the scope from outside", || screen().lines().any(|l| l.starts_with(" AGENTS") && l.trim_end().ends_with(title)));
         assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
     }
     // A window switch on the client, then the focus notice (tmux's hooks
-    // post it): the highlight follows.
+    // post it): the highlight (and its blue edge) follows.
     s.tmux(&["select-window", "-t", "work:3"]);
     post(&focus);
-    wait_for("the window switch", || screen().lines().any(|l| l.contains("Quiet one") && l.contains("here")));
+    wait_for("the window switch", || screen().lines().any(|l| l.starts_with("▎") && l.contains("Quiet one")));
     assert_eq!(s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_dead}"]).trim(), "0");
     // Suspended (prefix C-z): tmux 3.7 drops the client from list-clients,
     // but it is alive, so the sidebar stays (a notice forces a refresh).
@@ -592,7 +609,7 @@ fn the_registry_counts_sidebars_and_repairs_crashes() {
     let start = |win: &str| -> String {
         let cmd = format!("env AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}", s.name);
         s.tmux(&["new-window", "-d", "-t", win, "-n", "sb", &cmd]);
-        wait_for("a first frame", || s.tmux(&["capture-pane", "-p", "-t", win]).contains("needs you"));
+        wait_for("a first frame", || s.tmux(&["capture-pane", "-p", "-t", win]).contains("NEEDS YOU"));
         s.tmux(&["display-message", "-p", "-t", win, "#{pane_pid}"]).trim().to_string()
     };
     let kill = |sig: &str, pid: &str| assert!(Command::new("kill").args([sig, pid]).status().unwrap().success());
