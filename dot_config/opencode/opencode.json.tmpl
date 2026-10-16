@@ -67,6 +67,15 @@
         "--mcp"
       ],
       "enabled": true
+    },
+    "tmux": {
+      "type": "remote",
+      "url": "http://127.0.0.1:7998/mcp",
+      "headers": {
+        "Authorization": "Bearer {file:~/.local/state/tmux-mcp/token}"
+      },
+      "oauth": false,
+      "enabled": true
     }
   },
   "enabled_providers": [

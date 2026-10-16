@@ -194,7 +194,8 @@ tmux list-clients -F '#{client_name} space=#{@space_index} #{session_name}:#{win
 # → /dev/ttys000 space=1 main:7 @0 key=j table=root
 ```
 
-**where am I**: Claude Code: `mcp__tmux__whoami`. Codex/OpenCode:
+**where am I**: Claude Code and Codex: `mcp__tmux__whoami`; OpenCode:
+`tmux_whoami`. Without the MCP:
 `tmux display -p -t "$TMUX_PANE" '#{session_name} space=#{@space_index} #{window_index} key=#{@agent_key}'`.
 If that says session `agents`, you are in a pty MCP helper shell, not your own
 tab: use whoami.
@@ -207,9 +208,9 @@ Hidden-ness of a session: `tmux display -p -t '=stash' '#{@space_hidden}'`
 
 ## Reaching a peer
 
-1. **tmux MCP first; it speaks Mack's vocabulary** (Claude Code has
-   `mcp__tmux__*`). Its resources and pane references use the sidebar's
-   names:
+1. **tmux MCP first; it speaks Mack's vocabulary** (Claude Code and Codex
+   have `mcp__tmux__*`; OpenCode's orchestrator has `tmux_*`). Its
+   resources and pane references use the sidebar's names:
    - `tmux://d/<handle>`: agent D (the letter, global; `list_panes` prints
      `[d] @handle`). A bare `"d"` (either case) also works as a pane
      reference. Mack can `@`-mention `@tmux:tmux://d/tmux-agent-sidebar`.
@@ -230,8 +231,9 @@ Hidden-ness of a session: `tmux display -p -t '=stash' '#{@space_hidden}'`
    `read_pane` (its recent conversation turns), and `message_agent` (a
    bracketed paste into its prompt, queued if it is mid-turn, attributed
    `[message from @you]`, refused for non-agent panes).
-2. **No tmux MCP** (Codex and OpenCode, as configured today): call the same
-   server from the shell with the bundled helper. The token is read from
+2. **No tmux MCP tools** (a client without it configured, an OpenCode
+   subagent, or the tools failed to load): call the same server from the
+   shell with the bundled helper. The token is read from
    `~/.local/state/tmux-mcp/token` and never goes on the command line:
    ```sh
    H=~/.agents/skills/tmux-workspace/scripts/tmux-mcp-call.py

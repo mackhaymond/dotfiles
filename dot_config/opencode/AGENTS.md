@@ -116,9 +116,15 @@ agent, letter, parked tab or NEEDS YOU.
   global and stable for its life: "agent D" = key d, any space (⌥W d). ⌘N
   is the Nth agent of the current space and shifts, so name agents by
   letter. Parked agents have no letter.
-- **Reach a peer** through the shared tmux MCP server (pane `"d"` /
-  `tmux://d/<handle>` for an agent, `"cua-notch:2"` for a shell). It is not
-  wired into OpenCode, so call it from the shell:
+- **Reach a peer** through the shared `tmux` MCP server (pane `"d"` /
+  `tmux://d/<handle>` for an agent, `"cua-notch:2"` for a shell). It is
+  wired into OpenCode as `tmux_*` tools (`tmux_list_panes`,
+  `tmux_read_pane`, `tmux_message_agent`, `tmux_name_pane`, `tmux_whoami`,
+  `tmux_send_keys`; the orchestrator has them, subagents don't). Start with
+  `tmux_list_panes`; prefer `tmux_message_agent` (it refuses non-agent
+  panes) over `tmux_send_keys`. Peers see this OpenCode tab as a shell, so
+  they can read it but not `message_agent` it. If the tools are missing,
+  call the same server from the shell:
   `python3 ~/.agents/skills/tmux-workspace/scripts/tmux-mcp-call.py
   read_pane '{"pane": "d"}'` (also `list_panes`, `message_agent`). Read-only
   `tmux list-windows -a -F …` always works. Never type into an agent's pane.
