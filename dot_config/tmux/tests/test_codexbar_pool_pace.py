@@ -531,6 +531,44 @@ class MemberTests(PoolPaceTestCase):
                           opts['@codex_session_members']),
                          ('10', '', '1:20:0,2:0:1'))     # the active account has no reset
 
+    def test_idle_rule_matches_the_apps(self):
+        """'idle' iff the ACTIVE session is idle AND the pooled level is 0
+        (the apps: activeIdle && pool.used <= 0)."""
+        def session(other_pct, other_resets, active_used, active_resets):
+            slot1 = {'fetchedAt': NOW - 60,
+                     'lastGood': {'five_hour': {'pct': other_pct,
+                                                'resets_at': other_resets and iso_cswap(other_resets)},
+                                  'seven_day': {'pct': 90.0, 'resets_at': iso_cswap(A1_WEEKLY_RESETS)},
+                                  'scoped': []}}
+            self.home.cswap(slot1=slot1)
+            self.home.endpoint(session=active_used, session_resets=active_resets)
+            block = self.home.refresh()
+            self.assertEqual(block['session_pace']['scope'], 'pool')
+            return block
+
+        # Active idle, the other account's window just opened at 0%: the pool
+        # is at 0, so "idle" — with no numbers published for it.
+        block = session(0.0, NOW + 4 * HOUR, 0, None)
+        self.assertEqual(block['session_pace']['used'], 0)
+        self.assertEqual(block['session_text'], 'idle')
+        self.assertEqual(block['session_color'], 'brightblack')
+        opts = self.home.pace_opts()
+        self.assertEqual({opts[f'@codex_session_{f}'] for f in
+                          ('used', 'expected', 'delta', 'resets', 'members')}, {''})
+        # Active idle by a PASSED reset, the other at 0%: idle too.
+        block = session(0.0, NOW + 4 * HOUR, 30, NOW - HOUR)
+        self.assertEqual(block['session_text'], 'idle')
+        # The ACTIVE account's window is open (at 0%), the other is idle: the
+        # pool is at 0 but the active account is not idle, so it is a number.
+        block = session(0.0, None, 0, NOW + 4 * HOUR)
+        delta = reference_delta([(0, NOW + SESSION_W), (0, NOW + 4 * HOUR)], SESSION_W)
+        self.assertEqual(block['session_text'], f'0% ({delta:+d}%)')
+        self.assertEqual(self.home.pace_opts()['@codex_session_used'], '0')
+        # Active idle, the other at 1%: rounds to 1, not 0 — a number.
+        block = session(1.0, NOW + 4 * HOUR, 0, None)
+        self.assertEqual(block['session_pace']['used'], 1)       # 0.5 rounds away to 1
+        self.assertTrue(block['session_text'].startswith('1% ('))
+
     def test_matched_by_account_not_by_slot_number(self):
         # cswap's usage cache keyed the other way round: still matched by account.
         self.home.cswap()
@@ -653,6 +691,49 @@ class PublishTests(PoolPaceTestCase):
             self.assertEqual(self.tick(NOW + 70), 0)        # set, if empty
         finally:
             os.environ.pop('FAKE_TMUX_OPTS', None)
+
+    def publish(self):
+        self.home.tmux_log.unlink(missing_ok=True)
+        result = subprocess.run(['/bin/bash', str(STATUS), '--publish'], capture_output=True,
+                                text=True, timeout=30, env=self.home.env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rewrite_during_a_publish_is_not_marked_published(self):
+        self.home.cswap()
+        self.home.refresh()
+        # A jq wrapper that, the one time it is armed, rewrites (bumps the
+        # mtime of) usage.json while publish_pace_opts is reading it.
+        real_jq = shutil.which('jq', path='/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin')
+        self.assertIsNotNone(real_jq)
+        armed = self.home.root / 'bump.armed'
+        ref = self.home.root / 'bump.ref'
+        ref.touch()
+        later = time.time() + 60
+        os.utime(ref, (later, later))
+        (self.home.bin / 'jq').write_text(
+            '#!/bin/sh\n'
+            'case "$*" in *\'+ "_pace"\'*)\n'
+            f'  if [ -f "{armed}" ]; then rm -f "{armed}"; touch -r "{ref}" "{self.home.usage}"; fi ;;\n'
+            'esac\n'
+            f'exec "{real_jq}" "$@"\n')
+        (self.home.bin / 'jq').chmod(0o700)
+        armed.touch()
+        self.publish()                          # one ungated publish; the cache moves mid-read
+        self.assertFalse(armed.exists(), 'the bump never fired')
+        marker = self.home.cache / 'pace-opts.published'
+        self.assertLess(marker.stat().st_mtime, self.home.usage.stat().st_mtime)
+        self.assertEqual(self.tick(NOW + 60), 1)    # the rewrite is published, not skipped
+        self.assertEqual(self.tick(NOW + 65), 0)
+
+    def test_login_needed_publishes_no_numbers(self):
+        self.home.cswap()
+        self.home.refresh()
+        data = json.loads(self.home.usage.read_text())
+        data['providers']['claude']['state'] = 'auth_required'
+        self.home.usage.write_text(json.dumps(data))
+        self.publish()
+        self.assertEqual(self.home.published('@codex_weekly_text'), 'Need to log in')
+        self.assertEqual(set(self.home.pace_opts().values()), {''})
 
     def test_another_accounts_block_publishes_no_numbers(self):
         self.home.cswap()

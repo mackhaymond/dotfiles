@@ -1841,7 +1841,8 @@ publish_to_tmux_opts() {
 #                        scope; empty in account scope
 #
 # Each is empty when not known, and all five are empty for a window with no
-# data, one drawn as "idle", or another account's block (drawn "--%").
+# data, one drawn as "idle", another account's block (drawn "--%"), or a
+# block whose state is auth_required (drawn "Need to log in").
 #
 # ALL IN ONE tmux INVOCATION (set-option ... \; set-option ...): a reader
 # polling between separate calls could pair a new `used` with an old
@@ -1862,7 +1863,8 @@ publish_to_tmux_opts() {
 # restarted tmux server, which has lost the options (load_print_context
 # saw the listing without @codex_weekly_used). The one blind spot is the
 # 1-second resolution of bash's -nt: a rewrite in the same second as the
-# last publish, by a path that does not publish itself, waits for the next.
+# last publish's read, by a path that does not publish itself, waits for
+# the next rewrite.
 PACE_OPTS_MARKER="${CACHE_DIR}/pace-opts.published"
 PACE_OPTS_GATED=0
 publish_pace_opts() {
@@ -1878,8 +1880,19 @@ publish_pace_opts() {
     [[ "$recorded" == "$state" ]] && return 0
   fi
 
+  # The cache's mtime is captured BEFORE it is read, and that — not the mtime
+  # after the publish — is what the marker gets: a rewrite landing between
+  # the read and the stamp is then newer than the marker, and the next tick
+  # publishes it instead of taking it as already published.
+  local stamp=''
+  if [[ -f "$CACHE_FILE" ]]; then
+    stamp="${PACE_OPTS_MARKER}.stamp.$$"
+    CODEXBAR_TMP_FILES+=("$stamp")
+    touch -r "$CACHE_FILE" "$stamp" 2>/dev/null || stamp=''
+  fi
+
   local line=''
-  if [[ -f "$CACHE_FILE" && "${CACHE_OTHER_ACCOUNT:-0}" != 1 ]]; then
+  if [[ -f "$CACHE_FILE" && "${CACHE_OTHER_ACCOUNT:-0}" != 1 && "${CACHE_STATE:-ok}" != 'auth_required' ]]; then
     line="$(jq -r --arg p "$DISPLAY_PROVIDER" --arg primary "$PROVIDER_PRIMARY" '
       def signed: if . >= 0 then "+\(.)" else "\(.)" end;
       ((.providers[$p]? // (if $p == $primary then . else {} end)) // {}) as $b
@@ -1904,8 +1917,8 @@ publish_pace_opts() {
     ' "$CACHE_FILE" 2>/dev/null || true)"
   fi
 
-  # Fields by position; an empty line (no cache, other account) leaves every
-  # one empty, which is what gets published.
+  # Fields by position; an empty line (no cache, another account's block, a
+  # login needed) leaves every one empty, which is what gets published.
   local v=()
   IFS=$'\x1f' read -r -a v <<<"$line" || true
   local args=() w f n=0
@@ -1916,12 +1929,12 @@ publish_pace_opts() {
       n=$(( n + 1 ))
     done
   done
-  tmux "${args[@]}" >/dev/null 2>&1 || return 0
-  # Stamped with the cache's own mtime, so the next rewrite (whenever it
-  # lands) is newer; a failed publish leaves the marker and is retried.
-  if [[ -f "$CACHE_FILE" ]]; then
-    { printf '%s\n' "$state" >"$PACE_OPTS_MARKER" && touch -r "$CACHE_FILE" "$PACE_OPTS_MARKER"; } 2>/dev/null || true
+  if tmux "${args[@]}" >/dev/null 2>&1 && [[ -n "$stamp" ]]; then
+    # Stamped with the mtime captured above; a failed publish leaves the
+    # marker as it was, and the next tick retries.
+    { printf '%s\n' "$state" >"$PACE_OPTS_MARKER" && touch -r "$stamp" "$PACE_OPTS_MARKER"; } 2>/dev/null || true
   fi
+  [[ -n "$stamp" ]] && rm -f "$stamp" 2>/dev/null
   return 0
 }
 
@@ -3096,8 +3109,8 @@ json_int_or_null() {
 #    members: [{slot, email, used, resets_at, active, as_of}]}
 #
 # and in the pool case <family>_text is the pool's level and delta,
-# "59% (+16%)" (a pooled session reads "idle" only when every member is
-# idle), <family>_pace_color
+# "59% (+16%)" (a pooled session reads "idle" when the active account is
+# idle and the pooled level rounds to 0 — the apps' rule), <family>_pace_color
 # is the pooled delta's color, and <family>_color runs the pooled level and
 # pace through color_for_level_and_pace — red regardless when the ACTIVE
 # account itself is at 100% or critical (pool_window_color). @codexbar_pool_pace /
@@ -3113,8 +3126,7 @@ json_int_or_null() {
 # POOL_SLOT, the active member's slot ("" when not a member), and per family
 # POOL_<FAMILY>_JSON (the pool object, "" when the pool does not apply),
 # POOL_<FAMILY>_DELTA (signed, "+16"; "" when not computable) and
-# POOL_<FAMILY>_USED, plus POOL_SESSION_IDLE ("1" when no member has a
-# session window open).
+# POOL_<FAMILY>_USED.
 POOL_PACE_ENABLED=''
 pool_pace_enabled() {
   if [[ -z "$POOL_PACE_ENABLED" ]]; then
@@ -3167,9 +3179,6 @@ POOL_PACE_JQ='
        then {used: 0, resets_at: (.resets_at + (((($now - .resets_at) / $W) | floor) + 1) * $W)}
        else {used: 0, resets_at: ($now + $W)} end)
     else . end;
-  # No window open at $now: no reset at all, or (for the 5-hour session) one
-  # that has passed. Read off the reading BEFORE roll.
-  def idle($fixed): .resets_at == null or (($fixed | not) and .resets_at <= $now);
   # Half away from zero, as pace_delta rounds. (0 - x, not -x: older jq has
   # no unary minus on an expression.)
   def round_away: if . < 0 then 0 - (((0 - .) + 0.5) | floor) else ((. + 0.5) | floor) end;
@@ -3195,12 +3204,10 @@ POOL_PACE_JQ='
           [ $members[]
             | . as $mem
             | if $mem.slot == $active.slot then
-                {used: $a.used, resets_at: $a.resets} as $raw
-                | ($raw | roll($W; $fixed)) as $r
+                ({used: $a.used, resets_at: $a.resets} | roll($W; $fixed)) as $r
                 | select($r != null)
                 | {slot: $mem.slot, email: ($mem.acct.email // null), used: $r.used,
-                   resets_at: $r.resets_at, active: true, as_of: $now,
-                   _idle: ($raw | idle($fixed))}
+                   resets_at: $r.resets_at, active: true, as_of: $now}
               else
                 ((($UA[$mem.slot] // null) | select(type == "object" and same_acct(.; $mem.acct)))
                   // ([ $UA[]? | objects | select(same_acct(.; $mem.acct)) ] | first)
@@ -3209,9 +3216,9 @@ POOL_PACE_JQ='
                 | ($u.fetchedAt | floor) as $f
                 | select($now - $f <= $max_age)
                 | (pick(($u.lastGood | obj); $kind) // null)
-                | select(. != null) | . as $raw | roll($W; $fixed) | select(. != null)
+                | select(. != null) | roll($W; $fixed) | select(. != null)
                 | {slot: $mem.slot, email: ($mem.acct.email // $u.email // null), used,
-                   resets_at, active: false, as_of: $f, _idle: ($raw | idle($fixed))}
+                   resets_at, active: false, as_of: $f}
               end ] as $ms
           | if ($ms | length) < 2 or ([ $ms[] | select(.active) ] | length) != 1 then null else
               ($ms | length) as $n
@@ -3224,19 +3231,15 @@ POOL_PACE_JQ='
                  delta: ([ $hz[] | select(.at - $now > 0 and .at - $now <= $W)
                            | (100 * (.at - $now) / $W) - (.avail / $n) ]
                          | if length == 0 then null else (max | round_away) end),
-                 members: ($ms | map(del(._idle))),
-                 # Internal (not published): no member has a window open.
-                 _idle: ($ms | all(._idle))}
+                 members: $ms}
             end
         end;
-    # Per family: the published object, the signed delta, the pooled level,
-    # and "1" when every member is idle (render_provider_block says "idle").
+    # Per family: the published object, the signed delta, the pooled level.
     [ ($active.slot // "") ]
     + ([ "session", "weekly", "scoped" ]
        | map(pool(.) as $p
-             | if $p == null then ["", "", "", ""]
-               else [($p | del(._idle) | tojson), ($p.delta | signed), ($p.used | tostring),
-                     (if $p._idle then "1" else "0" end)] end)
+             | if $p == null then ["", "", ""]
+               else [($p | tojson), ($p.delta | signed), ($p.used | tostring)] end)
        | add)
     | join("\u001f")
 '
@@ -3244,13 +3247,13 @@ POOL_PACE_JQ='
 # $1 provider, $2 now (updated_at), then used / window minutes / resets_at
 # for session, weekly and scoped, exactly as render_provider_block has them.
 POOL_SLOT=''
-POOL_SESSION_JSON='' POOL_SESSION_DELTA='' POOL_SESSION_USED='' POOL_SESSION_IDLE=''
+POOL_SESSION_JSON='' POOL_SESSION_DELTA='' POOL_SESSION_USED=''
 POOL_WEEKLY_JSON=''  POOL_WEEKLY_DELTA=''  POOL_WEEKLY_USED=''
 POOL_SCOPED_JSON=''  POOL_SCOPED_DELTA=''  POOL_SCOPED_USED=''
 pool_pace_read() {
   local provider="$1" now="$2"
   POOL_SLOT=''
-  POOL_SESSION_JSON='' POOL_SESSION_DELTA='' POOL_SESSION_USED='' POOL_SESSION_IDLE=''
+  POOL_SESSION_JSON='' POOL_SESSION_DELTA='' POOL_SESSION_USED=''
   POOL_WEEKLY_JSON=''  POOL_WEEKLY_DELTA=''  POOL_WEEKLY_USED=''
   POOL_SCOPED_JSON=''  POOL_SCOPED_DELTA=''  POOL_SCOPED_USED=''
 
@@ -3279,17 +3282,14 @@ pool_pace_read() {
     "$POOL_PACE_JQ" 2>/dev/null || true)"
   [[ -n "${line:-}" ]] || return 0
 
-  # Only the session's all-idle flag is used: weekly and scoped windows are
-  # always open (an account at 0% of them is unused, not idle).
-  local weekly_idle scoped_idle
   IFS=$'\x1f' read -r POOL_SLOT \
-    POOL_SESSION_JSON POOL_SESSION_DELTA POOL_SESSION_USED POOL_SESSION_IDLE \
-    POOL_WEEKLY_JSON POOL_WEEKLY_DELTA POOL_WEEKLY_USED weekly_idle \
-    POOL_SCOPED_JSON POOL_SCOPED_DELTA POOL_SCOPED_USED scoped_idle <<<"$line" || true
+    POOL_SESSION_JSON POOL_SESSION_DELTA POOL_SESSION_USED \
+    POOL_WEEKLY_JSON POOL_WEEKLY_DELTA POOL_WEEKLY_USED \
+    POOL_SCOPED_JSON POOL_SCOPED_DELTA POOL_SCOPED_USED <<<"$line" || true
 
   # Anything that is not an object from the program above is not trusted
   # into the block's --argjson (a bad one would fail the whole render).
-  [[ "$POOL_SESSION_JSON" == '{'* && "$POOL_SESSION_USED" =~ ^[0-9]+$ ]] || { POOL_SESSION_JSON=''; POOL_SESSION_DELTA=''; POOL_SESSION_USED=''; POOL_SESSION_IDLE=''; }
+  [[ "$POOL_SESSION_JSON" == '{'* && "$POOL_SESSION_USED" =~ ^[0-9]+$ ]] || { POOL_SESSION_JSON=''; POOL_SESSION_DELTA=''; POOL_SESSION_USED=''; }
   [[ "$POOL_WEEKLY_JSON" == '{'* && "$POOL_WEEKLY_USED" =~ ^[0-9]+$ ]]   || { POOL_WEEKLY_JSON='';  POOL_WEEKLY_DELTA='';  POOL_WEEKLY_USED=''; }
   [[ "$POOL_SCOPED_JSON" == '{'* && "$POOL_SCOPED_USED" =~ ^[0-9]+$ ]]   || { POOL_SCOPED_JSON='';  POOL_SCOPED_DELTA='';  POOL_SCOPED_USED=''; }
   return 0
@@ -3420,12 +3420,21 @@ render_provider_block() {
   # resets_at — there is no window, so pacing is undefined and the reset time is
   # unknown. Say "idle" in gray instead of a bare green "0%", which is
   # indistinguishable from a live-but-unpaced reading or a stalled fetch.
-  # With a pooled session the number is the pool's, so "idle" means the
-  # POOL has no window open — every member idle. One idle account next to a
-  # busy one is just a low pooled number ("10% (-30%)").
+  # With a pooled session the number is the pool's, so "idle" takes both: the
+  # ACTIVE account idle (no window, or one whose reset has passed — the pool
+  # counts that as idle too) AND the pooled level at 0. This is the apps'
+  # own rule (activeIdle && pool.used <= 0), kept identical so the bar and
+  # the apps never disagree. An idle account next to a busy one is a low
+  # pooled number ("10% (-30%)"); next to one at 0% it is "idle".
   local session_idle=0
   if [[ -n "$POOL_SESSION_JSON" ]]; then
-    [[ "$POOL_SESSION_IDLE" == '1' ]] && session_idle=1
+    local active_idle=0
+    if [[ -z "${session_resets:-}" ]]; then
+      (( session_used == 0 )) && active_idle=1
+    elif [[ "$session_resets" =~ ^[0-9]+$ && "$updated_at" =~ ^[0-9]+$ ]] && (( session_resets <= updated_at )); then
+      active_idle=1
+    fi
+    (( active_idle == 1 && POOL_SESSION_USED <= 0 )) && session_idle=1
   elif [[ -n "$session_used" && -z "${session_resets:-}" ]] && (( session_used == 0 )); then
     session_idle=1
   fi
