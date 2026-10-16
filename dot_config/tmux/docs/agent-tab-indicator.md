@@ -221,16 +221,20 @@ Writing" through exactly that hole). Hooks that arrive with no `TMUX_PANE`
 are dropped outright — the old active-window fallback let pane-less codex
 contexts (ChatGPT-app threads) paint whatever tab the user was looking at.
 
-**Summary sources** (best first): Claude — last `ai-title` entry in the
-transcript tail (`transcript_path` from the payload), else `session_title`,
-else the submitted prompt; Codex — `threads.name` from
+**Summary sources** (best first): Claude — a `/rename` title or a topic-drift
+retitle, whichever is more recent (see "Renames and topic drift" below), then
+the last `ai-title` entry in the transcript tail (`transcript_path` from the
+payload), else `session_title`, else the submitted prompt; Codex — `threads.name` from
 `~/.codex/state_5.sqlite` keyed by `session_id` (0.148 stopped writing
 `session_index.jsonl`), else `threads.title` (the first user message,
 treated as interim), else the prompt.
 Sanitized (no `#`/`"`/`%`, one line, ≤60 chars). `extract_summary` tags its
-output `final\t<title>` (the agent's own conversation title) or
-`interim\t<title>` (the prompt, standing in until that title exists) — only
-`final` is worth a model call, see below.
+output `final\t<title>` (the agent's own conversation title),
+`interim\t<title>` (prompt-grade text: the prompt standing in until that title
+exists; kept to 200 chars because it is the condenser's input),
+`custom\t<title>` (a `/rename`, shown as-is, never condensed) or
+`retitle\t<label>\t<prompts>` (a drift retitle, for the condenser to judge
+against the label on screen when it fired).
 
 **Tab name format**: `project/short-title`. Project is the basename of the
 hook's `cwd` (`~` for `$HOME`). The raw title is condensed to its 2–4 most
@@ -274,6 +278,133 @@ recoverable: on a rejection the condenser retries immediately on copilot's
 default model and touches `$TMPDIR/agent-tab-model-unavailable.$UID`, which
 makes later runs skip the doomed call for 24 h (`MODEL_SKIP_TTL`) before
 re-probing the pin.
+
+**Renames and topic drift** (Claude only; 2026-10-16). Claude writes its
+`{"type":"ai-title"}` line once, at the end of the first turn, and re-appends
+the *same* line every turn after; across ~300 sessions on disk exactly one
+ever changed it. So a tab named "parser fix" on turn one stays "parser fix"
+through the afternoon the session spends porting the watcher to Rust. Two
+ways out, both read on every event:
+
+- **`/rename`** appends `{"type":"custom-title","customTitle":…}` (with no
+  argument Claude generates a fresh kebab-case name from the conversation).
+  One `tail | grep | jq` over the transcript's last 64 KB takes the last of
+  both title types (three forks, down from the old four). Neither line is
+  reliably in that tail: measured over real sessions, 41 prompts in 10 of 59
+  sessions had their last title line further back (up to 1.5 MB), and reading
+  "not in the tail" as "no title" made the tab flap. So the drift state
+  remembers the last of each it saw (`seen_custom`, `seen_ai`) and an empty
+  tail falls back to those.
+  A custom title is displayed, never sent to the condenser — a space-free name
+  with `-`/`_` reads as words (`topic-drift-detector` → `topic drift
+  detector`), word-trimmed to 24 cells — and is marked condensed
+  (`@agent_summary_cond 1`) so no raw stand-in ever repaints over it. **But
+  only a rename the user made counts.** CuaNotch's Tasks launcher
+  (`~/.claude/projects/-Users-mackhaymond-Tasks-t-*`) writes its own 24-char
+  slug as the custom title at line 2, cut mid-word ("check-five-variable-solu"),
+  and no ai-title. So the custom title the session started with is recorded as
+  `launch_custom` when its drift state is first created, and never changes;
+  only a *different* custom title is the user's. "Started with" is read from
+  the transcript's first 8 KB (the first custom-title there), once per
+  session at state creation, because every Tasks transcript is over 64 KB and
+  the slug is long out of the tail by then; the tail's custom title is the
+  fallback. With no state yet (a SessionStart before the first prompt) a
+  custom title can't be classified and is not trusted; a real `/rename` almost
+  always follows a prompt, so its state exists. An untrusted custom title falls
+  through to the ai-title / `session_title` / prompt path, condensed as before.
+  The cost: a `/rename` made before the first prompt, a rename followed by a
+  resume after the 30-day state GC, and a session renamed before this shipped
+  are all treated as launch names and not shown until renamed again.
+- **Topic drift**: `UserPromptSubmit` (mode `running`, after the state write)
+  runs `scripts/agent-topic-drift.awk` on the prompt — a lexical
+  **pre-filter**, then a model **judge** on the few prompts it lets through.
+  Calibrated over 117 real sessions, the lexical gate alone fired on ~10 per
+  100 prompts at 2 strikes and ~5 at 3, and many of those were the same task
+  in words that don't overlap (email proofing rounds, "pause before I close my
+  laptop"). Lexical overlap can't tell those apart; the condenser can.
+
+  The gate: `<pasted_content …>…</pasted_content>` blocks are cut out first
+  (an unterminated one runs to the end; a paste is material, not the goal),
+  then the prompt's first 600 bytes become a set of content words —
+  lowercased, split on non-alphanumerics, tokens under 3 characters, numbers
+  and a generous stopword list dropped (English function words *and* the
+  casual filler prompts are made of: lowk, idk, gonna, pls, thing, stuff,
+  actually, want, make, look, fix, add, bug…; a filler word left in matches
+  across unrelated topics and pads drift alike), crude suffix stemming. Most
+  prompts carry no topic at all ("yes", "do it", "lgtm"): fewer than 4
+  content words is skipped, and so is anything that isn't the user's own goal
+  text, checked after a left trim (pasted blocks often start with
+  whitespace): `<…` system tags (`<task-notification>`), `/…` slash commands,
+  `[message from @…` peer agents, "This session is being continued from a
+  previous conversation…" compaction continuations, and a paste with nothing
+  else. The rest is compared with a **bag**: the union of the last 6 on-topic
+  prompts' words, seeded with the title's words the first time a session is
+  seen (an empty bag takes the first prompt as on topic). Overlap = shared
+  words ÷ the prompt's words. At ≥ 0.15 the prompt is on topic and joins the
+  bag; below, it is a strike and a candidate, +1 strike if that drifted
+  prompt also has a pivot phrase ("switching gears", "unrelated", "new task",
+  "on another note"…) — never enough alone. **Three** strikes, past the first
+  substantive prompt and at least **1200 s** after the last retitle, fire: the
+  candidate prompts joined (≤300 bytes) become `retitle_raw`, and the bag
+  restarts from their words. An on-topic prompt clears the strikes, so a
+  tangent never retitles; strikes keep accumulating (capped) through the
+  cooldown, so a real shift fires the moment it ends. All of these are `-v`
+  tunables with the defaults inside the awk (`drift_t` 0.15, `strikes_needed`
+  3, `keep` 6, `cooldown` 1200, `min_turn` 2, `min_words` 4, `max_chars`
+  600). It is its own file, BWK-awk clean (macOS `/usr/bin/awk`, which the
+  hook pins), so an offline replay over old transcripts calibrates the exact
+  code. **It runs under `LC_ALL=C`**: macOS awk slices *bytes* with `substr`
+  but decodes UTF-8 in `tolower`/`match` under a UTF-8 locale, and exits 2 on
+  a cut that split a character — the prompt was silently dropped. Every cut
+  also drops a trailing incomplete UTF-8 sequence, so what it writes is always
+  valid UTF-8 (`sanitize_summary`'s `tr` fails on anything else and the
+  summary came out empty).
+
+  The judge: when the awk's verdict line says `RETITLE`, the hook reads the
+  label on screen (`@agent_summary` minus `project/`, with
+  `@agent_summary_cond` in the same tmux call, only then) and, if it is a
+  *condensed* label, appends it sanitized to the new state as `retitle_prev`.
+  A raw stand-in is never recorded — "keep it if it's the same work" would
+  lock it in — so it gets the plain condense prompt instead. The condenser then
+  gets a different prompt: here is the current label and the user's latest
+  messages; if they are still the same work (follow-ups, details, sub-steps,
+  feedback, logistics) output the label *exactly*, and only for a clearly
+  different task a new 2–4 word label. The answer is cached under the
+  composed input (label + prompts), so it is one call per trigger and every
+  later event re-displays it for free. "Same" comes back as the old label —
+  accepted as-is (case and a trailing period aside) even when `valid_short`
+  would refuse it as a new answer, such as a 5-word `/rename` display. A new label
+  goes through `valid_short` as usual, and a refused answer leaves the old
+  label up: a retitle never paints raw text, because the likeliest verdict is
+  "keep". No label to judge against (the `New Session` placeholder, or none)
+  → the plain condense prompt.
+
+  State lives in `~/.cache/agent-tab/drift/<session_id>` (id validated
+  `[0-9a-fA-F-]`, else no state), `key<TAB>value` lines behind a `v 1` header
+  (format: the awk's header) — a missing header reads as fresh, a bad line is
+  dropped — written to a temp file and `mv`ed into place. `SessionStart`
+  deletes files untouched for 30 days. Added cost per `running` hook: the awk
+  and the `mv` (the one jq that now reads every payload field the title path
+  needs replaces reads `extract_summary` made anyway) — measured +1–7 ms on a
+  ~355 ms hook. Once per session, at state creation, a `head | grep | jq` for
+  the first custom title; on a trigger only, one tmux call and one sanitize
+  for `retitle_prev`. Other events pay nothing beyond a builtin read of the
+  state file. A detector failure (missing file, awk error) leaves the old
+  state, and never costs the hook's state write.
+
+**Which one wins is recency.** When a retitle fires, the custom title in force
+at that moment is recorded beside it (`retitle_custom`; the last one seen if
+its line is out of the tail). At read time a user custom title that differs
+from it means the user renamed *after* the retitle, so it wins; otherwise the
+retitle goes to the judge, and without one the user custom title, then
+ai-title, `session_title`, prompt as before. Because the retitle lives in the
+state file, every later event (`done`, `idle` on resume) picks it up from the
+cache with no new call, and while the judge is out the old label stays up. A
+rename also reseeds the bag from the new name (the detector notices the custom
+title changed since it last looked), so the detector anchors to the user's own
+naming. One blind spot: re-running `/rename` with the *same* name it had
+before a retitle is indistinguishable from no rename, so the retitle keeps the
+tab. Tests: `tests/test_topic_drift.py`.
 
 ### 2. `scripts/agent-tab-watcher.sh` (presence daemon)
 

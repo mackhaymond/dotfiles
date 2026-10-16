@@ -73,7 +73,9 @@
 #   idle         SessionStart        → mark present (skipped for compact
 #                                      restarts); a fresh session with no title
 #                                      yet shows "<project>/New Session"
-#   running      UserPromptSubmit    → turn started; refresh @agent_summary
+#   running      UserPromptSubmit    → turn started; claude: topic-drift check
+#                                      (agent-topic-drift.awk); refresh
+#                                      @agent_summary
 #   heartbeat    PostToolUse         → re-arm running mid-turn: from
 #                                      running/needs-input, or from idle when
 #                                      @agent_pending marks an answered
@@ -773,16 +775,48 @@ compose_summary() {
     # Set "<project>/<short>" immediately from cache when we've condensed
     # this title before; otherwise show "<project>/<raw>" as an interim and
     # condense in a detached child (an LLM call must never block a hook).
-    # $2 is extract_summary's tagged "<src>\t<title>" (bare text = final).
-    local win="$1" tagged="$2" payload="$3" proj short src raw
+    # $2 is extract_summary's tagged "<src>\t<title>" (bare text = final;
+    # retitle is "retitle\t<label>\t<prompts>").
+    local win="$1" tagged="$2" payload="$3" proj short src raw prev="" kin
     [ -n "$tagged" ] || return 0
     case "$tagged" in
         *$'\t'*) src="${tagged%%$'\t'*}"; raw="${tagged#*$'\t'}" ;;
         *)       src="final"; raw="$tagged" ;;
     esac
+    # retitle carries "<label on screen when it fired>\t<drifted prompts>".
+    if [ "$src" = retitle ]; then
+        case "$raw" in
+            *$'\t'*) prev="${raw%%$'\t'*}"; raw="${raw#*$'\t'}" ;;
+            *)       src="interim" ;;
+        esac
+        [ -n "$prev" ] || src="interim"
+    fi
     [ -n "$raw" ] || return 0
+    # The condense input, which is also the cache key: a retitle is judged
+    # against the label it may keep, so the same prompts under another label
+    # are a different question.
+    kin="$raw"
+    [ -z "$prev" ] || kin="retitle"$'\n'"$prev"$'\n'"$raw"
     proj=$(project_name "$payload")
-    short=$(cached_short "$raw")
+    # A custom title (/rename) is the user's own naming: shown as written,
+    # never condensed. Claude's generated names are kebab slugs, so a
+    # space-free one with -/_ reads as words. Marked condensed (1) so no raw
+    # stand-in ever repaints over it.
+    if [ "$src" = custom ]; then
+        short="$raw"
+        case "$short" in
+            *" "*) ;;
+            *[-_]*)
+                short="${short//[-_]/ }"
+                while [[ $short == *"  "* ]]; do short="${short//  / }"; done
+                short="${short# }"; short="${short% }"
+                ;;
+        esac
+        [ -n "$short" ] || short="$raw"
+        set_summary "$win" "${proj:+$proj/}$(fit_words "$short" 24)" 1
+        return 0
+    fi
+    short=$(cached_short "$kin")
     if [ -n "$short" ]; then
         set_summary "$win" "${proj:+$proj/}$short" 1
         return 0
@@ -793,7 +827,10 @@ compose_summary() {
     # would otherwise flash the untrimmed title for a second or two mid-turn —
     # which reads as the tab breaking, not refining. With no condenser (or a
     # failing one) the flag never gets set and raw text still shows through.
-    if [ "$(tmux show-options -wqv -t "$win" @agent_summary_cond 2>/dev/null || true)" != 1 ]; then
+    # A retitle never paints raw at all: the judge's likeliest answer is "keep
+    # the label", which is what is on screen.
+    if [ "$src" != retitle ] &&
+       [ "$(tmux show-options -wqv -t "$win" @agent_summary_cond 2>/dev/null || true)" != 1 ]; then
         set_summary "$win" "${proj:+$proj/}$(fit_words "$raw" 24)"
     fi
     # $src is condensed either way. The agent writes its own title only at the
@@ -815,41 +852,215 @@ compose_summary() {
         "AGENT_TAB_OWNER_BINDING=${AGENT_TAB_OWNER_BINDING:-}" \
         "AGENT_TAB_OWNER_RECORD=${AGENT_TAB_OWNER_RECORD:-}" \
         "AGENT_TAB_CONDENSE_MODEL=$CONDENSE_MODEL" \
-        bash "$0" condense "$win" "$proj" "$raw"
+        bash "$0" condense "$win" "$proj" "$raw" "$prev"
     launch+=' >/dev/null 2>&1'
     tmux run-shell -b "$launch" >/dev/null 2>&1 || true
 }
 
+# --- claude title sources + topic drift --------------------------------------
+#
+# Claude writes {"type":"ai-title"} once, at the end of the first turn, and
+# re-appends the SAME line every turn: it practically never retitles (1 of
+# ~300 sessions ever did). So a tab named on turn one keeps that name while
+# the conversation moves on. Two ways out, both read per event:
+#   * /rename appends {"type":"custom-title","customTitle":…} (with no args,
+#     Claude generates a fresh kebab-case name). The user's own naming.
+#   * TOPIC DRIFT: on every UserPromptSubmit, agent-topic-drift.awk compares
+#     the prompt's content words with a bag of recent on-topic prompts (pure
+#     lexical, no model call). That is only a PRE-FILTER — same-task
+#     follow-ups often share no words — so when it fires it records the
+#     drifted prompts as `retitle_raw` in ~/.cache/agent-tab/drift/<sid>, the
+#     hook records the label then on screen as `retitle_prev`, and the
+#     condenser JUDGES: keep that label, or name the new task (one cached
+#     call per trigger, see the condense mode).
+# The detector is its own file so an offline calibration replay runs the
+# exact same code; its header documents the model and the state format.
+
+DRIFT_DIR="$HOME/.cache/agent-tab/drift"
+case "${BASH_SOURCE[0]}" in
+    */*) DRIFT_AWK="${BASH_SOURCE[0]%/*}/agent-topic-drift.awk" ;;
+    *)   DRIFT_AWK="./agent-topic-drift.awk" ;;
+esac
+DRIFT_AWK="${AGENT_TAB_DRIFT_AWK:-$DRIFT_AWK}"
+
+# claude_fields PAYLOAD: one jq for every payload field the claude title path
+# needs. Sets P_SID (validated [0-9a-fA-F-], else empty), P_TP (transcript
+# path), P_STITLE (session_title), P_PROMPT (first 1200 chars, one line).
+# Memoized: the running hook fills these before extract_summary's subshell.
+P_DONE=0; P_SID=""; P_TP=""; P_STITLE=""; P_PROMPT=""
+claude_fields() {
+    [ "$P_DONE" = 1 ] && return 0
+    P_DONE=1
+    local out
+    out=$("$JQ" -r 'def one: tostring | gsub("[\\r\\n\\t]"; " ");
+        (.session_id // "" | one), (.transcript_path // "" | one),
+        (.session_title // "" | one), (.prompt // "" | tostring | .[0:1200] | one)' \
+        <<<"$1" 2>/dev/null || true)
+    { IFS= read -r P_SID; IFS= read -r P_TP; IFS= read -r P_STITLE; IFS= read -r P_PROMPT; } <<<"$out" || true
+    case "$P_SID" in *[!0-9a-fA-F-]*) P_SID="" ;; esac
+}
+
+# claude_titles: CT_AI / CT_CUSTOM = the LAST ai-title and custom-title in the
+# transcript's last 64KB, from one tail + one grep + one jq (the ai-title-only
+# read it replaces was four forks). Both lines are re-appended over time, but
+# NOT reliably within 64KB of the end: measured, 41 prompts in 10 of 59
+# sessions had their last title line further back (up to 1.5MB). So an empty
+# answer here is "not in the tail", not "none" — extract_summary falls back to
+# the drift state's seen_custom / seen_ai. Memoized like claude_fields (needs
+# it first).
+CT_DONE=0; CT_AI=""; CT_CUSTOM=""
+claude_titles() {
+    [ "$CT_DONE" = 1 ] && return 0
+    CT_DONE=1
+    { [ -n "$P_TP" ] && [ -f "$P_TP" ]; } || return 0
+    local out
+    out=$(tail -c 65536 "$P_TP" 2>/dev/null | grep -E '"type":"(ai|custom)-title"' \
+        | "$JQ" -Rrn 'def one: tostring | gsub("[\\r\\n\\t]"; " ");
+            reduce (inputs | fromjson? | objects) as $o ({a: "", c: ""};
+              if $o.type == "ai-title" then .a = ($o.aiTitle // "" | one)
+              elif $o.type == "custom-title" then .c = ($o.customTitle // "" | one)
+              else . end) | .a, .c' 2>/dev/null || true)
+    { IFS= read -r CT_AI; IFS= read -r CT_CUSTOM; } <<<"$out" || true
+}
+
+# drift_read: this session's drift state (format: agent-topic-drift.awk's
+# header) into DR_OK (1 = a state exists), DR_RAW / DR_CUSTOM / DR_PREV
+# (retitle_raw / _custom / _prev), DR_LAUNCH (launch_custom), DR_SEEN_CUSTOM,
+# DR_SEEN_AI. Builtins only — it runs on every claude event.
+drift_read() {
+    DR_OK=0; DR_RAW=""; DR_CUSTOM=""; DR_PREV=""; DR_LAUNCH=""; DR_SEEN_CUSTOM=""; DR_SEEN_AI=""
+    { [ -n "$P_SID" ] && [ -f "$DRIFT_DIR/$P_SID" ]; } || return 0
+    local k v
+    while IFS=$'\t' read -r k v || [ -n "$k" ]; do
+        case "$k" in
+            v) [ "$v" != 1 ] || DR_OK=1 ;;
+            retitle_raw) DR_RAW="$v" ;;
+            retitle_custom) DR_CUSTOM="$v" ;;
+            retitle_prev) DR_PREV="$v" ;;
+            launch_custom) DR_LAUNCH="$v" ;;
+            seen_custom) DR_SEEN_CUSTOM="$v" ;;
+            seen_ai) DR_SEEN_AI="$v" ;;
+        esac
+    done < "$DRIFT_DIR/$P_SID" 2>/dev/null || true
+}
+
+# drift_update (running, claude): feed this prompt to the detector and replace
+# the session's state atomically (tmp + mv). Cost on top of the hook: the awk
+# and the mv (claude_fields' jq replaces reads extract_summary made anyway);
+# once per session, when the state is created, a head|grep|jq for the first
+# custom-title; and only on a prompt that fires a retitle, one tmux call plus
+# a sanitize: the condensed label on screen then is what the condenser judges
+# against (retitle_prev, appended to the new state here — the awk carries it
+# through later runs).
+# LC_ALL=C: macOS awk byte-slices with substr but decodes UTF-8 in tolower/
+# match, and exits 2 on a cut that split a character (the prompt was then
+# silently dropped). Best-effort throughout: the caller adds `|| true`, and
+# any failure leaves the old state (or none) in place — never the hook's
+# state write.
+drift_update() {
+    { [ "$agent" = claude ] && [ -n "$JQ" ] && [ -n "$payload" ] && [ -r "$DRIFT_AWK" ]; } || return 0
+    claude_fields "$payload"
+    [ -n "$P_SID" ] || return 0
+    claude_titles
+    local f="$DRIFT_DIR/$P_SID" in=/dev/null tmp now verdict="" prev launch="" ab=/usr/bin/awk
+    [ -x "$ab" ] || ab="awk"
+    [ -d "$DRIFT_DIR" ] || mkdir -p "$DRIFT_DIR" 2>/dev/null || return 0
+    tmp="$f.tmp.$$"
+    if [ -f "$f" ]; then
+        in="$f"
+    elif [ -n "$P_TP" ] && [ -f "$P_TP" ]; then
+        # Creating the state: launch_custom must be the custom-title the
+        # session STARTED with (a Tasks launcher slug sits at line 2), and in a
+        # long session it is far outside the tail by now. Once per session.
+        launch=$(head -c 8192 "$P_TP" 2>/dev/null | grep -m1 -F '"type":"custom-title"' \
+            | "$JQ" -Rr 'fromjson? | .customTitle // empty | tostring | gsub("[\\r\\n\\t]"; " ")' \
+            2>/dev/null || true)
+    fi
+    printf -v now '%(%s)T' -1 2>/dev/null || now=$(now_epoch)
+    if verdict=$(LC_ALL=C DRIFT_PROMPT="$P_PROMPT" DRIFT_TITLE="${CT_CUSTOM:-${CT_AI:-$P_STITLE}}" \
+            DRIFT_CUSTOM="$CT_CUSTOM" DRIFT_AI="$CT_AI" DRIFT_LAUNCH="$launch" \
+            "$ab" -v now="$now" -v state_out="$tmp" -f "$DRIFT_AWK" "$in" 2>/dev/null) \
+        && [ -s "$tmp" ]; then
+        case "$verdict" in
+            *RETITLE*)
+                # Only a CONDENSED label is worth judging against: a raw
+                # stand-in (@agent_summary_cond unset) handed to "keep it if
+                # it's the same work" would be locked in. One tmux call, two
+                # reads; -q prints nothing for an unset option, so exactly
+                # "1\n<label>" means condensed and set.
+                prev=$(tmux show-options -wqv -t "$win" @agent_summary_cond \; \
+                            show-options -wqv -t "$win" @agent_summary 2>/dev/null || true)
+                case "$prev" in
+                    1$'\n'?*) prev="${prev#1$'\n'}" ;;
+                    *) prev="" ;;
+                esac
+                case "$prev" in */*) prev="${prev#*/}" ;; esac
+                # The birth/SessionStart placeholder names nothing to keep.
+                [ "$prev" != "New Session" ] || prev=""
+                # Sanitized once here; extract_summary uses it as stored.
+                [ -z "$prev" ] || prev=$(printf '%s' "$prev" | sanitize_summary || true)
+                [ -z "$prev" ] || printf 'retitle_prev\t%s\n' "$prev" >> "$tmp" 2>/dev/null || true
+                ;;
+        esac
+        mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    else
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+}
+
 # Conversation title, best source first. Emits "<src>\t<title>", where <src>
 # distinguishes the agent's own conversation title (`final`) from the turn's
-# prompt standing in until that title exists (`interim`) — compose_summary
-# spends a model call only on `final`. Empty output = no title at all.
+# prompt standing in until that title exists (`interim`) — both condense, the
+# prompt at a longer bound — a user-blessed /rename title (`custom`), which
+# compose_summary shows as-is, and a drift retitle, emitted as
+# "retitle\t<label on screen when it fired>\t<drifted prompts>" for the
+# condenser to judge. Empty output = no title at all.
 # A tab is a safe delimiter: sanitize_summary maps tabs to spaces.
-#   claude: latest ai-title entry near the transcript tail (cheap: last 64KB),
-#           else session_title, else the prompt that started the turn.
+#   claude: the custom-title, if it is a user rename, against a drift retitle
+#           by recency: the rename wins unless a retitle fired after it (the
+#           retitle records the custom-title in force when it fired; a
+#           different one now means the user renamed since). Otherwise the
+#           retitle if there is one, else the latest ai-title, else
+#           session_title, else the turn's prompt. Title lines missing from
+#           the 64KB tail fall back to the drift state's seen_custom/seen_ai.
+#           A custom-title is a user rename only if it differs from
+#           launch_custom, the one the session already had when its drift
+#           state was created: CuaNotch's Tasks launcher writes a 24-char
+#           slug as custom-title at line 2 (no ai-title), which is not the
+#           user's naming. With no state yet (a SessionStart before the
+#           first prompt) it can't be told apart and is not trusted; a real
+#           /rename comes after a prompt, so its state exists.
 #   codex:  threads.name from ~/.codex/state_5.sqlite keyed by session_id
 #           (0.148 moved thread metadata off session_index.jsonl), else
 #           threads.title (first user message), else the prompt.
 extract_summary() {
-    local payload="$1" title="" src="final"
+    local payload="$1" title="" src="final" prev=""
     [ -n "$JQ" ] || return 0
     [ -n "$payload" ] || return 0
 
     case "$agent" in
         claude)
-            local transcript
-            transcript=$("$JQ" -r '.transcript_path // empty' <<<"$payload" 2>/dev/null || true)
-            if [ -n "$transcript" ] && [ -f "$transcript" ]; then
-                title=$(tail -c 65536 "$transcript" 2>/dev/null \
-                    | grep '"type":"ai-title"' | tail -1 \
-                    | "$JQ" -r '.aiTitle // empty' 2>/dev/null || true)
+            claude_fields "$payload"
+            claude_titles
+            drift_read
+            local cust="${CT_CUSTOM:-$DR_SEEN_CUSTOM}" ai="${CT_AI:-$DR_SEEN_AI}" blessed=0
+            if [ "$DR_OK" = 1 ] && [ -n "$cust" ] && [ "$cust" != "$DR_LAUNCH" ]; then
+                blessed=1
             fi
-            if [ -z "$title" ]; then
-                title=$("$JQ" -r '.session_title // empty' <<<"$payload" 2>/dev/null || true)
-            fi
-            if [ -z "$title" ]; then
-                title=$("$JQ" -r '.prompt // empty' <<<"$payload" 2>/dev/null || true)
-                src="interim"
+            if [ "$blessed" = 1 ] && { [ -z "$DR_RAW" ] || [ "$cust" != "$DR_CUSTOM" ]; }; then
+                title="$cust"; src="custom"
+            elif [ -n "$DR_RAW" ]; then
+                title="$DR_RAW"; src="interim"
+                # retitle_prev was sanitized when drift_update stored it; a tab
+                # (only a corrupt file could hold one) would break the format.
+                prev="${DR_PREV//$'\t'/ }"
+                [ -z "$prev" ] || src="retitle"
+            elif [ -n "$ai" ]; then
+                title="$ai"
+            elif [ -n "$P_STITLE" ]; then
+                title="$P_STITLE"
+            else
+                title="$P_PROMPT"; src="interim"
             fi
             ;;
         codex)
@@ -882,13 +1093,17 @@ extract_summary() {
     # condense fails; a prompt is a whole sentence whose first 60 chars can cut
     # off the identifying words the condenser exists to find, so give it room.
     # Display is unaffected — compose_summary trims to 24 chars either way.
-    if [ "$src" = "interim" ]; then
-        title=$(printf '%s' "$title" | sanitize_summary 200)
+    if [ "$src" = "interim" ] || [ "$src" = "retitle" ]; then
+        title=$(printf '%s' "$title" | sanitize_summary 200 || true)
     else
-        title=$(printf '%s' "$title" | sanitize_summary)
+        title=$(printf '%s' "$title" | sanitize_summary || true)
     fi
     [ -n "$title" ] || return 0
-    printf '%s\t%s' "$src" "$title"
+    if [ "$src" = "retitle" ]; then
+        printf '%s\t%s\t%s' "$src" "$prev" "$title"
+    else
+        printf '%s\t%s' "$src" "$title"
+    fi
 }
 
 # --- sidebar detail: @agent_detail_kind + @agent_detail ---------------------
@@ -1046,19 +1261,27 @@ fi
 
 # Detached condenser (spawned by compose_summary): distill the raw title to
 # its 2-4 identifying words with a one-shot copilot/haiku call, cache it,
-# update the tab. argv: condense <window_id> <project> <raw-title>. Never
+# update the tab. argv: condense <window_id> <project> <raw-title> [<prev>].
+# With <prev> (a topic-drift retitle: <raw-title> is the drifted prompts,
+# <prev> the label on screen when it fired) the model JUDGES instead: the
+# label back unchanged if the prompts are still the same work, a new label
+# only for a clearly different task. The lexical detector fires on plenty of
+# same-task follow-ups that share no words; this call is what rejects them.
+# Cached under the composed input, so it is one call per trigger. Never
 # invoked by hooks directly, so a slow/failed model call only delays the
 # title swap.
 if [ "$mode" = "condense" ] || [ "$mode" = "condense-locked" ]; then
-    win="${2:-}"; proj="${3:-}"; raw="${4:-}"
+    win="${2:-}"; proj="${3:-}"; raw="${4:-}"; prev="${5:-}"
     { [ -n "$win" ] && [ -n "$raw" ]; } || exit 0
-    key=$(title_key "$raw")
+    kin="$raw"
+    [ -z "$prev" ] || kin="retitle"$'\n'"$prev"$'\n'"$raw"   # = compose_summary's
+    key=$(title_key "$kin")
     if [ "$mode" = "condense" ]; then
         # A mkdir lock survives SIGKILL and then rejects this title forever.
         # Keep the advisory-lock inode permanently; the kernel releases its
         # lock when the worker exits, even if no shell trap can run. The new
         # suffix also bypasses orphaned legacy .lock directories safely.
-        exec python3 - "${TMPDIR:-/tmp}/agent-tab-condense.$key.flock" "$0" "$win" "$proj" "$raw" <<'PYLOCK'
+        exec python3 - "${TMPDIR:-/tmp}/agent-tab-condense.$key.flock" "$0" "$win" "$proj" "$raw" "$prev" <<'PYLOCK'
 import fcntl
 import os
 import sys
@@ -1078,7 +1301,7 @@ PYLOCK
     trap 'rm -f "$ERRF" 2>/dev/null' EXIT
     trap 'exit 0' INT TERM
 
-    short=$(cached_short "$raw")
+    short=$(cached_short "$kin")
     if [ -z "$short" ]; then
         # Back off if a recent attempt for this title failed, so a persistent
         # copilot error (not logged in, out of credit) isn't re-run every turn.
@@ -1086,6 +1309,12 @@ PYLOCK
 
         # gtimeout is coreutils' name when /usr/bin/timeout is absent (macOS).
         TO=$(command -v timeout || command -v gtimeout || true)
+        if [ -n "$prev" ]; then
+            PROMPT="Current tab label: $prev
+The user's latest messages: $raw
+
+If these messages are still about the same work as the label (follow-ups, details, sub-steps, feedback, logistics), output the label EXACTLY as given. Only if the user has clearly moved on to a different task or subject, output a new 2-4 word label for the new task, built from the MOST SPECIFIC, distinctive words: the concrete subject, target, feature, file, tech, or action unique to it. Keep proper nouns and real names. DROP generic filler (project, code, app, task, session, various, thing, stuff, update, changes, improve, and a bare fix/add/refactor when what it acts on is unnamed). Output ONLY the label - no punctuation, quotes, or explanation."
+        else
         PROMPT="From the coding-session title or first message below, output a 2-4 word tab label built from the MOST SPECIFIC, distinctive words in it: the concrete subject, target, feature, file, tech, or action unique to THIS task. Keep proper nouns and real names. DROP generic filler (project, code, app, task, session, various, deep, inspection, thing, stuff, update, changes, improve, and a bare fix/add/refactor when what it acts on is unnamed). Someone reading the label should be able to guess the task back. Prefer the unusual identifying word over the category word. Output ONLY the label - no punctuation, quotes, or explanation.
 
 Examples:
@@ -1094,6 +1323,7 @@ Examples:
 - 'figure out why the websocket reconnect drops messages under load' => Websocket reconnect bug
 
 Title: $raw"
+        fi
         # Copilot prints the answer on stdout, stats on stderr; a pure text
         # prompt grants no tool permissions. Capture the exit code explicitly
         # — `|| true` would mask a failed call whose stdout is an error string.
@@ -1129,9 +1359,19 @@ Title: $raw"
             # here — before the negative cache entry below is written, so
             # nothing throttles the next attempt and the condenser respawns
             # in a loop (silently: the child is detached to /dev/null).
-            short=$(printf '%s' "$out" | grep -m1 . | sanitize_summary | cut -d' ' -f1-4 || true)
-            short=$(fit_words "$short" 24)
-            valid_short "$short" || short=""
+            line=$(printf '%s' "$out" | grep -m1 . | sanitize_summary || true)
+            if [ -n "$prev" ] && { [ "${line%.}" = "$prev" ] ||
+                [ "$(printf '%s' "${line%.}" | tr '[:upper:]' '[:lower:]')" = \
+                  "$(printf '%s' "$prev" | tr '[:upper:]' '[:lower:]')" ]; }; then
+                # "Same work": keep the label exactly, even one valid_short
+                # would refuse as a new answer (a 5-word raw stand-in) — the
+                # judge kept it, and blanking it would be worse.
+                short="$prev"
+            else
+                short=$(printf '%s' "$line" | cut -d' ' -f1-4 || true)
+                short=$(fit_words "$short" 24)
+                valid_short "$short" || short=""
+            fi
         else
             short=""
         fi
@@ -1316,6 +1556,11 @@ case "$mode" in
         dkind=-   # SessionStart: a new conversation has no detail yet
         set_state "$win" idle
         clear_pending "$win"
+        # Drift state is per session and only ever read for the live one:
+        # drop what no session has touched in 30 days (best-effort).
+        if [ "$agent" = claude ] && [ -d "$DRIFT_DIR" ]; then
+            find "$DRIFT_DIR" -type f -mtime +30 -delete 2>/dev/null || true
+        fi
         summary=$(extract_summary "$payload")
         if [ -n "$summary" ]; then
             compose_summary "$win" "$summary" "$payload"
@@ -1336,6 +1581,9 @@ case "$mode" in
         take_detail running run
         set_state "$win" running
         clear_pending "$win"
+        # After the state write (it is what the user is waiting to see),
+        # before the summary (which reads what the detector just decided).
+        drift_update || true
         compose_summary "$win" "$(extract_summary "$payload")" "$payload"
         ;;
     needs-approval)
