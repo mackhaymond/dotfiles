@@ -265,6 +265,33 @@ fn agents_lose_detail_last() {
     }
 }
 
+/// The agents section's (first lines, second lines): a row that clicks
+/// through to an agent and stands for it, and one that clicks through
+/// without standing for anyone (its second line).
+fn agent_lines(f: &Frame) -> (usize, usize) {
+    let go = |y: usize| f.rows[y].target_at(0).is_some_and(|x| matches!(x, Target::Go { .. }));
+    let firsts = f.agents.clone().filter(|&y| go(y) && f.rows[y].covers.len() == 1).count();
+    let seconds = f.agents.clone().filter(|&y| go(y) && f.rows[y].covers.is_empty()).count();
+    (firsts, seconds)
+}
+
+/// Every agent row in a frame is the same height: all two lines or all one.
+#[test]
+fn agent_rows_are_one_height() {
+    for (name, v) in all() {
+        for w in [24u16, 30, 34, 44] {
+            for h in 2u16..=90 {
+                let f = layout(&v, w, h, &Opts::default());
+                let (firsts, seconds) = agent_lines(&f);
+                assert!(seconds == 0 || seconds == firsts, "{name} {w}x{h}: {:#?}", texts(&f));
+                if w >= 26 && f.agents_step <= 1 {
+                    assert_eq!(seconds, firsts, "{name} {w}x{h}: {:#?}", texts(&f));
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn quiet_is_roomy() {
     let v = quiet();
@@ -298,9 +325,10 @@ fn quiet_is_roomy() {
     // Recently done: the word, and its message.
     let c = find(&f, "Commodities Job Tracker");
     assert!(t[c].ends_with("✓ done ") && t[c + 1].starts_with("    7 fixes applied"), "{t:#?}");
-    // Idle: one line, the word and the age (the age first to go for a title).
+    // Idle: two lines like every agent, the word on the first, the age
+    // under it.
     let n = find(&f, "Lost suit jacket");
-    assert!(t[n].ends_with("idle 6m ") && f.rows[n + 1].covers.len() == 1, "{t:#?}");
+    assert!(t[n].ends_with(" idle ") && t[n + 1].ends_with(" 6m ") && f.rows[n + 2].covers.len() == 1, "{t:#?}");
     assert!(t[find(&f, "Notch Tasks Orchestrator")].ends_with(" idle "), "{t:#?}");
     // A blank row between groups, in ⌃N (here: name) order.
     let bai = find(&f, " ● bai");
@@ -316,26 +344,24 @@ fn quiet_is_roomy() {
 #[test]
 fn busy_squeezes_spaces_and_cards_before_agents() {
     let v = busy();
-    // 24 agents, one line each unless they have something to say: full
-    // detail in 58 rows, gaps and all.
-    assert_eq!(layout(&v, 34, 58, &Opts::default()).step, 0);
+    // 24 agents, two lines each: full detail in 90 rows, gaps and all.
+    assert_eq!(layout(&v, 34, 90, &Opts::default()).step, 0);
     // Shorter: the cards lose their second line before any agent loses detail.
-    let f = (20..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.step > 0).unwrap();
+    let f = (20..90).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.step > 0).unwrap();
     assert_eq!(f.agents_step, 0, "{:#?}", texts(&f));
-    // Shorter still: the agents compress, the second lines they keep going
-    // to the agents needing attention first.
-    let f = (20..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 1).unwrap();
-    let t = texts(&f);
-    assert_eq!(f.step, STEPS.len() as u8, "{t:#?}");
-    // All four needs still on screen, in agent-jump.sh order (failed first).
-    let fail = find(&f, "Handy.app");
-    assert!(fail < find(&f, "Notch hover") && fail < f.agents.start);
-    for title in ["Kua Yu focus timing", "Commodities Job Tracker"] {
-        assert!(t[f.needs.clone()].iter().any(|l| l.contains(title)), "{title}");
-    }
-    let seconds: Vec<usize> = f.agents.clone().filter(|&y| f.rows[y].covers.is_empty() && f.rows[y].target_at(0).is_some_and(|x| matches!(x, Target::Go { .. }))).collect();
-    for y in seconds {
-        assert!(t[y - 1].contains("◉"), "{t:#?}");
+    // Shorter still: the agents compress, every one of them the same height.
+    for step in [1, 2, 3] {
+        let f = (20..90).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == step).unwrap();
+        let t = texts(&f);
+        assert_eq!(f.step, STEPS.len() as u8, "{t:#?}");
+        // All four needs still on screen, in agent-jump.sh order (failed first).
+        let fail = find(&f, "Handy.app");
+        assert!(fail < find(&f, "Notch hover") && fail < f.agents.start);
+        for title in ["Kua Yu focus timing", "Commodities Job Tracker"] {
+            assert!(t[f.needs.clone()].iter().any(|l| l.contains(title)), "{title}");
+        }
+        let (firsts, seconds) = agent_lines(&f);
+        assert_eq!(seconds, if step == 1 { firsts } else { 0 }, "{step}: {t:#?}");
     }
     // In space scope (main only) the same fleet keeps its full detail,
     // full cards and every pill.
@@ -354,7 +380,7 @@ fn extreme_cuts_and_counts() {
     // keep the client's space and the alert ones, `+K` for the rest.
     let f = layout(&v, 34, 26, &Opts::default());
     let t = texts(&f);
-    assert_eq!((f.step, f.agents_step), (STEPS.len() as u8, 3), "{t:#?}");
+    assert_eq!((f.step, f.agents_step), (STEPS.len() as u8, 4), "{t:#?}");
     assert!(t[f.needs.clone()].last().unwrap().contains("more need you"), "{t:#?}");
     assert!(t[f.agents.clone()].iter().any(|l| l.starts_with(" … ") && l.contains(" more")), "{t:#?}");
     let pills = &t[f.spaces.start + 1..f.spaces.end];
@@ -363,7 +389,7 @@ fn extreme_cuts_and_counts() {
     // Shorter: more spaces than rows, the rest counted.
     let f = layout(&v, 34, 13, &Opts::default());
     let t = texts(&f);
-    assert_eq!(f.agents_step, 4, "{t:#?}");
+    assert_eq!(f.agents_step, 5, "{t:#?}");
     assert!(t.iter().any(|l| l.contains("more need you")), "{t:#?}");
     assert!(t.iter().any(|l| l.contains("more in")), "{t:#?}");
     // `… N more` opens the menu on All; `… N more need you` the default tab.
@@ -376,7 +402,7 @@ fn extreme_cuts_and_counts() {
     assert!(f.spaces.len() >= 2 && t[f.spaces.start + 1].contains(" alpha "), "{t:#?}");
     // With more room the spaces collapse, quietest first.
     let f = layout(&v, 34, 70, &Opts::default());
-    assert!(f.agents_step >= 3, "{:#?}", texts(&f));
+    assert!(f.agents_step >= 4, "{:#?}", texts(&f));
 }
 
 #[test]
@@ -459,20 +485,21 @@ fn titles_and_second_lines() {
     let f = layout(&v, 60, 58, &Opts::default());
     let t = texts(&f);
     let at = |s: &str| f.agents.start + agents_part(&f).iter().position(|l| l.contains(s)).unwrap_or_else(|| panic!("{s}: {t:#?}"));
-    // Working with last turn's outcome: one line, never the old outcome.
+    // Working with last turn's outcome: a second line with just the age,
+    // never the old outcome.
     let c = at("Commodities Job Tracker");
-    assert!(!t[c].contains("~/") && f.rows[c + 1].covers.len() == 1, "{t:#?}");
+    assert!(!t[c].contains("~/") && t[c + 1].trim() == "1m" && f.rows[c + 2].covers.len() == 1, "{t:#?}");
     // Working with what it runs: plain text under it; `project/` dropped.
     let r = at("Tmux Agent Sidebar");
     assert!(!t[r].contains("tmux/") && t[r + 1].starts_with("    cargo test "), "{:?}", t[r + 1]);
     let m = at("Markup only");
-    assert!(f.rows[m + 1].covers.len() == 1 || t[m + 1].trim().is_empty(), "{t:#?}");
+    assert!(t[m + 1].trim() == "5m", "{t:#?}");
     // Recently done (idle, 4 min): its outcome as plain text.
     let l = at("Lost suit jacket");
     assert!(t[l].contains("✓ done") && t[l + 1].starts_with("    Found it "), "{:?}", t[l + 1]);
-    // Long done: idle, one line.
+    // Long done: idle, its last outcome under it with the age.
     let g = at("Long ago");
-    assert!(t[g].contains("idle 1h") && !t.iter().any(|x| x.contains("Old news")), "{t:#?}");
+    assert!(t[g].ends_with(" idle ") && t[g + 1].starts_with("    Old news") && t[g + 1].ends_with(" 1h "), "{t:#?}");
     // Asking: the question.
     let k = at("Kua Yu");
     assert!(t[k].contains("◉ asks") && t[k + 1].starts_with("    Which deck?"), "{t:#?}");
@@ -599,7 +626,8 @@ fn spaces_wear_their_colour() {
 #[test]
 fn folding_and_collapsing() {
     let v = busy();
-    let f = (20..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 2).unwrap();
+    // Idle folded first, the rows still two lines each.
+    let f = (20..90).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 1).unwrap();
     let t = texts(&f);
     assert!(t.iter().any(|l| l.contains("○○○ 3 idle · ")), "{t:#?}");
     // The fold opens the menu on its Idle tab.
@@ -608,7 +636,7 @@ fn folding_and_collapsing() {
     // The client's window is never folded away.
     assert!(t.iter().any(|l| l.contains("Tmux Agent Sidebar")));
     // Squeezed further: whole spaces collapse, quietest first; main keeps its rows longest.
-    let f = (10..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 3).unwrap();
+    let f = (10..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 4).unwrap();
     let t = texts(&f);
     assert!(t[f.agents.clone()].iter().any(|l| l.contains("Kua Yu focus timing")), "{t:#?}");
 }
@@ -629,7 +657,7 @@ fn answered_is_never_folded() {
         None,
     );
     assert!(v.needs.is_empty());
-    let f = (8..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 2).unwrap();
+    let f = (8..58).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 1).unwrap();
     let t = texts(&f);
     assert!(t.iter().any(|l| l.contains("3 idle · Q3, Q4, Q5")), "{t:#?}");
     assert!(t.iter().any(|l| l.starts_with("  Two")), "{t:#?}");
@@ -765,9 +793,11 @@ fn the_card_replaces_the_status_line() {
     let x3 = t[2][..t[2].find("⌥3").unwrap()].chars().count() as u16;
     assert_eq!(f.target(x3, 2).cloned(), shell("@903"));
     // The meters: label, bar, percent, delta.
-    assert!(t[3].starts_with("  S ━") && t[3].contains(" 13%  −38 "), "{:?}", t[3]);
-    assert!(t[4].starts_with("  W ━") && t[4].contains(" 60% Σ+17 "), "{:?}", t[4]);
-    assert!(f.rows[4].segs.iter().any(|s| s.text.contains("Σ+17") && s.fg == Ink::Pal("peach")), "over pace: peach");
+    // The delta as the status bar wrote it, no Σ even for a pooled pace.
+    assert!(t[3].starts_with("  S ━") && t[3].contains(" 13% (-38%) "), "{:?}", t[3]);
+    assert!(t[4].starts_with("  W ━") && t[4].contains(" 60% (+17%) "), "{:?}", t[4]);
+    assert!(!t.iter().any(|l| l.contains('Σ')), "{t:#?}");
+    assert!(f.rows[4].segs.iter().any(|s| s.text.contains("(+17%)") && s.fg == Ink::Pal("peach")), "over pace: peach");
     assert!(t[5].starts_with("  F ─") && t[5].contains("   -- "), "{:?}", t[5]);
     assert!(t[6].contains(" ! ") && t[6].contains("last save 2h ago"), "{:?}", t[6]);
     // The card's border is ratatui's rounded Block, painted over the rows
@@ -825,12 +855,14 @@ fn meters_fill_and_tick() {
     assert_eq!(tick, (0.43 * bw as f64).round() as usize, "{t:?}");
     let filled = bar.chars().filter(|&c| c == '━').count() + usize::from(tick < (0.6 * bw as f64).round() as usize);
     assert_eq!(filled, (0.6 * bw as f64).round() as usize, "{t:?}");
-    assert!(t.ends_with(" 60%  +17 ") || t.ends_with("↻3h "), "{t:?}");
+    assert!(t.ends_with(" 60% (+17%) ") || t.ends_with("↻3h "), "{t:?}");
     // Wide: the reset hint too.
-    assert!(meter_row(&u, 60, NOW as f64).text().ends_with(" 60%  +17  ↻3h "), "{:?}", meter_row(&u, 60, NOW as f64).text());
-    // Under pace: dim; idle: an empty bar and `idle`; no number: `--`.
+    assert!(meter_row(&u, 60, NOW as f64).text().ends_with(" 60% (+17%)  ↻3h "), "{:?}", meter_row(&u, 60, NOW as f64).text());
+    // Under pace: dim; on pace: `±0%`; idle: an empty bar and `idle`; no number: `--`.
     let under = Usage { delta: Some(-4), ..u.clone() };
-    assert!(meter_row(&under, 40, 0.0).segs.iter().any(|s| s.text.contains("−4") && s.fg == Ink::Pal("overlay")));
+    assert!(meter_row(&under, 40, 0.0).segs.iter().any(|s| s.text.contains(" (-4%)") && s.fg == Ink::Pal("overlay")));
+    let even = Usage { delta: Some(0), pooled: true, ..u.clone() };
+    assert!(meter_row(&even, 40, 0.0).text().contains(" 60%  (±0%) "), "{:?}", meter_row(&even, 40, 0.0).text());
     let idle = Usage { label: "S".into(), idle: true, ..Usage::default() };
     let t = meter_row(&idle, 34, 0.0).text();
     assert!(t.contains("─────") && !t.contains('━') && !t.contains('┃') && t.ends_with("idle "), "{t:?}");
@@ -855,12 +887,12 @@ fn ages_follow_the_frame_clock() {
     let at = |now: Option<f64>| {
         let f = layout(&v, 34, 58, &Opts { now, ..Opts::default() });
         let t = texts(&f);
-        (t[find(&f, "Lost suit jacket")].clone(), t[find(&f, "Edit agent-roster.py")].clone(), t[find(&f, "▌ Kua Yu")].clone())
+        (t[find(&f, "Lost suit jacket") + 1].clone(), t[find(&f, "Edit agent-roster.py")].clone(), t[find(&f, "▌ Kua Yu")].clone())
     };
     let (idle, msg, card) = at(None);
-    assert!(idle.ends_with("idle 6m ") && msg.ends_with(" 2m ") && card.ends_with("◉ 3m "), "{idle:?} {msg:?} {card:?}");
+    assert!(idle.ends_with(" 6m ") && msg.ends_with(" 2m ") && card.ends_with("◉ 3m "), "{idle:?} {msg:?} {card:?}");
     let (idle, msg, card) = at(Some(NOW as f64 + 60.0));
-    assert!(idle.ends_with("idle 7m ") && msg.ends_with(" 3m ") && card.ends_with("◉ 4m "), "{idle:?} {msg:?} {card:?}");
+    assert!(idle.ends_with(" 7m ") && msg.ends_with(" 3m ") && card.ends_with("◉ 4m "), "{idle:?} {msg:?} {card:?}");
 }
 
 /// Dim text on a surface (a pill, a card, a lifted row) is `overlay2`,

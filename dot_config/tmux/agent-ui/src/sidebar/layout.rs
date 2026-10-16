@@ -18,9 +18,11 @@
 //!  AGENTS                    all spaces   (a click flips the scope)
 //!  ● main                     ◐2 ○3       space header: dot in @space_color
 //! ▎ d  Tmux Agent Sidebar   ⠹ working     the client's agent: highlighted row
-//!      run cargo test             26s     a dim second line only for working,
-//!   q  Pause Resume Agents      ✓ done     asking and recently done agents
-//!   h  Canvas Syllabus         idle 1h    idle: one line
+//!      run cargo test             26s     every agent two lines: a dim second
+//!   q  Pause Resume Agents      ✓ done     line (the message; for idle, its
+//!      Merged the pause key       2m      last outcome; maybe blank), the
+//!   h  Canvas Syllabus            idle    age at its end
+//!      Synced 4 assignments       1h
 //!
 //!  ──────────────────────────────────
 //!   1 main   2 bai   3 cs35l  4 sched     spaces as pills (current filled),
@@ -45,12 +47,11 @@
 //!    the agents' one-line shape leaves (at least 2, and at least a third of
 //!    the body), cut with a `… N more need you` line.
 //!
-//! The agents' own ladder: every agent to one line (age beside its state),
-//! rows left over going back to second lines for the agents that matter most
-//! (attention, then in flight); then the idle agents of a space fold into one
-//! `○○○ 3 idle · Name, Name…` line; then whole spaces collapse to their
-//! header (with its counts), fewest attention agents first; finally a
-//! `… N more` line.
+//! The agents' own ladder keeps every agent row the same height: the idle
+//! agents of a space fold into one `○○○ 3 idle · Name, Name…` line; then
+//! every agent goes to one line (age beside its state), unfolded, then
+//! folded again; then whole spaces collapse to their header (with its
+//! counts), fewest attention agents first; finally a `… N more` line.
 //!
 //! Every agents-section row records the agents it stands for
 //! ([`Row::covers`]), so a test can prove each agent is shown, folded,
@@ -583,16 +584,16 @@ fn hint_row(n: usize, w: usize) -> Row {
     Row::new(fit(w, vec![seg(" ", "text"), chip, seg(format!(" {keys}"), "sub")], vec![], None))
 }
 
-/// A signed delta as the meter prints it: `+17`, `−4`, `±0`; `Σ` first when
-/// the pace is a pool's.
+/// A signed delta as the meter prints it, the way the status bar did:
+/// `(+17%)`, `(-4%)`, `(±0%)`. A pooled pace reads the same.
 fn delta_text(u: &Usage) -> String {
     let Some(d) = u.delta else { return String::new() };
     let sign = match d.signum() {
         1 => "+",
-        -1 => "−",
+        -1 => "-",
         _ => "±",
     };
-    format!("{}{sign}{}", if u.pooled { "Σ" } else { "" }, d.unsigned_abs())
+    format!("({sign}{}%)", d.unsigned_abs())
 }
 
 /// Time until `at` as the meter's reset hint says it: `45m`, `3h`, `2d`.
@@ -629,7 +630,7 @@ fn meter_row(u: &Usage, w: usize, now: f64) -> Row {
     let build = |with_delta: bool, with_reset: bool| -> Vec<Seg> {
         let mut r = vec![bold(format!(" {pct:>4}"), "text")];
         if with_delta && !delta.is_empty() {
-            r.push(seg(format!(" {delta:>4}"), if over { "peach" } else { "overlay" }));
+            r.push(seg(format!(" {delta:>6}"), if over { "peach" } else { "overlay" }));
         }
         if let Some(rs) = resets.as_ref().filter(|_| with_reset) {
             r.push(seg(format!(" {rs:>4}"), "overlay"));
@@ -848,6 +849,16 @@ fn message(a: &Agent, now: f64) -> Option<String> {
     show.then_some(m)
 }
 
+/// What a two-line agent row says under its title: the [`message`]; else,
+/// for an idle agent, its last turn's outcome (what it last said is still
+/// true of it); else nothing (a working agent's old outcome never reads as
+/// what it does now). Every agent row is two lines either way.
+fn second_line(a: &Agent, now: f64) -> String {
+    message(a, now)
+        .or_else(|| (!a.in_flight && a.cat != Some(Cat::Working)).then(|| plain(&a.detail)))
+        .unwrap_or_default()
+}
+
 /// A title without a bare `~/` "project" (a summary made in $HOME).
 fn no_home(title: &str) -> &str {
     title.strip_prefix("~/").unwrap_or(title)
@@ -860,10 +871,11 @@ fn short_title(a: &Agent) -> String {
 }
 
 /// One agent: its key-cap, the title (bold unless idle), a flag (⚙ workflow,
-/// ◎ cua), and the state word on the right, the age beside it; with `two`
-/// and a [`message`], a dim second line with the age at its end. The
-/// client's agent sits on `surface0` with a blue edge; one in prefix v's
-/// selection on mauve with a mauve edge. Both lines click through.
+/// ◎ cua), and the state word on the right, the age beside it; with `two`,
+/// a dim second line ([`second_line`], maybe blank) with the age at its end,
+/// so every agent row is the same height. The client's agent sits on
+/// `surface0` with a blue edge; one in prefix v's selection on mauve with a
+/// mauve edge. Both lines click through.
 fn agent_rows(a: &Agent, cx: Cx, two: bool) -> Vec<Row> {
     let w = cx.w;
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
@@ -874,7 +886,7 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool) -> Vec<Row> {
     } else {
         (None, seg(" ", "text"))
     };
-    let msg = if two && cx.seconds() { message(a, cx.now) } else { None };
+    let msg = (two && cx.seconds()).then(|| second_line(a, cx.now));
     let word = state_word(a, cx);
     let age = Some(age_of(a, cx)).filter(|g| cx.ages() && !g.is_empty() && word.is_some());
     // Dim text on a lifted row needs the surface's dim.
@@ -1048,9 +1060,9 @@ fn partial_rows(sp: &Space, cx: Cx, room: usize) -> Vec<Row> {
     rows
 }
 
-/// Which one-line agents get their second line back first, when a
-/// compressed step leaves rows over: attention, then in flight, then the
-/// client's window, then any with a message; ties in list order.
+/// Which agents a collapsed space keeps first, when its rows run short:
+/// attention, then in flight, then the client's window, then any with a
+/// message; ties in list order.
 fn promotion_rank(a: &Agent, now: f64) -> u8 {
     if a.attention {
         0
@@ -1103,10 +1115,9 @@ fn agents_header(view: &ViewModel, w: usize) -> Row {
 /// `budget` rows → (rows, its ladder step). `spaced`: a blank row between
 /// groups when everything else fits.
 ///
-/// Steps 1..=3 are a SHAPE (one-line rows; idle folded; spaces collapsed);
-/// rows a shape leaves over go back to second lines for the agents that
-/// matter most ([`promotion_rank`]), so a section that just misses its
-/// full detail is not left mostly empty.
+/// Steps: 0 every agent two lines; 1 the same, idle folded; 2 every agent
+/// one line; 3 the same, idle folded; 4 spaces collapsed; 5 `… N more`.
+/// Never a mix of heights in one frame.
 fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec<Row>, u8) {
     if budget == 0 {
         return (vec![], 0);
@@ -1141,23 +1152,6 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
         }
         rows
     };
-    // A shape that fits, with its spare rows handed out as second lines.
-    let promoted = |fold: bool, collapsed: &[bool]| {
-        let base = build(&[], fold, collapsed, false);
-        if base.len() > budget {
-            return None;
-        }
-        let mut cands: Vec<&Agent> = groups
-            .iter()
-            .zip(collapsed)
-            .filter(|(_, &c)| !c)
-            .flat_map(|(sp, _)| split_idle(sp, fold, cx.now).0)
-            .filter(|a| cx.seconds() && message(a, cx.now).is_some())
-            .collect();
-        cands.sort_by_key(|a| promotion_rank(a, cx.now)); // stable: list order within a rank
-        let two: Vec<Key> = cands.into_iter().take(budget - base.len()).map(key).collect();
-        Some(build(&two, fold, collapsed, false))
-    };
     let mut collapsed = vec![false; groups.len()];
     let all: Vec<Key> = groups.iter().flat_map(|g| g.agents.iter().map(key)).collect();
     for sp in if spaced { &[true, false][..] } else { &[false][..] } {
@@ -1166,8 +1160,10 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
             return (rows, 0);
         }
     }
-    for (step, fold) in [(1, false), (2, true)] {
-        if let Some(rows) = promoted(fold, &collapsed) {
+    // Every agent row the same height: all two lines (idle folded), else all one.
+    for (step, two, fold) in [(1, &all[..], true), (2, &[][..], false), (3, &[][..], true)] {
+        let rows = build(two, fold, &collapsed, false);
+        if rows.len() <= budget {
             return (rows, step);
         }
     }
@@ -1191,40 +1187,39 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
             .map(|j| 1 + if collapsed[j] { 0 } else { group_rows(groups[j], cx, &[], true).len() })
             .sum::<usize>();
         if spare < 2 {
-            let rows = promoted(true, &collapsed).unwrap_or_else(|| base.clone());
-            if spare == 0 || rows.len() > base.len() {
-                return (rows, 3);
+            if spare == 0 {
+                return (base, 4);
             }
-            // One row and nothing to promote: the collapsed space's most
-            // important agent under its header, which still counts the rest.
+            // One row: the collapsed space's most important agent under its
+            // header, which still counts the rest.
             let g = groups[i];
             let Some(top) = (0..g.agents.len()).min_by_key(|&k| (promotion_rank(&g.agents[k], cx.now), k)) else {
-                return (rows, 3);
+                return (base, 4);
             };
             let mut rows = base;
             let gone = key(&g.agents[top]);
             rows[at].covers.retain(|(s, id)| (s.as_str(), id.as_str()) != gone);
             rows.insert(at + 1, agent_rows(&g.agents[top], cx, false).remove(0));
-            return (rows, 3);
+            return (rows, 4);
         }
         // The space whose collapse made it fit keeps the rows that frees:
         // its most important agents, one line each, and `… N more`.
         let mut rows = base;
         rows[at] = group_header(groups[i], w, false);
         rows.splice(at + 1..at + 1, partial_rows(groups[i], cx, spare));
-        return (rows, 3);
+        return (rows, 4);
     }
     // More spaces than rows: the first ones as headers, the rest counted.
     if budget == 1 {
         let all: Vec<&Agent> = groups.iter().flat_map(|g| g.agents.iter()).collect();
-        return (vec![more_row(w, &all, groups.len())], 4);
+        return (vec![more_row(w, &all, groups.len())], 5);
     }
     let keep = budget - 2;
     let mut rows = build(&[], true, &collapsed, false);
     rows.truncate(1 + keep);
     let rest: Vec<&Agent> = groups[keep..].iter().flat_map(|g| g.agents.iter()).collect();
     rows.push(more_row(w, &rest, groups.len() - keep));
-    (rows, 4)
+    (rows, 5)
 }
 
 // ---------------------------------------------------------------- needs you
