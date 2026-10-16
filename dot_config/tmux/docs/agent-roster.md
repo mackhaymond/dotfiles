@@ -625,7 +625,8 @@ described in the rest of this section; it was not changed.**
   resolution, same hidden/stash fallback, same shell rule, same ordinals,
   same Option-V / title toggle (`set-option -g @strip_scope`, the old scope
   kept and `couldn't set @strip_scope` shown on failure; the toggle is the
-  space chip once a client is known, else the ` agents` / ` space` title).
+  AGENTS header's scope word once a client is known, else the ` agents` /
+  ` space` title).
   In its own layout: the header's counts are that session's in space scope,
   the agents section (`agents  this space`, else `by space`) holds only the
   client's session's rule and rows; every row keeps its letter badge (no
@@ -783,27 +784,31 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   renders one frame):
 
   ```
-    ⌃1 main   prefix     ◉1 ◐1 ○1      space chip (@space_color), red `prefix` mark
-   ⌥1 ⌂~  ⌥2 nvim  ⌥3 tmp              this space's shells (⌥N; click: go there)
-    S  71%  W  19%  F  0%              usage (status-right's modules)
-    !  last save 2h ago                the stale-save chip, when set
-    ⏵ next ⌥S   ⤺ back ⌥X   ≡ ⌥W       toolbar (gone under 20 rows)
-                                       gap
-   needs you                      2    NEEDS YOU, agent-jump.sh order, as before
-  ▌ a ✕ Slides export                  3-line cards: letter, title, reason,
-  ▌     failed                         place · kind
-  ▌     bai:1 · ⬢ codex        ⏎ go
-                                       gap
-   agents                this space    THE BODY: the client's space (or every
-   main ⌥ main ─────────── ◉1 ◐1 ○1    space in `all` scope), two lines per
-   d ◐ Sidebar status block    here    agent, its LETTER badge first
-       run cargo test
+  ╭─ prefix ───────────────────────╮   the card: the key table's mark in its
+  │ S ━━━━━┃━━────────  21% (-4%)  │   top border (prefix / ⌥W jump), one
+  │ W ━━━━━━━━━┃━─────  60% (+17%) │   usage meter per window, the stale save
+  ╰────────────────────────────────╯
+   NEEDS YOU                      2    NEEDS YOU, agent-jump.sh order: tinted
+  ▌ a  Slides export            ✕ 3m   2-line cards (letter, title; reason)
+  ▌    failed
+   AGENTS                all spaces    THE BODY: every space (or the client's
+   ● main   main          ◉1 ◐1 ○1    in space scope); every agent row two
+  ▎ d  Sidebar status   ⠹ working     lines (message, or an idle agent's last
+  ▎    run cargo test           26s    outcome, or blank; the age at its end)
+   SHELLS                              the client's space's shells, one row
+    ⌥1  ⌂ ~                            each (⌥N; click: go there), the active
+  ▎ ⌥2  nvim                           one lifted
                                        spare rows collect here
-   spaces                              THE list of spaces, @space_index order
-   ⌃1 ● main               ◉1 ◐1 ○1    ⌃N chip in @space_color; click: go there
-   ⌃2 ○ bai                      ✕1
+   ────────────────────────────────    the spaces as pills, ⌃N order, the
+    1 main   2 bai   3 cs35l           client's filled in its @space_color
    ⏸ 0 parked                          the stash; a watcher problem in red
   ```
+
+  The card no longer shows a space chip (the filled pill at the bottom says
+  which space the client is in) or the shells (their own section). Under
+  pressure every agent row stays the same height: idle agents fold first,
+  then every agent goes to one line at once; the SHELLS section becomes one
+  line of pills (` SHELLS ⌥1 ⌂~ ⌥2 nvim +1`) before any agent loses detail.
 
 - **Letters**: every agent row (both scopes) and every NEEDS YOU card starts
   with a solid ` a ` badge, dark ink on the agent's state colour (the
@@ -811,39 +816,38 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   the menu's own assignment (`menu::letters::of_view`, see
   [letter keys](#agent-ui-menu-letter-keys)). A live sidebar persists the
   letters it assigns to `@agent_key` exactly like the menu (one batched
-  background write, `KeyMemo`), so UB's ⌥F table, the menu and every
+  background write, `KeyMemo`), so UB's ⌥W table, the menu and every
   sidebar agree; `--once` never writes. While the client's key table is
-  `jump` (⌥F armed) every badge turns peach and the header's right side
-  reads `⌥F · type a letter`. No letter (past 26): a blank badge; no letter
+  `jump` (⌥W armed) every badge turns peach and the card's top border
+  reads `⌥W jump  type a letter`. No letter (past 26): a blank badge; no letter
   anywhere: no column. The 1-9 ordinals and slot numbers are gone.
 - **Status block** (`status::Bar`, built from the one per-tick snapshot,
   before home windows are hidden; no script runs per frame):
-  - the header's space chip: ` ⌃N name ` as a solid block in the session's
-    `@space_color` (`#rrggbb`, `colourN` or a colour name; the neutral
-    `surface1` when unset or junk), `[name]` dim in a hidden session; a red
-    ` prefix ` block while `#{client_key_table}` is `prefix`;
-  - this space's shells (windows without `@agent_state`, window-index order,
-    so the home window is shell 1, exactly space.sh's `SHELLS`), each `⌥N`
-    plus its label (spaces.conf's rule: a shell shows `~` or its cwd's last
-    part, anything else its window name; `⌂` marks home), the active one
-    bold peach; a click goes there (`Target::Shell`, agent-jump.sh goto; a
-    right-click never parks it). Up to 2 lines, then `+K`;
-  - usage: `@codex_session_text` / `_weekly_` / `_scoped_` with their
-    `_color` and `@codex_scoped_icon` (codexbar-usage-status.sh keeps them;
-    they hold the display provider's numbers, Claude's), `--%` while one is
-    unset, the deltas dropped when the three do not fit;
+  - in the card's top border: a red ` prefix ` block while
+    `#{client_key_table}` is `prefix`, a peach ` ⌥W jump ` and `type a
+    letter` while it is `jump` (no card: a row of their own);
+  - this space's shells, in the SHELLS section under the agents (windows
+    without `@agent_state`, window-index order, so the home window is shell
+    1, exactly space.sh's `SHELLS`), each `⌥N` plus its label (spaces.conf's
+    rule: a shell shows `~` or its cwd's last part, anything else its window
+    name; `⌂` marks home), the active one lifted; a click goes there
+    (`Target::Shell`, agent-jump.sh goto; a right-click never parks it);
+  - usage meters: `@codex_<w>_used` / `_expected` / `_delta` / `_resets`
+    (`<w>` = `session` / `weekly` / `scoped`, falling back to `_text`) with
+    their `_color`; the pace as the status bar wrote it, `60% (+17%)`, no
+    `Σ` for a pooled one; `--` while one is unset;
   - `@resurrect_stale` as ` ! last save 2h ago` / `save refused`, red;
   - prefix v's range selection (below).
   All of it rides on the client row of the same `list-clients` call
   (`tmux::STATUS_FORMATS`) and the window rows (`@space_color`,
-  `@stash_sel`). Shorter frames give up, in order: the toolbar (under 20
-  rows), the second shells line (under 24), usage and the stale save
-  (under 12), the shells (under 10), the selection hint (under 6).
+  `@stash_sel`). Shorter frames give up, in order: the card's border (under
+  16 rows), the meters for one usage line (under 30), usage and the stale
+  save (under 12), the selection hint (under 6); a card with nothing in it
+  is not drawn.
 - **Stash selection** (prefix v, stash.sh `sel-start` / `sel-move`): live
   while the client is in the `stash` key table or any window still has
-  `@stash_sel`. Every selected agent row (both lines) and shell chip is
-  drawn on mauve with dark ink (catppuccin's tab tint), and a row under the
-  header reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
+  `@stash_sel`. Every selected agent row (both lines) and shell row is
+  drawn on a mauve tint with a mauve edge, and the card's first row reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
   many keys as fit). stash.sh posts the focus notice after sel-start,
   sel-move, sel-cancel and the park, so it shows at once.
 

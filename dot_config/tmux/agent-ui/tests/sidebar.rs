@@ -196,13 +196,15 @@ fn once_follows_the_scope_options() {
     let once = || plain(&s.sidebar(&["--once", "34x30", "--client", &tty]));
     let agents_part = |lines: &[String]| {
         let start = lines.iter().position(|l| l.starts_with(" AGENTS"));
-        let end = lines.iter().rposition(|l| l.contains("────")).expect("the spaces");
+        let end = lines.iter().position(|l| l.starts_with(" SHELLS"));
+        let end = end.or_else(|| lines.iter().rposition(|l| l.contains("────"))).expect("the spaces");
         lines[start.expect("the agents section")..end].to_vec()
     };
-    // Classic until an option says otherwise (the card shows the client's
-    // space chip; the agents section says which scope).
+    // Classic until an option says otherwise (no usage here, so no card and
+    // no space chip; work has no shells, so no SHELLS section; the agents
+    // section says which scope).
     let classic = once();
-    assert!(classic[0].starts_with("╭") && classic[1].contains(" work "), "{classic:#?}");
+    assert!(classic[0].starts_with(" NEEDS YOU") && !classic.iter().any(|l| l.contains("SHELLS")), "{classic:#?}");
     assert!(agents_part(&classic)[0].ends_with("all spaces ") && agents_part(&classic).iter().any(|l| l.starts_with(" ● zeta")),
         "{classic:#?}");
     s.tmux(&["set-option", "-g", "@spaces", "on"]);
@@ -230,8 +232,10 @@ fn once_follows_the_scope_options() {
     s.tmux(&["switch-client", "-c", &tty, "-t", "work:0"]);
     let lines = once();
     assert!(!agents_part(&lines).iter().any(|l| l.contains("home")), "{lines:#?}");
-    // ...it is the space's shell 1 on the card (⌥1, ⌂).
-    assert!(lines[1].contains(" work ") && lines[1].contains("⌥1 ⌂home"), "{lines:#?}");
+    // ...it is the space's shell 1 in the SHELLS section (⌥1, ⌂), lifted:
+    // the client is on it.
+    let sh = lines.iter().position(|l| l.starts_with(" SHELLS")).unwrap_or_else(|| panic!("{lines:#?}"));
+    assert!(lines[sh + 1].starts_with("▎ ⌥1  ⌂ home"), "{lines:#?}");
     assert!(lines.iter().any(|l| l.starts_with(" ● work")), "{lines:#?}");
 }
 
@@ -346,7 +350,8 @@ fn the_dashboard_pane_is_never_a_target() {
     // The status block: shell 1 is the home, labelled by the SHELL's cwd.
     let tty = s.nested_client("work", "main:8");
     let lines = plain(&s.sidebar(&["--once", "34x30", "--client", &tty]));
-    assert!(lines[1].contains("⌥1 ⌂tmp"), "{lines:#?}");
+    let home_row = |lines: &[String]| lines.iter().position(|l| l.starts_with("  ⌥1  ⌂ tmp"));
+    assert!(home_row(&lines).is_some(), "{lines:#?}");
     // The live sidebar, with a fake agent-jump.sh that just switches the
     // client: a click on ⌥1 lands on the home with the shell focused.
     let dir = std::env::temp_dir().join(format!("agentui-dash-{}", std::process::id()));
@@ -359,13 +364,13 @@ fn the_dashboard_pane_is_never_a_target() {
     s.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
-    wait_for("the first frame", || screen().lines().nth(1).is_some_and(|l| l.contains("⌥1 ⌂tmp")));
+    let lines = || screen().lines().map(String::from).collect::<Vec<_>>();
+    wait_for("the first frame", || home_row(&lines()).is_some());
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(s.tmux(&["display-message", "-p", "-t", "work:0", "#{pane_id}"]).trim(), dash);
-    // A click on the ⌥1 pill, wherever the card put it.
-    let line = screen().lines().nth(1).unwrap().to_string();
-    let x = line[..line.find("⌥1").unwrap()].chars().count() + 1;
-    let click = format!("\x1b[<0;{x};2M\x1b[<0;{x};2m");
+    // A click on the ⌥1 row, wherever the SHELLS section put it.
+    let (x, y) = (8, home_row(&lines()).unwrap() + 1);
+    let click = format!("\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m");
     let hex: Vec<String> = click.bytes().map(|b| format!("{b:02x}")).collect();
     let mut a = vec!["send-keys", "-t", "main:9", "-H"];
     a.extend(hex.iter().map(String::as_str));
@@ -396,7 +401,9 @@ fn key_table_marks_clear_without_a_notice() {
     wait_for("the first frame", || screen().contains("NEEDS YOU"));
     std::thread::sleep(Duration::from_millis(300));
     let card = || screen().lines().take(4).collect::<Vec<_>>().join("\n");
-    for (table, want) in [("prefix", " prefix "), ("jump", "⌥W jump")] {
+    // (No usage here, so no card: the mark gets a row of its own, which
+    // capture-pane trims.)
+    for (table, want) in [("prefix", "  prefix"), ("jump", "⌥W jump")] {
         // Entering the table posts the notice (the root binding does)...
         s.tmux(&["switch-client", "-c", &tty, "-T", table]);
         post(&focus);
@@ -497,7 +504,7 @@ fn the_sidebar_leaves_with_its_client() {
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
     wait_for("the first frame", || screen().contains("NEEDS YOU"));
     std::thread::sleep(Duration::from_millis(300));
-    assert!(screen().starts_with("╭") && screen().lines().nth(1).unwrap().contains(" work "), "{}", screen());
+    assert!(screen().contains(" AGENTS"), "{}", screen());
     // Open: counted, the status line hidden; its job still runs.
     let opt = |o: &str| s.tmux(&["show-options", "-gqv", o]).trim().to_string();
     let pid = s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_pid}"]).trim().to_string();
@@ -511,7 +518,7 @@ fn the_sidebar_leaves_with_its_client() {
     // (UB's ⌥W table and stash.sh's, here with one key each so they exist.)
     s.tmux(&["bind-key", "-T", "jump", "a", "display-message", "a"]);
     s.tmux(&["bind-key", "-T", "stash", "Escape", "display-message", "esc"]);
-    for (table, want) in [("prefix", " prefix "), ("jump", "⌥W jump"), ("stash", "0 selected")] {
+    for (table, want) in [("prefix", "  prefix"), ("jump", "⌥W jump"), ("stash", "0 selected")] {
         s.tmux(&["switch-client", "-c", &tty, "-T", table]);
         post(&focus);
         wait_for(table, || screen().contains(want));
