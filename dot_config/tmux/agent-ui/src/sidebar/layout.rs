@@ -50,6 +50,10 @@
 //!    the agents' one-line shape leaves (at least 2, and at least a third of
 //!    the body), cut with a `… N more need you` line.
 //!
+//! At full detail a hairline (`surface0`, [`sep_row`]) separates one agent
+//! of a space from the next; the hairlines go after the gaps and card
+//! lines, before any agent loses its second line.
+//!
 //! The agents' own ladder keeps every agent row the same height: the idle
 //! agents of a space fold into one `○○○ 3 idle · Name, Name…` line; then
 //! every agent goes to one line (age beside its state), unfolded, then
@@ -1071,14 +1075,31 @@ fn split_idle(sp: &Space, fold: bool, now: f64) -> (Vec<&Agent>, Vec<&Agent>) {
 }
 
 /// A space's agent rows in window-index order (the folded line last); the
-/// agents in `two` get their second line (if they have a message).
-fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool) -> Vec<Row> {
+/// agents in `two` get their second line. With `sep`, a hairline between
+/// one agent and the next ([`sep_row`]).
+fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool, sep: bool) -> Vec<Row> {
     let (shown, idle) = split_idle(sp, fold, cx.now);
-    let mut rows: Vec<Row> = shown.iter().flat_map(|a| agent_rows(a, cx, two.contains(&key(a)))).collect();
+    let mut rows: Vec<Row> = Vec::new();
+    for (k, a) in shown.iter().enumerate() {
+        if sep && k > 0 {
+            rows.push(sep_row(cx.w));
+        }
+        rows.extend(agent_rows(a, cx, two.contains(&key(a))));
+    }
     if !idle.is_empty() {
+        if sep && !shown.is_empty() {
+            rows.push(sep_row(cx.w));
+        }
         rows.push(fold_row(&idle, cx));
     }
     rows
+}
+
+/// The hairline between two agents of a space: a `surface0` rule from the
+/// third cell to the second-last, so each agent reads as its own row. Not
+/// a target, stands for no one.
+fn sep_row(w: usize) -> Row {
+    Row::new(fit(w, vec![seg("  ", "text"), seg("─".repeat(w.saturating_sub(4)), "surface0")], vec![], None))
 }
 
 /// A space's agents in `room` rows: all of them one line each if they fit,
@@ -1153,9 +1174,10 @@ fn agents_header(view: &ViewModel, w: usize) -> Row {
 /// `budget` rows → (rows, its ladder step). `spaced`: a blank row between
 /// groups when everything else fits.
 ///
-/// Steps: 0 every agent two lines; 1 the same, idle folded; 2 every agent
-/// one line; 3 the same, idle folded; 4 spaces collapsed; 5 `… N more`.
-/// Never a mix of heights in one frame.
+/// Steps: 0 every agent two lines (with the hairlines between agents, then
+/// without); 1 the same, idle folded; 2 every agent one line; 3 the same,
+/// idle folded; 4 spaces collapsed; 5 `… N more`. Never a mix of heights in
+/// one frame.
 fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec<Row>, u8) {
     if budget == 0 {
         return (vec![], 0);
@@ -1177,7 +1199,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
         rows.truncate(budget);
         return (rows, 0);
     }
-    let build = |two: &[Key], fold: bool, collapsed: &[bool], spaced: bool| {
+    let build_sep = |two: &[Key], fold: bool, collapsed: &[bool], spaced: bool, sep: bool| {
         let mut rows = vec![header.clone()];
         for (k, (sp, &c)) in groups.iter().zip(collapsed).enumerate() {
             if spaced && k > 0 {
@@ -1185,15 +1207,18 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
             }
             rows.push(group_header(sp, w, c));
             if !c {
-                rows.extend(group_rows(sp, cx, two, fold));
+                rows.extend(group_rows(sp, cx, two, fold, sep));
             }
         }
         rows
     };
+    let build = |two: &[Key], fold: bool, collapsed: &[bool], spaced: bool| build_sep(two, fold, collapsed, spaced, false);
     let mut collapsed = vec![false; groups.len()];
     let all: Vec<Key> = groups.iter().flat_map(|g| g.agents.iter().map(key)).collect();
-    for sp in if spaced { &[true, false][..] } else { &[false][..] } {
-        let rows = build(&all, false, &collapsed, *sp);
+    // Full detail: the gaps between spaces go before the hairlines between agents.
+    let full: &[(bool, bool)] = if spaced { &[(true, true), (false, true), (false, false)] } else { &[(false, true), (false, false)] };
+    for &(sp, sep) in full {
+        let rows = build_sep(&all, false, &collapsed, sp, sep);
         if rows.len() <= budget {
             return (rows, 0);
         }
@@ -1222,7 +1247,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
         }
         let spare = budget - base.len();
         let at = 1 + (0..i)
-            .map(|j| 1 + if collapsed[j] { 0 } else { group_rows(groups[j], cx, &[], true).len() })
+            .map(|j| 1 + if collapsed[j] { 0 } else { group_rows(groups[j], cx, &[], true, false).len() })
             .sum::<usize>();
         if spare < 2 {
             if spare == 0 {

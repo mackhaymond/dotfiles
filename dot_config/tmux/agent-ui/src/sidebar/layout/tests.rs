@@ -363,9 +363,14 @@ fn quiet_is_roomy() {
     let c = find(&f, "Commodities Job Tracker");
     assert!(t[c].ends_with("✓ done ") && t[c + 1].starts_with("    7 fixes applied"), "{t:#?}");
     // Idle: two lines like every agent, the word on the first, the age
-    // under it.
+    // under it; then a hairline (no target) before the next agent.
     let n = find(&f, "Lost suit jacket");
-    assert!(t[n].ends_with(" idle ") && t[n + 1].ends_with(" 6m ") && f.rows[n + 2].covers.len() == 1, "{t:#?}");
+    assert!(t[n].ends_with(" idle ") && t[n + 1].ends_with(" 6m ") && is_sep(&t[n + 2]), "{t:#?}");
+    assert_eq!(t[n + 2], format!("  {}  ", "─".repeat(30)));
+    assert!(f.rows[n + 2].targets.is_empty() && f.rows[n + 2].covers.is_empty() && f.rows[n + 3].covers.len() == 1, "{t:#?}");
+    // No hairline after a space's last agent: its next row is a gap.
+    let last = f.agents.end - 1;
+    assert!(!t[f.agents.clone()].iter().zip(&t[f.agents.start + 1..=last]).any(|(a, b)| is_sep(a) && (b.trim().is_empty() || b.starts_with(" ●"))), "{t:#?}");
     assert!(t[find(&f, "Notch Tasks Orchestrator")].ends_with(" idle "), "{t:#?}");
     // A blank row between groups, in ⌃N (here: name) order.
     let bai = find(&f, " ● bai");
@@ -381,11 +386,16 @@ fn quiet_is_roomy() {
 #[test]
 fn busy_squeezes_spaces_and_cards_before_agents() {
     let v = busy();
-    // 24 agents, two lines each: full detail in 90 rows, gaps and all.
-    assert_eq!(layout(&v, 34, 90, &Opts::default()).step, 0);
-    // Shorter: the cards lose their second line before any agent loses detail.
-    let f = (20..90).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.step > 0).unwrap();
+    // 24 agents, two lines each and hairlines between: full detail in 110
+    // rows, gaps and all.
+    let f = layout(&v, 34, 110, &Opts::default());
+    assert!(f.step == 0 && texts(&f).iter().any(|l| is_sep(l)), "{:#?}", texts(&f));
+    // Shorter: the cards lose their second line before any agent loses
+    // detail; then the hairlines go, the agents still two lines.
+    let f = (20..110).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.step > 0).unwrap();
     assert_eq!(f.agents_step, 0, "{:#?}", texts(&f));
+    let f = (20..110).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| !texts(f).iter().any(|l| is_sep(l))).unwrap();
+    assert_eq!((f.step, f.agents_step), (STEPS.len() as u8, 0), "{:#?}", texts(&f));
     // Shorter still: the agents compress, every one of them the same height.
     for step in [1, 2, 3] {
         let f = (20..90).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == step).unwrap();
@@ -525,7 +535,7 @@ fn titles_and_second_lines() {
     // Working with last turn's outcome: a second line with just the age,
     // never the old outcome.
     let c = at("Commodities Job Tracker");
-    assert!(!t[c].contains("~/") && t[c + 1].trim() == "1m" && f.rows[c + 2].covers.len() == 1, "{t:#?}");
+    assert!(!t[c].contains("~/") && t[c + 1].trim() == "1m" && is_sep(&t[c + 2]) && f.rows[c + 3].covers.len() == 1, "{t:#?}");
     // Working with what it runs: plain text under it; `project/` dropped.
     let r = at("Tmux Agent Sidebar");
     assert!(!t[r].contains("tmux/") && t[r + 1].starts_with("    cargo test "), "{:?}", t[r + 1]);
@@ -1075,7 +1085,13 @@ fn proj() -> Vec<A<'static>> {
 /// An agent row's title, when `l` is one (no letters in these views).
 fn row_title(l: &str) -> Option<&str> {
     let rest = l.strip_prefix("  ").or_else(|| l.strip_prefix("▎ "))?;
-    (!rest.starts_with(' ')).then(|| rest.split("  ").next().unwrap().trim())
+    (!rest.starts_with(' ') && !is_sep(l)).then(|| rest.split("  ").next().unwrap().trim())
+}
+
+/// A hairline between two agents (from the third cell; the spaces' rule
+/// starts at the second).
+fn is_sep(l: &str) -> bool {
+    l.starts_with("  ─") && l.trim().chars().all(|c| c == '─')
 }
 
 #[test]

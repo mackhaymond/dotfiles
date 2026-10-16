@@ -794,7 +794,10 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
    AGENTS                all spaces    THE BODY: every space (or the client's
    ● main   main          ◉1 ◐1 ○1    in space scope); every agent row two
   ▎ d  Sidebar status   ⠹ working     lines (message, or an idle agent's last
-  ▎    run cargo test           26s    outcome, or blank; the age at its end)
+  ▎    run cargo test           26s    outcome, or blank; the age at its end),
+    ──────────────────────────────     a hairline between one agent and the
+    h  Canvas Syllabus          idle   next while there is room
+       Synced 4 assignments       1h
    SHELLS                              the client's space's shells, one row
     ⌥1  ⌂ ~                            each (⌥N; click: go there), the active
   ▎ ⌥2  nvim                           one lifted
