@@ -329,11 +329,15 @@ class Server(unittest.TestCase):
         # A name that would read as a flag is skipped: the placeholder stays.
         self.assert_born(row, kind="codex")
 
-    def test_closed_tabs_shell_and_opencode_stay_shells(self):
-        for rec in (self.rec(), self.rec(tool="opencode", cmd="command opencode -s 'x'")):
-            row = self.reopen(rec)
-            self.assertEqual(row["@agent_state"], "", rec)
-            self.assertEqual(row["@agent_born"], "", rec)
+    def test_closed_tabs_reopens_opencode_as_an_opencode_agent(self):
+        row = self.reopen(self.rec(tool="opencode", cmd="command opencode -s 'ses_x'", label="proj/Fix it"))
+        self.assert_born(row, kind="opencode", summary="proj/Fix it")
+        self.assert_counted_as_agent(row["window_id"])
+
+    def test_closed_tabs_shell_stays_a_shell(self):
+        row = self.reopen(self.rec())
+        self.assertEqual(row["@agent_state"], "")
+        self.assertEqual(row["@agent_born"], "")
 
     # -- the format itself -----------------------------------------------
     def test_home_project_is_tilde(self):

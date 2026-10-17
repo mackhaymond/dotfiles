@@ -11,7 +11,7 @@
 # Every POLL_SECONDS this daemon matches agent processes to tmux windows by
 # TTY and reconciles the per-window @agent_state option:
 #   agent present + no state           → idle    (seed presence)
-#   agent present + no @agent_kind     → its comm's kind (codex|claude)
+#   agent present + no @agent_kind     → its comm's kind (codex|claude|opencode)
 #   no agent     + any state OR summary → unset @agent_state/@agent_summary (GC)
 #   no agent     + fresh @agent_born    → left alone (BIRTH GRACE: a claude tab
 #                                         marked an agent at creation, before
@@ -53,7 +53,9 @@
 # version-string pattern is kept as a fallback in case a Claude build stops
 # setting its process title. Codex's npm wrapper spawns the native binary
 # vendor/<triple>/bin/codex → comm basename "codex" (plus a "node" parent we
-# don't match). Candidates come from `pgrep` (cheap), and each one's tty+comm
+# don't match). OpenCode is one native process, comm "opencode", and counts
+# only as its interactive TUI (opencode_tui_args: `opencode serve` is not an
+# agent). Candidates come from `pgrep` (cheap), and each one's tty+comm
 # from a single-pid ps, cached per pid — see PROCESS DISCOVERY in the loop.
 #
 # TICK TRACE (live measurement, no restart needed). If the file
@@ -318,7 +320,7 @@ is_agent_comm() {
     # comm values like "-zsh", which basename parses as an option).
     local base="${1##*/}"
     case "$base" in
-        claude|codex) return 0 ;;
+        claude|codex|opencode) return 0 ;;
     esac
     # Claude's binary is version-named (e.g. "2.1.170") in case its
     # process-title rename ever stops applying. Anchored regex, digits-only
@@ -352,6 +354,55 @@ session_status() {
     [ -f "$sf" ] || return 0
     raw="$(<"$sf")"
     [[ $raw =~ \"status\":\"([^\"]+)\" ]] && st="${BASH_REMATCH[1]}"
+    return 0
+}
+
+# OpenCode's answer, from the status file its tmux-agent-state plugin keeps:
+#   ${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent/opencode/<pid>.status
+# one line, "busy" or "idle", written atomically (tmp + rename) on every
+# session status change and removed (best effort) when the process exits.
+# Into the caller's `st` like session_status: "busy" | "idle" | "" (no file,
+# or anything else - left alone, the same conservative failure). Builtin read,
+# no fork; the file is a few bytes.
+OPENCODE_STATUS_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent/opencode"
+opencode_status() {
+    local sf raw
+    st=""
+    [ -n "$1" ] || return 0
+    sf="$OPENCODE_STATUS_DIR/$1.status"
+    [ -f "$sf" ] || return 0
+    raw="$(<"$sf")"
+    case "$raw" in busy|idle) st="$raw" ;; esac
+    return 0
+}
+
+# Is this opencode command line ($1, `ps -o args=`) the interactive TUI? Only
+# that is an agent. `opencode` with no subcommand, a project dir
+# (`opencode ~/code/x`), -c/--continue, -s/--session <id>, --mini, `opencode
+# pr <n>` (checks the PR out, then runs the TUI): yes. Every other subcommand
+# - serve, web, acp, mcp ..., debug ..., run (one-shot), attach <url> (a TUI,
+# but on a remote server whose plugin cannot report this pane, so it would
+# sit `idle` forever), export, stats, models, ... - is a shell running a
+# command, not an agent tab. The first bare word decides; options that take
+# a value skip it (`opencode -m openai/gpt-5 serve` is still serve). ps
+# joins argv with spaces, so a --prompt with spaces in it can shift that by
+# a word - harmless unless its 2nd word is a subcommand name. Builtins only.
+opencode_tui_args() {
+    local -a a
+    local i=1 w
+    read -r -a a <<<"$1"
+    while [ "$i" -lt "${#a[@]}" ]; do
+        w="${a[i]}"
+        case "$w" in
+            --log-level|--port|--hostname|--mdns-domain|--cors|-m|--model|-s|--session|--prompt|--agent|--replay-limit)
+                i=$((i + 2)); continue ;;
+            --) return 0 ;;
+            -*) i=$((i + 1)); continue ;;
+            completion|acp|mcp|attach|run|debug|providers|auth|agent|upgrade|uninstall|serve|web|models|stats|export|import|github|session|plugin|plug|db)
+                return 1 ;;
+            *) return 0 ;;
+        esac
+    done
     return 0
 }
 
@@ -843,9 +894,9 @@ birth_fresh() {
 # with `case "$s" in *" ${key} "*`, a linear scan per probe; with ~165
 # windows (most of them pty-MCP shells in `agents`) and four such probes
 # per window that was quadratic, ~20 ms a tick at load 200.
-AGENT_PAT='claude|codex|[0-9]+\.[0-9]+\.[0-9]+'
+AGENT_PAT='claude|codex|opencode|[0-9]+\.[0-9]+\.[0-9]+'
 declare -A PID_TTY=() PID_NEXT=() TTY_PID=()   # pid->tty|-, its rebuild, tty->lowest pid
-# pid -> codex|claude, for agent pids only: written by the same single-pid ps
+# pid -> codex|claude|opencode, for agent pids only: written by the same single-pid ps
 # that fills PID_TTY (no extra fork), dropped with it. A pid that leaves the
 # pgrep set and comes back is ps'd again, so this is overwritten with it.
 declare -A PID_KIND=()
@@ -1297,11 +1348,31 @@ while :; do
         fi
         while IFS=' ' read -r tty pid comm; do
             [ -n "$pid" ] || continue
+            # An opencode pid is an agent only as the interactive TUI
+            # (opencode_tui_args): `opencode serve` / `web` / `mcp ...` in a
+            # shell tab is a command, not an agent. That needs its argv, so
+            # one more single-pid ps - for a NEW opencode pid only (the
+            # verdict is cached in PID_TTY like everything else here).
+            # An EMPTY answer is no verdict: it is not cached (a cached "-"
+            # would hide a live TUI for up to PID_CACHE_TICKS, long enough for
+            # the GC to collect its tab), so the pid counts as exited this
+            # tick and is looked at again next tick; one that really exited
+            # leaves the pgrep set anyway.
+            agent_ok=0
             if [ -n "$tty" ] && [ "$tty" != "??" ] && is_agent_comm "$comm"; then
+                agent_ok=1
+                if [ "${comm##*/}" = opencode ]; then
+                    oc_args=$(ps -ww -o args= -p "$pid" 2>/dev/null)
+                    [ -n "$oc_args" ] || continue
+                    opencode_tui_args "$oc_args" || agent_ok=0
+                fi
+            fi
+            if [ "$agent_ok" = 1 ]; then
                 PID_TTY[$pid]="$tty"
-                # is_agent_comm's names: codex, else claude (incl. N.N.N).
+                # is_agent_comm's names: codex, opencode, else claude (incl. N.N.N).
                 case "${comm##*/}" in
                     codex) PID_KIND[$pid]=codex ;;
+                    opencode) PID_KIND[$pid]=opencode ;;
                     *) PID_KIND[$pid]=claude ;;
                 esac
             else
@@ -1559,7 +1630,8 @@ EOF
             # Asked whatever wf says: a stale gear (the lib's verdict after a
             # crash and resume) must not stop a real task from holding.
             if [ "$state" = running ] && [ -n "$pid" ] \
-               && [ "${PID_KIND[$pid]:-}" != codex ]; then
+               && [ "${PID_KIND[$pid]:-}" != codex ] \
+               && [ "${PID_KIND[$pid]:-}" != opencode ]; then
                 st=""
                 session_status "$pid"
                 case "$st" in
@@ -1631,14 +1703,27 @@ EOF
         # other window none. A running tab whose last turn end predates its
         # stamp, or whose agent is not codex, keeps the older rule (idle after
         # the streak, state only).
+        #
+        # OPENCODE: its plugin's status file (opencode_status) is the ground
+        # truth, read the way Claude's session file is - `idle` for three
+        # ticks in a row clears a stuck `running` to idle, state only (Esc
+        # mid-turn, a missed session.idle, a plugin spawn that failed). Only
+        # `running`: like Claude's, it is not trusted to clear needs-input.
+        # An opencode pid never falls through to the Claude session file or a
+        # (stale, earlier-codex) rollout.
         fin=""        # the state this agent's own record says, if it disagrees
         cx_full=0     # 1 = a codex turn end after the stamp: the full write
         if [ "$has_agent" = 1 ]; then
             case "$state" in
                 running)
                     st=""
-                    [ -n "$pid" ] && session_status "$pid"          # claude
-                    if [ -z "$st" ] && [ -n "${W_ROLL[$win]:-}" ]; then   # codex
+                    if [ "${PID_KIND[$pid]:-}" = opencode ]; then
+                        opencode_status "$pid"                      # opencode
+                    else
+                        [ -n "$pid" ] && session_status "$pid"      # claude
+                    fi
+                    if [ -z "$st" ] && [ -n "${W_ROLL[$win]:-}" ] \
+                       && [ "${PID_KIND[$pid]:-}" != opencode ]; then   # codex
                         codex_tail_cached "$win" "${W_ROLL[$win]}"
                         # The full turn-end write is for a CODEX agent only: a
                         # claude window with no session file and a stale

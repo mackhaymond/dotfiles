@@ -550,14 +550,14 @@ reopen_one() {
     fi
     local -a autostart=() birth=()
     [ -n "$cmd" ] && autostart=(-e "ZSH_AUTOSTART=$cmd")
-    # A claude/codex tab comes back AS an agent, in the new-window's own
+    # A claude/codex/opencode tab comes back AS an agent, in the new-window's own
     # command list (agent-birth.conf; guarded, so a server without
     # @agent_birth still reopens it), wearing the name it had when it closed
     # until the resumed session's hooks retitle it. The name is a set-option
     # argument: one ending in ';' would end the command list, and one starting
     # with '-' would read as a flag, so those are trimmed / skipped.
     case "$tool" in
-    claude|codex)
+    claude|codex|opencode)
         if [ -n "$cmd" ]; then
             birth=(\; run-shell -C "#{?@agent_birth,#{@agent_birth} $tool,}")
             label="${label%"${label##*[!; ]}"}"

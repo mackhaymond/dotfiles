@@ -281,6 +281,76 @@ class PauseKey(Harness):
         self.press()
         self.assertEqual(self.stub.panes(), [pane])
 
+    # -- opencode -----------------------------------------------------------
+    def fake_opencode(self, *args):
+        """A pane whose process is argv `opencode - <args>` (exec -a) and
+        sleeps: python reading its program from stdin (`-`, which the argv
+        rule skips as an option), so any args can follow."""
+        prog = self.dir / "sleep.py"
+        prog.write_text("import time\ntime.sleep(600)\n")
+        cmd = "exec -a opencode %s - %s < %s" % (shlex.quote(sys.executable),
+                                                " ".join(shlex.quote(a) for a in args),
+                                                shlex.quote(str(prog)))
+        return self.t("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "main:",
+                      "/bin/bash -c %s" % shlex.quote(cmd))
+
+    def wait_args(self, pane, needle):
+        pid = int(self.t("display", "-p", "-t", pane, "#{pane_pid}"))
+        deadline = time.time() + 5
+        while needle not in AP.proc_args(pid) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertIn(needle, AP.proc_args(pid))
+        return pid
+
+    def test_opencode_agent_is_paused_as_opencode(self):
+        self.n += 1
+        oc = self.fake_opencode("--port", "0", "-c")
+        pid = self.wait_args(oc, "opencode")
+        self.t("set", "-w", "-t", oc, "@agent_state", "running")
+        self.t("set", "-w", "-t", oc, "@agent_kind", "opencode")
+        self.record(oc, "ses_abc", kind="opencode", pid=pid)
+        self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [oc])
+        (t,) = self.state()["targets"]
+        self.assertEqual((t["kind"], t["session_id"], t["found_by"]), ("opencode", "ses_abc", "record"))
+
+    def test_opencode_serve_and_attach_records_are_not_agents(self):
+        panes = []
+        for args in (("serve", "--port", "4096"), ("attach", "http://127.0.0.1:4096")):
+            self.n += 1
+            p = self.fake_opencode(*args)
+            pid = self.wait_args(p, args[0])
+            self.t("set", "-w", "-t", p, "@agent_state", "running")   # a leftover state
+            self.record(p, "ses_%d" % self.n, kind="opencode", pid=pid)
+            panes.append(p)
+        entry = self.press()
+        self.assertEqual(self.stub.calls, [])
+        self.assertIsNone(self.state())
+        self.assertIn("2 working windows had no agent pane", entry["message"])
+
+    def test_opencode_command_fallback_needs_the_opencode_kind(self):
+        # No record: an `opencode` pane is the agent only in a window marked
+        # @agent_kind opencode (the watcher's TUI-only mark), and the kind is
+        # opencode, never the old "claude" guess.
+        b = self.dir / "bin"; b.mkdir()
+        shutil.copy("/bin/sleep", b / "opencode")
+        def win(kind):
+            p = self.t("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "main:", "%s 600" % (b / "opencode"))
+            self.t("set", "-w", "-t", p, "@agent_state", "running")
+            if kind:
+                self.t("set", "-w", "-t", p, "@agent_kind", kind)
+            return p
+        marked, unmarked = win("opencode"), win("")
+        deadline = time.time() + 5
+        while time.time() < deadline and self.t("display", "-p", "-t", marked, "#{pane_current_command}") != "opencode":
+            time.sleep(0.05)
+        self.assertEqual(self.t("display", "-p", "-t", unmarked, "#{pane_current_command}"), "opencode")
+        entry = self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [marked])
+        (t,) = self.state()["targets"]
+        self.assertEqual((t["kind"], t["found_by"]), ("opencode", "command"))
+        self.assertIn("1 working window had no agent pane", entry["message"])
+
     # -- round trip --------------------------------------------------------
     def test_resume_goes_to_the_saved_set_not_a_fresh_scan(self):
         a = self.window("running")
@@ -882,10 +952,23 @@ class Units(unittest.TestCase):
         self.assertEqual(lines[-1].strip(), "closes in 2s · any key to close")
 
     def test_agent_command_fallback(self):
-        for c in ("claude", "codex", "2.1.170"):
+        for c in ("claude", "codex", "2.1.170", "opencode"):
             self.assertTrue(AP.AGENT_CMD.match(c), c)
-        for c in ("zsh", "sleep", "node", "2.1"):
+        for c in ("zsh", "sleep", "node", "2.1", "opencode-x"):
             self.assertFalse(AP.AGENT_CMD.match(c), c)
+        self.assertEqual([AP.cmd_kind(c) for c in ("claude", "2.1.170", "codex", "opencode")],
+                         ["claude", "claude", "codex", "opencode"])
+
+    def test_opencode_tui_args(self):
+        # Same table as the watcher's opencode_tui_args (test_opencode_watcher).
+        for a in ("opencode", "/opt/homebrew/bin/opencode", "opencode --port 0 -c",
+                  "opencode -s ses_abc", "opencode ~/code/proj", "opencode --mini",
+                  "opencode -m openai/gpt-5 --agent build", "opencode pr 12", "opencode -- serve"):
+            self.assertTrue(AP.opencode_tui_args(a), a)
+        for a in ("opencode serve", "opencode --port 4096 serve", "opencode web", "opencode mcp list",
+                  "opencode debug config", "opencode run hi", "opencode attach http://127.0.0.1:4096",
+                  "opencode -m a/b run hi", "opencode export ses_x", "opencode --log-level INFO serve"):
+            self.assertFalse(AP.opencode_tui_args(a), a)
 
     # -- the popup: pure frame + key handling ---------------------------------
     def frame(self, mode, items, cols=100, rows=30, elapsed=5, **kw):

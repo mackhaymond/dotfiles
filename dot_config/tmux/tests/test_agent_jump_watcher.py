@@ -168,6 +168,23 @@ if [ $# = 4 ] && [ "$1" = -o ] && [ "$2" = tty=,pid=,comm= ] && [ "$3" = -p ]; t
     done < "$FAKE_PROCS"
     exit 1
 fi
+# The opencode argv look (`ps -ww -o args= -p PID`): "pid args..." lines in
+# $FAKE_ARGS, logged to $FAKE_ARGS_LOG; no line = the process is gone.
+# $FAKE_ARGS_EMPTY_FIRST=PID: that pid's FIRST look answers nothing (a
+# transient ps failure); it needs $FAKE_ARGS_LOG to count the looks.
+if [ $# = 5 ] && [ "$1" = -ww ] && [ "$2" = -o ] && [ "$3" = args= ] && [ "$4" = -p ]; then
+    if [ -n "$FAKE_ARGS_EMPTY_FIRST" ] && [ "$5" = "$FAKE_ARGS_EMPTY_FIRST" ] \
+       && ! grep -qx -- "$5" "$FAKE_ARGS_LOG" 2>/dev/null; then
+        echo "$5" >> "$FAKE_ARGS_LOG"
+        exit 1
+    fi
+    [ -n "$FAKE_ARGS_LOG" ] && echo "$5" >> "$FAKE_ARGS_LOG"
+    [ -n "$FAKE_ARGS" ] && [ -f "$FAKE_ARGS" ] || exit 1
+    while read -r pid args; do
+        [ "$pid" = "$5" ] && { echo "$args"; exit 0; }
+    done < "$FAKE_ARGS"
+    exit 1
+fi
 case " $* " in *" -ax "*|*" -A "*|*" -e "*) echo "fake ps: all-process listing: $*" >&2; exit 3 ;; esac
 exec /bin/ps "$@"
 """

@@ -27,13 +27,20 @@ working. needs-input is blocked on Mack already, and tmux-mcp would only hold
 a message behind its dialog.
 
 THE AGENT PANE in a window is the one tmux-mcp itself knows as an agent: a
-live claude-<pid>.json / codex-<pid>.json record in tmux-assistant-resurrect's
-dir whose env.tmux_pane names it (the same lookup as tmux-mcp's readAgents,
-same dir search order). message_agent refuses any pane without one, so picking
-by anything else would only pick panes that cannot be reached. A window with
-no record falls back to the pane whose command looks like an agent (claude,
-codex, or Claude's version-named binary); those deliveries will most likely be
-refused and are reported as failures, never dropped silently.
+live claude-<pid>.json / codex-<pid>.json / opencode-<pid>.json record in
+tmux-assistant-resurrect's dir whose env.tmux_pane names it (the same lookup
+as tmux-mcp's readAgents, same dir search order; an opencode record counts
+only for the interactive TUI, never `opencode serve` or `attach`).
+message_agent refuses any pane without one, so picking by anything else would
+only pick panes that cannot be reached. A window with no record falls back to
+the pane whose command looks like an agent (claude, codex, Claude's
+version-named binary, or opencode in a window marked @agent_kind opencode,
+which tmux-mcp also accepts without a record); other such deliveries will most
+likely be refused and are reported as failures, never dropped silently.
+
+Pausing an OpenCode agent is the same text message as for the others, typed
+into its prompt by message_agent: no signal, nothing that could suspend or
+kill the TUI. tmux-mcp holds it behind a draft like any other.
 
 DELIVERY goes through tmux-mcp's message_agent (MCP over HTTP, bearer token
 from its state dir), not a raw paste: its draft guard HOLDS a message while
@@ -103,8 +110,53 @@ RESUME_MSG = (
 # window linked into one of these AND a real session is shown by the real one.
 EXCLUDE = {"agents", "tasks", "stash", "scratch", "btop-popup"}
 # Claude Code's kernel p_comm is its version ("2.1.170"); see the watcher's
-# AGENT_PAT. Only the fallback for a pane with no session record.
-AGENT_CMD = re.compile(r"^(claude|codex|[0-9]+\.[0-9]+\.[0-9]+)$")
+# AGENT_PAT. Only the fallback for a pane with no session record. An
+# `opencode` pane counts only in a window the watcher or plugin marked
+# @agent_kind opencode (scan): pane_current_command can't tell the TUI from
+# `opencode serve` / `attach`, and the kind is set for the TUI alone (same
+# rule as tmux-mcp's isOpencodeTab).
+AGENT_CMD = re.compile(r"^(claude|codex|opencode|[0-9]+\.[0-9]+\.[0-9]+)$")
+
+# opencode_tui_args in agent-tab-watcher.sh, ported: is this opencode command
+# line the interactive TUI? The first bare word after the program decides;
+# options that take a value skip it. `attach` is a TUI on a remote server
+# whose plugin cannot report this pane, so like serve/web/mcp/... it is not
+# an agent here either.
+OPENCODE_VALUE_OPTS = {"--log-level", "--port", "--hostname", "--mdns-domain", "--cors", "-m",
+                       "--model", "-s", "--session", "--prompt", "--agent", "--replay-limit"}
+OPENCODE_NOT_TUI = {"completion", "acp", "mcp", "attach", "run", "debug", "providers", "auth",
+                    "agent", "upgrade", "uninstall", "serve", "web", "models", "stats", "export",
+                    "import", "github", "session", "plugin", "plug", "db"}
+
+
+def opencode_tui_args(args):
+    a = args.split()
+    i = 1
+    while i < len(a):
+        w = a[i]
+        if w in OPENCODE_VALUE_OPTS:
+            i += 2
+        elif w == "--":
+            return True
+        elif w.startswith("-"):
+            i += 1
+        else:
+            return w not in OPENCODE_NOT_TUI
+    return True
+
+
+def proc_args(pid):
+    """`ps -o args=` for one pid, "" when it can't be read."""
+    try:
+        return subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True,
+                              text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def cmd_kind(cmd):
+    """The agent kind a pane_current_command (an AGENT_CMD match) names."""
+    return cmd if cmd in ("codex", "opencode") else "claude"
 US = "\x1f"
 # @agent_summary is free text, so it goes LAST and the split is bounded.
 PANE_FIELDS = ("pane_id", "window_id", "session_name", "window_index", "pane_index",
@@ -254,12 +306,19 @@ def agent_records():
     except OSError:
         return out
     for name in names:
-        m = re.match(r"^(claude|codex)-(\d+)\.json$", name)
+        m = re.match(r"^(claude|codex|opencode)-(\d+)\.json$", name)
         if not m:
             continue
         kind, pid = m.group(1), int(m.group(2))
         if not alive(pid):
             continue
+        # The resurrect plugin's OpenCode plugin can run in `opencode serve`
+        # (or an attach client) too: only the TUI is an agent. An argv we
+        # cannot read keeps the record (a missed pause is the worse failure).
+        if kind == "opencode":
+            args = proc_args(pid)
+            if args and not opencode_tui_args(args):
+                continue
         try:
             j = json.loads((d / name).read_text())
         except (OSError, ValueError):
@@ -322,8 +381,11 @@ def scan(panes, recs):
                                          r["pane_active"] != "1"))
             pick, how = with_rec[0], "record"
         else:
-            cmd = [r for r in rows if AGENT_CMD.match(r["pane_current_command"])]
-            cmd.sort(key=lambda r: r["pane_active"] != "1")
+            kind = head["agent_kind"]
+            cmd = [r for r in rows if AGENT_CMD.match(r["pane_current_command"])
+                   and (r["pane_current_command"] != "opencode" or kind == "opencode")]
+            cmd.sort(key=lambda r: (cmd_kind(r["pane_current_command"]) != kind if kind else False,
+                                    r["pane_active"] != "1"))
             if cmd:
                 pick, how = cmd[0], "command"
         if pick is None:
@@ -336,8 +398,7 @@ def scan(panes, recs):
             "window_id": wid,
             "location": pick["location"],
             "label": label_of(pick),
-            "kind": rec.get("kind") or head["agent_kind"] or (
-                "codex" if pick["pane_current_command"] == "codex" else "claude"),
+            "kind": rec.get("kind") or head["agent_kind"] or cmd_kind(pick["pane_current_command"]),
             "session_id": rec.get("session_id", ""),
             "pid": rec.get("pid"),
             "why": "+".join(why),

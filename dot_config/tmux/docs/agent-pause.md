@@ -30,12 +30,17 @@ tmux-mcp would only hold the message behind its dialog anyway.
 
 **The agent pane** in a working window is the one tmux-mcp itself recognises
 as an agent. That is a pane named by the `env.tmux_pane` of a live
-`claude-<pid>.json` or `codex-<pid>.json` record in tmux-assistant-resurrect's
-directory, found the same way and in the same search order as tmux-mcp's
-`readAgents`. `message_agent` refuses any pane without such a record. If a
-window has no record, the script falls back to a pane whose command looks like
-an agent (`claude`, `codex`, or Claude's version-named binary). Those deliveries
-will probably be refused, and they show up as failures. A working window with
+`claude-<pid>.json`, `codex-<pid>.json` or `opencode-<pid>.json` record in
+tmux-assistant-resurrect's directory, found the same way and in the same search
+order as tmux-mcp's `readAgents`. An opencode record counts only when its
+process is the interactive TUI, never `opencode serve`, `web`, `attach` and the
+like (the same argv rule as agent-tab-watcher.sh). `message_agent` refuses any
+pane without such a record. If a window has no record, the script falls back to
+a pane whose command looks like an agent (`claude`, `codex`, Claude's
+version-named binary, or `opencode` in a window marked `@agent_kind opencode`,
+which tmux-mcp also accepts without a record). The other fallback deliveries
+will probably be refused, and they show up as failures. Pausing an OpenCode
+agent is the same text message as for the others, with no signal sent. A working window with
 neither is reported as "no agent pane", on the key's message line and in
 `dry-run`.
 

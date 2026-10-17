@@ -111,7 +111,7 @@ agent, letter, parked tab or NEEDS YOU.
   space in window order among shells; shell 1 is the uncloseable **home**.
   Written `<space>:<N>`: `cua-notch:2` is shell 2, not tmux window 2.
 - **Agent** = a window with `@agent_state` (idle/running/needs-input/failed/
-  done; Claude and Codex tabs, while an OpenCode tab counts as a shell). Its
+  done; Claude, Codex and OpenCode tabs, this one included). Its
   **letter** (`@agent_key`, valid only while `@agent_state` is set) is
   global and stable for its life: "agent D" = key d, any space (⌥W d). ⌘N
   is the Nth agent of the current space and shifts, so name agents by
@@ -122,8 +122,8 @@ agent, letter, parked tab or NEEDS YOU.
   `tmux_read_pane`, `tmux_message_agent`, `tmux_name_pane`, `tmux_whoami`,
   `tmux_send_keys`; the orchestrator has them, subagents don't). Start with
   `tmux_list_panes`; prefer `tmux_message_agent` (it refuses non-agent
-  panes) over `tmux_send_keys`. Peers see this OpenCode tab as a shell, so
-  they can read it but not `message_agent` it. If the tools are missing,
+  panes) over `tmux_send_keys`. Peers see this OpenCode tab as an agent with
+  a letter, so they can `message_agent` you. If the tools are missing,
   call the same server from the shell:
   `python3 ~/.agents/skills/tmux-workspace/scripts/tmux-mcp-call.py
   read_pane '{"pane": "d"}'` (also `list_panes`, `message_agent`). Read-only

@@ -29,8 +29,8 @@
 #                   to answer its prompt). The next heartbeat consumes it to
 #                   restore `running` when the answered turn resumes; every
 #                   other lifecycle mode clears it so it can't go stale.
-#   @agent_kind     claude | codex — which agent's hooks drive this window;
-#                   written with any state/detail write a hook makes
+#   @agent_kind     claude | codex | opencode — which agent's hooks drive this
+#                   window; written with any state/detail write a hook makes
 #   @agent_detail_kind  perm | ask | fail | done | run — what the last event
 #                   was about (see DETAIL_JQ); @agent_detail = one sanitized
 #                   line for it (≤80 chars). Both written in set_state's
@@ -60,7 +60,10 @@
 #   (~/.codex/hooks.json) invoke:  agent-tab-indicator.sh <mode> <agent>
 #   with the hook's JSON payload on stdin. Claude uses inherited terminal
 #   identity; Codex resolves a verified frontend/thread binding because its
-#   hooks may run in a shared daemon.
+#   hooks may run in a shared daemon. OpenCode has no hooks: its plugin
+#   (~/.config/opencode/plugins/tmux-agent-state.js) runs inside the TUI's
+#   own process and calls this with `<mode> opencode` and a Claude-shaped
+#   payload, using the same inherited TMUX_PANE identity as Claude.
 #
 #   tmux after-select-window hook invokes:  agent-tab-indicator.sh clear-current
 #   (no stdin, no TMUX_PANE → operates on the now-active window).
@@ -555,7 +558,7 @@ set_state() {
     fi
     [ "${#cmd[@]}" -gt 0 ] || return 0
     case "$agent" in
-        claude|codex) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
+        claude|codex|opencode) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
     esac
     slot_locked=0
     if [ "$SLOT_OK" = 1 ] && { [ "$cur" != "$new" ] || [ "$po" = set ]; } \
@@ -1033,6 +1036,8 @@ drift_update() {
 #   codex:  threads.name from ~/.codex/state_5.sqlite keyed by session_id
 #           (0.148 moved thread metadata off session_index.jsonl), else
 #           threads.title (first user message), else the prompt.
+#   opencode: the payload's session_title unless it is OpenCode's
+#           "New session - <date>" placeholder, else the prompt.
 extract_summary() {
     local payload="$1" title="" src="final" prev=""
     [ -n "$JQ" ] || return 0
@@ -1082,6 +1087,20 @@ extract_summary() {
                     [ -n "$title" ] && src="interim"
                 fi
             fi
+            if [ -z "$title" ]; then
+                title=$("$JQ" -r '.prompt // empty' <<<"$payload" 2>/dev/null || true)
+                src="interim"
+            fi
+            ;;
+        opencode)
+            # The plugin sends the session's title (OpenCode generates it
+            # after the first turn) and the turn's prompt. Until then the
+            # title is OpenCode's placeholder "New session - <ISO date>"
+            # ("Child session - …" for subagents), which names nothing: skip
+            # it (the plugin already does; this is the backstop).
+            title=$("$JQ" -r '.session_title // empty | tostring
+                | if test("^(New|Child) session - [0-9]{4}-") then "" else . end' \
+                <<<"$payload" 2>/dev/null || true)
             if [ -z "$title" ]; then
                 title=$("$JQ" -r '.prompt // empty' <<<"$payload" 2>/dev/null || true)
                 src="interim"
@@ -1462,9 +1481,11 @@ if [ -n "$JQ" ] && [ -n "$payload" ] && [ "$mode" != needs-approval ]; then
     fi
 fi
 
-if [ "$agent" = claude ]; then
-    # A new Claude session in the same window invalidates detached Codex
-    # title writers even if the previous frontend has not exited yet.
+if [ "$agent" != codex ] && owns_window "$win"; then
+    # A new Claude/OpenCode session in the same window invalidates detached
+    # Codex title writers even if the previous frontend has not exited yet.
+    # owns_window: a hook carrying a Codex owner binding it cannot prove (a
+    # leaked condenser environment) must leave the window alone entirely.
     tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null || true
 fi
@@ -1527,9 +1548,10 @@ viewing_now() {
 
 case "$mode" in
     interrupt)
-        # The terminal bridge observes turn/completed with interrupted status.
+        # The terminal bridge observes turn/completed with interrupted status;
+        # the OpenCode plugin sees the turn end in MessageAbortedError (Esc).
         # Keep the conversation label, but discharge working/attention state.
-        [ "$agent" = codex ] || exit 0
+        case "$agent" in codex|opencode) ;; *) exit 0 ;; esac
         set_state "$win" idle
         clear_pending "$win"
         ;;
@@ -1681,7 +1703,7 @@ case "$mode" in
         clear_state "$win"
         ;;
     *)
-        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|failed|done|interrupt|clear|clear-current> [claude|codex]" >&2
+        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|failed|done|interrupt|reconcile|clear|clear-current> [claude|codex|opencode]" >&2
         # exit 0, not 1: codex treats a hook's exit status as a GATE (see the
         # header), so a typo'd mode in hooks.json would block every codex
         # event rather than just failing to paint a tab. A silently inert

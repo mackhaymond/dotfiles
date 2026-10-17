@@ -84,8 +84,13 @@ HOLD = "stash"
 WATCHER_STALE = 30          # same grace as ensure_watcher in agent-tab-indicator.sh
 REFRESH = 1.0
 ESC_WAIT = 0.025            # how long a trailing ESC / partial sequence waits for the rest
-# is_agent_comm in agent-tab-watcher.sh: ps comm basename claude or codex, or
-# Claude's version-named binary ("2.1.291"). Digits-only segments, anchored.
+# is_agent_comm in agent-tab-watcher.sh: ps comm basename claude, codex or
+# opencode, or Claude's version-named binary ("2.1.291"). Digits-only
+# segments, anchored. The watcher also drops `opencode serve|web|attach|...`
+# by argv, which a tty+comm ps can't see; so in pick_agent_pane an opencode
+# pane counts only in a window whose @agent_kind is opencode (the watcher
+# and plugin set that kind for the TUI alone), and a pane whose comm matches
+# the window's kind beats the active pane.
 AGENT_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
 # THIRD SURFACE of the agent colour language: same hex values as the
@@ -106,7 +111,7 @@ FIELDS = ["session", "index", "id", "name", "state", "summary", "workflow", "cua
 # Then six: window_active and pane_current_path (the window's active pane)
 # give the strip each session's current window and its git branch;
 # window_panes says whether a peek must look for the agent pane; @agent_kind
-# (claude|codex), @agent_detail_kind (perm|ask|fail|done|run) and @agent_detail
+# (claude|codex|opencode), @agent_detail_kind (perm|ask|fail|done|run) and @agent_detail
 # (one sanitized line, <= 80 chars) are set by agent-tab-indicator.sh and may
 # be empty on any window. Last, @space_home: a space's home shell
 # (docs/spaces.md), not shown here; parse_windows drops it unless an agent
@@ -287,7 +292,9 @@ def rank(w):
 CATS = ("failed", "needs-input", "done", "working", "idle")
 CAT_GLYPH = {"failed": "✕", "needs-input": "◉", "done": "✓", "working": "◐", "idle": "○"}
 CAT_HUE = {"failed": "red", "needs-input": "yellow", "done": "green", "working": "pink", "idle": "overlay"}
-KIND_GLYPH = {"claude": "✳", "codex": "⬢"}
+# opencode: nf-oct-terminal (U+F489), one cell like the others (agent-ui
+# model.rs kind_glyph uses the same codepoint).
+KIND_GLYPH = {"claude": "✳", "codex": "⬢", "opencode": ""}
 DETAIL_WORD = {"perm": "perm", "ask": "asks", "fail": "fail", "done": "done", "run": "run"}
 STATE_WORDS = {"failed": "failed", "needs-input": "waiting on you", "done": "done"}
 STRIP_GEAR, STRIP_MOUSE = "⚙", "◎"
@@ -695,47 +702,66 @@ def snapshot():
 
 def is_agent_comm(comm):
     base = comm.rsplit("/", 1)[-1]
-    return base in ("claude", "codex") or bool(AGENT_VERSION.match(base))
+    return base in ("claude", "codex", "opencode") or bool(AGENT_VERSION.match(base))
+
+
+def comm_kind(comm):
+    """The @agent_kind an is_agent_comm comm names: codex, opencode, else claude."""
+    base = comm.rsplit("/", 1)[-1]
+    return base if base in ("codex", "opencode") else "claude"
 
 
 PANE_GONE = "that window is gone"
 PANE_UNSURE = "can't tell which pane is the agent · close it from the tab"
 
 
-def pick_agent_pane(panes_text, ps_text):
+def pick_agent_pane(panes_text, ps_text, kind=""):
     """The pane `x` closes → (pane_id, None) or (None, why).
 
     panes_text: `list-panes -F pane_id US pane_tty US pane_active`.
     ps_text: `ps -ax -o tty=,comm=` (None when not needed or it failed).
+    kind: the window's @agent_kind ("" when unknown).
 
     Matched by TTY, like the watcher, never by pane_current_command: codex
     launched through npm shows up there as `node`, and falling back to the
-    active pane then closed the user's shell instead of the agent. A split
-    window where no pane (or more than one, none of them active) runs an
-    agent is refused rather than guessed at."""
+    active pane then closed the user's shell instead of the agent. An
+    `opencode` comm counts only when kind is opencode (`opencode serve` in a
+    split beside a claude must not be what `x` closes), and among several
+    agent panes the one whose comm matches kind wins before the active one.
+    A split window where no pane (or more than one, none of them active)
+    runs an agent is refused rather than guessed at."""
     rows = [l.split(US) for l in panes_text.splitlines() if l.count(US) == 2]
     if not rows:
         return None, PANE_GONE
     if len(rows) == 1:
         return rows[0][0], None
-    agent_ttys = set()
+    agent_ttys = {}   # tty -> the kinds running on it
     for l in (ps_text or "").splitlines():
         parts = l.strip().split(None, 1)
         if len(parts) == 2 and parts[0] != "??" and is_agent_comm(parts[1].strip()):
-            agent_ttys.add(parts[0])
-    hits = [(pid, active) for pid, t, active in rows
-            if t and (t[5:] if t.startswith("/dev/") else t) in agent_ttys]
+            k = comm_kind(parts[1].strip())
+            if k == "opencode" and kind != "opencode":
+                continue
+            agent_ttys.setdefault(parts[0], set()).add(k)
+    hits = [(pid, active, agent_ttys[tt]) for pid, t, active in rows
+            for tt in [t[5:] if t and t.startswith("/dev/") else t] if tt and tt in agent_ttys]
     if len(hits) == 1:
         return hits[0][0], None
-    active = [pid for pid, a in hits if a == "1"]
+    if kind:
+        same = [h for h in hits if kind in h[2]]
+        if len(same) == 1:
+            return same[0][0], None
+        hits = same or hits
+    active = [pid for pid, a, _ in hits if a == "1"]
     if len(active) == 1:
         return active[0], None
     return None, PANE_UNSURE
 
 
-def agent_pane(win):
-    """pick_agent_pane against the live server. Runs only on `x`, so its ps
-    costs nothing per tick, and only for a split window."""
+def agent_pane(win, kind=""):
+    """pick_agent_pane against the live server (kind: the window's
+    @agent_kind). Runs only on `x`, so its ps costs nothing per tick, and
+    only for a split window."""
     r = tmux("list-panes", "-t", win, "-F", US.join(["#{pane_id}", "#{pane_tty}", "#{pane_active}"]))
     if not r or r.returncode:
         return None, PANE_GONE
@@ -746,7 +772,7 @@ def agent_pane(win):
                                      text=True, errors="replace", timeout=5).stdout
         except (OSError, subprocess.TimeoutExpired):
             ps_text = None
-    return pick_agent_pane(r.stdout, ps_text)
+    return pick_agent_pane(r.stdout, ps_text, kind)
 
 
 PEEK_LINES = 15
@@ -760,7 +786,7 @@ def peek_lines(w):
     cannot tell)."""
     target = w["id"]
     if w.get("panes", 1) > 1:
-        pane, _ = agent_pane(w["id"])
+        pane, _ = agent_pane(w["id"], w.get("kind", ""))
         target = pane or target
     r = tmux("capture-pane", "-p", "-J", "-S", "-%d" % PEEK_LINES, "-t", target)
     if not r or r.returncode:
@@ -1011,7 +1037,7 @@ class Roster:
                 run_bg("'%s' kill-many '%s'" % (STASH, w["id"]))
                 self.say("discarded %s · its session id is in the stash log" % w["label"])
             else:
-                pane, why = agent_pane(w["id"])
+                pane, why = agent_pane(w["id"], w.get("kind", ""))
                 if pane:
                     run_bg("'%s' close '%s'" % (CLOSED, pane))
                     self.say("closed %s · ⌘Z brings it back" % w["label"])

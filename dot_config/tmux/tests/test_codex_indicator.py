@@ -306,7 +306,10 @@ class IndicatorIntegrationTests(unittest.TestCase):
     def test_record_fallback_is_only_for_the_locked_condenser(self):
         # Every other mode that checks ownership, given the full owner
         # environment and a live frontend but an unbound resolve, stays inert
-        # and never even asks `valid`.
+        # and never even asks `valid`. `opencode` is a whitelisted agent kind
+        # (its plugin drives real tabs): these calls are inert because of the
+        # unprovable owner binding alone, which owns_window refuses, ownership
+        # marks included (test_opencode_indicator covers the unbound case).
         self.bind_direct("aaaa", "direct-token", 123)
         self.hook("running")
         self.assertEqual(self.hook("needs-approval")["@agent_state"], "needs-input")

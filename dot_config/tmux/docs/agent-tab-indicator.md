@@ -68,7 +68,7 @@ Two per-window tmux user options are the single source of truth:
 - `@agent_workflow` — `1` while a background Claude Workflow is in flight (else unset); set by the watcher, orthogonal to `@agent_state`
 - `@agent_cua` — `1` while the agent is driving an app through cua-driver (lingers up to `CUA_LIVE`, 60 s); set by the watcher
 - `@agent_rollout` — codex only: the thread's rollout path, stashed by the indicator so the watcher can tell a live turn from an interrupted one
-- `@agent_kind` — `claude | codex`: whose hooks drive the window. Written by any indicator hook that writes state or detail (in the same command list), unset with the state by `clear_state` and the watcher GC. Never written by the focus hook or a no-op heartbeat. Before any hook has fired (Codex's first hook waits for the first prompt), the watcher seeds it from the agent process's own comm; it never overwrites a kind that is already set (see the watcher section).
+- `@agent_kind` — `claude | codex | opencode`: whose hooks drive the window. Written by any indicator hook that writes state or detail (in the same command list), unset with the state by `clear_state` and the watcher GC. Never written by the focus hook or a no-op heartbeat. Before any hook has fired (Codex's first hook waits for the first prompt), the watcher seeds it from the agent process's own comm; it never overwrites a kind that is already set (see the watcher section).
 - `@agent_slot` — decimal integer ≥ 1: the window's sticky number in agent-ui's Option-W menu and sidebar. Held only while the window is in the Active set and visible. Stamped by the indicator's `set_state` when a window enters the Active set, and by the watcher as the backstop; released and repaired only by the watcher (see "Agent slots" in the watcher section).
 - `@agent_detail_kind` + `@agent_detail` — what the event that set the state was *about*, for the sidebar (not rendered in the tab bar):
 
@@ -210,6 +210,70 @@ SessionStart, SessionEnd, UserPromptSubmit, SubagentStart, SubagentStop,
 Stop — no `Notification`/`StopFailure`, so codex `needs-input` never fires;
 its only blocked state is the red `needs-approval`.
 
+**OpenCode** (`~/.config/opencode/plugins/tmux-agent-state.js`, auto-loaded
+from the plugins directory; OpenCode has no shell hooks). The plugin turns
+OpenCode's events into `agent-tab-indicator.sh <mode> opencode` calls with a
+Claude-shaped payload on stdin (`session_id`, `cwd`, `prompt`, `tool_name`,
+`tool_input`, `last_assistant_message`, `error`, `session_title`, `source`),
+so everything downstream (detail kinds, slots, the condenser) is shared:
+
+| OpenCode event | Mode |
+|---|---|
+| plugin start; a new root `session.created` (no turn running) | `idle` (`source: startup` → `project/New Session`) |
+| `chat.message` (root session) | `running`, `prompt` = the message's text parts |
+| `session.status` busy/retry for a root with no turn yet | `running` (no prompt) |
+| `tool.execute.after` (any session) | `heartbeat`, at most one per 2 s |
+| `permission.asked` (any session, shown on the root's tab) | `needs-approval`, `tool_name` = the permission (`Bash`, `Edit`, …), `tool_input` = `command`/`file_path`/`pattern` → `perm` detail |
+| `question.asked` (any session) | `needs-approval` with `tool_name: AskUserQuestion` and the questions → `ask` detail |
+| `permission.replied`, `question.replied`, `question.rejected` | `heartbeat` (unthrottled; re-arms `running`) |
+| root idle (`session.status` idle / `session.idle`, once per turn) | `done` with the last assistant message's text; `interrupt` if the turn ended in `MessageAbortedError` (Esc); nothing after a `failed`, and nothing while another root's turn still runs in the pane |
+| `session.error` (root, not an abort) | `failed`, `error` = the error's message |
+| `session.updated` (root) with a new real title | `reconcile` |
+| plugin `dispose` (quit, SIGHUP/TERM/INT) | `clear` (synchronous, after the in-flight call lands or 1.5 s; nothing is sent after it) |
+
+- **Where it runs.** Verified on 1.18.18: the full TUI loads server plugins in
+  a *worker thread* of the opencode process itself, which inherits `TMUX` and
+  `TMUX_PANE`, so the plugin addresses its pane exactly as a Claude hook does
+  and `process.pid` is the `opencode` process. That worker gets no process
+  `exit` event; `dispose` runs on quit and on SIGHUP/SIGTERM/SIGINT. That
+  worker is the ONLY place the plugin acts. Every main-thread load stays
+  inert: `serve`, `web`, `acp` and the like cannot know which pane they serve,
+  and `opencode run "…"` is usually another agent's tool call carrying THAT
+  agent's `TMUX_PANE` (it used to repaint the parent's tab: title, kind,
+  running, done, clear). A TUI launched from an agent's tool shell is inert
+  too: `CLAUDECODE`, `CODEX_THREAD_ID`, `CODEX_SANDBOX`, `AGENT_PTY` or
+  `AGENT_SHELL` in its environment means the pane is the parent's. A TUI
+  started with `--port` that other clients attach to would paint their
+  sessions on its own tab; nobody does that today.
+- **One tab, several sessions.** `/new` while a turn runs, then a prompt,
+  gives the pane two running root sessions. The pane stays `running` until
+  the LAST of them ends; only that one paints `done`/`interrupt`.
+- **Never blocks.** Hooks queue work and return. Indicator calls (~300 ms each)
+  run one at a time through one promise chain, and the turn bookkeeping runs
+  inside that chain in event order, so a `running` can never land after the
+  `done` that followed it and a quick next prompt is not swallowed by the
+  previous turn's end. The last assistant message is fetched when the idle
+  event arrives (not when its job runs), so it is that turn's reply.
+- **Subagents.** Child sessions (`parentID`) never move the tab, except their
+  permission/question gates (shown on the root's tab, like Claude's subagent
+  `PermissionRequest`). Unknown sessions are looked up once via the SDK.
+- **Esc.** OpenCode emits `session.error` `MessageAbortedError` and then goes
+  idle: that turn ends as `interrupt` (idle, label kept, pending cleared), the
+  same mode the Codex bridge uses, never as a green `done` or a red `failed`.
+- **Owner bindings.** The plugin strips `AGENT_TAB_SOCKET`/`AGENT_TAB_OWNER_*`
+  from the indicator's environment. Like a Claude hook, an `opencode` hook
+  unsets a previous Codex frontend's `@agent_session_id`/`@agent_owner_token`
+  on the window (only when `owns_window` passes, so a leaked condenser
+  environment still leaves the window untouched).
+- **Status file** (ground truth for the watcher's stuck-`running` reconcile):
+  `${XDG_STATE_HOME:-~/.local/state}/tmux-agent/opencode/<pid>.status`, one
+  line `busy` or `idle`, written atomically (tmp + rename) whenever any
+  session's `session.status` flips between busy/retry and idle (a
+  `chat.message` marks its session busy at once), and removed on `dispose`
+  or process exit. A SIGKILLed opencode leaves it behind; the pid is dead.
+- Overrides for tests: `TMUX_AGENT_INDICATOR` (the script the plugin runs
+  with bash), `TMUX_AGENT_HEARTBEAT_MS` (the throttle).
+
 Subagent-context events (payload has `agent_id`) are ignored so a
 subagent's Stop can't flip the main agent's tab. Codex background threads
 (subagents, review/guardian workers, the Memory Writing Agent) fire the
@@ -227,7 +291,9 @@ the last `ai-title` entry in the transcript tail (`transcript_path` from the
 payload), else `session_title`, else the submitted prompt; Codex — `threads.name` from
 `~/.codex/state_5.sqlite` keyed by `session_id` (0.148 stopped writing
 `session_index.jsonl`), else `threads.title` (the first user message,
-treated as interim), else the prompt.
+treated as interim), else the prompt; OpenCode — the payload's
+`session_title` unless it is OpenCode's placeholder `New session - <ISO date>`
+(`Child session - …` for subagents), else the prompt (interim).
 Sanitized (no `#`/`"`/`%`, one line, ≤60 chars). `extract_summary` tags its
 output `final\t<title>` (the agent's own conversation title),
 `interim\t<title>` (prompt-grade text: the prompt standing in until that title

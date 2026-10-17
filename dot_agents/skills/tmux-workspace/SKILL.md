@@ -67,11 +67,11 @@ tmux server (default socket)
   NOT the target `cua-notch:2`**, which is window index 2 and may be an
   agent. Resolve it with the recipe below before you hand it to `tmux`.
 - **Agent**: a window with a non-empty `@agent_state` (`idle`, `running`
-  (Mack says "working"), `needs-input`, `failed`, `done`). Claude and Codex
-  tabs are agents from birth; `@agent_kind` = `claude`/`codex`,
-  `@agent_summary` = the title the sidebar shows (`project/Title`). An OpenCode
-  tab carries no `@agent_state`, so it counts as a shell. A shell where
-  someone starts claude becomes an agent.
+  (Mack says "working"), `needs-input`, `failed`, `done`). Claude, Codex and
+  OpenCode tabs are agents from birth; `@agent_kind` =
+  `claude`/`codex`/`opencode`, `@agent_summary` = the title the sidebar shows
+  (`project/Title`). A shell where someone starts claude, codex or opencode
+  becomes an agent.
   - **Letter** (`@agent_key`): GLOBAL across spaces and stable for the
     agent's life. The alphabet is handed out home row first: `a s d f g h j
     k l q w e r t y u i o p z x c v b n m`. Only listed agents get one

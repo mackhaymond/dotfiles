@@ -187,7 +187,8 @@ class KeyTests(unittest.TestCase):
 class PaneTests(unittest.TestCase):
     PS = "\n".join(["??       launchd", "ttys001  -zsh", "ttys002  /opt/homebrew/bin/codex",
                     "ttys002  node", "ttys003  2.1.291", "ttys004  /usr/bin/claude",
-                    "ttys005  10.0.0.1", "ttys006  opencode"])
+                    "ttys005  10.0.0.1", "ttys006  opencode-helper",
+                    "ttys007  /opt/homebrew/bin/opencode"])
 
     def panes(self, *rows):
         return "\n".join(US.join(r) for r in rows)
@@ -201,9 +202,38 @@ class PaneTests(unittest.TestCase):
         self.assertEqual(R.pick_agent_pane(panes, self.PS), ("%2", None))
         panes = self.panes(("%1", "/dev/ttys003", "0"), ("%2", "/dev/ttys001", "1"))
         self.assertEqual(R.pick_agent_pane(panes, self.PS), ("%1", None))
+        # opencode is an agent kind: in an opencode window its pane is the
+        # one, not the active shell.
+        panes = self.panes(("%1", "/dev/ttys001", "1"), ("%2", "/dev/ttys007", "0"))
+        self.assertEqual(R.pick_agent_pane(panes, self.PS, "opencode"), ("%2", None))
+
+    def test_opencode_counts_only_in_an_opencode_window(self):
+        # `opencode serve` split beside a claude / codex: the active serve pane
+        # is not the agent; the kind's own pane is (with or without a kind).
+        for agent_tty, kind in (("/dev/ttys004", "claude"), ("/dev/ttys002", "codex"), ("/dev/ttys004", "")):
+            panes = self.panes(("%1", agent_tty, "0"), ("%2", "/dev/ttys007", "1"))
+            self.assertEqual(R.pick_agent_pane(panes, self.PS, kind), ("%1", None), kind)
+        # An opencode pane alone in a non-opencode window: nothing to close.
+        panes = self.panes(("%1", "/dev/ttys001", "1"), ("%2", "/dev/ttys007", "0"))
+        self.assertEqual(R.pick_agent_pane(panes, self.PS, "claude"), (None, R.PANE_UNSURE))
+        self.assertEqual(R.pick_agent_pane(panes, self.PS), (None, R.PANE_UNSURE))
+
+    def test_kind_match_beats_the_active_pane(self):
+        # claude inactive, codex active, window kind claude: the claude pane.
+        panes = self.panes(("%1", "/dev/ttys004", "0"), ("%2", "/dev/ttys002", "1"))
+        self.assertEqual(R.pick_agent_pane(panes, self.PS, "claude"), ("%1", None))
+        self.assertEqual(R.pick_agent_pane(panes, self.PS, "codex"), ("%2", None))
+        # opencode window: the TUI over an active claude.
+        panes = self.panes(("%1", "/dev/ttys007", "0"), ("%2", "/dev/ttys004", "1"))
+        self.assertEqual(R.pick_agent_pane(panes, self.PS, "opencode"), ("%1", None))
+        # Two of the kind: the active one among them, else refuse.
+        panes = self.panes(("%1", "/dev/ttys003", "0"), ("%2", "/dev/ttys004", "1"), ("%3", "/dev/ttys002", "0"))
+        self.assertEqual(R.pick_agent_pane(panes, self.PS, "claude"), ("%2", None))
+        panes = self.panes(("%1", "/dev/ttys003", "0"), ("%2", "/dev/ttys004", "0"), ("%3", "/dev/ttys002", "1"))
+        self.assertEqual(R.pick_agent_pane(panes, self.PS, "claude"), (None, R.PANE_UNSURE))
 
     def test_refuses_to_guess(self):
-        # Split, no agent pane (IP-like and opencode comms don't count): refuse.
+        # Split, no agent pane (IP-like and lookalike comms don't count): refuse.
         panes = self.panes(("%1", "/dev/ttys001", "1"), ("%2", "/dev/ttys005", "0"), ("%3", "/dev/ttys006", "0"))
         self.assertEqual(R.pick_agent_pane(panes, self.PS), (None, R.PANE_UNSURE))
         self.assertEqual(R.pick_agent_pane(panes, None), (None, R.PANE_UNSURE))
@@ -215,10 +245,15 @@ class PaneTests(unittest.TestCase):
         self.assertEqual(R.pick_agent_pane("", self.PS), (None, R.PANE_GONE))
 
     def test_is_agent_comm(self):
-        for c in ("claude", "codex", "/usr/local/bin/codex", "2.1.291"):
+        for c in ("claude", "codex", "/usr/local/bin/codex", "2.1.291",
+                  "opencode", "/opt/homebrew/bin/opencode"):
             self.assertTrue(R.is_agent_comm(c), c)
-        for c in ("node", "-zsh", "10.0.0.1", "1.2.3-beta", "opencode", "claude-helper"):
+        for c in ("node", "-zsh", "10.0.0.1", "1.2.3-beta", "opencode-helper", "claude-helper"):
             self.assertFalse(R.is_agent_comm(c), c)
+
+    def test_kind_glyphs(self):
+        # Parity with agent-ui model.rs kind_glyph (U+F489 for opencode).
+        self.assertEqual(R.KIND_GLYPH, {"claude": "✳", "codex": "⬢", "opencode": ""})
 
 
 class ActTests(unittest.TestCase):
@@ -228,7 +263,9 @@ class ActTests(unittest.TestCase):
         self.calls = []
         self.saved = (R.run_bg, R.agent_pane, R.subprocess.run, R.tmux)
         R.run_bg = lambda cmd: self.calls.append(("bg", cmd))
-        R.agent_pane = lambda win: (self.calls.append(("pane", win)) or ("%9", None))
+        self.kinds = []
+        R.agent_pane = lambda win, kind="": (self.calls.append(("pane", win)) or self.kinds.append(kind)
+                                             or ("%9", None))
         R.tmux = lambda *a: None
 
         def fake_run(argv, **kw):
@@ -297,9 +334,11 @@ class ActTests(unittest.TestCase):
         self.r.act("y")
         self.assertEqual(self.calls[0], ("pane", "@1"))
         self.assertIn("close '%9'", self.calls[1][1])
+        # The window's @agent_kind goes along (pick_agent_pane's kind rule).
+        self.assertEqual(self.kinds, [next(w for w in self.r.windows if w["id"] == "@1")["kind"]])
 
     def test_close_refused_says_why(self):
-        R.agent_pane = lambda win: (None, R.PANE_UNSURE)
+        R.agent_pane = lambda win, kind="": (None, R.PANE_UNSURE)
         self.r.act("x"); self.r.act("y")
         self.assertEqual(self.calls, [])
         self.assertEqual(self.r.msg, R.PANE_UNSURE)
@@ -1265,7 +1304,7 @@ class PeekTests(unittest.TestCase):
             returncode = 0
             stdout = "".join("line %d\n" % i for i in range(1, 31)) + "\n\n"
         R.tmux = lambda *a: (self.calls.append(a), Cap)[1]
-        R.agent_pane = lambda win: (self.calls.append(("pane", win)), ("%42", None))[1]
+        R.agent_pane = lambda win, kind="": (self.calls.append(("pane", win)), ("%42", None))[1]
         self.r = R.Roster("/dev/ttys999")
         self.r.windows = R.parse_windows("\n".join([
             line("main", 1, "@1", "idle", "one"),
