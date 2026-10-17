@@ -345,7 +345,7 @@ impl PaneCache {
 
 /// [`Actions::peek`] with the pane taken from `cache`.
 fn capture(actions: &Actions, cache: &mut PaneCache, w: &Window, n: usize) -> Option<Vec<crate::ansi::StyledLine>> {
-    let target = cache.target(w, |win| actions.agent_pane(win).ok());
+    let target = cache.target(w, |win| actions.agent_pane(win, &w.kind).ok());
     let start = format!("-{n}");
     match actions.tmux.run(&["capture-pane", "-p", "-e", "-J", "-S", &start, "-t", &target]) {
         Ok(o) if o.ok() => Some(actions::peek_from_capture(&o.stdout, n)),

@@ -367,7 +367,7 @@ fn the_dashboard_pane_is_never_a_target() {
     assert_eq!((home.panes, home.has_dash(), home.focus_pane()), (1, true, Some(shell.as_str())), "{home:?}");
     assert!(home.path.ends_with("/tmp"), "{:?}", home.path);
     assert_eq!(home.capture_target(), shell);
-    assert_eq!(agent_ui::Actions::new(tmux.clone()).agent_pane(&home.id), Ok(shell.clone()));
+    assert_eq!(agent_ui::Actions::new(tmux.clone()).agent_pane(&home.id, &home.kind), Ok(shell.clone()));
     // No dashboard elsewhere: the plain count and path, as before.
     let other = snap.windows.iter().find(|w| w.session == "work" && w.index == 1).unwrap();
     assert_eq!((other.panes, other.has_dash(), other.pane_list.len()), (1, false, 1));

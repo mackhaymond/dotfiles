@@ -97,6 +97,16 @@ pub fn is_agent_comm(comm: &str) -> bool {
     parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// agent-roster.py `comm_kind`: the `@agent_kind` an [`is_agent_comm`] comm
+/// names: codex, opencode, else claude.
+pub fn comm_kind(comm: &str) -> &'static str {
+    match comm.rsplit('/').next().unwrap_or(comm) {
+        "codex" => "codex",
+        "opencode" => "opencode",
+        _ => "claude",
+    }
+}
+
 /// The `list-panes` format [`pick_agent_pane`] reads: id, tty, active, and
 /// the dashboard mark ([`crate::tmux::DASH_OPTION`]).
 pub fn pane_rows_format() -> String {
@@ -117,8 +127,14 @@ fn pane_rows(panes_text: &str) -> Vec<Vec<&str>> {
 /// agent-roster.py `pick_agent_pane`: the pane `x` closes → Ok(pane_id) or
 /// Err(why). `panes_text`: `list-panes -F pane_id US pane_tty US pane_active
 /// [US @space_dash_pane]` (dashboard panes are left out first);
-/// `ps_text`: `ps -ax -o tty=,comm=` (None when not needed or it failed).
-pub fn pick_agent_pane(panes_text: &str, ps_text: Option<&str>) -> Result<String, &'static str> {
+/// `ps_text`: `ps -ax -o tty=,comm=` (None when not needed or it failed);
+/// `kind`: the window's `@agent_kind` ("" when unknown).
+///
+/// An `opencode` comm counts only when `kind` is opencode (`opencode serve`
+/// in a split beside a claude must not be what `x` closes), and among
+/// several agent panes the one whose comm matches `kind` wins before the
+/// active one.
+pub fn pick_agent_pane(panes_text: &str, ps_text: Option<&str>, kind: &str) -> Result<String, &'static str> {
     let rows = pane_rows(panes_text);
     if rows.is_empty() {
         return Err(PANE_GONE);
@@ -126,24 +142,39 @@ pub fn pick_agent_pane(panes_text: &str, ps_text: Option<&str>) -> Result<String
     if rows.len() == 1 {
         return Ok(rows[0][0].to_string());
     }
-    let mut agent_ttys = std::collections::HashSet::new();
+    // tty → the kinds running on it.
+    let mut agent_ttys: std::collections::HashMap<&str, std::collections::HashSet<&str>> = Default::default();
     for l in ps_text.unwrap_or("").lines() {
         let l = l.trim();
         if let Some((tty, comm)) = l.split_once(char::is_whitespace) {
-            if tty != "??" && is_agent_comm(comm.trim()) {
-                agent_ttys.insert(tty.to_string());
+            let comm = comm.trim();
+            if tty != "??" && is_agent_comm(comm) {
+                let k = comm_kind(comm);
+                if k == "opencode" && kind != "opencode" {
+                    continue;
+                }
+                agent_ttys.entry(tty).or_default().insert(k);
             }
         }
     }
-    let hits: Vec<(&str, &str)> = rows
+    let mut hits: Vec<(&str, &str, &std::collections::HashSet<&str>)> = rows
         .iter()
-        .filter(|r| !r[1].is_empty() && agent_ttys.contains(r[1].strip_prefix("/dev/").unwrap_or(r[1])))
-        .map(|r| (r[0], r[2]))
+        .filter(|r| !r[1].is_empty())
+        .filter_map(|r| agent_ttys.get(r[1].strip_prefix("/dev/").unwrap_or(r[1])).map(|ks| (r[0], r[2], ks)))
         .collect();
     if hits.len() == 1 {
         return Ok(hits[0].0.to_string());
     }
-    let active: Vec<&str> = hits.iter().filter(|(_, a)| *a == "1").map(|(p, _)| *p).collect();
+    if !kind.is_empty() {
+        let same: Vec<_> = hits.iter().filter(|h| h.2.contains(kind)).cloned().collect();
+        if same.len() == 1 {
+            return Ok(same[0].0.to_string());
+        }
+        if !same.is_empty() {
+            hits = same;
+        }
+    }
+    let active: Vec<&str> = hits.iter().filter(|h| h.1 == "1").map(|h| h.0).collect();
     if active.len() == 1 {
         return Ok(active[0].to_string());
     }
@@ -321,7 +352,7 @@ impl Actions {
             self.run_bg_script("stash.sh", &["kill-many", &w.id]);
             return Ok(format!("discarded {} · its session id is in the stash log", w.label));
         }
-        let pane = self.agent_pane(&w.id)?;
+        let pane = self.agent_pane(&w.id, &w.kind)?;
         self.run_bg_script("closed-tabs.sh", &["close", &pane]);
         Ok(format!("closed {} · ⌘Z brings it back", w.label))
     }
@@ -334,8 +365,9 @@ impl Actions {
     }
 
     /// agent-roster.py `agent_pane`: pick_agent_pane against the live
-    /// server; `ps` only runs for a split window.
-    pub fn agent_pane(&self, win: &str) -> Result<String, String> {
+    /// server (`kind`: the window's `@agent_kind`); `ps` only runs for a
+    /// split window.
+    pub fn agent_pane(&self, win: &str, kind: &str) -> Result<String, String> {
         let out = match self.tmux.run(&["list-panes", "-t", win, "-F", &pane_rows_format()]) {
             Ok(o) if o.ok() => o.stdout,
             _ => return Err(PANE_GONE.into()),
@@ -348,7 +380,7 @@ impl Actions {
         } else {
             None
         };
-        pick_agent_pane(&out, ps.as_deref()).map_err(String::from)
+        pick_agent_pane(&out, ps.as_deref(), kind).map_err(String::from)
     }
 
     /// agent-roster.py `peek_lines`, with colours: the last `n` lines of the
@@ -358,7 +390,7 @@ impl Actions {
     pub fn peek(&self, w: &Window, n: usize) -> Option<Vec<StyledLine>> {
         let mut target = w.capture_target();
         if w.panes > 1 {
-            if let Ok(p) = self.agent_pane(&w.id) {
+            if let Ok(p) = self.agent_pane(&w.id, &w.kind) {
                 target = p;
             }
         }
@@ -397,29 +429,71 @@ mod tests {
 
     #[test]
     fn single_pane_is_it() {
-        assert_eq!(pick_agent_pane("%7\x1f/dev/ttys009\x1f1", None), Ok("%7".into()));
-        assert_eq!(pick_agent_pane("", None), Err(PANE_GONE));
-        assert_eq!(pick_agent_pane("garbage", None), Err(PANE_GONE));
+        assert_eq!(pick_agent_pane("%7\x1f/dev/ttys009\x1f1", None, ""), Ok("%7".into()));
+        assert_eq!(pick_agent_pane("", None, ""), Err(PANE_GONE));
+        assert_eq!(pick_agent_pane("garbage", None, ""), Err(PANE_GONE));
     }
 
     #[test]
     fn matched_by_tty_not_active() {
         let ps = "ttys001 -zsh\nttys002 /opt/homebrew/bin/claude\n?? claude\n";
-        assert_eq!(pick_agent_pane(P, Some(ps)), Ok("%2".into()));
+        assert_eq!(pick_agent_pane(P, Some(ps), ""), Ok("%2".into()));
         let ps = "ttys002 2.1.291\n";
-        assert_eq!(pick_agent_pane(P, Some(ps)), Ok("%2".into()));
+        assert_eq!(pick_agent_pane(P, Some(ps), ""), Ok("%2".into()));
     }
 
     #[test]
     fn refuses_to_guess() {
         // No agent at all: never the active pane by default.
-        assert_eq!(pick_agent_pane(P, Some("ttys001 zsh\nttys002 node\n")), Err(PANE_UNSURE));
-        assert_eq!(pick_agent_pane(P, None), Err(PANE_UNSURE));
+        assert_eq!(pick_agent_pane(P, Some("ttys001 zsh\nttys002 node\n"), ""), Err(PANE_UNSURE));
+        assert_eq!(pick_agent_pane(P, None, ""), Err(PANE_UNSURE));
         // Two agents: the active one.
-        assert_eq!(pick_agent_pane(P, Some("ttys001 claude\nttys002 codex\n")), Ok("%1".into()));
+        assert_eq!(pick_agent_pane(P, Some("ttys001 claude\nttys002 codex\n"), ""), Ok("%1".into()));
         // Two agents, neither active.
         let p = "%1\x1f/dev/ttys001\x1f0\n%2\x1f/dev/ttys002\x1f0\n%3\x1f/dev/ttys003\x1f1";
-        assert_eq!(pick_agent_pane(p, Some("ttys001 claude\nttys002 codex\n")), Err(PANE_UNSURE));
+        assert_eq!(pick_agent_pane(p, Some("ttys001 claude\nttys002 codex\n"), ""), Err(PANE_UNSURE));
+    }
+
+    /// agent-roster.py's test fixture `PS`.
+    const PS: &str = "??       launchd\nttys001  -zsh\nttys002  /opt/homebrew/bin/codex\nttys002  node\n\
+        ttys003  2.1.291\nttys004  /usr/bin/claude\nttys005  10.0.0.1\nttys006  opencode-helper\n\
+        ttys007  /opt/homebrew/bin/opencode";
+
+    fn panes(rows: &[(&str, &str, &str)]) -> String {
+        rows.iter().map(|(p, t, a)| [*p, *t, *a].join("\x1f")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// agent-roster.py `test_opencode_counts_only_in_an_opencode_window`.
+    #[test]
+    fn opencode_counts_only_in_an_opencode_window() {
+        // `opencode serve` split beside a claude / codex: the active serve pane
+        // is not the agent; the kind's own pane is (with or without a kind).
+        for (agent_tty, kind) in [("/dev/ttys004", "claude"), ("/dev/ttys002", "codex"), ("/dev/ttys004", "")] {
+            let p = panes(&[("%1", agent_tty, "0"), ("%2", "/dev/ttys007", "1")]);
+            assert_eq!(pick_agent_pane(&p, Some(PS), kind), Ok("%1".into()), "{kind}");
+        }
+        // An opencode pane alone in a non-opencode window: nothing to close.
+        let p = panes(&[("%1", "/dev/ttys001", "1"), ("%2", "/dev/ttys007", "0")]);
+        assert_eq!(pick_agent_pane(&p, Some(PS), "claude"), Err(PANE_UNSURE));
+        assert_eq!(pick_agent_pane(&p, Some(PS), ""), Err(PANE_UNSURE));
+        assert_eq!((comm_kind("/opt/homebrew/bin/opencode"), comm_kind("codex"), comm_kind("2.1.291")), ("opencode", "codex", "claude"));
+    }
+
+    /// agent-roster.py `test_kind_match_beats_the_active_pane`.
+    #[test]
+    fn kind_match_beats_the_active_pane() {
+        // claude inactive, codex active, window kind claude: the claude pane.
+        let p = panes(&[("%1", "/dev/ttys004", "0"), ("%2", "/dev/ttys002", "1")]);
+        assert_eq!(pick_agent_pane(&p, Some(PS), "claude"), Ok("%1".into()));
+        assert_eq!(pick_agent_pane(&p, Some(PS), "codex"), Ok("%2".into()));
+        // opencode window: the TUI over an active claude.
+        let p = panes(&[("%1", "/dev/ttys007", "0"), ("%2", "/dev/ttys004", "1")]);
+        assert_eq!(pick_agent_pane(&p, Some(PS), "opencode"), Ok("%1".into()));
+        // Two of the kind: the active one among them, else refuse.
+        let p = panes(&[("%1", "/dev/ttys003", "0"), ("%2", "/dev/ttys004", "1"), ("%3", "/dev/ttys002", "0")]);
+        assert_eq!(pick_agent_pane(&p, Some(PS), "claude"), Ok("%2".into()));
+        let p = panes(&[("%1", "/dev/ttys003", "0"), ("%2", "/dev/ttys004", "0"), ("%3", "/dev/ttys002", "1")]);
+        assert_eq!(pick_agent_pane(&p, Some(PS), "claude"), Err(PANE_UNSURE));
     }
 
     /// A space home's dashboard pane is never the agent pane, never counted
@@ -431,12 +505,12 @@ mod tests {
         // Dashboard + shell: the shell is the window's one pane, no ps asked.
         let home = "%3\x1f/dev/ttys003\x1f1\x1f1\n%4\x1f/dev/ttys004\x1f0\x1f";
         assert_eq!(pane_rows(home).len(), 1);
-        assert_eq!(pick_agent_pane(home, None), Ok("%4".into()));
+        assert_eq!(pick_agent_pane(home, None, ""), Ok("%4".into()));
         // An agent split with a dashboard: the dashboard's tty never matches.
         let split = "%3\x1f/dev/ttys003\x1f0\x1f1\n%4\x1f/dev/ttys004\x1f1\x1f0\n%5\x1f/dev/ttys005\x1f0\x1f";
-        assert_eq!(pick_agent_pane(split, Some("ttys003 claude\nttys005 claude\n")), Ok("%5".into()));
+        assert_eq!(pick_agent_pane(split, Some("ttys003 claude\nttys005 claude\n"), ""), Ok("%5".into()));
         // Only a dashboard: nothing to close.
-        assert_eq!(pick_agent_pane("%3\x1f/dev/ttys003\x1f1\x1f1", None), Err(PANE_GONE));
+        assert_eq!(pick_agent_pane("%3\x1f/dev/ttys003\x1f1\x1f1", None, ""), Err(PANE_GONE));
         // Focus: moved to the shell only while the dashboard is active.
         let w = Window::parse(&row("main", 0, "@1", &[("home", "1"), ("pane_flags", "D0%3 p1%4 ")])).unwrap();
         assert_eq!(Actions::focus_shell_command(&w), Some(vec!["select-pane".into(), "-t".into(), "%4".into()]));

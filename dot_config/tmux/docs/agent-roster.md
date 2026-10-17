@@ -461,12 +461,18 @@ a digit back, any other key drops it and does its own thing.
   `switch-client`, so the visit discharges the tint like a tab click does.
 - `x` finds the agent's pane by TTY, the way the watcher does: `list-panes`
   (`pane_id`, `pane_tty`, `pane_active`) plus one `ps -ax -o tty=,comm=`, run
-  only on `x` and only for a split window, matching a comm of `claude`,
-  `codex`, `opencode` or a bare version like `2.1.291`. `pane_current_command` is not
-  used: codex launched through npm shows there as `node`. A one-pane window
-  closes that pane; a split window where no pane runs an agent is refused
-  ("can't tell which pane is the agent · close it from the tab") rather than
-  guessed at.
+  only on `x` (and on peek) and only for a split window, matching a comm of
+  `claude`, `codex`, `opencode` or a bare version like `2.1.291`.
+  `pane_current_command` is not used: codex launched through npm shows there
+  as `node`. The window's `@agent_kind` steers it (`pick_agent_pane`'s
+  `kind`, mirrored from agent-roster.py with the same tests): an `opencode`
+  pane counts only in an opencode window, so `opencode serve` split beside a
+  Claude is never what `x` closes; among several agent panes the one whose
+  comm matches the kind (`comm_kind`: codex, opencode, else claude) wins
+  before the active-pane fallback. A one-pane window closes that pane; a
+  split window where no pane runs an agent, or several do and neither the
+  kind nor the active pane picks one, is refused ("can't tell which pane is
+  the agent · close it from the tab") rather than guessed at.
 - Keys: a read that ends in a bare ESC or a cut-off sequence (`ESC [`,
   `ESC [1;`) waits 25 ms for the rest; only silence makes a lone ESC close the
   popup. Alt+key is ignored, and UTF-8 is decoded incrementally across reads.
