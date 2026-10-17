@@ -462,7 +462,7 @@ a digit back, any other key drops it and does its own thing.
 - `x` finds the agent's pane by TTY, the way the watcher does: `list-panes`
   (`pane_id`, `pane_tty`, `pane_active`) plus one `ps -ax -o tty=,comm=`, run
   only on `x` and only for a split window, matching a comm of `claude`,
-  `codex` or a bare version like `2.1.291`. `pane_current_command` is not
+  `codex`, `opencode` or a bare version like `2.1.291`. `pane_current_command` is not
   used: codex launched through npm shows there as `node`. A one-pane window
   closes that pane; a split window where no pane runs an agent is refused
   ("can't tell which pane is the agent · close it from the tab") rather than
@@ -494,7 +494,7 @@ tmux keeps two GLOBAL options, each a window id (`@12`) or empty:
 | `@agent_mru_prev` | the agent window landed on before that; never equal to cur |
 
 - **Agent window** = `@agent_state` is set. It is the one marker present on
-  every live Claude/Codex window, idle ones included: the hooks write it and
+  every live Claude/Codex/OpenCode window, idle ones included: the hooks write it and
   the watcher seeds `idle` for any agent process it finds without one, and its
   GC unsets it when the agent is gone (the same field the roster and
   agent-jump.sh filter on). `@agent_kind` would mostly work too, but it is a
@@ -646,8 +646,9 @@ described in the rest of this section; it was not changed.**
   are not chosen anywhere new: `Roster.shape()` is `dot()` with the glyph
   swapped and `strip_glyph()` is `glyph()` with ⚙/◎ for the Nerd Font ones,
   so cua-notch's palette check (section 65, which reads `dot()`/`glyph()`)
-  still covers the strip. A dim `✳` (Claude) or `⬢` (Codex) follows the
-  state when `@agent_kind` is set. Titles: `project/` is kept only if it fits
+  still covers the strip. A dim `✳` (Claude), `⬢` (Codex) or U+F489
+  (OpenCode, Nerd Font nf-oct-terminal) follows the state when
+  `@agent_kind` is set. Titles: `project/` is kept only if it fits
   whole in a third of the width, else the title gets everything
   (`fit_label`).
 - **Branch**: dim `⎇ name` after the session name, when it fits. Read from
@@ -807,8 +808,8 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
    SPACES                              one row per space, ⌃N order: ` N ` on
     1 main ▶            ◐1 ○3          its colour, the name, its counts; the
     2  bai                 ○2          client's as @space_here (red on prefix)
-   PARKED  3                           the stash's count; a message or the
-     ⏸ Canvas export        main       watcher on the right; up to 3 parked
+   PARKED  3                           always one line: the stash's count; a
+                                       message or the watcher on the right
   ```
 
   Chips take a page out of the tmux status line (its catppuccin blocks,
@@ -862,7 +863,9 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   `turn_aborted`) nothing, so the run detail shows. Inline code (`-c`,
   `-e`, `-m`) is shown as just the interpreter; a script file only by a
   plain, not secret-looking name. `AGENT_UI_CLAUDE_DIR` points the Claude side
-  elsewhere (tests; Codex needs no directory).
+  elsewhere (tests; Codex needs no directory). An OpenCode agent has no
+  blurb (no transcript reader for it yet): its run detail shows, and it
+  never borrows the words of a Claude session naming the same window.
 
 - **Letters**: every agent tile (both scopes) and every NEEDS YOU card
   starts, after its stripe, with a ` a ` key-cap (a raised `surface1` chip):
@@ -930,11 +933,11 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   space (`agent-jump.sh goto` on its active window, in that session). The
   index, hidden mark and colour are SESSION options read through the
   window-row format, so they cost no extra tmux call.
-- **Stash** (PARKED, the last section, after a gap): ` PARKED` and the
-  count as a square mauve chip (`none` dim with nothing parked), a message
-  or the watcher's problem on the right; with rows to spare (beside the
-  full SPACES list), up to 3 parked tabs one row each (dim: the title, the
-  space it came from) and `+N more`. A click on any of it runs exactly prefix h's
+- **Stash** (PARKED, the last section, after a gap): always ONE line, at
+  every height: ` PARKED` and the count as a square mauve chip (`none` dim
+  with nothing parked), a message or the watcher's problem on the right.
+  The parked tabs themselves are never listed (prefix h's picker and the
+  menu's Parked tab show them). A click on the line runs exactly prefix h's
   command, `tmux run-shell "stash.sh unstash '' <client>"` (the sidebar's
   client for `#{client_name}`; a unit test compares it with tmux.conf.tmpl's
   `bind-key h`), so the same picker popup opens on that client. A plain
@@ -973,7 +976,7 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   the stash selection's mauve, the key-caps and the status-line modules.
   Rows left over after all that buy spacing back: the gaps above AGENTS,
   SHELLS and NEEDS YOU, the cards' pads, the gaps between spaces in
-  AGENTS, then PARKED's tabs. Dim text on any
+  AGENTS (never PARKED: it stays one line). Dim text on any
   surface is `overlay2` (`overlay` there is under 3:1).
 - **Sync (told, not polling)**: the loop sleeps in `poll(2)` on stdin, the
   signal pipe, one Darwin-notification fd (`notify_register_file_descriptor`,

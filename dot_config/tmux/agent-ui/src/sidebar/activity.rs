@@ -41,6 +41,10 @@
 //!   other agents; reasoning only → `Thinking…`; a turn already over
 //!   (`task_complete`, `turn_aborted`) → nothing (the run detail). The same
 //!   scrubbing of secrets and hashed names.
+//! - **OpenCode**: no transcript reader, so no blurb (the row keeps the run
+//!   detail). It never falls through to the Claude lookup, which would lend
+//!   it the words of a live Claude session naming the same window (one in
+//!   another pane of it).
 
 use super::term;
 use crate::json::{self, Value};
@@ -122,7 +126,7 @@ impl Activity {
         }
         self.scan_sessions();
         for a in view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()).chain(view.needs.iter_mut().map(|n| &mut n.agent)) {
-            a.blurb = if !working(a) {
+            a.blurb = if !working(a) || a.kind == "opencode" {
                 None
             } else if a.kind == "codex" {
                 // Its rollout path rides on the window (`@agent_rollout`).

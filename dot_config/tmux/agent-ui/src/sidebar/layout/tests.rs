@@ -232,11 +232,13 @@ fn check_order(name: &str, f: &Frame) {
         let vertical = t[f.spaces.start + 1].starts_with(" SPACES");
         assert!(!vertical || f.parked.len() >= 2, "{name}: a gap above PARKED under the SPACES list {t:#?}");
     }
-    // PARKED last, its header always there (the stash, messages, the watcher).
+    // PARKED last, its header always there (the stash, messages, the watcher),
+    // and only ever that one line (after its gap): never the parked tabs.
     assert_eq!(f.parked.end, h, "{name}: {t:#?}");
+    assert!((1..=2).contains(&f.parked.len()), "{name}: PARKED is one line (and its gap) {:?} {t:#?}", f.parked);
     if f.toast.end <= f.parked.start {
-        let header = f.parked.clone().find(|&y| t[y].starts_with(" PARKED")).unwrap_or_else(|| panic!("{name}: no PARKED {t:#?}"));
-        assert!(f.parked.clone().take_while(|&y| y < header).all(|y| t[y].trim().is_empty()), "{name}: {t:#?}");
+        assert!(t[h - 1].starts_with(" PARKED"), "{name}: no PARKED {t:#?}");
+        assert!(f.parked.clone().take_while(|&y| y < h - 1).all(|y| t[y].trim().is_empty()), "{name}: {t:#?}");
     }
     assert!(f.toast.end < h, "{name}: {t:#?}");
     assert!(!t.iter().any(|l| l.starts_with(" log") || l.contains('═')), "{name}: {t:#?}");
@@ -525,19 +527,19 @@ fn quiet_is_roomy() {
     let bai = find(&f, " ● bai");
     assert!(t[main - 1].trim().is_empty() && is_pad(&t[main - 2]) && bai < main, "{t:#?}");
     // SPACES: a gap, its header and a row per space in ⌃N (here: name)
-    // order, each with its counts; then a gap and PARKED with its count and
-    // the parked tab. Spare rows above them.
-    assert_eq!((f.spaces.clone(), f.parked.clone()), (50..55, 55..58), "{t:#?}");
-    assert!(t[50].trim().is_empty() && t[51].trim_end() == " SPACES", "{t:#?}");
-    assert!(t[52].contains(" bai ") && t[52].ends_with("○2  ") && t[54].contains(" schedule "), "{t:#?}");
+    // order, each with its counts; then a gap and PARKED: one line, its
+    // count, never the parked tab itself. Spare rows above them.
+    assert_eq!((f.spaces.clone(), f.parked.clone()), (51..56, 56..58), "{t:#?}");
+    assert!(t[51].trim().is_empty() && t[52].trim_end() == " SPACES", "{t:#?}");
+    assert!(t[53].contains(" bai ") && t[53].ends_with("○2  ") && t[55].contains(" schedule "), "{t:#?}");
     // The client's space: `@space_here`, one chip (peach: no colour of its
     // own) ending in the arrow.
     let peach = Ink::Pal("peach");
-    assert!(f.rows[53].segs.contains(&block(" main ", "crust", peach)) && f.rows[53].segs.contains(&seg(ARROW, peach)), "{:?}", f.rows[53].segs);
-    assert!(t[53].ends_with("◉1 ◐2 ○4  "), "{t:#?}");
-    assert!(t[f.agents.end..50].iter().all(|l| l.trim().is_empty()), "{t:#?}");
-    assert!(t[55].trim().is_empty() && t[56].starts_with(&parked(1)), "{t:#?}");
-    assert!(t[57].contains("⏸ Parked one"), "{t:#?}");
+    assert!(f.rows[54].segs.contains(&block(" main ", "crust", peach)) && f.rows[54].segs.contains(&seg(ARROW, peach)), "{:?}", f.rows[54].segs);
+    assert!(t[54].ends_with("◉1 ◐2 ○4  "), "{t:#?}");
+    assert!(t[f.agents.end..51].iter().all(|l| l.trim().is_empty()), "{t:#?}");
+    assert!(t[56].trim().is_empty() && t[57].starts_with(&parked(1)), "{t:#?}");
+    assert!(!t.iter().any(|l| l.contains("Parked one") || l.contains('⏸')), "{t:#?}");
     assert!(!f.spin || t.iter().any(|l| l.contains('⠋')));
 }
 
@@ -662,8 +664,9 @@ fn click_targets() {
     assert_eq!(f.target(5, s + 1), None);
     assert_eq!(f.target(2, find(&f, " NEEDS YOU") as u16), None);
     assert_eq!(f.target(2, 1), None);
-    // PARKED (its header and its tabs) opens the stash picker.
-    assert_eq!((f.target(2, 56), f.target(20, 57)), (Some(&Target::Stash), Some(&Target::Stash)));
+    // PARKED (its one line, across its width) opens the stash picker; the
+    // gap above it does nothing.
+    assert_eq!((f.target(2, 57), f.target(20, 57), f.target(2, 56)), (Some(&Target::Stash), Some(&Target::Stash), None));
     // A watcher problem is a restart button, on the PARKED header.
     let mut v = quiet();
     v.watcher_age = Some(99.0);
@@ -1509,7 +1512,7 @@ fn the_spinner_turns_only_working_rows() {
 fn glyph_widths_agree_with_ratatui() {
     // Every fixed glyph the sidebar draws: the layout's cell count
     // (text::dwidth) must be ratatui's (unicode-width over the grapheme).
-    let glyphs = "⏵⤺≡⌥▌▎▄▀◉✓✕•◐○●─━┃│╭╮╰╯↻Σ−±↑↓✎⚙◎▸…✳⬢⏎⏸⌃⌂\u{e0a0}\u{e0b0}›\u{f05a}\u{f058}\u{f071}\u{f057}".to_string() + &SPIN.concat();
+    let glyphs = "⏵⤺≡⌥▌▎▄▀◉✓✕•◐○●─━┃│╭╮╰╯↻Σ−±↑↓✎⚙◎▸…✳⬢\u{f489}⏎⏸⌃⌂\u{e0a0}\u{e0b0}›\u{f05a}\u{f058}\u{f071}\u{f057}".to_string() + &SPIN.concat();
     let bad: Vec<(char, usize, usize)> = glyphs
         .chars()
         .map(|c| (c, dwidth(&c.to_string()), c.to_string().width()))
@@ -1793,10 +1796,10 @@ fn a_working_agent_shows_its_activity() {
     assert!(texts(&f)[r + 1].starts_with(" ▌    Edit agent-roster.py"), "{:#?}", texts(&f));
 }
 
-/// The bottom gives way in order as rows run short: PARKED's tabs first
-/// (its header and count stay), then SPACES collapses to the client's
-/// space and the attention ones (`+K more spaces`), then to chips; the
-/// PARKED header is always there.
+/// The bottom gives way in order as rows run short: SPACES collapses to the
+/// client's space and the attention ones (`+K more spaces`), then to chips;
+/// PARKED is always its one line (label and count), never its tabs, at
+/// every height.
 #[test]
 fn the_bottom_gives_way_in_order() {
     let mut v = quiet();
@@ -1814,28 +1817,25 @@ fn the_bottom_gives_way_in_order() {
         let f = layout(&v, 34, h, &Opts::default());
         let t = texts(&f);
         check_order(&format!("bottom {h}"), &f);
-        let tabs = f.parked.clone().filter(|&y| t[y].contains("⏸ Parked")).count();
+        // One line with the count; no tab, no `+N more`, anywhere.
+        assert!(t[f.parked.end - 1].starts_with(&parked(5)), "{h}: {t:#?}");
+        assert!(!t.iter().any(|l| l.contains("Parked ") || l.contains('⏸') || l.contains("+2 more")), "{h}: {t:#?}");
+        assert_eq!(f.target(5, (f.parked.end - 1) as u16), Some(&Target::Stash));
         let spaces = &t[f.spaces.clone()];
         let form = match spaces.get(1) {
             Some(l) if l.starts_with(" SPACES") => usize::from(spaces.iter().any(|l| l.contains("more spaces"))),
             Some(_) => 2,
             None => 3,
         };
-        if tabs > 0 {
-            // Three tabs and the count of the rest, beside the full list.
-            assert_eq!((form, tabs), (0, 3), "{h}: {t:#?}");
-            assert!(t[f.parked.end - 1].contains("+2 more") && t[f.parked.end - 2].ends_with("bai "), "{h}: {t:#?}");
-            assert_eq!(f.target(5, (f.parked.end - 1) as u16), Some(&Target::Stash));
-        }
         if form == 1 {
             // The client's space (main, which needs you too) and `+2`.
             let more = f.spaces.clone().find(|&y| t[y].contains("+2  more spaces")).unwrap_or_else(|| panic!("{h}: {t:#?}"));
             assert!(spaces.iter().any(|l| l.contains(" main ")) && !spaces.iter().any(|l| l.contains(" bai ")), "{h}: {t:#?}");
             assert_eq!(f.target(5, more as u16), Some(&Target::Menu(Some("all"))));
         }
-        forms.push((form, tabs > 0));
+        forms.push(form);
     }
-    for want in [(0, true), (0, false), (1, false), (2, false)] {
+    for want in [0, 1, 2] {
         assert!(forms.contains(&want), "{want:?} never seen: {forms:?}");
     }
 }

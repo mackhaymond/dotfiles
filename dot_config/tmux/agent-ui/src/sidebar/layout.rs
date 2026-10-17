@@ -55,9 +55,9 @@
 //!   2  bai                    ○2        client's `@space_here` (red while the
 //!   3  cs35l                            prefix is armed)
 //!
-//!  PARKED  4                            the stash (a click: its picker); a
-//!    ⏸ Canvas export          main      message or the watcher on the right;
-//!     +1 more                           up to 3 parked tabs when rows allow
+//!  PARKED  4                            the stash (a click: its picker): one
+//!                                       line, its count, a message or the
+//!                                       watcher on the right; never its tabs
 //! ```
 //!
 //! (`▶`: the arrow.) Without a [`Bar`] (no client space, no usage, nothing
@@ -74,8 +74,10 @@
 //! ([`bottom`]): every space a row; else the client's space and those with
 //! an attention agent and `+K more spaces`; else chips on as few as one
 //! line; the gap above PARKED last. Spare rows then buy spacing back (the
-//! section gaps, the cards' pads, the gaps between spaces in AGENTS) and,
-//! last, PARKED's tabs (beside the full SPACES list only).
+//! section gaps, the cards' pads, the gaps between spaces in AGENTS). PARKED
+//! is always ONE line, its label and count (`none` dim with nothing parked),
+//! at every height: the parked tabs themselves are never listed (prefix h's
+//! picker, or the menu's Parked tab, shows them).
 //!
 //! ## Toasts: nvim-notify cards over the top, so nothing moves
 //!
@@ -422,7 +424,7 @@ pub enum Target {
     Back,
     /// The agents menu (Strip.open_menu), optionally on a tab ("all", "idle").
     Menu(Option<&'static str>),
-    /// PARKED (its header or a parked tab): the stash picker, exactly prefix h's
+    /// PARKED (its one line): the stash picker, exactly prefix h's
     /// `stash.sh unstash '' <client>`.
     Stash,
     /// The red watcher warning: restart it (the strip's ⟳, Strip.click "restart").
@@ -521,8 +523,8 @@ pub struct Frame {
     /// of rows, the spaces as chips.
     pub spaces: Range<usize>,
     /// The PARKED section, at the very bottom: its gap (when room), its
-    /// header (the stash's count, the message or watcher problem on the
-    /// right) and, with rows to spare, up to 3 parked tabs.
+    /// one line (the stash's count, the message or watcher problem on the
+    /// right). Never the parked tabs themselves.
     pub parked: Range<usize>,
     /// A spinner is on screen: the sidebar redraws it every
     /// [`crate::sidebar::SPIN_EVERY`] (and only then).
@@ -2030,45 +2032,22 @@ fn parked_header(view: &ViewModel, w: usize, msg: Option<&str>) -> Row {
     row
 }
 
-/// How many parked tabs the PARKED section lists at most.
-const PARKED_SHOWN: usize = 3;
-
-/// The parked tabs under ` PARKED`: up to [`PARKED_SHOWN`], dim, each its
-/// title and, on the right, the space it came from; `+N more` for the
-/// rest. Every row opens the unpark picker.
-fn parked_rows(view: &ViewModel, w: usize) -> Vec<Row> {
-    let mut rows: Vec<Row> = view
-        .parked
-        .iter()
-        .take(PARKED_SHOWN)
-        .map(|p| {
-            let right = vec![seg(sanitize(&p.origin), "overlay"), seg(" ", "text")];
-            Row::new(fit(w, vec![seg("   ⏸ ", "overlay"), seg(sanitize(&p.agent.short_title), "overlay")], right, None)).click(w, Target::Stash)
-        })
-        .collect();
-    let rest = view.parked.len().saturating_sub(PARKED_SHOWN);
-    if rest > 0 {
-        rows.push(dim_line(w, &format!("     +{rest} more")).click(w, Target::Stash));
-    }
-    rows
-}
-
 /// The bottom of the frame in `room` rows (at least 1): the SPACES section
-/// and the PARKED section's header, the richest form that fits. As rows run
-/// short the spaces collapse to the client's space and the attention ones
-/// (`+K more`), then to chips on as few as one line, the gap above PARKED
-/// last. (The parked tabs under the header are spare rows' business:
-/// [`parked_rows`], only beside the full SPACES section.) → (the spaces
-/// rows, the parked rows: its gap and header, whether the spaces are full).
-fn bottom(view: &ViewModel, w: usize, room: usize, prefix: bool, msg: Option<&str>) -> (Vec<Row>, Vec<Row>, bool) {
+/// and the PARKED section, the richest form that fits. PARKED is always its
+/// one header line ([`parked_header`]: the label and the count), never the
+/// parked tabs themselves, at any height. As rows run short the spaces
+/// collapse to the client's space and the attention ones (`+K more`), then
+/// to chips on as few as one line, the gap above PARKED last. → (the spaces
+/// rows, the parked rows: its gap and header).
+fn bottom(view: &ViewModel, w: usize, room: usize, prefix: bool, msg: Option<&str>) -> (Vec<Row>, Vec<Row>) {
     let header = parked_header(view, w, msg);
     let parked = |gap: bool| -> Vec<Row> { if gap { vec![Row::blank(w), header.clone()] } else { vec![header.clone()] } };
     let list = space_list(view);
     if list.is_empty() {
-        return (Vec::new(), parked(room >= 2), true);
+        return (Vec::new(), parked(room >= 2));
     }
     if room < 3 {
-        return (Vec::new(), parked(false), false);
+        return (Vec::new(), parked(false));
     }
     let chips = pill_lines(view, w);
     let collapsible = list.iter().any(|sp| !sp.is_current && !space_alert(sp));
@@ -2082,10 +2061,10 @@ fn bottom(view: &ViewModel, w: usize, room: usize, prefix: bool, msg: Option<&st
         let s = spaces_rows(view, w, form, prefix);
         let p = parked(gap);
         if s.len() + p.len() <= room {
-            return (s, p, form == SpacesForm::Full);
+            return (s, p);
         }
     }
-    (Vec::new(), parked(false), false)
+    (Vec::new(), parked(false))
 }
 
 /// One step at which agents keep full detail ([`STEPS`]).
@@ -2215,7 +2194,7 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     // already settled, and their pads never come back.
     let used = |n: &[Row], a: &[Row], g: [bool; 3]| top.len() + n.len() + a.len() + shells.len() + g.iter().filter(|x| **x).count();
     let room = h.saturating_sub(used(&needs, &agents, [gap_needs, gap_agents, gap_shells]));
-    let (spaces, mut parked, full) = bottom(view, w, room, bar.prefix, opts.msg.as_deref());
+    let (spaces, parked) = bottom(view, w, room, bar.prefix, opts.msg.as_deref());
     let mut spare = room.saturating_sub(spaces.len() + parked.len());
     // 1. The gap above each section header: AGENTS, SHELLS, NEEDS YOU.
     for (gap, there) in [(&mut gap_agents, !agents.is_empty()), (&mut gap_shells, !shells.is_empty()), (&mut gap_needs, !top.is_empty())] {
@@ -2235,15 +2214,11 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
         }
     }
     // 3. A gap above each space header in AGENTS (but the first): all or none.
+    // (The last use of spare rows: PARKED never takes any, it is always its
+    // one header line.)
     let missing = group_gaps(&agents, w);
     if missing > 0 && missing <= spare {
         agents = spaced_groups(agents, w);
-        spare -= missing;
-    }
-    // 4. The parked tabs under their header (beside the full SPACES list).
-    let tabs = parked_rows(view, w);
-    if full && !tabs.is_empty() && tabs.len() <= spare {
-        parked.extend(tabs);
     }
     let mut rows = top;
     frame.status = status;

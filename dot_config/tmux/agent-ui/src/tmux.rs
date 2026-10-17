@@ -508,7 +508,7 @@ pub struct Window {
     /// included and marked; empty for a row without the field's tokens
     /// (tests, junk).
     pub pane_list: Vec<Pane>,
-    /// @agent_kind: claude | codex | "".
+    /// @agent_kind: claude | codex | opencode | "".
     pub kind: String,
     /// @agent_detail_kind: perm | ask | fail | done | run | "".
     pub detail_kind: String,

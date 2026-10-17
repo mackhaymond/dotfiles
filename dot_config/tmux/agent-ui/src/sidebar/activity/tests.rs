@@ -186,8 +186,9 @@ fn the_transcript_is_found_and_read_only_when_it_changes() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Through the view: working agents get a blurb, the rest none; codex
-/// agents none (no transcript reader for them yet).
+/// Through the view: working agents get a blurb, the rest none; an
+/// OpenCode agent none even while working (no transcript reader for it),
+/// never a Claude session's that names its window.
 #[test]
 fn apply_fills_only_working_agents() {
     use crate::collate::Collator;
@@ -198,6 +199,7 @@ fn apply_fills_only_working_agents() {
     let rows = [
         row("work", 1, "@7", &[("state", "running"), ("summary", "Busy"), ("kind", "claude")]),
         row("work", 2, "@8", &[("state", "idle"), ("summary", "Calm"), ("kind", "claude")]),
+        row("work", 3, "@9", &[("state", "running"), ("summary", "Open"), ("kind", "opencode")]),
     ];
     let c = Collator::new("C");
     let args = BuildArgs { client: None, now: 0.0, collator: &c, git: None, log: vec![], watcher_age: Some(1.0) };
@@ -205,7 +207,13 @@ fn apply_fills_only_working_agents() {
     let mut a = Activity::new(root.clone());
     a.apply(&mut v);
     let got: Vec<_> = v.agents().map(|x| (x.window_id.clone(), x.blurb.clone())).collect();
-    assert_eq!(got, [("@7".to_string(), Some("Reading a.rs".to_string())), ("@8".to_string(), None)]);
+    assert_eq!(got, [("@7".to_string(), Some("Reading a.rs".to_string())), ("@8".to_string(), None), ("@9".to_string(), None)]);
+    // Even a live Claude session naming its window (a Claude in another pane
+    // of it) lends an OpenCode agent nothing.
+    let args = BuildArgs { client: None, now: 0.0, collator: &c, git: None, log: vec![], watcher_age: Some(1.0) };
+    let mut v = ViewModel::build(&Snapshot::parse(&row("work", 1, "@7", &[("state", "running"), ("summary", "Open"), ("kind", "opencode")])), args);
+    a.apply(&mut v);
+    assert_eq!(v.agents().map(|x| x.blurb.clone()).collect::<Vec<_>>(), [None]);
     let _ = std::fs::remove_dir_all(&root);
 }
 

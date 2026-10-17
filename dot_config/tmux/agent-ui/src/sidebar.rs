@@ -22,7 +22,7 @@
 //! - **Clicks only.** A left press acts on what was drawn at that cell
 //!   ([`Target`]), resolved against the frame ON SCREEN; a plain RIGHT
 //!   press on an agent row or NEEDS YOU card parks that window (`stash.sh
-//!   stash <win>`), and `⏸ N parked` opens prefix h's stash picker
+//!   stash <win>`), and `PARKED N` opens prefix h's stash picker
 //!   ([`stash_command`]). Every click hands
 //!   focus straight back to the tmux pane first (Strip.handle → focus_back),
 //!   and any key that lands here is forwarded there. The wheel does nothing:
@@ -312,7 +312,7 @@ pub fn menu_command(tmux: &Tmux, client: &str, exe: Option<&std::path::Path>, ta
     c
 }
 
-/// `⏸ N parked`: exactly what prefix h runs (tmux.conf.tmpl `bind-key h
+/// `PARKED N`: exactly what prefix h runs (tmux.conf.tmpl `bind-key h
 /// run-shell "…/stash.sh unstash '' '#{client_name}'"`), with the sidebar's
 /// client in place of `#{client_name}`. A foreground run-shell, as there: the
 /// script raises the picker with `display-popup -c <client>` and returns when
@@ -971,7 +971,7 @@ mod tests {
         assert_eq!((a.focus_backs, a.last_act.clone()), (1, None));
     }
 
-    /// `⏸ N parked` runs exactly prefix h's line (tmux.conf.tmpl, read when
+    /// `PARKED N` runs exactly prefix h's line (tmux.conf.tmpl, read when
     /// the source tree is there), the client in place of `#{client_name}`.
     #[test]
     fn stash_click_is_prefix_h() {

@@ -86,11 +86,11 @@ pub fn watcher_problem(age: Option<f64>) -> Option<String> {
     }
 }
 
-/// agent-roster.py `is_agent_comm`: a ps comm whose basename is claude or
-/// codex, or Claude's version-named binary ("2.1.291").
+/// agent-roster.py `is_agent_comm`: a ps comm whose basename is claude,
+/// codex or opencode, or Claude's version-named binary ("2.1.291").
 pub fn is_agent_comm(comm: &str) -> bool {
     let base = comm.rsplit('/').next().unwrap_or(comm);
-    if base == "claude" || base == "codex" {
+    if matches!(base, "claude" | "codex" | "opencode") {
         return true;
     }
     let parts: Vec<&str> = base.split('.').collect();
@@ -448,10 +448,10 @@ mod tests {
 
     #[test]
     fn agent_comms() {
-        for c in ["claude", "/usr/local/bin/codex", "2.1.291", "/x/10.0.1"] {
+        for c in ["claude", "/usr/local/bin/codex", "/opt/homebrew/bin/opencode", "2.1.291", "/x/10.0.1"] {
             assert!(is_agent_comm(c), "{c}");
         }
-        for c in ["node", "claude-code", "2.1", "2.1.x", "1..2", "zsh", "v2.1.3"] {
+        for c in ["node", "claude-code", "opencode-ai", "2.1", "2.1.x", "1..2", "zsh", "v2.1.3"] {
             assert!(!is_agent_comm(c), "{c}");
         }
     }

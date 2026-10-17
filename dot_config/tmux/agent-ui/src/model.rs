@@ -211,6 +211,8 @@ pub fn kind_glyph(kind: &str) -> Option<&'static str> {
     match kind {
         "claude" => Some("✳"),
         "codex" => Some("⬢"),
+        // nf-oct-terminal (U+F489): Nerd Font, one cell like the others.
+        "opencode" => Some("\u{f489}"),
         _ => None,
     }
 }
