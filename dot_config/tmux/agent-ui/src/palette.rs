@@ -29,21 +29,18 @@ pub const HEX: [(&str, &str); 16] = [
 /// below `sub`, so the hierarchy holds.
 ///
 /// The sidebar's raised surfaces (its "tiles": agent cards, the usage
-/// panel, shell buttons) come in two tones. A two-line card is TWO-TONE:
-/// its title row on `tile` (the lighter, between the canvas `base` and
-/// `surface0`), its detail row on `tile_lo` (darker, but plainly off the
-/// canvas, so an empty detail row still reads as part of its card), so
-/// cards stacked with no gap still part cleanly: every card starts with a
-/// visible bar. One-row tiles stacked edge to edge (one-line agents,
-/// shells, SPACES rows) alternate the same two. `tile_hi` (about `blue` at
-/// 18% over the canvas) lifts the client's own agent's title row and the
-/// active shell; `tile_hi_lo` is the darker partner for that agent's
-/// detail row.
-pub const UI: [(&str, &str); 11] = [
+/// panel, shell buttons) come in two shades, a zebra: every card is ONE
+/// colour, and cards stacked edge to edge alternate `tile` (the lighter,
+/// between the canvas `base` and `surface0`) and `tile_lo` (darker, but
+/// plainly off the canvas, so an empty row of a card still reads as part
+/// of it), so neighbours part with no gap between them. `tile_hi` (about
+/// `blue` at 18% over the canvas) lifts the client's own agent (both rows)
+/// and the active shell.
+pub const UI: [(&str, &str); 10] = [
     ("base", "#1e1e2e"), ("mantle", "#181825"), ("surface2", "#585b70"),
     ("mauve", "#cba6f7"), ("lavender", "#b4befe"), ("sel", "#2a2b3d"),
     ("overlay2", "#9399b2"), ("tile", "#30314a"), ("tile_lo", "#28283b"),
-    ("tile_hi", "#31394f"), ("tile_hi_lo", "#2a3044"),
+    ("tile_hi", "#31394f"),
 ];
 
 /// The `#rrggbb` for a palette name ([`HEX`] first, then [`UI`]). Panics on
@@ -148,21 +145,22 @@ mod tests {
             assert!(contrast(rgb("sub"), bg) > c);
             assert!(contrast(rgb("overlay"), bg) < 3.0, "{bg:?}");
         }
-        // The darker tones (a card's detail row) sit nearer the canvas:
-        // dim text reads there even better, still under `sub`.
-        for bg in [rgb("tile_lo"), rgb("tile_hi_lo"), mix_rgb("yellow", 8), mix_rgb("mauve", 11)] {
+        // The zebra's darker shades sit nearer the canvas: dim text reads
+        // there even better, still under `sub`.
+        for bg in [rgb("tile_lo"), mix_rgb("yellow", 9), mix_rgb("red", 9), mix_rgb("green", 9)] {
             let c = contrast(rgb("overlay2"), bg);
             assert!(c >= 4.5 && contrast(rgb("sub"), bg) > c, "{bg:?}: {c:.2}");
         }
     }
 
-    /// A two-tone card: its title row visibly lighter than its detail row,
-    /// and the detail row plainly off the canvas (an empty one must not
-    /// read as a gap), neither loud.
+    /// The zebra: neighbouring cards' shades visibly apart, the darker one
+    /// plainly off the canvas (an empty row of its card must not read as a
+    /// gap), neither loud; the client's lift apart from both.
     #[test]
     fn card_tones_part_but_stay_quiet() {
         let l = |n: &str| contrast(rgb(n), rgb("base"));
-        for (hi, lo) in [("tile", "tile_lo"), ("tile_hi", "tile_hi_lo")] {
+        assert!(rgb("tile_hi") != rgb("tile") && rgb("tile_hi").2 > rgb("tile").2 && rgb("tile_hi").1 > rgb("tile").1);
+        for (hi, lo) in [("tile", "tile_lo")] {
             assert!(contrast(rgb(hi), rgb(lo)) > 1.1, "{hi}/{lo}: {:.3}", contrast(rgb(hi), rgb(lo)));
             assert!(l(lo) > 1.12 && l(hi) < 1.6, "{hi}/{lo}: {:.3} {:.3}", l(lo), l(hi));
         }

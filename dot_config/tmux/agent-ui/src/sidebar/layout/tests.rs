@@ -368,7 +368,7 @@ fn agents_lose_detail_last() {
 /// while blank rows sit unused above the spaces, no section gap is missing
 /// (above AGENTS, SHELLS, NEEDS YOU), nor the gaps between spaces unless
 /// they cost more than is left. Never a pad between list tiles (cards stack
-/// two-tone), and every agent row keeps one shape.
+/// in the zebra), and every agent row keeps one shape.
 #[test]
 fn spare_rows_buy_spacing_back() {
     let bars = [Bar::default(), demo_bar(), Bar { prefix: true, ..demo_bar() }];
@@ -405,7 +405,7 @@ fn spare_rows_buy_spacing_back() {
     assert!(bought > 0, "spacing never bought back");
     // A frame that asked for it (34x40, the shells in one line, rows left
     // over): the gap above AGENTS is back and the one above PARKED, nothing
-    // blank at the bottom; the agents keep their shape (two-tone, no pads).
+    // blank at the bottom; the agents keep their shape (the zebra, no pads).
     let f = layout(&lettered(quiet()), 34, 40, &with_bar(demo_bar()));
     let t = texts(&f);
     assert_eq!((f.step, f.agents_step, f.shells.len()), (STEPS.len() as u8 - 1, 0, 1), "{t:#?}");
@@ -481,11 +481,11 @@ fn quiet_is_roomy() {
     assert!(t[0].starts_with(" agents") && t[0].ends_with("◉1 ◐2 ○8 "), "{:?}", t[0]);
     // The count: a small yellow pill.
     assert!(t[1].trim().is_empty() && t[2].starts_with(" NEEDS YOU") && t[2].ends_with(" 1  "), "{t:#?}");
-    // The card: two-tone, tinted in its state's colour with a yellow stripe;
-    // title, glyph and age; then the question on the darker tint. No pad.
+    // The card: one tint of its state's colour, a yellow stripe; title,
+    // glyph and age; then the question. No pad.
     assert!(t[3].starts_with(" ▌ Kua Yu focus timing") && t[3].ends_with("◉ 3m  "), "{:?}", t[3]);
     assert!(t[4].starts_with(" ▌ Which deck should I pull"), "{:?}", t[4]);
-    assert_eq!((f.rows[3].bg, f.rows[4].bg), (Some(Ink::Mix("yellow", 14)), Some(Ink::Mix("yellow", 8))));
+    assert_eq!((f.rows[3].bg, f.rows[4].bg), (Some(Ink::Mix("yellow", 14)), Some(Ink::Mix("yellow", 14))));
     assert_eq!((f.rows[3].segs[0].clone(), f.rows[3].segs[1].clone()), (bare(1), seg("▌", "yellow")));
     // Then a gap, and the agents right under it.
     assert!(t[5].trim().is_empty() && t[6].starts_with(" AGENTS") && t[6].ends_with("all spaces "), "{t:#?}");
@@ -497,45 +497,47 @@ fn quiet_is_roomy() {
     let peach = Ink::Pal("peach");
     assert!(t[main].ends_with("◉1 ◐2 ○4  ") && f.rows[main].bg == Some(Ink::Mix("peach", HEAD_TINT)), "{:?}", t[main]);
     assert!(f.rows[main].segs.contains(&block(" main ", "crust", peach)) && f.rows[main].segs.contains(&seg(ARROW, peach)), "{:?}", f.rows[main].segs);
-    // The client's agent: lifted (`tile_hi`, its detail on `tile_hi_lo`), a
-    // wide stripe in its state's colour, the spinner and its word; its
-    // message under it with the age; the next card right under that. A
-    // canvas margin either side.
+    // The client's agent: lifted (`tile_hi`, both rows), a wide stripe in
+    // its state's colour, the spinner and its word; its message under it
+    // with the age; the next card right under that. A canvas margin either
+    // side.
     let r = find(&f, "Tmux Agent Sidebar");
     assert!(t[r].starts_with(" ▌ Tmux Agent Sidebar") && t[r].ends_with("⠋ working  "), "{:?}", t[r]);
     assert!(t[r + 1].starts_with(" ▌   Edit agent-roster.py") && t[r + 1].ends_with(" 2m  "), "{:?}", t[r + 1]);
-    assert_eq!((f.rows[r].bg, f.rows[r + 1].bg), (Some(Ink::Pal("tile_hi")), Some(Ink::Pal("tile_hi_lo"))));
+    assert_eq!((f.rows[r].bg, f.rows[r + 1].bg), (Some(Ink::Pal("tile_hi")), Some(Ink::Pal("tile_hi"))));
     assert_eq!(f.rows[r].segs[1], seg("▌", "blue"));
     assert_eq!((f.rows[r].segs[0].clone(), f.rows[r].segs.last().cloned()), (bare(1), Some(bare(1))));
     assert!(f.rows[r + 2].covers.len() == 1 && f.rows[r + 2].bg == Some(Ink::Pal("tile")), "{t:#?}");
     // A title gives way to the state word (and the flag stays); working:
-    // a blue stripe on a plain two-tone card.
+    // a blue stripe down a plain card, one colour (its group's first: `tile`).
     let h = find(&f, "Handy.app Speech… ⚙");
     assert!(t[h].ends_with("⠋ working  ") && t[h + 1].starts_with(" ▎   Bash swift build"), "{t:#?}");
     assert_eq!((f.rows[h].bg, f.rows[h].segs[1].clone()), (Some(Ink::Pal("tile")), seg("▎", "blue")));
-    assert_eq!((f.rows[h + 1].bg, f.rows[h + 1].segs[1].clone()), (Some(Ink::Pal("tile_lo")), seg("▎", "blue")));
-    // Recently done: the word, its message, a green stripe.
+    assert_eq!((f.rows[h + 1].bg, f.rows[h + 1].segs[1].clone()), (Some(Ink::Pal("tile")), seg("▎", "blue")));
+    // Recently done: the word, its message, a green stripe; the zebra's
+    // other shade (the 4th card of main).
     let c = find(&f, "Commodities Job Track");
     assert!(t[c].ends_with("✓ done  ") && t[c + 1].starts_with(" ▎   7 fixes applied"), "{t:#?}");
     assert_eq!(f.rows[c].segs[1], seg("▎", "green"));
+    assert_eq!((f.rows[c].bg, f.rows[c + 1].bg), (Some(Ink::Pal("tile_lo")), Some(Ink::Pal("tile_lo"))));
     // Idle: two lines like every agent, no stripe, the word on the first,
     // the age under it; the next card right under it.
     let n = find(&f, "Lost suit jacket");
     assert!(t[n].starts_with("   Lost suit") && t[n].ends_with(" idle  ") && t[n + 1].ends_with(" 6m  "), "{t:#?}");
     assert!(f.rows[n + 2].covers.len() == 1 && t[n + 2].contains("Backyard"), "{t:#?}");
-    // No pads: the section is headers, two-tone cards and the gaps between
-    // spaces, nothing else.
+    // No pads: the section is headers, cards (each one colour of the zebra,
+    // or the client's lift) and the gaps between spaces, nothing else.
     for y in f.agents.clone().skip(1) {
         let r = &f.rows[y];
-        let tone = |n: &'static str| r.bg == Some(Ink::Pal(n));
-        let title = r.covers.len() == 1 && (tone("tile") || tone("tile_hi"));
-        let detail = r.covers.is_empty() && (tone("tile_lo") || tone("tile_hi_lo"));
-        assert!(!is_pad(&t[y]) && (is_blank(r) || title || detail || is_group_header(r, 34)), "{y}: {t:#?}");
-        assert!(!title || f.rows[y + 1].covers.is_empty(), "{y}: a title row, then its detail {t:#?}");
+        let tile = matches!(r.bg, Some(Ink::Pal("tile" | "tile_lo" | "tile_hi")));
+        assert!(!is_pad(&t[y]) && (is_blank(r) || tile || is_group_header(r, 34)), "{y}: {t:#?}");
+        if r.covers.len() == 1 {
+            assert!(f.rows[y + 1].covers.is_empty() && f.rows[y + 1].bg == r.bg, "{y}: a card is one colour {t:#?}");
+        }
     }
     assert!(t[find(&f, "Notch Tasks Orchestrator")].ends_with(" idle  "), "{t:#?}");
-    // A blank row between groups (after the last card's detail row), in ⌃N
-    // (here: name) order.
+    // A blank row between groups (after bai's second card, on the zebra's
+    // other shade), in ⌃N (here: name) order.
     let bai = head(&f, "bai");
     assert!(t[main - 1].trim().is_empty() && f.rows[main - 2].bg == Some(Ink::Pal("tile_lo")) && bai < main, "{t:#?}");
     // SPACES: a gap, its header and a row per space in ⌃N (here: name)
@@ -560,7 +562,7 @@ fn busy_squeezes_spaces_and_cards_before_agents() {
     let v = busy();
     let at = |h: u16| layout(&v, 34, h, &Opts::default());
     let first = |p: &dyn Fn(&Frame) -> bool| (20..120).rev().map(at).find(|f| p(f)).unwrap();
-    // 24 agents, two lines each, stacked two-tone (no pads): full detail in
+    // 24 agents, two lines each, stacked in the zebra (no pads): full detail in
     // 90 rows, gaps and all (in 80 the section gaps still, bought back).
     let f = at(90);
     assert!(f.step == 0 && f.agents_step == 0 && !texts(&f).iter().any(|l| is_pad(l)), "{:#?}", texts(&f));
@@ -571,10 +573,10 @@ fn busy_squeezes_spaces_and_cards_before_agents() {
     let f = first(&|f| f.step > 1);
     let card_lines = f.rows[f.needs.clone()].iter().filter(|r| r.bg.is_some()).count();
     assert_eq!((f.step, f.agents_step, card_lines), (2, 0, 2 * v.needs.len()), "{:#?}", texts(&f));
-    // Every card two-tone: its title row lighter, its detail row darker.
+    // Every card one colour: the zebra's (the next card the other), or the lift.
     for y in f.agents.clone().filter(|&y| f.rows[y].covers.len() == 1) {
         let pair = (f.rows[y].bg, f.rows[y + 1].bg);
-        assert!(matches!(pair, (Some(Ink::Pal("tile")), Some(Ink::Pal("tile_lo"))) | (Some(Ink::Pal("tile_hi")), Some(Ink::Pal("tile_hi_lo")))), "{y}: {pair:?}");
+        assert!(pair.0 == pair.1 && matches!(pair.0, Some(Ink::Pal("tile" | "tile_lo" | "tile_hi"))), "{y}: {pair:?}");
     }
     let f = first(&|f| f.step > 2);
     assert_eq!((f.step, f.agents_step), (3, 0), "{:#?}", texts(&f));
@@ -1017,36 +1019,44 @@ fn letter_chips_wear_their_space_colour() {
 }
 
 /// Cards stack edge to edge: no pad row between them (NEEDS YOU, agents,
-/// shells), at any size; each two-line card two-tone (the title row on the
-/// lighter tone, the detail row on the darker), so every card starts with
-/// a visible bar.
+/// shells), at any size; every card is ONE colour (both its rows), and the
+/// card right under it another (the zebra, the client's lift, a tint), so
+/// neighbours part with no gap.
 #[test]
-fn cards_stack_two_tone_without_pads() {
+fn cards_are_one_colour_and_neighbours_differ() {
     for (name, v) in all().into_iter().chain([("coloured", coloured())]) {
         for (w, h) in [34u16, 24].into_iter().flat_map(|w| (8u16..=90).map(move |h| (w, h))) {
             let f = layout(&v, w, h, &with_bar(demo_bar()));
             let t = texts(&f);
             let name = format!("{name} {w}x{h}");
             let lists = f.needs.start..f.shells.end.max(f.agents.end);
-            assert!(!t[lists.clone()].iter().any(|l| is_pad(l)), "{name} {h}: {t:#?}");
-            for y in lists {
+            assert!(!t[lists.clone()].iter().any(|l| is_pad(l)), "{name}: {t:#?}");
+            // A card: a tile row clicking through to something (not a header).
+            let card = |y: usize| {
                 let r = &f.rows[y];
-                // A two-line card's title row: its detail row right under it, darker.
-                if r.covers.len() == 1 && f.rows.get(y + 1).is_some_and(|n| n.covers.is_empty() && n.targets == r.targets) {
-                    let (a, b) = (r.bg.unwrap(), f.rows[y + 1].bg.unwrap());
-                    let lum = |i: Ink| {
-                        let (r, g, b) = super::super::status::ink_rgb(i);
-                        u32::from(r) + u32::from(g) + u32::from(b)
-                    };
-                    assert!(lum(a) > lum(b), "{name} {h} {y}: {a:?} over {b:?}");
+                (r.bg.is_some() && !is_group_header(r, usize::from(w)) && r.target_at(1).is_some()).then(|| r.target_at(1).cloned())
+            };
+            for y in lists.start..lists.end.saturating_sub(1) {
+                let (Some(a), Some(b)) = (card(y), card(y + 1)) else { continue };
+                let (x, z) = (f.rows[y].bg, f.rows[y + 1].bg);
+                if a == b {
+                    assert_eq!(x, z, "{name} {y}: one card, one colour {t:#?}");
+                } else {
+                    assert_ne!(x, z, "{name} {y}: neighbouring cards share a colour {t:#?}");
                 }
             }
         }
     }
-    // A NEEDS YOU card too: its tint, then the darker one.
+    // A NEEDS YOU card too: one tint, both rows.
     let f = layout(&quiet(), 34, 58, &Opts::default());
     let k = find(&f, "▌ Kua Yu");
-    assert_eq!((f.rows[k].bg, f.rows[k + 1].bg), (Some(Ink::Mix("yellow", NEED_TINT[0])), Some(Ink::Mix("yellow", NEED_TINT[1]))));
+    assert_eq!((f.rows[k].bg, f.rows[k + 1].bg), (Some(Ink::Mix("yellow", NEED_TINT[0])), Some(Ink::Mix("yellow", NEED_TINT[0]))));
+    // The zebra starts afresh under each space's header.
+    let f = layout(&busy(), 34, 90, &Opts::default());
+    for (y, _) in heads(&f) {
+        let next = &f.rows[y + 1];
+        assert!(next.bg == Some(Ink::Pal("tile")) || next.bg == Some(Ink::Pal("tile_hi")), "{y}: {:#?}", texts(&f));
+    }
 }
 
 #[test]
@@ -1424,9 +1434,9 @@ fn the_stash_selection_tints_rows_and_shows_its_keys() {
     let f = layout(&v, 34, 40, &with_bar(bar.clone()));
     let t = texts(&f);
     let r = find(&f, "Sel one");
-    // (Two-tone like every card: the detail row the lighter mauve.)
-    for (row, pct) in f.rows[r..r + 2].iter().zip([18, 11]) {
-        assert_eq!(row.bg, Some(Ink::Mix("mauve", pct)), "{:?}", row.text());
+    // (One colour, like every card.)
+    for row in &f.rows[r..r + 2] {
+        assert_eq!(row.bg, Some(Ink::Mix("mauve", 18)), "{:?}", row.text());
         assert_eq!(row.segs[1], seg("▌", "mauve"));
     }
     let p = find(&f, "Plain");
@@ -1964,9 +1974,9 @@ fn renders_through_ratatui_on_the_terminal_background() {
             }
             let row = &f.rows[y as usize];
             if (y == here || y == here + 1) && inside {
-                assert_eq!(bg, palette::color(if y == here { "tile_hi" } else { "tile_hi_lo" }), "({x},{y})");
+                assert_eq!(bg, palette::color("tile_hi"), "({x},{y})");
             } else if (y == card || y == card + 1) && inside {
-                assert_eq!(bg, palette::mix("yellow", if y == card { 14 } else { 8 }), "({x},{y})");
+                assert_eq!(bg, palette::mix("yellow", 14), "({x},{y})");
             } else if is_group_header(row, 34) {
                 // A band: the space's tint edge to edge, its chip (peach here) on it.
                 assert!([palette::mix("peach", HEAD_TINT), palette::color("peach")].contains(&bg), "({x},{y}) {bg:?}");
@@ -1978,7 +1988,7 @@ fn renders_through_ratatui_on_the_terminal_background() {
             }
         }
     }
-    // No pad: the next card's title tone right under the client's agent.
+    // No pad: the next card (the zebra's `tile`) right under the client's agent.
     let next = here + 2;
     assert_eq!((buf[(5, next)].bg, buf[(0, next)].bg), (palette::color("tile"), Color::Reset));
     let ansi = to_ansi(buf);

@@ -10,11 +10,10 @@
 //! cell of padding inside. The usage panel has a half-block row (`▀` / `▄`
 //! in its colour on the canvas, [`pad_row`]) above and below it. List tiles
 //! (agents, NEEDS YOU cards, shell buttons) have NO pads: they stack edge to
-//! edge, so a card is exactly its two rows. A two-line card is TWO-TONE
-//! ([`TONES`]): its title row on the lighter `tile`, its detail row on the
-//! darker `tile_lo`, so every card starts with a visible bar and the next
-//! parts from it cleanly; one-row tiles stacked edge to edge alternate the
-//! same two ([`shade`]). Chips take a page out of the tmux status line (its
+//! edge, so a card is exactly its two rows, both in ONE colour; consecutive
+//! cards alternate the zebra's two shades ([`TONES`], [`shade`]: `tile`,
+//! the darker `tile_lo`), starting afresh under each space's header, so
+//! each card parts cleanly from the next. Chips take a page out of the tmux status line (its
 //! catppuccin blocks, square ends): a [`module`] is ` key ` bold in dark ink
 //! on a colour, then ` label ` on `surface0` (the spaces, the shells in one
 //! line, the scope toggle ` ⌥V `, the NEEDS YOU and PARKED counts, `+K`);
@@ -34,17 +33,18 @@
 //!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ┃ = where the pace expects it)
 //!
 //!  NEEDS YOU                        1   (the count a square chip)
-//!  ▌ g  1Password Sign-ins      ✓ 4m    cards: two-tone tiles tinted in the
-//!  ▌    Your four calls are done        state's colour, a ▌ stripe in it
+//!  ▌ g  1Password Sign-ins      ✓ 4m    cards: tiles tinted in the state's
+//!  ▌    Your four calls are done        colour (one tint each), a ▌ stripe
 //!
 //!  AGENTS            ⌥V  all spaces     (the scope: a module once it toggles)
 //! ▌  1  main   main          ◐2 ○3     a space header: a band tinted in its
 //!  ▌ d  Tmux Agent Sidebar ⠹ working    colour, ` N ` solid in it, the name
 //!  ▌  › Running cargo test        26s   bold in it; the client's space
 //!  ▎ q  Pause Resume Agents    ✓ done   `@space_here` (`2 cs35l▶`). Cards stack
-//!  ▎    Merged the pause key       2m   edge to edge, two-tone (title row
-//!     h  Canvas Syllabus         idle   `tile`, detail row `tile_lo`); the
-//!        Synced 4 assignments      1h   key-cap solid in the SPACE's colour;
+//!  ▎    Merged the pause key       2m   edge to edge, each one colour, the
+//!     h  Canvas Syllabus         idle   next the zebra's other (`tile` /
+//!        Synced 4 assignments      1h   `tile_lo`); the key-cap solid in the
+//!                                       SPACE's colour;
 //!                                       the client's agent `tile_hi`, a wide
 //! ▌  2 cs35l ▶  main            ○1     stripe; every agent two lines: working,
 //!  ▎ w  Eight Component Values ✓ done   its live activity (`›`, from its
@@ -176,9 +176,9 @@
 //!
 //! The canvas is the terminal's own background ([`Color::Reset`], and
 //! [`Ink::Canvas`] for a tiled row's margins), so the split is WezTerm's
-//! colour. Surfaces ([`palette::UI`]): `tile` / `tile_lo` (a card's two
-//! tones, and the zebra), `tile_hi` / `tile_hi_lo` (the client's agent's two
-//! tones; `tile_hi` the active shell too), NEEDS YOU cards and toast cards (their colour mixed over
+//! colour. Surfaces ([`palette::UI`]): `tile` / `tile_lo` (the zebra: cards
+//! alternate them), `tile_hi` (the client's agent, both rows, and the
+//! active shell), NEEDS YOU cards and toast cards (their colour mixed over
 //! the canvas, [`Ink::Mix`]), space headers (their `@space_color` at
 //! [`HEAD_TINT`]%, [`Ink::Tint`]), the stash selection (mauve, mixed), and
 //! the solid chips (key-caps, the key-table marks, the status-line
@@ -368,7 +368,7 @@ fn into_tile(row: Row, w: usize, bg: Ink) -> Row {
 /// of canvas, then half a row of the tile) or below it (`▀`): the tile's
 /// colour on the canvas, between the margins. Not a target, stands for no
 /// one. List tiles (agents, NEEDS YOU cards, shells) have no pads: they
-/// stack edge to edge, parted by their two tones ([`TONES`]).
+/// stack edge to edge, parted by the zebra ([`TONES`]).
 const PAD_TOP: char = '▄';
 const PAD_BOTTOM: char = '▀';
 
@@ -420,14 +420,13 @@ fn label_module(label: Vec<Seg>) -> Vec<Seg> {
     out
 }
 
-/// A list tile's two tones: (its title row, its detail row). A two-line
-/// card is two-tone, so cards stacked with no gap between them still part:
-/// every card starts with the lighter bar.
+/// The zebra's two shades: list tiles stacked edge to edge (agent cards,
+/// one row or two, the shells, the SPACES rows) alternate them, so every
+/// card is ONE colour and its neighbours the other.
 const TONES: (Hue, Hue) = ("tile", "tile_lo");
 
-/// The zebra for ONE-ROW tiles stacked edge to edge (one-line agents, the
-/// shells, the SPACES rows): the same two tones, alternating. (A two-line
-/// card needs no zebra: its own two tones part it from the next.)
+/// The `k`th tile of a run's shade ([`TONES`]); a run starts afresh under
+/// each space's header.
 fn shade(k: usize) -> Ink {
     Ink::Pal(if k.is_multiple_of(2) { TONES.0 } else { TONES.1 })
 }
@@ -1137,8 +1136,7 @@ fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
 /// home first) as one-row button tiles: the ⌥N key-cap, `⌂` on the home,
 /// the label. The session's active window is lifted like the client's
 /// agent (`tile_hi`, a blue stripe); one in prefix v's selection on mauve.
-/// They sit edge to edge in the zebra's two tones ([`shade`]: one-row
-/// tiles, no two-tone card), quieter than the agents: no state stripe but
+/// They sit edge to edge in the zebra's two shades ([`shade`]), quieter than the agents: no state stripe but
 /// the active one's. A button clicks through to its shell.
 fn shells_section(bar: &Bar, w: usize) -> Vec<Row> {
     if bar.shells.is_empty() {
@@ -1321,37 +1319,34 @@ fn short_title(a: &Agent) -> String {
     sanitize(if a.short_title.is_empty() { no_home(&a.title) } else { &a.short_title })
 }
 
-/// The two tones an agent's card sits on, (title row, detail row):
-/// prefix v's selection mauve, the client's own agent `tile_hi` /
-/// `tile_hi_lo`, else [`TONES`]. A one-row agent `k`th in its run sits on
-/// the zebra's ([`shade`]) unless lifted.
-fn agent_tones(a: &Agent, k: usize, two: bool) -> (Ink, Ink) {
+/// The ONE colour an agent's card sits on, both its rows: prefix v's
+/// selection mauve, the client's own agent `tile_hi`, else the zebra's
+/// shade for the `k`th card of its group ([`shade`]: consecutive cards
+/// alternate, so cards stacked with no gap still part).
+fn agent_bg(a: &Agent, k: usize) -> Ink {
     if a.selected {
-        (Ink::Mix("mauve", 18), Ink::Mix("mauve", 11))
+        Ink::Mix("mauve", 18)
     } else if a.is_current {
-        (Ink::Pal("tile_hi"), Ink::Pal("tile_hi_lo"))
-    } else if two {
-        (Ink::Pal(TONES.0), Ink::Pal(TONES.1))
+        Ink::Pal("tile_hi")
     } else {
-        (shade(k), shade(k))
+        shade(k)
     }
 }
 
-/// One agent as a two-tone card ([`agent_tones`]; `k`: its place in its
-/// run, for the zebra when it is one row): a state stripe down its left
-/// edge (`▎` in the state's colour; none when idle; the client's agent a
-/// wider `▌`, blue when idle; the selection's mauve), its key-cap in its
-/// space's colour (`space`), the title (bold unless idle), a flag (⚙
-/// workflow, ◎ cua), and the state word on the right, the age beside it;
-/// with `two`, a dim second line ([`second_line`], maybe blank) on the
-/// darker tone with the age at its end, so every agent row is the same
-/// height. Both lines click through.
+/// One agent as a card in one colour ([`agent_bg`]; `k`: its place in its
+/// group, for the zebra): a state stripe down its left edge (`▎` in the
+/// state's colour; none when idle; the client's agent a wider `▌`, blue
+/// when idle; the selection's mauve), its key-cap in its space's colour
+/// (`space`), the title (bold unless idle), a flag (⚙ workflow, ◎ cua), and
+/// the state word on the right, the age beside it; with `two`, a dim
+/// second line ([`second_line`], maybe blank) with the age at its end, so
+/// every agent row is the same height. Both lines click through.
 fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink) -> Vec<Row> {
     let w = inner(cx.w);
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
     let msg = (two && cx.seconds()).then(|| second_line(a, cx.now));
     let word = state_word(a, cx);
-    let (bg, bg2) = agent_tones(a, k, msg.is_some());
+    let bg = agent_bg(a, k);
     let busy = word.as_ref().filter(|x| x.word != "idle").map(|x| x.hue);
     let edge = if a.selected {
         seg("▌", "mauve")
@@ -1425,7 +1420,7 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink) -> Vec<Row> {
     } else {
         vec![edge, seg(" ".repeat(indent), "text"), seg(m, dimc)]
     };
-    let second = tile_row(cx.w, bg2, l2, r2).click(cx.w, go);
+    let second = tile_row(cx.w, bg, l2, r2).click(cx.w, go);
     vec![first, second]
 }
 
@@ -1540,9 +1535,10 @@ fn split_idle(sp: &Space, fold: bool, now: f64) -> (Vec<&Agent>, Vec<&Agent>) {
 }
 
 /// A space's agent cards in window-index order (the folded line last),
-/// stacked edge to edge (no pads: each two-line card's two tones part it
-/// from the next; one-line rows alternate the zebra's, [`shade`]); the
-/// agents in `two` get their second line.
+/// stacked edge to edge (no pads: consecutive cards alternate the zebra's
+/// two shades, [`shade`], afresh under each space's header, so each card is
+/// one colour and the next another); the agents in `two` get their second
+/// line.
 fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool) -> Vec<Row> {
     let (shown, idle) = split_idle(sp, fold, cx.now);
     let ink = space_colour(sp);
@@ -1551,9 +1547,8 @@ fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool) -> Vec<Row> {
         rows.extend(agent_rows(a, cx, two.contains(&key(a)), k, ink));
     }
     if !idle.is_empty() {
-        // After two-tone cards (their darker row last), the lighter tone.
-        let bg = if two.is_empty() || !cx.seconds() { shade(shown.len()) } else { Ink::Pal(TONES.0) };
-        rows.push(fold_row(&idle, cx, bg));
+        // The zebra goes on: the fold is the next card.
+        rows.push(fold_row(&idle, cx, shade(shown.len())));
     }
     rows
 }
@@ -1781,14 +1776,13 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
 
 // ---------------------------------------------------------------- needs you
 
-/// How strongly a NEEDS YOU card takes its state's colour: its title row
-/// and its detail row (a two-tone card, like the agents'); one-line cards
-/// edge to edge alternate the two.
-const NEED_TINT: [u8; 2] = [14, 8];
+/// How strongly a NEEDS YOU card takes its state's colour (one tint for the
+/// whole card): consecutive cards, edge to edge, alternate the two.
+const NEED_TINT: [u8; 2] = [14, 9];
 
-/// A NEEDS YOU card, a tile of 2 or 1 lines on its state colour mixed over
-/// the canvas (`tint`: [`NEED_TINT`]'s index for its first line; a second
-/// line takes the darker), a `▌` stripe in that colour; the key-cap (in
+/// A NEEDS YOU card, a tile of 2 or 1 lines all on its state colour mixed
+/// over the canvas (`tint`: [`NEED_TINT`]'s index, the zebra's), a `▌`
+/// stripe in that colour; the key-cap (in
 /// its space's colour, `space`), the title (bold), and on the right the
 /// state glyph and age. Line 2: the reason (a `perm` prompt says so), or
 /// the state in words.
@@ -1821,7 +1815,7 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
             }
             l2.push(seg(plain(&n.reason), "sub"));
         }
-        rows.push(card(Ink::Mix(hue, NEED_TINT[1]), l2, vec![seg(" ", "text")]));
+        rows.push(card(bg, l2, vec![seg(" ", "text")]));
     }
     rows
 }
@@ -1842,12 +1836,12 @@ fn needs_header(view: &ViewModel, w: usize) -> Row {
 }
 
 /// The whole NEEDS YOU section: its header and the cards, edge to edge
-/// (two-tone; one-line cards zebra-shaded). Never empty: with nothing
-/// pending it is the header saying so.
+/// (each one tint, consecutive cards alternating). Never empty: with
+/// nothing pending it is the header saying so.
 fn needs_block(view: &ViewModel, cx: Cx, lines: u8) -> Vec<Row> {
     let mut rows = vec![needs_header(view, cx.w)];
     for (k, n) in view.needs.iter().enumerate() {
-        let tint = usize::from(lines < 2 && k % 2 == 1);
+        let tint = usize::from(!k.is_multiple_of(2));
         rows.extend(need_rows(n, cx, lines, tint, space_ink(view, &n.agent.session)));
     }
     rows
@@ -2155,7 +2149,7 @@ pub struct Step {
 /// go (pure decoration, before anything that says something), then the
 /// SPACES list's reserve, then the cards' second lines. The spaces section
 /// takes what each leaves over. (No step has pads: list tiles stack edge
-/// to edge, two-tone, at every height.)
+/// to edge, in the zebra, at every height.)
 pub const STEPS: [Step; 4] = [
     Step { gaps: true, listed: true, lines: 2 },
     Step { gaps: false, listed: true, lines: 2 },
@@ -2260,7 +2254,7 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     // The SPACES and PARKED sections take the rows left over (the richest
     // form that fits: they are content); what they leave buys spacing back,
     // never detail: the agents' shape (and so the ladder's steps) is
-    // already settled. Never a gap between cards: they stack, two-tone.
+    // already settled. Never a gap between cards: they stack, in the zebra.
     let used = |n: &[Row], a: &[Row], g: [bool; 3]| top.len() + n.len() + a.len() + shells.len() + g.iter().filter(|x| **x).count();
     let room = h.saturating_sub(used(&needs, &agents, [gap_needs, gap_agents, gap_shells]));
     let (spaces, parked) = bottom(view, w, room, bar.prefix, opts.msg.as_deref());
