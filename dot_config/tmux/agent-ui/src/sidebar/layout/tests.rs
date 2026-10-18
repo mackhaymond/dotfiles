@@ -176,6 +176,22 @@ fn body(l: &str) -> &str {
     l.trim_start_matches([' ', '▎', '▌']).trim_end()
 }
 
+/// The agents section's space headers, in order: (row, its space).
+fn heads(f: &Frame) -> Vec<(usize, String)> {
+    f.agents
+        .clone()
+        .filter_map(|y| match f.rows[y].targets.as_slice() {
+            [(0, _, Target::Session(s))] => Some((y, s.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The row of `name`'s space header in the agents section.
+fn head(f: &Frame, name: &str) -> usize {
+    heads(f).into_iter().find(|(_, s)| s == name).map(|(y, _)| y).unwrap_or_else(|| panic!("no {name:?} header in {:#?}", texts(f)))
+}
+
 /// The parked row as drawn: a rounded button.
 fn parked(n: usize) -> String {
     if n == 0 { " PARKED none".to_string() } else { format!(" PARKED  {n} ") }
@@ -350,10 +366,9 @@ fn agents_lose_detail_last() {
 
 /// Rows a frame's step leaves over are spent on spacing, never on detail:
 /// while blank rows sit unused above the spaces, no section gap is missing
-/// (above AGENTS, SHELLS, NEEDS YOU), the NEEDS YOU cards have their pads
-/// unless they cost more than is left, and so do the gaps between spaces.
-/// The agents' pads never come back past the step that dropped them, and
-/// every agent row keeps one shape.
+/// (above AGENTS, SHELLS, NEEDS YOU), nor the gaps between spaces unless
+/// they cost more than is left. Never a pad between list tiles (cards stack
+/// two-tone), and every agent row keeps one shape.
 #[test]
 fn spare_rows_buy_spacing_back() {
     let bars = [Bar::default(), demo_bar(), Bar { prefix: true, ..demo_bar() }];
@@ -374,23 +389,14 @@ fn spare_rows_buy_spacing_back() {
                     if spare > 0 {
                         assert_eq!(gaps, [true; 3], "{ctx}: a blank run at the bottom, a section gap missing: {t:#?}");
                     }
-                    // The cards: all padded, or the pads cost more than is left.
-                    let cards = f.rows[f.needs.clone()].iter().filter(|r| r.covers.is_empty() && r.target_at(0).is_some()).count();
-                    let cut = t[f.needs.clone()].iter().any(|l| l.contains("need you"));
-                    let pads = t[f.needs.clone()].iter().filter(|l| is_pad(l)).count();
-                    let n = v.needs.len();
-                    assert!(pads == 0 || pads == n, "{ctx}: {t:#?}");
-                    if n > 0 && !cut && pads == 0 {
-                        assert!(spare < n, "{ctx}: {cards} card rows unpadded with {spare} spare: {t:#?}");
-                    }
                     // The spaces: a gap above every header but the first, or not enough left for all.
                     let missing = group_gaps(&f.rows[f.agents.clone()], usize::from(w));
                     if missing > 0 {
                         assert!(spare < missing, "{ctx}: {t:#?}");
                     }
-                    // Never the agents' pads past the step that dropped them.
-                    let agent_pads = t[f.agents.clone()].iter().any(|l| is_pad(l));
-                    assert!(!agent_pads || STEPS.get(usize::from(f.step)).is_some_and(|s| s.pads), "{ctx}: {t:#?}");
+                    // Never a pad between list tiles, whatever is spare.
+                    let lists = f.needs.start.min(f.agents.start)..f.shells.end.max(f.agents.end);
+                    assert!(!t[lists].iter().any(|l| is_pad(l)), "{ctx}: {t:#?}");
                     bought += usize::from(f.step > 0 && gaps == [true; 3]);
                 }
             }
@@ -399,7 +405,7 @@ fn spare_rows_buy_spacing_back() {
     assert!(bought > 0, "spacing never bought back");
     // A frame that asked for it (34x40, the shells in one line, rows left
     // over): the gap above AGENTS is back and the one above PARKED, nothing
-    // blank at the bottom; the agents keep their shape (no pads, zebra).
+    // blank at the bottom; the agents keep their shape (two-tone, no pads).
     let f = layout(&lettered(quiet()), 34, 40, &with_bar(demo_bar()));
     let t = texts(&f);
     assert_eq!((f.step, f.agents_step, f.shells.len()), (STEPS.len() as u8 - 1, 0, 1), "{t:#?}");
@@ -475,57 +481,63 @@ fn quiet_is_roomy() {
     assert!(t[0].starts_with(" agents") && t[0].ends_with("◉1 ◐2 ○8 "), "{:?}", t[0]);
     // The count: a small yellow pill.
     assert!(t[1].trim().is_empty() && t[2].starts_with(" NEEDS YOU") && t[2].ends_with(" 1  "), "{t:#?}");
-    // The card: a tile tinted in its state's colour with a yellow stripe;
-    // title, glyph and age; then the question; then its pad.
+    // The card: two-tone, tinted in its state's colour with a yellow stripe;
+    // title, glyph and age; then the question on the darker tint. No pad.
     assert!(t[3].starts_with(" ▌ Kua Yu focus timing") && t[3].ends_with("◉ 3m  "), "{:?}", t[3]);
     assert!(t[4].starts_with(" ▌ Which deck should I pull"), "{:?}", t[4]);
-    assert_eq!((f.rows[3].bg, f.rows[4].bg), (Some(Ink::Mix("yellow", 14)), Some(Ink::Mix("yellow", 14))));
+    assert_eq!((f.rows[3].bg, f.rows[4].bg), (Some(Ink::Mix("yellow", 14)), Some(Ink::Mix("yellow", 8))));
     assert_eq!((f.rows[3].segs[0].clone(), f.rows[3].segs[1].clone()), (bare(1), seg("▌", "yellow")));
-    assert_eq!(t[5], format!(" {} ", "▀".repeat(32)));
-    assert!(f.rows[5].segs.contains(&seg("▀".repeat(32), Ink::Mix("yellow", 14))) && f.rows[5].bg.is_none());
     // Then a gap, and the agents right under it.
-    assert!(t[6].trim().is_empty() && t[7].starts_with(" AGENTS") && t[7].ends_with("all spaces "), "{t:#?}");
-    assert_eq!(f.agents.start, 7);
-    // Space headers: on the canvas, a dot and the name, the counts on the right.
-    let main = find(&f, " ● main");
-    assert!(t[main].ends_with("◉1 ◐2 ○4 ") && f.rows[main].bg.is_none(), "{:?}", t[main]);
-    // The client's agent: lifted (`tile_hi`), a wide stripe in its state's
-    // colour, the spinner and its word; its message under it with the age;
-    // its pad under that, in its colour. A canvas margin either side.
+    assert!(t[5].trim().is_empty() && t[6].starts_with(" AGENTS") && t[6].ends_with("all spaces "), "{t:#?}");
+    assert_eq!(f.agents.start, 6);
+    // Space headers: a one-row tile tinted in the space's colour (peach: no
+    // colour of its own), the counts on the right; the client's space as
+    // `@space_here`, its chip ending in the arrow.
+    let main = head(&f, "main");
+    let peach = Ink::Pal("peach");
+    assert!(t[main].ends_with("◉1 ◐2 ○4  ") && f.rows[main].bg == Some(Ink::Mix("peach", HEAD_TINT)), "{:?}", t[main]);
+    assert!(f.rows[main].segs.contains(&block(" main ", "crust", peach)) && f.rows[main].segs.contains(&seg(ARROW, peach)), "{:?}", f.rows[main].segs);
+    // The client's agent: lifted (`tile_hi`, its detail on `tile_hi_lo`), a
+    // wide stripe in its state's colour, the spinner and its word; its
+    // message under it with the age; the next card right under that. A
+    // canvas margin either side.
     let r = find(&f, "Tmux Agent Sidebar");
     assert!(t[r].starts_with(" ▌ Tmux Agent Sidebar") && t[r].ends_with("⠋ working  "), "{:?}", t[r]);
     assert!(t[r + 1].starts_with(" ▌   Edit agent-roster.py") && t[r + 1].ends_with(" 2m  "), "{:?}", t[r + 1]);
-    assert_eq!((f.rows[r].bg, f.rows[r + 1].bg), (Some(Ink::Pal("tile_hi")), Some(Ink::Pal("tile_hi"))));
+    assert_eq!((f.rows[r].bg, f.rows[r + 1].bg), (Some(Ink::Pal("tile_hi")), Some(Ink::Pal("tile_hi_lo"))));
     assert_eq!(f.rows[r].segs[1], seg("▌", "blue"));
     assert_eq!((f.rows[r].segs[0].clone(), f.rows[r].segs.last().cloned()), (bare(1), Some(bare(1))));
-    assert!(is_pad(&t[r + 2]) && f.rows[r + 2].segs.contains(&seg("▀".repeat(32), "tile_hi")), "{t:#?}");
+    assert!(f.rows[r + 2].covers.len() == 1 && f.rows[r + 2].bg == Some(Ink::Pal("tile")), "{t:#?}");
     // A title gives way to the state word (and the flag stays); working:
-    // a blue stripe on a plain tile.
+    // a blue stripe on a plain two-tone card.
     let h = find(&f, "Handy.app Speech… ⚙");
     assert!(t[h].ends_with("⠋ working  ") && t[h + 1].starts_with(" ▎   Bash swift build"), "{t:#?}");
     assert_eq!((f.rows[h].bg, f.rows[h].segs[1].clone()), (Some(Ink::Pal("tile")), seg("▎", "blue")));
+    assert_eq!((f.rows[h + 1].bg, f.rows[h + 1].segs[1].clone()), (Some(Ink::Pal("tile_lo")), seg("▎", "blue")));
     // Recently done: the word, its message, a green stripe.
     let c = find(&f, "Commodities Job Track");
     assert!(t[c].ends_with("✓ done  ") && t[c + 1].starts_with(" ▎   7 fixes applied"), "{t:#?}");
     assert_eq!(f.rows[c].segs[1], seg("▎", "green"));
     // Idle: two lines like every agent, no stripe, the word on the first,
-    // the age under it; then its pad (no target, stands for no one).
+    // the age under it; the next card right under it.
     let n = find(&f, "Lost suit jacket");
     assert!(t[n].starts_with("   Lost suit") && t[n].ends_with(" idle  ") && t[n + 1].ends_with(" 6m  "), "{t:#?}");
-    assert_eq!(t[n + 2], format!(" {} ", "▀".repeat(32)));
-    assert!(f.rows[n + 2].targets.is_empty() && f.rows[n + 2].covers.is_empty() && f.rows[n + 3].covers.len() == 1, "{t:#?}");
-    // Every tile has its pad: the section is headers, tiles and pads (and
-    // the gaps between spaces), nothing else.
+    assert!(f.rows[n + 2].covers.len() == 1 && t[n + 2].contains("Backyard"), "{t:#?}");
+    // No pads: the section is headers, two-tone cards and the gaps between
+    // spaces, nothing else.
     for y in f.agents.clone().skip(1) {
         let r = &f.rows[y];
-        assert!(r.text().trim().is_empty() || is_pad(&t[y]) || r.bg == Some(Ink::Pal("tile")) || r.bg == Some(Ink::Pal("tile_hi"))
-            || t[y].starts_with(" ● "), "{y}: {t:#?}");
+        let tone = |n: &'static str| r.bg == Some(Ink::Pal(n));
+        let title = r.covers.len() == 1 && (tone("tile") || tone("tile_hi"));
+        let detail = r.covers.is_empty() && (tone("tile_lo") || tone("tile_hi_lo"));
+        assert!(!is_pad(&t[y]) && (is_blank(r) || title || detail || is_group_header(r, 34)), "{y}: {t:#?}");
+        assert!(!title || f.rows[y + 1].covers.is_empty(), "{y}: a title row, then its detail {t:#?}");
     }
     assert!(t[find(&f, "Notch Tasks Orchestrator")].ends_with(" idle  "), "{t:#?}");
-    // A blank row between groups (after the last tile's pad), in ⌃N (here:
-    // name) order.
-    let bai = find(&f, " ● bai");
-    assert!(t[main - 1].trim().is_empty() && is_pad(&t[main - 2]) && bai < main, "{t:#?}");
+    // A blank row between groups (after the last card's detail row), in ⌃N
+    // (here: name) order.
+    let bai = head(&f, "bai");
+    assert!(t[main - 1].trim().is_empty() && f.rows[main - 2].bg == Some(Ink::Pal("tile_lo")) && bai < main, "{t:#?}");
     // SPACES: a gap, its header and a row per space in ⌃N (here: name)
     // order, each with its counts; then a gap and PARKED: one line, its
     // count, never the parked tab itself. Spare rows above them.
@@ -548,22 +560,24 @@ fn busy_squeezes_spaces_and_cards_before_agents() {
     let v = busy();
     let at = |h: u16| layout(&v, 34, h, &Opts::default());
     let first = |p: &dyn Fn(&Frame) -> bool| (20..120).rev().map(at).find(|f| p(f)).unwrap();
-    // 24 agents, two lines each and a pad under each: full detail in 120
-    // rows, gaps and all.
-    let f = at(120);
-    assert!(f.step == 0 && texts(&f).iter().any(|l| is_pad(l)), "{:#?}", texts(&f));
-    // Shorter: the gaps go, then the cards' pads, then the agents' (the
-    // cards still two lines), all before any agent loses detail.
+    // 24 agents, two lines each, stacked two-tone (no pads): full detail in
+    // 90 rows, gaps and all (in 80 the section gaps still, bought back).
+    let f = at(90);
+    assert!(f.step == 0 && f.agents_step == 0 && !texts(&f).iter().any(|l| is_pad(l)), "{:#?}", texts(&f));
+    // Shorter: the gaps go, then the SPACES list's reserve (the cards
+    // still two lines), all before any agent loses detail.
     let f = first(&|f| f.step > 0);
     assert_eq!(f.agents_step, 0, "{:#?}", texts(&f));
-    let f = first(&|f| !texts(f)[f.needs.clone()].iter().any(|l| is_pad(l)));
-    assert!(texts(&f)[f.agents.clone()].iter().any(|l| is_pad(l)) && f.agents_step == 0, "{:#?}", texts(&f));
-    let f = first(&|f| !texts(f)[f.agents.clone()].iter().any(|l| is_pad(l)));
+    let f = first(&|f| f.step > 1);
     let card_lines = f.rows[f.needs.clone()].iter().filter(|r| r.bg.is_some()).count();
-    assert_eq!((f.step, f.agents_step, card_lines), (3, 0, 2 * v.needs.len()), "{:#?}", texts(&f));
-    // Without pads, adjacent tiles alternate the zebra's two shades.
-    let bgs: Vec<Option<Ink>> = f.rows[f.agents.clone()].iter().filter(|r| r.covers.len() == 1).map(|r| r.bg).collect();
-    assert!(bgs.contains(&Some(Ink::Pal("tile"))) && bgs.contains(&Some(Ink::Pal("tile_alt"))), "{bgs:?}");
+    assert_eq!((f.step, f.agents_step, card_lines), (2, 0, 2 * v.needs.len()), "{:#?}", texts(&f));
+    // Every card two-tone: its title row lighter, its detail row darker.
+    for y in f.agents.clone().filter(|&y| f.rows[y].covers.len() == 1) {
+        let pair = (f.rows[y].bg, f.rows[y + 1].bg);
+        assert!(matches!(pair, (Some(Ink::Pal("tile")), Some(Ink::Pal("tile_lo"))) | (Some(Ink::Pal("tile_hi")), Some(Ink::Pal("tile_hi_lo")))), "{y}: {pair:?}");
+    }
+    let f = first(&|f| f.step > 2);
+    assert_eq!((f.step, f.agents_step), (3, 0), "{:#?}", texts(&f));
     // Shorter still: the agents compress, every one of them the same height.
     for step in [1, 2, 3] {
         let f = (20..90).rev().map(at).find(|f| f.agents_step == step).unwrap();
@@ -640,12 +654,12 @@ fn click_targets() {
     let f = layout(&v, 34, 58, &Opts::default());
     let go = |win: &str| Some(Target::Go { win: win.into(), session: "main".into() });
     // Both lines of an agent tile, anywhere (its margins too), and both
-    // lines of the card; never their pads.
+    // lines of the card; the next card right under it is the next agent's.
     let r = find(&f, "Tmux Agent Sidebar") as u16;
     assert_eq!(f.target(5, r).cloned(), go("@2"));
     assert_eq!(f.target(0, r + 1).cloned(), go("@2"));
     assert_eq!(f.target(33, r + 1).cloned(), go("@2"));
-    assert_eq!(f.target(5, r + 2), None);
+    assert_eq!(f.target(5, r + 2).cloned(), go("@3"));
     let card = find(&f, "▌ Kua Yu") as u16;
     for y in card..card + 2 {
         assert_eq!(f.target(0, y).cloned(), go("@3"));
@@ -653,8 +667,8 @@ fn click_targets() {
     }
     assert_eq!(f.target(5, card + 2), None);
     // Space headers and SPACES rows (anywhere on them) go to the session.
-    let hd = find(&f, " ● bai") as u16;
-    assert_eq!(f.target(20, hd).cloned(), Some(Target::Session("bai".into())));
+    let hd = head(&f, "bai") as u16;
+    assert_eq!((f.target(0, hd).cloned(), f.target(20, hd).cloned()), (Some(Target::Session("bai".into())), Some(Target::Session("bai".into()))));
     let s = f.spaces.start as u16;
     for (y, name) in [(s + 2, "bai"), (s + 3, "main"), (s + 4, "schedule")] {
         assert_eq!((f.target(0, y), f.target(33, y)), (Some(&Target::Session(name.into())), Some(&Target::Session(name.into()))));
@@ -705,9 +719,9 @@ fn titles_and_second_lines() {
     let t = texts(&f);
     let at = |s: &str| f.agents.start + agents_part(&f).iter().position(|l| l.contains(s)).unwrap_or_else(|| panic!("{s}: {t:#?}"));
     // Working with last turn's outcome: a second line with just the age,
-    // never the old outcome; then its pad, then the next agent.
+    // never the old outcome; then, right under it, the next agent.
     let c = at("Commodities Job Tracker");
-    assert!(!t[c].contains("~/") && body(&t[c + 1]) == "1m" && is_pad(&t[c + 2]) && f.rows[c + 3].covers.len() == 1, "{t:#?}");
+    assert!(!t[c].contains("~/") && body(&t[c + 1]) == "1m" && f.rows[c + 2].covers.len() == 1, "{t:#?}");
     // Working with what it runs: plain text under it; `project/` dropped.
     let r = at("Tmux Agent Sidebar");
     assert!(!t[r].contains("tmux/") && t[r + 1].starts_with(" ▎   cargo test "), "{:?}", t[r + 1]);
@@ -786,10 +800,7 @@ fn groups_and_pills_share_the_space_order() {
     );
     let f = layout(&v, 60, 58, &Opts::default());
     let t = texts(&f);
-    let group_order: Vec<String> = agents_part(&f)
-        .iter()
-        .filter_map(|l| l.strip_prefix(" ● ").map(|r| r.split_whitespace().next().unwrap().to_string()))
-        .collect();
+    let group_order: Vec<String> = heads(&f).into_iter().map(|(_, s)| s).collect();
     let pills = uncapped(&t[f.spaces.start + 1..f.spaces.end].join(" "));
     let pill_order: Vec<&str> = ["main", "bai", "cua-notch", "zeta", "aaa", "hidden"]
         .into_iter()
@@ -835,9 +846,11 @@ fn spaces_wear_their_colour() {
     // light one, light on a dark one; peach for a colour tmux cannot read).
     assert!(row(&f, "bai").segs.contains(&block(" 2 ", "text", Ink::Idx(24))), "{:?}", row(&f, "bai").segs);
     assert!(row(&f, "zeta").segs.contains(&block(" 3 ", "crust", "peach")), "{:?}", row(&f, "zeta").segs);
-    // Space headers: the dot in the space's colour.
-    let hd = &f.rows[find(&f, " ● bai")];
-    assert_eq!(hd.segs[1], seg("● ", Ink::Idx(24)));
+    // Space headers: the same chip, on a tint of the space's colour; a dark
+    // colour's name in plain text (it would not read on its own tint).
+    let hd = &f.rows[head(&f, "bai")];
+    assert!(hd.segs.contains(&block(" 2 ", "text", Ink::Idx(24))) && hd.segs.contains(&bold("bai", "text")), "{:?}", hd.segs);
+    assert_eq!(hd.bg, Some(tint(Ink::Idx(24), HEAD_TINT)));
     // An alert space's row counts it; a current space with no colour is
     // peach (the status line's), red while the prefix is armed.
     let v = view(vec![a("main", 1, "running", "M"), a("bai", 1, "needs-input", "B")], Some("@1"));
@@ -846,6 +859,194 @@ fn spaces_wear_their_colour() {
     assert!(row(&f, "main").segs.contains(&block(" main ", "crust", "peach")), "{:?}", row(&f, "main").segs);
     let f = layout(&v, 34, 40, &with_bar(Bar { prefix: true, ..Bar::default() }));
     assert!(row(&f, "main").segs.contains(&block(" main ", "crust", "red")), "{:?}", row(&f, "main").segs);
+    // (The header never goes red: it keeps the colour its agents' caps wear.)
+    let hd = &f.rows[head(&f, "main")];
+    assert!(hd.segs.contains(&block(" main ", "crust", "peach")) && hd.segs.contains(&seg(ARROW, "peach")), "{:?}", hd.segs);
+}
+
+/// Two coloured, indexed spaces, the client in cs35l; letters as the
+/// sidebar gives them.
+fn coloured() -> ViewModel {
+    lettered(view(
+        vec![
+            a("main", 1, "running", "Canvas Syllabus").with("space_index", "1").with("space_color", "#b4befe"),
+            a("main", 2, "idle", "Tmux sidebar hotkeys"),
+            a("cs35l", 1, "needs-input", "Eight Component Values").with("space_index", "2").with("space_color", "#94e2d5")
+                .with("detail_kind", "ask").with("detail", "Which one?"),
+            a("cs35l", 2, "idle", "Lab 3"),
+        ],
+        Some("@3"),
+    ))
+}
+
+/// A space's header in AGENTS reads like its SPACES row: ` N ` solid in
+/// the space's colour (dark ink), the name bold in that colour, the branch
+/// quieter, the counts right; but shaped unlike a card: a band across the
+/// whole width tinted in the colour, a `▌` block in it at the edge, its chip
+/// in the key-cap column (lined up with its agents' letter chips); the
+/// client's space as `@space_here` (number and name in one chip ending in
+/// the arrow), in both scopes.
+#[test]
+fn space_headers_read_like_their_spaces_rows() {
+    let lav = Ink::Rgb(0xb4, 0xbe, 0xfe);
+    let teal = Ink::Rgb(0x94, 0xe2, 0xd5);
+    let mut v = coloured();
+    for sp in v.spaces.iter_mut().filter(|s| s.name == "main") {
+        sp.branch = "trunk".into();
+    }
+    let f = layout(&v, 42, 62, &Opts::default());
+    let t = texts(&f);
+    let (m, c) = (head(&f, "main"), head(&f, "cs35l"));
+    // Another space: its number chip, its name bold in its colour, the branch dim.
+    let main = &f.rows[m];
+    assert!(main.segs.contains(&block(" 1 ", "crust", lav)) && main.segs.contains(&bold("main", lav)), "{:?}", main.segs);
+    assert!(main.segs.contains(&seg("  \u{e0a0} trunk", "sub")) && t[m].ends_with("◐1 ○1  "), "{:?}", t[m]);
+    // A band: the edge block on the tint, no canvas margin (a card has one).
+    assert_eq!((main.bg, main.segs[0].clone()), (Some(Ink::Tint(0xb4, 0xbe, 0xfe, HEAD_TINT)), seg("▌", lav)));
+    assert!(!main.segs.iter().any(|s| s.bg == Some(Ink::Canvas)), "{:?}", main.segs);
+    // The client's: `@space_here`, the arrow tail, so "where am I" reads at once.
+    let here = &f.rows[c];
+    assert!(here.segs.contains(&block(" 2 cs35l ", "crust", teal)) && here.segs.contains(&seg(ARROW, teal)), "{:?}", here.segs);
+    assert!(t[c].starts_with("▌  2 cs35l \u{e0b0}") && here.bg == Some(Ink::Tint(0x94, 0xe2, 0xd5, HEAD_TINT)), "{:?}", t[c]);
+    assert_eq!(heads(&f).iter().filter(|(y, _)| t[*y].contains(ARROW)).count(), 1, "{t:#?}");
+    // The header's chip starts in its agents' key-cap column.
+    let first = f.rows[m + 1].clone();
+    assert_eq!((col(&t[m], " 1 "), col(&t[m + 1], &first.segs[2].text)), (2, 2), "{:?} / {:?}", t[m], t[m + 1]);
+    assert!(first.covers.len() == 1 && first.segs[2].bg == Some(lav), "{:?}", first.segs);
+    // The tint is a wash: well under the colour.
+    let (r, g, b) = super::super::status::ink_rgb(here.bg.unwrap());
+    assert!(r < 0x48 && g < 0x58 && b < 0x58, "{:?}", (r, g, b));
+    // Space scope: the same header.
+    let mut sv = coloured();
+    sv.scope.session = Some("cs35l".into());
+    let f = layout(&sv, 42, 62, &Opts::default());
+    let c = head(&f, "cs35l");
+    assert!(f.rows[c].segs.contains(&block(" 2 cs35l ", "crust", teal)) && f.rows[c].segs.contains(&seg(ARROW, teal)), "{:#?}", texts(&f));
+    // Collapsed, it still reads so (and stands for its agents).
+    let f = (8..40).rev().map(|h| layout(&v, 42, h, &Opts::default())).find(|f| f.agents_step >= 4).expect("a collapsed frame");
+    let collapsed: Vec<(usize, String)> = heads(&f).into_iter().filter(|(y, _)| !f.rows[*y].covers.is_empty()).collect();
+    assert!(!collapsed.is_empty(), "{:#?}", texts(&f));
+    for (y, name) in collapsed {
+        let sp = v.spaces.iter().find(|s| s.name == name).unwrap();
+        let mine: Vec<(String, String)> = sp.agents.iter().map(|a| (a.session.clone(), a.window_id.clone())).collect();
+        // It stands for its agents (all, or all but the one shown under it).
+        assert!(f.rows[y].covers.iter().all(|c| mine.contains(c)) && f.rows[y].covers.len() + 1 >= mine.len(), "{name}: {:#?}", texts(&f));
+        let ink = if name == "main" { lav } else { teal };
+        assert!(f.rows[y].segs.iter().any(|s| s.bg == Some(ink)) && f.rows[y].segs[0] == seg("▌", ink), "{name}: {:#?}", texts(&f));
+    }
+}
+
+/// A header is plainly not a card whatever its space's hue: for every
+/// catppuccin accent its band sits well away from `tile` (and `tile_lo`),
+/// and its quieter text (`sub`: the branch, the idle count) still reads.
+#[test]
+fn headers_stand_apart_from_cards_in_every_hue() {
+    const ACCENTS: [(u8, u8, u8); 14] = [
+        (0xf5, 0xe0, 0xdc), (0xf2, 0xcd, 0xcd), (0xf5, 0xc2, 0xe7), (0xcb, 0xa6, 0xf7), (0xf3, 0x8b, 0xa8), (0xeb, 0xa0, 0xac),
+        (0xfa, 0xb3, 0x87), (0xf9, 0xe2, 0xaf), (0xa6, 0xe3, 0xa1), (0x94, 0xe2, 0xd5), (0x89, 0xdc, 0xeb), (0x74, 0xc7, 0xec),
+        (0x89, 0xb4, 0xfa), (0xb4, 0xbe, 0xfe),
+    ];
+    let lin = |v: u8| {
+        let s = f64::from(v) / 255.0;
+        if s <= 0.03928 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    };
+    let lum = |(r, g, b): (u8, u8, u8)| 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+    let contrast = |a, b| {
+        let (x, y): (f64, f64) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    };
+    let dist = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+        let d = |x: u8, y: u8| (f64::from(x) - f64::from(y)).powi(2);
+        (d(a.0, b.0) + d(a.1, b.1) + d(a.2, b.2)).sqrt()
+    };
+    for (r, g, b) in ACCENTS {
+        let band = super::super::status::ink_rgb(tint(Ink::Rgb(r, g, b), HEAD_TINT));
+        for card in ["tile", "tile_lo"] {
+            let d = dist(band, palette::rgb(card));
+            assert!(d >= 20.0, "#{r:02x}{g:02x}{b:02x} vs {card}: {d:.1}");
+        }
+        // (Yellow's band is the lightest: about 3.9.)
+        let c = contrast(palette::rgb("sub"), band);
+        assert!(c >= 3.75, "#{r:02x}{g:02x}{b:02x}: sub at {c:.2}");
+        // Its name, bold in the colour itself, reads on its own band.
+        assert!(contrast((r, g, b), band) >= 4.5, "#{r:02x}{g:02x}{b:02x}");
+    }
+}
+
+/// Every agent's letter chip wears its SPACE's colour (dark ink, bold), the
+/// header's chip colour, in AGENTS and in NEEDS YOU alike: an agent says
+/// where it lives even mid-list. While ⌥W is armed every cap is inverted
+/// (peach on crust), unlike any space's chip, a peach one included.
+#[test]
+fn letter_chips_wear_their_space_colour() {
+    let lav = Ink::Rgb(0xb4, 0xbe, 0xfe);
+    let teal = Ink::Rgb(0x94, 0xe2, 0xd5);
+    let v = coloured();
+    let f = layout(&v, 42, 62, &Opts::default());
+    let chip = |y: usize| f.rows[y].segs[2].clone();
+    for (title, ink) in [("Canvas Syllabus", lav), ("Tmux sidebar hotkeys", lav), ("Lab 3", teal)] {
+        let y = f.agents.start + agents_part(&f).iter().position(|l| l.contains(title)).unwrap();
+        let c = chip(y);
+        assert_eq!((c.fg, c.bg, c.bold, c.text.trim().len()), (Ink::Pal("crust"), Some(ink), true, 1), "{title}: {c:?}");
+        // The same colour as its header's number chip.
+        let hd = heads(&f).into_iter().rev().find(|(h, _)| *h < y).unwrap().0;
+        assert!(f.rows[hd].segs.iter().any(|s| s.bg == Some(ink)), "{title}");
+    }
+    // The NEEDS YOU card (cs35l's): teal too.
+    let card = f.needs.clone().find(|&y| f.rows[y].covers.is_empty() && texts(&f)[y].contains("Eight")).unwrap();
+    assert_eq!(chip(card).bg, Some(teal));
+    // ⌥W armed: every cap inverted.
+    let f = layout(&v, 42, 62, &with_bar(Bar { jump: true, ..Bar::default() }));
+    let y = find(&f, "Lab 3");
+    let s = &f.rows[y].segs[2];
+    assert_eq!((s.fg, s.bg, s.bold), (Ink::Pal("peach"), Some(Ink::Pal("crust")), true), "{s:?}");
+    // A colourless space (peach, the status line's default) and a peach
+    // one: their caps never look armed, and armed they all change.
+    let v = lettered(view(
+        vec![a("plain", 1, "idle", "Colourless"), a("warm", 1, "idle", "Peachy").with("space_color", "#fab387")],
+        Some("@1"),
+    ));
+    let cap = |f: &Frame, title: &str| f.rows[find(f, title)].segs[2].clone();
+    let (calm, armed) = (layout(&v, 42, 40, &Opts::default()), layout(&v, 42, 40, &with_bar(Bar { jump: true, ..Bar::default() })));
+    for title in ["Colourless", "Peachy"] {
+        let (c, a) = (cap(&calm, title), cap(&armed, title));
+        assert!(c.bg.is_some_and(|b| ink_rgb(b) == palette::rgb("peach")) && c.fg == Ink::Pal("crust"), "{title}: {c:?}");
+        assert_eq!((a.fg, a.bg, a.text.clone()), (Ink::Pal("peach"), Some(Ink::Pal("crust")), c.text.clone()), "{title}");
+        assert_ne!(a, c, "{title}");
+    }
+}
+
+/// Cards stack edge to edge: no pad row between them (NEEDS YOU, agents,
+/// shells), at any size; each two-line card two-tone (the title row on the
+/// lighter tone, the detail row on the darker), so every card starts with
+/// a visible bar.
+#[test]
+fn cards_stack_two_tone_without_pads() {
+    for (name, v) in all().into_iter().chain([("coloured", coloured())]) {
+        for (w, h) in [34u16, 24].into_iter().flat_map(|w| (8u16..=90).map(move |h| (w, h))) {
+            let f = layout(&v, w, h, &with_bar(demo_bar()));
+            let t = texts(&f);
+            let name = format!("{name} {w}x{h}");
+            let lists = f.needs.start..f.shells.end.max(f.agents.end);
+            assert!(!t[lists.clone()].iter().any(|l| is_pad(l)), "{name} {h}: {t:#?}");
+            for y in lists {
+                let r = &f.rows[y];
+                // A two-line card's title row: its detail row right under it, darker.
+                if r.covers.len() == 1 && f.rows.get(y + 1).is_some_and(|n| n.covers.is_empty() && n.targets == r.targets) {
+                    let (a, b) = (r.bg.unwrap(), f.rows[y + 1].bg.unwrap());
+                    let lum = |i: Ink| {
+                        let (r, g, b) = super::super::status::ink_rgb(i);
+                        u32::from(r) + u32::from(g) + u32::from(b)
+                    };
+                    assert!(lum(a) > lum(b), "{name} {h} {y}: {a:?} over {b:?}");
+                }
+            }
+        }
+    }
+    // A NEEDS YOU card too: its tint, then the darker one.
+    let f = layout(&quiet(), 34, 58, &Opts::default());
+    let k = find(&f, "▌ Kua Yu");
+    assert_eq!((f.rows[k].bg, f.rows[k + 1].bg), (Some(Ink::Mix("yellow", NEED_TINT[0])), Some(Ink::Mix("yellow", NEED_TINT[1]))));
 }
 
 #[test]
@@ -942,29 +1143,36 @@ fn with_bar(bar: Bar) -> Opts {
 }
 
 /// Every agent row and NEEDS YOU card shows its letter as a key-cap (a
-/// raised chip on its tile), in both scopes; peach while ⌥W's jump table
-/// is armed; blank past 26.
+/// solid chip in its space's colour), in both scopes; peach while ⌥W's
+/// jump table is armed; blank past 26.
 #[test]
 fn letter_key_caps_lead_every_agent_row_and_card() {
-    let v = lettered(quiet());
+    let mut v = lettered(quiet());
+    let green = Ink::Rgb(0xa6, 0xe3, 0xa1);
+    for sp in v.spaces.iter_mut().filter(|s| s.name == "main") {
+        sp.color = "#a6e3a1".into();
+    }
     let f = layout(&v, 34, 58, &Opts::default());
     let t = texts(&f);
     let r = find(&f, "Tmux Agent Side");
     assert!(t[r].starts_with(" ▌ f  Tmux Agent Side"), "{:?}", t[r]);
     assert!(t[r + 1].starts_with(" ▌    Edit agent-roster.py"), "{:?}", t[r + 1]);
-    assert_eq!(f.rows[r].segs[2], on(" f ", "sub", "surface1"));
+    assert_eq!(f.rows[r].segs[2], block(" f ", "crust", green));
     let c = find(&f, "▌ g  Kua Yu focus timing");
-    assert_eq!(f.rows[c].segs[2], on(" g ", "sub", "surface1"));
+    assert_eq!(f.rows[c].segs[2], block(" g ", "crust", green));
     assert!(t[c + 1].starts_with(" ▌    Which deck"), "{t:#?}");
     let i = find(&f, "▎ h  Commodities Job");
-    assert_eq!(f.rows[i].segs[2], on(" h ", "sub", "surface1"));
+    assert_eq!(f.rows[i].segs[2], block(" h ", "crust", green));
+    // Another space's (no colour of its own): peach, the status line's.
+    let b = find(&f, "Application link");
+    assert_eq!(f.rows[b].segs[2].bg, Some(Ink::Pal("peach")));
     // Space scope: the same letters.
     let mut sv = lettered(quiet());
     sv.scope.session = Some("main".into());
     let f = layout(&sv, 34, 58, &Opts::default());
     find(&f, " f  Tmux Agent Side");
     find(&f, "▌ g  Kua Yu");
-    // ⌥W armed (key table `jump`): every cap peach; the mark and the hint a
+    // ⌥W armed (key table `jump`): every cap inverted (peach on crust); the mark and the hint a
     // tab on the panel's top pad, the panel no taller for it.
     let f = layout(&v, 34, 58, &with_bar(Bar { jump: true, ..demo_bar() }));
     let top = &f.rows[f.card.start];
@@ -972,9 +1180,9 @@ fn letter_key_caps_lead_every_agent_row_and_card() {
     assert_eq!(top.text(), format!(" ▄ ⌥W jump  type a letter {} ", "▄".repeat(7)));
     assert_eq!(f.card, layout(&v, 34, 58, &with_bar(demo_bar())).card);
     let r = find(&f, "Tmux Agent Side");
-    assert_eq!(f.rows[r].segs[2], block(" f ", "crust", "peach"));
+    assert_eq!(f.rows[r].segs[2], block(" f ", "peach", "crust"));
     let c = find(&f, "▌ g  Kua Yu");
-    assert_eq!(f.rows[c].segs[2], block(" g ", "crust", "peach"));
+    assert_eq!(f.rows[c].segs[2], block(" g ", "peach", "crust"));
     // Narrow: the hint gives way, the mark stays whole, the pad's ends too.
     let f = layout(&v, 22, 58, &with_bar(Bar { jump: true, ..demo_bar() }));
     let top = f.rows[f.card.start].text();
@@ -1052,36 +1260,39 @@ fn shells_list_under_the_agents() {
     let t = texts(&f);
     assert!(f.shells.start >= f.agents.end, "{t:#?}");
     let s = f.shells.start;
-    // Each button with its pad.
-    assert_eq!(f.shells.len(), 7, "{t:#?}");
+    // One-row buttons edge to edge, no pads, the zebra's two tones (the
+    // active one lifted).
+    assert_eq!(f.shells.len(), 4, "{t:#?}");
     assert_eq!(t[s].trim_end(), " SHELLS");
     assert_eq!(t[s + 1].trim_end(), "   ⌥1  ⌂ ~");
-    assert_eq!(t[s + 3].trim_end(), " ▌ ⌥2  nvim");
-    assert_eq!(t[s + 5].trim_end(), "   ⌥3  proj");
-    assert!([s + 2, s + 4, s + 6].iter().all(|&y| is_pad(&t[y]) && f.rows[y].targets.is_empty()), "{t:#?}");
-    assert_eq!((f.rows[s + 1].bg, f.rows[s + 3].bg), (Some(Ink::Pal("tile")), Some(Ink::Pal("tile_hi"))));
-    assert_eq!(f.rows[s + 3].segs[1], seg("▌", "blue"));
-    assert!(f.rows[s + 3].segs.iter().any(|x| x.text == "nvim" && x.bold));
+    assert_eq!(t[s + 2].trim_end(), " ▌ ⌥2  nvim");
+    assert_eq!(t[s + 3].trim_end(), "   ⌥3  proj");
+    let bgs: Vec<Option<Ink>> = (s + 1..s + 4).map(|y| f.rows[y].bg).collect();
+    assert_eq!(bgs, [Some(Ink::Pal("tile")), Some(Ink::Pal("tile_hi")), Some(Ink::Pal("tile"))]);
+    let twins = layout(&v, 34, 62, &with_bar(Bar { shells: demo_bar().shells.into_iter().map(|s| Shell { active: false, ..s }).collect(), ..demo_bar() }));
+    let s2 = twins.shells.start;
+    let bgs: Vec<Option<Ink>> = (s2 + 1..s2 + 4).map(|y| twins.rows[y].bg).collect();
+    assert_eq!(bgs, [Some(Ink::Pal("tile")), Some(Ink::Pal("tile_lo")), Some(Ink::Pal("tile"))]);
+    assert_eq!(f.rows[s + 2].segs[1], seg("▌", "blue"));
+    assert!(f.rows[s + 2].segs.iter().any(|x| x.text == "nvim" && x.bold));
     let shell = |win: &str| Some(Target::Shell { win: win.into(), session: "main".into() });
-    for (y, win) in [(s + 1, "@901"), (s + 3, "@902"), (s + 5, "@903")] {
+    for (y, win) in [(s + 1, "@901"), (s + 2, "@902"), (s + 3, "@903")] {
         let y = y as u16;
         assert_eq!((f.target(0, y).cloned(), f.target(33, y).cloned()), (shell(win), shell(win)));
     }
     assert_eq!(f.target(3, s as u16), None);
-    // Under the last agent's pad; a blank row before it too while the gaps last.
-    assert!(is_pad(&t[s - 1]), "{t:#?}");
-    let tall = layout(&v, 34, 80, &with_bar(demo_bar()));
-    assert!(tall.step == 0 && texts(&tall)[tall.shells.start - 1].trim().is_empty(), "{:#?}", texts(&tall));
+    // Under the agents, a blank row before it while the gaps last.
+    assert!(t[s - 1].trim().is_empty() && f.step == 0, "{t:#?}");
     // No shells, no section.
     let f = layout(&v, 34, 58, &with_bar(Bar { shells: vec![], ..demo_bar() }));
     assert!(f.shells.is_empty() && !texts(&f).iter().any(|l| l.contains("SHELLS")));
-    // Short: the pads go, then one line of buttons before the agents lose
-    // any detail, then kept in one line while they compress.
+    // Short: one line of buttons before the agents lose any detail, then
+    // kept in one line while they compress.
     let v = busy();
     for h in 12u16..=120 {
         let f = layout(&v, 34, h, &with_bar(demo_bar()));
         let t = texts(&f);
-        assert!([7, 4, 1].contains(&f.shells.len()), "{h}: {t:#?}");
+        assert!([4, 1].contains(&f.shells.len()), "{h}: {t:#?}");
         if f.shells.len() == 1 {
             assert!(t[f.shells.start].starts_with(" SHELLS ") && t[f.shells.start].contains("nvim"), "{h}: {t:#?}");
         } else {
@@ -1111,7 +1322,7 @@ fn shells_line_counts_what_does_not_fit() {
     let t = shells_line(&bar, 200)[0].text();
     assert!(t.starts_with(" SHELLS  ⌥1  ⌂sh1   ⌥2  sh2 "), "{t:?}");
     assert!(t.contains(" ⌥9  sh9   sh10   sh11 "), "{t:?}");
-    assert!(shells_line(&Bar::default(), 34).is_empty() && shells_section(&Bar::default(), 34, true).is_empty());
+    assert!(shells_line(&Bar::default(), 34).is_empty() && shells_section(&Bar::default(), 34).is_empty());
 }
 
 /// A meter's bar as (glyph, ink) cells: from its fourth cell, the `━` and
@@ -1213,8 +1424,9 @@ fn the_stash_selection_tints_rows_and_shows_its_keys() {
     let f = layout(&v, 34, 40, &with_bar(bar.clone()));
     let t = texts(&f);
     let r = find(&f, "Sel one");
-    for row in &f.rows[r..r + 2] {
-        assert_eq!(row.bg, Some(Ink::Mix("mauve", 18)), "{:?}", row.text());
+    // (Two-tone like every card: the detail row the lighter mauve.)
+    for (row, pct) in f.rows[r..r + 2].iter().zip([18, 11]) {
+        assert_eq!(row.bg, Some(Ink::Mix("mauve", pct)), "{:?}", row.text());
         assert_eq!(row.segs[1], seg("▌", "mauve"));
     }
     let p = find(&f, "Plain");
@@ -1298,7 +1510,7 @@ fn space_scope_shows_one_session() {
     let b = agents_part(&f);
     // The scope: a rounded button.
     assert!(b[0].starts_with(" AGENTS") && b[0].ends_with(" ⌥V  this space  "), "{b:#?}");
-    assert!(b[1].starts_with(" ● proj"), "{b:#?}");
+    assert_eq!(heads(&f), [(f.agents.start + 1, "proj".to_string())], "{b:#?}");
     // Window-index order; no shell rows.
     let rows: Vec<&str> = b[2..].iter().filter_map(|l| row_title(l)).collect();
     assert_eq!(rows, ["two", "four", "five", "twelve"], "{b:#?}");
@@ -1336,7 +1548,8 @@ fn all_scope_with_spaces_drops_shells_and_toggles() {
     assert_eq!(f.target(3, 0), Some(&Target::Scope));
     let b = agents_part(&f);
     assert!(b[0].contains("all spaces"), "{b:#?}");
-    assert!(b.iter().any(|l| l.starts_with(" ● other")) && b.iter().any(|l| l.starts_with(" ● proj")), "{b:#?}");
+    let names: Vec<String> = heads(&f).into_iter().map(|(_, s)| s).collect();
+    assert!(names.contains(&"other".to_string()) && names.contains(&"proj".to_string()), "{b:#?}");
     assert!(!b.iter().any(|l| l.contains("zsh")), "{b:#?}");
     assert!(b.iter().any(|l| row_title(l) == Some("five")) && b.iter().any(|l| row_title(l) == Some("two")), "{b:#?}");
     // A space with nothing but shells is no group at all.
@@ -1373,7 +1586,7 @@ fn hidden_sessions_fall_back_to_all() {
         let f = layout(&v, 34, 58, &Opts::default());
         assert!(texts(&f)[0].starts_with(" agents "), "{session}");
         let b = agents_part(&f);
-        assert!(b[0].contains("all spaces") && b.iter().any(|l| l.starts_with(" ● other")), "{session}: {b:#?}");
+        assert!(b[0].contains("all spaces") && heads(&f).iter().any(|(_, s)| s == "other"), "{session}: {b:#?}");
     }
 }
 
@@ -1386,7 +1599,8 @@ fn empty_space_still_has_its_header() {
     let t = texts(&f);
     assert_eq!(t[0].trim_end(), " space"); // no counts: nothing in it
     let b = agents_part(&f);
-    assert!(b[1].starts_with(" ● empty") && b[2].starts_with("   no agents in this space"), "{b:#?}");
+    assert!(heads(&f) == [(f.agents.start + 1, "empty".to_string())] && b[2].starts_with("   no agents in this space"), "{b:#?}");
+    assert!(b[1].contains(&format!(" empty {ARROW}")), "{b:#?}");
     assert!(t[f.needs.clone()][0].starts_with(" NEEDS YOU"));
     assert_eq!(f.target(4, (f.agents.start + 1) as u16), Some(&Target::Session("empty".into())));
 }
@@ -1440,7 +1654,7 @@ fn a_last_spare_row_shows_an_agent() {
     }
     let f = layout(&v, 34, 11, &Opts::default());
     let t = texts(&f);
-    let hd = find(&f, " ● main");
+    let hd = head(&f, "main");
     assert!(t[hd + 1].contains("Handy.app"), "{t:#?}");
     assert_eq!(f.spaces.len(), 2, "{t:#?}");
     assert!(t[10].starts_with(&parked(0)[..4]), "{t:#?}");
@@ -1748,20 +1962,25 @@ fn renders_through_ratatui_on_the_terminal_background() {
             if pills.contains(&y) {
                 continue;
             }
+            let row = &f.rows[y as usize];
             if (y == here || y == here + 1) && inside {
-                assert_eq!(bg, palette::color("tile_hi"), "({x},{y})");
+                assert_eq!(bg, palette::color(if y == here { "tile_hi" } else { "tile_hi_lo" }), "({x},{y})");
             } else if (y == card || y == card + 1) && inside {
-                assert_eq!(bg, palette::mix("yellow", 14), "({x},{y})");
-            } else if f.rows[y as usize].bg.is_some() && inside {
-                assert_eq!(bg, palette::color("tile"), "({x},{y}) {:?}", f.rows[y as usize].text());
+                assert_eq!(bg, palette::mix("yellow", if y == card { 14 } else { 8 }), "({x},{y})");
+            } else if is_group_header(row, 34) {
+                // A band: the space's tint edge to edge, its chip (peach here) on it.
+                assert!([palette::mix("peach", HEAD_TINT), palette::color("peach")].contains(&bg), "({x},{y}) {bg:?}");
+            } else if row.bg.is_some() && inside {
+                assert!([palette::color("tile"), palette::color("tile_lo")].contains(&bg), "({x},{y}) {:?}", row.text());
+                assert_eq!(Some(bg), row.bg.map(Ink::color), "({x},{y})");
             } else if !pills.contains(&y) && y != 57 && !(y == 2 && x > 28) {
-                assert_eq!(bg, Color::Reset, "({x},{y}) {:?}", f.rows[y as usize].text());
+                assert_eq!(bg, Color::Reset, "({x},{y}) {:?}", row.text());
             }
         }
     }
-    // A pad: the tile's colour as the half block's ink, on the canvas.
-    let pad = here + 2;
-    assert_eq!((buf[(5, pad)].symbol(), buf[(5, pad)].fg, buf[(5, pad)].bg), ("▀", palette::color("tile_hi"), Color::Reset));
+    // No pad: the next card's title tone right under the client's agent.
+    let next = here + 2;
+    assert_eq!((buf[(5, next)].bg, buf[(0, next)].bg), (palette::color("tile"), Color::Reset));
     let ansi = to_ansi(buf);
     assert_eq!(ansi.lines().count(), 58);
     // No background code at all on an untinted row.

@@ -50,12 +50,17 @@ use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- colours
 
-/// The xterm-256 colour `n` as (r, g, b).
+/// The xterm-256 colour `n` as (r, g, b), as THIS terminal draws it: the
+/// sixteen ANSI colours are WezTerm's `catppuccin-mocha` scheme's (wezterm.lua
+/// `color_scheme`), not stock xterm's; the cube and the greys are xterm's.
 fn xterm(n: u8) -> (u8, u8, u8) {
     const BASE: [(u8, u8, u8); 16] = [
-        (0, 0, 0), (205, 0, 0), (0, 205, 0), (205, 205, 0), (0, 0, 238), (205, 0, 205), (0, 205, 205), (229, 229, 229),
-        (127, 127, 127), (255, 0, 0), (0, 255, 0), (255, 255, 0), (92, 92, 255), (255, 0, 255), (0, 255, 255),
-        (255, 255, 255),
+        // black surface1, red, green, yellow, blue, magenta pink, cyan teal, white subtext1
+        (0x45, 0x47, 0x5a), (0xf3, 0x8b, 0xa8), (0xa6, 0xe3, 0xa1), (0xf9, 0xe2, 0xaf),
+        (0x89, 0xb4, 0xfa), (0xf5, 0xc2, 0xe7), (0x94, 0xe2, 0xd5), (0xba, 0xc2, 0xde),
+        // bright: black surface2, the same accents, white subtext0
+        (0x58, 0x5b, 0x70), (0xf3, 0x8b, 0xa8), (0xa6, 0xe3, 0xa1), (0xf9, 0xe2, 0xaf),
+        (0x89, 0xb4, 0xfa), (0xf5, 0xc2, 0xe7), (0x94, 0xe2, 0xd5), (0xa6, 0xad, 0xc8),
     ];
     match n {
         0..=15 => BASE[n as usize],
@@ -101,16 +106,23 @@ pub fn tmux_colour(raw: &str) -> Option<Ink> {
     Some(Ink::Pal(pal))
 }
 
-/// The ink that reads on `bg`: dark (`crust`) on a light colour, light
-/// (`text`) on a dark one (relative luminance, 0.45 cut).
-pub fn ink_on(bg: Ink) -> Ink {
-    let (r, g, b) = match bg {
+/// An ink's (r, g, b), as the terminal will show it (the canvas: the
+/// palette's `base`).
+pub fn ink_rgb(ink: Ink) -> (u8, u8, u8) {
+    match ink {
         Ink::Rgb(r, g, b) => (r, g, b),
         Ink::Idx(n) => xterm(n),
         Ink::Pal(p) => crate::palette::rgb(p),
         Ink::Mix(p, pct) => crate::palette::mix_rgb(p, pct),
+        Ink::Tint(r, g, b, pct) => crate::palette::over_canvas((r, g, b), pct),
         Ink::Canvas => crate::palette::rgb(crate::palette::CANVAS),
-    };
+    }
+}
+
+/// The ink that reads on `bg`: dark (`crust`) on a light colour, light
+/// (`text`) on a dark one (relative luminance, 0.45 cut).
+pub fn ink_on(bg: Ink) -> Ink {
+    let (r, g, b) = ink_rgb(bg);
     let lum = (0.2126 * f64::from(r) + 0.7152 * f64::from(g) + 0.0722 * f64::from(b)) / 255.0;
     Ink::Pal(if lum > 0.45 { "crust" } else { "text" })
 }
@@ -961,6 +973,10 @@ mod tests {
         assert_eq!(ink_on(Ink::Rgb(0x1e, 0x1e, 0x2e)), Ink::Pal("text"));
         assert_eq!(xterm(196), (255, 0, 0));
         assert_eq!(xterm(232), (8, 8, 8));
+        // The ANSI sixteen: catppuccin-mocha's, as WezTerm draws them.
+        assert_eq!((xterm(0), xterm(4), xterm(12), xterm(15)), ((0x45, 0x47, 0x5a), (0x89, 0xb4, 0xfa), (0x89, 0xb4, 0xfa), (0xa6, 0xad, 0xc8)));
+        assert_eq!((ink_on(Ink::Idx(1)), ink_on(Ink::Idx(0))), (Ink::Pal("crust"), Ink::Pal("text")));
+        assert_eq!(ink_rgb(Ink::Tint(0x89, 0xb4, 0xfa, 20)), crate::palette::over_canvas(xterm(4), 20));
     }
 
     fn client(session: &str, win: &str, status: &[&str]) -> String {

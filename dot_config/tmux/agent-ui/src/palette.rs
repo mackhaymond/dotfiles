@@ -28,16 +28,22 @@ pub const HEX: [(&str, &str); 16] = [
 /// row): `overlay` there is under 3:1, overlay2 about 4-4.5:1, and still
 /// below `sub`, so the hierarchy holds.
 ///
-/// The sidebar's raised surfaces (its "tiles": agent rows, the usage panel,
-/// shell buttons): `tile` sits between the canvas (`base`) and `surface0`;
-/// `tile_alt` is its zebra partner (adjacent tiles with no gap between them
-/// alternate the two); `tile_hi` (a blue-tinted lift, about `blue` at 18%
-/// over the canvas) marks the client's own agent and the active shell.
-pub const UI: [(&str, &str); 10] = [
+/// The sidebar's raised surfaces (its "tiles": agent cards, the usage
+/// panel, shell buttons) come in two tones. A two-line card is TWO-TONE:
+/// its title row on `tile` (the lighter, between the canvas `base` and
+/// `surface0`), its detail row on `tile_lo` (darker, but plainly off the
+/// canvas, so an empty detail row still reads as part of its card), so
+/// cards stacked with no gap still part cleanly: every card starts with a
+/// visible bar. One-row tiles stacked edge to edge (one-line agents,
+/// shells, SPACES rows) alternate the same two. `tile_hi` (about `blue` at
+/// 18% over the canvas) lifts the client's own agent's title row and the
+/// active shell; `tile_hi_lo` is the darker partner for that agent's
+/// detail row.
+pub const UI: [(&str, &str); 11] = [
     ("base", "#1e1e2e"), ("mantle", "#181825"), ("surface2", "#585b70"),
     ("mauve", "#cba6f7"), ("lavender", "#b4befe"), ("sel", "#2a2b3d"),
-    ("overlay2", "#9399b2"), ("tile", "#282839"), ("tile_alt", "#33344a"),
-    ("tile_hi", "#31394f"),
+    ("overlay2", "#9399b2"), ("tile", "#30314a"), ("tile_lo", "#28283b"),
+    ("tile_hi", "#31394f"), ("tile_hi_lo", "#2a3044"),
 ];
 
 /// The `#rrggbb` for a palette name ([`HEX`] first, then [`UI`]). Panics on
@@ -73,7 +79,13 @@ pub const CANVAS: &str = "base";
 /// highlighted row sits on (a NEEDS YOU card in its state's colour, the
 /// stash selection's mauve).
 pub fn mix_rgb(name: &str, pct: u8) -> (u8, u8, u8) {
-    let (a, b) = (rgb(name), rgb(CANVAS));
+    over_canvas(rgb(name), pct)
+}
+
+/// Any (r, g, b) at `pct`% over [`CANVAS`] (a space's own `@space_color`
+/// tint, which is no palette name).
+pub fn over_canvas(a: (u8, u8, u8), pct: u8) -> (u8, u8, u8) {
+    let b = rgb(CANVAS);
     let p = f64::from(pct.min(100)) / 100.0;
     let m = |x: u8, y: u8| (f64::from(x) * p + f64::from(y) * (1.0 - p)).round() as u8;
     (m(a.0, b.0), m(a.1, b.1), m(a.2, b.2))
@@ -129,13 +141,32 @@ mod tests {
     #[test]
     fn dim_text_on_surfaces_reads() {
         let bgs = [rgb("surface0"), mix_rgb("yellow", 14), mix_rgb("red", 14), mix_rgb("green", 14), mix_rgb("mauve", 18),
-            rgb("tile"), rgb("tile_alt"), rgb("tile_hi")];
+            rgb("tile"), rgb("tile_hi")];
         for bg in bgs {
             let c = contrast(rgb("overlay2"), bg);
             assert!(c >= 3.9, "{bg:?}: {c:.2}");
             assert!(contrast(rgb("sub"), bg) > c);
             assert!(contrast(rgb("overlay"), bg) < 3.0, "{bg:?}");
         }
+        // The darker tones (a card's detail row) sit nearer the canvas:
+        // dim text reads there even better, still under `sub`.
+        for bg in [rgb("tile_lo"), rgb("tile_hi_lo"), mix_rgb("yellow", 8), mix_rgb("mauve", 11)] {
+            let c = contrast(rgb("overlay2"), bg);
+            assert!(c >= 4.5 && contrast(rgb("sub"), bg) > c, "{bg:?}: {c:.2}");
+        }
+    }
+
+    /// A two-tone card: its title row visibly lighter than its detail row,
+    /// and the detail row plainly off the canvas (an empty one must not
+    /// read as a gap), neither loud.
+    #[test]
+    fn card_tones_part_but_stay_quiet() {
+        let l = |n: &str| contrast(rgb(n), rgb("base"));
+        for (hi, lo) in [("tile", "tile_lo"), ("tile_hi", "tile_hi_lo")] {
+            assert!(contrast(rgb(hi), rgb(lo)) > 1.1, "{hi}/{lo}: {:.3}", contrast(rgb(hi), rgb(lo)));
+            assert!(l(lo) > 1.12 && l(hi) < 1.6, "{hi}/{lo}: {:.3} {:.3}", l(lo), l(hi));
+        }
+        assert_eq!(over_canvas(rgb("red"), 14), mix_rgb("red", 14));
     }
 
     #[test]

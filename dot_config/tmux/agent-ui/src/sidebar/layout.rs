@@ -7,19 +7,23 @@
 //! Textual's way: every surface is a filled block ("tile") on the terminal's
 //! own background, never a box drawn in lines. A tile leaves one canvas
 //! column at each side of the sidebar ([`margin`], [`tile_row`]) and keeps a
-//! cell of padding inside; a half-block row (`▀` / `▄` in the tile's colour
-//! on the canvas, [`pad_row`]) pads it, so it reads as a raised button. List
-//! tiles (agents, NEEDS YOU cards, shell buttons) keep their pad BELOW them
-//! ([`PAD_BELOW`]): a header sits right on its first tile, and half a row of
-//! canvas parts one tile from the next. Without room for pads, tiles sit edge
-//! to edge in two alternating shades ([`shade`]: `tile` / `tile_alt`).
-//! Chips take a page out of the tmux status line (its catppuccin blocks,
-//! square ends): a [`module`] is ` key ` bold in dark ink on a colour, then
-//! ` label ` on `surface0` (the spaces, the shells in one line, the scope
-//! toggle ` ⌥V `, the NEEDS YOU and PARKED counts, `+K`); the client's space
-//! is `@space_here`, one chip in its colour ending in the powerline arrow
-//! ([`ARROW`]). Section and space headers are text on the canvas. The only
-//! line art left is a toast card's rounded border.
+//! cell of padding inside. The usage panel has a half-block row (`▀` / `▄`
+//! in its colour on the canvas, [`pad_row`]) above and below it. List tiles
+//! (agents, NEEDS YOU cards, shell buttons) have NO pads: they stack edge to
+//! edge, so a card is exactly its two rows. A two-line card is TWO-TONE
+//! ([`TONES`]): its title row on the lighter `tile`, its detail row on the
+//! darker `tile_lo`, so every card starts with a visible bar and the next
+//! parts from it cleanly; one-row tiles stacked edge to edge alternate the
+//! same two ([`shade`]). Chips take a page out of the tmux status line (its
+//! catppuccin blocks, square ends): a [`module`] is ` key ` bold in dark ink
+//! on a colour, then ` label ` on `surface0` (the spaces, the shells in one
+//! line, the scope toggle ` ⌥V `, the NEEDS YOU and PARKED counts, `+K`);
+//! the client's space is `@space_here`, one chip in its colour ending in the
+//! powerline arrow ([`ARROW`]). Section headers are text on the canvas; a
+//! space's header in AGENTS is a BAND across the whole width (no margins,
+//! unlike any card) tinted in its colour, a `▌` block in it at the edge
+//! ([`group_header`]). The only line art left is a toast card's rounded
+//! border.
 //!
 //! ## Shape: the usage panel, NEEDS YOU, the agents (the body), the shells, SPACES, PARKED
 //!
@@ -30,25 +34,30 @@
 //!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ┃ = where the pace expects it)
 //!
 //!  NEEDS YOU                        1   (the count a square chip)
-//!  ▌ g  1Password Sign-ins      ✓ 4m    cards: tiles tinted in the state's
-//!  ▌    Your four calls are done        colour, a ▌ stripe in it
-//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+//!  ▌ g  1Password Sign-ins      ✓ 4m    cards: two-tone tiles tinted in the
+//!  ▌    Your four calls are done        state's colour, a ▌ stripe in it
 //!
 //!  AGENTS            ⌥V  all spaces     (the scope: a module once it toggles)
-//!  ● main                     ◐2 ○3     space header: dot in @space_color
-//!  ▌ d  Tmux Agent Sidebar ⠹ working    the client's agent: `tile_hi`, a wide
-//!  ▌  › Running cargo test        26s   stripe; every agent two lines: working,
-//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   its live activity (`›`, from its
-//!  ▎ q  Pause Resume Agents    ✓ done   transcript, see `activity`); else a
-//!  ▎    Merged the pause key       2m   dim message (for idle, its last
-//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   outcome; maybe blank), the age at its
-//!     h  Canvas Syllabus         idle   end; a `▎` stripe in the state's
-//!        Synced 4 assignments      1h   colour (idle: none)
-//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+//! ▌  1  main   main          ◐2 ○3     a space header: a band tinted in its
+//!  ▌ d  Tmux Agent Sidebar ⠹ working    colour, ` N ` solid in it, the name
+//!  ▌  › Running cargo test        26s   bold in it; the client's space
+//!  ▎ q  Pause Resume Agents    ✓ done   `@space_here` (`2 cs35l▶`). Cards stack
+//!  ▎    Merged the pause key       2m   edge to edge, two-tone (title row
+//!     h  Canvas Syllabus         idle   `tile`, detail row `tile_lo`); the
+//!        Synced 4 assignments      1h   key-cap solid in the SPACE's colour;
+//!                                       the client's agent `tile_hi`, a wide
+//! ▌  2 cs35l ▶  main            ○1     stripe; every agent two lines: working,
+//!  ▎ w  Eight Component Values ✓ done   its live activity (`›`, from its
+//!  ▎    I wrote tic-tac-toe.txt     9s  transcript, see `activity`); else a
+//!                                       dim message (for idle, its last
+//!                                       outcome; maybe blank), the age at its
+//!                                       end; a `▎` stripe in the state's
+//!                                       colour (idle: none)
 //!
 //!  SHELLS                               the client's space's shells, one-row
-//!     ⌥1  ⌂ ~                           buttons (⌥N); the active one lifted;
-//!  ▌ ⌥2  nvim                           one line of modules when short
+//!     ⌥1  ⌂ ~                           buttons (⌥N) edge to edge in the
+//!  ▌ ⌥2  nvim                           zebra; the active one lifted; one
+//!                                       line of modules when short
 //!
 //!  SPACES                               one row per space, ⌃N order: ` N ` on
 //!   1 main ▶               ◐2 ○3        its colour, the name, its counts; the
@@ -68,13 +77,14 @@
 //!
 //! Spaces are listed nowhere else, so their gap and one line of chips are
 //! held back before anything else is laid out ([`spaces_min`]), with the
-//! PARKED header (the old last row). The steps that keep decoration (gaps,
-//! pads) must also leave the SPACES list its rows ([`spaces_listed`]); then
-//! the bottom takes the rows left over, the richest form that fits
-//! ([`bottom`]): every space a row; else the client's space and those with
-//! an attention agent and `+K more spaces`; else chips on as few as one
-//! line; the gap above PARKED last. Spare rows then buy spacing back (the
-//! section gaps, the cards' pads, the gaps between spaces in AGENTS). PARKED
+//! PARKED header (the old last row). The first steps (with the gaps, and
+//! the one right after) also leave the SPACES list its rows
+//! ([`spaces_listed`], [`Step::listed`]); then the bottom takes the rows
+//! left over, the richest form that fits ([`bottom`]): every space a row;
+//! else the client's space and those with an attention agent and `+K more
+//! spaces`; else chips on as few as one line, each line kept over the gap
+//! above PARKED. Spare rows then buy spacing back (the section gaps, then
+//! the gaps between spaces in AGENTS; never a gap between cards). PARKED
 //! is always ONE line, its label and count (`none` dim with nothing parked),
 //! at every height: the parked tabs themselves are never listed (prefix h's
 //! picker, or the menu's Parked tab, shows them).
@@ -112,9 +122,9 @@
 //!
 //! 1. SPACES and PARKED get the rows left over (above: "The bottom"); their
 //!    minimum is held back before anything else is laid out;
-//! 2. the blank gaps go (between sections, between spaces);
-//! 3. the pads go: the NEEDS YOU cards' and shell buttons' first, then the
-//!    agents' (pure decoration goes before anything that says something);
+//! 2. the blank gaps go (between sections, between spaces: pure decoration
+//!    goes before anything that says something);
+//! 3. the SPACES list's reserve goes (it may fall to chips);
 //! 4. NEEDS YOU cards go from 2 lines to 1; then the shells to one line;
 //! 5. only then do the agents compress (below), NEEDS YOU kept to the rows
 //!    the agents' one-line shape leaves (at least 2, and at least a third of
@@ -141,9 +151,12 @@
 //! Every agent tile and NEEDS YOU card starts (after its stripe) with the
 //! agent's lifetime letter (`@agent_key`, assigned by
 //! [`crate::menu::letters::of_view`], the menu's own function) as a key-cap
-//! ([`Badge`]): a raised `surface1` chip, peach while ⌥W's jump table is
-//! armed. Agents without one leave it blank; with no letter anywhere the
-//! column is not drawn.
+//! ([`Badge`]): a solid chip in its SPACE's colour (dark ink), the colour of
+//! its space header's ` N ` chip, so the agent says where it lives anywhere
+//! in the list (NEEDS YOU too); it sits right under the header's chip.
+//! While ⌥W's jump table is armed every cap is inverted, a peach letter on
+//! `crust`, which no space's chip looks like. Agents without one show the
+//! chip blank; with no letter anywhere the column is not drawn.
 //!
 //! ## Scope
 //!
@@ -163,13 +176,15 @@
 //!
 //! The canvas is the terminal's own background ([`Color::Reset`], and
 //! [`Ink::Canvas`] for a tiled row's margins), so the split is WezTerm's
-//! colour. Surfaces ([`palette::UI`]): `tile`, `tile_alt` (the zebra),
-//! `tile_hi` (the client's agent, the active shell), NEEDS YOU cards and
-//! toast cards (their colour mixed over the canvas, [`Ink::Mix`]), the stash
-//! selection (mauve, mixed), and the solid chips (key-caps, the key-table
-//! marks, the status-line modules). Dim text on a surface is `overlay2`.
+//! colour. Surfaces ([`palette::UI`]): `tile` / `tile_lo` (a card's two
+//! tones, and the zebra), `tile_hi` / `tile_hi_lo` (the client's agent's two
+//! tones; `tile_hi` the active shell too), NEEDS YOU cards and toast cards (their colour mixed over
+//! the canvas, [`Ink::Mix`]), space headers (their `@space_color` at
+//! [`HEAD_TINT`]%, [`Ink::Tint`]), the stash selection (mauve, mixed), and
+//! the solid chips (key-caps, the key-table marks, the status-line
+//! modules). Dim text on a surface is `overlay2`.
 
-use super::status::{ink_on, tmux_colour, Bar, Kind, Shell, Toast, ToastId, Usage};
+use super::status::{ink_on, ink_rgb, tmux_colour, Bar, Kind, Shell, Toast, ToastId, Usage};
 use crate::actions::watcher_problem;
 use crate::model::{Cat, Counts, Flag};
 use crate::palette;
@@ -195,6 +210,9 @@ pub enum Ink {
     Idx(u8),
     /// The colour at this percent over the canvas ([`palette::mix`]).
     Mix(Hue, u8),
+    /// Any (r, g, b) at this percent over the canvas: a space's own colour
+    /// as the tint of its header ([`tint`]).
+    Tint(u8, u8, u8, u8),
     /// The canvas itself: the terminal's own background ([`Color::Reset`]),
     /// for the margin cells of a row that is otherwise a tile.
     Canvas,
@@ -207,7 +225,24 @@ impl Ink {
             Ink::Rgb(r, g, b) => Color::Rgb(r, g, b),
             Ink::Idx(n) => Color::Indexed(n),
             Ink::Mix(p, pct) => palette::mix(p, pct),
+            Ink::Tint(r, g, b, pct) => {
+                let (r, g, b) = palette::over_canvas((r, g, b), pct);
+                Color::Rgb(r, g, b)
+            }
             Ink::Canvas => Color::Reset,
+        }
+    }
+}
+
+/// `ink` at `pct`% over the canvas: a palette colour as [`Ink::Mix`], any
+/// other (`@space_color`'s `#rrggbb`, `colourN`) as [`Ink::Tint`].
+pub fn tint(ink: Ink, pct: u8) -> Ink {
+    match ink {
+        Ink::Pal(p) => Ink::Mix(p, pct),
+        Ink::Canvas => Ink::Canvas,
+        other => {
+            let (r, g, b) = ink_rgb(other);
+            Ink::Tint(r, g, b, pct)
         }
     }
 }
@@ -329,32 +364,16 @@ fn into_tile(row: Row, w: usize, bg: Ink) -> Row {
     Row { covers: row.covers, anim: row.anim, ..t }
 }
 
-/// The half-block above a tile (`▄`, its top padding: half a row of canvas,
-/// then half a row of the tile) or below one (`▀`): the tile's colour on the
-/// canvas, between the margins. Not a target, stands for no one.
+/// The half-block above the usage panel (`▄`, its top padding: half a row
+/// of canvas, then half a row of the tile) or below it (`▀`): the tile's
+/// colour on the canvas, between the margins. Not a target, stands for no
+/// one. List tiles (agents, NEEDS YOU cards, shells) have no pads: they
+/// stack edge to edge, parted by their two tones ([`TONES`]).
 const PAD_TOP: char = '▄';
 const PAD_BOTTOM: char = '▀';
 
 fn pad_row(w: usize, bg: Ink, glyph: char) -> Row {
     pad_with(w, bg, glyph, Vec::new())
-}
-
-/// Where a list tile (an agent, a NEEDS YOU card, a shell button) keeps its
-/// half-block pad: BELOW it, so a section or space header sits right on top
-/// of its first tile (a label for them) and half a row of canvas parts one
-/// tile from the next, and the last from whatever follows.
-const PAD_BELOW: bool = true;
-
-/// A list tile's rows (on `bg`) with its pad when `pads`.
-fn padded(mut rows: Vec<Row>, w: usize, bg: Ink, pads: bool) -> Vec<Row> {
-    if pads {
-        if PAD_BELOW {
-            rows.push(pad_row(w, bg, PAD_BOTTOM));
-        } else {
-            rows.insert(0, pad_row(w, bg, PAD_TOP));
-        }
-    }
-    rows
 }
 
 /// A pad row carrying `chips` (solid blocks) from its third cell: a tab on
@@ -401,10 +420,16 @@ fn label_module(label: Vec<Seg>) -> Vec<Seg> {
     out
 }
 
-/// The zebra: adjacent tiles with no gap between them alternate two shades
-/// so each still reads as its own; with gaps they are all `tile`.
-fn shade(k: usize, gaps: bool) -> Ink {
-    Ink::Pal(if gaps || k % 2 == 0 { "tile" } else { "tile_alt" })
+/// A list tile's two tones: (its title row, its detail row). A two-line
+/// card is two-tone, so cards stacked with no gap between them still part:
+/// every card starts with the lighter bar.
+const TONES: (Hue, Hue) = ("tile", "tile_lo");
+
+/// The zebra for ONE-ROW tiles stacked edge to edge (one-line agents, the
+/// shells, the SPACES rows): the same two tones, alternating. (A two-line
+/// card needs no zebra: its own two tones part it from the next.)
+fn shade(k: usize) -> Ink {
+    Ink::Pal(if k.is_multiple_of(2) { TONES.0 } else { TONES.1 })
 }
 
 /// What a click on a cell does.
@@ -1112,10 +1137,10 @@ fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
 /// home first) as one-row button tiles: the ⌥N key-cap, `⌂` on the home,
 /// the label. The session's active window is lifted like the client's
 /// agent (`tile_hi`, a blue stripe); one in prefix v's selection on mauve.
-/// With `pads` each button has its half-block pad below it; without, they
-/// sit edge to edge in the zebra's two shades. A button clicks through to
-/// its shell.
-fn shells_section(bar: &Bar, w: usize, pads: bool) -> Vec<Row> {
+/// They sit edge to edge in the zebra's two tones ([`shade`]: one-row
+/// tiles, no two-tone card), quieter than the agents: no state stripe but
+/// the active one's. A button clicks through to its shell.
+fn shells_section(bar: &Bar, w: usize) -> Vec<Row> {
     if bar.shells.is_empty() {
         return Vec::new();
     }
@@ -1126,7 +1151,7 @@ fn shells_section(bar: &Bar, w: usize, pads: bool) -> Vec<Row> {
         } else if s.active {
             (Ink::Pal("tile_hi"), seg("▌", "blue"))
         } else {
-            (shade(k, pads), seg(" ", "text"))
+            (shade(k), seg(" ", "text"))
         };
         let key = shell_key(s).map_or("    ".to_string(), |k| format!(" {k} "));
         let mut left = vec![edge, on(key, if s.active { "peach" } else { "sub" }, "surface1")];
@@ -1136,7 +1161,7 @@ fn shells_section(bar: &Bar, w: usize, pads: bool) -> Vec<Row> {
         }
         left.push(if s.active { bold(s.label.clone(), "text") } else { seg(s.label.clone(), "sub") });
         let go = Target::Shell { win: s.win.clone(), session: s.session.clone() };
-        rows.extend(padded(vec![tile_row(w, bg, left, vec![]).click(w, go)], w, bg, pads));
+        rows.push(tile_row(w, bg, left, vec![]).click(w, go));
     }
     rows
 }
@@ -1191,13 +1216,17 @@ impl Badge {
         }
     }
 
-    /// `a`'s key-cap (blank when it holds no letter): a raised chip
-    /// (`surface1`) on its tile.
-    fn seg(self, a: &Agent) -> Seg {
+    /// `a`'s key-cap: a solid chip in its SPACE's colour (`space`, dark ink
+    /// on it, bold), the same chip its space's header leads with, so an
+    /// agent says which space it lives in anywhere in the list. While ⌥W is
+    /// armed every cap is INVERTED, a peach letter on `crust`: no space's
+    /// colour (peach, the colourless default, included) looks like it.
+    /// Without a letter, the chip blank (still the space's colour).
+    fn seg(self, a: &Agent, space: Ink) -> Seg {
         match a.letter {
-            Some(c) if self.loud => block(format!(" {c} "), "crust", "peach"),
-            Some(c) => on(format!(" {c} "), "sub", "surface1"),
-            None => seg(" ".repeat(BADGE_W), "text"),
+            Some(c) if self.loud => block(format!(" {c} "), "peach", "crust"),
+            Some(c) => block(format!(" {c} "), ink_on(space), space),
+            None => on(" ".repeat(BADGE_W), "text", space),
         }
     }
 }
@@ -1292,31 +1321,37 @@ fn short_title(a: &Agent) -> String {
     sanitize(if a.short_title.is_empty() { no_home(&a.title) } else { &a.short_title })
 }
 
-/// The tile an agent sits on: prefix v's selection mauve, the client's own
-/// agent `tile_hi`, else `base` (the zebra's shade).
-fn agent_bg(a: &Agent, base: Ink) -> Ink {
+/// The two tones an agent's card sits on, (title row, detail row):
+/// prefix v's selection mauve, the client's own agent `tile_hi` /
+/// `tile_hi_lo`, else [`TONES`]. A one-row agent `k`th in its run sits on
+/// the zebra's ([`shade`]) unless lifted.
+fn agent_tones(a: &Agent, k: usize, two: bool) -> (Ink, Ink) {
     if a.selected {
-        Ink::Mix("mauve", 18)
+        (Ink::Mix("mauve", 18), Ink::Mix("mauve", 11))
     } else if a.is_current {
-        Ink::Pal("tile_hi")
+        (Ink::Pal("tile_hi"), Ink::Pal("tile_hi_lo"))
+    } else if two {
+        (Ink::Pal(TONES.0), Ink::Pal(TONES.1))
     } else {
-        base
+        (shade(k), shade(k))
     }
 }
 
-/// One agent as a tile on `base` ([`agent_bg`]): a state stripe at its left
+/// One agent as a two-tone card ([`agent_tones`]; `k`: its place in its
+/// run, for the zebra when it is one row): a state stripe down its left
 /// edge (`▎` in the state's colour; none when idle; the client's agent a
-/// wider `▌`, blue when idle; the selection's mauve), its key-cap, the title
-/// (bold unless idle), a flag (⚙ workflow, ◎ cua), and the state word on
-/// the right, the age beside it; with `two`, a dim second line
-/// ([`second_line`], maybe blank) with the age at its end, so every agent
-/// row is the same height. Both lines click through.
-fn agent_rows(a: &Agent, cx: Cx, two: bool, base: Ink) -> Vec<Row> {
+/// wider `▌`, blue when idle; the selection's mauve), its key-cap in its
+/// space's colour (`space`), the title (bold unless idle), a flag (⚙
+/// workflow, ◎ cua), and the state word on the right, the age beside it;
+/// with `two`, a dim second line ([`second_line`], maybe blank) on the
+/// darker tone with the age at its end, so every agent row is the same
+/// height. Both lines click through.
+fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink) -> Vec<Row> {
     let w = inner(cx.w);
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
     let msg = (two && cx.seconds()).then(|| second_line(a, cx.now));
     let word = state_word(a, cx);
-    let bg = agent_bg(a, base);
+    let (bg, bg2) = agent_tones(a, k, msg.is_some());
     let busy = word.as_ref().filter(|x| x.word != "idle").map(|x| x.hue);
     let edge = if a.selected {
         seg("▌", "mauve")
@@ -1369,7 +1404,7 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, base: Ink) -> Vec<Row> {
     let title = if quiet { seg(title, "sub") } else { bold(title, "text") };
     let mut left = vec![edge.clone()];
     if cx.b.on {
-        left.push(cx.b.seg(a));
+        left.push(cx.b.seg(a, space));
     }
     left.push(seg(" ", "text"));
     left.push(title);
@@ -1390,7 +1425,7 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, base: Ink) -> Vec<Row> {
     } else {
         vec![edge, seg(" ".repeat(indent), "text"), seg(m, dimc)]
     };
-    let second = tile_row(cx.w, bg, l2, r2).click(cx.w, go);
+    let second = tile_row(cx.w, bg2, l2, r2).click(cx.w, go);
     vec![first, second]
 }
 
@@ -1401,23 +1436,52 @@ pub fn space_order(sp: &Space) -> (bool, Option<u32>) {
     (sp.index.is_none(), sp.index)
 }
 
-/// A space's header in the agents section: a dot in its `@space_color`
-/// (blue for the client's space without one, else dim), its name (bold),
-/// its branch dim when there is room, and on the right its counts in their
-/// colours. No rule. Collapsed, it stands for all its agents. A click
-/// switches to the space.
+/// How strongly a space header's band takes its space's colour (percent
+/// over the canvas): enough that even a lavender or blue space's band is
+/// plainly not a card (`tile`), not enough to outshout one.
+const HEAD_TINT: u8 = 22;
+
+/// A space's counts on a surface: the idle glyph's `overlay` lifted to
+/// `dimc` (the surface's dim).
+fn surface_counts(c: &Counts, dimc: Hue) -> Vec<Seg> {
+    count_segs(c).into_iter().map(|s| if s.fg == Ink::Pal("overlay") { Seg { fg: Ink::Pal(dimc), ..s } } else { s }).collect()
+}
+
+/// A space's header in the agents section, read like its SPACES row, but
+/// shaped unlike any card: a BAND across the whole width (no canvas
+/// margins) tinted in the space's colour ([`HEAD_TINT`]), a `▌` block in
+/// that colour at the very edge, then (in the key-cap column, so it lines up
+/// with its agents' letter chips) ` N ` solid in the colour (dark ink) and
+/// the name bold in it; the client's space as `@space_here` ([`here_chip`]:
+/// number and name in one chip ending in the arrow), so "where am I" reads
+/// at a glance. Its branch quieter (`sub`: the tint is too strong for
+/// `overlay2`) when there is room, its counts on the right, where a card's
+/// end. Collapsed, it stands for all its agents. A click switches to the
+/// space.
 fn group_header(sp: &Space, w: usize, collapsed: bool) -> Row {
-    let dot = tmux_colour(&sp.color).unwrap_or(Ink::Pal(if sp.is_current { "blue" } else { "overlay" }));
-    let mut left = vec![seg(" ", "text"), seg("● ", dot), bold(sanitize(&sp.name), if sp.is_current { "text" } else { "sub" })];
-    let mut right = count_segs(&sp.counts);
-    right.push(seg(" ", "text"));
+    let ink = space_colour(sp);
+    let m = margin(w);
+    let mut right = surface_counts(&sp.counts, "sub");
+    right.push(seg(" ".repeat(1 + m), "text"));
+    // The edge block, then up to the key-cap column (a card's margin and stripe).
+    let mut left = vec![seg("▌", ink), seg(" ".repeat(m), "text")];
+    let room = w.saturating_sub(width(&left) + width(&right) + 1);
+    left.extend(if sp.is_current {
+        // (Never red: the header keeps the colour its agents' key-caps wear.)
+        here_chip(sp, false, room)
+    } else {
+        let num = sp.index.filter(|n| (1..=9).contains(n)).map_or(" ".to_string(), |n| n.to_string());
+        // A dark @space_color would not read as text on its own tint.
+        let name_ink = if ink_on(ink) == Ink::Pal("crust") { ink } else { Ink::Pal("text") };
+        vec![block(format!(" {num} "), ink_on(ink), ink), seg(" ", "text"), bold(sanitize(&sp.name), name_ink)]
+    });
     if !sp.branch.is_empty() {
         let br = format!("  \u{e0a0} {}", sanitize(&sp.branch));
         if width(&left) + dwidth(&br) + width(&right) < w {
-            left.push(seg(br, "overlay"));
+            left.push(seg(br, "sub"));
         }
     }
-    let row = Row::new(fit(w, left, right, None)).click(w, Target::Session(sp.name.clone()));
+    let row = Row::new(fit(w, left, right, None)).bg(Some(tint(ink, HEAD_TINT))).click(w, Target::Session(sp.name.clone()));
     if collapsed {
         row.covering(&sp.agents)
     } else {
@@ -1475,20 +1539,21 @@ fn split_idle(sp: &Space, fold: bool, now: f64) -> (Vec<&Agent>, Vec<&Agent>) {
     }
 }
 
-/// A space's agent tiles in window-index order (the folded line last); the
-/// agents in `two` get their second line. With `pads`, each tile has its
-/// half-block pad below it ([`pad_row`]: a half-row gap between tiles);
-/// without, they sit edge to edge in the zebra's two shades ([`shade`]).
-fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool, pads: bool) -> Vec<Row> {
+/// A space's agent cards in window-index order (the folded line last),
+/// stacked edge to edge (no pads: each two-line card's two tones part it
+/// from the next; one-line rows alternate the zebra's, [`shade`]); the
+/// agents in `two` get their second line.
+fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool) -> Vec<Row> {
     let (shown, idle) = split_idle(sp, fold, cx.now);
+    let ink = space_colour(sp);
     let mut rows: Vec<Row> = Vec::new();
     for (k, a) in shown.iter().enumerate() {
-        let base = shade(k, pads);
-        rows.extend(padded(agent_rows(a, cx, two.contains(&key(a)), base), cx.w, agent_bg(a, base), pads));
+        rows.extend(agent_rows(a, cx, two.contains(&key(a)), k, ink));
     }
     if !idle.is_empty() {
-        let base = shade(shown.len(), pads);
-        rows.extend(padded(vec![fold_row(&idle, cx, base)], cx.w, base, pads));
+        // After two-tone cards (their darker row last), the lighter tone.
+        let bg = if two.is_empty() || !cx.seconds() { shade(shown.len()) } else { Ink::Pal(TONES.0) };
+        rows.push(fold_row(&idle, cx, bg));
     }
     rows
 }
@@ -1497,15 +1562,15 @@ fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool, pads: bool) -> Vec<Ro
 /// else the `room - 1` that matter most ([`promotion_rank`], kept in list
 /// order) and a `… N more` line for the rest.
 fn partial_rows(sp: &Space, cx: Cx, room: usize) -> Vec<Row> {
+    let ink = space_colour(sp);
     if sp.agents.len() <= room {
-        return sp.agents.iter().enumerate().flat_map(|(k, a)| agent_rows(a, cx, false, shade(k, false))).collect();
+        return sp.agents.iter().enumerate().flat_map(|(k, a)| agent_rows(a, cx, false, k, ink)).collect();
     }
     let mut ranked: Vec<usize> = (0..sp.agents.len()).collect();
     ranked.sort_by_key(|&k| promotion_rank(&sp.agents[k], cx.now));
     let mut keep = ranked[..room - 1].to_vec();
     keep.sort_unstable();
-    let mut rows: Vec<Row> =
-        keep.iter().enumerate().flat_map(|(n, &k)| agent_rows(&sp.agents[k], cx, false, shade(n, false))).collect();
+    let mut rows: Vec<Row> = keep.iter().enumerate().flat_map(|(n, &k)| agent_rows(&sp.agents[k], cx, false, n, ink)).collect();
     let rest: Vec<&Agent> = (0..sp.agents.len()).filter(|k| !keep.contains(k)).map(|k| &sp.agents[k]).collect();
     rows.push(more_row(cx.w, &rest, 1));
     rows
@@ -1550,10 +1615,10 @@ fn agents_one_line(view: &ViewModel) -> usize {
     1 + groups.iter().map(|g| 1 + g.agents.len()).sum::<usize>()
 }
 
-/// A space header in the agents section ([`group_header`]: on the canvas,
-/// the whole row switches to its space).
+/// A space header in the agents section ([`group_header`]: the whole row
+/// switches to its space; nothing else there does).
 fn is_group_header(r: &Row, w: usize) -> bool {
-    r.bg.is_none() && matches!(r.targets.as_slice(), [(0, x1, Target::Session(_))] if usize::from(*x1) == w)
+    matches!(r.targets.as_slice(), [(0, x1, Target::Session(_))] if usize::from(*x1) == w)
 }
 
 /// A blank canvas row that does nothing and stands for no one (a gap).
@@ -1603,14 +1668,13 @@ fn agents_header(view: &ViewModel, w: usize) -> Row {
 
 /// The agents section (header, then each group's header and rows), at most
 /// `budget` rows → (rows, its ladder step). `spaced`: a blank row between
-/// groups when everything else fits; `pads`: each tile with its half-block
-/// pad (the frame's [`STEPS`] say when).
+/// groups when everything else fits (the frame's [`STEPS`] say when).
 ///
 /// Steps: 0 every agent two lines (as asked, then without the gaps between
-/// groups, then without pads, zebra-shaded); 1 the same, idle folded; 2
-/// every agent one line; 3 the same, idle folded; 4 spaces collapsed; 5
-/// `… N more`. Never a mix of heights in one frame.
-fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, pads: bool) -> (Vec<Row>, u8) {
+/// groups); 1 the same, idle folded; 2 every agent one line; 3 the same,
+/// idle folded; 4 spaces collapsed; 5 `… N more`. Never a mix of heights
+/// in one frame.
+fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec<Row>, u8) {
     if budget == 0 {
         return (vec![], 0);
     }
@@ -1631,7 +1695,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, pads: b
         rows.truncate(budget);
         return (rows, 0);
     }
-    let build_sep = |two: &[Key], fold: bool, collapsed: &[bool], spaced: bool, sep: bool| {
+    let build = |two: &[Key], fold: bool, collapsed: &[bool], spaced: bool| {
         let mut rows = vec![header.clone()];
         for (k, (sp, &c)) in groups.iter().zip(collapsed).enumerate() {
             if spaced && k > 0 {
@@ -1639,17 +1703,16 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, pads: b
             }
             rows.push(group_header(sp, w, c));
             if !c {
-                rows.extend(group_rows(sp, cx, two, fold, sep));
+                rows.extend(group_rows(sp, cx, two, fold));
             }
         }
         rows
     };
-    let build = |two: &[Key], fold: bool, collapsed: &[bool], spaced: bool| build_sep(two, fold, collapsed, spaced, false);
     let mut collapsed = vec![false; groups.len()];
     let all: Vec<Key> = groups.iter().flat_map(|g| g.agents.iter().map(key)).collect();
-    // Full detail: the gaps between spaces go before the tiles' pads.
-    for (sp, sep) in [(spaced, pads), (false, pads), (false, false)] {
-        let rows = build_sep(&all, false, &collapsed, sp, sep);
+    // Full detail: the gaps between spaces go first.
+    for sp in [spaced, false] {
+        let rows = build(&all, false, &collapsed, sp);
         if rows.len() <= budget {
             return (rows, 0);
         }
@@ -1678,7 +1741,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, pads: b
         }
         let spare = budget - base.len();
         let at = 1 + (0..i)
-            .map(|j| 1 + if collapsed[j] { 0 } else { group_rows(groups[j], cx, &[], true, false).len() })
+            .map(|j| 1 + if collapsed[j] { 0 } else { group_rows(groups[j], cx, &[], true).len() })
             .sum::<usize>();
         if spare < 2 {
             if spare == 0 {
@@ -1693,7 +1756,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, pads: b
             let mut rows = base;
             let gone = key(&g.agents[top]);
             rows[at].covers.retain(|(s, id)| (s.as_str(), id.as_str()) != gone);
-            rows.insert(at + 1, agent_rows(&g.agents[top], cx, false, shade(0, false)).remove(0));
+            rows.insert(at + 1, agent_rows(&g.agents[top], cx, false, 0, space_colour(g)).remove(0));
             return (rows, 4);
         }
         // The space whose collapse made it fit keeps the rows that frees:
@@ -1718,23 +1781,25 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, pads: b
 
 // ---------------------------------------------------------------- needs you
 
-/// How strongly a NEEDS YOU card takes its state's colour: the card's own
-/// shade, and the zebra's other one (cards edge to edge alternate them).
-const NEED_TINT: [u8; 2] = [14, 9];
+/// How strongly a NEEDS YOU card takes its state's colour: its title row
+/// and its detail row (a two-tone card, like the agents'); one-line cards
+/// edge to edge alternate the two.
+const NEED_TINT: [u8; 2] = [14, 8];
 
 /// A NEEDS YOU card, a tile of 2 or 1 lines on its state colour mixed over
-/// the canvas (`tint` percent), a `▌` stripe in that colour; the key-cap,
-/// the title (bold), and on the right the state glyph and age. Line 2: the
-/// reason (a `perm` prompt says so), or the state in words. With `pad`,
-/// its half-block pad below it.
-fn need_rows(n: &Need, cx: Cx, lines: u8, tint: u8, pad: bool) -> Vec<Row> {
+/// the canvas (`tint`: [`NEED_TINT`]'s index for its first line; a second
+/// line takes the darker), a `▌` stripe in that colour; the key-cap (in
+/// its space's colour, `space`), the title (bold), and on the right the
+/// state glyph and age. Line 2: the reason (a `perm` prompt says so), or
+/// the state in words.
+fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
     let w = cx.w;
     let iw = inner(w);
     let a = &n.agent;
     let hue = a.color.unwrap_or("overlay");
-    let bg = Ink::Mix(hue, tint);
+    let bg = Ink::Mix(hue, NEED_TINT[tint]);
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
-    let card = |l: Vec<Seg>, r: Vec<Seg>| tile_row(w, bg, l, r).click(w, go.clone());
+    let card = |bg: Ink, l: Vec<Seg>, r: Vec<Seg>| tile_row(w, bg, l, r).click(w, go.clone());
     let edge = || seg("▌", hue);
     let age = Some(age_of(a, cx)).filter(|g| cx.ages() && !g.is_empty()).map_or(String::new(), |g| format!(" {g}"));
     let right = vec![seg(a.glyph, hue), seg(format!("{age} "), dim(true))];
@@ -1742,10 +1807,10 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: u8, pad: bool) -> Vec<Row> {
     let (proj, title) = fit_label(no_home(&a.title), iw.saturating_sub(lead + width(&right) + 1));
     let mut first = vec![edge()];
     if cx.b.on {
-        first.push(cx.b.seg(a));
+        first.push(cx.b.seg(a, space));
     }
     first.extend([seg(" ", "text"), seg(proj, dim(true)), bold(title, "text")]);
-    let mut rows = vec![card(first, right)];
+    let mut rows = vec![card(bg, first, right)];
     if lines >= 2 {
         let mut l2 = vec![edge(), seg(" ".repeat(lead - 1), "text")];
         if n.reason.is_empty() {
@@ -1756,9 +1821,15 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: u8, pad: bool) -> Vec<Row> {
             }
             l2.push(seg(plain(&n.reason), "sub"));
         }
-        rows.push(card(l2, vec![seg(" ", "text")]));
+        rows.push(card(Ink::Mix(hue, NEED_TINT[1]), l2, vec![seg(" ", "text")]));
     }
-    padded(rows, w, bg, pad)
+    rows
+}
+
+/// The colour of the space `session` (its `@space_color`, else peach), for
+/// a card outside its space's group.
+fn space_ink(view: &ViewModel, session: &str) -> Ink {
+    view.spaces.iter().find(|s| s.name == session).map_or(Ink::Pal("peach"), space_colour)
 }
 
 /// ` NEEDS YOU` and the count as a square yellow chip, or `✓ all clear`
@@ -1770,14 +1841,14 @@ fn needs_header(view: &ViewModel, w: usize) -> Row {
     Row::new(fit(w, vec![bold(" NEEDS YOU", if n > 0 { "yellow" } else { "overlay" })], right, None))
 }
 
-/// The whole NEEDS YOU section: its header and the cards (each with its
-/// pad with `pads`, else edge to edge, zebra-shaded). Never empty: with
-/// nothing pending it is the header saying so.
-fn needs_block(view: &ViewModel, cx: Cx, lines: u8, pads: bool) -> Vec<Row> {
+/// The whole NEEDS YOU section: its header and the cards, edge to edge
+/// (two-tone; one-line cards zebra-shaded). Never empty: with nothing
+/// pending it is the header saying so.
+fn needs_block(view: &ViewModel, cx: Cx, lines: u8) -> Vec<Row> {
     let mut rows = vec![needs_header(view, cx.w)];
     for (k, n) in view.needs.iter().enumerate() {
-        let tint = NEED_TINT[usize::from(!pads && k % 2 == 1)];
-        rows.extend(need_rows(n, cx, lines, tint, pads));
+        let tint = usize::from(lines < 2 && k % 2 == 1);
+        rows.extend(need_rows(n, cx, lines, tint, space_ink(view, &n.agent.session)));
     }
     rows
 }
@@ -1789,7 +1860,7 @@ fn needs_cut(view: &ViewModel, cx: Cx, room: usize) -> Vec<Row> {
     let more = |k: usize, words: &str| {
         Row::new(fit(w, vec![seg(format!(" … {k} {words}"), "yellow")], vec![], None)).click(w, Target::Menu(None))
     };
-    let mut rows = needs_block(view, cx, 1, false);
+    let mut rows = needs_block(view, cx, 1);
     if rows.len() <= room {
         return rows;
     }
@@ -1935,10 +2006,9 @@ fn spaces_listed(view: &ViewModel, w: usize) -> usize {
 /// `@space_here`: one chip in its colour (red while the prefix is armed)
 /// across number and name, ending in the arrow. A click switches to it.
 fn space_row(sp: &Space, w: usize, k: usize, prefix: bool) -> Row {
-    let bg = shade(k, false);
+    let bg = shade(k);
     let name = sanitize(&sp.name);
-    let mut right: Vec<Seg> =
-        count_segs(&sp.counts).into_iter().map(|s| if s.fg == Ink::Pal("overlay") { Seg { fg: Ink::Pal(dim(true)), ..s } } else { s }).collect();
+    let mut right = surface_counts(&sp.counts, dim(true));
     right.push(seg(" ", "text"));
     let mut left = if sp.is_current {
         // The counts stay; the name gives way, the arrow kept.
@@ -1966,7 +2036,7 @@ fn spaces_header(w: usize) -> Row {
 /// `+K more spaces`: the ones a collapsed SPACES section leaves out (the
 /// menu's All tab).
 fn spaces_more(k: usize, w: usize, shade_k: usize) -> Row {
-    tile_row(w, shade(shade_k, false), [module(&format!("+{k}"), "overlay2", vec![]), vec![seg(" more spaces", dim(true))]].concat(), vec![])
+    tile_row(w, shade(shade_k), [module(&format!("+{k}"), "overlay2", vec![]), vec![seg(" more spaces", dim(true))]].concat(), vec![])
         .click(w, Target::Menu(Some("all")))
 }
 
@@ -2037,8 +2107,9 @@ fn parked_header(view: &ViewModel, w: usize, msg: Option<&str>) -> Row {
 /// one header line ([`parked_header`]: the label and the count), never the
 /// parked tabs themselves, at any height. As rows run short the spaces
 /// collapse to the client's space and the attention ones (`+K more`), then
-/// to chips on as few as one line, the gap above PARKED last. → (the spaces
-/// rows, the parked rows: its gap and header).
+/// to chips on as few as one line, each line of chips going only after the
+/// gap above PARKED. → (the spaces rows, the parked rows: its gap and
+/// header).
 fn bottom(view: &ViewModel, w: usize, room: usize, prefix: bool, msg: Option<&str>) -> (Vec<Row>, Vec<Row>) {
     let header = parked_header(view, w, msg);
     let parked = |gap: bool| -> Vec<Row> { if gap { vec![Row::blank(w), header.clone()] } else { vec![header.clone()] } };
@@ -2055,8 +2126,9 @@ fn bottom(view: &ViewModel, w: usize, room: usize, prefix: bool, msg: Option<&st
     if collapsible {
         forms.push((SpacesForm::Collapsed, true));
     }
-    forms.extend((1..=chips).rev().map(|l| (SpacesForm::Chips(l), true)));
-    forms.extend((1..=chips).rev().map(|l| (SpacesForm::Chips(l), false)));
+    // Every space's chip before the gap above PARKED (a space is content,
+    // the gap is not).
+    forms.extend((1..=chips).rev().flat_map(|l| [(SpacesForm::Chips(l), true), (SpacesForm::Chips(l), false)]));
     for (form, gap) in forms {
         let s = spaces_rows(view, w, form, prefix);
         let p = parked(gap);
@@ -2072,25 +2144,23 @@ fn bottom(view: &ViewModel, w: usize, room: usize, prefix: bool, msg: Option<&st
 pub struct Step {
     /// Blank gaps between sections (and between spaces in AGENTS).
     pub gaps: bool,
-    /// Every agent tile with its half-block pad; without, they sit edge to
-    /// edge, zebra-shaded.
-    pub pads: bool,
-    /// The same for the NEEDS YOU cards and the shell buttons.
-    pub card_pads: bool,
+    /// The SPACES list keeps its rows (every space a row, [`spaces_listed`]);
+    /// without, it has its held-back minimum and takes what is left.
+    pub listed: bool,
     /// NEEDS YOU card lines.
     pub lines: u8,
 }
 
 /// The steps at which agents keep full detail, roomiest first: the gaps
-/// go, then the pads (pure decoration, before anything that says
-/// something: the cards' and shells' first, the agents' last), then the
-/// cards' second lines. The spaces section takes what each leaves over.
-pub const STEPS: [Step; 5] = [
-    Step { gaps: true, pads: true, card_pads: true, lines: 2 },
-    Step { gaps: false, pads: true, card_pads: true, lines: 2 },
-    Step { gaps: false, pads: true, card_pads: false, lines: 2 },
-    Step { gaps: false, pads: false, card_pads: false, lines: 2 },
-    Step { gaps: false, pads: false, card_pads: false, lines: 1 },
+/// go (pure decoration, before anything that says something), then the
+/// SPACES list's reserve, then the cards' second lines. The spaces section
+/// takes what each leaves over. (No step has pads: list tiles stack edge
+/// to edge, two-tone, at every height.)
+pub const STEPS: [Step; 4] = [
+    Step { gaps: true, listed: true, lines: 2 },
+    Step { gaps: false, listed: true, lines: 2 },
+    Step { gaps: false, listed: false, lines: 2 },
+    Step { gaps: false, listed: false, lines: 1 },
 ];
 
 /// The whole screen: the panel, NEEDS YOU, agents, shells, spare rows, the
@@ -2148,26 +2218,25 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     // lose detail.
     let min = spaces_min(view, avail);
     let avail = avail - min;
-    // Every step with the shells' whole section (each button with its pad
-    // while the gaps last, then edge to edge), then the last step with their
-    // one line: one ladder, so as the frame shrinks neither the step nor the
-    // shells' form ever comes back.
-    let (padded, full, line) = (shells_section(bar, w, true), shells_section(bar, w, false), shells_line(bar, w));
+    // Every step with the shells' whole section, then the last step with
+    // their one line: one ladder, so as the frame shrinks neither the step
+    // nor the shells' form ever comes back.
+    let (full, line) = (shells_section(bar, w), shells_line(bar, w));
     let end = STEPS.len() - 1;
-    let tries = STEPS.iter().enumerate().map(|(i, s)| (i, *s, if s.card_pads { &padded } else { &full })).chain([(end, STEPS[end], &line)]);
+    let tries = STEPS.iter().enumerate().map(|(i, s)| (i, *s, &full)).chain([(end, STEPS[end], &line)]);
     // The SPACES list stood on end says something (each space's counts):
-    // the steps that keep decoration (gaps, pads) must leave it its rows
-    // too; the plain steps only its held-back minimum.
-    let listed = if min == 0 { 0 } else { spaces_listed(view, w).saturating_sub(min) };
-    let fits = tries.into_iter().find_map(|(i, Step { gaps, pads, card_pads, lines }, shells)| {
-        let needs = needs_block(view, cx, lines, card_pads);
-        let agents = agents_section(view, cx, usize::MAX, gaps, pads).0;
+    // the steps that keep it ([`Step::listed`]) leave it its rows; the
+    // others only its held-back minimum.
+    let reserve = if min == 0 { 0 } else { spaces_listed(view, w).saturating_sub(min) };
+    let fits = tries.into_iter().find_map(|(i, Step { gaps, listed, lines }, shells)| {
+        let needs = needs_block(view, cx, lines);
+        let agents = agents_section(view, cx, usize::MAX, gaps).0;
         let gap_rows = usize::from(gaps) * (2 + usize::from(!shells.is_empty()));
-        let room = if gaps || pads || card_pads { avail.saturating_sub(listed) } else { avail };
-        (needs.len() + agents.len() + shells.len() + gap_rows <= room).then(|| (i as u8, gaps, lines, needs, agents, shells.clone()))
+        let room = if listed { avail.saturating_sub(reserve) } else { avail };
+        (needs.len() + agents.len() + shells.len() + gap_rows <= room).then(|| (i as u8, gaps, needs, agents, shells.clone()))
     });
-    let (step, gaps, lines, mut needs, (mut agents, agents_step), shells) = match fits {
-        Some((i, gaps, lines, needs, agents, shells)) => (i, gaps, lines, needs, (agents, 0), shells),
+    let (step, gaps, needs, (mut agents, agents_step), shells) = match fits {
+        Some((i, gaps, needs, agents, shells)) => (i, gaps, needs, (agents, 0), shells),
         None => {
             // The agents compress, the shells in one line (none in under 4
             // rows). NEEDS YOU gets what the agents' one-line shape leaves
@@ -2175,12 +2244,12 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
             // and always leaves the agents a row.
             let shells = if avail >= 4 { line.clone() } else { Vec::new() };
             let avail = avail - shells.len();
-            let n1 = needs_block(view, cx, 1, false).len();
+            let n1 = needs_block(view, cx, 1).len();
             let floor = (avail / 3).max(2);
             let room = n1.min(avail.saturating_sub(agents_one_line(view)).max(floor)).min(avail - 1);
             let needs = needs_cut(view, cx, room);
-            let agents = agents_section(view, cx, avail - needs.len(), false, false);
-            (STEPS.len() as u8, false, 1, needs, agents, shells)
+            let agents = agents_section(view, cx, avail - needs.len(), false);
+            (STEPS.len() as u8, false, needs, agents, shells)
         }
     };
     // The section gaps the step keeps. (No gap above NEEDS YOU when nothing
@@ -2191,7 +2260,7 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     // The SPACES and PARKED sections take the rows left over (the richest
     // form that fits: they are content); what they leave buys spacing back,
     // never detail: the agents' shape (and so the ladder's steps) is
-    // already settled, and their pads never come back.
+    // already settled. Never a gap between cards: they stack, two-tone.
     let used = |n: &[Row], a: &[Row], g: [bool; 3]| top.len() + n.len() + a.len() + shells.len() + g.iter().filter(|x| **x).count();
     let room = h.saturating_sub(used(&needs, &agents, [gap_needs, gap_agents, gap_shells]));
     let (spaces, parked) = bottom(view, w, room, bar.prefix, opts.msg.as_deref());
@@ -2203,17 +2272,7 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
             spare -= 1;
         }
     }
-    // 2. The NEEDS YOU cards' pads: every card or none (only when none were
-    // cut: a `… N more need you` section stays as it is).
-    if needs.len() == needs_block(view, cx, lines, false).len() {
-        let padded = needs_block(view, cx, lines, true);
-        let more = padded.len() - needs.len();
-        if more > 0 && more <= spare {
-            needs = padded;
-            spare -= more;
-        }
-    }
-    // 3. A gap above each space header in AGENTS (but the first): all or none.
+    // 2. A gap above each space header in AGENTS (but the first): all or none.
     // (The last use of spare rows: PARKED never takes any, it is always its
     // one header line.)
     let missing = group_gaps(&agents, w);

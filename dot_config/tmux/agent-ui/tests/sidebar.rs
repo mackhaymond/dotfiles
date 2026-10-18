@@ -149,6 +149,34 @@ fn uncapped(l: &str) -> String {
     format!(" {} ", l.replace(ARROW, " ").split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" "))
 }
 
+/// `l` is `name`'s space header in AGENTS: a band that starts at the very
+/// edge with its `▌` block (a SPACES row or a card starts on the canvas),
+/// then the space's number chip (when it has one) and its name (the
+/// client's chip ends in the arrow), then the branch and counts.
+fn is_group(l: &str, name: &str) -> bool {
+    let Some(rest) = l.strip_prefix('▌') else { return false };
+    let w: Vec<String> = uncapped(rest).split_whitespace().map(String::from).collect();
+    match w.as_slice() {
+        [n, s, ..] if n.chars().all(|c| c.is_ascii_digit()) => s == name,
+        [s, ..] => s == name,
+        _ => false,
+    }
+}
+
+/// The AGENTS section's lines: from its header to SHELLS, else to the
+/// SPACES section → (its first line, the lines).
+fn agents_section(lines: &[String]) -> (usize, &[String]) {
+    let start = at(lines, " AGENTS");
+    let end = lines.iter().position(|l| l.starts_with(" SHELLS")).unwrap_or_else(|| spaces_at(lines).0);
+    (start, &lines[start..end])
+}
+
+/// The line of `name`'s space header, in the AGENTS section only.
+fn group(lines: &[String], name: &str) -> usize {
+    let (start, part) = agents_section(lines);
+    start + part.iter().position(|l| is_group(l, name)).unwrap_or_else(|| panic!("no {name:?} header in AGENTS: {lines:#?}"))
+}
+
 /// Where the SPACES section starts (its header, else the gap above its
 /// chips) → (that line, the PARKED header's line).
 fn spaces_at(lines: &[String]) -> (usize, usize) {
@@ -186,7 +214,7 @@ fn once_renders_the_fixture() {
     // Cards are tinted surfaces; the canvas is the terminal's own background
     // (no background code at all) on the title and section headers.
     assert!(raw[fail].contains(";48;2;"), "{:?}", raw[fail]);
-    // Then the agents, grouped by space under a dot and the name (no rule).
+    // Then the agents, grouped by space under a header tile (no rule).
     let agents = at(&lines, " AGENTS");
     assert!(lines[agents].ends_with("all spaces "), "{lines:#?}");
     for y in [0, agents] {
@@ -198,8 +226,10 @@ fn once_renders_the_fixture() {
     }
     let s_row = lines.iter().find(|l| l.starts_with(" ▎ s  Long running")).unwrap();
     assert!(s_row.contains(" ⚙ ") && s_row.ends_with("⠋ working  "), "{s_row:?}");
-    for t in [" ● work", " ● zeta"] {
-        assert!(lines[agents..].iter().any(|l| l.starts_with(t) && !l.contains('─')), "{t}: {lines:#?}");
+    for t in ["work", "zeta"] {
+        let y = group(&lines, t);
+        // A band tinted in the space's colour, never a rule.
+        assert!(!lines[y].contains('─') && raw[y].contains(";48;2;"), "{t}: {lines:#?}");
     }
     // The spaces (each a row, or chips), then PARKED with nothing parked.
     let pills = spaces_text(&lines);
@@ -230,12 +260,14 @@ fn once_follows_the_scope_options() {
     // section says which scope).
     let classic = once();
     assert!(classic[0].starts_with(" NEEDS YOU") && !classic.iter().any(|l| l.contains("SHELLS")), "{classic:#?}");
-    assert!(agents_part(&classic)[0].ends_with("all spaces ") && agents_part(&classic).iter().any(|l| l.starts_with(" ● zeta")),
+    assert!(agents_part(&classic)[0].ends_with("all spaces ") && agents_part(&classic).iter().any(|l| is_group(l, "zeta")),
         "{classic:#?}");
     s.tmux(&["set-option", "-g", "@spaces", "on"]);
     let lines = once();
     let body = agents_part(&lines);
-    assert!(body[0].ends_with(" ⌥V  this space  ") && body[1].starts_with(" ● work") && body[1].contains("◉1 ◐1 ○1"), "{lines:#?}");
+    // (The client's space: its chip ends in the arrow.)
+    assert!(body[0].ends_with(" ⌥V  this space  ") && is_group(&body[1], "work") && body[1].contains(ARROW) && body[1].contains("◉1 ◐1 ○1"),
+        "{lines:#?}");
     // (The client sits on work:1: its row is the highlighted one.)
     for t in [" ▌ a  Which deck", " ▎ s  Long running", "   d  Quiet one"] {
         assert!(body.iter().any(|l| l.starts_with(t)), "{t}: {lines:#?}");
@@ -245,7 +277,7 @@ fn once_follows_the_scope_options() {
     assert!(lines.iter().any(|l| l.starts_with(" ▌ f  Broken thing")), "{lines:#?}");
     s.tmux(&["set-option", "-g", "@strip_scope", "all"]);
     let lines = once();
-    assert!(agents_part(&lines).iter().any(|l| l.starts_with(" ● zeta")), "{lines:#?}");
+    assert!(agents_part(&lines).iter().any(|l| is_group(l, "zeta")), "{lines:#?}");
     // Back to classic: byte for byte what it drew before any option was set.
     s.tmux(&["set-option", "-gu", "@strip_scope"]);
     s.tmux(&["set-option", "-gu", "@spaces"]);
@@ -261,7 +293,7 @@ fn once_follows_the_scope_options() {
     // the client is on it.
     let sh = lines.iter().position(|l| l.starts_with(" SHELLS")).unwrap_or_else(|| panic!("{lines:#?}"));
     assert!(lines[sh + 1].starts_with(" ▌ ⌥1  ⌂ home"), "{lines:#?}");
-    assert!(lines.iter().any(|l| l.starts_with(" ● work")), "{lines:#?}");
+    group(&lines, "work");
 }
 
 /// The spaces read each session's @space_index and @space_hidden off the
@@ -283,7 +315,7 @@ fn once_lists_spaces_by_space_index() {
     assert!(pos.windows(2).all(|p| p[0] < p[1]), "{lines:#?}");
     assert!(!lines.iter().any(|l| l.contains("secret")), "{lines:#?}");
     // The groups: ⌃N order too (zeta before work, unlike by name).
-    assert!(at(&lines, " ● zeta") < at(&lines, " ● work"), "{lines:#?}");
+    assert!(group(&lines, "zeta") < group(&lines, "work"), "{lines:#?}");
 }
 
 /// Right-click → park, end to end, with a FAKE stash.sh (`AGENT_UI_SCRIPTS`):

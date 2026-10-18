@@ -796,20 +796,23 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
     W ━━━━━━━━━┃━━━━━  60% (+17%)      border); the key table's mark a solid
    ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀    tab on its top pad; one meter per window
    NEEDS YOU                      2    NEEDS YOU, agent-jump.sh order: cards are
-   ▌ a  Slides export          ✕ 3m    tiles tinted in the state colour, a ▌
-   ▌    failed                         stripe (letter, title; reason)
-   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ▌ a  Slides export          ✕ 3m    two-tone tiles tinted in the state
+   ▌    failed                         colour, a ▌ stripe (letter, title; reason)
    AGENTS          ⌥V  all spaces      THE BODY: every space (or the client's
-   ● main   main          ◉1 ◐1 ○1    in space scope); every agent a 2-line
-   ▌ d  Sidebar status ⠹ working      tile; the second line (below), the age
-   ▌  › Running cargo test     26s     at its end; a state stripe at its left
-   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀    edge, a half-block pad under it while
-     h  Canvas Syllabus        idle    there is room (else edge to edge,
-        Synced 4 assignments     1h    zebra-shaded)
-   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  ▌  1  main   main       ◉1 ◐1 ○1    in space scope) under a header that reads
+   ▌ d  Sidebar status ⠹ working      like its SPACES row (a full-width band
+   ▌  › Running cargo test     26s     tinted in its colour, a ▌ block at the
+                                       edge, ` N ` solid in it over its agents'
+                                       key-caps, the name bold
+     h  Canvas Syllabus        idle    in it; the client's space `@space_here`,
+        Synced 4 assignments     1h    `2 cs35l▶`); every agent a 2-line card,
+  ▌  2 cs35l ▶  main           ○1     stacked edge to edge with no pad: title
+   ▎ w  Eight Component  ✓ done        row on `tile`, detail row on the darker
+   ▎    I wrote tic-tac-toe     9s     `tile_lo`; the key-cap in the SPACE's
+                                       colour; a state stripe down its left
    SHELLS                              the client's space's shells, one-row
    ▌ ⌥1  ⌂ ~                           button tiles (⌥N; click: go there),
-                                       the active one lifted
+                                       edge to edge, the active one lifted
                                        spare rows collect here
    SPACES                              one row per space, ⌃N order: ` N ` on
     1 main ▶            ◐1 ○3          its colour, the name, its counts; the
@@ -826,9 +829,17 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   `@space_here`: one chip in its colour (peach without one, red while the
   prefix is armed) ending in the powerline arrow U+E0B0 (`▶` above). Every
   tile and button leaves one canvas column at each side of the sidebar;
-  section and space headers are text on the canvas. Palette: `tile`
-  (#282839), `tile_alt` (the zebra's other shade), `tile_hi` (the client's
-  agent, the active shell), key-caps on `surface1`. The panel shows no
+  section headers are text on the canvas, a space's header in AGENTS a
+  band across the WHOLE width (no margins, so never mistaken for a card) on
+  its `@space_color` at 22% over the canvas, a `▌` block in the colour at
+  the edge. Palette: `tile` (#30314a, a card's title row) and `tile_lo`
+  (#28283b, its detail row, plainly off the canvas so an empty one is
+  still part of its card; the pair is also the zebra for one-row tiles
+  stacked edge to edge), `tile_hi` / `tile_hi_lo` (#31394f / #2a3044: the
+  client's agent's two rows; `tile_hi` the active shell too); key-caps
+  solid in their space's colour. `colour0`-`colour15` space colours are
+  read as WezTerm's catppuccin-mocha ANSI colours (what the terminal
+  draws), not stock xterm's. The panel shows no
   space chip (SPACES says which space the client is in) and no shells
   (their own section). Under pressure every agent row stays the same
   height: idle agents fold first, then every agent goes to one line at
@@ -874,15 +885,19 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   never borrows the words of a Claude session naming the same window.
 
 - **Letters**: every agent tile (both scopes) and every NEEDS YOU card
-  starts, after its stripe, with a ` a ` key-cap (a raised `surface1` chip):
-  the agent's lifetime letter, from
+  starts, after its stripe, with a ` a ` key-cap: a solid chip in the
+  agent's SPACE's `@space_color` (dark ink; peach without one), the colour
+  of its space header's ` N ` chip, so an agent says which space it lives
+  in anywhere in the list. The letter is the agent's lifetime letter, from
   the menu's own assignment (`menu::letters::of_view`, see
   [letter keys](#agent-ui-menu-letter-keys)). A live sidebar persists the
   letters it assigns to `@agent_key` exactly like the menu (one batched
   background write, `KeyMemo`), so UB's ⌥W table, the menu and every
   sidebar agree; `--once` never writes. While the client's key table is
-  `jump` (⌥W armed) every badge turns peach and the panel's top pad carries
-  a `⌥W jump │ type a letter` tab. No letter (past 26): a blank badge; no letter
+  `jump` (⌥W armed) every badge is inverted (a peach letter on `crust`, which
+  no space's chip looks like, a peach one included) and the panel's top pad carries
+  a `⌥W jump │ type a letter` tab. No letter (past 26): a blank badge (still
+  in the space's colour); no letter
   anywhere: no column. The 1-9 ordinals and slot numbers are gone.
 - **Status block** (`status::Bar`, built from the one per-tick snapshot,
   before home windows are hidden; no script runs per frame):
@@ -913,8 +928,8 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   the selection hint (under 6); a panel with nothing in it is not drawn.
 - **Stash selection** (prefix v, stash.sh `sel-start` / `sel-move`): live
   while the client is in the `stash` key table or any window still has
-  `@stash_sel`. Every selected agent tile (both lines) and shell button is
-  drawn on a mauve tint with a mauve stripe, and the panel's first row reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
+  `@stash_sel`. Every selected agent tile (both lines: 18% and 11%) and
+  shell button is drawn on a mauve tint with a mauve stripe, and the panel's first row reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
   many keys as fit). stash.sh posts the focus notice after sel-start,
   sel-move, sel-cancel and the park, so it shows at once.
 
@@ -935,7 +950,8 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   colour, red while the prefix is armed, ending in the U+E0B0 arrow. As
   rows run short: the client's space and those with an attention agent and
   `+K more spaces` (click: the menu's All tab), then chips on as few as one
-  line (`@space_here` and modules). A click switches the client to that
+  line (`@space_here` and modules; every line of chips is kept over the gap
+  above PARKED). A click switches the client to that
   space (`agent-jump.sh goto` on its active window, in that session). The
   index, hidden mark and colour are SESSION options read through the
   window-row format, so they cost no extra tmux call.
@@ -959,14 +975,15 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   back.
 - **Density ladder** (`layout::STEPS`): agents lose detail last. Before
   anything else the spaces' gap and one line of chips are held back, with
-  the PARKED header; the steps that keep decoration (gaps, pads) must also
-  leave the SPACES list its rows. A frame then takes the first step at
-  which every agent still gets two lines: (1) SPACES and PARKED take the
-  leftover rows, the richest form that fits (every space a row, else the
-  client's and the attention ones, else chips); (2)
-  the blank gaps go; (3) the pads go, the cards' and shell buttons' first,
-  then the agents' (tiles edge to edge, alternating `tile` / `tile_alt`);
-  (4) NEEDS YOU cards go to 1 line; (5) the shells to one line of buttons.
+  the PARKED header; the first two steps (with the gaps, and the one right
+  after) also leave the SPACES list its rows. A frame then takes the first
+  step at which every agent still gets two lines: (1) SPACES and PARKED
+  take the leftover rows, the richest form that fits (every space a row,
+  else the client's and the attention ones, else chips); (2) the blank
+  gaps go; (3) the SPACES list's reserve goes; (4) NEEDS YOU cards go to 1
+  line; (5) the shells to one line of buttons. There are no pads at any
+  step: list tiles always stack edge to edge, two-line cards two-tone,
+  one-row tiles alternating `tile` / `tile_lo`.
   Only then do agents compress (idle folded into a `○○○ 3 idle · …` tile,
   every agent one line, folded again, spaces collapsed to their header,
   then `… N more`), with NEEDS YOU held to at least 2 rows and a third of
@@ -977,12 +994,14 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
 - **Colour**: the canvas is the terminal's own background (`Color::Reset`,
   `--once` writes no `48;` code on it), so the split is WezTerm's colour.
   The surfaces are tiles and buttons in solid fills (no box-drawing lines
-  around anything but a toast card): `tile` / `tile_alt` / `tile_hi`,
-  NEEDS YOU cards in their state colour mixed over the canvas (`Ink::Mix`),
-  the stash selection's mauve, the key-caps and the status-line modules.
-  Rows left over after all that buy spacing back: the gaps above AGENTS,
-  SHELLS and NEEDS YOU, the cards' pads, the gaps between spaces in
-  AGENTS (never PARKED: it stays one line). Dim text on any
+  around anything but a toast card): `tile` / `tile_lo` / `tile_hi` /
+  `tile_hi_lo`, NEEDS YOU cards in their state colour mixed over the canvas
+  (`Ink::Mix`, 14% title row, 8% detail row), space headers on their
+  `@space_color` at 22% (`Ink::Tint`), the stash selection's mauve, the
+  key-caps and the status-line modules. Rows left over after all that buy
+  spacing back: the gaps above AGENTS, SHELLS and NEEDS YOU, then the gaps
+  between spaces in AGENTS (never a gap between cards; never PARKED: it
+  stays one line). Dim text on any
   surface is `overlay2` (`overlay` there is under 3:1).
 - **Sync (told, not polling)**: the loop sleeps in `poll(2)` on stdin, the
   signal pipe, one Darwin-notification fd (`notify_register_file_descriptor`,
