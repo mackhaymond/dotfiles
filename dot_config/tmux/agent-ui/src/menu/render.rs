@@ -750,7 +750,7 @@ mod tests {
         assert!(f[11].starts_with("│  f  ◐ Handy.app Speech ⚙"), "{}", f[11]); // linked: the same letter
         assert!(f[12].starts_with("│     ▪ 5 parked ⇥"), "{}", f[12]);
         assert!(f[31].starts_with("├─") && f[31].ends_with("─┤"));
-        assert!(f[32].starts_with("│  a–j  go  ⌥W  close  ⏎  open  /  search  ␣  actions  ⇥  filter"), "{}", f[32]);
+        assert!(f[32].starts_with("│  a–k  go  ⌥W  close  ⏎  open  /  search  ␣  actions  ⇥  filter"), "{}", f[32]);
         assert!(f[33].starts_with("╰") && f[33].ends_with("╯"));
         // Badges: the letter in reverse video on its state's colour.
         let b = buffer(&mut m, 110, 34);
@@ -765,7 +765,9 @@ mod tests {
         assert_eq!((b[(8, 9)].bg, b[(8, 9)].fg), (color("surface1"), color("red")));
         assert_eq!(b[(30, 6)].bg, color("base"));
         // What the keys mean in this frame.
-        assert_eq!(m.drawn.letters.keys().collect::<String>(), "adfghjs");
+        // (k: main's shell, lettered from the one pool after the agents, though the menu lists no row for it.)
+        assert_eq!(m.drawn.letters.keys().collect::<String>(), "adfghjks");
+        assert_eq!(m.drawn.letters[&'k'].win, "@5");
         assert_eq!(m.drawn.letters[&'f'].key, RowKey::Agent("main".into(), "@3".into()));
         assert_eq!(m.drawn.rows.len(), 8);
         assert_eq!(m.preview_rows, 0);
@@ -864,10 +866,10 @@ mod tests {
         let f = frame(&mut m, 110, 34);
         assert!(f[32].contains("close Kua Yu focus timing? y/n"), "{}", f[32]);
         m.act(Key::Char('n'), &mut NoEffects);
-        m.act(Key::Char('k'), &mut NoEffects); // nobody's letter
+        m.act(Key::Char('l'), &mut NoEffects); // nobody's letter
         let mut buf = Buffer::empty(Rect::new(0, 0, 110, 34));
         render(&mut m, &mut buf, crate::text::now());
-        assert!(dump(&buf, false)[32].contains("no agent on k"));
+        assert!(dump(&buf, false)[32].contains("nothing on l"));
         // ⌥W says where it goes.
         let mut snap = fixture();
         for w in &mut snap.windows {
@@ -878,7 +880,7 @@ mod tests {
         assert!(f[32].contains("⌥W  last"), "{}", f[32]);
         // Narrow: the least needed keys go first; go and ⌥W stay.
         let f = frame(&mut m, 40, 20);
-        assert!(f[18].contains("a–j  go") && f[18].contains("⌥W  last") && !f[18].contains("back"), "{}", f[18]);
+        assert!(f[18].contains("a–k  go") && f[18].contains("⌥W  last") && !f[18].contains("back"), "{}", f[18]);
     }
 
     /// Past 26 agents: no badge, the row still drawn and navigable.

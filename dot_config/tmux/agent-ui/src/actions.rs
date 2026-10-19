@@ -8,7 +8,7 @@
 //! | go to a parked one| `tmux run-shell -b "stash.sh unstash <win> <tty>"`       | `Roster.go`       |
 //! | next              | `bash agent-jump.sh next <tty>`                          | `Roster.jump`     |
 //! | back (⌥X)         | `bash nav.sh back <tty>` (docs/nav.md)                   | (none)            |
-//! | go to a session   | goto on that session's ACTIVE window, in that session    | `Strip.click`     |
+//! | go to a space     | goto on its HOME window (else its active one), there     | `Strip.click`     |
 //! | park              | `run-shell -b "stash.sh stash <win>"`                    | `Roster.act` H    |
 //! | close             | `run-shell -b "closed-tabs.sh close <pane>"` (agent pane)| `Roster.act` x    |
 //! | discard (parked)  | `run-shell -b "stash.sh kill-many <win>"`                | `Roster.act` x    |
@@ -302,20 +302,30 @@ impl Actions {
         }
     }
 
-    /// Strip.click on a session header: goto that session's ACTIVE window,
-    /// in THAT session (even for a linked window). Select-then-switch, so the
-    /// visit discharges the tint like a tab click.
+    /// Strip.click on a space (its header in AGENTS, its dock row or chip): goto that
+    /// space's HOME window (`@space_home`: going to a space goes to its home
+    /// shell, as ⌃N does), else, for a session with no home, its ACTIVE
+    /// window; in THAT session (even for a linked window). Select-then-
+    /// switch, so the visit discharges the tint like a tab click.
     pub fn goto_session(&self, snap: &Snapshot, client: &str, session: &str) -> Result<(), String> {
-        let w = snap
-            .windows
-            .iter()
-            .find(|w| w.session == session && w.active)
-            .ok_or_else(|| format!("session {session} is gone"))?;
+        let w = space_landing(snap, session).ok_or_else(|| format!("session {session} is gone"))?;
         self.jump("goto", client, &[&w.id, session])?;
         self.focus_shell(w);
         Ok(())
     }
 
+}
+
+/// Where going to `session` lands ([`Actions::goto_session`]): its home
+/// window (`@space_home` 1), else its active window; None when the session
+/// is gone.
+pub fn space_landing<'a>(snap: &'a Snapshot, session: &str) -> Option<&'a Window> {
+    let mut ws = snap.windows.iter().filter(|w| w.session == session);
+    let home = ws.clone().find(|w| w.home);
+    home.or_else(|| ws.find(|w| w.active))
+}
+
+impl Actions {
     /// The current row of `win` in `session`, or the Python's refusal text.
     fn recheck<'a>(&self, snap: &'a Snapshot, win: &str, session: &str) -> Result<&'a Window, String> {
         if snap.rows(win).next().is_none() {
@@ -518,6 +528,22 @@ mod tests {
         assert_eq!(Actions::focus_shell_command(&w), None);
         let w = Window::parse(&row("main", 1, "@2", &[])).unwrap();
         assert_eq!(Actions::focus_shell_command(&w), None);
+    }
+
+    /// Going to a space lands on its HOME window, wherever the session's
+    /// active window is; a session with no home lands on its active window.
+    #[test]
+    fn a_space_lands_on_its_home() {
+        use crate::tmux::tests::row;
+        let snap = Snapshot::parse(&[
+            row("main", 1, "@1", &[("home", "1")]),
+            row("main", 2, "@2", &[("state", "running"), ("active", "1")]),
+            row("work", 1, "@3", &[]),
+            row("work", 2, "@4", &[("active", "1")]),
+        ].join("\n"));
+        assert_eq!(space_landing(&snap, "main").map(|w| w.id.as_str()), Some("@1"));
+        assert_eq!(space_landing(&snap, "work").map(|w| w.id.as_str()), Some("@4"));
+        assert!(space_landing(&snap, "gone").is_none());
     }
 
     #[test]

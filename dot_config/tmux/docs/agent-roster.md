@@ -285,33 +285,44 @@ list stay as they were last drawn.
 The agent-ui menu takes no number keys any more: every listed agent owns a
 home-row-first **letter** for its whole life, drawn as a badge at the start
 of its row, and pressing it goes there at once (no second key, no wait).
+Shells draw from the SAME pool (one set of letters for agents and shells,
+`menu::letters::lettered`): the menu lists only agents, but a shell's
+letter pressed there still goes to that shell.
 
-- **Who has one**: every agent window the menu lists (an `@agent_state`, in
-  a shown session: not parked, not in `agents`/`tasks`/`scratch`/
-  `btop-popup`), idle ones included. Parked tabs, plain shells and spaces'
-  home windows (`@space_home`) have none. A window linked into two sessions
-  is one agent (one letter, keyed by window id).
+- **Who has one**: every agent window (an `@agent_state`, in a shown
+  session: not parked, not in `agents`/`tasks`/`scratch`/`btop-popup`),
+  idle ones included, AND every shell of every space (a window without an
+  `@agent_state` in a session that is not `@space_hidden`). Never a space's
+  home window (`@space_home`: the space itself, reached by ⌃N), never a
+  parked tab. A window linked into two sessions is one window (one letter,
+  keyed by window id). A window keeps its letter for life across the
+  shell/agent change: a shell where claude starts stays listed, and so does
+  an agent that exits back to its shell.
 - **One assignment, two UIs**: the menu and the CMD+B sidebar both call
   `menu::letters::of_view` (snapshot + unscoped view + their own in-flight
   `KeyMemo`), so every open menu and sidebar shows and writes the same
   letters from the same snapshot; a write tmux already shows is never sent
   again, and two writers that raced converge on the next refresh (a
-  duplicate goes to the lower window id). UB's ⌥F table reads the same
-  `@agent_key`.
+  duplicate goes to the lower window id). spaces.conf's ⌥W `jump` table
+  reads the same `@agent_key`, for agents and shells alike (never a home).
 - **Alphabet**, in hand-out order: `a s d f g h j k l q w e r t y u i o p z
-  x c v b n m` (26). Past 26 agents a row has no badge but is still
+  x c v b n m` (26). Past 26 windows a row has no badge but is still
   navigable.
 - **Stored** on the window as the tmux user option `@agent_key`, read in the
   same snapshot as everything else (no extra tmux call). On each refresh
-  (`menu::letters::assign`): an agent whose `@agent_key` is a valid letter
-  keeps it, unless another listed agent holds it too, where the lower
-  numeric window id wins and the other is reassigned; every agent without a
-  valid letter takes the lowest free one in alphabet order, agents taken in
-  display order. A letter whose holder is no longer listed (closed, parked,
-  exited) is free at once; if an unlisted window still carries a letter a
-  listed agent now holds, its stale `@agent_key` is unset, so it gets a free
-  letter (not its old one back) when it returns. A parked agent whose letter
-  nobody took gets it back on unpark.
+  (`menu::letters::assign`): a window whose `@agent_key` is a valid letter
+  keeps it, unless another listed window holds it too, where the lower
+  numeric window id wins and the other is reassigned; every window without
+  a valid letter takes the lowest free one in alphabet order, windows taken
+  in DISPLAY order (spaces in ⌃N order, then by name; in each, its agents by
+  window index, then its shells). A letter whose holder is no longer listed
+  (closed, parked, made a home) is free at once; if an unlisted window
+  still carries a letter a listed window now holds, its stale `@agent_key`
+  is unset, so it gets a free letter (not its old one back) when it
+  returns. A parked window whose letter nobody took gets it back on
+  unpark. Readers that care only about agents (tmux-mcp, the
+  tmux-workspace recipes) trust `@agent_key` as an agent's only while
+  `@agent_state` is set: a key without a state is a shell's letter.
 - **Writes**: the frame shows the assignment immediately (in memory); only
   when it differs from what tmux stores does the menu (or a live sidebar)
   send ONE batched
@@ -322,7 +333,8 @@ of its row, and pressing it goes there at once (no second key, no wait).
 - **What a letter resolves against**: the frame ON SCREEN. Each letter maps
   to the window that held it when the frame was drawn (its first row on
   screen, else its first row in the All order, so a letter whose row is
-  scrolled off or on another filter still goes). If that agent closed and a
+  scrolled off or on another filter still goes; a shell, which has no row,
+  goes to the shell in its space). If that window closed and a
   newcomer took its letter before the next frame, the key still means the
   old window (the jump fails and says so), never the newcomer. A letter
   nobody holds says "no agent on k".
@@ -384,8 +396,9 @@ letters above).
   A window linked into two sessions shows the same number on both rows.
 
 **Sidebar**: no longer draws slots (nor the space-scope 1-9 ordinals;
-Command-N still goes by position): every agent row and NEEDS YOU card
-starts with the agent's [letter](#agent-ui-menu-letter-keys) badge instead.
+Command-N still goes by position): every agent row, shell row and NEEDS
+YOU card starts with the window's [letter](#agent-ui-menu-letter-keys)
+badge instead.
 
 Known limit: two unstamped agents that first appear in the SAME frame are
 numbered together in fill order; the watcher numbers them the same way.
@@ -550,11 +563,11 @@ in wezterm.lua. `CMD+B` (wezterm.lua) opens it, and closes it again if
 the tab already has one. It runs `agent-ui sidebar` when
 `~/.local/bin/agent-ui` exists (see [agent-ui](#agent-ui-primary-and-the-python-fallback));
 otherwise this same program, `agent-roster.py --strip`, which the rest of
-this section describes. agent-ui's sidebar starts each agent row and NEEDS
-YOU card with the agent's lifetime letter, the same one the Option-W menu
-uses (see [letter keys](#agent-ui-menu-letter-keys)), and replaces the tmux
-status line while it is open. agent-ui's sidebar has its own layout (status
-block, NEEDS YOU, agents, spaces; no log), its own sync (Darwin notices, not a poll) and leaves when
+this section describes. agent-ui's sidebar starts each agent row, shell row
+and NEEDS YOU card with the window's lifetime letter, the same one the menu
+and ⌥W use (see [letter keys](#agent-ui-menu-letter-keys)), and replaces the
+tmux status line while it is open. agent-ui's sidebar has its own layout
+(status block, NEEDS YOU, agents and shells by space, the dock; no log), its own sync (Darwin notices, not a poll) and leaves when
 its tmux client does: see [agent-ui sidebar](#agent-ui-sidebar-layout-sync-lifecycle).
 **The Python fallback (`--strip`) keeps the older layout and the 1 s poll
 described in the rest of this section; it was not changed.**
@@ -628,16 +641,17 @@ described in the rest of this section; it was not changed.**
   chosen `@strip_scope` (`chosen_scope`).
   **agent-ui's sidebar** (used instead when installed) implements the same
   scope (`view::Scope`, `ViewModel::apply_scope`): same options, same
-  resolution, same hidden/stash fallback, same shell rule, same ordinals,
-  same Option-V / title toggle (`set-option -g @strip_scope`, the old scope
+  resolution, same hidden/stash fallback, same ordinals (shells, though,
+  are rows of their own under each space's agents; see below), same
+  Option-V / title toggle (`set-option -g @strip_scope`, the old scope
   kept and `couldn't set @strip_scope` shown on failure; the toggle is the
   AGENTS header's scope word once a client is known, else the ` agents` /
   ` space` title).
   In its own layout: the header's counts are that session's in space scope,
   the agents section (`agents  this space`, else `by space`) holds only the
-  client's session's rule and rows; every row keeps its letter badge (no
-  ordinals any more), and NEEDS YOU, the spaces list and parked stay
-  global. A `@strip_scope` set from outside (tmux's `M-v`)
+  client's session's rule and rows (its agents and shells); every row keeps
+  its letter badge (no ordinals any more), and NEEDS YOU, the spaces list
+  and parked stay global. A `@strip_scope` set from outside (tmux's `M-v`)
   shows at once when the binding posts the focus notice (see
   [agent-ui sidebar](#agent-ui-sidebar-layout-sync-lifecycle)). Its client row carries one more field than the
   Python's, `#{@space_hidden}` (the client's session's), for the hidden
@@ -805,22 +819,48 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
    ▎  d  Sidebar status   ⠹ working      BAND of its colour with a ▌ at the edge
    ▎     › Running cargo test     26s    (only it: "where am I"), any other
       h  Canvas Syllabus                 header on the canvas; ` N ` solid in
-         Synced 4 assignments      1h    the colour, the name bold in it. Every
-                                         agent a 2-line card on the card grid:
-    2  cs35l   main                ○1    rail, key-cap, title (bold when it has
-   ▎  w  Eight Component     ✓ done      a state), the state word right; idle
-   ▎     I wrote tic-tac-toe       9s    says NOTHING (no rail, no word)
-
-   SHELLS                                the client's space's shells, one-row
-   ▎  ⌥1  ⌂ ~                            buttons (⌥N; click: go there)
+         Synced 4 assignments      1h    the colour, the name bold in it. The
+      j  >_ agent-ui                     header IS the space's home (click: go
+      k  >_ nvim                         home). Every agent a 2-line card on
+                                         the card grid: rail, key-cap, title
+    2  cs35l   main                ○1    (bold when it has a state), the state
+   ▎  w  Eight Component     ✓ done      word right; idle says NOTHING (no
+   ▎     I wrote tic-tac-toe       9s    rail, no word). Then the space's
+                                         shells, one row each on the canvas
+                                         (`>_` here = the terminal glyph)
                                          spare rows collect here
    ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄    THE DOCK: one panel to the last row
    ▌ 1  main             ◐1 ○3           every space a row (the client's on its
      2  bai                 ○2           band, its chip red on prefix), or chips;
-    SHELLS  ⌥1  ⌂ ~   ⌥2  nvim           the shells' line when folded in;
     PARKED  3                            PARKED: always one line, a message or
    ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀    the watcher on the right
   ```
+
+- **Spaces, homes and shells**: a space's HOME window (`@space_home`) is
+  never listed; the space's header stands for it. A click on the header
+  (or on the space's dock row or chip) goes to the home window
+  (`actions::space_landing`: the home, else the session's active window),
+  and while the client is ON the home the header wears the client's own
+  lift instead of its band (`tile_me` and a full lavender cell down its
+  right edge, as the client's own agent card). Every other window without
+  an agent state is a SHELL of its space, listed in its space's group
+  after the agents, one row each (`layout::shell_row`): on the card grid
+  (rail, key-cap, label) but on the CANVAS, no tile, so it reads quieter
+  than the agent cards; the key-cap exactly an agent's (its letter from the
+  same pool, inverted while ⌥W is armed); then the terminal glyph
+  (`SHELL_GLYPH`, nf-fa-terminal U+F120, faint) and the label in `sub`:
+  the folder while it sits at a shell prompt (`~`, or the cwd's last
+  part), else the running command (`view::shell_label`, spaces.conf's
+  `@space_shell_label` rule; a home's dashboard pane never lends its
+  name). The client's own shell is lifted like its own agent card; prefix
+  v's selection tints it mauve. A click goes there (`Target::Shell`,
+  agent-jump.sh goto; a right-click never parks it). In the steps that
+  fold the idle agents, two or more shells fold into one line of pills
+  (`layout::shells_line`: each its cap and label, `+K` for those that do
+  not fit). In ALL scope every space with agents OR shells gets a group,
+  so a space with only shells has one; a `@space_hidden` session lists no
+  shells. There is no SHELLS section any more, and no shells' line in the
+  dock.
 
   The look follows OpenCode's and herdr's sidebars: the sidebar paints
   its own canvas, `mantle` (#181825, a shade under the terminals' `base`),
@@ -829,10 +869,12 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   tone and weight (bold `text` titles over `overlay2` details, bold
   `overlay2` section labels), not lines; blank rows group sections and
   spaces. Palette: the zebra `tile` (#30314a) and `tile_lo` (#28283b): every
-  card is one colour, both rows, consecutive cards (agents, shells)
-  alternating the two, afresh under each space's header; `tile_hi`
-  (#31394f: the active shell); `tile_me` (#474a66, lavender 30% over the
-  canvas: the client's own agent, below); the two
+  card is one colour, both rows, consecutive agent cards alternating the
+  two, afresh under each space's header (shell rows sit on the canvas);
+  `tile_hi` (#31394f: lifted the old SHELLS section's active shell; no row
+  wears it now, but bands still keep apart from it); `tile_me` (#474a66,
+  lavender 30% over the canvas: the client's own agent or shell, or its
+  space's header while it is on the home, below); the two
   panels (usage, dock) `tile_lo` behind `▄` / `▀` caps. The client's
   space's band is its colour over the canvas at the least strength (16%
   up) that keeps it 20+ RGB apart from the canvas and every card shade
@@ -843,9 +885,9 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   space colours are read as WezTerm's catppuccin-mocha ANSI colours (what
   the terminal draws), not stock xterm's. The panel shows no space chip
   (the dock says which space the client is in) and no shells. Under
-  pressure every agent row stays the same height: idle agents fold first,
-  then every agent goes to one line at once; the SHELLS section becomes
-  one line in the dock before any agent loses detail.
+  pressure every agent row stays the same height: idle agents fold first
+  (a space's shells into one line with them), then every agent goes to one
+  line at once.
 - **Cards and state**: a state rail `▎` down a card's left edge in its
   state's colour (blue working, yellow asking, red failed, green done; the
   client's own idle agent lavender; the stash selection a heavier mauve
@@ -856,13 +898,15 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   question), a live blurb after a blue `›`, the age at its end.
 - **Your own card** ("you are here" at a glance): the client's own agent
   card is LIFTED, both rows, on `tile_me` (#474a66, lavender 30% over the
-  canvas: 30+ RGB apart from both zebra shades, the active shell, the stash
+  canvas: 30+ RGB apart from both zebra shades, `tile_hi`, the stash
   selection and the NEEDS YOU tints; every space's band keeps 12+ apart
   from it), with a full lavender `█` cell down its right edge (from 26
   columns), its key-cap solid, its title bold `text`, its dim text `sub`
   (`overlay2` is about 3:1 there). The left state rail is as on any card.
   A window linked into two spaces is current in both (window ids): only
-  the copy in the client's own space (`cur_session`) is lifted.
+  the copy in the client's own space (`cur_session`) is lifted. The same
+  lift marks the client's own shell row and, while the client is on its
+  space's home, that space's header.
 
 - **The second line** (`layout::second_line`): a WORKING agent's live
   activity, a few words of what it does right now, after a blue `›`
@@ -902,19 +946,19 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   blurb (no transcript reader for it yet): its run detail shows, and it
   never borrows the words of a Claude session naming the same window.
 
-- **Letters**: every agent tile (both scopes) and every NEEDS YOU card
-  starts, after its rail and a pad, with a ` a ` key-cap in the agent's
-  SPACE's `@space_color` (peach without one), the colour of its space
-  header's ` N ` chip, so an agent says which space it lives in anywhere
-  in the list. Quiet by default: the letter bold in the colour on the
+- **Letters**: every agent tile and shell row (both scopes) and every
+  NEEDS YOU card starts, after its rail and a pad, with a ` a ` key-cap in
+  the window's SPACE's `@space_color` (peach without one), the colour of
+  its space header's ` N ` chip, so a window says which space it lives in
+  anywhere in the list. Quiet by default: the letter bold in the colour on the
   colour at 22% over its card (`text` for a dark colour). SOLID (dark ink
   on the colour) only where you look next: the client's own agent, an
-  asking or failed one, every NEEDS YOU card. The letter is the agent's lifetime letter, from
-  the menu's own assignment (`menu::letters::of_view`, see
-  [letter keys](#agent-ui-menu-letter-keys)). A live sidebar persists the
-  letters it assigns to `@agent_key` exactly like the menu (one batched
-  background write, `KeyMemo`), so UB's ⌥W table, the menu and every
-  sidebar agree; `--once` never writes. While the client's key table is
+  asking or failed one, every NEEDS YOU card. The letter is the window's lifetime letter (one
+  pool for agents and shells), from the menu's own assignment
+  (`menu::letters::of_view`, see [letter keys](#agent-ui-menu-letter-keys)).
+  A live sidebar persists the letters it assigns to `@agent_key` exactly
+  like the menu (one batched background write, `KeyMemo`), so the ⌥W
+  `jump` table, the menu and every sidebar agree; `--once` never writes. While the client's key table is
   `jump` (⌥W armed) every cap is inverted (a bold peach letter on `crust`,
   darker than any surface: no calm cap looks like it, quiet or solid, a
   peach space's included) and the panel's top cap carries a `⌥W jump │
@@ -925,12 +969,8 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   - a tab on the usage panel's top pad: a red ` prefix ` chip while
     `#{client_key_table}` is `prefix`, a peach ` ⌥W jump ` chip and a
     ` type a letter ` one while it is `jump` (no panel: a row of their own);
-  - this space's shells, in the SHELLS section under the agents (windows
-    without `@agent_state`, window-index order, so the home window is shell
-    1, exactly space.sh's `SHELLS`), each `⌥N` plus its label (spaces.conf's
-    rule: a shell shows `~` or its cwd's last part, anything else its window
-    name; `⌂` marks home), the active one lifted; a click goes there
-    (`Target::Shell`, agent-jump.sh goto; a right-click never parks it);
+  - (no shells: they are rows of their space in the agents section now,
+    see **Spaces, homes and shells** above);
   - usage meters: `@codex_<w>_used` / `_expected` / `_delta` / `_resets`
     (`<w>` = `session` / `weekly` / `scoped`, falling back to `_text`) with
     their `_color`; the percent bold, the pace as `+17%` / `−4%` (a real
@@ -953,7 +993,7 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
 - **Stash selection** (prefix v, stash.sh `sel-start` / `sel-move`): live
   while the client is in the `stash` key table or any window still has
   `@stash_sel`. Every selected agent tile (both lines, mauve 18%) and
-  shell button is drawn on a mauve tint with a mauve stripe, and the panel's first row reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
+  shell row is drawn on a mauve tint with a mauve stripe, and the panel's first row reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
   many keys as fit). stash.sh posts the focus notice after sel-start,
   sel-move, sel-cancel and the park, so it shows at once.
 
@@ -963,8 +1003,7 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   each rule.
 - **The dock** (the status bar is hidden, so this is where every space is
   seen): one `tile_lo` panel anchoring the bottom (OpenCode's prompt box),
-  after a gap: its `▄` cap, the spaces, the shells' line when they are
-  folded in, PARKED, its `▀` cap. The spaces: one row per session,
+  after a gap: its `▄` cap, the spaces, PARKED, its `▀` cap. The spaces: one row per session,
   sessions with `@space_hidden` 1 left out, ordered by the session option
   `@space_index` (space.sh's number: main = 1, then the registry),
   unnumbered ones last by name; the agents section's groups use the same
@@ -978,8 +1017,9 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   (click: the menu's All tab), then chips on as few as one line (` N ` then
   ` name ` on `surface0`; the client's name bold on its colour at 30% over
   the dock; an attention agent's glyph inside it), each line of chips
-  going only after the caps. A click switches the client to that space
-  (`agent-jump.sh goto` on its active window, in that session). The index,
+  going only after the caps. A click switches the client to that space's
+  HOME (`agent-jump.sh goto` on its `@space_home` window, else its active
+  one, in that session), as ⌃N does. The index,
   hidden mark and colour are SESSION options read through the window-row
   format, so they cost no extra tmux call.
 - **Stash** (PARKED, the dock's last line): always ONE line, at every
@@ -1009,12 +1049,12 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   (every space a row, else the client's and the attention ones, else
   chips; its caps go before a line of chips); (2) the blank rows go, the
   gaps between spaces in AGENTS before the section gaps; (3) the dock's
-  reserve goes; (4) NEEDS YOU cards go to 1 line; (5) the shells to one
-  line of buttons in the dock. There are no pads at any
+  reserve goes; (4) NEEDS YOU cards go to 1 line. There are no pads at any
   step: list tiles always stack edge to edge, every card one colour, consecutive
   cards alternating `tile` / `tile_lo`.
-  Only then do agents compress (idle folded into a `○○○ 3 idle · …` tile,
-  every agent one line, folded again, spaces collapsed to their header,
+  Only then do agents compress (idle folded into a `○○○ 3 idle · …` tile
+  and a space's 2+ shells into one line, every agent one line, folded
+  again, spaces collapsed to their header, their shells gone with it,
   then `… N more`), with NEEDS YOU held to at least 2 rows and a third of
   the body (`… N more need you`). Never two heights of agent row in one
   frame. Nothing is dropped silently: every agents-section row records the
@@ -1029,7 +1069,7 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   14% / 9%), the client's space's band (`layout::band`), the stash
   selection's mauve, the key-caps and the status-line modules; tests
   re-check every one against the canvas and its neighbours. Rows left
-  over after all that buy spacing back: the gaps above AGENTS, SHELLS and
+  over after all that buy spacing back: the gaps above AGENTS and
   NEEDS YOU, then the gaps between spaces in AGENTS (never a gap between
   cards; never PARKED: it stays one line). Dim text is `overlay2` (about
   6:1 on the canvas, 4:1 or better on any surface; `overlay` there is
@@ -1139,7 +1179,8 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
 - **Home windows**: a window with `@space_home` 1 (a space's landing
   screen) is never an agent row and never counted, in any scope, with
   `@spaces` on or off (its agent options are ignored; its space still shows
-  as the client's). It is the space's shell 1 in the status block.
+  as the client's). It has no row and no letter: the space's header stands
+  for it (a click goes there; lifted while the client is on it).
 - **Tests**: `tests/sidebar.rs` drives the live loop with test-only notice
   names (state and focus notices reflected in well under the 5 s net, scope
   set from outside, a window switch, the prefix / jump / stash key tables, a

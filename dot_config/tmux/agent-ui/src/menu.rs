@@ -234,7 +234,7 @@ fn once(tmux: Tmux, a: &Args, w: u16, h: u16) -> ExitCode {
         match key {
             Some(k) => menu.sel = Some(k),
             None => {
-                eprintln!("agent-ui menu: no agent on {sel}");
+                eprintln!("agent-ui menu: nothing on {sel}");
                 return ExitCode::from(2);
             }
         }

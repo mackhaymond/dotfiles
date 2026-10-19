@@ -58,10 +58,10 @@
 //! - **The whole UI.** While any sidebar is open the tmux status line is
 //!   hidden and its content drawn here ([`status`]: the usage panel with
 //!   the meters, the stale save, the prefix / ⌥W / selection marks; the
-//!   SHELLS section; the spaces buttons); the
+//!   spaces buttons); the
 //!   registry behind `@sidebar_open` restores it when the last one leaves.
-//!   Agent rows carry their lifetime letters (`@agent_key`, shared with the
-//!   menu and persisted like it).
+//!   Agent and shell rows carry their lifetime letters (`@agent_key`, one
+//!   pool shared with the menu and ⌥W, persisted like it).
 //! - **Toasts.** scripts/notify.sh, the replacement for `tmux
 //!   display-message` while a sidebar is open, writes `@toast` and posts the
 //!   focus notice; the refresh that follows reads it in the one snapshot and
@@ -230,7 +230,8 @@ fn hide_homes(snap: &mut Snapshot) {
 /// never an agent row (with `@spaces` off it would be the classic one).
 ///
 /// Letters: [`letters::of_view`], THE assignment the agents menu runs too, on
-/// the unscoped view; every agent row and NEEDS YOU card gets its letter.
+/// the unscoped view; every agent row, shell row and NEEDS YOU card gets its
+/// letter.
 /// `keys`: the live sidebar's in-flight `@agent_key` writes; the writes
 /// returned are the ones to send (None: `--once`, nothing to send).
 fn build_view(core: &mut Core, client: Option<&str>, keys: Option<&mut KeyMemo>) -> (ViewModel, Vec<KeyWrite>) {
@@ -240,7 +241,8 @@ fn build_view(core: &mut Core, client: Option<&str>, keys: Option<&mut KeyMemo>)
     let persist = keys.is_some();
     let assigned = letters::of_view(&core.snapshot, &view, keys);
     let letter = |a: &mut crate::view::Agent| a.letter = assigned.letters.get(&a.window_id).copied();
-    view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()).for_each(letter);
+    // Agents and shells alike (one pool): a shell row shows its letter too.
+    view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut().chain(s.plain.iter_mut())).for_each(letter);
     view.needs.iter_mut().for_each(|n| letter(&mut n.agent));
     view.apply_scope(&core.snapshot);
     let homes: HashSet<&str> = core.snapshot.windows.iter().filter(|w| w.home).map(|w| w.id.as_str()).collect();
@@ -1199,9 +1201,10 @@ mod tests {
     }
 
     /// The sidebar and the agents menu assign the SAME letters from the same
-    /// snapshot (one shared function, `letters::of_view`): unique, home
-    /// windows never lettered, a duplicate going to the lower window id, a
-    /// parked window's stale claim unset. The writes are the menu's, sent
+    /// snapshot (one shared function, `letters::of_view`): unique across
+    /// agents AND shells (one pool, each space's agents then its shells),
+    /// home windows never lettered, a duplicate going to the lower window
+    /// id, a parked window's stale claim unset. The writes are the menu's, sent
     /// once, and never again once tmux shows them.
     #[test]
     fn letters_are_shared_with_the_menu_and_persisted_once() {
@@ -1214,7 +1217,8 @@ mod tests {
             row("work", 1, "@3", &[("state", "needs-input")]),
             row("work", 2, "@4", &[("state", "idle"), ("key", "s")]),
             row("stash", 1, "@5", &[("state", "idle"), ("key", "a")]),
-            format!("\x1fclient\x1f{cl}\x1f@2\x1fmain"),
+            // (@spaces on: shells are lettered too.)
+            format!("\x1fclient\x1f{cl}\x1f@2\x1fmain\x1fon\x1f\x1f"),
         ].join("\n"));
         let menu = crate::menu::rows::Data::build(&raw, Some(cl), 0.0, &crate::collate::Collator::new("C"), None, None);
         let mut a = app();
@@ -1227,10 +1231,14 @@ mod tests {
         for (id, l) in &got {
             assert_eq!(*l, menu.letter(id), "{id}: the menu agrees");
         }
-        assert_eq!((menu.letter("@9"), menu.letter("@6"), menu.letter("@5")), (None, None, None));
+        // main's shell: its letter from the same pool, after every agent.
+        let shell = v.spaces.iter().flat_map(|s| s.plain.iter()).find(|x| x.window_id == "@6").map(|x| x.letter);
+        assert_eq!((shell, menu.letter("@6")), (Some(Some('g')), Some('g')));
+        assert_eq!((menu.letter("@9"), menu.letter("@5")), (None, None));
         // NEEDS YOU cards carry the same letter.
         assert_eq!(v.needs.iter().map(|n| n.agent.letter).collect::<Vec<_>>(), [Some('d')]);
-        let want: Vec<KeyWrite> = vec![("@2".into(), Some('a')), ("@3".into(), Some('d')), ("@4".into(), Some('f')), ("@5".into(), None)];
+        let want: Vec<KeyWrite> =
+            vec![("@2".into(), Some('a')), ("@3".into(), Some('d')), ("@4".into(), Some('f')), ("@6".into(), Some('g')), ("@5".into(), None)];
         assert_eq!((&writes, &menu.key_writes), (&want, &want));
         // Idempotent: the same snapshot again sends nothing (in flight)...
         assert!(build_view(&mut a.core, Some(cl), Some(&mut keys)).1.is_empty());

@@ -25,7 +25,8 @@
 #                             among windows with @agent_state, by window_index;
 #                             the agent sidebar numbers agents the same way)
 #   shell N SID               go to shell N of SID (same ordinal, among shells,
-#                             home = 1; the status line shows them)
+#                             home = 1; no key runs it since Option-N was
+#                             dropped: shells are reached by letter, ⌥W)
 #   next|prev SID             on an agent: next / previous agent; on a shell:
 #                             next / previous shell; wrapping
 #   respawn-home PANE         the pane-died hook: a home shell (or dashboard)
@@ -1158,8 +1159,8 @@ preview_dir() {
 }
 
 # pick-tab's preview of row KEY: a space's tabs (shells in tab order, home
-# first, then the agents with their ⌥W letter and summary), or a folder's
-# listing.
+# first and unlettered, the rest with their ⌥W letter; then the agents with
+# their ⌥W letter and summary), or a folder's listing.
 cmd_preview_tab() {
   local key="${1:-}"
   case "$key" in
@@ -1169,13 +1170,14 @@ cmd_preview_tab() {
   esac
   local sid="\$${key#s:}" rows k home letter summary state wname cmd path
   rows="$(t list-windows -t "$sid" -F "#{?#{@agent_state},a,s}${US}#{@space_home}${US}#{@agent_key}${US}#{@agent_summary}${US}#{@agent_state}${US}#{window_name}${US}#{pane_current_command}${US}#{pane_current_path}" 2>/dev/null)" || return 0
-  local n=0
+  local n=0 mark
+  # Shells as the status line marks them: home unlettered (⌃N reaches it),
+  # the others by their ⌥W letter, · until they have one.
   printf 'shells\n'
   while IFS="$US" read -r k home letter summary state wname cmd path; do
     [[ "$k" == s ]] || continue
-    n=$((n + 1))
-    [[ "$home" == 1 ]] && cmd=home
-    printf '  %d  %-10s %s\n' "$n" "$cmd" "$(printf '%s\n' "$path" | tilde_paths)"
+    if [[ "$home" == 1 ]]; then mark=" " cmd=home; else mark="${letter:-·}"; fi
+    printf '  %s  %-10s %s\n' "$mark" "$cmd" "$(printf '%s\n' "$path" | tilde_paths)"
   done <<<"$rows"
   printf '\nagents\n'
   n=0

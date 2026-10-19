@@ -240,6 +240,12 @@ pub struct Agent {
     /// A Codex agent's rollout (transcript) path (`@agent_rollout`), "" for
     /// any other: where its blurb comes from.
     pub rollout: String,
+    /// The window is its space's HOME (`@space_home` 1): the space itself,
+    /// never a shell row of its own and never lettered.
+    pub home: bool,
+    /// What a SHELL row says ([`shell_label`]): the folder while it sits at
+    /// a shell prompt, else the running command.
+    pub shell: String,
 }
 
 impl Agent {
@@ -293,6 +299,8 @@ impl Agent {
             selected: w.stash_sel,
             blurb: None,
             rollout: w.rollout.clone(),
+            home: w.home,
+            shell: shell_label(w),
         }
     }
 
@@ -393,9 +401,56 @@ pub struct Space {
     pub hidden: bool,
     /// The session's `@space_color` as set (`#rrggbb`; "" when unset).
     pub color: String,
+    /// The space's HOME window (`@space_home` 1), when it has one: going to
+    /// the space goes there.
+    pub home: Option<String>,
+}
+
+/// A shell's label, as spaces.conf's `@space_shell_label`: a shell process
+/// shows where it is (`~`, or the cwd's last part), anything else its name
+/// (tmux's automatic name: the command). The window name stands in for
+/// `pane_current_command` (no extra field). While a space home's DASHBOARD
+/// pane is the active one, the automatic name is the dashboard's command,
+/// so the shell under it is labelled by its cwd ([`Window::path`] is the
+/// shell's then).
+pub fn shell_label(w: &Window) -> String {
+    let name = w.name.trim();
+    let dash_active = w.pane_list.iter().any(|p| p.dash && p.active);
+    if dash_active || matches!(name.trim_start_matches('-'), "zsh" | "bash" | "sh" | "fish") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = w.path.trim_end_matches('/');
+        if path.is_empty() {
+            return text::sanitize(name);
+        }
+        if !home.is_empty() && path == home.trim_end_matches('/') {
+            return "~".into();
+        }
+        return text::sanitize(path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("/"));
+    }
+    text::sanitize(name)
+}
+
+/// THE space order, everywhere (the sidebar's groups and dock, the menu's
+/// groups, the letters' display order): `@space_index` (⌃N) first, spaces
+/// without one after (by name: the view's order, kept by a stable sort).
+pub fn space_order(sp: &Space) -> (bool, Option<u32>) {
+    (sp.index.is_none(), sp.index)
 }
 
 impl Space {
+    /// The space's SHELLS: every window without an agent state but its home,
+    /// by window index, wherever the view keeps it (`plain`, or `agents`
+    /// for the client's own window before [`ViewModel::apply_scope`]). A
+    /// hidden session (`@space_hidden`) is no space: no shells.
+    pub fn shells(&self) -> Vec<&Agent> {
+        if self.hidden {
+            return Vec::new();
+        }
+        let mut v: Vec<&Agent> = self.agents.iter().chain(&self.plain).filter(|a| a.state.is_empty() && !a.home).collect();
+        v.sort_by_key(|a| a.index);
+        v
+    }
+
     pub fn to_json(&self) -> Value {
         obj![
             ("name", &self.name), ("is_current", self.is_current), ("counts", counts_json(&self.counts)),
@@ -524,6 +579,11 @@ pub struct ViewModel {
     /// The sidebar's scope ([`apply_scope`](Self::apply_scope)); the classic
     /// every-session view until that is called.
     pub scope: Scope,
+    /// SHELLS are a thing (`@spaces` "on", the global option read off this
+    /// view's client row, else any client's, as [`ViewModel::apply_scope`]
+    /// does): listed in their spaces and lettered. Off (the classic
+    /// sidebar, no ⌥W table): no shell is listed or lettered.
+    pub shells: bool,
 }
 
 /// The sidebar's SCOPE (agent-roster.py `Strip.scope`): `"space"` shows only
@@ -652,6 +712,7 @@ impl ViewModel {
                 index: ws.first().and_then(|w| w.space_index),
                 hidden: ws.first().is_some_and(|w| w.space_hidden),
                 color: ws.first().map(|w| w.space_color.clone()).unwrap_or_default(),
+                home: ws.iter().find(|w| w.home).map(|w| w.id.clone()),
             });
         }
 
@@ -694,6 +755,7 @@ impl ViewModel {
             locale: collator.name().to_string(),
             slot_width: hotkeys::slot_width(slots.values().copied().max()),
             scope: Scope::default(),
+            shells: cl.or(snap.clients.first()).is_some_and(|c| c.spaces == "on"),
         }
     }
 
@@ -754,6 +816,14 @@ impl ViewModel {
     pub fn agents(&self) -> impl Iterator<Item = &Agent> {
         self.spaces.iter().flat_map(|s| s.agents.iter())
     }
+
+    /// The spaces in THE space order ([`space_order`]).
+    pub fn ordered_spaces(&self) -> Vec<&Space> {
+        let mut v: Vec<&Space> = self.spaces.iter().collect();
+        v.sort_by_key(|s| space_order(s));
+        v
+    }
+
 
     pub fn to_json(&self) -> Value {
         obj![

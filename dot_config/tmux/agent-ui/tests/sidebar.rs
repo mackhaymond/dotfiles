@@ -24,6 +24,9 @@ impl Server {
         let s = Server { name: format!("agentui-sb-{}-{tag}", std::process::id()) };
         let (w, h) = (w.to_string(), h.to_string());
         s.tmux(&["new-session", "-d", "-s", "main", "-x", &w, "-y", &h, LIFE]);
+        // main's first window is its HOME (as space.sh makes it): the space
+        // itself, never a shell row, never lettered.
+        s.tmux(&["set-option", "-w", "-t", "main:0", "@space_home", "1"]);
         s
     }
 
@@ -254,8 +257,10 @@ fn once_follows_the_scope_options() {
         lines[start.expect("the agents section")..end].to_vec()
     };
     // Classic until an option says otherwise (no usage here, so no card and
-    // no space chip; work has no shells, so no SHELLS section; the agents
-    // section says which scope).
+    // no space chip; never a SHELLS section: shells are rows of their space;
+    // the agents section says which scope). Letters: every agent first
+    // (work a s d, zeta f), then the shells (with @spaces on: the nested
+    // client's window, main's one shell, g).
     let classic = once();
     assert!(classic[0].starts_with(" NEEDS YOU") && !classic.iter().any(|l| l.contains("SHELLS")), "{classic:#?}");
     assert!(agents_part(&classic)[0].ends_with("all spaces ") && agents_part(&classic).iter().any(|l| is_group(l, "zeta")),
@@ -276,6 +281,11 @@ fn once_follows_the_scope_options() {
     s.tmux(&["set-option", "-g", "@strip_scope", "all"]);
     let lines = once();
     assert!(agents_part(&lines).iter().any(|l| is_group(l, "zeta")), "{lines:#?}");
+    // Every space: main is a group for its one shell, a prompt line.
+    let main = group(&lines, "main");
+    assert!(lines[main + 1].starts_with("    g  ❯ "), "{lines:#?}");
+    // Classic (no @spaces): no shell rows at all.
+    assert!(!classic.iter().any(|l| l.contains('❯')), "{classic:#?}");
     // Back to classic: byte for byte what it drew before any option was set.
     s.tmux(&["set-option", "-gu", "@strip_scope"]);
     s.tmux(&["set-option", "-gu", "@spaces"]);
@@ -287,11 +297,10 @@ fn once_follows_the_scope_options() {
     s.tmux(&["switch-client", "-c", &tty, "-t", "work:0"]);
     let lines = once();
     assert!(!agents_part(&lines).iter().any(|l| l.contains("home")), "{lines:#?}");
-    // ...it is the space's shell 1 in the SHELLS section (⌥1, ⌂), lifted:
-    // the client is on it.
-    let sh = lines.iter().position(|l| l.starts_with(" SHELLS")).unwrap_or_else(|| panic!("{lines:#?}"));
-    assert!(lines[sh + 1].starts_with(" ▎  ⌥1  ⌂ home"), "{lines:#?}");
-    group(&lines, "work");
+    // ...the space's header IS it: lifted (its lavender edge), the client
+    // being on it.
+    let y = group(&lines, "work");
+    assert!(lines[y].trim_end().ends_with('█') && !lines.iter().any(|l| l.contains("SHELLS")), "{lines:#?}");
 }
 
 /// The spaces read each session's @space_index and @space_hidden off the
@@ -385,7 +394,8 @@ fn home_with_dashboard(s: &Server) -> (String, String) {
 
 /// A space home's dashboard pane, against the real format: never counted,
 /// never the window's path or shell label, never the agent pane, and a
-/// click on the home shell (⌥1) leaves focus on the shell under it.
+/// click on the space's header (the space IS its home: no home row) lands
+/// on the home with focus on the shell under the dashboard.
 #[test]
 fn the_dashboard_pane_is_never_a_target() {
     let s = Server::start("dash", 34, 30);
@@ -393,7 +403,7 @@ fn the_dashboard_pane_is_never_a_target() {
     let (dash, shell) = home_with_dashboard(&s);
     let tmux = agent_ui::Tmux::with_socket(Some(Socket::Name(s.name.clone())));
     let snap = tmux.snapshot();
-    let home = snap.windows.iter().find(|w| w.home).expect("the home row");
+    let home = snap.windows.iter().find(|w| w.home && w.session == "work").expect("the home row");
     assert_eq!((home.panes, home.has_dash(), home.focus_pane()), (1, true, Some(shell.as_str())), "{home:?}");
     assert!(home.path.ends_with("/tmp"), "{:?}", home.path);
     assert_eq!(home.capture_target(), shell);
@@ -401,11 +411,12 @@ fn the_dashboard_pane_is_never_a_target() {
     // No dashboard elsewhere: the plain count and path, as before.
     let other = snap.windows.iter().find(|w| w.session == "work" && w.index == 1).unwrap();
     assert_eq!((other.panes, other.has_dash(), other.pane_list.len()), (1, false, 1));
-    // The status block: shell 1 is the home, labelled by the SHELL's cwd.
+    // The home is no row (its label, the shell's cwd `tmp`, nowhere): the
+    // space's header stands for it.
     let tty = s.nested_client("work", "main:8");
     let lines = plain(&s.sidebar(&["--once", "34x30", "--client", &tty]));
-    let home_row = |lines: &[String]| lines.iter().position(|l| l.contains("⌥1  ⌂ tmp"));
-    assert!(home_row(&lines).is_some(), "{lines:#?}");
+    let home_row = |lines: &[String]| lines.iter().position(|l| is_group(l, "work"));
+    assert!(home_row(&lines).is_some() && !lines.iter().any(|l| l.contains(" tmp")), "{lines:#?}");
     // The live sidebar, with a fake agent-jump.sh that just switches the
     // client: a click on ⌥1 lands on the home with the shell focused.
     let dir = std::env::temp_dir().join(format!("agentui-dash-{}", std::process::id()));
@@ -422,7 +433,7 @@ fn the_dashboard_pane_is_never_a_target() {
     wait_for("the first frame", || home_row(&lines()).is_some());
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(s.tmux(&["display-message", "-p", "-t", "work:0", "#{pane_id}"]).trim(), dash);
-    // A click on the ⌥1 row, wherever the SHELLS section put it.
+    // A click on work's header, wherever the AGENTS section put it.
     let (x, y) = (8, home_row(&lines()).unwrap() + 1);
     let click = format!("\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m");
     let hex: Vec<String> = click.bytes().map(|b| format!("{b:02x}")).collect();
@@ -689,8 +700,11 @@ fn the_sidebar_leaves_with_its_client() {
     let pid = s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_pid}"]).trim().to_string();
     assert_eq!((opt("@sidebar_open"), opt("@sidebar_pids"), opt("status")), ("1".into(), pid.clone(), "off".into()));
     wait_for("the status job", || job.exists());
-    // Letters persisted to @agent_key, as the menu would (work a s d, zeta f).
+    // Letters persisted to @agent_key, as the menu would (work a s d, zeta
+    // f). No @spaces here (classic): shells and the home take none.
     wait_for("the letters", || s.tmux(&["show-options", "-wqv", "-t", "work:3", "@agent_key"]).trim() == "d");
+    assert_eq!(s.tmux(&["show-options", "-wqv", "-t", "main:8", "@agent_key"]).trim(), "", "a shell, classic: none");
+    assert_eq!(s.tmux(&["show-options", "-wqv", "-t", "main:0", "@agent_key"]).trim(), "", "the home: never lettered");
     assert!(screen().lines().any(|l| l.starts_with("    d  Quiet one")), "{}", screen());
     // The client's key table, told by the focus notice: the prefix mark, the
     // ⌥W hint, prefix v's selection.

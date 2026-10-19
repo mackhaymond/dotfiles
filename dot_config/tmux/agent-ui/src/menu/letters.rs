@@ -1,23 +1,38 @@
-//! The menu's lifetime LETTER keys (`@agent_key`).
+//! The lifetime LETTER keys (`@agent_key`), one pool for agents AND shells.
 //!
-//! Every listed agent window (an agent state, in a shown session: not
-//! parked, not in a hidden session) owns one home-row-first letter for its
-//! whole life, stored on the window as the tmux user option `@agent_key`.
-//! Pressing it in the menu goes straight to that agent.
+//! Every LISTED window owns one home-row-first letter for its whole life,
+//! stored on the window as the tmux user option `@agent_key`. ⌥W then the
+//! letter (spaces.conf's `jump` table), the letter in the menu, or a click
+//! on its key-cap in the sidebar goes straight to it. Listed ([`lettered`]):
+//!
+//! - every AGENT window (an agent state, in a shown session: not parked,
+//!   not in a HIDDEN session), and
+//! - every SHELL of every space (a window without an agent state in a
+//!   session that is not `@space_hidden`), only while `@spaces` is on
+//!   ([`crate::view::ViewModel::shells`]: the classic setup has no ⌥W
+//!   table, so it letters agents only, as before),
+//!
+//! never a space's HOME window (`@space_home`): the space itself is the
+//! home, reached by its ⌃N. Agents and shells share the one pool, so no
+//! letter is ever both a shell's and an agent's. An agent that exits back
+//! to its shell, or a shell where an agent starts, stays listed, so it
+//! keeps its letter.
 //!
 //! On each refresh ([`assign`], pure):
-//! 1. An agent whose `@agent_key` is a valid letter keeps it, unless another
-//!    listed agent holds the same letter with priority: on a duplicate the
+//! 1. A window whose `@agent_key` is a valid letter keeps it, unless another
+//!    listed window holds the same letter with priority: on a duplicate the
 //!    lower NUMERIC window id keeps it, the other is reassigned.
-//! 2. Every other agent (no key, junk, a duplicate's loser) takes the lowest
-//!    free letter in [`ALPHABET`] order, agents taken in display order.
-//! 3. Past 26 agents there is no letter (the row is still navigable).
-//! 4. A letter whose holder is no longer listed (closed, parked, exited) is
-//!    free. An unlisted window that still carries a letter a listed agent
-//!    now holds has its stale `@agent_key` unset, so it cannot steal the
-//!    letter back when it returns (it gets the lowest free one instead).
+//! 2. Every other window (no key, junk, a duplicate's loser) takes the
+//!    lowest free letter in [`ALPHABET`] order: every AGENT first, in
+//!    DISPLAY order ([`lettered`]), then every shell in display order, so
+//!    past 26 a new agent still gets a letter before a shell does.
+//! 3. Past 26 windows there is no letter (the row is still navigable).
+//! 4. A letter whose holder is no longer listed (closed, parked, made a
+//!    home) is free. An unlisted window that still carries a letter a listed
+//!    window now holds has its stale `@agent_key` unset, so it cannot steal
+//!    the letter back when it returns (it gets the lowest free one instead).
 //!
-//! A window linked into two sessions is one agent (keyed by window id). The
+//! A window linked into two sessions is one window (keyed by id). The
 //! assignment is shown at once (in memory); what changed is persisted with
 //! ONE batched, fire-and-forget tmux command ([`command`], every part `-q`
 //! so one dead target cannot abort the rest), and [`KeyMemo`] makes sure the
@@ -25,7 +40,7 @@
 //! once more if a snapshot still hasn't shown it after [`RESEND_AFTER`].
 
 use crate::tmux::Snapshot;
-use crate::view::ViewModel;
+use crate::view::{Agent, Space, ViewModel};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -122,15 +137,32 @@ pub fn assign(listed: &[(String, String)], unlisted: &[(String, String)]) -> Ass
     Assigned { letters, writes }
 }
 
+/// THE DISPLAY ORDER of the lettered windows, the one the sidebar draws
+/// and the menu groups by: space by space in [`crate::view::space_order`]
+/// (⌃N, then by name), and in each space its agents (agent state, by window
+/// index), then its shells ([`Space::shells`]: no state, not the home, by
+/// window index; none in a `@space_hidden` session). Homes are never in it.
+/// A window linked into two spaces appears under both (its first entry
+/// counts). Built from an UNSCOPED view (the scope never drops a window).
+pub fn lettered(view: &ViewModel) -> Vec<&Agent> {
+    view.ordered_spaces()
+        .into_iter()
+        .flat_map(|s: &Space| {
+            let agents = s.agents.iter().filter(|a| !a.state.is_empty() && !a.home);
+            let shells = if view.shells { s.shells() } else { Vec::new() };
+            agents.chain(shells).collect::<Vec<&Agent>>()
+        })
+        .collect()
+}
+
 /// THE assignment for one snapshot, shared by the ⌥W menu and the CMD+B
 /// sidebar so the two (and every open copy of either) always agree and
 /// never fight over a letter: both call this with the snapshot and the
 /// UNSCOPED view built from it ([`crate::view::ViewModel::build_with`]; the
 /// sidebar's scope only renumbers, it never drops an agent from the view).
 ///
-/// - Listed: [`super::rows::listed`] (every shown space's agent windows, in
-///   display order), minus spaces' home windows (`@space_home`), which are
-///   never agents. Every other window of the snapshot is unlisted.
+/// - Listed: [`lettered`] (every shown space's agents and shells, in display
+///   order; never a home). Every other window of the snapshot is unlisted.
 /// - `keys`: the caller's in-flight writes ([`KeyMemo`]): settled against
 ///   this snapshot, used as each window's key while unseen, and the writes
 ///   returned are only those not already in flight (plus any due a resend),
@@ -155,10 +187,13 @@ pub fn of_view(snap: &Snapshot, view: &ViewModel, keys: Option<&mut KeyMemo>) ->
         let r = raw.get(id).copied().unwrap_or("");
         keys.as_deref().map_or_else(|| r.to_string(), |k| k.effective(id, r))
     };
-    let shown: Vec<(String, String)> = super::rows::listed(view)
-        .filter(|a| !homes.contains(a.window_id.as_str()))
-        .map(|a| (a.window_id.clone(), eff(&a.window_id)))
-        .collect();
+    // (A window that is a home in ANY of its links is a home: never listed.)
+    // The FILL order: every agent first (display order), then every shell,
+    // so past 26 a new agent still gets a letter before a shell does.
+    let (agents, shells): (Vec<&Agent>, Vec<&Agent>) =
+        lettered(view).into_iter().filter(|a| !homes.contains(a.window_id.as_str())).partition(|a| !a.state.is_empty());
+    let shown: Vec<(String, String)> =
+        agents.into_iter().chain(shells).map(|a| (a.window_id.clone(), eff(&a.window_id))).collect();
     let ids: HashSet<&str> = shown.iter().map(|(id, _)| id.as_str()).collect();
     let mut others: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
@@ -367,6 +402,108 @@ mod tests {
         let b = assign(&stored, &[]);
         assert_eq!((got(&b, "@27"), got(&b, "@28")), (Some('g'), None));
         assert_eq!(b.writes, [("@27".into(), Some('g'))]);
+    }
+
+    /// [`of_view`] over a snapshot, as the menu and the sidebar call it
+    /// (`--once`: no memo).
+    fn of_rows(rows: &[String]) -> Assigned {
+        let snap = Snapshot::parse(&rows.join("\n"));
+        let c = crate::collate::Collator::new("C");
+        let args = crate::view::BuildArgs { client: None, now: 0.0, collator: &c, git: None, log: vec![], watcher_age: None };
+        of_view(&snap, &ViewModel::build(&snap, args), None)
+    }
+
+    /// Spaces: work (⌃1: first), then hid and main by name. work: its home
+    /// @5, its shell @6. hid (`@space_hidden`): a shell @7, an agent @8.
+    /// main: its home @1, agents @2 (main:1) and @4 (main:3), a shell @3
+    /// (main:2).
+    fn pool(set: &[(&str, &str, &str)]) -> Vec<String> {
+        type Spec<'a> = (&'a str, u32, &'a str, Vec<(&'a str, &'a str)>);
+        let mut rows: Vec<Spec> = vec![
+            ("main", 0, "@1", vec![("home", "1")]),
+            ("main", 1, "@2", vec![("state", "running")]),
+            ("main", 2, "@3", vec![]),
+            ("main", 3, "@4", vec![("state", "idle")]),
+            ("work", 0, "@5", vec![("home", "1"), ("space_index", "1")]),
+            ("work", 1, "@6", vec![("space_index", "1")]),
+            ("hid", 1, "@7", vec![("space_hidden", "1")]),
+            ("hid", 2, "@8", vec![("state", "running"), ("space_hidden", "1")]),
+        ];
+        for (id, k, v) in set {
+            for r in rows.iter_mut().filter(|r| r.2 == *id) {
+                r.3.retain(|(f, _)| f != k);
+                r.3.push((k, v));
+            }
+        }
+        let mut out: Vec<String> = rows.iter().map(|(s, i, id, f)| crate::tmux::tests::row(s, *i, id, f)).collect();
+        // A client with @spaces on (shells are a thing), unless `set` says "classic".
+        if !set.iter().any(|(id, _, _)| *id == "classic") {
+            out.push("\x1fclient\x1f/dev/ttys999\x1f@2\x1fmain\x1fon\x1f\x1f".into());
+        }
+        out
+    }
+
+    /// ONE pool for agents and shells. Free letters go to every agent first
+    /// (display order: spaces ⌃N first, then by name; each space's agents
+    /// by index), then to the shells (display order); a home never; a
+    /// hidden session's shell never (its agent, as ever, yes).
+    #[test]
+    fn shells_share_the_pool_and_homes_never_get_one() {
+        let a = of_rows(&pool(&[]));
+        let got = |id: &str| a.letters.get(id).copied();
+        assert_eq!([got("@8"), got("@2"), got("@4"), got("@6"), got("@3")], [Some('a'), Some('s'), Some('d'), Some('f'), Some('g')]);
+        assert_eq!((got("@1"), got("@5"), got("@7")), (None, None, None));
+        assert_eq!(a.letters.len(), 5);
+        // No letter is both a shell's and an agent's.
+        assert_eq!(a.letters.values().collect::<HashSet<_>>().len(), a.letters.len());
+        // A shell holding a letter an agent also claims: one pool, the lower
+        // window id keeps it, the other moves.
+        let a = of_rows(&pool(&[("@3", "key", "a"), ("@6", "key", "a")]));
+        assert_eq!((a.letters["@3"], a.letters["@6"]), ('a', 'g'));
+        // @spaces off (classic, no ⌥W table): agents only, as before.
+        let a = of_rows(&pool(&[("classic", "", "")]));
+        assert_eq!((a.letters.len(), a.letters.get("@3"), a.letters.get("@6")), (3, None, None));
+    }
+
+    /// Past 26: agents before shells. With every letter but one held by
+    /// stored shells, a new agent takes the free one; a new shell gets none.
+    #[test]
+    fn agents_fill_before_shells_past_26() {
+        let mut rows: Vec<String> = Vec::new();
+        for (k, c) in ALPHABET.iter().take(25).enumerate() {
+            rows.push(crate::tmux::tests::row("main", k as u32 + 1, &format!("@{}", k + 1), &[("key", &c.to_string())]));
+        }
+        rows.push(crate::tmux::tests::row("main", 26, "@26", &[])); // a new shell, first in display order
+        rows.push(crate::tmux::tests::row("zz", 1, "@27", &[("state", "running")])); // a new agent, last
+        rows.push("\x1fclient\x1f/dev/ttys999\x1f@1\x1fmain\x1fon\x1f\x1f".into());
+        let a = of_rows(&rows);
+        assert_eq!((a.letters.get("@27"), a.letters.get("@26")), (Some(&'m'), None));
+        assert_eq!(a.writes, [("@27".to_string(), Some('m'))]);
+        // Stored letters still stick: the shells keep all 25.
+        assert_eq!(a.letters.len(), 26);
+    }
+
+    /// A window keeps its letter for life: a shell where an agent starts, and
+    /// an agent that exits back to its shell, keep theirs, nothing written.
+    /// A home carrying a contested letter has it unset like any unlisted
+    /// window.
+    #[test]
+    fn shell_and_agent_keep_their_letter_across_the_switch() {
+        let keys = [("@6", "key", "a"), ("@8", "key", "s"), ("@2", "key", "d"), ("@4", "key", "f"), ("@3", "key", "g")];
+        let stored = of_rows(&pool(&keys));
+        assert!(stored.writes.is_empty(), "{:?}", stored.writes);
+        // claude starts in the shell @3; the agent @2 exits to its shell.
+        let mut flip = keys.to_vec();
+        flip.extend([("@3", "state", "running"), ("@2", "state", "")]);
+        let a = of_rows(&pool(&flip));
+        assert_eq!(a.letters, stored.letters);
+        assert!(a.writes.is_empty(), "{:?}", a.writes);
+        // A home with a stale contested letter: unset; with a free one: left.
+        let mut stale = keys.to_vec();
+        stale.extend([("@1", "key", "a"), ("@5", "key", "z")]);
+        let a = of_rows(&pool(&stale));
+        assert_eq!(a.writes, [("@1".to_string(), None)]);
+        assert_eq!(a.letters.get("@1"), None);
     }
 
     #[test]

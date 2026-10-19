@@ -485,7 +485,7 @@ impl Menu {
         match self.drawn.letters.get(&c).cloned() {
             Some(t) => self.go(&t, fx),
             None => {
-                self.say(format!("no agent on {c}"));
+                self.say(format!("nothing on {c}"));
                 false
             }
         }
@@ -886,24 +886,29 @@ pub(crate) mod tests {
     #[test]
     fn letters_go_at_once() {
         let mut fx = Rec::default();
-        // Alpha:@8 a, main:@1 s, @2 d, @3 f, @4 g, work:@6 h, @7 j.
+        // Alpha:@8 a, main:@1 s, @2 d, @3 f, @4 g, work:@6 h, @7 j; then
+        // the shells: main's @5 k.
         assert!(menu().handle(&[Char('d')], &mut fx));
         assert!(menu().handle(&[Char('J')], &mut fx)); // capitals too
         assert!(menu().handle(&[Char('f')], &mut fx)); // linked: its first row on screen (main)
         assert_eq!(fx.calls, ["go @2 main", "go @7 work", "go @3 main"]);
+        // A shell's letter (one pool with the agents): the shell, though
+        // the menu lists no row for it.
+        assert!(menu().handle(&[Char('k')], &mut fx));
+        assert_eq!(fx.calls[3], "go @5 main");
         // j and k are letters now, not movement.
         let mut m = menu();
-        assert!(!m.handle(&[Char('k')], &mut fx)); // nobody holds k
-        assert_eq!(m.msg, "no agent on k");
+        assert!(!m.handle(&[Char('l')], &mut fx)); // nobody holds l
+        assert_eq!(m.msg, "nothing on l");
         assert_eq!(m.sel, Some(ak("work", "@6")));
         // Digits do nothing.
         assert!(!m.handle(&keys("123"), &mut fx));
-        assert_eq!(fx.calls.len(), 3);
+        assert_eq!(fx.calls.len(), 4);
         // Off screen (another filter): still the agent's.
         let mut m = Menu::new(data(), Tab::Parked);
         draw_all(&mut m);
         assert!(m.handle(&[Char('a')], &mut fx));
-        assert_eq!(fx.calls[3], "go @8 Alpha");
+        assert_eq!(fx.calls[4], "go @8 Alpha");
     }
 
     /// The drawn-frame rule: a letter freed and handed to a newcomer between

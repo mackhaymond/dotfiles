@@ -159,17 +159,22 @@ they name a space, shell, agent, letter, parked tab or NEEDS YOU.
   `@space_index` (main = 1); it lasts until closed (prefix Q). Hidden
   sessions (agents, tasks, stash, scratch, btop-popup) are never spaces;
   `stash` holds parked tabs.
-- **Shell** = a window of a space without `@agent_state`, numbered ⌥N per
-  space in window order among shells; shell 1 is the uncloseable **home**.
-  Written `<space>:<N>`: `cua-notch:2` is shell 2, not tmux window 2.
+- **Home** = each space's uncloseable first window; a space IS its home
+  (⌃N lands there). **Shell** = any other window of a space without
+  `@agent_state`; it has a **letter** from the agents' pool ("shell e" =
+  `@agent_key` e, no `@agent_state`), so ⌥W + letter reaches a shell or an
+  agent in any space. Homes never get a letter.
 - **Agent** = a window with `@agent_state` (idle/running/needs-input/failed/
-  done). Its **letter** (`@agent_key`, valid only while `@agent_state` is
-  set) is global and stable for its life: "agent D" = key d, any space
-  (⌥W d). ⌘N is the Nth agent of the current space and shifts, so name
-  agents by letter. Parked agents have no letter.
+  done). "Agent D" = `@agent_key` d with `@agent_state` set (trust the key
+  for an agent only then). A letter is global and kept for the window's
+  life, even when a shell becomes an agent or back. ⌘N is the Nth agent of
+  the current space and shifts, so name agents by letter. Parked windows
+  have no letter.
 - **Reach a peer** through the tmux MCP: pane `"d"` / `tmux://d/<handle>`
-  for an agent, `"cua-notch:2"` for a shell; `read_pane` to see what it is
-  doing, `message_agent` to tell it. Never send_keys into an agent's pane.
+  for an agent; a shell as `"cua-notch:2"` (shell 2 by window order, home
+  = 1, not tmux window 2; find "shell e" with the skill's recipe);
+  `read_pane` to see what it is doing, `message_agent` to tell it. Never
+  send_keys into an agent's pane.
 - Don't close, kill, park, move or rename tabs or spaces you don't own.
   User-facing messages go through `~/.config/tmux/scripts/notify.sh`, never
   `tmux display-message`. Test tmux only on a private `-L` server

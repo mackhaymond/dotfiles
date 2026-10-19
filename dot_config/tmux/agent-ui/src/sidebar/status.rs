@@ -141,22 +141,6 @@ pub struct Chip {
     pub hidden: bool,
 }
 
-/// One of this space's shells (a window without `@agent_state`), as
-/// space.sh numbers them: window-index order, the home window (always the
-/// lowest) first, so ⌥N (M-N, `space.sh shell N`) is the Nth here.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Shell {
-    pub n: u32,
-    pub label: String,
-    pub home: bool,
-    /// The session's active window.
-    pub active: bool,
-    /// In stash.sh's range selection (`@stash_sel`): the stash tint.
-    pub selected: bool,
-    pub win: String,
-    pub session: String,
-}
-
 /// One usage window of status-right (`S` / `W` / the scoped one), drawn as
 /// a meter: the numbers come from `@codex_<w>_used` / `_expected` /
 /// `_delta` / `_resets` / `_members` when set, else from the text
@@ -256,8 +240,9 @@ impl Usage {
 }
 
 /// Everything the status block draws (besides the counts, which the view
-/// has): built from the RAW snapshot, before home windows are hidden (a
-/// space's home is its shell 1).
+/// has): built from the RAW snapshot, before home windows are hidden. (No
+/// shells: they are rows of their space in the agents section now, each
+/// with its letter; a space's home is the space itself.)
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Bar {
     /// The client's space; None when the client is unknown (the classic
@@ -268,7 +253,6 @@ pub struct Bar {
     /// It is `jump` (⌥W armed): the letter key-caps turn peach and the
     /// card says `⌥W jump · type a letter`.
     pub jump: bool,
-    pub shells: Vec<Shell>,
     /// Empty when no usage option is set at all (no usage line).
     pub usage: Vec<Usage>,
     /// `@resurrect_stale` in words (`last save 2h ago`, `save refused`).
@@ -398,29 +382,8 @@ impl Toast {
     }
 }
 
-/// A shell's label, as spaces.conf's `@space_shell_label`: a shell process
-/// shows where it is (`~`, or the cwd's last part), anything else its name
-/// (tmux's automatic name: the command). The window name stands in for
-/// `pane_current_command` (no extra field). While a space home's DASHBOARD
-/// pane is the active one, the automatic name is the dashboard's command,
-/// so the shell under it is labelled by its cwd ([`Window::path`] is the
-/// shell's then).
-pub fn shell_label(w: &Window) -> String {
-    let name = w.name.trim();
-    let dash_active = w.pane_list.iter().any(|p| p.dash && p.active);
-    if dash_active || matches!(name.trim_start_matches('-'), "zsh" | "bash" | "sh" | "fish") {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let path = w.path.trim_end_matches('/');
-        if path.is_empty() {
-            return sanitize(name);
-        }
-        if !home.is_empty() && path == home.trim_end_matches('/') {
-            return "~".into();
-        }
-        return sanitize(path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("/"));
-    }
-    sanitize(name)
-}
+/// A shell's label (the view's, where every shell row gets it).
+pub use crate::view::shell_label;
 
 impl Bar {
     pub fn build(snap: &Snapshot, client: Option<&str>) -> Bar {
@@ -461,25 +424,9 @@ impl Bar {
         bar.space = Some(Chip {
             index: ws.first().and_then(|w| w.space_index),
             color: ws.first().and_then(|w| tmux_colour(&w.space_color)),
-            name: session.clone(),
+            name: session,
             hidden,
         });
-        if !hidden {
-            bar.shells = ws
-                .iter()
-                .filter(|w| w.state.is_empty())
-                .enumerate()
-                .map(|(k, w)| Shell {
-                    n: k as u32 + 1,
-                    label: shell_label(w),
-                    home: w.home,
-                    active: w.active,
-                    selected: w.stash_sel,
-                    win: w.id.clone(),
-                    session: session.clone(),
-                })
-                .collect();
-        }
         bar
     }
 }
@@ -1006,8 +953,10 @@ mod tests {
         let bar = Bar::build(&snap, Some("/dev/ttys999"));
         assert_eq!(bar.space, Some(Chip { index: Some(1), name: "main".into(), color: Some(Ink::Rgb(0xf9, 0xe2, 0xaf)), hidden: false }));
         assert!(bar.prefix && !bar.jump);
-        let shells: Vec<_> = bar.shells.iter().map(|s| (s.n, s.label.as_str(), s.home, s.active, s.win.as_str())).collect();
-        assert_eq!(shells, [(1, "~", true, false, "@1"), (2, "proj", false, true, "@3"), (3, "nvim", false, false, "@4")]);
+        // The shells' labels (each shell row's, in its space): where a shell
+        // sits, or what it runs.
+        let labels: Vec<String> = snap.windows.iter().map(shell_label).collect();
+        assert_eq!(labels[..4], ["~", "zsh", "proj", "nvim"].map(String::from)[..]);
         assert_eq!(bar.usage.iter().map(|u| (u.label.as_str(), u.text.as_str())).collect::<Vec<_>>(),
             [("S", "71% (-1%)"), ("W", "--%"), ("F", "0%")]);
         assert_eq!(bar.usage[1].color, Some(Ink::Idx(239)));
@@ -1023,16 +972,15 @@ mod tests {
         ].join("\n"));
         let bar = Bar::build(&snap, Some("/dev/ttys999"));
         assert_eq!(bar.selecting, Some(2));
-        assert_eq!(bar.shells.iter().map(|s| s.selected).collect::<Vec<_>>(), [true, false]);
         // Armed with nothing flagged yet: live, 0; a leaked flag without the table: live too.
         let armed = Snapshot::parse(&[row("main", 1, "@2", &[]), client("main", "@2", &["stash"])].join("\n"));
         assert_eq!(Bar::build(&armed, Some("/dev/ttys999")).selecting, Some(0));
         let leaked = Snapshot::parse(&[row("main", 1, "@2", &[("stash_sel", "1")]), client("main", "@2", &["root"])].join("\n"));
         assert_eq!(Bar::build(&leaked, Some("/dev/ttys999")).selecting, Some(1));
-        // The jump table; a hidden session has no shells and a dim chip.
+        // The jump table; a hidden session has a dim chip.
         let snap = Snapshot::parse(&[row("agents", 1, "@9", &[]), client("agents", "@9", &["jump", "", "", "refused"])].join("\n"));
         let bar = Bar::build(&snap, Some("/dev/ttys999"));
-        assert!(bar.jump && !bar.prefix && bar.shells.is_empty() && bar.usage.is_empty());
+        assert!(bar.jump && !bar.prefix && bar.usage.is_empty());
         assert!(bar.space.as_ref().is_some_and(|c| c.hidden));
         assert_eq!(bar.stale.as_deref(), Some("save refused"));
         // No client: no chip (the classic header), the global options still read.
@@ -1173,8 +1121,8 @@ mod tests {
         assert_eq!(k.due(), Some(at(60_250)));
     }
 
-    /// The status block never takes a dashboard pane's word for a shell's:
-    /// with it active, the home shell is labelled by the shell's cwd.
+    /// A shell label never takes a dashboard pane's word for a shell's:
+    /// with it active, the window is labelled by the shell's cwd.
     #[test]
     fn a_dashboard_never_names_the_home_shell() {
         let sep = crate::tmux::PATH_SEP.to_string();
@@ -1186,10 +1134,8 @@ mod tests {
             row("main", 1, "@2", &[("active", "1")]),
             client("main", "@2", &["root"]),
         ].join("\n"));
-        let bar = Bar::build(&snap, Some("/dev/ttys999"));
-        let shells: Vec<_> = bar.shells.iter().map(|s| (s.n, s.label.as_str(), s.home, s.win.as_str())).collect();
-        assert_eq!(shells[0], (1, "proj", true, "@1"));
-        assert_eq!(shells.len(), 2);
+        assert_eq!(shell_label(&snap.windows[0]), "proj");
+        assert_eq!(shell_label(&snap.windows[1]), "zsh");
     }
 
     /// `@toast` as notify.sh writes it; junk is no toast.

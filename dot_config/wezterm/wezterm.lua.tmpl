@@ -374,12 +374,12 @@ config.keys = {
 -- The digit rows (tmux SPACES, ~/.config/tmux/docs/spaces.md). Each chord
 -- sends ONE private escape sequence, which tmux reads as one key (its
 -- user-keys, set in spaces.conf; no real terminal sends CSI 9111-9139 ~):
---   CTRL+1-9  \e[911N~  User0-8    space N   (spaces off: window N)
---   OPT+1-9   \e[912N~  User9-17   shell N   (spaces off: M-N to the pane)
+--   CTRL+1-9  \e[911N~  User0-8    space N's home   (spaces off: window N)
+--   OPT+1-9   \e[912N~  User9-17   M-N to the pane (spaces on or off)
 --   CMD+1-9   \e[913N~  User18-26  agent N   (spaces off: window N)
 -- Exact chords, nothing timing-dependent: CMD+N used to send the prefix and
 -- then ESC N, the same bytes as OPT+N, so a dropped prefix or a touched
--- Option landed on shell N. The mixed chords (CMD+OPT, CMD+CTRL, CTRL+OPT,
+-- Option sent OPT+N instead. The mixed chords (CMD+OPT, CMD+CTRL, CTRL+OPT,
 -- CMD+SHIFT + digit) do nothing at all, so a sloppy press never picks the
 -- wrong row. Each is bound by the mapped digit and by the physical key, and
 -- CMD+SHIFT also by the shifted character (US layout: 1 -> !), however

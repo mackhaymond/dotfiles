@@ -20,7 +20,10 @@
 //!   over the canvas, a full lavender cell down its right edge, its dim
 //!   text `sub`; only the copy in the client's own space when a window is
 //!   linked into two); NEEDS YOU cards their state's colour
-//!   mixed over the canvas; shell buttons in the zebra too;
+//!   mixed over the canvas;
+//! - SHELL rows: one row each, a TERMINAL LINE on a sunken strip (`term`,
+//!   darker than the canvas where cards are raised), the same key-cap as
+//!   an agent's, a green `❯` prompt; the client's own lifted;
 //! - toasts: square `┃` bars on `surface0` (no corners).
 //!
 //! Hierarchy is tone and weight, never lines: section labels bold
@@ -31,7 +34,7 @@
 //! catppuccin blocks): a [`module`] is ` key ` bold in dark ink on a colour,
 //! then ` label ` on `surface0`.
 //!
-//! ## Shape: the usage panel, NEEDS YOU, the agents (the body), the shells, the dock
+//! ## Shape: the usage panel, NEEDS YOU, the agents and shells (the body), the dock
 //!
 //! ```text
 //!  ▄ prefix ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄   the usage panel; the key table's
@@ -51,22 +54,36 @@
 //!  ▎     Merged the pause key      2m    key-cap (quiet: the letter in its
 //!     h  Canvas Syllabus                 SPACE's colour on a tint; solid for
 //!        Synced 4 assignments      1h    the client's and asking / failed
-//!                                        agents), the title, the state word
-//!   2  cs35l   main              ○1     right; idle: no rail, no word. The
-//!  ▎  w  Eight Component Va… ✓ done      second line: the live blurb after
-//!  ▎     I wrote tic-tac-toe.txt  9s     a `›`, else a message; the age
-//!
-//!  SHELLS                                the client's space's shells, one-row
-//!     ⌥1  ⌂ ~                            buttons (⌥N), the active one lifted
-//!  ▎  ⌥2  nvim                           (in the dock's line when short)
+//!     j  ❯ …/tmux/agent-ui               agents), the title, the state word
+//!     k  ❯ nvim  agent-ui                right; idle: no rail, no word. The
+//!                                        second line: the live blurb after
+//!   2  cs35l   main              ○1     a `›`, else a message; the age.
+//!  ▎  w  Eight Component Va… ✓ done      Then the space's SHELLS, one row
+//!  ▎     I wrote tic-tac-toe.txt  9s     each a sunken strip: the key-cap,
+//!                                        a green `❯`, the cwd, or the
+//!                                        command and its folder.
+//!                                        The header IS the space's home.
 //!
 //!  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄   the dock: every space a row (⌃N
 //!  ▌ 1  main               ◐2 ○3         order; the client's on its band),
-//!    2  cs35l                 ○1         or chips; the shells' line when
-//!   SHELLS  ⌥1  ⌂ ~   ⌥2  nvim           folded; PARKED one line, its count,
-//!   PARKED  4                            a message or the watcher on the
-//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   right; never its tabs
+//!    2  cs35l                 ○1         or chips; PARKED one line, its
+//!   PARKED  4                            count, a message or the watcher
+//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   on the right; never its tabs
 //! ```
+//!
+//! ## Spaces, homes and shells
+//!
+//! A space's HOME window (`@space_home`) is never listed: the space's header
+//! is the home. A click on it (or on the space in the dock) goes to the home
+//! window ([`crate::actions::space_landing`]), and while the client is on
+//! the home the header wears the client's own lift (`tile_me` and the
+//! lavender edge) instead of its band. Every other window without an agent
+//! state is a SHELL of its space: listed in its space's group after the
+//! agents, one row each ([`shell_row`]), with its letter from the same pool
+//! as the agents ([`crate::menu::letters`]); in the steps that fold the idle
+//! agents, two or more shells fold into one line of pills
+//! ([`shells_line`]). A space with only shells still gets its group; a
+//! `@space_hidden` session lists no shells.
 //!
 //! Without a [`Bar`] (no client space, no usage, nothing selected) the top
 //! is the classic ` agents` / ` space` title with the counts.
@@ -124,17 +141,17 @@
 //!    section gaps: pure decoration goes before anything that says
 //!    something);
 //! 3. the dock's reserve goes (it may fall to chips);
-//! 4. NEEDS YOU cards go from 2 lines to 1; then the shells to one line, in
-//!    the dock;
+//! 4. NEEDS YOU cards go from 2 lines to 1;
 //! 5. only then do the agents compress (below), NEEDS YOU kept to the rows
 //!    the agents' one-line shape leaves (at least 2, and at least a third of
 //!    the body), cut with a `… N more need you` line.
 //!
 //! The agents' own ladder keeps every agent row the same height: the idle
-//! agents of a space fold into one `○○○ 3 idle · Name, Name…` tile; then
-//! every agent goes to one line (age beside its state), unfolded, then
-//! folded again; then whole spaces collapse to their header (with its
-//! counts), fewest attention agents first; finally a `… N more` line.
+//! agents of a space fold into one `○○○ 3 idle · Name, Name…` tile (and its
+//! shells into one line); then every agent goes to one line (age beside its
+//! state), unfolded, then folded again; then whole spaces collapse to their
+//! header (with its counts, its shells gone with it), fewest attention
+//! agents first; finally a `… N more` line.
 //!
 //! Every agents-section row records the agents it stands for
 //! ([`Row::covers`]), so a test can prove each agent is shown, folded,
@@ -148,20 +165,21 @@
 //!
 //! ## Letters
 //!
-//! Every agent card and NEEDS YOU card carries the agent's lifetime letter
-//! (`@agent_key`, assigned by [`crate::menu::letters::of_view`], the menu's
-//! own function) as a key-cap ([`Badge`]) in its SPACE's colour, so the
-//! agent says where it lives anywhere in the list: quiet by default, solid
-//! where you look next. While ⌥W's jump table is armed every cap is
-//! inverted ([`ARMED`]: a peach letter on `crust`), a look no calm cap has.
-//! Agents without one show the cap blank; with no letter anywhere the
-//! column is not drawn.
+//! Every agent card, shell row and NEEDS YOU card carries the window's
+//! lifetime letter (`@agent_key`, one pool for agents and shells, assigned
+//! by [`crate::menu::letters::of_view`], the menu's own function) as a
+//! key-cap ([`Badge`]) in its SPACE's colour, so the window says where it
+//! lives anywhere in the list: quiet by default, solid where you look next.
+//! While ⌥W's jump table is armed every cap is inverted ([`ARMED`]: a peach
+//! letter on `crust`), a look no calm cap has. Windows without one show the
+//! cap blank; with no letter anywhere the column is not drawn.
 //!
 //! ## Scope
 //!
 //! [`crate::view::Scope`] (`@spaces` / `@strip_scope`): in SPACE scope the
-//! agents section shows only the client's session (its header and ` no
-//! agents in this space` when it has none). NEEDS YOU, the spaces and parked
+//! agents section shows only the client's session, its agents and shells
+//! (its header and ` no agents in this space` when it has neither); in ALL
+//! scope every space with agents or shells. NEEDS YOU, the spaces and parked
 //! stay global. The AGENTS header's scope word is a toggle once the scope is
 //! a thing.
 //!
@@ -176,17 +194,18 @@
 //! Every tint is mixed over the canvas ([`palette::mix`], [`Ink::Mix`],
 //! [`Ink::Tint`]), or over a card ([`over`]: a quiet key-cap). Surfaces
 //! ([`palette::UI`]): `tile` / `tile_lo` (the zebra), `tile_me` (the
-//! client's own agent, both rows: [`MINE_BG`]), `tile_hi` (the active
-//! shell), the panels (`tile_lo`),
+//! client's own agent, both rows, its own shell, and its space's header while
+//! it is on the home: [`MINE_BG`]), the panels (`tile_lo`),
 //! NEEDS YOU cards (their state colour, 14% / 9%), the client's space's band
 //! ([`band`]: apart from every card shade), the stash selection (mauve 18%),
 //! toasts (`surface0`), and the solid chips. Dim text is `overlay2`.
 
-use super::status::{ink_on, ink_rgb, tmux_colour, Bar, Kind, Shell, Toast, ToastId, Usage};
+use super::status::{ink_on, ink_rgb, tmux_colour, Bar, Kind, Toast, ToastId, Usage};
 use crate::actions::watcher_problem;
 use crate::model::{Cat, Counts, Flag};
 use crate::palette;
 use crate::text::{clip, dwidth, fit_label, plain, sanitize};
+pub use crate::view::space_order;
 use crate::view::{Agent, Need, Space, ViewModel};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -404,7 +423,7 @@ fn into_tile(row: Row, w: usize, bg: Ink) -> Row {
 /// The half-block above the usage panel (`▄`, its top padding: half a row
 /// of canvas, then half a row of the tile) or below it (`▀`): the tile's
 /// colour on the canvas, between the margins. Not a target, stands for no
-/// one. List tiles (agents, NEEDS YOU cards, shells) have no pads: they
+/// one. List tiles (agents, NEEDS YOU cards) have no pads: they
 /// stack edge to edge, parted by the zebra ([`TONES`]).
 const PAD_TOP: char = '▄';
 const PAD_BOTTOM: char = '▀';
@@ -444,17 +463,9 @@ fn module(key: &str, key_bg: impl Into<Ink>, label: Vec<Seg>) -> Vec<Seg> {
     out
 }
 
-/// A label alone as a module's `surface0` half (no key): ` label `.
-fn label_module(label: Vec<Seg>) -> Vec<Seg> {
-    let s0 = Ink::Pal("surface0");
-    let mut out = vec![on(" ", "text", s0)];
-    out.extend(label.into_iter().map(|s| Seg { bg: s.bg.or(Some(s0)), ..s }));
-    out.push(on(" ", "text", s0));
-    out
-}
 
 /// The zebra's two shades: list tiles stacked edge to edge (agent cards,
-/// one row or two, the shells) alternate them, so every card is ONE colour
+/// one row or two, the idle fold) alternate them, so every card is ONE colour
 /// and its neighbours the other.
 const TONES: (Hue, Hue) = ("tile", "tile_lo");
 
@@ -474,10 +485,11 @@ pub enum Target {
     /// An agent row or a needs card: agent-jump.sh goto (`Actions::go`,
     /// Strip.click "goto").
     Go { win: String, session: String },
-    /// A dock space row or chip, or a space header: that session's active
-    /// window (Strip.click "session").
+    /// A dock space row or chip, or a space header: that space's HOME
+    /// window, else the session's active one (Strip.click "session",
+    /// [`crate::actions::space_landing`]).
     Session(String),
-    /// One of this space's shells in the SHELLS section (⌥N): that window, like an
+    /// A shell row (or its pill in a folded line): that window, like an
     /// agent row, but never parked by a right-click.
     Shell { win: String, session: String },
     /// agent-jump.sh next / back (no button draws them any more; kept for
@@ -577,12 +589,11 @@ pub struct Frame {
     pub toast_until: Option<i64>,
     /// The rows of each section, header included (empty: not drawn).
     pub needs: Range<usize>,
+    /// The agents section: every shown space's header (its home), its
+    /// agents, then its shells.
     pub agents: Range<usize>,
-    /// This space's shells: the section under AGENTS, or one line of
-    /// buttons in the dock.
-    pub shells: Range<usize>,
     /// The dock, through the last row: its gap (when room), its `▄` cap,
-    /// the spaces, the shells' line (when folded), PARKED, its `▀` cap.
+    /// the spaces, PARKED, its `▀` cap.
     pub dock: Range<usize>,
     /// The dock's spaces: one row per space (or the client's and the
     /// attention ones and `+K more`), or, short of rows, chips.
@@ -665,7 +676,7 @@ fn dim(on_surface: bool) -> Hue {
     }
 }
 
-/// The section labels' ink (NEEDS YOU, AGENTS, SHELLS, PARKED: bold,
+/// The section labels' ink (NEEDS YOU, AGENTS, PARKED: bold,
 /// uppercase) and the canvas's dim text.
 const LABEL: Hue = "overlay2";
 
@@ -698,6 +709,10 @@ struct Cx<'a> {
     /// window linked into two spaces is current in both: [`own`]); None:
     /// any copy.
     home: Option<&'a str>,
+    /// The client's window: on a space's HOME, that space's header is "you".
+    cur: Option<&'a str>,
+    /// Shells are listed (`@spaces` on: [`ViewModel::shells`]).
+    shells: bool,
 }
 
 impl Cx<'_> {
@@ -814,38 +829,6 @@ fn pack(fixed: &[Item], items: &[Item], rank: &[usize], w: usize, lines: usize, 
             }
         }
     }
-}
-
-/// THE shell label: `⌥N` (Option+N, space.sh's `shell N`; none past 9).
-fn shell_key(s: &Shell) -> Option<String> {
-    (s.n <= 9).then(|| format!("⌥{}", s.n))
-}
-
-/// A shell's ⌥N key-cap (herdr's key-hint chips): bold `sub` on `surface1`;
-/// the session's active shell solid (dark ink on `blue`), one in prefix
-/// v's selection on the stash's mauve.
-fn shell_cap(s: &Shell, text: String) -> Seg {
-    if s.selected {
-        block(text, "crust", "mauve")
-    } else if s.active {
-        block(text, "crust", "blue")
-    } else {
-        block(text, "sub", "surface1")
-    }
-}
-
-/// A shell as a button in the dock's SHELLS line: its key-cap
-/// ([`shell_cap`]) then ` ⌂ home ` on `surface0` (the active one's label
-/// bold), square ends.
-fn shell_pill(s: &Shell) -> Item {
-    let label = format!("{}{}", if s.home { "⌂ " } else { "" }, clip(&s.label, 12));
-    let label = vec![Seg { bold: s.active, ..seg(label, if s.active { "text" } else { "sub" }) }];
-    let mut segs = match shell_key(s) {
-        Some(k) => vec![shell_cap(s, format!(" {k} "))],
-        None => Vec::new(),
-    };
-    segs.extend(label_module(label));
-    item(segs, Some(Target::Shell { win: s.win.clone(), session: s.session.clone() }))
 }
 
 /// The key-table marks, solid chips: a red ` prefix ` while the client's key
@@ -1230,52 +1213,162 @@ fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
 
 // ---------------------------------------------------------------- shells
 
-/// ` SHELLS`, then this space's shells (the client's session, ⌥N order, the
-/// home first) as one-row button tiles: the ⌥N key-cap, `⌂` on the home,
-/// the label. The session's active window is lifted (`tile_hi`, a blue
-/// rail); one in prefix v's selection on mauve.
-/// They sit edge to edge in the zebra's two shades ([`shade`]), quieter than the agents: no state stripe but
-/// the active one's. A button clicks through to its shell.
-fn shells_section(bar: &Bar, w: usize) -> Vec<Row> {
-    if bar.shells.is_empty() {
+/// A shell row's prompt (green, bold): what says "a terminal", not an
+/// agent, at a glance.
+pub const PROMPT: &str = "❯ ";
+
+/// A space's SHELLS as its group lists them: [`Space::shells`] (no agent
+/// state, never the home: the space's header IS the home), minus a window
+/// the group already shows as a card (the client's own window in the
+/// classic scope, `@spaces` off). `on`: shells are a thing at all
+/// ([`ViewModel::shells`], `@spaces` on); off, none (the classic sidebar).
+fn shells_of(sp: &Space, on: bool) -> Vec<&Agent> {
+    if !on {
         return Vec::new();
     }
-    let mut rows = vec![section_header(w, "SHELLS", vec![])];
-    for (k, s) in bar.shells.iter().enumerate() {
-        // The card grid: a rail, a pad, the key-cap, a pad, the label.
-        let (bg, rail) = if s.selected {
-            (Ink::Mix("mauve", 18), seg("▌", "mauve"))
-        } else if s.active {
-            (Ink::Pal("tile_hi"), seg(RAIL, "blue"))
-        } else {
-            (shade(k), seg(" ", "text"))
-        };
-        let key = shell_key(s).map_or("    ".to_string(), |k| format!(" {k} "));
-        let mut left = vec![rail, seg(" ", "text"), shell_cap(s, key), seg(" ", "text")];
-        if s.home {
-            left.push(seg("⌂ ", dim(true)));
-        }
-        left.push(if s.active { bold(s.label.clone(), "text") } else { seg(s.label.clone(), "text") });
-        let go = Target::Shell { win: s.win.clone(), session: s.session.clone() };
-        rows.push(tile_row(w, bg, left, vec![]).click(w, go));
-    }
-    rows
+    sp.shells().into_iter().filter(|s| !sp.agents.iter().any(|a| a.window_id == s.window_id)).collect()
 }
 
-/// The shells in one line of the dock, for a frame with no room for their
-/// section: `SHELLS` and the shells as square buttons ([`shell_pill`]),
-/// the active one kept, `+K` for those that do not fit. Built [`inner`]
-/// wide, for the dock's panel.
-fn shells_line(bar: &Bar, w: usize) -> Vec<Row> {
-    if bar.shells.is_empty() {
-        return Vec::new();
+/// A shell row's sunken strip ([`palette::UI`]'s `term`, between the canvas
+/// and `crust`).
+const TERM_BG: Hue = "term";
+
+/// A shell as its prompt line says it: (the running command, None at a
+/// shell prompt; its cwd, `~` for $HOME).
+fn shell_parts(s: &Agent) -> (Option<String>, String) {
+    let name = s.name.trim().trim_start_matches('-');
+    let prompt = name.is_empty() || matches!(name, "zsh" | "bash" | "sh" | "fish");
+    let dir = sanitize(&crate::view::tilde(&s.path));
+    let dir = if dir.is_empty() { sanitize(&s.shell) } else { dir };
+    ((!prompt).then(|| sanitize(&s.shell)), dir)
+}
+
+/// A path in at most `room` cells, cut from the LEFT at a folder boundary
+/// (`…/tmux/agent-ui`, as a prompt truncates it): a path's end is the part
+/// that says where. A last folder too long on its own is cut mid-name.
+fn clip_left(text: &str, room: usize) -> String {
+    if dwidth(text) <= room {
+        return text.to_string();
     }
-    let items: Vec<Item> = bar.shells.iter().map(shell_pill).collect();
-    let mut rank: Vec<usize> = (0..items.len()).collect();
-    rank.sort_by_key(|&i| !bar.shells[i].active);
-    let more = |k: usize| item(vec![seg(format!("+{k}"), "overlay2")], None);
-    let rows = pack(&[item(vec![bold("SHELLS", LABEL)], None)], &items, &rank, inner(w), 1, &more).0;
-    rows.into_iter().map(|r| into_tile(r, w, Ink::Pal(PANEL))).collect()
+    let parts: Vec<&str> = text.split('/').collect();
+    for k in (1..parts.len()).rev() {
+        let t = format!("…/{}", parts[parts.len() - k..].join("/"));
+        if dwidth(&t) <= room {
+            return t;
+        }
+    }
+    if room == 0 {
+        return String::new();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 1;
+    for c in text.chars().rev() {
+        let cw = dwidth(&c.to_string());
+        if used + cw > room {
+            break;
+        }
+        used += cw;
+        tail.push(c);
+    }
+    format!("…{}", tail.into_iter().rev().collect::<String>())
+}
+
+/// One of a space's shells as ONE row in its group, after its agents, drawn
+/// as a TERMINAL LINE: a sunken strip ([`TERM_BG`], darker than the canvas,
+/// where the agent cards are raised tiles; one colour for the row), on the
+/// card grid (c1 the rail, c3-c5 the key-cap, c7 the prompt). The key-cap
+/// is EXACTLY an agent's (a quiet cap drawn as over the zebra's first
+/// shade, `tile`; solid for the client's own; inverted while ⌥W is armed),
+/// so its letter is as easy to spot. Then a green [`PROMPT`] and what the
+/// prompt line would say: at a shell prompt its cwd (`~` for $HOME, cut
+/// from the left at a folder: `…/tmux/agent-ui`) in `sub`; running a
+/// command, the command bold `text` and the folder dim after it. The
+/// client's own shell is lifted like its own agent card (`tile_me`, a
+/// lavender rail, a full lavender cell down its right edge, the path
+/// `text`); prefix v's selection tints it mauve with the heavy mauve rail.
+/// A click goes to the shell.
+fn shell_row(s: &Agent, cx: Cx, space: Ink) -> Row {
+    let w = cx.w;
+    let mine = own(s, cx);
+    let bg = if s.selected {
+        Ink::Mix("mauve", 18)
+    } else if mine {
+        Ink::Pal(MINE_BG)
+    } else {
+        Ink::Pal(TERM_BG)
+    };
+    let rail = if s.selected {
+        seg(RAIL_HEAVY, "mauve")
+    } else if mine {
+        seg(RAIL, "lavender")
+    } else {
+        seg(" ", "text")
+    };
+    let mut left = vec![rail, seg(" ", "text")];
+    if cx.b.on {
+        left.extend([cx.b.seg(s, space, Ink::Pal(TONES.0), mine), seg(" ", "text")]);
+    }
+    left.push(bold(PROMPT, "green"));
+    let mut right = vec![seg(" ", "text")];
+    if mine && cx.seconds() {
+        right.push(seg(MINE, MINE_HUE));
+    }
+    let dimc = if mine { MINE_DIM } else { dim(true) };
+    let room = inner(w).saturating_sub(width(&left) + width(&right));
+    let (cmd, dir) = shell_parts(s);
+    match cmd {
+        Some(c) => {
+            let c = clip(&c, room);
+            let rest = room.saturating_sub(dwidth(&c) + 2);
+            let folder = dir.rsplit('/').next().unwrap_or(&dir).to_string();
+            left.push(bold(c, "text"));
+            if rest >= 4 {
+                left.push(seg(format!("  {}", clip(&folder, rest)), dimc));
+            }
+        }
+        None => left.push(seg(clip_left(&dir, room), if mine { "text" } else { "sub" })),
+    }
+    tile_row(w, bg, left, right).click(w, Target::Shell { win: s.window_id.clone(), session: s.session.clone() })
+}
+
+/// A space's shells in ONE row, for the steps that fold (the idle agents
+/// fold into one line then too): the shell rows' strip, from the card
+/// grid's cap column each shell its key-cap (as on its row) and its label
+/// (the command it runs, else its folder), two cells apart, `+K` (dim) for
+/// those that do not fit; without letters, the green prompt before each
+/// label. Each shell's cells click through to it.
+fn shells_line(shells: &[&Agent], cx: Cx, space: Ink) -> Row {
+    let w = cx.w;
+    let m = margin(w);
+    let end = inner(w).saturating_sub(1);
+    let mut segs: Vec<Seg> = vec![seg("  ", "text")];
+    let mut targets = Vec::new();
+    let mut x = 2;
+    for (k, s) in shells.iter().enumerate() {
+        let mut pill = Vec::new();
+        if cx.b.on {
+            pill.extend([cx.b.seg(s, space, Ink::Pal(TONES.0), own(s, cx)), seg(" ", "text")]);
+        } else {
+            pill.push(bold(PROMPT, "green"));
+        }
+        pill.push(seg(clip(&sanitize(&s.shell), 14), if own(s, cx) { "text" } else { "sub" }));
+        let gap = usize::from(k > 0) * 2;
+        let left = shells.len() - k - 1;
+        let more = if left > 0 { dwidth(&format!("  +{left}")) } else { 0 };
+        if x + gap + width(&pill) + more > end {
+            let rest = format!("{}+{}", if k > 0 { "  " } else { "" }, shells.len() - k);
+            segs.push(seg(rest, dim(true)));
+            break;
+        }
+        if gap > 0 {
+            segs.push(seg("  ", "text"));
+        }
+        let x0 = m + x + gap;
+        x += gap + width(&pill);
+        segs.extend(pill);
+        targets.push((x0 as u16, (m + x) as u16, Target::Shell { win: s.window_id.clone(), session: s.session.clone() }));
+    }
+    Row { targets, ..tile_row(w, Ink::Pal(TERM_BG), segs, vec![]) }
 }
 
 // ---------------------------------------------------------------- agents
@@ -1326,7 +1419,8 @@ impl Badge {
     const OFF: Badge = Badge { on: false, loud: false };
 
     fn of(view: &ViewModel, bar: &Bar) -> Badge {
-        let on = view.agents().chain(view.needs.iter().map(|n| &n.agent)).any(|a| a.letter.is_some());
+        let shells = view.spaces.iter().flat_map(|s| s.plain.iter());
+        let on = view.agents().chain(shells).chain(view.needs.iter().map(|n| &n.agent)).any(|a| a.letter.is_some());
         Badge { on, loud: bar.jump }
     }
 
@@ -1428,7 +1522,8 @@ fn loud_card(a: &Agent, cx: Cx) -> bool {
 /// that copy, and only it, is the client's own card.
 fn home_of(view: &ViewModel) -> Option<&str> {
     let s = view.cur_session.as_deref()?;
-    view.agents().any(|a| a.is_current && a.session == s).then_some(s)
+    let rows = view.spaces.iter().flat_map(|sp| sp.agents.iter().chain(&sp.plain));
+    rows.into_iter().any(|a| a.is_current && a.session == s).then_some(s)
 }
 
 /// `a` is the client's own card ([`home_of`]).
@@ -1622,13 +1717,6 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink) -> Vec<Row> {
     vec![first, second]
 }
 
-/// THE space order, everywhere (the agents' groups, the dock):
-/// `@space_index` (⌃N) first, spaces without one after (by name: the view's
-/// order, kept by a stable sort).
-pub fn space_order(sp: &Space) -> (bool, Option<u32>) {
-    (sp.index.is_none(), sp.index)
-}
-
 /// A space's counts: the idle glyph's `overlay` lifted to `dimc` (the dim
 /// of what they sit on).
 fn surface_counts(c: &Counts, dimc: Hue) -> Vec<Seg> {
@@ -1657,13 +1745,18 @@ fn name_ink(ink: Ink) -> Ink {
 /// is a BAND ([`band`]: its colour washed over the card's columns) with a
 /// `▌` in its colour at the very edge, the branch and idle count lifted to
 /// `sub`, so "where am I" reads at a glance and the band never melts into
-/// the card under it. Collapsed, it stands for all its agents. A click
-/// switches to the space. (Never red: the header keeps the colour its
-/// agents' key-caps wear.)
-fn group_header(sp: &Space, w: usize, collapsed: bool) -> Row {
+/// the card under it. The header IS the space's HOME (no home row is
+/// listed): a click goes to the home window, and while the client is ON
+/// its home the header gets the client's own lift instead of the band
+/// (`tile_me`, and a full lavender cell down its right edge, as the
+/// client's own agent card). Collapsed, it stands for all its agents.
+/// (Never red: the header keeps the colour its agents' key-caps wear.)
+fn group_header(sp: &Space, cx: Cx, collapsed: bool) -> Row {
+    let w = cx.w;
     let ink = space_colour(sp);
     let m = margin(w);
-    let here = sp.is_current;
+    let mine = sp.home.is_some() && sp.home.as_deref() == cx.cur;
+    let here = sp.is_current || mine;
     let dimc = if here { "sub" } else { "overlay2" };
     let mut right = surface_counts(&sp.counts, dimc);
     if !right.is_empty() {
@@ -1671,6 +1764,10 @@ fn group_header(sp: &Space, w: usize, collapsed: bool) -> Row {
         right.insert(0, seg(" ", "text"));
     }
     right.push(seg(" ", "text"));
+    if mine && cx.seconds() {
+        // (After the right side's own pad, where an own card's edge is.)
+        right.push(seg(MINE, MINE_HUE));
+    }
     let mut left = vec![block(format!(" {} ", space_num(sp)), ink_on(ink), ink), seg(" ", "text"), bold(sanitize(&sp.name), name_ink(ink))];
     if !sp.branch.is_empty() {
         let br = format!("  \u{e0a0} {}", sanitize(&sp.branch));
@@ -1678,8 +1775,10 @@ fn group_header(sp: &Space, w: usize, collapsed: bool) -> Row {
             left.push(seg(br, dimc));
         }
     }
+    // The space's home: [`crate::actions::space_landing`].
     let target = Target::Session(sp.name.clone());
-    let mut row = if here { tile_row(w, band(ink), left, right) } else { Row::new([vec![bare(m)], fit(inner(w), left, right, None), vec![bare(m)]].concat()) };
+    let bg = if mine { Ink::Pal(MINE_BG) } else { band(ink) };
+    let mut row = if here { tile_row(w, bg, left, right) } else { Row::new([vec![bare(m)], fit(inner(w), left, right, None), vec![bare(m)]].concat()) };
     if here && m > 0 {
         row.segs[0] = Seg { bg: Some(Ink::Canvas), ..seg(RAIL_HEAVY, ink) };
     }
@@ -1745,7 +1844,9 @@ fn split_idle(sp: &Space, fold: bool, now: f64) -> (Vec<&Agent>, Vec<&Agent>) {
 /// stacked edge to edge (no pads: consecutive cards alternate the zebra's
 /// two shades, [`shade`], afresh under each space's header, so each card is
 /// one colour and the next another); the agents in `two` get their second
-/// line.
+/// line. Then its shells ([`shells_of`]), one row each ([`shell_row`]); with
+/// `fold` (the steps that fold the idle agents), two or more of them in one
+/// line ([`shells_line`]).
 fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool) -> Vec<Row> {
     let (shown, idle) = split_idle(sp, fold, cx.now);
     let ink = space_colour(sp);
@@ -1757,16 +1858,26 @@ fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool) -> Vec<Row> {
         // The zebra goes on: the fold is the next card.
         rows.push(fold_row(&idle, cx, shade(shown.len())));
     }
+    let shells = shells_of(sp, cx.shells);
+    if fold && shells.len() >= 2 {
+        rows.push(shells_line(&shells, cx, ink));
+    } else {
+        rows.extend(shells.iter().map(|s| shell_row(s, cx, ink)));
+    }
     rows
 }
 
-/// A space's agents in `room` rows: all of them one line each if they fit,
-/// else the `room - 1` that matter most ([`promotion_rank`], kept in list
-/// order) and a `… N more` line for the rest.
+/// A space's agents in `room` rows: all of them one line each if they fit
+/// (and as many of its shells as fit after them), else the `room - 1` that
+/// matter most ([`promotion_rank`], kept in list order) and a `… N more`
+/// line for the rest.
 fn partial_rows(sp: &Space, cx: Cx, room: usize) -> Vec<Row> {
     let ink = space_colour(sp);
     if sp.agents.len() <= room {
-        return sp.agents.iter().enumerate().flat_map(|(k, a)| agent_rows(a, cx, false, k, ink)).collect();
+        let mut rows: Vec<Row> = sp.agents.iter().enumerate().flat_map(|(k, a)| agent_rows(a, cx, false, k, ink)).collect();
+        let left = room - rows.len();
+        rows.extend(shells_of(sp, cx.shells).into_iter().take(left).map(|s| shell_row(s, cx, ink)));
+        return rows;
     }
     let mut ranked: Vec<usize> = (0..sp.agents.len()).collect();
     ranked.sort_by_key(|&k| promotion_rank(&sp.agents[k], cx.now));
@@ -1796,25 +1907,31 @@ fn promotion_rank(a: &Agent, now: f64) -> u8 {
 }
 
 /// The spaces the agents section draws, in [`space_order`]: those with
-/// agents; in space scope, just the client's session, agents or not.
+/// agents or shells; in space scope, just the client's session, whatever
+/// it holds.
 fn groups(view: &ViewModel) -> Vec<&Space> {
     let mut v: Vec<&Space> = match &view.scope.session {
         Some(s) => view.spaces.iter().filter(|sp| &sp.name == s).collect(),
-        None => view.spaces.iter().filter(|s| !s.agents.is_empty()).collect(),
+        None => view.spaces.iter().filter(|s| !bare_group(view, s)).collect(),
     };
     v.sort_by_key(|s| space_order(s));
     v
 }
 
-/// The agents section's rows when every agent is on one line, nothing
-/// folded or collapsed: what step 4 leaves the agents before NEEDS YOU
-/// gets the rest.
+/// Nothing to list under a space's header: no agent, no shell.
+fn bare_group(view: &ViewModel, sp: &Space) -> bool {
+    sp.agents.is_empty() && shells_of(sp, view.shells).is_empty()
+}
+
+/// The agents section's rows when every agent (and shell) is on one line,
+/// nothing folded or collapsed: what step 4 leaves the agents before NEEDS
+/// YOU gets the rest.
 fn agents_one_line(view: &ViewModel) -> usize {
     let groups = groups(view);
-    if groups.iter().all(|g| g.agents.is_empty()) {
+    if groups.iter().all(|g| bare_group(view, g)) {
         return 2 + usize::from(view.scope.session.is_some());
     }
-    1 + groups.iter().map(|g| 1 + g.agents.len()).sum::<usize>()
+    1 + groups.iter().map(|g| 1 + g.agents.len() + shells_of(g, view.shells).len()).sum::<usize>()
 }
 
 /// A space header in the agents section ([`group_header`]: the whole row
@@ -1884,10 +2001,10 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
     let groups = groups(view);
     let space = view.scope.session.is_some();
     let header = agents_header(view, w);
-    if space && groups.iter().all(|g| g.agents.is_empty()) {
-        // The space's header even with no agent in it, so the section says whose it is.
+    if space && groups.iter().all(|g| bare_group(view, g)) {
+        // The space's header even with nothing in it, so the section says whose it is.
         let mut rows = vec![header];
-        rows.extend(groups.iter().map(|g| group_header(g, w, false)));
+        rows.extend(groups.iter().map(|g| group_header(g, cx, false)));
         rows.push(dim_line(w, "   no agents in this space"));
         rows.truncate(budget);
         return (rows, 0);
@@ -1903,7 +2020,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
             if spaced && k > 0 {
                 rows.push(Row::blank(w));
             }
-            rows.push(group_header(sp, w, c));
+            rows.push(group_header(sp, cx, c));
             if !c {
                 rows.extend(group_rows(sp, cx, two, fold));
             }
@@ -1964,7 +2081,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
         // The space whose collapse made it fit keeps the rows that frees:
         // its most important agents, one line each, and `… N more`.
         let mut rows = base;
-        rows[at] = group_header(groups[i], w, false);
+        rows[at] = group_header(groups[i], cx, false);
         rows.splice(at + 1..at + 1, partial_rows(groups[i], cx, spare));
         return (rows, 4);
     }
@@ -2409,7 +2526,7 @@ pub const STEPS: [Step; 4] = [
     Step { gaps: false, listed: false, lines: 1 },
 ];
 
-/// The whole screen: the panel, NEEDS YOU, agents, shells, spare rows, the
+/// The whole screen: the panel, NEEDS YOU, agents (and shells), spare rows, the
 /// spaces, the last row; then the live toasts as cards over its top. Always
 /// exactly `height` rows of exactly `width` cells.
 pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
@@ -2418,7 +2535,15 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
     if w == 0 || h == 0 {
         return frame;
     }
-    let cx = Cx { w, b: Badge::of(view, &opts.bar), now: opts.now.unwrap_or(view.now), spin: opts.spin, home: home_of(view) };
+    let cx = Cx {
+        w,
+        b: Badge::of(view, &opts.bar),
+        now: opts.now.unwrap_or(view.now),
+        spin: opts.spin,
+        home: home_of(view),
+        cur: view.cur_win.as_deref(),
+        shells: view.shells,
+    };
     let keep = sections(view, &mut frame, opts, cx).min(frame.rows.len());
     // The toasts float over whatever is there: nothing beneath moves, and
     // the rows they hide still stand for their agents (back when they go).
@@ -2468,57 +2593,45 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     // listed nowhere else, so they never go before the agents lose detail.
     let min = spaces_min(view, avail);
     let avail = avail - min;
-    // Every step with the shells' whole section (under AGENTS), then the
-    // last step with their one line (in the dock): one ladder, so as the
-    // frame shrinks neither the step nor the shells' form ever comes back.
-    let (full, line) = (shells_section(bar, w), shells_line(bar, w));
-    let end = STEPS.len() - 1;
-    let tries = STEPS.iter().enumerate().map(|(i, s)| (i, *s, &full, false)).chain([(end, STEPS[end], &line, true)]);
     // The spaces stood on end say something (each space's counts): the
     // steps that keep them ([`Step::listed`]) leave the dock its rows; the
     // others only its held-back minimum.
     let reserve = if min == 0 { 0 } else { spaces_listed(view, w).saturating_sub(min) };
-    let fits = tries.into_iter().find_map(|(i, Step { gaps, listed, lines }, shells, docked)| {
+    let fits = STEPS.iter().enumerate().find_map(|(i, &Step { gaps, listed, lines })| {
         let needs = needs_block(view, cx, lines);
         let agents = agents_section(view, cx, usize::MAX, gaps).0;
-        let gap_rows = usize::from(gaps) * (2 + usize::from(!shells.is_empty() && !docked));
+        let gap_rows = usize::from(gaps) * 2;
         let room = if listed { avail.saturating_sub(reserve) } else { avail };
-        (needs.len() + agents.len() + shells.len() + gap_rows <= room).then(|| (i as u8, gaps, needs, agents, shells.clone(), docked))
+        (needs.len() + agents.len() + gap_rows <= room).then_some((i as u8, gaps, needs, agents))
     });
-    let (step, gaps, needs, (mut agents, agents_step), shells, docked) = match fits {
-        Some((i, gaps, needs, agents, shells, docked)) => (i, gaps, needs, (agents, 0), shells, docked),
+    let (step, gaps, needs, (mut agents, agents_step)) = match fits {
+        Some((i, gaps, needs, agents)) => (i, gaps, needs, (agents, 0)),
         None => {
-            // The agents compress, the shells in one line (none in under 4
-            // rows). NEEDS YOU gets what the agents' one-line shape leaves
-            // (up to the whole, at least 2 rows and a third of the body),
-            // and always leaves the agents a row.
-            let shells = if avail >= 4 { line.clone() } else { Vec::new() };
-            let avail = avail - shells.len();
+            // The agents compress. NEEDS YOU gets what the agents' one-line
+            // shape leaves (up to the whole, at least 2 rows and a third of
+            // the body), and always leaves the agents a row.
             let n1 = needs_block(view, cx, 1).len();
             let floor = (avail / 3).max(2);
             let room = n1.min(avail.saturating_sub(agents_one_line(view)).max(floor)).min(avail - 1);
             let needs = needs_cut(view, cx, room);
             let agents = agents_section(view, cx, avail - needs.len(), false);
-            (STEPS.len() as u8, false, needs, agents, shells, true)
+            (STEPS.len() as u8, false, needs, agents)
         }
     };
     // The section gaps the step keeps. (No gap above NEEDS YOU when nothing
-    // is on top, none above an empty section, none above the shells' line:
-    // it is in the dock.)
-    let section = !shells.is_empty() && !docked;
+    // is on top, none above an empty section.)
     let mut gap_needs = gaps && !top.is_empty();
     let mut gap_agents = gaps && !agents.is_empty();
-    let mut gap_shells = gaps && section;
     // The dock takes the rows left over (the richest form that fits: its
     // spaces are content); what it leaves buys spacing back, never detail:
     // the agents' shape (and so the ladder's steps) is already settled.
     // Never a gap between cards: they stack, in the zebra.
-    let used = |n: &[Row], a: &[Row], g: [bool; 3]| top.len() + n.len() + a.len() + shells.len() + g.iter().filter(|x| **x).count();
-    let room = h.saturating_sub(used(&needs, &agents, [gap_needs, gap_agents, gap_shells]));
+    let used = |n: &[Row], a: &[Row], g: [bool; 2]| top.len() + n.len() + a.len() + g.iter().filter(|x| **x).count();
+    let room = h.saturating_sub(used(&needs, &agents, [gap_needs, gap_agents]));
     let dock = bottom(view, w, room, bar.prefix, opts.msg.as_deref());
     let mut spare = room.saturating_sub(dock.len());
-    // 1. The gap above each section header: AGENTS, SHELLS, NEEDS YOU.
-    for (gap, there) in [(&mut gap_agents, !agents.is_empty()), (&mut gap_shells, section), (&mut gap_needs, !top.is_empty())] {
+    // 1. The gap above each section header: AGENTS, NEEDS YOU.
+    for (gap, there) in [(&mut gap_agents, !agents.is_empty()), (&mut gap_needs, !top.is_empty())] {
         if there && !*gap && spare > 0 {
             *gap = true;
             spare -= 1;
@@ -2546,16 +2659,9 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     let at = rows.len();
     rows.extend(agents);
     frame.agents = at..rows.len();
-    let (section_rows, docked_rows) = if docked { (Vec::new(), shells) } else { (shells, Vec::new()) };
-    if gap_shells {
-        rows.push(Row::blank(w));
-    }
-    let at = rows.len();
-    rows.extend(section_rows);
-    frame.shells = at..rows.len();
     // Spare rows collect here (what spacing could not use); the dock sits
     // at the bottom.
-    while rows.len() + dock.len() + docked_rows.len() < h {
+    while rows.len() + dock.len() < h {
         rows.push(Row::blank(w));
     }
     let Dock { head, spaces, tail } = dock;
@@ -2563,11 +2669,6 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     rows.extend(head);
     frame.dock = at.min(h)..h;
     frame.spaces = (rows.len() - spaces).min(h)..rows.len().min(h);
-    if !docked_rows.is_empty() {
-        let at = rows.len();
-        rows.extend(docked_rows);
-        frame.shells = at.min(h)..rows.len().min(h);
-    }
     let at = rows.len();
     rows.extend(tail);
     rows.truncate(h);

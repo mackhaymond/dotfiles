@@ -81,9 +81,11 @@ def on_branch():
 # do what their keys did before spaces.
 OFF_META = [l for l in else_branch().splitlines()
             if re.match(r'bind -N "Select window \d" M-\d |bind -n User\d+ ', l)]
-# WezTerm's digit chords: row (CTRL space, ALT shell, CMD agent) -> sequence.
-# This space's chip, as text: █⌃N name, then the powerline edge.
-CHIP_RE = "█⌃(\\d) ([\\w-]+)\ue0b0"
+# WezTerm's digit chords: row (CTRL space, ALT M-N to the pane, CMD agent) ->
+# sequence.
+# This space's chip, as text: █⌃N name (󰋜 while on its home), then the
+# powerline edge.
+CHIP_RE = "█⌃(\\d) ([\\w-]+)(?: 󰋜)?\ue0b0"
 CHORD = {(row, n): f"\x1b[91{r}{n}~" for r, row in ((1, "CTRL"), (2, "ALT"), (3, "CMD")) for n in range(1, 10)}
 
 
@@ -131,15 +133,25 @@ class ConfigShape(unittest.TestCase):
 
     def test_else_unbinds_every_root_key_the_on_branch_binds(self):
         user = {f"User{i}" for i in range(27)}
+        meta = {f"M-{n}" for n in range(1, 10)}
         on = set(re.findall(r"^bind -n (\S+)", on_branch(), re.M)) - {"MouseDown1Status"}
         off = set(re.findall(r"^unbind -q -n (\S+)", else_branch(), re.M))
+        on_unbound = set(re.findall(r"^unbind -q -n (\S+)", on_branch(), re.M))
         # M-w: tmux.conf's menu comes back on reload (PICKER_BINDS). M-f: the
         # leader's first key, unbound in both modes so a reload drops it.
-        self.assertEqual(on - user - {"M-w"}, off - {"M-f"})
-        self.assertNotIn("M-f", on)
+        # M-1..9: Option-N was "shell N"; now it is the pane's in both modes,
+        # unbound in both so a reload from an older spaces.conf drops it.
+        self.assertEqual(on - user - {"M-w"}, off - {"M-f"} - meta)
+        self.assertEqual(on_unbound, {"M-f"} | meta)
+        self.assertTrue(meta <= off)
+        self.assertFalse(on & (meta | {"M-f"}))
         # The WezTerm chords are bound in both branches (off: the old thing).
         self.assertEqual(on & user, user)
         self.assertEqual(set(re.findall(r"^bind -n (User\d+) ", else_branch(), re.M)), user)
+        # OPT+N (User9..17) is M-N to the pane in BOTH modes, the same lines.
+        opt = [f"bind -n User{n + 8} send-keys M-{n}" for n in range(1, 10)]
+        for branch in (on_branch(), else_branch()):
+            self.assertEqual([l for l in branch.splitlines() if re.match(r"bind -n User(9|1[0-7]) ", l)], opt)
 
     def test_user_keys_match_wezterm_and_are_set_in_both_modes(self):
         head = SPACES.read_text().split('\n%if "#{==:#{@spaces},on}"\n')[0]
@@ -156,7 +168,7 @@ class ConfigShape(unittest.TestCase):
         self.assertEqual([l.split()[5] for l in OFF_META if l.startswith("bind -N")], [f"M-{n}" for n in range(1, 10)])
 
     def test_wezterm_digit_rows(self):
-        # CTRL+N → \e[911N~ (space), ALT+N → \e[912N~ (shell), CMD+N →
+        # CTRL+N → \e[911N~ (space), ALT+N → \e[912N~ (M-N), CMD+N →
         # \e[913N~ (agent): one sequence per chord, no prefix, no bare ESC N.
         # The mixed chords do nothing.
         text = WEZTERM.read_text()
@@ -375,7 +387,9 @@ class FlagOff(Server):
         bound = lambda table, key="M-1": next(l for l in self.t("list-keys", "-T", table).splitlines()
                                               if re.match(rf"bind-key +-T {table} +{key} ", l))
         self.assertIn(" agent 1 ", bound("prefix"))
-        self.assertIn(" shell 1 ", bound("root"))
+        self.assertEqual(self.t("list-keys", "-T", "root", "M-1", check=False), "")   # Option-1: the pane's
+        self.assertIn("send-keys M-1", bound("root", "User9"))                         # OPT+1 too
+        self.assertIn("@space_home", bound("prefix", "1"))                             # ⌃1: space 1's home
         self.assertIn(" pick-tab shell ", bound("prefix", "C-t"))   # CMD+SHIFT+T: which space?
         self.assertIn(" pick-tab agent ", bound("prefix", "K"))     # CMD+SHIFT+R
 
@@ -566,7 +580,9 @@ class Spaces(Server):
         w = self.t("new-window", "-d", "-b", "-t", self.M1, "-P", "-F", "#{window_id}")   # as closed-tabs reopens
         self.wait(lambda: self.t("display", "-t", "main:^", "-p", "#{window_id}"), self.M1)
         self.assertEqual(self.t("display", "-t", w, "-p", "#{window_index}"), "2")
-        self.key("M-1"); self.wait(self.on, f"main:{self.M1}")                       # Option-1 = home
+        self.t("select-window", "-t", w)
+        self.wait(self.on, f"main:{w}")
+        self.key("C-b", "1"); self.wait(self.on, f"main:{self.M1}")                  # ⌃1 = home
 
     def test_window_hooks_sync_only_for_a_space_whatever_the_client_is_on(self):
         log = os.path.join(self.tmp, "calls.log")
@@ -714,7 +730,7 @@ class Spaces(Server):
         # Not a shell, not a tab: shells and the close prompt count windows.
         self.assertEqual(self.t("display", "-t", "main:", "-p", "#{E:@space_close_prompt}"),
                          "close space main: 3 agents, 2 shells?")
-        self.assertEqual([int(i) for i in re.findall(r"█(\d+)█", self.status()[1])], [1, 2])
+        self.assertEqual(self.shell_tabs(), ["·"])                      # M3 (home has no tab)
         # Its content: the name (large), key, folder, git, agents, counts, hint.
         d = self.dash("main")
         self.t("set", "-w", "-t", self.M4, "@agent_summary", "tmux/fix the bar")
@@ -917,6 +933,34 @@ class Spaces(Server):
             self.assertEqual(self.on(), here)
             self.assertEqual(self.table(), "root")
 
+    def said(self):
+        """notify.sh's log as [kind, client, text] rows."""
+        log = os.path.join(self.env["XDG_STATE_HOME"], "tmux-notify", "log")
+        return [l.split("\t")[1:] for l in Path(log).read_text().splitlines()] if os.path.exists(log) else []
+
+    def test_option_w_jumps_to_a_lettered_shell_never_to_a_home(self):
+        # Non-home shells draw letters from the agents' pool (@agent_key).
+        Z2 = self.new_window("zed")
+        self.t("set", "-w", "-t", self.M3, "@agent_key", "k")
+        self.t("set", "-w", "-t", Z2, "@agent_key", "s")
+        self.t("set", "-w", "-t", self.M1, "@agent_key", "j")            # stale key on a home
+        self.t("set", "-w", "-t", self.P1, "@agent_key", "x")
+        self.key("M-w", "s")
+        self.wait(self.on, f"zed:{Z2}")                                  # a shell in another space
+        self.key("M-w", "k")
+        self.wait(self.on, f"main:{self.M3}")
+        for k in ("j", "x"):                                             # homes: never a target
+            self.key("M-w", k)
+            time.sleep(0.3)
+            self.assertEqual(self.on(), f"main:{self.M3}")
+            self.assertEqual(self.table(), "root")
+        self.wait(lambda: ["warn", self.client, "jump: nothing on x"] in self.said(), True)
+        self.assertIn(["warn", self.client, "jump: nothing on j"], self.said())
+        # A home and a shell share a letter: the shell wins, wherever it is.
+        self.t("set", "-w", "-t", Z2, "@agent_key", "j")
+        self.key("M-w", "j")
+        self.wait(self.on, f"zed:{Z2}")
+
     def test_option_w_escape_or_another_key_cancels_and_is_swallowed(self):
         w = self.new_window("main", path=self.env["HOME"])
         self.t("respawn-pane", "-k", "-t", w, "cat -v")
@@ -1002,16 +1046,37 @@ class Spaces(Server):
         self.assertNotIn(f"range=session|{self.sid('agents')}]", raw)
         self.assertIn("⌃2●", text)                                              # proj: done
         self.assertNotIn("proj", text)
-        self.assertEqual([int(i) for i in re.findall(r"█(\d+)█", text)], [1, 2])   # shells: windows 1 and 3
-        self.assertIn("█1█ 󰋜 ", text)                                              # home marker
-        self.assertNotIn("█2█ 󰋜", text)
+        self.assertEqual(self.shell_tabs(), ["·"])                  # shells: window 3 only, no letter yet
+        self.assertIn("⌃1 main 󰋜", text)                            # on home: the mark, in the chip
+        self.assertEqual(text.count("󰋜"), 1)                         # ...and home has no tab
         self.assertIn("range=window|3", raw)
+        self.assertNotIn("range=window|1]", raw)
         self.assertIn("[+]", text)
         self.assertIn("range=user|space-new", raw)
         self.assertTrue(text.rstrip().endswith("RIGHT"))
         self.assertIn("align=right", raw)
         self.assertLess(text.index("⌃1"), text.index("⌃2●"))
-        self.assertLess(text.index("⌃2●"), text.index("█1█ 󰋜"))
+        self.assertLess(text.index("⌃2●"), text.index("█·█"))
+
+    def shell_tabs(self):
+        """The shell tabs' letters (· for none yet), left to right."""
+        return re.findall(r"█(\S)█ ", self.status()[1])
+
+    def test_shell_tabs_show_their_letter_and_the_chip_marks_home(self):
+        S2 = self.new_window("main")
+        self.t("set", "-w", "-t", self.M3, "@agent_key", "k")
+        self.t("set", "-w", "-t", self.M1, "@agent_key", "j")      # stale key on home: still no tab
+        self.assertEqual(self.shell_tabs(), ["k", "·"])
+        raw, _ = self.status()
+        self.assertIn(f"range=window|{self.t('display', '-t', S2, '-p', '#{window_index}')}]", raw)
+        self.assertIn("⌃1 main 󰋜", self.here())                     # on home
+        self.t("select-window", "-t", self.M3)
+        self.wait(lambda: "󰋜" in self.status()[1], False)          # off home: no mark anywhere
+        self.assertIn("bold]⌃1 main#[", self.here())
+        self.assertIn("#[fg=#1e1e2e,bg=#fab387]k", self.status()[0])  # the window you are on: peach
+        self.t("select-window", "-t", self.M2)                       # on an agent: no mark either
+        self.wait(lambda: "󰋜" in self.status()[1], False)
+        self.assertEqual(self.shell_tabs(), ["k", "·"])
 
     def state(self):
         """The raw tail after this space's chip: its rollup ● and glyph."""
@@ -1020,8 +1085,8 @@ class Spaces(Server):
 
     def test_this_space_chip_is_its_colour_and_the_rollup_follows_it(self):
         # A solid chip in the space's colour, bold crust text, a powerline edge.
-        self.assertIn("#[fg=#b4befe,bg=default]█#[fg=#11111b,bg=#b4befe,bold]⌃1 main#[fg=#b4befe,bg=default,nobold]",
-                      self.here())                                # main: lavender
+        self.assertIn("#[fg=#b4befe,bg=default]█#[fg=#11111b,bg=#b4befe,bold]⌃1 main 󰋜#[fg=#b4befe,bg=default,nobold]",
+                      self.here())                                # main: lavender, on its home
         self.assertIn("#[fg=#f9e2af]●", self.state())             # needs-input beats running
         self.t("set", "-w", "-t", self.M4, "@agent_state", "idle")
         self.assertNotIn("●", self.state())                       # quiet: no dot
@@ -1034,7 +1099,7 @@ class Spaces(Server):
         self.t("set", "-w", "-t", self.P1, "@agent_workflow", "1")
         self.assertIn("󰒓", self.state())
         # Set off from the shells: edge, state, a two-cell gap.
-        self.assertTrue(self.status()[1].startswith("█⌃2 proj ● 󰒓   [+]"), self.status()[1])   # P1 is an agent now
+        self.assertTrue(self.status()[1].startswith("█⌃2 proj 󰋜 ● 󰒓   [+]"), self.status()[1])   # P1 is an agent now
 
     def test_prefix_turns_the_chip_red(self):
         self.t("set", "-w", "-t", self.M4, "@agent_state", "idle")
@@ -1066,7 +1131,7 @@ class Spaces(Server):
         self.new_window("s10", "needs-input")
         self.wait(lambda: "s10●" in self.status()[1], True)              # alert: the name, no key
         self.t("switch-client", "-c", self.client, "-t", "s10")
-        self.wait(lambda: self.status()[1].startswith("█s10\ue0b0"), True)   # the name alone, no ⌃10
+        self.wait(lambda: self.status()[1].startswith("█s10 󰋜\ue0b0"), True)   # the name alone, no ⌃10
 
     def test_alerts_only_for_other_spaces_that_need_you(self):
         self.assertEqual(self.alerts(), [("#a6e3a1", "2")])     # proj done; main (here) never
@@ -1108,7 +1173,7 @@ class Spaces(Server):
                 if "[+]" in lines[-1]:
                     break
                 time.sleep(0.1)
-            self.assertRegex(lines[-1], r"^█⌃1 main\ue0b0 ●  ⌃2● █1█ 󰋜 ~██2█ ~█ \[\+\] +RIGHT$")
+            self.assertRegex(lines[-1], r"^█⌃1 main 󰋜\ue0b0 ●  ⌃2● █·█ ~█ \[\+\] +RIGHT$")
             self.assertNotIn("[+]", lines[-2])   # one status line
         finally:
             run("kill-server")
@@ -1123,6 +1188,30 @@ class Spaces(Server):
         self.key("C-b", "7"); time.sleep(0.2)
         self.assertEqual(self.on("#{session_name}"), "main")
 
+    def test_prefix_digit_lands_on_that_spaces_home(self):
+        # A space IS its home: never the window last active there.
+        ZH = self.homes("zed")[0]
+        self.t("select-window", "-t", self.P2)                           # proj's current: an agent
+        self.assertEqual(self.t("display", "-t", "proj:", "-p", "#{window_id}"), self.P2)
+        self.key("C-b", "2"); self.wait(self.on, f"proj:{self.P1}")
+        Z2 = self.new_window("zed")
+        self.t("select-window", "-t", Z2)                                # zed's current: a shell
+        self.key("C-b", "3"); self.wait(self.on, f"zed:{ZH}")
+        # The space you are already in: back to its home too.
+        self.t("select-window", "-t", Z2)
+        self.wait(self.on, f"zed:{Z2}")
+        self.key("C-b", "3"); self.wait(self.on, f"zed:{ZH}")
+        self.t("select-window", "-t", self.M4)                           # main's current: an agent
+        self.key("C-b", "1"); self.wait(self.on, f"main:{self.M1}")
+        # The target, expanded as the binding does: $S:@home, and with no
+        # home (sync never leaves one missing for long, so this reads the
+        # format rather than racing a sync) the bare session.
+        line = next(l for l in on_branch().splitlines() if l.startswith('bind -N "Go to space 1" 1 '))
+        target = re.search(r"switch-client -t '(.*?)',run-shell", line).group(1)
+        self.assertEqual(self.t("display", "-p", target), f"{self.sid('main')}:{self.M1}")
+        self.t("set", "-wu", "-t", self.M1, "@space_home")
+        self.assertEqual(self.t("display", "-p", target), self.sid("main"))
+
     def test_prefix_meta_digit_goes_to_agent_n_of_this_space(self):
         self.key("C-b", "M-2"); self.wait(self.on, f"main:{self.M4}")
         self.key("C-b", "M-1"); self.wait(self.on, f"main:{self.M2}")
@@ -1130,24 +1219,37 @@ class Spaces(Server):
         self.key("C-b", "M-4"); time.sleep(0.3)   # only 3 agents: stays put
         self.assertEqual(self.on(), f"main:{self.M5}")
 
-    def test_meta_digit_goes_to_shell_n_of_this_space(self):
-        self.t("select-window", "-t", self.M4)
-        self.key("M-2"); self.wait(self.on, f"main:{self.M3}")
-        self.key("M-1"); self.wait(self.on, f"main:{self.M1}")   # home is shell 1
-        self.key("M-3"); time.sleep(0.3)   # only 2 shells: stays put
-        self.assertEqual(self.on(), f"main:{self.M1}")
+    def cat_window(self):
+        """A shell window of main running `cat -v`, selected: shows what reaches the pane."""
+        w = self.new_window("main", path=self.env["HOME"])
+        self.t("respawn-pane", "-k", "-t", w, "cat -v")
+        self.t("select-window", "-t", w)
+        self.wait(lambda: self.on("#{window_id}"), w)
+        return w
+
+    def test_meta_digit_reaches_the_pane(self):
+        # Option-1..9 were "shell N"; with spaces on they are the pane's again.
+        for n in range(1, 10):
+            self.assertEqual(self.t("list-keys", "-T", "root", f"M-{n}", check=False), "")
+        w = self.cat_window()
+        self.key("M-2")
+        self.wait(lambda: "^[2" in self.t("capture-pane", "-p", "-t", w), True)
+        self.assertEqual(self.on(), f"main:{w}")
 
     def chord(self, row, n):
         """A WezTerm digit chord, written into the client's terminal."""
         os.write(self.fd, CHORD[(row, n)].encode())
 
     def test_wezterm_chords_are_exact_keys(self):
-        self.t("select-window", "-t", self.M4)
-        self.chord("ALT", 2); self.wait(self.on, f"main:{self.M3}")     # OPT+2: shell 2
+        w = self.cat_window()
+        self.chord("ALT", 2)                                            # OPT+2: M-2 to the pane
+        self.wait(lambda: "^[2" in self.t("capture-pane", "-p", "-t", w), True)
+        self.assertEqual(self.on(), f"main:{w}")
         self.chord("CMD", 1); self.wait(self.on, f"main:{self.M2}")     # CMD+1: agent 1, never a shell
         self.chord("CMD", 3); self.wait(self.on, f"main:{self.M5}")
-        self.chord("ALT", 1); self.wait(self.on, f"main:{self.M1}")     # home
-        self.chord("CTRL", 2); self.wait(lambda: self.on("#{session_name}"), "proj")
+        self.chord("CTRL", 1); self.wait(self.on, f"main:{self.M1}")    # CTRL+1, already here: home
+        self.t("select-window", "-t", self.P2)
+        self.chord("CTRL", 2); self.wait(self.on, f"proj:{self.P1}")    # its home, not its last window
         self.chord("CTRL", 1); self.wait(lambda: self.on("#{session_name}"), "main")
         self.chord("CTRL", 7); time.sleep(0.3)                          # no space 7: stays
         self.assertEqual(self.on("#{session_name}"), "main")
@@ -1442,8 +1544,14 @@ class Spaces(Server):
         r = self.script("preview-tab", "s:" + self.sid("main").lstrip("$"))
         self.assertEqual(r.returncode, 0, r.stderr)
         shells, agents = r.stdout.split("\nagents\n")
-        self.assertEqual(len(re.findall(r"(?m)^  \d  ", shells)), 2)        # home + M3
-        self.assertIn("  1  home", shells)
+        self.assertEqual(shells.splitlines()[1:], [l for l in shells.splitlines() if l.startswith("  ")])
+        self.assertEqual(len(shells.strip().splitlines()), 3)              # header, home, M3
+        self.assertTrue(shells.splitlines()[1].startswith("     home "))     # home: no number, no letter
+        self.assertRegex(shells.splitlines()[2], r"^  ·  \S")               # M3: no letter yet
+        self.assertNotRegex(shells, r"(?m)^  \d  ")                         # no ordinals
+        self.t("set", "-w", "-t", self.M3, "@agent_key", "k")
+        r = self.script("preview-tab", "s:" + self.sid("main").lstrip("$"))
+        self.assertRegex(r.stdout.split("\nagents\n")[0].splitlines()[2], r"^  k  \S")
         self.assertIn("  d  my.proj/Fix it  (needs-input)", agents)
         self.assertEqual(len(agents.strip().splitlines()), 3)
         Path(self.proj, "README").write_text("")
@@ -1455,7 +1563,7 @@ class Spaces(Server):
         self.wait(lambda: self.on("#{session_name}"), "agents")
         here = self.on()
         windows = self.t("list-windows", "-t", "agents", "-F", "#{window_id}")
-        for k in (("M-1",), ("C-b", "M-1"), ("M-l",), ("M-h",), ("M-`",), ("M-m",)):
+        for k in (("C-b", "M-1"), ("M-l",), ("M-h",), ("M-`",), ("M-m",)):
             self.key(*k)
         time.sleep(0.5)
         self.assertEqual(self.on(), here)
@@ -1486,14 +1594,14 @@ class Spaces(Server):
         run("sel-start", "here", self.M2)                          # = prefix v
         self.wait(lambda: " W1C2W3W4W5RIGHT" in self.status()[1], True)   # every window, agents too
         self.assertNotIn("[+]", self.status()[1])
-        self.assertTrue(self.status()[1].startswith("█⌃1 main\ue0b0"))   # this space's tab stays
+        self.assertTrue(self.status()[1].startswith("█⌃1 main\ue0b0"))   # this space's tab stays (on M2: no home mark)
         self.assertEqual(self.status()[0].count("bg=#cba6f7"), 1)   # (fg=: proj's colour)
         self.assertIn("range=window|2", self.status()[0])
         run("sel-move", "right", self.M2)                          # = l
         self.wait(lambda: self.status()[0].count("bg=#cba6f7"), 2)
         run("sel-cancel")
         self.wait(lambda: "[+]" in self.status()[1], True)         # back to shells only
-        self.assertEqual([int(i) for i in re.findall(r"█(\d+)█", self.status()[1])], [1, 2])
+        self.assertEqual(self.shell_tabs(), ["·"])                 # M3; home has no tab
 
     # -- mouse ---------------------------------------------------------------
     def click(self, x, y):
@@ -1509,12 +1617,33 @@ class Spaces(Server):
         self.click(plus + 1, ROWS - 1)
         self.wait(lambda: len(self.t("list-windows", "-t", "proj").splitlines()), before + 1)
         self.wait(lambda: self.on("#{pane_current_path}"), self.proj)
-        self.new_window("zed", "needs-input")                     # zed now needs you
+        Z = self.new_window("zed", "needs-input")                 # zed now needs you
+        self.t("select-window", "-t", Z)                          # ...and it is zed's current window
+        ZH = self.homes("zed")[0]
         self.wait(lambda: "⌃3●" in self.status()[1], True)
         _, text = self.status()
         time.sleep(0.6)   # past double-click-time, so this is a fresh single click
         self.click(text.index("⌃3●"), ROWS - 1)
-        self.wait(lambda: self.on("#{session_name}"), "zed")
+        self.wait(self.on, f"zed:{ZH}")                           # an alert: that space's HOME
+
+    def test_clicking_a_shell_tab_selects_it_and_the_chip_goes_home(self):
+        self.t("set", "-w", "-t", self.M3, "@agent_key", "k")
+        self.wait(lambda: "█k█" in self.status()[1], True)
+        _, text = self.status()
+        self.click(text.index("█k█") + 1, ROWS - 1)               # a shell tab: that window
+        self.wait(self.on, f"main:{self.M3}")
+        _, text = self.status()
+        self.assertNotIn("󰋜", text)
+        time.sleep(0.6)
+        self.click(text.index("⌃1") + 1, ROWS - 1)                # this space's chip: home
+        self.wait(self.on, f"main:{self.M1}")
+        self.t("switch-client", "-c", self.client, "-t", "proj")
+        self.t("select-window", "-t", self.P2)                    # proj's current: an agent
+        self.wait(self.on, f"proj:{self.P2}")
+        _, text = self.status()
+        time.sleep(0.6)
+        self.click(text.index("⌃2") + 1, ROWS - 1)                # proj's own chip, from P2: home
+        self.wait(self.on, f"proj:{self.P1}")
 
 
 if __name__ == "__main__":

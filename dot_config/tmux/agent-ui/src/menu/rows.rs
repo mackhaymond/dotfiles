@@ -1,7 +1,7 @@
 //! What the menu's list shows: the filters, the search, and the rows.
 //!
-//! The menu opens on **All**, in a FIXED order: one group per space in the
-//! core's space order (the sidebar's AGENTS order, by name), each group's
+//! The menu opens on **All**, in a FIXED order: one group per space in THE
+//! space order (the sidebar's AGENTS order: ⌃N, then by name), each group's
 //! agents by window index. Nothing about a row's state or age moves it: an
 //! agent that goes from working to needs-input stays where it is and only
 //! changes glyph and colour (its title takes the needs colour and its reason
@@ -185,10 +185,11 @@ impl Target {
 }
 
 /// Every LISTED agent row in display order (the All list's order): the
-/// spaces' windows with an agent state, by space then window index. A
-/// window linked into two spaces appears under both.
+/// spaces' windows with an agent state, by space ([`crate::view::space_order`],
+/// the sidebar's) then window index. A window linked into two spaces
+/// appears under both.
 pub fn listed(v: &ViewModel) -> impl Iterator<Item = &Agent> {
-    v.spaces.iter().flat_map(|s| s.agents.iter()).filter(|a| !a.state.is_empty())
+    v.ordered_spaces().into_iter().flat_map(|s| s.agents.iter()).filter(|a| !a.state.is_empty())
 }
 
 /// One refresh's data for the menu: the shared view model plus what only
@@ -271,9 +272,15 @@ impl Data {
         self.letters.get(win).copied()
     }
 
-    /// `win`'s first row in display order (the All list), as a target.
+    /// `win`'s first place in display order, as a target: its All-list row
+    /// for an agent ([`listed`], a home running one included); else, for a
+    /// SHELL (lettered, never listed as a row here: the menu is the
+    /// agents'), the shell in its space, so its letter still goes there
+    /// ([`letters::lettered`]).
     pub fn first_row(&self, win: &str) -> Option<Target> {
-        let a = listed(&self.view).find(|a| a.window_id == win)?;
+        let a = listed(&self.view)
+            .find(|a| a.window_id == win)
+            .or_else(|| letters::lettered(&self.view).into_iter().find(|a| a.window_id == win))?;
         Some(Target::of(RowKey::Agent(a.session.clone(), a.window_id.clone()), a))
     }
 }
@@ -308,9 +315,10 @@ pub fn build_rows(d: &Data, tab: Tab, query: &str) -> Vec<Row> {
             }
     };
     if matches!(tab, Tab::All | Tab::Active | Tab::Working | Tab::Idle) {
-        // The core's space order (by name, as the sidebar), never the
-        // attach recency, so switching sessions moves nothing.
-        for s in &v.spaces {
+        // THE space order (⌃N, then by name: the sidebar's and the
+        // letters'), never the attach recency, so switching sessions moves
+        // nothing.
+        for s in v.ordered_spaces() {
             let shown: Vec<&Agent> = s.agents.iter().filter(|a| keep(a)).collect();
             if shown.is_empty() {
                 continue;
@@ -380,7 +388,8 @@ pub(crate) mod tests {
             row("stash", 3, "@12", &[("stash_label", "ICS export spike"), ("stash_origin", "schedule")]),
             row("stash", 4, "@13", &[("stash_label", "Calendar sync"), ("stash_origin", "schedule")]),
             row("stash", 5, "@14", &[("stash_label", "Catalog sync"), ("state", "idle"), ("stash_origin", "web")]),
-            "\x1fclient\x1f/dev/ttys999\x1f@2\x1fmain".into(),
+            // (@spaces on: shells are lettered too.)
+            "\x1fclient\x1f/dev/ttys999\x1f@2\x1fmain\x1fon\x1f\x1f".into(),
         ];
         Snapshot::parse(&rows.join("\n"))
     }
@@ -516,16 +525,20 @@ pub(crate) mod tests {
         assert!(d.letters.is_empty() && d.last.is_none() && d.key_writes.is_empty());
     }
 
-    /// Letters in display order (Alpha:@8 a, main:@1 s, @2 d, @3 f, @4 g,
-    /// work:@6 h, @7 j); the linked @3 once; the plain @5 and the hidden
-    /// @9 none; parked tabs none.
+    /// Letters, the agents first in display order (Alpha:@8 a, main:@1 s,
+    /// @2 d, @3 f, @4 g, work:@6 h, @7 j), then the shells (main's @5 k);
+    /// the linked @3 once; the hidden @9 none; parked tabs none.
     #[test]
     fn letters_from_the_snapshot() {
         let d = data();
-        let got: Vec<(&str, char)> = ["@8", "@1", "@2", "@3", "@4", "@6", "@7"].iter().map(|w| (*w, d.letter(w).unwrap())).collect();
-        assert_eq!(got, [("@8", 'a'), ("@1", 's'), ("@2", 'd'), ("@3", 'f'), ("@4", 'g'), ("@6", 'h'), ("@7", 'j')]);
-        assert_eq!(d.letters.len(), 7);
-        assert_eq!(d.key_writes.len(), 7);
+        let got: Vec<(&str, char)> = ["@8", "@1", "@2", "@3", "@4", "@6", "@7", "@5"].iter().map(|w| (*w, d.letter(w).unwrap())).collect();
+        assert_eq!(got, [("@8", 'a'), ("@1", 's'), ("@2", 'd'), ("@3", 'f'), ("@4", 'g'), ("@6", 'h'), ("@7", 'j'), ("@5", 'k')]);
+        assert_eq!(d.letters.len(), 8);
+        assert_eq!(d.key_writes.len(), 8);
+        // The shell is lettered, never listed as a row: its letter goes to
+        // it in its space all the same.
+        assert!(!shape(&build_rows(&d, Tab::All, "")).iter().any(|r| r.contains("@5")));
+        assert_eq!(d.first_row("@5").map(|t| (t.win, t.session)), Some(("@5".into(), "main".into())));
         // Stored: the same letters, nothing to write; a stored letter wins
         // over display order.
         let mut snap = fixture();
@@ -541,6 +554,11 @@ pub(crate) mod tests {
         let d2 = data_of(&snap);
         assert_eq!((d2.letter("@7"), d2.letter("@8"), d2.letter("@1")), (Some('a'), Some('j'), Some('s')));
         assert_eq!(d2.key_writes, [("@8".to_string(), Some('j'))]);
+        // @spaces off (classic: no ⌥W table): shells are never lettered.
+        let mut classic = fixture();
+        classic.clients[0].spaces = String::new();
+        let d3 = data_of(&classic);
+        assert_eq!((d3.letter("@5"), d3.letters.len()), (None, 7));
     }
 
     /// The live memo: a write in flight is not sent again, and its letter
@@ -554,7 +572,7 @@ pub(crate) mod tests {
             Data::build_with(s, Some("/dev/ttys999"), 1000.0, &coll, None, None, &mut SlotMemo::default(), Some(k))
         };
         let d1 = b(&snap, &mut keys);
-        assert_eq!(d1.key_writes.len(), 7);
+        assert_eq!(d1.key_writes.len(), 8);
         // tmux has not applied them; @8 (a) closes meanwhile: nobody moves.
         let mut s2 = snap.clone();
         s2.windows.retain(|w| w.id != "@8");
@@ -590,5 +608,23 @@ pub(crate) mod tests {
             w.mru_prev = "@10".into(); // parked: not listed
         }
         assert_eq!(data_of(&snap).last, None);
+    }
+
+    /// A HOME window running an agent is listed (the menu never hides
+    /// homes) but never lettered: its row off screen (another filter, a
+    /// search), ⌥W "last" still finds it by its All-list row.
+    #[test]
+    fn first_row_finds_a_home_running_an_agent() {
+        let mut snap = fixture();
+        for w in snap.windows.iter_mut().filter(|w| w.id == "@6") {
+            w.home = true; // work:1, failed
+        }
+        let d = data_of(&snap);
+        assert_eq!(d.letter("@6"), None);
+        let t = d.first_row("@6").expect("its All-list row");
+        assert_eq!((t.key, t.session), (RowKey::Agent("work".into(), "@6".into()), "work".to_string()));
+        // Off screen: the Parked tab draws no agent row, the target holds.
+        let drawn = super::super::state::Drawn::of(&{ let mut d = d.clone(); d.last = Some("@6".into()); d }, Vec::new());
+        assert_eq!(drawn.last.map(|t| t.win), Some("@6".into()));
     }
 }

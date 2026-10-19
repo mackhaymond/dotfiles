@@ -107,17 +107,21 @@ agent, letter, parked tab or NEEDS YOU.
   `@space_index` (main = 1); it lasts until closed (prefix Q). Hidden
   sessions (agents, tasks, stash, scratch, btop-popup) are never spaces;
   `stash` holds parked tabs.
-- **Shell** = a window of a space without `@agent_state`, numbered ⌥N per
-  space in window order among shells; shell 1 is the uncloseable **home**.
-  Written `<space>:<N>`: `cua-notch:2` is shell 2, not tmux window 2.
+- **Home** = each space's uncloseable first window; a space IS its home
+  (⌃N lands there). **Shell** = any other window of a space without
+  `@agent_state`; it has a **letter** from the agents' pool ("shell e" =
+  `@agent_key` e, no `@agent_state`), so ⌥W + letter reaches a shell or an
+  agent in any space. Homes never get a letter.
 - **Agent** = a window with `@agent_state` (idle/running/needs-input/failed/
-  done; Claude, Codex and OpenCode tabs, this one included). Its
-  **letter** (`@agent_key`, valid only while `@agent_state` is set) is
-  global and stable for its life: "agent D" = key d, any space (⌥W d). ⌘N
-  is the Nth agent of the current space and shifts, so name agents by
-  letter. Parked agents have no letter.
+  done; Claude, Codex and OpenCode tabs, this one included). "Agent D" =
+  `@agent_key` d with `@agent_state` set (trust the key for an agent only
+  then). A letter is global and kept for the window's life, even when a
+  shell becomes an agent or back. ⌘N is the Nth agent of the current space
+  and shifts, so name agents by letter. Parked windows have no letter.
 - **Reach a peer** through the shared `tmux` MCP server (pane `"d"` /
-  `tmux://d/<handle>` for an agent, `"cua-notch:2"` for a shell). It is
+  `tmux://d/<handle>` for an agent; a shell as `"cua-notch:2"`, shell 2 by
+  window order, home = 1, not tmux window 2; find "shell e" with the
+  skill's recipe). It is
   wired into OpenCode as `tmux_*` tools (`tmux_list_panes`,
   `tmux_read_pane`, `tmux_message_agent`, `tmux_name_pane`, `tmux_whoami`,
   `tmux_send_keys`; the orchestrator has them, subagents don't). Start with

@@ -19,7 +19,7 @@ fn idle_says_nothing_and_every_state_has_its_rail() {
     for (name, v) in all().into_iter().chain([("coloured", coloured())]).flat_map(|(n, v)| [(n, v.clone()), (n, lettered(v))]) {
         for (w, h) in [(34u16, 58u16), (42, 90), (42, 30), (24, 40)] {
             let f = layout(&v, w, h, &Opts::default());
-            let cx = Cx { w: usize::from(w), b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None };
+            let cx = Cx { w: usize::from(w), b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true };
             let t = texts(&f);
             for y in f.agents.clone().filter(|&y| f.rows[y].covers.len() == 1 && !is_group_header(&f.rows[y], usize::from(w))) {
                 let r = &f.rows[y];
@@ -88,10 +88,11 @@ fn view(agents: Vec<A>, here: Option<&str>) -> ViewModel {
             row(x.s, x.i, &id, &set)
         })
         .collect();
-    // Noise the sidebar must ignore: a hidden session, a parked tab, a plain shell.
+    // Noise the sidebar must ignore: a hidden session, a parked tab, a
+    // space's home (the space's header is the home: never a row).
     rows.push(row("agents", 1, "@900", &[("state", "failed"), ("summary", "hidden")]));
     rows.push(row("stash", 1, "@901", &[("summary", "x"), ("stash_label", "Parked one"), ("stash_ts", "5")]));
-    rows.push(row("main", 99, "@902", &[]));
+    rows.push(row("main", 99, "@902", &[("home", "1")]));
     if let Some(h) = here {
         rows.push(format!("\x1fclient\x1f{CLIENT}\x1f{h}\x1fmain"));
     }
@@ -207,16 +208,10 @@ fn uncapped(l: &str) -> String {
     format!(" {} ", l.split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" "))
 }
 
-/// The end of the sections above the dock: NEEDS YOU, AGENTS and the
-/// shells' section (not their line, which is in the dock).
+/// The end of the sections above the dock: NEEDS YOU and AGENTS (the
+/// shells are rows of their spaces in it).
 fn body_end(f: &Frame) -> usize {
-    let shells = if f.shells.start < f.dock.start { f.shells.end } else { 0 };
-    f.needs.end.max(f.agents.end).max(shells)
-}
-
-/// The shells are their one line, in the dock.
-fn docked(f: &Frame) -> bool {
-    !f.shells.is_empty() && f.shells.start >= f.dock.start
+    f.needs.end.max(f.agents.end)
 }
 
 /// The cell column `needle` starts at in `l` (every glyph here is one cell).
@@ -274,10 +269,11 @@ fn check_accounting(name: &str, v: &ViewModel, f: &Frame) {
 }
 
 /// The order every frame keeps: the panel (or title; nothing when the panel
-/// would be empty), NEEDS YOU, agents, the shells' section, spare rows,
-/// then the dock to the last row (its gap, its `▄` cap, the spaces, the
-/// shells' line, PARKED, its `▀` cap); sections never overlap; no line art
-/// anywhere; the toast cards (drawn over the top) never over the last row.
+/// would be empty), NEEDS YOU, agents (the shells in their spaces), spare
+/// rows, then the dock to the last row (its gap, its `▄` cap, the spaces,
+/// PARKED, its `▀` cap); sections never overlap; no SHELLS section or line
+/// anywhere; no line art anywhere; the toast cards (drawn over the top)
+/// never over the last row.
 fn check_order(name: &str, f: &Frame) {
     let h = usize::from(f.height);
     if h < 4 {
@@ -287,17 +283,7 @@ fn check_order(name: &str, f: &Frame) {
     let shown = |y: usize| !f.toast.contains(&y);
     assert!(f.needs.end <= f.agents.start, "{name}: {:?} {:?} {t:#?}", f.needs, f.agents);
     assert!(f.agents.end <= f.dock.start && f.dock.end == h, "{name}: {:?} {:?} {t:#?}", f.agents, f.dock);
-    if !f.shells.is_empty() {
-        assert!(f.agents.end <= f.shells.start, "{name}: shells {:?} {t:#?}", f.shells);
-        if docked(f) {
-            // The line: in the dock, between the spaces and PARKED.
-            assert!(f.shells.len() == 1 && f.spaces.end <= f.shells.start && f.shells.end == f.parked.start, "{name}: {t:#?}");
-            assert!(!shown(f.shells.start) || t[f.shells.start].trim_start().starts_with("SHELLS"), "{name}: {t:#?}");
-        } else {
-            assert!(f.shells.end <= f.dock.start, "{name}: shells {:?} {t:#?}", f.shells);
-            assert!(!shown(f.shells.start) || t[f.shells.start].starts_with(" SHELLS"), "{name}: {t:#?}");
-        }
-    }
+    assert!(!t.iter().any(|l| l.contains("SHELLS")), "{name}: {t:#?}");
     if !f.card.is_empty() {
         assert!(f.card.start == 0 && f.card.end <= f.needs.start, "{name}: card {:?} {t:#?}", f.card);
         assert!(f.status.start > f.card.start && f.status.end < f.card.end, "{name}");
@@ -454,9 +440,9 @@ fn spare_rows_buy_spacing_back() {
                     assert!(f.rows[end..stop].iter().all(is_blank), "{ctx}: {t:#?}");
                     let spare = stop - end;
                     let gap_above = |r: &std::ops::Range<usize>| r.is_empty() || r.start == 0 || is_blank(&f.rows[r.start - 1]);
-                    let gaps = [gap_above(&f.needs), gap_above(&f.agents), docked(&f) || gap_above(&f.shells)];
+                    let gaps = [gap_above(&f.needs), gap_above(&f.agents)];
                     if spare > 0 {
-                        assert_eq!(gaps, [true; 3], "{ctx}: a blank run at the bottom, a section gap missing: {t:#?}");
+                        assert_eq!(gaps, [true; 2], "{ctx}: a blank run at the bottom, a section gap missing: {t:#?}");
                     }
                     // The spaces: a gap above every header but the first, or not enough left for all.
                     let missing = group_gaps(&f.rows[f.agents.clone()], usize::from(w));
@@ -466,19 +452,18 @@ fn spare_rows_buy_spacing_back() {
                     // Never a pad between list tiles, whatever is spare.
                     let lists = f.needs.start.min(f.agents.start)..body_end(&f);
                     assert!(!t[lists].iter().any(|l| is_pad(l)), "{ctx}: {t:#?}");
-                    bought += usize::from(f.step > 0 && gaps == [true; 3]);
+                    bought += usize::from(f.step > 0 && gaps == [true; 2]);
                 }
             }
         }
     }
     assert!(bought > 0, "spacing never bought back");
-    // A frame with just enough (34x40, the shells in the dock): the dock
-    // keeps its caps, nothing blank at the bottom; the agents keep their
-    // shape (the zebra, no pads).
+    // A frame with just enough (34x40): the dock keeps its caps, nothing
+    // blank at the bottom; the agents keep their shape (the zebra, no pads).
     let f = layout(&lettered(quiet()), 34, 40, &with_bar(demo_bar()));
     let t = texts(&f);
-    assert_eq!((f.step, f.agents_step, f.shells.len()), (STEPS.len() as u8 - 1, 0, 1), "{t:#?}");
-    assert!(docked(&f) && is_pad(&t[39]) && f.dock.start == f.agents.end, "{t:#?}");
+    assert_eq!(f.agents_step, 0, "{t:#?}");
+    assert!(is_pad(&t[39]) && f.dock.start == f.agents.end, "{t:#?}");
     assert!(!t[f.agents.clone()].iter().any(|l| is_pad(l)), "{t:#?}");
 }
 
@@ -491,8 +476,7 @@ fn spare_rows_buy_spacing_back() {
 fn blank_rows_are_spent_first() {
     let section_gaps = |f: &Frame| {
         let gap = |r: &Range<usize>| !r.is_empty() && r.start > 0 && is_blank(&f.rows[r.start - 1]);
-        let can = 2 + usize::from(!f.shells.is_empty() && !docked(f));
-        (usize::from(gap(&f.needs)) + usize::from(gap(&f.agents)) + usize::from(!docked(f) && gap(&f.shells)), can)
+        (usize::from(gap(&f.needs)) + usize::from(gap(&f.agents)), 2)
     };
     let group_gaps_shown = |f: &Frame| heads(f).len().saturating_sub(1 + group_gaps(&f.rows[f.agents.clone()], f.width.into()));
     let caps = |f: &Frame| is_pad(&texts(f)[usize::from(f.height) - 1]);
@@ -500,7 +484,7 @@ fn blank_rows_are_spent_first() {
         for w in [34u16, 42] {
             let at = |h: u16| layout(&v, w, h, &with_bar(demo_bar()));
             let roomy = at(120);
-            assert!(group_gaps_shown(&roomy) > 0 && section_gaps(&roomy) == (3, 3) && caps(&roomy), "{name}: {:#?}", texts(&roomy));
+            assert!(group_gaps_shown(&roomy) > 0 && section_gaps(&roomy) == (2, 2) && caps(&roomy), "{name}: {:#?}", texts(&roomy));
             for f in (16..=120).rev().map(at) {
                 let t = texts(&f);
                 let ctx = format!("{name} {w}x{}", f.height);
@@ -551,30 +535,24 @@ fn agent_rows_are_one_height() {
 }
 
 /// With a panel and shells too, a shrinking frame only ever gives detail
-/// up: the step, the agents' step and the shells' form (section → one
-/// line → none) never come back while the panel keeps its size (the panel
-/// has its own ladder: the meters, then the panel, then usage go, and the
-/// rows that frees may well buy the sections detail back).
+/// up: the step and the agents' step never come back while the panel keeps
+/// its size (the panel has its own ladder: the meters, then the panel, then
+/// usage go, and the rows that frees may well buy the sections detail back).
 #[test]
 fn shrinking_never_brings_detail_back() {
     let bars = [demo_bar(), Bar { usage: vec![], stale: None, ..demo_bar() }, Bar { prefix: true, ..demo_bar() }];
-    for (name, v) in all() {
+    for (name, v) in all().into_iter().chain([("shells", lettered(shelly()))]) {
         for bar in &bars {
             for w in [30u16, 34, 44] {
-                let mut last = (0u8, 0u8, 0u8);
+                let mut last = (0u8, 0u8);
                 let mut top = usize::MAX;
                 for h in (12u16..=110).rev() {
                     let f = layout(&v, w, h, &with_bar(bar.clone()));
                     if f.status.end + f.card.len() != top {
-                        (top, last) = (f.status.end + f.card.len(), (0, 0, 0));
+                        (top, last) = (f.status.end + f.card.len(), (0, 0));
                     }
-                    let form = match f.shells.len() {
-                        0 => 2,
-                        1 => 1,
-                        _ => 0,
-                    };
-                    let now = (f.step, f.agents_step, form);
-                    assert!(now.0 >= last.0 && now.1 >= last.1 && now.2 >= last.2, "{name} {w}x{h}: {now:?} after {last:?} {:#?}", texts(&f));
+                    let now = (f.step, f.agents_step);
+                    assert!(now.0 >= last.0 && now.1 >= last.1, "{name} {w}x{h}: {now:?} after {last:?} {:#?}", texts(&f));
                     last = now;
                 }
             }
@@ -881,7 +859,7 @@ fn tiny_heights() {
         assert_eq!(f.target(3, y as u16), Some(&Target::Menu(Some("all"))));
     }
     // Nothing pending in one row: the header saying so, never ` … 0 need you`.
-    let cx = Cx { w: 34, b: Badge::OFF, now: NOW as f64, spin: 0, home: None };
+    let cx = Cx { w: 34, b: Badge::OFF, now: NOW as f64, spin: 0, home: None, cur: None, shells: true };
     assert_eq!(needs_cut(&empty(), cx, 1).iter().map(Row::text).collect::<Vec<_>>(), [needs_header(&empty(), 34).text()]);
 }
 
@@ -1289,11 +1267,13 @@ fn answered_is_never_folded() {
 }
 
 /// `v` with letters as the sidebar gives them (`letters::of_view`'s
-/// assignment, nothing stored yet): the listed agents in display order.
+/// assignment, nothing stored yet): the listed agents and shells in display
+/// order ([`crate::menu::letters::lettered`]).
 fn lettered(mut v: ViewModel) -> ViewModel {
-    let listed: Vec<(String, String)> = crate::menu::rows::listed(&v).map(|a| (a.window_id.clone(), String::new())).collect();
+    let listed: Vec<(String, String)> =
+        crate::menu::letters::lettered(&v).into_iter().map(|a| (a.window_id.clone(), String::new())).collect();
     let got = crate::menu::letters::assign(&listed, &[]).letters;
-    for x in v.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()) {
+    for x in v.spaces.iter_mut().flat_map(|s| s.agents.iter_mut().chain(s.plain.iter_mut())) {
         x.letter = got.get(&x.window_id).copied();
     }
     for n in v.needs.iter_mut() {
@@ -1302,26 +1282,74 @@ fn lettered(mut v: ViewModel) -> ViewModel {
     v
 }
 
-/// A bar like the live one: main (⌃1, yellow), three shells (home first,
-/// the second active), usage meters (the weekly one from its numbers, the
-/// session one from its text) and a stale save.
+/// Spaces with HOMES and SHELLS, `@spaces` on, every space shown (scope
+/// `scope`), the client on `here`, letters as the sidebar assigns them:
+///
+/// - main (⌃1): home @1; agents @2 working (main:1), @3 idle (main:2), @4
+///   asking (main:3); shells @5 at a prompt in agent-ui (main:4), @6
+///   running nvim (main:5);
+/// - work (⌃2): home @7; agent @8 working; shell @9 in cua-notch;
+/// - notes (⌃3): home @10; shell @11 in notes, no agent.
+///
+/// Letters (display order: each space's agents, then its shells): @2 a,
+/// @3 s, @4 d, @5 f, @6 g, @8 h, @9 j, @11 k; homes none.
+fn shells_at(here: &str, scope: &str, extra: &[(&str, &str, &str)]) -> ViewModel {
+    let since = |st: &str| format!("{} {st}", NOW - 90);
+    let mut rows = vec![
+        row("main", 0, "@1", &[("home", "1"), ("space_index", "1"), ("path", "/x/main")]),
+        row("main", 1, "@2", &[("state", "running"), ("summary", "Tmux Agent Sidebar"), ("since", &since("running")), ("space_index", "1"),
+            ("detail_kind", "run"), ("detail", "Edit layout.rs")]),
+        row("main", 2, "@3", &[("state", "idle"), ("summary", "Commodities Job Tracker"), ("since", &since("idle")), ("space_index", "1")]),
+        row("main", 3, "@4", &[("state", "needs-input"), ("summary", "Kua Yu focus timing"), ("since", &since("needs-input")),
+            ("detail_kind", "ask"), ("detail", "Which deck?"), ("space_index", "1")]),
+        row("main", 4, "@5", &[("path", "/x/agent-ui"), ("space_index", "1")]),
+        row("main", 5, "@6", &[("path", "/x/agent-ui"), ("space_index", "1")]).replacen("zsh", "nvim", 1),
+        row("work", 0, "@7", &[("home", "1"), ("space_index", "2")]),
+        row("work", 1, "@8", &[("state", "running"), ("summary", "Island resize spring"), ("since", &since("running")), ("space_index", "2")]),
+        row("work", 2, "@9", &[("path", "/x/cua-notch"), ("space_index", "2")]),
+        row("notes", 0, "@10", &[("home", "1"), ("space_index", "3")]),
+        row("notes", 1, "@11", &[("path", "/x/notes"), ("space_index", "3")]),
+        row("agents", 1, "@900", &[("state", "failed"), ("summary", "hidden")]),
+    ];
+    let session = rows.iter().find(|r| r.split('\x1f').nth(2) == Some(here)).and_then(|r| r.split('\x1f').next()).unwrap().to_string();
+    // ("classic", ..) in `extra`: @spaces off.
+    let spaces = if extra.iter().any(|e| e.0 == "classic") { "" } else { "on" };
+    rows.push(format!("\x1fclient\x1f{CLIENT}\x1f{here}\x1f{session}\x1f{spaces}\x1f{scope}\x1f"));
+    let mut snap = Snapshot::parse(&rows.join("\n"));
+    for (id, k, v) in extra.iter().filter(|e| e.0 != "classic") {
+        for w in snap.windows.iter_mut().filter(|w| w.id == *id) {
+            match *k {
+                "stash_sel" => w.stash_sel = *v == "1",
+                "state" => w.state = v.to_string(),
+                _ => panic!("{k}"),
+            }
+        }
+    }
+    let c = Collator::new("en_US.UTF-8");
+    let args = BuildArgs { client: Some(CLIENT), now: NOW as f64, collator: &c, git: None, log: vec![], watcher_age: Some(1.0) };
+    let mut v = ViewModel::build(&snap, args);
+    let got = crate::menu::letters::of_view(&snap, &v, None).letters;
+    for x in v.spaces.iter_mut().flat_map(|s| s.agents.iter_mut().chain(s.plain.iter_mut())) {
+        x.letter = got.get(&x.window_id).copied();
+    }
+    for n in v.needs.iter_mut() {
+        n.agent.letter = got.get(&n.agent.window_id).copied();
+    }
+    v.apply_scope(&snap);
+    v
+}
+
+/// [`shells_at`] with the client on main's agent-ui shell, every space shown.
+fn shelly() -> ViewModel {
+    shells_at("@5", "all", &[])
+}
+
+/// A bar like the live one: main (⌃1, yellow), usage meters (the weekly
+/// one from its numbers, the session one from its text) and a stale save.
 fn demo_bar() -> Bar {
     use super::super::status::{Chip, Member};
     Bar {
         space: Some(Chip { index: Some(1), name: "main".into(), color: Some(Ink::Rgb(0xf9, 0xe2, 0xaf)), hidden: false }),
-        shells: ["~", "nvim", "proj"]
-            .iter()
-            .enumerate()
-            .map(|(k, l)| Shell {
-                n: k as u32 + 1,
-                label: l.to_string(),
-                home: k == 0,
-                active: k == 1,
-                selected: false,
-                win: format!("@{}", 901 + k),
-                session: "main".into(),
-            })
-            .collect(),
         usage: vec![
             Usage { label: "S".into(), text: "13% (-38%)".into(), color: Some(Ink::Pal("green")), used: Some(13.0),
                 expected: Some(51.0), delta: Some(-38), ..Usage::default() },
@@ -1459,88 +1487,153 @@ fn the_panel_replaces_the_status_line() {
     assert!(!t.iter().any(|l| l.contains("⏵ next") || l.contains("≡")), "{t:#?}");
 }
 
-/// The client's space's shells: a SHELLS section under the agents, one
-/// button tile each on the card grid (rail, pad, the ⌥N key-cap, pad, ⌂ on
-/// the home, the label), the active one lifted (`tile_hi`, a blue rail, its
-/// cap solid blue, its label bold), each clicking through to its shell.
+/// Shells are rows of their SPACE, after its agents: one row each, a
+/// TERMINAL LINE on its sunken strip (`term`, one colour for the row), the
+/// key-cap exactly an agent's quiet cap (as over `tile`), a green bold `❯`,
+/// then the cwd at a prompt (`sub`) or the command bold `text` with its
+/// folder dim; the client's own lifted like its own agent card. No home row
+/// anywhere (the header is the home), no SHELLS section, a space with
+/// nothing but shells still a group; each row clicks through to its shell.
 #[test]
-fn shells_list_under_the_agents() {
-    let v = lettered(quiet());
-    let f = layout(&v, 34, 62, &with_bar(demo_bar()));
+fn shells_are_rows_of_their_space() {
+    let v = shelly();
+    let f = layout(&v, 44, 60, &with_bar(demo_bar()));
     let t = texts(&f);
-    assert!(f.shells.start >= f.agents.end && f.shells.end <= f.dock.start, "{t:#?}");
-    let s = f.shells.start;
-    // One-row buttons edge to edge, no pads, the zebra's two tones (the
-    // active one lifted).
-    assert_eq!(f.shells.len(), 4, "{t:#?}");
-    assert_eq!(t[s].trim_end(), " SHELLS");
-    assert!(f.rows[s].segs.contains(&bold(" SHELLS", "overlay2")));
-    assert_eq!(t[s + 1].trim_end(), "    ⌥1  ⌂ ~");
-    assert_eq!(t[s + 2].trim_end(), " ▎  ⌥2  nvim");
-    assert_eq!(t[s + 3].trim_end(), "    ⌥3  proj");
-    let bgs: Vec<Option<Ink>> = (s + 1..s + 4).map(|y| f.rows[y].bg).collect();
-    assert_eq!(bgs, [Some(Ink::Pal("tile")), Some(Ink::Pal("tile_hi")), Some(Ink::Pal("tile"))]);
-    let twins = layout(&v, 34, 62, &with_bar(Bar { shells: demo_bar().shells.into_iter().map(|s| Shell { active: false, ..s }).collect(), ..demo_bar() }));
-    let s2 = twins.shells.start;
-    let bgs: Vec<Option<Ink>> = (s2 + 1..s2 + 4).map(|y| twins.rows[y].bg).collect();
-    assert_eq!(bgs, [Some(Ink::Pal("tile")), Some(Ink::Pal("tile_lo")), Some(Ink::Pal("tile"))]);
-    assert_eq!((f.rows[s + 2].segs[1].clone(), cap_of(&f.rows[s + 2])), (seg("▎", "blue"), block(" ⌥2 ", "crust", "blue")));
-    assert_eq!(cap_of(&f.rows[s + 1]), block(" ⌥1 ", "sub", "surface1"));
-    assert!(f.rows[s + 2].segs.iter().any(|x| x.text == "nvim" && x.bold));
-    let shell = |win: &str| Some(Target::Shell { win: win.into(), session: "main".into() });
-    for (y, win) in [(s + 1, "@901"), (s + 2, "@902"), (s + 3, "@903")] {
-        let y = y as u16;
-        assert_eq!((f.target(0, y).cloned(), f.target(33, y).cloned()), (shell(win), shell(win)));
+    assert_eq!((f.step, f.agents_step), (0, 0), "{t:#?}");
+    assert!(!t.iter().any(|l| l.contains("SHELLS")), "{t:#?}");
+    // main: its header, its three agent cards (two rows each), then its two
+    // shells. Letters: every agent first (a s d, work's f), then the shells.
+    let main = head(&f, "main");
+    let (own, nvim) = (find(&f, "/x/agent-ui"), find(&f, "nvim"));
+    assert_eq!((own, nvim), (main + 7, main + 8), "{t:#?}");
+    assert!(t[nvim].starts_with("    h  ❯ nvim  agent-ui ") && t[nvim].ends_with("  "), "{:?}", t[nvim]);
+    let peach = Ink::Pal("peach");
+    assert_eq!(cap_of(&f.rows[nvim]), block(" h ", peach, over(peach, CAP_TINT, Ink::Pal("tile"))));
+    assert_eq!(f.rows[nvim].bg, Some(Ink::Pal(TERM_BG)));
+    for s in [bold(PROMPT, "green"), bold("nvim", "text"), seg("  agent-ui", "overlay2")] {
+        assert!(f.rows[nvim].segs.contains(&s), "{s:?} in {:?}", f.rows[nvim].segs);
     }
-    assert_eq!(f.target(3, s as u16), None);
-    // Under the agents, a blank row before it while the gaps last.
-    assert!(t[s - 1].trim().is_empty() && f.step == 0, "{t:#?}");
-    // No shells, no section.
-    let f = layout(&v, 34, 58, &with_bar(Bar { shells: vec![], ..demo_bar() }));
-    assert!(f.shells.is_empty() && !texts(&f).iter().any(|l| l.contains("SHELLS")));
-    // Short: one line of buttons in the dock (under the spaces, over
-    // PARKED) before the agents lose any detail, then kept there while they
-    // compress.
-    let v = busy();
-    for h in 12u16..=120 {
-        let f = layout(&v, 34, h, &with_bar(demo_bar()));
-        let t = texts(&f);
-        assert!([4, 1].contains(&f.shells.len()), "{h}: {t:#?}");
-        if f.shells.len() == 1 {
-            assert!(t[f.shells.start].starts_with("  SHELLS ") && t[f.shells.start].contains("nvim"), "{h}: {t:#?}");
-            assert!(docked(&f) && f.shells.end == f.parked.start && f.rows[f.shells.start].bg == Some(Ink::Pal(PANEL)), "{h}: {t:#?}");
-        } else {
-            assert_eq!(f.agents_step, 0, "{h}: {t:#?}");
-            assert!(f.shells.start >= f.agents.end && f.shells.end <= f.dock.start, "{h}: {t:#?}");
+    // The client's own shell (at a prompt): lifted like its own card (the cap solid).
+    assert!(t[own].starts_with(" ▎  g  ❯ /x/agent-ui") && t[own].ends_with(" █ "), "{:?}", t[own]);
+    assert_eq!((f.rows[own].bg, f.rows[own].segs[1].clone(), cap_of(&f.rows[own])),
+        (Some(Ink::Pal(MINE_BG)), seg("▎", "lavender"), block(" g ", "crust", peach)));
+    assert!(f.rows[own].segs.contains(&seg("/x/agent-ui", "text")));
+    let shell = |win: &str, s: &str| Some(Target::Shell { win: win.into(), session: s.into() });
+    for (y, win) in [(own, "@5"), (nvim, "@6")] {
+        assert_eq!((f.target(0, y as u16).cloned(), f.target(43, y as u16).cloned()), (shell(win, "main"), shell(win, "main")));
+    }
+    // work: its agent, then its shell (a prompt: its cwd, in `sub`); notes:
+    // no agent, its shell alone.
+    let work = head(&f, "work");
+    assert!(t[work + 3].starts_with("    j  ❯ /x/cua-notch"), "{t:#?}");
+    assert!(f.rows[work + 3].segs.contains(&seg("/x/cua-notch", "sub")), "{:?}", f.rows[work + 3].segs);
+    let notes = head(&f, "notes");
+    assert!(t[notes + 1].starts_with("    k  ❯ /x/notes"), "{t:#?}");
+    assert_eq!(f.target(5, (notes + 1) as u16).cloned(), shell("@11", "notes"));
+    assert!(main < work && work < notes, "⌃N order: {t:#?}");
+    // No home anywhere: nothing goes to @1, @7 or @10.
+    for r in &f.rows {
+        for (_, _, tg) in &r.targets {
+            if let Target::Go { win, .. } | Target::Shell { win, .. } = tg {
+                assert!(!["@1", "@7", "@10"].contains(&win.as_str()), "{tg:?}: {t:#?}");
+            }
         }
+    }
+    // Shell rows stand for no agent: the accounting is the agents'.
+    check_accounting("shells", &v, &f);
+    check_order("shells", &f);
+    // @spaces off (the classic sidebar): no shell rows, no shell letters.
+    let classic = shells_at("@2", "", &[("classic", "", "")]);
+    assert!(!classic.shells && crate::menu::letters::lettered(&classic).iter().all(|a| !a.state.is_empty()));
+    let f = layout(&classic, 44, 60, &Opts::default());
+    assert!(!texts(&f).iter().any(|l| l.contains(PROMPT.trim())) && !heads(&f).iter().any(|(_, s)| s == "notes"), "{:#?}", texts(&f));
+}
+
+/// The cwd as a prompt shows it: `~` for $HOME, cut from the LEFT at a
+/// folder boundary when it does not fit (`…/tmux/agent-ui`), a last folder
+/// too long on its own cut mid-name.
+#[test]
+fn shell_paths_cut_from_the_left() {
+    assert_eq!(clip_left("~/code/agent-ui", 20), "~/code/agent-ui");
+    assert_eq!(clip_left("~/.local/share/chezmoi/dot_config/tmux/agent-ui", 26), "…/dot_config/tmux/agent-ui");
+    assert_eq!(clip_left("~/.local/share/chezmoi/dot_config/tmux/agent-ui", 16), "…/tmux/agent-ui");
+    assert_eq!(clip_left("~/x/averyveryverylongfolder", 10), "…ongfolder");
+    assert_eq!(clip_left("/a/b", 0), "");
+}
+
+/// The space's header IS its home: a click goes there ([`Target::Session`],
+/// which lands on the home window), and while the client is ON the home the
+/// header wears the client's own lift (`tile_me`, the lavender edge)
+/// instead of its band, in either scope.
+#[test]
+fn the_header_is_the_home() {
+    let f = layout(&shelly(), 44, 60, &Opts::default());
+    let main = head(&f, "main");
+    assert_eq!(f.rows[main].bg, Some(band(Ink::Pal("peach"))), "{:#?}", texts(&f));
+    assert!(!texts(&f)[main].contains('█'));
+    for scope in ["all", "space"] {
+        let f = layout(&shells_at("@1", scope, &[]), 44, 60, &Opts::default());
+        let t = texts(&f);
+        let main = head(&f, "main");
+        assert_eq!(f.rows[main].bg, Some(Ink::Pal(MINE_BG)), "{scope}: {t:#?}");
+        assert!(t[main].starts_with("▌ 1  main") && t[main].ends_with(" █ "), "{scope}: {:?}", t[main]);
+        let n = f.rows[main].segs.len();
+        assert_eq!(f.rows[main].segs[n - 2], seg("█", "lavender"), "{scope}");
+        assert_eq!(f.target(20, main as u16), Some(&Target::Session("main".into())));
+        // The only lifted row: no own card, no own shell.
+        assert_eq!(f.rows.iter().filter(|r| r.bg == Some(Ink::Pal(MINE_BG))).count(), 1, "{scope}: {t:#?}");
+        if scope == "all" {
+            assert!(f.rows[head(&f, "work")].bg.is_none(), "{t:#?}");
+        }
+    }
+    // Narrow (no second lines, no edges): the lift without the edge.
+    let f = layout(&shells_at("@1", "all", &[]), 24, 60, &Opts::default());
+    let main = head(&f, "main");
+    assert!(f.rows[main].bg == Some(Ink::Pal(MINE_BG)) && !texts(&f)[main].contains('█'), "{:#?}", texts(&f));
+}
+
+/// ⌥W armed: a shell's cap is inverted like every agent's.
+#[test]
+fn jump_mode_inverts_shell_caps() {
+    let f = layout(&shelly(), 44, 60, &with_bar(Bar { jump: true, ..demo_bar() }));
+    for (needle, k) in [("nvim", 'h'), ("/x/agent-ui", 'g'), ("/x/cua-notch", 'j'), ("Tmux Agent", 'a')] {
+        assert_eq!(cap_of(&f.rows[find(&f, needle)]), block(format!(" {k} "), "peach", "crust"), "{needle}");
     }
 }
 
+/// Squeezed to a step that folds the idle agents, a space's shells fold
+/// too: two or more in ONE line on the shells' strip, each its key-cap and
+/// label (its command, else its folder) two cells apart, each clicking
+/// through to its shell; `+K` for those that do not fit, at any width.
 #[test]
-fn shells_line_counts_what_does_not_fit() {
-    let shells: Vec<Shell> = (1..=12)
-        .map(|n| Shell { n, label: format!("sh{n}"), home: n == 1, active: n == 7, selected: false, win: format!("@{n}"), session: "main".into() })
-        .collect();
-    let bar = Bar { shells, ..demo_bar() };
-    for w in [34usize, 24, 60, 16] {
-        let rows = shells_line(&bar, w);
-        assert_eq!(rows.len(), 1, "{w}");
-        let shown = rows[0].targets.len();
-        let text = rows[0].text();
-        let more = text.split(" +").nth(1).map_or(0, |k| k.trim().parse::<usize>().unwrap());
-        assert_eq!(shown + more, 12, "{w}: {text:?}");
-        assert_eq!(width(&rows[0].segs), w);
-        // The active shell is kept first.
-        assert!(w < 20 || text.contains("sh7"), "{w}: {text:?}");
+fn shells_fold_into_one_line() {
+    let v = shelly();
+    let f = (10..80).rev().map(|h| layout(&v, 44, h, &Opts::default())).find(|f| f.agents_step == 3).expect("a folding step");
+    let t = texts(&f);
+    let y = find(&f, "agent-ui");
+    assert!(t[y].starts_with("    g  agent-ui   h  nvim"), "{t:#?}");
+    assert_eq!(f.rows[y].bg, Some(Ink::Pal(TERM_BG)));
+    let shell = |win: &str| Some(Target::Shell { win: win.into(), session: "main".into() });
+    assert_eq!((f.target(4, y as u16).cloned(), f.target(col(&t[y], "nvim"), y as u16).cloned()), (shell("@5"), shell("@6")));
+    assert_eq!(f.target(1, y as u16), None);
+    // A lone shell never folds (work's).
+    assert!(t.iter().any(|l| l.starts_with("    j  ❯ /x/cua-notch")), "{t:#?}");
+    // Many: what does not fit is counted.
+    let base = v.spaces.iter().flat_map(|s| s.plain.iter()).find(|a| a.window_id == "@6").unwrap().clone();
+    let many: Vec<Agent> = (1..=12).map(|n| Agent { window_id: format!("@{}", 100 + n), shell: format!("sh{n}"), letter: None, ..base.clone() }).collect();
+    let refs: Vec<&Agent> = many.iter().collect();
+    for w in [16usize, 24, 34, 60, 200] {
+        for on in [true, false] {
+            let cx = Cx { w, b: Badge { on, loud: false }, now: NOW as f64, spin: 0, home: None, cur: None, shells: true };
+            let r = shells_line(&refs, cx, Ink::Pal("peach"));
+            let text = r.text();
+            assert_eq!(width(&r.segs), w, "{w}: {text:?}");
+            let more = text.split('+').nth(1).map_or(0, |k| k.trim().parse::<usize>().unwrap());
+            assert_eq!(r.targets.len() + more, 12, "{w}: {text:?}");
+            assert!(r.targets.iter().all(|(a, b, _)| a < b && usize::from(*b) < w), "{w}: {:?}", r.targets);
+            assert_eq!(more == 0, w == 200, "{w}: {text:?}");
+        }
     }
-    let t = shells_line(&bar, 200)[0].text();
-    assert!(t.starts_with("  SHELLS  ⌥1  ⌂ sh1   ⌥2  sh2 "), "{t:?}");
-    assert!(t.contains(" ⌥9  sh9   sh10   sh11 "), "{t:?}");
-    // The active shell's cap solid blue, the others quiet; on the dock.
-    let row = &shells_line(&bar, 200)[0];
-    assert!(row.segs.contains(&block(" ⌥7 ", "crust", "blue")) && row.segs.contains(&block(" ⌥1 ", "sub", "surface1")), "{:?}", row.segs);
-    assert_eq!(row.bg, Some(Ink::Pal(PANEL)));
-    assert!(shells_line(&Bar::default(), 34).is_empty() && shells_section(&Bar::default(), 34).is_empty());
 }
 
 /// A meter's bar as (glyph, ink) cells: from its fourth cell, the `━` and
@@ -1635,7 +1728,7 @@ fn dim_text_on_surfaces_is_overlay2() {
 }
 
 /// prefix v's selection: every selected agent tile (both lines) and shell
-/// button on a mauve tint with a mauve stripe; the hint.
+/// row on a mauve tint with a mauve stripe; the hint.
 #[test]
 fn the_stash_selection_tints_rows_and_shows_its_keys() {
     let v = lettered(view(
@@ -1646,7 +1739,6 @@ fn the_stash_selection_tints_rows_and_shows_its_keys() {
         Some("@1"),
     ));
     let mut bar = demo_bar();
-    bar.shells[1].selected = true;
     bar.selecting = Some(2);
     let f = layout(&v, 34, 40, &with_bar(bar.clone()));
     let t = texts(&f);
@@ -1658,15 +1750,14 @@ fn the_stash_selection_tints_rows_and_shows_its_keys() {
     }
     let p = find(&f, "Plain");
     assert_ne!(f.rows[p].bg, Some(Ink::Mix("mauve", 18)));
-    // A selected shell: its cap in the stash's mauve (the line in the
-    // dock, or its button in the section).
-    let sh = find(&f, "⌥2  nvim");
-    assert!(f.rows[sh].segs.contains(&block(" ⌥2 ", "crust", "mauve")), "{t:#?}");
-    let tall = layout(&v, 34, 62, &with_bar(bar.clone()));
-    let sh = find(&tall, "⌥2  nvim");
-    assert!(texts(&tall)[sh].starts_with(" ▌  ⌥2  nvim"), "{:#?}", texts(&tall));
+    // A selected shell: its row on the tint, the heavy mauve stripe; the
+    // other shell on its strip.
+    let sv = shells_at("@2", "all", &[("@6", "stash_sel", "1")]);
+    let tall = layout(&sv, 44, 62, &with_bar(bar.clone()));
+    let sh = find(&tall, "nvim");
+    assert!(texts(&tall)[sh].starts_with(" ▌  h  ❯ nvim"), "{:#?}", texts(&tall));
     assert_eq!((tall.rows[sh].bg, tall.rows[sh].segs[1].clone()), (Some(Ink::Mix("mauve", 18)), seg("▌", "mauve")));
-    assert_ne!(f.rows[find(&f, "⌥3  proj")].bg, Some(Ink::Mix("mauve", 18)));
+    assert_eq!(tall.rows[find(&tall, "/x/agent-ui")].bg, Some(Ink::Pal(TERM_BG)));
     // The hint, first in the panel: as many of the keys as fit.
     assert_eq!(find(&f, " selected "), f.status.start);
     let hint = find(&f, " selected ");
@@ -1744,9 +1835,14 @@ fn space_scope_shows_one_session() {
     assert!(b[0].starts_with(" AGENTS") && b[0].ends_with(" ⌥V this space "), "{b:#?}");
     assert!(f.rows[f.agents.start].segs.contains(&bold("⌥V", "blue")) && f.rows[f.agents.start].segs.iter().all(|s| s.bg.is_none()), "{b:#?}");
     assert_eq!(heads(&f), [(f.agents.start + 1, "proj".to_string())], "{b:#?}");
-    // Window-index order; no shell rows.
+    // Window-index order: the agents, then the shells (each its prompt
+    // line, the cwd; the client's own first, lifted).
     let rows: Vec<&str> = b[2..].iter().filter_map(|l| row_title(l)).collect();
-    assert_eq!(rows, ["two", "four", "five", "twelve"], "{b:#?}");
+    let g = format!("{PROMPT}/nonexistent/proj");
+    assert_eq!(rows, ["two", "four", "five", "twelve", &g, &g, &g], "{b:#?}");
+    let own = f.agents.start + b.iter().position(|l| l.contains(&g)).unwrap();
+    assert_eq!(f.rows[own].bg, Some(Ink::Pal(MINE_BG)), "{b:#?}");
+    assert_eq!(f.target(3, own as u16), Some(&Target::Shell { win: "@1".into(), session: "proj".into() }));
     assert!(!b.iter().any(|l| l.contains("other") || l.contains("o/one") || l.contains("zsh")), "{b:#?}");
     // NEEDS YOU stays global, as do the spaces.
     let needs = &t[f.needs.clone()];
@@ -1773,7 +1869,7 @@ fn explicit_space_scope_without_spaces_keeps_the_current_shell() {
 }
 
 #[test]
-fn all_scope_with_spaces_drops_shells_and_toggles() {
+fn all_scope_lists_every_space_with_its_shells_and_toggles() {
     let v = scoped(proj(), "@1", "proj", "on", "all", "");
     assert_eq!(v.scope.session, None);
     let f = layout(&v, 34, 58, &Opts::default());
@@ -1784,13 +1880,23 @@ fn all_scope_with_spaces_drops_shells_and_toggles() {
     assert!(b[0].contains("all spaces"), "{b:#?}");
     let names: Vec<String> = heads(&f).into_iter().map(|(_, s)| s).collect();
     assert!(names.contains(&"other".to_string()) && names.contains(&"proj".to_string()), "{b:#?}");
+    // The shells are rows (by folder), never the window name.
     assert!(!b.iter().any(|l| l.contains("zsh")), "{b:#?}");
+    assert_eq!(b.iter().filter(|l| l.contains(PROMPT)).count(), 3, "{b:#?}");
     assert!(b.iter().any(|l| row_title(l) == Some("five")) && b.iter().any(|l| row_title(l) == Some("two")), "{b:#?}");
-    // A space with nothing but shells is no group at all.
+    // A space with nothing but shells is a group: its header, its shell.
     let mut only_shell = proj();
     only_shell.push(a("plain", 1, "", "zsh"));
     let v = scoped(only_shell, "@9", "plain", "on", "all", "");
-    assert!(!agents_part(&layout(&v, 34, 58, &Opts::default())).iter().any(|l| l.contains(" plain")));
+    let f = layout(&v, 34, 58, &Opts::default());
+    let y = head(&f, "plain");
+    assert!(texts(&f)[y + 1].contains(&format!("{PROMPT}/nonexistent/plain")), "{:#?}", texts(&f));
+    // ...unless its session is hidden (`@space_hidden`): no space, no shells.
+    let mut v = v;
+    for sp in v.spaces.iter_mut().filter(|s| s.name == "plain") {
+        sp.hidden = true;
+    }
+    assert!(!heads(&layout(&v, 34, 58, &Opts::default())).iter().any(|(_, s)| s == "plain"));
 }
 
 #[test]
@@ -1824,19 +1930,27 @@ fn hidden_sessions_fall_back_to_all() {
     }
 }
 
+/// A space with nothing but its home (the client on it): its header (the
+/// home, lifted: the client is on it) and `no agents in this space`.
 #[test]
 fn empty_space_still_has_its_header() {
     let mut ws = proj();
-    ws.push(a("empty", 1, "", "zsh"));
+    ws.push(a("empty", 1, "", "zsh").with("home", "1"));
     let v = scoped(ws, "@9", "empty", "on", "", "");
     let f = layout(&v, 34, 30, &Opts::default());
     let t = texts(&f);
     assert_eq!(t[0].trim_end(), " space"); // no counts: nothing in it
     let b = agents_part(&f);
     assert!(heads(&f) == [(f.agents.start + 1, "empty".to_string())] && b[2].starts_with("   no agents in this space"), "{b:#?}");
-    assert!(b[1].starts_with("▌") && b[1].contains(" empty ") && f.rows[f.agents.start + 1].bg.is_some(), "{b:#?}");
+    assert!(b[1].starts_with("▌") && b[1].contains(" empty ") && f.rows[f.agents.start + 1].bg == Some(Ink::Pal(MINE_BG)), "{b:#?}");
     assert!(t[f.needs.clone()][0].starts_with(" NEEDS YOU"));
     assert_eq!(f.target(4, (f.agents.start + 1) as u16), Some(&Target::Session("empty".into())));
+    // A shell in it (the client on it): no `no agents` line, the shell is the row.
+    let mut ws = proj();
+    ws.push(a("empty", 1, "", "zsh"));
+    let v = scoped(ws, "@9", "empty", "on", "", "");
+    let b = agents_part(&layout(&v, 34, 30, &Opts::default()));
+    assert!(b[2].contains(&format!("{PROMPT}/nonexistent/empty")) && !b.iter().any(|l| l.contains("no agents")), "{b:#?}");
 }
 
 #[test]

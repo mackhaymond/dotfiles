@@ -43,6 +43,9 @@ impl Server {
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
         let s = Server { name, dir };
         s.tmux(&["-f", "/dev/null", "new-session", "-d", "-s", "boot", "-x", "120", "-y", "40", LIFE]);
+        // boot (and the menu's own panes in it) is scaffolding, no space: its
+        // shells take no letter (shells share the agents' pool).
+        s.tmux(&["set-option", "-t", "boot", "@space_hidden", "1"]);
         s.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
         // Recording fakes of every script an action runs.
         let body = format!("#!/bin/bash\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> '{}'\n", s.log().display());

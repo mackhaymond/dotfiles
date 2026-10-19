@@ -40,15 +40,19 @@ pub const HEX: [(&str, &str); 16] = [
 /// card still reads as part of it), so neighbours part with no gap between
 /// them. The two panels (usage at the top, the dock at the bottom) are
 /// `tile_lo` too: never next to a card, always behind half-block caps.
-/// `tile_hi` (about `blue` at 18% over `base`) lifts the active
-/// shell. `tile_me` (lavender at 30% over the canvas) is the client's own
+/// `tile_hi` (about `blue` at 18% over `base`) lifted the old SHELLS
+/// section's active shell; no row wears it now, but bands still keep apart
+/// from it. `tile_me` (lavender at 30% over the canvas) is the client's own
 /// agent card, both rows: lifted well off every other surface, "you are
-/// here" at a glance.
-pub const UI: [(&str, &str); 12] = [
+/// here" at a glance. `term` (between `mantle` and `crust`) is a SHELL row's
+/// strip: sunk below the canvas, a little terminal beside the raised agent
+/// tiles.
+pub const UI: [(&str, &str); 13] = [
     ("base", "#1e1e2e"), ("mantle", "#181825"), ("surface2", "#585b70"),
     ("mauve", "#cba6f7"), ("lavender", "#b4befe"), ("sel", "#2a2b3d"),
     ("overlay2", "#9399b2"), ("tile", "#30314a"), ("tile_lo", "#28283b"),
     ("tile_hi", "#31394f"), ("overlay1", "#7f849c"), ("tile_me", "#474a66"),
+    ("term", "#13131d"),
 ];
 
 /// The `#rrggbb` for a palette name ([`HEX`] first, then [`UI`]). Panics on
