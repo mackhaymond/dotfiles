@@ -521,6 +521,25 @@ class PauseKey(Harness):
         self.press()
         self.assertEqual((flag(b), st(b)), ("", "running"))
 
+    def test_gone_agent_leaves_no_flag_behind(self):
+        """A paused pane that now runs another session (/clear, a restart)
+        is gone for the resume, and its flag must still be cleared; a closed
+        pane in the same set must not stop the others' flags from moving."""
+        flag = lambda p: self.t("display", "-p", "-t", p, "#{@agent_paused}").strip()
+        a = self.window("running")
+        b = self.window("running")
+        c = self.window("running")
+        self.press()
+        self.assertTrue(all(flag(p).isdigit() for p in (a, b, c)))
+        self.record(a, "sid-new")                          # a's pane: another session now
+        self.t("kill-pane", "-t", b)                       # b: closed
+        self.t("set", "-w", "-t", a, "@agent_state", "paused")
+        self.press()                                       # resume: a, b gone; c reached
+        self.assertEqual(flag(a), "")
+        self.assertEqual(self.t("display", "-p", "-t", a, "#{@agent_state}").strip(), "idle")
+        self.assertEqual(flag(c), "")
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [c])
+
     def test_no_reply_after_send_counts_as_reached(self):
         a = self.window("running")
         b = self.window("running")

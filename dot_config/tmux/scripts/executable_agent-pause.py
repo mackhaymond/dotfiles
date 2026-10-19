@@ -244,27 +244,25 @@ def mark_paused(panes, on, repause=False):
     seconds) and cleared BEFORE the RESUME (that turn must end normally);
     the misses are put back afterwards. Clearing also turns a window still
     sitting in `paused` back to idle (the RESUME's prompt makes it running);
-    repause (a RESUME that was refused) undoes that. One tmux call;
-    cosmetic, so it never raises."""
-    cmds = []
-    for p in panes:
-        if not p:
-            continue
-        if cmds:
-            cmds.append(";")
-        if on:
-            cmds += ["set-option", "-w", "-t", p, "@agent_paused", str(int(time.time()))]
-            if repause:
-                cmds += [";", "if-shell", "-F", "-t", p, "#{==:#{@agent_state},idle}",
-                         "set-option -w -t %s @agent_state paused" % p]
-        else:
-            cmds += ["set-option", "-wu", "-t", p, "@agent_paused", ";",
-                     "if-shell", "-F", "-t", p, "#{==:#{@agent_state},paused}",
-                     "set-option -w -t %s @agent_state idle" % p]
-    if not cmds:
+    repause (a RESUME that was refused) undoes that. One tmux call per pane:
+    tmux abandons the rest of a command list at the first error, so one
+    closed pane must not cost the others their flag. Cosmetic, so it never
+    raises."""
+    panes = [p for p in dict.fromkeys(panes) if p]
+    if not panes:
         return
     try:
-        tmux(*cmds, check=False)
+        for p in panes:
+            if on:
+                cmds = ["set-option", "-w", "-t", p, "@agent_paused", str(int(time.time()))]
+                if repause:
+                    cmds += [";", "if-shell", "-F", "-t", p, "#{==:#{@agent_state},idle}",
+                             "set-option -w -t %s @agent_state paused" % p]
+            else:
+                cmds = ["set-option", "-wu", "-t", p, "@agent_paused", ";",
+                        "if-shell", "-F", "-t", p, "#{==:#{@agent_state},paused}",
+                        "set-option -w -t %s @agent_state idle" % p]
+            tmux(*cmds, check=False)
         # The sidebar redraws on this notification instead of its 5 s poll.
         subprocess.run(["notifyutil", "-p", "com.mackhaymond.tmux.agent-state"],
                        capture_output=True, timeout=5)
@@ -868,6 +866,17 @@ def finish_resume(client, prog, st, live, gone):
             log(dict(entry, message=msg, targets=live + gone))
             return msg, False
         mark_paused([t["resume_pane"] for t in live], False)
+    # A gone agent is no longer in its old pane (closed, or the pane now runs
+    # another session: /clear, another /resume, a restart). If that pane is
+    # still there its flag must go, or every later Stop in it reads paused.
+    # The agent itself stays saved for a retry, wherever it turns up.
+    if gone:
+        try:
+            alive = set(list_panes())
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            alive = set()
+        mark_paused([t.get("pane_id") for t in gone if t.get("pane_id") in alive], False)
+    if live:
         try:
             res = deliver(mcp, [(i, t["resume_pane"]) for i, t in enumerate(live)], RESUME_MSG,
                           on_result=prog.result)
