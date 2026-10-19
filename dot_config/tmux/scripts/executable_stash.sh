@@ -1595,7 +1595,7 @@ is_working() {
         tab=$(tmux show -wqv -t "$win" @agent_state 2>/dev/null)
         case "$tab" in
             running)                    return 0 ;;   # definitely working
-            idle|done|needs-*|failed)   return 1 ;;   # definitely not; skip the proxy
+            idle|done|paused|needs-*|failed) return 1 ;;   # definitely not; skip the proxy
         esac
     fi
 
@@ -2055,7 +2055,7 @@ agent_running() {
     AGENT_RUNNING_WHY=""
     tab=$(tmux show -wqv -t "$win" @agent_state 2>/dev/null)
     case "$tab" in
-        ""|idle|done|needs-*|failed) : ;;
+        ""|idle|done|paused|needs-*|failed) : ;;
         # `running`, and anything this script has never heard of. A state the
         # watcher grows later must read as "working" here — is_working treats
         # the unknown as unknown and falls back to its proxies, but a refusal

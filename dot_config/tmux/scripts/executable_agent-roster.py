@@ -101,13 +101,14 @@ HEX = {
     "blue": "#89b4fa", "teal": "#94e2d5", "dimteal": "#659a91", "dimblue": "#5d7aaa",
     "peach": "#fab387", "text": "#cdd6f4", "sub": "#a6adc8", "overlay": "#6c7086",
     "surface0": "#313244", "surface1": "#45475a", "crust": "#11111b", "sky": "#89dceb",
+    "lavender": "#b4befe",
 }
 GEAR = "\U000F0493"   # nf-md-cog: background workflow / subagent
 MOUSE = "\U000F037D"  # nf-md-mouse: driving an app through cua-driver
 
 FIELDS = ["session", "index", "id", "name", "state", "summary", "workflow", "cua",
           "since", "last_attached", "blink", "stash_label", "stash_session", "stash_ts",
-          "active", "panes", "path", "kind", "detail_kind", "detail", "space_home"]
+          "active", "panes", "path", "kind", "detail_kind", "detail", "space_home", "paused"]
 # Then six: window_active and pane_current_path (the window's active pane)
 # give the strip each session's current window and its git branch;
 # window_panes says whether a peek must look for the agent pane; @agent_kind
@@ -115,16 +116,19 @@ FIELDS = ["session", "index", "id", "name", "state", "summary", "workflow", "cua
 # (one sanitized line, <= 80 chars) are set by agent-tab-indicator.sh and may
 # be empty on any window. Last, @space_home: a space's home shell
 # (docs/spaces.md), not shown here; parse_windows drops it unless an agent
-# runs in it (non-empty @agent_state: then it is an agent like any other). Rows
-# without it (the tests' 20-field fixtures) still parse.
+# runs in it (non-empty @agent_state: then it is an agent like any other).
+# Then @agent_paused (agent-pause.py: the window is in the pause key's saved
+# set), folded into the state by paused_state. Rows without either (the
+# tests' 20-field fixtures) or without @agent_paused (21) still parse.
 FMT = US.join(["#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}",
                "#{@agent_state}", "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}",
                "#{@agent_since}", "#{session_last_attached}", "#{@agent_blink}",
                "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}",
                "#{window_active}", "#{window_panes}", "#{pane_current_path}",
-               "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}", "#{@space_home}"])
+               "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}", "#{@space_home}",
+               "#{@agent_paused}"])
 # Rides in the same tmux call as FMT, after a `;`. Seven fields where a window
-# row has twenty-one, so parse_windows skips it and parse_clients takes only it.
+# row has twenty-two, so parse_windows skips it and parse_clients takes only it.
 # The last three are for the strip's scope (Strip.load): the client's session
 # and the two global options, which a client-context format resolves through
 # the session's options to the global ones, so they cost no extra call.
@@ -159,17 +163,27 @@ BOLD = "\x1b[1m"
 
 # ── pure model (unit-tested) ────────────────────────────────────────────────
 
+def paused_state(state, flag):
+    """The state with the pause folded in (docs/agent-pause.md "The paused
+    state"; agent-ui model.rs paused_state): `paused` as the tab hook writes
+    it, and done / idle on a window whose @agent_paused is set. Running or
+    asking keeps its live state (it has not stopped; only Mack can answer),
+    and no state stays none."""
+    return "paused" if flag and state in ("done", "idle") else state
+
+
 def parse_windows(text):
     out = []
     for line in text.splitlines():
         parts = line.split(US)
-        if len(parts) == len(FIELDS) - 1:
-            parts.append("")
+        if len(FIELDS) - 2 <= len(parts) < len(FIELDS):
+            parts += [""] * (len(FIELDS) - len(parts))
         if len(parts) != len(FIELDS):
             continue
-        if parts[-1] == "1" and not parts[4]:   # a space's home shell, unless an agent runs in it
-            continue
         w = dict(zip(FIELDS, parts))
+        if w["space_home"] == "1" and not w["state"]:   # a space's home shell, unless an agent runs in it
+            continue
+        w["state"] = paused_state(w["state"], w["paused"])
         w["index"] = int(w["index"]) if w["index"].isdigit() else 0
         w["last_attached"] = int(w["last_attached"]) if w["last_attached"].isdigit() else 0
         s = w["since"].split(" ", 1)[0]
@@ -289,14 +303,17 @@ def rank(w):
 # and swaps the glyph, so the palette check (cua-notch section 65) still reads
 # the one mapping. CAT_HUE is only for the static count tokens; a test pins
 # it to dot()'s colours.
-CATS = ("failed", "needs-input", "done", "working", "idle")
-CAT_GLYPH = {"failed": "✕", "needs-input": "◉", "done": "✓", "working": "◐", "idle": "○"}
-CAT_HUE = {"failed": "red", "needs-input": "yellow", "done": "green", "working": "pink", "idle": "overlay"}
+# paused (the pause key's stopped agents): not working, not attention, never
+# done-green; ⏸ in lavender on every surface (the tab, the sidebar, CuaNotch).
+CATS = ("failed", "needs-input", "done", "working", "paused", "idle")
+CAT_GLYPH = {"failed": "✕", "needs-input": "◉", "done": "✓", "working": "◐", "paused": "⏸", "idle": "○"}
+CAT_HUE = {"failed": "red", "needs-input": "yellow", "done": "green", "working": "pink", "paused": "lavender",
+           "idle": "overlay"}
 # opencode: nf-oct-terminal (U+F489), one cell like the others (agent-ui
 # model.rs kind_glyph uses the same codepoint).
 KIND_GLYPH = {"claude": "✳", "codex": "⬢", "opencode": ""}
 DETAIL_WORD = {"perm": "perm", "ask": "asks", "fail": "fail", "done": "done", "run": "run"}
-STATE_WORDS = {"failed": "failed", "needs-input": "waiting on you", "done": "done"}
+STATE_WORDS = {"failed": "failed", "needs-input": "waiting on you", "done": "done", "paused": "paused"}
 STRIP_GEAR, STRIP_MOUSE = "⚙", "◎"
 
 
@@ -306,6 +323,8 @@ def cat(w):
         return w["state"]
     if in_flight(w):
         return "working"
+    if w["state"] == "paused":
+        return "paused"
     return "idle" if w["state"] else None
 
 
@@ -1128,6 +1147,8 @@ class Roster:
             if w["id"] == self.cur_win:
                 return fg("blue") + "●"        # the window you are on never pulses
             return fg("pink" if blink else "blue") + "●"
+        if w["state"] == "paused":
+            return fg(CAT_HUE["paused"]) + CAT_GLYPH["paused"]
         if w["state"]:
             return fg("overlay") + "·"
         return " "
@@ -1176,7 +1197,7 @@ class Roster:
             ix = where if it["long"] else ("  %d" % w["index"])
             ixs = fg("overlay") + ix
         state = {"failed": "failed", "needs-input": "waiting on you", "done": "done",
-                 "running": "working", "idle": "idle"}.get(w["state"], "")
+                 "running": "working", "idle": "idle", "paused": "paused"}.get(w["state"], "")
         if w["state"] == "done" and w["workflow"]:
             state = "done · fleet out"
         when = w["since_t"]
@@ -1231,9 +1252,12 @@ class Roster:
         n_work = sum(1 for w in ws if w["state"] and in_flight(w) and not is_attn(w))
         n_need = len(self.needs)
         n_idle = sum(1 for w in ws if w["state"] == "idle" and not in_flight(w))
+        n_paused = len({w["id"] for w in ws if cat(w) == "paused"})
         lines = []
         counts = "%s%d working%s · %s%d need you%s · %d idle" % (
             fg("pink"), n_work, fg("overlay"), fg("yellow") if n_need else "", n_need, fg("overlay"), n_idle)
+        if n_paused:
+            counts += " · %s%s %d paused%s" % (fg(CAT_HUE["paused"]), CAT_GLYPH["paused"], n_paused, fg("overlay"))
         lines.append(" " + fg("peach") + BOLD + "AGENTS" + RESET + "   " + fg("overlay") + counts)
         age = watcher_age()
         if age is None or age > WATCHER_STALE:

@@ -224,7 +224,7 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
 /// dropped, so nothing counts or lists it.
 fn hide_homes(snap: &mut Snapshot) {
     for w in snap.windows.iter_mut().filter(|w| w.home) {
-        for f in [&mut w.state, &mut w.workflow, &mut w.cua, &mut w.summary, &mut w.detail, &mut w.detail_kind] {
+        for f in [&mut w.state, &mut w.workflow, &mut w.cua, &mut w.summary, &mut w.detail, &mut w.detail_kind, &mut w.paused] {
             f.clear();
         }
     }

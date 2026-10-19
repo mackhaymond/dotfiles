@@ -159,6 +159,7 @@ pub fn badge_color(a: &Agent) -> &'static str {
         Some(Cat::NeedsInput) => "yellow",
         Some(Cat::Done) => "green",
         Some(Cat::Working) => "blue",
+        Some(Cat::Paused) => crate::model::PAUSED_HUE,
         Some(Cat::Idle) | None => "overlay",
     }
 }
@@ -239,6 +240,7 @@ fn header(m: &mut Menu, buf: &mut Buffer, w: u16) {
     let counts: Vec<(String, &str)> = [
         (v.needs.len(), "◉", "need you", "yellow"),
         (v.counts.get(Cat::Working), "◐", "working", "blue"),
+        (v.counts.get(Cat::Paused), crate::model::PAUSED_GLYPH, "paused", crate::model::PAUSED_HUE),
         (v.counts.get(Cat::Idle), "○", "idle", "overlay"),
         (v.parked.len(), "▪", "parked", "overlay"),
     ]
@@ -956,6 +958,50 @@ mod tests {
         assert!(f[1].starts_with("│     ▪ Pitch deck v2") && f[1].contains("bai  ") && f[1].ends_with("8m │"), "{}", f[1]);
         assert!(m.act(click(110 - 4, 0), &mut fx));
         assert!(!m.act(click(1, 33), &mut fx));
+    }
+
+    /// Paused (docs/agent-pause.md "The paused state"): its own category,
+    /// ⏸ in lavender (glyph, letter badge, header count), out of the needs
+    /// tiers: `paused` as written and done / idle with `@agent_paused` set;
+    /// listed under Idle, never under Needs you or Active.
+    #[test]
+    fn paused_is_a_lavender_category_out_of_the_needs() {
+        let r = |i: u32, set: &[(&str, &str)]| crate::tmux::tests::row("main", i, &format!("@{i}"), set);
+        let snap = crate::tmux::Snapshot::parse(&[
+            r(1, &[("state", "paused"), ("summary", "Written paused")]),
+            r(2, &[("state", "done"), ("paused", "1792418628"), ("summary", "Flagged done")]),
+            r(3, &[("state", "idle"), ("paused", "1792418628"), ("summary", "Flagged idle")]),
+            r(4, &[("state", "running"), ("paused", "1792418628"), ("summary", "Still working")]),
+            r(5, &[("state", "done"), ("summary", "Really done")]),
+            r(6, &[("state", "idle"), ("summary", "Just idle")]),
+        ].join("\n"));
+        let d = Data::build(&snap, None, 1000.0, &crate::Collator::new("C"), None, Some(1.0));
+        assert_eq!(d.view.needs.iter().map(|n| n.agent.window_id.as_str()).collect::<Vec<_>>(), ["@5"]);
+        let mut m = Menu::new(d.clone(), Tab::All);
+        let f = frame(&mut m, 110, 20);
+        assert!(f[0].contains("◉ 1 need you · ◐ 1 working · ⏸ 3 paused · ○ 1 idle"), "{}", f[0]);
+        assert!(f[1].contains("✓1 ◐1 ⏸3 ○1"), "{}", f[1]);
+        let b = buffer(&mut m, 110, 20);
+        for name in ["Written paused", "Flagged done", "Flagged idle"] {
+            let y = at(&f, name);
+            assert!(f[y].contains(&format!("⏸ {name}")), "{}", f[y]);
+            let gx = f[y].chars().position(|c| c == '⏸').unwrap() as u16;
+            assert_eq!(b[(gx, y as u16)].fg, color("lavender"), "{name}");
+            assert_eq!((b[(3, y as u16)].bg, b[(3, y as u16)].fg), (color("lavender"), color("crust")), "{name}");
+        }
+        let y = at(&f, "Really done");
+        assert_eq!(b[(3, y as u16)].bg, color("green"));
+        // The header's paused count in lavender.
+        let hx = f[0].chars().position(|c| c == '⏸').unwrap() as u16;
+        assert_eq!(b[(hx, 0)].fg, color("lavender"));
+        // Filters: Idle lists the paused and the idle; Needs you and Active never a paused one.
+        let titles = |tab: Tab| -> Vec<String> {
+            super::super::rows::build_rows(&d, tab, "").iter().filter_map(|r| r.agent().map(|a| a.title.clone())).collect()
+        };
+        assert_eq!(titles(Tab::Idle), ["Written paused", "Flagged done", "Flagged idle", "Just idle"]);
+        assert_eq!(titles(Tab::Needs), ["Really done"]);
+        assert_eq!(titles(Tab::Active), ["Still working", "Really done"]);
+        assert_eq!(titles(Tab::Working), ["Still working"]);
     }
 
     #[test]

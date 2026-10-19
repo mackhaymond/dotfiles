@@ -42,7 +42,9 @@ is_valid_session_name() {
 # most urgent tab, then counts. Same hues and the same ranking as the tab bar
 # and agent-jump.sh: failed (red) > needs-input (yellow) > done (green; NOT
 # while @agent_workflow is set — that tab renders untinted) > in flight (pink:
-# running, a workflow, or driving an app) > idle. One list-windows for all
+# running, a workflow, or driving an app) > idle. Paused (`paused`, or done/
+# idle with the pause key's @agent_paused flag, folded in the format) ranks
+# with idle, never as needing you (docs/agent-pause.md). One list-windows for all
 # sessions; fields split on US because an empty option must stay a field.
 decorate() {
   local us=$'\x1f'
@@ -50,7 +52,7 @@ decorate() {
   # EMPTY, NR == FNR then holds for the session list too, every row was
   # swallowed into d[] and the picker showed nothing at all.
   awk -F '\t' 'FILENAME == ARGV[1] { d[$1] = $2; next } { print $1 "\t" d[$1] }' \
-    <(tmux list-windows -a -F "#{session_name}${us}#{@agent_state}${us}#{@agent_workflow}${us}#{@agent_cua}" 2>/dev/null |
+    <(tmux list-windows -a -F "#{session_name}${us}#{?#{&&:#{@agent_paused},#{m/r:^(done|idle)$,#{@agent_state}}},paused,#{@agent_state}}${us}#{@agent_workflow}${us}#{@agent_cua}" 2>/dev/null |
       awk -F "$us" '
         function rank(st, wf, cua) {
           if (st == "failed") return 0

@@ -136,6 +136,86 @@ class ModelTests(unittest.TestCase):
         self.assertEqual((R.ago(0, 59), R.ago(0, 61), R.ago(0, 7300)), ("59s", "1m", "2h"))
 
 
+def paused_line(session, index, wid, state, summary, flag="", **kw):
+    """line() plus @space_home (empty) and @agent_paused: the full 22-field row."""
+    return US.join([line(session, index, wid, state, summary, **kw), "", flag])
+
+
+class PausedTests(unittest.TestCase):
+    """docs/agent-pause.md "The paused state": `paused` is its own quiet state
+    (⏸ lavender), never attention, never in NEEDS YOU, never done-green; done
+    or idle with @agent_paused set reads paused until the tab hook writes it;
+    running or asking with the flag keeps its live state."""
+    FLAG = "1792418628"
+
+    def ws(self):
+        return R.parse_windows("\n".join([
+            paused_line("main", 1, "@1", "paused", "proj/Written"),
+            paused_line("main", 2, "@2", "done", "proj/Flagged done", self.FLAG, since="300 done"),
+            paused_line("main", 3, "@3", "idle", "proj/Flagged idle", self.FLAG),
+            paused_line("main", 4, "@4", "running", "proj/Still working", self.FLAG),
+            paused_line("main", 5, "@5", "needs-input", "proj/Asks", self.FLAG, since="200 needs-input"),
+            paused_line("main", 6, "@6", "done", "proj/Plain done", since="100 done"),
+            paused_line("main", 7, "@7", "", "", self.FLAG),                 # a plain shell: no state, flag or not
+            line("main", 8, "@8", "idle", "proj/Old row"),                    # 20 fields: no flag, still parses
+        ]))
+
+    def test_classification(self):
+        by = {w["id"]: w for w in self.ws()}
+        self.assertEqual(len(by), 8)
+        self.assertEqual([by[i]["state"] for i in ("@1", "@2", "@3", "@4", "@5", "@6", "@7", "@8")],
+                         ["paused", "paused", "paused", "running", "needs-input", "done", "", "idle"])
+        for i in ("@1", "@2", "@3"):
+            w = by[i]
+            self.assertEqual(R.cat(w), "paused", i)
+            self.assertFalse(R.is_attn(w) or R.in_flight(w), i)
+            self.assertEqual(R.rank(w), 4, i)
+        self.assertEqual(R.cat(by["@4"]), "working")
+        self.assertEqual(R.cat(by["@5"]), "needs-input")
+        self.assertIsNone(R.cat(by["@7"]))
+        self.assertEqual(R.paused_state("done", ""), "done")
+        self.assertEqual(R.paused_state("weird", self.FLAG), "weird")
+        # A paused agent with a fleet still out is in flight (the pause's rule).
+        fleet_out = R.parse_windows(paused_line("m", 1, "@9", "paused", "x", workflow="1"))[0]
+        self.assertEqual(R.cat(fleet_out), "working")
+
+    def test_never_needs_you(self):
+        R.collation("C")
+        order = R.needs_order(self.ws())
+        self.assertNotIn("@1", order)
+        self.assertNotIn("@2", order)
+        self.assertNotIn("@3", order)
+        self.assertEqual(set(order), {"@5", "@6"})
+
+    def test_counts_glyph_and_colour(self):
+        ws = self.ws()
+        self.assertEqual(R.counts(ws), [("needs-input", 1), ("done", 1), ("working", 1), ("paused", 3), ("idle", 1)])
+        toks, cells = R.count_tokens([("paused", 3)])
+        self.assertEqual(strip_plain(toks), "⏸3")
+        self.assertIn(R.fg("lavender"), toks)
+        self.assertEqual(cells, 2)
+        self.assertEqual((R.CAT_GLYPH["paused"], R.CAT_HUE["paused"], R.HEX["lavender"]), ("⏸", "lavender", "#b4befe"))
+        r = R.Roster("/dev/ttys999")
+        w = [x for x in ws if x["id"] == "@2"][0]
+        self.assertEqual(r.dot(w, True), R.fg("lavender") + "⏸")
+        self.assertEqual(r.dot(w, False), R.fg("lavender") + "⏸")           # steady: no pulse
+        self.assertEqual(r.shape(w, True), R.fg("lavender") + "⏸")
+        self.assertNotIn(R.fg("green"), r.dot(w, True))
+        row = strip_plain(r.row({"kind": "win", "w": w, "long": False}, 120, False, 1000, False))
+        self.assertRegex(row, r"⏸ .*Flagged done\s+paused ")
+
+    def test_header_counts_paused(self):
+        r = R.Roster("/dev/ttys999")
+        r.windows = self.ws()
+        r.needs = R.needs_order(r.windows)
+        head = strip_plain(r.render(100, 20, 1000)[0])
+        self.assertIn("⏸ 3 paused", head)
+        self.assertIn("1 idle", head)
+
+    def test_strip_never_folds_paused(self):
+        self.assertNotEqual(R.cat(self.ws()[1]), "idle")
+
+
 class KeyTests(unittest.TestCase):
     def test_keys(self):
         self.assertEqual(R.parse_keys("\x1b[A\x1b[B\x1b[Z\t\r j"),

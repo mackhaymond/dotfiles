@@ -39,14 +39,27 @@ is the primary one for both the Option-W popup and the CMD+B sidebar.
   or a gone client.
 - **Rows**: `[letter] glyph Title  reason  · here ·  project  age`. The
   letter badge is reverse video on the agent's state colour (needs yellow,
-  failed red, working blue, done green, idle overlay); a `project/` prefix
+  failed red, working blue, done green, paused lavender, idle overlay); a `project/` prefix
   of the title moves to the dim tag on the right (a bare `~/` is dropped);
   `· here ·` marks the window the popup is covering; idle titles are dimmer
   but readable. Short of room the project tag goes first, then `here`.
 - **Filters** (Tab / Shift-Tab): All, Active (working or needing you, or a
   prompt just answered), Needs you (agent-jump.sh's queue, in its order),
-  Working, Idle, Parked (every parked tab). The sidebar's idle fold opens
+  Working, Idle (paused agents too), Parked (every parked tab). The sidebar's idle fold opens
   the menu on Idle, its `… N more` rows on All.
+- **Paused** (the pause key's stopped agents, [agent-pause.md](agent-pause.md)
+  "The paused state"): a state of its own, `⏸` in lavender (`#b4befe`, the
+  same on every surface) on the row's glyph, its letter badge and a
+  `⏸ N paused` header count (between working and idle). Paused is
+  `@agent_state` `paused`, or `done` / `idle` on a window whose
+  `@agent_paused` is set (before the tab hook writes `paused`); a window
+  still running or asking with the flag keeps its live state. Never in
+  NEEDS YOU, the Needs you or Active filters, never done-green; ranked with
+  the quiet states. agent-ui folds it in where it parses a row
+  (`model::paused_state`, so every reader sees one state); the Python
+  fallback the same in `parse_windows` (`paused_state`), with its own
+  bucket in `CATS` and a lavender `⏸` dot. Both read `#{@agent_paused}` as
+  the last field of their window format.
 - **Initial cursor**: the oldest agent that needs you (the first in
   `agent-jump.sh list` order), else the last agent (where ⌥W would go), else
   the window the popup covers, else the first row. A state change never
@@ -661,7 +674,8 @@ described in the rest of this section; it was not changed.**
 - **Shapes and colours** (shape and colour both carry the state, herdr's
   rule): failed red `✕`, needs-input yellow `◉`, done green `✓` (finished and
   unseen; a visit discharges it), working `◐` pulsing pink/blue on
-  `@agent_blink` (the window you are on stays blue), idle grey `○`; workflow
+  `@agent_blink` (the window you are on stays blue), paused lavender `⏸`
+  (steady), idle grey `○`; workflow
   teal `⚙` and computer use blue `◎` pulse like the tab glyphs. The colours
   are not chosen anywhere new: `Roster.shape()` is `dot()` with the glyph
   swapped and `strip_glyph()` is `glyph()` with ⚙/◎ for the Nerd Font ones,
@@ -889,10 +903,17 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   (a space's shells into one line with them), then every agent goes to one
   line at once.
 - **Cards and state**: a state rail `▎` down a card's left edge in its
-  state's colour (blue working, yellow asking, red failed, green done; the
-  client's own idle agent lavender; the stash selection a heavier mauve
-  `▌`), its glyph and word bold in that colour on the right (`⠹ working`,
-  `◉ asks`, `✕ error`, `✓ done`; the glyph alone when narrow). Idle is the
+  state's colour (blue working, yellow asking, red failed, green done,
+  lavender paused; the client's own idle agent lavender; the stash
+  selection a heavier mauve `▌`), its glyph and word bold in that colour on
+  the right (`⠹ working`, `◉ asks`, `✕ error`, `✓ done`, `⏸ paused`; the
+  glyph alone when narrow). A PAUSED card's second line says `paused` (bold
+  lavender) in place of the agent's last reply, then, while a pause is
+  saved (the banner's stopping, safe or ready), the key that resumes it, dim:
+  `paused · prefix P resumes`, `paused · prefix P` at 34 columns; its first
+  line keeps just the `⏸` (the word once, not twice). Paused agents never
+  fold into the idle line, and every count (the space headers, the title,
+  the dock) has a lavender `⏸N` bucket after working. Idle is the
   absence of all that: no rail, no word, a regular title. The second line
   is `overlay2` (`sub` for an asking or failed agent: there it is the
   question), a live blurb after a blue `›`, the age at its end.
@@ -1212,13 +1233,18 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   no notice per delivery). Malformed or torn files show nothing. The
   banner is the very top: one tile tinted 14% in its phase's colour, a
   heavy `▌` rail, glyph and word bold in the colour, the meaning after it;
-  a second row (dim) with who is still working or the labels:
+  a second row (dim) with who is still working or the labels. Settled
+  (safe, ready) is "all paused": the paused state's lavender, never green
+  (green means done). The two part by emphasis: safe's `⏸ PAUSED` bold in
+  lavender, ready's count on a SOLID lavender chip (dark ink), the one that
+  asks for a press:
 
   ```
    ▌ ⠹ PAUSING  2 of 5 stopped          peach (also "sending 2 of 5")
    ▌   still working  Tmux Agent Sidebar, I…
-   ▌ ✓ PAUSED  safe to close            green
-   ▌ ↻ 3 ready  to resume   prefix P · click   blue
+   ▌ ⏸ PAUSED  safe to close            lavender, bold word
+   ▌ [ ↻ 3 ready ] Tmux Agent Sidebar…  lavender, solid chip
+   ▌   prefix P or click to resume
    ▌ ⠹ RESUMING  3 agents…              peach
   ```
 

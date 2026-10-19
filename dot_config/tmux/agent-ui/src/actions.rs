@@ -187,8 +187,11 @@ pub fn pick_agent_pane(panes_text: &str, ps_text: Option<&str>, kind: &str) -> R
 /// flagged window park anyway when no live agent is registered in it (a
 /// stale flag left by a dead watcher); that check reads session files, so
 /// it is not mirrored here: such a window is refused here, parkable by H.
+/// `paused` is quiet too (stopped by the pause key, not working): the state
+/// agent-ui folds `@agent_paused` + done / idle into, and the one the tab
+/// hook writes (stash.sh needs `paused` in its quiet list to match).
 pub fn park_refused_busy(w: &Window) -> bool {
-    let quiet = matches!(w.state.as_str(), "" | "idle" | "done" | "failed") || w.state.starts_with("needs-");
+    let quiet = matches!(w.state.as_str(), "" | "idle" | "done" | "failed" | "paused") || w.state.starts_with("needs-");
     !quiet || !w.workflow.is_empty() || !w.cua.is_empty()
 }
 
@@ -603,15 +606,20 @@ mod tests {
             row("main", 8, "@8", &[("state", "done"), ("summary", "Done")]),
             row("scratch", 1, "@9", &[("state", "idle"), ("summary", "Scr")]),
             row("mine", 1, "@10", &[("state", "idle"), ("summary", "Hid"), ("space_hidden", "1")]),
+            row("main", 11, "@11", &[("state", "paused"), ("summary", "Paused")]),
+            row("main", 12, "@12", &[("state", "done"), ("paused", "1792418628"), ("summary", "Flagged")]),
+            row("main", 13, "@13", &[("state", "running"), ("paused", "1792418628"), ("summary", "Stopping")]),
         ].join("\n"));
         let a = Actions::new(Tmux::with_socket(Some(crate::tmux::Socket::Name(format!("agentui-park-none-{}", std::process::id())))));
-        for (win, s, label) in [("@1", "main", "Busy"), ("@2", "main", "Gear"), ("@3", "main", "Eyes"), ("@4", "main", "Odd")] {
+        for (win, s, label) in [("@1", "main", "Busy"), ("@2", "main", "Gear"), ("@3", "main", "Eyes"), ("@4", "main", "Odd"),
+            ("@13", "main", "Stopping")] {
             assert_eq!(a.park(&snap, win, s), Err(format!("{label} is working, can't park")));
         }
         for (win, s, label) in [("@9", "scratch", "Scr"), ("@10", "mine", "Hid")] {
             assert_eq!(a.park(&snap, win, s), Err(format!("{label} isn't in a space, can't park")));
         }
-        for (win, label) in [("@5", "Asks"), ("@6", "Quiet"), ("@7", "Broke"), ("@8", "Done")] {
+        // Paused is stopped, not working: parkable, as done + the flag was.
+        for (win, label) in [("@5", "Asks"), ("@6", "Quiet"), ("@7", "Broke"), ("@8", "Done"), ("@11", "Paused"), ("@12", "Flagged")] {
             assert_eq!(a.park(&snap, win, "main"), Ok(format!("parking {label}…")));
         }
     }

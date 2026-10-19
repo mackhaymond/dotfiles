@@ -12,7 +12,9 @@
 //!
 //! The other filters (cycled with ⇥ / ⇧⇥) narrow it: Active (working or
 //! needing you, the old default), Needs you (agent-jump.sh's queue, in its
-//! order), Working, Idle (the same fixed groups), Parked (every parked tab).
+//! order), Working, Idle (the same fixed groups; paused agents, stopped by
+//! the pause key, are listed here too, never under Needs you or Active),
+//! Parked (every parked tab).
 //! Every row passes the search query.
 //!
 //! Selectable rows carry a [`RowKey`], unique within the list: a window
@@ -310,7 +312,8 @@ pub fn build_rows(d: &Data, tab: Tab, query: &str) -> Vec<Row> {
                 Tab::All => true,
                 Tab::Active => is_active(v, a),
                 Tab::Working => a.cat == Some(Cat::Working),
-                Tab::Idle => a.cat == Some(Cat::Idle),
+                // Paused agents are stopped too: listed with the idle ones.
+                Tab::Idle => matches!(a.cat, Some(Cat::Idle | Cat::Paused)),
                 Tab::Needs | Tab::Parked => false,
             }
     };

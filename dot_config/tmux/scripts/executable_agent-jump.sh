@@ -56,7 +56,11 @@
 # (the watcher stamps at 1 s resolution) still sort the same way every time.
 # `done` while @agent_workflow is set is NOT in the queue: the tab renders
 # untinted because a fleet is still out (see tmux.conf.tmpl), so it doesn't
-# want you yet. A window with no stamp sorts last within its tier.
+# want you yet. Nor is a paused agent: `paused` is in no tier, and `done`
+# with @agent_paused set (the pause key's flag, before the tab hook writes
+# `paused`) is left out the same way (docs/agent-pause.md "The paused
+# state"; agent-ui and agent-roster.py agree). A window with no stamp sorts
+# last within its tier.
 #
 # NEVER INTO: agents (pty-MCP shells), tasks (CuaNotch's broker), stash (the
 # parked-tab holding session — switching there would land you inside the
@@ -191,17 +195,17 @@ say() {
 }
 
 list_needs() {
-    tmux list-windows -a -F "#{window_id}${US}#{session_name}${US}#{window_index}${US}#{@agent_state}${US}#{@agent_workflow}${US}#{@agent_since}${US}#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}" 2>/dev/null |
+    tmux list-windows -a -F "#{window_id}${US}#{session_name}${US}#{window_index}${US}#{@agent_state}${US}#{@agent_workflow}${US}#{@agent_since}${US}#{@agent_paused}${US}#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}" 2>/dev/null |
     awk -F "$US" -v ex="$EXCLUDE" '
         index(ex, " " $2 " ") { next }
         {
             if ($4 == "failed") p = 0
             else if ($4 == "needs-input") p = 1
-            else if ($4 == "done" && $5 == "") p = 2
+            else if ($4 == "done" && $5 == "" && $7 == "") p = 2
             else next
             split($6, a, " ")
             t = (a[1] ~ /^[0-9]+$/) ? a[1] : 9999999999
-            label = $7; gsub(/\t/, " ", label)
+            label = $8; gsub(/\t/, " ", label)
             printf "%d\t%s\t%s\t%09d\t%s\t%s\t%s\t%s\t%s\t%s\n", p, t, $2, $3, $1, $2, $3, $4, t, label
         }' |
     sort -t "$(printf '\t')" -k1,1n -k2,2n -k3,3 -k4,4 |

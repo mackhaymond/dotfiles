@@ -203,7 +203,7 @@
 use super::pause::Phase;
 use super::status::{ink_on, ink_rgb, tmux_colour, Bar, Kind, Toast, ToastId, Usage};
 use crate::actions::watcher_problem;
-use crate::model::{Cat, Counts, Flag};
+use crate::model::{Cat, Counts, Flag, PAUSED_GLYPH, PAUSED_HUE};
 use crate::palette;
 use crate::text::{clip, dwidth, fit_label, plain, sanitize};
 pub use crate::view::space_order;
@@ -652,11 +652,12 @@ pub fn cat_hue(c: Cat) -> Hue {
         Cat::NeedsInput => "yellow",
         Cat::Done => "green",
         Cat::Working => "blue",
+        Cat::Paused => "lavender",
         Cat::Idle => "overlay",
     }
 }
 
-/// `✕1 ◉2 ◐4`: nonzero only, each in its state colour.
+/// `✕1 ◉2 ◐4 ⏸3`: nonzero only, each in its state colour.
 fn count_segs(c: &Counts) -> Vec<Seg> {
     let mut v = Vec::new();
     for (i, (k, n)) in c.nonzero().into_iter().enumerate() {
@@ -722,6 +723,10 @@ struct Cx<'a> {
     cur: Option<&'a str>,
     /// Shells are listed (`@spaces` on: [`ViewModel::shells`]).
     shells: bool,
+    /// A pause is saved and settled or settling (the banner's stopping, safe
+    /// or ready: `paused.json` lists targets), so prefix P resumes: a paused
+    /// card says so.
+    resumes: bool,
 }
 
 impl Cx<'_> {
@@ -1227,12 +1232,16 @@ fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
 pub const PAUSE_TINT: u8 = 14;
 
 /// A phase's colour: in progress (sending, stopping, resuming) peach, the
-/// pause popup's own; safe to close green; ready to resume blue.
+/// pause popup's own; settled (safe to close, ready to resume) the paused
+/// state's lavender, "all paused", as on every surface (a paused card's ⏸,
+/// CuaNotch's all-paused glow). Never green: green means done. The two
+/// settled phases part by emphasis ([`pause_rows`]): safe says `⏸ PAUSED`
+/// bold in lavender, ready puts its count on a SOLID lavender chip, the one
+/// that asks for a press.
 pub fn pause_hue(p: &Phase) -> Hue {
     match p {
         Phase::Resuming { .. } | Phase::Sending { .. } | Phase::Stopping { .. } => "peach",
-        Phase::Safe { .. } => "green",
-        Phase::Ready { .. } => "blue",
+        Phase::Safe { .. } | Phase::Ready { .. } => PAUSED_HUE,
     }
 }
 
@@ -1267,8 +1276,8 @@ fn agents_n(n: usize) -> String {
 ///  ▌ ⠹ PAUSING  sending 2 of 5          peach (a press in flight)
 ///  ▌ ⠹ PAUSING  3 of 5 stopped          peach
 ///  ▌   still working  Tmux Sidebar, …
-///  ▌ ✓ PAUSED  safe to close            green; a click resumes
-///  ▌ ↻ 5 ready  Tmux Sidebar, Island…   blue; a click resumes
+///  ▌ ⏸ PAUSED  safe to close            lavender, bold word; a click resumes
+///  ▌ [↻ 5 ready] Tmux Sidebar, Island…  lavender: a SOLID chip; a click resumes
 ///  ▌   prefix P or click to resume      (one row: ↻ 5 ready  prefix P · click)
 ///  ▌ ⠹ RESUMING  5 agents…              peach
 /// ```
@@ -1290,7 +1299,8 @@ fn pause_rows(p: &Phase, cx: Cx, lines: usize) -> Vec<Row> {
     let names = |l: &[String]| seg(l.join(", "), dimc);
     let rail = || seg(RAIL_HEAVY, hue);
     if let Phase::Ready { labels } = p {
-        let mut l1 = vec![rail(), seg(" ", "text"), bold(format!("↻ {} ready", labels.len()), hue), seg("  ", "text")];
+        // The chip: the count in dark ink on solid lavender, "press me".
+        let mut l1 = vec![rail(), seg(" ", "text"), block(format!(" ↻ {} ready ", labels.len()), "crust", hue), seg(" ", "text")];
         let rows = if lines >= 2 {
             l1.push(names(labels));
             let l2 = vec![rail(), seg("   ", "text"), bold("prefix P", "text"), seg(" or click to resume", dimc)];
@@ -1309,7 +1319,7 @@ fn pause_rows(p: &Phase, cx: Cx, lines: usize) -> Vec<Row> {
             format!("{stopped} of {n} stopped"),
             vec![seg("still working  ", dimc), seg(working.join(", "), "sub")],
         ),
-        Phase::Safe { labels } => ("✓ PAUSED".into(), "safe to close".into(), vec![names(labels)]),
+        Phase::Safe { labels } => (format!("{PAUSED_GLYPH} PAUSED"), "safe to close".into(), vec![names(labels)]),
         Phase::Ready { .. } => unreachable!("handled above"),
     };
     let left = vec![rail(), seg(" ", "text"), bold(word, hue), seg(format!("  {rest}"), "text")];
@@ -1610,8 +1620,8 @@ fn recent_done(a: &Agent, now: f64) -> bool {
 
 /// The state word: `⠹ working` (blue, animated), `◉ asks` / `◉ perm`
 /// (yellow), `✕ error` (red), `✓ done` (green: done, or idle with a recent
-/// finished turn); idle says nothing ([`Word::idle`]). None for a plain
-/// shell.
+/// finished turn), `⏸ paused` (lavender: never done-green, whatever its last
+/// turn said); idle says nothing ([`Word::idle`]). None for a plain shell.
 fn state_word(a: &Agent, cx: Cx) -> Option<Word> {
     if a.in_flight || a.cat == Some(Cat::Working) {
         return Some(Word { glyph: SPIN[cx.spin % SPIN.len()], word: "working", hue: "blue" });
@@ -1630,7 +1640,24 @@ fn cat_word(a: &Agent, c: Cat) -> Word {
         Cat::NeedsInput => Word { glyph: "◉", word: if a.detail_kind == "perm" { "perm" } else { "asks" }, hue: "yellow" },
         Cat::Done | Cat::Idle => Word { glyph: "✓", word: "done", hue: "green" },
         Cat::Working => Word { glyph: "◐", word: "working", hue: "blue" },
+        Cat::Paused => Word { glyph: PAUSED_GLYPH, word: "paused", hue: PAUSED_HUE },
     }
+}
+
+/// A paused card's second line (docs/agent-pause.md "The paused state"):
+/// `paused` bold lavender, then, while a pause is saved ([`Cx::resumes`]),
+/// the key that resumes it, dim: ` · prefix P resumes` where it fits in
+/// `room` cells, ` · prefix P` where that does (Mack's usual 34 columns),
+/// else `paused` alone. It stands in for the agent's last reply (the
+/// PAUSE's own acknowledgement says nothing), so a paused agent never reads
+/// as done.
+fn paused_line(room: usize, resumes: bool, dimc: Hue) -> Vec<Seg> {
+    let mut v = vec![bold("paused", PAUSED_HUE)];
+    let hint = [" · prefix P resumes", " · prefix P"].into_iter().find(|h| dwidth("paused") + dwidth(h) <= room);
+    if let Some(h) = hint.filter(|_| resumes) {
+        v.push(seg(h, dimc));
+    }
+    v
 }
 
 /// The cards that ask for a solid key-cap: the client's own agent, and one
@@ -1772,9 +1799,14 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink) -> Vec<Row> {
         Flag::Cua => seg(" ◎", if a.attention { "overlay2" } else { "blue" }),
     });
     let lead = cx.b.lead();
+    // A paused card with its second line says `paused` there: the first
+    // line keeps just the ⏸ (one word once, not twice).
+    let paused = a.cat == Some(Cat::Paused) && !a.in_flight;
+    let word_below = paused && msg.is_some();
     let right_of = |full: bool, with_age: bool| -> Vec<Seg> {
         let mut r = Vec::new();
         if let Some(wd) = word.as_ref().filter(|x| !x.idle()) {
+            let full = full && !word_below;
             r.push(bold(if full { format!("{} {}", wd.glyph, wd.word) } else { wd.glyph.to_string() }, wd.hue));
         }
         if with_age && msg.is_none() {
@@ -1824,7 +1856,10 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink) -> Vec<Row> {
     // so a message never reads as another agent.
     let indent = if cx.b.on { lead - 1 } else { 3 };
     let mut l2 = vec![rail, seg(" ".repeat(indent), "text")];
-    if live_blurb(a).is_some() {
+    if word_below {
+        let room = inner(cx.w).saturating_sub(1 + indent + width(&r2));
+        l2.extend(paused_line(room, cx.resumes, dimc));
+    } else if live_blurb(a).is_some() {
         // Live: what it does right now, after a blue `›`.
         l2.extend([seg("› ", "blue"), seg(m, dimc)]);
     } else if m.trim().is_empty() && a.cat.is_some() {
@@ -2665,6 +2700,7 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
         home: home_of(view),
         cur: view.cur_win.as_deref(),
         shells: view.shells,
+        resumes: matches!(opts.pause, Some(Phase::Stopping { .. } | Phase::Safe { .. } | Phase::Ready { .. })),
     };
     let keep = sections(view, &mut frame, opts, cx).min(frame.rows.len());
     // The toasts float over whatever is there: nothing beneath moves, and

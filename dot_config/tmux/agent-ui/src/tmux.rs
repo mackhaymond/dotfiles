@@ -203,12 +203,14 @@ impl Tmux {
 /// one token per pane, so a space's DASHBOARD pane (`@space_dash_pane`) is
 /// never counted, captured, closed or focused), and `rollout`
 /// (`@agent_rollout`: a Codex agent's rollout path, which the sidebar reads
-/// for its live activity blurb).
-pub const FIELDS: [&str; 33] = [
+/// for its live activity blurb), and `paused` (agent-pause.py's
+/// `@agent_paused`: the window is in the pause key's saved set; see
+/// [`crate::model::paused_state`]).
+pub const FIELDS: [&str; 34] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
     "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home", "space_index",
-    "space_hidden", "space_color", "stash_sel", "pane_flags", "rollout",
+    "space_hidden", "space_color", "stash_sel", "pane_flags", "rollout", "paused",
 ];
 
 /// The pane option space.sh sets (to 1) on a space home's dashboard pane
@@ -228,14 +230,14 @@ pub const PANE_FLAGS: &str =
 
 /// The tmux format of each FIELDS entry, in order. (`#{pane_current_path}`
 /// is printed by [`path_format`], dashboard-aware.)
-pub const FORMATS: [&str; 33] = [
+pub const FORMATS: [&str; 34] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
     "#{window_panes}", "#{pane_current_path}", "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}",
     "#{@stash_origin}", "#{@agent_slot}", "#{@agent_pending}", "#{@agent_key}", "#{@agent_mru_cur}",
     "#{@agent_mru_prev}", "#{@space_home}", "#{@space_index}", "#{@space_hidden}", "#{@space_color}", "#{@stash_sel}",
-    PANE_FLAGS, "#{@agent_rollout}",
+    PANE_FLAGS, "#{@agent_rollout}", "#{@agent_paused}",
 ];
 
 /// Ends each path in the dashboard case of [`path_format`] (a private-use
@@ -359,7 +361,7 @@ pub fn fmt() -> String {
 /// the GLOBAL options the sidebar's status block shows in place of the
 /// hidden status line (usage, the stale-save mark, the open-sidebar count).
 /// Starts with an empty field and has 9 + [`STATUS_FORMATS`] fields where a
-/// window row has 31, so the two parsers can never take each other's rows.
+/// window row has [`FIELDS`]' 34, so the two parsers can never take each other's rows.
 pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
@@ -490,7 +492,10 @@ pub struct Window {
     /// window_id, `@N`.
     pub id: String,
     pub name: String,
-    /// @agent_state: idle | running | needs-input | failed | done | "" (no agent).
+    /// @agent_state: idle | running | needs-input | failed | done | paused |
+    /// "" (no agent), with the pause folded in: `done` / `idle` on a window
+    /// that has `@agent_paused` set reads `paused` ([`crate::model::paused_state`]),
+    /// so every reader sees one state.
     pub state: String,
     pub summary: String,
     /// @agent_workflow / @agent_cua: any non-empty value means set.
@@ -559,6 +564,9 @@ pub struct Window {
     /// @agent_rollout: a Codex agent's rollout (its transcript) path, as
     /// agent-tab-indicator.sh stashes it; "" for any other.
     pub rollout: String,
+    /// Raw @agent_paused (agent-pause.py: `<epoch>` while the window is in
+    /// the pause key's saved set; "" = unset). Already folded into `state`.
+    pub paused: String,
 }
 
 fn digits(s: &str) -> bool {
@@ -607,7 +615,7 @@ impl Window {
             index: num(p[1]).and_then(|n| u32::try_from(n).ok()).unwrap_or(0),
             id: p[2].into(),
             name: name.into(),
-            state: p[4].into(),
+            state: crate::model::paused_state(p[4], p[33]).into(),
             summary: summary.into(),
             workflow: p[6].into(),
             cua: p[7].into(),
@@ -638,6 +646,7 @@ impl Window {
             space_color: p[29].trim().into(),
             stash_sel: !p[30].is_empty(),
             rollout: p[32].trim().into(),
+            paused: p[33].into(),
             label: label.into(),
             session,
         })
@@ -982,14 +991,39 @@ pub(crate) mod tests {
         assert_eq!((w.session.as_str(), w.label.as_str()), ("日本", "🫠 x\tz"));
     }
 
-    /// A row from an older format (32 fields, before `rollout`) or one with
+    /// A row from an older format (33 fields, before `paused`) or one with
     /// a field too many is no window: never misread by position.
     #[test]
     fn rows_of_the_wrong_length_are_rejected() {
-        assert_eq!(FIELDS.len(), 33);
-        assert!(Window::parse(&vec!["x"; 32].join("\x1f")).is_none());
-        assert!(Window::parse(&vec!["x"; 34].join("\x1f")).is_none());
-        assert!(Window::parse(&vec!["x"; 33].join("\x1f")).is_some());
+        assert_eq!(FIELDS.len(), 34);
+        assert!(Window::parse(&vec!["x"; 33].join("\x1f")).is_none());
+        assert!(Window::parse(&vec!["x"; 35].join("\x1f")).is_none());
+        assert!(Window::parse(&vec!["x"; 34].join("\x1f")).is_some());
+    }
+
+    /// `@agent_paused` folds into the state: done / idle read paused, a
+    /// window still running or asking keeps its live state, `paused` as
+    /// written stays paused, and a stray flag on a plain shell is nothing.
+    #[test]
+    fn the_pause_flag_folds_into_the_state() {
+        let st = |state: &str, flag: &str| Window::parse(&row("main", 1, "@1", &[("state", state), ("paused", flag)])).unwrap();
+        for (state, flag, want) in [
+            ("paused", "", "paused"),
+            ("paused", "1792418628", "paused"),
+            ("done", "1792418628", "paused"),
+            ("idle", "1792418628", "paused"),
+            ("running", "1792418628", "running"),
+            ("needs-input", "1792418628", "needs-input"),
+            ("failed", "1792418628", "failed"),
+            ("", "1792418628", ""),
+            ("done", "", "done"),
+            ("idle", "", "idle"),
+        ] {
+            let w = st(state, flag);
+            assert_eq!(w.state, want, "{state:?} + {flag:?}");
+            assert_eq!(w.paused, flag);
+        }
+        assert!(fmt().contains(&guarded("#{@agent_paused}")));
     }
 
     #[test]
@@ -997,8 +1031,9 @@ pub(crate) mod tests {
         assert!(fmt().contains(&guarded("#{@agent_slot}")) && fmt().contains(&guarded("#{@agent_pending}")));
         assert!(fmt().contains(&guarded("#{@agent_key}")) && fmt().contains(&guarded("#{@agent_mru_prev}")));
         assert!(fmt().contains(&guarded("#{@space_home}")));
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{PANE_FLAGS}\x1f{}", guarded("#{@space_index}"),
-            guarded("#{@space_hidden}"), guarded("#{@space_color}"), guarded("#{@stash_sel}"), guarded("#{@agent_rollout}"))));
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{PANE_FLAGS}\x1f{}\x1f{}", guarded("#{@space_index}"),
+            guarded("#{@space_hidden}"), guarded("#{@space_color}"), guarded("#{@stash_sel}"), guarded("#{@agent_rollout}"),
+            guarded("#{@agent_paused}"))));
         let s = Snapshot::parse(&row("main", 1, "@1", &[("rollout", "/x/rollout-1.jsonl")]));
         assert_eq!(s.windows[0].rollout, "/x/rollout-1.jsonl");
         let s = Snapshot::parse(&row("main", 1, "@1", &[("space_color", " #f9e2af "), ("stash_sel", "1")]));

@@ -11,12 +11,15 @@
 
 use ratatui::style::Color;
 
-/// name → `#rrggbb`. Same 16 entries, same values as agent-roster.py `HEX`.
-pub const HEX: [(&str, &str); 16] = [
+/// name → `#rrggbb`. Same 17 entries, same values as agent-roster.py `HEX`.
+/// `lavender` joined when it became a STATE's colour (paused, ⏸): it is no
+/// longer chrome only.
+pub const HEX: [(&str, &str); 17] = [
     ("red", "#f38ba8"), ("yellow", "#f9e2af"), ("green", "#a6e3a1"), ("pink", "#f5c2e7"),
     ("blue", "#89b4fa"), ("teal", "#94e2d5"), ("dimteal", "#659a91"), ("dimblue", "#5d7aaa"),
     ("peach", "#fab387"), ("text", "#cdd6f4"), ("sub", "#a6adc8"), ("overlay", "#6c7086"),
     ("surface0", "#313244"), ("surface1", "#45475a"), ("crust", "#11111b"), ("sky", "#89dceb"),
+    ("lavender", "#b4befe"),
 ];
 
 /// Chrome-only colours the sidebar and menu draw with (backgrounds, the
@@ -47,9 +50,9 @@ pub const HEX: [(&str, &str); 16] = [
 /// here" at a glance. `term` (the terminals' own `base`) is a SHELL row's
 /// strip: a little terminal on the canvas, a step under the agent tiles
 /// (it was crust-dark, #13131d, which Mack found too dark).
-pub const UI: [(&str, &str); 13] = [
+pub const UI: [(&str, &str); 12] = [
     ("base", "#1e1e2e"), ("mantle", "#181825"), ("surface2", "#585b70"),
-    ("mauve", "#cba6f7"), ("lavender", "#b4befe"), ("sel", "#2a2b3d"),
+    ("mauve", "#cba6f7"), ("sel", "#2a2b3d"),
     ("overlay2", "#9399b2"), ("tile", "#30314a"), ("tile_lo", "#28283b"),
     ("tile_hi", "#31394f"), ("overlay1", "#7f849c"), ("tile_me", "#474a66"),
     ("term", "#1e1e2e"),
@@ -118,7 +121,8 @@ mod tests {
         let py = r##"{"red": "#f38ba8", "yellow": "#f9e2af", "green": "#a6e3a1", "pink": "#f5c2e7",
     "blue": "#89b4fa", "teal": "#94e2d5", "dimteal": "#659a91", "dimblue": "#5d7aaa",
     "peach": "#fab387", "text": "#cdd6f4", "sub": "#a6adc8", "overlay": "#6c7086",
-    "surface0": "#313244", "surface1": "#45475a", "crust": "#11111b", "sky": "#89dceb","##;
+    "surface0": "#313244", "surface1": "#45475a", "crust": "#11111b", "sky": "#89dceb",
+    "lavender": "#b4befe","##;
         for (n, h) in HEX {
             assert!(py.contains(&format!("\"{n}\": \"{h}\"")), "{n} {h}");
         }

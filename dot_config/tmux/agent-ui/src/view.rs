@@ -172,13 +172,14 @@ pub struct Agent {
     pub index: u32,
     /// window_name.
     pub name: String,
-    /// Raw @agent_state ("" = no agent).
+    /// @agent_state ("" = no agent), with the pause folded in (`paused`:
+    /// [`crate::model::paused_state`]).
     pub state: String,
     /// Count bucket (None: plain shell).
     pub cat: Option<Cat>,
     /// agent-roster.py `rank` (0 failed .. 4 other, 9 none).
     pub rank: u8,
-    /// The state shape (✕ ◉ ✓ ◐ ○), " " for a plain shell.
+    /// The state shape (✕ ◉ ✓ ◐ ⏸ ○), " " for a plain shell.
     pub glyph: &'static str,
     /// The palette colour of the shape (Roster.dot, pulse applied), None
     /// for a plain shell.
@@ -954,7 +955,7 @@ mod tests {
         assert_eq!(v.needs[0].reason_word, "failed");
         assert_eq!(v.needs[1].agent.age, "15m");
         // Header: failed 1, needs 1, working 2 (@3, @5), idle 1 (Alpha).
-        assert_eq!(v.counts.0, [1, 1, 0, 2, 1]);
+        assert_eq!(v.counts.0, [1, 1, 0, 2, 0, 1]);
         assert_eq!((v.cur_win.as_deref(), v.cur_session.as_deref(), v.client_gone), (Some("@2"), Some("main"), false));
         assert!(build(Some("/dev/nope")).client_gone);
     }

@@ -19,36 +19,41 @@ pub const JUMP_EXCLUDE: &str = " agents tasks stash scratch btop-popup ";
 pub const NO_STAMP: &str = "9999999999";
 
 /// The count bucket of a window (agent-roster.py `CATS`), in display order.
+/// `Paused` (docs/agent-pause.md "The paused state") is stopped for a while:
+/// not working, not attention, never done; its own bucket, after working.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Cat {
     Failed,
     NeedsInput,
     Done,
     Working,
+    Paused,
     Idle,
 }
 
 impl Cat {
-    pub const ALL: [Cat; 5] = [Cat::Failed, Cat::NeedsInput, Cat::Done, Cat::Working, Cat::Idle];
+    pub const ALL: [Cat; 6] = [Cat::Failed, Cat::NeedsInput, Cat::Done, Cat::Working, Cat::Paused, Cat::Idle];
 
-    /// The CATS name ("failed", "needs-input", "done", "working", "idle").
+    /// The CATS name ("failed", "needs-input", "done", "working", "paused", "idle").
     pub fn name(self) -> &'static str {
         match self {
             Cat::Failed => "failed",
             Cat::NeedsInput => "needs-input",
             Cat::Done => "done",
             Cat::Working => "working",
+            Cat::Paused => "paused",
             Cat::Idle => "idle",
         }
     }
 
-    /// agent-roster.py `CAT_GLYPH`: the state SHAPE (✕ ◉ ✓ ◐ ○).
+    /// agent-roster.py `CAT_GLYPH`: the state SHAPE (✕ ◉ ✓ ◐ ⏸ ○).
     pub fn glyph(self) -> &'static str {
         match self {
             Cat::Failed => "✕",
             Cat::NeedsInput => "◉",
             Cat::Done => "✓",
             Cat::Working => "◐",
+            Cat::Paused => PAUSED_GLYPH,
             Cat::Idle => "○",
         }
     }
@@ -61,22 +66,44 @@ impl Cat {
             Cat::NeedsInput => "yellow",
             Cat::Done => "green",
             Cat::Working => "pink",
+            Cat::Paused => PAUSED_HUE,
             Cat::Idle => "overlay",
         }
     }
 
     /// The bucket of a bare state word (no workflow/cua flags), for event-log
-    /// lines: failed/needs-input/done as themselves, running → working, any
-    /// other non-empty state → idle.
+    /// lines: failed/needs-input/done/paused as themselves, running →
+    /// working, any other non-empty state (unknown ones included) → idle.
     pub fn of_state(state: &str) -> Option<Cat> {
         match state {
             "failed" => Some(Cat::Failed),
             "needs-input" => Some(Cat::NeedsInput),
             "done" => Some(Cat::Done),
             "running" => Some(Cat::Working),
+            "paused" => Some(Cat::Paused),
             "" => None,
             _ => Some(Cat::Idle),
         }
+    }
+}
+
+/// A paused agent's mark and colour, the same on every surface (the tab,
+/// the sidebar, the menus, CuaNotch's row): `⏸` in lavender (`#b4befe`).
+pub const PAUSED_GLYPH: &str = "⏸";
+pub const PAUSED_HUE: &str = "lavender";
+
+/// The state a window shows, with the pause folded in (docs/agent-pause.md
+/// "The paused state"): `paused` as the tab hook writes it, and, until that
+/// lands everywhere, `done` or `idle` on a window whose `@agent_paused` is
+/// set (non-empty) reads `paused` too. A window still running or asking
+/// keeps its live state: it has not stopped yet (the pause banner says who
+/// is still working), and only Mack can answer a prompt. No agent state
+/// (a plain shell) stays none, flag or not.
+pub fn paused_state<'a>(state: &'a str, paused_flag: &str) -> &'a str {
+    if !paused_flag.is_empty() && matches!(state, "done" | "idle") {
+        "paused"
+    } else {
+        state
     }
 }
 
@@ -109,13 +136,17 @@ pub fn rank(w: &Window) -> u8 {
     }
 }
 
-/// agent-roster.py `cat`: the count bucket, or None for a plain shell.
+/// agent-roster.py `cat`: the count bucket, or None for a plain shell. A
+/// paused agent with a fleet or cua still out is in flight (working), as the
+/// pause's own "still working" rule counts it.
 pub fn cat(w: &Window) -> Option<Cat> {
     if is_attn(w) {
         return Cat::of_state(&w.state);
     }
     if in_flight(w) {
         Some(Cat::Working)
+    } else if w.state == "paused" {
+        Some(Cat::Paused)
     } else if !w.state.is_empty() {
         Some(Cat::Idle)
     } else {
@@ -126,13 +157,13 @@ pub fn cat(w: &Window) -> Option<Cat> {
 /// Per-bucket counts (agent-roster.py `counts`, which returns the non-zero
 /// ones in CATS order: see [`Counts::nonzero`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Counts(pub [usize; 5]);
+pub struct Counts(pub [usize; 6]);
 
 impl Counts {
     /// Each window id once (a linked window is one agent).
     pub fn of<'a>(ws: impl IntoIterator<Item = &'a Window>) -> Counts {
         let mut seen = HashSet::new();
-        let mut n = [0usize; 5];
+        let mut n = [0usize; 6];
         for w in ws {
             if let Some(c) = cat(w) {
                 if seen.insert(w.id.as_str()) {
@@ -159,8 +190,8 @@ impl Counts {
 
 /// agent-roster.py `Roster.dot` colour: the live mark of a window. Attention
 /// states in their own colour; in flight pulses pink/blue with @agent_blink,
-/// except the window the client is on, which never pulses (blue); other
-/// agent states overlay; None for a plain shell.
+/// except the window the client is on, which never pulses (blue); paused
+/// lavender (steady); other agent states overlay; None for a plain shell.
 pub fn dot_color(w: &Window, blink: bool, is_current: bool) -> Option<&'static str> {
     if is_attn(w) {
         return Some(match w.state.as_str() {
@@ -171,6 +202,9 @@ pub fn dot_color(w: &Window, blink: bool, is_current: bool) -> Option<&'static s
     }
     if in_flight(w) {
         return Some(if is_current || !blink { "blue" } else { "pink" });
+    }
+    if w.state == "paused" {
+        return Some(PAUSED_HUE);
     }
     if w.state.is_empty() {
         None
@@ -238,6 +272,7 @@ pub fn state_words(w: &Window) -> &'static str {
         "done" => "done",
         "running" => "working",
         "idle" => "idle",
+        "paused" => "paused",
         _ => "",
     }
 }
@@ -548,6 +583,7 @@ mod tests {
         assert_eq!(cat(&w("", "1", "")), Some(Cat::Working)); // the Python's quirk: flag alone counts
         assert_eq!(rank(&w("", "", "")), 9);
         assert_eq!(rank(&w("weird", "", "")), 4);
+        assert_eq!((cat(&w("weird", "", "")), is_attn(&w("weird", "", ""))), (Some(Cat::Idle), false)); // unknown: idle, never needs
         assert_eq!(dot_color(&w("running", "", ""), true, false), Some("pink"));
         assert_eq!(dot_color(&w("running", "", ""), false, false), Some("blue"));
         assert_eq!(dot_color(&w("running", "", ""), true, true), Some("blue")); // never pulses under you
@@ -561,6 +597,51 @@ mod tests {
         for (s, c) in [("failed", Cat::Failed), ("needs-input", Cat::NeedsInput), ("done", Cat::Done)] {
             assert_eq!(dot_color(&w(s, "", ""), true, false), Some(c.hue()));
         }
+    }
+
+    /// Paused (docs/agent-pause.md "The paused state"): its own bucket, ⏸
+    /// lavender, ranked with the quiet states, never attention, never in
+    /// the NEEDS YOU queue, never done-green: `paused` as written, and
+    /// done / idle with `@agent_paused` set. Running or asking with the flag
+    /// keeps its live state.
+    #[test]
+    fn paused_is_its_own_quiet_state() {
+        let w = |state: &str, flag: &str, wf: &str| {
+            Window::parse(&row("s", 1, "@1", &[("state", state), ("paused", flag), ("workflow", wf), ("since", "5 x")])).unwrap()
+        };
+        for (state, flag) in [("paused", ""), ("done", "1792418628"), ("idle", "1792418628"), ("paused", "1792418628")] {
+            let p = w(state, flag, "");
+            let ctx = format!("{state} + {flag:?}");
+            assert_eq!(p.state, "paused", "{ctx}");
+            assert_eq!(cat(&p), Some(Cat::Paused), "{ctx}");
+            assert!(!is_attn(&p) && !in_flight(&p), "{ctx}");
+            assert_eq!(rank(&p), 4, "{ctx}");
+            assert_eq!(dot_color(&p, true, false), Some("lavender"), "{ctx}");
+            assert_eq!(dot_color(&p, false, true), Some("lavender"), "{ctx}"); // steady: no pulse
+            assert_eq!(state_words(&p), "paused", "{ctx}");
+            assert!(needs_order(&[p], &Collator::new("C")).is_empty(), "{ctx}");
+        }
+        // Still running / asking with the flag: its live state, as before.
+        let r = w("running", "1792418628", "");
+        assert_eq!((cat(&r), dot_color(&r, true, false)), (Some(Cat::Working), Some("pink")));
+        let n = w("needs-input", "1792418628", "");
+        assert_eq!(cat(&n), Some(Cat::NeedsInput));
+        assert_eq!(needs_order(&[n], &Collator::new("C")).len(), 1);
+        // Paused with a fleet still out is working (the pause's own rule).
+        assert_eq!(cat(&w("paused", "", "1")), Some(Cat::Working));
+        assert_eq!((Cat::Paused.glyph(), Cat::Paused.hue(), Cat::Paused.name()), ("⏸", "lavender", "paused"));
+        assert_eq!(Cat::of_state("paused"), Some(Cat::Paused));
+        // The bucket order: after working, before idle.
+        assert_eq!(Cat::ALL, [Cat::Failed, Cat::NeedsInput, Cat::Done, Cat::Working, Cat::Paused, Cat::Idle]);
+        let ws: Vec<Window> = vec![w("paused", "", ""), w("done", "9", ""), w("idle", "", "")]
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut x)| {
+                x.id = format!("@{i}");
+                x
+            })
+            .collect();
+        assert_eq!(Counts::of(&ws).nonzero(), vec![(Cat::Paused, 2), (Cat::Idle, 1)]);
     }
 
     #[test]

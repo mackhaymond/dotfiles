@@ -19,7 +19,7 @@ fn idle_says_nothing_and_every_state_has_its_rail() {
     for (name, v) in all().into_iter().chain([("coloured", coloured())]).flat_map(|(n, v)| [(n, v.clone()), (n, lettered(v))]) {
         for (w, h) in [(34u16, 58u16), (42, 90), (42, 30), (24, 40)] {
             let f = layout(&v, w, h, &Opts::default());
-            let cx = Cx { w: usize::from(w), b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true };
+            let cx = Cx { w: usize::from(w), b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false };
             let t = texts(&f);
             for y in f.agents.clone().filter(|&y| f.rows[y].covers.len() == 1 && !is_group_header(&f.rows[y], usize::from(w))) {
                 let r = &f.rows[y];
@@ -859,7 +859,7 @@ fn tiny_heights() {
         assert_eq!(f.target(3, y as u16), Some(&Target::Menu(Some("all"))));
     }
     // Nothing pending in one row: the header saying so, never ` … 0 need you`.
-    let cx = Cx { w: 34, b: Badge::OFF, now: NOW as f64, spin: 0, home: None, cur: None, shells: true };
+    let cx = Cx { w: 34, b: Badge::OFF, now: NOW as f64, spin: 0, home: None, cur: None, shells: true, resumes: false };
     assert_eq!(needs_cut(&empty(), cx, 1).iter().map(Row::text).collect::<Vec<_>>(), [needs_header(&empty(), 34).text()]);
 }
 
@@ -1624,7 +1624,7 @@ fn shells_fold_into_one_line() {
     let refs: Vec<&Agent> = many.iter().collect();
     for w in [16usize, 24, 34, 60, 200] {
         for on in [true, false] {
-            let cx = Cx { w, b: Badge { on, loud: false }, now: NOW as f64, spin: 0, home: None, cur: None, shells: true };
+            let cx = Cx { w, b: Badge { on, loud: false }, now: NOW as f64, spin: 0, home: None, cur: None, shells: true, resumes: false };
             let r = shells_line(&refs, cx, Ink::Pal("peach"));
             let text = r.text();
             assert_eq!(width(&r.segs), w, "{w}: {text:?}");
@@ -2501,7 +2501,7 @@ fn phases() -> Vec<Phase> {
 #[test]
 fn the_pause_banner_says_where_the_pause_stands() {
     let v = lettered(quiet());
-    let words = ["PAUSING  sending 2 of 5", "PAUSING  3 of 5 stopped", "✓ PAUSED  safe to close", "↻ 3 ready  ", "RESUMING  3 agents…"];
+    let words = ["PAUSING  sending 2 of 5", "PAUSING  3 of 5 stopped", "⏸ PAUSED  safe to close", "↻ 3 ready  ", "RESUMING  3 agents…"];
     for (p, word) in phases().into_iter().zip(words) {
         for w in [24u16, 34, 44] {
             let f = layout(&v, w, 58, &Opts { pause: Some(p.clone()), ..with_bar(demo_bar()) });
@@ -2521,7 +2521,14 @@ fn the_pause_banner_says_where_the_pause_stands() {
                     assert!(click.iter().all(Option::is_none), "{ctx}");
                 }
             }
-            assert!(f.rows[0].segs.iter().any(|s| s.bold && s.fg == Ink::Pal(hue)), "{ctx}");
+            // The word bold in the colour; ready's count on a solid chip of it.
+            let chip = |s: &Seg| s.bold && s.bg == Some(Ink::Pal(hue)) && s.fg == Ink::Pal("crust");
+            if matches!(p, Phase::Ready { .. }) {
+                assert!(f.rows[0].segs.iter().any(chip), "{ctx}");
+            } else {
+                assert!(f.rows[0].segs.iter().any(|s| s.bold && s.fg == Ink::Pal(hue)), "{ctx}");
+                assert!(!f.rows[0].segs.iter().any(chip), "{ctx}");
+            }
             if w == 44 {
                 assert!(t[0].contains(word), "{ctx}");
             }
@@ -2536,7 +2543,7 @@ fn the_pause_banner_says_where_the_pause_stands() {
     for w in [34u16, 44] {
         let f = layout(&v, w, 58, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() });
         let t = texts(&f);
-        assert!(t[0].contains("↻ 3 ready  Tmux Agent Sideba"), "{t:#?}");
+        assert!(t[0].contains("↻ 3 ready  Tmux Agent Side"), "{t:#?}");
         assert!(t[1].contains("prefix P or click to resume"), "{t:#?}");
     }
     let f = layout(&v, 34, 10, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() });
@@ -2640,4 +2647,107 @@ fn only_the_clients_own_card_is_lifted() {
             }
         }
     }
+}
+
+/// Agents paused by the pause key (docs/agent-pause.md "The paused state"):
+/// `paused` as written, and done / idle with `@agent_paused` set (before the
+/// tab hook writes `paused`). Plus one still running with the flag (it has
+/// not stopped yet) and one asking with it (only Mack can answer).
+fn paused_view() -> ViewModel {
+    let flag = (NOW - 300).to_string();
+    view(
+        vec![
+            a("main", 1, "running", "Tmux Agent Sidebar"),
+            a("main", 2, "paused", "Island resize spring").with("detail_kind", "done").with("detail", "Paused. Waiting for RESUME."),
+            a("main", 3, "done", "Census AX sweep").with("paused", &flag).with("detail_kind", "done").with("detail", "ok, pausing"),
+            a("main", 4, "idle", "Kua Yu deck").with("paused", &flag).with("detail_kind", "done").with("detail", "7 fixes applied"),
+            a("main", 5, "running", "Handy.app Speech").with("paused", &flag),
+            a("main", 6, "needs-input", "Asks anyway").with("paused", &flag).with("detail_kind", "ask").with("detail", "which?"),
+            a("main", 7, "idle", "Q7"),
+            a("main", 8, "idle", "Q8"),
+        ],
+        Some("@1"),
+    )
+}
+
+/// A paused card: a lavender `▎` rail down both rows, the ⏸ bold lavender
+/// on the right (its word below: `paused`, never twice), the second line
+/// `paused · prefix P resumes` while a pause is saved and it fits, else
+/// `paused`; never green, never a NEEDS YOU card, never folded into the idle
+/// line; the space's counts carry `⏸3` in lavender.
+#[test]
+fn paused_cards_are_lavender_and_never_need_you() {
+    let v = lettered(paused_view());
+    let ids = |want: &str| v.agents().filter(|a| a.state == want).map(|a| a.title.clone()).collect::<Vec<_>>();
+    assert_eq!(ids("paused"), ["Island resize spring", "Census AX sweep", "Kua Yu deck"]);
+    assert_eq!(v.needs.iter().map(|n| n.agent.title.as_str()).collect::<Vec<_>>(), ["Asks anyway"]);
+    for (w, settled) in [(34u16, true), (44, true), (44, false)] {
+        let pause = settled.then(|| Phase::Safe { labels: vec!["Island resize spring".into()] });
+        let f = layout(&v, w, 70, &Opts { pause, ..Opts::default() });
+        let t = texts(&f);
+        let ctx = format!("{w} {settled}: {t:#?}");
+        for title in ["Island resize spring", "Census AX sweep", "Kua Yu deck"] {
+            let y = f.agents.clone().find(|&y| t[y].contains(title)).unwrap_or_else(|| panic!("{title}: {ctx}"));
+            assert!(!f.needs.contains(&y), "{ctx}");
+            let (r, r2) = (&f.rows[y], &f.rows[y + 1]);
+            assert_eq!((r.segs[1].clone(), r2.segs[1].clone()), (seg("▎", "lavender"), seg("▎", "lavender")), "{title} {ctx}");
+            assert!(r.segs.contains(&bold("⏸", "lavender")) && !t[y].contains("⏸ paused"), "{title} {ctx}");
+            assert!(r2.segs.contains(&bold("paused", "lavender")), "{title} {ctx}");
+            // The key that resumes, while a pause is saved: whole from 44
+            // columns, `prefix P` at Mack's usual 34.
+            let want = if w >= 44 { "paused · prefix P resumes" } else { "paused · prefix P" };
+            assert_eq!(t[y + 1].contains(want), settled, "{title} {ctx}");
+            assert_eq!(t[y + 1].contains("prefix P"), settled, "{title} {ctx}");
+            assert!(!t[y + 1].contains("Paused. Waiting") && !t[y + 1].contains("7 fixes"), "{title}: the reply gives way {ctx}");
+            for s in r.segs.iter().chain(&r2.segs) {
+                assert!(s.fg != Ink::Pal("green"), "{title}: never green {ctx}");
+            }
+        }
+        // Still running with the flag: working, as before.
+        let h = find(&f, "Handy.app Spee");
+        assert!(t[h].contains("working") && f.rows[h].segs[1] == seg("▎", "blue"), "{ctx}");
+        // The space's header counts the paused bucket, after working.
+        let m = head(&f, "main");
+        assert!(f.rows[m].segs.contains(&seg("⏸3", "lavender")), "{:?}", f.rows[m].segs);
+        assert!(t[m].contains("◉1 ◐2 ⏸3 ○2"), "{ctx}");
+    }
+    // Squeezed: the idle agents fold, the paused ones never do.
+    let f = (10..70).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 1).unwrap();
+    let t = texts(&f);
+    assert!(t.iter().any(|l| l.contains("2 idle · Q7, Q8")), "{t:#?}");
+    for title in ["Island resize spring", "Census AX sweep", "Kua Yu deck"] {
+        assert!(t[f.agents.clone()].iter().any(|l| l.contains(title)), "{title}: {t:#?}");
+    }
+    // Narrow (no second lines under 26 columns): the glyph and the word on
+    // the one line.
+    let f = layout(&v, 24, 70, &Opts::default());
+    let y = find(&f, "Islan");
+    assert!(f.rows[y].segs.contains(&bold("⏸ paused", "lavender")) && f.rows[y].segs[1] == seg("▎", "lavender"), "{:?}", f.rows[y].segs);
+}
+
+/// The settled banner is "all paused": lavender for safe and ready alike
+/// (never green: green means done; never the old blue), the two told apart
+/// by emphasis: safe's `⏸ PAUSED` bold in lavender, ready's count on a
+/// solid lavender chip. Moving phases stay peach.
+#[test]
+fn settled_pause_banner_is_lavender_never_green() {
+    let v = lettered(quiet());
+    for p in phases() {
+        let hue = pause_hue(&p);
+        match p {
+            Phase::Safe { .. } | Phase::Ready { .. } => assert_eq!(hue, "lavender", "{p:?}"),
+            _ => assert_eq!(hue, "peach", "{p:?}"),
+        }
+        for w in [34u16, 44] {
+            let f = layout(&v, w, 58, &Opts { pause: Some(p.clone()), ..Opts::default() });
+            for y in f.pause.clone() {
+                assert_eq!(f.rows[y].bg, Some(Ink::Mix(hue, PAUSE_TINT)));
+                assert!(f.rows[y].segs.iter().all(|s| s.fg != Ink::Pal("green") && s.fg != Ink::Pal("blue")), "{p:?}");
+            }
+        }
+    }
+    let f = layout(&v, 34, 58, &Opts { pause: Some(phases()[2].clone()), ..Opts::default() });
+    assert!(f.rows[0].segs.contains(&bold("⏸ PAUSED", "lavender")), "{:?}", f.rows[0].segs);
+    let f = layout(&v, 34, 58, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() });
+    assert!(f.rows[0].segs.contains(&block(" ↻ 3 ready ", "crust", "lavender")), "{:?}", f.rows[0].segs);
 }
