@@ -8,6 +8,7 @@ agents finish while the lid is shut and states move on, and a RESUME must
 reach the agents that were paused, not whatever happens to be running now.
 
     agent-pause.py toggle <client_name>   the key: pause, or resume a saved set
+    agent-pause.py resume <client_name>   resume a saved set, never pause (the sidebar)
     agent-pause.py status                 print the saved set, or "not paused"
     agent-pause.py dry-run                print who WOULD be paused/resumed; sends nothing
     agent-pause.py watch pause|resume [--demo] [--press <id>]
@@ -885,11 +886,13 @@ def finish_resume(client, prog, st, live, gone):
     return msg, bool(ok)
 
 
-def toggle(client):
+def toggle(client, resume_only=False):
     """The key. Under the lock: the cheap plan, progress.json, the popup
     (launched, not waited for), then delivery and the final state. A second
     press while this one delivers finds the lock held ("busy"), so it can
-    never read a half-made pause as a resumable set."""
+    never read a half-made pause as a resumable set. resume_only (the
+    sidebar's click, `resume`): with no saved set it does nothing, so a click
+    on a banner that just went stale can never turn into a fresh pause."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     lf = open(LOCK, "a")
     popup = None
@@ -907,6 +910,9 @@ def toggle(client):
             prog = Progress(press, "resume", live, gone)
             popup = open_popup(client, "resume", press)
             msg = finished(prog, lambda: finish_resume(client, prog, st, live, gone))
+        elif resume_only:
+            msg = "▶ nothing is paused — nothing to resume"
+            log({"mode": "resume", "client": client, "message": msg, "targets": []})
         else:
             targets, unidentified = plan_pause()
             if not targets:
@@ -1639,10 +1645,10 @@ def dry_run():
 
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else ""
-    if cmd == "toggle":
+    if cmd in ("toggle", "resume"):
         client = argv[2] if len(argv) > 2 else ""
         try:
-            toggle(client)
+            toggle(client, resume_only=(cmd == "resume"))
         except Exception as e:   # the keybind path never fails silently
             msg = "⏸ pause key error: %s: %s" % (type(e).__name__, e)
             log({"mode": "error", "client": client, "message": msg})
@@ -1670,7 +1676,7 @@ def main(argv):
             import select
             select.select([sys.stdin], [], [], 30)
         return 0
-    sys.stderr.write("usage: agent-pause.py toggle <client_name> | status | dry-run"
+    sys.stderr.write("usage: agent-pause.py toggle|resume <client_name> | status | dry-run"
                      " | watch pause|resume [--demo] [--press <id>]\n")
     return 2
 

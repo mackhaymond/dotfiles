@@ -591,6 +591,20 @@ class PauseKey(Harness):
         self.assertEqual(self.stub.methods, [])
         self.assertIsNone(self.state())
 
+    def test_resume_only_never_pauses(self):
+        a = self.window("running")
+        r = self.run_script("resume", "")
+        self.assertEqual((r.returncode, r.stdout), (0, ""), r.stderr)
+        self.assertIn("nothing to resume", self.last_log()["message"])
+        self.assertEqual(self.stub.methods, [])
+        self.assertIsNone(self.state())
+        self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [a])
+        r = self.run_script("resume", "")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [a])
+        self.assertIsNone(self.state())
+
     def test_dry_run_and_status_send_nothing(self):
         a = self.window("running")
         self.window("idle")

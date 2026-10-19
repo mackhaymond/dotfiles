@@ -205,8 +205,30 @@ Everything lives in `~/.local/state/agent-pause/` (override:
 | `lock` | `flock`ed for the whole press |
 
 The tmux global option `@agents_paused` holds the number of agents still saved
-while paused, and is unset once none are left. It is there for a future status
-indicator; nothing renders it yet.
+while paused, and is unset once none are left.
+
+## In the sidebar
+
+Mack closes the popup (Esc) or a tab and still wants to see where the pause
+stands, so the sidebar (agent-ui) shows it too. It reads the files above plus
+its own window options; the script publishes nothing extra. Phases, first
+match wins:
+
+| phase | when | shows |
+|---|---|---|
+| resuming | `progress.json`: `mode` resume, `done` false | resuming N agents… |
+| pausing (sending) | `progress.json`: `mode` pause, `done` false | pausing, sending to N agents (K of N done; K = targets whose `result` is no longer `sending`) |
+| ready to resume | `paused.json` has targets AND the last wake (`sysctl kern.waketime`) is after `paused_at` | N agents paused, prefix P (or a click) resumes; their labels |
+| pausing (stopping) | `paused.json` has targets and any target window is still WORKING (`@agent_state` running, `@agent_workflow` or `@agent_cua` set) | pausing, K of N stopped; who is still working |
+| safe to close | `paused.json` has targets, none working, no wake since `paused_at` | paused, safe to close |
+| (nothing) | no `paused.json` and no press in flight | nothing |
+
+A target's window is its `window_id`; after a resurrect restore that may be
+gone (the script itself re-finds agents by session id), and a gone window
+counts as stopped. A click resumes with `agent-pause.py resume
+<client_name>`, never `toggle`: `resume` does nothing when no set is saved, so
+a click on a stale banner cannot start a pause. Both files are written
+atomically (temp file + rename).
 
 **The toggle rule:** if `paused.json` exists and lists at least one target, the
 press resumes. Otherwise it pauses.
@@ -272,6 +294,9 @@ to 30 s) instead of blinking shut.
 ~/.config/tmux/scripts/agent-pause.py dry-run   # who WOULD be paused (or resumed, and where), and why
 ~/.config/tmux/scripts/agent-pause.py status    # the saved set, or "not paused"
 ```
+
+`agent-pause.py resume <client_name>` is the key's resume half alone (same
+popup), and does nothing when nothing is saved. The sidebar's click uses it.
 
 `dry-run` only reads tmux and the session records. It takes no lock, opens no
 MCP connection and writes nothing.
