@@ -265,6 +265,9 @@ def mark_paused(panes, on, repause=False):
         return
     try:
         tmux(*cmds, check=False)
+        # The sidebar redraws on this notification instead of its 5 s poll.
+        subprocess.run(["notifyutil", "-p", "com.mackhaymond.tmux.agent-state"],
+                       capture_output=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         pass
 

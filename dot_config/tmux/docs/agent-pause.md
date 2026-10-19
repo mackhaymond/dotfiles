@@ -229,7 +229,12 @@ Every reader:
 - The watcher's reconciles (the seen-it discharge, the stuck-`running`
   reconcile, the idle seed) leave `paused` alone.
 - **Display:** `⏸` in lavender (`#b4befe`) on the tab, the sidebar tile, the
-  agent menu and CuaNotch's row. It is the same colour on every surface.
+  agent menu and CuaNotch's row. It is the same colour on every surface, and
+  the sidebar's safe-to-close and ready banners are lavender too. Readers
+  also count `@agent_paused` with `done` or `idle` as paused (the sidebar
+  does, b1e2795), so a tile is right even before the hook writes `paused`.
+- agent-pause.py posts `notifyutil -p com.mackhaymond.tmux.agent-state`
+  after setting or clearing the flag, so the sidebar redraws at once.
 - **All paused** = `paused.json` lists targets and none of their windows is
   working (the sidebar's safe and ready phases). CuaNotch shows one distinct
   lavender glow for it until `paused.json` goes away (the resume); the
