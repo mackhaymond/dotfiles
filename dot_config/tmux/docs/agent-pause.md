@@ -230,6 +230,18 @@ counts as stopped. A click resumes with `agent-pause.py resume
 a click on a stale banner cannot start a pause. Both files are written
 atomically (temp file + rename).
 
+The sidebar's own refinements (agent-ui `src/sidebar/pause.rs`, 41d6932):
+
+- A boot after `paused_at` (`kern.boottime`) counts as a wake, so after a
+  reboot it says ready, never safe to close.
+- If the tmux server started after `paused_at`, every saved `window_id`
+  counts as gone (a new server reuses `@N` ids).
+- A press is in flight only while `done` is false, its `<ms>-<pid>` process
+  lives, it began after the last boot and less than 20 minutes ago, so a
+  toggle killed mid-delivery never holds the banner.
+- A pause's `unidentified` rows and a resume's `gone` rows are left out of N.
+- Only safe to close and ready are clickable.
+
 **The toggle rule:** if `paused.json` exists and lists at least one target, the
 press resumes. Otherwise it pauses.
 
