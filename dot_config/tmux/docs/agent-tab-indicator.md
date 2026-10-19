@@ -1078,7 +1078,9 @@ separated by US (`\x1f`), and each line ends in `\n`:
 | 8 | `title` | `@agent_summary`, else the window name (the roster's fallback) |
 | 9 | `detail` | `@agent_detail` (empty on an `idle` line) |
 
-An `idle` line always has empty detail fields. The seen-it discharge, the
+An `idle` line always has empty detail fields, except a quiet restore's
+(detail_kind `quiet`, "↩ replied to @<from>"; see "Agent-originated turns").
+The seen-it discharge, the
 stuck-`running` reconcile and a bare `SessionStart` change only the state, so
 the window still holds the previous event's detail. Without blanking, an idle
 line would repeat it ("idle, 3 tasks filed").
@@ -1117,6 +1119,181 @@ is logged: a FIFO would block the daemon on `open`, and a symlink would
 redirect its writes. A missing file is fine; the next append creates it.
 
 Tests: `tests/test_agent_events_log.py`.
+
+### 6. Agent-originated turns (quiet finish)
+
+Mack's ask (2026-10-19): when an agent sits finished and *another agent*
+messages it (tmux-mcp's `message_agent`), it works, and it finishes, he must
+not be told. No green tab, no NEEDS YOU row, no notch glow: he did nothing,
+and the work was for the other agent. He hears about it only when the agent
+has something specifically for him. The shared contract lives with the
+change (tmux-mcp writes the inbound side, the indicator decides, CuaNotch's
+`cua-notch-agent-hook` reads the verdict).
+
+**Quiet means invisible.** A quiet finish puts the window back to exactly the
+attention state it had before the agent-started turn: an unseen green from
+Mack's own earlier turn stays green (with its old `@agent_since` and detail),
+an idle tab goes back to idle. The pulse while the agent works is still
+shown; that is motion, not a notification. The only other trace is the
+watcher's event-log line.
+
+**Loud anyway** when:
+- the turn's origin is Mack's, or unknown (no recorded origin, a failed
+  classification): the safe direction;
+- the agent called `notify_user` (tmux MCP) or
+  `~/.config/tmux/scripts/agent-notify-user.sh "<reason>"` during the turn:
+  a normal `done`, with the reason as the sidebar detail;
+- the turn failed (`StopFailure`, red);
+- it asks for permission or a question mid-turn: that is `needs-input` as
+  always, only Mack can answer.
+
+**Options** (window scope, on the agent's window):
+
+| Option | Writer | Value |
+|---|---|---|
+| `@agent_inbound` | tmux-mcp, at delivery, before the Enter | `<epoch> <sha1> <from> <for>` entries joined by `\|`, newest last, ≤ 8 |
+| `@agent_awaiting` | tmux-mcp, on a *sender* whose turn is Mack's | `<pane>=<epoch>` entries, 2 h |
+| `@agent_for_user` | `notify_user` / `agent-notify-user.sh` | `<epoch> <reason>` (one line, no `\|` `#`, ≤ 200 chars) |
+| `@agent_turn_origin` | indicator, UserPromptSubmit | `<user\|agent> <turn_id> <from\|->` |
+| `@agent_turn_result` | indicator, Stop / StopFailure | `<turn_id> loud`, or `<turn_id> quiet <restored_state>` |
+| `@agent_prior_state`, `_since`, `_detail_kind`, `_detail` | indicator, at an agent turn's start | the attention state to restore |
+| `@agent_inbound_seen` | indicator, mid-turn | verified mid-turn messages, inbound's format, ≤ 8 |
+| `@agent_quiet` | a quiet restore (indicator or watcher), consumed by the watcher | `<from\|->`: the next event-log line is the reply; also dropped by the next prompt and by a loud Stop |
+| `@agent_bg_owner` | a Stop held `running` for background work | `user` (a loud turn) or `agent` (a quiet one), sticky toward `user`; unset by a Stop that is not held and by the watcher's release when the work drains |
+
+**`agent-notify-user.sh` finds the agent's window, not its shell's.** Native
+Bash is deny-listed here; agents run commands through the pty MCP server,
+whose shells live in the hidden `agents` session, so `$TMUX_PANE` is usually
+the pty's pane. The CLI takes `$TMUX_PANE`'s window only if it has
+`@agent_state`; else the pty window's `@pty_claude_pid` (the pty server's tag
+for the agent that owns it) → that pid's tty → the pane on it; else the
+first ancestor of the CLI whose tty is an agent window's pane (native Bash, a
+Codex tool shell; a Codex thread id resolves through `codex-terminal-owner`
+first). No agent window found: exit 1, "Mack was NOT notified", nothing set.
+
+**The event log names a quiet restore as what it was.** A restore would
+otherwise log as `running → done` with the restored (earlier) detail: a
+fresh-looking finish. So every quiet restore sets `@agent_quiet <from>` in
+its own command, and the watcher's next read logs that transition with
+detail_kind `quiet` and detail `↩ replied to @<from>` (an idle restore
+included; a `running` line with the mark is a new turn, logged as that), then
+unsets the mark. The window's own detail options keep the restored detail.
+agent-ui parses any detail_kind; its sidebar layout does not draw the event
+log at all today, and `agent-ui dump` prints a log line as `time glyph title
+state`, so a quiet line reads like any other line for that state there until
+agent-ui learns the kind (`LogEntry::new` in `agent-ui/src/view.rs`, and the
+dump loop in `agent-ui/src/main.rs`).
+
+`turn_id` is Claude's `prompt_id` or Codex's `turn_id` (both are on the
+UserPromptSubmit and on the Stop of the same turn), `-` when the agent sends
+none (OpenCode). `<restored_state>` is the tab state the restore actually
+wrote after the seen-it rules (below), so CuaNotch can tell a green Mack
+already saw from one he has not; a quiet Stop held running by background
+work says `running`. The prior options exist **only** while an agent-started
+turn's finish is pending: they are unset on every consumption (a quiet
+restore, a loud finish, a red one), on an upgrade to Mack's, on a Mack turn,
+on `SessionStart`, and with the session (`clear_state`, the watcher GC, which
+drop every option in the table).
+
+**Classifying a prompt** (`running` mode). A prompt is *agent-verified* iff
+an `@agent_inbound` entry no older than 180 s has the prompt's hash or its
+`from` matches the prompt's `[message from @<from>]` opener. The hash is
+sha1 of the whole prompt trimmed of space, tab, CR and LF at both ends,
+exactly what tmux-mcp hashes; tmux's `paste-buffer` without `-r` turns LF
+into CR, so a miss is retried with CR/CRLF folded to LF. The matched entry
+is removed, and stale ones with it. `for=user` (one-hop: A, in a turn Mack
+started, messaged B; B's reply to A within 2 h) counts as Mack's. Then:
+
+- **New turn** (no origin, or the origin's turn id differs; for an agent
+  without ids, whenever the window is not mid-turn): an agent message (for
+  `agent`) makes the origin `agent`, saves the window's state, since and
+  detail as the prior, and clears `@agent_for_user`. A window still `running`
+  from a background-held Stop is not a state to restore: a prior an earlier
+  agent turn saved stays (Mack may have seen it since); else, if the work out
+  is Mack's (`@agent_bg_owner` `user`; for windows marked before that option,
+  origin `user` with a `loud` result, any id, since a Claude split turn's loud
+  Stop carries a newer id than the origin), the prior is `done` (an unseen
+  green, with that turn's done detail when the window still shows it); else
+  `idle`. It also
+  and prints the `additionalContext` JSON telling the model that Mack won't
+  be notified and how to flag him. Anything else makes it `user` and drops
+  any prior.
+- **Same turn**: a non-agent prompt upgrades an `agent` origin to `user`
+  (never back). A verified message, either `for`, is appended to
+  `@agent_inbound_seen` for the split case.
+- **Harness wake-ups inherit.** A background task or subagent reporting back
+  arrives as a `<task-notification>` (or "Another Claude session sent a
+  message: <agent-message …") prompt with a new `prompt_id`, and DOES fire
+  UserPromptSubmit (the event log shows `run <task-notification>` details).
+  It inherits the origin of the turn whose work is out: `@agent_bg_owner`
+  when a held Stop recorded it (an agent turn may have run in between, and
+  Mack's own background result must still be loud), else the current origin,
+  under the new id; an agent inheritance leaves the prior alone. So a quiet
+  turn's background work stays quiet and Mack's stays loud. When an
+  agent turn's quiet finish already consumed its prior, the wake-up saves the
+  window's current state as a new one (else its quiet Stop would restore idle
+  over an unseen green). It never upgrades a turn. Sender handles reach tmux
+  (origin, seen list, the log mark) only as `[A-Za-z0-9_.-]`.
+
+The hook's stdout is model context for UserPromptSubmit, so `running` mode
+sends everything to `/dev/null` and writes only that JSON, to the saved
+stdout. Cost per prompt: one more tmux read (`display-message`, every field
+in one call) and one jq (turn id, opener, wake-up test); the hash
+(`jq -j … | openssl dgst -sha1`) runs only when a fresh inbound entry exists.
+Measured 2026-10-19 on a private server, 15 hooks per run, two interleaved
+runs: `running` 136–146 ms before, 146–148 ms after; `done` 80–81 ms before,
+92 ms after (its tmux read and jq); an agent-message `running` with the hash
+~173 ms, two setup tmux calls included.
+
+**Deciding at Stop** (`done` mode, one tmux read + one jq). The Stop's id
+equal to the origin's turn id: the origin decides. An id nobody announced is
+Claude's **split case** (a prompt queued while the model wrote its final
+text runs as its own turn, new id, no UserPromptSubmit) or a wake-up that
+skipped the hook. The transcript's `user` row with that `promptId` settles it
+(last 1 MB only, grepped for the id first): Claude records `origin.kind`
+(`human` for typed and queued prompts, `task-notification` for injected ones)
+and `promptSource` (`typed`/`queued`/`system`). A human row is agent iff its
+hash is in `@agent_inbound_seen` (whose `for` wins) or it opens with
+`[message from @`; a non-human row inherits the current origin; no row is
+loud. Codex never splits, so an unseen Codex id is loud.
+
+A quiet Stop restores the prior (or, for a split turn with no prior, leaves
+the window exactly as it is), writes `@agent_turn_result <id> quiet <state>`
+in the same tmux command list as the state, and unsets the prior. **Seen-it
+rules apply to what comes back:** a `done`/`needs-input` restored while
+`viewing_now` lands as `idle`, stamped `@agent_seen_at`, as a watched Stop
+would; red is never discharged by being watched. A quiet Stop held `running`
+by background work keeps the prior for whoever ends it.
+
+**Mack looking during the turn discharges the prior.** `clear-current`
+(focus) turns a saved `done`/`needs-input`/`failed` into `idle` and stamps
+`@agent_seen_at`; a `needs-approval` landing while viewed, and the watcher's
+once-a-second seen-it check, do the same for `done`/`needs-input`. Otherwise
+the quiet restore would re-tint something he already saw.
+
+**Every writer that can end a turn respects it.** The watcher, when it is the
+one ending an agent-started turn, restores the prior (one read, one write)
+instead of writing `idle`/`done`: the bg-pending release (BACKGROUND TASKS
+HOLD A TAB RUNNING), the stuck-`running` un-stick (Esc, a missed Stop;
+Claude's session file, OpenCode's status file, a rollout), and the Codex
+turn-end reconcile (`task_complete` would paint `done`). Its `prior_restore`
+applies the same seen-it rules as the indicator's (one of two places, change
+both), and writes nothing when the prior is gone by its own re-read (the
+indicator's quiet Stop restored in between; idle over that would undo it). The Codex bridge's `interrupt` mode restores the prior too, and
+OpenCode's root-idle `done` goes through the indicator's Stop path. Codex's
+internal threads stay out by the existing filter, which now also drops any
+event whose `cwd` is `~/.codex/memories` (codex 0.162's memory agent fires
+UserPromptSubmit).
+
+Known limits: tmux-mcp may append an inbound entry in the milliseconds
+between the hook's read and its rewrite of `@agent_inbound`; that entry is
+lost and its message classifies as Mack's (loud), the safe direction. A
+split-case prompt whose transcript row has scrolled past the last 1 MB reads
+as loud. Typing `[message from @x]` by hand mid-turn in a split turn reads as
+an agent message (the opener test the contract allows).
+
+Tests: `tests/test_agent_origin.py` (a real private tmux server for the
+indicator, the watcher's fake harness for its restores).
 
 ## Troubleshooting
 

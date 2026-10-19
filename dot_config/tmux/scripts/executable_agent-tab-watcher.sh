@@ -21,6 +21,8 @@
 # agent lives, except by the agent's own record of the turn: a `running` its
 # session/rollout says is over, and a codex `needs-input` or `running` whose
 # rollout ended the turn after the state was stamped (see the reconcile).
+# When such an ending closes a turn another agent started, the window gets
+# back its saved prior state instead (AGENT-ORIGINATED TURNS).
 #
 # It also makes tabs aware of background Claude WORKFLOWS. A backgrounded
 # Workflow keeps running after the main turn's Stop fires (so the tab would
@@ -908,7 +910,72 @@ declare -A W_DK=() W_DTXT=() W_SESS=() W_IDX=() W_NAME=()   # event-log fields
 declare -A W_AK=()   # @agent_kind alone (W_DET is kind+detail kind, for the GC)
 declare -A W_PEND=() # @agent_pending (agent slots: idle + pending is active)
 declare -A W_BORN=() # @agent_born (BIRTH GRACE)
+declare -A W_PRIOR=() # @agent_prior_state (AGENT-ORIGINATED TURNS)
+declare -A W_QUIET=() # @agent_quiet: a quiet restore's one-shot log mark
 wins=()
+
+# AGENT-ORIGINATED TURNS (agent-tab-indicator.sh, same heading; the doc's
+# section of that name). A turn another agent started finishes QUIET: the
+# window goes back to the attention state it had before that turn, saved by
+# the indicator in @agent_prior_state/_since/_detail_kind/_detail, which are
+# set ONLY while such a turn's finish is pending. The indicator's Stop does
+# the restore itself, except when this watcher is the one ending the turn:
+#   - a Stop held `running` by background work (BACKGROUND TASKS HOLD A TAB
+#     RUNNING), released here when the work drains;
+#   - a stuck `running` (Esc, a missed Stop) un-stuck from the session file /
+#     OpenCode status / rollout;
+#   - the CODEX TURN ENDS reconcile (task_complete would paint done).
+# Each of those writes prior_restore's state instead of idle/done when the
+# window holds a prior. Seen-it rules apply to what comes back, as the Stop
+# path's prior_restore applies them (one of two places - change both): a
+# done/needs-input restored while viewed lands as idle, stamped seen; red is
+# never discharged by being watched; the saved stamp comes back when it still
+# describes the restored state.
+ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_prior_since
+             @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
+             @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner)
+# prior_restore WIN WAC: one read of the saved fields, one write. Sets
+# r_state (the state written) and r_since; returns 1 when nothing was
+# written: the write failed, or the prior is gone since the tick's read (the
+# indicator's quiet Stop restored it in between - the window is already
+# right, and writing idle over it would undo that).
+# The write also sets @agent_quiet "<from>", the one-shot mark that makes
+# the next tick's event-log line read "↩ replied to @from" (see log_event).
+prior_restore() {
+    local win="$1" wac="$2" out x ps psince pdk pdt origin ofrom seen=0
+    local -a cmd=()
+    out=$(tmux display-message -p -t "$win" "x${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_origin}${US}#{@agent_prior_detail}" 2>/dev/null || true)
+    ps=""; psince=""; pdk=""; pdt=""; origin=""
+    case "$out" in "x$US"*) IFS="$US" read -r x ps psince pdk origin pdt <<<"$out" || true ;; esac
+    [ -n "$ps" ] || return 1
+    read -r _ _ ofrom _ <<<"$origin" || true
+    ofrom="${ofrom//[^A-Za-z0-9_.-]/}"
+    case "$ps" in idle|done|needs-input|failed) ;; *) ps=idle ;; esac
+    case "$ps" in done|needs-input) viewed_now "$wac" && { ps=idle; seen=1; } ;; esac
+    r_since="$tick_now $ps"
+    if [[ $psince =~ ^[0-9]{1,18}\ (.+)$ ]] && [ "${BASH_REMATCH[1]}" = "$ps" ]; then
+        r_since="$psince"
+    fi
+    cmd=(set-option -w -t "$win" @agent_state "$ps" \;
+         set-option -w -t "$win" @agent_since "$r_since" \;
+         set-option -uw -t "$win" @agent_pending \;
+         set-option -uw -t "$win" @agent_prior_state \;
+         set-option -uw -t "$win" @agent_prior_since \;
+         set-option -uw -t "$win" @agent_prior_detail_kind \;
+         set-option -uw -t "$win" @agent_prior_detail \;
+         set-option -uw -t "$win" @agent_bg_owner)
+    if [ -n "$pdk" ]; then
+        cmd+=(\; set-option -w -t "$win" @agent_detail_kind "$pdk" \;
+              set-option -w -t "$win" @agent_detail "$pdt")
+    else
+        cmd+=(\; set-option -uw -t "$win" @agent_detail_kind \;
+              set-option -uw -t "$win" @agent_detail)
+    fi
+    [ "$seen" = 1 ] && cmd+=(\; set-option -w -t "$win" @agent_seen_at "$tick_now")
+    cmd+=(\; set-option -w -t "$win" @agent_quiet "${ofrom:--}")
+    r_state="$ps"
+    tmux "${cmd[@]}" 2>/dev/null
+}
 
 # AGENT SLOTS (see the header). In the tick, the fold fills S_SLOT/S_VIS
 # from the list-panes rows and the per-window loop S_ELIG (from the state
@@ -1153,6 +1220,19 @@ log_event() {
     local f line="$tick_now" dk="${W_DK[$1]:-}" dt="${W_DTXT[$1]:-}" ev_all
     # Idle carries no event of its own (see the header): no stale detail.
     [ "$2" = idle ] && { dk=""; dt=""; }
+    # A QUIET RESTORE (AGENT-ORIGINATED TURNS: @agent_quiet, set with it)
+    # is logged as what it was, a reply to another agent, whatever state it
+    # restored (idle included): detail_kind `quiet`, detail "↩ replied to
+    # @from". The window's own restored detail is not this line's. A restore
+    # never writes `running`: a running line with the mark means a new turn
+    # began before the tick looked, and is logged as that turn.
+    if [ -n "${W_QUIET[$1]:-}" ] && [ "$2" != running ]; then
+        dk=quiet
+        case "${W_QUIET[$1]}" in
+            -) dt="↩ replied to another agent" ;;
+            *) dt="↩ replied to @${W_QUIET[$1]}" ;;
+        esac
+    fi
     for f in "$1" "${W_SESS[$1]:-}" "${W_IDX[$1]:-}" "$2" "$3" \
              "$dk" "${W_SUM[$1]:-${W_NAME[$1]:-}}" "$dt"; do
         line+="$US${f//[$EV_STRIP]/}"
@@ -1442,7 +1522,9 @@ EOF
     # A row only counts if it starts with a window id and carries a /dev/
     # tty, so a line that is not a pane row (a summary with an embedded
     # newline continues on its own line) can never be taken for a window.
-    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
+    # @agent_prior_state (AGENT-ORIGINATED TURNS) is a bare state token, so it
+    # rides with the digit fields, ahead of all free text.
+    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{@agent_prior_state}${US}#{@agent_quiet}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
@@ -1466,15 +1548,16 @@ EOF
     # exits, exactly like any other window.
     W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_SUM=(); W_DET=()
     W_DK=(); W_DTXT=(); W_SESS=(); W_IDX=(); W_NAME=(); W_AK=()
-    W_PEND=(); W_BORN=(); S_SLOT=(); S_VIS=(); S_ELIG=()
+    W_PEND=(); W_BORN=(); W_PRIOR=(); W_QUIET=(); S_SLOT=(); S_VIS=(); S_ELIG=()
     wins=()
-    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind slot pend born sess widx wname dtxt summary; do
+    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind slot pend born prior quiet sess widx wname dtxt summary; do
         case "$win" in @*) ;; *) continue ;; esac
         case "$tty" in /dev/?*) ;; *) continue ;; esac
         if [ -z "${W_SEEN[$win]+x}" ]; then
             W_SEEN[$win]=1
             wins+=("$win")
-            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${akind}${dkind}${born}${summary}" ]; then
+            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${akind}${dkind}${born}${prior}${summary}" ]; then
+                W_PRIOR[$win]="$prior"; W_QUIET[$win]="$quiet"
                 W_STATE[$win]="$state"; W_WAC[$win]="$wac"; W_SINCE[$win]="$since"
                 W_WF[$win]="$wf_opt"; W_CUA[$win]="$cua_opt"; W_ROLL[$win]="$roll"
                 W_SUM[$win]="$summary"; W_DET[$win]="${akind}${dkind}"; W_AK[$win]="$akind"
@@ -1544,6 +1627,11 @@ EOF
                 log_event "$win" "$state" "${EV_SEED[$win]}"
             fi
         fi
+        # The quiet-restore mark is one-shot: consumed by the read that saw
+        # it (logged above if the state moved, which it does with it).
+        if [ -n "${W_QUIET[$win]:-}" ]; then
+            tmux set-option -uw -t "$win" @agent_quiet 2>/dev/null
+        fi
         wac="${W_WAC[$win]:-}"
         since="${W_SINCE[$win]:-}"
         # MID-TICK HEARTBEAT. The heartbeat means "the loop is turning", and a
@@ -1594,6 +1682,18 @@ EOF
                     state=idle
                 fi ;;
         esac
+        # ...and the attention state an agent-originated turn is holding for
+        # its quiet restore (AGENT-ORIGINATED TURNS): seen the same way, so
+        # the restore can't re-tint what Mack already looked at. Red is left
+        # alone here too. Asks the front app only for a watched window.
+        case "${W_PRIOR[$win]:-}" in
+            done|needs-input)
+                if viewed_now "$wac"; then
+                    tmux set-option -w -t "$win" @agent_prior_state idle \; \
+                         set-option -w -t "$win" @agent_seen_at "$tick_now" 2>/dev/null
+                    W_PRIOR[$win]=idle
+                fi ;;
+        esac
         has_agent=0; [ -n "$pid" ] && has_agent=1
         # BIRTH GRACE (see its note): a fresh mark with no agent yet holds the
         # window off the GC; the agent arriving retires the mark.
@@ -1608,7 +1708,8 @@ EOF
             fi
         fi
         # A leftover sidebar kind/detail is collectable exactly like a summary.
-        has_summary=0; [ -n "${W_SUM[$win]:-}${W_DET[$win]:-}" ] && has_summary=1
+        # So is a leftover @agent_prior_state (AGENT-ORIGINATED TURNS).
+        has_summary=0; [ -n "${W_SUM[$win]:-}${W_DET[$win]:-}${W_PRIOR[$win]:-}" ] && has_summary=1
         had_wf=0; [ -n "${W_WF[$win]:-}" ] && had_wf=1
         had_cua=0; [ -n "${W_CUA[$win]:-}" ] && had_cua=1
 
@@ -1767,7 +1868,16 @@ EOF
             done
             n=$((n + 1))
             if [ "$n" -ge 3 ]; then
-                if [ "$cx_full" = 1 ]; then
+                if [ -n "${W_PRIOR[$win]:-}" ]; then
+                    # An agent-originated turn ended here (its work drained, Esc,
+                    # a missed Stop, a codex turn end): restore, never tint.
+                    if prior_restore "$win" "$wac"; then
+                        changed=1; state_moved=1; since="$r_since"; pending=""; fin="$r_state"
+                        W_PRIOR[$win]=""
+                    else
+                        fin="$state"   # nothing written: the window is as read
+                    fi
+                elif [ "$cx_full" = 1 ]; then
                     # The Stop path's viewing_now: a finish the user is
                     # looking at is not tinted.
                     cx_seen=0
@@ -1785,7 +1895,11 @@ EOF
                     fi
                     tmux "${cx_cmd[@]}" 2>/dev/null && { changed=1; state_moved=1; since="$tick_now $fin"; pending=""; }
                 else
-                    tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && { changed=1; state_moved=1; }
+                    # The bg-pending release lands here (and in prior_restore):
+                    # no background work is out any more, so nobody owns any
+                    # (@agent_bg_owner, AGENT-ORIGINATED TURNS). Same call.
+                    tmux set-option -w -t "$win" @agent_state idle \; \
+                         set-option -uw -t "$win" @agent_bg_owner 2>/dev/null && { changed=1; state_moved=1; }
                 fi
                 state=$fin
             else
@@ -1824,6 +1938,13 @@ EOF
                      set-option -uw -t "$win" @agent_detail_kind \; \
                      set-option -uw -t "$win" @agent_detail \; \
                      set-option -uw -t "$win" @agent_born 2>/dev/null
+                # The agent-origin bookkeeping goes with the session (one
+                # call), as clear_state drops it.
+                gc_cmd=()
+                for o in "${ORIGIN_OPTS[@]}"; do
+                    gc_cmd+=(${gc_cmd[0]+\;} set-option -uw -t "$win" "$o")
+                done
+                tmux "${gc_cmd[@]}" 2>/dev/null
                 # A discharge, as clear_state's: the stamp outlives the unsets.
                 if [ -n "$state" ]; then
                     tmux set-option -w -t "$win" @agent_seen_at "$tick_now" 2>/dev/null

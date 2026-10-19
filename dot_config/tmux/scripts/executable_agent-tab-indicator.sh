@@ -103,7 +103,9 @@
 #                                      other attention state (focus ≠ fixed)
 #                                      and discharged by the focus hook.
 #   done         Stop                → turn finished; refresh @agent_summary;
-#                                      not tinted if a client is watching it
+#                                      not tinted if a client is watching it;
+#                                      a turn ANOTHER AGENT started finishes
+#                                      quiet (AGENT-ORIGINATED TURNS below)
 #   clear        SessionEnd          → remove state (skipped for clear/resume,
 #                                      which are followed by a new SessionStart)
 #   clear-current  focus hook        → attention states → idle once seen;
@@ -127,6 +129,14 @@ command -v tmux >/dev/null 2>&1 || exit 0
 
 mode="${1:-}"
 agent="${2:-}"
+# UserPromptSubmit's stdout is CONTEXT for the model (Claude adds plain text
+# to the prompt; both Claude and Codex read hookSpecificOutput JSON). The only
+# thing this hook may ever print there is the agent-origin additionalContext
+# (see AGENT-ORIGINATED TURNS), written explicitly to fd 3. Everything else -
+# a stray tmux message, a helper's echo - goes to /dev/null.
+if [ "$mode" = running ]; then
+    exec 3>&1 1>/dev/null
+fi
 # The sidebar detail the next set_state writes (see set_state/take_detail).
 dkind=""
 dtext=""
@@ -135,6 +145,11 @@ pend_op=""
 ss_wrote=0
 # set_state's discharge flag: 1 stamps @agent_seen_at (see set_state).
 seen_op=""
+# set_state's @agent_since override ("<epoch> <state>", used only when the
+# state changes; a quiet finish restores the stamp the window had) and extra
+# tmux commands to run in the SAME command list (ss_add). Both consumed.
+ss_since=""
+ss_extra=()
 
 JQ="$(command -v jq || true)"
 # Codex hooks run in a shared app-server. Its inherited TMUX_PANE belongs to
@@ -529,15 +544,22 @@ set_state() {
     # NOTICE even when the state itself was already idle (the hooks race).
     # CuaNotch's contract: never unset, always the latest discharge; it acks
     # a done/input row whose stamp is no earlier than 1 s before the row's.
+    #
+    # ss_since / ss_extra (globals, consumed like dkind): the AGENT-ORIGINATED
+    # TURNS bookkeeping (@agent_turn_origin, @agent_turn_result, the
+    # @agent_prior_* save/restore, @agent_inbound) rides in this same command
+    # list, so the notch never reads a turn result ahead of the state it
+    # describes, and a restored state never pairs with a fresh stamp.
     local win="$1" new="$2" dk="$dkind" dt="$dtext" po="$pend_op" so="$seen_op" cur ts
-    local -a cmd=()
-    dkind=""; dtext=""; pend_op=""; seen_op=""; ss_wrote=0
+    local sv="$ss_since"
+    local -a cmd=() ex=(${ss_extra[@]+"${ss_extra[@]}"})
+    dkind=""; dtext=""; pend_op=""; seen_op=""; ss_wrote=0; ss_since=""; ss_extra=()
     owns_window "$win" || return 0
     cur=$(window_state "$win")
     if [ "$cur" != "$new" ]; then
         printf -v ts '%(%s)T' -1 2>/dev/null || ts=$(date +%s)
         cmd=(set-option -w -t "$win" @agent_state "$new" \;
-             set-option -w -t "$win" @agent_since "$ts $new")
+             set-option -w -t "$win" @agent_since "${sv:-$ts $new}")
     fi
     if [ "$dk" = - ]; then
         cmd+=(${cmd[0]+\;} set-option -uw -t "$win" @agent_detail_kind \;
@@ -556,6 +578,7 @@ set_state() {
         [ -n "${ts:-}" ] || { printf -v ts '%(%s)T' -1 2>/dev/null || ts=$(date +%s); }
         cmd+=(${cmd[0]+\;} set-option -w -t "$win" @agent_seen_at "$ts")
     fi
+    [ "${#ex[@]}" -gt 0 ] && cmd+=(${cmd[0]+\;} "${ex[@]}")
     [ "${#cmd[@]}" -gt 0 ] || return 0
     case "$agent" in
         claude|codex|opencode) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
@@ -625,6 +648,14 @@ clear_state() {
          set-option -uw -t "$win" @agent_detail_kind \; \
          set-option -uw -t "$win" @agent_detail \; \
          set-option -uw -t "$win" @agent_born 2>/dev/null || true
+    # AGENT-ORIGINATED TURNS: the session is gone, and so is every turn,
+    # message and flag that belonged to it (one call).
+    local -a ocmd=()
+    local o
+    for o in "${ORIGIN_OPTS[@]}"; do
+        ocmd+=(${ocmd[0]+\;} set-option -uw -t "$win" "$o")
+    done
+    tmux "${ocmd[@]}" 2>/dev/null || true
     if [ -n "$cur" ]; then
         # A discharge too (see seen_op in set_state): @agent_seen_at is the
         # one mark that survives the unsets, and is never unset itself.
@@ -636,6 +667,290 @@ clear_state() {
 
 clear_pending() {
     tmux set-option -uw -t "$1" @agent_pending 2>/dev/null || true
+}
+
+# ------------------------------------------------- agent-originated turns
+#
+# AGENT-ORIGINATED TURNS (docs/agent-tab-indicator.md, same heading). When a
+# turn was started by another agent (tmux-mcp's message_agent) rather than by
+# Mack, its finish is QUIET: the window goes back to exactly the attention
+# state it had before that turn (an unseen green stays green, idle stays
+# idle), no done tint. Loud instead when the agent flagged Mack
+# (@agent_for_user, notify_user), when the turn failed, or when the turn's
+# origin is unknown. Options, all window-scope:
+#   @agent_inbound      written by tmux-mcp at delivery: "<epoch> <sha1> <from>
+#                       <for>" entries joined by "|", newest last. A prompt is
+#                       AGENT-VERIFIED iff an entry no older than 180 s has
+#                       sha1(trimmed prompt) or the prompt opens with
+#                       "[message from @<from>]"; the match is removed.
+#                       for=user (a reply to a message Mack's own turn sent)
+#                       counts as Mack's.
+#   @agent_turn_origin  "<user|agent> <turn_id> <from|->", per turn.
+#   @agent_turn_result  "<turn_id> loud" | "<turn_id> quiet <restored_state>"
+#                       at Stop (CuaNotch's hook reads it).
+#   @agent_prior_state / _since / _detail_kind / _detail   the attention state
+#                       saved when an agent turn began; restored on a quiet
+#                       finish, by this hook or (bg-held, Esc, codex turn end)
+#                       by the watcher. Set only while an agent-origin turn's
+#                       finish is pending.
+#   @agent_inbound_seen verified messages that arrived MID-turn, same format,
+#                       for Claude's split case (an unseen prompt_id at Stop).
+#   @agent_for_user     "<epoch> <reason>", set by notify_user /
+#                       agent-notify-user.sh; cleared when an agent turn starts.
+#   @agent_awaiting     tmux-mcp's own (on a sender's window), unset with the
+#                       session.
+#   @agent_quiet        "<from|->": one-shot mark set with a quiet restore;
+#                       the watcher logs that transition as "↩ replied to
+#                       @from" (detail_kind `quiet`) and unsets it.
+#   @agent_bg_owner     user | agent: whose turn's background work is still
+#                       out. Set by a Stop HELD running for it (loud turn ->
+#                       user, quiet -> agent; sticky toward user), unset by
+#                       any Stop that is not held and by the watcher's
+#                       release when the work drains. A wake-up (the work
+#                       reporting back) inherits THIS origin, not whatever
+#                       turn ran in between.
+ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_prior_since
+             @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
+             @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner)
+PRIOR_OPTS=(@agent_prior_state @agent_prior_since @agent_prior_detail_kind @agent_prior_detail)
+INBOUND_TTL=180
+US=$'\x1f'
+
+# ss_add CMD...: one more tmux command for the next set_state's command list.
+ss_add() {
+    [ "${#ss_extra[@]}" -eq 0 ] || ss_extra+=(\;)
+    ss_extra+=("$@")
+}
+prior_unset() {
+    local o
+    for o in "${PRIOR_OPTS[@]}"; do ss_add set-option -uw -t "$1" "$o"; done
+}
+
+# origin_read WIN: everything the origin logic needs in ONE tmux call. The
+# leading "x" is a sentinel: a read that did not come back from a format
+# expansion (a failed call) leaves every field empty, which classifies as an
+# unknown origin, i.e. LOUD. Free text rides last (details are sanitized to
+# one control-free line; the for_user reason, written by tmux-mcp, last of
+# all so a stray separator in it can only shorten itself).
+origin_read() {
+    local out x
+    O_ORIGIN=""; O_STATE=""; O_SINCE=""; O_DK=""; O_PSTATE=""; O_PSINCE=""; O_PDK=""
+    O_INB=""; O_SEEN=""; O_DT=""; O_PDT=""; O_FORUSER=""; O_RESULT=""; O_BGOWN=""
+    O_OKIND=""; O_OTID=""; O_OFROM=""
+    out=$(tmux display-message -p -t "$1" "x${US}#{@agent_turn_origin}${US}#{@agent_state}${US}#{@agent_since}${US}#{@agent_detail_kind}${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_result}${US}#{@agent_bg_owner}${US}#{@agent_inbound}${US}#{@agent_inbound_seen}${US}#{@agent_detail}${US}#{@agent_prior_detail}${US}#{@agent_for_user}" 2>/dev/null || true)
+    case "$out" in "x$US"*) ;; *) return 0 ;; esac
+    IFS="$US" read -r x O_ORIGIN O_STATE O_SINCE O_DK O_PSTATE O_PSINCE O_PDK O_RESULT O_BGOWN O_INB O_SEEN O_DT O_PDT O_FORUSER <<<"$out" || true
+    case "$O_BGOWN" in user|agent) ;; *) O_BGOWN="" ;; esac
+    O_OKIND=""; O_OTID=""; O_OFROM=""
+    read -r O_OKIND O_OTID O_OFROM _ <<<"$O_ORIGIN" || true
+    case "$O_OKIND" in user|agent) ;; *) O_OKIND=""; O_OTID=""; O_OFROM="" ;; esac
+    O_OFROM="${O_OFROM//[^A-Za-z0-9_.-]/}"
+}
+
+# The one jq for a turn event: line 1 the turn id (Claude prompt_id, Codex
+# turn_id, "-" when absent or not a plain token), line 2 the sender handle when
+# the prompt opens with "[message from @h]" (after leading whitespace), line 3
+# "sys" when the prompt is harness-injected - a <task-notification> (a
+# background task/agent reporting back; it fires UserPromptSubmit with a new
+# prompt_id) or a subagent hand-back - which neither starts a turn of its own
+# origin nor upgrades one: it inherits. Bounded slice before the regex.
+TURN_JQ='
+(.prompt_id // .turn_id // "" | tostring | .[0:128]
+ | if test("^[A-Za-z0-9_.:-]+$") then . else "-" end),
+(.prompt // "" | tostring | .[0:600]
+ | ((capture("^[ \\t\\r\\n]*\\[message from @(?<h>[^\\]\\s|]{1,64})\\]") // {h: ""}).h),
+   (if test("^[ \\t\\r\\n]*(<task-notification>|Another Claude session sent a message:\\s*<agent-message )")
+    then "sys" else "" end))'
+
+# Trim leading/trailing space, tab, CR, LF (the set tmux-mcp trims before it
+# hashes) in LINEAR time: explode + two early-exit scans. A regex rtrim is
+# quadratic on long whitespace runs (see DETAIL_JQ's note on bounding).
+TRIM_JQ='
+def ws: . == 32 or . == 9 or . == 13 or . == 10;
+def trimws: tostring | explode as $c | ($c | length) as $n
+  | (first(range(0; $n) | select($c[.] | ws | not)) // $n) as $a
+  | (first(range($n - 1; $a - 1; -1) | select($c[.] | ws | not)) // ($a - 1)) as $b
+  | $c[$a:$b + 1] | implode;
+'
+
+# sha1 hex of stdin, or nothing. openssl is a C binary (~5 ms); shasum is
+# perl (~40 ms), the fallback.
+sha1_stdin() {
+    local out
+    if command -v openssl >/dev/null 2>&1; then
+        out=$(openssl dgst -sha1 -r 2>/dev/null) || out=""
+    else
+        out=$(shasum -a 1 2>/dev/null) || out=""
+    fi
+    out="${out%% *}"
+    [[ $out =~ ^[0-9a-f]{40}$ ]] && printf '%s' "$out"
+    return 0
+}
+
+# prompt_sha1 raw|lf: sha1 of the payload's FULL prompt, trimmed (tmux-mcp
+# hashes the full trimmed UTF-8 body it delivered). jq -j writes the exact
+# trimmed string, no newline added, straight into the hash: no $(...) ever
+# holds the text, so nothing is stripped. `lf` first turns CRLF and CR into
+# LF (split/join: linear, unlike gsub). Only computed when a fresh inbound
+# entry exists, so an ordinary prompt never pays for it.
+prompt_sha1() {
+    local s f='.prompt // "" | tostring'
+    [ "$1" = lf ] && f="$f"' | split("\r\n") | join("\n") | split("\r") | join("\n")'
+    s=$("$JQ" -j "$TRIM_JQ$f"' | trimws' <<<"$payload" 2>/dev/null | sha1_stdin) || s=""
+    printf '%s' "$s"
+}
+
+# seen_for SHA: the <for> of an @agent_inbound_seen entry with that hash.
+seen_for() {
+    local e ep sh fr fo
+    local -a ents=()
+    IFS='|' read -ra ents <<<"$O_SEEN" || true
+    for e in ${ents[@]+"${ents[@]}"}; do
+        read -r ep sh fr fo _ <<<"$e" || true
+        [ "$sh" = "$1" ] && { printf '%s' "${fo:-agent}"; return 0; }
+    done
+    return 0
+}
+
+# split_classify ID TRANSCRIPT: the origin of a Claude turn whose Stop carries
+# a prompt_id no UserPromptSubmit announced. Two ways that happens:
+#   * the SPLIT case: a prompt queued while the model wrote its final text
+#     runs as its own turn with a new id and no UserPromptSubmit;
+#   * a harness wake-up (a background task reporting back) that skipped the
+#     hook.
+# The transcript's `user` row carrying that promptId says which: Claude
+# records origin.kind ("human" for typed/queued prompts, "task-notification"
+# for injected ones; promptSource typed|queued|system, isMeta). A human row is
+# classified by @agent_inbound_seen's hash (its <for>) or the
+# "[message from @" opener; anything else INHERITS the current origin. Only
+# the last 1 MB is read (a grep for the id first, so jq sees only that turn's
+# rows). Prints agent | user | inherit; nothing found prints user (LOUD).
+split_classify() {
+    local id="$1" tp="$2" out kind pre txt h fo
+    out=$(tail -c 1048576 "$tp" 2>/dev/null | grep -F "\"promptId\":\"$id\"" \
+        | "$JQ" -Rrn --arg id "$id" "$TRIM_JQ"'
+            first(inputs | fromjson? | objects
+              | select(.type == "user" and .promptId == $id)
+              | . as $r | ($r.message.content) as $c
+              | (if ($c | type) == "string" then $c
+                 elif ($c | type) == "array" then
+                   ([$c[] | select(type == "object" and .type == "text") | .text] | if length > 0 then join("\n") else empty end)
+                 else empty end) as $t
+              | (if ($r.origin.kind // "") == "human" or ($r.promptSource // "") == "typed"
+                    or ($r.promptSource // "") == "queued" then "human" else "sys" end)
+                + "\t" + ($t | trimws | if startswith("[message from @") then "P" else "-" end)
+                + "\t" + ($t | trimws))' 2>/dev/null || true)
+    if [ -z "$out" ]; then printf user; return 0; fi
+    kind="${out%%$'\t'*}"; out="${out#*$'\t'}"
+    pre="${out%%$'\t'*}"; txt="${out#*$'\t'}"
+    if [ "$kind" != human ]; then printf inherit; return 0; fi
+    if [ -n "$O_SEEN" ]; then
+        # As typed, then with CR/CRLF line ends as LF (see prompt_sha1).
+        local t2="${txt//$'\r\n'/$'\n'}"
+        t2="${t2//$'\r'/$'\n'}"
+        for t2 in "$txt" "$t2"; do
+            h=$(printf '%s' "$t2" | sha1_stdin)
+            [ -n "$h" ] || continue
+            fo=$(seen_for "$h")
+            case "$fo" in user) printf user; return 0 ;; agent) printf agent; return 0 ;; esac
+        done
+    fi
+    if [ "$pre" = P ]; then printf agent; else printf user; fi
+}
+
+# prior_save WIN: queue (ss_add) the save of WIN's current attention state as
+# the prior an agent-originated turn's quiet finish restores. A window still
+# `running` (a Stop held by background work) is not a state to come back to:
+#   - a prior an earlier agent turn saved (and maybe Mack has since seen and
+#     clear-current downgraded) stays as it is;
+#   - else Mack's own turn that already ENDED loud and is only held for its
+#     background work: a green he has not seen yet, so the prior is `done`
+#     (that turn's done detail if the window still shows it);
+#   - else idle.
+prior_save() {
+    local win="$1"
+    case "$O_STATE" in
+        running|"")
+            # Held for Mack's background work: @agent_bg_owner says so. The
+            # verdict test is the fallback for a window marked before that
+            # option existed; it matches any `loud` (a Claude split turn's
+            # loud Stop carries a newer id than the origin's), which is safe
+            # because a new agent turn cannot start while a USER turn is
+            # still in flight - a ping then joins that turn instead.
+            if [ -n "$O_PSTATE" ]; then
+                :
+            elif [ "$O_STATE" = running ] && { [ "$O_BGOWN" = user ] || \
+               { [ -z "$O_BGOWN" ] && [ "$O_OKIND" = user ] && [[ $O_RESULT == *" loud" ]]; }; }; then
+                local now
+                printf -v now '%(%s)T' -1 2>/dev/null || now=$(now_epoch)
+                ss_add set-option -w -t "$win" @agent_prior_state done
+                ss_add set-option -w -t "$win" @agent_prior_since "$now done"
+                if [ "$O_DK" = done ]; then
+                    ss_add set-option -w -t "$win" @agent_prior_detail_kind done
+                    ss_add set-option -w -t "$win" @agent_prior_detail "$O_DT"
+                else
+                    ss_add set-option -uw -t "$win" @agent_prior_detail_kind
+                    ss_add set-option -uw -t "$win" @agent_prior_detail
+                fi
+            else
+                ss_add set-option -w -t "$win" @agent_prior_state idle
+            fi ;;
+        *)
+            ss_add set-option -w -t "$win" @agent_prior_state "$O_STATE"
+            if [ -n "$O_SINCE" ]; then ss_add set-option -w -t "$win" @agent_prior_since "$O_SINCE"
+            else ss_add set-option -uw -t "$win" @agent_prior_since; fi
+            if [ -n "$O_DK" ]; then
+                ss_add set-option -w -t "$win" @agent_prior_detail_kind "$O_DK"
+                ss_add set-option -w -t "$win" @agent_prior_detail "$O_DT"
+            else
+                ss_add set-option -uw -t "$win" @agent_prior_detail_kind
+                ss_add set-option -uw -t "$win" @agent_prior_detail
+            fi ;;
+    esac
+}
+
+# prior_restore WIN: set up the next set_state to put WIN back to the saved
+# prior attention state (quiet finish). Seen-it rules apply to what comes
+# back: a done or needs-input restored while Mack is looking (viewing_now)
+# lands as idle, stamped seen, exactly as a watched Stop would; red is never
+# discharged by being watched. The stamp the window had comes back with it
+# when it still describes that state. Sets R_STATE.
+prior_restore() {
+    local win="$1" ps="${O_PSTATE:-idle}"
+    case "$ps" in idle|done|needs-input|failed) ;; *) ps=idle ;; esac
+    case "$ps" in
+        done|needs-input) if viewing_now; then ps=idle; seen_op=1; fi ;;
+    esac
+    ss_since=""
+    if [[ $O_PSINCE =~ ^[0-9]{1,18}\ (.+)$ ]] && [ "${BASH_REMATCH[1]}" = "$ps" ]; then
+        ss_since="$O_PSINCE"
+    fi
+    if [ -n "$O_PDK" ]; then dkind="$O_PDK"; dtext="$O_PDT"; else dkind=-; dtext=""; fi
+    pend_op=unset
+    prior_unset "$win"
+    R_STATE="$ps"
+}
+
+# stop_fields: S_ID (the turn id, as TURN_JQ's line 1) and S_TP (Claude's
+# transcript_path) from the payload, one jq.
+stop_fields() {
+    local out=""
+    s_id=-; s_tp=""
+    if [ -n "$JQ" ] && [ -n "$payload" ]; then
+        out=$("$JQ" -r '(.prompt_id // .turn_id // "" | tostring | .[0:128]
+                         | if test("^[A-Za-z0-9_.:-]+$") then . else "-" end),
+                        (.transcript_path // "" | tostring | gsub("[\\r\\n]"; " "))' \
+              <<<"$payload" 2>/dev/null || true)
+    fi
+    { IFS= read -r s_id; IFS= read -r s_tp; } <<<"$out" || true
+    [ -n "$s_id" ] || s_id=-
+}
+
+# A for_user reason as a sidebar detail: DETAIL_JQ's own sanitizer.
+reason_detail() {
+    local r="$1"
+    case "$r" in [0-9]*" "*) r="${r#* }" ;; esac
+    printf '%s' "$r" | "$JQ" -Rr "$DETAIL_JQ"'clean' 2>/dev/null | head -n 1 || true
 }
 
 
@@ -1256,7 +1571,24 @@ if [ "$mode" = "clear-current" ]; then
         win=$(tmux display-message -p '#{window_id}' 2>/dev/null || true)
     fi
     [ -n "$win" ] || exit 0
-    case "$(window_state "$win")" in
+    cc_state=$(window_state "$win")
+    # AGENT-ORIGINATED TURNS: while an agent-started turn runs, the window
+    # holds the attention state it had before (@agent_prior_state) for a quiet
+    # finish to restore. Mack has now looked at the window, so that state is
+    # seen: downgrade a saved done/needs-input/failed to idle (stamped seen),
+    # or the quiet restore would re-tint something he already looked at. One
+    # extra read, only for a window that is mid-turn or idle (prior is never
+    # set otherwise).
+    case "$cc_state" in
+        running|idle|needs-*)
+            case "$(tmux show-options -wqv -t "$win" @agent_prior_state 2>/dev/null || true)" in
+                done|needs-input|failed)
+                    tmux set-option -w -t "$win" @agent_prior_state idle \; \
+                         set-option -w -t "$win" @agent_seen_at "$(now_epoch)" 2>/dev/null || true
+                    ;;
+            esac ;;
+    esac
+    case "$cc_state" in
         needs-*)
             # The user came to answer the prompt. Discharge the tint, but
             # stamp @agent_pending so the next heartbeat can restore
@@ -1500,7 +1832,16 @@ fi
 # A session with no row yet is presumed interactive (rows land within the
 # first turn, and a wrong "interactive" guess only refreshes the tab early).
 if [ "$agent" = codex ] && [ -n "$JQ" ] && [ -n "$payload" ]; then
-    case "$("$JQ" -r '.prompt // empty' <<<"$payload" 2>/dev/null | head -c 40)" in
+    # Also by its cwd: codex 0.162's memory agent runs in ~/.codex/memories
+    # and fires UserPromptSubmit too (seen in the agent-origin spike); it
+    # must never touch the tab or the agent-origin bookkeeping. Same one jq.
+    cx_head=$("$JQ" -r '(.cwd // "" | tostring | gsub("[\\r\\n]"; " ")),
+                        (.prompt // "" | tostring | .[0:40] | gsub("[\\r\\n]"; " "))' \
+              <<<"$payload" 2>/dev/null || true)
+    case "${cx_head%%$'\n'*}" in
+        "$HOME/.codex/memories"|"$HOME/.codex/memories/"*) exit 0 ;;
+    esac
+    case "${cx_head#*$'\n'}" in
         "You are a Memory Writing Agent"*) exit 0 ;;
     esac
     csid=$("$JQ" -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)
@@ -1552,7 +1893,16 @@ case "$mode" in
         # the OpenCode plugin sees the turn end in MessageAbortedError (Esc).
         # Keep the conversation label, but discharge working/attention state.
         case "$agent" in codex|opencode) ;; *) exit 0 ;; esac
-        set_state "$win" idle
+        # An interrupted agent-originated turn ends like a quiet one: back to
+        # the attention state the window had before it (AGENT-ORIGINATED
+        # TURNS), seen-it rules included.
+        origin_read "$win"
+        if [ -n "$O_PSTATE" ]; then
+            prior_restore "$win"
+            set_state "$win" "$R_STATE"
+        else
+            set_state "$win" idle
+        fi
         clear_pending "$win"
         ;;
     reconcile)
@@ -1576,6 +1926,7 @@ case "$mode" in
             [ "$src" = "compact" ] && exit 0
         fi
         dkind=-   # SessionStart: a new conversation has no detail yet
+        prior_unset "$win"   # no turn is in flight in a fresh/resumed session
         set_state "$win" idle
         clear_pending "$win"
         # Drift state is per session and only ever read for the live one:
@@ -1600,8 +1951,159 @@ case "$mode" in
         fi
         ;;
     running)
+        # AGENT-ORIGINATED TURNS: who started this turn? See the section's
+        # header for the options and docs/agent-tab-indicator.md for the
+        # rules. One tmux read + one jq always; the prompt hash (jq|openssl)
+        # only when a fresh @agent_inbound entry exists to match it against.
+        origin_read "$win"
+        ctx_from=""
+        if [ -n "$JQ" ] && [ -n "$payload" ]; then
+            tj=$("$JQ" -r "$TURN_JQ" <<<"$payload" 2>/dev/null || true)
+        else
+            tj=""
+        fi
+        { IFS= read -r t_id; IFS= read -r t_pre; IFS= read -r t_sys; } <<<"$tj" || true
+        [ -n "$t_id" ] || t_id=-
+        printf -v t_now '%(%s)T' -1 2>/dev/null || t_now=$(now_epoch)
+        # Match the prompt against the pending inbound messages.
+        v_ok=0; v_for=""; v_from=""; v_sha=""
+        inb_keep=""; inb_changed=0
+        ents=()
+        IFS='|' read -ra ents <<<"$O_INB" || true
+        fresh=()
+        for i in ${ents[@]+"${!ents[@]}"}; do
+            read -r ep sh fr fo _ <<<"${ents[i]}" || true
+            if [[ $ep =~ ^[0-9]{1,18}$ ]] && [[ $sh =~ ^[0-9a-f]{40}$ ]] \
+               && [ $((t_now - 10#$ep)) -le "$INBOUND_TTL" ] && [ $((10#$ep - t_now)) -le 60 ]; then
+                fresh+=("$i")
+            fi
+        done
+        m=-1
+        if [ "${#fresh[@]}" -gt 0 ] && [ "$t_sys" != sys ]; then
+            p_sha=$(prompt_sha1 raw)
+            for i in "${fresh[@]}"; do
+                read -r ep sh fr fo _ <<<"${ents[i]}" || true
+                if [ -n "$p_sha" ] && [ "$sh" = "$p_sha" ]; then m=$i; break; fi
+            done
+            # tmux's paste-buffer (without -r) turns LF into CR, so a
+            # multi-line message can reach the prompt with CR or CRLF line
+            # ends while tmux-mcp hashed it with LF: try that form too, only
+            # when the raw hash missed.
+            if [ "$m" -lt 0 ]; then
+                p_sha2=$(prompt_sha1 lf)
+                if [ -n "$p_sha2" ] && [ "$p_sha2" != "$p_sha" ]; then
+                    for i in "${fresh[@]}"; do
+                        read -r ep sh fr fo _ <<<"${ents[i]}" || true
+                        if [ "$sh" = "$p_sha2" ]; then m=$i; p_sha=$p_sha2; break; fi
+                    done
+                fi
+            fi
+            if [ "$m" -lt 0 ] && [ -n "$t_pre" ]; then
+                for i in "${fresh[@]}"; do
+                    read -r ep sh fr fo _ <<<"${ents[i]}" || true
+                    if [ "$fr" = "$t_pre" ]; then m=$i; break; fi
+                done
+            fi
+            if [ "$m" -ge 0 ]; then
+                read -r ep sh fr fo _ <<<"${ents[m]}" || true
+                # The handle reaches tmux argv (and the event log) only as
+                # [A-Za-z0-9_.-]: tmux-mcp writes it, but a trailing `;` in
+                # an argv element would end the command list.
+                v_from="${fr//[^A-Za-z0-9_.-]/}"
+                v_ok=1; v_from="${v_from:--}"; v_for="${fo:-agent}"; v_sha="${p_sha:-$sh}"
+                [ "$v_for" = user ] || v_for=agent
+            fi
+        fi
+        # Keep every other FRESH entry; the match and anything stale go.
+        if [ "${#ents[@]}" -gt 0 ]; then
+            for i in "${!ents[@]}"; do
+                [ "$i" = "$m" ] && continue
+                case " ${fresh[*]-} " in *" $i "*) inb_keep="${inb_keep:+$inb_keep|}${ents[i]}" ;; esac
+            done
+            [ "$inb_keep" = "$O_INB" ] || inb_changed=1
+        fi
+        agent_msg=0
+        [ "$v_ok" = 1 ] && [ "$v_for" = agent ] && agent_msg=1
+        # New turn or the running one? By id; an agent without turn ids
+        # (OpenCode, "-") starts a new turn whenever it is not mid-turn.
+        t_new=0
+        if [ -z "$O_OKIND" ] || [ "$O_OTID" != "$t_id" ]; then
+            t_new=1
+        elif [ "$t_id" = - ]; then
+            case "$O_STATE" in running|needs-input) ;; *) t_new=1 ;; esac
+        fi
+        if [ "$t_new" = 1 ]; then
+            if [ "$t_sys" = sys ] && [ -n "${O_BGOWN:-$O_OKIND}" ]; then
+                # A harness wake-up (a background task or subagent reporting
+                # back) continues the work of the turn that launched it:
+                # INHERIT its origin. That is @agent_bg_owner when a held Stop
+                # recorded whose work is out - an agent turn may have run in
+                # between, and Mack's own background result must still be
+                # loud - else the current origin. A quiet turn's background
+                # work stays quiet; Mack's stays loud.
+                t_inh="${O_BGOWN:-$O_OKIND}"
+                if [ "$t_inh" = user ]; then
+                    ss_add set-option -w -t "$win" @agent_turn_origin "user $t_id -"
+                    prior_unset "$win"
+                else
+                    t_ifrom=-
+                    [ "$O_OKIND" = agent ] && t_ifrom="${O_OFROM:--}"
+                    ss_add set-option -w -t "$win" @agent_turn_origin "agent $t_id $t_ifrom"
+                    # An agent turn whose quiet finish already restored
+                    # (prior consumed) is waking up for its background work:
+                    # the window's state now is again the one to come back to.
+                    if [ -z "$O_PSTATE" ]; then
+                        case "$O_STATE" in running|"") ;; *) prior_save "$win" ;; esac
+                    fi
+                fi
+            elif [ "$agent_msg" = 1 ]; then
+                ss_add set-option -w -t "$win" @agent_turn_origin "agent $t_id $v_from"
+                prior_save "$win"   # the attention state to come back to
+                ss_add set-option -uw -t "$win" @agent_for_user
+                ctx_from="$v_from"
+            else
+                ss_add set-option -w -t "$win" @agent_turn_origin "user $t_id -"
+                prior_unset "$win"
+            fi
+        else
+            # Same turn. Mack typing into an agent's turn makes it his
+            # (upgrade only, never back); a harness wake-up changes nothing.
+            if [ "$agent_msg" = 0 ] && [ "$t_sys" != sys ] && [ "$O_OKIND" = agent ]; then
+                ss_add set-option -w -t "$win" @agent_turn_origin "user $O_OTID -"
+                prior_unset "$win"
+            fi
+            # A verified message mid-turn may yet run as its own turn (Claude's
+            # split case): remember it, with its <for>, for that Stop.
+            if [ "$v_ok" = 1 ]; then
+                # Oldest first, at most 8 with this one.
+                ents=()
+                IFS='|' read -ra ents <<<"$O_SEEN" || true
+                n=${#ents[@]}
+                [ "$n" -gt 7 ] && ents=("${ents[@]:$((n - 7))}")
+                seen_new=""
+                for e in ${ents[@]+"${ents[@]}"}; do seen_new="${seen_new:+$seen_new|}$e"; done
+                seen_new="${seen_new:+$seen_new|}$t_now $v_sha $v_from $v_for"
+                ss_add set-option -w -t "$win" @agent_inbound_seen "$seen_new"
+            fi
+        fi
+        if [ "$inb_changed" = 1 ]; then
+            if [ -n "$inb_keep" ]; then ss_add set-option -w -t "$win" @agent_inbound "$inb_keep"
+            else ss_add set-option -uw -t "$win" @agent_inbound; fi
+        fi
+        # A quiet restore's log mark never outlives it into a new turn (no
+        # watcher tick in between, or a deploy window): free, same call.
+        ss_add set-option -uw -t "$win" @agent_quiet
         take_detail running run
         set_state "$win" running
+        if [ -n "$ctx_from" ] && [ "$ss_wrote" = 1 ]; then
+            # The model is told why nobody will be watching for its finish,
+            # and how to flag Mack when it should. A handle reaches the JSON
+            # only as [A-Za-z0-9_.-].
+            ctx_h="${ctx_from//[^A-Za-z0-9_.-]/}"
+            if [ -n "$ctx_h" ] && [ "$ctx_h" != - ]; then ctx_who="@$ctx_h"; else ctx_who="another agent"; fi
+            printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"%s"}}\n' \
+                "This turn was started by a message from $ctx_who, not by Mack. Mack will not be notified when you finish — his tab stays as it was. If your result needs Mack's own attention or a decision from him, call the tmux MCP tool \`notify_user\` with a one-line reason before you finish (fallback: run \`~/.config/tmux/scripts/agent-notify-user.sh \\\"<reason>\\\"\`). Don't use it for routine replies to $ctx_who." >&3 2>/dev/null || true
+        fi
         clear_pending "$win"
         # After the state write (it is what the user is waiting to see),
         # before the summary (which reads what the detector just decided).
@@ -1643,6 +2145,12 @@ case "$mode" in
         fi
         if viewing_now; then
             pend_op=set; seen_op=1   # in the state's own command, as clear-current
+            # Mack is looking at the window: a done/needs-input saved for an
+            # agent turn's quiet restore is seen now too (AGENT-ORIGINATED
+            # TURNS; red is not discharged by being watched).
+            case "$(tmux show-options -wqv -t "$win" @agent_prior_state 2>/dev/null || true)" in
+                done|needs-input) ss_add set-option -w -t "$win" @agent_prior_state idle ;;
+            esac
             set_state "$win" idle
             [ "$ss_wrote" = 1 ] || tmux set-option -w -t "$win" @agent_pending "$(now_epoch)" 2>/dev/null || true
         else
@@ -1652,6 +2160,12 @@ case "$mode" in
     failed)
         # The turn itself died (529, overloaded). RED, and red now means
         # exactly this — nothing is waiting on an answer, something broke.
+        # Loud in any turn, agent-originated included: a failure is never
+        # quiet (AGENT-ORIGINATED TURNS). The turn result and the dropped
+        # prior ride in the state's own command list.
+        stop_fields
+        ss_add set-option -w -t "$win" @agent_turn_result "$s_id loud"
+        prior_unset "$win"
         take_detail failed fail "turn failed"
         set_state "$win" failed
         ;;
@@ -1676,6 +2190,82 @@ case "$mode" in
         # The detail is the Stop's either way: even a turn held `running` by
         # background work has a final message worth showing.
         take_detail done done "turn finished"
+        # AGENT-ORIGINATED TURNS: loud or quiet? The Stop carries the id of
+        # the turn's UserPromptSubmit; an id nobody announced is Claude's
+        # split case or a harness wake-up, settled from the transcript row.
+        origin_read "$win"
+        stop_fields
+        s_cls=user; s_unseen=0
+        if [ -n "$O_OKIND" ] && [ "$s_id" = "$O_OTID" ]; then
+            s_cls="$O_OKIND"
+        else
+            s_unseen=1
+            if [ "$agent" = claude ] && [ "$s_id" != - ] && [ -n "$s_tp" ] && [ -f "$s_tp" ] && [ -n "$JQ" ]; then
+                s_cls=$(split_classify "$s_id" "$s_tp")
+                # A wake-up continues the current turn's origin (unknown:
+                # loud). Record it, so the next event of this turn agrees.
+                if [ "$s_cls" = inherit ]; then
+                    # From whoever's background work is out, as in running.
+                    s_cls="${O_BGOWN:-${O_OKIND:-user}}"
+                    if [ -n "$O_BGOWN$O_OKIND" ]; then
+                        s_ifrom=-
+                        [ "$s_cls" = agent ] && [ "$O_OKIND" = agent ] && s_ifrom="${O_OFROM:--}"
+                        ss_add set-option -w -t "$win" @agent_turn_origin "$s_cls $s_id $s_ifrom"
+                    fi
+                fi
+            fi
+        fi
+        s_quiet=0
+        if [ "$s_cls" = agent ]; then
+            if [ -n "$O_FORUSER" ]; then
+                # The agent flagged Mack (notify_user): a normal loud finish,
+                # with its reason as the detail.
+                r=$(reason_detail "$O_FORUSER")
+                [ -z "$r" ] || { dkind=done; dtext="$r"; }
+            else
+                s_quiet=1
+            fi
+        fi
+        # @agent_bg_owner: a Stop HELD for background work records whose work
+        # it is (quiet -> agent, loud -> user; never user -> agent, so Mack's
+        # work out under an agent turn keeps its claim); a Stop that is not
+        # held clears it - nothing of this turn is out any more.
+        if [ "$bg_pending" -eq 1 ]; then
+            s_own=user
+            [ "$s_quiet" = 1 ] && [ "$O_BGOWN" != user ] && s_own=agent
+            ss_add set-option -w -t "$win" @agent_bg_owner "$s_own"
+        else
+            ss_add set-option -uw -t "$win" @agent_bg_owner
+        fi
+        if [ "$s_quiet" = 1 ]; then
+            if [ "$bg_pending" -eq 1 ]; then
+                # Held running for its background work, prior kept: the
+                # watcher restores it when the work drains (or a wake-up
+                # turn's own quiet Stop does).
+                ss_add set-option -w -t "$win" @agent_turn_result "$s_id quiet running"
+                set_state "$win" running
+            elif [ "$s_unseen" = 1 ] && [ -z "$O_PSTATE" ]; then
+                # A split-case turn that never went `running`: there is
+                # nothing to restore - leave the window exactly as it is.
+                dkind=""; dtext=""
+                cur_st=$(window_state "$win")
+                ss_add set-option -w -t "$win" @agent_turn_result "$s_id quiet ${cur_st:-idle}"
+                set_state "$win" "${cur_st:-idle}"
+            else
+                prior_restore "$win"
+                ss_add set-option -w -t "$win" @agent_turn_result "$s_id quiet $R_STATE"
+                # The watcher's event log describes this transition as the
+                # reply it was ("↩ replied to @from"), not as a fresh finish
+                # carrying the restored detail; it consumes the mark.
+                ss_add set-option -w -t "$win" @agent_quiet "${O_OFROM:--}"
+                set_state "$win" "$R_STATE"
+            fi
+            compose_summary "$win" "$(extract_summary "$payload")" "$payload"
+            exit 0
+        fi
+        ss_add set-option -w -t "$win" @agent_turn_result "$s_id loud"
+        ss_add set-option -uw -t "$win" @agent_quiet   # never logged as a reply
+        prior_unset "$win"
         if [ "$bg_pending" -eq 1 ]; then
             set_state "$win" running
             compose_summary "$win" "$(extract_summary "$payload")" "$payload"
