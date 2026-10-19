@@ -1489,24 +1489,33 @@ format_session_reset_text() {
 # based on how far out the projection lands (see format_projected_daytime):
 # weekday name for the near term, month+day for projections that would
 # otherwise be ambiguous as a bare weekday.
+#
+# $6, when given, is the reset to SHOW, and $1 stays the one the run-out
+# projection is measured against. They differ for a pooled window: the level
+# beside this view is the pool's, so the reset shown is the pool's (see "THE
+# POOL RESET"), but the projection is the active account's own (its raw
+# percent, its history-keyed rate, its elapsed share of its own window), and
+# a projection is only comparable with the reset of the same scope. The
+# projected time itself is absolute, so it reads correctly beside either.
 format_weekly_reset_text() {
   local resets_at="$1" used="$2" window_minutes="$3" now="$4" mode="${5:-weekly}"
+  local shown="${6:-$1}"
 
   local time_until reset_daytime
-  time_until="$(format_time_until_reset "$resets_at" "$now")"
+  time_until="$(format_time_until_reset "$shown" "$now")"
 
   if [[ "$time_until" != "--" && "$window_minutes" =~ ^[0-9]+$ ]]; then
     local duration delta
     duration=$(( window_minutes * 60 ))
-    delta=$(( resets_at - now ))
+    delta=$(( shown - now ))
     if (( duration <= 0 || delta > duration )); then
       time_until='--'
     fi
   fi
 
   reset_daytime=''
-  if [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
-    reset_daytime="$(format_short_daytime "$resets_at" 2>/dev/null || true)"
+  if [[ "$shown" =~ ^[0-9]+$ ]] && (( shown > now )); then
+    reset_daytime="$(format_short_daytime "$shown" 2>/dev/null || true)"
   fi
 
   if [[ -n "${reset_daytime:-}" && "$time_until" != "--" ]]; then
@@ -1643,6 +1652,8 @@ load_cache_fields() {
   CACHE_SCOPED_USED=''
   CACHE_SCOPED_WINDOW_MINUTES=''
   CACHE_SCOPED_LABEL=''
+  CACHE_WEEKLY_POOL_RESETS=''
+  CACHE_SCOPED_POOL_RESETS=''
   CACHE_OTHER_ACCOUNT=0
 
   [[ -f "$CACHE_FILE" ]] || return 0
@@ -1654,12 +1665,23 @@ load_cache_fields() {
   # open, which slid the weekly reset into CACHE_SESSION_RESETS and pushed the
   # tail fields off the end. Use a non-whitespace separator (US, \037) so empty
   # fields survive; @tsv escapes any literal tab in a value, so this is lossless.
+  #
+  # The two trailing fields are the reset view's POOL RESET candidates (see
+  # "THE POOL RESET" at POOL_PACE_JQ), for the weekly and scoped windows:
+  # when <w>_pace is scope "pool", its horizon times ascending and then its
+  # resets_at, space-separated; empty in account scope. pool_reset_at picks
+  # the first one past now. They are APPENDED so every field before them
+  # keeps its position, and they are computed in this same jq rather than a
+  # second one, because this runs on every status tick. The candidates, not
+  # the answer: "past now" needs now, and now is a `date` fork that only the
+  # reset view pays (render_text_for_mode), not every tick.
   local parsed
   parsed="$(jq -r --arg p "$provider" --arg primary "$PROVIDER_PRIMARY" \
-    '((.providers[$p]? // (if $p == $primary then . else {} end)) // {}) | [.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//"", .scoped_text//"", .scoped_color//"", .scoped_resets_at//"", .scoped_used//"", .scoped_window_minutes//"", .scoped_label//""] | @tsv' \
+    'def pool_resets($pc): if ($pc | type) == "object" and $pc.scope == "pool" then ([ ($pc.horizons // []) | arrays | .[] | objects | .at | numbers ] | sort) + [ $pc.resets_at | numbers ] | map(tostring) | join(" ") else "" end;
+    ((.providers[$p]? // (if $p == $primary then . else {} end)) // {}) | [.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//"", .scoped_text//"", .scoped_color//"", .scoped_resets_at//"", .scoped_used//"", .scoped_window_minutes//"", .scoped_label//"", pool_resets(.weekly_pace), pool_resets(.scoped_pace)] | @tsv' \
     "$CACHE_FILE" 2>/dev/null | tr '\t' '\037' || true)"
   [[ -n "$parsed" ]] || return 0
-  IFS=$'\037' read -r CACHE_STATE CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES CACHE_SCOPED_TEXT CACHE_SCOPED_COLOR CACHE_SCOPED_RESETS CACHE_SCOPED_USED CACHE_SCOPED_WINDOW_MINUTES CACHE_SCOPED_LABEL <<<"$parsed"
+  IFS=$'\037' read -r CACHE_STATE CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES CACHE_SCOPED_TEXT CACHE_SCOPED_COLOR CACHE_SCOPED_RESETS CACHE_SCOPED_USED CACHE_SCOPED_WINDOW_MINUTES CACHE_SCOPED_LABEL CACHE_WEEKLY_POOL_RESETS CACHE_SCOPED_POOL_RESETS <<<"$parsed"
 
   # Another account's numbers are not this account's usage. Draw them as
   # unknown, in gray, until a fetch (or a live sample) for the account that is
@@ -1670,6 +1692,23 @@ load_cache_fields() {
     CACHE_WEEKLY_COLOR='brightblack'
     CACHE_SCOPED_COLOR='brightblack'
   fi
+}
+
+# The reset to show beside a pooled level: the first of load_cache_fields'
+# pool candidates ($1, epochs ascending then resets_at) past $2, else the
+# block's own reset ($3). In account scope the candidates are empty and this
+# is just $3. Answers in POOL_RESET_SHOWN, not on stdout: builtins only, no
+# $(…) subshell, since it runs in the status line's reset view.
+POOL_RESET_SHOWN=''
+pool_reset_at() {
+  local candidates="$1" now="$2" t
+  POOL_RESET_SHOWN="$3"
+  for t in $candidates; do
+    if [[ "$t" =~ ^[0-9]+$ ]] && (( t > now )); then
+      POOL_RESET_SHOWN="$t"
+      return 0
+    fi
+  done
 }
 
 render_text_for_mode() {
@@ -1701,11 +1740,16 @@ render_text_for_mode() {
           out="$(format_session_reset_text "$resets_at" "$used" "$window_minutes" "$now")"
         fi
         ;;
+      # The weekly windows may be pooled: the level next door in the percent
+      # view is then the pool's, so the reset shown is the pool's too, while
+      # the run-out projection stays the active account's (used, resets_at
+      # and the history are all its own; see format_weekly_reset_text).
       weekly)
         resets_at="$CACHE_WEEKLY_RESETS"
         used="$CACHE_WEEKLY_USED"
         window_minutes="$CACHE_WEEKLY_WINDOW_MINUTES"
-        out="$(format_weekly_reset_text "$resets_at" "$used" "$window_minutes" "$now")"
+        pool_reset_at "$CACHE_WEEKLY_POOL_RESETS" "$now" "$resets_at"
+        out="$(format_weekly_reset_text "$resets_at" "$used" "$window_minutes" "$now" "weekly" "$POOL_RESET_SHOWN")"
         ;;
       scoped)
         resets_at="$CACHE_SCOPED_RESETS"
@@ -1715,7 +1759,8 @@ render_text_for_mode() {
           # The provider reported no narrower scoped window at all.
           out='n/a'
         else
-          out="$(format_weekly_reset_text "$resets_at" "$used" "$window_minutes" "$now" "scoped")"
+          pool_reset_at "$CACHE_SCOPED_POOL_RESETS" "$now" "$resets_at"
+          out="$(format_weekly_reset_text "$resets_at" "$used" "$window_minutes" "$now" "scoped" "$POOL_RESET_SHOWN")"
         fi
         ;;
     esac
@@ -1836,8 +1881,14 @@ publish_to_tmux_opts() {
 #   @codex_<w>_expected  where pace says the level should be now:
 #                        used − delta, clamped to 0..100
 #   @codex_<w>_delta     signed pace delta, "+17" / "-4"
-#   @codex_<w>_resets    the logged-in account's next reset (epoch), as the
-#                        block has it
+#   @codex_<w>_resets    the next reset (epoch) of whatever @codex_<w>_used
+#                        measures: in pool scope the POOL reset (the first
+#                        horizon past now, else <w>_pace.resets_at, else the
+#                        block's; see "THE POOL RESET"), otherwise the
+#                        logged-in account's own, as the block has it. "Now"
+#                        is this publish: the options are only rewritten
+#                        with the cache, so a pool reset that passes before
+#                        the next rewrite stays until then
 #   @codex_<w>_members   "slot:used:active:cap,..." ("1:90:0:90,2:32:1:100")
 #                        in pool scope, cap being the member's limit (100
 #                        minus its weekly reserve; 100 for no reserve and
@@ -1895,10 +1946,20 @@ publish_pace_opts() {
     touch -r "$CACHE_FILE" "$stamp" 2>/dev/null || stamp=''
   fi
 
-  local line=''
+  local line='' now
   if [[ -f "$CACHE_FILE" && "${CACHE_OTHER_ACCOUNT:-0}" != 1 && "${CACHE_STATE:-ok}" != 'auth_required' ]]; then
-    line="$(jq -r --arg p "$DISPLAY_PROVIDER" --arg primary "$PROVIDER_PRIMARY" '
+    now="$(now_epoch)"
+    [[ "$now" =~ ^[0-9]+$ ]] || now=0
+    line="$(jq -r --arg p "$DISPLAY_PROVIDER" --arg primary "$PROVIDER_PRIMARY" --argjson now "$now" '
       def signed: if . >= 0 then "+\(.)" else "\(.)" end;
+      # The pool reset (see "THE POOL RESET" at POOL_PACE_JQ): the first
+      # horizon past $now, else the published resets_at when still ahead,
+      # else the block reset passed in. A cache from before resets_at has
+      # horizons, so it gets the pool reset too.
+      def pool_reset($pc; $own):
+        ([ ($pc.horizons // []) | arrays | .[] | objects | .at | numbers | select(. > $now) ] | min)
+        // ($pc.resets_at | numbers | select(. > $now))
+        // $own;
       ((.providers[$p]? // (if $p == $primary then . else {} end)) // {}) as $b
       | [ "session", "weekly", "scoped" ]
       | map(. as $k | ($b[$k + "_pace"]) as $pc
@@ -1910,7 +1971,9 @@ publish_pace_opts() {
                 | [ ($pc.used | tostring),
                     (if $d == null then "" else ([[($pc.used - $d), 0] | max, 100] | min | tostring) end),
                     (if $d == null then "" else ($d | signed) end),
-                    ($b[$k + "_resets_at"] | if type == "number" then tostring else "" end),
+                    ($b[$k + "_resets_at"]
+                     | if $pc.scope == "pool" then pool_reset($pc; .) else . end
+                     | if type == "number" then tostring else "" end),
                     (if $pc.scope == "pool"
                      then [ ($pc.members // [])[]
                             | "\(.slot // "")" + ":" + "\(.used)" + ":" + (if .active then "1" else "0" end)
@@ -3132,8 +3195,8 @@ json_int_or_null() {
 # horizons are exact rather than rounded):
 #
 #   {scope: "pool"|"account", accounts: n, capacity: C (pool only),
-#    window_minutes: W, used: <pool level>, horizons: [{at, avail}],
-#    delta: <int or null, at updated_at>,
+#    window_minutes: W, used: <pool level>, resets_at: <epoch> (pool only),
+#    horizons: [{at, avail}], delta: <int or null, at updated_at>,
 #    members: [{slot, email, used, resets_at, active, as_of, cap (pool only)}]}
 #
 # A member's used is its own reading, not clamped to its cap (90% at cap 90
@@ -3142,12 +3205,32 @@ json_int_or_null() {
 # evaluating delta(now) take C = capacity when it is a number with
 # 0 < C <= 100·accounts, else 100·accounts (a cache from before caps).
 #
+# THE POOL RESET. resets_at is min(t_i), the earliest member reset (each one
+# already rolled forward, so it is past updated_at): the pool's next refill,
+# and the first horizon's at. The block's <family>_resets_at stays the
+# ACTIVE account's own reset (history keying, the live merge and alerts key
+# on it), and in the pool case it is usually NOT the next refill: with slot 1
+# at its cap resetting in 2 hours and the active slot 2 in 33, the level
+# drops at slot 1's reset, so "resets in 33h" beside the pooled level was
+# the wrong account's clock. So wherever the POOLED level is shown, the reset
+# shown beside it is the pool's, read as: the first horizon at > now, else
+# resets_at when > now, else the block's <family>_resets_at. Horizons first,
+# so a reset that passes between two writes moves on to the next one, as
+# delta(now) does. Scope "account" has no resets_at: its reset IS the block's.
+# Per-account rows keep each member's own resets_at, and a run-out ETA made
+# from the active account's own percent and rate keeps the active account's
+# reset: a projection is compared with the reset of its own scope.
+#
 # The worked example above publishes, as weekly_pace:
 #
 #   {scope: "pool", accounts: 2, capacity: 190, window_minutes: 10080,
-#    used: 64, horizons: [{at: t1, avail: 68}, {at: t2, avail: 158}],
+#    used: 64, resets_at: t1,
+#    horizons: [{at: t1, avail: 68}, {at: t2, avail: 158}],
 #    delta: 22, members: [{slot: "1", used: 90, cap: 90, active: false, …},
 #                         {slot: "2", used: 32, cap: 100, active: true, …}]}
+#
+# (resets_at t1, ~4.04 days out: account 1 refills by 90 then, not account
+# 2 at ~5.33 days.)
 #
 # and in the pool case <family>_text is the pool's level and delta,
 # "64% (+22%)" (a pooled session reads "idle" when the active account is
@@ -3280,8 +3363,11 @@ POOL_PACE_JQ='
               | ([ $ms[] | [.cap - .used, 0] | max ] | add) as $base
               | [ ([ $ms[].resets_at ] | unique)[] as $T
                   | {at: $T, avail: ($base + ([ $ms[] | select(.resets_at < $T) | .cap ] | add // 0))} ] as $hz
+              # resets_at: the pool reset, the earliest member reset. Every
+              # member reset was rolled forward above, so it is past $now.
               | {scope: "pool", accounts: $n, capacity: $C, window_minutes: $Wm,
                  used: (100 * ([ $ms[] | [.used, .cap] | min ] | add) / $C | round_away),
+                 resets_at: ([ $ms[].resets_at ] | min),
                  horizons: $hz,
                  delta: ([ $hz[] | select(.at - $now > 0 and .at - $now <= $W)
                            | (100 * (.at - $now) / $W) - (100 * .avail / $C) ]

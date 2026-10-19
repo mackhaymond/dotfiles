@@ -259,6 +259,8 @@ class PoolPaceTestCase(unittest.TestCase):
         self.assertEqual(pace['delta'], delta)
         self.assertEqual(len(pace['members']), 1)
         self.assertTrue(pace['members'][0]['active'])
+        # No pool reset in account scope: the block's own reset is the one.
+        self.assertNotIn('resets_at', pace)
 
 
 class WorkedExampleTests(PoolPaceTestCase):
@@ -269,7 +271,7 @@ class WorkedExampleTests(PoolPaceTestCase):
         weekly = block['weekly_pace']
         self.assertEqual(weekly, {
             'scope': 'pool', 'accounts': 2, 'capacity': 200, 'window_minutes': 10080,
-            'used': 59,
+            'used': 59, 'resets_at': A1_WEEKLY_RESETS,
             'horizons': [{'at': A1_WEEKLY_RESETS, 'avail': 83},
                          {'at': A2_WEEKLY_RESETS, 'avail': 183}],
             'delta': 16,
@@ -308,16 +310,18 @@ class WorkedExampleTests(PoolPaceTestCase):
                          reference_delta([(2, A1_WEEKLY_RESETS), (2, A2_WEEKLY_RESETS)], WEEK_W))
         self.assertEqual(block['scoped_text'], f"2% ({scoped['delta']:+d}%)")
 
-        # The plain-number options, all fifteen in one tmux invocation.
+        # The plain-number options, all fifteen in one tmux invocation. The
+        # pooled windows' resets are the POOL's (account 1's, the earlier);
+        # the session's is the active account's own.
         self.assertEqual(self.home.pace_opts(), {
             '@codex_session_used': '12', '@codex_session_expected': '20',
             '@codex_session_delta': '-8', '@codex_session_resets': str(A2_SESSION_RESETS),
             '@codex_session_members': '',
             '@codex_weekly_used': '59', '@codex_weekly_expected': '43',
-            '@codex_weekly_delta': '+16', '@codex_weekly_resets': str(A2_WEEKLY_RESETS),
+            '@codex_weekly_delta': '+16', '@codex_weekly_resets': str(A1_WEEKLY_RESETS),
             '@codex_weekly_members': '1:90:0:100,2:27:1:100',
             '@codex_scoped_used': '2', '@codex_scoped_expected': '42',
-            '@codex_scoped_delta': '-40', '@codex_scoped_resets': str(A2_WEEKLY_RESETS),
+            '@codex_scoped_delta': '-40', '@codex_scoped_resets': str(A1_WEEKLY_RESETS),
             '@codex_scoped_members': '1:2:0:100,2:2:1:100',
         })
 
@@ -866,6 +870,135 @@ class PublishTests(PoolPaceTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.home.published('@codex_weekly_text'), '--%')
         self.assertEqual(set(self.home.pace_opts().values()), {''})
+
+
+class PoolResetTests(PoolPaceTestCase):
+    """The pool reset: the earliest member reset, shown wherever the pooled
+    level is (the @codex_<w>_resets option and the status line's reset view),
+    while the block's <w>_resets_at stays the active account's own."""
+
+    def edit_pace(self, family, **fields):
+        """Rewrite fields of the cached <family>_pace in place (a cache whose
+        horizons have partly passed since it was written, or an older shape)."""
+        data = json.loads(self.home.usage.read_text())
+        data['providers']['claude'][f'{family}_pace'].update(fields)
+        self.home.usage.write_text(json.dumps(data))
+
+    def publish_resets(self):
+        self.home.tmux_log.unlink(missing_ok=True)
+        result = subprocess.run(['/bin/bash', str(STATUS), '--publish'], capture_output=True,
+                                text=True, timeout=30, env=self.home.env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        opts = self.home.pace_opts()
+        return opts['@codex_weekly_resets'], opts['@codex_scoped_resets']
+
+    def reset_view(self, mode):
+        """What the status-line module prints for `mode` in the reset view."""
+        stub = self.home.bin / 'tmux'
+        stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >>"$FAKE_TMUX_LOG"\n'
+                        'case "$1" in show-options) echo "@codexbar_view reset" ;; esac\n')
+        env = self.home.env()
+        env.pop('CODEXBAR_USAGE_FORCE_REFRESH')
+        result = subprocess.run(['/bin/bash', str(STATUS), mode], capture_output=True,
+                                text=True, timeout=30, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_resets_at_is_the_earliest_member_reset(self):
+        self.home.cswap()
+        block = self.home.refresh()
+        self.assertEqual(block['weekly_pace']['resets_at'], A1_WEEKLY_RESETS)
+        self.assertEqual(block['weekly_pace']['resets_at'], block['weekly_pace']['horizons'][0]['at'])
+        self.assertEqual(block['scoped_pace']['resets_at'], A1_WEEKLY_RESETS)
+        # The block's own resets stay the active account's.
+        self.assertEqual(block['weekly_resets_at'], A2_WEEKLY_RESETS)
+        self.assertEqual(block['scoped_resets_at'], A2_WEEKLY_RESETS)
+        # The session is never pooled, so it has none.
+        self.assertNotIn('resets_at', block['session_pace'])
+        # The ACTIVE account resetting first: it is the pool reset.
+        self.home.endpoint(weekly_resets=NOW + HOUR)
+        self.assertEqual(self.home.refresh()['weekly_pace']['resets_at'], NOW + HOUR)
+
+    def test_a_rolled_forward_member_reset_counts_as_rolled(self):
+        # Slot 1's reset passed 3 days ago: it rolled to NOW + 4 days, which is
+        # before the active account's (NOW + 6.5 days), so it is the pool reset.
+        passed = NOW - 3 * DAY
+        slot1 = {'fetchedAt': NOW - 60,
+                 'lastGood': {'five_hour': {'pct': 0.0, 'resets_at': None},
+                              'seven_day': {'pct': 90.0, 'resets_at': iso_cswap(passed)},
+                              'scoped': []}}
+        self.home.cswap(slot1=slot1)
+        active_resets = NOW + int(6.5 * DAY)
+        self.home.endpoint(weekly_resets=active_resets)
+        weekly = self.home.refresh()['weekly_pace']
+        self.assertEqual(weekly['members'][0]['resets_at'], passed + WEEK_W)
+        self.assertEqual(weekly['resets_at'], passed + WEEK_W)
+        self.assertEqual(self.publish_resets()[0], str(passed + WEEK_W))
+        # Rolled forward past the active account's reset: the active one is first.
+        slot1['lastGood']['seven_day']['resets_at'] = iso_cswap(NOW - HOUR)
+        self.home.cswap(slot1=slot1)
+        self.home.endpoint()
+        weekly = self.home.refresh()['weekly_pace']
+        self.assertEqual(weekly['members'][0]['resets_at'], NOW - HOUR + WEEK_W)
+        self.assertEqual(weekly['resets_at'], A2_WEEKLY_RESETS)
+
+    def test_resets_option_pool_vs_account_scope(self):
+        self.home.cswap()
+        self.home.refresh()
+        self.assertEqual(self.publish_resets(), (str(A1_WEEKLY_RESETS), str(A1_WEEKLY_RESETS)))
+        # Pool off: account scope, the active account's own reset.
+        self.home.refresh(CODEXBAR_USAGE_POOL_PACE='off')
+        self.assertEqual(self.publish_resets(), (str(A2_WEEKLY_RESETS), str(A2_WEEKLY_RESETS)))
+        # One live member: account scope too.
+        self.home.cswap(disabled=(1,))
+        self.home.refresh()
+        self.assertEqual(self.publish_resets(), (str(A2_WEEKLY_RESETS), str(A2_WEEKLY_RESETS)))
+
+    def test_resets_option_reads_past_a_passed_horizon(self):
+        self.home.cswap()
+        self.home.refresh()
+        # The first horizon has passed since the write: the next one, not it.
+        self.edit_pace('weekly', resets_at=NOW - 60,
+                       horizons=[{'at': NOW - 60, 'avail': 83}, {'at': A1_WEEKLY_RESETS, 'avail': 183}])
+        self.assertEqual(self.publish_resets()[0], str(A1_WEEKLY_RESETS))
+        # No horizons (an odd cache): resets_at, while it is ahead...
+        self.edit_pace('weekly', resets_at=A1_WEEKLY_RESETS, horizons=[])
+        self.assertEqual(self.publish_resets()[0], str(A1_WEEKLY_RESETS))
+        # ...then the block's own.
+        self.edit_pace('weekly', resets_at=NOW - 60, horizons=[])
+        self.assertEqual(self.publish_resets()[0], str(A2_WEEKLY_RESETS))
+        # A cache from before resets_at: the horizons alone give the pool reset.
+        data = json.loads(self.home.usage.read_text())
+        del data['providers']['claude']['scoped_pace']['resets_at']
+        self.home.usage.write_text(json.dumps(data))
+        self.assertEqual(self.publish_resets()[1], str(A1_WEEKLY_RESETS))
+
+    def test_reset_view_shows_the_pool_reset(self):
+        # A1 is NOW + 4d0h57m, A2 NOW + 5d7h55m.
+        self.home.cswap()
+        self.home.refresh(CODEXBAR_USAGE_POOL_PACE='off')
+        account = {m: self.reset_view(m) for m in ('weekly', 'scoped')}
+        self.home.refresh()
+        pooled = {m: self.reset_view(m) for m in ('weekly', 'scoped')}
+        for mode in ('weekly', 'scoped'):
+            with self.subTest(mode=mode):
+                self.assertIn(' in 5d7h', account[mode])
+                self.assertIn(' in 4d0h', pooled[mode])
+                # The run-out projection is the active account's own in both
+                # (its percent, its rate, its reset), so it does not move.
+                self.assertEqual(account[mode].partition(' (')[1:],
+                                 pooled[mode].partition(' (')[1:])
+        self.assertNotEqual(self.reset_view('weekly').partition(' in ')[0],
+                            account['weekly'].partition(' in ')[0])
+        # A passed first horizon moves on to the next one, as delta(now) does.
+        self.edit_pace('weekly', resets_at=NOW - 60,
+                       horizons=[{'at': NOW - 60, 'avail': 83}, {'at': A2_WEEKLY_RESETS, 'avail': 183}])
+        self.assertEqual(self.reset_view('weekly'), account['weekly'])
+        # Nothing ahead: the block's own reset, as in account scope.
+        self.edit_pace('weekly', resets_at=NOW - 60, horizons=[{'at': NOW - 60, 'avail': 83}])
+        self.assertEqual(self.reset_view('weekly'), account['weekly'])
+        # The session view is untouched by any of it.
+        self.assertIn(self.reset_view('session').split(' ')[0], ('4h0m', '3h59m'))
 
 
 class ToggleAndFailureTests(PoolPaceTestCase):
