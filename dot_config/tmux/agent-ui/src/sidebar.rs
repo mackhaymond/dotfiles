@@ -962,8 +962,10 @@ mod tests {
     #[test]
     fn clicks_act_once_and_hand_focus_back() {
         let mut a = app();
-        // A click on the parked row (the last one) acts on the release-less press.
-        a.handle(b"\x1b[<0;3;30M\x1b[<0;3;30m");
+        // A click on the parked row (the dock's, over its bottom cap) acts on
+        // the release-less press.
+        let y = a.shown.parked.start + 1;
+        a.handle(format!("\x1b[<0;3;{y}M\x1b[<0;3;{y}m").as_bytes());
         assert_eq!((a.focus_backs, a.last_act.clone()), (1, Some(Target::Stash)));
         // Motion and releases alone do nothing.
         a.last_act = None;
@@ -1269,7 +1271,7 @@ mod tests {
         a.bar.toasts = vec![toast(3, t0, 60.0)];
         let frame = |a: &App| layout(&a.view, 34, 30, &Opts { bar: a.shown_bar(), now: Some(text::now()), ..Opts::default() });
         a.shown = frame(&a);
-        // One card: its top border, one line of text, its bottom border.
+        // One card (its title row, one line of text) and the blank row under it.
         assert_eq!(a.shown.toast, 0..3);
         let l = left(&a);
         assert!(l > Duration::from_secs(55) && l <= Duration::from_secs(61), "{l:?}");

@@ -24,23 +24,29 @@ pub const HEX: [(&str, &str); 16] = [
 /// carry no agent state, so the cross-surface check has nothing to compare
 /// them with. Never give a state its colour from this table.
 ///
+/// `overlay1` is fainter still, only for a card's placeholder line (`no
+/// reply yet`): never information, still 3:1 on every card shade.
+///
 /// `overlay2` is the dim text for a SURFACE (a pill, a card tint, a lifted
 /// row): `overlay` there is under 3:1, overlay2 about 4-4.5:1, and still
 /// below `sub`, so the hierarchy holds.
 ///
-/// The sidebar's raised surfaces (its "tiles": agent cards, the usage
-/// panel, shell buttons) come in two shades, a zebra: every card is ONE
-/// colour, and cards stacked edge to edge alternate `tile` (the lighter,
-/// between the canvas `base` and `surface0`) and `tile_lo` (darker, but
-/// plainly off the canvas, so an empty row of a card still reads as part
-/// of it), so neighbours part with no gap between them. `tile_hi` (about
-/// `blue` at 18% over the canvas) lifts the client's own agent (both rows)
-/// and the active shell.
-pub const UI: [(&str, &str); 10] = [
+/// The sidebar paints its own canvas, `mantle` ([`CANVAS`]): a shade under
+/// the terminals' `base`, so it reads as chrome beside them. Its raised
+/// surfaces (its "tiles": agent cards, shell buttons) come in two shades, a
+/// zebra: every card is ONE colour, and cards stacked edge to edge
+/// alternate `tile` (the lighter, between `base` and `surface0`) and
+/// `tile_lo` (darker, but plainly off the canvas, so an empty row of a
+/// card still reads as part of it), so neighbours part with no gap between
+/// them. The two panels (usage at the top, the dock at the bottom) are
+/// `tile_lo` too: never next to a card, always behind half-block caps.
+/// `tile_hi` (about `blue` at 18% over `base`) lifts the client's own
+/// agent (both rows) and the active shell.
+pub const UI: [(&str, &str); 11] = [
     ("base", "#1e1e2e"), ("mantle", "#181825"), ("surface2", "#585b70"),
     ("mauve", "#cba6f7"), ("lavender", "#b4befe"), ("sel", "#2a2b3d"),
     ("overlay2", "#9399b2"), ("tile", "#30314a"), ("tile_lo", "#28283b"),
-    ("tile_hi", "#31394f"),
+    ("tile_hi", "#31394f"), ("overlay1", "#7f849c"),
 ];
 
 /// The `#rrggbb` for a palette name ([`HEX`] first, then [`UI`]). Panics on
@@ -67,10 +73,11 @@ pub fn color(name: &str) -> Color {
     Color::Rgb(r, g, b)
 }
 
-/// The canvas the sidebar's tints are mixed over: WezTerm's (and tmux's)
-/// catppuccin-mocha background, which the sidebar leaves as the terminal's
-/// default everywhere it does not tint.
-pub const CANVAS: &str = "base";
+/// The canvas the sidebar paints under everything and mixes its tints
+/// over: catppuccin-mocha's `mantle` (OpenCode's `backgroundPanel`), one
+/// step darker than the terminals' `base`, so the sidebar is a surface of
+/// its own and never the terminal's default background.
+pub const CANVAS: &str = "mantle";
 
 /// `name` at `pct`% over [`CANVAS`]: the subtle surface a card or a
 /// highlighted row sits on (a NEEDS YOU card in its state's colour, the
@@ -111,9 +118,10 @@ mod tests {
         }
         assert_eq!(rgb("red"), (0xf3, 0x8b, 0xa8));
         assert_eq!(color("crust"), Color::Rgb(0x11, 0x11, 0x1b));
-        // Tints: the ends are the canvas and the colour itself.
-        assert_eq!((mix_rgb("red", 0), mix_rgb("red", 100)), (rgb("base"), rgb("red")));
-        assert_eq!(mix("yellow", 50), Color::Rgb(0x8c, 0x80, 0x6f));
+        // Tints: the ends are the canvas (mantle) and the colour itself.
+        assert_eq!(CANVAS, "mantle");
+        assert_eq!((mix_rgb("red", 0), mix_rgb("red", 100)), (rgb("mantle"), rgb("red")));
+        assert_eq!(mix("yellow", 50), Color::Rgb(0x89, 0x7d, 0x6a));
     }
 
     /// WCAG contrast of `fg` on `bg`.
@@ -133,17 +141,20 @@ mod tests {
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
     }
 
-    /// Dim text on the sidebar's surfaces reads (about 4:1 or better) and
-    /// stays below `sub` (the hierarchy); `overlay` there did not.
+    /// Dim text on the sidebar's surfaces (over the mantle canvas) reads
+    /// (about 4:1 or better) and stays below `sub` (the hierarchy);
+    /// `overlay` there did not. On the canvas itself the dim tier
+    /// (`overlay2`) is about 6:1 and the title tier (`text`) about 12:1.
     #[test]
     fn dim_text_on_surfaces_reads() {
         let bgs = [rgb("surface0"), mix_rgb("yellow", 14), mix_rgb("red", 14), mix_rgb("green", 14), mix_rgb("mauve", 18),
             rgb("tile"), rgb("tile_hi")];
         for bg in bgs {
             let c = contrast(rgb("overlay2"), bg);
-            assert!(c >= 3.9, "{bg:?}: {c:.2}");
+            assert!(c >= 4.0, "{bg:?}: {c:.2}");
             assert!(contrast(rgb("sub"), bg) > c);
             assert!(contrast(rgb("overlay"), bg) < 3.0, "{bg:?}");
+            assert!(contrast(rgb("text"), bg) >= 7.5, "{bg:?}");
         }
         // The zebra's darker shades sit nearer the canvas: dim text reads
         // there even better, still under `sub`.
@@ -151,20 +162,55 @@ mod tests {
             let c = contrast(rgb("overlay2"), bg);
             assert!(c >= 4.5 && contrast(rgb("sub"), bg) > c, "{bg:?}: {c:.2}");
         }
+        let canvas = rgb(CANVAS);
+        assert!(contrast(rgb("overlay2"), canvas) >= 6.0 && contrast(rgb("text"), canvas) >= 12.0);
+        // A placeholder (`overlay1`: `no reply yet`) is fainter than any
+        // detail on a card, but still 3:1.
+        for card in ["tile", "tile_lo", "tile_hi"] {
+            let c = contrast(rgb("overlay1"), rgb(card));
+            assert!(c >= 3.0 && c < contrast(rgb("overlay2"), rgb(card)), "{card}: {c:.2}");
+        }
     }
 
     /// The zebra: neighbouring cards' shades visibly apart, the darker one
-    /// plainly off the canvas (an empty row of its card must not read as a
-    /// gap), neither loud; the client's lift apart from both.
+    /// plainly off the (mantle) canvas (an empty row of its card must not
+    /// read as a gap), neither loud; the client's lift apart from both.
     #[test]
     fn card_tones_part_but_stay_quiet() {
-        let l = |n: &str| contrast(rgb(n), rgb("base"));
+        let l = |n: &str| contrast(rgb(n), rgb(CANVAS));
         assert!(rgb("tile_hi") != rgb("tile") && rgb("tile_hi").2 > rgb("tile").2 && rgb("tile_hi").1 > rgb("tile").1);
-        for (hi, lo) in [("tile", "tile_lo")] {
-            assert!(contrast(rgb(hi), rgb(lo)) > 1.1, "{hi}/{lo}: {:.3}", contrast(rgb(hi), rgb(lo)));
-            assert!(l(lo) > 1.12 && l(hi) < 1.6, "{hi}/{lo}: {:.3} {:.3}", l(lo), l(hi));
-        }
+        let (hi, lo) = ("tile", "tile_lo");
+        assert!(contrast(rgb(hi), rgb(lo)) > 1.1, "{hi}/{lo}: {:.3}", contrast(rgb(hi), rgb(lo)));
+        assert!(l(lo) > 1.18 && l(hi) < 1.6, "{hi}/{lo}: {:.3} {:.3}", l(lo), l(hi));
         assert_eq!(over_canvas(rgb("red"), 14), mix_rgb("red", 14));
+    }
+
+    /// Every surface stands off the canvas and off whatever can sit right
+    /// next to it: the zebra's shades and the client's lift (cards), the
+    /// NEEDS YOU tints (and their alternate), the stash selection, the
+    /// toasts' `surface0`, the panels (`tile_lo`). The canvas is darker than
+    /// the terminals' `base`, so the sidebar reads as chrome beside them.
+    #[test]
+    fn surfaces_stay_distinct_on_the_canvas() {
+        let dist = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            let d = |x: u8, y: u8| (f64::from(x) - f64::from(y)).powi(2);
+            (d(a.0, b.0) + d(a.1, b.1) + d(a.2, b.2)).sqrt()
+        };
+        let canvas = rgb(CANVAS);
+        assert!(contrast(rgb("base"), canvas) > 1.03 && rgb("base").2 > canvas.2);
+        let surfaces = [rgb("tile"), rgb("tile_lo"), rgb("tile_hi"), rgb("surface0"), mix_rgb("mauve", 18),
+            mix_rgb("yellow", 14), mix_rgb("yellow", 9), mix_rgb("red", 14), mix_rgb("red", 9), mix_rgb("green", 14), mix_rgb("green", 9)];
+        for s in surfaces {
+            assert!(contrast(s, canvas) > 1.15, "{s:?} on the canvas: {:.3}", contrast(s, canvas));
+        }
+        // Neighbours: cards in the zebra, the lift beside either shade, a
+        // NEEDS YOU card beside the next (same state: the other tint).
+        for (a, b) in [("tile", "tile_lo"), ("tile", "tile_hi"), ("tile_lo", "tile_hi")] {
+            assert!(dist(rgb(a), rgb(b)) >= 9.0, "{a}/{b}");
+        }
+        for hue in ["yellow", "red", "green"] {
+            assert!(dist(mix_rgb(hue, 14), mix_rgb(hue, 9)) >= 12.0, "{hue}");
+        }
     }
 
     #[test]

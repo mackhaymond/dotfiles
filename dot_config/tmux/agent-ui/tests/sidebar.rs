@@ -141,30 +141,25 @@ fn at(lines: &[String], p: &str) -> usize {
     lines.iter().position(|l| l.starts_with(p)).unwrap_or_else(|| panic!("{p:?} not in {lines:#?}"))
 }
 
-/// The status line's arrow (U+E0B0) the client's space chip ends in.
-const ARROW: char = '\u{e0b0}';
-
-/// `l` as words: the arrow a space, runs of spaces one, padded (` 1 main `).
+/// `l` as words: runs of spaces one, padded (` 1 main `).
 fn uncapped(l: &str) -> String {
-    format!(" {} ", l.replace(ARROW, " ").split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" "))
+    format!(" {} ", l.split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" "))
 }
 
-/// `l` is `name`'s space header in AGENTS: a band that starts at the very
-/// edge with its `▌` block (a SPACES row or a card starts on the canvas),
-/// then the space's number chip (when it has one) and its name (the
-/// client's chip ends in the arrow), then the branch and counts.
+/// `l` is `name`'s space header in AGENTS: past the edge (the client's
+/// `▌`, else the canvas), the space's ` N ` chip (blank without a ⌃N),
+/// a pad, then its name at the fifth cell (a card's letter sits at the
+/// fourth), then the branch and counts.
 fn is_group(l: &str, name: &str) -> bool {
-    let Some(rest) = l.strip_prefix('▌') else { return false };
-    let w: Vec<String> = uncapped(rest).split_whitespace().map(String::from).collect();
-    match w.as_slice() {
-        [n, s, ..] if n.chars().all(|c| c.is_ascii_digit()) => s == name,
-        [s, ..] => s == name,
-        _ => false,
+    let c: Vec<char> = l.chars().collect();
+    if c.len() < 6 || !matches!(c[0], ' ' | '▌') || c[1] != ' ' || c[3] != ' ' || c[4] != ' ' || !(c[2] == ' ' || c[2].is_ascii_digit()) {
+        return false;
     }
+    c[5..].iter().collect::<String>().split(' ').next() == Some(name)
 }
 
 /// The AGENTS section's lines: from its header to SHELLS, else to the
-/// SPACES section → (its first line, the lines).
+/// dock → (its first line, the lines).
 fn agents_section(lines: &[String]) -> (usize, &[String]) {
     let start = at(lines, " AGENTS");
     let end = lines.iter().position(|l| l.starts_with(" SHELLS")).unwrap_or_else(|| spaces_at(lines).0);
@@ -177,16 +172,15 @@ fn group(lines: &[String], name: &str) -> usize {
     start + part.iter().position(|l| is_group(l, name)).unwrap_or_else(|| panic!("no {name:?} header in AGENTS: {lines:#?}"))
 }
 
-/// Where the SPACES section starts (its header, else the gap above its
-/// chips) → (that line, the PARKED header's line).
+/// Where the dock starts (the gap above it) → (that line, the PARKED
+/// line).
 fn spaces_at(lines: &[String]) -> (usize, usize) {
-    let p = at(lines, " PARKED");
-    let s = lines[..p].iter().rposition(|l| l.starts_with(" SPACES"));
-    let s = s.unwrap_or_else(|| lines[..p - 1].iter().rposition(|l| l.trim().is_empty()).unwrap_or_else(|| panic!("no spaces: {lines:#?}")));
+    let p = at(lines, "  PARKED");
+    let s = lines[..p].iter().rposition(|l| l.trim().is_empty()).unwrap_or_else(|| panic!("no dock: {lines:#?}"));
     (s, p)
 }
 
-/// The SPACES section's text, as words.
+/// The dock's text (its spaces, its shells' line), as words.
 fn spaces_text(lines: &[String]) -> String {
     let (s, p) = spaces_at(lines);
     uncapped(&lines[s..p].join(" "))
@@ -208,34 +202,38 @@ fn once_renders_the_fixture() {
     assert!(lines[1..].iter().find(|l| !l.trim().is_empty()).unwrap().starts_with(" NEEDS YOU"));
     // Needs in agent-jump.sh order: failed first; each card starts with the
     // agent's letter key-cap (display order: work a s d, zeta f).
-    let fail = at(&lines, " ▌ f  Broken thing");
-    let ask = at(&lines, " ▌ a  proj/Which deck");
+    let fail = at(&lines, " ▌  f  Broken thing");
+    let ask = at(&lines, " ▌  a  proj/Which deck");
     assert!(fail < ask);
-    // Cards are tinted surfaces; the canvas is the terminal's own background
-    // (no background code at all) on the title and section headers.
-    assert!(raw[fail].contains(";48;2;"), "{:?}", raw[fail]);
-    // Then the agents, grouped by space under a header tile (no rule).
+    // Cards are tinted surfaces; the title and section headers sit on the
+    // sidebar's own canvas (mantle), never the terminal's default.
+    const CANVAS: &str = ";48;2;24;24;37";
+    assert!(raw[fail].matches(";48;2;").count() > raw[fail].matches(CANVAS).count(), "{:?}", raw[fail]);
+    // Then the agents, grouped by space under a header (no rule).
     let agents = at(&lines, " AGENTS");
     assert!(lines[agents].ends_with("all spaces "), "{lines:#?}");
     for y in [0, agents] {
-        assert!(!raw[y].contains(";48;"), "{:?}", raw[y]);
+        assert_eq!(raw[y].matches(";48;").count(), raw[y].matches(CANVAS).count(), "{:?}", raw[y]);
     }
-    // Each a tile: a canvas margin, its state stripe (none when idle), its key-cap.
-    for t in [" ▎ s  Long running", "   d  Quiet one", " ▎ a  Which deck", " ▎ f  Broken thing"] {
+    assert!(raw.iter().all(|l| l.contains(CANVAS)), "the canvas on every row");
+    // Each a tile: a canvas margin, its state rail (none when idle), its key-cap.
+    for t in [" ▎  s  Long running", "    d  Quiet one", " ▎  a  Which deck", " ▎  f  Broken thing"] {
         assert!(lines[agents..].iter().any(|l| l.starts_with(t)), "{t}: {lines:#?}");
     }
-    let s_row = lines.iter().find(|l| l.starts_with(" ▎ s  Long running")).unwrap();
+    let s_row = lines.iter().find(|l| l.starts_with(" ▎  s  Long running")).unwrap();
     assert!(s_row.contains(" ⚙ ") && s_row.ends_with("⠋ working  "), "{s_row:?}");
+    assert!(!lines.iter().any(|l| l.ends_with(" idle  ")), "no idle word: {lines:#?}");
     for t in ["work", "zeta"] {
         let y = group(&lines, t);
-        // A band tinted in the space's colour, never a rule.
-        assert!(!lines[y].contains('─') && raw[y].contains(";48;2;"), "{t}: {lines:#?}");
+        // Its chip solid in its colour (peach: none of its own), never a rule.
+        assert!(!lines[y].contains('─') && raw[y].contains(";48;2;250;179;135"), "{t}: {lines:#?}");
     }
-    // The spaces (each a row, or chips), then PARKED with nothing parked.
+    // The dock: the spaces (each a row, or chips), then PARKED with
+    // nothing parked, then its bottom cap.
     let pills = spaces_text(&lines);
     let pos: Vec<usize> = [" main ", " work ", " zeta "].iter().map(|n| pills.find(n).unwrap_or_else(|| panic!("{n}: {lines:#?}"))).collect();
     assert!(pos.windows(2).all(|p| p[0] < p[1]), "{lines:#?}");
-    assert!(lines[29].starts_with(" PARKED none"), "{lines:#?}");
+    assert!(lines[28].starts_with("  PARKED none") && lines[29].trim().chars().all(|c| c == '▀'), "{lines:#?}");
     assert!(!lines.iter().any(|l| l.starts_with(" log") || l.contains('═')), "{lines:#?}");
     // `--split` (gone) is ignored, not an error.
     assert_eq!(plain(&s.sidebar(&["--once", "34x30", "--client", CLIENT, "--split", "0.7"])), lines);
@@ -266,15 +264,15 @@ fn once_follows_the_scope_options() {
     let lines = once();
     let body = agents_part(&lines);
     // (The client's space: its chip ends in the arrow.)
-    assert!(body[0].ends_with(" ⌥V  this space  ") && is_group(&body[1], "work") && body[1].contains(ARROW) && body[1].contains("◉1 ◐1 ○1"),
+    assert!(body[0].ends_with(" ⌥V this space ") && is_group(&body[1], "work") && body[1].starts_with('▌') && body[1].contains("◉1 ◐1 ○1"),
         "{lines:#?}");
-    // (The client sits on work:1: its row is the highlighted one.)
-    for t in [" ▌ a  Which deck", " ▎ s  Long running", "   d  Quiet one"] {
+    // (The client sits on work:1: its card is the lifted one.)
+    for t in [" ▎  a  Which deck", " ▎  s  Long running", "    d  Quiet one"] {
         assert!(body.iter().any(|l| l.starts_with(t)), "{t}: {lines:#?}");
     }
     assert!(!body.iter().any(|l| l.contains("zeta") || l.contains("Broken")), "{lines:#?}");
     // NEEDS YOU stays global, with the same letters.
-    assert!(lines.iter().any(|l| l.starts_with(" ▌ f  Broken thing")), "{lines:#?}");
+    assert!(lines.iter().any(|l| l.starts_with(" ▌  f  Broken thing")), "{lines:#?}");
     s.tmux(&["set-option", "-g", "@strip_scope", "all"]);
     let lines = once();
     assert!(agents_part(&lines).iter().any(|l| is_group(l, "zeta")), "{lines:#?}");
@@ -292,7 +290,7 @@ fn once_follows_the_scope_options() {
     // ...it is the space's shell 1 in the SHELLS section (⌥1, ⌂), lifted:
     // the client is on it.
     let sh = lines.iter().position(|l| l.starts_with(" SHELLS")).unwrap_or_else(|| panic!("{lines:#?}"));
-    assert!(lines[sh + 1].starts_with(" ▌ ⌥1  ⌂ home"), "{lines:#?}");
+    assert!(lines[sh + 1].starts_with(" ▎  ⌥1  ⌂ home"), "{lines:#?}");
     group(&lines, "work");
 }
 
@@ -363,7 +361,7 @@ fn right_click_parks_through_stash_sh() {
     wait_for("the footer", || screen().contains("parked Quiet one") && screen().contains("PARKED  1"));
     // The parked line: prefix h's command, the sidebar's client in it.
     let lines: Vec<String> = screen().lines().map(String::from).collect();
-    let last = lines.iter().rposition(|l| l.starts_with(" PARKED")).unwrap() + 1;
+    let last = lines.iter().rposition(|l| l.starts_with("  PARKED")).unwrap() + 1;
     send(&format!("\x1b[<0;3;{last}M\x1b[<0;3;{last}m"));
     wait_for("the unstash", || std::fs::read_to_string(&log).unwrap_or_default().contains(&format!("unstash  {CLIENT}")));
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().next(), Some(format!("stash {win}").as_str()));
@@ -525,11 +523,11 @@ fn notify_toasts_in_the_sidebar_and_falls_back_without_one() {
     // A toast for this client.
     let t = Instant::now();
     assert!(notify(&s, &focus, &log, &["-c", &tty, "-k", "ok", "-t", "2", "--", "parked", "Canvas\tSyllabus"]).success());
-    wait_for("the toast", || screen().contains("│ parked Canvas Syllabus"));
+    wait_for("the toast", || screen().contains("┃ parked Canvas Syllabus"));
     assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
-    // A card: the kind's title in its top border.
+    // A card: the kind's glyph and title on its first row, between its bars.
     let top = screen().lines().next().unwrap_or_default().to_string();
-    assert!(top.starts_with(" ╭─ \u{f058} Done ─"), "{top:?}");
+    assert!(top.starts_with(" ┃ ✓ Done ") && top.ends_with(" ┃"), "{top:?}");
     // (Untrimmed: an empty title is a trailing tab.)
     let raw = s.tmux(&["show-options", "-gqv", "@toast"]);
     let f: Vec<&str> = raw.trim_end_matches('\n').split('\t').collect();
@@ -541,8 +539,8 @@ fn notify_toasts_in_the_sidebar_and_falls_back_without_one() {
     assert!(gone >= Duration::from_millis(1900) && gone < Duration::from_millis(3500), "{gone:?}");
     // A click on a long-lived one dismisses it (here).
     assert!(notify(&s, &focus, &log, &["-c", &tty, "-t", "60", "click me"]).success());
-    wait_for("the second toast", || screen().contains("│ click me"));
-    let y = screen().lines().position(|l| l.contains("│ click me")).unwrap() + 1;
+    wait_for("the second toast", || screen().contains("┃ click me"));
+    let y = screen().lines().position(|l| l.contains("┃ click me")).unwrap() + 1;
     let click = format!("\x1b[<0;6;{y}M\x1b[<0;6;{y}m");
     let hex: Vec<String> = click.bytes().map(|b| format!("{b:02x}")).collect();
     let mut a = vec!["send-keys", "-t", "main:9", "-H"];
@@ -553,9 +551,9 @@ fn notify_toasts_in_the_sidebar_and_falls_back_without_one() {
     // with -T, its own title. Two at once: stacked, the older on top.
     assert!(notify(&s, &focus, &log, &["-k", "warn", "-T", "Heads up", "no client given"]).success());
     assert!(notify(&s, &focus, &log, &["-k", "error", "-t", "60", "and another"]).success());
-    wait_for("the context's toasts", || screen().contains("│ no client given") && screen().contains("│ and another"));
+    wait_for("the context's toasts", || screen().contains("┃ no client given") && screen().contains("┃ and another"));
     let lines: Vec<String> = screen().lines().map(String::from).collect();
-    assert!(lines[0].contains("\u{f071} Heads up") && lines[1].contains("no client given") && lines[3].contains("\u{f057} Error")
+    assert!(lines[0].contains("▲ Heads up") && lines[1].contains("no client given") && lines[3].contains("✕ Error")
         && lines[4].contains("and another"), "{lines:#?}");
     // A second client, with no sidebar: tmux's own message, no toast.
     let other = s.nested_client("zeta", "main:7");
@@ -577,7 +575,7 @@ fn notify_toasts_in_the_sidebar_and_falls_back_without_one() {
     s.tmux(&["new-window", "-d", "-t", "main:6", "-n", "sb2", &cmd]);
     wait_for("the second sidebar", || opt("@sidebar_clients") == tty);
     assert!(notify(&s, &focus, &log, &["-c", &tty, "-t", "60", "alive"]).success());
-    wait_for("its toast", || s.tmux(&["capture-pane", "-p", "-t", "main:6"]).contains("│ alive"));
+    wait_for("its toast", || s.tmux(&["capture-pane", "-p", "-t", "main:6"]).contains("┃ alive"));
     let pid = s.tmux(&["display-message", "-p", "-t", "main:6", "#{pane_pid}"]);
     Command::new("kill").args(["-KILL", pid.trim()]).status().unwrap();
     wait_for("the crash", || s.tmux(&["display-message", "-p", "-t", "main:6", "#{pane_dead}"]).trim() == "1");
@@ -693,7 +691,7 @@ fn the_sidebar_leaves_with_its_client() {
     wait_for("the status job", || job.exists());
     // Letters persisted to @agent_key, as the menu would (work a s d, zeta f).
     wait_for("the letters", || s.tmux(&["show-options", "-wqv", "-t", "work:3", "@agent_key"]).trim() == "d");
-    assert!(screen().lines().any(|l| l.starts_with("   d  Quiet one")), "{}", screen());
+    assert!(screen().lines().any(|l| l.starts_with("    d  Quiet one")), "{}", screen());
     // The client's key table, told by the focus notice: the prefix mark, the
     // ⌥W hint, prefix v's selection.
     // (UB's ⌥W table and stash.sh's, here with one key each so they exist.)
@@ -731,10 +729,11 @@ fn the_sidebar_leaves_with_its_client() {
         assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
     }
     // A window switch on the client, then the focus notice (tmux's hooks
-    // post it): the highlight (and its blue edge) follows.
+    // post it): the lift (and its lavender rail, the agent being idle)
+    // follows.
     s.tmux(&["select-window", "-t", "work:3"]);
     post(&focus);
-    wait_for("the window switch", || screen().lines().any(|l| l.starts_with(" ▌") && l.contains("Quiet one")));
+    wait_for("the window switch", || screen().lines().any(|l| l.starts_with(" ▎  d  Quiet one")));
     assert_eq!(s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_dead}"]).trim(), "0");
     // Suspended (prefix C-z): tmux 3.7 drops the client from list-clients,
     // but it is alive, so the sidebar stays (a notice forces a refresh).
