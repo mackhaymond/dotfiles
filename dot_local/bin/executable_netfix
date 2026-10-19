@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+#
+# netfix — figure out why "the internet is down" on this Mac and, when it is the
+# known AdGuard wedge, fix it without a reboot.
+#
+# The wedge (2026-10-19): after waking and switching Wi-Fi networks, AdGuard's
+# app-proxy network extension stopped opening outbound connections. Wi-Fi, DHCP
+# and the router were fine and raw DNS to 1.1.1.1 answered, but every app's
+# traffic disappeared into the proxy. Restarting AdGuard clears it.
+#
+# Usage:
+#   netfix           # diagnose; if it's the AdGuard pattern, restart AdGuard
+#   netfix --check   # diagnose only, change nothing
+#   netfix --force   # restart AdGuard even if the checks pass
+#
+# Exit status: 0 = internet works (now), 1 = still broken, 2 = usage error.
+
+set -uo pipefail
+
+CHECK_ONLY=0 FORCE=0
+case "${1:-}" in
+  "") ;;
+  --check) CHECK_ONLY=1 ;;
+  --force) FORCE=1 ;;
+  -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo "netfix: unknown option '$1' (try --help)" >&2; exit 2 ;;
+esac
+
+ADGUARD_ID=com.adguard.mac.adguard
+ADGUARD_APP_RE='Adguard.app/Contents/MacOS/Adguard$'
+PROBE_URL=https://www.apple.com/library/test/success.html
+
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
+info() { printf '%s\n' "$*"; }
+
+# Each probe returns 0 on success; all are bounded to a few seconds.
+has_ip()      { ipconfig getifaddr en0 >/dev/null 2>&1; }
+gateway()     { route -n get default 2>/dev/null | awk '/gateway:/ {print $2}'; }
+gateway_up()  { local gw; gw=$(gateway); [[ -n $gw ]] && ping -c1 -t2 "$gw" >/dev/null 2>&1; }
+raw_dns()     { dig @1.1.1.1 example.com +short +time=2 +tries=1 2>/dev/null | grep -qE '^[0-9.]+$'; }
+system_path() { curl -m6 -s -o /dev/null -w '%{http_code}' "$PROBE_URL" 2>/dev/null | grep -q '^200$'; }
+
+diagnose() {
+  info "netfix: checking…"
+  if has_ip; then ok "Wi-Fi has an address ($(ipconfig getifaddr en0))"; else bad "Wi-Fi has no IP address"; return 10; fi
+  if gateway_up; then ok "router $(gateway) answers"; else bad "router $(gateway) does not answer"; return 11; fi
+  if raw_dns; then ok "raw DNS to 1.1.1.1 works (the internet is reachable)"; else bad "raw DNS to 1.1.1.1 fails"; return 12; fi
+  if system_path; then ok "apps can load web pages"; return 0; else bad "apps can't load web pages (system DNS/proxy path)"; return 13; fi
+}
+
+# True once nesessionmanager has logged AdGuard's proxy session reconnecting
+# since the given "YYYY-MM-DD HH:MM:SS" (one `log show` is ~0.7s).
+adguard_connected_since() {
+  log show --start "$1" --style compact --predicate \
+    'process=="nesessionmanager" AND eventMessage CONTAINS "AdGuard" AND eventMessage CONTAINS "status changed to connected"' \
+    2>/dev/null | grep -q 'status changed to connected'
+}
+
+# Returns 0 = AdGuard back and pages load, 1 = pages still fail,
+# 3 = pages load but AdGuard protection didn't come back.
+restart_adguard() {
+  info "netfix: restarting AdGuard…"
+  local t0; t0=$(date '+%Y-%m-%d %H:%M:%S')
+  # SIGTERM, never -9. Quitting the app makes the extension tear down its proxy
+  # session ("Application XPC connection was interrupted" → emergency stop);
+  # the extension process itself stays resident, and that's expected.
+  pkill -TERM -f "$ADGUARD_APP_RE" 2>/dev/null
+  for _ in {1..20}; do pgrep -f "$ADGUARD_APP_RE" >/dev/null || break; sleep 0.5; done
+  if pgrep -f "$ADGUARD_APP_RE" >/dev/null; then
+    bad "AdGuard didn't quit; quit it from its menu bar icon and run netfix again."
+    return 1
+  fi
+  sudo -n true 2>/dev/null && { sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder; } 2>/dev/null
+  open -g -b "$ADGUARD_ID"
+  # AdGuard re-enables protection ~30-40s after launch (it updates filters first).
+  info "  waiting for AdGuard to turn protection back on (up to ~90s)…"
+  local back=0
+  for _ in {1..30}; do
+    adguard_connected_since "$t0" && { back=1; break; }
+    sleep 3
+  done
+  if ! system_path; then sleep 3; system_path || return 1; fi
+  (( back )) && return 0
+  return 3
+}
+
+diagnose; rc=$?
+
+if (( rc == 0 && ! FORCE )); then
+  info "netfix: everything works — nothing to fix."
+  exit 0
+fi
+
+case $rc in
+  10|11) info "netfix: this is a Wi-Fi/router problem, not AdGuard. Turn Wi-Fi off and on, or check the router."
+         (( FORCE )) || exit 1 ;;
+  12)    info "netfix: the router is up but nothing past it answers — likely the network/ISP (or a captive portal)."
+         (( FORCE )) || exit 1 ;;
+  13)    info "netfix: internet reachable but apps aren't — this is the AdGuard wedge." ;;
+esac
+
+if (( CHECK_ONLY )); then
+  info "netfix: --check given, not changing anything. Run 'netfix' to restart AdGuard."
+  exit 1
+fi
+
+restart_adguard; rc=$?
+if (( rc == 0 )); then
+  ok "fixed — AdGuard protection is back on and apps can load web pages."
+  exit 0
+elif (( rc == 3 )); then
+  ok "apps can load web pages again"
+  bad "but AdGuard protection hasn't come back on — check its menu bar icon."
+  exit 0
+fi
+bad "still broken after restarting AdGuard."
+info "Next: quit Cisco Secure Client if it's running, toggle Wi-Fi, then reboot as a last resort."
+exit 1
