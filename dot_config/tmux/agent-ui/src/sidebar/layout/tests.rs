@@ -2501,7 +2501,7 @@ fn phases() -> Vec<Phase> {
 #[test]
 fn the_pause_banner_says_where_the_pause_stands() {
     let v = lettered(quiet());
-    let words = ["PAUSING  sending 2 of 5", "PAUSING  3 of 5 stopped", "✓ PAUSED  safe to close", "↻ 3 ready  to resume", "RESUMING  3 agents…"];
+    let words = ["PAUSING  sending 2 of 5", "PAUSING  3 of 5 stopped", "✓ PAUSED  safe to close", "↻ 3 ready  ", "RESUMING  3 agents…"];
     for (p, word) in phases().into_iter().zip(words) {
         for w in [24u16, 34, 44] {
             let f = layout(&v, w, 58, &Opts { pause: Some(p.clone()), ..with_bar(demo_bar()) });
@@ -2530,11 +2530,19 @@ fn the_pause_banner_says_where_the_pause_stands() {
             assert!(f.spin || !p.busy(), "{ctx}");
         }
     }
-    // Ready: the hint beside it when it all fits; the second row is who.
-    let f = layout(&v, 44, 58, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() });
+    // Ready always says how to resume, at Mack's usual 34 columns too: who
+    // on the first row, "prefix P or click to resume" on the second; one
+    // row, the hint takes the place of who.
+    for w in [34u16, 44] {
+        let f = layout(&v, w, 58, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() });
+        let t = texts(&f);
+        assert!(t[0].contains("↻ 3 ready  Tmux Agent Sideba"), "{t:#?}");
+        assert!(t[1].contains("prefix P or click to resume"), "{t:#?}");
+    }
+    let f = layout(&v, 34, 10, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() });
     let t = texts(&f);
-    assert!(t[0].trim_end().ends_with("prefix P · click"), "{t:#?}");
-    assert!(t[1].contains("Tmux Agent Sidebar, Island resize sp…"), "{t:#?}");
+    assert_eq!(f.pause, 0..1, "{t:#?}");
+    assert!(t[0].contains("↻ 3 ready  prefix P · click"), "{t:#?}");
     let f = layout(&v, 44, 58, &Opts { pause: Some(phases()[1].clone()), ..Opts::default() });
     assert!(texts(&f)[1].contains("still working  Tmux Agent Sidebar, C…"), "{:#?}", texts(&f));
     // No pause: nothing at all, the frame exactly as before.

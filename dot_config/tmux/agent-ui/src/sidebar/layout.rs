@@ -1268,12 +1268,16 @@ fn agents_n(n: usize) -> String {
 ///  ▌ ⠹ PAUSING  3 of 5 stopped          peach
 ///  ▌   still working  Tmux Sidebar, …
 ///  ▌ ✓ PAUSED  safe to close            green; a click resumes
-///  ▌ ↻ 5 ready  to resume  prefix P · click   blue; a click resumes
+///  ▌ ↻ 5 ready  Tmux Sidebar, Island…   blue; a click resumes
+///  ▌   prefix P or click to resume      (one row: ↻ 5 ready  prefix P · click)
 ///  ▌ ⠹ RESUMING  5 agents…              peach
 /// ```
 ///
 /// Safe and ready rows click through to [`Target::Resume`]; the others do
-/// nothing (a press is in flight, or agents are still stopping).
+/// nothing (a press is in flight, or agents are still stopping). Ready
+/// always says how to resume (Mack asked for the prefix P hint), so at the
+/// usual 34 columns the hint takes the second row and the labels the rest
+/// of the first.
 fn pause_rows(p: &Phase, cx: Cx, lines: usize) -> Vec<Row> {
     let w = cx.w;
     if lines == 0 || w == 0 {
@@ -1284,24 +1288,32 @@ fn pause_rows(p: &Phase, cx: Cx, lines: usize) -> Vec<Row> {
     let spin = SPIN[cx.spin % SPIN.len()];
     let dimc = dim(true);
     let names = |l: &[String]| seg(l.join(", "), dimc);
-    let (word, rest, hint, detail): (String, String, &str, Vec<Seg>) = match p {
-        Phase::Sending { done, n, labels } => (format!("{spin} PAUSING"), format!("sending {done} of {n}"), "", vec![names(labels)]),
-        Phase::Resuming { n, labels } => (format!("{spin} RESUMING"), format!("{}…", agents_n(*n)), "", vec![names(labels)]),
+    let rail = || seg(RAIL_HEAVY, hue);
+    if let Phase::Ready { labels } = p {
+        let mut l1 = vec![rail(), seg(" ", "text"), bold(format!("↻ {} ready", labels.len()), hue), seg("  ", "text")];
+        let rows = if lines >= 2 {
+            l1.push(names(labels));
+            let l2 = vec![rail(), seg("   ", "text"), bold("prefix P", "text"), seg(" or click to resume", dimc)];
+            vec![tile_row(w, bg, l1, vec![seg(" ", "text")]), tile_row(w, bg, l2, vec![seg(" ", "text")])]
+        } else {
+            l1.extend([bold("prefix P", "text"), seg(" · click", dimc)]);
+            vec![tile_row(w, bg, l1, vec![seg(" ", "text")])]
+        };
+        return rows.into_iter().map(|r| r.click(w, Target::Resume)).collect();
+    }
+    let (word, rest, detail): (String, String, Vec<Seg>) = match p {
+        Phase::Sending { done, n, labels } => (format!("{spin} PAUSING"), format!("sending {done} of {n}"), vec![names(labels)]),
+        Phase::Resuming { n, labels } => (format!("{spin} RESUMING"), format!("{}…", agents_n(*n)), vec![names(labels)]),
         Phase::Stopping { stopped, n, working } => (
             format!("{spin} PAUSING"),
             format!("{stopped} of {n} stopped"),
-            "",
             vec![seg("still working  ", dimc), seg(working.join(", "), "sub")],
         ),
-        Phase::Safe { labels } => ("✓ PAUSED".into(), "safe to close".into(), "", vec![names(labels)]),
-        Phase::Ready { labels } => (format!("↻ {} ready", labels.len()), "to resume".into(), "prefix P · click", vec![names(labels)]),
+        Phase::Safe { labels } => ("✓ PAUSED".into(), "safe to close".into(), vec![names(labels)]),
+        Phase::Ready { .. } => unreachable!("handled above"),
     };
-    let rail = || seg(RAIL_HEAVY, hue);
     let left = vec![rail(), seg(" ", "text"), bold(word, hue), seg(format!("  {rest}"), "text")];
-    // The hint only beside the whole of what the banner says.
-    let with_hint = vec![seg(hint, dimc), seg(" ", "text")];
-    let right = if !hint.is_empty() && width(&left) + width(&with_hint) < inner(w) { with_hint } else { vec![] };
-    let mut rows = vec![tile_row(w, bg, left, right)];
+    let mut rows = vec![tile_row(w, bg, left, vec![])];
     let says = detail.iter().any(|s| !s.text.trim().is_empty());
     if lines >= 2 && says {
         let mut l2 = vec![rail(), seg("   ", "text")];
