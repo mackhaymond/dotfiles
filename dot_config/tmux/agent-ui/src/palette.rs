@@ -44,15 +44,15 @@ pub const HEX: [(&str, &str); 16] = [
 /// section's active shell; no row wears it now, but bands still keep apart
 /// from it. `tile_me` (lavender at 30% over the canvas) is the client's own
 /// agent card, both rows: lifted well off every other surface, "you are
-/// here" at a glance. `term` (between `mantle` and `crust`) is a SHELL row's
-/// strip: sunk below the canvas, a little terminal beside the raised agent
-/// tiles.
+/// here" at a glance. `term` (the terminals' own `base`) is a SHELL row's
+/// strip: a little terminal on the canvas, a step under the agent tiles
+/// (it was crust-dark, #13131d, which Mack found too dark).
 pub const UI: [(&str, &str); 13] = [
     ("base", "#1e1e2e"), ("mantle", "#181825"), ("surface2", "#585b70"),
     ("mauve", "#cba6f7"), ("lavender", "#b4befe"), ("sel", "#2a2b3d"),
     ("overlay2", "#9399b2"), ("tile", "#30314a"), ("tile_lo", "#28283b"),
     ("tile_hi", "#31394f"), ("overlay1", "#7f849c"), ("tile_me", "#474a66"),
-    ("term", "#13131d"),
+    ("term", "#1e1e2e"),
 ];
 
 /// The `#rrggbb` for a palette name ([`HEX`] first, then [`UI`]). Panics on
