@@ -88,6 +88,29 @@ bind R new-window -a -c "#{pane_current_path}" \; kill-window -t -
 source-file -F "#{d:current_file}/agent-birth.conf"
 bind k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude \; run-shell -C "#{?@agent_birth,#{@agent_birth} claude,}"
 
+# POPUP POSITION. With the agent sidebar open (⌘B: `agent-ui sidebar`, a
+# WezTerm split beside this tmux client, not a tmux pane) the client is
+# narrower than the window, so tmux's own centring (-x C) puts every popup
+# and menu off the window's middle. tmux cannot draw outside its client, so
+# @popup_x centres a popup on the whole WezTerm row instead: the client's
+# width plus @sidebar_width (the sidebar's columns + WezTerm's 1-column split
+# divider, NEGATIVE when wezterm.lua's STRIP_SIDE puts the sidebar on the
+# left; the leading sidebar keeps it set, the registry unsets it when the
+# last one closes), counted only when THIS client is in @sidebar_clients
+# (the ttys that have a sidebar beside them). Same rounding as tmux's own
+# popup_centre_x: with no sidebar it IS that. Too wide to fit shifted, tmux
+# clamps it to the client's edge (n + w >= width → width - w; n < 0 → 0).
+#
+# Every centred popup/menu passes `-x '#{E:@popup_x}'` (display-popup and
+# display-menu expand -x at popup time, with popup_width set). Inside
+# `run-shell -C "…"`, which expands formats BEFORE display-popup runs, it is
+# `-x '##{E:@popup_x}'`. Scripts, agent-ui and agent-roster.py, which may run
+# against a server that has not reloaded this file yet, pass
+# `#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}` (unset → tmux's centre,
+# never column 0). Popups placed on purpose (agent-pause's own geometry, the
+# btop popup's -y) keep what they set. Only x moves: -y is untouched.
+set -g @popup_x '#{e|-:#{e|/:#{e|+:#{e|-:#{client_width},1},#{?#{m:* #{client_tty} *, #{@sidebar_clients} },#{@sidebar_width},0}},2},#{e|/:#{popup_width},2}}'
+
 # K is the one that asks where first: a popup fuzzy-picker over zoxide's
 # frecency list (plus this tab's cwd and $HOME, the key's old destination).
 # The script creates the tab itself — display-popup -E can only return an exit
@@ -101,7 +124,7 @@ bind k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude \; run-sh
 #
 # With @spaces on, spaces.conf rebinds K to the space picker (which space gets
 # the claude tab; space.sh pick-tab), and restores this binding when off.
-bind K display-popup -E -w 80% -h 70% -d "#{pane_current_path}" \
+bind K display-popup -E -w 80% -h 70% -x '#{E:@popup_x}' -d "#{pane_current_path}" \
   "$HOME/.config/tmux/scripts/claude-dir-picker.sh"
 
 bind C-k new-window -a -c "#{pane_current_path}" -e ZSH_AUTOSTART=claude \; run-shell -C "#{?@agent_birth,#{@agent_birth} claude,}" \; kill-window -t -
@@ -136,7 +159,7 @@ bind N new-window -a -c "#{pane_current_path}" nu
 # or pane by its command); Cancel is the first item, so ⏎ / n / Esc / q keep
 # it and only y closes, as before. prefix Q (spaces.conf) asks the same way.
 set -g @close_title '#[align=centre]#{?#{@agent_state}, close agent #{?#{@agent_key},#{@agent_key} · ,}#{=/30/…:#{?#{@agent_summary},#{s|^[^/]*/||:@agent_summary},#{window_name}}} , close #{?#{==:#{window_panes},1},tab,pane} #{=/24/…:pane_current_command} }'
-bind x display-menu -b rounded -s 'bg=#1e1e2e,fg=#cdd6f4' -S 'fg=#f38ba8' -H 'bg=#45475a,fg=#cdd6f4,bold' -T "#{E:@close_title}" -x C -y C "Cancel" n "" "Close" y "run-shell -b '#{HOME}/.config/tmux/scripts/closed-tabs.sh close #{pane_id}'"
+bind x display-menu -b rounded -s 'bg=#1e1e2e,fg=#cdd6f4' -S 'fg=#f38ba8' -H 'bg=#45475a,fg=#cdd6f4,bold' -T "#{E:@close_title}" -x '#{E:@popup_x}' -y C "Cancel" n "" "Close" y "run-shell -b '#{HOME}/.config/tmux/scripts/closed-tabs.sh close #{pane_id}'"
 bind X run-shell "#{HOME}/.config/tmux/scripts/closed-tabs.sh pick-popup '#{session_id}' '#{client_tty}'"
 
 set -g status-position bottom
@@ -562,10 +585,10 @@ set -g @assistant-resurrect-capture-env 'VIRTUAL_ENV NODE_ENV CONDA_DEFAULT_ENV 
 # in the agent-ui block below (its list is on screen 20-40 ms after the key,
 # this one's 70-90 ms; docs/agent-roster.md "agent-ui sessions").
 unbind-key a
-bind-key a display-popup -E -w 60% -h 75% "$HOME/.config/tmux/scripts/mru-session-switch.sh"
+bind-key a display-popup -E -w 60% -h 75% -x '#{E:@popup_x}' "$HOME/.config/tmux/scripts/mru-session-switch.sh"
 
 unbind-key C-a
-bind-key C-a display-popup -E -w 60% -h 75% "$HOME/.config/tmux/scripts/mru-session-switch.sh"
+bind-key C-a display-popup -E -w 60% -h 75% -x '#{E:@popup_x}' "$HOME/.config/tmux/scripts/mru-session-switch.sh"
 
 # prefix d → the next tab that needs you, across every session: red (failed),
 # then yellow (waiting on you), then green (done), oldest first. Repeated
@@ -614,8 +637,8 @@ bind-key D   run-shell -b "#{HOME}/.config/tmux/scripts/agent-jump.sh back '#{cl
 # PYTHONPYCACHEPREFIX the stub sets and recompile the stdlib every launch
 # (-S is fine: the prefix comes from the stub, not site). Never a pyenv shim
 # (~140-260 ms). Numbers: docs/agent-roster.md.
-bind-key q   run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
-bind-key C-q run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
+bind-key q   run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -x '##{E:@popup_x}' -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
+bind-key C-q run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -x '##{E:@popup_x}' -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
 
 # OPTION KEYS for the agent controls, no prefix (Mack, 2026-10-08: important
 # enough to deserve one chord). They sit around the existing Option-Q (floax)
@@ -647,7 +670,7 @@ set-hook -g 'client-session-changed[30]' { if-shell -F "#{?#{@space_hidden},,1}"
 set-hook -g 'session-window-changed[30]' { if-shell -F "#{&&:#{session_attached},#{?#{@space_hidden},0,1}}" { run-shell -b "#{HOME}/.config/tmux/scripts/nav.sh record session '#{hook_session}'" } }
 bind-key -n M-x run-shell -b "#{HOME}/.config/tmux/scripts/nav.sh back '#{client_name}'"
 bind-key -n M-c run-shell -b "#{HOME}/.config/tmux/scripts/nav.sh forward '#{client_name}'"
-bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
+bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% -x '##{E:@popup_x}' -T ' agents ' /bin/dash -c '[ -x {{ .homebrew_prefix }}/bin/python3 ] && exec {{ .homebrew_prefix }}/bin/python3 -I -S \"\$0\" --client \"\$1\"; exec /usr/bin/python3 -S \"\$0\" --client \"\$1\"' '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-roster.py' '#{client_tty}'"
 
 # agent-ui MENU (primary): when ~/.local/bin/agent-ui is installed, the same
 # three keys are re-bound to `agent-ui menu`; the python lines above stay as
@@ -669,14 +692,14 @@ bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% 
 if-shell "test -x '{{ .chezmoi.homeDir }}/.local/bin/agent-ui'" {
     # Width: at most 100 columns (narrower clients get the whole width), so a
     # row's title, project tag and age stay within one glance.
-    bind-key q      run-shell -C "display-popup -c '#{client_tty}' -E -B -w '#{?#{e|<:#{client_width},100},#{client_width},100}' -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
-    bind-key C-q    run-shell -C "display-popup -c '#{client_tty}' -E -B -w '#{?#{e|<:#{client_width},100},#{client_width},100}' -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
-    bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -B -w '#{?#{e|<:#{client_width},100},#{client_width},100}' -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
+    bind-key q      run-shell -C "display-popup -c '#{client_tty}' -E -B -w '#{?#{e|<:#{client_width},100},#{client_width},100}' -h 75% -x '##{E:@popup_x}' '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
+    bind-key C-q    run-shell -C "display-popup -c '#{client_tty}' -E -B -w '#{?#{e|<:#{client_width},100},#{client_width},100}' -h 75% -x '##{E:@popup_x}' '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
+    bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -B -w '#{?#{e|<:#{client_width},100},#{client_width},100}' -h 75% -x '##{E:@popup_x}' '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' menu --client '#{client_tty}'"
     # prefix a / C-a: `agent-ui sessions`, the session picker (the bash + fzf
     # mru-session-switch.sh lines above stay as the fallback). Same launch
     # as the menu; docs/agent-roster.md "agent-ui sessions".
-    bind-key a      run-shell -C "display-popup -c '#{client_tty}' -E -B -w 60% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' sessions --client '#{client_tty}'"
-    bind-key C-a    run-shell -C "display-popup -c '#{client_tty}' -E -B -w 60% -h 75% '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' sessions --client '#{client_tty}'"
+    bind-key a      run-shell -C "display-popup -c '#{client_tty}' -E -B -w 60% -h 75% -x '##{E:@popup_x}' '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' sessions --client '#{client_tty}'"
+    bind-key C-a    run-shell -C "display-popup -c '#{client_tty}' -E -B -w 60% -h 75% -x '##{E:@popup_x}' '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' sessions --client '#{client_tty}'"
 }
 
 # Double-tap hyper or right shift in WezTerm (Karabiner, karabiner-base.json) flips

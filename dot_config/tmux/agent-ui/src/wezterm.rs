@@ -106,6 +106,17 @@ pub fn pick_tmux_pane(panes: &[Value], own: Option<&str>, snap: &Snapshot, hint:
     Some((best.get("tty_name")?.as_str()?.to_string(), field(best, "pane_id")?))
 }
 
+/// Whether the sidebar pane (`own`) sits LEFT of its tmux client's pane
+/// (`tmux_pane`), as with wezterm.lua's `STRIP_SIDE = "Left"`: its
+/// `left_col` is the smaller. None when either pane or column is missing.
+pub fn strip_left_of(panes: &[Value], own: Option<&str>, tmux_pane: Option<&str>) -> Option<bool> {
+    let col = |id: &str| {
+        let p = panes.iter().find(|p| field(p, "pane_id").as_deref() == Some(id))?;
+        field(p, "left_col")?.parse::<i64>().ok()
+    };
+    Some(col(own?)? < col(tmux_pane?)?)
+}
+
 /// The sidebar has nothing to sit beside: per a good `wezterm cli list`,
 /// the pane CMD+B split it from (`hint`) is gone, or no other pane is left
 /// in its tab. False when its own pane is not listed (nothing is known).
@@ -134,6 +145,10 @@ pub struct WeztermLink {
     /// The last good resolve found the sidebar alone in its tab
     /// ([`alone_in`]): time to go. Never set when pinned.
     pub alone: bool,
+    /// The last resolve found this sidebar LEFT of its client
+    /// ([`strip_left_of`]); false (right, the default side) when unknown or
+    /// pinned. The leader's `@sidebar_width` is negative then.
+    pub left: bool,
     next_resolve: f64,
 }
 
@@ -141,7 +156,7 @@ impl WeztermLink {
     pub fn new(exe: String, client: Option<String>, hint: Option<String>, own: Option<String>) -> WeztermLink {
         let fixed = client.is_some();
         let tmux_pane = if fixed { hint.clone() } else { None };
-        WeztermLink { exe, own, tmux_pane, hint, fixed, client, alone: false, next_resolve: 0.0 }
+        WeztermLink { exe, own, tmux_pane, hint, fixed, client, alone: false, left: false, next_resolve: 0.0 }
     }
 
     /// Strip.load: after each snapshot, re-resolve if our client is gone
@@ -163,6 +178,7 @@ impl WeztermLink {
         self.alone = alone_in(&panes, self.own.as_deref(), self.hint.as_deref());
         match pick_tmux_pane(&panes, self.own.as_deref(), snap, self.hint.as_deref()) {
             Some((c, p)) => {
+                self.left = strip_left_of(&panes, self.own.as_deref(), Some(&p)).unwrap_or(false);
                 self.client = Some(c);
                 self.tmux_pane = Some(p);
             }
@@ -242,6 +258,30 @@ mod tests {
         assert!(alone_in(panes, Some("13"), None));
         assert!(!alone_in(panes, Some("99"), Some("77")));
         assert!(!alone_in(panes, None, Some("77")));
+    }
+
+    #[test]
+    fn which_side_of_its_client() {
+        // wezterm.lua's STRIP_SIDE: "Right" (the tmux pane at 0, the sidebar
+        // past it and the divider) or "Left" (the sidebar first).
+        let panes = json::parse(
+            r#"[{"tab_id":0,"pane_id":0,"left_col":0,"tty_name":"/dev/ttys001"},
+                {"tab_id":0,"pane_id":25,"left_col":226,"tty_name":"/dev/ttys002"},
+                {"tab_id":1,"pane_id":30,"left_col":47,"tty_name":"/dev/ttys003"},
+                {"tab_id":1,"pane_id":31,"left_col":0,"tty_name":"/dev/ttys004"},
+                {"tab_id":2,"pane_id":40,"tty_name":"/dev/ttys005"}]"#,
+        )
+        .unwrap();
+        let panes = panes.as_array().unwrap();
+        assert_eq!(strip_left_of(panes, Some("25"), Some("0")), Some(false)); // right of it
+        assert_eq!(strip_left_of(panes, Some("31"), Some("30")), Some(true)); // left of it
+        // Unknown: a pane or its column missing.
+        assert_eq!(strip_left_of(panes, Some("40"), Some("30")), None);
+        assert_eq!(strip_left_of(panes, Some("99"), Some("0")), None);
+        assert_eq!(strip_left_of(panes, None, Some("0")), None);
+        assert_eq!(strip_left_of(panes, Some("25"), None), None);
+        // A new link knows nothing yet: right, the default side.
+        assert!(!WeztermLink::new("wezterm".into(), None, None, None).left);
     }
 
     #[test]

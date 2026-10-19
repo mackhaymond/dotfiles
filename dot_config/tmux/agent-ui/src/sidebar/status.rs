@@ -29,6 +29,13 @@
 //! next refresh ([`needs_repair`]). notify.sh reads it to choose between a
 //! toast and tmux's own `display-message`.
 //!
+//! `@sidebar_width` ([`WIDTH`]): the columns a sidebar takes from the
+//! WezTerm row (its own + the split divider; negative left of its client), so tmux.conf.tmpl's
+//! `@popup_x` can centre popups and menus on the whole row for the clients
+//! listed in `@sidebar_clients`. The leader writes it when its width differs
+//! from the snapshot's (start, resize, a repair that dropped it); the write
+//! that leaves the list empty, or a `--repair` that finds none, unsets it.
+//!
 //! ## Toasts (`@toast`)
 //!
 //! scripts/notify.sh posts a message as a toast instead of tmux's
@@ -580,6 +587,36 @@ pub const CLIENTS: &str = "@sidebar_clients";
 /// The [`CLIENTS`] word of a sidebar whose client is not known (yet).
 pub const NO_CLIENT: &str = "-";
 
+/// The columns an open sidebar takes from the WezTerm row beside its client:
+/// its own plus the split's 1-column divider. tmux.conf.tmpl's `@popup_x`
+/// adds it to `#{client_width}` for a client listed in [`CLIENTS`], so every
+/// centred popup and menu centres on the whole row, not on the narrower
+/// client. NEGATIVE for a sidebar LEFT of its client (wezterm.lua's
+/// `STRIP_SIDE = "Left"`): the row's middle is then left of the client's,
+/// and the same formula, `(client_width - 1 + width) / 2 - popup_width / 2`,
+/// is exactly the row's centre in client columns either way. One value for
+/// every sidebar: the leader (the lowest live pid, as for the [`Keeper`])
+/// keeps it ([`width_value`]); the registry unsets it with the last one.
+pub const WIDTH: &str = "@sidebar_width";
+
+/// [`WIDTH`]'s value for a sidebar `cols` wide, the divider included;
+/// negated when it sits `left` of its client.
+pub fn width_value(cols: u16, left: bool) -> String {
+    let w = i64::from(cols) + 1;
+    (if left { -w } else { w }).to_string()
+}
+
+/// The one tmux command storing [`WIDTH`].
+pub fn width_command(value: &str) -> Vec<String> {
+    ["set-option", "-gq", WIDTH, value].map(String::from).to_vec()
+}
+
+/// A popup's `-x` for display-popup argv built here (no `run-shell -C` in
+/// between, so no `##`): tmux.conf.tmpl's `@popup_x`, or tmux's own centre
+/// on a server that has not loaded it (an unset `@popup_x` would expand to
+/// "", i.e. column 0).
+pub const POPUP_X: &str = "#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}";
+
 /// One open sidebar: its pid and its client's word in [`CLIENTS`].
 pub type Entry = (i32, String);
 
@@ -621,13 +658,15 @@ pub fn next_entries(prev: &[Entry], live: &dyn Fn(i32) -> bool, add: Option<&Ent
 
 /// The ONE tmux command line storing `entries`: the pids, their clients,
 /// the count, and the status line (hidden while any sidebar is open, back
-/// once none is).
+/// once none is). None open: [`WIDTH`] goes too (popups centre on the client
+/// again).
 pub fn write_command(entries: &[Entry]) -> Vec<String> {
     let pids = entries.iter().map(|e| e.0.to_string()).collect::<Vec<_>>().join(" ");
     let clients = entries.iter().map(|e| e.1.as_str()).collect::<Vec<_>>().join(" ");
     let mut a: Vec<String> = Vec::new();
     if entries.is_empty() {
-        a.extend(["set-option", "-gqu", PIDS, ";", "set-option", "-gqu", CLIENTS].map(String::from));
+        a.extend(["set-option", "-gqu", PIDS, ";", "set-option", "-gqu", CLIENTS, ";", "set-option", "-gqu", WIDTH]
+            .map(String::from));
     } else {
         a.extend(["set-option", "-gq", PIDS, &pids, ";", "set-option", "-gq", CLIENTS, &clients].map(String::from));
     }
@@ -731,8 +770,9 @@ impl Registry {
         let next = next_entries(&prev, &is_sidebar, add.as_ref(), remove);
         if !force && next.is_empty() && prev.is_empty() {
             // Nothing open and nothing to repair: leave the status line
-            // alone (off for another reason stays off), make the count agree.
-            let _ = self.tmux.run(&["set-option", "-gq", OPEN, "0"]);
+            // alone (off for another reason stays off), make the count agree
+            // and drop any stale width (popups centre on the client).
+            let _ = self.tmux.run(&["set-option", "-gq", OPEN, "0", ";", "set-option", "-gqu", WIDTH]);
             return Some(0);
         }
         let o = self.tmux.run(&write_command(&next)).ok().filter(|o| o.ok())?;
@@ -1219,8 +1259,17 @@ mod tests {
         assert_eq!(write_command(&[e(12, "/dev/a"), e(50, "-")]), ["set-option", "-gq", "@sidebar_pids", "12 50", ";",
             "set-option", "-gq", "@sidebar_clients", "/dev/a -", ";", "set-option", "-gq",
             "@sidebar_open", "2", ";", "set-option", "-gq", "status", "off"]);
+        // The last one gone: the width goes with the list.
         assert_eq!(write_command(&[]), ["set-option", "-gqu", "@sidebar_pids", ";", "set-option", "-gqu", "@sidebar_clients", ";",
+            "set-option", "-gqu", "@sidebar_width", ";",
             "set-option", "-gq", "@sidebar_open", "0", ";", "set-option", "-gq", "status", "on"]);
+        // The width: the sidebar's columns plus WezTerm's split divider.
+        assert_eq!((width_value(46, false), width_value(0, false), width_value(u16::MAX, false)),
+            ("47".into(), "1".into(), "65536".into()));
+        // Left of its client (STRIP_SIDE = "Left"): the same columns, negated.
+        assert_eq!((width_value(46, true), width_value(0, true)), ("-47".into(), "-1".into()));
+        assert_eq!(width_command("47"), ["set-option", "-gq", "@sidebar_width", "47"]);
+        assert_eq!(POPUP_X, "#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}");
         // The cheap check.
         let st = |pids: &str, clients: &str, open: &str| crate::tmux::Status {
             sidebar_pids: pids.into(),

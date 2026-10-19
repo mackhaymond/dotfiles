@@ -29,9 +29,12 @@ else
   client_height=$(tmux display-message -p '#{client_height}')
 fi
 popup_y=$(( client_height * popup_bottom_pct / 100 ))
+# Horizontally centred on the whole WezTerm row while a sidebar sits beside
+# the client (tmux.conf.tmpl's @popup_x); tmux's own centre without it.
+popup_x='#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}'
 
 if [ -n "$target_client" ]; then
-  tmux display-popup -t "$target_client" -E -w "$popup_width" -h "$popup_height" -y "$popup_y" "$popup_cmd"
+  tmux display-popup -t "$target_client" -E -w "$popup_width" -h "$popup_height" -x "$popup_x" -y "$popup_y" "$popup_cmd"
 else
-  tmux display-popup -E -w "$popup_width" -h "$popup_height" -y "$popup_y" "$popup_cmd"
+  tmux display-popup -E -w "$popup_width" -h "$popup_height" -x "$popup_x" -y "$popup_y" "$popup_cmd"
 fi

@@ -418,6 +418,12 @@ def fit_label(label, width):
     return proj, clip(title, width - pw)
 
 
+# A popup's -x: centred on the whole WezTerm row while a sidebar sits beside
+# the client (tmux.conf.tmpl's @popup_x); tmux's own centre on a server that
+# has not loaded it (the binding itself passes `##{E:@popup_x}`).
+POPUP_X = "#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}"
+
+
 def roster_popup_argv(client, prefix=None):
     """prefix q's display-popup, for the strip's ☰: the same /bin/dash line
     as tmux.conf.tmpl's `bind-key q` (a test compares the two), with the
@@ -428,7 +434,7 @@ def roster_popup_argv(client, prefix=None):
     py = prefix + "/bin/python3"
     script = ('[ -x %s ] && exec %s -I -S "$0" --client "$1"; exec /usr/bin/python3 -S "$0" --client "$1"'
               % (py, py))
-    return ["tmux", "display-popup", "-c", client, "-E", "-w", "75%", "-h", "75%", "-T", " agents ",
+    return ["tmux", "display-popup", "-c", client, "-E", "-w", "75%", "-h", "75%", "-x", POPUP_X, "-T", " agents ",
             "/bin/dash", "-c", script, os.path.join(SCRIPTS, "agent-roster.py"), client]
 
 

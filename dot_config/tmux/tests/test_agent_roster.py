@@ -1131,10 +1131,15 @@ class StripLayoutTests(unittest.TestCase):
         flags, script = m.group(1), m.group(2).replace('\\"', '"').replace("\\$", "$")
         argv = R.roster_popup_argv("/dev/ttysX", prefix="/opt/homebrew")
         self.assertEqual(argv[:4], ["tmux", "display-popup", "-c", "/dev/ttysX"])
-        self.assertEqual(" ".join(argv[4:11]), flags.replace("-c '#{client_tty}' ", "").replace("' agents '", " agents "))
-        self.assertEqual(argv[11:13], ["/bin/dash", "-c"])
-        self.assertEqual(argv[13], script.replace("{{ .homebrew_prefix }}", "/opt/homebrew"))
-        self.assertEqual(argv[14:], [os.path.join(R.SCRIPTS, "agent-roster.py"), "/dev/ttysX"])
+        # -x: the binding's @popup_x, escaped for run-shell -C's expansion; the
+        # argv's own form falls back to tmux's centre while it is unset.
+        self.assertIn(" -x '##{E:@popup_x}' ", flags)
+        self.assertEqual(R.POPUP_X, "#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}")
+        flags = flags.replace("'##{E:@popup_x}'", R.POPUP_X)
+        self.assertEqual(" ".join(argv[4:13]), flags.replace("-c '#{client_tty}' ", "").replace("' agents '", " agents "))
+        self.assertEqual(argv[13:15], ["/bin/dash", "-c"])
+        self.assertEqual(argv[15], script.replace("{{ .homebrew_prefix }}", "/opt/homebrew"))
+        self.assertEqual(argv[16:], [os.path.join(R.SCRIPTS, "agent-roster.py"), "/dev/ttysX"])
 
     def test_fold_and_collapse(self):
         text = "\n".join([line("big", i, "@%d" % i, "idle", "p/idle %d" % i, active="1" if i == 1 else "0")

@@ -699,6 +699,17 @@ fn the_sidebar_leaves_with_its_client() {
     let opt = |o: &str| s.tmux(&["show-options", "-gqv", o]).trim().to_string();
     let pid = s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_pid}"]).trim().to_string();
     assert_eq!((opt("@sidebar_open"), opt("@sidebar_pids"), opt("status")), ("1".into(), pid.clone(), "off".into()));
+    // The leader keeps @sidebar_width (its columns + WezTerm's divider) for
+    // tmux.conf's @popup_x: from the first frame, and after a resize.
+    let width = |w: u16| (w + 1).to_string();
+    let cols = s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_width}"]).trim().parse::<u16>().unwrap();
+    wait_for("the width", || opt("@sidebar_width") == width(cols));
+    s.tmux(&["resize-window", "-t", "main:9", "-x", &(cols + 6).to_string()]);
+    wait_for("the new width", || opt("@sidebar_width") == width(cols + 6));
+    // Dropped by hand (a stale repair, say): back on the next refresh.
+    s.tmux(&["set-option", "-gu", "@sidebar_width"]);
+    post(&focus);
+    wait_for("the width again", || opt("@sidebar_width") == width(cols + 6));
     wait_for("the status job", || job.exists());
     // Letters persisted to @agent_key, as the menu would (work a s d, zeta
     // f). No @spaces here (classic): shells and the home take none.
@@ -767,8 +778,10 @@ fn the_sidebar_leaves_with_its_client() {
     wait_for("the sidebar to leave", || s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_dead}"]).trim() == "1");
     assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
     assert_eq!(s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_dead_status}"]).trim(), "0");
-    // The never-alone exit unlisted it: none open, the status line back.
+    // The never-alone exit unlisted it: none open, the status line back,
+    // popups centred on the client again (no width).
     assert_eq!((opt("@sidebar_open"), opt("@sidebar_pids"), opt("status")), ("0".into(), String::new(), "on".into()));
+    assert_eq!(opt("@sidebar_width"), "");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -834,12 +847,17 @@ fn the_registry_counts_sidebars_and_repairs_crashes() {
     kill("-KILL", &p9);
     wait_for("the crash", || s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_dead}"]).trim() == "1");
     // Quiet (a run-shell hook would show output in view mode); -v counts.
+    // A crashed leader's @sidebar_width goes with it.
+    s.tmux(&["set-option", "-g", "@sidebar_width", "47"]);
     assert_eq!(s.sidebar(&["--repair"]), "");
     assert_eq!((opt("@sidebar_open"), opt("@sidebar_pids"), opt("status")), ("0".into(), String::new(), "on".into()));
-    // Nothing to repair: the status line is left as it is.
+    assert_eq!(opt("@sidebar_width"), "");
+    // Nothing to repair: the status line is left as it is (a stray width
+    // still goes: no sidebar, no offset).
     s.tmux(&["set-option", "-g", "status", "off"]);
+    s.tmux(&["set-option", "-g", "@sidebar_width", "47"]);
     assert_eq!(s.sidebar(&["--repair", "-v"]).trim(), "0");
-    assert_eq!(opt("status"), "off");
+    assert_eq!((opt("status"), opt("@sidebar_width")), ("off".into(), String::new()));
     s.tmux(&["set-option", "-g", "status", "on"]);
     // A reload's `status on` with a sidebar open: --repair hides it again.
     let p10 = start("main:10");

@@ -87,7 +87,9 @@ main() {
   if bash "$status_script" --auth-required >/dev/null 2>&1; then
     local login_command
     printf -v login_command 'bash %q --login' "$status_script"
-    tmux display-popup -E -w 80% -h 70% "$login_command"
+    # -x: centred on the whole WezTerm row while a sidebar sits beside the
+    # client (tmux.conf.tmpl's @popup_x); tmux's own centre without it.
+    tmux display-popup -E -w 80% -h 70% -x '#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}' "$login_command"
     return 0
   fi
 

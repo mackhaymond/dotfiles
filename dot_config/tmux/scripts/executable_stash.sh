@@ -85,6 +85,9 @@ ACTIVE_SECS=15        # a transcript written this recently means a turn is in fl
 # preview UNDER it at (nearly) the full width.
 POPUP_W_PCT=94
 POPUP_H_PCT=85
+# Centred on the whole WezTerm row while a sidebar sits beside the client
+# (tmux.conf.tmpl's @popup_x); tmux's own centre on a server without it.
+POPUP_X='#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}'
 PREVIEW_PCT=72
 PREVIEW_DIR="$HOME/.local/state/tmux-stash/previews"
 
@@ -2484,7 +2487,7 @@ do_sel_send() {
     # Unquoted $ids: tmux window ids (@ plus digits), nothing for a shell to
     # interpret. The session is NOT passed — send-pick re-derives it from the
     # ids, so a user-chosen name never has to survive a round of quoting.
-    tmux display-popup ${client:+-c "$client"} -E -w 60% -h 75% \
+    tmux display-popup ${client:+-c "$client"} -E -w 60% -h 75% -x "$POPUP_X" \
         -T " move $n tab$([ "$n" -eq 1 ] || echo s) to… " \
         "'$SELF' send-pick '$client' $(printf '%s ' $ids)"
 }
@@ -2725,7 +2728,7 @@ do_unstash() {
             # if-shell in tmux.conf keeps the branch in one place and avoids a
             # second layer of shell quoting inside a tmux command string.
             # Deliberately outside the lock: the popup waits on a human.
-            tmux display-popup ${client:+-c "$client"} -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" -T ' stashed tabs ' "'$SELF' pick '$client'"
+            tmux display-popup ${client:+-c "$client"} -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" -x "$POPUP_X" -T ' stashed tabs ' "'$SELF' pick '$client'"
             return 0
         fi
     fi

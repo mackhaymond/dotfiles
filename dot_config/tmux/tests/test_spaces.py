@@ -99,7 +99,7 @@ class ConfigShape(unittest.TestCase):
         # CMD+SHIFT+T / CMD+SHIFT+R: the space picker in a popup, opened as
         # Option-N's is; tmux.conf's own C-t / K are gone from the on branch.
         on = on_branch().splitlines()
-        popup = ("bind {key} run-shell -C \"display-popup -c '#{{client_tty}}' -E -w 80% -h 70% "
+        popup = ("bind {key} run-shell -C \"display-popup -c '#{{client_tty}}' -E -w 80% -h 70% -x '##{{E:@popup_x}}' "
                  "-d '#{{pane_current_path}}' \\\"#{{@space_sh}} pick-tab {kind} '#{{client_tty}}'\\\"\"")
         self.assertIn(popup.format(key="C-t", kind="shell"), on)
         self.assertIn(popup.format(key="K", kind="agent"), on)

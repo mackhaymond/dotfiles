@@ -76,6 +76,9 @@ t() { "$TMUX_BIN" "$@"; }
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 US=$'\x1f'
+# Centred on the whole WezTerm row while a sidebar sits beside the client
+# (tmux.conf.tmpl's @popup_x); tmux's own centre on a server without it.
+POPUP_X='#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}'
 
 # Messages go to the client whose key ran us (CLIENT, passed by the binding as
 # '#{client_name}'); without one tmux picks its "best" client, which may be a
@@ -842,7 +845,7 @@ cmd_move_menu() {
   local -a args=(display-menu -T "#[align=centre] move tab to space ")
   [[ -n "$CLIENT" ]] && args+=(-c "$CLIENT")
   # "--": a disabled item starts with "-", which would read as a flag.
-  args+=(-x C -y C --)
+  args+=(-x "$POPUP_X" -y C --)
   local idx id name h label
   while IFS="$US" read -r idx id name h; do
     [[ -n "$id" ]] || continue

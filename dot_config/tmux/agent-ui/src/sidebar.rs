@@ -60,6 +60,8 @@
 //!   the meters, the stale save, the prefix / ⌥W / selection marks; the
 //!   spaces buttons); the
 //!   registry behind `@sidebar_open` restores it when the last one leaves.
+//!   The leader also keeps `@sidebar_width` (its columns + the divider), so
+//!   tmux.conf.tmpl's `@popup_x` centres popups on the whole WezTerm row.
 //!   Agent and shell rows carry their lifetime letters (`@agent_key`, one
 //!   pool shared with the menu and ⌥W, persisted like it).
 //! - **Toasts.** scripts/notify.sh, the replacement for `tmux
@@ -281,7 +283,9 @@ pub fn popup_width(client_cols: Option<u16>) -> String {
 /// `width` is [`popup_width`]'s.
 pub fn menu_command(tmux: &Tmux, client: &str, exe: Option<&std::path::Path>, tab: Option<&str>, width: &str) -> Command {
     let mut c = tmux.command();
-    c.args(["display-popup", "-c", client, "-E", "-w", width, "-h", "75%"]);
+    // -x: centred on the whole WezTerm row, this sidebar's columns included
+    // (tmux.conf.tmpl's @popup_x, as prefix q's binding).
+    c.args(["display-popup", "-c", client, "-E", "-w", width, "-h", "75%", "-x", status::POPUP_X]);
     match exe {
         Some(exe) => {
             // The Rust menu draws its own rounded border and title: no popup border.
@@ -377,6 +381,14 @@ struct App {
     registry: Option<Registry>,
     /// When the registry was last repaired from a refresh (at most every 2 s).
     repaired_at: Option<Instant>,
+    /// This sidebar's width as last drawn (None before the first frame).
+    cols: Option<u16>,
+    /// Whether this sidebar is the leader (the lowest live pid in the
+    /// registry): it runs the status jobs and keeps `@sidebar_width`.
+    leader: bool,
+    /// `@sidebar_width` as tmux holds it: the last snapshot's value, or what
+    /// this sidebar wrote since.
+    width_seen: String,
     /// Runs the status line's `#()` jobs while it is hidden.
     keeper: Keeper,
     /// Re-reads the client's key table while it is not `root` ([`KeyPoll`]).
@@ -426,6 +438,9 @@ impl App {
             persist: false,
             registry: None,
             repaired_at: None,
+            cols: None,
+            leader: false,
+            width_seen: String::new(),
             keeper: Keeper::default(),
             keypoll: KeyPoll::default(),
             key_reads: 0,
@@ -558,6 +573,29 @@ impl App {
         let live = status::parse_pids(&st.sidebar_pids).into_iter().filter(|&p| p == me || status::is_sidebar(p)).min();
         let leader = live.is_none_or(|p| p == me);
         self.keeper.tick(&self.core.tmux, leader, now);
+        self.leader = leader;
+        self.width_seen = st.sidebar_width.trim().to_string();
+        self.sync_width();
+    }
+
+    /// The leader keeps `@sidebar_width` ([`status::WIDTH`]) at its own
+    /// columns plus WezTerm's divider (negative when the last `wezterm cli
+    /// list` put it LEFT of its client), so tmux.conf.tmpl's `@popup_x`
+    /// centres popups on the whole row: one `set-option`, only when tmux's
+    /// value differs (start, a resize, a repair that dropped it). Only the
+    /// leader writes, so two sidebars of different widths never flip it back
+    /// and forth; one shared value is the price. Never before a frame was
+    /// drawn (the width is the terminal's, known from `draw`), never without
+    /// a registry (`--once`, the unit tests).
+    fn sync_width(&mut self) {
+        let (Some(cols), true, true) = (self.cols, self.leader, self.registry.is_some()) else { return };
+        let want = status::width_value(cols, self.link.left);
+        if self.width_seen == want {
+            return;
+        }
+        if matches!(self.core.tmux.run(&status::width_command(&want)), Ok(o) if o.ok()) {
+            self.width_seen = want;
+        }
     }
 
     /// A park in flight that a snapshot now shows in the stash: say so
@@ -762,6 +800,11 @@ impl App {
     /// Lay out and draw, unless the rendered buffer is what is on screen.
     fn draw(&mut self, term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         let size = term.size()?;
+        if self.cols != Some(size.width) {
+            // The first frame, or a resize: the popups' offset follows at once.
+            self.cols = Some(size.width);
+            self.sync_width();
+        }
         let now = text::now();
         let msg = self.msg.as_ref().filter(|(_, until)| *until > now).map(|(m, _)| m.clone());
         let spin = self.spin_at(Instant::now());
@@ -939,7 +982,8 @@ mod tests {
         let c = menu_command(&t, "/dev/ttys999", Some(std::path::Path::new("/x/agent-ui")), Some("parked"), "100");
         assert_eq!(
             args(&c),
-            ["-u", "-L", "priv", "display-popup", "-c", "/dev/ttys999", "-E", "-w", "100", "-h", "75%", "-B",
+            ["-u", "-L", "priv", "display-popup", "-c", "/dev/ttys999", "-E", "-w", "100", "-h", "75%", "-x",
+                "#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}", "-B",
                 "/x/agent-ui", "--socket", "priv", "menu", "--client", "/dev/ttys999", "--tab", "parked"]
         );
         // No binary path: the Python popup (prefix q's line, with its title).

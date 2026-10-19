@@ -1121,6 +1121,26 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   sidebar's client (`-` until one is resolved); a sidebar whose client
   resolves or changes re-registers on its next refresh (the same repair
   check).
+- **Popups centre on the WezTerm row** (`@sidebar_width`, tmux.conf.tmpl
+  "POPUP POSITION"): with a sidebar beside it the tmux client is narrower
+  than the window, so tmux's `-x C` put every popup and menu off the
+  middle. The leader (lowest live pid, as for the status jobs) keeps
+  `@sidebar_width` = its columns + 1 (WezTerm's split divider), negated
+  when it sits LEFT of its client (`STRIP_SIDE = "Left"`: its `left_col` in
+  the `wezterm cli list` that resolved the client is the smaller), written
+  only when tmux's value differs (first frame, a resize, a dropped value);
+  the registry write that empties the list, or a `--repair` that finds
+  none, unsets it. `@popup_x` = `(client_width - 1 + extra) / 2 -
+  popup_width / 2`, extra = `@sidebar_width` when `#{client_tty}` is a word
+  of `@sidebar_clients`, else 0 (then it is tmux's own `popup_centre_x`);
+  tmux clamps a popup too wide to fit shifted to the client's right edge.
+  Every centred display-popup / display-menu passes `-x '#{E:@popup_x}'`
+  (`##{…}` inside `run-shell -C`, which expands formats before the popup
+  exists); scripts, agent-ui (`status::POPUP_X`) and agent-roster.py pass
+  `#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}`, so a server that has
+  not reloaded tmux.conf still centres (an unset `@popup_x` would be column
+  0). One width for all sidebars: two of different widths share the
+  leader's. tests/test_popup_x.py reads the drawn column off a nested client.
 - **Toasts** (`scripts/notify.sh`, `status::Toast`, layout.rs "Toasts"):
   with the status line off, `tmux display-message` draws on the client's
   bottom line, which reads as the status line coming back. Scripts say

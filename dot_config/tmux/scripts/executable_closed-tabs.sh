@@ -64,6 +64,9 @@ MAX_ENTRIES=100
 # clipped on the right.
 POPUP_W_PCT=94
 POPUP_H_PCT=85
+# Centred on the whole WezTerm row while a sidebar sits beside the client
+# (tmux.conf.tmpl's @popup_x); tmux's own centre on a server without it.
+POPUP_X='#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}'
 
 RESURRECT_SAVE="$HOME/.config/tmux/plugins/tmux-assistant-resurrect/scripts/save-assistant-sessions.sh"
 
@@ -646,7 +649,7 @@ do_pick_popup() {
     fi
     local -a client=()
     [ -n "$client_tty" ] && client=(-c "$client_tty")
-    tmux display-popup "${client[@]}" -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" \
+    tmux display-popup "${client[@]}" -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" -x "$POPUP_X" \
         -T ' closed tabs ' "XDG_STATE_HOME='$STATE_HOME' '$SELF' pick '$client_sess' '$client_tty'"
 }
 
