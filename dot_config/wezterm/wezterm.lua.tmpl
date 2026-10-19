@@ -149,6 +149,12 @@ end)
 -- prefix q fallback (Homebrew python3 -I -S, else /usr/bin/python3 -S, which
 -- must keep its pycache prefix).
 local STRIP_COLS = 34
+-- The width it opens at is the width it was last CLOSED at (CMD+B), so a
+-- drag sticks: kept in wezterm.GLOBAL (config reloads) and in a one-line
+-- file (WezTerm restarts). STRIP_COLS is only the first-ever width, and any
+-- remembered width outside STRIP_MIN..STRIP_MAX falls back to it.
+local STRIP_COLS_FILE = wezterm.home_dir .. "/.local/state/agent-ui-strip-cols"
+local STRIP_MIN, STRIP_MAX = 20, 120
 -- Which side of the tmux pane the sidebar opens on: "Right" or "Left".
 -- Takes effect at the next CMD+B (an open sidebar stays where it is).
 local STRIP_SIDE = "Right"
@@ -193,6 +199,44 @@ local function find_strip(tab)
     return nil
 end
 
+local function strip_width_ok(n)
+    return type(n) == "number" and n >= STRIP_MIN and n <= STRIP_MAX
+end
+
+-- The width to open at: the remembered one, else STRIP_COLS.
+local function strip_cols()
+    local n = wezterm.GLOBAL.strip_cols
+    if not strip_width_ok(n) then
+        local f = io.open(STRIP_COLS_FILE, "r")
+        if f then
+            n = tonumber(f:read("*l"))
+            f:close()
+        end
+    end
+    if not strip_width_ok(n) then
+        return STRIP_COLS
+    end
+    n = math.floor(n)
+    wezterm.GLOBAL.strip_cols = n
+    return n
+end
+
+-- Remember the closing strip's width (only when it changed: no write per
+-- CMD+B otherwise).
+local function remember_strip_cols(strip)
+    local ok, dims = pcall(function() return strip:get_dimensions() end)
+    local n = ok and dims and dims.cols
+    if not strip_width_ok(n) or n == wezterm.GLOBAL.strip_cols then
+        return
+    end
+    wezterm.GLOBAL.strip_cols = n
+    local f = io.open(STRIP_COLS_FILE, "w")
+    if f then
+        f:write(tostring(n), "\n")
+        f:close()
+    end
+end
+
 local toggle_strip = wezterm.action_callback(function(window, pane)
     local tab = pane:tab()
     if not tab then
@@ -200,6 +244,7 @@ local toggle_strip = wezterm.action_callback(function(window, pane)
     end
     local strip = find_strip(tab)
     if strip then
+        remember_strip_cols(strip)
         wezterm.GLOBAL[strip_key(tab)] = -1
         -- The Pane object has no kill(); CloseCurrentPane would close
         -- whichever pane is active, which is the tmux pane.
@@ -210,7 +255,7 @@ local toggle_strip = wezterm.action_callback(function(window, pane)
     end
     local new = pane:split {
         direction = (STRIP_SIDE == "Left") and "Left" or "Right",
-        size = STRIP_COLS,          -- >= 1: a cell count, not a fraction
+        size = strip_cols(),        -- >= 1: a cell count, not a fraction
         top_level = true,
         args = strip_argv(pane),
         set_environment_variables = {
