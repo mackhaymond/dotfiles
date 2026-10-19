@@ -791,6 +791,8 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   renders one frame):
 
   ```
+  ▌  d  Sidebar status   ⠹ working       "YOU'RE ON": the client's window, a
+  ▌     › Running cargo test  1 main     full-width `tile_hi` band (below)
    ▄ prefix ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄    the usage panel (`tile_lo`, half-block
     S ━━━━━┃━━━━━━━━━━━    21%   −4%     caps); the key table's mark a solid tab
     W ━━━━━━━━━━┃━━━━━━    60%  +17%     on its top cap; one meter per window
@@ -845,6 +847,28 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   pressure every agent row stays the same height: idle agents fold first,
   then every agent goes to one line at once; the SHELLS section becomes
   one line in the dock before any agent loses detail.
+- **"You're on"** (`layout::here_rows`, `Frame::here`): the very top row
+  names the client's own window, as OpenCode's sidebar opens with the
+  session's title. A full-width band on `tile_hi` (no canvas margins: a
+  header, not a card) with a `▌` in the space's colour at the edge. An
+  agent: its key-cap solid, its title bold, its state's glyph and word on
+  the right (nothing when idle; the glyph alone when narrow); a shell (no
+  agent is the client's): its ⌥N cap and name. The space as a small chip
+  (` 1 ` solid, its name in its colour) when the whole title fits beside
+  it, else ` N ` alone, else none. From 24 rows a second line when it says
+  something (the live blurb after `›`, the message), the chip at its end.
+  A click does what the card's does (goto; a shell: go there); a
+  right-click on it parks nothing (the top row is too easy to hit). A
+  window linked into two spaces is named as the client's own space's copy.
+  At any width it keeps its state's glyph (the title clips first). Nothing in
+  a hidden session (the stash, `agents`, ...) or without a client space.
+  Priority: it is there from 3 rows, so wherever any agent card shows; it
+  takes its row from the body before any optional row is spent; toasts
+  start under it, never over it; only the ⌥W / prefix marks take its row
+  when a frame is too short for both. In AGENTS the client's own card
+  also carries a lavender `▐` down its right edge, both rows (apart from
+  every left-edge state rail, the stash selection's mauve and the NEEDS
+  YOU tints).
 - **Cards and state**: a state rail `▎` down a card's left edge in its
   state's colour (blue working, yellow asking, red failed, green done; the
   client's own idle agent lavender; the stash selection a heavier mauve

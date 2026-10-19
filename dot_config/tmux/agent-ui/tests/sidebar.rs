@@ -257,7 +257,9 @@ fn once_follows_the_scope_options() {
     // no space chip; work has no shells, so no SHELLS section; the agents
     // section says which scope).
     let classic = once();
-    assert!(classic[0].starts_with(" NEEDS YOU") && !classic.iter().any(|l| l.contains("SHELLS")), "{classic:#?}");
+    // (On top, the "you're on" header: the client sits on work:1.)
+    assert!(classic[0].starts_with("▌  a  Which deck") && classic[0].trim_end().ends_with("◉ asks"), "{classic:#?}");
+    assert!(classic[1..5].iter().any(|l| l.starts_with(" NEEDS YOU")) && !classic.iter().any(|l| l.contains("SHELLS")), "{classic:#?}");
     assert!(agents_part(&classic)[0].ends_with("all spaces ") && agents_part(&classic).iter().any(|l| is_group(l, "zeta")),
         "{classic:#?}");
     s.tmux(&["set-option", "-g", "@spaces", "on"]);
@@ -525,9 +527,11 @@ fn notify_toasts_in_the_sidebar_and_falls_back_without_one() {
     assert!(notify(&s, &focus, &log, &["-c", &tty, "-k", "ok", "-t", "2", "--", "parked", "Canvas\tSyllabus"]).success());
     wait_for("the toast", || screen().contains("┃ parked Canvas Syllabus"));
     assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
-    // A card: the kind's glyph and title on its first row, between its bars.
-    let top = screen().lines().next().unwrap_or_default().to_string();
-    assert!(top.starts_with(" ┃ ✓ Done ") && top.ends_with(" ┃"), "{top:?}");
+    // A card: the kind's glyph and title on its first row, between its
+    // bars, right under the "you're on" header (which it never covers).
+    let lines: Vec<String> = screen().lines().map(String::from).collect();
+    let k = lines.iter().position(|l| l.starts_with(" ┃ ")).unwrap();
+    assert!(k > 0 && lines[0].starts_with("▌  a  Which deck") && lines[k].starts_with(" ┃ ✓ Done ") && lines[k].ends_with(" ┃"), "{lines:#?}");
     // (Untrimmed: an empty title is a trailing tab.)
     let raw = s.tmux(&["show-options", "-gqv", "@toast"]);
     let f: Vec<&str> = raw.trim_end_matches('\n').split('\t').collect();
@@ -553,8 +557,9 @@ fn notify_toasts_in_the_sidebar_and_falls_back_without_one() {
     assert!(notify(&s, &focus, &log, &["-k", "error", "-t", "60", "and another"]).success());
     wait_for("the context's toasts", || screen().contains("┃ no client given") && screen().contains("┃ and another"));
     let lines: Vec<String> = screen().lines().map(String::from).collect();
-    assert!(lines[0].contains("▲ Heads up") && lines[1].contains("no client given") && lines[3].contains("✕ Error")
-        && lines[4].contains("and another"), "{lines:#?}");
+    let k = lines.iter().position(|l| l.starts_with(" ┃ ")).unwrap();
+    assert!(lines[k].contains("▲ Heads up") && lines[k + 1].contains("no client given") && lines[k + 3].contains("✕ Error")
+        && lines[k + 4].contains("and another"), "{lines:#?}");
     // A second client, with no sidebar: tmux's own message, no toast.
     let other = s.nested_client("zeta", "main:7");
     let seq = opt("@toast_seq");

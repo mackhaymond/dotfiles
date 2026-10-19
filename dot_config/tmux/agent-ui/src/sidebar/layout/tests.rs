@@ -185,8 +185,10 @@ fn texts(f: &Frame) -> Vec<String> {
     f.rows.iter().map(Row::text).collect()
 }
 
+/// The first row under the "you're on" header that says `needle`.
 fn find(f: &Frame, needle: &str) -> usize {
-    f.rows.iter().position(|r| r.text().contains(needle)).unwrap_or_else(|| panic!("{needle:?} not in {:#?}", texts(f)))
+    f.rows.iter().enumerate().skip(f.here.end).find(|(_, r)| r.text().contains(needle)).map(|(y, _)| y)
+        .unwrap_or_else(|| panic!("{needle:?} not in {:#?}", texts(f)))
 }
 
 /// The agents section's text.
@@ -299,7 +301,7 @@ fn check_order(name: &str, f: &Frame) {
         }
     }
     if !f.card.is_empty() {
-        assert!(f.card.start == 0 && f.card.end <= f.needs.start, "{name}: card {:?} {t:#?}", f.card);
+        assert!(f.card.start == f.here.end && f.card.end <= f.needs.start, "{name}: card {:?} {t:#?}", f.card);
         assert!(f.status.start > f.card.start && f.status.end < f.card.end, "{name}");
         assert!(!shown(f.card.end - 1) || is_pad(&t[f.card.end - 1]), "{name}: the panel's bottom pad {t:#?}");
     }
@@ -475,7 +477,7 @@ fn spare_rows_buy_spacing_back() {
     // A frame with just enough (34x40, the shells in the dock): the dock
     // keeps its caps, nothing blank at the bottom; the agents keep their
     // shape (the zebra, no pads).
-    let f = layout(&lettered(quiet()), 34, 40, &with_bar(demo_bar()));
+    let f = layout(&lettered(quiet()), 34, 40, &with_bar(headless()));
     let t = texts(&f);
     assert_eq!((f.step, f.agents_step, f.shells.len()), (STEPS.len() as u8 - 1, 0, 1), "{t:#?}");
     assert!(docked(&f) && is_pad(&t[39]) && f.dock.start == f.agents.end, "{t:#?}");
@@ -619,8 +621,10 @@ fn quiet_is_roomy() {
     // with the age; the next card right under that. A canvas margin either
     // side.
     let r = find(&f, "Tmux Agent Sidebar");
-    assert!(t[r].starts_with(" ▎ Tmux Agent Sidebar") && t[r].ends_with("⠋ working  "), "{:?}", t[r]);
-    assert!(t[r + 1].starts_with(" ▎   Edit agent-roster.py") && t[r + 1].ends_with(" 2m  "), "{:?}", t[r + 1]);
+    assert!(t[r].starts_with(" ▎ Tmux Agent Sidebar") && t[r].ends_with("⠋ working▐ "), "{:?}", t[r]);
+    assert!(t[r + 1].starts_with(" ▎   Edit agent-roster.py") && t[r + 1].ends_with(" 2m▐ "), "{:?}", t[r + 1]);
+    // The client's own card: a lavender `▐` down its right edge, both rows.
+    assert_eq!((f.rows[r].segs[f.rows[r].segs.len() - 2].clone(), f.rows[r + 1].segs[f.rows[r + 1].segs.len() - 2].clone()), (seg("▐", "lavender"), seg("▐", "lavender")));
     assert_eq!((f.rows[r].bg, f.rows[r + 1].bg), (Some(Ink::Pal("tile_hi")), Some(Ink::Pal("tile_hi"))));
     assert_eq!((f.rows[r].segs[1].clone(), f.rows[r + 1].segs[1].clone()), (seg("▎", "blue"), seg("▎", "blue")));
     assert!(f.rows[r].segs.contains(&bold("Tmux Agent Sidebar", "text")) && f.rows[r].segs.contains(&bold("⠋ working", "blue")), "{:?}", f.rows[r].segs);
@@ -1328,6 +1332,12 @@ fn demo_bar() -> Bar {
     }
 }
 
+/// [`demo_bar`] without a client space: no "you're on" header, so a toast
+/// test's rows start at the top.
+fn headless() -> Bar {
+    Bar { space: None, ..demo_bar() }
+}
+
 fn with_bar(bar: Bar) -> Opts {
     Opts { bar, ..Opts::default() }
 }
@@ -1401,7 +1411,7 @@ fn letter_key_caps_lead_every_agent_row_and_card() {
 #[test]
 fn the_panel_replaces_the_status_line() {
     let v = lettered(quiet());
-    let f = layout(&v, 34, 40, &with_bar(demo_bar()));
+    let f = layout(&v, 34, 40, &with_bar(headless()));
     let t = texts(&f);
     assert_eq!((f.card.clone(), f.status.clone()), (0..6, 1..5), "{t:#?}");
     assert!(!t[f.card.clone()].iter().any(|l| l.contains("main") || l.contains('⌥')), "{t:#?}");
@@ -1429,23 +1439,23 @@ fn the_panel_replaces_the_status_line() {
     assert_eq!((buf[(0, 2)].bg, buf[(1, 2)].bg, buf[(32, 2)].bg, buf[(33, 2)].bg),
         (canvas, palette::color(PANEL), palette::color(PANEL), canvas));
     // The red prefix mark, keyed on the client's key table: a tab on the top pad.
-    let p = layout(&v, 34, 40, &with_bar(Bar { prefix: true, ..demo_bar() }));
+    let p = layout(&v, 34, 40, &with_bar(Bar { prefix: true, ..headless() }));
     assert_eq!(texts(&p)[0], format!(" ▄ prefix {} ", "▄".repeat(23)));
     assert!(p.rows[0].segs.contains(&block(" prefix ", "crust", "red")));
     assert_eq!((p.card.clone(), texts(&p)[1..].to_vec()), (f.card.clone(), t[1..].to_vec()), "the panel keeps its rows");
     // 34x20: still a panel, usage in one line.
-    let f = layout(&v, 34, 20, &with_bar(demo_bar()));
+    let f = layout(&v, 34, 20, &with_bar(headless()));
     let t = texts(&f);
     assert!(!f.card.is_empty() && t.iter().any(|l| l.contains("S 13%  W 60%  F --")), "{t:#?}");
     // 34x14: no panel, the prefix mark on a row of its own; 34x11: no
     // usage either, nothing on top but the mark.
-    let f = layout(&v, 34, 14, &with_bar(Bar { prefix: true, ..demo_bar() }));
+    let f = layout(&v, 34, 14, &with_bar(Bar { prefix: true, ..headless() }));
     let t = texts(&f);
     assert!(f.card.is_empty() && t[0].starts_with("  prefix ") && t[1].starts_with(" S 13%"), "{t:#?}");
-    let f = layout(&v, 34, 11, &with_bar(demo_bar()));
+    let f = layout(&v, 34, 11, &with_bar(headless()));
     let t = texts(&f);
     assert!(f.status.is_empty() && t[0].starts_with(" NEEDS YOU") && !t.iter().any(|l| l.contains("13%")), "{t:#?}");
-    let f = layout(&v, 34, 11, &with_bar(Bar { prefix: true, ..demo_bar() }));
+    let f = layout(&v, 34, 11, &with_bar(Bar { prefix: true, ..headless() }));
     assert!(texts(&f)[0].starts_with("  prefix "), "{:#?}", texts(&f));
     // No toolbar, ever.
     assert!(!t.iter().any(|l| l.contains("⏵ next") || l.contains("≡")), "{t:#?}");
@@ -1603,9 +1613,9 @@ fn ages_follow_the_frame_clock() {
         (t[find(&f, "Lost suit jacket") + 1].clone(), t[find(&f, "Edit agent-roster.py")].clone(), t[find(&f, "▌ Kua Yu") + 1].clone())
     };
     let (idle, msg, card) = at(None);
-    assert!(idle.ends_with(" 6m  ") && msg.ends_with(" 2m  ") && card.ends_with(" 3m  "), "{idle:?} {msg:?} {card:?}");
+    assert!(idle.ends_with(" 6m  ") && msg.ends_with(" 2m▐ ") && card.ends_with(" 3m  "), "{idle:?} {msg:?} {card:?}");
     let (idle, msg, card) = at(Some(NOW as f64 + 60.0));
-    assert!(idle.ends_with(" 7m  ") && msg.ends_with(" 3m  ") && card.ends_with(" 4m  "), "{idle:?} {msg:?} {card:?}");
+    assert!(idle.ends_with(" 7m  ") && msg.ends_with(" 3m▐ ") && card.ends_with(" 4m  "), "{idle:?} {msg:?} {card:?}");
 }
 
 /// Dim text on a surface (a pill, a card, a tile) is `overlay2`, never
@@ -1760,7 +1770,7 @@ fn explicit_space_scope_without_spaces_keeps_the_current_shell() {
     // The client's shell is a tile (the classic rule), its lavender rail,
     // no state word.
     let z = b.iter().find(|l| l.contains("zsh")).unwrap_or_else(|| panic!("{b:#?}"));
-    assert!(z.starts_with(" ▎ zsh") && z.trim_end().ends_with("zsh"), "{z:?}");
+    assert!(z.starts_with(" ▎ zsh") && z.trim_end().ends_with("▐") && !z.contains("idle"), "{z:?}");
     assert!(b.iter().any(|l| row_title(l) == Some("two")) && b.iter().any(|l| row_title(l) == Some("twelve")), "{b:#?}");
 }
 
@@ -1985,9 +1995,9 @@ const LONG: &str = "couldn't park Canvas Syllabus: it is still working on the ex
 #[test]
 fn a_toast_is_a_card_over_the_top() {
     let v = lettered(quiet());
-    let plain = layout(&v, 34, 40, &with_bar(demo_bar()));
+    let plain = layout(&v, 34, 40, &with_bar(headless()));
     let ok = toast(Kind::Ok, "parked Canvas Syllabus");
-    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![ok.clone()], ..demo_bar() }));
+    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![ok.clone()], ..headless() }));
     let t = texts(&f);
     let time = posted_at(&ok);
     assert_eq!(f.toast, 0..3, "{t:#?}");
@@ -2019,16 +2029,16 @@ fn a_toast_is_a_card_over_the_top() {
     // Each kind: its glyph, title and colour.
     for (k, glyph, title, hue) in [(Kind::Info, "●", "Info", "blue"), (Kind::Ok, "✓", "Done", "green"),
         (Kind::Warn, "▲", "Warning", "peach"), (Kind::Error, "✕", "Error", "red")] {
-        let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![toast(k, "hi")], ..demo_bar() }));
+        let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![toast(k, "hi")], ..headless() }));
         assert!(texts(&f)[0].starts_with(&format!(" ┃ {glyph} {title} ")), "{k:?}: {:?}", texts(&f)[0]);
         assert!(f.rows[0].segs.contains(&bold(format!("{glyph} {title}"), hue)) && f.rows[1].segs[1] == seg("┃", hue), "{k:?}");
     }
     // notify.sh -T: the title instead of the kind's.
     let titled = Toast { title: Some("Stash".into()), ..ok.clone() };
-    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![titled], ..demo_bar() }));
+    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![titled], ..headless() }));
     assert!(texts(&f)[0].starts_with(" ┃ ✓ Stash "), "{:?}", texts(&f)[0]);
     // Narrow: the time goes before the title is cut; the bars stay.
-    let f = layout(&v, 17, 40, &with_bar(Bar { toasts: vec![ok], ..demo_bar() }));
+    let f = layout(&v, 17, 40, &with_bar(Bar { toasts: vec![ok], ..headless() }));
     let top = texts(&f)[0].clone();
     assert!(top.starts_with(" ┃ ✓ Done ") && top.ends_with(" ┃ ") && !top.contains(':'), "{top:?}");
 }
@@ -2041,7 +2051,7 @@ fn a_toast_is_a_card_over_the_top() {
 fn toasts_stack_oldest_on_top() {
     let v = lettered(quiet());
     let stack = vec![toast_n(1, Kind::Ok, "one"), toast_n(2, Kind::Warn, "two"), toast_n(3, Kind::Error, "three"), toast_n(4, Kind::Info, "four")];
-    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: stack.clone(), ..demo_bar() }));
+    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: stack.clone(), ..headless() }));
     let t = texts(&f);
     assert_eq!(f.toast, 0..9, "{t:#?}");
     assert!(t[1].contains("two") && t[4].contains("three") && t[7].contains("four") && !t.iter().any(|l| l.contains(" one ")), "{t:#?}");
@@ -2054,25 +2064,25 @@ fn toasts_stack_oldest_on_top() {
     // By posting time, whatever order `@toast` gave them in.
     let mut rev = stack.clone();
     rev.reverse();
-    assert_eq!(layout(&v, 34, 40, &with_bar(Bar { toasts: rev, ..demo_bar() })).rows, f.rows);
+    assert_eq!(layout(&v, 34, 40, &with_bar(Bar { toasts: rev, ..headless() })).rows, f.rows);
     // The earliest deadline among those drawn; an expired one is not drawn.
     let short = Toast { ttl: 2.0, ..toast_n(5, Kind::Ok, "short") };
     let pair = vec![short.clone(), toast_n(6, Kind::Ok, "long")];
-    let at = |now: f64| layout(&v, 34, 40, &Opts { now: Some(now), ..with_bar(Bar { toasts: pair.clone(), ..demo_bar() }) });
+    let at = |now: f64| layout(&v, 34, 40, &Opts { now: Some(now), ..with_bar(Bar { toasts: pair.clone(), ..headless() }) });
     assert_eq!((at(NOW as f64).toast.clone(), at(NOW as f64).toast_until), (0..6, Some(until_ms(&short))));
     let later = at(NOW as f64 + 3.0);
     assert_eq!((later.toast.clone(), later.toast_until), (0..3, Some(until_ms(&pair[1]))));
     assert!(texts(&later)[1].contains("long"));
     // Short frames: never the last row; the newest always there when any is.
     for h in 2u16..=12 {
-        let f = layout(&v, 34, h, &with_bar(Bar { toasts: stack.clone(), ..demo_bar() }));
+        let f = layout(&v, 34, h, &with_bar(Bar { toasts: stack.clone(), ..headless() }));
         let t = texts(&f);
         assert!(f.toast.len() < usize::from(h) && !f.toast.is_empty(), "{h}: {t:#?}");
         assert!(t.iter().any(|l| l.contains("four")), "{h}: {t:#?}");
         assert!(h >= 3 || f.toast.len() == 1, "{h}: a compact row {t:#?}");
     }
     // Too narrow for a card: the newest as a compact row.
-    let f = layout(&v, 15, 40, &with_bar(Bar { toasts: stack, ..demo_bar() }));
+    let f = layout(&v, 15, 40, &with_bar(Bar { toasts: stack, ..headless() }));
     assert!(f.toast == (0..1) && texts(&f)[0].contains("four"), "{:#?}", texts(&f));
 }
 
@@ -2081,13 +2091,13 @@ fn toasts_stack_oldest_on_top() {
 #[test]
 fn a_long_toast_wraps_inside_its_card() {
     let v = lettered(quiet());
-    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![toast(Kind::Error, LONG)], ..demo_bar() }));
+    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![toast(Kind::Error, LONG)], ..headless() }));
     let t = texts(&f);
     assert_eq!(f.toast, 0..5, "{t:#?}");
     assert!(t[1].starts_with(" ┃ couldn't park Canvas ") && t[2].starts_with(" ┃ Syllabus: it is still ") && t[3].starts_with(" ┃ working on the export "), "{t:#?}");
     assert!((0..4).all(|y| t[y].ends_with(" ┃ ") && f.target(1, y as u16) == Some(&Target::Toast(TOAST_ID))), "{t:#?}");
     let huge = format!("{LONG} {LONG}");
-    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![toast(Kind::Error, &huge)], ..demo_bar() }));
+    let f = layout(&v, 34, 40, &with_bar(Bar { toasts: vec![toast(Kind::Error, &huge)], ..headless() }));
     let t = texts(&f);
     assert_eq!(f.toast, 0..5, "{t:#?}");
     assert!(t[3].trim_end_matches([' ', '┃']).ends_with('…'), "{t:#?}");
@@ -2135,7 +2145,7 @@ fn the_toast_clock_is_local_hh_mm() {
 fn toasts_never_cover_the_marks_or_the_hint() {
     let v = lettered(busy());
     let up = vec![toast(Kind::Ok, "parked it")];
-    let bar = Bar { prefix: true, selecting: Some(2), toasts: up.clone(), ..demo_bar() };
+    let bar = Bar { prefix: true, selecting: Some(2), toasts: up.clone(), ..headless() };
     for (w, h) in [(34u16, 40u16), (34, 14), (38, 50), (24, 30)] {
         let f = layout(&v, w, h, &with_bar(bar.clone()));
         let t = texts(&f);
@@ -2144,11 +2154,11 @@ fn toasts_never_cover_the_marks_or_the_hint() {
         assert!(t[f.toast.clone()].iter().any(|l| l.contains("parked it")), "{w}x{h}: {t:#?}");
     }
     // ⌥W armed: the tab stays, the card under it.
-    let f = layout(&v, 34, 40, &with_bar(Bar { jump: true, toasts: up.clone(), ..demo_bar() }));
+    let f = layout(&v, 34, 40, &with_bar(Bar { jump: true, toasts: up.clone(), ..headless() }));
     assert_eq!(f.toast, 1..4, "{:#?}", texts(&f));
     assert!(texts(&f)[0].contains("⌥W jump"), "{:#?}", texts(&f));
     // Nothing waiting: from the very top.
-    assert_eq!(layout(&v, 34, 40, &with_bar(Bar { toasts: up, ..demo_bar() })).toast, 0..3);
+    assert_eq!(layout(&v, 34, 40, &with_bar(Bar { toasts: up, ..headless() })).toast, 0..3);
 }
 
 /// A sidebar too small for a card still shows the newest toast, as one
@@ -2160,7 +2170,7 @@ fn a_small_sidebar_still_shows_a_toast() {
     let v = lettered(quiet());
     let stack = vec![toast_n(1, Kind::Ok, "older"), toast_n(2, Kind::Warn, "newest")];
     for (w, h) in [(15u16, 40u16), (12, 10), (6, 8), (34, 2), (20, 2)] {
-        let f = layout(&v, w, h, &with_bar(Bar { toasts: stack.clone(), ..demo_bar() }));
+        let f = layout(&v, w, h, &with_bar(Bar { toasts: stack.clone(), ..headless() }));
         let t = texts(&f);
         assert_eq!(f.toast.len(), 1, "{w}x{h}: {t:#?}");
         let y = f.toast.start;
@@ -2170,10 +2180,10 @@ fn a_small_sidebar_still_shows_a_toast() {
         assert_eq!(f.toast_until, Some(until_ms(&stack[1])));
     }
     // Three rows already hold a card (two rows), the frame's last row kept.
-    let f = layout(&v, 34, 3, &with_bar(Bar { toasts: stack.clone(), ..demo_bar() }));
+    let f = layout(&v, 34, 3, &with_bar(Bar { toasts: stack.clone(), ..headless() }));
     assert!(f.toast == (0..2) && texts(&f)[0].contains("▲ Warning") && texts(&f)[1].contains("newest"), "{:#?}", texts(&f));
     // One row: nothing (the last row is the parked one).
-    assert!(layout(&v, 34, 1, &with_bar(Bar { toasts: stack, ..demo_bar() })).toast.is_empty());
+    assert!(layout(&v, 34, 1, &with_bar(Bar { toasts: stack, ..headless() })).toast.is_empty());
 }
 
 /// The sidebar paints its own canvas (mantle) under everything: no cell is
@@ -2244,7 +2254,7 @@ fn a_working_agent_shows_its_activity() {
     let f = layout(&v, 34, 58, &Opts::default());
     let t = texts(&f);
     let r = find(&f, "Tmux Agent Sid");
-    assert!(t[r + 1].starts_with(" ▎     › Running @2") && t[r + 1].ends_with(" 2m  "), "{:?}", t[r + 1]);
+    assert!(t[r + 1].starts_with(" ▎     › Running @2") && t[r + 1].ends_with(" 2m▐ "), "{:?}", t[r + 1]);
     assert!(f.rows[r + 1].segs.contains(&seg("› ", "blue")) && f.rows[r + 1].segs.contains(&seg("Running @2", "overlay2")));
     // Not working (idle, asking): their own second lines.
     let n = find(&f, "Lost suit jacket");
@@ -2376,3 +2386,128 @@ fn toasts_never_cover_parked() {
     }
 }
 
+
+/// The "you're on" header at the very top: a full-width band (no canvas
+/// margins: a header, not a card) on `tile_hi` with a `▌` in the space's
+/// colour at the edge. An agent: its key-cap solid, its title bold, its
+/// state's glyph and word, the space as a small chip; a second line (its
+/// live blurb or message) from 24 rows, the chip at its end. A click does
+/// what its card's does; toasts start under it.
+#[test]
+fn the_header_says_where_you_are() {
+    let peach = Ink::Pal("peach");
+    let v = lettered(quiet());
+    let f = layout(&v, 42, 62, &with_bar(demo_bar()));
+    let t = texts(&f);
+    let go = Some(Target::Go { win: "@2".into(), session: "main".into() });
+    assert_eq!(f.here, 0..2, "{t:#?}");
+    let (r0, r1) = (&f.rows[0], &f.rows[1]);
+    assert_eq!((r0.bg, r1.bg, r0.segs[0].clone(), r1.segs[0].clone()), (Some(Ink::Pal("tile_hi")), Some(Ink::Pal("tile_hi")), seg("▌", peach), seg("▌", peach)));
+    assert!(t[0].starts_with("▌  f  Tmux Agent Sidebar") && t[0].ends_with("⠋ working "), "{:?}", t[0]);
+    assert!(r0.segs.contains(&block(" f ", "crust", peach)) && r0.segs.contains(&bold("Tmux Agent Sidebar", "text")) && r0.segs.contains(&bold("⠋ working", "blue")));
+    assert!(t[1].starts_with("▌     Edit agent-roster.py") && r1.segs.contains(&seg(" main", peach)) && t[1].ends_with(" main "), "{:?}", t[1]);
+    assert!(r0.anim && f.spin);
+    for (x, y) in [(0u16, 0u16), (20, 0), (41, 1)] {
+        assert_eq!(f.target(x, y).cloned(), go, "({x},{y})");
+    }
+    // Then the panel, under it.
+    assert_eq!(f.card.start, 2);
+    // Fewer rows: one line, the chip beside the state when the whole title
+    // still fits, else its ` N ` (blank here: no ⌃N), else none.
+    let f = layout(&v, 42, 20, &with_bar(demo_bar()));
+    assert_eq!(f.here, 0..1);
+    let t0 = f.rows[0].text();
+    assert!(t0.contains("Tmux Agent Sidebar ") && t0.contains("⠋ working") && !t0.contains("main"), "{t0:?}");
+    let f = layout(&v, 60, 20, &with_bar(demo_bar()));
+    assert!(f.rows[0].text().trim_end().ends_with("⠋ working     main"), "{:?}", f.rows[0].text());
+    // Narrow: the title keeps its room, the state shrinks to its glyph.
+    let t0 = layout(&v, 24, 40, &with_bar(demo_bar())).rows[0].text();
+    assert!(t0.contains("Tmux") && t0.contains('⠋') && !t0.contains("working"), "{t0:?}");
+    // A toast starts under it.
+    let f = layout(&v, 42, 40, &with_bar(Bar { toasts: vec![toast(Kind::Ok, "hi")], ..demo_bar() }));
+    assert_eq!(f.toast.start, f.here.end);
+    assert!(f.rows[0].text().contains("Tmux Agent Sidebar"));
+    // On a shell (no agent is the client's): its ⌥N cap, its name; a click
+    // goes there.
+    let v = lettered(view(vec![a("main", 1, "idle", "Calm")], None));
+    let f = layout(&v, 42, 40, &with_bar(demo_bar()));
+    let t0 = f.rows[0].text();
+    assert!(t0.starts_with("▌  ⌥2  nvim") && f.rows[0].segs.contains(&block(" ⌥2 ", "crust", "blue")) && f.rows[0].segs.contains(&bold("nvim", "text")), "{t0:?}");
+    assert_eq!((f.here.len(), f.target(5, 0)), (1, Some(&Target::Shell { win: "@902".into(), session: "main".into() })));
+    // In a hidden session, or with no client space: no header at all.
+    let hidden = Bar { space: Some(super::super::status::Chip { index: None, name: "stash".into(), color: None, hidden: true }), ..demo_bar() };
+    for bar in [hidden, headless()] {
+        let f = layout(&lettered(quiet()), 42, 40, &with_bar(bar));
+        assert!(f.here.is_empty() && !f.rows[0].text().contains("Tmux"), "{:#?}", texts(&f));
+    }
+}
+
+/// The header goes after everything optional: wherever the sidebar shows
+/// an agent's card, it shows the header too, on the very top row (only the
+/// ⌥W / prefix mark, what a key press waits on, takes that row from it in a
+/// frame too short for both); two rows only from 24 rows. Every width.
+#[test]
+fn the_header_survives_short_frames() {
+    let marked = |b: &Bar| b.prefix || b.jump;
+    let bars = [demo_bar(), Bar { prefix: true, ..demo_bar() }, Bar { jump: true, ..demo_bar() }];
+    for (name, v) in [("quiet", lettered(quiet())), ("busy", lettered(busy())), ("extreme", lettered(extreme()))] {
+        let me = v.agents().find(|a| a.is_current).map(|a| (a.session.clone(), a.window_id.clone())).unwrap();
+        for bar in &bars {
+            for w in [16u16, 20, 24, 34, 42] {
+                for h in 2u16..=70 {
+                    let f = layout(&v, w, h, &with_bar(bar.clone()));
+                    let t = texts(&f);
+                    let ctx = format!("{name} {w}x{h} prefix={} jump={}", bar.prefix, bar.jump);
+                    let cards = f.agents.clone().any(|y| f.rows[y].covers.len() == 1 && !is_group_header(&f.rows[y], usize::from(w)));
+                    let word = if bar.prefix { "prefix" } else { "⌥W jump" };
+                    let mark_at = |y: usize| t.get(y).is_some_and(|l| l.contains(word));
+                    if cards {
+                        // The header on the top row, or (marks armed, a
+                        // frame too short for both) the mark there instead.
+                        let header = f.here.start == 0 && !f.here.is_empty() && t[0].starts_with('▌');
+                        assert!(header || marked(bar) && f.here.is_empty() && mark_at(0), "{ctx}: {t:#?}");
+                    }
+                    if marked(bar) && h >= 3 {
+                        // The mark right under the header (or on top).
+                        assert!(mark_at(f.here.end), "{ctx}: the header never hides the mark {t:#?}");
+                    }
+                    assert!(f.here.len() <= 1 || h >= 24, "{ctx}");
+                    // The `▐` only on the client's own card (both its rows).
+                    for y in (f.here.end..f.rows.len()).filter(|&y| f.rows[y].segs.iter().any(|s| s.text == "▐")) {
+                        let own = |y: usize| f.rows[y].covers == [me.clone()];
+                        assert!(own(y) || y > 0 && own(y - 1) && f.rows[y].covers.is_empty(), "{ctx}: {y} {t:#?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// At any width the header keeps its state's glyph (the title clips
+/// first), as the cards do.
+#[test]
+fn the_header_keeps_the_state_glyph_when_narrow() {
+    let v = lettered(quiet());
+    for w in [16u16, 20, 24, 30] {
+        let f = layout(&v, w, 40, &with_bar(demo_bar()));
+        let r = &f.rows[f.here.start];
+        assert!(r.segs.contains(&bold("⠋", "blue")) || r.segs.contains(&bold("⠋ working", "blue")), "{w}: {:?}", r.text());
+        assert!(r.text().contains('⠋') && width(&r.segs) == usize::from(w), "{w}: {:?}", r.text());
+    }
+}
+
+/// A window linked into two spaces is current in both (window ids): the
+/// header names the client's own space's copy, so its chip is that space's
+/// and a click keeps the client there.
+#[test]
+fn the_header_prefers_the_clients_own_space_for_a_linked_window() {
+    let mut v = lettered(view(vec![a("aaa", 1, "running", "Linked"), a("main", 1, "running", "Linked")], Some("@2")));
+    for x in v.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()) {
+        x.window_id = "@2".into();
+        x.is_current = true;
+    }
+    assert_eq!(v.agents().filter(|a| a.is_current).map(|a| a.session.as_str()).collect::<Vec<_>>(), ["aaa", "main"]);
+    let f = layout(&v, 42, 40, &with_bar(demo_bar()));
+    assert_eq!(f.target(5, 0), Some(&Target::Go { win: "@2".into(), session: "main".into() }), "{:#?}", texts(&f));
+    assert!(f.rows[0].segs.contains(&seg(" main", "peach")) || f.rows.get(1).is_some_and(|r| r.segs.contains(&seg(" main", "peach"))), "{:#?}", texts(&f));
+}

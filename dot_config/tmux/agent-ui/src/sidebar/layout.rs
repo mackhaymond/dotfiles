@@ -28,9 +28,11 @@
 //! catppuccin blocks): a [`module`] is ` key ` bold in dark ink on a colour,
 //! then ` label ` on `surface0`.
 //!
-//! ## Shape: the usage panel, NEEDS YOU, the agents (the body), the shells, the dock
+//! ## Shape: the header, the usage panel, NEEDS YOU, the agents (the body), the shells, the dock
 //!
 //! ```text
+//! ▌  d  Tmux Agent Sidebar ⚙  ⠹ working  "you're on": the client's window,
+//! ▌     › Running cargo test    1 main   a full-width `tile_hi` band
 //!  ▄ prefix ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄   the usage panel; the key table's
 //!   S ━━━━━━━━┃━━━━━━━━━━   21%   −4%    mark a chip on its top cap; one
 //!   W ━━━━━━━━━━━━━┃━━━━━   60%  +17%    meter per window, in its pace's
@@ -67,6 +69,26 @@
 //!
 //! Without a [`Bar`] (no client space, no usage, nothing selected) the top
 //! is the classic ` agents` / ` space` title with the counts.
+//!
+//! ## The header: "you're on"
+//!
+//! OpenCode's sidebar opens with the session's title; ours opens with the
+//! client's own window ([`here_rows`], [`Frame::here`]): a full-width band
+//! on `tile_hi` (the client's colour; no canvas margins, so a header and
+//! not a card) with a `▌` in the space's colour at the edge. An agent: its
+//! key-cap solid, its title bold, its state's glyph and word on the right
+//! (nothing when idle; the glyph alone when narrow); a shell: its ⌥N cap and
+//! name. The space as a small chip (` 1 ` solid, its name in its colour)
+//! where the whole title still fits beside it, else its ` N ` alone, else
+//! none. From [`HERE_TWO_H`] rows a second line when it says something
+//! (the live blurb, the message), the chip at its end. A click does what
+//! the card's does. Nothing in a hidden session or without a client space.
+//! It is the last thing to go: it costs the body its row before any
+//! optional row is spent, from [`HERE_MIN_H`] rows, and toasts start under
+//! it (it joins the top rows they never cover); only the key-table marks
+//! take its row in a frame too short for both. The client's own card in
+//! AGENTS carries a lavender `▐` down its right edge ([`MINE`]), both rows,
+//! where no state rail ever is.
 //!
 //! ## The bottom: the dock
 //!
@@ -556,6 +578,9 @@ pub struct Frame {
     /// The panel's content rows (the selection hint, usage, the stale save;
     /// the key-table marks without a panel): empty without a [`Bar`].
     pub status: Range<usize>,
+    /// The "you're on" header at the very top (the client's window): one
+    /// row, two with its second line; empty when there is none.
+    pub here: Range<usize>,
     /// The usage panel's rows, its two half-block pads included; empty when
     /// the frame is too short (or narrow) for one.
     pub card: Range<usize>,
@@ -1154,6 +1179,8 @@ fn until_ms(t: &Toast) -> i64 {
 /// The top of the frame ([`top_rows`]).
 struct Top {
     rows: Vec<Row>,
+    /// The "you're on" header's rows ([`here_rows`]; empty: none).
+    here: Range<usize>,
     /// The content rows.
     status: Range<usize>,
     /// The panel's rows (empty: no panel).
@@ -1164,6 +1191,160 @@ struct Top {
     keep: usize,
 }
 
+/// The client's own window, as the header shows it.
+#[derive(Debug, Clone, Copy)]
+enum Here<'a> {
+    Agent(&'a Agent),
+    Shell(&'a Shell),
+}
+
+/// Where the client is: its current agent, else its space's active shell
+/// (the client's plain window drawn as an agent row, in the classic rule,
+/// is that shell). None without a client space, in a hidden session (the
+/// stash, `agents`, ...), or with nothing to name.
+fn here_of<'a>(view: &'a ViewModel, bar: &'a Bar) -> Option<Here<'a>> {
+    let chip = bar.space.as_ref()?;
+    if chip.hidden {
+        return None;
+    }
+    let shell = bar.shells.iter().find(|s| s.active);
+    // (`is_current` compares window ids: a window linked into two spaces is
+    // current in both. The client's own space's copy is the one it is on,
+    // whose chip and click keep it there.)
+    let current: Vec<&Agent> = view.agents().filter(|a| a.is_current).collect();
+    match current.iter().find(|a| a.session == chip.name).or(current.first()).copied() {
+        Some(a) if a.cat.is_some() || shell.is_none_or(|s| s.win != a.window_id) => Some(Here::Agent(a)),
+        _ => shell.map(Here::Shell),
+    }
+}
+
+/// The header needs this many rows in the frame (one); its second line,
+/// this many.
+const HERE_MIN_H: usize = 3;
+const HERE_TWO_H: usize = 24;
+
+/// The header's surface: the client's own colour (its agent's card, its
+/// active shell), full width, so it reads as a header and not a card.
+const HERE_BG: Hue = "tile_hi";
+
+/// The "you're on" header at the very top (OpenCode's sidebar opens with
+/// the session's title, bold): a full-width band on [`HERE_BG`] with a `▌`
+/// in the space's colour at the edge. An agent: its key-cap (solid), its
+/// title bold, its state's glyph and word on the right (nothing when
+/// idle); a shell: its ⌥N cap and its name. The space as a small chip (` 1 `
+/// solid, the name in its colour), where it fits. A second line (from
+/// [`HERE_TWO_H`] rows) only when it says something: an agent's live blurb
+/// or message, the space chip at its end. A click does what the card's
+/// does. None ([`here_of`]): no rows.
+fn here_rows(view: &ViewModel, bar: &Bar, cx: Cx, h: usize) -> Vec<Row> {
+    let w = cx.w;
+    let Some(here) = here_of(view, bar).filter(|_| h >= HERE_MIN_H && w >= 8) else { return Vec::new() };
+    let session = match here {
+        Here::Agent(a) => a.session.as_str(),
+        Here::Shell(s) => s.session.as_str(),
+    };
+    let space = view.spaces.iter().find(|sp| sp.name == session);
+    let chip_of = |n: Option<u32>, name: &str, ink: Ink| {
+        let num = n.filter(|n| (1..=9).contains(n)).map_or(" ".to_string(), |n| n.to_string());
+        vec![block(format!(" {num} "), ink_on(ink), ink), seg(format!(" {}", clip(&sanitize(name), 12)), name_ink(ink))]
+    };
+    let (ink, chip) = match (space, bar.space.as_ref()) {
+        (Some(sp), _) => (space_colour(sp), chip_of(sp.index, &sp.name, space_colour(sp))),
+        (None, Some(c)) => {
+            let ink = c.color.unwrap_or(Ink::Pal("peach"));
+            (ink, chip_of(c.index, &c.name, ink))
+        }
+        (None, None) => return Vec::new(),
+    };
+    let bg = Ink::Pal(HERE_BG);
+    let edge = seg(RAIL_HEAVY, ink);
+    let pad = || seg(" ", "text");
+    let (left, state, target, second, anim) = match here {
+        Here::Agent(a) => {
+            let mut left = vec![edge.clone(), pad()];
+            if cx.b.on {
+                left.extend([cx.b.seg(a, ink, bg, true), pad()]);
+            }
+            left.push(bold(short_title(a), "text"));
+            left.extend(a.flag.map(|(f, _)| match f {
+                Flag::Workflow => seg(" ⚙", "teal"),
+                Flag::Cua => seg(" ◎", "blue"),
+            }));
+            let word = state_word(a, cx).filter(|x| !x.idle());
+            let state: Vec<Vec<Seg>> = match &word {
+                Some(x) => vec![vec![bold(format!("{} {}", x.glyph, x.word), x.hue)], vec![bold(x.glyph, x.hue)]],
+                None => vec![vec![]],
+            };
+            let m = second_line(a, cx.now);
+            let second = (!m.trim().is_empty()).then(|| {
+                let lead = width(&left) - dwidth(&short_title(a)) - a.flag.map_or(0, |_| 2);
+                let mut l2 = vec![edge.clone(), seg(" ".repeat(lead - 1), "text")];
+                if live_blurb(a).is_some() {
+                    l2.extend([seg("› ", "blue"), seg(m.clone(), "overlay2")]);
+                } else {
+                    let asks = matches!(a.cat, Some(Cat::NeedsInput | Cat::Failed));
+                    l2.push(seg(m.clone(), if asks { "sub" } else { "overlay2" }));
+                }
+                l2
+            });
+            let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
+            (left, state, go, second, word.as_ref().is_some_and(Word::working))
+        }
+        Here::Shell(s) => {
+            let key = shell_key(s).map_or("    ".to_string(), |k| format!(" {k} "));
+            let mut left = vec![edge.clone(), pad(), shell_cap(s, key), pad()];
+            if s.home {
+                left.push(seg("⌂ ", "overlay2"));
+            }
+            left.push(bold(sanitize(&s.label), "text"));
+            (left, vec![vec![]], Target::Shell { win: s.win.clone(), session: s.session.clone() }, None, false)
+        }
+    };
+    let second = second.filter(|_| h >= HERE_TWO_H && cx.seconds());
+    // The chip on the second line, else on the first when the title keeps
+    // 12 cells (or its whole) beside it.
+    let with = |mut r: Vec<Seg>, chip: &[Seg]| {
+        if !r.is_empty() && !chip.is_empty() {
+            r.push(pad());
+        }
+        r.extend(chip.iter().cloned());
+        r.push(pad());
+        r
+    };
+    // (The title is the left's last bold `text` segment: what may clip.)
+    let tw = left.iter().rev().find(|x| x.bold && x.fg == Ink::Pal("text")).map_or(0, |x| dwidth(&x.text));
+    let need = width(&left) - tw + tw.min(12);
+    let room = |r: &[Seg]| w.saturating_sub(width(r) + 1);
+    // The chip whole, else its ` N ` alone, else none: the title (or the
+    // second line) comes first. The state's word gives way to its glyph
+    // only when the title would keep under 12 cells.
+    let short = if chip[0].text.trim().is_empty() { Vec::new() } else { chip[..1].to_vec() };
+    let chips = [chip.clone(), short, Vec::new()];
+    let mut rows = Vec::new();
+    // The state's word, else (narrow) its glyph, which always stays, as on
+    // the cards (the title clips first); then the chip as it fits beside
+    // them.
+    let state = state.iter().find(|x| room(&with((*x).clone(), &[])) >= need).or(state.last()).cloned().unwrap_or_default();
+    let right = match &second {
+        Some(_) => with(state, &[]),
+        // (The chip only beside the WHOLE title: the title comes first.)
+        None => chips.iter().map(|c| with(state.clone(), c)).find(|r| room(r) >= width(&left)).unwrap_or_else(|| with(state, &[])),
+    };
+    let left = clip_segs(left, room(&right));
+    let mut first = Row::new(fit(w, left, right, None)).bg(Some(bg)).click(w, target.clone());
+    first.anim = anim;
+    rows.push(first);
+    if let Some(l2) = second {
+        let lw = width(&l2);
+        let full = with(Vec::new(), &chips[0]);
+        let mut r2 = if lw + width(&full) < w { full } else { with(Vec::new(), &chips[1]) };
+        // (A cell between a line cut short and the chip.)
+        r2.insert(0, pad());
+        rows.push(Row::new(fit(w, l2, r2, None)).bg(Some(bg)).click(w, target));
+    }
+    rows
+}
+
 /// The top of the frame. With a [`Bar`]: the usage panel, a tile with a
 /// half-block pad above and below its content rows, the key-table marks a
 /// tab on its top pad. It needs 16 rows and 20 columns; one meter per
@@ -1171,8 +1352,26 @@ struct Top {
 /// too); the selection hint 6. Short of the panel, the marks get a row of
 /// their own and the content sits on the canvas. Without a bar: the
 /// classic title.
-fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
-    let mut top = Top { rows: Vec::new(), status: 0..0, card: 0..0, keep: 0 };
+fn top_rows(view: &ViewModel, bar: &Bar, cx: Cx, h: usize) -> Top {
+    let here = here_rows(view, bar, cx, h);
+    let mut top = panel_rows(view, bar, cx.w, h, cx.now);
+    let n = here.len();
+    if n > 0 {
+        // The header first; everything under it moves down, and stays under
+        // any toast with it (the cards start below the header).
+        let shift = |r: Range<usize>| r.start + n..r.end + n;
+        top.status = shift(top.status.clone());
+        top.card = if top.card.is_empty() { top.card } else { shift(top.card.clone()) };
+        top.keep += n;
+        top.rows.splice(0..0, here);
+        top.here = 0..n;
+    }
+    top
+}
+
+/// The panel part of [`top_rows`]: everything but the header.
+fn panel_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
+    let mut top = Top { rows: Vec::new(), here: 0..0, status: 0..0, card: 0..0, keep: 0 };
     if !bar_shown(bar) {
         top.rows.push(title_row(view, w));
         top.status = 1..1;
@@ -1289,6 +1488,12 @@ pub const CAP_TINT: u8 = 22;
 /// the heavier one of a NEEDS YOU card and the stash selection (U+258C).
 const RAIL: &str = "▎";
 const RAIL_HEAVY: &str = "▌";
+
+/// The client's own card's marker: a right-half block down its right edge
+/// in lavender (the "you" colour), both rows: apart from every state rail
+/// (left edge), the stash selection's mauve and the NEEDS YOU tints.
+const MINE: &str = "▐";
+const MINE_HUE: Hue = "lavender";
 
 /// What the jump table (⌥W) turns every key-cap into: INVERTED, a bold
 /// peach letter (its ` ⌥W jump ` mark's colour) on `crust`, darker than
@@ -1547,13 +1752,21 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink) -> Vec<Row> {
     }
     left.push(title);
     left.extend(flag);
-    let mut first = tile_row(cx.w, bg, left, right).click(cx.w, go.clone()).covering([a]);
+    // The client's own card: a lavender `▐` down its right edge (both
+    // rows), where no state rail ever is.
+    let mine = |mut r: Vec<Seg>| {
+        if a.is_current {
+            r.pop();
+            r.push(seg(MINE, MINE_HUE));
+        }
+        r
+    };
+    let mut first = tile_row(cx.w, bg, left, mine(right)).click(cx.w, go.clone()).covering([a]);
     first.anim = word.as_ref().is_some_and(Word::working);
     let Some(m) = msg else { return vec![first] };
-    let r2 = match &age {
-        Some(ag) => vec![seg(format!(" {ag} "), dimc)],
-        None => vec![seg(" ", "text")],
-    };
+    let mut r2: Vec<Seg> = age.iter().map(|ag| seg(format!(" {ag}"), dimc)).collect();
+    r2.push(seg(" ", "text"));
+    let r2 = mine(r2);
     // Under the title (past the key-cap); without letters, indented anyway,
     // so a message never reads as another agent.
     let indent = if cx.b.on { lead - 1 } else { 3 };
@@ -2395,7 +2608,7 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
 fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     let (w, h) = (cx.w, usize::from(frame.height));
     let bar = &opts.bar;
-    let Top { rows: top, status, card, keep } = top_rows(view, bar, w, h, cx.now);
+    let Top { rows: top, here, status, card, keep } = top_rows(view, bar, cx, h);
     // The rows between the top and the PARKED line (held back like the old
     // last row: it carries the stash, the messages and the watcher).
     let avail = h.saturating_sub(top.len() + 1);
@@ -2403,7 +2616,10 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
         // No room for sections: one row still counts every agent of the
         // scope, then the parked row.
         let all: Vec<&Agent> = groups(view).into_iter().flat_map(|s| s.agents.iter()).collect();
-        let mut rows = vec![top.into_iter().next().unwrap_or_else(|| Row::blank(w))];
+        // (What a key press waits on, the marks, over the header.)
+        let first = if keep > here.end { here.end } else { 0 };
+        let here = if first == 0 { here } else { 0..0 };
+        let mut rows = vec![top.into_iter().nth(first).unwrap_or_else(|| Row::blank(w))];
         rows.push(if all.is_empty() { Row::blank(w) } else { more_row(w, &all, 0) });
         rows.push(parked_header(view, w, opts.msg.as_deref()));
         rows.truncate(h);
@@ -2413,6 +2629,7 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
         frame.rows = rows;
         frame.step = STEPS.len() as u8;
         frame.status = 0..0;
+        frame.here = here.start.min(1)..here.end.min(1);
         return keep.min(1);
     }
     // The dock's gap and one line of chips are held back first: spaces are
@@ -2484,6 +2701,7 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     }
     let mut rows = top;
     frame.status = status;
+    frame.here = here;
     frame.card = card;
     if gap_needs {
         rows.push(Row::blank(w));
