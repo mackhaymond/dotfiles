@@ -791,8 +791,6 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   renders one frame):
 
   ```
-  ▌  d  Sidebar status   ⠹ working       "YOU'RE ON": the client's window, a
-  ▌     › Running cargo test  1 main     full-width `tile_hi` band (below)
    ▄ prefix ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄    the usage panel (`tile_lo`, half-block
     S ━━━━━┃━━━━━━━━━━━    21%   −4%     caps); the key table's mark a solid tab
     W ━━━━━━━━━━┃━━━━━━    60%  +17%     on its top cap; one meter per window
@@ -833,7 +831,8 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   spaces. Palette: the zebra `tile` (#30314a) and `tile_lo` (#28283b): every
   card is one colour, both rows, consecutive cards (agents, shells)
   alternating the two, afresh under each space's header; `tile_hi`
-  (#31394f: the client's agent, both rows, and the active shell); the two
+  (#31394f: the active shell); `tile_me` (#474a66, lavender 30% over the
+  canvas: the client's own agent, below); the two
   panels (usage, dock) `tile_lo` behind `▄` / `▀` caps. The client's
   space's band is its colour over the canvas at the least strength (16%
   up) that keeps it 20+ RGB apart from the canvas and every card shade
@@ -847,28 +846,6 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   pressure every agent row stays the same height: idle agents fold first,
   then every agent goes to one line at once; the SHELLS section becomes
   one line in the dock before any agent loses detail.
-- **"You're on"** (`layout::here_rows`, `Frame::here`): the very top row
-  names the client's own window, as OpenCode's sidebar opens with the
-  session's title. A full-width band on `tile_hi` (no canvas margins: a
-  header, not a card) with a `▌` in the space's colour at the edge. An
-  agent: its key-cap solid, its title bold, its state's glyph and word on
-  the right (nothing when idle; the glyph alone when narrow); a shell (no
-  agent is the client's): its ⌥N cap and name. The space as a small chip
-  (` 1 ` solid, its name in its colour) when the whole title fits beside
-  it, else ` N ` alone, else none. From 24 rows a second line when it says
-  something (the live blurb after `›`, the message), the chip at its end.
-  A click does what the card's does (goto; a shell: go there); a
-  right-click on it parks nothing (the top row is too easy to hit). A
-  window linked into two spaces is named as the client's own space's copy.
-  At any width it keeps its state's glyph (the title clips first). Nothing in
-  a hidden session (the stash, `agents`, ...) or without a client space.
-  Priority: it is there from 3 rows, so wherever any agent card shows; it
-  takes its row from the body before any optional row is spent; toasts
-  start under it, never over it; only the ⌥W / prefix marks take its row
-  when a frame is too short for both. In AGENTS the client's own card
-  also carries a lavender `▐` down its right edge, both rows (apart from
-  every left-edge state rail, the stash selection's mauve and the NEEDS
-  YOU tints).
 - **Cards and state**: a state rail `▎` down a card's left edge in its
   state's colour (blue working, yellow asking, red failed, green done; the
   client's own idle agent lavender; the stash selection a heavier mauve
@@ -877,6 +854,15 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   absence of all that: no rail, no word, a regular title. The second line
   is `overlay2` (`sub` for an asking or failed agent: there it is the
   question), a live blurb after a blue `›`, the age at its end.
+- **Your own card** ("you are here" at a glance): the client's own agent
+  card is LIFTED, both rows, on `tile_me` (#474a66, lavender 30% over the
+  canvas: 30+ RGB apart from both zebra shades, the active shell, the stash
+  selection and the NEEDS YOU tints; every space's band keeps 12+ apart
+  from it), with a full lavender `█` cell down its right edge (from 26
+  columns), its key-cap solid, its title bold `text`, its dim text `sub`
+  (`overlay2` is about 3:1 there). The left state rail is as on any card.
+  A window linked into two spaces is current in both (window ids): only
+  the copy in the client's own space (`cur_session`) is lifted.
 
 - **The second line** (`layout::second_line`): a WORKING agent's live
   activity, a few words of what it does right now, after a blue `›`
@@ -1038,7 +1024,7 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   every cell is painted, `--once` writes a `48;2;24;24;37` code on every
   untinted cell), and every tint is mixed over it. The surfaces are tiles
   and buttons in solid fills (no box-drawing lines anywhere): `tile` /
-  `tile_lo` / `tile_hi`, the panels, NEEDS YOU cards in their state colour
+  `tile_lo` / `tile_hi` / `tile_me`, the panels, NEEDS YOU cards in their state colour
   mixed over the canvas (`Ink::Mix`, one tint per card, consecutive cards
   14% / 9%), the client's space's band (`layout::band`), the stash
   selection's mauve, the key-caps and the status-line modules; tests

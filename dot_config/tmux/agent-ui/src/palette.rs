@@ -40,13 +40,15 @@ pub const HEX: [(&str, &str); 16] = [
 /// card still reads as part of it), so neighbours part with no gap between
 /// them. The two panels (usage at the top, the dock at the bottom) are
 /// `tile_lo` too: never next to a card, always behind half-block caps.
-/// `tile_hi` (about `blue` at 18% over `base`) lifts the client's own
-/// agent (both rows) and the active shell.
-pub const UI: [(&str, &str); 11] = [
+/// `tile_hi` (about `blue` at 18% over `base`) lifts the active
+/// shell. `tile_me` (lavender at 30% over the canvas) is the client's own
+/// agent card, both rows: lifted well off every other surface, "you are
+/// here" at a glance.
+pub const UI: [(&str, &str); 12] = [
     ("base", "#1e1e2e"), ("mantle", "#181825"), ("surface2", "#585b70"),
     ("mauve", "#cba6f7"), ("lavender", "#b4befe"), ("sel", "#2a2b3d"),
     ("overlay2", "#9399b2"), ("tile", "#30314a"), ("tile_lo", "#28283b"),
-    ("tile_hi", "#31394f"), ("overlay1", "#7f849c"),
+    ("tile_hi", "#31394f"), ("overlay1", "#7f849c"), ("tile_me", "#474a66"),
 ];
 
 /// The `#rrggbb` for a palette name ([`HEX`] first, then [`UI`]). Panics on
@@ -183,6 +185,30 @@ mod tests {
         assert!(contrast(rgb(hi), rgb(lo)) > 1.1, "{hi}/{lo}: {:.3}", contrast(rgb(hi), rgb(lo)));
         assert!(l(lo) > 1.18 && l(hi) < 1.6, "{hi}/{lo}: {:.3} {:.3}", l(lo), l(hi));
         assert_eq!(over_canvas(rgb("red"), 14), mix_rgb("red", 14));
+    }
+
+    /// The client's own card (`tile_me`) is "you are here" at a glance: it
+    /// stands off every other surface by a wide margin (both zebra shades,
+    /// the active shell's lift, the stash selection, the NEEDS YOU tints,
+    /// the canvas, the panels), is lavender at 30% over the canvas, and its
+    /// text reads: `text` well over 5:1, `sub` (its dim text) about 4:1, the
+    /// placeholder's `overlay2` at least 3:1.
+    #[test]
+    fn the_own_card_stands_out() {
+        let dist = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            let d = |x: u8, y: u8| (f64::from(x) - f64::from(y)).powi(2);
+            (d(a.0, b.0) + d(a.1, b.1) + d(a.2, b.2)).sqrt()
+        };
+        let me = rgb("tile_me");
+        assert_eq!(me, mix_rgb("lavender", 30));
+        let others = [rgb(CANVAS), rgb("tile"), rgb("tile_lo"), rgb("tile_hi"), rgb("surface0"), mix_rgb("mauve", 18),
+            mix_rgb("yellow", 14), mix_rgb("yellow", 9), mix_rgb("red", 14), mix_rgb("red", 9), mix_rgb("green", 14), mix_rgb("green", 9)];
+        for o in others {
+            assert!(dist(me, o) >= 30.0, "{o:?}: {:.1}", dist(me, o));
+        }
+        // Lighter than either zebra shade: a lift, not another stripe.
+        assert!(contrast(me, rgb("tile")) > 1.25 && contrast(me, rgb(CANVAS)) > 1.7);
+        assert!(contrast(rgb("text"), me) >= 5.5 && contrast(rgb("sub"), me) >= 3.8 && contrast(rgb("overlay2"), me) >= 3.0);
     }
 
     /// Every surface stands off the canvas and off whatever can sit right

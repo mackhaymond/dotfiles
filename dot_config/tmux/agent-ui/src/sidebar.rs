@@ -643,13 +643,8 @@ impl App {
                 0 => act = t,
                 // A plain right press (SGR button 2; WezTerm has no right-click
                 // binding of its own, so it reaches a mouse-reporting pane):
-                // park, on an agent row or card only; never the "you're on"
-                // header (the top row, too easy to hit: it would park the
-                // window you are on).
-                2 => {
-                    let header = self.shown.here.contains(&usize::from(m.y.saturating_sub(1)));
-                    park = t.filter(|t| matches!(t, Target::Go { .. }) && !header);
-                }
+                // park, on an agent row or card only.
+                2 => park = t.filter(|t| matches!(t, Target::Go { .. })),
                 _ => {} // middle, or a modifier held: focus only
             }
         }
@@ -976,26 +971,6 @@ mod tests {
         a.last_act = None;
         a.handle(b"\x1b[<32;3;20M\x1b[<0;3;20m");
         assert_eq!((a.focus_backs, a.last_act.clone()), (1, None));
-    }
-
-    /// A right press on the "you're on" header (the top row: too easy to hit)
-    /// parks nothing; on the same agent's card it parks; a left click on the
-    /// header goes there.
-    #[test]
-    fn the_header_never_parks() {
-        let mut a = app();
-        let go = Target::Go { win: "@7".into(), session: "main".into() };
-        let mut rows = vec![layout::Row::default(); 30];
-        for y in [0, 9] {
-            rows[y].targets = vec![(0, 34, go.clone())];
-        }
-        a.shown = layout::Frame { width: 34, height: 30, rows, here: 0..1, ..layout::Frame::default() };
-        a.handle(b"\x1b[<2;5;1M\x1b[<2;5;1m");
-        assert_eq!((a.focus_backs, a.last_park.clone()), (1, None));
-        a.handle(b"\x1b[<2;5;10M\x1b[<2;5;10m");
-        assert_eq!(a.last_park, Some(("@7".to_string(), "main".to_string())));
-        a.handle(b"\x1b[<0;5;1M\x1b[<0;5;1m");
-        assert_eq!(a.last_act, Some(go));
     }
 
     /// `PARKED N` runs exactly prefix h's line (tmux.conf.tmpl, read when
