@@ -43,7 +43,8 @@ def sha1(body):
 
 
 @unittest.skipUnless(REAL_TMUX, "tmux executable required")
-class OriginTests(unittest.TestCase):
+class OriginHarness(unittest.TestCase):
+    """The private-server harness, no tests (test_agent_paused.py reuses it)."""
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="agent-origin-test-")
         self.root = Path(self.tmp.name)
@@ -151,6 +152,8 @@ class OriginTests(unittest.TestCase):
 
     VIEWING = dict(FAKE_ACTIVE_CLIENTS="1", FAKE_FRONT="wez")
 
+
+class OriginTests(OriginHarness):
     # --- new-turn agent origin: quiet restore ---
 
     def test_agent_turn_from_idle_is_quiet_back_to_idle(self):
@@ -654,8 +657,9 @@ class OriginTests(unittest.TestCase):
             self.assertFalse(self.has(name), name)
 
 
-class WatcherOriginTests(unittest.TestCase):
-    """The watcher ends an agent-originated turn by restoring its prior."""
+class WatcherHarness(unittest.TestCase):
+    """The watcher fake-harness, no tests (test_agent_paused.py reuses it): a
+    claude window running an agent turn with a saved `done` prior."""
     SID = "11111111-aaaa-bbbb-cccc-000000000001"
 
     def setUp(self):
@@ -693,6 +697,9 @@ class WatcherOriginTests(unittest.TestCase):
         st = self.f.read(); st["windows"]["@1"]["active_clients"] = n
         self.f.state.write_text(json.dumps(st))
 
+
+class WatcherOriginTests(WatcherHarness):
+    """The watcher ends an agent-originated turn by restoring its prior."""
     def test_bg_drain_restores_the_prior_instead_of_idle(self):
         o = self.ticks(5, FAKE_BG_RC="1")
         self.assertEqual(o["@agent_state"], "done")

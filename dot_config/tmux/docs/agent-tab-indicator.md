@@ -27,6 +27,7 @@ State by state (unselected tab):
 | `needs-input` | waiting on you: a permission gate or a question (`needs-approval` survives only as the hook MODE name) | crust (yellow digit) | yellow `#f9e2af` | — |
 | `failed` | the turn itself died (`StopFailure`: 529, overloaded) | crust (red digit) | red `#f38ba8` | — |
 | `done` | turn finished | crust (green digit) | green `#a6e3a1` | — |
+| `paused` | a turn end while the pause key's `@agent_paused` is set (see "Paused" in §6) | blue, solid | stock | lavender `⏸` `#b4befe`, still |
 | any | agent has a conversation title | — | — | tab name = `project/short-title`, else `#W` |
 
 **The selected tab never pulses**: solid peach `#fab387` for every ambient state (idle/running/cua/workflow). You are looking at it — the terminal itself is the progress indicator. Attention states still force the chip to crust even when selected, because the digit's fg *is* the bright body tint and needs a dark chip to read; focusing a prompt is not answering it.
@@ -62,7 +63,7 @@ test — a dead turn is not answered by being looked at — but focusing the tab
 
 Two per-window tmux user options are the single source of truth:
 
-- `@agent_state` — `idle | running | needs-input | failed | done` (unset = no agent)
+- `@agent_state` — `idle | running | needs-input | failed | done | paused` (unset = no agent)
 - `@agent_since` — `"<epoch> <state>"`: when the state last changed. Stamped by the hook's `set_state` at the transition itself, in the same tmux command list as `@agent_state` so the watcher can never snapshot one without the other (and unset by `clear_state`), because a watcher tick can take 4–6 s and a `done→running→done` inside one tick otherwise kept the old stamp. The watcher stays the backstop for every other writer (seen-it discharge, stuck-running reconcile, idle seed, GC): it compares the live state with the stored stamp each tick, leaves a matching stamp alone, so restarts lose nothing; unset with the state. Read by `agent-jump.sh` (oldest-first order) and the `prefix e` roster's elapsed column.
 - `@agent_summary` — short conversation title
 - `@agent_workflow` — `1` while a background Claude Workflow is in flight (else unset); set by the watcher, orthogonal to `@agent_state`
@@ -1155,7 +1156,8 @@ watcher's event-log line.
 | `@agent_awaiting` | tmux-mcp, on a *sender* whose turn is Mack's | `<pane>=<epoch>` entries, 2 h |
 | `@agent_for_user` | `notify_user` / `agent-notify-user.sh` | `<epoch> <reason>` (one line, no `\|` `#`, ≤ 200 chars) |
 | `@agent_turn_origin` | indicator, UserPromptSubmit | `<user\|agent> <turn_id> <from\|->` |
-| `@agent_turn_result` | indicator, Stop / StopFailure | `<turn_id> loud`, or `<turn_id> quiet <restored_state>` |
+| `@agent_turn_result` | indicator, Stop / StopFailure | `<turn_id> loud`, `<turn_id> quiet <restored_state>`, or `<turn_id> paused` |
+| `@agent_paused` | agent-pause.py (docs/agent-pause.md) | `<epoch>`: turn ends write `paused` (see "Paused" below) |
 | `@agent_prior_state`, `_since`, `_detail_kind`, `_detail` | indicator, at an agent turn's start | the attention state to restore |
 | `@agent_inbound_seen` | indicator, mid-turn | verified mid-turn messages, inbound's format, ≤ 8 |
 | `@agent_quiet` | a quiet restore (indicator or watcher), consumed by the watcher | `<from\|->`: the next event-log line is the reply; also dropped by the next prompt and by a loud Stop |
@@ -1284,6 +1286,65 @@ OpenCode's root-idle `done` goes through the indicator's Stop path. Codex's
 internal threads stay out by the existing filter, which now also drops any
 event whose `cwd` is `~/.codex/memories` (codex 0.162's memory agent fires
 UserPromptSubmit).
+
+**Paused (the pause key).** agent-pause.py sets `@agent_paused <epoch>` on
+each target window before its PAUSE goes out, and before a RESUME it unsets
+the flag and turns `paused` back to `idle` itself (docs/agent-pause.md, "The
+paused state", is the contract). While the flag is set:
+
+- Every turn end that would write `done` or `idle`, or do a quiet restore,
+  writes `paused` and `@agent_turn_result <id> paused` (CuaNotch's hook maps
+  that to no notification): the Stop, whatever its origin or
+  `@agent_for_user` flag; the Codex/OpenCode `interrupt`; and the watcher's
+  turn ends (stuck-`running` un-stick, bg-pending release, Codex turn end).
+  Paused beats the quiet finish. The PAUSE itself arrives through
+  `message_agent`, often queued mid-turn, so the first Stop after the flag
+  gives `paused`; a brief `paused → running → paused` is possible and fine.
+- `needs-input` and `failed` are written as always.
+- A Stop held by background work stays `running` (result `<id> paused`, the
+  usual `@agent_bg_owner`); the watcher writes `paused` when the work drains.
+- Nothing else moves a `paused` window: not focus (`clear-current`), not the
+  watcher's seen-it discharge, idle seed or reconciles, flag or no flag.
+  Paused is not in the Active set, so the watcher releases its slot.
+- `clear_state` and the watcher GC drop `@agent_paused` with the session, and
+  so does a `SessionStart` with source `clear` or `startup`: a fresh
+  conversation is not the paused one, and agent-pause.py, finding that target
+  gone at the resume, would never clear the flag (every later Stop would end
+  `paused`). Not on `resume` (a tmux restore resumes the paused session
+  itself) or `compact`.
+- **The flag is re-checked in the write itself.** The indicator reads it with
+  the origin and the watcher at the tick's start; agent-pause.py's resume
+  (flag off and `paused` → `idle`, one call) can land in between. So every
+  `paused` write ends its own tmux command list with
+  `if-shell -F '#{?#{@agent_paused},0,1}' 'set-option … @agent_state idle'`:
+  tmux runs the list as a unit, and a flag gone by then lands on `idle`,
+  what the resume would have made of it. Only a window id and fixed words
+  pass through if-shell's re-parse.
+
+Bookkeeping across a pause: `@agent_quiet` is never set by a paused end (no
+"↩ replied" line for a pause). `@agent_bg_owner` follows the usual held/not
+held rule. The prior an agent turn saved is **kept** through the pause: an
+unseen green from before the pause comes back after the resume. The next
+agent turn (the RESUME, or a ping while still paused) keeps that prior
+instead of saving `paused` or the resume's `idle` (`prior_save`: state
+`paused`, or `idle` with a last result `<id> paused`), so the RESUME's quiet
+finish restores it. A look at the paused tab (`clear-current`, or the
+watcher's viewed check) downgrades that saved prior to idle like any other
+seen prior. A turn Mack types after the resume is his: loud, prior dropped.
+
+**Resuming Mack's own work is loud.** tmux-mcp stamps agent-pause.py's
+messages `for=agent` (no sender pane), so the RESUME would start an
+agent-origin turn and its finish would be quiet, even when the work it picks
+up is the task Mack started and the pause interrupted. So a new turn from a
+verified agent message, when the last `@agent_turn_result` ends in ` paused`
+and the paused turn's origin (still in `@agent_turn_origin`) is `user`, is
+recorded as `user`: loud, prior dropped, no "Mack won't be notified" context.
+A pause that stopped an agent-started turn keeps that turn's quiet finish and
+its prior. A ping while Mack's paused turn is still paused counts as his too
+(it ends `paused` while the flag is set).
+`paused` itself is never saved as a prior. Tests: `tests/test_agent_paused.py`
+(hook, watcher, and the tab glyph rendered from `tmux.conf.tmpl` on a private
+server).
 
 Known limits: tmux-mcp may append an inbound entry in the milliseconds
 between the hook's read and its rewrite of `@agent_inbound`; that entry is

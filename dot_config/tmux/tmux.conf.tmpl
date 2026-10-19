@@ -319,7 +319,7 @@ set -g @catppuccin_window_default_fill "number"
 set -g @catppuccin_window_current_fill "number"
 # Agent tab indicator (see docs/agent-tab-indicator.md). Claude Code / Codex
 # hooks + scripts/agent-tab-watcher.sh maintain per-window options
-# @agent_state (idle|running|needs-input|failed|done), @agent_summary,
+# @agent_state (idle|running|needs-input|failed|done|paused), @agent_summary,
 # @agent_workflow (a background Claude Workflow OR a background subagent in
 # flight - one gear for both) and @agent_cua (the agent is driving an app
 # through cua-driver); the Catppuccin window formats below render them.
@@ -432,7 +432,7 @@ set -g @catppuccin_window_default_color "#{?#{@stash_sel},#11111b,#{?#{==:#{@age
 set -g @catppuccin_window_current_color "#{?#{@stash_sel},#11111b,#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#fab387,#11111b},#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#fab387}}}"
 
 # Tab text: the glyph slot, then the summary. The slot is EXCEPTIONS ONLY —
-# priority background workflow > computer use > nothing. Ordinary states
+# priority background workflow > paused > computer use > nothing. Ordinary states
 # (idle, running, and every attention state) render NO glyph: the chip pulse
 # says "in flight" and the body tint says "wants you", so a robot or a ● would
 # only restate what the colors already carry, and both cost 2 cells.
@@ -441,6 +441,13 @@ set -g @catppuccin_window_current_color "#{?#{@stash_sel},#11111b,#{?#{==:#{@age
 #   󰍽 (nf-md-mouse U+F037D) blue #89b4fa — the agent is driving an app through
 #                           cua-driver (see the palette note above for why cua
 #                           lives here and not in the chip).
+#   ⏸ (U+23F8)              lavender #b4befe — @agent_state `paused`: stopped by
+#                           the pause key (docs/agent-pause.md, "The paused
+#                           state"). Neither attention nor motion, so the body
+#                           stays stock and the chip solid; the glyph is the
+#                           only mark, and it never pulses. It beats the mouse
+#                           (a lingering 60 s cua flag must not hide a pause),
+#                           never the gear. Same lavender on every surface.
 # The slot is EXCLUSIVE and the gear wins: a session both driving an app and
 # running a workflow shows only 󰒓. Deliberate, and deliberately asymmetric with
 # CuaNotch, where a workflow is an OVERLAY that composes with the state and the
@@ -465,8 +472,8 @@ set -g @catppuccin_window_current_color "#{?#{@stash_sel},#11111b,#{?#{==:#{@age
 # workflow/cua flags and shove later tabs. Deliberate — those flags flip rarely
 # (once per workflow, not per turn), and reserving a blank for every agent
 # window would pad the common case to pay for the rare one.
-set -g @catppuccin_window_default_text "#{?#{@agent_workflow},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_blink},#94e2d5,#659a91}}]󰒓 ,#{?#{@agent_cua},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{==:#{@agent_state},done},#11111b,#{?#{@agent_blink},#89b4fa,#5d7aaa}}}]󰍽 ,}}#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
-set -g @catppuccin_window_current_text "#{?#{@agent_workflow},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_blink},#94e2d5,#659a91}}]󰒓 ,#{?#{@agent_cua},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{==:#{@agent_state},done},#11111b,#{?#{@agent_blink},#89b4fa,#5d7aaa}}}]󰍽 ,}}#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
+set -g @catppuccin_window_default_text "#{?#{@agent_workflow},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_blink},#94e2d5,#659a91}}]󰒓 ,#{?#{==:#{@agent_state},paused},#[fg=#{?#{@stash_sel},#11111b,#b4befe}]⏸ ,#{?#{@agent_cua},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{==:#{@agent_state},done},#11111b,#{?#{@agent_blink},#89b4fa,#5d7aaa}}}]󰍽 ,}}}#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
+set -g @catppuccin_window_current_text "#{?#{@agent_workflow},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_blink},#94e2d5,#659a91}}]󰒓 ,#{?#{==:#{@agent_state},paused},#[fg=#{?#{@stash_sel},#11111b,#b4befe}]⏸ ,#{?#{@agent_cua},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{==:#{@agent_state},done},#11111b,#{?#{@agent_blink},#89b4fa,#5d7aaa}}}]󰍽 ,}}}#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
 # end catppuccin
 
 # Agent tab indicator runtime: presence/GC watcher daemon (singleton), and

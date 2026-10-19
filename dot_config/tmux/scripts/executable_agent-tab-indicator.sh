@@ -3,7 +3,9 @@
 # lifecycle hooks so the Catppuccin tab bar reflects agent state.
 #
 # Options written (window scope; unset = no agent in window):
-#   @agent_state    idle | running | needs-input | failed | done
+#   @agent_state    idle | running | needs-input | failed | done | paused
+#                   (paused: stopped by the pause key while @agent_paused is
+#                   set - see AGENT-ORIGINATED TURNS and docs/agent-pause.md)
 #                   REPALETTED 2026-08-21 (Mack's call): yellow means
 #                   SOMETHING IS WAITING ON YOU — approvals and questions
 #                   alike, one state — and red means SOMETHING BROKE. Red used
@@ -709,9 +711,15 @@ clear_pending() {
 #                       release when the work drains. A wake-up (the work
 #                       reporting back) inherits THIS origin, not whatever
 #                       turn ran in between.
+#   @agent_paused       "<epoch>": agent-pause.py's flag (docs/agent-pause.md,
+#                       "The paused state"), set before its PAUSE goes out and
+#                       unset before the RESUME. While it is set, a turn end
+#                       that would write done or idle, or a quiet restore,
+#                       writes @agent_state `paused` and @agent_turn_result
+#                       "<id> paused". Dropped with the session.
 ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_prior_since
              @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
-             @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner)
+             @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused)
 PRIOR_OPTS=(@agent_prior_state @agent_prior_since @agent_prior_detail_kind @agent_prior_detail)
 INBOUND_TTL=180
 US=$'\x1f'
@@ -735,11 +743,11 @@ prior_unset() {
 origin_read() {
     local out x
     O_ORIGIN=""; O_STATE=""; O_SINCE=""; O_DK=""; O_PSTATE=""; O_PSINCE=""; O_PDK=""
-    O_INB=""; O_SEEN=""; O_DT=""; O_PDT=""; O_FORUSER=""; O_RESULT=""; O_BGOWN=""
+    O_INB=""; O_SEEN=""; O_DT=""; O_PDT=""; O_FORUSER=""; O_RESULT=""; O_BGOWN=""; O_PAUSED=""
     O_OKIND=""; O_OTID=""; O_OFROM=""
-    out=$(tmux display-message -p -t "$1" "x${US}#{@agent_turn_origin}${US}#{@agent_state}${US}#{@agent_since}${US}#{@agent_detail_kind}${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_result}${US}#{@agent_bg_owner}${US}#{@agent_inbound}${US}#{@agent_inbound_seen}${US}#{@agent_detail}${US}#{@agent_prior_detail}${US}#{@agent_for_user}" 2>/dev/null || true)
+    out=$(tmux display-message -p -t "$1" "x${US}#{@agent_turn_origin}${US}#{@agent_state}${US}#{@agent_since}${US}#{@agent_detail_kind}${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_result}${US}#{@agent_bg_owner}${US}#{@agent_paused}${US}#{@agent_inbound}${US}#{@agent_inbound_seen}${US}#{@agent_detail}${US}#{@agent_prior_detail}${US}#{@agent_for_user}" 2>/dev/null || true)
     case "$out" in "x$US"*) ;; *) return 0 ;; esac
-    IFS="$US" read -r x O_ORIGIN O_STATE O_SINCE O_DK O_PSTATE O_PSINCE O_PDK O_RESULT O_BGOWN O_INB O_SEEN O_DT O_PDT O_FORUSER <<<"$out" || true
+    IFS="$US" read -r x O_ORIGIN O_STATE O_SINCE O_DK O_PSTATE O_PSINCE O_PDK O_RESULT O_BGOWN O_PAUSED O_INB O_SEEN O_DT O_PDT O_FORUSER <<<"$out" || true
     case "$O_BGOWN" in user|agent) ;; *) O_BGOWN="" ;; esac
     O_OKIND=""; O_OTID=""; O_OFROM=""
     read -r O_OKIND O_OTID O_OFROM _ <<<"$O_ORIGIN" || true
@@ -869,6 +877,22 @@ split_classify() {
 #   - else idle.
 prior_save() {
     local win="$1"
+    # ACROSS A PAUSE. A paused Stop keeps the prior an agent turn saved (an
+    # unseen green from before the pause), and agent-pause.py turns `paused`
+    # back to idle at the resume. So the turn after it - the RESUME, or any
+    # ping while still paused - must not save `paused` or that idle over it:
+    # keep the existing prior, so the RESUME's quiet finish brings the green
+    # back. `paused` itself is never a state to come back to (it would outlive
+    # the resume).
+    if [ "$O_STATE" = paused ] || { [ "$O_STATE" = idle ] && [[ $O_RESULT == *" paused" ]]; }; then
+        if [ -z "$O_PSTATE" ]; then
+            ss_add set-option -w -t "$win" @agent_prior_state idle
+            ss_add set-option -uw -t "$win" @agent_prior_since
+            ss_add set-option -uw -t "$win" @agent_prior_detail_kind
+            ss_add set-option -uw -t "$win" @agent_prior_detail
+        fi
+        return 0
+    fi
     case "$O_STATE" in
         running|"")
             # Held for Mack's background work: @agent_bg_owner says so. The
@@ -1579,8 +1603,10 @@ if [ "$mode" = "clear-current" ]; then
     # or the quiet restore would re-tint something he already looked at. One
     # extra read, only for a window that is mid-turn or idle (prior is never
     # set otherwise).
+    # A `paused` window can hold one too (kept across the pause for after the
+    # resume); `paused` itself is never discharged by a look.
     case "$cc_state" in
-        running|idle|needs-*)
+        running|idle|paused|needs-*)
             case "$(tmux show-options -wqv -t "$win" @agent_prior_state 2>/dev/null || true)" in
                 done|needs-input|failed)
                     tmux set-option -w -t "$win" @agent_prior_state idle \; \
@@ -1897,7 +1923,13 @@ case "$mode" in
         # the attention state the window had before it (AGENT-ORIGINATED
         # TURNS), seen-it rules included.
         origin_read "$win"
-        if [ -n "$O_PSTATE" ]; then
+        if [ -n "$O_PAUSED" ]; then
+            # Paused beats idle and the restore; flag re-checked in the same
+            # command list, as the Stop does.
+            ss_add if-shell -F -t "$win" '#{?#{@agent_paused},0,1}' \
+                "set-option -w -t $win @agent_state idle"
+            set_state "$win" paused
+        elif [ -n "$O_PSTATE" ]; then
             prior_restore "$win"
             set_state "$win" "$R_STATE"
         else
@@ -1927,6 +1959,14 @@ case "$mode" in
         fi
         dkind=-   # SessionStart: a new conversation has no detail yet
         prior_unset "$win"   # no turn is in flight in a fresh/resumed session
+        # A fresh conversation (/clear, a new start) is not the paused one:
+        # agent-pause.py would find that target gone at the resume and never
+        # clear its flag, and every later Stop here would end `paused`. Drop
+        # it. Not on `resume` (a tmux restore resumes the paused session
+        # itself) and not on `compact` (skipped above).
+        case "$src" in
+            clear|startup) ss_add set-option -uw -t "$win" @agent_paused ;;
+        esac
         set_state "$win" idle
         clear_pending "$win"
         # Drift state is per session and only ever read for the live one:
@@ -2056,6 +2096,15 @@ case "$mode" in
                         case "$O_STATE" in running|"") ;; *) prior_save "$win" ;; esac
                     fi
                 fi
+            elif [ "$agent_msg" = 1 ] && [[ $O_RESULT == *" paused" ]] && [ "$O_OKIND" = user ]; then
+                # The RESUME (or a ping) after a pause that stopped MACK's
+                # own turn: tmux-mcp stamps agent-pause.py's messages
+                # for=agent, but the work this turn picks up is his, and he
+                # must hear when it finishes. Loud, prior dropped. (A pause
+                # that stopped an agent-started turn keeps that turn's quiet
+                # finish and its prior: the next arm.)
+                ss_add set-option -w -t "$win" @agent_turn_origin "user $t_id -"
+                prior_unset "$win"
             elif [ "$agent_msg" = 1 ]; then
                 ss_add set-option -w -t "$win" @agent_turn_origin "agent $t_id $v_from"
                 prior_save "$win"   # the attention state to come back to
@@ -2236,6 +2285,34 @@ case "$mode" in
             ss_add set-option -w -t "$win" @agent_bg_owner "$s_own"
         else
             ss_add set-option -uw -t "$win" @agent_bg_owner
+        fi
+        # PAUSED (docs/agent-pause.md, "The paused state"): agent-pause.py
+        # flagged this window before its PAUSE went out, so this turn end -
+        # loud, quiet or flagged for Mack alike - is `paused`: not done, no
+        # green, no restore. The PAUSE itself usually arrives as an agent
+        # message (often queued mid-turn), and paused beats the quiet finish.
+        # Held by background work: still running, and the watcher writes
+        # paused when it drains. The prior an agent turn saved is KEPT for
+        # after the resume (see prior_save); the log mark never applies.
+        if [ -n "$O_PAUSED" ]; then
+            ss_add set-option -w -t "$win" @agent_turn_result "$s_id paused"
+            ss_add set-option -uw -t "$win" @agent_quiet
+            if [ "$bg_pending" -eq 1 ]; then
+                set_state "$win" running
+            else
+                pend_op=unset
+                # The flag was read above; agent-pause.py may have cleared it
+                # for a resume since (it unsets the flag and turns `paused`
+                # into idle in one call). Re-checked INSIDE this command
+                # list, which tmux runs as a unit: flag gone -> idle, exactly
+                # what the resume would have made of it. Only a window id
+                # and fixed words go through if-shell's re-parse.
+                ss_add if-shell -F -t "$win" '#{?#{@agent_paused},0,1}' \
+                    "set-option -w -t $win @agent_state idle"
+                set_state "$win" paused
+            fi
+            compose_summary "$win" "$(extract_summary "$payload")" "$payload"
+            exit 0
         fi
         if [ "$s_quiet" = 1 ]; then
             if [ "$bg_pending" -eq 1 ]; then

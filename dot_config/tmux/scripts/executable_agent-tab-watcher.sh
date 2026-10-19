@@ -22,7 +22,9 @@
 # session/rollout says is over, and a codex `needs-input` or `running` whose
 # rollout ended the turn after the state was stamped (see the reconcile).
 # When such an ending closes a turn another agent started, the window gets
-# back its saved prior state instead (AGENT-ORIGINATED TURNS).
+# back its saved prior state instead (AGENT-ORIGINATED TURNS); while the pause
+# key's @agent_paused is set, every such ending writes `paused` (and nothing
+# here ever moves a `paused` window: docs/agent-pause.md, "The paused state").
 #
 # It also makes tabs aware of background Claude WORKFLOWS. A backgrounded
 # Workflow keeps running after the main turn's Stop fires (so the tab would
@@ -912,6 +914,7 @@ declare -A W_PEND=() # @agent_pending (agent slots: idle + pending is active)
 declare -A W_BORN=() # @agent_born (BIRTH GRACE)
 declare -A W_PRIOR=() # @agent_prior_state (AGENT-ORIGINATED TURNS)
 declare -A W_QUIET=() # @agent_quiet: a quiet restore's one-shot log mark
+declare -A W_PAUSED=() # @agent_paused: agent-pause.py's flag (docs/agent-pause.md)
 wins=()
 
 # AGENT-ORIGINATED TURNS (agent-tab-indicator.sh, same heading; the doc's
@@ -933,7 +936,7 @@ wins=()
 # describes the restored state.
 ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_prior_since
              @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
-             @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner)
+             @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused)
 # prior_restore WIN WAC: one read of the saved fields, one write. Sets
 # r_state (the state written) and r_since; returns 1 when nothing was
 # written: the write failed, or the prior is gone since the tick's read (the
@@ -1524,7 +1527,7 @@ EOF
     # newline continues on its own line) can never be taken for a window.
     # @agent_prior_state (AGENT-ORIGINATED TURNS) is a bare state token, so it
     # rides with the digit fields, ahead of all free text.
-    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{@agent_prior_state}${US}#{@agent_quiet}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
+    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{@agent_prior_state}${US}#{@agent_quiet}${US}#{@agent_paused}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
@@ -1548,16 +1551,16 @@ EOF
     # exits, exactly like any other window.
     W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_SUM=(); W_DET=()
     W_DK=(); W_DTXT=(); W_SESS=(); W_IDX=(); W_NAME=(); W_AK=()
-    W_PEND=(); W_BORN=(); W_PRIOR=(); W_QUIET=(); S_SLOT=(); S_VIS=(); S_ELIG=()
+    W_PEND=(); W_BORN=(); W_PRIOR=(); W_QUIET=(); W_PAUSED=(); S_SLOT=(); S_VIS=(); S_ELIG=()
     wins=()
-    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind slot pend born prior quiet sess widx wname dtxt summary; do
+    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind slot pend born prior quiet paused sess widx wname dtxt summary; do
         case "$win" in @*) ;; *) continue ;; esac
         case "$tty" in /dev/?*) ;; *) continue ;; esac
         if [ -z "${W_SEEN[$win]+x}" ]; then
             W_SEEN[$win]=1
             wins+=("$win")
-            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${akind}${dkind}${born}${prior}${summary}" ]; then
-                W_PRIOR[$win]="$prior"; W_QUIET[$win]="$quiet"
+            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${akind}${dkind}${born}${prior}${paused}${summary}" ]; then
+                W_PRIOR[$win]="$prior"; W_QUIET[$win]="$quiet"; W_PAUSED[$win]="$paused"
                 W_STATE[$win]="$state"; W_WAC[$win]="$wac"; W_SINCE[$win]="$since"
                 W_WF[$win]="$wf_opt"; W_CUA[$win]="$cua_opt"; W_ROLL[$win]="$roll"
                 W_SUM[$win]="$summary"; W_DET[$win]="${akind}${dkind}"; W_AK[$win]="$akind"
@@ -1709,7 +1712,7 @@ EOF
         fi
         # A leftover sidebar kind/detail is collectable exactly like a summary.
         # So is a leftover @agent_prior_state (AGENT-ORIGINATED TURNS).
-        has_summary=0; [ -n "${W_SUM[$win]:-}${W_DET[$win]:-}${W_PRIOR[$win]:-}" ] && has_summary=1
+        has_summary=0; [ -n "${W_SUM[$win]:-}${W_DET[$win]:-}${W_PRIOR[$win]:-}${W_PAUSED[$win]:-}" ] && has_summary=1
         had_wf=0; [ -n "${W_WF[$win]:-}" ] && had_wf=1
         had_cua=0; [ -n "${W_CUA[$win]:-}" ] && had_cua=1
 
@@ -1868,7 +1871,28 @@ EOF
             done
             n=$((n + 1))
             if [ "$n" -ge 3 ]; then
-                if [ -n "${W_PRIOR[$win]:-}" ]; then
+                if [ -n "${W_PAUSED[$win]:-}" ]; then
+                    # PAUSED (docs/agent-pause.md, "The paused state"): this
+                    # turn end - its background work drained, Esc, a missed
+                    # Stop, a codex turn end - is `paused`, never idle, done
+                    # or a restore. A saved prior stays for after the resume
+                    # (the indicator's prior_save keeps it); nobody's work is
+                    # out any more. One call. The flag was read at the tick's
+                    # start; agent-pause.py may have cleared it for a resume
+                    # since (flag off + paused -> idle, in one call), so the
+                    # SAME command list re-checks it and lands on idle if it
+                    # is gone - what that resume would have made of it.
+                    if tmux set-option -w -t "$win" @agent_state paused \; \
+                            set-option -w -t "$win" @agent_since "$tick_now paused" \; \
+                            set-option -uw -t "$win" @agent_pending \; \
+                            set-option -uw -t "$win" @agent_bg_owner \; \
+                            if-shell -F -t "$win" '#{?#{@agent_paused},0,1}' \
+                                "set-option -w -t $win @agent_state idle" 2>/dev/null; then
+                        changed=1; state_moved=1; since="$tick_now paused"; pending=""; fin=paused
+                    else
+                        fin="$state"
+                    fi
+                elif [ -n "${W_PRIOR[$win]:-}" ]; then
                     # An agent-originated turn ended here (its work drained, Esc,
                     # a missed Stop, a codex turn end): restore, never tint.
                     if prior_restore "$win" "$wac"; then
