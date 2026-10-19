@@ -364,7 +364,7 @@ pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
 /// instead of status-right, read in the same one call (no script runs).
-pub const STATUS_FORMATS: [&str; 32] = [
+pub const STATUS_FORMATS: [&str; 33] = [
     "#{client_key_table}", "#{@sidebar_open}", "#{@sidebar_pids}", "#{@resurrect_stale}",
     "#{@codex_session_text}", "#{@codex_session_color}", "#{@codex_weekly_text}", "#{@codex_weekly_color}",
     "#{@codex_scoped_icon}", "#{@codex_scoped_text}", "#{@codex_scoped_color}", "#{@codex_account_label}",
@@ -382,6 +382,10 @@ pub const STATUS_FORMATS: [&str; 32] = [
     "#{@toast}", "#{@sidebar_clients}",
     // The columns the sidebars take from the WezTerm row (popups centre on it).
     "#{@sidebar_width}",
+    // When this server started (epoch seconds): window ids restart at @0 in
+    // a new server, so the pause banner trusts a saved id only from a pause
+    // made since ([`crate::sidebar::pause`]).
+    "#{start_time}",
 ];
 
 /// One usage window's numeric options (`@codex_<w>_used`, `_expected`,
@@ -440,6 +444,8 @@ pub struct Status {
     /// `@sidebar_width`: the leading sidebar's columns plus WezTerm's divider
     /// (tmux.conf.tmpl's `@popup_x` reads it); "" when unset.
     pub sidebar_width: String,
+    /// `#{start_time}`: when the server started (epoch seconds), raw.
+    pub server_start: String,
 }
 
 impl Status {
@@ -466,6 +472,7 @@ impl Status {
             toast: f(29),
             sidebar_clients: f(30),
             sidebar_width: f(31),
+            server_start: f(32),
         }
     }
 }
@@ -901,7 +908,7 @@ pub(crate) mod tests {
             resets: "v17".into(), members: "v18".into() });
         assert_eq!((c.status.meters[1].used.as_str(), c.status.meters[2].members.as_str()), ("v19", "v28"));
         assert_eq!((c.status.toast.as_str(), c.status.sidebar_clients.as_str()), ("v29", "v30"));
-        assert_eq!(c.status.sidebar_width, "v31");
+        assert_eq!((c.status.sidebar_width.as_str(), c.status.server_start.as_str()), ("v31", "v32"));
         // One field short or long: not a client row.
         assert!(Client::parse(&full[..full.len() - 1].join("\x1f")).is_none());
         let s = Snapshot::parse(&[

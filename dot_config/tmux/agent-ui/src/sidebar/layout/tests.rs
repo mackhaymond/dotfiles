@@ -2482,6 +2482,101 @@ fn an_empty_second_line_has_a_placeholder() {
     assert_eq!(firsts, seconds);
 }
 
+fn phases() -> Vec<Phase> {
+    let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    vec![
+        Phase::Sending { done: 2, n: 5, labels: l(&["Tmux Agent Sidebar", "Island resize spring"]) },
+        Phase::Stopping { stopped: 3, n: 5, working: l(&["Tmux Agent Sidebar", "Census AX sweep"]) },
+        Phase::Safe { labels: l(&["Tmux Agent Sidebar", "Island resize spring"]) },
+        Phase::Ready { labels: l(&["Tmux Agent Sidebar", "Island resize spring", "Census AX sweep"]) },
+        Phase::Resuming { n: 3, labels: l(&["Tmux Agent Sidebar"]) },
+    ]
+}
+
+/// The pause banner sits at the very top, ONE tint in its phase's colour,
+/// a heavy rail, its word bold in the colour; two rows when the frame has
+/// the room, the second the dim detail (who is still working); exactly the
+/// frame's width. Only a settled pause (safe, ready) clicks through to
+/// [`Target::Resume`]; only a moving one spins.
+#[test]
+fn the_pause_banner_says_where_the_pause_stands() {
+    let v = lettered(quiet());
+    let words = ["PAUSING  sending 2 of 5", "PAUSING  3 of 5 stopped", "✓ PAUSED  safe to close", "↻ 3 ready  to resume", "RESUMING  3 agents…"];
+    for (p, word) in phases().into_iter().zip(words) {
+        for w in [24u16, 34, 44] {
+            let f = layout(&v, w, 58, &Opts { pause: Some(p.clone()), ..with_bar(demo_bar()) });
+            let t = texts(&f);
+            let ctx = format!("{p:?} {w}: {t:#?}");
+            assert_eq!(f.pause, 0..2, "{ctx}");
+            let hue = pause_hue(&p);
+            for y in f.pause.clone() {
+                let r = &f.rows[y];
+                assert_eq!((dwidth(&r.text()), r.bg), (usize::from(w), Some(Ink::Mix(hue, PAUSE_TINT))), "{ctx}");
+                assert_eq!(r.segs[1], seg("▌", hue), "{ctx}");
+                assert_eq!(r.anim, p.busy(), "{ctx}");
+                let click = (0..w).map(|x| f.target(x, y as u16)).collect::<Vec<_>>();
+                if p.clickable() {
+                    assert!(click.iter().all(|c| *c == Some(&Target::Resume)), "{ctx}");
+                } else {
+                    assert!(click.iter().all(Option::is_none), "{ctx}");
+                }
+            }
+            assert!(f.rows[0].segs.iter().any(|s| s.bold && s.fg == Ink::Pal(hue)), "{ctx}");
+            if w == 44 {
+                assert!(t[0].contains(word), "{ctx}");
+            }
+            // The panel follows, then NEEDS YOU, as without a banner.
+            assert!(f.card.start == 2 && f.needs.start > f.card.end, "{ctx}");
+            assert!(f.spin || !p.busy(), "{ctx}");
+        }
+    }
+    // Ready: the hint beside it when it all fits; the second row is who.
+    let f = layout(&v, 44, 58, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() });
+    let t = texts(&f);
+    assert!(t[0].trim_end().ends_with("prefix P · click"), "{t:#?}");
+    assert!(t[1].contains("Tmux Agent Sidebar, Island resize sp…"), "{t:#?}");
+    let f = layout(&v, 44, 58, &Opts { pause: Some(phases()[1].clone()), ..Opts::default() });
+    assert!(texts(&f)[1].contains("still working  Tmux Agent Sidebar, C…"), "{:#?}", texts(&f));
+    // No pause: nothing at all, the frame exactly as before.
+    let none = layout(&v, 44, 58, &Opts::default());
+    assert!(none.pause.is_empty());
+    assert_eq!(none, layout(&v, 44, 58, &Opts { pause: None, ..Opts::default() }));
+}
+
+/// The banner survives the height ladder: two rows from 16, one from 4;
+/// the sections under it take the squeeze (agents fold and compress, every
+/// agent still accounted for); toasts float under it, never over it.
+#[test]
+fn the_pause_banner_outlasts_the_agents() {
+    let stopping = phases()[1].clone();
+    for (name, v) in all() {
+        let v = lettered(v);
+        for w in [30u16, 44] {
+            for h in 2u16..=80 {
+                let bar = Bar { toasts: vec![toast(Kind::Ok, "paused 5 agents")], ..demo_bar() };
+                let f = layout(&v, w, h, &Opts { pause: Some(stopping.clone()), ..with_bar(bar) });
+                let t = texts(&f);
+                let ctx = format!("{name} {w}x{h}: {t:#?}");
+                assert_eq!(f.rows.len(), usize::from(h), "{ctx}");
+                assert!(f.rows.iter().all(|r| dwidth(&r.text()) == usize::from(w)), "{ctx}");
+                let want = pause_lines(usize::from(h));
+                // (A frame with no room for sections keeps its first row.)
+                assert!(f.pause.len() == want || (f.pause.len() == 1 && f.step as usize == STEPS.len()), "{ctx}");
+                if want > 0 {
+                    assert!(t[0].contains("PAUSING"), "{ctx}");
+                    assert!(f.toast.is_empty() || f.toast.start >= f.pause.end, "{ctx}");
+                }
+                check_accounting(name, &v, &f);
+            }
+        }
+    }
+    // Where the agents have had to give up detail, the banner kept both rows.
+    let v = lettered(busy());
+    let f = layout(&v, 44, 24, &Opts { pause: Some(stopping), ..with_bar(demo_bar()) });
+    assert!(f.step as usize == STEPS.len() || f.agents_step > 0, "{:#?}", texts(&f));
+    assert_eq!(f.pause, 0..2);
+}
+
 /// Toasts never cover PARKED, even when the dock's bottom cap is the last
 /// row: a light fleet, a short frame, three long toasts, the watcher in
 /// trouble; its warning stays readable (and clickable).

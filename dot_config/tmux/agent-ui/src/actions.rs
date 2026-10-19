@@ -228,7 +228,23 @@ impl Actions {
         self.script_line("stash.sh", &["stash", win])
     }
 
-    /// agent-roster.py `Roster.jump`: `bash agent-jump.sh <mode> <tty> [args]`.
+    /// What [`resume_paused`](Self::resume_paused) hands `run-shell -b`:
+    /// `agent-pause.py resume <client>`, the pause key's resume half alone
+    /// (docs/agent-pause.md), never `toggle`: `resume` does nothing when no
+    /// set is saved, so a click on a stale banner cannot start a pause.
+    pub fn resume_line(&self, client: &str) -> String {
+        self.script_line("agent-pause.py", &["resume", client])
+    }
+
+    /// The sidebar's pause banner, clicked: resume the saved set, with its
+    /// popup on `client`. `run-shell -b` as prefix P's own binding (the
+    /// delivery waits on tmux-mcp; tmux runs it, so it outlives nothing
+    /// here). Fire and forget.
+    pub fn resume_paused(&self, client: &str) {
+        self.tmux.run_bg(&self.resume_line(client));
+    }
+
+    /// agent-roster.py `Roster.jump`:`bash agent-jump.sh <mode> <tty> [args]`.
     /// Ok once it ran (the popup then closes); Err with the footer text on a
     /// hang or a missing bash.
     pub fn jump(&self, mode: &str, client: &str, rest: &[&str]) -> Result<(), String> {

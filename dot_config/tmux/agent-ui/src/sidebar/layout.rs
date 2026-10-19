@@ -200,6 +200,7 @@
 //! ([`band`]: apart from every card shade), the stash selection (mauve 18%),
 //! toasts (`surface0`), and the solid chips. Dim text is `overlay2`.
 
+use super::pause::Phase;
 use super::status::{ink_on, ink_rgb, tmux_colour, Bar, Kind, Toast, ToastId, Usage};
 use crate::actions::watcher_problem;
 use crate::model::{Cat, Counts, Flag};
@@ -508,6 +509,9 @@ pub enum Target {
     Scope,
     /// A toast ([`Toast::id`]): dismissed, in this sidebar only.
     Toast(ToastId),
+    /// The pause banner once the pause is settled (safe to close, or ready
+    /// after a wake): `agent-pause.py resume <client>`, never `toggle`.
+    Resume,
 }
 
 /// One screen line.
@@ -587,6 +591,8 @@ pub struct Frame {
     /// When the first toast on screen expires (epoch milliseconds, rounded
     /// up): the sidebar wakes then to draw the frame without it.
     pub toast_until: Option<i64>,
+    /// The pause banner's rows ([`pause_rows`]): the very top. Empty: none.
+    pub pause: Range<usize>,
     /// The rows of each section, header included (empty: not drawn).
     pub needs: Range<usize>,
     /// The agents section: every shown space's header (its home), its
@@ -627,6 +633,9 @@ pub struct Opts {
     /// The clock ages are shown against (epoch seconds); None: the view's
     /// snapshot time. The live sidebar passes the time of each frame.
     pub now: Option<f64>,
+    /// Where the pause key's pause stands ([`super::pause`]): a banner at
+    /// the very top. None: nothing at all.
+    pub pause: Option<Phase>,
 }
 
 /// The working spinner: braille, one cell, ten frames.
@@ -1209,6 +1218,107 @@ fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
     top.status = 1..n - 1;
     top.card = 0..n;
     top
+}
+
+// ---------------------------------------------------------------- the pause banner
+
+/// How strongly the pause banner takes its phase's colour (one tint for the
+/// whole banner, NEEDS YOU's first).
+pub const PAUSE_TINT: u8 = 14;
+
+/// A phase's colour: in progress (sending, stopping, resuming) peach, the
+/// pause popup's own; safe to close green; ready to resume blue.
+pub fn pause_hue(p: &Phase) -> Hue {
+    match p {
+        Phase::Resuming { .. } | Phase::Sending { .. } | Phase::Stopping { .. } => "peach",
+        Phase::Safe { .. } => "green",
+        Phase::Ready { .. } => "blue",
+    }
+}
+
+/// How many rows the banner gets in a frame `h` tall: two (the second the
+/// dim detail) from 16 rows, the usage panel's own threshold; one from 4;
+/// none below. It is cut only after everything but the frame's last row:
+/// the sections under it take the squeeze (the agents compress, NEEDS YOU
+/// folds), never the banner.
+pub fn pause_lines(h: usize) -> usize {
+    match h {
+        16.. => 2,
+        4.. => 1,
+        _ => 0,
+    }
+}
+
+/// `n agent(s)`.
+fn agents_n(n: usize) -> String {
+    format!("{n} agent{}", if n == 1 { "" } else { "s" })
+}
+
+/// The pause banner (docs/agent-pause.md "In the sidebar"): ONE tile in
+/// its phase's colour mixed over the canvas ([`PAUSE_TINT`], like a NEEDS
+/// YOU card), a heavy `▌` rail in that colour down its rows; the glyph (the
+/// spinner while something moves) and the word bold in the colour, what it
+/// means in `text` after it. The second row, when there is room and
+/// something to say, is the detail under the word: who is still working
+/// (`sub`, after a dim `still working`), else the agents' labels (dim),
+/// clipped.
+///
+/// ```text
+///  ▌ ⠹ PAUSING  sending 2 of 5          peach (a press in flight)
+///  ▌ ⠹ PAUSING  3 of 5 stopped          peach
+///  ▌   still working  Tmux Sidebar, …
+///  ▌ ✓ PAUSED  safe to close            green; a click resumes
+///  ▌ ↻ 5 ready  to resume  prefix P · click   blue; a click resumes
+///  ▌ ⠹ RESUMING  5 agents…              peach
+/// ```
+///
+/// Safe and ready rows click through to [`Target::Resume`]; the others do
+/// nothing (a press is in flight, or agents are still stopping).
+fn pause_rows(p: &Phase, cx: Cx, lines: usize) -> Vec<Row> {
+    let w = cx.w;
+    if lines == 0 || w == 0 {
+        return Vec::new();
+    }
+    let hue = pause_hue(p);
+    let bg = Ink::Mix(hue, PAUSE_TINT);
+    let spin = SPIN[cx.spin % SPIN.len()];
+    let dimc = dim(true);
+    let names = |l: &[String]| seg(l.join(", "), dimc);
+    let (word, rest, hint, detail): (String, String, &str, Vec<Seg>) = match p {
+        Phase::Sending { done, n, labels } => (format!("{spin} PAUSING"), format!("sending {done} of {n}"), "", vec![names(labels)]),
+        Phase::Resuming { n, labels } => (format!("{spin} RESUMING"), format!("{}…", agents_n(*n)), "", vec![names(labels)]),
+        Phase::Stopping { stopped, n, working } => (
+            format!("{spin} PAUSING"),
+            format!("{stopped} of {n} stopped"),
+            "",
+            vec![seg("still working  ", dimc), seg(working.join(", "), "sub")],
+        ),
+        Phase::Safe { labels } => ("✓ PAUSED".into(), "safe to close".into(), "", vec![names(labels)]),
+        Phase::Ready { labels } => (format!("↻ {} ready", labels.len()), "to resume".into(), "prefix P · click", vec![names(labels)]),
+    };
+    let rail = || seg(RAIL_HEAVY, hue);
+    let left = vec![rail(), seg(" ", "text"), bold(word, hue), seg(format!("  {rest}"), "text")];
+    // The hint only beside the whole of what the banner says.
+    let with_hint = vec![seg(hint, dimc), seg(" ", "text")];
+    let right = if !hint.is_empty() && width(&left) + width(&with_hint) < inner(w) { with_hint } else { vec![] };
+    let mut rows = vec![tile_row(w, bg, left, right)];
+    let says = detail.iter().any(|s| !s.text.trim().is_empty());
+    if lines >= 2 && says {
+        let mut l2 = vec![rail(), seg("   ", "text")];
+        l2.extend(detail);
+        rows.push(tile_row(w, bg, l2, vec![seg(" ", "text")]));
+    }
+    let busy = p.busy();
+    rows.into_iter()
+        .map(|r| {
+            let r = Row { anim: busy, ..r };
+            if p.clickable() {
+                r.click(w, Target::Resume)
+            } else {
+                r
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------- shells
@@ -2569,7 +2679,15 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
 fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     let (w, h) = (cx.w, usize::from(frame.height));
     let bar = &opts.bar;
-    let Top { rows: top, status, card, keep } = top_rows(view, bar, w, h, cx.now);
+    // The pause banner first, at the very top: the panel under it is laid
+    // out in the rows it leaves, and the toasts float under it, never over.
+    let banner = opts.pause.as_ref().map_or_else(Vec::new, |p| pause_rows(p, cx, pause_lines(h)));
+    let nb = banner.len();
+    let Top { rows: top, status, card, keep } = top_rows(view, bar, w, h - nb, cx.now);
+    let shift = |r: Range<usize>| r.start + nb..r.end + nb;
+    let (status, card, keep) = (shift(status), shift(card), keep + nb);
+    frame.pause = 0..nb;
+    let top = [banner, top].concat();
     // The rows between the top and the PARKED line (held back like the old
     // last row: it carries the stash, the messages and the watcher).
     let avail = h.saturating_sub(top.len() + 1);
@@ -2587,6 +2705,8 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
         frame.rows = rows;
         frame.step = STEPS.len() as u8;
         frame.status = 0..0;
+        // (The banner, when there is one, is that first row.)
+        frame.pause = 0..nb.min(1);
         return keep.min(1);
     }
     // The dock's gap and one line of chips are held back first: spaces are

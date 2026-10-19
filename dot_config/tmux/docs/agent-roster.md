@@ -1188,6 +1188,45 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   its (seq, epoch_ms) id (the seq is read then written, so two racing
   posts can share one; never their posting time too). The dismissed ids
   are bounded (8) and forgotten once `@toast` no longer holds them.
+- **Pause banner** (`sidebar/pause.rs`, layout.rs `pause_rows`; the
+  contract is [agent-pause.md](agent-pause.md) "In the sidebar"): where
+  prefix P's pause stands, so closing its popup or the tab loses nothing.
+  `pause::phase` is pure (the parsed `progress.json` / `paused.json`, a
+  clock of now / last wake / last boot, the snapshot's working and existing
+  window ids and the server's `#{start_time}` → resuming, sending, ready,
+  stopping, safe, or nothing), first match wins.
+  `pause::Reader` stats both files in `$AGENT_PAUSE_STATE_DIR` (else
+  `~/.local/state/agent-pause`) on every refresh and re-parses one only
+  when its inode, size or mtime changed; `sysctl kern.waketime` only while
+  `paused.json` lists targets, `kern.boottime` once. A press is in flight
+  only while not done, its `<ms>-<pid>` process alive, begun after the
+  boot and under 20 min ago (8 deliveries at a time, 60 s each: 160
+  agents fit), so a killed toggle whose pid is reused never holds the
+  banner; its record-only rows (a pause's `unidentified`, a resume's
+  `gone`) are not counted. A wake OR a boot after `paused_at` is ready. A
+  tmux server started after `paused_at` numbers windows from @0 again, so
+  then every saved `window_id` counts as gone. WORKING is the script's rule on the RAW snapshot
+  (`@agent_state` running, `@agent_workflow` or `@agent_cua` set, before
+  homes are blanked); a gone window counts as stopped. While a press is in
+  flight the files are re-stat'ed on the spinner's ticks (the script posts
+  no notice per delivery). Malformed or torn files show nothing. The
+  banner is the very top: one tile tinted 14% in its phase's colour, a
+  heavy `▌` rail, glyph and word bold in the colour, the meaning after it;
+  a second row (dim) with who is still working or the labels:
+
+  ```
+   ▌ ⠹ PAUSING  2 of 5 stopped          peach (also "sending 2 of 5")
+   ▌   still working  Tmux Agent Sidebar, I…
+   ▌ ✓ PAUSED  safe to close            green
+   ▌ ↻ 3 ready  to resume   prefix P · click   blue
+   ▌ ⠹ RESUMING  3 agents…              peach
+  ```
+
+  Two rows from 16 rows tall, one from 4: the panel under it and the
+  sections take the squeeze, and toasts float under it, never over. Safe
+  and ready rows click to `agent-pause.py resume <client>` through
+  `run-shell -b` (prefix P's own shape; never `toggle`); the others do
+  nothing.
 - **Status jobs** (`status::Keeper`): with the line hidden tmux runs none of
   status-right's `#()` jobs, and two of them must keep running:
   continuum's autosave (`continuum_save.sh`) and the usage tick

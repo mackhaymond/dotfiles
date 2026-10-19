@@ -80,6 +80,7 @@ pub mod activity;
 mod input;
 pub mod layout;
 pub mod notice;
+pub mod pause;
 pub mod status;
 mod term;
 
@@ -203,11 +204,14 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
     };
     // The status block from the RAW snapshot (a space's home is its shell 1).
     let bar = Bar::build(&core.snapshot, client.as_deref());
+    // The pause banner from the RAW snapshot too (the script reads the
+    // window options as tmux holds them).
+    let pause = pause::Reader::home().phase(&pause::windows(&core.snapshot));
     hide_homes(&mut core.snapshot);
     // Letters as the live sidebar would assign them; `--once` never writes.
     let (mut view, _) = build_view(&mut core, client.as_deref(), None);
     activity::Activity::home().apply(&mut view);
-    let frame = layout(&view, w, h, &Opts { msg: None, bar, spin: 0, now: None });
+    let frame = layout(&view, w, h, &Opts { msg: None, bar, spin: 0, now: None, pause });
     let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
     layout::paint(&frame, &mut buf);
     let mut out = io::stdout().lock();
@@ -403,6 +407,14 @@ struct App {
     dismissed: Vec<status::ToastId>,
     /// The working agents' activity blurbs ([`activity`]), cached.
     activity: activity::Activity,
+    /// The pause key's files, re-parsed only when they change ([`pause`]).
+    pause: pause::Reader,
+    /// The working and existing window ids (and the server's start) of the
+    /// last snapshot that listed any window (a failed snapshot proves
+    /// nothing about the pause).
+    pause_windows: pause::Windows,
+    /// The pause banner's phase, as of the last read.
+    pause_phase: Option<pause::Phase>,
 }
 
 /// How many dismissed toast ids a sidebar remembers at most.
@@ -448,7 +460,17 @@ impl App {
             dismissed: Vec::new(),
             // (Unit tests never read the real transcripts.)
             activity: if cfg!(test) { activity::Activity::new("/nonexistent".into()) } else { activity::Activity::home() },
+            // (Nor the real pause state.)
+            pause: if cfg!(test) { pause::Reader::new("/nonexistent".into()) } else { pause::Reader::home() },
+            pause_windows: pause::Windows::default(),
+            pause_phase: None,
         }
+    }
+
+    /// Re-read the pause state (two stats; a file parsed only when it
+    /// changed) against the last snapshot's windows.
+    fn check_pause(&mut self) {
+        self.pause_phase = self.pause.phase(&self.pause_windows);
     }
 
     /// The bar to draw: the snapshot's, less the toasts dismissed here.
@@ -516,6 +538,11 @@ impl App {
         self.forget_gone_toasts();
         let table = self.client_key_table();
         self.keypoll.seen(&table, Instant::now());
+        // The pause banner reads the RAW window options (as the script does).
+        if !self.core.snapshot.windows.is_empty() {
+            self.pause_windows = pause::windows(&self.core.snapshot);
+        }
+        self.check_pause();
         hide_homes(&mut self.core.snapshot);
         let keys = if self.persist { Some(&mut self.keys) } else { None };
         let (mut view, writes) = build_view(&mut self.core, self.link.client.as_deref(), keys);
@@ -773,6 +800,14 @@ impl App {
                 }
                 Err(e) => Err(format!("stash failed: {e}")),
             },
+            Target::Resume => {
+                // prefix P's resume half alone (run-shell -b, as its
+                // binding): its popup on this client. `resume` does nothing
+                // when nothing is saved, so a stale banner never pauses.
+                self.actions.resume_paused(&client);
+                self.say("resuming the paused agents…");
+                Ok(false)
+            }
             Target::Restart | Target::Scope | Target::Toast(_) => Ok(false),
         };
         match moved {
@@ -810,7 +845,7 @@ impl App {
         let spin = self.spin_at(Instant::now());
         // Ages at this frame's clock (no tmux call), so a spinner frame
         // between snapshots never shows a stale one.
-        let opts = Opts { msg, bar: self.shown_bar(), spin, now: Some(now) };
+        let opts = Opts { msg, bar: self.shown_bar(), spin, now: Some(now), pause: self.pause_phase.clone() };
         let frame = layout(&self.view, size.width, size.height, &opts);
         let mut buf = Buffer::empty(Rect::new(0, 0, size.width, size.height));
         layout::paint(&frame, &mut buf);
@@ -895,6 +930,12 @@ impl App {
                 next = Instant::now() + self.cadence();
             } else {
                 self.poll_key_table(now);
+                // A press in flight lands only in its files (the script
+                // posts no notice per delivery): re-stat them on the
+                // spinner's ticks until it is done.
+                if self.pause_phase.as_ref().is_some_and(pause::Phase::in_flight) {
+                    self.check_pause();
+                }
             }
             if self.gone {
                 return Ok(());
@@ -1387,6 +1428,32 @@ mod tests {
         assert!(a.toast_due(now).unwrap() <= now + Duration::from_millis(5));
         a.shown = frame(&a);
         assert_eq!((a.shown.toast.clone(), a.toast_due(now)), (0..0, None));
+    }
+
+    /// A click on a settled pause banner (safe to close, ready) runs prefix
+    /// P's resume half alone, `agent-pause.py resume <client>` through
+    /// run-shell -b (the line unit-tested; the server is missing here, so
+    /// nothing runs), never `toggle`; one still moving does nothing.
+    #[test]
+    fn a_settled_pause_banner_resumes_on_click() {
+        let mut a = app();
+        let frame = |a: &App| layout(&a.view, 34, 30, &Opts { pause: a.pause_phase.clone(), ..Opts::default() });
+        a.pause_phase = Some(pause::Phase::Safe { labels: vec!["One".into()] });
+        a.shown = frame(&a);
+        a.handle(b"\x1b[<0;5;2M\x1b[<0;5;2m");
+        assert_eq!(a.last_act, Some(Target::Resume));
+        assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("no tmux client"));
+        a.link.client = Some("/dev/ttys999".into());
+        a.handle(b"\x1b[<0;5;1M\x1b[<0;5;1m");
+        assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("resuming the paused agents…"));
+        let script = a.actions.scripts.join("agent-pause.py");
+        assert_eq!(a.actions.resume_line("/dev/ttys999"), format!("{} 'resume' '/dev/ttys999'", sh_quote(&script.to_string_lossy())));
+        // Still stopping: the banner is no button.
+        a.last_act = None;
+        a.pause_phase = Some(pause::Phase::Stopping { stopped: 0, n: 1, working: vec!["One".into()] });
+        a.shown = frame(&a);
+        a.handle(b"\x1b[<0;5;1M\x1b[<0;5;1m");
+        assert_eq!(a.last_act, None);
     }
 
     #[test]
