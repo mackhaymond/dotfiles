@@ -493,6 +493,34 @@ class PauseKey(Harness):
         last = json.loads((self.dir / "state" / "paused.last.json").read_text())
         self.assertEqual(last["resume_attempts"], 3)
 
+    def test_paused_flag_follows_the_saved_set(self):
+        """@agent_paused marks exactly the agents a PAUSE reached; a resume
+        clears it (and a window still `paused` goes idle), a refused resume
+        puts both back."""
+        flag = lambda p: self.t("display", "-p", "-t", p, "#{@agent_paused}").strip()
+        st = lambda p: self.t("display", "-p", "-t", p, "#{@agent_state}").strip()
+        a = self.window("running")
+        b = self.window("running")
+        self.stub.reply = {b: "refuse"}
+        self.press()
+        self.assertTrue(flag(a).isdigit(), flag(a))
+        self.assertEqual(flag(b), "")                      # refused: never paused
+        self.t("set", "-w", "-t", a, "@agent_state", "paused")   # the hook's Stop
+        self.stub.reply = {a: "refuse"}
+        self.press()                                       # resume refused
+        self.assertTrue(flag(a).isdigit())
+        self.assertEqual(st(a), "paused")
+        self.stub.reply = {}
+        self.press()                                       # resume reaches a
+        self.assertEqual((flag(a), st(a)), ("", "idle"))
+        self.assertIsNone(self.state())
+        # A window the RESUME's turn already made running is left running.
+        self.t("set", "-w", "-t", b, "@agent_state", "running")
+        self.press()
+        self.t("set", "-w", "-t", b, "@agent_state", "running")
+        self.press()
+        self.assertEqual((flag(b), st(b)), ("", "running"))
+
     def test_no_reply_after_send_counts_as_reached(self):
         a = self.window("running")
         b = self.window("running")

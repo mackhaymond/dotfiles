@@ -236,6 +236,39 @@ def set_paused_option(n):
         pass
 
 
+def mark_paused(panes, on, repause=False):
+    """The per-agent PAUSED flag (docs/agent-pause.md, "The paused state"):
+    @agent_paused = <epoch> on each pane's window, which tells the tab hooks
+    to end its turn as @agent_state `paused` instead of done or a quiet
+    restore. Set BEFORE the PAUSE goes out (the reply's Stop can land within
+    seconds) and cleared BEFORE the RESUME (that turn must end normally);
+    the misses are put back afterwards. Clearing also turns a window still
+    sitting in `paused` back to idle (the RESUME's prompt makes it running);
+    repause (a RESUME that was refused) undoes that. One tmux call;
+    cosmetic, so it never raises."""
+    cmds = []
+    for p in panes:
+        if not p:
+            continue
+        if cmds:
+            cmds.append(";")
+        if on:
+            cmds += ["set-option", "-w", "-t", p, "@agent_paused", str(int(time.time()))]
+            if repause:
+                cmds += [";", "if-shell", "-F", "-t", p, "#{==:#{@agent_state},idle}",
+                         "set-option -w -t %s @agent_state paused" % p]
+        else:
+            cmds += ["set-option", "-wu", "-t", p, "@agent_paused", ";",
+                     "if-shell", "-F", "-t", p, "#{==:#{@agent_state},paused}",
+                     "set-option -w -t %s @agent_state idle" % p]
+    if not cmds:
+        return
+    try:
+        tmux(*cmds, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 # ------------------------------------------------------ agent identity
 
 def resurrect_dir():
@@ -755,6 +788,7 @@ def finish_pause(client, prog, targets, unidentified):
         prog.write(True, "failed", msg)
         log(dict(entry, message=msg, targets=targets))
         return msg, False
+    mark_paused([t["pane_id"] for t in targets], True)
     try:
         res = deliver(mcp, [(i, t["pane_id"]) for i, t in enumerate(targets)], PAUSE_MSG,
                       on_result=prog.result)
@@ -765,6 +799,7 @@ def finish_pause(client, prog, targets, unidentified):
         t["result"], t["detail"] = res.get(i, ("unknown", "no result"))
     ok = [t for t in targets if t["result"] in REACHED]
     bad = [t for t in targets if t["result"] not in REACHED]
+    mark_paused([t["pane_id"] for t in bad], False)
     held = [t for t in ok if t["result"] == "held"]
     unsure = [t for t in ok if t["result"] == "unknown"]
     if not ok:
@@ -829,6 +864,7 @@ def finish_resume(client, prog, st, live, gone):
             prog.write(True, "failed", msg)
             log(dict(entry, message=msg, targets=live + gone))
             return msg, False
+        mark_paused([t["resume_pane"] for t in live], False)
         try:
             res = deliver(mcp, [(i, t["resume_pane"]) for i, t in enumerate(live)], RESUME_MSG,
                           on_result=prog.result)
@@ -852,6 +888,9 @@ def finish_resume(client, prog, st, live, gone):
         t["dropped"] = True
         t["detail"] += " (missed %d times: dropped)" % t["miss_count"]
     keep = [t for t in bad + gone if not t.get("dropped")]
+    # A refused RESUME leaves that agent paused: its flag goes back on (a gone
+    # one has no pane to flag; a dropped one is no longer paused at all).
+    mark_paused([t["resume_pane"] for t in bad if not t.get("dropped")], True, repause=True)
     attempts = int(st.get("resume_attempts") or 0) + 1
     write_json(LAST, dict(st, resumed_at=now_iso(), resume=live + gone,
                           still_paused=len(keep), resume_attempts=attempts))

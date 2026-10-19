@@ -207,6 +207,37 @@ Everything lives in `~/.local/state/agent-pause/` (override:
 The tmux global option `@agents_paused` holds the number of agents still saved
 while paused, and is unset once none are left.
 
+## The paused state
+
+`paused` is an agent state, alongside idle, running, needs-input, failed and
+done. Mack's rule (2026-10-19): a paused agent is not done, it is stopped for a
+while. So there is no green, no NEEDS YOU row, no notification and no notch
+glow for a single agent. The one loud signal is **all paused**, shown once the
+whole saved set has stopped and kept until the resume.
+
+| piece | writer | meaning |
+|---|---|---|
+| `@agent_paused` (window) = `<epoch>` | agent-pause.py sets it on every target BEFORE the PAUSE goes out (a reply's Stop can land within seconds), then unsets it on the targets the PAUSE did not reach. It unsets it BEFORE the RESUME, and sets it back on a refused RESUME. The watcher GC and `clear_state` drop it with the session. | this agent is in the saved paused set |
+| `@agent_state` = `paused` | the tab hook: wherever a turn end would write `done` or `idle`, or do a quiet restore, while `@agent_paused` is set. `needs-input` and `failed` are written as always: only Mack can answer, and a failure must show. | the agent has stopped for the pause |
+| `paused` → `idle` | agent-pause.py, when it clears the flag for a resume (the RESUME's prompt then makes it `running`); back to `paused` if that RESUME is refused | |
+
+Every reader:
+
+- `paused` is not working (agent-pause's own rule, and the safe-to-close
+  check) and not attention. It never appears in NEEDS YOU, ⌥S, agent-jump or
+  the mru tiers, and it gets no done notification and no per-agent glow.
+- The watcher's reconciles (the seen-it discharge, the stuck-`running`
+  reconcile, the idle seed) leave `paused` alone.
+- **Display:** `⏸` in lavender (`#b4befe`) on the tab, the sidebar tile, the
+  agent menu and CuaNotch's row. It is the same colour on every surface.
+- **All paused** = `paused.json` lists targets and none of their windows is
+  working (the sidebar's safe and ready phases). CuaNotch shows one distinct
+  lavender glow for it until `paused.json` goes away (the resume); the
+  sidebar shows its banner.
+- **Paused beats a quiet finish.** The PAUSE arrives through
+  `message_agent`, so the tab hook may classify that turn as agent-started
+  (`agent-tab-indicator.md` §6). `paused` wins over the quiet restore.
+
 ## In the sidebar
 
 Mack closes the popup (Esc) or a tab and still wants to see where the pause
