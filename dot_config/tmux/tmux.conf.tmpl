@@ -913,6 +913,10 @@ set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/
 # After a restore:
 #   assistant-restore.sh  resumes every saved agent in parallel. Replaces the
 #                         plugin's hook, which waited ~7s per agent, serially.
+#                         Holds the resumes (≤90s) until the local http MCP
+#                         servers in ~/.claude.json answer: at login launchd
+#                         starts tmux-pty-mcp/tmux-mcp after tmux, and a claude
+#                         that misses them at startup never reconnects.
 #   stash.sh restore-state  parked windows come back parked on their own, but
 #                         resurrect does not save WINDOW OPTIONS, which hold the
 #                         parked state — including a suspended agent's

@@ -183,8 +183,51 @@ while :; do
 	sleep 0.1
 	waited=$((waited + 1))
 done
-snapshot="$(ps -eo pid=,ppid=,args= 2>/dev/null)"
 log "panes ready after $(elapsed)s"
+
+# --- wait (once, bounded) for the local MCP servers -----------------------------
+# Claude connects to its HTTP MCP servers once, at startup; a refused connection
+# marks the server failed for the life of the process (no retry, only /mcp by
+# hand). At login launchd starts the LaunchAgents behind them (tmux-pty-mcp on
+# 7997, tmux-mcp on 7998) AFTER WezTerm has brought tmux up: on 2026-10-19 the
+# resumes went out at 12:32:53 and the servers listened at 12:32:59, so all 14
+# restored agents came up without pty or tmux tools. So the resumes wait here
+# until every loopback http server in ~/.claude.json answers (any HTTP status,
+# 401 included, means it is listening). Remote ones are not ours to wait on.
+# @assistant-resurrect-mcp-urls overrides the list; @assistant-resurrect-mcp-wait
+# (seconds) bounds the wait, after which the agents are resumed anyway.
+MCP_WAIT="$(tmux show-option -gqv @assistant-resurrect-mcp-wait 2>/dev/null)"
+MCP_WAIT="${MCP_WAIT:-90}"
+mcp_urls="$(tmux show-option -gqv @assistant-resurrect-mcp-urls 2>/dev/null)"
+if [ -z "$mcp_urls" ] && [ -f "$HOME/.claude.json" ]; then
+	mcp_urls="$(jq -r '(.mcpServers // {})[] | select(.type == "http" or .type == "sse") | .url // empty
+		| select(test("^https?://(127\\.0\\.0\\.1|localhost|\\[::1\\])[:/]"))' "$HOME/.claude.json" 2>/dev/null | tr '\n' ' ')"
+fi
+mcp_down() {
+	local u down=""
+	for u in $mcp_urls; do
+		[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "$u" 2>/dev/null)" = 000 ] && down+=" $u"
+	done
+	printf '%s' "${down# }"
+}
+if [ -n "$mcp_urls" ]; then
+	mcp_start=$EPOCHREALTIME
+	down="$(mcp_down)"
+	[ -n "$down" ] && log "waiting up to ${MCP_WAIT}s for MCP server(s): $down"
+	while [ -n "$down" ]; do
+		if awk -v s="$mcp_start" -v e="$EPOCHREALTIME" -v w="$MCP_WAIT" 'BEGIN { exit !(e - s >= w) }'; then
+			log "MCP server(s) still down after ${MCP_WAIT}s, resuming anyway (those agents will need /mcp → Reconnect): $down"
+			"$HOME/.config/tmux/scripts/notify.sh" -k warn -- "Agents resumed without MCP: $down down. /mcp → Reconnect in each, or re-resume them." 2>/dev/null
+			break
+		fi
+		sleep 0.5
+		down="$(mcp_down)"
+		[ -z "$down" ] && log "MCP servers up after $(elapsed)s"
+	done
+	# Guard 1 below reads $live: refresh it if the wait gave panes time to change.
+	live="$(tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}${US}#{pane_current_command}${US}#{pane_pid}${US}#{cursor_x}${US}#{cursor_y}" 2>/dev/null)"
+fi
+snapshot="$(ps -eo pid=,ppid=,args= 2>/dev/null)"
 
 # --- resume ------------------------------------------------------------------------
 restored=0
