@@ -67,11 +67,17 @@ held message therefore counts as delivered.
 - **RESUME**: pick up from the noted next steps, and restart anything you
   stopped if you still need it.
 
-## The popup
+## The popup (opt-in)
+
+**Off by default** (Mack, 2026-10-19). The status lives in the sidebar's pause
+banner (see "In the sidebar") and CuaNotch's pulsing "all paused" glow, and a
+press says its outcome as a toast (`notify.sh`). Turn the popup back on with
+`set -g @agent_pause_popup on` in `agent-pause.conf` (`AGENT_PAUSE_POPUP`
+overrides it; the tests use that). Everything below describes it when on.
 
 A line at the bottom of the screen is too easy to miss with the lid half
-shut (Mack's call), so any press with someone to message opens a big popup on
-the client that pressed the key. It is border-less, about 70% wide and 60%
+shut (Mack's call at the time), so with the popup on, any press with someone
+to message opens a big popup on the client that pressed the key. It is border-less, about 70% wide and 60%
 tall, never smaller than 60x16 (or the whole client when that is smaller), on
 a solid tint with dark text.
 

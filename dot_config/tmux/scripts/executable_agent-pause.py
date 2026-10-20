@@ -1101,12 +1101,26 @@ def wezterm_panes():
         return None
 
 
+def popup_enabled():
+    """The popup is opt-in (Mack, 2026-10-19): the sidebar's pause banner
+    and CuaNotch's glow are the status, and a press with the popup off says
+    its outcome as a toast. On with the tmux option `@agent_pause_popup on`
+    (agent-pause.conf); AGENT_PAUSE_POPUP overrides it (tests)."""
+    v = os.environ.get("AGENT_PAUSE_POPUP")
+    if v is None:
+        try:
+            v = tmux("show-options", "-gqv", "@agent_pause_popup", check=False)
+        except (OSError, subprocess.SubprocessError):
+            v = ""
+    return v.strip().lower() in ("on", "1", "true", "yes")
+
+
 def open_popup(client, mode, press):
     """Launch the popup for this press and return its process, without
     waiting: display-popup blocks until the popup closes, and the popup must
     be up while delivery runs. Its own session, so it outlives the toggle.
     Big, border-less, on a solid tint; positioned by popup_geometry."""
-    if not client:
+    if not client or not popup_enabled():
         return None
     bg = PEACH if mode == "pause" else GREEN
     try:

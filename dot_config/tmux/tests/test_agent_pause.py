@@ -681,6 +681,7 @@ class Popup(Harness):
 
     def setUp(self):
         super().setUp()
+        self.env["AGENT_PAUSE_POPUP"] = "on"   # opt-in; these tests are about it
         self.out = bytearray()
         self.child = None
         self.addCleanup(self.detach)
@@ -764,6 +765,25 @@ class Popup(Harness):
         except subprocess.TimeoutExpired:
             self.fail("the toggle never finished")
         self.wait_for(lambda: not self.popup_alive(), "the popup to close", timeout)
+
+    def test_popup_is_off_unless_enabled(self):
+        """Opt-in: with neither the env override nor @agent_pause_popup on, a
+        press on a real client opens no popup and still pauses; the tmux
+        option alone turns it on."""
+        a = self.window("running")
+        del self.env["AGENT_PAUSE_POPUP"]
+        r = subprocess.run([sys.executable, str(SCRIPT), "toggle", self.client],
+                           env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual((r.returncode, r.stdout), (0, ""), r.stderr)
+        lines = [json.loads(l) for l in (self.dir / "state" / "log").read_text().splitlines()]
+        self.assertFalse([l for l in lines if l["mode"] == "popup"])
+        self.assertEqual([t["pane_id"] for t in self.state()["targets"]], [a])
+        self.t("set", "-g", "@agent_pause_popup", "on")
+        self.press_with_popup()                            # the resume, now with its popup
+        self.wait_for(lambda: self.popup_up("RESUMED") or not self.popup_alive(), "the RESUMED popup")
+        lines = [json.loads(l) for l in (self.dir / "state" / "log").read_text().splitlines()]
+        self.assertTrue([l for l in lines if l["mode"] == "popup"])
+        self.press_done()
 
     def test_pause_popup_ignores_stray_keys_and_esc_keeps_the_set(self):
         a = self.window("running")
