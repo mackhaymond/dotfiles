@@ -236,17 +236,23 @@ Every reader:
   the mru tiers, and it gets no done notification and no per-agent glow.
 - The watcher's reconciles (the seen-it discharge, the stuck-`running`
   reconcile, the idle seed) leave `paused` alone.
-- **Display:** `⏸` in lavender (`#b4befe`) on the tab, the sidebar tile, the
-  agent menu and CuaNotch's row. It is the same colour on every surface, and
-  the sidebar's safe-to-close and ready banners are lavender too. Readers
+- **Display:** `⏸` in violet `#7f6bff` on the tab, the sidebar tile, the
+  agent menu, the space dashboard and CuaNotch's row. It is the same colour on
+  every surface (cua-notch `dev/check-invariants` §65 enforces it), and the
+  sidebar's banners use it too (a dimmer `#6c5bd9` while pausing or
+  resuming). It was lavender `#b4befe`, then Mack asked for something more
+  interesting; `#9d6bff` was 2.8° from CuaNotch's backup-running violet, so
+  the two rings would have looked the same. Readers
   also count `@agent_paused` with `done` or `idle` as paused (the sidebar
   does, b1e2795), so a tile is right even before the hook writes `paused`.
 - agent-pause.py posts `notifyutil -p com.mackhaymond.tmux.agent-state`
   after setting or clearing the flag, so the sidebar redraws at once.
 - **All paused** = `paused.json` lists targets and none of their windows is
-  working (the sidebar's safe and ready phases). CuaNotch shows one distinct
-  lavender glow for it until `paused.json` goes away (the resume); the
-  sidebar shows its banner.
+  working (the sidebar's safe and ready phases). CuaNotch shows one violet
+  ring for it that pulses hard (near-off to full every 1.7 s, swelling at the
+  peak; cua-notch b27e552, 2cbcd3f) until `paused.json` goes away (the
+  resume); the sidebar shows its banner. While agents are still stopping
+  there is no glow: the pulse coming on is the cue that the lid can close.
 - **Paused beats a quiet finish.** The PAUSE arrives through
   `message_agent`, so the tab hook may classify that turn as agent-started
   (`agent-tab-indicator.md` §6). `paused` wins over the quiet restore.
