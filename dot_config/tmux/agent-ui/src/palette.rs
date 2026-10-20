@@ -11,15 +11,19 @@
 
 use ratatui::style::Color;
 
-/// name → `#rrggbb`. Same 17 entries, same values as agent-roster.py `HEX`.
-/// `lavender` joined when it became a STATE's colour (paused, ⏸): it is no
-/// longer chrome only.
-pub const HEX: [(&str, &str); 17] = [
+/// name → `#rrggbb`. Same 18 entries, same values as agent-roster.py `HEX`.
+/// `violet` (electric violet, #7f6bff) is the paused STATE's colour (⏸, the
+/// pause banner's settled phases): Mack wanted paused "more interesting"
+/// than the lavender it first wore (and CuaNotch's backup violet, #9d6bff's
+/// neighbour, pushed it bluer). `lavender` joined when it was paused's
+/// colour and stays (the client's own card: its lift `tile_me` and its
+/// edge), so both tables keep it.
+pub const HEX: [(&str, &str); 18] = [
     ("red", "#f38ba8"), ("yellow", "#f9e2af"), ("green", "#a6e3a1"), ("pink", "#f5c2e7"),
     ("blue", "#89b4fa"), ("teal", "#94e2d5"), ("dimteal", "#659a91"), ("dimblue", "#5d7aaa"),
     ("peach", "#fab387"), ("text", "#cdd6f4"), ("sub", "#a6adc8"), ("overlay", "#6c7086"),
     ("surface0", "#313244"), ("surface1", "#45475a"), ("crust", "#11111b"), ("sky", "#89dceb"),
-    ("lavender", "#b4befe"),
+    ("lavender", "#b4befe"), ("violet", "#7f6bff"),
 ];
 
 /// Chrome-only colours the sidebar and menu draw with (backgrounds, the
@@ -50,12 +54,18 @@ pub const HEX: [(&str, &str); 17] = [
 /// here" at a glance. `term` (the terminals' own `base`) is a SHELL row's
 /// strip: a little terminal on the canvas, a step under the agent tiles
 /// (it was crust-dark, #13131d, which Mack found too dark).
-pub const UI: [(&str, &str); 12] = [
+///
+/// `dimviolet` is `violet` at 85% brightness (its HSV hue held still, as
+/// `dimblue` is `blue`'s): the pause banner's MOVING phases (pausing and
+/// resuming, with the spinner), the quieter of its two violets; the settled
+/// phases (safe to close, ready) wear the full `violet`. Banner chrome, no
+/// agent state: no other surface draws it.
+pub const UI: [(&str, &str); 13] = [
     ("base", "#1e1e2e"), ("mantle", "#181825"), ("surface2", "#585b70"),
     ("mauve", "#cba6f7"), ("sel", "#2a2b3d"),
     ("overlay2", "#9399b2"), ("tile", "#30314a"), ("tile_lo", "#28283b"),
     ("tile_hi", "#31394f"), ("overlay1", "#7f849c"), ("tile_me", "#474a66"),
-    ("term", "#1e1e2e"),
+    ("term", "#1e1e2e"), ("dimviolet", "#6c5bd9"),
 ];
 
 /// The `#rrggbb` for a palette name ([`HEX`] first, then [`UI`]). Panics on
@@ -122,7 +132,7 @@ mod tests {
     "blue": "#89b4fa", "teal": "#94e2d5", "dimteal": "#659a91", "dimblue": "#5d7aaa",
     "peach": "#fab387", "text": "#cdd6f4", "sub": "#a6adc8", "overlay": "#6c7086",
     "surface0": "#313244", "surface1": "#45475a", "crust": "#11111b", "sky": "#89dceb",
-    "lavender": "#b4befe","##;
+    "lavender": "#b4befe", "violet": "#7f6bff","##;
         for (n, h) in HEX {
             assert!(py.contains(&format!("\"{n}\": \"{h}\"")), "{n} {h}");
         }
@@ -217,6 +227,31 @@ mod tests {
         // Lighter than either zebra shade: a lift, not another stripe.
         assert!(contrast(me, rgb("tile")) > 1.25 && contrast(me, rgb(CANVAS)) > 1.7);
         assert!(contrast(rgb("text"), me) >= 5.5 && contrast(rgb("sub"), me) >= 3.8 && contrast(rgb("overlay2"), me) >= 3.0);
+    }
+
+    /// The pause banner's two violets: `dimviolet` is `violet` with its HSV
+    /// hue held still and darker (the moving phases, on `violet` at 9%), the
+    /// full `violet` the settled ones (on 14%); both words read on their
+    /// tints, the two tints part, and ready's solid chip keeps dark ink.
+    #[test]
+    fn the_pause_violets_read_and_part() {
+        let hsv = |(r, g, b): (u8, u8, u8)| {
+            let (r, g, b) = (f64::from(r), f64::from(g), f64::from(b));
+            let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+            let h = if mx == b { 240.0 + 60.0 * (r - g) / (mx - mn) } else { f64::NAN };
+            (h, mx)
+        };
+        let ((hv, vv), (hd, vd)) = (hsv(rgb("violet")), hsv(rgb("dimviolet")));
+        assert!((hv - hd).abs() < 1.0 && vd < vv, "{hv:.1}/{hd:.1}");
+        let moving = contrast(rgb("dimviolet"), mix_rgb("violet", 9));
+        let settled = contrast(rgb("violet"), mix_rgb("violet", 14));
+        assert!(moving >= 3.0 && settled > moving + 0.4, "{moving:.2} {settled:.2}");
+        assert!(contrast(rgb("crust"), rgb("violet")) >= 4.5);
+        let d = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            let s = |x: u8, y: u8| (f64::from(x) - f64::from(y)).powi(2);
+            (s(a.0, b.0) + s(a.1, b.1) + s(a.2, b.2)).sqrt()
+        };
+        assert!(d(mix_rgb("violet", 9), mix_rgb("violet", 14)) >= 12.0);
     }
 
     /// Every surface stands off the canvas and off whatever can sit right

@@ -143,7 +143,7 @@ def paused_line(session, index, wid, state, summary, flag="", **kw):
 
 class PausedTests(unittest.TestCase):
     """docs/agent-pause.md "The paused state": `paused` is its own quiet state
-    (⏸ lavender), never attention, never in NEEDS YOU, never done-green; done
+    (⏸ violet), never attention, never in NEEDS YOU, never done-green; done
     or idle with @agent_paused set reads paused until the tab hook writes it;
     running or asking with the flag keeps its live state."""
     FLAG = "1792418628"
@@ -192,14 +192,14 @@ class PausedTests(unittest.TestCase):
         self.assertEqual(R.counts(ws), [("needs-input", 1), ("done", 1), ("working", 1), ("paused", 3), ("idle", 1)])
         toks, cells = R.count_tokens([("paused", 3)])
         self.assertEqual(strip_plain(toks), "⏸3")
-        self.assertIn(R.fg("lavender"), toks)
+        self.assertIn(R.fg("violet"), toks)
         self.assertEqual(cells, 2)
-        self.assertEqual((R.CAT_GLYPH["paused"], R.CAT_HUE["paused"], R.HEX["lavender"]), ("⏸", "lavender", "#b4befe"))
+        self.assertEqual((R.CAT_GLYPH["paused"], R.CAT_HUE["paused"], R.HEX["violet"]), ("⏸", "violet", "#7f6bff"))
         r = R.Roster("/dev/ttys999")
         w = [x for x in ws if x["id"] == "@2"][0]
-        self.assertEqual(r.dot(w, True), R.fg("lavender") + "⏸")
-        self.assertEqual(r.dot(w, False), R.fg("lavender") + "⏸")           # steady: no pulse
-        self.assertEqual(r.shape(w, True), R.fg("lavender") + "⏸")
+        self.assertEqual(r.dot(w, True), R.fg("violet") + "⏸")
+        self.assertEqual(r.dot(w, False), R.fg("violet") + "⏸")           # steady: no pulse
+        self.assertEqual(r.shape(w, True), R.fg("violet") + "⏸")
         self.assertNotIn(R.fg("green"), r.dot(w, True))
         row = strip_plain(r.row({"kind": "win", "w": w, "long": False}, 120, False, 1000, False))
         self.assertRegex(row, r"⏸ .*Flagged done\s+paused ")

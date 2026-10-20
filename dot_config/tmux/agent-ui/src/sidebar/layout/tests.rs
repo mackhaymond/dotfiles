@@ -2511,7 +2511,7 @@ fn the_pause_banner_says_where_the_pause_stands() {
             let hue = pause_hue(&p);
             for y in f.pause.clone() {
                 let r = &f.rows[y];
-                assert_eq!((dwidth(&r.text()), r.bg), (usize::from(w), Some(Ink::Mix(hue, PAUSE_TINT))), "{ctx}");
+                assert_eq!((dwidth(&r.text()), r.bg), (usize::from(w), Some(pause_bg(&p))), "{ctx}");
                 assert_eq!(r.segs[1], seg("▌", hue), "{ctx}");
                 assert_eq!(r.anim, p.busy(), "{ctx}");
                 let click = (0..w).map(|x| f.target(x, y as u16)).collect::<Vec<_>>();
@@ -2670,13 +2670,13 @@ fn paused_view() -> ViewModel {
     )
 }
 
-/// A paused card: a lavender `▎` rail down both rows, the ⏸ bold lavender
+/// A paused card: a violet `▎` rail down both rows, the ⏸ bold violet
 /// on the right (its word below: `paused`, never twice), the second line
 /// `paused · prefix P resumes` while a pause is saved and it fits, else
 /// `paused`; never green, never a NEEDS YOU card, never folded into the idle
-/// line; the space's counts carry `⏸3` in lavender.
+/// line; the space's counts carry `⏸3` in violet.
 #[test]
-fn paused_cards_are_lavender_and_never_need_you() {
+fn paused_cards_are_violet_and_never_need_you() {
     let v = lettered(paused_view());
     let ids = |want: &str| v.agents().filter(|a| a.state == want).map(|a| a.title.clone()).collect::<Vec<_>>();
     assert_eq!(ids("paused"), ["Island resize spring", "Census AX sweep", "Kua Yu deck"]);
@@ -2690,9 +2690,9 @@ fn paused_cards_are_lavender_and_never_need_you() {
             let y = f.agents.clone().find(|&y| t[y].contains(title)).unwrap_or_else(|| panic!("{title}: {ctx}"));
             assert!(!f.needs.contains(&y), "{ctx}");
             let (r, r2) = (&f.rows[y], &f.rows[y + 1]);
-            assert_eq!((r.segs[1].clone(), r2.segs[1].clone()), (seg("▎", "lavender"), seg("▎", "lavender")), "{title} {ctx}");
-            assert!(r.segs.contains(&bold("⏸", "lavender")) && !t[y].contains("⏸ paused"), "{title} {ctx}");
-            assert!(r2.segs.contains(&bold("paused", "lavender")), "{title} {ctx}");
+            assert_eq!((r.segs[1].clone(), r2.segs[1].clone()), (seg("▎", "violet"), seg("▎", "violet")), "{title} {ctx}");
+            assert!(r.segs.contains(&bold("⏸", "violet")) && !t[y].contains("⏸ paused"), "{title} {ctx}");
+            assert!(r2.segs.contains(&bold("paused", "violet")), "{title} {ctx}");
             // The key that resumes, while a pause is saved: whole from 44
             // columns, `prefix P` at Mack's usual 34.
             let want = if w >= 44 { "paused · prefix P resumes" } else { "paused · prefix P" };
@@ -2708,7 +2708,7 @@ fn paused_cards_are_lavender_and_never_need_you() {
         assert!(t[h].contains("working") && f.rows[h].segs[1] == seg("▎", "blue"), "{ctx}");
         // The space's header counts the paused bucket, after working.
         let m = head(&f, "main");
-        assert!(f.rows[m].segs.contains(&seg("⏸3", "lavender")), "{:?}", f.rows[m].segs);
+        assert!(f.rows[m].segs.contains(&seg("⏸3", "violet")), "{:?}", f.rows[m].segs);
         assert!(t[m].contains("◉1 ◐2 ⏸3 ○2"), "{ctx}");
     }
     // Squeezed: the idle agents fold, the paused ones never do.
@@ -2722,34 +2722,41 @@ fn paused_cards_are_lavender_and_never_need_you() {
     // the one line.
     let f = layout(&v, 24, 70, &Opts::default());
     let y = find(&f, "Islan");
-    assert!(f.rows[y].segs.contains(&bold("⏸ paused", "lavender")) && f.rows[y].segs[1] == seg("▎", "lavender"), "{:?}", f.rows[y].segs);
+    assert!(f.rows[y].segs.contains(&bold("⏸ paused", "violet")) && f.rows[y].segs[1] == seg("▎", "violet"), "{:?}", f.rows[y].segs);
 }
 
-/// The settled banner is "all paused": lavender for safe and ready alike
-/// (never green: green means done; never the old blue), the two told apart
-/// by emphasis: safe's `⏸ PAUSED` bold in lavender, ready's count on a
-/// solid lavender chip. Moving phases stay peach.
+/// The banner is two shades of the paused violet, never green (green means
+/// done), never the old blue, never peach: the settled phases ("all
+/// paused") the full violet at 14%, safe and ready told apart by emphasis
+/// (safe's `⏸ PAUSED` bold in violet, ready's count on a solid violet
+/// chip); the moving ones (pausing, resuming: the spinner) the quieter
+/// `dimviolet` at 9%.
 #[test]
-fn settled_pause_banner_is_lavender_never_green() {
+fn pause_banner_is_two_violets_never_green() {
     let v = lettered(quiet());
     for p in phases() {
-        let hue = pause_hue(&p);
+        let (hue, bg) = (pause_hue(&p), pause_bg(&p));
         match p {
-            Phase::Safe { .. } | Phase::Ready { .. } => assert_eq!(hue, "lavender", "{p:?}"),
-            _ => assert_eq!(hue, "peach", "{p:?}"),
+            Phase::Safe { .. } | Phase::Ready { .. } => {
+                assert_eq!((hue, bg), ("violet", Ink::Mix("violet", PAUSE_TINT)), "{p:?}");
+            }
+            _ => assert_eq!((hue, bg), ("dimviolet", Ink::Mix("violet", PAUSE_TINT_MOVING)), "{p:?}"),
         }
         for w in [34u16, 44] {
             let f = layout(&v, w, 58, &Opts { pause: Some(p.clone()), ..Opts::default() });
             for y in f.pause.clone() {
-                assert_eq!(f.rows[y].bg, Some(Ink::Mix(hue, PAUSE_TINT)));
-                assert!(f.rows[y].segs.iter().all(|s| s.fg != Ink::Pal("green") && s.fg != Ink::Pal("blue")), "{p:?}");
+                assert_eq!(f.rows[y].bg, Some(bg));
+                let banned = ["green", "blue", "peach"].map(Ink::Pal);
+                assert!(f.rows[y].segs.iter().all(|s| !banned.contains(&s.fg)), "{p:?}");
             }
         }
     }
     let f = layout(&v, 34, 58, &Opts { pause: Some(phases()[2].clone()), ..Opts::default() });
-    assert!(f.rows[0].segs.contains(&bold("⏸ PAUSED", "lavender")), "{:?}", f.rows[0].segs);
+    assert!(f.rows[0].segs.contains(&bold("⏸ PAUSED", "violet")), "{:?}", f.rows[0].segs);
     let f = layout(&v, 34, 58, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() });
-    assert!(f.rows[0].segs.contains(&block(" ↻ 3 ready ", "crust", "lavender")), "{:?}", f.rows[0].segs);
+    assert!(f.rows[0].segs.contains(&block(" ↻ 3 ready ", "crust", "violet")), "{:?}", f.rows[0].segs);
+    let f = layout(&v, 34, 58, &Opts { pause: Some(phases()[0].clone()), ..Opts::default() });
+    assert!(f.rows[0].segs.iter().any(|s| s.text.contains("PAUSING") && s.fg == Ink::Pal("dimviolet")), "{:?}", f.rows[0].segs);
 }
 
 mod pinned;

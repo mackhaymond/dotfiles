@@ -973,11 +973,11 @@ mod tests {
     }
 
     /// Paused (docs/agent-pause.md "The paused state"): its own category,
-    /// ⏸ in lavender (glyph, letter badge, header count), out of the needs
+    /// ⏸ in violet (glyph, letter badge, header count), out of the needs
     /// tiers: `paused` as written and done / idle with `@agent_paused` set;
     /// listed under Idle, never under Needs you or Active.
     #[test]
-    fn paused_is_a_lavender_category_out_of_the_needs() {
+    fn paused_is_a_violet_category_out_of_the_needs() {
         let r = |i: u32, set: &[(&str, &str)]| crate::tmux::tests::row("main", i, &format!("@{i}"), set);
         let snap = crate::tmux::Snapshot::parse(&[
             r(1, &[("state", "paused"), ("summary", "Written paused")]),
@@ -998,14 +998,14 @@ mod tests {
             let y = at(&f, name);
             assert!(f[y].contains(&format!("⏸ {name}")), "{}", f[y]);
             let gx = f[y].chars().position(|c| c == '⏸').unwrap() as u16;
-            assert_eq!(b[(gx, y as u16)].fg, color("lavender"), "{name}");
-            assert_eq!((b[(3, y as u16)].bg, b[(3, y as u16)].fg), (color("lavender"), color("crust")), "{name}");
+            assert_eq!(b[(gx, y as u16)].fg, color("violet"), "{name}");
+            assert_eq!((b[(3, y as u16)].bg, b[(3, y as u16)].fg), (color("violet"), color("crust")), "{name}");
         }
         let y = at(&f, "Really done");
         assert_eq!(b[(3, y as u16)].bg, color("green"));
-        // The header's paused count in lavender.
+        // The header's paused count in violet.
         let hx = f[0].chars().position(|c| c == '⏸').unwrap() as u16;
-        assert_eq!(b[(hx, 0)].fg, color("lavender"));
+        assert_eq!(b[(hx, 0)].fg, color("violet"));
         // Filters: Idle lists the paused and the idle; Needs you and Active never a paused one.
         let titles = |tab: Tab| -> Vec<String> {
             super::super::rows::build_rows(&d, tab, "").iter().filter_map(|r| r.agent().map(|a| a.title.clone())).collect()

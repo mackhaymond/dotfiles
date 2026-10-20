@@ -101,7 +101,7 @@ HEX = {
     "blue": "#89b4fa", "teal": "#94e2d5", "dimteal": "#659a91", "dimblue": "#5d7aaa",
     "peach": "#fab387", "text": "#cdd6f4", "sub": "#a6adc8", "overlay": "#6c7086",
     "surface0": "#313244", "surface1": "#45475a", "crust": "#11111b", "sky": "#89dceb",
-    "lavender": "#b4befe",
+    "lavender": "#b4befe", "violet": "#7f6bff",
 }
 GEAR = "\U000F0493"   # nf-md-cog: background workflow / subagent
 MOUSE = "\U000F037D"  # nf-md-mouse: driving an app through cua-driver
@@ -304,10 +304,11 @@ def rank(w):
 # the one mapping. CAT_HUE is only for the static count tokens; a test pins
 # it to dot()'s colours.
 # paused (the pause key's stopped agents): not working, not attention, never
-# done-green; ⏸ in lavender on every surface (the tab, the sidebar, CuaNotch).
+# done-green; ⏸ in electric violet (#7f6bff) on every surface (the tab, the
+# sidebar, CuaNotch). lavender stays in HEX: the sidebar's own-card edge.
 CATS = ("failed", "needs-input", "done", "working", "paused", "idle")
 CAT_GLYPH = {"failed": "✕", "needs-input": "◉", "done": "✓", "working": "◐", "paused": "⏸", "idle": "○"}
-CAT_HUE = {"failed": "red", "needs-input": "yellow", "done": "green", "working": "pink", "paused": "lavender",
+CAT_HUE = {"failed": "red", "needs-input": "yellow", "done": "green", "working": "pink", "paused": "violet",
            "idle": "overlay"}
 # opencode: nf-oct-terminal (U+F489), one cell like the others (agent-ui
 # model.rs kind_glyph uses the same codepoint).

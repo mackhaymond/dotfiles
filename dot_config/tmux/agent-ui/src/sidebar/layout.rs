@@ -674,7 +674,7 @@ pub fn cat_hue(c: Cat) -> Hue {
         Cat::NeedsInput => "yellow",
         Cat::Done => "green",
         Cat::Working => "blue",
-        Cat::Paused => "lavender",
+        Cat::Paused => PAUSED_HUE,
         Cat::Idle => "overlay",
     }
 }
@@ -1249,22 +1249,30 @@ fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
 
 // ---------------------------------------------------------------- the pause banner
 
-/// How strongly the pause banner takes its phase's colour (one tint for the
-/// whole banner, NEEDS YOU's first).
+/// How strongly a SETTLED pause banner (safe, ready) takes the paused
+/// violet (one tint for the whole banner, NEEDS YOU's first).
 pub const PAUSE_TINT: u8 = 14;
 
-/// A phase's colour: in progress (sending, stopping, resuming) peach, the
-/// pause popup's own; settled (safe to close, ready to resume) the paused
-/// state's lavender, "all paused", as on every surface (a paused card's ⏸,
+/// How strongly a MOVING pause banner (pausing, resuming) takes it: the
+/// NEEDS YOU zebra's quieter tint, a step under [`PAUSE_TINT`].
+pub const PAUSE_TINT_MOVING: u8 = 9;
+
+/// A phase's colour, two shades of the paused state's violet (Mack's ask):
+/// in progress (sending, stopping, resuming: the spinner) the quieter
+/// `dimviolet`; settled (safe to close, ready to resume) the full
+/// [`PAUSED_HUE`], "all paused", as on every surface (a paused card's ⏸,
 /// CuaNotch's all-paused glow). Never green: green means done. The two
 /// settled phases part by emphasis ([`pause_rows`]): safe says `⏸ PAUSED`
-/// bold in lavender, ready puts its count on a SOLID lavender chip, the one
+/// bold in violet, ready puts its count on a SOLID violet chip, the one
 /// that asks for a press.
 pub fn pause_hue(p: &Phase) -> Hue {
-    match p {
-        Phase::Resuming { .. } | Phase::Sending { .. } | Phase::Stopping { .. } => "peach",
-        Phase::Safe { .. } | Phase::Ready { .. } => PAUSED_HUE,
-    }
+    if p.busy() { "dimviolet" } else { PAUSED_HUE }
+}
+
+/// A phase's banner background: the paused violet over the canvas,
+/// [`PAUSE_TINT`] settled, [`PAUSE_TINT_MOVING`] while something moves.
+pub fn pause_bg(p: &Phase) -> Ink {
+    Ink::Mix(PAUSED_HUE, if p.busy() { PAUSE_TINT_MOVING } else { PAUSE_TINT })
 }
 
 /// How many rows the banner gets in a frame `h` tall: two (the second the
@@ -1286,8 +1294,9 @@ fn agents_n(n: usize) -> String {
 }
 
 /// The pause banner (docs/agent-pause.md "In the sidebar"): ONE tile in
-/// its phase's colour mixed over the canvas ([`PAUSE_TINT`], like a NEEDS
-/// YOU card), a heavy `▌` rail in that colour down its rows; the glyph (the
+/// the paused violet mixed over the canvas ([`pause_bg`], like a NEEDS YOU
+/// card), a heavy `▌` rail in its phase's colour ([`pause_hue`]) down its
+/// rows; the glyph (the
 /// spinner while something moves) and the word bold in the colour, what it
 /// means in `text` after it. The second row, when there is room and
 /// something to say, is the detail under the word: who is still working
@@ -1295,13 +1304,13 @@ fn agents_n(n: usize) -> String {
 /// clipped.
 ///
 /// ```text
-///  ▌ ⠹ PAUSING  sending 2 of 5          peach (a press in flight)
-///  ▌ ⠹ PAUSING  3 of 5 stopped          peach
+///  ▌ ⠹ PAUSING  sending 2 of 5          dim violet on 9% (a press in flight)
+///  ▌ ⠹ PAUSING  3 of 5 stopped          dim violet on 9%
 ///  ▌   still working  Tmux Sidebar, …
-///  ▌ ⏸ PAUSED  safe to close            lavender, bold word; a click resumes
-///  ▌ [↻ 5 ready] Tmux Sidebar, Island…  lavender: a SOLID chip; a click resumes
+///  ▌ ⏸ PAUSED  safe to close            violet on 14%, bold word; a click resumes
+///  ▌ [↻ 5 ready] Tmux Sidebar, Island…  violet on 14%: a SOLID chip; a click resumes
 ///  ▌   prefix P or click to resume      (one row: ↻ 5 ready  prefix P · click)
-///  ▌ ⠹ RESUMING  5 agents…              peach
+///  ▌ ⠹ RESUMING  5 agents…              dim violet on 9%
 /// ```
 ///
 /// Safe and ready rows click through to [`Target::Resume`]; the others do
@@ -1315,13 +1324,13 @@ fn pause_rows(p: &Phase, cx: Cx, lines: usize) -> Vec<Row> {
         return Vec::new();
     }
     let hue = pause_hue(p);
-    let bg = Ink::Mix(hue, PAUSE_TINT);
+    let bg = pause_bg(p);
     let spin = SPIN[cx.spin % SPIN.len()];
     let dimc = dim(true);
     let names = |l: &[String]| seg(l.join(", "), dimc);
     let rail = || seg(RAIL_HEAVY, hue);
     if let Phase::Ready { labels } = p {
-        // The chip: the count in dark ink on solid lavender, "press me".
+        // The chip: the count in dark ink on solid violet, "press me".
         let mut l1 = vec![rail(), seg(" ", "text"), block(format!(" ↻ {} ready ", labels.len()), "crust", hue), seg(" ", "text")];
         let rows = if lines >= 2 {
             l1.push(names(labels));
@@ -1642,7 +1651,7 @@ fn recent_done(a: &Agent, now: f64) -> bool {
 
 /// The state word: `⠹ working` (blue, animated), `◉ asks` / `◉ perm`
 /// (yellow), `✕ error` (red), `✓ done` (green: done, or idle with a recent
-/// finished turn), `⏸ paused` (lavender: never done-green, whatever its last
+/// finished turn), `⏸ paused` (violet: never done-green, whatever its last
 /// turn said); idle says nothing ([`Word::idle`]). None for a plain shell.
 fn state_word(a: &Agent, cx: Cx) -> Option<Word> {
     if a.in_flight || a.cat == Some(Cat::Working) {
@@ -1667,7 +1676,7 @@ fn cat_word(a: &Agent, c: Cat) -> Word {
 }
 
 /// A paused card's second line (docs/agent-pause.md "The paused state"):
-/// `paused` bold lavender, then, while a pause is saved ([`Cx::resumes`]),
+/// `paused` bold violet, then, while a pause is saved ([`Cx::resumes`]),
 /// the key that resumes it, dim: ` · prefix P resumes` where it fits in
 /// `room` cells, ` · prefix P` where that does (Mack's usual 34 columns),
 /// else `paused` alone. It stands in for the agent's last reply (the

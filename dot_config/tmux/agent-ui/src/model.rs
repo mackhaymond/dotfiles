@@ -88,9 +88,10 @@ impl Cat {
 }
 
 /// A paused agent's mark and colour, the same on every surface (the tab,
-/// the sidebar, the menus, CuaNotch's row): `⏸` in lavender (`#b4befe`).
+/// the sidebar, the menus, CuaNotch's row): `⏸` in electric violet
+/// (`violet`, `#7f6bff`; it was lavender, which Mack found too tame).
 pub const PAUSED_GLYPH: &str = "⏸";
-pub const PAUSED_HUE: &str = "lavender";
+pub const PAUSED_HUE: &str = "violet";
 
 /// The state a window shows, with the pause folded in (docs/agent-pause.md
 /// "The paused state"): `paused` as the tab hook writes it, and, until that
@@ -191,7 +192,7 @@ impl Counts {
 /// agent-roster.py `Roster.dot` colour: the live mark of a window. Attention
 /// states in their own colour; in flight pulses pink/blue with @agent_blink,
 /// except the window the client is on, which never pulses (blue); paused
-/// lavender (steady); other agent states overlay; None for a plain shell.
+/// violet (steady); other agent states overlay; None for a plain shell.
 pub fn dot_color(w: &Window, blink: bool, is_current: bool) -> Option<&'static str> {
     if is_attn(w) {
         return Some(match w.state.as_str() {
@@ -600,7 +601,7 @@ mod tests {
     }
 
     /// Paused (docs/agent-pause.md "The paused state"): its own bucket, ⏸
-    /// lavender, ranked with the quiet states, never attention, never in
+    /// violet, ranked with the quiet states, never attention, never in
     /// the NEEDS YOU queue, never done-green: `paused` as written, and
     /// done / idle with `@agent_paused` set. Running or asking with the flag
     /// keeps its live state.
@@ -616,8 +617,8 @@ mod tests {
             assert_eq!(cat(&p), Some(Cat::Paused), "{ctx}");
             assert!(!is_attn(&p) && !in_flight(&p), "{ctx}");
             assert_eq!(rank(&p), 4, "{ctx}");
-            assert_eq!(dot_color(&p, true, false), Some("lavender"), "{ctx}");
-            assert_eq!(dot_color(&p, false, true), Some("lavender"), "{ctx}"); // steady: no pulse
+            assert_eq!(dot_color(&p, true, false), Some("violet"), "{ctx}");
+            assert_eq!(dot_color(&p, false, true), Some("violet"), "{ctx}"); // steady: no pulse
             assert_eq!(state_words(&p), "paused", "{ctx}");
             assert!(needs_order(&[p], &Collator::new("C")).is_empty(), "{ctx}");
         }
@@ -629,7 +630,8 @@ mod tests {
         assert_eq!(needs_order(&[n], &Collator::new("C")).len(), 1);
         // Paused with a fleet still out is working (the pause's own rule).
         assert_eq!(cat(&w("paused", "", "1")), Some(Cat::Working));
-        assert_eq!((Cat::Paused.glyph(), Cat::Paused.hue(), Cat::Paused.name()), ("⏸", "lavender", "paused"));
+        assert_eq!((Cat::Paused.glyph(), Cat::Paused.hue(), Cat::Paused.name()), ("⏸", "violet", "paused"));
+        assert_eq!(crate::palette::hex(PAUSED_HUE), "#7f6bff");
         assert_eq!(Cat::of_state("paused"), Some(Cat::Paused));
         // The bucket order: after working, before idle.
         assert_eq!(Cat::ALL, [Cat::Failed, Cat::NeedsInput, Cat::Done, Cat::Working, Cat::Paused, Cat::Idle]);

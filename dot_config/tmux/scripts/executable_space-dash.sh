@@ -39,7 +39,7 @@ E=$'\e'
 fg() { local h="${1#\#}"; printf '%s[38;2;%d;%d;%dm' "$E" "0x${h:0:2}" "0x${h:2:2}" "0x${h:4:2}"; }
 C_TEXT="$(fg '#cdd6f4')" C_SUB="$(fg '#a6adc8')" C_DIM="$(fg '#6c7086')"
 C_RED="$(fg '#f38ba8')" C_YEL="$(fg '#f9e2af')" C_GRN="$(fg '#a6e3a1')" C_PINK="$(fg '#f5c2e7')"
-C_LAV="$(fg '#b4befe')"
+C_VIO="$(fg '#7f6bff')"   # paused ⏸: electric violet (the agent UIs' `violet`)
 BOLD="$E[1m" RST="$E[0m"
 
 # ── the big name: a 3x5 pixel font drawn with half blocks (3 rows) ─────────
@@ -223,7 +223,7 @@ render() {
     elif [[ "$st" == needs-* ]]; then glyph="◉" gc="$C_YEL"
     elif [[ "$st" == done && -z "${A_WF[i]}" ]]; then glyph="✓" gc="$C_GRN"
     elif [[ "$st" == running || -n "${A_WF[i]}" || -n "${A_CUA[i]}" ]]; then glyph="◐" gc="$C_PINK"
-    elif [[ "$st" == paused ]]; then glyph="⏸" gc="$C_LAV"
+    elif [[ "$st" == paused ]]; then glyph="⏸" gc="$C_VIO"
     else glyph="○" gc="$C_DIM"; fi
     seg "" "  "; seg "$gc" "$glyph"; seg "$C_DIM" " ⌘$((i + 1)) "
     if [[ -n "${A_KEY[i]}" ]]; then seg "$C_SPACE" "${A_KEY[i]}"; else seg "" " "; fi
