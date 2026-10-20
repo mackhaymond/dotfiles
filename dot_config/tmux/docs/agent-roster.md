@@ -1333,22 +1333,24 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   homes are blanked); a gone window counts as stopped. While a press is in
   flight the files are re-stat'ed on the spinner's ticks (the script posts
   no notice per delivery). Malformed or torn files show nothing. The
-  banner is the very top: one tile tinted in the paused violet, a heavy
-  `▌` rail, glyph and word bold in its phase's colour, the meaning after
-  it; a second row (dim) with who is still working or the labels. Two
-  shades of the violet (`layout::pause_hue`, `pause_bg`), never green
-  (green means done), never peach: the MOVING phases (pausing, resuming:
-  the spinner) the quieter `dimviolet` (`#6c5bd9`, violet at 85%
-  brightness, same hue) on a 9% tint; the SETTLED ones (safe, ready: "all
-  paused") the full `violet` (`#7f6bff`) on 14%. The settled two part by
-  emphasis: safe's `⏸ PAUSED` bold in violet, ready's count on a SOLID
-  violet chip (dark ink), the one that asks for a press:
+  banner is the very top: one tile tinted in its phase's colour, a heavy
+  `▌` rail, glyph and word bold in that colour, the meaning after it; a
+  second row (dim) with who is still working or the labels. It matches
+  CuaNotch (`layout::pause_hue`, `pause_bg`), never green (green means
+  done), never peach: the MOVING phases (pausing, resuming: the spinner)
+  the quieter `dimviolet` (`#6c5bd9`, violet at 85% brightness, same hue)
+  on a 9% violet tint, as the notch pulses violet while pausing; the
+  SETTLED ones (safe, ready: every paused agent stopped) `white`
+  (`#ffffff`) on a 14% white tint, as the notch holds a solid white ring
+  until the resume. Paused CARDS stay violet. The settled two part by
+  emphasis: safe's `⏸ PAUSED` bold in white, ready's count on a SOLID
+  white chip (dark ink), the one that asks for a press:
 
   ```
    ▌ ⠹ PAUSING  2 of 5 stopped          dim violet, 9% (also "sending 2 of 5")
    ▌   still working  Tmux Agent Sidebar, I…
-   ▌ ⏸ PAUSED  safe to close            violet, 14%, bold word
-   ▌ [ ↻ 3 ready ] Tmux Agent Sidebar…  violet, 14%, solid chip
+   ▌ ⏸ PAUSED  safe to close            white, 14%, bold word
+   ▌ [ ↻ 3 ready ] Tmux Agent Sidebar…  white, 14%, solid chip
    ▌   prefix P or click to resume
    ▌ ⠹ RESUMING  3 agents…              dim violet, 9%
   ```

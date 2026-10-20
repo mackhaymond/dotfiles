@@ -1249,30 +1249,38 @@ fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
 
 // ---------------------------------------------------------------- the pause banner
 
-/// How strongly a SETTLED pause banner (safe, ready) takes the paused
-/// violet (one tint for the whole banner, NEEDS YOU's first).
+/// How strongly a SETTLED pause banner (safe, ready) takes its white (one
+/// tint for the whole banner, NEEDS YOU's first): a neutral, plainly lit
+/// band, CuaNotch's solid white ring in the sidebar.
 pub const PAUSE_TINT: u8 = 14;
+
+/// The settled banner's accent (safe to close, ready to resume): white, as
+/// CuaNotch holds a solid white ring once every paused agent has stopped.
+/// The paused CARDS stay violet ([`PAUSED_HUE`]); only the "all stopped"
+/// signal is white.
+pub const SETTLED_HUE: &str = "white";
 
 /// How strongly a MOVING pause banner (pausing, resuming) takes it: the
 /// NEEDS YOU zebra's quieter tint, a step under [`PAUSE_TINT`].
 pub const PAUSE_TINT_MOVING: u8 = 9;
 
-/// A phase's colour, two shades of the paused state's violet (Mack's ask):
-/// in progress (sending, stopping, resuming: the spinner) the quieter
-/// `dimviolet`; settled (safe to close, ready to resume) the full
-/// [`PAUSED_HUE`], "all paused", as on every surface (a paused card's ⏸,
-/// CuaNotch's all-paused glow). Never green: green means done. The two
-/// settled phases part by emphasis ([`pause_rows`]): safe says `⏸ PAUSED`
-/// bold in violet, ready puts its count on a SOLID violet chip, the one
-/// that asks for a press.
+/// A phase's colour, matching CuaNotch (Mack's ask): in progress (sending,
+/// stopping, resuming: the spinner) the quieter `dimviolet`, as the notch
+/// pulses violet while pausing; settled (safe to close, ready to resume)
+/// [`SETTLED_HUE`] white, as the notch holds a solid white ring once every
+/// agent has stopped. Never green: green means done. The two settled
+/// phases part by emphasis ([`pause_rows`]): safe says `⏸ PAUSED` bold in
+/// white, ready puts its count on a SOLID white chip, the one that asks for
+/// a press.
 pub fn pause_hue(p: &Phase) -> Hue {
-    if p.busy() { "dimviolet" } else { PAUSED_HUE }
+    if p.busy() { "dimviolet" } else { SETTLED_HUE }
 }
 
-/// A phase's banner background: the paused violet over the canvas,
-/// [`PAUSE_TINT`] settled, [`PAUSE_TINT_MOVING`] while something moves.
+/// A phase's banner background over the canvas: the paused violet at
+/// [`PAUSE_TINT_MOVING`] while something moves, white at [`PAUSE_TINT`]
+/// once settled.
 pub fn pause_bg(p: &Phase) -> Ink {
-    Ink::Mix(PAUSED_HUE, if p.busy() { PAUSE_TINT_MOVING } else { PAUSE_TINT })
+    if p.busy() { Ink::Mix(PAUSED_HUE, PAUSE_TINT_MOVING) } else { Ink::Mix(SETTLED_HUE, PAUSE_TINT) }
 }
 
 /// How many rows the banner gets in a frame `h` tall: two (the second the
@@ -1294,7 +1302,7 @@ fn agents_n(n: usize) -> String {
 }
 
 /// The pause banner (docs/agent-pause.md "In the sidebar"): ONE tile in
-/// the paused violet mixed over the canvas ([`pause_bg`], like a NEEDS YOU
+/// its phase's colour mixed over the canvas ([`pause_bg`], like a NEEDS YOU
 /// card), a heavy `▌` rail in its phase's colour ([`pause_hue`]) down its
 /// rows; the glyph (the
 /// spinner while something moves) and the word bold in the colour, what it
@@ -1307,8 +1315,8 @@ fn agents_n(n: usize) -> String {
 ///  ▌ ⠹ PAUSING  sending 2 of 5          dim violet on 9% (a press in flight)
 ///  ▌ ⠹ PAUSING  3 of 5 stopped          dim violet on 9%
 ///  ▌   still working  Tmux Sidebar, …
-///  ▌ ⏸ PAUSED  safe to close            violet on 14%, bold word; a click resumes
-///  ▌ [↻ 5 ready] Tmux Sidebar, Island…  violet on 14%: a SOLID chip; a click resumes
+///  ▌ ⏸ PAUSED  safe to close            white on 14%, bold word; a click resumes
+///  ▌ [↻ 5 ready] Tmux Sidebar, Island…  white on 14%: a SOLID chip; a click resumes
 ///  ▌   prefix P or click to resume      (one row: ↻ 5 ready  prefix P · click)
 ///  ▌ ⠹ RESUMING  5 agents…              dim violet on 9%
 /// ```
@@ -1330,7 +1338,7 @@ fn pause_rows(p: &Phase, cx: Cx, lines: usize) -> Vec<Row> {
     let names = |l: &[String]| seg(l.join(", "), dimc);
     let rail = || seg(RAIL_HEAVY, hue);
     if let Phase::Ready { labels } = p {
-        // The chip: the count in dark ink on solid violet, "press me".
+        // The chip: the count in dark ink on solid white, "press me".
         let mut l1 = vec![rail(), seg(" ", "text"), block(format!(" ↻ {} ready ", labels.len()), "crust", hue), seg(" ", "text")];
         let rows = if lines >= 2 {
             l1.push(names(labels));

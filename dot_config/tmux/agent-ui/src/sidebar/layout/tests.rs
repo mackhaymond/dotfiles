@@ -2725,20 +2725,20 @@ fn paused_cards_are_violet_and_never_need_you() {
     assert!(f.rows[y].segs.contains(&bold("⏸ paused", "violet")) && f.rows[y].segs[1] == seg("▎", "violet"), "{:?}", f.rows[y].segs);
 }
 
-/// The banner is two shades of the paused violet, never green (green means
-/// done), never the old blue, never peach: the settled phases ("all
-/// paused") the full violet at 14%, safe and ready told apart by emphasis
-/// (safe's `⏸ PAUSED` bold in violet, ready's count on a solid violet
-/// chip); the moving ones (pausing, resuming: the spinner) the quieter
-/// `dimviolet` at 9%.
+/// The banner matches CuaNotch: the moving phases (pausing, resuming: the
+/// spinner) the quieter `dimviolet` on violet at 9%, as the notch pulses
+/// violet; the settled ones ("all stopped") white on white at 14%, as the
+/// notch holds a solid white ring, safe and ready told apart by emphasis
+/// (safe's `⏸ PAUSED` bold in white, ready's count on a solid white chip).
+/// Never green (green means done), never the old blue, never peach.
 #[test]
-fn pause_banner_is_two_violets_never_green() {
+fn pause_banner_is_violet_then_white_never_green() {
     let v = lettered(quiet());
     for p in phases() {
         let (hue, bg) = (pause_hue(&p), pause_bg(&p));
         match p {
             Phase::Safe { .. } | Phase::Ready { .. } => {
-                assert_eq!((hue, bg), ("violet", Ink::Mix("violet", PAUSE_TINT)), "{p:?}");
+                assert_eq!((hue, bg), ("white", Ink::Mix("white", PAUSE_TINT)), "{p:?}");
             }
             _ => assert_eq!((hue, bg), ("dimviolet", Ink::Mix("violet", PAUSE_TINT_MOVING)), "{p:?}"),
         }
@@ -2752,9 +2752,9 @@ fn pause_banner_is_two_violets_never_green() {
         }
     }
     let f = layout(&v, 34, 58, &Opts { pause: Some(phases()[2].clone()), ..Opts::default() });
-    assert!(f.rows[0].segs.contains(&bold("⏸ PAUSED", "violet")), "{:?}", f.rows[0].segs);
+    assert!(f.rows[0].segs.contains(&bold("⏸ PAUSED", "white")), "{:?}", f.rows[0].segs);
     let f = layout(&v, 34, 58, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() });
-    assert!(f.rows[0].segs.contains(&block(" ↻ 3 ready ", "crust", "violet")), "{:?}", f.rows[0].segs);
+    assert!(f.rows[0].segs.contains(&block(" ↻ 3 ready ", "crust", "white")), "{:?}", f.rows[0].segs);
     let f = layout(&v, 34, 58, &Opts { pause: Some(phases()[0].clone()), ..Opts::default() });
     assert!(f.rows[0].segs.iter().any(|s| s.text.contains("PAUSING") && s.fg == Ink::Pal("dimviolet")), "{:?}", f.rows[0].segs);
 }

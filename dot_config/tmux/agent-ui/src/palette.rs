@@ -57,15 +57,16 @@ pub const HEX: [(&str, &str); 18] = [
 ///
 /// `dimviolet` is `violet` at 85% brightness (its HSV hue held still, as
 /// `dimblue` is `blue`'s): the pause banner's MOVING phases (pausing and
-/// resuming, with the spinner), the quieter of its two violets; the settled
-/// phases (safe to close, ready) wear the full `violet`. Banner chrome, no
-/// agent state: no other surface draws it.
-pub const UI: [(&str, &str); 13] = [
+/// resuming, with the spinner). `white` is the SETTLED banner's accent (safe
+/// to close, ready to resume): CuaNotch holds a solid white ring once every
+/// paused agent has stopped, and the banner matches it. Banner chrome, no
+/// agent state: no other surface draws either (a paused card stays `violet`).
+pub const UI: [(&str, &str); 14] = [
     ("base", "#1e1e2e"), ("mantle", "#181825"), ("surface2", "#585b70"),
     ("mauve", "#cba6f7"), ("sel", "#2a2b3d"),
     ("overlay2", "#9399b2"), ("tile", "#30314a"), ("tile_lo", "#28283b"),
     ("tile_hi", "#31394f"), ("overlay1", "#7f849c"), ("tile_me", "#474a66"),
-    ("term", "#1e1e2e"), ("dimviolet", "#6c5bd9"),
+    ("term", "#1e1e2e"), ("dimviolet", "#6c5bd9"), ("white", "#ffffff"),
 ];
 
 /// The `#rrggbb` for a palette name ([`HEX`] first, then [`UI`]). Panics on
