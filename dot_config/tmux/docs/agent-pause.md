@@ -248,11 +248,16 @@ Every reader:
 - agent-pause.py posts `notifyutil -p com.mackhaymond.tmux.agent-state`
   after setting or clearing the flag, so the sidebar redraws at once.
 - **All paused** = `paused.json` lists targets and none of their windows is
-  working (the sidebar's safe and ready phases). CuaNotch shows one violet
-  ring for it that pulses hard (near-off to full every 1.7 s, swelling at the
-  peak; cua-notch b27e552, 2cbcd3f) until `paused.json` goes away (the
-  resume); the sidebar shows its banner. While agents are still stopping
-  there is no glow: the pulse coming on is the cue that the lid can close.
+  working (the sidebar's safe and ready phases).
+- **The notch, two phases** (Mack, 2026-10-19: "pulse while it's pausing and
+  some strong solid glow of another color when it's done"; cua-notch
+  fffa8f1). **Pausing** (a pause press in flight, or a saved target still
+  working): violet `#7f6bff` pulsing hard, near-off to full every 1.7 s and
+  swelling at the peak. **All paused**: a strong, steady white `#ffffff` ring
+  at that peak reach, held until `paused.json` goes away (the resume, wakes
+  included). A resume press in flight shows neither. The white is the cue
+  that the lid can close. The sidebar matches: dim violet banners while
+  pausing or resuming, white for safe to close and ready (04f76d8).
 - **Paused beats a quiet finish.** The PAUSE arrives through
   `message_agent`, so the tab hook may classify that turn as agent-started
   (`agent-tab-indicator.md` §6). `paused` wins over the quiet restore.
