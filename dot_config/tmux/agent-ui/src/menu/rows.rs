@@ -169,12 +169,22 @@ pub struct Target {
     pub session: String,
     pub index: u32,
     pub title: String,
+    /// The window was pinned (`@agent_pinned`) as the row showed it: Space p
+    /// unpins it then, else pins it.
+    pub pinned: bool,
 }
 
 impl Target {
     /// `a` as listed under `key`.
     pub fn of(key: RowKey, a: &Agent) -> Target {
-        Target { key, win: a.window_id.clone(), session: a.session.clone(), index: a.index, title: a.title.clone() }
+        Target {
+            key,
+            win: a.window_id.clone(),
+            session: a.session.clone(),
+            index: a.index,
+            title: a.title.clone(),
+            pinned: a.pinned.is_some(),
+        }
     }
 
     pub fn parked(&self) -> bool {
@@ -263,6 +273,8 @@ impl Data {
 
         // Letters: the one shared assignment ([`letters::of_view`]), from each
         // window's @agent_key (or a write still in flight).
+        // The pins' ⌥W digit (the row's pin mark says it).
+        crate::view::Agent::set_pin_keys(&mut view, &crate::pins::pin_keys(snap));
         let a = letters::of_view(snap, &view, keys);
         let ids: HashSet<&str> = listed(&view).map(|a| a.window_id.as_str()).collect();
         let last = last_agent(&ids, view.cur_win.as_deref(), snap.mru());

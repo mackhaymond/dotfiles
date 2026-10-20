@@ -97,6 +97,12 @@ tmux server (default socket)
   a home. tmux-mcp and the agent recipes trust `@agent_key` as an AGENT's
   only while `@agent_state` is set, so tmux-mcp's pane `"e"` never finds a
   shell: use recipe **letter**.
+- **Pinned agent**: an agent with `@agent_pinned` set (a pin timestamp). The
+  sidebar lists it in its PINNED section (between NEEDS YOU and AGENTS, in
+  pin order, in both scopes) instead of its space group, and it keeps its
+  letter. `@pin_key` (1-9, gap-free, pin order) is its ⌥W digit; trust it only
+  while `@agent_pinned` is set. Pins survive a restore (the sidebar keeps
+  `~/.local/state/agent-ui/pins.json` by session id) and parking.
 - **Tab / window / pane**: Mack's "tab" is a tmux window. A pane is a split
   inside one. "Window" may also mean a macOS/WezTerm window, so ask yourself
   which they mean.
@@ -291,17 +297,19 @@ Prefix is **⌃S**. ⌘ chords come from WezTerm.
 |---|---|
 | ⌃1-9 | space N's home (by `@space_index`); in the space you're in, back home |
 | ⌘1-9 | agent N of this space (ordinal) |
-| ⌥1-9 | nothing of tmux's: they reach the program in the tab (shells go by letter, ⌥W) |
+| ⌥1-9 | nothing of tmux's: they reach the program in the tab (all nav goes through ⌥W) |
+| prefix t | pin / unpin this tab (agents only); a middle-click on a sidebar card does the same |
 | ⌥L / ⌥H | next / previous of the same kind (agent→agent, shell→shell), wrapping |
 | ⌥\` | agent ↔ last-visited shell of this space |
 | ⌥W then a letter | jump to that agent or shell, any space; never a home (Esc cancels; a miss says "jump: nothing on x") |
+| ⌥W then 1-9 | jump to the Nth pinned agent (`@pin_key`, the sidebar's PINNED section, any space; a miss says "no pin N") |
 | ⌥S | next tab that needs you (CuaNotch owns it; prefix d is tmux's) |
 | ⌥X / ⌥C | back / forward through visited tabs (prefix D undoes a whole run of ⌥S jumps) |
 | ⌥N | new space (folder picker; reuses a space already on that folder) |
 | ⌥M | move this tab to another space |
 | ⌥V | sidebar scope: this space ↔ all spaces |
 | ⌘B | sidebar on/off |
-| prefix q | agent menu (lists agents only; letters jump, a shell's too; Tab filters; Space then s park / x close) |
+| prefix q | agent menu (lists agents only; letters jump, a shell's too; Tab filters; Space then s park / x close / p pin / v preview) |
 | prefix H / prefix h | park this tab / unpark (picker) |
 | prefix v | select a range of tabs (h/l extend, H or ⏎ park, m move, Esc) |
 | prefix Q | close this space (y/n; never main) |

@@ -205,12 +205,17 @@ impl Tmux {
 /// (`@agent_rollout`: a Codex agent's rollout path, which the sidebar reads
 /// for its live activity blurb), and `paused` (agent-pause.py's
 /// `@agent_paused`: the window is in the pause key's saved set; see
-/// [`crate::model::paused_state`]).
-pub const FIELDS: [&str; 34] = [
+/// [`crate::model::paused_state`]), and `pinned` (`@agent_pinned`: the
+/// sidebar's PINNED section, [`crate::pins`]) with `session_id` (the tab
+/// hook's `@agent_session_id`, a Codex agent's session: what a pin is kept
+/// by across a restore), and `pin_key` (`@pin_key`: a pinned agent's ⌥W digit,
+/// [`crate::pins::pin_keys`]).
+pub const FIELDS: [&str; 37] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
     "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home", "space_index",
-    "space_hidden", "space_color", "stash_sel", "pane_flags", "rollout", "paused",
+    "space_hidden", "space_color", "stash_sel", "pane_flags", "rollout", "paused", "pinned", "session_id",
+    "pin_key",
 ];
 
 /// The pane option space.sh sets (to 1) on a space home's dashboard pane
@@ -218,26 +223,29 @@ pub const FIELDS: [&str; 34] = [
 /// agent, a shell, a count, or a click / capture / close target.
 pub const DASH_OPTION: &str = "@space_dash_pane";
 
-/// Every pane of the window as `<flag><pane_index><pane_id> `: flag `A` /
-/// `p` for the active / another pane, `D` / `d` for a dashboard pane
-/// ([`DASH_OPTION`]) that is / is not active. Only `[ADdp%0-9 ]` is printed,
-/// so it needs no guard. Verified on tmux 3.7: a `#{P:}` loop in a
-/// `list-windows` format resolves pane options per pane. The loop's order
-/// is tmux's internal one (pane creation, not `pane_index`), so the index
-/// rides along and [`parse_pane_flags`] sorts by it.
+/// Every pane of the window as `<flag><pane_index><pane_id>:<pane_pid> `:
+/// flag `A` / `p` for the active / another pane, `D` / `d` for a dashboard
+/// pane ([`DASH_OPTION`]) that is / is not active; the pid of the pane's
+/// process (the pins find an opencode's session under it). Only
+/// `[ADdp%:0-9 ]` is printed, so it needs no guard. Verified on tmux 3.7: a
+/// `#{P:}` loop in a `list-windows` format resolves pane options per pane.
+/// The loop's order is tmux's internal one (pane creation, not
+/// `pane_index`), so the index rides along and [`parse_pane_flags`] sorts
+/// by it.
 pub const PANE_FLAGS: &str =
-    "#{P:#{?#{@space_dash_pane},#{?pane_active,D,d},#{?pane_active,A,p}}#{pane_index}#{pane_id} }";
+    "#{P:#{?#{@space_dash_pane},#{?pane_active,D,d},#{?pane_active,A,p}}#{pane_index}#{pane_id}:#{pane_pid} }";
 
 /// The tmux format of each FIELDS entry, in order. (`#{pane_current_path}`
 /// is printed by [`path_format`], dashboard-aware.)
-pub const FORMATS: [&str; 34] = [
+pub const FORMATS: [&str; 37] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
     "#{window_panes}", "#{pane_current_path}", "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}",
     "#{@stash_origin}", "#{@agent_slot}", "#{@agent_pending}", "#{@agent_key}", "#{@agent_mru_cur}",
     "#{@agent_mru_prev}", "#{@space_home}", "#{@space_index}", "#{@space_hidden}", "#{@space_color}", "#{@stash_sel}",
-    PANE_FLAGS, "#{@agent_rollout}", "#{@agent_paused}",
+    PANE_FLAGS, "#{@agent_rollout}", "#{@agent_paused}", "#{@agent_pinned}", "#{@agent_session_id}",
+    "#{@pin_key}",
 ];
 
 /// Ends each path in the dashboard case of [`path_format`] (a private-use
@@ -278,10 +286,12 @@ pub struct Pane {
     pub active: bool,
     /// A dashboard pane ([`DASH_OPTION`]).
     pub dash: bool,
+    /// `pane_pid` (None from an older token without it).
+    pub pid: Option<i32>,
 }
 
 /// [`PANE_FLAGS`]' output → the panes in `pane_index` order; tokens that
-/// are not `<flag><digits>%<digits>` are skipped.
+/// are not `<flag><digits>%<digits>[:<digits>]` are skipped.
 pub fn parse_pane_flags(s: &str) -> Vec<Pane> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let mut v: Vec<Pane> = s
@@ -289,6 +299,11 @@ pub fn parse_pane_flags(s: &str) -> Vec<Pane> {
         .filter_map(|t| {
             let (flag, rest) = (t.chars().next()?, t.get(1..)?);
             let (index, num) = rest.split_once('%')?;
+            let (num, pid) = match num.split_once(':') {
+                Some((n, p)) if digits(p) => (n, p.parse::<i32>().ok()),
+                Some(_) => return None,
+                None => (num, None),
+            };
             if !digits(index) || !digits(num) {
                 return None;
             }
@@ -299,7 +314,7 @@ pub fn parse_pane_flags(s: &str) -> Vec<Pane> {
                 'd' => (false, true),
                 _ => return None,
             };
-            Some(Pane { id: format!("%{num}"), index: index.parse().ok()?, active, dash })
+            Some(Pane { id: format!("%{num}"), index: index.parse().ok()?, active, dash, pid })
         })
         .collect();
     v.sort_by_key(|p| p.index);
@@ -361,7 +376,7 @@ pub fn fmt() -> String {
 /// the GLOBAL options the sidebar's status block shows in place of the
 /// hidden status line (usage, the stale-save mark, the open-sidebar count).
 /// Starts with an empty field and has 9 + [`STATUS_FORMATS`] fields where a
-/// window row has [`FIELDS`]' 34, so the two parsers can never take each other's rows.
+/// window row has [`FIELDS`]' 37, so the two parsers can never take each other's rows.
 pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
@@ -567,6 +582,14 @@ pub struct Window {
     /// Raw @agent_paused (agent-pause.py: `<epoch>` while the window is in
     /// the pause key's saved set; "" = unset). Already folded into `state`.
     pub paused: String,
+    /// `@agent_pinned`: None when unset; else when it was pinned (epoch
+    /// seconds; 0 for a value that is not all digits, still pinned).
+    pub pinned: Option<i64>,
+    /// `@agent_session_id` (the tab hook's, for a Codex agent), trimmed.
+    pub session_id: String,
+    /// Raw `@pin_key` ("" = none): a pinned agent's ⌥W digit as stored. Only a
+    /// stamp: the number shown is [`crate::pins::pin_keys`]'.
+    pub pin_key: String,
 }
 
 fn digits(s: &str) -> bool {
@@ -647,6 +670,9 @@ impl Window {
             stash_sel: !p[30].is_empty(),
             rollout: p[32].trim().into(),
             paused: p[33].into(),
+            pinned: Some(p[34].trim()).filter(|s| !s.is_empty()).map(|s| num(s).unwrap_or(0)),
+            session_id: p[35].trim().into(),
+            pin_key: p[36].trim().into(),
             label: label.into(),
             session,
         })
@@ -991,14 +1017,31 @@ pub(crate) mod tests {
         assert_eq!((w.session.as_str(), w.label.as_str()), ("日本", "🫠 x\tz"));
     }
 
-    /// A row from an older format (33 fields, before `paused`) or one with
-    /// a field too many is no window: never misread by position.
+    /// A row from an older format (34 fields, before `pinned`,
+    /// `session_id` and `pin_key`) or one with a field too many is no
+    /// window: never misread by position.
     #[test]
     fn rows_of_the_wrong_length_are_rejected() {
-        assert_eq!(FIELDS.len(), 34);
-        assert!(Window::parse(&vec!["x"; 33].join("\x1f")).is_none());
-        assert!(Window::parse(&vec!["x"; 35].join("\x1f")).is_none());
-        assert!(Window::parse(&vec!["x"; 34].join("\x1f")).is_some());
+        assert_eq!(FIELDS.len(), 37);
+        for n in [33, 34, 35, 36, 38] {
+            assert!(Window::parse(&vec!["x"; n].join("\x1f")).is_none(), "{n}");
+        }
+        assert!(Window::parse(&vec!["x"; 37].join("\x1f")).is_some());
+    }
+
+    /// `@agent_pinned`: unset is None; digits are the pin time; anything
+    /// else non-empty still pins (time 0). `@agent_session_id` rides along.
+    #[test]
+    fn the_pin_and_the_session_id() {
+        let w = |pin: &str| Window::parse(&row("main", 1, "@1", &[("pinned", pin), ("session_id", " abc-1 ")])).unwrap();
+        assert_eq!(w("").pinned, None);
+        assert_eq!(w("1792418628").pinned, Some(1_792_418_628));
+        assert_eq!(w(" 12 ").pinned, Some(12));
+        assert_eq!(w("yes").pinned, Some(0));
+        assert_eq!(w("").session_id, "abc-1");
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}", guarded("#{@agent_pinned}"), guarded("#{@agent_session_id}"),
+            guarded("#{@pin_key}"))));
+        assert_eq!(Window::parse(&row("main", 1, "@1", &[("pin_key", " 3 ")])).unwrap().pin_key, "3");
     }
 
     /// `@agent_paused` folds into the state: done / idle read paused, a
@@ -1031,9 +1074,9 @@ pub(crate) mod tests {
         assert!(fmt().contains(&guarded("#{@agent_slot}")) && fmt().contains(&guarded("#{@agent_pending}")));
         assert!(fmt().contains(&guarded("#{@agent_key}")) && fmt().contains(&guarded("#{@agent_mru_prev}")));
         assert!(fmt().contains(&guarded("#{@space_home}")));
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{PANE_FLAGS}\x1f{}\x1f{}", guarded("#{@space_index}"),
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{PANE_FLAGS}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", guarded("#{@space_index}"),
             guarded("#{@space_hidden}"), guarded("#{@space_color}"), guarded("#{@stash_sel}"), guarded("#{@agent_rollout}"),
-            guarded("#{@agent_paused}"))));
+            guarded("#{@agent_paused}"), guarded("#{@agent_pinned}"), guarded("#{@agent_session_id}"), guarded("#{@pin_key}"))));
         let s = Snapshot::parse(&row("main", 1, "@1", &[("rollout", "/x/rollout-1.jsonl")]));
         assert_eq!(s.windows[0].rollout, "/x/rollout-1.jsonl");
         let s = Snapshot::parse(&row("main", 1, "@1", &[("space_color", " #f9e2af "), ("stash_sel", "1")]));
@@ -1073,9 +1116,13 @@ pub(crate) mod tests {
         assert!(fmt().contains(&path_format()) && path_format().contains(&guarded("#{pane_current_path}")));
         // Sorted by pane_index (tmux loops in creation order); junk skipped.
         assert_eq!(parse_pane_flags("p2%9 D0%3 p1%4 x3%5 A4% p5%x A%6 p%7"), [
-            Pane { id: "%3".into(), index: 0, active: true, dash: true },
-            Pane { id: "%4".into(), index: 1, active: false, dash: false },
-            Pane { id: "%9".into(), index: 2, active: false, dash: false },
+            Pane { id: "%3".into(), index: 0, active: true, dash: true, pid: None },
+            Pane { id: "%4".into(), index: 1, active: false, dash: false, pid: None },
+            Pane { id: "%9".into(), index: 2, active: false, dash: false, pid: None },
+        ]);
+        // With the pane's pid (today's format); a junk pid drops the token.
+        assert_eq!(parse_pane_flags("A0%3:4242 p1%4:x p2%5:"), [
+            Pane { id: "%3".into(), index: 0, active: true, dash: false, pid: Some(4242) },
         ]);
         let sep = PATH_SEP.to_string();
         assert_eq!(dash_path("/plain path"), "/plain path");

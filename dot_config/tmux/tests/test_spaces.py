@@ -152,6 +152,10 @@ class ConfigShape(unittest.TestCase):
         opt = [f"bind -n User{n + 8} send-keys M-{n}" for n in range(1, 10)]
         for branch in (on_branch(), else_branch()):
             self.assertEqual([l for l in branch.splitlines() if re.match(r"bind -n User(9|1[0-7]) ", l)], opt)
+        # Pinned agent N is ⌥W then N: the jump table's digits, the letters' pattern.
+        pin = [f'bind -T jump {n} {{ set -g @space_pin_n {n} ; run-shell -C "#{{E:@space_pin_go}}" ; '
+               f'run-shell -b "notifyutil -p com.mackhaymond.tmux.focus" }}' for n in range(1, 10)]
+        self.assertEqual([l for l in on_branch().splitlines() if re.match(r"bind -T jump [0-9] ", l)], pin)
 
     def test_user_keys_match_wezterm_and_are_set_in_both_modes(self):
         head = SPACES.read_text().split('\n%if "#{==:#{@spaces},on}"\n')[0]
@@ -389,6 +393,8 @@ class FlagOff(Server):
         self.assertIn(" agent 1 ", bound("prefix"))
         self.assertEqual(self.t("list-keys", "-T", "root", "M-1", check=False), "")   # Option-1: the pane's
         self.assertIn("send-keys M-1", bound("root", "User9"))                         # OPT+1 too
+        self.assertIn("@space_pin_n 1", bound("jump", "1"))                            # ⌥W 1: pin 1
+        self.assertIn("pin toggle", self.t("show", "-gv", "@space_pin"))               # prefix t: pin this tab
         self.assertIn("@space_home", bound("prefix", "1"))                             # ⌃1: space 1's home
         self.assertIn(" pick-tab shell ", bound("prefix", "C-t"))   # CMD+SHIFT+T: which space?
         self.assertIn(" pick-tab agent ", bound("prefix", "K"))     # CMD+SHIFT+R
@@ -909,6 +915,26 @@ class Spaces(Server):
         self.wait(calls, ["sidebar --repair"] * 2)                        # client-attached[21]
         self.wait(lambda: self.t("show", "-gv", "@sidebar_open"), "0")
 
+    # -- prefix t: pin this tab in the sidebar ------------------------------------
+    def test_prefix_t_pins_the_current_tab_through_agent_ui(self):
+        calls = self.fake_agent_ui()
+        self.source()                                                     # (its load's repair)
+        wid = self.new_window("main", "idle")
+        self.t("select-window", "-t", wid)
+        self.wait(self.on, f"main:{wid}")
+        before = len(calls())
+        self.key("C-b", "t")
+        self.wait(lambda: calls()[before:], [f"pin toggle --window {wid} --client {self.client}"])
+        self.assertNotIn("clock-mode", self.t("list-keys", "-T", "prefix", "t"))
+        # No binary: refused aloud (notify.sh), never tmux's clock. (The
+        # stand-in's `echo 0` left run-shell's view mode up: dismissed.)
+        if self.on("m=#{pane_mode}") != "m=":
+            self.t("send-keys", "-t", wid, "-X", "cancel")
+        self.t("set", "-g", "@space_agent_ui", os.path.join(self.tmp, "missing"))
+        self.key("C-b", "t")
+        time.sleep(0.2)
+        self.assertNotEqual(self.on("m=#{pane_mode}"), "m=clock-mode")
+
     # -- Option-W: jump to an agent by its letter -------------------------------
     def table(self):
         return self.on("#{client_key_table}")
@@ -1227,6 +1253,11 @@ class Spaces(Server):
         self.wait(lambda: self.on("#{window_id}"), w)
         return w
 
+    def notified(self):
+        """notify.sh's log, as (kind, client, text) lists."""
+        log = os.path.join(self.env["XDG_STATE_HOME"], "tmux-notify", "log")
+        return [l.split("\t")[1:] for l in Path(log).read_text().splitlines()] if os.path.exists(log) else []
+
     def test_meta_digit_reaches_the_pane(self):
         # Option-1..9 were "shell N"; with spaces on they are the pane's again.
         for n in range(1, 10):
@@ -1235,6 +1266,49 @@ class Spaces(Server):
         self.key("M-2")
         self.wait(lambda: "^[2" in self.t("capture-pane", "-p", "-t", w), True)
         self.assertEqual(self.on(), f"main:{w}")
+
+    def pin(self, wid, key, state="idle"):
+        """A pinned agent holding ⌥W `key` (what the sidebar would store)."""
+        self.t("set", "-w", "-t", wid, "@agent_state", state)
+        self.t("set", "-w", "-t", wid, "@agent_pinned", "1700000000")
+        self.t("set", "-w", "-t", wid, "@pin_key", str(key))
+
+    def test_option_w_digit_goes_to_pinned_agent_n(self):
+        # ⌥W then N: the pinned agent whose @pin_key is N (the agent sidebar
+        # keeps them 1..N), in ANY space; the digit never reaches the pane.
+        w = self.cat_window()
+        self.pin(self.P2, 1)
+        self.pin(self.M2, 2, "running")
+        self.key("M-w", "1"); self.wait(self.on, f"proj:{self.P2}")      # another space
+        self.wait(self.table, "root")
+        self.key("M-w", "2"); self.wait(self.on, f"main:{self.M2}")
+        self.assertNotIn("1", self.t("capture-pane", "-p", "-t", w))
+        # A miss stays, says so, and leaves the table.
+        self.key("M-w", "7"); time.sleep(0.3)
+        self.assertEqual((self.on(), self.table()), (f"main:{self.M2}", "root"))
+        self.wait(lambda: ["warn", self.client, "no pin 7"] in self.notified(), True)
+
+    def test_option_w_digit_needs_a_live_pinned_agent_outside_hidden_sessions(self):
+        # A hidden session's window never matches (the stash, agents, ...).
+        start = self.on()
+        self.wait(lambda: self.t("show", "-t", "agents", "-v", "@space_hidden"), "1")    # (the fixture's)
+        hid = self.new_window("agents")
+        self.pin(hid, 3)
+        self.key("M-w", "3"); time.sleep(0.3)
+        self.assertEqual(self.on(), start)
+        self.wait(lambda: ["warn", self.client, "no pin 3"] in self.notified(), True)
+        # A stale key: the agent exited (no state), or the pin is gone.
+        self.pin(self.M2, 4)
+        self.t("set", "-wu", "-t", self.M2, "@agent_state")
+        self.pin(self.M5, 5)
+        self.t("set", "-wu", "-t", self.M5, "@agent_pinned")
+        for k in ("4", "5"):
+            self.key("M-w", k); time.sleep(0.3)
+            self.assertEqual(self.on(), start)
+        # A miss runs `agent-ui pin renumber` (a gap no sidebar repaired).
+        calls = self.fake_agent_ui()
+        self.key("M-w", "6")
+        self.wait(lambda: "pin renumber" in calls(), True)
 
     def chord(self, row, n):
         """A WezTerm digit chord, written into the client's terminal."""

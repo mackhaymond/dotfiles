@@ -14,8 +14,10 @@
 //!   the list; ⏎ goes to the selected match; Esc leaves the search and clears
 //!   it (a second Esc closes); Backspace on an empty query leaves it.
 //! - **Actions** (Space): the footer lists what the selected row offers
-//!   (`p` preview, `s` park, `x` close or discard, `r` restart the watcher,
-//!   ⏎ go); the next key runs one; Esc or any other key cancels.
+//!   (`p` pin / unpin: the sidebar's PINNED section, `s` park, `x` close or
+//!   discard, `v` the preview strip, `r` restart the watcher, ⏎ go; a
+//!   parked row offers neither p nor s); the next key runs one; Esc or any
+//!   other key cancels.
 //! - **y/n** after park / close: only `y` (on a prompt already on screen)
 //!   confirms; any other key cancels.
 //! - **⌥W**, in every mode: go to the LAST agent ([`Data::last`]); with none,
@@ -87,6 +89,9 @@ pub trait Effects {
     fn park(&mut self, win: &str, session: &str) -> Result<String, String>;
     fn close(&mut self, win: &str, session: &str) -> Result<String, String>;
     fn restart_watcher(&mut self) -> String;
+    /// Space p: pin (`pin`) or unpin window `win` ([`crate::pins::toggle`]).
+    /// Ok = footer text.
+    fn pin(&mut self, win: &str, pin: bool) -> Result<String, String>;
 }
 
 /// Effects that refuse everything: `--once` and tests that must not act.
@@ -110,6 +115,9 @@ impl Effects for NoEffects {
     }
     fn restart_watcher(&mut self) -> String {
         "read-only".into()
+    }
+    fn pin(&mut self, _: &str, _: bool) -> Result<String, String> {
+        Err("read-only".into())
     }
 }
 
@@ -143,18 +151,24 @@ pub enum Act {
     Go,
     /// Toggle the bottom preview strip.
     Peek,
+    /// Pin or unpin (the sidebar's PINNED section).
+    Pin,
     Park,
     Close,
     Restart,
 }
 
-/// The actions strip's entries for `t`: (key, act, words).
+/// The actions strip's entries for `t`: (key, act, words). `p` pins (or
+/// unpins: the row says which) an agent's window; a parked tab is neither
+/// pinned nor parked again. The preview strip is `v` ("view").
 pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
-    let mut v = vec![('p', Act::Peek, "preview")];
+    let mut v = Vec::new();
     if !t.parked() {
+        v.push(('p', Act::Pin, if t.pinned { "unpin" } else { "pin" }));
         v.push(('s', Act::Park, "park"));
     }
     v.push(('x', Act::Close, if t.parked() { "discard" } else { "close" }));
+    v.push(('v', Act::Peek, "preview"));
     v.push(('r', Act::Restart, "restart watcher"));
     v
 }
@@ -412,6 +426,10 @@ impl Menu {
             Act::Peek => {
                 self.preview = !self.preview;
                 self.follow = true;
+            }
+            Act::Pin => {
+                let r = fx.pin(&t.win, !t.pinned);
+                self.say(r.unwrap_or_else(|e| e));
             }
             Act::Park if t.parked() => self.say("already parked"),
             Act::Park => self.ask(Action::Park, t),
@@ -755,6 +773,10 @@ pub(crate) mod tests {
             self.calls.push("watcher".into());
             "watcher restarted".into()
         }
+        fn pin(&mut self, win: &str, pin: bool) -> Result<String, String> {
+            self.calls.push(format!("{} {win}", if pin { "pin" } else { "unpin" }));
+            Ok(format!("{} {win}", if pin { "pinned" } else { "unpinned" }))
+        }
     }
 
     fn keys(s: &str) -> Vec<Key> {
@@ -1012,9 +1034,9 @@ pub(crate) mod tests {
         let mut m = menu();
         m.act(Char(' '), &mut fx);
         assert_eq!(m.actions.as_ref().map(|t| t.win.as_str()), Some("@6"));
-        assert!(!m.act(Char('p'), &mut fx)); // p: the preview strip
+        assert!(!m.act(Char('v'), &mut fx)); // v: the preview strip
         assert!(m.preview && m.actions.is_none());
-        m.handle(&keys(" p"), &mut fx);
+        m.handle(&keys(" v"), &mut fx);
         assert!(!m.preview);
         // Esc cancels (and does not close); a letter after Space is not a jump.
         m.act(Char(' '), &mut fx);
@@ -1046,6 +1068,39 @@ pub(crate) mod tests {
         assert!(m.confirm.is_none());
         m.handle(&keys(" x"), &mut fx);
         assert_eq!(m.confirm.as_ref().map(|c| c.verb()), Some("discard"));
+    }
+
+    /// Space p pins the selected agent at once (no y/n), or unpins it when
+    /// its row showed it pinned; the footer says which. A parked row is
+    /// offered no pin.
+    #[test]
+    fn space_p_pins_and_unpins() {
+        let mut fx = Rec::default();
+        let mut m = menu();
+        let t = m.selected_target().unwrap();
+        assert_eq!(strip(&t).iter().map(|(k, _, w)| format!("{k} {w}")).collect::<Vec<_>>(),
+            ["p pin", "s park", "x close", "v preview", "r restart watcher"]);
+        assert!(!m.handle(&keys(" p"), &mut fx));
+        assert_eq!((fx.calls.as_slice(), m.msg.as_str(), m.confirm.is_none()), (&["pin @6".to_string()][..], "pinned @6", true));
+        // The same window, pinned in tmux: p unpins.
+        let mut snap = fixture();
+        for w in snap.windows.iter_mut().filter(|w| w.id == "@6") {
+            w.pinned = Some(1_792_000_000);
+        }
+        let mut m = menu_of(data_of(&snap));
+        let t = m.selected_target().unwrap();
+        assert!(t.pinned);
+        assert_eq!(strip(&t)[0].2, "unpin");
+        m.handle(&keys(" p"), &mut fx);
+        assert_eq!(fx.calls.last().map(String::as_str), Some("unpin @6"));
+        // Parked: no p (and p does nothing there).
+        let mut m = Menu::new(data(), Tab::Parked);
+        draw_all(&mut m);
+        let t = m.selected_target().unwrap();
+        assert!(!strip(&t).iter().any(|(k, _, _)| *k == 'p'));
+        let n = fx.calls.len();
+        m.handle(&keys(" p"), &mut fx);
+        assert_eq!(fx.calls.len(), n);
     }
 
     /// A batch never confirms itself; a y before the prompt was drawn does
@@ -1221,7 +1276,7 @@ pub(crate) mod tests {
         let mut m = menu();
         m.preview_rows = 9;
         assert_eq!(m.peek_want(), None); // off by default
-        m.handle(&keys(" p"), &mut NoEffects);
+        m.handle(&keys(" v"), &mut NoEffects);
         assert_eq!(m.peek_want().map(|w| (w.target.win, w.n)), Some(("@6".into(), 9)));
         m.preview_rows = 0; // no room for it
         assert_eq!(m.peek_want(), None);

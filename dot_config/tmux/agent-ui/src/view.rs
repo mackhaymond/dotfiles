@@ -66,7 +66,7 @@ impl SlotMemo {
 }
 
 /// The window id's number, `@12` → 12 (unparseable: last).
-fn id_num(id: &str) -> u64 {
+pub(crate) fn id_num(id: &str) -> u64 {
     id.strip_prefix('@').and_then(|n| n.parse().ok()).unwrap_or(u64::MAX)
 }
 
@@ -247,6 +247,12 @@ pub struct Agent {
     /// What a SHELL row says ([`shell_label`]): the folder while it sits at
     /// a shell prompt, else the running command.
     pub shell: String,
+    /// `@agent_pinned` (when it was pinned, epoch seconds): the sidebar
+    /// lists a pinned AGENT in its PINNED section ([`ViewModel::pins_split`]).
+    pub pinned: Option<i64>,
+    /// A pinned agent's ⌥W digit (1-9, [`crate::pins::pin_keys`]): set by the UIs
+    /// from the snapshot, None from [`Agent::from_window`] alone.
+    pub pin_key: Option<u8>,
 }
 
 impl Agent {
@@ -302,7 +308,23 @@ impl Agent {
             rollout: w.rollout.clone(),
             home: w.home,
             shell: shell_label(w),
+            pinned: w.pinned,
+            pin_key: None,
         }
+    }
+
+    /// Give every agent of `view` its pin key (`keys`: window id → ⌥W digit).
+    pub fn set_pin_keys(view: &mut ViewModel, keys: &HashMap<String, u8>) {
+        let all = view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut().chain(s.plain.iter_mut()));
+        for a in all.chain(view.needs.iter_mut().map(|n| &mut n.agent)).chain(view.pinned.iter_mut()) {
+            a.pin_key = keys.get(&a.window_id).copied();
+        }
+    }
+
+    /// Listed in PINNED: pinned, an agent (a state; a shell's stray pin is
+    /// nothing), never a space's home.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned.is_some() && !self.state.is_empty() && !self.home
     }
 
     /// `session:index`.
@@ -326,7 +348,7 @@ impl Agent {
                 ("color", c)])),
             ("attention", self.attention), ("in_flight", self.in_flight), ("run_detail", self.run_detail),
             ("is_current", self.is_current), ("active", self.active), ("panes", self.panes),
-            ("path", &self.path), ("slot", self.slot), ("answered", self.answered),
+            ("path", &self.path), ("slot", self.slot), ("answered", self.answered), ("pinned", self.pinned),
         ]
     }
 }
@@ -585,6 +607,9 @@ pub struct ViewModel {
     /// does): listed in their spaces and lettered. Off (the classic
     /// sidebar, no ⌥W table): no shell is listed or lettered.
     pub shells: bool,
+    /// The PINNED agents once [`pins_split`](Self::pins_split) moved them
+    /// out of their spaces (in pin order); empty in a view built as is.
+    pub pinned: Vec<Agent>,
 }
 
 /// The sidebar's SCOPE (agent-roster.py `Strip.scope`): `"space"` shows only
@@ -757,7 +782,43 @@ impl ViewModel {
             slot_width: hotkeys::slot_width(slots.values().copied().max()),
             scope: Scope::default(),
             shells: cl.or(snap.clients.first()).is_some_and(|c| c.spaces == "on"),
+            pinned: Vec::new(),
         }
+    }
+
+    /// The PINNED agents ([`Agent::is_pinned`]) in PIN order: the first
+    /// pinned first (`@agent_pinned`'s time, then the window id's number),
+    /// so pinning another never moves the ones already there. A window
+    /// linked into two spaces is listed once: its copy in the client's
+    /// session, else its first in THE space order.
+    pub fn pinned_agents(&self) -> Vec<&Agent> {
+        let mut seen = std::collections::HashSet::new();
+        let cur = self.cur_session.as_deref();
+        let spaces = self.ordered_spaces();
+        let mine = spaces.iter().filter(|s| Some(s.name.as_str()) == cur);
+        let rest = spaces.iter().filter(|s| Some(s.name.as_str()) != cur);
+        let mut v: Vec<&Agent> = mine
+            .chain(rest)
+            .flat_map(|s| s.agents.iter())
+            .filter(|a| a.is_pinned() && seen.insert(a.window_id.as_str()))
+            .collect();
+        v.sort_by_key(|a| (a.pinned.unwrap_or(0), id_num(&a.window_id)));
+        v
+    }
+
+    /// The view the sidebar lays out: every pinned agent MOVED out of its
+    /// space (each copy of a linked window) into [`pinned`](Self::pinned),
+    /// in pin order. The spaces keep their counts (still the whole space's)
+    /// and their shells.
+    pub fn pins_split(&self) -> ViewModel {
+        let pinned: Vec<Agent> = self.pinned_agents().into_iter().cloned().collect();
+        let mut v = self.clone();
+        let ids: std::collections::HashSet<&str> = pinned.iter().map(|a| a.window_id.as_str()).collect();
+        for sp in &mut v.spaces {
+            sp.agents.retain(|a| !(a.is_pinned() && ids.contains(a.window_id.as_str())));
+        }
+        v.pinned = pinned;
+        v
     }
 
     /// The sidebar's scope (agent-roster.py `Strip.load` + `strip_model`),

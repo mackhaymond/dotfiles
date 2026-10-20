@@ -9,7 +9,7 @@
 //! │  g  ○ Commodities Job Tracker                                   3h  │   idle: dimmer title
 //! │ work ──────────────────────────────────────────────────────── ✕1 ○1 │
 //! │     ▪ 6 parked ⇥                                                    │   the fold
-//! ├─ Kua Yu focus timing · main:1 · ✳ claude · ⌥ main · ~/x ────────────┤   preview strip (Space p)
+//! ├─ Kua Yu focus timing · main:1 · ✳ claude · ⌥ main · ~/x ────────────┤   preview strip (Space v)
 //! │ (the pane's last lines, coloured)                                   │
 //! ├─────────────────────────────────────────────────────────────────────┤
 //! │  a–j  go   ⌥W  last   ⏎  open   /  search   ␣  actions   ⇥  filter  │   key bar / search / strip / y/n
@@ -21,8 +21,10 @@
 //! agent row leads with its letter in reverse video, the background its
 //! state's colour (needs yellow, failed red, done green, working blue, idle
 //! overlay). A needs-you row's title takes the needs colour and its reason
-//! shows inline. The preview is OFF by default; Space p turns on a strip of
-//! up to 10 lines under the list, full width. The footer shows, first match
+//! shows inline; a pinned agent (the sidebar's PINNED section, Space p) wears
+//! a dim pin glyph after its title, its row where it always is. The preview
+//! is OFF by default; Space v turns on a strip of up to 10 lines under the
+//! list, full width. The footer shows, first match
 //! wins: a y/n, the search line, the actions strip, a message, else the key
 //! bar.
 
@@ -400,7 +402,14 @@ fn agent_row(m: &Menu, buf: &mut Buffer, x0: u16, y: u16, cw: u16, a: &Agent, pl
         };
         (format!(" {g}"), c)
     });
-    let fw = flag.as_ref().map_or(0, |(s, _)| cells(s));
+    // A pinned agent (the sidebar's PINNED section) wears the pin glyph
+    // after its title, dim, with its ⌥W digit: the menu's order never moves
+    // for it.
+    let pin = a.pinned.is_some().then(|| match a.pin_key {
+        Some(n) => format!(" {} {n}", crate::pins::GLYPH),
+        None => format!(" {}", crate::pins::GLYPH),
+    });
+    let fw = flag.as_ref().map_or(0, |(s, _)| cells(s)) + pin.as_deref().map_or(0, cells);
     // The right-hand tags, dropped (project, then here) when the title would
     // get too little room.
     let age = format!(" {:>4}", a.age);
@@ -447,6 +456,9 @@ fn agent_row(m: &Menu, buf: &mut Buffer, x0: u16, y: u16, cw: u16, a: &Agent, pl
     x = put(buf, x, y, rx, &clip(&title, title_room), tst);
     if let Some((s, c)) = &flag {
         x = put(buf, x, y, rx, s, fg(c));
+    }
+    if let Some(p) = &pin {
+        x = put(buf, x, y, rx, p, fg("overlay2"));
     }
     if let Some((wd, wcol, text)) = reason {
         let stop = rx.saturating_sub(1);
@@ -825,7 +837,7 @@ mod tests {
         assert!(!l.contains("tmux") && l.contains("Agent Sidebar"), "{l}");
     }
 
-    /// Space p: a strip under the list, full width, with the pane's tail.
+    /// Space v: a strip under the list, full width, with the pane's tail.
     #[test]
     fn preview_strip() {
         let mut m = menu();
@@ -834,7 +846,7 @@ mod tests {
             lines: Some(vec![parse_line("\x1b[31m529 overloaded\x1b[0m"), parse_line("retry?")]),
             n: 10,
         });
-        m.handle(&[Key::Char(' '), Key::Char('p')], &mut NoEffects);
+        m.handle(&[Key::Char(' '), Key::Char('v')], &mut NoEffects);
         assert!(m.preview);
         let f = frame(&mut m, 110, 34);
         // Body 30 rows: the list keeps 19, the strip 11 (its rule + 10 lines).
@@ -847,7 +859,7 @@ mod tests {
         let f = frame(&mut m, 110, 11);
         assert!(!f.iter().any(|l| l.contains("Island resize ·")));
         assert_eq!(m.peek_want(), None);
-        m.handle(&[Key::Char(' '), Key::Char('p')], &mut NoEffects);
+        m.handle(&[Key::Char(' '), Key::Char('v')], &mut NoEffects);
         let f = frame(&mut m, 110, 34);
         assert!(!f.iter().any(|l| l.contains("529")));
     }
@@ -862,7 +874,7 @@ mod tests {
         m.act(Key::Esc, &mut NoEffects); // the search moved the selection to Kua; it stays
         m.act(Key::Char(' '), &mut NoEffects);
         let f = frame(&mut m, 110, 34);
-        assert!(f[32].starts_with("│ Kua Yu focus timing  p  preview  s  park  x  close  r  restart watcher  ⏎  go  esc  cancel"),
+        assert!(f[32].starts_with("│ Kua Yu focus timing  p  pin  s  park  x  close  v  preview  r  restart watcher  ⏎  go  esc  cancel"),
             "{}", f[32]);
         m.act(Key::Char('x'), &mut NoEffects);
         let f = frame(&mut m, 110, 34);

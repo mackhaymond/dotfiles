@@ -57,6 +57,8 @@
 //!   `watcher_age`.
 //! - [`wezterm`]: the sidebar's marker OSC, mouse mode, client resolution
 //!   and focus hand-back ([`WeztermLink`]).
+//! - [`pins`]: PINNED agents (`@agent_pinned`), toggled and kept across a
+//!   restore in `pins.json` by session id.
 //! - [`hotkeys`]: number-key labels and digit matching.
 //! - [`git`]: `git_head` (pure file reads) and the [`GitCache`].
 //! - [`events`]: the event log reader.
@@ -78,6 +80,7 @@ pub mod json;
 pub mod menu;
 pub mod model;
 pub mod palette;
+pub mod pins;
 pub mod proc;
 pub mod sessions;
 pub mod sidebar;

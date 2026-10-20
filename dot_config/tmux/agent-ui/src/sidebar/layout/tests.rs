@@ -2751,3 +2751,5 @@ fn settled_pause_banner_is_lavender_never_green() {
     let f = layout(&v, 34, 58, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() });
     assert!(f.rows[0].segs.contains(&block(" ↻ 3 ready ", "crust", "lavender")), "{:?}", f.rows[0].segs);
 }
+
+mod pinned;

@@ -7,6 +7,7 @@
 //! agent-ui [--socket <name|path>] sidebar ...   (see sidebar.rs)
 //! agent-ui [--socket <name|path>] menu ...      (see menu.rs)
 //! agent-ui [--socket <name|path>] sessions ...  (see sessions.rs; prefix a)
+//! agent-ui [--socket <name|path>] pin [toggle|on|off] [--window <@id>] [--client <tty>]   (pins.rs; prefix t)
 //! ```
 //!
 //! `needs` prints exactly what `agent-jump.sh list` prints, from the same
@@ -20,7 +21,8 @@ const USAGE: &str = "usage: agent-ui [--socket <name|path>] dump [--client <tty>
        agent-ui [--socket <name|path>] needs
        agent-ui sidebar [--client <tty>] | --once <W>x<H>
        agent-ui menu --client <tty> [--tab <tab>] | --once <W>x<H>
-       agent-ui sessions --client <tty> | --once <W>x<H> [--client <tty>] [--query <q>] [--ansi]";
+       agent-ui sessions --client <tty> | --once <W>x<H> [--client <tty>] [--query <q>] [--ansi]
+       agent-ui pin [toggle|on|off] [--window <@id>] [--client <tty>]";
 
 fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let i = args.iter().position(|a| a == flag)?;
@@ -49,6 +51,7 @@ fn main() -> ExitCode {
         "sidebar" => agent_ui::sidebar::run(tmux, rest),
         "menu" => agent_ui::menu::run(tmux, rest),
         "sessions" => agent_ui::sessions::run(tmux, rest),
+        "pin" => agent_ui::pins::run(tmux, rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             ExitCode::SUCCESS

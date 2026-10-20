@@ -22,7 +22,8 @@
 //! - **Clicks only.** A left press acts on what was drawn at that cell
 //!   ([`Target`]), resolved against the frame ON SCREEN; a plain RIGHT
 //!   press on an agent row or NEEDS YOU card parks that window (`stash.sh
-//!   stash <win>`), and `PARKED N` opens prefix h's stash picker
+//!   stash <win>`), a MIDDLE press there pins or unpins it ([`crate::pins`]:
+//!   the PINNED section), and `PARKED N` opens prefix h's stash picker
 //!   ([`stash_command`]). Every click hands
 //!   focus straight back to the tmux pane first (Strip.handle → focus_back),
 //!   and any key that lands here is forwarded there. The wheel does nothing:
@@ -82,7 +83,7 @@ pub mod layout;
 pub mod notice;
 pub mod pause;
 pub mod status;
-mod term;
+pub(crate) mod term;
 
 pub use layout::{layout, Frame, Opts, Row, Seg, Target};
 
@@ -250,6 +251,9 @@ fn build_view(core: &mut Core, client: Option<&str>, keys: Option<&mut KeyMemo>)
     // Agents and shells alike (one pool): a shell row shows its letter too.
     view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut().chain(s.plain.iter_mut())).for_each(letter);
     view.needs.iter_mut().for_each(|n| letter(&mut n.agent));
+    // The pins' ⌥W digit, as the frame shows them (the live sidebar stores them:
+    // App::store_pin_keys).
+    crate::view::Agent::set_pin_keys(&mut view, &crate::pins::pin_keys(&core.snapshot));
     view.apply_scope(&core.snapshot);
     let homes: HashSet<&str> = core.snapshot.windows.iter().filter(|w| w.home).map(|w| w.id.as_str()).collect();
     let scoped = view.scope.session.clone();
@@ -415,6 +419,11 @@ struct App {
     pause_windows: pause::Windows,
     /// The pause banner's phase, as of the last read.
     pause_phase: Option<pause::Phase>,
+    /// The pins' state file kept in step with the windows ([`crate::pins`]);
+    /// None: not this sidebar's job (`--once`, tests, another server).
+    pins: Option<crate::pins::Sync>,
+    /// The `@pin_key` writes in flight.
+    pin_keys: crate::pins::KeyMemo,
 }
 
 /// How many dismissed toast ids a sidebar remembers at most.
@@ -464,6 +473,64 @@ impl App {
             pause: if cfg!(test) { pause::Reader::new("/nonexistent".into()) } else { pause::Reader::home() },
             pause_windows: pause::Windows::default(),
             pause_phase: None,
+            // (Turned on by `live` only, with the registry: never in tests.)
+            pins: None,
+            pin_keys: crate::pins::KeyMemo::default(),
+        }
+    }
+
+    /// The pins' sync, once per refresh (it runs only when the windows
+    /// changed, or every few seconds): pins a restore or a reopened tab lost
+    /// are put back, with ONE tmux command from a thread (the next notice
+    /// redraws them).
+    fn sync_pins(&mut self) {
+        let Some(sync) = self.pins.as_mut() else { return };
+        if let Some(args) = sync.tick(&self.core.snapshot, text::now(), &crate::pins::LiveProcs) {
+            let tmux = self.core.tmux.clone();
+            let notice = notice::names()[0].clone();
+            std::thread::spawn(move || {
+                if matches!(tmux.run(&args), Ok(o) if o.ok()) {
+                    crate::pins::renumber(&tmux);
+                    notice::post(&notice);
+                }
+            });
+        }
+    }
+
+    /// The live sidebar keeps every window's `@pin_key` what the pins say
+    /// (1..N in pin order, no gap; a closed or unpinned pin's key gone), as
+    /// it keeps the letters: ONE batched command from a thread, only what
+    /// differs and is not already in flight ([`crate::pins::KeyMemo`]).
+    fn store_pin_keys(&mut self) {
+        if !self.persist || self.core.snapshot.windows.is_empty() {
+            return;
+        }
+        let snap = &self.core.snapshot;
+        let writes = crate::pins::key_writes(snap, &crate::pins::pin_keys(snap));
+        let fresh = self.pin_keys.fresh(snap, writes, text::now());
+        if let Some(args) = crate::pins::key_command(&fresh) {
+            let tmux = self.core.tmux.clone();
+            std::thread::spawn(move || {
+                let _ = tmux.run(&args);
+            });
+        }
+    }
+
+    /// A middle press on an agent row or card: pin it, or unpin it
+    /// ([`crate::pins::toggle`]), then redraw every sidebar.
+    fn pin(&mut self, t: &Target) {
+        let Target::Go { win, .. } = t else { return };
+        let store = crate::pins::store_for(&self.core.tmux);
+        let dir = crate::pins::claude_sessions_dir();
+        let r = crate::pins::toggle(&self.core.tmux, &self.core.snapshot, win, None, text::now() as i64, store.as_deref(),
+            &dir, &crate::pins::LiveProcs);
+        match r {
+            Ok(t) => {
+                notice::post(&notice::names()[0]);
+                self.say(crate::pins::said(&t));
+                self.refresh();
+            }
+            Err(e) => self.say(format!("pin: {e}")),
         }
     }
 
@@ -553,9 +620,11 @@ impl App {
         if !writes.is_empty() {
             crate::menu::store_keys(&self.core.tmux, writes);
         }
+        self.store_pin_keys();
         self.check_registry();
         self.check_client();
         self.check_park();
+        self.sync_pins();
     }
 
     /// The client's key table as the last snapshot shows it ("" unknown).
@@ -700,6 +769,7 @@ impl App {
         let mut focus = toggles > 0 || !inp.stray.is_empty();
         let mut act = None;
         let mut park = None;
+        let mut pin = None;
         for m in &inp.mice {
             if m.b & 64 != 0 || m.b & 32 != 0 || !m.press {
                 continue; // the wheel, motion, releases: nothing
@@ -712,7 +782,10 @@ impl App {
                 // binding of its own, so it reaches a mouse-reporting pane):
                 // park, on an agent row or card only.
                 2 => park = t.filter(|t| matches!(t, Target::Go { .. })),
-                _ => {} // middle, or a modifier held: focus only
+                // A plain middle press (SGR button 1): pin or unpin, on an
+                // agent row or card only.
+                1 => pin = t.filter(|t| matches!(t, Target::Go { .. })),
+                _ => {} // a modifier held: focus only
             }
         }
         if focus {
@@ -723,6 +796,9 @@ impl App {
         }
         if let Some(t) = park {
             self.park(&t);
+        }
+        if let Some(t) = pin {
+            self.pin(&t);
         }
         for _ in 0..toggles {
             self.toggle_scope();
@@ -984,6 +1060,7 @@ fn live(tmux: Tmux, args: &[String]) -> io::Result<()> {
     );
     let mut app = App::new(tmux.clone(), link, Notices::register(&notice::names()));
     app.persist = true;
+    app.pins = crate::pins::Sync::for_tmux(&tmux);
     let sig = term::Signals::install()?;
     // In the registry (status line hidden) from here until every exit path
     // drops the guard: a normal return, the never-alone exit, SIGHUP/SIGTERM

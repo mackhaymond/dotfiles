@@ -183,6 +183,22 @@
 //! stay global. The AGENTS header's scope word is a toggle once the scope is
 //! a thing.
 //!
+//! ## Pinned
+//!
+//! A pinned agent (`@agent_pinned`, [`crate::pins`]) MOVES out of its
+//! space's group into the PINNED block at the top of the agents section,
+//! above the AGENTS header ([`pin_block`]): ` PINNED` like the other section
+//! labels, the `⌥W 1-N` hint and the count on the right; its cards in PIN
+//! order (first pinned first: pinning another never moves one already
+//! there), each exactly as in its space (letter, state, rail, the client's
+//! lift, clicks), the zebra afresh, its second line naming its space before
+//! the age (`main · 4m`), and its ⌥W digit ([`pin_cap`]) under its letter (beside
+//! it on a one-line card). Global in BOTH scopes (that is what a pin is
+//! for). NEEDS YOU still lists a pinned agent that asks. On the ladder the
+//! pins take the frame's card height but never fold, and the spaces
+//! collapse before a pin loses its card; only a frame too short for every
+//! pin on one line cuts them ([`pins_cut`]).
+//!
 //! ## Space order
 //!
 //! ONE order everywhere: `@space_index` (⌃N), spaces without one after, by
@@ -528,6 +544,9 @@ pub struct Row {
     pub covers: Vec<(String, String)>,
     /// The row draws a spinner frame (a working agent): the frame animates.
     pub anim: bool,
+    /// The row is part of the PINNED block (its header, its cards, its
+    /// `… more` line), at the top of the agents section.
+    pub pinned: bool,
 }
 
 impl Row {
@@ -595,9 +614,12 @@ pub struct Frame {
     pub pause: Range<usize>,
     /// The rows of each section, header included (empty: not drawn).
     pub needs: Range<usize>,
-    /// The agents section: every shown space's header (its home), its
-    /// agents, then its shells.
+    /// The agents section: the PINNED block (when anything is pinned), then
+    /// every shown space's header (its home), its agents, then its shells.
     pub agents: Range<usize>,
+    /// The PINNED block's rows (its header and cards), inside `agents`;
+    /// empty when nothing is pinned.
+    pub pinned: Range<usize>,
     /// The dock, through the last row: its gap (when room), its `▄` cap,
     /// the spaces, PARKED, its `▀` cap.
     pub dock: Range<usize>,
@@ -1552,7 +1574,7 @@ impl Badge {
 
     fn of(view: &ViewModel, bar: &Bar) -> Badge {
         let shells = view.spaces.iter().flat_map(|s| s.plain.iter());
-        let on = view.agents().chain(shells).chain(view.needs.iter().map(|n| &n.agent)).any(|a| a.letter.is_some());
+        let on = view.agents().chain(&view.pinned).chain(shells).chain(view.needs.iter().map(|n| &n.agent)).any(|a| a.letter.is_some());
         Badge { on, loud: bar.jump }
     }
 
@@ -1671,7 +1693,7 @@ fn loud_card(a: &Agent, cx: Cx) -> bool {
 /// that copy, and only it, is the client's own card.
 fn home_of(view: &ViewModel) -> Option<&str> {
     let s = view.cur_session.as_deref()?;
-    let rows = view.spaces.iter().flat_map(|sp| sp.agents.iter().chain(&sp.plain));
+    let rows = view.spaces.iter().flat_map(|sp| sp.agents.iter().chain(&sp.plain)).chain(&view.pinned);
     rows.into_iter().any(|a| a.is_current && a.session == s).then_some(s)
 }
 
@@ -1770,8 +1792,10 @@ fn agent_bg(a: &Agent, k: usize, mine: bool) -> Ink {
 /// idle), the age beside it; with `two`, a second line under the title
 /// ([`second_line`], maybe blank: `overlay2`, `sub` when it asks or failed,
 /// a live blurb after a blue `›`) with the age at its end, so every agent
-/// row is the same height. Both lines click through.
-fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink) -> Vec<Row> {
+/// row is the same height. Both lines click through. `tag`: a dim word
+/// before the second line's age (a PINNED card's space, `cs35l · 4m`),
+/// dropped when it would leave the line under [`TAG_ROOM`] cells.
+fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&str>) -> Vec<Row> {
     let w = inner(cx.w);
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
     let msg = (two && cx.seconds()).then(|| second_line(a, cx.now));
@@ -1798,7 +1822,11 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink) -> Vec<Row> {
         Flag::Workflow => seg(" ⚙", "teal"),
         Flag::Cua => seg(" ◎", if a.attention { "overlay2" } else { "blue" }),
     });
-    let lead = cx.b.lead();
+    // A PINNED card's ⌥W digit ([`pin_cap`]): under its letter on the
+    // second line; on a one-line card, beside it.
+    let pin = a.pin_key.filter(|_| tag.is_some() && cx.b.on).map(|n| pin_cap(n, bg, cx.b.loud));
+    let inline = pin.is_some() && msg.is_none();
+    let lead = cx.b.lead() + if inline { BADGE_W + 1 } else { 0 };
     // A paused card with its second line says `paused` there: the first
     // line keeps just the ⏸ (one word once, not twice).
     let paused = a.cat == Some(Cat::Paused) && !a.in_flight;
@@ -1835,6 +1863,9 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink) -> Vec<Row> {
     if cx.b.on {
         left.extend([cx.b.seg(a, space, bg, loud_card(a, cx)), seg(" ", "text")]);
     }
+    if let Some(p) = pin.clone().filter(|_| inline) {
+        left.extend([p, seg(" ", "text")]);
+    }
     left.push(title);
     left.extend(flag);
     // The client's own card: a full lavender cell down its right edge
@@ -1849,13 +1880,30 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink) -> Vec<Row> {
     let mut first = tile_row(cx.w, bg, left, edge(right)).click(cx.w, go.clone()).covering([a]);
     first.anim = word.as_ref().is_some_and(Word::working);
     let Some(m) = msg else { return vec![first] };
-    let mut r2: Vec<Seg> = age.iter().map(|ag| seg(format!(" {ag}"), dimc)).collect();
-    r2.push(seg(" ", "text"));
-    let r2 = edge(r2);
     // Under the title (past the key-cap); without letters, indented anyway,
     // so a message never reads as another agent.
     let indent = if cx.b.on { lead - 1 } else { 3 };
-    let mut l2 = vec![rail, seg(" ".repeat(indent), "text")];
+    let right2 = |tag: Option<&str>| {
+        let mut r: Vec<Seg> = Vec::new();
+        if let Some(t) = tag {
+            r.push(seg(format!(" {}", clip(&sanitize(t), TAG_W)), dimc));
+            if age.is_some() {
+                r.push(seg(" ·", dimc));
+            }
+        }
+        r.extend(age.iter().map(|ag| seg(format!(" {ag}"), dimc)));
+        r.push(seg(" ", "text"));
+        edge(r)
+    };
+    let mut r2 = right2(tag);
+    if tag.is_some() && inner(cx.w).saturating_sub(1 + indent + width(&r2)) < TAG_ROOM {
+        r2 = right2(None);
+    }
+    let mut l2 = match pin {
+        // The ⌥W digit cap under the letter's, on the card grid (c3-c5).
+        Some(p) => vec![rail, seg(" ", "text"), p, seg(" ".repeat(indent - 1 - BADGE_W), "text")],
+        None => vec![rail, seg(" ".repeat(indent), "text")],
+    };
     if word_below {
         let room = inner(cx.w).saturating_sub(1 + indent + width(&r2));
         l2.extend(paused_line(room, cx.resumes, dimc));
@@ -1873,6 +1921,25 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink) -> Vec<Row> {
     let second = tile_row(cx.w, bg, l2, r2).click(cx.w, go);
     vec![first, second]
 }
+
+/// A pinned card's digit as a key-cap (` 1 `, [`BADGE_W`] wide): ⌥W then
+/// that digit goes there (spaces.conf's `jump` table, like the letters).
+/// The digit bold `text` on a neutral cap (overlay at 30% over the card),
+/// the letter's quiet twin without a space colour: it is a key, not a place.
+/// While ⌥W's table is armed (`loud`) it inverts with every letter cap
+/// ([`ARMED`]). The PINNED header says `⌥W 1-3`.
+fn pin_cap(n: u8, card: Ink, loud: bool) -> Seg {
+    if loud {
+        block(format!(" {n} "), ARMED.0, ARMED.1)
+    } else {
+        block(format!(" {n} "), "text", over(Ink::Pal("overlay"), 30, card))
+    }
+}
+
+/// A second line's tag ([`agent_rows`]) is at most this many cells, and
+/// goes when the line's text would keep fewer than [`TAG_ROOM`].
+const TAG_W: usize = 10;
+const TAG_ROOM: usize = 10;
 
 /// A space's counts: the idle glyph's `overlay` lifted to `dimc` (the dim
 /// of what they sit on).
@@ -2009,7 +2076,7 @@ fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool) -> Vec<Row> {
     let ink = space_colour(sp);
     let mut rows: Vec<Row> = Vec::new();
     for (k, a) in shown.iter().enumerate() {
-        rows.extend(agent_rows(a, cx, two.contains(&key(a)), k, ink));
+        rows.extend(agent_rows(a, cx, two.contains(&key(a)), k, ink, None));
     }
     if !idle.is_empty() {
         // The zebra goes on: the fold is the next card.
@@ -2031,7 +2098,7 @@ fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool) -> Vec<Row> {
 fn partial_rows(sp: &Space, cx: Cx, room: usize) -> Vec<Row> {
     let ink = space_colour(sp);
     if sp.agents.len() <= room {
-        let mut rows: Vec<Row> = sp.agents.iter().enumerate().flat_map(|(k, a)| agent_rows(a, cx, false, k, ink)).collect();
+        let mut rows: Vec<Row> = sp.agents.iter().enumerate().flat_map(|(k, a)| agent_rows(a, cx, false, k, ink, None)).collect();
         let left = room - rows.len();
         rows.extend(shells_of(sp, cx.shells).into_iter().take(left).map(|s| shell_row(s, cx, ink)));
         return rows;
@@ -2040,7 +2107,7 @@ fn partial_rows(sp: &Space, cx: Cx, room: usize) -> Vec<Row> {
     ranked.sort_by_key(|&k| promotion_rank(&sp.agents[k], cx.now));
     let mut keep = ranked[..room - 1].to_vec();
     keep.sort_unstable();
-    let mut rows: Vec<Row> = keep.iter().enumerate().flat_map(|(n, &k)| agent_rows(&sp.agents[k], cx, false, n, ink)).collect();
+    let mut rows: Vec<Row> = keep.iter().enumerate().flat_map(|(n, &k)| agent_rows(&sp.agents[k], cx, false, n, ink, None)).collect();
     let rest: Vec<&Agent> = (0..sp.agents.len()).filter(|k| !keep.contains(k)).map(|k| &sp.agents[k]).collect();
     rows.push(more_row(cx.w, &rest, 1));
     rows
@@ -2084,11 +2151,12 @@ fn bare_group(view: &ViewModel, sp: &Space) -> bool {
 /// nothing folded or collapsed: what step 4 leaves the agents before NEEDS
 /// YOU gets the rest.
 fn agents_one_line(view: &ViewModel) -> usize {
+    let pins = if view.pinned.is_empty() { 0 } else { 1 + view.pinned.len() };
     let groups = groups(view);
     if groups.iter().all(|g| bare_group(view, g)) {
-        return 2 + usize::from(view.scope.session.is_some());
+        return pins + 2 + usize::from(view.scope.session.is_some());
     }
-    1 + groups.iter().map(|g| 1 + g.agents.len() + shells_of(g, view.shells).len()).sum::<usize>()
+    pins + 1 + groups.iter().map(|g| 1 + g.agents.len() + shells_of(g, view.shells).len()).sum::<usize>()
 }
 
 /// A space header in the agents section ([`group_header`]: the whole row
@@ -2102,28 +2170,84 @@ fn is_blank(r: &Row) -> bool {
     r.bg.is_none() && r.targets.is_empty() && r.covers.is_empty() && r.text().trim().is_empty()
 }
 
-/// How many space headers in an agents section (its first aside) have no
-/// gap above them.
-fn group_gaps(rows: &[Row], w: usize) -> usize {
-    let heads: Vec<usize> = (0..rows.len()).filter(|&y| is_group_header(&rows[y], w)).collect();
-    heads.iter().skip(1).filter(|&&y| !is_blank(&rows[y - 1])).count()
-}
-
-/// The agents section with a gap above each space header but the first
-/// (spare rows spent on spacing, whatever the agents' step).
-fn spaced_groups(rows: Vec<Row>, w: usize) -> Vec<Row> {
-    let mut out: Vec<Row> = Vec::with_capacity(rows.len() + 4);
+/// Where an agents section wants a gap that it does not have: above each
+/// space header but the first, and above the AGENTS header under the
+/// PINNED block.
+fn gap_spots(rows: &[Row], w: usize) -> Vec<usize> {
     let mut seen = false;
-    for r in rows {
-        if is_group_header(&r, w) {
-            if seen && !out.last().is_some_and(is_blank) {
-                out.push(Row::blank(w));
+    let mut v = Vec::new();
+    for (y, r) in rows.iter().enumerate() {
+        if is_group_header(r, w) {
+            if seen {
+                v.push(y);
             }
             seen = true;
+        } else if y > 0 && rows[y - 1].pinned && !r.pinned && !is_blank(r) {
+            v.push(y);
+        }
+    }
+    v.retain(|&y| !is_blank(&rows[y - 1]));
+    v
+}
+
+/// How many headers in an agents section lack their gap ([`gap_spots`]).
+fn group_gaps(rows: &[Row], w: usize) -> usize {
+    gap_spots(rows, w).len()
+}
+
+/// The agents section with a gap above each space header but the first,
+/// and under the PINNED block (spare rows spent on spacing, whatever the
+/// agents' step).
+fn spaced_groups(rows: Vec<Row>, w: usize) -> Vec<Row> {
+    let spots = gap_spots(&rows, w);
+    let mut out: Vec<Row> = Vec::with_capacity(rows.len() + spots.len());
+    for (y, r) in rows.into_iter().enumerate() {
+        if spots.contains(&y) {
+            out.push(Row::blank(w));
         }
         out.push(r);
     }
     out
+}
+
+/// The PINNED block's header: ` PINNED` like the other section labels; on
+/// the right the keys that reach them as a herdr-style hint (`⌥W` bold
+/// blue, as AGENTS' `⌥V`, then the digits dim: `⌥W 1-3`, `⌥W 1` for one;
+/// none when no pin holds a key), then the pin glyph and how many, dim (a
+/// pin asks for nothing). Too narrow for both, the count stays.
+fn pinned_header(pins: &[Agent], w: usize) -> Row {
+    let keys = pins.iter().filter_map(|a| a.pin_key).max();
+    let mut right = Vec::new();
+    match keys {
+        Some(1) => right.extend([bold("⌥W", "blue"), seg(" 1", LABEL)]),
+        Some(k) => right.extend([bold("⌥W", "blue"), seg(format!(" 1-{k}"), LABEL)]),
+        None => {}
+    }
+    let count = format!("{} {}", crate::pins::GLYPH, pins.len());
+    right.push(seg(if keys.is_some() { format!("  {count}") } else { count.clone() }, LABEL));
+    if keys.is_some() && dwidth(" PINNED") + width(&right) + 2 > w {
+        right = vec![seg(count, LABEL)];
+    }
+    Row { pinned: true, ..section_header(w, "PINNED", right) }
+}
+
+/// The PINNED block: its header, then each pinned agent ([`ViewModel::pinned`],
+/// pin order) as its own card, exactly as in its space (letter, state, the
+/// client's lift, clicks), the zebra afresh under the header, the agents in
+/// `two` on two lines; out of its space's group, its second line names the
+/// space (dim, before the age), and its key-cap wears the space's colour as
+/// everywhere. Never folded: a pin says "keep this in view". Empty when
+/// nothing is pinned.
+fn pin_block(view: &ViewModel, cx: Cx, two: &[Key]) -> Vec<Row> {
+    if view.pinned.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = vec![pinned_header(&view.pinned, cx.w)];
+    for (k, a) in view.pinned.iter().enumerate() {
+        let cards = agent_rows(a, cx, two.contains(&key(a)), k, space_ink(view, &a.session), Some(&a.session));
+        rows.extend(cards.into_iter().map(|r| Row { pinned: true, ..r }));
+    }
+    rows
 }
 
 /// ` AGENTS` and the scope on the right (`this space` / `all spaces`): a
@@ -2150,6 +2274,12 @@ fn agents_header(view: &ViewModel, w: usize) -> Row {
 /// groups); 1 the same, idle folded; 2 every agent one line; 3 the same,
 /// idle folded; 4 spaces collapsed; 5 `… N more`. Never a mix of heights
 /// in one frame.
+///
+/// The PINNED block ([`pin_block`]) comes first, above the AGENTS header
+/// (a blank row between them when `spaced`): its cards take the same
+/// height as every other agent row but never fold, and the spaces collapse
+/// before it loses anything; only a frame too short for every pin on one
+/// line cuts it (the first pins, then one `… N agents` line for the rest).
 fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec<Row>, u8) {
     if budget == 0 {
         return (vec![], 0);
@@ -2158,21 +2288,30 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
     let groups = groups(view);
     let space = view.scope.session.is_some();
     let header = agents_header(view, w);
-    if space && groups.iter().all(|g| bare_group(view, g)) {
-        // The space's header even with nothing in it, so the section says whose it is.
-        let mut rows = vec![header];
-        rows.extend(groups.iter().map(|g| group_header(g, cx, false)));
-        rows.push(dim_line(w, "   no agents in this space"));
-        rows.truncate(budget);
-        return (rows, 0);
-    }
-    if groups.is_empty() {
-        let mut rows = vec![header, dim_line(w, "   no agents running")];
-        rows.truncate(budget);
-        return (rows, 0);
-    }
+    let pins = !view.pinned.is_empty();
+    // Nothing (else) to list: the space's header even with nothing in it,
+    // so the section says whose it is; the words say why.
+    let bare = if space { groups.iter().all(|g| bare_group(view, g)) } else { groups.is_empty() };
+    let mine_pinned = view.pinned.iter().any(|a| Some(&a.session) == view.scope.session.as_ref());
+    let empty = match (space, pins) {
+        (true, _) if mine_pinned => "   all pinned above",
+        (true, _) => "   no agents in this space",
+        (false, true) => "   all pinned above",
+        (false, false) => "   no agents running",
+    };
     let build = |two: &[Key], fold: bool, collapsed: &[bool], spaced: bool| {
-        let mut rows = vec![header.clone()];
+        let mut rows = pin_block(view, cx, two);
+        if spaced && pins {
+            rows.push(Row::blank(w));
+        }
+        rows.push(header.clone());
+        if bare {
+            if space {
+                rows.extend(groups.iter().map(|g| group_header(g, cx, false)));
+            }
+            rows.push(dim_line(w, empty));
+            return rows;
+        }
         for (k, (sp, &c)) in groups.iter().zip(collapsed).enumerate() {
             if spaced && k > 0 {
                 rows.push(Row::blank(w));
@@ -2185,7 +2324,12 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
         rows
     };
     let mut collapsed = vec![false; groups.len()];
-    let all: Vec<Key> = groups.iter().flat_map(|g| g.agents.iter().map(key)).collect();
+    if bare && !pins {
+        let mut rows = build(&[], false, &collapsed, false);
+        rows.truncate(budget);
+        return (rows, 0);
+    }
+    let all: Vec<Key> = view.pinned.iter().map(key).chain(groups.iter().flat_map(|g| g.agents.iter().map(key))).collect();
     // Full detail: the gaps between spaces go first.
     for sp in [spaced, false] {
         let rows = build(&all, false, &collapsed, sp);
@@ -2199,6 +2343,11 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
         if rows.len() <= budget {
             return (rows, step);
         }
+    }
+    // The pinned block on one line each: what every later step keeps.
+    let lead = pin_block(view, cx, &[]).len();
+    if bare {
+        return pins_cut(view, cx, &groups, &header, budget);
     }
     // Collapse whole spaces: fewest attention agents first, then the client's
     // space last, then fewest in flight, then from the end of the list.
@@ -2216,7 +2365,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
             continue;
         }
         let spare = budget - base.len();
-        let at = 1 + (0..i)
+        let at = lead + 1 + (0..i)
             .map(|j| 1 + if collapsed[j] { 0 } else { group_rows(groups[j], cx, &[], true).len() })
             .sum::<usize>();
         if spare < 2 {
@@ -2232,7 +2381,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
             let mut rows = base;
             let gone = key(&g.agents[top]);
             rows[at].covers.retain(|(s, id)| (s.as_str(), id.as_str()) != gone);
-            rows.insert(at + 1, agent_rows(&g.agents[top], cx, false, 0, space_colour(g)).remove(0));
+            rows.insert(at + 1, agent_rows(&g.agents[top], cx, false, 0, space_colour(g), None).remove(0));
             return (rows, 4);
         }
         // The space whose collapse made it fit keeps the rows that frees:
@@ -2243,15 +2392,35 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
         return (rows, 4);
     }
     // More spaces than rows: the first ones as headers, the rest counted.
-    if budget == 1 {
-        let all: Vec<&Agent> = groups.iter().flat_map(|g| g.agents.iter()).collect();
-        return (vec![more_row(w, &all, groups.len())], 5);
+    if budget < lead + 2 {
+        return pins_cut(view, cx, &groups, &header, budget);
     }
-    let keep = budget - 2;
+    let keep = budget - lead - 2;
     let mut rows = build(&[], true, &collapsed, false);
-    rows.truncate(1 + keep);
+    rows.truncate(lead + 1 + keep);
     let rest: Vec<&Agent> = groups[keep..].iter().flat_map(|g| g.agents.iter()).collect();
     rows.push(more_row(w, &rest, groups.len() - keep));
+    (rows, 5)
+}
+
+/// The agents section in fewer rows than the pins on one line each and a
+/// line for the rest (step 5): the PINNED header and the first pins, then
+/// one `… N more` line for every agent not shown (or the AGENTS header, when
+/// every pin is shown and nothing else is listed). One row: that line alone.
+/// Without pins it is the old last resort, unchanged.
+fn pins_cut(view: &ViewModel, cx: Cx, groups: &[&Space], header: &Row, budget: usize) -> (Vec<Row>, u8) {
+    let w = cx.w;
+    let in_groups = || groups.iter().flat_map(|g| g.agents.iter());
+    if budget == 1 {
+        let all: Vec<&Agent> = view.pinned.iter().chain(in_groups()).collect();
+        let spaces = if view.pinned.is_empty() { groups.len() } else { 0 };
+        return (vec![more_row(w, &all, spaces)], 5);
+    }
+    let block = pin_block(view, cx, &[]);
+    let shown = (budget - 1).min(block.len());
+    let mut rows: Vec<Row> = block[..shown].to_vec();
+    let rest: Vec<&Agent> = view.pinned.iter().skip(shown.saturating_sub(1)).chain(in_groups()).collect();
+    rows.push(if rest.is_empty() { header.clone() } else { Row { pinned: true, ..more_row(w, &rest, 0) } });
     (rows, 5)
 }
 
@@ -2702,6 +2871,16 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
         shells: view.shells,
         resumes: matches!(opts.pause, Some(Phase::Stopping { .. } | Phase::Safe { .. } | Phase::Ready { .. })),
     };
+    // Pinned agents move out of their spaces into PINNED (a view already
+    // split is laid out as it is). The letters, the client's own card and
+    // the key-caps above were read off the whole view.
+    let split;
+    let view = if view.pinned.is_empty() && view.agents().any(|a| a.is_pinned()) {
+        split = view.pins_split();
+        &split
+    } else {
+        view
+    };
     let keep = sections(view, &mut frame, opts, cx).min(frame.rows.len());
     // The toasts float over whatever is there: nothing beneath moves, and
     // the rows they hide still stand for their agents (back when they go).
@@ -2742,7 +2921,7 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     if avail == 0 {
         // No room for sections: one row still counts every agent of the
         // scope, then the parked row.
-        let all: Vec<&Agent> = groups(view).into_iter().flat_map(|s| s.agents.iter()).collect();
+        let all: Vec<&Agent> = view.pinned.iter().chain(groups(view).into_iter().flat_map(|s| s.agents.iter())).collect();
         let mut rows = vec![top.into_iter().next().unwrap_or_else(|| Row::blank(w))];
         rows.push(if all.is_empty() { Row::blank(w) } else { more_row(w, &all, 0) });
         rows.push(parked_header(view, w, opts.msg.as_deref()));
@@ -2827,6 +3006,8 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     let at = rows.len();
     rows.extend(agents);
     frame.agents = at..rows.len();
+    let pinned: Vec<usize> = frame.agents.clone().filter(|&y| rows[y].pinned).collect();
+    frame.pinned = pinned.first().zip(pinned.last()).map_or(at..at, |(a, b)| *a..b + 1);
     // Spare rows collect here (what spacing could not use); the dock sits
     // at the bottom.
     while rows.len() + dock.len() < h {

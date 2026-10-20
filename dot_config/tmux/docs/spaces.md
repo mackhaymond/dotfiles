@@ -319,7 +319,8 @@ a key table, so the sidebar re-reads `#{client_key_table}` after the next key.
 | key | tmux | does |
 |---|---|---|
 | Control-1-9 | User0-8 (also prefix 1-9) | space N's HOME window, tab order; never its last-active window, and from inside space N it goes home. No fork: an `S:` loop finds the session whose `@space_index` is N and a nested `W:` loop its `@space_home` window, for one `switch-client -t '$S:@W'` (`#{s/ .*//:}` keeps the first match; no home means the bare session) |
-| Option-1-9 | User9-17 (`send-keys M-N`) | nothing of ours: M-1..M-9 reach the pane, as with spaces off (they were "shell N"; shells have letters now, ⌥W). Unbound with `unbind -q`, so a reload from an older spaces.conf drops them |
+| Option-1-9 | User9-17 (`send-keys M-N`) | nothing of ours: M-1..M-9 reach the pane, as with spaces off (they were "shell N"; shells have letters now, ⌥W). Unbound with `unbind -q`, so a reload from an older spaces.conf drops them. Pinned agent N is ⌥W then N (below) |
+| — | prefix t | pin / unpin THIS tab in the sidebar's PINNED section (`agent-ui pin toggle --window <win> --client <tty>`, `@space_pin`; a shell, a home, a parked tab or a hidden session's agent is refused aloud; no binary: "pin: agent-ui is not installed"). Replaces tmux's clock-mode, given back with spaces off. Not prefix p: it sits next to prefix P, the pause key |
 | Command-1-9 | User18-26 (also prefix M-1..M-9) | agent N of this space |
 | ⌥L / ⌥H | M-l / M-h | kind-aware: on an agent, next / previous agent; on a shell, next / previous shell; wrapping |
 | ⌥\` | M-\` | agent → last-visited shell of this space (a new shell at the space folder if there is none); shell → last-visited agent |
@@ -327,6 +328,7 @@ a key table, so the sidebar re-reads `#{client_key_table}` after the next key.
 | ⌥N | M-n | new space: zoxide/fzf folder picker (as `prefix K` with spaces off), then reuse the session already on that folder, else `new-session -d -s <basename> -c <dir>`; switch to it. `~` → main |
 | ⌥V | M-v | sidebar scope, this space ↔ all spaces (posts `com.mackhaymond.tmux.focus` so the Rust sidebar redraws at once) |
 | ⌥W *letter* | M-w, then key table `jump` | the agent OR non-home shell whose window option `@agent_key` is that letter (one pool), in any space (`switch-client -t '$S:@W'`, one step); hidden sessions never, a home never (even with a stale `@agent_key`: homes are reached by ⌃N). A miss says "jump: nothing on x". Escape, or any other key (`Any`), cancels and is swallowed. Entering and leaving post `com.mackhaymond.tmux.focus` so the sidebar can show "jump mode" (`#{client_key_table}` = `jump`). The sidebar assigns the letters; this only reads them. No fork: an `S:`/`W:` loop, `#{s/ .*//:}` keeps the first match, the letter rides in the global `@space_jump_key` |
+| ⌥W *digit* | M-w, then key table `jump` 1-9 | the Nth PINNED agent (the agent sidebar's PINNED section, pin order; docs/agent-roster.md "Pinned agents"), in any space: the window whose `@pin_key` is N AND that is still a pinned agent (`@agent_pinned` and a non-empty `@agent_state`), never a home, hidden sessions (the stash among them) skipped (`switch-client -t '$S:@W'`, one step). The sidebar and every pin toggle keep the pins numbered 1..N with no gap; this only reads them. Fork-free on a hit, the letters' way (the digit rides in the global `@space_pin_n`, `@space_pin_hit`'s `S:`/`W:` loop, first match), posting the focus notice like them. A miss runs `agent-ui pin renumber` (a gap no sidebar was open to repair is gone for the next press) and says "no pin N" (`@space_pin_miss`) |
 | — | prefix Q | close this space: a y/n menu box in the middle of the window ("close space bai: 2 agents, 1 shell?"; Cancel is first, so only y closes; not `confirm-before`, which draws on the status line), then `space.sh close`: it is marked `@space_closing` (no sync re-registers it or rebuilds its home meanwhile) and unregistered, clients on it move to main (detach-on-destroy would close them), every pane goes through `closed-tabs.sh close` (snapshot + agent session id, so CMD+Z can bring each back; `@space_closer` overrides, `none` skips), the session is killed and unregistered. Never main, never a hidden session |
 | CMD+W, CMD+SHIFT+W | prefix x, C-l | as tmux.conf, except on home (refuse) |
 | CMD+T, CMD+R, CMD+OPT+R | prefix c, k, C-k | in a project space (path ≠ `~`, not hidden) the new tab starts in the space folder; elsewhere unchanged |
@@ -371,7 +373,8 @@ id is still a shell/agent of the session before using it.
 Claude Code binds `meta+j` to `app:toggleTerminal` (Global). ⌥H/⌥L are free
 in Claude Code, zsh (vi keymap: no `^[` bindings in viins) and nvim (only
 `<A-e>`, `<A-o>`, `<A-g>` are mapped). ⌥M, ⌥N, ⌥\` are free in all
-three. ⌥1-9 are not tmux's (they reach the pane). Already-taken root keys
+three. ⌥1-9 are not tmux's (they reach the pane; the pins are ⌥W then a
+digit: every jump goes through the ⌥W leader). Already-taken root keys
 (M-s M-x M-a M-q) are untouched; M-w is the jump leader (below).
 
 ⌥W (M-w) was tmux.conf's agent menu; with spaces on the leader takes it

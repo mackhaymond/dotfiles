@@ -66,7 +66,11 @@ is the primary one for both the Option-W popup and the CMD+B sidebar.
   moves it; if the selected row goes away it moves to the nearest surviving
   row, and ⏎ / Space typed before a frame showed that are refused ("that tab
   moved · pick it again"), never retargeted.
-- **Preview**: off by default. Space p turns on a strip of up to 10 lines
+- **Pinned**: a pinned agent (the sidebar's PINNED section, [Pinned
+  agents](#agent-ui-sidebar-layout-sync-lifecycle)) keeps its row where it
+  is and wears a dim pin glyph and its ⌥W digit after the title (`` 2``);
+  Space p pins or unpins the selected agent.
+- **Preview**: off by default. Space v turns on a strip of up to 10 lines
   under the list, full width, its rule naming `title · session:index · ✳
   claude · ⌥ branch · ~/path`; the pane's tail is captured on a worker
   thread only while it is on.
@@ -137,7 +141,7 @@ agent-ui menu keys:
 | ⏎ | go to the selected row (a parked tab comes back via `stash.sh unstash`; the `▪ N parked` row opens the Parked filter); a click selects, a second click goes |
 | Tab / Shift-Tab | cycle the filter: All, Active, Needs you, Working, Idle, Parked |
 | `/` | search title, session, `session:index`, detail and path as you type (letters and digits type); ⏎ goes to the selected match; Esc leaves and clears it (a second Esc closes); Backspace on an empty query leaves it |
-| Space | the actions strip for the selected row, in the footer; the next key runs one, Esc cancels: `p` preview strip on/off, `s` park (`stash.sh stash`, after y/n), `x` close the agent's pane through `closed-tabs.sh` after y/n (CMD+Z undoes it; on a parked row: discard via `stash.sh kill-many`), `r` restart the watcher, ⏎ go |
+| Space | the actions strip for the selected row, in the footer; the next key runs one, Esc cancels: `p` pin / unpin (the sidebar's PINNED section, at once, no y/n; the strip says which), `s` park (`stash.sh stash`, after y/n), `x` close the agent's pane through `closed-tabs.sh` after y/n (CMD+Z undoes it; on a parked row: discard via `stash.sh kill-many`), `v` preview strip on/off (was `p`), `r` restart the watcher, ⏎ go. A parked row offers neither `p` nor `s` |
 | Option-S / Option-X | next tab that needs you (agent-jump.sh) / one step back through the tabs you were on (nav.sh, the same Option-X as everywhere: [nav.md](nav.md)), and close. When CuaNotch's `keyJumpToNeedy` is opt+s (this machine's setting), CuaNotch owns Option-S, so while it runs only Option-X reaches the menu |
 | Esc / C-c | close |
 
@@ -828,6 +832,12 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
    ▌  a  Slides export        ✕ error    of the state colour, a heavy ▌ rail,
    ▌     AX tree came back empty  3m     the key-cap solid, the reason in text
 
+   PINNED               ⌥W 1-2   2    pinned agents, MOVED here, pin order;
+   ▎  f  Kua Yu focus ti…  ◉ asks      every scope; ⌥W's digit under the letter,
+   ▎  1  Which deck sho… main · 5m     the space before the age (see Pinned
+      k  BAI Info Session Slides       agents below)
+      2  Slides 4-9 rew… work · 9m
+
    AGENTS               ⌥V all spaces    THE BODY: every space (or the client's
   ▌ 1  main   main          ◉1 ◐1 ○1    in space scope); the client's space a
    ▎  d  Sidebar status   ⠹ working      BAND of its colour with a ▌ at the edge
@@ -1061,6 +1071,98 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   `window-unlinked` hook's agent-state notice, so every sidebar redraws at
   once. A right press anywhere else, or with a modifier, only hands focus
   back.
+- **Pinned agents** (the Codex app's pins; `agent-ui/src/pins.rs`,
+  `layout::pin_block`):
+  - **What**: the window option `@agent_pinned` = the epoch second it was
+    pinned. A pinned AGENT (a state; never a shell or a home) MOVES out of
+    its space's group into the PINNED block between NEEDS YOU and AGENTS
+    (not duplicated; NEEDS YOU still lists it while it asks, as for every
+    agent). The block is global in BOTH scopes: in "this space" a pin from
+    another space still shows (that is what pinning is for). A window
+    linked into two spaces is pinned once (its copy in the client's space).
+  - **Order**: pin order, first pinned first (`@agent_pinned`, then the
+    window id): pinning another appends it and never moves the ones
+    already there, the sidebar's "nothing moves under the mouse" rule. A
+    toggle stores `max(now, the latest pin + 1)`, so a pin made in the
+    same second as another still sorts after it.
+  - **Look**: ` PINNED` like the other section labels, `⌥W 1-N` (`⌥W` bold
+    blue, the AGENTS header's `⌥V` style, the digits dim; just the count
+    when narrow) and the pin glyph and count dim on the right. Each card is
+    exactly its space-group card (letter cap in the space's colour, state
+    rail and word, the client's lift, clicks: go / right-click park /
+    middle-click unpin), zebra afresh; its second line ends `<space> ·
+    <age>` (dim; dropped when the line's text would keep under 10 cells)
+    and its digit sits as a neutral cap UNDER its letter cap (beside it on a
+    one-line card), so no title room is lost. While ⌥W is armed the digit
+    caps invert with every letter cap.
+  - **Ladder**: pins take the frame's one card height (two lines, then one)
+    but never fold into an idle line; the spaces collapse before a pin loses
+    its card; only a frame too short for every pin on one line cuts them
+    (the first pins, then `… N agents`). With every agent of the scope
+    pinned, AGENTS says `all pinned above`.
+  - **Toggle**: prefix t on the current tab (spaces.conf: `agent-ui pin
+    toggle --window <win> --client <tty>`; it replaces tmux's clock-mode,
+    which comes back with spaces off; not prefix p, next to prefix P's
+    pause-everything), the menu's Space p (pin / unpin, no y/n), or a plain
+    MIDDLE click (SGR button 1) on a sidebar card. Each sets or clears the
+    option, renumbers the pins' digits, updates `pins.json`, posts the
+    agent-state notice (every sidebar redraws at once) and says `pinned
+    <title> · ⌥W 2` (notify.sh / the footer). Refused, aloud: a shell
+    (`only agents pin`), a home, a parked tab (`a parked tab is never
+    pinned · unpark it first`), an agent in a hidden session (`agents is
+    not a space`), a gone tab. `agent-ui pin [toggle|on|off] [--window @id]
+    [--client tty]`: exit 0 done, 1 refused, 2 usage; `agent-ui pin
+    renumber` only renumbers.
+  - **⌥W then 1-9** (`@pin_key`): the first nine pins in pin order hold
+    1..9, no gap (`pins::pin_keys`); past nine, no key. Every toggle
+    renumbers at once (`pins::renumber`), and the live sidebar repairs any
+    gap on each refresh (a pin closed, parked, unpinned or exited
+    elsewhere), like the letters: ONE batched `set-option` from a thread,
+    only what differs, never re-sent while in flight (`pins::KeyMemo`,
+    resent once after 5 s unseen). spaces.conf's `jump` table (⌥W, the one
+    nav leader) binds 1-9 beside the letters: the window whose `@pin_key`
+    is N and that is still a pinned agent (`@agent_pinned` and a state, so
+    a stale key on an exited agent never lands), in any space but a hidden
+    one, fork-free; a miss runs `agent-ui pin renumber` (no sidebar open to
+    repair the gap) and says `no pin N` (docs/spaces.md).
+  - **Parking** a pinned agent keeps its pin (a window option travels with
+    the window): it leaves the list while parked (no digit then; the stash
+    is hidden, so ⌥W never lands there) and comes back pinned, with a key,
+    when unparked.
+  - **Kept across a restore**: `~/.local/state/agent-ui/pins.json`
+    (`$AGENT_UI_PINS`), one entry per pin: the agent's SESSION ID, the pin
+    time, the server it was last seen in (`#{start_time}`), its window
+    there, when last seen. A window's session id: claude's
+    `~/.claude/sessions/<pid>.json` (its `"tmux"` field names
+    `<session>:<@window>.<%pane>`; the pid alive, the pane still in that
+    window, the newest `startedAt`), plus the ids its argv was started to
+    RESUME (`--resume <id>` / `-r <id>` / `--resume=<id>`, read with
+    `sysctl(KERN_PROCARGS2)`, no fork): every restore path (assistant-
+    restore.sh, closed-tabs.sh, stash.sh's unpark) runs `claude --resume
+    <sid>` and a resumed claude may report a NEW id (after a compaction), so
+    an entry under the old id still finds its window and is RE-KEYED to the
+    new one (`--continue` names no id and is not matched); codex's
+    `@agent_session_id`; opencode's `-s <id>` / `--session <id>` from the
+    argv of the opencode process under one of its panes (libproc's child
+    list from `#{pane_pid}`), so one started without an id has none (its
+    pin lives as long as its window). The live sidebar syncs
+    (`pins::Sync`: only while anything is pinned or stored, when the windows
+    changed or every 10 s, no fork): a pinned window's entry is kept
+    current; an entry whose session now runs in an unpinned window is put
+    back (`@agent_pinned` = its old time) when that is a NEW server (a
+    resurrect restore) or a new window (closed-tabs.sh's ⌘Z reopen), and
+    dropped when it is the same window in the same server (unpinned); an
+    entry whose session runs nowhere is kept a week (parked, closed, not
+    restored yet), dropped at once if its window is still here unpinned.
+    Writes are whole-file renames; a lost race is repaired by the next
+    sync, which never re-pins a window it saw unpinned in the same server.
+    Only the DEFAULT server's processes touch the file: the server's
+    socket path, resolved (`/tmp` → `/private/tmp`), must be
+    `realpath(${TMUX_TMPDIR:-/tmp})/tmux-<uid>/default`, whether it comes
+    from `--socket`, `$AGENT_UI_TMUX_SOCKET` or an ambient `$TMUX`
+    (`pins::is_default_server`); any other needs an explicit
+    `$AGENT_UI_PINS`, so tests, previews and a private server running the
+    real config never rewrite it.
 - **Density ladder** (`layout::STEPS`): agents lose detail last. Before
   anything else the dock's gap and one line of chips are held back, with
   the PARKED line; the first two steps (with the gaps, and the one right

@@ -217,6 +217,15 @@ impl Effects for Live {
     fn restart_watcher(&mut self) -> String {
         self.actions.restart_watcher()
     }
+    fn pin(&mut self, win: &str, pin: bool) -> Result<String, String> {
+        let tmux = &self.actions.tmux;
+        let store = crate::pins::store_for(tmux);
+        let t = crate::pins::toggle(tmux, &self.snap, win, Some(pin), text::now() as i64, store.as_deref(),
+            &crate::pins::claude_sessions_dir(), &crate::pins::LiveProcs)?;
+        // Every sidebar redraws at once (this menu's rows on its next tick).
+        crate::sidebar::notice::post(&crate::sidebar::notice::names()[0]);
+        Ok(crate::pins::said(&t))
+    }
 }
 
 /// `--once`: one frame of the live server, read-only.
