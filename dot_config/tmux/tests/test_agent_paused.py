@@ -3,7 +3,7 @@ docs/agent-tab-indicator.md, "Agent-originated turns"): while agent-pause.py's
 @agent_paused flag is set, a turn end that would write done or idle, or do a
 quiet restore, writes `paused` instead; the watcher's reconciles leave a
 paused window alone and end a flagged turn as paused; the tab shows a
-lavender ⏸ in the glyph slot.
+electric violet ⏸ in the glyph slot.
 
 Indicator tests reuse test_agent_origin's private-server harness
 (OriginHarness: a real `tmux -L <unique> -f /dev/null`, killed in cleanup);
@@ -381,11 +381,11 @@ class PausedGlyphTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout.rstrip("\n")
 
-    def test_paused_shows_a_lavender_glyph_in_both_formats(self):
+    def test_paused_shows_a_violet_glyph_in_both_formats(self):
         for name in ("default_text", "current_text"):
             with self.subTest(name=name):
                 out = self.render(name, **{"@agent_state": "paused", "@agent_summary": "proj/thing"})
-                self.assertTrue(out.startswith("#[fg=#b4befe]⏸ "), out)
+                self.assertTrue(out.startswith("#[fg=#9d6bff]⏸ "), out)
                 self.assertTrue(out.endswith("]proj/thing"), out)
                 self.assertNotIn("⏸", self.render(name, **{"@agent_state": "idle"}))
                 self.assertNotIn("⏸", self.render(name, **{"@agent_state": "done"}))
