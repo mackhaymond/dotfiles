@@ -1340,17 +1340,18 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   done), never peach: the MOVING phases (pausing, resuming: the spinner)
   the quieter `dimviolet` (`#6c5bd9`, violet at 85% brightness, same hue)
   on a 9% violet tint, as the notch pulses violet while pausing; the
-  SETTLED ones (safe, ready: every paused agent stopped) `white`
-  (`#ffffff`) on a 14% white tint, as the notch holds a solid white ring
-  until the resume. Paused CARDS stay violet. The settled two part by
-  emphasis: safe's `⏸ PAUSED` bold in white, ready's count on a SOLID
-  white chip (dark ink), the one that asks for a press:
+  SETTLED ones (safe, ready: every paused agent stopped) electric `cyan`
+  (`#00d9ff`) on a 14% cyan tint, as the notch glows cyan until the
+  resume (white before; Mack: "solid white is no good"). Paused CARDS stay
+  violet. The settled two part by emphasis: safe's `⏸ PAUSED` bold in
+  cyan, ready's count on a SOLID cyan chip (dark ink), the one that asks
+  for a press:
 
   ```
    ▌ ⠹ PAUSING  2 of 5 stopped          dim violet, 9% (also "sending 2 of 5")
    ▌   still working  Tmux Agent Sidebar, I…
-   ▌ ⏸ PAUSED  safe to close            white, 14%, bold word
-   ▌ [ ↻ 3 ready ] Tmux Agent Sidebar…  white, 14%, solid chip
+   ▌ ⏸ PAUSED  safe to close            cyan, 14%, bold word
+   ▌ [ ↻ 3 ready ] Tmux Agent Sidebar…  cyan, 14%, solid chip
    ▌   prefix P or click to resume
    ▌ ⠹ RESUMING  3 agents…              dim violet, 9%
   ```
