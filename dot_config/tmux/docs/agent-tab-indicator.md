@@ -27,7 +27,7 @@ State by state (unselected tab):
 | `needs-input` | waiting on you: a permission gate or a question (`needs-approval` survives only as the hook MODE name) | crust (yellow digit) | yellow `#f9e2af` | — |
 | `failed` | the turn itself died (`StopFailure`: 529, overloaded) | crust (red digit) | red `#f38ba8` | — |
 | `done` | turn finished | crust (green digit) | green `#a6e3a1` | — |
-| `paused` | a turn end while the pause key's `@agent_paused` is set (see "Paused" in §6) | blue, solid | stock | electric violet `⏸` `#9d6bff`, still |
+| `paused` | a turn end while the pause key's `@agent_paused` is set (see "Paused" in §6) | blue, solid | stock | electric violet `⏸` `#7f6bff`, still |
 | any | agent has a conversation title | — | — | tab name = `project/short-title`, else `#W` |
 
 **The selected tab never pulses**: solid peach `#fab387` for every ambient state (idle/running/cua/workflow). You are looking at it — the terminal itself is the progress indicator. Attention states still force the chip to crust even when selected, because the digit's fg *is* the bright body tint and needs a dark chip to read; focusing a prompt is not answering it.

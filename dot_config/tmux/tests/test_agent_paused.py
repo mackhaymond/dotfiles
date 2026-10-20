@@ -385,7 +385,7 @@ class PausedGlyphTests(unittest.TestCase):
         for name in ("default_text", "current_text"):
             with self.subTest(name=name):
                 out = self.render(name, **{"@agent_state": "paused", "@agent_summary": "proj/thing"})
-                self.assertTrue(out.startswith("#[fg=#9d6bff]⏸ "), out)
+                self.assertTrue(out.startswith("#[fg=#7f6bff]⏸ "), out)
                 self.assertTrue(out.endswith("]proj/thing"), out)
                 self.assertNotIn("⏸", self.render(name, **{"@agent_state": "idle"}))
                 self.assertNotIn("⏸", self.render(name, **{"@agent_state": "done"}))
