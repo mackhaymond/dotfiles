@@ -98,7 +98,11 @@ PAUSE_MSG = (
     "immediately: don't finish the task, the step or the current thought. Clean up "
     "only what would be left broken, and fast: if you are mid-edit, finish or undo "
     "that one edit so no file is half-written; stop dev servers and long jobs you "
-    "started (kill_pty); tell running subagents/workflows to stop now. Start "
+    "started (kill_pty); stop running subagents/workflows now. A message reaches a "
+    "subagent only after its current tool call, so one in a long build or test "
+    "would keep going for minutes: stop it outright (TaskStop) and kill_pty the "
+    "shell its command runs in, and note where it was so a RESUME can restart "
+    "it. Start "
     "nothing else: no new edits, tests, builds, commits or pushes. Then reply in "
     "2-3 lines with where you stopped and what's next, and stay stopped. Do not "
     "continue for any reason until a RESUME message arrives.")

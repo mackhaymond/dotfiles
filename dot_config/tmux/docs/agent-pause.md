@@ -60,8 +60,10 @@ held message therefore counts as delivered.
 - **PAUSE**: urgent. The lid is closing now, so drop the work immediately
   rather than finishing the task or step (Mack's call). Clean up only what
   would be left broken: finish or undo the one edit in flight so no file is
-  half-written, stop your own dev servers and long jobs, and tell subagents and
-  workflows to stop now. Start nothing else (no edits, tests, builds, commits
+  half-written, stop your own dev servers and long jobs, and stop subagents and
+  workflows now. A message reaches a subagent only after its current tool call,
+  so one in a long build kept a pause waiting for minutes (2026-10-19): stop it
+  outright (TaskStop) and kill its pty, noting where it was for the RESUME. Start nothing else (no edits, tests, builds, commits
   or pushes), reply in 2-3 lines with where you stopped and what's next, and
   stay stopped until RESUME.
 - **RESUME**: pick up from the noted next steps, and restart anything you
