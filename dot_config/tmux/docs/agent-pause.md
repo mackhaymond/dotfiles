@@ -253,11 +253,13 @@ Every reader:
   some strong solid glow of another color when it's done"; cua-notch
   fffa8f1). **Pausing** (a pause press in flight, or a saved target still
   working): violet `#7f6bff` pulsing hard, near-off to full every 1.7 s and
-  swelling at the peak. **All paused**: a strong, steady white `#ffffff` ring
-  at that peak reach, held until `paused.json` goes away (the resume, wakes
-  included). A resume press in flight shows neither. The white is the cue
-  that the lid can close. The sidebar matches: dim violet banners while
-  pausing or resuming, white for safe to close and ready (04f76d8).
+  swelling at the peak. **All paused**: a strong, steady electric cyan
+  `#00d9ff` ring at that peak reach (white `#ffffff` first; Mack: "solid white
+  is no good", and he picked cyan; cua-notch f01c127), held until
+  `paused.json` goes away (the resume, wakes included). A resume press in
+  flight shows neither. The cyan is the cue that the lid can close. The
+  sidebar matches: dim violet banners while pausing or resuming, cyan for
+  safe to close and ready.
 - **Paused beats a quiet finish.** The PAUSE arrives through
   `message_agent`, so the tab hook may classify that turn as agent-started
   (`agent-tab-indicator.md` §6). `paused` wins over the quiet restore.
