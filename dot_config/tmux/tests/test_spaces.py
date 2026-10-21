@@ -1382,14 +1382,18 @@ class Spaces(Server):
         self.assertNotEqual(self.script("move-to", self.M1, sid, self.client).returncode, 0)
         self.assertEqual(self.homes("main"), [self.M1])
 
-    def test_new_window_keys_use_the_space_folder_in_project_spaces(self):
+    def test_new_window_keys_use_this_tabs_folder(self):
+        # Even in a project space, CMD+T opens where this tab is, not the
+        # space's folder (that is the SHIFT row: C-t asks which space,
+        # test_new_tab_*).
+        sub = os.path.join(self.proj, "sub")
+        os.makedirs(sub, exist_ok=True)
         self.t("switch-client", "-c", self.client, "-t", "proj")
-        self.t("send-keys", "-t", self.P1, f"cd {self.home_dir}", "Enter")
-        self.wait(lambda: self.on("#{pane_current_path}"), self.home_dir)
+        self.t("send-keys", "-t", self.P1, f"cd {sub}", "Enter")
+        self.wait(lambda: self.on("#{pane_current_path}"), sub)
         self.key("C-b", "c")
-        self.wait(lambda: self.on("#{pane_current_path}"), self.proj)
-        # (C-t asks which space: test_new_tab_*.)
-        # main is not a project space: today's cwd rule.
+        self.wait(lambda: self.on("#{window_id}") != self.P1 and self.on("#{pane_current_path}"), sub)
+        # The same in main.
         self.t("switch-client", "-c", self.client, "-t", "main")
         self.t("send-keys", "-t", self.M1, f"cd {self.home_dir}", "Enter")
         self.wait(lambda: self.t("display", "-t", self.M1, "-p", "#{pane_current_path}"), self.home_dir)
