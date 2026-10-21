@@ -367,9 +367,12 @@ const PARK_WATCH: f64 = 15.0;
 
 /// The click targets a left press trusts only once they have settled
 /// under the pointer ([`crate::answer::Arrivals`]): an answer chip (it
-/// types into an agent) and a diff badge (it opens a popup).
+/// types into an agent), a diff badge (it opens a popup), the pause
+/// banner's resume (it messages every paused agent) and its held rows
+/// (when the held agent stops, the banner settles and its resume row can
+/// land right where a held row was).
 fn guarded(t: &Target) -> bool {
-    matches!(t, Target::Answer { .. } | Target::Diff(_))
+    matches!(t, Target::Answer { .. } | Target::Diff(_) | Target::Resume | Target::Held { .. })
 }
 
 /// Every cell of `f` whose click target ([`Frame::target`]) is [`guarded`].
@@ -1023,7 +1026,7 @@ impl App {
         }
         let snap = &self.core.snapshot;
         let moved = match t {
-            Target::Go { win, session } | Target::Shell { win, session } => {
+            Target::Go { win, session } | Target::Shell { win, session } | Target::Held { win, session } => {
                 self.actions.go(snap, &client, &win, &session).map(|_| true)
             }
             Target::Session(s) => self.actions.goto_session(snap, &client, &s).map(|_| true),
@@ -1898,8 +1901,10 @@ mod tests {
     fn a_settled_pause_banner_resumes_on_click() {
         let mut a = app();
         let frame = |a: &App| layout(&a.view, 34, 30, &Opts { pause: a.pause_phase.clone(), ..Opts::default() });
+        // (Drawn long enough ago: the resume is a guarded target.)
+        let settled = Instant::now() - crate::answer::SETTLE;
         a.pause_phase = Some(pause::Phase::Safe { labels: vec!["One".into()] });
-        a.shown = frame(&a);
+        a.show(frame(&a), settled);
         a.handle(b"\x1b[<0;5;2M\x1b[<0;5;2m");
         assert_eq!(a.last_act, Some(Target::Resume));
         assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("no tmux client"));
@@ -1910,10 +1915,41 @@ mod tests {
         assert_eq!(a.actions.resume_line("/dev/ttys999"), format!("{} 'resume' '/dev/ttys999'", sh_quote(&script.to_string_lossy())));
         // Still stopping: the banner is no button.
         a.last_act = None;
-        a.pause_phase = Some(pause::Phase::Stopping { stopped: 0, n: 1, working: vec!["One".into()] });
-        a.shown = frame(&a);
+        a.pause_phase = Some(pause::Phase::Stopping { stopped: 0, n: 1, working: vec!["One".into()], held: vec![] });
+        a.show(frame(&a), settled);
         a.handle(b"\x1b[<0;5;1M\x1b[<0;5;1m");
         assert_eq!(a.last_act, None);
+        // An agent whose PAUSE tmux-mcp holds: its row (under the banner's)
+        // jumps to its tab, as its card would; a right press there parks
+        // nothing.
+        let held = pause::Held { label: "P0a".into(), window_id: "@1".into(), why: "the pane is in copy mode".into(), session: "main".into(), letter: Some('k') };
+        let tab = Target::Held { win: "@1".into(), session: "main".into() };
+        a.pause_phase = Some(pause::Phase::Stopping { stopped: 1, n: 2, working: vec![], held: vec![held] });
+        a.show(frame(&a), settled);
+        a.handle(b"\x1b[<0;5;1M\x1b[<0;5;1m");
+        assert_eq!(a.last_act, None);
+        assert_eq!(a.card_at(8, 1), None);
+        a.handle(b"\x1b[<0;9;2M\x1b[<0;9;2m");
+        assert_eq!(a.last_act, Some(tab.clone()));
+        // The race: the agent stops, the banner settles, and its resume
+        // row lands where the held row was. A click there just then was
+        // aimed at the held row: it resumes nothing.
+        a.last_act = None;
+        a.pause_phase = Some(pause::Phase::Safe { labels: vec!["One".into(), "P0a".into()] });
+        a.show(frame(&a), Instant::now());
+        assert_eq!(a.shown.target(8, 1), Some(&Target::Resume));
+        a.handle(b"\x1b[<0;9;2M\x1b[<0;9;2m");
+        assert_eq!(a.last_act, None);
+        assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("that card just moved · click again"));
+        // Likewise a held row that only just appeared.
+        a.pause_phase = Some(pause::Phase::Stopping { stopped: 1, n: 2, working: vec![], held: a_held() });
+        a.show(frame(&a), Instant::now());
+        a.handle(b"\x1b[<0;9;2M\x1b[<0;9;2m");
+        assert_eq!(a.last_act, None);
+    }
+
+    fn a_held() -> Vec<pause::Held> {
+        vec![pause::Held { label: "P0a".into(), window_id: "@1".into(), session: "main".into(), ..Default::default() }]
     }
 
     #[test]

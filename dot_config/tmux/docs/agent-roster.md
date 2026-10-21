@@ -1372,6 +1372,46 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   and ready rows click to `agent-pause.py resume <client>` through
   `run-shell -b` (prefix P's own shape; never `toggle`); the others do
   nothing.
+
+  A target whose PAUSE tmux-mcp HELD (`"result": "held"` on a
+  `progress.json` or `paused.json` target) and whose `window_id` still
+  works is `pause::Held`: pausing (sending or stopping) lists it apart,
+  never in `still working` (that row goes when only held agents are
+  left), with its session and letter from the RAW snapshot (`@agent_key`,
+  none in a hidden session). The PAUSE goes out urgent (through a draft),
+  so tmux-mcp holds it only while it cannot read the prompt box; the
+  reason is the `<why>` of the target's `detail` (`held for @h (…):
+  <why>. It will be delivered…`, `pause::held_why`), and `pause::ask` maps
+  tmux-mcp's wording to what to do: copy mode → `leave copy mode`, no
+  prompt box on screen → `show its prompt`, the box without the cursor →
+  `close its dialog`, a permission or question prompt → `answer its
+  prompt`, a draft → `clear its prompt box`; any other reason is shown as
+  it is (dim `sub`), none at all → `look at its tab`. `paused.json` keeps
+  `held` until the resume, so `pause::Reader` remembers every held window
+  it has seen existing and NOT working (per `paused_at`, per press):
+  delivered, it is never held again in that pause (an agent woken while
+  still paused is just `still working`); a window missing from the
+  snapshot proves nothing. Each held agent gets a row of its own under the
+  banner, on the banner's violet tint, its rail and `✎` in `yellow` (the
+  "needs you" colour: the one thing to do there; never peach, ⌥W's armed
+  caps). `waiting:` goes first when short of room, then a long title gives
+  way to the agent's letter cap, then the title is cut. Up to 3 rows from
+  16 rows tall (past 3: two and `+N more  look at their tabs`), one from
+  10 (`N agents waiting` when several), none below. A click jumps to that
+  agent's tab (`Target::Held`: the card's jump, but never a park or pin
+  from the banner; `+N more` to the first not listed). Once its window
+  stops working the row goes and the banner settles like any other.
+  `Target::Held` and `Target::Resume` are guarded like the answer chips
+  (`sidebar.rs` `guarded`, 400 ms `SETTLE`): when the held agent stops,
+  the settled banner's resume row lands where the held row was, and a
+  click aimed at the held row must not resume everyone.
+
+  ```
+   ▌ ⠹ PAUSING  1 of 2 stopped
+   ▌ ✎ P0a  waiting: leave copy mode      44 cols
+   ▌ ✎ P0a  leave copy mode               34 cols
+   ▌ ✎ [k] clear its prompt box           34 cols, a long title
+  ```
 - **Status jobs** (`status::Keeper`): with the line hidden tmux runs none of
   status-right's `#()` jobs, and two of them must keep running:
   continuum's autosave (`continuum_save.sh`) and the usage tick

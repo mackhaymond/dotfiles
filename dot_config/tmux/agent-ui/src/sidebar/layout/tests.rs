@@ -2601,8 +2601,8 @@ fn an_empty_second_line_has_a_placeholder() {
 fn phases() -> Vec<Phase> {
     let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     vec![
-        Phase::Sending { done: 2, n: 5, labels: l(&["Tmux Agent Sidebar", "Island resize spring"]) },
-        Phase::Stopping { stopped: 3, n: 5, working: l(&["Tmux Agent Sidebar", "Census AX sweep"]) },
+        Phase::Sending { done: 2, n: 5, labels: l(&["Tmux Agent Sidebar", "Island resize spring"]), held: vec![] },
+        Phase::Stopping { stopped: 3, n: 5, working: l(&["Tmux Agent Sidebar", "Census AX sweep"]), held: vec![] },
         Phase::Safe { labels: l(&["Tmux Agent Sidebar", "Island resize spring"]) },
         Phase::Ready { labels: l(&["Tmux Agent Sidebar", "Island resize spring", "Census AX sweep"]) },
         Phase::Resuming { n: 3, labels: l(&["Tmux Agent Sidebar"]) },
@@ -2873,6 +2873,137 @@ fn pause_banner_is_violet_then_cyan_never_green() {
     assert!(f.rows[0].segs.contains(&block(" ↻ 3 ready ", "crust", "cyan")), "{:?}", f.rows[0].segs);
     let f = layout(&v, 34, 58, &Opts { pause: Some(phases()[0].clone()), ..Opts::default() });
     assert!(f.rows[0].segs.iter().any(|s| s.text.contains("PAUSING") && s.fg == Ink::Pal("dimviolet")), "{:?}", f.rows[0].segs);
+}
+
+/// tmux-mcp's reason for holding a PAUSE (server.ts `readBox`): copy mode.
+const COPY: &str = "the pane is in copy mode";
+
+/// A held agent in the snapshot's `main`: `label`, window `win`, letter
+/// `c`, held for copy mode.
+fn held(label: &str, win: &str, c: Option<char>) -> Held {
+    Held { label: label.into(), window_id: win.into(), why: COPY.into(), session: "main".into(), letter: c }
+}
+
+/// Stopping, `working` still working and `held` held by tmux-mcp.
+fn holding(working: &[&str], held: Vec<Held>) -> Phase {
+    let n = working.len() + held.len() + 1;
+    Phase::Stopping { stopped: 1, n, working: working.iter().map(|s| s.to_string()).collect(), held }
+}
+
+/// An agent whose PAUSE tmux-mcp holds gets its own row under the banner:
+/// on the banner's violet tint, a `yellow` rail and `✎` (the one thing to
+/// do there), its title and `waiting: <what to do>` from tmux-mcp's reason
+/// (copy mode: `leave copy mode`); at 34 columns `waiting:` goes, and a
+/// title too long gives way to its letter's key-cap. A click jumps to its
+/// tab ([`Target::Held`]). It is never also in `still working` (that row
+/// goes when only held agents are left).
+#[test]
+fn a_held_pause_gets_its_own_row() {
+    let v = lettered(quiet());
+    let p0a = held("P0a", "@9", Some('k'));
+    let p = holding(&[], vec![p0a.clone()]);
+    for w in [34u16, 44] {
+        let f = layout(&v, w, 58, &Opts { pause: Some(p.clone()), ..with_bar(demo_bar()) });
+        let t = texts(&f);
+        let ctx = format!("{w}: {t:#?}");
+        // The banner's row, then the held row; no `still working` row.
+        assert_eq!(f.pause, 0..2, "{ctx}");
+        assert!(t[0].contains("PAUSING  1 of 2 stopped") && !t.iter().any(|l| l.contains("still working")), "{ctx}");
+        let r = &f.rows[1];
+        assert_eq!((dwidth(&r.text()), r.bg), (usize::from(w), Some(pause_bg(&p))), "{ctx}");
+        assert_eq!(r.segs[1], seg("▌", HELD_HUE), "{ctx}");
+        assert!(r.segs.contains(&bold(HELD_GLYPH, HELD_HUE)), "{ctx}");
+        let want = if w == 44 { " ▌ ✎ P0a  waiting: leave copy mode" } else { " ▌ ✎ P0a  leave copy mode" };
+        assert_eq!(t[1].trim_end(), want, "{ctx}");
+        assert!(r.segs.contains(&seg("leave copy mode", "text")), "{ctx}");
+        assert!(!r.anim, "{ctx}");
+        // Anywhere on it: that agent's tab.
+        let tab = Target::Held { win: "@9".into(), session: "main".into() };
+        assert!((0..w).all(|x| f.target(x, 1) == Some(&tab)), "{ctx}");
+        // Never peach (⌥W's armed caps), never green; the panel follows.
+        assert!(r.segs.iter().all(|s| ![Ink::Pal("peach"), Ink::Pal("green")].contains(&s.fg)), "{ctx}");
+        assert!(f.card.start == 2, "{ctx}");
+    }
+    // Each reason, what to do about it (34 columns).
+    let row34 = |h: Held| texts(&layout(&v, 34, 58, &Opts { pause: Some(holding(&[], vec![h])), ..Opts::default() }))[1].trim_end().to_string();
+    for (why, want) in [
+        ("no prompt box on screen (a dialog or menu may be up)", " ▌ ✎ P0a  show its prompt"),
+        ("the prompt box does not have the cursor (a dialog or menu may be up)", " ▌ ✎ P0a  close its dialog"),
+        ("a permission or question prompt is up", " ▌ ✎ P0a  answer its prompt"),
+        ("its prompt box has a half-written draft in it", " ▌ ✎ P0a  clear its prompt box"),
+        // A reason it does not know: the reason itself (dim, cut).
+        ("earlier messages to it are still held", " ▌ ✎ P0a  earlier messages to i…"),
+        // None at all: look.
+        ("", " ▌ ✎ P0a  look at its tab"),
+    ] {
+        assert_eq!(row34(Held { why: why.into(), ..p0a.clone() }), want, "{why}");
+    }
+    let f = layout(&v, 44, 58, &Opts { pause: Some(holding(&[], vec![Held { why: "could not read the cursor".into(), ..p0a.clone() }])), ..Opts::default() });
+    assert!(f.rows[1].segs.contains(&seg("could not read the cursor", "sub")), "{:?}", f.rows[1].segs);
+    // A long title: cut (`waiting:` goes first), at 34 its letter when what
+    // to do is long; no letter, the title cut.
+    let long = |c: Option<char>, why: &str| holding(&[], vec![Held { why: why.into(), ..held("Tmux Agent Sidebar redesign", "@9", c) }]);
+    let t = texts(&layout(&v, 44, 58, &Opts { pause: Some(long(Some('k'), COPY)), ..Opts::default() }));
+    assert_eq!(t[1].trim_end(), " ▌ ✎ Tmux Agent…  waiting: leave copy mode", "{t:#?}");
+    let t = texts(&layout(&v, 34, 58, &Opts { pause: Some(long(Some('k'), COPY)), ..Opts::default() }));
+    assert_eq!(t[1].trim_end(), " ▌ ✎ Tmux Agen…  leave copy mode", "{t:#?}");
+    let draft = "its prompt box has a half-written draft in it";
+    let f = layout(&v, 34, 58, &Opts { pause: Some(long(Some('k'), draft)), ..Opts::default() });
+    assert_eq!(texts(&f)[1].trim_end(), " ▌ ✎  k  clear its prompt box", "{:#?}", texts(&f));
+    assert!(f.rows[1].segs.iter().any(|s| s.text == " k " && s.bold && s.bg.is_some()), "{:?}", f.rows[1].segs);
+    let t = texts(&layout(&v, 34, 58, &Opts { pause: Some(long(None, draft)), ..Opts::default() }));
+    assert_eq!(t[1].trim_end(), " ▌ ✎ Tmux…  clear its prompt box", "{t:#?}");
+    // Others still working keep their row, above the held one.
+    let both = holding(&["Census AX sweep"], vec![p0a.clone()]);
+    let t = texts(&layout(&v, 44, 58, &Opts { pause: Some(both), ..Opts::default() }));
+    assert!(t[1].contains("still working  Census AX sweep") && !t[1].contains("P0a") && t[2].contains("✎ P0a"), "{t:#?}");
+    // While the press is still in flight too.
+    let sending = Phase::Sending { done: 2, n: 2, labels: vec!["P0a".into(), "Two".into()], held: vec![p0a.clone()] };
+    let f = layout(&v, 34, 58, &Opts { pause: Some(sending), ..Opts::default() });
+    assert_eq!(f.pause, 0..3, "{:#?}", texts(&f));
+    assert!(texts(&f)[2].contains("✎ P0a  leave copy mode"), "{:#?}", texts(&f));
+    // A window the snapshot could not place: the row says it, no jump.
+    let lost = holding(&[], vec![Held { session: String::new(), ..p0a.clone() }]);
+    let f = layout(&v, 44, 58, &Opts { pause: Some(lost), ..Opts::default() });
+    assert!(texts(&f)[1].contains("✎ P0a") && (0..44).all(|x| f.target(x, 1).is_none()), "{:#?}", texts(&f));
+    // Once it stops (safe, nothing held), the row is gone: the banner
+    // settles like any other.
+    let f = layout(&v, 44, 58, &Opts { pause: Some(Phase::Safe { labels: vec!["P0a".into()] }), ..Opts::default() });
+    assert!(!texts(&f).iter().any(|l| l.contains(HELD_GLYPH)) && f.pause == (0..2), "{:#?}", texts(&f));
+}
+
+/// One row per held agent, at most [`HELD_MAX`]: past it the last says
+/// how many more (and jumps to the first of them). Short frames keep one
+/// (a count when several), very short ones none; every frame still exactly
+/// its height.
+#[test]
+fn held_rows_are_capped() {
+    let v = lettered(quiet());
+    let many: Vec<Held> = (0..5).map(|i| held(&format!("Agent {i}"), &format!("@{}", 20 + i), None)).collect();
+    let three = holding(&[], many[..3].to_vec());
+    let t = texts(&layout(&v, 44, 58, &Opts { pause: Some(three), ..Opts::default() }));
+    assert!((1..4).all(|y| t[y].contains(&format!("✎ Agent {}", y - 1))), "{t:#?}");
+    let five = holding(&[], many.clone());
+    let f = layout(&v, 44, 58, &Opts { pause: Some(five.clone()), ..Opts::default() });
+    let t = texts(&f);
+    assert_eq!(f.pause, 0..4, "{t:#?}");
+    assert!(t[1].contains("✎ Agent 0") && t[2].contains("✎ Agent 1"), "{t:#?}");
+    assert!(t[3].contains("✎ +3 more  look at their tabs"), "{t:#?}");
+    assert_eq!(f.target(5, 3), Some(&Target::Held { win: "@22".into(), session: "main".into() }));
+    // 10..16 rows: the banner's one row and one held row (a count of all).
+    for h in [10u16, 15] {
+        let f = layout(&v, 34, h, &Opts { pause: Some(five.clone()), ..Opts::default() });
+        let t = texts(&f);
+        assert_eq!((f.pause.clone(), f.rows.len()), (0..2, usize::from(h)), "{t:#?}");
+        assert!(t[1].contains("✎ 5 agents waiting"), "{t:#?}");
+        let one = holding(&[], many[..1].to_vec());
+        assert!(texts(&layout(&v, 34, h, &Opts { pause: Some(one), ..Opts::default() }))[1].contains("✎ Agent 0  leave copy mode"));
+    }
+    for h in 2u16..10 {
+        let f = layout(&v, 34, h, &Opts { pause: Some(five.clone()), ..Opts::default() });
+        assert!(f.rows.len() == usize::from(h) && !texts(&f).iter().any(|l| l.contains(HELD_GLYPH)), "{h}: {:#?}", texts(&f));
+    }
+    assert_eq!((held_lines(58), held_lines(16), held_lines(12), held_lines(9)), (HELD_MAX, HELD_MAX, 1, 0));
 }
 
 mod answer;

@@ -223,7 +223,7 @@
 //! ([`band`]: apart from every card shade), the stash selection (mauve 18%),
 //! toasts (`surface0`), and the solid chips. Dim text is `overlay2`.
 
-use super::pause::Phase;
+use super::pause::{Held, Phase};
 use super::status::{ink_on, ink_rgb, tmux_colour, Bar, Kind, Toast, ToastId, Usage};
 use crate::actions::watcher_problem;
 use crate::model::{Cat, Counts, Flag, PAUSED_GLYPH, PAUSED_HUE};
@@ -542,6 +542,11 @@ pub enum Target {
     /// A card's diff badge ([`extras`]): that window's diff popup,
     /// `agent-ui diff <win> --client <client>` (nothing when it fails).
     Diff(String),
+    /// A pause banner's held row ([`held_rows`]): that agent's window, as
+    /// [`Target::Go`], but never parked or pinned from the banner, and
+    /// trusted only once settled under the pointer (when the agent stops,
+    /// the banner settles and a resume row can land where the row was).
+    Held { win: String, session: String },
 }
 
 /// One screen line.
@@ -1341,8 +1346,10 @@ fn agents_n(n: usize) -> String {
 /// nothing (a press is in flight, or agents are still stopping). Ready
 /// always says how to resume (Mack asked for the prefix P hint), so at the
 /// usual 34 columns the hint takes the second row and the labels the rest
-/// of the first.
-fn pause_rows(p: &Phase, cx: Cx, lines: usize) -> Vec<Row> {
+/// of the first. Agents whose PAUSE tmux-mcp holds get up to
+/// `held` rows of their own under it ([`held_rows`]), and leave the
+/// `still working` row (gone when they are the only ones still working).
+fn pause_rows(p: &Phase, cx: Cx, lines: usize, held: usize) -> Vec<Row> {
     let w = cx.w;
     if lines == 0 || w == 0 {
         return Vec::new();
@@ -1367,9 +1374,11 @@ fn pause_rows(p: &Phase, cx: Cx, lines: usize) -> Vec<Row> {
         return rows.into_iter().map(|r| r.click(w, Target::Resume)).collect();
     }
     let (word, rest, detail): (String, String, Vec<Seg>) = match p {
-        Phase::Sending { done, n, labels } => (format!("{spin} PAUSING"), format!("sending {done} of {n}"), vec![names(labels)]),
+        Phase::Sending { done, n, labels, .. } => (format!("{spin} PAUSING"), format!("sending {done} of {n}"), vec![names(labels)]),
         Phase::Resuming { n, labels } => (format!("{spin} RESUMING"), format!("{}…", agents_n(*n)), vec![names(labels)]),
-        Phase::Stopping { stopped, n, working } => (
+        // (Only the held still working: their own rows say who, and why.)
+        Phase::Stopping { stopped, n, working, .. } if working.is_empty() => (format!("{spin} PAUSING"), format!("{stopped} of {n} stopped"), vec![]),
+        Phase::Stopping { stopped, n, working, .. } => (
             format!("{spin} PAUSING"),
             format!("{stopped} of {n} stopped"),
             vec![seg("still working  ", dimc), seg(working.join(", "), "sub")],
@@ -1386,7 +1395,8 @@ fn pause_rows(p: &Phase, cx: Cx, lines: usize) -> Vec<Row> {
         rows.push(tile_row(w, bg, l2, vec![seg(" ", "text")]));
     }
     let busy = p.busy();
-    rows.into_iter()
+    let mut rows: Vec<Row> = rows
+        .into_iter()
         .map(|r| {
             let r = Row { anim: busy, ..r };
             if p.clickable() {
@@ -1395,7 +1405,125 @@ fn pause_rows(p: &Phase, cx: Cx, lines: usize) -> Vec<Row> {
                 r
             }
         })
-        .collect()
+        .collect();
+    rows.extend(held_rows(p.held(), w, bg, held));
+    rows
+}
+
+/// A held row's accent ([`held_rows`]): `yellow`, the sidebar's "needs
+/// you" colour (`◉ asks`, NEEDS YOU), because the row asks Mack to act
+/// (leave copy mode, close a dialog, …).
+/// Never `peach` (⌥W's armed caps), never green.
+pub const HELD_HUE: Hue = "yellow";
+
+/// A held row's glyph: a pencil, the PAUSE waiting to be typed into the
+/// agent's prompt box.
+pub const HELD_GLYPH: &str = "✎";
+
+/// At most this many held rows under the banner; past it the last says
+/// how many more.
+pub const HELD_MAX: usize = 3;
+
+/// How many held rows a frame `h` tall gives the banner: up to
+/// [`HELD_MAX`] where it has its two rows, one from 10 rows tall (the
+/// banner's one row and the sections keep room), none below.
+pub fn held_lines(h: usize) -> usize {
+    match h {
+        16.. => HELD_MAX,
+        10.. => 1,
+        _ => 0,
+    }
+}
+
+/// A held row's longer form, before what it asks.
+const HELD_WAIT: &str = "waiting: ";
+
+/// What a held row asks when tmux-mcp gave no reason.
+pub const HELD_LOOK: &str = "look at its tab";
+
+/// What a held row says after its title, and whether it is an action:
+/// what to do about tmux-mcp's reason ([`super::pause::ask`]: `leave copy
+/// mode`, `close its dialog`, …), else the reason itself (not an action:
+/// `sub`), else [`HELD_LOOK`].
+fn held_ask(h: &Held) -> (String, bool) {
+    match super::pause::ask(&h.why) {
+        Some(a) => (a.to_string(), true),
+        None if !h.why.is_empty() => (h.why.clone(), false),
+        None => (HELD_LOOK.to_string(), true),
+    }
+}
+
+/// The banner's HELD rows (`pause::Held`: the PAUSE tmux-mcp holds because
+/// it cannot read that agent's prompt box, so it works on), under its own
+/// rows, on its tint: one per agent, at most `room` (the last says `+N
+/// more` when they do not fit). The banner's violet tile carries them, but
+/// the rail and the `✎` are [`HELD_HUE`]: the one thing on the banner Mack
+/// has to do. A click jumps to that agent's tab ([`Target::Held`], as its
+/// card's; `+N more` to the first not listed).
+///
+/// ```text
+///  ▌ ⠹ PAUSING  1 of 2 stopped           dim violet on 9%
+///  ▌ ✎ P0a  waiting: leave copy mode          yellow rail and ✎
+///  ▌ ✎ [k] leave copy mode                    a long title: its letter
+/// ```
+fn held_rows(held: &[Held], w: usize, bg: Ink, room: usize) -> Vec<Row> {
+    if room == 0 || held.is_empty() {
+        return Vec::new();
+    }
+    let shown = if held.len() <= room { held.len() } else { room - 1 };
+    let mut rows: Vec<Row> = held[..shown].iter().map(|h| held_row(h, w, bg)).collect();
+    if let Some(first) = held.get(shown) {
+        let k = held.len() - shown;
+        let who = if shown == 0 { format!("{k} agents waiting") } else { format!("+{k} more") };
+        let l = vec![seg(RAIL_HEAVY, HELD_HUE), seg(" ", "text"), bold(HELD_GLYPH, HELD_HUE), seg(" ", "text"), bold(who, "text"), seg("  look at their tabs", dim(true))];
+        rows.push(held_click(tile_row(w, bg, l, vec![seg(" ", "text")]), w, first));
+    }
+    rows
+}
+
+/// A held row clicks through to its agent's window, when the snapshot
+/// placed it.
+fn held_click(row: Row, w: usize, h: &Held) -> Row {
+    if h.session.is_empty() || h.window_id.is_empty() {
+        return row;
+    }
+    row.click(w, Target::Held { win: h.window_id.clone(), session: h.session.clone() })
+}
+
+/// One held agent's row ([`held_rows`]): `✎ <title>  waiting: <ask>`
+/// ([`held_ask`]); short of room the `waiting:` goes, then the title gives
+/// way to the agent's letter (its key-cap, as on its card), then the title
+/// is cut.
+fn held_row(h: &Held, w: usize, bg: Ink) -> Row {
+    let dimc = dim(true);
+    // The rail, a pad, the glyph, a pad; a pad at the right.
+    let room = inner(w).saturating_sub(5);
+    let tw = dwidth(&h.label);
+    let (said, act) = held_ask(h);
+    let ask = || seg(said.clone(), if act { "text" } else { "sub" });
+    let title = |n: usize| bold(clip(&h.label, n), "text");
+    let need = |extra: &str| dwidth(extra) + 2 + dwidth(&said);
+    // The title whole, or at least `min` cells of it, beside `extra`.
+    let fits = |extra: &str, min: usize| {
+        let left = room.saturating_sub(need(extra));
+        (room >= need(extra) && (tw <= left || left >= min)).then_some(left.min(tw))
+    };
+    let body = if let Some(n) = fits(HELD_WAIT, 10) {
+        vec![title(n), seg("  ", "text"), seg(HELD_WAIT, dimc), ask()]
+    } else if let Some(n) = fits("", 8) {
+        vec![title(n), seg("  ", "text"), ask()]
+    } else if let Some(c) = h.letter.filter(|_| room >= BADGE_W + 1 + dwidth(&said)) {
+        vec![block(format!(" {c} "), "text", over(Ink::Pal(HELD_HUE), CAP_TINT, bg)), seg(" ", "text"), ask()]
+    } else {
+        // What it asks whole, beside a few cells of title; one too long
+        // for that (a reason, not an action) is cut by the row instead.
+        let left = room.saturating_sub(need(""));
+        let n = tw.min(if left >= 4 { left } else { 8.min(room) }).max(1);
+        vec![title(n), seg("  ", "text"), ask()]
+    };
+    let mut l = vec![seg(RAIL_HEAVY, HELD_HUE), seg(" ", "text"), bold(HELD_GLYPH, HELD_HUE), seg(" ", "text")];
+    l.extend(body);
+    held_click(tile_row(w, bg, l, vec![seg(" ", "text")]), w, h)
 }
 
 // ---------------------------------------------------------------- shells
@@ -3259,7 +3387,7 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     let bar = &opts.bar;
     // The pause banner first, at the very top: the panel under it is laid
     // out in the rows it leaves, and the toasts float under it, never over.
-    let banner = opts.pause.as_ref().map_or_else(Vec::new, |p| pause_rows(p, cx, pause_lines(h)));
+    let banner = opts.pause.as_ref().map_or_else(Vec::new, |p| pause_rows(p, cx, pause_lines(h), held_lines(h)));
     let nb = banner.len();
     let Top { rows: top, status, card, keep } = top_rows(view, bar, w, h - nb, cx.now);
     let shift = |r: Range<usize>| r.start + nb..r.end + nb;

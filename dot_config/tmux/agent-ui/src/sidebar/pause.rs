@@ -19,6 +19,19 @@
 //! | safe | `paused.json` has targets, none working, no wake since |
 //! | (none) | anything else |
 //!
+//! A target whose PAUSE tmux-mcp HELD (`"result": "held"` in either file)
+//! and whose window still works is [`Held`]: sending and stopping list it
+//! apart ([`Phase::held`]), with tmux-mcp's reason (its `detail`, `held
+//! for @h (…): <why>. It will be delivered…`: [`held_why`]) and where its
+//! window lives in the snapshot, so the banner can say what to do
+//! ([`ask`]) and jump there. The PAUSE goes out urgent, through a draft,
+//! so it is held only while tmux-mcp cannot read the prompt box: copy
+//! mode, a dialog or menu up, no box on screen. Once its window stops
+//! working it is just stopped, and stays so for that pause: `paused.json`
+//! keeps `held` until the resume, so the [`Reader`] remembers each held
+//! window it has seen stopped (per `paused_at`, per press) and never holds
+//! it again (an agent woken while paused is just still working).
+//!
 //! A press is in flight while it is not done, its `<ms>-<pid>` process
 //! lives, it started after the last boot and less than [`PRESS_MAX_AGE`]
 //! ago: a toggle killed mid-delivery never holds the banner, even once its
@@ -33,7 +46,7 @@
 
 use crate::json::{self, Value};
 use crate::tmux::Snapshot;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Where the pause sits, as the banner says it.
@@ -41,18 +54,46 @@ use std::path::PathBuf;
 pub enum Phase {
     /// A resume press in flight: `n` agents being told to resume.
     Resuming { n: usize, labels: Vec<String> },
-    /// A pause press in flight: `done` of `n` deliveries landed.
-    Sending { done: usize, n: usize, labels: Vec<String> },
+    /// A pause press in flight: `done` of `n` deliveries landed (a held one
+    /// counts: it is delivered once the box is clear); `held` still work.
+    Sending { done: usize, n: usize, labels: Vec<String>, held: Vec<Held> },
     /// Paused, and the machine woke (or booted) since: a click (or prefix
     /// P) resumes.
     Ready { labels: Vec<String> },
-    /// Paused, `stopped` of `n` agents stopped; `working` still are.
-    Stopping { stopped: usize, n: usize, working: Vec<String> },
+    /// Paused, `stopped` of `n` agents stopped; `working` still are, and
+    /// `held` still are because tmux-mcp holds their PAUSE (never in
+    /// `working` too).
+    Stopping { stopped: usize, n: usize, working: Vec<String>, held: Vec<Held> },
     /// Paused, nothing working, no wake since: the lid can close.
     Safe { labels: Vec<String> },
 }
 
+/// A target whose PAUSE tmux-mcp holds (module docs) while its window
+/// still works.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Held {
+    pub label: String,
+    pub window_id: String,
+    /// tmux-mcp's reason ([`held_why`]; "" when its detail did not say).
+    pub why: String,
+    /// The window's session in the snapshot ([`Windows::places`]): where a
+    /// click jumps. Empty when the snapshot has no such window.
+    pub session: String,
+    /// Its lifetime letter (`@agent_key`), when it is listed (not parked,
+    /// not in a hidden session).
+    pub letter: Option<char>,
+}
+
 impl Phase {
+    /// The held targets ([`Held`]): only a pause press in flight or agents
+    /// still stopping have any.
+    pub fn held(&self) -> &[Held] {
+        match self {
+            Phase::Sending { held, .. } | Phase::Stopping { held, .. } => held,
+            _ => &[],
+        }
+    }
+
     /// A click on the banner resumes (`agent-pause.py resume`): only once
     /// the pause is settled (safe, or ready after a wake).
     pub fn clickable(&self) -> bool {
@@ -91,9 +132,11 @@ pub struct Progress {
     /// `pause` or `resume` (anything else is ignored).
     pub mode: String,
     pub done: bool,
-    /// The rows the press messages, (label, result); `sending` until its
-    /// delivery lands. The extras ([`extra`]) are left out.
-    pub targets: Vec<(String, String)>,
+    /// The rows the press messages; each `sending` until its delivery
+    /// lands. The extras ([`extra`]) are left out.
+    pub targets: Vec<Sent>,
+    /// `press` as written (`<ms>-<pid>`): which press this is.
+    pub press: String,
     /// When the press started (its `press` is `<ms>-<pid>`), epoch seconds.
     pub started: Option<f64>,
     /// The press's process, when it says.
@@ -103,11 +146,29 @@ pub struct Progress {
     pub alive: bool,
 }
 
+/// One row a press messages (`progress.json`'s `targets`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Sent {
+    pub label: String,
+    /// `sending`, `sent`, `held`, `failed`, `unknown`, ...
+    pub result: String,
+    pub window_id: String,
+    /// `result` is `held`, and the [`Reader`] has not seen its window stop.
+    pub held: bool,
+    /// tmux-mcp's reason ([`held_why`]).
+    pub why: String,
+}
+
 /// One saved agent of `paused.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Saved {
     pub window_id: String,
     pub label: String,
+    /// Its PAUSE was held (`"result": "held"`), and the [`Reader`] has not
+    /// seen its window stop since.
+    pub held: bool,
+    /// tmux-mcp's reason ([`held_why`]).
+    pub why: String,
 }
 
 /// `paused.json`, as far as the banner needs it.
@@ -116,6 +177,8 @@ pub struct Paused {
     /// `paused_at` as epoch seconds; None when missing or unreadable (then
     /// no wake can be compared with it, and the phase never says ready).
     pub paused_at: Option<f64>,
+    /// `paused_at` as written: which pause this is (the [`Reader`]'s memo).
+    pub stamp: String,
     pub targets: Vec<Saved>,
 }
 
@@ -137,6 +200,10 @@ pub struct Windows {
     pub exists: HashSet<String>,
     /// When the tmux server started (`#{start_time}`), if a client row said.
     pub server_start: Option<f64>,
+    /// Every window by id → (its session, its letter when listed): where a
+    /// [`Held`] row jumps. A window linked into two sessions: a shown
+    /// session's row first.
+    pub places: HashMap<String, (String, Option<char>)>,
 }
 
 /// A row's label: `label` (the agent's `@agent_summary`), else its
@@ -145,6 +212,45 @@ fn label_of(t: &Value) -> String {
     let pick = |k: &str| t.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
     let raw = pick("label").or_else(|| pick("location")).unwrap_or("agent");
     crate::text::sanitize(raw)
+}
+
+/// A row's string field `k` ("" when missing or not a string).
+fn str_of(t: &Value, k: &str) -> String {
+    t.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// A held row's reason, from its `detail` (message_agent's reply line,
+/// tmux-mcp server.ts `held for @<handle> (<loc>, pane <id>): <why>. It
+/// will be delivered once…`): `<why>`, one line; "" for any other detail.
+pub fn held_why(detail: &str) -> String {
+    let Some(rest) = detail.trim().strip_prefix("held for").and_then(|r| r.split_once("): ")).map(|(_, w)| w) else {
+        return String::new();
+    };
+    let why = rest.split(". It will be delivered").next().unwrap_or("");
+    crate::text::sanitize(why.trim().trim_end_matches('.').trim())
+}
+
+/// What Mack can do about a held PAUSE, from tmux-mcp's reason (its
+/// `readBox` and `deliverGuarded` wording): leave copy mode, answer or
+/// close what is over the box, bring the box back, clear a draft. None for
+/// a reason it does not know (the banner shows the reason itself).
+pub fn ask(why: &str) -> Option<&'static str> {
+    let w = why.to_ascii_lowercase();
+    Some(if w.contains("copy mode") {
+        "leave copy mode"
+    } else if w.contains("permission or question prompt") {
+        "answer its prompt"
+    } else if w.contains("does not have the cursor") {
+        "close its dialog"
+    } else if w.starts_with("no prompt box") {
+        "show its prompt"
+    } else if w.contains("draft") {
+        "clear its prompt box"
+    } else if w.contains("dialog") || w.contains("menu") {
+        "close its dialog"
+    } else {
+        return None;
+    })
 }
 
 /// `progress.json`'s text → [`Progress`] (`alive` false: the reader sets
@@ -164,13 +270,17 @@ pub fn parse_progress(text: &str) -> Option<Progress> {
         .unwrap_or(&[])
         .iter()
         .filter(|t| matches!(t, Value::Obj(_)))
-        .map(|t| (label_of(t), t.get("result").and_then(Value::as_str).unwrap_or("").to_string()))
-        .filter(|(_, r)| !extra(&mode, r))
+        .map(|t| {
+            let result = str_of(t, "result");
+            Sent { label: label_of(t), held: result == "held", result, window_id: str_of(t, "window_id"), why: held_why(&str_of(t, "detail")) }
+        })
+        .filter(|s| !extra(&mode, &s.result))
         .collect();
+    let stamp = str_of(&v, "press");
     let press = v.get("press").and_then(Value::as_str).and_then(|p| p.split_once('-'));
     let started = press.and_then(|(ms, _)| ms.parse::<u64>().ok()).map(|ms| ms as f64 / 1000.0);
     let pid = press.and_then(|(_, pid)| pid.parse().ok());
-    Some(Progress { mode, done, targets, started, pid, alive: false })
+    Some(Progress { mode, done, targets, press: stamp, started, pid, alive: false })
 }
 
 /// `paused.json`'s text → [`Paused`]. None unless it is an object whose
@@ -182,10 +292,10 @@ pub fn parse_paused(text: &str) -> Option<Paused> {
     let targets = targets
         .iter()
         .filter(|t| matches!(t, Value::Obj(_)))
-        .map(|t| Saved { window_id: t.get("window_id").and_then(Value::as_str).unwrap_or("").to_string(), label: label_of(t) })
+        .map(|t| Saved { window_id: str_of(t, "window_id"), label: label_of(t), held: str_of(t, "result") == "held", why: held_why(&str_of(t, "detail")) })
         .collect();
     let paused_at = v.get("paused_at").and_then(Value::as_str).and_then(parse_iso);
-    Some(Paused { paused_at, targets })
+    Some(Paused { paused_at, stamp: str_of(&v, "paused_at"), targets })
 }
 
 /// Days from 1970-01-01 to a civil date (Howard Hinnant's algorithm).
@@ -250,15 +360,58 @@ pub fn parse_iso(s: &str) -> Option<f64> {
 
 /// The snapshot's [`Windows`]: the WORKING ones (the script's own rule:
 /// `@agent_state` running, or `@agent_workflow` / `@agent_cua` set), every
-/// window, by id, and the server's start (its first client row's
-/// `#{start_time}`). From the RAW snapshot (before the sidebar blanks its
-/// spaces' homes): the script reads the options as tmux holds them.
+/// window, by id, the server's start (its first client row's
+/// `#{start_time}`) and where each window lives. From the RAW snapshot
+/// (before the sidebar blanks its spaces' homes): the script reads the
+/// options as tmux holds them.
 pub fn windows(snap: &Snapshot) -> Windows {
     let rows = &snap.windows;
     let working = rows.iter().filter(|w| w.state == "running" || !w.workflow.is_empty() || !w.cua.is_empty()).map(|w| w.id.clone()).collect();
     let exists = rows.iter().map(|w| w.id.clone()).collect();
     let server_start = snap.clients.first().and_then(|c| c.status.server_start.trim().parse::<f64>().ok()).filter(|&s| s > 0.0);
-    Windows { working, exists, server_start }
+    // A hidden session (the stash, `agents`) letters nothing: a parked
+    // window's stale `@agent_key` may name another window by now.
+    let mut places: HashMap<String, (String, Option<char>)> = HashMap::new();
+    for w in rows.iter().filter(|w| !w.space_hidden).chain(rows.iter().filter(|w| w.space_hidden)) {
+        let letter = (!w.space_hidden).then(|| crate::menu::letters::parse_key(&w.key)).flatten();
+        places.entry(w.id.clone()).or_insert((w.session.clone(), letter));
+    }
+    Windows { working, exists, server_start, places }
+}
+
+/// A held target as the banner lists it: its label, window and reason,
+/// with where the window lives.
+fn held_of(label: &str, window_id: &str, why: &str, win: &Windows) -> Held {
+    let (session, letter) = win.places.get(window_id).cloned().unwrap_or_default();
+    Held { label: label.to_string(), window_id: window_id.to_string(), why: why.to_string(), session, letter }
+}
+
+/// The held windows the [`Reader`] has seen stopped, for one pause or press
+/// (`key`: `paused_at`, `press`): `paused.json` says `held` until the
+/// resume, but once the agent stopped its PAUSE was delivered.
+#[derive(Debug, Default)]
+struct Delivered {
+    key: String,
+    windows: HashSet<String>,
+}
+
+impl Delivered {
+    /// For the pause or press `key` (another one starts afresh): note every
+    /// held target whose window exists and does not work (a window missing
+    /// from the snapshot proves nothing: no snapshot yet, or it is gone and
+    /// counts as stopped anyway), then clear `held` on every one noted.
+    fn settle<'a>(&mut self, key: &str, rows: impl Iterator<Item = (&'a str, &'a mut bool)>, win: &Windows) {
+        if self.key != key {
+            self.key = key.to_string();
+            self.windows.clear();
+        }
+        for (id, held) in rows {
+            if *held && win.exists.contains(id) && !win.working.contains(id) {
+                self.windows.insert(id.to_string());
+            }
+            *held &= !self.windows.contains(id);
+        }
+    }
 }
 
 /// The press in `p` is still in flight: not done, its process alive, begun
@@ -271,15 +424,18 @@ pub fn in_flight(p: &Progress, clock: Clock) -> bool {
 
 /// THE phase (module docs), first match wins.
 pub fn phase(progress: Option<&Progress>, paused: Option<&Paused>, clock: Clock, win: &Windows) -> Option<Phase> {
+    // A window still works: it exists and works by the script's rule.
+    let works = |id: &str| !id.is_empty() && win.exists.contains(id) && win.working.contains(id);
     if let Some(p) = progress.filter(|p| in_flight(p, clock)) {
-        let labels: Vec<String> = p.targets.iter().map(|(l, _)| l.clone()).collect();
+        let labels: Vec<String> = p.targets.iter().map(|t| t.label.clone()).collect();
         let n = p.targets.len();
         if p.mode == "resume" {
             return Some(Phase::Resuming { n, labels });
         }
         if p.mode == "pause" {
-            let done = p.targets.iter().filter(|(_, r)| r != "sending").count();
-            return Some(Phase::Sending { done, n, labels });
+            let done = p.targets.iter().filter(|t| t.result != "sending").count();
+            let held = p.targets.iter().filter(|t| t.held && works(&t.window_id)).map(|t| held_of(&t.label, &t.window_id, &t.why, win)).collect();
+            return Some(Phase::Sending { done, n, labels, held });
         }
     }
     let st = paused.filter(|s| !s.targets.is_empty())?;
@@ -295,11 +451,14 @@ pub fn phase(progress: Option<&Progress>, paused: Option<&Paused>, clock: Clock,
     let fresh = after(win.server_start);
     // A target is still working while its window exists and works; a
     // window that is gone (a resurrect restore renumbers them) has stopped.
-    let busy = |t: &&Saved| !fresh && !t.window_id.is_empty() && win.exists.contains(&t.window_id) && win.working.contains(&t.window_id);
-    let working: Vec<String> = st.targets.iter().filter(busy).map(|t| t.label.clone()).collect();
-    if !working.is_empty() {
+    // One whose PAUSE is held works on until tmux-mcp can deliver it:
+    // listed apart.
+    let busy = |t: &&Saved| !fresh && works(&t.window_id);
+    let working: Vec<String> = st.targets.iter().filter(busy).filter(|t| !t.held).map(|t| t.label.clone()).collect();
+    let held: Vec<Held> = st.targets.iter().filter(busy).filter(|t| t.held).map(|t| held_of(&t.label, &t.window_id, &t.why, win)).collect();
+    if !working.is_empty() || !held.is_empty() {
         let n = st.targets.len();
-        return Some(Phase::Stopping { stopped: n - working.len(), n, working });
+        return Some(Phase::Stopping { stopped: n - working.len() - held.len(), n, working, held });
     }
     Some(Phase::Safe { labels })
 }
@@ -393,6 +552,9 @@ pub struct Reader {
     /// The boot as read (tests replace it); read once, it never changes.
     boot_fn: fn() -> Option<f64>,
     boot: Option<Option<f64>>,
+    /// The held targets seen stopped, of the press and of the saved pause.
+    delivered_press: Delivered,
+    delivered: Delivered,
 }
 
 impl Reader {
@@ -403,6 +565,8 @@ impl Reader {
             wake: waketime,
             boot_fn: boottime,
             boot: None,
+            delivered_press: Delivered::default(),
+            delivered: Delivered::default(),
         }
     }
 
@@ -412,16 +576,23 @@ impl Reader {
     }
 
     /// The phase now: the two files (re-parsed only when changed), the
-    /// press's liveness, the clocks (the wake only while targets are saved
+    /// press's liveness, the held targets already seen stopped
+    /// ([`Delivered`]), the clocks (the wake only while targets are saved
     /// and no press is in flight; the boot once, when there is anything to
     /// compare it with).
     pub fn phase(&mut self, win: &Windows) -> Option<Phase> {
         let progress = self.progress.get(parse_progress).map(|mut p| {
             // Only a press not done needs its process checked.
             p.alive = !p.done && p.pid.is_none_or(super::term::alive);
+            let rows = p.targets.iter_mut().map(|t| (t.window_id.as_str(), &mut t.held));
+            self.delivered_press.settle(&p.press, rows, win);
             p
         });
-        let paused = self.paused.get(parse_paused).filter(|p| !p.targets.is_empty());
+        let paused = self.paused.get(parse_paused).filter(|p| !p.targets.is_empty()).map(|mut p| {
+            let rows = p.targets.iter_mut().map(|t| (t.window_id.as_str(), &mut t.held));
+            self.delivered.settle(&p.stamp, rows, win);
+            p
+        });
         if progress.as_ref().is_none_or(|p| p.done) && paused.is_none() {
             return None;
         }
@@ -445,7 +616,7 @@ mod tests {
 
     /// Windows `exists`, of which `working` work, on a server of unknown start.
     fn wins(working: &[&str], exists: &[&str]) -> Windows {
-        Windows { working: set(working), exists: set(exists), server_start: None }
+        Windows { working: set(working), exists: set(exists), ..Windows::default() }
     }
 
     fn paused(at: &str, targets: &[(&str, &str)]) -> Paused {
@@ -510,7 +681,7 @@ mod tests {
         let p = progress("pause", false, &["sent", "sending", "held"]);
         assert_eq!(
             phase(Some(&p), Some(&st), clock(Some(AT_S + 60.0)), &ex),
-            Some(Phase::Sending { done: 2, n: 3, labels: vec!["A0".into(), "A1".into(), "A2".into()] })
+            Some(Phase::Sending { done: 2, n: 3, labels: vec!["A0".into(), "A1".into(), "A2".into()], held: vec![] })
         );
         let r = progress("resume", false, &["sending", "sending"]);
         assert_eq!(phase(Some(&r), Some(&st), clock(Some(AT_S + 60.0)), &ex), Some(Phase::Resuming { n: 2, labels: vec!["A0".into(), "A1".into()] }));
@@ -525,7 +696,7 @@ mod tests {
     fn extras_are_not_counted() {
         let p = progress("pause", false, &["sent", "sending", "unidentified", "unidentified"]);
         assert_eq!(p.targets.len(), 2);
-        assert_eq!(phase(Some(&p), None, clock(None), &wins(&[], &[])), Some(Phase::Sending { done: 1, n: 2, labels: vec!["A0".into(), "A1".into()] }));
+        assert_eq!(phase(Some(&p), None, clock(None), &wins(&[], &[])), Some(Phase::Sending { done: 1, n: 2, labels: vec!["A0".into(), "A1".into()], held: vec![] }));
         let r = progress("resume", false, &["sending", "gone", "sent"]);
         assert_eq!(phase(Some(&r), None, clock(None), &wins(&[], &[])), Some(Phase::Resuming { n: 2, labels: vec!["A0".into(), "A2".into()] }));
         // (Each mode drops only its own kind.)
@@ -569,7 +740,7 @@ mod tests {
         // with its id were working elsewhere: it is not in `exists`).
         assert_eq!(
             phase(None, Some(&st), clock(None), &wins(&["@2", "@3"], &["@1", "@2"])),
-            Some(Phase::Stopping { stopped: 3, n: 4, working: vec!["Two".into()] })
+            Some(Phase::Stopping { stopped: 3, n: 4, working: vec!["Two".into()], held: vec![] })
         );
         let all = vec!["One".to_string(), "Two".into(), "Three".into(), "NoWin".into()];
         assert_eq!(phase(None, Some(&st), clock(None), &wins(&[], &["@1", "@2"])), Some(Phase::Safe { labels: all.clone() }));
@@ -584,7 +755,7 @@ mod tests {
     fn a_new_server_reuses_window_ids() {
         let st = paused(AT, &[("@1", "One"), ("@2", "Two")]);
         let mut w = wins(&["@2"], &["@0", "@1", "@2"]);
-        let stopping = Some(Phase::Stopping { stopped: 1, n: 2, working: vec!["Two".into()] });
+        let stopping = Some(Phase::Stopping { stopped: 1, n: 2, working: vec!["Two".into()], held: vec![] });
         assert_eq!(phase(None, Some(&st), clock(None), &w), stopping);
         w.server_start = Some(AT_S - 600.0);
         assert_eq!(phase(None, Some(&st), clock(None), &w), stopping);
@@ -613,7 +784,7 @@ mod tests {
         // Woke before (or exactly then), or unknown: by the working check.
         assert_eq!(phase(None, Some(&st), clock(Some(AT_S - 1.0)), &idle), safe);
         assert_eq!(phase(None, Some(&st), clock(Some(AT_S)), &idle), safe);
-        assert_eq!(phase(None, Some(&st), clock(None), &ex), Some(Phase::Stopping { stopped: 0, n: 1, working: vec!["One".into()] }));
+        assert_eq!(phase(None, Some(&st), clock(None), &ex), Some(Phase::Stopping { stopped: 0, n: 1, working: vec!["One".into()], held: vec![] }));
         // Booted after the pause (a reboot; the wake is from before, or
         // none since boot): ready, never "safe to close".
         let rebooted = Clock { now: NOW, wake: None, boot: Some(AT_S + 120.0) };
@@ -642,7 +813,7 @@ mod tests {
         }
         // Odd entries are skipped; labels fall back; a half record is done.
         let p = parse_paused(r#"{"targets":[1,"x",{"window_id":"@4","location":"main:2.1"},{"label":"  "}],"paused_at":7}"#).unwrap();
-        assert_eq!(p.targets, vec![Saved { window_id: "@4".into(), label: "main:2.1".into() }, Saved { window_id: "".into(), label: "agent".into() }]);
+        assert_eq!(p.targets, vec![Saved { window_id: "@4".into(), label: "main:2.1".into(), ..Saved::default() }, Saved { window_id: "".into(), label: "agent".into(), ..Saved::default() }]);
         assert_eq!(p.paused_at, None);
         let q = parse_progress(r#"{"mode":"pause","targets":[{"result":"sending"}]}"#).unwrap();
         assert!(q.done && q.pid.is_none() && q.started.is_none());
@@ -687,6 +858,159 @@ mod tests {
         std::fs::remove_file(dir.join("paused.json")).unwrap();
         assert_eq!(r.phase(&none), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows `exists`, of which `working` work, each placed in `main`
+    /// with the letter `places` gives it.
+    fn placed(working: &[&str], places: &[(&str, Option<char>)]) -> Windows {
+        let ids: Vec<&str> = places.iter().map(|(w, _)| *w).collect();
+        let places = places.iter().map(|(w, c)| (w.to_string(), ("main".to_string(), *c))).collect();
+        Windows { places, ..wins(working, &ids) }
+    }
+
+    /// message_agent's reply line for a PAUSE held because of copy mode
+    /// (tmux-mcp server.ts), as the script saves it in `detail`.
+    const COPY: &str = "held for @p0a (main:3.1, pane %9): the pane is in copy mode. It will be delivered once the box has been empty for 3s (1 message waiting).";
+
+    /// A held PAUSE: `"result": "held"` in paused.json (as the script
+    /// writes it once the press is done) and in progress.json (while it is
+    /// in flight), its reason from `detail`. A held agent whose window still
+    /// works is listed apart, with its session and letter, never also in
+    /// `working`; once its window stops it is just stopped (then safe).
+    #[test]
+    fn a_held_pause_is_listed_apart_until_its_agent_stops() {
+        // paused.json as finish_pause writes it (`ok` targets keep their result).
+        let st = parse_paused(&format!(
+            r#"{{"version":1,"paused_at":"{AT}","targets":[
+              {{"pane_id":"%9","window_id":"@9","location":"main:3.1","label":"P0a","kind":"claude","result":"held","detail":"{COPY}"}},
+              {{"pane_id":"%4","window_id":"@4","location":"main:2.1","label":"Done one","kind":"claude","result":"sent","detail":"sent to %4"}},
+              {{"pane_id":"%5","window_id":"@5","location":"main:4.1","label":"Busy","kind":"codex","result":"unknown","detail":""}}],"failed":[]}}"#
+        ))
+        .unwrap();
+        assert_eq!(st.targets.iter().map(|t| t.held).collect::<Vec<_>>(), [true, false, false]);
+        let p0a = Held { label: "P0a".into(), window_id: "@9".into(), why: "the pane is in copy mode".into(), session: "main".into(), letter: Some('k') };
+        let w = placed(&["@9", "@5"], &[("@9", Some('k')), ("@4", Some('a')), ("@5", None)]);
+        let got = phase(None, Some(&st), clock(None), &w);
+        assert_eq!(got, Some(Phase::Stopping { stopped: 1, n: 3, working: vec!["Busy".into()], held: vec![p0a.clone()] }));
+        assert_eq!(got.unwrap().held(), std::slice::from_ref(&p0a));
+        // Only the held one still works: no one in `working`.
+        let w = placed(&["@9"], &[("@9", Some('k')), ("@4", None), ("@5", None)]);
+        assert_eq!(phase(None, Some(&st), clock(None), &w), Some(Phase::Stopping { stopped: 2, n: 3, working: vec![], held: vec![p0a.clone()] }));
+        // tmux-mcp delivered it, the agent stopped: no longer held, safe.
+        let w = placed(&[], &[("@9", Some('k')), ("@4", None), ("@5", None)]);
+        let safe = phase(None, Some(&st), clock(None), &w).unwrap();
+        assert_eq!(safe, Phase::Safe { labels: vec!["P0a".into(), "Done one".into(), "Busy".into()] });
+        assert!(safe.held().is_empty());
+        // Its window gone: stopped like any other.
+        assert!(matches!(phase(None, Some(&st), clock(None), &placed(&["@5"], &[("@5", None)])), Some(Phase::Stopping { ref held, .. }) if held.is_empty()));
+        // A wake since: ready, nothing held.
+        assert_eq!(phase(None, Some(&st), clock(Some(AT_S + 9.0)), &w).unwrap().held(), []);
+        // A window the snapshot cannot place: listed, with nowhere to jump.
+        let w = wins(&["@9"], &["@9"]);
+        assert_eq!(phase(None, Some(&st), clock(None), &w).unwrap().held(), [Held { session: "".into(), letter: None, ..p0a.clone() }]);
+
+        // progress.json while the press is in flight (Progress.write's shape).
+        let ms = ((NOW - 30.0) * 1000.0) as u64;
+        let mut pr = parse_progress(&format!(
+            r#"{{"press":"{ms}-4242","mode":"pause","done":false,"outcome":"","message":"","targets":[
+              {{"pane_id":"%9","window_id":"@9","location":"main:3.1","label":"P0a","result":"held","detail":"{COPY}"}},
+              {{"pane_id":"%4","window_id":"@4","location":"main:2.1","label":"Done one","result":"sending","detail":""}},
+              {{"window_id":"@7","location":"main:5.1","label":"No pane","result":"unidentified"}}]}}"#
+        ))
+        .unwrap();
+        pr.alive = true;
+        assert_eq!(pr.targets[0], Sent { label: "P0a".into(), result: "held".into(), window_id: "@9".into(), held: true, why: "the pane is in copy mode".into() });
+        let w = placed(&["@9", "@4"], &[("@9", Some('k')), ("@4", Some('a'))]);
+        assert_eq!(
+            phase(Some(&pr), None, clock(None), &w),
+            Some(Phase::Sending { done: 1, n: 2, labels: vec!["P0a".into(), "Done one".into()], held: vec![p0a.clone()] })
+        );
+        // Stopped meanwhile: not held. A resume's held rows are no pause's.
+        assert_eq!(phase(Some(&pr), None, clock(None), &placed(&["@4"], &[("@9", Some('k'))])).unwrap().held(), []);
+        pr.mode = "resume".into();
+        assert_eq!(phase(Some(&pr), None, clock(None), &placed(&["@9"], &[("@9", Some('k'))])).unwrap().held(), []);
+    }
+
+    /// The reason is tmux-mcp's `<why>` (its `readBox` / `deliverGuarded`
+    /// wording, server.ts), mapped to what to do; one it does not know has
+    /// no action (the banner shows it as it is).
+    #[test]
+    fn a_held_reason_says_what_to_do() {
+        let reply = |why: &str| format!("held for @h (main:3.1, pane %9): {why}. It will be delivered once the box has been empty for 3s (1 message waiting).");
+        for (why, want) in [
+            ("the pane is in copy mode", Some("leave copy mode")),
+            ("no prompt box on screen (a dialog or menu may be up)", Some("show its prompt")),
+            ("the prompt box does not have the cursor (a dialog or menu may be up)", Some("close its dialog")),
+            ("a permission or question prompt is up", Some("answer its prompt")),
+            ("its prompt box has a half-written draft in it", Some("clear its prompt box")),
+            ("earlier messages to it are still held", None),
+            ("could not read the cursor", None),
+            ("capture failed: Error: can't find pane %9", None),
+        ] {
+            assert_eq!(held_why(&reply(why)), why);
+            assert_eq!(ask(why), want, "{why}");
+        }
+        // Not a hold, or no reply line: no reason. Control characters out.
+        for d in ["", "sent to @h (main:1.1, pane %1)", "held for nothing"] {
+            assert_eq!(held_why(d), "", "{d}");
+        }
+        assert!(!held_why("held for @h (x, pane %1): a\u{1b}[31mb\nc").chars().any(char::is_control));
+    }
+
+    /// `paused.json` says `held` until the resume. Once the sidebar has seen
+    /// the held agent's window stopped (its PAUSE delivered), that pause
+    /// never holds it again: woken while paused, it is just still working.
+    /// A new pause (another `paused_at`) starts afresh; a window missing
+    /// from the snapshot (none yet) proves nothing.
+    #[test]
+    fn a_held_agent_seen_stopped_is_delivered() {
+        let dir = std::env::temp_dir().join(format!("agent-ui-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = Reader::new(dir.clone());
+        r.wake = || None;
+        r.boot_fn = || Some(AT_S - 86_400.0);
+        let write = |at: &str| {
+            let tmp = dir.join(".paused.json.tmp");
+            let t = format!(r#"{{"window_id":"@9","label":"P0a","result":"held","detail":"{COPY}"}}"#);
+            std::fs::write(&tmp, format!(r#"{{"paused_at":"{at}","targets":[{t}]}}"#)).unwrap();
+            std::fs::rename(&tmp, dir.join("paused.json")).unwrap();
+        };
+        write(AT);
+        let p0a = |p: Option<Phase>| p.is_some_and(|p| p.held().len() == 1 && p.held()[0].why == "the pane is in copy mode");
+        let (busy, idle) = (placed(&["@9"], &[("@9", None)]), placed(&[], &[("@9", None)]));
+        // No snapshot yet: nothing proves it stopped.
+        assert!(matches!(r.phase(&Windows::default()), Some(Phase::Safe { .. })));
+        assert!(p0a(r.phase(&busy)));
+        // Stopped (delivered): safe. Working again later: no longer held.
+        assert!(matches!(r.phase(&idle), Some(Phase::Safe { .. })));
+        assert_eq!(r.phase(&busy), Some(Phase::Stopping { stopped: 0, n: 1, working: vec!["P0a".into()], held: vec![] }));
+        // A new pause: held again.
+        write("2026-10-19T15:00:00-07:00");
+        assert!(p0a(r.phase(&busy)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Where a held row jumps: each window's session (a shown one before a
+    /// hidden one it is linked into) and its letter, never from a hidden
+    /// session (a parked window's stale key).
+    #[test]
+    fn places_come_from_the_snapshot() {
+        let snap = Snapshot::parse(
+            &[
+                crate::tmux::tests::row("main", 1, "@1", &[("state", "running"), ("key", "k")]),
+                crate::tmux::tests::row("stash", 2, "@2", &[("state", "running"), ("key", "s"), ("space_hidden", "1")]),
+                crate::tmux::tests::row("agents", 1, "@3", &[("state", "running"), ("key", "d"), ("space_hidden", "1")]),
+                crate::tmux::tests::row("work", 3, "@3", &[("state", "running"), ("key", "d")]),
+                crate::tmux::tests::row("main", 4, "@4", &[("state", "running"), ("key", "junk")]),
+            ]
+            .join("\n"),
+        );
+        let p = windows(&snap).places;
+        assert_eq!(p["@1"], ("main".to_string(), Some('k')));
+        assert_eq!(p["@2"], ("stash".to_string(), None));
+        assert_eq!(p["@3"], ("work".to_string(), Some('d')));
+        assert_eq!(p["@4"], ("main".to_string(), None));
     }
 
     #[test]
