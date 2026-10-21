@@ -1674,10 +1674,13 @@ EOF
             done|needs-input)
                 if viewed_now "$wac"; then
                     if [ "$state" = needs-input ]; then
+                        # @agent_ask_from (the indicator's ASKER GATE) goes
+                        # with the needs-input it described, as in set_state.
                         pending=$tick_now
                         tmux set-option -w -t "$win" @agent_state idle \; \
                              set-option -w -t "$win" @agent_pending "$pending" \; \
-                             set-option -w -t "$win" @agent_seen_at "$tick_now" 2>/dev/null && { changed=1; state_moved=1; }
+                             set-option -w -t "$win" @agent_seen_at "$tick_now" \; \
+                             set-option -uw -t "$win" @agent_ask_from 2>/dev/null && { changed=1; state_moved=1; }
                     else
                         tmux set-option -w -t "$win" @agent_state idle \; \
                              set-option -w -t "$win" @agent_seen_at "$tick_now" 2>/dev/null && { changed=1; state_moved=1; }
@@ -1961,7 +1964,9 @@ EOF
                 tmux set-option -uw -t "$win" @agent_kind \; \
                      set-option -uw -t "$win" @agent_detail_kind \; \
                      set-option -uw -t "$win" @agent_detail \; \
-                     set-option -uw -t "$win" @agent_born 2>/dev/null
+                     set-option -uw -t "$win" @agent_born \; \
+                     set-option -uw -t "$win" @agent_ask_from \; \
+                     set-option -uw -t "$win" @agent_held_detail 2>/dev/null
                 # The agent-origin bookkeeping goes with the session (one
                 # call), as clear_state drops it.
                 gc_cmd=()

@@ -70,6 +70,8 @@ Two per-window tmux user options are the single source of truth:
 - `@agent_cua` — `1` while the agent is driving an app through cua-driver (lingers up to `CUA_LIVE`, 60 s); set by the watcher
 - `@agent_rollout` — codex only: the thread's rollout path, stashed by the indicator so the watcher can tell a live turn from an interrupted one
 - `@agent_kind` — `claude | codex | opencode`: whose hooks drive the window. Written by any indicator hook that writes state or detail (in the same command list), unset with the state by `clear_state` and the watcher GC. Never written by the focus hook or a no-op heartbeat. Before any hook has fired (Codex's first hook waits for the first prompt), the watcher seeds it from the agent process's own comm; it never overwrites a kind that is already set (see the watcher section).
+- `@agent_ask_from` — who a `needs-input` is waiting for: the `PermissionRequest` payload's `agent_id` (a subagent's gate) or `main`. Written by `needs-approval` for a `PermissionRequest` (never its `Notification` twin) in the same command list as the state; unset in `set_state`'s command list by any write that *leaves* `needs-input`, by `clear_state`, and by the watcher's viewed discharge and GC. Read by the heartbeat and by `Stop` (see **Asker gate**). Unset while `needs-input` (a gate raised by the `Notification` alone, a window that went yellow before 2026-10-21, a quiet restore) means *no asker*: the old rule, any tool call re-arms.
+- `@agent_held_detail` — `"<kind>\t<text>"`: the detail a main-agent `Stop` would have written while a subagent's gate held the window at `needs-input`; written back by the heartbeat (or `subagent-stop`) that ends that gate. Unset by the next prompt, Stop, failure, SessionStart, `clear_state` and the watcher GC (see **Asker gate**).
 - `@agent_slot` — decimal integer ≥ 1: the window's sticky number in agent-ui's Option-W menu and sidebar. Held only while the window is in the Active set and visible. Stamped by the indicator's `set_state` when a window enters the Active set, and by the watcher as the backstop; released and repaired only by the watcher (see "Agent slots" in the watcher section).
 - `@agent_detail_kind` + `@agent_detail` — what the event that set the state was *about*, for the sidebar (not rendered in the tab bar):
 
@@ -81,7 +83,7 @@ Two per-window tmux user options are the single source of truth:
   | `fail` | `StopFailure` | `<error>: <error_details>` (either half), else `turn failed` |
   | `done` | `Stop` | first non-empty line of `last_assistant_message` (Claude, verified 2.1.294; Codex sends the same field); Claude without the field falls back to the last assistant text in the transcript's last 64 KB; else `turn finished` |
 
-  Both are written by `set_state` in the **same tmux command list** as `@agent_state`/`@agent_since`, even when the state itself is unchanged, so a reader never pairs a new state with an older event's detail. Unset by `SessionStart` (except `source=compact`, which fires mid-turn), by `clear_state`, and by the watcher GC; the watcher's codex turn-end reconcile also writes them (`done`/`turn finished`, or unset after an abort; see the watcher section); never touched by the heartbeat (it stays fork-free) or the focus discharge. A `Notification` names no tool, so it never overwrites a `perm`/`ask` its `PermissionRequest` twin already wrote (one extra `show-options`, only on that event); landing first, it stands in as `perm <Tool>` parsed from "…permission to use <Tool>". The detail of a `Stop` held `running` by background work is still `done`. Text is untrusted and sanitized in the same jq call that extracts it (one fork per event): one line, no `#` `"` `%`, no control characters (C0, DEL, C1, U+2028/9) and no invisible/bidi controls (U+200B–200F, U+202A–202E, U+2060–2069, U+FEFF, U+061C), whitespace collapsed, leading/trailing `;`/space dropped (a tmux argv element ending in `;` terminates the command list), ≤ 80 code points with a trailing `…` when cut. Every value is sliced (4000, then 1000 code points) *before* any per-character work: unbounded, the sanitizer was quadratic (a 152 KB heredoc took 16 s), which blocks a permission dialog or prompt submission and gets a Codex hook killed at its 10 s timeout, state write included; bounded, a 1 MB payload costs ~20 ms of jq, and a jq failure yields the bare kind, never a lost state write. The detail rides in globals (`dkind`/`dtext`, consumed by the next `set_state`), so every call site stays `set_state "$win" <state>` — cua-notch's `dev/check-invariants` pins `        set_state "$win" failed` verbatim. Values reach tmux only as `set-option` argv: stored verbatim, and `list-windows -F '#{@agent_detail}'` expands them without re-parsing formats inside (checked on a scratch tmux 3.7c server).
+  Both are written by `set_state` in the **same tmux command list** as `@agent_state`/`@agent_since`, even when the state itself is unchanged, so a reader never pairs a new state with an older event's detail. Unset by `SessionStart` (except `source=compact`, which fires mid-turn), by `clear_state`, and by the watcher GC; the watcher's codex turn-end reconcile also writes them (`done`/`turn finished`, or unset after an abort; see the watcher section); never touched by the heartbeat (it stays fork-free) or the focus discharge — except the heartbeat that ends a subagent's gate a main-agent `Stop` was held on, which writes that Stop's stashed detail (`@agent_held_detail`, see **Asker gate**). A `Notification` names no tool, so it never overwrites a `perm`/`ask` its `PermissionRequest` twin already wrote (one extra `show-options`, only on that event); landing first, it stands in as `perm <Tool>` parsed from "…permission to use <Tool>". The detail of a `Stop` held `running` by background work is still `done`. Text is untrusted and sanitized in the same jq call that extracts it (one fork per event): one line, no `#` `"` `%`, no control characters (C0, DEL, C1, U+2028/9) and no invisible/bidi controls (U+200B–200F, U+202A–202E, U+2060–2069, U+FEFF, U+061C), whitespace collapsed, leading/trailing `;`/space dropped (a tmux argv element ending in `;` terminates the command list), ≤ 80 code points with a trailing `…` when cut. Every value is sliced (4000, then 1000 code points) *before* any per-character work: unbounded, the sanitizer was quadratic (a 152 KB heredoc took 16 s), which blocks a permission dialog or prompt submission and gets a Codex hook killed at its 10 s timeout, state write included; bounded, a 1 MB payload costs ~20 ms of jq, and a jq failure yields the bare kind, never a lost state write. The detail rides in globals (`dkind`/`dtext`, consumed by the next `set_state`), so every call site stays `set_state "$win" <state>` — cua-notch's `dev/check-invariants` pins `        set_state "$win" failed` verbatim. Values reach tmux only as `set-option` argv: stored verbatim, and `list-windows -F '#{@agent_detail}'` expands them without re-parsing formats inside (checked on a scratch tmux 3.7c server).
 
 **External reader: CuaNotch's tmux-seen ack** (cua-notch 2b0a2ec). When an
 agent finishes or asks while the user is looking at its tab, the indicator's
@@ -147,7 +149,7 @@ payload on stdin. Hook processes are children of the agent, so
 |---|---|
 | `SessionStart` | `idle` (skips `source=compact` — fires mid-turn; a fresh session shows `project/New Session` until the first turn titles it) |
 | `UserPromptSubmit` | `running` |
-| `PostToolUse` | `heartbeat` (re-arms `running` *only* from `running`/`needs-input`, so a late tool call can't resurrect a finished tab; never reads stdin — `tool_response` can be huge) |
+| `PostToolUse` | `heartbeat` (re-arms `running` *only* from `running`/`failed`/`needs-input`, or idle + `@agent_pending`, so a late tool call can't resurrect a finished tab; from `needs-input` only for the agent that asked — see **Asker gate** below; never parses stdin — `tool_response` can be huge — and peeks at its first 8 KB only while the window is `needs-input`) |
 | `PermissionRequest`, `Notification` (matcher `permission_prompt`) | `needs-approval` — **unless `tool_name` is a question tool, then `needs-input`** (see below) |
 | `StopFailure` | `needs-input` |
 | `Stop` | `done` |
@@ -276,7 +278,106 @@ so everything downstream (detail kinds, slots, the condenser) is shared:
   with bash), `TMUX_AGENT_HEARTBEAT_MS` (the throttle).
 
 Subagent-context events (payload has `agent_id`) are ignored so a
-subagent's Stop can't flip the main agent's tab. Codex background threads
+subagent's Stop can't flip the main agent's tab — except its
+`PermissionRequest`, which blocks on the user like the main agent's own and
+is the tab's `needs-input`.
+
+**Asker gate** (2026-10-21). The heartbeat used to exit before that subagent
+guard ever saw a payload, so a *background* subagent's tool calls re-armed
+`running` over the main agent's open question: window @15 went
+`needs-input`/`ask` at 09:37 and `running` at 09:37:55, `@agent_workflow` set,
+the question still on screen, and the tab and sidebar said "working". (CuaNotch
+said so too, but through its own hook: `cua-notch-agent-hook` maps every
+`PostToolUse` to `working` with no `agent_id` check, and its tmux reconcile
+only *acknowledges* rows, so this fix does not reach the notch.) Now:
+
+- `needs-approval` records the asker in `@agent_ask_from` on a
+  `PermissionRequest`: the payload's `agent_id`, else `main`. The
+  `Notification` twin never carries an `agent_id` (Claude builds it with no
+  agent context, whoever asked), so it never touches `@agent_ask_from`: after
+  its `PermissionRequest`, that one's asker stands; landing first, the gate
+  has no asker until the `PermissionRequest` lands on the standing gate and
+  records it (nothing here drops a late hook, so the twin that loses the
+  ordering race still writes). A discharged (viewed) prompt writes no asker.
+- While the window is `needs-input` **with an asker**, the heartbeat re-arms
+  `running` only for a tool call by that same agent (the gate answered: the
+  approved tool's own `PostToolUse`, or `AskUserQuestion`'s). Another
+  subagent's tool calls, and the main agent's for a subagent's gate (a
+  background subagent can sit on its prompt while main keeps working), leave
+  it yellow. With **no asker** (a `Notification`-only gate, a pre-deploy
+  window) the old rule stands, any tool call re-arms: a gate nobody can end
+  would stay yellow until the next prompt. CuaNotch's hook rules the same way
+  (cua-notch 0083845).
+- **The main agent's `Stop` leaves a subagent's gate standing** (asker set and
+  not `main`). An asking subagent is background work still out, so the Stop
+  takes its background-held branches — `@agent_turn_result`,
+  `@agent_bg_owner`, a quiet turn's prior kept — with the gate (state and
+  `perm`/`ask` detail) held where `running` would be. The detail the Stop
+  would have written (its reply's first line, or an agent-originated turn's
+  `notify_user` reason) is stashed as `"<kind>\t<text>"` in
+  `@agent_held_detail`. The heartbeat that ends the gate — the asker's own,
+  or whichever consumes the seen gate's `@agent_pending` — re-arms the
+  `running` that Stop would have held *with that detail*, unsetting the
+  stash in the same command, and the existing drain takes over (the watcher's
+  release, or the wake-up turn's own Stop). The stash is unset by the next
+  prompt, Stop, failure, SessionStart, `clear_state` and the watcher GC.
+  Matches CuaNotch, which keeps its row `input`. A `StopFailure` still goes
+  red; a new prompt always ends the gate.
+- **Gaps in the wiring (not this script's to fix).** The asker's gate ends on
+  its next `PostToolUse`. Two ways a subagent's gate can end with none:
+  its approved tool *fails* (Claude fires `PostToolUseFailure`, which
+  `~/.claude/settings.json` sends only to the chezmoi guard), or it is denied
+  and simply finishes (`SubagentStop`, not wired to this script at all;
+  CuaNotch ends the gate there). Either leaves the tab yellow until a focus
+  or the next prompt. The script is ready for both — `heartbeat` already
+  handles a failure payload (same base fields, `agent_id` ahead of
+  `hook_event_name`), and the `subagent-stop` mode ends a needs-input whose
+  asker is that `agent_id` (only that: from `failed` or idle + pending it is
+  inert, since a subagent ending is not the main turn resuming) — and needs
+  only two `hooks` entries in settings.json:
+
+  ```json
+  "PostToolUseFailure": [ … existing chezmoi-guard entry …,
+    { "hooks": [ { "type": "command", "command": "bash '/Users/mackhaymond/.config/tmux/scripts/agent-tab-indicator.sh' heartbeat claude" } ] } ],
+  "SubagentStop": [
+    { "hooks": [ { "type": "command", "command": "bash '/Users/mackhaymond/.config/tmux/scripts/agent-tab-indicator.sh' subagent-stop claude" } ] } ]
+  ```
+- **How the heartbeat knows who.** It still never waits on or parses the
+  whole payload. Claude Code (2.1.306, `wu()` in the bundle) builds every hook
+  payload as `{session_id, transcript_path, cwd, scratchpad_dir, prompt_id,
+  permission_mode, agent_id, agent_type, effort, hook_event_name, tool_name,
+  tool_input, tool_response, …}`, and `JSON.stringify` keeps that insertion
+  order, so a subagent's top-level `agent_id` sits in the first few hundred
+  bytes. The heartbeat reads `head -c 8192`, keeps what precedes the first
+  `"hook_event_name"`, and regex-matches `"agent_id": "<id>"` there (jq can't
+  parse a truncated document). Cutting at `hook_event_name` makes it the
+  top-level key: a `tool_input`/`tool_response` object with its own
+  `agent_id` comes later, and inside a JSON string every quote is escaped, so
+  quoted text can't match. No match = `main`. The order was read from the
+  2.1.306 bundle itself; `test_agent_ask_from` builds its payloads in that
+  order, so it assumes it rather than checking Claude. If a future Claude
+  moved `agent_id` after `hook_event_name`, every heartbeat would read as
+  `main`: the main agent's gates keep working, subagent heartbeats clobber
+  them again as before the fix, and a subagent's own gate waits for a
+  focus, its `SubagentStop` (once wired) or the next prompt. Re-check the
+  bundle's `wu()` after a Claude upgrade that touches hooks.
+- **Cost.** The `running`/`failed` heartbeat runs the same commands as
+  before (one `show-options`, the drain), with no payload read. The
+  `needs-input` branch adds one `show-options`, plus one `head` when the gate
+  has an asker; ending a held gate adds one more (`@agent_held_detail`), as
+  does consuming a fresh `@agent_pending`. The drain is now
+  `( cat <&0 >/dev/null & )` (same forks): without job control bash gives an
+  async command `/dev/null` as stdin unless it names one, so the old bare
+  `( cat & )` never drained anything and the writer took an EPIPE on any
+  payload past the 64 KB pipe buffer.
+- **Unchanged:** `running`/`failed` → `running` from anyone; idle +
+  `@agent_pending` (a prompt already *seen*, so no longer "asks" on any
+  surface) is consumed by the first heartbeat, whoever's, as before. Codex
+  drops subagent payloads up front and OpenCode sends no `agent_id`, so both
+  are always `main` and behave exactly as before. One asker is tracked: if a
+  second gate opens while one stands, the later one owns the re-arm.
+
+Codex background threads
 (subagents, review/guardian workers, the Memory Writing Agent) fire the
 same hooks from the same process — the script drops events whose
 `session_id` maps to a non-`user` `thread_source` in

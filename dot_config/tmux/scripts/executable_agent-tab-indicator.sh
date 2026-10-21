@@ -34,7 +34,19 @@
 #                   to answer its prompt). The next heartbeat consumes it to
 #                   restore `running` when the answered turn resumes; every
 #                   other lifecycle mode clears it so it can't go stale.
-#   @agent_kind     claude | codex | opencode — which agent's hooks drive this
+#   @agent_ask_from WHO the window's needs-input is waiting for: the
+#                   PermissionRequest payload's agent_id (a subagent's gate)
+#                   or "main". Written with needs-input by the
+#                   PermissionRequest (never its Notification twin), unset
+#                   in the same command list by any set_state that leaves
+#                   needs-input (and by clear_state / the watcher's
+#                   discharge and GC). Read by the heartbeat - a tool call
+#                   by anyone else must not re-arm `running` over a gate
+#                   still on screen - and by Stop, which leaves a subagent's
+#                   gate standing (ASKER GATE, see heartbeat and done).
+#                   Unset while needs-input = no asker: the old rule, any
+#                   tool call re-arms.
+#   @agent_kind    claude | codex | opencode — which agent's hooks drive this
 #                   window; written with any state/detail write a hook makes
 #   @agent_detail_kind  perm | ask | fail | done | run — what the last event
 #                   was about (see DETAIL_JQ); @agent_detail = one sanitized
@@ -85,12 +97,15 @@
 #                                      (agent-topic-drift.awk); refresh
 #                                      @agent_summary
 #   heartbeat    PostToolUse         → re-arm running mid-turn: from
-#                                      running/needs-input, or from idle when
+#                                      running/failed, from needs-input only
+#                                      when the tool call is the asker's own
+#                                      (@agent_ask_from), or from idle when
 #                                      @agent_pending marks an answered
 #                                      permission prompt — never from bare
 #                                      idle/done, so a late tool call can't
-#                                      resurrect a finished tab; skips stdin
-#                                      entirely — payloads can be huge
+#                                      resurrect a finished tab; never parses
+#                                      stdin — payloads can be huge (only
+#                                      needs-input peeks at its first 8 KB)
 #   needs-approval  PermissionRequest, and Notification(permission_prompt)
 #                → sets needs-input (YELLOW). Both events describe the SAME
 #                                      gate: PermissionRequest is structural
@@ -102,6 +117,8 @@
 #                                      approvals from questions kept failing,
 #                                      and why they no longer are: one state,
 #                                      and the tab name says which session.
+#   subagent-stop  SubagentStop (NOT wired yet) → the asking subagent's end
+#                                      ends its gate (ASKER GATE); else inert
 #   failed       StopFailure         → the TURN ITSELF died (529, overloaded).
 #                                      Red. Nothing is waiting on an answer;
 #                                      something broke. Asserted like the
@@ -110,7 +127,9 @@
 #   done         Stop                → turn finished; refresh @agent_summary;
 #                                      not tinted if a client is watching it;
 #                                      a turn ANOTHER AGENT started finishes
-#                                      quiet (AGENT-ORIGINATED TURNS below)
+#                                      quiet (AGENT-ORIGINATED TURNS below);
+#                                      a SUBAGENT's open gate stands through
+#                                      it (ASKER GATE)
 #   clear        SessionEnd          → remove state (skipped for clear/resume,
 #                                      which are followed by a new SessionStart)
 #   clear-current  focus hook        → attention states → idle once seen;
@@ -581,6 +600,10 @@ set_state() {
         printf -v ts '%(%s)T' -1 2>/dev/null || ts=$(date +%s)
         cmd=(set-option -w -t "$win" @agent_state "$new" \;
              set-option -w -t "$win" @agent_since "${sv:-$ts $new}")
+        # Leaving needs-input answers its gate: who asked goes with it, in
+        # the same command (ASKER GATE, heartbeat). One place, so every way
+        # out (a prompt, a discharge, Stop, a failure, a restore) drops it.
+        [ "$cur" != needs-input ] || cmd+=(\; set-option -uw -t "$win" @agent_ask_from)
     fi
     if [ "$dk" = - ]; then
         cmd+=(${cmd[0]+\;} set-option -uw -t "$win" @agent_detail_kind \;
@@ -669,7 +692,9 @@ clear_state() {
     tmux set-option -uw -t "$win" @agent_kind \; \
          set-option -uw -t "$win" @agent_detail_kind \; \
          set-option -uw -t "$win" @agent_detail \; \
-         set-option -uw -t "$win" @agent_born 2>/dev/null || true
+         set-option -uw -t "$win" @agent_born \; \
+         set-option -uw -t "$win" @agent_ask_from \; \
+         set-option -uw -t "$win" @agent_held_detail 2>/dev/null || true
     # AGENT-ORIGINATED TURNS: the session is gone, and so is every turn,
     # message and flag that belonged to it (one call).
     local -a ocmd=()
@@ -689,6 +714,25 @@ clear_state() {
 
 clear_pending() {
     tmux set-option -uw -t "$1" @agent_pending 2>/dev/null || true
+}
+
+# HELD DETAIL (ASKER GATE, see done): a main-agent Stop that a subagent's
+# open gate holds keeps the gate's perm/ask detail on screen, and stashes
+# the detail it would have written - the reply's first line, or an agent
+# turn's notify_user reason - as "<kind>\t<text>" in @agent_held_detail
+# (sanitized text never holds a tab). The heartbeat that ends that gate
+# (the asker's re-arm, or consuming the seen gate's @agent_pending) takes
+# it back into dkind/dtext for its set_state, so the window lands exactly
+# where the held Stop would have left it. Unset by the next prompt, Stop,
+# failure, SessionStart and clear_state; one show-options, on those two
+# rare heartbeat paths only.
+held_detail_take() {
+    local hd
+    hd=$(tmux show-options -wqv -t "$1" @agent_held_detail 2>/dev/null || true)
+    [ -n "$hd" ] || return 0
+    dkind="${hd%%$'\t'*}"; dtext=""
+    case "$hd" in *$'\t'*) dtext="${hd#*$'\t'}" ;; esac
+    ss_add set-option -uw -t "$1" @agent_held_detail
 }
 
 # ------------------------------------------------- agent-originated turns
@@ -1943,10 +1987,79 @@ fi
 # Only re-arm running from running/needs-input — a late PostToolUse landing
 # after Stop's `done` must NOT resurrect a finished tab. Codex reads its
 # payload earlier to validate session ownership and reject subagents.
+# The drain's `<&0` is load-bearing: without job control, bash points an
+# async command's stdin at /dev/null unless it names one itself, so the bare
+# `( cat & )` that stood here until 2026-10-21 drained nothing at all (the
+# writer got its EPIPE after all; Claude shrugs it off).
+#
+# ASKER GATE (2026-10-21). PostToolUse fires for EVERY agent in the session,
+# subagents included, and this branch exits before the subagent guard below
+# ever sees the payload. So a background subagent's tool calls re-armed
+# `running` over the main agent's open AskUserQuestion (live: window @15
+# went needs-input/ask at 09:37, `running` at 09:37:55 with @agent_workflow
+# set and the question still on screen; the tab and sidebar said "working" -
+# CuaNotch too, but via its own hook, which this does not reach). The fix
+# is bounded to needs-input, the rare state: there the
+# heartbeat peeks at the payload and re-arms only for the agent that asked
+# (@agent_ask_from, written by needs-approval: the PermissionRequest's
+# agent_id, or "main"). The asker's own next tool call is the gate
+# answering - an approved tool's PostToolUse, or AskUserQuestion's own.
+# A subagent's gate is NOT re-armed by the main agent either: a background
+# subagent can sit on its prompt while main keeps working (nor ended by
+# main's Stop: see done). A gate with NO recorded asker (raised by the
+# Notification alone, or yellow since before this) keeps the old rule - any
+# tool call re-arms - since a gate nobody can end would stand yellow until
+# the next prompt; CuaNotch's hook (0083845) rules the same way.
+#   WHO: Claude Code builds every hook payload as {...base, hook_event_name,
+# tool_name, tool_input, tool_response, ...} (2.1.306's wu(): session_id,
+# transcript_path, cwd, scratchpad_dir, prompt_id, permission_mode,
+# agent_id, agent_type, effort), and JSON.stringify keeps that insertion
+# order, so a subagent's top-level agent_id sits in the first few hundred
+# bytes, BEFORE "hook_event_name" and long before the megabytes of
+# tool_response. jq can't parse a truncated document, so: `head -c 8192`,
+# keep what precedes the first "hook_event_name", and match the key there.
+# Cutting at hook_event_name is what makes the match the top-level key: a
+# tool_input or tool_response OBJECT with its own "agent_id" key (an MCP
+# tool's argument, say) comes after it; inside a JSON string every quote
+# is escaped (\"agent_id\"), which the pattern can't match anyway. No
+# agent_id = the main agent. Codex rejects subagent payloads up top and
+# OpenCode sends none, so both are always "main" and behave as before.
+# running/failed run the same commands as before: the payload is read
+# only when the window is needs-input with an asker. Ending a held gate, and
+# consuming a fresh @agent_pending, add one show-options (HELD DETAIL).
 if [ "$mode" = "heartbeat" ]; then
-    [ "$agent" = codex ] || ( cat >/dev/null 2>&1 & ) 2>/dev/null
-    case "$(window_state "$win")" in
-        running|needs-*|failed) set_state "$win" running ;;
+    hb_state=$(window_state "$win")
+    hb_ok=1
+    case "$hb_state" in
+        needs-*)
+            hb_ask=$(tmux show-options -wqv -t "$win" @agent_ask_from 2>/dev/null || true)
+            if [ -n "$hb_ask" ]; then
+                hb_from=main
+                if [ "$agent" != codex ]; then
+                    hb_head=$(head -c 8192 2>/dev/null || true)
+                    hb_cut='"hook_event_name"'
+                    hb_head=${hb_head%%"$hb_cut"*}
+                    hb_re='"agent_id"[[:space:]]*:[[:space:]]*"([^"]*)"'
+                    if [[ $hb_head =~ $hb_re ]]; then
+                        hb_from="${BASH_REMATCH[1]//[^A-Za-z0-9_.-]/}"
+                        hb_from="${hb_from:-main}"
+                    fi
+                fi
+                [ "$hb_from" = "$hb_ask" ] || hb_ok=0
+            fi
+            ;;
+    esac
+    [ "$agent" = codex ] || ( cat <&0 >/dev/null 2>&1 & ) 2>/dev/null
+    case "$hb_state" in
+        running|failed) set_state "$win" running ;;
+        needs-*)
+            if [ "$hb_ok" = 1 ]; then
+                # A subagent's gate the main agent's Stop held (see done):
+                # its answer lands the window where that Stop would have,
+                # running with the Stop's own detail.
+                case "${hb_ask:-main}" in main) ;; *) held_detail_take "$win" ;; esac
+                set_state "$win" running
+            fi ;;
         idle)
             # idle + @agent_pending = an answered permission prompt's turn
             # resuming (see clear-current). Single-use and age-gated, so a
@@ -1960,6 +2073,7 @@ if [ "$mode" = "heartbeat" ]; then
                 case "$pend" in *[!0-9]*) pend=0 ;; esac
                 if [ "$(( $(now_epoch) - pend ))" -lt 3600 ]; then
                     pend_op=unset
+                    held_detail_take "$win"   # a held Stop's, if its gate was seen
                     set_state "$win" running
                     [ "$ss_wrote" = 1 ] || clear_pending "$win"
                 else
@@ -1972,6 +2086,26 @@ if [ "$mode" = "heartbeat" ]; then
 fi
 
 [ "$agent" = codex ] || payload=$(cat 2>/dev/null || true)
+
+# subagent-stop (ASKER GATE): the asking subagent ENDING ends its gate, the
+# way its own next tool call would - for the cases that fire no heartbeat:
+# its approved tool failed (PostToolUseFailure, not wired to heartbeat
+# today), or it was denied and simply finished. Mode for SubagentStop,
+# which ~/.claude/settings.json does NOT wire as of 2026-10-21 (see the
+# doc's Asker gate); inert until it does. Only a needs-input whose recorded
+# asker is this agent_id moves, to `running` - the state a held Stop stands
+# on, or main's turn still going - with a held Stop's stash (HELD DETAIL).
+# Never a heartbeat: from failed or idle + pending it would claim a turn.
+if [ "$mode" = subagent-stop ]; then
+    [ "$agent" = claude ] && [ -n "$JQ" ] && [ -n "$payload" ] || exit 0
+    sa_id=$("$JQ" -r '.agent_id // empty' <<<"$payload" 2>/dev/null || true)
+    sa_id="${sa_id//[^A-Za-z0-9_.-]/}"
+    [ -n "$sa_id" ] && [ "$(window_state "$win")" = needs-input ] || exit 0
+    [ "$(tmux show-options -wqv -t "$win" @agent_ask_from 2>/dev/null || true)" = "$sa_id" ] || exit 0
+    held_detail_take "$win"
+    set_state "$win" running
+    exit 0
+fi
 
 # Hooks also fire inside subagent contexts (payload carries agent_id); a
 # subagent's Stop/heartbeat/turn events must not flip the main agent's tab.
@@ -2115,6 +2249,7 @@ case "$mode" in
         case "$src" in
             clear|startup) ss_add set-option -uw -t "$win" @agent_paused ;;
         esac
+        ss_add set-option -uw -t "$win" @agent_held_detail   # HELD DETAIL
         set_state "$win" idle
         clear_pending "$win"
         # Drift state is per session and only ever read for the live one:
@@ -2292,6 +2427,8 @@ case "$mode" in
         # A quiet restore's log mark never outlives it into a new turn (no
         # watcher tick in between, or a deploy window): free, same call.
         ss_add set-option -uw -t "$win" @agent_quiet
+        # Mack has spoken: a held Stop's stash (HELD DETAIL) is history.
+        ss_add set-option -uw -t "$win" @agent_held_detail
         take_detail running run
         set_state "$win" running
         if [ -n "$ctx_from" ] && [ "$ss_wrote" = 1 ]; then
@@ -2335,7 +2472,30 @@ case "$mode" in
         # twin already wrote — one extra read, only on that event. If it lands
         # first, its "needs your permission to use <Tool>" stands in until the
         # PermissionRequest replaces it.
+        #
+        # ASKER GATE (see heartbeat): record whose gate this is, in the
+        # state's own command list - the PermissionRequest's agent_id (a
+        # subagent's prompt, let through the subagent guard above), else
+        # "main". ONLY the PermissionRequest writes it. The Notification twin
+        # (the "note" detail) never names an agent - Claude builds it without
+        # one, whoever asked - so it leaves @agent_ask_from exactly as it is:
+        # after its PermissionRequest, that one's asker stands; landing first,
+        # the gate has no asker (the old any-tool-call rule) until the
+        # PermissionRequest arrives and records it. Hooks here are never
+        # dropped for arriving late, so the twin that loses the ordering race
+        # still lands its write.
         take_detail needs-approval perm
+        ask_from=""
+        if [ "$dkind" != note ]; then
+            ask_from=main
+            if [ -n "$JQ" ] && [ -n "$payload" ]; then
+                ask_from=$("$JQ" -r '.agent_id // empty' <<<"$payload" 2>/dev/null || true)
+                # Same charset the heartbeat compares in; also keeps a
+                # trailing ';' out of tmux argv.
+                ask_from="${ask_from//[^A-Za-z0-9_.-]/}"
+                ask_from="${ask_from:-main}"
+            fi
+        fi
         if [ "$dkind" = note ]; then
             case "$(tmux show-options -wqv -t "$win" @agent_detail_kind 2>/dev/null || true)" in
                 perm|ask) dkind="" ;;
@@ -2353,6 +2513,9 @@ case "$mode" in
             set_state "$win" idle
             [ "$ss_wrote" = 1 ] || tmux set-option -w -t "$win" @agent_pending "$(now_epoch)" 2>/dev/null || true
         else
+            # (A discharged prompt needs no asker: idle + @agent_pending is
+            # consumed by whichever heartbeat comes first, as before.)
+            [ -z "$ask_from" ] || ss_add set-option -w -t "$win" @agent_ask_from "$ask_from"
             set_state "$win" needs-input
         fi
         ;;
@@ -2365,6 +2528,7 @@ case "$mode" in
         stop_fields
         ss_add set-option -w -t "$win" @agent_turn_result "$s_id loud"
         prior_unset "$win"
+        ss_add set-option -uw -t "$win" @agent_held_detail   # HELD DETAIL
         take_detail failed fail "turn failed"
         set_state "$win" failed
         ;;
@@ -2386,6 +2550,40 @@ case "$mode" in
                 bg_pending=1
             fi
         fi
+        # ASKER GATE (see heartbeat), 2026-10-21: the MAIN agent's reply
+        # ending says nothing about a SUBAGENT's gate - a background one can
+        # still be waiting on Mack after it - so a needs-input whose asker is
+        # a subagent id stands through this Stop (CuaNotch 0083845 keeps its
+        # row `input` the same way). It is held exactly like background work,
+        # because that is what it is: an asking subagent is work still out.
+        # So the Stop takes the bg_pending branches below (turn result,
+        # @agent_bg_owner, a quiet turn's prior kept) with the state that
+        # holds being the gate (sd_hold) instead of `running`, and the gate's
+        # perm/ask detail kept instead of the reply's. When the subagent's
+        # gate is answered its own heartbeat re-arms `running`, which is the
+        # state this Stop would have held anyway, and the existing drain
+        # takes it from there: the watcher's release when the work is gone,
+        # or the wake-up turn's own Stop. Two reads, on Stop only.
+        sd_hold=running
+        if [ "$(window_state "$win")" = needs-input ]; then
+            case "$(tmux show-options -wqv -t "$win" @agent_ask_from 2>/dev/null || true)" in
+                ''|main) ;;
+                *) sd_hold=needs-input; bg_pending=1 ;;
+            esac
+        fi
+        # Any stash of an earlier held Stop is this Stop's to replace.
+        ss_add set-option -uw -t "$win" @agent_held_detail
+        # set_state for a Stop held by background work: `running`, or the
+        # standing subagent gate with its own detail - this Stop's detail
+        # (its reply, or a notify_user reason) stashed for when the gate
+        # ends (HELD DETAIL, see held_detail_take).
+        set_held() {
+            if [ "$sd_hold" != running ]; then
+                [ -z "$dkind" ] || ss_add set-option -w -t "$win" @agent_held_detail "$dkind"$'\t'"$dtext"
+                dkind=""; dtext=""
+            fi
+            set_state "$win" "$sd_hold"
+        }
         # The detail is the Stop's either way: even a turn held `running` by
         # background work has a final message worth showing.
         take_detail done done "turn finished"
@@ -2448,7 +2646,7 @@ case "$mode" in
             ss_add set-option -w -t "$win" @agent_turn_result "$s_id paused"
             ss_add set-option -uw -t "$win" @agent_quiet
             if [ "$bg_pending" -eq 1 ]; then
-                set_state "$win" running
+                set_held
             else
                 pend_op=unset
                 # The flag was read above; agent-pause.py may have cleared it
@@ -2469,8 +2667,8 @@ case "$mode" in
                 # Held running for its background work, prior kept: the
                 # watcher restores it when the work drains (or a wake-up
                 # turn's own quiet Stop does).
-                ss_add set-option -w -t "$win" @agent_turn_result "$s_id quiet running"
-                set_state "$win" running
+                ss_add set-option -w -t "$win" @agent_turn_result "$s_id quiet $sd_hold"
+                set_held
             elif [ "$s_unseen" = 1 ] && [ -z "$O_PSTATE" ]; then
                 # A split-case turn that never went `running`: there is
                 # nothing to restore - leave the window exactly as it is.
@@ -2494,7 +2692,7 @@ case "$mode" in
         ss_add set-option -uw -t "$win" @agent_quiet   # never logged as a reply
         prior_unset "$win"
         if [ "$bg_pending" -eq 1 ]; then
-            set_state "$win" running
+            set_held
             compose_summary "$win" "$(extract_summary "$payload")" "$payload"
             exit 0
         fi
@@ -2520,7 +2718,7 @@ case "$mode" in
         clear_state "$win"
         ;;
     *)
-        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|failed|done|interrupt|reconcile|clear|clear-current> [claude|codex|opencode]" >&2
+        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|subagent-stop|failed|done|interrupt|reconcile|clear|clear-current> [claude|codex|opencode]" >&2
         # exit 0, not 1: codex treats a hook's exit status as a GATE (see the
         # header), so a typo'd mode in hooks.json would block every codex
         # event rather than just failing to paint a tab. A silently inert
