@@ -26,10 +26,13 @@
 //!   watcher flips every second, read from the same snapshot, so a 1 s tick
 //!   can alias against it (two frames in one phase). A UI that wants a
 //!   steadier pulse may refresh at 0.5 s; the snapshot is cheap (~5 ms).
-//!   Draw from [`ViewModel::blink`] only: every colour in the view
-//!   ([`Agent::color`], [`Agent::flag`]) already has the phase applied, and
-//!   the window the client is on never pulses. The pulse freezes when the
-//!   watcher stops (it stops flipping), exactly like the tab bar. The
+//!   The view's own colours ([`Agent::color`], [`Agent::flag`]) already
+//!   have that phase applied (the window the client is on never pulses);
+//!   that pulse freezes when the watcher stops (it stops flipping), exactly
+//!   like the tab bar. The sidebar's working key-cap blink is NOT that
+//!   pulse: it follows the wall clock (`sidebar::layout::blink_on`, one
+//!   second on, one off, the client's own card included) on the spinner's
+//!   redraws, since a snapshot-borne `@agent_blink` would stutter. The
 //!   sidebar does not poll for changes: it wakes on Darwin notices
 //!   ([`sidebar::notice`]) and keeps the 0.5 s tick only while something it
 //!   draws pulses.
@@ -55,11 +58,16 @@
 //! - [`actions`]: [`Actions`] (go, next, back, goto_session, unstash, park,
 //!   close, restart_watcher, agent_pane, peek), [`pick_agent_pane`],
 //!   `watcher_age`.
+//! - [`answer`]: allow / deny an agent's permission prompt from here, once
+//!   a capture shows Claude Code's dialog on its pane.
 //! - [`wezterm`]: the sidebar's marker OSC, mouse mode, client resolution
 //!   and focus hand-back ([`WeztermLink`]).
 //! - [`pins`]: PINNED agents (`@agent_pinned`), toggled and kept across a
 //!   restore in `pins.json` by session id.
 //! - [`hotkeys`]: number-key labels and digit matching.
+//! - [`insight`]: per agent, from its transcript: its uncommitted diff (the
+//!   files IT edited), what it is doing, how full its context is.
+//! - [`diff`]: that uncommitted diff in a popup (`agent-ui diff`).
 //! - [`git`]: `git_head` (pure file reads) and the [`GitCache`].
 //! - [`events`]: the event log reader.
 //! - [`text`]: cell widths, `clip`, `fit_label`, `ago`, `sanitize`.
@@ -72,10 +80,13 @@
 
 pub mod actions;
 pub mod ansi;
+pub mod answer;
 pub mod collate;
+pub mod diff;
 pub mod events;
 pub mod git;
 pub mod hotkeys;
+pub mod insight;
 pub mod json;
 pub mod menu;
 pub mod model;

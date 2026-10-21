@@ -37,7 +37,9 @@
 //!   other sidebar follows at once.
 //! - **Cadence: told, not polling.** The loop sleeps in poll(2) on stdin,
 //!   the signal pipe, the Darwin notice fd ([`notice`]: agent-state and focus
-//!   notices) and the client's exit watch. A notice schedules one snapshot
+//!   notices), the insight notice's fd (the server's insight publisher
+//!   wrote a result: read with no snapshot, [`crate::insight::Board`]) and
+//!   the client's exit watch. A notice schedules one snapshot
 //!   [`notice::DEBOUNCE`] later (a burst is one refresh); a click that moves
 //!   refreshes at once. The timer is only a safety net: [`FALLBACK`] (5 s),
 //!   or [`TICK`] (0.5 s) when there is no notice fd. A redraw happens only
@@ -212,7 +214,13 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
     // Letters as the live sidebar would assign them; `--once` never writes.
     let (mut view, _) = build_view(&mut core, client.as_deref(), None);
     activity::Activity::home().apply(&mut view);
-    let frame = layout(&view, w, h, &Opts { msg: None, bar, spin: 0, now: None, pause });
+    // The insight read once, here (the live sidebar's worker would; none
+    // with $AGENT_UI_NO_INSIGHT).
+    if !crate::insight::disabled() {
+        crate::insight::fill(&mut view, &crate::insight::Engine::home().update(&core.snapshot, text::now()));
+    }
+    let opts = Opts { msg: None, bar, spin: 0, now: None, pause, ctx: layout::CtxStyle::from_env() };
+    let frame = layout(&view, w, h, &opts);
     let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
     layout::paint(&frame, &mut buf);
     let mut out = io::stdout().lock();
@@ -338,9 +346,46 @@ pub fn stash_command(tmux: &Tmux, client: &str, scripts: &std::path::Path) -> Co
     c
 }
 
+/// A card's diff badge ([`Target::Diff`]): `agent-ui [--socket S] diff
+/// <win> [--client <tty>]`, this binary against the same server (it raises
+/// its own popup on the client). None without this binary's path.
+pub fn diff_command(tmux: &Tmux, client: Option<&str>, exe: Option<&std::path::Path>, win: &str) -> Option<Command> {
+    let mut c = Command::new(exe?);
+    if let Some(Socket::Name(s) | Socket::Path(s)) = &tmux.socket {
+        c.args(["--socket", s]);
+    }
+    c.args(["diff", win]);
+    if let Some(cl) = client {
+        c.args(["--client", cl]);
+    }
+    Some(c)
+}
+
 /// How long a right-click park waits to see its window reach the stash
 /// before the footer stops tracking it.
 const PARK_WATCH: f64 = 15.0;
+
+/// The click targets a left press trusts only once they have settled
+/// under the pointer ([`crate::answer::Arrivals`]): an answer chip (it
+/// types into an agent) and a diff badge (it opens a popup).
+fn guarded(t: &Target) -> bool {
+    matches!(t, Target::Answer { .. } | Target::Diff(_))
+}
+
+/// Every cell of `f` whose click target ([`Frame::target`]) is [`guarded`].
+fn guarded_cells(f: &Frame) -> Vec<((u16, u16), Target)> {
+    let mut v = Vec::new();
+    for (y, r) in f.rows.iter().enumerate() {
+        for (x0, x1, _) in r.targets.iter().filter(|(_, _, t)| guarded(t)) {
+            for x in *x0..*x1 {
+                if let Some(t) = r.target_at(x).filter(|t| guarded(t)) {
+                    v.push(((x, y as u16), t.clone()));
+                }
+            }
+        }
+    }
+    v
+}
 
 /// The live sidebar: everything Strip holds between frames.
 struct App {
@@ -351,6 +396,11 @@ struct App {
     /// What is on screen: clicks resolve against it (Strip.targets), and the
     /// buffer is compared to skip identical redraws.
     shown: Frame,
+    /// When each answer chip and diff badge on screen first appeared at each
+    /// of its cells ([`guarded_cells`]): a left press on one acts only once
+    /// that same target has sat there [`crate::answer::SETTLE`]
+    /// ([`crate::answer::Arrivals`]; redraws of the spinner never restart it).
+    arrivals: crate::answer::Arrivals<Target>,
     buf: Option<Buffer>,
     /// Redraw in full next time (SIGWINCH).
     force: bool,
@@ -371,6 +421,9 @@ struct App {
     exe: Option<PathBuf>,
     /// The Darwin notices this sidebar wakes on ([`notice`]).
     notices: Notices,
+    /// The insight notice ([`notice::INSIGHT_NOTICE`]), on a fd of its own:
+    /// the publisher's new result, read with no snapshot.
+    insight_notices: Notices,
     /// The focus notice's name, posted after a scope toggle.
     focus_notice: String,
     /// The client process being watched for its exit.
@@ -411,6 +464,16 @@ struct App {
     dismissed: Vec<status::ToastId>,
     /// The working agents' activity blurbs ([`activity`]), cached.
     activity: activity::Activity,
+    /// Every agent's diff, doing line and context ([`crate::insight`]):
+    /// worked out on its own thread by the ONE sidebar of this server that
+    /// holds the publisher's lock, mirrored by the others
+    /// ([`crate::insight::Board`]).
+    board: crate::insight::Board,
+    /// The board's generation the view holds ([`App::take_insights`]).
+    insight_gen: u64,
+    /// (`#{start_time}`, the server's insight key) last worked out
+    /// ([`App::insight_key`]).
+    server_key: Option<(String, String)>,
     /// The pause key's files, re-parsed only when they change ([`pause`]).
     pause: pause::Reader,
     /// The working and existing window ids (and the server's start) of the
@@ -439,6 +502,7 @@ impl App {
             link,
             view,
             shown: Frame::default(),
+            arrivals: Default::default(),
             buf: None,
             force: false,
             focus_backs: 0,
@@ -450,6 +514,7 @@ impl App {
             reader: input::Reader::default(),
             exe: std::env::current_exe().ok(),
             notices,
+            insight_notices: Notices::default(),
             focus_notice: notice::names()[1].clone(),
             watch: None,
             client_pid: None,
@@ -469,6 +534,17 @@ impl App {
             dismissed: Vec::new(),
             // (Unit tests never read the real transcripts.)
             activity: if cfg!(test) { activity::Activity::new("/nonexistent".into()) } else { activity::Activity::home() },
+            board: crate::insight::Board::new(
+                if cfg!(test) || crate::insight::disabled() {
+                    crate::insight::Insights::off()
+                } else {
+                    crate::insight::Insights::home()
+                },
+                crate::insight::files_dir(),
+            )
+            .with_notice(notice::insight_name()),
+            insight_gen: 0,
+            server_key: None,
             // (Nor the real pause state.)
             pause: if cfg!(test) { pause::Reader::new("/nonexistent".into()) } else { pause::Reader::home() },
             pause_windows: pause::Windows::default(),
@@ -616,6 +692,13 @@ impl App {
         // The working agents' live activity, from their transcripts (cached;
         // a file is read only when it changed).
         self.activity.apply(&mut view);
+        // Diffs, doing lines, context: the publisher's worker's last results
+        // (it is handed this snapshot when idle, at most every 2 s; never
+        // waited on), or the publisher's mirrored ([`crate::insight::Board`]).
+        let key = self.insight_key();
+        self.board.refresh(&self.core.snapshot, key.as_deref());
+        self.insight_gen = self.board.generation();
+        self.board.apply(&mut view);
         self.view = view;
         if !writes.is_empty() {
             crate::menu::store_keys(&self.core.tmux, writes);
@@ -625,6 +708,46 @@ impl App {
         self.check_client();
         self.check_park();
         self.sync_pins();
+    }
+
+    /// Insights that landed since the view took them: into the view (no
+    /// snapshot, no tmux call; the draw that follows shows them). A result
+    /// lands on the worker's thread, after the refresh that asked for it,
+    /// so without this it would sit unseen until the next wake.
+    /// This server's insight key ([`crate::insight::board::server_key`]):
+    /// its `#{start_time}` from the snapshot, its `#{socket_path}` asked
+    /// once per server (one `display-message`). None when the snapshot has
+    /// no start time (it failed) or tmux would not say: the board keeps the
+    /// last key then.
+    fn insight_key(&mut self) -> Option<String> {
+        let start = crate::pins::server_of(&self.core.snapshot)?;
+        if let Some((s, k)) = &self.server_key {
+            if *s == start {
+                return Some(k.clone());
+            }
+        }
+        let o = self.core.tmux.run(&["display-message", "-p", "#{socket_path}"]).ok().filter(|o| o.ok())?;
+        let key = crate::insight::board::server_key(&start, o.stdout.trim());
+        self.server_key = Some((start, key.clone()));
+        Some(key)
+    }
+
+    /// (The publisher publishes them then; a mirror reads the publisher's
+    /// newer ones: one tiny read per wake.)
+    fn take_insights(&mut self) {
+        self.board.poll();
+        let g = self.board.generation();
+        if g != self.insight_gen {
+            self.insight_gen = g;
+            self.board.apply(&mut self.view);
+        }
+    }
+
+    /// When to look for the worker's result: every [`TICK`] while it holds
+    /// a snapshot (an update takes milliseconds, a first read of a long
+    /// transcript a second or so); never otherwise.
+    fn insights_due(&self, now: Instant) -> Option<Instant> {
+        self.board.pending().then(|| now + TICK)
     }
 
     /// The client's key table as the last snapshot shows it ("" unknown).
@@ -757,6 +880,21 @@ impl App {
         }
     }
 
+    /// The agent row or card drawn at cell (x, y) as its whole-row
+    /// [`Target::Go`]: on its diff badge or an answer chip (a left-click's
+    /// own target) too, so a right or middle press there still parks or
+    /// pins the card.
+    fn card_at(&self, x: u16, y: u16) -> Option<Target> {
+        match self.shown.target(x, y) {
+            Some(t @ Target::Go { .. }) => Some(t.clone()),
+            Some(Target::Diff(_) | Target::Answer { .. }) => {
+                let row = self.shown.rows.get(y as usize)?;
+                row.targets.iter().map(|(_, _, t)| t).find(|t| matches!(t, Target::Go { .. })).cloned()
+            }
+            _ => None,
+        }
+    }
+
     /// Strip.handle, events in order. Any press (modifiers too, not the
     /// wheel) hands focus back; only a plain left press acts, the last one
     /// in the read winning. Option-V (ESC v / ESC V) is the one key the
@@ -770,26 +908,37 @@ impl App {
         let mut act = None;
         let mut park = None;
         let mut pin = None;
+        let mut unsettled = false;
         for m in &inp.mice {
             if m.b & 64 != 0 || m.b & 32 != 0 || !m.press {
                 continue; // the wheel, motion, releases: nothing
             }
             focus = true;
-            let t = self.shown.target(m.x.saturating_sub(1), m.y.saturating_sub(1)).cloned();
+            let (x, y) = (m.x.saturating_sub(1), m.y.saturating_sub(1));
+            let t = self.shown.target(x, y).cloned();
             match m.b {
-                0 => act = t,
+                // A chip that only just arrived under the pointer: the click
+                // was most likely aimed at what was there before.
+                // (A diff badge too: it opens a popup.)
+                0 if t.as_ref().is_some_and(|t| guarded(t) && !self.arrivals.settled((x, y), t, Instant::now())) => {
+                    (act, unsettled) = (None, true);
+                }
+                0 => (act, unsettled) = (t, false),
                 // A plain right press (SGR button 2; WezTerm has no right-click
                 // binding of its own, so it reaches a mouse-reporting pane):
-                // park, on an agent row or card only.
-                2 => park = t.filter(|t| matches!(t, Target::Go { .. })),
+                // park, on an agent row or card only (its diff badge too).
+                2 => park = self.card_at(x, y),
                 // A plain middle press (SGR button 1): pin or unpin, on an
                 // agent row or card only.
-                1 => pin = t.filter(|t| matches!(t, Target::Go { .. })),
+                1 => pin = self.card_at(x, y),
                 _ => {} // a modifier held: focus only
             }
         }
         if focus {
             self.focus_back(&inp.stray);
+        }
+        if unsettled {
+            self.say("that card just moved · click again");
         }
         if let Some(t) = act {
             self.click(t);
@@ -840,10 +989,38 @@ impl App {
             self.dismiss(id);
             return;
         }
+        if let Target::Answer { win, allow, prompt, .. } = &t {
+            // A perm card's chip: answer the prompt it showed, where it is
+            // (no move). answer() discharges the window itself
+            // (clear-current), whose state notice redraws the card away.
+            let v = if *allow { crate::answer::Verdict::Allow } else { crate::answer::Verdict::Deny };
+            let r = crate::answer::answer(&self.actions, &self.core.snapshot, win, v, Some(prompt));
+            self.say(r.unwrap_or_else(|e| e));
+            return;
+        }
         let Some(client) = self.link.client.clone() else {
             self.say("no tmux client");
             return;
         };
+        if let Target::Diff(win) = &t {
+            // A card's diff badge: that agent's diff popup, on this client,
+            // told where this sidebar left the files it counted. Nothing at
+            // all when it cannot start or fails (no stdio, no message).
+            // (Never from the unit tests: their binary is the test harness.)
+            let exe = if cfg!(test) { None } else { self.exe.as_deref() };
+            let files = self.board.files_of(win);
+            let cmd = diff_command(&self.core.tmux, Some(&client), exe, win).map(|mut c| {
+                match files {
+                    Some(f) => c.env("AGENT_UI_DIFF_FILES", f),
+                    None => c.env_remove("AGENT_UI_DIFF_FILES"),
+                };
+                c
+            });
+            if let Some(Ok(child)) = cmd.map(proc::spawn_detached) {
+                self.children.push(child);
+            }
+            return;
+        }
         let snap = &self.core.snapshot;
         let moved = match t {
             Target::Go { win, session } | Target::Shell { win, session } => {
@@ -884,7 +1061,7 @@ impl App {
                 self.say("resuming the paused agents…");
                 Ok(false)
             }
-            Target::Restart | Target::Scope | Target::Toast(_) => Ok(false),
+            Target::Restart | Target::Scope | Target::Toast(_) | Target::Answer { .. } | Target::Diff(_) => Ok(false),
         };
         match moved {
             Ok(true) => self.refresh(),
@@ -921,12 +1098,12 @@ impl App {
         let spin = self.spin_at(Instant::now());
         // Ages at this frame's clock (no tmux call), so a spinner frame
         // between snapshots never shows a stale one.
-        let opts = Opts { msg, bar: self.shown_bar(), spin, now: Some(now), pause: self.pause_phase.clone() };
+        let opts = Opts { msg, bar: self.shown_bar(), spin, now: Some(now), pause: self.pause_phase.clone(), ctx: layout::CtxStyle::from_env() };
         let frame = layout(&self.view, size.width, size.height, &opts);
         let mut buf = Buffer::empty(Rect::new(0, 0, size.width, size.height));
         layout::paint(&frame, &mut buf);
         if !self.force && self.buf.as_ref() == Some(&buf) {
-            self.shown = frame;
+            self.show(frame, Instant::now());
             return Ok(());
         }
         if std::mem::take(&mut self.force) {
@@ -940,8 +1117,15 @@ impl App {
             }
         })?;
         self.buf = Some(buf);
-        self.shown = frame;
+        self.show(frame, Instant::now());
         Ok(())
+    }
+
+    /// `frame` is on screen as of `now`: clicks resolve against it, and the
+    /// guarded targets' arrival times carry over where they stayed put.
+    fn show(&mut self, frame: Frame, now: Instant) {
+        self.arrivals.update(guarded_cells(&frame), now);
+        self.shown = frame;
     }
 
     /// agent-roster.py `main`'s loop: wait for input, a notice, the client's
@@ -974,8 +1158,12 @@ impl App {
             if let Some(t) = self.toast_due(now) {
                 wake = wake.min(t);
             }
-            let fds = [self.notices.fd(), self.watch.as_ref().map(term::ProcWatch::fd)];
-            let (has_input, [noticed, exited]) = sig.wait(0, fds, wake.saturating_duration_since(now))?;
+            // Only while the insight worker holds a snapshot: its result.
+            if let Some(i) = self.insights_due(now) {
+                wake = wake.min(i);
+            }
+            let fds = [self.notices.fd(), self.watch.as_ref().map(term::ProcWatch::fd), self.insight_notices.fd()];
+            let (has_input, [noticed, exited, insight]) = sig.wait(0, fds, wake.saturating_duration_since(now))?;
             let fired = sig.take();
             if fired.exit || exited {
                 // CMD+B's kill-pane, or the tmux client next to us exited.
@@ -984,6 +1172,11 @@ impl App {
             self.force |= fired.resize;
             if noticed && self.notices.drain() > 0 {
                 due.get_or_insert(Instant::now() + notice::DEBOUNCE);
+            }
+            // (The publisher's new result: read below, take_insights, with
+            // no snapshot.)
+            if insight {
+                self.insight_notices.drain();
             }
             if has_input {
                 let Some(mut data) = term::read_stdin()? else { return Ok(()) };
@@ -1012,6 +1205,7 @@ impl App {
                 if self.pause_phase.as_ref().is_some_and(pause::Phase::in_flight) {
                     self.check_pause();
                 }
+                self.take_insights();
             }
             if self.gone {
                 return Ok(());
@@ -1059,6 +1253,7 @@ fn live(tmux: Tmux, args: &[String]) -> io::Result<()> {
         std::env::var("WEZTERM_PANE").ok().filter(|s| !s.is_empty()),
     );
     let mut app = App::new(tmux.clone(), link, Notices::register(&notice::names()));
+    app.insight_notices = Notices::register(&[notice::insight_name()]);
     app.persist = true;
     app.pins = crate::pins::Sync::for_tmux(&tmux);
     let sig = term::Signals::install()?;
@@ -1112,6 +1307,141 @@ mod tests {
         assert!(a[a.len() - 2].ends_with("agent-roster.py") && a[a.len() - 1] == "/dev/ttys999");
     }
 
+    /// A card's diff badge: `agent-ui --socket S diff <win> --client <tty>`
+    /// (no client known: without it); nothing without this binary's path.
+    /// A click on it spawns nothing here and says nothing.
+    #[test]
+    fn the_diff_badge_runs_agent_ui_diff() {
+        let t = Tmux::with_socket(Some(Socket::Name("priv".into())));
+        let exe = Some(std::path::Path::new("/x/agent-ui"));
+        let c = diff_command(&t, Some("/dev/ttys999"), exe, "@7").unwrap();
+        assert_eq!(c.get_program(), "/x/agent-ui");
+        assert_eq!(args(&c), ["--socket", "priv", "diff", "@7", "--client", "/dev/ttys999"]);
+        assert_eq!(args(&diff_command(&Tmux::default(), None, exe, "@7").unwrap()), ["diff", "@7"]);
+        assert!(diff_command(&t, None, None, "@7").is_none());
+        // No client resolved: said, like every other action.
+        let mut a = app();
+        a.click(Target::Diff("@7".into()));
+        assert_eq!((a.last_act.clone(), a.children.len()), (Some(Target::Diff("@7".into())), 0));
+        assert_eq!(a.msg.as_ref().map(|m| m.0.as_str()), Some("no tmux client"));
+    }
+
+    /// An insight for a test card: `diff` (added, removed, files), the
+    /// dirty files.
+    fn insight_with(diff: (u64, u64, usize), dirty: Vec<PathBuf>) -> crate::insight::Insight {
+        crate::insight::Insight {
+            kind: crate::insight::Kind::Claude,
+            transcript: PathBuf::from("/nonexistent/t.jsonl"),
+            doing: None,
+            todo: None,
+            prompt: None,
+            ctx_used: None,
+            ctx_window: crate::insight::WINDOW_1M,
+            diff: Some(crate::insight::DiffStat { added: diff.0, removed: diff.1, files: diff.2 }),
+            touched: dirty.len(),
+            dirty_files: dirty,
+        }
+    }
+
+    /// The diff badge under the pointer: a left press opens the diff only
+    /// once the card has settled (the chips' guard); a right or middle
+    /// press there parks or pins the card, as anywhere else on it.
+    #[test]
+    fn badge_presses_open_the_diff_or_act_on_the_card() {
+        let mut a = app();
+        let card = row("main", 1, "@1", &[("state", "running"), ("kind", "claude"), ("summary", "Sidebar"), ("since", "100 running")]);
+        let c = crate::collate::Collator::new("en_US.UTF-8");
+        let args = crate::view::BuildArgs { client: None, now: 200.0, collator: &c, git: None, log: vec![], watcher_age: Some(1.0) };
+        a.view = crate::view::ViewModel::build(&crate::tmux::Snapshot::parse(&card), args);
+        let map = [("@1".to_string(), insight_with((48, 12, 3), vec![]))].into_iter().collect();
+        crate::insight::fill(&mut a.view, &map);
+        let frame = layout(&a.view, 44, 30, &Opts::default());
+        a.show(frame, Instant::now());
+        let (x, y) = (0..30u16).flat_map(|y| (0..44u16).map(move |x| (x, y)))
+            .find(|&(x, y)| matches!(a.shown.target(x, y), Some(Target::Diff(_))))
+            .expect("a badge");
+        let go = Target::Go { win: "@1".into(), session: "main".into() };
+        assert_eq!(a.card_at(x, y), Some(go.clone()));
+        assert_eq!(a.card_at(x - 2, y), Some(go));
+        let press = format!("\x1b[<0;{};{}M", x + 1, y + 1);
+        // Just drawn: ignored, and said.
+        a.handle(press.as_bytes());
+        assert_eq!(a.last_act, None);
+        assert_eq!(a.msg.as_ref().map(|m| m.0.as_str()), Some("that card just moved · click again"));
+        // Settled there: it acts (no client here: says so).
+        let frame = a.shown.clone();
+        a.arrivals = Default::default();
+        a.show(frame, Instant::now() - crate::answer::SETTLE);
+        a.handle(press.as_bytes());
+        assert_eq!(a.last_act, Some(Target::Diff("@1".into())));
+    }
+
+    /// The shared files `agent-ui diff` reads: `<server>-<win>.files` in
+    /// `insight-files`' format, mode 0600, written when they change, gone
+    /// when the window has no dirty file left; the first sync sweeps this
+    /// server's stale ones (never another server's).
+    #[test]
+    fn dirty_files_are_published_for_the_diff_popup() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("agentui-published-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (repo, dir) = (base.join("repo"), base.join("state"));
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("77-9.files"), "stale").unwrap();
+        std::fs::write(dir.join("88-9.files"), "another server").unwrap();
+        let mut p = crate::insight::Published::new(dir.clone(), "77".into());
+        let files = vec![repo.join("src/a.rs"), repo.join("b.md"), PathBuf::from("/nowhere/c.rs")];
+        let map = [("@3".to_string(), insight_with((5, 1, 2), files)), ("@4".to_string(), insight_with((0, 0, 0), vec![]))]
+            .into_iter()
+            .collect();
+        // Not before a complete pass: nothing swept.
+        crate::insight::Published::new(dir.clone(), "77".into()).sync(&map, false);
+        assert!(dir.join("77-9.files").exists());
+        p.sync(&map, true);
+        let path = crate::insight::files_path_in(&dir, "77", "@3");
+        assert_eq!(path, dir.join("77-3.files"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{}\n\tsrc/a.rs\n\tb.md\n", repo.display()));
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!dir.join("77-9.files").exists() && !dir.join("77-4.files").exists() && dir.join("88-9.files").exists());
+        // Unchanged: not written again; gone: removed.
+        std::fs::write(&path, "kept").unwrap();
+        p.sync(&map, true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept");
+        p.sync(&std::collections::BTreeMap::new(), true);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The insight worker's results reach the view as they land, with no
+    /// snapshot ([`App::take_insights`]); the loop looks for them only while
+    /// the worker holds one ([`App::insights_due`]).
+    #[test]
+    fn insights_land_without_a_snapshot() {
+        let mut a = app();
+        assert_eq!(a.insights_due(Instant::now()), None);
+        let insights = crate::insight::Insights::with(|| {
+            let none = PathBuf::from("/nonexistent");
+            crate::insight::Engine::new(none.clone(), none.clone(), none, Box::new(crate::pins::LiveProcs))
+        });
+        a.board = crate::insight::Board::new(insights, PathBuf::from("/nonexistent/insight"));
+        // (No client row, so no server to elect over: solo, its own engine;
+        // a window, so not a failed snapshot.)
+        a.core.snapshot = crate::tmux::Snapshot::parse(&row("main", 1, "@1", &[]));
+        a.board.refresh(&a.core.snapshot, None);
+        assert!(a.board.runs() && !a.board.holder());
+        a.insight_gen = a.board.generation();
+        let t0 = Instant::now();
+        while a.board.pending() && t0.elapsed() < Duration::from_secs(5) {
+            assert!(a.insights_due(Instant::now()).is_some());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before = a.insight_gen;
+        a.take_insights();
+        assert!(a.insight_gen > before);
+        assert_eq!(a.insights_due(Instant::now()), None);
+    }
+
     /// An App over a tmux socket that does not exist (no command here can
     /// start a server) and no client (so no action runs: click() says "no
     /// tmux client"), showing an empty 34x30 frame.
@@ -1135,6 +1465,59 @@ mod tests {
         a.last_act = None;
         a.handle(b"\x1b[<32;3;20M\x1b[<0;3;20m");
         assert_eq!((a.focus_backs, a.last_act.clone()), (1, None));
+    }
+
+    /// A perm card's chip trusts a left press only once that same chip has
+    /// sat under the pointer [`crate::answer::SETTLE`], however often the
+    /// frame redraws meanwhile (a working agent's spinner every 125 ms), and
+    /// starts over when another prompt's chip takes the cell. A right or
+    /// middle press on a chip acts on the card (park / pin).
+    #[test]
+    fn answer_chips_wait_for_their_frame_to_settle() {
+        let mut a = app();
+        let view = |since: &str| {
+            let rows = [
+                row("main", 1, "@1", &[("state", "needs-input"), ("kind", "claude"), ("detail_kind", "perm"),
+                    ("detail", "Bash ls"), ("summary", "Perm"), ("since", &format!("{since} needs-input"))]),
+                row("main", 2, "@2", &[("state", "running"), ("kind", "claude"), ("summary", "Busy"), ("since", "100 running")]),
+            ];
+            let c = crate::collate::Collator::new("en_US.UTF-8");
+            let args = crate::view::BuildArgs { client: None, now: 200.0, collator: &c, git: None, log: vec![], watcher_age: Some(1.0) };
+            crate::view::ViewModel::build(&crate::tmux::Snapshot::parse(&rows.join("\n")), args)
+        };
+        let frame = |v: &crate::view::ViewModel, spin: usize| layout(v, 34, 30, &Opts { spin, ..Opts::default() });
+        let (v100, v150) = (view("100"), view("150"));
+        let ms = |n: u64| Instant::now() - Duration::from_millis(n);
+        // The spinner really redraws the frame.
+        assert_ne!(frame(&v100, 0).rows.iter().map(|r| r.text()).collect::<Vec<_>>(),
+            frame(&v100, 1).rows.iter().map(|r| r.text()).collect::<Vec<_>>());
+        a.show(frame(&v100, 0), ms(300));
+        let (x, y) = (0..30u16).flat_map(|y| (0..34u16).map(move |x| (x, y)))
+            .find(|&(x, y)| matches!(a.shown.target(x, y), Some(Target::Answer { allow: true, .. })))
+            .expect("a chip");
+        let press = format!("\x1b[<0;{};{}M", x + 1, y + 1);
+        // On screen 300 ms, redrawn every 125 ms since: not settled.
+        a.show(frame(&v100, 1), ms(175));
+        a.show(frame(&v100, 2), ms(50));
+        a.handle(press.as_bytes());
+        assert_eq!(a.last_act, None);
+        assert_eq!(a.msg.as_ref().map(|m| m.0.as_str()), Some("that card just moved · click again"));
+        // The same chip there 450 ms, spinner or not: it answers (here:
+        // refused, no server).
+        a.arrivals = Default::default();
+        a.show(frame(&v100, 0), ms(450));
+        a.show(frame(&v100, 3), ms(100));
+        a.handle(press.as_bytes());
+        assert!(matches!(&a.last_act, Some(Target::Answer { win, allow: true, prompt, .. }) if win == "@1" && prompt == "100 Bash ls"));
+        // Another prompt's chip in the same cell: its own clock.
+        a.last_act = None;
+        a.show(frame(&v150, 4), ms(50));
+        a.handle(press.as_bytes());
+        assert_eq!(a.last_act, None);
+        // Right / middle press on a chip: the card's own target.
+        assert_eq!(a.card_at(x, y), Some(Target::Go { win: "@1".into(), session: "main".into() }));
+        a.handle(format!("\x1b[<2;{};{}M", x + 1, y + 1).as_bytes());
+        assert_eq!(a.last_park, Some(("@1".into(), "main".into())));
     }
 
     /// `PARKED N` runs exactly prefix h's line (tmux.conf.tmpl, read when

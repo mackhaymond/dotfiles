@@ -83,6 +83,10 @@ impl Server {
             .env_remove("WEZTERM_PANE")
             // (Never the real transcripts: no activity blurbs here.)
             .env("AGENT_UI_CLAUDE_DIR", "/nonexistent")
+            .env("AGENT_UI_CLAUDE_SESSIONS", "/nonexistent")
+            .env("CODEX_HOME", "/nonexistent")
+            // (No insight read at all: hermetic.)
+            .env("AGENT_UI_NO_INSIGHT", "1")
             // (Nor Mack's pause state: no pause banner here.)
             .env("AGENT_PAUSE_STATE_DIR", NO_PAUSE)
             .output()
@@ -352,7 +356,7 @@ fn right_click_parks_through_stash_sh() {
     std::fs::write(&path, script).unwrap();
     assert!(Command::new("chmod").args(["+x", path.to_str().unwrap()]).status().unwrap().success());
     let (state, focus) = notice_names("park");
-    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_UI_SCRIPTS={} AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}",
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_UI_NO_INSIGHT=1 AGENT_INSIGHT_NOTICE=com.mackhaymond.agent-ui.test.insight CODEX_HOME=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_UI_SCRIPTS={} AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}",
         dir.display(), s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
@@ -429,7 +433,7 @@ fn the_dashboard_pane_is_never_a_target() {
     let jump = dir.join("agent-jump.sh");
     std::fs::write(&jump, "#!/bin/sh\n[ \"$1\" = goto ] && tmux switch-client -c \"$2\" -t \"$3\"\nexit 0\n").unwrap();
     let (state, focus) = notice_names("dash");
-    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_UI_SCRIPTS={} AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}",
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_UI_NO_INSIGHT=1 AGENT_INSIGHT_NOTICE=com.mackhaymond.agent-ui.test.insight CODEX_HOME=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_UI_SCRIPTS={} AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}",
         dir.display(), s.name);
     s.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
@@ -465,7 +469,7 @@ fn key_table_marks_clear_without_a_notice() {
     s.tmux(&["bind-key", "-T", "jump", "a", "display-message", "a"]);
     let tty = s.nested_client("work", "main:8");
     let (state, focus) = notice_names("keys");
-    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_UI_NO_INSIGHT=1 AGENT_INSIGHT_NOTICE=com.mackhaymond.agent-ui.test.insight CODEX_HOME=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
     wait_for("the first frame", || screen().contains("NEEDS YOU"));
@@ -524,7 +528,7 @@ fn notify_toasts_in_the_sidebar_and_falls_back_without_one() {
     std::fs::create_dir_all(&dir).unwrap();
     let log = dir.join("log");
     let (state, focus) = notice_names("toast");
-    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_UI_NO_INSIGHT=1 AGENT_INSIGHT_NOTICE=com.mackhaymond.agent-ui.test.insight CODEX_HOME=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
     let opt = |o: &str| s.tmux(&["show-options", "-gqv", o]).trim().to_string();
@@ -633,7 +637,7 @@ fn live_loop_draws_follows_notices_and_exits_quietly() {
     s.tmux(&["set-option", "-w", "-t", "work:2", "@agent_state", "idle"]);
     s.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
     let (state, focus) = notice_names("live");
-    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}", s.name);
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_UI_NO_INSIGHT=1 AGENT_INSIGHT_NOTICE=com.mackhaymond.agent-ui.test.insight CODEX_HOME=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
     wait_for("the first frame", || screen().contains("NEEDS YOU"));
@@ -694,7 +698,7 @@ fn the_sidebar_leaves_with_its_client() {
     s.tmux(&["set-option", "-g", "status-interval", "1"]);
     s.tmux(&["set-option", "-g", "status-right", &format!("#(touch '{}')x", job.display())]);
     let (state, focus) = notice_names("alone");
-    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_UI_NO_INSIGHT=1 AGENT_INSIGHT_NOTICE=com.mackhaymond.agent-ui.test.insight CODEX_HOME=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     let screen = || s.tmux(&["capture-pane", "-p", "-t", "main:9"]);
     wait_for("the first frame", || screen().contains("NEEDS YOU"));
@@ -804,7 +808,7 @@ fn status_jobs_run_quietly() {
     s.tmux(&["set-option", "-g", "status-interval", "1"]);
     s.tmux(&["set-option", "-g", "status-right", &format!("#(date +%S)#(echo oops >&2; false)#(touch '{}')x", job.display())]);
     let (state, focus) = notice_names("quiet");
-    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
+    let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_UI_NO_INSIGHT=1 AGENT_INSIGHT_NOTICE=com.mackhaymond.agent-ui.test.insight CODEX_HOME=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {tty}", s.name);
     s.tmux(&["new-window", "-d", "-t", "main:9", "-n", "sb", &cmd]);
     wait_for("the status job", || job.exists());
     std::fs::remove_file(&job).unwrap();
@@ -826,7 +830,7 @@ fn the_registry_counts_sidebars_and_repairs_crashes() {
     let opt = |o: &str| s.tmux(&["show-options", "-gqv", o]).trim().to_string();
     let (state, focus) = notice_names("reg");
     let start = |win: &str| -> String {
-        let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}", s.name);
+        let cmd = format!("env AGENT_UI_CLAUDE_DIR=/nonexistent AGENT_UI_NO_INSIGHT=1 AGENT_INSIGHT_NOTICE=com.mackhaymond.agent-ui.test.insight CODEX_HOME=/nonexistent AGENT_PAUSE_STATE_DIR=/nonexistent/agent-pause AGENT_STATE_NOTICE={state} AGENT_FOCUS_NOTICE={focus} {BIN} --socket {} sidebar --client {CLIENT}", s.name);
         s.tmux(&["new-window", "-d", "-t", win, "-n", "sb", &cmd]);
         wait_for("a first frame", || s.tmux(&["capture-pane", "-p", "-t", win]).contains("NEEDS YOU"));
         s.tmux(&["display-message", "-p", "-t", win, "#{pane_pid}"]).trim().to_string()

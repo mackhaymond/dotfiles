@@ -241,6 +241,10 @@ pub struct Agent {
     /// A Codex agent's rollout (transcript) path (`@agent_rollout`), "" for
     /// any other: where its blurb comes from.
     pub rollout: String,
+    /// Its diff, doing line and context fullness, from its transcript (the
+    /// sidebar's [`crate::insight::Insights`], a refresh or two behind);
+    /// None otherwise and from [`Agent::from_window`] alone.
+    pub insight: Option<crate::insight::Insight>,
     /// The window is its space's HOME (`@space_home` 1): the space itself,
     /// never a shell row of its own and never lettered.
     pub home: bool,
@@ -306,6 +310,7 @@ impl Agent {
             selected: w.stash_sel,
             blurb: None,
             rollout: w.rollout.clone(),
+            insight: None,
             home: w.home,
             shell: shell_label(w),
             pinned: w.pinned,

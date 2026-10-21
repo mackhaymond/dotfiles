@@ -1,0 +1,25 @@
+
+⏺ Write(probe3.txt)
+  ⎿  User rejected write to probe3.txt
+      1 hi
+
+✻ Brewed for 1s · done 8:06 AM
+
+❯ Use the AskUserQuestion tool to ask me: Do you want to proceed? with options Yes and No
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Proceed
+
+Do you want to proceed?
+
+❯ 1. Yes
+     Continue with the next step.
+  2. No
+     Stop here and make no further changes.
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+
+

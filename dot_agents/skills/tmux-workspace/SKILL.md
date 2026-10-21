@@ -303,13 +303,14 @@ Prefix is **⌃S**. ⌘ chords come from WezTerm.
 | ⌥\` | agent ↔ last-visited shell of this space |
 | ⌥W then a letter | jump to that agent or shell, any space; never a home (Esc cancels; a miss says "jump: nothing on x") |
 | ⌥W then 1-9 | jump to the Nth pinned agent (`@pin_key`, the sidebar's PINNED section, any space; a miss says "no pin N") |
+| ⌥W then Shift+letter | that agent's uncommitted diff in a popup, only the files IT edited (`agent-ui diff @W`); you stay put; Esc / q close it; nothing dirty says "d: no uncommitted changes", a shell or nobody "diff: no agent on x" |
 | ⌥S | next tab that needs you (CuaNotch owns it; prefix d is tmux's) |
 | ⌥X / ⌥C | back / forward through visited tabs (prefix D undoes a whole run of ⌥S jumps) |
 | ⌥N | new space (folder picker; reuses a space already on that folder) |
 | ⌥M | move this tab to another space |
 | ⌥V | sidebar scope: this space ↔ all spaces |
 | ⌘B | sidebar on/off |
-| prefix q | agent menu (lists agents only; letters jump, a shell's too; Tab filters; Space then s park / x close / p pin / v preview) |
+| prefix q | agent menu (lists agents only; letters jump, a shell's too; Tab filters; Space then y allow / n deny on a permission prompt, s park / x close / p pin / d diff / v preview) |
 | prefix H / prefix h | park this tab / unpark (picker) |
 | prefix v | select a range of tabs (h/l extend, H or ⏎ park, m move, Esc) |
 | prefix Q | close this space (y/n; never main) |

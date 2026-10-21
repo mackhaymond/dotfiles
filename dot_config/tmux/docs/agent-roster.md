@@ -141,7 +141,7 @@ agent-ui menu keys:
 | ⏎ | go to the selected row (a parked tab comes back via `stash.sh unstash`; the `▪ N parked` row opens the Parked filter); a click selects, a second click goes |
 | Tab / Shift-Tab | cycle the filter: All, Active, Needs you, Working, Idle, Parked |
 | `/` | search title, session, `session:index`, detail and path as you type (letters and digits type); ⏎ goes to the selected match; Esc leaves and clears it (a second Esc closes); Backspace on an empty query leaves it |
-| Space | the actions strip for the selected row, in the footer; the next key runs one, Esc cancels: `p` pin / unpin (the sidebar's PINNED section, at once, no y/n; the strip says which), `s` park (`stash.sh stash`, after y/n), `x` close the agent's pane through `closed-tabs.sh` after y/n (CMD+Z undoes it; on a parked row: discard via `stash.sh kill-many`), `v` preview strip on/off (was `p`), `r` restart the watcher, ⏎ go. A parked row offers neither `p` nor `s` |
+| Space | the actions strip for the selected row, in the footer; the next key runs one, Esc cancels: `p` pin / unpin (the sidebar's PINNED section, at once, no y/n; the strip says which), `s` park (`stash.sh stash`, after y/n), `x` close the agent's pane through `closed-tabs.sh` after y/n (CMD+Z undoes it; on a parked row: discard via `stash.sh kill-many`), `d` its uncommitted diff in a popup (any row, parked too: the menu closes, and `agent-ui diff --after <menu pid>` opens it once the menu's popup is gone; see [Agent insight](#agent-insight-srcinsightrs)), `v` preview strip on/off (was `p`), `r` restart the watcher, ⏎ go. A parked row offers neither `p` nor `s`. A Claude agent waiting on a permission prompt offers `y` allow and `n` deny first (at once, no y/n: see [Answering a permission prompt](#answering-a-permission-prompt-srcanswerrs)) |
 | Option-S / Option-X | next tab that needs you (agent-jump.sh) / one step back through the tabs you were on (nav.sh, the same Option-X as everywhere: [nav.md](nav.md)), and close. When CuaNotch's `keyJumpToNeedy` is opt+s (this machine's setting), CuaNotch owns Option-S, so while it runs only Option-X reaches the menu |
 | Esc / C-c | close |
 
@@ -984,7 +984,18 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   anywhere in the list. Quiet by default: the letter bold in the colour on the
   colour at 22% over its card (`text` for a dark colour). SOLID (dark ink
   on the colour) only where you look next: the client's own agent, an
-  asking or failed one, every NEEDS YOU card. The letter is the window's lifetime letter (one
+  asking or failed one, every NEEDS YOU card. A WORKING agent's cap
+  BLINKS (`layout::blink_on`): solid in the working blue (dark ink) in even
+  wall-clock seconds (the client's own, already solid, inverts instead: a
+  blue letter on `crust`, so it shows even in a blue space), its usual look
+  (quiet, or the client's solid) in odd
+  ones, so "working" reads from the left edge where the list is scanned,
+  not only from the word on the right (Mack, 2026-10-21: "second on, second
+  off"). Every sidebar blinks in step; it rides the spinner's 8 fps redraw
+  (no wakeup of its own), and its rail stays a steady blue `▎` down both
+  rows (the blinking cap is the one moving thing; a steady rail keeps the
+  edge saying "working" in the off second). Asking, failed, done, idle and
+  paused caps never blink; ⌥W armed wins over both phases. The letter is the window's lifetime letter (one
   pool for agents and shells), from the menu's own assignment
   (`menu::letters::of_view`, see [letter keys](#agent-ui-menu-letter-keys)).
   A live sidebar persists the letters it assigns to `@agent_key` exactly
@@ -1388,6 +1399,249 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   a sidebar and after the sidebar closes; `tests/test_notify.py` covers the
   script's CLI, sanitising, decision, the record stack (at most 4, expired
   dropped, 6-field records kept, the title field) and log.
+
+### Agent insight (`src/insight.rs`)
+
+Per agent, from its OWN transcript (several agents often share one checkout
+with no worktrees, so `git diff` of the folder is everyone's work): the
+files it edited that are still uncommitted (`+48 −12 · 3f`), what it is
+doing, and how full its context is (`Agent::insight` in the view). On the
+cards (`layout.rs`, `says` / `extras`):
+
+```text
+ ▎  d  Tmux Agent Sidebar      ⠹ working
+ ▎     › Wiring the badge +48 −12 · 3f 85% 1m   working: its todo
+    g  Lost suit jacket
+       > find the receipt         +5 62% 7m    idle: your last prompt
+```
+
+- **Row 2 says**, first that applies: an asking / failed agent's reason
+  (unchanged); a working agent's in-progress todo, else its live activity
+  (both after the blue `›`), else its run detail (`Edit layout.rs`), else
+  your last prompt; a done agent's message; an idle one's old outcome,
+  else your last prompt. A prompt reads after a faint `> ` (how Claude Code
+  marks what you typed), never the blue `›` of what it does now.
+  `no reply yet` / `no activity yet` only when there is nothing at all.
+- **Diff badge**, before the age: `+48` dim green, `−12` dim red (a zero
+  side left out), ` · 3f` dim; none while clean. A click on it runs
+  `agent-ui diff <win> --client <tty>` (nothing when that fails; `no tmux
+  client` without one; ignored, like the answer chips, until the card has
+  sat 400 ms), with `AGENT_UI_DIFF_FILES` naming its shared file (below)
+  when there is one; a right or middle press there still parks or pins the
+  card. NEEDS YOU cards carry it too (line 2, never beside the answer
+  chips); a one-line card puts it before the state word.
+- **One publisher per server** (`insight::Board`, `src/insight/board.rs`).
+  Every WezTerm tab runs a sidebar; only the one holding `<dir>/<key>.lock`
+  (`flock(LOCK_EX|LOCK_NB)`, held for its life, let go by the kernel
+  however it exits) runs the insight engine and writes the shared files.
+  The others run NO engine: they mirror `<key>.json` whenever `<key>.gen`
+  changes, woken at once by the publisher's Darwin notice
+  (`com.mackhaymond.agent-ui.insight`, `$AGENT_INSIGHT_NOTICE`; on a fd of
+  its own, read with no snapshot), so every sidebar's badges agree; and
+  they try the lock again on every refresh, so one takes over when the
+  holder is gone. Taking the lock first removes what the key had published
+  (`.gen` first: a crashed holder's files are never trusted) and other
+  servers' leftovers whose lock nobody holds (`.gen`, `.json`, `.files`;
+  their `.lock` once untouched a day; temp files after a minute). A worker
+  that gives up (3 engine panics, or no thread) removes `.gen`, then lets
+  the lock go, for good; a holder exiting cleanly does the same; a publish
+  that cannot write (full or read-only disk) ends publishing (its own
+  engine kept). A FAILED snapshot (tmux did not answer) changes nothing:
+  the key stands and the engine never sees it (it would forget every
+  window's history). No key known yet, or a folder it cannot use: its own
+  engine, nothing published.
+- **Shared files**, under `<dir>` = `$AGENT_UI_INSIGHT_DIR`, else
+  `$XDG_STATE_HOME/agent-ui/insight`, else `~/.local/state/agent-ui/insight`
+  (`insight::files_dir`). `<key>` = `<#{start_time}>_<8 hex: FNV-1a of
+  #{socket_path}>` (`board::server_key`: a restart renumbers windows, so a
+  new key; two servers started in the same second still differ):
+  - `<key>-<window id without @>.files` (`files_path(key, win)`): that
+    agent's dirty files, `insight-files`' format exactly (each repo's work
+    tree on its own line, then its files repo-relative after a tab).
+    Written only when the set changed; removed once the window has no
+    dirty file or is gone.
+  - `<key>.json`: every window's insight (`board::encode`: `generation`,
+    then `windows` → `{kind, transcript, doing, todo, prompt, ctx_used,
+    ctx_window, diff: {added, removed, files} | null, dirty_files,
+    touched}`).
+  - `<key>.gen`: `<pid> <generation> <complete>`, written LAST after each
+    result (`complete` 1 once a pass with every repo answered whole landed
+    since this holder took the lock); then the lock file is touched and
+    the notice posted.
+  - `<key>.lock`: the election.
+  All written atomically (temp file + rename), 0600, folder 0700. A reader
+  (`agent-ui diff`) trusts the `.files` only while `board::verified`: `.gen`
+  there saying complete, and the lock held (a try fails); else its own
+  one-off engine, ` · unverified`. `AGENT_UI_DIFF_FILES` (the click passes
+  it) comes first.
+- **Context meter**, from 50% full: `72%`, dim, amber (`peach`) from 80%,
+  red from 90%. `CTX_STYLE` picks it; `$AGENT_UI_CTX_STYLE=glyph` draws one
+  cell by eighths instead (`▄` half, `▇` 85%).
+- **Narrow**: the file count goes first, then a dim meter, then the badge,
+  then a PINNED card's space tag, then the meter, before the doing text
+  has under 12 cells past its mark (`DOING_MIN`, or its whole). At 34
+  columns a working card keeps `+48 −12` beside a 12-cell doing line; an
+  amber or red meter outranks the badge there.
+- **Freshness**: the worker's result lands after the refresh that asked
+  for it; while it holds a snapshot (at most 10 s) the publisher's loop
+  looks every 0.5 s (`TICK`) and puts a new generation into the view (and
+  the shared files) without a snapshot; a mirror reads it when the
+  insight notice wakes it. `sidebar --once` reads the insight once, synchronously.
+  `AGENT_UI_NO_INSIGHT=1` reads none at all, live or `--once` (the
+  integration tests set it).
+
+- **Transcript.** Claude: the window's session id as the pins resolve it
+  (`pins::sessions`), then `~/.claude/projects/<slug>/<sid>.jsonl` (else a
+  scan of the project folders, cached), plus `<sid>/subagents/*.jsonl` for
+  its subagents' edits. Codex: `@agent_rollout`, else
+  `~/.codex/sessions/*/*/*/rollout-*-<@agent_session_id>.jsonl`. OpenCode:
+  none.
+- **Reads.** Incremental per file by (inode, len, mtime): only appended
+  whole lines (a half-written one is read again whole); shrunk, replaced or
+  rewritten → parsed again. At most the last 32 MB on first sight (an edit
+  further back in a 100 MB transcript is not attributed). Lines are
+  JSON-parsed only when a substring test says they matter.
+- **Extracts.** Touched files: Claude Edit / Write / MultiEdit /
+  NotebookEdit (an errored call does not count), Codex `FileChange` items
+  (else `apply_patch` paths). Doing: the latest todo list's in-progress item
+  (TodoWrite, TaskUpdate, Codex `update_plan`), else the last real prompt
+  (no tool results, meta, notifications, peer messages; `<pasted_content>`
+  tags off; first line). Context: Claude's latest usage (input + cache read
+  + cache creation) of 1M for a `[1m]` id / Fable / anything seen past 200k,
+  else 200k; Codex `token_count` (`last_token_usage.input_tokens` of
+  `model_context_window`).
+- **Diff.** Touched files by repo root; per repo one `git diff --numstat -z
+  --no-renames HEAD -- <files>` plus `git ls-files --others
+  --exclude-standard` (untracked = all lines added), `--no-optional-locks`,
+  3 s timeout; asked again only when the files, index, HEAD or HEAD reflog
+  changed, and at most every 5 s (a half answer, one of the two failed, is
+  asked again). Committed files drop out by themselves, and once a current
+  answer shows a file clean after an agent's last settled edit of it, a
+  later change there is not that agent's until it edits the file again
+  (A's committed edit never lends A the diff B makes afterwards).
+- **Doing and context, refined.** A real prompt newer than the todo list
+  hides its stale in-progress item; `[message from @…]` (another agent) is
+  no prompt; a model switch or a compaction forgets the usage peak.
+- **Threading.** The sidebar's `Insights` hands the latest snapshot to its
+  own worker thread at most every 2 s, only while that is idle; a frame
+  reads the last results and never waits (`generation()` moves when new
+  ones land). A panic in the engine is caught (never stuck busy), the
+  engine is made afresh, and three in a row turn insights off. Transcripts
+  and untracked files are opened non-blocking and only when regular (a
+  FIFO never hangs the worker).
+- **CLI.** `agent-ui insight [@id] [--json]` prints them;
+  `agent-ui insight-files @id` prints that agent's dirty files: each repo's
+  work tree on its own line, then its files repo-relative, one per line
+  after a tab.
+- **Diff popup** (`src/diff.rs`). `agent-ui diff @id --client tty` (the
+  client is required: tmux would guess one) shows those files' uncommitted
+  diff, nobody else's. The files: `AGENT_UI_DIFF_FILES` (the sidebar's
+  click passes its own published file), else, while `@sidebar_open` says a
+  sidebar runs, its published file for the window (`insight::files_path`,
+  keyed by the server's `#{start_time}`; none = nothing dirty, as the badge
+  says), else a one-off engine over the window, whose title ends `·
+  unverified` (no attribution history, last 32 MB only). Per repo `git diff
+  --no-renames HEAD -- <files>` (the empty tree before a first commit),
+  then each untracked one as an addition (`git diff --no-index /dev/null
+  <file>`; at most 200, none over 1 MB: a `# untracked, not shown: …` line
+  instead); pathspecs in batches of at most 128 KB, never one argv near
+  ARG_MAX; several repos each start with a `# repo <root>` line (a magenta
+  rule in the less fallback). A git that fails says `diff: git failed in
+  <root>: <its first error line>`. The plain diff goes to a 0600 temp file
+  and a `display-popup -w 90% -h 85% -x <@popup_x>` titled ` d · <title> ·
+  +A −R · Nf ` pages it: `delta` (git's `core.pager` here, so its `[delta]`
+  config) through `less -R -c --mouse`, else `less -R` over the diff in
+  git's colours (`AGENT_UI_DIFF_PAGER=less` forces that). No `-E`: tmux
+  closes the popup on Esc / C-c itself (less cannot tell a bare Esc from an
+  arrow key's), and after `q` the script runs `display-popup -C -c <tty>`.
+  The popup opens the file, unlinks it, then pages (its command and `-d`
+  are not formats: no `#` doubling there). Nothing dirty: no popup,
+  notify.sh says `d: no uncommitted changes` (the letter, else the title);
+  not an agent / no transcript / gone: said the same way. Exit 0 shown, 1
+  refused, 2 usage. It returns when the popup closes (tmux's display-popup
+  client waits), so callers run it detached or from `run-shell -b`. tmux
+  silently opens no popup over one still up: the temp file still there
+  afterwards says so (`diff: popup could not open`, exit 1). The menu's
+  Space d passes `--after <its pid>` and closes; the diff waits for that
+  pid first and retries once 300 ms later. Keys: ⌥W then ⇧letter
+  (spaces.conf, docs/spaces.md), the menu's Space d, a card's diff badge.
+  `--print` prints the popup's tmux argv, one per line, instead.
+
+### Answering a permission prompt (`src/answer.rs`)
+
+A Claude agent in NEEDS YOU on a tool-permission prompt (`@agent_state`
+needs-input, `@agent_detail_kind` perm, `@agent_kind` claude) can be
+allowed or denied without going to its tab:
+
+- **Sidebar.** Its NEEDS YOU card ends line 2 with two square caps,
+  ` y  allow   n  deny` (solid green / red key-caps, the words on the
+  card's own colour; still two rows, one background), and its age moves up
+  beside `◉ perm`. Under 39 columns (Mack's usual 34) the caps alone,
+  ` y   n `, so the detail keeps its room; under 26 (no second lines) and on
+  one-line cards in a squeezed frame, none. A left click on a cap or its
+  word answers; the rest of the card still goes there.
+- **Menu.** On that agent's row the Space strip lists `y allow` and
+  `n deny` first: Space y / Space n answer at once (no y/n of the menu's
+  own; the capture below is the check).
+- **CLI.** `agent-ui answer <@id> allow|deny [--client <tty>]`: exit 0
+  sent, 1 refused (said through notify.sh, warn, to `--client` when given;
+  `$NOTIFY_SH` names another), 2 usage.
+
+Every path runs `answer::answer`, which sends nothing unless it is sure:
+
+1. The window (as the current snapshot has it) is a Claude agent still
+   in needs-input on a permission gate. Codex (`answer Codex prompts in its
+   tab`), OpenCode and unknown kinds are refused: Codex's approval overlay
+   ("Would you like to run the following command?", `› 1. Yes, proceed`)
+   has not been verified on a live pane, so its keys are not guessed.
+2. It is the prompt the click or key saw: a chip and a menu row carry the
+   prompt they drew (`answer::prompt_key`: `@agent_since` and the detail),
+   and a window on another prompt by now is refused (`that prompt changed
+   · look again`). The sidebar also trusts a left press on a chip (or a
+   diff badge) only once that same target (window, allow / deny, prompt)
+   has sat at that cell for 400 ms (`answer::Arrivals`, kept per target
+   and cell across redraws, so the spinner's 125 ms redraws never restart
+   or fake it): perm cards' chips stack in one column, so a card leaving
+   would slide the next card's chip under a click aimed at the old one. A
+   right or middle press on a chip parks or pins the card, as anywhere on
+   it.
+3. `capture-pane -p` of the agent's own pane (`Actions::agent_pane`, by
+   TTY in a split) shows Claude Code's dialog as the LAST thing on screen
+   (`answer::detect`, against captures of Claude Code 2.1.306 in
+   `src/answer/fixtures/`): the last line starting `Do you want to` (`…
+   proceed?`, `… create x.txt?`, `… make this edit to …?`), numbered options
+   under it in order, one reading exactly `Yes` and a `No…` one last, then
+   only blanks, wrapped option lines and the `Esc to cancel · Tab to
+   amend` footer. An answered prompt (the input box is back), an
+   AskUserQuestion picker (`Type something.`, `Chat about this`, `Enter to
+   select`) or any other layout is refused, with nothing sent; so is the
+   select's `❯` anywhere but on the `Yes` line (moved onto an editable
+   "don't ask again" row, a digit would type into it).
+4. The capture rides in one tmux call with the pane's `cursor_y`,
+   `history_size`, `pane_in_mode`, `pane_mode` and `synchronize-panes`,
+   and the keys go through ONE `if-shell -F -t %N` whose condition is
+   those same values plus the window's `@agent_since` and `@agent_detail`
+   as the snapshot read them (escaped as format literals: `#,` `#}` `##`)
+   (`answer::plan`): a pane that redrew or scrolled in between, or a
+   prompt asked again in between, gets nothing (`its screen changed · try
+   again`), checked by tmux itself at the send. Keys go to the
+   pane by id: allow is the `Yes` option's digit (`1`: the single-use yes,
+   never "Yes, and don't ask again"; Claude's select takes a digit as the
+   pick), deny is `Escape` (the dialog's cancel, the same as its No). A
+   pane left in copy or view mode (scrolled back) captures its live screen
+   but would eat the keys as copy-mode commands, so `send-keys -X cancel`
+   leads the same command list (only the scroll position is lost: the
+   point is not having to go there); any other pane mode, and a window
+   with `synchronize-panes` on (the key would reach every pane), is
+   refused.
+5. Then the window is discharged exactly as a look at it would: the
+   indicator's own focus-hook entry point, `agent-tab-indicator.sh
+   clear-current <window>` (needs-input → idle, `@agent_pending` and
+   `@agent_seen_at` stamped), run through `run-shell` so it has the
+   server's `$TMUX`. A denied call fires no PostToolUse, so without it the
+   card stayed; and during a long allowed tool a second click would have
+   answered the NEXT prompt. An allowed tool's heartbeat still re-arms
+   `running` from the pending stamp, as after any answered prompt.
 
 ## Launch speed
 

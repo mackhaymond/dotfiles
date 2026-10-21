@@ -226,6 +226,22 @@ impl Effects for Live {
         crate::sidebar::notice::post(&crate::sidebar::notice::names()[0]);
         Ok(crate::pins::said(&t))
     }
+    fn answer(&mut self, win: &str, allow: bool, prompt: &str) -> Result<String, String> {
+        let v = if allow { crate::answer::Verdict::Allow } else { crate::answer::Verdict::Deny };
+        crate::answer::answer(&self.actions, &self.snap, win, v, Some(prompt))
+    }
+    fn diff(&mut self, win: &str) -> Result<(), String> {
+        // Its own session (this popup's close must not take it along); it
+        // waits for this process (`--after`), since tmux opens no popup
+        // over one still up, and says a refusal through notify.sh.
+        let exe = std::env::current_exe().map_err(|e| format!("diff: {e}"))?;
+        let mut c = std::process::Command::new(exe);
+        if let Some(crate::tmux::Socket::Name(s) | crate::tmux::Socket::Path(s)) = &self.actions.tmux.socket {
+            c.args(["--socket", s]);
+        }
+        c.args(["diff", win, "--client", &self.client, "--after", &std::process::id().to_string()]);
+        crate::proc::spawn_detached(c).map(drop).map_err(|e| format!("diff: {e}"))
+    }
 }
 
 /// `--once`: one frame of the live server, read-only.

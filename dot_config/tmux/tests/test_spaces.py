@@ -156,6 +156,13 @@ class ConfigShape(unittest.TestCase):
         pin = [f'bind -T jump {n} {{ set -g @space_pin_n {n} ; run-shell -C "#{{E:@space_pin_go}}" ; '
                f'run-shell -b "notifyutil -p com.mackhaymond.tmux.focus" }}' for n in range(1, 10)]
         self.assertEqual([l for l in on_branch().splitlines() if re.match(r"bind -T jump [0-9] ", l)], pin)
+        # ⌥W then a capital: that agent's diff, the letter lowercased into the
+        # same @space_jump_key; all 26, nothing else in capitals.
+        diff = [f'bind -T jump {c.upper()} {{ set -g @space_jump_key {c} ; run-shell -C "#{{E:@space_diff_go}}" ; '
+                f'run-shell -b "notifyutil -p com.mackhaymond.tmux.focus" }}' for c in "abcdefghijklmnopqrstuvwxyz"]
+        self.assertEqual([l for l in on_branch().splitlines() if re.match(r"bind -T jump [A-Z] ", l)], diff)
+        for opt in ("@space_diff_hit", "@space_diff", "@space_diff_go"):
+            self.assertIn(f"\nset -gu {opt}\n", else_branch())
 
     def test_user_keys_match_wezterm_and_are_set_in_both_modes(self):
         head = SPACES.read_text().split('\n%if "#{==:#{@spaces},on}"\n')[0]
@@ -987,6 +994,35 @@ class Spaces(Server):
         self.key("M-w", "j")
         self.wait(self.on, f"zed:{Z2}")
 
+    def test_option_w_capital_shows_that_agents_diff_and_stays(self):
+        # ⌥W ⇧P: `agent-ui diff <P's window> --client <tty>` (the stand-in
+        # logs it); the client stays put. A shell's letter, a hidden
+        # session's, or nobody's: "diff: no agent on x", agent-ui never runs.
+        calls = self.fake_agent_ui()
+        self.source()                                                    # (its load's repair)
+        before = len(calls())
+        self.t("set", "-w", "-t", self.P2, "@agent_key", "p")            # an agent, another space
+        self.t("set", "-w", "-t", self.M3, "@agent_key", "k")            # a shell
+        hid = self.t("list-windows", "-t", "agents", "-F", "#{window_id}").split()[0]
+        self.t("set", "-w", "-t", hid, "@agent_key", "h")
+        self.t("set", "-w", "-t", hid, "@agent_state", "idle")           # an agent, but hidden
+        here = self.on()
+        self.key("M-w", "P")
+        self.wait(lambda: calls()[before:], [f"diff {self.P2} --client {self.client}"])
+        self.assertEqual(self.on(), here)
+        self.assertEqual(self.table(), "root")
+        for k in ("K", "H", "Z"):
+            self.key("M-w", k)
+            self.wait(self.table, "root")
+        for k in ("k", "h", "z"):
+            self.wait(lambda: ["warn", self.client, f"diff: no agent on {k}"] in self.said(), True)
+        self.assertEqual(calls()[before:], [f"diff {self.P2} --client {self.client}"])
+        self.assertEqual(self.on(), here)
+        # No binary: said, not run.
+        self.t("set", "-g", "@space_agent_ui", os.path.join(self.tmp, "missing"))
+        self.key("M-w", "P")
+        self.wait(lambda: ["warn", self.client, "diff: agent-ui is not installed"] in self.said(), True)
+
     def test_option_w_escape_or_another_key_cancels_and_is_swallowed(self):
         w = self.new_window("main", path=self.env["HOME"])
         self.t("respawn-pane", "-k", "-t", w, "cat -v")
@@ -999,7 +1035,7 @@ class Spaces(Server):
         self.wait(self.table, "root")
         self.key("M-w", "5")                                             # not a letter: cancels
         self.wait(self.table, "root")
-        self.key("M-w", "M")                                             # uppercase: cancels
+        self.key("M-w", "M")                                             # uppercase: a diff, never typed
         self.wait(self.table, "root")
         self.key("m")                                                    # jump mode is over: typed
         self.wait(lambda: "m" in self.t("capture-pane", "-p", "-t", w), True)

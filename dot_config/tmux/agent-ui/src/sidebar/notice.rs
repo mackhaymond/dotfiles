@@ -39,6 +39,17 @@ pub fn names() -> [String; 2] {
     [pick("AGENT_STATE_NOTICE", STATE_NOTICE), pick("AGENT_FOCUS_NOTICE", FOCUS_NOTICE)]
 }
 
+/// The insight notice: the server's insight publisher wrote a new result
+/// ([`crate::insight::Board`]); the other sidebars read it at once, with no
+/// snapshot. Registered on a fd of its own (a token says nothing of its
+/// name). `$AGENT_INSIGHT_NOTICE` renames it (tests).
+pub const INSIGHT_NOTICE: &str = "com.mackhaymond.agent-ui.insight";
+
+/// [`INSIGHT_NOTICE`], or its env override.
+pub fn insight_name() -> String {
+    std::env::var("AGENT_INSIGHT_NOTICE").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| INSIGHT_NOTICE.to_string())
+}
+
 /// How long a notice waits for the rest of its burst before the refresh:
 /// a window switch fires session-window-changed, the indicator's
 /// clear-current and maybe a state write within a few ms of each other.

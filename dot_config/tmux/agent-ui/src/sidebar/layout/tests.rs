@@ -19,7 +19,7 @@ fn idle_says_nothing_and_every_state_has_its_rail() {
     for (name, v) in all().into_iter().chain([("coloured", coloured())]).flat_map(|(n, v)| [(n, v.clone()), (n, lettered(v))]) {
         for (w, h) in [(34u16, 58u16), (42, 90), (42, 30), (24, 40)] {
             let f = layout(&v, w, h, &Opts::default());
-            let cx = Cx { w: usize::from(w), b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false };
+            let cx = Cx { w: usize::from(w), b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false, ctx: CTX_STYLE };
             let t = texts(&f);
             for y in f.agents.clone().filter(|&y| f.rows[y].covers.len() == 1 && !is_group_header(&f.rows[y], usize::from(w))) {
                 let r = &f.rows[y];
@@ -859,7 +859,7 @@ fn tiny_heights() {
         assert_eq!(f.target(3, y as u16), Some(&Target::Menu(Some("all"))));
     }
     // Nothing pending in one row: the header saying so, never ` … 0 need you`.
-    let cx = Cx { w: 34, b: Badge::OFF, now: NOW as f64, spin: 0, home: None, cur: None, shells: true, resumes: false };
+    let cx = Cx { w: 34, b: Badge::OFF, now: NOW as f64, spin: 0, home: None, cur: None, shells: true, resumes: false, ctx: CTX_STYLE };
     assert_eq!(needs_cut(&empty(), cx, 1).iter().map(Row::text).collect::<Vec<_>>(), [needs_header(&empty(), 34).text()]);
 }
 
@@ -1105,7 +1105,8 @@ fn key_caps_are_quiet_but_where_you_look() {
     let lav = Ink::Rgb(0xb4, 0xbe, 0xfe);
     let teal = Ink::Rgb(0x94, 0xe2, 0xd5);
     let v = coloured();
-    let f = layout(&v, 42, 62, &Opts::default());
+    // (The blink's off second: a working cap its usual self.)
+    let f = layout(&v, 42, 62, &blink_off());
     let t = texts(&f);
     let at = |title: &str| f.agents.start + agents_part(&f).iter().position(|l| l.contains(title)).unwrap();
     for (title, ink) in [("Canvas Syllabus", lav), ("Tmux sidebar hotkeys", lav), ("Lab 3", teal)] {
@@ -1123,14 +1124,14 @@ fn key_caps_are_quiet_but_where_you_look() {
     // The NEEDS YOU card (cs35l's): solid teal too.
     let card = f.needs.clone().find(|&y| t[y].contains("Eight")).unwrap();
     assert_eq!((cap_of(&f.rows[card]).fg, cap_of(&f.rows[card]).bg), (Ink::Pal("crust"), Some(teal)));
-    // Asking and failed: solid; working, done and idle: quiet (no client
-    // here).
+    // Asking and failed: solid; working (its off second: [`a_working_cap_blinks`]),
+    // done and idle: quiet (no client here).
     let v = lettered(view(
         vec![a("main", 1, "failed", "Broke"), a("main", 2, "needs-input", "Ask"), a("main", 3, "running", "Run"),
             a("main", 4, "done", "Done"), a("main", 5, "idle", "Calm")],
         None,
     ));
-    let f = layout(&v, 42, 62, &Opts::default());
+    let f = layout(&v, 42, 62, &blink_off());
     let peach = Ink::Pal("peach");
     for (title, solid) in [("Broke", true), ("Ask", true), ("Run", false), ("Done", false), ("Calm", false)] {
         let y = f.agents.start + agents_part(&f).iter().position(|l| l.contains(title)).unwrap();
@@ -1142,6 +1143,121 @@ fn key_caps_are_quiet_but_where_you_look() {
     let v = lettered(view(vec![a("dark", 1, "idle", "Murky").with("space_color", "colour24")], None));
     let f = layout(&v, 42, 30, &Opts::default());
     assert_eq!(cap_of(&f.rows[find(&f, "Murky")]).fg, Ink::Pal("text"));
+}
+
+/// The frame's clock in the blink's off second (`NOW` is even: on).
+fn blink_off() -> Opts {
+    Opts { now: Some(NOW as f64 + 1.0), ..Opts::default() }
+}
+
+/// A working agent's key-cap BLINKS on the wall clock, so "working" reads
+/// from the left edge: solid in the working blue in even seconds, its usual
+/// look in odd ones (quiet, or the client's solid in its space's colour);
+/// its rail steady blue down both rows in both. Asking, failed, done, idle
+/// and paused caps never blink. The blink rides the spinner's redraws: the
+/// working card's first row is already animated.
+#[test]
+fn a_working_cap_blinks() {
+    assert!(blink_on(NOW as f64) && blink_on(NOW as f64 + 0.9) && !blink_on(NOW as f64 + 1.0) && blink_on(NOW as f64 + 2.0));
+    assert!(blink_on(-2.0) && !blink_on(-0.5));
+    let v = lettered(view(
+        vec![a("main", 1, "failed", "Broke"), a("main", 2, "needs-input", "Ask"), a("main", 3, "running", "Run"),
+            a("main", 4, "done", "Done"), a("main", 5, "idle", "Calm"), a("main", 6, "paused", "Rest"),
+            a("main", 7, "running", "Mine")],
+        Some("@7"),
+    ));
+    let peach = Ink::Pal("peach");
+    let blue = Ink::Pal(cat_hue(Cat::Working));
+    for (w, h) in [(44u16, 62u16), (34, 62), (34, 18)] {
+        let on = layout(&v, w, h, &Opts { now: Some(NOW as f64 + 0.5), ..Opts::default() });
+        let off = layout(&v, w, h, &Opts { now: Some(NOW as f64 + 1.5), ..Opts::default() });
+        let row = |f: &Frame, title: &str| f.agents.start + agents_part(f).iter().position(|l| l.contains(title)).unwrap();
+        for title in ["Broke", "Ask", "Run", "Done", "Calm", "Rest", "Mine"] {
+            let ctx = format!("{w}x{h} {title}");
+            let (y0, y1) = (row(&on, title), row(&off, title));
+            let (c0, c1) = (cap_of(&on.rows[y0]), cap_of(&off.rows[y1]));
+            match title {
+                "Run" => {
+                    assert_eq!((c0.fg, c0.bg, c0.bold), (Ink::Pal("crust"), Some(blue), true), "{ctx}");
+                    assert_eq!((c1.fg, c1.bg), (peach, Some(over(peach, CAP_TINT, off.rows[y1].bg.unwrap()))), "{ctx}");
+                }
+                "Mine" => {
+                    // Already solid: the ON second inverts ([`blink_cap`]).
+                    assert_eq!((c0.fg, c0.bg, c0.bold), (blue, Some(Ink::Pal("crust")), true), "{ctx}");
+                    assert_eq!((c1.fg, c1.bg), (Ink::Pal("crust"), Some(peach)), "{ctx}");
+                }
+                _ => assert_eq!(c0, c1, "{ctx}: never blinks"),
+            }
+            if matches!(title, "Run" | "Mine") {
+                // The rail: steady working blue, both rows when there are
+                // two, in either second; the row animates (the spinner's clock).
+                for (f, y) in [(&on, y0), (&off, y1)] {
+                    assert_eq!(f.rows[y].segs[1], seg("▎", "blue"), "{ctx}");
+                    assert!(f.rows[y].anim && f.spin, "{ctx}");
+                    let next = &f.rows[y + 1];
+                    if next.covers.is_empty() && next.bg == f.rows[y].bg && next.target_at(1) == f.rows[y].target_at(1) {
+                        assert_eq!(next.segs[1], seg("▎", "blue"), "{ctx}");
+                    }
+                }
+            }
+        }
+        // Only the two working cards' caps differ between the seconds.
+        let caps = |f: &Frame| f.agents.clone().filter(|&y| f.rows[y].covers.len() == 1).map(|y| cap_of(&f.rows[y])).collect::<Vec<_>>();
+        let differ = caps(&on).iter().zip(caps(&off)).filter(|(a, b)| **a != *b).count();
+        assert_eq!(differ, 2, "{w}x{h}");
+    }
+    // ⌥W armed: the armed look in both seconds (the jump table wins).
+    let armed = |now: f64| layout(&v, 34, 62, &Opts { now: Some(now), bar: Bar { jump: true, ..Bar::default() }, ..Opts::default() });
+    for f in [armed(NOW as f64), armed(NOW as f64 + 1.0)] {
+        for title in ["Run", "Mine"] {
+            let y = f.agents.start + agents_part(&f).iter().position(|l| l.contains(title)).unwrap();
+            assert_eq!((cap_of(&f.rows[y]).fg, cap_of(&f.rows[y]).bg), (Ink::Pal("peach"), Some(Ink::Pal("crust"))), "{title}");
+        }
+    }
+}
+
+/// The blink shows whatever the space's colour: in a space as blue as the
+/// working hue (blue itself, sapphire, sky) the client's own working card,
+/// solid in that colour the off second, inverts the on second (a blue
+/// letter on crust), never a solid blue that looks the same; a quiet
+/// working cap there goes solid. PINNED cards blink exactly as in their
+/// space (own or not).
+#[test]
+fn the_blink_shows_in_a_blue_space_and_in_pinned() {
+    let blue = Ink::Pal(cat_hue(Cat::Working));
+    for (hex, rgb) in [("#89b4fa", Ink::Rgb(0x89, 0xb4, 0xfa)), ("#74c7ec", Ink::Rgb(0x74, 0xc7, 0xec)), ("#89dceb", Ink::Rgb(0x89, 0xdc, 0xeb))] {
+        for pin_mine in [false, true] {
+            let mine = a("work", 1, "running", "Mine").with("space_color", hex);
+            let v = lettered(view(
+                vec![
+                    if pin_mine { mine.with("pinned", "50") } else { mine },
+                    a("work", 2, "running", "Pinned").with("space_color", hex).with("pinned", "100"),
+                    a("work", 3, "idle", "Calm").with("space_color", hex),
+                ],
+                Some("@1"),
+            ));
+            for w in [44u16, 34] {
+                let on = layout(&v, w, 40, &Opts { now: Some(NOW as f64), ..Opts::default() });
+                let off = layout(&v, w, 40, &blink_off());
+                let ctx = format!("{hex} {w} pin_mine={pin_mine}");
+                let row = |f: &Frame, title: &str| f.agents.start + agents_part(f).iter().position(|l| l.contains(title)).unwrap();
+                let cap = |f: &Frame, title: &str| cap_of(&f.rows[row(f, title)]);
+                assert!(on.pinned.contains(&row(&on, "Pinned")), "{ctx}");
+                assert_eq!(on.pinned.contains(&row(&on, "Mine")), pin_mine, "{ctx}");
+                // The client's own: solid in the space's colour, then inverted.
+                let (c0, c1) = (cap(&on, "Mine"), cap(&off, "Mine"));
+                assert_eq!((c1.fg, c1.bg), (Ink::Pal("crust"), Some(rgb)), "{ctx}");
+                assert_eq!((c0.fg, c0.bg, c0.bold), (blue, Some(Ink::Pal("crust")), true), "{ctx}");
+                // The pinned one (not the client's): quiet, then solid blue.
+                let (p0, p1) = (cap(&on, "Pinned"), cap(&off, "Pinned"));
+                let bg = off.rows[row(&off, "Pinned")].bg.unwrap();
+                assert_eq!((p1.fg, p1.bg), (rgb, Some(over(rgb, CAP_TINT, bg))), "{ctx}");
+                assert_eq!((p0.fg, p0.bg), (Ink::Pal("crust"), Some(blue)), "{ctx}");
+                // Idle: the same both seconds.
+                assert_eq!(cap(&on, "Calm"), cap(&off, "Calm"), "{ctx}");
+            }
+        }
+    }
 }
 
 /// ⌥W armed: EVERY cap with a letter, in AGENTS and NEEDS YOU, quiet or
@@ -1378,9 +1494,9 @@ fn letter_key_caps_lead_every_agent_row_and_card() {
     for sp in v.spaces.iter_mut().filter(|s| s.name == "main") {
         sp.color = "#a6e3a1".into();
     }
-    let f = layout(&v, 34, 58, &Opts::default());
+    let f = layout(&v, 34, 58, &blink_off());
     let t = texts(&f);
-    // The client's own: solid.
+    // The client's own: solid (working too, in the blink's off second).
     let r = find(&f, "Tmux Agent S");
     assert!(t[r].starts_with(" ▎  f  Tmux Agent S"), "{:?}", t[r]);
     assert!(t[r + 1].starts_with(" ▎     Edit agent-roster.py"), "{:?}", t[r + 1]);
@@ -1624,7 +1740,7 @@ fn shells_fold_into_one_line() {
     let refs: Vec<&Agent> = many.iter().collect();
     for w in [16usize, 24, 34, 60, 200] {
         for on in [true, false] {
-            let cx = Cx { w, b: Badge { on, loud: false }, now: NOW as f64, spin: 0, home: None, cur: None, shells: true, resumes: false };
+            let cx = Cx { w, b: Badge { on, loud: false }, now: NOW as f64, spin: 0, home: None, cur: None, shells: true, resumes: false, ctx: CTX_STYLE };
             let r = shells_line(&refs, cx, Ink::Pal("peach"));
             let text = r.text();
             assert_eq!(width(&r.segs), w, "{w}: {text:?}");
@@ -2759,4 +2875,6 @@ fn pause_banner_is_violet_then_cyan_never_green() {
     assert!(f.rows[0].segs.iter().any(|s| s.text.contains("PAUSING") && s.fg == Ink::Pal("dimviolet")), "{:?}", f.rows[0].segs);
 }
 
+mod answer;
+mod insight;
 mod pinned;

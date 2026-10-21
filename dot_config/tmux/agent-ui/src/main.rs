@@ -8,6 +8,10 @@
 //! agent-ui [--socket <name|path>] menu ...      (see menu.rs)
 //! agent-ui [--socket <name|path>] sessions ...  (see sessions.rs; prefix a)
 //! agent-ui [--socket <name|path>] pin [toggle|on|off] [--window <@id>] [--client <tty>]   (pins.rs; prefix t)
+//! agent-ui [--socket <name|path>] answer <@id> allow|deny [--client <tty>]  (answer.rs: a permission prompt)
+//! agent-ui [--socket <name|path>] insight [<@id>] [--json]   (insight.rs: diff, doing, context per agent)
+//! agent-ui [--socket <name|path>] insight-files <@id>        (its dirty files: a repo root, then "\t<file>" lines)
+//! agent-ui [--socket <name|path>] diff <@id> --client <tty>   (diff.rs: those files' diff in a popup; ⌥W ⇧letter)
 //! ```
 //!
 //! `needs` prints exactly what `agent-jump.sh list` prints, from the same
@@ -22,7 +26,11 @@ const USAGE: &str = "usage: agent-ui [--socket <name|path>] dump [--client <tty>
        agent-ui sidebar [--client <tty>] | --once <W>x<H>
        agent-ui menu --client <tty> [--tab <tab>] | --once <W>x<H>
        agent-ui sessions --client <tty> | --once <W>x<H> [--client <tty>] [--query <q>] [--ansi]
-       agent-ui pin [toggle|on|off] [--window <@id>] [--client <tty>]";
+       agent-ui pin [toggle|on|off] [--window <@id>] [--client <tty>]
+       agent-ui answer <@id> allow|deny [--client <tty>]
+       agent-ui insight [<@id>] [--json]
+       agent-ui insight-files <@id>
+       agent-ui diff <@id> --client <tty> [--after <pid>] [--print]";
 
 fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let i = args.iter().position(|a| a == flag)?;
@@ -52,6 +60,10 @@ fn main() -> ExitCode {
         "menu" => agent_ui::menu::run(tmux, rest),
         "sessions" => agent_ui::sessions::run(tmux, rest),
         "pin" => agent_ui::pins::run(tmux, rest),
+        "answer" => agent_ui::answer::run(tmux, rest),
+        "insight" => agent_ui::insight::run(tmux, rest),
+        "insight-files" => agent_ui::insight::run_files(tmux, rest),
+        "diff" => agent_ui::diff::run(tmux, rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             ExitCode::SUCCESS

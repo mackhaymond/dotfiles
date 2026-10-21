@@ -15,9 +15,12 @@
 //!   it (a second Esc closes); Backspace on an empty query leaves it.
 //! - **Actions** (Space): the footer lists what the selected row offers
 //!   (`p` pin / unpin: the sidebar's PINNED section, `s` park, `x` close or
-//!   discard, `v` the preview strip, `r` restart the watcher, ⏎ go; a
-//!   parked row offers neither p nor s); the next key runs one; Esc or any
-//!   other key cancels.
+//!   discard, `d` its uncommitted diff in a popup (closes the menu), `v`
+//!   the preview strip, `r` restart the watcher, ⏎ go; a
+//!   parked row offers neither p nor s; a Claude agent waiting on a
+//!   permission prompt offers `y` allow and `n` deny first, answered in
+//!   place by [`crate::answer`], no y/n of its own: the capture is the
+//!   check); the next key runs one; Esc or any other key cancels.
 //! - **y/n** after park / close: only `y` (on a prompt already on screen)
 //!   confirms; any other key cancels.
 //! - **⌥W**, in every mode: go to the LAST agent ([`Data::last`]); with none,
@@ -92,6 +95,13 @@ pub trait Effects {
     /// Space p: pin (`pin`) or unpin window `win` ([`crate::pins::toggle`]).
     /// Ok = footer text.
     fn pin(&mut self, win: &str, pin: bool) -> Result<String, String>;
+    /// Space y / Space n: allow or deny window `win`'s permission prompt,
+    /// the one the row showed (`prompt`, [`crate::answer::prompt_key`];
+    /// [`crate::answer::answer`]). Ok = footer text.
+    fn answer(&mut self, win: &str, allow: bool, prompt: &str) -> Result<String, String>;
+    /// Space d: window `win`'s uncommitted diff in a popup of its own
+    /// ([`crate::diff`]), once this menu's popup is gone. Ok closes the menu.
+    fn diff(&mut self, win: &str) -> Result<(), String>;
 }
 
 /// Effects that refuse everything: `--once` and tests that must not act.
@@ -117,6 +127,12 @@ impl Effects for NoEffects {
         "read-only".into()
     }
     fn pin(&mut self, _: &str, _: bool) -> Result<String, String> {
+        Err("read-only".into())
+    }
+    fn answer(&mut self, _: &str, _: bool, _: &str) -> Result<String, String> {
+        Err("read-only".into())
+    }
+    fn diff(&mut self, _: &str) -> Result<(), String> {
         Err("read-only".into())
     }
 }
@@ -156,18 +172,31 @@ pub enum Act {
     Park,
     Close,
     Restart,
+    /// Answer the row's permission prompt: allow (the single-use Yes) or
+    /// deny ([`crate::answer`]).
+    Allow,
+    Deny,
+    /// Its uncommitted diff in a popup ([`crate::diff`]).
+    Diff,
 }
 
 /// The actions strip's entries for `t`: (key, act, words). `p` pins (or
 /// unpins: the row says which) an agent's window; a parked tab is neither
-/// pinned nor parked again. The preview strip is `v` ("view").
+/// pinned nor parked again. `d` shows its diff (a parked one's too). The
+/// preview strip is `v` ("view"). A row a permission prompt waits on offers
+/// `y` allow and `n` deny first.
 pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
     let mut v = Vec::new();
+    if t.perm.is_some() && !t.parked() {
+        v.push(('y', Act::Allow, "allow"));
+        v.push(('n', Act::Deny, "deny"));
+    }
     if !t.parked() {
         v.push(('p', Act::Pin, if t.pinned { "unpin" } else { "pin" }));
         v.push(('s', Act::Park, "park"));
     }
     v.push(('x', Act::Close, if t.parked() { "discard" } else { "close" }));
+    v.push(('d', Act::Diff, "diff"));
     v.push(('v', Act::Peek, "preview"));
     v.push(('r', Act::Restart, "restart watcher"));
     v
@@ -438,6 +467,15 @@ impl Menu {
                 let m = fx.restart_watcher();
                 self.say(m);
             }
+            Act::Allow | Act::Deny => {
+                let r = fx.answer(&t.win, act == Act::Allow, t.perm.as_deref().unwrap_or_default());
+                self.say(r.unwrap_or_else(|e| e));
+            }
+            // The diff's popup can only open once this one has closed.
+            Act::Diff => match fx.diff(&t.win) {
+                Ok(()) => return true,
+                Err(e) => self.say(e),
+            },
         }
         false
     }
@@ -777,6 +815,14 @@ pub(crate) mod tests {
             self.calls.push(format!("{} {win}", if pin { "pin" } else { "unpin" }));
             Ok(format!("{} {win}", if pin { "pinned" } else { "unpinned" }))
         }
+        fn answer(&mut self, win: &str, allow: bool, prompt: &str) -> Result<String, String> {
+            self.calls.push(format!("{} {win} [{prompt}]", if allow { "allow" } else { "deny" }));
+            Ok(format!("{} {win}", if allow { "allowed" } else { "denied" }))
+        }
+        fn diff(&mut self, win: &str) -> Result<(), String> {
+            self.calls.push(format!("diff {win}"));
+            self.go_err.clone().map_or(Ok(()), Err)
+        }
     }
 
     fn keys(s: &str) -> Vec<Key> {
@@ -1079,7 +1125,7 @@ pub(crate) mod tests {
         let mut m = menu();
         let t = m.selected_target().unwrap();
         assert_eq!(strip(&t).iter().map(|(k, _, w)| format!("{k} {w}")).collect::<Vec<_>>(),
-            ["p pin", "s park", "x close", "v preview", "r restart watcher"]);
+            ["p pin", "s park", "x close", "d diff", "v preview", "r restart watcher"]);
         assert!(!m.handle(&keys(" p"), &mut fx));
         assert_eq!((fx.calls.as_slice(), m.msg.as_str(), m.confirm.is_none()), (&["pin @6".to_string()][..], "pinned @6", true));
         // The same window, pinned in tmux: p unpins.
@@ -1101,6 +1147,77 @@ pub(crate) mod tests {
         let n = fx.calls.len();
         m.handle(&keys(" p"), &mut fx);
         assert_eq!(fx.calls.len(), n);
+    }
+
+    /// Space d hands the selected row's window to the diff popup and closes
+    /// the menu (that popup can only open once this one is gone); a refusal
+    /// stays, with why. Offered on a parked row too; a bare d is a letter.
+    #[test]
+    fn space_d_shows_the_diff() {
+        let mut fx = Rec::default();
+        let mut m = menu();
+        assert!(m.handle(&keys(" d"), &mut fx));
+        assert_eq!(fx.calls, ["diff @6"]);
+        let mut m = menu();
+        assert!(m.handle(&keys(" D"), &mut fx)); // the strip takes either case
+        assert_eq!(fx.calls.len(), 2);
+        fx.go_err = Some("d: no uncommitted changes".into());
+        let mut m = menu();
+        assert!(!m.handle(&keys(" d"), &mut fx));
+        assert_eq!((m.msg.as_str(), m.actions.is_none()), ("d: no uncommitted changes", true));
+        let mut m = Menu::new(data(), Tab::Parked);
+        draw_all(&mut m);
+        let t = m.selected_target().unwrap();
+        assert!(strip(&t).iter().any(|(k, a, w)| (*k, *a, *w) == ('d', Act::Diff, "diff")));
+        m.handle(&keys(" d"), &mut fx);
+        assert_eq!(fx.calls.last().map(String::as_str), Some(format!("diff {}", t.win).as_str()));
+        // Esc after Space: nothing.
+        let n = fx.calls.len();
+        let mut m = menu();
+        m.act(Char(' '), &mut fx);
+        m.act(Esc, &mut fx);
+        assert_eq!(fx.calls.len(), n);
+    }
+
+    /// Space y / Space n answer a Claude agent's permission prompt at once
+    /// (the capture is the check, no y/n of the menu's own), listed first in
+    /// the strip; a row without one (an asking, a Codex, a failed agent) is
+    /// offered neither, and y / n there cancel like any other key.
+    #[test]
+    fn space_y_n_answer_a_permission_prompt() {
+        let perm = |kind: &str, dk: &str| {
+            let mut snap = fixture();
+            for w in snap.windows.iter_mut().filter(|w| w.id == "@6") {
+                (w.state, w.kind, w.detail_kind) = ("needs-input".into(), kind.into(), dk.into());
+                (w.detail, w.since_t) = ("Bash ls".into(), Some(500));
+            }
+            let mut m = menu_of(data_of(&snap));
+            m.sel = Some(ak("work", "@6"));
+            draw_all(&mut m);
+            m
+        };
+        let mut fx = Rec::default();
+        let mut m = perm("claude", "perm");
+        let t = m.selected_target().unwrap();
+        // The row names the prompt it showed: answer() refuses another one.
+        assert_eq!(t.perm.as_deref(), Some("500 Bash ls"));
+        assert_eq!(strip(&t).iter().map(|(k, _, w)| format!("{k} {w}")).take(3).collect::<Vec<_>>(),
+            ["y allow", "n deny", "p pin"]);
+        assert!(!m.handle(&keys(" y"), &mut fx));
+        assert_eq!((fx.calls.as_slice(), m.msg.as_str(), m.confirm.is_none()),
+            (&["allow @6 [500 Bash ls]".to_string()][..], "allowed @6", true));
+        m.handle(&keys(" n"), &mut fx);
+        assert_eq!(fx.calls.last().map(String::as_str), Some("deny @6 [500 Bash ls]"));
+        for (kind, dk) in [("claude", "ask"), ("codex", "perm")] {
+            let mut m = perm(kind, dk);
+            let t = m.selected_target().unwrap();
+            assert!(t.perm.is_none() && !strip(&t).iter().any(|(k, _, _)| matches!(k, 'y' | 'n')), "{kind} {dk}");
+            let n = fx.calls.len();
+            m.handle(&keys(" y n"), &mut fx);
+            assert_eq!(fx.calls.len(), n, "{kind} {dk}");
+        }
+        // Failed (the fixture's own @6): nothing to answer.
+        assert!(menu().selected_target().unwrap().perm.is_none());
     }
 
     /// A batch never confirms itself; a y before the prompt was drawn does

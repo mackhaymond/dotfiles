@@ -557,7 +557,8 @@ pub fn letter_hint(drawn: &Drawn) -> Option<String> {
 }
 
 /// Key items (`key`, `words`) drawn as ` key  words ` chips, dropping the
-/// words in `drop_order` until they fit.
+/// words in `drop_order` until they fit, then whole items off the end:
+/// never a chip cut in two.
 fn key_items(buf: &mut Buffer, x: u16, y: u16, end: u16, items: Vec<(String, String)>, drop_order: &[&str]) -> u16 {
     let item_w = |k: &str, wd: &str| cells(k) + 2 + cells(wd) + 2;
     let total = |v: &[(String, String)]| v.iter().map(|(k, wd)| item_w(k, wd)).sum::<u16>();
@@ -568,6 +569,7 @@ fn key_items(buf: &mut Buffer, x: u16, y: u16, end: u16, items: Vec<(String, Str
         }
         shown.retain(|(_, wd)| wd != d);
     }
+    while total(&shown) > end.saturating_sub(x) && shown.pop().is_some() {}
     let mut cx = x;
     for (k, wd) in shown {
         cx = put(buf, cx, y, end, &format!(" {k} "), on("text", "surface0"));
@@ -619,7 +621,9 @@ fn footer(m: &Menu, buf: &mut Buffer, w: u16, y: u16, now: f64) {
             strip(t).into_iter().map(|(k, _, wd)| (k.to_string(), wd.to_string())).collect();
         items.push(("⏎".into(), "go".into()));
         items.push(("esc".into(), "cancel".into()));
-        key_items(buf, cx, y, end, items, &["cancel", "go"]);
+        // The least needed go first; the answers, the diff and ⏎ go last.
+        key_items(buf, cx, y, end, items,
+            &["cancel", "restart watcher", "preview", "park", "discard", "close", "unpin", "pin", "go", "diff"]);
         return;
     }
     if !m.msg.is_empty() && now < m.msg_until {
@@ -864,6 +868,45 @@ mod tests {
         assert!(!f.iter().any(|l| l.contains("529")));
     }
 
+    /// The Space strip never cuts a chip in two: what does not fit goes
+    /// whole, least needed first (esc cancel, restart watcher, preview,
+    /// park, close, pin), so a permission row keeps y / n, d diff and ⏎ go
+    /// at every usual menu width.
+    #[test]
+    fn strip_drops_whole_chips() {
+        let mut snap = fixture();
+        for w in snap.windows.iter_mut().filter(|w| w.id == "@6") {
+            (w.state, w.kind, w.detail_kind) = ("needs-input".into(), "claude".into(), "perm".into());
+            (w.detail, w.since_t) = ("Bash ls".into(), Some(500));
+        }
+        let words = ["allow", "deny", "pin", "park", "close", "diff", "preview", "restart watcher", "go", "cancel"];
+        for w in [80u16, 100, 120] {
+            let mut m = Menu::new(data_of(&snap), Tab::All);
+            m.sel = Some(RowKey::Agent("work".into(), "@6".into()));
+            frame(&mut m, w, 34);
+            m.act(Key::Char(' '), &mut NoEffects);
+            assert!(m.actions.as_ref().is_some_and(|t| t.perm.is_some()), "{w}");
+            let f = frame(&mut m, w, 34);
+            let line = f[32].trim_end_matches('│').trim_end();
+            for want in ["y  allow", "n  deny", "d  diff", "⏎  go"] {
+                assert!(line.contains(want), "{w}: {want} in {line}");
+            }
+            assert!(words.iter().any(|wd| line.ends_with(wd)), "{w}: cut mid-chip: {line}");
+            // Every word shown is whole: its key chip right before it.
+            for (k, wd) in [("p", "pin"), ("s", "park"), ("x", "close"), ("v", "preview"), ("r", "restart watcher"), ("esc", "cancel")] {
+                let shown = line.contains(&format!(" {k}  {}", &wd[..1]));
+                assert_eq!(shown, line.contains(&format!(" {k}  {wd}")), "{w}: {wd} cut in {line}");
+            }
+        }
+        // Wide enough: all of it.
+        let mut m = Menu::new(data_of(&snap), Tab::All);
+        m.sel = Some(RowKey::Agent("work".into(), "@6".into()));
+        frame(&mut m, 160, 34);
+        m.act(Key::Char(' '), &mut NoEffects);
+        let f = frame(&mut m, 160, 34);
+        assert!(f[32].contains("r  restart watcher  ⏎  go  esc  cancel"), "{}", f[32]);
+    }
+
     #[test]
     fn footer_modes() {
         let mut m = menu();
@@ -874,7 +917,8 @@ mod tests {
         m.act(Key::Esc, &mut NoEffects); // the search moved the selection to Kua; it stays
         m.act(Key::Char(' '), &mut NoEffects);
         let f = frame(&mut m, 110, 34);
-        assert!(f[32].starts_with("│ Kua Yu focus timing  p  pin  s  park  x  close  v  preview  r  restart watcher  ⏎  go  esc  cancel"),
+        // (At 110 columns `esc cancel` is the first to go.)
+        assert!(f[32].starts_with("│ Kua Yu focus timing  p  pin  s  park  x  close  d  diff  v  preview  r  restart watcher  ⏎  go"),
             "{}", f[32]);
         m.act(Key::Char('x'), &mut NoEffects);
         let f = frame(&mut m, 110, 34);

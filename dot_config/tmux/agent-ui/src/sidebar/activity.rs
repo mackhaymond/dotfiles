@@ -702,7 +702,7 @@ pub fn codex_blurb(tail: &str, whole: bool) -> Option<String> {
 
 /// What one Codex call says.
 #[derive(Debug, PartialEq)]
-enum Codex {
+pub(crate) enum Codex {
     /// A plan (`update_plan`): its in-progress step, if any.
     Plan(Option<String>),
     Said(String),
@@ -716,7 +716,7 @@ enum Codex {
 /// JavaScript calling `tools.<name>(…)`), a `local_shell_call`
 /// (`action.command` argv), a `web_search_call` (`action.query`, or the
 /// first of `action.queries`).
-fn codex_call(p: &Value) -> Codex {
+pub(crate) fn codex_call(p: &Value) -> Codex {
     let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
     let name = s(p, "name").unwrap_or_default();
     match p.get("type").and_then(Value::as_str) {

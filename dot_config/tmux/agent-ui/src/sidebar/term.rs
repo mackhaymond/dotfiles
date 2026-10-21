@@ -113,19 +113,15 @@ impl Signals {
         Fired { exit: f & ((1 << SIGHUP) | (1 << SIGTERM)) != 0, resize: f & (1 << SIGWINCH) != 0 }
     }
 
-    /// Wait up to `timeout` for `fd`, the `extra` fds (the notice fd, the
+    /// Wait up to `timeout` for `fd`, the `extra` fds (the notice fds, the
     /// client's exit watch) or a signal → (`fd` has something to read (data,
     /// EOF or an error: the read tells which), which `extra` fds are ready).
-    pub fn wait(&self, fd: RawFd, extra: [Option<RawFd>; 2], timeout: Duration) -> io::Result<(bool, [bool; 2])> {
-        let mut fds = [
-            PollFd { fd, events: POLLIN, revents: 0 },
-            PollFd { fd: self.rx.as_raw_fd(), events: POLLIN, revents: 0 },
-            // poll(2) skips a negative fd.
-            PollFd { fd: extra[0].unwrap_or(-1), events: POLLIN, revents: 0 },
-            PollFd { fd: extra[1].unwrap_or(-1), events: POLLIN, revents: 0 },
-        ];
+    pub fn wait<const N: usize>(&self, fd: RawFd, extra: [Option<RawFd>; N], timeout: Duration) -> io::Result<(bool, [bool; N])> {
+        let mut fds = vec![PollFd { fd, events: POLLIN, revents: 0 }, PollFd { fd: self.rx.as_raw_fd(), events: POLLIN, revents: 0 }];
+        // poll(2) skips a negative fd.
+        fds.extend(extra.iter().map(|e| PollFd { fd: e.unwrap_or(-1), events: POLLIN, revents: 0 }));
         poll_fds(&mut fds, timeout)?;
-        Ok((ready(&fds[0]), [extra[0].is_some() && ready(&fds[2]), extra[1].is_some() && ready(&fds[3])]))
+        Ok((ready(&fds[0]), std::array::from_fn(|i| extra[i].is_some() && ready(&fds[i + 2]))))
     }
 }
 

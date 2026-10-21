@@ -172,6 +172,10 @@ pub struct Target {
     /// The window was pinned (`@agent_pinned`) as the row showed it: Space p
     /// unpins it then, else pins it.
     pub pinned: bool,
+    /// A permission prompt was waiting on it as the row showed it
+    /// ([`crate::answer::answerable`]): Space y / Space n answer it, and only
+    /// that prompt ([`crate::answer::prompt_key`]).
+    pub perm: Option<String>,
 }
 
 impl Target {
@@ -184,6 +188,7 @@ impl Target {
             index: a.index,
             title: a.title.clone(),
             pinned: a.pinned.is_some(),
+            perm: crate::answer::answerable(a).then(|| crate::answer::prompt_key(a)),
         }
     }
 

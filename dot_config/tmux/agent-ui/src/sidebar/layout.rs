@@ -161,7 +161,11 @@
 //!
 //! Under 30 columns the ages go, under 26 the second lines, then the state
 //! word shrinks to its glyph; titles take what is left and are clipped. A row
-//! is always exactly the frame's width: nothing wraps.
+//! is always exactly the frame's width: nothing wraps. A card's insight
+//! extras ([`extras`]: the diff badge, the context meter) give way first,
+//! the file count, then a dim meter, then the badge, then the meter,
+//! before the doing text (or a one-line card's title) has under
+//! [`DOING_MIN`] cells.
 //!
 //! ## Letters
 //!
@@ -170,6 +174,9 @@
 //! by [`crate::menu::letters::of_view`], the menu's own function) as a
 //! key-cap ([`Badge`]) in its SPACE's colour, so the window says where it
 //! lives anywhere in the list: quiet by default, solid where you look next.
+//! A working agent's cap BLINKS, a second solid in the working blue (the
+//! client's own, already solid, inverts: blue on `crust`) and a second its
+//! usual look ([`blink_on`]), so the left edge says who works.
 //! While ⌥W's jump table is armed every cap is inverted ([`ARMED`]: a peach
 //! letter on `crust`), a look no calm cap has. Windows without one show the
 //! cap blank; with no letter anywhere the column is not drawn.
@@ -528,6 +535,13 @@ pub enum Target {
     /// The pause banner once the pause is settled (safe to close, or ready
     /// after a wake): `agent-pause.py resume <client>`, never `toggle`.
     Resume,
+    /// A perm card's `y allow` / `n deny` chip ([`answer_chips`]): answer
+    /// that window's permission prompt ([`crate::answer::answer`]), only
+    /// the one the card showed (`prompt`: [`crate::answer::prompt_key`]).
+    Answer { win: String, session: String, allow: bool, prompt: String },
+    /// A card's diff badge ([`extras`]): that window's diff popup,
+    /// `agent-ui diff <win> --client <client>` (nothing when it fails).
+    Diff(String),
 }
 
 /// One screen line.
@@ -658,6 +672,8 @@ pub struct Opts {
     /// Where the pause key's pause stands ([`super::pause`]): a banner at
     /// the very top. None: nothing at all.
     pub pause: Option<Phase>,
+    /// How cards draw the context meter ([`CTX_STYLE`] by default).
+    pub ctx: CtxStyle,
 }
 
 /// The working spinner: braille, one cell, ten frames.
@@ -749,6 +765,8 @@ struct Cx<'a> {
     /// or ready: `paused.json` lists targets), so prefix P resumes: a paused
     /// card says so.
     resumes: bool,
+    /// How the context meter reads ([`Opts::ctx`]).
+    ctx: CtxStyle,
 }
 
 impl Cx<'_> {
@@ -1580,7 +1598,8 @@ const MINE_HUE: Hue = "lavender";
 /// any surface. No calm cap can look like it: a quiet cap's tint sits over
 /// its card (never as dark as crust) and a solid one is its space's colour
 /// with dark ink (never a peach letter), whatever the space's colour, the
-/// colourless default peach included.
+/// colourless default peach included. (The client's working cap blinks to
+/// `crust` too, [`blink_cap`], but with a blue letter.)
 const ARMED: (Hue, Hue) = ("peach", "crust");
 
 impl Badge {
@@ -1703,6 +1722,40 @@ fn loud_card(a: &Agent, cx: Cx) -> bool {
     own(a, cx) || matches!(a.cat, Some(Cat::NeedsInput | Cat::Failed))
 }
 
+/// A working agent's key-cap BLINKS, so "working" reads from the left edge,
+/// where the eye scans the list (the word sits far right): its ON look
+/// ([`blink_cap`]) while [`blink_on`], its usual look (quiet tint, or the
+/// client's solid) the other second. Not an asking or failed agent's, even
+/// one in flight: its cap stays solid and steady (it asks; it does not work).
+fn blinks(a: &Agent, word: Option<&Word>) -> bool {
+    word.is_some_and(Word::working) && !matches!(a.cat, Some(Cat::NeedsInput | Cat::Failed))
+}
+
+/// A blinking cap's ON second (`a` on a card of colour `card`). Over a quiet
+/// cap: SOLID in the working hue (dark ink). Over one already solid in its
+/// space's colour (`solid`: the client's own card), a solid blue would
+/// barely differ, or not at all in a blue, sapphire or sky space, so it
+/// INVERTS instead: the letter bold in the working hue on `crust` (darker
+/// than any card, so the swap reads whatever the space; a blue letter,
+/// never the armed peach). While ⌥W is armed, the armed look.
+fn blink_cap(b: Badge, a: &Agent, card: Ink, solid: bool) -> Seg {
+    let hue = Ink::Pal(cat_hue(Cat::Working));
+    match a.letter {
+        _ if b.loud || !solid => b.seg(a, hue, card, true),
+        Some(c) => block(format!(" {c} "), hue, "crust"),
+        None => on(" ".repeat(BADGE_W), "text", "crust"),
+    }
+}
+
+/// The blink's phase: on in even wall-clock seconds, off in odd ones (one
+/// second on, one off, as the tab bar's old `@agent_blink` pulse; every
+/// sidebar in step). A frame with a working card already redraws on the
+/// spinner's clock ([`Frame::spin`]), which turns the cap within one of its
+/// frames of the second: no wakeup of its own.
+pub fn blink_on(now: f64) -> bool {
+    (now.floor() as i64).rem_euclid(2) == 0
+}
+
 /// The client's session when it holds a copy of the client's window (a
 /// window linked into two spaces is `is_current` in both, by window id):
 /// that copy, and only it, is the client's own card.
@@ -1742,18 +1795,48 @@ fn live_blurb(a: &Agent) -> Option<&str> {
     (a.cat == Some(Cat::Working)).then_some(a.blurb.as_deref()).flatten().filter(|b| !b.trim().is_empty())
 }
 
-/// What a two-line agent row says under its title: a working agent's live
-/// activity blurb ([`live_blurb`]); else the [`message`]; else, for an
-/// idle agent, its last turn's outcome (what it last said is still true of
-/// it); else nothing (a working agent's old outcome never reads as what it
-/// does now). Every agent row is two lines either way.
-fn second_line(a: &Agent, now: f64) -> String {
-    if let Some(b) = live_blurb(a) {
-        return sanitize(b);
+/// What a card's second line says, and so how it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Says {
+    /// What it does right now (a working agent's in-progress todo, its
+    /// live activity blurb): after a blue `›`.
+    Now(String),
+    /// A message as it is: a reason, a run detail, an outcome.
+    Said(String),
+    /// Its last prompt, YOUR words: after a faint `> ` ([`PROMPT_MARK`]).
+    Prompt(String),
+    /// Nothing at all: the faint [`placeholder`].
+    Nothing,
+}
+
+/// How a last prompt is marked on a card: Claude Code's own mark for what
+/// you typed (its transcript shows your turns as `> …`), so the line reads
+/// as yours; not the blue `›` of what it does now, nor a shell's `❯`.
+pub const PROMPT_MARK: &str = "> ";
+
+/// What a two-line agent row says under its title, first that applies:
+/// a working agent's in-progress todo ([`crate::insight::Insight::todo`]),
+/// then its live activity blurb ([`live_blurb`]); else the [`message`] (an
+/// asking agent's question, a working one's run detail, a done one's
+/// outcome); else, for an idle agent, its last turn's outcome (what it last
+/// said is still true of it); else its last prompt; else nothing (a working
+/// agent's old outcome never reads as what it does now). Every agent row is
+/// two lines either way.
+fn says(a: &Agent, now: f64) -> Says {
+    let ins = a.insight.as_ref();
+    // (Whitespace runs one space: a todo or blurb may hold newlines, tabs.)
+    let some = |s: Option<&str>| s.map(|s| sanitize(s).split_whitespace().collect::<Vec<_>>().join(" ")).filter(|s| !s.is_empty());
+    if a.cat == Some(Cat::Working) {
+        if let Some(t) = some(ins.and_then(|i| i.todo.as_deref())).or_else(|| some(live_blurb(a))) {
+            return Says::Now(t);
+        }
     }
-    message(a, now)
-        .or_else(|| (!a.in_flight && a.cat != Some(Cat::Working)).then(|| plain(&a.detail)))
-        .unwrap_or_default()
+    if let Some(m) = message(a, now).or_else(|| (!a.in_flight && a.cat != Some(Cat::Working)).then(|| plain(&a.detail))) {
+        if !m.trim().is_empty() {
+            return Says::Said(m);
+        }
+    }
+    some(ins.and_then(|i| i.prompt.as_deref())).map_or(Says::Nothing, Says::Prompt)
 }
 
 /// The faint ink of a second line with nothing to say ([`placeholder`]):
@@ -1768,6 +1851,146 @@ fn placeholder(a: &Agent) -> &'static str {
     } else {
         "no reply yet"
     }
+}
+
+/// How a card's context meter reads ([`CTX_STYLE`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtxStyle {
+    /// One cell by eighths, `▁`..`█` (`▄` half full, `▇` 85%).
+    Glyph,
+    /// `72%`.
+    Percent,
+}
+
+/// The meter cards draw: `72%`, Mack's pick (readability first: a lone
+/// block glyph read as a stray mark); the glyph stays a switch away
+/// ([`CtxStyle::from_env`]).
+pub const CTX_STYLE: CtxStyle = CtxStyle::Percent;
+
+impl Default for CtxStyle {
+    fn default() -> CtxStyle {
+        CTX_STYLE
+    }
+}
+
+impl CtxStyle {
+    /// `$AGENT_UI_CTX_STYLE` (`glyph` / `percent`), else [`CTX_STYLE`] (the
+    /// previews draw both); read once per process.
+    pub fn from_env() -> CtxStyle {
+        static ONCE: std::sync::OnceLock<CtxStyle> = std::sync::OnceLock::new();
+        *ONCE.get_or_init(|| match std::env::var("AGENT_UI_CTX_STYLE").as_deref() {
+            Ok("percent" | "pct") => CtxStyle::Percent,
+            Ok("glyph") => CtxStyle::Glyph,
+            _ => CTX_STYLE,
+        })
+    }
+}
+
+/// The meter shows from half full (under that the context is no concern);
+/// amber from [`CTX_WARN`], red from [`CTX_FULL`] (a compaction is near).
+pub const CTX_SHOWN: f64 = 0.5;
+pub const CTX_WARN: f64 = 0.8;
+pub const CTX_FULL: f64 = 0.9;
+const CTX_LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+/// Context `f` full as the meter says it: dim (`dimc`), amber (`peach`, not
+/// the asks yellow) from [`CTX_WARN`], red from [`CTX_FULL`]; None under
+/// [`CTX_SHOWN`].
+fn ctx_seg(f: f64, style: CtxStyle, dimc: Hue) -> Option<Seg> {
+    if f.is_nan() || f < CTX_SHOWN {
+        return None;
+    }
+    let hue = if f >= CTX_FULL {
+        "red"
+    } else if f >= CTX_WARN {
+        "peach"
+    } else {
+        dimc
+    };
+    let text = match style {
+        CtxStyle::Glyph => CTX_LEVELS[((f * 8.0).ceil() as usize).clamp(1, 8) - 1].to_string(),
+        CtxStyle::Percent => format!("{}%", (f.min(1.0) * 100.0).floor() as u32),
+    };
+    Some(seg(text, hue))
+}
+
+/// A diff's line count, compact: `48`, `1.2k`, `12k` (9950 and up: `10k`,
+/// never `10.0k`).
+fn lines_n(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1000..=9949 => format!("{:.1}k", n as f64 / 1000.0),
+        9950..=9999 => "10k".to_string(),
+        _ => format!("{}k", n / 1000),
+    }
+}
+
+/// How strongly the diff badge's `+` and `−` take green and red over the
+/// card: dim, a colour that means added / removed without shouting.
+pub const DIFF_TINT: u8 = 70;
+
+/// The doing text keeps at least this many cells past its `›` / `>` mark
+/// (or its whole) before a card's right side gives up its file count, then
+/// a dim meter, then its diff badge, then its meter.
+pub const DOING_MIN: usize = 12;
+
+/// [`extras`]' levels, richest first: the badge with its file count and
+/// the meter; the badge and the meter; the badge and only an amber or red
+/// meter (a dim one says least); the meter; nothing.
+const EXTRA_LEVELS: u8 = 5;
+
+/// What an agent's insight adds to a card's right side at `level`
+/// ([`EXTRA_LEVELS`]), each part after a space: the diff badge (`+48 −12`,
+/// `+` dim green and `−` dim red over the card `bg`, [`DIFF_TINT`], a zero
+/// side left out; ` · 3f`
+/// in `dimc` at level 0; none while clean), then the context meter
+/// ([`ctx_seg`]; none with `meter` None: a NEEDS YOU card's). Returns the
+/// segments and the badge's cells `[x0, x1)` among them: a click there opens
+/// the agent's diff ([`Target::Diff`]).
+fn extras(a: &Agent, level: u8, meter: Option<CtxStyle>, bg: Ink, dimc: Hue) -> (Vec<Seg>, Option<(usize, usize)>) {
+    let Some(i) = a.insight.as_ref() else { return (Vec::new(), None) };
+    let mut v = Vec::new();
+    let mut span = None;
+    if let Some(d) = i.diff.filter(|_| level < 3) {
+        v.push(seg(" ", "text"));
+        let x0 = width(&v);
+        // (A side with nothing to say goes: `+5`, `−3`; both none, `+0`.)
+        if d.added > 0 || d.removed == 0 {
+            v.push(seg(format!("+{}", lines_n(d.added)), over(Ink::Pal("green"), DIFF_TINT, bg)));
+        }
+        if d.removed > 0 {
+            if d.added > 0 {
+                v.push(seg(" ", "text"));
+            }
+            v.push(seg(format!("−{}", lines_n(d.removed)), over(Ink::Pal("red"), DIFF_TINT, bg)));
+        }
+        if level == 0 {
+            v.push(seg(format!(" · {}f", d.files), dimc));
+        }
+        span = Some((x0, width(&v)));
+    }
+    let f = i.ctx_fraction().filter(|f| level != 2 || *f >= CTX_WARN);
+    if let Some(m) = meter.filter(|_| level < 4).and_then(|s| f.and_then(|f| ctx_seg(f, s, dimc))) {
+        v.extend([seg(" ", "text"), m]);
+    }
+    (v, span)
+}
+
+/// `row`'s cells `span` of its right side (`right_w` cells wide, ending at
+/// the tile's last cell) open window `win`'s diff, before the row's own
+/// click.
+fn diff_click(mut row: Row, w: usize, right_w: usize, span: Option<(usize, usize)>, win: &str) -> Row {
+    if let Some((x0, x1)) = span {
+        // (A right side wider than the tile is drawn clipped from its end
+        // ([`fit`]): the span is kept to the cells drawn.)
+        let drawn = right_w.min(inner(w));
+        let at = margin(w) + inner(w) - drawn;
+        let (a, b) = (at + x0.min(drawn), at + x1.min(drawn));
+        if a < b {
+            row.targets.insert(0, (a as u16, b as u16, Target::Diff(win.to_string())));
+        }
+    }
+    row
 }
 
 /// A title without a bare `~/` "project" (a summary made in $HOME).
@@ -1801,19 +2024,23 @@ fn agent_bg(a: &Agent, k: usize, mine: bool) -> Ink {
 /// state's colour; the client's own idle agent lavender; none when idle;
 /// the selection's heavier mauve `▌`), a pad, its key-cap ([`Badge::seg`]:
 /// solid for the client's and an asking or failed agent, else a quiet
-/// tint of its space's colour, `space`), a pad, the title (`text`, bold
+/// tint of its space's colour, `space`; a working agent's blinks,
+/// [`blinks`]), a pad, the title (`text`, bold
 /// for any state and for the client's), a flag (⚙ workflow, ◎ cua), and on
 /// the right the state's glyph and word bold in its colour (nothing when
 /// idle), the age beside it; with `two`, a second line under the title
-/// ([`second_line`], maybe blank: `overlay2`, `sub` when it asks or failed,
-/// a live blurb after a blue `›`) with the age at its end, so every agent
-/// row is the same height. Both lines click through. `tag`: a dim word
+/// ([`says`]: `overlay2`, `sub` when it asks or failed, what it does now
+/// after a blue `›`, your last prompt after a faint `> `, else a faint
+/// placeholder) with the age at its end, so every agent row is the same
+/// height; the insight's diff badge and context meter ([`extras`]) before
+/// the age (a one-line card's before its word), the badge a click into the
+/// diff ([`Target::Diff`]). Both lines click through. `tag`: a dim word
 /// before the second line's age (a PINNED card's space, `cs35l · 4m`),
 /// dropped when it would leave the line under [`TAG_ROOM`] cells.
 fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&str>) -> Vec<Row> {
     let w = inner(cx.w);
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
-    let msg = (two && cx.seconds()).then(|| second_line(a, cx.now));
+    let msg = (two && cx.seconds()).then(|| says(a, cx.now));
     let word = state_word(a, cx);
     let mine = own(a, cx);
     // (Its edge from 26 columns, like second lines: narrower, the title.)
@@ -1846,8 +2073,17 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     // line keeps just the ⏸ (one word once, not twice).
     let paused = a.cat == Some(Cat::Paused) && !a.in_flight;
     let word_below = paused && msg.is_some();
-    let right_of = |full: bool, with_age: bool| -> Vec<Seg> {
+    // A one-line card's insight extras ([`extras`]: the diff badge, the
+    // meter) before its word; a two-line card's go on its second line.
+    let right_of = |full: bool, with_age: bool, level: u8| -> Vec<Seg> {
         let mut r = Vec::new();
+        if msg.is_none() {
+            r.extend(extras(a, level, Some(cx.ctx), bg, dimc).0);
+            // (A space between them and the word.)
+            if !r.is_empty() && word.as_ref().is_some_and(|x| !x.idle()) {
+                r.push(seg(" ", "text"));
+            }
+        }
         if let Some(wd) = word.as_ref().filter(|x| !x.idle()) {
             let full = full && !word_below;
             r.push(bold(if full { format!("{} {}", wd.glyph, wd.word) } else { wd.glyph.to_string() }, wd.hue));
@@ -1862,21 +2098,33 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     };
     let fixed = |r: &[Seg]| lead + flag.as_ref().map_or(0, |f| dwidth(&f.text)) + width(r) + 1 + usize::from(marked);
     let full = short_title(a);
+    // The richest extras that leave the title its whole or DOING_MIN cells.
+    // (Never wider than the tile; an empty title still keeps a cell.)
+    let level = (0..EXTRA_LEVELS).find(|&l| {
+        let f = fixed(&right_of(true, true, l));
+        f <= w && w - f >= dwidth(&full).clamp(1, DOING_MIN)
+    });
+    let level = level.unwrap_or(EXTRA_LEVELS - 1);
     // The title before the age: an age that would clip it goes (a working
     // agent's age is the least of what the row says).
-    let mut right = right_of(true, true);
+    let mut right = right_of(true, true, level);
     if fixed(&right) + dwidth(&full) > w {
-        right = right_of(true, false);
+        right = right_of(true, false, level);
     }
     if w < fixed(&right) + 6 {
-        right = right_of(false, false);
+        right = right_of(false, false, level);
     }
     let room = w.saturating_sub(fixed(&right));
     let title = clip(&full, room);
     let title = if busy.is_some() || mine { bold(title, "text") } else { seg(title, "text") };
     let mut left = vec![rail.clone(), seg(" ", "text")];
     if cx.b.on {
-        left.extend([cx.b.seg(a, space, bg, loud_card(a, cx)), seg(" ", "text")]);
+        let cap = if blinks(a, word.as_ref()) && blink_on(cx.now) {
+            blink_cap(cx.b, a, bg, loud_card(a, cx))
+        } else {
+            cx.b.seg(a, space, bg, loud_card(a, cx))
+        };
+        left.extend([cap, seg(" ", "text")]);
     }
     if let Some(p) = pin.clone().filter(|_| inline) {
         left.extend([p, seg(" ", "text")]);
@@ -1892,14 +2140,36 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
         }
         r
     };
-    let mut first = tile_row(cx.w, bg, left, edge(right)).click(cx.w, go.clone()).covering([a]);
+    let right = edge(right);
+    let rw = width(&right);
+    let span = if msg.is_none() { extras(a, level, Some(cx.ctx), bg, dimc).1 } else { None };
+    let first = tile_row(cx.w, bg, left, right).click(cx.w, go.clone());
+    let mut first = diff_click(first, cx.w, rw, span, &a.window_id).covering([a]);
     first.anim = word.as_ref().is_some_and(Word::working);
     let Some(m) = msg else { return vec![first] };
     // Under the title (past the key-cap); without letters, indented anyway,
     // so a message never reads as another agent.
     let indent = if cx.b.on { lead - 1 } else { 3 };
-    let right2 = |tag: Option<&str>| {
-        let mut r: Vec<Seg> = Vec::new();
+    let faint = if mine { "overlay2" } else { PLACEHOLDER };
+    let text: Vec<Seg> = match m {
+        Says::Now(t) => vec![seg("› ", "blue"), seg(t, dimc)],
+        Says::Prompt(p) => vec![seg(PROMPT_MARK, faint), seg(p, dimc)],
+        Says::Said(m) => {
+            let asks = matches!(a.cat, Some(Cat::NeedsInput | Cat::Failed));
+            vec![seg(m, if asks { "sub" } else { dimc })]
+        }
+        // Nothing to say yet: a faint placeholder, so the row never reads
+        // as a broken card (the age stays where it is).
+        Says::Nothing if a.cat.is_some() => vec![seg(placeholder(a), faint)],
+        Says::Nothing => Vec::new(),
+    };
+    // (The words' cells: a `› ` / `> ` mark is not the text DOING_MIN keeps.)
+    let mark = if text.len() > 1 { width(&text[..1]) } else { 0 };
+    let tw = if word_below { width(&paused_line(usize::MAX, cx.resumes, dimc)) } else { width(&text) - mark };
+    // The right side: the extras ([`extras`]), the tag, the age.
+    let right2 = |level: u8, tag: Option<&str>| {
+        let (mut r, span) = extras(a, level, Some(cx.ctx), bg, dimc);
+        let some = !r.is_empty();
         if let Some(t) = tag {
             r.push(seg(format!(" {}", clip(&sanitize(t), TAG_W)), dimc));
             if age.is_some() {
@@ -1908,32 +2178,34 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
         }
         r.extend(age.iter().map(|ag| seg(format!(" {ag}"), dimc)));
         r.push(seg(" ", "text"));
-        edge(r)
+        (edge(r), span, some)
     };
-    let mut r2 = right2(tag);
-    if tag.is_some() && inner(cx.w).saturating_sub(1 + indent + width(&r2)) < TAG_ROOM {
-        r2 = right2(None);
-    }
+    // Richest first: the file count goes, then a dim meter, then the badge,
+    // then the tag, then the meter; extras only while the text keeps its
+    // whole or DOING_MIN cells, the tag only while the text keeps TAG_ROOM.
+    let room = |r: &[Seg]| inner(cx.w).saturating_sub(1 + indent + width(r));
+    let tries = (0..EXTRA_LEVELS - 1).map(|l| (l, tag)).chain([(EXTRA_LEVELS - 2, None), (EXTRA_LEVELS - 1, None)]);
+    let fits = |(r, _, some): &(Vec<Seg>, Option<(usize, usize)>, bool), t: Option<&str>| {
+        let fit = 1 + indent + width(r) <= inner(cx.w);
+        (!some || fit && room(r) >= mark + tw.clamp(1, DOING_MIN)) && (t.is_none() || room(r) >= TAG_ROOM)
+    };
+    let (r2, span, _) = tries
+        .into_iter()
+        .map(|(l, t)| (right2(l, t), t))
+        .find(|(x, t)| fits(x, *t))
+        .map_or_else(|| right2(EXTRA_LEVELS - 1, None), |(x, _)| x);
     let mut l2 = match pin {
         // The ⌥W digit cap under the letter's, on the card grid (c3-c5).
         Some(p) => vec![rail, seg(" ", "text"), p, seg(" ".repeat(indent - 1 - BADGE_W), "text")],
         None => vec![rail, seg(" ".repeat(indent), "text")],
     };
     if word_below {
-        let room = inner(cx.w).saturating_sub(1 + indent + width(&r2));
-        l2.extend(paused_line(room, cx.resumes, dimc));
-    } else if live_blurb(a).is_some() {
-        // Live: what it does right now, after a blue `›`.
-        l2.extend([seg("› ", "blue"), seg(m, dimc)]);
-    } else if m.trim().is_empty() && a.cat.is_some() {
-        // Nothing to say yet: a faint placeholder, so the row never reads
-        // as a broken card (the age stays where it is).
-        l2.push(seg(placeholder(a), if mine { "overlay2" } else { PLACEHOLDER }));
+        l2.extend(paused_line(room(&r2), cx.resumes, dimc));
     } else {
-        let asks = matches!(a.cat, Some(Cat::NeedsInput | Cat::Failed));
-        l2.push(seg(m, if asks { "sub" } else { dimc }));
+        l2.extend(text);
     }
-    let second = tile_row(cx.w, bg, l2, r2).click(cx.w, go);
+    let rw = width(&r2);
+    let second = diff_click(tile_row(cx.w, bg, l2, r2).click(cx.w, go), cx.w, rw, span, &a.window_id);
     vec![first, second]
 }
 
@@ -2452,11 +2724,22 @@ const NEED_TINT: [u8; 2] = [14, 9];
 /// on the right the state's glyph and word bold in its colour (the age
 /// beside it on a one-line card). Line 2: the reason in `text` (here the
 /// detail IS the content; a `perm` prompt says so), or the state in words;
-/// the age at its end.
+/// the age at its end. A permission prompt Claude waits on
+/// ([`crate::answer::answerable`]) ends its line 2 with the answer chips
+/// instead ([`answer_chips`]), and its age moves up beside the state:
+///
+/// ```text
+///  ▌  s  tmux/Answer from the sid… ◉ perm 2m      44 columns
+///  ▌     perm Bash carg…  y  allow   n  deny
+///  ▌  s  tmux/Answer fr… ◉ perm 2m                34: the caps alone
+///  ▌     perm Bash cargo …  y   n
+/// ```
 fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
     let w = cx.w;
     let iw = inner(w);
     let a = &n.agent;
+    // (From 26 columns, like an agent card's second line: narrower, no room.)
+    let answering = lines >= 2 && cx.seconds() && crate::answer::answerable(a);
     let word = a.cat.map(|c| cat_word(a, c));
     let hue = word.as_ref().map_or(a.color.unwrap_or("overlay2"), |x| x.hue);
     let bg = Ink::Mix(hue, NEED_TINT[tint]);
@@ -2472,7 +2755,7 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
     // The richest right side that leaves the title room (its whole, or 10
     // cells: the word is worth a clipped title, as on an agent's card):
     // the word, then the glyph alone, then (a one-line card) no age.
-    let one = lines < 2;
+    let one = lines < 2 || answering;
     let rights: Vec<Vec<Seg>> = [(true, one), (false, one), (false, false)]
         .into_iter()
         .map(|(full, aged)| {
@@ -2502,11 +2785,63 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
             }
             l2.push(seg(plain(&n.reason), "text"));
         }
-        let mut r2: Vec<Seg> = age.into_iter().collect();
-        r2.push(seg(" ", "text"));
-        rows.push(card(bg, l2, r2));
+        if answering {
+            let room = iw.saturating_sub(width(&l2[..2]) + 1);
+            let (chips, spans) = answer_chips(room);
+            let at = (margin(w) + iw - 1 - width(&chips)) as u16;
+            let mut r2 = vec![seg(" ", "text")];
+            r2.extend(chips);
+            r2.push(seg(" ", "text"));
+            let mut row = card(bg, l2, r2);
+            for (k, (x0, x1)) in spans.into_iter().enumerate() {
+                let t = Target::Answer { win: a.window_id.clone(), session: a.session.clone(), allow: k == 0,
+                    prompt: crate::answer::prompt_key(a) };
+                row.targets.insert(k, (at + x0 as u16, at + x1 as u16, t));
+            }
+            rows.push(row);
+            return rows;
+        }
+        // The diff badge before the age, while the reason keeps its whole
+        // or DOING_MIN cells (its file count first to go); no meter here.
+        let tw = width(&l2[2..]);
+        let right2 = |level: u8| {
+            let (mut r, span) = extras(a, level, None, bg, dim(true));
+            r.extend(age.clone());
+            r.push(seg(" ", "text"));
+            (r, span)
+        };
+        let (r2, span) = (0..2)
+            .map(right2)
+            .find(|(r, span)| {
+                let used = width(&l2[..2]) + width(r);
+                span.is_some() && used <= iw && iw - used >= tw.clamp(1, DOING_MIN)
+            })
+            .unwrap_or_else(|| right2(EXTRA_LEVELS - 1));
+        let rw = width(&r2);
+        rows.push(diff_click(card(bg, l2, r2), w, rw, span, &a.window_id));
     }
     rows
+}
+
+/// What the detail keeps beside the answer chips before they shrink.
+const ANSWER_DETAIL: usize = 10;
+
+/// A perm card's answer chips, square key-caps like the letter's: ` y `
+/// solid green then `allow`, ` n ` solid red then `deny`, on the card's own
+/// colour (one background); as caps alone (` y   n `) when the labels would
+/// leave the detail under [`ANSWER_DETAIL`] of `room` (the cells after the
+/// card's lead), as at Mack's usual 34 columns. Returns the segments and
+/// each chip's cells `[x0, x1)` within them (allow, then deny): a click on
+/// a cap or its word answers.
+fn answer_chips(room: usize) -> (Vec<Seg>, [(usize, usize); 2]) {
+    let cap = |k: &str, hue: Hue| block(format!(" {k} "), ink_on(Ink::Pal(hue)), hue);
+    let full = vec![cap("y", "green"), seg(" allow", "text"), seg("  ", "text"), cap("n", "red"), seg(" deny", "text")];
+    if room >= width(&full) + 1 + ANSWER_DETAIL {
+        let y = BADGE_W + dwidth(" allow");
+        return (full, [(0, y), (y + 2, y + 2 + BADGE_W + dwidth(" deny"))]);
+    }
+    let caps = vec![cap("y", "green"), seg(" ", "text"), cap("n", "red")];
+    (caps, [(0, BADGE_W), (BADGE_W + 1, 2 * BADGE_W + 1)])
 }
 
 /// The colour of the space `session` (its `@space_color`, else peach), for
@@ -2885,6 +3220,7 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
         cur: view.cur_win.as_deref(),
         shells: view.shells,
         resumes: matches!(opts.pause, Some(Phase::Stopping { .. } | Phase::Safe { .. } | Phase::Ready { .. })),
+        ctx: opts.ctx,
     };
     // Pinned agents move out of their spaces into PINNED (a view already
     // split is laid out as it is). The letters, the client's own card and
