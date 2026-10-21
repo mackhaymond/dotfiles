@@ -819,7 +819,10 @@ def finish_pause(client, prog, targets, unidentified):
     set_paused_option(len(ok))
     msg = "⏸ paused %d agent%s: %s" % (len(ok), "" if len(ok) == 1 else "s", names(ok))
     if held:
-        msg += " · %d held behind a draft" % len(held)
+        # Said by name, with what to do: tmux-mcp delivers only once that box
+        # is clear, so the agent keeps working until Mack clears or sends it
+        # (2026-10-21: one waited 6 min while the banner said "still working").
+        msg += " · WAITING on a draft in %s's prompt box: clear or send it" % names(held)
     if unsure:
         msg += " · %d unconfirmed (no reply; saved anyway)" % len(unsure)
     if bad:
@@ -984,7 +987,7 @@ def toggle(client, resume_only=False):
     # The line too whenever the popup is NOT still up: it never opened, or
     # Mack pressed Esc while it was sending - then nothing else would tell him.
     if not popup_still_up(popup):
-        display(client, msg)
+        display(client, msg, "warn" if "WAITING on a draft" in msg else "info")
 
 
 def finished(prog, finish):

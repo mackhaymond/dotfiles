@@ -586,7 +586,8 @@ class PauseKey(Harness):
         self.assertEqual(sorted(t["pane_id"] for t in st["targets"]), sorted([a, h]))
         self.assertEqual([t["pane_id"] for t in st["failed"]], [b])
         self.assertIn("FAILED 1", entry["message"])
-        self.assertIn("1 held behind a draft", entry["message"])
+        self.assertIn("WAITING on a draft in", entry["message"])
+        self.assertIn("clear or send it", entry["message"])
         self.assertEqual(self.paused_opt(), "2")
 
     def test_all_failed_writes_no_state(self):
