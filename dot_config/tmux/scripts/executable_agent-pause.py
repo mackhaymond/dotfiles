@@ -614,15 +614,22 @@ def classify(resp):
 REACHED = ("sent", "held", "unknown")   # "unknown" = no reply, probably delivered
 
 
-def deliver(mcp, jobs, msg, on_result=None):
+def deliver(mcp, jobs, msg, on_result=None, urgent=False):
     """jobs [(key, pane_id)] -> {key: (status, detail)}, concurrently: each
     delivery spends ~400 ms in tmux-mcp's draft guard. Never raises: every
     job gets a status - sent | held | failed | unknown (see McpUncertain;
     anything unexpected counts as unknown too, since it may have gone out).
-    on_result(key, (status, detail)) is called as each one lands (progress)."""
+    on_result(key, (status, detail)) is called as each one lands (progress).
+    urgent (the PAUSE; Mack: "pause should override that hold"): tmux-mcp
+    sends it along with a half-written draft, behind a note, instead of
+    holding it until the box clears; only a dialog still holds it."""
+    args = {"raw": True, "message": msg}
+    if urgent:
+        args["urgent"] = True
+
     def one(pane):
         try:
-            return classify(mcp.call("message_agent", {"pane": pane, "message": msg, "raw": True}))
+            return classify(mcp.call("message_agent", dict(args, pane=pane)))
         except McpUncertain as e:
             return "unknown", str(e)
         except McpError as e:
@@ -796,7 +803,7 @@ def finish_pause(client, prog, targets, unidentified):
     mark_paused([t["pane_id"] for t in targets], True)
     try:
         res = deliver(mcp, [(i, t["pane_id"]) for i, t in enumerate(targets)], PAUSE_MSG,
-                      on_result=prog.result)
+                      on_result=prog.result, urgent=True)
     finally:
         mcp.close()
     for i, t in enumerate(targets):

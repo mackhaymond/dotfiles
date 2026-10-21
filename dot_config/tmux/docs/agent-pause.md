@@ -57,6 +57,16 @@ tmux-mcp has a **draft guard**: if a target's prompt box holds a half-typed
 draft or a dialog, the message is held and delivered once the box is clear. A
 held message therefore counts as delivered.
 
+**The PAUSE overrides the draft hold** (Mack, 2026-10-21: "pause should
+override that hold", after one PAUSE waited 6 minutes behind a draft). It goes
+out with `urgent: true` (tmux-mcp 5b96c99): a draft no longer holds it, it is
+sent along with the draft behind a note telling the agent that text was an
+unsent draft, not a request, and it is submitted. Nothing is lost, since the
+draft stays in that agent's conversation. A dialog (a permission prompt, a
+menu) still holds it, because an Enter there would answer the dialog; such a
+hold shows in the toast as `WAITING on … clear or send it`. The RESUME is not
+urgent and waits for a clear box as before.
+
 - **PAUSE**: urgent. The lid is closing now, so drop the work immediately
   rather than finishing the task or step (Mack's call). Clean up only what
   would be left broken: finish or undo the one edit in flight so no file is

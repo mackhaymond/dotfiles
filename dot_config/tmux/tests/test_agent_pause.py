@@ -639,6 +639,16 @@ class PauseKey(Harness):
         self.assertEqual(self.stub.methods, [])
         self.assertIsNone(self.state())
 
+    def test_pause_is_urgent_resume_is_not(self):
+        """The PAUSE overrides tmux-mcp's draft hold (urgent); the RESUME
+        waits for a clear box like any other message."""
+        a = self.window("running")
+        self.press()
+        self.press()
+        urgent = {c["message"]: c.get("urgent") for c in self.stub.calls if c["pane"] == a}
+        self.assertIs(urgent[AP.PAUSE_MSG], True)
+        self.assertIsNone(urgent[AP.RESUME_MSG])
+
     def test_resume_only_never_pauses(self):
         a = self.window("running")
         r = self.run_script("resume", "")
