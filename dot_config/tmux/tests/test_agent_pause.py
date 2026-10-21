@@ -586,8 +586,13 @@ class PauseKey(Harness):
         self.assertEqual(sorted(t["pane_id"] for t in st["targets"]), sorted([a, h]))
         self.assertEqual([t["pane_id"] for t in st["failed"]], [b])
         self.assertIn("FAILED 1", entry["message"])
-        self.assertIn("WAITING on a draft in", entry["message"])
-        self.assertIn("clear or send it", entry["message"])
+        self.assertIn("WAITING on ", entry["message"])
+        self.assertIn("(its prompt box has a half-written draft in it)", entry["message"])
+        self.assertEqual(AP.held_reason("held for @x (s:1.0, pane %1): no prompt box on screen (a dialog "
+                                        "or menu may be up). It will be delivered once the box has been "
+                                        "empty for 3s (1 message waiting)."),
+                         "no prompt box on screen (a dialog or menu may be up)")
+        self.assertEqual(AP.held_reason(""), "its prompt box is not free: look at its tab")
         self.assertEqual(self.paused_opt(), "2")
 
     def test_all_failed_writes_no_state(self):

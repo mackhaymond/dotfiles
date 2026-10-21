@@ -64,7 +64,7 @@ sent along with the draft behind a note telling the agent that text was an
 unsent draft, not a request, and it is submitted. Nothing is lost, since the
 draft stays in that agent's conversation. A dialog (a permission prompt, a
 menu) still holds it, because an Enter there would answer the dialog; such a
-hold shows in the toast as `WAITING on … clear or send it`. The RESUME is not
+hold shows in the toast as `WAITING on <agent> (<tmux-mcp's reason>)` and as its own row in the sidebar (8a0b766). The RESUME is not
 urgent and waits for a clear box as before.
 
 - **PAUSE**: urgent. The lid is closing now, so drop the work immediately
