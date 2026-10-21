@@ -27,6 +27,9 @@
 #                   (interim: the raw title until the condensation lands)
 #   @agent_summary_cond  1 while @agent_summary holds a condensed label, unset
 #                   while it holds raw stand-in text — see compose_summary
+#   @agent_summary_key  the condense key the label should come from; a
+#                   detached worker paints only while it is still its own —
+#                   see compose_summary's SUMMARY KEY
 #   @agent_pending  epoch stamp: a needs-input window the user focused (went
 #                   to answer its prompt). The next heartbeat consumes it to
 #                   restore `running` when the answered turn resumes; every
@@ -199,6 +202,22 @@ notify_state() {
     local name="${AGENT_STATE_NOTICE-com.mackhaymond.tmux.agent-state}"
     [ -n "$name" ] || return 0
     notifyutil -p "$name" >/dev/null 2>&1 || true
+}
+
+# owns_window, answered once per window per process: compose_summary asks
+# before it writes anything (the SUMMARY KEY rides in tmux calls that bypass
+# set_summary), and set_summary's own check then costs a codex hook nothing
+# more. A process is one hook event, or one worker whose first ask is at
+# paint time, so the answer can't go stale in between.
+OWN_MEMO=""
+owns_window_once() {
+    case "$OWN_MEMO" in
+        "$1:1") return 0 ;;
+        "$1:0") return 1 ;;
+    esac
+    if owns_window "$1"; then OWN_MEMO="$1:1"; return 0; fi
+    OWN_MEMO="$1:0"
+    return 1
 }
 
 owns_window() {
@@ -637,7 +656,8 @@ clear_state() {
     cur=$(window_state "$win")
     tmux set-option -uw -t "$win" @agent_state 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_summary 2>/dev/null || true
-    tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null || true
+    tmux set-option -uw -t "$win" @agent_summary_cond \; \
+         set-option -uw -t "$win" @agent_summary_key 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_pending 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_rollout 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null || true
@@ -999,14 +1019,23 @@ sanitize_summary() {
 # refuse to downgrade a finished label back to raw text on a later turn. The
 # flag is written before the no-change short-circuit: re-asserting the same
 # string must still correct the flag.
+# $4: the condense key this label answers (@agent_summary_key, see
+# compose_summary's SUMMARY KEY), "-" to unset it, empty to leave it. It
+# rides in the flag's tmux call: no extra fork.
 set_summary() {
-    local win="$1" summary="$2" cond="${3:-0}" cur
-    owns_window "$win" || return 0
+    local win="$1" summary="$2" cond="${3:-0}" key="${4:-}" cur
+    local -a kc=()
+    owns_window_once "$win" || return 0
     [ -n "$summary" ] || return 0
+    case "$key" in
+        "") ;;
+        -) kc=(\; set-option -uw -t "$win" @agent_summary_key) ;;
+        *) kc=(\; set-option -w -t "$win" @agent_summary_key "$key") ;;
+    esac
     if [ "$cond" = 1 ]; then
-        tmux set-option -w -t "$win" @agent_summary_cond 1 2>/dev/null || true
+        tmux set-option -w -t "$win" @agent_summary_cond 1 ${kc[@]+"${kc[@]}"} 2>/dev/null || true
     else
-        tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null || true
+        tmux set-option -uw -t "$win" @agent_summary_cond ${kc[@]+"${kc[@]}"} 2>/dev/null || true
     fi
     cur=$(tmux show-options -wqv -t "$win" @agent_summary 2>/dev/null || true)
     [ "$cur" = "$summary" ] && return 0
@@ -1045,7 +1074,13 @@ title_key() {
 # Last non-empty short for a title (skips negative rows; last writer wins).
 cached_short() {
     [ -f "$CACHE" ] || return 0
-    awk -F'\t' -v k="$(title_key "$1")" \
+    cached_short_key "$(title_key "$1")"
+}
+
+# The same, by a title_key already computed.
+cached_short_key() {
+    [ -f "$CACHE" ] || return 0
+    awk -F'\t' -v k="$1" \
         '$1==k && $2!=""{v=$2} END{if(v!="")print v}' "$CACHE" 2>/dev/null || true
 }
 
@@ -1071,14 +1106,73 @@ fit_words() {
     printf '%s' "$s" | cut -c1-"$n"
 }
 
+# TITLE BUDGET: the cells a label gets in the agent-ui sidebar, which shows
+# @agent_summary minus its `project/` (layout.rs short_title) and clips it to
+# what its card row leaves (layout.rs agent_rows). Derived from that code, for
+# the worst common card — two lines, working, a ⚙/◎ flag, the client's own:
+#   pane  = |@sidebar_width| - 1     the value includes WezTerm's divider and
+#                                    is negative for a left sidebar
+#                                    (status.rs width_value)
+#   inner = pane - 2                 a 1-cell margin each side (inner/margin)
+#   fixed = 6 + 2 + 10 + 1 + 1       lead: rail, pad, the 3-cell key-cap
+#                                    (BADGE_W), pad (Badge::lead); the flag
+#                                    " ⚙"/" ◎"; "◐ working" + its pad
+#                                    (right_of: "working" is the longest state
+#                                    word); the 1 in `fixed`; `marked` (the
+#                                    client's own card's edge)
+#   room  = @sidebar_width - 23      22 at today's 45 columns
+# Clamped to 12..24 (24: the tab bar's own cap; 12: below that a label is
+# useless, the sidebar clips). Unset or non-numeric width → 24.
+# AGENT_TAB_TITLE_BUDGET overrides (tests). Read ONLY in the detached
+# condense worker: never a tmux call on the hook's hot path. A width change
+# later does not re-condense cached labels — the sidebar clips with an
+# ellipsis. If agent_rows' chrome changes, change TITLE_CHROME with it.
+TITLE_CHROME=23
+TITLE_BUDGET_MIN=12
+TITLE_BUDGET_MAX=24
+title_budget() {
+    local w="${AGENT_TAB_TITLE_BUDGET:-}"
+    if [[ $w =~ ^[0-9]+$ ]] && [ "$w" -ge 1 ]; then
+        printf '%s' "$((10#$w))"
+        return 0
+    fi
+    w=$(tmux show-options -gqv @sidebar_width 2>/dev/null || true)
+    w="${w#-}"
+    if ! [[ $w =~ ^[0-9]{1,4}$ ]]; then
+        printf '%s' "$TITLE_BUDGET_MAX"
+        return 0
+    fi
+    w=$((10#$w - TITLE_CHROME))
+    [ "$w" -ge "$TITLE_BUDGET_MIN" ] || w=$TITLE_BUDGET_MIN
+    [ "$w" -le "$TITLE_BUDGET_MAX" ] || w=$TITLE_BUDGET_MAX
+    printf '%s' "$w"
+}
+
+# A /rename title as words: Claude's generated names are kebab slugs, so a
+# space-free one with -/_ reads as words; anything with a space is shown as
+# typed.
+custom_words() {
+    local s="$1"
+    case "$s" in
+        *" "*) ;;
+        *[-_]*)
+            s="${s//[-_]/ }"
+            while [[ $s == *"  "* ]]; do s="${s//  / }"; done
+            s="${s# }"; s="${s% }"
+            ;;
+    esac
+    printf '%s' "${s:-$1}"
+}
+
 # Gate model output before caching: accept only title-like text (1-4 words,
-# <=24 chars, has a letter, no colon / sentence-final punctuation, not an
-# apology / refusal / auth-error / first-person reply). This is what stops
-# copilot error strings ("Credit balance is too…") from poisoning the cache.
+# <= $2 chars — the title budget, default 24 — has a letter, no colon /
+# sentence-final punctuation, not an apology / refusal / auth-error /
+# first-person reply). This is what stops copilot error strings ("Credit
+# balance is too…") from poisoning the cache.
 valid_short() {
-    local s="$1" lc wc
+    local s="$1" max="${2:-24}" lc wc
     [ -n "$s" ] || return 1
-    [ "${#s}" -le 24 ] || return 1
+    [ "${#s}" -le "$max" ] || return 1
     case "$s" in *:*|*.|*!|*\?) return 1 ;; esac
     case "$s" in *[A-Za-z]*) ;; *) return 1 ;; esac
     wc=$(printf '%s' "$s" | wc -w | tr -d ' ')
@@ -1139,28 +1233,41 @@ compose_summary() {
     # are a different question.
     kin="$raw"
     [ -z "$prev" ] || kin="retitle"$'\n'"$prev"$'\n'"$raw"
+    [ "$src" != custom ] || kin="custom"$'\n'"$raw"
+    # SUMMARY KEY. The window remembers which condense its label should come
+    # from (@agent_summary_key = this kin's title_key), written with every
+    # final paint (set_summary's 4th argument, in the flag's tmux call) and
+    # with every worker spawn (in the run-shell's own call): no extra fork. A
+    # worker paints only while the key is still its own, so a slow worker for
+    # an older title (a long /rename, then a short one before copilot
+    # answered) can't repaint the newer one for a turn.
+    local key
+    # Nothing below may touch a window this hook can't prove it owns (the key
+    # writes ride outside set_summary). Memoized: set_summary reuses it.
+    owns_window_once "$win" || return 0
+    key=$(title_key "$kin")
     proj=$(project_name "$payload")
-    # A custom title (/rename) is the user's own naming: shown as written,
-    # never condensed. Claude's generated names are kebab slugs, so a
-    # space-free one with -/_ reads as words. Marked condensed (1) so no raw
-    # stand-in ever repaints over it.
+    # A custom title (/rename) is the user's own naming, but Claude's
+    # generated names run long ("topic-drift-detector-hook-for-tab-titles"),
+    # and the sidebar clips whatever doesn't fit its card. So it is shown as
+    # written when it fits the title budget, else shortened by the condenser
+    # to fit — keyed apart from every other source ("custom\n<title>"), so a
+    # rename never shares a cache row with the same text as a prompt. Until
+    # the worker answers (or if it fails), the words trimmed to 24 stand in.
+    # Marked condensed (1) either way, so no raw stand-in repaints over it.
     if [ "$src" = custom ]; then
-        short="$raw"
-        case "$short" in
-            *" "*) ;;
-            *[-_]*)
-                short="${short//[-_]/ }"
-                while [[ $short == *"  "* ]]; do short="${short//  / }"; done
-                short="${short# }"; short="${short% }"
-                ;;
-        esac
-        [ -n "$short" ] || short="$raw"
-        set_summary "$win" "${proj:+$proj/}$(fit_words "$short" 24)" 1
+        short=$(cached_short_key "$key")
+        if [ -n "$short" ]; then
+            set_summary "$win" "${proj:+$proj/}$short" 1 "$key"
+            return 0
+        fi
+        set_summary "$win" "${proj:+$proj/}$(fit_words "$(custom_words "$raw")" 24)" 1
+        spawn_condense "$win" "$proj" "$raw" "" custom "$key"
         return 0
     fi
-    short=$(cached_short "$kin")
+    short=$(cached_short_key "$key")
     if [ -n "$short" ]; then
-        set_summary "$win" "${proj:+$proj/}$short" 1
+        set_summary "$win" "${proj:+$proj/}$short" 1 "$key"
         return 0
     fi
     # Raw text is only ever a stand-in for the label the condenser is about to
@@ -1181,10 +1288,20 @@ compose_summary() {
     # from the moment the first message is sent, for one extra call per
     # session (the real title hashes to a different key). The cache read above
     # keeps repeats — and every later turn — free.
+    spawn_condense "$win" "$proj" "$raw" "$prev" "" "$key"
+}
+
+# spawn_condense WIN PROJ RAW PREV KIND KEY: the detached condense worker (see
+# the condense mode; KIND is "" or custom). KEY (the SUMMARY KEY) is stored
+# on the window in the same tmux call that launches the worker.
+spawn_condense() {
     command -v copilot >/dev/null 2>&1 || return 0
+    local -a pre=()
+    [ -z "${6:-}" ] || pre=(set-option -w -t "$1" @agent_summary_key "$6" \;)
     # Hooks may have their whole process group reaped after returning. Ask
     # the tmux server to own this background job instead, carrying the exact
     # socket/session identity rather than the server's launch environment.
+    # The title budget's override rides along (the worker reads the budget).
     local launch
     printf -v launch '%q ' env "HOME=$HOME" "PATH=$PATH" "TMPDIR=${TMPDIR:-/tmp}" \
         "TMUX=${TMUX:-}" "TMUX_PANE=${TMUX_PANE:-}" \
@@ -1194,9 +1311,10 @@ compose_summary() {
         "AGENT_TAB_OWNER_BINDING=${AGENT_TAB_OWNER_BINDING:-}" \
         "AGENT_TAB_OWNER_RECORD=${AGENT_TAB_OWNER_RECORD:-}" \
         "AGENT_TAB_CONDENSE_MODEL=$CONDENSE_MODEL" \
-        bash "$0" condense "$win" "$proj" "$raw" "$prev"
+        "AGENT_TAB_TITLE_BUDGET=${AGENT_TAB_TITLE_BUDGET:-}" \
+        bash "$0" condense "$1" "$2" "$3" "$4" "$5"
     launch+=' >/dev/null 2>&1'
-    tmux run-shell -b "$launch" >/dev/null 2>&1 || true
+    tmux ${pre[@]+"${pre[@]}"} run-shell -b "$launch" >/dev/null 2>&1 || true
 }
 
 # --- claude title sources + topic drift --------------------------------------
@@ -1354,7 +1472,8 @@ drift_update() {
 # distinguishes the agent's own conversation title (`final`) from the turn's
 # prompt standing in until that title exists (`interim`) — both condense, the
 # prompt at a longer bound — a user-blessed /rename title (`custom`), which
-# compose_summary shows as-is, and a drift retitle, emitted as
+# compose_summary shows as written when it fits the title budget and has the
+# condenser shorten when it doesn't, and a drift retitle, emitted as
 # "retitle\t<label on screen when it fired>\t<drifted prompts>" for the
 # condenser to judge. Empty output = no title at all.
 # A tab is a safe delimiter: sanitize_summary maps tabs to spaces.
@@ -1644,21 +1763,30 @@ fi
 # label back unchanged if the prompts are still the same work, a new label
 # only for a clearly different task. The lexical detector fires on plenty of
 # same-task follow-ups that share no words; this call is what rejects them.
-# Cached under the composed input, so it is one call per trigger. Never
-# invoked by hooks directly, so a slow/failed model call only delays the
-# title swap.
+# Cached under the composed input, so it is one call per trigger.
+# <kind> custom (argv 6): a /rename title, shown verbatim when it fits the
+# title budget (no model call), else shortened to fit it. Every new label is
+# held to the budget (title_budget: the sidebar card's room), in the prompt
+# and in valid_short. Never invoked by hooks directly, so a slow/failed model
+# call only delays the title swap.
+if [ "$mode" = "title-budget" ]; then
+    title_budget; echo
+    exit 0
+fi
 if [ "$mode" = "condense" ] || [ "$mode" = "condense-locked" ]; then
-    win="${2:-}"; proj="${3:-}"; raw="${4:-}"; prev="${5:-}"
+    win="${2:-}"; proj="${3:-}"; raw="${4:-}"; prev="${5:-}"; kind="${6:-}"
     { [ -n "$win" ] && [ -n "$raw" ]; } || exit 0
-    kin="$raw"
-    [ -z "$prev" ] || kin="retitle"$'\n'"$prev"$'\n'"$raw"   # = compose_summary's
+    [ "$kind" != custom ] || prev=""
+    kin="$raw"   # = compose_summary's
+    [ -z "$prev" ] || kin="retitle"$'\n'"$prev"$'\n'"$raw"
+    [ "$kind" != custom ] || kin="custom"$'\n'"$raw"
     key=$(title_key "$kin")
     if [ "$mode" = "condense" ]; then
         # A mkdir lock survives SIGKILL and then rejects this title forever.
         # Keep the advisory-lock inode permanently; the kernel releases its
         # lock when the worker exits, even if no shell trap can run. The new
         # suffix also bypasses orphaned legacy .lock directories safely.
-        exec python3 - "${TMPDIR:-/tmp}/agent-tab-condense.$key.flock" "$0" "$win" "$proj" "$raw" "$prev" <<'PYLOCK'
+        exec python3 - "${TMPDIR:-/tmp}/agent-tab-condense.$key.flock" "$0" "$win" "$proj" "$raw" "$prev" "$kind" <<'PYLOCK'
 import fcntl
 import os
 import sys
@@ -1677,22 +1805,42 @@ PYLOCK
     ERRF=$(mktemp "${TMPDIR:-/tmp}/agent-tab-condense.$key.err.XXXXXX")
     trap 'rm -f "$ERRF" 2>/dev/null' EXIT
     trap 'exit 0' INT TERM
+    # SUMMARY KEY (compose_summary): paint only while the window still wants
+    # this condense. One show-options, in the detached worker only.
+    paint() {
+        [ "$(tmux show-options -wqv -t "$win" @agent_summary_key 2>/dev/null || true)" = "$key" ] || return 0
+        set_summary "$win" "${proj:+$proj/}$1" 1
+    }
 
-    short=$(cached_short "$kin")
+    short=$(cached_short_key "$key")
     if [ -z "$short" ]; then
         # Back off if a recent attempt for this title failed, so a persistent
         # copilot error (not logged in, out of credit) isn't re-run every turn.
         negative_fresh "$key" && exit 0
+        budget=$(title_budget)
+
+        if [ "$kind" = custom ]; then
+            disp=$(custom_words "$raw")
+            if [ "${#disp}" -le "$budget" ]; then
+                # It fits: the user's own words, no model call.
+                cache_put "$key" "$disp"
+                paint "$disp"
+                exit 0
+            fi
+        fi
 
         # gtimeout is coreutils' name when /usr/bin/timeout is absent (macOS).
         TO=$(command -v timeout || command -v gtimeout || true)
-        if [ -n "$prev" ]; then
+        if [ "$kind" = custom ]; then
+            PROMPT="The user named this coding session: $disp
+Shorten it to a tab label of at most $budget characters (1-4 words) that keeps its meaning and its most distinctive words. Output ONLY the label - no punctuation, quotes, or explanation."
+        elif [ -n "$prev" ]; then
             PROMPT="Current tab label: $prev
 The user's latest messages: $raw
 
-If these messages are still about the same work as the label (follow-ups, details, sub-steps, feedback, logistics), output the label EXACTLY as given. Only if the user has clearly moved on to a different task or subject, output a new 2-4 word label for the new task, built from the MOST SPECIFIC, distinctive words: the concrete subject, target, feature, file, tech, or action unique to it. Keep proper nouns and real names. DROP generic filler (project, code, app, task, session, various, thing, stuff, update, changes, improve, and a bare fix/add/refactor when what it acts on is unnamed). Output ONLY the label - no punctuation, quotes, or explanation."
+If these messages are still about the same work as the label (follow-ups, details, sub-steps, feedback, logistics), output the label EXACTLY as given. Only if the user has clearly moved on to a different task or subject, output a new 2-4 word label of at most $budget characters for the new task, built from the MOST SPECIFIC, distinctive words: the concrete subject, target, feature, file, tech, or action unique to it. Keep proper nouns and real names. DROP generic filler (project, code, app, task, session, various, thing, stuff, update, changes, improve, and a bare fix/add/refactor when what it acts on is unnamed). Output ONLY the label - no punctuation, quotes, or explanation."
         else
-        PROMPT="From the coding-session title or first message below, output a 2-4 word tab label built from the MOST SPECIFIC, distinctive words in it: the concrete subject, target, feature, file, tech, or action unique to THIS task. Keep proper nouns and real names. DROP generic filler (project, code, app, task, session, various, deep, inspection, thing, stuff, update, changes, improve, and a bare fix/add/refactor when what it acts on is unnamed). Someone reading the label should be able to guess the task back. Prefer the unusual identifying word over the category word. Output ONLY the label - no punctuation, quotes, or explanation.
+        PROMPT="From the coding-session title or first message below, output a 2-4 word tab label of at most $budget characters, built from the MOST SPECIFIC, distinctive words in it: the concrete subject, target, feature, file, tech, or action unique to THIS task. Keep proper nouns and real names. DROP generic filler (project, code, app, task, session, various, deep, inspection, thing, stuff, update, changes, improve, and a bare fix/add/refactor when what it acts on is unnamed). Someone reading the label should be able to guess the task back. Prefer the unusual identifying word over the category word. Output ONLY the label - no punctuation, quotes, or explanation.
 
 Examples:
 - 'deep inspection of this project docs, I wanna open source it, make sure nothing reads like AI or oddly specific to me' => Open-source doc cleanup
@@ -1746,8 +1894,8 @@ Title: $raw"
                 short="$prev"
             else
                 short=$(printf '%s' "$line" | cut -d' ' -f1-4 || true)
-                short=$(fit_words "$short" 24)
-                valid_short "$short" || short=""
+                short=$(fit_words "$short" "$budget")
+                valid_short "$short" "$budget" || short=""
             fi
         else
             short=""
@@ -1761,7 +1909,7 @@ Title: $raw"
         fi
     fi
     [ -n "$short" ] || exit 0
-    set_summary "$win" "${proj:+$proj/}$short" 1
+    paint "$short"
     exit 0
 fi
 
@@ -1985,7 +2133,9 @@ case "$mode" in
             case "$src" in
                 clear|startup)
                     proj=$(project_name "$payload")
-                    set_summary "$win" "${proj:+$proj/}New Session"
+                    # "-": no condense owns this label, so no worker still out
+                    # for the previous conversation may paint over it.
+                    set_summary "$win" "${proj:+$proj/}New Session" 0 -
                     ;;
             esac
         fi

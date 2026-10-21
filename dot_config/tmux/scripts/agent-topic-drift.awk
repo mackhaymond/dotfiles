@@ -37,7 +37,9 @@
 #   overlap = |W ∩ bag| / |W|
 # Prompts that carry no goal are skipped outright (after a left trim):
 # system/tag text ('<…'), slash commands ('/…'), peer agents ('[message from
-# @…'), compaction continuations ('This session is being continued from a
+# @…'), pause-key broadcasts ('[pause key] PAUSE NOW…' / '[pause key]
+# RESUME…', agent-pause.py: 2 of the first 13 live retitles were these),
+# compaction continuations ('This session is being continued from a
 # previous conversation…'), and anything with fewer than min_words content
 # words ("yes", "do it", "lgtm" — most prompts).
 # overlap >= drift_t: on topic — W joins the ring, strikes and candidates
@@ -301,6 +303,7 @@ END {
     head = utf8_trim(substr(p, 1, max_chars))
 
     if (p == "" || substr(p, 1, 1) == "<" || substr(p, 1, 1) == "/" || index(p, "[message from @") == 1 \
+        || index(p, "[pause key]") == 1 \
         || index(p, "This session is being continued from a previous conversation") == 1) {
         verdict = verdict "skip tag"
     } else {

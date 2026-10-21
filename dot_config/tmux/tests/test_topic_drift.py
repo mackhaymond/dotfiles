@@ -181,6 +181,11 @@ class DriftAwkTests(unittest.TestCase):
                   "  /compact invoice pdf export margins footer pages printed",
                   "\r\n[message from @reviewer] invoice pdf export margins footer pages are wrong",
                   "[message from @reviewer] invoice pdf export margins footer pages are wrong",
+                  # agent-pause.py's broadcasts (2 of the first 13 live retitles)
+                  "[pause key] PAUSE NOW: Mack is shutting the laptop right now. Drop your work "
+                  "at a clean point and write down where you are.",
+                  "  [pause key] RESUME: Mack is back. Pick up where you paused, using the next "
+                  "step you wrote down.",
                   "This session is being continued from a previous conversation that ran out of context. "
                   "The invoice pdf export margins footer pages summary follows"]:
             self.assertEqual(self.feed(p), "skip tag", repr(p))
@@ -365,15 +370,25 @@ from pathlib import Path
 r=Path(os.environ['FAKE_CONDENSER'])
 p=sys.argv[sys.argv.index('-p')+1]
 def first(t,n): return ' '.join(re.findall(r'[A-Za-z0-9]+',t)[:n])
+m=re.search(r'at most (\d+) characters',p)
 if 'Current tab label: ' in p:
+    kind='judge'
     prev=p.split('Current tab label: ',1)[1].split('\n',1)[0]
     msgs=p.split("The user's latest messages: ",1)[1].split('\n',1)[0]
     entry='JUDGE '+prev+' | '+msgs
     mode=(r/'judge').read_text().strip() if (r/'judge').exists() else 'same'
     ans={'same':prev,'same-lower':prev.lower()+'.','bad':'I think this is still the same work.'}.get(mode,'N '+first(msgs,2))
+elif 'The user named this coding session: ' in p:
+    kind='custom'
+    name=p.split('The user named this coding session: ',1)[1].split('\n',1)[0]
+    entry='CUSTOM '+name
+    ans='I cannot shorten that.' if (r/'customfail').exists() else 'R '+first(name,2)
 else:
+    kind='plain'
     entry=p.rsplit('Title: ',1)[1]
     ans='I cannot label that.' if (r/'plainfail').exists() else 'C '+first(entry,2)
+    if (r/'plainanswer').exists(): ans=(r/'plainanswer').read_text().strip()
+with (r/'budgets').open('a') as f: f.write(kind+' '+(m.group(1) if m else '-')+'\n')
 with (r/'calls').open('a') as f: f.write(entry+'\n')
 while (r/'block').exists(): time.sleep(.02)
 print(ans)
@@ -432,7 +447,7 @@ class DriftHookTests(ci.IndicatorIntegrationTests):
 
     # --- custom-title (/rename) ---------------------------------------------
 
-    def test_custom_title_beats_ai_title_and_is_not_condensed(self):
+    def test_custom_title_beats_ai_title_and_fits_without_a_call(self):
         self.drift_state()
         self.ai("Claude app window space detection")
         self.custom("drift-detector-hook")
@@ -444,13 +459,171 @@ class DriftHookTests(ci.IndicatorIntegrationTests):
         self.assertEqual(self.calls(), [])
 
     def test_custom_title_display_rules(self):
+        # Budget 24 (no @sidebar_width): what doesn't fit shows trimmed to 24
+        # at once, then the condenser's shortening.
         self.drift_state()
         self.custom("a-very-long-generated-session-name-here")
         self.assertEqual(self.claude("done")["@agent_summary"], "project/a very long generated")
-        self.custom("Hand typed name with-dash")   # has spaces: shown as typed
+        self.assertEqual(self.summary_after("project/R a very"), "project/R a very")
+        self.custom("Hand typed name with-dash")   # has spaces: words as typed (25 chars)
         self.assertEqual(self.claude("done")["@agent_summary"], "project/Hand typed name")
+        self.assertEqual(self.summary_after("project/R Hand typed"), "project/R Hand typed")
         self.custom("snake_case_name")
         self.assertEqual(self.claude("done")["@agent_summary"], "project/snake case name")
+
+    # --- title budget -------------------------------------------------------
+
+    def set_width(self, value):
+        state = json.loads(self.state.read_text())
+        state["windows"][""] = {} if value is None else {"@sidebar_width": value}
+        self.state.write_text(json.dumps(state))
+
+    def budget(self, width, override=None):
+        self.set_width(width)
+        env = dict(self.env, TMUX="/fake/owned,12,0", TMUX_PANE="%42")
+        env.pop("AGENT_TAB_TITLE_BUDGET", None)
+        if override is not None:
+            env["AGENT_TAB_TITLE_BUDGET"] = override
+        r = subprocess.run(["bash", str(self.script), "title-budget", "claude"], text=True,
+                           capture_output=True, env=env, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def test_title_budget_math(self):
+        # room = @sidebar_width - 23 (agent-ui layout.rs agent_rows), clamped 12..24.
+        cases = {"45": "22", "46": "23", "47": "24", "60": "24", "999": "24",
+                 "36": "13", "35": "12", "30": "12", "1": "12",
+                 "-45": "22",           # a sidebar left of its client: negative
+                 "": "24", "abc": "24", "4.5": "24", None: "24"}
+        for width, want in cases.items():
+            self.assertEqual(self.budget(width), want, width)
+        self.assertEqual(self.budget("45", override="18"), "18")
+        self.assertEqual(self.budget("45", override="nope"), "22")
+        self.assertEqual(self.budget("45", override="0"), "22")
+
+    def cache_rows(self):
+        p = self.root / ".cache/agent-tab/titles.tsv"
+        return [l.split("\t") for l in p.read_text().splitlines()] if p.exists() else []
+
+    def wait_rows(self, n=1):
+        deadline = time.monotonic() + 10
+        while len(self.cache_rows()) < n and time.monotonic() < deadline:
+            time.sleep(.02)
+        return self.cache_rows()
+
+    def budgets(self):
+        p = self.cond / "budgets"
+        return p.read_text().split("\n")[:-1] if p.exists() else []
+
+    def test_rename_that_fits_is_verbatim_without_a_call(self):
+        self.set_width("45")   # budget 22
+        self.drift_state()
+        self.custom("drift-detector-hook")   # 19 chars
+        w = self.claude("done")
+        self.assertEqual(w["@agent_summary"], "project/drift detector hook")
+        rows = self.wait_rows()
+        self.assertEqual([r[1] for r in rows], ["drift detector hook"])
+        time.sleep(.2)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.window()["@agent_summary"], "project/drift detector hook")
+        self.assertEqual(self.window()["@agent_summary_cond"], "1")
+
+    def test_rename_too_long_is_condensed_to_budget(self):
+        self.set_width("45")   # budget 22
+        self.drift_state()
+        self.custom("topic-drift-detector-hook-for-tabs")
+        w = self.claude("done")
+        self.assertEqual(w["@agent_summary"], "project/topic drift detector")   # trimmed to 24 at once
+        self.assertEqual(self.summary_after("project/R topic drift"), "project/R topic drift")
+        self.assertEqual(self.calls(), ["CUSTOM topic drift detector hook for tabs"])
+        self.assertEqual(self.budgets(), ["custom 22"])
+        self.assertEqual(self.window()["@agent_summary_cond"], "1")
+        # Cached under its own key: the next event shows it with no call.
+        self.set_label("project/something else")
+        self.assertEqual(self.claude("done")["@agent_summary"], "project/R topic drift")
+        time.sleep(.2)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_stale_rename_worker_never_repaints_a_newer_rename(self):
+        # Review repro (round 5): a long rename's worker is still waiting on
+        # copilot when the user renames again to something short.
+        self.set_width("45")   # budget 22
+        self.drift_state()
+        (self.cond / "block").touch()
+        self.custom("topic-drift-detector-hook-for-tabs")   # too long: a model call (held)
+        self.claude("done")
+        self.wait_for("calls")
+        self.custom("short-name")
+        self.assertEqual(self.claude("done")["@agent_summary"], "project/short name")
+        self.wait_rows(1)                                   # its worker: fits, cached verbatim
+        time.sleep(.3)
+        self.assertEqual(self.window()["@agent_summary"], "project/short name")
+        (self.cond / "block").unlink()                      # the old worker answers now
+        rows = self.wait_rows(2)
+        self.assertIn("R topic drift", [r[1] for r in rows])  # cached, for if it comes back
+        time.sleep(.3)
+        self.assertEqual(self.window()["@agent_summary"], "project/short name")
+        self.assertEqual(self.claude("done")["@agent_summary"], "project/short name")
+
+    def test_stale_plain_worker_never_repaints_a_newer_title(self):
+        self.drift_state()
+        (self.cond / "block").touch()
+        self.claude("running", prompt="investigate the flaky websocket reconnect test on ci")
+        self.wait_for("calls")                              # the prompt's condense, held
+        self.custom("ci-flake")
+        self.assertEqual(self.claude("done")["@agent_summary"], "project/ci flake")
+        self.wait_rows(1)
+        (self.cond / "block").unlink()
+        self.wait_rows(2)
+        time.sleep(.3)
+        self.assertEqual(self.window()["@agent_summary"], "project/ci flake")
+
+    def test_summary_key_follows_the_label(self):
+        self.ai("Fix websocket reconnect bug")
+        self.claude("done")
+        self.summary_after("project/C Fix websocket")
+        key = self.window().get("@agent_summary_key")
+        self.assertTrue(key and len(key) == 16, key)
+        # A cache hit re-asserts it; the New Session placeholder drops it.
+        self.claude("done")
+        self.assertEqual(self.window()["@agent_summary_key"], key)
+        self.tp.write_text("")
+        self.assertNotIn("@agent_summary_key", self.claude("idle", source="clear"))
+
+    def test_rename_condense_failure_keeps_trimmed_title(self):
+        (self.cond / "customfail").touch()
+        self.drift_state()
+        self.custom("topic-drift-detector-hook-for-tabs")
+        self.assertEqual(self.claude("done")["@agent_summary"], "project/topic drift detector")
+        self.assertEqual(self.wait_rows()[-1][1], "")   # a negative row
+        self.assertEqual(self.window()["@agent_summary"], "project/topic drift detector")
+        # Backed off: the next event makes no new call.
+        self.claude("done")
+        time.sleep(.3)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.window()["@agent_summary"], "project/topic drift detector")
+
+    def test_plain_condense_uses_budget(self):
+        self.set_width("45")   # budget 22
+        (self.cond / "plainanswer").write_text("Websocket reconnect backoff fix\n")   # 31 chars
+        self.ai("Fix websocket reconnect bug")
+        self.claude("done")
+        self.assertEqual(self.summary_after("project/Websocket reconnect"), "project/Websocket reconnect")
+        self.assertEqual(self.budgets(), ["plain 22"])
+        # The judge's new labels are held to it too.
+        self.drift_state(retitle_raw="port the watcher to rust", retitle_prev="Space detection")
+        self.judge("new")
+        self.claude("done")
+        self.assertEqual(self.summary_after("project/N port the"), "project/N port the")
+        self.assertEqual(self.budgets(), ["plain 22", "judge 22"])
+
+    def test_budget_env_override_reaches_the_worker(self):
+        self.env["AGENT_TAB_TITLE_BUDGET"] = "12"
+        (self.cond / "plainanswer").write_text("Websocket reconnect backoff fix\n")
+        self.ai("Fix websocket reconnect bug")
+        self.claude("done")
+        self.assertEqual(self.summary_after("project/Websocket"), "project/Websocket")
+        self.assertEqual(self.budgets(), ["plain 12"])
 
     def test_latest_custom_title_wins(self):
         self.drift_state()

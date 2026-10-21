@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -45,7 +46,8 @@ with p.with_suffix('.lock').open('a') as lock:
    key=next(x for x in a[1:] if x.startswith('@agent_'))
    if '-uw' in a: s['windows'][target].pop(key,None)
    else: s['windows'][target][key]=a[-1]
- p.write_text(json.dumps(s))
+ # Atomic: tests read the state unlocked while detached workers write it.
+ t=p.with_suffix('.tmp%d'%os.getpid()); t.write_text(json.dumps(s)); os.replace(t,p)
 # Simulate only the title job, not the unrelated watcher watchdog request.
 # The job is a tmux-server child: it does not descend from the Codex frontend.
 if cmd=='run-shell' and ' condense ' in a[-1]:
@@ -83,12 +85,57 @@ print('Condensed title')
 '''
 
 
+# The PATH every harness subprocess gets: the fakes (self.bin), then links to
+# just the real tools the hook and the fakes need (self.tools), then the
+# system dirs. Never the user's PATH: a detached title worker that outlived a
+# test once found /opt/homebrew/bin/copilot after cleanup deleted the fake,
+# and ran it under the test's HOME (only missing auth stopped a real model
+# call). bash: the hook wants bash 4+ (/bin/bash is 3.2); python3: the fakes'
+# shebang and the condenser's flock; jq: every payload read.
+SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+REAL_TOOLS = {"bash": shutil.which("bash"), "jq": shutil.which("jq"), "python3": os.path.realpath(sys.executable)}
+
+
+def reap(root):
+    """Kill every process whose argv names `root` (detached title workers,
+    fake copilots, their fake tmux calls): TERM, then KILL, until none."""
+    me = os.getpid()
+    for sig in (signal.SIGTERM, signal.SIGKILL, signal.SIGKILL):
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+        pids = [int(l.split(None, 1)[0]) for l in out.splitlines()
+                if str(root) in l and int(l.split(None, 1)[0]) != me]
+        if not pids:
+            return
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            alive = []
+            for pid in pids:
+                try:
+                    os.kill(pid, 0)
+                    alive.append(pid)
+                except ProcessLookupError:
+                    pass
+            if not alive:
+                break
+            time.sleep(.02)
+
+
 class IndicatorIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="codex-indicator-test-")
         self.root = Path(self.tmp.name)
         self.bin = self.root / ".local/bin"
         self.bin.mkdir(parents=True)
+        self.tools = self.root / "tools"
+        self.tools.mkdir()
+        for name, real in REAL_TOOLS.items():
+            if real:
+                (self.tools / name).symlink_to(real)
         self.cond = self.root / "condenser"
         self.cond.mkdir()
         self.state = self.root / "tmux.json"
@@ -101,19 +148,23 @@ class IndicatorIntegrationTests(unittest.TestCase):
             path = self.bin / name
             path.write_text(source)
             path.chmod(0o755)
-        self.env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin)+":"+os.environ["PATH"],
+        self.env = dict(os.environ, HOME=str(self.root), PATH=f"{self.bin}:{self.tools}:{SYSTEM_PATH}",
                         TMPDIR=str(self.root), TMUX="/fake/stale,12,0", TMUX_PANE="%999",
                         FAKE_TMUX_STATE=str(self.state), FAKE_OWNER_STATE=str(self.owners),
                         FAKE_CONDENSER=str(self.cond), AGENT_TAB_CONDENSE_MODEL="",
                         TMUX_ASSISTANT_RESURRECT_DIR=str(self.root / "tmux-assistant-resurrect"),
                         FAKE_FRONTEND="1")  # hooks descend from their Codex frontend
         for key in ("AGENT_TAB_SOCKET", "AGENT_TAB_OWNER_SESSION", "AGENT_TAB_OWNER_TOKEN", "AGENT_TAB_OWNER_BINDING",
-                    "AGENT_TAB_OWNER_RECORD"):
+                    "AGENT_TAB_OWNER_RECORD", "AGENT_TAB_TITLE_BUDGET"):
             self.env.pop(key, None)
         self.bind("aaaa")
 
     def tearDown(self):
         (self.cond / "block").unlink(missing_ok=True)
+        # Detached workers are the fake tmux server's children, not ours: kill
+        # them before the rmtree, which they would otherwise race ("Directory
+        # not empty") and outlive.
+        reap(self.root)
         self.tmp.cleanup()
 
     def bind(self, sid, token="frontend-token"):
@@ -328,6 +379,7 @@ class IndicatorIntegrationTests(unittest.TestCase):
         windows = lambda text: json.loads(text)["windows"]
         self.assertEqual(windows(self.state.read_text()), windows(before))
         # Control: the locked condenser with the same environment does write.
+        self.claim("Locked condenser control")
         result = subprocess.run(["bash", str(self.script), "condense", "@7", "project", "Locked condenser control"],
                                 env=env, cwd=self.root, capture_output=True, text=True, timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -342,6 +394,7 @@ class IndicatorIntegrationTests(unittest.TestCase):
         env = dict(self.condenser_env(), AGENT_TAB_OWNER_TOKEN="direct-token",
                    AGENT_TAB_OWNER_BINDING="direct-token:aaaa")
         env.pop("FAKE_FRONTEND")
+        self.claim("No record given")   # so only the missing record can stop it
         result = subprocess.run(["bash", str(self.script), "condense", "@7", "project", "No record given"],
                                 env=env, cwd=self.root, capture_output=True, text=True, timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -352,7 +405,15 @@ class IndicatorIntegrationTests(unittest.TestCase):
                     AGENT_TAB_SOCKET="/fake/owned", AGENT_TAB_OWNER_SESSION="aaaa",
                     AGENT_TAB_OWNER_TOKEN="frontend-token", AGENT_TAB_OWNER_BINDING="binding-aaaa")
 
+    def claim(self, raw):
+        """What compose_summary does when it spawns a worker: the window's
+        @agent_summary_key names this condense (a worker paints only then)."""
+        state = json.loads(self.state.read_text())
+        state["windows"]["@7"]["@agent_summary_key"] = hashlib.sha256(raw.encode()).hexdigest()[:16]
+        self.state.write_text(json.dumps(state))
+
     def condense(self, raw, background=False):
+        self.claim(raw)
         command = ["bash", str(self.script), "condense", "@7", "project", raw]
         kwargs = dict(env=self.condenser_env(), cwd=self.root,
                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -477,7 +538,12 @@ class IndicatorIntegrationTests(unittest.TestCase):
         tmux = shutil.which("tmux")
         server = "codex-indicator-test-" + uuid.uuid4().hex
         command = [tmux, "-L", server, "-f", "/dev/null"]
-        env = dict(self.env, PATH=os.environ["PATH"])
+        # The real tmux alone, linked into a dir of its own: its install dir
+        # (/opt/homebrew/bin) also holds the real copilot.
+        realtmux = self.root / "realtmux"
+        realtmux.mkdir()
+        (realtmux / "tmux").symlink_to(tmux)
+        env = dict(self.env, PATH=f"{realtmux}:{self.tools}:{SYSTEM_PATH}")
         env.pop("TMUX", None)
         env.pop("TMUX_PANE", None)
         socket = None

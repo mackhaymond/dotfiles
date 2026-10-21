@@ -299,7 +299,9 @@ Sanitized (no `#`/`"`/`%`, one line, ≤60 chars). `extract_summary` tags its
 output `final\t<title>` (the agent's own conversation title),
 `interim\t<title>` (prompt-grade text: the prompt standing in until that title
 exists; kept to 200 chars because it is the condenser's input),
-`custom\t<title>` (a `/rename`, shown as-is, never condensed) or
+`custom\t<title>` (a `/rename`: shown as written when it fits the title
+budget, else shortened to fit by the condenser, see "Renames and topic
+drift") or
 `retitle\t<label>\t<prompts>` (a drift retitle, for the condenser to judge
 against the label on screen when it fired).
 
@@ -308,12 +310,34 @@ hook's `cwd` (`~` for `$HOME`). The raw title is condensed to its 2–4 most
 identifying words by a detached `copilot -p …` call (answer on stdout, stats
 footer on stderr; a plain text prompt grants no tool permissions) and cached
 in `~/.cache/agent-tab/titles.tsv` keyed by title hash. The model's output is
-**validated** before caching (1–4 words, no colon/sentence punctuation, not an
-apology/refusal/auth-error) so error strings can't poison the cache; a
-failed/rejected condense writes a negative row that backs off retries for
-`NEG_TTL` (600 s) instead of re-calling every turn. Until the condensation
-lands (or if `copilot` fails), the tab shows `project/<raw title>`
-(word-trimmed to 24 cells) as an interim.
+**validated** before caching (1–4 words, within the title budget below, no
+colon/sentence punctuation, not an apology/refusal/auth-error) so error
+strings can't poison the cache; a failed/rejected condense writes a negative
+row that backs off retries for `NEG_TTL` (600 s) instead of re-calling every
+turn. Until the condensation lands (or if `copilot` fails), the tab shows
+`project/<raw title>` (word-trimmed to 24 cells) as an interim.
+
+**Title budget** (2026-10-21). The label has to fit where it is read most:
+the agent-ui sidebar, which shows `@agent_summary` without its `project/`
+(layout.rs `short_title`) and clips it to what the card row leaves
+(`agent_rows`). For the worst common card (two lines, working, a ⚙/◎ flag,
+the client's own) that is `@sidebar_width` − 23: the value carries WezTerm's
+1-column divider (and is negative for a sidebar on the left), the tile has a
+1-cell margin each side, and the row spends 6 on the rail, pads and key-cap,
+2 on the flag, 10 on "◐ working" and its pad ("working" is the longest state
+word), 1 more, and 1 on the own card's edge. 22 at today's 45 columns.
+`title_budget` clamps that to 12–24 (24 is the tab bar's own cap) and falls
+back to 24 when the width is unset or not a number; `TITLE_CHROME` (23) is
+the constant to change if `agent_rows` changes, and
+`AGENT_TAB_TITLE_BUDGET` overrides the whole thing (tests). It is read only by
+the detached condense worker — never a tmux call on a hook's hot path — and
+every NEW label is held to it: the prompt asks for "at most N characters",
+and `fit_words`/`valid_short` cut and check at N. Cache keys are unchanged,
+so the labels cached before the budget existed (up to 24) stay. A later
+width change re-condenses nothing that is already cached; the sidebar clips
+those with an ellipsis. `agent-tab-indicator.sh title-budget` prints the
+current value; like every mode it needs `$TMUX` (run it from inside tmux), and
+prints nothing outside.
 
 **Condenser lifetime and locking.** Title jobs run through `tmux run-shell -b`,
 so hook process-group cleanup cannot kill them. The launch carries shell-quoted
@@ -333,6 +357,20 @@ can be condensed, so the first turn can acquire a short label before the agent
 names the conversation. A changed title has a separate cache key; repeated
 hooks reuse cached labels. Raw text never overwrites an already condensed
 label while a newer title is being shortened.
+
+**Only the newest condense paints** (2026-10-21). Workers are detached and a
+copilot call takes seconds, so an older one can finish after a newer title
+has taken over: rename to a long name, then to a short one before the first
+call returns, and the long name's shortening used to land on top and stay
+for a turn. Every title the hook resolves has a condense key (the cache key:
+`title_key` of the condense input), and the window remembers the one its
+label should come from in `@agent_summary_key`. It is written with every
+final paint (a cache hit: in `set_summary`'s flag call) and with every worker
+spawn (in the `run-shell`'s own tmux call), so it costs the hook no fork; the
+`New Session` placeholder unsets it, and `clear_state` unsets it with the
+summary. A worker paints only while the key is still its own (one
+`show-options`, in the worker); otherwise its answer is just cached. The same
+holds for plain, judge and rename workers.
 
 **Model pin is best-effort.** `--model` is set from `CONDENSE_MODEL`
 (default `claude-haiku-4.5`, override with `$AGENT_TAB_CONDENSE_MODEL`, empty
@@ -362,10 +400,24 @@ ways out, both read on every event:
   "not in the tail" as "no title" made the tab flap. So the drift state
   remembers the last of each it saw (`seen_custom`, `seen_ai`) and an empty
   tail falls back to those.
-  A custom title is displayed, never sent to the condenser — a space-free name
-  with `-`/`_` reads as words (`topic-drift-detector` → `topic drift
-  detector`), word-trimmed to 24 cells — and is marked condensed
-  (`@agent_summary_cond 1`) so no raw stand-in ever repaints over it. **But
+  A custom title is read as words (a space-free name with `-`/`_`:
+  `topic-drift-detector` → `topic drift detector`) and is shown as written
+  when it fits the title budget; Claude's own generated names often don't
+  ("topic-drift-detector-hook-for-tab-titles"), and a rename the sidebar
+  clips mid-word is no better than the title it replaced (Mack, 2026-10-21:
+  "make an AI title that is short enough to actually fit, regardless of what
+  Claude renames it to"). So the custom branch looks up its own cache key
+  (`custom\n<title>`, never shared with the same text as a prompt); on a hit
+  it shows that, on a miss it shows the words trimmed to 24 at once and
+  spawns the worker in custom mode. The worker reads the budget: a title that
+  fits is cached verbatim with no model call; a longer one gets one call ("The
+  user named this coding session: … Shorten it to a tab label of at most N
+  characters (1-4 words) that keeps its meaning and its most distinctive
+  words"), validated at N and cached; a failure writes the negative row and
+  leaves the trimmed title up. Same flock, negative cache and window
+  ownership as every condense. Marked condensed (`@agent_summary_cond 1`)
+  throughout, so no raw stand-in ever repaints over it. A rename cached at
+  one sidebar width is not re-condensed at another. **But
   only a rename the user made counts.** CuaNotch's Tasks launcher
   (`~/.claude/projects/-Users-mackhaymond-Tasks-t-*`) writes its own 24-char
   slug as the custom title at line 2, cut mid-word ("check-five-variable-solu"),
@@ -402,7 +454,9 @@ ways out, both read on every event:
   content words is skipped, and so is anything that isn't the user's own goal
   text, checked after a left trim (pasted blocks often start with
   whitespace): `<…` system tags (`<task-notification>`), `/…` slash commands,
-  `[message from @…` peer agents, "This session is being continued from a
+  `[message from @…` peer agents, `[pause key] …` broadcasts from
+  agent-pause.py (2 of the first 13 live retitles were "PAUSE NOW" /
+  "RESUME"), "This session is being continued from a
   previous conversation…" compaction continuations, and a paste with nothing
   else. The rest is compared with a **bag**: the union of the last 6 on-topic
   prompts' words, seeded with the title's words the first time a session is
