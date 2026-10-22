@@ -291,6 +291,14 @@ ways out besides the resume:
   itself). Both commands take the press lock and post
   `com.mackhaymond.tmux.agent-state`, so the sidebar and the notch redraw at
   once.
+- **Where the actions live.** Sidebar (720b0f1): a plain click on the
+  settled banner resumes; its `✕ void` chip (just `✕` at 34 columns) arms on
+  the first click (red "void? click again") and voids on a second click
+  0.7–3 s later; a dismissed glow shows as a dim "glow off". CuaNotch
+  (cua-notch 160164e): a click on the notch while the cyan ring is the TOP
+  glow dismisses it (a failure, question, finished agent or ask on top keeps
+  its click); the menu's "Paused (N)" row has Resume and a two-press Void
+  (0.7–4 s).
 - **The banner stays until resume or void.** It shows whenever paused.json
   lists targets, dismissed or not. **The notch menu keeps the agents paused**
   until resume or void: a void removes paused.json, which the notch already
