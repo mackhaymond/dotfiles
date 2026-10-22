@@ -239,6 +239,94 @@ class ConfigShape(unittest.TestCase):
         self.assertEqual([w["id"] for w in got], ["@2", "@3", "@4"])   # a home running an agent is an agent
 
 
+class DashHints(unittest.TestCase):
+    """The home dashboard's key hints, drawn by `space-dash.sh --once` against
+    a tmux stand-in (SPACE_TMUX_BIN) that answers its one read with a canned
+    pane of a given width and N idle agents: no server at all."""
+
+    FULL1 = "⌘1-9 space · ⌥W letter jump · ⌥W digit pin · ⌥W ⇧letter diff · ⌥` agent↔shell"
+    FULL2 = "⌘T new shell · ⌘R new agent · ⌘⇧T/R in a space · ⌥N new space · prefix v select tabs · prefix Q close space"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="dash-hints-")
+        cls.fake = os.path.join(cls.tmp, "tmux")
+        Path(cls.fake).write_text(
+            "#!/bin/sh\n"
+            '[ "$1" = display-message ] || exit 0\n'
+            "U=$(printf '\\037')\n"
+            "printf 'S%s%%1%sproj%s/nonexistent%s#cba6f7%s⌘2%s%s%s9%s0%s0\\n' "
+            '"$U" "$U" "$U" "$U" "$U" "$U" "$FAKE_W" "$U" "$U" "$U"\n'
+            "i=0; while [ $i -lt $FAKE_AGENTS ]; do\n"
+            "  printf 'W%sidle%s%s%s%s%sagent %s%s%s\\n' \"$U\" \"$U\" \"$U\" \"$U\" \"$U\" \"$U\" $i \"$U\" \"$U\"\n"
+            "  i=$((i + 1)); done\n")
+        os.chmod(cls.fake, 0o755)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def frame(self, width, agents):
+        env = dict(os.environ, SPACE_TMUX_BIN=self.fake, TMUX="/nonexistent,0,0", TMUX_PANE="%1",
+                   FAKE_W=str(width), FAKE_AGENTS=str(agents), LC_ALL="en_US.UTF-8")
+        r = subprocess.run(["bash", str(DASH), "--once"], env=env, capture_output=True, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", r.stdout.decode()).replace("\r", "")
+        lines = out.rstrip("\n").split("\n")
+        self.assertEqual(len(lines), 9, lines)                             # the 9-row pane, filled
+        for line in lines:
+            self.assertLessEqual(len(line), width, line)                  # nothing past the edge
+        return lines
+
+    @staticmethod
+    def hints(line):
+        return line.strip().split(" · ") if line.strip() else []
+
+    def test_one_row_when_everything_fits(self):
+        lines = self.frame(220, 1)
+        self.assertEqual(lines[-1], "  " + self.FULL1 + " · " + self.FULL2)
+        self.assertIn("agent 0", lines[-5])
+        self.assertEqual(lines[-2], "")
+
+    def test_two_rows_when_it_does_not_and_an_agent_row_is_spare(self):
+        for agents in (0, 1, 3):
+            lines = self.frame(140, agents)
+            self.assertEqual(lines[-2:], ["  " + self.FULL1, "  " + self.FULL2], agents)
+        self.assertEqual(self.frame(140, 0)[4], "  no agents here · ⌘R starts one")
+
+    def test_narrow_drops_whole_hints_least_important_first(self):
+        all_hints = self.hints(self.FULL1) + self.hints(self.FULL2)
+        # Four agents fill every row: one hint row, dropped by priority.
+        expect = {
+            160: ["⌘1-9 space", "⌥W letter jump", "⌥W digit pin", "⌥` agent↔shell", "⌘T new shell",
+                  "⌘R new agent", "⌥N new space", "prefix v select tabs", "prefix Q close space"],
+            120: ["⌘1-9 space", "⌥W letter jump", "⌥` agent↔shell", "⌘T new shell", "⌘R new agent",
+                  "⌥N new space", "prefix Q close space"],
+            60: ["⌘1-9 space", "⌥W letter jump", "⌘T new shell", "⌘R new agent"],
+            30: ["⌘1-9 space", "⌥W letter jump"],
+            16: ["⌥W letter jump"],
+            10: [],
+        }
+        for width, want in expect.items():
+            lines = self.frame(width, 4)
+            self.assertEqual(sum(l.startswith("  ○") for l in lines), 4, width)   # all four agents still shown
+            self.assertTrue(lines[-2].startswith("  ○"), width)            # and the hint is one row
+            got = self.hints(lines[-1])
+            self.assertEqual(got, want, width)
+            self.assertNotIn("…", lines[-1], width)                        # never cut mid-hint
+            self.assertEqual(got, [h for h in all_hints if h in got], width)   # display order kept
+        # Two rows: each row drops its own, the same way.
+        lines = self.frame(60, 1)
+        self.assertEqual(self.hints(lines[-2]), ["⌘1-9 space", "⌥W letter jump", "⌥` agent↔shell"])
+        self.assertEqual(self.hints(lines[-1]), ["⌘T new shell", "⌘R new agent", "⌥N new space"])
+        # Narrower always keeps a subset of what wider kept.
+        prev = set(all_hints)
+        for width in range(200, 8, -3):
+            got = set(self.hints(self.frame(width, 4)[-1]))
+            self.assertLessEqual(got, prev, width)
+            prev = got
+
+
 class Server(unittest.TestCase):
     """A -L test server with spaces.conf sourced and one attached client."""
     flag = "on"
@@ -818,8 +906,12 @@ class Spaces(Server):
         self.assertIn("◐  ", text)                                     # running (no letter yet)
         self.assertIn("○  ", text)                                     # idle
         self.assertNotRegex(text, r"[◐○◉✓✕] ⌘")                          # agents have no number
-        self.assertIn("⌥W jump", text)
-        self.assertIn("⌘N home", text)
+        # The hints: two rows (3 agents leave one spare, and 140 columns fit
+        # neither all of them on one row nor need any dropped from a row).
+        self.assertIn("  ⌘1-9 space · ⌥W letter jump · ⌥W digit pin · ⌥W ⇧letter diff · ⌥` agent↔shell\n", text)
+        self.assertIn("  ⌘T new shell · ⌘R new agent · ⌘⇧T/R in a space · ⌥N new space · prefix v select tabs"
+                      " · prefix Q close space", text)
+        self.assertNotIn("⌘N home", text)
 
     def test_dashboard_never_takes_the_focus(self):
         d = self.dash("main")

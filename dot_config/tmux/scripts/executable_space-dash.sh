@@ -4,7 +4,8 @@
 # top pane of every space's home window (@space_dash_pane), above the home
 # shell: the space's name, large, in its colour (@space_color); its folder
 # and git branch with a dirty count; one line per agent of the space; the
-# shell count; how many tabs are parked from it; a key hint.
+# shell count; how many tabs are parked from it; the key hints (one row, or
+# two when there is room; a narrow pane drops the least important first).
 #
 # Redraws when com.mackhaymond.tmux.agent-state or com.mackhaymond.tmux.focus
 # is posted: ONE long-lived `notifyutil -w` per dashboard, read with a 60 s
@@ -96,6 +97,62 @@ seg() {
 pad() { local n=$(($1 - LW)); ((n > 0)) && seg "" "$(printf '%*s' "$n" '')"; return 0; }
 FRAME=()
 emit() { FRAME+=("$LINE"); LINE="" LW=0; }
+
+# ── the key hints ──────────────────────────────────────────────────────────
+# "ROW PRIORITY TEXT", in display order. Row 1 moves around, row 2 makes and
+# manages; priority 1 is kept longest. A pane too narrow for them drops whole
+# hints, least important first: never wraps, never cuts one. Checked against
+# spaces.conf / tmux.conf.tmpl / wezterm.lua.tmpl (2026-10-22): ⌘N is space
+# N's home (User18..26), ⌥W + letter / digit / ⇧letter the jump table's
+# agent-or-shell / pin / diff popup, ⌥` space.sh toggle, ⌥N the new-space
+# picker, ⌘T / ⌘R prefix c / k (this tab's folder), ⌘⇧T / ⌘⇧R prefix C-t / K
+# (space.sh pick-tab: which space, at its folder), prefix v the tab
+# selection, prefix Q the close-space menu.
+HINTS=(
+  "1 2 ⌘1-9 space"
+  "1 1 ⌥W letter jump"
+  "1 9 ⌥W digit pin"
+  "1 11 ⌥W ⇧letter diff"
+  "1 5 ⌥\` agent↔shell"
+  "2 4 ⌘T new shell"
+  "2 3 ⌘R new agent"
+  "2 10 ⌘⇧T/R in a space"
+  "2 6 ⌥N new space"
+  "2 8 prefix v select tabs"
+  "2 7 prefix Q close space"
+)
+HSEP=" · "
+# hint_line ROW ROOM: HINT_OUT = the hints of ROW (0: all of them) that fit
+# in ROOM cells, joined by HSEP; HINT_DROPPED = how many did not. No forks.
+HINT_OUT="" HINT_DROPPED=0
+hint_line() {
+  local want="$1" room="$2" h row rest i total cnt maxp drop
+  local -a T=() P=() K=()
+  for h in "${HINTS[@]}"; do
+    row="${h%% *}" rest="${h#* }"
+    ((want && row != want)) && continue
+    P+=("${rest%% *}") T+=("${rest#* }") K+=(1)
+  done
+  HINT_DROPPED=0
+  while :; do
+    total=0 cnt=0
+    for i in "${!T[@]}"; do
+      ((K[i])) && total=$((total + ${#T[i]})) cnt=$((cnt + 1))
+    done
+    ((cnt > 1)) && total=$((total + (cnt - 1) * ${#HSEP}))
+    ((total <= room || cnt == 0)) && break
+    maxp=0 drop=0
+    for i in "${!T[@]}"; do
+      ((K[i] && P[i] > maxp)) && maxp=${P[i]} drop=$i
+    done
+    K[drop]=0 HINT_DROPPED=$((HINT_DROPPED + 1))
+  done
+  HINT_OUT=""
+  for i in "${!T[@]}"; do
+    ((K[i])) && HINT_OUT+="${HINT_OUT:+$HSEP}${T[i]}"
+  done
+  return 0
+}
 
 # ── git, cached ────────────────────────────────────────────────────────────
 G_DIR="" G_AT=0 G_BRANCH="" G_DIRTY=0 G_AB="" G_REPO=0
@@ -212,7 +269,7 @@ render() {
   ((rows < 0)) && rows=0
   LINE="" LW=0; emit
   if ((n == 0)); then
-    ((rows)) && { seg "" "  "; seg "$C_DIM" "no agents here · prefix k starts one"; emit; rows=$((rows - 1)); }
+    ((rows)) && { seg "" "  "; seg "$C_DIM" "no agents here · ⌘R starts one"; emit; rows=$((rows - 1)); }
   fi
   for ((i = 0; i < n && rows > 0; i++)); do
     if ((rows == 1 && i < n - 1)); then
@@ -232,10 +289,22 @@ render() {
     emit
     rows=$((rows - 1))
   done
-  while ((rows > 0)); do emit; rows=$((rows - 1)); done
-  seg "" "  "
-  seg "$C_DIM" "⌘N home · ⌥W jump to a shell or agent · ⌥\` agent↔shell · ⌥N new space · prefix Q close"
-  emit
+  # The key hints: one row when they all fit; two (moving around, then making
+  # and managing) when they do not and an agent row is spare; whatever does
+  # not fit is dropped by priority (hint_line).
+  local room=$((W - 2)) hr
+  hint_line 0 "$room"
+  if ((HINT_DROPPED && rows > 0)); then
+    rows=$((rows - 1))
+    while ((rows > 0)); do emit; rows=$((rows - 1)); done
+    for hr in 1 2; do
+      hint_line "$hr" "$room"
+      seg "" "  "; seg "$C_DIM" "$HINT_OUT"; emit
+    done
+  else
+    while ((rows > 0)); do emit; rows=$((rows - 1)); done
+    seg "" "  "; seg "$C_DIM" "$HINT_OUT"; emit
+  fi
   # Draw: home, each line cleared to its end, the rest of the pane cleared.
   local buf="$E[H" k
   for ((k = 0; k < ${#FRAME[@]} && k < H; k++)); do

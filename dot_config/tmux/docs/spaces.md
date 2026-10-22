@@ -115,14 +115,32 @@ focused pane, so ⌘N lands in it.
 ```
   ▀█▀ █▄█ █ █ █ █   ⌘2  ~/.local/share/chezmoi
    █  █▀█ █ █ ▄▀▄    main  ±16
-   ▀  ▀ ▀ ▀▀▀ ▀ ▀   4 agents · 2 shells · 1 parked
+   ▀  ▀ ▀ ▀▀▀ ▀ ▀   3 agents · 2 shells · 1 parked
 
   ◐ a  tmux/Tmux Agent Sidebar  Two implementers are running in parallel
   ◉ d  tmux/home dashboard  Allow Bash(notifyutil -p ...)?
   ✓ f  tmux/resurrect guard  Everything is live on your server
-  ○    tmux/Canvas syllabus
-  ⌘N home · ⌥W jump to a shell or agent · ⌥` agent↔shell · ⌥N new space · prefix Q close
+  ⌘1-9 space · ⌥W letter jump · ⌥W digit pin · ⌥W ⇧letter diff · ⌥` agent↔shell
+  ⌘T new shell · ⌘R new agent · ⌘⇧T/R in a space · ⌥N new space · prefix v select tabs · prefix Q close space
 ```
+
+The key hints: ⌘1-9 a space's home; ⌥W + letter an agent or shell, + digit
+the Nth pin, + ⇧letter that agent's diff popup; ⌥` agent↔shell; ⌘T / ⌘R a
+new shell / claude tab in this tab's folder, ⌘⇧T / ⌘⇧R the same in a space
+picked from a popup (at its folder); ⌥N the new-space picker; prefix v the
+tab selection; prefix Q close the space. One row when they all fit, else
+two (moving around, then making and managing) when an agent row is spare
+(fewer agents than rows), else one. A row too narrow for its hints drops
+whole hints, least important first (the priorities in `HINTS`), never
+wrapping or cutting one; ⌥W letter, ⌘1-9, ⌘R and ⌘T go last. With four
+agents (no spare row) at 120 columns:
+
+```
+  ⌘1-9 space · ⌥W letter jump · ⌥` agent↔shell · ⌘T new shell · ⌘R new agent · ⌥N new space · prefix Q close space
+```
+
+and at 60, `⌘1-9 space · ⌥W letter jump · ⌘T new shell · ⌘R new agent`. With
+no agents the agent row reads `no agents here · ⌘R starts one`.
 
 Idle cost, measured on a test server over 60 s: 0.00-0.02 s of CPU (under
 0.04%) for the dashboard's bash, its reader and its `notifyutil`, wakes for
@@ -136,7 +154,7 @@ count (`±N`, or `clean`) and ahead/behind; the agent / shell / parked counts
 (parked = windows in `stash` whose `@stash_origin` is this space); one line
 per agent, in window order, with its state shape (✕ ◉ ✓ ◐ ○, colours as the
 roster), its ⌥W letter (`@agent_key`), its summary and detail (as many as
-fit, then `+N more`); a key hint.
+fit, then `+N more`); the key hints (above).
 
 - **Redraws** on `com.mackhaymond.tmux.agent-state` and
   `com.mackhaymond.tmux.focus`: one long-lived `notifyutil -w` per dashboard,
