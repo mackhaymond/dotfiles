@@ -95,6 +95,12 @@ pub const PENDING_FOR: Duration = Duration::from_secs(10);
 pub const RETRY: f64 = 10.0;
 /// How long a folder → repo root lookup is trusted (seconds).
 pub const ROOT_TTL: f64 = 30.0;
+/// A transcript's cache and its attribution history outlive the last
+/// update that used them by this long (seconds). (2026-10-22: dropped after
+/// ONE pass that missed the window, a sessions file read mid-rewrite say,
+/// every transcript of it was read again from scratch, up to FIRST_MAX
+/// each, and a committed file went back to the agent that had edited it.)
+pub const KEEP_FOR: f64 = 60.0;
 /// A git command still running after this is killed.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Claude's context windows.
@@ -975,6 +981,8 @@ struct Seen {
     /// clean (after them): it is that agent's again only once it edits it
     /// once more.
     clean_at: Option<u32>,
+    /// When an update last used it (epoch seconds; [`KEEP_FOR`]).
+    used: f64,
 }
 
 /// Dirty files (repo-relative) → (added, removed).
@@ -995,10 +1003,23 @@ fn git(root: &Path) -> Command {
 /// None when git failed outright.
 pub fn numstat(root: &Path, rels: &[String]) -> Option<(Stats, bool)> {
     let mut out = HashMap::new();
-    let mut c = git(root);
-    c.args(["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-color", "HEAD", "--"]).args(rels);
-    // (A repo with no commit yet has no HEAD: its files are untracked or staged.)
-    let diff = crate::proc::run(c, None, GIT_TIMEOUT).ok().filter(|o| o.ok());
+    let diff_from = |base: &str| {
+        let mut c = git(root);
+        c.args(["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-color", base, "--"]).args(rels);
+        crate::proc::run(c, None, GIT_TIMEOUT).ok().filter(|o| o.ok())
+    };
+    // A repo with no commit yet has no HEAD: then the base is the empty tree,
+    // as diff.rs `repo_diff` does, so a staged file counts as added and the
+    // answer is whole. (2026-10-22: diffing HEAD there always failed, so a
+    // staged file never showed, the repo was asked again every DIFF_EVERY and
+    // no pass was ever complete.) Asked only when the HEAD diff failed, and
+    // only a clean "no such ref" (rev-parse -q exits 1) switches the base.
+    let diff = diff_from("HEAD").or_else(|| {
+        let mut c = git(root);
+        c.args(["rev-parse", "--verify", "-q", "HEAD"]);
+        let no_head = crate::proc::run(c, None, GIT_TIMEOUT).is_ok_and(|o| o.status.code() == Some(1));
+        no_head.then(|| diff_from(crate::diff::EMPTY_TREE)).flatten()
+    });
     if let Some(o) = &diff {
         for rec in o.stdout.split('\0').filter(|r| !r.is_empty()) {
             let mut it = rec.splitn(3, '\t');
@@ -1047,6 +1068,8 @@ pub struct Engine {
     pub diff_every: f64,
     procs: Box<dyn Procs + Send>,
     files: HashMap<PathBuf, Transcript>,
+    /// Transcript → when an update last used it (kept [`KEEP_FOR`]).
+    used: HashMap<PathBuf, f64>,
     /// Session id → its transcript, or when it was last looked for in vain.
     found: HashMap<String, Result<PathBuf, f64>>,
     /// Folder → (looked up at, its real path and its repo's work tree).
@@ -1077,6 +1100,7 @@ impl Engine {
             diff_every: DIFF_EVERY,
             procs,
             files: HashMap::new(),
+            used: HashMap::new(),
             found: HashMap::new(),
             roots: HashMap::new(),
             repos: HashMap::new(),
@@ -1163,7 +1187,21 @@ impl Engine {
             };
             got.push((w.id.clone(), ins, edits));
         }
-        self.files.retain(|p, _| live.contains(p));
+        // A transcript this pass did not reach (its window missed for a
+        // pass: a sessions file read mid-rewrite) keeps its cache a while.
+        for p in live {
+            self.used.insert(p, now);
+        }
+        self.used.retain(|_, t| now - *t < KEEP_FOR);
+        let used = &self.used;
+        self.files.retain(|p, _| used.contains_key(p));
+        // A session id's lookup goes with its transcript's cache, a miss once
+        // it would be retried anyway (2026-10-22: every session id ever seen,
+        // windows long gone among them, used to stay).
+        self.found.retain(|_, f| match f {
+            Ok(p) => used.contains_key(p),
+            Err(at) => now - *at < RETRY,
+        });
         // The diff: every touched file (its real path) by its repo, each
         // repo asked once.
         let mut want: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
@@ -1202,6 +1240,7 @@ impl Engine {
                     }
                     (s.resets, s.edits, s.since) = (resets, n, tick);
                 }
+                s.used = now;
                 kept.insert(key);
                 let repo = self.repos.get(root);
                 match repo.and_then(|r| r.stats.get(rel)) {
@@ -1221,7 +1260,9 @@ impl Engine {
             ins.diff = (d.files > 0).then_some(d);
             out.insert(id, ins);
         }
-        self.seen.retain(|k, _| kept.contains(k));
+        // (Kept a while unused too: a window back after a missed pass keeps
+        // its `clean_at`, so a file it committed stays out of its badge.)
+        self.seen.retain(|k, s| kept.contains(k) || now - s.used < KEEP_FOR);
         out
     }
 

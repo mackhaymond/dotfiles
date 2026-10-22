@@ -67,6 +67,9 @@ if sys.argv[1]=='valid':
  with open(os.environ['FAKE_OWNER_STATE']+'.valid','a') as f: f.write(sid+'\n')
  sys.exit(0 if r.get('direct') is True and r.get('session_id')==sid and r.get('token')==token
           and f"{r.get('frontend_pid')}:{r.get('frontend_start')}" in s.get('_live',[]) else 1)
+# Every resolve, by whom: a hook (in its frontend's tree) or a title worker.
+with open(os.environ['FAKE_OWNER_STATE']+'.resolve','a') as f:
+ f.write(sys.argv[-1]+(' hook' if os.environ.get('FAKE_FRONTEND') else ' worker')+'\n')
 r=s.get(sys.argv[-1],{'status':'unbound'})
 # direct_owner() walks up from the hook to its frontend: outside that process
 # tree (FAKE_FRONTEND unset, e.g. a tmux run-shell job) it finds nothing.
@@ -82,6 +85,23 @@ with (r/'calls').open('a') as f: f.write(str(os.getpid())+'\n')
 while (r/'block').exists(): time.sleep(.02)
 print('Condensed title')
 (r/'finished').touch()
+'''
+# The real ps and stat, logging their argv (one line per call) to
+# $FAKE_FORK_LOG. ps's process-table listing (the nested_agent walk) can
+# relabel comms: $FAKE_PS_COMM = "pid:comm,pid:comm".
+FAKE_PS = r'''#!/usr/bin/env python3
+import os,subprocess,sys
+with open(os.environ['FAKE_FORK_LOG'],'a') as f: f.write('ps '+' '.join(sys.argv[1:])+'\n')
+if sys.argv[1:]!=['-axo','pid=,ppid=,comm=']: os.execv('/bin/ps',['ps']+sys.argv[1:])
+relabel=dict(x.split(':',1) for x in os.environ.get('FAKE_PS_COMM','').split(',') if x)
+out=subprocess.run(['/bin/ps']+sys.argv[1:],capture_output=True,text=True).stdout
+for line in out.splitlines():
+ pid,ppid,comm=(line.split(None,2)+['',''])[:3]
+ print(pid,ppid,relabel.get(pid,comm))
+'''
+FAKE_STAT = r'''#!/bin/sh
+echo "stat $*" >> "$FAKE_FORK_LOG"
+exec /usr/bin/stat "$@"
 '''
 
 
@@ -144,18 +164,23 @@ class IndicatorIntegrationTests(unittest.TestCase):
         self.owners.write_text("{}")
         self.script = self.root / "agent-tab-indicator.sh"
         shutil.copyfile(SOURCE, self.script)
-        for name, source in [("tmux", FAKE_TMUX), ("codex-terminal-owner", FAKE_OWNER), ("copilot", FAKE_COPILOT)]:
+        for name, source in [("tmux", FAKE_TMUX), ("codex-terminal-owner", FAKE_OWNER), ("copilot", FAKE_COPILOT),
+                             ("ps", FAKE_PS), ("stat", FAKE_STAT)]:
             path = self.bin / name
             path.write_text(source)
             path.chmod(0o755)
+        self.forks = self.root / "forks.log"
         self.env = dict(os.environ, HOME=str(self.root), PATH=f"{self.bin}:{self.tools}:{SYSTEM_PATH}",
                         TMPDIR=str(self.root), TMUX="/fake/stale,12,0", TMUX_PANE="%999",
                         FAKE_TMUX_STATE=str(self.state), FAKE_OWNER_STATE=str(self.owners),
                         FAKE_CONDENSER=str(self.cond), AGENT_TAB_CONDENSE_MODEL="",
                         TMUX_ASSISTANT_RESURRECT_DIR=str(self.root / "tmux-assistant-resurrect"),
+                        FAKE_FORK_LOG=str(self.forks),
                         FAKE_FRONTEND="1")  # hooks descend from their Codex frontend
+        # CODEX_*: a run from inside a codex tool shell must not read as one
+        # (A FOREIGN AGENT'S TOOL SHELL); the tests that want it set it.
         for key in ("AGENT_TAB_SOCKET", "AGENT_TAB_OWNER_SESSION", "AGENT_TAB_OWNER_TOKEN", "AGENT_TAB_OWNER_BINDING",
-                    "AGENT_TAB_OWNER_RECORD", "AGENT_TAB_TITLE_BUDGET"):
+                    "AGENT_TAB_OWNER_RECORD", "AGENT_TAB_TITLE_BUDGET", "CODEX_THREAD_ID", "CODEX_SANDBOX"):
             self.env.pop(key, None)
         self.bind("aaaa")
 
@@ -194,10 +219,11 @@ class IndicatorIntegrationTests(unittest.TestCase):
             time.sleep(.3)
         return self.window().get("@agent_summary")
 
-    def hook(self, mode, sid="aaaa", agent="codex", **payload):
+    def hook(self, mode, sid="aaaa", agent="codex", _env=None, **payload):
         data = dict(session_id=sid, cwd="/work/project", **payload)
         env = dict(self.env)
-        if agent == "claude": env.update(TMUX="/fake/owned,12,0", TMUX_PANE="%42")
+        if agent in ("claude", "opencode"): env.update(TMUX="/fake/owned,12,0", TMUX_PANE="%42")
+        env.update(_env or {})
         result = subprocess.run(["bash", str(self.script), mode, agent], input=json.dumps(data),
                                 text=True, capture_output=True, env=env, cwd=self.root, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -297,6 +323,106 @@ class IndicatorIntegrationTests(unittest.TestCase):
         self.wait_for("finished")
         time.sleep(.25)
         self.assertEqual(self.window()["@agent_summary"], "project/New Session")
+
+    def test_claude_in_codex_tool_shell_leaves_codex_tab_alone(self):
+        # Codex's shell tool runs `claude -p`: that claude's hooks inherit
+        # codex's TMUX_PANE (A FOREIGN AGENT'S TOOL SHELL). Its SessionStart
+        # repainted codex's tab as an idle claude and dropped the owner
+        # binding; its SessionEnd wiped the window.
+        self.hook("running", prompt="Codex task")
+        self.wait_for("finished")          # its title worker is done painting
+        time.sleep(.3)
+        before = self.window()
+        self.assertEqual((before["@agent_state"], before["@agent_kind"]), ("running", "codex"))
+        for marker in ({"CODEX_THREAD_ID": "019a-thread"}, {"CODEX_SANDBOX": "seatbelt"}):
+            for agent in ("claude", "opencode"):
+                for mode, extra in [("idle", {"source": "startup"}), ("running", {"prompt": "child"}),
+                                    ("heartbeat", {}), ("done", {}), ("clear", {"reason": "other"})]:
+                    self.hook(mode, sid="cccc", agent=agent, _env=marker, **extra)
+                    self.assertEqual(self.window(), before, (marker, agent, mode))
+        # ...and without the marker, the same claude hook still paints.
+        self.assertEqual(self.hook("idle", sid="cccc", agent="claude", source="startup")["@agent_kind"], "claude")
+
+    def nested_ps(self):
+        """FAKE_PS_COMM making this test process a claude whose ancestor two
+        levels up is another agent: agent -> shell -> agent above the hook."""
+        parent = os.getppid()
+        grand = subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(parent)],
+                               capture_output=True, text=True).stdout.strip()
+        if not grand.isdigit() or int(grand) <= 1:
+            self.skipTest("this test runner has no grandparent process to relabel")
+        return f"{os.getpid()}:2.1.308,{parent}:zsh,{grand}:claude"
+
+    def test_claude_in_claude_tool_shell_is_inert(self):
+        # A `claude -p` run from another Claude's Bash tool carries no codex
+        # marker; the process tree says it (nested_agent).
+        w = self.hook("idle", agent="claude", source="startup")
+        self.assertEqual(w["@agent_state"], "idle")
+        before = self.window()
+        nested = {"FAKE_PS_COMM": self.nested_ps()}
+        for mode, extra in [("idle", {"source": "startup"}), ("running", {"prompt": "child task"}),
+                            ("needs-approval", {}), ("done", {}), ("clear", {"reason": "other"})]:
+            self.hook(mode, sid="cccc", agent="claude", _env=nested, **extra)
+            self.assertEqual(self.window(), before, mode)
+        # A claude whose direct parent is an agent (no shell between) is not
+        # a nesting, and neither is one agent alone.
+        direct = {"FAKE_PS_COMM": f"{os.getpid()}:claude,{os.getppid()}:claude"}
+        self.assertEqual(self.hook("running", agent="claude", _env=direct, prompt="go")["@agent_state"], "running")
+
+    def test_noop_heartbeat_resolves_the_owner_once(self):
+        # Codex blocks on every PostToolUse hook, and each owner resolve is a
+        # python + ps + tmux (~150 ms): one per hook event, not three.
+        log = Path(str(self.owners) + ".resolve")
+        def hook_resolves():
+            return [l for l in log.read_text().splitlines() if l.endswith(" hook")]
+        self.hook("running")
+        log.unlink()
+        self.assertEqual(self.hook("heartbeat")["@agent_state"], "running")
+        self.assertEqual(hook_resolves(), ["aaaa hook"])
+        self.hook("needs-approval")
+        log.unlink()
+        self.assertEqual(self.hook("heartbeat")["@agent_state"], "running")   # a write: owns_window asks
+        self.assertEqual(hook_resolves(), ["aaaa hook"])
+
+    def test_healthy_watcher_costs_a_hook_no_forks(self):
+        # NO FORKS WHEN HEALTHY: a watcher that has restamped its pidfile since
+        # a mark written under 30 s ago is alive, ours and turning.
+        fake = self.root / "agent-tab-watcher.sh"
+        fake.write_text("sleep 60\n")
+        proc = subprocess.Popen(["bash", str(fake)], start_new_session=True)
+        self.addCleanup(proc.kill)
+        uid = os.getuid()
+        pidfile = self.root / f"agent-tab-watcher.{uid}.pid"
+        mark = self.root / f"agent-tab-watcher.{uid}.hookseen"
+        pidfile.write_text(f"{proc.pid}\n")
+        def watcher_spawns():
+            calls = json.loads(self.state.read_text())["calls"]
+            return [c for c in calls if c[0] == "run-shell" and "agent-tab-watcher.sh" in c[-1]]
+        def forks():
+            return self.forks.read_text().splitlines() if self.forks.exists() else []
+        # First hook: no mark yet - the slow path proves the beat, writes it.
+        self.hook("running")
+        self.assertTrue(mark.exists())
+        self.assertTrue(any(f.startswith("stat ") for f in forks()))
+        self.assertEqual(watcher_spawns(), [])
+        # The watcher ticks; the next hook pays nothing for the check.
+        t = time.time() + 1
+        os.utime(pidfile, (t, t))
+        self.forks.unlink()
+        self.hook("heartbeat")
+        self.assertEqual(forks(), [])
+        self.assertEqual(watcher_spawns(), [])
+        # A mark past 30 s proves nothing: the slow path runs again.
+        mark.write_text(f"{int(time.time()) - 31}\n")
+        os.utime(mark, (t - 2, t - 2))
+        self.hook("heartbeat")
+        self.assertTrue(any(f.startswith("stat ") for f in forks()))
+        self.assertEqual(watcher_spawns(), [])
+        # A wedged watcher (no beat for 30 s) is still caught.
+        os.utime(pidfile, (t - 60, t - 60))
+        mark.write_text(f"{int(time.time()) - 31}\n")
+        self.hook("heartbeat")
+        self.assertEqual(len(watcher_spawns()), 1)
 
     def test_delayed_summary_checks_registry_even_before_next_hook(self):
         (self.cond / "block").touch()

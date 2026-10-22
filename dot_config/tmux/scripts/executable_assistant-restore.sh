@@ -59,6 +59,21 @@ log() {
 }
 elapsed() { awk -v s="$START" -v e="$EPOCHREALTIME" 'BEGIN { printf "%.1f", e - s }'; }
 
+# Undo the save's blank-title placeholder. resurrect-save.sh writes an empty
+# #{pane_title} as ':' so the plugin's whitespace-IFS read keeps its columns,
+# but restore.sh applies the title as-is (`select-pane -T ":"`): restored
+# shells came back titled ':' (three stash shells on 2026-10-18), and the next
+# save kept it, for good. This hook is the first of post-restore-all, so it
+# blanks every pane titled exactly ':' in one tmux call, before anything reads
+# them. Runs whatever the sidecar holds.
+untitle=()
+while IFS="$US" read -r t_pane t_title; do
+	[ "$t_title" = ":" ] || continue
+	[ "${#untitle[@]}" -gt 0 ] && untitle+=(";")
+	untitle+=(select-pane -t "$t_pane" -T "")
+done < <(tmux list-panes -a -F "#{pane_id}${US}#{pane_title}" 2>/dev/null)
+[ "${#untitle[@]}" -gt 0 ] && tmux "${untitle[@]}" 2>/dev/null
+
 [ -f "$INPUT_FILE" ] || { log "no saved sessions found at $INPUT_FILE"; exit 0; }
 START=$EPOCHREALTIME
 
@@ -87,6 +102,7 @@ capture_json="$(printf '%s\n' "${capture_env[@]+"${capture_env[@]}"}" | jq -Rsc 
 # touched.
 read -r -d '' JQ_PROG <<'JQ'
 def q: "'" + gsub("'"; "'\"'\"'") + "'";
+def nq: if type != "string" or contains("'###") then error("unquotable") else "r###'" + . + "'###" end;
 def vflag: . as $w | any(("-c", "--config", "--enable", "--disable", "-C", "--cd", "-m", "--model",
   "-p", "--profile", "-s", "--sandbox", "-a", "--ask-for-approval", "-i", "--image", "--add-dir",
   "--local-provider", "--remote"); . == $w);
@@ -103,11 +119,34 @@ def ctxdrop:
     elif ($w | test("^-c[^-=]")) and ($w[2:] | mcw) then .
     else .out += [$w] end)
   | .out;
+# Claude rows keep only their leading options (claudecut). ps prints argv
+# space-joined and upstream strips only the binary and the session flags, so a
+# launch prompt (`claude "fix the login bug"`, an Ask Claude space's sentence)
+# was saved as cli_args and replayed word by word on every restore: extra
+# positionals, a new turn, or a subcommand (`update …`) run instead of the
+# resume. So a value-taking flag keeps its one operand, and the first bare word
+# or `--` ends the options: it and everything after are dropped. Same list as
+# build_cmd in closed-tabs.sh.
+def cvflag: . as $w | any(("--model", "--permission-mode", "--add-dir", "--allowedTools", "--allowed-tools",
+  "--disallowedTools", "--disallowed-tools", "--tools", "--append-system-prompt", "--system-prompt",
+  "--append-system-prompt-file", "--system-prompt-file", "--settings", "--setting-sources", "--mcp-config",
+  "--agents", "--agent", "--fallback-model", "--session-id", "--output-format", "--input-format",
+  "--max-turns", "--betas", "--plugin-dir"); . == $w);
+def claudecut:
+  reduce .[] as $w ({out: [], pend: false, stop: false};
+    if .stop then .
+    elif .pend then .out += [$w] | .pend = false
+    elif $w == "--" or ($w | startswith("-") | not) then .stop = true
+    elif ($w | cvflag) then .out += [$w] | .pend = true
+    else .out += [$w] end)
+  | .out;
 (.sessions // [])[]
 | . as $e
 | ((.cli_args // "") | [splits("[ \t\n]+")] | map(select(length > 0))
-   | if $e.tool == "codex" then ctxdrop else . end | map(" " + q) | join("")) as $args
-| (if (.model // "") != "" and .tool == "claude" and ((.cli_args // "") | contains("--model") | not)
+   | if $e.tool == "codex" then ctxdrop elif $e.tool == "claude" then claudecut else . end) as $words
+| ($words | map(" " + q) | join("")) as $args
+| (if (.model // "") != "" and .tool == "claude"
+     and ($words | any(. == "--model" or startswith("--model=")) | not)
    then " --model " + (.model | q) else "" end) as $model
 | ([$cap[] as $v | (($e.env // {})[$v] // "") | tostring
     | select(. != "" and . != "null") | $v + "=" + q + " "] | join("")) as $envp
@@ -115,15 +154,34 @@ def ctxdrop:
    elif .tool == "opencode" then "command opencode" + $args + " -s " + (.session_id | q)
    elif .tool == "codex" then $codex + $args + " resume " + (.session_id | q)
    else "" end) as $cmd
-| [.pane, .tool, .session_id, (.cwd // ""), (if $cmd == "" then "" else $envp + $cmd end)]
+# The same line for a nu pane (field 6), whole: nu cannot parse the POSIX one
+# (`2>/dev/null`, `command`, a `VAR=x` prefix), so a nu shell typed it and the
+# agent stayed down. Words are nu raw strings, which take any text but their
+# own terminator; a value holding that (or a non-string env value) leaves the
+# field empty, and the pane is skipped with a log line.
+| (try (
+     ($words | map(" " + nq) | join("")) as $nargs
+     | (if $model == "" then "" else " --model " + (.model | nq) end) as $nmodel
+     | (if .tool == "claude" then "^claude" + $nargs + $nmodel + " --resume " + (.session_id | nq)
+        elif .tool == "opencode" then "^opencode" + $nargs + " -s " + (.session_id | nq)
+        elif .tool == "codex" then $codexnu + $nargs + " resume " + (.session_id | nq)
+        else "" end) as $ncmd
+     | ([$cap[] as $v | (($e.env // {})[$v] // "") | tostring
+         | select(. != "" and . != "null") | $v + ": " + nq] | join(", ")) as $nenv
+     | (if $nenv == "" then $ncmd else "with-env {" + $nenv + "} { " + $ncmd + " }" end) as $nline
+     | if $ncmd == "" then ""
+       elif (.cwd // "") == "" then $nline
+       else (.cwd | nq) as $d | "if (" + $d + " | path exists) { cd " + $d + " }; " + $nline end
+   ) catch "") as $nucmd
+| [.pane, .tool, .session_id, (.cwd // ""), (if $cmd == "" then "" else $envp + $cmd end), $nucmd]
 | join("\u001f")
 JQ
 # Codex resumes through the ~/.local/bin wrapper by path: it adds --no-daemon,
 # which the tab/notch binding relies on, and a restored pane's PATH can put
-# ~/.bun/bin's raw CLI first.
-codex_cmd="command codex"
-[ -x "$HOME/.local/bin/codex" ] && codex_cmd="$(posix_quote "$HOME/.local/bin/codex")"
-rows="$(jq -r --argjson cap "$capture_json" --arg codex "$codex_cmd" "$JQ_PROG" "$INPUT_FILE")" || { log "could not parse $INPUT_FILE"; exit 0; }
+# ~/.bun/bin's raw CLI first. codex_nu is the same for a nu pane (^ = external).
+codex_cmd="command codex" codex_nu="^codex"
+[ -x "$HOME/.local/bin/codex" ] && codex_cmd="$(posix_quote "$HOME/.local/bin/codex")" && codex_nu="^r###'$HOME/.local/bin/codex'###"
+rows="$(jq -r --argjson cap "$capture_json" --arg codex "$codex_cmd" --arg codexnu "$codex_nu" "$JQ_PROG" "$INPUT_FILE")" || { log "could not parse $INPUT_FILE"; exit 0; }
 
 count="$(printf '%s\n' "$rows" | grep -c . || true)"
 [ "${count:-0}" -gt 0 ] || { log "no assistant sessions to restore"; exit 0; }
@@ -145,7 +203,7 @@ attached=" $(tmux list-clients -F '#{client_session}' 2>/dev/null | tr '\n' ' ')
 
 # --- pick the panes, attached sessions first ------------------------------------
 first="" rest=""
-while IFS="$US" read -r pane tool sid cwd cmd; do
+while IFS="$US" read -r pane tool sid cwd cmd nucmd; do
 	[ -n "$pane" ] || continue
 	sess="${pane%%:*}"
 	if is_excluded "$sess"; then log "session '$sess' is excluded, skipping $pane"; continue; fi
@@ -153,7 +211,7 @@ while IFS="$US" read -r pane tool sid cwd cmd; do
 		log "unknown tool '$tool' for pane $pane, skipping"
 		continue
 	fi
-	line="${pane}${US}${tool}${US}${sid}${US}${cwd}${US}${cmd}"$'\n'
+	line="${pane}${US}${tool}${US}${sid}${US}${cwd}${US}${cmd}${US}${nucmd}"$'\n'
 	case "$attached" in *" $sess "*) first+="$line" ;; *) rest+="$line" ;; esac
 done <<<"$rows"
 todo="${first}${rest}"
@@ -231,7 +289,7 @@ snapshot="$(ps -eo pid=,ppid=,args= 2>/dev/null)"
 
 # --- resume ------------------------------------------------------------------------
 restored=0
-while IFS="$US" read -r pane tool sid cwd cmd; do
+while IFS="$US" read -r pane tool sid cwd cmd nucmd; do
 	[ -n "$pane" ] || continue
 	sess="${pane%%:*}"
 	if ! tmux has-session -t "=$sess" 2>/dev/null; then
@@ -256,8 +314,17 @@ while IFS="$US" read -r pane tool sid cwd cmd; do
 		continue
 	fi
 
-	line="$cmd"
-	[ -n "$cwd" ] && [ "$cwd" != "null" ] && line="cd $(posix_quote "$cwd") 2>/dev/null; $cmd"
+	if [ "${pane_cmd#-}" = nu ]; then
+		# nu needs its own line (JQ_PROG's field 6, cd included).
+		if [ -z "$nucmd" ]; then
+			log "pane $pane is a nu shell and its resume command cannot be quoted for nu, skipping"
+			continue
+		fi
+		line="$nucmd" cmd="$nucmd"
+	else
+		line="$cmd"
+		[ -n "$cwd" ] && [ "$cwd" != "null" ] && line="cd $(posix_quote "$cwd") 2>/dev/null; $cmd"
+	fi
 	log "restoring $tool in $pane (session: $sid, cmd: $cmd)"
 	# resurrect may have replayed old pane text; wipe it so the TUI starts clean.
 	tmux clear-history -t "$pane" 2>/dev/null

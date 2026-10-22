@@ -125,6 +125,9 @@ main() {
 
   target="${target/#\~/$HOME}"
   [[ -d "$target" ]] || die "not a directory: $target"
+  # A clean path for -c, so agent-birth's label never sees `..`, `.` or a
+  # trailing slash (2026-10-22).
+  target="$(cd "$target" && pwd)"
 
   # Mirrors `bind K`'s old body. claude is NOT the window command (quitting it
   # would close the tab); ZSH_AUTOSTART tells .zshrc to launch it as a child of

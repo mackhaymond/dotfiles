@@ -176,6 +176,29 @@ lock_release() {
 
 hold_exists() { tmux has-session -t "=$HOLD" 2>/dev/null; }
 
+# Every session that is not a place for a tab, one name per line: tmux.conf's
+# @space_hidden_sessions, any session spaces.conf flagged @space_hidden, and the
+# built-in list as a floor (a server running without the spaces config still
+# has an `agents` and a holding session). Hard-coded subsets of it were the bug
+# (2026-10-22): the send picker offered `pending` and `btop-popup`, and an
+# unpark whose origin was gone could land in `agents` — tmux-pty-mcp's session,
+# whose sweep deletes an untagged window — and switch the client there.
+hidden_sessions() {
+    local s
+    printf '%s\n' "$HOLD" agents tasks scratch btop-popup pending
+    # read -a, not an unquoted expansion: no pathname expansion of the names.
+    local -a cfg=()
+    read -r -a cfg <<< "$(tmux show -gqv @space_hidden_sessions 2>/dev/null)"
+    for s in ${cfg[@]+"${cfg[@]}"}; do printf '%s\n' "$s"; done
+    tmux list-sessions -F '#{?#{@space_hidden},#{session_name},}' 2>/dev/null | grep -v '^$'
+    return 0
+}
+# A here-string, not `hidden_sessions | grep -q`: grep -q quits on the first
+# match, the rest of hidden_sessions then dies of SIGPIPE, and pipefail turns
+# that 141 into "not hidden" — for every built-in name once tmux.conf sets
+# @space_hidden_sessions to the same list (2026-10-22 review).
+is_hidden_session() { [ -n "${1:-}" ] && grep -qxF -- "$1" <<< "$(hidden_sessions)"; }
+
 # Close the gap a park leaves behind. `renumber-windows on` only fires when a
 # window is CLOSED — moving one to another session is not a close, so parking
 # tab 2 of 1,2,3 left 1,3 with a hole in it. `move-window -r` renumbers a
@@ -1868,7 +1891,35 @@ suspend_agent() {
     # conversation as it looked at the moment it was put away.
     snapshot_pane "$win" "$a_pane" "$a_sid"
 
+    # ...and the snapshot is itself 0.6s+ (the resize settle), plus everything
+    # since the re-check above — so that check was stale again by the time the
+    # signal went (2026-10-22: prefix+H then prefix+h a second later SIGTERMed
+    # claude in the tab just brought back, and its composer with it). The
+    # FINAL check and the kill now happen under the main lock: do_unstash_many
+    # moves windows only while holding it, so the window cannot leave the
+    # holding session between this test and the signal. Only the test and the
+    # kill are inside — not the snapshot, not the TERM_WAIT. Lock not to be had
+    # = uncertain = left running, like every other doubt in here.
+    local why=""
+    if ! lock_acquire; then
+        why="stash lock busy at the kill — left running"
+    elif [ "$(tmux display-message -p -t "$win" '#{session_name}' 2>/dev/null)" != "$HOLD" ]; then
+        why="window left the holding session during the snapshot — not suspending"
+    elif has_unsent_input "$a_pane"; then
+        why="text appeared in the composer during the snapshot — left running"
+    fi
+    if [ -n "$why" ]; then
+        lock_release
+        tmux set-option -uw -t "$win" @stash_session 2>/dev/null
+        tmux set-option -uw -t "$win" @stash_cwd 2>/dev/null
+        tmux set-option -uw -t "$win" @stash_pane_idx 2>/dev/null
+        save_state
+        rm -f "$PREVIEW_DIR/$a_sid.ansi" 2>/dev/null
+        log "$why"
+        return 0
+    fi
     kill -TERM "$a_pid" 2>/dev/null
+    lock_release
     local i=0
     while [ "$i" -lt "$TERM_WAIT" ] && kill -0 "$a_pid" 2>/dev/null; do sleep 1; i=$((i + 1)); done
 
@@ -2102,7 +2153,7 @@ agent_running() {
 # per window, renumber per window, and let another park interleave halfway
 # through a group the user selected as one unit.
 do_stash_many() {
-    local w s sess="" wins=() total busy=0 seen="" note=""
+    local w s sess="" wins=() total busy=0 homes=0 seen="" note=""
 
     # Everything from here to the moves reads tmux state and then acts on it, so
     # it runs under the lock. Released before the suspends, which are slow and
@@ -2124,6 +2175,15 @@ do_stash_many() {
         # one working agent twice and report "all 2 of those agents".
         case " $seen " in *" $w "*) continue ;; esac
         seen="$seen $w"
+        # A space's HOME never parks (2026-10-22). M-m and x/C-l already refuse
+        # it, but H did not — and a range always reaches it, since sel_order
+        # walks the home first. Parked, the space grew a new home; brought back,
+        # space.sh's sync kept the lower one, stripped the returning window's
+        # markers and killed its dashboard pane.
+        if [ "$(tmux show -wqv -t "$w" @space_home 2>/dev/null)" = "1" ]; then
+            log "refused to hide $w — it is its space's home"
+            homes=$((homes + 1)); continue
+        fi
         # Refuse to hide a working agent at all, rather than hiding it and then
         # declining to suspend it. That combination is the worst of both: the
         # tab is gone from the bar AND still holding its ~1GB and its share of a
@@ -2142,6 +2202,8 @@ do_stash_many() {
             msg -k warn "that agent is still working — not hiding it"
         elif [ "$busy" -gt 1 ]; then
             msg -k warn "all $busy of those agents are still working — not hiding them"
+        elif [ "$homes" -gt 0 ]; then
+            msg -k warn "that's the space's home tab — it stays"
         else
             msg -k warn "already parked"
         fi
@@ -2225,9 +2287,10 @@ do_stash_many() {
     # Never a silent partial: if part of a range stayed behind, say which and
     # why, or the tab bar just looks like the gesture misfired. ONE message —
     # see the note on `note` above.
-    if [ "$busy" -gt 0 ] || [ "$failed" -gt 0 ] || [ -n "$note" ]; then
+    if [ "$busy" -gt 0 ] || [ "$homes" -gt 0 ] || [ "$failed" -gt 0 ] || [ -n "$note" ]; then
         local report="hid ${#parked[@]}"
         [ "$busy" -gt 0 ]   && report="$report — left $busy still working"
+        [ "$homes" -gt 0 ]  && report="$report — the home tab stays"
         [ "$failed" -gt 0 ] && report="$report — could not park $failed"
         [ -n "$note" ]      && report="$report — $note"
         if [ "$failed" -gt 0 ]; then msg -k error "$report"; else msg -k warn "$report"; fi
@@ -2577,10 +2640,14 @@ do_send_pick() {
     # Same list and order as prefix+a (mru-session-switch.sh): most recently
     # attached first, minus the session the tabs are already in and the ones
     # that are not places to put things.
+    # The not-places are every hidden session (hidden_sessions), not a
+    # hard-coded subset — `pending` and `btop-popup` were offered until
+    # 2026-10-22.
     local list
     list=$(tmux list-sessions -F $'#{session_last_attached}\t#{session_name}' 2>/dev/null \
-        | awk -F '\t' -v cur="$src" -v hold="$HOLD" '$2 != cur && $2 != "scratch" && $2 != "agents" && $2 != "tasks" && $2 != hold' \
-        | sort -t $'\t' -k1,1nr | cut -f2-)
+        | awk -F '\t' -v cur="$src" '$2 != cur' \
+        | sort -t $'\t' -k1,1nr | cut -f2- \
+        | grep -vxF -f <(hidden_sessions))
 
     # Tab for "stay", not ⌥⏎ or ⌃s: WezTerm's default bindings take Alt+Enter
     # for ToggleFullScreen before fzf ever sees it, and C-s is the tmux prefix.
@@ -2617,7 +2684,7 @@ do_send_pick() {
 
 do_send_many() {
     local client="$1" mode="$2" target="$3"; shift 3
-    local w s src="" wins=() seen="" created=0 boot="" total
+    local w s src="" wins=() seen="" created=0 boot="" total homes=0
     # say [-k KIND] [-t SECONDS] TEXT: to $client (a backgrounded run-shell
     # has no client of its own), as is (no "stash: ").
     say() {
@@ -2630,10 +2697,15 @@ do_send_many() {
     # The picker hides these, but a typed name bypasses the list. `agents` is
     # tmux-pty-mcp's: it owns windows there by @pty_* tags, and an untagged
     # window is exactly what its sweep and agent-restore-prune.sh delete.
+    # Every hidden session, not a hard-coded few: `pending` (space.sh's
+    # space-building claudes) and `btop-popup` got through, and ⏎ then switched
+    # the client into a session that is on no bar.
     case "$target" in
         "$HOLD")  say -k warn "that's the parking session — use H to hide tabs"; return 0 ;;
-        scratch|agents|tasks) say -k warn "$target isn't a place to put tabs"; return 0 ;;
     esac
+    if is_hidden_session "$target"; then
+        say -k warn "$target isn't a place to put tabs"; return 0
+    fi
 
     lock_acquire || { say -k warn "stash: busy — try again"; return 0; }
 
@@ -2646,10 +2718,20 @@ do_send_many() {
         [ -n "$src" ] || src="$s"
         [ "$s" = "$src" ] || continue
         case " $seen " in *" $w "*) continue ;; esac
-        seen="$seen $w"; wins+=("$w")
+        seen="$seen $w"
+        # A space's home stays in its space — M-m's rule, now here too (see
+        # do_stash_many: a range always reaches the home first).
+        if [ "$(tmux show -wqv -t "$w" @space_home 2>/dev/null)" = "1" ]; then
+            homes=$((homes + 1)); continue
+        fi
+        wins+=("$w")
     done
 
-    if [ "${#wins[@]}" -eq 0 ]; then lock_release; say -k warn "nothing to move"; return 0; fi
+    if [ "${#wins[@]}" -eq 0 ]; then
+        lock_release
+        if [ "$homes" -gt 0 ]; then say -k warn "that's the space's home tab — it stays"; else say -k warn "nothing to move"; fi
+        return 0
+    fi
     if [ "$src" = "$target" ]; then lock_release; say -k warn "already in $target"; return 0; fi
 
     total=$(tmux list-windows -t "=$src" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ')
@@ -2751,8 +2833,9 @@ do_send_many() {
     # SHORT one; failures always get one.
     local n="${#moved[@]}" report
     report="moved $n tab$([ "$n" -eq 1 ] || echo s) to $target$([ "$created" = 1 ] && echo ' (new)')"
-    if [ "$failed" -gt 0 ] || [ -n "$note" ]; then
+    if [ "$failed" -gt 0 ] || [ "$homes" -gt 0 ] || [ -n "$note" ]; then
         [ "$failed" -gt 0 ] && report="$report — could not move $failed"
+        [ "$homes" -gt 0 ]  && report="$report — the home tab stays"
         [ -n "$note" ]      && report="$report — $note"
         if [ "$failed" -gt 0 ]; then say -k error "$report"; else say -k warn "$report"; fi
     elif [ "$mode" = stay ]; then
@@ -2781,7 +2864,7 @@ pending_windows() {
 
 do_unstash() {
     local win="${1:-}" client="${2:-}"
-    if ! hold_exists; then
+    if [ -z "$win" ] && ! hold_exists; then
         # Nothing parked, but a pending resume may still be waiting.
         local p; p=$(pending_windows | head -1)
         if [ -n "$p" ]; then
@@ -2794,6 +2877,8 @@ do_unstash() {
     fi
 
     if [ -z "$win" ]; then
+        # The picker lists pending resumes too (do_pick), so they stay
+        # reachable while anything else is parked.
         if [ "$(count)" -ge 1 ]; then
             # Even for a single parked window: the popup's preview shows what is
             # about to come back, and ⌃x kill is only reachable from here.
@@ -2825,7 +2910,23 @@ do_unstash_many() {
     if [ "${1:-}" = "-c" ]; then client="${2:-}"; shift 2; fi
     local w win origin origins=() ordered=() wanted=" $* "
 
-    hold_exists || { msg -k warn "nothing is parked"; return 0; }
+    # Ids NAMED here that are pending resumes rather than parked windows: home
+    # already, agent dead, @stash_session still set (a resume refused because
+    # the pane was busy). The picker lists them, and filtering them out against
+    # $HOLD below — as this did until 2026-10-22 — left no key that could
+    # resume one while anything else was parked. They get the resume, nothing
+    # else: there is nothing to move.
+    local pend=()
+    if [ "$wanted" != "  " ]; then
+        while read -r w; do
+            case "$wanted" in *" $w "*) pend+=("$w") ;; esac
+        done < <(pending_windows)
+    fi
+
+    if ! hold_exists; then
+        [ "${#pend[@]}" -gt 0 ] && { resume_pending "$client" "${pend[@]}"; return 0; }
+        msg -k warn "nothing is parked"; return 0
+    fi
 
     lock_acquire || { msg -k warn "busy — try again"; return 0; }   # 0: see the note on the refusal below
 
@@ -2847,6 +2948,7 @@ do_unstash_many() {
 
     if [ "${#ordered[@]}" -eq 0 ]; then
         lock_release
+        [ "${#pend[@]}" -gt 0 ] && { resume_pending "$client" "${pend[@]}"; return 0; }
         msg -k warn "nothing is parked"
         return 0
     fi
@@ -2857,30 +2959,44 @@ do_unstash_many() {
         # window must never become unreachable because its origin session was
         # closed. Resolved per window: a batch can span origins.
         origin=$(tmux show -wqv -t "$win" @stash_origin 2>/dev/null)
-        if [ -z "$origin" ] || ! tmux has-session -t "=$origin" 2>/dev/null; then
-            origin=$(tmux display-message -p '#{session_name}' 2>/dev/null)
-        fi
-        # ...but that fallback resolves by tmux's most-recently-active rules,
-        # not "the session the client is looking at", and the holding session is
-        # the newest thing on the server whenever anything is parked — so it can
-        # answer `stash`, and moving a parked window to `stash` succeeds while
-        # leaving it exactly where it was: parked, with its origin now cleared,
-        # and no way left to tell it had ever been anywhere else.
-        #
-        # Prefer a session someone is actually ATTACHED to. `list-sessions` is
-        # sorted by name, so taking its head is "alphabetically first", which on
-        # this machine is `agents` — the window would land somewhere the user is
-        # not looking, and the select-window below would then quietly change
-        # THAT session's current window instead. -F to match literally: a
-        # session name is user-chosen and may contain regex metacharacters.
-        case "${origin:-}" in
-            "$HOLD"|"")
+        if [ -z "$origin" ] || [ "$origin" = "$HOLD" ] || ! tmux has-session -t "=$origin" 2>/dev/null; then
+            # The session the CLIENT is looking at first, when there is one —
+            # that is "wherever we are now". The bare display-message below is
+            # only right inside tmux: from the sidebar (run-shell sent from
+            # outside tmux) it answered tmux's best session, which was `agents`
+            # whenever tmux-pty-mcp had just opened a window there.
+            origin=""
+            [ -n "$client" ] && origin=$(tmux display-message -p -c "$client" '#{client_session}' 2>/dev/null)
+            [ -n "$origin" ] || origin=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+            # ...but the bare form resolves by tmux's most-recently-active
+            # rules, not "the session the client is looking at", and the
+            # holding session is the newest thing on the server whenever
+            # anything is parked — so it can answer `stash`, and moving a parked
+            # window to `stash` succeeds while leaving it exactly where it was:
+            # parked, with its origin now cleared, and no way left to tell it
+            # had ever been anywhere else. It can equally answer `agents`,
+            # `tasks` or `pending` — a hidden session, where the tab is off
+            # every bar and the client is then switched INTO it (2026-10-22:
+            # landed in tmux-pty-mcp's `agents` from the sidebar). Every hidden
+            # session is refused, not only $HOLD.
+            #
+            # Then prefer a session someone is actually ATTACHED to.
+            # `list-sessions` is sorted by name, so taking its head is
+            # "alphabetically first", which on this machine is `agents` — the
+            # window would land somewhere the user is not looking, and the
+            # select-window below would then quietly change THAT session's
+            # current window instead. -F to match literally: a session name is
+            # user-chosen and may contain regex metacharacters. With no visible
+            # session left at all the window stays parked (counted as failed):
+            # still reachable, unlike one moved into a hidden session.
+            if [ -z "$origin" ] || is_hidden_session "$origin"; then
+                local hidden; hidden=$(hidden_sessions)
                 origin=$(tmux list-sessions -F '#{?session_attached,#{session_name},}' 2>/dev/null |
-                         grep -vxF "$HOLD" | grep -v '^$' | head -1)
+                         grep -v '^$' | grep -vxF -f <(printf '%s\n' "$hidden") | head -1)
                 [ -n "$origin" ] || origin=$(tmux list-sessions -F '#{session_name}' 2>/dev/null |
-                                             grep -vxF "$HOLD" | head -1)
-                ;;
-        esac
+                                             grep -vxF -f <(printf '%s\n' "$hidden") | head -1)
+            fi
+        fi
         if [ -z "$origin" ]; then
             failed=$((failed + 1))
             log "no session left to bring $win back to"
@@ -2906,7 +3022,9 @@ do_unstash_many() {
     done
 
     if [ "${#restored[@]}" -eq 0 ]; then
-        lock_release; msg -k error "could not bring it back"; return 0
+        lock_release
+        [ "${#pend[@]}" -gt 0 ] && { resume_pending "$client" "${pend[@]}"; return 0; }
+        msg -k error "could not bring it back"; return 0
     fi
     # Land on the first of the group, so a multi-tab restore leaves you at the
     # left end of what just came back rather than on whichever one moved last.
@@ -2940,6 +3058,29 @@ do_unstash_many() {
     # and the sidecar write they each trigger is a rename, so the worst case is
     # a redundant mirror, not a lost id.
     for win in "${restored[@]}"; do
+        tmux run-shell -b "'$SELF' resume '$win'"
+    done
+    # Pending resumes picked alongside: resumed in place, and the client stays
+    # on the first window that MOVED (that is what came back on screen).
+    for win in ${pend[@]+"${pend[@]}"}; do
+        tmux run-shell -b "'$SELF' resume '$win'"
+    done
+}
+
+# Resume windows that are home already (see pending_windows) and take the
+# client to the first, as an unpark would. Same backgrounded hand-off as
+# do_unstash_many's, for the same reason.
+resume_pending() {
+    local client="$1" win dest; shift
+    [ "$#" -gt 0 ] || return 0
+    tmux select-window -t "$1" 2>/dev/null
+    if [ -n "$client" ]; then
+        dest=$(tmux display-message -p -t "$1" '#{session_name}' 2>/dev/null)
+        if [ -n "$dest" ] && [ "$dest" != "$(tmux display-message -p -c "$client" '#{client_session}' 2>/dev/null)" ]; then
+            tmux switch-client -c "$client" -t "=$dest" 2>/dev/null
+        fi
+    fi
+    for win in "$@"; do
         tmux run-shell -b "'$SELF' resume '$win'"
     done
 }
@@ -3089,28 +3230,7 @@ ago() {
 }
 do_pick() {
     local client="${1:-}" out key wins now; now=$(date +%s)
-    local dim=$'\e[2m' mauve=$'\e[38;2;203;166;247m' teal=$'\e[38;2;148;226;213m' off=$'\e[0m'
-    local sub=$'\e[38;2;166;173;200m'
-    local id ts sid cmd label cwd desc tool c
-    out=$(tmux list-windows -t "=$HOLD" \
-            -F "#{window_id}${SEP}#{@stash_ts}${SEP}#{@stash_session}${SEP}#{pane_current_command}${SEP}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}${SEP}#{?#{@stash_cwd},#{@stash_cwd},#{pane_current_path}}${SEP}#{@stash_desc}" \
-          | sort -t "$SEP" -k2,2nr \
-          | while IFS="$SEP" read -r id ts sid cmd label cwd desc; do
-              [ -n "$id" ] || continue
-              # claude's process title is its version string.
-              case "$cmd" in
-                  [0-9]*.[0-9]*) tool=claude ;;
-                  zsh|bash|sh|fish|-zsh) tool=shell ;;
-                  *) tool=$cmd ;;
-              esac
-              [ -n "$sid" ] && tool=claude
-              c="$teal"; [ "$tool" = claude ] && c="$mauve"
-              if [ -n "$ts" ]; then ago "$ts" "$now"; else REPLY="?"; fi
-              [ -n "$desc" ] && desc="  ${sub}— ${desc}${off}"
-              printf '%s\t%s%-9s%s %s%-9s%s %s%s\t%s%s%s\n' "$id" \
-                  "$dim" "$REPLY" "$off" "$c" "$tool" "$off" "$label" "$desc" \
-                  "$dim" "${cwd/#"$HOME"/\~}" "$off"
-            done \
+    out=$(pick_rows "$now" \
           | fzf --ansi --with-nth=2.. --delimiter='\t' --reverse --prompt='bring back > ' \
                 --multi \
                 --expect=ctrl-x \
@@ -3134,6 +3254,47 @@ do_pick() {
     else
         tmux run-shell -b "'$SELF' unstash-many ${client:+-c '$client' }$wins"
     fi
+}
+
+# The picker's rows: every parked window, newest first, then every pending
+# resume (pending_windows) — marked, since those are on the tab bar already
+# and ⏎ only resumes their agent. Without them a refused resume could not be
+# retried from the keyboard while anything else was parked. ⌃x on one is a
+# no-op: kill-many acts on parked windows only.
+pick_rows() {
+    local now="$1" p
+    local dim=$'\e[2m' mauve=$'\e[38;2;203;166;247m' teal=$'\e[38;2;148;226;213m' off=$'\e[0m'
+    local sub=$'\e[38;2;166;173;200m' peach=$'\e[38;2;250;179;135m'
+    local id ts sid cmd label cwd desc tool c where
+    tmux list-windows -t "=$HOLD" \
+            -F "#{window_id}${SEP}#{@stash_ts}${SEP}#{@stash_session}${SEP}#{pane_current_command}${SEP}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}${SEP}#{?#{@stash_cwd},#{@stash_cwd},#{pane_current_path}}${SEP}#{@stash_desc}" \
+            2>/dev/null \
+          | sort -t "$SEP" -k2,2nr \
+          | while IFS="$SEP" read -r id ts sid cmd label cwd desc; do
+              [ -n "$id" ] || continue
+              # claude's process title is its version string.
+              case "$cmd" in
+                  [0-9]*.[0-9]*) tool=claude ;;
+                  zsh|bash|sh|fish|-zsh) tool=shell ;;
+                  *) tool=$cmd ;;
+              esac
+              [ -n "$sid" ] && tool=claude
+              c="$teal"; [ "$tool" = claude ] && c="$mauve"
+              if [ -n "$ts" ]; then ago "$ts" "$now"; else REPLY="?"; fi
+              [ -n "$desc" ] && desc="  ${sub}— ${desc}${off}"
+              printf '%s\t%s%-9s%s %s%-9s%s %s%s\t%s%s%s\n' "$id" \
+                  "$dim" "$REPLY" "$off" "$c" "$tool" "$off" "$label" "$desc" \
+                  "$dim" "${cwd/#"$HOME"/\~}" "$off"
+            done
+    for p in $(pending_windows); do
+        label="" cwd="" where=""
+        IFS="$SEP" read -r label cwd where < <(tmux display-message -p -t "$p" \
+            "#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}${SEP}#{?#{@stash_cwd},#{@stash_cwd},#{pane_current_path}}${SEP}#{session_name}" 2>/dev/null)
+        printf '%s\t%s%-9s%s %s%-9s%s %s  %s— resume pending, in %s%s\t%s%s%s\n' "$p" \
+            "$peach" "pending" "$off" "$mauve" "claude" "$off" "${label:-$p}" "$sub" "${where:-?}" "$off" \
+            "$dim" "${cwd/#"$HOME"/\~}" "$off"
+    done
+    return 0
 }
 
 # Detached, one per parked window (do_stash_many starts it): a one-line

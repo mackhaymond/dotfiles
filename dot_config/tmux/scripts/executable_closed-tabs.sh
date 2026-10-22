@@ -59,6 +59,7 @@ LOCK="$STATE_DIR/lock"
 LOGFILE="$STATE_DIR/log"
 RETAIN_DAYS=7
 MAX_ENTRIES=100
+PREVIEW_GRACE=120     # seconds an unreferenced snapshot is left for its close to finish (prune)
 # The preview sits UNDER the list so it gets (nearly) the full client width: a
 # snapshot is as wide as the tab was, and anything wider than the preview is
 # clipped on the right.
@@ -155,12 +156,22 @@ prune() {
     fi
     # One jq for the live ids, then in-shell matching: a grep per snapshot
     # was a fork per history entry on every close and every CMD+Z.
-    local keep f id
+    #
+    # An unreferenced snapshot younger than PREVIEW_GRACE is NOT orphaned: it
+    # belongs to a close still in flight. do_close writes the preview first
+    # and its history row only after the agent lookup, the kill and
+    # agent_session — hundreds of ms for a claude tab — and closing a space
+    # (prefix Q) runs every pane's close at once, so the first one to reach
+    # this deleted the screens of all the others (2026-10-22). The stat is
+    # paid only for unreferenced files, so the steady state forks nothing.
+    local keep f id now; now=$(date +%s)
     keep=$'\n'$(jq -r '.id' "$HISTORY" 2>/dev/null)$'\n'
     for f in "$PREVIEWS"/*.ansi; do
         [ -e "$f" ] || continue
         id=${f##*/}; id=${id%.ansi}
-        [[ "$keep" == *$'\n'"$id"$'\n'* ]] || rm -f "$f"
+        [[ "$keep" == *$'\n'"$id"$'\n'* ]] && continue
+        [ $(( now - $(stat -f %m "$f" 2>/dev/null || echo "$now") )) -lt "$PREVIEW_GRACE" ] && continue
+        rm -f "$f"
     done
 }
 
@@ -231,7 +242,7 @@ build_cmd() {
     [ -n "$sid" ] || return 0
     # shellcheck source=/dev/null
     source "$(dirname "$RESURRECT_SAVE")/lib-detect.sh" 2>/dev/null || return 0
-    local q_args="" a v i=0 n literal=0 words=()
+    local q_args="" a v i=0 n literal=0 has_model=0 words=()
     set -f
     words=($cli_args)
     set +f
@@ -269,6 +280,25 @@ build_cmd() {
             -c[!-=]*) v=${a#-c}; [ "${v%%=*}" = model_context_window ] && continue ;;
             esac
         fi
+        # Claude: only the leading options. A launch prompt (`claude "fix
+        # it"`, an Ask Claude space's sentence) reaches cli_args word by word,
+        # and replayed it became extra positionals, a new turn or a subcommand
+        # (`update …`) run instead of the resume. A value-taking flag keeps its
+        # one operand; the first bare word or `--` ends it all. Flag list =
+        # cvflag in assistant-restore.sh's JQ_PROG.
+        if [ "$tool" = claude ]; then
+            case "$a" in
+            --|[!-]*) break ;;
+            --model|--permission-mode|--add-dir|--allowedTools|--allowed-tools|--disallowedTools|--disallowed-tools|--tools|--append-system-prompt|--system-prompt|--append-system-prompt-file|--system-prompt-file|--settings|--setting-sources|--mcp-config|--agents|--agent|--fallback-model|--session-id|--output-format|--input-format|--max-turns|--betas|--plugin-dir)
+                [ "$a" = --model ] && has_model=1
+                if [ "$i" -lt "$n" ]; then
+                    q_args+=" $(posix_quote "$a") $(posix_quote "${words[i]}")"
+                    i=$((i + 1))
+                    continue
+                fi ;;
+            --model=*) has_model=1 ;;
+            esac
+        fi
         q_args+=" $(posix_quote "$a")"
     done
     # Only the variables @assistant-resurrect-capture-env lists, as a prefix.
@@ -282,7 +312,7 @@ build_cmd() {
          | "\(.key)\u001f\(.value)"' <<<"$env_json" 2>/dev/null)
     case "$tool" in
     claude)
-        case "$cli_args" in *--model*) ;; *) [ -n "$model" ] && q_args+=" --model $(posix_quote "$model")" ;; esac
+        [ "$has_model" = 0 ] && [ -n "$model" ] && q_args+=" --model $(posix_quote "$model")"
         echo "${env_prefix}command claude${q_args} --resume $(posix_quote "$sid")" ;;
     opencode) echo "${env_prefix}command opencode${q_args} -s $(posix_quote "$sid")" ;;
     codex)

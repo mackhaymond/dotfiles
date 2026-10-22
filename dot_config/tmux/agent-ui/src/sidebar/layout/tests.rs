@@ -4,6 +4,7 @@ use crate::tmux::tests::row;
 use crate::tmux::Snapshot;
 use crate::view::BuildArgs;
 use std::collections::HashMap;
+use unicode_width::UnicodeWidthStr;
 
 const NOW: i64 = 1_000_000;
 const CLIENT: &str = "/dev/ttys999";
@@ -1675,6 +1676,62 @@ fn shell_paths_cut_from_the_left() {
     assert_eq!(clip_left("~/.local/share/chezmoi/dot_config/tmux/agent-ui", 16), "…/tmux/agent-ui");
     assert_eq!(clip_left("~/x/averyveryverylongfolder", 10), "…ongfolder");
     assert_eq!(clip_left("/a/b", 0), "");
+    // A last folder cut mid-name keeps whole clusters: never a VS16 or a
+    // ZWJ part without its base. (WezTerm's cells: "❤️" is one.)
+    assert_eq!(clip_left("a/b❤\u{fe0f}c", 2), "…c");
+    assert_eq!(clip_left("a/b❤\u{fe0f}c", 3), "…❤\u{fe0f}c");
+    assert_eq!(clip_left("a/b❤\u{fe0f}c", 4), "…b❤\u{fe0f}c");
+    assert_eq!(clip_left("a/x👩\u{200d}💻yz", 4), "…yz");
+    assert_eq!(clip_left("a/x👩\u{200d}💻yz", 5), "…👩\u{200d}💻yz");
+    for room in 1..8 {
+        assert!(dwidth(&clip_left("a/b❤\u{fe0f}c👍🏽dé", room)) <= room, "{room}");
+    }
+}
+
+/// Every glyph sits where WezTerm, which draws the sidebar, puts it: where
+/// ratatui sizes a cluster otherwise (`❤️`: two cells to `unicode-width`,
+/// one in WezTerm) its cell is marked with WezTerm's width, so the diff
+/// writes the next cell where WezTerm's cursor is. (2026-10-22: the cells
+/// were tmux 3.7c's, so `✌`, one cell in WezTerm, was laid out and marked
+/// two wide and the diff never wrote the cell after it: a stale one.)
+#[test]
+fn glyphs_sit_where_wezterm_draws_them() {
+    use ratatui::buffer::CellDiffOption;
+    use std::num::NonZeroU16;
+    let xs = |buf: &Buffer| -> Vec<u16> { Buffer::empty(buf.area).diff(buf).iter().map(|(x, _, _)| *x).collect() };
+    // ✌: one cell, as ratatui sizes it: unmarked, and the cell after it written.
+    let segs = [seg("✌ Peace", "text"), seg("|", "text")];
+    let mut buf = Buffer::empty(Rect::new(0, 0, 12, 1));
+    put(&mut buf, 1, 0, &segs, Color::Reset);
+    assert_eq!(buf[(1, 0)].diff_option, CellDiffOption::None);
+    let at: Vec<&str> = (0..12).map(|x| buf[(x, 0)].symbol()).collect();
+    assert_eq!(at[1..9].concat(), "✌ Peace|");
+    assert_eq!(xs(&buf), (1..9).collect::<Vec<u16>>());
+    // ❤️: one cell in WezTerm, marked so, the next cell written right after it.
+    let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+    put(&mut buf, 0, 0, &[seg("❤\u{fe0f}ab", "text")], Color::Reset);
+    assert_eq!((buf[(0, 0)].symbol(), buf[(1, 0)].symbol(), buf[(2, 0)].symbol()), ("❤\u{fe0f}", "a", "b"));
+    assert_eq!(buf[(0, 0)].diff_option, CellDiffOption::ForcedWidth(NonZeroU16::MIN));
+    assert_eq!(xs(&buf), [0, 1, 2]);
+    // ...and to_ansi skips nothing after it.
+    assert!(to_ansi(&buf).contains("❤\u{fe0f}ab"), "{:?}", to_ansi(&buf));
+    // x‍💻: a ZWJ joins two pictographs only, so `x‍` (one cell) then 💻 (two).
+    let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+    put(&mut buf, 0, 0, &[seg("x\u{200d}💻|", "text")], Color::Reset);
+    assert_eq!((buf[(0, 0)].symbol(), buf[(1, 0)].symbol(), buf[(3, 0)].symbol()), ("x\u{200d}", "💻", "|"));
+    // 👩‍💻: one wide cell, the next cluster right after it.
+    let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+    put(&mut buf, 0, 0, &[seg("👩\u{200d}💻ab", "text")], Color::Reset);
+    assert_eq!((buf[(0, 0)].symbol(), buf[(2, 0)].symbol()), ("👩\u{200d}💻", "a"));
+    // A soft hyphen takes no cell in WezTerm: not drawn, nothing shifted.
+    let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+    put(&mut buf, 0, 0, &[seg("a\u{ad}b", "text"), seg("|", "text")], Color::Reset);
+    assert_eq!((0..3).map(|x| buf[(x, 0)].symbol()).collect::<String>(), "ab|");
+    assert_eq!(xs(&buf), [0, 1, 2]);
+    // At the edge: no half a glyph.
+    let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+    put(&mut buf, 2, 0, &[seg("💻", "text")], Color::Reset);
+    assert_eq!(buf[(2, 0)].symbol(), " ");
 }
 
 /// The space's header IS its home: a click goes there ([`Target::Session`],

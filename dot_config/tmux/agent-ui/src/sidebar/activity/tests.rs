@@ -217,6 +217,37 @@ fn apply_fills_only_working_agents() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The per-session caches are pruned: what a pass still asks for stays,
+/// what none has asked for within `keep` goes (they used to grow forever).
+#[test]
+fn unused_caches_are_forgotten() {
+    use crate::collate::Collator;
+    use crate::tmux::tests::row;
+    use crate::tmux::Snapshot;
+    use crate::view::BuildArgs;
+    let (root, _t) = fake_home("prune");
+    let c = Collator::new("C");
+    let view = |state: &str| {
+        let args = BuildArgs { client: None, now: 0.0, collator: &c, git: None, log: vec![], watcher_age: Some(1.0) };
+        ViewModel::build(&Snapshot::parse(&row("work", 1, "@7", &[("state", state), ("kind", "claude")])), args)
+    };
+    let mut a = Activity::new(root.clone());
+    a.apply(&mut view("running"));
+    assert_eq!((a.paths.len(), a.blurbs.len()), (1, 1));
+    // Idle a while (within KEEP): kept, and working again reads nothing new.
+    a.apply(&mut view("idle"));
+    a.apply(&mut view("running"));
+    assert_eq!((a.paths.len(), a.blurbs.len(), a.reads), (1, 1, 1));
+    // Used this pass: kept even at a zero `keep` (pruned before the lookups).
+    a.keep = Duration::ZERO;
+    a.apply(&mut view("running"));
+    assert_eq!((a.paths.len(), a.blurbs.len()), (1, 1));
+    // Unused past `keep`: gone.
+    a.apply(&mut view("idle"));
+    assert_eq!((a.paths.len(), a.blurbs.len()), (0, 0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A file whose name is a hash is named by where it lives instead.
 #[test]
 fn hashed_file_names_say_what_they_are() {

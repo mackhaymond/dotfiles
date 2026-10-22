@@ -32,16 +32,16 @@ set -u
 mode=$1
 if [ "$mode" = closed-tabs ]; then
     eval "$(awk '/^build_cmd\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$SCRIPTS/executable_closed-tabs.sh")"
-    build_cmd codex s-1 "${CLI_ARGS---no-daemon -c k=v}" "" "{}"
+    build_cmd "${TOOL:-codex}" s-1 "${CLI_ARGS---no-daemon -c k=v}" "${MODEL-}" "{}"
 else
     source "$LIB_DETECT"
     log() { echo "log: $*" >&2; }
     src="$SCRIPTS/executable_assistant-restore.sh"
     eval "$(awk "/^read -r -d '' JQ_PROG <<'JQ'\$/{f=1} f{print} f&&/^JQ\$/{exit}" "$src")"
     eval "$(grep -E '^(\[ -x "\$HOME/.local/bin/codex" \] && )?codex_cmd=' "$src")"
-    capture_json='[]'
+    capture_json="${CAPTURE_JSON:-[]}"
     eval "$(grep -E '^rows=' "$src")"
-    printf '%s\n' "$rows" | awk -F '\037' '{print $5}'
+    printf '%s\n' "$rows" | awk -F '\037' -v f="${FIELD:-5}" '{print $f}'
 fi
 '''
 
@@ -71,11 +71,11 @@ class CodexLauncherTests(unittest.TestCase):
                     'RESURRECT_SAVE': str(LIB_DETECT.with_name('save-assistant-sessions.sh'))}
         self.saved('--no-daemon -c k=v')
 
-    def saved(self, cli_args, tool='codex'):
+    def saved(self, cli_args, tool='codex', model=''):
         """The cli_args both scripts read: the sidecar row and build_cmd's argument."""
         self.sidecar.write_text(json.dumps({'sessions': [
-            {'pane': 's:1.1', 'tool': tool, 'session_id': 's-1', 'cli_args': cli_args}]}))
-        self.env['CLI_ARGS'] = cli_args
+            {'pane': 's:1.1', 'tool': tool, 'session_id': 's-1', 'cli_args': cli_args, 'model': model}]}))
+        self.env.update(CLI_ARGS=cli_args, TOOL=tool, MODEL=model)
 
     @staticmethod
     def write(path, text):
@@ -150,6 +150,49 @@ class CodexLauncherTests(unittest.TestCase):
         # Only Codex rows are filtered (the closed-tabs harness builds Codex only).
         self.saved('-c model_context_window=1', tool='opencode')
         self.assertIn("command opencode '-c' 'model_context_window=1' -s", self.command('assistant-restore'))
+
+    def test_claude_resume_drops_the_launch_prompt(self):
+        # ps space-joins argv, so `claude "update the README please"` was saved
+        # as cli_args words and replayed as positionals (here a subcommand)
+        # before --resume. Only the leading options survive; a value flag
+        # keeps its operand even when it looks like a word.
+        cases = (
+            ('--model claude-opus-5-5[1m] update the README please',
+             "command claude '--model' 'claude-opus-5-5[1m]' --resume 's-1'", ''),
+            ('fix the login bug', "command claude --model 'opus' --resume 's-1'", 'opus'),
+            ('--dangerously-skip-permissions --permission-mode plan --add-dir /x -- --model y',
+             "command claude '--dangerously-skip-permissions' '--permission-mode' 'plan' '--add-dir' '/x'"
+             " --model 'opus' --resume 's-1'", 'opus'),
+            ('--model=sonnet doctor', "command claude '--model=sonnet' --resume 's-1'", 'opus'),
+            ('--verbose', "command claude '--verbose' --resume 's-1'", ''),
+        )
+        for script in ('closed-tabs', 'assistant-restore'):
+            for cli_args, expected, model in cases:
+                with self.subTest(script=script, cli_args=cli_args):
+                    self.saved(cli_args, tool='claude', model=model)
+                    self.assertEqual(self.command(script), expected)
+
+    @unittest.skipUnless(shutil.which('nu'), 'needs nu')
+    def test_nu_panes_get_a_line_nu_can_run(self):
+        # nu cannot parse the POSIX line (`2>/dev/null`, `command`, VAR=x), so
+        # field 6 carries a nu one: cd into the saved cwd, env via with-env.
+        cwd = self.home.parent / "a b'c"
+        cwd.mkdir()
+        self.write(self.wrapper, '#!/bin/sh\nprintf "<%s>" "$PWD" "$FOO" "$@"; echo\n')
+        rows = [{'pane': 's:1.1', 'tool': 'codex', 'session_id': 's-1', 'cwd': str(cwd),
+                 'cli_args': "--no-daemon -c model_context_window=1 -c k='v'", 'env': {'FOO': "x 'y'"}}]
+        self.sidecar.write_text(json.dumps({'sessions': rows}))
+        self.env.update(FIELD='6', CAPTURE_JSON='["FOO"]')
+        line = self.command('assistant-restore')
+        result = subprocess.run([shutil.which('nu'), '-n', '-c', line], env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"<{cwd}><x 'y'><--no-daemon><-c><k='v'><resume><s-1>")
+        # A value nu's raw string cannot hold leaves the field empty (skipped).
+        rows[0]['session_id'] = "s'###"
+        self.sidecar.write_text(json.dumps({'sessions': rows}))
+        out = subprocess.run([BASH, str(self.harness), 'assistant-restore'], env=self.env,
+                             capture_output=True, text=True, timeout=20)
+        self.assertEqual(out.stdout.strip(), '')
 
     def test_resume_falls_back_to_path_lookup_without_the_wrapper(self):
         self.wrapper.unlink()

@@ -186,6 +186,13 @@ pub struct Target {
     /// no space yet, so [`crate::actions::Actions::park`] refuses it and
     /// Space s is not offered. Closing it stays.
     pub pending: bool,
+    /// A space's HOME window ([`Agent::home`]) running an agent: never
+    /// parked ([`crate::actions::Actions::park`] refuses it), and with no
+    /// split ([`Target::panes`] 1) its agent IS the home shell pane, which
+    /// is never closed either.
+    pub home: bool,
+    /// The window's panes, its dashboard not counted ([`Agent::panes`]).
+    pub panes: u32,
 }
 
 impl Target {
@@ -200,6 +207,8 @@ impl Target {
             pinned: a.pinned.is_some(),
             perm: crate::answer::answerable(a).then(|| crate::answer::prompt_key(a)),
             pending: a.pending.is_some() || a.session == PENDING,
+            home: a.home,
+            panes: a.panes,
         }
     }
 

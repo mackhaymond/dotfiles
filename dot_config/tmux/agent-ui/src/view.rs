@@ -45,8 +45,22 @@ use std::collections::HashMap;
 /// epoch at most 600 s old, its turn not resumed yet; going to answer a
 /// needs-input agent must not free its number). Other idle agents (a lapsed
 /// or junk stamp among them), plain shells and stateless windows hold none.
+///
+/// Read off the RAW @agent_state, as the watcher's `slot_active` does
+/// (2026-10-22): `done` or answered `idle` with @agent_paused set folds to
+/// `paused`, and between the pause key setting the flag and a hook writing
+/// `paused` the watcher kept that window's stamp while this freed it, so a
+/// newcomer was shown that number and then jumped to its real stamp. A
+/// state set after parsing (tests) no longer folds from the raw one: then
+/// it is the state.
 pub fn holds_slot(w: &Window, now: f64) -> bool {
-    model::in_flight(w) || model::is_attn(w) || w.answered(now)
+    let st = if model::paused_state(&w.raw_state, &w.paused) == w.state { &w.raw_state } else { &w.state };
+    let active = match st.as_str() {
+        "running" | "failed" | "needs-input" | "done" => true,
+        "idle" => w.pending_fresh(now),
+        _ => false,
+    };
+    active || !w.workflow.is_empty() || !w.cua.is_empty()
 }
 
 /// The provisional numbers this process has shown, by window id: an
@@ -104,7 +118,15 @@ pub(crate) fn id_num(id: &str) -> u64 {
 /// active fills the lowest one. With an empty memo this is the watcher's
 /// assignment exactly. `now` (epoch seconds) dates answered prompts
 /// ([`holds_slot`]).
+///
+/// No windows at all leaves `memo` alone: a live server always has one, so
+/// that is a failed or timed-out snapshot (2026-10-22), and forgetting the
+/// provisional numbers then would renumber unstamped agents on the next
+/// good one.
 pub fn assign_slots(windows: &[Window], now: f64, memo: &mut SlotMemo) -> HashMap<String, u32> {
+    if windows.is_empty() {
+        return HashMap::new();
+    }
     /// A window's link: (session, window index), ordered as a tuple: the
     /// session name by bytes (`str`'s `Ord`), then the index.
     type Link<'a> = (&'a str, u32);
@@ -482,9 +504,14 @@ pub fn shell_label(w: &Window) -> String {
     let dash_active = w.pane_list.iter().any(|p| p.dash && p.active);
     if dash_active || matches!(name.trim_start_matches('-'), "zsh" | "bash" | "sh" | "fish") {
         let home = std::env::var("HOME").unwrap_or_default();
+        // Unknown (no path) shows the name; `/` trims to "" but is a real
+        // cwd, labelled `/` as `#{b:pane_current_path}` does (2026-10-22).
+        if w.path.is_empty() {
+            return text::sanitize(name);
+        }
         let path = w.path.trim_end_matches('/');
         if path.is_empty() {
-            return text::sanitize(name);
+            return "/".into();
         }
         if !home.is_empty() && path == home.trim_end_matches('/') {
             return "~".into();
@@ -1030,8 +1057,12 @@ impl Core {
 
     /// One tmux call, then the view for `client`. Never blocks on git
     /// status; a branch read may take up to BRANCH_WAIT on a cache miss.
+    /// A failed tmux call keeps the last snapshot ([`Tmux::try_snapshot`]),
+    /// so one busy tick neither blanks the view nor forgets its slots.
     pub fn refresh(&mut self, client: Option<&str>) -> ViewModel {
-        self.snapshot = self.tmux.snapshot();
+        if let Some(s) = self.tmux.try_snapshot() {
+            self.snapshot = s;
+        }
         self.rebuild(client)
     }
 
@@ -1218,6 +1249,16 @@ mod tests {
         assert_eq!(v.parked[0].state_words, "waiting on you");
     }
 
+    /// A shell at the filesystem root is `/` (as `#{b:pane_current_path}`),
+    /// a shell with no path its name.
+    #[test]
+    fn shell_label_at_the_root() {
+        let w = |path: &str| Window::parse(&row("main", 2, "@2", &[("name", "zsh"), ("path", path)])).unwrap();
+        assert_eq!(shell_label(&w("/")), "/");
+        assert_eq!(shell_label(&w("")), "zsh");
+        assert_eq!(shell_label(&w("/x/proj/")), "proj");
+    }
+
     #[test]
     fn colours_and_json() {
         let v = build(Some("/dev/ttys999"));
@@ -1360,6 +1401,10 @@ mod tests {
         rows.push(run("main", 2, "@7", ""));
         assert_eq!(slots_with(&rows, &mut memo), ids(&[("@1", 1), ("@5", 2), ("@6", 3), ("@7", 4)]));
         assert_eq!(memo_of(&memo), ids(&[("@5", 2), ("@6", 3), ("@7", 4)]));
+        // A failed snapshot (no windows at all) forgets nothing: the next
+        // good frame shows the same numbers.
+        assert_eq!(slots_with(&[], &mut memo), vec![]);
+        assert_eq!(memo_of(&memo), ids(&[("@5", 2), ("@6", 3), ("@7", 4)]));
         // Frame 4: the watcher stamps. @5 and @6 as shown; @7 differently
         // (a race): the stamp is adopted, and stamped windows leave the memo.
         rows = vec![run("main", 1, "@1", "1"), run("work", 5, "@5", "2"), run("aa", 1, "@6", "3"),
@@ -1412,6 +1457,25 @@ mod tests {
             let r = [row("main", 1, "@1", &[("state", "running")]), row("aa", 1, "@9", &[("state", st.0), ("pending", st.1)])];
             assert_eq!(slots_with(&r, &mut memo), ids(&[("@1", 2), ("@9", 1)]), "{st:?}");
         }
+    }
+
+    /// The pause flag set but the state not yet rewritten: `done` and
+    /// answered `idle` read `paused` yet keep their stamps, as the watcher's
+    /// slot_active (raw state) does, so a newcomer never borrows one. A hook's
+    /// real `paused` lets it go.
+    #[test]
+    fn slots_follow_the_raw_state_under_a_pause_flag() {
+        let rows = [
+            row("main", 1, "@1", &[("state", "done"), ("paused", "5"), ("slot", "1")]),
+            row("main", 2, "@2", &[("state", "idle"), ("pending", "1700000000"), ("paused", "5"), ("slot", "2")]),
+            row("main", 3, "@3", &[("state", "idle"), ("paused", "5"), ("slot", "3")]), // no answer: free
+            row("main", 4, "@4", &[("state", "paused"), ("paused", "5"), ("slot", "4")]), // the hook wrote it: free
+            row("main", 5, "@5", &[("state", "running")]),
+        ];
+        let s = Snapshot::parse(&rows.join("\n"));
+        assert_eq!(s.windows.iter().map(|w| w.state.as_str()).collect::<Vec<_>>(),
+            ["paused", "paused", "paused", "paused", "running"]);
+        assert_eq!(slots_of(&rows), ids(&[("@1", 1), ("@2", 2), ("@5", 3)]));
     }
 
     /// The pending stamp ages out: at 600 s the answered agent still holds

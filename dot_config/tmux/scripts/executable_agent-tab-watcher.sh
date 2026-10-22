@@ -858,6 +858,33 @@ viewed_now() {
     [ "$wez_front" = yes ]
 }
 
+# CONDITIONAL WRITES (2026-10-22). Every state this loop writes is decided
+# from the tick's ONE READ, and that read can be seconds old when the write
+# lands: refresh_cua_pids, the windows before this one, this window's own
+# viewed_now forks. A hook that moved the window in between was overwritten
+# with no trace - Mack Cmd-Tabs back to a `done` tab as a prompt (typed, a
+# message_agent, a task wake-up) sets `running`, and the seen-it discharge
+# wrote idle over it with no @agent_pending, which the heartbeat never
+# re-arms: the whole turn read idle, no pulse, its slot released. So each
+# write is guarded IN tmux by the value it was decided from (if-shell -F runs
+# no shell), and the same call reads the window back. The paused turn end is
+# guarded on its state like the rest; its resume-flag re-check is a second
+# if-shell INSIDE that guarded list, not a guard of its own.
+# cas_write WIN COND CMDS: CMDS (a tmux command string, parsed by tmux: window
+# ids, epochs and fixed words only - never user text, which goes through
+# set-option -F copies) runs only while the format COND is true. Sets state,
+# pending, since and W_PRIOR[WIN] to what the window holds AFTER the call,
+# whichever writer won. Returns 1 only when tmux failed (nothing is known).
+cas_write() {
+    local out p
+    out=$(tmux if-shell -F -t "$1" "$2" "$3" \; \
+          display-message -p -t "$1" "x${US}#{@agent_state}${US}#{@agent_pending}${US}#{@agent_since}${US}#{@agent_prior_state}" 2>/dev/null) || return 1
+    case "$out" in "x$US"*) ;; *) return 1 ;; esac
+    IFS="$US" read -r _ state pending since p <<<"$out" || true
+    W_PRIOR[$1]="$p"
+    return 0
+}
+
 # Consecutive agent-LESS ticks per window, same " @win=N " shape, for the GC
 # below. A window is only garbage-collected after GC_TICKS ticks in a row
 # without an agent pane. One tick is not enough: tmux-thumbs (prefix+Space)
@@ -944,9 +971,14 @@ ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_pri
 # right, and writing idle over it would undo that).
 # The write also sets @agent_quiet "<from>", the one-shot mark that makes
 # the next tick's event-log line read "↩ replied to @from" (see log_event).
+#   The write is a cas_write (CONDITIONAL WRITES): it lands only while the
+# window still holds the tick's state STATE and a prior. The detail is
+# user text, so it is copied tmux-side (set-option -F), never spliced into
+# the command string; it goes before the unsets it reads from. Whatever
+# the window holds after the call - written here, or by the hook that won -
+# comes back in r_state/r_since (and the caller's state/pending/since).
 prior_restore() {
-    local win="$1" wac="$2" out x ps psince pdk pdt origin ofrom seen=0
-    local -a cmd=()
+    local win="$1" wac="$2" was="${3//[^a-z-]/}" out x ps psince pdk pdt origin ofrom seen=0 c
     out=$(tmux display-message -p -t "$win" "x${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_origin}${US}#{@agent_prior_detail}" 2>/dev/null || true)
     ps=""; psince=""; pdk=""; pdt=""; origin=""
     case "$out" in "x$US"*) IFS="$US" read -r x ps psince pdk origin pdt <<<"$out" || true ;; esac
@@ -959,25 +991,22 @@ prior_restore() {
     if [[ $psince =~ ^[0-9]{1,18}\ (.+)$ ]] && [ "${BASH_REMATCH[1]}" = "$ps" ]; then
         r_since="$psince"
     fi
-    cmd=(set-option -w -t "$win" @agent_state "$ps" \;
-         set-option -w -t "$win" @agent_since "$r_since" \;
-         set-option -uw -t "$win" @agent_pending \;
-         set-option -uw -t "$win" @agent_prior_state \;
-         set-option -uw -t "$win" @agent_prior_since \;
-         set-option -uw -t "$win" @agent_prior_detail_kind \;
-         set-option -uw -t "$win" @agent_prior_detail \;
-         set-option -uw -t "$win" @agent_bg_owner)
     if [ -n "$pdk" ]; then
-        cmd+=(\; set-option -w -t "$win" @agent_detail_kind "$pdk" \;
-              set-option -w -t "$win" @agent_detail "$pdt")
+        c="set-option -w -t $win -F @agent_detail_kind '#{@agent_prior_detail_kind}' ; set-option -w -t $win -F @agent_detail '#{@agent_prior_detail}'"
     else
-        cmd+=(\; set-option -uw -t "$win" @agent_detail_kind \;
-              set-option -uw -t "$win" @agent_detail)
+        c="set-option -uw -t $win @agent_detail_kind ; set-option -uw -t $win @agent_detail"
     fi
-    [ "$seen" = 1 ] && cmd+=(\; set-option -w -t "$win" @agent_seen_at "$tick_now")
-    cmd+=(\; set-option -w -t "$win" @agent_quiet "${ofrom:--}")
-    r_state="$ps"
-    tmux "${cmd[@]}" 2>/dev/null
+    c+=" ; set-option -w -t $win @agent_state $ps ; set-option -w -t $win @agent_since '$r_since'"
+    c+=" ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_prior_state"
+    c+=" ; set-option -uw -t $win @agent_prior_since ; set-option -uw -t $win @agent_prior_detail_kind"
+    c+=" ; set-option -uw -t $win @agent_prior_detail ; set-option -uw -t $win @agent_bg_owner"
+    [ "$seen" = 1 ] && c+=" ; set-option -w -t $win @agent_seen_at $tick_now"
+    c+=" ; set-option -w -t $win @agent_quiet ${ofrom:--}"
+    cas_write "$win" "#{&&:#{==:#{@agent_state},$was},#{!=:#{@agent_prior_state},}}" "$c" || return 1
+    # Still a prior: the guard was false (a hook moved the state), nothing
+    # written. Gone: restored - here, or by the indicator's quiet Stop.
+    [ -z "${W_PRIOR[$win]:-}" ] || return 1
+    r_state="$state"; r_since="$since"
 }
 
 # AGENT SLOTS (see the header). In the tick, the fold fills S_SLOT/S_VIS
@@ -1669,6 +1698,8 @@ EOF
         # read bare idle and hand that number to someone else. Every discharge
         # also stamps @agent_seen_at in that call (CuaNotch's ack, see
         # seen_op in agent-tab-indicator.sh's set_state).
+        # Each discharge is a cas_write (CONDITIONAL WRITES): it lands only
+        # while the window still holds the state the tick read.
         pending="${W_PEND[$win]:-}"
         case "$state" in
             done|needs-input)
@@ -1676,16 +1707,14 @@ EOF
                     if [ "$state" = needs-input ]; then
                         # @agent_ask_from (the indicator's ASKER GATE) goes
                         # with the needs-input it described, as in set_state.
-                        pending=$tick_now
-                        tmux set-option -w -t "$win" @agent_state idle \; \
-                             set-option -w -t "$win" @agent_pending "$pending" \; \
-                             set-option -w -t "$win" @agent_seen_at "$tick_now" \; \
-                             set-option -uw -t "$win" @agent_ask_from 2>/dev/null && { changed=1; state_moved=1; }
+                        cas_write "$win" "#{==:#{@agent_state},needs-input}" \
+                            "set-option -w -t $win @agent_state idle ; set-option -w -t $win @agent_pending $tick_now ; set-option -w -t $win @agent_seen_at $tick_now ; set-option -uw -t $win @agent_ask_from" \
+                            && [ "$state" = idle ] && { changed=1; state_moved=1; }
                     else
-                        tmux set-option -w -t "$win" @agent_state idle \; \
-                             set-option -w -t "$win" @agent_seen_at "$tick_now" 2>/dev/null && { changed=1; state_moved=1; }
+                        cas_write "$win" "#{==:#{@agent_state},done}" \
+                            "set-option -w -t $win @agent_state idle ; set-option -w -t $win @agent_seen_at $tick_now" \
+                            && [ "$state" = idle ] && { changed=1; state_moved=1; }
                     fi
-                    state=idle
                 fi ;;
         esac
         # ...and the attention state an agent-originated turn is holding for
@@ -1695,9 +1724,8 @@ EOF
         case "${W_PRIOR[$win]:-}" in
             done|needs-input)
                 if viewed_now "$wac"; then
-                    tmux set-option -w -t "$win" @agent_prior_state idle \; \
-                         set-option -w -t "$win" @agent_seen_at "$tick_now" 2>/dev/null
-                    W_PRIOR[$win]=idle
+                    cas_write "$win" "#{==:#{@agent_prior_state},${W_PRIOR[$win]}}" \
+                        "set-option -w -t $win @agent_prior_state idle ; set-option -w -t $win @agent_seen_at $tick_now" || true
                 fi ;;
         esac
         has_agent=0; [ -n "$pid" ] && has_agent=1
@@ -1884,22 +1912,20 @@ EOF
                     # start; agent-pause.py may have cleared it for a resume
                     # since (flag off + paused -> idle, in one call), so the
                     # SAME command list re-checks it and lands on idle if it
-                    # is gone - what that resume would have made of it.
-                    if tmux set-option -w -t "$win" @agent_state paused \; \
-                            set-option -w -t "$win" @agent_since "$tick_now paused" \; \
-                            set-option -uw -t "$win" @agent_pending \; \
-                            set-option -uw -t "$win" @agent_bg_owner \; \
-                            if-shell -F -t "$win" '#{?#{@agent_paused},0,1}' \
-                                "set-option -w -t $win @agent_state idle" 2>/dev/null; then
-                        changed=1; state_moved=1; since="$tick_now paused"; pending=""; fin=paused
-                    else
-                        fin="$state"
-                    fi
+                    # is gone - what that resume would have made of it. And
+                    # the whole list lands only over the state this was
+                    # decided from (CONDITIONAL WRITES, 2026-10-22): a gate
+                    # that just landed keeps its yellow, since and pending.
+                    cas_was="$state"
+                    cas_write "$win" "#{==:#{@agent_state},$cas_was}" \
+                        "set-option -w -t $win @agent_state paused ; set-option -w -t $win @agent_since '$tick_now paused' ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_bg_owner ; if-shell -F -t $win '#{?#{@agent_paused},0,1}' 'set-option -w -t $win @agent_state idle'" \
+                        && [ "$state" != "$cas_was" ] && { changed=1; state_moved=1; }
+                    fin="$state"
                 elif [ -n "${W_PRIOR[$win]:-}" ]; then
                     # An agent-originated turn ended here (its work drained, Esc,
                     # a missed Stop, a codex turn end): restore, never tint.
-                    if prior_restore "$win" "$wac"; then
-                        changed=1; state_moved=1; since="$r_since"; pending=""; fin="$r_state"
+                    if prior_restore "$win" "$wac" "$state"; then
+                        changed=1; state_moved=1; since="$r_since"; fin="$r_state"
                         W_PRIOR[$win]=""
                     else
                         fin="$state"   # nothing written: the window is as read
@@ -1909,24 +1935,28 @@ EOF
                     # looking at is not tinted.
                     cx_seen=0
                     [ "$fin" = done ] && viewed_now "$wac" && { fin=idle; cx_seen=1; }
-                    cx_cmd=(set-option -w -t "$win" @agent_state "$fin" \;
-                            set-option -w -t "$win" @agent_since "$tick_now $fin" \;
-                            set-option -uw -t "$win" @agent_pending \;)
-                    [ "$cx_seen" = 1 ] && cx_cmd+=(set-option -w -t "$win" @agent_seen_at "$tick_now" \;)
+                    cx_cmd="set-option -w -t $win @agent_state $fin ; set-option -w -t $win @agent_since '$tick_now $fin' ; set-option -uw -t $win @agent_pending"
+                    [ "$cx_seen" = 1 ] && cx_cmd+=" ; set-option -w -t $win @agent_seen_at $tick_now"
                     if [ "$cx_mark" = complete ]; then
-                        cx_cmd+=(set-option -w -t "$win" @agent_detail_kind done \;
-                                 set-option -w -t "$win" @agent_detail "turn finished")
+                        cx_cmd+=" ; set-option -w -t $win @agent_detail_kind done ; set-option -w -t $win @agent_detail 'turn finished'"
                     else
-                        cx_cmd+=(set-option -uw -t "$win" @agent_detail_kind \;
-                                 set-option -uw -t "$win" @agent_detail)
+                        cx_cmd+=" ; set-option -uw -t $win @agent_detail_kind ; set-option -uw -t $win @agent_detail"
                     fi
-                    tmux "${cx_cmd[@]}" 2>/dev/null && { changed=1; state_moved=1; since="$tick_now $fin"; pending=""; }
+                    # CONDITIONAL WRITES: only over the state this was decided from.
+                    cas_was="$state"
+                    cas_write "$win" "#{==:#{@agent_state},$cas_was}" "$cx_cmd" \
+                        && [ "$state" != "$cas_was" ] && { changed=1; state_moved=1; }
+                    fin="$state"
                 else
                     # The bg-pending release lands here (and in prior_restore):
                     # no background work is out any more, so nobody owns any
-                    # (@agent_bg_owner, AGENT-ORIGINATED TURNS). Same call.
-                    tmux set-option -w -t "$win" @agent_state idle \; \
-                         set-option -uw -t "$win" @agent_bg_owner 2>/dev/null && { changed=1; state_moved=1; }
+                    # (@agent_bg_owner, AGENT-ORIGINATED TURNS). Same call,
+                    # and only over the `running` it was decided from
+                    # (CONDITIONAL WRITES) - never over a gate that just landed.
+                    cas_write "$win" "#{==:#{@agent_state},running}" \
+                        "set-option -w -t $win @agent_state idle ; set-option -uw -t $win @agent_bg_owner" \
+                        && [ "$state" = idle ] && { changed=1; state_moved=1; }
+                    fin="$state"
                 fi
                 state=$fin
             else
@@ -1935,8 +1965,10 @@ EOF
         fi
 
         if [ "$has_agent" = 1 ] && [ -z "$state" ]; then
-            tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && { changed=1; state_moved=1; }
-            state=idle
+            # The seed never lands over a first hook's state (CONDITIONAL
+            # WRITES); state is whatever the window holds after it.
+            cas_write "$win" "#{==:#{@agent_state},}" "set-option -w -t $win @agent_state idle" \
+                && [ "$state" = idle ] && { changed=1; state_moved=1; }
         elif [ "$has_agent" = 0 ] && [ "$birth_hold" = 0 ] \
              && { [ -n "$state" ] || [ "$has_summary" = 1 ] \
                   || [ "$wf$cua" != 00 ] || [ -n "$born" ]; }; then
@@ -1957,6 +1989,10 @@ EOF
                 tmux set-option -uw -t "$win" @agent_state 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_summary 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null
+                # The condenser's paint() matches its key against this one, as
+                # clear_state's unset makes it: left set, a worker still
+                # running for the dead agent painted its title on the shell.
+                tmux set-option -uw -t "$win" @agent_summary_key 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_pending 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_rollout 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null
@@ -2032,13 +2068,37 @@ EOF
         # an approval answered with No/Esc fires no resume hook, so nothing
         # else would ever clear it. Past that (or junk) it is unset here,
         # once - it must not linger for the heartbeat's own 3600 s gate, which
-        # it now never reaches. (Not atomic with a hook: a fresh stamp written
-        # in the ms between our read and this unset would be lost - that
-        # needs an old stale stamp AND a newly answered prompt inside one
-        # tick, and costs that turn its running re-arm, nothing more.)
+        # it now never reaches. (A junk stamp's unset is not atomic with a
+        # hook; an epoch's is, below.)
+        #   A TURN STILL GOING (2026-10-22). The stamp also outlives a YES:
+        # the approved tool - a 12-minute build - fires its PostToolUse only
+        # when it finishes, so the heartbeat that would re-arm finds bare idle
+        # and the rest of the turn read idle (no pulse, slot released) until
+        # its Stop. So an expiring stamp whose agent's own record says busy
+        # (Claude's session file, the OpenCode plugin's status; codex has no
+        # such record) becomes `running` instead, the way the heartbeat would
+        # have made it; a turn that is over idles it again through the stuck-
+        # running reconcile above. Both writes are conditional on the window
+        # still holding this idle and this stamp (CONDITIONAL WRITES).
         if [ "$state" = idle ] && [ -n "$pending" ] && ! slot_pending_fresh "$pending"; then
-            tmux set-option -uw -t "$win" @agent_pending 2>/dev/null
-            pending=""
+            st=""
+            if [ "$has_agent" = 1 ] && [ -n "$pid" ]; then
+                case "${PID_KIND[$pid]:-}" in
+                    opencode) opencode_status "$pid" ;;
+                    codex) ;;
+                    *) session_status "$pid" ;;
+                esac
+            fi
+            if [[ $pending =~ ^[0-9]{1,18}$ ]]; then
+                cas_c="set-option -uw -t $win @agent_pending"
+                [ "$st" = busy ] \
+                    && cas_c+=" ; set-option -w -t $win @agent_state running ; set-option -w -t $win @agent_since '$tick_now running'"
+                cas_write "$win" "#{&&:#{==:#{@agent_state},idle},#{==:#{@agent_pending},$pending}}" "$cas_c" \
+                    && [ "$state" = running ] && { changed=1; state_moved=1; blink_active=1; }
+            else
+                tmux set-option -uw -t "$win" @agent_pending 2>/dev/null
+                pending=""
+            fi
         fi
         # Slot eligibility (slot_active), from the window as this tick
         # LEAVES it: state, pending, and wf/cua - exactly what the flags now

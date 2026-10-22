@@ -186,6 +186,9 @@ pub enum Act {
 /// is not parked (it is in no space yet: the park would only refuse). `d`
 /// shows its diff (a parked one's too). The preview strip is `v` ("view").
 /// A row a permission prompt waits on offers `y` allow and `n` deny first.
+/// A space's home ([`Target::home`]) is never parked, and with no split
+/// never closed (its agent is the home shell pane; prefix Q closes the
+/// space), so neither is offered then (2026-10-22).
 pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
     let mut v = Vec::new();
     if t.perm.is_some() && !t.parked() {
@@ -194,11 +197,13 @@ pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
     }
     if !t.parked() {
         v.push(('p', Act::Pin, if t.pinned { "unpin" } else { "pin" }));
-        if !t.pending {
+        if !t.pending && !t.home {
             v.push(('s', Act::Park, "park"));
         }
     }
-    v.push(('x', Act::Close, if t.parked() { "discard" } else { "close" }));
+    if t.parked() || !(t.home && t.panes <= 1) {
+        v.push(('x', Act::Close, if t.parked() { "discard" } else { "close" }));
+    }
     v.push(('d', Act::Diff, "diff"));
     v.push(('v', Act::Peek, "preview"));
     v.push(('r', Act::Restart, "restart watcher"));
@@ -585,10 +590,9 @@ impl Menu {
         }
     }
 
-    /// The selection, if a key may act on it: a row the user can see and
-    /// last saw selected. Else refuse (the row went away under the key) or
-    /// scroll it back into view, and None.
-    fn checked_selection(&mut self) -> Option<Target> {
+    /// The selection, unless the row last seen selected went away under the
+    /// key: then refuse, and None.
+    fn moved_selection(&mut self) -> Option<Target> {
         let t = self.selected_target()?;
         let gone = self.drawn_sel.as_ref().is_some_and(|d| !self.rows.iter().any(|r| r.key().as_ref() == Some(&d.key)));
         if gone {
@@ -596,6 +600,14 @@ impl Menu {
             self.follow = true;
             return None;
         }
+        Some(t)
+    }
+
+    /// The selection, if a key may act on it: a row the user can see and
+    /// last saw selected. Else refuse (the row went away under the key) or
+    /// scroll it back into view, and None.
+    fn checked_selection(&mut self) -> Option<Target> {
+        let t = self.moved_selection()?;
         if !self.on_screen(&t.key) {
             self.follow = true;
             return None;
@@ -604,12 +616,13 @@ impl Menu {
     }
 
     /// ⏎: go to the selected row; the fold row opens the Parked filter.
-    fn enter(&mut self, fx: &mut dyn Effects, checked: bool) -> bool {
+    /// `seen`: the row must also be in the frame on screen (the list's ⏎).
+    fn enter(&mut self, fx: &mut dyn Effects, seen: bool) -> bool {
         if self.sel == Some(RowKey::Fold) {
             self.set_tab(Tab::Parked);
             return false;
         }
-        let t = if checked { self.checked_selection() } else { self.selected_target() };
+        let t = if seen { self.checked_selection() } else { self.moved_selection() };
         match t {
             Some(t) => self.go(&t, fx),
             None => false,
@@ -624,6 +637,10 @@ impl Menu {
                 self.query.clear();
             }
             Key::CtrlC => return true,
+            // Refused as in the list when a refresh moved the selection away
+            // from what was drawn (2026-10-22): every edit below re-takes it
+            // (chose). Not the on-screen half: a typed-ahead `/query⏎` lands
+            // on a match no frame has drawn yet, and goes to it.
             Key::Enter => return self.enter(fx, false),
             Key::Backspace if self.query.is_empty() => self.searching = false,
             Key::Backspace => {
@@ -951,6 +968,17 @@ pub(crate) mod tests {
         m.set_data(data_of(&snap));
         assert!(m.handle(&[Up, Enter], &mut fx));
         assert_eq!(fx.calls, ["go @4 main"]);
+        // The same in the search: ⏎ typed against the frame that showed @6
+        // is refused once a refresh moved the selection to @7.
+        let mut fx = Rec::default();
+        let mut m = menu();
+        m.handle(&keys("/"), &mut fx);
+        assert!(m.searching && m.sel == Some(ak("work", "@6")));
+        m.set_data(data_of(&snap));
+        assert_eq!(m.sel, Some(ak("work", "@7")));
+        assert!(!m.handle(&[Enter], &mut fx));
+        assert_eq!(m.msg, "that tab moved · pick it again");
+        assert!(fx.calls.is_empty());
     }
 
     /// A letter goes at once, to the window holding it in the frame on screen.
@@ -1043,6 +1071,15 @@ pub(crate) mod tests {
         assert_eq!(m.sel, Some(ak("main", "@1")));
         // ⏎ goes to the selected match.
         assert!(m.act(Enter, &mut fx));
+        assert_eq!(fx.calls, ["go @1 main"]);
+        // Even typed ahead in one read against a frame that never drew the
+        // match (scrolled to @6): the search's ⏎ needs no on-screen row.
+        let mut fx = Rec::default();
+        let mut m = menu();
+        m.drawn.rows.retain(|t| t.key == ak("work", "@6"));
+        let mut typed = keys("/kua");
+        typed.push(Enter);
+        assert!(m.handle(&typed, &mut fx), "{:?}", m.msg);
         assert_eq!(fx.calls, ["go @1 main"]);
         // Esc leaves and clears; a second Esc closes.
         let mut m = menu();
@@ -1181,6 +1218,23 @@ pub(crate) mod tests {
             // Any other agent row still offers it.
             let other = menu_of(data_of(&snap)).selected_target().unwrap();
             assert!(!other.pending && strip(&other).iter().any(|(k, _, _)| *k == 's'), "{spaces}: {other:?}");
+        }
+    }
+
+    /// A space's home running an agent is never offered s park, nor x close
+    /// while its agent is the home shell pane (no split); with a split, x
+    /// stays (Actions::close refuses only the home pane itself).
+    #[test]
+    fn a_home_is_not_offered_park_or_close() {
+        let keys_of = |t: &Target| strip(t).iter().map(|(k, _, _)| *k).collect::<String>();
+        for (panes, want) in [(1, "pdvr"), (2, "pxdvr")] {
+            let mut snap = fixture();
+            for w in snap.windows.iter_mut().filter(|w| w.id == "@6") {
+                (w.home, w.panes) = (true, panes); // work:1, failed
+            }
+            let t = data_of(&snap).first_row("@6").expect("its row");
+            assert!(t.home, "{t:?}");
+            assert_eq!(keys_of(&t), want, "{panes} panes");
         }
     }
 

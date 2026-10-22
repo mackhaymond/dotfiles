@@ -326,7 +326,7 @@ class AskerGateTests(sn.IndicatorNoticeTests):
         self.raw("heartbeat", post_tool_use("ffff6666"))
         self.assertEqual(self.state(), "running")
         self.raw("failed", payload("StopFailure", error="overloaded"))
-        self.raw("heartbeat", post_tool_use("ffff6666"))
+        self.raw("heartbeat", post_tool_use())
         self.assertEqual(self.state(), "running")
         # A seen prompt (idle + @agent_pending) re-arms on the next heartbeat,
         # whoever's: the pending path never reads the payload.
@@ -341,6 +341,17 @@ class AskerGateTests(sn.IndicatorNoticeTests):
         self.raw("done", payload("Stop", last_assistant_message="ok"))
         self.raw("heartbeat", post_tool_use())
         self.assertEqual(self.state(), "done")
+
+    def test_failed_is_rearmed_by_main_only(self):
+        # The main turn died (529) while a background subagent works on: its
+        # tool calls - PostToolUse, PostToolUseFailure - must not turn the red
+        # back into `running` (FAILED IS MAIN'S). Main's own does.
+        self.start_turn()
+        self.raw("failed", payload("StopFailure", error="overloaded"))
+        self.raw("heartbeat", post_tool_use("ffff6666"))
+        self.assertEqual(self.state(), "failed")
+        self.raw("heartbeat", post_tool_use())
+        self.assertEqual(self.state(), "running")
 
     def test_viewed_prompt_writes_no_asker(self):
         # Lands in front of Mack's eyes: discharged to idle + pending at once.

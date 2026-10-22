@@ -131,6 +131,38 @@ class SaveTests(ThrowawayServer):
         self.tmux("new-session", "-d", "-s", "agents", ";", "set", "-g", "@resurrect-exclude-sessions", "none")
         self.assertIn("pane\tagents\t", self.save())
 
+    def attach(self, session):
+        """A real client on `session` (a pty-backed `tmux attach`), detached at cleanup."""
+        primary, secondary = os.openpty()
+        env = {k: v for k, v in self.env.items() if k != "TMUX"}
+        proc = subprocess.Popen([TMUX, "-L", self.socket, "attach", "-t", session], env=env,
+                                stdin=secondary, stdout=secondary, stderr=secondary, start_new_session=True)
+        os.close(secondary)
+        def done():
+            proc.kill()
+            proc.wait()
+            os.close(primary)
+        self.addCleanup(done)
+        for _ in range(100):
+            if f"{session}\n" in self.tmux("list-clients", "-F", "#{client_session}"):
+                return
+            time.sleep(0.05)
+        self.fail(f"no client attached to {session}")
+
+    def test_state_line_never_names_a_hidden_or_excluded_session(self):
+        # A popup's nested client (btop-popup) used to be the one a bare
+        # display-message -p resolved to, and a restore then switched into it.
+        self.tmux("new-session", "-d", "-s", "work", ";", "new-session", "-d", "-s", "btop-popup", ";",
+                  "new-session", "-d", "-s", "agents", ";",
+                  "set", "-g", "@space_hidden_sessions", "agents btop-popup")
+        self.attach("agents")
+        state = self.save("").splitlines()[-1]
+        self.assertEqual(state, "state\t\t")  # only an excluded session's client: blank
+        self.attach("work")
+        time.sleep(1.1)  # client_activity has one-second resolution
+        self.attach("btop-popup")
+        self.assertEqual(self.save("").splitlines()[-1], "state\twork\t")
+
 
 @unittest.skipUnless((PLUGIN / "scripts/lib-detect.sh").exists(), "tmux-assistant-resurrect not installed")
 class RestoreHookTests(ThrowawayServer):
@@ -176,6 +208,16 @@ class RestoreHookTests(ThrowawayServer):
         self.assertIn("session 'agents' is excluded", log)
         self.assertIn("session 'gone' does not exist", log)
         self.assertIn("restored 2 of 5", log)
+
+    def test_blank_title_placeholder_is_undone_without_moving_the_active_pane(self):
+        # The save writes an empty title as ':' and restore.sh applies it as-is.
+        self.tmux("new-session", "-d", "-s", "work", ";", "split-window", "-t", "work:", ";",
+                  "select-pane", "-t", "work:0.0", "-T", ":", ";", "select-pane", "-t", "work:0.1", "-T", "keep:",
+                  ";", "select-pane", "-t", "main:0.0", "-T", ":", ";", "select-pane", "-t", "work:0.1")
+        # No sidecar: the cleanup runs before the hook's early exit.
+        subprocess.run(["bash", str(RESTORE_HOOK)], env=self.env, check=True, capture_output=True, timeout=60)
+        titles = self.tmux("list-panes", "-a", "-F", "#{session_name}:#{pane_index}=#{pane_title}=#{pane_active}")
+        self.assertEqual(sorted(titles.split()), ["main:0==1", "work:0==0", "work:1=keep:=1"])
 
     def test_exclusions_are_shell_patterns(self):
         # A matching session exists, so only the exclusion can stop the resume.

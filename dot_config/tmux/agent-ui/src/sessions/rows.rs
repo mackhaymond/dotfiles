@@ -4,7 +4,8 @@
 //!
 //! ## Rows
 //! `list-sessions` sorted `-k1,1nr` on `session_last_attached`, minus the
-//! client's current session and [`EXCLUDE`] (exact names, the script's awk).
+//! client's current session and hidden ones: `@space_hidden`, or a name in
+//! tmux.conf's `@space_hidden_sessions` ([`EXCLUDE`], exact names).
 //! `sort` has no `-s`, so equal stamps fall back to the whole line
 //! (`<stamp>\t<name>`) in the locale's collation, ascending; a session never
 //! attached prints an empty stamp, sorted as 0. Every session has a window,
@@ -24,8 +25,9 @@ use crate::collate::Collator;
 use crate::model;
 use crate::tmux::Snapshot;
 
-/// Sessions the picker never lists (the script's awk filter, exact names).
-pub const EXCLUDE: [&str; 4] = ["scratch", "agents", "tasks", "stash"];
+/// Sessions the picker never lists: tmux.conf's `@space_hidden_sessions`,
+/// which the script reads live (exact names).
+pub const EXCLUDE: [&str; 6] = ["agents", "tasks", "stash", "scratch", "btop-popup", "pending"];
 
 /// A session's agent rollup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -113,7 +115,11 @@ pub fn build(snap: &Snapshot, client: Option<&str>, coll: &Collator) -> Sessions
     let current = client.and_then(|c| snap.client(c)).map(|c| c.session.clone()).filter(|s| !s.is_empty());
     let mut rows: Vec<SessionRow> = Vec::new();
     let mut all: Vec<String> = Vec::new();
+    let mut hidden: Vec<&str> = Vec::new();
     for w in &snap.windows {
+        if w.space_hidden && !hidden.contains(&w.session.as_str()) {
+            hidden.push(&w.session);
+        }
         let pos = match all.iter().position(|s| *s == w.session) {
             Some(p) => p,
             None => {
@@ -129,7 +135,9 @@ pub fn build(snap: &Snapshot, client: Option<&str>, coll: &Collator) -> Sessions
             ru.add(r);
         }
     }
-    rows.retain(|r| Some(&r.name) != current.as_ref() && !EXCLUDE.contains(&r.name.as_str()));
+    rows.retain(|r| {
+        Some(&r.name) != current.as_ref() && !EXCLUDE.contains(&r.name.as_str()) && !hidden.contains(&r.name.as_str())
+    });
     // sort -t TAB -k1,1nr: stamps descending; ties by the whole line.
     let line = |r: &SessionRow| if r.last == 0 { format!("\t{}", r.name) } else { format!("{}\t{}", r.last, r.name) };
     rows.sort_by(|a, b| b.last.cmp(&a.last).then_with(|| coll.sort_cmp(&line(a), &line(b))));
@@ -401,14 +409,18 @@ pub(crate) mod tests {
         let snap = snap(&[
             ("zeta", "", &[]), ("Beta", "", &[]), ("alpha", "", &[]), ("one", "100", &[]), ("two", "100", &[]),
             ("three", "300", &[]), ("cur", "999", &[]), ("stash", "5", &[]), ("b", "", &[]),
+            ("pending", "700", &[]), ("btop-popup", "800", &[]),
         ], &[("/dev/x", "cur")]);
+        // tmux's side of the hidden column: @space_hidden, or a name in
+        // @space_hidden_sessions (tmux.conf's list, which EXCLUDE mirrors).
         let mut fake = String::new();
         let mut seen = Vec::new();
         for w in &snap.windows {
             if !seen.contains(&w.session) {
                 seen.push(w.session.clone());
                 let stamp = if w.last_attached == 0 { String::new() } else { w.last_attached.to_string() };
-                fake.push_str(&format!("{stamp}\t{}\n", w.session));
+                let hid = u8::from(w.space_hidden || EXCLUDE.contains(&w.session.as_str()));
+                fake.push_str(&format!("{stamp}\t{hid}\t{}\n", w.session));
             }
         }
         for loc in ["C", "en_US.UTF-8"] {

@@ -82,14 +82,66 @@ cleanup_tmp_files() {
 
 trap 'cleanup_tmp_files' EXIT INT TERM HUP
 
+# ONE `tmux show-options -g` per run, not one show-option per setting. Each
+# run read ~14 @codexbar_* options with a fork apiece (in nested $()), plus the
+# listing load_print_context takes anyway: a --tick with nothing due was 28
+# tmux calls and ~0.33s of CPU, every status-interval (2026-10-22 review). So
+# the listing is taken once, here, before the first option is read; its
+# @codexbar_* values become TMUXOPT_<name> variables, and load_print_context's
+# first call reuses the same listing. tmux quotes a listed value when it has to
+# ("two words", '' for empty) and backslash-escapes the rest (\$, \t, \"); a
+# value with any backslash is not decoded here but asked for directly, so the
+# value read is always exactly the one show-option -gqv would give.
+#   TMUX_OPTS_STATE 1: listed, 2: no tmux / no server (every option empty).
+TMUX_OPTS_LISTING=''
+TMUX_OPTS_STATE=2
+TMUX_OPTS_CONSUMED=0
+TMUX_OPT_ASK=$'\x1f'
+read_tmux_opts_listing() {
+  TMUX_OPTS_STATE=2 TMUX_OPTS_LISTING=''
+  command -v tmux >/dev/null 2>&1 || return 0
+  TMUX_OPTS_LISTING="$(tmux show-options -g 2>/dev/null)" || { TMUX_OPTS_LISTING=''; return 0; }
+  TMUX_OPTS_STATE=1
+  local line name val
+  while IFS= read -r line; do
+    case "$line" in @codexbar_*) ;; *) continue ;; esac
+    name="${line%% *}" val=''
+    [[ "$line" == *' '* ]] && val="${line#* }"
+    case "$val" in
+      *\\*) val="$TMUX_OPT_ASK" ;;
+      \"*\") val="${val#\"}"; val="${val%\"}" ;;
+      \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    printf -v "TMUXOPT_${name//[^A-Za-z0-9_]/_}" '%s' "$val"
+  done <<<"$TMUX_OPTS_LISTING"
+  return 0
+}
+
 tmux_opt_or_empty() {
   local opt_name="${1:-}"
 
   command -v tmux >/dev/null 2>&1 || { printf '%s' ""; return 0; }
   [[ -n "${opt_name:-}" ]] || { printf '%s' ""; return 0; }
+  (( TMUX_OPTS_STATE == 2 )) && { printf '%s' ""; return 0; }
+
+  case "$opt_name" in
+    @codexbar_*)
+      local var="TMUXOPT_${opt_name//[^A-Za-z0-9_]/_}"
+      if [[ -z "${!var+x}" ]]; then
+        printf '%s' ""   # not in the listing: unset
+        return 0
+      fi
+      if [[ "${!var}" != "$TMUX_OPT_ASK" ]]; then
+        printf '%s' "${!var}"
+        return 0
+      fi
+      ;;
+  esac
 
   tmux show-option -gqv "$opt_name" 2>/dev/null || true
 }
+
+read_tmux_opts_listing
 
 opt_or_env_or_default() {
   local opt_name="${1:-}" env_name="${2:-}" default_value="${3:-}"
@@ -241,11 +293,18 @@ normalize_provider_list() {
   printf '%s' "$out"
 }
 
-USAGE_PROVIDER_LEGACY="$(opt_or_env_or_default '@codexbar_provider' 'CODEXBAR_USAGE_PROVIDER' '')"
+# Only the legacy OPTION narrows the fetch set; the legacy ENV seeds the
+# display provider alone. codexbar-usage-push.sh passes
+# CODEXBAR_USAGE_PROVIDER=claude, meaning "display", and when its Stop hook
+# found tmux unreachable (@codexbar_providers read empty) that env made the
+# fetch set 'claude' only, so write_usage_cache dropped the Codex block from
+# usage.json: CuaNotch and UsageBar lost the Codex numbers until the next run.
+USAGE_PROVIDER_LEGACY_OPT="$(tmux_opt_or_empty '@codexbar_provider')"
+USAGE_PROVIDER_LEGACY="${USAGE_PROVIDER_LEGACY_OPT:-${CODEXBAR_USAGE_PROVIDER:-}}"
 
 USAGE_PROVIDERS="$(normalize_provider_list "$(opt_or_env_or_default '@codexbar_providers' 'CODEXBAR_USAGE_PROVIDERS' '')")"
 if [[ -z "${USAGE_PROVIDERS:-}" ]]; then
-  USAGE_PROVIDERS="$(normalize_provider_list "$USAGE_PROVIDER_LEGACY")"
+  USAGE_PROVIDERS="$(normalize_provider_list "$USAGE_PROVIDER_LEGACY_OPT")"
 fi
 if [[ -z "${USAGE_PROVIDERS:-}" ]]; then
   USAGE_PROVIDERS='claude codex'
@@ -765,8 +824,15 @@ iso_utc_to_epoch() {
   local iso="${1:-}"
   [[ -n "$iso" ]] || return 1
 
-  if [[ "$iso" =~ ^([0-9-]+T[0-9:]+)\.[0-9]+(.*)$ ]]; then
-    iso="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+  # Fractional seconds round to the nearest second, never truncate: the
+  # endpoint says '…T17:59:59.9xx' for the window Claude Code's live sample
+  # calls …T18:00:00, and truncating stored one window as both X-1 and X, so
+  # pace_recent_rate saw only part of its history (2026-10-22). Same rule in
+  # the jq `epoch` defs (POOL_PACE_JQ, adopt_cswap_claude).
+  local round_up=0
+  if [[ "$iso" =~ ^([0-9-]+T[0-9:]+)\.([0-9]+)(.*)$ ]]; then
+    iso="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+    [[ "${BASH_REMATCH[2]:0:1}" == [5-9] ]] && round_up=1
   fi
   iso="${iso/+00:00/Z}"
 
@@ -779,7 +845,7 @@ iso_utc_to_epoch() {
   fi
 
   [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
-  printf '%s' "$epoch"
+  printf '%s' "$(( epoch + round_up ))"
 }
 
 codex_reset_description_to_epoch() {
@@ -1201,12 +1267,16 @@ pace_recent_rate() {
   local cutoff samples
   cutoff=$(( now - window_seconds ))
 
+  # The same window within 10 min, like every other resets_at comparison
+  # here: history written before the rounding fix holds one window as both X
+  # and X-1, and an exact match kept only the samples of whichever variant the
+  # block carried that tick, so the ETA jumped between ticks (2026-10-22).
   samples="$(jq -c \
     --argjson c "$cutoff" \
     --argjson r "$current_resets_at" \
     --arg uk "$used_key" \
     --arg rk "$resets_key" \
-    'select((.t // 0) >= $c and (.[$rk] // null) == $r) | [.t, (.[$uk] // 0)]' \
+    'select((.t // 0) >= $c and ((.[$rk] | numbers) as $x | (($x - $r) | fabs) <= 600)) | [.t, (.[$uk] // 0)]' \
     "$history_file" 2>/dev/null || true)"
   [[ -n "$samples" ]] || return 0
 
@@ -1553,13 +1623,35 @@ load_print_context() {
 
   command -v tmux >/dev/null 2>&1 || return 0
 
+  # The first call takes the run's startup listing (read_tmux_opts_listing),
+  # which costs no fork; a later one in the same run asks again, since the
+  # view and preview options may have moved during a fetch.
   local opts
-  opts="$(tmux show-options -g 2>/dev/null || true)"
+  if (( TMUX_OPTS_CONSUMED == 0 )); then
+    TMUX_OPTS_CONSUMED=1
+    opts="$TMUX_OPTS_LISTING"
+  else
+    opts="$(tmux show-options -g 2>/dev/null || true)"
+  fi
   [[ -n "${opts:-}" ]] || return 0
   PRINT_OPTS_LISTED=1
 
   local line key val
   while IFS= read -r line; do
+    # Every @codex_* option as the server holds it now (PRINTOPT_<name>), for
+    # publish_to_tmux_opts' tick gate; decoded as read_tmux_opts_listing does.
+    case "$line" in
+      @codex_*)
+        key="${line%% *}" val=''
+        [[ "$line" == *' '* ]] && val="${line#* }"
+        case "$val" in
+          *\\*) val="$TMUX_OPT_ASK" ;;
+          \"*\") val="${val#\"}"; val="${val%\"}" ;;
+          \'*\') val="${val#\'}"; val="${val%\'}" ;;
+        esac
+        printf -v "PRINTOPT_${key//[^A-Za-z0-9_]/_}" '%s' "$val"
+        ;;
+    esac
     case "$line" in
       "@codex_weekly_used"|"@codex_weekly_used "*)
         PRINT_PACE_OPTS_SET=1
@@ -1831,13 +1923,18 @@ publish_to_tmux_opts() {
   weekly_text="$(render_text_for_mode weekly  "$weekly_view"  "$debug_suffix")"
   scoped_text="$(render_text_for_mode scoped  "$scoped_view"  "$debug_suffix")"
 
-  publish_text_and_alias @codex_session_text '' "$session_text"
-  publish_text_and_alias @codex_weekly_text  '' "$weekly_text"
-  publish_text_and_alias @codex_scoped_text  @codex_fable_text "$scoped_text"
+  # Every value goes into ONE tmux invocation (set-option … \; set-option …),
+  # instead of a fork apiece: 13 calls on every tick.
+  local args=()
+  opt_arg() { (( ${#args[@]} > 0 )) && args+=(';'); args+=(set-option -gq "$1" "$2"); }
+  opt_arg @codex_session_text "$session_text"
+  opt_arg @codex_weekly_text "$weekly_text"
+  opt_arg @codex_scoped_text "$scoped_text"
+  opt_arg @codex_fable_text "$scoped_text"
 
-  tmux set-option -gq @codex_provider "$DISPLAY_PROVIDER" >/dev/null 2>&1 || true
-  tmux set-option -gq @codex_provider_label "$(provider_label_for "$DISPLAY_PROVIDER")" >/dev/null 2>&1 || true
-  tmux set-option -gq @codex_scoped_icon "$(icon_for_label "$CACHE_SCOPED_LABEL")" >/dev/null 2>&1 || true
+  opt_arg @codex_provider "$DISPLAY_PROVIDER"
+  opt_arg @codex_provider_label "$(provider_label_for "$DISPLAY_PROVIDER")"
+  opt_arg @codex_scoped_icon "$(icon_for_label "$CACHE_SCOPED_LABEL")"
 
   # Whose numbers these are: the codex_session module draws the label in
   # front of "S:" when it is non-empty. Claude only — Codex has no accounts
@@ -1849,24 +1946,48 @@ publish_to_tmux_opts() {
     account_label="$(claude_account_label)"
     account_email="$CLAUDE_ACCOUNT_EMAIL"
   fi
-  tmux set-option -gq @codex_account_label "$account_label" >/dev/null 2>&1 || true
-  tmux set-option -gq @codex_account "$account_email" >/dev/null 2>&1 || true
+  opt_arg @codex_account_label "$account_label"
+  opt_arg @codex_account "$account_email"
 
   if [[ "$CACHE_STATE" == "auth_required" ]]; then
-    publish_text_and_alias @codex_session_color '' "$AUTH_REQUIRED_COLOR"
-    publish_text_and_alias @codex_weekly_color  '' "$AUTH_REQUIRED_COLOR"
-    publish_text_and_alias @codex_scoped_color  @codex_fable_color "$AUTH_REQUIRED_COLOR"
+    opt_arg @codex_session_color "$AUTH_REQUIRED_COLOR"
+    opt_arg @codex_weekly_color "$AUTH_REQUIRED_COLOR"
+    opt_arg @codex_scoped_color "$AUTH_REQUIRED_COLOR"
+    opt_arg @codex_fable_color "$AUTH_REQUIRED_COLOR"
   else
     if [[ -n "$CACHE_SESSION_COLOR" ]]; then
-      publish_text_and_alias @codex_session_color '' "$CACHE_SESSION_COLOR"
+      opt_arg @codex_session_color "$CACHE_SESSION_COLOR"
     fi
     if [[ -n "$CACHE_WEEKLY_COLOR" ]]; then
-      publish_text_and_alias @codex_weekly_color '' "$CACHE_WEEKLY_COLOR"
+      opt_arg @codex_weekly_color "$CACHE_WEEKLY_COLOR"
     fi
     if [[ -n "$CACHE_SCOPED_COLOR" ]]; then
-      publish_text_and_alias @codex_scoped_color @codex_fable_color "$CACHE_SCOPED_COLOR"
+      opt_arg @codex_scoped_color "$CACHE_SCOPED_COLOR"
+      opt_arg @codex_fable_color "$CACHE_SCOPED_COLOR"
     fi
   fi
+
+  # GATED ON THE TICK, like publish_pace_opts below, but against the server
+  # itself: the tick skips the call when the option listing load_print_context
+  # just read (PRINTOPT_*) already holds every one of these exact values.
+  # Anything that moves a value — a cache rewrite, the reset view or its
+  # preview (time-dependent text), an account switch — publishes, and so does
+  # anything that changed the options under us: a restarted server, or a
+  # re-sourced tmux.conf (it resets the colors to colour239). An unset option,
+  # one whose listed form this cannot decode, no listing at all, and debug mode
+  # all publish.
+  local i unchanged=0
+  if (( PACE_OPTS_GATED == 1 && CODEXBAR_USAGE_DEBUG == 0 && ${PRINT_OPTS_LISTED:-0} == 1 )); then
+    unchanged=1
+    for (( i = 0; i < ${#args[@]}; i += 5 )); do
+      local var="PRINTOPT_${args[i+2]//[^A-Za-z0-9_]/_}"
+      if [[ -z "${!var+x}" || "${!var}" != "${args[i+3]}" ]]; then
+        unchanged=0
+        break
+      fi
+    done
+  fi
+  (( unchanged == 1 )) || tmux "${args[@]}" >/dev/null 2>&1 || true
 
   publish_pace_opts || true
 }
@@ -2135,7 +2256,17 @@ try_acquire_lock() {
   return 0
 }
 
+# release_lock [owner]: removes the lock only while it is still ours, i.e. its
+# pid file holds `owner` ($$ by default; spawn_background_refresh_locked's
+# pre-spawn lock is "STARTING"). An unconditional rm let a worker whose lock a
+# manual refresh had force-stolen delete the NEW holder's lock from its EXIT
+# trap, so a tick's merge then read-modify-wrote usage.json alongside the
+# manual fetch and could undo it. `--any` is the force-steal itself.
 release_lock() {
+  local owner="${1:-$$}"
+  if [[ "$owner" != --any ]] && [[ "$(cat "$LOCKDIR/pid" 2>/dev/null || true)" != "$owner" ]]; then
+    return 0
+  fi
   rm -rf "$LOCKDIR" 2>/dev/null || true
 }
 
@@ -2158,7 +2289,7 @@ spawn_background_refresh_locked() {
     fi
 
     log_debug "spawn: tmux failed"
-    release_lock
+    release_lock STARTING
     return 1
   fi
 
@@ -2171,7 +2302,7 @@ spawn_background_refresh_locked() {
   fi
 
   log_debug "spawn: nohup failed status=${nohup_status}"
-  release_lock
+  release_lock STARTING
   return 1
 }
 
@@ -2376,6 +2507,20 @@ release_refresh_lock() {
   rm -rf "$CLAUDE_OAUTH_REFRESH_LOCKDIR" 2>/dev/null || true
 }
 
+# True when the Keychain's refresh token is no longer `sent` (another writer
+# rotated it), checked now and once more after a short wait for a write
+# that is still in flight. CODEXBAR_OAUTH_ROTATION_WAIT (seconds) is for tests.
+claude_oauth_refresh_token_rotated_from() {
+  local sent="$1" now_refresh
+  now_refresh="$(read_claude_oauth_refresh_token 2>/dev/null || true)"
+  if [[ -n "$now_refresh" && "$now_refresh" != "$sent" ]]; then
+    return 0
+  fi
+  sleep "${CODEXBAR_OAUTH_ROTATION_WAIT:-2}"
+  now_refresh="$(read_claude_oauth_refresh_token 2>/dev/null || true)"
+  [[ -n "$now_refresh" && "$now_refresh" != "$sent" ]]
+}
+
 # Returns 0 on success (new tokens in keychain ready to use), non-zero on failure.
 # On success, the caller can re-read the access token from keychain and retry.
 try_oauth_token_refresh() {
@@ -2433,12 +2578,22 @@ try_oauth_token_refresh() {
       ""
     ' 2>/dev/null)"
     err_msg="${err_msg//$'\n'/ }"
+    log_warn "oauth-refresh: endpoint returned error type=${err_type} msg=${err_msg}"
     case "$err_type" in
       invalid_grant|invalid_token|authentication_error)
-        CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED=1
+        # Claude Code refreshes the same Keychain item without our lock, so
+        # a refresh token it has just rotated is "not found or invalid" here
+        # (10:15:31Z and 18:24:46Z, 2026-10-21/22). If the Keychain holds
+        # another refresh token now, or a moment later once its write lands,
+        # the login is fine and the caller retries with the new access token;
+        # only the same credentials still in place mean "log in again".
+        if claude_oauth_refresh_token_rotated_from "$current_refresh"; then
+          log_info "oauth-refresh: lost the rotation race to another writer; using its tokens"
+        else
+          CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED=1
+        fi
         ;;
     esac
-    log_warn "oauth-refresh: endpoint returned error type=${err_type} msg=${err_msg}"
     release_refresh_lock
     return 1
   fi
@@ -2446,7 +2601,13 @@ try_oauth_token_refresh() {
   local new_access new_refresh expires_in
   new_access="$(printf '%s' "$response" | jq -er '.access_token' 2>/dev/null || true)"
   new_refresh="$(printf '%s' "$response" | jq -er '.refresh_token' 2>/dev/null || true)"
-  expires_in="$(printf '%s' "$response" | jq -er '.expires_in' 2>/dev/null || echo 28800)"
+  # A whole number or the default. `jq -er … || echo 28800` printed "null"
+  # AND 28800 for a missing field, and the arithmetic below then died on
+  # 'null: unbound variable' AFTER the endpoint had rotated the refresh token
+  # and BEFORE the new pair was saved: both lost, the keychain left holding a
+  # revoked token, every session on the account sent to /login.
+  expires_in="$(printf '%s' "$response" | jq -r '.expires_in | numbers | floor' 2>/dev/null || true)"
+  [[ "$expires_in" =~ ^[0-9]+$ ]] || expires_in=28800
 
   if [[ -z "$new_access" || "$new_access" != sk-ant-oat* ]] \
      || [[ -z "$new_refresh" || "$new_refresh" != sk-ant-ort* ]]; then
@@ -2475,11 +2636,21 @@ try_oauth_token_refresh() {
   return 0
 }
 
-fetch_claude_oauth_usage_json() {
+# One usage request. Sets CLAUDE_USAGE_RAW (the body; empty when curl failed)
+# and CLAUDE_USAGE_STATUS (the HTTP status; "000" for no response, e.g. rc 28
+# after @codexbar_web_timeout or rc 6; empty when unknown). Called directly,
+# not in $(), so the caller sees both. The status exists so a token refresh is
+# tried only on 401/403: every empty body used to rotate the shared Keychain
+# tokens, so each timeout was one more chance to race Claude Code's own
+# refresh (50 needless rotations in three days of logs, 2026-10-22).
+CLAUDE_USAGE_RAW=''
+CLAUDE_USAGE_STATUS=''
+claude_usage_request() {
   local token="$1"
+  CLAUDE_USAGE_RAW='' CLAUDE_USAGE_STATUS=''
   command -v curl >/dev/null 2>&1 || return 1
 
-  local cfg result rc
+  local cfg result rc last
   cfg="$(umask 077 && mktemp "${CACHE_DIR}/curl.cfg.XXXXXX")" || return 1
   CODEXBAR_TMP_FILES+=("$cfg")
 
@@ -2490,14 +2661,38 @@ fetch_claude_oauth_usage_json() {
     printf 'header = "Authorization: Bearer %s"\n' "$token"
     printf 'header = "anthropic-beta: oauth-2025-04-20"\n'
     printf 'header = "Content-Type: application/json"\n'
+    printf 'write-out = "\\n%%{http_code}"\n'
     printf 'url = "https://api.anthropic.com/api/oauth/usage"\n'
   } >"$cfg" 2>/dev/null || { rm -f "$cfg" 2>/dev/null; return 1; }
 
   result="$(curl --config "$cfg" 2>/dev/null)"
   rc=$?
   rm -f "$cfg" 2>/dev/null
-  (( rc == 0 )) || return 1
-  printf '%s' "$result"
+  last="${result##*$'\n'}"
+  if [[ "$result" == *$'\n'* && "$last" =~ ^[0-9]{3}$ ]]; then
+    CLAUDE_USAGE_STATUS="$last"
+    result="${result%$'\n'*}"
+  fi
+  if (( rc != 0 )); then
+    log_warn "refresh[claude]: usage request failed (curl rc=${rc} http=${CLAUDE_USAGE_STATUS:-?})"
+    [[ -n "$CLAUDE_USAGE_STATUS" ]] || CLAUDE_USAGE_STATUS='000'
+    return 1
+  fi
+  CLAUDE_USAGE_RAW="$result"
+}
+
+# The usage request was rejected for its credentials: a 401, a 403 that is not
+# a permission_error, or an auth error in the body. A permission_error 403 (a
+# scope or org-policy refusal) says nothing about the token's validity: a
+# refresh rotated Claude Code's shared tokens on every fetch only to get the
+# same 403 and report 'Need to log in' (2026-10-22). It stays a plain fetch
+# failure for the backoff ladder, as before the status code was consulted.
+claude_usage_auth_rejected() {
+  [[ "$CLAUDE_USAGE_STATUS" == 401 ]] \
+    || { [[ "$CLAUDE_USAGE_STATUS" == 403 ]] \
+           && ! printf '%s' "$CLAUDE_USAGE_RAW" \
+                | jq -e '(try .error.type catch null) == "permission_error"' >/dev/null 2>&1; } \
+    || claude_oauth_response_is_auth_error "$CLAUDE_USAGE_RAW"
 }
 
 # One fetch's worth of output, in the shape every provider answers in. The
@@ -2775,47 +2970,48 @@ fetch_via_claude_oauth() {
     return 1
   fi
 
-  raw="$(fetch_claude_oauth_usage_json "$token" 2>/dev/null || true)"
+  claude_usage_request "$token" || true
+  raw="$CLAUDE_USAGE_RAW"
 
-  # An empty or unparseable body can be a transient blip OR an auth-rejected
-  # request whose 401/403 carried no JSON body (fetch_claude_oauth_usage_json
-  # does not surface the HTTP status, so we can't tell from the body alone).
-  # Make one token-refresh attempt and re-fetch before giving up: a healthy
-  # token simply succeeds on retry, an expired one gets rotated.
-  if [[ -z "${raw:-}" ]] || ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
-    log_warn "refresh[claude]: empty/unparseable oauth response; attempting token refresh"
-    if try_oauth_token_refresh; then
-      token="$(read_claude_oauth_access_token 2>/dev/null || true)"
-      if [[ -n "${token:-}" ]]; then
-        raw="$(fetch_claude_oauth_usage_json "$token" 2>/dev/null || true)"
-      fi
-    fi
-    if [[ -z "${raw:-}" ]]; then
-      log_warn "refresh[claude]: empty oauth response after refresh attempt"
-      (( CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED != 0 )) && FETCH_AUTH_REQUIRED=1
-      return 1
-    fi
-  fi
-
-  if claude_oauth_response_is_auth_error "$raw"; then
-    log_info "refresh[claude]: auth error detected; attempting token refresh"
-    if try_oauth_token_refresh; then
-      token="$(read_claude_oauth_access_token 2>/dev/null || true)"
-      if [[ -n "${token:-}" ]]; then
-        raw="$(fetch_claude_oauth_usage_json "$token" 2>/dev/null || true)"
-      fi
+  # Only a request rejected for its credentials (claude_usage_auth_rejected:
+  # 401, a non-permission 403, or an auth error in the body) is worth a token
+  # refresh. A timeout, a network error or a 5xx is
+  # a plain fetch failure for the backoff ladder: refreshing on those rotated
+  # Claude Code's tokens for nothing (claude_usage_request).
+  if claude_usage_auth_rejected; then
+    log_info "refresh[claude]: auth rejected (http=${CLAUDE_USAGE_STATUS:-?}); attempting token refresh"
+    local used_token="$token"
+    try_oauth_token_refresh || true
+    # Re-fetch whenever the Keychain now holds another access token: ours
+    # from the refresh, or one Claude Code wrote meanwhile. The latter is the
+    # race try_oauth_token_refresh loses with invalid_grant (10:15:31Z on
+    # 2026-10-22, 'Need to log in' for a login that worked 74s later).
+    token="$(read_claude_oauth_access_token 2>/dev/null || true)"
+    if [[ -n "${token:-}" && "$token" != "$used_token" ]]; then
+      claude_usage_request "$token" || true
+      raw="$CLAUDE_USAGE_RAW"
+    else
+      raw=''
     fi
 
     if [[ -z "${raw:-}" ]]; then
-      log_warn "refresh[claude]: empty oauth response after refresh attempt"
-      (( CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED != 0 )) && FETCH_AUTH_REQUIRED=1
+      log_warn "refresh[claude]: no usable oauth response after refresh attempt"
+      if (( CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED != 0 )) \
+         || [[ -z "$(read_claude_oauth_refresh_token 2>/dev/null || true)" ]]; then
+        FETCH_AUTH_REQUIRED=1
+      fi
       return 1
     fi
-    if claude_oauth_response_is_auth_error "$raw"; then
+    if claude_usage_auth_rejected; then
       log_warn "refresh[claude]: auth error persists after refresh attempt"
       FETCH_AUTH_REQUIRED=1
       return 1
     fi
+  fi
+
+  if [[ -z "${raw:-}" ]] || ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+    log_warn "refresh[claude]: empty/unparseable oauth response (http=${CLAUDE_USAGE_STATUS:-?}); not refreshing the token"
+    return 1
   fi
 
   if printf '%s' "$raw" | jq -e '(try .error.type catch null) == "rate_limit_error"' >/dev/null 2>&1; then
@@ -3267,10 +3463,13 @@ pool_pace_enabled() {
 POOL_PACE_MAX_AGE_SECONDS=$(( 48 * 3600 ))
 
 POOL_PACE_JQ='
+  # Fractional seconds round to the nearest second (iso_utc_to_epoch).
   def epoch:
     if type == "number" then floor
     elif type == "string" then
-      (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | (fromdateiso8601? // null))
+      (if test("\\.[5-9]") then 1 else 0 end) as $up
+      | (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | (fromdateiso8601? // null))
+      | if . == null then null else . + $up end
     else null end;
   def lc: (. // "") | tostring | ascii_downcase;
   def obj: if type == "object" then . else {} end;
@@ -4292,7 +4491,9 @@ adopt_cswap_claude_locked() {
       def epoch:
         if type == "number" then floor
         elif type == "string" then
-          (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | (fromdateiso8601? // null))
+          (if test("\\.[5-9]") then 1 else 0 end) as $up
+          | (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | (fromdateiso8601? // null))
+          | if . == null then null else . + $up end
         else null end;
       # CLAUDE_ACCOUNT_JQ, applied to a cswap slot.
       def slot_key:
@@ -4469,6 +4670,13 @@ refresh_cache() {
   log_debug "refresh: start providers=[${USAGE_PROVIDERS}] display=${DISPLAY_PROVIDER}"
 
   if [[ "${CODEXBAR_USAGE_LOCK_HELD:-}" == "1" && "${CODEXBAR_USAGE_LOCKDIR:-}" == "$LOCKDIR" ]]; then
+    # Ours only while it still holds the spawner's STARTING: a manual refresh
+    # may have force-stolen it before this worker started, and writing our pid
+    # over the thief's would make two holders (release_lock).
+    if [[ "$(cat "$LOCKDIR/pid" 2>/dev/null || true)" != STARTING ]]; then
+      log_debug "refresh: inherited lock was taken over; yielding"
+      return 0
+    fi
     log_debug "refresh: lock inherited"
     printf '%s\n' "$$" >"$LOCKDIR/pid" 2>/dev/null || true
     printf '%s\n' "$(now_epoch)" >"$LOCKDIR/started_at" 2>/dev/null || true
@@ -4481,7 +4689,7 @@ refresh_cache() {
       # yields on contention.
       if [[ "${CODEXBAR_USAGE_FORCE_REFRESH:-}" == "1" ]]; then
         log_warn "refresh: lock busy; force-stealing for manual refresh"
-        release_lock
+        release_lock --any
         if ! try_acquire_lock "$$"; then
           log_debug "refresh: lock still busy after steal"
           return 0

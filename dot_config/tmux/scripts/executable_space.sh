@@ -207,14 +207,31 @@ reg_save() {
 # removes a lock that still holds its own token, so a holder whose lock was
 # broken never removes the next one's. Held only for short stretches (a sync,
 # close's registry edit), never across slow work. Released on exit.
+# Breaking one renames it aside first and re-checks the age of what it moved
+# (closed-tabs.sh's lock_acquire): a plain stat-then-rm let a waiter that
+# saw the stale lock delete the fresh one another waiter had just taken, and
+# both rewrote spaces.tsv. A stat that fails (the lock just went) is a retry,
+# never "stale" (2026-10-22).
 LOCKED="" LOCK_TOKEN=""
+lock_age() {
+  local m
+  m="$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null)" || return 1
+  [[ "$m" =~ ^[0-9]+$ ]] || return 1
+  REPLY=$(($(date +%s) - m))
+}
 reg_lock() {
-  local lock="$REG.lock" i=0 m
+  local lock="$REG.lock" i=0
   mkdir -p "$(dirname "$REG")" 2>/dev/null || return 1
   until mkdir "$lock" 2>/dev/null; do
-    if ((i % 20 == 19)); then
-      m="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
-      (($(date +%s) - m > 15)) && rm -rf "$lock" 2>/dev/null
+    if ((i % 20 == 19)) && lock_age "$lock" && ((REPLY > 15)) && mv "$lock" "$lock.stale.$$" 2>/dev/null; then
+      if lock_age "$lock.stale.$$" && ((REPLY > 15)); then
+        rm -rf "$lock.stale.$$" 2>/dev/null
+        continue
+      fi
+      # Fresh: someone's live lock, put back. Guarded: mv onto an existing
+      # directory moves INTO it.
+      [[ -e "$lock" ]] || mv "$lock.stale.$$" "$lock" 2>/dev/null
+      rm -rf "$lock.stale.$$" 2>/dev/null
     fi
     i=$((i + 1))
     ((i >= 200)) && return 1
@@ -1658,9 +1675,15 @@ cmd_create() {
       # complete: a failure removes only its own temp folder, and two clones
       # of one repo at once never share (or delete) a target.
       tmp="${N_DIR%/*}/.${N_DIR##*/}.clone-$$"
+      # ^C in the popup on a slow clone kills git and this script together:
+      # only a clone that returned removed its temp folder, so a partial one
+      # stayed in ~/code/projects (2026-10-22). Cleared once it is renamed.
+      trap "rm -rf -- $(printf %q "$tmp")" EXIT   # expanded now: tmp is gone by exit
+      trap 'exit 129' HUP; trap 'exit 143' TERM; trap 'exit 130' INT
       printf 'cloning %s into %s ...\n' "$N_SRC" "$N_DIR" >&2
       if ! out="$(GIT_TERMINAL_PROMPT=0 git clone -q -- "$N_URL" "$tmp" 2>&1)"; then
         rm -rf -- "$tmp"
+        trap - EXIT HUP TERM INT
         # git's own reason: its first fatal:/error: line, else its last line.
         line=""
         while IFS= read -r l; do [[ "$l" == fatal:* || "$l" == error:* ]] && { line="$l"; break; }; done <<<"$out"
@@ -1673,9 +1696,11 @@ cmd_create() {
       # meanwhile; rename onto a non-empty one fails.
       if ! perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' -- "$tmp" "$N_DIR" 2>/dev/null; then
         rm -rf -- "$tmp"
+        trap - EXIT HUP TERM INT
         [[ -d "$N_DIR" ]] || { msg -k error "could not move the clone into $N_DIR"; return 1; }
         N_KIND=exists           # another clone got there first: use that one
-      fi ;;
+      fi
+      trap - EXIT HUP TERM INT ;;
     project | folder)
       mkdir -- "$N_DIR" 2>/dev/null || [[ -d "$N_DIR" ]] || { msg -k error "could not create $N_DIR"; return 1; }
       if ((N_GIT)); then git init -q -b main -- "$N_DIR" >/dev/null 2>&1 || msg -k warn "git init failed in $N_DIR"; fi ;;
@@ -1720,9 +1745,12 @@ cmd_catalog_sync() {
       mkdir "$lock" 2>/dev/null || return 0
     fi
     printf '%s\n' "$$" >"$lock/pid"
+    # rc is the LAST run's: one that failed (a transient npm error) and was
+    # followed by one that worked leaves the catalog up to date, no toast.
     while [[ -e "$pend" ]]; do
       sleep 2
       rm -f "$pend"
+      rc=0
       { printf '== %s %s\n' "$(date '+%F %T')" "$repo"; (cd "$repo" && npm run catalog:sync); } >>"$log" 2>&1 || rc=$?
     done
     rm -rf "$lock"
@@ -1839,37 +1867,98 @@ cmd_pending_popup() {
 # @pending_viewers (space-padded: " /dev/ttys7>/dev/ttys1 "), so a key can
 # tell a pending popup's client from a real one that went to `pending`:
 #   viewers_edit add|del TOKEN
+# One set -F, so the server does the edit: two read-modify-writes from the
+# shell at once (adopt-pending detaching two viewers) could lose a del, and a
+# stale token later detached a real client that got the freed tty
+# (2026-10-22). The value keeps its padding (" A B "); an emptied one is unset.
 viewers_edit() {
-  local v
-  v=" $(t show -gqv @pending_viewers 2>/dev/null) "
-  v="${v// $2 / }"
-  [[ "$1" == add ]] && v+="$2 "
-  trim "$v"
-  if [[ -n "$REPLY" ]]; then t set -g @pending_viewers " $REPLY "; else t set -gu @pending_viewers; fi
+  if [[ "$1" == add ]]; then
+    t set -gF @pending_viewers "#{?@pending_viewers,#{s| $2 | :@pending_viewers}, }$2 " 2>/dev/null
+  else
+    t set -gF @pending_viewers "#{s| $2 | :@pending_viewers}" ";" \
+      if -F "#{m:*>*,#{@pending_viewers}}" "" "set -gu @pending_viewers" 2>/dev/null
+  fi
+  return 0
+}
+
+# popup_client PID OUTER: the client whose pid is PID is a live pending
+# popup's nested client for OUTER: its parent is that popup's popup-attach.
+# A token can outlive its popup (killed before its del ran), and macOS hands
+# the freed tty to the next real client.
+popup_client() {
+  local pp
+  [[ "$1" =~ ^[0-9]+$ ]] || return 1
+  pp="$(ps -o ppid= -p "$1" 2>/dev/null)"; pp="${pp//[[:space:]]/}"
+  [[ "$pp" =~ ^[0-9]+$ ]] || return 1
+  [[ "$(ps -ww -o command= -p "$pp" 2>/dev/null) " == *" popup-attach "*" $2 "* ]]
 }
 
 # popup-attach WINDOW OUTER SOCKET: the command a pending popup runs. Its
 # nested client (this popup's tty) is a viewer while attached to WINDOW.
+# The del is an EXIT trap: a popup killed with its outer client (a WezTerm
+# tab closed, a detach) gets HUP/TERM, and a del after attach-session never
+# ran, so the token stayed.
 cmd_popup_attach() {
   local wid="${1:-}" outer="${2:-}" sock="${3:-}" me tb
   me="$(tty 2>/dev/null)"
   tb="$(command -v "$TMUX_BIN" 2>/dev/null)"
+  trap "viewers_edit del $(printf %q "$me>$outer")" EXIT   # expanded now: the locals are gone by exit
+  trap 'exit 129' HUP; trap 'exit 143' TERM; trap 'exit 130' INT
   viewers_edit add "$me>$outer"
   env -u TMUX "${tb:-tmux}" -S "$sock" attach-session -t "$wid"
-  viewers_edit del "$me>$outer"
+}
+
+# viewers-prune (client-detached, viewer-left): drop the tokens whose outer
+# client is gone, or whose nested tty is now a client that is not that popup's.
+cmd_viewers_prune() {
+  local v tok nested outer clients pid
+  local -a toks=()
+  v="$(t show -gqv @pending_viewers 2>/dev/null)"
+  read -ra toks <<<"$v"
+  ((${#toks[@]})) || return 0
+  clients="$(t list-clients -F "#{client_name}${US}#{client_pid}" 2>/dev/null)"
+  for tok in "${toks[@]}"; do
+    [[ "$tok" == *'>'* ]] || continue
+    nested="${tok%%>*}" outer="${tok#*>}"
+    if [[ $'\n'"$clients"$'\n' != *$'\n'"$outer$US"* ]]; then
+      viewers_edit del "$tok"
+      continue
+    fi
+    pid="$(awk -F"$US" -v c="$nested" '$1 == c { print $2; exit }' <<<"$clients")"
+    # Not a client yet: a popup between its add and its attach.
+    [[ -z "$pid" ]] || popup_client "$pid" "$outer" || viewers_edit del "$tok"
+  done
+  return 0
 }
 
 # viewer-left CLIENT (client-session-changed): a pending popup's nested
 # client that left `pending` (⌥W, ⌘N, a click, typed inside the popup) closes
-# its popup, and the client outside goes where it was going.
+# its popup, and the client outside goes where it was going. Only a live
+# token's (popup_client): a stale one naming a real client is dropped, never
+# acted on, or every space switch of that client detached it. Any other
+# client's switch prunes (viewers-prune): a token whose popup was SIGKILLed
+# (no EXIT trap) and whose tty never comes back kept @pending_viewers set,
+# and this hook forking on every switch of every client (2026-10-22).
+# The stale check comes before the `pending` one: a real client with a stale
+# token that switched into `pending` kept it there, and ⌥N detached it.
 cmd_viewer_left() {
-  local nested="${1:-}" v outer sess target
-  v=" $(t show -gqv @pending_viewers 2>/dev/null) "
-  [[ -n "$nested" && "$v" == *" $nested>"* ]] || return 0
-  outer="${v#*" $nested>"}"; outer="${outer%% *}"
-  IFS="$US" read -r sess target <<<"$(t list-clients -F "#{client_name}${US}#{session_name}${US}#{session_id}:#{window_id}" 2>/dev/null \
-    | awk -F"$US" -v c="$nested" '$1 == c { print $2 FS $3; exit }')"
-  [[ -n "$sess" && "$sess" != "$PEND_SESS" ]] || return 0
+  local nested="${1:-}" v outer sess target cpid try
+  [[ -n "$nested" ]] || return 0
+  IFS="$US" read -r sess target cpid <<<"$(t list-clients -F "#{client_name}${US}#{session_name}${US}#{session_id}:#{window_id}${US}#{client_pid}" 2>/dev/null \
+    | awk -F"$US" -v c="$nested" '$1 == c { print $2 FS $3 FS $4; exit }')"
+  for try in 1 2 3 4; do
+    v=" $(t show -gqv @pending_viewers 2>/dev/null) "
+    [[ "$v" == *" $nested>"* ]] || { ((try > 1)) || cmd_viewers_prune; return 0; }
+    outer="${v#*" $nested>"}"; outer="${outer%% *}"
+    [[ -n "$sess" ]] || return 0
+    if popup_client "$cpid" "$outer"; then
+      # A live popup's nested client attaching to `pending`: it stays.
+      [[ "$sess" != "$PEND_SESS" ]] || return 0
+      break
+    fi
+    viewers_edit del "$nested>$outer"
+    ((try < 4)) || return 0
+  done
   t detach-client -t "$nested" 2>/dev/null
   [[ -n "$outer" && "$target" == \$*:@* ]] && t switch-client -c "$outer" -t "$target"
   notify
@@ -2057,6 +2146,7 @@ main() {
     pending-popup) cmd_pending_popup "${1:-}" "${2:-}" "${3:-}" ;;
     popup-attach) cmd_popup_attach "${1:-}" "${2:-}" "${3:-}" ;;
     viewer-left) cmd_viewer_left "${1:-}" ;;
+    viewers-prune) cmd_viewers_prune ;;
     is-english) is_english "${1:-}" ;;
     catalog-sync) cmd_catalog_sync "${1:-}" "${2:-}" ;;
     ask-claude) cmd_ask_claude "$@" ;;

@@ -80,6 +80,7 @@ LAST = STATE_DIR / "paused.last.json"
 LOG = STATE_DIR / "log"
 LOCK = STATE_DIR / "lock"
 PROGRESS = STATE_DIR / "progress.json"
+VIEW = STATE_DIR / "view.pid"            # the open PAUSE popup's watch pid (pause_view_open)
 MCP_URL = os.environ.get("TMUX_MCP_URL") or (
     "http://127.0.0.1:%s/mcp" % (os.environ.get("TMUX_MCP_PORT") or "7998"))
 TOKEN_FILE = Path(os.environ.get("TMUX_MCP_TOKEN_FILE") or HOME / ".local/state/tmux-mcp/token")
@@ -442,6 +443,8 @@ def scan(panes, recs):
             "kind": rec.get("kind") or head["agent_kind"] or cmd_kind(pick["pane_current_command"]),
             "session_id": rec.get("session_id", ""),
             "pid": rec.get("pid"),
+            "pane_pid": pick["pane_pid"],   # the pane's identity when there is no session id (locate)
+            "pane_cmd": pick["pane_current_command"],   # ... with the agent it ran then
             "why": "+".join(why),
             "found_by": how,
         })
@@ -452,13 +455,36 @@ def locate(t, panes, recs):
     """Where a saved target lives now -> (pane_id | None, note). Its own pane
     if it still exists and (when a session id was saved) still runs that
     session; else a pane now running that session (a tmux-resurrect restore
-    renumbers panes); else gone."""
+    renumbers panes); else gone.
+
+    With no session id (the command fallback: an opencode TUI with no
+    record) the pane id alone is not identity: a server restored by
+    tmux-resurrect numbers panes from %0 again, so the saved %7 can be
+    another agent, which got the RESUME while the paused one was dropped
+    (2026-10-22). Such a pane counts only while its pane_pid is the saved
+    one. A target saved before pane_pid was recorded has none to compare
+    and keeps the old trust.
+
+    pane_pid is the SHELL's pid when the agent was started from one, so it
+    survives Mack quitting that agent and starting another in the same
+    pane (2026-10-22 review). So the pane must also still run the same kind
+    of agent (pane_current_command, as saved, else the target's kind) and
+    carry no session record: a record there means another, identified agent
+    lives in it now."""
     sid = t.get("session_id") or ""
     pane = t.get("pane_id")
     note = "pane gone"
     if pane in panes:
         if not sid:
-            return pane, ""
+            row = panes[pane]
+            saved = t.get("pane_pid")
+            cmd = row.get("pane_current_command") or ""
+            kind = cmd_kind(t["pane_cmd"]) if t.get("pane_cmd") else t.get("kind")
+            same = (not saved or row.get("pane_pid") == saved) and pane not in recs \
+                and bool(AGENT_CMD.match(cmd)) and (not kind or cmd_kind(cmd) == kind)
+            if same:
+                return pane, ""
+            return None, "pane now runs something else"
         cur = recs.get(pane, {}).get("session_id")
         if cur == sid:
             return pane, ""
@@ -1071,7 +1097,11 @@ def dismiss_glow(client):
 def void_pause(client):
     """Forget the saved set without messaging anyone: each agent's flag goes
     (and a window still `paused` goes idle), paused.json goes, and the record
-    is kept in paused.last.json as `voided_at`. -> message."""
+    is kept in paused.last.json as `voided_at`. -> message, or None when an
+    open PAUSE popup will say it: its VOIDED view. A line then would be a
+    tmux message wherever no sidebar shows the client, and tmux 3.7c draws
+    no popup frame under one (see open_popup), so VOIDED (3 s) would never
+    show behind the 6 s line (2026-10-22 review)."""
     def run():
         st = load_state()
         if not st or not st["targets"]:
@@ -1095,7 +1125,7 @@ def void_pause(client):
         msg = "⏸ pause voided: %d agent%s left stopped, not resumed" % (n, "" if n == 1 else "s")
         log({"mode": "void", "client": client, "paused_at": st.get("paused_at"), "message": msg,
              "targets": st["targets"]})
-        return msg
+        return None if pause_view_open() else msg
     return under_lock(client, run)
 
 
@@ -1109,6 +1139,7 @@ def void_pause(client):
 # the fallback for no client or a popup that will not open.
 
 PEACH, GREEN, INK = "#fab387", "#a6e3a1", "#11111b"
+LAVENDER = "#b4befe"                          # neutral: VOIDED (not a resume, not a failure)
 OVERRIDES = ("AGENT_PAUSE_STATE_DIR", "TMUX_MCP_URL", "TMUX_MCP_PORT", "TMUX_MCP_TOKEN_FILE",
              "TMUX_ASSISTANT_RESURRECT_DIR")
 
@@ -1260,6 +1291,15 @@ def popup_still_up(p):
         return True
 
 
+def pause_view_open():
+    """Is a PAUSE popup's view up now? watch keeps its pid in view.pid for
+    as long as it runs; a stale file (a killed view) names a dead pid."""
+    try:
+        return alive(int(VIEW.read_text().split()[0]))
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def press_alive(press):
     """Is the toggle that owns this press id ("<ms>-<pid>") still running?
     An id it cannot parse counts as alive."""
@@ -1305,6 +1345,7 @@ FONT = {
     "R": ["████ ", "█   █", "████ ", "█  █ ", "█   █"],
     "M": ["█   █", "██ ██", "█ █ █", "█   █", "█   █"],
     "D": ["████ ", "█   █", "█   █", "█   █", "████ "],
+    "V": ["█   █", "█   █", "█   █", " █ █ ", "  █  "],
     " ": ["   "] * 5,
 }
 
@@ -1376,7 +1417,8 @@ def fit(s, n):
 
 def build_frame(mode, items, cols, rows, elapsed, close_in=None, note="", spin=0, sending=False):
     """-> (background hex, exactly `rows` lines of exactly `cols` chars).
-    mode: pause | resume | dropped (NOT RESUMED) | notpaused (NOT PAUSED);
+    mode: pause | resume | dropped (NOT RESUMED) | notpaused (NOT PAUSED) |
+    voided (VOIDED: the saved set was voided under an open PAUSE view);
     items: [(label, location, status)]; close_in: a brief view's countdown
     (s); note: one extra line; spin: the spinner frame for rows still in
     flight; sending: delivery is still running (rows read SENDING until their
@@ -1410,6 +1452,11 @@ def build_frame(mode, items, cols, rows, elapsed, close_in=None, note="", spin=0
     elif mode == "dropped":   # a resume that reached nobody: never green
         title, bg, waiting = "NOT RESUMED", PEACH, []
         sub = "no paused agent could be reached"
+        left = 0 if close_in is None else int(close_in)
+        foot = "closes in %ds · any key to close" % max(0, left)
+    elif mode == "voided":    # the pause was voided: neither a resume nor a failure
+        title, bg, waiting = "VOIDED", LAVENDER, []
+        sub = "pause voided — agents left stopped, not resumed"
         left = 0 if close_in is None else int(close_in)
         foot = "closes in %ds · any key to close" % max(0, left)
     elif sending:             # resume, delivery still running
@@ -1544,6 +1591,13 @@ def resume_reached(last):
     return any(t.get("result") in REACHED for t in last.get("resume") or [])
 
 
+def voided(last, base):
+    """Was the pause this popup shows (baseline `base`) voided, not resumed?
+    void_pause writes paused.last.json from paused.json itself, so it
+    carries that pause's paused_at and no `resume` at all. Pure."""
+    return bool(last.get("voided_at")) and base is not None and last.get("paused_at") == base[0]
+
+
 def dropped_note(last):
     """The NOT RESUMED view's line: a resume that reached nobody and dropped
     what was left. Pure."""
@@ -1640,10 +1694,16 @@ def watch(mode, demo=False, press=None):
         also removed when a resume reached nobody and dropped the last misses.
           reached someone          -> RESUMED (with the retry count, if any)
           nobody, a set remains    -> stay paused, re-reading the set
-          nobody, nothing remains  -> NOT RESUMED (peach), then close"""
+          nobody, nothing remains  -> NOT RESUMED (peach), then close
+          voided (CuaNotch, the sidebar: `agent-pause.py void`) -> VOIDED,
+            then close. Its paused.last.json has no `resume`, so it used to
+            read as a resume that reached nobody (2026-10-22)."""
         nonlocal base, items_now, items, note, phase, close_at
         st, last = load_state(), last_resume()
-        if resume_reached(last):
+        if not (st and st.get("targets")) and voided(last, base):
+            phase, close_at = "voided", now + RESUMED_AFTER_PAUSE
+            note = ""
+        elif resume_reached(last):
             to_resumed(now)
         elif st and st.get("targets"):
             base = baseline(st)
@@ -1683,6 +1743,15 @@ def watch(mode, demo=False, press=None):
             items = progress_items(prog, panes_seen) if prog.get("targets") else items
         flag["dirty"] = True
 
+    # A PAUSE view says so in view.pid, so a void elsewhere leaves the
+    # telling to its VOIDED view (void_pause, pause_view_open).
+    me = str(os.getpid())
+    if mode == "pause" and not demo:
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            VIEW.write_text(me + "\n")
+        except OSError:
+            pass
     sys.stdout.write("\x1b[?1049h\x1b[?25l")
     try:
         if saved is not None:
@@ -1756,6 +1825,11 @@ def watch(mode, demo=False, press=None):
                     note = msg                  # busy, or tmux-mcp down: nothing changed
                 flag["dirty"] = True
     finally:
+        try:
+            if VIEW.read_text().strip() == me:   # never a later view's
+                VIEW.unlink()
+        except OSError:
+            pass
         if saved is not None:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
@@ -1832,7 +1906,8 @@ def main(argv):
             msg = "⏸ pause key error: %s: %s" % (type(e).__name__, e)
             log({"mode": "error", "client": client, "message": msg})
         try:
-            display(client, msg)
+            if msg:   # None: an open PAUSE popup shows the void itself
+                display(client, msg)
         except Exception:
             pass
         return 0

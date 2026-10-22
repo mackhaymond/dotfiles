@@ -279,40 +279,17 @@ class PausedWatcherTests(ao.WatcherHarness):
         o = self.ticks(3, FAKE_BG_RC="1")
         self.assertEqual(o["@agent_state"], "paused")
 
-    # The fake tmux has no if-shell: this wrapper gives it one (just the
-    # watcher's `#{?#{@agent_paused},0,1}` guard), running a command list's
-    # parts in order, and with RACE=1 clears the flag right before the paused
-    # write - agent-pause.py's resume landing between the tick's read and it.
+    # The shared fake runs if-shell -F itself now (the watcher's cas_write,
+    # whose guarded list nests the `#{?#{@agent_paused},0,1}` re-check -
+    # 2026-10-22). This wrapper only stages the race: with RACE=1 it clears
+    # the flag right before the call carrying the paused write -
+    # agent-pause.py's resume landing between the tick's read and it.
     IF_SHELL = r'''#!/usr/bin/env python3
-import json, os, shlex, subprocess, sys
+import os, subprocess, sys
 real = os.environ["REAL_FAKE_TMUX"]
-cmds = [[]]
-for x in sys.argv[1:]:
-    cmds.append([]) if x == ";" else cmds[-1].append(x)
-cmds = [c for c in cmds if c]
-if not any(c[0] == "if-shell" for c in cmds):
-    os.execv(real, [real] + sys.argv[1:])
-if os.environ.get("RACE") == "1" and any(c[:1] == ["set-option"] and c[-2:] == ["@agent_state", "paused"] for c in cmds):
+if os.environ.get("RACE") == "1" and any("@agent_state paused" in a for a in sys.argv[1:]):
     subprocess.run([real, "set-option", "-uw", "-t", "@1", "@agent_paused"])
-rc, plain = 0, []
-def flush():
-    global rc, plain
-    if plain:
-        argv = []
-        for c in plain:
-            argv += (argv and [";"] or []) + c
-        rc = subprocess.run([real] + argv).returncode or rc
-        plain = []
-for c in cmds:
-    if c[0] != "if-shell":
-        plain.append(c); continue
-    flush()
-    assert c[-2] == "#{?#{@agent_paused},0,1}", c
-    flag = json.load(open(os.environ["FAKE_TMUX_STATE"]))["windows"]["@1"]["opts"].get("@agent_paused", "")
-    if not flag:
-        subprocess.run([real] + shlex.split(c[-1]))
-flush()
-sys.exit(rc)
+os.execv(real, [real] + sys.argv[1:])
 '''
 
     def with_if_shell(self):

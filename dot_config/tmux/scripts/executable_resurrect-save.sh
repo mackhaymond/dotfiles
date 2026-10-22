@@ -453,7 +453,23 @@ done < <(tr '\t' '\037' <"$WINDOWS")
 # the rest of the chain; those windows then save as ":" (no local value).
 [ "${#args[@]}" -gt 0 ] && tmux "${args[@]}" >"$AUTORENAME" 2>/dev/null
 
-STATE="$(tmux display-message -p "state${d}#{client_session}${d}#{client_last_session}" 2>/dev/null || true)"
+# The state line names the session a restore switches the client to, so it is
+# taken from the most recently active client in a session worth landing in.
+# A bare `display-message -p` resolved to whichever client was busiest, and
+# while the btop popup was open that was its nested client: on 2026-10-18 a
+# snapshot read `state btop-popup`, and a restore from it switched Mack into
+# that hidden session (recreated as a plain zsh, which the btop toggle then
+# attached to instead of btop). Excluded sessions and the hidden ones
+# (@space_hidden_sessions: popups, stash, scratch) are never written here; no
+# such client leaves the line blank, which restores into nothing special.
+HIDDEN=" $(tmux show-option -gqv @space_hidden_sessions 2>/dev/null) "
+state_ok() { [ -n "$1" ] && ! is_excluded "$1" && case "$HIDDEN" in *" $1 "*) false ;; *) true ;; esac; }
+STATE="state${d}${d}" state_act=-1
+while IFS="$US" read -r c_act c_sess c_last; do
+	state_ok "$c_sess" && [ "${c_act:-0}" -gt "$state_act" ] 2>/dev/null || continue
+	state_ok "$c_last" || c_last=""
+	STATE="state${d}${c_sess}${d}${c_last}" state_act="${c_act:-0}"
+done < <(tmux list-clients -F "#{client_activity}${US}#{client_session}${US}#{client_last_session}" 2>/dev/null)
 
 # --- write the layout -----------------------------------------------------------
 # The exclusion list goes through ENVIRON, not -v: awk would interpret

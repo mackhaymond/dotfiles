@@ -115,8 +115,10 @@ main() {
 
   local list
   list="$({
-    tmux list-sessions -F $'#{session_last_attached}\t#{session_name}' 2>/dev/null \
-      | awk -F $'\t' -v cur="$current_session" '$2 != cur && $2 != "scratch" && $2 != "agents" && $2 != "tasks" && $2 != "stash"' \
+    # Hidden = @space_hidden or listed in @space_hidden_sessions (pending,
+    # btop-popup, …), the same test double-tap-switch.sh uses (2026-10-22).
+    tmux list-sessions -F $'#{session_last_attached}\t#{?#{||:#{@space_hidden},#{m:* #{session_name} *, #{@space_hidden_sessions} }},1,0}\t#{session_name}' 2>/dev/null \
+      | awk -F $'\t' -v cur="$current_session" '$2 == "0" && $3 != cur { print $1 "\t" $3 }' \
       | sort -t $'\t' -k1,1nr \
       | cut -f2-
   } || true)"

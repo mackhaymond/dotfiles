@@ -459,6 +459,22 @@ class Nav(unittest.TestCase):
         self.dtap()                          # last-window: other's previous, not main's
         self.wait(lambda: self.on(c), self.e("other", self.other[0]))
 
+    def test_double_tap_session_target_skips_hidden_sessions(self):
+        # A pending popup's nested client attaching to `pending` makes it the
+        # most recently attached session; the flip must never land there (nor
+        # in any session named in @space_hidden_sessions).
+        self.t("set", "-g", "@double_tap_target", "session")
+        self.t("new-session", "-d", "-s", "pending")
+        self.t("set", "-t", "pending", "@space_hidden", "1")                 # as spaces.conf marks it
+        self.t("new-session", "-d", "-s", "btop-popup")                      # named in the list only
+        c = self.attach()
+        self.t("switch-client", "-c", c, "-t", "other")
+        time.sleep(1.1)                                                      # last_attached is in seconds
+        for s in ("pending", "btop-popup", "main"):
+            self.t("switch-client", "-c", c, "-t", s)
+        self.dtap()
+        self.wait(lambda: self.on(c).split(":")[0], self.sid["other"])
+
     def test_detach_forgets(self):
         c = self.attach()
         self.go(c, "main", self.main[1])

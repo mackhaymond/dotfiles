@@ -240,13 +240,20 @@ def collation(name=""):
 
 
 def needs_order(windows):
-    """agent-jump.sh `list`, in-process → window ids in priority order.
+    """agent-jump.sh `list`, in-process → (window id, session) pairs in
+    priority order.
 
     The same pipeline over the same list-windows rows: drop EXCLUDE sessions;
     tier failed 0 > needs-input 1 > done-without-a-fleet 2 (anything else is
     not in the queue); sort; a linked window (one row per session) keeps its
     first sorted row. Pinned to the real script by tests/test_agent_roster.py's
     NeedsOrderTests.
+
+    The session is the kept row's, i.e. `list`'s second column: a NEEDS YOU
+    row must be built from THAT row, not from whichever link a by-id dict
+    kept last. `list-windows -a` lists sessions by name, so for a window
+    linked into main and stash a by-id lookup got the stash row, and Enter
+    unstashed it, x killed it everywhere (2026-10-22).
 
     The sort is /usr/bin/sort's (2.3-Apple, FreeBSD's) exactly, for
     `-k1,1n -k2,2n -k3,3 -k4,4` with no -s, over the awk's full line:
@@ -274,9 +281,12 @@ def needs_order(windows):
         label = (w["summary"] or w["name"]).replace("\t", " ")
         line = "\t".join([str(tier), stamp, s, ix, w["id"], s, str(w["index"]), w["state"], stamp, label])
         key = (tier, int(stamp), xfrm(s), len(s), xfrm(ix), len(ix), xfrm(line), len(line))
-        keyed.append((key, w["id"]))
+        keyed.append((key, w))
     keyed.sort(key=lambda kv: kv[0])
-    return list(dict.fromkeys(wid for _, wid in keyed))
+    first = {}
+    for _, w in keyed:
+        first.setdefault(w["id"], (w["id"], w["session"]))
+    return list(first.values())
 
 
 def is_attn(w):
@@ -476,7 +486,9 @@ def build_items(windows, needs, cur_win, show_all=False, parked_open=False, quer
         hits.sort(key=lambda w: (w["session"] == HOLD, -w["last_attached"], w["session"], w["index"]))
         return [{"kind": "win", "w": w, "long": True, "key": ("hit", w["session"], w["id"])} for w in hits]
 
-    need_rows = [by_id[i] for i in dict.fromkeys(needs) if i in by_id]
+    # needs: needs_order's (id, session) pairs; each row is that exact link.
+    by_link = {(w["id"], w["session"]): w for w in windows}
+    need_rows = [by_link[n] for n in dict.fromkeys(needs) if n in by_link]
     if need_rows:
         items.append({"kind": "label", "text": "NEEDS YOU"})
         items.extend({"kind": "win", "w": w, "long": True, "key": ("need", w["id"])} for w in need_rows)
@@ -1671,8 +1683,8 @@ class Strip(Roster):
         global in both scopes. With @spaces on, a plain shell is never a row;
         with it off, the current window stays one even without an agent (the
         popup's rule: a prompt landing under the strip must stay visible)."""
-        by_id = {w["id"]: w for w in self.windows}
-        needs = [by_id[i] for i in dict.fromkeys(self.needs) if i in by_id]
+        by_link = {(w["id"], w["session"]): w for w in self.windows}     # needs_order's pairs
+        needs = [by_link[n] for n in dict.fromkeys(self.needs) if n in by_link]
         space = self.scope() == "space"
         self.ordinals = agent_ordinals(self.windows, self.cur_sess) if space else None
         by = {}

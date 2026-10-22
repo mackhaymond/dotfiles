@@ -351,6 +351,28 @@ class PauseKey(Harness):
         self.assertEqual((t["kind"], t["found_by"]), ("opencode", "command"))
         self.assertIn("1 working window had no agent pane", entry["message"])
 
+    def test_sessionless_target_needs_the_same_pane_process(self):
+        # A command-fallback target has no session id, only a pane id. After
+        # a server restore the same %N can be another agent: it must not get
+        # the RESUME (2026-10-22). respawn-pane keeps the id, new pane_pid.
+        b = self.dir / "bin"; b.mkdir()
+        shutil.copy("/bin/sleep", b / "opencode")
+        p = self.t("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "main:", "%s 600" % (b / "opencode"))
+        self.t("set", "-w", "-t", p, "@agent_state", "running")
+        self.t("set", "-w", "-t", p, "@agent_kind", "opencode")
+        deadline = time.time() + 5
+        while time.time() < deadline and self.t("display", "-p", "-t", p, "#{pane_current_command}") != "opencode":
+            time.sleep(0.05)
+        self.press()
+        (t,) = self.state()["targets"]
+        self.assertEqual((t["session_id"], t["pane_pid"], t["pane_cmd"]),
+                         ("", self.t("display", "-p", "-t", p, "#{pane_pid}"), "opencode"))
+        self.t("respawn-pane", "-k", "-t", p, "/bin/sleep 600")
+        self.record(p, "sid-another-agent")
+        entry = self.press()
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [])
+        self.assertEqual(entry["targets"][0]["detail"], "pane now runs something else")
+
     # -- round trip --------------------------------------------------------
     def test_resume_goes_to_the_saved_set_not_a_fresh_scan(self):
         a = self.window("running")
@@ -885,6 +907,36 @@ class Popup(Harness):
         self.press_done()
         self.assertIsNone(self.state())
 
+    def test_void_elsewhere_closes_the_pause_popup_as_voided(self):
+        # CuaNotch / the sidebar voids while the PAUSE popup is up: a neutral
+        # VOIDED, never "NOT RESUMED · dropped 0 unreachable agents".
+        self.window("running")
+        self.press_with_popup()
+        self.wait_for(lambda: self.popup_up("resume all now"), "the PAUSE popup")
+        view = self.dir / "state" / "view.pid"
+        self.assertTrue(view.exists())
+        # No notify.sh here (HOME is private), so a line would be tmux's own
+        # message, under which the popup draws no new frame: the void must
+        # leave the telling to the popup (2026-10-22 review).
+        r = self.run_script("void", "")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # The VOIDED view's own line; HEAD showed NOT RESUMED · dropped 0 here.
+        self.wait_for(lambda: self.popup_up("pause voided — agents left stopped"), "the VOIDED view")
+        self.press_done()
+        self.assertFalse(self.popup_up("could be reached"))
+        self.assertFalse(self.popup_up("dropped 0"))
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [])
+        self.assertFalse(view.exists())                    # the view cleans up after itself
+        self.assertEqual(self.last_log()["mode"], "void")  # the line is still logged
+
+    def test_void_with_no_pause_popup_still_says_so(self):
+        self.window("running")
+        self.press()                                       # no client: no popup
+        r = self.run_script("void", self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNone(self.state())
+        self.wait_for(lambda: self.popup_up("left stopped, not resumed"), "the void's message line")
+
     def test_enter_that_reaches_nobody_stays_paused(self):
         a = self.window("running")
         self.press_with_popup()
@@ -1084,6 +1136,42 @@ class Units(unittest.TestCase):
         self.assertEqual(bg, AP.PEACH)                     # never green
         self.assertTrue(all(r in text for r in AP.block("NOT RESUMED")))
         self.assertIn("dropped 1 unreachable agent", text)
+        self.assertEqual(lines[-1].strip(), "closes in 2s · any key to close")
+
+    def test_locate_sessionless_target_by_pane_pid(self):
+        panes = {"%7": {"pane_pid": "500", "pane_current_command": "opencode"}}
+        t = {"pane_id": "%7", "session_id": "", "pane_pid": "500", "pane_cmd": "opencode", "kind": "opencode"}
+        other = (None, "pane now runs something else")
+        self.assertEqual(AP.locate(t, panes, {}), ("%7", ""))
+        self.assertEqual(AP.locate(dict(t, pane_pid="400"), panes, {}), other)   # renumbered after a restore
+        self.assertEqual(AP.locate({"pane_id": "%7", "session_id": "", "kind": "opencode"}, panes, {}),
+                         ("%7", ""))                                          # saved before pane_pid
+        self.assertEqual(AP.locate(t, {}, {}), (None, "pane gone"))
+        # The same shell (same pane_pid) now runs another agent: quit opencode,
+        # start claude there; or one that has a session record (2026-10-22 review).
+        claude = {"%7": dict(panes["%7"], pane_current_command="2.1.170")}
+        self.assertEqual(AP.locate(t, claude, {}), other)
+        self.assertEqual(AP.locate(t, {"%7": dict(panes["%7"], pane_current_command="zsh")}, {}), other)
+        self.assertEqual(AP.locate(t, panes, {"%7": {"session_id": "sid-x", "kind": "opencode"}}), other)
+        # A claude whose version string is its command is still that claude.
+        c = dict(t, pane_cmd="2.1.170", kind="claude")
+        self.assertEqual(AP.locate(c, claude, {}), ("%7", ""))
+
+    def test_void_is_not_a_failed_resume(self):
+        # void_pause's paused.last.json: paused.json + voided_at, no `resume`.
+        base = AP.baseline({"paused_at": "T1", "targets": [{}]})
+        last = {"paused_at": "T1", "targets": [{}], "voided_at": "T9", "still_paused": 0}
+        self.assertTrue(AP.voided(last, base))
+        self.assertFalse(AP.voided(dict(last, paused_at="T0"), base))   # an older pause's void
+        self.assertFalse(AP.voided({"paused_at": "T1", "resume": []}, base))
+        self.assertFalse(AP.voided(last, None))
+        self.assertEqual(AP.on_key("voided", b"x"), "close")
+        bg, lines = AP.build_frame("voided", [("a", "m:1.0", AP.STOPPED)], 100, 24, 0, close_in=2)
+        text = "\n".join(lines)
+        self.assertEqual(bg, AP.LAVENDER)                  # neither green nor peach
+        self.assertTrue(all(r in text for r in AP.block("VOIDED")))
+        self.assertIn("left stopped, not resumed", text)
+        self.assertNotIn("could be reached", text)
         self.assertEqual(lines[-1].strip(), "closes in 2s · any key to close")
 
     def test_agent_command_fallback(self):

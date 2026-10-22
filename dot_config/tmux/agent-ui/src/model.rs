@@ -366,8 +366,9 @@ fn awk_int(s: &str) -> i64 {
 /// on `[ \t\n]+`, leading blanks skipped) when it is all ASCII digits, else
 /// NO_STAMP; the index key is `%09d`.
 ///
-/// FREE TEXT. agent-jump.sh reads its own 7-field row (`id US session US
-/// index US state US workflow US since US summary-or-name`) through awk, so a
+/// FREE TEXT. agent-jump.sh reads its own 8-field row (`id US session US
+/// index US state US workflow US since US paused US summary-or-name`; done
+/// with a paused flag is not queued) through awk, so a
 /// newline in any value ends that record (the rest is a record of its own)
 /// and a US starts a new field. This function rebuilds exactly that row from
 /// the window's real values and runs the awk rules over every record of it,
@@ -380,7 +381,13 @@ pub fn needs_order(windows: &[Window], coll: &Collator) -> Vec<NeedRow> {
     let mut lines: Vec<String> = Vec::new();
     for w in windows {
         let label = if w.summary.is_empty() { &w.name } else { &w.summary };
-        let raw = [w.id.as_str(), &w.session, &w.index.to_string(), &w.state, &w.workflow, &w.since, label].join(&us);
+        // The script's row carries the RAW @agent_state (a paused flag that
+        // holds a newline is "" in the first record, so its `done` queues
+        // there). A state set after parsing (tests) no longer folds from the
+        // raw one: then it is the state.
+        let state = if paused_state(&w.raw_state, &w.paused) == w.state { &w.raw_state } else { &w.state };
+        let raw = [w.id.as_str(), &w.session, &w.index.to_string(), state, &w.workflow, &w.since, &w.paused, label]
+            .join(&us);
         for rec in raw.split('\n') {
             let f: Vec<&str> = rec.split(&us).collect();
             let g = |i: usize| f.get(i - 1).copied().unwrap_or("");
@@ -390,12 +397,12 @@ pub fn needs_order(windows: &[Window], coll: &Collator) -> Vec<NeedRow> {
             let tier = match g(4) {
                 "failed" => 0,
                 "needs-input" => 1,
-                "done" if g(5).is_empty() => 2,
+                "done" if g(5).is_empty() && g(7).is_empty() => 2,
                 _ => continue,
             };
             let word = g(6).split([' ', '\t', '\n']).find(|s| !s.is_empty()).unwrap_or("");
             let stamp = if !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()) { word } else { NO_STAMP };
-            let label = g(7).replace('\t', " ");
+            let label = g(8).replace('\t', " ");
             lines.push(format!(
                 "{tier}\t{stamp}\t{s}\t{ix:09}\t{id}\t{s}\t{idx}\t{st}\t{stamp}\t{label}",
                 s = g(2),
@@ -664,14 +671,21 @@ mod tests {
         for (id, summary, since) in [
             ("@1", "a\nb", "5 x"),
             ("@2", "c\x1fd", "6 x"),
-            ("@3", "x\n@9\x1fmain\x1f7\x1ffailed\x1f\x1f1\x1ffake", "7 x"),
+            ("@3", "x\n@9\x1fmain\x1f7\x1ffailed\x1f\x1f1\x1f\x1ffake", "7 x"),
             ("@4", "tab\there", "8\nx"),
+            // The script's row is 8 fields (paused 7th): a smuggled 7-field
+            // `done` record has "fake" as its paused flag, so it is skipped.
+            ("@5", "x\n@1\x1fmain\x1f1\x1fdone\x1f\x1f1\x1ffake", "9 x"),
         ] {
             let mut w = Window::parse(&row("main", 1, id, &[("state", "failed"), ("since", "0")])).unwrap();
             w.summary = summary.into();
             w.since = since.into();
             ws.push(w);
         }
+        // done with a paused flag that starts with a newline: folded to
+        // paused here, but the script's first record has an empty $7.
+        ws.push(Window::parse(&row("main", 1, "@6", &[("state", "done"), ("paused", "\n5"), ("since", "10")])).unwrap());
+        assert_eq!(ws[5].state, "paused");
         let got: Vec<String> = needs_order(&ws, &c).iter().map(|r| r.list_line()).collect();
         assert_eq!(got, [
             "@9\tmain\t7\tfailed\t1\tfake", // a record smuggled in after a newline: awk lists it too
@@ -679,6 +693,8 @@ mod tests {
             "@2\tmain\t1\tfailed\t6\tc",
             "@3\tmain\t1\tfailed\t7\tx",
             "@4\tmain\t1\tfailed\t8\t", // a newline in since ends the record before the label
+            "@5\tmain\t1\tfailed\t9\tx",
+            "@6\tmain\t1\tdone\t10\t",
         ]);
         assert_eq!((awk_int("12a"), awk_int(""), awk_int(" -3.9"), awk_int("1e3x"), awk_int("x1")), (12, 0, -3, 1000, 0));
     }

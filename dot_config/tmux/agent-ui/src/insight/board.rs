@@ -266,6 +266,9 @@ pub struct Board {
     published: Option<Published>,
     /// A complete pass landed since it holds the lock.
     complete_seen: bool,
+    /// What the last publish wrote (the map, the complete flag): a result
+    /// that changed neither is not written again.
+    sent: Option<(BTreeMap<String, Insight>, bool)>,
     /// The engine's generation last taken.
     seen: u64,
     /// `.gen`'s text last mirrored.
@@ -291,6 +294,7 @@ impl Board {
             gave_up: false,
             published: None,
             complete_seen: false,
+            sent: None,
             seen: 0,
             stamp: None,
             mirror: BTreeMap::new(),
@@ -366,7 +370,7 @@ impl Board {
         sweep_others(&self.dir, key);
         self.lock = Some(lock);
         self.published = Some(Published::new(self.dir.clone(), key.to_string()));
-        (self.solo, self.complete_seen, self.stamp, self.seen) = (false, false, None, 0);
+        (self.solo, self.complete_seen, self.stamp, self.seen, self.sent) = (false, false, None, 0, None);
         self.mirror.clear();
     }
 
@@ -409,11 +413,23 @@ impl Board {
     /// The holder's writes after a result: the `.files`, `.json`, `.gen`
     /// (then the lock touched, the notice posted). A failed write ends its
     /// publishing.
+    ///
+    /// A result the same as the last one written (the map and the complete
+    /// flag) writes nothing and posts nothing; only the lock is touched, so
+    /// LOCK_AGE never trips. (2026-10-22: the engine's generation moves on
+    /// every pass, so every 2-5 s the holder fsynced `.json` and `.gen` on
+    /// its UI thread and woke every mirror to decode the same content.)
     fn publish(&mut self) {
         let (Some(p), Some(k)) = (self.published.as_mut(), self.key.clone()) else { return };
         let (map, complete, g) = self.insights.result();
         self.complete_seen |= complete;
         p.sync(&map, self.complete_seen);
+        if self.sent.as_ref().is_some_and(|(m, c)| *c == self.complete_seen && *m == map) {
+            if let Some(l) = &self.lock {
+                let _ = l.set_modified(SystemTime::now());
+            }
+            return;
+        }
         let stamp = format!("{} {g} {}", std::process::id(), u8::from(self.complete_seen));
         let wrote = write_atomic(&json_path(&self.dir, &k), &encode(&stamp, &map)).and_then(|_| write_atomic(&gen_path(&self.dir, &k), &stamp));
         if wrote.is_err() {
@@ -421,6 +437,7 @@ impl Board {
             (self.no_publish, self.solo) = (true, true);
             return;
         }
+        self.sent = Some((map, self.complete_seen));
         if let Some(l) = &self.lock {
             let _ = l.set_modified(SystemTime::now());
         }
@@ -681,6 +698,29 @@ mod tests {
         a.refresh(&snap(), None);
         settle(&mut a);
         assert!(a.holder() && a.insights.generation() > g);
+        drop(a);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A pass whose result is the same as the last one published writes
+    /// neither `.json` nor `.gen` (nor posts), but still touches the lock.
+    #[test]
+    fn the_same_result_is_not_published_again() {
+        let d = dir("same");
+        let mut a = Board::new(counted(&Arc::new(AtomicUsize::new(0)), Duration::ZERO), d.clone());
+        a.refresh(&snap(), Some(K));
+        settle(&mut a);
+        assert!(gen_path(&d, K).is_file());
+        // Marked, so a rewrite would show; the lock dated back.
+        write_atomic(&gen_path(&d, K), "mark").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        File::options().write(true).open(lock_path(&d, K)).unwrap().set_modified(old).unwrap();
+        let g = a.insights.generation();
+        a.refresh(&snap(), Some(K));
+        settle(&mut a);
+        assert!(a.insights.generation() > g, "the engine ran again");
+        assert_eq!(fs::read_to_string(gen_path(&d, K)).unwrap(), "mark");
+        assert!(fs::metadata(lock_path(&d, K)).unwrap().modified().unwrap() > old);
         drop(a);
         let _ = fs::remove_dir_all(&d);
     }

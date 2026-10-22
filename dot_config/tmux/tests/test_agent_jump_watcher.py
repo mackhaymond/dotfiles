@@ -56,13 +56,44 @@ def wvars(s, wid):
     v.update(w.get("opts", {}))
     return v
 
+def truth(fmt, v):
+    # if-shell -F's condition: #{name}, #{==:a,b}, #{!=:a,b}, #{&&:a,b},
+    # #{||:a,b}, #{?c,a,b}, innermost first. True = non-empty and not "0".
+    t = lambda x: x not in ("", "0")
+    def one(m):
+        x = m.group(1)
+        for op, f in (("==:", lambda a, b: a == b), ("!=:", lambda a, b: a != b),
+                      ("&&:", lambda a, b: t(a) and t(b)), ("||:", lambda a, b: t(a) or t(b))):
+            if x.startswith(op):
+                a, b = (x[3:].split(",", 1) + [""])[:2]
+                return "1" if f(a, b) else "0"
+        if x.startswith("?"):
+            c_, a, b = (x[1:].split(",", 2) + ["", ""])[:3]
+            return a if t(c_) else b
+        return str(v.get(x, ""))
+    while True:
+        n = re.sub(r"#\{([^#{}]*)\}", one, fmt)
+        if n == fmt: return t(fmt)
+        fmt = n
+
 with p.with_suffix(".lock").open("a") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     s = json.loads(p.read_text())
     rc, out = 0, []
-    for c in split_cmds(sys.argv[1:]):
+    # A queue, not a for: a true if-shell -F runs its command string's
+    # commands next, in this same locked call (the watcher's cas_write).
+    q = split_cmds(sys.argv[1:])
+    while q:
+        c = q.pop(0)
         s["calls"].append(c)
         cmd = c[0]
+        if cmd == "if-shell":
+            t = arg(c, "-t")
+            if t not in s["windows"]: rc = 1; break
+            if "-F" in c and truth(c[-2], wvars(s, t)):
+                import shlex
+                q[0:0] = split_cmds(shlex.split(c[-1]))
+            continue
         if cmd == "list-windows":
             for wid in s["windows"]:
                 out.append(render(arg(c, "-F"), wvars(s, wid)))
@@ -100,6 +131,7 @@ with p.with_suffix(".lock").open("a") as lock:
                 else: s["globals"][name] = val
             else:
                 if t not in s["windows"]: rc = 1; continue
+                if "-F" in c: val = render(val, wvars(s, t))
                 o = s["windows"][t].setdefault("opts", {})
                 if unset: o.pop(name, None)
                 else: o[name] = val

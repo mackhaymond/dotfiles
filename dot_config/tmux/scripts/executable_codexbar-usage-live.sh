@@ -168,7 +168,8 @@ SRC="$HOME/.config/tmux/scripts/codexbar-usage-status.sh"
 # The SESSION's own config, CLAUDE_CONFIG_DIR included: the rate_limits this
 # script is handed are that session's, so the stamp is that session's account
 # (a `cswap run N` profile's, there). codexbar-usage-status.sh ignores samples
-# stamped for an account other than the default login.
+# stamped for an account other than the default login, so such a session
+# writes no sample at all (profile_session below).
 CLAUDE_GLOBAL_CONFIG="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
 
 incoming="${1:-}"
@@ -195,13 +196,28 @@ fi
 # The same key codexbar-usage-status.sh computes (CLAUDE_ACCOUNT_JQ there):
 # lower-cased email, plus "/<organization uuid>" when there is one. Empty when
 # the file is missing or holds no login; then nothing is stamped or fenced.
-account=''
-if [[ -f "$CLAUDE_GLOBAL_CONFIG" ]]; then
-  account="$(jq -r '(.oauthAccount // {}) as $a
+account_key_of() {
+  [[ -f "$1" ]] || return 0
+  jq -r '(.oauthAccount // {}) as $a
     | (($a.emailAddress // "") | tostring) as $e
     | (($a.organizationUuid // "") | tostring) as $o
     | if $e == "" then "" else ($e | ascii_downcase) + (if $o == "" then "" else "/" + $o end) end
-  ' "$CLAUDE_GLOBAL_CONFIG" 2>/dev/null)" || account=''
+  ' "$1" 2>/dev/null || true
+}
+account="$(account_key_of "$CLAUDE_GLOBAL_CONFIG")"
+
+# A PROFILE session (`cswap run N`: CLAUDE_CONFIG_DIR naming another account
+# than the default login) feeds the session map only, never the sample. The
+# sample is one file for every session, and the status script ignores one
+# stamped for another account than the default login anyway; written, it read
+# as an account switch: each idle repaint of the profile session replaced the
+# default account's live readings and `seen` with a fence, and woke
+# --merge-live for nothing (2026-10-22 review). Unknown either way (a torn
+# file) is judged below as before.
+profile_session=0
+if [[ -n "${CLAUDE_CONFIG_DIR:-}" && -n "$account" ]]; then
+  default_account="$(account_key_of "$HOME/.claude.json")"
+  [[ -n "$default_account" && "$default_account" != "$account" ]] && profile_session=1
 fi
 
 # Unreadable (a torn write, a logout) means UNKNOWN, not "the same account as
@@ -363,6 +379,7 @@ if [[ "$newmap" == '{'* ]]; then
          || rm -f "$mtmp" 2>/dev/null; }
 fi
 
+(( profile_session )) && exit 0
 [[ "$merged" == "$prev" ]] && exit 0
 
 tmp="$(mktemp "${SAMPLE}.tmp.XXXXXX" 2>/dev/null)" || exit 0

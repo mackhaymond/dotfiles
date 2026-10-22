@@ -108,10 +108,11 @@ pub fn comm_kind(comm: &str) -> &'static str {
     }
 }
 
-/// The `list-panes` format [`pick_agent_pane`] reads: id, tty, active, and
-/// the dashboard mark ([`crate::tmux::DASH_OPTION`]).
+/// The `list-panes` format [`pick_agent_pane`] reads: id, tty, active, the
+/// dashboard mark ([`crate::tmux::DASH_OPTION`]) and the home-shell mark
+/// (`@space_home_pane`: [`is_home_pane`]).
 pub fn pane_rows_format() -> String {
-    ["#{pane_id}", "#{pane_tty}", "#{pane_active}", "#{@space_dash_pane}"].join(&US.to_string())
+    ["#{pane_id}", "#{pane_tty}", "#{pane_active}", "#{@space_dash_pane}", "#{@space_home_pane}"].join(&US.to_string())
 }
 
 /// The rows of a `list-panes` ([`pane_rows_format`], or the Python's three
@@ -119,7 +120,7 @@ pub fn pane_rows_format() -> String {
 fn pane_rows(panes_text: &str) -> Vec<Vec<&str>> {
     panes_text
         .lines()
-        .filter(|l| matches!(l.matches(US).count(), 2 | 3))
+        .filter(|l| matches!(l.matches(US).count(), 2..=4))
         .map(|l| l.split(US).collect::<Vec<_>>())
         .filter(|r| r.get(3).is_none_or(|d| d.is_empty() || *d == "0"))
         .collect()
@@ -181,6 +182,17 @@ pub fn pick_agent_pane(panes_text: &str, ps_text: Option<&str>, kind: &str) -> R
     }
     Err(PANE_UNSURE)
 }
+
+/// `pane` is a space's HOME shell pane (`@space_home_pane` set in its
+/// [`pane_rows_format`] row): never closed by hand (spaces.conf's prefix x
+/// / C-l refuse it; prefix Q closes the space).
+pub fn is_home_pane(panes_text: &str, pane: &str) -> bool {
+    pane_rows(panes_text).iter().any(|r| r[0] == pane && r.get(4).is_some_and(|h| !h.is_empty() && *h != "0"))
+}
+
+/// The refusals of parking a space's home window or closing its home pane.
+pub const HOME_PARK: &str = "a space's home is never parked · prefix Q closes the space";
+pub const HOME_CLOSE: &str = "home is this space's main shell · prefix Q closes the space";
 
 /// stash.sh `agent_running`'s refusal, from the tab's own options: a state
 /// other than "", idle, done, needs-*, failed (`running`, or anything
@@ -412,6 +424,11 @@ impl Actions {
         if w.space_hidden || crate::model::HIDDEN.contains(&w.session.as_str()) {
             return Err(format!("{} isn't in a space, can't park", w.label));
         }
+        // (2026-10-22: the ⌥W menu lists a home running an agent, and
+        // stash.sh does not check; parked, the space lost its home.)
+        if w.home {
+            return Err(HOME_PARK.into());
+        }
         if park_refused_busy(w) {
             return Err(format!("{} is working, can't park", w.label));
         }
@@ -422,14 +439,19 @@ impl Actions {
     /// `x` after its y. A parked tab goes through stash.sh's own discard
     /// (`kill-many`, which logs a suspended conversation's id); anything
     /// else closes the agent's pane through closed-tabs.sh (⌘Z restores it),
-    /// or is refused when the pane can't be told.
+    /// or is refused when the pane can't be told, or is a space's home shell
+    /// pane (as prefix x refuses it; an agent in a split of the home window
+    /// still closes).
     pub fn close(&self, snap: &Snapshot, win: &str, session: &str) -> Result<String, String> {
         let w = self.recheck(snap, win, session)?;
         if w.session == HOLD {
             self.run_bg_script("stash.sh", &["kill-many", &w.id]);
             return Ok(format!("discarded {} · its session id is in the stash log", w.label));
         }
-        let pane = self.agent_pane(&w.id, &w.kind)?;
+        let (pane, home) = self.agent_pane_row(&w.id, &w.kind)?;
+        if home {
+            return Err(HOME_CLOSE.into());
+        }
         self.run_bg_script("closed-tabs.sh", &["close", &pane]);
         Ok(format!("closed {} · ⌘Z brings it back", w.label))
     }
@@ -445,6 +467,12 @@ impl Actions {
     /// server (`kind`: the window's `@agent_kind`); `ps` only runs for a
     /// split window.
     pub fn agent_pane(&self, win: &str, kind: &str) -> Result<String, String> {
+        self.agent_pane_row(win, kind).map(|(p, _)| p)
+    }
+
+    /// [`agent_pane`](Self::agent_pane), and whether that pane is the
+    /// space's home shell pane ([`is_home_pane`]).
+    fn agent_pane_row(&self, win: &str, kind: &str) -> Result<(String, bool), String> {
         let out = match self.tmux.run(&["list-panes", "-t", win, "-F", &pane_rows_format()]) {
             Ok(o) if o.ok() => o.stdout,
             _ => return Err(PANE_GONE.into()),
@@ -457,7 +485,9 @@ impl Actions {
         } else {
             None
         };
-        pick_agent_pane(&out, ps.as_deref(), kind).map_err(String::from)
+        let pane = pick_agent_pane(&out, ps.as_deref(), kind)?;
+        let home = is_home_pane(&out, &pane);
+        Ok((pane, home))
     }
 
     /// agent-roster.py `peek_lines`, with colours: the last `n` lines of the
@@ -578,7 +608,7 @@ mod tests {
     #[test]
     fn dashboard_panes_are_never_targets() {
         use crate::tmux::tests::row;
-        assert!(pane_rows_format().ends_with("\x1f#{@space_dash_pane}"));
+        assert!(pane_rows_format().ends_with("\x1f#{@space_dash_pane}\x1f#{@space_home_pane}"));
         // Dashboard + shell: the shell is the window's one pane, no ps asked.
         let home = "%3\x1f/dev/ttys003\x1f1\x1f1\n%4\x1f/dev/ttys004\x1f0\x1f";
         assert_eq!(pane_rows(home).len(), 1);
@@ -595,6 +625,22 @@ mod tests {
         assert_eq!(Actions::focus_shell_command(&w), None);
         let w = Window::parse(&row("main", 1, "@2", &[])).unwrap();
         assert_eq!(Actions::focus_shell_command(&w), None);
+    }
+
+    /// The home shell pane (`@space_home_pane`) is what close refuses: an
+    /// agent in the home pane itself, never one in a split beside it.
+    #[test]
+    fn the_home_pane_is_told() {
+        // Dashboard + the home shell running claude: that pane, and it is home.
+        let home = "%3\x1f/dev/ttys003\x1f0\x1f1\x1f\n%4\x1f/dev/ttys004\x1f1\x1f\x1f1";
+        let pane = pick_agent_pane(home, None, "claude").unwrap();
+        assert_eq!((pane.as_str(), is_home_pane(home, &pane)), ("%4", true));
+        // A split of the home window: the agent's pane is not home.
+        let split = format!("{home}\n%5\x1f/dev/ttys005\x1f0\x1f\x1f");
+        let pane = pick_agent_pane(&split, Some("ttys005 claude\n"), "claude").unwrap();
+        assert_eq!((pane.as_str(), is_home_pane(&split, &pane)), ("%5", false));
+        // The Python's three fields, and an unknown pane: never home.
+        assert!(!is_home_pane("%7\x1f/dev/ttys009\x1f1", "%7") && !is_home_pane(home, "%9"));
     }
 
     /// Going to a space lands on its HOME window, wherever the session's
@@ -670,6 +716,9 @@ mod tests {
         for (win, label) in [("@5", "Asks"), ("@6", "Quiet"), ("@7", "Broke"), ("@8", "Done"), ("@11", "Paused"), ("@12", "Flagged")] {
             assert_eq!(a.park(&snap, win, "main"), Ok(format!("parking {label}…")));
         }
+        // A space's home (an idle agent in it): never parked.
+        let home = Snapshot::parse(&row("main", 0, "@14", &[("state", "idle"), ("summary", "Home"), ("home", "1")]));
+        assert_eq!(a.park(&home, "@14", "main"), Err(HOME_PARK.to_string()));
     }
 
     /// Going to a pending space's claude (its card, a NEEDS YOU card, the

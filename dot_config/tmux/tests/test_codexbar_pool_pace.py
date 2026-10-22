@@ -212,12 +212,16 @@ class Home:
         return block
 
     def published(self, option):
+        # One tmux call can set several (`set-option … ; set-option …`).
         prefix = f'set-option -gq {option} '
         value = None
         if self.tmux_log.exists():
             for line in self.tmux_log.read_text().splitlines():
-                if line.startswith(prefix):
-                    value = line[len(prefix):]
+                for part in line.split(' ; '):
+                    if part.startswith(prefix):
+                        value = part[len(prefix):]
+                    elif part == prefix.rstrip():
+                        value = ''
         return value
 
     def pace_opts(self):

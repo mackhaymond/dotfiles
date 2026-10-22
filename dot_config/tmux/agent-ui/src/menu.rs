@@ -167,7 +167,11 @@ impl Source {
     }
 
     pub fn load(&mut self) -> Data {
-        self.core.snapshot = self.core.tmux.snapshot();
+        // A failed call keeps the last snapshot: an empty one would drop
+        // every row (and the selection) for one busy tick.
+        if let Some(s) = self.core.tmux.try_snapshot() {
+            self.core.snapshot = s;
+        }
         let keys = if self.persist { Some(&mut self.keys) } else { None };
         let mut d = Data::build_with(&self.core.snapshot, self.client.as_deref(), text::now(), &self.core.collator,
             Some(&mut self.core.git), actions::watcher_age(), &mut self.core.slots, keys);

@@ -64,12 +64,17 @@ case "$(tmux show -gv @double_tap_target 2>/dev/null)" in
     ;;
   session)
     current="$(tmux display-message -t "$client" -p '#S')"
-    # Same list and order as mru-session-switch.sh, minus the picker. Space-separated:
+    # Most recently attached first, the order mru-session-switch.sh's picker
+    # uses (its skip list is still its own hard-coded four). Space-separated:
     # in Karabiner's bare env (no LANG) tmux prints a tab as `_`. The name is the
-    # rest of the line, so a name with spaces still compares whole.
-    target="$(tmux list-sessions -F '#{session_last_attached} #{session_name}' |
-      awk -v cur="$current" '{ n = substr($0, index($0, " ") + 1) }
-        n != cur && n != "scratch" && n != "agents" && n != "tasks" && n != "stash"' |
+    # rest of the line, so a name with spaces still compares whole. Hidden
+    # sessions are skipped as nav.sh's HIDDEN does (@space_hidden, or named in
+    # @space_hidden_sessions): a hard-coded four once let a pending popup's
+    # nested client, attaching to `pending`, make it the "most recent" one and
+    # the flip switched the real client into it (2026-10-22).
+    target="$(tmux list-sessions -F '#{session_last_attached} #{?#{||:#{@space_hidden},#{m:* #{session_name} *, #{@space_hidden_sessions} }},1,0} #{session_name}' |
+      awk -v cur="$current" '{ r = substr($0, index($0, " ") + 1); h = substr(r, 1, 1); n = substr(r, 3) }
+        h == "0" && n != cur { print $1, n }' |
       sort -k1,1nr | head -1 | cut -d' ' -f2-)"
     if [[ -n "$target" ]]; then
       tmux switch-client -c "$client" -t "=$target"

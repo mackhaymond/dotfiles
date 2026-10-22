@@ -243,15 +243,18 @@ use super::status::{ink_on, ink_rgb, tmux_colour, Bar, Kind, Toast, ToastId, Usa
 use crate::actions::watcher_problem;
 use crate::model::{Cat, Counts, Flag, PAUSED_GLYPH, PAUSED_HUE};
 use crate::palette;
-use crate::text::{clip, dwidth, fit_label, plain, sanitize};
+// WezTerm draws the sidebar, so its cells are WezTerm's (2026-10-22: they
+// were tmux's, see [`crate::text::wez`]).
+use crate::text::wez::{clip, clusters, dwidth, fit_label};
+use crate::text::{plain, sanitize};
 pub use crate::view::space_order;
 use crate::view::{Agent, Need, Space, ViewModel};
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, CellDiffOption, CellWidth};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use std::cmp::Reverse;
+use std::num::NonZeroU16;
 use std::ops::Range;
-use unicode_width::UnicodeWidthStr;
 
 /// A palette colour name ([`palette::HEX`] or [`palette::UI`]).
 pub type Hue = &'static str;
@@ -1725,15 +1728,16 @@ fn clip_left(text: &str, room: usize) -> String {
     if room == 0 {
         return String::new();
     }
-    let mut tail: Vec<char> = Vec::new();
+    // Whole clusters (2026-10-22: by char, a VS16 could end up after the
+    // `…` without its base, two cells wide).
+    let mut tail: Vec<String> = Vec::new();
     let mut used = 1;
-    for c in text.chars().rev() {
-        let cw = dwidth(&c.to_string());
+    for (t, cw) in clusters(text).into_iter().rev() {
         if used + cw > room {
             break;
         }
         used += cw;
-        tail.push(c);
+        tail.push(t);
     }
     format!("…{}", tail.into_iter().rev().collect::<String>())
 }
@@ -3731,6 +3735,15 @@ pub fn paint(frame: &Frame, buf: &mut Buffer) {
 /// `segs` drawn on row `y` from cell `x0` of the buffer's area, each at the
 /// cells the layout counted (a segment never spills into the next, whatever
 /// width ratatui gives a grapheme), clipped at the area's edge.
+///
+/// Each cluster ([`clusters`], the layout's own cells: WezTerm's) goes in at
+/// the column the layout counted, and where ratatui would size it otherwise
+/// (`❤️`: two cells to `unicode-width`, one as WezTerm draws it) its head
+/// cell carries [`CellDiffOption::ForcedWidth`], so the diff emits the next
+/// cell where WezTerm's cursor really is. A zero-cell cluster (a soft
+/// hyphen) is not drawn. (2026-10-22: with `set_stringn` the rest of such a
+/// row landed a cell off on screen, the last cell wrapping onto the next
+/// row; then the cells were tmux's, so a `✌` left a stale cell after it.)
 fn put(buf: &mut Buffer, x0: usize, y: u16, segs: &[Seg], row_bg: Color) {
     let area = buf.area;
     let mut x = x0;
@@ -3745,8 +3758,27 @@ fn put(buf: &mut Buffer, x0: usize, y: u16, segs: &[Seg], row_bg: Color) {
             if s.italic {
                 st = st.add_modifier(Modifier::ITALIC);
             }
-            buf.set_style(Rect::new(area.x + x as u16, y, sw.min(room) as u16, 1), st);
-            buf.set_stringn(area.x + x as u16, y, &s.text, sw.min(room), st);
+            let end = x + sw.min(room);
+            buf.set_style(Rect::new(area.x + x as u16, y, (end - x) as u16, 1), st);
+            let mut cx = x;
+            for (t, cw) in clusters(&s.text) {
+                if cx + cw > end {
+                    break; // no half a glyph at the edge
+                }
+                if cw > 0 {
+                    // (A control character keeps its cell, blank.)
+                    let sym = if t.contains(char::is_control) { " " } else { t.as_str() };
+                    let cell = &mut buf[(area.x + cx as u16, y)];
+                    cell.set_symbol(sym).set_style(st);
+                    if sym.cell_width() != cw as u16 {
+                        cell.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(cw as u16).unwrap_or(NonZeroU16::MIN)));
+                    }
+                    for k in cx + 1..cx + cw {
+                        buf[(area.x + k as u16, y)].set_symbol(" ").set_style(st);
+                    }
+                }
+                cx += cw;
+            }
         }
         x += sw;
     }
@@ -3795,7 +3827,7 @@ pub fn to_ansi(buf: &Buffer) -> String {
                 last = Some(key);
             }
             out.push_str(c.symbol());
-            skip = c.symbol().width().saturating_sub(1);
+            skip = usize::from(c.cell_width()).saturating_sub(1); // ForcedWidth too
         }
         out.push_str("\x1b[0m\n");
     }

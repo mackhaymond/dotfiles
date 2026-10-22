@@ -38,7 +38,9 @@ SCRIPT = HERE / "scripts" / "executable_space.sh"
 DASH = HERE / "scripts" / "executable_space-dash.sh"
 NOTIFY = HERE / "scripts" / "executable_notify.sh"
 ROSTER = HERE / "scripts" / "executable_agent-roster.py"
-WEZTERM = HERE.parent / "wezterm" / "wezterm.lua.tmpl"
+STASH = HERE / "scripts" / "executable_stash.sh"
+STASH_ROOT_CONF = HERE / "scripts" / "stash-root-keys.conf"
+WEZTERM =HERE.parent / "wezterm" / "wezterm.lua.tmpl"
 TMUX = shutil.which("tmux")
 HIDDEN = "agents tasks stash scratch btop-popup pending"
 COLS, ROWS = 140, 20
@@ -59,7 +61,7 @@ def conf_line(prefix):
 
 
 # tmux.conf lines spaces.conf rebinds when on and restores verbatim when off.
-TODAY_BINDS = [conf_line(p) for p in ("bind c ", "bind C-t ", "bind k ", "bind K ", "bind C-k ", "bind x ", "bind C-l ")]
+TODAY_BINDS = [conf_line(p) for p in ("bind c ", "bind C-t ", "bind R ", "bind k ", "bind K ", "bind C-k ", "bind x ", "bind C-l ")]
 # The session picker and the Option-W menu: tmux.conf binds them on every
 # load; spaces.conf unbinds the picker / gives M-w to the agent leader when on,
 # and leaves them alone when off (prefix r re-runs tmux.conf first).
@@ -100,7 +102,7 @@ class ConfigShape(unittest.TestCase):
         # Option-N's is; tmux.conf's own C-t / K are gone from the on branch.
         on = on_branch().splitlines()
         popup = ("bind {key} run-shell -C \"display-popup -c '#{{client_tty}}' -E -w 80% -h 70% -x '##{{E:@popup_x}}' "
-                 "-d '#{{pane_current_path}}' \\\"#{{@space_sh}} pick-tab {kind} '#{{client_tty}}'\\\"\"")
+                 "-d '##{{pane_current_path}}' \\\"#{{@space_sh}} pick-tab {kind} '#{{client_tty}}'\\\"\"")
         self.assertIn(popup.format(key="C-t", kind="shell"), on)
         self.assertIn(popup.format(key="K", kind="agent"), on)
         self.assertEqual([l for l in on if l.startswith(("bind C-t ", "bind K "))],
@@ -174,6 +176,16 @@ class ConfigShape(unittest.TestCase):
     def test_no_meta_j_k(self):
         # Claude Code binds meta+j (app:toggleTerminal); next/prev use M-l/M-h.
         self.assertNotRegex(on_branch(), r"(?m)^bind -n M-[jk] ")
+
+    def test_jump_binds_every_stash_root_key(self):
+        # A key `jump` misses falls back to root, where prefix v's
+        # stash-root-keys.conf binds these while a selection exists (or stale
+        # after one): ⌥W then Enter typed \r into the pane, or parked the
+        # selection. Each must be bound in `jump`, so it never gets there.
+        keys = re.search(r'(?m)^STASH_ROOT_KEYS="([^"]*)"$', STASH.read_text()).group(1).split()
+        self.assertIn("Enter", keys)
+        jump = set(re.findall(r"^bind -T jump (\S+) ", on_branch(), re.M))
+        self.assertEqual(set(keys) - jump, set())
 
     def test_off_binds_prefix_meta_digits_to_windows(self):
         self.assertEqual([l.split()[5] for l in OFF_META if l.startswith("bind -N")], [f"M-{n}" for n in range(1, 10)])
@@ -593,6 +605,29 @@ class Spaces(Server):
         time.sleep(0.5)
         self.assertEqual(self.homes("main"), [self.M1])
         self.assertEqual(self.t("display", "-t", self.M1, "-p", "#{pane_dead}"), "0")
+
+    def test_cmd_opt_t_on_home_only_adds_a_tab(self):
+        # CMD+OPT+T (prefix R) replaces the tab, as tmux.conf's; on home it
+        # only adds one (home stays), as C-k does. tmux.conf's kill-window
+        # would kill home past closed-tabs.sh.
+        wins = lambda: self.t("list-windows", "-t", "main", "-F", "#{window_id}").split()
+        before = wins()
+        home_panes = self.t("list-panes", "-t", self.M1, "-F", "#{pane_id}")
+        self.key("C-b", "R")
+        self.wait(lambda: len(wins()), len(before) + 1)
+        new = [w for w in wins() if w not in before]
+        self.wait(self.on, f"main:{new[0]}")
+        time.sleep(0.3)
+        self.assertEqual(self.homes("main"), [self.M1])
+        self.assertEqual(self.t("list-panes", "-t", self.M1, "-F", "#{pane_id}"), home_panes)
+        # Any other tab: replaced in place, as with spaces off.
+        self.t("select-window", "-t", self.M3)
+        self.wait(self.on, f"main:{self.M3}")
+        before = wins()
+        self.key("C-b", "R")
+        self.wait(lambda: self.M3 in wins(), False)
+        self.assertEqual(len(wins()), len(before))
+        self.assertEqual(self.homes("main"), [self.M1])
 
     def test_a_split_inside_home_is_an_ordinary_pane(self):
         home_pane = self.t("display", "-t", self.M1, "-p", "#{pane_id}")
@@ -1062,12 +1097,68 @@ class Spaces(Server):
         self.wait(self.table, "root")
         self.key("M-w", "M")                                             # uppercase: a diff, never typed
         self.wait(self.table, "root")
+        self.key("M-w", ",")                                             # bound nowhere: dropped, never typed
+        self.wait(self.table, "root")
         self.key("m")                                                    # jump mode is over: typed
         self.wait(lambda: "m" in self.t("capture-pane", "-p", "-t", w), True)
         text = self.t("capture-pane", "-p", "-t", w)
         self.assertNotIn("5", text)
         self.assertNotIn("M", text)
+        self.assertNotIn(",", text)
         self.assertEqual(self.on("#{window_id}"), w)
+
+    def test_option_w_survives_mouse_motion_and_c_s_still_arms_the_prefix(self):
+        # No `Any` in `jump`: it matched mouse motion before tmux's rule that
+        # keeps motion from leaving a table, and a Claude pane tracks all
+        # motion (DEC 1003), so ⌥W, a trackpad nudge, then a letter typed the
+        # letter into the pane. It swallowed C-s too (tmux.conf's root-bound
+        # prefix), so ⌥W then a CMD chord typed the chord's key.
+        self.assertEqual(self.t("list-keys", "-T", "jump", "Any", check=False), "")
+        w = self.new_window("main", path=self.env["HOME"])
+        self.t("respawn-pane", "-k", "-t", w, "printf '\\033[?1003h\\033[?1006h'; exec cat -v")
+        self.t("select-window", "-t", w)
+        self.wait(lambda: self.on("#{window_id}"), w)
+        self.wait(lambda: self.t("display", "-p", "-t", w, "#{mouse_all_flag}"), "1")
+        self.t("set", "-w", "-t", self.M5, "@agent_key", "m")
+        self.key("M-w")
+        self.wait(self.table, "jump")
+        os.write(self.fd, b"\x1b[<35;6;6M")                              # one cell of pointer motion
+        self.wait(lambda: "<35;" in self.t("capture-pane", "-p", "-t", w), True)   # the pane's
+        self.assertEqual(self.table(), "jump")
+        self.key("m")
+        self.wait(self.on, f"main:{self.M5}")
+        self.assertNotIn("m", self.t("capture-pane", "-p", "-t", w).replace("<35;6;6M", ""))
+        # tmux.conf's prefix: None as the option, C-s a root binding.
+        self.t("set", "-g", "prefix", "None")
+        self.t("bind", "-n", "C-s", "switch-client", "-T", "prefix")
+        self.key("M-w")
+        self.wait(self.table, "jump")
+        self.key("C-s")
+        self.wait(self.table, "prefix")
+
+    def test_option_w_then_a_stash_root_key_types_nothing(self):
+        # stash-root-keys.conf binds Enter / Space / C-c in ROOT while a
+        # prefix v selection exists (or stale, after one whose tabs were closed
+        # by hand), guarded: with no selection in this session they
+        # `send-keys` the key to the pane. Missed in `jump`, ⌥W then Enter
+        # would reach that root binding and submit a Claude prompt; ⌥W then
+        # C-c would interrupt its turn. Byte-exact: a raw pane writing a file.
+        self.t("source-file", str(STASH_ROOT_CONF))
+        self.assertEqual(self.t("show", "-gqv", "@stash_live"), "")      # no selection here
+        out = os.path.join(self.tmp, "typed")
+        w = self.new_window("main", path=self.env["HOME"])
+        self.t("respawn-pane", "-k", "-t", w, f"stty raw -echo; exec cat > {out}")
+        self.t("select-window", "-t", w)
+        self.wait(lambda: self.on("#{window_id}"), w)
+        self.wait(lambda: os.path.exists(out), True)
+        time.sleep(0.2)                                                  # stty has run
+        for k in ("Enter", "Space", "C-c", "Escape"):
+            self.key("M-w")
+            self.wait(self.table, "jump")
+            self.key(k)
+            self.wait(self.table, "root")
+        self.key("m")                                                    # root's guard: typed
+        self.wait(lambda: Path(out).read_bytes(), b"m")
 
     # -- the prefix: a root binding, so pressing it can post a notice ---------
     def test_prefix_as_a_root_binding_keeps_every_prefix_use(self):
@@ -1464,6 +1555,27 @@ class Spaces(Server):
         self.wait(lambda: self.t("display", "-t", self.M1, "-p", "#{pane_current_path}"), self.home_dir)
         self.key("C-b", "c")
         self.wait(lambda: self.on("#{pane_current_path}"), self.home_dir)
+
+    def test_popup_keys_open_in_a_folder_with_a_quote(self):
+        # Option-N, CMD+SHIFT+T and CMD+SHIFT+R open their popup through
+        # run-shell -C, which parses the expanded string as a command: a
+        # '#{pane_current_path}' with an apostrophe in it broke the quoting
+        # ("too many arguments", no popup). ##{...} lets display-popup expand
+        # it itself. A recorder stands in for space.sh: its folder and words.
+        d = os.path.join(self.home_dir, "Mack's notes")
+        os.mkdir(d)
+        log = os.path.join(self.tmp, "space-sh.log")
+        rec = os.path.join(self.tmp, "space-sh-rec.sh")
+        Path(rec).write_text(f'printf "%s|%s\\n" "$PWD" "$*" >> {log}\n')
+        w = self.new_window("main", path=d)
+        self.t("select-window", "-t", w)
+        self.wait(lambda: self.on("#{window_id}|#{pane_current_path}"), f"{w}|{d}")
+        self.t("set", "-g", "@space_sh", f"bash {rec}")
+        calls = lambda: [l.split("|", 1) for l in Path(log).read_text().splitlines()] if os.path.exists(log) else []
+        for keys, word in ((("C-b", "C-t"), "pick-tab shell "), (("C-b", "K"), "pick-tab agent "), (("M-n",), "new-space ")):
+            self.key(*keys)
+            self.wait(lambda: [p for p, a in calls() if a.startswith(word)], [d])
+            time.sleep(0.5)                                                  # -E: the popup closes
 
     def test_open_dir_creates_reuses_and_switches(self):
         newdir = os.path.join(self.tmp, "a b.c")
@@ -2080,6 +2192,24 @@ class Create(Server):
         self.assertEqual(Path(d, "mine").read_text(), "keep\n")
         self.assertEqual(sorted(os.listdir(self.projects)), ["cs35l", "remote"])
 
+    def test_an_interrupted_clone_leaves_no_temp_folder(self):
+        # ^C in the popup on a slow clone: SIGINT to git and space.sh at once.
+        slow = os.path.join(self.tmp, "slowbin")
+        os.mkdir(slow)
+        g = Path(slow, "git")
+        g.write_text('#!/bin/sh\n[ "$1" = clone ] || exit 1\n'
+                     'for a; do t="$a"; done\nmkdir -p "$t/.git" && echo partial > "$t/x"\nexec sleep 30\n')
+        g.chmod(0o755)
+        e = dict(self.script_env(), HOME=self.home, PATH=os.pathsep.join([slow, self.bin, self.env["PATH"]]))
+        p = subprocess.Popen(["bash", str(SCRIPT), "create", "https://example.com/u/slowrepo.git", self.client],
+                             env=e, cwd=self.home, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        self.addCleanup(lambda: p.poll() is None and os.killpg(p.pid, signal.SIGKILL))
+        self.wait(lambda: any(n.startswith(".slowrepo.clone-") for n in os.listdir(self.projects)), True)
+        os.killpg(p.pid, signal.SIGINT)
+        p.wait(timeout=10)
+        self.assertEqual(sorted(os.listdir(self.projects)), ["cs35l"])
+
     def test_create_from_pick_tab_opens_the_tab_there(self):
         r = self.run_sh("create", "tabproj", self.client, "agent")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -2141,6 +2271,51 @@ class Create(Server):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(os.path.exists(marker))
         self.assertFalse(os.path.exists(lock))
+
+    def test_registry_lock_breaks_a_stale_lock_and_keeps_a_fresh_one(self):
+        lock = self.registry + ".lock"
+        deadline = time.time() + 10                                                # setUp's syncs drain
+        while os.path.exists(lock) and time.time() < deadline:
+            time.sleep(0.05)
+        # A live holder's lock: a waiter (past its first break check) leaves
+        # it alone, and gets it once the holder lets go.
+        os.mkdir(lock)
+        Path(lock, "owner").write_text("live\n")
+        p = subprocess.Popen(["bash", str(SCRIPT), "sync"], env=self.script_env(),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        time.sleep(1.5)
+        self.assertEqual(Path(lock, "owner").read_text(), "live\n")
+        self.assertEqual([f for f in os.listdir(self.tmp) if ".lock.stale." in f], [])
+        shutil.rmtree(lock)
+        self.assertEqual(p.wait(timeout=15), 0)
+        # A crashed holder's (older than 15 s): broken, and the sync runs.
+        os.mkdir(lock)
+        Path(lock, "owner").write_text("dead\n")
+        os.utime(lock, (time.time() - 60, time.time() - 60))
+        t0 = time.time()
+        self.assertEqual(self.script("sync").returncode, 0)
+        self.assertLess(time.time() - t0, 8)
+        self.assertFalse(os.path.exists(lock))
+        self.assertEqual([f for f in os.listdir(self.tmp) if ".lock.stale." in f], [])
+
+    @unittest.skipUnless(shutil.which("npm"), "npm not installed")
+    def test_catalog_sync_toast_follows_the_last_run(self):
+        # The first run fails and leaves a pending mark (a creation while it
+        # ran); the second, in the same lock hold, works: no failure toast.
+        repo = os.path.join(self.projects, "mackhaymond.co")
+        os.makedirs(repo)
+        state = os.path.join(self.env["XDG_STATE_HOME"], "tmux-spaces")
+        once = os.path.join(self.tmp, "failed-once")
+        Path(repo, "sync.sh").write_text(
+            f'[ -e "{once}" ] && exit 0\n: > "{once}"; : > "{state}/catalog-sync.pending"; exit 1\n')
+        Path(repo, "package.json").write_text(
+            '{"name": "fake", "private": true, "scripts": {"catalog:sync": "sh sync.sh"}}')
+        r = self.run_sh("catalog-sync", self.client, repo)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.exists(once))
+        self.assertEqual(Path(state, "catalog-sync.log").read_text().count("== "), 2)   # both ran
+        self.assertFalse([s for s in self.said() if "catalog sync failed" in " ".join(s)])
 
     # -- pending spaces ---------------------------------------------------------------
     def ask(self, text="make me a todo app"):
@@ -2241,6 +2416,65 @@ class Create(Server):
         time.sleep(0.8)
         self.assertIn(self.client, self.t("list-clients", "-F", "#{client_name}").split())
         os.write(self.fd, b"\x1b")                                                     # close the picker
+
+    def test_a_stale_viewer_token_never_detaches_a_real_client(self):
+        # A token left by a popup that died before its del, naming the tty a
+        # real client got next: a space switch must not detach that client.
+        self.t("set", "-g", "@pending_viewers", f" {self.client}>/dev/no-such-outer ")
+        self.t("switch-client", "-c", self.client, "-t", "zed")
+        self.wait(lambda: self.t("show", "-gqv", "@pending_viewers"), "")              # dropped
+        self.assertIn(self.client, self.t("list-clients", "-F", "#{client_name}").split())
+        self.assertEqual(self.on("#{session_name}"), "zed")
+
+    def test_a_stale_viewer_token_is_dropped_when_its_client_goes_to_pending(self):
+        # The same stale token, but the real client switches into `pending`:
+        # it is dropped there too, so a later Option-N cannot detach it.
+        wid = self.ask()
+        self.t("set", "-g", "@pending_viewers", f" {self.client}>/dev/no-such-outer ")
+        self.t("switch-client", "-c", self.client, "-t", wid)
+        self.wait(lambda: self.on("#{session_name}"), "pending")
+        self.wait(lambda: self.t("show", "-gqv", "@pending_viewers"), "")              # dropped
+        self.assertIn(self.client, self.t("list-clients", "-F", "#{client_name}").split())
+
+    def test_any_switch_prunes_a_token_whose_popup_was_killed(self):
+        # A popup SIGKILLed (no EXIT trap): its token names a tty that never
+        # comes back and an outer client that is gone. The next switch of any
+        # client drops it, so @pending_viewers is unset again.
+        self.t("set", "-g", "@pending_viewers", " /dev/gone1>/dev/gone2 ")
+        self.t("switch-client", "-c", self.client, "-t", "zed")
+        self.wait(lambda: self.t("show", "-gv", "@pending_viewers", check=False), "")
+        self.assertEqual(self.on("#{session_name}"), "zed")
+
+    def test_option_n_never_detaches_a_real_client_holding_a_stale_token(self):
+        # A stale token naming the tty a new real client got: Option-N before
+        # any switch opens the picker, never detaches that client.
+        self.t("set", "-g", "@pending_viewers", f" {self.client}>/dev/no-such-outer ")
+        self.key("M-n")
+        time.sleep(0.8)
+        self.assertIn(self.client, self.t("list-clients", "-F", "#{client_name}").split())
+        os.write(self.fd, b"\x1b")                                                     # close the picker
+
+    def test_a_popup_killed_with_its_outer_client_drops_its_token(self):
+        wid = self.ask()
+        self.wait(lambda: self.wopt(wid, "@pending_space"), "3")
+        popup = self.open_popup(wid)
+        inner = self.nested()[0]
+        self.wait(lambda: self.t("show", "-gqv", "@pending_viewers"), f"{inner}>{self.client}")
+        self.t("detach-client", "-t", self.client)                                     # its tab closed
+        self.wait(lambda: popup.poll() is not None, True, timeout=6)
+        self.wait(lambda: self.t("show", "-gqv", "@pending_viewers"), "")
+        self.assertEqual(self.wopt(wid, "@pending_space"), "3")                      # claude still pending
+
+    def test_viewers_prune_drops_dead_tokens_only(self):
+        self.t("set", "-g", "@pending_viewers",
+               f" /dev/gone1>/dev/gone2 {self.client}>{self.client} /dev/notyet>{self.client} ")
+        self.assertEqual(self.run_sh("viewers-prune").returncode, 0)
+        # outer gone: dropped; nested a client but not a popup's: dropped; a
+        # popup between its add and its attach (not a client yet): kept.
+        self.assertEqual(self.t("show", "-gqv", "@pending_viewers"), f"/dev/notyet>{self.client}")
+        self.t("set", "-g", "@pending_viewers", " /dev/gone1>/dev/gone2 ")
+        self.run_sh("viewers-prune")
+        self.assertEqual(self.t("show", "-gv", "@pending_viewers", check=False), "")  # unset
 
     def test_a_pinned_pending_claude_opens_by_its_pin_digit(self):
         wid = self.ask()

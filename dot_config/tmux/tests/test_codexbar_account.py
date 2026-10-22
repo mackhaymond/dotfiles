@@ -128,15 +128,17 @@ class Home:
         return result
 
     def published(self, option):
-        """The last value the script set for a tmux option, or None."""
+        """The last value the script set for a tmux option, or None. One tmux
+        call can set several (`set-option … ; set-option …`)."""
         prefix = f'set-option -gq {option} '
         value = None
         if self.tmux_log.exists():
             for line in self.tmux_log.read_text().splitlines():
-                if line.startswith(prefix):
-                    value = line[len(prefix):]
-                elif line == prefix.rstrip():
-                    value = ''
+                for part in line.split(' ; '):
+                    if part.startswith(prefix):
+                        value = part[len(prefix):]
+                    elif part == prefix.rstrip():
+                        value = ''
         return value
 
     def claude(self):
@@ -463,10 +465,36 @@ class LiveSampleTests(AccountTestCase):
         self.home.block(A_KEY, 12, 2)
         (self.home.cache / 'claude-account').write_text(A_KEY + '\n')
         self.home.run(LIVE, self.reading(70, 80), CLAUDE_CONFIG_DIR=str(profile))
-        self.assertEqual(self.sample()['account'], B_KEY)
+        self.assertFalse(self.home.sample.exists())  # the profile's numbers are not the default login's
         block = self.home.claude()
         self.assertEqual((block['account'], block['session_used']), (A_KEY, 12))
         self.assertEqual((self.home.cache / 'claude-account').read_text().strip(), A_KEY)
+
+    def test_profile_session_repaint_leaves_the_default_accounts_sample_alone(self):
+        # Default-login session A reports with evidence (twice: a first
+        # sighting is never believed), then a `cswap run` profile session B
+        # repaints. A's readings and `seen` must survive, and nothing wakes
+        # --merge-live.
+        profile = self.home.root / 'profile'
+        profile.mkdir()
+        self.home.login(B_EMAIL, B_ORG, path=profile / '.claude.json')
+        self.home.login(A_EMAIL, A_ORG)
+        self.live(self.reading(40, 60), 'sa', '100')
+        self.live(self.reading(40, 60), 'sa', '200')
+        before = self.sample()
+        self.assertEqual((before['account'], before['five_hour']['used']), (A_KEY, 40))
+        self.assertIn('seen', before)
+        tmux_calls = self.home.tmux_log.read_text() if self.home.tmux_log.exists() else ''
+        self.home.run(LIVE, self.reading(70, 80, self.home.now + 3600, self.home.now + 86400), 'sb', '5',
+                      CLAUDE_CONFIG_DIR=str(profile))
+        self.home.run(LIVE, self.reading(70, 80, self.home.now + 3600, self.home.now + 86400), 'sb', '9',
+                      CLAUDE_CONFIG_DIR=str(profile))
+        self.assertEqual(self.sample(), before)
+        self.assertNotIn('fence', self.sample())
+        after = self.home.tmux_log.read_text() if self.home.tmux_log.exists() else ''
+        self.assertEqual(after, tmux_calls)  # no --merge-live run
+        # B's evidence is still tracked in the session map.
+        self.assertIn('sb', json.loads((self.home.cache / 'claude-live-sessions.json').read_text()))
 
     def test_lapsed_fence_is_dropped(self):
         self.home.login(B_EMAIL, B_ORG)

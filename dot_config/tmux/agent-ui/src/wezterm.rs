@@ -19,7 +19,7 @@
 //!   forwarding any keys that landed in the sidebar (`send-text --no-paste`).
 
 use crate::json::{self, Value};
-use crate::proc::{self, Output};
+use crate::proc::{self, Output, RunError};
 use crate::tmux::Snapshot;
 use std::process::Command;
 use std::time::Duration;
@@ -65,9 +65,15 @@ pub fn wezterm_exe(arg: Option<&str>) -> String {
 /// or None. `--no-auto-start`: with no GUI running, a plain `wezterm cli`
 /// would start a mux server (which outlives us) instead of failing.
 pub fn wezterm_cli(exe: &str, args: &[&str], input: Option<&[u8]>) -> Option<Output> {
+    cli_run(exe, args, input).ok()
+}
+
+/// [`wezterm_cli`] with the failure kept: a timed-out call may still have
+/// done its work.
+fn cli_run(exe: &str, args: &[&str], input: Option<&[u8]>) -> Result<Output, RunError> {
     let mut c = Command::new(exe);
     c.args(["cli", "--no-auto-start"]).args(args);
-    proc::run(c, input, CLI_TIMEOUT).ok()
+    proc::run(c, input, CLI_TIMEOUT)
 }
 
 /// agent-roster.py `wezterm_panes`: `wezterm cli list --format json`, parsed.
@@ -168,7 +174,9 @@ impl WeztermLink {
         }
     }
 
-    /// Strip.resolve. A failed `wezterm cli list` keeps what we had.
+    /// Strip.resolve. A failed `wezterm cli list` keeps what we had, and so
+    /// does a snapshot that lists no client at all (a failed or timed-out
+    /// one, as focus_back's or `--once`'s can be; 2026-10-22).
     pub fn resolve(&mut self, snap: &Snapshot, now: f64) {
         self.next_resolve = now + RESOLVE_EVERY;
         if self.fixed {
@@ -182,6 +190,7 @@ impl WeztermLink {
                 self.client = Some(c);
                 self.tmux_pane = Some(p);
             }
+            None if snap.clients.is_empty() => {}
             None => {
                 self.client = None;
                 self.tmux_pane = None;
@@ -193,7 +202,14 @@ impl WeztermLink {
     /// `data` (keys that landed in the sidebar). One re-resolve if the pane
     /// id went stale. → None on success (or when pinned with no pane to hand
     /// to: silent, as in Python), else the message to show.
+    ///
+    /// The keys are typed at most once (2026-10-22: a retry used to resend
+    /// them, so `y` Enter reached the agent twice): the retry resends them
+    /// only when the first `send-text` surely typed nothing (it could not
+    /// start, or wezterm refused it); delivered, or timed out (it may well
+    /// have typed them), only the activate is retried.
     pub fn focus_back(&mut self, data: &[u8], snap: &Snapshot, now: f64) -> Option<String> {
+        let mut unsent = !data.is_empty();
         for attempt in 0..2 {
             let Some(pane) = self.tmux_pane.clone() else {
                 if attempt == 1 || self.fixed {
@@ -203,9 +219,12 @@ impl WeztermLink {
                 continue;
             };
             let mut ok = true;
-            if !data.is_empty() {
-                ok = wezterm_cli(&self.exe, &["send-text", "--pane-id", &pane, "--no-paste"], Some(data))
-                    .is_some_and(|o| o.ok());
+            if unsent {
+                match cli_run(&self.exe, &["send-text", "--pane-id", &pane, "--no-paste"], Some(data)) {
+                    Ok(o) if o.ok() => unsent = false,
+                    Err(RunError::Timeout) => (unsent, ok) = (false, false),
+                    _ => ok = false,
+                }
             }
             let r = wezterm_cli(&self.exe, &["activate-pane", "--pane-id", &pane], None);
             if ok && r.is_some_and(|o| o.ok()) {
@@ -258,6 +277,67 @@ mod tests {
         assert!(alone_in(panes, Some("13"), None));
         assert!(!alone_in(panes, Some("99"), Some("77")));
         assert!(!alone_in(panes, None, Some("77")));
+    }
+
+    /// A stand-in `wezterm` in a fresh directory: it logs each subcommand,
+    /// appends what `send-text` is handed to `typed`, fails `send-text`
+    /// once if `send-fails` exists, fails the first `activate-pane`, and
+    /// lists `panes.json` (no file: the list fails).
+    fn fake_wezterm(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("agentui-wez-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let exe = d.join("wezterm");
+        std::fs::write(&exe, "#!/bin/sh\nd=$(dirname \"$0\"); shift 2; echo \"$1\" >> \"$d/log\"\ncase \"$1\" in\n\
+            send-text) cat >> \"$d/typed\"; [ -e \"$d/send-fails\" ] && { rm \"$d/send-fails\"; exit 1; }; exit 0;;\n\
+            activate-pane) [ -e \"$d/act-ok\" ] && exit 0; touch \"$d/act-ok\"; exit 1;;\n\
+            list) exec cat \"$d/panes.json\";;\nesac\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        d
+    }
+
+    /// focus_back types the keys once: a failed activate retries only the
+    /// activate; a refused send-text (nothing typed) is sent again.
+    #[test]
+    fn focus_back_types_the_keys_once() {
+        let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+        for refused in [false, true] {
+            let d = fake_wezterm(if refused { "refused" } else { "once" });
+            if refused {
+                std::fs::write(d.join("send-fails"), "").unwrap();
+            }
+            let mut link = WeztermLink::new(d.join("wezterm").to_string_lossy().into(), None, None, Some("10".into()));
+            link.tmux_pane = Some("11".into());
+            assert_eq!(link.focus_back(b"y\r", &Snapshot::default(), 100.0), None);
+            let log = read(d.join("log"));
+            let sends = log.lines().filter(|l| *l == "send-text").count();
+            // (Between the attempts, the re-resolve's list fails: no panes.json.)
+            assert_eq!(log.lines().filter(|l| *l == "activate-pane").count(), 2, "{log}");
+            if refused {
+                assert_eq!((sends, read(d.join("typed"))), (2, "y\ry\r".to_string()));
+            } else {
+                assert_eq!((sends, read(d.join("typed"))), (1, "y\r".to_string()));
+            }
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// A resolve against a snapshot that lists no client (failed) keeps the
+    /// client; one that lists other clients only lets it go.
+    #[test]
+    fn resolve_keeps_the_client_over_a_failed_snapshot() {
+        let d = fake_wezterm("resolve");
+        std::fs::write(d.join("panes.json"), r#"[{"tab_id":1,"pane_id":10,"tty_name":"/dev/ttys003"},
+            {"tab_id":1,"pane_id":11,"tty_name":"/dev/ttys004"}]"#).unwrap();
+        let mut link = WeztermLink::new(d.join("wezterm").to_string_lossy().into(), None, None, Some("10".into()));
+        link.client = Some("/dev/ttys004".into());
+        link.tmux_pane = Some("11".into());
+        link.resolve(&Snapshot::default(), 100.0);
+        assert_eq!((link.client.as_deref(), link.tmux_pane.as_deref()), (Some("/dev/ttys004"), Some("11")));
+        link.resolve(&Snapshot::parse("\x1fclient\x1f/dev/ttys009\x1f@1\x1fmain"), 200.0);
+        assert_eq!((link.client.as_deref(), link.tmux_pane.as_deref()), (None, None));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

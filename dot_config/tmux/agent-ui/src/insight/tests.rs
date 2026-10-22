@@ -502,9 +502,28 @@ fn fifos_never_block() {
     let _ = fs::remove_dir_all(&d);
 }
 
-/// A half answer (here: no HEAD yet, so the diff fails while the untracked
-/// list works) is used, but never cached as whole: asked again once
-/// allowed, though nothing changed.
+/// A repo with no commit yet answers whole: diffed against the empty tree,
+/// a staged file counts as added, an untracked one too.
+#[test]
+fn numstat_before_the_first_commit() {
+    if !has_git() {
+        return;
+    }
+    let d = scratch("nohead");
+    sh(&d, &["init", "-q", "-b", "main"]);
+    fs::write(d.join("new.txt"), "a\nb\n").unwrap();
+    fs::write(d.join("staged.txt"), "x\n").unwrap();
+    sh(&d, &["add", "staged.txt"]);
+    let rels = vec!["new.txt".to_string(), "staged.txt".to_string()];
+    let want: HashMap<String, (u64, u64)> =
+        [("new.txt", (2, 0)), ("staged.txt", (1, 0))].map(|(k, v)| (k.to_string(), v)).into_iter().collect();
+    assert_eq!(numstat(&d, &rels), Some((want, true)));
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// A half answer (here: HEAD names a missing commit, so the diff fails
+/// while the untracked list works) is used, but never cached as whole:
+/// asked again once allowed, though nothing changed.
 #[test]
 fn half_answers_are_asked_again() {
     if !has_git() {
@@ -513,6 +532,8 @@ fn half_answers_are_asked_again() {
     let d = scratch("half");
     sh(&d, &["init", "-q", "-b", "main"]);
     fs::write(d.join("new.txt"), "a\nb\n").unwrap();
+    let main_ref = d.join(".git/refs/heads/main");
+    fs::write(&main_ref, "1234567890123456789012345678901234567890\n").unwrap();
     let rels = vec!["new.txt".to_string()];
     assert_eq!(numstat(&d, &rels), Some(([("new.txt".to_string(), (2, 0))].into_iter().collect(), false)));
     let mut e = Engine::new(d.join("c"), d.join("s"), d.join("x"), Box::new(Alive));
@@ -522,8 +543,9 @@ fn half_answers_are_asked_again() {
     e.ask_repo(&d, &rels, 106.0, 3);
     assert_eq!(e.git_runs, 2, "half answer: asked again");
     assert_eq!(e.repos[&d].valid, 0, "never current");
-    // A whole one, once HEAD exists: then nothing changed means not asked.
-    sh(&d, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    // A whole one, once the bad ref is gone (no HEAD: the empty tree's
+    // diff): then nothing changed means not asked.
+    fs::remove_file(&main_ref).unwrap();
     e.ask_repo(&d, &rels, 112.0, 4);
     e.ask_repo(&d, &rels, 118.0, 5);
     assert_eq!((e.git_runs, e.repos[&d].valid), (3, 5));
@@ -662,6 +684,64 @@ fn a_committed_edit_is_not_anothers_later_change() {
     e.diff_every = 1000.0;
     let got = e.update(&snap, 1004.0);
     assert!(got["@1"].diff.is_some(), "the old answer still shows it dirty");
+    for x in [&d, &root] {
+        let _ = fs::remove_dir_all(x);
+    }
+}
+
+/// One pass that misses a window (its sessions file unreadable for a pass,
+/// say) keeps its transcript's cache and its attribution: back the next
+/// pass, a file it committed is still not its; gone past KEEP_FOR, both go.
+#[test]
+fn a_missed_pass_keeps_the_history() {
+    if !has_git() {
+        return;
+    }
+    let d = repo("missed");
+    let root = scratch("missed-claude");
+    let (sessions, projects) = (root.join("sessions"), root.join("projects"));
+    let cwd = d.to_string_lossy().into_owned();
+    let dir = projects.join(crate::sidebar::activity::project_slug(&cwd));
+    fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    for (pid, sid, win, pane) in [(31, "sid-a", "@1", "%1"), (32, "sid-b", "@2", "%2")] {
+        let v = obj![("pid", pid), ("sessionId", sid), ("tmux", format!("main:{win}.{pane}")), ("startedAt", 5)];
+        fs::write(sessions.join(format!("{pid}.json")), v.to_json()).unwrap();
+    }
+    let a_txt = d.join("a.txt").to_string_lossy().into_owned();
+    let (ta, tb) = (dir.join("sid-a.jsonl"), dir.join("sid-b.jsonl"));
+    fs::write(&ta, lines(&[user("edit a"), edit("a1", &a_txt), result("a1", false)])).unwrap();
+    fs::write(&tb, lines(&[user("wait")])).unwrap();
+    fs::write(d.join("a.txt"), "1\n2\n3\nA\n").unwrap();
+    let a_row = row("main", 1, "@1", &[("state", "idle"), ("kind", "claude"), ("pane_flags", "A0%1 "), ("path", &cwd)]);
+    let b_row = row("main", 2, "@2", &[("state", "idle"), ("kind", "claude"), ("pane_flags", "A0%2 "), ("path", &cwd)]);
+    let snap = Snapshot::parse(&[a_row, b_row.clone()].join("\n"));
+    let only_b = Snapshot::parse(&b_row);
+    let mut e = Engine::new(root.clone(), sessions, root.join("codex"), Box::new(Alive));
+    e.diff_every = 0.0;
+    assert_eq!(e.update(&snap, 1000.0)["@1"].diff.map(|x| x.files), Some(1));
+    // A's change committed (seen clean after A's edit); B edits it later.
+    sh(&d, &["commit", "-qam", "a"]);
+    assert_eq!(e.update(&snap, 1001.0)["@1"].diff, None);
+    append(&tb, &lines(&[edit("b1", &a_txt), result("b1", false)]));
+    fs::write(d.join("a.txt"), "1\n2\n3\nA\nB\n").unwrap();
+    // A pass without A: its cache and history stay.
+    e.update(&only_b, 1002.0);
+    assert_eq!((e.files.len(), e.seen.len(), e.found.len()), (2, 2, 2));
+    let got = e.update(&snap, 1003.0);
+    assert_eq!((got["@1"].diff, got["@2"].diff.map(|x| x.added)), (None, Some(1)), "B's change is still not A's");
+    // Gone for longer than KEEP_FOR: forgotten, its session id's lookup too.
+    e.update(&only_b, 1003.0 + KEEP_FOR + 1.0);
+    assert_eq!((e.files.len(), e.seen.len()), (1, 1));
+    assert_eq!(e.found.keys().collect::<Vec<_>>(), ["sid-b"]);
+    // A session id looked for in vain is kept only while it would not be
+    // looked for again (RETRY).
+    fs::remove_file(&tb).unwrap();
+    let t = 1003.0 + KEEP_FOR + 2.0;
+    e.update(&only_b, t);
+    assert!(matches!(e.found.get("sid-b"), Some(Err(_))), "{:?}", e.found);
+    e.update(&Snapshot::parse(""), t + RETRY + 1.0);
+    assert!(e.found.is_empty(), "{:?}", e.found);
     for x in [&d, &root] {
         let _ = fs::remove_dir_all(x);
     }

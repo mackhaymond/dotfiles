@@ -76,7 +76,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(R.parse_windows("garbage\n" + WINDOWS)[0]["id"], "@1")
 
     def test_layout(self):
-        items = R.build_items(self.ws, ["@4"], cur_win="@2")
+        items = R.build_items(self.ws, [("@4", "work")], cur_win="@2")
         self.assertEqual(self.kinds(items),
                          ["label", "@4",                       # NEEDS YOU, in agent-jump's order
                           "[main]", "@1", "@2", "@3",          # current session first; @2 shown: it is under the popup
@@ -116,7 +116,7 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(R.in_flight(five))
 
     def test_filter_is_flat_and_skips_hidden(self):
-        items = R.build_items(self.ws, ["@4"], cur_win="@1", query="proj")
+        items = R.build_items(self.ws, [("@4", "work")], cur_win="@1", query="proj")
         ids = self.kinds(items)
         self.assertNotIn("@6", ids)
         self.assertEqual(ids[-2:], ["@7", "@9"])               # parked sorts last
@@ -181,7 +181,7 @@ class PausedTests(unittest.TestCase):
 
     def test_never_needs_you(self):
         R.collation("C")
-        order = R.needs_order(self.ws())
+        order = [i for i, _ in R.needs_order(self.ws())]
         self.assertNotIn("@1", order)
         self.assertNotIn("@2", order)
         self.assertNotIn("@3", order)
@@ -464,7 +464,7 @@ class NavTests(unittest.TestCase):
     def test_down_passes_through_the_duplicate(self):
         text = "\n".join([line("main", 1, "@1", "idle", "one"), line("main", 2, "@2", "needs-input", "two"),
                           line("main", 3, "@3", "running", "three"), line("main", 4, "@4", "idle", "four")])
-        r = self.roster(text, ["@2"], "@1")
+        r = self.roster(text, [("@2", "main")], "@1")
         self.assertEqual(r.sel_key, ("sess", "main", "@1"))
         r.sel_key = ("need", "@2")                           # top of the list
         seen = self.walk(r, 8)
@@ -500,7 +500,7 @@ class NavTests(unittest.TestCase):
 
     def test_selection_survives_refresh_and_falls_back(self):
         text = "\n".join([line("main", 1, "@1", "idle", "one"), line("main", 2, "@2", "needs-input", "two")])
-        r = self.roster(text, ["@2"], "@1")
+        r = self.roster(text, [("@2", "main")], "@1")
         r.sel_key = ("need", "@2")
         r.rebuild()
         self.assertEqual(r.sel_key, ("need", "@2"))          # same key kept across a tick
@@ -565,13 +565,13 @@ class HotkeyTests(unittest.TestCase):
 
     def test_window_shown_twice_gets_two_numbers(self):
         text = "\n".join([line("main", 1, "@1", "idle", "one"), line("main", 2, "@2", "needs-input", "two")])
-        r = self.roster(text, ["@2"], "@1")
+        r = self.roster(text, [("@2", "main")], "@1")
         self.assertEqual({l: it["w"]["id"] for l, it in r.drawn.items()}, {"1": "@2", "2": "@1", "3": "@2"})
         frame = [self.strip(l) for l in r.render(100, 40, 1000)]
         self.assertTrue(any("1 main:2  two" in l for l in frame), frame)
         self.assertTrue(any(l.startswith(" ● 3  two") or " 3  two" in l for l in frame), frame)
         # the parked header carries no number; expanded parked rows do
-        r = self.roster(WINDOWS, ["@4"], "@1")
+        r = self.roster(WINDOWS, [("@4", "work")], "@1")
         r.parked_open = True; r.rebuild(); r.render(100, 40, 1000)
         parked = [l for l, it in r.drawn.items() if it["w"]["session"] == "stash"]
         self.assertEqual(len(parked), 3)
@@ -686,7 +686,7 @@ class HotkeyTests(unittest.TestCase):
         text = "\n".join([line("main", 1, "@1", "idle", "one"), line("main", 2, "@2", "idle", "two"),
                           line("main", 3, "@3", "needs-input", "three")])
         r = self.roster(text, [], "@1")           # drawn: 1=@1 2=@2 3=@3
-        r.needs = ["@3"]; r.rebuild()             # a refresh renumbers (NEEDS YOU on top), not yet drawn
+        r.needs = [("@3", "main")]; r.rebuild()             # a refresh renumbers (NEEDS YOU on top), not yet drawn
         self.assertTrue(r.handle(["1"]))
         self.assertEqual(self.gotos(), ["@1"])    # the row that SAID 1, not the new first row
         # A row whose window moved (parked) since it was drawn: refused.
@@ -894,7 +894,7 @@ class StripTests(unittest.TestCase):
                               workflow="1", since="1 x", attached=5) for i, lab in enumerate(labels))
         s = R.Strip(client="/dev/ttys999")
         s.load(text)
-        s.needs = ["@30", "@31"]; s.rebuild()
+        s.needs = [("@30", "a-very-long-session-name"), ("@31", "a-very-long-session-name")]; s.rebuild()
         for cols in (12, 20, 34, 50):
             out = s.render(cols, 12, 1000)
             self.assertEqual(len(out), 12)
@@ -1090,7 +1090,7 @@ class StripLayoutTests(unittest.TestCase):
 
     def test_order(self):
         needs, groups, parked = self.s.strip_model(1000)
-        self.assertEqual([w["id"] for w in needs], self.s.needs)            # needs_order, unchanged
+        self.assertEqual([(w["id"], w["session"]) for w in needs], self.s.needs)            # needs_order, unchanged
         self.assertEqual([w["id"] for w in needs], ["@6", "@3", "@5"])
         self.assertEqual([g["name"] for g in groups], ["alpha", "zeta"])     # by name, tasks/stash never
         self.assertEqual([w["id"] for w in groups[0]["rows"]], ["@6", "@5", "@7", "@4"])   # rank, then index
@@ -1394,7 +1394,7 @@ class PeekTests(unittest.TestCase):
         self.r.windows = R.parse_windows("\n".join([
             line("main", 1, "@1", "idle", "one"),
             line("main", 2, "@2", "needs-input", "two", panes="2", detail_kind="perm", detail="Bash rm -rf build")]))
-        self.r.needs, self.r.cur_win = ["@2"], "@1"
+        self.r.needs, self.r.cur_win = [("@2", "main")], "@1"
         self.r.rebuild()
 
     def tearDown(self):
@@ -1545,7 +1545,7 @@ class WidthTests(unittest.TestCase):
         r = R.Roster("/dev/ttys999")
         r.windows = R.parse_windows(text)
         r.cur_win = "@30"
-        r.needs = ["@31"]
+        r.needs = [("@31", "main")]
         r.rebuild()
         for cols in (20, 41, 80, 133):
             r.msg, r.msg_until = "🫠 " * 80, 1e12
@@ -1647,7 +1647,10 @@ class NeedsOrderTests(unittest.TestCase):
     def jump_list(self, loc):
         r = self.f.run("agent-jump.sh", "list", LC_ALL=loc)
         self.assertEqual(r.returncode, 0, r.stderr)
-        return [l.split("\t")[0] for l in r.stdout.splitlines() if l]
+        return [tuple(l.split("\t")[:2]) for l in r.stdout.splitlines() if l]   # (id, session)
+
+    def ids(self, loc):
+        return [i for i, _ in self.roster(loc).needs]
 
     def roster(self, loc):
         """The roster's own snapshot call, answered by the same fake tmux."""
@@ -1666,7 +1669,7 @@ class NeedsOrderTests(unittest.TestCase):
             self.assertEqual(self.roster(loc).needs, want, loc)
 
     def test_fixture_exercises_the_rules(self):
-        got = self.roster("en_US.UTF-8").needs
+        got = self.ids("en_US.UTF-8")
         self.assertEqual(got[:3], ["@26", "@50", "@51"])   # failed, oldest first; linked rows once
         self.assertNotIn("@4", got); self.assertNotIn("@14", got)
         for wid in ("@20", "@21", "@22", "@23", "@24", "@25"):
@@ -1677,16 +1680,33 @@ class NeedsOrderTests(unittest.TestCase):
         self.assertLess(got.index("@12"), got.index("@2"))    # "0150" is 150, before 200
         self.assertLess(got.index("@9"), got.index("@1"))     # no stamp: last of its tier, not of all
 
+    def test_linked_need_rows_use_the_queued_link(self):
+        # @50 is linked into zz, main and stash: queued from its main row,
+        # and the NEEDS YOU rows (popup and strip) must be THAT row. A by-id
+        # dict kept the last link listed, stash, so Enter unstashed it and x
+        # discarded it everywhere (2026-10-22).
+        r = self.roster("en_US.UTF-8")
+        self.assertEqual([w["session"] for w in r.windows if w["id"] == "@50"][-1], "stash")   # the trap
+        pairs = dict(r.needs)
+        self.assertEqual((pairs["@50"], pairs["@51"]), ("main", "yy"))
+        rows = {it["w"]["id"]: it["w"]["session"] for it in r.items if it.get("key", ("",))[0] == "need"}
+        self.assertEqual((rows["@50"], rows["@51"]), ("main", "yy"))
+        s = R.Strip(client=self.TTY)
+        s.windows, s.needs, s.cur_win = r.windows, r.needs, r.cur_win
+        needs, _, _ = s.strip_model(1000)
+        got = {w["id"]: w["session"] for w in needs}
+        self.assertEqual((got["@50"], got["@51"]), ("main", "yy"))
+
     def test_locale_changes_ties(self):
         # The reason for collation(): en_US puts `a` before `B`, C does not.
-        en, c = self.roster("en_US.UTF-8").needs, self.roster("C").needs
+        en, c = self.ids("en_US.UTF-8"), self.ids("C")
         self.assertLess(en.index("@31"), en.index("@30"))
         self.assertLess(c.index("@30"), c.index("@31"))
 
     def test_weightless_names(self):
         # What /usr/bin/sort does here (and the parity test holds us to):
         # equal collation → shorter key first → next key → whole line.
-        got = self.roster("en_US.UTF-8").needs
+        got = self.ids("en_US.UTF-8")
 
         def before(a, b):
             self.assertLess(got.index(a), got.index(b), (a, b, got))
@@ -1733,7 +1753,7 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0][:4], ("list-windows", "-a", "-F", R.FMT))
         self.assertIn(";", self.calls[0])
-        self.assertEqual((r.cur_win, r.needs, r.gone), ("@2", ["@1"], False))
+        self.assertEqual((r.cur_win, r.needs, r.gone), ("@2", [("@1", "main")], False))
         self.assertEqual(len(r.windows), 2)                      # client rows are not windows
 
     def test_client_gone(self):

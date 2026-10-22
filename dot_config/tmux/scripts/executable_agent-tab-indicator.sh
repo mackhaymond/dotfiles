@@ -96,16 +96,18 @@
 #   running      UserPromptSubmit    → turn started; claude: topic-drift check
 #                                      (agent-topic-drift.awk); refresh
 #                                      @agent_summary
-#   heartbeat    PostToolUse         → re-arm running mid-turn: from
-#                                      running/failed, from needs-input only
-#                                      when the tool call is the asker's own
-#                                      (@agent_ask_from), or from idle when
+#   heartbeat    PostToolUse         → re-arm running mid-turn: from failed
+#                                      only for a main-agent tool call, from
+#                                      needs-input only when the tool call is
+#                                      the asker's own (@agent_ask_from), or
+#                                      from idle when
 #                                      @agent_pending marks an answered
 #                                      permission prompt — never from bare
 #                                      idle/done, so a late tool call can't
 #                                      resurrect a finished tab; never parses
 #                                      stdin — payloads can be huge (only
-#                                      needs-input peeks at its first 8 KB)
+#                                      needs-input and failed peek at its
+#                                      first 8 KB)
 #   needs-approval  PermissionRequest, and Notification(permission_prompt)
 #                → sets needs-input (YELLOW). Both events describe the SAME
 #                                      gate: PermissionRequest is structural
@@ -174,6 +176,9 @@ seen_op=""
 # tmux commands to run in the SAME command list (ss_add). Both consumed.
 ss_since=""
 ss_extra=()
+# owner_current's answer for this process ("" = not asked yet, 1, 0). See
+# owner_current.
+OWNER_MEMO=""
 
 JQ="$(command -v jq || true)"
 # Codex hooks run in a shared app-server. Its inherited TMUX_PANE belongs to
@@ -197,7 +202,26 @@ if [ "$agent" = codex ]; then
     export AGENT_TAB_OWNER_RECORD=$("$JQ" -c . <<<"$owner")
     reconcile_binding=$("$JQ" -r '.terminal_binding_id // empty' <<<"$payload" 2>/dev/null || true)
     [ -z "$reconcile_binding" ] || [ "$reconcile_binding" = "$AGENT_TAB_OWNER_BINDING" ] || exit 0
+    # This resolve IS owner_current's answer for this hook: the binding and
+    # token it would compare were just copied out of this same bound record.
+    # Re-resolving cost ~150 ms each (python + a ps ancestor walk + tmux), and
+    # a no-op heartbeat paid it three times, on every codex tool call, which
+    # codex blocks on (2026-10-22).
+    OWNER_MEMO=1
 fi
+# A FOREIGN AGENT'S TOOL SHELL (2026-10-22). A claude (or opencode) started by
+# another agent's tool call - codex's shell running `claude -p "..."` -
+# inherits that agent's TMUX_PANE, and its hooks then drive the PARENT's tab:
+# SessionStart repainted codex's running window as an idle claude "New
+# Session" and dropped its owner binding, SessionEnd's clear_state wiped it,
+# and codex's next hook (sid mismatch) cleared it again - the codex turn read
+# idle until its Stop. Codex marks its tool shells with these two; the
+# OpenCode plugin's PARENT_AGENT_ENV skips on the same pair (not on
+# AGENT_PTY: a pty-MCP shell owns its own pane, and a headless claude there
+# paints it). Claude-in-Claude is caught after the pane lookup (nested_agent).
+case "$agent" in
+    claude|opencode) [ -z "${CODEX_THREAD_ID:-}${CODEX_SANDBOX:-}" ] || exit 0 ;;
+esac
 [ -n "${TMUX:-}" ] || exit 0
 
 # Detached condensers inherit the explicit socket too; a pane/window id by
@@ -246,8 +270,21 @@ owns_window() {
         owner_current
 }
 
+# Memoized per process like owns_window_once (OWNER_MEMO; the codex hook seeds
+# it from its own resolve): one hook event is one answer, and the detached
+# condenser's first ask is at paint time.
 owner_current() {
     [ -z "${AGENT_TAB_OWNER_SESSION:-}" ] && return 0
+    case "$OWNER_MEMO" in
+        1) return 0 ;;
+        0) return 1 ;;
+    esac
+    if owner_resolve; then OWNER_MEMO=1; return 0; fi
+    OWNER_MEMO=0
+    return 1
+}
+
+owner_resolve() {
     local current status
     current=$("$HOME/.local/bin/codex-terminal-owner" resolve "$AGENT_TAB_OWNER_SESSION" 2>/dev/null || true)
     status=$("$JQ" -r '.status // empty' <<<"$current" 2>/dev/null || true)
@@ -276,13 +313,29 @@ BG_PENDING="$HOME/.local/bin/agent-bg-pending"
 # tmux hiccup) everything it drives silently stops — no blink (the glyph
 # freezes on the @agent_blink=unset color), no workflow gear, no presence
 # seeding, no GC — until the next `prefix r`, and nothing surfaces the failure.
-# Hooks fire constantly, so re-assert it here: in the healthy case this is a
-# file test plus a kill -0, no forks. Respawn goes through the tmux server so
-# the daemon outlives this short-lived hook process. PIDFILE path must match
-# the watcher's.
+# Hooks fire constantly, so re-assert it here. Respawn goes through the tmux
+# server so the daemon outlives this short-lived hook process. PIDFILE path
+# must match the watcher's.
+#
+# NO FORKS WHEN HEALTHY (2026-10-22). The checks below cost a ps, a date and a
+# stat on every hook - every tool call - where this header used to promise
+# none. Only a TURNING watcher restamps its pidfile (each tick, and never over
+# a successor's), so "the pidfile changed after a moment we know is under 30 s
+# ago" proves the whole chain - alive, ours, not wedged - with builtins:
+# $SEEN holds the epoch it was last written at (by the slow path below, once
+# it has proved a beat), and `-nt` compares the two mtimes. Past 30 s, or
+# with no tick since, the slow path runs exactly as before and rewrites the
+# mark. So a busy turn pays the forks about once per 30 s, not per tool call.
 ensure_watcher() {
-    local pidfile pid="" now beat
+    local pidfile seen_mark seen="" pid="" now beat
     pidfile="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.pid"
+    seen_mark="${pidfile%.pid}.hookseen"
+    printf -v now '%(%s)T' -1 2>/dev/null || now=$(date +%s 2>/dev/null || echo 0)
+    read -r seen < "$seen_mark" 2>/dev/null || seen=""
+    case "$seen" in ''|*[!0-9]*) seen=0 ;; esac
+    if [ $((now - seen)) -lt 30 ] && [ "$pidfile" -nt "$seen_mark" ]; then
+        return 0
+    fi
     if [ -f "$pidfile" ]; then
         read -r pid < "$pidfile" 2>/dev/null || pid=""
     fi
@@ -291,9 +344,7 @@ ensure_watcher() {
     # here wrap in ~15 min, so a stale file usually points at an unrelated
     # live process. That reads as HEALTHY and the watchdog never fires —
     # the one failure it exists to catch, silently. Confirm identity before
-    # believing it. This costs one ps against the "no forks in the healthy
-    # case" goal, but hooks fire a few times per turn, not 86400 times a day
-    # like the watcher's own tick, so it is the cheap place to pay.
+    # believing it (one ps, on the slow path only - see NO FORKS WHEN HEALTHY).
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         case "$(ps -o command= -p "$pid" 2>/dev/null)" in
             *"/agent-tab-watcher.sh")
@@ -303,9 +354,11 @@ ensure_watcher() {
                 # longer reconciling, and invisible because a frozen blink now
                 # renders as plain blue (= idle). 30s is 30 ticks of grace.
                 # Kill it so the respawn below isn't refused by the singleton.
-                now=$(date +%s 2>/dev/null || echo 0)
                 beat=$(stat -f %m "$pidfile" 2>/dev/null || echo 0)
                 if [ $((now - beat)) -lt 30 ]; then
+                    # The mark for the fast path: written now, so a pidfile
+                    # newer than it is a beat inside the next 30 s.
+                    printf '%s\n' "$now" 2>/dev/null > "$seen_mark" || true
                     return 0
                 fi
                 # TERM then CONT: a wedge that is STOPPED rather than blocked
@@ -594,8 +647,12 @@ set_state() {
     local sv="$ss_since"
     local -a cmd=() ex=(${ss_extra[@]+"${ss_extra[@]}"})
     dkind=""; dtext=""; pend_op=""; seen_op=""; ss_wrote=0; ss_since=""; ss_extra=()
-    owns_window "$win" || return 0
     cur=$(window_state "$win")
+    # A call that would write nothing returns BEFORE the ownership check:
+    # owns_window is two show-options plus (codex) an owner resolve, and an
+    # unchanged running->running heartbeat must not pay for a no-op.
+    [ "$cur" != "$new" ] || [ -n "$dk$po$so" ] || [ "${#ex[@]}" -gt 0 ] || return 0
+    owns_window "$win" || return 0
     if [ "$cur" != "$new" ]; then
         printf -v ts '%(%s)T' -1 2>/dev/null || ts=$(date +%s)
         cmd=(set-option -w -t "$win" @agent_state "$new" \;
@@ -1971,13 +2028,50 @@ win=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null || true)
 if [ "$agent" = codex ]; then
     # Ownership may have changed since resolve (or while a detached title
     # condenser was working). Never let an old hook reclaim the window.
+    # owner_current is this hook's own resolve (OWNER_MEMO), not a second one.
     owner_current || exit 0
     previous_sid=$(tmux show-options -wqv -t "$win" @agent_session_id 2>/dev/null || true)
     if [ "$previous_sid" != "$AGENT_TAB_OWNER_SESSION" ]; then
         clear_state "$win"
     fi
-    tmux set-option -w -t "$win" @agent_session_id "$AGENT_TAB_OWNER_SESSION" 2>/dev/null || exit 0
-    tmux set-option -w -t "$win" @agent_owner_token "$AGENT_TAB_OWNER_TOKEN" 2>/dev/null || exit 0
+    tmux set-option -w -t "$win" @agent_session_id "$AGENT_TAB_OWNER_SESSION" \; \
+         set-option -w -t "$win" @agent_owner_token "$AGENT_TAB_OWNER_TOKEN" 2>/dev/null || exit 0
+fi
+
+# Claude-in-Claude (see A FOREIGN AGENT'S TOOL SHELL above): a `claude -p`
+# run from another Claude's Bash tool carries no codex marker, so ask the
+# process tree. nested_agent: walking up from this hook, is there an agent
+# (claude/codex/opencode, or a native claude's version-number comm, as the
+# watcher's AGENT_PAT) ABOVE a non-agent that is itself above the hook's own
+# agent? That is agent -> tool shell -> agent: this hook's claude was started
+# by another agent, whose tab TMUX_PANE names. An agent's direct agent parent
+# (no shell between) is not a nesting. One ps, on the lifecycle events only:
+# the heartbeat (every tool call) skips it - from a nested claude it is inert
+# anyway, since the parent's window is running while its tool runs. Any ps
+# failure reads as not nested (the old behavior). Bash 4+ (associative).
+nested_agent() {
+    [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || return 1
+    local rows pid ppid comm p seen=0 gap=0 n=0
+    local -A PP=() PC=()
+    rows=$(ps -axo pid=,ppid=,comm= 2>/dev/null) || return 1
+    while read -r pid ppid comm; do
+        PP[$pid]="$ppid"; PC[$pid]="${comm##*/}"
+    done <<<"$rows"
+    p="$PPID"
+    while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$n" -lt 64 ]; do
+        n=$((n + 1))
+        if [[ ${PC[$p]:-} =~ ^(claude|codex|opencode|[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            [ "$gap" = 1 ] && return 0
+            seen=1
+        elif [ "$seen" = 1 ]; then
+            gap=1
+        fi
+        p="${PP[$p]:-}"
+    done
+    return 1
+}
+if [ "$agent" = claude ] && [ "$mode" != heartbeat ] && nested_agent; then
+    exit 0
 fi
 
 # Claude heartbeat is the hot path (every tool call): don't wait on stdin — the
@@ -2024,9 +2118,30 @@ fi
 # is escaped (\"agent_id\"), which the pattern can't match anyway. No
 # agent_id = the main agent. Codex rejects subagent payloads up top and
 # OpenCode sends none, so both are always "main" and behave as before.
-# running/failed run the same commands as before: the payload is read
-# only when the window is needs-input with an asker. Ending a held gate, and
-# consuming a fresh @agent_pending, add one show-options (HELD DETAIL).
+# The payload is read only when the window is needs-input with an asker, or
+# failed. Ending a held gate, and consuming a fresh @agent_pending, add one
+# show-options (HELD DETAIL).
+#   FAILED IS MAIN'S (2026-10-22). A StopFailure (529) kills the MAIN turn;
+# background subagents keep working, and their PostToolUse (and
+# PostToolUseFailure, wired to heartbeat) re-armed `running` over the red
+# within seconds, so the failure was never seen - the same clobbering the
+# asker gate stops for needs-input. So `failed` re-arms only for a main-agent
+# tool call (same 8 KB peek); a new prompt or the wake-up turn clears it as
+# before.
+#   A running window is left alone without a set_state: nothing would be
+# written, and the hot path skips even the call's state re-read.
+hb_who() {
+    hb_from=main
+    [ "$agent" != codex ] || return 0
+    hb_head=$(head -c 8192 2>/dev/null || true)
+    hb_cut='"hook_event_name"'
+    hb_head=${hb_head%%"$hb_cut"*}
+    hb_re='"agent_id"[[:space:]]*:[[:space:]]*"([^"]*)"'
+    if [[ $hb_head =~ $hb_re ]]; then
+        hb_from="${BASH_REMATCH[1]//[^A-Za-z0-9_.-]/}"
+        hb_from="${hb_from:-main}"
+    fi
+}
 if [ "$mode" = "heartbeat" ]; then
     hb_state=$(window_state "$win")
     hb_ok=1
@@ -2034,24 +2149,19 @@ if [ "$mode" = "heartbeat" ]; then
         needs-*)
             hb_ask=$(tmux show-options -wqv -t "$win" @agent_ask_from 2>/dev/null || true)
             if [ -n "$hb_ask" ]; then
-                hb_from=main
-                if [ "$agent" != codex ]; then
-                    hb_head=$(head -c 8192 2>/dev/null || true)
-                    hb_cut='"hook_event_name"'
-                    hb_head=${hb_head%%"$hb_cut"*}
-                    hb_re='"agent_id"[[:space:]]*:[[:space:]]*"([^"]*)"'
-                    if [[ $hb_head =~ $hb_re ]]; then
-                        hb_from="${BASH_REMATCH[1]//[^A-Za-z0-9_.-]/}"
-                        hb_from="${hb_from:-main}"
-                    fi
-                fi
+                hb_who
                 [ "$hb_from" = "$hb_ask" ] || hb_ok=0
             fi
+            ;;
+        failed)
+            hb_who
+            [ "$hb_from" = main ] || hb_ok=0
             ;;
     esac
     [ "$agent" = codex ] || ( cat <&0 >/dev/null 2>&1 & ) 2>/dev/null
     case "$hb_state" in
-        running|failed) set_state "$win" running ;;
+        running) ;;
+        failed) if [ "$hb_ok" = 1 ]; then set_state "$win" running; fi ;;
         needs-*)
             if [ "$hb_ok" = 1 ]; then
                 # A subagent's gate the main agent's Stop held (see done):

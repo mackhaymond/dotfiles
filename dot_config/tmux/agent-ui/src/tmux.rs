@@ -170,15 +170,31 @@ impl Tmux {
     /// agent-roster.py `snapshot`: every window and every client in ONE
     /// round trip → stdout, or "" when tmux failed (no server, timeout).
     pub fn snapshot_text(&self) -> String {
+        self.try_snapshot_text().unwrap_or_default()
+    }
+
+    /// [`snapshot_text`](Self::snapshot_text), but None when the call failed
+    /// (non-zero exit, timeout, no server) instead of "". (2026-10-22) A
+    /// failed call used to look exactly like an empty server, so a UI's
+    /// tick blanked its view, wiped its provisional slots and unbound its
+    /// client on one busy or restarting server; a UI keeps its last
+    /// snapshot on None.
+    pub fn try_snapshot_text(&self) -> Option<String> {
         match self.run(&["list-windows", "-a", "-F", &fmt(), ";", "list-clients", "-F", &client_fmt()]) {
-            Ok(o) if o.ok() => o.stdout,
-            _ => String::new(),
+            Ok(o) if o.ok() => Some(o.stdout),
+            _ => None,
         }
     }
 
     /// [`snapshot_text`](Self::snapshot_text) parsed.
     pub fn snapshot(&self) -> Snapshot {
         Snapshot::parse(&self.snapshot_text())
+    }
+
+    /// [`try_snapshot_text`](Self::try_snapshot_text) parsed: None when the
+    /// call failed (keep the last snapshot).
+    pub fn try_snapshot(&self) -> Option<Snapshot> {
+        self.try_snapshot_text().map(|t| Snapshot::parse(&t))
     }
 }
 
@@ -522,6 +538,11 @@ pub struct Window {
     /// that has `@agent_paused` set reads `paused` ([`crate::model::paused_state`]),
     /// so every reader sees one state.
     pub state: String,
+    /// @agent_state exactly as tmux printed it, the pause NOT folded in.
+    /// Only [`crate::model::needs_order`] reads it (it rebuilds agent-jump.sh's
+    /// own raw row, free text and all) and [`crate::view::holds_slot`] (the
+    /// watcher's slot_active reads the raw state too).
+    pub raw_state: String,
     pub summary: String,
     /// @agent_workflow / @agent_cua: any non-empty value means set.
     pub workflow: String,
@@ -657,6 +678,7 @@ impl Window {
             id: p[2].into(),
             name: name.into(),
             state: crate::model::paused_state(p[4], p[33]).into(),
+            raw_state: p[4].into(),
             summary: summary.into(),
             workflow: p[6].into(),
             cua: p[7].into(),
@@ -749,7 +771,14 @@ impl Window {
     /// old stamp (an answer-by-No that never resumed, a seen failure) has
     /// lapsed, so that agent lets its number go.
     pub fn answered(&self, now: f64) -> bool {
-        if self.state != "idle" || !digits(&self.pending) {
+        self.state == "idle" && self.pending_fresh(now)
+    }
+
+    /// [`answered`](Self::answered)'s stamp half alone, whatever the state:
+    /// the watcher's `slot_pending_fresh`. [`crate::view::holds_slot`] pairs
+    /// it with the RAW state.
+    pub fn pending_fresh(&self, now: f64) -> bool {
+        if !digits(&self.pending) {
             return false;
         }
         match self.pending.parse::<i64>() {

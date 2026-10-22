@@ -61,6 +61,12 @@ pub const TAIL: u64 = 64 * 1024;
 /// How long a session whose transcript could not be found is left alone.
 const RETRY: Duration = Duration::from_secs(10);
 
+/// A session id's transcript and a transcript's blurb are forgotten once no
+/// pass has used them for this long. (2026-10-22: both only ever grew, one
+/// entry per Claude session, `/clear` and Codex rollout a long-lived sidebar
+/// ever saw.) Long enough that an agent between turns keeps them.
+const KEEP: Duration = Duration::from_secs(10 * 60);
+
 /// A file's identity for the caches: (len, mtime).
 type Stamp = (u64, SystemTime);
 
@@ -90,10 +96,15 @@ pub struct Activity {
     /// `~/.claude` (tests point it elsewhere).
     root: PathBuf,
     sessions: HashMap<PathBuf, Session>,
-    /// Session id → its transcript (or when it was last looked for in vain).
-    paths: HashMap<String, Result<PathBuf, Instant>>,
-    /// Transcript → (its stamp when read, the blurb).
-    blurbs: HashMap<PathBuf, (Stamp, Option<String>)>,
+    /// Session id → (its transcript, or when it was last looked for in vain;
+    /// when a pass last asked for it).
+    paths: HashMap<String, (Result<PathBuf, Instant>, Instant)>,
+    /// Transcript → (its stamp when read, the blurb, when a pass last asked
+    /// for it).
+    blurbs: HashMap<PathBuf, (Stamp, Option<String>, Instant)>,
+    /// Unused entries of `paths` and `blurbs` live this long ([`KEEP`];
+    /// tests shorten it).
+    keep: Duration,
     /// Transcript reads so far (observable for the tests).
     pub reads: usize,
 }
@@ -101,7 +112,7 @@ pub struct Activity {
 impl Activity {
     /// Reading `<root>/sessions` and `<root>/projects` (`root` = `~/.claude`).
     pub fn new(root: PathBuf) -> Activity {
-        Activity { root, ..Activity::default() }
+        Activity { root, keep: KEEP, ..Activity::default() }
     }
 
     /// `~/.claude`, or `$AGENT_UI_CLAUDE_DIR` when set (tests).
@@ -116,6 +127,10 @@ impl Activity {
     /// Fill in [`crate::view::Agent::blurb`] for every working agent of
     /// `view` (spaces and NEEDS YOU alike); every other agent's stays None.
     pub fn apply(&mut self, view: &mut ViewModel) {
+        // What no pass has asked for in a while goes ([`KEEP`]).
+        let keep = self.keep;
+        self.paths.retain(|_, (_, used)| used.elapsed() < keep);
+        self.blurbs.retain(|_, (_, _, used)| used.elapsed() < keep);
         // Working by its state alone: `in_flight` is also true of an asking
         // or failed agent with a workflow or cua flag, whose own line says
         // what it needs.
@@ -189,9 +204,15 @@ impl Activity {
     /// scan of every project directory; cached (a miss retried after
     /// [`RETRY`]).
     fn transcript(&mut self, sid: &str, cwd: &str) -> Option<PathBuf> {
-        match self.paths.get(sid) {
-            Some(Ok(p)) if p.exists() => return Some(p.clone()),
-            Some(Err(at)) if at.elapsed() < RETRY => return None,
+        match self.paths.get_mut(sid) {
+            Some((Ok(p), used)) if p.exists() => {
+                *used = Instant::now();
+                return Some(p.clone());
+            }
+            Some((Err(at), used)) if at.elapsed() < RETRY => {
+                *used = Instant::now();
+                return None;
+            }
             _ => {}
         }
         let projects = self.root.join("projects");
@@ -202,7 +223,7 @@ impl Activity {
         } else {
             fs::read_dir(&projects).ok().and_then(|d| d.flatten().map(|e| e.path().join(&file)).find(|p| p.exists()))
         };
-        self.paths.insert(sid.to_string(), found.clone().ok_or_else(Instant::now));
+        self.paths.insert(sid.to_string(), (found.clone().ok_or_else(Instant::now), Instant::now()));
         found
     }
 
@@ -216,14 +237,15 @@ impl Activity {
     /// [`codex_blurb`]): read only when its (len, mtime) changed.
     pub fn read(&mut self, path: &Path, parse: fn(&str, bool) -> Option<String>) -> Option<String> {
         let st = stamp(path)?;
-        if let Some((s, b)) = self.blurbs.get(path) {
+        if let Some((s, b, used)) = self.blurbs.get_mut(path) {
             if *s == st {
+                *used = Instant::now();
                 return b.clone();
             }
         }
         self.reads += 1;
         let b = read_tail(path, TAIL).and_then(|(t, whole)| parse(&t, whole));
-        self.blurbs.insert(path.to_path_buf(), (st, b.clone()));
+        self.blurbs.insert(path.to_path_buf(), (st, b.clone(), Instant::now()));
         b
     }
 }

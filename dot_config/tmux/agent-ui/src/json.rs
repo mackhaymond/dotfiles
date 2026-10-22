@@ -353,13 +353,22 @@ impl Parser<'_> {
                         b't' => '\t',
                         b'u' => {
                             let hi = self.hex4()?;
-                            let cp = if (0xD800..0xDC00).contains(&hi) && self.s[self.i..].starts_with(b"\\u") {
+                            // A high surrogate pairs only with a LOW one
+                            // (DC00..DFFF). Anything else after it (a lone
+                            // half from an emoji cut mid-way, then `\u001b`)
+                            // is left to parse on its own, and the lone half
+                            // reads U+FFFD (2026-10-22).
+                            let mut cp = hi;
+                            if (0xD800..0xDC00).contains(&hi) && self.s[self.i..].starts_with(b"\\u") {
+                                let at = self.i;
                                 self.i += 2;
-                                let lo = self.hex4()?;
-                                0x10000 + ((hi - 0xD800) << 10) + (lo.wrapping_sub(0xDC00) & 0x3FF)
-                            } else {
-                                hi
-                            };
+                                match self.hex4() {
+                                    Ok(lo) if (0xDC00..0xE000).contains(&lo) => {
+                                        cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+                                    }
+                                    _ => self.i = at,
+                                }
+                            }
                             char::from_u32(cp).unwrap_or('\u{FFFD}')
                         }
                         _ => return self.err("bad escape"),
@@ -400,5 +409,16 @@ mod tests {
         assert!(parse("[1,").is_err());
         assert!(parse("{\"a\" 1}").is_err());
         assert!(parse("[] x").is_err());
+    }
+
+    /// Surrogates: a pair joins; a lone high half followed by another escape
+    /// is U+FFFD and the escape after it is kept.
+    #[test]
+    fn lone_surrogates() {
+        assert_eq!(parse(r#""🫠""#).unwrap().as_str(), Some("🫠"));
+        assert_eq!(parse(r#""\ud83d\u001b[0m""#).unwrap().as_str(), Some("\u{FFFD}\u{1b}[0m"));
+        assert_eq!(parse(r#""\ud83d😀""#).unwrap().as_str(), Some("\u{FFFD}😀"));
+        assert_eq!(parse(r#""\ud83dx""#).unwrap().as_str(), Some("\u{FFFD}x"));
+        assert_eq!(parse(r#""\ude00""#).unwrap().as_str(), Some("\u{FFFD}"));
     }
 }

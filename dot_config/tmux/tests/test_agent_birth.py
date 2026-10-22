@@ -345,6 +345,24 @@ class Server(unittest.TestCase):
         self.t("new-window", "-a", "-t", "main:", "-c", self.home, ";", "run-shell", "-C", "#{@agent_birth} claude")
         self.assert_born(self.first_sighting(before), summary="~/New Session")
 
+    def test_start_path_is_tidied(self):
+        # -c is taken as typed (made absolute, never normalized): the picker
+        # hands over "$HOME/" for a "~/" query, "." stays ".../.".
+        os.makedirs(os.path.join(self.proj, "sub"))
+        cases = [(self.home + "/", "~"), (self.home + "//.", "~"), (self.proj + "/", "my-project"),
+                 (self.proj + "/./", "my-project"), (self.proj + "/sub/..", "my-project")]
+        for c, want in cases:
+            before = self.rows()
+            self.t("new-window", "-a", "-t", "main:", "-c", c, ";", "run-shell", "-C", "#{@agent_birth} claude")
+            self.assert_born(self.first_sighting(before), summary=want + "/New Session")
+        # A relative -c, resolved against the client's cwd.
+        for c in (".", "./"):
+            before = self.rows()
+            subprocess.run([TMUX, "-L", self.sock, "-f", "/dev/null", "new-window", "-a", "-t", "main:", "-c", c,
+                            ";", "run-shell", "-C", "#{@agent_birth} claude"],
+                           env=self.env, cwd=self.proj, check=True, capture_output=True, timeout=10)
+            self.assert_born(self.first_sighting(before))
+
     def test_long_project_cut_like_project_name(self):
         d = os.path.join(self.tmp, "an-extremely-long-project-directory-name")
         os.makedirs(d)
@@ -352,6 +370,28 @@ class Server(unittest.TestCase):
         self.t("new-window", "-a", "-t", "main:", "-c", d, ";", "run-shell", "-C", "#{@agent_birth} claude")
         # project_name(): basename | cut -c1-20
         self.assert_born(self.first_sighting(before), summary="an-extremely-long-pr/New Session")
+
+    def test_project_is_the_start_path_not_the_live_cwd(self):
+        # The live cwd is read from the pane's foreground process, which right
+        # after new-window can be not there yet (empty: "/New Session"). The
+        # folder new-window was given is always there. A pane that moved away
+        # at once shows which one the birth reads, every time.
+        # (Not -d: run-shell -C's commands act on the session's current window.)
+        wid = self.t("new-window", "-P", "-F", "#{window_id}", "-t", "main:", "-c", self.proj,
+                     "cd /usr && exec sleep 600")
+        deadline = time.time() + 4
+        while self.t("display", "-p", "-t", wid, "#{pane_current_path}") != "/usr" and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(self.t("display", "-p", "-t", wid, "#{pane_current_path}"), "/usr")
+        self.t("run-shell", "-C", "#{@agent_birth} claude")
+        self.assert_born(self.rows()[wid])
+
+    def test_project_right_after_new_window_every_time(self):
+        # The live race itself: birth in new-window's own command list.
+        for _ in range(15):
+            before = self.rows()
+            self.t("new-window", "-a", "-t", "main:", "-c", self.proj, ";", "run-shell", "-C", "#{@agent_birth} claude")
+            self.assert_born(self.first_sighting(before))
 
 
 def born_window(born, tty="/dev/ttys950", **extra):

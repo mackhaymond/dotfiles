@@ -462,6 +462,9 @@ struct App {
     client_pid: Option<i32>,
     /// The client is gone (or the sidebar is alone in its tab): exit.
     gone: bool,
+    /// The last refresh's snapshot failed (nothing listed): everything kept
+    /// the one before, and the loop's next refresh is a [`TICK`] away.
+    stale: bool,
     /// What the hidden status line showed, from the last snapshot.
     bar: Bar,
     /// The `@agent_key` writes in flight (the live sidebar persists the
@@ -549,6 +552,7 @@ impl App {
             buf: None,
             force: false,
             focus_backs: 0,
+            stale: false,
             last_act: None,
             last_park: None,
             parking: None,
@@ -744,9 +748,32 @@ impl App {
     /// client if it went missing, then the view; then whether the client
     /// (or the tab) is gone. The key table seen starts or stops the
     /// key-table poll ([`KeyPoll::seen`]).
+    ///
+    /// A failed snapshot (no window and no client: tmux timed out or would
+    /// not answer) changes nothing: the view, the client and the registry
+    /// keep the last good one's (only the tab is looked at: alone in it, the
+    /// sidebar goes), and the loop retries after [`TICK`]
+    /// ([`App::stale`]). (2026-10-22: an empty one used to draw a blank
+    /// frame, clear the resolved client for RESOLVE_EVERY and re-register
+    /// the sidebar as clientless.)
     fn refresh(&mut self) {
         self.children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
-        self.core.snapshot = self.core.tmux.snapshot();
+        let snap = self.core.tmux.snapshot();
+        self.stale = snap.windows.is_empty() && snap.clients.is_empty();
+        if self.stale {
+            // Proves nothing about the client either: gone only if its pid died.
+            self.gone |= self.client_pid.is_some_and(|pid| !term::alive(pid));
+            // The tab is WezTerm's, not tmux's: still check the sidebar is not
+            // alone in it (resolve keeps the client over a clientless
+            // snapshot). (2026-10-22: with no tmux server, every refresh was
+            // stale, so a sidebar left alone in its tab never exited.)
+            self.link.on_snapshot(&snap, text::now());
+            if self.link.alone && !self.link.fixed {
+                self.gone = true;
+            }
+            return;
+        }
+        self.core.snapshot = snap;
         self.link.on_snapshot(&self.core.snapshot, text::now());
         self.bar = Bar::build(&self.core.snapshot, self.link.client.as_deref());
         self.forget_gone_toasts();
@@ -1170,8 +1197,11 @@ impl App {
     }
 
     /// The safety-net poll interval ([`TICK`] / [`FALLBACK`]).
+    ///
+    /// After a failed snapshot ([`App::stale`]) the fast tick, so the
+    /// sidebar catches up as soon as tmux answers again.
     fn cadence(&self) -> Duration {
-        if self.notices.fd().is_none() {
+        if self.notices.fd().is_none() || self.stale {
             TICK
         } else {
             FALLBACK
@@ -1562,6 +1592,48 @@ mod tests {
         let mut a = App::new(tmux, link, Notices::default());
         a.shown = layout(&a.view, 34, 30, &Opts::default());
         a
+    }
+
+    /// A failed snapshot (here: no server) keeps the last good snapshot,
+    /// view and client, and the next refresh comes a [`TICK`] later.
+    #[test]
+    fn a_failed_snapshot_keeps_the_last_frame() {
+        let mut a = app();
+        a.notices = Notices::register(&[format!("com.mackhaymond.agent-ui.test.{}.stale", std::process::id())]);
+        a.link.client = Some("/dev/ttys999".into());
+        a.core.snapshot = Snapshot::parse(&[
+            row("main", 1, "@1", &[("state", "idle"), ("summary", "Kept one")]),
+            "\x1fclient\x1f/dev/ttys999\x1f@1\x1fmain".into(),
+        ].join("\n"));
+        a.view = build_view(&mut a.core, Some("/dev/ttys999"), None).0;
+        let shows = |a: &App| layout(&a.view, 34, 30, &Opts::default()).rows.iter().any(|r| r.text().contains("Kept one"));
+        assert!(shows(&a) && !a.stale);
+        a.refresh();
+        assert!(a.stale && shows(&a) && !a.gone);
+        assert_eq!((a.core.snapshot.windows.len(), a.link.client.as_deref()), (1, Some("/dev/ttys999")));
+        assert_eq!(a.cadence(), TICK);
+    }
+
+    /// Failed snapshots (here: no tmux server at all) still look at the
+    /// WezTerm tab: a sidebar left alone in it exits; one beside another
+    /// pane stays.
+    #[test]
+    fn alone_in_its_tab_over_failed_snapshots_exits() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("agentui-alone-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let exe = d.join("wezterm");
+        std::fs::write(&exe, "#!/bin/sh\nexec cat \"$(dirname \"$0\")/panes.json\"\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (panes, gone) in [(r#"[{"tab_id":1,"pane_id":10},{"tab_id":1,"pane_id":11}]"#, false), (r#"[{"tab_id":1,"pane_id":10}]"#, true)] {
+            std::fs::write(d.join("panes.json"), panes).unwrap();
+            let mut a = app();
+            a.link = WeztermLink::new(exe.to_string_lossy().into(), None, None, Some("10".into()));
+            a.refresh();
+            assert_eq!((a.stale, a.gone), (true, gone), "{panes}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
