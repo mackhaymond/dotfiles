@@ -9,8 +9,8 @@
 //! private HOME and TMPDIR, so the indicator's watcher watchdog finds no
 //! pidfile and "respawns" a stub, never touching the real watcher.
 
-use agent_ui::answer::{plan, Asked, Dialog, PaneState, Verdict};
-use agent_ui::{Socket, Tmux};
+use agent_ui::answer::{answer_seen, plan, Asked, Dialog, PaneState, Seen, Verdict};
+use agent_ui::{Actions, Socket, Tmux};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -99,8 +99,14 @@ impl Server {
     }
 
     fn answer(&self, win: &str, verdict: &str) -> Output {
+        self.answer_with(win, verdict, &[])
+    }
+
+    /// `answer` with more arguments after the verdict (`--since …`).
+    fn answer_with(&self, win: &str, verdict: &str, more: &[&str]) -> Output {
         Command::new(BIN)
             .args(["--socket", &self.name, "answer", win, verdict])
+            .args(more)
             .env("NOTIFY_SH", self.dir.join("notify.sh"))
             .env("AGENT_UI_SCRIPTS", SCRIPTS)
             .env_remove("TMUX")
@@ -217,4 +223,128 @@ fn a_pane_that_changed_gets_nothing() {
     assert_eq!(s.got("moved"), "");
     assert_eq!(run(&st, asked).trim(), "sent");
     assert_eq!(s.got("moved"), "31");
+}
+
+/// A detail with everything tmux's command and format parsers care about:
+/// quotes, `#{…}`, `#(…)`, braces, `,`, `;`, `$`, backticks, a backslash.
+const NASTY: &str = "Bash a,b {x} }y \"q\" 'sq' $(id) ${HOME} `id` #{pane_id} ##x #(echo pwned) ;x \\ end";
+
+/// CuaNotch names the prompt it drew (`--since` / `--detail`, raw): another
+/// one by now is refused (exit 1, said through notify.sh, nothing sent); a
+/// flag without its value or an unknown flag is usage (exit 2, the old
+/// builds' fallback); the same prompt, written differently (the since's
+/// number alone, the detail with a trailing newline), is answered.
+#[test]
+fn cuanotch_names_the_prompt_it_drew() {
+    let s = Server::start("s");
+    let w = s.agent("stale", "perm_bash", "claude", "perm");
+    s.tmux(&["set-option", "-w", "-t", &w, "@agent_detail", NASTY]);
+    assert_eq!(s.opt(&w, "@agent_detail"), NASTY);
+    let since = s.opt(&w, "@agent_since");
+    let why = "stale: that prompt changed · look again";
+    for more in [
+        &["--since", "1699999999 needs-input"][..],
+        &["--detail", "Bash ls"],
+        &["--since", &since, "--detail", &NASTY.replace('#', "##")],
+        &["--since", "", "--detail", NASTY],
+        &["--detail", NASTY, "--since", "1700000000.5"],
+    ] {
+        let o = s.answer_with(&w, "allow", more);
+        assert_eq!(o.status.code(), Some(1), "{more:?}: {o:?}");
+        assert!(String::from_utf8_lossy(&o.stderr).contains(why), "{more:?}: {o:?}");
+    }
+    assert!(s.notified().contains(&format!("-k warn -- {why}")), "{}", s.notified());
+    for more in [&["--since"][..], &["--detail"], &["--since", &since, "--detail"], &["--bogus", "1"], &["--since=1700000000"]] {
+        let o = s.answer_with(&w, "allow", more);
+        assert_eq!(o.status.code(), Some(2), "{more:?}: {o:?}");
+        assert!(String::from_utf8_lossy(&o.stderr).contains("--since <raw @agent_since>"), "{o:?}");
+    }
+    assert_eq!(s.got("stale"), "");
+    assert_eq!(s.opt(&w, "@agent_state"), "needs-input");
+
+    let detail = format!("{NASTY}\n");
+    let o = s.answer_with(&w, "allow", &["--since", "1700000000", "--detail", &detail, "--client", "/dev/null"]);
+    assert!(o.status.success(), "{o:?}");
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "allowed stale");
+    assert_eq!(s.got("stale"), "31");
+    assert_eq!(s.opt(&w, "@agent_state"), "idle");
+}
+
+/// The race: CuaNotch's values match the snapshot `answer` read, then the
+/// window is asked again before the send. The guard (the snapshot's raw
+/// values, checked by tmux at the send) refuses; when the window no longer
+/// matches what CuaNotch drew that is said as "that prompt changed", and a
+/// re-ask that reads the same to CuaNotch is still refused (the screen).
+#[test]
+fn a_re_ask_after_the_read_is_refused_at_the_send() {
+    let s = Server::start("r");
+    let w = s.agent("race", "perm_bash", "claude", "perm");
+    s.tmux(&["set-option", "-w", "-t", &w, "@agent_detail", NASTY]);
+    let since = s.opt(&w, "@agent_since");
+    let tmux = Tmux::with_socket(Some(Socket::Name(s.name.clone())));
+    let actions = Actions::new(tmux.clone());
+    let seen = Seen { since: Some(&since), detail: Some(NASTY) };
+    let read = || {
+        let snap = tmux.snapshot();
+        assert!(seen.matches(snap.rows(&w).next().expect("the window")), "{snap:?}");
+        snap
+    };
+    let set = |k: &str, v: &str| s.tmux(&["set-option", "-w", "-t", &w, k, v]);
+    let changed = Err("race: that prompt changed · look again".to_string());
+
+    let snap = read();
+    set("@agent_since", "1700000001 needs-input");
+    assert_eq!(answer_seen(&actions, &snap, &w, Verdict::Allow, None, seen), changed);
+
+    set("@agent_since", &since);
+    let snap = read();
+    set("@agent_detail", "Bash rm -rf ~");
+    assert_eq!(answer_seen(&actions, &snap, &w, Verdict::Deny, None, seen), changed);
+
+    // Asked again with what normalises to the same prompt: still not the
+    // one the snapshot (and so the guard) pinned.
+    set("@agent_detail", NASTY);
+    let snap = read();
+    set("@agent_detail", &format!("{NASTY} "));
+    assert_eq!(answer_seen(&actions, &snap, &w, Verdict::Allow, None, seen), Err("race: its screen changed · try again".into()));
+
+    assert_eq!(s.got("race"), "");
+    assert_eq!(s.opt(&w, "@agent_state"), "needs-input");
+}
+
+/// CuaNotch drew a perm prompt; by the click it is a question (same
+/// `@agent_since`, `@agent_detail_kind` ask, a new detail): "that prompt
+/// changed", not "no permission prompt pending", and nothing sent.
+#[test]
+fn a_perm_prompt_that_became_a_question() {
+    let s = Server::start("q");
+    let w = s.agent("asked", "perm_bash", "claude", "perm");
+    s.tmux(&["set-option", "-w", "-t", &w, "@agent_detail", "Bash touch probe.txt"]);
+    let since = s.opt(&w, "@agent_since");
+    s.tmux(&["set-option", "-w", "-t", &w, "@agent_detail_kind", "ask"]);
+    s.tmux(&["set-option", "-w", "-t", &w, "@agent_detail", "Which deck?"]);
+    let o = s.answer_with(&w, "allow", &["--since", &since, "--detail", "Bash touch probe.txt"]);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("asked: that prompt changed · look again"), "{o:?}");
+    assert_eq!(s.got("asked"), "");
+    assert_eq!(s.opt(&w, "@agent_state"), "needs-input");
+}
+
+/// The global `--socket` / `-L` is read only before the subcommand: a raw
+/// detail that reads `-L` (or `--socket`) is the detail, never the socket.
+#[test]
+fn a_detail_reading_like_the_socket_flag() {
+    let s = Server::start("l");
+    for (name, detail) in [("dashl", "-L"), ("dashsock", "--socket")] {
+        let w = s.agent(name, "perm_bash", "claude", "perm");
+        s.tmux(&["set-option", "-w", "-t", &w, "@agent_detail", detail]);
+        let since = s.opt(&w, "@agent_since");
+        let o = s.answer_with(&w, "allow", &["--detail", detail, "--since", &since]);
+        assert!(o.status.success(), "{name}: {o:?}");
+        assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), format!("allowed {name}"));
+        assert_eq!(s.got(name), "31", "{name}");
+    }
+    // After the subcommand, a stray `-L` is the subcommand's: usage.
+    let o = s.answer_with("@1", "allow", &["-L", &s.name]);
+    assert_eq!(o.status.code(), Some(2), "{o:?}");
 }

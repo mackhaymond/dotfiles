@@ -8,7 +8,7 @@
 //! agent-ui [--socket <name|path>] menu ...      (see menu.rs)
 //! agent-ui [--socket <name|path>] sessions ...  (see sessions.rs; prefix a)
 //! agent-ui [--socket <name|path>] pin [toggle|on|off] [--window <@id>] [--client <tty>]   (pins.rs; prefix t)
-//! agent-ui [--socket <name|path>] answer <@id> allow|deny [--client <tty>]  (answer.rs: a permission prompt)
+//! agent-ui [--socket <name|path>] answer <@id> allow|deny [--client <tty>] [--since <raw>] [--detail <raw>]  (answer.rs: a permission prompt)
 //! agent-ui [--socket <name|path>] insight [<@id>] [--json]   (insight.rs: diff, doing, context per agent)
 //! agent-ui [--socket <name|path>] insight-files <@id>        (its dirty files: a repo root, then "\t<file>" lines)
 //! agent-ui [--socket <name|path>] diff <@id> --client <tty>   (diff.rs: those files' diff in a popup; ⌥W ⇧letter)
@@ -27,7 +27,7 @@ const USAGE: &str = "usage: agent-ui [--socket <name|path>] dump [--client <tty>
        agent-ui menu --client <tty> [--tab <tab>] | --once <W>x<H>
        agent-ui sessions --client <tty> | --once <W>x<H> [--client <tty>] [--query <q>] [--ansi]
        agent-ui pin [toggle|on|off] [--window <@id>] [--client <tty>]
-       agent-ui answer <@id> allow|deny [--client <tty>]
+       agent-ui answer <@id> allow|deny [--client <tty>] [--since <raw @agent_since>] [--detail <raw @agent_detail>]
        agent-ui insight [<@id>] [--json]
        agent-ui insight-files <@id>
        agent-ui diff <@id> --client <tty> [--after <pid>] [--print]";
@@ -40,13 +40,15 @@ fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut tmux = Tmux::from_env();
-    if let Some(i) = args.iter().position(|a| a == "--socket" || a == "-L") {
-        let Some(v) = args.get(i + 1).cloned() else {
+    // The global flag only BEFORE the subcommand word: after it, `-L` may be
+    // a subcommand's value (a raw `answer --detail -L`), never the socket.
+    if matches!(args.first().map(String::as_str), Some("--socket" | "-L")) {
+        let Some(v) = args.get(1).cloned() else {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
         };
         tmux = Tmux::with_socket(Socket::parse(&v));
-        args.drain(i..i + 2);
+        args.drain(..2);
     }
     let Some(cmd) = args.first().cloned() else {
         eprintln!("{USAGE}");

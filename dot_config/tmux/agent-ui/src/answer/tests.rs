@@ -103,6 +103,92 @@ fn another_prompt_is_refused() {
     }
 }
 
+/// `--since`: the first word, numerically when both are numbers.
+#[test]
+fn since_normalised() {
+    assert!(same_since("1700000000 needs-input", "1700000000"));
+    assert!(same_since("  1700000000\tneeds-input ", "1700000000 idle"));
+    assert!(same_since("1700000000", "1700000000.0"));
+    assert!(same_since("+500", "500") && same_since("5e2", "500"));
+    assert!(same_since("", "") && same_since("abc x", "abc y"));
+    assert!(!same_since("1700000000 needs-input", "1700000001 needs-input"));
+    assert!(!same_since("500", "") && !same_since("", "500"));
+    assert!(!same_since("abc", "abd") && !same_since("500", "500x"));
+    // Not finite floats: text.
+    assert!(same_since("nan", "nan") && !same_since("inf", "infinity"));
+}
+
+/// `--detail`: the sidebar's sanitize (controls → spaces), trimmed; inner
+/// runs of spaces still count.
+#[test]
+fn detail_normalised() {
+    assert!(same_detail("Bash  ls\x01", "Bash  ls"));
+    assert!(same_detail(" Bash ls\n", "Bash ls"));
+    assert!(same_detail("a\tb", "a b"));
+    let nasty = "Bash a,b {x} }y \"q\" 'q' $(id) ${HOME} #{pane_id} #(id) ;x";
+    assert!(same_detail(nasty, &format!("{nasty}  ")));
+    assert!(!same_detail("Bash  ls", "Bash ls"));
+    assert!(!same_detail(nasty, &nasty.replace('#', "##")));
+    assert!(!same_detail("", "x"));
+}
+
+/// The command line: flags anywhere, each with its value (whatever it
+/// reads); anything else is usage (exit 2), which old CuaNotch falls back on.
+#[test]
+fn command_line() {
+    let p = |a: &[&str]| Args::parse(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert_eq!(p(&["@3", "allow"]), Some(Args { win: "@3".into(), verdict: Verdict::Allow, client: None, since: None, detail: None }));
+    assert_eq!(p(&["--since", "500 needs-input", "@3", "--detail", "-rf {x}; $y", "deny", "--client", "/dev/ttys004"]),
+        Some(Args { win: "@3".into(), verdict: Verdict::Deny, client: Some("/dev/ttys004".into()),
+            since: Some("500 needs-input".into()), detail: Some("-rf {x}; $y".into()) }));
+    // Empty values are values.
+    assert_eq!(p(&["@3", "allow", "--since", "", "--detail", ""]).map(|a| (a.since, a.detail)),
+        Some((Some(String::new()), Some(String::new()))));
+    for bad in [
+        &["@3", "allow", "--since"][..],
+        &["@3", "allow", "--detail"],
+        &["@3", "allow", "--client"],
+        &["@3", "allow", "--bogus", "x"],
+        &["@3", "allow", "--since=5"],
+        &["@3", "allow", "-x"],
+        &["@3", "allow", "--since", "1", "--since", "1"],
+        &["@3", "maybe"],
+        &["@3"],
+        &["@3", "allow", "extra"],
+        &[],
+    ] {
+        assert_eq!(p(bad), None, "{bad:?}");
+    }
+}
+
+/// `--since` / `--detail` against the snapshot row, before any pane is
+/// read: a match gets as far as the (absent) pane, a mismatch is refused.
+#[test]
+fn seen_prompt_is_checked() {
+    let snap = Snapshot::parse(&row("main", 1, "@1", &[("state", "needs-input"), ("kind", "claude"),
+        ("detail_kind", "perm"), ("summary", "P"), ("detail", "Bash  ls\x01"), ("since", "500 needs-input")]));
+    let a = Actions::new(Tmux::with_socket(Some(crate::tmux::Socket::Name(format!("agentui-answer-none3-{}", std::process::id())))));
+    let go = |since: Option<&str>, detail: Option<&str>| answer_seen(&a, &snap, "@1", Verdict::Allow, None, Seen { since, detail });
+    for (s, d) in [(None, None), (Some("500 needs-input"), None), (Some("500"), Some("Bash  ls ")), (None, Some("Bash  ls\x01"))] {
+        assert_eq!(go(s, d), Err(PANE_GONE.into()), "{s:?} {d:?}");
+    }
+    for (s, d) in [(Some("499 needs-input"), None), (Some(""), None), (None, Some("Bash ls")), (Some("500"), Some("Bash  cat"))] {
+        assert_eq!(go(s, d), Err("P: that prompt changed · look again".into()), "{s:?} {d:?}");
+    }
+    // The same prompt, answered meanwhile: the window's own refusal.
+    let idle = Snapshot::parse(&row("main", 1, "@1", &[("state", "idle"), ("kind", "claude"), ("detail_kind", "perm"),
+        ("summary", "P"), ("detail", "Bash ls"), ("since", "500 idle")]));
+    assert_eq!(answer_seen(&a, &idle, "@1", Verdict::Allow, None, Seen { since: Some("500 needs-input"), detail: Some("Bash ls") }),
+        Err("P: no permission prompt pending".into()));
+    // The prompt turned into a question (same since, a new detail): changed,
+    // checked before the window's refusal (not "no permission prompt").
+    let ask = Snapshot::parse(&row("main", 1, "@1", &[("state", "needs-input"), ("kind", "claude"), ("detail_kind", "ask"),
+        ("summary", "P"), ("detail", "Which deck?"), ("since", "500 needs-input")]));
+    assert_eq!(answer_seen(&a, &ask, "@1", Verdict::Allow, None, Seen { since: Some("500 needs-input"), detail: Some("Bash ls") }),
+        Err("P: that prompt changed · look again".into()));
+    assert_eq!(answer_seen(&a, &ask, "@1", Verdict::Allow, None, Seen::NONE), Err("P: no permission prompt pending".into()));
+}
+
 /// The select's `❯` must be on the plain Yes: anywhere else (an editable
 /// "don't ask again" row, No) a digit could land in a text field.
 #[test]

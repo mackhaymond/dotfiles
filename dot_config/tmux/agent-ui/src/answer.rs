@@ -59,6 +59,19 @@
 //! The command line refuses through notify.sh (a toast in the sidebar, else
 //! tmux's message; `$NOTIFY_SH` names another, as agent-jump.sh), exit 1;
 //! the sidebar and the menu say the refusal on their own message line.
+//!
+//! A caller outside agent-ui (CuaNotch's Allow / Deny buttons) names the
+//! prompt it drew with `--since <raw>` / `--detail <raw>`: the window's
+//! `@agent_since` and `@agent_detail` exactly as tmux gave them when it drew.
+//! Either one that no longer matches the window ([`Seen`]: the since's first
+//! word, numerically when both are numbers; the detail [`sanitize`]d and
+//! trimmed) is refused as `that prompt changed · look again`, exit 1. The
+//! match is against the snapshot whose raw values [`plan`]'s guard pins, so
+//! a re-ask between that read and the send is still refused by tmux itself.
+//! An unknown flag, or one of these without its value, is a usage error
+//! (exit 2), which older CuaNotch builds take as "fall back".
+//!
+//! [`sanitize`]: crate::text::sanitize
 
 use crate::actions::{sh_quote, Actions, PANE_GONE};
 use crate::proc;
@@ -67,7 +80,8 @@ use crate::view::Agent;
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
-const USAGE: &str = "usage: agent-ui answer <window_id> allow|deny [--client <tty>]";
+const USAGE: &str =
+    "usage: agent-ui answer <window_id> allow|deny [--client <tty>] [--since <raw @agent_since>] [--detail <raw @agent_detail>]";
 
 /// Allow (the single-use Yes) or deny (Esc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +252,53 @@ fn window_prompt(w: &Window) -> String {
     format!("{} {}", w.since_t.unwrap_or(0), crate::text::sanitize(&w.detail))
 }
 
+/// The prompt an outside caller drew (`--since` / `--detail`): the window's
+/// raw `@agent_since` and `@agent_detail` as it read them, either one
+/// optional (None: not checked).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Seen<'a> {
+    pub since: Option<&'a str>,
+    pub detail: Option<&'a str>,
+}
+
+impl Seen<'_> {
+    /// Nothing named: the check is off.
+    pub const NONE: Seen<'static> = Seen { since: None, detail: None };
+
+    /// Each value given is still the window's ([`same_since`],
+    /// [`same_detail`] against the snapshot row).
+    pub fn matches(&self, w: &Window) -> bool {
+        self.since.is_none_or(|s| same_since(s, &w.since)) && self.detail.is_none_or(|d| same_detail(d, &w.detail))
+    }
+
+    fn given(&self) -> bool {
+        self.since.is_some() || self.detail.is_some()
+    }
+}
+
+/// Two `@agent_since` values name the same moment: their first words
+/// (`<epoch> <state>` → `<epoch>`), compared as numbers when both are
+/// (integers exactly, else finite floats: `1700000000` = `1700000000.0`),
+/// else as text.
+pub fn same_since(a: &str, b: &str) -> bool {
+    let word = |s: &str| s.split_whitespace().next().unwrap_or("").to_string();
+    let (a, b) = (word(a), word(b));
+    if let (Ok(x), Ok(y)) = (a.parse::<i64>(), b.parse::<i64>()) {
+        return x == y;
+    }
+    let float = |s: &str| s.parse::<f64>().ok().filter(|f| f.is_finite());
+    match (float(&a), float(&b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Two `@agent_detail` values read the same: the sidebar's own
+/// [`crate::text::sanitize`] (controls → spaces), whitespace-trimmed.
+pub fn same_detail(a: &str, b: &str) -> bool {
+    crate::text::sanitize(a).trim() == crate::text::sanitize(b).trim()
+}
+
 /// How long a guarded target (a chip, a diff badge) must have sat at a cell
 /// before a click there is trusted ([`Arrivals`]).
 pub const SETTLE: Duration = Duration::from_millis(400);
@@ -370,12 +431,28 @@ pub fn plan(st: &PaneState, d: Dialog, v: Verdict, pane: &str, asked: Asked) -> 
 /// Nothing is sent unless [`detect`] confirmed the dialog on the agent's
 /// pane, and the pane is still as it was then ([`plan`]).
 pub fn answer(actions: &Actions, snap: &Snapshot, win: &str, v: Verdict, prompt: Option<&str>) -> Result<String, String> {
+    answer_seen(actions, snap, win, v, prompt, Seen::NONE)
+}
+
+/// [`answer`], also refusing unless the window's prompt is still the one
+/// `seen` names (the command line's `--since` / `--detail`). That check is
+/// against `snap`, whose raw values [`plan`] pins in the send's guard, so a
+/// re-ask after `snap` was read is refused at the send too (and said as
+/// "that prompt changed" when the window no longer matches `seen`).
+pub fn answer_seen(actions: &Actions, snap: &Snapshot, win: &str, v: Verdict, prompt: Option<&str>, seen: Seen)
+    -> Result<String, String> {
     let w = snap.rows(win).next().ok_or_else(|| PANE_GONE.to_string())?;
+    let changed = || format!("{}: that prompt changed · look again", w.label);
+    // Before the window's own refusal: a prompt that turned into another
+    // kind (perm → ask, the same since, a new detail) is "changed" too.
+    if !seen.matches(w) {
+        return Err(changed());
+    }
     if let Some(why) = refuse_window(w) {
         return Err(why);
     }
     if prompt.is_some_and(|p| p != window_prompt(w)) {
-        return Err(format!("{}: that prompt changed · look again", w.label));
+        return Err(changed());
     }
     let pane = actions.agent_pane(&w.id, &w.kind)?;
     let tmux = &actions.tmux;
@@ -392,6 +469,12 @@ pub fn answer(actions: &Actions, snap: &Snapshot, win: &str, v: Verdict, prompt:
         Ok(o) if o.ok() && o.stdout.trim() == "sent" => {
             discharge(actions, &w.id);
             Ok(format!("{} {}", v.done(), w.label))
+        }
+        // Refused by the guard: when the caller named its prompt and the
+        // window is on another one now, say that (a fresh read, words only;
+        // nothing was sent either way).
+        Ok(o) if o.ok() && seen.given() && !tmux.snapshot().rows(win).next().is_some_and(|now| seen.matches(now)) => {
+            Err(changed())
         }
         Ok(o) if o.ok() => Err(format!("{}: its screen changed · try again", w.label)),
         _ => Err(format!("{}: couldn't send the keys", w.label)),
@@ -431,19 +514,58 @@ fn notify(tmux: &Tmux, actions: &Actions, client: Option<&str>, text: &str) {
     let _ = proc::run(c, None, Duration::from_secs(5));
 }
 
+/// The command line, parsed ([`Args::parse`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Args {
+    pub win: String,
+    pub verdict: Verdict,
+    pub client: Option<String>,
+    /// `--since`: the raw `@agent_since` the caller drew.
+    pub since: Option<String>,
+    /// `--detail`: the raw `@agent_detail` the caller drew.
+    pub detail: Option<String>,
+}
+
+impl Args {
+    /// `<window_id> allow|deny` plus `--client` / `--since` / `--detail`,
+    /// each with its value (the next argument, taken whatever it reads: a
+    /// raw detail may start with `-`). None (usage, exit 2) for a flag
+    /// without its value or given twice, any other `-…` argument, or not
+    /// exactly two words: an older caller probes this to fall back.
+    pub fn parse(args: &[String]) -> Option<Args> {
+        let (mut client, mut since, mut detail) = (None, None, None);
+        let mut words = Vec::new();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            let slot = match a.as_str() {
+                "--client" => &mut client,
+                "--since" => &mut since,
+                "--detail" => &mut detail,
+                s if s.starts_with('-') => return None,
+                _ => {
+                    words.push(a.clone());
+                    continue;
+                }
+            };
+            if slot.replace(it.next()?.clone()).is_some() {
+                return None;
+            }
+        }
+        let [win, v] = <[String; 2]>::try_from(words).ok()?;
+        Some(Args { win, verdict: Verdict::parse(&v)?, client, since, detail })
+    }
+}
+
 /// The subcommand.
 pub fn run(tmux: Tmux, args: &[String]) -> ExitCode {
-    let client = args.iter().position(|a| a == "--client").and_then(|i| args.get(i + 1)).cloned();
-    let words: Vec<&String> = args.iter().enumerate()
-        .filter(|(i, a)| *a != "--client" && (*i == 0 || args[i - 1] != "--client"))
-        .map(|(_, a)| a)
-        .collect();
-    let (Some(win), Some(v), None) = (words.first(), words.get(1).and_then(|s| Verdict::parse(s)), words.get(2)) else {
+    let Some(a) = Args::parse(args) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
+    let client = a.client.clone();
+    let seen = Seen { since: a.since.as_deref(), detail: a.detail.as_deref() };
     let actions = Actions::new(tmux.clone());
-    match answer(&actions, &tmux.snapshot(), win, v, None) {
+    match answer_seen(&actions, &tmux.snapshot(), &a.win, a.verdict, None, seen) {
         Ok(m) => {
             println!("{m}");
             ExitCode::SUCCESS

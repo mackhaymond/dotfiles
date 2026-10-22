@@ -1708,9 +1708,19 @@ allowed or denied without going to its tab:
 - **Menu.** On that agent's row the Space strip lists `y allow` and
   `n deny` first: Space y / Space n answer at once (no y/n of the menu's
   own; the capture below is the check).
-- **CLI.** `agent-ui answer <@id> allow|deny [--client <tty>]`: exit 0
-  sent, 1 refused (said through notify.sh, warn, to `--client` when given;
-  `$NOTIFY_SH` names another), 2 usage.
+- **CLI.** `agent-ui answer <@id> allow|deny [--client <tty>] [--since
+  <raw>] [--detail <raw>]`: exit 0 sent, 1 refused (said through
+  notify.sh, warn, to `--client` when given; `$NOTIFY_SH` names another),
+  2 usage (an unknown flag, a flag without its value or given twice; older
+  CuaNotch builds take exit 2 as "fall back"). `--since` / `--detail` are
+  the window's `@agent_since` / `@agent_detail` exactly as tmux gave them
+  when the caller (CuaNotch's Allow / Deny buttons) drew its prompt; either
+  one given that no longer matches is refused as `that prompt changed ·
+  look again`, nothing sent (`answer::Seen`: the since's first word,
+  numerically when both are numbers, else as text; the detail through the
+  sidebar's `sanitize`, whitespace-trimmed). The match is against the
+  snapshot whose raw values step 4's guard pins, so a re-ask between that
+  read and the send is refused by tmux at the send as well.
 
 Every path runs `answer::answer`, which sends nothing unless it is sure:
 
