@@ -242,7 +242,7 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
     if !crate::insight::disabled() {
         crate::insight::fill(&mut view, &crate::insight::Engine::home().update(&core.snapshot, text::now()));
     }
-    let opts = Opts { msg: None, bar, spin: 0, now: None, pause, void_armed, glow_off, ctx: layout::CtxStyle::from_env() };
+    let opts = Opts { msg: None, bar, spin: 0, now: None, pause, void_armed, glow_off };
     let frame = layout(&view, w, h, &opts);
     let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
     layout::paint(&frame, &mut buf);
@@ -1205,7 +1205,6 @@ impl App {
             pause: self.pause_phase.clone(),
             void_armed: self.void_armed(Instant::now()),
             glow_off: self.glow_off,
-            ctx: layout::CtxStyle::from_env(),
         };
         let frame = layout(&self.view, size.width, size.height, &opts);
         let mut buf = Buffer::empty(Rect::new(0, 0, size.width, size.height));

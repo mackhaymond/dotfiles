@@ -243,9 +243,11 @@ fn needs_matches_agent_jump_list() {
     let _ = std::fs::remove_dir_all(nl_dir);
 }
 
-/// Outside tmux under a non-UTF-8 locale, agent-jump.sh's plain `tmux`
-/// prints US as `_` and lists nothing; utf8_ctype_env (what Tmux::script_env
-/// applies) fixes that without changing its order.
+/// Outside tmux under a non-UTF-8 locale, a plain `tmux` prints US as `_`,
+/// so agent-jump.sh would list nothing; utf8_ctype_env (what
+/// Tmux::script_env applies) fixes that without changing its order, and so
+/// does the script's own locale fix (its LC_ALL kept as LC_COLLATE), so the
+/// list matches with or without it, whatever LANG the test runs under.
 #[test]
 fn agent_jump_outside_tmux_under_a_c_locale() {
     let s = Server::start_default("ctype");
@@ -273,7 +275,14 @@ fn agent_jump_outside_tmux_under_a_c_locale() {
         run(c)
     };
     assert!(ours.lines().count() > 20, "{ours}");
-    assert_ne!(jump(false), ours, "the bug did not reproduce: is $TMUX leaking in?");
+    let plain = {
+        let mut c = Command::new("tmux");
+        c.args(["list-windows", "-a", "-F", "#{window_id}\x1f#{session_name}"]).env("LC_ALL", "C");
+        s.env_for_plain_tmux(&mut c);
+        run(c)
+    };
+    assert!(!plain.is_empty() && !plain.contains('\x1f'),"the bug did not reproduce: is $TMUX leaking in?\n{plain}");
+    assert_eq!(jump(false), ours);
     assert_eq!(jump(true), ours);
 }
 

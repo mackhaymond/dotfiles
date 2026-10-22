@@ -30,7 +30,7 @@ use super::letters::{self, KeyMemo, Write};
 use crate::collate::Collator;
 use crate::git::GitCache;
 use crate::model::{Cat, Counts};
-use crate::tmux::{Snapshot, HOLD};
+use crate::tmux::{Snapshot, HOLD, PENDING};
 use crate::view::{Agent, BuildArgs, Need, Parked, SlotMemo, ViewModel};
 use std::collections::{HashMap, HashSet};
 
@@ -181,6 +181,11 @@ pub struct Target {
     /// ([`crate::answer::answerable`]): Space y / Space n answer it, and only
     /// that prompt ([`crate::answer::prompt_key`]).
     pub perm: Option<String>,
+    /// A PENDING space's claude ([`Agent::pending`]; with `@spaces` off any
+    /// window of the hidden [`PENDING`] session, listed by name): it is in
+    /// no space yet, so [`crate::actions::Actions::park`] refuses it and
+    /// Space s is not offered. Closing it stays.
+    pub pending: bool,
 }
 
 impl Target {
@@ -194,6 +199,7 @@ impl Target {
             title: a.title.clone(),
             pinned: a.pinned.is_some(),
             perm: crate::answer::answerable(a).then(|| crate::answer::prompt_key(a)),
+            pending: a.pending.is_some() || a.session == PENDING,
         }
     }
 

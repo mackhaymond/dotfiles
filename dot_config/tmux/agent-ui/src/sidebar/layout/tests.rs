@@ -19,7 +19,7 @@ fn idle_says_nothing_and_every_state_has_its_rail() {
     for (name, v) in all().into_iter().chain([("coloured", coloured())]).flat_map(|(n, v)| [(n, v.clone()), (n, lettered(v))]) {
         for (w, h) in [(34u16, 58u16), (42, 90), (42, 30), (24, 40)] {
             let f = layout(&v, w, h, &Opts::default());
-            let cx = Cx { w: usize::from(w), b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false, ctx: CTX_STYLE };
+            let cx = Cx { w: usize::from(w), b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false };
             let t = texts(&f);
             for y in f.agents.clone().filter(|&y| f.rows[y].covers.len() == 1 && !is_group_header(&f.rows[y], usize::from(w))) {
                 let r = &f.rows[y];
@@ -859,7 +859,7 @@ fn tiny_heights() {
         assert_eq!(f.target(3, y as u16), Some(&Target::Menu(Some("all"))));
     }
     // Nothing pending in one row: the header saying so, never ` … 0 need you`.
-    let cx = Cx { w: 34, b: Badge::OFF, now: NOW as f64, spin: 0, home: None, cur: None, shells: true, resumes: false, ctx: CTX_STYLE };
+    let cx = Cx { w: 34, b: Badge::OFF, now: NOW as f64, spin: 0, home: None, cur: None, shells: true, resumes: false };
     assert_eq!(needs_cut(&empty(), cx, 1).iter().map(Row::text).collect::<Vec<_>>(), [needs_header(&empty(), 34).text()]);
 }
 
@@ -1740,7 +1740,7 @@ fn shells_fold_into_one_line() {
     let refs: Vec<&Agent> = many.iter().collect();
     for w in [16usize, 24, 34, 60, 200] {
         for on in [true, false] {
-            let cx = Cx { w, b: Badge { on, loud: false }, now: NOW as f64, spin: 0, home: None, cur: None, shells: true, resumes: false, ctx: CTX_STYLE };
+            let cx = Cx { w, b: Badge { on, loud: false }, now: NOW as f64, spin: 0, home: None, cur: None, shells: true, resumes: false };
             let r = shells_line(&refs, cx, Ink::Pal("peach"));
             let text = r.text();
             assert_eq!(width(&r.segs), w, "{w}: {text:?}");

@@ -130,9 +130,18 @@ set -uo pipefail
 # read as "nothing needs you", and the client lookup would never match
 # (`jump` → 5). agent-ui's Tmux::command passes -u for the same reason;
 # exporting the locale also covers the awk/sort below.
+# Only LC_CTYPE changes: the sort keeps the caller's collation, which is the
+# order agent-ui's sidebar and menu show the queue in (its Collator reads
+# LC_ALL, then LC_COLLATE, then LANG). A non-UTF-8 LC_ALL has to go (it
+# would override LC_CTYPE), so its value stays on as LC_COLLATE and
+# LC_NUMERIC, as agent-ui's utf8_ctype_env does; dropping it bare let LANG
+# pick the collation instead (LC_ALL=C with LANG=en_US.UTF-8 sorted "Ω"
+# before "main", where the sidebar sorts it after).
 case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
     *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) ;;
-    *) unset LC_ALL; export LC_CTYPE=en_US.UTF-8 ;;
+    *)
+        [ -n "${LC_ALL:-}" ] && export LC_COLLATE="$LC_ALL" LC_NUMERIC="$LC_ALL"
+        unset LC_ALL; export LC_CTYPE=en_US.UTF-8 ;;
 esac
 
 US=$'\x1f'

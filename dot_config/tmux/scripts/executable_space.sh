@@ -1932,29 +1932,39 @@ cmd_adopt_pending() {
   viewers="$(t list-clients -F "#{client_name}${US}#{session_name}${US}#{window_id}" 2>/dev/null \
     | awk -F"$US" -v w="$wid" -v s="$PEND_SESS" '$2 == s && $3 == w { print $1 }')"
   local sid name pi created=0
+  # The window stops holding N before the lock goes: the first sync after it
+  # (the session-created one, home_now's) numbers the new space N, and a
+  # window still marked N would be a second space N (two groups in the
+  # sidebar) until the move below. Off the sidebar for that moment instead.
+  local -a unpend=(set -wu -t "$wid" @pending_space ";" set -wu -t "$wid" @pending_request
+    ";" set -wu -t "$wid" @pending_client ";" set -wu -t "$wid" @pending_color)
   reg_lock || { echo "space.sh adopt-pending: the registry is busy, try again" >&2; return 1; }
   reg_load
   pi="$(reg_find "pending:$wid")"
   sid="$(space_for_dir "$dir")"
   if [[ -z "$sid" ]]; then
     name="$(new_space_name "$dir")"
-    sid="$(t new-session -d -s "$name" -c "$dir" -P -F '#{session_id}' 2>/dev/null)"
+    # One command list: the unmarking never runs without the space (a list
+    # stops at a failing new-session, and claude keeps its N to try again).
+    sid="$(t new-session -d -s "$name" -c "$dir" -P -F '#{session_id}' ";" "${unpend[@]}" 2>/dev/null)"
+    sid="${sid%%$'\n'*}"
     [[ "$sid" == \$* ]] || { reg_unlock; echo "space.sh adopt-pending: could not make a space for $dir" >&2; return 1; }
     created=1
     # The reservation's row becomes the space's: its place in the order (N)
     # and its colour. Its session-created sync waits for this lock.
     ((pi >= 0)) && R_NAME[pi]="$name" R_PATH[pi]="$dir"
-  elif ((pi >= 0)); then
-    reg_del "$pi"
+  else
+    # Its folder already has a space: the reservation goes, and N with it.
+    t "${unpend[@]}" 2>/dev/null
+    ((pi >= 0)) && reg_del "$pi"
   fi
   ((pi >= 0)) && reg_save
   reg_unlock
   ((created)) && home_now "$sid"
-  local -a args=(set -wu -t "$wid" @pending_space ";" set -wu -t "$wid" @pending_request
-    ";" set -wu -t "$wid" @pending_client ";" set -wu -t "$wid" @pending_color)
+  local -a args=()
   local v
-  while IFS= read -r v; do [[ -n "$v" ]] && args+=(";" detach-client -t "$v"); done <<<"$viewers"
-  args+=(";" move-window -d -a -s "$wid" -t "$sid:{end}")
+  while IFS= read -r v; do [[ -n "$v" ]] && add detach-client -t "$v"; done <<<"$viewers"
+  add move-window -d -a -s "$wid" -t "$sid:{end}"
   run_args
   if [[ "$(t display-message -p -t "$wid" '#{session_id}' 2>/dev/null)" != "$sid" ]]; then
     msg -k error "could not move claude ($wid) into its space"

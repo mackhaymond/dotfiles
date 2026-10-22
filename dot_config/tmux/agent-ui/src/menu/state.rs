@@ -16,9 +16,9 @@
 //! - **Actions** (Space): the footer lists what the selected row offers
 //!   (`p` pin / unpin: the sidebar's PINNED section, `s` park, `x` close or
 //!   discard, `d` its uncommitted diff in a popup (closes the menu), `v`
-//!   the preview strip, `r` restart the watcher, ⏎ go; a
-//!   parked row offers neither p nor s; a Claude agent waiting on a
-//!   permission prompt offers `y` allow and `n` deny first, answered in
+//!   the preview strip, `r` restart the watcher, ⏎ go; a parked row offers
+//!   neither p nor s, a pending space's claude no s; a Claude agent waiting
+//!   on a permission prompt offers `y` allow and `n` deny first, answered in
 //!   place by [`crate::answer`], no y/n of its own: the capture is the
 //!   check); the next key runs one; Esc or any other key cancels.
 //! - **y/n** after park / close: only `y` (on a prompt already on screen)
@@ -182,9 +182,10 @@ pub enum Act {
 
 /// The actions strip's entries for `t`: (key, act, words). `p` pins (or
 /// unpins: the row says which) an agent's window; a parked tab is neither
-/// pinned nor parked again. `d` shows its diff (a parked one's too). The
-/// preview strip is `v` ("view"). A row a permission prompt waits on offers
-/// `y` allow and `n` deny first.
+/// pinned nor parked again; a pending space's claude ([`Target::pending`])
+/// is not parked (it is in no space yet: the park would only refuse). `d`
+/// shows its diff (a parked one's too). The preview strip is `v` ("view").
+/// A row a permission prompt waits on offers `y` allow and `n` deny first.
 pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
     let mut v = Vec::new();
     if t.perm.is_some() && !t.parked() {
@@ -193,7 +194,9 @@ pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
     }
     if !t.parked() {
         v.push(('p', Act::Pin, if t.pinned { "unpin" } else { "pin" }));
-        v.push(('s', Act::Park, "park"));
+        if !t.pending {
+            v.push(('s', Act::Park, "park"));
+        }
     }
     v.push(('x', Act::Close, if t.parked() { "discard" } else { "close" }));
     v.push(('d', Act::Diff, "diff"));
@@ -1147,6 +1150,38 @@ pub(crate) mod tests {
         let n = fx.calls.len();
         m.handle(&keys(" p"), &mut fx);
         assert_eq!(fx.calls.len(), n);
+    }
+
+    /// A pending space's claude (a window of the hidden `pending` session
+    /// building space N) is in no space yet, so `Actions::park` would only
+    /// refuse it: its strip offers no s (and s does nothing there), but
+    /// still x close. `@spaces` on (its own group) or off (`-- pending`).
+    #[test]
+    fn a_pending_space_is_not_offered_park() {
+        let mut snap = fixture();
+        let set = [("state", "idle"), ("summary", "Rust CLI fizz"), ("pending_space", "2"), ("pending_request", "make fizz"),
+            ("pending_color", "#f5c2e7"), ("space_hidden", "1")];
+        snap.windows.push(crate::tmux::Window::parse(&crate::tmux::tests::row("pending", 1, "@40", &set)).unwrap());
+        for spaces in [true, false] {
+            if !spaces {
+                snap.clients[0].spaces = String::new();
+            }
+            let mut fx = Rec::default();
+            let mut m = menu_of(data_of(&snap));
+            m.sel = Some(ak("pending", "@40"));
+            draw_all(&mut m);
+            let t = m.selected_target().unwrap_or_else(|| panic!("{spaces}: no pending row"));
+            assert!(t.pending && t.win == "@40", "{spaces}: {t:?}");
+            assert_eq!(strip(&t).iter().map(|(k, _, w)| format!("{k} {w}")).collect::<Vec<_>>(),
+                ["p pin", "x close", "d diff", "v preview", "r restart watcher"], "{spaces}");
+            m.handle(&keys(" s"), &mut fx);
+            assert!(m.confirm.is_none() && fx.calls.is_empty(), "{spaces}: {:?}", fx.calls);
+            m.handle(&keys(" x"), &mut fx);
+            assert_eq!(m.confirm.as_ref().map(|c| c.verb()), Some("close"), "{spaces}");
+            // Any other agent row still offers it.
+            let other = menu_of(data_of(&snap)).selected_target().unwrap();
+            assert!(!other.pending && strip(&other).iter().any(|(k, _, _)| *k == 's'), "{spaces}: {other:?}");
+        }
     }
 
     /// Space d hands the selected row's window to the diff popup and closes

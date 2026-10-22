@@ -1,5 +1,5 @@
 //! What the insight ([`crate::insight`]) puts on a card: the doing line,
-//! the diff badge (a click into the diff), the context meter; and how they
+//! the diff badge (a click into the diff), never the context; and how they
 //! give way at narrow widths.
 
 use super::*;
@@ -87,18 +87,18 @@ fn the_second_line_says_what_it_does() {
 
 /// The diff badge on row 2 before the age: `+48` dim green and `−12` dim
 /// red (over the card, [`DIFF_TINT`]), ` · 3f` dim; nothing when clean.
-/// Both rows one background: nothing in the badge or meter has its own.
+/// Both rows one background: nothing in the badge has its own.
 #[test]
 fn the_badge_is_dim_green_and_red_on_the_card() {
     let x = a("main", 1, "running", "Sidebar").with("detail_kind", "run").with("detail", "Edit layout.rs");
     let (l2, r) = second(x, Some(ins(Some(TODO), None, Some((48, 12, 3)), Some(850_000))), None);
-    assert_eq!(l2, "› Wiring the b… +48 −12 · 3f 85% 1m");
+    assert_eq!(l2, "› Wiring the badge +48 −12 · 3f 1m");
     let bg = r.bg.expect("a card");
     assert!(r.segs.contains(&seg("+48", over(Ink::Pal("green"), DIFF_TINT, bg))), "{:?}", r.segs);
     assert!(r.segs.contains(&seg("−12", over(Ink::Pal("red"), DIFF_TINT, bg))), "{:?}", r.segs);
-    assert!(r.segs.contains(&seg(" · 3f", "overlay2")) && r.segs.contains(&seg("85%", "peach")), "{:?}", r.segs);
+    assert!(r.segs.contains(&seg(" · 3f", "overlay2")), "{:?}", r.segs);
     assert!(r.segs.iter().all(|s| s.bg.is_none() || s.bg == Some(Ink::Canvas)), "{:?}", r.segs);
-    // Clean, and context under half: neither.
+    // Clean: none.
     let (l2, _) = second(a("main", 1, "idle", "Jacket"), Some(ins(None, Some(PROMPT), None, Some(400_000))), None);
     assert_eq!(l2, "> fix the parser 1m");
     // Thousands, compact.
@@ -106,64 +106,50 @@ fn the_badge_is_dim_green_and_red_on_the_card() {
     assert!(l2.ends_with("+12k −1.2k · 20f 1m"), "{l2:?}");
 }
 
-/// The meter shows from half full: the percentage (the default), or one
-/// cell by eighths; dim, amber (`peach`) from 80%, red from 90%.
+/// No context meter, however full (Mack: "no need for the context %"): a
+/// nearly full agent's card, one line or two, at any width, never says
+/// how full it is; its row 2 is the prompt and the age alone.
 #[test]
-fn the_context_meter_has_thresholds() {
-    let g = |f| ctx_seg(f, CtxStyle::Glyph, "overlay2");
-    let p = |f| ctx_seg(f, CtxStyle::Percent, "overlay2");
-    assert_eq!((g(0.0), g(0.49), p(0.499)), (None, None, None));
-    assert_eq!(g(0.5), Some(seg("▄", "overlay2")));
-    assert_eq!(g(0.72), Some(seg("▆", "overlay2")));
-    assert_eq!(g(0.79), Some(seg("▇", "overlay2")));
-    assert_eq!(g(0.8), Some(seg("▇", "peach")));
-    assert_eq!(g(0.85), Some(seg("▇", "peach")));
-    assert_eq!(g(0.9), Some(seg("█", "red")));
-    assert_eq!(g(1.0), Some(seg("█", "red")));
-    assert_eq!(p(0.72), Some(seg("72%", "overlay2")));
-    assert_eq!(p(0.899), Some(seg("89%", "peach")));
-    assert_eq!(p(0.95), Some(seg("95%", "red")));
-    assert_eq!(CTX_STYLE, CtxStyle::Percent);
-    // Drawn, in either style.
-    let v = with(lettered(view(vec![a("main", 1, "idle", "Jacket")], None)), vec![("@1", ins(None, Some("go"), None, Some(950_000)))]);
-    for (style, want) in [(CtxStyle::Glyph, "> go █ 1m"), (CtxStyle::Percent, "> go 95% 1m")] {
-        let f = layout(&v, 44, 30, &Opts { ctx: style, ..Opts::default() });
-        let y = find(&f, "Jacket") + 1;
-        assert_eq!(words(&f.rows[y].text()), want, "{style:?}");
+fn the_context_is_never_drawn() {
+    let v = with(
+        lettered(view(vec![a("main", 1, "idle", "Jacket"), a("main", 2, "running", "Sidebar")], None)),
+        vec![("@1", ins(None, Some("go"), None, Some(950_000))), ("@2", ins(Some(TODO), None, Some((48, 12, 3)), Some(1_000_000)))],
+    );
+    let f = layout(&v, 44, 30, &Opts::default());
+    assert_eq!(words(&f.rows[find(&f, "Jacket") + 1].text()), "> go 1m", "{:#?}", texts(&f));
+    for w in 20u16..=60 {
+        for h in [8u16, 30] {
+            let f = layout(&v, w, h, &Opts::default());
+            assert!(texts(&f).iter().all(|l| !l.contains('%') && !l.contains('█')), "{w}x{h}: {:#?}", texts(&f));
+        }
     }
 }
 
-/// Narrow: the file count goes first, then a dim meter (34 columns keep
-/// the badge), then the badge, then the meter, before the doing text has
-/// under [`DOING_MIN`] cells past its mark (or its whole); an amber meter
-/// outlasts the badge. Every row exactly the frame's width.
+/// Narrow: the file count goes first (34 columns keep the badge), then the
+/// badge, before the doing text has under [`DOING_MIN`] cells past its mark
+/// (or its whole). Every row exactly the frame's width.
 #[test]
 fn the_extras_give_way_before_the_doing_text() {
     let x = || a("main", 1, "running", "Sidebar").with("detail_kind", "run").with("detail", "Edit layout.rs");
-    for (used, meter) in [(600_000, "60%"), (850_000, "85%")] {
-        let i = ins(Some("Porting the whole parser to the new grammar"), None, Some((48, 12, 3)), Some(used));
-        let v = with(lettered(view(vec![x()], None)), vec![("@1", i)]);
-        for w in 26u16..=60 {
-            let f = layout(&v, w, 40, &Opts::default());
-            let t = texts(&f);
-            assert!(t.iter().all(|l| dwidth(l) == usize::from(w)), "{w}: {t:#?}");
-            let y = find(&f, "Sidebar") + 1;
-            let r = &f.rows[y];
-            let doing = r.segs.iter().find(|s| s.text.starts_with("Porting")).map_or(0, |s| dwidth(&s.text));
-            let l = r.text();
-            if l.contains('+') || l.contains(meter) {
-                assert!(doing >= DOING_MIN, "{w}: {l:?}");
-            }
-            // Dropped in order: a count only with a badge; an amber meter
-            // before the badge never.
-            assert!(!l.contains(" · 3f") || l.contains("+48"), "{w}: {l:?}");
-            assert!(meter == "60%" || !l.contains("+48") || l.contains(meter), "{w}: {l:?}");
-            match (w, meter) {
-                (44, _) => assert!(l.contains(&format!("+48 −12 · 3f {meter} 1m")), "{l:?}"),
-                (34, "60%") => assert!(l.contains("+48 −12 1m") && !l.contains("3f") && !l.contains(meter), "{l:?}"),
-                (34, _) => assert!(l.contains("85% 1m") && !l.contains("+48"), "{l:?}"),
-                _ => {}
-            }
+    let i = ins(Some("Porting the whole parser to the new grammar"), None, Some((48, 12, 3)), Some(850_000));
+    let v = with(lettered(view(vec![x()], None)), vec![("@1", i)]);
+    for w in 26u16..=60 {
+        let f = layout(&v, w, 40, &Opts::default());
+        let t = texts(&f);
+        assert!(t.iter().all(|l| dwidth(l) == usize::from(w)), "{w}: {t:#?}");
+        let y = find(&f, "Sidebar") + 1;
+        let r = &f.rows[y];
+        let doing = r.segs.iter().find(|s| s.text.starts_with("Porting")).map_or(0, |s| dwidth(&s.text));
+        let l = r.text();
+        if l.contains('+') {
+            assert!(doing >= DOING_MIN, "{w}: {l:?}");
+        }
+        // Dropped in order: a count only with a badge.
+        assert!(!l.contains(" · 3f") || l.contains("+48"), "{w}: {l:?}");
+        match w {
+            44 => assert!(l.contains("+48 −12 · 3f 1m"), "{l:?}"),
+            34 => assert!(l.contains("+48 −12 1m") && !l.contains("3f"), "{l:?}"),
+            _ => {}
         }
     }
     // A short line keeps its whole: the badge stays.
@@ -208,8 +194,7 @@ fn the_badge_clicks_into_the_diff() {
     }
     // A one-line card: the badge before the word, where the title keeps room.
     let a1 = v.agents().find(|a| a.window_id == "@1").unwrap();
-    let cx = Cx { w: 44, b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false,
-        ctx: CTX_STYLE };
+    let cx = Cx { w: 44, b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false };
     let rows = agent_rows(a1, cx, false, 0, Ink::Pal("peach"), None);
     let l = rows[0].text();
     assert!(rows.len() == 1 && l.contains("Sidebar") && l.contains("+48 −12 ") && col(&l, "+48") < col(&l, "working"), "{l:?}");
@@ -221,9 +206,9 @@ fn the_badge_clicks_into_the_diff() {
     assert!(!rows[0].text().contains('+'), "{:?}", rows[0].text());
 }
 
-/// A PINNED card keeps its space tag, the badge given up first (then the
-/// tag, before an amber meter); every card stays two rows on one
-/// background, the zebra intact.
+/// A PINNED card keeps its space tag, the file count given up first, then
+/// the badge, then the tag; every card stays two rows on one background,
+/// the zebra intact.
 #[test]
 fn pinned_cards_and_the_card_invariants() {
     let v = with(
@@ -244,11 +229,14 @@ fn pinned_cards_and_the_card_invariants() {
     );
     let f = layout(&v, 44, 40, &Opts::default());
     let y = f.pinned.clone().find(|&y| f.rows[y].text().contains("Sidebar")).unwrap() + 1;
-    assert_eq!(words(&f.rows[y].text()), "› Wiring the badge 85% main · 1m", "{:#?}", texts(&f));
-    // Wider, the badge too.
+    assert_eq!(words(&f.rows[y].text()), "› Wiring the bad… +48 −12 main · 1m", "{:#?}", texts(&f));
+    // Wider, the file count too; narrower, the tag alone.
     let f = layout(&v, 50, 40, &Opts::default());
     let y = f.pinned.clone().find(|&y| f.rows[y].text().contains("Sidebar")).unwrap() + 1;
-    assert_eq!(words(&f.rows[y].text()), "› Wiring the … +48 −12 · 3f 85% main · 1m", "{:#?}", texts(&f));
+    assert_eq!(words(&f.rows[y].text()), "› Wiring the badge +48 −12 · 3f main · 1m", "{:#?}", texts(&f));
+    let f = layout(&v, 38, 40, &Opts::default());
+    let y = f.pinned.clone().find(|&y| f.rows[y].text().contains("Sidebar")).unwrap() + 1;
+    assert_eq!(words(&f.rows[y].text()), "› Wiring the badge main · 1m", "{:#?}", texts(&f));
     for w in [34u16, 44, 60] {
         let f = layout(&v, w, 40, &Opts::default());
         let cards: Vec<usize> = f.agents.clone().filter(|&y| f.rows[y].covers.len() == 1 && !is_group_header(&f.rows[y], usize::from(w))).collect();
@@ -272,8 +260,7 @@ fn an_empty_title_never_overflows() {
     let v = with(lettered(view(vec![a("main", 1, "running", "~/")], None)), vec![("@1", ins(Some(TODO), None, Some((48, 12, 3)), Some(950_000)))]);
     let a1 = v.agents().find(|a| a.window_id == "@1").unwrap();
     for w in 8usize..=44 {
-        let cx = Cx { w, b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false,
-            ctx: CTX_STYLE };
+        let cx = Cx { w, b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false };
         for two in [false, true] {
             for r in agent_rows(a1, cx, two, 0, Ink::Pal("peach"), None) {
                 assert_eq!(dwidth(&r.text()), w, "{w} {two}: {:?}", r.text());

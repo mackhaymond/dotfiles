@@ -2323,6 +2323,40 @@ class Create(Server):
         self.wait(lambda: ["ok", self.client, "space 3 ready: todo"] in self.said(), True)
         self.assertNotEqual(self.run_sh("adopt-pending", wid, d).returncode, 0)        # not pending any more
 
+    def test_adopt_pending_never_shows_its_number_twice(self):
+        # The sidebar draws a space for a session with @space_index N and one
+        # for a pending window with @pending_space N: never both at once. A
+        # tmux stand-in for adopt-pending and every sync it sets off snapshots
+        # both (s<index> per visible session, w<number> per window) after each
+        # of their tmux calls.
+        snaps = os.path.join(self.tmp, "snaps.log")
+        wrap = os.path.join(self.tmp, "tmux-snap")
+        Path(wrap).write_text(
+            "#!/bin/sh\n"
+            f'"{TMUX}" "$@"; rc=$?\n'
+            f"s=$('{TMUX}' list-sessions -F '#{{?#{{@space_hidden}},,s#{{@space_index}}}}' \\; "
+            f"list-windows -a -F 'w#{{@pending_space}}' 2>/dev/null | tr '\\n' ' ')\n"
+            f"printf '%s\\n' \"$s\" >> '{snaps}'\n"
+            "exit $rc\n")
+        os.chmod(wrap, 0o755)
+        wid = self.ask()
+        self.wait(lambda: self.wopt(wid, "@pending_space"), "3")
+        self.t("set", "-g", "@space_sh", f"SPACE_TMUX_BIN={wrap} bash {SCRIPT}")      # the syncs too
+        d = os.path.join(self.projects, "todo")
+        os.mkdir(d)
+        r = self.run_sh("adopt-pending", wid, d, SPACE_TMUX_BIN=wrap)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait(lambda: self.wopt(wid, "session_name"), "todo")
+        self.wait(lambda: subprocess.run(["pgrep", "-f", f"{SCRIPT} sync"], capture_output=True).returncode, 1,
+                  timeout=10)                                                        # every sync it set off
+        self.t("set", "-g", "@space_sh", f"bash {SCRIPT}")
+        snap = [(set(w[1:] for w in l.split() if w[:1] == "s" and w[1:]), set(w[1:] for w in l.split() if w[:1] == "w" and w[1:]))
+                for l in Path(snaps).read_text().splitlines()]
+        self.assertIn(({"1", "2"}, {"3"}), snap)                                     # held,
+        self.assertIn(({"1", "2", "3"}, set()), snap)                                # then a space
+        for spaces, held in snap:
+            self.assertEqual(spaces & held, set(), snap)
+
     def test_adopt_pending_with_its_popup_open_takes_the_client_there(self):
         wid = self.ask()
         self.wait(lambda: self.wopt(wid, "@pending_space"), "3")

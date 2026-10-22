@@ -1,8 +1,9 @@
 //! What each agent has been up to, from its own transcript: the files it
 //! edited (and how much of that is still uncommitted), what it is doing, and
 //! how full its context is. The data behind an agent card's diff badge
-//! (`+48 −12 · 3f`), its "doing" line and its context meter, and behind the
-//! diff popup (`agent-ui insight-files`). No rendering here.
+//! (`+48 −12 · 3f`) and its "doing" line, behind the diff popup
+//! (`agent-ui insight-files`), and `agent-ui insight`'s context column (no
+//! card draws the context). No rendering here.
 //!
 //! Several agents often share ONE checkout (no worktrees), so `git diff` of
 //! a folder is everyone's work: an agent's changes are the files ITS

@@ -141,7 +141,7 @@ agent-ui menu keys:
 | ⏎ | go to the selected row (a parked tab comes back via `stash.sh unstash`; the `▪ N parked` row opens the Parked filter); a click selects, a second click goes |
 | Tab / Shift-Tab | cycle the filter: All, Active, Needs you, Working, Idle, Parked |
 | `/` | search title, session, `session:index`, detail and path as you type (letters and digits type); ⏎ goes to the selected match; Esc leaves and clears it (a second Esc closes); Backspace on an empty query leaves it |
-| Space | the actions strip for the selected row, in the footer; the next key runs one, Esc cancels: `p` pin / unpin (the sidebar's PINNED section, at once, no y/n; the strip says which), `s` park (`stash.sh stash`, after y/n), `x` close the agent's pane through `closed-tabs.sh` after y/n (CMD+Z undoes it; on a parked row: discard via `stash.sh kill-many`), `d` its uncommitted diff in a popup (any row, parked too: the menu closes, and `agent-ui diff --after <menu pid>` opens it once the menu's popup is gone; see [Agent insight](#agent-insight-srcinsightrs)), `v` preview strip on/off (was `p`), `r` restart the watcher, ⏎ go. A parked row offers neither `p` nor `s`. A Claude agent waiting on a permission prompt offers `y` allow and `n` deny first (at once, no y/n: see [Answering a permission prompt](#answering-a-permission-prompt-srcanswerrs)) |
+| Space | the actions strip for the selected row, in the footer; the next key runs one, Esc cancels: `p` pin / unpin (the sidebar's PINNED section, at once, no y/n; the strip says which), `s` park (`stash.sh stash`, after y/n), `x` close the agent's pane through `closed-tabs.sh` after y/n (CMD+Z undoes it; on a parked row: discard via `stash.sh kill-many`), `d` its uncommitted diff in a popup (any row, parked too: the menu closes, and `agent-ui diff --after <menu pid>` opens it once the menu's popup is gone; see [Agent insight](#agent-insight-srcinsightrs)), `v` preview strip on/off (was `p`), `r` restart the watcher, ⏎ go. A parked row offers neither `p` nor `s`; a pending space's claude (the hidden `pending` session, building a space) no `s` (it is in no space yet: the park would only refuse). A Claude agent waiting on a permission prompt offers `y` allow and `n` deny first (at once, no y/n: see [Answering a permission prompt](#answering-a-permission-prompt-srcanswerrs)) |
 | Option-S / Option-X | next tab that needs you (agent-jump.sh) / one step back through the tabs you were on (nav.sh, the same Option-X as everywhere: [nav.md](nav.md)), and close. When CuaNotch's `keyJumpToNeedy` is opt+s (this machine's setting), CuaNotch owns Option-S, so while it runs only Option-X reaches the menu |
 | Esc / C-c | close |
 
@@ -1529,14 +1529,15 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
 Per agent, from its OWN transcript (several agents often share one checkout
 with no worktrees, so `git diff` of the folder is everyone's work): the
 files it edited that are still uncommitted (`+48 −12 · 3f`), what it is
-doing, and how full its context is (`Agent::insight` in the view). On the
-cards (`layout.rs`, `says` / `extras`):
+doing, and how full its context is (`Agent::insight` in the view; the
+context only for `agent-ui insight`, never on a card). On the cards
+(`layout.rs`, `says` / `extras`):
 
 ```text
  ▎  d  Tmux Agent Sidebar      ⠹ working
- ▎     › Wiring the badge +48 −12 · 3f 85% 1m   working: its todo
+ ▎     › Wiring the badge +48 −12 · 3f 1m   working: its todo
     g  Lost suit jacket
-       > find the receipt         +5 62% 7m    idle: your last prompt
+       > find the receipt         +5 7m    idle: your last prompt
 ```
 
 - **Row 2 says**, first that applies: an asking / failed agent's reason
@@ -1598,14 +1599,14 @@ cards (`layout.rs`, `says` / `extras`):
   there saying complete, and the lock held (a try fails); else its own
   one-off engine, ` · unverified`. `AGENT_UI_DIFF_FILES` (the click passes
   it) comes first.
-- **Context meter**, from 50% full: `72%`, dim, amber (`peach`) from 80%,
-  red from 90%. `CTX_STYLE` picks it; `$AGENT_UI_CTX_STYLE=glyph` draws one
-  cell by eighths instead (`▄` half, `▇` 85%).
-- **Narrow**: the file count goes first, then a dim meter, then the badge,
-  then a PINNED card's space tag, then the meter, before the doing text
-  has under 12 cells past its mark (`DOING_MIN`, or its whole). At 34
-  columns a working card keeps `+48 −12` beside a 12-cell doing line; an
-  amber or red meter outranks the badge there.
+- **No context meter** (Mack: "no need for the context %"): the insight
+  still reads it (`ctx_used` / `ctx_window`, `agent-ui insight`), but no
+  card draws it, one line or two, NEEDS YOU or PINNED; its cells go to
+  the doing text and the badge.
+- **Narrow**: the file count goes first, then the badge, then a PINNED
+  card's space tag, before the doing text has under 12 cells past its
+  mark (`DOING_MIN`, or its whole). At 34 columns a working card keeps
+  `+48 −12` beside a 12-cell doing line.
 - **Freshness**: the worker's result lands after the refresh that asked
   for it; while it holds a snapshot (at most 10 s) the publisher's loop
   looks every 0.5 s (`TICK`) and puts a new generation into the view (and

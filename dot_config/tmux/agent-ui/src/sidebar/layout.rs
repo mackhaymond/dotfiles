@@ -178,10 +178,9 @@
 //! Under 30 columns the ages go, under 26 the second lines, then the state
 //! word shrinks to its glyph; titles take what is left and are clipped. A row
 //! is always exactly the frame's width: nothing wraps. A card's insight
-//! extras ([`extras`]: the diff badge, the context meter) give way first,
-//! the file count, then a dim meter, then the badge, then the meter,
-//! before the doing text (or a one-line card's title) has under
-//! [`DOING_MIN`] cells.
+//! extra ([`extras`]: the diff badge) gives way first, its file count,
+//! then the badge, before the doing text (or a one-line card's title) has
+//! under [`DOING_MIN`] cells.
 //!
 //! ## Letters
 //!
@@ -721,8 +720,6 @@ pub struct Opts {
     /// a settled banner says `glow off`, dim, on its second row. The banner
     /// itself stays either way.
     pub glow_off: bool,
-    /// How cards draw the context meter ([`CTX_STYLE`] by default).
-    pub ctx: CtxStyle,
 }
 
 /// The working spinner: braille, one cell, ten frames.
@@ -814,8 +811,6 @@ struct Cx<'a> {
     /// or ready: `paused.json` lists targets), so prefix P resumes: a paused
     /// card says so.
     resumes: bool,
-    /// How the context meter reads ([`Opts::ctx`]).
-    ctx: CtxStyle,
 }
 
 impl Cx<'_> {
@@ -2194,67 +2189,6 @@ fn placeholder(a: &Agent) -> &'static str {
     }
 }
 
-/// How a card's context meter reads ([`CTX_STYLE`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CtxStyle {
-    /// One cell by eighths, `▁`..`█` (`▄` half full, `▇` 85%).
-    Glyph,
-    /// `72%`.
-    Percent,
-}
-
-/// The meter cards draw: `72%`, Mack's pick (readability first: a lone
-/// block glyph read as a stray mark); the glyph stays a switch away
-/// ([`CtxStyle::from_env`]).
-pub const CTX_STYLE: CtxStyle = CtxStyle::Percent;
-
-impl Default for CtxStyle {
-    fn default() -> CtxStyle {
-        CTX_STYLE
-    }
-}
-
-impl CtxStyle {
-    /// `$AGENT_UI_CTX_STYLE` (`glyph` / `percent`), else [`CTX_STYLE`] (the
-    /// previews draw both); read once per process.
-    pub fn from_env() -> CtxStyle {
-        static ONCE: std::sync::OnceLock<CtxStyle> = std::sync::OnceLock::new();
-        *ONCE.get_or_init(|| match std::env::var("AGENT_UI_CTX_STYLE").as_deref() {
-            Ok("percent" | "pct") => CtxStyle::Percent,
-            Ok("glyph") => CtxStyle::Glyph,
-            _ => CTX_STYLE,
-        })
-    }
-}
-
-/// The meter shows from half full (under that the context is no concern);
-/// amber from [`CTX_WARN`], red from [`CTX_FULL`] (a compaction is near).
-pub const CTX_SHOWN: f64 = 0.5;
-pub const CTX_WARN: f64 = 0.8;
-pub const CTX_FULL: f64 = 0.9;
-const CTX_LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
-
-/// Context `f` full as the meter says it: dim (`dimc`), amber (`peach`, not
-/// the asks yellow) from [`CTX_WARN`], red from [`CTX_FULL`]; None under
-/// [`CTX_SHOWN`].
-fn ctx_seg(f: f64, style: CtxStyle, dimc: Hue) -> Option<Seg> {
-    if f.is_nan() || f < CTX_SHOWN {
-        return None;
-    }
-    let hue = if f >= CTX_FULL {
-        "red"
-    } else if f >= CTX_WARN {
-        "peach"
-    } else {
-        dimc
-    };
-    let text = match style {
-        CtxStyle::Glyph => CTX_LEVELS[((f * 8.0).ceil() as usize).clamp(1, 8) - 1].to_string(),
-        CtxStyle::Percent => format!("{}%", (f.min(1.0) * 100.0).floor() as u32),
-    };
-    Some(seg(text, hue))
-}
-
 /// A diff's line count, compact: `48`, `1.2k`, `12k` (9950 and up: `10k`,
 /// never `10.0k`).
 fn lines_n(n: u64) -> String {
@@ -2272,27 +2206,24 @@ pub const DIFF_TINT: u8 = 70;
 
 /// The doing text keeps at least this many cells past its `›` / `>` mark
 /// (or its whole) before a card's right side gives up its file count, then
-/// a dim meter, then its diff badge, then its meter.
+/// its diff badge.
 pub const DOING_MIN: usize = 12;
 
-/// [`extras`]' levels, richest first: the badge with its file count and
-/// the meter; the badge and the meter; the badge and only an amber or red
-/// meter (a dim one says least); the meter; nothing.
-const EXTRA_LEVELS: u8 = 5;
+/// [`extras`]' levels, richest first: the badge with its file count; the
+/// badge; nothing.
+const EXTRA_LEVELS: u8 = 3;
 
 /// What an agent's insight adds to a card's right side at `level`
-/// ([`EXTRA_LEVELS`]), each part after a space: the diff badge (`+48 −12`,
-/// `+` dim green and `−` dim red over the card `bg`, [`DIFF_TINT`], a zero
-/// side left out; ` · 3f`
-/// in `dimc` at level 0; none while clean), then the context meter
-/// ([`ctx_seg`]; none with `meter` None: a NEEDS YOU card's). Returns the
+/// ([`EXTRA_LEVELS`]), after a space: the diff badge (`+48 −12`, `+` dim
+/// green and `−` dim red over the card `bg`, [`DIFF_TINT`], a zero side
+/// left out; ` · 3f` in `dimc` at level 0; none while clean). Returns the
 /// segments and the badge's cells `[x0, x1)` among them: a click there opens
 /// the agent's diff ([`Target::Diff`]).
-fn extras(a: &Agent, level: u8, meter: Option<CtxStyle>, bg: Ink, dimc: Hue) -> (Vec<Seg>, Option<(usize, usize)>) {
+fn extras(a: &Agent, level: u8, bg: Ink, dimc: Hue) -> (Vec<Seg>, Option<(usize, usize)>) {
     let Some(i) = a.insight.as_ref() else { return (Vec::new(), None) };
     let mut v = Vec::new();
     let mut span = None;
-    if let Some(d) = i.diff.filter(|_| level < 3) {
+    if let Some(d) = i.diff.filter(|_| level < 2) {
         v.push(seg(" ", "text"));
         let x0 = width(&v);
         // (A side with nothing to say goes: `+5`, `−3`; both none, `+0`.)
@@ -2309,10 +2240,6 @@ fn extras(a: &Agent, level: u8, meter: Option<CtxStyle>, bg: Ink, dimc: Hue) -> 
             v.push(seg(format!(" · {}f", d.files), dimc));
         }
         span = Some((x0, width(&v)));
-    }
-    let f = i.ctx_fraction().filter(|f| level != 2 || *f >= CTX_WARN);
-    if let Some(m) = meter.filter(|_| level < 4).and_then(|s| f.and_then(|f| ctx_seg(f, s, dimc))) {
-        v.extend([seg(" ", "text"), m]);
     }
     (v, span)
 }
@@ -2375,7 +2302,7 @@ fn agent_bg(a: &Agent, k: usize, mine: bool) -> Ink {
 /// ([`says`]: `overlay2`, `sub` when it asks or failed, what it does now
 /// after a blue `›`, your last prompt after a faint `> `, else a faint
 /// placeholder) with the age at its end, so every agent row is the same
-/// height; the insight's diff badge and context meter ([`extras`]) before
+/// height; the insight's diff badge ([`extras`]) before
 /// the age (a one-line card's before its word), the badge a click into the
 /// diff ([`Target::Diff`]). Both lines click through. `tag`: a dim word
 /// before the second line's age (a PINNED card's space, `cs35l · 4m`),
@@ -2416,12 +2343,12 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     // line keeps just the ⏸ (one word once, not twice).
     let paused = a.cat == Some(Cat::Paused) && !a.in_flight;
     let word_below = paused && msg.is_some();
-    // A one-line card's insight extras ([`extras`]: the diff badge, the
-    // meter) before its word; a two-line card's go on its second line.
+    // A one-line card's insight extras ([`extras`]: the diff badge) before
+    // its word; a two-line card's go on its second line.
     let right_of = |full: bool, with_age: bool, level: u8| -> Vec<Seg> {
         let mut r = Vec::new();
         if msg.is_none() {
-            r.extend(extras(a, level, Some(cx.ctx), bg, dimc).0);
+            r.extend(extras(a, level, bg, dimc).0);
             // (A space between them and the word.)
             if !r.is_empty() && word.as_ref().is_some_and(|x| !x.idle()) {
                 r.push(seg(" ", "text"));
@@ -2485,7 +2412,7 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     };
     let right = edge(right);
     let rw = width(&right);
-    let span = if msg.is_none() { extras(a, level, Some(cx.ctx), bg, dimc).1 } else { None };
+    let span = if msg.is_none() { extras(a, level, bg, dimc).1 } else { None };
     let first = tile_row(cx.w, bg, left, right).click(cx.w, go.clone());
     let mut first = diff_click(first, cx.w, rw, span, &a.window_id).covering([a]);
     first.anim = word.as_ref().is_some_and(Word::working);
@@ -2512,7 +2439,7 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     let tw = if word_below { width(&paused_line(usize::MAX, cx.resumes, dimc)) } else { width(&text) - mark };
     // The right side: the extras ([`extras`]), the tag, the age.
     let right2 = |level: u8, tag: Option<&str>| {
-        let (mut r, span) = extras(a, level, Some(cx.ctx), bg, dimc);
+        let (mut r, span) = extras(a, level, bg, dimc);
         let some = !r.is_empty();
         if let Some(t) = tag {
             r.push(seg(format!(" {}", clip(&sanitize(t), TAG_W)), dimc));
@@ -2524,11 +2451,11 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
         r.push(seg(" ", "text"));
         (edge(r), span, some)
     };
-    // Richest first: the file count goes, then a dim meter, then the badge,
-    // then the tag, then the meter; extras only while the text keeps its
-    // whole or DOING_MIN cells, the tag only while the text keeps TAG_ROOM.
+    // Richest first: the file count goes, then the badge, then the tag;
+    // extras only while the text keeps its whole or DOING_MIN cells, the
+    // tag only while the text keeps TAG_ROOM.
     let room = |r: &[Seg]| inner(cx.w).saturating_sub(1 + indent + width(r));
-    let tries = (0..EXTRA_LEVELS - 1).map(|l| (l, tag)).chain([(EXTRA_LEVELS - 2, None), (EXTRA_LEVELS - 1, None)]);
+    let tries = (0..EXTRA_LEVELS).map(|l| (l, tag)).chain([(EXTRA_LEVELS - 1, None)]);
     let fits = |(r, _, some): &(Vec<Seg>, Option<(usize, usize)>, bool), t: Option<&str>| {
         let fit = 1 + indent + width(r) <= inner(cx.w);
         (!some || fit && room(r) >= mark + tw.clamp(1, DOING_MIN)) && (t.is_none() || room(r) >= TAG_ROOM)
@@ -3187,10 +3114,10 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
             return rows;
         }
         // The diff badge before the age, while the reason keeps its whole
-        // or DOING_MIN cells (its file count first to go); no meter here.
+        // or DOING_MIN cells (its file count first to go).
         let tw = width(&l2[2..]);
         let right2 = |level: u8| {
-            let (mut r, span) = extras(a, level, None, bg, dim(true));
+            let (mut r, span) = extras(a, level, bg, dim(true));
             r.extend(age.clone());
             r.push(seg(" ", "text"));
             (r, span)
@@ -3621,7 +3548,6 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
         cur: view.cur_win.as_deref(),
         shells: view.shells,
         resumes: matches!(opts.pause, Some(Phase::Stopping { .. } | Phase::Safe { .. } | Phase::Ready { .. })),
-        ctx: opts.ctx,
     };
     // Pinned agents move out of their spaces into PINNED (a view already
     // split is laid out as it is). The letters, the client's own card and
