@@ -1067,8 +1067,16 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   (70% over mauve, about 4.8:1; crust itself about 9:1) and key-caps
   inverted (mauve letter on crust) (`layout::sel_row`). While it is live
   PINNED is not drawn: every pinned agent sits in its space's group, so
-  the selection reads in tab order; PINNED is back when it ends. The panel's first row reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
-  many keys as fit). stash.sh posts the focus notice after sel-start,
+  the selection reads in the sidebar's own order; PINNED is back when it
+  ends. That order is the one the keys walk: j/k (or h/l) move the cursor
+  through a space as its group lists it, its home (the header) first, then
+  its agents by window index, then its shells by window index (stash.sh
+  `sel_order`), never the tab bar's order, and the range is the run
+  between anchor and cursor in it; the park and the move take the tabs in
+  that order too. tests/sidebar.rs `selection_walks_the_sidebars_order`
+  checks it against a rendered frame. The panel's first row reads
+  ` N selected  j/k extend · ⏎ park · m move · esc cancel` (as many keys as
+  fit). stash.sh posts the focus notice after sel-start,
   sel-move, sel-cancel and the park, so it shows at once. Those keys hold
   for as long as a window of the client's session carries `@stash_sel`,
   even after a click, a focus change (into this sidebar and back) or a

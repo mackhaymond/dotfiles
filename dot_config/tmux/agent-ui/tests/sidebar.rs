@@ -334,6 +334,92 @@ fn once_lists_spaces_by_space_index() {
     assert!(group(&lines, "zeta") < group(&lines, "work"), "{lines:#?}");
 }
 
+/// prefix v's j/k (h/l) walk a space in THIS sidebar's order, not the tab
+/// bar's: the REAL stash.sh (its `sel_order`) against a rendered frame. Tabs
+/// home, shell, agent, shell, agent (pinned), agent, shell; the group lists
+/// the home (its header), the agents by index (the pinned one in place: a
+/// selection is live), then the shells by index — and sel-move right from
+/// the home must visit exactly those rows top to bottom, then hold.
+#[test]
+fn selection_walks_the_sidebars_order() {
+    let s = Server::start("selord", 80, 24);
+    s.tmux(&["set-option", "-g", "@spaces", "on"]);
+    let id = |t: &str| s.tmux(&["display-message", "-p", "-t", t, "#{window_id}"]).trim().to_string();
+    s.tmux(&["new-session", "-d", "-s", "work", "-n", "home", LIFE]);
+    s.tmux(&["set-option", "-w", "-t", "work:0", "@space_home", "1"]);
+    // (Row label → window id; a shell row shows its window's name.)
+    let mut label = vec![("work".to_string(), id("work:0"))];
+    for (i, kind, name) in [(1, "shell", "sh-uno"), (2, "agent", "alpha"), (3, "shell", "sh-tres"), (4, "pinned", "bravo"),
+        (5, "agent", "charlie"), (6, "shell", "sh-seis")]
+    {
+        let t = format!("work:{i}");
+        s.tmux(&["new-window", "-d", "-t", &t, "-n", name, LIFE]);
+        if kind != "shell" {
+            s.tmux(&["set-option", "-w", "-t", &t, "@agent_state", "idle"]);
+            s.tmux(&["set-option", "-w", "-t", &t, "@agent_summary", name]);
+        }
+        if kind == "pinned" {
+            s.tmux(&["set-option", "-w", "-t", &t, "@agent_pinned", "1700000000"]);
+        }
+        label.push((name.to_string(), id(&t)));
+    }
+    // stash.sh, scratch HOME/state, on this server only.
+    let dir = std::env::temp_dir().join(format!("agentui-selord-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = s.tmux(&["display-message", "-p", "#{socket_path}"]).trim().to_string();
+    let stash = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/executable_stash.sh");
+    let run = |args: &[&str]| {
+        let o = Command::new("bash")
+            .arg(&stash)
+            .args(args)
+            .env_remove("TMUX_PANE")
+            .env("TMUX", format!("{sock},0,0"))
+            .env("HOME", &dir)
+            .env("TMPDIR", format!("{}/", dir.display()))
+            .env("XDG_STATE_HOME", dir.join("state"))
+            .env("AGENT_FOCUS_NOTICE", "")
+            .env("NOTIFY_SH", dir.join("no-notify"))
+            .output()
+            .expect("run stash.sh");
+        assert!(o.status.success(), "stash.sh {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    };
+    let home = label[0].1.clone();
+    run(&["sel-start", "here", &home]);
+    let cursor = || s.tmux(&["show-options", "-gqv", "@stash_cursor"]).trim().to_string();
+    let mut walk = vec![cursor()];
+    for _ in 0..label.len() {
+        run(&["sel-move", "right", &home]);
+        walk.push(cursor());
+    }
+    // One step past the last row holds there.
+    assert_eq!(walk[label.len()], walk[label.len() - 1], "{walk:?}");
+    walk.pop();
+    // The frame, with that selection live: work's group, top to bottom (a
+    // real client on work's home: shells are listed only with a client row
+    // to read @spaces off).
+    let tty = s.nested_client("work", "main:8");
+    let lines = plain(&s.sidebar(&["--once", "34x60", "--client", &tty]));
+    let (start, part) = agents_section(&lines);
+    let from = group(&lines, "work") - start;
+    let to = part[from + 1..].iter().position(|l| is_group(l, "main") || is_group(l, "zeta")).map_or(part.len(), |k| from + 1 + k);
+    let mut shown: Vec<String> = vec![label[0].1.clone()];
+    for l in &part[from + 1..to] {
+        if let Some((_, w)) = label[1..].iter().find(|(n, _)| l.contains(&format!(" {n} ")) || l.ends_with(&format!(" {n}"))) {
+            if !shown.contains(w) {
+                shown.push(w.clone());
+            }
+        }
+    }
+    assert!(!lines.iter().any(|l| l.starts_with(" PINNED")), "{lines:#?}");
+    assert_eq!(shown.len(), label.len(), "every row once: {lines:#?}");
+    assert_eq!(walk, shown, "{label:?}\n{lines:#?}");
+    // (And that is not the tab bar's order.)
+    let tabs: Vec<String> = label.iter().map(|(_, w)| w.clone()).collect();
+    assert_ne!(walk, tabs);
+    run(&["sel-cancel"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Right-click → park, end to end, with a FAKE stash.sh (`AGENT_UI_SCRIPTS`):
 /// the sidebar hands `run-shell -b` the script with `stash <win>`, the fake
 /// moves the window into `stash` like the real one, and the footer says

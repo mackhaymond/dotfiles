@@ -756,7 +756,7 @@ bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash '' '#{client
 
 # ...and a range of adjacent tabs at once, vim-visual style. prefix+v enters
 # the mode with just the current tab selected (tinted); the client is then
-# parked in the `stash` key table below, where h/l extend the selection and H
+# parked in the `stash` key table below, where h/l (or j/k) extend the selection and H
 # — the same key that hides one tab — hides the lot. One key to enter, the
 # same hide key to finish; prefix+v again (or Esc) drops it. The bring-back
 # picker takes the nearest gesture fzf allows (Shift-Up/Down or Tab — a plain
@@ -803,9 +803,14 @@ bind-key v if -F "#{E:@stash_live}" { run-shell "#{HOME}/.config/tmux/scripts/st
 #
 # Each extend re-arms the table: a key table is one-shot, so a binding that does
 # not switch-client back into it drops you to root after one press.
-# h/l, vim-style, once in the table.
+# h/l, vim-style, once in the table; j/k the same (j = l, k = h) for the
+# sidebar, which lists the selection top to bottom. Both walk stash.sh's
+# sel_order — the sidebar's order (home, agents, shells), not the tab bar's.
+# (prefix k is a new claude: the prefix table, untouched by these.)
 bind-key -T stash l switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move right '#{window_id}'"
 bind-key -T stash h switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move left '#{window_id}'"
+bind-key -T stash j switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move right '#{window_id}'"
+bind-key -T stash k switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move left '#{window_id}'"
 bind-key -T stash H     run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh sel-commit '#{window_id}'"
 bind-key -T stash Enter run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh sel-commit '#{window_id}'"
 # m (or a, like prefix+a) moves the selection to another session instead of
@@ -855,7 +860,7 @@ bind-key -T stash Space  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-ca
 #
 # So while a selection exists the keys are in ROOT too, guarded by
 # @stash_live: with a selection up in this session they do exactly what their
-# `stash` binding does (h/l re-arm the table as they go); otherwise
+# `stash` binding does (h/l/j/k re-arm the table as they go); otherwise
 # `send-keys` hands the key to the pane. The guard is fork-free, and the
 # pass-through is byte-exact: tests/test_stash_keys.py compares what a pane
 # reads with and without these bindings, typed singly, in a burst and as a
@@ -872,7 +877,7 @@ bind-key -T stash Space  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-ca
 # scripts/stash-root-keys.conf: sel-start `source-file`s it when it paints a
 # selection, and stash.sh's sel_clear — the one path every ending goes through
 # (sel-cancel, the park, sel-send, prefix+H, the next sel-start's wipe) —
-# unbinds the ten keys in one call, gated on @stash_root_bound so a prefix+H
+# unbinds the twelve keys in one call, gated on @stash_root_bound so a prefix+H
 # with no selection pays nothing. That unbind would take any OTHER root binding
 # of those keys with it; there is none, so keep it that way. A server restart
 # starts with none bound. A selection that ends some other way (its tabs
@@ -881,7 +886,7 @@ bind-key -T stash Space  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-ca
 # selection still reaches the pane (the guard sends it on).
 #
 # The table stays, for what root cannot do: in it the mode's keys come before
-# a copy-mode pane's own h/l/q (root is consulted only after copy-mode-vi),
+# a copy-mode pane's own h/l/j/k/q (root is consulted only after copy-mode-vi),
 # and the sidebar reads `#{client_key_table}` = stash as "armed". The root
 # keys must stay identical to the table's bindings; the test checks it.
 #

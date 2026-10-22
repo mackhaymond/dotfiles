@@ -951,11 +951,13 @@ fn marks(bar: &Bar) -> Vec<Seg> {
 }
 
 /// prefix v's range selection is live: ` N selected ` on mauve and stash.sh's
-/// real keys (tmux.conf.tmpl's `stash` table), as many as fit.
+/// real keys (tmux.conf.tmpl's `stash` table), as many as fit. j/k, not
+/// h/l (both work): this list is vertical, and they walk it top to bottom
+/// (stash.sh's `sel_order` is this sidebar's order).
 fn hint_row(n: usize, w: usize) -> Row {
     let chip = block(format!(" {n} selected "), "crust", "mauve");
     let room = w.saturating_sub(2 + dwidth(&chip.text));
-    let keys = ["h/l extend · ⏎ park · m move · esc cancel", "h/l · ⏎ park · m move · esc", "h/l ⏎ park esc", "h/l ⏎ esc"]
+    let keys = ["j/k extend · ⏎ park · m move · esc cancel", "j/k · ⏎ park · m move · esc", "j/k ⏎ park esc", "j/k ⏎ esc"]
         .into_iter()
         .find(|k| dwidth(k) < room)
         .unwrap_or("");

@@ -1926,10 +1926,10 @@ fn the_stash_selection_fills_rows_and_shows_its_keys() {
     // The hint, first in the panel: as many of the keys as fit.
     assert_eq!(find(&f, " selected "), f.status.start);
     let hint = find(&f, " selected ");
-    assert!(t[hint].contains(" 2 selected  h/l ⏎ park esc"), "{:?}", t[hint]);
+    assert!(t[hint].contains(" 2 selected  j/k ⏎ park esc"), "{:?}", t[hint]);
     assert!(f.rows[hint].segs.iter().any(|s| *s == block(" 2 selected ", "crust", "mauve")));
     let f = layout(&v, 60, 40, &with_bar(bar));
-    assert!(texts(&f).iter().any(|l| l.contains(" 2 selected  h/l extend · ⏎ park · m move · esc cancel")));
+    assert!(texts(&f).iter().any(|l| l.contains(" 2 selected  j/k extend · ⏎ park · m move · esc cancel")));
     // No selection: no hint.
     assert!(!texts(&layout(&v, 34, 40, &with_bar(demo_bar()))).iter().any(|l| l.contains("selected")));
 }

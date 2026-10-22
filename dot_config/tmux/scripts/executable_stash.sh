@@ -2326,7 +2326,7 @@ sel_sess_of() { [ -n "${1:-}" ] && tmux display-message -p -t "$1" '#{session_na
 # exactly these keys. The file sits beside this script, wherever it runs from
 # (~/.config/tmux/scripts, or the chezmoi source in the tests);
 # STASH_ROOT_KEYS_CONF names another.
-STASH_ROOT_KEYS="h l H Enter m a Escape q C-c Space"
+STASH_ROOT_KEYS="h l j k H Enter m a Escape q C-c Space"
 stash_root_keys_conf() {
     local d="${BASH_SOURCE[0]%/*}"
     [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
@@ -2341,7 +2341,7 @@ SEL_ROOT_BOUND=""     # what the last sel_clear found in @stash_root_bound
 # (sel-cancel, so the park, sel-send and prefix+H too, and sel-start's wipe).
 # @stash_root_bound rides in the list-windows call this makes anyway, so with
 # nothing bound (a plain prefix+H) it costs no tmux call; with them bound it is
-# one call: ten `unbind-key -q -n` and the flag, as a single command list.
+# one call: twelve `unbind-key -q -n` and the flag, as a single command list.
 # `keep` (sel-start, which binds them again at once) leaves them be.
 sel_clear() {
     local line w bound="" ids="" k cmd=()
@@ -2369,16 +2369,46 @@ sel_bind_root_keys() {
         || log "could not bind the selection's root keys ($(stash_root_keys_conf))"
 }
 
-# The ids the tab bar is currently showing as selected, in tab order.
-sel_ids() {
-    tmux list-windows -t "=$1" -F '#{?#{@stash_sel},#{window_id},}' 2>/dev/null | grep -v '^$'
+# THE order a selection walks session $1 in: the agent sidebar's, not the tab
+# bar's. agent-ui draws a space as its HOME (`@space_home` 1: the space's
+# header), then its AGENTS (an `@agent_state`) by window index, then its
+# SHELLS (the rest) by window index — view.rs `ViewModel::build` partitions
+# the index-sorted windows, sidebar.rs `hide_homes` takes the home out of
+# the agents whatever it runs, `Space::shells` sorts the rest; and while a
+# selection is live PINNED is not drawn, so a pinned agent keeps its place
+# among the agents. So with tabs `shell agent shell agent`, l from the first
+# agent goes to the second, then to the shells, as the rows read on screen.
+# (The idle fold and the shells' pill line only squeeze rows that are
+# already in this order.) agent-ui/tests/sidebar.rs checks the two agree
+# against a rendered frame. One list-windows, already in index order.
+sel_order() {
+    tmux list-windows -t "=$1" -F "#{window_id}${SEP}#{@space_home}${SEP}#{@agent_state}" 2>/dev/null |
+        awk -F "$SEP" '
+            $2 == "1" { home[++nh] = $1; next }
+            $3 != ""  { agent[++na] = $1; next }
+                      { shell[++ns] = $1 }
+            END {
+                for (k = 1; k <= nh; k++) print home[k]
+                for (k = 1; k <= na; k++) print agent[k]
+                for (k = 1; k <= ns; k++) print shell[k]
+            }'
 }
 
-# The window one step left/right of $2 in session $1 — or $2 itself at either
-# end, so holding the key down parks the selection against the edge instead of
-# silently wrapping around to the far side of the tab bar.
+# The ids currently selected, in sel_order — what a park parks and a move
+# moves, in the order the sidebar shows them.
+sel_ids() {
+    local sel w
+    sel=" $(tmux list-windows -t "=$1" -F '#{?#{@stash_sel},#{window_id},}' 2>/dev/null | tr '\n' ' ') "
+    sel_order "$1" | while IFS= read -r w; do
+        case "$sel" in *" $w "*) printf '%s\n' "$w" ;; esac
+    done
+}
+
+# The window one step left/right of $2 in session $1, in sel_order — or $2
+# itself at either end, so holding the key down parks the selection against
+# the edge instead of silently wrapping around to the far side.
 sel_neighbour() {
-    tmux list-windows -t "=$1" -F '#{window_id}' 2>/dev/null |
+    sel_order "$1" |
         awk -v w="$2" -v d="$3" '
             { id[NR] = $0; if ($0 == w) i = NR }
             END {
@@ -2389,10 +2419,11 @@ sel_neighbour() {
             }'
 }
 
-# Every window between anchor and cursor inclusive, in tab order, whichever way
-# round the two are. Empty (and nonzero) if either has since gone.
+# Every window between anchor and cursor inclusive, in sel_order (contiguous
+# in the sidebar, not necessarily in the tab bar), whichever way round the
+# two are. Empty (and nonzero) if either has since gone.
 sel_range() {
-    tmux list-windows -t "=$1" -F '#{window_id}' 2>/dev/null |
+    sel_order "$1" |
         awk -v a="$2" -v c="$3" '
             { id[NR] = $0; if ($0 == a) ai = NR; if ($0 == c) ci = NR }
             END {
@@ -2442,7 +2473,7 @@ do_sel_start() {
     # parked, and the tab bar it tints is not on screen to begin with.
     case "$sess" in "$HOLD") return 0 ;; esac
     sel_clear keep
-    # `here` selects only the current tab — vim's `v` — and h/l grow it from
+    # `here` selects only the current tab — vim's `v` — and h/l (j/k) grow it from
     # there. left/right start already extended by one (the shift-arrow shape).
     if [ "$dir" = "here" ]; then nxt="$cur"; else nxt=$(sel_neighbour "$sess" "$cur" "$dir"); fi
     # Global, not session-scoped: set-option's -t is a PANE target, so naming a

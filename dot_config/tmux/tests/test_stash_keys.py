@@ -36,8 +36,8 @@ STASH = HERE / "scripts" / "executable_stash.sh"
 ROOT_CONF = HERE / "scripts" / "stash-root-keys.conf"
 TMUX = shutil.which("tmux")
 COLS, ROWS = 120, 20
-KEYS = ["h", "l", "H", "Enter", "m", "a", "Escape", "q", "C-c", "Space"]
-TYPED = {"h": b"h", "l": b"l", "H": b"H", "Enter": b"\r", "m": b"m", "a": b"a",
+KEYS = ["h", "l", "j", "k", "H", "Enter", "m", "a", "Escape", "q", "C-c", "Space"]
+TYPED = {"h": b"h", "l": b"l", "j": b"j", "k": b"k", "H": b"H", "Enter": b"\r", "m": b"m", "a": b"a",
          "Escape": b"\x1b", "q": b"q", "C-c": b"\x03", "Space": b" "}
 
 
@@ -317,7 +317,7 @@ class Keys(unittest.TestCase):
     def test_mode_survives_being_knocked_out_of_the_table(self):
         self.start()
         knocks = [
-            ("unbound key", lambda: self.type(b"j")),
+            ("unbound key", lambda: self.type(b"x")),         # (not j: a mode key now)
             ("click in the pane", lambda: self.type(b"\x1b[<0;10;5M\x1b[<0;10;5m")),
             ("focus out", lambda: self.type(b"\x1b[O")),
             ("focus in", lambda: self.type(b"\x1b[I")),
@@ -363,6 +363,53 @@ class Keys(unittest.TestCase):
         self.type(b"\x13")
         self.type(b"v")
         self.wait(self.selected, [wid])
+
+    # -- h/l walk the sidebar's order, not the tab bar's --------------------
+    def sidebar_space(self):
+        """main as a space: main:1 its home, then tabs shell, agent, shell,
+        agent → (home, agents, shells), each in tab order."""
+        self.t("set", "-w", "-t", self.wins[0], "@space_home", "1")
+        self.wins.append(self.t("new-window", "-d", "-t", "main:", "-P", "-F", "#{window_id}"))
+        home, s2, a3, s4, a5 = self.wins
+        for a in (a3, a5):
+            self.t("set", "-w", "-t", a, "@agent_state", "idle")
+        return home, [a3, a5], [s2, s4]
+
+    def cursor(self):
+        return self.t("show", "-gqv", "@stash_cursor")
+
+    def test_h_and_l_walk_home_agents_then_shells(self):
+        home, (a3, a5), (s2, s4) = self.sidebar_space()
+        sel = lambda: sorted(self.selected())
+        self.script("sel-start", "here", a3)
+        self.assertEqual(sel(), [a3])
+        # l: the next agent, though a shell sits between them in the tab bar;
+        # then the shells, in tab order; then the edge holds.
+        for cur, want in ((a5, [a3, a5]), (s2, [a3, a5, s2]), (s4, [a3, a5, s2, s4]), (s4, [a3, a5, s2, s4])):
+            self.script("sel-move", "right", a3)
+            self.assertEqual((self.cursor(), sel()), (cur, sorted(want)))
+        # h: back the same way, past the anchor to the home (first in the
+        # sidebar: the space's header), and the edge holds there too.
+        for cur, want in ((s2, [a3, a5, s2]), (a5, [a3, a5]), (a3, [a3]), (home, [home, a3]), (home, [home, a3])):
+            self.script("sel-move", "left", a3)
+            self.assertEqual((self.cursor(), sel()), (cur, sorted(want)))
+        # A range from the last agent to the first shell is exactly those two:
+        # contiguous in the sidebar, though the tab bar has a3 and s4 between.
+        self.script("sel-start", "here", a5)
+        self.script("sel-move", "right", a5)
+        self.assertEqual((self.cursor(), sel()), (s2, sorted([a5, s2])))
+        # ...typed too: l (and j, the sidebar's down) from there takes in s4,
+        # h (and k, up) gives it back.
+        for more, less in ((b"l", b"h"), (b"j", b"k")):
+            self.type(more)
+            self.wait(sel, sorted([a5, s2, s4]))
+            self.type(less)
+            self.wait(sel, sorted([a5, s2]))
+        # The park takes them in that order (the agent first), the tabs
+        # between them stay.
+        self.type(b"H")
+        self.wait(lambda: self.t("list-windows", "-t", "stash", "-F", "#{window_id}", check=False).split(), [a5, s2])
+        self.assertEqual(self.t("list-windows", "-t", "main", "-F", "#{window_id}").split(), [home, a3, s4])
 
     # -- prefix v toggles ------------------------------------------------
     def test_prefix_v_toggles(self):
