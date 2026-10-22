@@ -286,6 +286,57 @@ fn armed_jump_inverts_the_pin_digits() {
     assert!(!calm.rows[p + 2].segs.iter().any(|s| s.text == " 1 " && s.fg == Ink::Pal(ARMED.0)), "{:?}", calm.rows[p + 2].segs);
 }
 
+/// While prefix v's selection is live, PINNED goes: every pinned agent sits
+/// in its space's group in tab order (selected or not), so a selection
+/// across a pinned tab reads as the tabs do; it comes back when the
+/// selection ends.
+#[test]
+fn a_live_selection_puts_pins_back_in_their_space() {
+    let mut ag = quiet_agents();
+    ag[2] = a("main", 3, "needs-input", "Kua Yu focus timing").with("detail_kind", "ask")
+        .with("detail", "Which deck should I pull the timing from?").with("pinned", "200");
+    for x in &mut ag[4..7] {
+        *x = std::mem::replace(x, a("x", 0, "", "")).with("stash_sel", "1");
+    }
+    let x = std::mem::replace(&mut ag[5], a("x", 0, "", ""));
+    ag[5] = x.with("pinned", "100");
+    let v = lettered(view(ag, Some("@2")));
+    let mut bar = demo_bar();
+    bar.selecting = Some(3);
+    for (w, h) in [(34u16, 70u16), (44, 70)] {
+        let f = layout(&v, w, h, &with_bar(bar.clone()));
+        let t = texts(&f);
+        assert!(f.pinned.is_empty() && !t.iter().any(|l| l.contains(" PINNED")), "{w}: {t:#?}");
+        // Tab order in main: @3 (pinned, not selected) between @2 and @4;
+        // the selection @5 @6 (pinned) @7 one run of mauve cards.
+        let at = |s: &str| (f.agents.start..f.agents.end).find(|&y| t[y].contains(s)).unwrap_or_else(|| panic!("{s}: {t:#?}"));
+        let order = ["Tmux Agent", "Kua Yu", "Commodities", "Notch Tasks", "Lost suit", "Backyard"].map(at);
+        assert!(order.windows(2).all(|p| p[0] < p[1]), "{order:?} {t:#?}");
+        // (Each card's both rows.)
+        let run = order[3]..order[5] + 2;
+        for (r, l) in f.rows[run.clone()].iter().zip(&t[run]) {
+            assert_eq!(r.bg, Some(Ink::Pal(SEL_BG)), "{w} {l:?}");
+        }
+        assert_ne!(f.rows[order[1]].bg, Some(Ink::Pal(SEL_BG)));
+        // Each agent drawn once (NEEDS YOU aside).
+        let mut seen: HashMap<(String, String), usize> = HashMap::new();
+        for r in &f.rows[f.agents.clone()] {
+            for c in &r.covers {
+                *seen.entry(c.clone()).or_default() += 1;
+            }
+        }
+        assert!(seen.values().all(|&n| n == 1), "{seen:?}");
+        assert_eq!(seen.get(&("main".into(), "@6".into())), Some(&1));
+        // The selection ends: PINNED is back, @6 and @3 in it.
+        let f = layout(&v, w, h, &with_bar(demo_bar()));
+        let t = texts(&f);
+        let p = find(&f, " PINNED");
+        assert_eq!(f.pinned.start, p, "{t:#?}");
+        assert!(t[f.pinned.clone()].iter().any(|l| l.contains("Lost suit jacket")) && t[f.pinned.clone()].iter().any(|l| l.contains("Kua Yu")), "{t:#?}");
+        assert!(!t[f.pinned.end..f.agents.end].iter().any(|l| l.contains("Lost suit jacket")), "{t:#?}");
+    }
+}
+
 /// Without a single pin, nothing changes: no PINNED header, an empty range.
 #[test]
 fn no_pins_no_section() {

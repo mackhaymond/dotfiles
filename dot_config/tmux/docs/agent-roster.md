@@ -1060,8 +1060,14 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   the selection hint (under 6); a panel with nothing in it is not drawn.
 - **Stash selection** (prefix v, stash.sh `sel-start` / `sel-move`): live
   while the client is in the `stash` key table or any window still has
-  `@stash_sel`. Every selected agent tile (both lines, mauve 18%) and
-  shell row is drawn on a mauve tint with a mauve stripe, and the panel's first row reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
+  `@stash_sel`. Every selected window's WHOLE row goes solid mauve with
+  crust ink, the tab bar's selected tab (`#cba6f7` / `#11111b`): an agent
+  card (both lines, one colour, no rail), a shell row (a pill in the
+  folded shells line), a home's space header; dim text a softer crust
+  (70% over mauve, about 4.8:1; crust itself about 9:1) and key-caps
+  inverted (mauve letter on crust) (`layout::sel_row`). While it is live
+  PINNED is not drawn: every pinned agent sits in its space's group, so
+  the selection reads in tab order; PINNED is back when it ends. The panel's first row reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
   many keys as fit). stash.sh posts the focus notice after sel-start,
   sel-move, sel-cancel and the park, so it shows at once. Those keys hold
   for as long as a window of the client's session carries `@stash_sel`,
@@ -1124,6 +1130,8 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
     agent). The block is global in BOTH scopes: in "this space" a pin from
     another space still shows (that is what pinning is for). A window
     linked into two spaces is pinned once (its copy in the client's space).
+    Exception: while prefix v's stash selection is live the block goes and
+    every pin is back in its group (see Stash selection above).
   - **Order**: pin order, first pinned first (`@agent_pinned`, then the
     window id): pinning another appends it and never moves the ones
     already there, the sidebar's "nothing moves under the mouse" rule. A

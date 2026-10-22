@@ -1843,10 +1843,37 @@ fn dim_text_on_surfaces_is_overlay2() {
     }
 }
 
-/// prefix v's selection: every selected agent tile (both lines) and shell
-/// row on a mauve tint with a mauve stripe; the hint.
+/// A selected window's row ([`sel_row`]): every cell between the margins
+/// solid mauve but a key-cap's or chip's (inverted: mauve text on crust, at
+/// most `chips` cells), its text crust (dim text the soft crust), the
+/// margins the canvas.
+fn assert_selected(r: &Row, w: usize, chips: usize) {
+    let soft = over(Ink::Pal(SEL_INK), SEL_SOFT, Ink::Pal(SEL_BG));
+    let ctx = format!("{:?}: {:?}", r.text(), r.segs);
+    assert_eq!(r.bg, Some(Ink::Pal(SEL_BG)), "{ctx}");
+    let (mut x, mut crust) = (0, 0);
+    for s in &r.segs {
+        let n = dwidth(&s.text);
+        let edge = x < margin(w) || x >= w - margin(w);
+        match s.bg {
+            Some(Ink::Canvas) => assert!(edge && n == 1, "{ctx}"),
+            Some(b) => {
+                assert!(!edge && (b, s.fg) == (Ink::Pal(SEL_INK), Ink::Pal(SEL_BG)), "{ctx}");
+                crust += n;
+            }
+            None => assert!(!edge && (s.text.trim().is_empty() || s.fg == Ink::Pal(SEL_INK) || s.fg == soft), "{ctx}"),
+        }
+        x += n;
+    }
+    assert_eq!(x, w, "{ctx}");
+    assert!(crust <= chips, "{crust} chip cells: {ctx}");
+}
+
+/// prefix v's selection: every selected agent card (both lines) and shell
+/// row SOLID mauve with crust ink (the tab bar's selected tab), no rail;
+/// the hint.
 #[test]
-fn the_stash_selection_tints_rows_and_shows_its_keys() {
+fn the_stash_selection_fills_rows_and_shows_its_keys() {
     let v = lettered(view(
         vec![
             a("main", 1, "running", "Sel one").with("stash_sel", "1").with("detail_kind", "run").with("detail", "Bash ls"),
@@ -1859,21 +1886,43 @@ fn the_stash_selection_tints_rows_and_shows_its_keys() {
     let f = layout(&v, 34, 40, &with_bar(bar.clone()));
     let t = texts(&f);
     let r = find(&f, "Sel one");
-    // (One colour, like every card.)
+    // (One colour, like every card: both rows, every cell but the key-cap.)
+    assert!(t[r + 1].contains("Bash ls"), "{t:#?}");
     for row in &f.rows[r..r + 2] {
-        assert_eq!(row.bg, Some(Ink::Mix("mauve", 18)), "{:?}", row.text());
-        assert_eq!(row.segs[1], seg("▌", "mauve"));
+        assert_selected(row, 34, BADGE_W);
+        assert_eq!(row.segs[1].text, " ");
     }
+    // The title and the state word in bold crust; the cap inverted.
+    assert!(f.rows[r].segs.iter().any(|s| s.text.contains("Sel one") && s.bold && s.fg == Ink::Pal("crust")), "{:?}", f.rows[r].segs);
+    assert!(f.rows[r].segs.iter().any(|s| s.text.trim() == "a" && s.bg == Some(Ink::Pal("crust")) && s.fg == Ink::Pal("mauve")));
     let p = find(&f, "Plain");
-    assert_ne!(f.rows[p].bg, Some(Ink::Mix("mauve", 18)));
-    // A selected shell: its row on the tint, the heavy mauve stripe; the
-    // other shell on its strip.
-    let sv = shells_at("@2", "all", &[("@6", "stash_sel", "1")]);
+    assert_ne!(f.rows[p].bg, Some(Ink::Pal(SEL_BG)));
+    // A selected shell: its row solid mauve, no stripe; the other shell on
+    // its strip. A selected home: its space's header a mauve tile too.
+    let sv = shells_at("@2", "all", &[("@6", "stash_sel", "1"), ("@7", "stash_sel", "1")]);
     let tall = layout(&sv, 44, 62, &with_bar(bar.clone()));
+    let tt = texts(&tall);
     let sh = find(&tall, "nvim");
-    assert!(texts(&tall)[sh].starts_with(" ▌  h  ❯ nvim"), "{:#?}", texts(&tall));
-    assert_eq!((tall.rows[sh].bg, tall.rows[sh].segs[1].clone()), (Some(Ink::Mix("mauve", 18)), seg("▌", "mauve")));
+    assert!(tt[sh].starts_with("    h  ❯ nvim"), "{tt:#?}");
+    assert_selected(&tall.rows[sh], 44, BADGE_W);
     assert_eq!(tall.rows[find(&tall, "/x/agent-ui")].bg, Some(Ink::Pal(TERM_BG)));
+    let home = (0..tt.len()).find(|&y| is_group_header(&tall.rows[y], 44) && tt[y].contains("work")).expect("work's header");
+    assert_selected(&tall.rows[home], 44, 3);
+    let main = (0..tt.len()).find(|&y| is_group_header(&tall.rows[y], 44) && tt[y].contains("main")).expect("main's header");
+    assert_ne!(tall.rows[main].bg, Some(Ink::Pal(SEL_BG)));
+    // Readable: crust on mauve about 9:1, the soft ink still over 4.5:1.
+    let lum = |i: Ink| {
+        let (r, g, b) = ink_rgb(i);
+        let l = |c: u8| {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * l(r) + 0.7152 * l(g) + 0.0722 * l(b)
+    };
+    let contrast = |a: Ink, b: Ink| (lum(a).max(lum(b)) + 0.05) / (lum(a).min(lum(b)) + 0.05);
+    let soft = over(Ink::Pal(SEL_INK), SEL_SOFT, Ink::Pal(SEL_BG));
+    assert!(contrast(Ink::Pal(SEL_INK), Ink::Pal(SEL_BG)) > 9.0);
+    assert!(contrast(soft, Ink::Pal(SEL_BG)) > 4.5);
     // The hint, first in the panel: as many of the keys as fit.
     assert_eq!(find(&f, " selected "), f.status.start);
     let hint = find(&f, " selected ");

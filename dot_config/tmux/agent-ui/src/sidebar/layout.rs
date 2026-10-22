@@ -236,8 +236,8 @@
 //! client's own agent, both rows, its own shell, and its space's header while
 //! it is on the home: [`MINE_BG`]), the panels (`tile_lo`),
 //! NEEDS YOU cards (their state colour, 14% / 9%), the client's space's band
-//! ([`band`]: apart from every card shade), the stash selection (mauve 18%),
-//! toasts (`surface0`), and the solid chips. Dim text is `overlay2`.
+//! ([`band`]: apart from every card shade), the stash selection (SOLID
+//! mauve with crust ink, the tab bar's selected tab: [`sel_row`]), toasts (`surface0`), and the solid chips. Dim text is `overlay2`.
 
 use super::pause::{Held, Phase};
 use super::status::{ink_on, ink_rgb, tmux_colour, Bar, Kind, Toast, ToastId, Usage};
@@ -1753,20 +1753,20 @@ fn clip_left(text: &str, room: usize) -> String {
 /// command, the command bold `text` and the folder dim after it. The
 /// client's own shell is lifted like its own agent card (`tile_me`, a
 /// lavender rail, a full lavender cell down its right edge, the path
-/// `text`); prefix v's selection tints it mauve with the heavy mauve rail.
-/// A click goes to the shell.
+/// `text`); prefix v's selection makes the whole row solid mauve with
+/// crust ink ([`sel_row`]). A click goes to the shell.
 fn shell_row(s: &Agent, cx: Cx, space: Ink) -> Row {
     let w = cx.w;
     let mine = own(s, cx);
     let bg = if s.selected {
-        Ink::Mix("mauve", 18)
+        Ink::Pal(SEL_BG)
     } else if mine {
         Ink::Pal(MINE_BG)
     } else {
         Ink::Pal(TERM_BG)
     };
     let rail = if s.selected {
-        seg(RAIL_HEAVY, "mauve")
+        seg(" ", "text")
     } else if mine {
         seg(RAIL, "lavender")
     } else {
@@ -1796,7 +1796,12 @@ fn shell_row(s: &Agent, cx: Cx, space: Ink) -> Row {
         }
         None => left.push(seg(clip_left(&dir, room), if mine { "text" } else { "sub" })),
     }
-    tile_row(w, bg, left, right).click(w, Target::Shell { win: s.window_id.clone(), session: s.session.clone() })
+    let row = tile_row(w, bg, left, right).click(w, Target::Shell { win: s.window_id.clone(), session: s.session.clone() });
+    if s.selected {
+        sel_row(row)
+    } else {
+        row
+    }
 }
 
 /// A space's shells in ONE row, for the steps that fold (the idle agents
@@ -1804,7 +1809,8 @@ fn shell_row(s: &Agent, cx: Cx, space: Ink) -> Row {
 /// grid's cap column each shell its key-cap (as on its row) and its label
 /// (the command it runs, else its folder), two cells apart, `+K` (dim) for
 /// those that do not fit; without letters, the green prompt before each
-/// label. Each shell's cells click through to it.
+/// label. Each shell's cells click through to it. A shell in prefix v's
+/// selection is a solid mauve pill, crust ink ([`SEL_BG`]).
 fn shells_line(shells: &[&Agent], cx: Cx, space: Ink) -> Row {
     let w = cx.w;
     let m = margin(w);
@@ -1820,6 +1826,11 @@ fn shells_line(shells: &[&Agent], cx: Cx, space: Ink) -> Row {
             pill.push(bold(PROMPT, "green"));
         }
         pill.push(seg(clip(&sanitize(&s.shell), 14), if own(s, cx) { "text" } else { "sub" }));
+        if s.selected {
+            for p in &mut pill {
+                (p.fg, p.bg) = (Ink::Pal(SEL_INK), Some(Ink::Pal(SEL_BG)));
+            }
+        }
         let gap = usize::from(k > 0) * 2;
         let left = shells.len() - k - 1;
         let more = if left > 0 { dwidth(&format!("  +{left}")) } else { 0 };
@@ -1873,6 +1884,42 @@ pub const MINE_BG: Hue = "tile_me";
 const MINE_DIM: Hue = "sub";
 const MINE: &str = "█";
 const MINE_HUE: Hue = "lavender";
+
+/// prefix v's range selection (`@stash_sel`): the WHOLE card goes solid
+/// `mauve` with `crust` ink, exactly the tab bar's selected tab (tmux.conf's
+/// `#cba6f7` background, `#11111b` text), so the sidebar and the tabs say
+/// "these are selected" in one colour. Dark ink on the light fill, not a
+/// tint with bright text: crust on mauve is about 9:1, and a solid fill is
+/// the one look no other card has (every other surface is dark). Dim text
+/// keeps a step down ([`SEL_SOFT`]% crust over mauve, about 4.8:1); a
+/// key-cap or chip inverts (its text in mauve on crust). [`sel_row`].
+const SEL_BG: Hue = "mauve";
+const SEL_INK: Hue = "crust";
+const SEL_SOFT: u8 = 70;
+
+/// `row` (a selected window's card row, a tile) as [`SEL_BG`] through: the
+/// row's colour mauve; every text in [`SEL_INK`] (dim text the softer
+/// [`SEL_SOFT`] ink; bold kept); a chip's or key-cap's own fill inverted to
+/// crust with its text mauve, a blank one dropped into the card; the
+/// canvas margins left alone. One colour per card, both rows.
+fn sel_row(mut row: Row) -> Row {
+    let soft = over(Ink::Pal(SEL_INK), SEL_SOFT, Ink::Pal(SEL_BG));
+    let dim = |ink: Ink| match ink {
+        Ink::Pal(h) => matches!(h, "overlay" | "overlay0" | "overlay1" | "overlay2" | "sub" | "surface0" | "surface1" | "surface2"),
+        Ink::Mix(..) | Ink::Tint(..) => true,
+        _ => false,
+    };
+    row.bg = Some(Ink::Pal(SEL_BG));
+    for s in &mut row.segs {
+        match s.bg {
+            Some(Ink::Canvas) => {}
+            Some(_) if s.text.trim().is_empty() => s.bg = None,
+            Some(_) => (s.fg, s.bg) = (Ink::Pal(SEL_BG), Some(Ink::Pal(SEL_INK))),
+            None => s.fg = if dim(s.fg) { soft } else { Ink::Pal(SEL_INK) },
+        }
+    }
+    row
+}
 
 /// What the jump table (⌥W) turns every key-cap into: INVERTED, a bold
 /// peach letter (its ` ⌥W jump ` mark's colour) on `crust`, darker than
@@ -2297,13 +2344,14 @@ fn short_title(a: &Agent) -> String {
 }
 
 /// The ONE colour an agent's card sits on, both its rows: prefix v's
-/// selection mauve, the client's own agent [`MINE_BG`] (lifted well off
-/// the zebra: "you are here"), else the zebra's shade for the `k`th card of
-/// its group ([`shade`]: consecutive cards alternate, so cards stacked with
-/// no gap still part).
+/// selection solid mauve ([`SEL_BG`], crust ink: [`sel_row`]), the
+/// client's own agent [`MINE_BG`] (lifted well off the zebra: "you are
+/// here"), else the zebra's shade for the `k`th card of its group
+/// ([`shade`]: consecutive cards alternate, so cards stacked with no gap
+/// still part).
 fn agent_bg(a: &Agent, k: usize, mine: bool) -> Ink {
     if a.selected {
-        Ink::Mix("mauve", 18)
+        Ink::Pal(SEL_BG)
     } else if mine {
         Ink::Pal(MINE_BG)
     } else {
@@ -2313,8 +2361,9 @@ fn agent_bg(a: &Agent, k: usize, mine: bool) -> Ink {
 
 /// One agent as a card in one colour ([`agent_bg`]; `k`: its place in its
 /// group, for the zebra), on the card grid: a state rail (`▎` in the
-/// state's colour; the client's own idle agent lavender; none when idle;
-/// the selection's heavier mauve `▌`), a pad, its key-cap ([`Badge::seg`]:
+/// state's colour; the client's own idle agent lavender; none when idle,
+/// nor on a selected card, solid mauve with crust ink through, both rows:
+/// [`sel_row`]), a pad, its key-cap ([`Badge::seg`]:
 /// solid for the client's and an asking or failed agent, else a quiet
 /// tint of its space's colour, `space`; a working agent's blinks,
 /// [`blinks`]), a pad, the title (`text`, bold
@@ -2340,7 +2389,7 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     let bg = agent_bg(a, k, mine);
     let busy = word.as_ref().filter(|x| !x.idle()).map(|x| x.hue);
     let rail = if a.selected {
-        seg(RAIL_HEAVY, "mauve")
+        seg(" ", "text")
     } else if let Some(h) = busy {
         seg(RAIL, h)
     } else if mine {
@@ -2438,7 +2487,8 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     let first = tile_row(cx.w, bg, left, right).click(cx.w, go.clone());
     let mut first = diff_click(first, cx.w, rw, span, &a.window_id).covering([a]);
     first.anim = word.as_ref().is_some_and(Word::working);
-    let Some(m) = msg else { return vec![first] };
+    let sel = |rows: Vec<Row>| if a.selected { rows.into_iter().map(sel_row).collect() } else { rows };
+    let Some(m) = msg else { return sel(vec![first]) };
     // Under the title (past the key-cap); without letters, indented anyway,
     // so a message never reads as another agent.
     let indent = if cx.b.on { lead - 1 } else { 3 };
@@ -2498,7 +2548,7 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     }
     let rw = width(&r2);
     let second = diff_click(tile_row(cx.w, bg, l2, r2).click(cx.w, go), cx.w, rw, span, &a.window_id);
-    vec![first, second]
+    sel(vec![first, second])
 }
 
 /// A pinned card's digit as a key-cap (` 1 `, [`BADGE_W`] wide): ⌥W then
@@ -2613,9 +2663,15 @@ fn group_header(sp: &Space, cx: Cx, collapsed: bool) -> Row {
     // space's claude: its popup.
     let target = space_target(sp);
     let bg = if mine { Ink::Pal(MINE_BG) } else { band(ink) };
-    let mut row = if here { tile_row(w, bg, left, right) } else { Row::new([vec![bare(m)], fit(inner(w), left, right, None), vec![bare(m)]].concat()) };
+    // The home in prefix v's selection: the header a solid mauve tile like
+    // any selected card ([`sel_row`]).
+    let sel = sp.agents.iter().chain(&sp.plain).any(|a| a.home && a.selected);
+    let mut row = if here || sel { tile_row(w, bg, left, right) } else { Row::new([vec![bare(m)], fit(inner(w), left, right, None), vec![bare(m)]].concat()) };
     if here && m > 0 {
         row.segs[0] = Seg { bg: Some(Ink::Canvas), ..seg(RAIL_HEAVY, ink) };
+    }
+    if sel {
+        row = sel_row(row);
     }
     let mut row = row.click(w, target);
     row.anim = spin.is_some();
@@ -3567,9 +3623,13 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
     };
     // Pinned agents move out of their spaces into PINNED (a view already
     // split is laid out as it is). The letters, the client's own card and
-    // the key-caps above were read off the whole view.
+    // the key-caps above were read off the whole view. While prefix v's
+    // range selection is live ([`Bar::selecting`]) nothing moves: PINNED is
+    // not drawn and every pinned agent sits in its space's group, so the
+    // selection reads in tab order; PINNED is back once it ends.
     let split;
-    let view = if view.pinned.is_empty() && view.agents().any(|a| a.is_pinned()) {
+    let selecting = opts.bar.selecting.is_some();
+    let view = if view.pinned.is_empty() && !selecting && view.agents().any(|a| a.is_pinned()) {
         split = view.pins_split();
         &split
     } else {
