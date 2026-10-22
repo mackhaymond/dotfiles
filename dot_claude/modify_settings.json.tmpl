@@ -153,6 +153,24 @@ FULL=$(cat <<'EOF'
             "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun --no-env-file {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-tab-indicator.sh' heartbeat claude"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-tab-indicator.sh' subagent-stop claude"
+          }
+        ]
       }
     ],
     "PreToolUse": [
