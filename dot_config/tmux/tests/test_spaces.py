@@ -40,7 +40,7 @@ NOTIFY = HERE / "scripts" / "executable_notify.sh"
 ROSTER = HERE / "scripts" / "executable_agent-roster.py"
 WEZTERM = HERE.parent / "wezterm" / "wezterm.lua.tmpl"
 TMUX = shutil.which("tmux")
-HIDDEN = "agents tasks stash scratch btop-popup"
+HIDDEN = "agents tasks stash scratch btop-popup pending"
 COLS, ROWS = 140, 20
 
 
@@ -81,11 +81,11 @@ def on_branch():
 # do what their keys did before spaces.
 OFF_META = [l for l in else_branch().splitlines()
             if re.match(r'bind -N "Select window \d" M-\d |bind -n User\d+ ', l)]
-# WezTerm's digit chords: row (CTRL space, ALT M-N to the pane, CMD agent) ->
-# sequence.
-# This space's chip, as text: █⌃N name (󰋜 while on its home), then the
+# WezTerm's digit chords: row (CTRL C-N to the pane, ALT M-N to the pane, CMD
+# space; all three window N when off) -> sequence.
+# This space's chip, as text: █⌘N name (󰋜 while on its home), then the
 # powerline edge.
-CHIP_RE = "█⌃(\\d) ([\\w-]+)(?: 󰋜)?\ue0b0"
+CHIP_RE = "█⌘(\\d) ([\\w-]+)(?: 󰋜)?\ue0b0"
 CHORD = {(row, n): f"\x1b[91{r}{n}~" for r, row in ((1, "CTRL"), (2, "ALT"), (3, "CMD")) for n in range(1, 10)}
 
 
@@ -178,10 +178,30 @@ class ConfigShape(unittest.TestCase):
     def test_off_binds_prefix_meta_digits_to_windows(self):
         self.assertEqual([l.split()[5] for l in OFF_META if l.startswith("bind -N")], [f"M-{n}" for n in range(1, 10)])
 
+    def test_digit_chords_per_mode(self):
+        # Spaces on: CMD+N (User18..26) is space N's home, the very command of
+        # prefix N; CTRL+N (User0..8) is C-N to the pane; nothing is "agent N"
+        # (prefix M-N unbound). Off: CTRL+N and CMD+N select window N, as
+        # before spaces, and prefix M-N too.
+        on, off = on_branch().splitlines(), else_branch().splitlines()
+        cmd = lambda lines, k: next(l.split(" ", 3)[3] for l in lines if l.startswith(f"bind -n User{k} "))
+        for n in range(1, 10):
+            space = next(l for l in on if l.startswith(f'bind -N "Go to space {n}" {n} '))
+            self.assertEqual(cmd(on, n + 17), space.split(f'"Go to space {n}" {n} ', 1)[1])
+            self.assertIn(f"@space_index}},{n}", cmd(on, n + 17))
+            self.assertEqual(cmd(on, n - 1), f"send-keys C-{n}")
+            self.assertIn(f"unbind -q M-{n}", on)
+            self.assertFalse([l for l in on if re.match(rf"bind (-N \"[^\"]*\" )?M-{n} ", l)])
+            for k in (n - 1, n + 17):
+                self.assertEqual(cmd(off, k), f"select-window -t :={n}")
+            self.assertIn(f'bind -N "Select window {n}" M-{n} select-window -t :={n}', off)
+        self.assertNotRegex(SPACES.read_text(), r"space_sh\} agent |Go to agent")
+        self.assertNotIn("\n    agent)", SCRIPT.read_text())
+
     def test_wezterm_digit_rows(self):
-        # CTRL+N → \e[911N~ (space), ALT+N → \e[912N~ (M-N), CMD+N →
-        # \e[913N~ (agent): one sequence per chord, no prefix, no bare ESC N.
-        # The mixed chords do nothing.
+        # CTRL+N → \e[911N~ (C-N), ALT+N → \e[912N~ (M-N), CMD+N → \e[913N~
+        # (space): one sequence per chord, sent whatever @spaces says, no
+        # prefix, no bare ESC N. The mixed chords do nothing.
         text = WEZTERM.read_text()
         loop = text[text.rindex("for i = 1, 9 do"):]
         self.assertIn('{ { "CTRL", "1" }, { "ALT", "2" }, { "CMD", "3" } }', loop)
@@ -240,6 +260,7 @@ class Server(unittest.TestCase):
         self.t("set", "-g", "@notify_sh", f"zsh -f {NOTIFY}")                          # the source copy
         self.t("set", "-g", "@space_registry", self.registry)
         self.t("set", "-g", "@space_closer", "none")
+        self.t("set", "-g", "@space_catalog_sync", "off")                              # never npm from a test
         self.t("set", "-g", "@spaces", self.flag)
         self.source()
         if self.flag == "on":
@@ -397,12 +418,14 @@ class FlagOff(Server):
         self.assertEqual(self.t("list-keys", "-T", "prefix", "C-a", check=False), "")
         bound = lambda table, key="M-1": next(l for l in self.t("list-keys", "-T", table).splitlines()
                                               if re.match(rf"bind-key +-T {table} +{key} ", l))
-        self.assertIn(" agent 1 ", bound("prefix"))
+        self.assertEqual(self.t("list-keys", "-T", "prefix", "M-1", check=False), "")  # no agent N
+        self.assertIn("@space_home", bound("root", "User18"))                          # CMD+1: space 1's home
+        self.assertIn("send-keys C-1", bound("root", "User0"))                         # CTRL+1: the pane's
         self.assertEqual(self.t("list-keys", "-T", "root", "M-1", check=False), "")   # Option-1: the pane's
         self.assertIn("send-keys M-1", bound("root", "User9"))                         # OPT+1 too
         self.assertIn("@space_pin_n 1", bound("jump", "1"))                            # ⌥W 1: pin 1
         self.assertIn("pin toggle", self.t("show", "-gv", "@space_pin"))               # prefix t: pin this tab
-        self.assertIn("@space_home", bound("prefix", "1"))                             # ⌃1: space 1's home
+        self.assertIn("@space_home", bound("prefix", "1"))                             # prefix 1 (⌘1's twin)
         self.assertIn(" pick-tab shell ", bound("prefix", "C-t"))   # CMD+SHIFT+T: which space?
         self.assertIn(" pick-tab agent ", bound("prefix", "K"))     # CMD+SHIFT+R
 
@@ -595,7 +618,7 @@ class Spaces(Server):
         self.assertEqual(self.t("display", "-t", w, "-p", "#{window_index}"), "2")
         self.t("select-window", "-t", w)
         self.wait(self.on, f"main:{w}")
-        self.key("C-b", "1"); self.wait(self.on, f"main:{self.M1}")                  # ⌃1 = home
+        self.key("C-b", "1"); self.wait(self.on, f"main:{self.M1}")                  # ⌘1 = home
 
     def test_window_hooks_sync_only_for_a_space_whatever_the_client_is_on(self):
         log = os.path.join(self.tmp, "calls.log")
@@ -752,14 +775,16 @@ class Spaces(Server):
         self.t("move-window", "-s", self.M3, "-t", "stash:")          # parked from main
         self.t("set", "-w", "-t", self.M3, "@stash_origin", "main")
         self.t("respawn-pane", "-k", "-t", d, f"bash {DASH}")          # a fresh draw (no notice needed)
-        self.wait(lambda: "◉ ⌘2 q  tmux/fix the bar" in self.dash_text(d), True, timeout=6)
+        self.wait(lambda: "◉ q  tmux/fix the bar" in self.dash_text(d), True, timeout=6)
         text = self.dash_text(d)
         self.assertIn("█▄█", text)                                      # "main", large: half blocks
-        self.assertIn("⌃1  ~", text)
+        self.assertIn("⌘1  ~", text)
         self.assertIn("3 agents · 1 shell · 1 parked", text)
-        self.assertIn("◐ ⌘1", text)                                    # running
-        self.assertIn("○ ⌘3", text)                                    # idle
+        self.assertIn("◐  ", text)                                     # running (no letter yet)
+        self.assertIn("○  ", text)                                     # idle
+        self.assertNotRegex(text, r"[◐○◉✓✕] ⌘")                          # agents have no number
         self.assertIn("⌥W jump", text)
+        self.assertIn("⌘N home", text)
 
     def test_dashboard_never_takes_the_focus(self):
         d = self.dash("main")
@@ -1092,8 +1117,8 @@ class Spaces(Server):
         return [(dot, n) for _, n, dot in self.alert_chips()]
 
     def alert_chips(self):
-        """[(space colour, N, state colour)]: ⌃N in its space's colour, ● in the state's."""
-        return re.findall(r"#\[fg=(#\w+)\]⌃(\d+)#\[fg=(#\w+)\]●", self.status()[0])
+        """[(space colour, N, state colour)]: ⌘N in its space's colour, ● in the state's."""
+        return re.findall(r"#\[fg=(#\w+)\]⌘(\d+)#\[fg=(#\w+)\]●", self.status()[0])
 
     def sid(self, name):
         return self.t("display", "-t", name, "-p", "#{session_id}")
@@ -1106,10 +1131,10 @@ class Spaces(Server):
             self.assertNotIn(other, text)
         self.assertNotIn(f"range=session|{self.sid('zed')}]", raw)
         self.assertNotIn(f"range=session|{self.sid('agents')}]", raw)
-        self.assertIn("⌃2●", text)                                              # proj: done
+        self.assertIn("⌘2●", text)                                              # proj: done
         self.assertNotIn("proj", text)
         self.assertEqual(self.shell_tabs(), ["·"])                  # shells: window 3 only, no letter yet
-        self.assertIn("⌃1 main 󰋜", text)                            # on home: the mark, in the chip
+        self.assertIn("⌘1 main 󰋜", text)                            # on home: the mark, in the chip
         self.assertEqual(text.count("󰋜"), 1)                         # ...and home has no tab
         self.assertIn("range=window|3", raw)
         self.assertNotIn("range=window|1]", raw)
@@ -1117,8 +1142,8 @@ class Spaces(Server):
         self.assertIn("range=user|space-new", raw)
         self.assertTrue(text.rstrip().endswith("RIGHT"))
         self.assertIn("align=right", raw)
-        self.assertLess(text.index("⌃1"), text.index("⌃2●"))
-        self.assertLess(text.index("⌃2●"), text.index("█·█"))
+        self.assertLess(text.index("⌘1"), text.index("⌘2●"))
+        self.assertLess(text.index("⌘2●"), text.index("█·█"))
 
     def shell_tabs(self):
         """The shell tabs' letters (· for none yet), left to right."""
@@ -1131,10 +1156,10 @@ class Spaces(Server):
         self.assertEqual(self.shell_tabs(), ["k", "·"])
         raw, _ = self.status()
         self.assertIn(f"range=window|{self.t('display', '-t', S2, '-p', '#{window_index}')}]", raw)
-        self.assertIn("⌃1 main 󰋜", self.here())                     # on home
+        self.assertIn("⌘1 main 󰋜", self.here())                     # on home
         self.t("select-window", "-t", self.M3)
         self.wait(lambda: "󰋜" in self.status()[1], False)          # off home: no mark anywhere
-        self.assertIn("bold]⌃1 main#[", self.here())
+        self.assertIn("bold]⌘1 main#[", self.here())
         self.assertIn("#[fg=#1e1e2e,bg=#fab387]k", self.status()[0])  # the window you are on: peach
         self.t("select-window", "-t", self.M2)                       # on an agent: no mark either
         self.wait(lambda: "󰋜" in self.status()[1], False)
@@ -1147,28 +1172,28 @@ class Spaces(Server):
 
     def test_this_space_chip_is_its_colour_and_the_rollup_follows_it(self):
         # A solid chip in the space's colour, bold crust text, a powerline edge.
-        self.assertIn("#[fg=#b4befe,bg=default]█#[fg=#11111b,bg=#b4befe,bold]⌃1 main 󰋜#[fg=#b4befe,bg=default,nobold]",
+        self.assertIn("#[fg=#b4befe,bg=default]█#[fg=#11111b,bg=#b4befe,bold]⌘1 main 󰋜#[fg=#b4befe,bg=default,nobold]",
                       self.here())                                # main: lavender, on its home
         self.assertIn("#[fg=#f9e2af]●", self.state())             # needs-input beats running
         self.t("set", "-w", "-t", self.M4, "@agent_state", "idle")
         self.assertNotIn("●", self.state())                       # quiet: no dot
         self.t("switch-client", "-c", self.client, "-t", "proj")
-        self.wait(lambda: "⌃2 proj" in self.status()[1], True)
-        self.assertIn("bg=#cba6f7,bold]⌃2 proj", self.here())     # proj: the first palette colour
+        self.wait(lambda: "⌘2 proj" in self.status()[1], True)
+        self.assertIn("bg=#cba6f7,bold]⌘2 proj", self.here())     # proj: the first palette colour
         self.assertIn("#[fg=#a6e3a1]●", self.state())             # done
         self.t("set", "-w", "-t", self.P1, "@agent_state", "failed")
         self.assertIn("#[fg=#f38ba8]●", self.state())             # failed beats done
         self.t("set", "-w", "-t", self.P1, "@agent_workflow", "1")
         self.assertIn("󰒓", self.state())
         # Set off from the shells: edge, state, a two-cell gap.
-        self.assertTrue(self.status()[1].startswith("█⌃2 proj 󰋜 ● 󰒓   [+]"), self.status()[1])   # P1 is an agent now
+        self.assertTrue(self.status()[1].startswith("█⌘2 proj 󰋜 ● 󰒓   [+]"), self.status()[1])   # P1 is an agent now
 
     def test_prefix_turns_the_chip_red(self):
         self.t("set", "-w", "-t", self.M4, "@agent_state", "idle")
         self.key("C-b")
-        self.wait(lambda: "#[fg=#f38ba8,bg=default]█#[fg=#11111b,bg=#f38ba8,bold]⌃1 main" in self.here(), True)
+        self.wait(lambda: "#[fg=#f38ba8,bg=default]█#[fg=#11111b,bg=#f38ba8,bold]⌘1 main" in self.here(), True)
         self.key("Escape")
-        self.wait(lambda: "#[fg=#b4befe,bg=default]█#[fg=#11111b,bg=#b4befe,bold]⌃1 main" in self.here(), True)
+        self.wait(lambda: "#[fg=#b4befe,bg=default]█#[fg=#11111b,bg=#b4befe,bold]⌘1 main" in self.here(), True)
 
     def test_alert_number_in_its_space_colour_dot_in_the_state_colour(self):
         Z = self.new_window("zed", "needs-input")
@@ -1188,12 +1213,12 @@ class Spaces(Server):
         for i in range(4, 11):
             self.new_session(f"s{i}", "/usr")
         self.wait(lambda: self.t("show", "-t", "s10", "-qv", "@space_index"), "10")
-        self.wait(lambda: self.t("show", "-t", "s9", "-qv", "@space_key"), "⌃9")
+        self.wait(lambda: self.t("show", "-t", "s9", "-qv", "@space_key"), "⌘9")
         self.assertEqual(self.t("show", "-t", "s10", "-qv", "@space_key"), "")
         self.new_window("s10", "needs-input")
         self.wait(lambda: "s10●" in self.status()[1], True)              # alert: the name, no key
         self.t("switch-client", "-c", self.client, "-t", "s10")
-        self.wait(lambda: self.status()[1].startswith("█s10 󰋜\ue0b0"), True)   # the name alone, no ⌃10
+        self.wait(lambda: self.status()[1].startswith("█s10 󰋜\ue0b0"), True)   # the name alone, no ⌘10
 
     def test_alerts_only_for_other_spaces_that_need_you(self):
         self.assertEqual(self.alerts(), [("#a6e3a1", "2")])     # proj done; main (here) never
@@ -1235,7 +1260,7 @@ class Spaces(Server):
                 if "[+]" in lines[-1]:
                     break
                 time.sleep(0.1)
-            self.assertRegex(lines[-1], r"^█⌃1 main 󰋜\ue0b0 ●  ⌃2● █·█ ~█ \[\+\] +RIGHT$")
+            self.assertRegex(lines[-1], r"^█⌘1 main 󰋜\ue0b0 ●  ⌘2● █·█ ~█ \[\+\] +RIGHT$")
             self.assertNotIn("[+]", lines[-2])   # one status line
         finally:
             run("kill-server")
@@ -1274,12 +1299,13 @@ class Spaces(Server):
         self.t("set", "-wu", "-t", self.M1, "@space_home")
         self.assertEqual(self.t("display", "-p", target), self.sid("main"))
 
-    def test_prefix_meta_digit_goes_to_agent_n_of_this_space(self):
-        self.key("C-b", "M-2"); self.wait(self.on, f"main:{self.M4}")
-        self.key("C-b", "M-1"); self.wait(self.on, f"main:{self.M2}")
-        self.key("C-b", "M-3"); self.wait(self.on, f"main:{self.M5}")
-        self.key("C-b", "M-4"); time.sleep(0.3)   # only 3 agents: stays put
-        self.assertEqual(self.on(), f"main:{self.M5}")
+    def test_prefix_meta_digit_is_no_longer_agent_n(self):
+        # ⌘N's old "agent N" (prefix M-N) is gone: unbound, nothing moves.
+        for n in range(1, 10):
+            self.assertEqual(self.t("list-keys", "-T", "prefix", f"M-{n}", check=False), "")
+        start = self.on()
+        self.key("C-b", "M-1"); time.sleep(0.3)
+        self.assertEqual(self.on(), start)
 
     def cat_window(self):
         """A shell window of main running `cat -v`, selected: shows what reaches the pane."""
@@ -1355,13 +1381,16 @@ class Spaces(Server):
         self.chord("ALT", 2)                                            # OPT+2: M-2 to the pane
         self.wait(lambda: "^[2" in self.t("capture-pane", "-p", "-t", w), True)
         self.assertEqual(self.on(), f"main:{w}")
-        self.chord("CMD", 1); self.wait(self.on, f"main:{self.M2}")     # CMD+1: agent 1, never a shell
-        self.chord("CMD", 3); self.wait(self.on, f"main:{self.M5}")
-        self.chord("CTRL", 1); self.wait(self.on, f"main:{self.M1}")    # CTRL+1, already here: home
+        # CTRL+N is the pane's: C-N in a terminal's bytes (C-1 is "1", C-3
+        # ESC), never a space. cat -v shows ESC as ^[.
+        self.chord("CTRL", 1); self.chord("CTRL", 3); self.chord("CTRL", 9)
+        self.wait(lambda: "1^[9" in self.t("capture-pane", "-p", "-t", w), True)
+        self.assertEqual(self.on(), f"main:{w}")
+        self.chord("CMD", 1); self.wait(self.on, f"main:{self.M1}")     # CMD+1, already here: home
         self.t("select-window", "-t", self.P2)
-        self.chord("CTRL", 2); self.wait(self.on, f"proj:{self.P1}")    # its home, not its last window
-        self.chord("CTRL", 1); self.wait(lambda: self.on("#{session_name}"), "main")
-        self.chord("CTRL", 7); time.sleep(0.3)                          # no space 7: stays
+        self.chord("CMD", 2); self.wait(self.on, f"proj:{self.P1}")     # its home, not its last window
+        self.chord("CMD", 1); self.wait(lambda: self.on("#{session_name}"), "main")
+        self.chord("CMD", 7); time.sleep(0.3)                           # no space 7: stays
         self.assertEqual(self.on("#{session_name}"), "main")
         # ...and says so through notify.sh, to this client (its log line:
         # epoch, kind, client, text).
@@ -1370,7 +1399,7 @@ class Spaces(Server):
         self.wait(lambda: ["warn", self.client, "no space 7"] in said(), True)
         self.t("copy-mode", "-t", self.M1)                              # also from copy mode
         self.wait(lambda: self.on("#{pane_in_mode}"), "1")
-        self.chord("CTRL", 3); self.wait(lambda: self.on("#{session_name}"), "zed")
+        self.chord("CMD", 3); self.wait(lambda: self.on("#{session_name}"), "zed")
 
     def test_next_prev_are_kind_aware(self):
         self.key("M-l"); self.wait(self.on, f"main:{self.M3}")   # from the home shell: next shell
@@ -1440,7 +1469,8 @@ class Spaces(Server):
         newdir = os.path.join(self.tmp, "a b.c")
         os.mkdir(newdir)
         self.assertEqual(self.script("open-dir", newdir, self.client).returncode, 0)
-        self.wait(lambda: self.on("#{session_name}|#{session_path}"), f"a-b-c|{newdir}")
+        # (its symlinks resolved: the temp dir is under /var -> /private/var)
+        self.wait(lambda: self.on("#{session_name}|#{session_path}"), f"a-b-c|{os.path.realpath(newdir)}")
         self.wait(lambda: self.t("show", "-t", "a-b-c", "-qv", "@space_index"), "4")
         self.wait(lambda: self.t("list-windows", "-t", "a-b-c", "-F", "#{@space_home}"), "1")  # one window: home
         self.script("open-dir", self.proj, self.client)
@@ -1464,7 +1494,7 @@ class Spaces(Server):
             d = os.path.join(self.tmp, name)
             os.mkdir(d)
             self.script("open-dir", d, self.client)
-            self.wait(lambda: self.on("#{session_name}|#{session_path}"), f"{name}-2|{d}")
+            self.wait(lambda: self.on("#{session_name}|#{session_path}"), f"{name}-2|{os.path.realpath(d)}")
             self.wait(lambda: self.on("#{@space_hidden}|#{?#{@space_index},n,}"), "|n")
         names = self.t("list-sessions", "-F", "#{session_name}").split()
         self.assertNotIn("stash", names)
@@ -1677,7 +1707,7 @@ class Spaces(Server):
         self.wait(lambda: self.on("#{session_name}"), "agents")
         here = self.on()
         windows = self.t("list-windows", "-t", "agents", "-F", "#{window_id}")
-        for k in (("C-b", "M-1"), ("M-l",), ("M-h",), ("M-`",), ("M-m",)):
+        for k in (("M-l",), ("M-h",), ("M-`",), ("M-m",)):
             self.key(*k)
         time.sleep(0.5)
         self.assertEqual(self.on(), here)
@@ -1689,7 +1719,7 @@ class Spaces(Server):
         self.wait(lambda: self.t("show", "-t", "stash", "-qv", "@space_hidden"), "1")
         self.t("set", "-w", "-t", "stash:", "@agent_state", "idle")   # agent only: toggle would add a shell
         before = self.t("list-windows", "-t", "stash", "-F", "#{window_id}")
-        for args in (["toggle", sid], ["agent", "1", sid], ["shell", "1", sid], ["next", sid]):
+        for args in (["toggle", sid], ["shell", "1", sid], ["next", sid]):
             r = self.script(*args, self.client)
             self.assertNotEqual(r.returncode, 0, args)
         self.assertEqual(self.t("list-windows", "-t", "stash", "-F", "#{window_id}"), before)
@@ -1708,7 +1738,7 @@ class Spaces(Server):
         run("sel-start", "here", self.M2)                          # = prefix v
         self.wait(lambda: " W1C2W3W4W5RIGHT" in self.status()[1], True)   # every window, agents too
         self.assertNotIn("[+]", self.status()[1])
-        self.assertTrue(self.status()[1].startswith("█⌃1 main\ue0b0"))   # this space's tab stays (on M2: no home mark)
+        self.assertTrue(self.status()[1].startswith("█⌘1 main\ue0b0"))   # this space's tab stays (on M2: no home mark)
         self.assertEqual(self.status()[0].count("bg=#cba6f7"), 1)   # (fg=: proj's colour)
         self.assertIn("range=window|2", self.status()[0])
         run("sel-move", "right", self.M2)                          # = l
@@ -1734,10 +1764,10 @@ class Spaces(Server):
         Z = self.new_window("zed", "needs-input")                 # zed now needs you
         self.t("select-window", "-t", Z)                          # ...and it is zed's current window
         ZH = self.homes("zed")[0]
-        self.wait(lambda: "⌃3●" in self.status()[1], True)
+        self.wait(lambda: "⌘3●" in self.status()[1], True)
         _, text = self.status()
         time.sleep(0.6)   # past double-click-time, so this is a fresh single click
-        self.click(text.index("⌃3●"), ROWS - 1)
+        self.click(text.index("⌘3●"), ROWS - 1)
         self.wait(self.on, f"zed:{ZH}")                           # an alert: that space's HOME
 
     def test_clicking_a_shell_tab_selects_it_and_the_chip_goes_home(self):
@@ -1749,15 +1779,577 @@ class Spaces(Server):
         _, text = self.status()
         self.assertNotIn("󰋜", text)
         time.sleep(0.6)
-        self.click(text.index("⌃1") + 1, ROWS - 1)                # this space's chip: home
+        self.click(text.index("⌘1") + 1, ROWS - 1)                # this space's chip: home
         self.wait(self.on, f"main:{self.M1}")
         self.t("switch-client", "-c", self.client, "-t", "proj")
         self.t("select-window", "-t", self.P2)                    # proj's current: an agent
         self.wait(self.on, f"proj:{self.P2}")
         _, text = self.status()
         time.sleep(0.6)
-        self.click(text.index("⌃2") + 1, ROWS - 1)                # proj's own chip, from P2: home
+        self.click(text.index("⌘2") + 1, ROWS - 1)                # proj's own chip, from P2: home
         self.wait(self.on, f"proj:{self.P1}")
+
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+@unittest.skipUnless(TMUX, "tmux not installed")
+class Create(Server):
+    """The pickers' ^N (space.sh create, new-hint, enter-key, new-key) and
+    pending spaces (ask-claude, pending-open/-go, adopt-pending). HOME is a
+    temp dir, for the script and in the server's global environment (popups,
+    run-shell jobs, new shells), so ~/code/projects is never the real one;
+    zoxide is a stub that logs; new windows run a recorder, never zsh or
+    claude; @space_catalog_sync is off (Server)."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = os.path.join(self.home_dir, "home")
+        self.projects = os.path.join(self.home, "code", "projects")
+        os.makedirs(os.path.join(self.projects, "cs35l"))
+        os.symlink(self.projects, os.path.join(self.home, "projects"))   # as on Mack's machine
+        self.bin = os.path.join(self.tmp, "bin")
+        os.mkdir(self.bin)
+        self.zlog = os.path.join(self.tmp, "zoxide.log")
+        self.zlist = os.path.join(self.tmp, "zoxide.list")
+        z = Path(self.bin, "zoxide")
+        z.write_text(f'#!/bin/sh\nif [ "$1" = query ]; then cat "{self.zlist}" 2>/dev/null; else echo "$*" >> "{self.zlog}"; fi\n')
+        z.chmod(0o755)
+        self.t("set-environment", "-g", "HOME", self.home)
+        self.t("set-environment", "-g", "PATH", self.bin + os.pathsep + self.env["PATH"])   # the stub zoxide
+        self.t("set-environment", "-g", "_ZO_DATA_DIR", self.tmp)
+        self.t("set", "-g", "default-shell", "/bin/sh")
+        self.t("set", "-g", "default-command",
+               f'echo "${{ZSH_AUTOSTART:-none}}" > {self.tmp}/autostart.$TMUX_PANE; exec sleep 600')
+        self.new_session("zed", "/usr")
+        self.wait_home("zed")
+        self.attach()
+
+    def run_sh(self, *args, cwd=None, **env):
+        e = dict(self.script_env(), HOME=self.home, PATH=self.bin + os.pathsep + self.env["PATH"], **env)
+        return subprocess.run(["bash", str(SCRIPT), *args], env=e, cwd=cwd or self.home, capture_output=True,
+                              text=True, timeout=30)
+
+    def hint(self, q, mode="space", cat="on", matches="0", cwd=None, row=""):
+        r = self.run_sh("new-hint", mode, cat, q, row, cwd=cwd, FZF_MATCH_COUNT=matches)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def said(self):
+        log = os.path.join(self.env["XDG_STATE_HOME"], "tmux-notify", "log")
+        return [l.split("\t")[1:] for l in Path(log).read_text().splitlines()] if os.path.exists(log) else []
+
+    def autostart(self, wid):
+        pane = self.t("display", "-t", wid, "-p", "#{pane_id}")
+        f = os.path.join(self.tmp, "autostart." + pane)
+        self.wait(lambda: os.path.exists(f) and Path(f).read_text().strip() != "", True)
+        return Path(f).read_text().strip()
+
+    def registry_names(self):
+        try:
+            return [l.split("\t")[0] for l in Path(self.registry).read_text().splitlines()]
+        except FileNotFoundError:
+            return []
+
+    def sopt(self, session, opt):
+        rows = self.t("list-sessions", "-F", "#{session_name}|#{" + opt + "}").splitlines()
+        return next((r.split("|", 1)[1] for r in rows if r.split("|", 1)[0] == session), None)
+
+    def index_of(self, session):
+        return self.sopt(session, "@space_index")
+
+    # -- the header ------------------------------------------------------------
+    def test_new_hint_says_in_words_what_ctrl_n_will_do(self):
+        plain = lambda q, **kw: ANSI.sub("", self.hint(q, **kw)).splitlines()
+        os.makedirs(os.path.join(self.projects, "Foo"))
+        cases = {
+            "newapp": "^N Create a new project newapp in ~/code/projects · git init",
+            "My App": "^N Create a new project My-App in ~/code/projects · git init",
+            "cs35l/assign4": "^N New folder assign4 inside cs35l (~/code/projects/cs35l) → space cs35l-assign4",
+            "~/code/tool": "^N New folder tool in ~/code",
+            "owner/repo": "^N Can't create: ~/code/projects/owner/repo — parent ~/code/projects/owner doesn't exist",
+            "gh:owner/repo": "^N Clone gh:owner/repo into ~/code/projects/repo",
+            "github.com/me/dots": "^N Clone github.com/me/dots into ~/code/projects/dots",
+            "https://example.com/a/thing.git": "^N Clone https://example.com/a/thing.git into ~/code/projects/thing",
+            "git@github.com:me/dots.git": "^N Clone git@github.com:me/dots.git into ~/code/projects/dots",
+            "foo": "^N Open ~/code/projects/Foo (exists) as a new space Foo",      # APFS: any case
+            "nope/x/y": "^N Can't create: ~/code/projects/nope/x/y — parent ~/code/projects/nope/x doesn't exist",
+            ".hidden": "^N Can't create: a name can't start with '.': .hidden",
+            "-x": "^N Can't create: a name can't start with '-': -x",
+            "a..b": "^N Can't create: a name can't contain '..': a..b",
+            "!!!": "^N Can't create: no usable name in '!!!'",
+            "x" * 65: "^N Can't create: a name is at most 64 characters: " + "x" * 65,
+            "make me a todo app": "^N Ask Claude (a claude in a popup, holding the next space number)"
+                                  " · ⌥⏎ folder make-me-a-todo-app",
+        }
+        for q, want in cases.items():
+            self.assertEqual(plain(q)[1], want, q)
+        # A bare a/b under an existing project is a folder there, never a clone.
+        self.assertEqual(plain("cs35l/notes")[1].split()[1], "New")
+        # Line 1 is enter: nothing to open keeps the popup, a match opens it.
+        self.assertEqual(plain("zzz")[0], "⏎ no such folder · ^N creates it")
+        self.assertEqual(plain("zzz", matches="2")[0], "⏎ open the highlighted folder")
+        self.assertEqual(plain("~/code/projects/cs35l")[0], "⏎ Open ~/code/projects/cs35l")
+        self.assertEqual(plain("set up a rust cli")[0], "⏎ Ask Claude: set up a rust cli")
+        # A sentence beats fuzzy matches, unless the highlighted row IS its slug.
+        self.assertEqual(plain("make me a todo app", matches="2", row="~/code/projects/todo")[0],
+                         "⏎ Ask Claude: make me a todo app")
+        self.assertEqual(plain("make me a todo app", matches="1", row="~/x/make-me-a-todo-app")[0],
+                         "⏎ open the highlighted folder")
+        self.assertEqual(plain("zzz", mode="agent")[1], "^N Create a new project zzz in ~/code/projects · git init"
+                         " · then a new claude tab there")
+        # Colour: the verb bold and green, the name bold, the place dim.
+        raw = self.hint("newapp").splitlines()[1]
+        self.assertIn("\x1b[1;38;2;166;227;161mCreate\x1b[0m", raw)
+        self.assertIn("\x1b[1mnewapp\x1b[0m", raw)
+        self.assertIn("\x1b[1;38;2;243;139;168mCan't create", self.hint("nope/x/y"))
+        # "sync catalog" only when the catalog's repo is there and the option is on.
+        repo = os.path.join(self.projects, "mackhaymond.co")
+        os.makedirs(repo)
+        Path(repo, "package.json").write_text("{}")
+        self.assertTrue(plain("newapp")[1].endswith("· git init · sync catalog"))
+        self.assertTrue(plain("gh:owner/repo")[1].endswith("· sync catalog"))
+        self.assertFalse(plain("newapp", cat="off")[1].endswith("sync catalog"))
+        self.assertFalse(plain("cs35l/assign4")[1].endswith("sync catalog"))      # not a direct child
+        # A folder that already has a space: its name.
+        self.assertEqual(plain("/usr")[1], "^N Open space zed (/usr exists)")
+        self.assertEqual(plain("~")[1], "^N Open space main (~ exists)")
+
+    def test_is_english_heuristic(self):
+        table = {
+            # requests
+            "make me a todo app": True, "clone my dotfiles": True, "set up a rust cli": True,
+            "make foo": True, "set up foo": True, "spin up a server": True, "build me a cli": True,
+            "start a new blog": True, "new rust cli": True, "rust cli with clap": True, "My Cool App Idea": True,
+            # names: two-word nouns, a non-verb start, one word, paths, URLs
+            "set theory": False, "build tools": False, "new project": False, "start page": False,
+            "data structures notes": False, "add ons": False, "set up": False, "my project": False,
+            "foo": False, "owner/repo": False, "cs35l/assign4": False,
+            "~/code/a b c d": False, "./x y z w": False, "https://x.com/a b c d": False, "": False, "   ": False,
+        }
+        for q, want in table.items():
+            self.assertEqual(self.run_sh("is-english", q).returncode == 0, want, q)
+
+    def test_enter_never_creates_and_ctrl_n_does(self):
+        def key(which, q, matches="0", mode="space", row=""):
+            r = self.run_sh(which, mode, self.client, q, row, FZF_MATCH_COUNT=matches)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout.strip()
+        ask = f"become:bash {SCRIPT} ask-claude {self.client} {{q}} >&2"
+        self.assertEqual(key("enter-key", "zzz", matches="1"), "accept")              # a row: open it
+        self.assertEqual(key("enter-key", "zzz"), "")                                   # nothing: stay
+        self.assertEqual(key("enter-key", "~/code"), "accept")                          # a typed folder
+        self.assertEqual(key("enter-key", "make a new app"), ask)
+        # A sentence wins over fuzzy matches, unless the row is exactly its slug
+        # (⌥N rows are ~-paths; pick-tab rows "KEY<TAB>label").
+        self.assertEqual(key("enter-key", "make a new app", matches="3", row="~/code/projects/app"), ask)
+        self.assertEqual(key("enter-key", "make a new app", matches="1", row="~/code/make-a-new-app"), "accept")
+        self.assertEqual(key("enter-key", "make a new app", matches="1",
+                             row="d:/x/make-a-new-app\t~/x/make-a-new-app"), "accept")
+        self.assertEqual(key("enter-key", "make a new app", matches="1",
+                             row="s:4\t⌘4  make-a-new-app  ~/q"), "accept")
+        self.assertEqual(key("new-key", "zzz", mode="agent"),
+                         f"become:bash {SCRIPT} create {{q}} {self.client} agent >&2")
+        self.assertEqual(key("new-key", "nope/x/y"), "")                                # refused: stay
+        self.assertEqual(key("new-key", "make a new app"), ask)
+        # ⌥⏎: a folder named after the text, sentence or not.
+        self.assertEqual(key("alt-key", "data structures notes extra"),
+                         f"become:bash {SCRIPT} create --name {{q}} {self.client} space >&2")
+        self.assertEqual(key("alt-key", "!!!"), "")
+        self.assertFalse(os.path.exists(os.path.join(self.projects, "zzz")))
+
+    def test_alt_enter_makes_a_folder_from_a_sentence(self):
+        r = self.run_sh("create", "--name", "make me a todo app", self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = os.path.join(self.projects, "make-me-a-todo-app")
+        self.wait(lambda: self.on("#{session_name}|#{session_path}"), f"make-me-a-todo-app|{d}")
+        self.assertTrue(os.path.isdir(os.path.join(d, ".git")))
+        # --name never clones or follows a path.
+        r = self.run_sh("create", "--name", "gh:a/b", self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isdir(os.path.join(self.projects, "ghab")))
+
+    @unittest.skipUnless(shutil.which("fzf"), "fzf not installed")
+    def test_option_n_popup_enter_stays_ctrl_n_creates(self):
+        self.key("M-n")                                                                # ⌥N
+        time.sleep(1.0)                                                                # fzf up
+        os.write(self.fd, b"e2eproj")
+        time.sleep(0.6)
+        os.write(self.fd, b"\r")                                                       # nothing matches: stays
+        time.sleep(0.8)
+        self.assertEqual(self.on("#{session_name}"), "main")
+        self.assertFalse(os.path.exists(os.path.join(self.projects, "e2eproj")))
+        os.write(self.fd, b"\x0e")                                                     # ^N
+        self.wait(lambda: self.on("#{session_name}"), "e2eproj", timeout=8)
+        self.assertTrue(os.path.isdir(os.path.join(self.projects, "e2eproj", ".git")))
+
+    @unittest.skipUnless(shutil.which("fzf"), "fzf not installed")
+    def test_a_sentence_in_the_popup_opens_a_pending_claude_in_a_new_popup(self):
+        self.key("C-b", "C-t")                                                         # ⌘⇧T: the same
+        time.sleep(1.0)
+        os.write(self.fd, b"make me a todo app")
+        time.sleep(0.6)
+        os.write(self.fd, b"\r")
+        self.wait(lambda: len(self.nested()), 1, timeout=8)                           # the claude popup
+        wid = self.t("list-windows", "-t", "=pending", "-F", "#{window_id}")
+        self.assertEqual(self.wopt(wid, "@pending_request"), "make me a todo app")
+        self.assertTrue(self.autostart(wid).startswith("claude "))                     # the recorder, not claude
+        self.t("send-keys", "-K", "-c", self.nested()[0], "M-n")
+        self.wait(lambda: self.nested(), [], timeout=6)
+        self.assertEqual(self.on("#{session_name}"), "main")
+
+    # -- create -------------------------------------------------------------------
+    def test_create_a_project_git_inits_adds_zoxide_and_opens_its_space(self):
+        r = self.run_sh("create", "My App", self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = os.path.join(self.projects, "My-App")
+        self.wait(lambda: self.on("#{session_name}|#{session_path}"), f"My-App|{d}")
+        self.assertEqual(os.listdir(d), [".git"])                                       # no README, no stubs
+        git = lambda *a: subprocess.run(["git", "-C", d, *a], capture_output=True, text=True)
+        self.assertEqual(git("symbolic-ref", "HEAD").stdout.strip(), "refs/heads/main")
+        self.assertNotEqual(git("rev-parse", "--verify", "HEAD").returncode, 0)         # no commit
+        self.assertEqual(Path(self.zlog).read_text().split(), ["add", "--", d])
+        self.wait(lambda: self.index_of("My-App"), "3")
+
+    def test_create_a_folder_inside_a_project_names_its_space_parent_basename(self):
+        r = self.run_sh("create", "cs35l/assign4", self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = os.path.join(self.projects, "cs35l", "assign4")
+        self.wait(lambda: self.on("#{session_name}|#{session_path}"), f"cs35l-assign4|{d}")
+        self.assertEqual(os.listdir(d), [])                                             # not a project: no git
+        # . is the popup's folder (the tab's).
+        r = self.run_sh("create", "./notes", self.client, cwd=d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait(lambda: self.on("#{session_name}"), "assign4-notes")
+        # Opening an existing nested folder names it the same way.
+        os.makedirs(os.path.join(self.projects, "cs35l", "assign5"))
+        self.run_sh("open-dir", os.path.join(self.projects, "cs35l", "assign5"), self.client)
+        self.wait(lambda: self.on("#{session_name}"), "cs35l-assign5")
+
+    def test_create_refuses_a_missing_parent_and_bad_names(self):
+        here = self.on()
+        for q in ("nope/x/y", ".hidden", "a..b", "-x", "!!!", "y" * 65, "~bob/x"):
+            r = self.run_sh("create", q, self.client)
+            self.assertNotEqual(r.returncode, 0, q)
+        self.assertEqual(sorted(os.listdir(self.projects)), ["cs35l"])
+        self.assertFalse(os.path.exists(os.path.join(self.projects, "nope")))
+        self.assertEqual(self.on(), here)
+        self.wait(lambda: any(k == "warn" and "can't create" in t for k, _, t, *x in self.said()), True)
+        self.assertFalse(os.path.exists(self.zlog))
+
+    def test_create_on_an_existing_folder_just_opens_it(self):
+        d = os.path.join(self.projects, "Foo")
+        os.makedirs(d)
+        r = self.run_sh("create", "foo", self.client)                                  # another case
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait(lambda: self.on("#{session_name}|#{session_path}"), f"Foo|{d}")
+        self.assertEqual(os.listdir(d), [])                                             # no git init
+        self.assertFalse(os.path.exists(self.zlog))                                     # nothing new
+        self.run_sh("create", "Foo", self.client)
+        self.assertEqual(self.t("list-sessions", "-F", "#{session_path}").split().count(d), 1)
+
+    def test_create_clones_a_url_and_a_failed_clone_leaves_nothing(self):
+        src = os.path.join(self.tmp, "src")
+        g = lambda *a, cwd=src: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd,
+                                                capture_output=True, text=True, env=dict(self.env, HOME=self.home))
+        os.mkdir(src)
+        g("init", "-q", "-b", "main")
+        Path(src, "README").write_text("hi\n")
+        g("add", "README")
+        g("commit", "-q", "-m", "one")
+        bare = os.path.join(self.tmp, "remote.git")
+        g("clone", "-q", "--bare", src, bare, cwd=self.tmp)
+        r = self.run_sh("create", "file://" + bare, self.client, GIT_CONFIG_NOSYSTEM="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = os.path.join(self.projects, "remote")
+        self.wait(lambda: self.on("#{session_name}|#{session_path}"), f"remote|{d}")
+        self.assertEqual(Path(d, "README").read_text(), "hi\n")
+        self.assertEqual(Path(self.zlog).read_text().split(), ["add", "--", d])
+        r = self.run_sh("create", "file://" + os.path.join(self.tmp, "missing.git"), self.client)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.projects, "missing")))
+        # git's own reason (its fatal: line), and no temp folder left behind.
+        self.wait(lambda: any(k == "error" and "clone of" in t and "fatal:" in t
+                              for k, _, t, *x in self.said()), True)
+        self.assertEqual(sorted(os.listdir(self.projects)), ["cs35l", "remote"])
+        # A clone whose target appeared meanwhile never replaces or deletes it:
+        # the existing folder is opened.
+        Path(d, "mine").write_text("keep\n")
+        r = self.run_sh("create", "file://" + bare, self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(Path(d, "mine").read_text(), "keep\n")
+        self.assertEqual(sorted(os.listdir(self.projects)), ["cs35l", "remote"])
+
+    def test_create_from_pick_tab_opens_the_tab_there(self):
+        r = self.run_sh("create", "tabproj", self.client, "agent")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait(lambda: self.on("#{session_name}"), "tabproj")
+        rows = self.t("list-windows", "-t", "=tabproj", "-F", "#{window_id}|#{?#{@agent_state},a,s}|#{@space_home}")
+        wins = [r.split("|") for r in rows.splitlines()]
+        self.assertEqual([(k, h) for _, k, h in wins], [("s", "1"), ("a", "")])          # home + the claude tab
+        self.assertEqual(self.autostart(wins[1][0]), "claude")
+        self.assertEqual(self.on("#{window_id}"), wins[1][0])
+
+    def test_projects_symlink_is_one_folder(self):
+        x = os.path.join(self.projects, "x")
+        os.mkdir(x)
+        via = os.path.join(self.home, "projects", "x")
+        self.run_sh("open-dir", via, self.client)
+        self.wait(lambda: self.on("#{session_name}|#{session_path}"), f"x|{x}")
+        sessions = self.t("list-sessions", "-F", "#{session_id}")
+        self.run_sh("open-dir", x, self.client)
+        self.run_sh("new-tab", "shell", via, self.client)
+        self.assertEqual(self.t("list-sessions", "-F", "#{session_id}"), sessions)       # reused, never x-2
+        # The pickers' candidates: one row however zoxide spells it.
+        Path(self.zlist).write_text(f"{via}\n{x}\n{self.home}/projects\n{self.projects}\n")
+        r = self.run_sh("candidates", x)
+        self.assertEqual(r.stdout.split(), [x, self.projects])
+
+    def test_catalog_sync_never_runs_with_the_option_off(self):
+        repo = os.path.join(self.projects, "mackhaymond.co")
+        os.makedirs(repo)
+        marker = os.path.join(self.tmp, "catalog-ran")
+        Path(repo, "package.json").write_text(
+            '{"name": "fake", "private": true, "scripts": {"catalog:sync": "echo ran > %s"}}' % marker)
+        state = os.path.join(self.env["XDG_STATE_HOME"], "tmux-spaces")
+        self.assertEqual(self.run_sh("create", "offproj", self.client).returncode, 0)
+        time.sleep(1.0)
+        self.assertFalse(os.path.exists(marker))
+        self.assertFalse(os.path.exists(os.path.join(state, "catalog-sync.log")))
+        if not shutil.which("npm"):
+            return
+        # On: one background run, in the (fake) catalog repo, logged.
+        self.t("set", "-g", "@space_catalog_sync", "on")
+        self.assertEqual(self.run_sh("create", "onproj", self.client).returncode, 0)
+        self.wait(lambda: os.path.exists(marker), True, timeout=20)
+        self.wait(lambda: os.path.exists(os.path.join(state, "catalog-sync.lock")), False, timeout=10)
+        self.assertIn("catalog:sync", Path(state, "catalog-sync.log").read_text())
+        # A lock whose owner is alive: the run is left to it (the mark stays);
+        # one whose owner is dead is taken over.
+        os.remove(marker)
+        lock = os.path.join(state, "catalog-sync.lock")
+        os.mkdir(lock)
+        Path(lock, "pid").write_text(f"{os.getpid()}\n")
+        r = self.run_sh("catalog-sync", self.client, repo)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(marker))
+        self.assertTrue(os.path.exists(os.path.join(state, "catalog-sync.pending")))
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        Path(lock, "pid").write_text(f"{dead.pid}\n")
+        r = self.run_sh("catalog-sync", self.client, repo)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.exists(marker))
+        self.assertFalse(os.path.exists(lock))
+
+    # -- pending spaces ---------------------------------------------------------------
+    def ask(self, text="make me a todo app"):
+        r = self.run_sh("ask-claude", "--no-popup", self.client, text)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        wid = r.stdout.strip()
+        self.assertRegex(wid, r"^@\d+$")
+        return wid
+
+    def wopt(self, wid, opt):
+        return self.t("display", "-t", wid, "-p", "#{" + opt + "}")
+
+    def open_popup(self, wid):
+        """pending-open for real: display-popup waits until its popup closes,
+        so it runs in the background (killed at teardown if still up)."""
+        e = dict(self.script_env(), HOME=self.home, PATH=self.bin + os.pathsep + self.env["PATH"])
+        p = subprocess.Popen(["bash", str(SCRIPT), "pending-open", wid, self.client], env=e, cwd=self.home,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        self.wait(lambda: len(self.nested()), 1, timeout=6)
+        return p
+
+    def nested(self):
+        """Clients attached to the pending session (a pending popup's)."""
+        rows = self.t("list-clients", "-F", "#{client_name}|#{session_name}").splitlines()
+        return [r.split("|")[0] for r in rows if r.split("|")[1] == "pending"]
+
+    def test_ask_claude_holds_the_next_space_number(self):
+        wid = self.ask()
+        self.assertEqual(self.wopt(wid, "session_name"), "pending")
+        self.wait(lambda: self.sopt("pending", "@space_hidden"), "1")
+        self.assertEqual(self.wopt(wid, "@agent_state"), "idle")                      # an agent from birth
+        self.assertEqual(self.wopt(wid, "@pending_request"), "make me a todo app")
+        self.assertEqual(self.wopt(wid, "@pending_client"), self.client)
+        self.wait(lambda: self.wopt(wid, "@pending_space"), "3")                       # main 1, zed 2
+        self.assertRegex(self.wopt(wid, "@pending_color"), r"^#[0-9a-f]{6}$")
+        self.assertIn(f"pending:{wid}", self.registry_names())
+        self.assertEqual(self.wopt(wid, "pane_current_path"), os.path.realpath(self.home))
+        auto = self.autostart(wid)
+        self.assertTrue(auto.startswith('claude "$(bash '), auto)                      # claude, never run here
+        self.assertIn("pending-prompt", auto)
+        pane = self.wopt(wid, "pane_id")
+        prompt = self.run_sh("pending-prompt", pane).stdout
+        self.assertIn("«make me a todo app»", prompt)
+        self.assertIn(f"space.sh adopt-pending {wid} <dir>", prompt)
+        self.assertIn(f"as space 3", prompt)
+        self.assertIn(self.client, prompt)
+        # A space made meanwhile goes after it.
+        other = os.path.join(self.home_dir, "other")
+        os.mkdir(other)
+        self.run_sh("open-dir", other, self.client)
+        self.wait(lambda: self.index_of("other"), "4")
+        self.assertEqual(self.wopt(wid, "@pending_space"), "3")
+
+    def test_pending_popup_argv_and_hiding_it_keeps_claude(self):
+        wid = self.ask()
+        self.wait(lambda: self.wopt(wid, "@pending_space"), "3")
+        r = self.run_sh("pending-open", "--print", wid, self.client)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = r.stdout.splitlines()
+        self.assertEqual(argv[:9], ["display-popup", "-c", self.client, "-E", "-w", "70%", "-h", "60%", "-x"])
+        self.assertEqual(argv[9], "#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}")
+        self.assertEqual(argv[10:13], ["-d", self.home, "-T"])
+        self.assertIn("space 3", argv[13])
+        self.assertEqual(argv[14], f"bash {SCRIPT} popup-attach {wid} {self.client} {self.path}")
+        self.assertEqual(self.nested(), [])
+        # Open for real: a second client, on that window, a known viewer;
+        # Option-N in it detaches.
+        popup = self.open_popup(wid)
+        inner = self.nested()[0]
+        self.wait(lambda: self.t("list-clients", "-F", "#{client_name}|#{window_id}").count(f"{inner}|{wid}"), 1)
+        self.assertEqual(self.t("show", "-gqv", "@pending_viewers"), f"{inner}>{self.client}")   # (padded with spaces)
+        self.t("send-keys", "-K", "-c", inner, "M-n")
+        self.wait(lambda: self.nested(), [], timeout=6)
+        self.wait(lambda: popup.poll() is not None, True)                             # the popup closed
+        self.wait(lambda: self.t("show", "-gqv", "@pending_viewers"), "")
+        self.assertEqual(self.wopt(wid, "window_id"), wid)                            # claude still there
+        self.assertEqual(self.wopt(wid, "@pending_space"), "3")
+        self.assertIn(f"pending:{wid}", self.registry_names())
+
+    def test_leaving_pending_from_inside_the_popup_takes_the_outer_client(self):
+        wid = self.ask()
+        self.wait(lambda: self.wopt(wid, "@pending_space"), "3")
+        popup = self.open_popup(wid)
+        inner = self.nested()[0]
+        # ⌥W x / ⌘N inside the popup: the nested client switches away...
+        self.t("switch-client", "-c", inner, "-t", "zed")
+        # ...so the popup closes and the real client goes there instead.
+        self.wait(lambda: popup.poll() is not None, True, timeout=6)
+        self.wait(lambda: self.on("#{session_name}"), "zed")
+        self.assertEqual(self.wopt(wid, "@pending_space"), "3")                      # claude still pending
+
+    def test_option_n_never_detaches_a_real_client_in_pending(self):
+        wid = self.ask()
+        self.t("switch-client", "-c", self.client, "-t", wid)
+        self.wait(lambda: self.on("#{session_name}"), "pending")
+        self.key("M-n")                                                                # the picker, not a detach
+        time.sleep(0.8)
+        self.assertIn(self.client, self.t("list-clients", "-F", "#{client_name}").split())
+        os.write(self.fd, b"\x1b")                                                     # close the picker
+
+    def test_a_pinned_pending_claude_opens_by_its_pin_digit(self):
+        wid = self.ask()
+        self.wait(lambda: self.wopt(wid, "@pending_space"), "3")
+        self.t("set", "-w", "-t", wid, "@agent_pinned", "1")
+        self.t("set", "-w", "-t", wid, "@pin_key", "1")
+        self.key("M-w", "1")                                                           # ⌥W 1
+        self.wait(lambda: len(self.nested()), 1, timeout=6)
+        self.assertEqual(self.on("#{session_name}"), "main")
+        self.assertNotIn(["warn", self.client, "no pin 1"], self.said())
+
+    def test_needs_you_jump_opens_a_pending_claude_in_its_popup(self):
+        wid = self.ask()
+        self.wait(lambda: self.wopt(wid, "@pending_space"), "3")
+        self.t("set", "-w", "-t", wid, "@agent_state", "needs-input")
+        jump = HERE / "scripts" / "executable_agent-jump.sh"
+        run = lambda *a: subprocess.run(["bash", str(jump), *a], env=dict(self.script_env(), HOME=self.home),
+                                        capture_output=True, text=True, timeout=20)
+        self.assertIn(wid, run("list").stdout)                                         # still in NEEDS YOU
+        self.assertEqual(run("next", self.client).returncode, 0)
+        self.wait(lambda: len(self.nested()), 1, timeout=6)
+        self.assertEqual(self.on("#{session_name}"), "main")                          # never INTO pending
+        self.t("send-keys", "-K", "-c", self.nested()[0], "M-n")
+        self.wait(lambda: self.t("show", "-gqv", "@pending_viewers"), "")
+        self.assertEqual(run("goto", self.client, wid).returncode, 0)
+        self.wait(lambda: len(self.nested()), 1, timeout=6)
+        self.assertEqual(self.on("#{session_name}"), "main")
+
+    def test_a_trailing_semicolon_in_a_request_is_kept(self):
+        wid = self.ask("make me a todo app;")
+        self.assertEqual(self.wopt(wid, "@pending_request"), "make me a todo app;")
+
+    def test_a_popup_that_cannot_open_says_where_claude_is(self):
+        wid = self.ask()
+        self.wait(lambda: self.wopt(wid, "@pending_space"), "3")
+        r = self.run_sh("pending-popup", wid, "/dev/no-such-client", "")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("claude is working on space 3 — ⌘3 to open", [t for k, c, t, *x in self.said()])
+
+    def test_cmd_n_on_a_pending_number_reopens_its_popup(self):
+        wid = self.ask()
+        self.wait(lambda: self.wopt(wid, "@pending_space"), "3")
+        self.key("C-b", "3")                                                           # ⌘3
+        self.wait(lambda: len(self.nested()), 1, timeout=6)
+        self.t("send-keys", "-K", "-c", self.nested()[0], "M-n")
+        self.wait(lambda: self.nested(), [], timeout=6)
+        self.wait(lambda: self.t("show", "-gqv", "@pending_viewers"), "")              # popup gone
+        self.key("C-b", "8")                                                           # nothing there
+        self.wait(lambda: ["warn", self.client, "no space 8"] in self.said(), True)
+        # Its ⌥W letter (the sidebar gives it one) opens the popup as well.
+        self.t("set", "-w", "-t", wid, "@agent_key", "q")
+        self.key("M-w", "q")
+        self.wait(lambda: len(self.nested()), 1, timeout=6)
+        self.assertEqual(self.on("#{session_name}"), "main")                          # the client stays put
+
+    def test_adopt_pending_lands_the_space_at_its_number_and_moves_claude(self):
+        wid = self.ask()
+        self.wait(lambda: self.wopt(wid, "@pending_space"), "3")
+        other = os.path.join(self.home_dir, "other")
+        os.mkdir(other)
+        self.run_sh("open-dir", other, self.client)
+        self.wait(lambda: self.index_of("other"), "4")
+        here = self.on()
+        d = os.path.join(self.projects, "todo")
+        os.mkdir(d)
+        r = self.run_sh("adopt-pending", wid, d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), f"space 3: todo ({d})")
+        self.wait(lambda: self.index_of("todo"), "3")
+        self.assertEqual(self.index_of("other"), "4")
+        self.assertEqual(self.wopt(wid, "session_name"), "todo")
+        self.assertEqual(self.wopt(wid, "@pending_space") + self.wopt(wid, "@pending_request"), "")
+        rows = self.t("list-windows", "-t", "=todo", "-F", "#{window_id}|#{@space_home}")
+        wins = [r.split("|") for r in rows.splitlines()]
+        self.assertEqual([h for _, h in wins], ["1", ""])                              # home, then claude
+        self.assertEqual(wins[1][0], wid)
+        self.assertNotIn(f"pending:{wid}", self.registry_names())
+        self.assertEqual(self.registry_names().index("todo"), self.registry_names().index("other") - 1)
+        self.assertEqual(self.on(), here)                                              # no popup: no switch
+        self.wait(lambda: ["ok", self.client, "space 3 ready: todo"] in self.said(), True)
+        self.assertNotEqual(self.run_sh("adopt-pending", wid, d).returncode, 0)        # not pending any more
+
+    def test_adopt_pending_with_its_popup_open_takes_the_client_there(self):
+        wid = self.ask()
+        self.wait(lambda: self.wopt(wid, "@pending_space"), "3")
+        self.open_popup(wid)
+        d = os.path.join(self.projects, "seen")
+        os.mkdir(d)
+        self.assertEqual(self.run_sh("adopt-pending", wid, d).returncode, 0)
+        self.wait(lambda: self.nested(), [], timeout=6)                                # the popup closed
+        self.wait(lambda: self.on("#{session_name}:#{window_id}"), f"seen:{wid}")
+        # Reusing a space: it keeps its number, the reservation goes.
+        wid2 = self.ask("clone the thing for zed")
+        self.wait(lambda: self.wopt(wid2, "@pending_space"), "4")
+        self.assertEqual(self.run_sh("adopt-pending", wid2, "/usr").returncode, 0)
+        self.assertEqual(self.wopt(wid2, "session_name"), "zed")
+        self.assertEqual(self.index_of("zed"), "2")
+        self.assertNotIn(f"pending:{wid2}", self.registry_names())
+
+    def test_a_claude_that_quits_while_pending_frees_its_number(self):
+        wid = self.ask()
+        self.wait(lambda: self.wopt(wid, "@pending_space"), "3")
+        other = os.path.join(self.home_dir, "other")
+        os.mkdir(other)
+        self.run_sh("open-dir", other, self.client)
+        self.wait(lambda: self.index_of("other"), "4")
+        self.t("kill-window", "-t", wid)                                               # claude quit, shell exited
+        self.wait(lambda: f"pending:{wid}" in self.registry_names(), False)
+        self.wait(lambda: self.index_of("other"), "3")
 
 
 if __name__ == "__main__":

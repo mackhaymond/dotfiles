@@ -180,6 +180,11 @@ pub struct Paused {
     /// `paused_at` as written: which pause this is (the [`Reader`]'s memo).
     pub stamp: String,
     pub targets: Vec<Saved>,
+    /// `glow_dismissed_at` is set (`agent-pause.py dismiss`: the notch's
+    /// "all paused" ring turned off). Only the banner's dim `glow off`
+    /// reads it: never the phase, so the banner stays until resume or void
+    /// (docs/agent-pause.md "Dismiss and void").
+    pub glow_off: bool,
 }
 
 /// The clocks the phase compares with: now, the last wake from sleep and
@@ -295,7 +300,8 @@ pub fn parse_paused(text: &str) -> Option<Paused> {
         .map(|t| Saved { window_id: str_of(t, "window_id"), label: label_of(t), held: str_of(t, "result") == "held", why: held_why(&str_of(t, "detail")) })
         .collect();
     let paused_at = v.get("paused_at").and_then(Value::as_str).and_then(parse_iso);
-    Some(Paused { paused_at, stamp: str_of(&v, "paused_at"), targets })
+    let glow_off = !str_of(&v, "glow_dismissed_at").trim().is_empty();
+    Some(Paused { paused_at, stamp: str_of(&v, "paused_at"), targets, glow_off })
 }
 
 /// Days from 1970-01-01 to a civil date (Howard Hinnant's algorithm).
@@ -370,10 +376,12 @@ pub fn windows(snap: &Snapshot) -> Windows {
     let exists = rows.iter().map(|w| w.id.clone()).collect();
     let server_start = snap.clients.first().and_then(|c| c.status.server_start.trim().parse::<f64>().ok()).filter(|&s| s > 0.0);
     // A hidden session (the stash, `agents`) letters nothing: a parked
-    // window's stale `@agent_key` may name another window by now.
+    // window's stale `@agent_key` may name another window by now. (A
+    // pending space's claude is the exception: listed, lettered.)
     let mut places: HashMap<String, (String, Option<char>)> = HashMap::new();
-    for w in rows.iter().filter(|w| !w.space_hidden).chain(rows.iter().filter(|w| w.space_hidden)) {
-        let letter = (!w.space_hidden).then(|| crate::menu::letters::parse_key(&w.key)).flatten();
+    let seen = |w: &&crate::tmux::Window| !w.space_hidden || w.is_pending();
+    for w in rows.iter().filter(seen).chain(rows.iter().filter(|w| !seen(w))) {
+        let letter = seen(&w).then(|| crate::menu::letters::parse_key(&w.key)).flatten();
         places.entry(w.id.clone()).or_insert((w.session.clone(), letter));
     }
     Windows { working, exists, server_start, places }
@@ -604,6 +612,19 @@ impl Reader {
         }
         phase(progress.as_ref(), paused.as_ref(), clock, win)
     }
+
+    /// The saved set as last read ([`Reader::phase`]) has its glow
+    /// dismissed ([`Paused::glow_off`]).
+    pub fn glow_off(&self) -> bool {
+        self.paused.value.as_ref().is_some_and(|p| p.glow_off)
+    }
+
+    /// Which pause the saved set as last read is: its `paused_at` as
+    /// written ([`Paused::stamp`]); None with no saved set. (The banner's
+    /// void chip is armed on one pause only.)
+    pub fn stamp(&self) -> Option<String> {
+        self.paused.value.as_ref().map(|p| p.stamp.clone())
+    }
 }
 
 #[cfg(test)]
@@ -801,6 +822,46 @@ mod tests {
         let naive = paused("2026-10-19T14:00:00", &[("@1", "One")]);
         assert_eq!(naive.paused_at, None);
         assert_eq!(phase(None, Some(&naive), Clock { now: NOW, wake: Some(AT_S + 1e6), boot: Some(AT_S + 1e6) }, &idle), safe);
+    }
+
+    /// `agent-pause.py dismiss` only turns the notch's ring off
+    /// (`glow_dismissed_at` in paused.json): the banner stays, the phase
+    /// exactly as without it, until the resume or the void removes the
+    /// targets (docs/agent-pause.md "Dismiss and void"). Only `glow_off`
+    /// says so.
+    #[test]
+    fn a_dismissed_glow_keeps_the_banner() {
+        let text = |extra: &str| format!(r#"{{"version":1,"paused_at":"{AT}"{extra},"targets":[{{"window_id":"@1","label":"One"}}],"failed":[]}}"#);
+        let lit = parse_paused(&text("")).unwrap();
+        let dark = parse_paused(&text(r#","glow_dismissed_at":"2026-10-19T15:00:00-07:00""#)).unwrap();
+        assert!(!lit.glow_off && dark.glow_off);
+        assert_eq!(Paused { glow_off: false, ..dark.clone() }, lit);
+        let (idle, busy) = (wins(&[], &["@1"]), wins(&["@1"], &["@1"]));
+        for (c, w) in [(clock(None), &idle), (clock(Some(AT_S + 9.0)), &idle), (clock(None), &busy)] {
+            let got = phase(None, Some(&dark), c, w);
+            assert!(got.is_some(), "{c:?}");
+            assert_eq!(got, phase(None, Some(&lit), c, w), "{c:?}");
+        }
+        // Empty or not a string: not dismissed.
+        assert!(!parse_paused(&text(r#","glow_dismissed_at":"""#)).unwrap().glow_off);
+        assert!(!parse_paused(&text(r#","glow_dismissed_at":null"#)).unwrap().glow_off);
+        // Through the reader: the banner, with `glow off`; voided (the file
+        // gone), nothing.
+        let dir = std::env::temp_dir().join(format!("agent-ui-glow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = Reader::new(dir.clone());
+        r.wake = || None;
+        r.boot_fn = || Some(AT_S - 86_400.0);
+        std::fs::write(dir.join("paused.json"), text(r#","glow_dismissed_at":"2026-10-19T15:00:00-07:00""#)).unwrap();
+        assert_eq!(r.phase(&idle), Some(Phase::Safe { labels: vec!["One".into()] }));
+        assert!(r.glow_off());
+        // Which pause it is (the void chip's arm is tied to it).
+        assert_eq!(r.stamp(), Some(AT.to_string()));
+        std::fs::remove_file(dir.join("paused.json")).unwrap();
+        assert_eq!(r.phase(&idle), None);
+        assert!(!r.glow_off() && r.stamp().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

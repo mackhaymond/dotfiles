@@ -1,6 +1,6 @@
 ---
 name: tmux-workspace
-description: How Mack's tmux workspace is organized (spaces, homes, shells, agents, the letters agents and shells share, the sidebar, parking/stash, NEEDS YOU) and how to find and reach any pane in it. Load whenever the user says things like "agent D", "shell E", "tell S to…", "ask the sidebar agent", "shell 2 in cua-notch", "the home shell", "space 3", "⌃3/⌘4/⌥W e", "park it", "unpark", "it's in needs-you", "the sidebar", or asks you to message, check on, find, or read another agent, tab, or pane, or to say which key to press.
+description: How Mack's tmux workspace is organized (spaces, homes, shells, agents, the letters agents and shells share, the sidebar, parking/stash, NEEDS YOU) and how to find and reach any pane in it. Load whenever the user says things like "agent D", "shell E", "tell S to…", "ask the sidebar agent", "shell 2 in cua-notch", "the home shell", "space 3", "⌘3/⌥W e", "park it", "unpark", "it's in needs-you", "the sidebar", or asks you to message, check on, find, or read another agent, tab, or pane, or to say which key to press.
 ---
 
 # Mack's tmux workspace
@@ -37,26 +37,26 @@ Questions they can answer out loud to fill this in:
 
 ```
 tmux server (default socket)
-├── space  = a tmux session WITHOUT @space_hidden        "space 3", "cua-notch", ⌃3
-│   ├── home    = window @space_home=1 (lowest); the space "home", "the home shell", ⌃3
+├── space  = a tmux session WITHOUT @space_hidden        "space 3", "cua-notch", ⌘3
+│   ├── home    = window @space_home=1 (lowest); the space "home", "the home shell", ⌘3
 │   │            itself (dashboard pane on top, the home shell pane below; no letter)
 │   ├── shells  = every other window WITHOUT @agent_state "shell E" (⌥W e), cua-notch:2
-│   └── agents  = windows WITH @agent_state               "agent D" (⌥W d), ⌘1-9
-└── hidden sessions (@space_hidden=1): agents tasks stash scratch btop-popup
+│   └── agents  = windows WITH @agent_state               "agent D" (⌥W d)
+└── hidden sessions (@space_hidden=1): agents tasks stash scratch btop-popup pending
     (no number, no home, never shown as spaces; `stash` holds parked tabs,
      `agents` holds the pty MCP helper shells)
 ```
 
 - **Space**: a tmux session, numbered by the session option `@space_index`
   (`main` is always 1, the rest follow the registry order) and reached with
-  ⌃N. Coloured by `@space_color`. Usually a project folder (`session_path`);
+  ⌘N. Coloured by `@space_color`. Usually a project folder (`session_path`);
   `main` is `~`. A space lasts until it is deliberately closed (prefix Q).
   Closing all its tabs never closes it, because its home cannot be closed.
   The registry (`~/.local/state/tmux-spaces/spaces.tsv`) recreates spaces
   after a restart.
 - **Home**: every space has exactly one, its lowest window, named `home`.
-  A space IS its home: ⌃N lands there (never on the last-active window;
-  ⌃N for the space you are in goes home), and so does a click on the
+  A space IS its home: ⌘N lands there (never on the last-active window;
+  ⌘N for the space you are in goes home), and so does a click on the
   space's chip in the status line, its header in the sidebar or its row in
   the sidebar's dock. It holds a 9-row dashboard pane on top (name, branch,
   agents with their letters; never focused) and the home shell pane below
@@ -78,14 +78,15 @@ tmux server (default socket)
   `claude`/`codex`/`opencode`, `@agent_summary` = the title the sidebar shows
   (`project/Title`). A shell where someone starts claude, codex or opencode
   becomes an agent.
-  - **Ordinal** (⌘N): position among the agents of ONE space, by
-    `window_index`. It shifts when tabs open or close, so it is good for
-    keys and bad as a name. Name agents by their letter.
+  - **Ordinal**: position among the agents of ONE space, by
+    `window_index`. It shifts when tabs open or close and no key uses it
+    (⌘N is the space key, not "agent N"). Name and reach agents by their
+    letter (⌥W).
 - **Letter** (`@agent_key`): ONE pool for agents and shells, GLOBAL across
   spaces, and kept for the window's life: a shell where claude starts keeps
   its letter as an agent, and an agent that exits back to a shell keeps it.
   The alphabet is handed out home row first: `a s d f g h j k l q w e r t y
-  u i o p z x c v b n m`, in display order (spaces in ⌃N order; in each,
+  u i o p z x c v b n m`, in display order (spaces in ⌘N order; in each,
   its agents by window index, then its shells). Every agent (not parked,
   not in a hidden session) and every non-home shell of a space gets one;
   homes never, parked windows never, and past 26 there are none. Parking
@@ -108,7 +109,7 @@ tmux server (default socket)
   which they mean.
 - **Global vs per-space**: letters (agents' and shells'), NEEDS YOU, the
   parked stash, back/forward history and the sidebar's spaces list are
-  global. Agent ordinals (⌘N), shell ordinals (`<space>:<N>`) and home are
+  global. Agent ordinals, shell ordinals (`<space>:<N>`) and home are
   per space.
 
 ## The sidebar (agent-ui)
@@ -134,7 +135,7 @@ whole UI and the tmux status line is off. Top to bottom:
   shell lifted like his own agent card. With little room, 2+ shells fold
   into one line of pills. In all-spaces scope a space with only shells
   still gets a group;
-- the dock, **SPACES**: one row per space in ⌃N order (`N name`, its agent
+- the dock, **SPACES**: one row per space in ⌘N order (`N name`, its agent
   counts; a click lands on its home), the current one a solid chip in its
   colour (red while the prefix is armed);
 - **PARKED** and its count (the stash; a click opens the unpark picker), with
@@ -157,10 +158,10 @@ parked. It has no letter, isn't messageable, and isn't listed by
 | "agent D", "D", "tell D…" | the agent whose `@agent_key` is `d`, in any space (a bare "D" may be a shell's letter: recipe **letter** says which) | tmux MCP pane `"d"` (or `tmux://d/<handle>`); CLI: recipe **letter** |
 | "shell E", "E" (a shell) | the non-home shell whose `@agent_key` is `e`, no `@agent_state`, in any space | recipe **letter**, then tmux MCP by its pane id (`"%131"`); tmux-mcp's `"e"` finds agents only |
 | "the sidebar agent", "the tmux-mcp agent" | an agent by its title/topic | `list_panes` filter, or grep `@agent_summary` in recipe **map** |
-| "agent 3", "⌘3" | 3rd agent of the space Mack is looking at | recipe **where is Mack**, then **ordinal**; then address it by its letter |
-| "space 3", "⌃3" | session with `@space_index` 3 | recipe **space** |
+| "agent 3" | 3rd agent of the space Mack is looking at (no key does this any more; ask for the letter if unsure) | recipe **where is Mack**, then **ordinal**; then address it by its letter |
+| "space 3", "⌘3" | session with `@space_index` 3 | recipe **space** |
 | "the cua-notch space" | session named `cua-notch` | `list_panes` filter `cua-notch`; CLI: `tmux has-session -t '=cua-notch'` |
-| "the home shell", "home", "⌃3" (as a place) | home window of that space (their current one if unsaid); the shell pane, not the dashboard | tmux MCP pane `"cua-notch:1"`; CLI: recipe **shell N** with N=1 |
+| "the home shell", "home", "⌘3" (as a place) | home window of that space (their current one if unsaid); the shell pane, not the dashboard | tmux MCP pane `"cua-notch:1"`; CLI: recipe **shell N** with N=1 |
 | "shell 2 in cua-notch", `cua-notch:2` | 2nd non-agent window of cua-notch, home being the 1st (the ordinal form; Mack usually says the letter) | tmux MCP pane `"cua-notch:2"` (`tmux://cua-notch:2/<handle>`); CLI: recipe **shell N** |
 | "my shell", "the shell I'm in" | the window their client shows, if it's a shell | recipe **where is Mack** |
 | "it's in needs-you", "it's waiting on me" | state `needs-input`/`failed`/`done` | `agent-jump.sh list` |
@@ -178,7 +179,7 @@ Your shell is INSIDE tmux and `$TMUX` points at the real server, so a plain
 (a bare `=main` is zsh path expansion and aborts the line).
 
 **map**: every space, shell and agent, with shell ordinals (`shN`, home =
-1), ⌘N ordinals (`cmdN`) and letters (agents' and shells'; a home shows
+1), agent ordinals (`cmdN`) and letters (agents' and shells'; a home shows
 `-` even if a stale key sits on it):
 
 ```sh
@@ -215,7 +216,7 @@ S=cua-notch N=1; tmux list-windows -t "=$S" -F '#{window_index} #{window_id} #{p
 # → 1 @34 %35 s home       (%35 is the home SHELL pane; the dashboard is %145, pane 1)
 ```
 
-**ordinal**: agent ⌘N of space S: same as **shell N**, with `$4=="a"`.
+**ordinal**: agent N of space S: same as **shell N**, with `$4=="a"`.
 
 **space**: space N → session: `tmux list-sessions -F '#{@space_index} #{session_name} #{session_path}' | awk -v n=3 '$1==n'`
 → `3 schedule /Users/mackhaymond/math_econ_sched`
@@ -295,8 +296,8 @@ Prefix is **⌃S**. ⌘ chords come from WezTerm.
 
 | Key | Does |
 |---|---|
-| ⌃1-9 | space N's home (by `@space_index`); in the space you're in, back home |
-| ⌘1-9 | agent N of this space (ordinal) |
+| ⌘1-9 | space N's home (by `@space_index`); in the space you're in, back home. Agents and shells have no number key: ⌥W + letter |
+| ⌃1-9 | nothing of tmux's: they reach the program in the tab |
 | ⌥1-9 | nothing of tmux's: they reach the program in the tab (all nav goes through ⌥W) |
 | prefix t | pin / unpin this tab (agents only); a middle-click on a sidebar card does the same |
 | ⌥L / ⌥H | next / previous of the same kind (agent→agent, shell→shell), wrapping |
@@ -306,7 +307,8 @@ Prefix is **⌃S**. ⌘ chords come from WezTerm.
 | ⌥W then Shift+letter | that agent's uncommitted diff in a popup, only the files IT edited (`agent-ui diff @W`); you stay put; Esc / q close it; nothing dirty says "d: no uncommitted changes", a shell or nobody "diff: no agent on x" |
 | ⌥S | next tab that needs you (CuaNotch owns it; prefix d is tmux's) |
 | ⌥X / ⌥C | back / forward through visited tabs (prefix D undoes a whole run of ⌥S jumps) |
-| ⌥N | new space (folder picker; reuses a space already on that folder) |
+| double-tap hyper or right ⇧ | flip to the previous tab in ANY space (agent, shell or home), again to come back; skips closed/parked tabs (`@double_tap_target global`; `window` = last-window in this space) |
+| ⌥N | new space (folder picker; reuses a space already on that folder). ⏎ opens, never creates; ^N creates from the query: a name → ~/code/projects/NAME (git init), a path (`cs35l/x` is under ~/code/projects; parent must exist) → that folder, an explicit git URL or `gh:owner/repo` → clone (a bare a/b is a path, never a clone); ⌥⏎ → ~/code/projects/<slug of the text>, even a sentence. A sentence ("make me a todo app"; ⏎ or ^N) → a claude in a popup holding the next space number (a "pending space", window in hidden session `pending`; ⌥N inside hides it, ⌘N on that number / its ⌥W letter / pin / NEEDS YOU reopen it; it ends with `space.sh adopt-pending @W DIR`). The header says what ⏎ / ^N / ⌥⏎ will do |
 | ⌥M | move this tab to another space |
 | ⌥V | sidebar scope: this space ↔ all spaces |
 | ⌘B | sidebar on/off |
@@ -315,7 +317,7 @@ Prefix is **⌃S**. ⌘ chords come from WezTerm.
 | prefix v | select a range of tabs (h/l extend, H or ⏎ park, m move, Esc) |
 | prefix Q | close this space (y/n; never main) |
 | ⌘T / ⌘R | new shell tab / new claude tab (prefix c / prefix k) in THIS space, in the current tab's folder |
-| ⌘⇧T / ⌘⇧R | picker: which space gets a new shell / claude tab (at its end, in that space's root folder; prefix C-t / prefix K). Type a folder to open or reuse a space for it |
+| ⌘⇧T / ⌘⇧R | picker: which space gets a new shell / claude tab (at its end, in that space's root folder; prefix C-t / prefix K). Type a folder to open or reuse a space for it; ^N creates (as ⌥N's) and the tab opens in the new folder's space |
 | ⌘⌥R | replace this tab with a claude tab (prefix C-k; on home it adds one) |
 | ⌘W / ⌘Z | close tab (refused on home) / reopen the last closed tab, agent resumed |
 | prefix P | pause every working agent before closing the laptop; again to resume that set |

@@ -33,11 +33,40 @@ to the start of the chain in one step.
   the existing `session-window-changed[50]` / `client-session-changed[50]`
   hooks, which the move fires. nav.sh posts nothing itself.
 
+## Double-tap: flip to the last tab
+
+Double-tapping hyper (caps lock) or right shift in WezTerm flips to the tab
+you were on before this one, in any space. Double-tap again to come back, so
+it toggles between the two most recently visited tabs, the way the same
+double-tap toggles Arc's tabs with Ctrl+Tab.
+
+- Karabiner (`.chezmoitemplates/karabiner-base.json`) detects the double-tap
+  and runs `scripts/double-tap-switch.sh`, which finds the focused client and
+  runs `nav.sh last <client>`. `@double_tap_target` picks the flip:
+  `global` (the default, this one), `session` (the top row of prefix a) or
+  `window` (tmux's `last-window`, this space only, the old default).
+- It goes to `<prev>`, the tab you just left, whichever way you left it: a
+  click, a key, Option-X or Option-C. After Option-X from B to A, the
+  double-tap returns to B (B sits on forward, not on back's end).
+- If that tab is closed or now lives only in a hidden session, it falls back to
+  the end of the same per-client history as Option-X, which it skips and drops
+  the same way. It never lands in a hidden session. From inside one, it
+  returns to the last recorded tab.
+- Agents, shells and homes all count. A home is a tab you visit like any other,
+  and nav records it like any other.
+- Unlike Option-X, the flip is a new navigation: the tab you leave goes onto
+  back, forward is cleared, and it becomes `<prev>`. That is what makes the
+  next double-tap return. A back entry naming the target is dropped first, so
+  flipping back and forth does not grow back.
+- With nothing to flip to, a chip says "no previous tab".
+
 ## How it works
 
 `scripts/nav.sh` keeps two global options per client:
-`@nav_<key> = "<cur>|<back...>|<forward...>"` and a write counter,
-`@nav_seq_<key>`.
+`@nav_<key> = "<cur>|<back...>|<forward...>|<prev>"` and a write counter,
+`@nav_seq_<key>`. `<prev>` is the tab the client was on just before `<cur>`.
+Every write that changes `<cur>`'s window sets it: a recorded move, back,
+forward and the double-tap. Only the double-tap reads it.
 
 - **Recording.** The hooks only say who may have moved. The script reads
   where that client is now, so a late or reordered `run-shell -b` hook can

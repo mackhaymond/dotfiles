@@ -419,9 +419,11 @@ config.keys = {
 -- The digit rows (tmux SPACES, ~/.config/tmux/docs/spaces.md). Each chord
 -- sends ONE private escape sequence, which tmux reads as one key (its
 -- user-keys, set in spaces.conf; no real terminal sends CSI 9111-9139 ~):
---   CTRL+1-9  \e[911N~  User0-8    space N's home   (spaces off: window N)
+--   CTRL+1-9  \e[911N~  User0-8    C-N to the pane  (spaces off: window N)
 --   OPT+1-9   \e[912N~  User9-17   M-N to the pane (spaces on or off)
---   CMD+1-9   \e[913N~  User18-26  agent N   (spaces off: window N)
+--   CMD+1-9   \e[913N~  User18-26  space N's home   (spaces off: window N)
+-- All three rows are sent whatever @spaces says (WezTerm cannot see it); the
+-- tmux side decides, so with spaces on CTRL+N still reaches the pane as C-N.
 -- Exact chords, nothing timing-dependent: CMD+N used to send the prefix and
 -- then ESC N, the same bytes as OPT+N, so a dropped prefix or a touched
 -- Option sent OPT+N instead. The mixed chords (CMD+OPT, CMD+CTRL, CTRL+OPT,

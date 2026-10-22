@@ -781,8 +781,10 @@ pub type Want = Option<bool>;
 #[allow(clippy::too_many_arguments)]
 pub fn toggle(tmux: &Tmux, snap: &Snapshot, win: &str, want: Want, now: i64, path: Option<&Path>, dir: &Path,
     procs: &dyn Procs) -> Result<Toggled, String> {
+    // (A pending space's claude is listed, in its own space: it pins.)
     let shown = |w: &&Window| {
-        w.session != crate::tmux::HOLD && !w.space_hidden && !crate::model::HIDDEN.contains(&w.session.as_str())
+        w.is_pending()
+            || (w.session != crate::tmux::HOLD && !w.space_hidden && !crate::model::HIDDEN.contains(&w.session.as_str()))
     };
     let w = snap.rows(win).find(shown).or_else(|| snap.rows(win).next());
     let Some(w) = w else { return Err("that tab is gone".into()) };

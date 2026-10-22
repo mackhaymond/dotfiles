@@ -206,7 +206,7 @@ render() {
     esac
     emit
   done
-  # Then one line per agent (Cmd+N reaches agent N), as many as fit above
+  # Then one line per agent (⌥W and its letter reach it), as many as fit above
   # the hint row; a last "+N more" when they do not.
   local rows=$((H - 5)) n=${#A_STATE[@]} i st glyph gc
   ((rows < 0)) && rows=0
@@ -225,7 +225,7 @@ render() {
     elif [[ "$st" == running || -n "${A_WF[i]}" || -n "${A_CUA[i]}" ]]; then glyph="◐" gc="$C_PINK"
     elif [[ "$st" == paused ]]; then glyph="⏸" gc="$C_VIO"
     else glyph="○" gc="$C_DIM"; fi
-    seg "" "  "; seg "$gc" "$glyph"; seg "$C_DIM" " ⌘$((i + 1)) "
+    seg "" "  "; seg "$gc" "$glyph"; seg "" " "
     if [[ -n "${A_KEY[i]}" ]]; then seg "$C_SPACE" "${A_KEY[i]}"; else seg "" " "; fi
     seg "" "  "; seg "$C_TEXT" "${A_LABEL[i]//$'\t'/ }"
     [[ -n "${A_DETAIL[i]}" ]] && { seg "" "  "; seg "$C_DIM" "${A_DETAIL[i]//$'\t'/ }"; }
@@ -234,7 +234,7 @@ render() {
   done
   while ((rows > 0)); do emit; rows=$((rows - 1)); done
   seg "" "  "
-  seg "$C_DIM" "⌃N home · ⌥W jump to a shell or agent · ⌘1-9 agents · ⌥\` agent↔shell · ⌥N new space · prefix Q close"
+  seg "$C_DIM" "⌘N home · ⌥W jump to a shell or agent · ⌥\` agent↔shell · ⌥N new space · prefix Q close"
   emit
   # Draw: home, each line cleared to its end, the rest of the pane cleared.
   local buf="$E[H" k

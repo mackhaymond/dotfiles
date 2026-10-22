@@ -193,7 +193,7 @@ impl Tmux {
 /// `@agent_blink`, every row carries the same value), and `home`
 /// (spaces' `@space_home` "1": a space's landing window, never an agent row
 /// nor counted in the sidebar), and the SESSION options `space_index`
-/// (`@space_index`, space.sh's number for a visible space: its ⌃N) and
+/// (`@space_index`, space.sh's number for a visible space: its ⌘N) and
 /// `space_hidden` (`@space_hidden` "1"): a window row's format resolves a
 /// user option through its session, so every row of a session carries its
 /// session's values and the sidebar's spaces list costs no extra call.
@@ -209,13 +209,17 @@ impl Tmux {
 /// sidebar's PINNED section, [`crate::pins`]) with `session_id` (the tab
 /// hook's `@agent_session_id`, a Codex agent's session: what a pin is kept
 /// by across a restore), and `pin_key` (`@pin_key`: a pinned agent's ⌥W digit,
-/// [`crate::pins::pin_keys`]).
-pub const FIELDS: [&str; 37] = [
+/// [`crate::pins::pin_keys`]), and a PENDING SPACE's window options
+/// (space.sh `ask-claude`, docs/spaces.md "Pending spaces"): `pending_space`
+/// (`@pending_space`, the space number N its claude holds), `pending_request`
+/// (`@pending_request`, the words typed into the picker) and `pending_color`
+/// (`@pending_color`, the colour space N will have).
+pub const FIELDS: [&str; 40] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
     "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home", "space_index",
     "space_hidden", "space_color", "stash_sel", "pane_flags", "rollout", "paused", "pinned", "session_id",
-    "pin_key",
+    "pin_key", "pending_space", "pending_request", "pending_color",
 ];
 
 /// The pane option space.sh sets (to 1) on a space home's dashboard pane
@@ -237,7 +241,7 @@ pub const PANE_FLAGS: &str =
 
 /// The tmux format of each FIELDS entry, in order. (`#{pane_current_path}`
 /// is printed by [`path_format`], dashboard-aware.)
-pub const FORMATS: [&str; 37] = [
+pub const FORMATS: [&str; 40] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
@@ -245,7 +249,7 @@ pub const FORMATS: [&str; 37] = [
     "#{@stash_origin}", "#{@agent_slot}", "#{@agent_pending}", "#{@agent_key}", "#{@agent_mru_cur}",
     "#{@agent_mru_prev}", "#{@space_home}", "#{@space_index}", "#{@space_hidden}", "#{@space_color}", "#{@stash_sel}",
     PANE_FLAGS, "#{@agent_rollout}", "#{@agent_paused}", "#{@agent_pinned}", "#{@agent_session_id}",
-    "#{@pin_key}",
+    "#{@pin_key}", "#{@pending_space}", "#{@pending_request}", "#{@pending_color}",
 ];
 
 /// Ends each path in the dashboard case of [`path_format`] (a private-use
@@ -376,7 +380,7 @@ pub fn fmt() -> String {
 /// the GLOBAL options the sidebar's status block shows in place of the
 /// hidden status line (usage, the stale-save mark, the open-sidebar count).
 /// Starts with an empty field and has 9 + [`STATUS_FORMATS`] fields where a
-/// window row has [`FIELDS`]' 37, so the two parsers can never take each other's rows.
+/// window row has [`FIELDS`]' 40, so the two parsers can never take each other's rows.
 pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
@@ -497,6 +501,12 @@ impl Status {
 /// The holding session for parked tabs (agent-roster.py `HOLD`).
 pub const HOLD: &str = "stash";
 
+/// The hidden session holding every PENDING SPACE's claude (space.sh
+/// `PEND_SESS`, docs/spaces.md "Pending spaces"): the one hidden session the
+/// sidebar lists, and only its windows with `@pending_space` set
+/// ([`Window::is_pending`]).
+pub const PENDING: &str = "pending";
+
 /// One `list-windows -a` row: one (session, window) pair. A window linked into
 /// two sessions is two rows with the same `id`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -568,7 +578,7 @@ pub struct Window {
     /// @space_home is "1": a space's home (landing) window, never an agent.
     pub home: bool,
     /// The window's SESSION's @space_index (1-based, digits only; None when
-    /// unset or junk): the space's number, ⌃N.
+    /// unset or junk): the space's number, ⌘N.
     pub space_index: Option<u32>,
     /// The window's SESSION has @space_hidden "1" (not a space).
     pub space_hidden: bool,
@@ -590,6 +600,14 @@ pub struct Window {
     /// Raw `@pin_key` ("" = none): a pinned agent's ⌥W digit as stored. Only a
     /// stamp: the number shown is [`crate::pins::pin_keys`]'.
     pub pin_key: String,
+    /// `@pending_space`: the space number a pending space's claude holds
+    /// (digits, no leading zero; None when unset or junk). Only counts in
+    /// the [`PENDING`] session ([`Window::is_pending`]).
+    pub pending_space: Option<u32>,
+    /// `@pending_request`: what was typed into the new-space picker, raw.
+    pub pending_request: String,
+    /// `@pending_color`: the `#rrggbb` space N will have, trimmed.
+    pub pending_color: String,
 }
 
 fn digits(s: &str) -> bool {
@@ -673,6 +691,9 @@ impl Window {
             pinned: Some(p[34].trim()).filter(|s| !s.is_empty()).map(|s| num(s).unwrap_or(0)),
             session_id: p[35].trim().into(),
             pin_key: p[36].trim().into(),
+            pending_space: parse_slot(p[37].trim()),
+            pending_request: p[38].into(),
+            pending_color: p[39].trim().into(),
             label: label.into(),
             session,
         })
@@ -680,6 +701,14 @@ impl Window {
 
     pub fn is_parked(&self) -> bool {
         self.session == HOLD
+    }
+
+    /// A PENDING SPACE's claude: in the hidden [`PENDING`] session with
+    /// `@pending_space` set. Going to it opens its popup (`space.sh
+    /// pending-open`), never selects it; adoption clears the option and
+    /// moves the window into its space, where it is an ordinary agent.
+    pub fn is_pending(&self) -> bool {
+        self.session == PENDING && self.pending_space.is_some()
     }
 
     /// The window has a dashboard pane ([`DASH_OPTION`]).
@@ -1017,16 +1046,34 @@ pub(crate) mod tests {
         assert_eq!((w.session.as_str(), w.label.as_str()), ("日本", "🫠 x\tz"));
     }
 
-    /// A row from an older format (34 fields, before `pinned`,
-    /// `session_id` and `pin_key`) or one with a field too many is no
-    /// window: never misread by position.
+    /// A row from an older format (37 fields, before the pending space's
+    /// options; 34, before `pinned`, `session_id` and `pin_key`) or one with
+    /// a field too many is no window: never misread by position.
     #[test]
     fn rows_of_the_wrong_length_are_rejected() {
-        assert_eq!(FIELDS.len(), 37);
-        for n in [33, 34, 35, 36, 38] {
+        assert_eq!(FIELDS.len(), 40);
+        for n in [34, 36, 37, 38, 39, 41] {
             assert!(Window::parse(&vec!["x"; n].join("\x1f")).is_none(), "{n}");
         }
-        assert!(Window::parse(&vec!["x"; 37].join("\x1f")).is_some());
+        assert!(Window::parse(&vec!["x"; 40].join("\x1f")).is_some());
+        assert_ne!(FIELDS.len(), CLIENT_FIELDS);
+    }
+
+    /// A pending space's options: only a window of the `pending` session
+    /// with a valid `@pending_space` is one; the request is kept raw (a
+    /// newline in it survives the row), the colour trimmed.
+    #[test]
+    fn pending_space_options() {
+        let set = [("pending_space", "4"), ("pending_request", "make a\nrust cli"), ("pending_color", " #f5c2e7 ")];
+        let w = Window::parse(&row(PENDING, 1, "@7", &set)).unwrap();
+        assert!(w.is_pending());
+        assert_eq!((w.pending_space, w.pending_request.as_str(), w.pending_color.as_str()), (Some(4), "make a\nrust cli", "#f5c2e7"));
+        // Elsewhere (adopted: the options are cleared anyway), or junk: none.
+        assert!(!Window::parse(&row("main", 1, "@7", &set)).unwrap().is_pending());
+        for junk in ["", "0", "04", "x"] {
+            assert!(!Window::parse(&row(PENDING, 1, "@7", &[("pending_space", junk)])).unwrap().is_pending(), "{junk:?}");
+        }
+        assert!(fmt().contains("@pending_request") && fmt().contains("@pending_color"));
     }
 
     /// `@agent_pinned`: unset is None; digits are the pin time; anything
@@ -1039,7 +1086,7 @@ pub(crate) mod tests {
         assert_eq!(w(" 12 ").pinned, Some(12));
         assert_eq!(w("yes").pinned, Some(0));
         assert_eq!(w("").session_id, "abc-1");
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}", guarded("#{@agent_pinned}"), guarded("#{@agent_session_id}"),
+        assert!(fmt().contains(&format!("{}\x1f{}\x1f{}\x1f", guarded("#{@agent_pinned}"), guarded("#{@agent_session_id}"),
             guarded("#{@pin_key}"))));
         assert_eq!(Window::parse(&row("main", 1, "@1", &[("pin_key", " 3 ")])).unwrap().pin_key, "3");
     }
@@ -1074,9 +1121,12 @@ pub(crate) mod tests {
         assert!(fmt().contains(&guarded("#{@agent_slot}")) && fmt().contains(&guarded("#{@agent_pending}")));
         assert!(fmt().contains(&guarded("#{@agent_key}")) && fmt().contains(&guarded("#{@agent_mru_prev}")));
         assert!(fmt().contains(&guarded("#{@space_home}")));
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{PANE_FLAGS}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", guarded("#{@space_index}"),
+        assert!(fmt().contains(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{PANE_FLAGS}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f", guarded("#{@space_index}"),
             guarded("#{@space_hidden}"), guarded("#{@space_color}"), guarded("#{@stash_sel}"), guarded("#{@agent_rollout}"),
             guarded("#{@agent_paused}"), guarded("#{@agent_pinned}"), guarded("#{@agent_session_id}"), guarded("#{@pin_key}"))));
+        // Then a pending space's options, last.
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}", guarded("#{@pending_space}"), guarded("#{@pending_request}"),
+            guarded("#{@pending_color}"))));
         let s = Snapshot::parse(&row("main", 1, "@1", &[("rollout", "/x/rollout-1.jsonl")]));
         assert_eq!(s.windows[0].rollout, "/x/rollout-1.jsonl");
         let s = Snapshot::parse(&row("main", 1, "@1", &[("space_color", " #f9e2af "), ("stash_sel", "1")]));

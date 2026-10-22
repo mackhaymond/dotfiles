@@ -5,7 +5,7 @@ A **space** is a tmux session. Most have a project folder (`session_path`);
 non-empty `@agent_state` (the agent-tab indicator sets it for every live
 claude/codex window, idle included, and the GC clears it); every other window
 is a **shell**. One shell per space is its **home** (`@space_home 1`), and a
-space IS its home: going to the space (⌃N, a click on its chip or in the
+space IS its home: going to the space (⌘N, a click on its chip or in the
 sidebar) lands there. Every other shell has a lifetime **letter**
 (`@agent_key`) from the same pool as the agents', so ⌥W + the letter
 reaches it, in any space; homes never have one.
@@ -16,17 +16,18 @@ reaches it, in any space; homes never have one.
 |---|---|
 | `tmux.conf.tmpl` | `set -g @spaces on` (the one flag) and `@space_hidden_sessions` (the one hidden list), near the top; `source-file -F "#{d:current_file}/spaces.conf"` as the last line |
 | `spaces.conf` | everything else: hooks, status lines, keys. `%if @spaces on … %else … %endif` |
-| `scripts/space.sh` | the logic a format can't do: `sync`, `agent`/`shell N` (no key runs `shell N` any more), `next`/`prev`, `toggle`, `close`, `move-menu`/`move-to`, `respawn-home`, `new-space`, `open-dir`, `pick-tab`/`new-tab` |
+| `scripts/space.sh` | the logic a format can't do: `sync`, `shell N` (no key runs it any more; its twin `agent N`, ⌘N's, went when ⌘N became the space key), `next`/`prev`, `toggle`, `close`, `move-menu`/`move-to`, `respawn-home`, `new-space`, `open-dir`, `pick-tab`/`new-tab`, `create` (the pickers' ^N, with `new-hint`/`enter-key`/`new-key`, its fzf helpers, and `catalog-sync`), `ask-claude`/`pending-open`/`pending-go`/`pending-prompt`/`adopt-pending` (pending spaces) |
 | `scripts/space-dash.sh` | the home dashboard (below); `--once` draws one frame |
 | `tests/test_spaces.py` | real `-L` servers, keys sent with `send-keys -K`, clicks as SGR reports |
-| `wezterm.lua.tmpl` | the digit rows: CTRL+N and CMD+N send prefix keys (below) |
+| `wezterm.lua.tmpl` | the digit rows: CTRL+N, OPT+N and CMD+N each send one private key (below) |
 
 Why a second file: `%if` is decided when a file is *parsed*, before any of its
 commands run, so a `%if` on `@spaces` inside tmux.conf would see the value
 from the previous load. By the time tmux.conf's `source-file` runs, its `set`
 has.
 
-`space.sh` refuses everything but `preview` when `$TMUX` is empty: outside a
+`space.sh` refuses everything but `preview` and the pickers' read-only fzf
+helpers (`new-hint`, `enter-key`, `new-key`, `is-english`) when `$TMUX` is empty: outside a
 tmux server, a plain `tmux` reaches the DEFAULT server, whichever one the
 caller meant. (A hand-run test closed a real space that way on 2026-10-15.)
 Keys, hooks and popups always have `$TMUX`; the tests set it.
@@ -37,8 +38,8 @@ Keys, hooks and popups always have `$TMUX`; the tests set it.
 `list-keys` (notes included), same `status`/`status-format`, with two
 deliberate differences, both about WezTerm's digit chords, which reach tmux
 whatever the flag says and must keep meaning what they always meant: prefix
-M-1..M-9 select window N (tmux's stock prefix M-1..M-7 layout presets are
-gone in both modes), and the chord keys `User0`-`User26` (below) do what
+M-1..M-9 select window N (unbound when on; tmux's stock prefix M-1..M-7
+layout presets are gone in both modes), and the chord keys `User0`-`User26` (below) do what
 their chords did before spaces: CTRL+N and CMD+N select window N, OPT+N
 `send-keys M-N` to the pane. Every other `%else` line undoes its `%if` twin:
 `set -gu status-format` restores tmux's default array (the default format plus
@@ -61,7 +62,7 @@ is no `jump` table (M-w is tmux.conf's ⌥W menu again).
 
 ## Hidden sessions
 
-`agents tasks stash scratch btop-popup` get `@space_hidden 1`: by the
+`agents tasks stash scratch btop-popup pending` get `@space_hidden 1`: by the
 `session-created[20]` hook (pure tmux, at birth) and by `space.sh sync` (on
 load, on `session-closed[20]`/`session-renamed[20]`). They have no tab, no
 number, no home and no registry entry, and the status formats never loop into
@@ -70,8 +71,8 @@ them — `agents` alone holds hundreds of windows.
 ## Home: the space's main shell
 
 Every visible space has exactly one home: a normal interactive shell at the
-space folder, the space's LOWEST window, named `home`. It is where ⌃N lands
-(also ⌃N for the space you are in: it goes home) and where a click on the
+space folder, the space's LOWEST window, named `home`. It is where ⌘N lands
+(also ⌘N for the space you are in: it goes home) and where a click on the
 space lands; it has no shell tab and no letter (the space's chip wears 󰋜
 while you are on it). It is what keeps a space alive: closing the last other
 tab lands you on home, still in the space. It cannot be closed by hand:
@@ -109,18 +110,18 @@ agent-roster.py's FMT).
 
 The home window is two panes: on top, full width and 9 rows, the
 **dashboard** (`space-dash.sh`); below it the home shell, which stays the
-focused pane, so ⌃N lands in it.
+focused pane, so ⌘N lands in it.
 
 ```
-  ▀█▀ █▄█ █ █ █ █   ⌃2  ~/.local/share/chezmoi
+  ▀█▀ █▄█ █ █ █ █   ⌘2  ~/.local/share/chezmoi
    █  █▀█ █ █ ▄▀▄    main  ±16
    ▀  ▀ ▀ ▀▀▀ ▀ ▀   4 agents · 2 shells · 1 parked
 
-  ◐ ⌘1 a  tmux/Tmux Agent Sidebar  Two implementers are running in parallel
-  ◉ ⌘2 d  tmux/home dashboard  Allow Bash(notifyutil -p ...)?
-  ✓ ⌘3 f  tmux/resurrect guard  Everything is live on your server
-  ○ ⌘4    tmux/Canvas syllabus
-  ⌃N home · ⌥W jump to a shell or agent · ⌘1-9 agents · ⌥` agent↔shell · ⌥N new space · prefix Q close
+  ◐ a  tmux/Tmux Agent Sidebar  Two implementers are running in parallel
+  ◉ d  tmux/home dashboard  Allow Bash(notifyutil -p ...)?
+  ✓ f  tmux/resurrect guard  Everything is live on your server
+  ○    tmux/Canvas syllabus
+  ⌘N home · ⌥W jump to a shell or agent · ⌥` agent↔shell · ⌥N new space · prefix Q close
 ```
 
 Idle cost, measured on a test server over 60 s: 0.00-0.02 s of CPU (under
@@ -130,10 +131,10 @@ answers a missing target with empty fields, not an error, so it checks its
 own `#{pane_id}` comes back) exits at its next draw, at most 60 s later.
 
 The name, large (a 3x5 font in half blocks; plain bold when the pane is too
-narrow), in the space's colour; its ⌃N key and folder; git branch, dirty
+narrow), in the space's colour; its ⌘N key and folder; git branch, dirty
 count (`±N`, or `clean`) and ahead/behind; the agent / shell / parked counts
 (parked = windows in `stash` whose `@stash_origin` is this space); one line
-per agent, by ordinal (⌘N), with its state shape (✕ ◉ ✓ ◐ ○, colours as the
+per agent, in window order, with its state shape (✕ ◉ ✓ ◐ ○, colours as the
 roster), its ⌥W letter (`@agent_key`), its summary and detail (as many as
 fit, then `+N more`); a key hint.
 
@@ -220,26 +221,26 @@ back as shells named `home` and are adopted.
 ## Status (flag on: ONE line)
 
 ```
-█⌃1 main 󰋜 ●  ⌃3● █j█ src██·█ nvim█ [+]                 … status-right
+█⌘1 main 󰋜 ●  ⌘3● █j█ src██·█ nvim█ [+]                 … status-right
 ```
 
 (Drawn only while no agent sidebar is open; the sidebar has all of it.)
 
-The full list of spaces, with their ⌃N keys, is in the sidebar. The status
+The full list of spaces, with their ⌘N keys, is in the sidebar. The status
 line shows, left to right:
 
-**This space's chip**, `⌃N name`: a solid block in the space's colour
+**This space's chip**, `⌘N name`: a solid block in the space's colour
 (`@space_color`, peach until it has one), bold crust text, ended by a
 powerline edge (U+E0B0, which WezTerm draws itself) and a gap, so it never
 reads as a shell tab. Red while the prefix is pressed (what catppuccin's
 `session` module showed, see below). The label is the session option
 `@space_key` (the key that reaches the space; `space.sh sync` sets it next to
-`@space_index`, `⌃N` for now), so a new key scheme is one line of the script.
+`@space_index`, `⌘N` for now), so a new key scheme is one line of the script.
 Spaces past 9 have no key: `@space_key` is unset, the chip shows the name
 alone and their alert shows the name (`proj●`). While you are on the space's
 home window a 󰋜 follows the name inside the chip: a space IS its home, so
 home has no shell tab of its own. A click on the chip lands on the home (as
-⌃N does). After the edge, the space's **rollup**, in the window tabs' colour
+⌘N does). After the edge, the space's **rollup**, in the window tabs' colour
 language:
 
 - a ●: red failed > yellow needs-* > green done (done+workflow does not
@@ -249,7 +250,7 @@ language:
 Inside a hidden session its name (`[agents]`) stands in for the tab: dimmed,
 or crust on red while the prefix is pressed, like the chip.
 
-**Other spaces that need you**: `⌃N●`, the ⌃N in that space's colour and the
+**Other spaces that need you**: `⌘N●`, the ⌘N in that space's colour and the
 ● red / yellow / green, for each other visible space whose rollup is failed /
 needs-* / done (the states prefix d walks). In-flight and idle spaces never show, so this is usually empty. One
 `S:` loop, in name order. Each is `#[range=session|$id]`, and a click on it
@@ -273,7 +274,7 @@ chip on the one you're on. Then `[+]` (`#[range=user|space-new]`).
 
 Clicks (`MouseDown1Status`): `[+]` opens a shell at the space folder; a
 session range (this space's chip, another's alert) lands on that space's
-HOME, as ⌃N does (`run-shell -C "switch-client -t '$S:@home'"`: in a mouse
+HOME, as ⌘N does (`run-shell -C "switch-client -t '$S:@home'"`: in a mouse
 binding the formats expand in the clicked session, so its `W:` loop finds
 that space's home; plain `switch-client -t =` would land on its last-active
 window); anything else (a shell tab) falls back to `switch-client -t =`.
@@ -282,7 +283,11 @@ window); anything else (a shell tab) falls back to `switch-client -t =`.
 give way to *every* window of the space as today's catppuccin tab
 (`window-status-format`/`-current-format`, `@stash_sel` mauve tint included),
 since the selection's only feedback is that tint and agents have no tab
-otherwise. The trigger is any window of the space carrying `@stash_sel`.
+otherwise. The trigger is any window of the space carrying `@stash_sel` —
+the same test as tmux.conf's `@stash_live`, which keeps the mode's keys
+(h/l/H/⏎/m/a/esc/q/C-c/space, bound in root only while a selection exists:
+scripts/stash-root-keys.conf) working in that space until the selection
+ends, and makes prefix v a toggle (tests/test_stash_keys.py).
 
 No `#()` in the line, one `S:` loop, and hidden sessions are skipped before
 any `W:` runs inside them.
@@ -318,22 +323,22 @@ a key table, so the sidebar re-reads `#{client_key_table}` after the next key.
 
 | key | tmux | does |
 |---|---|---|
-| Control-1-9 | User0-8 (also prefix 1-9) | space N's HOME window, tab order; never its last-active window, and from inside space N it goes home. No fork: an `S:` loop finds the session whose `@space_index` is N and a nested `W:` loop its `@space_home` window, for one `switch-client -t '$S:@W'` (`#{s/ .*//:}` keeps the first match; no home means the bare session) |
+| Command-1-9 | User18-26 (also prefix 1-9) | space N's HOME window, tab order; never its last-active window, and from inside space N it goes home. No fork: an `S:` loop finds the session whose `@space_index` is N and a nested `W:` loop its `@space_home` window, for one `switch-client -t '$S:@W'` (`#{s/ .*//:}` keeps the first match; no home means the bare session). No space N: `space.sh pending-go N`, the popup of the pending claude holding N, else "no space N" |
 | Option-1-9 | User9-17 (`send-keys M-N`) | nothing of ours: M-1..M-9 reach the pane, as with spaces off (they were "shell N"; shells have letters now, ⌥W). Unbound with `unbind -q`, so a reload from an older spaces.conf drops them. Pinned agent N is ⌥W then N (below) |
 | — | prefix t | pin / unpin THIS tab in the sidebar's PINNED section (`agent-ui pin toggle --window <win> --client <tty>`, `@space_pin`; a shell, a home, a parked tab or a hidden session's agent is refused aloud; no binary: "pin: agent-ui is not installed"). Replaces tmux's clock-mode, given back with spaces off. Not prefix p: it sits next to prefix P, the pause key |
-| Command-1-9 | User18-26 (also prefix M-1..M-9) | agent N of this space |
+| Control-1-9 | User0-8 (`send-keys C-N`) | nothing of ours: C-1..C-9 reach the pane, in the bytes a terminal sends for them (extended-keys is off: `1`, NUL, ESC, FS..US, DEL, `9`). They were the space key and ⌘N was "agent N" until Mack's 2026-10-21 change: ⌘N is the space key, agents and shells are reached by their ⌥W letter only. prefix M-1..9 (⌘N's old twin) are unbound |
 | ⌥L / ⌥H | M-l / M-h | kind-aware: on an agent, next / previous agent; on a shell, next / previous shell; wrapping |
 | ⌥\` | M-\` | agent → last-visited shell of this space (a new shell at the space folder if there is none); shell → last-visited agent |
 | ⌥M | M-m | move this tab to another space: a menu of the spaces (number = key); the tab goes to the end of that space, you stay here. Not home, not from a hidden session |
-| ⌥N | M-n | new space: zoxide/fzf folder picker (as `prefix K` with spaces off), then reuse the session already on that folder, else `new-session -d -s <basename> -c <dir>`; switch to it. `~` → main |
+| ⌥N | M-n | new space: zoxide/fzf folder picker (as `prefix K` with spaces off), then reuse the session already on that folder, else `new-session -d -s <name> -c <dir>` (Session names); switch to it. `~` → main. ⏎ opens the highlighted folder, or a typed one that exists, and never creates: with nothing to open the popup stays ("no such folder · ^N creates it"). ^N creates from what you typed, a sentence asks Claude (Creating a project, below); a two-line coloured header says live what ⏎ and ^N would do. Inside a pending claude's popup, ⌥N hides it (detaches; claude keeps running) |
 | ⌥V | M-v | sidebar scope, this space ↔ all spaces (posts `com.mackhaymond.tmux.focus` so the Rust sidebar redraws at once) |
-| ⌥W *letter* | M-w, then key table `jump` | the agent OR non-home shell whose window option `@agent_key` is that letter (one pool), in any space (`switch-client -t '$S:@W'`, one step); hidden sessions never, a home never (even with a stale `@agent_key`: homes are reached by ⌃N). A miss says "jump: nothing on x". Escape, or any other key (`Any`), cancels and is swallowed. Entering and leaving post `com.mackhaymond.tmux.focus` so the sidebar can show "jump mode" (`#{client_key_table}` = `jump`). The sidebar assigns the letters; this only reads them. No fork: an `S:`/`W:` loop, `#{s/ .*//:}` keeps the first match, the letter rides in the global `@space_jump_key` |
+| ⌥W *letter* | M-w, then key table `jump` | the agent OR non-home shell whose window option `@agent_key` is that letter (one pool), in any space (`switch-client -t '$S:@W'`, one step); hidden sessions never, a home never (even with a stale `@agent_key`: homes are reached by ⌘N). A miss says "jump: nothing on x". Escape, or any other key (`Any`), cancels and is swallowed. Entering and leaving post `com.mackhaymond.tmux.focus` so the sidebar can show "jump mode" (`#{client_key_table}` = `jump`). The sidebar assigns the letters; this only reads them. No fork: an `S:`/`W:` loop, `#{s/ .*//:}` keeps the first match, the letter rides in the global `@space_jump_key` |
 | ⌥W *digit* | M-w, then key table `jump` 1-9 | the Nth PINNED agent (the agent sidebar's PINNED section, pin order; docs/agent-roster.md "Pinned agents"), in any space: the window whose `@pin_key` is N AND that is still a pinned agent (`@agent_pinned` and a non-empty `@agent_state`), never a home, hidden sessions (the stash among them) skipped (`switch-client -t '$S:@W'`, one step). The sidebar and every pin toggle keep the pins numbered 1..N with no gap; this only reads them. Fork-free on a hit, the letters' way (the digit rides in the global `@space_pin_n`, `@space_pin_hit`'s `S:`/`W:` loop, first match), posting the focus notice like them. A miss runs `agent-ui pin renumber` (a gap no sidebar was open to repair is gone for the next press) and says "no pin N" (`@space_pin_miss`) |
 | ⌥W ⇧*letter* | M-w, then key table `jump` A-Z | that AGENT's uncommitted diff in a popup, and you stay where you are: `agent-ui diff <@W> --client <tty>` (docs/agent-roster.md "Agent insight": only the files its own transcript says it edited, still dirty, since agents share checkouts; delta through less, ` d · title · +A −R · Nf ` in the border, Esc / q close; nothing dirty → "d: no uncommitted changes", no popup). The window is found the lowercase way (the letter, lowercased, in `@space_jump_key`; `@space_diff_hit`'s `S:`/`W:` loop, first match, fork-free) but must have an `@agent_state` (a shell has no transcript), never a home, hidden sessions skipped. A hit forks once, `run-shell -b` (`@space_diff`; no binary: "diff: agent-ui is not installed"); a miss says "diff: no agent on x" (`@space_diff_go`). prefix q's agent menu does the same with Space d on a row (its Space strip: y allow / n deny on a permission prompt, p pin, s park, x close, d diff, v preview) |
 | — | prefix Q | close this space: a y/n menu box in the middle of the window ("close space bai: 2 agents, 1 shell?"; Cancel is first, so only y closes; not `confirm-before`, which draws on the status line), then `space.sh close`: it is marked `@space_closing` (no sync re-registers it or rebuilds its home meanwhile) and unregistered, clients on it move to main (detach-on-destroy would close them), every pane goes through `closed-tabs.sh close` (snapshot + agent session id, so CMD+Z can bring each back; `@space_closer` overrides, `none` skips), the session is killed and unregistered. Never main, never a hidden session |
 | CMD+W, CMD+SHIFT+W | prefix x, C-l | as tmux.conf, except on home (refuse) |
 | CMD+T, CMD+R, CMD+OPT+R | prefix c, k, C-k | the new tab starts in THIS tab's folder (`#{pane_current_path}`), in every space (Mack, 2026-10-21); the space's own folder is the SHIFT row's (below). C-k on home adds a tab instead of replacing home |
-| CMD+SHIFT+T, CMD+SHIFT+R | prefix C-t, K | which space? A popup (`space.sh pick-tab shell\|agent`, opened as ⌥N's is): the spaces in ⌃N order (`⌃N  name  folder`, this one marked "(here)" but still a pick), then the zoxide folders (⌥N's candidate list) that are not a space's folder yet; typing filters both, and a typed path that matches no row is taken as a folder. A space gets a new shell / claude tab at its END (`new-window -a -t '$S:{end}' -c <its folder>`) and you are switched to it; the space is never renamed, closed or reordered. A folder goes through `open-dir` first (reuse, else create): a shell in a space made just now lands on its home (its only window, no second shell), otherwise it is as picking that space; claude always adds its tab. The claude tab is born an agent (`@agent_birth` in the same command list as its `new-window`). Esc / ^C: nothing. The preview shows a space's shells (home as `home`, the others by their ⌥W letter, `·` until they have one), then its agents with their ⌥W letter and summary; a folder's listing. Rows carry a hidden key column (`s:N` / `d:/path`, `--with-nth=2`), so a pick is never parsed from its label. `space.sh new-tab shell\|agent SID\|DIR [CLIENT]` is the same without the popup |
+| CMD+SHIFT+T, CMD+SHIFT+R | prefix C-t, K | which space? A popup (`space.sh pick-tab shell\|agent`, opened as ⌥N's is): the spaces in ⌘N order (`⌘N  name  folder`, this one marked "(here)" but still a pick), then the zoxide folders (⌥N's candidate list) that are not a space's folder yet; typing filters both, and a typed path that matches no row is taken as a folder. A space gets a new shell / claude tab at its END (`new-window -a -t '$S:{end}' -c <its folder>`) and you are switched to it; the space is never renamed, closed or reordered. A folder goes through `open-dir` first (reuse, else create): a shell in a space made just now lands on its home (its only window, no second shell), otherwise it is as picking that space; claude always adds its tab. The claude tab is born an agent (`@agent_birth` in the same command list as its `new-window`). Esc / ^C: nothing. The preview shows a space's shells (home as `home`, the others by their ⌥W letter, `·` until they have one), then its agents with their ⌥W letter and summary; a folder's listing. Rows carry a hidden key column (`s:N` / `d:/path`, `--with-nth=2`), so a pick is never parsed from its label. `space.sh new-tab shell\|agent SID\|DIR [CLIENT]` is the same without the popup. ⏎ / ^N / the header as ⌥N's: ^N's folder gets the shell / claude tab exactly as if it had been picked |
 
 WezTerm (wezterm.lua.tmpl, the last loop) sends each digit chord as ONE
 private escape sequence, which tmux reads as one key through its
@@ -344,25 +349,27 @@ timing or on a stray modifier: CMD+N used to send `C-s` then `ESC N`, the
 very bytes of OPT+N, so a dropped prefix or a touched Option landed on a
 shell. The mixed chords (CMD+OPT, CMD+CTRL, CTRL+OPT, CMD+SHIFT + digit) are
 `Nop` in WezTerm. OPT+N's User key only sends M-N on to the pane, in both
-modes. The prefix 1-9 and prefix M-1..9 bindings stay for other terminals
-(ssh, a nested client). The User keys work from copy mode too
+modes, and with spaces on CTRL+N's User key sends C-N the same way: WezTerm
+cannot see `@spaces`, so it always sends its sequence and tmux decides. The
+prefix 1-9 bindings (space N) stay for other terminals (ssh, a nested
+client). The User keys work from copy mode too
 (tmux falls back to the root table). WezTerm matches CTRL/ALT/SHIFT/SUPER
 without left/right variants, so it is any Control or Option. Ctrl+digit is
 free: no WezTerm default, macOS "Switch to Desktop N" is off, Karabiner only
 claims digits with all four modifiers.
 
-In a hidden session the agent/next/prev/toggle/move keys only say "not
+In a hidden session the next/prev/toggle/move keys only say "not
 a space" (an `if -F` on `@space_hidden`, no fork); `space.sh` refuses hidden
 sessions as well, so nothing ever selects or creates windows in agents/stash.
 Script messages go to the invoking client (`'#{client_name}'` is passed
 along). `space.sh` posts `com.mackhaymond.tmux.focus` (notifyutil) after it
 closes, creates or recreates a space or moves a tab.
 
-**Ordinals** (agents shared with the agent sidebar): position among the
-session's windows with non-empty `@agent_state` (agents, ⌘N) or empty
-(shells, home = 1), by `window_index`, 1-based. No key uses the shell
-ordinal now; `space.sh shell N` and tmux-mcp's `<space>:<N>` pane
-references still do.
+**Ordinals**: position among the session's windows with non-empty
+`@agent_state` (agents) or empty (shells, home = 1), by `window_index`,
+1-based. No key uses either now (⌘N was agent N until it became the space
+key); `space.sh shell N` and tmux-mcp's `<space>:<N>` pane references still
+use the shell ordinal.
 
 Last-visited agent/shell are session options `@space_last_agent` /
 `@space_last_shell` (window ids), written by `session-window-changed[20]` and
@@ -395,18 +402,134 @@ status line follows it), and shows "prefix armed" / "jump mode" from
 `#{client_key_table}` (`prefix` / `jump`) on the focus notice. It assigns
 the letters ⌥W reads (`@agent_key`, one pool for agents and non-home
 shells, never a home), and a click on a space (its header, its dock row)
-lands on the space's home window, as ⌃N does.
+lands on the space's home window, as ⌘N does.
+
+Pending spaces (below) are windows in the hidden session `pending`, agents
+from birth (they get a letter), each carrying window options the sidebar can
+render as "pending space N · creating: REQUEST":
+
+| option | value |
+|---|---|
+| `@pending_space` | N, the space number reserved for it (an integer; sync keeps it current as numbers shift, like `@space_index`) |
+| `@pending_request` | the text typed in the picker |
+| `@pending_client` | the tty of the client it belongs to (the last one its popup opened on) |
+| `@pending_color` | `#rrggbb`, the colour space N will have (`@space_color` once adopted) |
+
+All four go when the window is adopted into its space (it is then an ordinary
+agent of that space). The reservation itself is the registry row
+`pending:@W<TAB>~<TAB>colour`. A click on such a row should run
+`space.sh pending-open @W <client tty>` (the popup).
+
+## Creating a project
+
+In all three pickers (⌥N, CMD+SHIFT+T, CMD+SHIFT+R) ^N makes the folder the
+query names, then goes on as if it had been picked. ⏎ never creates. ⌥⏎
+makes ~/code/projects/<slug of the text> whatever the text looks like (a
+sentence included: "data structures notes and more" → that folder, not
+Claude). The header (`space.sh new-hint`, redrawn on every fzf `result` and
+`focus`, ANSI colours)
+says it in words before you press anything: green **Create** a new project
+**foo** in ~/code/projects · git init · sync catalog, **New folder**
+**assign4** inside **cs35l** → space **cs35l-assign4**, peach **Clone**
+**gh:owner/repo** into ~/code/projects/repo, blue **Open** space **zed**, red
+**Can't create**: ~/x/y — parent ~/x doesn't exist, mauve **Ask Claude**.
+Resolution (`resolve_new`, first match wins, nothing special-cased):
+
+1. an explicit git URL (`scheme://…`, `user@host:path`, `github.com/o/r`,
+   `gh:owner/repo`): `git clone` into ~/code/projects/<repo>. A bare `a/b`
+   is never a clone (`notes/todo` would fetch a stranger's repo): it is a
+   path (2.). The clone goes to a hidden `.<repo>.clone-PID` beside the
+   target and is renamed into place (rename(2): never into or over a folder
+   that appeared meanwhile, which is then just opened); a failure removes
+   only that temp folder and toasts git's first `fatal:`/`error:` line
+2. a path (has a `/`, or starts with `~` `/` `.`): `~` and `/` absolute, `.`
+   relative to the popup's folder (the tab's), anything else relative to
+   ~/code/projects (`cs35l/assign4`). The parent must exist (never `mkdir
+   -p`)
+3. anything else: ~/code/projects/<slug>
+
+The new folder's name is a slug: trimmed, runs of spaces become `-`, only
+`[A-Za-z0-9._-]` kept, case kept; refused when empty, starting with `.` or
+`-`, containing `..`, or over 64 characters. A target that exists (APFS:
+any case) is just opened. What gets made: the folder; `git init -q -b main`
+(no commit) only for a direct child of ~/code/projects not already inside a
+work tree; a `zoxide add`; nothing else (no README, no CLAUDE.md). For a
+direct child of ~/code or ~/code/projects the launchpad catalog is synced in
+the background (`npm run catalog:sync` in ~/code/projects/mackhaymond.co, per
+its CLAUDE.md), via `run-shell -b space.sh catalog-sync`, behind a mkdir lock
+holding its owner's pid (a creation during a run leaves a mark that run picks
+up, re-checked after the lock is released, so quick creations share runs; a
+lock whose owner is dead is taken over), logged to
+~/.local/state/tmux-spaces/catalog-sync.log, a toast only on failure. `set -g
+@space_catalog_sync off` disables it (the tests do). `space.sh create
+[--name] QUERY [CLIENT] [space|shell|agent]` is ^N (⌥⏎) without the popup.
+
+## Pending spaces: a sentence asks Claude
+
+A query that reads like a request (`is_english`, any case: 4+ words; or 2+
+starting with make, create, clone, scaffold, init, write, generate or
+bootstrap; or 3+ starting with build, start, set, new, add (as often nouns:
+"build tools", "start page", "set theory", "new project" stay names) or with
+"set up" / "spin up"; a leading `~` `/` `.`, a `://`, or one word never
+counts) makes ⏎ and ^N start a claude for it instead (`space.sh
+ask-claude`). ⏎ on a sentence ignores the fuzzy matches (a request matches
+some folder more often than not) unless the highlighted row's name is
+exactly the text's slug; ⌥⏎ makes the folder instead:
+
+1. a window in the hidden session `pending` (made on demand, status off) at
+   ~, born an agent (`@agent_birth`), its shell autostarting `claude
+   "$(space.sh pending-prompt)"`: "Mack typed this into the tmux new-space
+   picker: «…». Do what he described … When the folder is ready, run
+   `~/.config/tmux/scripts/space.sh adopt-pending @W <dir>` …", with his
+   client's tty. When claude quits while still pending, the shell exits and
+   the window goes
+2. the next space number N is reserved: a registry row `pending:@W` at the
+   end of the order. Sync counts it as a slot, so a space made meanwhile
+   gets N+1, and drops it once @W has left `pending` (claude quit, a
+   restart; the `window-unlinked[20]` hook syncs for `pending` too)
+3. a popup (70%×60%, centred as the others) on the client, once the
+   picker's popup is gone (`pending-popup` waits for the picker's pid, then
+   opens and checks a viewer attached, three tries; else a toast "claude is
+   working on space N — ⌘N to open"): a nested client of the same server
+   (`space.sh popup-attach`: `env -u TMUX tmux -S <socket> attach-session -t
+   @W`), registered while attached in the global `@pending_viewers` as
+   " NESTED_TTY>OUTER_TTY " tokens. Closing it never stops claude: ⌥N inside
+   it detaches that nested client (M-n detaches a client listed in
+   `@pending_viewers`, never one that is merely in `pending`). If the nested
+   client leaves `pending` (⌥W x, ⌘N typed inside the popup), the
+   `client-session-changed[21]` hook (`space.sh viewer-left`) detaches it,
+   closing the popup, and switches the outer client there. ⌘N on N reopens it
+   (`space.sh pending-go`, the digit keys' miss branch), and so does ⌥W +
+   its letter (`@space_jump_pending`: the one hidden session the letters
+   reach, through `space.sh pending-open`; the client stays where it is),
+   its pin digit when pinned (⌥W N, `@space_pin_pending`), and the NEEDS YOU
+   jump (`agent-jump.sh` next/goto/jump list it like any agent but open its
+   popup instead of switching into `pending`)
+
+`space.sh adopt-pending @W DIR` (claude runs it) makes DIR's space AT N (the
+reservation's row becomes its row, colour included) or, if DIR already has a
+space, reuses it (that space keeps its number; N is freed), moves @W to its
+end (an agent of that space now), clears the pending options, and closes the
+popup if it is open: then the client goes to the new space, otherwise a
+toast says "space N ready: NAME". Spaces mode only. One `pending` session
+holds every pending claude, so two popups open at once on different windows
+would share its current window (rare; each popup attaches by window id).
 
 ## Session names
 
 `new-space`/`open-dir` keep `[A-Za-z0-9_-]` from the folder's basename
 (tmux rewrites `.`/`:` anyway) and add `-2`, `-3`… when the name is taken by a
 different folder, or is one of `@space_hidden_sessions` (a folder called
-`stash` becomes `stash-2`, never a hidden session). The folder is made
-absolute (`cd && pwd`) before matching or creating, so a typed `../x` or `.`
-works. Without zoxide the pickers (⌥N, and the folder rows of CMD+SHIFT+T /
-CMD+SHIFT+R) offer this tab's folder, `~`, and the folders under
-`~/code/projects` and `~/code`.
+`stash` becomes `stash-2`, never a hidden session). A folder nested inside a
+project (under ~, its parent not ~, ~/code or ~/code/projects) is
+`<parent>-<basename>`: ~/code/projects/cs35l/assign4 is `cs35l-assign4`;
+this names new sessions only, existing spaces keep theirs. The folder is made
+absolute with its symlinks resolved (`cd && pwd -P`) before matching or
+creating, so a typed `../x` or `.` works and ~/projects/x (a symlink to
+~/code/projects) is the same space as ~/code/projects/x; the pickers'
+candidates are deduped after resolving too. Without zoxide the pickers (⌥N,
+and the folder rows of CMD+SHIFT+T / CMD+SHIFT+R) offer this tab's folder,
+`~`, and the folders under `~/code/projects` and `~/code`.
 
 ## Rollout
 

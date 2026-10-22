@@ -40,8 +40,8 @@ set-option -g renumber-windows on
 set -g pane-border-lines heavy
 
 # SPACES (docs/spaces.md): sessions as project spaces with an uncloseable home
-# shell; one status line (this space's ⌃N chip, alert chips for other spaces,
-# this space's shells); Ctrl+N space, Option+N shell, Cmd+N agent (WezTerm
+# shell; one status line (this space's ⌘N chip, alert chips for other spaces,
+# this space's shells); Cmd+N space, ⌥W + letter any shell or agent (WezTerm
 # user-keys). The full spaces list lives in the CMD+B sidebar. Everything it
 # changes lives in spaces.conf, sourced at the very bottom of this file.
 # `off` + prefix r gives back the pre-spaces keys and status line (the
@@ -50,7 +50,9 @@ set -g @spaces on
 # Sessions that are never spaces: no tab, no number, never looped by the
 # status line (agents alone has hundreds of windows). Marked @space_hidden 1
 # whatever @spaces says. The ONE list; spaces.conf and space.sh read it.
-set -g @space_hidden_sessions 'agents tasks stash scratch btop-popup'
+# pending holds the claudes a picker's sentence started, until each has made
+# its space (space.sh: pending spaces).
+set -g @space_hidden_sessions 'agents tasks stash scratch btop-popup pending'
 
 #### end general setup ####
 
@@ -711,10 +713,13 @@ if-shell "test -x '{{ .chezmoi.homeDir }}/.local/bin/agent-ui'" {
 
 # Double-tap hyper or right shift in WezTerm (Karabiner, karabiner-base.json) flips
 # back to the previous one of these, like the same double-tap does for Arc tabs:
+#   global   the tab you were on before this one, in ANY space (agent, shell
+#            or home; never a hidden session), and again to come back: an
+#            A<->B flip over Option-X's history (nav.sh last, docs/nav.md)
 #   session  the top row of prefix+a, without the picker
-#   window   last-window
+#   window   last-window (this space only)
 # Change it live, no reload needed: tmux set -g @double_tap_target window
-set -g @double_tap_target 'window'
+set -g @double_tap_target 'global'
 
 set -g @plugin '27medkamal/tmux-session-wizard'
 set -g @session-wizard 'T'
@@ -753,8 +758,20 @@ bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash '' '#{client
 # the mode with just the current tab selected (tinted); the client is then
 # parked in the `stash` key table below, where h/l extend the selection and H
 # — the same key that hides one tab — hides the lot. One key to enter, the
-# same hide key to finish. The bring-back picker takes the nearest gesture
-# fzf allows (Shift-Up/Down or Tab — a plain letter there is filter input).
+# same hide key to finish; prefix+v again (or Esc) drops it. The bring-back
+# picker takes the nearest gesture fzf allows (Shift-Up/Down or Tab — a plain
+# letter there is filter input).
+#
+# The mode is the TINT, not the key table: it lasts while a window of the
+# client's session carries @stash_sel, and guarded root keys (installed only
+# while a selection exists, see below) keep its keys working after the client
+# has been knocked out of the table.
+# @stash_live is that test, one copy for every binding that asks it. Fork-free
+# (a `W:` loop over this session's windows, the same one spaces.conf's tab bar
+# runs), because while they are bound the root keys evaluate it on every h,
+# Enter and Space typed into any pane. Per SESSION, so a selection left up in `main` never steals
+# the keys of a client looking at another space.
+set -g @stash_live '#{W:#{?#{@stash_sel},1,}}'
 #
 # '#{window_id}' is passed for the same reason prefix+H passes it: a bare
 # `display-message -p` inside the script does NOT resolve to the client's
@@ -771,7 +788,12 @@ bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash '' '#{client
 # literal keystroke. Arming the table before the work closes the gap: a repeat
 # then dispatches from the `stash` table and queues behind the running job,
 # which is exactly the serialisation the foreground run-shell is here for.
-bind-key v switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-start here '#{window_id}'"
+#
+# A TOGGLE since 2026-10-21: with a selection live in this session, prefix+v
+# cancels it. It is reachable from inside the mode because tmux takes the
+# prefix key before any table lookup and switches to the prefix table from
+# wherever the client is (checked on 3.7c: in `stash`, C-s v ran this binding).
+bind-key v if -F "#{E:@stash_live}" { run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-cancel" } { switch-client -T stash ; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-start here '#{window_id}'" }
 
 # NOT run-shell -b: two quick taps backgrounded both read the same cursor and
 # both wrote cursor+1, so the selection stopped growing while the keys kept
@@ -813,15 +835,60 @@ bind-key -T stash Space  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-ca
 #
 # Shadowing those with explicit no-op bindings is NOT available: tmux 3.6
 # rejects `MouseMovePane`, `FocusIn` and `FocusOut` as unknown key names
-# (checked). So the fallback goes, and an unbound key now falls through to root
-# and reaches the pane, leaving the tint painted.
+# (checked). So the fallback went.
 #
-# That is survivable because the tint is self-healing rather than modal: every
-# sel-start clears the flag server-wide before selecting, and a single
-# prefix+H clears it too (see do_stash), and prefix+v restarts it. The one
-# escape this cannot catch is the prefix key itself, which tmux intercepts
-# before any binding lookup — so a binding for it in THIS table would never
-# run. prefix followed by either of those is therefore the way out.
+# WITHOUT it the table could not hold the mode either (2026-10-21). Mack was
+# found with the tint painted and his client in ROOT, every mode key going to
+# the pane: he had clicked into the WezTerm sidebar and back. Measured on a
+# private 3.7c server (mouse on, focus-events on, client parked in `stash`),
+# each of these puts the client back in root:
+#   - any key `stash` does not bind, typed or `send-keys -K` — and it is
+#     SWALLOWED, not passed to the pane: tmux does not forward a key that
+#     missed in a table other than the one the lookup began in;
+#   - a click in a pane or on the status line, a wheel step (root's mouse
+#     bindings then run as usual);
+#   - FocusOut and FocusIn, separately — so leaving the tmux pane for the
+#     sidebar drops it, and so does Cmd-Tab. The pane still gets its focus
+#     report: focus reaches panes outside the key-table lookup;
+#   - switch-client to another session.
+# Pointer motion alone (DEC 1003) does NOT, and neither does select-window.
+#
+# So while a selection exists the keys are in ROOT too, guarded by
+# @stash_live: with a selection up in this session they do exactly what their
+# `stash` binding does (h/l re-arm the table as they go); otherwise
+# `send-keys` hands the key to the pane. The guard is fork-free, and the
+# pass-through is byte-exact: tests/test_stash_keys.py compares what a pane
+# reads with and without these bindings, typed singly, in a burst and as a
+# bracketed paste, plus a tree-mode pane that takes `q`. Re-injecting the key
+# instead (`send-keys -K`, one source of truth with the table) was tried and
+# dropped: -K queues at the END of the client's queue, so in a burst ("hello")
+# the re-injected h ran after the keys typed behind it.
+#
+# ONLY while a selection exists — they are NOT bound here. They first went in
+# for good, and review caught the cost the same day: a key that misses in the
+# PREFIX table is retried in root, and tmux swallows it only when root has no
+# binding either. Bound permanently, C-s Esc reached the pane as \x1b (which
+# interrupts a Claude turn), C-s Enter as \r, C-s C-c as \x03. So they live in
+# scripts/stash-root-keys.conf: sel-start `source-file`s it when it paints a
+# selection, and stash.sh's sel_clear — the one path every ending goes through
+# (sel-cancel, the park, sel-send, prefix+H, the next sel-start's wipe) —
+# unbinds the ten keys in one call, gated on @stash_root_bound so a prefix+H
+# with no selection pays nothing. That unbind would take any OTHER root binding
+# of those keys with it; there is none, so keep it that way. A server restart
+# starts with none bound. A selection that ends some other way (its tabs
+# closed by hand) leaves them bound but guarded, i.e. inert, until the next
+# clear; while bound, a prefix miss on one of them in a session with NO
+# selection still reaches the pane (the guard sends it on).
+#
+# The table stays, for what root cannot do: in it the mode's keys come before
+# a copy-mode pane's own h/l/q (root is consulted only after copy-mode-vi),
+# and the sidebar reads `#{client_key_table}` = stash as "armed". The root
+# keys must stay identical to the table's bindings; the test checks it.
+#
+# Ending the mode is therefore explicit: Esc / q / C-c / Space, prefix+v,
+# H / Enter (park), m / a (move), or prefix+H, which clears the selection
+# before parking its one tab (see do_stash). sel-start also clears any old tint
+# server-wide, so a fresh prefix+v anywhere never inherits a stale one.
 
 # CMD+SHIFT+W (wezterm) → prefix C-l: CMD+W without the y/n, still remembered
 # on the closed-tabs stack so CMD+Z brings it back.
@@ -906,7 +973,10 @@ bind-key C-s run-shell '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-sa
 #           (80 at once on 2026-08-29; saves had reached 173 panes).
 #   tasks   the task broker (CuaNotch agentd) recreates it and resumes tasks
 #           on demand; resurrect must never relaunch its panes.
-set -g @resurrect-exclude-sessions 'agents tasks ptymcp-*'
+#   pending claudes a picker's sentence started (space.sh, pending spaces).
+#           What makes one pending is window options resurrect cannot save,
+#           and a restart frees the space numbers they held anyway.
+set -g @resurrect-exclude-sessions 'agents tasks ptymcp-* pending'
 
 # After every save:
 #   assistant-save.sh  the plugin's assistant detection with its --help parse

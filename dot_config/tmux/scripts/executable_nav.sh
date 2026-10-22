@@ -7,16 +7,21 @@
 #   nav.sh attach <client_name>           fresh history (a tty can be reused)
 #   nav.sh forget <client_name>           the client detached: drop its history
 #   nav.sh back|forward <client_name>     the keys
+#   nav.sh last <client_name>             the double-tap: flip to the previous tab
 #   nav.sh show <client_name>             debugging: the history, one per line
 #
 # HISTORY, per client. tmux has no client-scoped user options, so it lives in
 # two globals keyed by the client name (non-alphanumerics -> _):
-#   @nav_<key>     = "<cur>|<back...>|<forward...>"
+#   @nav_<key>     = "<cur>|<back...>|<forward...>|<prev>"
 #   @nav_seq_<key> = a counter bumped by every write
 # An entry is "<session_id>:<window_id>" ($3:@12). <back> is oldest first and
 # pops from its end; so does <forward>. A navigation pushes <cur> onto <back>
 # (unless back's last entry is the same window: consecutive duplicates
 # collapse), caps <back> at NAV_CAP (50), clears <forward>, and becomes <cur>.
+# <prev> is the tab the client was on just before <cur>, however it left it
+# (a navigation, back, forward or last): every write that changes <cur>'s
+# window sets it to the old <cur>. Only last reads it. A value written before
+# <prev> existed has three fields; its <prev> reads as empty.
 #
 # RECORDING. The hooks (session-window-changed, client-session-changed) fire
 # for every focus change, whatever caused it: keys, clicks, the sidebar,
@@ -56,6 +61,16 @@
 # session (a popup client, say) records nothing; back from there returns to
 # <cur>. The sidebar's focus notification is already posted by the
 # session-window-changed[50] / client-session-changed[50] hooks the move fires.
+#
+# LAST IS A NAVIGATION. The double-tap (double-tap-switch.sh, Karabiner) goes
+# to <prev>, the tab just left, in ANY space, whether it was left by a click,
+# Option-X or Option-C. Not back's end: after Option-X that is the tab before
+# the one you were on, and the one you left sits on forward. If <prev> is gone
+# or hidden (or empty), last pops back's end like back does, with the same
+# skipping. Then it is an ordinary move: <cur> goes onto back (back's own last
+# entry is dropped first when it IS the target, so flipping does not grow
+# back), forward is cleared, and <prev> becomes the tab left, so the next
+# double-tap returns: a true A<->B flip, the way Arc's Ctrl+Tab flips tabs.
 
 set -o pipefail
 
@@ -78,7 +93,7 @@ ROWS=$NL
 mode="${1:-}"
 
 usage() {
-    echo "usage: nav.sh record client <client> | record session <session_id> | attach|forget|back|forward|show <client>" >&2
+    echo "usage: nav.sh record client <client> | record session <session_id> | attach|forget|back|forward|last|show <client>" >&2
     exit 2
 }
 
@@ -114,7 +129,7 @@ notify_user() {
 say() { notify_user -c "$client" -k warn -- "${1//\#/##}"; }
 
 # load [windows]: ONE tmux call. Sets act (the client's "<session>:<window>"
-# now), act_hidden, seq, state, cur, back[], fwd[]; with `windows`, also
+# now), act_hidden, seq, state, cur, back[], fwd[], prev; with `windows`, also
 # ROWS: "\n<session>:<window> <hidden>\n..." for every linked window
 # (without it, ROWS keeps its last listing). Fails if the client is not
 # attached.
@@ -137,7 +152,7 @@ load() {
     done <<<"$out"
     [ -n "$act" ] || return 1
     local bs fs
-    IFS='|' read -r cur bs fs <<<"$state"
+    IFS='|' read -r cur bs fs prev <<<"$state"
     back=() fwd=()
     read -ra back <<<"$bs"
     read -ra fwd <<<"$fs"
@@ -150,7 +165,7 @@ load() {
 # 2 the list failed (the move's target vanished, or the client left).
 commit() {
     local IFS=' ' new next r
-    new="$cur|${back[*]}|${fwd[*]}"
+    new="$cur|${back[*]}|${fwd[*]}|$prev"
     case "$seq" in '' | *[!0-9]*) next=1 ;; *) next=$((seq + 1)) ;; esac
     r=$(tmux if-shell -F "#{==:#{@nav_seq_${K}},${seq}}" \
         "${1:-}set-option -g @nav_${K} '${new}' ; set-option -g @nav_seq_${K} ${next}" \
@@ -194,6 +209,7 @@ catch_up() {
     if [ "${act#*:}" != "${cur#*:}" ]; then
         push_back "$cur"
         fwd=()
+        prev=$cur
     fi
     cur=$act                           # same window seen via another session: no step
     return 0
@@ -224,24 +240,32 @@ record_one() {
     done
 }
 
-move() {                               # move back|forward
+move() {                               # move back|forward|last
     local dir=$1 e n found rc races=0 fails=0 list=windows
     while load $list; do
         list=                          # retries after a lost race keep ROWS
         found=
         if [ "$act_hidden" = 1 ]; then
-            # In a hidden session: back (or forward) means "out of here".
+            # In a hidden session: back (or forward, or last) means "out of here".
             [ -n "$cur" ] && resolve "$cur" && found=here
         else
             catch_up
         fi
+        # last: the tab just left, when it is still there to go to; the back
+        # entry naming it goes (a flip must not grow back), else back's end.
+        if [ -z "$found" ] && [ "$dir" = last ] && [ -n "$prev" ] &&
+            [ "${prev#*:}" != "${cur#*:}" ] && resolve "$prev"; then
+            found=1
+            n=${#back[@]}
+            [ "$n" -gt 0 ] && [ "${back[n-1]#*:}" = "${prev#*:}" ] && back=("${back[@]:0:n-1}")
+        fi
         while [ -z "$found" ]; do
-            if [ "$dir" = back ]; then n=${#back[@]}; else n=${#fwd[@]}; fi
+            if [ "$dir" = forward ]; then n=${#fwd[@]}; else n=${#back[@]}; fi
             [ "$n" -gt 0 ] || break
-            if [ "$dir" = back ]; then
-                e=${back[n-1]}; back=("${back[@]:0:n-1}")
-            else
+            if [ "$dir" = forward ]; then
                 e=${fwd[n-1]}; fwd=("${fwd[@]:0:n-1}")
+            else
+                e=${back[n-1]}; back=("${back[@]:0:n-1}")
             fi
             [ "${e#*:}" = "${cur#*:}" ] && continue
             resolve "$e" && found=1
@@ -249,11 +273,20 @@ move() {                               # move back|forward
         if [ -z "$found" ]; then
             commit                     # keep the catch-up and the dropped entries
             if [ $? -eq 1 ] && ((++races < MAX_RACES)); then continue; fi
-            if [ "$dir" = back ]; then say "nothing to go back to"; else say "nothing to go forward to"; fi
+            case $dir in
+                back) say "nothing to go back to" ;;
+                forward) say "nothing to go forward to" ;;
+                *) say "no previous tab" ;;
+            esac
             return 0
         fi
         if [ "$found" = 1 ]; then
-            if [ "$dir" = back ]; then push_fwd "$cur"; else push_back "$cur"; fi
+            case $dir in
+                back) push_fwd "$cur" ;;
+                forward) push_back "$cur" ;;
+                *) push_back "$cur"; fwd=() ;;   # last: a new navigation
+            esac
+            prev=$cur
         fi
         cur=$go
         moves_to "$go"
@@ -290,7 +323,7 @@ case "$mode" in
         K=${client//[^A-Za-z0-9]/_}
         for ((i = 0; i < TRIES; i++)); do
             load || break
-            back=() fwd=() cur=
+            back=() fwd=() cur= prev=
             [ "$act_hidden" = 0 ] && cur=$act
             commit && break
         done
@@ -300,7 +333,7 @@ case "$mode" in
         K=${client//[^A-Za-z0-9]/_}
         tmux set-option -gu "@nav_${K}" \; set-option -gu "@nav_seq_${K}" 2>/dev/null
         ;;
-    back | forward)
+    back | forward | last)
         client="${2:-}"; [ -n "$client" ] || usage
         K=${client//[^A-Za-z0-9]/_}
         move "$mode"
@@ -312,6 +345,7 @@ case "$mode" in
         printf 'cur %s\n' "$cur"
         for e in "${back[@]}"; do printf 'back %s\n' "$e"; done
         for e in "${fwd[@]}"; do printf 'fwd %s\n' "$e"; done
+        printf 'prev %s\n' "$prev"
         ;;
     *) usage ;;
 esac

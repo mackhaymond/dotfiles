@@ -121,9 +121,27 @@ pub const SCOPE_OPTION: &str = "@strip_scope";
 const ESC_WAIT: Duration = Duration::from_millis(25);
 /// How long a footer message stays.
 const SAY_FOR: f64 = 4.0;
+/// How long the pause banner's void chip stays armed after its first click
+/// ([`Target::Void`]): a second click within it voids, else it reverts.
+pub const VOID_ARM: Duration = Duration::from_secs(3);
+/// How long after arming the armed chip ignores clicks: a confirm is a
+/// second, deliberate click, never the tail of a fast double click.
+pub const VOID_FLOOR: Duration = Duration::from_millis(700);
+
+/// The pause banner's void chip, armed by a first click ([`App::void`]).
+#[derive(Debug, Clone, PartialEq)]
+struct VoidArm {
+    /// When (a re-arm starts it over).
+    at: Instant,
+    /// The settled phase it was armed on.
+    phase: pause::Phase,
+    /// The pause it was armed on: `paused.json`'s `paused_at` as written
+    /// ([`pause::Reader::stamp`]).
+    stamp: Option<String>,
+}
 
 const USAGE: &str = "usage: agent-ui sidebar [--client <tty>] [--tmux-pane <id>] [--wezterm <path>]
-       agent-ui sidebar --once <W>x<H> [--client <tty>]
+       agent-ui sidebar --once <W>x<H> [--client <tty>] [--void-armed]
        agent-ui sidebar --repair [-v]";
 
 fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
@@ -209,7 +227,12 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
     let bar = Bar::build(&core.snapshot, client.as_deref());
     // The pause banner from the RAW snapshot too (the script reads the
     // window options as tmux holds them).
-    let pause = pause::Reader::home().phase(&pause::windows(&core.snapshot));
+    let mut reader = pause::Reader::home();
+    let pause = reader.phase(&pause::windows(&core.snapshot));
+    let glow_off = reader.glow_off();
+    // (`--void-armed`, for previews: the banner as a first click on its
+    // void chip leaves it.)
+    let void_armed = args.iter().any(|a| a == "--void-armed");
     hide_homes(&mut core.snapshot);
     // Letters as the live sidebar would assign them; `--once` never writes.
     let (mut view, _) = build_view(&mut core, client.as_deref(), None);
@@ -219,7 +242,7 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
     if !crate::insight::disabled() {
         crate::insight::fill(&mut view, &crate::insight::Engine::home().update(&core.snapshot, text::now()));
     }
-    let opts = Opts { msg: None, bar, spin: 0, now: None, pause, ctx: layout::CtxStyle::from_env() };
+    let opts = Opts { msg: None, bar, spin: 0, now: None, pause, void_armed, glow_off, ctx: layout::CtxStyle::from_env() };
     let frame = layout(&view, w, h, &opts);
     let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
     layout::paint(&frame, &mut buf);
@@ -274,7 +297,8 @@ fn build_view(core: &mut Core, client: Option<&str>, keys: Option<&mut KeyMemo>)
                 sp.plain.sort_by_key(|a| a.index);
             }
         }
-        if !sp.agents.is_empty() || scoped.as_ref() == Some(&sp.name) {
+        // (A pending space has no folder yet: no branch.)
+        if (!sp.agents.is_empty() || scoped.as_ref() == Some(&sp.name)) && sp.pending.is_none() {
             sp.branch = core.git.branch(&sp.path, now);
         }
     }
@@ -368,11 +392,14 @@ const PARK_WATCH: f64 = 15.0;
 /// The click targets a left press trusts only once they have settled
 /// under the pointer ([`crate::answer::Arrivals`]): an answer chip (it
 /// types into an agent), a diff badge (it opens a popup), the pause
-/// banner's resume (it messages every paused agent) and its held rows
-/// (when the held agent stops, the banner settles and its resume row can
-/// land right where a held row was).
+/// banner's resume (it messages every paused agent), its held rows (when
+/// the held agent stops, the banner settles and its resume row can land
+/// right where a held row was) and its void chip, quiet or armed (a click
+/// aimed at a row a relayout moved must never arm or confirm a void; and
+/// the armed chip is new under the pointer, so a double click on the quiet
+/// one never voids).
 fn guarded(t: &Target) -> bool {
-    matches!(t, Target::Answer { .. } | Target::Diff(_) | Target::Resume | Target::Held { .. })
+    matches!(t, Target::Answer { .. } | Target::Diff(_) | Target::Resume | Target::Held { .. } | Target::Void | Target::VoidArmed)
 }
 
 /// Every cell of `f` whose click target ([`Frame::target`]) is [`guarded`].
@@ -485,6 +512,19 @@ struct App {
     pause_windows: pause::Windows,
     /// The pause banner's phase, as of the last read.
     pause_phase: Option<pause::Phase>,
+    /// The saved set's glow is dismissed ([`pause::Reader::glow_off`]): the
+    /// banner says `glow off`.
+    glow_off: bool,
+    /// Which pause the banner shows: `paused.json`'s `paused_at` as written
+    /// ([`pause::Reader::stamp`]), as of the last read.
+    pause_stamp: Option<String>,
+    /// The banner's void chip, armed by a first click. Armed for
+    /// [`VOID_ARM`], and only while the phase and the pause are still the
+    /// ones it was armed on ([`App::void_armed`]).
+    void: Option<VoidArm>,
+    /// The last `agent-pause.py` line the banner handed `run-shell -b`
+    /// (resume or void; observable for the tests).
+    pause_ran: Option<String>,
     /// The pins' state file kept in step with the windows ([`crate::pins`]);
     /// None: not this sidebar's job (`--once`, tests, another server).
     pins: Option<crate::pins::Sync>,
@@ -552,6 +592,10 @@ impl App {
             pause: if cfg!(test) { pause::Reader::new("/nonexistent".into()) } else { pause::Reader::home() },
             pause_windows: pause::Windows::default(),
             pause_phase: None,
+            glow_off: false,
+            pause_stamp: None,
+            void: None,
+            pause_ran: None,
             // (Turned on by `live` only, with the registry: never in tests.)
             pins: None,
             pin_keys: crate::pins::KeyMemo::default(),
@@ -617,6 +661,30 @@ impl App {
     /// changed) against the last snapshot's windows.
     fn check_pause(&mut self) {
         self.pause_phase = self.pause.phase(&self.pause_windows);
+        self.glow_off = self.pause.glow_off();
+        self.pause_stamp = self.pause.stamp();
+        // The pause moved on (settled otherwise, resumed, voided, a new
+        // pause): the void chip's question was about the old one.
+        if !self.void.as_ref().is_some_and(|v| self.void_same(v)) {
+            self.void = None;
+        }
+    }
+
+    /// The banner still shows the phase and the pause `v` was armed on.
+    fn void_same(&self, v: &VoidArm) -> bool {
+        self.pause_phase.as_ref() == Some(&v.phase) && self.pause_stamp == v.stamp
+    }
+
+    /// The void chip is armed at `now`: a first click less than
+    /// [`VOID_ARM`] ago, on the phase and the pause still shown.
+    fn void_armed(&self, now: Instant) -> bool {
+        self.void.as_ref().is_some_and(|v| now.saturating_duration_since(v.at) < VOID_ARM && self.void_same(v))
+    }
+
+    /// When the armed chip reverts (a redraw then), while it is armed.
+    fn void_due(&self, now: Instant) -> Option<Instant> {
+        let v = self.void.as_ref().filter(|_| self.void_armed(now))?;
+        Some(v.at + VOID_ARM + Duration::from_millis(5))
     }
 
     /// The bar to draw: the snapshot's, less the toasts dismissed here.
@@ -839,6 +907,10 @@ impl App {
     /// hook, whose agent-state notice redraws every sidebar at once.
     fn park(&mut self, t: &Target) {
         let Target::Go { win, session } = t else { return };
+        // A pending space's claude has no space to come back to: nothing.
+        if self.core.snapshot.row_in(win, session).is_some_and(crate::tmux::Window::is_pending) {
+            return;
+        }
         self.last_park = Some((win.clone(), session.clone()));
         match self.actions.park(&self.core.snapshot, win, session) {
             Ok(m) => {
@@ -1030,6 +1102,8 @@ impl App {
                 self.actions.go(snap, &client, &win, &session).map(|_| true)
             }
             Target::Session(s) => self.actions.goto_session(snap, &client, &s).map(|_| true),
+            // A popup: the client stays where it is.
+            Target::Pending(win) => self.actions.open_pending(snap, &client, &win).map(|_| false),
             Target::Next => self.actions.next(&client).map(|_| true),
             Target::Back => self.actions.back(&client).map(|_| true),
             Target::Menu(tab) => {
@@ -1060,8 +1134,30 @@ impl App {
                 // prefix P's resume half alone (run-shell -b, as its
                 // binding): its popup on this client. `resume` does nothing
                 // when nothing is saved, so a stale banner never pauses.
-                self.actions.resume_paused(&client);
+                self.void = None;
+                self.pause_ran = Some(self.actions.resume_paused(&client));
                 self.say("resuming the paused agents…");
+                Ok(false)
+            }
+            // The void chip, armed and still armed (not reverted, the same
+            // phase and pause), past its floor: `agent-pause.py void
+            // <client>`, run as the resume.
+            Target::VoidArmed if self.void_armed(Instant::now()) => {
+                if self.void.as_ref().is_some_and(|v| v.at.elapsed() < VOID_FLOOR) {
+                    // Too soon after the first click: ignored, still armed.
+                    return;
+                }
+                self.void = None;
+                self.pause_ran = Some(self.actions.void_paused(&client));
+                self.say("voiding the pause…");
+                Ok(false)
+            }
+            // A first click (or one on a chip that has just reverted): arm
+            // it, from now (the floor again); the next frame asks "void?
+            // click again".
+            Target::Void | Target::VoidArmed => {
+                let stamp = self.pause_stamp.clone();
+                self.void = self.pause_phase.clone().filter(pause::Phase::clickable).map(|phase| VoidArm { at: Instant::now(), phase, stamp });
                 Ok(false)
             }
             Target::Restart | Target::Scope | Target::Toast(_) | Target::Answer { .. } | Target::Diff(_) => Ok(false),
@@ -1101,7 +1197,16 @@ impl App {
         let spin = self.spin_at(Instant::now());
         // Ages at this frame's clock (no tmux call), so a spinner frame
         // between snapshots never shows a stale one.
-        let opts = Opts { msg, bar: self.shown_bar(), spin, now: Some(now), pause: self.pause_phase.clone(), ctx: layout::CtxStyle::from_env() };
+        let opts = Opts {
+            msg,
+            bar: self.shown_bar(),
+            spin,
+            now: Some(now),
+            pause: self.pause_phase.clone(),
+            void_armed: self.void_armed(Instant::now()),
+            glow_off: self.glow_off,
+            ctx: layout::CtxStyle::from_env(),
+        };
         let frame = layout(&self.view, size.width, size.height, &opts);
         let mut buf = Buffer::empty(Rect::new(0, 0, size.width, size.height));
         layout::paint(&frame, &mut buf);
@@ -1160,6 +1265,10 @@ impl App {
             // Only while a toast is on screen: its expiry.
             if let Some(t) = self.toast_due(now) {
                 wake = wake.min(t);
+            }
+            // Only while the void chip is armed: when it reverts.
+            if let Some(v) = self.void_due(now) {
+                wake = wake.min(v);
             }
             // Only while the insight worker holds a snapshot: its result.
             if let Some(i) = self.insights_due(now) {
@@ -1950,6 +2059,128 @@ mod tests {
 
     fn a_held() -> Vec<pause::Held> {
         vec![pause::Held { label: "P0a".into(), window_id: "@1".into(), session: "main".into(), ..Default::default() }]
+    }
+
+    /// The settled banner's void chip (docs/agent-pause.md "Dismiss and
+    /// void"), confirmed: a first click only arms it ("void? click again");
+    /// a second within [`VOID_ARM`] runs `agent-pause.py void <client>`
+    /// through run-shell -b, as the resume runs (the line recorded; the
+    /// server is missing here, so nothing runs). Both chips are guarded: a
+    /// click on one that just arrived does nothing (so a double click never
+    /// voids), and the armed one ignores clicks for [`VOID_FLOOR`] after
+    /// arming (a re-arm starts that over). Armed, it reverts after
+    /// [`VOID_ARM`] or once the phase or the pause (`paused_at`) changes;
+    /// anywhere else on the banner still resumes.
+    #[test]
+    fn the_void_chip_arms_then_voids() {
+        let mut a = app();
+        a.link.client = Some("/dev/ttys999".into());
+        let frame = |a: &App| layout(&a.view, 34, 30, &Opts { pause: a.pause_phase.clone(), void_armed: a.void_armed(Instant::now()), ..Opts::default() });
+        let settled = Instant::now() - crate::answer::SETTLE;
+        let click = |a: &mut App, t: Target| {
+            // (SGR is 1-based.)
+            let x = (0..34).find(|&x| a.shown.target(x, 0) == Some(&t)).unwrap_or_else(|| panic!("no {t:?}")) + 1;
+            a.handle(format!("\x1b[<0;{x};1M\x1b[<0;{x};1m").as_bytes());
+        };
+        let msg = |a: &App| a.msg.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
+        let safe = pause::Phase::Safe { labels: vec!["One".into()] };
+        const AT: &str = "2026-10-21T18:00:00-07:00";
+        a.pause_phase = Some(safe.clone());
+        a.pause_stamp = Some(AT.into());
+        // Only just drawn: the chip is not trusted yet.
+        a.show(frame(&a), Instant::now());
+        click(&mut a, Target::Void);
+        assert!((a.last_act.clone(), a.void.is_none()) == (None, true), "{:?}", a.last_act);
+        assert_eq!(msg(&a), "that card just moved · click again");
+        // Settled: the first click arms it, nothing runs; the next frame
+        // asks.
+        a.arrivals = Default::default();
+        a.show(frame(&a), settled);
+        click(&mut a, Target::Void);
+        assert_eq!((a.last_act.clone(), a.pause_ran.clone()), (Some(Target::Void), None));
+        assert!(a.void_armed(Instant::now()));
+        assert!(a.void_due(Instant::now()).is_some_and(|d| d <= Instant::now() + VOID_ARM + Duration::from_millis(5)));
+        a.show(frame(&a), Instant::now());
+        assert!(texts_of(&a.shown)[0].contains("✕ void?"), "{:#?}", texts_of(&a.shown));
+        // A second click at once (a double click): the armed chip only just
+        // arrived, so nothing voids, and it stays armed.
+        a.last_act = None;
+        click(&mut a, Target::VoidArmed);
+        assert_eq!((a.last_act.clone(), a.pause_ran.clone()), (None, None));
+        assert!(a.void_armed(Instant::now()));
+        // Settled under the pointer, but within [`VOID_FLOOR`] of the
+        // arming click: ignored, still armed.
+        a.arrivals = Default::default();
+        a.show(frame(&a), settled);
+        click(&mut a, Target::VoidArmed);
+        assert_eq!(a.pause_ran, None);
+        assert!(a.void_armed(Instant::now()));
+        // Past the floor (the clock injected): the void, exactly as the
+        // resume runs.
+        a.void.as_mut().unwrap().at = Instant::now() - VOID_FLOOR;
+        click(&mut a, Target::VoidArmed);
+        let script = a.actions.scripts.join("agent-pause.py");
+        let line = format!("{} 'void' '/dev/ttys999'", sh_quote(&script.to_string_lossy()));
+        assert_eq!(a.actions.void_line("/dev/ttys999"), line);
+        assert_eq!((a.last_act.clone(), a.pause_ran.clone()), (Some(Target::VoidArmed), Some(line)));
+        assert_eq!(msg(&a), "voiding the pause…");
+        assert!(a.void.is_none() && !a.void_armed(Instant::now()));
+        // Timed out (the clock injected): it reverts; a click on the armed
+        // chip still on screen arms afresh, never voids, and its floor
+        // starts over.
+        let arm = |at: Instant, phase: &pause::Phase| Some(VoidArm { at, phase: phase.clone(), stamp: Some(AT.into()) });
+        a.pause_ran = None;
+        a.void = arm(Instant::now() - VOID_ARM, &safe);
+        assert!(!a.void_armed(Instant::now()) && a.void_due(Instant::now()).is_none());
+        a.void = arm(Instant::now() - VOID_ARM + Duration::from_millis(50), &safe);
+        assert!(a.void_armed(Instant::now()));
+        assert!(!a.void_armed(Instant::now() + Duration::from_millis(60)));
+        a.void = arm(Instant::now() - VOID_ARM, &safe);
+        assert!(texts_of(&frame(&a))[0].contains(" ✕  "), "{:#?}", texts_of(&frame(&a)));
+        a.arrivals = Default::default();
+        a.void = arm(Instant::now(), &safe);
+        a.show(frame(&a), settled);
+        a.void = arm(Instant::now() - VOID_ARM, &safe);
+        click(&mut a, Target::VoidArmed);
+        assert_eq!(a.pause_ran, None);
+        assert!(a.void_armed(Instant::now()));
+        assert!(a.void.as_ref().is_some_and(|v| v.at.elapsed() < VOID_FLOOR));
+        click(&mut a, Target::VoidArmed);
+        assert_eq!(a.pause_ran, None);
+        // Armed on THIS pause (`paused_at`): another one (voided and paused
+        // again, the same labels, so the same phase) disarms it.
+        assert_eq!(a.void.as_ref().and_then(|v| v.stamp.clone()), Some(AT.to_string()));
+        a.pause_stamp = Some("2026-10-21T19:00:00-07:00".into());
+        assert!(!a.void_armed(Instant::now()));
+        a.pause_stamp = Some(AT.into());
+        assert!(a.void_armed(Instant::now()));
+        // The phase changes (a wake: ready): disarmed, the chip quiet again.
+        let ready = pause::Phase::Ready { labels: vec!["One".into()] };
+        a.pause_phase = Some(ready.clone());
+        assert!(!a.void_armed(Instant::now()));
+        assert!(frame(&a).rows[0].targets.iter().any(|(_, _, t)| *t == Target::Void));
+        // ... and a re-read drops it (here: no files, so no banner at all).
+        a.check_pause();
+        assert!(a.void.is_none() && a.pause_phase.is_none() && a.pause_stamp.is_none());
+        // Ready has the chip too; a plain click anywhere else on the banner
+        // resumes (and disarms).
+        a.pause_phase = Some(ready);
+        a.arrivals = Default::default();
+        a.show(frame(&a), settled);
+        click(&mut a, Target::Void);
+        assert!(a.void_armed(Instant::now()));
+        a.handle(b"\x1b[<0;5;2M\x1b[<0;5;2m");
+        assert_eq!(a.last_act, Some(Target::Resume));
+        assert_eq!(a.pause_ran, Some(a.actions.resume_line("/dev/ttys999")));
+        assert!(a.void.is_none());
+        // A banner still moving has no chip to click.
+        a.pause_phase = Some(pause::Phase::Stopping { stopped: 0, n: 1, working: vec!["One".into()], held: vec![] });
+        assert!(!frame(&a).rows.iter().any(|r| r.targets.iter().any(|(_, _, t)| matches!(t, Target::Void | Target::VoidArmed))));
+    }
+
+    /// The frame's rows as text.
+    fn texts_of(f: &Frame) -> Vec<String> {
+        f.rows.iter().map(Row::text).collect()
     }
 
     #[test]

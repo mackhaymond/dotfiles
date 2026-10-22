@@ -19,14 +19,13 @@
 #                             @space_color) in step. `load` (config
 #                             load) and `reconcile` also recreate registered
 #                             spaces that are missing and restore their folder.
-#   (agent/shell/next/prev/toggle take an optional trailing CLIENT, for
+#   (shell/next/prev/toggle take an optional trailing CLIENT, for
 #    messages; all refuse a hidden session)
-#   agent N SID               go to agent N of session SID (1-based ordinal
-#                             among windows with @agent_state, by window_index;
-#                             the agent sidebar numbers agents the same way)
-#   shell N SID               go to shell N of SID (same ordinal, among shells,
-#                             home = 1; no key runs it since Option-N was
-#                             dropped: shells are reached by letter, ⌥W)
+#   shell N SID               go to shell N of SID (1-based ordinal among
+#                             shells by window_index, home = 1; no key runs it
+#                             since Option-N was dropped: shells are reached by
+#                             letter, ⌥W. Its twin `agent N`, ⌘N's, went when
+#                             ⌘N became the space key)
 #   next|prev SID             on an agent: next / previous agent; on a shell:
 #                             next / previous shell; wrapping
 #   respawn-home PANE         the pane-died hook: a home shell (or dashboard)
@@ -40,7 +39,7 @@
 #   open-dir DIR [CLIENT]     the same without the picker
 #   pick-tab shell|agent CLIENT
 #                             which space? (run inside display-popup): the
-#                             spaces in ⌃N order, then zoxide's folders; a
+#                             spaces in ⌘N order, then zoxide's folders; a
 #                             pick (or a typed folder) runs new-tab
 #   new-tab shell|agent TARGET [CLIENT]
 #                             a new shell / claude tab at the END of space
@@ -50,7 +49,19 @@
 #                             in a space made just now is its home, no extra
 #                             tab. Never renames, closes or reorders a space
 #   preview-tab KEY           pick-tab's preview of one row
-#   close SID CLIENT         close a space for good: every tab through
+#   create [--name] QUERY [CLIENT] [space|shell|agent]
+#                             the pickers' ^N: make the folder QUERY names
+#                             (a name, a path, owner/repo, a git URL) and open
+#                             it as picking it would (see "create from the
+#                             query"); new-hint / enter-key / new-key are the
+#                             pickers' fzf helpers, catalog-sync its background
+#                             launchpad catalog run
+#   ask-claude CLIENT TEXT    a sentence typed in a picker: a claude in the
+#                             hidden `pending` session holding the next space
+#                             number, in a popup ("pending spaces");
+#                             pending-open / pending-go (⌘N on that number) /
+#                             pending-prompt / adopt-pending WID DIR go with it
+#   close SID CLIENT        close a space for good: every tab through
 #                             @space_closer (closed-tabs.sh, so CMD+Z can bring
 #                             it back), unregister, kill the session. Never main
 #   move-menu WID CLIENT      menu of spaces; picking one runs move-to
@@ -297,6 +308,17 @@ cmd_sync() {
   add() { ((${#args[@]})) && args+=(";"); args+=("$@"); }
   local i
   reg_load
+  # Reserved numbers (ask-claude, "pending spaces" below): a registry row
+  # "pending:@W" holds space number N for the claude window @W waiting in the
+  # hidden `pending` session. Its windows and their @pending_space, read only
+  # when the registry has such a row.
+  local -a PW_ID=() PW_N=()
+  local pw pn
+  if [[ " ${R_NAME[*]+"${R_NAME[*]}"} " == *" pending:"* ]]; then
+    while IFS="$US" read -r pw pn; do
+      [[ "$pw" == @* ]] && PW_ID+=("$pw") PW_N+=("$pn")
+    done < <(t list-windows -t '=pending' -F "#{window_id}${US}#{@pending_space}" 2>/dev/null)
+  fi
   local -a recreate=() repath=()
   if ((struct)); then
     local changed=0 ri rn
@@ -334,6 +356,13 @@ cmd_sync() {
     for ((ri = ${#R_NAME[@]} - 1; ri >= 0; ri--)); do
       rn="${R_NAME[ri]}"
       local live=0
+      # A reservation lives as long as its window waits in `pending`; gone
+      # (claude quit without adopt-pending, a restart): the number is free.
+      if [[ "$rn" == pending:* ]]; then
+        for pw in "${PW_ID[@]+"${PW_ID[@]}"}"; do [[ "$pw" == "${rn#pending:}" ]] && { live=1; break; }; done
+        ((live)) || { reg_del "$ri"; changed=1; }
+        continue
+      fi
       for i in "${!S_NAME[@]}"; do [[ "${S_NAME[i]}" == "$rn" ]] && { live=1; break; }; done
       ((live)) && continue
       if [[ "$mode" == "reconcile" ]]; then
@@ -366,6 +395,11 @@ cmd_sync() {
   done
   for rn2 in "${R_NAME[@]+"${R_NAME[@]}"}"; do
     [[ "$rn2" == "main" ]] && continue
+    # A reservation takes its place in the order (P@W) while its window lives.
+    if [[ "$rn2" == pending:* ]]; then
+      for pw in "${PW_ID[@]+"${PW_ID[@]}"}"; do [[ "$pw" == "${rn2#pending:}" ]] && order+=("P$pw"); done
+      continue
+    fi
     for i in "${!S_ID[@]}"; do [[ "${S_NAME[i]}" == "$rn2" ]] && order+=("$i"); done
   done
   for i in "${!S_ID[@]}"; do
@@ -393,13 +427,21 @@ cmd_sync() {
     fi
   done
   # @space_key: the label the status line draws for the space (its tab and
-  # its alert chip): the key that reaches it. Ctrl+N today, so only spaces
+  # its alert chip): the key that reaches it. Cmd+N today, so only spaces
   # 1-9 have one; past 9 it is unset (no key to show).
   n=1
   for k in "${order[@]+"${order[@]}"}"; do
+    if [[ "$k" == P* ]]; then
+      # The reserved number, on its window (what ⌘N and the sidebar read).
+      for i in "${!PW_ID[@]}"; do
+        [[ "${PW_ID[i]}" == "${k#P}" && "${PW_N[i]}" != "$n" ]] && add set-option -w -t "${k#P}" @pending_space "$n"
+      done
+      n=$((n + 1))
+      continue
+    fi
     [[ "${S_IDX[k]}" == "$n" ]] || add set-option -t "${S_ID[k]}" @space_index "$n"
     if ((n <= 9)); then
-      [[ "${S_KEY[k]}" == "⌃$n" ]] || add set-option -t "${S_ID[k]}" @space_key "⌃$n"
+      [[ "${S_KEY[k]}" == "⌘$n" ]] || add set-option -t "${S_ID[k]}" @space_key "⌘$n"
     else
       [[ -z "${S_KEY[k]}" ]] || add set-option -u -t "${S_ID[k]}" @space_key
     fi
@@ -714,17 +756,6 @@ contains() {
   return 1
 }
 
-cmd_agent() {
-  local n="$1" sid="$2"
-  [[ "$n" =~ ^[1-9][0-9]*$ ]] || { msg -k warn "bad agent number '$n'"; return 1; }
-  load_session "$sid" || return 1
-  if ((n > ${#AGENTS[@]})); then
-    msg -k warn "no agent $n here (${#AGENTS[@]} in this space)"
-    return 0
-  fi
-  t select-window -t "${AGENTS[n - 1]}"
-}
-
 cmd_shell() {
   local n="$1" sid="$2"
   [[ "$n" =~ ^[1-9][0-9]*$ ]] || { msg -k warn "bad shell number '$n'"; return 1; }
@@ -881,12 +912,13 @@ cmd_move_to() {
 # ── new space ──────────────────────────────────────────────────────────────
 # tmux refuses '.' and ':' in session names (it rewrites them to '_'); spaces
 # and other oddities read badly in the tab, so keep [A-Za-z0-9_-] only.
-sanitize() {
+san() {
   local s="$1"
   s="${s//[^A-Za-z0-9_-]/-}"
   s="${s##-}"
-  printf '%s' "${s:-space}"
+  REPLY="${s:-space}"
 }
+sanitize() { san "$1"; printf '%s' "$REPLY"; }
 
 # A folder as the reuse matches compare it: no trailing /, but / stays /.
 norm_dir() {
@@ -895,40 +927,86 @@ norm_dir() {
   printf '%s' "${d:-/}"
 }
 
+# canon DIR: DIR with every symlink resolved, in REPLY (empty, and false, when
+# it cannot be entered). cd -P is a builtin: no fork, so the pickers can run
+# it on every row. ~/projects is a symlink to ~/code/projects, and the two
+# must read as one folder everywhere a folder is matched.
+canon() {
+  local here="$PWD"
+  REPLY=""
+  CDPATH= builtin cd -P -- "$1" 2>/dev/null || return 1
+  REPLY="$PWD"
+  builtin cd -- "$here" 2>/dev/null
+  return 0
+}
+# HOME_P: ~ with its symlinks resolved, the root the naming rules compare.
+HOME_P=""
+home_canon() { [[ -n "$HOME_P" ]] && return 0; if canon "$HOME"; then HOME_P="$REPLY"; else HOME_P="$HOME"; fi; }
+
 # The space already on DIR (absolute): print its session id, or nothing. ~ is
-# main's. Hidden sessions never count.
+# main's. Hidden sessions never count. Both sides are compared with their
+# symlinks resolved, so ~/projects/x finds the space made on ~/code/projects/x.
 space_for_dir() {
   local dir rows id name path hid
   dir="$(norm_dir "$1")"
-  [[ "$dir" == "$HOME" ]] && { t list-sessions -F '#{session_id}|#{session_name}' | awk -F'|' '$2=="main"{print $1; exit}'; return 0; }
+  canon "$dir" && dir="$REPLY"
+  home_canon
+  [[ "$dir" == "$HOME" || "$dir" == "$HOME_P" ]] && { t list-sessions -F '#{session_id}|#{session_name}' | awk -F'|' '$2=="main"{print $1; exit}'; return 0; }
   rows="$(t list-sessions -F '#{session_id}|#{session_name}|#{session_path}|#{@space_hidden}')" || return 1
   while IFS='|' read -r id name path hid; do
     [[ "$hid" == "1" ]] && continue
-    if [[ "$(norm_dir "$path")" == "$dir" ]]; then printf '%s\n' "$id"; return 0; fi
+    path="$(norm_dir "$path")"
+    canon "$path" && path="$REPLY"
+    if [[ "$path" == "$dir" ]]; then printf '%s\n' "$id"; return 0; fi
   done <<<"$rows"
   return 0
+}
+
+# The name a new space on DIR (absolute, symlinks resolved) starts from, in
+# REPLY: its basename, sanitized. A folder nested inside a project (under ~,
+# its parent not ~, ~/code or ~/code/projects) is <parent>-<basename>, so
+# ~/code/projects/cs35l/assign4 is cs35l-assign4. Spaces made before this rule
+# keep their names (only a new session is named here).
+space_base() {
+  local d="$1" parent b
+  home_canon
+  parent="${d%/*}"
+  [[ -n "$parent" ]] || parent=/
+  san "${d##*/}"; b="$REPLY"
+  if [[ "$d" == "$HOME_P"/* && "$parent" != "$HOME_P" && "$parent" != "$HOME_P/code" && "$parent" != "$HOME_P/code/projects" ]]; then
+    san "${parent##*/}"; REPLY="$REPLY-$b"
+  else
+    REPLY="$b"
+  fi
+}
+
+# new_space_name DIR: the session name a new space on DIR gets (space_base,
+# then -2, -3... while taken), printed.
+new_space_name() {
+  local rows name base hidden k=2
+  rows="$(t list-sessions -F '#{session_id}|#{session_name}|#{session_path}|#{@space_hidden}')" || return 1
+  # Every hidden name counts as taken even with no such session yet: a folder
+  # called stash/tasks/agents/... must become stash-2, never a hidden session.
+  hidden=" $(t show -gqv @space_hidden_sessions 2>/dev/null) "
+  space_base "$1"; base="$REPLY"
+  name="$base"
+  while [[ "$hidden" == *" $name "* ]] \
+    || printf '%s\n' "$rows" | awk -F'|' -v n="$name" '$2==n{f=1} END{exit !f}'; do
+    name="$base-$k"; k=$((k + 1))
+  done
+  printf '%s\n' "$name"
 }
 
 # Create-or-reuse for DIR, print the session id to switch to. Pure tmux, no
 # picker, so tests can drive it: `space.sh open-dir DIR`.
 # DIR must already be absolute (cmd_open_dir makes it so).
 open_dir() {
-  local dir="${1%/}" rows name base sid
+  local dir="${1%/}" name sid
   [[ -n "$dir" ]] || dir="/"
   sid="$(space_for_dir "$dir")" || return 1
-  [[ -n "$sid" || "$dir" == "$HOME" ]] && { printf '%s\n' "$sid"; return 0; }
-  rows="$(t list-sessions -F '#{session_id}|#{session_name}|#{session_path}|#{@space_hidden}')" || return 1
-  local hidden
-  # Every hidden name counts as taken even with no such session yet: a folder
-  # called stash/tasks/agents/... must become stash-2, never a hidden session.
-  hidden=" $(t show -gqv @space_hidden_sessions 2>/dev/null) "
-  base="$(sanitize "$(basename "$dir")")"
-  name="$base"
-  local k=2
-  while [[ "$hidden" == *" $name "* ]] \
-    || printf '%s\n' "$rows" | awk -F'|' -v n="$name" '$2==n{f=1} END{exit !f}'; do
-    name="$base-$k"; k=$((k + 1))
-  done
+  home_canon
+  [[ -n "$sid" || "$dir" == "$HOME" || "$dir" == "$HOME_P" ]] && { printf '%s\n' "$sid"; return 0; }
+  name="$(new_space_name "$dir")" || return 1
   # Its session-created sync registers it (end of the order) and adds home.
   t new-session -d -s "$name" -c "$dir" -P -F '#{session_id}'
 }
@@ -937,8 +1015,9 @@ cmd_open_dir() {
   local dir="$1" client="${2:-}" sid
   [[ -d "$dir" ]] || { msg -k warn "not a directory: $dir"; return 1; }
   # Absolute before the reuse match and before it becomes a session_path: a
-  # typed "../foo" or "." is relative to the popup's cwd, not to tmux's.
-  dir="$(cd -- "$dir" 2>/dev/null && pwd)" || { msg -k error "cannot enter: $1"; return 1; }
+  # typed "../foo" or "." is relative to the popup's cwd, not to tmux's. pwd
+  # -P: symlinks resolved, so ~/projects/x and ~/code/projects/x are one space.
+  dir="$(cd -- "$dir" 2>/dev/null && pwd -P)" || { msg -k error "cannot enter: $1"; return 1; }
   sid="$(open_dir "$dir")" || { msg -k error "could not open a space for $dir"; return 1; }
   [[ -n "$sid" ]] || { msg -k error "could not open a space for $dir"; return 1; }
   notify
@@ -947,8 +1026,10 @@ cmd_open_dir() {
 
 # The folder candidates the pickers offer, best first, one absolute path a
 # line: PANE_PATH (the tab's cwd), then zoxide by frecency — or, without
-# zoxide, ~ and the folders under ~/code/projects and ~/code — deduped, dead
-# dirs dropped. Same list as claude-dir-picker.sh. tilde_paths ~-shortens it.
+# zoxide, ~ and the folders under ~/code/projects and ~/code — dead dirs
+# dropped, symlinks resolved (canon, no fork) and deduped after that, so
+# ~/projects/x and ~/code/projects/x are one row. Same sources as
+# claude-dir-picker.sh. tilde_paths ~-shortens it.
 dir_candidates() {
   local d
   {
@@ -960,7 +1041,8 @@ dir_candidates() {
       for d in "$HOME"/code/projects/*/ "$HOME"/code/*/; do [[ -d "$d" ]] && printf '%s\n' "${d%/}"; done
     fi
   } | awk 'NF && !seen[$0]++' \
-    | while IFS= read -r d; do [[ -d "$d" ]] && printf '%s\n' "$d"; done
+    | while IFS= read -r d; do canon "$d" && printf '%s\n' "$REPLY"; done \
+    | awk '!seen[$0]++'
 }
 tilde_paths() { sed "s|^$HOME\$|~|; s|^$HOME/|~/|"; }
 
@@ -986,12 +1068,14 @@ cmd_new_space() {
   else pane_path="$(t display-message -p '#{pane_current_path}')"; fi
   [[ -d "$pane_path" ]] || pane_path="$HOME"
   # dir_candidates, ~-shortened. A typed path that is not listed still works
-  # (--print-query).
+  # (--print-query); enter and ^N are picker_binds' (CREATE below): ^N, or a
+  # sentence, runs in fzf's place (become), so `out` is then empty.
   list="$(dir_candidates "$pane_path" | tilde_paths)"
+  picker_binds space "$client"
   out="$(printf '%s\n' "$list" | fzf \
     --reverse --info=inline --print-query --tiebreak=index \
     --prompt='new space in: ' \
-    --header='enter: open (or switch to) a space for this folder · esc: cancel' \
+    "${PICK_BINDS[@]}" \
     --preview "bash '${BASH_SOURCE[0]}' preview {}" \
     --preview-window=right:50%:nowrap:noinfo)"
   status=$?
@@ -1017,6 +1101,20 @@ cmd_new_space() {
 # added. A claude tab is an agent from birth: @agent_birth runs in the SAME
 # command list as its new-window (agent-birth.conf), so it never counts as a
 # shell, even for a moment.
+#
+# home_now SID: the space SID made just now gets its home before a second
+# window lands in it (new-tab's claude tab, adopt-pending's window); see the
+# comment where new-tab calls it.
+home_now() {
+  local sid="$1" fw fp fh
+  cmd_sync normal; reg_unlock
+  IFS="$US" read -r fw fp fh <<<"$(t display-message -p -t "$sid:^" "#{window_id}${US}#{pane_id}${US}#{@space_home}" 2>/dev/null)"
+  if [[ "$fw" == @* && "$fp" == %* && "$fh" != 1 ]]; then
+    local -a args=()
+    home_opts "$fw" "$fp"
+    run_args
+  fi
+}
 cmd_new_tab() {
   local kind="$1" target="$2" client="${3:-}" sid dir="" created=0 info hid name spath wid
   CLIENT="$client"
@@ -1027,8 +1125,9 @@ cmd_new_tab() {
     sid="\$${target#\$}"
   else
     [[ -d "$target" ]] || { msg -k warn "not a directory: $target"; return 1; }
-    # Absolute, as cmd_open_dir: a typed "../foo" is relative to the popup.
-    dir="$(cd -- "$target" 2>/dev/null && pwd)" || { msg -k error "cannot enter: $target"; return 1; }
+    # Absolute and symlinks resolved, as cmd_open_dir: a typed "../foo" is
+    # relative to the popup.
+    dir="$(cd -- "$target" 2>/dev/null && pwd -P)" || { msg -k error "cannot enter: $target"; return 1; }
     sid="$(space_for_dir "$dir")" || { msg -k error "could not open a space for $dir"; return 1; }
     if [[ -z "$sid" ]]; then
       sid="$(open_dir "$dir")"
@@ -1055,16 +1154,7 @@ cmd_new_tab() {
   # the home marks here, exactly the ones sync's adoption sets (home_opts);
   # the next structural sync keeps it as home (a marked window wins) and adds
   # its dashboard (ensure_dash, add_panes), and never a second home.
-  if ((created)); then
-    cmd_sync normal; reg_unlock
-    local fw fp fh
-    IFS="$US" read -r fw fp fh <<<"$(t display-message -p -t "$sid:^" "#{window_id}${US}#{pane_id}${US}#{@space_home}" 2>/dev/null)"
-    if [[ "$fw" == @* && "$fp" == %* && "$fh" != 1 ]]; then
-      local -a args=()
-      home_opts "$fw" "$fp"
-      run_args
-    fi
-  fi
+  ((created)) && home_now "$sid"
 
   local -a cmd=(new-window -a -t "$sid:{end}" -c "${spath:-$HOME}" -P -F '#{window_id}')
   [[ "$kind" == agent ]] && cmd+=(-e ZSH_AUTOSTART=claude ";" run-shell -C '#{?@agent_birth,#{@agent_birth} claude,}')
@@ -1075,7 +1165,7 @@ cmd_new_tab() {
   t switch-client ${client:+-c "$client"} -t "$sid:$wid"
 }
 
-# pick-tab KIND CLIENT (inside display-popup): the spaces in ⌃N order, the
+# pick-tab KIND CLIENT (inside display-popup): the spaces in ⌘N order, the
 # client's own marked (here) but still a pick, then the folder candidates
 # (dir_candidates) that are not already a space's folder. Each row is
 # "KEY<TAB>label"; fzf shows and filters the label only (--with-nth=2) and
@@ -1101,6 +1191,7 @@ cmd_pick_tab() {
   while IFS="$US" read -r idx id name h key path; do
     [[ -n "$id" ]] || continue
     p="$path"; while [[ "$p" == */ && "$p" != / ]]; do p="${p%/}"; done   # norm_dir, inline
+    canon "${p:-/}" && p="$REPLY"                                        # as dir_candidates' rows
     s_id+=("$id") s_label+=("${key:-$idx}") s_name+=("$name") s_path+=("${p:-/}")
     ((${#name} > w)) && w=${#name}
   done < <(spaces_in_order)
@@ -1125,13 +1216,14 @@ cmd_pick_tab() {
 
   local what=shell; [[ "$kind" == agent ]] && what=claude
   local out status query selection target
+  picker_binds "$kind" "$client"
   # pipefail off in here: a pick made before every row has streamed in
   # leaves the feeder dying of SIGPIPE, and that 141 must not read as a cancel.
   out="$(set +o pipefail; { printf '%s' "$list"; dir_candidates "$pane_path" | "${folder_rows[@]}"; } | fzf \
     --reverse --info=inline --print-query --tiebreak=index \
     --delimiter=$'\t' --with-nth=2 \
     --prompt="new $what in: " \
-    --header="enter: new $what tab at the end of that space (a folder: its space, made if new) · esc: cancel" \
+    "${PICK_BINDS[@]}" \
     --preview "bash '${BASH_SOURCE[0]}' preview-tab {1}" \
     --preview-window=right:50%:nowrap:noinfo)"
   status=$?
@@ -1154,6 +1246,733 @@ cmd_pick_tab() {
   cmd_new_tab "$kind" "$target" "$client"
 }
 
+# ── create from the query (^N in the pickers) ──────────────────────────────
+# ⌥N, CMD+SHIFT+T and CMD+SHIFT+R share two keys and a live header
+# (picker_binds):
+#   enter  a sentence (is_english) asks Claude ("pending spaces" below),
+#          unless the highlighted row is exactly its slug; else the
+#          highlighted row; with none, a typed folder that EXISTS; anything
+#          else leaves the popup up. Enter never creates
+#   ^N     makes what the query names (resolve_new, then `create`: the same
+#          as picking that folder), or asks Claude for a sentence
+#   ⌥⏎     makes ~/code/projects/<slug of the query>, sentence or not
+# The header (new-hint, redrawn on every result) says what they would do.
+# new-hint, enter-key, new-key and alt-key run inside fzf on keystrokes:
+# builtins only, no network; new-hint asks tmux one thing (the space an
+# existing folder already has), and forks nothing else.
+#
+# resolve_new QUERY, first match wins:
+#   1. an explicit git URL (scheme://..., user@host:path, github.com/o/r,
+#      gh:owner/repo): clone into ~/code/projects/<repo>. A bare owner/repo
+#      is a path (2.), never a clone
+#   2. a path (a /, or a leading ~ / .): ~ and / absolute, . relative to the
+#      popup's folder (the tab's), anything else to ~/code/projects
+#      (cs35l/assign4). Its parent must exist: never mkdir -p
+#   3. a name: ~/code/projects/<slug>
+# The new folder's name is a slug (slugify). A folder that exists (as APFS
+# matches names: case-insensitively) is opened, never made again. `create`
+# makes the folder; `git init -b main` (no commit) only for a direct child of
+# ~/code/projects not already inside a work tree; a zoxide entry; and, for a
+# direct child of ~/code or ~/code/projects, a launchpad catalog sync
+# (catalog_kick). Nothing else: no README, no CLAUDE.md.
+
+# Catppuccin Mocha, as the status line: a verb bold in its colour (green
+# create, blue open, peach clone, red can't, mauve Claude), names bold,
+# places dim.
+H_GREEN=$'\e[1;38;2;166;227;161m' H_BLUE=$'\e[1;38;2;137;180;250m' H_PEACH=$'\e[1;38;2;250;179;135m'
+H_RED=$'\e[1;38;2;243;139;168m' H_MAUVE=$'\e[1;38;2;203;166;247m' H_DIM=$'\e[22;38;2;127;132;156m'
+H_B=$'\e[1m' H_0=$'\e[0m'
+
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; REPLY="${s%"${s##*[![:space:]]}"}"; }
+# ~-shortened, in REPLY.
+tildify() {
+  local p="$1" h
+  home_canon
+  for h in "$HOME_P" "$HOME"; do
+    [[ "$p" == "$h" ]] && { REPLY="~"; return 0; }
+    [[ "$p" == "$h"/* ]] && { REPLY="~${p#"$h"}"; return 0; }
+  done
+  REPLY="$p"
+}
+
+# A folder name from free text, in REPLY: trimmed, each run of spaces one -,
+# then only [A-Za-z0-9._-]; case kept. Refused (N_ERR, false): empty, a
+# leading . or -, a .., over 64 characters.
+slugify() {
+  local s
+  trim "$1"; s="$REPLY"; REPLY=""
+  while [[ "$s" == *[[:space:]][[:space:]]* ]]; do s="${s//[[:space:]][[:space:]]/ }"; done
+  s="${s//[[:space:]]/-}"
+  s="${s//[^A-Za-z0-9._-]/}"
+  if [[ -z "$s" ]]; then N_ERR="no usable name in '$1'"
+  elif [[ "$s" == [.-]* ]]; then N_ERR="a name can't start with '${s:0:1}': $s"
+  elif [[ "$s" == *..* ]]; then N_ERR="a name can't contain '..': $s"
+  elif ((${#s} > 64)); then N_ERR="a name is at most 64 characters: $s"
+  else REPLY="$s"; return 0; fi
+  return 1
+}
+
+# ci_entry DIR NAME: DIR has an entry NAME (as the file system matches it:
+# APFS ignores case); its name as stored, in REPLY.
+ci_entry() {
+  local p="$1" n="$2" e b hit="" nc=0
+  REPLY=""
+  [[ -e "$p/$n" ]] || return 1
+  shopt -q nocasematch && nc=1
+  for e in "$p"/*; do
+    b="${e##*/}"
+    shopt -u nocasematch
+    [[ "$b" == "$n" ]] && { hit="$b"; break; }
+    shopt -s nocasematch
+    [[ -z "$hit" && "$b" == "$n" ]] && hit="$b"
+  done
+  if ((nc)); then shopt -s nocasematch; else shopt -u nocasematch; fi
+  REPLY="${hit:-$n}"
+}
+
+# DIR (absolute) is inside a git work tree: some folder from it up has .git.
+in_work_tree() {
+  local d="$1"
+  while :; do
+    [[ -e "${d%/}/.git" ]] && return 0
+    [[ "$d" == / || "$d" != */* ]] && return 1
+    d="${d%/*}"; [[ -n "$d" ]] || d=/
+  done
+}
+
+# A query that reads as a request to Claude rather than a name, path or URL
+# (any case): 4+ words; or 2+ starting with an imperative from VERBS ("make
+# foo", "clone my dotfiles"); or 3+ starting with one that is as often a noun
+# or an adjective (VERBS_AMBIG: "build tools", "start page", "set theory",
+# "new project" stay names) or with "set up" / "spin up". A leading ~ / . or a
+# :// never does, nor does one word (a slug, a path, a URL).
+VERBS=" make create clone scaffold init write generate bootstrap "
+VERBS_AMBIG=" build start set new add "
+is_english() {
+  local q nc=0 r=1 n
+  local -a w=()
+  trim "$1"; q="$REPLY"
+  [[ -n "$q" && "$q" != [~/.]* && "$q" != *://* ]] || return 1
+  read -r -a w <<<"$q"
+  n=${#w[@]}
+  ((n >= 4)) && return 0
+  ((n >= 2)) || return 1
+  shopt -q nocasematch && nc=1
+  shopt -s nocasematch
+  if [[ "$VERBS" == *" ${w[0]} "* ]]; then r=0
+  elif ((n >= 3)) && [[ "$VERBS_AMBIG" == *" ${w[0]} "* || "${w[0]} ${w[1]}" == "set up" || "${w[0]} ${w[1]}" == "spin up" ]]; then r=0
+  fi
+  ((nc)) || shopt -u nocasematch
+  return "$r"
+}
+
+# The highlighted picker row's name, in REPLY: a folder's basename (⌥N's
+# ~-path rows, pick-tab's d:/path keys) or a space's name (pick-tab's s:N
+# rows, "⌘N  name  folder").
+row_base() {
+  local r="$1" k l
+  REPLY=""
+  if [[ "$r" == *$'\t'* ]]; then
+    k="${r%%$'\t'*}" l="${r#*$'\t'}"
+    case "$k" in
+      d:*) REPLY="${k#d:}"; REPLY="${REPLY%/}"; REPLY="${REPLY##*/}" ;;
+      s:*) read -r _ REPLY _ <<<"$l" ;;
+    esac
+  else
+    REPLY="${r%/}"; REPLY="${REPLY##*/}"
+  fi
+}
+# A sentence wins over the fuzzy matches (a request matches some row more
+# often than not), unless the highlighted row is exactly what its slug
+# would name: then that row is what was meant.
+asks_claude() {
+  local q="$1" row="$2" m="${FZF_MATCH_COUNT:-0}" b
+  is_english "$q" || return 1
+  [[ "$m" =~ ^[1-9] && -n "$row" ]] || return 0
+  row_base "$row"; b="$REPLY"
+  slugify "$q" || return 0
+  [[ "$REPLY" != "$b" ]]
+}
+
+# PROJECTS: ~/code/projects, symlinks resolved.
+projects_dir() {
+  home_canon
+  PROJECTS="$HOME_P/code/projects"
+  canon "$PROJECTS" && PROJECTS="$REPLY"
+  return 0
+}
+
+# What ^N does with QUERY (see above). Sets N_KIND (project, folder, clone,
+# exists, error), N_DIR (the folder, absolute), N_URL / N_SRC (a clone's URL
+# and what was typed), N_GIT (1: git init it), N_ERR (why not); false on
+# error.
+resolve_new() {
+  local q p parent base name tp
+  N_KIND=error N_DIR="" N_URL="" N_SRC="" N_GIT=0 N_ERR=""
+  trim "$1"; q="$REPLY"
+  projects_dir
+  [[ -n "$q" ]] || { N_ERR="type a name, a path, a git URL or gh:owner/repo"; return 1; }
+  # NAME (⌥⏎): a folder named after the text, whatever it looks like.
+  if [[ "${2:-}" == name ]]; then
+    slugify "$q" || return 1
+    name="$REPLY"
+    [[ -d "$PROJECTS" ]] || { N_ERR="~/code/projects doesn't exist"; return 1; }
+    resolve_at "$PROJECTS" "$name" folder
+    return
+  fi
+  # Only an explicit URL clones; a bare a/b is a path (notes/todo must never
+  # fetch a stranger's repo).
+  if [[ "$q" =~ ^[A-Za-z][A-Za-z0-9+.-]*://[^[:space:]]+$ || "$q" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^[:space:]]+$ ]]; then
+    N_URL="$q" N_SRC="$q"
+  elif [[ "$q" =~ ^gh:[A-Za-z0-9_.-]+/[A-Za-z0-9._-]+$ ]]; then
+    N_SRC="$q" N_URL="https://github.com/${q#gh:}"
+  elif [[ "$q" =~ ^(www\.)?github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9._-]+/?$ ]]; then
+    N_SRC="$q" N_URL="https://${q%/}"
+  fi
+  if [[ -n "$N_URL" ]]; then
+    base="${N_URL%/}"; base="${base##*/}"; base="${base##*:}"; base="${base%.git}"
+  fi
+  if [[ -n "$N_URL" ]]; then
+    slugify "$base" || { N_ERR="no folder name in $q ($N_ERR)"; return 1; }
+    name="$REPLY"
+    [[ -d "$PROJECTS" ]] || { N_ERR="~/code/projects doesn't exist"; return 1; }
+    resolve_at "$PROJECTS" "$name" clone
+    return
+  fi
+  if [[ "$q" == */* || "$q" == [~/.]* ]]; then
+    case "$q" in
+      "~" | "~/"*) p="$HOME${q#"~"}" ;;
+      "~"*) N_ERR="only ~/ paths, not ~user: $q"; return 1 ;;
+      /*) p="$q" ;;
+      .*) p="$PWD/$q" ;;
+      *) p="$PROJECTS/$q" ;;
+    esac
+    while [[ "$p" == */ && "$p" != / ]]; do p="${p%/}"; done
+    [[ -d "$p" ]] && { exists_at "$p"; return; }
+    parent="${p%/*}"; [[ -n "$parent" ]] || parent=/
+    N_DIR="$p"
+    if [[ ! -d "$parent" ]]; then
+      tildify "$p"; tp="$REPLY"; tildify "$parent"
+      N_ERR="$tp — parent $REPLY doesn't exist"
+      return 1
+    fi
+    slugify "${p##*/}" || return 1
+    name="$REPLY"
+    canon "$parent" && parent="$REPLY"
+    resolve_at "$parent" "$name" folder
+    return
+  fi
+  slugify "$q" || return 1
+  name="$REPLY"
+  [[ -d "$PROJECTS" ]] || { N_ERR="~/code/projects doesn't exist"; return 1; }
+  resolve_at "$PROJECTS" "$name" folder
+}
+# resolve_at PARENT NAME folder|clone: PARENT/NAME (PARENT absolute, symlinks
+# resolved, existing), unless that already exists.
+resolve_at() {
+  local parent="$1" name="$2" kind="$3" tp
+  [[ "$parent" == / ]] && parent=""
+  if ci_entry "${parent:-/}" "$name"; then
+    [[ -d "$parent/$REPLY" ]] && { exists_at "$parent/$REPLY"; return; }
+    N_DIR="$parent/$REPLY"; tildify "$N_DIR"
+    N_ERR="$REPLY exists and is not a folder"
+    return 1
+  fi
+  N_DIR="$parent/$name" N_KIND="$kind"
+  if [[ "$kind" == folder && "${parent:-/}" == "$PROJECTS" ]]; then
+    N_KIND=project
+    in_work_tree "$PROJECTS" || N_GIT=1
+  fi
+  return 0
+}
+# An existing folder: opened as it is stored (symlinks resolved, the case of
+# its last name as on disk).
+exists_at() {
+  local d par
+  canon "$1" || { N_ERR="cannot enter $1"; return 1; }
+  d="$REPLY" par="${REPLY%/*}"
+  [[ -n "$par" ]] || par=/
+  [[ "$d" != / ]] && ci_entry "$par" "${d##*/}" && d="${par%/}/$REPLY"
+  N_KIND=exists N_DIR="$d"
+  return 0
+}
+
+# The name of the space on DIR (absolute, symlinks resolved), in REPLY, or
+# empty. Asks tmux only from inside it.
+space_name_on() {
+  local dir="$1" name path hid p
+  REPLY=""
+  home_canon
+  [[ "$dir" == "$HOME_P" ]] && { REPLY=main; return 0; }
+  [[ -n "${TMUX:-}" ]] || return 0
+  while IFS="$US" read -r name path hid; do
+    [[ "$hid" == 1 || -z "$path" ]] && continue
+    p="$(norm_dir "$path")"
+    canon "$p" && p="$REPLY"
+    [[ "$p" == "$dir" ]] && { REPLY="$name"; return 0; }
+  done < <(t list-sessions -F "#{session_name}${US}#{session_path}${US}#{@space_hidden}" 2>/dev/null)
+  REPLY=""
+}
+
+# For a direct child of ~/code or ~/code/projects (the folders the launchpad
+# catalog scans), when the catalog's repo is there (CATALOG_REPO).
+catalog_applies() {
+  local parent="${1%/*}"
+  projects_dir
+  CATALOG_REPO="$PROJECTS/mackhaymond.co"
+  [[ "$parent" == "$HOME_P/code" || "$parent" == "$PROJECTS" ]] && [[ -f "$CATALOG_REPO/package.json" ]]
+}
+
+# new-hint MODE CATALOG QUERY [ROW]: the pickers' header, two lines: what
+# enter does, then what ^N does (resolve_new, as a sentence; for a sentence,
+# also what ⌥⏎ makes). MODE space, shell or agent; CATALOG on/off
+# (@space_catalog_sync, read once by picker_binds); ROW the highlighted row
+# ({}). FZF_MATCH_COUNT (fzf exports it) says whether a row is highlighted.
+cmd_new_hint() {
+  local mode="${1:-space}" cat="${2:-on}" q row="${4:-}" m="${FZF_MATCH_COUNT:-0}" l1 l2 what=shell tab=""
+  trim "${3:-}"; q="$REPLY"
+  [[ "$m" =~ ^[0-9]+$ ]] || m=0
+  [[ "$mode" == agent ]] && what=claude
+  [[ "$mode" == space ]] || tab=" ${H_DIM}· then a new $what tab there${H_0}"
+  if [[ -z "$q" ]]; then
+    if [[ "$mode" == space ]]; then l1="⏎ open the highlighted folder (its space, made if new)"
+    else l1="⏎ a new $what tab in the highlighted space (a folder: its space, made if new)"; fi
+    l1="${H_DIM}$l1 · esc cancel${H_0}"
+  elif asks_claude "$q" "$row"; then
+    l1="⏎ ${H_MAUVE}Ask Claude${H_0}: ${H_B}$q${H_0}"
+  elif ((m > 0)); then
+    if [[ "$mode" == space ]]; then l1="${H_DIM}⏎ open the highlighted folder${H_0}"
+    else l1="${H_DIM}⏎ a new $what tab in the highlighted row${H_0}"; fi
+  elif [[ -d "${q/#\~/$HOME}" ]]; then
+    tildify "${q/#\~/$HOME}"
+    l1="⏎ ${H_BLUE}Open${H_0} ${H_B}$REPLY${H_0}"
+  else
+    l1="⏎ ${H_DIM}no such folder · ^N creates it${H_0}"
+  fi
+  if [[ -z "$q" ]]; then
+    l2="${H_DIM}^N creates from what you type: a name (in ~/code/projects), a path, a git URL or gh:owner/repo · a sentence asks Claude${H_0}"
+  elif is_english "$q"; then
+    l2="^N ${H_MAUVE}Ask Claude${H_0} ${H_DIM}(a claude in a popup, holding the next space number)${H_0}"
+    slugify "$q" && l2+=" · ⌥⏎ ${H_GREEN}folder${H_0} ${H_B}$REPLY${H_0}"
+  elif ! resolve_new "$q"; then
+    l2="^N ${H_RED}Can't create${H_0}: $N_ERR"
+  else
+    local name="${N_DIR##*/}" par="${N_DIR%/*}" tp td extra="" sname
+    [[ -n "$par" ]] || par=/
+    tildify "$par"; tp="$REPLY"
+    tildify "$N_DIR"; td="$REPLY"
+    [[ "$cat" != off ]] && catalog_applies "$N_DIR" && extra=" · sync catalog"
+    case "$N_KIND" in
+      project)
+        l2="^N ${H_GREEN}Create${H_0} a new project ${H_B}$name${H_0} ${H_DIM}in $tp${H_0}"
+        ((N_GIT)) && l2+=" · git init"
+        l2+="$extra" ;;
+      folder)
+        space_base "$N_DIR"; sname="$REPLY"
+        if [[ "$par" == "$HOME_P" || "$par" == "$HOME_P/code" || "$par" == "$PROJECTS" || "$N_DIR" != "$HOME_P"/* ]]; then
+          l2="^N ${H_GREEN}New folder${H_0} ${H_B}$name${H_0} ${H_DIM}in $tp${H_0}$extra"
+        else
+          l2="^N ${H_GREEN}New folder${H_0} ${H_B}$name${H_0} inside ${H_B}${par##*/}${H_0} ${H_DIM}($tp)${H_0} → space ${H_B}$sname${H_0}"
+        fi ;;
+      clone)
+        l2="^N ${H_PEACH}Clone${H_0} ${H_B}$N_SRC${H_0} into ${H_DIM}$td${H_0}$extra" ;;
+      exists)
+        space_name_on "$N_DIR"
+        if [[ -n "$REPLY" ]]; then l2="^N ${H_BLUE}Open${H_0} space ${H_B}$REPLY${H_0} ${H_DIM}($td exists)${H_0}"
+        else space_base "$N_DIR"; l2="^N ${H_BLUE}Open${H_0} ${H_B}$td${H_0} ${H_DIM}(exists) as a new space${H_0} ${H_B}$REPLY${H_0}"; fi ;;
+    esac
+    l2+="$tab"
+  fi
+  printf '%s\n%s\n' "$l1" "$l2"
+}
+
+# enter-key MODE CLIENT QUERY [ROW] (fzf's enter, via transform): the action
+# enter takes. A sentence: ask Claude (in fzf's place; asks_claude). Else a
+# highlighted row: accept; a typed folder that exists: accept (--print-query
+# hands it over); anything else: nothing, the popup stays and the header
+# says why.
+cmd_enter_key() {
+  local client="${2:-}" q
+  trim "${3:-}"; q="$REPLY"
+  if [[ -n "$q" ]] && asks_claude "$q" "${4:-}"; then
+    printf 'become:bash %q ask-claude %q {q} >&2\n' "$SELF" "$client"; return 0
+  fi
+  [[ "${FZF_MATCH_COUNT:-0}" =~ ^[1-9] ]] && { echo accept; return 0; }
+  [[ -n "$q" ]] || return 0
+  [[ -d "${q/#\~/$HOME}" ]] && echo accept
+  return 0
+}
+
+# alt-key MODE CLIENT QUERY (fzf's ⌥⏎): `create --name`, a folder named
+# after the text in ~/code/projects even when it reads as a sentence.
+cmd_alt_key() {
+  local mode="${1:-space}" client="${2:-}"
+  resolve_new "${3:-}" name || return 0
+  printf 'become:bash %q create --name {q} %q %q >&2\n' "$SELF" "$client" "$mode"
+}
+
+# new-key MODE CLIENT QUERY (fzf's ^N): `create` (or ask Claude) in fzf's
+# place, its output on the popup's terminal, not in the picker's $(...); a
+# query resolve_new refuses does nothing (the header already says why).
+cmd_new_key() {
+  local mode="${1:-space}" client="${2:-}" q
+  trim "${3:-}"; q="$REPLY"
+  if is_english "$q"; then printf 'become:bash %q ask-claude %q {q} >&2\n' "$SELF" "$client"; return 0; fi
+  resolve_new "$q" || return 0
+  printf 'become:bash %q create {q} %q %q >&2\n' "$SELF" "$client" "$mode"
+}
+
+# The fzf options the three pickers share (PICK_BINDS): the first header, the
+# live one, enter, ^N. MODE space (⌥N), shell or agent (pick-tab's KIND).
+picker_binds() {
+  local mode="$1" client="$2" cat s c
+  cat="$(t show -gqv @space_catalog_sync 2>/dev/null)"
+  [[ "$cat" == off ]] || cat=on
+  printf -v s 'bash %q' "$SELF"
+  printf -v c '%q' "$client"
+  # The picker's own pid: ask-claude waits for this popup to be gone before
+  # it opens its own.
+  export SPACE_PICKER_PID=$$
+  PICK_BINDS=(
+    --header="$(cmd_new_hint "$mode" "$cat" "")"
+    --bind "start,result,focus:transform-header:$s new-hint $mode $cat {q} {}"
+    --bind "enter:transform:$s enter-key $mode $c {q} {}"
+    --bind "ctrl-n:transform:$s new-key $mode $c {q}"
+    --bind "alt-enter:transform:$s alt-key $mode $c {q}"
+  )
+}
+
+# create [--name] QUERY [CLIENT] [MODE]: what ^N (--name: ⌥⏎) runs (resolve_new), then opens it as
+# picking that folder would: MODE space (⌥N: its space), shell or agent
+# (pick-tab: a new tab in its space). A failed clone leaves no folder behind.
+cmd_create() {
+  local force=""
+  [[ "${1:-}" == --name ]] && { force=name; shift; }
+  local q="${1:-}" client="${2:-}" mode="${3:-space}" out tmp line l
+  CLIENT="$client"
+  case "$mode" in space | shell | agent) ;; *) msg -k warn "create: space, shell or agent, not '$mode'"; return 1 ;; esac
+  resolve_new "$q" $force || { msg -k warn "can't create: $N_ERR"; return 1; }
+  case "$N_KIND" in
+    clone)
+      # Into a hidden folder beside the target, renamed into place once
+      # complete: a failure removes only its own temp folder, and two clones
+      # of one repo at once never share (or delete) a target.
+      tmp="${N_DIR%/*}/.${N_DIR##*/}.clone-$$"
+      printf 'cloning %s into %s ...\n' "$N_SRC" "$N_DIR" >&2
+      if ! out="$(GIT_TERMINAL_PROMPT=0 git clone -q -- "$N_URL" "$tmp" 2>&1)"; then
+        rm -rf -- "$tmp"
+        # git's own reason: its first fatal:/error: line, else its last line.
+        line=""
+        while IFS= read -r l; do [[ "$l" == fatal:* || "$l" == error:* ]] && { line="$l"; break; }; done <<<"$out"
+        [[ -n "$line" ]] || { out="${out%$'\n'}"; line="${out##*$'\n'}"; }
+        line="${line//#/##}"   # tmux would read a # as a format
+        msg -k error "clone of $N_SRC failed: ${line:-git clone failed}"
+        return 1
+      fi
+      # rename(2), not mv: mv would move it INTO a folder that appeared
+      # meanwhile; rename onto a non-empty one fails.
+      if ! perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' -- "$tmp" "$N_DIR" 2>/dev/null; then
+        rm -rf -- "$tmp"
+        [[ -d "$N_DIR" ]] || { msg -k error "could not move the clone into $N_DIR"; return 1; }
+        N_KIND=exists           # another clone got there first: use that one
+      fi ;;
+    project | folder)
+      mkdir -- "$N_DIR" 2>/dev/null || [[ -d "$N_DIR" ]] || { msg -k error "could not create $N_DIR"; return 1; }
+      if ((N_GIT)); then git init -q -b main -- "$N_DIR" >/dev/null 2>&1 || msg -k warn "git init failed in $N_DIR"; fi ;;
+  esac
+  if [[ "$N_KIND" != exists ]]; then
+    command -v zoxide >/dev/null 2>&1 && zoxide add -- "$N_DIR" >/dev/null 2>&1
+    catalog_kick "$N_DIR"
+  fi
+  if [[ "$mode" == space ]]; then cmd_open_dir "$N_DIR" "$client"; else cmd_new_tab "$mode" "$N_DIR" "$client"; fi
+}
+
+# The launchpad catalog (~/code/projects/mackhaymond.co, its CLAUDE.md: "New
+# repo or project folder: npm run catalog:sync") learns of a folder made in
+# ~/code or ~/code/projects. In the background (run-shell -b: tmux runs it,
+# so closing the popup does not stop it), unless @space_catalog_sync is off
+# (the tests' servers).
+catalog_kick() {
+  catalog_applies "$1" || return 0
+  [[ "$(t show -gqv @space_catalog_sync 2>/dev/null)" == off ]] && return 0
+  t run-shell -b "$(printf 'bash %q catalog-sync %q %q' "$SELF" "$CLIENT" "$CATALOG_REPO")"
+}
+# catalog-sync CLIENT REPO: `npm run catalog:sync` in REPO, logged to
+# ~/.local/state/tmux-spaces/catalog-sync.log, a toast only when it fails.
+# Behind a mkdir lock holding its owner's pid: a creation while a run is in
+# flight leaves a pending mark that run picks up (re-checked after the lock
+# is gone, so none is lost), so creations in quick succession share runs. A
+# lock whose owner is dead is taken over.
+cmd_catalog_sync() {
+  local client="${1:-}" repo="${2:-}" st lock pend log rc=0 pid
+  CLIENT="$client"
+  [[ -n "$repo" && -f "$repo/package.json" ]] || return 0
+  st="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-spaces"
+  mkdir -p "$st" || return 0
+  lock="$st/catalog-sync.lock" pend="$st/catalog-sync.pending" log="$st/catalog-sync.log"
+  : >"$pend"
+  while :; do
+    if ! mkdir "$lock" 2>/dev/null; then
+      pid="$(cat "$lock/pid" 2>/dev/null)"
+      [[ -n "$pid" ]] || { sleep 0.3; pid="$(cat "$lock/pid" 2>/dev/null)"; }   # just made
+      [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0                   # it will see the mark
+      rm -rf "$lock"
+      mkdir "$lock" 2>/dev/null || return 0
+    fi
+    printf '%s\n' "$$" >"$lock/pid"
+    while [[ -e "$pend" ]]; do
+      sleep 2
+      rm -f "$pend"
+      { printf '== %s %s\n' "$(date '+%F %T')" "$repo"; (cd "$repo" && npm run catalog:sync); } >>"$log" 2>&1 || rc=$?
+    done
+    rm -rf "$lock"
+    [[ -e "$pend" ]] || break
+  done
+  ((rc == 0)) || msg -k warn "catalog sync failed (exit $rc): see $log"
+  return 0
+}
+
+# ── pending spaces: a sentence asks Claude ─────────────────────────────────
+# A query that reads as a request (is_english), entered or ^N'd in a picker,
+# goes to a fresh claude instead (ask-claude):
+#   1. a claude window in the hidden session `pending` (in
+#      @space_hidden_sessions; made on demand, status off), at ~, an agent
+#      from birth (@agent_birth), so it gets a letter and the sidebar shows it.
+#      Its window options are the contract the sidebar renders ("pending
+#      space N · creating: REQUEST"):
+#        @pending_space    N, the space number reserved for it (sync keeps it
+#                          current, as it does @space_index)
+#        @pending_request  the text typed
+#        @pending_client   the client it belongs to (the last popup's)
+#        @pending_color    the colour space N will have
+#      Its shell's autostart runs claude with pending-prompt's prompt, and
+#      exits the shell when claude quits while still pending (window gone).
+#   2. space number N reserved: a registry row "pending:@W<TAB>~<TAB>colour"
+#      at the end of the order. Sync counts it as a slot (nothing else gets
+#      N) for as long as @W is in `pending`, and drops it once @W has gone
+#      (claude quit, a restart): N is free again.
+#   3. a popup on the client (pending-open): a nested client of the same
+#      server attached to @W. ⌥N inside it detaches that client: the popup
+#      closes, claude keeps running. ⌘N on N (pending-go) opens it again.
+# claude finishes with `space.sh adopt-pending @W DIR`: DIR's space is made AT
+# N (the reservation's row becomes its row, colour and all), or reused (it
+# keeps its number, N is freed); @W moves to its end and loses the pending
+# options. With the popup open the client goes there (the popup closes);
+# without, a toast: "space N ready: NAME".
+PEND_SESS=pending
+
+# ask-claude [--no-popup] CLIENT TEXT
+cmd_ask_claude() {
+  local nopopup=0
+  [[ "${1:-}" == --no-popup ]] && { nopopup=1; shift; }
+  local client="${1:-}" text n wid had=0 auto color=""
+  CLIENT="$client"
+  trim "${2:-}"; text="$REPLY"
+  [[ -n "$text" ]] || return 0
+  read_opts || return 1
+  [[ "$SPACES_ON" == on ]] || { msg -k warn "ask: spaces are off"; return 1; }
+  # Its number until the sync below settles it: one past every space and
+  # every reservation.
+  n="$({ t list-sessions -F '#{?#{@space_hidden},,#{@space_index}}'; t list-windows -t "=$PEND_SESS" -F '#{@pending_space}' 2>/dev/null; } \
+    | awk '$1 + 0 > m { m = $1 + 0 } END { print m + 1 }')"
+  printf -v auto 'claude "$(bash %q pending-prompt)"; [[ -n "$(tmux show -wqv -t "$TMUX_PANE" @pending_space 2>/dev/null)" ]] && exit' "$SELF"
+  local -a mk=()
+  # A new window becomes its session's current one (set -w below needs it to
+  # be); last-window gives a popup already open on another one its view back.
+  if t has-session -t "=$PEND_SESS" 2>/dev/null; then had=1; mk=(new-window -t "=$PEND_SESS:" -c "$HOME")
+  else mk=(new-session -d -s "$PEND_SESS" -c "$HOME"); fi
+  targ "$text"
+  mk+=(-e "ZSH_AUTOSTART=$auto" -P -F '#{window_id}'
+    ";" set -w @pending_request "$REPLY" ";" set -w @pending_client "$client" ";" set -w @pending_space "$n"
+    ";" run-shell -C '#{?@agent_birth,#{@agent_birth} claude,}')
+  if ((had)); then mk+=(";" last-window -t "=$PEND_SESS"); else mk+=(";" set -t "=$PEND_SESS" status off); fi
+  wid="$(t "${mk[@]}" 2>/dev/null)"
+  wid="${wid%%$'\n'*}"
+  [[ "$wid" == @* ]] || { msg -k error "could not start claude"; return 1; }
+  if reg_lock; then
+    reg_load
+    R_NAME+=("pending:$wid") R_PATH+=("$HOME") R_COLOR+=("")
+    color="$(pick_color "pending:$wid")"
+    R_COLOR[${#R_NAME[@]} - 1]="$color"
+    reg_save
+    reg_unlock
+  fi
+  [[ -n "$color" ]] && t set -w -t "$wid" @pending_color "$color"
+  cmd_sync normal; reg_unlock
+  notify
+  ((nopopup)) && { printf '%s\n' "$wid"; return 0; }
+  # From inside a picker's popup: the next popup can only open once this
+  # one has closed, i.e. after we exit (pending-popup waits for it).
+  (trap '' HUP; exec bash "$SELF" pending-popup "$wid" "$client" "${SPACE_PICKER_PID:-}") </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null
+  return 0
+}
+
+# A user's text as ONE tmux argument: tmux reads an argument ending in ; as
+# the end of a command, so a trailing ; is escaped (REPLY).
+targ() { REPLY="$1"; [[ "$REPLY" == *';' ]] && REPLY="${REPLY%;}\\;"; return 0; }
+
+# pending-popup WINDOW CLIENT [PICKER_PID]: pending-open once the picker's
+# popup is gone (a display-popup while one is still up does nothing): wait
+# for the picker to exit (up to 3 s), then open, and check a viewer did
+# attach; three tries. Still nothing: a toast says where claude is.
+cmd_pending_popup() {
+  local wid="${1:-}" client="${2:-}" picker="${3:-}" i try n
+  CLIENT="$client"
+  for ((i = 0; i < 30; i++)); do
+    [[ -n "$picker" ]] && kill -0 "$picker" 2>/dev/null || break
+    sleep 0.1
+  done
+  for try in 1 2 3; do
+    sleep 0.2
+    bash "$SELF" pending-open "$wid" "$client" </dev/null >/dev/null 2>&1 &
+    for ((i = 0; i < 8; i++)); do
+      sleep 0.1
+      [[ " $(t show -gqv @pending_viewers 2>/dev/null) " == *">$client "* ]] && return 0
+    done
+  done
+  n="$(t display-message -p -t "$wid" '#{@pending_space}' 2>/dev/null)"
+  NOTIFY_TMUX="${NOTIFY_TMUX:-$TMUX_BIN}" notify_user ${client:+-c "$client"} -k info -- "claude is working on space $n — ⌘$n to open"
+}
+
+# The popups' nested clients, as "NESTED>OUTER" tokens in the global
+# @pending_viewers (space-padded: " /dev/ttys7>/dev/ttys1 "), so a key can
+# tell a pending popup's client from a real one that went to `pending`:
+#   viewers_edit add|del TOKEN
+viewers_edit() {
+  local v
+  v=" $(t show -gqv @pending_viewers 2>/dev/null) "
+  v="${v// $2 / }"
+  [[ "$1" == add ]] && v+="$2 "
+  trim "$v"
+  if [[ -n "$REPLY" ]]; then t set -g @pending_viewers " $REPLY "; else t set -gu @pending_viewers; fi
+}
+
+# popup-attach WINDOW OUTER SOCKET: the command a pending popup runs. Its
+# nested client (this popup's tty) is a viewer while attached to WINDOW.
+cmd_popup_attach() {
+  local wid="${1:-}" outer="${2:-}" sock="${3:-}" me tb
+  me="$(tty 2>/dev/null)"
+  tb="$(command -v "$TMUX_BIN" 2>/dev/null)"
+  viewers_edit add "$me>$outer"
+  env -u TMUX "${tb:-tmux}" -S "$sock" attach-session -t "$wid"
+  viewers_edit del "$me>$outer"
+}
+
+# viewer-left CLIENT (client-session-changed): a pending popup's nested
+# client that left `pending` (⌥W, ⌘N, a click, typed inside the popup) closes
+# its popup, and the client outside goes where it was going.
+cmd_viewer_left() {
+  local nested="${1:-}" v outer sess target
+  v=" $(t show -gqv @pending_viewers 2>/dev/null) "
+  [[ -n "$nested" && "$v" == *" $nested>"* ]] || return 0
+  outer="${v#*" $nested>"}"; outer="${outer%% *}"
+  IFS="$US" read -r sess target <<<"$(t list-clients -F "#{client_name}${US}#{session_name}${US}#{session_id}:#{window_id}" 2>/dev/null \
+    | awk -F"$US" -v c="$nested" '$1 == c { print $2 FS $3; exit }')"
+  [[ -n "$sess" && "$sess" != "$PEND_SESS" ]] || return 0
+  t detach-client -t "$nested" 2>/dev/null
+  [[ -n "$outer" && "$target" == \$*:@* ]] && t switch-client -c "$outer" -t "$target"
+  notify
+  return 0
+}
+
+# pending-prompt [PANE]: the prompt a pending claude starts with (its
+# autostart runs this in its own pane).
+cmd_pending_prompt() {
+  local pane="${1:-${TMUX_PANE:-}}" wid req cl n
+  [[ -n "$pane" ]] || return 1
+  IFS="$US" read -r wid req cl n <<<"$(t display-message -p -t "$pane" "#{window_id}${US}#{@pending_request}${US}#{@pending_client}${US}#{@pending_space}" 2>/dev/null)"
+  [[ "$wid" == @* && -n "$req" ]] || return 1
+  printf '%s\n' "Mack typed this into the tmux new-space picker: «${req}». Do what he described (e.g. create or clone the project folders, scaffold, etc.). Prefer ~/code/projects for new projects. When the folder is ready, run \`~/.config/tmux/scripts/space.sh adopt-pending $wid <dir>\`: it opens the tmux space for that folder as space $n (reserved for you) on his client $cl and moves this claude window into it. Then say so."
+}
+
+# pending-open [--print] WINDOW [CLIENT]: the popup on CLIENT showing pending
+# WINDOW (a nested client of this server: TMUX unset, -S its socket). --print:
+# the display-popup argv, one per line, and nothing opened.
+cmd_pending_open() {
+  local dry=0
+  [[ "${1:-}" == --print ]] && { dry=1; shift; }
+  local ref="${1:-}" client="${2:-}" wid sess n sock tb
+  CLIENT="$client"
+  IFS="$US" read -r wid sess n sock <<<"$(t display-message -p -t "$ref" "#{window_id}${US}#{session_name}${US}#{@pending_space}${US}#{socket_path}" 2>/dev/null)"
+  [[ "$wid" == @* && "$sess" == "$PEND_SESS" ]] || { msg -k warn "not a pending space: $ref"; return 1; }
+  local -a cmd=(display-popup ${client:+-c "$client"} -E -w 70% -h 60% -x "$POPUP_X" -d "$HOME"
+    -T " space $n · creating · ⌥N hides it "
+    "$(printf 'bash %q popup-attach %q %q %q' "$SELF" "$wid" "$client" "$sock")")
+  ((dry)) && { printf '%s\n' "${cmd[@]}"; return 0; }
+  [[ -n "$client" ]] && t set -w -t "$wid" @pending_client "$client"
+  t "${cmd[@]}"
+}
+
+# pending-go N CLIENT: ⌘N for an N no space has. The pending claude holding
+# N, in its popup; else "no space N", as before.
+cmd_pending_go() {
+  local n="${1:-}" client="${2:-}" w
+  CLIENT="$client"
+  w="$(t list-windows -t "=$PEND_SESS" -F "#{window_id}${US}#{@pending_space}" 2>/dev/null \
+    | awk -F"$US" -v n="$n" '$2 == n { print $1; exit }')"
+  [[ -n "$w" ]] && { cmd_pending_open "$w" "$client"; return; }
+  NOTIFY_TMUX="${NOTIFY_TMUX:-$TMUX_BIN}" notify_user ${client:+-c "$client"} -k warn -- "no space $n"
+}
+
+# adopt-pending WINDOW DIR (the pending claude runs it): see above. Prints
+# "space N: NAME (DIR)" for claude to report.
+cmd_adopt_pending() {
+  local ref="${1:-}" dir="${2:-}" wid sess pn pcl
+  read_opts || return 1
+  IFS="$US" read -r wid sess pn pcl <<<"$(t display-message -p -t "$ref" "#{window_id}${US}#{session_name}${US}#{@pending_space}${US}#{@pending_client}" 2>/dev/null)"
+  if [[ "$wid" != @* || "$sess" != "$PEND_SESS" ]]; then
+    echo "space.sh adopt-pending: '$ref' is not a window waiting in the $PEND_SESS session" >&2
+    return 1
+  fi
+  CLIENT="$pcl"
+  dir="$(cd -- "$dir" 2>/dev/null && pwd -P)" || { echo "space.sh adopt-pending: not a folder: ${2:-}" >&2; return 1; }
+  # Its popup: the nested clients looking at it.
+  local viewers
+  viewers="$(t list-clients -F "#{client_name}${US}#{session_name}${US}#{window_id}" 2>/dev/null \
+    | awk -F"$US" -v w="$wid" -v s="$PEND_SESS" '$2 == s && $3 == w { print $1 }')"
+  local sid name pi created=0
+  reg_lock || { echo "space.sh adopt-pending: the registry is busy, try again" >&2; return 1; }
+  reg_load
+  pi="$(reg_find "pending:$wid")"
+  sid="$(space_for_dir "$dir")"
+  if [[ -z "$sid" ]]; then
+    name="$(new_space_name "$dir")"
+    sid="$(t new-session -d -s "$name" -c "$dir" -P -F '#{session_id}' 2>/dev/null)"
+    [[ "$sid" == \$* ]] || { reg_unlock; echo "space.sh adopt-pending: could not make a space for $dir" >&2; return 1; }
+    created=1
+    # The reservation's row becomes the space's: its place in the order (N)
+    # and its colour. Its session-created sync waits for this lock.
+    ((pi >= 0)) && R_NAME[pi]="$name" R_PATH[pi]="$dir"
+  elif ((pi >= 0)); then
+    reg_del "$pi"
+  fi
+  ((pi >= 0)) && reg_save
+  reg_unlock
+  ((created)) && home_now "$sid"
+  local -a args=(set -wu -t "$wid" @pending_space ";" set -wu -t "$wid" @pending_request
+    ";" set -wu -t "$wid" @pending_client ";" set -wu -t "$wid" @pending_color)
+  local v
+  while IFS= read -r v; do [[ -n "$v" ]] && args+=(";" detach-client -t "$v"); done <<<"$viewers"
+  args+=(";" move-window -d -a -s "$wid" -t "$sid:{end}")
+  run_args
+  if [[ "$(t display-message -p -t "$wid" '#{session_id}' 2>/dev/null)" != "$sid" ]]; then
+    msg -k error "could not move claude ($wid) into its space"
+    echo "space.sh adopt-pending: could not move $wid into $sid" >&2
+    return 1
+  fi
+  cmd_sync normal; reg_unlock
+  local idx sname
+  IFS="$US" read -r idx sname <<<"$(t display-message -p -t "$sid" "#{@space_index}${US}#{session_name}")"
+  notify
+  if [[ -n "$viewers" && -n "$pcl" ]]; then
+    t switch-client -c "$pcl" -t "$sid:$wid"
+  else
+    NOTIFY_TMUX="${NOTIFY_TMUX:-$TMUX_BIN}" notify_user ${pcl:+-c "$pcl"} -k ok -- "space ${idx:-?} ready: $sname"
+  fi
+  printf 'space %s: %s (%s)\n' "${idx:-?}" "$sname" "$dir"
+}
+
 # A folder's listing, for the pickers' previews (~ allowed).
 preview_dir() {
   local d="${1:-}"
@@ -1174,7 +1993,7 @@ cmd_preview_tab() {
   local sid="\$${key#s:}" rows k home letter summary state wname cmd path
   rows="$(t list-windows -t "$sid" -F "#{?#{@agent_state},a,s}${US}#{@space_home}${US}#{@agent_key}${US}#{@agent_summary}${US}#{@agent_state}${US}#{window_name}${US}#{pane_current_command}${US}#{pane_current_path}" 2>/dev/null)" || return 0
   local n=0 mark
-  # Shells as the status line marks them: home unlettered (⌃N reaches it),
+  # Shells as the status line marks them: home unlettered (⌘N reaches it),
   # the others by their ⌥W letter, · until they have one.
   printf 'shells\n'
   while IFS="$US" read -r k home letter summary state wname cmd path; do
@@ -1198,7 +2017,8 @@ main() {
   # Every caller that should act (keys, hooks, popups, tests) runs inside a
   # tmux server and has $TMUX. Without it, `tmux` means the default server,
   # which is how a hand-run test once closed a real space (2026-10-15).
-  if [[ -z "${TMUX:-}" && "$cmd" != "preview" ]]; then
+  # The pickers' per-keystroke helpers only read: they may run anywhere.
+  if [[ -z "${TMUX:-}" && " preview new-hint enter-key new-key alt-key is-english " != *" $cmd "* ]]; then
     echo "space.sh: \$TMUX is empty (not run by a tmux server); refusing '$cmd'" >&2
     return 3
   fi
@@ -1206,7 +2026,6 @@ main() {
     sync) cmd_sync "${1:-normal}" ;;
     restore-wait) cmd_restore_wait ;;
     respawn-home) cmd_respawn_home "${1:-}" ;;
-    agent) CLIENT="${3:-}"; cmd_agent "${1:-}" "${2:-}" ;;
     shell) CLIENT="${3:-}"; cmd_shell "${1:-}" "${2:-}" ;;
     next | prev) CLIENT="${2:-}"; cmd_step "$cmd" "${1:-}" ;;
     toggle) CLIENT="${2:-}"; cmd_toggle "${1:-}" ;;
@@ -1219,8 +2038,24 @@ main() {
     new-tab) cmd_new_tab "${1:-}" "${2:-}" "${3:-}" ;;
     preview-tab) cmd_preview_tab "${1:-}" ;;
     preview) preview_dir "${1:-}" ;;
+    candidates) dir_candidates "${1:-$PWD}" ;;
+    create) cmd_create "$@" ;;
+    new-hint) cmd_new_hint "${1:-}" "${2:-}" "${3:-}" "${4:-}" ;;
+    enter-key) cmd_enter_key "${1:-}" "${2:-}" "${3:-}" "${4:-}" ;;
+    new-key) cmd_new_key "${1:-}" "${2:-}" "${3:-}" ;;
+    alt-key) cmd_alt_key "${1:-}" "${2:-}" "${3:-}" ;;
+    pending-popup) cmd_pending_popup "${1:-}" "${2:-}" "${3:-}" ;;
+    popup-attach) cmd_popup_attach "${1:-}" "${2:-}" "${3:-}" ;;
+    viewer-left) cmd_viewer_left "${1:-}" ;;
+    is-english) is_english "${1:-}" ;;
+    catalog-sync) cmd_catalog_sync "${1:-}" "${2:-}" ;;
+    ask-claude) cmd_ask_claude "$@" ;;
+    pending-prompt) cmd_pending_prompt "${1:-}" ;;
+    pending-open) cmd_pending_open "$@" ;;
+    pending-go) cmd_pending_go "${1:-}" "${2:-}" ;;
+    adopt-pending) cmd_adopt_pending "${1:-}" "${2:-}" ;;
     *)
-      echo "usage: space.sh sync [load|reconcile] | agent|shell N SID [CLIENT] | next|prev SID [CLIENT] | toggle SID [CLIENT] | close SID [CLIENT] | move-menu WID [CLIENT] | move-to WID SID [CLIENT] | respawn-home PANE | new-space CLIENT | open-dir DIR [CLIENT] | pick-tab shell|agent CLIENT | new-tab shell|agent SID|DIR [CLIENT] | preview-tab KEY" >&2
+      echo "usage: space.sh sync [load|reconcile] | shell N SID [CLIENT] | next|prev SID [CLIENT] | toggle SID [CLIENT] | close SID [CLIENT] | move-menu WID [CLIENT] | move-to WID SID [CLIENT] | respawn-home PANE | new-space CLIENT | open-dir DIR [CLIENT] | pick-tab shell|agent CLIENT | new-tab shell|agent SID|DIR [CLIENT] | preview-tab KEY | create [--name] QUERY [CLIENT] [space|shell|agent] | new-hint MODE on|off QUERY | is-english TEXT | ask-claude [--no-popup] CLIENT TEXT | pending-open [--print] WID [CLIENT] | pending-go N [CLIENT] | adopt-pending WID DIR" >&2
       return 2
       ;;
   esac

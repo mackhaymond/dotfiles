@@ -583,7 +583,7 @@ fn quiet_is_roomy() {
     assert!(t[5].trim().is_empty() && t[6].starts_with(" AGENTS") && t[6].ends_with("all spaces "), "{t:#?}");
     assert_eq!(f.agents.start, 6);
     // Space headers on the canvas: ` N ` solid in the space's colour (peach:
-    // no colour of its own; no ⌃N: blank), the name bold in it, the counts
+    // no colour of its own; no ⌘N: blank), the name bold in it, the counts
     // on the right. The client's space a band of its colour with a `▌` at
     // the very edge.
     let main = head(&f, "main");
@@ -639,9 +639,9 @@ fn quiet_is_roomy() {
     }
     assert!(!t.iter().any(|l| l.contains(" idle ") || l.ends_with(" idle  ")), "{t:#?}");
     // A blank row between groups (after bai's second card, on the zebra's
-    // other shade), in ⌃N (here: name) order.
+    // other shade), in ⌘N (here: name) order.
     assert!(t[main - 1].trim().is_empty() && f.rows[main - 2].bg == Some(Ink::Pal("tile_lo")) && bai < main, "{t:#?}");
-    // The dock: a gap, its `▄` cap, a row per space in ⌃N (here: name)
+    // The dock: a gap, its `▄` cap, a row per space in ⌘N (here: name)
     // order, each with its counts, PARKED (one line, its count, never the
     // parked tab itself), its `▀` cap. Spare rows above it.
     assert_eq!((f.dock.clone(), f.spaces.clone(), f.parked.clone()), (51..58, 53..56, 56..57), "{t:#?}");
@@ -892,7 +892,7 @@ fn cut_pills_keep_the_current_and_attention_spaces() {
 }
 
 /// ONE space order: the pills and the agents' groups both go by
-/// `@space_index` (⌃N), unindexed spaces after by name; hidden spaces have
+/// `@space_index` (⌘N), unindexed spaces after by name; hidden spaces have
 /// no pill. A click on a pill switches the client to that space.
 #[test]
 fn groups_and_pills_share_the_space_order() {
@@ -923,7 +923,7 @@ fn groups_and_pills_share_the_space_order() {
     let shown: Vec<&str> = group_order.iter().map(String::as_str).filter(|g| *g != "hidden").collect();
     assert_eq!(shown, by_pos, "{t:#?}");
     assert!(group_order.iter().map(String::as_str).eq(want.iter().copied().filter(|g| group_order.iter().any(|x| x == g))));
-    // The ⌃N digit leads each indexed pill; past 9 or unset, none.
+    // The ⌘N digit leads each indexed pill; past 9 or unset, none.
     assert!(pills.contains(" 1 main ") && pills.contains(" 2 cua-notch ") && pills.contains(" 3 bai "), "{pills:?}");
     assert!(!pills.contains("12") && pills.contains(" zeta "), "{pills:?}");
     let y = f.spaces.clone().find(|&y| t[y].contains("cua-notch")).unwrap() as u16;
@@ -946,7 +946,7 @@ fn spaces_wear_their_colour() {
     );
     let f = layout(&v, 34, 40, &Opts::default());
     let row = |f: &Frame, name: &str| f.rows[f.spaces.clone().find(|&y| f.rows[y].text().contains(&format!(" {name} "))).unwrap()].clone();
-    // The client's space in the dock: its ⌃N chip solid in its colour (dark
+    // The client's space in the dock: its ⌘N chip solid in its colour (dark
     // ink), its name bold on its band.
     let yellow = Ink::Rgb(0xf9, 0xe2, 0xaf);
     let p = row(&f, "main");
@@ -1401,11 +1401,11 @@ fn lettered(mut v: ViewModel) -> ViewModel {
 /// Spaces with HOMES and SHELLS, `@spaces` on, every space shown (scope
 /// `scope`), the client on `here`, letters as the sidebar assigns them:
 ///
-/// - main (⌃1): home @1; agents @2 working (main:1), @3 idle (main:2), @4
+/// - main (⌘1): home @1; agents @2 working (main:1), @3 idle (main:2), @4
 ///   asking (main:3); shells @5 at a prompt in agent-ui (main:4), @6
 ///   running nvim (main:5);
-/// - work (⌃2): home @7; agent @8 working; shell @9 in cua-notch;
-/// - notes (⌃3): home @10; shell @11 in notes, no agent.
+/// - work (⌘2): home @7; agent @8 working; shell @9 in cua-notch;
+/// - notes (⌘3): home @10; shell @11 in notes, no agent.
 ///
 /// Letters (display order: each space's agents, then its shells): @2 a,
 /// @3 s, @4 d, @5 f, @6 g, @8 h, @9 j, @11 k; homes none.
@@ -1460,7 +1460,7 @@ fn shelly() -> ViewModel {
     shells_at("@5", "all", &[])
 }
 
-/// A bar like the live one: main (⌃1, yellow), usage meters (the weekly
+/// A bar like the live one: main (⌘1, yellow), usage meters (the weekly
 /// one from its numbers, the session one from its text) and a stale save.
 fn demo_bar() -> Bar {
     use super::super::status::{Chip, Member};
@@ -1646,7 +1646,7 @@ fn shells_are_rows_of_their_space() {
     let notes = head(&f, "notes");
     assert!(t[notes + 1].starts_with("    k  ❯ /x/notes"), "{t:#?}");
     assert_eq!(f.target(5, (notes + 1) as u16).cloned(), shell("@11", "notes"));
-    assert!(main < work && work < notes, "⌃N order: {t:#?}");
+    assert!(main < work && work < notes, "⌘N order: {t:#?}");
     // No home anywhere: nothing goes to @1, @7 or @10.
     for r in &f.rows {
         for (_, _, tg) in &r.targets {
@@ -2632,7 +2632,13 @@ fn the_pause_banner_says_where_the_pause_stands() {
                 assert_eq!(r.anim, p.busy(), "{ctx}");
                 let click = (0..w).map(|x| f.target(x, y as u16)).collect::<Vec<_>>();
                 if p.clickable() {
-                    assert!(click.iter().all(|c| *c == Some(&Target::Resume)), "{ctx}");
+                    // Everywhere but the first row's void chip, at its
+                    // right end (a pad and the margin after it).
+                    let void = click.iter().filter(|c| **c == Some(&Target::Void)).count();
+                    assert!(click.iter().all(|c| matches!(c, Some(Target::Resume | Target::Void))), "{ctx}");
+                    assert_eq!(void > 0, y == 0, "{ctx}");
+                    let w = usize::from(w);
+                    assert!(click[w - 2 - void..w - 2].iter().all(|c| *c == Some(&Target::Void)), "{ctx}");
                 } else {
                     assert!(click.iter().all(Option::is_none), "{ctx}");
                 }
@@ -2655,17 +2661,20 @@ fn the_pause_banner_says_where_the_pause_stands() {
     }
     // Ready always says how to resume, at Mack's usual 34 columns too: who
     // on the first row, "prefix P or click to resume" on the second; one
-    // row, the hint takes the place of who.
+    // row, the hint takes the place of who (` · click` going for the void
+    // chip at 34).
     for w in [34u16, 44] {
         let f = layout(&v, w, 58, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() });
         let t = texts(&f);
-        assert!(t[0].contains("↻ 3 ready  Tmux Agent Side"), "{t:#?}");
+        assert!(t[0].contains("↻ 3 ready  Tmux Agent S"), "{t:#?}");
         assert!(t[1].contains("prefix P or click to resume"), "{t:#?}");
     }
     let f = layout(&v, 34, 10, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() });
     let t = texts(&f);
     assert_eq!(f.pause, 0..1, "{t:#?}");
-    assert!(t[0].contains("↻ 3 ready  prefix P · click"), "{t:#?}");
+    assert!(t[0].contains("↻ 3 ready  prefix P ") && t[0].contains("✕"), "{t:#?}");
+    let t = texts(&layout(&v, 44, 10, &Opts { pause: Some(phases()[3].clone()), ..Opts::default() }));
+    assert!(t[0].contains("↻ 3 ready  prefix P · click") && t[0].contains("✕"), "{t:#?}");
     let f = layout(&v, 44, 58, &Opts { pause: Some(phases()[1].clone()), ..Opts::default() });
     assert!(texts(&f)[1].contains("still working  Tmux Agent Sidebar, C…"), "{:#?}", texts(&f));
     // No pause: nothing at all, the frame exactly as before.
@@ -2875,6 +2884,79 @@ fn pause_banner_is_violet_then_cyan_never_green() {
     assert!(f.rows[0].segs.iter().any(|s| s.text.contains("PAUSING") && s.fg == Ink::Pal("dimviolet")), "{:?}", f.rows[0].segs);
 }
 
+/// The settled banner's void chip (docs/agent-pause.md "Dismiss and void"),
+/// safe and ready only, square at the first row's right end (a pad and the
+/// margin after it): quiet, ` ✕ void ` dim on the cyan a step up (` ✕ ` at
+/// Mack's usual 34 columns); armed by a first click, ` ✕ void? click
+/// again ` bold dark ink on solid red (` ✕ void? ` at 34), and safe's
+/// `safe to close` makes way for it. Its cells are [`Target::Void`]
+/// ([`Target::VoidArmed`] armed); the rest of the banner still resumes.
+/// A dismissed glow keeps the banner and says `glow off`, dim, at the
+/// second row's right end (ready's hint shorter for it at 34).
+#[test]
+fn the_settled_banner_has_a_void_chip() {
+    let v = lettered(quiet());
+    let ph = phases();
+    let (safe, ready) = (&ph[2], &ph[3]);
+    let lay = |p: &Phase, w: u16, armed: bool, glow_off: bool| layout(&v, w, 58, &Opts { pause: Some(p.clone()), void_armed: armed, glow_off, ..Opts::default() });
+    let chip_of = |f: &Frame| f.rows[0].segs.iter().find(|s| s.text.contains('✕') || s.text.contains("void?")).cloned();
+    for (w, quiet, asks) in [(44u16, " ✕ void ", " ✕ void? click again "), (34, " ✕ ", " ✕ void? ")] {
+        for p in [safe, ready] {
+            let ctx = |f: &Frame| format!("{p:?} {w}: {:#?}", texts(f));
+            let f = lay(p, w, false, false);
+            let c = chip_of(&f).unwrap_or_else(|| panic!("{}", ctx(&f)));
+            assert_eq!(c.text, quiet, "{}", ctx(&f));
+            assert!(!c.bold && c.fg == Ink::Pal("overlay2") && c.bg.is_some_and(|b| b != pause_bg(p)), "{c:?}");
+            assert!(texts(&f)[0].ends_with(&format!("{quiet}  ")), "{}", ctx(&f));
+            let x1 = w - 2;
+            let x0 = x1 - dwidth(quiet) as u16;
+            assert!((x0..x1).all(|x| f.target(x, 0) == Some(&Target::Void)), "{}", ctx(&f));
+            assert_eq!((f.target(x0 - 1, 0), f.target(x1, 0)), (Some(&Target::Resume), Some(&Target::Resume)), "{}", ctx(&f));
+            assert!((0..w).all(|x| f.target(x, 1) == Some(&Target::Resume)), "{}", ctx(&f));
+            // Armed: the question, in red, where the quiet chip was.
+            let f = lay(p, w, true, false);
+            assert_eq!(chip_of(&f), Some(block(asks, ink_on(Ink::Pal(VOID_HUE)), VOID_HUE)), "{}", ctx(&f));
+            assert!(texts(&f)[0].ends_with(&format!("{asks}  ")), "{}", ctx(&f));
+            let x0 = x1 - dwidth(asks) as u16;
+            assert!((x0..x1).all(|x| f.target(x, 0) == Some(&Target::VoidArmed)), "{}", ctx(&f));
+            assert!(!(0..w).any(|x| f.target(x, 0) == Some(&Target::Void)), "{}", ctx(&f));
+            assert_eq!(f.target(2, 0), Some(&Target::Resume), "{}", ctx(&f));
+            if matches!(p, Phase::Safe { .. }) {
+                assert!(texts(&f)[0].contains("⏸ PAUSED") && !texts(&f)[0].contains("safe to close"), "{}", ctx(&f));
+            }
+        }
+    }
+    // A moving banner has none, armed or not, and never `glow off`.
+    for p in [&ph[0], &ph[1], &ph[4]] {
+        for armed in [false, true] {
+            let f = lay(p, 44, armed, true);
+            assert!(chip_of(&f).is_none() && !texts(&f).iter().any(|l| l.contains(GLOW_OFF)), "{p:?}: {:#?}", texts(&f));
+            assert!(f.rows.iter().all(|r| r.targets.iter().all(|(_, _, t)| !matches!(t, Target::Void | Target::VoidArmed))));
+        }
+    }
+    for w in [34u16, 44] {
+        // Dismissed: the banner as ever, `glow off` on its second row.
+        let f = lay(safe, w, false, true);
+        let t = texts(&f);
+        assert_eq!(f.pause, 0..2, "{t:#?}");
+        assert!(t[0].contains("⏸ PAUSED") && t[1].contains("Tmux"), "{t:#?}");
+        assert!(t[1].ends_with(&format!("{GLOW_OFF}  ")) && f.rows[1].segs.contains(&seg(GLOW_OFF, "overlay2")), "{t:#?}");
+        let t = texts(&lay(ready, w, false, true));
+        let hint = if w == 44 { "prefix P or click to resume" } else { "prefix P · click" };
+        assert!(t[1].contains(hint) && t[1].ends_with(&format!("{GLOW_OFF}  ")), "{t:#?}");
+        assert!(!texts(&lay(safe, w, false, false)).iter().any(|l| l.contains(GLOW_OFF)));
+    }
+    // Every banner row exactly the frame's width, at any width.
+    for w in 4u16..=60 {
+        for (p, armed, glow) in [safe, ready].into_iter().flat_map(|p| [(p, false, false), (p, true, false), (p, false, true), (p, true, true)]) {
+            let f = lay(p, w, armed, glow);
+            assert!(f.rows.iter().all(|r| dwidth(&r.text()) == usize::from(w)), "{p:?} {w} {armed} {glow}: {:#?}", texts(&f));
+            let chip = if armed { Target::VoidArmed } else { Target::Void };
+            assert!(w < 8 || (0..w).any(|x| f.target(x, 0) == Some(&chip)), "{p:?} {w}: {:#?}", texts(&f));
+        }
+    }
+}
+
 /// tmux-mcp's reason for holding a PAUSE (server.ts `readBox`): copy mode.
 const COPY: &str = "the pane is in copy mode";
 
@@ -3008,4 +3090,5 @@ fn held_rows_are_capped() {
 
 mod answer;
 mod insight;
+mod pending;
 mod pinned;

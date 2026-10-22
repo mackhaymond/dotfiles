@@ -13,7 +13,10 @@
 //!   table, so it letters agents only, as before),
 //!
 //! never a space's HOME window (`@space_home`): the space itself is the
-//! home, reached by its ⌃N. Agents and shells share the one pool, so no
+//! home, reached by its ⌘N. A PENDING space's claude (the hidden `pending`
+//! session's windows with `@pending_space`, [`crate::view::Space::pending`])
+//! is an agent like any, listed in display order at its space's number;
+//! spaces.conf's `@space_jump_pending` takes ⌥W + its letter to its popup. Agents and shells share the one pool, so no
 //! letter is ever both a shell's and an agent's. An agent that exits back
 //! to its shell, or a shell where an agent starts, stays listed, so it
 //! keeps its letter.
@@ -139,7 +142,7 @@ pub fn assign(listed: &[(String, String)], unlisted: &[(String, String)]) -> Ass
 
 /// THE DISPLAY ORDER of the lettered windows, the one the sidebar draws
 /// and the menu groups by: space by space in [`crate::view::space_order`]
-/// (⌃N, then by name), and in each space its agents (agent state, by window
+/// (⌘N, then by name), and in each space its agents (agent state, by window
 /// index), then its shells ([`Space::shells`]: no state, not the home, by
 /// window index; none in a `@space_hidden` session). Homes are never in it.
 /// A window linked into two spaces appears under both (its first entry
@@ -413,7 +416,7 @@ mod tests {
         of_view(&snap, &ViewModel::build(&snap, args), None)
     }
 
-    /// Spaces: work (⌃1: first), then hid and main by name. work: its home
+    /// Spaces: work (⌘1: first), then hid and main by name. work: its home
     /// @5, its shell @6. hid (`@space_hidden`): a shell @7, an agent @8.
     /// main: its home @1, agents @2 (main:1) and @4 (main:3), a shell @3
     /// (main:2).
@@ -444,7 +447,7 @@ mod tests {
     }
 
     /// ONE pool for agents and shells. Free letters go to every agent first
-    /// (display order: spaces ⌃N first, then by name; each space's agents
+    /// (display order: spaces ⌘N first, then by name; each space's agents
     /// by index), then to the shells (display order); a home never; a
     /// hidden session's shell never (its agent, as ever, yes).
     #[test]

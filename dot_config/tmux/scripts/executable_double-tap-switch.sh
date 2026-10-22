@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Double-tap hyper or right shift in WezTerm → flip to the previous tmux session or
-# window, the way the same double-tap flips Arc tabs (BTT sends Ctrl+Tab there).
-# Karabiner runs this (.chezmoitemplates/karabiner-base.json), so there is no $TMUX:
-# the target is the focused client. Which flip is `@double_tap_target` (tmux.conf):
+# Double-tap hyper or right shift in WezTerm → flip to the previous tmux tab,
+# session or window, the way the same double-tap flips Arc tabs (Karabiner
+# sends Ctrl+Tab there). Karabiner runs this (.chezmoitemplates/karabiner-base.json),
+# so there is no $TMUX: the target is the focused client. Which flip is
+# `@double_tap_target` (tmux.conf; unset = global):
+#   global   the tab this client was on before this one, in ANY space: agent,
+#            shell or home, never a hidden session. Pressed again, back: a true
+#            A<->B flip. It is `nav.sh last`, Option-X's history (docs/nav.md),
+#            which skips closed and parked tabs.
 #   session  the most recently attached other session — the top row of prefix+a
-#   window   last-window in the focused client's session
+#   window   last-window in the focused client's session (same space only)
 # Switch live: tmux set -g @double_tap_target window
 
 set -uo pipefail
@@ -57,7 +62,7 @@ case "$(tmux show -gv @double_tap_target 2>/dev/null)" in
     tmux last-window -t "$session" 2>/dev/null ||
       say "No previous window"
     ;;
-  *)
+  session)
     current="$(tmux display-message -t "$client" -p '#S')"
     # Same list and order as mru-session-switch.sh, minus the picker. Space-separated:
     # in Karabiner's bare env (no LANG) tmux prints a tab as `_`. The name is the
@@ -70,6 +75,22 @@ case "$(tmux show -gv @double_tap_target 2>/dev/null)" in
       tmux switch-client -c "$client" -t "=$target"
     else
       say "No other session"
+    fi
+    ;;
+  *)
+    # nav.sh beside this script (executable_nav.sh in the chezmoi source). It
+    # keys the history by client name, which is what $client is; it sets its
+    # own UTF-8 locale and says "no previous tab" itself. $BASH, the bash
+    # running this: Karabiner's PATH may not hold the one tmux's would.
+    d="${BASH_SOURCE[0]%/*}"
+    [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+    for nav in "$d/nav.sh" "$d/executable_nav.sh" "$HOME/.config/tmux/scripts/nav.sh"; do
+      [ -f "$nav" ] && break
+    done
+    if [ -f "$nav" ]; then
+      "${BASH:-bash}" "$nav" last "$client"
+    else
+      say "double-tap: nav.sh not found"
     fi
     ;;
 esac

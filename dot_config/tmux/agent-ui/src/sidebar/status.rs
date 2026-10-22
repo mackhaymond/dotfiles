@@ -139,7 +139,7 @@ pub fn ink_on(bg: Ink) -> Ink {
 /// The client's space, as the status line's chip showed it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chip {
-    /// `@space_index` (⌃N), when set.
+    /// `@space_index` (⌘N), when set.
     pub index: Option<u32>,
     pub name: String,
     /// `@space_color`, when set and valid.

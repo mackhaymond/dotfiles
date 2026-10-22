@@ -159,7 +159,7 @@ fn uncapped(l: &str) -> String {
 }
 
 /// `l` is `name`'s space header in AGENTS: past the edge (the client's
-/// `▌`, else the canvas), the space's ` N ` chip (blank without a ⌃N),
+/// `▌`, else the canvas), the space's ` N ` chip (blank without a ⌘N),
 /// a pad, then its name at the fifth cell (a card's letter sits at the
 /// fourth), then the branch and counts.
 fn is_group(l: &str, name: &str) -> bool {
@@ -313,7 +313,7 @@ fn once_follows_the_scope_options() {
 }
 
 /// The spaces read each session's @space_index and @space_hidden off the
-/// window rows (session options through the window format): ⌃N digits on
+/// window rows (session options through the window format): ⌘N digits on
 /// the pills, index order, hidden sessions left out; and the agents' groups
 /// follow the same order.
 #[test]
@@ -330,7 +330,7 @@ fn once_lists_spaces_by_space_index() {
     let pos: Vec<usize> = [" 1 main ", " 2 zeta ", " 3 work "].iter().map(|n| pills.find(n).unwrap_or_else(|| panic!("{n}: {lines:#?}"))).collect();
     assert!(pos.windows(2).all(|p| p[0] < p[1]), "{lines:#?}");
     assert!(!lines.iter().any(|l| l.contains("secret")), "{lines:#?}");
-    // The groups: ⌃N order too (zeta before work, unlike by name).
+    // The groups: ⌘N order too (zeta before work, unlike by name).
     assert!(group(&lines, "zeta") < group(&lines, "work"), "{lines:#?}");
 }
 

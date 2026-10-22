@@ -252,6 +252,15 @@ go_to() {
         [ -n "$go_sess" ] || return 1
     fi
     case "$EXCLUDE" in *" $go_sess "*) return 2 ;; esac
+    # A pending claude (space.sh's pending spaces: a claude a picker's
+    # sentence started, waiting in the hidden session `pending`) is listed and
+    # jumped to like any agent, but never by switching the client into
+    # `pending`: its popup opens instead (run-shell -b, as display-popup waits
+    # for the popup to close). No chain: nothing to come back from.
+    if [ "$go_sess" = pending ]; then
+        tmux run-shell -b "#{@space_sh} pending-open $win '$tty'" 2>/dev/null
+        return
+    fi
     if [ -n "$chain" ]; then
         tmux select-window -t "=$go_sess:$win" \; switch-client -c "$tty" -t "=$go_sess" \
             \; set-option -g "$(chain_key)" "$chain" 2>/dev/null

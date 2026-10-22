@@ -7,7 +7,10 @@ and the @space_hidden marker on hidden sessions), then loads the nav lines
 lines come from tmux.conf.tmpl when it carries them, else from the block in
 docs/nav.md, so the test always runs what tmux.conf will. Clients attach from
 pseudo-terminals this process opens (pty.fork); keys go through the client's
-key tables with `send-keys -K -c <client>`. Run with unittest or pytest.
+key tables with `send-keys -K -c <client>`. The double-tap runs
+double-tap-switch.sh the way Karabiner does, from outside tmux, under
+/bin/bash; only $TMUX points its bare `tmux` at the test socket. Run with
+unittest or pytest.
 """
 import fcntl
 import os
@@ -29,6 +32,7 @@ HERE = Path(__file__).resolve().parents[1]
 CONF = HERE / "tmux.conf.tmpl"
 DOC = HERE / "docs" / "nav.md"
 SCRIPT = HERE / "scripts" / "executable_nav.sh"
+DTAP = HERE / "scripts" / "executable_double-tap-switch.sh"
 LIVE_PATH = "#{HOME}/.config/tmux/scripts/nav.sh"
 TMUX = shutil.which("tmux")
 HIDDEN = "agents tasks stash scratch btop-popup"
@@ -43,6 +47,11 @@ def nav_lines():
         block = re.search(r"```tmux\n(.*?)```", DOC.read_text(), re.S)
         lines = [l for l in block.group(1).splitlines() if keep(l)]
     return lines
+
+
+def dtap_target():
+    """tmux.conf's @double_tap_target."""
+    return re.search(r"^set -g @double_tap_target '(\w+)'", CONF.read_text(), re.M).group(1)
 
 
 class Nav(unittest.TestCase):
@@ -62,6 +71,7 @@ class Nav(unittest.TestCase):
         self.path = self.t("display", "-p", "#{socket_path}")
         self.t("set", "-g", "exit-empty", "off")
         self.t("set", "-g", "@space_hidden_sessions", HIDDEN)
+        self.t("set", "-g", "@double_tap_target", dtap_target())
         self.t("new-session", "-d", "-s", "stash")
         self.t("set", "-t", "stash", "@space_hidden", "1")
         self.t("new-session", "-d", "-s", "other")
@@ -146,8 +156,8 @@ class Nav(unittest.TestCase):
 
     def hist(self, client):
         k = re.sub(r"[^A-Za-z0-9]", "_", client)
-        cur, _, rest = self.t("show", "-gqv", f"@nav_{k}").partition("|")
-        back, _, fwd = rest.partition("|")
+        # "<cur>|<back>|<fwd>|<prev>"; <prev> is only the double-tap's
+        cur, back, fwd = (self.t("show", "-gqv", f"@nav_{k}").split("|") + ["", ""])[:3]
         return {"cur": cur, "back": back.split(), "fwd": fwd.split()}
 
     def go(self, client, session, win):
@@ -166,6 +176,15 @@ class Nav(unittest.TestCase):
 
     def forward(self, client, session, win):
         self.key(client, "M-c")
+        self.wait(lambda: self.on(client), self.e(session, win))
+
+    def dtap(self):
+        """The double-tap, as Karabiner runs it: no client named, the script picks."""
+        subprocess.run(["/bin/bash", str(DTAP)], env=dict(self.env, TMUX=f"{self.path},0,0"),
+                       check=True, timeout=10)
+
+    def tap(self, client, session, win):
+        self.dtap()
         self.wait(lambda: self.on(client), self.e(session, win))
 
     def settle(self, client):
@@ -344,6 +363,102 @@ class Nav(unittest.TestCase):
         self.assertEqual(len(back), 50)
         self.assertEqual(back[-2:], [self.e("main", self.main[0]), self.e("main", self.main[4])])
 
+    # -- the double-tap: double-tap-switch.sh -> nav.sh last ---------------
+    def test_double_tap_flips_across_spaces(self):
+        c = self.attach()
+        a, b = self.main[1], self.other[1]
+        self.go(c, "main", a)
+        self.go(c, "other", b)
+        self.tap(c, "main", a)
+        self.tap(c, "other", b)
+        self.tap(c, "main", a)
+        self.settle(c)                       # the flips' own hooks recorded nothing
+        self.assertEqual(self.hist(c), {"cur": self.e("main", a), "fwd": [],
+                                        "back": [self.e("main", self.main[0]), self.e("other", b)]})
+
+    def test_double_tap_after_back_returns_to_the_tab_left(self):
+        c = self.attach()
+        z, a, b = self.main[1], self.other[0], self.main[2]
+        self.go(c, "main", z)
+        self.go(c, "other", a)
+        self.go(c, "main", b)
+        self.back(c, "other", a)
+        self.tap(c, "main", b)               # the tab just left (on forward), not Z
+        self.tap(c, "other", a)
+        self.tap(c, "main", b)
+        self.settle(c)
+        # a new navigation: forward cleared; flipping did not grow back
+        self.assertEqual(self.hist(c), {"cur": self.e("main", b), "fwd": [],
+                                        "back": [self.e("main", self.main[0]), self.e("main", z),
+                                                 self.e("other", a)]})
+        self.back(c, "other", a)             # Option-X undoes the flip
+        self.back(c, "main", z)
+
+    def test_double_tap_after_back_back_forward(self):
+        c = self.attach()
+        z, a, b = self.main[1], self.other[0], self.main[2]
+        for s, w in (("main", z), ("other", a), ("main", b)):
+            self.go(c, s, w)
+        self.back(c, "other", a)
+        self.back(c, "main", z)
+        self.forward(c, "other", a)
+        self.tap(c, "main", z)               # forward left Z
+        self.tap(c, "other", a)
+        self.tap(c, "main", z)
+        self.settle(c)
+        self.assertEqual(self.hist(c), {"cur": self.e("main", z), "fwd": [],
+                                        "back": [self.e("main", self.main[0]), self.e("other", a)]})
+
+    def test_double_tap_skips_a_hidden_session_visit(self):
+        c = self.attach()
+        a, b = self.main[1], self.other[1]
+        self.go(c, "main", a)
+        self.t("switch-client", "-c", c, "-t", "stash")
+        self.settle(c)
+        self.go(c, "other", b)
+        self.tap(c, "main", a)
+        self.tap(c, "other", b)
+        # from inside a hidden session: out, to the last recorded tab
+        self.t("switch-client", "-c", c, "-t", "stash")
+        self.settle(c)
+        self.tap(c, "other", b)
+
+    def test_double_tap_skips_closed_and_parked_tabs(self):
+        c = self.attach()
+        a, closed, parked, b = self.main[1], self.main[2], self.main[3], self.other[1]
+        for s, w in (("main", a), ("main", closed), ("main", parked), ("other", b)):
+            self.go(c, s, w)
+        self.t("kill-window", "-t", closed)
+        self.t("move-window", "-s", parked, "-t", "stash:")   # a park
+        self.tap(c, "main", a)
+        self.tap(c, "other", b)
+        self.settle(c)
+        self.assertEqual(self.hist(c)["back"], [self.e("main", self.main[0]), self.e("main", a)])
+
+    def test_double_tap_with_nothing_to_flip_to_says_so(self):
+        c = self.attach()
+        self.dtap()
+        self.wait(lambda: "no previous tab" in self.messages(), True)
+        self.assertEqual(self.on(c), self.e("main", self.main[0]))
+
+    def test_double_tap_without_nav_sh_says_so(self):
+        c = self.attach()
+        self.go(c, "main", self.main[1])
+        alone = Path(self.tmp) / "double-tap-switch.sh"      # no nav.sh beside it or in HOME
+        shutil.copy(DTAP, alone)
+        subprocess.run(["/bin/bash", str(alone)], check=True, timeout=10,
+                       env=dict(self.env, TMUX=f"{self.path},0,0", HOME=self.tmp))
+        self.wait(lambda: "double-tap: nav.sh not found" in self.messages(), True)
+        self.assertEqual(self.on(c), self.e("main", self.main[1]))
+
+    def test_double_tap_window_target_stays_in_the_space(self):
+        self.t("set", "-g", "@double_tap_target", "window")
+        c = self.attach()
+        self.go(c, "main", self.main[1])
+        self.go(c, "other", self.other[1])
+        self.dtap()                          # last-window: other's previous, not main's
+        self.wait(lambda: self.on(c), self.e("other", self.other[0]))
+
     def test_detach_forgets(self):
         c = self.attach()
         self.go(c, "main", self.main[1])
@@ -366,6 +481,9 @@ class Wiring(unittest.TestCase):
         theirs = {m for m in re.findall(r"set-hook -g '?([a-z-]+\[\d+\])", text)
                   if not any(m in l for l in lines)}
         self.assertFalse(ours & theirs, ours & theirs)
+
+    def test_double_tap_default_is_global(self):
+        self.assertEqual(dtap_target(), "global")
 
 
 Nav = unittest.skipUnless(TMUX, "tmux not installed")(Nav)

@@ -2261,11 +2261,12 @@ do_stash_many() {
 # you are looking at, or no-op with a misleading "already parked".
 #
 # It also clears any range selection first. tmux hands the prefix key back to
-# the prefix table WITHOUT consulting the `stash` table's bindings, so pressing
-# prefix mid-selection is the one exit that cannot run sel-cancel — and the
-# muscle-memory follow-up is prefix+H. Clearing here means that sequence parks
-# the current window and tidies the tint, instead of parking one window that
-# then travels into the holding session still flagged and comes back mauve.
+# the prefix table WITHOUT consulting the `stash` table's bindings, so prefix
+# mid-selection leaves the mode — prefix+v cancels it (a toggle since
+# 2026-10-21), and the muscle-memory follow-up prefix+H lands here. Clearing
+# here means that sequence parks the current window and tidies the tint,
+# instead of parking one window that then travels into the holding session
+# still flagged and comes back mauve.
 do_stash() {
     do_sel_cancel
     do_stash_many "$(sel_win "${1:-}")"
@@ -2319,13 +2320,53 @@ sel_win() {
 }
 sel_sess_of() { [ -n "${1:-}" ] && tmux display-message -p -t "$1" '#{session_name}' 2>/dev/null; }
 
+# The mode's keys in the ROOT table, bound only while a selection exists
+# (tmux.conf.tmpl's stash section has why: bound for good, a prefix miss —
+# C-s Esc — reached the pane). sel-start sources the file; sel_clear unbinds
+# exactly these keys. The file sits beside this script, wherever it runs from
+# (~/.config/tmux/scripts, or the chezmoi source in the tests);
+# STASH_ROOT_KEYS_CONF names another.
+STASH_ROOT_KEYS="h l H Enter m a Escape q C-c Space"
+stash_root_keys_conf() {
+    local d="${BASH_SOURCE[0]%/*}"
+    [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+    printf '%s' "${STASH_ROOT_KEYS_CONF:-$d/stash-root-keys.conf}"
+}
+SEL_ROOT_BOUND=""     # what the last sel_clear found in @stash_root_bound
+
 # Clear the flag wherever it is, not merely where we believe it is. A selection
 # that leaked would tint tabs with no way to reach the mode that clears them.
+#
+# Also THE place the root keys come off — every ending runs through here
+# (sel-cancel, so the park, sel-send and prefix+H too, and sel-start's wipe).
+# @stash_root_bound rides in the list-windows call this makes anyway, so with
+# nothing bound (a plain prefix+H) it costs no tmux call; with them bound it is
+# one call: ten `unbind-key -q -n` and the flag, as a single command list.
+# `keep` (sel-start, which binds them again at once) leaves them be.
 sel_clear() {
-    local w
-    for w in $(tmux list-windows -a -F '#{?#{@stash_sel},#{window_id},}' 2>/dev/null); do
+    local line w bound="" ids="" k cmd=()
+    while IFS= read -r line; do
+        [ -n "$bound" ] || bound="${line%%"$SEP"*}"
+        w="${line#*"$SEP"}"
+        [ -n "$w" ] && ids="$ids $w"
+    done < <(tmux list-windows -a -F "#{@stash_root_bound}${SEP}#{?#{@stash_sel},#{window_id},}" 2>/dev/null)
+    for w in $ids; do
         tmux set-option -uw -t "$w" @stash_sel 2>/dev/null
     done
+    SEL_ROOT_BOUND="$bound"
+    if [ -n "$bound" ] && [ "${1:-}" != keep ]; then
+        for k in $STASH_ROOT_KEYS; do cmd+=(unbind-key -q -n "$k" ';'); done
+        tmux "${cmd[@]}" set-option -gu @stash_root_bound 2>/dev/null
+        SEL_ROOT_BOUND=""
+    fi
+}
+
+# Bind the root keys (one call), unless the sel_clear just before found them
+# bound and kept them.
+sel_bind_root_keys() {
+    [ -n "$SEL_ROOT_BOUND" ] && return 0
+    tmux source-file "$(stash_root_keys_conf)" ';' set-option -g @stash_root_bound 1 2>/dev/null \
+        || log "could not bind the selection's root keys ($(stash_root_keys_conf))"
 }
 
 # The ids the tab bar is currently showing as selected, in tab order.
@@ -2400,7 +2441,7 @@ do_sel_start() {
     # Selecting inside the holding session would offer to park what is already
     # parked, and the tab bar it tints is not on screen to begin with.
     case "$sess" in "$HOLD") return 0 ;; esac
-    sel_clear
+    sel_clear keep
     # `here` selects only the current tab — vim's `v` — and h/l grow it from
     # there. left/right start already extended by one (the shift-arrow shape).
     if [ "$dir" = "here" ]; then nxt="$cur"; else nxt=$(sel_neighbour "$sess" "$cur" "$dir"); fi
@@ -2410,6 +2451,8 @@ do_sel_start() {
     # session's windows, does not find it, and the selection simply restarts.
     tmux set-option -g @stash_anchor "$cur" 2>/dev/null
     tmux set-option -g @stash_cursor "$nxt" 2>/dev/null
+    # Before the paint, so the keys are there by the time the tint is.
+    sel_bind_root_keys
     sel_apply "$sess" $(sel_range "$sess" "$cur" "$nxt")
 }
 

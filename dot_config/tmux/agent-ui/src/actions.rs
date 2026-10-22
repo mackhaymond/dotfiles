@@ -6,6 +6,7 @@
 //! |-------------------|----------------------------------------------------------|-------------------|
 //! | go to a window    | `bash agent-jump.sh goto <tty> <win> <session>` (10 s)   | `Roster.go/jump`  |
 //! | go to a parked one| `tmux run-shell -b "stash.sh unstash <win> <tty>"`       | `Roster.go`       |
+//! | go to a pending one| `tmux run-shell -b "space.sh pending-open <win> <tty>"` | (none)            |
 //! | next              | `bash agent-jump.sh next <tty>`                          | `Roster.jump`     |
 //! | back (⌥X)         | `bash nav.sh back <tty>` (docs/nav.md)                   | (none)            |
 //! | go to a space     | goto on its HOME window (else its active one), there     | `Strip.click`     |
@@ -242,9 +243,29 @@ impl Actions {
     /// The sidebar's pause banner, clicked: resume the saved set, with its
     /// popup on `client`. `run-shell -b` as prefix P's own binding (the
     /// delivery waits on tmux-mcp; tmux runs it, so it outlives nothing
-    /// here). Fire and forget.
-    pub fn resume_paused(&self, client: &str) {
-        self.tmux.run_bg(&self.resume_line(client));
+    /// here). Fire and forget; the line handed over is returned (the
+    /// sidebar keeps it for the record).
+    pub fn resume_paused(&self, client: &str) -> String {
+        let line = self.resume_line(client);
+        self.tmux.run_bg(&line);
+        line
+    }
+
+    /// What [`void_paused`](Self::void_paused) hands `run-shell -b`:
+    /// `agent-pause.py void <client>` (docs/agent-pause.md "Dismiss and
+    /// void"): the saved set is forgotten, each agent's flag cleared, no
+    /// RESUME sent; nothing when no set is saved.
+    pub fn void_line(&self, client: &str) -> String {
+        self.script_line("agent-pause.py", &["void", client])
+    }
+
+    /// The pause banner's void chip, confirmed: void the saved set, its
+    /// message on `client`; `run-shell -b` exactly as the resume. Fire and
+    /// forget; the line handed over is returned.
+    pub fn void_paused(&self, client: &str) -> String {
+        let line = self.void_line(client);
+        self.tmux.run_bg(&line);
+        line
     }
 
     /// agent-roster.py `Roster.jump`:`bash agent-jump.sh <mode> <tty> [args]`.
@@ -276,6 +297,12 @@ impl Actions {
             self.unstash(client, win);
             return Ok(());
         }
+        // A pending space's claude lives in a hidden session: its popup,
+        // never a select (the client stays where it is).
+        if w.is_pending() {
+            self.tmux.run_bg(&self.pending_open_line(win, client));
+            return Ok(());
+        }
         self.jump("goto", client, &[win, session])?;
         self.focus_shell(w);
         Ok(())
@@ -294,6 +321,27 @@ impl Actions {
         if let Some(cmd) = Self::focus_shell_command(w) {
             let _ = self.tmux.run(&cmd);
         }
+    }
+
+    /// What going to a pending space's claude hands `run-shell -b`: `space.sh
+    /// pending-open <win> <client>` (docs/spaces.md "Pending spaces": its
+    /// popup on that client, as ⌘N on its number and ⌥W on its letter do).
+    pub fn pending_open_line(&self, win: &str, client: &str) -> String {
+        self.script_line("space.sh", &["pending-open", win, client])
+    }
+
+    /// A pending space (its header, its dock row or chip) clicked: the
+    /// popup of the claude building it, when that window is still pending
+    /// in the CURRENT snapshot (adopted meanwhile: [`TAB_MOVED`]).
+    pub fn open_pending(&self, snap: &Snapshot, client: &str, win: &str) -> Result<(), String> {
+        if snap.rows(win).next().is_none() {
+            return Err(PANE_GONE.into());
+        }
+        if !snap.rows(win).any(Window::is_pending) {
+            return Err(format!("{TAB_MOVED} · pick it again"));
+        }
+        self.tmux.run_bg(&self.pending_open_line(win, client));
+        Ok(())
     }
 
     /// `stash.sh unstash <win> <client>` on the tmux server (outlives us).
@@ -323,7 +371,7 @@ impl Actions {
 
     /// Strip.click on a space (its header in AGENTS, its dock row or chip): goto that
     /// space's HOME window (`@space_home`: going to a space goes to its home
-    /// shell, as ⌃N does), else, for a session with no home, its ACTIVE
+    /// shell, as ⌘N does), else, for a session with no home, its ACTIVE
     /// window; in THAT session (even for a linked window). Select-then-
     /// switch, so the visit discharges the tint like a tab click.
     pub fn goto_session(&self, snap: &Snapshot, client: &str, session: &str) -> Result<(), String> {
@@ -622,6 +670,41 @@ mod tests {
         for (win, label) in [("@5", "Asks"), ("@6", "Quiet"), ("@7", "Broke"), ("@8", "Done"), ("@11", "Paused"), ("@12", "Flagged")] {
             assert_eq!(a.park(&snap, win, "main"), Ok(format!("parking {label}…")));
         }
+    }
+
+    /// Going to a pending space's claude (its card, a NEEDS YOU card, the
+    /// menu's Enter: all [`Actions::go`]) opens its popup, `space.sh
+    /// pending-open <win> <client>`, never agent-jump.sh's select; its
+    /// header ([`Actions::open_pending`]) the same, only while the window is
+    /// still pending. A fake agent-jump.sh records any jump; the server does
+    /// not exist, so the popup's run-shell runs nothing.
+    #[test]
+    fn a_pending_space_opens_its_popup() {
+        use crate::tmux::tests::row;
+        let dir = std::env::temp_dir().join(format!("agentui-pending-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mark = dir.join("jumped");
+        std::fs::write(dir.join("agent-jump.sh"), format!("echo \"$@\" >> '{}'\n", mark.display())).unwrap();
+        let mut a = Actions::new(Tmux::with_socket(Some(crate::tmux::Socket::Name(format!("agentui-pend-none-{}", std::process::id())))));
+        a.scripts = dir.clone();
+        assert_eq!(a.pending_open_line("@7", "/dev/ttys004"),
+            format!("'{}/space.sh' 'pending-open' '@7' '/dev/ttys004'", dir.display()));
+        let snap = Snapshot::parse(&[
+            row("pending", 1, "@7", &[("state", "needs-input"), ("pending_space", "3"), ("space_hidden", "1")]),
+            row("pending", 2, "@8", &[("state", "idle"), ("space_hidden", "1")]),
+            row("main", 1, "@2", &[("state", "idle")]),
+        ].join("\n"));
+        assert_eq!(a.go(&snap, "/dev/ttys004", "@7", "pending"), Ok(()));
+        assert_eq!(a.open_pending(&snap, "/dev/ttys004", "@7"), Ok(()));
+        assert!(!mark.exists(), "a pending window is never selected");
+        // Not pending (no number; adopted meanwhile; gone): refused.
+        assert_eq!(a.open_pending(&snap, "/dev/ttys004", "@8"), Err(format!("{TAB_MOVED} · pick it again")));
+        assert_eq!(a.open_pending(&snap, "/dev/ttys004", "@2"), Err(format!("{TAB_MOVED} · pick it again")));
+        assert_eq!(a.open_pending(&snap, "/dev/ttys004", "@9"), Err(PANE_GONE.into()));
+        // Any other window: agent-jump.sh goto, as ever.
+        assert_eq!(a.go(&snap, "/dev/ttys004", "@2", "main"), Ok(()));
+        assert_eq!(std::fs::read_to_string(&mark).unwrap(), "goto /dev/ttys004 @2 main\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

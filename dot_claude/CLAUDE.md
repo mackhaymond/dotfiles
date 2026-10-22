@@ -155,21 +155,21 @@ One tmux server, seen through WezTerm with the agent sidebar on the right
 the full vocabulary table, read-only recipes and keys, so load it whenever
 they name a space, shell, agent, letter, parked tab or NEEDS YOU.
 
-- **Space** = a tmux session not marked `@space_hidden`, numbered ⌃N by
+- **Space** = a tmux session not marked `@space_hidden`, numbered ⌘N by
   `@space_index` (main = 1); it lasts until closed (prefix Q). Hidden
   sessions (agents, tasks, stash, scratch, btop-popup) are never spaces;
   `stash` holds parked tabs.
 - **Home** = each space's uncloseable first window; a space IS its home
-  (⌃N lands there). **Shell** = any other window of a space without
+  (⌘N lands there). **Shell** = any other window of a space without
   `@agent_state`; it has a **letter** from the agents' pool ("shell e" =
   `@agent_key` e, no `@agent_state`), so ⌥W + letter reaches a shell or an
   agent in any space. Homes never get a letter.
 - **Agent** = a window with `@agent_state` (idle/running/needs-input/failed/
   done). "Agent D" = `@agent_key` d with `@agent_state` set (trust the key
   for an agent only then). A letter is global and kept for the window's
-  life, even when a shell becomes an agent or back. ⌘N is the Nth agent of
-  the current space and shifts, so name agents by letter. Parked windows
-  have no letter.
+  life, even when a shell becomes an agent or back. Agents and shells are
+  reached only by ⌥W + letter (no number key), so name them by letter.
+  Parked windows have no letter.
 - **Reach a peer** through the tmux MCP: pane `"d"` / `tmux://d/<handle>`
   for an agent; a shell as `"cua-notch:2"` (shell 2 by window order, home
   = 1, not tmux window 2; find "shell e" with the skill's recipe);

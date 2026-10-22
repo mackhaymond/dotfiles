@@ -310,7 +310,7 @@ letter pressed there still goes to that shell.
   session: not parked, not in `agents`/`tasks`/`scratch`/`btop-popup`),
   idle ones included, AND every shell of every space (a window without an
   `@agent_state` in a session that is not `@space_hidden`). Never a space's
-  home window (`@space_home`: the space itself, reached by ⌃N), never a
+  home window (`@space_home`: the space itself, reached by ⌘N), never a
   parked tab. A window linked into two sessions is one window (one letter,
   keyed by window id). A window keeps its letter for life across the
   shell/agent change: a shell where claude starts stays listed, and so does
@@ -331,7 +331,7 @@ letter pressed there still goes to that shell.
   keeps it, unless another listed window holds it too, where the lower
   numeric window id wins and the other is reassigned; every window without
   a valid letter takes the lowest free one in alphabet order, windows taken
-  in DISPLAY order (spaces in ⌃N order, then by name; in each, its agents by
+  in DISPLAY order (spaces in ⌘N order, then by name; in each, its agents by
   window index, then its shells). A letter whose holder is no longer listed
   (closed, parked, made a home) is free at once; if an unlisted window
   still carries a letter a listed window now holds, its stale `@agent_key`
@@ -630,8 +630,9 @@ described in the rest of this section; it was not changed.**
   (`no agents in this space`), rows in window-index order, each starting with
   its **agent number** (`agent_ordinals`): the position among the session's
   windows with a non-empty `@agent_state`, by `window_index`, 1-based, shown
-  for 1-9 only (10+ keep the blank column). That is the number tmux.conf's
-  `M-1`..`M-9` jump by, so the two must change together. The number takes a
+  for 1-9 only (10+ keep the blank column). It was the number ⌘N jumped by;
+  since 2026-10-21 ⌘N is the space key and no key uses it (agents are
+  reached by their ⌥W letter; agent-ui's sidebar does not draw it). The number takes a
   2-cell column only while the title keeps 4 cells, so narrow strips lose it
   first. NEEDS YOU and `parked` stay global in both scopes: an agent needing
   you in another space still surfaces. Unset, the scope is `space` when
@@ -886,6 +887,31 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   shells. There is no SHELLS section any more, and no shells' line in the
   dock.
 
+- **Pending spaces** (docs/spaces.md "Pending spaces"; `@spaces` on only):
+  a claude in the hidden `pending` session building space N (its window
+  has `@pending_space` N) is the one hidden-session window the sidebar
+  lists, as a space of its own AT N (`view::Space::pending`, named by its
+  registry row `pending:@W`), in THE space order, in AGENTS and the dock:
+  the header ` N ` solid in `@pending_color` (the colour N will have),
+  `creating…` dim italic where the name goes, the working spinner after it
+  while the claude works (its counts otherwise); under it the claude's
+  ordinary card (letter, blink, rail, state word), whose second line is
+  what it does now (todo, blurb), else what it asks, else
+  `@pending_request` after the prompt mark. The dock row and chip say
+  ` N  creating…` the same way. A click on the header, the dock row or
+  chip (`Target::Pending`) or on the card (`Target::Go`, which
+  `Actions::go` routes) runs `space.sh pending-open @W <client>` (its
+  popup; never a select, the client stays where it is). It counts in the
+  header and NEEDS YOU like any agent (its NEEDS YOU card's cap in the
+  pending colour; a click there opens the popup too), it is lettered in
+  display order at N (⌥W + the letter: spaces.conf's
+  `@space_jump_pending`), a middle-click pins it (PINNED says `creating`
+  where a space's name would be), a right-click (park) does nothing. The
+  menu lists it as a group `N · creating…`, Enter its popup. On adoption
+  the options clear and the window is an ordinary agent of its space.
+  With `@spaces` off nothing changes (the `pending` session is the hidden,
+  unnumbered group it always was).
+
   The look follows OpenCode's and herdr's sidebars: the sidebar paints
   its own canvas, `mantle` (#181825, a shade under the terminals' `base`),
   so it reads as chrome, never as a terminal printing coloured text; on it
@@ -1037,7 +1063,14 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   `@stash_sel`. Every selected agent tile (both lines, mauve 18%) and
   shell row is drawn on a mauve tint with a mauve stripe, and the panel's first row reads ` N selected  h/l extend · ⏎ park · m move · esc cancel` (as
   many keys as fit). stash.sh posts the focus notice after sel-start,
-  sel-move, sel-cancel and the park, so it shows at once.
+  sel-move, sel-cancel and the park, so it shows at once. Those keys hold
+  for as long as a window of the client's session carries `@stash_sel`,
+  even after a click, a focus change (into this sidebar and back) or a
+  stray key has dropped the client out of the `stash` table: root twins of
+  them (scripts/stash-root-keys.conf, bound by sel-start and unbound by
+  every ending, so never at rest), guarded fork-free by `@stash_live`, do
+  the table's action and otherwise pass the key to the pane unchanged.
+  prefix v again cancels.
 
   There is no event log and no divider any more (`@agent_sidebar_split` is
   no longer read; `--split` is accepted and ignored). The spaces list has no
@@ -1049,8 +1082,8 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   sessions with `@space_hidden` 1 left out, ordered by the session option
   `@space_index` (space.sh's number: main = 1, then the registry),
   unnumbered ones last by name; the agents section's groups use the same
-  order. A row is the status line's module stood on end: ` N ` (⌃N,
-  Ctrl+N; blank past 9) bold in dark ink on the space's `@space_color`
+  order. A row is the status line's module stood on end: ` N ` (⌘N,
+  Cmd+N; blank past 9) bold in dark ink on the space's `@space_color`
   (peach without one), its name, its branch dim when there is room, its
   agents' counts on the right (the AGENTS headers' glyphs). The client's
   space is on its band, a `▌` in its colour at the panel's edge, its name
@@ -1061,7 +1094,7 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   the dock; an attention agent's glyph inside it), each line of chips
   going only after the caps. A click switches the client to that space's
   HOME (`agent-jump.sh goto` on its `@space_home` window, else its active
-  one, in that session), as ⌃N does. The index,
+  one, in that session), as ⌘N does. The index,
   hidden mark and colour are SESSION options read through the window-row
   format, so they cost no extra tmux call.
 - **Stash** (PARKED, the dock's last line): always ONE line, at every
@@ -1411,6 +1444,41 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
    ▌ ✎ P0a  waiting: leave copy mode      44 cols
    ▌ ✎ P0a  leave copy mode               34 cols
    ▌ ✎ [k] clear its prompt box           34 cols, a long title
+  ```
+
+  **Void and glow off** ([agent-pause.md](agent-pause.md) "Dismiss and
+  void"). The settled banner (safe, ready) carries a square `✕ void` chip
+  at its first row's right end (`layout::void_row`), dim on the cyan a
+  step up; ` ✕ ` when short of room, as at 34 columns (ready's labels keep
+  10 cells before it shrinks). Voiding is confirmed: a first click only
+  arms it (`Target::Void`), and the chip turns to ` ✕ void? click again `
+  bold dark ink on solid red (` ✕ void? ` at 34; safe's `safe to close`
+  makes way for it). A second click within 3 s (`sidebar::VOID_ARM`) on
+  the armed chip (`Target::VoidArmed`) runs `agent-pause.py void <client>`
+  through `run-shell -b`, exactly as the resume runs. The armed state
+  reverts after 3 s (the loop wakes then to redraw it) and whenever the
+  phase or the pause changes (safe → ready, resumed, voided, a new
+  `paused_at`: compared on every re-read); a click on an armed chip that
+  has just reverted arms it afresh, never voids. The armed chip ignores
+  clicks for 700 ms after arming (`sidebar::VOID_FLOOR`; a re-arm starts
+  it over), so a fast double click never confirms. Both chips are guarded like the resume (`guarded`, 400 ms
+  `SETTLE`): a click aimed at a row a relayout moved never arms or
+  confirms, and the armed chip is new under the pointer, so a double click
+  never voids. A plain click anywhere else on the banner still resumes
+  (and disarms). A moving banner has no chip. Right-click does nothing on
+  the banner. `--once --void-armed` draws the armed state (previews).
+
+  The banner ignores `glow_dismissed_at` (`agent-pause.py dismiss`, the
+  notch's ring off): it shows whenever `paused.json` lists targets,
+  dismissed or not, until resume or void. Dismissed, a settled banner says
+  `glow off`, dim, at its second row's right end (`pause::Paused::glow_off`,
+  `Reader::glow_off`); ready's hint shortens to `prefix P · click` for it
+  at 34 columns.
+
+  ```
+   ▌ ⏸ PAUSED  safe to close   [✕ void]   44 cols ([✕] at 34)
+   ▌   Island resize spring, C… glow off
+   ▌ ⏸ PAUSED       [✕ void? click again]  armed, solid red ([✕ void?] at 34)
   ```
 - **Status jobs** (`status::Keeper`): with the line hidden tmux runs none of
   status-right's `#()` jobs, and two of them must keep running:

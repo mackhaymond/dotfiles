@@ -64,7 +64,7 @@
 //!                                        command and its folder.
 //!                                        The header IS the space's home.
 //!
-//!  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄   the dock: every space a row (⌃N
+//!  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄   the dock: every space a row (⌘N
 //!  ▌ 1  main               ◐2 ○3         order; the client's on its band),
 //!    2  cs35l                 ○1         or chips; PARKED one line, its
 //!   PARKED  4                            count, a message or the watcher
@@ -84,6 +84,22 @@
 //! agents, two or more shells fold into one line of pills
 //! ([`shells_line`]). A space with only shells still gets its group; a
 //! `@space_hidden` session lists no shells.
+//!
+//! ## Pending spaces
+//!
+//! A sentence typed into the new-space picker starts a claude in the hidden
+//! `pending` session that builds the project and holds space number N
+//! (docs/spaces.md "Pending spaces"). With `@spaces` on, each such window
+//! is a space of its own ([`Space::pending`]) at N, in AGENTS and the dock
+//! alike, in THE space order: the header ` N ` solid in the colour N will
+//! have, [`CREATING`] dim italic where the name goes, the blue spinner after
+//! it while the claude works; under it the claude's ordinary card (letter,
+//! blink, rail, state word), its second line what it does now, else what it
+//! asks, else the request typed (as a prompt). A click on the header, the
+//! dock row or chip ([`Target::Pending`]) or the card (its [`Target::Go`])
+//! opens its popup (`space.sh pending-open`): it lives in a hidden session,
+//! so nothing ever selects it. It counts and asks like any agent (NEEDS YOU,
+//! the header's counts); it pins; a right-click (park) does nothing.
 //!
 //! Without a [`Bar`] (no client space, no usage, nothing selected) the top
 //! is the classic ` agents` / ` space` title with the counts.
@@ -208,7 +224,7 @@
 //!
 //! ## Space order
 //!
-//! ONE order everywhere: `@space_index` (⌃N), spaces without one after, by
+//! ONE order everywhere: `@space_index` (⌘N), spaces without one after, by
 //! name ([`space_order`]). The agents section's groups and the dock's spaces
 //! both sort by it.
 //!
@@ -341,14 +357,20 @@ pub struct Seg {
     /// None: the row's background.
     pub bg: Option<Ink>,
     pub bold: bool,
+    /// Italic: only a pending space's `creating…` ([`CREATING`]).
+    pub italic: bool,
 }
 
 fn seg(text: impl Into<String>, fg: impl Into<Ink>) -> Seg {
-    Seg { text: text.into(), fg: fg.into(), bg: None, bold: false }
+    Seg { text: text.into(), fg: fg.into(), bg: None, bold: false, italic: false }
 }
 
 fn bold(text: impl Into<String>, fg: impl Into<Ink>) -> Seg {
     Seg { bold: true, ..seg(text, fg) }
+}
+
+fn italic(text: impl Into<String>, fg: impl Into<Ink>) -> Seg {
+    Seg { italic: true, ..seg(text, fg) }
 }
 
 /// A solid block: `text` in `fg` on `bg`, bold.
@@ -513,6 +535,12 @@ pub enum Target {
     /// window, else the session's active one (Strip.click "session",
     /// [`crate::actions::space_landing`]).
     Session(String),
+    /// A PENDING space's header, dock row or chip (the claude window
+    /// building it, [`Space::pending`]): its popup, `space.sh pending-open
+    /// <win> <client>` ([`crate::actions::Actions::open_pending`]), never a
+    /// select (it lives in a hidden session). Its card is a [`Target::Go`]
+    /// like any agent's, which [`crate::actions::Actions::go`] routes there.
+    Pending(String),
     /// A shell row (or its pill in a folded line): that window, like an
     /// agent row, but never parked by a right-click.
     Shell { win: String, session: String },
@@ -535,6 +563,14 @@ pub enum Target {
     /// The pause banner once the pause is settled (safe to close, or ready
     /// after a wake): `agent-pause.py resume <client>`, never `toggle`.
     Resume,
+    /// The settled banner's `✕ void` chip ([`void_chip`]): a first click
+    /// only arms it (the sidebar redraws it as [`Target::VoidArmed`]).
+    Void,
+    /// The void chip, armed by a first click: a second one within
+    /// [`crate::sidebar::VOID_ARM`] runs `agent-pause.py void <client>`
+    /// (docs/agent-pause.md "Dismiss and void"): the saved set is forgotten,
+    /// nobody is resumed.
+    VoidArmed,
     /// A perm card's `y allow` / `n deny` chip ([`answer_chips`]): answer
     /// that window's permission prompt ([`crate::answer::answer`]), only
     /// the one the card showed (`prompt`: [`crate::answer::prompt_key`]).
@@ -677,6 +713,14 @@ pub struct Opts {
     /// Where the pause key's pause stands ([`super::pause`]): a banner at
     /// the very top. None: nothing at all.
     pub pause: Option<Phase>,
+    /// The settled banner's void chip is armed: a first click on it asked
+    /// "void?" ([`void_chip`]); the sidebar disarms it after
+    /// [`crate::sidebar::VOID_ARM`] or once the phase changes.
+    pub void_armed: bool,
+    /// `paused.json` has `glow_dismissed_at` (the notch's ring dismissed):
+    /// a settled banner says `glow off`, dim, on its second row. The banner
+    /// itself stays either way.
+    pub glow_off: bool,
     /// How cards draw the context meter ([`CTX_STYLE`] by default).
     pub ctx: CtxStyle,
 }
@@ -1336,20 +1380,22 @@ fn agents_n(n: usize) -> String {
 ///  ▌ ⠹ PAUSING  sending 2 of 5          dim violet on 9% (a press in flight)
 ///  ▌ ⠹ PAUSING  3 of 5 stopped          dim violet on 9%
 ///  ▌   still working  Tmux Sidebar, …
-///  ▌ ⏸ PAUSED  safe to close            cyan on 14%, bold word; a click resumes
-///  ▌ [↻ 5 ready] Tmux Sidebar, Island…  cyan on 14%: a SOLID chip; a click resumes
-///  ▌   prefix P or click to resume      (one row: ↻ 5 ready  prefix P · click)
+///  ▌ ⏸ PAUSED  safe to close    [✕ void]  cyan on 14%, bold word; a click resumes
+///  ▌   Tmux Sidebar, Island…    glow off  (glow off: the notch's ring dismissed)
+///  ▌ [↻ 5 ready] Tmux Sidebar…  [✕ void]  cyan on 14%: a SOLID chip; a click resumes
+///  ▌   prefix P or click to resume        (one row: ↻ 5 ready  prefix P · click)
 ///  ▌ ⠹ RESUMING  5 agents…              dim violet on 9%
 /// ```
 ///
-/// Safe and ready rows click through to [`Target::Resume`]; the others do
-/// nothing (a press is in flight, or agents are still stopping). Ready
+/// Safe and ready rows click through to [`Target::Resume`], but for the
+/// `✕ void` chip at the first row's right end ([`void_row`]); the others
+/// do nothing (a press is in flight, or agents are still stopping). Ready
 /// always says how to resume (Mack asked for the prefix P hint), so at the
 /// usual 34 columns the hint takes the second row and the labels the rest
 /// of the first. Agents whose PAUSE tmux-mcp holds get up to
 /// `held` rows of their own under it ([`held_rows`]), and leave the
 /// `still working` row (gone when they are the only ones still working).
-fn pause_rows(p: &Phase, cx: Cx, lines: usize, held: usize) -> Vec<Row> {
+fn pause_rows(p: &Phase, cx: Cx, lines: usize, held: usize, settled: Settled) -> Vec<Row> {
     let w = cx.w;
     if lines == 0 || w == 0 {
         return Vec::new();
@@ -1360,16 +1406,40 @@ fn pause_rows(p: &Phase, cx: Cx, lines: usize, held: usize) -> Vec<Row> {
     let dimc = dim(true);
     let names = |l: &[String]| seg(l.join(", "), dimc);
     let rail = || seg(RAIL_HEAVY, hue);
+    let armed = settled.armed;
+    // `glow off` at the second row's right end, when the notch's ring was
+    // dismissed, a cell clear of the labels cut before it (else just the
+    // pad).
+    let glow = |on: bool| if on { vec![seg(" ", "text"), seg(GLOW_OFF, dimc), seg(" ", "text")] } else { vec![seg(" ", "text")] };
     if let Phase::Ready { labels } = p {
         // The chip: the count in dark ink on solid cyan, "press me".
-        let mut l1 = vec![rail(), seg(" ", "text"), block(format!(" ↻ {} ready ", labels.len()), "crust", hue), seg(" ", "text")];
+        let lead = vec![rail(), seg(" ", "text"), block(format!(" ↻ {} ready ", labels.len()), "crust", hue), seg(" ", "text")];
         let rows = if lines >= 2 {
-            l1.push(names(labels));
-            let l2 = vec![rail(), seg("   ", "text"), bold("prefix P", "text"), seg(" or click to resume", dimc)];
-            vec![tile_row(w, bg, l1, vec![seg(" ", "text")]), tile_row(w, bg, l2, vec![seg(" ", "text")])]
+            // The labels give way to the void chip (keeping a few while it
+            // is quiet; an armed one takes what it needs).
+            let need = width(&lead) + if armed { 0 } else { VOID_NAMES };
+            let l1 = [lead, vec![names(labels)]].concat();
+            // The hint whole beside `glow off`, else shorter, else no
+            // `glow off`.
+            let hint = |h: &str| vec![rail(), seg("   ", "text"), bold("prefix P", "text"), seg(h, dimc)];
+            let fits = |l: &[Seg], r: &[Seg]| width(l) + 1 + width(r) <= inner(w);
+            let (full, short) = (hint(" or click to resume"), hint(" · click"));
+            let on = glow(settled.glow_off);
+            let (l2, r2) = if !settled.glow_off || fits(&full, &on) {
+                (full, on)
+            } else if fits(&short, &on) {
+                (short, on)
+            } else {
+                (full, glow(false))
+            };
+            vec![void_row(w, bg, l1, need, armed), tile_row(w, bg, l2, r2)]
         } else {
-            l1.extend([bold("prefix P", "text"), seg(" · click", dimc)]);
-            vec![tile_row(w, bg, l1, vec![seg(" ", "text")])]
+            // One row: `· click` goes when no form of the chip fits
+            // beside it.
+            let full = [lead.clone(), vec![bold("prefix P", "text"), seg(" · click", dimc)]].concat();
+            let l1 = if void_fits(armed, w, width(&full)) { full } else { [lead, vec![bold("prefix P", "text")]].concat() };
+            let need = width(&l1);
+            vec![void_row(w, bg, l1, need, armed)]
         };
         return rows.into_iter().map(|r| r.click(w, Target::Resume)).collect();
     }
@@ -1386,13 +1456,23 @@ fn pause_rows(p: &Phase, cx: Cx, lines: usize, held: usize) -> Vec<Row> {
         Phase::Safe { labels } => (format!("{PAUSED_GLYPH} PAUSED"), "safe to close".into(), vec![names(labels)]),
         Phase::Ready { .. } => unreachable!("handled above"),
     };
-    let left = vec![rail(), seg(" ", "text"), bold(word, hue), seg(format!("  {rest}"), "text")];
-    let mut rows = vec![tile_row(w, bg, left, vec![])];
+    let safe = matches!(p, Phase::Safe { .. });
+    let mut left = vec![rail(), seg(" ", "text"), bold(word, hue)];
+    // Armed, the chip asks its question where `safe to close` was.
+    if !(safe && armed) {
+        left.push(seg(format!("  {rest}"), "text"));
+    }
+    let mut rows = vec![if safe {
+        let need = width(&left);
+        void_row(w, bg, left, need, armed)
+    } else {
+        tile_row(w, bg, left, vec![])
+    }];
     let says = detail.iter().any(|s| !s.text.trim().is_empty());
     if lines >= 2 && says {
         let mut l2 = vec![rail(), seg("   ", "text")];
         l2.extend(detail);
-        rows.push(tile_row(w, bg, l2, vec![seg(" ", "text")]));
+        rows.push(tile_row(w, bg, l2, glow(safe && settled.glow_off)));
     }
     let busy = p.busy();
     let mut rows: Vec<Row> = rows
@@ -1408,6 +1488,79 @@ fn pause_rows(p: &Phase, cx: Cx, lines: usize, held: usize) -> Vec<Row> {
         .collect();
     rows.extend(held_rows(p.held(), w, bg, held));
     rows
+}
+
+/// What a settled banner shows besides its phase ([`Opts::void_armed`],
+/// [`Opts::glow_off`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct Settled {
+    armed: bool,
+    glow_off: bool,
+}
+
+/// What a settled banner's second row says at its right end once the
+/// notch's "all paused" ring was dismissed (`glow_dismissed_at`).
+pub const GLOW_OFF: &str = "glow off";
+
+/// The void chip's forms, longest first ([`void_chip`]): quiet, and armed
+/// by a first click.
+pub const VOID_QUIET: [&str; 2] = [" ✕ void ", " ✕ "];
+pub const VOID_ASKS: [&str; 3] = [" ✕ void? click again ", " ✕ void? ", " void? "];
+
+/// The armed chip's colour: the sidebar's red (a failure, the deny cap),
+/// because a second click forgets the paused set.
+pub const VOID_HUE: Hue = "red";
+
+/// How many cells of ready's labels a QUIET void chip leaves before it
+/// shrinks to ` ✕ ` (an armed one takes what it needs).
+const VOID_NAMES: usize = 10;
+
+/// The void chip (docs/agent-pause.md "Dismiss and void"), square like a
+/// key-cap: quiet, ` ✕ void ` in dim ink on the banner's cyan a step up
+/// (` ✕ ` short of room, as at Mack's usual 34 columns); armed by a first
+/// click, ` ✕ void? click again ` bold dark ink on solid [`VOID_HUE`]
+/// (` ✕ void? `, ` void? ` short of room). The longest form that fits
+/// `room` cells, else the shortest.
+fn void_chip(armed: bool, room: usize, bg: Ink) -> Seg {
+    let forms: &[&str] = if armed { &VOID_ASKS } else { &VOID_QUIET };
+    let text = forms.iter().find(|f| dwidth(f) <= room).or(forms.last()).copied().unwrap_or_default();
+    if armed {
+        block(text, ink_on(Ink::Pal(VOID_HUE)), VOID_HUE)
+    } else {
+        on(text, dim(true), over(Ink::Pal(SETTLED_HUE), CAP_TINT, bg))
+    }
+}
+
+/// The cells a void chip may take beside `need` cells of a first row: the
+/// tile's width less a gap before the chip and the pad after it.
+fn void_room(w: usize, need: usize) -> usize {
+    inner(w).saturating_sub(need + 2)
+}
+
+/// Some form of the chip fits beside `need` cells.
+fn void_fits(armed: bool, w: usize, need: usize) -> bool {
+    let forms: &[&str] = if armed { &VOID_ASKS } else { &VOID_QUIET };
+    forms.iter().any(|f| dwidth(f) <= void_room(w, need))
+}
+
+/// A settled banner's first row: `left`, and the void chip at its right
+/// end ([`void_chip`], as long as `need` cells of `left` leave room;
+/// anything of `left` past them is cut first), a pad after it. The chip's
+/// cells are [`Target::Void`] ([`Target::VoidArmed`] once armed), ahead of
+/// the row's resume.
+fn void_row(w: usize, bg: Ink, left: Vec<Seg>, need: usize, armed: bool) -> Row {
+    let chip = void_chip(armed, void_room(w, need), bg);
+    let cw = dwidth(&chip.text);
+    let mut row = tile_row(w, bg, left, vec![chip, seg(" ", "text")]);
+    // (A chip wider than the tile is drawn cut ([`fit`]): the span is kept
+    // to the cells drawn.)
+    let drawn = (cw + 1).min(inner(w));
+    let x0 = margin(w) + inner(w) - drawn;
+    let x1 = x0 + cw.min(drawn);
+    if x0 < x1 {
+        row.targets.insert(0, (x0 as u16, x1 as u16, if armed { Target::VoidArmed } else { Target::Void }));
+    }
+    row
 }
 
 /// A held row's accent ([`held_rows`]): `yellow`, the sidebar's "needs
@@ -1948,8 +2101,10 @@ pub const PROMPT_MARK: &str = "> ";
 /// asking agent's question, a working one's run detail, a done one's
 /// outcome); else, for an idle agent, its last turn's outcome (what it last
 /// said is still true of it); else its last prompt; else nothing (a working
-/// agent's old outcome never reads as what it does now). Every agent row is
-/// two lines either way.
+/// agent's old outcome never reads as what it does now). A pending space's
+/// claude ([`crate::view::Agent::pending`]), past its doing line, says what
+/// it asks (asking or failed), else the request typed into the picker, as a
+/// prompt. Every agent row is two lines either way.
 fn says(a: &Agent, now: f64) -> Says {
     let ins = a.insight.as_ref();
     // (Whitespace runs one space: a todo or blurb may hold newlines, tabs.)
@@ -1958,6 +2113,15 @@ fn says(a: &Agent, now: f64) -> Says {
         if let Some(t) = some(ins.and_then(|i| i.todo.as_deref())).or_else(|| some(live_blurb(a))) {
             return Says::Now(t);
         }
+    }
+    // A pending space's claude: what it asks or why it failed, else what
+    // it was asked to build (your words, as a prompt).
+    if let Some(p) = a.pending.as_ref().filter(|p| !p.request.is_empty()) {
+        let asks = matches!(a.cat, Some(Cat::NeedsInput | Cat::Failed));
+        if let Some(m) = message(a, now).filter(|m| asks && !m.trim().is_empty()) {
+            return Says::Said(m);
+        }
+        return Says::Prompt(p.request.clone());
     }
     if let Some(m) = message(a, now).or_else(|| (!a.in_flight && a.cat != Some(Cat::Working)).then(|| plain(&a.detail))) {
         if !m.trim().is_empty() {
@@ -2362,9 +2526,27 @@ fn surface_counts(c: &Counts, dimc: Hue) -> Vec<Seg> {
     count_segs(c).into_iter().map(|s| if s.fg == Ink::Pal("overlay") { Seg { fg: Ink::Pal(dimc), ..s } } else { s }).collect()
 }
 
-/// A space's ⌃N number as its chip says it (` 2 `; blank past 9 or unset).
+/// A space's ⌘N number as its chip says it (` 2 `; blank past 9 or unset).
 fn space_num(sp: &Space) -> String {
     sp.index.filter(|n| (1..=9).contains(n)).map_or(" ".to_string(), |n| n.to_string())
+}
+
+/// What stands where a PENDING space's name goes ([`Space::pending`]), dim
+/// and italic: the space is being made.
+pub const CREATING: &str = "creating…";
+
+/// A pending space whose claude works: its header shows the spinner.
+fn pending_spins(sp: &Space) -> bool {
+    sp.pending.is_some() && sp.counts.get(Cat::Working) > 0
+}
+
+/// What a click on a space (its header, its dock row or chip) does: its
+/// home ([`Target::Session`]), or a pending space's popup ([`Target::Pending`]).
+fn space_target(sp: &Space) -> Target {
+    match &sp.pending {
+        Some(win) => Target::Pending(win.clone()),
+        None => Target::Session(sp.name.clone()),
+    }
 }
 
 /// The ink a space's name is bold in on a dark surface: its colour, or
@@ -2390,6 +2572,12 @@ fn name_ink(ink: Ink) -> Ink {
 /// (`tile_me`, and a full lavender cell down its right edge, as the
 /// client's own agent card). Collapsed, it stands for all its agents.
 /// (Never red: the header keeps the colour its agents' key-caps wear.)
+///
+/// A PENDING space's header ([`Space::pending`]): ` N ` solid in the colour
+/// it will have, then [`CREATING`] dim italic where the name goes (nothing
+/// is there yet) and, while its claude works, the blue spinner after it
+/// (the row animates; its counts then say nothing more). A click opens the
+/// claude's popup ([`Target::Pending`]).
 fn group_header(sp: &Space, cx: Cx, collapsed: bool) -> Row {
     let w = cx.w;
     let ink = space_colour(sp);
@@ -2397,7 +2585,8 @@ fn group_header(sp: &Space, cx: Cx, collapsed: bool) -> Row {
     let mine = sp.home.is_some() && sp.home.as_deref() == cx.cur;
     let here = sp.is_current || mine;
     let dimc = if here { "sub" } else { "overlay2" };
-    let mut right = surface_counts(&sp.counts, dimc);
+    let spin = pending_spins(sp).then(|| SPIN[cx.spin % SPIN.len()]);
+    let mut right = if spin.is_some() { Vec::new() } else { surface_counts(&sp.counts, dimc) };
     if !right.is_empty() {
         // (A cell between a name cut short and its counts.)
         right.insert(0, seg(" ", "text"));
@@ -2407,21 +2596,29 @@ fn group_header(sp: &Space, cx: Cx, collapsed: bool) -> Row {
         // (After the right side's own pad, where an own card's edge is.)
         right.push(seg(MINE, MINE_HUE));
     }
-    let mut left = vec![block(format!(" {} ", space_num(sp)), ink_on(ink), ink), seg(" ", "text"), bold(sanitize(&sp.name), name_ink(ink))];
+    let mut left = vec![block(format!(" {} ", space_num(sp)), ink_on(ink), ink), seg(" ", "text")];
+    if sp.pending.is_some() {
+        left.push(italic(CREATING, dimc));
+        left.extend(spin.map(|g| bold(format!(" {g}"), cat_hue(Cat::Working))));
+    } else {
+        left.push(bold(sanitize(&sp.name), name_ink(ink)));
+    }
     if !sp.branch.is_empty() {
         let br = format!("  \u{e0a0} {}", sanitize(&sp.branch));
         if width(&left) + dwidth(&br) + width(&right) < inner(w) {
             left.push(seg(br, dimc));
         }
     }
-    // The space's home: [`crate::actions::space_landing`].
-    let target = Target::Session(sp.name.clone());
+    // The space's home: [`crate::actions::space_landing`]; a pending
+    // space's claude: its popup.
+    let target = space_target(sp);
     let bg = if mine { Ink::Pal(MINE_BG) } else { band(ink) };
     let mut row = if here { tile_row(w, bg, left, right) } else { Row::new([vec![bare(m)], fit(inner(w), left, right, None), vec![bare(m)]].concat()) };
     if here && m > 0 {
         row.segs[0] = Seg { bg: Some(Ink::Canvas), ..seg(RAIL_HEAVY, ink) };
     }
-    let row = row.click(w, target);
+    let mut row = row.click(w, target);
+    row.anim = spin.is_some();
     if collapsed {
         row.covering(&sp.agents)
     } else {
@@ -2577,7 +2774,7 @@ fn agents_one_line(view: &ViewModel) -> usize {
 /// A space header in the agents section ([`group_header`]: the whole row
 /// switches to its space; nothing else there does).
 fn is_group_header(r: &Row, w: usize) -> bool {
-    matches!(r.targets.as_slice(), [(0, x1, Target::Session(_))] if usize::from(*x1) == w)
+    matches!(r.targets.as_slice(), [(0, x1, Target::Session(_) | Target::Pending(_))] if usize::from(*x1) == w)
 }
 
 /// A blank canvas row that does nothing and stands for no one (a gap).
@@ -2659,7 +2856,9 @@ fn pin_block(view: &ViewModel, cx: Cx, two: &[Key]) -> Vec<Row> {
     }
     let mut rows = vec![pinned_header(&view.pinned, cx.w)];
     for (k, a) in view.pinned.iter().enumerate() {
-        let cards = agent_rows(a, cx, two.contains(&key(a)), k, space_ink(view, &a.session), Some(&a.session));
+        // (A pending space's claude: its space has no name yet.)
+        let tag = if a.pending.is_some() { CREATING } else { &a.session };
+        let cards = agent_rows(a, cx, two.contains(&key(a)), k, space_ink(view, a), Some(tag));
         rows.extend(cards.into_iter().map(|r| Row { pinned: true, ..r }));
     }
     rows
@@ -2972,10 +3171,14 @@ fn answer_chips(room: usize) -> (Vec<Seg>, [(usize, usize); 2]) {
     (caps, [(0, BADGE_W), (BADGE_W + 1, 2 * BADGE_W + 1)])
 }
 
-/// The colour of the space `session` (its `@space_color`, else peach), for
-/// a card outside its space's group.
-fn space_ink(view: &ViewModel, session: &str) -> Ink {
-    view.spaces.iter().find(|s| s.name == session).map_or(Ink::Pal("peach"), space_colour)
+/// The colour of `a`'s space (its session's `@space_color`, else peach; a
+/// pending space's claude its `@pending_color`), for a card outside its
+/// space's group.
+fn space_ink(view: &ViewModel, a: &Agent) -> Ink {
+    if let Some(p) = &a.pending {
+        return tmux_colour(&p.color).unwrap_or(Ink::Pal("peach"));
+    }
+    view.spaces.iter().find(|s| s.name == a.session).map_or(Ink::Pal("peach"), space_colour)
 }
 
 /// ` NEEDS YOU` and the count as a square chip (dark ink on yellow; on red
@@ -2995,7 +3198,7 @@ fn needs_block(view: &ViewModel, cx: Cx, lines: u8) -> Vec<Row> {
     let mut rows = vec![needs_header(view, cx.w)];
     for (k, n) in view.needs.iter().enumerate() {
         let tint = usize::from(!k.is_multiple_of(2));
-        rows.extend(need_rows(n, cx, lines, tint, space_ink(view, &n.agent.session)));
+        rows.extend(need_rows(n, cx, lines, tint, space_ink(view, &n.agent)));
     }
     rows
 }
@@ -3080,17 +3283,23 @@ fn space_pill(sp: &Space, prefix: bool) -> Item {
         None => vec![],
     };
     segs.push(on(" ", "text", name_bg));
-    segs.push(if here { block(name, "text", name_bg) } else { on(name, if quiet { dim(true) } else { "sub" }, name_bg) });
+    segs.push(if sp.pending.is_some() {
+        Seg { bg: Some(name_bg), ..italic(CREATING, dim(true)) }
+    } else if here {
+        block(name, "text", name_bg)
+    } else {
+        on(name, if quiet { dim(true) } else { "sub" }, name_bg)
+    });
     if let Some((g, hue)) = alert_of(sp) {
         segs.push(block(format!(" {g}"), hue, name_bg));
     }
     segs.push(on(" ", "text", name_bg));
-    item(segs, Some(Target::Session(sp.name.clone())))
+    item(segs, Some(space_target(sp)))
 }
 
 /// The spaces as chips in at most `lines` dock rows (the bottom's last
 /// resort): all of them, else the client's space, those with an attention
-/// agent, then ⌃N order, kept (shown in list order), and a `+K` chip (the
+/// agent, then ⌘N order, kept (shown in list order), and a `+K` chip (the
 /// menu's All tab) for the rest.
 fn pill_rows(view: &ViewModel, w: usize, lines: usize, prefix: bool) -> Vec<Row> {
     let list = space_list(view);
@@ -3160,7 +3369,13 @@ fn space_row(sp: &Space, w: usize, prefix: bool) -> Row {
         if here { seg(RAIL_HEAVY, ink) } else { seg(" ", "text") },
         block(format!(" {} ", space_num(sp)), ink_on(chip), chip),
         seg(" ", "text"),
-        if here { bold(name, "text") } else { seg(name, if quiet { dim(true) } else { "sub" }) },
+        if sp.pending.is_some() {
+            italic(CREATING, dimc)
+        } else if here {
+            bold(name, "text")
+        } else {
+            seg(name, if quiet { dim(true) } else { "sub" })
+        },
     ];
     if !sp.branch.is_empty() {
         let br = format!("  \u{e0a0} {}", sanitize(&sp.branch));
@@ -3169,7 +3384,7 @@ fn space_row(sp: &Space, w: usize, prefix: bool) -> Row {
         }
     }
     let bg = if here { band(ink) } else { Ink::Pal(PANEL) };
-    tile_row(w, bg, left, right).click(w, Target::Session(sp.name.clone()))
+    tile_row(w, bg, left, right).click(w, space_target(sp))
 }
 
 /// `+K more spaces`: the ones a collapsed dock leaves out (the menu's All
@@ -3387,7 +3602,8 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     let bar = &opts.bar;
     // The pause banner first, at the very top: the panel under it is laid
     // out in the rows it leaves, and the toasts float under it, never over.
-    let banner = opts.pause.as_ref().map_or_else(Vec::new, |p| pause_rows(p, cx, pause_lines(h), held_lines(h)));
+    let settled = Settled { armed: opts.void_armed, glow_off: opts.glow_off };
+    let banner = opts.pause.as_ref().map_or_else(Vec::new, |p| pause_rows(p, cx, pause_lines(h), held_lines(h), settled));
     let nb = banner.len();
     let Top { rows: top, status, card, keep } = top_rows(view, bar, w, h - nb, cx.now);
     let shift = |r: Range<usize>| r.start + nb..r.end + nb;
@@ -3538,6 +3754,9 @@ fn put(buf: &mut Buffer, x0: usize, y: u16, segs: &[Seg], row_bg: Color) {
             if s.bold {
                 st = st.add_modifier(Modifier::BOLD);
             }
+            if s.italic {
+                st = st.add_modifier(Modifier::ITALIC);
+            }
             buf.set_style(Rect::new(area.x + x as u16, y, sw.min(room) as u16, 1), st);
             buf.set_stringn(area.x + x as u16, y, &s.text, sw.min(room), st);
         }
@@ -3559,6 +3778,9 @@ fn sgr(fg: Color, bg: Color, m: Modifier) -> String {
     }
     if m.contains(Modifier::BOLD) {
         s.push_str(";1");
+    }
+    if m.contains(Modifier::ITALIC) {
+        s.push_str(";3");
     }
     s.push('m');
     s

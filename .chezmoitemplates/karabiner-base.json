@@ -92,7 +92,7 @@
                                 "type": "basic"
                             },
                             {
-                                "description": "WezTerm: second quick tap of caps_lock (hyper) flips to the previous tmux session/window (@double_tap_target).",
+                                "description": "WezTerm: second quick tap of caps_lock (hyper) flips to the last tmux tab, any space (@double_tap_target).",
                                 "conditions": [
                                     { "type": "frontmost_application_if", "bundle_identifiers": ["^com\\.github\\.wez\\.wezterm$"] },
                                     { "type": "variable_if", "name": "hyper_tapped", "value": 1 }
@@ -155,7 +155,7 @@
                                 "type": "basic"
                             },
                             {
-                                "description": "WezTerm: second quick tap of right_shift flips to the previous tmux session/window (@double_tap_target).",
+                                "description": "WezTerm: second quick tap of right_shift flips to the last tmux tab, any space (@double_tap_target).",
                                 "conditions": [
                                     { "type": "frontmost_application_if", "bundle_identifiers": ["^com\\.github\\.wez\\.wezterm$"] },
                                     { "type": "variable_if", "name": "right_shift_tapped", "value": 1 }

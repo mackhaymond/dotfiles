@@ -1,7 +1,7 @@
 //! What the menu's list shows: the filters, the search, and the rows.
 //!
 //! The menu opens on **All**, in a FIXED order: one group per space in THE
-//! space order (the sidebar's AGENTS order: ⌃N, then by name), each group's
+//! space order (the sidebar's AGENTS order: ⌘N, then by name), each group's
 //! agents by window index. Nothing about a row's state or age moves it: an
 //! agent that goes from working to needs-input stays where it is and only
 //! changes glyph and colour (its title takes the needs colour and its reason
@@ -16,6 +16,11 @@
 //! the pause key, are listed here too, never under Needs you or Active),
 //! Parked (every parked tab).
 //! Every row passes the search query.
+//!
+//! A PENDING space (`@spaces` on: a claude in the hidden `pending` session
+//! building space N, [`crate::view::Space::pending`]) is a group of its own
+//! at N, `N · creating…`, its claude under it; Enter goes there as anywhere
+//! ([`crate::actions::Actions::go`]: its popup, `space.sh pending-open`).
 //!
 //! Selectable rows carry a [`RowKey`], unique within the list: a window
 //! linked into two sessions is listed under both, so the window id alone
@@ -257,7 +262,8 @@ impl Data {
         );
         let mut branches = HashMap::new();
         if let Some(g) = git {
-            for s in &mut view.spaces {
+            // (A pending space has no folder yet: no branch.)
+            for s in view.spaces.iter_mut().filter(|s| s.pending.is_none()) {
                 s.branch = g.branch(&s.path, now);
             }
             let paths = view
@@ -335,7 +341,7 @@ pub fn build_rows(d: &Data, tab: Tab, query: &str) -> Vec<Row> {
             }
     };
     if matches!(tab, Tab::All | Tab::Active | Tab::Working | Tab::Idle) {
-        // THE space order (⌃N, then by name: the sidebar's and the
+        // THE space order (⌘N, then by name: the sidebar's and the
         // letters'), never the attach recency, so switching sessions moves
         // nothing.
         for s in v.ordered_spaces() {
@@ -343,7 +349,8 @@ pub fn build_rows(d: &Data, tab: Tab, query: &str) -> Vec<Row> {
             if shown.is_empty() {
                 continue;
             }
-            rows.push(Row::Group { name: s.name.clone(), branch: s.branch.clone(), counts: s.counts, current: s.is_current });
+            // (A pending space is named by its number: `3 · creating…`.)
+            rows.push(Row::Group { name: s.label(), branch: s.branch.clone(), counts: s.counts, current: s.is_current });
             rows.extend(shown.into_iter().cloned().map(Row::Agent));
         }
     }
@@ -628,6 +635,41 @@ pub(crate) mod tests {
             w.mru_prev = "@10".into(); // parked: not listed
         }
         assert_eq!(data_of(&snap).last, None);
+    }
+
+    /// A pending space's claude (`@spaces` on) is a group of its own at its
+    /// number, `N · creating…`, the claude under it (lettered, in display
+    /// order there); its row's target is its real window and session, which
+    /// Enter hands to `Actions::go` (its popup). Spaces off: no such group.
+    #[test]
+    fn a_pending_space_is_a_group_at_its_number() {
+        let mut snap = fixture();
+        let set = [("state", "running"), ("summary", "Rust CLI fizz"), ("pending_space", "2"), ("pending_request", "make fizz"),
+            ("pending_color", "#f5c2e7"), ("space_hidden", "1")];
+        snap.windows.push(crate::tmux::Window::parse(&row("pending", 1, "@40", &set)).unwrap());
+        for w in snap.windows.iter_mut().filter(|w| w.session == "main") {
+            w.space_index = Some(1);
+        }
+        for w in snap.windows.iter_mut().filter(|w| w.session == "work") {
+            w.space_index = Some(3);
+        }
+        let d = data_of(&snap);
+        assert_eq!(shape(&build_rows(&d, Tab::All, "")), [
+            "-- main", "main:@1", "main:@2", "main:@3", "main:@4",
+            "-- 2 · creating…", "pending:@40",
+            "-- work", "work:@6", "work:@7", "work:@3",
+            "-- Alpha", "Alpha:@8",
+            "▪5",
+        ]);
+        assert_eq!(shape(&build_rows(&d, Tab::Working, "fizz")), ["-- 2 · creating…", "pending:@40"]);
+        // Its letter: after main's agents (a s d f), before work's.
+        assert_eq!(d.letter("@40"), Some('g'));
+        let t = build_rows(&d, Tab::All, "").iter().find(|r| r.agent().is_some_and(|a| a.window_id == "@40")).and_then(Row::target).unwrap();
+        assert_eq!((t.win.as_str(), t.session.as_str()), ("@40", "pending"));
+        // @spaces off: the hidden `pending` session as before, by name.
+        snap.clients[0].spaces = String::new();
+        let rows = shape(&build_rows(&data_of(&snap), Tab::All, ""));
+        assert!(rows.contains(&"-- pending".to_string()) && !rows.iter().any(|r| r.contains("creating")), "{rows:?}");
     }
 
     /// A HOME window running an agent is listed (the menu never hides

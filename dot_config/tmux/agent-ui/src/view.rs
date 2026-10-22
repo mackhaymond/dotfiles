@@ -15,6 +15,11 @@
 //!   recolours a row where it is and never moves it. (The Python strip sorted
 //!   by rank first; the new layout deliberately does not.) `plain` holds the
 //!   rest (plain shells), for a "show all" toggle.
+//! - PENDING spaces (`@spaces` on only): each claude in the hidden `pending`
+//!   session that holds a space number (`@pending_space`) is a space of its
+//!   own ([`Space::pending`]), at that number, in its `@pending_color`, its
+//!   one agent the claude ([`Agent::pending`]). The session's other windows
+//!   (none, normally) stay as before.
 //! - `parked`: the stash's windows by index.
 //! - `log`: the newest events, newest first.
 //! - `counts`: the header's per-state counts over every shown session
@@ -30,7 +35,7 @@ use crate::json::Value;
 use crate::model::{self, Cat, Counts, Flag};
 use crate::obj;
 use crate::text;
-use crate::tmux::{Snapshot, Tmux, Window, HOLD};
+use crate::tmux::{Snapshot, Tmux, Window, HOLD, PENDING};
 use std::collections::HashMap;
 
 /// The agents that hold a number key: the ACTIVE set, the menu's Active tab.
@@ -257,6 +262,29 @@ pub struct Agent {
     /// A pinned agent's ⌥W digit (1-9, [`crate::pins::pin_keys`]): set by the UIs
     /// from the snapshot, None from [`Agent::from_window`] alone.
     pub pin_key: Option<u8>,
+    /// A PENDING SPACE's claude ([`Window::is_pending`]) in a view with
+    /// `@spaces` on: the space it is building. None otherwise (spaces off:
+    /// the classic view, unchanged).
+    pub pending: Option<Pending>,
+}
+
+/// What a pending space's claude carries ([`Agent::pending`]): docs/spaces.md
+/// "Pending spaces".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pending {
+    /// `@pending_space`: the space number N it holds.
+    pub space: u32,
+    /// `@pending_request`, scrubbed: what was typed into the picker.
+    pub request: String,
+    /// `@pending_color` as set (`#rrggbb`; "" when unset): space N's colour.
+    pub color: String,
+}
+
+impl Pending {
+    fn of(w: &Window) -> Option<Pending> {
+        let space = w.pending_space.filter(|_| w.is_pending())?;
+        Some(Pending { space, request: text::sanitize(w.pending_request.trim()), color: w.pending_color.clone() })
+    }
 }
 
 impl Agent {
@@ -315,6 +343,7 @@ impl Agent {
             shell: shell_label(w),
             pinned: w.pinned,
             pin_key: None,
+            pending: None,
         }
     }
 
@@ -423,7 +452,7 @@ pub struct Space {
     /// The other (plain) windows, by window index.
     pub plain: Vec<Agent>,
     /// The session's `@space_index` (space.sh numbers the visible spaces:
-    /// main = 1, ⌃N), None when unset.
+    /// main = 1, ⌘N), None when unset.
     pub index: Option<u32>,
     /// The session has `@space_hidden` "1": not a space (agents, scratch…).
     pub hidden: bool,
@@ -432,6 +461,13 @@ pub struct Space {
     /// The space's HOME window (`@space_home` 1), when it has one: going to
     /// the space goes there.
     pub home: Option<String>,
+    /// A PENDING space (`@spaces` on): the claude window in the hidden
+    /// `pending` session building space N ([`Window::is_pending`]). Such a
+    /// space is that one window: `name` is its registry row's
+    /// (`pending:@W`), `index` its `@pending_space`, `color` its
+    /// `@pending_color`, its one agent the claude; no shells, no home, no
+    /// branch. Going to it opens its popup (`space.sh pending-open`).
+    pub pending: Option<String>,
 }
 
 /// A shell's label, as spaces.conf's `@space_shell_label`: a shell process
@@ -458,8 +494,33 @@ pub fn shell_label(w: &Window) -> String {
     text::sanitize(name)
 }
 
+/// A pending space's claude `w` (its row `a`) as the space it is building
+/// ([`Space::pending`]): named as its registry row (`pending:@W`), at its
+/// `@pending_space`, in its `@pending_color`, its one agent the claude
+/// (with a state or not), no shells, no home, no git.
+fn pending_space(w: &Window, a: Agent, cur_win: Option<&str>) -> Space {
+    Space {
+        name: format!("{PENDING}:{}", w.id),
+        is_current: cur_win == Some(w.id.as_str()),
+        counts: Counts::of(std::iter::once(w)),
+        active_window: Some(w.id.clone()),
+        active_index: Some(w.index),
+        path_short: text::sanitize(&tilde(&w.path)),
+        path: w.path.clone(),
+        branch: String::new(),
+        git: None,
+        agents: vec![a],
+        plain: Vec::new(),
+        index: w.pending_space,
+        hidden: false,
+        color: w.pending_color.clone(),
+        home: None,
+        pending: Some(w.id.clone()),
+    }
+}
+
 /// THE space order, everywhere (the sidebar's groups and dock, the menu's
-/// groups, the letters' display order): `@space_index` (⌃N) first, spaces
+/// groups, the letters' display order): `@space_index` (⌘N) first, spaces
 /// without one after (by name: the view's order, kept by a stable sort).
 pub fn space_order(sp: &Space) -> (bool, Option<u32>) {
     (sp.index.is_none(), sp.index)
@@ -471,7 +532,7 @@ impl Space {
     /// for the client's own window before [`ViewModel::apply_scope`]). A
     /// hidden session (`@space_hidden`) is no space: no shells.
     pub fn shells(&self) -> Vec<&Agent> {
-        if self.hidden {
+        if self.hidden || self.pending.is_some() {
             return Vec::new();
         }
         let mut v: Vec<&Agent> = self.agents.iter().chain(&self.plain).filter(|a| a.state.is_empty() && !a.home).collect();
@@ -479,12 +540,22 @@ impl Space {
         v
     }
 
+    /// What a space is called where it is named in words (the menu's group
+    /// rule): its session name; a pending space `N · creating…`.
+    pub fn label(&self) -> String {
+        match (&self.pending, self.index) {
+            (Some(_), Some(n)) => format!("{n} · creating…"),
+            (Some(_), None) => "creating…".into(),
+            _ => self.name.clone(),
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         obj![
             ("name", &self.name), ("is_current", self.is_current), ("counts", counts_json(&self.counts)),
             ("active_window", self.active_window.clone()), ("active_index", self.active_index),
             ("path", &self.path), ("path_short", &self.path_short), ("branch", &self.branch),
-            ("index", self.index), ("hidden", self.hidden),
+            ("index", self.index), ("hidden", self.hidden), ("pending", self.pending.clone()),
             ("git", self.git.as_ref().map(|g| obj![
                 ("head", &g.head), ("upstream", g.upstream.clone()), ("ahead", g.ahead),
                 ("behind", g.behind), ("changed", g.changed), ("untracked", g.untracked),
@@ -702,7 +773,14 @@ impl ViewModel {
         });
         let cw = cur_win.as_deref();
         let slots = assign_slots(&snap.windows, now, memo);
-        let agent = |w: &Window| Agent { slot: slots.get(&w.id).copied(), ..Agent::from_window(w, blink, cw, now) };
+        // `@spaces` on (the global option, off this view's client row, else
+        // any client's): shells, and the pending spaces, are a thing.
+        let spaces_on = cl.or(snap.clients.first()).is_some_and(|c| c.spaces == "on");
+        let agent = |w: &Window| Agent {
+            slot: slots.get(&w.id).copied(),
+            pending: Pending::of(w).filter(|_| spaces_on),
+            ..Agent::from_window(w, blink, cw, now)
+        };
 
         let needs = model::needs_order(&snap.windows, collator)
             .into_iter()
@@ -719,6 +797,17 @@ impl ViewModel {
         for name in names {
             let mut ws: Vec<&Window> = snap.windows.iter().filter(|w| w.session == name).collect();
             ws.sort_by_key(|w| w.index);
+            // The hidden `pending` session: each claude building a space is
+            // a space of its own, at the number it holds (spaces on only).
+            if spaces_on && name == PENDING {
+                for w in ws.iter().filter(|w| w.is_pending()) {
+                    spaces.push(pending_space(w, agent(w), cw));
+                }
+                ws.retain(|w| !w.is_pending());
+                if ws.is_empty() {
+                    continue;
+                }
+            }
             let active = ws.iter().find(|w| w.active).copied();
             let path = active.map(|w| w.path.clone()).unwrap_or_default();
             let (branch, status) = match git.as_deref_mut() {
@@ -744,6 +833,7 @@ impl ViewModel {
                 hidden: ws.first().is_some_and(|w| w.space_hidden),
                 color: ws.first().map(|w| w.space_color.clone()).unwrap_or_default(),
                 home: ws.iter().find(|w| w.home).map(|w| w.id.clone()),
+                pending: None,
             });
         }
 
@@ -786,7 +876,7 @@ impl ViewModel {
             locale: collator.name().to_string(),
             slot_width: hotkeys::slot_width(slots.values().copied().max()),
             scope: Scope::default(),
-            shells: cl.or(snap.clients.first()).is_some_and(|c| c.spaces == "on"),
+            shells: spaces_on,
             pinned: Vec::new(),
         }
     }
@@ -850,7 +940,8 @@ impl ViewModel {
             me.is_some_and(|c| c.space_hidden) || model::HIDDEN.contains(&s) || s == HOLD
         };
         if scope.spaces {
-            for sp in &mut self.spaces {
+            // (A pending space's claude is its one card, with a state or not.)
+            for sp in self.spaces.iter_mut().filter(|sp| sp.pending.is_none()) {
                 if let Some(k) = sp.agents.iter().position(|a| a.state.is_empty()) {
                     sp.plain.push(sp.agents.remove(k));
                     sp.plain.sort_by_key(|a| a.index);
@@ -1024,6 +1115,96 @@ mod tests {
         assert_eq!(v.counts.0, [1, 1, 0, 2, 0, 1]);
         assert_eq!((v.cur_win.as_deref(), v.cur_session.as_deref(), v.client_gone), (Some("@2"), Some("main"), false));
         assert!(build(Some("/dev/nope")).client_gone);
+    }
+
+    /// A snapshot with pending spaces: main (⌘1) and notes (⌘4); in the
+    /// hidden `pending` session the claude @5 holding space 3 (asking), the
+    /// claude @6 holding 2 (working), and @7 with no `@pending_space` (not a
+    /// pending space). `spaces`: the client row's `@spaces`.
+    fn pending_snap(spaces: &str) -> Snapshot {
+        let p = |n: &str, req: &str, color: &str| vec![("pending_space", n.to_string()), ("pending_request", req.to_string()),
+            ("pending_color", color.to_string()), ("space_hidden", "1".to_string())];
+        let mut five = p("3", "make a rust cli called fizz", "#f5c2e7");
+        five.extend([("state", "needs-input".into()), ("detail_kind", "ask".into()), ("detail", "Which crate?".into()),
+            ("since", "500 needs-input".into()), ("path", "/nonexistent/home".into())]);
+        let mut six = p("2", "clone owner/repo", "#89b4fa");
+        six.push(("state", "running".into()));
+        let r = |s: &str, i, id: &str, set: &[(&str, String)]| row(s, i, id, &set.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
+        let rows = [
+            row("main", 0, "@1", &[("home", "1"), ("space_index", "1")]),
+            row("main", 1, "@2", &[("state", "idle"), ("space_index", "1"), ("active", "1")]),
+            row("notes", 0, "@3", &[("home", "1"), ("space_index", "4")]),
+            row("notes", 1, "@4", &[("state", "running"), ("space_index", "4")]),
+            r("pending", 1, "@5", &five),
+            r("pending", 2, "@6", &six),
+            row("pending", 3, "@7", &[("state", "idle"), ("space_hidden", "1"), ("pending_request", "stray")]),
+            format!("\x1fclient\x1f/dev/ttys999\x1f@2\x1fmain\x1f{spaces}\x1f\x1f"),
+        ];
+        Snapshot::parse(&rows.join("\n"))
+    }
+
+    fn pending_view(spaces: &str) -> ViewModel {
+        let c = Collator::new("en_US.UTF-8");
+        let args = BuildArgs { client: Some("/dev/ttys999"), now: 1000.0, collator: &c, git: None, log: vec![], watcher_age: None };
+        ViewModel::build(&pending_snap(spaces), args)
+    }
+
+    /// `@spaces` on: each claude holding a number is a space of its own at
+    /// that number, in its colour, its one agent the claude (carrying what
+    /// it builds); the session's other windows stay a hidden space as
+    /// before; THE space order puts them between the real spaces.
+    #[test]
+    fn pending_windows_are_spaces_at_their_number() {
+        let v = pending_view("on");
+        let order: Vec<(Option<u32>, &str)> = v.ordered_spaces().iter().map(|s| (s.index, s.name.as_str())).collect();
+        assert_eq!(order, [(Some(1), "main"), (Some(2), "pending:@6"), (Some(3), "pending:@5"), (Some(4), "notes"), (None, "pending")]);
+        let p = v.spaces.iter().find(|s| s.name == "pending:@5").unwrap();
+        assert_eq!((p.pending.as_deref(), p.hidden, p.color.as_str(), p.home.as_deref()), (Some("@5"), false, "#f5c2e7", None));
+        assert_eq!(p.agents.iter().map(|a| a.window_id.as_str()).collect::<Vec<_>>(), ["@5"]);
+        assert!(p.shells().is_empty() && p.plain.is_empty() && p.branch.is_empty());
+        assert_eq!(p.counts.get(Cat::NeedsInput), 1);
+        assert_eq!(p.label(), "3 · creating…");
+        let a = &p.agents[0];
+        assert_eq!(a.session, "pending"); // the real session: actions need it
+        assert_eq!(a.pending, Some(Pending { space: 3, request: "make a rust cli called fizz".into(), color: "#f5c2e7".into() }));
+        // The stray window: no space of its own, no pending mark.
+        let rest = v.spaces.iter().find(|s| s.name == "pending").unwrap();
+        assert!(rest.hidden && rest.pending.is_none() && rest.agents.iter().all(|a| a.pending.is_none()));
+        // It asks like any agent: NEEDS YOU and the header's counts (needs 1;
+        // working @4 and @6; idle @2 and @7).
+        assert_eq!(v.needs.iter().map(|n| n.agent.window_id.as_str()).collect::<Vec<_>>(), ["@5"]);
+        assert!(v.needs[0].agent.pending.is_some());
+        assert_eq!(v.counts.0, [0, 1, 0, 2, 0, 2]);
+        // In space scope the client's space is still main's; nothing moves
+        // out of a pending space (its claude is its card, state or not).
+        let mut snap = pending_snap("on");
+        for w in snap.windows.iter_mut().filter(|w| w.id == "@6") {
+            w.state.clear();
+        }
+        let c = Collator::new("en_US.UTF-8");
+        let args = BuildArgs { client: Some("/dev/ttys999"), now: 1000.0, collator: &c, git: None, log: vec![], watcher_age: None };
+        let mut s = ViewModel::build(&snap, args);
+        s.apply_scope(&snap);
+        assert_eq!(s.scope.session.as_deref(), Some("main"));
+        let six = s.spaces.iter().find(|x| x.name == "pending:@6").unwrap();
+        assert_eq!((six.agents.len(), six.plain.len()), (1, 0));
+    }
+
+    /// `@spaces` off: nothing changes. The `pending` session is the hidden
+    /// space it always was, no agent carries a pending mark, and the view is
+    /// exactly the one built without the pending options.
+    #[test]
+    fn pending_spaces_need_spaces_on() {
+        let v = pending_view("");
+        assert!(v.spaces.iter().all(|s| s.pending.is_none()));
+        assert!(v.spaces.iter().flat_map(|s| s.agents.iter()).chain(v.needs.iter().map(|n| &n.agent)).all(|a| a.pending.is_none()));
+        let mut bare = pending_snap("");
+        for w in &mut bare.windows {
+            (w.pending_space, w.pending_request, w.pending_color) = (None, String::new(), String::new());
+        }
+        let c = Collator::new("en_US.UTF-8");
+        let args = BuildArgs { client: Some("/dev/ttys999"), now: 1000.0, collator: &c, git: None, log: vec![], watcher_age: None };
+        assert_eq!(v, ViewModel::build(&bare, args));
     }
 
     #[test]
