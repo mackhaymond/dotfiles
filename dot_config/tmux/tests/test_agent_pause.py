@@ -644,6 +644,44 @@ class PauseKey(Harness):
         self.assertEqual(self.stub.methods, [])
         self.assertIsNone(self.state())
 
+    def test_dismiss_turns_off_the_glow_and_keeps_the_pause(self):
+        a = self.window("running")
+        r = self.run_script("dismiss", "")
+        self.assertEqual((r.returncode, r.stdout), (0, ""), r.stderr)
+        self.assertIsNone(self.state())                    # nothing paused: a no-op
+        self.press()
+        self.run_script("dismiss", "")
+        st = self.state()
+        self.assertTrue(st["glow_dismissed_at"])
+        self.assertEqual([t["pane_id"] for t in st["targets"]], [a])
+        self.assertEqual(self.paused_opt(), "1")
+        self.assertTrue(self.t("display", "-p", "-t", a, "#{@agent_paused}").strip())
+        self.press()                                       # and prefix P still resumes it
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [a])
+        self.assertIsNone(self.state())
+
+    def test_void_forgets_the_pause_and_messages_nobody(self):
+        flag = lambda p: self.t("display", "-p", "-t", p, "#{@agent_paused}").strip()
+        a = self.window("running")
+        b = self.window("running")
+        self.press()
+        self.t("set", "-w", "-t", a, "@agent_state", "paused")   # the hook's Stop
+        self.t("set", "-w", "-t", b, "@agent_state", "running")  # b never stopped
+        calls = len(self.stub.calls)
+        r = self.run_script("void", "")
+        self.assertEqual((r.returncode, r.stdout), (0, ""), r.stderr)
+        self.assertIn("pause voided: 2 agents", self.last_log()["message"])
+        self.assertEqual(len(self.stub.calls), calls)     # no RESUME, no MCP at all
+        self.assertIsNone(self.state())
+        self.assertEqual(self.paused_opt(), "")
+        self.assertEqual((flag(a), flag(b)), ("", ""))
+        self.assertEqual(self.t("display", "-p", "-t", a, "#{@agent_state}").strip(), "idle")
+        self.assertEqual(self.t("display", "-p", "-t", b, "#{@agent_state}").strip(), "running")
+        last = json.loads((self.dir / "state" / "paused.last.json").read_text())
+        self.assertTrue(last["voided_at"])
+        self.press()                                       # the next press is a fresh pause
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), sorted([a, b, b]))
+
     def test_pause_is_urgent_resume_is_not(self):
         """The PAUSE overrides tmux-mcp's draft hold (urgent); the RESUME
         waits for a clear box like any other message."""

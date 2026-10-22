@@ -9,6 +9,8 @@ reach the agents that were paused, not whatever happens to be running now.
 
     agent-pause.py toggle <client_name>   the key: pause, or resume a saved set
     agent-pause.py resume <client_name>   resume a saved set, never pause (the sidebar)
+    agent-pause.py dismiss [client_name]  turn off the notch's "all paused" glow; stays paused
+    agent-pause.py void [client_name]     forget the pause, message nobody, unmark the agents
     agent-pause.py status                 print the saved set, or "not paused"
     agent-pause.py dry-run                print who WOULD be paused/resumed; sends nothing
     agent-pause.py watch pause|resume [--demo] [--press <id>]
@@ -1022,6 +1024,81 @@ def finished(prog, finish):
         raise
 
 
+# ------------------------------------------------- dismiss and void
+# After the lid opens (Mack, 2026-10-21): the notch's strong cyan "all paused"
+# ring can be DISMISSED without resuming anyone - the saved set, the sidebar's
+# banner and every paused row stay - and the whole pause can be VOIDED: the
+# set is forgotten and nobody is messaged, so the agents stay where they
+# stopped, just no longer marked paused. Both run under the toggle's lock, so
+# they never interleave with a press.
+
+def under_lock(client, fn):
+    """fn() under the press lock -> its message, or the "busy" line."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK, "a") as lf:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "⏸ pause key busy — the last press is still sending"
+        return fn()
+
+
+def post_state_change():
+    """The sidebar and CuaNotch redraw on this instead of their next poll."""
+    try:
+        subprocess.run(["notifyutil", "-p", "com.mackhaymond.tmux.agent-state"],
+                       capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def dismiss_glow(client):
+    """Turn off the notch's "all paused" ring: `glow_dismissed_at` in
+    paused.json, until the set is resumed, voided or replaced. Nothing else
+    changes. -> message."""
+    def run():
+        st = load_state()
+        if not st or not st["targets"]:
+            return "⏸ nothing is paused — no glow to dismiss"
+        if not st.get("glow_dismissed_at"):
+            write_json(STATE, dict(st, glow_dismissed_at=now_iso()))
+            post_state_change()
+        log({"mode": "dismiss", "client": client, "paused_at": st.get("paused_at")})
+        return "⏸ glow dismissed — %d still paused (prefix P resumes)" % len(st["targets"])
+    return under_lock(client, run)
+
+
+def void_pause(client):
+    """Forget the saved set without messaging anyone: each agent's flag goes
+    (and a window still `paused` goes idle), paused.json goes, and the record
+    is kept in paused.last.json as `voided_at`. -> message."""
+    def run():
+        st = load_state()
+        if not st or not st["targets"]:
+            return "⏸ nothing is paused — nothing to void"
+        try:
+            panes, recs = list_panes(), agent_records()
+            found = [locate(t, panes, recs)[0] for t in st["targets"]]
+            alive = set(panes)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            found, alive = [], set()
+        old = [t.get("pane_id") for t in st["targets"] if t.get("pane_id") in alive]
+        mark_paused([p for p in found if p] + old, False)
+        write_json(LAST, dict(st, voided_at=now_iso(), still_paused=0))
+        try:
+            STATE.unlink()
+        except FileNotFoundError:
+            pass
+        set_paused_option(0)
+        post_state_change()
+        n = len(st["targets"])
+        msg = "⏸ pause voided: %d agent%s left stopped, not resumed" % (n, "" if n == 1 else "s")
+        log({"mode": "void", "client": client, "paused_at": st.get("paused_at"), "message": msg,
+             "targets": st["targets"]})
+        return msg
+    return under_lock(client, run)
+
+
 # ------------------------------------------------------------- feedback
 # A display-message line is too easy to miss with the lid half shut (Mack's
 # call), so a press with anyone to message opens a big border-less popup
@@ -1747,6 +1824,18 @@ def main(argv):
             except Exception:
                 pass
         return 0
+    if cmd in ("dismiss", "void"):
+        client = argv[2] if len(argv) > 2 else ""
+        try:
+            msg = (dismiss_glow if cmd == "dismiss" else void_pause)(client)
+        except Exception as e:   # the click/key path never fails silently
+            msg = "⏸ pause key error: %s: %s" % (type(e).__name__, e)
+            log({"mode": "error", "client": client, "message": msg})
+        try:
+            display(client, msg)
+        except Exception:
+            pass
+        return 0
     if cmd == "status":
         status()
         return 0
@@ -1766,7 +1855,8 @@ def main(argv):
             import select
             select.select([sys.stdin], [], [], 30)
         return 0
-    sys.stderr.write("usage: agent-pause.py toggle|resume <client_name> | status | dry-run"
+    sys.stderr.write("usage: agent-pause.py toggle|resume <client_name> | dismiss|void [client_name]"
+                     " | status | dry-run"
                      " | watch pause|resume [--demo] [--press <id>]\n")
     return 2
 

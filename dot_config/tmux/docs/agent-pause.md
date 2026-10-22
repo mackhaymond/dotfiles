@@ -274,6 +274,29 @@ Every reader:
   `message_agent`, so the tab hook may classify that turn as agent-started
   (`agent-tab-indicator.md` §6). `paused` wins over the quiet restore.
 
+## Dismiss and void (after the lid opens)
+
+Mack, 2026-10-21: on opening the laptop he may not want everyone back yet, but
+also doesn't want the notch shouting cyan. So the paused set now has two more
+ways out besides the resume:
+
+| action | what changes | what stays | how |
+|---|---|---|---|
+| **dismiss** the glow | paused.json gains `glow_dismissed_at`; the notch's "all paused" ring goes dark | the saved set, `@agent_paused`, the `paused` rows (notch menu, tabs, sidebar cards) and the sidebar's banner | `agent-pause.py dismiss [client]`; a click on the notch while it shows the cyan ring |
+| **void** the pause | paused.json is removed (recorded in paused.last.json as `voided_at`); every target's `@agent_paused` is cleared and a window still `paused` goes `idle`; no RESUME is sent to anyone | the agents themselves: they stay where they stopped, idle, with their notes | `agent-pause.py void [client]`; the sidebar banner's void action (confirmed); the notch menu's "Void pause" |
+| **resume** | as always | | prefix P; a click on the banner; the notch menu's "Resume" |
+
+- The dismissal lasts until the set is resumed, voided or replaced by a new
+  pause; the violet pulse while pausing cannot be dismissed (it ends by
+  itself). Both commands take the press lock and post
+  `com.mackhaymond.tmux.agent-state`, so the sidebar and the notch redraw at
+  once.
+- **The banner stays until resume or void.** It shows whenever paused.json
+  lists targets, dismissed or not. **The notch menu keeps the agents paused**
+  until resume or void: a void removes paused.json, which the notch already
+  treats like a resume for its rows (hook-written `paused` → ready), while
+  nothing is sent to the agents.
+
 ## In the sidebar
 
 Mack closes the popup (Esc) or a tab and still wants to see where the pause
