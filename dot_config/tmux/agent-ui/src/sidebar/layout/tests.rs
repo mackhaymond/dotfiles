@@ -1985,6 +1985,9 @@ fn the_stash_selection_fills_rows_and_shows_its_keys() {
     let hint = find(&f, " selected ");
     assert!(t[hint].contains(" 2 selected  j/k ⏎ park esc"), "{:?}", t[hint]);
     assert!(f.rows[hint].segs.iter().any(|s| *s == block(" 2 selected ", "crust", "mauve")));
+    // Too narrow for one row: move and close go on a second, never dropped.
+    assert!(t[hint + 1].contains("m move") && t[hint + 1].contains("x close"), "{:?}", t[hint + 1]);
+    assert_eq!(t.iter().filter(|l| l.contains("m move")).count(), 1);
     let f = layout(&v, 60, 40, &with_bar(bar.clone()));
     assert!(texts(&f).iter().any(|l| l.contains(" 2 selected  j/k · ⏎ park · m move · x close · esc")));
     let f = layout(&v, 70, 40, &with_bar(bar));

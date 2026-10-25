@@ -952,20 +952,23 @@ fn marks(bar: &Bar) -> Vec<Seg> {
 /// real keys (tmux.conf.tmpl's `stash` table), as many as fit. j/k, not
 /// h/l (both work): this list is vertical, and they walk it top to bottom
 /// (stash.sh's `sel_order` is this sidebar's order).
-fn hint_row(n: usize, w: usize) -> Row {
+/// Every key on one row when it fits; else two (2026-10-25: one narrow row
+/// had to drop m move or x close), the second under the first's keys.
+fn hint_rows(n: usize, w: usize) -> Vec<Row> {
     let chip = block(format!(" {n} selected "), "crust", "mauve");
-    let room = w.saturating_sub(2 + dwidth(&chip.text));
-    let keys = [
-        "j/k extend · ⏎ park · m move · x close · esc cancel",
-        "j/k · ⏎ park · m move · x close · esc",
-        "j/k ⏎ park x close esc",
-        "j/k ⏎ park esc",
-        "j/k ⏎ esc",
-    ]
-        .into_iter()
-        .find(|k| dwidth(k) < room)
-        .unwrap_or("");
-    Row::new(fit(w, vec![seg(" ", "text"), chip, seg(format!(" {keys}"), "sub")], vec![], None))
+    let cw = dwidth(&chip.text);
+    let room = w.saturating_sub(2 + cw);
+    let pick = |tiers: &[&'static str]| tiers.iter().copied().find(|k| dwidth(k) < room);
+    let row = |lead: Seg, keys: &str| Row::new(fit(w, vec![seg(" ", "text"), lead, seg(format!(" {keys}"), "sub")], vec![], None));
+    let one = ["j/k extend · ⏎ park · m move · x close · esc cancel", "j/k · ⏎ park · m move · x close · esc", "j/k ⏎ park m move x close esc"];
+    if let Some(keys) = pick(&one) {
+        return vec![row(chip, keys)];
+    }
+    let first = pick(&["j/k · ⏎ park · esc", "j/k ⏎ park esc", "j/k ⏎ esc"]).unwrap_or("");
+    let second = pick(&["m move · x close", "m move x close"]);
+    let mut rows = vec![row(chip, first)];
+    rows.extend(second.map(|k| row(seg(" ".repeat(cw), "text"), k)));
+    rows
 }
 
 /// A signed delta as the meter prints it: `+17%`, `−4%` (a real minus),
@@ -1289,7 +1292,7 @@ fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
     let marks = marks(bar);
     let hint = bar.selecting.filter(|_| h >= 6);
     if let Some(n) = hint {
-        content.push(hint_row(n, iw));
+        content.extend(hint_rows(n, iw));
     }
     if h >= 30 {
         content.extend(bar.usage.iter().map(|u| meter_row(u, iw, now)));
