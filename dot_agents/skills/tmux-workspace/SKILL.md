@@ -314,7 +314,7 @@ Prefix is **⌃S**. ⌘ chords come from WezTerm.
 | ⌘B | sidebar on/off |
 | prefix q | agent menu (lists agents only; letters jump, a shell's too; Tab filters; Space then y allow / n deny on a permission prompt, s park / x close / p pin / d diff / v preview) |
 | prefix H / prefix h | park this tab / unpark (picker) |
-| prefix v | select a range of tabs (h/l extend, H or ⏎ park, m move, Esc) |
+| prefix v | select a range of tabs (h/l extend, H or ⏎ park, m move, x close, ⇧Y confirms, any other key cancels (homes skipped, ⌘Z reopens), Esc) |
 | prefix Q | close this space (y/n; never main) |
 | ⌘T / ⌘R | new shell tab / new claude tab (prefix c / prefix k) in THIS space, in the current tab's folder |
 | ⌘⇧T / ⌘⇧R | picker: which space gets a new shell / claude tab (at its end, in that space's root folder; prefix C-t / prefix K). Type a folder to open or reuse a space for it; ^N creates (as ⌥N's) and the tab opens in the new folder's space |

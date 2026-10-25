@@ -38,6 +38,10 @@
 #   stash.sh sel-commit           park everything selected
 #   stash.sh sel-send             move everything selected to another (or a
 #                                 new) session, picked in a popup
+#   stash.sh sel-kill <w> <client>  close everything selected (homes skipped)
+#                                 after a popup only ⇧Y confirms, through
+#                                 closed-tabs.sh
+#   stash.sh sel-kill-prompt <w>  print that menu's question (tests)
 #   stash.sh count                how many are parked (for the status line)
 #   stash.sh list                 what is parked, and where each came from
 #   stash.sh restore-state        re-apply parked state after a resurrect restore
@@ -2389,7 +2393,7 @@ sel_sess_of() { [ -n "${1:-}" ] && tmux display-message -p -t "$1" '#{session_na
 # exactly these keys. The file sits beside this script, wherever it runs from
 # (~/.config/tmux/scripts, or the chezmoi source in the tests);
 # STASH_ROOT_KEYS_CONF names another.
-STASH_ROOT_KEYS="h l j k H Enter m a Escape q C-c Space"
+STASH_ROOT_KEYS="h l j k H Enter m a x Escape q C-c Space"
 stash_root_keys_conf() {
     local d="${BASH_SOURCE[0]%/*}"
     [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
@@ -2404,7 +2408,7 @@ SEL_ROOT_BOUND=""     # what the last sel_clear found in @stash_root_bound
 # (sel-cancel, so the park, sel-send and prefix+H too, and sel-start's wipe).
 # @stash_root_bound rides in the list-windows call this makes anyway, so with
 # nothing bound (a plain prefix+H) it costs no tmux call; with them bound it is
-# one call: twelve `unbind-key -q -n` and the flag, as a single command list.
+# one call: an `unbind-key -q -n` per key and the flag, as a single command list.
 # `keep` (sel-start, which binds them again at once) leaves them be.
 sel_clear() {
     local line w bound="" ids="" k cmd=()
@@ -2444,12 +2448,15 @@ sel_bind_root_keys() {
 # (The idle fold and the shells' pill line only squeeze rows that are
 # already in this order.) agent-ui/tests/sidebar.rs checks the two agree
 # against a rendered frame. One list-windows, already in index order.
+# `sel_order SESS rows` prints the whole row (id, @space_home, @agent_state,
+# @agent_workflow, @agent_cua).
 sel_order() {
-    tmux list-windows -t "=$1" -F "#{window_id}${SEP}#{@space_home}${SEP}#{@agent_state}" 2>/dev/null |
-        awk -F "$SEP" '
-            $2 == "1" { home[++nh] = $1; next }
-            $3 != ""  { agent[++na] = $1; next }
-                      { shell[++ns] = $1 }
+    tmux list-windows -t "=$1" -F "#{window_id}${SEP}#{@space_home}${SEP}#{@agent_state}${SEP}#{@agent_workflow}${SEP}#{@agent_cua}" 2>/dev/null |
+        awk -F "$SEP" -v rows="${2:-}" '
+            { r = (rows != "" ? $0 : $1) }
+            $2 == "1" { home[++nh] = r; next }
+            $3 != ""  { agent[++na] = r; next }
+                      { shell[++ns] = r }
             END {
                 for (k = 1; k <= nh; k++) print home[k]
                 for (k = 1; k <= na; k++) print agent[k]
@@ -2589,6 +2596,219 @@ do_sel_commit() {
     [ -n "$ids" ] || return 0
     do_stash_many $ids
     sel_notice
+}
+
+# --- closing a selection ------------------------------------------------------
+#
+# x: close every selected tab, after a y/n. Each pane goes through closed-tabs.sh
+# `close`, the very path prefix x / CMD+W takes (snapshot, agent session id, a
+# history row CMD+Z reopens from), one after the other so each row's recorded
+# index is the slot that tab really left: reopened newest-first, they land back
+# where they were. A space's HOME is never closed (prefix x refuses it too);
+# it is skipped and the question says so.
+#
+# sel-kill runs in the key's foreground run-shell and only asks, in a small
+# popup (status-line prompts are hidden behind the sidebar) that reads ONE key:
+# ⇧Y closes, and every other key, y included, cancels and is swallowed there,
+# never reaching the pane. Not prefix x's display-menu, and not a plain y: x
+# is also the root twin's, live whenever a selection is, so ordinary typing
+# can open the box. "proxy" / "oxygen" at speed answered a y/n menu with y,
+# and a menu's own keys walk its highlight (k wraps onto the last item, G,
+# Tab, the arrows), so "xkcd⏎" picked Close (both measured, review
+# 2026-10-25). Capital Y, and nothing navigable, is the one rule.
+# The binding re-arms the `stash` table before calling this, so a "no" leaves
+# the selection exactly as it was, keys and all. Y hands sel-kill-go the ids
+# the question described, in the background.
+CLOSED_TABS_SH="${CLOSED_TABS_SH:-$HOME/.config/tmux/scripts/closed-tabs.sh}"
+
+# What x would do to the selection in session $1, as globals: KILL_IDS (the
+# non-home selected windows, sel_order), KILL_N, KILL_AGENTS, KILL_RUN
+# (running), KILL_ASK (needs-input), KILL_HOMES (selected homes, skipped) and
+# KILL_ALL (1: they are every window of the session, so closing them would end
+# it). With $2.. given, those ids instead of the tint (sel-kill-go: the ones the
+# question named, re-checked).
+sel_kill_survey() {
+    local sess="$1"; shift
+    local want wid home state flow cua
+    KILL_IDS=""; KILL_N=0; KILL_AGENTS=0; KILL_RUN=0; KILL_ASK=0; KILL_HOMES=0; KILL_ALL=0
+    if [ "$#" -gt 0 ]; then want=" $* "; else want=" $(sel_ids "$sess" | tr '\n' ' ') "; fi
+    local total=0
+    while IFS="$SEP" read -r wid home state flow cua; do
+        [ -n "$wid" ] || continue
+        total=$((total + 1))
+        case "$want" in *" $wid "*) ;; *) continue ;; esac
+        if [ "$home" = 1 ]; then KILL_HOMES=$((KILL_HOMES + 1)); continue; fi
+        KILL_IDS="$KILL_IDS $wid"; KILL_N=$((KILL_N + 1))
+        [ -n "$state" ] || continue
+        KILL_AGENTS=$((KILL_AGENTS + 1))
+        # Waiting on you first (the sidebar's rank puts attention before
+        # work), then working exactly as the sidebar counts it
+        # (agent-ui model::in_flight): running, or a workflow or cua flag
+        # whatever the state. One count per agent, never both.
+        if [ "$state" = needs-input ]; then
+            KILL_ASK=$((KILL_ASK + 1))
+        elif [ "$state" = running ] || [ -n "$flow" ] || [ -n "$cua" ]; then
+            KILL_RUN=$((KILL_RUN + 1))
+        fi
+    done < <(sel_order_rows "$sess")
+    KILL_IDS="${KILL_IDS# }"
+    [ "$KILL_N" -gt 0 ] && [ "$KILL_N" -eq "$total" ] && KILL_ALL=1
+    return 0
+}
+
+# sel_order's walk with each window's @space_home, @agent_state,
+# @agent_workflow and @agent_cua beside it.
+sel_order_rows() { sel_order "$1" rows; }
+
+# The question, from the survey: "close 3 tabs (2 agents, 1 working, 1 needs
+# input)? · home stays". Running and needs-input agents are named because
+# those are the ones a close interrupts.
+sel_kill_prompt() {
+    local p d s=""
+    [ "$KILL_N" -eq 1 ] || s=s
+    p="close $KILL_N tab$s"
+    if [ "$KILL_AGENTS" -gt 0 ]; then
+        d="$KILL_AGENTS agent"; [ "$KILL_AGENTS" -eq 1 ] || d="${d}s"
+        [ "$KILL_RUN" -gt 0 ] && d="$d, $KILL_RUN working"
+        if [ "$KILL_ASK" -gt 0 ]; then
+            d="$d, $KILL_ASK need"; [ "$KILL_ASK" -eq 1 ] && d="${d}s"; d="$d input"
+        fi
+        p="$p ($d)"
+    fi
+    p="$p?"
+    [ "$KILL_HOMES" -gt 0 ] && p="$p · home stays"
+    printf '%s' "$p"
+}
+
+do_sel_kill_prompt() {
+    local cur sess
+    cur=$(sel_win "${1:-}"); [ -n "$cur" ] || return 0
+    sess=$(sel_sess_of "$cur"); [ -n "$sess" ] || return 0
+    sel_kill_survey "$sess"
+    sel_kill_prompt; echo
+}
+
+do_sel_kill() {
+    local cur sess client="${2:-}" s
+    cur=$(sel_win "${1:-}"); [ -n "$cur" ] || return 0
+    sess=$(sel_sess_of "$cur"); [ -n "$sess" ] || return 0
+    # The binding armed the table; with nothing to ask about, put the client
+    # back in root, or its next l would start a new selection.
+    unarm() { [ -n "$client" ] && tmux switch-client -c "$client" -T root 2>/dev/null; return 0; }
+    case "$sess" in
+        "$HOLD") unarm; return 0 ;;
+        agents) do_sel_cancel; unarm; msg -k warn "agents windows belong to tmux-pty-mcp — not closing them"; return 0 ;;
+        tasks) do_sel_cancel; unarm; msg -k warn "tasks windows belong to CuaNotch — not closing them"; return 0 ;;
+    esac
+    sel_kill_survey "$sess"
+    if [ "$KILL_N" -eq 0 ]; then
+        if [ "$KILL_HOMES" -gt 0 ]; then
+            # Only the home is selected: the selection stays, as after a "no".
+            notify_user ${client:+-c "$client"} -k warn -- "home is never closed · prefix Q closes the space"
+        else
+            unarm
+        fi
+        return 0
+    fi
+    if [ "$KILL_ALL" = 1 ]; then
+        notify_user ${client:+-c "$client"} -k warn -- "closing every tab would end $sess · leave one out"
+        return 0
+    fi
+    # Sized to its two lines (sel_kill_ask prints them), prefix x's colours.
+    # Ids go in unquoted: @ plus digits, nothing a shell would touch.
+    local q y w
+    q=" $(sel_kill_prompt) "; y=" $(sel_kill_yes) "
+    w=${#q}; [ "${#y}" -gt "$w" ] && w=${#y}
+    tmux display-popup ${client:+-c "$client"} -E -b rounded -s 'bg=#1e1e2e,fg=#cdd6f4' -S 'fg=#f38ba8' \
+        -T "#[align=centre] close tabs " -w $((w + 4)) -h 4 -x "$POPUP_X" -y C \
+        "'$SELF' sel-kill-ask '$client' $KILL_HOMES $KILL_IDS" 2>/dev/null
+    return 0
+}
+
+# The popup's second line: its one yes, and that nothing else is.
+sel_kill_yes() {
+    local s=s; [ "$KILL_N" -eq 1 ] && s=""
+    printf '%s' "⇧Y close $KILL_N tab$s · any other key cancels"
+}
+
+# Inside the popup: the question, then one key. Re-surveyed from the ids, so
+# the counts are the ones sel-kill-go will act on. Anything but Y (⏎, Esc and
+# the rest of an escape sequence, a stray letter) ends the popup and goes no
+# further: what is left unread dies with the popup's terminal.
+do_sel_kill_ask() {
+    local client="${1:-}" homes="${2:-0}"; shift 2
+    local sess="" w k
+    for w in "$@"; do
+        sess=$(tmux display-message -p -t "$w" '#{session_name}' 2>/dev/null) && [ -n "$sess" ] && break
+    done
+    [ -n "$sess" ] || return 0
+    sel_kill_survey "$sess" "$@"
+    KILL_HOMES="$homes"
+    printf ' %s\n \033[1;31m%s\033[0m' "$(sel_kill_prompt)" "$(sel_kill_yes)"
+    IFS= read -rsn1 k
+    [ "$k" = Y ] || return 0
+    tmux run-shell -b "'$SELF' sel-kill-go '$client' $homes $*"
+}
+
+# y: the closes themselves, in a backgrounded run-shell (the menu is gone the
+# moment you answer). $2 is how many homes the question said stay, $3.. the
+# ids it named; anything that has since closed, moved session or become a home
+# is dropped.
+do_sel_kill_go() {
+    local client="${1:-}" homes="${2:-0}"; shift 2
+    local sess="" w s land="" act wid lastf p
+    for w in "$@"; do
+        s=$(tmux display-message -p -t "$w" '#{session_name}' 2>/dev/null) || continue
+        [ -n "$s" ] && { sess="$s"; break; }
+    done
+    # The selection ends here, like every other way out of it, and the client
+    # leaves the `stash` table the binding re-armed.
+    do_sel_cancel
+    [ -n "$client" ] && tmux switch-client -c "$client" -T root 2>/dev/null
+    [ -n "$sess" ] || return 0
+    case "$sess" in "$HOLD"|agents|tasks) return 0 ;; esac
+    sel_kill_survey "$sess" "$@"
+    [ "$KILL_N" -gt 0 ] || return 0
+    [ "$KILL_ALL" = 1 ] && { notify_user ${client:+-c "$client"} -k warn -- "closing every tab would end $sess · leave one out"; return 0; }
+
+    # Where the session lands, picked once instead of letting tmux hop through
+    # the ones about to close: what a single close lands on (the last-visited
+    # window) if it stays, else the window just before the first closed one in
+    # sel_order (the home, in a space), else any that stays.
+    while IFS="$SEP" read -r wid lastf; do
+        case " $KILL_IDS " in *" $wid "*) continue ;; esac
+        [ "$lastf" = 1 ] && land="$wid"
+    done < <(tmux list-windows -t "=$sess" -F "#{window_id}${SEP}#{window_last_flag}" 2>/dev/null)
+    if [ -z "$land" ]; then
+        land=$(sel_order "$sess" | awk -v ids=" $KILL_IDS " '
+            { if (index(ids, " " $0 " ")) { if (prev != "") { print prev; exit } ; hit = 1; next }
+              prev = $0; if (hit) { print; exit } }')
+    fi
+    act=$(tmux display-message -p -t "=$sess:" '#{window_id}' 2>/dev/null)
+    case " $KILL_IDS " in *" $act "*) [ -n "$land" ] && tmux select-window -t "$land" 2>/dev/null ;; esac
+
+    local n=0
+    for w in $KILL_IDS; do
+        # Every pane of the tab, as prefix x on each would; a home's panes can
+        # not be among them (surveyed out), and a dashboard is never a tab.
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            bash "$CLOSED_TABS_SH" close "$p" </dev/null >/dev/null 2>&1
+        done < <(tmux list-panes -t "$w" -F '#{?#{||:#{@space_home_pane},#{@space_dash_pane}},,#{pane_id}}' 2>/dev/null)
+        # Counted only once the window is really gone: a close that failed
+        # (or a pane the filter kept) leaves it standing.
+        [ -n "$(tmux display-message -p -t "$w" '#{window_id}' 2>/dev/null)" ] || n=$((n + 1))
+    done
+    sel_notice
+    local kind=ok what
+    s=s; [ "$KILL_N" -eq 1 ] && s=""
+    if [ "$n" -eq "$KILL_N" ]; then what="closed $n tab$s"
+    elif [ "$n" -eq 0 ]; then what="couldn't close $([ "$KILL_N" -eq 1 ] && echo the tab || echo "the $KILL_N tabs")"; kind=warn
+    else what="closed $n of $KILL_N tab$s"; kind=warn
+    fi
+    [ $((homes + KILL_HOMES)) -gt 0 ] && what="$what · home stays"
+    [ "$n" -gt 0 ] && what="$what · ⌘Z reopens"
+    notify_user ${client:+-c "$client"} -k "$kind" -- "$what"
 }
 
 # --- sending a selection to another session -----------------------------------
@@ -3437,6 +3657,10 @@ case "${1:-}" in
     sel-cancel) do_sel_cancel ;;
     sel-commit) shift; do_sel_commit "${1:-}" ;;
     sel-send)   shift; do_sel_send "${1:-}" "${2:-}" ;;
+    sel-kill)   shift; do_sel_kill "${1:-}" "${2:-}" ;;
+    sel-kill-prompt) shift; do_sel_kill_prompt "${1:-}" ;;
+    sel-kill-ask) shift; do_sel_kill_ask "$@" ;;
+    sel-kill-go) shift; do_sel_kill_go "$@" ;;
     send-pick)  shift; do_send_pick "$@" ;;
     send-many)  shift; do_send_many "$@" ;;
     count)   count ;;

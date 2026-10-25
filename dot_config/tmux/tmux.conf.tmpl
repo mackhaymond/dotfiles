@@ -758,7 +758,8 @@ bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash '' '#{client
 # the mode with just the current tab selected (tinted); the client is then
 # parked in the `stash` key table below, where h/l (or j/k) extend the selection and H
 # — the same key that hides one tab — hides the lot. One key to enter, the
-# same hide key to finish; prefix+v again (or Esc) drops it. The bring-back
+# same hide key to finish; x closes the lot instead (⇧Y confirms); prefix+v
+# again (or Esc) drops it. The bring-back
 # picker takes the nearest gesture fzf allows (Shift-Up/Down or Tab — a plain
 # letter there is filter input).
 #
@@ -821,6 +822,16 @@ bind-key -T stash Enter run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh sel-
 # has no client to switch.
 bind-key -T stash m run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-send '#{window_id}' '#{client_name}'"
 bind-key -T stash a run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-send '#{window_id}' '#{client_name}'"
+# x closes the selected tabs once confirmed: a small popup names how many tabs
+# and agents (working / needs-input ones called out) and that a home stays,
+# and reads ONE key. ⇧Y closes; every other key, y included, cancels and is
+# swallowed (x's root twin is live during a selection, so "proxy" typed at
+# speed must not answer it; stash.sh's sel-kill has the measurements).
+# Each goes through closed-tabs.sh, so CMD+Z reopens them; a home is skipped.
+# The table is re-armed FIRST, as h/l do: the popup takes the keys while it
+# is up, and a "no" then leaves the selection and its keys exactly as they
+# were. ⇧Y clears it and drops the client back to root.
+bind-key -T stash x switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-kill '#{window_id}' '#{client_name}'"
 bind-key -T stash Escape run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-cancel"
 bind-key -T stash q      run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-cancel"
 bind-key -T stash C-c    run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-cancel"
@@ -876,8 +887,8 @@ bind-key -T stash Space  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-ca
 # interrupts a Claude turn), C-s Enter as \r, C-s C-c as \x03. So they live in
 # scripts/stash-root-keys.conf: sel-start `source-file`s it when it paints a
 # selection, and stash.sh's sel_clear — the one path every ending goes through
-# (sel-cancel, the park, sel-send, prefix+H, the next sel-start's wipe) —
-# unbinds the twelve keys in one call, gated on @stash_root_bound so a prefix+H
+# (sel-cancel, the park, sel-send, the close, prefix+H, the next sel-start's
+# wipe) — unbinds the keys (stash.sh's STASH_ROOT_KEYS) in one call, gated on @stash_root_bound so a prefix+H
 # with no selection pays nothing. That unbind would take any OTHER root binding
 # of those keys with it; there is none, so keep it that way. A server restart
 # starts with none bound. A selection that ends some other way (its tabs
@@ -891,7 +902,7 @@ bind-key -T stash Space  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-ca
 # keys must stay identical to the table's bindings; the test checks it.
 #
 # Ending the mode is therefore explicit: Esc / q / C-c / Space, prefix+v,
-# H / Enter (park), m / a (move), or prefix+H, which clears the selection
+# H / Enter (park), m / a (move), x then ⇧Y (close), or prefix+H, which clears the selection
 # before parking its one tab (see do_stash). sel-start also clears any old tint
 # server-wide, so a fresh prefix+v anywhere never inherits a stale one.
 

@@ -303,7 +303,7 @@ give way to *every* window of the space as today's catppuccin tab
 since the selection's only feedback is that tint and agents have no tab
 otherwise. The trigger is any window of the space carrying `@stash_sel` —
 the same test as tmux.conf's `@stash_live`, which keeps the mode's keys
-(h/l/j/k/H/⏎/m/a/esc/q/C-c/space, bound in root only while a selection exists:
+(h/l/j/k/H/⏎/m/a/x/esc/q/C-c/space, bound in root only while a selection exists:
 scripts/stash-root-keys.conf) working in that space until the selection
 ends, and makes prefix v a toggle (tests/test_stash_keys.py). h/l and j/k
 walk the space in the SIDEBAR's order (home, agents, shells; stash.sh

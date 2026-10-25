@@ -36,9 +36,11 @@ STASH = HERE / "scripts" / "executable_stash.sh"
 ROOT_CONF = HERE / "scripts" / "stash-root-keys.conf"
 TMUX = shutil.which("tmux")
 COLS, ROWS = 120, 20
-KEYS = ["h", "l", "j", "k", "H", "Enter", "m", "a", "Escape", "q", "C-c", "Space"]
+CLOSED_TABS = HERE / "scripts" / "executable_closed-tabs.sh"
+KEYS = ["h", "l", "j", "k", "H", "Enter", "m", "a", "x", "Escape", "q", "C-c", "Space"]
 TYPED = {"h": b"h", "l": b"l", "j": b"j", "k": b"k", "H": b"H", "Enter": b"\r", "m": b"m", "a": b"a",
-         "Escape": b"\x1b", "q": b"q", "C-c": b"\x03", "Space": b" "}
+         "x": b"x", "Escape": b"\x1b", "q": b"q", "C-c": b"\x03", "Space": b" "}
+ANSI = re.compile(rb"\x1b(\[[0-9;?<>=]*[ -/]*[@-~]|[()][0-9A-Za-z]|[@-Z\\-_])")
 
 
 def stash_section():
@@ -85,6 +87,11 @@ class Keys(unittest.TestCase):
         # A wrapper, not a symlink: the chezmoi source copy is not executable.
         (scripts / "stash.sh").write_text(f'#!/bin/sh\nexec bash "{STASH}" "$@"\n')
         (scripts / "stash.sh").chmod(0o755)
+        # x closes through closed-tabs.sh beside it, as installed. Its history
+        # lands under XDG_STATE_HOME (the temp dir); with no resurrect plugin
+        # under this HOME it records every pane as a plain shell.
+        (scripts / "closed-tabs.sh").write_text(f'#!/bin/sh\nexec bash "{CLOSED_TABS}" "$@"\n')
+        (scripts / "closed-tabs.sh").chmod(0o755)
         self.env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
         self.env.update(TERM="xterm-256color", HOME=self.tmp, TMPDIR=self.tmp + "/",
                         AGENT_FOCUS_NOTICE="", XDG_STATE_HOME=os.path.join(self.tmp, "state"),
@@ -125,12 +132,15 @@ class Keys(unittest.TestCase):
             finally:
                 os._exit(127)
         self.child, self.fd = pid, fd
+        self.screen = bytearray()             # everything the client drew
 
         def drain():
             while True:
                 try:
-                    if not os.read(fd, 65536):
+                    b = os.read(fd, 65536)
+                    if not b:
                         return
+                    self.screen += b
                 except OSError:
                     return
         threading.Thread(target=drain, daemon=True).start()
@@ -317,7 +327,7 @@ class Keys(unittest.TestCase):
     def test_mode_survives_being_knocked_out_of_the_table(self):
         self.start()
         knocks = [
-            ("unbound key", lambda: self.type(b"x")),         # (not j: a mode key now)
+            ("unbound key", lambda: self.type(b"z")),         # (not j or x: mode keys now)
             ("click in the pane", lambda: self.type(b"\x1b[<0;10;5M\x1b[<0;10;5m")),
             ("focus out", lambda: self.type(b"\x1b[O")),
             ("focus in", lambda: self.type(b"\x1b[I")),
@@ -410,6 +420,217 @@ class Keys(unittest.TestCase):
         self.type(b"H")
         self.wait(lambda: self.t("list-windows", "-t", "stash", "-F", "#{window_id}", check=False).split(), [a5, s2])
         self.assertEqual(self.t("list-windows", "-t", "main", "-F", "#{window_id}").split(), [home, a3, s4])
+
+    # -- x closes the selection after a y/n ------------------------------
+    def drawn(self):
+        """What the client has drawn so far, escapes stripped."""
+        return ANSI.sub(b"", bytes(self.screen)).decode("utf-8", "replace")
+
+    def menu(self, text):
+        """Type x and wait for the box asking `text`."""
+        self.screen.clear()
+        self.type(b"x")
+        deadline = time.time() + 5
+        while text not in self.drawn() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertIn(text, self.drawn())
+        time.sleep(0.2)
+
+    def history(self):
+        f = Path(self.tmp, "state", "tmux-closed-tabs", "history.jsonl")
+        import json
+        return [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
+
+    def windows(self, sess="main"):
+        return self.t("list-windows", "-t", sess, "-F", "#{window_id}").split()
+
+    def toasts(self):
+        """Route notify.sh into a file; returns a reader of its lines."""
+        log = Path(self.tmp, "toasts")
+        log.touch()
+        sh = Path(self.tmp, "notify-rec.sh")
+        sh.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log}"\n')
+        sh.chmod(0o755)
+        self.t("set-environment", "-g", "NOTIFY_SH", str(sh))
+        return lambda: log.read_text().splitlines()
+
+    def test_x_prompt_names_tabs_agents_and_the_home(self):
+        home, (a3, a5), (s2, s4) = self.sidebar_space()
+        self.t("set", "-w", "-t", a3, "@agent_state", "running")
+        self.t("set", "-w", "-t", a5, "@agent_state", "needs-input")
+        prompt = lambda: self.script("sel-kill-prompt", home).strip()
+        self.script("sel-start", "here", home)
+        for _ in range(3):
+            self.script("sel-move", "right", home)              # home, a3, a5, s2
+        self.assertEqual(prompt(), "close 3 tabs (2 agents, 1 working, 1 needs input)? · home stays")
+        self.script("sel-start", "here", s2)
+        self.assertEqual(prompt(), "close 1 tab?")
+        self.t("set", "-w", "-t", a5, "@agent_state", "idle")
+        self.script("sel-start", "here", a5)
+        self.script("sel-move", "left", a5)                     # a3 (running), a5 (idle)
+        self.assertEqual(prompt(), "close 2 tabs (2 agents, 1 working)?")
+        # Working the way the sidebar counts it (model::in_flight): running,
+        # or a workflow / cua flag on any agent state.
+        self.t("set", "-w", "-t", a3, "@agent_state", "idle")
+        self.t("set", "-w", "-t", a3, "@agent_workflow", "1")
+        self.t("set", "-w", "-t", a5, "@agent_cua", "1")
+        self.assertEqual(prompt(), "close 2 tabs (2 agents, 2 working)?")
+        self.t("set", "-w", "-t", a5, "@agent_state", "needs-input")   # waiting on you wins
+        self.assertEqual(prompt(), "close 2 tabs (2 agents, 1 working, 1 needs input)?")
+        self.t("set", "-uw", "-t", a3, "@agent_workflow")
+        self.t("set", "-uw", "-t", a5, "@agent_cua")
+        self.t("set", "-w", "-t", a3, "@agent_state", "running")
+        self.t("set", "-w", "-t", a5, "@agent_state", "idle")
+        # Typed, the box asks exactly that, and names its one yes.
+        self.t("select-window", "-t", a3)
+        self.script("sel-cancel")
+        self.start_on(a3)
+        self.type(b"l")
+        self.wait(lambda: sorted(self.selected()), sorted([a3, a5]))
+        self.menu("close 2 tabs (2 agents, 1 working)?")
+        self.assertIn("⇧Y close 2 tabs", self.drawn())
+        self.type(b"q")
+
+    def test_x_then_anything_but_Y_keeps_the_selection_live(self):
+        self.t("select-window", "-t", "main:2")
+        self.start_on(self.wins[1])
+        self.type(b"l")
+        self.wait(lambda: len(self.selected()), 2)
+        picked = sorted(self.selected())
+        out = self.recorder(self.wins[1])
+        for no in (b"y", b"n", b"\x1b", b"q", b"\r", b"k", b"G", b"\t", b"\x1b[A"):
+            self.menu("close 2 tabs?")
+            self.type(no, 0.1)
+            # The box goes. (The client's first lone Esc takes ~1 s here:
+            # tmux holds it while this fake terminal leaves its queries
+            # unanswered; later ones are immediate.)
+            self.wait(lambda: "close 2 tabs" in self.box(), False, timeout=4)
+            self.assertEqual(sorted(self.selected()), picked, no)
+            self.assertEqual(self.root_bound(), KEYS, no)
+            self.assertEqual(self.table(), "stash", no)
+            self.assertEqual(self.windows(), self.wins, no)
+        self.assertEqual(self.history(), [])
+        self.assertEqual(self.read(out), b"")                   # and none of it reached the pane
+        self.type(b"l")                                         # and the mode goes on
+        self.wait(lambda: len(self.selected()), 3)
+
+    def box(self):
+        """The client's screen as tmux draws it now (the popup included)."""
+        self.screen.clear()
+        self.t("refresh-client", "-t", self.client)
+        time.sleep(0.4)
+        return self.drawn()
+
+    def test_ordinary_typing_never_closes_tabs(self):
+        # The review's catch: knocked out of the table (a click, a focus
+        # change, a stray key), the root twin of x still opens the box, and
+        # "proxy" typed at speed answered it with y. Then "xkcd⏎" and "xG⏎"
+        # walked a menu's highlight onto Close and picked it.
+        # A ⏎ that gets past the box lands on the mode's own ⏎ (the root
+        # twin: park), as it would with no x typed at all; so "nothing
+        # closed" is: no closed-tabs row and every window still alive,
+        # parked or not.
+        alive = lambda: sorted(w for w in self.t("list-windows", "-a", "-F", "#{window_id}").split()
+                               if w in self.wins)
+        typings = [(b"prox", g, b"y") for g in (0.08, 0.12, 0.16, 0.2, 0.3)]
+        typings += [(b"x", 0.15, rest) for rest in (b"kcd\r", b"G\r", b"\t\r", b"jj\r", b"\x1b[A\r")]
+        for head, gap, tail in typings:
+            what = (head, gap, tail)
+            self.t("select-window", "-t", self.wins[1])
+            self.start_on(self.wins[1])
+            self.type(b"l")
+            self.wait(lambda: len(self.selected()), 2)
+            self.type(b"z", 0.3)                                # knocked out of the stash table
+            self.wait(self.table, "root")
+            out = self.recorder(self.wins[1])
+            self.type(head, gap)
+            for c in tail:
+                self.type(bytes([c]), 0.15)
+            time.sleep(1.5)
+            self.assertEqual(self.history(), [], what)
+            self.assertEqual(alive(), sorted(self.wins), what)
+            got = self.read(out)
+            self.assertNotIn(b"x", got, what)                   # x was the mode's,
+            self.assertNotIn(b"y", got, what)                   # and y never reaches the pane
+            self.t("display-popup", "-C", "-c", self.client, check=False)   # a box still waiting, if any
+            self.script("sel-cancel")
+            self.wait(self.root_bound, [])
+            for w in self.wins:                                 # anything the ⏎ parked comes back
+                if w not in self.windows():
+                    self.t("move-window", "-s", w, "-t", "main:")
+            self.t("select-window", "-t", self.wins[0])
+        # Y, and only Y, closes.
+        self.t("select-window", "-t", self.wins[1])
+        self.start_on(self.wins[1])
+        self.type(b"l")
+        self.wait(lambda: len(self.selected()), 2)
+        doomed = self.selected()
+        self.type(b"z", 0.3)
+        self.menu("close 2 tabs?")
+        self.type(b"Y")
+        self.wait(lambda: sorted(self.windows()), sorted(set(self.wins) - set(doomed)), timeout=10)
+        self.wait(lambda: len(self.history()), 2, timeout=10)
+
+    def test_the_toast_counts_only_tabs_that_really_closed(self):
+        toasts = self.toasts()
+        keep = self.t("display", "-p", "-t", self.wins[2], "#{pane_id}")
+        closer = Path(self.tmp, "fake-closer.sh")             # closes every pane but one
+        closer.write_text(f'#!/bin/sh\n[ "$2" = "{keep}" ] || tmux kill-pane -t "$2"\n')
+        closer.chmod(0o755)
+        self.t("set-environment", "-g", "CLOSED_TABS_SH", str(closer))
+        self.t("select-window", "-t", self.wins[1])
+        self.start_on(self.wins[1])
+        self.type(b"l")
+        self.wait(lambda: len(self.selected()), 2)
+        self.menu("close 2 tabs?")
+        self.type(b"Y")
+        self.wait(lambda: any(" closed " in l for l in toasts()), True, timeout=10)
+        self.assertEqual([l.split(" -- ", 1)[1] for l in toasts() if " closed " in l],
+                         ["closed 1 of 2 tabs · ⌘Z reopens"])
+        self.assertEqual(self.windows(), [self.wins[0], self.wins[2], self.wins[3]])
+
+    def test_x_then_yes_closes_them_through_closed_tabs(self):
+        home, (a3, a5), (s2, s4) = self.sidebar_space()
+        self.t("select-window", "-t", home)
+        self.t("select-window", "-t", a3)                       # last visited: home
+        self.start_on(a3)
+        self.type(b"l")                                         # a3, a5
+        self.wait(lambda: sorted(self.selected()), sorted([a3, a5]))
+        self.menu("close 2 tabs (2 agents)?")
+        self.type(b"Y")
+        self.wait(self.windows, [home, s2, s4], timeout=10)
+        self.wait(lambda: len(self.history()), 2, timeout=10)
+        self.assertEqual([r["session"] for r in self.history()], ["main", "main"])
+        self.assertEqual(self.selected(), [])
+        self.assertEqual(self.root_bound(), [])
+        self.assertEqual(self.t("show", "-gqv", "@stash_anchor"), "")
+        self.assertEqual(self.table(), "root")
+        # The client was on a3: it lands where a lone close would, home.
+        self.assertEqual(self.t("list-clients", "-F", "#{session_name} #{window_id}"), f"main {home}")
+        # And keys are the pane's again: x types x.
+        out = self.recorder(home)
+        self.type(b"xl", 0.3)
+        self.assertEqual(self.read(out), b"xl")
+
+    def test_x_skips_the_home(self):
+        home, (a3, a5), (s2, s4) = self.sidebar_space()
+        toasts = self.toasts()
+        self.t("select-window", "-t", home)
+        self.start_on(home)
+        # Only the home: nothing to ask, the selection stays.
+        self.type(b"x", 0.5)
+        self.wait(lambda: any("home is never closed" in l for l in toasts()), True)
+        self.assertEqual(self.selected(), [home])
+        self.assertEqual(self.table(), "stash")
+        # Home and a3: a3 closes, home stays, and both the box and the toast say so.
+        self.type(b"l")
+        self.wait(lambda: sorted(self.selected()), sorted([home, a3]))
+        self.menu("close 1 tab (1 agent)? · home stays")
+        self.type(b"Y")
+        self.wait(self.windows, [home, s2, s4, a5], timeout=10)
+        self.wait(lambda: len(self.history()), 1, timeout=10)
+        self.wait(lambda: any(l.endswith("closed 1 tab · home stays · ⌘Z reopens") for l in toasts()), True)
+        self.assertEqual(self.selected(), [])
 
     # -- prefix v toggles ------------------------------------------------
     def test_prefix_v_toggles(self):

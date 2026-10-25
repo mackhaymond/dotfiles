@@ -1075,9 +1075,23 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   between anchor and cursor in it; the park and the move take the tabs in
   that order too. tests/sidebar.rs `selection_walks_the_sidebars_order`
   checks it against a rendered frame. The panel's first row reads
-  ` N selected  j/k extend · ⏎ park · m move · esc cancel` (as many keys as
-  fit). stash.sh posts the focus notice after sel-start,
-  sel-move, sel-cancel and the park, so it shows at once. Those keys hold
+  ` N selected  j/k extend · ⏎ park · m move · x close · esc cancel` (as
+  many keys as fit). x closes the selected tabs once confirmed: a small
+  popup says what is at stake, e.g. `close 3 tabs (2 agents, 1 working,
+  1 needs input)? · home stays` (working counted as this sidebar does,
+  `model::in_flight`; a needs-input agent counts as that, not both), over
+  `⇧Y close 3 tabs · any other key cancels`, and reads one key. ⇧Y closes
+  each tab through closed-tabs.sh (CMD+Z reopens it) and ends the
+  selection; every other key, y, ⏎, Esc and q included, cancels, is
+  swallowed, and leaves the selection live. Not a y/n menu: x's root twin
+  is live during a selection, so "proxy" typed at speed answered one with
+  y, and a menu's k / G / Tab walk onto Close before a ⏎. The done toast
+  counts the tabs whose windows are really gone (`closed 2 of 3 tabs`
+  otherwise). A space's home is never closed: it is skipped, and a
+  selection of only the home just says so (stash.sh `sel-kill`,
+  `sel-kill-ask`, `sel-kill-go`). stash.sh posts the focus notice
+  after sel-start, sel-move, sel-cancel, the park and the close, so it
+  shows at once. Those keys hold
   for as long as a window of the client's session carries `@stash_sel`,
   even after a click, a focus change (into this sidebar and back) or a
   stray key has dropped the client out of the `stash` table: root twins of
