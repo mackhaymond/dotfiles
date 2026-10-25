@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""ai-exec: a drop-in for `codex exec` that falls back codex -> claude -> copilot.
+
+    ai-exec [--search] [exec] <codex exec args...> [PROMPT | -]
+
+Codex runs with the arguments verbatim (`codex [--search] exec ...`). When it
+fails (nonzero exit, -o file missing/empty, or --output-schema output that
+isn't JSON), the same task is translated for `claude -p`, then `copilot`.
+Exit 0 if any backend succeeded, else the last nonzero code.
+
+ai-exec-only flags (never passed to codex):
+  --claude-model M     default $AI_EXEC_CLAUDE_MODEL or sonnet
+  --copilot-model M    default $AI_EXEC_COPILOT_MODEL or auto
+Env: AI_EXEC_{CODEX,CLAUDE,COPILOT}_BIN override the binaries;
+     AI_EXEC_ORDER (default codex,claude,copilot) picks/orders backends.
+
+Codex's usage-limit message is remembered in ~/.cache/ai-exec/
+codex-limited-until (epoch secs) and codex is skipped until then. Fallbacks
+are logged to ~/.local/state/ai-exec/log. SIGTERM/SIGINT/SIGHUP kill the
+running backend's process group and exit; nothing further is tried.
+
+Fallback children run with CUA_NOTCH_IGNORE=1 in the -C dir. With -s
+workspace-write, claude runs in its OS sandbox (Bash writes confined to the
+work dir, edits auto-accepted only there) and copilot with --sandbox.
+"""
+
+import json
+import os
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+
+HOME = os.path.expanduser("~")
+MEMO = os.path.join(HOME, ".cache/ai-exec/codex-limited-until")
+LOG = os.path.join(HOME, ".local/state/ai-exec/log")
+EXTRA_PATH = [os.path.join(HOME, ".local/bin"), os.path.join(HOME, ".bun/bin"),
+              "/opt/homebrew/bin"]
+
+# codex exec options that take a value (anything else is treated as boolean).
+VALUE_FLAGS = {"-c", "--config", "--enable", "--disable", "-m", "--model",
+               "--local-provider", "-p", "--profile", "-s", "--sandbox",
+               "-C", "--cd", "--add-dir", "--thread-source",
+               "--cyber-access-program", "--output-schema", "--color",
+               "-o", "--output-last-message"}
+MULTI_FLAGS = {"-i", "--image"}
+# `codex exec <sub>` subcommands the fallbacks can't reproduce.
+SUBCOMMANDS = {"resume", "review", "help"}
+
+CLAUDE_EFFORT = {"none": "low", "minimal": "low", "low": "low",
+                 "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"}
+
+current = None          # the running child Popen, for the signal handler
+
+
+def warn(msg):
+    sys.stderr.write("ai-exec: %s\n" % msg)
+    sys.stderr.flush()
+
+
+def log(msg):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as fh:
+            fh.write("%s cwd=%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                         os.getcwd(), msg))
+    except OSError:
+        pass
+
+
+# --- arguments -----------------------------------------------------------------
+
+class Args:
+    def __init__(self):
+        self.search = False
+        self.codex_args = []        # passed to `codex exec` verbatim
+        self.prompt = None          # positional prompt ('-' = stdin)
+        self.model = None
+        self.effort = None
+        self.sandbox = "read-only"
+        self.cd = None
+        self.out = None
+        self.schema = None
+        self.json = False
+        self.images = []
+        self.add_dirs = []
+        self.subcommand = None
+        self.claude_model = os.environ.get("AI_EXEC_CLAUDE_MODEL") or "sonnet"
+        self.copilot_model = os.environ.get("AI_EXEC_COPILOT_MODEL") or "auto"
+
+
+def unquote(v):
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        v = v[1:-1]
+    return v
+
+
+def parse(argv):
+    a = Args()
+    positionals = []
+    saw_exec = False
+    i = 0
+    rest_positional = False
+    while i < len(argv):
+        tok = argv[i]
+        i += 1
+        if rest_positional:
+            positionals.append(tok)
+            a.codex_args.append(tok)
+            continue
+        if tok == "--":
+            rest_positional = True
+            a.codex_args.append(tok)
+            continue
+        if tok in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        if tok == "--search":
+            a.search = True
+            continue
+        if tok == "exec" and not saw_exec and not positionals:
+            saw_exec = True
+            continue
+        name, eq, inline = tok.partition("=") if tok.startswith("--") else (tok, "", "")
+        if name in ("--claude-model", "--copilot-model"):
+            val = inline if eq else (argv[i] if i < len(argv) else "")
+            if not eq:
+                i += 1
+            setattr(a, name[2:].replace("-", "_"), val)
+            continue
+        if name in MULTI_FLAGS:
+            a.codex_args.append(tok)
+            if eq:
+                a.images.append(inline)
+            while i < len(argv) and not argv[i].startswith("-"):
+                a.images.append(argv[i])
+                a.codex_args.append(argv[i])
+                i += 1
+            continue
+        if name in VALUE_FLAGS:
+            a.codex_args.append(tok)
+            if eq:
+                val = inline
+            elif i < len(argv):
+                val = argv[i]
+                a.codex_args.append(val)
+                i += 1
+            else:
+                val = ""
+            apply_value(a, name, val)
+            continue
+        if tok == "--json":
+            a.json = True
+        elif tok == "--dangerously-bypass-approvals-and-sandbox":
+            a.sandbox = "danger-full-access"
+        a.codex_args.append(tok)
+        if tok == "-" or not tok.startswith("-"):
+            if not positionals and tok in SUBCOMMANDS:
+                a.subcommand = tok
+            positionals.append(tok)
+    # Last positional: robust to an unknown flag having eaten a value slot.
+    if positionals and not a.subcommand:
+        a.prompt = positionals[-1]
+    return a
+
+
+def apply_value(a, name, val):
+    if name in ("-m", "--model"):
+        a.model = val
+    elif name in ("-s", "--sandbox"):
+        a.sandbox = val
+    elif name in ("-C", "--cd"):
+        a.cd = val
+    elif name in ("-o", "--output-last-message"):
+        a.out = val
+    elif name == "--output-schema":
+        a.schema = val
+    elif name == "--add-dir":
+        a.add_dirs.append(val)
+    elif name in ("-c", "--config"):
+        key, _, v = val.partition("=")
+        key = key.strip()
+        if key == "model_reasoning_effort":
+            a.effort = unquote(v)
+        elif key == "sandbox_mode":
+            a.sandbox = unquote(v)
+
+
+def read_prompt(a):
+    """Returns (stdin_bytes or None, fallback prompt text)."""
+    data = None
+    try:
+        mode = os.fstat(0).st_mode
+        piped = stat.S_ISFIFO(mode) or stat.S_ISREG(mode)
+        tty = os.isatty(0)
+    except OSError:
+        piped, tty = False, True
+    if a.prompt in (None, "-"):
+        if a.prompt == "-" or not tty:
+            data = sys.stdin.buffer.read()
+        text = (data or b"").decode("utf-8", "replace")
+    else:
+        text = a.prompt
+        if piped:       # codex appends piped stdin as a <stdin> block
+            data = sys.stdin.buffer.read()
+            if data:
+                text += "\n\n<stdin>\n%s\n</stdin>" % data.decode("utf-8", "replace")
+    return data, text
+
+
+# --- running a child -----------------------------------------------------------
+
+def find_bin(name):
+    override = os.environ.get("AI_EXEC_%s_BIN" % name.upper())
+    if override:
+        return override if os.path.exists(override) or shutil.which(override) else None
+    path = os.pathsep.join([os.environ.get("PATH", "")] + EXTRA_PATH)
+    return shutil.which(name, path=path)
+
+
+def run(argv, cwd, env, stdin_data, on_stdout_line=None):
+    """Run argv in its own process group; stderr streams through.
+    Returns (rc, stdout_text, stderr_tail)."""
+    global current
+    try:
+        proc = subprocess.Popen(argv, cwd=cwd, env=env,
+                                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True, close_fds=False)
+    except OSError as e:
+        return 127, "", str(e)
+    current = proc
+    out_chunks, err_tail = [], [b""]
+
+    def pump_out():
+        for line in iter(proc.stdout.readline, b""):
+            out_chunks.append(line)
+            if on_stdout_line:
+                on_stdout_line(line)
+
+    def pump_err():
+        while True:
+            chunk = os.read(proc.stderr.fileno(), 65536)
+            if not chunk:
+                break
+            try:
+                sys.stderr.buffer.write(chunk)
+                sys.stderr.flush()
+            except (OSError, ValueError):
+                pass
+            err_tail[0] = (err_tail[0] + chunk)[-65536:]
+
+    def feed():
+        try:
+            proc.stdin.write(stdin_data)
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    threads = [threading.Thread(target=pump_out), threading.Thread(target=pump_err)]
+    if stdin_data is not None:
+        threads.append(threading.Thread(target=feed))
+    for t in threads:
+        t.daemon = True
+        t.start()
+    rc = proc.wait()
+    for t in threads:
+        t.join(5)
+    current = None
+    return (rc, b"".join(out_chunks).decode("utf-8", "replace"),
+            err_tail[0].decode("utf-8", "replace"))
+
+
+def on_signal(signum, _frame):
+    """The caller is enforcing a timeout or cancelling: take the backend down
+    with us and stop. Never fall through to the next backend."""
+    proc = current
+    if proc is not None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            deadline = time.time() + 2
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.05)
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    log("killed by signal %d" % signum)
+    os._exit(128 + signum)
+
+
+# --- output helpers ------------------------------------------------------------
+
+def strip_fences(text):
+    t = text.strip()
+    m = re.match(r"^```[A-Za-z0-9_-]*\s*\n(.*?)\n?```\s*$", t, re.S)
+    return m.group(1).strip() if m else t
+
+
+def extract_json(text):
+    """The first JSON object/array in text (fences stripped), or None."""
+    t = strip_fences(text)
+    try:
+        return json.loads(t)
+    except ValueError:
+        pass
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"[\[{]", t):
+        try:
+            return dec.raw_decode(t[m.start():])[0]
+        except ValueError:
+            continue
+    return None
+
+
+def fits_schema(value, schema):
+    """Light check: top-level type and required keys. Not a full validator."""
+    if value is None:
+        return False
+    want = schema.get("type") if isinstance(schema, dict) else None
+    if want == "object":
+        if not isinstance(value, dict):
+            return False
+        return all(k in value for k in schema.get("required", []))
+    if want == "array":
+        return isinstance(value, list)
+    return True
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def stat_key(path):
+    try:
+        st = os.stat(path)
+        return (st.st_ino, st.st_size, st.st_mtime_ns)
+    except OSError:
+        return None
+
+
+# --- codex usage-limit memo ----------------------------------------------------
+
+def memo_until():
+    try:
+        with open(MEMO) as fh:
+            return float(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0.0
+
+
+def remember_limit(text):
+    until = time.time() + 3600
+    m = re.search(r"try again at ([A-Za-z]{3})[a-z]* (\d{1,2})(?:st|nd|rd|th)?,? (\d{4}),? "
+                  r"(\d{1,2}):(\d{2})\s*([AaPp][Mm])?", text)
+    if m:
+        try:
+            mon, day, year, hh, mm, ampm = m.groups()
+            hh = int(hh)
+            if ampm:
+                hh = hh % 12 + (12 if ampm.lower() == "pm" else 0)
+            st = time.strptime("%s %s %s %d %s" % (mon.title(), day, year, hh, mm), "%b %d %Y %H %M")
+            parsed = time.mktime(st)
+            if parsed > time.time():
+                until = parsed
+        except (ValueError, OverflowError):
+            pass
+    try:
+        os.makedirs(os.path.dirname(MEMO), exist_ok=True)
+        with open(MEMO, "w") as fh:
+            fh.write("%d\n" % until)
+    except OSError:
+        pass
+    return until
+
+
+# --- backends ------------------------------------------------------------------
+# Each returns (ok, rc, final_text, reason). Fallbacks emit their own output on
+# success; codex's output has already gone out (or is flushed here).
+
+def try_codex(binary, a, ctx):
+    argv = [binary] + (["--search"] if a.search else []) + ["exec"] + a.codex_args
+    held = []
+
+    def passthrough(line):
+        # Stream codex's JSONL live, but hold back failure events: if we fall
+        # back, callers should see the fallback's events, not codex's error.
+        if not a.json:
+            return
+        try:
+            typ = json.loads(line).get("type")
+        except (ValueError, AttributeError):
+            typ = None
+        if typ in ("error", "turn.failed"):
+            held.append(line)
+        else:
+            sys.stdout.buffer.write(line)
+            sys.stdout.flush()
+
+    before = stat_key(ctx["out"]) if ctx["out"] else None
+    rc, out, err = run(argv, None, os.environ.copy(), ctx["stdin"], passthrough)
+    blob = out + "\n" + err
+    if rc != 0 and re.search(r"usage limit", blob, re.I):
+        until = remember_limit(blob)
+        return False, rc, None, "usage limit until %s" % time.strftime("%b %d %H:%M", time.localtime(until))
+    if rc != 0:
+        return False, rc, None, "exit %d%s" % (rc, last_line(err))
+    final = None
+    if ctx["out"]:
+        after = stat_key(ctx["out"])
+        if after is None or after[1] == 0 or after == before:
+            return False, 1, None, "output file missing/empty"
+        with open(ctx["out"], errors="replace") as fh:
+            final = fh.read()
+    elif a.json:
+        for line in out.splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            item = ev.get("item") or {}
+            if ev.get("type") == "item.completed" and item.get("type") == "agent_message":
+                final = item.get("text")
+    else:
+        final = out
+    if ctx["schema"] is not None and extract_json(final or "") is None:
+        return False, 1, None, "output is not valid JSON"
+    if a.json:
+        for line in held:       # codex succeeded: its non-fatal errors are its own business
+            sys.stdout.buffer.write(line)
+    else:
+        sys.stdout.write(out)
+    sys.stdout.flush()
+    return True, 0, final, ""
+
+
+def last_line(err):
+    lines = [l.strip() for l in err.splitlines() if l.strip()]
+    return (": " + lines[-1][:160]) if lines else ""
+
+
+def fallback_env():
+    env = os.environ.copy()
+    env["CUA_NOTCH_IGNORE"] = "1"
+    return env
+
+
+def try_claude(binary, a, ctx):
+    write = ctx["write"]
+    tools = ["Read", "Grep", "Glob"]
+    allow = ["Read(//**)"]
+    if write:
+        tools = ["Bash", "Read", "Write", "Edit", "Grep", "Glob"]
+    if a.search:
+        tools += ["WebSearch", "WebFetch"]
+        allow += ["WebSearch", "WebFetch"]
+    settings = {"permissions": {"allow": allow}}
+    if write:
+        # Claude Code's OS sandbox: Bash writes are confined to the working
+        # dirs, unsandboxed retries are refused, edits outside are denied
+        # (--permission-prompts none: nobody can approve them).
+        settings["sandbox"] = {"enabled": True, "autoAllowBashIfSandboxed": True,
+                               "allowUnsandboxedCommands": False}
+    argv = [binary, "-p", "--model", a.claude_model, "--no-session-persistence",
+            "--setting-sources", "", "--strict-mcp-config",
+            "--permission-prompts", "none", "--output-format", "json",
+            "--settings", json.dumps(settings)]
+    if a.effort in CLAUDE_EFFORT:
+        argv += ["--effort", CLAUDE_EFFORT[a.effort]]
+    if write:
+        argv += ["--permission-mode", "acceptEdits", "--add-dir", ctx["cwd"]]
+    for d in ctx["dirs"]:
+        argv += ["--add-dir", d]
+    if ctx["schema"] is not None:
+        argv += ["--json-schema", json.dumps(ctx["schema"])]
+    argv += ["--tools", ",".join(tools)]      # variadic: keep it last; prompt is on stdin
+    prompt = ctx["prompt"]
+    if ctx["images"]:
+        prompt = ("Attached images — read each with the Read tool: %s\n\n"
+                  % ", ".join(ctx["images"])) + prompt
+    dot_claude = os.path.join(ctx["cwd"], ".claude")
+    had_dot_claude = os.path.exists(dot_claude)
+    rc, out, err = run(argv, ctx["cwd"], fallback_env(), prompt.encode("utf-8"))
+    if not had_dot_claude:      # claude leaves an empty .claude/.cc-writes behind
+        for d in (os.path.join(dot_claude, ".cc-writes"), dot_claude):
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+    res = {}
+    for candidate in (out.strip(), (out.strip().splitlines() or [""])[-1]):
+        try:
+            res = json.loads(candidate)
+            break
+        except ValueError:
+            continue
+    if not isinstance(res, dict):
+        res = {}
+    if rc != 0 or not res or res.get("is_error") or res.get("subtype") != "success":
+        why = res.get("result") or res.get("subtype") or last_line(err).lstrip(": ")
+        return False, rc or 1, None, "exit %d%s" % (rc, (": " + str(why)[:160]) if why else "")
+    final = res.get("result") or ""
+    if ctx["schema"] is not None:
+        value = res.get("structured_output")
+        if value is None:
+            value = extract_json(final)
+        if not fits_schema(value, ctx["schema"]):
+            return False, 1, None, "output is not valid JSON for the schema"
+        final = json.dumps(value)
+    if not final.strip():
+        return False, 1, None, "empty answer"
+    return True, 0, final, ""
+
+
+def try_copilot(binary, a, ctx):
+    argv = [binary, "-s", "--no-color", "--no-custom-instructions",
+            "--disable-builtin-mcps", "--no-ask-user", "--model", a.copilot_model]
+    if a.effort and a.copilot_model != "auto":     # auto rejects --reasoning-effort
+        argv += ["--reasoning-effort", a.effort]
+    if ctx["write"]:
+        argv += ["--allow-all-tools", "--sandbox", "--add-dir", ctx["cwd"]]
+    else:
+        # Reads anywhere (like codex read-only); no shell, no file writes.
+        argv += ["--allow-all-tools", "--allow-all-paths",
+                 "--deny-tool", "shell", "--deny-tool", "write"]
+        if not a.search:
+            argv += ["--deny-tool", "url"]
+    if a.search:
+        argv += ["--allow-all-urls"]
+    for d in ctx["dirs"]:
+        argv += ["--add-dir", d]
+    for img in ctx["images"]:
+        argv += ["--attachment", img]
+    prompt = ctx["prompt"]
+    if ctx["schema"] is not None:
+        prompt += ("\n\nRespond with ONLY a JSON value (no prose, no code fences) "
+                   "that validates against this JSON Schema:\n%s" % json.dumps(ctx["schema"]))
+    # The prompt goes on stdin: copilot reads a piped prompt, and argv can't
+    # carry a ~400k-char one.
+    rc, out, err = run(argv, ctx["cwd"], fallback_env(), prompt.encode("utf-8"))
+    if rc != 0:
+        return False, rc, None, "exit %d%s" % (rc, last_line(err))
+    final = out.strip()
+    if ctx["schema"] is not None:
+        value = extract_json(final)
+        if not fits_schema(value, ctx["schema"]):
+            return False, 1, None, "output is not valid JSON for the schema"
+        final = json.dumps(value)
+    if not final:
+        return False, 1, None, "empty answer"
+    return True, 0, final, ""
+
+
+BACKENDS = {"codex": try_codex, "claude": try_claude, "copilot": try_copilot}
+
+
+# --- main ----------------------------------------------------------------------
+
+def main(argv):
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, on_signal)
+    a = parse(argv)
+    stdin_data, prompt = read_prompt(a)
+
+    base = os.getcwd()
+    absp = lambda p: os.path.abspath(os.path.join(base, os.path.expanduser(p)))
+    cwd = absp(a.cd) if a.cd else base
+    schema = None
+    if a.schema:
+        try:
+            with open(absp(a.schema)) as fh:
+                schema = json.load(fh)
+        except (OSError, ValueError) as e:
+            warn("can't read --output-schema %s: %s (fallbacks run without it)" % (a.schema, e))
+            schema = {}
+    images = [absp(p) for p in a.images]
+    ctx = {"stdin": stdin_data, "prompt": prompt, "cwd": cwd,
+           "out": absp(a.out) if a.out else None, "schema": schema,
+           "write": a.sandbox != "read-only", "images": images,
+           "dirs": sorted({os.path.dirname(p) for p in images} | {absp(d) for d in a.add_dirs})}
+
+    order = [b.strip() for b in os.environ.get("AI_EXEC_ORDER", "codex,claude,copilot").split(",")
+             if b.strip() in BACKENDS]
+    if a.subcommand:        # `exec resume/review`: codex only
+        order = [b for b in order if b == "codex"]
+    attempts = [(name, find_bin(name)) for name in order]
+    attempts = [(n, b) for n, b in attempts if b]
+
+    rc, failed = 1, []
+    for idx, (name, binary) in enumerate(attempts):
+        nxt = attempts[idx + 1][0] if idx + 1 < len(attempts) else None
+        if name == "codex" and memo_until() > time.time():
+            reason = "usage limit until %s" % time.strftime("%b %d %H:%M", time.localtime(memo_until()))
+            failed.append("codex skipped (%s)" % reason)
+            if nxt:
+                warn("codex skipped (%s); trying %s" % (reason, nxt))
+            continue
+        if name != "codex" and not prompt.strip():
+            failed.append("%s skipped (no prompt)" % name)
+            continue
+        if name != "codex" and not os.path.isdir(cwd):
+            failed.append("%s skipped (no such dir %s)" % (name, cwd))
+            continue
+        ok, code, final, reason = BACKENDS[name](binary, a, ctx)
+        if ok:
+            if name != "codex":
+                if ctx["out"]:
+                    with open(ctx["out"], "w") as fh:
+                        fh.write(final)
+                if a.json:
+                    emit({"type": "thread.started", "thread_id": "ai-exec-%s-%d" % (name, os.getpid())})
+                    emit({"type": "turn.started"})
+                    emit({"type": "item.completed",
+                          "item": {"id": "item_0", "type": "agent_message", "text": final}})
+                    emit({"type": "turn.completed",
+                          "usage": {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}})
+                else:
+                    sys.stdout.write(final if final.endswith("\n") else final + "\n")
+                    sys.stdout.flush()
+            if failed:
+                log("%s; %s succeeded" % ("; ".join(failed), name))
+            return 0
+        rc = code or 1
+        failed.append("%s failed (%s)" % (name, reason))
+        if nxt:
+            warn("%s failed (%s); trying %s" % (name, reason, nxt))
+            log("%s failed (%s); trying %s" % (name, reason, nxt))
+
+    msg = "; ".join(failed) or "no backend available (order: %s)" % ",".join(order)
+    warn("all backends failed: %s" % msg)
+    log("all backends failed: %s" % msg)
+    if a.json:
+        emit({"type": "error", "message": "ai-exec: " + msg})
+        emit({"type": "turn.failed", "error": {"message": "ai-exec: " + msg}})
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
