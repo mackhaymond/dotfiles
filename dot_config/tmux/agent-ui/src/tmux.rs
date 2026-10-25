@@ -229,13 +229,16 @@ impl Tmux {
 /// (space.sh `ask-claude`, docs/spaces.md "Pending spaces"): `pending_space`
 /// (`@pending_space`, the space number N its claude holds), `pending_request`
 /// (`@pending_request`, the words typed into the picker) and `pending_color`
-/// (`@pending_color`, the colour space N will have).
-pub const FIELDS: [&str; 40] = [
+/// (`@pending_color`, the colour space N will have), and `ask_bg`
+/// (`@agent_ask_bg`: agent-tab-indicator.sh's ASKS WHILE WORK IS OUT, a
+/// needs-input raised by a turn that ended asking while its background work
+/// is still out).
+pub const FIELDS: [&str; 41] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
     "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home", "space_index",
     "space_hidden", "space_color", "stash_sel", "pane_flags", "rollout", "paused", "pinned", "session_id",
-    "pin_key", "pending_space", "pending_request", "pending_color",
+    "pin_key", "pending_space", "pending_request", "pending_color", "ask_bg",
 ];
 
 /// The pane option space.sh sets (to 1) on a space home's dashboard pane
@@ -257,7 +260,7 @@ pub const PANE_FLAGS: &str =
 
 /// The tmux format of each FIELDS entry, in order. (`#{pane_current_path}`
 /// is printed by [`path_format`], dashboard-aware.)
-pub const FORMATS: [&str; 40] = [
+pub const FORMATS: [&str; 41] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
@@ -265,7 +268,7 @@ pub const FORMATS: [&str; 40] = [
     "#{@stash_origin}", "#{@agent_slot}", "#{@agent_pending}", "#{@agent_key}", "#{@agent_mru_cur}",
     "#{@agent_mru_prev}", "#{@space_home}", "#{@space_index}", "#{@space_hidden}", "#{@space_color}", "#{@stash_sel}",
     PANE_FLAGS, "#{@agent_rollout}", "#{@agent_paused}", "#{@agent_pinned}", "#{@agent_session_id}",
-    "#{@pin_key}", "#{@pending_space}", "#{@pending_request}", "#{@pending_color}",
+    "#{@pin_key}", "#{@pending_space}", "#{@pending_request}", "#{@pending_color}", "#{@agent_ask_bg}",
 ];
 
 /// Ends each path in the dashboard case of [`path_format`] (a private-use
@@ -396,7 +399,7 @@ pub fn fmt() -> String {
 /// the GLOBAL options the sidebar's status block shows in place of the
 /// hidden status line (usage, the stale-save mark, the open-sidebar count).
 /// Starts with an empty field and has 9 + [`STATUS_FORMATS`] fields where a
-/// window row has [`FIELDS`]' 40, so the two parsers can never take each other's rows.
+/// window row has [`FIELDS`]' 41, so the two parsers can never take each other's rows.
 pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
@@ -629,6 +632,12 @@ pub struct Window {
     pub pending_request: String,
     /// `@pending_color`: the `#rrggbb` space N will have, trimmed.
     pub pending_color: String,
+    /// `@agent_ask_bg`, trimmed ("" = unset): `1` on a needs-input that a
+    /// turn raised by ending with a question while its background work is
+    /// still out (agent-tab-indicator.sh, ASKS WHILE WORK IS OUT). A second
+    /// word, when a writer knows it, is how much of that work is out
+    /// ([`crate::model::ask_bg_count`]).
+    pub ask_bg: String,
 }
 
 fn digits(s: &str) -> bool {
@@ -716,6 +725,7 @@ impl Window {
             pending_space: parse_slot(p[37].trim()),
             pending_request: p[38].into(),
             pending_color: p[39].trim().into(),
+            ask_bg: p[40].trim().into(),
             label: label.into(),
             session,
         })
@@ -1075,17 +1085,29 @@ pub(crate) mod tests {
         assert_eq!((w.session.as_str(), w.label.as_str()), ("日本", "🫠 x\tz"));
     }
 
-    /// A row from an older format (37 fields, before the pending space's
-    /// options; 34, before `pinned`, `session_id` and `pin_key`) or one with
-    /// a field too many is no window: never misread by position.
+    /// A row from an older format (40 fields, before `ask_bg`; 37, before
+    /// the pending space's options; 34, before `pinned`, `session_id` and
+    /// `pin_key`) or one with a field too many is no window: never misread
+    /// by position.
     #[test]
     fn rows_of_the_wrong_length_are_rejected() {
-        assert_eq!(FIELDS.len(), 40);
-        for n in [34, 36, 37, 38, 39, 41] {
+        assert_eq!(FIELDS.len(), 41);
+        for n in [34, 36, 37, 38, 39, 40, 42] {
             assert!(Window::parse(&vec!["x"; n].join("\x1f")).is_none(), "{n}");
         }
-        assert!(Window::parse(&vec!["x"; 40].join("\x1f")).is_some());
+        assert!(Window::parse(&vec!["x"; 41].join("\x1f")).is_some());
         assert_ne!(FIELDS.len(), CLIENT_FIELDS);
+    }
+
+    /// `@agent_ask_bg` rides last, guarded like the other user options, and
+    /// is read trimmed.
+    #[test]
+    fn ask_bg_is_the_last_field() {
+        assert_eq!((FIELDS[40], FORMATS[40]), ("ask_bg", "#{@agent_ask_bg}"));
+        let w = Window::parse(&row("main", 1, "@1", &[("state", "needs-input"), ("ask_bg", " 1 ")])).unwrap();
+        assert_eq!(w.ask_bg, "1");
+        let w = Window::parse(&row("main", 1, "@1", &[("state", "needs-input")])).unwrap();
+        assert_eq!(w.ask_bg, "");
     }
 
     /// A pending space's options: only a window of the `pending` session
@@ -1153,9 +1175,9 @@ pub(crate) mod tests {
         assert!(fmt().contains(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{PANE_FLAGS}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f", guarded("#{@space_index}"),
             guarded("#{@space_hidden}"), guarded("#{@space_color}"), guarded("#{@stash_sel}"), guarded("#{@agent_rollout}"),
             guarded("#{@agent_paused}"), guarded("#{@agent_pinned}"), guarded("#{@agent_session_id}"), guarded("#{@pin_key}"))));
-        // Then a pending space's options, last.
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}", guarded("#{@pending_space}"), guarded("#{@pending_request}"),
-            guarded("#{@pending_color}"))));
+        // Then a pending space's options, and the raised ask's flag last.
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}", guarded("#{@pending_space}"), guarded("#{@pending_request}"),
+            guarded("#{@pending_color}"), guarded("#{@agent_ask_bg}"))));
         let s = Snapshot::parse(&row("main", 1, "@1", &[("rollout", "/x/rollout-1.jsonl")]));
         assert_eq!(s.windows[0].rollout, "/x/rollout-1.jsonl");
         let s = Snapshot::parse(&row("main", 1, "@1", &[("space_color", " #f9e2af "), ("stash_sel", "1")]));

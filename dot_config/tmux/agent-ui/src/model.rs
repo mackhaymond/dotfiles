@@ -113,6 +113,25 @@ pub fn is_attn(w: &Window) -> bool {
     matches!(w.state.as_str(), "failed" | "needs-input") || (w.state == "done" && w.workflow.is_empty())
 }
 
+/// How much background work a raised ask (`@agent_ask_bg`, agent-tab-
+/// indicator.sh's ASKS WHILE WORK IS OUT) says is out: its second word, when
+/// a writer knew it (`1 3`); None for the plain `1` the hook writes today,
+/// and for junk.
+pub fn ask_bg_count(raw: &str) -> Option<u32> {
+    let mut it = raw.split_whitespace();
+    it.next()?;
+    it.next().and_then(|n| n.parse::<u32>().ok()).filter(|&n| n > 0)
+}
+
+/// A NEEDS YOU agent's background tail, after its state word: ` · ⚙ N`
+/// (` · ⚙` when the count is unknown). For a needs-input agent whose work
+/// is still out: a raised ask (`ask_bg`), or a gate standing while a
+/// workflow runs (`workflow`). None otherwise.
+pub fn bg_tail(cat: Option<Cat>, ask_bg: bool, workflow: bool, count: Option<u32>) -> Option<String> {
+    (cat == Some(Cat::NeedsInput) && (ask_bg || workflow))
+        .then(|| count.map_or_else(|| format!(" · {STRIP_GEAR}"), |n| format!(" · {STRIP_GEAR} {n}")))
+}
+
 /// agent-roster.py `in_flight`: running, or a workflow / cua flag set.
 pub fn in_flight(w: &Window) -> bool {
     w.state == "running" || !w.workflow.is_empty() || !w.cua.is_empty()
@@ -448,6 +467,47 @@ mod tests {
     use super::*;
     use crate::tmux::tests::row;
     use crate::tmux::Window;
+
+    /// ASKS WHILE WORK IS OUT: an agent waiting on Mack lands in NEEDS YOU
+    /// (and its count, and its colour) whatever still runs beside it - a
+    /// workflow, a cua session, a raised ask's background work.
+    #[test]
+    fn needs_input_and_failed_win_over_in_flight() {
+        let w = |state: &str, set: &[(&str, &str)]| {
+            let mut v = vec![("state", state)];
+            v.extend_from_slice(set);
+            Window::parse(&row("main", 1, "@1", &v)).unwrap()
+        };
+        for flags in [&[("workflow", "1")][..], &[("cua", "1")], &[("workflow", "1"), ("ask_bg", "1")]] {
+            let ask = w("needs-input", flags);
+            assert!(in_flight(&ask), "{flags:?}: the repro needs an in-flight agent");
+            assert_eq!(cat(&ask), Some(Cat::NeedsInput), "{flags:?}");
+            assert_eq!((rank(&ask), dot_color(&ask, true, false)), (1, Some("yellow")), "{flags:?}");
+            let fail = w("failed", flags);
+            assert_eq!(cat(&fail), Some(Cat::Failed), "{flags:?}");
+        }
+        // Still: running with a gear is working, done with one is not queued.
+        assert_eq!(cat(&w("running", &[("workflow", "1")])), Some(Cat::Working));
+        assert_eq!(cat(&w("done", &[("workflow", "1")])), Some(Cat::Working));
+        let c = Counts::of([&w("needs-input", &[("workflow", "1"), ("ask_bg", "1")])]);
+        assert_eq!(c.nonzero(), vec![(Cat::NeedsInput, 1)]);
+    }
+
+    #[test]
+    fn ask_bg_count_and_the_needs_you_tail() {
+        assert_eq!(ask_bg_count("1"), None);
+        assert_eq!(ask_bg_count("1 3"), Some(3));
+        for junk in ["", "1 x", "1 0", "1 -2", " "] {
+            assert_eq!(ask_bg_count(junk), None, "{junk:?}");
+        }
+        let ask = Some(Cat::NeedsInput);
+        assert_eq!(bg_tail(ask, true, false, None).as_deref(), Some(" · ⚙"));
+        assert_eq!(bg_tail(ask, true, true, Some(3)).as_deref(), Some(" · ⚙ 3"));
+        assert_eq!(bg_tail(ask, false, true, None).as_deref(), Some(" · ⚙"));
+        assert_eq!(bg_tail(ask, false, false, Some(3)), None);
+        assert_eq!(bg_tail(Some(Cat::Failed), true, true, None), None);
+        assert_eq!(bg_tail(Some(Cat::Working), true, true, None), None);
+    }
 
     fn win(session: &str, index: u32, id: &str, state: &str, since: Option<&str>, workflow: &str) -> Window {
         let mut set = vec![("state", state), ("workflow", workflow)];

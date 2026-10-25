@@ -955,7 +955,13 @@ fn marks(bar: &Bar) -> Vec<Seg> {
 fn hint_row(n: usize, w: usize) -> Row {
     let chip = block(format!(" {n} selected "), "crust", "mauve");
     let room = w.saturating_sub(2 + dwidth(&chip.text));
-    let keys = ["j/k extend · ⏎ park · m move · esc cancel", "j/k · ⏎ park · m move · esc", "j/k ⏎ park esc", "j/k ⏎ esc"]
+    let keys = [
+        "j/k extend · ⏎ park · m move · x close · esc cancel",
+        "j/k · ⏎ park · m move · x close · esc",
+        "j/k ⏎ park x close esc",
+        "j/k ⏎ park esc",
+        "j/k ⏎ esc",
+    ]
         .into_iter()
         .find(|k| dwidth(k) < room)
         .unwrap_or("");
@@ -2008,6 +2014,12 @@ fn recent_done(a: &Agent, now: f64) -> bool {
 /// finished turn), `⏸ paused` (violet: never done-green, whatever its last
 /// turn said); idle says nothing ([`Word::idle`]). None for a plain shell.
 fn state_word(a: &Agent, cx: Cx) -> Option<Word> {
+    // Asking or failed wins over in flight (a workflow or cua flag): such an
+    // agent waits on Mack, as model::cat files it (NEEDS YOU), whatever
+    // still runs beside it.
+    if let Some(c @ (Cat::NeedsInput | Cat::Failed)) = a.cat {
+        return Some(cat_word(a, c));
+    }
     if a.in_flight || a.cat == Some(Cat::Working) {
         return Some(Word { glyph: SPIN[cx.spin % SPIN.len()], word: "working", hue: "blue" });
     }
@@ -3064,8 +3076,11 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
     let rail = || seg(RAIL_HEAVY, hue);
     let age = Some(age_of(a, cx)).filter(|g| cx.ages() && !g.is_empty()).map(|g| seg(format!(" {g}"), dim(true)));
     let lead = cx.b.lead();
+    // An ask standing while its background work is still out reads
+    // `◉ asks · ⚙ N` (model::bg_tail): it asks, and the work goes on.
+    let tail = crate::model::bg_tail(a.cat, a.ask_bg, a.workflow, a.bg_count).unwrap_or_default();
     let state = |full: bool| match &word {
-        Some(x) if full => bold(format!("{} {}", x.glyph, x.word), hue),
+        Some(x) if full => bold(format!("{} {}{tail}", x.glyph, x.word), hue),
         _ => bold(a.glyph, hue),
     };
     // The richest right side that leaves the title room (its whole, or 10

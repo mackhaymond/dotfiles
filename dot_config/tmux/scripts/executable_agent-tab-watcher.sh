@@ -942,6 +942,7 @@ declare -A W_BORN=() # @agent_born (BIRTH GRACE)
 declare -A W_PRIOR=() # @agent_prior_state (AGENT-ORIGINATED TURNS)
 declare -A W_QUIET=() # @agent_quiet: a quiet restore's one-shot log mark
 declare -A W_PAUSED=() # @agent_paused: agent-pause.py's flag (docs/agent-pause.md)
+declare -A W_ASKBG=()  # @agent_ask_bg: the indicator's ASKS WHILE WORK IS OUT raise
 wins=()
 
 # AGENT-ORIGINATED TURNS (agent-tab-indicator.sh, same heading; the doc's
@@ -963,7 +964,8 @@ wins=()
 # describes the restored state.
 ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_prior_since
              @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
-             @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused)
+             @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused
+             @agent_turn_start)
 # prior_restore WIN WAC: one read of the saved fields, one write. Sets
 # r_state (the state written) and r_since; returns 1 when nothing was
 # written: the write failed, or the prior is gone since the tick's read (the
@@ -1000,6 +1002,7 @@ prior_restore() {
     c+=" ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_prior_state"
     c+=" ; set-option -uw -t $win @agent_prior_since ; set-option -uw -t $win @agent_prior_detail_kind"
     c+=" ; set-option -uw -t $win @agent_prior_detail ; set-option -uw -t $win @agent_bg_owner"
+    c+=" ; set-option -uw -t $win @agent_ask_bg"   # it only ever describes a needs-input
     [ "$seen" = 1 ] && c+=" ; set-option -w -t $win @agent_seen_at $tick_now"
     c+=" ; set-option -w -t $win @agent_quiet ${ofrom:--}"
     cas_write "$win" "#{&&:#{==:#{@agent_state},$was},#{!=:#{@agent_prior_state},}}" "$c" || return 1
@@ -1556,7 +1559,7 @@ EOF
     # newline continues on its own line) can never be taken for a window.
     # @agent_prior_state (AGENT-ORIGINATED TURNS) is a bare state token, so it
     # rides with the digit fields, ahead of all free text.
-    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{@agent_prior_state}${US}#{@agent_quiet}${US}#{@agent_paused}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
+    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{@agent_prior_state}${US}#{@agent_quiet}${US}#{@agent_paused}${US}#{@agent_ask_bg}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
@@ -1580,9 +1583,9 @@ EOF
     # exits, exactly like any other window.
     W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_SUM=(); W_DET=()
     W_DK=(); W_DTXT=(); W_SESS=(); W_IDX=(); W_NAME=(); W_AK=()
-    W_PEND=(); W_BORN=(); W_PRIOR=(); W_QUIET=(); W_PAUSED=(); S_SLOT=(); S_VIS=(); S_ELIG=()
+    W_PEND=(); W_BORN=(); W_PRIOR=(); W_QUIET=(); W_PAUSED=(); W_ASKBG=(); S_SLOT=(); S_VIS=(); S_ELIG=()
     wins=()
-    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind slot pend born prior quiet paused sess widx wname dtxt summary; do
+    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind slot pend born prior quiet paused askbg sess widx wname dtxt summary; do
         case "$win" in @*) ;; *) continue ;; esac
         case "$tty" in /dev/?*) ;; *) continue ;; esac
         if [ -z "${W_SEEN[$win]+x}" ]; then
@@ -1590,6 +1593,7 @@ EOF
             wins+=("$win")
             if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${akind}${dkind}${born}${prior}${paused}${summary}" ]; then
                 W_PRIOR[$win]="$prior"; W_QUIET[$win]="$quiet"; W_PAUSED[$win]="$paused"
+                W_ASKBG[$win]="$askbg"
                 W_STATE[$win]="$state"; W_WAC[$win]="$wac"; W_SINCE[$win]="$since"
                 W_WF[$win]="$wf_opt"; W_CUA[$win]="$cua_opt"; W_ROLL[$win]="$roll"
                 W_SUM[$win]="$summary"; W_DET[$win]="${akind}${dkind}"; W_AK[$win]="$akind"
@@ -1704,11 +1708,30 @@ EOF
         case "$state" in
             done|needs-input)
                 if viewed_now "$wac"; then
-                    if [ "$state" = needs-input ]; then
+                    # A raised ask's shown line is kept as seen (copied
+                    # tmux-side) only while the detail still IS the ask
+                    # (kind `ask`, as the tick read it).
+                    aseen=""
+                    [ -n "${W_ASKBG[$win]:-}" ] && [ "${W_DK[$win]:-}" = ask ] \
+                        && aseen="set-option -w -t $win -F @agent_ask_seen '#{@agent_detail}' ; "
+                    if [ "$state" = needs-input ] && [ -n "${W_ASKBG[$win]:-}" ] && [ -n "${W_WF[$win]:-}" ]; then
+                        # ASKS WHILE WORK IS OUT (the indicator's section;
+                        # clear-current's twin): a raised ask, seen while
+                        # its work is still out (@agent_workflow), goes back
+                        # to the `running` it was held at - seen_at and
+                        # since on one epoch, the detail kind no longer
+                        # `ask`, the shown line kept as @agent_ask_seen
+                        # (copied tmux-side, before anything else moves).
+                        cas_write "$win" "#{&&:#{==:#{@agent_state},needs-input},#{!=:#{@agent_ask_bg},}}" \
+                            "${aseen}set-option -w -t $win @agent_state running ; set-option -w -t $win @agent_since '$tick_now running' ; set-option -w -t $win @agent_seen_at $tick_now ; set-option -uw -t $win @agent_detail_kind ; set-option -uw -t $win @agent_ask_bg ; set-option -uw -t $win @agent_ask_from" \
+                            && [ "$state" = running ] && { changed=1; state_moved=1; }
+                    elif [ "$state" = needs-input ]; then
                         # @agent_ask_from (the indicator's ASKER GATE) goes
-                        # with the needs-input it described, as in set_state.
+                        # with the needs-input it described, as in set_state;
+                        # so does @agent_ask_bg, whose line (if it was one)
+                        # is seen now (aseen, above).
                         cas_write "$win" "#{==:#{@agent_state},needs-input}" \
-                            "set-option -w -t $win @agent_state idle ; set-option -w -t $win @agent_pending $tick_now ; set-option -w -t $win @agent_seen_at $tick_now ; set-option -uw -t $win @agent_ask_from" \
+                            "${aseen}set-option -w -t $win @agent_state idle ; set-option -w -t $win @agent_pending $tick_now ; set-option -w -t $win @agent_seen_at $tick_now ; set-option -uw -t $win @agent_ask_from ; set-option -uw -t $win @agent_ask_bg" \
                             && [ "$state" = idle ] && { changed=1; state_moved=1; }
                     else
                         cas_write "$win" "#{==:#{@agent_state},done}" \
@@ -1764,7 +1787,11 @@ EOF
             # BACKGROUND TASKS HOLD A TAB RUNNING).
             # Asked whatever wf says: a stale gear (the lib's verdict after a
             # crash and resume) must not stop a real task from holding.
-            if [ "$state" = running ] && [ -n "$pid" ] \
+            # Also asked for a raised ask (ASKS WHILE WORK IS OUT: needs-input
+            # + @agent_ask_bg), so its gear - which a look reads as "the work
+            # is still out" - stays true for a background task too.
+            if { [ "$state" = running ] || { [ "$state" = needs-input ] && [ -n "${W_ASKBG[$win]:-}" ]; }; } \
+               && [ -n "$pid" ] \
                && [ "${PID_KIND[$pid]:-}" != codex ] \
                && [ "${PID_KIND[$pid]:-}" != opencode ]; then
                 st=""
@@ -1918,7 +1945,7 @@ EOF
                     # that just landed keeps its yellow, since and pending.
                     cas_was="$state"
                     cas_write "$win" "#{==:#{@agent_state},$cas_was}" \
-                        "set-option -w -t $win @agent_state paused ; set-option -w -t $win @agent_since '$tick_now paused' ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_bg_owner ; if-shell -F -t $win '#{?#{@agent_paused},0,1}' 'set-option -w -t $win @agent_state idle'" \
+                        "set-option -w -t $win @agent_state paused ; set-option -w -t $win @agent_since '$tick_now paused' ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_bg_owner ; set-option -uw -t $win @agent_ask_bg ; if-shell -F -t $win '#{?#{@agent_paused},0,1}' 'set-option -w -t $win @agent_state idle'" \
                         && [ "$state" != "$cas_was" ] && { changed=1; state_moved=1; }
                     fin="$state"
                 elif [ -n "${W_PRIOR[$win]:-}" ]; then
@@ -1935,7 +1962,7 @@ EOF
                     # looking at is not tinted.
                     cx_seen=0
                     [ "$fin" = done ] && viewed_now "$wac" && { fin=idle; cx_seen=1; }
-                    cx_cmd="set-option -w -t $win @agent_state $fin ; set-option -w -t $win @agent_since '$tick_now $fin' ; set-option -uw -t $win @agent_pending"
+                    cx_cmd="set-option -w -t $win @agent_state $fin ; set-option -w -t $win @agent_since '$tick_now $fin' ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_ask_bg"
                     [ "$cx_seen" = 1 ] && cx_cmd+=" ; set-option -w -t $win @agent_seen_at $tick_now"
                     if [ "$cx_mark" = complete ]; then
                         cx_cmd+=" ; set-option -w -t $win @agent_detail_kind done ; set-option -w -t $win @agent_detail 'turn finished'"
@@ -2002,6 +2029,8 @@ EOF
                      set-option -uw -t "$win" @agent_detail \; \
                      set-option -uw -t "$win" @agent_born \; \
                      set-option -uw -t "$win" @agent_ask_from \; \
+                     set-option -uw -t "$win" @agent_ask_bg \; \
+                     set-option -uw -t "$win" @agent_ask_seen \; \
                      set-option -uw -t "$win" @agent_held_detail 2>/dev/null
                 # The agent-origin bookkeeping goes with the session (one
                 # call), as clear_state drops it.

@@ -264,6 +264,19 @@ class PauseKey(Harness):
         self.assertIn("1 working window had no agent pane", entry["message"])
         self.assertEqual(self.stub.deleted, 1)          # MCP session closed
 
+    def test_an_asking_agent_is_not_working_whatever_runs_beside_it(self):
+        # ASKS WHILE WORK IS OUT: a turn that ended asking Mack while its
+        # background work is still out is needs-input with the gear lit
+        # (@agent_workflow, @agent_ask_bg). It waits on Mack: pause must
+        # not message it, gear or no gear - nor one driving cua.
+        asked = self.window("needs-input", workflow="1")
+        self.t("set", "-w", "-t", asked, "@agent_ask_bg", "1")
+        self.window("needs-input", cua="Safari")
+        entry = self.press()
+        self.assertIn("no agents are working", entry["message"])
+        self.assertIsNone(self.state())
+        self.assertEqual(self.stub.methods, [])
+
     def test_zero_working_writes_nothing_and_contacts_nobody(self):
         self.window("idle")
         self.window("done")

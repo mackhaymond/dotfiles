@@ -383,6 +383,12 @@ def agent_records():
 # ------------------------------------------------------------- scanning
 
 def working_reasons(row):
+    # An agent waiting on Mack is never WORKING, whatever runs beside it: a
+    # turn that ended asking while its background work is still out
+    # (agent-tab-indicator.sh, ASKS WHILE WORK IS OUT) is needs-input with
+    # @agent_workflow lit, and a pause message would land on its question.
+    if row["agent_state"] == "needs-input":
+        return []
     why = []
     if row["agent_state"] == "running":
         why.append("running")

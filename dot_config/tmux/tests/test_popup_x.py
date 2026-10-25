@@ -86,11 +86,12 @@ class ConfigShape(unittest.TestCase):
                 self.assertNotRegex(text, r"\(-x C -y C", path.name)
         self.assertEqual(seen, {"codexbar-usage-key.sh", "executable_agent-roster.py", "executable_closed-tabs.sh",
                                 "executable_space.sh", "executable_stash.sh", "executable_toggle-btop-popup.sh"})
-        # Each popup line in them passes it (space.sh builds its menu's argv).
-        for name, n in (("executable_closed-tabs.sh", 1), ("executable_stash.sh", 2),
+        # Each popup call in them passes it (space.sh builds its menu's argv);
+        # a call may continue over `\`-ended lines (stash.sh's sel-kill box).
+        for name, n in (("executable_closed-tabs.sh", 1), ("executable_stash.sh", 3),
                         ("executable_toggle-btop-popup.sh", 2)):
             text = (SCRIPTS / name).read_text()
-            calls = re.findall(r"tmux display-popup[^\n]*", text)
+            calls = re.findall(r"tmux display-popup(?:[^\n]*\\\n)*[^\n]*", text)
             self.assertEqual(len(calls), n, name)
             self.assertTrue(all(re.search(r'-x "\$(POPUP_X|popup_x)"', c) for c in calls), calls)
         self.assertIn('args+=(-x "$POPUP_X" -y C --)', (SCRIPTS / "executable_space.sh").read_text())

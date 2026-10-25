@@ -1985,8 +1985,10 @@ fn the_stash_selection_fills_rows_and_shows_its_keys() {
     let hint = find(&f, " selected ");
     assert!(t[hint].contains(" 2 selected  j/k ⏎ park esc"), "{:?}", t[hint]);
     assert!(f.rows[hint].segs.iter().any(|s| *s == block(" 2 selected ", "crust", "mauve")));
-    let f = layout(&v, 60, 40, &with_bar(bar));
-    assert!(texts(&f).iter().any(|l| l.contains(" 2 selected  j/k extend · ⏎ park · m move · esc cancel")));
+    let f = layout(&v, 60, 40, &with_bar(bar.clone()));
+    assert!(texts(&f).iter().any(|l| l.contains(" 2 selected  j/k · ⏎ park · m move · x close · esc")));
+    let f = layout(&v, 70, 40, &with_bar(bar));
+    assert!(texts(&f).iter().any(|l| l.contains(" 2 selected  j/k extend · ⏎ park · m move · x close · esc cancel")));
     // No selection: no hint.
     assert!(!texts(&layout(&v, 34, 40, &with_bar(demo_bar()))).iter().any(|l| l.contains("selected")));
 }
@@ -2666,6 +2668,31 @@ fn an_asking_agent_never_shows_a_blurb() {
     let t = texts(&f);
     let r = f.agents.start + agents_part(&f).iter().position(|l| l.contains("Ask")).unwrap();
     assert!(t[r + 1].contains("Which deck should I use?") && !t.iter().any(|l| l.contains("stale tool")), "{t:#?}");
+}
+
+/// ASKS WHILE WORK IS OUT: an agent whose turn ended asking while its
+/// background work is still out sits in NEEDS YOU as `◉ asks · ⚙` (with the
+/// count, `⚙ 3`, when one is known), and its AGENTS card says it asks, not
+/// that it works, though it is in flight (a workflow flag). A gate with no
+/// work out keeps its plain word.
+#[test]
+fn an_ask_with_work_out_says_asks_and_the_gear() {
+    for (ask_bg, want) in [("1", "◉ asks · ⚙ "), ("1 3", "◉ asks · ⚙ 3")] {
+        let v = view(vec![a("main", 1, "needs-input", "Ask").with("workflow", "1").with("ask_bg", ask_bg)
+            .with("detail_kind", "ask").with("detail", "pick A or B"), a("main", 2, "idle", "Calm")], None);
+        assert!(v.needs[0].agent.ask_bg && v.needs[0].agent.in_flight);
+        assert_eq!(v.needs[0].agent.bg_count, crate::model::ask_bg_count(ask_bg));
+        let f = layout(&v, 44, 40, &Opts::default());
+        let t = texts(&f);
+        let need = t[f.needs.clone()].iter().find(|l| l.contains("Ask")).unwrap_or_else(|| panic!("{t:#?}"));
+        assert!(need.contains(want), "{ask_bg:?} {need:?}");
+        let card = agents_part(&f).into_iter().find(|l| l.contains("Ask")).unwrap();
+        assert!(card.contains("◉ asks") && !card.contains("working"), "{card:?}");
+    }
+    let v = view(vec![a("main", 1, "needs-input", "Gate").with("detail_kind", "ask").with("detail", "which?")], None);
+    let f = layout(&v, 44, 40, &Opts::default());
+    let need = texts(&f)[f.needs.clone()].iter().find(|l| l.contains("Gate")).unwrap().clone();
+    assert!(need.contains("◉ asks") && !need.contains('⚙'), "{need:?}");
 }
 
 /// The client's space keeps its chip and its counts when its name is long:

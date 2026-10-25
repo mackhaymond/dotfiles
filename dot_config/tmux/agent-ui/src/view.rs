@@ -231,6 +231,11 @@ pub struct Agent {
     pub kind_glyph: Option<&'static str>,
     pub workflow: bool,
     pub cua: bool,
+    /// `@agent_ask_bg` is set: a needs-input raised by a turn that ended
+    /// asking while its background work is still out; `bg_count`, how much
+    /// of it, when known ([`model::ask_bg_count`]).
+    pub ask_bg: bool,
+    pub bg_count: Option<u32>,
     /// The side flag (workflow ⚙ / cua ◎) and its colour, pulse applied.
     pub flag: Option<(Flag, &'static str)>,
     pub attention: bool,
@@ -345,6 +350,8 @@ impl Agent {
             kind_glyph: model::kind_glyph(&w.kind),
             workflow: !w.workflow.is_empty(),
             cua: !w.cua.is_empty(),
+            ask_bg: !w.ask_bg.is_empty(),
+            bg_count: model::ask_bg_count(&w.ask_bg),
             flag: model::flag(w, blink),
             attention: model::is_attn(w),
             in_flight: model::in_flight(w),
@@ -397,7 +404,7 @@ impl Agent {
             ("detail_kind", &self.detail_kind), ("detail_word", self.detail_word), ("detail", &self.detail),
             ("since", self.since), ("age", &self.age), ("state_words", self.state_words),
             ("kind", &self.kind), ("kind_glyph", self.kind_glyph), ("workflow", self.workflow),
-            ("cua", self.cua),
+            ("cua", self.cua), ("ask_bg", self.ask_bg), ("bg_count", self.bg_count),
             ("flag", self.flag.map(|(f, c)| obj![
                 ("kind", match f { Flag::Workflow => "workflow", Flag::Cua => "cua" }),
                 ("glyph", match f { Flag::Workflow => model::STRIP_GEAR, Flag::Cua => model::STRIP_MOUSE }),

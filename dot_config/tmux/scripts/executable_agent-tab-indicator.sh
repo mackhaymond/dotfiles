@@ -46,6 +46,13 @@
 #                   gate standing (ASKER GATE, see heartbeat and done).
 #                   Unset while needs-input = no asker: the old rule, any
 #                   tool call re-arms.
+#   @agent_ask_bg   "1": this needs-input is a turn that ENDED asking Mack
+#                   while its background work is still out (ASKS WHILE WORK
+#                   IS OUT, in done). Written with that needs-input (asker
+#                   "main", detail kind ask), unset by every write that
+#                   leaves needs-input (set_state, clear_state, the
+#                   watcher's discharge and GC). A look while the work is
+#                   still out discharges it to running, not idle.
 #   @agent_kind    claude | codex | opencode — which agent's hooks drive this
 #                   window; written with any state/detail write a hook makes
 #   @agent_detail_kind  perm | ask | fail | done | run — what the last event
@@ -300,13 +307,24 @@ owner_resolve() {
     # `valid` re-derives the token from that frontend's pid+start, socket and
     # pane and checks the process is still alive on that pane's tty, so a
     # stale condenser cannot vouch for a window another session now owns.
-    [ "$mode" = condense-locked ] && [ -n "${AGENT_TAB_OWNER_RECORD:-}" ] || return 1
+    # (The detached ask run, ask-bg, is the same kind of tmux-server child.)
+    case "$mode" in condense-locked|ask-bg) ;; *) return 1 ;; esac
+    [ -n "${AGENT_TAB_OWNER_RECORD:-}" ] || return 1
     "$HOME/.local/bin/codex-terminal-owner" valid "$AGENT_TAB_OWNER_SESSION" "$AGENT_TAB_OWNER_TOKEN" \
         <<<"$AGENT_TAB_OWNER_RECORD" >/dev/null 2>&1
 }
 # Shared with CuaNotch's cua-notch-agent-hook: the one implementation of "is
 # background work from this session still out?". See its header.
 BG_PENDING="$HOME/.local/bin/agent-bg-pending"
+# ...and of "does the turn that just ended ask Mack for something?" (cua-notch
+# 547f0e7; its header has the contract). See ASKS WHILE WORK IS OUT in done.
+TURN_ASKS="$HOME/.local/bin/agent-turn-asks"
+# The Stop hook's synchronous --marker-only call: SIGTERMed past this (s).
+ASK_SYNC_BUDGET=0.3
+# The detached full run's own bound (s), SIGTERM too (never SIGKILL: the
+# decider kills its copilot group on TERM and exits 2). Above its own 20 s
+# model timeout plus the 3 s lock wait, so normally it ends itself.
+ASK_BG_TIMEOUT="${AGENT_TAB_ASK_BG_TIMEOUT:-30}"
 
 # Watchdog for the companion daemon. agent-tab-watcher.sh is spawned exactly
 # once, from tmux.conf, so if it ever dies mid-session (stray pkill, OOM, a
@@ -589,6 +607,22 @@ window_state() {
     tmux show-options -wqv -t "$1" @agent_state 2>/dev/null || true
 }
 
+# Is the user actually LOOKING at the agent's window? $watched is its
+# #{window_active_clients}, read by the caller (the hook body, the ask-bg
+# worker). A watched window in a WezTerm that is behind Slack is not being
+# seen, and until 2026-08-25 `done` skipped its tint on the watched test
+# alone - the one case where a finish could be missed with no colour ever
+# shown. Now both: the window is active for a client AND WezTerm is
+# frontmost. Two lsappinfo forks, ~11ms, and only on the events that would
+# tint. Mack's ask: a yellow or green that lands while he is sitting on that
+# tab with WezTerm focused clears at once.
+watched=0
+viewing_now() {
+    [ "$watched" -gt 0 ] || return 1
+    [ "$(lsappinfo info -only bundleid "$(lsappinfo front 2>/dev/null)" 2>/dev/null)" = \
+      '"CFBundleIdentifier"="com.github.wez.wezterm"' ]
+}
+
 
 set_state() {
     # Write + redraw only on change; heartbeat fires on every tool call and
@@ -660,7 +694,10 @@ set_state() {
         # Leaving needs-input answers its gate: who asked goes with it, in
         # the same command (ASKER GATE, heartbeat). One place, so every way
         # out (a prompt, a discharge, Stop, a failure, a restore) drops it.
-        [ "$cur" != needs-input ] || cmd+=(\; set-option -uw -t "$win" @agent_ask_from)
+        # So does @agent_ask_bg (ASKS WHILE WORK IS OUT): it only ever
+        # describes the needs-input it was raised with.
+        [ "$cur" != needs-input ] || cmd+=(\; set-option -uw -t "$win" @agent_ask_from \;
+                                          set-option -uw -t "$win" @agent_ask_bg)
     fi
     if [ "$dk" = - ]; then
         cmd+=(${cmd[0]+\;} set-option -uw -t "$win" @agent_detail_kind \;
@@ -751,6 +788,8 @@ clear_state() {
          set-option -uw -t "$win" @agent_detail \; \
          set-option -uw -t "$win" @agent_born \; \
          set-option -uw -t "$win" @agent_ask_from \; \
+         set-option -uw -t "$win" @agent_ask_bg \; \
+         set-option -uw -t "$win" @agent_ask_seen \; \
          set-option -uw -t "$win" @agent_held_detail 2>/dev/null || true
     # AGENT-ORIGINATED TURNS: the session is gone, and so is every turn,
     # message and flag that belonged to it (one call).
@@ -838,9 +877,15 @@ held_detail_take() {
 #                       that would write done or idle, or a quiet restore,
 #                       writes @agent_state `paused` and @agent_turn_result
 #                       "<id> paused". Dropped with the session.
+#   @agent_turn_start   "<epoch>": when the last REAL prompt (not a harness
+#                       wake-up, TURN_JQ's "sys") started a turn. The --since
+#                       of ASKS WHILE WORK IS OUT: an agent-needs-you marker
+#                       older than it belongs to an earlier turn, and one
+#                       written in a woken turn after it still counts.
 ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_prior_since
              @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
-             @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused)
+             @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused
+             @agent_turn_start)
 PRIOR_OPTS=(@agent_prior_state @agent_prior_since @agent_prior_detail_kind @agent_prior_detail)
 INBOUND_TTL=180
 US=$'\x1f'
@@ -866,9 +911,14 @@ origin_read() {
     O_ORIGIN=""; O_STATE=""; O_SINCE=""; O_DK=""; O_PSTATE=""; O_PSINCE=""; O_PDK=""
     O_INB=""; O_SEEN=""; O_DT=""; O_PDT=""; O_FORUSER=""; O_RESULT=""; O_BGOWN=""; O_PAUSED=""
     O_OKIND=""; O_OTID=""; O_OFROM=""
-    out=$(tmux display-message -p -t "$1" "x${US}#{@agent_turn_origin}${US}#{@agent_state}${US}#{@agent_since}${US}#{@agent_detail_kind}${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_result}${US}#{@agent_bg_owner}${US}#{@agent_paused}${US}#{@agent_inbound}${US}#{@agent_inbound_seen}${US}#{@agent_detail}${US}#{@agent_prior_detail}${US}#{@agent_for_user}" 2>/dev/null || true)
+    # ASKS WHILE WORK IS OUT's two ride along: @agent_turn_start (digits)
+    # with the bare tokens, @agent_ask_seen (a sanitized line) with the
+    # details.
+    O_TSTART=""; O_ASKSEEN=""
+    out=$(tmux display-message -p -t "$1" "x${US}#{@agent_turn_origin}${US}#{@agent_state}${US}#{@agent_since}${US}#{@agent_detail_kind}${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_result}${US}#{@agent_bg_owner}${US}#{@agent_paused}${US}#{@agent_turn_start}${US}#{@agent_inbound}${US}#{@agent_inbound_seen}${US}#{@agent_detail}${US}#{@agent_prior_detail}${US}#{@agent_ask_seen}${US}#{@agent_for_user}" 2>/dev/null || true)
     case "$out" in "x$US"*) ;; *) return 0 ;; esac
-    IFS="$US" read -r x O_ORIGIN O_STATE O_SINCE O_DK O_PSTATE O_PSINCE O_PDK O_RESULT O_BGOWN O_PAUSED O_INB O_SEEN O_DT O_PDT O_FORUSER <<<"$out" || true
+    IFS="$US" read -r x O_ORIGIN O_STATE O_SINCE O_DK O_PSTATE O_PSINCE O_PDK O_RESULT O_BGOWN O_PAUSED O_TSTART O_INB O_SEEN O_DT O_PDT O_ASKSEEN O_FORUSER <<<"$out" || true
+    case "$O_TSTART" in *[!0-9]*) O_TSTART="" ;; esac
     case "$O_BGOWN" in user|agent) ;; *) O_BGOWN="" ;; esac
     O_OKIND=""; O_OTID=""; O_OFROM=""
     read -r O_OKIND O_OTID O_OFROM _ <<<"$O_ORIGIN" || true
@@ -1098,6 +1148,104 @@ reason_detail() {
     printf '%s' "$r" | "$JQ" -Rr "$DETAIL_JQ"'clean' 2>/dev/null | head -n 1 || true
 }
 
+# ------------------------------------------------- asks while work is out
+#
+# ASKS WHILE WORK IS OUT (2026-10-22; docs/agent-tab-indicator.md, same
+# heading). A Stop with background work still out stays `running` (see done),
+# so a turn that ended ASKING Mack something hid behind the spinner. At such
+# a Stop the one decider both surfaces share, agent-turn-asks, is asked:
+#   - synchronously, `--marker-only --since @agent_turn_start`, SIGTERMed at
+#     ASK_SYNC_BUDGET (300 ms): the agent's own `agent-needs-you` marker;
+#   - else, for a loud turn, ONE detached full run (its model backstop),
+#     whose yes lands only while the window is still `running` with the same
+#     turn bookkeeping (@agent_turn_origin|@agent_turn_result) this Stop
+#     wrote - a new prompt or a woken turn in between discards it.
+# A yes RAISES: needs-input, @agent_detail_kind ask, @agent_detail the line,
+# @agent_ask_from main (so only the main agent's own next tool call re-arms
+# it, never a background subagent's), @agent_ask_bg 1. Unless Mack is
+# looking (the Stop stays running, stamped seen) or the line is the one he
+# already saw (@agent_ask_seen, below): then nothing ask-related is written.
+#   A LOOK (clear-current, the watcher's viewed-discharge, agent-ui's answer
+# discharge, which is clear-current) at an @agent_ask_bg window copies the
+# shown line into @agent_ask_seen (while its kind is still `ask`: a
+# permission gate landing on a raised ask replaces it, ask_bg and all, in
+# needs-approval) and, while @agent_workflow says the work is
+# still out, goes back to `running` in ONE command list: @agent_seen_at and
+# @agent_since "<same epoch> running", @agent_detail_kind unset, @agent_ask_bg
+# unset. With nothing out any more it is the ordinary idle + pending
+# discharge. Only a later Stop raises again. @agent_ask_seen is unset by a
+# real prompt (Mack replied), a SessionStart, clear_state and the GC.
+
+# ask_detail LINE: the decider's line as a sidebar detail (DETAIL_JQ clean).
+ask_detail() {
+    local d=""
+    [ -z "$1" ] || d=$(printf '%s' "$1" | "$JQ" -Rr "$DETAIL_JQ"'clean' 2>/dev/null | head -n 1 || true)
+    printf '%s' "${d:-needs your input}"
+}
+
+# ask_run BUDGET ARGS... < STDIN: agent-turn-asks ARGS with this stdin,
+# SIGTERMed after BUDGET seconds (never KILL). Sets ask_rc (its exit status,
+# 2 when it is missing, 143 when stopped) and ask_line (its first line).
+# The watchdog writes nowhere a hook's reader waits on, and its orphaned
+# sleep (when the decider ends first) holds no pipe.
+ask_run() {
+    local budget="$1" out pid wd
+    shift
+    ask_rc=2; ask_line=""
+    [ -x "$TURN_ASKS" ] || return 0
+    out=$(mktemp "${TMPDIR:-/tmp}/agent-tab-ask.XXXXXX" 2>/dev/null) || return 0
+    # `<&0`: an async command's stdin is /dev/null unless it names one.
+    "$TURN_ASKS" "$@" <&0 >"$out" 2>/dev/null &
+    pid=$!
+    ( sleep "$budget"; kill -TERM "$pid" ) </dev/null >/dev/null 2>&1 &
+    wd=$!
+    ask_rc=0
+    wait "$pid" 2>/dev/null || ask_rc=$?
+    kill "$wd" 2>/dev/null || true
+    IFS= read -r ask_line < "$out" 2>/dev/null || true
+    rm -f "$out" 2>/dev/null || true
+}
+
+# ask_seen_same CLEAN: CLEAN (an ask_detail line) is the ask Mack already
+# saw on the window: origin_read's @agent_ask_seen (written only as a cleaned
+# line, so no second sanitizer fork).
+ask_seen_same() {
+    [ -n "$O_ASKSEEN" ] && [ "$O_ASKSEEN" = "$1" ]
+}
+
+# ask_raise WIN CLEAN: queue the raise for set_state (the caller writes
+# needs-input next).
+ask_raise() {
+    dkind=ask; dtext="$2"
+    ss_add set-option -w -t "$1" @agent_ask_from main
+    ss_add set-option -w -t "$1" @agent_ask_bg 1
+}
+
+# ask_spawn WIN TOKEN: the ONE detached full run for this Stop, owned by the
+# tmux server (as the condenser: a hook's process group may be reaped once it
+# returns). TOKEN is the "@agent_turn_origin|@agent_turn_result" this Stop
+# just wrote (built by the caller, not read back); the payload goes through
+# a private temp file the worker opens and removes first thing.
+ask_spawn() {
+    local w="$1" tok="$2" pf launch
+    [ -x "$TURN_ASKS" ] || return 0
+    pf=$(mktemp "${TMPDIR:-/tmp}/agent-tab-askbg.XXXXXX" 2>/dev/null) || return 0
+    printf '%s' "$payload" > "$pf" 2>/dev/null || { rm -f "$pf"; return 0; }
+    printf -v launch '%q ' env "HOME=$HOME" "PATH=$PATH" "TMPDIR=${TMPDIR:-/tmp}" \
+        "TMUX=${TMUX:-}" "TMUX_PANE=${TMUX_PANE:-}" \
+        "AGENT_TAB_SOCKET=${AGENT_TAB_SOCKET:-}" \
+        "AGENT_TAB_OWNER_SESSION=${AGENT_TAB_OWNER_SESSION:-}" \
+        "AGENT_TAB_OWNER_TOKEN=${AGENT_TAB_OWNER_TOKEN:-}" \
+        "AGENT_TAB_OWNER_BINDING=${AGENT_TAB_OWNER_BINDING:-}" \
+        "AGENT_TAB_OWNER_RECORD=${AGENT_TAB_OWNER_RECORD:-}" \
+        "AGENT_TAB_CONDENSE_MODEL=$CONDENSE_MODEL" \
+        "AGENT_TAB_ASK_BG_TIMEOUT=$ASK_BG_TIMEOUT" \
+        "AGENT_STATE_NOTICE=${AGENT_STATE_NOTICE-com.mackhaymond.tmux.agent-state}" \
+        bash "$0" ask-bg "$w" "$tok" "$pf" "$agent" "${ask_since:-}"
+    launch+=' >/dev/null 2>&1'
+    tmux run-shell -b "$launch" >/dev/null 2>&1 || rm -f "$pf"
+}
+
 
 
 
@@ -1162,7 +1310,12 @@ NEG_TTL=600
 # later runs skip the doomed call, re-probing the pin once the marker ages out
 # (models come back). Override the pin with AGENT_TAB_CONDENSE_MODEL; set it
 # empty to always use copilot's default.
-CONDENSE_MODEL="${AGENT_TAB_CONDENSE_MODEL-claude-haiku-4.5}"
+#   2026-10-22, CLI 1.0.102: `--model` refuses EVERY named id on this
+# account - claude-haiku-4.5, gpt-5-mini, gpt-5.4-mini, gemini-3.8-flash,
+# even gpt-5.6-luna, the model the default route itself runs on - with
+# `Model "…" is not available`; only `auto` (Copilot routes the call) is
+# accepted. So the pin is `auto`: no doomed first call, no MODEL_SKIP.
+CONDENSE_MODEL="${AGENT_TAB_CONDENSE_MODEL-auto}"
 MODEL_SKIP="${TMPDIR:-/tmp}/agent-tab-model-unavailable.${UID:-$(id -u)}"
 MODEL_SKIP_TTL=86400
 
@@ -1834,6 +1987,30 @@ if [ "$mode" = "clear-current" ]; then
                     ;;
             esac ;;
     esac
+    # ASKS WHILE WORK IS OUT: a raised ask (@agent_ask_bg) is seen now. Its
+    # line becomes @agent_ask_seen (copied tmux-side, in the discharge's own
+    # command list); with the work still out (@agent_workflow, the
+    # watcher's) the window goes back to the `running` it was held at, the
+    # detail kind no longer `ask`. One read, needs-input only. The line is
+    # kept as seen only while the detail still IS the ask (kind `ask`).
+    # @agent_ask_bg counts when non-empty (`1`, or a counted `1 N`); a read
+    # without both separators is no answer at all.
+    cc_ab=""; cc_wf=""; cc_dk=""; cc_rest=""
+    case "$cc_state" in
+        needs-*) cc_rest=$(tmux display-message -p -t "$win" "#{@agent_ask_bg}${US}#{@agent_workflow}${US}#{@agent_detail_kind}" 2>/dev/null || true) ;;
+    esac
+    if [[ $cc_rest == *"$US"*"$US"* ]]; then
+        IFS="$US" read -r cc_ab cc_wf cc_dk <<<"$cc_rest" || true
+    fi
+    if [ -n "$cc_ab" ]; then
+        [ "$cc_dk" != ask ] || ss_add set-option -w -t "$win" -F @agent_ask_seen '#{@agent_detail}'
+        if [ -n "$cc_wf" ]; then
+            seen_op=1
+            ss_add set-option -uw -t "$win" @agent_detail_kind
+            set_state "$win" running
+            exit 0
+        fi
+    fi
     case "$cc_state" in
         needs-*)
             # The user came to answer the prompt. Discharge the tint, but
@@ -1872,6 +2049,66 @@ fi
 # call only delays the title swap.
 if [ "$mode" = "title-budget" ]; then
     title_budget; echo
+    exit 0
+fi
+
+# Detached ask run (ASKS WHILE WORK IS OUT; spawned by ask_spawn at a held
+# Stop): agent-turn-asks in full, then the raise - only while the window is
+# still `running` with the turn bookkeeping that Stop wrote (TOKEN), and not
+# for a line Mack already saw. argv:
+# ask-bg <window_id> <token> <payload file> <agent> [<since>].
+#   The write is GUARDED IN TMUX, in one command list: the cleaned line is
+# staged in @agent_ask_line (argv, never parsed), an if-shell -F (no shell
+# runs) checks state, token and @agent_ask_seen against it and only then
+# raises - the detail copied from the staged line tmux-side - and the stage
+# is unset and the state read back in the same call. So a prompt, a woken
+# turn or a look that lands after the decider answered always wins. The
+# token and agent reach that command string, so both are held to a plain
+# charset first (a turn id is [A-Za-z0-9_.:-], an origin adds spaces, the
+# pair a `|`); anything else writes nothing.
+if [ "$mode" = "ask-bg" ]; then
+    win="${2:-}"; ask_tok="${3:-}"; ask_pf="${4:-}"; agent="${5:-}"; ask_since="${6:-}"
+    { [ -n "$win" ] && [ -n "$ask_pf" ] && [ -f "$ask_pf" ]; } || exit 0
+    # The payload is open on fd 4 and its file gone before anything runs:
+    # no exit path below can leak it.
+    exec 4<"$ask_pf" || exit 0
+    rm -f "$ask_pf" 2>/dev/null || true
+    [[ $win =~ ^@[0-9]+$ ]] || exit 0
+    ask_tok_re='^[A-Za-z0-9_.:| -]+$'
+    [[ $ask_tok =~ $ask_tok_re ]] || exit 0
+    case "$agent" in claude|codex|opencode) ;; *) exit 0 ;; esac
+    case "$ask_since" in *[!0-9]*) ask_since="" ;; esac
+    ask_run "$ASK_BG_TIMEOUT" ${ask_since:+--since "$ask_since"} <&4
+    exec 4<&-
+    [ "$ask_rc" = 0 ] && [ -n "$JQ" ] || exit 0
+    owns_window "$win" || exit 0
+    ask_clean=$(ask_detail "$ask_line")
+    watched=$(tmux display-message -p -t "$win" '#{window_active_clients}' 2>/dev/null || true)
+    case "$watched" in ''|*[!0-9]*) watched=0 ;; esac
+    ask_ts=$(now_epoch)
+    if viewing_now; then
+        # In front of Mack's eyes: seen as it lands (the look rule) - the
+        # line kept as seen, the window stamped seen - and never raised
+        # for this line later either.
+        ask_cmd="set-option -w -t $win -F @agent_ask_seen '#{@agent_ask_line}' ; set-option -w -t $win @agent_seen_at $ask_ts"
+        ask_want="$ask_ts"
+    else
+        ask_cmd="set-option -w -t $win @agent_state needs-input ; set-option -w -t $win @agent_since '$ask_ts needs-input'"
+        ask_cmd+=" ; set-option -w -t $win -F @agent_detail '#{@agent_ask_line}' ; set-option -w -t $win @agent_detail_kind ask"
+        ask_cmd+=" ; set-option -w -t $win @agent_ask_from main ; set-option -w -t $win @agent_ask_bg 1"
+        ask_cmd+=" ; set-option -w -t $win @agent_kind $agent"
+        ask_want=needs-input
+    fi
+    ask_cond="#{&&:#{&&:#{==:#{@agent_state},running},#{==:#{@agent_turn_origin}|#{@agent_turn_result},$ask_tok}},#{!=:#{@agent_ask_seen},#{@agent_ask_line}}}"
+    ask_out=$(tmux set-option -w -t "$win" @agent_ask_line "$ask_clean" \; \
+                   if-shell -F -t "$win" "$ask_cond" "$ask_cmd" \; \
+                   set-option -uw -t "$win" @agent_ask_line \; \
+                   display-message -p -t "$win" "x#{@agent_state}${US}#{@agent_seen_at}" 2>/dev/null || true)
+    case "$ask_out" in
+        "x$ask_want$US"*|"x"*"$US$ask_want")
+            [ "$ask_want" != needs-input ] || tmux refresh-client -S 2>/dev/null || true
+            notify_state ;;
+    esac
     exit 0
 fi
 if [ "$mode" = "condense" ] || [ "$mode" = "condense-locked" ]; then
@@ -2291,19 +2528,7 @@ fi
 # #{window_active} is 1 even for zero-client sessions — neither is correct).
 watched=$(tmux display-message -p -t "$win" '#{window_active_clients}' 2>/dev/null || true)
 case "$watched" in ''|*[!0-9]*) watched=0 ;; esac
-
-# ...and is the user actually LOOKING? A watched window in a WezTerm that is
-# behind Slack is not being seen, and until 2026-08-25 `done` skipped its
-# tint on the watched test alone - the one case where a finish could be
-# missed with no colour ever shown. Now both: the window is active for a
-# client AND WezTerm is frontmost. Two lsappinfo forks, ~11ms, and only on
-# the two events that would tint. Mack's ask: a yellow or green that lands
-# while he is sitting on that tab with WezTerm focused clears at once.
-viewing_now() {
-    [ "$watched" -gt 0 ] || return 1
-    [ "$(lsappinfo info -only bundleid "$(lsappinfo front 2>/dev/null)" 2>/dev/null)" = \
-      '"CFBundleIdentifier"="com.github.wez.wezterm"' ]
-}
+# ...and is the user actually LOOKING? See viewing_now (with the helpers).
 
 case "$mode" in
     interrupt)
@@ -2360,6 +2585,9 @@ case "$mode" in
             clear|startup) ss_add set-option -uw -t "$win" @agent_paused ;;
         esac
         ss_add set-option -uw -t "$win" @agent_held_detail   # HELD DETAIL
+        # ASKS WHILE WORK IS OUT: a new or resumed session (compact exited
+        # above) has seen no ask of its own yet.
+        ss_add set-option -uw -t "$win" @agent_ask_seen
         set_state "$win" idle
         clear_pending "$win"
         # Drift state is per session and only ever read for the live one:
@@ -2539,6 +2767,16 @@ case "$mode" in
         ss_add set-option -uw -t "$win" @agent_quiet
         # Mack has spoken: a held Stop's stash (HELD DETAIL) is history.
         ss_add set-option -uw -t "$win" @agent_held_detail
+        # ASKS WHILE WORK IS OUT: a REAL prompt (not a harness wake-up, the
+        # same "sys" test as the origin above) starts the turn an ask is
+        # scoped to (agent-turn-asks --since: a peer's message counts, as
+        # its transcript rule does). Mack's own prompt also answers whatever
+        # ask he saw: the next one raises even if it reads the same. A
+        # verified agent message (agent_msg) is not Mack replying.
+        if [ "$t_sys" != sys ]; then
+            ss_add set-option -w -t "$win" @agent_turn_start "$t_now"
+            [ "$agent_msg" = 1 ] || ss_add set-option -uw -t "$win" @agent_ask_seen
+        fi
         take_detail running run
         set_state "$win" running
         if [ -n "$ctx_from" ] && [ "$ss_wrote" = 1 ]; then
@@ -2607,8 +2845,17 @@ case "$mode" in
             fi
         fi
         if [ "$dkind" = note ]; then
+            # (A raised ask's `ask` - ASKS WHILE WORK IS OUT - is no twin of
+            # this gate: the gate replaces it, detail and asker both; the
+            # asker stays unknown until its PermissionRequest lands.)
             case "$(tmux show-options -wqv -t "$win" @agent_detail_kind 2>/dev/null || true)" in
-                perm|ask) dkind="" ;;
+                perm) dkind="" ;;
+                ask)
+                    dkind=""
+                    if [ -n "$(tmux show-options -wqv -t "$win" @agent_ask_bg 2>/dev/null || true)" ]; then
+                        dkind=perm
+                        ss_add set-option -uw -t "$win" @agent_ask_from
+                    fi ;;
                 *) dkind=perm ;;
             esac
         fi
@@ -2626,6 +2873,9 @@ case "$mode" in
             # (A discharged prompt needs no asker: idle + @agent_pending is
             # consumed by whichever heartbeat comes first, as before.)
             [ -z "$ask_from" ] || ss_add set-option -w -t "$win" @agent_ask_from "$ask_from"
+            # A gate replaces a raised ask (ASKS WHILE WORK IS OUT) standing
+            # on this needs-input: it is no longer that ask.
+            ss_add set-option -uw -t "$win" @agent_ask_bg
             set_state "$win" needs-input
         fi
         ;;
@@ -2703,6 +2953,7 @@ case "$mode" in
         origin_read "$win"
         stop_fields
         s_cls=user; s_unseen=0
+        s_origin="$O_ORIGIN"   # @agent_turn_origin as this Stop leaves it
         if [ -n "$O_OKIND" ] && [ "$s_id" = "$O_OTID" ]; then
             s_cls="$O_OKIND"
         else
@@ -2718,6 +2969,7 @@ case "$mode" in
                         s_ifrom=-
                         [ "$s_cls" = agent ] && [ "$O_OKIND" = agent ] && s_ifrom="${O_OFROM:--}"
                         ss_add set-option -w -t "$win" @agent_turn_origin "$s_cls $s_id $s_ifrom"
+                        s_origin="$s_cls $s_id $s_ifrom"
                     fi
                 fi
             fi
@@ -2731,6 +2983,30 @@ case "$mode" in
                 [ -z "$r" ] || { dkind=done; dtext="$r"; }
             else
                 s_quiet=1
+            fi
+        fi
+        # ASKS WHILE WORK IS OUT (see its section): a Stop held `running` by
+        # background work asks the decider whether the turn asked Mack. Its
+        # marker is the agent saying so outright, so it makes even an
+        # agent-started turn loud (as notify_user does); the detached model
+        # run is for loud turns only - a quiet turn's questions are for the
+        # peer that started it. A subagent's standing gate (sd_hold) or a
+        # pause already decides what the window shows: not asked there.
+        ask_hit=0; ask_bg_run=0; ask_line=""; ask_clean=""
+        if [ "$bg_pending" -eq 1 ] && [ "$sd_hold" = running ] && [ -z "$O_PAUSED" ] && [ -n "$JQ" ]; then
+            ask_since="$O_TSTART"
+            ask_run "$ASK_SYNC_BUDGET" --marker-only ${ask_since:+--since "$ask_since"} <<<"$payload"
+            if [ "$ask_rc" = 0 ]; then
+                # Sanitized once; every use below takes this.
+                ask_clean=$(ask_detail "$ask_line")
+                # The question Mack already saw (@agent_ask_seen; a marker
+                # stands through the agent's woken turns): no re-ping, and
+                # nothing ask-related written - this Stop is as if unasked.
+                if ! ask_seen_same "$ask_clean"; then
+                    ask_hit=1; s_quiet=0
+                fi
+            elif [ "$s_quiet" = 0 ]; then
+                ask_bg_run=1
             fi
         fi
         # @agent_bg_owner: a Stop HELD for background work records whose work
@@ -2802,8 +3078,20 @@ case "$mode" in
         ss_add set-option -uw -t "$win" @agent_quiet   # never logged as a reply
         prior_unset "$win"
         if [ "$bg_pending" -eq 1 ]; then
-            set_held
+            if [ "$ask_hit" = 1 ] && viewing_now; then
+                # In front of his eyes: seen as it lands (still running).
+                seen_op=1
+                ss_add set-option -w -t "$win" @agent_ask_seen "$ask_clean"
+                set_held
+            elif [ "$ask_hit" = 1 ]; then
+                ask_raise "$win" "$ask_clean"
+                set_state "$win" needs-input
+            else
+                set_held
+            fi
             compose_summary "$win" "$(extract_summary "$payload")" "$payload"
+            # The token: the turn bookkeeping exactly as this Stop wrote it.
+            if [ "$ask_bg_run" = 1 ]; then ask_spawn "$win" "$s_origin|$s_id loud"; fi
             exit 0
         fi
         # Don't tint a window the user is looking at — they saw it finish.
