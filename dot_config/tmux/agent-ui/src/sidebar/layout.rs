@@ -248,7 +248,7 @@ use crate::palette;
 use crate::text::wez::{clip, clusters, dwidth, fit_label};
 use crate::text::{plain, sanitize};
 pub use crate::view::space_order;
-use crate::view::{Agent, Need, Space, ViewModel};
+use crate::view::{Agent, Need, Space, Stale, ViewModel};
 use ratatui::buffer::{Buffer, CellDiffOption, CellWidth};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -814,6 +814,9 @@ struct Cx<'a> {
     /// or ready: `paused.json` lists targets), so prefix P resumes: a paused
     /// card says so.
     resumes: bool,
+    /// The stale-agent sweep's threshold (seconds; 0: off): `@agent_stale_after`
+    /// ([`Bar::stale_after`], else [`crate::view::STALE_AFTER_DEFAULT`]).
+    stale_after: i64,
 }
 
 impl Cx<'_> {
@@ -2263,6 +2266,29 @@ fn extras(a: &Agent, level: u8, bg: Ink, dimc: Hue) -> (Vec<Seg>, Option<(usize,
     (v, span)
 }
 
+/// The stale-agent sweep's hint ([`Agent::stale`], docs/agent-roster.md
+/// "Stale agents") on a card's second line, by how much room there is,
+/// richest first: `unsaved work`, then `unsaved` (dim peach over the card,
+/// as the diff badge's colours, [`DIFF_TINT`]); `close?` (the faint
+/// placeholder ink: `faint`). Each with a ` ·` before the age, then (its
+/// last form) without, so it still fits Mack's 34 columns. Past its forms,
+/// nothing. Returns the segment and whether the ` ·` follows.
+fn stale_hint(s: Option<Stale>, form: usize, bg: Ink, faint: Hue) -> Option<(Seg, bool)> {
+    let (forms, ink): (&[(&str, bool)], Ink) = match s? {
+        Stale::Unsaved => {
+            (&[("unsaved work", true), ("unsaved", true), ("unsaved", false)], over(Ink::Pal("peach"), DIFF_TINT, bg))
+        }
+        Stale::Close => (&[("close?", true), ("close?", false)], Ink::Pal(faint)),
+    };
+    forms.get(form).map(|(t, dot)| (seg(*t, ink), *dot))
+}
+
+/// How the second line's right side gives way, richest first: (the
+/// [`extras`] level, the [`stale_hint`] form). The file count goes, then
+/// the hint shortens, then the badge goes, then the hint's ` ·`; the tag
+/// after these, the hint last of all.
+const GIVE_WAY: [(u8, usize); 5] = [(0, 0), (1, 0), (1, 1), (2, 1), (2, 2)];
+
 /// `row`'s cells `span` of its right side (`right_w` cells wide, ending at
 /// the tile's last cell) open window `win`'s diff, before the row's own
 /// click.
@@ -2325,7 +2351,9 @@ fn agent_bg(a: &Agent, k: usize, mine: bool) -> Ink {
 /// the age (a one-line card's before its word), the badge a click into the
 /// diff ([`Target::Diff`]). Both lines click through. `tag`: a dim word
 /// before the second line's age (a PINNED card's space, `cs35l · 4m`),
-/// dropped when it would leave the line under [`TAG_ROOM`] cells.
+/// dropped when it would leave the line under [`TAG_ROOM`] cells. A stale
+/// agent's hint ([`stale_hint`]: `close?`, `unsaved work`) sits after the
+/// badge on the second line (`close? · 4h`); a one-line card has none.
 fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&str>) -> Vec<Row> {
     let w = inner(cx.w);
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
@@ -2456,34 +2484,48 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     // (The words' cells: a `› ` / `> ` mark is not the text DOING_MIN keeps.)
     let mark = if text.len() > 1 { width(&text[..1]) } else { 0 };
     let tw = if word_below { width(&paused_line(usize::MAX, cx.resumes, dimc)) } else { width(&text) - mark };
-    // The right side: the extras ([`extras`]), the tag, the age.
-    let right2 = |level: u8, tag: Option<&str>| {
+    // The stale-agent sweep's hint ([`stale_hint`]): on this second line only.
+    let stale = a.stale(cx.now, cx.stale_after);
+    // The right side: the extras ([`extras`]), the sweep's hint, the tag,
+    // the age (after a ` ·` when a hint or tag stands before it).
+    let right2 = |level: u8, form: usize, tag: Option<&str>| {
         let (mut r, span) = extras(a, level, bg, dimc);
-        let some = !r.is_empty();
+        let hint = stale_hint(stale, form, bg, faint);
+        let some = !r.is_empty() || hint.is_some();
+        let mut dot = false;
+        if let Some((h, d)) = hint {
+            r.extend([seg(" ", "text"), h]);
+            dot = d;
+        }
         if let Some(t) = tag {
-            r.push(seg(format!(" {}", clip(&sanitize(t), TAG_W)), dimc));
-            if age.is_some() {
+            if dot {
                 r.push(seg(" ·", dimc));
             }
+            r.push(seg(format!(" {}", clip(&sanitize(t), TAG_W)), dimc));
+            dot = true;
+        }
+        if dot && age.is_some() {
+            r.push(seg(" ·", dimc));
         }
         r.extend(age.iter().map(|ag| seg(format!(" {ag}"), dimc)));
         r.push(seg(" ", "text"));
         (edge(r), span, some)
     };
-    // Richest first: the file count goes, then the badge, then the tag;
-    // extras only while the text keeps its whole or DOING_MIN cells, the
+    // Richest first ([`GIVE_WAY`]): the file count goes, then the hint
+    // shortens, then the badge goes, then the tag, then the hint; extras and
+    // the hint only while the text keeps its whole or DOING_MIN cells, the
     // tag only while the text keeps TAG_ROOM.
     let room = |r: &[Seg]| inner(cx.w).saturating_sub(1 + indent + width(r));
-    let tries = (0..EXTRA_LEVELS).map(|l| (l, tag)).chain([(EXTRA_LEVELS - 1, None)]);
+    let (last, gone) = (EXTRA_LEVELS - 1, GIVE_WAY[GIVE_WAY.len() - 1].1 + 1);
+    let tries = GIVE_WAY.map(|(l, f)| (l, f, tag)).into_iter().chain([(last, gone - 1, None), (last, gone, None)]);
     let fits = |(r, _, some): &(Vec<Seg>, Option<(usize, usize)>, bool), t: Option<&str>| {
         let fit = 1 + indent + width(r) <= inner(cx.w);
         (!some || fit && room(r) >= mark + tw.clamp(1, DOING_MIN)) && (t.is_none() || room(r) >= TAG_ROOM)
     };
     let (r2, span, _) = tries
-        .into_iter()
-        .map(|(l, t)| (right2(l, t), t))
+        .map(|(l, f, t)| (right2(l, f, t), t))
         .find(|(x, t)| fits(x, *t))
-        .map_or_else(|| right2(EXTRA_LEVELS - 1, None), |(x, _)| x);
+        .map_or_else(|| right2(last, gone, None), |(x, _)| x);
     let mut l2 = match pin {
         // The ⌥W digit cap under the letter's, on the card grid (c3-c5).
         Some(p) => vec![rail, seg(" ", "text"), p, seg(" ".repeat(indent - 1 - BADGE_W), "text")],
@@ -3570,6 +3612,7 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
         cur: view.cur_win.as_deref(),
         shells: view.shells,
         resumes: matches!(opts.pause, Some(Phase::Stopping { .. } | Phase::Safe { .. } | Phase::Ready { .. })),
+        stale_after: opts.bar.stale_after.unwrap_or(crate::view::STALE_AFTER_DEFAULT),
     };
     // Pinned agents move out of their spaces into PINNED (a view already
     // split is laid out as it is). The letters, the client's own card and

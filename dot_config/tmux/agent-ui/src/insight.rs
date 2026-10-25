@@ -160,6 +160,12 @@ pub struct Insight {
     pub ctx_window: u64,
     /// Its dirty touched files' lines (None: none dirty, or not known yet).
     pub diff: Option<DiffStat>,
+    /// `diff` is an answer, not a guess: every touched file is outside any
+    /// repo, dirty now, or shown clean by a whole git answer current since
+    /// the agent's last edit of it was first seen. False while a repo has
+    /// not answered (yet). (An agent that touched nothing: true, clean.)
+    /// The stale-agent sweep ([`crate::view::stale`]) trusts only this.
+    pub diff_known: bool,
     /// Its touched files still dirty, absolute, first edit first.
     pub dirty_files: Vec<PathBuf>,
     /// How many files it edited in all (dirty or not).
@@ -1182,6 +1188,7 @@ impl Engine {
                 ctx_used,
                 ctx_window,
                 diff: None,
+                diff_known: false,
                 dirty_files: Vec::new(),
                 touched,
             };
@@ -1230,7 +1237,9 @@ impl Engine {
         let mut out = BTreeMap::new();
         for (id, mut ins, edits) in got {
             let mut d = DiffStat::default();
+            let mut known = true;
             for (p, tr, resets, n) in edits {
+                // (Outside any repo: never dirty, so known.)
                 let Some(Some((real, root, rel))) = at.get(&p) else { continue };
                 let key = (tr, real.clone());
                 let s = self.seen.entry(key.clone()).or_default();
@@ -1247,6 +1256,9 @@ impl Engine {
                     None => {
                         if repo.is_some_and(|r| r.valid >= s.since) {
                             s.clean_at = Some(n);
+                        } else {
+                            // (Clean only by a stale or missing answer.)
+                            known = false;
                         }
                     }
                     Some(&(a, r)) => {
@@ -1258,6 +1270,7 @@ impl Engine {
                 }
             }
             ins.diff = (d.files > 0).then_some(d);
+            ins.diff_known = known;
             out.insert(id, ins);
         }
         // (Kept a while unused too: a window back after a missed pass keeps
@@ -1775,6 +1788,7 @@ pub fn to_json(win: &str, i: &Insight) -> Value {
         ("ctx_used", i.ctx_used),
         ("ctx_window", i.ctx_window),
         ("diff", diff),
+        ("diff_known", i.diff_known),
         ("dirty_files", dirty),
         ("touched", i.touched),
     ]

@@ -198,6 +198,7 @@ fn insight_value(i: &Insight) -> Value {
         ("ctx_used", i.ctx_used),
         ("ctx_window", i.ctx_window),
         ("diff", diff),
+        ("diff_known", i.diff_known),
         ("dirty_files", dirty),
         ("touched", i.touched),
     ]
@@ -225,6 +226,8 @@ fn insight_of(v: &Value) -> Option<Insight> {
         ctx_used: n(v, "ctx_used"),
         ctx_window: n(v, "ctx_window").unwrap_or(super::WINDOW_200K),
         diff,
+        // (A publisher from before the flag: not known, so no sweep hint.)
+        diff_known: v.get("diff_known").and_then(Value::as_bool).unwrap_or(false),
         dirty_files: dirty,
         touched: n(v, "touched").unwrap_or(0) as usize,
     })
@@ -232,7 +235,8 @@ fn insight_of(v: &Value) -> Option<Insight> {
 
 /// `<server>.json`'s text: `{"generation": "<pid> <n>", "windows": {"@3":
 /// {kind, transcript, doing, todo, prompt, ctx_used, ctx_window, diff:
-/// {added, removed, files} | null, dirty_files: [...], touched}}}`.
+/// {added, removed, files} | null, diff_known, dirty_files: [...],
+/// touched}}}`.
 pub fn encode(stamp: &str, map: &BTreeMap<String, Insight>) -> String {
     let wins = Value::Obj(map.iter().map(|(w, i)| (w.clone(), insight_value(i))).collect());
     crate::obj![("generation", stamp), ("windows", wins)].to_json()
@@ -574,6 +578,7 @@ mod tests {
             ctx_used: Some(850_000),
             ctx_window: 1_000_000,
             diff: Some(DiffStat { added: 48, removed: 12, files: 3 }),
+            diff_known: true,
             dirty_files: vec!["/r/a.rs".into()],
             touched: 4,
         }
@@ -582,8 +587,12 @@ mod tests {
     #[test]
     fn keys_and_the_json() {
         let map: BTreeMap<String, Insight> = [("@3".to_string(), one())].into_iter().collect();
-        assert_eq!(decode(&encode("1 2 1", &map)), Some(map));
+        assert_eq!(decode(&encode("1 2 1", &map)), Some(map.clone()));
         assert_eq!(decode("{}"), None);
+        // An older publisher's record (no `diff_known`): not known.
+        let old = encode("1 2 1", &map).replace("\"diff_known\":true,", "");
+        assert!(!old.contains("diff_known"), "{old}");
+        assert_eq!(decode(&old).unwrap()["@3"].diff_known, false);
         // Same second, another socket: another key.
         let (a, b) = (server_key("4242", "/private/tmp/tmux-501/default"), server_key("4242", "/private/tmp/tmux-501/insA2"));
         assert!(a.starts_with("4242_") && a.len() == 13 && a != b);

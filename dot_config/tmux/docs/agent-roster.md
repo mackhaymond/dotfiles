@@ -1601,8 +1601,9 @@ context only for `agent-ui insight`, never on a card). On the cards
     dirty file or is gone.
   - `<key>.json`: every window's insight (`board::encode`: `generation`,
     then `windows` → `{kind, transcript, doing, todo, prompt, ctx_used,
-    ctx_window, diff: {added, removed, files} | null, dirty_files,
-    touched}`).
+    ctx_window, diff: {added, removed, files} | null, diff_known,
+    dirty_files, touched}`; `diff_known` missing, from an older publisher,
+    reads false).
   - `<key>.gen`: `<pid> <generation> <complete>`, written LAST after each
     result (`complete` 1 once a pass with every repo answered whole landed
     since this holder took the lock); then the lock file is touched and
@@ -1705,6 +1706,51 @@ context only for `agent-ui insight`, never on a card). On the cards
   pid first and retries once 300 ms later. Keys: ⌥W then ⇧letter
   (spaces.conf, docs/spaces.md), the menu's Space d, a card's diff badge.
   `--print` prints the popup's tmux argv, one per line, instead.
+
+### Stale agents (`Agent::stale`, `layout.rs` `stale_hint`)
+
+A quiet sweep hint on the card of an agent that has sat a long time with
+nothing to do: a hint only, never an action (no auto-close, no key of its
+own; close it as ever: prefix q, Space x, or ⌘W on the tab).
+
+```text
+    g  Lost suit jacket
+       > find the receipt   close? · 4h      idle 4h, nothing it edited dirty
+    k  Port the parser
+       > port it +48 −12 unsaved work · 5h   idle 5h, its edits uncommitted
+```
+
+- **Who.** An agent whose state is `idle` or `done` (by `@agent_since`'s
+  epoch, the state stamp) for at least `@agent_stale_after` seconds. Never
+  working, asking, failed or paused, never with a workflow (⚙) or cua (◎)
+  flag in flight, never an idle agent whose prompt was just answered
+  (`@agent_pending` fresh), never a pending space's claude.
+- **Clean or dirty** is the insight's answer, nothing new is asked of git:
+  uncommitted changes in the files the agent itself edited (its transcript's
+  Edit / Write / … and its subagents', [Agent insight](#agent-insight-srcinsightrs)),
+  not the whole cwd repo (several agents share one checkout; a change made
+  through Bash, `sed` say, is not attributed). Only a KNOWN answer counts
+  (`Insight::diff_known`: every touched file outside any repo, dirty now,
+  or shown clean by a whole git answer current since the agent's last edit
+  of it). No insight (an OpenCode agent, a transcript not found yet), or a
+  repo not answered yet: no hint, never a guess.
+- **The hint**, on the card's second line after the diff badge, before the
+  age: `close?` in the placeholder's faint ink (`overlay1`; `overlay2` on
+  your own card) when nothing it edited is dirty; `unsaved work` dim peach
+  (peach at the badge's 70% over the card) when something is. Narrower, in
+  order: the badge's file count goes, `unsaved work` becomes `unsaved`,
+  the badge goes, the ` ·` before the age goes (`close? 4h`, so Mack's 34
+  columns still say it), then the hint, all before the text keeps under
+  `DOING_MIN` cells. A one-line card (under 26 columns, or the tightest
+  step) has no hint. NEEDS YOU cards carry none either (they are there to
+  be read).
+- **Pinned** agents are kept on purpose: never `close?`; `unsaved work`
+  still shows (on their PINNED card, before the space tag).
+- **`@agent_stale_after`** (global user option, seconds; unset: 10800 = 3
+  hours; `0` turns the sweep off; anything not all digits is the default).
+  It rides the sidebar's one snapshot call (the client row's status tail,
+  `tmux::STATUS_FORMATS`), so it costs nothing per tick:
+  `tmux set -g @agent_stale_after 7200`.
 
 ### Answering a permission prompt (`src/answer.rs`)
 

@@ -273,6 +273,10 @@ pub struct Bar {
     /// client or for every sidebar. Expiry is the layout's business (its
     /// clock): it draws only the live ones.
     pub toasts: Vec<Toast>,
+    /// `@agent_stale_after` read ([`crate::view::stale_after`], seconds; 0:
+    /// off): when an idle agent's card gets the stale-agent hint. None (no
+    /// client row to read it from): the default.
+    pub stale_after: Option<i64>,
 }
 
 // ---------------------------------------------------------------- toasts
@@ -406,6 +410,7 @@ impl Bar {
                 v => Some(format!("last save {} ago", sanitize(v))),
             };
             bar.toasts = Toast::parse_all(&st.toast).into_iter().filter(|t| t.for_client(client)).collect();
+            bar.stale_after = Some(crate::view::stale_after(&st.stale_after));
         }
         let mut flagged: Vec<&str> = snap.windows.iter().filter(|w| w.stash_sel).map(|w| w.id.as_str()).collect();
         flagged.sort_unstable();
@@ -1002,6 +1007,14 @@ mod tests {
         assert_eq!(bar.usage[1].color, Some(Ink::Idx(239)));
         assert_eq!(bar.stale.as_deref(), Some("last save 2h ago"));
         assert_eq!(bar.selecting, None);
+        // `@agent_stale_after` rides the same client row: unset, the default.
+        assert_eq!(bar.stale_after, Some(crate::view::STALE_AFTER_DEFAULT));
+        let mut st = vec![""; crate::tmux::STATUS_FORMATS.len()];
+        st[33] = "600";
+        let set = Snapshot::parse(&[row("main", 1, "@2", &[]), client("main", "@2", &st)].join("\n"));
+        assert_eq!(Bar::build(&set, Some("/dev/ttys999")).stale_after, Some(600));
+        // No client row at all: nothing read (the layout's default).
+        assert_eq!(Bar::build(&Snapshot::parse(&row("main", 1, "@2", &[])), None).stale_after, None);
         // A range selection: the stash table armed, two windows flagged
         // (an agent and a shell); the shell carries the tint.
         let snap = Snapshot::parse(&[

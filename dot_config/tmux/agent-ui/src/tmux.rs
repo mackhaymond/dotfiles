@@ -404,7 +404,7 @@ pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
 /// instead of status-right, read in the same one call (no script runs).
-pub const STATUS_FORMATS: [&str; 33] = [
+pub const STATUS_FORMATS: [&str; 34] = [
     "#{client_key_table}", "#{@sidebar_open}", "#{@sidebar_pids}", "#{@resurrect_stale}",
     "#{@codex_session_text}", "#{@codex_session_color}", "#{@codex_weekly_text}", "#{@codex_weekly_color}",
     "#{@codex_scoped_icon}", "#{@codex_scoped_text}", "#{@codex_scoped_color}", "#{@codex_account_label}",
@@ -426,6 +426,9 @@ pub const STATUS_FORMATS: [&str; 33] = [
     // a new server, so the pause banner trusts a saved id only from a pause
     // made since ([`crate::sidebar::pause`]).
     "#{start_time}",
+    // The stale-agent sweep's threshold in seconds (docs/agent-roster.md
+    // "Stale agents"; [`crate::view::stale_after`]): "" = the default.
+    "#{@agent_stale_after}",
 ];
 
 /// One usage window's numeric options (`@codex_<w>_used`, `_expected`,
@@ -486,6 +489,9 @@ pub struct Status {
     pub sidebar_width: String,
     /// `#{start_time}`: when the server started (epoch seconds), raw.
     pub server_start: String,
+    /// `@agent_stale_after`: the stale-agent sweep's threshold (seconds),
+    /// raw; "" when unset ([`crate::view::stale_after`]).
+    pub stale_after: String,
 }
 
 impl Status {
@@ -513,6 +519,7 @@ impl Status {
             sidebar_clients: f(30),
             sidebar_width: f(31),
             server_start: f(32),
+            stale_after: f(33),
         }
     }
 }
@@ -1012,6 +1019,7 @@ pub(crate) mod tests {
         assert_eq!((c.status.meters[1].used.as_str(), c.status.meters[2].members.as_str()), ("v19", "v28"));
         assert_eq!((c.status.toast.as_str(), c.status.sidebar_clients.as_str()), ("v29", "v30"));
         assert_eq!((c.status.sidebar_width.as_str(), c.status.server_start.as_str()), ("v31", "v32"));
+        assert_eq!(c.status.stale_after, "v33");
         // One field short or long: not a client row.
         assert!(Client::parse(&full[..full.len() - 1].join("\x1f")).is_none());
         let s = Snapshot::parse(&[

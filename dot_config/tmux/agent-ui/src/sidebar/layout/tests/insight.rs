@@ -18,6 +18,7 @@ fn ins(todo: Option<&str>, prompt: Option<&str>, diff: Option<(u64, u64, usize)>
         ctx_used: used,
         ctx_window: crate::insight::WINDOW_1M,
         diff: diff.map(|(added, removed, files)| DiffStat { added, removed, files }),
+        diff_known: true,
         dirty_files: Vec::new(),
         touched: diff.map_or(0, |d| d.2),
     }
@@ -194,7 +195,7 @@ fn the_badge_clicks_into_the_diff() {
     }
     // A one-line card: the badge before the word, where the title keeps room.
     let a1 = v.agents().find(|a| a.window_id == "@1").unwrap();
-    let cx = Cx { w: 44, b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false };
+    let cx = Cx { w: 44, b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false, stale_after: crate::view::STALE_AFTER_DEFAULT };
     let rows = agent_rows(a1, cx, false, 0, Ink::Pal("peach"), None);
     let l = rows[0].text();
     assert!(rows.len() == 1 && l.contains("Sidebar") && l.contains("+48 −12 ") && col(&l, "+48") < col(&l, "working"), "{l:?}");
@@ -260,7 +261,7 @@ fn an_empty_title_never_overflows() {
     let v = with(lettered(view(vec![a("main", 1, "running", "~/")], None)), vec![("@1", ins(Some(TODO), None, Some((48, 12, 3)), Some(950_000)))]);
     let a1 = v.agents().find(|a| a.window_id == "@1").unwrap();
     for w in 8usize..=44 {
-        let cx = Cx { w, b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false };
+        let cx = Cx { w, b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: None, cur: None, shells: true, resumes: false, stale_after: crate::view::STALE_AFTER_DEFAULT };
         for two in [false, true] {
             for r in agent_rows(a1, cx, two, 0, Ink::Pal("peach"), None) {
                 assert_eq!(dwidth(&r.text()), w, "{w} {two}: {:?}", r.text());

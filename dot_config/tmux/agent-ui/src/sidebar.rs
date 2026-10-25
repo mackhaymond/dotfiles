@@ -1479,6 +1479,7 @@ mod tests {
             ctx_used: None,
             ctx_window: crate::insight::WINDOW_1M,
             diff: Some(crate::insight::DiffStat { added: diff.0, removed: diff.1, files: diff.2 }),
+            diff_known: true,
             touched: dirty.len(),
             dirty_files: dirty,
         }

@@ -616,6 +616,9 @@ fn engine_attributes_per_agent() {
     assert_eq!((b.diff, b.touched), (Some(DiffStat { added: 1, removed: 1, files: 1 }), 2));
     assert_eq!(got["@3"].doing.as_deref(), Some("port it"));
     assert_eq!(got["@3"].diff, None);
+    // Every answer whole and current: known; a Codex agent that edited
+    // nothing is known clean.
+    assert!(["@1", "@2", "@3"].iter().all(|w| got[*w].diff_known));
     assert_eq!(e.git_runs, 1, "one repo, asked once for both agents");
     // Nothing changed: git is not asked again.
     e.update(&snap, 1002.0);
@@ -628,6 +631,7 @@ fn engine_attributes_per_agent() {
     let got = e.update(&snap, 1006.0);
     assert_eq!((got["@1"].diff, got["@2"].diff, e.git_runs), (None, None, 2));
     assert!(got["@1"].dirty_files.is_empty());
+    assert!(got["@1"].diff_known && got["@2"].diff_known, "clean by a current answer");
     for x in [&d, &root, &codex_root] {
         let _ = fs::remove_dir_all(x);
     }
@@ -684,6 +688,19 @@ fn a_committed_edit_is_not_anothers_later_change() {
     e.diff_every = 1000.0;
     let got = e.update(&snap, 1004.0);
     assert!(got["@1"].diff.is_some(), "the old answer still shows it dirty");
+    assert!(got["@1"].diff_known, "dirty by an answer: known");
+    // A edits a file the last answer never covered, git still throttled: its
+    // "clean" would be a guess, so the diff is not known (the sweep says
+    // nothing), until a current answer lands.
+    let c_txt = d.join("c.txt").to_string_lossy().into_owned();
+    append(&ta, &lines(&[edit("a3", &c_txt), result("a3", false)]));
+    fs::write(d.join("c.txt"), "changed\n").unwrap();
+    let got = e.update(&snap, 1005.0);
+    assert!(!got["@1"].diff_known, "{:?}", got["@1"]);
+    assert!(got["@2"].diff_known, "B's files: all answered");
+    e.diff_every = 0.0;
+    let got = e.update(&snap, 1006.0);
+    assert!(got["@1"].diff_known && got["@1"].diff.map(|x| x.files) == Some(1), "{:?}", got["@1"]);
     for x in [&d, &root] {
         let _ = fs::remove_dir_all(x);
     }

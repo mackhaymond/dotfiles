@@ -295,6 +295,31 @@ pub struct Agent {
     pub pending: Option<Pending>,
 }
 
+/// The stale-agent sweep's verdict on an agent long idle ([`Agent::stale`]):
+/// a quiet hint on its sidebar card, never an action (docs/agent-roster.md
+/// "Stale agents").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stale {
+    /// Nothing it edited is uncommitted: `close?`.
+    Close,
+    /// Files it edited are still uncommitted: `unsaved work`.
+    Unsaved,
+}
+
+/// `@agent_stale_after` unset: 3 hours.
+pub const STALE_AFTER_DEFAULT: i64 = 3 * 3600;
+
+/// `@agent_stale_after` (raw) → the sweep's threshold in seconds: digits
+/// as given (`0` turns the sweep off); unset, or anything that is not all
+/// digits, the default ([`STALE_AFTER_DEFAULT`]).
+pub fn stale_after(raw: &str) -> i64 {
+    let s = raw.trim();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return STALE_AFTER_DEFAULT;
+    }
+    s.parse().unwrap_or(STALE_AFTER_DEFAULT)
+}
+
 /// What a pending space's claude carries ([`Agent::pending`]): docs/spaces.md
 /// "Pending spaces".
 #[derive(Debug, Clone, PartialEq)]
@@ -388,6 +413,36 @@ impl Agent {
     /// nothing), never a space's home.
     pub fn is_pinned(&self) -> bool {
         self.pinned.is_some() && !self.state.is_empty() && !self.home
+    }
+
+    /// The stale-agent sweep ([`Stale`]) for this agent at `now`, with the
+    /// threshold `after` (seconds; [`stale_after`], 0 = off). Only an agent
+    /// sitting idle or done (never working, asking, failed or paused, never
+    /// with a workflow / cua flag in flight, never a prompt just answered
+    /// nor a pending space's claude) for `after` seconds by its state stamp
+    /// (`@agent_since`), and only on its insight's KNOWN answer
+    /// ([`crate::insight::Insight::diff_known`]): no insight, or one still
+    /// waiting on git, says nothing. Dirty is the insight's: uncommitted
+    /// changes in the files the agent itself edited. A pinned agent is kept
+    /// on purpose, so it is never offered a close; its unsaved work still
+    /// shows.
+    pub fn stale(&self, now: f64, after: i64) -> Option<Stale> {
+        if after <= 0 || self.in_flight || self.answered || self.pending.is_some() || self.home {
+            return None;
+        }
+        if !matches!(self.cat, Some(Cat::Idle | Cat::Done)) || !matches!(self.state.as_str(), "idle" | "done") {
+            return None;
+        }
+        let since = self.since?;
+        if now - (since as f64) < after as f64 {
+            return None;
+        }
+        let i = self.insight.as_ref().filter(|i| i.diff_known)?;
+        match i.diff {
+            Some(_) => Some(Stale::Unsaved),
+            None if self.is_pinned() => None,
+            None => Some(Stale::Close),
+        }
     }
 
     /// `session:index`.
