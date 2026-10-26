@@ -12,10 +12,12 @@
 #   closed-tabs.sh describe <id>                   label an entry (close runs this)
 #   closed-tabs.sh summarize <tool> <sid> <cwd> <label> <screen>   print one
 #
-# After a close, a detached `describe` has gpt-6-luna (codex exec) read the
-# tab's transcript — or its screen, for a plain shell — and stores a one-line
-# summary on the entry, shown on its line in the picker. stash.sh labels
-# parked tabs through `summarize` the same way.
+# After a close, a detached `describe` has a small model read the tab's
+# transcript — or its screen, for a plain shell — and stores a one-line
+# summary on the entry, shown on its line in the picker. The call goes through
+# ai-exec: gpt-6-luna (codex exec) first, then claude haiku, then copilot, each
+# only when the one before fails or is usage-limited. stash.sh labels parked
+# tabs through `summarize` the same way.
 #
 # Bound in tmux.conf: prefix x (CMD+W, asks y/n) and prefix C-l (CMD+SHIFT+W,
 # doesn't) close through here; prefix X (CMD+Z) opens the picker. Only closes
@@ -449,11 +451,15 @@ transcript_digest() {
 # shows on that entry's line. Agent tabs are read from their transcript, plain
 # shells from the screen snapshot. Any failure just leaves the entry without
 # one. The model call itself is `summarize`, which stash.sh uses too.
+# ai-exec tries codex on DESCRIBE_MODEL, then claude on DESCRIBE_CLAUDE_MODEL,
+# then copilot (auto); DESCRIBE_TIMEOUT covers the whole chain, not each leg.
 DESCRIBE_MODEL=gpt-6-luna
+DESCRIBE_CLAUDE_MODEL=haiku
 DESCRIBE_TIMEOUT=180
 # The whole digest goes in, so the label reflects the thread's theme rather
-# than its last few turns. ~400k chars is ~120k tokens, well inside luna's
-# 272k window; past it, tool-call lines go first, then the middle.
+# than its last few turns. ~400k chars is ~120k tokens, inside both luna's
+# 272k window and haiku's 200k; past it, tool-call lines go first, then the
+# middle.
 DESCRIBE_MAX_CHARS=400000
 do_describe() {
     local id="${1:-}" rec
@@ -481,8 +487,8 @@ do_describe() {
 #   summarize <tool> <session_id> <cwd> <label> <screen.ansi>
 do_summarize() {
     local tool="${1:-}" sid="${2:-}" cwd="${3:-}" label="${4:-}" screen_file="${5:-}"
-    local codex; codex=$(command -v codex || echo "$HOME/.bun/bin/codex")
-    [ -x "$codex" ] || { log "summarize: no codex"; return 0; }
+    local aiexec; aiexec=$(command -v ai-exec || echo "$HOME/.local/bin/ai-exec")
+    [ -x "$aiexec" ] || { log "summarize: no ai-exec"; return 0; }
 
     local convo screen=""
     convo=$(transcript_digest "$tool" "$sid")
@@ -518,17 +524,22 @@ EOF
         [ -n "$screen" ] && printf '\n<screen>\n%s\n</screen>\n' "$screen"
     } >"$work/prompt"
 
-    # --ephemeral keeps it out of codex's thread history and resume list;
-    # --ignore-user-config skips MCP servers and notify; hooks off so it
-    # doesn't show up in the tab indicator or notch as a running agent.
+    # The codex flags pass through ai-exec verbatim: --ephemeral keeps it out
+    # of codex's thread history and resume list; --ignore-user-config skips
+    # MCP servers and notify; hooks off so it doesn't show up in the tab
+    # indicator or notch as a running agent. ai-exec runs the claude/copilot
+    # legs with CUA_NOTCH_IGNORE=1 and no user settings, for the same reason.
     (
         cd "$work" || exit 1
         unset TMUX TMUX_PANE
-        exec "$codex" exec -m "$DESCRIBE_MODEL" -c model_reasoning_effort=low \
+        exec "$aiexec" exec -m "$DESCRIBE_MODEL" -c model_reasoning_effort=low \
             --ephemeral --skip-git-repo-check --ignore-user-config --ignore-rules \
-            --disable hooks -s read-only -o "$work/out" - <"$work/prompt" >"$work/log" 2>&1
+            --disable hooks -s read-only -o "$work/out" \
+            --claude-model "$DESCRIBE_CLAUDE_MODEL" - <"$work/prompt" >"$work/log" 2>&1
     ) &
     local cpid=$!
+    # The subshell exec'd ai-exec, so the kill lands on it: it takes its running
+    # backend's process group down with it and tries no further backend.
     ( sleep "$DESCRIBE_TIMEOUT"; kill "$cpid" ) 2>/dev/null &
     local wd=$!
     wait "$cpid"; local rc=$?

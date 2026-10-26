@@ -3,7 +3,8 @@
 # chezmoi-commit — split pending chezmoi *source* changes into logical commits,
 # write a message for each with a fast/cheap model, commit, and push.
 #
-# AI backend: claude CLI (haiku) first; falls back to codex CLI if claude fails.
+# AI backend: ai-exec — codex CLI first, then claude CLI (haiku), then copilot,
+# each only if the one before fails (or codex is usage-limited).
 # Does NOT run `chezmoi re-add` — it only commits what's already changed in the
 # chezmoi source repo (edit via `chezmoi edit` or directly, then run this).
 # Before any diff is sent to a model the pending changes are scanned with
@@ -15,11 +16,11 @@
 #   chezmoi-commit --no-push  # commit but don't push
 #
 # Env overrides:
-#   CHEZMOI_COMMIT_CLAUDE_MODEL  (default: haiku)
 #   CHEZMOI_COMMIT_CODEX_MODEL   (default: gpt-5.4-mini, run at low reasoning
-#                                 effort to keep the fallback fast/cheap)
+#                                 effort to keep it fast/cheap)
+#   CHEZMOI_COMMIT_CLAUDE_MODEL  (default: haiku; the first fallback)
 #
-# Requires: chezmoi, jq, gitleaks, and claude or codex.
+# Requires: chezmoi, jq, gitleaks, ai-exec, and one of codex/claude/copilot.
 #
 # Exit status:
 #   0  every group committed (and pushed unless --no-push), or nothing to do
@@ -147,37 +148,17 @@ extract_json() {
 
 GROUPS_JSON=""
 
-try_claude() {
-  command -v claude >/dev/null || return 1
-  local out
-  # Unset ANTHROPIC_API_KEY so claude authenticates via the OAuth subscription
-  # (Pro/Max) instead of billing the API credit balance.
-  # Strip the agent harness for speed: no MCP servers (--strict-mcp-config +
-  # empty config skips spawning codegraph/context7), no skills/hooks/settings
-  # (--setting-sources ''), and no tools (--disallowed-tools '*'). This is a
-  # pure one-shot text completion, so none of that is needed.
-  out="$(printf '%s' "$PROMPT" | env -u ANTHROPIC_API_KEY claude -p --model "$CLAUDE_MODEL" \
-    --output-format json \
-    --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
-    --setting-sources '' \
-    --disallowed-tools '*' 2>/dev/null)" || return 1
-  # Surface API/billing failures clearly instead of silently falling through.
-  if [ "$(printf '%s' "$out" | jq -r '.is_error // false' 2>/dev/null)" = "true" ]; then
-    echo "claude error: $(printf '%s' "$out" | jq -r '.result // "unknown"')" >&2
-    return 1
-  fi
-  # --output-format json wraps the model text in .result
-  out="$(printf '%s' "$out" | jq -r '.result // empty' 2>/dev/null)" || return 1
-  [ -n "$out" ] || return 1
-  out="$(printf '%s' "$out" | extract_json)"
-  printf '%s' "$out" | jq -e '.groups | type == "array"' >/dev/null 2>&1 || return 1
-  GROUPS_JSON="$out"
-}
-
-try_codex() {
-  command -v codex >/dev/null || return 1
-  local schema last
-  schema="$(mktemp)"; last="$(mktemp)"
+# One ai-exec call does the whole fallback chain: codex runs with these args
+# verbatim, and when it fails (or is usage-limited) ai-exec retries the same
+# task on claude --model $CLAUDE_MODEL, then copilot, translating the schema
+# and -o for each. Its stderr (which backend failed, and why) is kept aside
+# and shown only if every backend fails.
+try_ai_exec() {
+  local aiexec
+  aiexec="$(command -v ai-exec || echo "$HOME/.local/bin/ai-exec")"
+  [ -x "$aiexec" ] || { echo "ai-exec not found" >&2; return 1; }
+  local schema last errlog
+  schema="$(mktemp)"; last="$(mktemp)"; errlog="$(mktemp)"
   cat >"$schema" <<'JSON'
 {
   "type": "object",
@@ -199,24 +180,29 @@ try_codex() {
   }
 }
 JSON
-  codex exec \
-    -m "$CODEX_MODEL" \
-    -c model_reasoning_effort="low" \
-    --skip-git-repo-check \
-    --output-schema "$schema" \
-    -o "$last" \
-    "$PROMPT" >/dev/null 2>&1 || { rm -f "$schema" "$last"; return 1; }
-  local out; out="$(cat "$last" | extract_json)"
-  rm -f "$schema" "$last"
+  # Unset ANTHROPIC_API_KEY so the claude leg authenticates via the OAuth
+  # subscription (Pro/Max) instead of billing the API credit balance. The
+  # prompt goes on stdin (`-`): the diff can run to 60k+ chars.
+  if ! printf '%s' "$PROMPT" | env -u ANTHROPIC_API_KEY "$aiexec" exec \
+      -m "$CODEX_MODEL" \
+      -c model_reasoning_effort="low" \
+      --skip-git-repo-check \
+      --output-schema "$schema" \
+      -o "$last" \
+      --claude-model "$CLAUDE_MODEL" \
+      - >/dev/null 2>"$errlog"; then
+    tail -n 5 "$errlog" >&2
+    rm -f "$schema" "$last" "$errlog"
+    return 1
+  fi
+  local out; out="$(extract_json <"$last")"
+  rm -f "$schema" "$last" "$errlog"
   printf '%s' "$out" | jq -e '.groups | type == "array"' >/dev/null 2>&1 || return 1
   GROUPS_JSON="$out"
 }
 
-echo "Grouping changes with $CLAUDE_MODEL (claude)…" >&2
-if ! try_claude; then
-  echo "claude failed; falling back to codex ($CODEX_MODEL)…" >&2
-  try_codex || die "both claude and codex failed to produce a grouping"
-fi
+echo "Grouping changes (ai-exec: codex $CODEX_MODEL → claude $CLAUDE_MODEL → copilot)…" >&2
+try_ai_exec || die "codex, claude and copilot all failed to produce a grouping"
 
 # --- Validate the grouping against the real changed set -----------------------
 
