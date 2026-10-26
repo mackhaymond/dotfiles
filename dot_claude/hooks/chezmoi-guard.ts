@@ -41,13 +41,15 @@
 // sandbox: a future write-capable MCP server or new CC built-in tool that
 // bypasses these tool names would not be intercepted.
 //
-// LIMITATION (pty shell): mcp__pty__run has no per-call cwd — the persistent
-// pty shell's cwd is unknown to the hook. Relative paths are resolved against
-// the hook's top-level `cwd` (the Claude session cwd), exactly as for Bash, so
-// a relative write issued after a `cd` inside the pty may be misattributed.
-// Absolute / ~-prefixed paths and `cd <dir> && ...` chains are unaffected.
-// (Evidence attribution does ask tmux for the pty's cwd — see shellCwds — but
-// only to decide whether a call could reach chezmoi files at all.)
+// CWD (pty shell): mcp__pty__run has no per-call cwd, and the persistent pty
+// shell keeps every earlier `cd`, so the hook's top-level `cwd` (the Claude
+// session's) says nothing about where the command runs. The hard blocks ask
+// tmux for the pty window's pane_current_path (shellCwds) and start from it
+// AND the session cwd. Within the command, walkSegmentCwds follows each
+// segment's cwd through its cds; git hazards (cwdHazard) and relative write
+// targets are judged per segment against it. Where the cwd is unknown (tmux
+// can't say, or a hop like `z`/`cd -`/`cd $X`), a git hazard verb is denied
+// unless the git call names an absolute repo.
 //
 // Uses only node:child_process / node:fs / node:path, so the command may be
 // swapped from bun to node without code changes.
@@ -766,7 +768,8 @@ function callStampFile(input: any): string | undefined {
   return `${SESSIONS_DIR}/${sessionKey(sid)}.calls/${id.replace(/[^A-Za-z0-9._-]/g, "_")}`
 }
 
-function stampToolStart(input: any, name: unknown, ti: any): void {
+// `knownCwds`: shellCwds already sampled by the caller (saves a tmux query).
+function stampToolStart(input: any, name: unknown, ti: any, knownCwds?: string[] | null): void {
   try {
     const start = Date.now()
     const f = callStampFile(input)
@@ -774,7 +777,7 @@ function stampToolStart(input: any, name: unknown, ti: any): void {
     const rec: Record<string, unknown> = { v: 2, start, cwds: null }
     const { cmd } = extractShell(ti)
     if (shouldAttribute(name, cmd)) {
-      const cwds = shellCwds(input, name, ti)
+      const cwds = knownCwds !== undefined ? knownCwds : shellCwds(input, name, ti)
       rec.cwds = cwds
       // The snapshot (one `git status` + hashing the dirty files) is only
       // worth taking when PostToolUse will attribute this call; a call that
@@ -1771,15 +1774,21 @@ function pathsFromBashWriteTargets(cmd: string): string[] {
   const redirectRe = /(?:^|[\s|;&({`])(?:[0-9]*&?>>?|&>>?)(?:\|?|!)?\s*([^\s|;&()<>`]+|['"][^'"]+['"])/g
   let m: RegExpExecArray | null
   while ((m = redirectRe.exec(expanded)) !== null) push(m[1])
+  // A redirect glued to the word before it (`echo hi>~/.zshrc`) has no
+  // separator for redirectRe; take its absolute / ~ target anyway, so a parsed
+  // harmless target elsewhere in the segment can't hide it.
+  const gluedRedirectRe = /(?:[0-9]*&?>>?|&>>?)[|!]?\s*(['"]?)([~/][^\s|;&()<>'"`]*)\1/g
+  while ((m = gluedRedirectRe.exec(expanded)) !== null) push(m[2])
 
   const commandTargetRe = /(?:^|[\s|;&({`])(cp|mv|tee|truncate|rm|unlink|install|rsync|ln|sed|perl|ruby|awk)\b([^\n;|&()]*)/g
   while ((m = commandTargetRe.exec(expanded)) !== null) {
     const kind = m[1]
     const parts = (m[2].match(/(?:['"][^'"]+['"]|\S+)/g) ?? []).filter((p) => !p.startsWith("-"))
     if (kind === "cp") push(parts.at(-1))
-    else if (kind === "mv") {
+    else if (kind === "mv" || kind === "tee") {
+      // tee writes EVERY file operand, not just the first.
       for (const p of parts) push(p)
-    } else if (kind === "tee") push(parts[0])
+    }
     else if (kind === "truncate") push(parts.at(-1))
     else if (kind === "install" || kind === "rsync" || kind === "ln") push(parts.at(-1))
     else if (kind === "sed" || kind === "perl" || kind === "ruby" || kind === "awk") {
@@ -1814,27 +1823,57 @@ function splitBashSegments(cmd: string): string[] {
 // git-hazard detection (verbatim from source)
 // ---------------------------------------------------------------------------
 
-const GIT_PREFIX = String.raw`(?:^|[\s|;&(])git\s+(?:(?:-[cC]\s*\S+|-c\s+\S+|--(?:git-dir|work-tree)(?:=|\s+)\S+|--(?:no-pager|paginate|bare))\s+)*`
+// `git`, `\git`, `/usr/bin/git`, then any global options: `-C`/`-c` with
+// their value, the value-taking long options (`--git-dir <d>` / `=<d>`, …),
+// `-p`/`-P`, and any other `--flag` / `--flag=value` (`--no-pager`,
+// `--no-optional-locks`, `--bare`, …). A backtick opens a command too
+// (`` x=`git reset --hard` ``). Shell code inside quotes (`bash -c 'git
+// stash'`) is checked as its own command by cwdHazard.
+const GIT_WORD = String.raw`(?:^|[\s|;&(` + "`" + String.raw`])(?:\\|[^\s|;&()<>'"` + "`" + String.raw`]*/)?git\s+`
+const GIT_OPT = String.raw`(?:-[cC]\s*\S+|--(?:git-dir|work-tree|namespace|super-prefix|config-env)(?:=|\s+)\S+|-[pP]|--[a-z][a-z-]*(?:=\S+)?)`
+const GIT_PREFIX = `${GIT_WORD}(?:${GIT_OPT}\\s+)*`
 // Hazard verbs (after GIT_PREFIX). Blocked in the chezmoi source repo:
 //   reset / rebase / merge / restore        (any form)
 //   clean -f / -d / -x / --force            (a dry run — `-n`/`--dry-run`
 //                                            anywhere, incl. `-nd` — is allowed)
 //   stash  push/pop/drop/clear/apply/...    (`stash list` / `stash show` allowed)
-//   switch -f / --force / --discard-changes (bare `switch <branch>` / `-c` allowed)
+//   switch -f / --force / --discard-changes / -C / --force-create
+//                                           (bare `switch <branch>` / `-c` allowed)
 //   commit --amend
-//   push --force / +ref / --mirror
-// `checkout` file-restore forms are handled by gitCheckoutRestoresFiles below.
+//   push --force / +ref / --mirror / --delete / -d / :ref / --prune
+//   rm -r / -f / --force / --recursive, or a `.` / `..` / `:` / glob operand
+//                                           (`rm <file>`, `rm --cached <file>`
+//                                            allowed: git refuses those when the
+//                                            file holds anyone's uncommitted work)
+//   branch -d / -D / -f / -m / -M / -C / --delete / --force / --move
+//                                           (list / create allowed)
+//   update-ref, read-tree, filter-branch, filter-repo, gc, prune (any form)
+//   reflog expire / delete, worktree remove, checkout-index -f / --force
+// `checkout` file-restore forms (and `checkout -B`) are handled by
+// gitCheckoutRestoresFiles below. Every scan stops at a newline (`[^|;&\n]`):
+// a later line's `-n` / `-f` belongs to another command. Backslash-newline
+// continuations are joined first (gitHasHazard), so `git clean \<NL> -fd` is
+// still one command. A closing backtick ends a command as well.
+const GIT_NOT_SEP = String.raw`[^|;&\n` + "`" + "]"
+const GIT_B = String.raw`(?=$|[\s|;&)` + "`" + "])"
+const GIT_END = String.raw`(?=$|[\s|;&)'"` + "`" + "])"
 const GIT_HAZARD_VERBS =
-  String.raw`(?:reset|rebase|merge|restore)(?=$|[\s|;&)])` +
-  String.raw`|clean\b(?![^|;&]*(?:--dry-run|\s-[a-zA-Z]*n))[^|;&]*\s(?:-[a-zA-Z]*[fdx][a-zA-Z]*|--force)(?=$|[\s|;&)])` +
+  String.raw`(?:reset|rebase|merge|restore)${GIT_B}` +
+  String.raw`|clean\b(?!${GIT_NOT_SEP}*(?:--dry-run|\s-[a-zA-Z]*n))${GIT_NOT_SEP}*\s(?:-[a-zA-Z]*[fdx][a-zA-Z]*|--force)${GIT_B}` +
   // Anchored to the stash SUBCOMMAND so a message like `-m 'list of things'`
   // cannot leak into the allowlist.
-  String.raw`|stash(?=$|[\s|;&)])(?!\s+(?:list|show)\b)` +
-  String.raw`|switch\b[^|;&]*\s(?:-f\b|--force\b|--discard-changes\b)` +
-  String.raw`|commit\b[^|;&]*\s--amend\b` +
-  String.raw`|push\b[^|;&]*(?:\s['"]?\+\S+['"]?|\s(?:--force(?:-with-lease)?|-\w*f\w*|--mirror\b))`
+  String.raw`|stash${GIT_B}(?!\s+(?:list|show)\b)` +
+  String.raw`|switch\b${GIT_NOT_SEP}*\s(?:-f\b|--force\b|--discard-changes\b|-C\b|--force-create\b)` +
+  String.raw`|commit\b${GIT_NOT_SEP}*\s--amend\b` +
+  String.raw`|push\b${GIT_NOT_SEP}*(?:\s['"]?\+\S+['"]?|\s(?:--force(?:-with-lease)?|-\w*f\w*|--mirror\b|--delete\b|--prune\b)|\s-[a-zA-Z]*d[a-zA-Z]*${GIT_END}|\s['"]?:[^\s'"])` +
+  String.raw`|rm${GIT_B}${GIT_NOT_SEP}*\s(?:-[a-zA-Z]*[rRf][a-zA-Z]*${GIT_END}|--force\b|--recursive\b|['"]?(?:\.\.?/?|:\S*|\S*[*?[]\S*)['"]?${GIT_END})` +
+  String.raw`|branch${GIT_B}${GIT_NOT_SEP}*\s(?:-[a-zA-Z]*[dDfmMC][a-zA-Z]*${GIT_END}|--delete\b|--force\b|--move\b)` +
+  String.raw`|(?:update-ref|read-tree|filter-branch|filter-repo|gc|prune)${GIT_B}` +
+  String.raw`|reflog\s+(?:expire|delete)\b` +
+  String.raw`|worktree\s+remove\b` +
+  String.raw`|checkout-index\b${GIT_NOT_SEP}*\s(?:-[a-zA-Z]*f[a-zA-Z]*${GIT_END}|--force\b)`
 const GIT_HAZARD_RE = new RegExp(`${GIT_PREFIX}(?:${GIT_HAZARD_VERBS})`)
-const GIT_CHECKOUT_RE = new RegExp(`${GIT_PREFIX}checkout\\b([^|;&]*)`, "g")
+const GIT_CHECKOUT_RE = new RegExp(`${GIT_PREFIX}checkout\\b(${GIT_NOT_SEP}*)`, "g")
 
 // `git checkout` discards working-tree changes when given paths (`-- <path>`,
 // `.`, `-f`, or a bare operand that looks like a path). A plain branch switch
@@ -1851,7 +1890,8 @@ function gitCheckoutRestoresFiles(cmd: string): boolean {
         skipNext = false
         continue
       }
-      if (t === "--" || t === "-f" || t === "--force" || t === "-p" || t === "--patch") return true
+      // -B resets an existing branch to the start point: a ref rewrite.
+      if (t === "--" || t === "-f" || t === "--force" || t === "-p" || t === "--patch" || t === "-B") return true
       if (t === "-b" || t === "-B" || t === "--orphan" || t === "-t" || t === "--track") {
         skipNext = true
         continue
@@ -1863,8 +1903,554 @@ function gitCheckoutRestoresFiles(cmd: string): boolean {
   return false
 }
 
+function joinContinuations(cmd: string): string {
+  return cmd.replace(/\\\r?\n/g, " ")
+}
+
 function gitHasHazard(cmd: string): boolean {
-  return GIT_HAZARD_RE.test(cmd) || gitCheckoutRestoresFiles(cmd)
+  const c = joinContinuations(cmd)
+  return GIT_HAZARD_RE.test(c) || gitCheckoutRestoresFiles(c)
+}
+
+// ---------------------------------------------------------------------------
+// Shell structure: quotes, heredocs, comments, segments, where the shell is
+// ---------------------------------------------------------------------------
+
+// One left-to-right lexer pass over a command line. All three strings have
+// the SAME length, so offsets line up:
+//   text:  $HOME expanded; a backslash-newline continuation (outside quotes
+//          and comments) becomes two spaces;
+//   code:  text with DATA blanked to "_": quoted commit messages (`-m '…'`,
+//          `--message=…`), echo/printf arguments (unless the pipeline feeds a
+//          shell), the body of a heredoc fed to cat/tee/git that expands
+//          nothing and whose output isn't run (`bash -c "$(cat <<EOF …)"`,
+//          `eval`, `source <(…)` run it), and comments. What's left may run.
+//          A double-quoted string holding `$(` or a backtick stays code,
+//          except the `-m "$(cat <<'EOF' … EOF)"` commit idiom.
+//   quiet: text with EVERY quoted span, heredoc body and comment blanked:
+//          only the outer shell's own syntax (separators, parens, cd).
+//   spans: the outermost quoted spans' content ranges; `shellArg` = the
+//          argument of `sh -c`, `eval`, `watch` (shell code of its own).
+// `<<` starts a heredoc only in command context: not inside quotes, not in
+// `$(( ))` / `(( ))` arithmetic (`1 << n` is a shift). Context checks look at
+// most SCAN_WINDOW characters back, so the pass stays linear in the input.
+type Span = { a: number; b: number; data: boolean; shellArg: boolean }
+type ShellScan = { text: string; code: string; quiet: string; spans: Span[] }
+
+const SCAN_WINDOW = 200
+const HEREDOC_HEAD = /^<<(-?)[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/
+// The command owning a heredoc is cat/tee/git: its body is input, not code.
+const DATA_HEREDOC_OWNER = /(?:^|[\s;&|(])(?:cat|tee|git)\b[^;&|()]*$/
+// What precedes `$(`, `<(` or a backtick whose output a shell runs.
+const EXEC_CTX = /(?:^|[\s;&|(])(?:(?:ba|z|da|k|fi)?sh\b[^;&|()]*|eval|source|\.)\s*["']?$/
+// What precedes a quoted argument that is shell code of its own.
+const SHELL_ARG_CTX = /(?:^|[\s;&|(])(?:(?:ba|z|da|k|fi)?sh(?:\s+-[a-zA-Z]+)*\s+-[a-zA-Z]*c[a-zA-Z]*|eval|watch(?:\s+-\S+)*)\s*$/
+// A pipeline stage that runs its input as commands.
+const FEEDS_SHELL = /\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:env\s+(?:\S+=\S*\s+)*)?(?:(?:ba|z|da|k|fi)?sh|eval|source|xargs|\.)(?=$|[\s;&|)])/
+
+function scanShell(cmd: string): ShellScan {
+  const t = expandHomeVars(cmd).split("")
+  const n = t.length
+  const code = t.slice()
+  const quiet = t.slice()
+  const blank = (arr: string[], a: number, b: number) => {
+    for (let i = a; i < b; i++) arr[i] = "_"
+  }
+  const win = (arr: string[], a: number, b: number) => arr.slice(Math.max(a, b - SCAN_WINDOW), b).join("")
+  type Frame = { kind: "dq" | "sub" | "arith" | "bt"; start: number; depth: number; exec: boolean; saved: number }
+  const stack: Frame[] = []
+  const spans: Span[] = []
+  const echoSpans: Span[] = []
+  const pending: { strip: boolean; quoted: boolean; delim: string; owner: boolean; exec: boolean; headEnd: number }[] = []
+  let cmdStart = 0 // start of the current simple command (for context checks)
+  const execHere = () => stack.some((f) => f.exec)
+  const join = (i: number) => {
+    t[i] = t[i + 1] = code[i] = code[i + 1] = quiet[i] = quiet[i + 1] = " "
+  }
+  const push = (kind: Frame["kind"], start: number, depth: number, exec: boolean, nextCmd: number) => {
+    stack.push({ kind, start, depth, exec, saved: cmdStart })
+    cmdStart = nextCmd
+  }
+  // A finished quoted span [i+1, j) opened at i.
+  const span = (i: number, j: number, q: string) => {
+    if (stack.some((f) => f.kind === "dq")) return // inside an outer "…": that one decides
+    let data = false
+    let echo = false
+    const dyn =
+      q === '"' &&
+      /\$\(|`/.test(
+        code
+          .slice(i + 1, j)
+          .join("")
+          .replace(/\$\(\s*cat\s+<<-?\s*['"]?\w+['"]?/g, ""),
+      )
+    if (!dyn) {
+      const head = quiet.slice(cmdStart, Math.min(i, cmdStart + SCAN_WINDOW)).join("")
+      if (/^\s*(?:echo|printf)\b/.test(head)) data = echo = true
+      else if (/(?:^|[\s;&|(])(?:\\|\S*\/)?git\b/.test(head) && /(?:\s-[a-zA-Z]*m|\s--message=?)\s*$/.test(win(quiet, cmdStart, i))) data = true
+    }
+    const sp: Span = { a: i + 1, b: j, data, shellArg: SHELL_ARG_CTX.test(win(quiet, cmdStart, i)) }
+    if (data) blank(code, i + 1, j)
+    blank(quiet, i + 1, j)
+    spans.push(sp)
+    if (echo) echoSpans.push(sp)
+  }
+  // Heredoc bodies start on the line after their header; returns where the
+  // shell resumes (after the last delimiter line).
+  const readBodies = (from: number): number => {
+    let pos = from
+    for (const h of pending) {
+      const bodyStart = pos
+      let end = n
+      let after = n
+      while (pos < n) {
+        let e = pos
+        while (e < n && t[e] !== "\n") e++
+        const line = t.slice(pos, e).join("")
+        if ((h.strip ? line.replace(/^\t+/, "") : line).trim() === h.delim) {
+          end = pos
+          after = e < n ? e + 1 : n
+          break
+        }
+        pos = e + 1
+      }
+      pos = after
+      const tail = t.slice(h.headEnd, from - 1).join("")
+      const data = h.owner && !h.exec && !tail.includes("|") && (h.quoted || !/\$\(|`/.test(t.slice(bodyStart, end).join("")))
+      blank(quiet, bodyStart, end)
+      if (data) blank(code, bodyStart, end)
+    }
+    pending.length = 0
+    return pos
+  }
+  let i = 0
+  while (i < n) {
+    const f = stack[stack.length - 1]
+    const c = t[i]
+    if (f?.kind === "arith") {
+      if (c === "(") f.depth++
+      else if (c === ")" && --f.depth === 0) {
+        stack.pop()
+        cmdStart = f.saved
+      }
+      i++
+      continue
+    }
+    if (f?.kind === "dq") {
+      if (c === "\\") {
+        if (t[i + 1] === "\n") join(i)
+        i += 2
+      } else if (c === '"') {
+        stack.pop()
+        cmdStart = f.saved
+        span(f.start, i, '"')
+        i++
+      } else if (c === "$" && t[i + 1] === "(" && t[i + 2] === "(") {
+        push("arith", i, 2, false, cmdStart)
+        i += 3
+      } else if (c === "$" && t[i + 1] === "(") {
+        push("sub", i, 1, EXEC_CTX.test(win(quiet, f.saved, f.start)), i + 2)
+        i += 2
+      } else if (c === "`") {
+        push("bt", i, 0, EXEC_CTX.test(win(quiet, f.saved, f.start)), i + 1)
+        i++
+      } else i++
+      continue
+    }
+    // command context: top level, `$( … )`, `<( … )`, backticks
+    if (c === "\\") {
+      if (t[i + 1] === "\n") join(i)
+      i += 2
+    } else if (c === "\n") {
+      i = pending.length > 0 ? readBodies(i + 1) : i + 1
+      cmdStart = i
+    } else if (c === "'") {
+      let j = i + 1
+      while (j < n && t[j] !== "'") j++
+      span(i, j, "'")
+      i = j + 1
+    } else if (c === '"') {
+      push("dq", i, 0, false, cmdStart)
+      i++
+    } else if (c === "#" && (i === 0 || /[\s;&|(]/.test(t[i - 1]))) {
+      let e = i
+      while (e < n && t[e] !== "\n") e++
+      blank(code, i, e)
+      blank(quiet, i, e)
+      i = e
+    } else if (c === "<" && t[i + 1] === "<") {
+      if (t[i + 2] === "<") {
+        i += 3 // here-string
+        continue
+      }
+      const m = HEREDOC_HEAD.exec(t.slice(i, i + 128).join(""))
+      if (!m) {
+        i += 2
+        continue
+      }
+      pending.push({
+        strip: m[1] === "-",
+        quoted: m[2] !== "",
+        delim: m[3],
+        owner: DATA_HEREDOC_OWNER.test(win(quiet, cmdStart, i)),
+        exec: execHere(),
+        headEnd: i + m[0].length,
+      })
+      i += m[0].length
+    } else if (c === "$" && t[i + 1] === "(" && t[i + 2] === "(") {
+      push("arith", i, 2, false, cmdStart)
+      i += 3
+    } else if (c === "$" && t[i + 1] === "(") {
+      push("sub", i, 1, EXEC_CTX.test(win(quiet, cmdStart, i)), i + 2)
+      i += 2
+    } else if ((c === "<" || c === ">") && t[i + 1] === "(") {
+      push("sub", i, 1, EXEC_CTX.test(win(quiet, cmdStart, i)), i + 2)
+      i += 2
+    } else if (c === "(" && t[i + 1] === "(" && /^\s*$/.test(win(quiet, cmdStart, i))) {
+      push("arith", i, 2, false, cmdStart) // `(( … ))` arithmetic command
+      i += 2
+    } else if (c === "`") {
+      if (f?.kind === "bt") {
+        stack.pop()
+        cmdStart = f.saved
+      } else push("bt", i, 0, EXEC_CTX.test(win(quiet, cmdStart, i)), i + 1)
+      i++
+    } else if (c === "(") {
+      if (f?.kind === "sub") f.depth++
+      cmdStart = i + 1
+      i++
+    } else if (c === ")") {
+      if (f?.kind === "sub" && --f.depth === 0) {
+        stack.pop()
+        cmdStart = f.saved
+      }
+      i++
+    } else {
+      if (c === ";" || c === "|" || c === "&") cmdStart = i + 1
+      i++
+    }
+  }
+  // An unterminated "…" runs to the end.
+  const dq = stack.find((f) => f.kind === "dq")
+  if (dq) {
+    stack.length = 0
+    span(dq.start, n, '"')
+  }
+  // echo/printf text piped into a shell is code after all.
+  if (echoSpans.length > 0) {
+    const q = quiet.join("")
+    let p = 0
+    for (const r of segmentRanges(q)) {
+      let feeds: boolean | undefined
+      for (; p < echoSpans.length && echoSpans[p].a < r.b; p++) {
+        const sp = echoSpans[p]
+        if (sp.a < r.a) continue
+        feeds ??= FEEDS_SHELL.test(q.slice(r.a, r.b))
+        if (!feeds) continue
+        for (let k = sp.a; k < sp.b; k++) code[k] = t[k]
+        sp.data = false
+        sp.shellArg = true // its text is the commands the shell runs
+      }
+    }
+  }
+  return { text: t.join(""), code: code.join(""), quiet: quiet.join(""), spans }
+}
+
+// Command boundaries in `quiet`: newline, `;`, `&&`, `||`, and a single `&`
+// (which also backgrounds what precedes it: `bg`). `>&`, `&>`, `|&` are
+// redirections, not separators. `sep` = what ended the range.
+function segmentRanges(quiet: string): { a: number; b: number; bg: boolean; sep: string }[] {
+  const out: { a: number; b: number; bg: boolean; sep: string }[] = []
+  let start = 0
+  const cut = (end: number, next: number, sep: string) => {
+    out.push({ a: start, b: end, bg: sep === "&", sep })
+    start = next
+  }
+  for (let i = 0; i < quiet.length; i++) {
+    const c = quiet[i]
+    if (c === "\n" || c === ";") cut(i, i + 1, c)
+    else if (c === "|" && quiet[i + 1] === "|") {
+      cut(i, i + 2, "||")
+      i++
+    } else if (c === "&") {
+      if (quiet[i + 1] === "&") {
+        cut(i, i + 2, "&&")
+        i++
+      } else if (!"<>|".includes(quiet[i - 1] ?? "") && quiet[i + 1] !== ">") cut(i, i + 1, "&")
+    }
+  }
+  cut(quiet.length, quiet.length, "")
+  return out
+}
+
+type SegCwd = {
+  seg: string // the segment's text (trimmed)
+  code: string // the same range of ShellScan.code
+  a: number // its range in ShellScan.text
+  b: number
+  cur: string[] | null // where the shell stands while it runs (null = unknown)
+  all: string[] // every directory the shell may have stood in so far
+  evalCd: boolean // `eval "… cd …"`: an unfollowable hop in the current shell
+}
+
+// Cap on `all`: past it every relative hop is unknown (resolving each one
+// against every directory seen doubles the set); absolute hops still count.
+const CWD_SET_CAP = 64
+
+// `git rev-parse --show-toplevel` from `dir`, by the filesystem alone (no
+// git fork): the nearest ancestor holding `.git`. null = not in a repo.
+function repoRoot(dir: string): string | null {
+  for (let d = dir; ; d = dirname(d)) {
+    if (existsSync(d + "/.git")) return d
+    if (d === dirname(d)) return null
+  }
+}
+
+// Walk a command's segments in order, tracking where its shell stands.
+//   cur: known only while every hop so far was followable: a literal `cd` /
+//        `pushd` to an existing directory (bare `cd` = $HOME). Unknown after
+//        `cd -`, `cd $X`, popd, a zoxide hop (`z`, `\cd`, or a cd target that
+//        isn't an existing directory — `cd` is zoxide here), or from an
+//        unknown start.
+//   all: the start dirs plus every hop, resolved against everything seen —
+//        what a relative path may mean once cur is unknown.
+// Scoping: a cd inside `( … )` / `$( … )` ends at the `)`; a cd in a
+// backgrounded (`&`) segment or a pipeline moves only that child shell; a cd
+// inside quotes or a heredoc is data (or another shell's business — see
+// cwdHazard), never this shell's.
+function walkSegmentCwds(cmd: string, start: string[] | null, scan: ShellScan = scanShell(cmd)): SegCwd[] {
+  const { text, code, quiet, spans } = scan
+  const home = normalizePath(process.env.HOME || "/")
+  let cur: string[] | null = start && start.length > 0 ? [...new Set(start.map(normalizePath))] : null
+  const all = new Set<string>(cur ?? [])
+  const stack: (string[] | null)[] = []
+  // `sep`: what ends the cd's segment. A literal path that doesn't exist (yet)
+  // is entered after `&&` (`git worktree add ../wt && cd ../wt`), but after
+  // `;` / newline the cd may fail and the old cwd still counts.
+  const hop = (t: string | undefined, sep: string) => {
+    let next: string[]
+    let literal = true
+    if (t === undefined || t === "" || t.startsWith("#")) next = [home]
+    else if (t.startsWith("-") || /[$`*?[]/.test(t) || (t.startsWith("~") && t !== "~" && !t.startsWith("~/"))) {
+      cur = null
+      return
+    } else if (t.startsWith("/") || t.startsWith("~")) next = [normalizePath(t)] // still followed past the cap
+    else {
+      literal = t.includes("/") || t === "." || t === ".."
+      if (all.size >= CWD_SET_CAP) {
+        cur = null
+        return
+      }
+      if (!cur) {
+        for (const d of [...all]) {
+          if (all.size >= CWD_SET_CAP) break
+          all.add(normalizePath(resolve(d, t)))
+        }
+        return // still unknown
+      }
+      next = [...new Set(cur.map((d) => normalizePath(resolve(d, t))))]
+    }
+    for (const d of next) if (all.size < CWD_SET_CAP) all.add(d)
+    const dirs = next.filter(isDirectory)
+    if (dirs.length > 0) cur = dirs
+    else if (!literal) cur = null // a bare word that isn't a directory: a zoxide query
+    else if (sep === "&&") cur = next
+    else cur = cur ? [...new Set([...cur, ...next])] : null
+  }
+  // `cd "$(git rev-parse --show-toplevel)"`: the repo root holding cur.
+  const toTop = () => {
+    const roots = cur ? [...new Set(cur.map(repoRoot).filter((r): r is string => r !== null))] : []
+    cur = roots.length > 0 ? roots : null
+    for (const r of roots) if (all.size < CWD_SET_CAP) all.add(r)
+  }
+  const out: SegCwd[] = []
+  const CD_KW = /(?<=^|[\s|;&({])(?:cd|pushd)(?=$|[\s;&|)])/g
+  const ZOXIDE_KW = /(?<=^|[\s|;&({])(?:popd|z|zi|\\cd|__zoxide_zi?)(?=$|[\s;&|)])/g
+  const CD_OPTS = String.raw`(?:[ \t]+(?:-[LPe@]+|--)(?=[\s;&|)]|$))*`
+  const CD_TARGET = new RegExp(CD_OPTS + String.raw`(?:[ \t]+(?:'([^']*)'|"([^"]*)"|([^\s;&|()]+)))?`, "y")
+  const CD_TOPLEVEL = new RegExp(
+    CD_OPTS + String.raw`[ \t]+(["']?)(?:\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)|` + "`" + String.raw`\s*git\s+rev-parse\s+--show-toplevel\s*` + "`" + String.raw`)\1(?=$|[\s;&|)])`,
+    "y",
+  )
+  let sp = 0 // spans before this segment are done with (both lists are in order)
+  // A cd that may not run — after `&&` / `||`, or inside if/case/while/until/
+  // for/select — moves only the rest of its own `&&` chain (which runs only if
+  // the cd did). When that chain ends, cur is the union of where the shell
+  // was before the chain's first such hop (`chainBase`) and where it is now.
+  let prevSep = ""
+  let construct = 0
+  let chainBase: string[] | null | undefined
+  const union = (x: string[] | null, y: string[] | null) => (x && y ? [...new Set([...x, ...y])] : null)
+  for (const { a, b, bg, sep } of segmentRanges(quiet)) {
+    const q = quiet.slice(a, b)
+    if (/^\s*(?:if|while|until|for|case|select)\b/.test(q)) construct++
+    const conditional = construct > 0 || prevSep === "&&" || prevSep === "||"
+    const events = new Map<number, "cd" | "z">()
+    for (const mm of q.matchAll(CD_KW)) events.set(mm.index!, "cd")
+    for (const mm of q.matchAll(ZOXIDE_KW)) events.set(mm.index!, "z")
+    // Parens after the segment's last real character close a subshell AFTER
+    // this command ran; one before it (`$(…)/x`) closes mid-command.
+    let last = q.length - 1
+    while (last >= 0 && /[\s)]/.test(q[last])) last--
+    const pipeline = /(?:^|[^|])\|(?![|&])/.test(q)
+    const before = cur
+    const beforeDepth = stack.length
+    let pops = 0
+    for (let i = 0; i < q.length; i++) {
+      const c = q[i]
+      if (c === "(") stack.push(cur)
+      else if (c === ")") {
+        if (i > last) pops++
+        else if (stack.length > 0) cur = stack.pop()!
+      } else {
+        const ev = events.get(i)
+        if (ev && conditional && chainBase === undefined) chainBase = cur
+        if (ev === "z") cur = null
+        else if (ev === "cd") {
+          const at = a + i + (q.startsWith("pushd", i) ? 5 : 2)
+          CD_TOPLEVEL.lastIndex = at
+          if (CD_TOPLEVEL.test(text)) toTop()
+          else {
+            CD_TARGET.lastIndex = at
+            const tm = CD_TARGET.exec(text)
+            hop(tm ? (tm[1] ?? tm[2] ?? tm[3]) : undefined, sep)
+          }
+        }
+      }
+    }
+    let a2 = a
+    let b2 = b
+    while (a2 < b2 && /\s/.test(text[a2])) a2++
+    while (b2 > a2 && /\s/.test(text[b2 - 1])) b2--
+    while (sp < spans.length && spans[sp].a < a) sp++
+    let evalCd = false
+    if (/^\s*eval\b/.test(q)) {
+      for (let k = sp; k < spans.length && spans[k].a < b; k++) {
+        const s = spans[k]
+        if (!s.data && /(?:^|[\s;&|({])(?:cd|pushd|popd|z)(?=$|[\s;&|)])/.test(text.slice(s.a, s.b))) evalCd = true
+      }
+    }
+    if (a2 < b2) out.push({ seg: text.slice(a2, b2), code: code.slice(a2, b2), a: a2, b: b2, cur: cur ? [...cur] : null, all: [...all], evalCd })
+    for (; pops > 0 && stack.length > 0; pops--) cur = stack.pop()!
+    if (bg || pipeline) {
+      cur = before
+      stack.length = Math.min(stack.length, beforeDepth)
+    }
+    if (evalCd) cur = null
+    if (/^\s*(?:fi|done|esac)\b/.test(q)) construct = Math.max(0, construct - 1)
+    if (sep !== "&&" && chainBase !== undefined) {
+      cur = union(chainBase, cur)
+      chainBase = undefined
+    }
+    prevSep = sep
+  }
+  return out
+}
+
+// `git -C /abs`, `--git-dir=/abs`, `GIT_DIR=/abs …`: the git call names its
+// repo, so the shell's cwd doesn't matter (bashHazardsChezmoiRepo judges
+// these when they name the source).
+const EXPLICIT_REPO_RE = new RegExp(
+  `${GIT_WORD}(?:${GIT_OPT}\\s+)*?(?:-C\\s*|--git-dir(?:=|\\s+)|--work-tree(?:=|\\s+))['"]?[/~]` +
+    String.raw`|(?:^|[\s|;&(])(?:export\s+)?GIT_(?:DIR|WORK_TREE)=['"]?[/~]`,
+)
+
+// Git hazards judged by where the shell stands, segment by segment (Pattern
+// A3/B's successor). `start` = where the shell is when the command begins
+// (null = unknown). A hazard segment is denied when its cwd is inside the
+// source tree ("src"), or unknown ("unknown": an unknown start, or a hop
+// this text can't follow) unless the git call names an absolute repo.
+// Commit messages, echo text and data heredocs are blanked (ShellScan.code).
+// Shell code inside quotes — the argument of `sh/bash/zsh -c`, `eval`,
+// `watch`, or any quoted text that changes directory — is walked again as a
+// command of its own from the segment's cwd, so `bash -c 'git stash'` and
+// `bash -c 'cd <src> && git stash'` are caught, while `rg 'git reset' x`
+// (a search, not a command) is not.
+const CD_ISH = /(?:^|[\s;&|({])(?:cd|pushd|popd|z|zi|\\cd)(?=$|[\s;&|)])/
+const NESTED_MAX_DEPTH = 3
+
+// Walk `cmd` segment by segment and, for each segment, its quoted spans that
+// are shell code of their own (a `sh -c` / `eval` / `watch` argument, or
+// quoted text that cds) — `visit(s, inner?)`: inner = such a span's text.
+// Linear: segments and spans are both in order.
+function walkWithNested(
+  cmd: string,
+  start: string[] | null,
+  depth: number,
+  visit: (s: SegCwd, nested: string[]) => boolean,
+): boolean {
+  const scan = scanShell(cmd)
+  let p = 0
+  for (const s of walkSegmentCwds(cmd, start, scan)) {
+    const nested: string[] = []
+    while (p < scan.spans.length && scan.spans[p].a < s.a) p++
+    if (depth < NESTED_MAX_DEPTH) {
+      for (let k = p; k < scan.spans.length && scan.spans[k].a < s.b; k++) {
+        const sp = scan.spans[k]
+        if (sp.data) continue
+        const inner = scan.text.slice(sp.a, sp.b)
+        if (sp.shellArg || CD_ISH.test(inner)) nested.push(inner)
+      }
+    }
+    if (visit(s, nested)) return true
+  }
+  return false
+}
+
+function cwdHazard(cmd: string, start: string[] | null, depth = 0): { kind: "src"; dir: string } | { kind: "unknown" } | null {
+  let hit: { kind: "src"; dir: string } | { kind: "unknown" } | null = null
+  walkWithNested(cmd, start, depth, (s, nested) => {
+    for (const inner of nested) {
+      hit = cwdHazard(inner, s.cur, depth + 1)
+      if (hit) return true
+    }
+    hit = segHazard(s)
+    return hit !== null
+  })
+  return hit
+}
+
+function segHazard(s: SegCwd): { kind: "src"; dir: string } | { kind: "unknown" } | null {
+  if (!gitHasHazard(s.code)) return null
+  if (EXPLICIT_REPO_RE.test(s.code)) return null
+  if (s.cur === null) return { kind: "unknown" }
+  const dir = s.cur.find((d) => isInChezmoiSource(d))
+  return dir ? { kind: "src", dir } : null
+}
+
+// STEP C's check, per segment and into nested shell code (`bash -c "cd X &&
+// echo > f"` resolves f against X): the managed path a segment writes, if
+// any. A relative target resolves against where the shell stands (`cur`),
+// or every directory it may have reached (`all`) once a hop can't be followed.
+function managedWriteHit(cmd: string, start: string[], managed: string[], depth = 0): string | null {
+  let hit: string | null = null
+  walkWithNested(cmd, start, depth, (s, nested) => {
+    for (const inner of nested) {
+      hit = managedWriteHit(inner, s.cur ?? s.all, managed, depth + 1)
+      if (hit) return true
+    }
+    const writeTargets = pathsFromBashWriteTargets(s.seg)
+    // Only WRITE targets are blocked; a segment that merely reads or names a
+    // managed path (e.g. `cat ~/.zshrc`) has no write target -> allowed.
+    if (!bashHasWriteIntent(s.seg) && writeTargets.length === 0) return false
+    // Prefer explicit write targets (incl. glued `cmd>~/x` redirects); fall
+    // back to all path tokens only when a write-intent segment produced no
+    // parseable target (exotic quoting).
+    const candidatePaths = writeTargets.length > 0 ? writeTargets : pathsFromBashCommand(s.seg)
+    const where = s.cur ?? s.all
+    const dirs: (string | undefined)[] = where.length > 0 ? where : [undefined]
+    for (const raw of candidatePaths) {
+      for (const d of dirs) {
+        const p = normalizePath(resolveAgainstWorkdir(raw, d))
+        if (touchesManagedPath(p, managed)) {
+          hit = p
+          return true
+        }
+      }
+    }
+    return false
+  })
+  return hit
 }
 
 function resolveAgainstWorkdir(raw: string, workdir?: string): string {
@@ -1872,69 +2458,38 @@ function resolveAgainstWorkdir(raw: string, workdir?: string): string {
   return resolve(normalizePath(workdir), raw)
 }
 
-function bashHazardsChezmoiRepo(cmd: string, workdir?: string): boolean {
-  const expanded = expandHomeVars(cmd)
+// Hazards that name the source repo explicitly, wherever the shell stands.
+// Dirs are read from the text; the hazard test runs on ShellScan.code (same
+// offsets), so a commit message can't trip it. The cwd-dependent forms (the
+// old Pattern A3 "workdir is the source" and Pattern B "cd <src> && …") are
+// cwdHazard's job: it follows each segment's real cwd.
+function bashHazardsChezmoiRepo(cmd: string): boolean {
+  const { text, code } = scanShell(cmd)
+  const inSrc = (d: string) => {
+    const dir = normalizePath(d.replace(/\/\.git$/, ""))
+    return dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")
+  }
   // `chezmoi git [--] <verb ...>` always runs in the source repo: re-test the
   // tail with the same hazard set as a bare `git` (no duplicated alternation).
   const chezmoiGitRe = /(?:^|[\s|;&(])chezmoi\s+git\b\s+(?:--\s+)?/g
-  let cm: RegExpExecArray | null
-  while ((cm = chezmoiGitRe.exec(expanded)) !== null) {
-    if (gitHasHazard("git " + expanded.slice(cm.index + cm[0].length))) return true
+  let m: RegExpExecArray | null
+  while ((m = chezmoiGitRe.exec(code)) !== null) {
+    if (gitHasHazard("git " + code.slice(m.index + m[0].length))) return true
   }
   // Pattern A1: explicit `git -C <chezmoi-src>` + write-class git verb.
-  const gitDashCRe = /(?:^|[\s|;&(])git\s+(?:(?:-[cC]\s*\S+|-c\s+\S+|--(?:git-dir|work-tree)(?:=|\s+)\S+|--(?:no-pager|paginate|bare))\s+)*-C\s*(['"]?)([^\s'"|;&]+)\1/g
-  let m: RegExpExecArray | null
-  while ((m = gitDashCRe.exec(expanded)) !== null) {
-    const dir = normalizePath(m[2])
-    if (
-      (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) &&
-      gitHasHazard(expanded.slice(m.index))
-    ) {
-      return true
-    }
+  const gitDashCRe = new RegExp(`${GIT_WORD}(?:${GIT_OPT}\\s+)*?-C\\s*(['"]?)([^\\s'"|;&]+)\\1`, "g")
+  while ((m = gitDashCRe.exec(text)) !== null) {
+    if (inSrc(m[2]) && gitHasHazard(code.slice(m.index))) return true
   }
   // Pattern A2: `git --git-dir=<chezmoi-src>/.git` (or --work-tree=) + verb.
-  const gitDirRe = /(?:^|[\s|;&(])git\s+(?:[^|;&]*?\s+)?(?:--git-dir|--work-tree)(?:=|\s+)(['"]?)([^\s'"|;&]+)\1/g
-  while ((m = gitDirRe.exec(expanded)) !== null) {
-    const dir = normalizePath(m[2].replace(/\/\.git$/, ""))
-    if (
-      (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) &&
-      gitHasHazard(expanded.slice(m.index))
-    ) {
-      return true
-    }
+  const gitDirRe = /(?:^|[\s|;&(])(?:\\|[^\s|;&()<>'"]*\/)?git\s+(?:[^|;&\n]*?\s+)?(?:--git-dir|--work-tree)(?:=|\s+)(['"]?)([^\s'"|;&]+)\1/g
+  while ((m = gitDirRe.exec(text)) !== null) {
+    if (inSrc(m[2]) && gitHasHazard(code.slice(m.index))) return true
   }
   // Pattern A2.5: GIT_DIR / GIT_WORK_TREE env vars in the command preamble.
   const gitEnvRe = /(?:^|[\s|;&(])(?:export\s+)?(?:GIT_DIR|GIT_WORK_TREE)=(['"]?)([^\s'"|;&]+)\1/g
-  while ((m = gitEnvRe.exec(expanded)) !== null) {
-    const dir = normalizePath(m[2].replace(/\/\.git$/, ""))
-    if (
-      (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) &&
-      gitHasHazard(expanded.slice(m.index))
-    ) {
-      return true
-    }
-  }
-  // Pattern A3: workdir parameter pointed at chezmoi src + a hazard verb.
-  if (workdir) {
-    const dir = normalizePath(workdir)
-    if (
-      (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) &&
-      gitHasHazard(expanded)
-    ) {
-      return true
-    }
-  }
-  // Pattern B: implicit cwd via cd/pushd into chezmoi src + later git verb.
-  const cdRe = /(?:^|[\s|;&({])(?:cd|pushd)\s+(['"]?)([^\s'"|;&]+)\1/g
-  while ((m = cdRe.exec(expanded)) !== null) {
-    const dir = normalizePath(m[2])
-    if (dir === CHEZMOI_SOURCE_DIR || dir.startsWith(CHEZMOI_SOURCE_DIR + "/")) {
-      const restOfCmd = expanded.slice(m.index + m[0].length)
-      if (gitHasHazard(restOfCmd)) {
-        return true
-      }
-    }
+  while ((m = gitEnvRe.exec(text)) !== null) {
+    if (inSrc(m[2]) && gitHasHazard(code.slice(m.index))) return true
   }
   return false
 }
@@ -2007,11 +2562,18 @@ function handlePreToolUse(input: any): void {
   const ti = input.tool_input ?? {}
   const name = input.tool_name
   if (VERBOSE) debugLog("pretool", { session_id: input.session_id, name })
+  // Where the shell actually stands (null = unknown): Bash's hook cwd; for a
+  // pty run, tmux's pane_current_path of this session's window — the
+  // persistent shell keeps every earlier `cd`, so the session cwd says
+  // nothing; spawn_pty's cwd param or $HOME. Sampled once, used by the stamp
+  // and by STEP B / C.
+  const shellCmd = isShellTool(name) ? extractShell(ti).cmd : ""
+  const shellAt: string[] | null = shellCmd ? shellCwds(input, name, ti) : null
   // Start of this call's attribution window. Written before any deny below
   // (a denied call never gets a PostToolUse; GC sweeps its stamp). For a call
   // that can time-attribute it also carries the shell's cwd and the source
   // repo's dirty-set snapshot (see the attribution section).
-  if (isShellTool(name)) stampToolStart(input, name, ti)
+  if (isShellTool(name)) stampToolStart(input, name, ti, shellCmd ? shellAt : undefined)
 
   // STEP A: edit-class tools (Edit/Write/MultiEdit/NotebookEdit). EXACT managed
   // match (mirrors the opencode BLOCKED_TOOLS path — NOT prefix; prefix on
@@ -2041,36 +2603,57 @@ function handlePreToolUse(input: any): void {
     }
   }
 
-  // Shell branch: Bash and the MCP pty shell tools (mcp__pty__run has no
-  // per-call cwd, so relative paths resolve against the session cwd — see the
-  // LIMITATION note in the header).
+  // Shell branch: Bash and the MCP pty shell tools. Every check runs against
+  // the session cwd (as before) AND where the shell really stands (shellAt) —
+  // see the CWD note in the header.
   const { cmd, workdir } = isShellTool(name) ? extractShell(ti) : { cmd: "", workdir: undefined }
   const resolvedWorkdir = workdir || input.cwd
+  const bases = [...new Set([...(resolvedWorkdir ? [resolvedWorkdir] : []), ...(shellAt ?? [])])]
 
-  // STEP B: git-hazard against the chezmoi source repo.
-  if (cmd && bashHazardsChezmoiRepo(cmd, resolvedWorkdir)) {
-    debugLog("deny git hazard", { session_id: input.session_id })
-    denyPreToolUse(GIT_HAZARD_MESSAGE + "\nCommand (truncated): " + cmd.slice(0, 240))
-  }
-
-  // STEP C: per-segment write check (PREFIX-aware touchesManagedPath).
+  // STEP B: git-hazard against the chezmoi source repo: named explicitly
+  // (bashHazardsChezmoiRepo), or by where each segment runs (cwdHazard, from
+  // the session cwd and the shell's real cwd; from nowhere known when a pty's
+  // cwd can't be determined).
   if (cmd) {
-    const managed = loadManaged({ coldSpawnOnly: true })
-    for (const seg of splitBashSegments(cmd)) {
-      const writeTargets = pathsFromBashWriteTargets(seg)
-      // Only WRITE targets are blocked; a segment that merely reads or names a
-      // managed path (e.g. `cat ~/.zshrc`) has no write target -> allowed.
-      if (!bashHasWriteIntent(seg) && writeTargets.length === 0) continue
-      // Prefer explicit write targets; fall back to all path tokens only when a
-      // write-intent segment produced no parseable target (exotic quoting).
-      const candidatePaths = writeTargets.length > 0 ? writeTargets : pathsFromBashCommand(seg)
-      for (const raw of candidatePaths) {
-        const p = normalizePath(resolveAgainstWorkdir(raw, resolvedWorkdir))
-        if (touchesManagedPath(p, managed)) {
-          debugLog("deny bash write managed", { session_id: input.session_id, path: p })
-          denyPreToolUse(managedPathError(p))
+    const unknownPtyCwd = name === "mcp__pty__run" && shellAt === null
+    let note = ""
+    let hazard = bashHazardsChezmoiRepo(cmd)
+    if (!hazard) {
+      const h = cwdHazard(cmd, unknownPtyCwd ? null : bases)
+      if (h) {
+        hazard = true
+        if (h.kind === "unknown" && unknownPtyCwd) {
+          note =
+            `\nThe pty shell's cwd could not be determined, so it may be the source repo.\n` +
+            `If this is another repo, start the command with \`cd /abs/path/to/repo && \`.`
+        } else if (h.kind === "unknown") {
+          note =
+            `\nThe command changes directory in a way this guard can't follow (\`cd "$d"\`,\n` +
+            `\`cd $VAR\`, z, \`cd -\`, popd, or a bare name that isn't an existing directory),\n` +
+            `so the git command may run in the source repo. Use a literal absolute path:\n` +
+            `\`cd /abs/path/to/repo && git …\` (or \`git -C /abs/path/to/repo …\`).`
+        } else if (name === "mcp__pty__run" && (shellAt ?? []).some((d) => normalizePath(d) === h.dir)) {
+          note = `\nThe pty shell is in ${h.dir} (the persistent shell keeps earlier \`cd\`s).`
         }
       }
+    }
+    if (hazard) {
+      debugLog("deny git hazard", { session_id: input.session_id, unknownPtyCwd })
+      denyPreToolUse(GIT_HAZARD_MESSAGE + note + "\nCommand (truncated): " + cmd.slice(0, 240))
+    }
+  }
+
+  // STEP C: per-segment write check (PREFIX-aware touchesManagedPath). A
+  // relative target resolves against where the shell stands at that segment
+  // (walkSegmentCwds `cur`: the session cwd and the shell's real cwd, moved by
+  // every followable `cd`), or — once a hop can't be followed — against every
+  // directory it may have reached (`all`).
+  if (cmd) {
+    const managed = loadManaged({ coldSpawnOnly: true })
+    const p = managedWriteHit(cmd, bases, managed)
+    if (p) {
+      debugLog("deny bash write managed", { session_id: input.session_id, path: p })
+      denyPreToolUse(managedPathError(p))
     }
   }
 
@@ -2135,23 +2718,24 @@ function handlePostToolUse(input: any): void {
       if (cmd) {
         const paths: string[] = []
         const targets: string[] = []
-        for (const seg of splitBashSegments(cmd)) {
+        // Relative targets resolve against the source-tree directories the
+        // shell stands in at that segment (walkSegmentCwds `cur`, from the
+        // session cwd and the pty's cwd at the call's start; `all` once a hop
+        // can't be followed).
+        const bases = [...(resolvedWorkdir ? [resolvedWorkdir] : []), ...(stamp?.cwds ?? [])]
+        for (const { seg, cur, all } of walkSegmentCwds(cmd, bases)) {
+          const srcDirs = (cur ?? all).filter((d) => isInChezmoiSource(d))
           const targetPaths = pathsFromBashWriteTargets(seg)
-          if (
-            !bashHasWriteIntent(seg) &&
-            !(resolvedWorkdir && isInChezmoiSource(resolvedWorkdir) && targetPaths.length > 0)
-          ) {
-            continue
-          }
-          paths.push(...pathsFromBashCommand(seg), ...targetPaths)
-          targets.push(...targetPaths)
+          if (!bashHasWriteIntent(seg) && !(srcDirs.length > 0 && targetPaths.length > 0)) continue
+          const resolveSeg = (ps: string[]) =>
+            srcDirs.length === 0
+              ? ps
+              : ps.flatMap((p) => (p.startsWith("/") || p.startsWith("~") ? [p] : srcDirs.map((d) => resolveAgainstWorkdir(p, d))))
+          paths.push(...resolveSeg([...pathsFromBashCommand(seg), ...targetPaths]))
+          targets.push(...resolveSeg(targetPaths))
         }
-        const resolveAll = (ps: string[]) =>
-          resolvedWorkdir && isInChezmoiSource(resolvedWorkdir)
-            ? ps.map((p) => resolveAgainstWorkdir(p, resolvedWorkdir))
-            : ps
-        rememberSourceWrites(state, resolveAll(paths))
-        if (!shellCallFailed(input)) claimExactWrites(state, resolveAll(targets))
+        rememberSourceWrites(state, paths)
+        if (!shellCallFailed(input)) claimExactWrites(state, targets)
       }
     }
     // STEP attribute by evidence: what actually changed on disk while this

@@ -147,36 +147,102 @@ env vars, because bun auto-loads `.env` from the session's project dir.
   and pass, and a later `| grep -i` cannot be mistaken for the editor's flag.
   BSD `sed -i ''`'s empty backup-suffix operand is skipped (it is not a
   target; it used to normalize to the cwd and deny everything under `$HOME`).
-  Relative paths resolve
-  against the hook's top-level `cwd`: neither CC's `Bash` nor `mcp__pty__run`
-  carries a per-call workdir, and the persistent pty shell's real cwd is
-  unknown to the hook (a relative write after a `cd` inside the pty can be
-  misattributed; absolute/`~` paths and `cd <dir> && ...` chains are fine).
-- **Git hazard**: aimed at the chezmoi source repo via `git -C <src>`,
-  `--git-dir=`/`--work-tree=`, `GIT_DIR=` env, `chezmoi git -- ...`, the
-  workdir, or `cd <src> && git ...`:
+  A relative target resolves against where the shell stands at that segment
+  (`walkSegmentCwds`). It starts at the hook's top-level `cwd` plus where the
+  shell really is (Bash: that same `cwd`; `mcp__pty__run`: tmux's
+  `pane_current_path` of this session's pty window, since the persistent pty
+  keeps every earlier `cd`; `spawn_pty`: its `cwd` param or `$HOME`), and
+  every followable `cd`/`pushd` in the command moves it. Followable means:
+  - a literal path, relative ones included, with `-P`/`-L`/`-e`/`-@`/`--`
+    skipped (bare `cd` = `$HOME`);
+  - a literal path that doesn't exist yet, entered when the cd is followed by
+    `&&` (`git worktree add ../wt && cd ../wt`). After `;` the cd may fail,
+    so the old cwd counts too;
+  - `cd "$(git rev-parse --show-toplevel)"`, resolved to the nearest
+    ancestor holding `.git` (a filesystem walk, no git fork).
+
+  After `cd ~/code/proj &&` only `~/code/proj` counts. A cd that may not run
+  (after `&&` or `||`, or inside if/case/while/until/for/select) moves only
+  the rest of its own `&&` chain. Once that chain ends, the old and new cwd
+  both count: `[ -d x ] && cd /tmp && git stash` judges `/tmp`, but
+  `false && cd /tmp; git stash` judges both. Once a hop can't be
+  followed (`cd -`, `cd "$d"`, `cd $X`, `z`, popd, a bare name that isn't an
+  existing directory — `cd` is zoxide here) every directory seen so far
+  counts, capped at 64 (past that a relative hop is unknown, an absolute one
+  still counts). A cd inside `( … )` ends at the `)`, and one behind a single
+  `&` or in a pipeline moves only that child shell. Shell code in quotes
+  (`bash -c "cd ~/.config/tmux && echo x > tmux.conf"`) is walked the same
+  way. So `cd ~/.config/tmux && echo x > tmux.conf`, and `rm tmux.conf` in a
+  pty that cd'd there in an earlier call, are both denied. `tee` checks every
+  operand, and a redirect glued to the word before it (`echo hi>~/.zshrc`)
+  is a target even beside a parsed harmless one.
+- **Git hazard**: aimed at the chezmoi source repo explicitly (`git -C
+  <src>`, `--git-dir=`/`--work-tree=`, `GIT_DIR=` env, `chezmoi git -- ...`),
+  or by where the git command runs: each segment is judged by its own cwd
+  from the same walk (the session `cwd` and the shell's real cwd, moved by
+  the command's cds). So `cd ~/code/proj && git reset --hard` is fine even
+  from a pty standing in the source, and `cd .local/share/chezmoi && git
+  stash` from `$HOME` is not. A segment whose cwd is unknown — a pty whose cwd
+  tmux can't report, or after a hop the walk can't follow (`z chezmoi`,
+  `cd -`, `cd $DOTS`, `eval "cd …"`) — is treated as possibly the source: a
+  hazard verb there is denied unless the git call names an absolute repo
+  (`git -C /abs ...`). Starting the command with a literal `cd /abs/repo &&`
+  avoids it, and the deny message says which case applied and to use a
+  literal absolute path. Git is recognized as `git`, `\git` or
+  `/usr/bin/git`, also right after a backtick, with any global options
+  before the verb (`-P`, `--no-optional-locks`, `-c k=v`, `--git-dir=…`).
+
+  Data is not a command. `scanShell` is a single linear lexer pass (quotes,
+  `$( )`, `<( )`, backticks, arithmetic, heredocs, comments) that blanks
+  data before matching:
+  - commit messages: `-m '…'`, `--message=…`, and the
+    `-m "$(cat <<'EOF' … EOF)"` idiom;
+  - `echo`/`printf` arguments, unless the pipeline feeds `sh`/`bash`/`eval`/
+    `source`/`xargs`;
+  - a heredoc fed to `cat`/`tee`/`git` that expands nothing, unless its
+    output runs (`bash -c "$(cat <<EOF…)"`, `eval "$(cat …)"`,
+    `source <(cat …)`, `cat <<EOF | sh`);
+  - comments. These are found before continuations are joined, so a trailing
+    `\` in a comment doesn't swallow the next line.
+
+  `<<` is a heredoc only in command context, not inside quotes or
+  `$(( ))`/`(( ))` (`1 << n` is a shift). Shell code in quotes (`bash -c
+  '…'`, `sh -c "…"`, `eval '…'`, `watch '…'`, echo text piped into a shell, or
+  any quoted text that cds) is judged as a command of its own from the
+  segment's cwd. A search such as `rg 'git reset' dir` is neither. Each scan
+  stops at a newline or a closing backtick, so a later line's `-n`/`-f` is
+  not read as this git command's flag; backslash-newline continuations
+  outside comments are joined.
 
   | Blocked | Allowed |
   |---|---|
   | `reset`, `rebase`, `merge` (any form) | `add`, `commit`, non-force `push` |
-  | `push --force` / `--force-with-lease` / `+ref` / `--mirror` | `status`, `diff`, `log`, `show` |
+  | `push --force` / `--force-with-lease` / `+ref` / `--mirror` / `--delete` / `-d` / `:ref` / `--prune` | `status`, `diff`, `log`, `show`, `reflog` (show) |
   | `restore` (any form) | `checkout <branch>`, `checkout -b <name>`, `checkout HEAD~1` |
-  | `checkout -- <path>`, `checkout .`, `checkout <path-like>`, `checkout -f`/`-p`, `checkout <treeish> -- <path>`, `checkout HEAD .` | `clean -n` / `--dry-run` (anywhere in the command, incl. `-nd` / `-n -d`) |
+  | `checkout -- <path>`, `checkout .`, `checkout <path-like>`, `checkout -f`/`-p`/`-B`, `checkout <treeish> -- <path>`, `checkout HEAD .` | `clean -n` / `--dry-run` (on the same line, incl. `-nd` / `-n -d`) |
   | `clean -f` / `-d` / `-x` / `--force` (without a dry-run flag) | `stash list`, `stash show` |
   | `stash` (push/pop/apply/drop/clear/bare — anchored to the subcommand, so `stash push -m 'list'` is still blocked) | `switch <branch>`, `switch -c <name>` |
-  | `switch -f` / `--force` / `--discard-changes` | |
-  | `commit --amend` | |
+  | `switch -f` / `--force` / `--discard-changes` / `-C` / `--force-create` | `rm <file>`, `rm --cached <file>` (git itself refuses these when the file has uncommitted changes) |
+  | `commit --amend` | `branch` (list, `-a`, `-vv`, `--merged`), `branch <new>`, `branch -c` |
+  | `rm -r` / `-f` / `--force` / `--recursive`, or a `.`/`..`/`:`/glob operand (incl. with `--cached`) | `worktree list` |
+  | `branch -d`/`-D`/`-f`/`-m`/`-M`/`-C`/`--delete`/`--force`/`--move` | |
+  | `update-ref`, `read-tree`, `filter-branch`, `filter-repo`, `gc`, `prune` (any form) | |
+  | `reflog expire`/`delete`, `worktree remove`, `checkout-index -f`/`--force` | |
 
   "Path-like" for `checkout` means `.`, `./x`, `~`, anything containing `/`, or
   anything with a file extension — a branch named `feature/x` is therefore
-  blocked too (conservative; the deny message says so). Other repos are never
-  touched by this layer.
+  blocked too (conservative; the deny message says so). A git command that
+  demonstrably runs in another repo is never blocked. One that may run in the
+  source is: the session `cwd` is the source (kept as a candidate even when a
+  pty stands elsewhere), or its cwd is unknown (see above).
 
 ### Fail-open
 
 Any parse/read/handler error -> exit 0 with empty stdout (tool allowed). The two
-hard blocks depend only on `(tool_input, managed.json)` and never on session
-state, so a corrupt/locked session file cannot weaken a block. A broken
+hard blocks depend only on `(tool_input, managed.json)` and the shell's cwd
+(tmux, for a pty; unreachable tmux makes a hazard verb STRICTER, never
+looser), and never on session state, so a corrupt/locked session file cannot
+weaken a block. A broken
 bun/chezmoi binary disables the guard silently (by design — never wedge the
 agent).
 
