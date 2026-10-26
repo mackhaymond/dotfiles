@@ -1018,7 +1018,8 @@ fn until(at: i64, now: f64) -> Option<String> {
 
 /// One usage window as a meter: its label bold in its pace's colour
 /// ([`pace_ink`]), a progress bar (Textual's: `━` filled in that colour over
-/// a `surface1` track) with a tick (`┃`, `text`) where the pace expects it,
+/// a `surface1` track, to the half cell: the fill ends on `╸` or the track
+/// starts on `╺`) with a tick (`┃`, `text`) where the pace expects it,
 /// the percent (bold), the signed delta in the pace's colour (so "fine" or
 /// "over" reads before the number) and, when it fits, when the window
 /// resets (`↻3h`, dim). The reset goes first, then the delta, when the bar
@@ -1057,14 +1058,22 @@ fn meter_row(u: &Usage, w: usize, now: f64) -> Row {
     if bw >= 3 {
         // The fill and tick are clamped to the bar; the percent is not.
         let cells = |v: f64| ((v.clamp(0.0, 100.0) / 100.0) * bw as f64).round() as usize;
-        let filled = u.used.map_or(0, cells).min(bw);
+        // The fill in half cells: `full` whole ones, then a left half (`╸`)
+        // when odd; on a whole cell the track's first cell is a right half
+        // (`╺`), so fill and track always meet at a half-cell gap.
+        let halves = u.used.map_or(0, |v| ((v.clamp(0.0, 100.0) / 100.0) * (2 * bw) as f64).round() as usize);
+        let (full, half) = (halves / 2, halves % 2 == 1);
         let tick = u.expected.map(|e| cells(e).min(bw - 1));
         let mut runs: Vec<Seg> = Vec::new();
         for i in 0..bw {
             let (c, ink): (&str, Ink) = if Some(i) == tick {
                 ("┃", Ink::Pal("text"))
-            } else if i < filled {
+            } else if i < full {
                 ("━", hue)
+            } else if i == full && half {
+                ("╸", hue)
+            } else if i == full && halves > 0 {
+                ("╺", Ink::Pal("surface1"))
             } else {
                 ("━", Ink::Pal("surface1"))
             };

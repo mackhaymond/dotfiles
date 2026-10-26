@@ -1809,10 +1809,34 @@ fn shells_fold_into_one_line() {
     }
 }
 
-/// A meter's bar as (glyph, ink) cells: from its fourth cell, the `━` and
-/// `┃` run.
+/// A meter's bar as (glyph, ink) cells: from its fourth cell, the `━`,
+/// half-cell `╸`/`╺` and `┃` run.
 fn bar_cells(r: &Row) -> Vec<(char, Ink)> {
-    r.segs.iter().flat_map(|s| s.text.chars().map(move |c| (c, s.fg))).skip(3).take_while(|(c, _)| "━┃".contains(*c)).collect()
+    r.segs.iter().flat_map(|s| s.text.chars().map(move |c| (c, s.fg))).skip(3).take_while(|(c, _)| "━╸╺┃".contains(*c)).collect()
+}
+
+/// The bar fills to the half cell: a fill ending mid-cell ends on `╸` in
+/// the pace's colour, one ending on a whole cell hands over to a `╺` track
+/// cell, so a point or two moves the bar when a whole cell would not.
+#[test]
+fn meters_fill_to_the_half_cell() {
+    let at = |used: f64| {
+        let u = Usage { label: "W".into(), used: Some(used), delta: Some(30), ..Usage::default() };
+        bar_cells(&meter_row(&u, 40, NOW as f64))
+    };
+    let bw = at(0.0).len();
+    // Fills of exactly 5 and 5½ cells.
+    let pct = |halves: usize| halves as f64 * 100.0 / (2 * bw) as f64;
+    let even = at(pct(10));
+    assert_eq!(even.iter().take(5).collect::<Vec<_>>(), [&('━', Ink::Pal("red")); 5], "{even:?}");
+    assert_eq!(even[5], ('╺', Ink::Pal("surface1")), "{even:?}");
+    assert!(even[6..].iter().all(|x| *x == ('━', Ink::Pal("surface1"))), "{even:?}");
+    let odd = at(pct(11));
+    assert_eq!(odd[5], ('╸', Ink::Pal("red")), "{odd:?}");
+    assert!(odd[6..].iter().all(|x| *x == ('━', Ink::Pal("surface1"))), "{odd:?}");
+    // Empty: all track, no half cell; full: all fill.
+    assert!(at(0.0).iter().all(|x| *x == ('━', Ink::Pal("surface1"))));
+    assert!(at(100.0).iter().all(|x| *x == ('━', Ink::Pal("red"))));
 }
 
 /// A meter: Textual's progress bar, filled to the used percent over a
@@ -1831,8 +1855,14 @@ fn meters_fill_and_tick() {
     let bw = bar.len();
     let tick = bar.iter().position(|(c, _)| *c == '┃').unwrap();
     assert_eq!(tick, (0.43 * bw as f64).round() as usize, "{t:?}");
-    let filled = bar.iter().filter(|(_, ink)| *ink == Ink::Pal("red")).count() + usize::from(tick < (0.6 * bw as f64).round() as usize);
-    assert_eq!(filled, (0.6 * bw as f64).round() as usize, "{t:?}");
+    // In half cells: whole `━` cells count two, a `╸` one.
+    let halves = (0.6 * (2 * bw) as f64).round() as usize;
+    let filled: usize = bar.iter().map(|(c, ink)| match (c, ink) {
+        ('━', Ink::Pal("red")) => 2,
+        ('╸', _) => 1,
+        _ => 0,
+    }).sum::<usize>() + 2 * usize::from(2 * tick + 2 <= halves);
+    assert_eq!(filled, halves, "{t:?}");
     assert!(bar.iter().all(|(c, ink)| *c == '┃' || *ink == Ink::Pal("red") || *ink == Ink::Pal("surface1")), "{bar:?}");
     assert!(t.ends_with(" 60%  +17% ") || t.ends_with("↻3h "), "{t:?}");
     assert!(r.segs.contains(&bold("W", "red")) && r.segs.contains(&seg("  +17%", "red")), "{:?}", r.segs);
