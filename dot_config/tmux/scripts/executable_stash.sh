@@ -3518,8 +3518,9 @@ pick_rows() {
 }
 
 # Detached, one per parked window (do_stash_many starts it): a one-line
-# account of what the window was doing, from gpt-6-luna via closed-tabs.sh's
-# `summarize`, stored as @stash_desc for the picker. Reads the claude
+# account of what the window was doing, from closed-tabs.sh's `summarize`
+# (codex -> claude -> copilot through ai-exec), stored as @stash_desc for the
+# picker. Reads the claude
 # transcript when the window holds one, plus the screen either way.
 do_describe() {
     local win="${1:-}" agent sid="" cwd label ts shot desc
