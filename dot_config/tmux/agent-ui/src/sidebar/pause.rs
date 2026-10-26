@@ -364,15 +364,27 @@ pub fn parse_iso(s: &str) -> Option<f64> {
     Some((days * 86_400 + h * 3600 + mi * 60 - off) as f64 + sec)
 }
 
-/// The snapshot's [`Windows`]: the WORKING ones (the script's own rule:
-/// `@agent_state` running, or `@agent_workflow` / `@agent_cua` set), every
+/// The snapshot's [`Windows`]: the WORKING ones ([`window_working`]), every
 /// window, by id, the server's start (its first client row's
 /// `#{start_time}`) and where each window lives. From the RAW snapshot
 /// (before the sidebar blanks its spaces' homes): the script reads the
 /// options as tmux holds them.
+/// Is a window still working, for the pause? `@agent_state` running, or
+/// `@agent_workflow` set, or `@agent_cua` set - but the drive only while the
+/// turn is on. `@agent_cua` stays set for the watcher's CUA_LIVE (60s) after
+/// the last drive, so an agent that closed its browsers and ended its turn
+/// held the banner on "pausing" for up to a minute (agent l, 2026-10-26).
+/// An ended turn drives nothing itself; a subagent still driving is out, and
+/// `@agent_workflow` says so. CuaNotch has the same rule
+/// (agentPauseRowWorking).
+pub fn window_working(state: &str, workflow: &str, cua: &str) -> bool {
+    let turn_ended = matches!(state, "idle" | "done" | "paused" | "failed");
+    state == "running" || !workflow.is_empty() || (!cua.is_empty() && !turn_ended)
+}
+
 pub fn windows(snap: &Snapshot) -> Windows {
     let rows = &snap.windows;
-    let working = rows.iter().filter(|w| w.state == "running" || !w.workflow.is_empty() || !w.cua.is_empty()).map(|w| w.id.clone()).collect();
+    let working = rows.iter().filter(|w| window_working(&w.state, &w.workflow, &w.cua)).map(|w| w.id.clone()).collect();
     let exists = rows.iter().map(|w| w.id.clone()).collect();
     let server_start = snap.clients.first().and_then(|c| c.status.server_start.trim().parse::<f64>().ok()).filter(|&s| s > 0.0);
     // A hidden session (the stash, `agents`) letters nothing: a parked
@@ -667,6 +679,18 @@ mod tests {
     /// Now, a wake, a boot a day before the pause.
     fn clock(wake: Option<f64>) -> Clock {
         Clock { now: NOW, wake, boot: Some(AT_S - 86_400.0) }
+    }
+
+    /// A drive's flag outlives the turn by CUA_LIVE: once the turn ended it
+    /// is not work (agent l, 2026-10-26). A subagent out or a turn on still is.
+    #[test]
+    fn a_drive_after_the_turn_is_not_work() {
+        assert!(!window_working("paused", "", "1"));
+        assert!(!window_working("done", "", "1"));
+        assert!(!window_working("idle", "", "1"));
+        assert!(window_working("paused", "1", "1"));
+        assert!(window_working("running", "", ""));
+        assert!(window_working("needs-input", "", "1"));
     }
 
     #[test]
