@@ -390,6 +390,17 @@ class LibCase(unittest.TestCase):
         self.workflow("done", 60, completed=True)
         self.assertEqual(self.rc("session_has_running_workflow"), "rc=1")
 
+    def test_resumed_workflow_under_an_old_completion_file_runs(self):
+        # Workflow resumeFromRunId writes into the same run dir while the old
+        # completion file stays: a journal newer than it is a live run.
+        self.workflow("resumed", 60, completed=True)
+        done = self.proj / SID / "workflows" / "wf_resumed.json"
+        os.utime(done, (self.now - 3000, self.now - 3000))
+        self.assertEqual(self.rc("session_has_running_workflow"), "rc=0")
+        # Same second as the journal (a normal finish): done.
+        os.utime(done, (self.now - 60, self.now - 60))
+        self.assertEqual(self.rc("session_has_running_workflow"), "rc=1")
+
     def test_workflow_stale_without_completion(self):
         self.workflow("crashed", 4000, completed=False)
         self.assertEqual(self.rc("session_has_running_workflow"), "rc=1")

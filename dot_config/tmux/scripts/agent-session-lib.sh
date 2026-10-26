@@ -393,7 +393,14 @@ session_has_running_workflow() {
         # start with a dash ("-Users-mackhaymond-..."), which basename would
         # parse as options if the path were ever relative.
         wfid="${d%/}"; wfid="${wfid##*/}"
-        [ -f "$base/workflows/$wfid.json" ] && continue   # completion file → done
+        # A RESUMED run (Workflow resumeFromRunId) writes into this same dir
+        # while its old completion file stays (2026-10-25: a run killed at
+        # 16:48 was live again at 19:26 under a "killed" file), so the file
+        # only means done while the journal is not newer than it. Measured on
+        # all 88 runs: a normal run writes its journal 2-3 ms BEFORE the
+        # completion file; `-nt` is builtin (fork-free, whole seconds, a tie
+        # is done). PINNED to agent-bg-pending and Probes.swift (invariants).
+        [ -f "$base/workflows/$wfid.json" ] && ! [ "$d/journal.jsonl" -nt "$base/workflows/$wfid.json" ] && continue   # completion file, not resumed since → done
         # Backstop against a crashed/stale runtime dir. mtime is the only
         # liveness signal, but transcripts go quiet during long stalls (API
         # backoff, a tool with no timeout, a permission gate), so the old
