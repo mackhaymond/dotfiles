@@ -17,21 +17,29 @@ Env: AI_EXEC_{CODEX,CLAUDE,COPILOT}_BIN override the binaries;
 Codex's usage-limit message is remembered in ~/.cache/ai-exec/
 codex-limited-until (epoch secs) and codex is skipped until then. Fallbacks
 are logged to ~/.local/state/ai-exec/log. SIGTERM/SIGINT/SIGHUP kill the
-running backend's process group and exit; nothing further is tried.
+running backend's process group and exit; nothing further is tried. Each
+backend runs in its own process group, watched by a tiny sh watchdog that
+kills the group if ai-exec dies without cleaning up (SIGKILL included).
 
 Fallback children run with CUA_NOTCH_IGNORE=1 in the -C dir. With -s
 workspace-write, claude runs in its OS sandbox (Bash writes confined to the
-work dir, edits auto-accepted only there) and copilot with --sandbox.
+work dir, edits auto-accepted only there) and copilot with --sandbox. In
+read-only mode both may run a short list of read-only commands (git show/
+diff/log/..., ls, cat, ...); claude's sandbox also denies writes to the
+work dir. Copilot read-only runs unsandboxed (its sandbox also blocks reads
+outside the work dir); a git shim on its PATH refuses `--output=F`.
 """
 
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -49,12 +57,51 @@ VALUE_FLAGS = {"-c", "--config", "--enable", "--disable", "-m", "--model",
                "-o", "--output-last-message"}
 MULTI_FLAGS = {"-i", "--image"}
 # `codex exec <sub>` subcommands the fallbacks can't reproduce.
-SUBCOMMANDS = {"resume", "review", "help"}
+SUBCOMMANDS = {"resume", "fork", "review", "help"}
 
 CLAUDE_EFFORT = {"none": "low", "minimal": "low", "low": "low",
                  "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"}
 
+# Shell commands a read-only fallback may run (codex read-only can run shell;
+# reviews need `git show <sha>` / `git diff a..b`). No rg: `rg --pre CMD`
+# runs anything, and both CLIs have a native grep tool.
+READONLY_COMMANDS = ["git show", "git diff", "git log", "git status", "git blame",
+                     "git rev-parse", "git ls-files", "ls", "cat", "head", "tail", "wc"]
+
+# Codex's reset time: "try again at Oct 31st, 2026 11:10 PM" or, when the
+# reset is today, a bare "try again at 11:50 PM".
+RESET_RE = re.compile(r"try again at\s+(?:([a-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+"
+                      r"(\d{4}),?\s+)?(\d{1,2}):(\d{2})\s*([ap])?\.?m?\.?", re.I)
+
+# Kills the backend's process group when ai-exec's end of the pipe closes
+# while a group is still registered ("<pgid>" lines; "0" = none running).
+WATCHDOG = r"""trap '' HUP INT TERM
+pg=0
+while read -r line; do pg=$line; done
+[ "$pg" -gt 0 ] 2>/dev/null || exit 0
+kill -TERM -"$pg" 2>/dev/null || exit 0
+i=0
+while [ $i -lt 20 ] && kill -0 -"$pg" 2>/dev/null; do sleep 0.1; i=$((i+1)); done
+kill -KILL -"$pg" 2>/dev/null
+exit 0
+"""
+
+# First on PATH for copilot read-only: `git show/diff/log --output=F` (any
+# abbreviation git accepts) is the one write the shell allowlist lets through.
+GIT_SHIM = """#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    --o|--ou|--out|--outp|--outpu|--output|--o=*|--ou=*|--out=*|--outp=*|--outpu=*|--output=*)
+      echo "ai-exec: git --output is not allowed in read-only mode" >&2; exit 1 ;;
+  esac
+done
+exec %s "$@"
+"""
+
 current = None          # the running child Popen, for the signal handler
+spawning = False        # a signal during Popen is deferred until `current` is set
+pending = []
+watchdog_fd = None      # write end of the watchdog's pipe
 
 
 def warn(msg):
@@ -223,18 +270,46 @@ def find_bin(name):
     return shutil.which(name, path=path)
 
 
+def tell_watchdog(pgid):
+    """Register the running group (0 = none) with the watchdog, starting it
+    on first use. Its pipe's write end is non-inheritable, so no backend
+    holds it open: when ai-exec dies, by any means, the watchdog sees EOF."""
+    global watchdog_fd
+    try:
+        if watchdog_fd is None:
+            if not pgid:
+                return
+            r, w = os.pipe()
+            subprocess.Popen(["/bin/sh", "-c", WATCHDOG], stdin=r,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            os.close(r)
+            watchdog_fd = w
+        os.write(watchdog_fd, b"%d\n" % pgid)
+    except OSError:
+        pass
+
+
 def run(argv, cwd, env, stdin_data, on_stdout_line=None):
     """Run argv in its own process group; stderr streams through.
     Returns (rc, stdout_text, stderr_tail)."""
-    global current
+    global current, spawning
+    spawning = True
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=env,
                                 stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 start_new_session=True, close_fds=False)
     except OSError as e:
+        spawning = False
+        if pending:
+            on_signal(pending[0], None)
         return 127, "", str(e)
     current = proc
+    tell_watchdog(proc.pid)
+    spawning = False
+    if pending:
+        on_signal(pending[0], None)
     out_chunks, err_tail = [], [b""]
 
     def pump_out():
@@ -269,6 +344,7 @@ def run(argv, cwd, env, stdin_data, on_stdout_line=None):
         t.daemon = True
         t.start()
     rc = proc.wait()
+    tell_watchdog(0)
     for t in threads:
         t.join(5)
     current = None
@@ -279,16 +355,30 @@ def run(argv, cwd, env, stdin_data, on_stdout_line=None):
 def on_signal(signum, _frame):
     """The caller is enforcing a timeout or cancelling: take the backend down
     with us and stop. Never fall through to the next backend."""
+    if spawning:            # Popen in flight: finish it, then come back here
+        pending.append(signum)
+        return
     proc = current
     if proc is not None:
         try:
             os.killpg(proc.pid, signal.SIGTERM)
-            deadline = time.time() + 2
-            while time.time() < deadline and proc.poll() is None:
-                time.sleep(0.05)
-            os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
+        # Reap directly: proc.poll() can't while the main thread sits in
+        # proc.wait() holding Popen's lock, so it would always spin the 2s.
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            try:
+                if os.waitpid(proc.pid, os.WNOHANG)[0]:
+                    break
+            except ChildProcessError:
+                break
+            time.sleep(0.02)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)     # stragglers in the group
+        except OSError:
+            pass
+        tell_watchdog(0)
     log("killed by signal %d" % signum)
     os._exit(128 + signum)
 
@@ -354,22 +444,35 @@ def memo_until():
         return 0.0
 
 
+def parse_reset(text, now=None):
+    """Epoch of the LAST "try again at ..." in text, or None."""
+    now = time.time() if now is None else now
+    matches = list(RESET_RE.finditer(text))
+    if not matches:
+        return None
+    mon, day, year, hh, mm, ap = matches[-1].groups()
+    try:
+        hh, mm = int(hh), int(mm)
+        if ap:
+            hh = hh % 12 + (12 if ap.lower() == "p" else 0)
+        if mon:
+            st = time.strptime("%s %s %s %d %d" % (mon.title(), day, year, hh, mm), "%b %d %Y %H %M")
+            return time.mktime(st)
+        # bare time: today, or tomorrow if that time has passed
+        lt = time.localtime(now)
+        t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hh, mm, 0, 0, 0, -1))
+        if t <= now:
+            t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, hh, mm, 0, 0, 0, -1))
+        return t
+    except (ValueError, OverflowError):
+        return None
+
+
 def remember_limit(text):
     until = time.time() + 3600
-    m = re.search(r"try again at ([A-Za-z]{3})[a-z]* (\d{1,2})(?:st|nd|rd|th)?,? (\d{4}),? "
-                  r"(\d{1,2}):(\d{2})\s*([AaPp][Mm])?", text)
-    if m:
-        try:
-            mon, day, year, hh, mm, ampm = m.groups()
-            hh = int(hh)
-            if ampm:
-                hh = hh % 12 + (12 if ampm.lower() == "pm" else 0)
-            st = time.strptime("%s %s %s %d %s" % (mon.title(), day, year, hh, mm), "%b %d %Y %H %M")
-            parsed = time.mktime(st)
-            if parsed > time.time():
-                until = parsed
-        except (ValueError, OverflowError):
-            pass
+    parsed = parse_reset(text)
+    if parsed and parsed > time.time():
+        until = parsed
     try:
         os.makedirs(os.path.dirname(MEMO), exist_ok=True)
         with open(MEMO, "w") as fh:
@@ -388,8 +491,10 @@ def try_codex(binary, a, ctx):
     held = []
 
     def passthrough(line):
-        # Stream codex's JSONL live, but hold back failure events: if we fall
-        # back, callers should see the fallback's events, not codex's error.
+        # Stream codex's JSONL live, but hold back TRAILING failure events: if
+        # we fall back, callers should see the fallback's events, not codex's
+        # error. An error followed by more events (a retry notice) goes out in
+        # order, so a successful run's stream is byte-for-byte codex's.
         if not a.json:
             return
         try:
@@ -398,15 +503,18 @@ def try_codex(binary, a, ctx):
             typ = None
         if typ in ("error", "turn.failed"):
             held.append(line)
-        else:
-            sys.stdout.buffer.write(line)
-            sys.stdout.flush()
+            return
+        for h in held:
+            sys.stdout.buffer.write(h)
+        del held[:]
+        sys.stdout.buffer.write(line)
+        sys.stdout.flush()
 
     before = stat_key(ctx["out"]) if ctx["out"] else None
     rc, out, err = run(argv, None, os.environ.copy(), ctx["stdin"], passthrough)
-    blob = out + "\n" + err
-    if rc != 0 and re.search(r"usage limit", blob, re.I):
-        until = remember_limit(blob)
+    errors = codex_errors(out, err)
+    if rc != 0 and re.search(r"usage limit", errors, re.I):
+        until = remember_limit(errors)
         return False, rc, None, "usage limit until %s" % time.strftime("%b %d %H:%M", time.localtime(until))
     if rc != 0:
         return False, rc, None, "exit %d%s" % (rc, last_line(err))
@@ -439,6 +547,33 @@ def try_codex(binary, a, ctx):
     return True, 0, final, ""
 
 
+def codex_errors(out, err):
+    """Codex's own error text only: --json error/turn.failed messages and the
+    trailing ERROR: lines of stderr. Never the whole stream - plain codex
+    echoes the prompt to stderr, and prompts (agent transcripts) quote these
+    very errors."""
+    msgs = []
+    for line in out.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "error":
+            msgs.append(str(ev.get("message", "")))
+        elif ev.get("type") == "turn.failed":
+            msgs.append(str((ev.get("error") or {}).get("message", "")))
+    trailing = []
+    for line in reversed(err.splitlines()):
+        if not line.strip():
+            continue
+        if not line.startswith("ERROR"):
+            break
+        trailing.append(line)
+    return "\n".join(msgs + trailing[::-1])
+
+
 def last_line(err):
     lines = [l.strip() for l in err.splitlines() if l.strip()]
     return (": " + lines[-1][:160]) if lines else ""
@@ -452,20 +587,32 @@ def fallback_env():
 
 def try_claude(binary, a, ctx):
     write = ctx["write"]
-    tools = ["Read", "Grep", "Glob"]
+    # Reads go anywhere through Read(//**), images included, so image dirs
+    # never need --add-dir (which would make them writable in write mode).
     allow = ["Read(//**)"]
     if write:
         tools = ["Bash", "Read", "Write", "Edit", "Grep", "Glob"]
-    if a.search:
-        tools += ["WebSearch", "WebFetch"]
-        allow += ["WebSearch", "WebFetch"]
-    settings = {"permissions": {"allow": allow}}
-    if write:
+        dirs = [ctx["cwd"]] + ctx["dirs"]
         # Claude Code's OS sandbox: Bash writes are confined to the working
         # dirs, unsandboxed retries are refused, edits outside are denied
         # (--permission-prompts none: nobody can approve them).
-        settings["sandbox"] = {"enabled": True, "autoAllowBashIfSandboxed": True,
-                               "allowUnsandboxedCommands": False}
+        sandbox = {"enabled": True, "autoAllowBashIfSandboxed": True,
+                   "allowUnsandboxedCommands": False}
+    else:
+        # Bash only for the read-only allowlist (anything else would prompt,
+        # and --permission-prompts none denies it), and the sandbox denies
+        # writes to the work dir so even an allowed `git diff --output=F`
+        # can't write.
+        tools = ["Bash", "Read", "Grep", "Glob"]
+        allow += ["Bash(%s *)" % c for c in READONLY_COMMANDS]
+        dirs = ctx["dirs"]
+        sandbox = {"enabled": True, "autoAllowBashIfSandboxed": False,
+                   "allowUnsandboxedCommands": False,
+                   "filesystem": {"denyWrite": [ctx["cwd"]] + dirs}}
+    if a.search:
+        tools += ["WebSearch", "WebFetch"]
+        allow += ["WebSearch", "WebFetch"]
+    settings = {"permissions": {"allow": allow}, "sandbox": sandbox}
     argv = [binary, "-p", "--model", a.claude_model, "--no-session-persistence",
             "--setting-sources", "", "--strict-mcp-config",
             "--permission-prompts", "none", "--output-format", "json",
@@ -473,11 +620,16 @@ def try_claude(binary, a, ctx):
     if a.effort in CLAUDE_EFFORT:
         argv += ["--effort", CLAUDE_EFFORT[a.effort]]
     if write:
-        argv += ["--permission-mode", "acceptEdits", "--add-dir", ctx["cwd"]]
-    for d in ctx["dirs"]:
+        argv += ["--permission-mode", "acceptEdits"]
+    for d in dirs:
         argv += ["--add-dir", d]
     if ctx["schema"] is not None:
-        argv += ["--json-schema", json.dumps(ctx["schema"])]
+        # claude rejects a top-level "$schema" draft URL it can't resolve
+        # (every transcript2notes schema has one); the caller's file is untouched.
+        sch = ctx["schema"]
+        if isinstance(sch, dict):
+            sch = {k: v for k, v in sch.items() if k not in ("$schema", "$id")}
+        argv += ["--json-schema", json.dumps(sch)]
     argv += ["--tools", ",".join(tools)]      # variadic: keep it last; prompt is on stdin
     prompt = ctx["prompt"]
     if ctx["images"]:
@@ -522,19 +674,47 @@ def try_copilot(binary, a, ctx):
             "--disable-builtin-mcps", "--no-ask-user", "--model", a.copilot_model]
     if a.effort and a.copilot_model != "auto":     # auto rejects --reasoning-effort
         argv += ["--reasoning-effort", a.effort]
+    images, tmpd, env = ctx["images"], None, fallback_env()
     if ctx["write"]:
         argv += ["--allow-all-tools", "--sandbox", "--add-dir", ctx["cwd"]]
+        # --sandbox blocks attachments outside the work dir and temp, so the
+        # images ride along as copies in a temp dir (never --add-dir: writable).
+        if images:
+            tmpd = tempfile.mkdtemp(prefix="ai-exec-img-")
+            copies = []
+            for n, img in enumerate(images):
+                dst = os.path.join(tmpd, "%d-%s" % (n, os.path.basename(img)))
+                try:
+                    shutil.copyfile(img, dst)
+                    copies.append(dst)
+                except OSError:
+                    copies.append(img)
+            images = copies
     else:
-        # Reads anywhere (like codex read-only); no shell, no file writes.
-        argv += ["--allow-all-tools", "--allow-all-paths",
-                 "--deny-tool", "shell", "--deny-tool", "write"]
+        # Reads anywhere (like codex read-only), no file writes, and only the
+        # read-only shell allowlist (no --allow-all-tools: anything else is
+        # denied in prompt mode). Compound commands and redirections need
+        # every part allowed, so `git show && touch x` / `> f` are refused.
+        # No --sandbox here: it would also block reads outside the work dir;
+        # a git shim on PATH refuses the one write the allowlist lets through.
+        argv += ["--allow-all-paths", "--deny-tool", "write"]
+        for c in READONLY_COMMANDS:
+            argv += ["--allow-tool", "shell(%s:*)" % c]
         if not a.search:
             argv += ["--deny-tool", "url"]
+        real_git = shutil.which("git")
+        if real_git:
+            tmpd = tempfile.mkdtemp(prefix="ai-exec-git-")
+            shim = os.path.join(tmpd, "git")
+            with open(shim, "w") as fh:
+                fh.write(GIT_SHIM % shlex.quote(real_git))
+            os.chmod(shim, 0o755)
+            env["PATH"] = tmpd + os.pathsep + env.get("PATH", "")
     if a.search:
         argv += ["--allow-all-urls"]
     for d in ctx["dirs"]:
         argv += ["--add-dir", d]
-    for img in ctx["images"]:
+    for img in images:
         argv += ["--attachment", img]
     prompt = ctx["prompt"]
     if ctx["schema"] is not None:
@@ -542,7 +722,11 @@ def try_copilot(binary, a, ctx):
                    "that validates against this JSON Schema:\n%s" % json.dumps(ctx["schema"]))
     # The prompt goes on stdin: copilot reads a piped prompt, and argv can't
     # carry a ~400k-char one.
-    rc, out, err = run(argv, ctx["cwd"], fallback_env(), prompt.encode("utf-8"))
+    try:
+        rc, out, err = run(argv, ctx["cwd"], env, prompt.encode("utf-8"))
+    finally:
+        if tmpd:
+            shutil.rmtree(tmpd, ignore_errors=True)
     if rc != 0:
         return False, rc, None, "exit %d%s" % (rc, last_line(err))
     final = out.strip()
@@ -582,7 +766,8 @@ def main(argv):
     ctx = {"stdin": stdin_data, "prompt": prompt, "cwd": cwd,
            "out": absp(a.out) if a.out else None, "schema": schema,
            "write": a.sandbox != "read-only", "images": images,
-           "dirs": sorted({os.path.dirname(p) for p in images} | {absp(d) for d in a.add_dirs})}
+           # codex --add-dir only: image dirs are read, never added (they'd be writable)
+           "dirs": sorted({absp(d) for d in a.add_dirs})}
 
     order = [b.strip() for b in os.environ.get("AI_EXEC_ORDER", "codex,claude,copilot").split(",")
              if b.strip() in BACKENDS]
