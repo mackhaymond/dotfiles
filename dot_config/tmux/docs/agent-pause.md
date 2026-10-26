@@ -73,7 +73,11 @@ urgent and waits for a clear box as before.
   half-written, stop your own dev servers and long jobs, and stop subagents and
   workflows now. A message reaches a subagent only after its current tool call,
   so one in a long build kept a pause waiting for minutes (2026-10-19): stop it
-  outright (TaskStop) and kill its pty, noting where it was for the RESUME. Start nothing else (no edits, tests, builds, commits
+  outright (TaskStop) and kill its pty, noting where it was for the RESUME.
+  **In that order** (2026-10-25): agent k killed its shells first, a workflow
+  agent still alive re-created one 9 s later with a `sleep 240` poll, and the
+  TaskStop that followed cancelled the agent's call but not the command, so
+  k's tab read `running` (a busy pty, agent-bg-pending) for 6.5 min. Start nothing else (no edits, tests, builds, commits
   or pushes), reply in 2-3 lines with where you stopped and what's next, and
   stay stopped until RESUME.
 - **RESUME**: pick up from the noted next steps, and restart anything you
