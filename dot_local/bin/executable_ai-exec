@@ -24,16 +24,17 @@ kills the group if ai-exec dies without cleaning up (SIGKILL included).
 Fallback children run with CUA_NOTCH_IGNORE=1 in the -C dir. With -s
 workspace-write, claude runs in its OS sandbox (Bash writes confined to the
 work dir, edits auto-accepted only there) and copilot with --sandbox. In
-read-only mode both may run a short list of read-only commands (git show/
-diff/log/..., ls, cat, ...); claude's sandbox also denies writes to the
-work dir. Copilot read-only runs unsandboxed (its sandbox also blocks reads
-outside the work dir); a git shim on its PATH refuses `--output=F`.
+read-only mode claude may run a short list of read-only commands (git show/
+diff/log/..., ls, cat, ...) under a sandbox that denies writes to the work
+dir. Copilot read-only gets NO shell, so it can't run git: it strips leading
+VAR=value before matching its shell allow rules, which makes any allowlist
+an arbitrary-code hole (GIT_EXTERNAL_DIFF=cmd git diff --ext-diff). It
+still reads files anywhere with its native tools.
 """
 
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import stat
@@ -62,9 +63,9 @@ SUBCOMMANDS = {"resume", "fork", "review", "help"}
 CLAUDE_EFFORT = {"none": "low", "minimal": "low", "low": "low",
                  "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"}
 
-# Shell commands a read-only fallback may run (codex read-only can run shell;
-# reviews need `git show <sha>` / `git diff a..b`). No rg: `rg --pre CMD`
-# runs anything, and both CLIs have a native grep tool.
+# Shell commands a read-only claude fallback may run (codex read-only can run
+# shell; reviews need `git show <sha>` / `git diff a..b`). No rg: `rg --pre
+# CMD` runs anything, and claude has a native grep tool.
 READONLY_COMMANDS = ["git show", "git diff", "git log", "git status", "git blame",
                      "git rev-parse", "git ls-files", "ls", "cat", "head", "tail", "wc"]
 
@@ -73,35 +74,29 @@ READONLY_COMMANDS = ["git show", "git diff", "git log", "git status", "git blame
 RESET_RE = re.compile(r"try again at\s+(?:([a-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+"
                       r"(\d{4}),?\s+)?(\d{1,2}):(\d{2})\s*([ap])?\.?m?\.?", re.I)
 
-# Kills the backend's process group when ai-exec's end of the pipe closes
-# while a group is still registered ("<pgid>" lines; "0" = none running).
+# Runs when ai-exec's end of the pipe closes: kills the backend's process
+# group if one is still registered ("<pgid>" lines; "0" = none running) and
+# removes a temp dir left registered ("T<path>"; "T" = none).
 WATCHDOG = r"""trap '' HUP INT TERM
 pg=0
-while read -r line; do pg=$line; done
-[ "$pg" -gt 0 ] 2>/dev/null || exit 0
-kill -TERM -"$pg" 2>/dev/null || exit 0
-i=0
-while [ $i -lt 20 ] && kill -0 -"$pg" 2>/dev/null; do sleep 0.1; i=$((i+1)); done
-kill -KILL -"$pg" 2>/dev/null
-exit 0
-"""
-
-# First on PATH for copilot read-only: `git show/diff/log --output=F` (any
-# abbreviation git accepts) is the one write the shell allowlist lets through.
-GIT_SHIM = """#!/bin/sh
-for a in "$@"; do
-  case "$a" in
-    --o|--ou|--out|--outp|--outpu|--output|--o=*|--ou=*|--out=*|--outp=*|--outpu=*|--output=*)
-      echo "ai-exec: git --output is not allowed in read-only mode" >&2; exit 1 ;;
-  esac
+tmp=
+while read -r line; do
+  case "$line" in T*) tmp=${line#T} ;; *) pg=$line ;; esac
 done
-exec %s "$@"
+if [ "$pg" -gt 0 ] 2>/dev/null && kill -TERM -"$pg" 2>/dev/null; then
+  i=0
+  while [ $i -lt 20 ] && kill -0 -"$pg" 2>/dev/null; do sleep 0.1; i=$((i+1)); done
+  kill -KILL -"$pg" 2>/dev/null
+fi
+case "$tmp" in */ai-exec-*) rm -rf -- "$tmp" ;; esac
+exit 0
 """
 
 current = None          # the running child Popen, for the signal handler
 spawning = False        # a signal during Popen is deferred until `current` is set
 pending = []
 watchdog_fd = None      # write end of the watchdog's pipe
+temp_dir = None         # our temp dir (copilot's image copies), removed on any exit
 
 
 def warn(msg):
@@ -270,14 +265,15 @@ def find_bin(name):
     return shutil.which(name, path=path)
 
 
-def tell_watchdog(pgid):
-    """Register the running group (0 = none) with the watchdog, starting it
-    on first use. Its pipe's write end is non-inheritable, so no backend
-    holds it open: when ai-exec dies, by any means, the watchdog sees EOF."""
+def tell_watchdog(line, start=True):
+    """Send the watchdog a line: "<pgid>" (0 = none running) or "T<path>"
+    (temp dir to remove; "T" = none). Started on first use; its pipe's write
+    end is non-inheritable, so no backend holds it open: when ai-exec dies,
+    by any means, the watchdog sees EOF."""
     global watchdog_fd
     try:
         if watchdog_fd is None:
-            if not pgid:
+            if not start:
                 return
             r, w = os.pipe()
             subprocess.Popen(["/bin/sh", "-c", WATCHDOG], stdin=r,
@@ -285,9 +281,25 @@ def tell_watchdog(pgid):
                              start_new_session=True)
             os.close(r)
             watchdog_fd = w
-        os.write(watchdog_fd, b"%d\n" % pgid)
+        os.write(watchdog_fd, (line + "\n").encode("utf-8", "replace"))
     except OSError:
         pass
+
+
+def make_temp_dir(prefix):
+    """A temp dir removed on every exit path: finally, signal, watchdog."""
+    global temp_dir
+    temp_dir = tempfile.mkdtemp(prefix=prefix)
+    tell_watchdog("T" + temp_dir)
+    return temp_dir
+
+
+def drop_temp_dir():
+    global temp_dir
+    if temp_dir:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir = None
+        tell_watchdog("T", start=False)
 
 
 def run(argv, cwd, env, stdin_data, on_stdout_line=None):
@@ -306,7 +318,7 @@ def run(argv, cwd, env, stdin_data, on_stdout_line=None):
             on_signal(pending[0], None)
         return 127, "", str(e)
     current = proc
-    tell_watchdog(proc.pid)
+    tell_watchdog(str(proc.pid))
     spawning = False
     if pending:
         on_signal(pending[0], None)
@@ -344,7 +356,7 @@ def run(argv, cwd, env, stdin_data, on_stdout_line=None):
         t.daemon = True
         t.start()
     rc = proc.wait()
-    tell_watchdog(0)
+    tell_watchdog("0")
     for t in threads:
         t.join(5)
     current = None
@@ -378,7 +390,8 @@ def on_signal(signum, _frame):
             os.killpg(proc.pid, signal.SIGKILL)     # stragglers in the group
         except OSError:
             pass
-        tell_watchdog(0)
+        tell_watchdog("0")
+    drop_temp_dir()         # os._exit skips the backend's finally
     log("killed by signal %d" % signum)
     os._exit(128 + signum)
 
@@ -674,13 +687,13 @@ def try_copilot(binary, a, ctx):
             "--disable-builtin-mcps", "--no-ask-user", "--model", a.copilot_model]
     if a.effort and a.copilot_model != "auto":     # auto rejects --reasoning-effort
         argv += ["--reasoning-effort", a.effort]
-    images, tmpd, env = ctx["images"], None, fallback_env()
+    images = ctx["images"]
     if ctx["write"]:
         argv += ["--allow-all-tools", "--sandbox", "--add-dir", ctx["cwd"]]
         # --sandbox blocks attachments outside the work dir and temp, so the
         # images ride along as copies in a temp dir (never --add-dir: writable).
         if images:
-            tmpd = tempfile.mkdtemp(prefix="ai-exec-img-")
+            tmpd = make_temp_dir("ai-exec-img-")
             copies = []
             for n, img in enumerate(images):
                 dst = os.path.join(tmpd, "%d-%s" % (n, os.path.basename(img)))
@@ -691,25 +704,15 @@ def try_copilot(binary, a, ctx):
                     copies.append(img)
             images = copies
     else:
-        # Reads anywhere (like codex read-only), no file writes, and only the
-        # read-only shell allowlist (no --allow-all-tools: anything else is
-        # denied in prompt mode). Compound commands and redirections need
-        # every part allowed, so `git show && touch x` / `> f` are refused.
-        # No --sandbox here: it would also block reads outside the work dir;
-        # a git shim on PATH refuses the one write the allowlist lets through.
-        argv += ["--allow-all-paths", "--deny-tool", "write"]
-        for c in READONLY_COMMANDS:
-            argv += ["--allow-tool", "shell(%s:*)" % c]
+        # Reads anywhere (like codex read-only) with the native tools; no
+        # shell at all and no file writes (deny beats any allow). A shell
+        # allowlist can't be made safe: copilot strips leading VAR=value
+        # before matching, so `GIT_EXTERNAL_DIFF=cmd git diff --ext-diff`
+        # would pass `shell(git diff:*)`. No --sandbox: it blocks reads
+        # outside the work dir.
+        argv += ["--allow-all-paths", "--deny-tool", "shell", "--deny-tool", "write"]
         if not a.search:
             argv += ["--deny-tool", "url"]
-        real_git = shutil.which("git")
-        if real_git:
-            tmpd = tempfile.mkdtemp(prefix="ai-exec-git-")
-            shim = os.path.join(tmpd, "git")
-            with open(shim, "w") as fh:
-                fh.write(GIT_SHIM % shlex.quote(real_git))
-            os.chmod(shim, 0o755)
-            env["PATH"] = tmpd + os.pathsep + env.get("PATH", "")
     if a.search:
         argv += ["--allow-all-urls"]
     for d in ctx["dirs"]:
@@ -723,10 +726,9 @@ def try_copilot(binary, a, ctx):
     # The prompt goes on stdin: copilot reads a piped prompt, and argv can't
     # carry a ~400k-char one.
     try:
-        rc, out, err = run(argv, ctx["cwd"], env, prompt.encode("utf-8"))
+        rc, out, err = run(argv, ctx["cwd"], fallback_env(), prompt.encode("utf-8"))
     finally:
-        if tmpd:
-            shutil.rmtree(tmpd, ignore_errors=True)
+        drop_temp_dir()
     if rc != 0:
         return False, rc, None, "exit %d%s" % (rc, last_line(err))
     final = out.strip()
