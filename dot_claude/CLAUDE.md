@@ -179,6 +179,17 @@ they name a space, shell, agent, letter, parked tab or NEEDS YOU.
   User-facing messages go through `~/.config/tmux/scripts/notify.sh`, never
   `tmux display-message`. Test tmux only on a private `-L` server
   (`unset TMUX`, `-f /dev/null`).
+- **NEEDS YOU while still working.** A turn that ends while your
+  subagents, workflows or background tasks are still out keeps your tab
+  "working", so a question in it is invisible. If you truly need Mack (a
+  decision only he can make, a blocker), run `agent-needs-you "<what you
+  need, one line>"` as your LAST tool call before ending the turn. It is
+  the ONLY way to raise NEEDS YOU while work is out: nothing reads your
+  closing text for questions. Don't run it for optional offers ("want me
+  to also…?") or status updates, or for a turn that ends with nothing
+  still out (that finish already notifies him). Main agent only: a
+  subagent or workflow agent never runs it; it reports to its
+  orchestrator, which decides.
 
 ## Referencing other agents and panes (`tmux` MCP server)
 
