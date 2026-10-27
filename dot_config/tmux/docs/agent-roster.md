@@ -58,8 +58,16 @@ is the primary one for both the Option-W popup and the CMD+B sidebar.
   the quiet states. agent-ui folds it in where it parses a row
   (`model::paused_state`, so every reader sees one state); the Python
   fallback the same in `parse_windows` (`paused_state`), with its own
-  bucket in `CATS` and a violet `⏸` dot. Both read `#{@agent_paused}` as
-  the last field of their window format.
+  bucket in `CATS` and a violet `⏸` dot. Both read `#{@agent_paused}` in
+  their window format (then the limit's two fields, below).
+- **Rate-limited** (see [Rate-limited agents](#rate-limited-agents)): a
+  paused agent with `@agent_limit`. Its glyph and letter badge are the limit
+  mark in peach, the header counts it apart (`󱎫 N limit`, the paused count
+  without it), and where an asking row says what it asks it says its limit:
+  `limit  resets Tue 1:00 AM`, `limit  resetting`, `limit  reset unknown`,
+  with no reset time the indicator's own `@agent_detail` (`Opus limit
+  /model to switch`; `model limit` without one), `limit lifted  waiting for
+  you`. Listed under Idle with the paused; never Needs you or Active.
 - **Initial cursor**: the oldest agent that needs you (the first in
   `agent-jump.sh list` order), else the last agent (where ⌥W would go), else
   the window the popup covers, else the first row. A state change never
@@ -947,9 +955,12 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   violet) in place of the agent's last reply, then, while a pause is
   saved (the banner's stopping, safe or ready), the key that resumes it, dim:
   `paused · prefix P resumes`, `paused · prefix P` at 34 columns; its first
-  line keeps just the `⏸` (the word once, not twice). Paused agents never
+  line keeps just the `⏸` (the word once, not twice). A RATE-LIMITED card
+  is a paused card in peach with its limit below ([Rate-limited
+  agents](#rate-limited-agents)). Paused agents never
   fold into the idle line, and every count (the space headers, the title,
-  the dock) has a violet `⏸N` bucket after working. Idle is the
+  the dock) has a violet `⏸N` bucket after working (the rate-limited
+  counted in it). Idle is the
   absence of all that: no rail, no word, a regular title. The second line
   is `overlay2` (`sub` for an asking or failed agent: there it is the
   question), a live blurb after a blue `›`, the age at its end.
@@ -1510,6 +1521,10 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
    ▌   Island resize spring, C… glow off
    ▌ ⏸ PAUSED       [✕ void? click again]  armed, solid red ([✕ void?] at 34)
   ```
+- **Rate-limit banner** (layout.rs `limit_rows`): a strip of its own, apart
+  from the pause banner's cyan glow, right under it (the very top without
+  one), only while some agent is rate-limited ([Rate-limited
+  agents](#rate-limited-agents)). See there.
 - **Status jobs** (`status::Keeper`): with the line hidden tmux runs none of
   status-right's `#()` jobs, and two of them must keep running:
   continuum's autosave (`continuum_save.sh`) and the usage tick
@@ -1537,6 +1552,133 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   a sidebar and after the sidebar closes; `tests/test_notify.py` covers the
   script's CLI, sanitising, decision, the record stack (at most 4, expired
   dropped, 6-field records kept, the title field) and log.
+
+### Rate-limited agents
+
+A usage limit (Claude's StopFailure `rate_limit`, Codex's
+`usage_limit_exceeded`) does not fail the agent: the tab hook marks it a
+PAUSED agent with a reason (the contract is
+[agent-tab-indicator.md](agent-tab-indicator.md) and
+[agent-pause.md](agent-pause.md)): `@agent_state paused` and
+`@agent_paused` as for the pause key, plus the window's `@agent_limit
+"<resets_at> <type> <since>"` (`resets_at` epoch seconds, 0 when unknown: a
+model limit) and, once the limit has passed but the agent waits for Mack,
+`@agent_limit_lifted <epoch>`; `@agent_detail_kind limit` with readable
+`@agent_detail`. Mack's setting is the global `@agent_limit_autoresume`
+(on unless `off` / `0` / `false` / `no`, trimmed, any case, as
+agent-pause.py reads it; unset = on).
+
+- **Read**: agent-ui's window format ends with `#{@agent_limit}` and
+  `#{@agent_limit_lifted}` (`tmux.rs` `FIELDS`, 43), parsed into
+  `model::Limit` (a junk reset reads 0, never a guess); the global setting
+  rides on the client row (`STATUS_FORMATS`' last, `Status::limit_autoresume`,
+  no extra fork). The Python fallback reads the same two fields, then the
+  global setting on every row (`FIELDS`, `parse_limit`, `autoresume_on`: its
+  header says `· auto off` beside the limit count; rows of 20 fields and up
+  still parse).
+- **What it is**: `model::limited` (Python `limited`): `@agent_limit` is
+  set, the folded state is `paused` OR `idle`, nothing in flight. Idle
+  counts because agent-pause.py's `limit_send` unsets `@agent_paused` and
+  flips paused → idle just before its RESUME: a paste held behind a draft
+  (up to 2 h) or lost leaves the window idle with the limit (maybe lifted),
+  and it must still read limited (its card, its chip). `cat` files every
+  limited window in the paused bucket: never attention, never NEEDS YOU nor
+  agent-jump.sh's queue (whose rule is unchanged), never idle-folded or
+  stale. Slots follow the RAW state, mirroring the watcher's `slot_active`:
+  `paused` holds none; `idle` holds one only with a fresh `@agent_pending`
+  (an answered prompt), limited or not, so the two never disagree on a
+  number. A limited agent that is running, asking, failed or done (Mack
+  prompted it again; the limit is kept until the turn's outcome) is what it
+  is, not limited.
+- **Mark**: `󱎫` (nf-md-timer_sand, U+F13AB) in peach (`#fab387`),
+  `model::LIMIT_GLYPH` / `LIMIT_HUE` (Python `LIMIT_GLYPH` / `LIMIT_HUE`),
+  the same whether the limit holds or has lifted: the words tell those
+  apart. Provisional; it must match the tab's mark and CuaNotch's palette.
+  Its words are `limit`, never `paused` (`model::state_words`).
+- **Where a limit stands** (`model::Limit::stage`, Python `limit_stage`):
+  lifted; no reset time (resets_at written 0); unknown (the reset would not
+  parse, overflows an i64, or is more than 400 days from now,
+  `LIMIT_HORIZON`: never drawn, never a crash nor an empty time); before
+  the reset; resetting (past it, inside agent-pause.py's 120 s grace,
+  `model::LIMIT_GRACE` / Python `LIMIT_GRACE`, the script's `LIMIT_GRACE`:
+  change them together); passed (past the grace, not lifted: the tick
+  deferred it, a manual pause or the wake grace). It is RESUMABLE
+  (`Limit::resumable`, the script's own rule) when lifted, with no or an
+  unknown reset time, or passed.
+- **Sidebar card**: a paused card in peach: the rail, the mark on the
+  right (`󱎫 limit` on a one-line card), and in place of `paused` its
+  second line (`layout::limit_line`), the richest form that fits:
+
+  ```
+   ▎  s  Soon limited            󱎫
+   ▎     limit · resets 1:00 AM   2m      today
+   ▎     limit · resets Tue 1:00 AM       another day (Nov 2 1:00 AM a week out)
+   ▎     limit · resetting                inside the grace: no chip
+   ▎     limit · reset passed[ ⏎ resume ] past it, deferred
+   ▎     Opus limit[ ⏎ resume ]           no reset time: @agent_detail's words
+   ▎     model limit[ ⏎ resume ]          ... or this, without any
+   ▎     limit · reset unknown[ ⏎ resume ]
+   ▎     limit lifted[ ⏎ resume ]  5m      lifted
+  ```
+
+  With no reset time the line is the indicator's `@agent_detail`
+  (sanitized, blanks collapsed; `Opus limit · /model to switch` whole when
+  it fits, else the part before ` · `, else cut), `model limit` without
+  one (`view::limit_detail`). The ` ⏎ resume ` chip (solid peach) follows
+  whenever the card is resumable. Narrower, `resets` goes, then the time
+  (`limit`); the words give way before the chip, then the chip alone, then
+  the words without it. Times are local (`text::when`: 12-hour clock, the
+  weekday within six days, the date further).
+- **Resume**: the chip (`Target::LimitResume`, guarded like the answer
+  chips) runs `agent-pause.py limit-resume <win>` through `run-shell -b`
+  for that one agent, never the pause key's `resume`.
+  `Actions::limit_resume` checks the window as it is now first and says
+  why not in the footer, in the script's words: gone, `not rate-limited
+  any more`, `rate-limited until <t>` before the reset, `limit just reset ·
+  auto-continue first, try after <t>` inside the grace; the script decides
+  the rest. Anywhere else on the card goes to the window as before. The
+  menu and the Python roster have no per-agent resume (⏎ goes to the
+  window): they only show.
+- **Banner** (`layout::limit_rows`): drawn while any agent of any space is
+  rate-limited (`ViewModel::limited`, PINNED included, global in both
+  scopes), under the pause banner. One tile, peach at 12% (`LIMIT_TINT`),
+  a heavy peach `▌` rail; the mark and `rate-limited` bold peach, the count
+  bold, then when (the EARLIEST believable reset among those not lifted:
+  `resets <t>`, `resetting` inside its grace, `reset passed · resume when
+  ready` after; none believable (written 0, garbled, too far): `no reset
+  time · resume when ready`; all lifted: `lifted · waiting for you`) and the
+  setting (`auto ↻` or `auto off`):
+
+  ```
+   ▌ 󱎫 rate-limited · 2 · resets Tue 1:00 AM · auto ↻    one row when it fits
+   ▌ 󱎫 rate-limited · 2               auto ↻             two rows (34 columns)
+   ▌   resets Tue 1:00 AM
+   ▌ 󱎫 2 · resets Tue 1:00 AM                            one short row
+  ```
+
+  Two rows from 16 rows tall (the first shedding `rate-limited`, then the
+  setting; the second `resets`, then clipped), one from 8 (shedding `·
+  auto`, `rate-limited`, `resets`, then the time), none below. The COUNT is
+  never cut. A click goes to the agent it is about (the earliest reset;
+  else the first held).
+- **Menu**: the glyph and letter badge peach, the reason by stage (`limit
+  resets …`, `Opus limit  /model to switch`, `model limit`, `limit
+  resetting`, `limit  reset unknown`; `view::limit_words`), the header
+  `󱎫 N limit` apart from `⏸ N paused`.
+- **Python roster**: the dot and shape `󱎫` peach, the state word `limit`,
+  the dim detail by stage as the menu's (`limit_words`, `limit_stage`; a
+  huge reset is `reset unknown`, `when_words` never raises), the header
+  `󱎫 N limit` apart from `⏸ N paused`.
+- **Tests**: `sidebar/layout/tests/limit.rs` (cards, chip cells, forms,
+  banner forms and placement, every size), `model.rs`
+  `limited_is_paused_with_a_reason` / `limit_parse_and_resumable`,
+  `tmux.rs` `the_limit_fields_are_last`, `actions.rs`
+  `limited_agents_park_and_resume_through_limit_resume`, `sidebar.rs`
+  `a_lifted_limit_card_resumes_on_its_chip`, `menu/render.rs`
+  `limited_is_a_peach_paused_agent_out_of_the_needs` /
+  `limit_reasons_at_the_edges`, `text.rs`
+  `when_words_say_the_day`; Python `tests/test_agent_roster.py`
+  `LimitTests`.
 
 ### Agent insight (`src/insight.rs`)
 

@@ -277,6 +277,9 @@ pub struct Bar {
     /// off): when an idle agent's card gets the stale-agent hint. None (no
     /// client row to read it from): the default.
     pub stale_after: Option<i64>,
+    /// `@agent_limit_autoresume` is `off` ([`crate::tmux::Status::limit_autoresume`]):
+    /// the rate-limit banner says `auto off`. False (on) without a client row.
+    pub limit_auto_off: bool,
 }
 
 // ---------------------------------------------------------------- toasts
@@ -411,6 +414,7 @@ impl Bar {
             };
             bar.toasts = Toast::parse_all(&st.toast).into_iter().filter(|t| t.for_client(client)).collect();
             bar.stale_after = Some(crate::view::stale_after(&st.stale_after));
+            bar.limit_auto_off = !st.limit_autoresume();
         }
         let mut flagged: Vec<&str> = snap.windows.iter().filter(|w| w.stash_sel).map(|w| w.id.as_str()).collect();
         flagged.sort_unstable();

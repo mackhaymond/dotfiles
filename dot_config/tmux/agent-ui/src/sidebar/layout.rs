@@ -241,7 +241,7 @@
 use super::pause::{Held, Phase};
 use super::status::{ink_on, ink_rgb, tmux_colour, Bar, Kind, Toast, ToastId, Usage};
 use crate::actions::watcher_problem;
-use crate::model::{Cat, Counts, Flag, PAUSED_GLYPH, PAUSED_HUE};
+use crate::model::{Cat, Counts, Flag, Limit, Stage, LIMIT_GLYPH, LIMIT_HUE, PAUSED_GLYPH, PAUSED_HUE};
 use crate::palette;
 // WezTerm draws the sidebar, so its cells are WezTerm's (2026-10-22: they
 // were tmux's, see [`crate::text::wez`]).
@@ -585,6 +585,11 @@ pub enum Target {
     /// trusted only once settled under the pointer (when the agent stops,
     /// the banner settles and a resume row can land where the row was).
     Held { win: String, session: String },
+    /// A LIFTED rate-limited card's `⏎ resume` chip ([`limit_line`]):
+    /// `agent-pause.py limit-resume <win>`, that one agent, never the pause
+    /// key's `resume` (docs/agent-roster.md "Rate-limited agents"). The rest
+    /// of the card still goes to the window.
+    LimitResume(String),
 }
 
 /// One screen line.
@@ -669,6 +674,10 @@ pub struct Frame {
     pub toast_until: Option<i64>,
     /// The pause banner's rows ([`pause_rows`]): the very top. Empty: none.
     pub pause: Range<usize>,
+    /// The rate-limit banner's rows ([`limit_rows`]): right under the pause
+    /// banner (the top without one). Empty: no agent is rate-limited, or no
+    /// room.
+    pub limit: Range<usize>,
     /// The rows of each section, header included (empty: not drawn).
     pub needs: Range<usize>,
     /// The agents section: the PINNED block (when anything is pinned), then
@@ -1333,6 +1342,124 @@ fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
     top.status = 1..n - 1;
     top.card = 0..n;
     top
+}
+
+// ---------------------------------------------------------------- the rate-limit banner
+
+/// How strongly the rate-limit banner takes its peach (one tint for the
+/// whole strip, between the pause banner's moving and settled tints).
+pub const LIMIT_TINT: u8 = 12;
+
+/// How many rows the rate-limit banner may take in a frame `h` tall: two
+/// from 16 rows (the pause banner's and the usage panel's threshold), one
+/// from 8, none below (the pause banner, the sections and PARKED keep the
+/// smallest frames). Two only when one row cannot say it all.
+pub fn limit_lines(h: usize) -> usize {
+    match h {
+        16.. => 2,
+        8.. => 1,
+        _ => 0,
+    }
+}
+
+/// What the rate-limit banner says about when, and the agent a click goes
+/// to: the limited agents not lifted yet, by their EARLIEST believable reset
+/// ([`Limit::reset_at`]): `resets Tue 1:00 AM` before it, `resetting` inside
+/// agent-pause.py's grace ([`crate::model::LIMIT_GRACE`]), `reset passed ·
+/// resume when ready` after it; with no believable reset among them (written
+/// 0, garbled, absurdly far) `no reset time · resume when ready`; every one
+/// lifted, `lifted · waiting for you`.
+fn limit_when<'a>(limited: &[&'a Agent], now: f64) -> (String, &'a Agent) {
+    let held: Vec<&Agent> = limited.iter().copied().filter(|a| !a.limit_lifted()).collect();
+    let reset = |a: &Agent| a.limit.as_ref().and_then(|l| l.reset_at(now));
+    if let Some((a, r)) = held.iter().filter_map(|a| Some((*a, reset(a)?))).min_by_key(|(_, r)| *r) {
+        let says = match a.limit.as_ref().map(|l| l.stage(now)) {
+            Some(Stage::Resets(_)) => format!("resets {}", crate::text::when(r, now)),
+            Some(Stage::Resetting) => "resetting".to_string(),
+            _ => "reset passed · resume when ready".to_string(),
+        };
+        return (says, a);
+    }
+    if let Some(a) = held.first().copied() {
+        return ("no reset time · resume when ready".to_string(), a);
+    }
+    ("lifted · waiting for you".to_string(), limited[0])
+}
+
+/// The RATE-LIMIT banner (docs/agent-roster.md "Rate-limited agents"),
+/// apart from the pause banner's cyan "all paused" glow: drawn only while
+/// some agent is rate-limited ([`ViewModel::limited`], global in both
+/// scopes), right under the pause banner. ONE peach tile ([`LIMIT_TINT`],
+/// like the pause banner's), a heavy `▌` rail down it; the mark and
+/// `rate-limited` bold in peach, the count bold, when it resets (the
+/// earliest, [`limit_when`]) and Mack's auto-resume setting
+/// (`@agent_limit_autoresume`) after it:
+///
+/// ```text
+///  ▌ 󱎫 rate-limited · 2 · resets Tue 1:00 AM · auto ↻     (one row, when it fits)
+///  ▌ 󱎫 rate-limited · 2                 auto ↻          (two rows at 34 columns)
+///  ▌   resets Tue 1:00 AM
+///  ▌ 󱎫 2 · resets Tue 1:00 AM                            (one row, narrow)
+/// ```
+///
+/// One row when everything fits on it; else two where the frame allows
+/// ([`limit_lines`]): the first sheds `rate-limited`, then the setting, the
+/// second `resets`, then is clipped; else the one row sheds `· auto`, then
+/// `rate-limited`, then `resets`, then the time. The COUNT is never cut. A
+/// click goes to the agent the banner is about (the earliest reset; one
+/// with no reset time).
+fn limit_rows(view: &ViewModel, cx: Cx, lines: usize, auto: bool) -> Vec<Row> {
+    let w = cx.w;
+    let limited = view.limited();
+    if lines == 0 || w == 0 || limited.is_empty() {
+        return Vec::new();
+    }
+    let (when, first) = limit_when(&limited, cx.now);
+    let bg = Ink::Mix(LIMIT_HUE, LIMIT_TINT);
+    let dimc = dim(true);
+    let rail = || seg(RAIL_HEAVY, LIMIT_HUE);
+    let n = limited.len().to_string();
+    let head = |word: bool| {
+        let mut v = vec![rail(), seg(" ", "text"), bold(LIMIT_GLYPH, LIMIT_HUE), seg(" ", "text")];
+        if word {
+            v.extend([bold("rate-limited", LIMIT_HUE), seg(" · ", dimc)]);
+        }
+        v.push(bold(n.clone(), "text"));
+        v
+    };
+    let auto_segs = || if auto { vec![seg("auto ", dimc), bold("↻", LIMIT_HUE)] } else { vec![seg("auto off", dimc)] };
+    let short = when.strip_prefix("resets ").unwrap_or(&when).to_string();
+    let go = Target::Go { win: first.window_id.clone(), session: first.session.clone() };
+    let fits = |l: &[Seg]| width(l) < inner(w);
+    let full = [head(true), vec![seg(format!(" · {when} · "), dimc)], auto_segs()].concat();
+    let rows = if fits(&full) {
+        vec![tile_row(w, bg, full, vec![])]
+    } else if lines >= 2 {
+        // The first row: the count whole, `rate-limited` and then the
+        // setting giving way (a cell clear between the two sides).
+        let right = || [auto_segs(), vec![seg(" ", "text")]].concat();
+        let forms = [(head(true), right()), (head(false), right()), (head(false), vec![])];
+        let last = forms.len() - 1;
+        let (l1, r1) = forms
+            .into_iter()
+            .enumerate()
+            .find(|(i, (l, r))| *i == last || width(l) + 1 + width(r) <= inner(w))
+            .map(|(_, f)| f)
+            .unwrap_or_default();
+        let l2 = |t: &str| vec![rail(), seg("   ", "text"), seg(t.to_string(), "text")];
+        let second = if fits(&l2(&when)) { l2(&when) } else { l2(&short) };
+        vec![tile_row(w, bg, l1, r1), tile_row(w, bg, second, vec![])]
+    } else {
+        let forms = [
+            [head(true), vec![seg(format!(" · {when}"), dimc)]].concat(),
+            [head(false), vec![seg(format!(" · {when}"), dimc)]].concat(),
+            [head(false), vec![seg(format!(" · {short}"), dimc)]].concat(),
+            head(false),
+        ];
+        let pick = forms.iter().find(|f| fits(f)).unwrap_or(&forms[3]).clone();
+        vec![tile_row(w, bg, pick, vec![])]
+    };
+    rows.into_iter().map(|r| r.click(w, go.clone())).collect()
 }
 
 // ---------------------------------------------------------------- the pause banner
@@ -2052,8 +2179,81 @@ fn cat_word(a: &Agent, c: Cat) -> Word {
         Cat::NeedsInput => Word { glyph: "◉", word: if a.detail_kind == "perm" { "perm" } else { "asks" }, hue: "yellow" },
         Cat::Done | Cat::Idle => Word { glyph: "✓", word: "done", hue: "green" },
         Cat::Working => Word { glyph: "◐", word: "working", hue: "blue" },
+        // Rate-limited: a paused agent with a reason, its own mark.
+        Cat::Paused if a.limit.is_some() => Word { glyph: LIMIT_GLYPH, word: "limit", hue: LIMIT_HUE },
         Cat::Paused => Word { glyph: PAUSED_GLYPH, word: "paused", hue: PAUSED_HUE },
     }
+}
+
+/// A resumable rate-limited card's resume chip ([`Target::LimitResume`]):
+/// square, dark ink on solid [`LIMIT_HUE`], the one thing on the card that
+/// asks for a click.
+pub const LIMIT_RESUME: &str = " ⏎ resume ";
+
+pub use crate::view::{limit_detail, MODEL_LIMIT};
+
+/// A RATE-LIMITED card's second line (docs/agent-roster.md "Rate-limited
+/// agents"), in place of [`paused_line`], by its [`Stage`] at `now`:
+/// `limit` bold peach, then dim ` · resets 1:00 AM` (` · resets Tue 1:00
+/// AM` on another day, [`crate::text::when`]); ` · resetting` inside
+/// agent-pause.py's grace; ` · reset passed` after it; ` · reset unknown`
+/// for a reset that would not parse or is absurdly far; with no reset time
+/// the indicator's own words (`detail`, [`limit_detail`]); lifted, `limit
+/// lifted`. Whenever a manual resume is allowed ([`Limit::resumable`]:
+/// lifted, no or unknown reset time, past the grace) the [`LIMIT_RESUME`]
+/// chip follows. The richest form that fits `room` cells, down to `limit`
+/// alone. Also returns the chip's cells within the line (`[x0, x1)`), when
+/// it is drawn.
+fn limit_line(l: &Limit, detail: &str, now: f64, room: usize, dimc: Hue) -> (Vec<Seg>, Option<(usize, usize)>) {
+    let word = |t: &str| bold(t.to_string(), LIMIT_HUE);
+    let limit_and = |t: &str| vec![word("limit"), seg(format!(" · {t}"), dimc)];
+    let chip_on = l.resumable(now);
+    let chip_w = if chip_on { dwidth(LIMIT_RESUME) } else { 0 };
+    let texts: Vec<Vec<Seg>> = match l.stage(now) {
+        Stage::Lifted => vec![vec![word("limit lifted")], vec![word("lifted")]],
+        Stage::NoTime => {
+            let (head, rest) = limit_detail(detail);
+            let mut v = Vec::new();
+            if !rest.is_empty() {
+                v.push(vec![word(&head), seg(format!(" · {rest}"), dimc)]);
+            }
+            v.push(vec![word(&head)]);
+            // A long head, cut to what is left beside the chip, else to the
+            // room (no chip).
+            for r in [room.saturating_sub(chip_w), room] {
+                if r >= 6 {
+                    v.push(vec![word(&clip(&head, r))]);
+                }
+            }
+            v.push(vec![word("limit")]);
+            v
+        }
+        Stage::Unknown => vec![limit_and("reset unknown"), vec![word("limit")]],
+        Stage::Passed => vec![limit_and("reset passed"), vec![word("limit")]],
+        Stage::Resetting => vec![limit_and("resetting"), vec![word("limit")]],
+        Stage::Resets(r) => {
+            let at = crate::text::when(r, now);
+            vec![limit_and(&format!("resets {at}")), limit_and(&at), vec![word("limit")]]
+        }
+    };
+    let mut forms: Vec<Vec<Seg>> = Vec::new();
+    if chip_on {
+        // (The chip's own pad parts it from the words: `limit lifted` whole
+        // at Mack's 34 columns, beside the age.)
+        let chip = || block(LIMIT_RESUME, ink_on(Ink::Pal(LIMIT_HUE)), LIMIT_HUE);
+        forms.extend(texts.iter().map(|t| [t.clone(), vec![chip()]].concat()));
+        forms.push(vec![chip()]);
+    }
+    // Without the chip (too narrow for it, or not resumable), the shortest
+    // last.
+    forms.extend(texts);
+    let last = forms.len() - 1;
+    let line = forms.into_iter().enumerate().find(|(i, f)| *i == last || width(f) <= room).map(|(_, f)| f).unwrap_or_default();
+    let span = line.iter().position(|s| s.text == LIMIT_RESUME).map(|k| {
+        let x0 = width(&line[..k]);
+        (x0, x0 + dwidth(LIMIT_RESUME))
+    });
+    (line, span)
 }
 
 /// A paused card's second line (docs/agent-pause.md "The paused state"):
@@ -2492,7 +2692,13 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     };
     // (The words' cells: a `› ` / `> ` mark is not the text DOING_MIN keeps.)
     let mark = if text.len() > 1 { width(&text[..1]) } else { 0 };
-    let tw = if word_below { width(&paused_line(usize::MAX, cx.resumes, dimc)) } else { width(&text) - mark };
+    // A paused card's line under the title: a rate-limited one's own
+    // ([`limit_line`]), else [`paused_line`].
+    let below = |room: usize| match &a.limit {
+        Some(l) => limit_line(l, &a.detail, cx.now, room, dimc),
+        None => (paused_line(room, cx.resumes, dimc), None),
+    };
+    let tw = if word_below { width(&below(usize::MAX).0) } else { width(&text) - mark };
     // The stale-agent sweep's hint ([`stale_hint`]): on this second line only.
     let stale = a.stale(cx.now, cx.stale_after);
     // The right side: the extras ([`extras`]), the sweep's hint, the tag,
@@ -2540,13 +2746,21 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
         Some(p) => vec![rail, seg(" ", "text"), p, seg(" ".repeat(indent - 1 - BADGE_W), "text")],
         None => vec![rail, seg(" ".repeat(indent), "text")],
     };
+    let mut chip = None;
     if word_below {
-        l2.extend(paused_line(room(&r2), cx.resumes, dimc));
+        let (line, at) = below(room(&r2));
+        // (The chip's cells on the row: past the margin and the rail/indent.)
+        let x = margin(cx.w) + width(&l2);
+        chip = at.map(|(x0, x1)| ((x + x0) as u16, (x + x1) as u16));
+        l2.extend(line);
     } else {
         l2.extend(text);
     }
     let rw = width(&r2);
-    let second = diff_click(tile_row(cx.w, bg, l2, r2).click(cx.w, go), cx.w, rw, span, &a.window_id);
+    let mut second = diff_click(tile_row(cx.w, bg, l2, r2).click(cx.w, go), cx.w, rw, span, &a.window_id);
+    if let Some((x0, x1)) = chip.filter(|&(_, x1)| usize::from(x1) <= margin(cx.w) + inner(cx.w)) {
+        second.targets.insert(0, (x0, x1, Target::LimitResume(a.window_id.clone())));
+    }
     sel(vec![first, second])
 }
 
@@ -3665,12 +3879,17 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     // The pause banner first, at the very top: the panel under it is laid
     // out in the rows it leaves, and the toasts float under it, never over.
     let settled = Settled { armed: opts.void_armed, glow_off: opts.glow_off };
-    let banner = opts.pause.as_ref().map_or_else(Vec::new, |p| pause_rows(p, cx, pause_lines(h), held_lines(h), settled));
+    let mut banner = opts.pause.as_ref().map_or_else(Vec::new, |p| pause_rows(p, cx, pause_lines(h), held_lines(h), settled));
+    let np = banner.len();
+    // The rate-limit banner right under it (its own strip, never the
+    // pause's glow), while some agent is rate-limited.
+    banner.extend(limit_rows(view, cx, limit_lines(h), !bar.limit_auto_off));
     let nb = banner.len();
     let Top { rows: top, status, card, keep } = top_rows(view, bar, w, h - nb, cx.now);
     let shift = |r: Range<usize>| r.start + nb..r.end + nb;
     let (status, card, keep) = (shift(status), shift(card), keep + nb);
-    frame.pause = 0..nb;
+    frame.pause = 0..np;
+    frame.limit = np..nb;
     let top = [banner, top].concat();
     // The rows between the top and the PARKED line (held back like the old
     // last row: it carries the stash, the messages and the watcher).
@@ -3689,8 +3908,10 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
         frame.rows = rows;
         frame.step = STEPS.len() as u8;
         frame.status = 0..0;
-        // (The banner, when there is one, is that first row.)
-        frame.pause = 0..nb.min(1);
+        // (The banner, when there is one, is that first row: the pause's,
+        // else the rate limit's.)
+        frame.pause = 0..np.min(1);
+        frame.limit = if np == 0 { 0..nb.min(1) } else { 1..1 };
         return keep.min(1);
     }
     // The dock's gap and one line of chips are held back first: spaces are

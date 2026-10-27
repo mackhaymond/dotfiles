@@ -216,6 +216,189 @@ class PausedTests(unittest.TestCase):
         self.assertNotEqual(R.cat(self.ws()[1]), "idle")
 
 
+def limit_line(session, index, wid, state, summary, flag="", limit="", lifted="", **kw):
+    """paused_line() plus @agent_limit and @agent_limit_lifted: the full 24-field row."""
+    return US.join([paused_line(session, index, wid, state, summary, flag, **kw), limit, lifted])
+
+
+class LimitTests(unittest.TestCase):
+    """docs/agent-roster.md "Rate-limited agents": a PAUSED agent with
+    @agent_limit. Still the paused bucket (never attention, never NEEDS YOU),
+    its mark the limit glyph in peach, its word `limit`, its row saying when
+    the limit resets; counted apart in the header. Running again (Mack
+    prompted it; the limit kept until the turn's outcome) it is working."""
+    FLAG = "1792418628"
+    NOW = 1_000_000
+
+    def lim(self, r, kind="five_hour"):
+        return "%d %s %d" % (r, kind, self.NOW - 300)
+
+    def ws(self):
+        f = self.FLAG
+        return R.parse_windows("\n".join([
+            limit_line("main", 1, "@1", "paused", "proj/Soon", f, self.lim(self.NOW + 60)),
+            limit_line("main", 2, "@2", "paused", "proj/Model", f, self.lim(0, "model"),
+                       detail_kind="limit", detail="Opus limit · /model to switch"),
+            limit_line("main", 3, "@3", "paused", "proj/Lifted", f, self.lim(self.NOW - 600), str(self.NOW - 60)),
+            limit_line("main", 4, "@4", "running", "proj/Again", "", self.lim(self.NOW + 60)),
+            limit_line("main", 5, "@5", "paused", "proj/Plain", f),
+            limit_line("main", 6, "@6", "done", "proj/Done", since="100 done"),
+            paused_line("main", 7, "@7", "idle", "proj/Old row"),               # 22 fields: no limit, still parses
+            line("main", 8, "@8", "idle", "proj/Older row"),                    # 20 fields
+        ]))
+
+    def test_fields_and_parse(self):
+        self.assertEqual(R.FIELDS[-3:], ["limit", "limit_lifted", "limit_auto"])
+        self.assertTrue(R.FMT.endswith("#{@agent_paused}" + US + "#{@agent_limit}" + US + "#{@agent_limit_lifted}"
+                                       + US + "#{@agent_limit_autoresume}"))
+        by = {w["id"]: w for w in self.ws()}
+        self.assertEqual(len(by), 8)
+        self.assertEqual(by["@1"]["limit"], {"resets_at": self.NOW + 60, "garbled": False, "type": "five_hour",
+                                             "since": self.NOW - 300, "lifted": None})
+        self.assertEqual(by["@3"]["limit"]["lifted"], self.NOW - 60)
+        self.assertIsNone(by["@5"]["limit"])
+        self.assertIsNone(by["@7"]["limit"])
+        self.assertIsNone(by["@8"]["limit"])
+        self.assertEqual(R.parse_limit("x", "yes"), {"resets_at": 0, "garbled": True, "type": "", "since": None, "lifted": 0})
+        self.assertTrue(R.parse_limit("99999999999999999999 five_hour 1")["garbled"])   # past an i64, as agent-ui
+        self.assertFalse(R.parse_limit("0 model 1")["garbled"])
+        # agent-pause.py's grace, one constant.
+        self.assertEqual(R.LIMIT_GRACE, 120)
+        lim = R.parse_limit("1000 five_hour 900")
+        self.assertEqual([R.limit_stage(lim, t)[0] for t in (999, 1000, 1119, 1120)],
+                         ["resets", "resetting", "resetting", "passed"])
+        self.assertIsNone(R.parse_limit("  ", "5"))
+        # A row of 19 fields, or one too many, is no window.
+        self.assertEqual(R.parse_windows(US.join(["x"] * 19)), [])
+        self.assertEqual(R.parse_windows(US.join(["x"] * 26)), [])
+
+    def test_paused_with_a_reason_never_needs_you(self):
+        R.collation("C")
+        ws = self.ws()
+        by = {w["id"]: w for w in ws}
+        for i in ("@1", "@2", "@3"):
+            w = by[i]
+            self.assertTrue(R.limited(w), i)
+            self.assertEqual((R.cat(w), R.rank(w), R.is_attn(w), R.in_flight(w)), ("paused", 4, False, False), i)
+        self.assertNotIn("@1", [i for i, _ in R.needs_order(ws)])
+        self.assertEqual([i for i, _ in R.needs_order(ws)], ["@6"])
+        self.assertFalse(R.limited(by["@4"]))
+        self.assertEqual(R.cat(by["@4"]), "working")
+        self.assertFalse(R.limited(by["@5"]))
+        # A fleet out: working, not limited.
+        fleet = R.parse_windows(limit_line("m", 1, "@9", "paused", "x", self.FLAG, self.lim(self.NOW), workflow="1"))[0]
+        self.assertFalse(R.limited(fleet))
+        self.assertEqual(R.counts(ws), [("done", 1), ("working", 1), ("paused", 4), ("idle", 2)])
+
+    def test_mark_word_and_when(self):
+        r = R.Roster("/dev/ttys999")
+        by = {w["id"]: w for w in self.ws()}
+        self.assertEqual((R.LIMIT_GLYPH, R.LIMIT_HUE, R.HEX["peach"]), ("\U000F13AB", "peach", "#fab387"))
+        for i in ("@1", "@2", "@3"):
+            self.assertEqual(r.dot(by[i], True), R.fg("peach") + R.LIMIT_GLYPH, i)
+            self.assertEqual(r.dot(by[i], False), R.fg("peach") + R.LIMIT_GLYPH, i)
+            self.assertEqual(r.shape(by[i], True), R.fg("peach") + R.LIMIT_GLYPH, i)
+        self.assertEqual(r.dot(by["@5"], True), R.fg("violet") + "⏸")
+        when = R.when_words(self.NOW + 60, self.NOW)
+        row = lambda i: strip_plain(r.row({"kind": "win", "w": by[i], "long": False}, 120, False, self.NOW, False))
+        self.assertRegex(row("@1"), r"Soon\s+limit  resets %s\s+limit " % re.escape(when))
+        self.assertRegex(row("@2"), r"Model\s+Opus limit  /model to switch\s+limit ")
+        self.assertRegex(row("@3"), r"Lifted\s+limit lifted  waiting for you\s+limit ")
+        self.assertRegex(row("@5"), r"Plain\s+paused ")
+        self.assertRegex(row("@4"), r"Again\s+working ")
+
+    def edge_row(self, limit, detail=""):
+        """The row of one limited window with @agent_limit `limit`."""
+        w = R.parse_windows(limit_line("main", 1, "@1", "paused", "proj/Edge", self.FLAG, limit,
+                                       detail_kind="limit" if detail else "", detail=detail))[0]
+        r = R.Roster("/dev/ttys999")
+        return strip_plain(r.row({"kind": "win", "w": w, "long": False}, 120, False, self.NOW, False))
+
+    def test_limit_edges(self):
+        """No reset time and no words: `model limit`. A reset that overflows,
+        will not parse, or is more than 400 days off: `reset unknown`, never
+        a crash (time.localtime overflows) nor an empty time. Inside
+        agent-pause.py's 120 s grace: `resetting`; past it: `reset passed`."""
+        self.assertRegex(self.edge_row("0 model 1"), r"Edge\s+model limit\s+limit ")
+        for raw in ("99999999999999999999 five_hour 1", "%d seven_day 1" % (self.NOW + 500 * 86400),
+                    "soon five_hour 1", "-5 five_hour 1"):
+            row = self.edge_row(raw)
+            self.assertRegex(row, r"Edge\s+limit  reset unknown\s+limit ", raw)
+            self.assertNotIn("resets", row, raw)
+        self.assertRegex(self.edge_row("%d five_hour 1" % (self.NOW - 60)), r"Edge\s+limit  resetting\s+limit ")
+        self.assertRegex(self.edge_row("%d five_hour 1" % (self.NOW - 600)), r"Edge\s+limit  reset passed\s+limit ")
+        # when_words never raises, whatever it is handed.
+        self.assertEqual(R.when_words(10 ** 20, self.NOW), "")
+
+    def test_when_words(self):
+        t = 1_800_000_000
+        self.assertNotIn(R.when_words(t, t).split()[0], R.WDAY)
+        self.assertRegex(R.when_words(t, t), r"^\d{1,2}:\d\d [AP]M$")
+        self.assertIn(R.when_words(t + 86400, t).split()[0], R.WDAY)
+        self.assertRegex(R.when_words(t + 8 * 86400, t), r"^[A-Z][a-z]{2} \d{1,2} \d{1,2}:\d\d [AP]M$")
+        self.assertRegex(R.when_words(t - 86400, t), r"^[A-Z][a-z]{2} \d{1,2} ")
+        # By calendar day in local time: six days ahead a weekday, seven the date.
+        self.assertIn(R.when_words(t + 6 * 86400, t).split()[0], R.WDAY)
+        self.assertIn(R.when_words(t + 7 * 86400, t).split()[0], R.MON)
+        # Late tonight vs early tomorrow: one calendar day apart, though < 24 h.
+        midnight = t - (t + R.time.localtime(t).tm_gmtoff) % 86400 + 86400   # local midnight after t
+        self.assertNotIn(R.when_words(midnight - 60, midnight - 120).split()[0], R.WDAY)
+        self.assertIn(R.when_words(midnight + 60, midnight - 120).split()[0], R.WDAY)
+
+    def test_idle_with_a_limit_is_still_limited(self):
+        """agent-pause.py's limit_send unsets @agent_paused and flips paused →
+        idle just before its RESUME; held behind a draft (or lost), the window
+        sits idle with @agent_limit (maybe lifted). Still limited: the paused
+        bucket, the peach mark and the limit's words, never NEEDS YOU, never
+        counted idle. A done window with a stale limit is just done."""
+        R.collation("C")
+        ws = R.parse_windows("\n".join([
+            limit_line("main", 1, "@1", "idle", "proj/Held", "", self.lim(self.NOW - 600), str(self.NOW - 300)),
+            limit_line("main", 2, "@2", "idle", "proj/Waiting", "", self.lim(self.NOW + 3600)),
+            limit_line("main", 3, "@3", "done", "proj/Done", "", self.lim(self.NOW + 3600), since="100 done"),
+            limit_line("main", 4, "@4", "idle", "proj/Calm"),
+        ]))
+        by = {w["id"]: w for w in ws}
+        for i in ("@1", "@2"):
+            self.assertTrue(R.limited(by[i]), i)
+            self.assertEqual((R.cat(by[i]), R.rank(by[i]), R.is_attn(by[i])), ("paused", 4, False), i)
+        self.assertFalse(R.limited(by["@3"]))
+        self.assertEqual(R.cat(by["@3"]), "done")
+        self.assertEqual([i for i, _ in R.needs_order(ws)], ["@3"])
+        r = R.Roster("/dev/ttys999")
+        self.assertEqual(r.dot(by["@1"], True), R.fg("peach") + R.LIMIT_GLYPH)
+        row = strip_plain(r.row({"kind": "win", "w": by["@1"], "long": False}, 120, False, self.NOW, False))
+        self.assertRegex(row, r"Held\s+limit lifted  waiting for you\s+limit ")
+        r.windows, r.needs = ws, R.needs_order(ws)
+        head = strip_plain(r.render(140, 20, self.NOW)[0])
+        self.assertIn(R.LIMIT_GLYPH + " 2 limit", head)
+        self.assertIn("· 1 idle", head)
+
+    def test_autoresume_setting(self):
+        """@agent_limit_autoresume: off / 0 / false / no (trimmed, any case)
+        is off, anything else (unset included) on, as agent-pause.py reads
+        it; the header says `auto off` beside the limit count."""
+        for raw, on in (("", True), ("on", True), ("1", True), ("junk", True), ("off", False), (" OFF ", False),
+                        ("0", False), ("false", False), ("False", False), ("no", False), (" No", False)):
+            self.assertEqual(R.autoresume_on(raw), on, raw)
+        self.assertTrue(R.FMT.endswith(US + "#{@agent_limit_autoresume}"))
+        ws = R.parse_windows(US.join([limit_line("main", 1, "@1", "paused", "proj/Soon", self.FLAG,
+                                                 self.lim(self.NOW + 60)), "off"]))
+        r = R.Roster("/dev/ttys999")
+        r.windows, r.needs = ws, []
+        self.assertIn(R.LIMIT_GLYPH + " 1 limit · auto off", strip_plain(r.render(140, 20, self.NOW)[0]))
+        r.windows = self.ws()
+        self.assertNotIn("auto off", strip_plain(r.render(140, 20, self.NOW)[0]))
+
+    def test_header_counts_limit_apart(self):
+        r = R.Roster("/dev/ttys999")
+        r.windows = self.ws()
+        r.needs = R.needs_order(r.windows)
+        head = strip_plain(r.render(140, 20, self.NOW)[0])
+        self.assertIn("⏸ 1 paused", head)
+        self.assertIn(R.LIMIT_GLYPH + " 3 limit", head)
+
+
 class KeyTests(unittest.TestCase):
     def test_keys(self):
         self.assertEqual(R.parse_keys("\x1b[A\x1b[B\x1b[Z\t\r j"),

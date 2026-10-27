@@ -66,6 +66,10 @@
 #                   a claude tab, so the tab is an agent before claude runs.
 #                   The watcher honours it as a grace and drops it once the
 #                   agent shows up; clear_state unsets it.
+#   @agent_limit    "<resets_at> <type> <since>": the window is RATE-LIMITED
+#                   (a paused agent with a reason; RATE-LIMITED AGENTS below).
+#   @agent_limit_lifted  "<epoch>": that limit has passed, the agent waits
+#                   for Mack (written by agent-pause.py's limit-tick).
 #   @agent_slot     the window's sticky agent number (agent-ui's number keys).
 #                   Stamped by set_state, under the slot lock and in the
 #                   state's own tmux call, when a window ENTERS the Active
@@ -126,13 +130,16 @@
 #                                      approvals from questions kept failing,
 #                                      and why they no longer are: one state,
 #                                      and the tab name says which session.
-#   subagent-stop  SubagentStop (NOT wired yet) → the asking subagent's end
-#                                      ends its gate (ASKER GATE); else inert
+#   subagent-stop  SubagentStop        → the asking subagent's end ends its
+#                                      gate (ASKER GATE); else inert
 #   failed       StopFailure         → the TURN ITSELF died (529, overloaded).
 #                                      Red. Nothing is waiting on an answer;
 #                                      something broke. Asserted like the
 #                                      other attention state (focus ≠ fixed)
 #                                      and discharged by the focus hook.
+#                                      EXCEPT error == rate_limit (a usage
+#                                      limit): `paused` + @agent_limit, see
+#                                      RATE-LIMITED AGENTS.
 #   done         Stop                → turn finished; refresh @agent_summary;
 #                                      not tinted if a client is watching it;
 #                                      a turn ANOTHER AGENT started finishes
@@ -307,8 +314,7 @@ owner_resolve() {
     # `valid` re-derives the token from that frontend's pid+start, socket and
     # pane and checks the process is still alive on that pane's tty, so a
     # stale condenser cannot vouch for a window another session now owns.
-    # (The detached ask run, ask-bg, is the same kind of tmux-server child.)
-    case "$mode" in condense-locked|ask-bg) ;; *) return 1 ;; esac
+    case "$mode" in condense-locked) ;; *) return 1 ;; esac
     [ -n "${AGENT_TAB_OWNER_RECORD:-}" ] || return 1
     "$HOME/.local/bin/codex-terminal-owner" valid "$AGENT_TAB_OWNER_SESSION" "$AGENT_TAB_OWNER_TOKEN" \
         <<<"$AGENT_TAB_OWNER_RECORD" >/dev/null 2>&1
@@ -320,11 +326,9 @@ BG_PENDING="$HOME/.local/bin/agent-bg-pending"
 # 547f0e7; its header has the contract). See ASKS WHILE WORK IS OUT in done.
 TURN_ASKS="$HOME/.local/bin/agent-turn-asks"
 # The Stop hook's synchronous --marker-only call: SIGTERMed past this (s).
+# The ONLY call: there is no detached full (model) run any more (EXPLICIT
+# ONLY, in ASKS WHILE WORK IS OUT).
 ASK_SYNC_BUDGET=0.3
-# The detached full run's own bound (s), SIGTERM too (never SIGKILL: the
-# decider kills its copilot group on TERM and exits 2). Above its own 20 s
-# model timeout plus the 3 s lock wait, so normally it ends itself.
-ASK_BG_TIMEOUT="${AGENT_TAB_ASK_BG_TIMEOUT:-30}"
 
 # Watchdog for the companion daemon. agent-tab-watcher.sh is spawned exactly
 # once, from tmux.conf, so if it ever dies mid-session (stray pkill, OOM, a
@@ -608,8 +612,7 @@ window_state() {
 }
 
 # Is the user actually LOOKING at the agent's window? $watched is its
-# #{window_active_clients}, read by the caller (the hook body, the ask-bg
-# worker). A watched window in a WezTerm that is behind Slack is not being
+# #{window_active_clients}, read by the caller (the hook body). A watched window in a WezTerm that is behind Slack is not being
 # seen, and until 2026-08-25 `done` skipped its tint on the watched test
 # alone - the one case where a finish could be missed with no colour ever
 # shown. Now both: the window is active for a client AND WezTerm is
@@ -882,10 +885,12 @@ held_detail_take() {
 #                       of ASKS WHILE WORK IS OUT: an agent-needs-you marker
 #                       older than it belongs to an earlier turn, and one
 #                       written in a woken turn after it still counts.
+#   @agent_limit / @agent_limit_lifted   RATE-LIMITED AGENTS (below): dropped
+#                       wherever @agent_paused is, plus by a successful Stop.
 ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_prior_since
              @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
              @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused
-             @agent_turn_start)
+             @agent_turn_start @agent_limit @agent_limit_lifted)
 PRIOR_OPTS=(@agent_prior_state @agent_prior_since @agent_prior_detail_kind @agent_prior_detail)
 INBOUND_TTL=180
 US=$'\x1f'
@@ -915,9 +920,12 @@ origin_read() {
     # with the bare tokens, @agent_ask_seen (a sanitized line) with the
     # details.
     O_TSTART=""; O_ASKSEEN=""
-    out=$(tmux display-message -p -t "$1" "x${US}#{@agent_turn_origin}${US}#{@agent_state}${US}#{@agent_since}${US}#{@agent_detail_kind}${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_result}${US}#{@agent_bg_owner}${US}#{@agent_paused}${US}#{@agent_turn_start}${US}#{@agent_inbound}${US}#{@agent_inbound_seen}${US}#{@agent_detail}${US}#{@agent_prior_detail}${US}#{@agent_ask_seen}${US}#{@agent_for_user}" 2>/dev/null || true)
+    # RATE-LIMITED AGENTS: @agent_limit ("R T E", bare tokens) and the lifted
+    # stamp ride with the other bare fields.
+    O_LIMIT=""; O_LIFTED=""
+    out=$(tmux display-message -p -t "$1" "x${US}#{@agent_turn_origin}${US}#{@agent_state}${US}#{@agent_since}${US}#{@agent_detail_kind}${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_result}${US}#{@agent_bg_owner}${US}#{@agent_paused}${US}#{@agent_turn_start}${US}#{@agent_limit}${US}#{@agent_limit_lifted}${US}#{@agent_inbound}${US}#{@agent_inbound_seen}${US}#{@agent_detail}${US}#{@agent_prior_detail}${US}#{@agent_ask_seen}${US}#{@agent_for_user}" 2>/dev/null || true)
     case "$out" in "x$US"*) ;; *) return 0 ;; esac
-    IFS="$US" read -r x O_ORIGIN O_STATE O_SINCE O_DK O_PSTATE O_PSINCE O_PDK O_RESULT O_BGOWN O_PAUSED O_TSTART O_INB O_SEEN O_DT O_PDT O_ASKSEEN O_FORUSER <<<"$out" || true
+    IFS="$US" read -r x O_ORIGIN O_STATE O_SINCE O_DK O_PSTATE O_PSINCE O_PDK O_RESULT O_BGOWN O_PAUSED O_TSTART O_LIMIT O_LIFTED O_INB O_SEEN O_DT O_PDT O_ASKSEEN O_FORUSER <<<"$out" || true
     case "$O_TSTART" in *[!0-9]*) O_TSTART="" ;; esac
     case "$O_BGOWN" in user|agent) ;; *) O_BGOWN="" ;; esac
     O_OKIND=""; O_OTID=""; O_OFROM=""
@@ -933,13 +941,20 @@ origin_read() {
 # background task/agent reporting back; it fires UserPromptSubmit with a new
 # prompt_id) or a subagent hand-back - which neither starts a turn of its own
 # origin nor upgrades one: it inherits. Bounded slice before the regex.
+# Line 4: the payload's `source` (Claude 2.1.311: user | sdk | system |
+# loop_wakeup | schedule_wakeup | poll_event; absent on older CLIs), held to
+# [a-z_]. Read ONLY by RATE-LIMITED AGENTS' hold (a loop/schedule wake-up or
+# a poll event is not Mack); the origin rules above still classify by the
+# prompt alone, exactly as before. `system` is never a wake-up by itself:
+# native auto-continuation arrives as `system`.
 TURN_JQ='
 (.prompt_id // .turn_id // "" | tostring | .[0:128]
  | if test("^[A-Za-z0-9_.:-]+$") then . else "-" end),
 (.prompt // "" | tostring | .[0:600]
  | ((capture("^[ \\t\\r\\n]*\\[message from @(?<h>[^\\]\\s|]{1,64})\\]") // {h: ""}).h),
    (if test("^[ \\t\\r\\n]*(<task-notification>|Another Claude session sent a message:\\s*<agent-message )")
-    then "sys" else "" end))'
+    then "sys" else "" end)),
+(.source // "" | tostring | .[0:32] | gsub("[^a-z_]"; ""))'
 
 # Trim leading/trailing space, tab, CR, LF (the set tmux-mcp trims before it
 # hashes) in LINEAR time: explode + two early-exit scans. A regex rtrim is
@@ -1153,13 +1168,14 @@ reason_detail() {
 # ASKS WHILE WORK IS OUT (2026-10-22; docs/agent-tab-indicator.md, same
 # heading). A Stop with background work still out stays `running` (see done),
 # so a turn that ended ASKING Mack something hid behind the spinner. At such
-# a Stop the one decider both surfaces share, agent-turn-asks, is asked:
-#   - synchronously, `--marker-only --since @agent_turn_start`, SIGTERMed at
-#     ASK_SYNC_BUDGET (300 ms): the agent's own `agent-needs-you` marker;
-#   - else, for a loud turn, ONE detached full run (its model backstop),
-#     whose yes lands only while the window is still `running` with the same
-#     turn bookkeeping (@agent_turn_origin|@agent_turn_result) this Stop
-#     wrote - a new prompt or a woken turn in between discards it.
+# a Stop the one decider both surfaces share, agent-turn-asks, is asked
+# synchronously, `--marker-only --since @agent_turn_start`, SIGTERMed at
+# ASK_SYNC_BUDGET (300 ms): the agent's own `agent-needs-you` marker, which
+# it must write right before ending its turn.
+#   EXPLICIT ONLY (2026-10-26, Mack's call): that marker is the ONLY way in.
+# The detached full run (agent-turn-asks' copilot MODEL BACKSTOP, guessing
+# from the last message) is gone: it raised needs-input far too often. No
+# marker = the Stop stays `running`, nothing ask-related written.
 # A yes RAISES: needs-input, @agent_detail_kind ask, @agent_detail the line,
 # @agent_ask_from main (so only the main agent's own next tool call re-arms
 # it, never a background subagent's), @agent_ask_bg 1. Unless Mack is
@@ -1221,30 +1237,261 @@ ask_raise() {
     ss_add set-option -w -t "$1" @agent_ask_bg 1
 }
 
-# ask_spawn WIN TOKEN: the ONE detached full run for this Stop, owned by the
-# tmux server (as the condenser: a hook's process group may be reaped once it
-# returns). TOKEN is the "@agent_turn_origin|@agent_turn_result" this Stop
-# just wrote (built by the caller, not read back); the payload goes through
-# a private temp file the worker opens and removes first thing.
-ask_spawn() {
-    local w="$1" tok="$2" pf launch
-    [ -x "$TURN_ASKS" ] || return 0
-    pf=$(mktemp "${TMPDIR:-/tmp}/agent-tab-askbg.XXXXXX" 2>/dev/null) || return 0
-    printf '%s' "$payload" > "$pf" 2>/dev/null || { rm -f "$pf"; return 0; }
-    printf -v launch '%q ' env "HOME=$HOME" "PATH=$PATH" "TMPDIR=${TMPDIR:-/tmp}" \
-        "TMUX=${TMUX:-}" "TMUX_PANE=${TMUX_PANE:-}" \
-        "AGENT_TAB_SOCKET=${AGENT_TAB_SOCKET:-}" \
-        "AGENT_TAB_OWNER_SESSION=${AGENT_TAB_OWNER_SESSION:-}" \
-        "AGENT_TAB_OWNER_TOKEN=${AGENT_TAB_OWNER_TOKEN:-}" \
-        "AGENT_TAB_OWNER_BINDING=${AGENT_TAB_OWNER_BINDING:-}" \
-        "AGENT_TAB_OWNER_RECORD=${AGENT_TAB_OWNER_RECORD:-}" \
-        "AGENT_TAB_CONDENSE_MODEL=$CONDENSE_MODEL" \
-        "AGENT_TAB_ASK_BG_TIMEOUT=$ASK_BG_TIMEOUT" \
-        "AGENT_STATE_NOTICE=${AGENT_STATE_NOTICE-com.mackhaymond.tmux.agent-state}" \
-        bash "$0" ask-bg "$w" "$tok" "$pf" "$agent" "${ask_since:-}"
-    launch+=' >/dev/null 2>&1'
-    tmux run-shell -b "$launch" >/dev/null 2>&1 || rm -f "$pf"
+# ------------------------------------------------------ rate-limited agents
+#
+# RATE-LIMITED AGENTS (2026-10-26; docs/agent-tab-indicator.md, same heading).
+# A usage limit ends a Claude turn with StopFailure error == "rate_limit", not
+# with Stop. That used to land as `failed` (red, top of NEEDS YOU) although
+# nothing broke: the agent only has to wait. Now it is a PAUSED agent with a
+# reason, not a second state machine:
+#   @agent_paused E, @agent_limit "R T E", @agent_detail_kind limit,
+#   @agent_detail "<text>", @agent_turn_result "<id> limited R",
+#   @agent_since "E paused", @agent_state paused (last)
+# in ONE tmux command list, in that order (CuaNotch reads @agent_limit and the
+# state in one format), then the STATE NOTICE, then agent-pause.py limit-add W
+# in the background (its limited.json resume engine; fire-and-forget, a
+# missing or failing script costs nothing here). R = resets_at (epoch s, 0 =
+# unknown: a model limit, never auto-resumed), T = five_hour | seven_day |
+# seven_day_opus | seven_day_sonnet | overage | model | codex, E = when it was
+# marked. Idempotent: queued task-notifications each hit the limit again and
+# re-mark, which only refreshes E.
+#   A prompt while @agent_limit is set (running): a wake-up, task-notification
+# or peer message while @agent_paused is still set and now < R is HELD - the
+# hook writes nothing, so the tab stays paused without a running flicker.
+# Anything else runs, LOUD (the resumed work is Mack's own, even when our
+# RESUME comes through tmux-mcp), with the ordinary `run` detail, and unsets
+# @agent_paused in the same command list (Mack's prompt, a native
+# auto-continuation after R that limit-tick never beat, our RESUME) - except
+# a pause-key stamp set on the window while it was working. @agent_limit stays
+# until the turn's outcome: ANY outcome but a rate limit drops it (limit_end:
+# a Stop, another failure, an interrupt; the watcher's turn ends likewise),
+# a rate_limit StopFailure re-marks. A held prompt is one the harness sent
+# (task-notification, peer, or a `source` of loop_wakeup / schedule_wakeup /
+# poll_event). Codex has no failure hook: its Stop reads the rollout here,
+# and the watcher is the backstop (agent-tab-watcher.sh, same heading).
+# AGENT_LIMIT_PAUSE_PY overrides agent-pause.py's path (tests).
+LIMIT_PY="${AGENT_LIMIT_PAUSE_PY:-$HOME/.config/tmux/scripts/agent-pause.py}"
+# >>> LIMIT CORE >>> (byte-identical in agent-tab-watcher.sh and
+# agent-tab-indicator.sh; tests/test_agent_limit.py fails if they drift)
+# limit_text R TYPE NOW: into LIM_TXT the sidebar line for a limit, e.g.
+# "weekly limit · resets Tue 1:00 AM". The time follows the ONE date rule
+# every surface shares (agent-pause.py fmt_local, agent-ui text::when), by
+# calendar days in local time: the same day "5:31 PM", one to six days ahead
+# "Tue 5:31 PM", anything else (a week or more on, or past) "Nov 2 5:31 PM".
+# R 0 (unknown) is the label alone. Fixed words, digits, ':' and '·' only:
+# safe in a tmux command string. Builtin clock, no fork; C locale names.
+limit_text() {
+    local r="$1" ty="$2" now="$3" lab when d0 d1 dk h m s k noon
+    local LC_ALL=C
+    case "$ty" in
+        five_hour) lab="session limit" ;;
+        seven_day) lab="weekly limit" ;;
+        seven_day_opus) lab="Opus weekly limit" ;;
+        seven_day_sonnet) lab="Sonnet weekly limit" ;;
+        overage) lab="overage limit" ;;
+        codex) lab="Codex limit" ;;
+        *) lab="usage limit" ;;
+    esac
+    if ! [[ $r =~ ^[1-9][0-9]{0,11}$ ]] || ! [[ $now =~ ^[0-9]{1,12}$ ]]; then
+        LIM_TXT="$lab"
+        return 0
+    fi
+    printf -v d0 '%(%Y%m%d)T' "$now"
+    printf -v d1 '%(%Y%m%d)T' "$r"
+    printf -v when '%(%l:%M %p)T' "$r"
+    when="${when# }"
+    if [ "$d0" = "$d1" ]; then
+        LIM_TXT="$lab · resets $when"
+        return 0
+    fi
+    # One to six calendar days ahead: step a day at a time from NOW's local
+    # noon (a DST hour can never carry noon across a date).
+    printf -v h '%(%H)T' "$now"; printf -v m '%(%M)T' "$now"; printf -v s '%(%S)T' "$now"
+    noon=$((now - 10#$h * 3600 - 10#$m * 60 - 10#$s + 43200))
+    for k in 1 2 3 4 5 6; do
+        printf -v dk '%(%Y%m%d)T' "$((noon + k * 86400))"
+        if [ "$dk" = "$d1" ]; then
+            printf -v dk '%(%a)T' "$r"
+            LIM_TXT="$lab · resets $dk $when"
+            return 0
+        fi
+    done
+    printf -v dk '%(%b %e)T' "$r"
+    while [[ $dk == *"  "* ]]; do dk="${dk//  / }"; done
+    LIM_TXT="$lab · resets $dk $when"
 }
+# codex_reset_epoch TEXT NOW: into CL_R the epoch of codex's "try again at"
+# text, local time: "6:32 PM" (today, tomorrow if already past) or "Oct 22nd,
+# 2026 2:55 AM". 0 when it does not parse. BSD date, on the marking path only.
+codex_reset_epoch() {
+    local t="$1" now="$2" d="" day mon ap
+    local re1='^([0-9]{1,2}):([0-9]{2}) ?([AaPp][Mm])$'
+    local re2='^([A-Z][a-z]{2})[a-z]* ([0-9]{1,2})(st|nd|rd|th)?,? ([0-9]{4}),? ([0-9]{1,2}):([0-9]{2}) ?([AaPp][Mm])$'
+    CL_R=0
+    t="${t%.}"
+    if [[ $t =~ $re1 ]]; then
+        printf -v day '%(%Y-%m-%d)T' "$now"
+        t="$day ${BASH_REMATCH[1]}:${BASH_REMATCH[2]}:00 ${BASH_REMATCH[3]^^}"
+        d=$(LC_ALL=C date -j -f '%Y-%m-%d %I:%M:%S %p' "$t" +%s 2>/dev/null) || d=""
+        case "$d" in ''|*[!0-9]*) d="" ;; esac
+        if [ -n "$d" ] && [ "$d" -le "$now" ]; then
+            d=$(LC_ALL=C date -j -v+1d -f '%Y-%m-%d %I:%M:%S %p' "$t" +%s 2>/dev/null) || d=""
+        fi
+    elif [[ $t =~ $re2 ]]; then
+        mon="${BASH_REMATCH[1]}"; day="${BASH_REMATCH[2]}"; ap="${BASH_REMATCH[7]^^}"
+        d=$(LC_ALL=C date -j -f '%b %d %Y %I:%M:%S %p' \
+            "$mon $day ${BASH_REMATCH[4]} ${BASH_REMATCH[5]}:${BASH_REMATCH[6]}:00 $ap" +%s 2>/dev/null) || d=""
+    fi
+    if [[ $d =~ ^[1-9][0-9]{0,11}$ ]]; then CL_R="$d"; fi
+    return 0
+}
+# codex_limit_parse ROLLOUT NOW: the LAST task_complete in the rollout's tail
+# (256 KB, never the whole file). CL_HIT 1 when it is a usage limit
+# (error.codex_error_info usage_limit_exceeded) - tested on the WHOLE line,
+# as codex_tail tests it, so a long final message can never make the two
+# disagree; only the pieces read below are cut. CL_TID its turn_id ("-" when
+# none), CL_R its reset: the "try again at" text (codex_reset_epoch, "today"
+# meaning the day of the task_complete's own timestamp, else NOW's), else the
+# last token_count's rate_limits reset - the window at used_percent >= 100,
+# else the later - when still ahead of NOW, else 0. Safe under set -eu.
+codex_limit_parse() {
+    local rp="$1" now="$2" out="" hit="" ts="" tid="" err="" tk="" msg="" ref o obj p pr re ru=0 rmax=0
+    local re_tid='^"turn_id":"([A-Za-z0-9_.:-]{1,128})"' re_try='try again at ([A-Za-z0-9 ,:]{1,60})'
+    local re_at='"resets_at":([0-9]{1,12})' re_pct='"used_percent":([0-9]+)'
+    local re_ts='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$'
+    CL_HIT=0; CL_TID="-"; CL_R=0
+    [ -n "$rp" ] && [ -f "$rp" ] || return 0
+    out=$(tail -c 262144 "$rp" 2>/dev/null | awk '
+        index($0, "\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"") { tc = $0 }
+        index($0, "\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"") && index($0, "\"resets_at\":") { tk = $0 }
+        END {
+            print (index(tc, "\"codex_error_info\":\"usage_limit_exceeded\"") ? 1 : 0)
+            print ((substr(tc, 1, 14) == "{\"timestamp\":\"") ? substr(tc, 15, 19) : "")
+            p = index(tc, "\"turn_id\":\""); print (p ? substr(tc, p, 200) : "")
+            p = index(tc, "\"error\":{"); print (p ? substr(tc, p, 4096) : "")
+            print substr(tk, 1, 8192)
+        }' 2>/dev/null) || out=""
+    { IFS= read -r hit; IFS= read -r ts; IFS= read -r tid; IFS= read -r err; IFS= read -r tk; } <<<"$out" || true
+    [ "$hit" = 1 ] || return 0
+    CL_HIT=1
+    if [[ $tid =~ $re_tid ]]; then CL_TID="${BASH_REMATCH[1]}"; fi
+    if [[ $err =~ $re_try ]]; then msg="${BASH_REMATCH[1]% }"; fi
+    ref="$now"
+    if [[ $ts =~ $re_ts ]]; then
+        o=$(TZ=UTC0 date -j -f '%Y-%m-%dT%H:%M:%S' "$ts" +%s 2>/dev/null) || o=""
+        if [[ $o =~ ^[1-9][0-9]{0,11}$ ]]; then ref="$o"; fi
+    fi
+    codex_reset_epoch "$msg" "$ref"
+    [ "$CL_R" = 0 ] || return 0
+    for p in primary secondary; do
+        re="\"$p\":\\{([^}]*)\\}"
+        [[ $tk =~ $re ]] || continue
+        obj="${BASH_REMATCH[1]}"
+        [[ $obj =~ $re_at ]] || continue
+        o="${BASH_REMATCH[1]}"
+        if [ "$o" -gt "$rmax" ]; then rmax="$o"; fi
+        pr=0
+        if [[ $obj =~ $re_pct ]]; then pr="${BASH_REMATCH[1]}"; fi
+        if [ "$pr" -ge 100 ] && [ "$o" -gt "$ru" ]; then ru="$o"; fi
+    done
+    if [ "$ru" -gt 0 ]; then CL_R="$ru"; else CL_R="$rmax"; fi
+    if [ "$CL_R" -le "$now" ]; then CL_R=0; fi
+    return 0
+}
+# <<< LIMIT CORE <<<
+
+# limit_type RAW R E: into LIM_TY the @agent_limit type for a transcript's
+# rateLimitType. seven_day_overage_included (and any other seven_day_*) is
+# weekly; an unknown one is guessed from how far out the reset is.
+limit_type() {
+    case "$1" in
+        five_hour|seven_day|seven_day_opus|seven_day_sonnet|overage|model|codex) LIM_TY="$1" ;;
+        seven_day_*) LIM_TY=seven_day ;;
+        *) if [ $(($2 - $3)) -gt 21600 ]; then LIM_TY=seven_day; else LIM_TY=five_hour; fi ;;
+    esac
+}
+
+# limit_add WIN: agent-pause.py limit-add WIN, owned by the tmux server (a
+# hook's process group may be reaped once it returns, as spawn_condense notes).
+limit_add() {
+    local launch
+    [ -x "$LIMIT_PY" ] || return 0
+    printf -v launch '%q ' env "HOME=$HOME" "PATH=$PATH" "TMPDIR=${TMPDIR:-/tmp}" \
+        "$LIMIT_PY" limit-add "$1"
+    launch+=' >/dev/null 2>&1'
+    tmux run-shell -b "$launch" >/dev/null 2>&1 || true
+}
+
+# limit_mark WIN R TYPE TEXT TURN_ID: the marking (see the section header).
+# The marking list is one tmux call, preceded in that same call by the
+# housekeeping any turn end does: a stale @agent_pending, a held Stop's stash,
+# a quiet-restore mark and a lifted stamp go, as does the prior an agent
+# turn saved (the turn after a limit is Mack's own, so nothing is restored),
+# and the asker of a needs-input this leaves.
+limit_mark() {
+    local win="$1" r="$2" ty="$3" txt="$4" tid="$5" e cur o
+    local -a cmd=()
+    owns_window "$win" || return 0
+    printf -v e '%(%s)T' -1 2>/dev/null || e=$(now_epoch)
+    cur=$(window_state "$win")
+    for o in @agent_pending @agent_held_detail @agent_quiet @agent_limit_lifted "${PRIOR_OPTS[@]}"; do
+        cmd+=(${cmd[0]+\;} set-option -uw -t "$win" "$o")
+    done
+    [ "$cur" != needs-input ] || cmd+=(\; set-option -uw -t "$win" @agent_ask_from \;
+                                       set-option -uw -t "$win" @agent_ask_bg)
+    case "$agent" in
+        claude|codex|opencode) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
+    esac
+    cmd+=(\; set-option -w -t "$win" @agent_paused "$e"
+          \; set-option -w -t "$win" @agent_limit "$r $ty $e"
+          \; set-option -w -t "$win" @agent_detail_kind limit
+          \; set-option -w -t "$win" @agent_detail "$txt"
+          \; set-option -w -t "$win" @agent_turn_result "$tid limited $r"
+          \; set-option -w -t "$win" @agent_since "$e paused"
+          \; set-option -w -t "$win" @agent_state paused)
+    tmux "${cmd[@]}" 2>/dev/null || true
+    [ "$cur" = paused ] || tmux refresh-client -S 2>/dev/null || true
+    notify_state
+    limit_add "$win"
+}
+
+# limit_end WIN LIMIT LIFTED PAUSED: ANY turn outcome but a rate limit ends
+# the limit (a Stop, a failure, an interrupt; the watcher's un-stick too).
+# Queues (ss_add, the outcome's own command list) the unset of @agent_limit
+# and @agent_limit_lifted when either is set, and of @agent_paused while it
+# still holds the limit's own E (a pause-key stamp is left for the pause
+# key). LIM_UNPAUSED=1 when it dropped @agent_paused, so the caller treats
+# the window as not paused.
+limit_end() {
+    local win="$1" lim="$2" lifted="$3" paused="$4" r="" t="" e=""
+    LIM_UNPAUSED=0
+    [ -n "$lim$lifted" ] || return 0
+    ss_add set-option -uw -t "$win" @agent_limit
+    ss_add set-option -uw -t "$win" @agent_limit_lifted
+    read -r r t e _ <<<"$lim" || true
+    if [ -n "$paused" ] && [ -n "$e" ] && [ "$paused" = "$e" ]; then
+        ss_add set-option -uw -t "$win" @agent_paused
+        LIM_UNPAUSED=1
+    fi
+    return 0
+}
+
+# LIMIT_JQ: the last main-thread rate_limit record of a transcript tail
+# (lines already narrowed by grep): resetsAt (0 = none), rateLimitType,
+# apiError, and its text, sanitized (DETAIL_JQ's clean). One line each.
+LIMIT_JQ='
+  [inputs | fromjson? | objects
+   | select((.isSidechain // false) != true and .isApiErrorMessage == true and .error == "rate_limit")]
+  | (last // {}) as $r
+  | ($r.quotaLimits.resetsAt // $r.apiErrorParams.rate_limit_info.resetsAt // 0
+     | if type == "number" then floor elif type == "string" then (tonumber? // 0) else 0 end),
+    ($r.quotaLimits.rateLimitType // $r.apiErrorParams.rate_limit_info.rateLimitType // ""
+     | tostring | gsub("[^a-z_]"; "") | .[0:40]),
+    ($r.apiError // "" | tostring | gsub("[^A-Za-z0-9_]"; "") | .[0:60]),
+    ($r.message.content // ""
+     | if type == "string" then . elif type == "array" then
+         [.[] | select(type == "object" and .type == "text") | .text] | join(" ")
+       else "" end | clean)'
 
 
 
@@ -2052,65 +2299,6 @@ if [ "$mode" = "title-budget" ]; then
     exit 0
 fi
 
-# Detached ask run (ASKS WHILE WORK IS OUT; spawned by ask_spawn at a held
-# Stop): agent-turn-asks in full, then the raise - only while the window is
-# still `running` with the turn bookkeeping that Stop wrote (TOKEN), and not
-# for a line Mack already saw. argv:
-# ask-bg <window_id> <token> <payload file> <agent> [<since>].
-#   The write is GUARDED IN TMUX, in one command list: the cleaned line is
-# staged in @agent_ask_line (argv, never parsed), an if-shell -F (no shell
-# runs) checks state, token and @agent_ask_seen against it and only then
-# raises - the detail copied from the staged line tmux-side - and the stage
-# is unset and the state read back in the same call. So a prompt, a woken
-# turn or a look that lands after the decider answered always wins. The
-# token and agent reach that command string, so both are held to a plain
-# charset first (a turn id is [A-Za-z0-9_.:-], an origin adds spaces, the
-# pair a `|`); anything else writes nothing.
-if [ "$mode" = "ask-bg" ]; then
-    win="${2:-}"; ask_tok="${3:-}"; ask_pf="${4:-}"; agent="${5:-}"; ask_since="${6:-}"
-    { [ -n "$win" ] && [ -n "$ask_pf" ] && [ -f "$ask_pf" ]; } || exit 0
-    # The payload is open on fd 4 and its file gone before anything runs:
-    # no exit path below can leak it.
-    exec 4<"$ask_pf" || exit 0
-    rm -f "$ask_pf" 2>/dev/null || true
-    [[ $win =~ ^@[0-9]+$ ]] || exit 0
-    ask_tok_re='^[A-Za-z0-9_.:| -]+$'
-    [[ $ask_tok =~ $ask_tok_re ]] || exit 0
-    case "$agent" in claude|codex|opencode) ;; *) exit 0 ;; esac
-    case "$ask_since" in *[!0-9]*) ask_since="" ;; esac
-    ask_run "$ASK_BG_TIMEOUT" ${ask_since:+--since "$ask_since"} <&4
-    exec 4<&-
-    [ "$ask_rc" = 0 ] && [ -n "$JQ" ] || exit 0
-    owns_window "$win" || exit 0
-    ask_clean=$(ask_detail "$ask_line")
-    watched=$(tmux display-message -p -t "$win" '#{window_active_clients}' 2>/dev/null || true)
-    case "$watched" in ''|*[!0-9]*) watched=0 ;; esac
-    ask_ts=$(now_epoch)
-    if viewing_now; then
-        # In front of Mack's eyes: seen as it lands (the look rule) - the
-        # line kept as seen, the window stamped seen - and never raised
-        # for this line later either.
-        ask_cmd="set-option -w -t $win -F @agent_ask_seen '#{@agent_ask_line}' ; set-option -w -t $win @agent_seen_at $ask_ts"
-        ask_want="$ask_ts"
-    else
-        ask_cmd="set-option -w -t $win @agent_state needs-input ; set-option -w -t $win @agent_since '$ask_ts needs-input'"
-        ask_cmd+=" ; set-option -w -t $win -F @agent_detail '#{@agent_ask_line}' ; set-option -w -t $win @agent_detail_kind ask"
-        ask_cmd+=" ; set-option -w -t $win @agent_ask_from main ; set-option -w -t $win @agent_ask_bg 1"
-        ask_cmd+=" ; set-option -w -t $win @agent_kind $agent"
-        ask_want=needs-input
-    fi
-    ask_cond="#{&&:#{&&:#{==:#{@agent_state},running},#{==:#{@agent_turn_origin}|#{@agent_turn_result},$ask_tok}},#{!=:#{@agent_ask_seen},#{@agent_ask_line}}}"
-    ask_out=$(tmux set-option -w -t "$win" @agent_ask_line "$ask_clean" \; \
-                   if-shell -F -t "$win" "$ask_cond" "$ask_cmd" \; \
-                   set-option -uw -t "$win" @agent_ask_line \; \
-                   display-message -p -t "$win" "x#{@agent_state}${US}#{@agent_seen_at}" 2>/dev/null || true)
-    case "$ask_out" in
-        "x$ask_want$US"*|"x"*"$US$ask_want")
-            [ "$ask_want" != needs-input ] || tmux refresh-client -S 2>/dev/null || true
-            notify_state ;;
-    esac
-    exit 0
-fi
 if [ "$mode" = "condense" ] || [ "$mode" = "condense-locked" ]; then
     win="${2:-}"; proj="${3:-}"; raw="${4:-}"; prev="${5:-}"; kind="${6:-}"
     { [ -n "$win" ] && [ -n "$raw" ]; } || exit 0
@@ -2435,11 +2623,11 @@ fi
 [ "$agent" = codex ] || payload=$(cat 2>/dev/null || true)
 
 # subagent-stop (ASKER GATE): the asking subagent ENDING ends its gate, the
-# way its own next tool call would - for the cases that fire no heartbeat:
-# its approved tool failed (PostToolUseFailure, not wired to heartbeat
-# today), or it was denied and simply finished. Mode for SubagentStop,
-# which ~/.claude/settings.json does NOT wire as of 2026-10-21 (see the
-# doc's Asker gate); inert until it does. Only a needs-input whose recorded
+# way its own next tool call would - for the case that fires no heartbeat:
+# it was denied and simply finished (an approved tool that FAILED fires
+# PostToolUseFailure, which is wired to heartbeat). Mode for SubagentStop,
+# wired in ~/.claude/settings.json (see the doc's Asker gate). Only a
+# needs-input whose recorded
 # asker is this agent_id moves, to `running` - the state a held Stop stands
 # on, or main's turn still going - with a held Stop's stash (HELD DETAIL).
 # Never a heartbeat: from failed or idle + pending it would claim a turn.
@@ -2540,6 +2728,10 @@ case "$mode" in
         # the attention state the window had before it (AGENT-ORIGINATED
         # TURNS), seen-it rules included.
         origin_read "$win"
+        # RATE-LIMITED AGENTS: an interrupted turn is an outcome; it ends the
+        # limit (and the limit's own pause flag) like a Stop does.
+        limit_end "$win" "$O_LIMIT" "$O_LIFTED" "$O_PAUSED"
+        [ "$LIM_UNPAUSED" = 0 ] || O_PAUSED=""
         if [ -n "$O_PAUSED" ]; then
             # Paused beats idle and the restore; flag re-checked in the same
             # command list, as the Stop does.
@@ -2581,8 +2773,12 @@ case "$mode" in
         # clear its flag, and every later Stop here would end `paused`. Drop
         # it. Not on `resume` (a tmux restore resumes the paused session
         # itself) and not on `compact` (skipped above).
+        # A fresh conversation is not the rate-limited one either (RATE-LIMITED
+        # AGENTS): its limit goes with the flag.
         case "$src" in
-            clear|startup) ss_add set-option -uw -t "$win" @agent_paused ;;
+            clear|startup) ss_add set-option -uw -t "$win" @agent_paused
+                           ss_add set-option -uw -t "$win" @agent_limit
+                           ss_add set-option -uw -t "$win" @agent_limit_lifted ;;
         esac
         ss_add set-option -uw -t "$win" @agent_held_detail   # HELD DETAIL
         # ASKS WHILE WORK IS OUT: a new or resumed session (compact exited
@@ -2625,7 +2821,8 @@ case "$mode" in
         else
             tj=""
         fi
-        { IFS= read -r t_id; IFS= read -r t_pre; IFS= read -r t_sys; } <<<"$tj" || true
+        t_src=""
+        { IFS= read -r t_id; IFS= read -r t_pre; IFS= read -r t_sys; IFS= read -r t_src; } <<<"$tj" || true
         [ -n "$t_id" ] || t_id=-
         printf -v t_now '%(%s)T' -1 2>/dev/null || t_now=$(now_epoch)
         # Match the prompt against the pending inbound messages.
@@ -2687,6 +2884,46 @@ case "$mode" in
         fi
         agent_msg=0
         [ "$v_ok" = 1 ] && [ "$v_for" = agent ] && agent_msg=1
+        # RATE-LIMITED AGENTS (see its section): a prompt into a limited
+        # window. Held (nothing written: the tab stays paused, no running
+        # flicker) while the limit's pause still stands and the reset is
+        # ahead - a wake-up, a task-notification or a peer's ping, each of
+        # which hits the limit again and re-marks. Mack's own prompt is never
+        # held. Otherwise this turn RESUMES the limited work (lim_resume):
+        # Mack's, so loud below whoever sent it, and @agent_paused goes (see
+        # below for the one stamp kept). @agent_limit itself stays until
+        # the outcome (Stop clears, a rate_limit StopFailure re-marks).
+        lim_resume=0
+        if [ -n "$O_LIMIT" ]; then
+            l_r=""; l_t=""; l_e=""
+            read -r l_r l_t l_e _ <<<"$O_LIMIT" || true
+            [[ $l_r =~ ^[0-9]{1,12}$ ]] || l_r=0
+            l_mack=0
+            [ "$agent_msg" = 0 ] && [ "$t_sys" != sys ] && l_mack=1
+            # A /loop or scheduled wake-up, or a poll event, is the harness
+            # (TURN_JQ's source line), never Mack - held like a
+            # task-notification. Not `system` as a whole: native
+            # auto-continuation is `system` and must never be held by it.
+            case "$t_src" in loop_wakeup|schedule_wakeup|poll_event) l_mack=0 ;; esac
+            if [ "$l_mack" = 0 ] && [ -n "$O_PAUSED" ] && [ "$((10#$l_r))" -gt 0 ] \
+               && [ "$t_now" -lt "$((10#$l_r))" ]; then
+                exit 0
+            fi
+            lim_resume=1
+            # Not held: @agent_paused goes in the same command list as the
+            # running write, or the clean Stop that follows would read it and
+            # end the turn `paused` instead of loud. The one stamp kept: the
+            # pause key's own on a window that was WORKING when it was set
+            # (newer than the limit's E, state not paused) - its PAUSE can
+            # arrive as this very prompt.
+            if [ -n "$O_PAUSED" ]; then
+                if [ "$l_mack" = 1 ] || [ "$O_STATE" = paused ] || [ "$O_PAUSED" = "$l_e" ] \
+                   || ! [[ $O_PAUSED =~ ^[0-9]{1,12}$ && $l_e =~ ^[0-9]{1,12}$ ]] \
+                   || [ "$((10#$O_PAUSED))" -le "$((10#$l_e))" ]; then
+                    ss_add set-option -uw -t "$win" @agent_paused
+                fi
+            fi
+        fi
         # New turn or the running one? By id; an agent without turn ids
         # (OpenCode, "-") starts a new turn whenever it is not mid-turn.
         t_new=0
@@ -2696,7 +2933,14 @@ case "$mode" in
             case "$O_STATE" in running|needs-input) ;; *) t_new=1 ;; esac
         fi
         if [ "$t_new" = 1 ]; then
-            if [ "$t_sys" = sys ] && [ -n "${O_BGOWN:-$O_OKIND}" ]; then
+            if [ "$lim_resume" = 1 ]; then
+                # The turn after a limit picks up MACK's work: loud, prior
+                # dropped, no "started by another agent" context - even for
+                # agent-pause.py's RESUME, which tmux-mcp stamps for=agent
+                # (the manual pause's RESUME precedent, next arm but one).
+                ss_add set-option -w -t "$win" @agent_turn_origin "user $t_id -"
+                prior_unset "$win"
+            elif [ "$t_sys" = sys ] && [ -n "${O_BGOWN:-$O_OKIND}" ]; then
                 # A harness wake-up (a background task or subagent reporting
                 # back) continues the work of the turn that launched it:
                 # INHERIT its origin. That is @agent_bg_owner when a held Stop
@@ -2740,7 +2984,9 @@ case "$mode" in
         else
             # Same turn. Mack typing into an agent's turn makes it his
             # (upgrade only, never back); a harness wake-up changes nothing.
-            if [ "$agent_msg" = 0 ] && [ "$t_sys" != sys ] && [ "$O_OKIND" = agent ]; then
+            # So does a turn resuming limited work (RATE-LIMITED AGENTS).
+            if [ "$O_OKIND" = agent ] && { [ "$lim_resume" = 1 ] || \
+               { [ "$agent_msg" = 0 ] && [ "$t_sys" != sys ]; }; }; then
                 ss_add set-option -w -t "$win" @agent_turn_origin "user $O_OTID -"
                 prior_unset "$win"
             fi
@@ -2886,6 +3132,60 @@ case "$mode" in
         # quiet (AGENT-ORIGINATED TURNS). The turn result and the dropped
         # prior ride in the state's own command list.
         stop_fields
+        # RATE-LIMITED AGENTS: a usage limit is not a failure. The payload
+        # names the error but carries no reset time; the transcript's last
+        # main-thread rate_limit record does (tail -n 200, grep-narrowed:
+        # transcripts run to hundreds of MB). A model limit (Fable's
+        # model_requires_usage_credits) or a record with no resetsAt is type
+        # `model`, R 0: only Mack can fix it, in his own words.
+        if [ -n "$JQ" ] && [ -n "$payload" ]; then
+            lm_head=$("$JQ" -r '(.error | if type == "object" then (.type // .error // "") else (. // "") end
+                                 | tostring | .[0:40] | gsub("[\\r\\n]"; " ")),
+                                (.last_assistant_message // "" | tostring | .[0:600] | gsub("[\\r\\n]"; " "))' \
+                      <<<"$payload" 2>/dev/null || true)
+            lm_err="${lm_head%%$'\n'*}"
+            if [ "$lm_err" = rate_limit ]; then
+                lm_lam=""
+                case "$lm_head" in *$'\n'*) lm_lam="${lm_head#*$'\n'}" ;; esac
+                lm_r=0; lm_raw=""; lm_api=""; lm_text=""
+                if [ -n "$s_tp" ] && [ -f "$s_tp" ]; then
+                    lm_out=$(tail -n 200 "$s_tp" 2>/dev/null | grep -F '"rate_limit"' \
+                        | "$JQ" -Rrn "$DETAIL_JQ$LIMIT_JQ" 2>/dev/null || true)
+                    { IFS= read -r lm_r; IFS= read -r lm_raw; IFS= read -r lm_api; IFS= read -r lm_text; } <<<"$lm_out" || true
+                fi
+                [ -n "$lm_text" ] || lm_text=$(printf '%s' "$lm_lam" | "$JQ" -Rr "$DETAIL_JQ"'clean' 2>/dev/null | head -n 1 || true)
+                printf -v lm_now '%(%s)T' -1 2>/dev/null || lm_now=$(now_epoch)
+                if [ "$lm_api" = model_requires_usage_credits ] || ! [[ $lm_r =~ ^[1-9][0-9]{0,11}$ ]]; then
+                    lm_r=0; LIM_TY=model
+                    # "You've reached your Fable limit. Run /usage-credits to
+                    # continue or switch models with /model." -> "Fable limit
+                    # · /model to switch"; any other wording stands as written.
+                    lm_re='reached your ([A-Za-z0-9][A-Za-z0-9 ._-]{0,30}) limit'
+                    if [[ $lm_text =~ $lm_re ]]; then
+                        LIM_TXT="${BASH_REMATCH[1]} limit · /model to switch"
+                    elif [ "$lm_api" = model_requires_usage_credits ]; then
+                        LIM_TXT="model limit · /model to switch"
+                    else
+                        LIM_TXT="${lm_text:-usage limit}"
+                    fi
+                else
+                    limit_type "$lm_raw" "$lm_r" "$lm_now"
+                    limit_text "$lm_r" "$LIM_TY" "$lm_now"
+                fi
+                limit_mark "$win" "$lm_r" "$LIM_TY" "$LIM_TXT" "$s_id"
+                exit 0
+            fi
+        fi
+        # Any other failure is an outcome: it ends a limit the window still
+        # carries (a resumed turn that died, or a failure while still
+        # limited), with the limit's own pause flag. One read, failures only.
+        lf=$(tmux display-message -p -t "$win" "x#{@agent_limit}${US}#{@agent_limit_lifted}${US}#{@agent_paused}" 2>/dev/null || true)
+        case "$lf" in
+            "x"*"$US"*"$US"*)
+                lf="${lf#x}"
+                lf_lim="${lf%%"$US"*}"; lf="${lf#*"$US"}"
+                limit_end "$win" "$lf_lim" "${lf%%"$US"*}" "${lf#*"$US"}" ;;
+        esac
         ss_add set-option -w -t "$win" @agent_turn_result "$s_id loud"
         prior_unset "$win"
         ss_add set-option -uw -t "$win" @agent_held_detail   # HELD DETAIL
@@ -2952,8 +3252,40 @@ case "$mode" in
         # split case or a harness wake-up, settled from the transcript row.
         origin_read "$win"
         stop_fields
+        # RATE-LIMITED AGENTS: a turn that finished is past its limit. The
+        # limit and its lifted stamp go in this Stop's command list; so does
+        # @agent_paused while it is still the limit's own (a held wake-up
+        # whose turn got through after all - a cswap switch lifted the limit
+        # early): that pause was the limit's, so this finish is an ordinary
+        # one, not `paused`. A manual pause stamped since stands.
+        # A Stop for the very turn the limit was marked from (codex may run
+        # its Stop hook for the failed turn after the watcher marked it) is
+        # that limit, not a finish: left alone.
+        if [ -n "$O_LIMIT" ] && [ "$s_id" != - ] && [[ $O_RESULT == "$s_id limited "* ]]; then
+            exit 0
+        fi
+        # CODEX has no failure hook, but runs its Stop for a turn that ended
+        # on a usage limit: the rollout's last task_complete, for THIS turn,
+        # says so (usage_limit_exceeded). Marked here, so the verdict lands
+        # with the Stop (CuaNotch reads @agent_turn_result within 2 s); the
+        # watcher's rollout reconcile stays the backstop for a task_complete
+        # written after this hook ran. One show-options and a bounded tail
+        # (codex_limit_parse), on codex Stops only.
+        if [ "$agent" = codex ] && [ "$s_id" != - ]; then
+            cx_roll=$(tmux show-options -wqv -t "$win" @agent_rollout 2>/dev/null || true)
+            if [ -n "$cx_roll" ]; then
+                printf -v lm_now '%(%s)T' -1 2>/dev/null || lm_now=$(now_epoch)
+                codex_limit_parse "$cx_roll" "$lm_now"
+                if [ "$CL_HIT" = 1 ] && [ "$CL_TID" = "$s_id" ]; then
+                    limit_text "$CL_R" codex "$lm_now"
+                    limit_mark "$win" "$CL_R" codex "$LIM_TXT" "$s_id"
+                    exit 0
+                fi
+            fi
+        fi
+        limit_end "$win" "$O_LIMIT" "$O_LIFTED" "$O_PAUSED"
+        [ "$LIM_UNPAUSED" = 0 ] || O_PAUSED=""
         s_cls=user; s_unseen=0
-        s_origin="$O_ORIGIN"   # @agent_turn_origin as this Stop leaves it
         if [ -n "$O_OKIND" ] && [ "$s_id" = "$O_OTID" ]; then
             s_cls="$O_OKIND"
         else
@@ -2969,7 +3301,6 @@ case "$mode" in
                         s_ifrom=-
                         [ "$s_cls" = agent ] && [ "$O_OKIND" = agent ] && s_ifrom="${O_OFROM:--}"
                         ss_add set-option -w -t "$win" @agent_turn_origin "$s_cls $s_id $s_ifrom"
-                        s_origin="$s_cls $s_id $s_ifrom"
                     fi
                 fi
             fi
@@ -2988,11 +3319,11 @@ case "$mode" in
         # ASKS WHILE WORK IS OUT (see its section): a Stop held `running` by
         # background work asks the decider whether the turn asked Mack. Its
         # marker is the agent saying so outright, so it makes even an
-        # agent-started turn loud (as notify_user does); the detached model
-        # run is for loud turns only - a quiet turn's questions are for the
-        # peer that started it. A subagent's standing gate (sd_hold) or a
-        # pause already decides what the window shows: not asked there.
-        ask_hit=0; ask_bg_run=0; ask_line=""; ask_clean=""
+        # agent-started turn loud (as notify_user does). EXPLICIT ONLY: no
+        # marker, no ask - nothing guesses from the reply any more. A
+        # subagent's standing gate (sd_hold) or a pause already decides what
+        # the window shows: not asked there.
+        ask_hit=0; ask_line=""; ask_clean=""
         if [ "$bg_pending" -eq 1 ] && [ "$sd_hold" = running ] && [ -z "$O_PAUSED" ] && [ -n "$JQ" ]; then
             ask_since="$O_TSTART"
             ask_run "$ASK_SYNC_BUDGET" --marker-only ${ask_since:+--since "$ask_since"} <<<"$payload"
@@ -3005,8 +3336,6 @@ case "$mode" in
                 if ! ask_seen_same "$ask_clean"; then
                     ask_hit=1; s_quiet=0
                 fi
-            elif [ "$s_quiet" = 0 ]; then
-                ask_bg_run=1
             fi
         fi
         # @agent_bg_owner: a Stop HELD for background work records whose work
@@ -3090,8 +3419,6 @@ case "$mode" in
                 set_held
             fi
             compose_summary "$win" "$(extract_summary "$payload")" "$payload"
-            # The token: the turn bookkeeping exactly as this Stop wrote it.
-            if [ "$ask_bg_run" = 1 ]; then ask_spawn "$win" "$s_origin|$s_id loud"; fi
             exit 0
         fi
         # Don't tint a window the user is looking at — they saw it finish.

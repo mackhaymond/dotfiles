@@ -13,6 +13,7 @@ speaks just enough Streamable-HTTP MCP and records every tools/call; the real
 port is never touched. HOME and AGENT_PAUSE_STATE_DIR are private too.
 Run with unittest or pytest.
 """
+from datetime import datetime
 import fcntl
 import http.server
 import importlib.util
@@ -58,6 +59,7 @@ class StubMcp:
         self.reply = {}
         self.slow = 2.5
         self.fail_initialized = False
+        self.on_call = None   # f(args), run as each tools/call arrives (before the reply)
         self.sse = sse
         self.lock = threading.Lock()
         stub = self
@@ -108,6 +110,8 @@ class StubMcp:
                 args = req["params"]["arguments"]
                 with stub.lock:
                     stub.calls.append(args)
+                if stub.on_call:
+                    stub.on_call(args)
                 how = stub.reply.get(args["pane"], "sent")
                 p = args["pane"]
                 # Failures AFTER the request arrived (tmux-mcp would deliver):
@@ -1108,6 +1112,584 @@ class Popup(Harness):
         self.press_done()
 
 
+NOW = 2_000_000_000   # the limit engine's clock in these tests (AGENT_PAUSE_NOW)
+
+
+@unittest.skipUnless(TMUX, "tmux not installed")
+class RateLimits(Harness):
+    """limited.json and limit-add / limit-tick / limit-auto / limit-resume
+    (docs/agent-pause.md, "Rate-limited agents"). The clock, the last wake
+    and DNS are injected (AGENT_PAUSE_NOW / _WAKETIME / _DNS), the stagger is
+    0, and notify.sh is a fake that appends its arguments to a file. A
+    limited window is marked the way the tab indicator marks one: state
+    paused, @agent_paused, @agent_limit "<resets_at> <type> <since>"."""
+
+    def setUp(self):
+        super().setUp()
+        notify = self.dir / "notify.sh"
+        notify.write_text("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\n" % shlex.quote(str(self.dir / "notified")))
+        notify.chmod(0o755)
+        self.env.update({"AGENT_PAUSE_NOW": str(NOW), "AGENT_PAUSE_WAKETIME": str(NOW - 3600),
+                         "AGENT_PAUSE_DNS": "ok", "AGENT_PAUSE_LIMIT_STAGGER": "0",
+                         "AGENT_PAUSE_NOTIFY": str(notify)})
+        self.usage()
+
+    # -- harness ---------------------------------------------------------
+    def at(self, t):
+        self.env["AGENT_PAUSE_NOW"] = str(t)
+
+    def usage(self, **kw):
+        """usage.json as codexbar-usage-status.sh publishes it (the root)."""
+        d = self.dir / "home" / ".cache" / "codexbar-tmux"
+        d.mkdir(parents=True, exist_ok=True)
+        u = {"account": "acct-a", "updated_at": NOW - 30, "fetched_at": NOW - 900,
+             "session_locked": False, "session_used": 20, "weekly_locked": False, "weekly_used": 30,
+             "scoped_locked": False, "scoped_used": 10}
+        u.update(kw)
+        (d / "usage.json").write_text(json.dumps(u))
+
+    def switch(self, at):
+        """A cswap account switch at `at`: sequence.json rewritten then."""
+        d = self.dir / "home" / ".claude-swap-backup"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "sequence.json").write_text("{}")
+        os.utime(d / "sequence.json", (at, at))
+
+    def mark(self, pane, resets, typ="five_hour", since=NOW - 600, state="paused"):
+        for opt, val in (("@agent_paused", str(since)), ("@agent_limit", "%d %s %d" % (resets, typ, since)),
+                         ("@agent_state", state)):
+            self.t("set", "-w", "-t", pane, opt, val)
+
+    def limited(self, resets, typ="five_hour", since=NOW - 600):
+        """A new agent window the indicator just marked, and its limit-add."""
+        pane = self.window("paused")
+        self.mark(pane, resets, typ, since)
+        self.limit("limit-add", self.wid(pane))
+        return pane
+
+    def limit(self, *args):
+        r = self.run_script(*args)
+        self.assertEqual((r.returncode, r.stdout), (0, ""), r.stderr)   # hook/click paths never print
+        return self.last_log()
+
+    def tick(self):
+        return self.limit("limit-tick")
+
+    def wid(self, pane):
+        return self.t("display", "-p", "-t", pane, "#{window_id}")
+
+    def opt(self, pane, name):
+        return self.t("display", "-p", "-t", pane, "#{%s}" % name)
+
+    def due(self):
+        return self.t("show", "-gqv", "@agent_limit_due")
+
+    def lim(self):
+        p = self.dir / "state" / "limited.json"
+        return json.loads(p.read_text())["targets"] if p.exists() else None
+
+    def edit_lim(self, **kw):
+        p = self.dir / "state" / "limited.json"
+        d = json.loads(p.read_text())
+        d["targets"][0].update(kw)
+        p.write_text(json.dumps(d))
+
+    def log_of(self, mode):
+        """The last log line of that mode."""
+        lines = (self.dir / "state" / "log").read_text().splitlines()
+        return [json.loads(l) for l in lines if json.loads(l)["mode"] == mode][-1]
+
+    def in_flight(self):
+        """progress.json as a pause press writes it while delivering (this
+        test process stands in for the live toggle)."""
+        return self.progress_at(time.time())
+
+    def progress_at(self, began):
+        return json.dumps({"press": "%d-%d" % (began * 1000, os.getpid()), "mode": "pause",
+                           "done": False, "outcome": "", "message": "", "targets": []})
+
+    def notified(self, needle="limit lifted"):
+        p = self.dir / "notified"
+        return [l for l in (p.read_text().splitlines() if p.exists() else []) if needle in l]
+
+    # -- limit-add ---------------------------------------------------------
+    def test_limit_add_merges_and_keeps_attempts(self):
+        p = self.limited(NOW + 3000)
+        w = self.wid(p)
+        (t,) = self.lim()
+        self.assertEqual((t["window_id"], t["pane_id"], t["session_id"], t["kind"], t["resets_at"],
+                          t["type"], t["since"], t["account"], t["attempts"]),
+                         (w, p, "sid-1", "claude", NOW + 3000, "five_hour", NOW - 600, "acct-a", 0))
+        self.edit_lim(attempts=2, resumed_at=NOW - 100)
+        # The RESUME's turn hit the limit again, after a switch: the
+        # indicator re-marks it. An idempotent merge: attempts kept.
+        self.usage(account="acct-b")
+        self.mark(p, NOW + 9000, "seven_day", NOW - 60)
+        self.limit("limit-add", w)
+        self.limit("limit-add", p)                         # a pane id names its window too
+        (t,) = self.lim()
+        self.assertEqual((t["resets_at"], t["type"], t["since"], t["account"], t["attempts"]),
+                         (NOW + 9000, "seven_day", NOW - 60, "acct-b", 2))
+        self.assertNotIn("resumed_at", t)                  # that RESUME is spent
+        # A window with no @agent_limit is not added.
+        other = self.window("idle")
+        self.limit("limit-add", self.wid(other))
+        self.assertEqual(len(self.lim()), 1)
+
+    def test_due_is_the_earliest_possible_action(self):
+        a = self.limited(NOW + 3000)
+        self.assertEqual(self.due(), str(NOW + 3000 + AP.LIMIT_GRACE))
+        b = self.limited(NOW + 1000)
+        self.assertEqual(self.due(), str(NOW + 1000 + AP.LIMIT_GRACE))
+        model = self.limited(0, "model")                   # never automatic: no due of its own
+        self.assertEqual(self.due(), str(NOW + 1000 + AP.LIMIT_GRACE))
+        # b moved on (a Stop cleared its limit) and a's window closed.
+        self.t("set", "-wu", "-t", b, "@agent_limit")
+        self.t("kill-window", "-t", a)
+        self.tick()
+        self.assertEqual([t["window_id"] for t in self.lim()], [self.wid(model)])
+        self.assertEqual(self.due(), "")                   # only Mack can move a model limit on
+        self.t("set", "-wu", "-t", model, "@agent_limit")
+        self.tick()
+        self.assertEqual(self.lim(), [])
+        self.assertEqual(self.stub.calls, [])
+
+    # -- limit-tick ---------------------------------------------------------
+    def test_wall_clock_rule_waits_out_the_grace(self):
+        p = self.limited(NOW - 100)                        # reset 100 s ago: auto-continue's turn
+        self.tick()
+        self.assertEqual(self.stub.calls, [])
+        self.assertEqual(self.due(), str(NOW - 100 + AP.LIMIT_GRACE))
+        self.at(NOW + 21)
+        entry = self.tick()
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+        (call,) = self.stub.calls
+        self.assertIsNone(call.get("urgent"))              # a draft holds it, like the RESUME
+        self.assertTrue(AP.LIMIT_RESUME_MSG.startswith("[limit] Your usage limit has reset."))
+        self.assertEqual(self.opt(p, "@agent_paused"), "")  # off before the paste...
+        self.assertTrue(self.opt(p, "@agent_limit"))       # ...the limit kept until the outcome
+        (t,) = self.lim()
+        self.assertEqual((t["attempts"], t["resumed_at"], t["last_attempt"]), (1, NOW + 21, NOW + 21))
+        self.assertIn("resumed 1", entry["message"])
+        # Its turn runs: kept in the file, never prompted while running.
+        self.t("set", "-w", "-t", p, "@agent_state", "running")
+        self.at(NOW + 5000)
+        self.tick()
+        self.assertEqual(len(self.stub.calls), 1)
+        self.assertEqual(len(self.lim()), 1)
+        self.assertEqual(self.due(), "")                   # its outcome decides, not a clock
+
+    def test_a_running_limited_window_is_never_prompted(self):
+        p = self.limited(NOW - 1000)
+        self.t("set", "-wu", "-t", p, "@agent_paused")     # Mack typed a prompt into it
+        self.t("set", "-w", "-t", p, "@agent_state", "running")
+        self.tick()
+        self.assertEqual(self.stub.calls, [])
+        self.assertEqual(len(self.lim()), 1)
+
+    def test_a_cswap_switch_frees_it_early(self):
+        p = self.limited(NOW + 86400, "seven_day")         # the week resets tomorrow
+        self.usage(account="acct-b", updated_at=NOW - 200)
+        self.tick()                                        # another account, but no switch seen
+        self.assertEqual(self.stub.calls, [])
+        self.switch(NOW - 300)
+        self.usage(account="acct-b", weekly_locked=True, updated_at=NOW - 200)
+        self.tick()                                        # switched, but to a locked week
+        self.assertEqual(self.stub.calls, [])
+        self.usage(account="acct-b", updated_at=NOW - 200)
+        self.tick()
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+
+    def test_a_false_lift_needs_a_newer_switch(self):
+        p = self.limited(NOW + 86400, "seven_day")
+        self.switch(NOW - 300)
+        self.usage(account="acct-b", updated_at=NOW - 200)
+        self.tick()
+        self.assertEqual(len(self.stub.calls), 1)
+        # acct-b is out too: the RESUME's turn hits the limit, re-marked.
+        self.at(NOW + 100)
+        self.mark(p, NOW + 90000, "seven_day", NOW + 50)
+        self.limit("limit-add", self.wid(p))
+        self.at(NOW + 400)
+        self.tick()                                        # that switch predates the new limit
+        self.assertEqual(len(self.stub.calls), 1)
+        self.assertEqual(self.due(), str(NOW + 90000 + AP.LIMIT_GRACE))
+        self.switch(NOW + 500)                             # a newer switch, to a free account
+        self.usage(account="acct-c", updated_at=NOW + 550)
+        self.at(NOW + 600)
+        self.tick()
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p, p])
+        self.assertEqual(self.lim()[0]["attempts"], 2)
+
+    def test_model_limit_never_auto_resumes_but_limit_resume_does(self):
+        p = self.limited(0, "model")
+        self.at(NOW + 10 ** 6)
+        self.tick()
+        self.assertEqual(self.stub.calls, [])
+        entry = self.limit("limit-resume", self.wid(p))
+        self.assertTrue(entry["ok"], entry)
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+
+    def test_limit_resume_refuses_until_eligible_unless_forced(self):
+        p = self.limited(NOW + 3600)
+        entry = self.limit("limit-resume", self.wid(p))
+        self.assertFalse(entry["ok"])
+        self.assertIn("rate-limited until ", entry["message"])
+        self.assertTrue(self.notified("rate-limited until "))   # the click's toast
+        self.assertEqual(self.stub.calls, [])
+        entry = self.limit("limit-resume", "--force", self.wid(p))
+        self.assertTrue(entry["ok"], entry)
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+        # Wake and network graces are for the automatic path only.
+        q = self.limited(NOW - 1000)
+        self.env.update({"AGENT_PAUSE_WAKETIME": str(NOW - 5), "AGENT_PAUSE_DNS": "fail"})
+        self.assertTrue(self.limit("limit-resume", self.wid(q))["ok"])
+
+    def test_manual_pause_defers_and_its_resume_takes_them_along(self):
+        p = self.limited(NOW - 1000)
+        other = self.window("running")
+        self.press()                                       # the pause key: p is not working
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [other])
+        entry = self.tick()
+        self.assertIn("deferred", entry["message"])
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [])
+        self.assertEqual(self.due(), str(NOW + AP.LIMIT_RETRY))
+        self.t("set", "-w", "-t", other, "@agent_state", "paused")
+        self.press()                                       # resume: RESUME, then the LIMIT text
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [other])
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+        self.assertIn("limit lifted, resumed 1", self.log_of("limit-after-resume")["message"])
+        # Two toasts, the resume's first: the limit half's staggers never hold it up.
+        toasts = (self.dir / "notified").read_text().splitlines()
+        first = next(i for i, l in enumerate(toasts) if "resumed 1 agent" in l)
+        second = next(i for i, l in enumerate(toasts) if "limit lifted, resumed 1" in l)
+        self.assertLess(first, second)
+        self.assertNotIn("limit lifted", toasts[first])
+
+    def test_the_tick_stops_when_a_manual_pause_begins(self):
+        a = self.limited(NOW - 1000)
+        b = self.limited(NOW - 1000)
+        state = self.dir / "state" / "paused.json"
+        self.stub.on_call = lambda args: state.write_text(json.dumps(
+            {"version": 1, "paused_at": "x", "targets": [{"pane_id": "%999"}]}))
+        entry = self.tick()
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [a])
+        self.assertIn("stopped: a manual pause began", entry["message"])
+        self.assertEqual([t.get("attempts") for t in self.lim()], [1, 0])
+        self.assertTrue(self.opt(b, "@agent_paused"))      # untouched
+
+    def test_autoresume_off_lifts_and_notifies_once(self):
+        self.t("set", "-g", "@agent_limit_autoresume", "off")
+        p = self.limited(NOW - 1000)
+        self.tick()
+        self.tick()
+        self.assertEqual(self.stub.calls, [])
+        self.assertEqual(len(self.notified()), 1)
+        self.assertEqual(self.opt(p, "@agent_limit_lifted"), str(NOW))
+        self.assertEqual(self.lim()[0]["lifted_at"], NOW)
+        self.assertEqual(self.due(), "")                   # waits for Mack
+        self.limit("limit-auto", "on")
+        self.assertEqual(self.t("show", "-gqv", "@agent_limit_autoresume"), "on")
+        self.assertEqual(self.due(), str(NOW))             # the watcher's next tick
+        self.tick()
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+        self.assertEqual(self.opt(p, "@agent_limit_lifted"), "")
+        self.limit("limit-auto", "toggle")
+        self.assertEqual(self.t("show", "-gqv", "@agent_limit_autoresume"), "off")
+
+    def test_refused_resume_repauses_and_backs_off(self):
+        p = self.limited(NOW - 1000)
+        self.stub.reply = {p: "refuse"}
+        self.tick()
+        self.assertEqual(len(self.stub.calls), 1)
+        self.assertEqual(self.opt(p, "@agent_paused"), str(NOW - 600))   # put back, as the limit's since
+        self.assertEqual(self.opt(p, "@agent_state"), "paused")
+        self.assertEqual(self.due(), str(NOW + AP.LIMIT_BACKOFF))
+        self.tick()
+        self.assertEqual(len(self.stub.calls), 1)          # backing off
+        self.at(NOW + AP.LIMIT_BACKOFF)
+        self.tick()
+        self.assertEqual(len(self.stub.calls), 2)
+
+    def test_past_the_cap_it_waits_for_mack(self):
+        p = self.limited(NOW - 1000)
+        self.edit_lim(attempts=AP.LIMIT_MAX_ATTEMPTS, last_attempt=NOW - 5000)
+        self.tick()
+        self.tick()
+        self.assertEqual(self.stub.calls, [])
+        self.assertEqual(len(self.notified()), 1)
+        self.assertTrue(self.opt(p, "@agent_limit_lifted"))
+        self.assertEqual(self.due(), "")
+
+    def test_wake_and_network_graces(self):
+        self.limited(NOW - 1000)
+        self.env["AGENT_PAUSE_WAKETIME"] = str(NOW - 10)
+        entry = self.tick()
+        self.assertIn("waking", entry["message"])
+        self.assertEqual(self.due(), str(NOW - 10 + AP.WAKE_GRACE))
+        self.env["AGENT_PAUSE_WAKETIME"] = str(NOW - 3600)
+        self.env["AGENT_PAUSE_DNS"] = "fail"
+        self.assertIn("offline: api.anthropic.com", self.tick()["message"])
+        self.env["AGENT_PAUSE_DNS"] = "chatgpt.com"        # codex's host is no help to claude
+        self.tick()
+        self.assertEqual(self.stub.calls, [])
+        self.env["AGENT_PAUSE_DNS"] = "api.anthropic.com"
+        self.tick()
+        self.assertEqual(len(self.stub.calls), 1)
+
+    # -- the pause key -------------------------------------------------------
+    def test_toggle_resume_hands_a_limited_target_over(self):
+        a, b, c = self.window("running"), self.window("running"), self.window("running")
+        self.press()
+        # While the lid was shut, a's and b's PAUSE replies hit the limit.
+        self.mark(a, NOW + 3600)                           # still limited
+        self.mark(b, NOW - 1000)                           # already lifted
+        self.t("set", "-w", "-t", a, "@agent_paused", "123")    # the pause key's own stamp
+        self.t("set", "-w", "-t", c, "@agent_state", "paused")
+        self.press()
+        entry = self.log_of("resume")
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [c])    # never the pause RESUME
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [b])
+        # a is limited now: stays paused, its flag the limit's own since (the
+        # indicator clears only that value on the turn's outcome).
+        self.assertEqual(self.opt(a, "@agent_paused"), str(NOW - 600))
+        self.assertEqual(self.opt(a, "@agent_state"), "paused")
+        self.assertIsNone(self.state())                    # both left the saved set
+        self.assertEqual(self.paused_opt(), "")
+        self.assertEqual(sorted(t["window_id"] for t in self.lim()), sorted([self.wid(a), self.wid(b)]))
+        self.assertIn("resumed 1 agent", entry["message"])
+        self.assertIn("rate-limited until ", entry["message"])
+        self.assertEqual(self.due(), str(NOW + 3600 + AP.LIMIT_GRACE))
+        last = json.loads((self.dir / "state" / "paused.last.json").read_text())
+        self.assertEqual(sorted(t["result"] for t in last["resume"]), ["limited", "limited", "sent"])
+
+    def test_pause_skips_limited_windows(self):
+        lim = self.limited(NOW + 3600)
+        self.t("set", "-w", "-t", lim, "@agent_workflow", "1")   # even with a workflow out
+        run = self.window("running")
+        self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [run])
+        self.assertEqual([t["pane_id"] for t in self.state()["targets"]], [run])
+
+    def test_void_and_dismiss_leave_the_limited_set_alone(self):
+        lim = self.limited(NOW + 3600)
+        path = self.dir / "state" / "limited.json"
+        before = path.read_text()
+        self.window("running")
+        self.press()
+        self.run_script("dismiss", "")
+        self.run_script("void", "")
+        self.assertIsNone(self.state())
+        self.assertEqual(path.read_text(), before)
+        self.assertEqual(self.opt(lim, "@agent_limit"), "%d five_hour %d" % (NOW + 3600, NOW - 600))
+        self.assertTrue(self.opt(lim, "@agent_paused"))
+
+    # -- review fixes ---------------------------------------------------------
+    def test_a_held_resume_is_reached_never_resent(self):
+        p = self.limited(NOW - 1000)
+        self.stub.reply = {p: "held"}
+        self.tick()
+        self.assertEqual(len(self.stub.calls), 1)
+        self.assertEqual(self.opt(p, "@agent_paused"), "")  # left off: tmux-mcp will deliver it
+        (t,) = self.lim()
+        self.assertEqual((t["last_result"], t["held_at"], t["resumed_at"]), ("held", NOW, NOW))
+        self.at(NOW + 300)
+        self.tick()
+        self.assertEqual(len(self.stub.calls), 1)
+        # Mack's click would queue a second copy: refused, unless forced.
+        entry = self.limit("limit-resume", self.wid(p))
+        self.assertFalse(entry["ok"])
+        self.assertIn("already waiting behind the draft", entry["message"])
+        self.assertTrue(self.notified("already waiting behind the draft"))
+        self.assertEqual(len(self.stub.calls), 1)
+        self.stub.reply = {}
+        self.assertTrue(self.limit("limit-resume", "--force", self.wid(p))["ok"])
+        self.assertEqual(len(self.stub.calls), 2)
+        self.assertNotIn("held_at", self.lim()[0])         # pasted: nothing older waits
+
+    def test_a_remark_after_a_held_send_does_not_hold_back_the_next_resume(self):
+        p = self.limited(NOW + 86400, "seven_day")
+        self.switch(NOW - 300)
+        self.usage(account="acct-b", updated_at=NOW - 200)
+        self.stub.reply = {p: "held"}
+        self.tick()
+        self.assertEqual(len(self.stub.calls), 1)
+        # The held copy landed and its turn hit the limit: re-marked.
+        self.mark(p, NOW + 90000, "seven_day", NOW + 50)
+        self.limit("limit-add", self.wid(p))
+        self.assertNotIn("held_at", self.lim()[0])
+        self.switch(NOW + 100)                             # a newer switch frees it again
+        self.usage(account="acct-c", updated_at=NOW + 150)
+        self.stub.reply = {}
+        self.at(NOW + 200)
+        self.tick()
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p, p])   # at once, not in 2 h
+
+    def test_a_held_resume_that_never_lands_is_lifted_for_mack(self):
+        p = self.limited(NOW - 1000)
+        self.stub.reply = {p: "held"}
+        self.tick()
+        self.assertEqual(self.due(), str(NOW + AP.LIMIT_HELD_LIFT))
+        self.at(NOW + AP.LIMIT_HELD_LIFT - 1)
+        self.tick()
+        self.assertEqual(self.notified(), [])
+        self.at(NOW + AP.LIMIT_HELD_LIFT)
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.notified()), 1)
+        self.assertEqual(len(self.notified("a resume is waiting behind a draft in")), 1)   # says why
+        self.assertEqual(self.opt(p, "@agent_limit_lifted"), str(NOW + AP.LIMIT_HELD_LIFT))
+        self.assertEqual(len(self.stub.calls), 1)          # never resent
+        self.assertEqual(self.due(), "")
+
+    def test_a_pause_press_in_flight_defers_and_stops_the_tick(self):
+        self.limited(NOW - 1000)
+        prog = self.dir / "state" / "progress.json"
+        prog.write_text(self.in_flight())                  # a pause press delivering
+        self.assertIn("deferred", self.tick()["message"])
+        self.assertEqual(self.stub.calls, [])
+        prog.write_text(json.dumps(dict(json.loads(self.in_flight()), done=True)))
+        prog.unlink()
+        b = self.limited(NOW - 1000)
+        self.stub.calls.clear()
+        self.stub.on_call = lambda args: prog.write_text(self.in_flight())   # a press starts mid-run
+        entry = self.tick()
+        self.assertEqual(len(self.stub.calls), 1)
+        self.assertIn("stopped: a manual pause began", entry["message"])
+        self.assertNotIn(b, self.stub.panes())
+
+    def test_a_stale_in_flight_record_with_a_reused_pid_does_not_defer(self):
+        p = self.limited(NOW - 1000)
+        # A pause press "in flight" 11 min ago whose pid is alive again (here,
+        # this test process): no press delivers that long.
+        (self.dir / "state" / "progress.json").write_text(self.progress_at(time.time() - 660))
+        self.assertNotIn("deferred", self.tick()["message"])
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+
+    def test_a_new_episode_starts_its_attempts_over(self):
+        p = self.limited(NOW - 1000)
+        self.edit_lim(attempts=3, last_attempt=NOW - 10000, resumed_at=NOW - 10000, last_result="sent")
+        self.mark(p, NOW + 3600, since=NOW - 60)           # hours later: a new five-hour limit
+        self.limit("limit-add", self.wid(p))
+        (t,) = self.lim()
+        self.assertEqual(t["attempts"], 0)
+        self.assertNotIn("last_result", t)
+        # A stale entry for the same window, another agent's, is pruned.
+        path = self.dir / "state" / "limited.json"
+        d = json.loads(path.read_text())
+        d["targets"].append(dict(d["targets"][0], session_id="sid-gone", attempts=3))
+        path.write_text(json.dumps(d))
+        self.limit("limit-add", self.wid(p))
+        self.assertEqual([(t["session_id"], t["attempts"]) for t in self.lim()], [("sid-1", 0)])
+
+    def test_a_running_limited_target_is_resumed_not_handed_over(self):
+        a = self.window("running")
+        self.press()
+        self.mark(a, NOW + 3600, state="running")          # P pressed during a [limit] turn
+        self.press()
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [a])
+        self.assertIsNone(self.state())
+        self.assertIsNone(self.lim())                      # never handed to limited.json
+
+    def test_a_switch_freed_retry_waits_for_its_backoff_not_the_reset(self):
+        p = self.limited(NOW + 86400, "seven_day")
+        self.switch(NOW - 300)
+        self.usage(account="acct-b", updated_at=NOW - 200)
+        self.stub.reply = {p: "refuse"}
+        self.tick()
+        self.assertEqual(len(self.stub.calls), 1)
+        self.assertEqual(self.due(), str(NOW + AP.LIMIT_BACKOFF))
+        self.at(NOW + AP.LIMIT_BACKOFF)
+        self.env["AGENT_PAUSE_DNS"] = "fail"               # offline: the next look, not tomorrow
+        self.tick()
+        self.assertEqual(self.due(), str(NOW + AP.LIMIT_BACKOFF + AP.LIMIT_RETRY))
+
+    def test_a_switch_to_an_exhausted_account_frees_nothing(self):
+        self.limited(NOW + 86400, "seven_day")
+        self.switch(NOW - 300)
+        # cswap's reading adopted: every flag reset to false, but the week is spent.
+        self.usage(account="acct-b", updated_at=NOW - 200, weekly_used=100)
+        self.tick()
+        self.assertEqual(self.stub.calls, [])
+
+    def test_the_pause_lock_is_free_while_the_resume_sends_limit_text(self):
+        p = self.limited(NOW - 1000)
+        other = self.window("running")
+        self.press()
+        self.t("set", "-w", "-t", other, "@agent_state", "paused")
+        free = []
+
+        def probe(args):
+            if args["message"] == AP.LIMIT_RESUME_MSG:
+                with open(self.dir / "state" / "lock", "a") as f:
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        free.append(True)
+                    except OSError:
+                        free.append(False)
+        self.stub.on_call = probe
+        self.press()
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+        self.assertEqual(free, [True])                     # a pause press then would not be busy
+
+    def test_limit_resume_recovers_an_agent_a_lost_resume_left_idle(self):
+        p = self.limited(NOW - 1000)
+        self.t("set", "-wu", "-t", p, "@agent_paused")
+        self.t("set", "-w", "-t", p, "@agent_state", "idle")
+        self.tick()
+        self.assertEqual(self.stub.calls, [])              # the tick needs the full paused state
+        self.assertTrue(self.limit("limit-resume", self.wid(p))["ok"])
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+
+    def test_a_switch_keeps_the_watcher_ticking_until_usage_catches_up(self):
+        # The watcher runs one tick when sequence.json changes, but usage.json
+        # catches up only on the status tick (every 15 s): that first tick
+        # cannot see the new account yet.
+        p = self.limited(NOW + 86400, "seven_day")         # since NOW - 600
+        self.switch(NOW - 10)                              # usage.json: updated NOW - 30
+        self.tick()
+        self.assertEqual(self.stub.calls, [])
+        self.assertEqual(self.due(), str(NOW + AP.LIMIT_SWITCH_POLL))   # look again soon
+        # It never settles: past the switch's window, back to the reset.
+        self.at(NOW - 10 + AP.LIMIT_SWITCH_WAIT)
+        self.tick()
+        self.assertEqual(self.due(), str(NOW + 86400 + AP.LIMIT_GRACE))
+        # Autoresume off still keeps looking (so the lift is noticed).
+        self.t("set", "-g", "@agent_limit_autoresume", "off")
+        self.at(NOW)
+        self.tick()
+        self.assertEqual(self.due(), str(NOW + AP.LIMIT_SWITCH_POLL))
+        self.t("set", "-g", "@agent_limit_autoresume", "on")
+        # usage.json caught up with the new account: the next tick sends.
+        self.usage(account="acct-b", updated_at=NOW + 15)
+        self.at(NOW + 20)
+        self.tick()
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+
+    def test_the_tick_reads_the_live_mark_over_a_stale_file(self):
+        p = self.limited(NOW + 86400, "seven_day")         # since NOW - 600
+        self.mark(p, NOW + 90000, "seven_day", NOW - 60)   # re-marked; its limit-add was lost
+        self.switch(NOW - 300)                             # between the two marks
+        self.usage(account="acct-b", updated_at=NOW - 200)
+        self.tick()
+        self.assertEqual(self.stub.calls, [])              # that switch predates the live limit
+        self.assertEqual((self.lim()[0]["since"], self.lim()[0]["resets_at"]), (NOW - 60, NOW + 90000))
+        self.assertEqual(self.lim()[0]["account"], "acct-a")   # the account it hit the limit on
+
+    def test_status_and_dry_run_list_the_limited_set(self):
+        self.limited(NOW + 3600)
+        self.limited(0, "model")
+        out = self.run_script("status").stdout
+        self.assertIn("not paused", out)
+        self.assertIn("rate-limited: 2 agents (auto-resume on)", out)
+        self.assertIn("resets ", out)
+        self.assertIn("resets unknown", out)
+        self.assertIn("attempts 0", out)
+        out = self.run_script("dry-run").stdout
+        self.assertIn("rate-limited: 2 agents", out)
+        self.assertEqual(self.stub.calls, [])
+
+
 class Units(unittest.TestCase):
     def test_classify(self):
         ok = lambda t, err=False: {"result": {"content": [{"type": "text", "text": t}], "isError": err}}
@@ -1462,8 +2044,101 @@ class Units(unittest.TestCase):
         self.assertIn("'AGENT_PAUSE_STATE_DIR=/x/state dir'", cmd)
         self.assertTrue(cmd.endswith(" watch pause"))
 
+    def test_swap_rule_needs_all_four(self):
+        t = {"type": "seven_day", "since": 1000, "resets_at": 99999, "account": "a"}
+        u = {"account": "b", "updated_at": 1200, "fetched_at": 0,
+             "session_locked": True, "session_used": 40, "weekly_locked": False, "weekly_used": 30,
+             "scoped_locked": True, "scoped_used": 100}
+        E = lambda t=t, seq=1100, u=u: AP.limit_eligible(t, 2000, seq, u)
+        self.assertEqual(E(), "switch")
+        self.assertEqual(E(seq=900), "")                         # the switch came before the limit
+        self.assertEqual(E(u=dict(u, updated_at=1050)), "")      # usage.json not newer than it
+        self.assertEqual(E(u=dict(u, account="a")), "")          # still the same account
+        self.assertEqual(E(u=dict(u, weekly_locked=True)), "")   # that account's week locked too
+        # Right after a switch every *_locked reads false (cswap's reading is
+        # adopted with the flags reset), so the window's own use decides...
+        self.assertEqual(E(u=dict(u, weekly_used=100)), "")      # an exhausted account
+        # ...or, with no reading, our own fetch after the switch.
+        self.assertEqual(E(u=dict(u, weekly_used=None)), "")
+        self.assertEqual(E(u=dict(u, weekly_used=None, fetched_at=1150)), "switch")
+        # Each type reads its own window's family.
+        self.assertEqual(E(t=dict(t, type="five_hour")), "")
+        self.assertEqual(E(t=dict(t, type="five_hour"), u=dict(u, session_locked=False)), "switch")
+        self.assertEqual(E(t=dict(t, type="seven_day_opus")), "")             # scoped: locked, 100%
+        self.assertEqual(E(t=dict(t, type="seven_day_opus"), u=dict(u, scoped_locked=False)), "")
+        no_scoped = dict(u, scoped_used=None)                    # no scoped reading: the week's
+        self.assertEqual(E(t=dict(t, type="seven_day_sonnet"), u=no_scoped), "switch")
+        self.assertEqual(E(t=dict(t, type="seven_day_sonnet"), u=dict(no_scoped, weekly_used=100)), "")
+        self.assertEqual(E(t=dict(t, type="overage")), "switch")
+        self.assertEqual(E(t=dict(t, type="codex")), "")         # codex: the clock only
+        self.assertEqual(E(t=dict(t, resets_at=0)), "")          # model limits: never
+        self.assertEqual(E(t=dict(t, account=None)), "")         # whose limit it was is unknown
+        self.assertEqual(AP.limit_eligible(t, 99999 + AP.LIMIT_GRACE, 0, {}), "reset")
+        self.assertEqual(AP.limit_eligible(t, 99999 + AP.LIMIT_GRACE - 1, 0, {}), "")
+        self.assertEqual(AP.limit_eligible(dict(t, lifted_at=5), 0, 0, {}), "lifted")
+
+    def test_fmt_local_one_date_format(self):
+        # By calendar days in local time: today "5:31 PM", the next six days
+        # "Tue 5:31 PM", anything else (a week on, or past) "Nov 2 5:31 PM".
+        # 2026-10-26 is a Monday; the clock comes from AGENT_PAUSE_NOW.
+        from unittest import mock
+        at = lambda *a: datetime(*a).timestamp()
+        with mock.patch.dict(os.environ, {"AGENT_PAUSE_NOW": str(at(2026, 10, 26, 15, 0))}):
+            self.assertEqual(AP.fmt_local(at(2026, 10, 26, 17, 31)), "5:31 PM")       # same day
+            self.assertEqual(AP.fmt_local(at(2026, 10, 26, 0, 5)), "12:05 AM")        # earlier today
+            self.assertEqual(AP.fmt_local(at(2026, 10, 27, 0, 5)), "Tue 12:05 AM")    # +1, just past midnight
+            self.assertEqual(AP.fmt_local(at(2026, 11, 1, 17, 31)), "Sun 5:31 PM")    # +6
+            self.assertEqual(AP.fmt_local(at(2026, 11, 2, 17, 31)), "Nov 2 5:31 PM")  # +7
+            self.assertEqual(AP.fmt_local(at(2026, 10, 20, 9, 5)), "Oct 20 9:05 AM")  # past
+            self.assertEqual(AP.fmt_local(at(2026, 10, 25, 23, 59)), "Oct 25 11:59 PM")   # yesterday
+            self.assertEqual(AP.fmt_local(0), "unknown")
+        # Just before midnight, a reset a minute later is already "tomorrow".
+        with mock.patch.dict(os.environ, {"AGENT_PAUSE_NOW": str(at(2026, 10, 26, 23, 59))}):
+            self.assertEqual(AP.fmt_local(at(2026, 10, 27, 0, 0)), "Tue 12:00 AM")
+
+    def test_limit_due_and_backoff(self):
+        t = {"window_id": "@1", "resets_at": 1000, "attempts": 0}
+        due = lambda ts, auto=True, **kw: AP.limit_due_at(ts, auto, 0, **kw)
+        self.assertEqual(due([t]), 1000 + AP.LIMIT_GRACE)
+        self.assertIsNone(due([t], actionable=set()))            # running: its outcome decides
+        self.assertIsNone(due([dict(t, resets_at=0)]))
+        late = dict(t, attempts=2, last_attempt=5000)
+        self.assertEqual(due([late]), 5000 + 2 * AP.LIMIT_BACKOFF)
+        self.assertIsNone(due([dict(t, lifted_at=9)], False))    # waits for Mack
+        self.assertEqual(due([dict(t, lifted_at=9)]), 0)         # now
+        self.assertIsNone(due([dict(late, lifted_at=9, attempts=3)]))
+        # Freed by a switch: a retry waits for its backoff, not for the reset.
+        week = dict(t, resets_at=10 ** 6, attempts=1, last_attempt=50)
+        self.assertEqual(due([week], eligible={"@1"}), 50 + AP.LIMIT_BACKOFF)
+        self.assertEqual(due([week]), 10 ** 6 + AP.LIMIT_GRACE)
+        # A held copy that may still be queued: not before it would expire.
+        self.assertEqual(AP.limit_due_at([dict(week, held_at=50)], True, 100, eligible={"@1"}),
+                         50 + AP.LIMIT_HELD_MAX)
+        self.assertTrue(AP.held_pending({"held_at": 50}, 50 + AP.LIMIT_HELD_MAX - 1))
+        self.assertFalse(AP.held_pending({"held_at": 50}, 50 + AP.LIMIT_HELD_MAX))
+        idle = {"agent_state": "idle", "agent_paused": "", "agent_limit": "1 five_hour 1"}
+        sent = {"last_result": "held", "last_attempt": 0}
+        self.assertTrue(AP.held_stuck(sent, idle, AP.LIMIT_HELD_LIFT))
+        self.assertFalse(AP.held_stuck(sent, idle, AP.LIMIT_HELD_LIFT - 1))
+        self.assertFalse(AP.held_stuck(sent, dict(idle, agent_state="running"), 10 ** 6))
+        self.assertFalse(AP.held_stuck(dict(sent, last_result="sent"), idle, 10 ** 6))
+        self.assertTrue(AP.limit_actionable(idle, loose=True))   # Mack's limit-resume
+        self.assertFalse(AP.limit_actionable(idle))
+        self.assertFalse(AP.limit_handover(dict(idle, agent_state="running")))
+        self.assertTrue(AP.limit_handover(dict(idle, agent_state="paused")))
+        self.assertEqual(AP.parse_limit("1761500000 five_hour 1761490000"),
+                         (1761500000, "five_hour", 1761490000))
+        self.assertIsNone(AP.parse_limit("garbage"))
+        row = {"agent_state": "paused", "agent_paused": "1", "agent_limit": "1 five_hour 1"}
+        self.assertTrue(AP.limit_actionable(row))
+        self.assertFalse(AP.limit_actionable(dict(row, agent_state="running")))
+        self.assertFalse(AP.limit_actionable(dict(row, agent_paused="")))
+        self.assertFalse(AP.working_reasons(dict(row, agent_workflow="1", agent_cua="")))
+        self.assertEqual(AP.resume_status({"result": "limited"}, None), AP.LIMITED_ROW)
+
     def test_conf_binding(self):
         text = CONF.read_text()
+        self.assertIn("\nset -g @agent_limit_autoresume on\n", text)
         binds = [l for l in text.splitlines() if l.startswith("bind")]
         self.assertEqual(len(binds), 1)
         self.assertIn("bind-key P run-shell -b", binds[0])

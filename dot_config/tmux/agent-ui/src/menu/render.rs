@@ -161,6 +161,7 @@ pub fn badge_color(a: &Agent) -> &'static str {
         Some(Cat::NeedsInput) => "yellow",
         Some(Cat::Done) => "green",
         Some(Cat::Working) => "blue",
+        Some(Cat::Paused) if a.limit.is_some() => crate::model::LIMIT_HUE,
         Some(Cat::Paused) => crate::model::PAUSED_HUE,
         Some(Cat::Idle) | None => "overlay",
     }
@@ -239,10 +240,13 @@ fn header(m: &mut Menu, buf: &mut Buffer, w: u16) {
         x = put(buf, x, 0, end, &format!("{} ⇥", m.tab.title()), bold(fg("blue")));
         m.clicks.push((Rect::new(x0, 0, x - x0, 1), Hit::Filter));
     }
+    // Rate-limited agents are paused ones with a reason: counted apart.
+    let limited = v.limited().len();
     let counts: Vec<(String, &str)> = [
         (v.needs.len(), "◉", "need you", "yellow"),
         (v.counts.get(Cat::Working), "◐", "working", "blue"),
-        (v.counts.get(Cat::Paused), crate::model::PAUSED_GLYPH, "paused", crate::model::PAUSED_HUE),
+        (v.counts.get(Cat::Paused).saturating_sub(limited), crate::model::PAUSED_GLYPH, "paused", crate::model::PAUSED_HUE),
+        (limited, crate::model::LIMIT_GLYPH, "limit", crate::model::LIMIT_HUE),
         (v.counts.get(Cat::Idle), "○", "idle", "overlay"),
         (v.parked.len(), "▪", "parked", "overlay"),
     ]
@@ -430,10 +434,19 @@ fn agent_row(m: &Menu, buf: &mut Buffer, x0: u16, y: u16, cw: u16, a: &Agent, pl
         here = false;
     }
     let avail = room(right_w(&tag, here)) as usize;
-    let reason = need.map(|n| {
-        let text = plain(&n.reason);
-        (n.reason_word.clone(), reason_color(a, !n.reason.is_empty()), text)
-    });
+    // A rate-limited agent (never in NEEDS YOU) says its limit where an
+    // asking one says what it asks: `limit  resets Tue 1:00 AM`.
+    let reason = need
+        .map(|n| {
+            let text = plain(&n.reason);
+            (n.reason_word.clone(), reason_color(a, !n.reason.is_empty()), text)
+        })
+        .or_else(|| {
+            a.limit.as_ref().map(|l| {
+                let (word, text) = crate::view::limit_words(l, &a.detail, m.data.view.now);
+                (word, crate::model::LIMIT_HUE, text)
+            })
+        });
     let tw = dwidth(&title);
     let title_room = match &reason {
         Some((wd, _, text)) => {
@@ -1058,6 +1071,82 @@ mod tests {
         assert_eq!(titles(Tab::Needs), ["Really done"]);
         assert_eq!(titles(Tab::Active), ["Still working", "Really done"]);
         assert_eq!(titles(Tab::Working), ["Still working"]);
+    }
+
+    /// Rate-limited (docs/agent-roster.md "Rate-limited agents"): a paused
+    /// agent with `@agent_limit`. The menu marks it with the limit glyph in
+    /// peach (glyph and letter badge), says its limit where an asking agent
+    /// says what it asks (`limit  resets …`, `Fable limit  /model`, `limit
+    /// lifted  waiting for you`), counts it apart in the header (`󱎫 N
+    /// limit`, the paused count without it), and keeps it out of Needs you
+    /// and Active: listed under Idle with the paused.
+    #[test]
+    fn limited_is_a_peach_paused_agent_out_of_the_needs() {
+        use crate::model::LIMIT_GLYPH;
+        let r = |i: u32, set: &[(&str, &str)]| crate::tmux::tests::row("main", i, &format!("@{i}"), set);
+        let snap = crate::tmux::Snapshot::parse(&[
+            r(1, &[("state", "paused"), ("paused", "900"), ("limit", "4600 five_hour 900"), ("summary", "Soon")]),
+            r(2, &[("state", "paused"), ("paused", "900"), ("limit", "0 model 900"), ("summary", "Model"),
+                ("detail_kind", "limit"), ("detail", "Opus limit · /model to switch")]),
+            r(3, &[("state", "paused"), ("paused", "900"), ("limit", "500 five_hour 400"), ("limit_lifted", "950"), ("summary", "Lifted")]),
+            r(4, &[("state", "paused"), ("paused", "900"), ("summary", "Plain paused")]),
+            r(5, &[("state", "running"), ("limit", "4600 five_hour 900"), ("summary", "Again")]),
+            r(6, &[("state", "done"), ("summary", "Really done")]),
+        ].join("\n"));
+        let d = Data::build(&snap, None, 1000.0, &crate::Collator::new("C"), None, Some(1.0));
+        assert_eq!(d.view.needs.iter().map(|n| n.agent.window_id.as_str()).collect::<Vec<_>>(), ["@6"]);
+        let mut m = Menu::new(d.clone(), Tab::All);
+        let f = frame(&mut m, 120, 20);
+        assert!(f[0].contains(&format!("◉ 1 need you · ◐ 1 working · ⏸ 1 paused · {LIMIT_GLYPH} 3 limit")), "{}", f[0]);
+        let b = buffer(&mut m, 120, 20);
+        let when = crate::text::when(4600, 1000.0);
+        for (name, says) in [("Soon", format!("limit resets {when}")), ("Model", "Opus limit /model to switch".into()),
+            ("Lifted", "limit lifted waiting for you".into())] {
+            let y = at(&f, name);
+            assert!(f[y].contains(&format!("{LIMIT_GLYPH} {name}")), "{}", f[y]);
+            assert!(f[y].split_whitespace().collect::<Vec<_>>().join(" ").contains(&says), "{name}: {}", f[y]);
+            let gx = f[y].chars().position(|c| c.to_string() == LIMIT_GLYPH).unwrap() as u16;
+            assert_eq!(b[(gx, y as u16)].fg, color("peach"), "{name}");
+            assert_eq!(b[(3, y as u16)].bg, color("peach"), "{name}");
+        }
+        let y = at(&f, "Plain paused");
+        assert!(f[y].contains("⏸ Plain paused") && !f[y].contains("limit"), "{}", f[y]);
+        let y = at(&f, "Again");
+        assert!(!f[y].contains("limit") && !f[y].contains(LIMIT_GLYPH), "{}", f[y]);
+        let titles = |tab: Tab| -> Vec<String> {
+            super::super::rows::build_rows(&d, tab, "").iter().filter_map(|r| r.agent().map(|a| a.title.clone())).collect()
+        };
+        assert_eq!(titles(Tab::Idle), ["Soon", "Model", "Lifted", "Plain paused"]);
+        assert_eq!(titles(Tab::Needs), ["Really done"]);
+        assert_eq!(titles(Tab::Active), ["Again", "Really done"]);
+    }
+
+    /// A limit's edges in the menu's reason: no reset time and no words
+    /// (`model limit`), a reset that overflows or is absurdly far (`limit
+    /// reset unknown`, never an empty time), inside agent-pause.py's 120 s
+    /// grace (`limit resetting`), past it (`limit reset passed`).
+    #[test]
+    fn limit_reasons_at_the_edges() {
+        let r = |i: u32, l: &str, title: &str| {
+            crate::tmux::tests::row("main", i, &format!("@{i}"), &[("state", "paused"), ("paused", "900"), ("limit", l), ("summary", title)])
+        };
+        let snap = crate::tmux::Snapshot::parse(&[
+            r(1, "0 model 900", "Wordless"),
+            r(2, "99999999999999999999 five_hour 900", "Overflow"),
+            r(3, &format!("{} seven_day 900", 1000 + 500 * 86_400), "Far off"),
+            r(4, "940 five_hour 900", "Grace"),
+            r(5, "700 five_hour 600", "Passed"),
+        ].join("\n"));
+        let d = Data::build(&snap, None, 1000.0, &crate::Collator::new("C"), None, Some(1.0));
+        let mut m = Menu::new(d, Tab::All);
+        let f = frame(&mut m, 120, 20);
+        for (name, says) in [("Wordless", "model limit"), ("Overflow", "limit reset unknown"), ("Far off", "limit reset unknown"),
+            ("Grace", "limit resetting"), ("Passed", "limit reset passed")] {
+            let y = at(&f, name);
+            let words = f[y].split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains(says), "{name}: {}", f[y]);
+            assert!(!words.contains("resets"), "{name}: {}", f[y]);
+        }
     }
 
     #[test]

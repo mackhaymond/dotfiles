@@ -19,6 +19,14 @@ reach the agents that were paused, not whatever happens to be running now.
                                           --press: follow that press's delivery
                                           (progress.json) first
 
+Rate-limited agents (RATE LIMITS below; docs "Rate-limited agents"):
+    agent-pause.py limit-add <window>     remember a window the indicator marked @agent_limit
+    agent-pause.py limit-tick             resume the limited agents whose limit has lifted
+    agent-pause.py limit-auto on|off|toggle
+                                          @agent_limit_autoresume (Mack's setting)
+    agent-pause.py limit-resume [--force] <window>
+                                          resume one limited agent now (the sidebar click)
+
 WORKING (Mack's correction: idle agents are never messaged) is read from the
 per-window options the tab indicator hooks and agent-tab-watcher.sh keep:
   @agent_state running          a turn is in progress
@@ -56,6 +64,7 @@ outcome is a notify.sh message on the pressing client (a sidebar toast, else
 a display-message) and a line in the log.
 """
 import concurrent.futures
+import contextlib
 import fcntl
 import itertools
 import http.client
@@ -167,9 +176,11 @@ def cmd_kind(cmd):
     return cmd if cmd in ("codex", "opencode") else "claude"
 US = "\x1f"
 # @agent_summary is free text, so it goes LAST and the split is bounded.
+# @agent_limit is "<resets_at> <type> <since>" (RATE LIMITS): no separator in it.
 PANE_FIELDS = ("pane_id", "window_id", "session_name", "window_index", "pane_index",
                "pane_pid", "pane_current_command", "pane_active", "@agent_state",
-               "@agent_workflow", "@agent_cua", "@agent_kind", "@agent_summary")
+               "@agent_workflow", "@agent_cua", "@agent_kind", "@agent_paused",
+               "@agent_limit", "@agent_limit_lifted", "@agent_summary")
 PANE_FMT = US.join("#{%s}" % f for f in PANE_FIELDS)
 DISPLAY_MS = "6000"
 # Messages go through notify.sh: a toast in the agent-ui sidebar when one
@@ -243,7 +254,7 @@ def set_paused_option(n):
         pass
 
 
-def mark_paused(panes, on, repause=False):
+def mark_paused(panes, on, repause=False, stamp=None):
     """The per-agent PAUSED flag (docs/agent-pause.md, "The paused state"):
     @agent_paused = <epoch> on each pane's window, which tells the tab hooks
     to end its turn as @agent_state `paused` instead of done or a quiet
@@ -254,14 +265,16 @@ def mark_paused(panes, on, repause=False):
     repause (a RESUME that was refused) undoes that. One tmux call per pane:
     tmux abandons the rest of a command list at the first error, so one
     closed pane must not cost the others their flag. Cosmetic, so it never
-    raises."""
+    raises. stamp: the value to write instead of now. A rate-limited
+    window's flag must be its @agent_limit's <since>: the indicator clears
+    the flag on the turn's outcome only when the two match (RATE LIMITS)."""
     panes = [p for p in dict.fromkeys(panes) if p]
     if not panes:
         return
     try:
         for p in panes:
             if on:
-                cmds = ["set-option", "-w", "-t", p, "@agent_paused", str(int(time.time()))]
+                cmds = ["set-option", "-w", "-t", p, "@agent_paused", str(int(stamp or time.time()))]
                 if repause:
                     cmds += [";", "if-shell", "-F", "-t", p, "#{==:#{@agent_state},idle}",
                              "set-option -w -t %s @agent_state paused" % p]
@@ -389,6 +402,11 @@ def working_reasons(row):
     # @agent_workflow lit, and a pause message would land on its question.
     if row["agent_state"] == "needs-input":
         return []
+    # A rate-limited agent is paused with a reason (RATE LIMITS), not
+    # working, even with a workflow still out: that one is limited too. Only
+    # its own RESUME's turn (running, @agent_limit kept until the outcome) is.
+    if row.get("agent_limit") and row["agent_state"] != "running":
+        return []
     why = []
     if row["agent_state"] == "running":
         why.append("running")
@@ -403,57 +421,69 @@ def label_of(row):
     return (row["agent_summary"].strip() or row["pane_current_command"] or row["pane_id"])
 
 
+def window_rows(panes):
+    """{window_id: [rows by pane_index]}; window options are the same on
+    every pane of a window, so rows[0] answers for all of them."""
+    windows = {}
+    for row in panes.values():
+        windows.setdefault(row["window_id"], []).append(row)
+    for rows in windows.values():
+        rows.sort(key=lambda r: int(r["pane_index"] or 0))
+    return windows
+
+
+def pick_agent_pane(rows, recs):
+    """The agent pane among one window's rows -> (row, "record" | "command"),
+    or (None, "") when there is none we could message (see THE AGENT PANE)."""
+    kind = rows[0]["agent_kind"]
+    with_rec = [r for r in rows if r["pane_id"] in recs]
+    if with_rec:
+        with_rec.sort(key=lambda r: (recs[r["pane_id"]]["kind"] != kind if kind else False,
+                                     r["pane_active"] != "1"))
+        return with_rec[0], "record"
+    cmd = [r for r in rows if AGENT_CMD.match(r["pane_current_command"])
+           and (r["pane_current_command"] != "opencode" or kind == "opencode")]
+    cmd.sort(key=lambda r: (cmd_kind(r["pane_current_command"]) != kind if kind else False,
+                            r["pane_active"] != "1"))
+    return (cmd[0], "command") if cmd else (None, "")
+
+
+def agent_target(pick, head, recs):
+    """A saved target's identity (scan, limit-add): enough for locate()."""
+    rec = recs.get(pick["pane_id"], {})
+    return {
+        "pane_id": pick["pane_id"],
+        "window_id": head["window_id"],
+        "location": pick["location"],
+        "label": label_of(pick),
+        "kind": rec.get("kind") or head["agent_kind"] or cmd_kind(pick["pane_current_command"]),
+        "session_id": rec.get("session_id", ""),
+        "pid": rec.get("pid"),
+        "pane_pid": pick["pane_pid"],   # the pane's identity when there is no session id (locate)
+        "pane_cmd": pick["pane_current_command"],   # ... with the agent it ran then
+    }
+
+
 def scan(panes, recs):
     """-> (targets, idle, unidentified). targets: one dict per working agent
     window; idle: agent windows that are not working (for dry-run); and
     unidentified: working windows with no pane we could message."""
-    windows = {}
-    for row in panes.values():
-        windows.setdefault(row["window_id"], []).append(row)
     targets, idle, unidentified = [], [], []
-    for wid, rows in windows.items():
-        rows.sort(key=lambda r: int(r["pane_index"] or 0))
-        head = rows[0]   # window options are the same on every pane of it
-        with_rec = [r for r in rows if r["pane_id"] in recs]
-        if not (head["agent_state"] or head["agent_kind"] or with_rec):
+    for wid, rows in window_rows(panes).items():
+        head = rows[0]
+        if not (head["agent_state"] or head["agent_kind"] or any(r["pane_id"] in recs for r in rows)):
             continue   # not an agent window at all
         why = working_reasons(head)
         if not why:
             idle.append({"window_id": wid, "location": head["location"],
                          "state": head["agent_state"] or "(no state)", "label": label_of(head)})
             continue
-        pick, how = None, ""
-        if with_rec:
-            kind = head["agent_kind"]
-            with_rec.sort(key=lambda r: (recs[r["pane_id"]]["kind"] != kind if kind else False,
-                                         r["pane_active"] != "1"))
-            pick, how = with_rec[0], "record"
-        else:
-            kind = head["agent_kind"]
-            cmd = [r for r in rows if AGENT_CMD.match(r["pane_current_command"])
-                   and (r["pane_current_command"] != "opencode" or kind == "opencode")]
-            cmd.sort(key=lambda r: (cmd_kind(r["pane_current_command"]) != kind if kind else False,
-                                    r["pane_active"] != "1"))
-            if cmd:
-                pick, how = cmd[0], "command"
+        pick, how = pick_agent_pane(rows, recs)
         if pick is None:
             unidentified.append({"window_id": wid, "location": head["location"],
                                  "why": "+".join(why), "label": label_of(head)})
             continue
-        rec = recs.get(pick["pane_id"], {})
-        targets.append({
-            "pane_id": pick["pane_id"],
-            "window_id": wid,
-            "location": pick["location"],
-            "label": label_of(pick),
-            "kind": rec.get("kind") or head["agent_kind"] or cmd_kind(pick["pane_current_command"]),
-            "session_id": rec.get("session_id", ""),
-            "pid": rec.get("pid"),
-            "pane_pid": pick["pane_pid"],   # the pane's identity when there is no session id (locate)
-            "pane_cmd": pick["pane_current_command"],   # ... with the agent it ran then
-            "why": "+".join(why),
-            "found_by": how,
-        })
+        targets.append(dict(agent_target(pick, head, recs), why="+".join(why), found_by=how))
     return targets, idle, unidentified
 
 
@@ -893,7 +923,17 @@ def plan_resume(st):
     for t in st["targets"]:
         pane, note = locate(t, panes, recs)
         t = dict(t, resume_pane=pane, resume_note=note)
-        if pane:
+        if pane and limit_handover(panes[pane]):
+            # Rate-limited since the pause (its reply's turn hit the limit): a
+            # RESUME would only spend a turn on the same error. limited.json
+            # takes it over (finish_resume) and it stays paused.
+            lim = parse_limit(panes[pane]["agent_limit"])
+            t["limit_since"] = lim[2] if lim else 0
+            t["result"] = "limited"
+            t["detail"] = ("rate-limited until %s" % fmt_local(lim[0]) if lim and lim[0]
+                           else "rate-limited (no reset time: only Mack can move it on)")
+            live.append(t)
+        elif pane:
             t["result"], t["detail"] = "sending", ""
             live.append(t)
         else:
@@ -913,7 +953,9 @@ def finish_resume(client, prog, st, live, gone):
     """The slow half of a resume. -> (message line, reached anyone?)."""
     saved = st["targets"]
     entry = {"mode": "resume", "client": client, "paused_at": st.get("paused_at")}
-    if live:
+    # A rate-limited target (plan_resume) gets no RESUME and keeps its flag.
+    sendable = [(i, t) for i, t in enumerate(live) if t["result"] != "limited"]
+    if sendable:
         try:
             mcp = open_mcp()
         except McpError as e:
@@ -924,7 +966,7 @@ def finish_resume(client, prog, st, live, gone):
             prog.write(True, "failed", msg)
             log(dict(entry, message=msg, targets=live + gone))
             return msg, False
-        mark_paused([t["resume_pane"] for t in live], False)
+        mark_paused([t["resume_pane"] for _, t in sendable], False)
     # A gone agent is no longer in its old pane (closed, or the pane now runs
     # another session: /clear, another /resume, a restart). If that pane is
     # still there its flag must go, or every later Stop in it reads paused.
@@ -935,16 +977,27 @@ def finish_resume(client, prog, st, live, gone):
         except (OSError, RuntimeError, subprocess.SubprocessError):
             alive = set()
         mark_paused([t.get("pane_id") for t in gone if t.get("pane_id") in alive], False)
-    if live:
+    if sendable:
         try:
-            res = deliver(mcp, [(i, t["resume_pane"]) for i, t in enumerate(live)], RESUME_MSG,
+            res = deliver(mcp, [(i, t["resume_pane"]) for i, t in sendable], RESUME_MSG,
                           on_result=prog.result)
         finally:
             mcp.close()
-        for i, t in enumerate(live):
+        for i, t in sendable:
             t["result"], t["detail"] = res.get(i, ("unknown", "no result"))
     ok = [t for t in live if t["result"] in REACHED]
-    bad = [t for t in live if t["result"] not in REACHED]
+    handed = [t for t in live if t["result"] == "limited"]
+    bad = [t for t in live if t["result"] not in REACHED and t["result"] != "limited"]
+    # The limited ones leave the saved set and keep their flag, rewritten to
+    # their limit's <since> (the indicator clears only that value on the
+    # turn's outcome). limited.json resumes them once their limit lifts: the
+    # merge, and the LIMIT text for any that already has, run once the
+    # pause lock is released (limit_after_press), so no press waits on them.
+    for t in handed:
+        if t.get("limit_since"):
+            mark_paused([t["resume_pane"]], True, stamp=t["limit_since"])
+    LIMIT_LATER.append({"handed": [t["resume_pane"] for t in handed], "resumed_any": bool(ok),
+                        "paused_at": st.get("paused_at")})
     # Only the agents the RESUME reached leave the saved set, so a resume that
     # reached nobody can never turn into a fresh pause. A miss (failed or
     # gone) is kept until it has missed MISS_DROP times AND for MISS_AGE s
@@ -977,8 +1030,12 @@ def finish_resume(client, prog, st, live, gone):
     set_paused_option(len(keep))
     if ok:
         msg = "▶ resumed %d agent%s: %s" % (len(ok), "" if len(ok) == 1 else "s", names(ok))
+    elif handed:
+        msg = "▶ nothing resumed"
     else:
         msg = "▶ resume reached no agents"
+    if handed:
+        msg += " · " + "; ".join("%s %s" % (short(t["label"]), t["detail"]) for t in handed[:4])
     unsure = [t for t in ok if t["result"] == "unknown"]
     if unsure:
         msg += " · %d unconfirmed (no reply)" % len(unsure)
@@ -991,9 +1048,10 @@ def finish_resume(client, prog, st, live, gone):
     if keep:
         msg += " · %d still paused — press prefix P again to retry" % len(keep)
     # Nobody reached: the open popup shows NOT RESUMED, never a green claim.
-    prog.write(True, "resumed" if ok else "not_resumed", msg)
+    # A hand-over to limited.json is not a failure: they left the saved set.
+    prog.write(True, "resumed" if ok or handed else "not_resumed", msg)
     log(dict(entry, message=msg, targets=live + gone))
-    return msg, bool(ok)
+    return msg, bool(ok or handed)
 
 
 def toggle(client, resume_only=False):
@@ -1040,6 +1098,12 @@ def toggle(client, resume_only=False):
     # Mack pressed Esc while it was sending - then nothing else would tell him.
     if not popup_still_up(popup):
         display(client, msg, "warn" if "WAITING on " in msg else "info")
+    # Then a resume's limit half (RATE LIMITS), outside the lock (a pause
+    # press meanwhile is not turned away as busy) and after the resume's own
+    # toast (its staggers must not hold that up): its outcome, a toast of its own.
+    tail = limit_after_press()
+    if tail:
+        display(client, tail.lstrip(" ·"))
 
 
 def finished(prog, finish):
@@ -1133,6 +1197,938 @@ def void_pause(client):
              "targets": st["targets"]})
         return None if pause_view_open() else msg
     return under_lock(client, run)
+
+
+# --------------------------------------------------------- rate limits
+# RATE LIMITS (docs/agent-pause.md, "Rate-limited agents"). An agent whose
+# turn hit a usage limit is a PAUSED agent with a reason, not a second state
+# machine: the tab indicator (the watcher, for codex) writes @agent_paused,
+# @agent_limit "<resets_at> <type> <since>" and @agent_state paused, then
+# runs `limit-add <window>` in the background. limited.json is that set,
+# apart from the pause key's paused.json. `limit-tick`, which the watcher
+# spawns when @agent_limit_due comes, cswap switches account or the machine
+# wakes, sends each one LIMIT_RESUME_MSG once its limit has lifted.
+#
+# Its own lock (limit.lock), never the pause key's: a press must not wait
+# behind a staggered delivery, and nothing here ever holds both. A toggle's
+# resume only decides, under the pause lock, which saved targets are handed
+# over; the merge and any LIMIT text run after it lets go (limit_after_press).
+# Nor is the pause lock ever probed: the key takes it LOCK_NB, so even a brief
+# hold here would turn Mack's press away as busy. A press in flight is read
+# from progress.json instead (pause_in_flight).
+
+LIMITED = STATE_DIR / "limited.json"
+LIMIT_LOCK = STATE_DIR / "limit.lock"
+# codexbar-usage-status.sh's published cache (its "The published cache"):
+# the root is Claude's block, with `account`, `updated_at` (epoch s; moves
+# with any reading), `fetched_at` (our own endpoint fetch only) and, per
+# window family (session / weekly / scoped), `<family>_used` (percent, or
+# null) and `<family>_locked`.
+USAGE = HOME / ".cache/codexbar-tmux/usage.json"
+SWAP_SEQ = HOME / ".claude-swap-backup/sequence.json"   # cswap rewrites it on a switch
+LIMIT_RESUME_MSG = (
+    "[limit] Your usage limit has reset. Continue the task you were working on when the "
+    "limit was reached; do not repeat work that is already complete.")
+# s after resets_at before the wall-clock rule fires: Claude's own
+# auto-continue comes at reset + 30-90 s, and it must win (no double prompt).
+LIMIT_GRACE = 120
+WAKE_GRACE = 30          # s after a wake or boot: the network is still coming up
+DNS_TIMEOUT = 2.0
+LIMIT_MAX_ATTEMPTS = 3   # RESUMEs before a target waits for Mack (lifted, one notify)
+LIMIT_BACKOFF = 120      # s after attempt n before the next: LIMIT_BACKOFF * 2**(n-1)
+LIMIT_RETRY = 60         # s to the next tick when something due could not be acted on
+LIMIT_STAGGER = float(os.environ.get("AGENT_PAUSE_LIMIT_STAGGER") or 5)
+# A RESUME tmux-mcp HELD (a draft or dialog in the box) sits in its per-pane
+# queue, undeduplicated, until the box clears or for up to 2 h (its
+# HOLD_MAX_MS). It counts as reached and is never sent again while a copy may
+# be waiting; one still not landed after LIMIT_HELD_LIFT s is lifted (one
+# notify) for Mack instead.
+LIMIT_HELD_MAX = 2 * 3600
+LIMIT_HELD_LIFT = 600
+# A re-mark more than this long after our last RESUME is a new limit episode,
+# not that RESUME's false lift (which re-marks within minutes): its attempt
+# count starts over.
+LIMIT_EPISODE_GAP = 900
+# A cswap switch lands before usage.json describes the new account (the
+# publisher catches up on its status tick, every 15 s), so the watcher's one
+# tick on the switch sees nothing yet. While a switch is newer than a
+# target's since and usage.json is not, look again every LIMIT_SWITCH_POLL s,
+# for at most LIMIT_SWITCH_WAIT s after the switch.
+LIMIT_SWITCH_POLL = 20
+LIMIT_SWITCH_WAIT = 300
+SCOPED_TYPES = ("seven_day_opus", "seven_day_sonnet")
+# A resume press's limit half, queued under the pause lock by finish_resume
+# and run by limit_after_press once the lock is released.
+LIMIT_LATER = []
+
+
+def clock():
+    """Now, for the limit engine. AGENT_PAUSE_NOW (epoch s) fixes it (tests)."""
+    try:
+        return float(os.environ.get("AGENT_PAUSE_NOW") or time.time())
+    except ValueError:
+        return time.time()
+
+
+def last_wake():
+    """The last wake or boot (epoch s): the later of kern.waketime and
+    kern.boottime, the pair the sidebar reads for "ready to resume". 0 when
+    neither can be read. AGENT_PAUSE_WAKETIME replaces both (tests)."""
+    v = os.environ.get("AGENT_PAUSE_WAKETIME")
+    if v:
+        try:
+            return float(v)
+        except ValueError:
+            return 0.0
+    best = 0.0
+    for key in ("kern.waketime", "kern.boottime"):
+        try:   # "{ sec = 1761500000, usec = 0 } Sun Oct 26 ..."
+            out = subprocess.run(["sysctl", "-n", key], capture_output=True, text=True,
+                                 timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        m = re.search(r"\bsec\s*=\s*(\d+)", out)
+        if m:
+            best = max(best, float(m.group(1)))
+    return best
+
+
+def resolves(host):
+    """Does `host` resolve within DNS_TIMEOUT? getaddrinfo has no timeout of
+    its own, so it runs in a daemon thread that is abandoned if slow.
+    AGENT_PAUSE_DNS: "ok", "fail", or a comma list of the hosts that resolve
+    (tests)."""
+    v = os.environ.get("AGENT_PAUSE_DNS")
+    if v:
+        return v == "ok" or host in v.split(",")
+    box = []
+
+    def look():
+        try:
+            socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+            box.append(True)
+        except (OSError, UnicodeError):
+            pass
+    th = threading.Thread(target=look, daemon=True)
+    th.start()
+    th.join(DNS_TIMEOUT)
+    return bool(box)
+
+
+def limit_host(t):
+    return "chatgpt.com" if "codex" in (t.get("type"), t.get("kind")) else "api.anthropic.com"
+
+
+def parse_limit(v):
+    """@agent_limit "<resets_at> <type> <since>" -> (resets_at, type, since), or
+    None. resets_at 0: unknown (a model limit, never auto-resumed). Pure."""
+    parts = (v or "").split()
+    if len(parts) != 3:
+        return None
+    try:
+        return int(float(parts[0])), parts[1], int(float(parts[2]))
+    except ValueError:
+        return None
+
+
+def fmt_local(ts):
+    """A time as Mack reads it, the one format on every surface (toasts,
+    refusals, the log, status/dry-run), by calendar days in local time:
+    today "5:31 PM", the next six days "Tue 5:31 PM", anything else (a week
+    or more on, or past) "Nov 2 5:31 PM". A bare weekday for a reset 6 days
+    and 20 hours out read as today. No leading zeros."""
+    if not ts:
+        return "unknown"
+    dt = datetime.fromtimestamp(ts)
+    hm = "%d:%02d %s" % (dt.hour % 12 or 12, dt.minute, "AM" if dt.hour < 12 else "PM")
+    days = (dt.date() - datetime.fromtimestamp(clock()).date()).days
+    if days == 0:
+        return hm
+    if 1 <= days <= 6:
+        return "%s %s" % (dt.strftime("%a"), hm)
+    return "%s %d %s" % (dt.strftime("%b"), dt.day, hm)
+
+
+def num(v):
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def read_json(path):
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def swap_facts():
+    """-> (sequence.json's mtime or 0, usage.json's root or {})."""
+    try:
+        seq = SWAP_SEQ.stat().st_mtime
+    except OSError:
+        seq = 0.0
+    return seq, read_json(USAGE) or {}
+
+
+def is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def limit_family(typ, usage):
+    """The usage.json window family a limit of this type counts against:
+    "session" (five_hour), "scoped" (seven_day_opus/sonnet, while usage.json
+    has a scoped reading), else "weekly". Pure."""
+    if typ == "five_hour":
+        return "session"
+    if typ in SCOPED_TYPES and is_num(usage.get("scoped_used")):
+        return "scoped"
+    return "weekly"   # seven_day, overage, anything else, or no scoped reading
+
+
+def window_free(fam, seq_mtime, usage):
+    """Is that window free on the account usage.json now describes? Its
+    `<fam>_locked` is false AND either its `<fam>_used` is a number under 100,
+    or (no reading) our own fetch landed after the switch. The locked flags
+    alone prove nothing right after a switch: adopting cswap's reading resets
+    them to false and leaves fetched_at behind, so a switch to an exhausted
+    account would pass. Pure."""
+    if usage.get(fam + "_locked") is not False:
+        return False
+    used = usage.get(fam + "_used")
+    if is_num(used):
+        return used < 100
+    return num(usage.get("fetched_at")) > seq_mtime
+
+
+def swap_freed(t, seq_mtime, usage):
+    """Did a cswap switch free this target? All four: a switch after it was
+    marked (sequence.json newer than `since`), usage.json written after that
+    switch, another account than the one it hit the limit on, and that
+    account's matching window free (window_free). A false lift re-marks it
+    with a new `since`, so only a NEWER switch can free it again. Pure."""
+    acct = usage.get("account")
+    return (t.get("type") != "codex" and seq_mtime > num(t.get("since"))
+            and num(usage.get("updated_at")) > seq_mtime
+            and bool(acct) and bool(t.get("account")) and acct != t.get("account")
+            and window_free(limit_family(t.get("type"), usage), seq_mtime, usage))
+
+
+def switch_settling(t, now, seq_mtime, usage):
+    """Is a cswap switch that may free this target still waiting on
+    usage.json? The switch is newer than its since, usage.json not newer
+    than the switch, and the switch under LIMIT_SWITCH_WAIT s old (a
+    usage.json that never settles stops the polling). Regardless of
+    auto-resume: with it off, the tick must still see the lift to mark it.
+    Not for a target already waiting for Mack, a codex one or a model
+    limit (neither is freed by a switch). Pure."""
+    return (not t.get("lifted_at") and t.get("type") != "codex"
+            and int(num(t.get("resets_at"))) > 0
+            and seq_mtime > num(t.get("since")) and num(usage.get("updated_at")) <= seq_mtime
+            and now < seq_mtime + LIMIT_SWITCH_WAIT)
+
+
+def limit_eligible(t, now, seq_mtime, usage):
+    """Has this target's limit lifted? -> "lifted" (it was, and nothing has
+    re-marked it since), "reset" (resets_at + LIMIT_GRACE has passed),
+    "switch" (swap_freed), or "" (not yet). resets_at 0 is never eligible;
+    codex only by the clock. Pure."""
+    resets = int(num(t.get("resets_at")))
+    if t.get("lifted_at"):
+        return "lifted"
+    if resets <= 0:
+        return ""
+    if now >= resets + LIMIT_GRACE:
+        return "reset"
+    return "switch" if swap_freed(t, seq_mtime, usage) else ""
+
+
+def capped(t):
+    return int(num(t.get("attempts"))) >= LIMIT_MAX_ATTEMPTS
+
+
+def backoff_until(t):
+    """The earliest next RESUME after `attempts` of them. Pure."""
+    n = int(num(t.get("attempts")))
+    return num(t.get("last_attempt")) + (LIMIT_BACKOFF * 2 ** (n - 1) if n > 0 else 0)
+
+
+def held_pending(t, now):
+    """May a RESUME tmux-mcp held for this target still be queued? Pure."""
+    return bool(t.get("held_at")) and now - num(t["held_at"]) < LIMIT_HELD_MAX
+
+
+def held_stuck(t, row, now):
+    """A RESUME that went out held (or with no reply) and has not landed:
+    LIMIT_HELD_LIFT s on, the window is neither running nor paused again.
+    It is lifted for Mack, never resent. Pure."""
+    return (t.get("last_result") in ("held", "unknown") and not t.get("lifted_at")
+            and bool(row) and row["agent_state"] != "running" and not row["agent_paused"]
+            and now - num(t.get("last_attempt")) >= LIMIT_HELD_LIFT)
+
+
+def limit_due_at(targets, auto, now, actionable=None, eligible=()):
+    """The earliest moment limit-tick could act on any target (epoch s), or
+    None. Not counted: a target waiting for Mack (lifted with auto-resume off
+    or past the cap), one with resets_at 0 and nothing lifted, and, when
+    `actionable` (a set of window ids) is given, one not actionable now (its
+    RESUME's turn running, Mack moved it on): only a re-mark changes that,
+    and limit-add recomputes then. A target in `eligible` (window ids whose
+    limit has lifted already, e.g. by a switch) waits only for its backoff,
+    never for its reset; one whose held RESUME may still be queued waits for
+    that to expire. Pure."""
+    best = None
+    for t in targets:
+        wid = t.get("window_id")
+        if actionable is not None and wid not in actionable:
+            continue
+        if t.get("lifted_at"):
+            if not auto or capped(t):
+                continue
+            at = backoff_until(t)
+        elif wid in eligible:
+            at = backoff_until(t)
+        elif int(num(t.get("resets_at"))) <= 0:
+            continue
+        else:
+            at = max(int(num(t["resets_at"])) + LIMIT_GRACE, backoff_until(t))
+        if held_pending(t, now):
+            at = max(at, num(t["held_at"]) + LIMIT_HELD_MAX)
+        best = at if best is None else min(best, at)
+    return best
+
+
+def limit_actionable(row, loose=False):
+    """May the engine message this window now? Only while it is paused, in
+    the paused set (@agent_paused) and still limited. loose (Mack's own
+    limit-resume): limited and not running is enough, so an agent left idle
+    by a RESUME that never landed can still be resumed by hand. Pure."""
+    if loose:
+        return bool(row and row["agent_limit"] and row["agent_state"] != "running")
+    return bool(row and row["agent_state"] == "paused" and row["agent_paused"] and row["agent_limit"])
+
+
+def limit_handover(row):
+    """Does a toggle's resume hand this saved target to limited.json instead
+    of sending it the pause RESUME? Only while it is limited and NOT running:
+    one running a [limit] turn is resumed like any running target, or its
+    Stop would clear the limit and leave it paused in neither set. Pure."""
+    return bool(row["agent_limit"]) and row["agent_state"] != "running"
+
+
+def pause_in_flight():
+    """Is a pause press delivering right now? Its paused.json is written only
+    after delivery, so progress.json says it: mode pause, not done, and its
+    toggle still alive (a killed one never holds this)."""
+    prog = read_progress()
+    return bool(prog and prog.get("mode") == "pause" and not prog.get("done")
+                and press_alive(prog.get("press")) and press_age(prog.get("press")) < PRESS_MAX_AGE)
+
+
+PRESS_MAX_AGE = 600   # s: no press delivers this long; an older "in flight" is a reused pid
+
+
+def press_age(press):
+    """Seconds since a press began (real time, not clock()): its id's
+    "<ms>-" stamp, else progress.json's write time; 0 when neither reads."""
+    try:
+        return time.time() - int(str(press).split("-", 1)[0]) / 1000.0
+    except ValueError:
+        try:
+            return time.time() - PROGRESS.stat().st_mtime
+        except OSError:
+            return 0.0
+
+
+def manual_pause_active(allow=None):
+    """A manual pause the limit engine must not cut across: a pause press in
+    flight, or a saved set in paused.json. allow: True ignores the saved set
+    (Mack's own limit-resume); a paused_at string ignores only that set (a
+    resume's leftover misses)."""
+    if pause_in_flight():
+        return True
+    if allow is True:
+        return False
+    st = load_state()
+    return bool(st and st["targets"]) and (allow is None or st.get("paused_at") != allow)
+
+
+def limit_autoresume():
+    """@agent_limit_autoresume (global; agent-pause.conf sets it on). On
+    unless it says off."""
+    try:
+        v = tmux("show-options", "-gqv", "@agent_limit_autoresume", check=False)
+    except (OSError, subprocess.SubprocessError):
+        v = ""
+    return v.strip().lower() not in ("off", "0", "false", "no")
+
+
+def set_global(opt, val):
+    """A global option, or unset with val None. Cosmetic: never raises."""
+    try:
+        if val is None:
+            tmux("set-option", "-gu", opt, check=False)
+        else:
+            tmux("set-option", "-g", opt, str(val), check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def set_window_opt(target, opt, val):
+    """A window option on the window of `target` (a pane id), or unset with
+    val None. Cosmetic: never raises."""
+    try:
+        if val is None:
+            tmux("set-option", "-wu", "-t", target, opt, check=False)
+        else:
+            tmux("set-option", "-w", "-t", target, opt, str(val), check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+@contextlib.contextmanager
+def limit_lock(wait):
+    """limit.lock, held for as long as limited.json is read, changed and
+    written. Waits up to `wait` s for a holder; yields whether it got it."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lf = open(LIMIT_LOCK, "a")
+    try:
+        deadline = time.time() + wait
+        while True:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    held = False
+                    break
+                time.sleep(0.1)
+        yield held
+    finally:
+        lf.close()
+
+
+def load_limited():
+    try:
+        d = json.loads(LIMITED.read_text())
+    except FileNotFoundError:
+        d = None
+    except (OSError, ValueError) as e:
+        log({"mode": "warn", "message": "unreadable %s: %s" % (LIMITED, e)})
+        d = None
+    if not (isinstance(d, dict) and isinstance(d.get("targets"), list)):
+        d = {"version": 1, "targets": []}
+    return d
+
+
+def save_limited(d):
+    write_json(LIMITED, dict(d, version=1))
+
+
+def limit_where(t, panes, recs, wins):
+    """Where a limited target is now -> (row, pane to message). The pane is
+    located like a paused one (locate: the session id, after a restore too);
+    when it cannot be (a record lagging), the saved window still answers for
+    the options, with no pane to message: (row, None). (None, None): gone."""
+    pane, _note = locate(t, panes, recs)
+    if pane:
+        row = panes[pane]
+        t.update(pane_id=pane, window_id=row["window_id"], location=row["location"])
+        return row, pane
+    rows = wins.get(t.get("window_id"))
+    return (rows[0] if rows else None), None
+
+
+def limit_target(w, panes, recs):
+    """A limited window `w` (window id, or one of its panes) as a target ->
+    (target, row) or (None, why)."""
+    wid = panes[w]["window_id"] if w in panes else w
+    rows = window_rows(panes).get(wid)
+    if not rows:
+        return None, "no window %s" % w
+    head = rows[0]
+    lim = parse_limit(head["agent_limit"])
+    if not lim:
+        return None, "%s is not rate-limited (no @agent_limit)" % w
+    pick, _how = pick_agent_pane(rows, recs)
+    t = agent_target(pick or head, head, recs)
+    t.update(resets_at=lim[0], type=lim[1], since=lim[2])
+    return t, (pick or head)
+
+
+def limit_renew(old, resets, typ, since, account):
+    """A stored target's limit from a (re-)mark. A re-mark updates resets_at,
+    type, since and account and keeps attempts (each RESUME counted itself
+    when it went out). A re-mark with a new since is a new limit: no longer
+    lifted, its RESUME (if any) spent. One more than LIMIT_EPISODE_GAP after
+    our last RESUME is not that RESUME's false lift but a new episode, so the
+    attempt count starts over: a cap reached hours ago must not cap it.
+    Any re-mark also drops held_at: a turn has run since, so the held copy
+    has landed (or is no reason to hold back a new episode's resume).
+    account: the account at mark time; None keeps the stored one.
+    -> renewed?"""
+    renewed = old.get("since") != since or old.get("resets_at") != resets
+    last = num(old.get("last_attempt")) or num(old.get("resumed_at"))
+    if renewed and last and since > last + LIMIT_EPISODE_GAP:
+        old["attempts"] = 0
+        for k in ("last_result", "last_attempt"):
+            old.pop(k, None)
+    old.update(resets_at=resets, type=typ, since=since)
+    if account:
+        old["account"] = account
+    if renewed:
+        for k in ("lifted_at", "resumed_at", "held_at"):
+            old.pop(k, None)
+    return renewed
+
+
+def limit_merge(d, t, account):
+    """Merge one marked target into limited.json's set, by window or session,
+    renewing its limit (limit_renew). Any other entry for the same window or
+    session is pruned: its episode has ended, this mark replaced it. An entry
+    whose window now runs ANOTHER session starts over as a new target.
+    -> (the stored target, renewed?)."""
+    sid = t["session_id"]
+    matches = [o for o in d["targets"]
+               if o.get("window_id") == t["window_id"] or (sid and o.get("session_id") == sid)]
+    old = next((o for o in matches if sid and o.get("session_id") == sid), matches[0] if matches else None)
+    gone = {id(o) for o in matches if o is not old}
+    if old is not None and sid and old.get("session_id") and old["session_id"] != sid:
+        gone.add(id(old))   # another agent in that window: a new target
+        old = None
+    d["targets"] = [o for o in d["targets"] if id(o) not in gone]
+    if old is None:
+        t = dict(t, account=account, attempts=0)
+        d["targets"].append(t)
+        return t, True
+    lim = (t.pop("resets_at"), t.pop("type"), t.pop("since"))
+    old.update(t)   # where it lives now
+    return old, limit_renew(old, *lim, account)
+
+
+def limit_sync(t, row, account):
+    """The live @agent_limit on its window wins over the stored one, so a
+    limit-add that never ran cannot leave a stale since (the cswap rule and
+    the flag stamp both read it). The stored account stays: it is the one
+    the limit was hit on, and `account` (now's) only fills a target that has
+    none. -> renewed?"""
+    lim = parse_limit(row["agent_limit"]) if row else None
+    if not lim or (lim[0], lim[1], lim[2]) == (t.get("resets_at"), t.get("type"), t.get("since")):
+        return False
+    renewed = limit_renew(t, lim[0], lim[1], lim[2], None if t.get("account") else account)
+    if renewed and row["agent_limit_lifted"]:
+        set_window_opt(row["pane_id"], "@agent_limit_lifted", None)
+    return renewed
+
+
+def limit_add_locked(w, panes, recs, d):
+    """limit-add with limit.lock held and limited.json loaded -> (message,
+    target or None). Saves the file and recomputes @agent_limit_due."""
+    t, row = limit_target(w, panes, recs)
+    if t is None:
+        return row, None
+    t, renewed = limit_merge(d, t, swap_facts()[1].get("account"))
+    if renewed and row["agent_limit_lifted"]:
+        set_window_opt(t["pane_id"], "@agent_limit_lifted", None)
+    save_limited(d)
+    limit_recompute(d, floor=clock())   # already due: the next tick, at once
+    return "limited: %s until %s (%s)" % (short(t["label"]), fmt_local(t["resets_at"]), t["type"]), t
+
+
+def limit_add(w):
+    """`limit-add W`: the indicator just marked W. Waits for a tick in flight
+    (it is a background job; a lost add would leave the agent unresumed)."""
+    with limit_lock(180) as held:
+        if not held:
+            msg = "limit-add %s: limit.lock busy for 180 s, not added" % w
+        else:
+            msg, _t = limit_add_locked(w, list_panes(), agent_records(), load_limited())
+    log({"mode": "limit-add", "window": w, "message": msg})
+    return msg
+
+
+def limit_recompute(d, floor=None):
+    """@agent_limit_due from limited.json as it stands: the earliest moment
+    anything could be done, unset when nothing can. A moment that has passed
+    (something due could not be acted on) becomes `floor` (default: now +
+    LIMIT_RETRY), so the watcher does not respawn a tick every 20 s. Reads
+    tmux afresh: a delivery just changed the windows it judges."""
+    try:
+        panes, recs = list_panes(), agent_records()
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return None   # leave the option as it is
+    wins = window_rows(panes)
+    now = clock()
+    seq_mtime, usage = swap_facts()
+    # extra: moments limit_due_at does not know of (they need the window rows).
+    actionable, eligible, extra = set(), set(), []
+    for t in d["targets"]:
+        row, _pane = limit_where(dict(t), panes, recs, wins)   # a copy: judged, not moved
+        if limit_actionable(row):
+            actionable.add(t.get("window_id"))
+            if limit_eligible(t, now, seq_mtime, usage):
+                eligible.add(t.get("window_id"))
+            elif switch_settling(t, now, seq_mtime, usage):
+                extra.append(now + LIMIT_SWITCH_POLL)   # usage.json has not caught up yet
+        elif (t.get("last_result") in ("held", "unknown") and not t.get("lifted_at") and row
+              and row["agent_state"] != "running" and not row["agent_paused"]):
+            extra.append(num(t.get("last_attempt")) + LIMIT_HELD_LIFT)   # held_stuck's moment
+    at = limit_due_at(d["targets"], limit_autoresume(), now, actionable, eligible)
+    if extra:
+        at = min(extra) if at is None else min(at, min(extra))
+    if at is not None and at <= now:
+        at = floor if floor is not None else now + LIMIT_RETRY
+    set_global("@agent_limit_due", None if at is None else int(at))
+    return at
+
+
+LIMIT_REACHED = ("sent", "held", "unknown")   # as REACHED: a held RESUME will be delivered
+
+
+def limit_send(mcp, t, pane):
+    """LIMIT_RESUME_MSG to one limited target, recorded in t. @agent_paused
+    goes first (as finish_resume does: the v1.1 hold rule then lets the paste
+    make it running, @agent_limit kept until the turn's outcome). Never
+    urgent: a half-typed draft must hold it.
+      sent / unknown: reached.
+      held: reached too, and the flag stays off. tmux-mcp delivers it once the
+        box clears; it is never sent again while a copy may be queued
+        (held_pending), and one that has not landed LIMIT_HELD_LIFT s on is
+        lifted for Mack (held_stuck).
+      refused / failed: the flag goes back on, stamped with the limit's own
+        since (the indicator clears only that value), retried after the
+        backoff.
+    -> (status, detail)."""
+    mark_paused([pane], False)
+    res = deliver(mcp, [(0, pane)], LIMIT_RESUME_MSG).get(0, ("unknown", "no result"))
+    at = clock()
+    t["attempts"] = int(num(t.get("attempts"))) + 1
+    t["last_attempt"] = at
+    t["last_result"] = res[0]
+    if res[0] in LIMIT_REACHED:
+        t["resumed_at"] = at
+        if res[0] == "held":
+            t["held_at"] = at
+        elif res[0] == "sent":
+            t.pop("held_at", None)   # pasted: the box was clear, nothing older waits in it
+        t.pop("lifted_at", None)
+        set_window_opt(pane, "@agent_limit_lifted", None)
+    else:
+        mark_paused([pane], True, repause=True, stamp=t.get("since"))
+    log({"mode": "limit-send", "window": t.get("window_id"), "label": t.get("label"),
+         "attempt": t["attempts"], "result": res[0], "detail": res[1]})
+    return res
+
+
+def limit_lift(t, pane, notify=True, text=None):
+    """Its limit has lifted but it waits for Mack (auto-resume off, past the
+    cap, or a RESUME that never landed): @agent_limit_lifted on the window,
+    lifted_at in the file, and one notify.sh per lift (lifted_at keeps it
+    from repeating). text: the toast, when the usual one would mislead."""
+    if t.get("lifted_at"):
+        return
+    at = clock()
+    t["lifted_at"] = at
+    set_window_opt(pane, "@agent_limit_lifted", int(at))
+    if notify:
+        display("", text or "limit lifted · resume? %s" % short(t.get("label", "?")))
+
+
+def stuck_text(t):
+    """held_stuck's toast: say why, so Mack clears the box instead of
+    clicking resume (that would queue a second copy behind the first)."""
+    label = short(t.get("label", "?"))
+    if t.get("last_result") == "held":
+        return "limit lifted · a resume is waiting behind a draft in %s's box" % label
+    return "limit lifted · %s's resume got no reply: resume?" % label
+
+
+def limit_recheck(pane, allow=None, loose=False):
+    """Right before each delivery: "ok", "skip" (no longer actionable), or
+    "stop" (a manual pause began, or a pause press is delivering: the rest
+    waits for its resume). allow: see manual_pause_active; loose: see
+    limit_actionable."""
+    if manual_pause_active(allow):
+        return "stop"
+    try:
+        row = list_panes().get(pane)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return "skip"
+    return "ok" if limit_actionable(row, loose) else "skip"
+
+
+def limit_deliver(d, sends, allow=None, loose=False, stagger_first=False):
+    """sends [(target, pane)], LIMIT_RESUME_MSG to each, >= LIMIT_STAGGER s
+    apart, each re-checked first; limited.json saved after every attempt.
+    -> (reached [targets], failed [targets], stopped?, error or "")."""
+    sent, failed = [], []
+    if not sends:
+        return sent, failed, False, ""
+    try:
+        mcp = open_mcp()
+    except McpError as e:
+        return sent, failed, False, str(e)   # nothing went out: no attempt counted
+    try:
+        for i, (t, pane) in enumerate(sends):
+            if i or stagger_first:
+                time.sleep(LIMIT_STAGGER)
+            verdict = limit_recheck(pane, allow, loose)
+            if verdict == "stop":
+                return sent, failed, True, ""
+            if verdict == "skip":
+                continue
+            res = limit_send(mcp, t, pane)
+            (sent if res[0] in LIMIT_REACHED else failed).append(t)
+            save_limited(d)
+    finally:
+        mcp.close()
+    return sent, failed, False, ""
+
+
+def limit_tick():
+    """`limit-tick` (the watcher; flock-guarded here as well). -> its line."""
+    with limit_lock(0) as held:
+        if not held:
+            msg = "limit-tick: another limit run holds limit.lock"
+        else:
+            msg = _limit_tick()
+    log({"mode": "limit-tick", "message": msg})
+    return msg
+
+
+def _limit_tick():
+    d = load_limited()
+    if not d["targets"]:
+        set_global("@agent_limit_due", None)
+        return "nothing rate-limited"
+    now = clock()
+    panes, recs = list_panes(), agent_records()
+    wins = window_rows(panes)
+    # Drop what has moved on: a window gone, or @agent_limit cleared (a Stop
+    # after its RESUME or the native auto-continue, or Mack's own prompt).
+    keep, dropped, where = [], [], {}
+    seq_mtime, usage = swap_facts()
+    for t in d["targets"]:
+        row, pane = limit_where(t, panes, recs, wins)
+        if row is None or not row["agent_limit"]:
+            dropped.append(t)
+        else:
+            limit_sync(t, row, usage.get("account"))   # the live mark wins
+            keep.append(t)
+            where[id(t)] = (row, pane)
+    d["targets"] = keep
+    note = " · dropped %d: %s" % (len(dropped), names(dropped)) if dropped else ""
+    save_limited(d)
+
+    def done(msg, floor=None):
+        limit_recompute(d, floor)
+        post_state_change()
+        return msg + note
+
+    if not keep:
+        return done("nothing rate-limited")
+    if manual_pause_active():
+        # Deferred: the toggle's resume takes the lifted ones along.
+        return done("deferred: a manual pause is active, or a pause press is sending")
+    wake = last_wake()
+    if now - wake < WAKE_GRACE:
+        return done("waking: %ds since the last wake" % (now - wake), wake + WAKE_GRACE)
+    due, offline, hosts, lifted = [], [], {}, []
+    for t in keep:
+        row, pane = where[id(t)]
+        if held_stuck(t, row, now):
+            # Its held (or unanswered) RESUME never landed: Mack, not a resend.
+            limit_lift(t, pane or row["pane_id"], text=stuck_text(t))
+            lifted.append(t)
+            continue
+        if pane is None or not limit_actionable(row) or not limit_eligible(t, now, seq_mtime, usage):
+            continue
+        h = limit_host(t)
+        if h not in hosts:
+            hosts[h] = resolves(h)
+        (due if hosts[h] else offline).append((t, pane))
+    auto = limit_autoresume()
+    sends = []
+    for t, pane in due:
+        if not auto or capped(t):
+            if not t.get("lifted_at"):
+                limit_lift(t, pane)
+                lifted.append(t)
+        elif now >= backoff_until(t) and not held_pending(t, now):
+            sends.append((t, pane))
+    if lifted:
+        save_limited(d)
+    sent, failed, stopped, err = limit_deliver(d, sends)
+    msg = "limit-tick: %d rate-limited" % len(keep)
+    if sent:
+        msg += " · resumed %d: %s" % (len(sent), names(sent))
+    if failed:
+        msg += " · not taken %d (retry): %s" % (len(failed), names(failed))
+    if lifted:
+        msg += " · lifted %d (waiting for Mack): %s" % (len(lifted), names(lifted))
+    if offline:
+        msg += " · offline: %s unresolved" % ", ".join(sorted(h for h, ok in hosts.items() if not ok))
+    if stopped:
+        msg += " · stopped: a manual pause began"
+    if err:
+        msg += " · tmux-mcp: %s" % err
+    return done(msg)
+
+
+def limit_auto(arg):
+    """`limit-auto on|off|toggle` -> its line. The live global only;
+    agent-pause.conf holds the default. Turned on with lifted targets, the
+    watcher's next tick resumes them (@agent_limit_due = now)."""
+    on = {"on": True, "off": False, "toggle": not limit_autoresume()}[arg]
+    set_global("@agent_limit_autoresume", "on" if on else "off")
+    if on and any(t.get("lifted_at") and not capped(t) for t in load_limited()["targets"]):
+        set_global("@agent_limit_due", int(clock()))
+    post_state_change()
+    msg = "rate-limit auto-resume %s" % ("on" if on else "off")
+    log({"mode": "limit-auto", "message": msg})
+    return msg
+
+
+def limit_resume(w, force=False):
+    """`limit-resume [--force] W`: Mack's click on a limited card. Refused
+    while the limit holds ("rate-limited until <t>") unless it is eligible
+    (either rule, or lifted), resets_at is 0 (a model limit: only Mack can
+    judge it) or --force. No wake or DNS grace, no manual-pause deferral:
+    Mack asked. -> (ok, message)."""
+    with limit_lock(10) as held:
+        if not held:
+            return False, "rate limit: busy, another limit run is sending; try again"
+        panes, recs = list_panes(), agent_records()
+        d = load_limited()
+        t = next((x for x in d["targets"] if w in (x.get("window_id"), x.get("pane_id"))), None)
+        if t is None:
+            msg, t = limit_add_locked(w, panes, recs, d)   # marked, but its limit-add never ran
+            if t is None:
+                return False, msg
+        row, pane = limit_where(t, panes, recs, window_rows(panes))
+        if row is None or not row["agent_limit"]:
+            return False, "%s is not rate-limited any more" % short(t.get("label", w))
+        if row["agent_state"] == "running":
+            return False, "%s is already running" % short(t.get("label", w))
+        if pane is None:
+            return False, "%s: no agent pane to message" % short(t.get("label", w))
+        seq_mtime, usage = swap_facts()
+        limit_sync(t, row, usage.get("account"))
+        if held_pending(t, clock()) and not force:
+            # tmux-mcp queues, undeduplicated: a click would add a second copy.
+            return False, "a resume is already waiting behind the draft in %s's box" % short(
+                t.get("label", w))
+        resets = int(num(t.get("resets_at")))
+        if not (force or resets <= 0 or limit_eligible(t, clock(), seq_mtime, usage)):
+            if clock() >= resets:   # just reset: Claude's own auto-continue goes first
+                return False, "limit just reset · auto-continue first, try after %s" % fmt_local(
+                    resets + LIMIT_GRACE)
+            return False, "rate-limited until %s" % fmt_local(resets)
+        # Loose: limited and not running is enough (an agent a lost RESUME
+        # left idle, flag off). Only a pause press in flight stops it.
+        sent, failed, _stopped, err = limit_deliver(d, [(t, pane)], allow=True, loose=True)
+        save_limited(d)
+        limit_recompute(d)
+        post_state_change()
+    if err:
+        return False, "resume failed: %s" % err
+    if sent:
+        return True, "▶ resumed %s (rate limit)" % short(t.get("label", w))
+    if failed:
+        return False, "%s did not take it (%s): still paused" % (short(t.get("label", w)),
+                                                                t.get("last_result", "failed"))
+    return False, "%s is no longer paused by the limit" % short(t.get("label", w))
+
+
+def limit_after_press():
+    """A resume press's limit half (LIMIT_LATER), run once the pause lock is
+    released (toggle, locked_resume): a pause press meanwhile is not turned
+    away as busy. -> a " · ..." tail for the toast."""
+    jobs, LIMIT_LATER[:] = list(LIMIT_LATER), []
+    tail = "".join(limit_after_resume(job) for job in jobs)
+    if tail:
+        log({"mode": "limit-after-resume", "message": tail.lstrip(" ·")})
+    return tail
+
+
+def limit_after_resume(job):
+    """After a toggle's RESUMEs (job from finish_resume): first the saved
+    targets it handed over are merged into limited.json (the indicator's own
+    limit-add normally got there first; the merge is idempotent). Then the
+    limited agents whose limit has lifted (lifted, or eligible by either
+    rule) get LIMIT_RESUME_MSG, staggered after the RESUMEs (auto-resume on,
+    not past the cap, no held copy queued), or are marked lifted with no
+    message (off). No wake/DNS grace: Mack pressed resume. paused.json may
+    still hold this resume's misses, which do not stop it; a new pause (in
+    flight or saved) does. -> a " · ..." tail. Never raises: the press has
+    already written its state."""
+    try:
+        if not job["handed"] and not load_limited()["targets"]:
+            return ""
+        with limit_lock(30) as held:
+            if not held:   # a tick is sending: let the watcher's next one look
+                set_global("@agent_limit_due", int(clock()))
+                log({"mode": "warn", "message": "limit after resume: limit.lock busy"})
+                return ""
+            d = load_limited()
+            panes, recs = list_panes(), agent_records()
+            for p in job["handed"]:
+                if p in panes:
+                    limit_add_locked(p, panes, recs, d)
+            wins = window_rows(panes)
+            now, auto = clock(), limit_autoresume()
+            seq_mtime, usage = swap_facts()
+            sends, lifted = [], []
+            for t in d["targets"]:
+                row, pane = limit_where(t, panes, recs, wins)
+                if row is not None:
+                    limit_sync(t, row, usage.get("account"))
+                if pane is None or not limit_actionable(row) or not limit_eligible(t, now, seq_mtime, usage):
+                    continue
+                if auto and not capped(t):
+                    if not held_pending(t, now):
+                        sends.append((t, pane))
+                elif not t.get("lifted_at"):
+                    limit_lift(t, pane, notify=False)   # the toast says it
+                    lifted.append(t)
+            save_limited(d)
+            sent, failed, _stopped, err = limit_deliver(d, sends, allow=job["paused_at"],
+                                                        stagger_first=job["resumed_any"])
+            limit_recompute(d)
+        tail = ""
+        if sent:
+            tail += " · limit lifted, resumed %d: %s" % (len(sent), names(sent))
+        if failed or err:
+            tail += " · limit-resume not taken %d%s" % (len(failed), ": " + err if err else "")
+        if lifted:
+            tail += " · limit lifted %d (auto-resume off): %s" % (len(lifted), names(lifted))
+        return tail
+    except Exception as e:
+        log({"mode": "warn", "message": "limit after resume: %s: %s" % (type(e).__name__, e)})
+        return ""
+
+
+def limited_lines(eligibility=False):
+    """status / dry-run: the limited set, one line per target."""
+    targets = load_limited()["targets"]
+    if not targets:
+        return []
+    out = ["rate-limited: %d agent%s (auto-resume %s)" % (
+        len(targets), "" if len(targets) == 1 else "s", "on" if limit_autoresume() else "off")]
+    seq_mtime, usage = swap_facts()
+    for t in targets:
+        resets = int(num(t.get("resets_at")))
+        when = ("lifted" if t.get("lifted_at") else "resets %s" % fmt_local(resets) if resets
+                else "resets unknown (only Mack)")
+        why = limit_eligible(t, clock(), seq_mtime, usage) if eligibility else ""
+        out.append("  %-6s %-6s %-18s %-24s attempts %d  %s%s" % (
+            t.get("window_id", ""), t.get("kind", ""), t.get("type", ""), when,
+            int(num(t.get("attempts"))), t.get("label", ""),
+            "  [eligible: %s]" % why if why else ""))
+    return out
 
 
 # ------------------------------------------------------------- feedback
@@ -1359,6 +2355,7 @@ PAUSING, HELD, STOPPED = "pausing…", "held (draft in box)", "stopped ✓"
 RESUMED, WORKING, UNCONFIRMED = "resumed ✓", "working", "sent (no reply)"
 FAILED, GONE, NOT_SENT = "failed", "gone", "not messaged (no agent pane)"
 SENDING = "sending…"                          # delivery in flight (progress.json)
+LIMITED_ROW = "rate-limited (left paused)"    # handed to limited.json, no RESUME (RATE LIMITS)
 SENDING_FOOT = "sending… Enter works once every agent has it   ·   Esc  close"
 SETTLED = {STOPPED, FAILED, GONE, NOT_SENT}   # a pause row that needs nothing more
 STILL_AFTER = 180                             # s before "still working: …"
@@ -1412,6 +2409,8 @@ def pause_status(t, row):
 def resume_status(t, row):
     if t.get("result") in ("gone", "failed"):
         return GONE if t["result"] == "gone" else FAILED
+    if t.get("result") == "limited":
+        return LIMITED_ROW
     if row is not None and row["agent_state"] == "running":
         return WORKING
     return {"held": HELD, "unknown": UNCONFIRMED}.get(t.get("result"), RESUMED)
@@ -1593,8 +2592,9 @@ def resume_note(last):
 
 
 def resume_reached(last):
-    """Did that resume reach anyone? Pure."""
-    return any(t.get("result") in REACHED for t in last.get("resume") or [])
+    """Did that resume reach anyone? A target handed to limited.json counts:
+    it left the saved set, nothing failed. Pure."""
+    return any(t.get("result") in REACHED + ("limited",) for t in last.get("resume") or [])
 
 
 def voided(last, base):
@@ -1630,9 +2630,9 @@ def locked_resume(wait=3.0):
         if not st or not st["targets"]:
             return True, "already resumed"
         msg, popup = do_resume("popup", st)
-        return popup is not None, msg
     finally:
         lf.close()
+    return popup is not None, msg + limit_after_press()   # outside the lock (RATE LIMITS)
 
 
 def progress_items(prog, panes):
@@ -1853,13 +2853,15 @@ def status():
     st = load_state()
     if not st or not st["targets"]:
         print("not paused")
-        return
-    print("paused since %s: %d agent%s" % (st.get("paused_at"), len(st["targets"]),
-                                          "" if len(st["targets"]) == 1 else "s"))
-    for t in st["targets"]:
-        print(fmt_target(t, "  [%s]" % t.get("result", "")))
-    for t in st.get("failed") or []:
-        print(fmt_target(t, "  [FAILED at pause: %s]" % t.get("detail", "")))
+    else:
+        print("paused since %s: %d agent%s" % (st.get("paused_at"), len(st["targets"]),
+                                              "" if len(st["targets"]) == 1 else "s"))
+        for t in st["targets"]:
+            print(fmt_target(t, "  [%s]" % t.get("result", "")))
+        for t in st.get("failed") or []:
+            print(fmt_target(t, "  [FAILED at pause: %s]" % t.get("detail", "")))
+    for line in limited_lines():
+        print(line)
 
 
 def dry_run():
@@ -1872,7 +2874,11 @@ def dry_run():
         print("mode: RESUME (a saved set from %s)" % st.get("paused_at"))
         for t in st["targets"]:
             pane, note = locate(t, panes, recs)
+            if pane and limit_handover(panes[pane]):
+                note = "rate-limited: no RESUME, handed to limited.json"
             print(fmt_target(t, "  -> %s%s" % (pane or "GONE", " (%s)" % note if note else "")))
+        for line in limited_lines(eligibility=True):
+            print(line)
         print("nothing sent (dry run)")
         return
     targets, idle, unidentified = scan(panes, recs)
@@ -1887,6 +2893,8 @@ def dry_run():
     print("skipped, not working (%d):" % len(idle))
     for u in idle:
         print("  %-6s %-22s %-6s %-16s %s" % (u["window_id"], u["location"], "", u["state"], u["label"]))
+    for line in limited_lines(eligibility=True):
+        print(line)
     print("nothing sent (dry run)")
 
 
@@ -1917,6 +2925,37 @@ def main(argv):
         except Exception:
             pass
         return 0
+    # The rate-limit commands run from hooks, the watcher and sidebar clicks
+    # (run-shell -b), so like the key they never print and never exit
+    # non-zero: the log has every outcome, and a click's refusal is a toast.
+    if cmd in ("limit-add", "limit-tick", "limit-auto", "limit-resume"):
+        rest = argv[2:]
+        try:
+            if cmd == "limit-add" and len(rest) == 1:
+                limit_add(rest[0])
+            elif cmd == "limit-tick" and not rest:
+                limit_tick()
+            elif cmd == "limit-auto" and rest in (["on"], ["off"], ["toggle"]):
+                display("", limit_auto(rest[0]))
+            elif cmd == "limit-resume" and [a for a in rest if a != "--force"]:
+                w = [a for a in rest if a != "--force"][0]
+                ok, msg = limit_resume(w, force="--force" in rest)
+                log({"mode": "limit-resume", "window": w, "force": "--force" in rest, "ok": ok,
+                     "message": msg})
+                display("", msg, "info" if ok else "warn")
+            else:
+                sys.stderr.write("usage: agent-pause.py limit-add <window> | limit-tick"
+                                 " | limit-auto on|off|toggle | limit-resume [--force] <window>\n")
+                return 2
+        except Exception as e:
+            msg = "rate limit error (%s): %s: %s" % (cmd, type(e).__name__, e)
+            log({"mode": "error", "message": msg})
+            if cmd in ("limit-auto", "limit-resume"):   # Mack's own action: say so
+                try:
+                    display("", msg, "error")
+                except Exception:
+                    pass
+        return 0
     if cmd == "status":
         status()
         return 0
@@ -1938,7 +2977,9 @@ def main(argv):
         return 0
     sys.stderr.write("usage: agent-pause.py toggle|resume <client_name> | dismiss|void [client_name]"
                      " | status | dry-run"
-                     " | watch pause|resume [--demo] [--press <id>]\n")
+                     " | watch pause|resume [--demo] [--press <id>]"
+                     " | limit-add <window> | limit-tick | limit-auto on|off|toggle"
+                     " | limit-resume [--force] <window>\n")
     return 2
 
 

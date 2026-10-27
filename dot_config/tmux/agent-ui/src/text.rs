@@ -571,6 +571,68 @@ extern "C" {
     fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
 }
 
+/// An epoch broken down in local time, as much as a reset time needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Local {
+    /// Days since the epoch in LOCAL time (the UTC offset applied): two
+    /// moments on the same local day have the same number.
+    pub day: i64,
+    /// 0 = Sunday.
+    pub wday: u8,
+    /// 0 = January.
+    pub mon: u8,
+    pub mday: u8,
+    pub hour: u8,
+    pub min: u8,
+}
+
+/// `epoch` in local time (libc `localtime_r`, so `TZ` applies); None if the
+/// C library refused it.
+pub fn local(epoch: i64) -> Option<Local> {
+    let mut tm = Tm {
+        tm_sec: 0, tm_min: 0, tm_hour: 0, tm_mday: 0, tm_mon: 0, tm_year: 0, tm_wday: 0, tm_yday: 0,
+        tm_isdst: 0, tm_gmtoff: 0, tm_zone: std::ptr::null(),
+    };
+    // SAFETY: localtime_r writes only into `tm`; time_t is i64 on 64-bit macOS/Linux.
+    let ok = unsafe { !localtime_r(&epoch, &mut tm).is_null() };
+    ok.then(|| Local {
+        day: (epoch + tm.tm_gmtoff as i64).div_euclid(86_400),
+        wday: tm.tm_wday as u8,
+        mon: tm.tm_mon as u8,
+        mday: tm.tm_mday as u8,
+        hour: tm.tm_hour as u8,
+        min: tm.tm_min as u8,
+    })
+}
+
+const WDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// A moment as a person says it, from `now`'s day ([`Local`] both): `1:00
+/// AM` today, `Tue 1:00 AM` within the next six days, `Nov 2 1:00 AM`
+/// further (or in the past: a stale reset still names its day).
+pub fn when_words(at: Local, now: Local) -> String {
+    let h12 = match at.hour % 12 {
+        0 => 12,
+        h => h,
+    };
+    let clock = format!("{h12}:{:02} {}", at.min, if at.hour < 12 { "AM" } else { "PM" });
+    match at.day - now.day {
+        0 => clock,
+        1..=6 => format!("{} {clock}", WDAY[usize::from(at.wday % 7)]),
+        _ => format!("{} {} {clock}", MON[usize::from(at.mon % 12)], at.mday),
+    }
+}
+
+/// [`when_words`] for two epochs in this process's local time ("" if the
+/// C library refused either).
+pub fn when(at: i64, now: f64) -> String {
+    match (local(at), local(now.floor() as i64)) {
+        (Some(a), Some(n)) => when_words(a, n),
+        _ => String::new(),
+    }
+}
+
 /// `HH:MM` in local time for an epoch (the event log's time column).
 pub fn clock_hm(epoch: i64) -> String {
     let mut tm = Tm {
@@ -792,5 +854,27 @@ mod tests {
         let s = clock_hm(1_700_000_000);
         assert_eq!(s.len(), 5);
         assert_eq!(&s[2..3], ":");
+    }
+
+    /// A reset time as the cards and the banner say it: 12-hour clock, the
+    /// weekday when not today (up to six days ahead), the date further.
+    #[test]
+    fn when_words_say_the_day() {
+        let at = |day: i64, wday: u8, hour: u8, min: u8| Local { day, wday, mon: 9, mday: 27, hour, min };
+        let now = at(100, 1, 15, 0); // Mon
+        assert_eq!(when_words(at(100, 1, 1, 0), now), "1:00 AM");
+        assert_eq!(when_words(at(100, 1, 0, 5), now), "12:05 AM");
+        assert_eq!(when_words(at(100, 1, 12, 0), now), "12:00 PM");
+        assert_eq!(when_words(at(100, 1, 23, 59), now), "11:59 PM");
+        assert_eq!(when_words(at(101, 2, 1, 0), now), "Tue 1:00 AM");
+        assert_eq!(when_words(at(106, 0, 13, 30), now), "Sun 1:30 PM");
+        assert_eq!(when_words(at(107, 1, 1, 0), now), "Oct 27 1:00 AM"); // a week out: the date
+        assert_eq!(when_words(at(99, 0, 1, 0), now), "Oct 27 1:00 AM"); // past: the date too
+        // The real clock: today's moment has no weekday, tomorrow's has one.
+        let t = 1_800_000_000_i64;
+        let n = local(t).unwrap();
+        assert_eq!(n.day, local(t + 1).unwrap().day);
+        assert!(!WDAY.iter().any(|d| when(t, t as f64).starts_with(d)) && when(t, t as f64).ends_with('M'));
+        assert!(WDAY.iter().any(|d| when(t + 86_400, t as f64).starts_with(d)));
     }
 }

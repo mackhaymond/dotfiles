@@ -25,6 +25,9 @@
 # back its saved prior state instead (AGENT-ORIGINATED TURNS); while the pause
 # key's @agent_paused is set, every such ending writes `paused` (and nothing
 # here ever moves a `paused` window: docs/agent-pause.md, "The paused state").
+# A codex turn that ended on a usage limit is marked rate-limited (paused +
+# @agent_limit), and agent-pause.py's limit-tick is kicked when a limit may
+# have lifted (RATE-LIMITED AGENTS, below).
 #
 # It also makes tabs aware of background Claude WORKFLOWS. A backgrounded
 # Workflow keeps running after the main turn's Stop fires (so the tab would
@@ -411,7 +414,9 @@ opencode_tui_args() {
 }
 
 # Codex's answer to the same question, from its rollout stream, into the
-# caller's cx_mark = "started" | "complete" | "aborted" | "" (unknown) and
+# caller's cx_mark = "started" | "complete" | "aborted" | "limit" (a
+# task_complete whose error is usage_limit_exceeded: RATE-LIMITED AGENTS) |
+# "" (unknown) and
 # cx_ts = that event's own "timestamp", UTC to the second
 # ("2026-10-04T21:53:53"; "" for a start, or a line whose head the tail cut).
 # Codex has no ~/.claude/sessions equivalent and no pid→thread mapping we could
@@ -461,7 +466,8 @@ codex_tail() {
             return (t ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/) ? t : ""
         }
         index($0, "\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"")  { m = "started";  t = "" }
-        index($0, "\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"") { m = "complete"; t = ts() }
+        index($0, "\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"") {
+            m = (index($0, "\"codex_error_info\":\"usage_limit_exceeded\"") ? "limit" : "complete"); t = ts() }
         index($0, "\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\"")  { m = "aborted";  t = ts() }
         END { printf "%s %s", m, t }
     ')
@@ -510,6 +516,271 @@ cx_after() {
     case "$e" in ''|*[!0-9]*) return 1 ;; esac
     TZ=UTC0 printf -v iso '%(%Y-%m-%dT%H:%M:%S)T' "$e" 2>/dev/null || return 1
     [[ "$cx_ts" > "$iso" ]]
+}
+
+# ------------------------------------------------------ rate-limited agents
+#
+# RATE-LIMITED AGENTS (agent-tab-indicator.sh and the doc, same heading). The
+# indicator marks a Claude usage limit from its StopFailure; this daemon does
+# two things for the feature:
+#   1. CODEX. Codex has no failure hook: a usage limit ends the turn with a
+#      rollout event_msg task_complete whose error.codex_error_info is
+#      usage_limit_exceeded (codex_tail's "limit" mark). Spotted where the
+#      CODEX TURN ENDS reconcile looks (a running/needs-input window, the
+#      event after the state's stamp), and also on a done/idle window whose
+#      stamp is under LIMIT_FRESH_STAMP s old and the event not older than it
+#      (cx_recent: codex may still run its Stop hook for the failed turn,
+#      which paints done in the same second; a settled window reads nothing),
+#      it is marked exactly as the indicator marks Claude (codex_limit_mark):
+#      type codex, the reset parsed from the message's "try again at 6:32 PM."
+#      (today, or tomorrow once past) or "try again at Oct 22nd, 2026 2:55
+#      AM." (local time), else the last token_count's rate_limits reset (the
+#      exhausted window's, else the later), else 0. Then agent-pause.py
+#      limit-add W in the background.
+#   2. THE RESUME TRIGGER. agent-pause.py keeps the global @agent_limit_due
+#      (the earliest moment a limited agent could resume; unset when none
+#      can), which rides in the tick's one list-panes read for free. While it
+#      is set, `agent-pause.py limit-tick` is spawned in the background, at
+#      most once per LIMIT_TICK_EVERY s, when: due <= now; or cswap's
+#      sequence.json is newer than our mark (an account switch can lift a
+#      limit early; builtin -nt, the mark is rewritten when it fires); or the
+#      tick gap says the machine just slept (> LIMIT_WAKE_GAP s between
+#      ticks; remembered until it fires). limit-tick takes its own lock.
+# AGENT_LIMIT_PAUSE_PY / AGENT_LIMIT_SEQ_FILE override the paths, and
+# AGENT_LIMIT_WAKE_GAP the wake gap, AGENT_LIMIT_TICK_EVERY the rate limit
+# (tests).
+LIMIT_PY="${AGENT_LIMIT_PAUSE_PY:-$HOME/.config/tmux/scripts/agent-pause.py}"
+LIMIT_SEQ="${AGENT_LIMIT_SEQ_FILE:-$HOME/.claude-swap-backup/sequence.json}"
+LIMIT_SEQ_MARK="${TMPDIR:-/tmp}"
+LIMIT_SEQ_MARK="${LIMIT_SEQ_MARK%/}/agent-limit-seq.${UID:-$(id -u)}.mark"
+LIMIT_TICK_EVERY="${AGENT_LIMIT_TICK_EVERY:-20}"   # (override: tests)
+case "$LIMIT_TICK_EVERY" in ''|*[!0-9]*) LIMIT_TICK_EVERY=20 ;; esac
+LIMIT_FRESH_STAMP=30   # a done/idle codex stamp younger than this is looked at (cx_recent)
+LIMIT_WAKE_GAP="${AGENT_LIMIT_WAKE_GAP:-30}"   # (override: tests)
+case "$LIMIT_WAKE_GAP" in ''|*[!0-9]*) LIMIT_WAKE_GAP=30 ;; esac
+lim_last_spawn=0     # epoch of the last limit-tick spawn
+lim_prev_tick=0      # the previous tick's tick_now (wake detection)
+lim_wake=0           # a wake gap seen and not yet acted on
+lim_due=""           # this tick's @agent_limit_due (the global, read with the rows)
+
+# >>> LIMIT CORE >>> (byte-identical in agent-tab-watcher.sh and
+# agent-tab-indicator.sh; tests/test_agent_limit.py fails if they drift)
+# limit_text R TYPE NOW: into LIM_TXT the sidebar line for a limit, e.g.
+# "weekly limit · resets Tue 1:00 AM". The time follows the ONE date rule
+# every surface shares (agent-pause.py fmt_local, agent-ui text::when), by
+# calendar days in local time: the same day "5:31 PM", one to six days ahead
+# "Tue 5:31 PM", anything else (a week or more on, or past) "Nov 2 5:31 PM".
+# R 0 (unknown) is the label alone. Fixed words, digits, ':' and '·' only:
+# safe in a tmux command string. Builtin clock, no fork; C locale names.
+limit_text() {
+    local r="$1" ty="$2" now="$3" lab when d0 d1 dk h m s k noon
+    local LC_ALL=C
+    case "$ty" in
+        five_hour) lab="session limit" ;;
+        seven_day) lab="weekly limit" ;;
+        seven_day_opus) lab="Opus weekly limit" ;;
+        seven_day_sonnet) lab="Sonnet weekly limit" ;;
+        overage) lab="overage limit" ;;
+        codex) lab="Codex limit" ;;
+        *) lab="usage limit" ;;
+    esac
+    if ! [[ $r =~ ^[1-9][0-9]{0,11}$ ]] || ! [[ $now =~ ^[0-9]{1,12}$ ]]; then
+        LIM_TXT="$lab"
+        return 0
+    fi
+    printf -v d0 '%(%Y%m%d)T' "$now"
+    printf -v d1 '%(%Y%m%d)T' "$r"
+    printf -v when '%(%l:%M %p)T' "$r"
+    when="${when# }"
+    if [ "$d0" = "$d1" ]; then
+        LIM_TXT="$lab · resets $when"
+        return 0
+    fi
+    # One to six calendar days ahead: step a day at a time from NOW's local
+    # noon (a DST hour can never carry noon across a date).
+    printf -v h '%(%H)T' "$now"; printf -v m '%(%M)T' "$now"; printf -v s '%(%S)T' "$now"
+    noon=$((now - 10#$h * 3600 - 10#$m * 60 - 10#$s + 43200))
+    for k in 1 2 3 4 5 6; do
+        printf -v dk '%(%Y%m%d)T' "$((noon + k * 86400))"
+        if [ "$dk" = "$d1" ]; then
+            printf -v dk '%(%a)T' "$r"
+            LIM_TXT="$lab · resets $dk $when"
+            return 0
+        fi
+    done
+    printf -v dk '%(%b %e)T' "$r"
+    while [[ $dk == *"  "* ]]; do dk="${dk//  / }"; done
+    LIM_TXT="$lab · resets $dk $when"
+}
+# codex_reset_epoch TEXT NOW: into CL_R the epoch of codex's "try again at"
+# text, local time: "6:32 PM" (today, tomorrow if already past) or "Oct 22nd,
+# 2026 2:55 AM". 0 when it does not parse. BSD date, on the marking path only.
+codex_reset_epoch() {
+    local t="$1" now="$2" d="" day mon ap
+    local re1='^([0-9]{1,2}):([0-9]{2}) ?([AaPp][Mm])$'
+    local re2='^([A-Z][a-z]{2})[a-z]* ([0-9]{1,2})(st|nd|rd|th)?,? ([0-9]{4}),? ([0-9]{1,2}):([0-9]{2}) ?([AaPp][Mm])$'
+    CL_R=0
+    t="${t%.}"
+    if [[ $t =~ $re1 ]]; then
+        printf -v day '%(%Y-%m-%d)T' "$now"
+        t="$day ${BASH_REMATCH[1]}:${BASH_REMATCH[2]}:00 ${BASH_REMATCH[3]^^}"
+        d=$(LC_ALL=C date -j -f '%Y-%m-%d %I:%M:%S %p' "$t" +%s 2>/dev/null) || d=""
+        case "$d" in ''|*[!0-9]*) d="" ;; esac
+        if [ -n "$d" ] && [ "$d" -le "$now" ]; then
+            d=$(LC_ALL=C date -j -v+1d -f '%Y-%m-%d %I:%M:%S %p' "$t" +%s 2>/dev/null) || d=""
+        fi
+    elif [[ $t =~ $re2 ]]; then
+        mon="${BASH_REMATCH[1]}"; day="${BASH_REMATCH[2]}"; ap="${BASH_REMATCH[7]^^}"
+        d=$(LC_ALL=C date -j -f '%b %d %Y %I:%M:%S %p' \
+            "$mon $day ${BASH_REMATCH[4]} ${BASH_REMATCH[5]}:${BASH_REMATCH[6]}:00 $ap" +%s 2>/dev/null) || d=""
+    fi
+    if [[ $d =~ ^[1-9][0-9]{0,11}$ ]]; then CL_R="$d"; fi
+    return 0
+}
+# codex_limit_parse ROLLOUT NOW: the LAST task_complete in the rollout's tail
+# (256 KB, never the whole file). CL_HIT 1 when it is a usage limit
+# (error.codex_error_info usage_limit_exceeded) - tested on the WHOLE line,
+# as codex_tail tests it, so a long final message can never make the two
+# disagree; only the pieces read below are cut. CL_TID its turn_id ("-" when
+# none), CL_R its reset: the "try again at" text (codex_reset_epoch, "today"
+# meaning the day of the task_complete's own timestamp, else NOW's), else the
+# last token_count's rate_limits reset - the window at used_percent >= 100,
+# else the later - when still ahead of NOW, else 0. Safe under set -eu.
+codex_limit_parse() {
+    local rp="$1" now="$2" out="" hit="" ts="" tid="" err="" tk="" msg="" ref o obj p pr re ru=0 rmax=0
+    local re_tid='^"turn_id":"([A-Za-z0-9_.:-]{1,128})"' re_try='try again at ([A-Za-z0-9 ,:]{1,60})'
+    local re_at='"resets_at":([0-9]{1,12})' re_pct='"used_percent":([0-9]+)'
+    local re_ts='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$'
+    CL_HIT=0; CL_TID="-"; CL_R=0
+    [ -n "$rp" ] && [ -f "$rp" ] || return 0
+    out=$(tail -c 262144 "$rp" 2>/dev/null | awk '
+        index($0, "\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"") { tc = $0 }
+        index($0, "\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"") && index($0, "\"resets_at\":") { tk = $0 }
+        END {
+            print (index(tc, "\"codex_error_info\":\"usage_limit_exceeded\"") ? 1 : 0)
+            print ((substr(tc, 1, 14) == "{\"timestamp\":\"") ? substr(tc, 15, 19) : "")
+            p = index(tc, "\"turn_id\":\""); print (p ? substr(tc, p, 200) : "")
+            p = index(tc, "\"error\":{"); print (p ? substr(tc, p, 4096) : "")
+            print substr(tk, 1, 8192)
+        }' 2>/dev/null) || out=""
+    { IFS= read -r hit; IFS= read -r ts; IFS= read -r tid; IFS= read -r err; IFS= read -r tk; } <<<"$out" || true
+    [ "$hit" = 1 ] || return 0
+    CL_HIT=1
+    if [[ $tid =~ $re_tid ]]; then CL_TID="${BASH_REMATCH[1]}"; fi
+    if [[ $err =~ $re_try ]]; then msg="${BASH_REMATCH[1]% }"; fi
+    ref="$now"
+    if [[ $ts =~ $re_ts ]]; then
+        o=$(TZ=UTC0 date -j -f '%Y-%m-%dT%H:%M:%S' "$ts" +%s 2>/dev/null) || o=""
+        if [[ $o =~ ^[1-9][0-9]{0,11}$ ]]; then ref="$o"; fi
+    fi
+    codex_reset_epoch "$msg" "$ref"
+    [ "$CL_R" = 0 ] || return 0
+    for p in primary secondary; do
+        re="\"$p\":\\{([^}]*)\\}"
+        [[ $tk =~ $re ]] || continue
+        obj="${BASH_REMATCH[1]}"
+        [[ $obj =~ $re_at ]] || continue
+        o="${BASH_REMATCH[1]}"
+        if [ "$o" -gt "$rmax" ]; then rmax="$o"; fi
+        pr=0
+        if [[ $obj =~ $re_pct ]]; then pr="${BASH_REMATCH[1]}"; fi
+        if [ "$pr" -ge 100 ] && [ "$o" -gt "$ru" ]; then ru="$o"; fi
+    done
+    if [ "$ru" -gt 0 ]; then CL_R="$ru"; else CL_R="$rmax"; fi
+    if [ "$CL_R" -le "$now" ]; then CL_R=0; fi
+    return 0
+}
+# <<< LIMIT CORE <<<
+
+# cx_recent: the codex turn end codex_tail found (cx_ts) is no older than
+# this window's state stamp less 5 s - for a done/idle window, whose stamp a
+# Stop hook for the very same turn may have written in the same second. A
+# missing or mismatched stamp is "don't know" (no mark), as in cx_after.
+cx_recent() {
+    local e iso
+    [ -n "$cx_ts" ] && [ "${since#* }" = "$state" ] || return 1
+    e="${since%% *}"
+    case "$e" in ''|*[!0-9]*) return 1 ;; esac
+    TZ=UTC0 printf -v iso '%(%Y-%m-%dT%H:%M:%S)T' "$((e - 5))" 2>/dev/null || return 1
+    [[ ! "$cx_ts" < "$iso" ]]
+}
+
+# limit_end_cmd WIN: into lim_cmd the tmux commands (" ; ..."-joined, ids and
+# fixed words only) a watcher-written turn end adds to its own write: unset
+# @agent_limit / @agent_limit_lifted when the tick read a limit, and
+# @agent_paused while it still holds the limit's own E - then W_PAUSED is
+# cleared, so this turn end is not ruled `paused` (the indicator's
+# limit_end, for the watcher's un-stick, bg release and codex turn ends).
+limit_end_cmd() {
+    local w="$1" e=""
+    lim_cmd=""
+    [ -n "${W_LIMIT[$w]:-}" ] || return 0
+    lim_cmd=" ; set-option -uw -t $w @agent_limit ; set-option -uw -t $w @agent_limit_lifted"
+    read -r _ _ e _ <<<"${W_LIMIT[$w]}" || true
+    if [ -n "${W_PAUSED[$w]:-}" ] && [[ $e =~ ^[0-9]{1,12}$ ]] && [ "${W_PAUSED[$w]}" = "$e" ]; then
+        lim_cmd+=" ; set-option -uw -t $w @agent_paused"
+        W_PAUSED[$w]=""
+    fi
+    return 0
+}
+
+# limit_spawn ARGS...: agent-pause.py ARGS, detached (double fork: never in
+# this daemon's job table), fire-and-forget; a missing script is no error.
+limit_spawn() {
+    [ -x "$LIMIT_PY" ] || return 0
+    ( "$LIMIT_PY" "$@" </dev/null >/dev/null 2>&1 & ) 2>/dev/null
+    return 0
+}
+
+# codex_limit_mark WIN WAS ROLLOUT: mark a codex window rate-limited (the
+# indicator's limit_mark, same list and order) from its rollout's last
+# task_complete and token_count, over the state WAS the tick decided from
+# (CONDITIONAL WRITES). Sets the caller's state etc. through cas_write.
+# Returns 1 when nothing was written, 2 when the rollout did not parse as a
+# usage limit after all (the caller then ends the turn as a plain complete).
+codex_limit_mark() {
+    local win="$1" was="${2//[^a-z-]/}" rp="$3" r tid e c o
+    codex_limit_parse "$rp" "$tick_now"
+    [ "$CL_HIT" = 1 ] || return 2
+    r="$CL_R"; tid="$CL_TID"
+    limit_text "$r" codex "$tick_now"
+    e="$tick_now"
+    c=""
+    for o in @agent_pending @agent_held_detail @agent_quiet @agent_limit_lifted @agent_ask_from @agent_ask_bg \
+             @agent_prior_state @agent_prior_since @agent_prior_detail_kind @agent_prior_detail; do
+        c+="set-option -uw -t $win $o ; "
+    done
+    c+="set-option -w -t $win @agent_paused $e ; set-option -w -t $win @agent_limit '$r codex $e'"
+    c+=" ; set-option -w -t $win @agent_detail_kind limit ; set-option -w -t $win @agent_detail '$LIM_TXT'"
+    c+=" ; set-option -w -t $win @agent_turn_result '$tid limited $r'"
+    c+=" ; set-option -w -t $win @agent_since '$e paused' ; set-option -w -t $win @agent_state paused"
+    cas_write "$win" "#{==:#{@agent_state},$was}" "$c" || return 1
+    [ "$state" = paused ] || return 1
+    limit_spawn limit-add "$win"
+    return 0
+}
+
+# limit_trigger: the RESUME TRIGGER (item 2 above), once per tick after the
+# window loop. Builtins only unless it fires.
+limit_trigger() {
+    local why=""
+    [ "$lim_prev_tick" -gt 0 ] && [ $((tick_now - lim_prev_tick)) -gt "$LIMIT_WAKE_GAP" ] && lim_wake=1
+    lim_prev_tick="$tick_now"
+    [[ $lim_due =~ ^[0-9]{1,12}$ ]] || { lim_wake=0; return 0; }
+    [ $((tick_now - lim_last_spawn)) -ge "$LIMIT_TICK_EVERY" ] || return 0
+    if [ "$((10#$lim_due))" -le "$tick_now" ]; then
+        why=due
+    elif [ "$lim_wake" = 1 ]; then
+        why=wake
+    elif [ -e "$LIMIT_SEQ" ] && { [ ! -e "$LIMIT_SEQ_MARK" ] || [[ $LIMIT_SEQ -nt $LIMIT_SEQ_MARK ]]; }; then
+        why=swap
+    fi
+    [ -n "$why" ] || return 0
+    lim_last_spawn="$tick_now"
+    lim_wake=0
+    [ -e "$LIMIT_SEQ" ] && : > "$LIMIT_SEQ_MARK" 2>/dev/null
+    limit_spawn limit-tick
+    return 0
 }
 
 # Background-work detection — resolve_session_bases (the compaction-chain
@@ -943,6 +1214,7 @@ declare -A W_PRIOR=() # @agent_prior_state (AGENT-ORIGINATED TURNS)
 declare -A W_QUIET=() # @agent_quiet: a quiet restore's one-shot log mark
 declare -A W_PAUSED=() # @agent_paused: agent-pause.py's flag (docs/agent-pause.md)
 declare -A W_ASKBG=()  # @agent_ask_bg: the indicator's ASKS WHILE WORK IS OUT raise
+declare -A W_LIMIT=()  # @agent_limit: RATE-LIMITED AGENTS
 wins=()
 
 # AGENT-ORIGINATED TURNS (agent-tab-indicator.sh, same heading; the doc's
@@ -965,7 +1237,9 @@ wins=()
 ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_prior_since
              @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
              @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused
-             @agent_turn_start)
+             @agent_turn_start @agent_limit @agent_limit_lifted)
+# (@agent_limit / @agent_limit_lifted: RATE-LIMITED AGENTS, dropped with the
+# session wherever @agent_paused is.)
 # prior_restore WIN WAC: one read of the saved fields, one write. Sets
 # r_state (the state written) and r_since; returns 1 when nothing was
 # written: the write failed, or the prior is gone since the tick's read (the
@@ -1005,6 +1279,7 @@ prior_restore() {
     c+=" ; set-option -uw -t $win @agent_ask_bg"   # it only ever describes a needs-input
     [ "$seen" = 1 ] && c+=" ; set-option -w -t $win @agent_seen_at $tick_now"
     c+=" ; set-option -w -t $win @agent_quiet ${ofrom:--}"
+    c+="${lim_cmd:-}"   # RATE-LIMITED AGENTS: a turn end ends the limit (limit_end_cmd)
     cas_write "$win" "#{&&:#{==:#{@agent_state},$was},#{!=:#{@agent_prior_state},}}" "$c" || return 1
     # Still a prior: the guard was false (a hook moved the state), nothing
     # written. Gone: restored - here, or by the indicator's quiet Stop.
@@ -1559,7 +1834,11 @@ EOF
     # newline continues on its own line) can never be taken for a window.
     # @agent_prior_state (AGENT-ORIGINATED TURNS) is a bare state token, so it
     # rides with the digit fields, ahead of all free text.
-    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{@agent_prior_state}${US}#{@agent_quiet}${US}#{@agent_paused}${US}#{@agent_ask_bg}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
+    # So do @agent_limit ("R T E", bare tokens) and @agent_limit_due (RATE-
+    # LIMITED AGENTS): a GLOBAL, which a pane format resolves through the
+    # window to the global value - the resume trigger's input at no extra
+    # fork, the same on every row.
+    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{@agent_prior_state}${US}#{@agent_quiet}${US}#{@agent_paused}${US}#{@agent_ask_bg}${US}#{@agent_limit}${US}#{@agent_limit_due}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
@@ -1583,17 +1862,19 @@ EOF
     # exits, exactly like any other window.
     W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_SUM=(); W_DET=()
     W_DK=(); W_DTXT=(); W_SESS=(); W_IDX=(); W_NAME=(); W_AK=()
-    W_PEND=(); W_BORN=(); W_PRIOR=(); W_QUIET=(); W_PAUSED=(); W_ASKBG=(); S_SLOT=(); S_VIS=(); S_ELIG=()
+    W_PEND=(); W_BORN=(); W_PRIOR=(); W_QUIET=(); W_PAUSED=(); W_ASKBG=(); W_LIMIT=(); S_SLOT=(); S_VIS=(); S_ELIG=()
     wins=()
-    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind slot pend born prior quiet paused askbg sess widx wname dtxt summary; do
+    lim_due=""
+    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind slot pend born prior quiet paused askbg limit ldue sess widx wname dtxt summary; do
         case "$win" in @*) ;; *) continue ;; esac
         case "$tty" in /dev/?*) ;; *) continue ;; esac
+        [ -n "$lim_due" ] || lim_due="$ldue"
         if [ -z "${W_SEEN[$win]+x}" ]; then
             W_SEEN[$win]=1
             wins+=("$win")
-            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${akind}${dkind}${born}${prior}${paused}${summary}" ]; then
+            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${akind}${dkind}${born}${prior}${paused}${limit}${summary}" ]; then
                 W_PRIOR[$win]="$prior"; W_QUIET[$win]="$quiet"; W_PAUSED[$win]="$paused"
-                W_ASKBG[$win]="$askbg"
+                W_ASKBG[$win]="$askbg"; W_LIMIT[$win]="$limit"
                 W_STATE[$win]="$state"; W_WAC[$win]="$wac"; W_SINCE[$win]="$since"
                 W_WF[$win]="$wf_opt"; W_CUA[$win]="$cua_opt"; W_ROLL[$win]="$roll"
                 W_SUM[$win]="$summary"; W_DET[$win]="${akind}${dkind}"; W_AK[$win]="$akind"
@@ -1766,7 +2047,7 @@ EOF
         fi
         # A leftover sidebar kind/detail is collectable exactly like a summary.
         # So is a leftover @agent_prior_state (AGENT-ORIGINATED TURNS).
-        has_summary=0; [ -n "${W_SUM[$win]:-}${W_DET[$win]:-}${W_PRIOR[$win]:-}${W_PAUSED[$win]:-}" ] && has_summary=1
+        has_summary=0; [ -n "${W_SUM[$win]:-}${W_DET[$win]:-}${W_PRIOR[$win]:-}${W_PAUSED[$win]:-}${W_LIMIT[$win]:-}" ] && has_summary=1
         had_wf=0; [ -n "${W_WF[$win]:-}" ] && had_wf=1
         had_cua=0; [ -n "${W_CUA[$win]:-}" ] && had_cua=1
 
@@ -1875,6 +2156,7 @@ EOF
         # (stale, earlier-codex) rollout.
         fin=""        # the state this agent's own record says, if it disagrees
         cx_full=0     # 1 = a codex turn end after the stamp: the full write
+        cx_lim=0      # 1 = that turn end was a usage limit (RATE-LIMITED AGENTS)
         if [ "$has_agent" = 1 ]; then
             case "$state" in
                 running)
@@ -1893,9 +2175,10 @@ EOF
                         # keeps the older rule - idle, state only - never a
                         # codex "done" it did not have.
                         case "$cx_mark" in
-                            complete|aborted)
+                            complete|aborted|limit)
                                 if [ "${PID_KIND[$pid]:-}" = codex ] && cx_after; then
                                     cx_full=1
+                                    [ "$cx_mark" = limit ] && cx_lim=1
                                 else
                                     st=idle
                                 fi ;;
@@ -1913,11 +2196,44 @@ EOF
                         codex_tail_cached "$win" "${W_ROLL[$win]}"
                         case "$cx_mark" in
                             complete|aborted) cx_after && cx_full=1 ;;
+                            limit) cx_after && cx_lim=1 ;;
                         esac
                     fi
                     ;;
+                done|idle)
+                    # A usage limit whose turn codex's own Stop hook already
+                    # painted (done, or idle while viewed) in the same breath:
+                    # see cx_recent. Only a codex window with a rollout whose
+                    # stamp describes this state and is under
+                    # LIMIT_FRESH_STAMP s old (the Stop that just landed), so
+                    # a SETTLED done/idle window reads no rollout at all; a
+                    # cached look (builtin -nt) unless the file moved.
+                    cx_e="${since%% *}"
+                    if [ "${PID_KIND[$pid]:-}" = codex ] && [ -n "${W_ROLL[$win]:-}" ] \
+                       && [ "${since#* }" = "$state" ] && [[ $cx_e =~ ^[0-9]{1,12}$ ]] \
+                       && [ $((tick_now - 10#$cx_e)) -le "$LIMIT_FRESH_STAMP" ]; then
+                        codex_tail_cached "$win" "${W_ROLL[$win]}"
+                        [ "$cx_mark" = limit ] && cx_recent && cx_lim=1
+                    fi
+                    ;;
             esac
-            if [ "$cx_full" = 1 ]; then
+            if [ "$cx_lim" = 1 ]; then
+                # RATE-LIMITED AGENTS: marked at once (the rollout's verdict is
+                # final, no hysteresis), and nothing else ends this turn.
+                # If the rollout does not parse as a limit after all (rc 2),
+                # it is ended as the plain `complete` it also is, so the turn
+                # can never wedge at running.
+                cx_full=0
+                cx_rc=0
+                codex_limit_mark "$win" "$state" "${W_ROLL[$win]}" || cx_rc=$?
+                if [ "$cx_rc" = 0 ]; then
+                    changed=1; state_moved=1
+                elif [ "$cx_rc" = 2 ]; then
+                    case "$state" in
+                        running|needs-input) cx_full=1; cx_mark=complete; fin=done ;;
+                    esac
+                fi
+            elif [ "$cx_full" = 1 ]; then
                 fin=idle
                 [ "$cx_mark" = complete ] && fin=done
             fi
@@ -1929,6 +2245,10 @@ EOF
             done
             n=$((n + 1))
             if [ "$n" -ge 3 ]; then
+                # RATE-LIMITED AGENTS: whatever this turn end writes, it is an
+                # outcome, and any outcome but a rate limit ends the limit
+                # (and the limit's own pause flag): lim_cmd rides in its write.
+                limit_end_cmd "$win"
                 if [ -n "${W_PAUSED[$win]:-}" ]; then
                     # PAUSED (docs/agent-pause.md, "The paused state"): this
                     # turn end - its background work drained, Esc, a missed
@@ -1945,7 +2265,7 @@ EOF
                     # that just landed keeps its yellow, since and pending.
                     cas_was="$state"
                     cas_write "$win" "#{==:#{@agent_state},$cas_was}" \
-                        "set-option -w -t $win @agent_state paused ; set-option -w -t $win @agent_since '$tick_now paused' ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_bg_owner ; set-option -uw -t $win @agent_ask_bg ; if-shell -F -t $win '#{?#{@agent_paused},0,1}' 'set-option -w -t $win @agent_state idle'" \
+                        "set-option -w -t $win @agent_state paused ; set-option -w -t $win @agent_since '$tick_now paused' ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_bg_owner ; set-option -uw -t $win @agent_ask_bg${lim_cmd} ; if-shell -F -t $win '#{?#{@agent_paused},0,1}' 'set-option -w -t $win @agent_state idle'" \
                         && [ "$state" != "$cas_was" ] && { changed=1; state_moved=1; }
                     fin="$state"
                 elif [ -n "${W_PRIOR[$win]:-}" ]; then
@@ -1969,6 +2289,7 @@ EOF
                     else
                         cx_cmd+=" ; set-option -uw -t $win @agent_detail_kind ; set-option -uw -t $win @agent_detail"
                     fi
+                    cx_cmd+="$lim_cmd"
                     # CONDITIONAL WRITES: only over the state this was decided from.
                     cas_was="$state"
                     cas_write "$win" "#{==:#{@agent_state},$cas_was}" "$cx_cmd" \
@@ -1981,7 +2302,7 @@ EOF
                     # and only over the `running` it was decided from
                     # (CONDITIONAL WRITES) - never over a gate that just landed.
                     cas_write "$win" "#{==:#{@agent_state},running}" \
-                        "set-option -w -t $win @agent_state idle ; set-option -uw -t $win @agent_bg_owner" \
+                        "set-option -w -t $win @agent_state idle ; set-option -uw -t $win @agent_bg_owner$lim_cmd" \
                         && [ "$state" = idle ] && { changed=1; state_moved=1; }
                     fin="$state"
                 fi
@@ -2190,6 +2511,9 @@ EOF
     # After every write of the tick, @agent_since stamps included, so a reader
     # woken by it sees the whole tick (STATE NOTICE, agent-tab-indicator.sh).
     [ "$state_moved" = 1 ] && notify_state
+    # RATE-LIMITED AGENTS: the resume trigger (limit_trigger), after this
+    # tick's writes so a limit-tick it spawns reads them.
+    limit_trigger
 
     # HEARTBEAT. Being alive is not the same as turning: every check on this
     # daemon (the pidfile, ensure_watcher's kill -0 + ps) proves a PROCESS

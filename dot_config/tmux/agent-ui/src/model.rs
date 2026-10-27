@@ -93,6 +93,130 @@ impl Cat {
 pub const PAUSED_GLYPH: &str = "⏸";
 pub const PAUSED_HUE: &str = "violet";
 
+/// A RATE-LIMITED agent's mark and colour (docs/agent-roster.md "Rate-
+/// limited agents"): a paused agent with a reason, `@agent_limit` set. The
+/// mark is nf-md-timer_sand (U+F13AB) in peach (`#fab387`), whether the
+/// limit still holds or has lifted (the words tell those apart: "limit ·
+/// resets 1:00 AM" / "limit lifted · ⏎ resume"). Provisional: it MUST match
+/// the tmux tab's limit glyph and colour (agent-tab-indicator.sh) and
+/// CuaNotch's palette (Sources/Constants.swift, dev/check-invariants); change
+/// all three together.
+pub const LIMIT_GLYPH: &str = "\u{F13AB}";
+pub const LIMIT_HUE: &str = "peach";
+
+/// How long after `resets_at` a limited agent becomes eligible for a resume:
+/// agent-pause.py's `LIMIT_GRACE` (its `limit_eligible` and `limit-resume`:
+/// the grace lets Claude's own auto-continue go first, so there is no double
+/// prompt). Change both together.
+pub const LIMIT_GRACE: i64 = 120;
+
+/// A reset further than this from now (either way) is not believed: it is
+/// read as unknown, never drawn (a huge value would not even format).
+pub const LIMIT_HORIZON: i64 = 400 * 86_400;
+
+/// `@agent_limit` (`"<resets_at> <type> <since>"`) and `@agent_limit_lifted`
+/// (`<epoch>`), parsed: the indicator's mark of a rate-limited agent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Limit {
+    /// When the limit resets (epoch seconds) as written; 0 when written 0
+    /// (no reset time: a model limit) or when it would not parse.
+    pub resets_at: i64,
+    /// The reset word would not parse (junk, a sign, an overflow): unknown,
+    /// never a guess.
+    pub garbled: bool,
+    /// five_hour | seven_day | seven_day_opus | seven_day_sonnet | model |
+    /// overage | codex, as written ("" when missing).
+    pub kind: String,
+    /// When it was marked (epoch seconds), when readable.
+    pub since: Option<i64>,
+    /// `@agent_limit_lifted`: the limit has passed and the agent waits for
+    /// Mack (auto-resume off or deferred). Some(0) for a value that is not
+    /// all digits (still lifted).
+    pub lifted: Option<i64>,
+}
+
+/// Where a limit stands at a moment ([`Limit::stage`]): what every surface
+/// says about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// `@agent_limit_lifted`: passed, waiting for Mack.
+    Lifted,
+    /// resets_at written 0: no reset time (a model limit); the indicator's
+    /// `@agent_detail` says what it is.
+    NoTime,
+    /// The reset would not parse, or is more than [`LIMIT_HORIZON`] away.
+    Unknown,
+    /// Before the reset.
+    Resets(i64),
+    /// Past the reset, inside [`LIMIT_GRACE`]: native auto-continue goes
+    /// first; not resumable yet.
+    Resetting,
+    /// Past the reset and its grace: resumable (the tick may have deferred
+    /// it: a manual pause, the wake grace).
+    Passed,
+}
+
+impl Limit {
+    /// The two raw options → the limit, None unless `@agent_limit` is set
+    /// (its presence is what rate-limited means). A reset that would not
+    /// parse is [`garbled`](Self::garbled), never a guess.
+    pub fn parse(raw: &str, lifted: &str) -> Option<Limit> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let num = |s: &str| Some(s).filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).and_then(|s| s.parse::<i64>().ok());
+        let mut it = raw.split_whitespace();
+        let reset = it.next().and_then(num);
+        let kind = it.next().unwrap_or("").to_string();
+        let since = it.next().and_then(num);
+        let lifted = Some(lifted.trim()).filter(|s| !s.is_empty()).map(|s| num(s).unwrap_or(0));
+        Some(Limit { resets_at: reset.unwrap_or(0), garbled: reset.is_none(), kind, since, lifted })
+    }
+
+    /// The reset time as believed at `now`: None when written 0, garbled, or
+    /// further than [`LIMIT_HORIZON`].
+    pub fn reset_at(&self, now: f64) -> Option<i64> {
+        let r = self.resets_at;
+        (!self.garbled && r > 0 && (r as f64 - now).abs() <= LIMIT_HORIZON as f64).then_some(r)
+    }
+
+    /// Where it stands at `now` ([`Stage`]).
+    pub fn stage(&self, now: f64) -> Stage {
+        if self.lifted.is_some() {
+            return Stage::Lifted;
+        }
+        match self.reset_at(now) {
+            Some(r) if now >= (r + LIMIT_GRACE) as f64 => Stage::Passed,
+            Some(r) if now >= r as f64 => Stage::Resetting,
+            Some(r) => Stage::Resets(r),
+            None if !self.garbled && self.resets_at == 0 => Stage::NoTime,
+            None => Stage::Unknown,
+        }
+    }
+
+    /// A manual resume (`agent-pause.py limit-resume`) is allowed at `now`,
+    /// by the script's own rule: lifted, no (believable) reset time (only
+    /// Mack can judge it), or `now >= resets_at + LIMIT_GRACE`. The script
+    /// decides; this keeps the sidebar from offering what it refuses.
+    pub fn resumable(&self, now: f64) -> bool {
+        !matches!(self.stage(now), Stage::Resets(_) | Stage::Resetting)
+    }
+}
+
+/// A window is RATE-LIMITED: `@agent_limit` set, its folded state
+/// ([`paused_state`]) `paused` OR `idle`, nothing in flight. Idle counts
+/// because agent-pause.py's `limit_send` unsets `@agent_paused` and flips
+/// paused → idle just before its RESUME: a paste held behind a draft (up to
+/// 2 h) or lost leaves the window idle with the limit (and maybe lifted).
+/// A limited agent Mack prompts again goes running while `@agent_limit`
+/// stays until its turn's outcome: running (or asking, failed, done), it is
+/// what it is; with a fleet or cua out it is working ([`cat`]). [`cat`]
+/// files every limited window in the paused bucket.
+pub fn limited(w: &Window) -> bool {
+    matches!(w.state.as_str(), "paused" | "idle") && w.limit.is_some() && !in_flight(w)
+}
+
 /// The state a window shows, with the pause folded in (docs/agent-pause.md
 /// "The paused state"): `paused` as the tab hook writes it, and, until that
 /// lands everywhere, `done` or `idle` on a window whose `@agent_paused` is
@@ -158,14 +282,15 @@ pub fn rank(w: &Window) -> u8 {
 
 /// agent-roster.py `cat`: the count bucket, or None for a plain shell. A
 /// paused agent with a fleet or cua still out is in flight (working), as the
-/// pause's own "still working" rule counts it.
+/// pause's own "still working" rule counts it. A rate-limited window
+/// ([`limited`]) is paused, idle state or not.
 pub fn cat(w: &Window) -> Option<Cat> {
     if is_attn(w) {
         return Cat::of_state(&w.state);
     }
     if in_flight(w) {
         Some(Cat::Working)
-    } else if w.state == "paused" {
+    } else if w.state == "paused" || limited(w) {
         Some(Cat::Paused)
     } else if !w.state.is_empty() {
         Some(Cat::Idle)
@@ -223,6 +348,9 @@ pub fn dot_color(w: &Window, blink: bool, is_current: bool) -> Option<&'static s
     if in_flight(w) {
         return Some(if is_current || !blink { "blue" } else { "pink" });
     }
+    if limited(w) {
+        return Some(LIMIT_HUE);
+    }
     if w.state == "paused" {
         return Some(PAUSED_HUE);
     }
@@ -279,12 +407,17 @@ pub fn detail_word(kind: &str) -> Option<&'static str> {
         "fail" => Some("fail"),
         "done" => Some("done"),
         "run" => Some("run"),
+        "limit" => Some("limit"),
         _ => None,
     }
 }
 
-/// agent-roster.py `STATE_WORDS` plus the popup's row words: the state in words.
+/// agent-roster.py `STATE_WORDS` plus the popup's row words: the state in
+/// words. A rate-limited agent ([`limited`]) says `limit`, not `paused`.
 pub fn state_words(w: &Window) -> &'static str {
+    if limited(w) {
+        return "limit";
+    }
     match w.state.as_str() {
         "failed" => "failed",
         "needs-input" => "waiting on you",
@@ -711,6 +844,103 @@ mod tests {
             })
             .collect();
         assert_eq!(Counts::of(&ws).nonzero(), vec![(Cat::Paused, 2), (Cat::Idle, 1)]);
+    }
+
+    /// Rate-limited (docs/agent-roster.md "Rate-limited agents"): a paused
+    /// agent with `@agent_limit`. It stays in the paused bucket (out of NEEDS
+    /// YOU and agent-jump's queue, rank 4, never attention), wears the limit
+    /// mark in peach and says `limit`; running again (Mack prompted it, the
+    /// limit kept until the turn's outcome) or with a fleet out, it is
+    /// working, not limited. The queue (agent-jump.sh's own rule) is
+    /// untouched: a limited window's raw state is `paused`.
+    #[test]
+    fn limited_is_paused_with_a_reason() {
+        let w = |state: &str, flag: &str, limit: &str, wf: &str| {
+            Window::parse(&row("s", 1, "@1", &[("state", state), ("paused", flag), ("limit", limit), ("workflow", wf),
+                ("since", "5 x")])).unwrap()
+        };
+        let l = "1792420000 five_hour 1792410000";
+        for (state, flag) in [("paused", "1792410000"), ("paused", ""), ("done", "1792410000"), ("idle", "1792410000")] {
+            let p = w(state, flag, l, "");
+            let ctx = format!("{state} + {flag:?}");
+            assert!(limited(&p), "{ctx}");
+            assert_eq!((cat(&p), rank(&p), is_attn(&p), in_flight(&p)), (Some(Cat::Paused), 4, false, false), "{ctx}");
+            assert_eq!((dot_color(&p, true, false), dot_color(&p, false, true)), (Some("peach"), Some("peach")), "{ctx}");
+            assert_eq!(state_words(&p), "limit", "{ctx}");
+            assert!(needs_order(&[p], &Collator::new("C")).is_empty(), "{ctx}");
+        }
+        // Prompted again, or a fleet out: not limited.
+        let r = w("running", "", l, "");
+        assert!(!limited(&r));
+        assert_eq!((cat(&r), state_words(&r), dot_color(&r, true, false)), (Some(Cat::Working), "working", Some("pink")));
+        assert!(!limited(&w("paused", "1", l, "1")));
+        // A failed or asking agent with a stale limit is still what it is;
+        // so is a done one (its turn ended well: the hook clears the limit).
+        assert!(!limited(&w("failed", "", l, "")) && !limited(&w("needs-input", "", l, "")));
+        assert!(!limited(&w("done", "", l, "")));
+        assert_eq!(cat(&w("done", "", l, "")), Some(Cat::Done));
+        // IDLE with the limit (agent-pause.py's limit_send unsets
+        // @agent_paused and flips paused → idle just before its RESUME; a
+        // paste held behind a draft, or lost, leaves it there): still
+        // limited, lifted or not, in the paused bucket, never attention or
+        // NEEDS YOU.
+        let lifted = |state: &str| {
+            Window::parse(&row("s", 1, "@1", &[("state", state), ("limit", l), ("limit_lifted", "1792420100"), ("since", "5 x")])).unwrap()
+        };
+        for p in [w("idle", "", l, ""), lifted("idle")] {
+            assert!(limited(&p), "{:?}", p.limit);
+            assert_eq!((p.state.as_str(), cat(&p), rank(&p), is_attn(&p)), ("idle", Some(Cat::Paused), 4, false));
+            assert_eq!((dot_color(&p, true, false), state_words(&p)), (Some("peach"), "limit"));
+            assert!(needs_order(&[p], &Collator::new("C")).is_empty());
+        }
+        assert!(!limited(&w("idle", "", l, "1"))); // a fleet out: working
+        // No limit: plain paused.
+        let p = w("paused", "1", "", "");
+        assert!(!limited(&p));
+        assert_eq!((dot_color(&p, true, false), state_words(&p)), (Some("violet"), "paused"));
+        // The mark and its colour (they must match the tab and CuaNotch).
+        assert_eq!((LIMIT_GLYPH, LIMIT_HUE), ("\u{F13AB}", "peach"));
+        assert_eq!(crate::palette::hex(LIMIT_HUE), "#fab387");
+        assert_eq!(detail_word("limit"), Some("limit"));
+    }
+
+    /// `@agent_limit` parsed, and when a manual resume is allowed.
+    #[test]
+    fn limit_parse_and_resumable() {
+        assert_eq!(Limit::parse("", ""), None);
+        assert_eq!(Limit::parse("  ", "5"), None);
+        let l = Limit::parse("1000 seven_day 900", "").unwrap();
+        assert_eq!((l.resets_at, l.kind.as_str(), l.since, l.lifted), (1000, "seven_day", Some(900), None));
+        assert!(!l.garbled && l.reset_at(1000.0) == Some(1000));
+        // The stages around the reset.
+        assert_eq!([999.0, 1000.0, 1119.0, 1120.0].map(|t| l.stage(t)),
+            [Stage::Resets(1000), Stage::Resetting, Stage::Resetting, Stage::Passed]);
+        assert_eq!(LIMIT_GRACE, 120);
+        // agent-pause.py's rule: eligible from resets_at + its 120 s grace.
+        assert!(!l.resumable(999.0) && !l.resumable(1000.0) && !l.resumable(1119.0));
+        assert!(l.resumable(1120.0) && l.resumable(5000.0));
+        // A reset that overflows, or one absurdly far: unknown, resumable.
+        assert!(Limit::parse("99999999999999999999 five_hour 900", "").unwrap().resumable(1000.0));
+        assert!(Limit::parse(&format!("{} five_hour 900", 1_000 + 401 * 86_400), "").unwrap().resumable(1000.0));
+        assert!(!Limit::parse(&format!("{} five_hour 900", 1_000 + 399 * 86_400), "").unwrap().resumable(1000.0));
+        let lifted = Limit::parse("1000 five_hour 900", "950").unwrap();
+        assert!(lifted.resumable(10.0));
+        assert_eq!(lifted.stage(10.0), Stage::Lifted);
+        // Written 0: no reset time, resumable.
+        let m = Limit::parse("0 model 900", "").unwrap();
+        assert!(!m.garbled && m.stage(0.0) == Stage::NoTime && m.resumable(0.0));
+        assert_eq!(Limit::parse("0 codex 900", "").unwrap().stage(5.0), Stage::NoTime);
+        // Junk, a sign, an overflow: garbled, unknown. Absurdly far: unknown.
+        for raw in ["x", "-5 model", "99999999999999999999 five_hour 1"] {
+            let j = Limit::parse(raw, "").unwrap();
+            assert!(j.garbled && j.resets_at == 0 && j.stage(1000.0) == Stage::Unknown && j.resumable(1000.0), "{raw}");
+        }
+        let j = Limit::parse("x", "").unwrap();
+        assert_eq!((j.kind.as_str(), j.since), ("", None));
+        let far = Limit::parse(&format!("{} seven_day 1", 1000 + LIMIT_HORIZON + 1), "").unwrap();
+        assert_eq!((far.garbled, far.reset_at(1000.0), far.stage(1000.0)), (false, None, Stage::Unknown));
+        let past = Limit::parse(&format!("{} seven_day 1", 1), "").unwrap();
+        assert_eq!(past.stage(1.0 + LIMIT_HORIZON as f64 + 1.0), Stage::Unknown);
     }
 
     #[test]

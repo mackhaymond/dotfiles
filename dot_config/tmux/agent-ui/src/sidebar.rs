@@ -397,9 +397,11 @@ const PARK_WATCH: f64 = 15.0;
 /// right where a held row was) and its void chip, quiet or armed (a click
 /// aimed at a row a relayout moved must never arm or confirm a void; and
 /// the armed chip is new under the pointer, so a double click on the quiet
-/// one never voids).
+/// one never voids), and a lifted rate-limited card's resume chip (it
+/// messages an agent).
 fn guarded(t: &Target) -> bool {
-    matches!(t, Target::Answer { .. } | Target::Diff(_) | Target::Resume | Target::Held { .. } | Target::Void | Target::VoidArmed)
+    matches!(t, Target::Answer { .. } | Target::Diff(_) | Target::Resume | Target::Held { .. } | Target::Void
+        | Target::VoidArmed | Target::LimitResume(_))
 }
 
 /// Every cell of `f` whose click target ([`Frame::target`]) is [`guarded`].
@@ -1100,6 +1102,14 @@ impl App {
             self.say(r.unwrap_or_else(|e| e));
             return;
         }
+        if let Target::LimitResume(win) = &t {
+            // A lifted rate-limited card's chip: `agent-pause.py
+            // limit-resume <win>`, that agent alone (never the pause key's
+            // resume), re-checked against the window as it is now.
+            let r = self.actions.limit_resume(&self.core.snapshot, win, crate::text::now());
+            self.say(r.unwrap_or_else(|e| e));
+            return;
+        }
         let Some(client) = self.link.client.clone() else {
             self.say("no tmux client");
             return;
@@ -1187,7 +1197,9 @@ impl App {
                 self.void = self.pause_phase.clone().filter(pause::Phase::clickable).map(|phase| VoidArm { at: Instant::now(), phase, stamp });
                 Ok(false)
             }
-            Target::Restart | Target::Scope | Target::Toast(_) | Target::Answer { .. } | Target::Diff(_) => Ok(false),
+            Target::Restart | Target::Scope | Target::Toast(_) | Target::Answer { .. } | Target::Diff(_) | Target::LimitResume(_) => {
+                Ok(false)
+            }
         };
         match moved {
             Ok(true) => self.refresh(),
@@ -2078,6 +2090,39 @@ mod tests {
     /// P's resume half alone, `agent-pause.py resume <client>` through
     /// run-shell -b (the line unit-tested; the server is missing here, so
     /// nothing runs), never `toggle`; one still moving does nothing.
+    /// A lifted rate-limited card's `⏎ resume` chip: a guarded target (a
+    /// click on a chip new under the pointer does nothing) that runs
+    /// `agent-pause.py limit-resume <win>` for that agent (the server is
+    /// missing here, so nothing runs) and says so; the rest of the card goes
+    /// to the window as before.
+    #[test]
+    fn a_lifted_limit_card_resumes_on_its_chip() {
+        let mut a = app();
+        let now = crate::text::now() as i64;
+        a.link.client = Some("/dev/ttys999".into());
+        a.core.snapshot = Snapshot::parse(&[
+            row("main", 1, "@1", &[("state", "idle"), ("summary", "Here")]),
+            row("main", 2, "@2", &[("state", "paused"), ("paused", "5"), ("summary", "Lifted one"),
+                ("limit", &format!("{} five_hour {}", now - 60, now - 600)), ("limit_lifted", &now.to_string()),
+                ("since", &format!("{} paused", now - 60))]),
+            "\x1fclient\x1f/dev/ttys999\x1f@1\x1fmain".into(),
+        ].join("\n"));
+        a.view = build_view(&mut a.core, Some("/dev/ttys999"), None).0;
+        let f = layout(&a.view, 34, 30, &Opts::default());
+        let (x, y) = f.rows.iter().enumerate().find_map(|(y, r)| {
+            r.targets.iter().find(|t| matches!(t.2, Target::LimitResume(_))).map(|t| (t.0, y as u16))
+        }).unwrap_or_else(|| panic!("{:#?}", f.rows.iter().map(|r| r.text()).collect::<Vec<_>>()));
+        let click = |x: u16, y: u16| format!("\x1b[<0;{};{}M\x1b[<0;{};{}m", x + 1, y + 1, x + 1, y + 1);
+        // (A guarded target: trusted only once settled under the pointer.)
+        assert!(guarded(&Target::LimitResume("@2".into())));
+        a.show(f, Instant::now() - crate::answer::SETTLE);
+        a.handle(click(x, y).as_bytes());
+        assert_eq!(a.last_act, Some(Target::LimitResume("@2".into())));
+        assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("resuming Lifted one…"));
+        let script = a.actions.scripts.join("agent-pause.py");
+        assert_eq!(a.actions.limit_resume_line("@2"), format!("{} 'limit-resume' '@2'", sh_quote(&script.to_string_lossy())));
+    }
+
     #[test]
     fn a_settled_pause_banner_resumes_on_click() {
         let mut a = app();

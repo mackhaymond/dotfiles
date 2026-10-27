@@ -293,6 +293,49 @@ pub struct Agent {
     /// `@spaces` on: the space it is building. None otherwise (spaces off:
     /// the classic view, unchanged).
     pub pending: Option<Pending>,
+    /// A RATE-LIMITED agent ([`model::limited`]: paused with `@agent_limit`):
+    /// its limit. None for every other agent, a limited one Mack prompted
+    /// again (running) included. Its mark is [`model::LIMIT_GLYPH`] in
+    /// [`model::LIMIT_HUE`], its words `limit`.
+    pub limit: Option<model::Limit>,
+}
+
+/// What a limit with no reset time says when the indicator gave no words
+/// (`@agent_detail` empty): neutral, never a guessed model name.
+pub const MODEL_LIMIT: &str = "model limit";
+
+/// The indicator's words for a limit with no reset time (`@agent_detail`,
+/// already sanitized: "Opus limit · /model to switch"; blanks collapsed),
+/// else [`MODEL_LIMIT`]: (the part before ` · `, the rest).
+pub fn limit_detail(detail: &str) -> (String, String) {
+    let d = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    if d.is_empty() {
+        return (MODEL_LIMIT.to_string(), String::new());
+    }
+    match d.split_once(" · ") {
+        Some((head, rest)) => (head.to_string(), rest.to_string()),
+        None => (d, String::new()),
+    }
+}
+
+/// A rate-limited agent's limit in words, for a row with one line for it
+/// (the menu's reason): the word, then what to know, by its
+/// [`model::Stage`] at `now`. `limit` / `resets Tue 1:00 AM`
+/// ([`text::when`]), `resetting` (inside agent-pause.py's grace), `reset
+/// passed`, `reset unknown` (would not parse, absurdly far); no reset time:
+/// the indicator's words (`detail`, [`limit_detail`]); lifted, `limit
+/// lifted` / `waiting for you` (the menu's ⏎ goes to the window; the
+/// sidebar card's chip is the resume).
+pub fn limit_words(l: &model::Limit, detail: &str, now: f64) -> (String, String) {
+    let limit = |t: &str| ("limit".to_string(), t.to_string());
+    match l.stage(now) {
+        model::Stage::Lifted => ("limit lifted".into(), "waiting for you".into()),
+        model::Stage::NoTime => limit_detail(detail),
+        model::Stage::Unknown => limit("reset unknown"),
+        model::Stage::Passed => limit("reset passed"),
+        model::Stage::Resetting => limit("resetting"),
+        model::Stage::Resets(r) => limit(&format!("resets {}", text::when(r, now))),
+    }
 }
 
 /// The stale-agent sweep's verdict on an agent long idle ([`Agent::stale`]):
@@ -348,6 +391,7 @@ impl Agent {
         // a UI can draw these fields as they are. `session`, `window_id` and
         // `path` stay raw: actions and git need the real values.
         let label = text::sanitize(&w.label);
+        let limit = w.limit.clone().filter(|_| model::limited(w));
         let (project, short_title) = match label.split_once('/') {
             Some((p, t)) if !label.starts_with('/') => (format!("{p}/"), t.to_string()),
             _ => (String::new(), label.clone()),
@@ -360,7 +404,7 @@ impl Agent {
             state: w.state.clone(),
             cat,
             rank: model::rank(w),
-            glyph: cat.map(Cat::glyph).unwrap_or(" "),
+            glyph: if limit.is_some() { model::LIMIT_GLYPH } else { cat.map(Cat::glyph).unwrap_or(" ") },
             color: model::dot_color(w, blink, is_current),
             title: label,
             project,
@@ -398,7 +442,14 @@ impl Agent {
             pinned: w.pinned,
             pin_key: None,
             pending: None,
+            limit,
         }
+    }
+
+    /// Rate-limited and lifted: the limit has passed and it waits for Mack
+    /// (`@agent_limit_lifted`).
+    pub fn limit_lifted(&self) -> bool {
+        self.limit.as_ref().is_some_and(|l| l.lifted.is_some())
     }
 
     /// Give every agent of `view` its pin key (`keys`: window id → ⌥W digit).
@@ -467,6 +518,8 @@ impl Agent {
             ("attention", self.attention), ("in_flight", self.in_flight), ("run_detail", self.run_detail),
             ("is_current", self.is_current), ("active", self.active), ("panes", self.panes),
             ("path", &self.path), ("slot", self.slot), ("answered", self.answered), ("pinned", self.pinned),
+            ("limit", self.limit.as_ref().map(|l| obj![
+                ("resets_at", l.resets_at), ("type", &l.kind), ("since", l.since), ("lifted", l.lifted)])),
         ]
     }
 }
@@ -1062,6 +1115,18 @@ impl ViewModel {
     /// or numbering.
     pub fn agents(&self) -> impl Iterator<Item = &Agent> {
         self.spaces.iter().flat_map(|s| s.agents.iter())
+    }
+
+    /// Every RATE-LIMITED agent ([`Agent::limit`]) of every space, PINNED
+    /// included (a split view moves pins out of their spaces), each window
+    /// once: the sidebar's rate-limit banner and the menu's count.
+    pub fn limited(&self) -> Vec<&Agent> {
+        let mut seen = std::collections::HashSet::new();
+        self.pinned
+            .iter()
+            .chain(self.agents())
+            .filter(|a| a.limit.is_some() && seen.insert(a.window_id.as_str()))
+            .collect()
     }
 
     /// The spaces in THE space order ([`space_order`]).

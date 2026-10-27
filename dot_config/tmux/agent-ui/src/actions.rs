@@ -263,6 +263,45 @@ impl Actions {
         line
     }
 
+    /// What [`limit_resume`](Self::limit_resume) hands `run-shell -b`:
+    /// `agent-pause.py limit-resume <win>` (docs/agent-pause.md), the
+    /// manual resume of ONE rate-limited agent. The script decides: it
+    /// refuses with "rate-limited until <t>" while the agent is not
+    /// eligible.
+    pub fn limit_resume_line(&self, win: &str) -> String {
+        self.script_line("agent-pause.py", &["limit-resume", win])
+    }
+
+    /// A rate-limited agent's resume (the sidebar's `⏎ resume` chip): never
+    /// the pause key's `resume`, which only ever hands such an agent to
+    /// limited.json. Checked first against the window as `snap` has it at
+    /// `now`, so a stale card cannot ask for what the script would refuse:
+    /// gone, no longer rate-limited, or not yet resumable
+    /// ([`crate::model::Limit::resumable`], the script's own rule) is the
+    /// footer's text, worded as agent-pause.py words it: before the reset
+    /// "rate-limited until <t>", inside its grace "limit just reset ·
+    /// auto-continue first, try after <t>". Else `run-shell -b` as the
+    /// pause's resume (the delivery waits on tmux-mcp). Ok = the footer's text.
+    pub fn limit_resume(&self, snap: &Snapshot, win: &str, now: f64) -> Result<String, String> {
+        use crate::model::{Stage, LIMIT_GRACE};
+        let Some(w) = snap.rows(win).next() else {
+            return Err(PANE_GONE.into());
+        };
+        let Some(l) = w.limit.as_ref().filter(|_| crate::model::limited(w)) else {
+            return Err("not rate-limited any more".into());
+        };
+        match l.stage(now) {
+            Stage::Resets(r) => return Err(format!("rate-limited until {}", crate::text::when(r, now))),
+            Stage::Resetting => {
+                let after = crate::text::when(l.resets_at + LIMIT_GRACE, now);
+                return Err(format!("limit just reset · auto-continue first, try after {after}"));
+            }
+            _ => {}
+        }
+        self.tmux.run_bg(&self.limit_resume_line(win));
+        Ok(format!("resuming {}…", crate::text::sanitize(&w.label)))
+    }
+
     /// What [`void_paused`](Self::void_paused) hands `run-shell -b`:
     /// `agent-pause.py void <client>` (docs/agent-pause.md "Dismiss and
     /// void"): the saved set is forgotten, each agent's flag cleared, no
@@ -719,6 +758,44 @@ mod tests {
         // A space's home (an idle agent in it): never parked.
         let home = Snapshot::parse(&row("main", 0, "@14", &[("state", "idle"), ("summary", "Home"), ("home", "1")]));
         assert_eq!(a.park(&home, "@14", "main"), Err(HOME_PARK.to_string()));
+    }
+
+    /// A rate-limited agent is paused: quiet, so parkable like any paused
+    /// one. Its resume is `agent-pause.py limit-resume <win>` (never the
+    /// pause key's `resume`), offered only once allowed: lifted, unknown
+    /// (a model limit: only Mack can act), or past the reset; before it,
+    /// refused here with "rate-limited until <t>", as the script would. The
+    /// server does not exist, so an accepted resume runs nothing.
+    #[test]
+    fn limited_agents_park_and_resume_through_limit_resume() {
+        use crate::tmux::tests::row;
+        let now = 1_000_000.0;
+        let lim = |r: i64| format!("{r} five_hour 999000");
+        let snap = Snapshot::parse(&[
+            row("main", 1, "@1", &[("state", "paused"), ("paused", "999000"), ("limit", &lim(1_003_600)), ("summary", "Held")]),
+            row("main", 2, "@2", &[("state", "paused"), ("paused", "999000"), ("limit", &lim(999_000)), ("limit_lifted", "999500"),
+                ("summary", "Lifted")]),
+            row("main", 3, "@3", &[("state", "paused"), ("paused", "999000"), ("limit", "0 model 999000"), ("summary", "Model")]),
+            row("main", 4, "@4", &[("state", "paused"), ("paused", "999000"), ("limit", &lim(999_800)), ("summary", "Past")]),
+            row("main", 5, "@5", &[("state", "running"), ("limit", &lim(1_003_600)), ("summary", "Again")]),
+            row("main", 6, "@6", &[("state", "paused"), ("paused", "999000"), ("summary", "Plain")]),
+            // 50 s past its reset: inside agent-pause.py's 120 s grace.
+            row("main", 7, "@7", &[("state", "paused"), ("paused", "999000"), ("limit", &lim(999_950)), ("summary", "Grace")]),
+        ].join("\n"));
+        let a = Actions::new(Tmux::with_socket(Some(crate::tmux::Socket::Name(format!("agentui-limit-none-{}", std::process::id())))));
+        assert!(!park_refused_busy(snap.rows("@1").next().unwrap()));
+        assert_eq!(a.park(&snap, "@1", "main"), Ok("parking Held…".to_string()));
+        let line = a.limit_resume_line("@2");
+        assert!(line.ends_with("agent-pause.py' 'limit-resume' '@2'"), "{line}");
+        assert_eq!(a.limit_resume(&snap, "@1", now), Err(format!("rate-limited until {}", crate::text::when(1_003_600, now))));
+        assert_eq!(a.limit_resume(&snap, "@2", now), Ok("resuming Lifted…".to_string()));
+        assert_eq!(a.limit_resume(&snap, "@3", now), Ok("resuming Model…".to_string()));
+        assert_eq!(a.limit_resume(&snap, "@4", now), Ok("resuming Past…".to_string()));
+        assert_eq!(a.limit_resume(&snap, "@5", now), Err("not rate-limited any more".to_string()));
+        assert_eq!(a.limit_resume(&snap, "@6", now), Err("not rate-limited any more".to_string()));
+        assert_eq!(a.limit_resume(&snap, "@99", now), Err(PANE_GONE.to_string()));
+        assert_eq!(a.limit_resume(&snap, "@7", now),
+            Err(format!("limit just reset · auto-continue first, try after {}", crate::text::when(999_950 + 120, now))));
     }
 
     /// Going to a pending space's claude (its card, a NEEDS YOU card, the

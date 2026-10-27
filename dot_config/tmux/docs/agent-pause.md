@@ -225,6 +225,8 @@ Everything lives in `~/.local/state/agent-pause/` (override:
 | `progress.json` | the press in flight, or the last one, for the popup: `press`, `mode`, `done`, `outcome` (`paused`/`failed`, or `resumed`/`not_resumed`/`failed`), `message`, and `targets` with `result` (`sending` until it lands). **Display data only**: the toggle never reads it. |
 | `log` | one JSON line per press (mode, the message shown, every target and its result), plus a `popup` line with the geometry. Rolled to `log.1` at 1 MB. |
 | `lock` | `flock`ed for the whole press |
+| `limited.json` | the rate-limited set (see "Rate-limited agents"): `targets`, one per limited agent window (`pane_id`, `window_id`, `session_id`, `kind`, `label`, `resets_at`, `type`, `since`, `account`, `attempts`, and once they happen `lifted_at`, `resumed_at`, `last_attempt`, `last_result`; plus `location`, `pane_pid` and `pane_cmd` for `locate`; `held_at` while a held RESUME may still be queued in tmux-mcp). Written atomically. Separate from `paused.json`: a limited agent is never in the pause key's saved set. |
+| `limit.lock` | `flock`ed while `limited.json` is read, changed and written (`limit-add`, `limit-tick`, `limit-resume`, and a resume press's limit half, after it has released the pause lock). Never the same lock as the pause key's, and never held together with it. |
 
 The tmux global option `@agents_paused` holds the number of agents still saved
 while paused, and is unset once none are left.
@@ -379,6 +381,242 @@ press resumes. Otherwise it pauses.
   agent that tmux-mcp always refuses, or one that is really closed, cannot hold
   the toggle in resume mode forever. `paused.json` is removed, and
   `@agents_paused` unset, only once nothing is left.
+
+## Rate-limited agents
+
+When a turn hits a usage limit, the agent is a **paused agent with a
+reason**, not a second state machine. It keeps every paused behaviour: no
+NEEDS YOU row, no notification, its slot released. What it adds is a way
+back: once the limit lifts, this script sends it the limit's own resume
+text. The design contract is the "Rate-limited agents" contract (v1.1); this
+section covers the script's half of it, the resume engine.
+
+**Who marks it.** The tab indicator (StopFailure `rate_limit`; for codex, the
+watcher's rollout reconcile) writes, in one tmux list, `@agent_paused`,
+`@agent_limit "<resets_at> <type> <since>"`, the detail, the turn result and
+`@agent_state paused` last, then runs `agent-pause.py limit-add <window_id>`
+in the background. The indicator and agent-tab-watcher.sh are owned by
+@tmux-agent-sidebar, and so is the watcher's trigger for `limit-tick`: it
+spawns one when `@agent_limit_due` comes, when `sequence.json` changes (a
+cswap switch), or on wake, at most once per 20 s.
+
+| option | meaning |
+|---|---|
+| `@agent_limit` (window) | `"<resets_at> <type> <since>"`. `resets_at` is epoch s, or 0 when unknown (a model/Fable limit). `type` is `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `model`, `overage` or `codex`. `since` is when it was marked. Its presence means rate-limited; a Stop (success) clears it. |
+| `@agent_limit_lifted` (window) | `<epoch>`: the limit has lifted but the agent waits for Mack (auto-resume off, or past the attempt cap). Set by `limit-tick`; unset when a limit RESUME gets through or a re-mark starts a new limit. |
+| `@agent_limit_autoresume` (global) | `on` (agent-pause.conf's default) or `off`. Mack's setting. |
+| `@agent_limit_due` (global) | the earliest epoch at which `limit-tick` could act on anyone, or unset when nothing can happen without Mack (or nothing is limited). Kept by this script, read by the watcher. |
+
+### The commands
+
+- **`limit-add W`** (`W` a window id, or one of its panes). Reads the
+  window's `@agent_limit`, its agent pane and session id (picked as for a
+  pause target), its label, and `account` from usage.json's root. The merge
+  is idempotent, by window or session id: a re-mark (queued task
+  notifications each hit the limit again) updates `resets_at`, `type`,
+  `since` and `account` and keeps `attempts`. A re-mark with a new `since`
+  is a new limit, so `lifted_at` and `resumed_at` go and
+  `@agent_limit_lifted` is unset. A re-mark more than 15 min after our last
+  RESUME is a **new episode**, not that RESUME's false lift (which re-marks
+  within minutes): `attempts` starts over and `last_result` goes, so a cap
+  reached hours ago cannot cap the next limit. Any other entry for the same
+  window or session is pruned (its episode has ended), and an entry whose
+  window now runs another session starts over as a new target. A window
+  without `@agent_limit` is not added. It waits up to 180 s for `limit.lock`
+  (a background job; a lost add would leave the agent unresumed). Then it
+  recomputes `@agent_limit_due`.
+- **`limit-tick`**. One pass over `limited.json` (details below). If another
+  run holds `limit.lock`, it does nothing.
+- **`limit-auto on|off|toggle`**. Sets the live global
+  `@agent_limit_autoresume` (agent-pause.conf holds the default). Turned on
+  while lifted targets exist, it sets `@agent_limit_due` to now so the
+  watcher's next tick resumes them. Says the result as a toast.
+- **`limit-resume [--force] W`**. Mack's manual resume of one limited window
+  (the sidebar's click on a limited card). Refused with the toast
+  `rate-limited until <local time>` unless the target is eligible by either
+  rule below, or lifted, or `resets_at` is 0 (only Mack can judge a model
+  limit), or `--force`. A click in the 120 s just after the reset gets
+  `limit just reset · auto-continue first, try after <t>`. It skips the wake
+  and network graces and the saved-set deferral (Mack asked); only a pause
+  press still delivering stops it. It refuses a window that is already
+  running, and otherwise needs only `@agent_limit` (not `@agent_paused` or
+  `paused`), so an agent left idle by a RESUME that never landed can still
+  be resumed by hand. While a held RESUME may still be queued for it, it
+  refuses with `a resume is already waiting behind the draft in <label>'s
+  box` unless `--force`: tmux-mcp would queue a second copy behind the
+  first. It delivers the same way as the tick.
+
+All four are hook, watcher and click paths: like the key, they never print
+and always exit 0. Every outcome is in the log, and Mack's own actions
+(`limit-auto`, `limit-resume`) also get a toast.
+
+### limit-tick
+
+For each target in `limited.json`:
+
+1. **Drop it** if its window is gone, or no longer carries `@agent_limit`:
+   a Stop after its RESUME (or after Claude's native auto-continue) cleared
+   it, or Mack moved it on. A target is found the way the pause key finds a
+   saved one (`locate`: by session id, so a resurrect restore is followed).
+   The window's live `@agent_limit` then wins over the stored one (the same
+   renewal as a re-mark), so a `limit-add` that never ran cannot leave a
+   stale `since` for the cswap rule or the flag stamp. The stored `account`
+   stays (it is the one the limit was hit on); now's only fills a target
+   that has none.
+2. **Actionable only while** the window has `@agent_state paused` AND
+   `@agent_paused` AND `@agent_limit`. A running window (its RESUME's turn,
+   or a prompt Mack typed) is skipped but kept: that turn's outcome decides,
+   a Stop drops it, a fresh limit re-marks it.
+3. **Eligible when** either:
+   - **the clock:** `now >= resets_at + 120`. The 120 s grace lets Claude's
+     native auto-continue (reset + 30-90 s) go first, so there is never a
+     double prompt; or
+   - **a cswap switch freed it**, which needs all four of:
+     - `~/.claude-swap-backup/sequence.json`'s mtime is newer than the
+       target's `since`;
+     - `~/.cache/codexbar-tmux/usage.json`'s `updated_at` is newer than that
+       mtime (the numbers are the new account's);
+     - usage.json's root `account` differs from the target's `account`;
+     - the matching window is free on that account. The family is
+       `five_hour` → `session`; `seven_day_opus` / `seven_day_sonnet` →
+       `scoped` (or `weekly` while `scoped_used` is null); `seven_day`,
+       `overage` and anything else → `weekly`. Free means `<family>_locked`
+       is `false` AND either `<family>_used` is a number under 100, or (no
+       reading) usage.json's `fetched_at` is newer than the switch. The flag
+       alone proves nothing: right after a switch the publisher adopts
+       cswap's reading with every `*_locked` reset to false and `fetched_at`
+       left behind, so a switch to an exhausted account would pass.
+
+   `resets_at` 0 is **never** eligible by itself. `codex` targets go by the
+   clock only. A target already lifted stays eligible until a re-mark.
+4. **Graces.** The whole tick waits while `now - kern.waketime < 30 s` (the
+   later of `kern.waketime` and `kern.boottime`, as the sidebar reads them):
+   the network is still coming up. A target is skipped unless its host
+   resolves (`api.anthropic.com`, or `chatgpt.com` for codex), checked with
+   `getaddrinfo` in a thread with a 2 s timeout.
+5. **A manual pause defers everything.** While `paused.json` lists targets,
+   or a pause press is still delivering (its `paused.json` is written only
+   afterwards, so `progress.json` says it: mode `pause`, `done` false, its
+   toggle alive, and the press younger than 10 min by its id's millisecond
+   stamp, so a record left behind whose pid was reused never stalls it),
+   the tick acts on nobody; the toggle's resume takes the
+   lifted ones along (below). The pause lock itself is never probed: the key
+   takes it non-blocking, so even a brief hold would turn Mack's press away
+   as busy.
+6. **Auto-resume off** (or past the attempt cap): `@agent_limit_lifted
+   <epoch>` on the window, `lifted_at` in the file, and one notify.sh toast,
+   `limit lifted · resume? <label>`, once per lift. No message is sent.
+7. **Auto-resume on:** each eligible target, at least 5 s apart:
+   1. re-checked right before its delivery: still actionable, `paused.json`
+      still empty and no pause press delivering. If a manual pause began,
+      the tick **stops** there and the rest wait for its resume;
+   2. `@agent_paused` unset (as for a pause RESUME; `@agent_limit` stays, so
+      the paste makes it running and the turn's outcome decides);
+   3. the message, through tmux-mcp's `message_agent`, **not urgent** (a
+      half-typed draft holds it, like the pause RESUME):
+      `[limit] Your usage limit has reset. Continue the task you were
+      working on when the limit was reached; do not repeat work that is
+      already complete.` (the native auto-continue's own words);
+   4. **sent, held or no reply** counts as reached: `resumed_at`,
+      `@agent_limit_lifted` cleared, the flag left off. A **held** one sits
+      in tmux-mcp's per-pane queue, with no dedupe, until the box clears or
+      for up to 2 h, so it is never sent again while a copy may be queued
+      (`held_at`). `held_at` goes on any re-mark (a turn has run since, so
+      the copy has landed) and after a later `sent`. If a held (or
+      unanswered) RESUME has not landed 10 min on (the window neither
+      running nor paused again), it is lifted for Mack, never resent, with
+      one toast that says why: `limit lifted · a resume is waiting behind a
+      draft in <label>'s box` (or, unanswered, `<label>'s resume got no
+      reply: resume?`);
+   5. on a **refusal**, `@agent_paused` goes back on (and `idle` back to
+      `paused`), stamped with the limit's own `since`, never now: the
+      indicator clears the flag on the turn's outcome only when it equals
+      that value. Retried after the backoff;
+   6. `attempts` + 1, `last_attempt`, `last_result`.
+8. Finally `@agent_limit_due` is recomputed.
+
+**Attempts, backoff and the cap.** Each RESUME that goes out counts one
+attempt, whatever its result. The next one waits `120 s × 2^(attempts-1)`
+after the last. After 3 the target is treated as auto-resume off: lifted, one
+toast, and it waits for Mack (`limit-resume`, which still counts). If
+tmux-mcp cannot be reached at all, nothing went out and no attempt is
+counted. A new episode (a re-mark more than 15 min after the last RESUME)
+starts the count over.
+
+**No false-lift loop.** If a RESUME's turn hits the limit again (the switch
+landed on an account that is out too), the indicator re-marks it with a new
+`since`. The switch that freed it last time is now older than `since`, so
+only a newer switch, or the wall-clock reset, can free it again.
+
+**`@agent_limit_due`** is the minimum, over the actionable targets, of
+`max(resets_at + 120, last_attempt + backoff)`, or the backoff alone for a
+target whose limit has already lifted (eligible now, e.g. freed by a switch,
+or lifted while auto-resume is on): a refused retry of a switch-freed agent
+must not wait for a reset days away. A target with a held copy possibly
+queued waits until that copy would expire, and a held RESUME still not
+landed counts its 10 min check. A target waiting for Mack, a `resets_at` 0
+target, and one that is not actionable (running) do not count.
+If that moment has already passed after a tick (something was due but could
+not be acted on: offline, deferred, refused), it becomes now + 60 s, or the
+end of the wake grace, so the watcher does not respawn a tick every 20 s.
+Unset when nothing counts.
+
+**A switch waits for usage.json.** The watcher runs one tick when
+`sequence.json` changes, but usage.json describes the new account only after
+the publisher's next status tick (every 15 s), so that tick sees `updated_at`
+not newer than the switch and cannot free anyone. While a switch is newer
+than an actionable target's `since` and usage.json is not newer than the
+switch, that target's due is at most now + 20 s, so the watcher keeps
+calling until usage.json catches up; for at most 5 min after the switch, so a
+usage.json that never settles stops the polling (back to the normal due).
+This holds with auto-resume off too (the tick must still see the lift to mark
+it), but not for a target already waiting for Mack, a codex target or a
+model limit, none of which a switch frees.
+
+**Times** read the same on every surface (toasts, refusals, the log,
+status/dry-run), by calendar days in local time: today `5:31 PM`, the next six
+days `Tue 5:31 PM`, anything else, a week or more on or in the past, `Nov 2
+5:31 PM`. No leading zeros. (A bare weekday for a reset 6 days 20 h out read
+as today.)
+
+### With the pause key
+
+- **Pause** never targets a limited window: it is not working, even with a
+  workflow still out (that one is limited too). Only its own RESUME's turn
+  (running, `@agent_limit` kept) is working, and is paused like any other.
+- **Resume** (prefix P, the sidebar's banner, Enter in the popup): a saved
+  target whose window now carries `@agent_limit` and is **not running** (its
+  PAUSE reply's turn hit the limit) gets **no** pause RESUME, which would
+  spend a turn on the same error. It keeps `@agent_paused`, rewritten to the
+  limit's own `since` (see the refusal step above), leaves `paused.json`, is
+  merged into `limited.json`, and the toast says `<label> rate-limited until
+  <t>` (the popup row: `rate-limited (left paused)`). One that is running (P
+  pressed during a `[limit]` turn) is resumed like any running target: handed
+  over, its Stop would clear the limit and leave it paused in neither set.
+- **After the RESUMEs**, the limited agents whose limit has lifted (lifted,
+  or eligible by either rule) get the `[limit]` text, never the pause
+  RESUME, staggered after (auto-resume on, not past the cap, no held copy
+  queued), or are marked lifted without a message (off; the resume's toast
+  says so). No wake or DNS grace: Mack pressed the key. This resume's own
+  leftover misses in `paused.json` do not stop it; a new pause does. Then
+  `@agent_limit_due` is recomputed.
+- **None of the limit half runs under the pause lock.** Under it, the press
+  only decides what goes where and writes `paused.json` (and the flag
+  stamps). The merge into `limited.json` and the `[limit]` deliveries run
+  once the press has released the lock (`limit_after_press`), so a pause
+  press meanwhile is never turned away as busy. They also run after the
+  resume's own toast, so their staggers never hold it up: their outcome is a
+  second toast, and a `limit-after-resume` log line.
+- **void** and **dismiss** never touch `limited.json` or `@agent_limit`.
+- **status** and **dry-run** list the limited set: window, kind, type,
+  `resets <time>` or `lifted`, attempts and label (dry-run adds which are
+  eligible now, and marks a saved target that resume would hand over).
+
+Tests: the `RateLimits` class (private server, stub tmux-mcp, a fake
+notify.sh) injects the clock, the last wake and DNS through
+`AGENT_PAUSE_NOW`, `AGENT_PAUSE_WAKETIME` and `AGENT_PAUSE_DNS` (`ok`,
+`fail`, or a comma list of hosts that resolve), and sets
+`AGENT_PAUSE_LIMIT_STAGGER=0`.
 
 ## Failure modes
 

@@ -28,6 +28,7 @@ State by state (unselected tab):
 | `failed` | the turn itself died (`StopFailure`: 529, overloaded) | crust (red digit) | red `#f38ba8` | — |
 | `done` | turn finished | crust (green digit) | green `#a6e3a1` | — |
 | `paused` | a turn end while the pause key's `@agent_paused` is set (see "Paused" in §6) | blue, solid | stock | electric violet `⏸` `#7f6bff`, still |
+| `paused` (or `idle`) + `@agent_limit` | **rate-limited**: a usage limit ended the turn (Claude `StopFailure` `rate_limit`, a Codex `usage_limit_exceeded`), or that limit has lifted and the agent waits for Mack (`@agent_limit_lifted`); see §7 | blue, solid | stock | peach `󱎫` `#fab387`, still (one colour for limited and lifted) |
 | any | agent has a conversation title | — | — | tab name = `project/short-title`, else `#W` |
 
 **The selected tab never pulses**: solid peach `#fab387` for every ambient state (idle/running/cua/workflow). You are looking at it — the terminal itself is the progress indicator. Attention states still force the chip to crust even when selected, because the digit's fg *is* the bright body tint and needs a dark chip to read; focusing a prompt is not answering it.
@@ -72,7 +73,7 @@ Two per-window tmux user options are the single source of truth:
 - `@agent_kind` — `claude | codex | opencode`: whose hooks drive the window. Written by any indicator hook that writes state or detail (in the same command list), unset with the state by `clear_state` and the watcher GC. Never written by the focus hook or a no-op heartbeat. Before any hook has fired (Codex's first hook waits for the first prompt), the watcher seeds it from the agent process's own comm; it never overwrites a kind that is already set (see the watcher section).
 - `@agent_ask_from` — who a `needs-input` is waiting for: the `PermissionRequest` payload's `agent_id` (a subagent's gate) or `main`. Written by `needs-approval` for a `PermissionRequest` (never its `Notification` twin) in the same command list as the state; unset in `set_state`'s command list by any write that *leaves* `needs-input`, by `clear_state`, and by the watcher's viewed discharge and GC. Read by the heartbeat and by `Stop` (see **Asker gate**). Unset while `needs-input` (a gate raised by the `Notification` alone, a window that went yellow before 2026-10-21, a quiet restore) means *no asker*: the old rule, any tool call re-arms.
 - `@agent_held_detail` — `"<kind>\t<text>"`: the detail a main-agent `Stop` would have written while a subagent's gate held the window at `needs-input`; written back by the heartbeat (or `subagent-stop`) that ends that gate. Unset by the next prompt, Stop, failure, SessionStart, `clear_state` and the watcher GC (see **Asker gate**).
-- `@agent_ask_bg`, `@agent_ask_seen`, `@agent_turn_start` — **Asks while work is out** (2026-10-22). A `Stop` held `running` by background work (agent-bg-pending) asks cua-notch's `~/.local/bin/agent-turn-asks` whether the turn ended asking Mack: synchronously `--marker-only --since @agent_turn_start` (the agent's own `agent-needs-you` marker), SIGTERMed at 300 ms; else, for a loud turn, ONE detached full run (its model backstop, SIGTERMed at `AGENT_TAB_ASK_BG_TIMEOUT`, default 30 s) whose yes lands only while the window is still `running` with the same `@agent_turn_origin|@agent_turn_result` the Stop wrote (built by the Stop, not read back) and the line is not `@agent_ask_seen` - checked IN tmux: the cleaned line is staged in `@agent_ask_line`, an `if-shell -F` guard runs the raise (the detail copied `-F` from the stage), the stage is unset and the state read back, all one command list; the token and agent are held to a plain charset before they reach it, and the payload file is opened on fd 4 and removed before the decider runs. Seen as it lands (Mack looking), that run writes only `@agent_ask_seen` and `@agent_seen_at`. A marker makes even an agent-started turn loud (as `notify_user` does); the model run is for loud turns only; a subagent's standing gate or a pause skips all of it. A yes **raises**: `@agent_state needs-input`, `@agent_detail_kind ask`, `@agent_detail` the line (DETAIL_JQ-sanitized), `@agent_ask_from main` (only the main agent's own tool call re-arms it, never a background subagent's), `@agent_ask_bg 1` — in `set_state`'s one command list. Not raised, and nothing ask-related written, when the line equals `@agent_ask_seen` (both sides through the same sanitizer), or while Mack is looking (then the Stop stays `running`, stamped seen, and the line becomes `@agent_ask_seen`). A **look** (`clear-current`, the watcher's viewed-discharge, agent-ui's answer discharge, which is `clear-current`) at an `@agent_ask_bg` window (any non-empty value, `1` or a counted `1 N`) copies `@agent_detail` into `@agent_ask_seen` (only while `@agent_detail_kind` is `ask`) and, while `@agent_workflow` says the work is still out, writes in ONE command list `@agent_seen_at E`, `@agent_state running`, `@agent_since "E running"`, unsets `@agent_detail_kind`, `@agent_ask_bg` and `@agent_ask_from` (`@agent_detail` stays); with nothing out, the ordinary idle + `@agent_pending` discharge. Only a later `Stop` raises again. `@agent_ask_bg` is unset by every write that leaves `needs-input` (`set_state`, `clear_state`, the watcher's discharges, codex turn ends, paused, restores), by a permission gate that lands on it (the gate replaces the ask; a `Notification` twin there writes `perm` and drops the `main` asker), and by the GC; agent-pause.py never counts a `needs-input` window as working, gear or not; the watcher asks agent-bg-pending for a raised ask too, so its gear (`@agent_workflow`) stays true for a background task. `@agent_turn_start` ("<epoch>") is stamped by every prompt that is not a harness wake-up (TURN_JQ's `sys`); `@agent_ask_seen` is unset by Mack's own prompt (not a wake-up, not a verified peer message), a non-compact `SessionStart`, `clear_state` and the GC. agent-ui files such a window under NEEDS YOU (`needs-input` beats in-flight) as `◉ asks · ⚙` (`⚙ N` once a writer puts the count in `@agent_ask_bg`'s second word).
+- `@agent_ask_bg`, `@agent_ask_seen`, `@agent_turn_start` — **Asks while work is out** (2026-10-22). A `Stop` held `running` by background work (agent-bg-pending) asks cua-notch's `~/.local/bin/agent-turn-asks` whether the turn ended asking Mack, synchronously and ONLY for the agent's own marker: `--marker-only --since @agent_turn_start`, SIGTERMed at 300 ms. **Explicit only** (2026-10-26, Mack's call): to be shown as needing him while its work is still out, the agent must run `agent-needs-you "<what>"` right before it ends its turn. There is no model guess any more: the detached full run (agent-turn-asks' copilot model backstop, which judged the last message and raised `needs-input` far too often) is gone, with its `ask-bg` worker, the `@agent_ask_line` stage and `AGENT_TAB_ASK_BG_TIMEOUT`. No marker = the Stop stays `running` and nothing ask-related is written. A marker makes even an agent-started turn loud (as `notify_user` does); a subagent's standing gate or a pause skips all of it. A yes **raises**: `@agent_state needs-input`, `@agent_detail_kind ask`, `@agent_detail` the line (DETAIL_JQ-sanitized), `@agent_ask_from main` (only the main agent's own tool call re-arms it, never a background subagent's), `@agent_ask_bg 1` — in `set_state`'s one command list. Not raised, and nothing ask-related written, when the line equals `@agent_ask_seen` (both sides through the same sanitizer), or while Mack is looking (then the Stop stays `running`, stamped seen, and the line becomes `@agent_ask_seen`). A **look** (`clear-current`, the watcher's viewed-discharge, agent-ui's answer discharge, which is `clear-current`) at an `@agent_ask_bg` window (any non-empty value, `1` or a counted `1 N`) copies `@agent_detail` into `@agent_ask_seen` (only while `@agent_detail_kind` is `ask`) and, while `@agent_workflow` says the work is still out, writes in ONE command list `@agent_seen_at E`, `@agent_state running`, `@agent_since "E running"`, unsets `@agent_detail_kind`, `@agent_ask_bg` and `@agent_ask_from` (`@agent_detail` stays); with nothing out, the ordinary idle + `@agent_pending` discharge. Only a later `Stop` raises again. `@agent_ask_bg` is unset by every write that leaves `needs-input` (`set_state`, `clear_state`, the watcher's discharges, codex turn ends, paused, restores), by a permission gate that lands on it (the gate replaces the ask; a `Notification` twin there writes `perm` and drops the `main` asker), and by the GC; agent-pause.py never counts a `needs-input` window as working, gear or not; the watcher asks agent-bg-pending for a raised ask too, so its gear (`@agent_workflow`) stays true for a background task. `@agent_turn_start` ("<epoch>") is stamped by every prompt that is not a harness wake-up (TURN_JQ's `sys`); `@agent_ask_seen` is unset by Mack's own prompt (not a wake-up, not a verified peer message), a non-compact `SessionStart`, `clear_state` and the GC. agent-ui files such a window under NEEDS YOU (`needs-input` beats in-flight) as `◉ asks · ⚙` (`⚙ N` once a writer puts the count in `@agent_ask_bg`'s second word).
 - `@agent_slot` — decimal integer ≥ 1: the window's sticky number in agent-ui's Option-W menu and sidebar. Held only while the window is in the Active set and visible. Stamped by the indicator's `set_state` when a window enters the Active set, and by the watcher as the backstop; released and repaired only by the watcher (see "Agent slots" in the watcher section).
 - `@agent_detail_kind` + `@agent_detail` — what the event that set the state was *about*, for the sidebar (not rendered in the tab bar):
 
@@ -82,6 +83,7 @@ Two per-window tmux user options are the single source of truth:
   | `perm` | `PermissionRequest` (and `Notification`/`permission_prompt`) | tool name + its most identifying input: `command`, `file_path` (cwd-relative, else `~/…`), `url` (scheme/`www.` stripped), `pattern`, `path`, `query`, `description`… — e.g. `Bash git push origin main`, `Edit scripts/foo.py`, `WebFetch example.com` |
   | `ask` | `PermissionRequest` with `tool_name=AskUserQuestion` | the first question's text |
   | `fail` | `StopFailure` | `<error>: <error_details>` (either half), else `turn failed` |
+  | `limit` | `StopFailure` with `error` `rate_limit`; the watcher's Codex `usage_limit_exceeded` | `weekly limit · resets Tue 1:00 AM`, `session limit · resets 3:30 PM`, `Codex limit · resets Oct 31 11:10 PM`, `Fable limit · /model to switch` (see §7) |
   | `done` | `Stop` | first non-empty line of `last_assistant_message` (Claude, verified 2.1.294; Codex sends the same field); Claude without the field falls back to the last assistant text in the transcript's last 64 KB; else `turn finished` |
 
   Both are written by `set_state` in the **same tmux command list** as `@agent_state`/`@agent_since`, even when the state itself is unchanged, so a reader never pairs a new state with an older event's detail. Unset by `SessionStart` (except `source=compact`, which fires mid-turn), by `clear_state`, and by the watcher GC; the watcher's codex turn-end reconcile also writes them (`done`/`turn finished`, or unset after an abort; see the watcher section); never touched by the heartbeat (it stays fork-free) or the focus discharge — except the heartbeat that ends a subagent's gate a main-agent `Stop` was held on, which writes that Stop's stashed detail (`@agent_held_detail`, see **Asker gate**). A `Notification` names no tool, so it never overwrites a `perm`/`ask` its `PermissionRequest` twin already wrote (one extra `show-options`, only on that event); landing first, it stands in as `perm <Tool>` parsed from "…permission to use <Tool>". The detail of a `Stop` held `running` by background work is still `done`. Text is untrusted and sanitized in the same jq call that extracts it (one fork per event): one line, no `#` `"` `%`, no control characters (C0, DEL, C1, U+2028/9) and no invisible/bidi controls (U+200B–200F, U+202A–202E, U+2060–2069, U+FEFF, U+061C), whitespace collapsed, leading/trailing `;`/space dropped (a tmux argv element ending in `;` terminates the command list), ≤ 80 code points with a trailing `…` when cut. Every value is sliced (4000, then 1000 code points) *before* any per-character work: unbounded, the sanitizer was quadratic (a 152 KB heredoc took 16 s), which blocks a permission dialog or prompt submission and gets a Codex hook killed at its 10 s timeout, state write included; bounded, a 1 MB payload costs ~20 ms of jq, and a jq failure yields the bare kind, never a lost state write. The detail rides in globals (`dkind`/`dtext`, consumed by the next `set_state`), so every call site stays `set_state "$win" <state>` — cua-notch's `dev/check-invariants` pins `        set_state "$win" failed` verbatim. Values reach tmux only as `set-option` argv: stored verbatim, and `list-windows -F '#{@agent_detail}'` expands them without re-parsing formats inside (checked on a scratch tmux 3.7c server).
@@ -150,9 +152,10 @@ payload on stdin. Hook processes are children of the agent, so
 |---|---|
 | `SessionStart` | `idle` (skips `source=compact` — fires mid-turn; a fresh session shows `project/New Session` until the first turn titles it) |
 | `UserPromptSubmit` | `running` |
-| `PostToolUse` | `heartbeat` (re-arms `running` *only* from `running`/`failed`/`needs-input`, or idle + `@agent_pending`, so a late tool call can't resurrect a finished tab; from `needs-input` only for the agent that asked — see **Asker gate** below; never parses stdin — `tool_response` can be huge — and peeks at its first 8 KB only while the window is `needs-input`) |
-| `PermissionRequest`, `Notification` (matcher `permission_prompt`) | `needs-approval` — **unless `tool_name` is a question tool, then `needs-input`** (see below) |
-| `StopFailure` | `needs-input` |
+| `PostToolUse`, `PostToolUseFailure` | `heartbeat` (re-arms `running` *only* from `running`/`failed`/`needs-input`, or idle + `@agent_pending`, so a late tool call can't resurrect a finished tab — never from `paused`; from `needs-input` only for the agent that asked, from `failed` only for the main agent — see **Asker gate** below; never parses stdin — `tool_response` can be huge — and peeks at its first 8 KB only while the window is `needs-input` or `failed`) |
+| `PermissionRequest`, `Notification` (matcher `permission_prompt`) | `needs-approval` → `needs-input` (yellow: approvals and questions are one state since 2026-08-21) |
+| `SubagentStop` | `subagent-stop` (the asking subagent's end ends its gate; see **Asker gate**) |
+| `StopFailure` | `failed` (red) — except `error` `rate_limit`, which marks the window **rate-limited** (`paused` + `@agent_limit`, §7) |
 | `Stop` | `done` |
 | `SessionEnd` | `clear` (skips reasons `clear`/`resume` — a new SessionStart follows) |
 
@@ -187,8 +190,10 @@ which teaches you to discount red. `is_question_payload` routes
 `AskUserQuestion` to yellow `needs-input`; everything else stays red, and a
 question still loses to a standing gate.
 
-Yellow therefore means two things now — *the turn failed, retry* (`StopFailure`)
-and *answer a question* — united by "wants your words, not your consent".
+(Superseded twice since: approvals and questions became ONE yellow state on
+2026-08-21, and a failed turn (`StopFailure`) is `failed`, red — red means
+*something broke* — never yellow. A usage limit is not a failure at all: it is
+the rate-limited `paused`, §7.)
 
 `QUESTION_TOOLS` is deliberately the same identifier used in
 `~/.local/bin/cua-notch-agent-hook`, which makes the identical distinction: it
@@ -324,25 +329,14 @@ only *acknowledges* rows, so this fix does not reach the notch.) Now:
   prompt, Stop, failure, SessionStart, `clear_state` and the watcher GC.
   Matches CuaNotch, which keeps its row `input`. A `StopFailure` still goes
   red; a new prompt always ends the gate.
-- **Gaps in the wiring (not this script's to fix).** The asker's gate ends on
-  its next `PostToolUse`. Two ways a subagent's gate can end with none:
-  its approved tool *fails* (Claude fires `PostToolUseFailure`, which
-  `~/.claude/settings.json` sends only to the chezmoi guard), or it is denied
-  and simply finishes (`SubagentStop`, not wired to this script at all;
-  CuaNotch ends the gate there). Either leaves the tab yellow until a focus
-  or the next prompt. The script is ready for both — `heartbeat` already
-  handles a failure payload (same base fields, `agent_id` ahead of
-  `hook_event_name`), and the `subagent-stop` mode ends a needs-input whose
-  asker is that `agent_id` (only that: from `failed` or idle + pending it is
-  inert, since a subagent ending is not the main turn resuming) — and needs
-  only two `hooks` entries in settings.json:
-
-  ```json
-  "PostToolUseFailure": [ … existing chezmoi-guard entry …,
-    { "hooks": [ { "type": "command", "command": "bash '/Users/mackhaymond/.config/tmux/scripts/agent-tab-indicator.sh' heartbeat claude" } ] } ],
-  "SubagentStop": [
-    { "hooks": [ { "type": "command", "command": "bash '/Users/mackhaymond/.config/tmux/scripts/agent-tab-indicator.sh' subagent-stop claude" } ] } ]
-  ```
+- **The two gate ends with no `PostToolUse`** are wired (both are in
+  `~/.claude/settings.json`): an approved tool that *fails* fires
+  `PostToolUseFailure`, which goes to `heartbeat` like any tool call (same
+  base fields, `agent_id` ahead of `hook_event_name`); a subagent that is
+  denied and simply finishes fires `SubagentStop`, whose `subagent-stop`
+  mode ends a needs-input whose asker is that `agent_id` (only that: from
+  `failed` or idle + pending it is inert, since a subagent ending is not the
+  main turn resuming). CuaNotch ends the gate at `SubagentStop` too.
 - **How the heartbeat knows who.** It still never waits on or parses the
   whole payload. Claude Code (2.1.306, `wu()` in the bundle) builds every hook
   payload as `{session_id, transcript_path, cwd, scratchpad_dir, prompt_id,
@@ -360,7 +354,7 @@ only *acknowledges* rows, so this fix does not reach the notch.) Now:
   moved `agent_id` after `hook_event_name`, every heartbeat would read as
   `main`: the main agent's gates keep working, subagent heartbeats clobber
   them again as before the fix, and a subagent's own gate waits for a
-  focus, its `SubagentStop` (once wired) or the next prompt. Re-check the
+  focus, its `SubagentStop` or the next prompt. Re-check the
   bundle's `wu()` after a Claude upgrade that touches hooks.
 - **Cost.** The `running`/`failed` heartbeat runs the same commands as
   before (one `show-options`, the drain), with no payload read. The
@@ -1182,8 +1176,9 @@ Pink sits 27° from needs-approval red `#f38ba8`, which sounds close but cannot
 collide: attention states force the chip to crust, so a red chip and a pink
 chip never exist on the same surface (and pink is far lighter, 0.638 vs 0.404).
 
-The text options add the exception glyph (teal `󰒓` workflow, blue `󰍽` cua,
-nothing otherwise; crust and unpulsed on a tinted tab), a readable fg on bright
+The text options add the exception glyph (teal `󰒓` workflow, violet `⏸`
+paused, peach `󱎫` rate-limited, blue `󰍽` cua, nothing otherwise; crust and
+unpulsed on a tinted tab), a readable fg on bright
 backgrounds (crust `#11111b`), and the summary with `#W` fallback:
 `#{?#{n:#{@agent_summary}},#{@agent_summary},#W}`. The summary is
 pre-shortened by the indicator script, so there is no render-side
@@ -1312,8 +1307,9 @@ watcher's event-log line.
 | `@agent_awaiting` | tmux-mcp, on a *sender* whose turn is Mack's | `<pane>=<epoch>` entries, 2 h |
 | `@agent_for_user` | `notify_user` / `agent-notify-user.sh` | `<epoch> <reason>` (one line, no `\|` `#`, ≤ 200 chars) |
 | `@agent_turn_origin` | indicator, UserPromptSubmit | `<user\|agent> <turn_id> <from\|->` |
-| `@agent_turn_result` | indicator, Stop / StopFailure | `<turn_id> loud`, `<turn_id> quiet <restored_state>`, or `<turn_id> paused` |
-| `@agent_paused` | agent-pause.py (docs/agent-pause.md) | `<epoch>`: turn ends write `paused` (see "Paused" below) |
+| `@agent_turn_result` | indicator, Stop / StopFailure; the watcher's Codex limit | `<turn_id> loud`, `<turn_id> quiet <restored_state>`, `<turn_id> paused`, or `<turn_id> limited <resets_at>` (§7) |
+| `@agent_paused` | agent-pause.py (docs/agent-pause.md); a rate-limit mark (§7) | `<epoch>`: turn ends write `paused` (see "Paused" below) |
+| `@agent_limit`, `@agent_limit_lifted` | a rate-limit mark (§7); agent-pause.py's limit-tick (lifted) | `"<resets_at> <type> <since>"`; `<epoch>` |
 | `@agent_prior_state`, `_since`, `_detail_kind`, `_detail` | indicator, at an agent turn's start | the attention state to restore |
 | `@agent_inbound_seen` | indicator, mid-turn | verified mid-turn messages, inbound's format, ≤ 8 |
 | `@agent_quiet` | a quiet restore (indicator or watcher), consumed by the watcher | `<from\|->`: the next event-log line is the reply; also dropped by the next prompt and by a loud Stop |
@@ -1511,6 +1507,176 @@ an agent message (the opener test the contract allows).
 
 Tests: `tests/test_agent_origin.py` (a real private tmux server for the
 indicator, the watcher's fake harness for its restores).
+
+### 7. Rate-limited agents
+
+A usage limit ends a Claude turn with `StopFailure` (`error` `rate_limit`),
+not `Stop`. That used to land as `failed`: red, top of NEEDS YOU, red in
+CuaNotch, and never resumed, although nothing broke. Since 2026-10-26 a
+rate-limited agent is a **`paused` agent with a reason**, not a second state
+machine: every surface already keeps `paused` out of NEEDS YOU, releases its
+slot and never discharges it on focus. agent-pause.py owns the resume
+(`limited.json`, `limit-add` / `limit-tick` / `limit-resume`,
+docs/agent-pause.md); this page covers the tab side.
+
+**Options** (window scope unless noted):
+
+| Option | Value |
+|---|---|
+| `@agent_limit` | `"<resets_at> <type> <since>"`. `resets_at` is epoch seconds, `0` when unknown (a model limit). `type` is `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `overage`, `model` or `codex` (`seven_day_overage_included` and other `seven_day_*` are written `seven_day`; an unknown type is guessed from how far out the reset is). `since` is when it was marked, the same epoch as the mark's `@agent_paused`. Its presence means rate-limited. |
+| `@agent_limit_lifted` | `<epoch>`: the limit has passed but the agent waits for Mack (auto-resume off or deferred); written by limit-tick. |
+| `@agent_detail_kind` `limit` + `@agent_detail` | `weekly limit · resets Tue 1:00 AM`; `session limit · resets 3:30 PM` (the same day); `Codex limit · resets Oct 31 11:10 PM` (a week or more out); `Opus weekly limit` / `Sonnet weekly limit` / `overage limit`; for a model limit, the agent's own words: `Fable limit · /model to switch` from "You've reached your Fable limit…", else the message itself (cleaned like any detail), else `usage limit`. Times follow the ONE date rule every surface shares (agent-pause.py `fmt_local`, agent-ui `text::when`), by calendar days in local time: the same day `5:31 PM`, one to six days ahead `Tue 5:31 PM`, anything else (a week or more on, or past) `Nov 2 5:31 PM`; C-locale names. |
+| `@agent_turn_result` | `<turn_id> limited <resets_at>`: the cross-surface verdict (no red flare, no notify). |
+| `@agent_limit_due` (global) | the earliest moment any limited agent could resume, or unset; agent-pause.py keeps it, the watcher reads it. |
+| `@agent_limit_autoresume` (global) | `on`/`off`, Mack's setting, read by agent-pause.py. |
+
+**The mark** (indicator `failed` mode, main agent only: a payload with an
+`agent_id` is a subagent's and exits as before). The payload names the error
+but carries no reset, so the hook reads the transcript's last main-thread
+(`isSidechain` not true) record with `isApiErrorMessage` and `error`
+`rate_limit` — `tail -n 200`, `grep -F '"rate_limit"'`, one jq, never the
+whole file — for `quotaLimits.resetsAt` (else
+`apiErrorParams.rate_limit_info.resetsAt`), `quotaLimits.rateLimitType` and
+`apiError`. `apiError` `model_requires_usage_credits`, or no `resetsAt`, is
+type `model`, `resets_at` 0. Then ONE tmux command list: housekeeping unsets
+first (`@agent_pending`, `@agent_held_detail`, `@agent_quiet`,
+`@agent_limit_lifted`, the four `@agent_prior_*` — the turn after a limit is
+Mack's, so nothing is restored — and `@agent_ask_from`/`@agent_ask_bg` when
+leaving `needs-input`), `@agent_kind`, then in this order:
+
+1. `@agent_paused E`
+2. `@agent_limit "R T E"`
+3. `@agent_detail_kind limit`
+4. `@agent_detail "<text>"`
+5. `@agent_turn_result "<id> limited R"`
+6. `@agent_since "E paused"`
+7. `@agent_state paused` (last)
+
+then the STATE NOTICE, then `agent-pause.py limit-add <window_id>` through
+`tmux run-shell -b` (fire-and-forget: a missing or failing script costs
+nothing; `AGENT_LIMIT_PAUSE_PY` overrides the path). The mark is
+**idempotent**: queued task-notifications each start a turn that hits the
+limit again, and each re-mark writes the same `R` and `T` with a fresh `E`
+(limit-add merges and keeps its attempt count). Every other `StopFailure`
+error is `failed`, exactly as before.
+
+**A prompt while `@agent_limit` is set** (`running` mode):
+
+- **Held** while `@agent_paused` is still set, `resets_at` > 0 and now is
+  before it, unless Mack typed the prompt: a task-notification, a harness
+  wake-up or a peer's ping writes NOTHING (the tab stays `paused`, no
+  running flicker; that turn hits the limit and re-marks). Mack typed = not
+  a harness wake-up (TURN_JQ's `sys`), not a verified agent message, and not
+  a UserPromptSubmit whose `source` (Claude 2.1.311) is `loop_wakeup`,
+  `schedule_wakeup` or `poll_event`. Not `system` as a whole: native
+  auto-continuation arrives as `system`. The `source` is read for this hold
+  only; the origin rules (§6) classify by the prompt exactly as before.
+- Otherwise the turn **resumes the limited work**: `running`, with the
+  ordinary `run` detail (never a stale `limit`), and **loud**: the origin is
+  `user` and any prior is dropped, whoever sent it — including
+  agent-pause.py's RESUME, which tmux-mcp stamps `for=agent` (the manual
+  pause's "resuming Mack's own work is loud", §6) and a native
+  auto-continuation. No "Mack won't be notified" context is printed.
+- `@agent_paused` is unset in the same command list as the `running` write
+  by every prompt that is not held: Mack's, our RESUME (limit-tick has
+  usually unset it already), and a native auto-continuation that arrives
+  after the reset while the flag still stands because limit-tick never ran.
+  Otherwise the clean `Stop` that follows would read the flag and end the
+  turn `paused` instead of loud. The one stamp kept is the pause key's own,
+  set while the window was working (newer than the limit's `E`, state not
+  `paused`): its PAUSE may be this very prompt.
+- `@agent_limit` is **kept** until the turn's outcome.
+
+**Outcomes.** ANY turn outcome but a rate limit ends the limit: it unsets
+`@agent_limit` and `@agent_limit_lifted` in the outcome's own command list,
+and `@agent_paused` too while it is still the limit's `E` (`limit_end` in the
+indicator, `limit_end_cmd` in the watcher). That is a successful `Stop` (a
+held wake-up whose turn got through after all, say after a cswap switch, is
+then an ordinary finish, not `paused`), a non-`rate_limit` `StopFailure`
+(`failed`), the codex/OpenCode `interrupt` (Esc), and every watcher turn end
+(the stuck-`running` un-stick, the bg-pending release, a codex turn end, a
+quiet restore, a paused end). So a peer's message after it classifies
+normally again (agent, quiet, with its context). A pause-key stamp stands.
+A `Stop` whose
+id is the limited turn's own (`@agent_turn_result` `<id> limited …`: codex
+may run its Stop hook for the failed turn after the watcher marked it) changes
+nothing. A `rate_limit` `StopFailure` re-marks. `SessionStart` `clear`/`startup`, `clear_state`
+(SessionEnd) and the watcher GC drop both options wherever they drop
+`@agent_paused` (`ORIGIN_OPTS`, both scripts); `resume`/`compact` keep them.
+The heartbeat never re-arms from `paused`, and the watcher never moves a
+`paused` window.
+
+**Codex** has no failure hook, but it runs its `Stop` for a turn that ended on
+a usage limit. So the indicator's `done` mode, for codex, first reads the
+window's `@agent_rollout` tail (`codex_limit_parse`, 256 KB): when the last
+`task_complete` is a `usage_limit_exceeded` for THIS turn (its `turn_id` is
+the Stop's), the Stop marks the limit (the same list as Claude's, type
+`codex`) instead of writing `done`, so the `limited` verdict lands with the
+Stop (CuaNotch reads `@agent_turn_result` within 2 s of it). One
+`show-options` plus a tail and an awk, on codex Stops only. A later Stop
+carrying the limited turn's own id changes nothing. The watcher is the
+backstop, for a `task_complete` written after the hook ran or a Stop that
+never came: its rollout look (`codex_tail`) marks
+a `task_complete` whose `error.codex_error_info` is `usage_limit_exceeded` as
+`limit`. On a codex window that is `running` or `needs-input` with that event
+after its stamp (`cx_after`), or `done`/`idle` with a stamp under 30 s old
+and the event no more than 5 s before it (`cx_recent`: codex's own Stop hook
+may have painted the failed turn `done` in the same second; a settled
+`done`/`idle` window still reads no rollout), the watcher writes the same marking list
+(type `codex`, the task's `turn_id`) as one guarded `cas_write`, then spawns
+`agent-pause.py limit-add W`. `resets_at` comes from the message's
+`try again at 6:32 PM.` (the day of the `task_complete`'s own timestamp, or
+the next day once that time is past it - never "today" as of whenever the
+look happens) or `try again at Oct 22nd, 2026 2:55 AM.` (local time, BSD
+`date`); else from the last `token_count` carrying
+`rate_limits.primary/secondary.resets_at` (the window at `used_percent` ≥
+100, else the later, and only if still ahead); else 0. No hysteresis: the
+rollout's verdict is final. The limit test is the SAME in `codex_tail` and
+`codex_limit_parse`: `"codex_error_info":"usage_limit_exceeded"` anywhere in
+the whole `task_complete` line (a 9000-character final message once pushed it
+past a cut and wedged the turn at `running`); only the pieces read after it
+are cut. Should a mark still find no limit, the turn ends as the plain
+`complete` it also is.
+
+**The resume trigger** (watcher, each tick). `#{@agent_limit_due}` rides in the
+tick's one `list-panes` read (a global, resolved through the window), so it
+costs no fork. While it is set, the watcher spawns `agent-pause.py
+limit-tick` detached, at most once per 20 s, when:
+
+- `@agent_limit_due` ≤ now;
+- `~/.claude-swap-backup/sequence.json` is newer than its mark
+  (`$TMPDIR/agent-limit-seq.$UID.mark`, a builtin `-nt`; rewritten when it
+  fires): cswap switched accounts, which can lift a limit early;
+- the previous tick was more than 30 s ago (the machine slept); remembered
+  until it fires.
+
+limit-tick takes its own lock and decides eligibility (grace, wake, autoresume)
+itself. Overrides for tests: `AGENT_LIMIT_PAUSE_PY`, `AGENT_LIMIT_SEQ_FILE`,
+`AGENT_LIMIT_WAKE_GAP`, `AGENT_LIMIT_TICK_EVERY`.
+
+**The tab.** A `paused` OR `idle` window with `@agent_limit` shows `󱎫` in
+peach `#fab387` in the glyph slot instead of the violet `⏸`, limited and
+lifted alike, still, with the pause's priority (the gear still wins; stash
+selection turns it crust). Idle is the engine's own paused → idle at its
+RESUME when that paste is held behind a draft or never lands; the sidebar
+counts `@agent_limit` + paused|idle as limited, and the tab matches. Nothing
+for running, failed, done or needs-input. Body and chip stay stock. Colour and glyph are defined ONCE,
+in `tmux.conf.tmpl`'s `set -g @agent_limit_fg "#fab387"` and
+`set -g @agent_limit_glyph "󱎫"`, which the two `_text` formats read as
+`#{@agent_limit_fg}` / `#{@agent_limit_glyph}`; CuaNotch's
+`dev/check-invariants` §65 keeps its palette in step with that line.
+
+**Shared code.** The detail formatter (`limit_text`) and the Codex rollout
+reader (`codex_reset_epoch`, `codex_limit_parse`) are the LIMIT CORE block,
+byte-identical in both scripts (the test fails on drift).
+
+Not handled here: the `Notification` `quota_auto_resume_stale` ("treat as due
+now") is not wired to this script; the watcher's wake trigger covers the
+same slept-through-the-reset case.
+
+Tests: `tests/test_agent_limit.py` (the indicator on a private tmux server;
+the watcher's Codex marking, GC and trigger on the fake harness; the glyph
+rendered from `tmux.conf.tmpl`).
 
 ## Troubleshooting
 

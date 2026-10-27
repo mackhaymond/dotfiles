@@ -5,8 +5,8 @@ raises needs-input (detail kind ask, @agent_ask_bg 1) when it did.
 The contract (cua-notch 547f0e7, the orchestrator's pins):
   - a synchronous `agent-turn-asks --marker-only --since @agent_turn_start`,
     SIGTERMed at 300 ms; exit 0 raises at once;
-  - else ONE detached full run, whose exit 0 raises only while the window is
-    still `running` with the same turn bookkeeping;
+  - EXPLICIT ONLY (2026-10-26): nothing else. No marker = the Stop stays
+    `running` and the decider's full (model) mode is never run;
   - a look at a raised ask while the work is still out (@agent_workflow) is
     ONE command list: @agent_seen_at E, @agent_state running, @agent_since
     "E running", @agent_detail_kind and @agent_ask_bg unset, the shown line
@@ -18,8 +18,7 @@ The contract (cua-notch 547f0e7, the orchestrator's pins):
 Drives the real script against a private tmux server (the harness of
 test_agent_ask_from / test_agent_state_notice). agent-bg-pending and
 agent-turn-asks are fakes in the fake $HOME/.local/bin; the fake decider's
-behaviour is baked into its file (the detached run is started by the tmux
-server, whose environment is not the test's).
+behaviour is baked into its file.
 """
 import json
 import os
@@ -198,62 +197,35 @@ class AsksWhileWorkIsOutTests(af.AskerGateTests):
         self.assertTrue(self.wait_for(lambda: "term" in self.calls(), 2), self.calls())
         self.not_raised()
 
-    # --- the detached full run ---
+    # --- EXPLICIT ONLY: no model guess (2026-10-26) ---
 
-    def test_no_marker_full_run_raises_while_the_turn_is_unchanged(self):
+    def test_no_marker_stays_running_and_never_runs_the_full_decider(self):
+        # The decider's full mode would say yes; it must never be asked.
         self.start_turn()
-        self.decider(m_rc=2, f_rc=0, f_line="run sudo make install", f_sleep=0.5)
+        start = self.opt("@agent_turn_start")
+        self.decider(m_rc=2, f_rc=0, f_line="run sudo make install")
         self.stop()
         self.assertEqual(self.state(), "running")
-        self.assertTrue(self.wait_for(lambda: self.state() == "needs-input"), self.calls())
-        self.raised("run sudo make install")
-        # One full run, with no --marker-only (and the turn's --since).
-        self.assertEqual(self.calls().count("full"), 1)
-        self.assertEqual([c for c in self.calls() if c.startswith("argv") and "--marker-only" not in c],
-                         ["argv --since " + self.opt("@agent_turn_start")])
-
-    def test_full_run_saying_no_writes_nothing(self):
-        self.start_turn()
-        self.decider(m_rc=2, f_rc=1)
-        self.stop()
-        self.assertTrue(self.wait_for(lambda: "full" in self.calls(), 5))
-        time.sleep(0.8)
+        self.assertTrue(self.opt("@agent_turn_result").endswith(" loud"))
+        time.sleep(1.5)
         self.not_raised()
+        self.assertEqual(self.calls(), ["argv --marker-only --since " + start])
+        self.assertNotIn("full", self.calls())
+        self.assertEqual(sorted(p.name for p in self.root.glob("agent-tab-askbg.*")), [])
 
-    def test_a_new_prompt_discards_the_full_runs_answer(self):
+    def test_the_detached_ask_mode_is_gone(self):
         self.start_turn()
-        self.decider(m_rc=2, f_rc=0, f_line="late answer", f_sleep=1.5)
-        self.stop()
-        self.assertTrue(self.wait_for(lambda: "full" in self.calls(), 5))
-        self.raw("running", payload("UserPromptSubmit", prompt="next thing", prompt_id="p2"))
-        time.sleep(2.5)
+        self.set_opt("@agent_turn_result", "p1 loud")
+        tok = self.opt("@agent_turn_origin") + "|p1 loud"
+        pf = self.root / "payload.json"
+        pf.write_text(payload("Stop", last_assistant_message="m", prompt_id="p1"))
+        self.decider(f_rc=0, f_line="anything")
+        r = subprocess.run(["bash", str(self.script), "ask-bg", self.win, tok, str(pf), "claude"],
+                           text=True, capture_output=True, input="", env=dict(self.env, FAKE_ACTIVE_CLIENTS=""),
+                           timeout=15)
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.not_raised()
-
-    def test_a_woken_turn_discards_it_too(self):
-        self.start_turn()
-        self.decider(m_rc=2, f_rc=0, f_line="late answer", f_sleep=1.5)
-        self.stop()
-        self.raw("running", payload("UserPromptSubmit", prompt="<task-notification>done</task-notification>",
-                                    prompt_id="p3"))
-        time.sleep(2.5)
-        self.not_raised()
-
-    def test_a_window_no_longer_running_is_left_alone(self):
-        self.start_turn()
-        self.decider(m_rc=2, f_rc=0, f_line="late answer", f_sleep=1.0)
-        self.stop()
-        self.set_opt("@agent_state", "idle")
-        time.sleep(2.0)
-        self.assertEqual(self.state(), "idle")
-        self.assertFalse(self.has_opt("@agent_ask_bg"))
-
-    def test_full_run_is_stopped_with_sigterm_at_its_bound(self):
-        self.start_turn()
-        self.decider(m_rc=2, f_rc=0, f_line="never", f_sleep=10)
-        self.env["AGENT_TAB_ASK_BG_TIMEOUT"] = "1"
-        self.stop()
-        self.assertTrue(self.wait_for(lambda: "term" in self.calls(), 6), self.calls())
-        self.not_raised()
+        self.assertEqual(self.calls(), [])
 
     # --- a look ---
 
@@ -334,16 +306,6 @@ class AsksWhileWorkIsOutTests(af.AskerGateTests):
         self.stop(prompt_id="p2")
         self.raised("now pick C or D")
 
-    def test_the_full_run_respects_the_seen_line(self):
-        self.raise_by_marker("pick A or B")
-        self.set_opt("@agent_workflow", "1")
-        self.clear_current()
-        self.decider(m_rc=2, f_rc=0, f_line="pick A or B", f_sleep=0.2)
-        self.stop()
-        self.assertTrue(self.wait_for(lambda: "full" in self.calls(), 5))
-        time.sleep(1.0)
-        self.not_raised()
-
     def test_mack_replying_or_a_new_session_forgets_the_seen_line(self):
         for forget, gone in (
                 (lambda: self.raw("running", payload("UserPromptSubmit", prompt="A", prompt_id="p5")), True),
@@ -402,76 +364,6 @@ class AsksWhileWorkIsOutTests(af.AskerGateTests):
         self.clear_current()
         self.assertEqual(self.state(), "running")
         self.assertFalse(self.has_opt("@agent_ask_bg"))
-
-    def worker(self, tok, pf=None, **env):
-        if pf is None:
-            pf = self.root / "payload.json"
-            pf.write_text(payload("Stop", last_assistant_message="m", prompt_id="p1"))
-        # Real tmux answers #{window_active_clients} (0: no client) unless
-        # a test fakes a viewer, as the detached worker sees it.
-        env.setdefault("FAKE_ACTIVE_CLIENTS", "")
-        r = subprocess.run(["bash", str(self.script), "ask-bg", self.win, tok, str(pf), "claude"],
-                           text=True, capture_output=True, env=dict(self.env, **env), timeout=15)
-        self.assertEqual(r.returncode, 0, r.stderr)
-
-    def test_the_full_runs_write_is_guarded_in_tmux(self):
-        # The window leaves `running` between the worker's look and its
-        # write: a guarded write lands nothing over it.
-        self.start_turn()
-        self.decider(m_rc=2, f_rc=0, f_line="late answer", f_sleep=0.6)
-        armed = self.root / "race.armed"
-        raced = self.root / "race.done"
-        sn.write_exe(self.bin / "tmux", (
-            "#!/bin/sh\n"
-            "if [ -f %(armed)s ] && [ ! -f %(raced)s ]; then\n"
-            "  case \"$*\" in *needs-input*) : > %(raced)s; %(real)s set-option -w -t %(win)s @agent_state idle ;; esac\n"
-            "fi\n" % dict(armed=armed, raced=raced, real=sn.REAL_TMUX, win=self.win))
-            + LOGGING_TMUX.split("\n", 1)[1] % sn.REAL_TMUX)
-        self.stop()
-        armed.touch()
-        self.assertTrue(self.wait_for(lambda: raced.exists(), 6), self.calls())
-        time.sleep(0.8)
-        self.assertEqual(self.state(), "idle")
-        self.assertFalse(self.has_opt("@agent_ask_bg"))
-        self.assertFalse(self.has_opt("@agent_ask_line"))
-
-    def test_an_unsafe_token_writes_nothing(self):
-        self.start_turn()
-        self.set_opt("@agent_turn_origin", "user p1 a,b}")
-        self.set_opt("@agent_turn_result", "p1 loud")
-        self.decider(f_rc=0, f_line="anything")
-        self.worker("user p1 a,b}|p1 loud")
-        self.assertEqual(self.state(), "running")
-        self.assertFalse(self.has_opt("@agent_ask_bg"))
-
-    def test_the_worker_raises_with_a_matching_token(self):
-        self.start_turn()
-        self.set_opt("@agent_turn_result", "p1 loud")
-        tok = self.opt("@agent_turn_origin") + "|p1 loud"
-        self.decider(f_rc=0, f_line='pick "A"; ')
-        self.worker(tok)
-        self.raised("pick A")
-        self.assertFalse(self.has_opt("@agent_ask_line"))
-        self.assertRegex(self.opt("@agent_since"), r"^\d+ needs-input$")
-        self.assertEqual(self.opt("@agent_kind"), "claude")
-
-    def test_the_worker_seen_branch_stamps_seen_at(self):
-        self.start_turn()
-        self.set_opt("@agent_turn_result", "p1 loud")
-        tok = self.opt("@agent_turn_origin") + "|p1 loud"
-        self.decider(f_rc=0, f_line="which branch")
-        self.worker(tok, FAKE_FRONT="wez", FAKE_ACTIVE_CLIENTS="1")
-        self.not_raised()
-        self.assertEqual(self.opt("@agent_ask_seen"), "which branch")
-        sn.IndicatorNoticeTests.assert_recent_epoch(self, self.opt("@agent_seen_at"))
-
-    def test_the_payload_file_is_gone_while_the_decider_runs(self):
-        self.start_turn()
-        self.decider(m_rc=2, f_rc=1, f_sleep=1.5)
-        self.stop()
-        self.assertTrue(self.wait_for(lambda: "full" in self.calls(), 5))
-        time.sleep(0.3)
-        self.assertEqual(sorted(p.name for p in self.root.glob("agent-tab-askbg.*")), [])
 
     def test_one_sanitiser_fork_and_no_extra_read_per_stop(self):
         real_jq = __import__("shutil").which("jq")

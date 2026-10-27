@@ -108,7 +108,11 @@ MOUSE = "\U000F037D"  # nf-md-mouse: driving an app through cua-driver
 
 FIELDS = ["session", "index", "id", "name", "state", "summary", "workflow", "cua",
           "since", "last_attached", "blink", "stash_label", "stash_session", "stash_ts",
-          "active", "panes", "path", "kind", "detail_kind", "detail", "space_home", "paused"]
+          "active", "panes", "path", "kind", "detail_kind", "detail", "space_home", "paused",
+          "limit", "limit_lifted", "limit_auto"]
+# The oldest window row still read: the tests' 20-field fixtures (the rest
+# is padded empty).
+MIN_FIELDS = 20
 # Then six: window_active and pane_current_path (the window's active pane)
 # give the strip each session's current window and its git branch;
 # window_panes says whether a peek must look for the agent pane; @agent_kind
@@ -118,17 +122,22 @@ FIELDS = ["session", "index", "id", "name", "state", "summary", "workflow", "cua
 # (docs/spaces.md), not shown here; parse_windows drops it unless an agent
 # runs in it (non-empty @agent_state: then it is an agent like any other).
 # Then @agent_paused (agent-pause.py: the window is in the pause key's saved
-# set), folded into the state by paused_state. Rows without either (the
-# tests' 20-field fixtures) or without @agent_paused (21) still parse.
+# set), folded into the state by paused_state. Then @agent_limit ("<resets_at>
+# <type> <since>") and @agent_limit_lifted (<epoch>): a RATE-LIMITED agent
+# (parse_limit, limited). Last the GLOBAL @agent_limit_autoresume (Mack's
+# setting, autoresume_on; like @agent_blink every row carries it). Rows
+# without the tail (the tests' 20-field fixtures, MIN_FIELDS, and every
+# length up to FIELDS) still parse.
 FMT = US.join(["#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}",
                "#{@agent_state}", "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}",
                "#{@agent_since}", "#{session_last_attached}", "#{@agent_blink}",
                "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}",
                "#{window_active}", "#{window_panes}", "#{pane_current_path}",
                "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}", "#{@space_home}",
-               "#{@agent_paused}"])
+               "#{@agent_paused}", "#{@agent_limit}", "#{@agent_limit_lifted}",
+               "#{@agent_limit_autoresume}"])
 # Rides in the same tmux call as FMT, after a `;`. Seven fields where a window
-# row has twenty-two, so parse_windows skips it and parse_clients takes only it.
+# row has at least twenty, so parse_windows skips it and parse_clients takes only it.
 # The last three are for the strip's scope (Strip.load): the client's session
 # and the two global options, which a client-context format resolves through
 # the session's options to the global ones, so they cost no extra call.
@@ -172,11 +181,32 @@ def paused_state(state, flag):
     return "paused" if flag and state in ("done", "idle") else state
 
 
+def parse_limit(raw, lifted=""):
+    """@agent_limit ("<resets_at> <type> <since>") and @agent_limit_lifted
+    (<epoch>) → {resets_at, garbled, type, since, lifted} or None when
+    @agent_limit is unset (its presence is what rate-limited means). A reset
+    that would not parse (junk, a sign, past an i64, as agent-ui reads it)
+    is `garbled` with resets_at 0, never a guess; a lifted stamp that is not
+    digits still lifts (0). agent-ui model.rs Limit::parse."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    words = raw.split()
+    num = lambda s: int(s) if DIGITS.match(s) and int(s) < 2 ** 63 else None
+    lifted = (lifted or "").strip()
+    reset = num(words[0])
+    return {"resets_at": reset or 0,
+            "garbled": reset is None,
+            "type": words[1] if len(words) > 1 else "",
+            "since": num(words[2]) if len(words) > 2 else None,
+            "lifted": (num(lifted) or 0) if lifted else None}
+
+
 def parse_windows(text):
     out = []
     for line in text.splitlines():
         parts = line.split(US)
-        if len(FIELDS) - 2 <= len(parts) < len(FIELDS):
+        if MIN_FIELDS <= len(parts) < len(FIELDS):
             parts += [""] * (len(FIELDS) - len(parts))
         if len(parts) != len(FIELDS):
             continue
@@ -184,6 +214,7 @@ def parse_windows(text):
         if w["space_home"] == "1" and not w["state"]:   # a space's home shell, unless an agent runs in it
             continue
         w["state"] = paused_state(w["state"], w["paused"])
+        w["limit"] = parse_limit(w["limit"], w["limit_lifted"])
         w["index"] = int(w["index"]) if w["index"].isdigit() else 0
         w["last_attached"] = int(w["last_attached"]) if w["last_attached"].isdigit() else 0
         s = w["since"].split(" ", 1)[0]
@@ -323,9 +354,100 @@ CAT_HUE = {"failed": "red", "needs-input": "yellow", "done": "green", "working":
 # opencode: nf-oct-terminal (U+F489), one cell like the others (agent-ui
 # model.rs kind_glyph uses the same codepoint).
 KIND_GLYPH = {"claude": "✳", "codex": "⬢", "opencode": ""}
-DETAIL_WORD = {"perm": "perm", "ask": "asks", "fail": "fail", "done": "done", "run": "run"}
+DETAIL_WORD = {"perm": "perm", "ask": "asks", "fail": "fail", "done": "done", "run": "run", "limit": "limit"}
 STATE_WORDS = {"failed": "failed", "needs-input": "waiting on you", "done": "done", "paused": "paused"}
 STRIP_GEAR, STRIP_MOUSE = "⚙", "◎"
+# RATE-LIMITED (docs/agent-roster.md "Rate-limited agents"): a paused agent
+# with @agent_limit, still in the paused bucket (out of NEEDS YOU, no slot),
+# its mark nf-md-timer_sand in peach whether the limit holds or has lifted
+# (the words tell those apart). Provisional; MUST match agent-ui model.rs
+# LIMIT_GLYPH / LIMIT_HUE, the tmux tab (agent-tab-indicator.sh) and
+# CuaNotch's palette: change them together.
+LIMIT_GLYPH, LIMIT_HUE = "\U000F13AB", "peach"
+
+
+def limited(w):
+    """Rate-limited (agent-ui model.rs `limited`): @agent_limit set, the
+    folded state paused OR idle, nothing in flight. Idle counts because
+    agent-pause.py's limit_send unsets @agent_paused and flips paused → idle
+    just before its RESUME; a paste held behind a draft, or lost, leaves it
+    there. Running, asking, failed or done (Mack prompted it again; the limit
+    is kept until the turn's outcome), it is what it is. cat() files every
+    limited window as paused."""
+    return w["state"] in ("paused", "idle") and bool(w.get("limit")) and not in_flight(w)
+
+
+def autoresume_on(v):
+    """@agent_limit_autoresume as agent-pause.py reads it: on unless off / 0
+    / false / no (trimmed, any case); unset is on."""
+    return (v or "").strip().lower() not in ("off", "0", "false", "no")
+
+
+WDAY = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")   # time.struct_time: 0 = Monday
+MON = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def when_words(at, now):
+    """An epoch as a person says it, from `now`'s local day: `1:00 AM`
+    today, `Tue 1:00 AM` within six days, `Nov 2 1:00 AM` further or past
+    (agent-ui text.rs `when`). Days are counted in local time (the UTC
+    offset applied), as agent-ui does. "" when the C library cannot place
+    it (a value past time_t): never raises."""
+    try:
+        a, n = time.localtime(at), time.localtime(int(now))
+    except (OverflowError, OSError, ValueError):
+        return ""
+    clock = "%d:%02d %s" % (a.tm_hour % 12 or 12, a.tm_min, "AM" if a.tm_hour < 12 else "PM")
+    days = (int(at) + a.tm_gmtoff) // 86400 - (int(now) + n.tm_gmtoff) // 86400
+    if days == 0:
+        return clock
+    if 1 <= days <= 6:
+        return "%s %s" % (WDAY[a.tm_wday], clock)
+    return "%s %d %s" % (MON[a.tm_mon - 1], a.tm_mday, clock)
+
+
+# agent-pause.py's LIMIT_GRACE: a limited agent is eligible for a resume from
+# resets_at + this (native auto-continue goes first). agent-ui model.rs
+# LIMIT_GRACE; change all three together.
+LIMIT_GRACE = 120
+# A reset further than this from now (either way) is not believed: unknown.
+LIMIT_HORIZON = 400 * 86400
+MODEL_LIMIT = "model limit"
+
+
+def limit_stage(lim, now):
+    """Where a limit stands at `now` (agent-ui model.rs Limit::stage) →
+    ("lifted"|"notime"|"unknown"|"resets"|"resetting"|"passed", reset)."""
+    if lim.get("lifted") is not None:
+        return "lifted", None
+    r = lim["resets_at"]
+    if lim.get("garbled") or (r > 0 and abs(r - now) > LIMIT_HORIZON):
+        return "unknown", None
+    if r <= 0:
+        return "notime", None
+    if now >= r + LIMIT_GRACE:
+        return "passed", r
+    return ("resetting" if now >= r else "resets"), r
+
+
+def limit_words(lim, detail, now):
+    """A limit in words → (word, what to know) (agent-ui view.rs
+    `limit_words`): `limit` / `resets Tue 1:00 AM`, `resetting` (inside
+    agent-pause.py's grace), `reset passed`, `reset unknown` (would not
+    parse, more than 400 days off); no reset time: the indicator's own words
+    (@agent_detail, split at ` · `), else `model limit`; lifted `limit
+    lifted` / `waiting for you`."""
+    stage, r = limit_stage(lim, now)
+    if stage == "lifted":
+        return "limit lifted", "waiting for you"
+    if stage == "notime":
+        d = " ".join(CONTROL.sub(" ", detail or "").split())
+        if not d:
+            return MODEL_LIMIT, ""
+        head, _, rest = d.partition(" · ")
+        return head, rest
+    return "limit", {"unknown": "reset unknown", "passed": "reset passed", "resetting": "resetting"}.get(
+        stage) or "resets " + when_words(r, now)
 
 
 def cat(w):
@@ -334,7 +456,7 @@ def cat(w):
         return w["state"]
     if in_flight(w):
         return "working"
-    if w["state"] == "paused":
+    if w["state"] == "paused" or limited(w):
         return "paused"
     return "idle" if w["state"] else None
 
@@ -1160,6 +1282,8 @@ class Roster:
             if w["id"] == self.cur_win:
                 return fg("blue") + "●"        # the window you are on never pulses
             return fg("pink" if blink else "blue") + "●"
+        if limited(w):
+            return fg(LIMIT_HUE) + LIMIT_GLYPH
         if w["state"] == "paused":
             return fg(CAT_HUE["paused"]) + CAT_GLYPH["paused"]
         if w["state"]:
@@ -1175,9 +1299,12 @@ class Roster:
 
     def shape(self, w, blink):
         """The strip's state mark: dot()'s colour (the checked mapping, pulse
-        included) on a shape per state, ✕ ◉ ✓ ◐ ○ (CAT_GLYPH)."""
+        included) on a shape per state, ✕ ◉ ✓ ◐ ○ (CAT_GLYPH); a
+        rate-limited agent's is the limit mark (LIMIT_GLYPH)."""
         c = cat(w)
-        return self.dot(w, blink)[:-1] + CAT_GLYPH[c] if c else " "
+        if not c:
+            return " "
+        return self.dot(w, blink)[:-1] + (LIMIT_GLYPH if limited(w) else CAT_GLYPH[c])
 
     def strip_glyph(self, w, blink):
         """glyph()'s colour and pulse, with the strip's text glyphs ⚙ / ◎."""
@@ -1213,6 +1340,8 @@ class Roster:
                  "running": "working", "idle": "idle", "paused": "paused"}.get(w["state"], "")
         if w["state"] == "done" and w["workflow"]:
             state = "done · fleet out"
+        if limited(w):
+            state = "limit"
         when = w["since_t"]
         if w["session"] == HOLD:
             if not w["state"]:
@@ -1229,6 +1358,13 @@ class Roster:
             room = title_w - dwidth(title) - 2
             if room >= 8:
                 detail = "  " + clip(CONTROL.sub(" ", "%s  %s" % (DETAIL_WORD[w["detail_kind"]], w["detail"])), room)
+        elif limited(w):
+            # A rate-limited row: when its limit resets (or that it lifted),
+            # dim, where an asking row says what it asks.
+            room = title_w - dwidth(title) - 2
+            says = "  ".join(p for p in limit_words(w["limit"], w.get("detail", ""), now) if p)
+            if room >= 8:
+                detail = "  " + clip(says, room)
         pad = " " * max(0, title_w - dwidth(title) - dwidth(detail))
         tcol = fg("text") if w["state"] or cur or w["session"] == HOLD else fg("overlay")
         return (base + bar + self.dot(w, blink) + base + " " + ixs + "  " + tcol + title + fg("overlay") + detail
@@ -1264,13 +1400,21 @@ class Roster:
         ws = [w for w in self.windows if w["session"] not in HIDDEN]
         n_work = sum(1 for w in ws if w["state"] and in_flight(w) and not is_attn(w))
         n_need = len(self.needs)
-        n_idle = sum(1 for w in ws if w["state"] == "idle" and not in_flight(w))
-        n_paused = len({w["id"] for w in ws if cat(w) == "paused"})
+        # (A rate-limited idle window is limited, not idle.)
+        n_idle = sum(1 for w in ws if w["state"] == "idle" and not in_flight(w) and not limited(w))
+        # The rate-limited are paused agents with a reason: counted apart.
+        n_limited = len({w["id"] for w in ws if limited(w)})
+        n_paused = len({w["id"] for w in ws if cat(w) == "paused"}) - n_limited
         lines = []
         counts = "%s%d working%s · %s%d need you%s · %d idle" % (
             fg("pink"), n_work, fg("overlay"), fg("yellow") if n_need else "", n_need, fg("overlay"), n_idle)
         if n_paused:
             counts += " · %s%s %d paused%s" % (fg(CAT_HUE["paused"]), CAT_GLYPH["paused"], n_paused, fg("overlay"))
+        if n_limited:
+            # Mack's auto-resume setting, a global every row carries.
+            auto = autoresume_on(self.windows[0].get("limit_auto", "")) if self.windows else True
+            counts += " · %s%s %d limit%s%s" % (fg(LIMIT_HUE), LIMIT_GLYPH, n_limited, fg("overlay"),
+                                                "" if auto else " · auto off")
         lines.append(" " + fg("peach") + BOLD + "AGENTS" + RESET + "   " + fg("overlay") + counts)
         age = watcher_age()
         if age is None or age > WATCHER_STALE:

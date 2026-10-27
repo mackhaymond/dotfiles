@@ -232,13 +232,15 @@ impl Tmux {
 /// (`@pending_color`, the colour space N will have), and `ask_bg`
 /// (`@agent_ask_bg`: agent-tab-indicator.sh's ASKS WHILE WORK IS OUT, a
 /// needs-input raised by a turn that ended asking while its background work
-/// is still out).
-pub const FIELDS: [&str; 41] = [
+/// is still out), and `limit` / `limit_lifted` (the indicator's
+/// `@agent_limit` `"<resets_at> <type> <since>"` and `@agent_limit_lifted`
+/// `<epoch>`: a RATE-LIMITED agent, [`crate::model::Limit`]).
+pub const FIELDS: [&str; 43] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
     "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home", "space_index",
     "space_hidden", "space_color", "stash_sel", "pane_flags", "rollout", "paused", "pinned", "session_id",
-    "pin_key", "pending_space", "pending_request", "pending_color", "ask_bg",
+    "pin_key", "pending_space", "pending_request", "pending_color", "ask_bg", "limit", "limit_lifted",
 ];
 
 /// The pane option space.sh sets (to 1) on a space home's dashboard pane
@@ -260,7 +262,7 @@ pub const PANE_FLAGS: &str =
 
 /// The tmux format of each FIELDS entry, in order. (`#{pane_current_path}`
 /// is printed by [`path_format`], dashboard-aware.)
-pub const FORMATS: [&str; 41] = [
+pub const FORMATS: [&str; 43] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
@@ -269,6 +271,7 @@ pub const FORMATS: [&str; 41] = [
     "#{@agent_mru_prev}", "#{@space_home}", "#{@space_index}", "#{@space_hidden}", "#{@space_color}", "#{@stash_sel}",
     PANE_FLAGS, "#{@agent_rollout}", "#{@agent_paused}", "#{@agent_pinned}", "#{@agent_session_id}",
     "#{@pin_key}", "#{@pending_space}", "#{@pending_request}", "#{@pending_color}", "#{@agent_ask_bg}",
+    "#{@agent_limit}", "#{@agent_limit_lifted}",
 ];
 
 /// Ends each path in the dashboard case of [`path_format`] (a private-use
@@ -404,7 +407,7 @@ pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
 /// instead of status-right, read in the same one call (no script runs).
-pub const STATUS_FORMATS: [&str; 34] = [
+pub const STATUS_FORMATS: [&str; 35] = [
     "#{client_key_table}", "#{@sidebar_open}", "#{@sidebar_pids}", "#{@resurrect_stale}",
     "#{@codex_session_text}", "#{@codex_session_color}", "#{@codex_weekly_text}", "#{@codex_weekly_color}",
     "#{@codex_scoped_icon}", "#{@codex_scoped_text}", "#{@codex_scoped_color}", "#{@codex_account_label}",
@@ -429,6 +432,10 @@ pub const STATUS_FORMATS: [&str; 34] = [
     // The stale-agent sweep's threshold in seconds (docs/agent-roster.md
     // "Stale agents"; [`crate::view::stale_after`]): "" = the default.
     "#{@agent_stale_after}",
+    // Mack's rate-limit auto-resume setting (`agent-pause.py limit-auto`):
+    // "off" turns it off; anything else, unset included, is on. The
+    // sidebar's rate-limit banner says which.
+    "#{@agent_limit_autoresume}",
 ];
 
 /// One usage window's numeric options (`@codex_<w>_used`, `_expected`,
@@ -492,9 +499,18 @@ pub struct Status {
     /// `@agent_stale_after`: the stale-agent sweep's threshold (seconds),
     /// raw; "" when unset ([`crate::view::stale_after`]).
     pub stale_after: String,
+    /// `@agent_limit_autoresume`, raw ("" = unset: on).
+    pub limit_autoresume: String,
 }
 
 impl Status {
+    /// Rate-limited agents resume on their own once the limit lifts: on
+    /// unless off / 0 / false / no (trimmed, any case), as agent-pause.py
+    /// reads it (unset is the default, on).
+    pub fn limit_autoresume(&self) -> bool {
+        !matches!(self.limit_autoresume.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")
+    }
+
     fn from_fields(f: &dyn Fn(usize) -> String) -> Status {
         Status {
             key_table: f(0),
@@ -520,6 +536,7 @@ impl Status {
             sidebar_width: f(31),
             server_start: f(32),
             stale_after: f(33),
+            limit_autoresume: f(34),
         }
     }
 }
@@ -645,6 +662,10 @@ pub struct Window {
     /// word, when a writer knows it, is how much of that work is out
     /// ([`crate::model::ask_bg_count`]).
     pub ask_bg: String,
+    /// `@agent_limit` + `@agent_limit_lifted`: None unless the window was
+    /// marked rate-limited ([`crate::model::Limit::parse`]). Shown only
+    /// while it is paused ([`crate::model::limited`]).
+    pub limit: Option<crate::model::Limit>,
 }
 
 fn digits(s: &str) -> bool {
@@ -733,6 +754,7 @@ impl Window {
             pending_request: p[38].into(),
             pending_color: p[39].trim().into(),
             ask_bg: p[40].trim().into(),
+            limit: crate::model::Limit::parse(p[41], p[42]),
             label: label.into(),
             session,
         })
@@ -1020,6 +1042,13 @@ pub(crate) mod tests {
         assert_eq!((c.status.toast.as_str(), c.status.sidebar_clients.as_str()), ("v29", "v30"));
         assert_eq!((c.status.sidebar_width.as_str(), c.status.server_start.as_str()), ("v31", "v32"));
         assert_eq!(c.status.stale_after, "v33");
+        assert_eq!(c.status.limit_autoresume, "v34");
+        // Auto-resume: on unless off / 0 / false / no (trimmed, any case),
+        // as agent-pause.py reads it.
+        for (raw, on) in [("", true), ("on", true), ("1", true), ("yes", true), ("junk", true), ("off", false),
+            (" off ", false), ("OFF", false), ("0", false), ("false", false), ("False", false), (" no", false), ("NO", false)] {
+            assert_eq!(Status { limit_autoresume: raw.into(), ..Status::default() }.limit_autoresume(), on, "{raw:?}");
+        }
         // One field short or long: not a client row.
         assert!(Client::parse(&full[..full.len() - 1].join("\x1f")).is_none());
         let s = Snapshot::parse(&[
@@ -1093,29 +1122,49 @@ pub(crate) mod tests {
         assert_eq!((w.session.as_str(), w.label.as_str()), ("日本", "🫠 x\tz"));
     }
 
-    /// A row from an older format (40 fields, before `ask_bg`; 37, before
-    /// the pending space's options; 34, before `pinned`, `session_id` and
-    /// `pin_key`) or one with a field too many is no window: never misread
-    /// by position.
+    /// A row from an older format (41 fields, before `limit` and
+    /// `limit_lifted`; 40, before `ask_bg`; 37, before the pending space's
+    /// options; 34, before `pinned`, `session_id` and `pin_key`) or one with
+    /// a field too many is no window: never misread by position.
     #[test]
     fn rows_of_the_wrong_length_are_rejected() {
-        assert_eq!(FIELDS.len(), 41);
-        for n in [34, 36, 37, 38, 39, 40, 42] {
+        assert_eq!(FIELDS.len(), 43);
+        for n in [34, 36, 37, 38, 39, 40, 41, 42, 44] {
             assert!(Window::parse(&vec!["x"; n].join("\x1f")).is_none(), "{n}");
         }
-        assert!(Window::parse(&vec!["x"; 41].join("\x1f")).is_some());
+        assert!(Window::parse(&vec!["x"; 43].join("\x1f")).is_some());
         assert_ne!(FIELDS.len(), CLIENT_FIELDS);
     }
 
-    /// `@agent_ask_bg` rides last, guarded like the other user options, and
-    /// is read trimmed.
+    /// `@agent_ask_bg` rides after the pending space's options, guarded like
+    /// the other user options, and is read trimmed.
     #[test]
-    fn ask_bg_is_the_last_field() {
+    fn ask_bg_field() {
         assert_eq!((FIELDS[40], FORMATS[40]), ("ask_bg", "#{@agent_ask_bg}"));
         let w = Window::parse(&row("main", 1, "@1", &[("state", "needs-input"), ("ask_bg", " 1 ")])).unwrap();
         assert_eq!(w.ask_bg, "1");
         let w = Window::parse(&row("main", 1, "@1", &[("state", "needs-input")])).unwrap();
         assert_eq!(w.ask_bg, "");
+    }
+
+    /// `@agent_limit` and `@agent_limit_lifted` ride last, guarded, and
+    /// parse into the window's [`crate::model::Limit`]: unset is none; the
+    /// reset, type and since words; a junk reset reads 0 (unknown); a lifted
+    /// stamp that is not digits still lifts.
+    #[test]
+    fn the_limit_fields_are_last() {
+        use crate::model::Limit;
+        assert_eq!((FIELDS[41], FORMATS[41]), ("limit", "#{@agent_limit}"));
+        assert_eq!((FIELDS[42], FORMATS[42]), ("limit_lifted", "#{@agent_limit_lifted}"));
+        let lim = |l: &str, lifted: &str| Window::parse(&row("main", 1, "@1", &[("limit", l), ("limit_lifted", lifted)])).unwrap().limit;
+        assert_eq!(lim("", ""), None);
+        assert_eq!(lim("", "1792418628"), None); // lifted alone is no limit
+        assert_eq!(lim("1792420000 seven_day 1792410000", ""),
+            Some(Limit { resets_at: 1_792_420_000, garbled: false, kind: "seven_day".into(), since: Some(1_792_410_000), lifted: None }));
+        assert_eq!(lim(" 0 model 5 ", " 9 "),
+            Some(Limit { resets_at: 0, garbled: false, kind: "model".into(), since: Some(5), lifted: Some(9) }));
+        assert_eq!(lim("soon", "yes"), Some(Limit { resets_at: 0, garbled: true, kind: "".into(), since: None, lifted: Some(0) }));
+        assert!(fmt().ends_with(&format!("{}\x1f{}", guarded("#{@agent_limit}"), guarded("#{@agent_limit_lifted}"))));
     }
 
     /// A pending space's options: only a window of the `pending` session
@@ -1183,9 +1232,9 @@ pub(crate) mod tests {
         assert!(fmt().contains(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{PANE_FLAGS}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f", guarded("#{@space_index}"),
             guarded("#{@space_hidden}"), guarded("#{@space_color}"), guarded("#{@stash_sel}"), guarded("#{@agent_rollout}"),
             guarded("#{@agent_paused}"), guarded("#{@agent_pinned}"), guarded("#{@agent_session_id}"), guarded("#{@pin_key}"))));
-        // Then a pending space's options, and the raised ask's flag last.
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}", guarded("#{@pending_space}"), guarded("#{@pending_request}"),
-            guarded("#{@pending_color}"), guarded("#{@agent_ask_bg}"))));
+        // Then a pending space's options, the raised ask's flag, and the limit.
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", guarded("#{@pending_space}"), guarded("#{@pending_request}"),
+            guarded("#{@pending_color}"), guarded("#{@agent_ask_bg}"), guarded("#{@agent_limit}"), guarded("#{@agent_limit_lifted}"))));
         let s = Snapshot::parse(&row("main", 1, "@1", &[("rollout", "/x/rollout-1.jsonl")]));
         assert_eq!(s.windows[0].rollout, "/x/rollout-1.jsonl");
         let s = Snapshot::parse(&row("main", 1, "@1", &[("space_color", " #f9e2af "), ("stash_sel", "1")]));
