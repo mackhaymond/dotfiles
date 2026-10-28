@@ -106,6 +106,7 @@ code/various_scripts/.DS_Store
 .config/github-copilot/cl/**
 .config/github-copilot/intellij/**
 .config/github-copilot/iu/**
+.config/github-copilot/versions.json
 .config/agents/**
 .config/crush/**
 .config/goose/**
