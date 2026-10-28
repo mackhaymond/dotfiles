@@ -1547,24 +1547,25 @@ set_summary() {
 CACHE="$HOME/.cache/agent-tab/titles.tsv"
 NEG_TTL=600
 
-# Condenser model. copilot's --model whitelist tracks the CLI version and the
-# account's entitlements, and an id that vanishes fails EVERY condense: CLI
-# 1.0.75 rejected claude-haiku-4.5 (and every other explicit id) with
-# `Model "…" is not available`, so tabs silently kept their raw interim titles
-# and the cache filled with negative entries — a broken renamer that looks
-# exactly like a slow one. The pin is therefore best-effort: on rejection the
-# condenser falls back to copilot's default model and drops MODEL_SKIP so
-# later runs skip the doomed call, re-probing the pin once the marker ages out
-# (models come back). Override the pin with AGENT_TAB_CONDENSE_MODEL; set it
-# empty to always use copilot's default.
-#   2026-10-22, CLI 1.0.102: `--model` refuses EVERY named id on this
-# account - claude-haiku-4.5, gpt-5-mini, gpt-5.4-mini, gemini-3.8-flash,
-# even gpt-5.6-luna, the model the default route itself runs on - with
-# `Model "…" is not available`; only `auto` (Copilot routes the call) is
-# accepted. So the pin is `auto`: no doomed first call, no MODEL_SKIP.
-CONDENSE_MODEL="${AGENT_TAB_CONDENSE_MODEL-auto}"
-MODEL_SKIP="${TMPDIR:-/tmp}/agent-tab-model-unavailable.${UID:-$(id -u)}"
-MODEL_SKIP_TTL=86400
+# Condenser backends. Every condense is one ai-exec call (the fallback door
+# closed-tabs.sh and chezmoi-commit use too): copilot first, then codex, then
+# claude haiku, each only when the one before fails or is usage-limited
+# (ai-exec remembers codex's reset time and skips it until then). 2026-10-28:
+# copilot ran out of its monthly quota and, with copilot as the only backend,
+# every condense failed and tabs sat on raw prompt words for the rest of the
+# month. Copilot's `--model` takes only `auto` on this account (CLI 1.0.102
+# refused every named id), so that is the default; AGENT_TAB_CONDENSE_MODEL
+# overrides it.
+CONDENSE_ORDER="${AGENT_TAB_CONDENSE_ORDER:-copilot,codex,claude}"
+CONDENSE_MODEL="${AGENT_TAB_CONDENSE_MODEL:-auto}"
+CONDENSE_CODEX_MODEL=gpt-6-luna
+CONDENSE_CLAUDE_MODEL=haiku
+# The whole chain, not each leg: a quota-dead copilot answers in ~3 s.
+CONDENSE_TIMEOUT=120
+
+ai_exec_bin() {
+    command -v ai-exec 2>/dev/null || { [ -x "$HOME/.local/bin/ai-exec" ] && echo "$HOME/.local/bin/ai-exec"; }
+}
 
 now_epoch() { date +%s 2>/dev/null || echo 0; }
 
@@ -1796,7 +1797,7 @@ compose_summary() {
 # the condense mode; KIND is "" or custom). KEY (the SUMMARY KEY) is stored
 # on the window in the same tmux call that launches the worker.
 spawn_condense() {
-    command -v copilot >/dev/null 2>&1 || return 0
+    [ -n "$(ai_exec_bin)" ] || return 0
     local -a pre=()
     [ -z "${6:-}" ] || pre=(set-option -w -t "$1" @agent_summary_key "$6" \;)
     # Hooks may have their whole process group reaped after returning. Ask
@@ -1812,6 +1813,7 @@ spawn_condense() {
         "AGENT_TAB_OWNER_BINDING=${AGENT_TAB_OWNER_BINDING:-}" \
         "AGENT_TAB_OWNER_RECORD=${AGENT_TAB_OWNER_RECORD:-}" \
         "AGENT_TAB_CONDENSE_MODEL=$CONDENSE_MODEL" \
+        "AGENT_TAB_CONDENSE_ORDER=$CONDENSE_ORDER" \
         "AGENT_TAB_TITLE_BUDGET=${AGENT_TAB_TITLE_BUDGET:-}" \
         bash "$0" condense "$1" "$2" "$3" "$4" "$5"
     launch+=' >/dev/null 2>&1'
@@ -2328,8 +2330,8 @@ PYLOCK
     fi
     # Each worker owns its stderr file. A killed worker may leave diagnostics,
     # but no stale directory can block the next attempt.
-    ERRF=$(mktemp "${TMPDIR:-/tmp}/agent-tab-condense.$key.err.XXXXXX")
-    trap 'rm -f "$ERRF" 2>/dev/null' EXIT
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/agent-tab-condense.$key.XXXXXX") || exit 0
+    trap 'rm -rf "$WORK" 2>/dev/null' EXIT
     trap 'exit 0' INT TERM
     # SUMMARY KEY (compose_summary): paint only while the window still wants
     # this condense. One show-options, in the detached worker only.
@@ -2375,33 +2377,28 @@ Examples:
 
 Title: $raw"
         fi
-        # Copilot prints the answer on stdout, stats on stderr; a pure text
-        # prompt grants no tool permissions. Capture the exit code explicitly
-        # — `|| true` would mask a failed call whose stdout is an error string.
-        # Empty $1 = no --model flag, i.e. whatever copilot picks by default.
-        copilot_condense() {
-            ${TO:+"$TO" 90} copilot -p "$PROMPT" ${1:+--model "$1"} \
-                --no-color </dev/null 2>"$ERRF"
-        }
-
-        model="$CONDENSE_MODEL"
-        # A standing rejection marker means the pin was refused recently —
-        # go straight to the default instead of burning a doomed call.
-        if [ -n "$model" ] && [ -f "$MODEL_SKIP" ]; then
-            mts=$(stat -f %m "$MODEL_SKIP" 2>/dev/null || echo 0)
-            [ "$(( $(now_epoch) - mts ))" -lt "$MODEL_SKIP_TTL" ] && model=""
-        fi
-
+        # ai-exec runs copilot -> codex -> claude (CONDENSE_ORDER) and exits 0
+        # if any of them answered; the answer is in -o. The codex flags pass
+        # through verbatim (as closed-tabs.sh's): --ephemeral keeps it out of
+        # codex's thread history, --ignore-user-config skips MCP servers and
+        # notify, hooks off so the call never shows up as an agent in a tab or
+        # the notch. ai-exec runs the claude/copilot legs with no user settings
+        # and CUA_NOTCH_IGNORE=1 for the same reason. Every leg runs in the
+        # empty $WORK, read-only; the prompt goes in on stdin. Capture the exit
+        # code explicitly: `|| true` would accept a failed chain.
         ok=0
-        if out=$(copilot_condense "$model"); then
+        aiexec=$(ai_exec_bin)
+        if [ -n "$aiexec" ] && printf '%s' "$PROMPT" | (
+                cd "$WORK" || exit 1
+                unset TMUX TMUX_PANE
+                AI_EXEC_ORDER="$CONDENSE_ORDER" exec ${TO:+"$TO" "$CONDENSE_TIMEOUT"} \
+                    "$aiexec" exec -m "$CONDENSE_CODEX_MODEL" -c model_reasoning_effort=low \
+                    --ephemeral --skip-git-repo-check --ignore-user-config --ignore-rules \
+                    --disable hooks -s read-only -o "$WORK/out" \
+                    --claude-model "$CONDENSE_CLAUDE_MODEL" --copilot-model "$CONDENSE_MODEL" -
+            ) >/dev/null 2>&1 && [ -s "$WORK/out" ]; then
+            out=$(cat "$WORK/out")
             ok=1
-        elif [ -n "$model" ] && grep -qiE 'not available|unknown model|invalid model' "$ERRF" 2>/dev/null; then
-            # The pin is gone from this CLI/account. Remember it (so the next
-            # condense skips straight to the default) and retry right now on
-            # the default model — a renamed model must not cost a whole
-            # session of raw tab titles.
-            : > "$MODEL_SKIP" 2>/dev/null || true
-            out=$(copilot_condense "") && ok=1
         fi
 
         if [ "$ok" = 1 ]; then

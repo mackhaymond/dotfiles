@@ -468,17 +468,21 @@ summary. A worker paints only while the key is still its own (one
 `show-options`, in the worker); otherwise its answer is just cached. The same
 holds for plain, judge and rename workers.
 
-**Model pin is best-effort.** `--model` is set from `CONDENSE_MODEL`
-(default `claude-haiku-4.5`, override with `$AGENT_TAB_CONDENSE_MODEL`, empty
-= always copilot's default). copilot's whitelist tracks the CLI version and
-the account's entitlements, and a pin that disappears fails *every* condense —
-CLI 1.0.75 rejected `claude-haiku-4.5` with `Model "…" is not available`, so
-tabs sat on their raw interim titles and the cache filled with negatives. That
-reads as "the renamer is slow" when it is actually dead, so the failure is now
-recoverable: on a rejection the condenser retries immediately on copilot's
-default model and touches `$TMPDIR/agent-tab-model-unavailable.$UID`, which
-makes later runs skip the doomed call for 24 h (`MODEL_SKIP_TTL`) before
-re-probing the pin.
+**Backends: one `ai-exec` call** (2026-10-28). The condenser no longer calls
+`copilot` itself: the worker pipes the prompt to `ai-exec` (the fallback door
+closed-tabs.sh and chezmoi-commit use) with `AI_EXEC_ORDER=copilot,codex,claude`
+(`$AGENT_TAB_CONDENSE_ORDER`): copilot on `auto` (`$AGENT_TAB_CONDENSE_MODEL`;
+CLI 1.0.102 refuses every named id on this account), then codex on
+`gpt-6-luna` at low effort (`--ephemeral --ignore-user-config --disable hooks`,
+read-only, so it never shows up as an agent), then claude `haiku`. Each leg
+runs only when the one before fails; ai-exec skips codex until its usage-limit
+reset, and logs every fallback to `~/.local/state/ai-exec/log`. All legs run
+in an empty temp dir with the answer read from `-o`, under one 120 s timeout
+for the whole chain. Why: with copilot as the only backend, its monthly quota
+running out ("You have exceeded your monthly quota") failed every condense,
+and tabs sat on raw prompt words for the rest of the month. A quota-dead
+copilot costs each condense ~2 s before the next leg; the worker is detached,
+so no hook waits on it.
 
 **Renames and topic drift** (Claude only; 2026-10-16). Claude writes its
 `{"type":"ai-title"}` line once, at the end of the first turn, and re-appends
