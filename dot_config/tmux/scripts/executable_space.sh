@@ -2053,6 +2053,10 @@ cmd_adopt_pending() {
   local -a args=()
   local v
   while IFS= read -r v; do [[ -n "$v" ]] && add detach-client -t "$v"; done <<<"$viewers"
+  # claude stays where it was born (~): its new tabs (CMD+T/R, spaces.conf's
+  # @tab_dir) open in DIR instead while its pane is still there.
+  add set -w -t "$wid" @tab_cwd "$dir"
+  add set -wF -t "$wid" @tab_cwd_from "#{pane_current_path}"
   add move-window -d -a -s "$wid" -t "$sid:{end}"
   run_args
   if [[ "$(t display-message -p -t "$wid" '#{session_id}' 2>/dev/null)" != "$sid" ]]; then

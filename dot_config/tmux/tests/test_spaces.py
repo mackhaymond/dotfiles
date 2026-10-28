@@ -2648,6 +2648,23 @@ class Create(Server):
         self.assertEqual(self.on(), here)                                              # no popup: no switch
         self.wait(lambda: ["ok", self.client, "space 3 ready: todo"] in self.said(), True)
         self.assertNotEqual(self.run_sh("adopt-pending", wid, d).returncode, 0)        # not pending any more
+        # claude stays in ~ (where it was born): CMD+T / CMD+R on its tab open
+        # in the project, not ~ (Mack, 2026-10-27).
+        born = self.wopt(wid, "pane_current_path")
+        self.assertNotEqual(born, d)
+        self.assertEqual(self.wopt(wid, "@tab_cwd_from"), born)
+        self.t("switch-client", "-c", self.client, "-t", wid)
+        for k in ("c", "k"):
+            self.t("select-window", "-t", wid)
+            self.wait(lambda: self.on("#{window_id}"), wid)
+            self.key("C-b", k)
+            self.wait(lambda: self.on("#{window_id}") != wid and self.on("#{pane_current_path}"), d)
+        # Once its pane leaves that folder, the pane's own folder wins again.
+        self.t("set", "-w", "-t", wid, "@tab_cwd_from", "/nowhere")
+        self.t("select-window", "-t", wid)
+        self.wait(lambda: self.on("#{window_id}"), wid)
+        self.key("C-b", "c")
+        self.wait(lambda: self.on("#{window_id}") != wid and self.on("#{pane_current_path}"), born)
 
     def test_adopt_pending_never_shows_its_number_twice(self):
         # The sidebar draws a space for a session with @space_index N and one
