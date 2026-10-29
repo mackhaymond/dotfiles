@@ -880,6 +880,16 @@ held_detail_take() {
 #                       that would write done or idle, or a quiet restore,
 #                       writes @agent_state `paused` and @agent_turn_result
 #                       "<id> paused". Dropped with the session.
+#   @agent_pause_voided "<epoch>": that flag is an orphan. agent-pause.py's
+#                       void forgot the saved set without messaging anyone,
+#                       so no RESUME will ever clear it; the agent stays
+#                       paused until Mack's OWN prompt into it (the `running`
+#                       arm's PAUSE VOIDED: the rate limit's l_mack test),
+#                       which unsets both in the running write. Wake-ups,
+#                       task-notifications and peers leave both: those turns
+#                       end `paused`. Cleared with the flag everywhere else
+#                       (the pause key's mark_paused, a fresh session, a
+#                       limit taking the flag over, the session's end).
 #   @agent_turn_start   "<epoch>": when the last REAL prompt (not a harness
 #                       wake-up, TURN_JQ's "sys") started a turn. The --since
 #                       of ASKS WHILE WORK IS OUT: an agent-needs-you marker
@@ -890,7 +900,7 @@ held_detail_take() {
 ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_prior_since
              @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
              @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused
-             @agent_turn_start @agent_limit @agent_limit_lifted)
+             @agent_pause_voided @agent_turn_start @agent_limit @agent_limit_lifted)
 PRIOR_OPTS=(@agent_prior_state @agent_prior_since @agent_prior_detail_kind @agent_prior_detail)
 INBOUND_TTL=180
 US=$'\x1f'
@@ -923,9 +933,11 @@ origin_read() {
     # RATE-LIMITED AGENTS: @agent_limit ("R T E", bare tokens) and the lifted
     # stamp ride with the other bare fields.
     O_LIMIT=""; O_LIFTED=""
-    out=$(tmux display-message -p -t "$1" "x${US}#{@agent_turn_origin}${US}#{@agent_state}${US}#{@agent_since}${US}#{@agent_detail_kind}${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_result}${US}#{@agent_bg_owner}${US}#{@agent_paused}${US}#{@agent_turn_start}${US}#{@agent_limit}${US}#{@agent_limit_lifted}${US}#{@agent_inbound}${US}#{@agent_inbound_seen}${US}#{@agent_detail}${US}#{@agent_prior_detail}${US}#{@agent_ask_seen}${US}#{@agent_for_user}" 2>/dev/null || true)
+    # PAUSE VOIDED (@agent_pause_voided, an epoch) is one more bare field.
+    O_VOIDED=""
+    out=$(tmux display-message -p -t "$1" "x${US}#{@agent_turn_origin}${US}#{@agent_state}${US}#{@agent_since}${US}#{@agent_detail_kind}${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_result}${US}#{@agent_bg_owner}${US}#{@agent_paused}${US}#{@agent_turn_start}${US}#{@agent_limit}${US}#{@agent_limit_lifted}${US}#{@agent_pause_voided}${US}#{@agent_inbound}${US}#{@agent_inbound_seen}${US}#{@agent_detail}${US}#{@agent_prior_detail}${US}#{@agent_ask_seen}${US}#{@agent_for_user}" 2>/dev/null || true)
     case "$out" in "x$US"*) ;; *) return 0 ;; esac
-    IFS="$US" read -r x O_ORIGIN O_STATE O_SINCE O_DK O_PSTATE O_PSINCE O_PDK O_RESULT O_BGOWN O_PAUSED O_TSTART O_LIMIT O_LIFTED O_INB O_SEEN O_DT O_PDT O_ASKSEEN O_FORUSER <<<"$out" || true
+    IFS="$US" read -r x O_ORIGIN O_STATE O_SINCE O_DK O_PSTATE O_PSINCE O_PDK O_RESULT O_BGOWN O_PAUSED O_TSTART O_LIMIT O_LIFTED O_VOIDED O_INB O_SEEN O_DT O_PDT O_ASKSEEN O_FORUSER <<<"$out" || true
     case "$O_TSTART" in *[!0-9]*) O_TSTART="" ;; esac
     case "$O_BGOWN" in user|agent) ;; *) O_BGOWN="" ;; esac
     O_OKIND=""; O_OTID=""; O_OFROM=""
@@ -1427,14 +1439,16 @@ limit_add() {
 # housekeeping any turn end does: a stale @agent_pending, a held Stop's stash,
 # a quiet-restore mark and a lifted stamp go, as does the prior an agent
 # turn saved (the turn after a limit is Mack's own, so nothing is restored),
-# and the asker of a needs-input this leaves.
+# and the asker of a needs-input this leaves. So does a void's orphan mark
+# (@agent_pause_voided): the flag is the limit's now, and resumes with it.
 limit_mark() {
     local win="$1" r="$2" ty="$3" txt="$4" tid="$5" e cur o
     local -a cmd=()
     owns_window "$win" || return 0
     printf -v e '%(%s)T' -1 2>/dev/null || e=$(now_epoch)
     cur=$(window_state "$win")
-    for o in @agent_pending @agent_held_detail @agent_quiet @agent_limit_lifted "${PRIOR_OPTS[@]}"; do
+    for o in @agent_pending @agent_held_detail @agent_quiet @agent_limit_lifted @agent_pause_voided \
+             "${PRIOR_OPTS[@]}"; do
         cmd+=(${cmd[0]+\;} set-option -uw -t "$win" "$o")
     done
     [ "$cur" != needs-input ] || cmd+=(\; set-option -uw -t "$win" @agent_ask_from \;
@@ -1460,8 +1474,8 @@ limit_mark() {
 # Queues (ss_add, the outcome's own command list) the unset of @agent_limit
 # and @agent_limit_lifted when either is set, and of @agent_paused while it
 # still holds the limit's own E (a pause-key stamp is left for the pause
-# key). LIM_UNPAUSED=1 when it dropped @agent_paused, so the caller treats
-# the window as not paused.
+# key). LIM_UNPAUSED=1 when it dropped @agent_paused (and with it any
+# @agent_pause_voided), so the caller treats the window as not paused.
 limit_end() {
     local win="$1" lim="$2" lifted="$3" paused="$4" r="" t="" e=""
     LIM_UNPAUSED=0
@@ -1471,6 +1485,7 @@ limit_end() {
     read -r r t e _ <<<"$lim" || true
     if [ -n "$paused" ] && [ -n "$e" ] && [ "$paused" = "$e" ]; then
         ss_add set-option -uw -t "$win" @agent_paused
+        ss_add set-option -uw -t "$win" @agent_pause_voided
         LIM_UNPAUSED=1
     fi
     return 0
@@ -2771,9 +2786,10 @@ case "$mode" in
         # it. Not on `resume` (a tmux restore resumes the paused session
         # itself) and not on `compact` (skipped above).
         # A fresh conversation is not the rate-limited one either (RATE-LIMITED
-        # AGENTS): its limit goes with the flag.
+        # AGENTS): its limit goes with the flag, as does a void's orphan mark.
         case "$src" in
             clear|startup) ss_add set-option -uw -t "$win" @agent_paused
+                           ss_add set-option -uw -t "$win" @agent_pause_voided
                            ss_add set-option -uw -t "$win" @agent_limit
                            ss_add set-option -uw -t "$win" @agent_limit_lifted ;;
         esac
@@ -2881,6 +2897,17 @@ case "$mode" in
         fi
         agent_msg=0
         [ "$v_ok" = 1 ] && [ "$v_for" = agent ] && agent_msg=1
+        # Mack's own prompt: not a verified agent message, not a harness
+        # wake-up (TURN_JQ's "sys"), and not a /loop or scheduled wake-up or
+        # a poll event (its source line) - those are the harness, never Mack.
+        # Not `system` as a whole: native auto-continuation is `system`.
+        # Nor a prompt that opens "[message from @h]" (t_pre) at all: a peer's
+        # whose @agent_inbound entry is stale or missing goes unverified, and
+        # must never pass for Mack's.
+        # Read by the rate limit's hold and by PAUSE VOIDED, both below.
+        p_mack=0
+        [ "$agent_msg" = 0 ] && [ "$t_sys" != sys ] && [ -z "$t_pre" ] && p_mack=1
+        case "$t_src" in loop_wakeup|schedule_wakeup|poll_event) p_mack=0 ;; esac
         # RATE-LIMITED AGENTS (see its section): a prompt into a limited
         # window. Held (nothing written: the tab stays paused, no running
         # flicker) while the limit's pause still stands and the reset is
@@ -2895,13 +2922,9 @@ case "$mode" in
             l_r=""; l_t=""; l_e=""
             read -r l_r l_t l_e _ <<<"$O_LIMIT" || true
             [[ $l_r =~ ^[0-9]{1,12}$ ]] || l_r=0
-            l_mack=0
-            [ "$agent_msg" = 0 ] && [ "$t_sys" != sys ] && l_mack=1
-            # A /loop or scheduled wake-up, or a poll event, is the harness
-            # (TURN_JQ's source line), never Mack - held like a
-            # task-notification. Not `system` as a whole: native
-            # auto-continuation is `system` and must never be held by it.
-            case "$t_src" in loop_wakeup|schedule_wakeup|poll_event) l_mack=0 ;; esac
+            # A wake-up (task-notification, /loop, schedule, poll event) is
+            # held like a peer: only p_mack's prompt is never held.
+            l_mack="$p_mack"
             if [ "$l_mack" = 0 ] && [ -n "$O_PAUSED" ] && [ "$((10#$l_r))" -gt 0 ] \
                && [ "$t_now" -lt "$((10#$l_r))" ]; then
                 exit 0
@@ -2912,14 +2935,30 @@ case "$mode" in
             # end the turn `paused` instead of loud. The one stamp kept: the
             # pause key's own on a window that was WORKING when it was set
             # (newer than the limit's E, state not paused) - its PAUSE can
-            # arrive as this very prompt.
+            # arrive as this very prompt. A void's orphan mark goes with the
+            # flag (PAUSE VOIDED).
             if [ -n "$O_PAUSED" ]; then
                 if [ "$l_mack" = 1 ] || [ "$O_STATE" = paused ] || [ "$O_PAUSED" = "$l_e" ] \
                    || ! [[ $O_PAUSED =~ ^[0-9]{1,12}$ && $l_e =~ ^[0-9]{1,12}$ ]] \
                    || [ "$((10#$O_PAUSED))" -le "$((10#$l_e))" ]; then
                     ss_add set-option -uw -t "$win" @agent_paused
+                    ss_add set-option -uw -t "$win" @agent_pause_voided
+                    O_VOIDED=""
                 fi
             fi
+        fi
+        # PAUSE VOIDED (@agent_pause_voided): agent-pause.py's void forgot the
+        # saved set, so this window's paused flag is an orphan no RESUME will
+        # ever clear. Mack's own prompt ends it: both go in the same command
+        # list as the running write, or the clean Stop that follows would read
+        # the flag and end the turn `paused` instead of done. A wake-up, a
+        # task-notification or a peer leaves both, and its turn ends paused,
+        # exactly as under a live pause. The mark is re-checked in the write
+        # itself: a press's mark_paused (flag fresh, mark gone) can land
+        # between origin_read and it, and that flag is the new pause's.
+        if [ -n "$O_VOIDED" ] && [ "$p_mack" = 1 ]; then
+            ss_add if-shell -F -t "$win" '#{@agent_pause_voided}' \
+                "set-option -uw -t $win @agent_paused ; set-option -uw -t $win @agent_pause_voided"
         fi
         # New turn or the running one? By id; an agent without turn ids
         # (OpenCode, "-") starts a new turn whenever it is not mid-turn.

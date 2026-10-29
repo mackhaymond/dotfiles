@@ -1313,6 +1313,7 @@ watcher's event-log line.
 | `@agent_turn_origin` | indicator, UserPromptSubmit | `<user\|agent> <turn_id> <from\|->` |
 | `@agent_turn_result` | indicator, Stop / StopFailure; the watcher's Codex limit | `<turn_id> loud`, `<turn_id> quiet <restored_state>`, `<turn_id> paused`, or `<turn_id> limited <resets_at>` (§7) |
 | `@agent_paused` | agent-pause.py (docs/agent-pause.md); a rate-limit mark (§7) | `<epoch>`: turn ends write `paused` (see "Paused" below) |
+| `@agent_pause_voided` | agent-pause.py `void` | `<epoch>`: the flag above is an orphan (its saved set was voided); Mack's own prompt unsets both (see "Paused" below) |
 | `@agent_limit`, `@agent_limit_lifted` | a rate-limit mark (§7); agent-pause.py's limit-tick (lifted) | `"<resets_at> <type> <since>"`; `<epoch>` |
 | `@agent_prior_state`, `_since`, `_detail_kind`, `_detail` | indicator, at an agent turn's start | the attention state to restore |
 | `@agent_inbound_seen` | indicator, mid-turn | verified mid-turn messages, inbound's format, ≤ 8 |
@@ -1467,7 +1468,21 @@ paused state", is the contract). While the flag is set:
   conversation is not the paused one, and agent-pause.py, finding that target
   gone at the resume, would never clear the flag (every later Stop would end
   `paused`). Not on `resume` (a tmux restore resumes the paused session
-  itself) or `compact`.
+  itself) or `compact`. `@agent_pause_voided` goes with it everywhere
+  (`ORIGIN_OPTS`, both scripts).
+- **A voided pause** (`agent-pause.py void`, docs/agent-pause.md "Dismiss and
+  void") leaves the flag and the `paused` state and adds
+  `@agent_pause_voided`: no RESUME will ever clear that flag. Mack's own
+  prompt does: the `running` write's command list unsets both, so the clean
+  Stop after it ends `done` (loud), not `paused`. "Mack's own" is `p_mack`,
+  the test §7's hold uses: not a verified agent message nor any prompt
+  opening `[message from @h]` (an unverified one too), not TURN_JQ's `sys`
+  (task-notification, subagent hand-back), not a `source` of `loop_wakeup`,
+  `schedule_wakeup` or `poll_event`. Every other prompt leaves both and its
+  turn ends `paused`. The unset is `if-shell -F '#{@agent_pause_voided}'`
+  in the write: a press's `mark_paused` (fresh flag, mark gone) landing
+  after the read keeps its flag. Without the mark nothing changes: a prompt into a
+  live pause's window ends `paused` as before.
 - **The flag is re-checked in the write itself.** The indicator reads it with
   the origin and the watcher at the tick's start; agent-pause.py's resume
   (flag off and `paused` → `idle`, one call) can land in between. So every
@@ -1588,13 +1603,16 @@ error is `failed`, exactly as before.
   Otherwise the clean `Stop` that follows would read the flag and end the
   turn `paused` instead of loud. The one stamp kept is the pause key's own,
   set while the window was working (newer than the limit's `E`, state not
-  `paused`): its PAUSE may be this very prompt.
+  `paused`): its PAUSE may be this very prompt. `@agent_pause_voided` goes
+  with the flag whenever it does (a limit mark already drops it: the flag is
+  the limit's from then on).
 - `@agent_limit` is **kept** until the turn's outcome.
 
 **Outcomes.** ANY turn outcome but a rate limit ends the limit: it unsets
 `@agent_limit` and `@agent_limit_lifted` in the outcome's own command list,
-and `@agent_paused` too while it is still the limit's `E` (`limit_end` in the
-indicator, `limit_end_cmd` in the watcher). That is a successful `Stop` (a
+and `@agent_paused` too while it is still the limit's `E`, with any
+`@agent_pause_voided` (`limit_end` in the indicator, `limit_end_cmd` in the
+watcher). That is a successful `Stop` (a
 held wake-up whose turn got through after all, say after a cswap switch, is
 then an ordinary finish, not `paused`), a non-`rate_limit` `StopFailure`
 (`failed`), the codex/OpenCode `interrupt` (Esc), and every watcher turn end

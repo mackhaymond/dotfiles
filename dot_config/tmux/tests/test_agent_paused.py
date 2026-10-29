@@ -246,6 +246,110 @@ exec "%s" "$@"
         self.assertEqual(self.opt("@agent_state"), "paused")
         self.assertEqual(self.opt("@agent_turn_result"), "p2 paused")
 
+    # --- a voided pause (agent-pause.py void: the flag stays, an orphan) ---
+
+    WAKE = "<task-notification><task-id>b1</task-id><status>completed</status></task-notification>"
+
+    def void(self):
+        """agent-pause.py's mark_voided: the flag and state are left."""
+        self.set_opt("@agent_pause_voided", str(int(time.time())))
+
+    def voided_pause(self):
+        self.prompt("build it", "u1"); self.pause(); self.stop("u1")
+        self.void()
+        self.assertEqual(self.opt("@agent_state"), "paused")
+
+    def prompt_src(self, text, pid, source):
+        payload = {"session_id": "s1", "cwd": str(self.root), "hook_event_name": "UserPromptSubmit",
+                   "prompt": text, "prompt_id": pid, "source": source, "transcript_path": str(self.transcript)}
+        return self.hook("running", "claude", payload=payload).stdout
+
+    def test_macks_prompt_ends_a_voided_pause_and_the_turn_ends_done(self):
+        self.voided_pause()
+        self.prompt("ok, carry on with the parser", "u2")
+        self.assertEqual(self.opt("@agent_state"), "running")
+        self.assertFalse(self.has("@agent_paused"))
+        self.assertFalse(self.has("@agent_pause_voided"))
+        self.stop("u2")
+        self.assertEqual(self.opt("@agent_state"), "done")
+        self.assertEqual(self.opt("@agent_turn_result"), "u2 loud")
+
+    def test_macks_typed_source_ends_a_voided_pause_too(self):
+        for src in ("user", "system"):          # native auto-continuation is `system`
+            with self.subTest(source=src):
+                self.voided_pause()
+                self.prompt_src("go on", "s-" + src, src)
+                self.assertFalse(self.has("@agent_paused"))
+                self.assertFalse(self.has("@agent_pause_voided"))
+
+    def test_wakeups_and_peers_leave_a_voided_pause_and_end_paused(self):
+        self.voided_pause()
+        cases = [("task-notification", lambda pid: self.prompt(self.WAKE, pid)),
+                 ("peer", lambda pid: self.prompt(self.deliver("status?"), pid))]
+        for src in ("loop_wakeup", "schedule_wakeup", "poll_event"):
+            cases.append((src, lambda pid, src=src: self.prompt_src("check the CI build again", pid, src)))
+        for i, (name, send) in enumerate(cases):
+            with self.subTest(prompt=name):
+                flag, mark = self.opt("@agent_paused"), self.opt("@agent_pause_voided")
+                send("w%d" % i)
+                self.assertEqual((self.opt("@agent_paused"), self.opt("@agent_pause_voided")), (flag, mark))
+                self.stop("w%d" % i)
+                self.assertEqual(self.opt("@agent_state"), "paused")
+                self.assertEqual(self.opt("@agent_turn_result"), "w%d paused" % i)
+
+    def test_an_unverified_message_from_a_peer_is_not_macks(self):
+        # Opens "[message from @x]" but no fresh @agent_inbound entry matches
+        # (stale, or never stamped): not verified, and still never Mack's.
+        self.voided_pause()
+        flag = self.opt("@agent_paused")
+        self.prompt("[message from @peer] status?", "x1")
+        self.assertEqual(self.opt("@agent_paused"), flag)
+        self.assertTrue(self.has("@agent_pause_voided"))
+        self.stop("x1")
+        self.assertEqual(self.opt("@agent_state"), "paused")
+
+    def test_a_press_landing_after_the_read_keeps_its_fresh_flag(self):
+        # agent-pause.py's mark_paused(on) - fresh flag, mark gone - lands
+        # between the hook's origin_read and its write: that flag is the new
+        # pause's, so the write's own re-check leaves it.
+        self.voided_pause()
+        write_exe(self.bin / "tmux", """#!/bin/sh
+case "$*" in *'#{window_active_clients}'*) echo 0; exit 0 ;; esac
+case "$*" in
+  *display-message*'#{@agent_pause_voided}'*)
+    "%s" "$@"; rc=$?
+    "%s" set-option -w -t "$RACE_WIN" @agent_paused 999 \\; set-option -uw -t "$RACE_WIN" @agent_pause_voided
+    exit $rc ;;
+esac
+exec "%s" "$@"
+""" % (ao.REAL_TMUX, ao.REAL_TMUX, ao.REAL_TMUX))
+        self.prompt("carry on", "u2", RACE_WIN=self.win)
+        write_exe(self.bin / "tmux", ao.FAKE_TMUX_WRAPPER % ao.REAL_TMUX)
+        self.assertEqual(self.opt("@agent_paused"), "999")
+        self.assertFalse(self.has("@agent_pause_voided"))
+        self.stop("u2")
+        self.assertEqual(self.opt("@agent_state"), "paused")
+
+    def test_a_live_pause_is_not_ended_by_macks_prompt(self):
+        # Control: without the orphan mark the pause key still owns the flag
+        # (its RESUME clears it), exactly as before.
+        self.prompt("build it", "u1"); self.pause(); self.stop("u1")
+        self.prompt("one more thing", "u2")
+        self.assertTrue(self.has("@agent_paused"))
+        self.stop("u2")
+        self.assertEqual(self.opt("@agent_state"), "paused")
+
+    def test_fresh_session_and_session_end_drop_the_orphan_mark(self):
+        self.voided_pause()
+        self.hook("idle", "claude", payload={"session_id": "s2", "cwd": str(self.root), "source": "resume"})
+        self.assertTrue(self.has("@agent_pause_voided"))           # resume: the same session
+        self.hook("idle", "claude", payload={"session_id": "s2", "cwd": str(self.root), "source": "clear"})
+        self.assertFalse(self.has("@agent_pause_voided"))
+        self.assertFalse(self.has("@agent_paused"))
+        self.voided_pause()
+        self.hook("clear", "claude", payload={"session_id": "s1", "reason": "other"})
+        self.assertFalse(self.has("@agent_pause_voided"))
+
 
 class PausedWatcherTests(ao.WatcherHarness):
     def set_opts(self, **opts):
@@ -318,6 +422,15 @@ os.execv(real, [real] + sys.argv[1:])
         o = self.ticks(6)
         self.assertNotIn("@agent_paused", o)
         self.assertNotIn("@agent_state", o)
+
+    def test_gc_drops_the_orphan_mark(self):
+        st = self.f.read(); st["panes"] = [{"window": "@1", "tty": "/dev/ttys903"}]   # agent gone
+        st["windows"]["@1"]["opts"].update({"@agent_state": "paused", "@agent_paused": "1",
+                                            "@agent_pause_voided": "2"})
+        self.f.state.write_text(json.dumps(st))
+        o = self.ticks(6)
+        self.assertNotIn("@agent_pause_voided", o)
+        self.assertNotIn("@agent_paused", o)
 
 
 @unittest.skipUnless(ao.REAL_TMUX, "tmux executable required")

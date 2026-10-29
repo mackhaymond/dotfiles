@@ -311,6 +311,38 @@ class LimitPromptTests(LimitHookHarness):
         self.assertEqual(self.opt("@agent_detail"), "try again anyway")
         self.assertEqual(self.opt("@agent_turn_origin"), "user u2 -")
 
+    # A voided pause's orphan mark (@agent_pause_voided, agent-pause.py void)
+    # never outlives the flag it marks.
+    def test_a_limit_takes_over_a_voided_flag(self):
+        self.prompt("build it", "u1")
+        self.set_opt("@agent_paused", "100")
+        self.set_opt("@agent_pause_voided", "101")
+        e = self.mark_week()
+        self.assertTrue(self.opt("@agent_paused") not in ("", "100"))
+        self.assertFalse(self.has("@agent_pause_voided"))
+        self.assertTrue(e)
+
+    def test_the_limit_resume_drops_an_orphan_mark_with_the_flag(self):
+        self.prompt("build it", "u1")
+        self.mark_week()
+        self.set_opt("@agent_pause_voided", "101")
+        self.prompt(self.WAKE, "w1")                           # held: both stay
+        self.assertTrue(self.has("@agent_paused"))
+        self.assertTrue(self.has("@agent_pause_voided"))
+        self.prompt("try again anyway", "u2")                 # Mack: both go
+        self.assertFalse(self.has("@agent_paused"))
+        self.assertFalse(self.has("@agent_pause_voided"))
+        self.assertTrue(self.has("@agent_limit"))
+
+    def test_a_failure_ending_the_limit_drops_an_orphan_mark_with_the_flag(self):
+        self.prompt("build it", "u1")
+        self.mark_week()
+        self.set_opt("@agent_pause_voided", "101")
+        self.stop_failure("x1", error="server_error", msg="500")
+        self.assertFalse(self.has("@agent_limit"))
+        self.assertFalse(self.has("@agent_paused"))
+        self.assertFalse(self.has("@agent_pause_voided"))
+
     def test_native_auto_continuation_after_reset_runs_and_unpauses(self):
         self.prompt("build it", "u1")
         now = int(time.time())

@@ -304,8 +304,9 @@ impl Actions {
 
     /// What [`void_paused`](Self::void_paused) hands `run-shell -b`:
     /// `agent-pause.py void <client>` (docs/agent-pause.md "Dismiss and
-    /// void"): the saved set is forgotten, each agent's flag cleared, no
-    /// RESUME sent; nothing when no set is saved.
+    /// void"): the saved set is forgotten and no RESUME sent; the agents
+    /// stay paused (each flag marked `@agent_pause_voided`, which Mack's own
+    /// prompt into that window ends); nothing when no set is saved.
     pub fn void_line(&self, client: &str) -> String {
         self.script_line("agent-pause.py", &["void", client])
     }

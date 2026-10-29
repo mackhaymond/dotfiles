@@ -10,7 +10,7 @@ reach the agents that were paused, not whatever happens to be running now.
     agent-pause.py toggle <client_name>   the key: pause, or resume a saved set
     agent-pause.py resume <client_name>   resume a saved set, never pause (the sidebar)
     agent-pause.py dismiss [client_name]  turn off the notch's "all paused" glow; stays paused
-    agent-pause.py void [client_name]     forget the pause, message nobody, unmark the agents
+    agent-pause.py void [client_name]     forget the pause, message nobody; they stay paused
     agent-pause.py status                 print the saved set, or "not paused"
     agent-pause.py dry-run                print who WOULD be paused/resumed; sends nothing
     agent-pause.py watch pause|resume [--demo] [--press <id>]
@@ -180,7 +180,7 @@ US = "\x1f"
 PANE_FIELDS = ("pane_id", "window_id", "session_name", "window_index", "pane_index",
                "pane_pid", "pane_current_command", "pane_active", "@agent_state",
                "@agent_workflow", "@agent_cua", "@agent_kind", "@agent_paused",
-               "@agent_limit", "@agent_limit_lifted", "@agent_summary")
+               "@agent_limit", "@agent_limit_lifted", "@agent_pause_voided", "@agent_summary")
 PANE_FMT = US.join("#{%s}" % f for f in PANE_FIELDS)
 DISPLAY_MS = "6000"
 # Messages go through notify.sh: a toast in the agent-ui sidebar when one
@@ -254,7 +254,7 @@ def set_paused_option(n):
         pass
 
 
-def mark_paused(panes, on, repause=False, stamp=None):
+def mark_paused(panes, on, repause=False, stamp=None, unless_limited=False):
     """The per-agent PAUSED flag (docs/agent-pause.md, "The paused state"):
     @agent_paused = <epoch> on each pane's window, which tells the tab hooks
     to end its turn as @agent_state `paused` instead of done or a quiet
@@ -267,19 +267,33 @@ def mark_paused(panes, on, repause=False, stamp=None):
     closed pane must not cost the others their flag. Cosmetic, so it never
     raises. stamp: the value to write instead of now. A rate-limited
     window's flag must be its @agent_limit's <since>: the indicator clears
-    the flag on the turn's outcome only when the two match (RATE LIMITS)."""
+    the flag on the turn's outcome only when the two match (RATE LIMITS).
+    Either way a void's orphan mark (@agent_pause_voided, void_pause) goes:
+    the flag is this press's, or nobody's, from now on. unless_limited
+    (clearing only): leave a window that carries @agent_limit alone, tested
+    by tmux in the same call - the indicator may have marked it limited
+    since we looked, and its flag is then the limit's <since>."""
     panes = [p for p in dict.fromkeys(panes) if p]
     if not panes:
         return
     try:
         for p in panes:
             if on:
-                cmds = ["set-option", "-w", "-t", p, "@agent_paused", str(int(stamp or time.time()))]
+                cmds = ["set-option", "-w", "-t", p, "@agent_paused", str(int(stamp or time.time())), ";",
+                        "set-option", "-wu", "-t", p, "@agent_pause_voided"]
                 if repause:
                     cmds += [";", "if-shell", "-F", "-t", p, "#{==:#{@agent_state},idle}",
                              "set-option -w -t %s @agent_state paused" % p]
+            elif unless_limited:
+                cmds = ["if-shell", "-F", "-t", p,
+                        "#{&&:#{==:#{@agent_state},paused},#{?#{@agent_limit},0,1}}",
+                        "set-option -w -t %s @agent_state idle" % p, ";",
+                        "if-shell", "-F", "-t", p, "#{?#{@agent_limit},0,1}",
+                        "set-option -wu -t %s @agent_paused ; set-option -wu -t %s @agent_pause_voided"
+                        % (p, p)]
             else:
                 cmds = ["set-option", "-wu", "-t", p, "@agent_paused", ";",
+                        "set-option", "-wu", "-t", p, "@agent_pause_voided", ";",
                         "if-shell", "-F", "-t", p, "#{==:#{@agent_state},paused}",
                         "set-option -w -t %s @agent_state idle" % p]
             tmux(*cmds, check=False)
@@ -483,7 +497,12 @@ def scan(panes, recs):
             unidentified.append({"window_id": wid, "location": head["location"],
                                  "why": "+".join(why), "label": label_of(head)})
             continue
-        targets.append(dict(agent_target(pick, head, recs), why="+".join(why), found_by=how))
+        t = dict(agent_target(pick, head, recs), why="+".join(why), found_by=how)
+        if head.get("agent_pause_voided") and head["agent_paused"].isdigit():
+            # Still paused from a voided set (its workflow or cua is out):
+            # a PAUSE this agent does not take must leave it so (finish_pause).
+            t["orphan_flag"] = head["agent_paused"]
+        targets.append(t)
     return targets, idle, unidentified
 
 
@@ -884,7 +903,24 @@ def finish_pause(client, prog, targets, unidentified):
         t["result"], t["detail"] = res.get(i, ("unknown", "no result"))
     ok = [t for t in targets if t["result"] in REACHED]
     bad = [t for t in targets if t["result"] not in REACHED]
-    mark_paused([t["pane_id"] for t in bad], False)
+    # A miss marked rate-limited during the delivery keeps the limit's flag
+    # (unless_limited: tmux tests it in the same call).
+    mark_paused([t["pane_id"] for t in bad if not t.get("orphan_flag")], False, unless_limited=True)
+    # A voided set's agent this PAUSE missed was paused before the press and
+    # stays so: its own flag back, an orphan again (void_pause) - unless it
+    # was marked limited meanwhile, whose <since> must stand (RATE LIMITS).
+    # One call per pane, the test in it, as everywhere.
+    for t in bad:
+        if t.get("orphan_flag"):
+            p, stamp = t["pane_id"], str(int(t["orphan_flag"]))
+            try:
+                tmux("if-shell", "-F", "-t", p, "#{?#{@agent_limit},0,1}",
+                     "set-option -w -t %s @agent_paused %s ; set-option -w -t %s @agent_pause_voided %d"
+                     % (p, stamp, p, int(time.time())), check=False)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+    for t in targets:
+        t.pop("orphan_flag", None)
     held = [t for t in ok if t["result"] == "held"]
     unsure = [t for t in ok if t["result"] == "unknown"]
     if not ok:
@@ -1124,9 +1160,13 @@ def finished(prog, finish):
 # After the lid opens (Mack, 2026-10-21): the notch's strong cyan "all paused"
 # ring can be DISMISSED without resuming anyone - the saved set, the sidebar's
 # banner and every paused row stay - and the whole pause can be VOIDED: the
-# set is forgotten and nobody is messaged, so the agents stay where they
-# stopped, just no longer marked paused. Both run under the toggle's lock, so
-# they never interleave with a press.
+# set is forgotten and nobody is messaged, so the next press is a fresh PAUSE,
+# never a RESUME of them. The agents themselves stay paused (Mack,
+# 2026-10-28: a void cancels the resume, not the pause): @agent_paused and the
+# `paused` state are left, and @agent_pause_voided marks the flag an orphan
+# that only Mack's own prompt into that window ends (the tab hook's PAUSE
+# VOIDED). Both run under the toggle's lock, so they never interleave with a
+# press.
 
 def under_lock(client, fn):
     """fn() under the press lock -> its message, or the "busy" line."""
@@ -1164,37 +1204,79 @@ def dismiss_glow(client):
     return under_lock(client, run)
 
 
+def mark_voided(panes):
+    """@agent_pause_voided = <epoch> on each pane's window that still carries
+    the pause key's flag (docs/agent-pause.md, "Dismiss and void"): that flag
+    is an orphan now, which no RESUME will ever clear, so the tab hook drops
+    both on Mack's own next prompt there. Never on a rate-limited window: its
+    flag is the limit's (RATE LIMITS), resumed by limited.json. The test is
+    tmux's own, in the same call as the write. One call per pane, as
+    mark_paused; cosmetic, so it never raises."""
+    now = str(int(time.time()))
+    try:
+        for p in [p for p in dict.fromkeys(panes) if p]:
+            tmux("if-shell", "-F", "-t", p, "#{?#{@agent_limit},0,#{?#{@agent_paused},1,0}}",
+                 "set-option -w -t %s @agent_pause_voided %s" % (p, now), check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def void_pause(client):
-    """Forget the saved set without messaging anyone: each agent's flag goes
-    (and a window still `paused` goes idle), paused.json goes, and the record
-    is kept in paused.last.json as `voided_at`. -> message, or None when an
-    open PAUSE popup will say it: its VOIDED view. A line then would be a
-    tmux message wherever no sidebar shows the client, and tmux 3.7c draws
-    no popup frame under one (see open_popup), so VOIDED (3 s) would never
-    show behind the 6 s line (2026-10-22 review)."""
+    """Forget the saved set without messaging anyone: paused.json goes, the
+    record is kept in paused.last.json as `voided_at`, and the next press is
+    a fresh PAUSE. The agents stay PAUSED: no @agent_paused or @agent_state
+    is touched, so every surface still shows them paused; each flagged window
+    gets @agent_pause_voided (mark_voided) instead, which Mack's own prompt
+    there ends. -> message, or None when an open PAUSE popup will say it:
+    its VOIDED view. A line then would be a tmux message wherever no sidebar
+    shows the client, and tmux 3.7c draws no popup frame under one (see
+    open_popup), so VOIDED (3 s) would never show behind the 6 s line
+    (2026-10-22 review)."""
     def run():
         st = load_state()
         if not st or not st["targets"]:
             return "⏸ nothing is paused — nothing to void"
         try:
             panes, recs = list_panes(), agent_records()
-            found = [locate(t, panes, recs)[0] for t in st["targets"]]
-            alive = set(panes)
+            found = [locate(t, panes, recs) for t in st["targets"]]
         except (OSError, RuntimeError, subprocess.SubprocessError):
-            found, alive = [], set()
-        old = [t.get("pane_id") for t in st["targets"] if t.get("pane_id") in alive]
-        mark_paused([p for p in found if p] + old, False)
-        write_json(LAST, dict(st, voided_at=now_iso(), still_paused=0))
+            panes, found = None, []
+        # Where each agent is now, else its old pane while that is still
+        # there (a flagged window whose record is gone is still paused). An
+        # old pane that now runs ANOTHER agent (locate's "another session" /
+        # "something else") is not the paused one: its flag goes, as the
+        # resume clears a gone target's pane, or that unrelated conversation
+        # would show paused for good. Never a limited one's: that flag is
+        # its own limit's.
+        where, others = [], []
+        if panes is not None:
+            for t, (p, note) in zip(st["targets"], found):
+                old = t.get("pane_id") if t.get("pane_id") in panes else None
+                if p:
+                    where.append(p)
+                elif old and ("another session" in note or "something else" in note):
+                    others.append(old)
+                elif old:
+                    where.append(old)
+        mark_paused(others, False, unless_limited=True)
+        mark_voided(where)
+        # still_paused: the windows still flagged (a limited one too: it
+        # stays paused, by its limit). Unknown (tmux failed): all of them.
+        if panes is None:
+            n = len(st["targets"])
+        else:
+            n = len({panes[p]["window_id"] for p in where if panes[p]["agent_paused"]})
+        write_json(LAST, dict(st, voided_at=now_iso(), still_paused=n))
         try:
             STATE.unlink()
         except FileNotFoundError:
             pass
         set_paused_option(0)
         post_state_change()
-        n = len(st["targets"])
-        msg = "⏸ pause voided: %d agent%s left stopped, not resumed" % (n, "" if n == 1 else "s")
+        msg = "⏸ pause voided: %d agent%s paused, won't be resumed" % (
+            n, " stays" if n == 1 else "s stay")
         log({"mode": "void", "client": client, "paused_at": st.get("paused_at"), "message": msg,
-             "targets": st["targets"]})
+             "still_paused": n, "targets": st["targets"]})
         return None if pause_view_open() else msg
     return under_lock(client, run)
 
@@ -2461,7 +2543,7 @@ def build_frame(mode, items, cols, rows, elapsed, close_in=None, note="", spin=0
         foot = "closes in %ds · any key to close" % max(0, left)
     elif mode == "voided":    # the pause was voided: neither a resume nor a failure
         title, bg, waiting = "VOIDED", LAVENDER, []
-        sub = "pause voided — agents left stopped, not resumed"
+        sub = "⏸ pause voided — agents stay paused, won't be resumed"
         left = 0 if close_in is None else int(close_in)
         foot = "closes in %ds · any key to close" % max(0, left)
     elif sending:             # resume, delivery still running

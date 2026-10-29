@@ -32,6 +32,7 @@ import termios
 import threading
 import time
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "scripts" / "executable_agent-pause.py"
@@ -699,27 +700,183 @@ class PauseKey(Harness):
         self.assertEqual(self.stub.panes(AP.RESUME_MSG), [a])
         self.assertIsNone(self.state())
 
+    def wopt(self, pane, name):
+        return self.t("display", "-p", "-t", pane, "#{%s}" % name).strip()
+
     def test_void_forgets_the_pause_and_messages_nobody(self):
-        flag = lambda p: self.t("display", "-p", "-t", p, "#{@agent_paused}").strip()
+        # Mack, 2026-10-28: a void cancels the RESUME, not the pause. The
+        # agents stay paused (flag and state untouched) and each flag is
+        # marked an orphan, @agent_pause_voided.
         a = self.window("running")
         b = self.window("running")
         self.press()
+        flags = (self.wopt(a, "@agent_paused"), self.wopt(b, "@agent_paused"))
+        self.assertTrue(all(flags))
         self.t("set", "-w", "-t", a, "@agent_state", "paused")   # the hook's Stop
         self.t("set", "-w", "-t", b, "@agent_state", "running")  # b never stopped
         calls = len(self.stub.calls)
+        before = int(time.time())
         r = self.run_script("void", "")
         self.assertEqual((r.returncode, r.stdout), (0, ""), r.stderr)
-        self.assertIn("pause voided: 2 agents", self.last_log()["message"])
+        self.assertIn("pause voided: 2 agents stay paused, won't be resumed", self.last_log()["message"])
         self.assertEqual(len(self.stub.calls), calls)     # no RESUME, no MCP at all
         self.assertIsNone(self.state())
         self.assertEqual(self.paused_opt(), "")
-        self.assertEqual((flag(a), flag(b)), ("", ""))
-        self.assertEqual(self.t("display", "-p", "-t", a, "#{@agent_state}").strip(), "idle")
-        self.assertEqual(self.t("display", "-p", "-t", b, "#{@agent_state}").strip(), "running")
+        self.assertEqual((self.wopt(a, "@agent_paused"), self.wopt(b, "@agent_paused")), flags)
+        self.assertEqual(self.wopt(a, "@agent_state"), "paused")
+        self.assertEqual(self.wopt(b, "@agent_state"), "running")   # its Stop will end paused
+        for p in (a, b):
+            self.assertGreaterEqual(int(self.wopt(p, "@agent_pause_voided")), before)
         last = json.loads((self.dir / "state" / "paused.last.json").read_text())
         self.assertTrue(last["voided_at"])
-        self.press()                                       # the next press is a fresh pause
-        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), sorted([a, b, b]))
+        self.assertEqual(last["still_paused"], 2)
+        self.assertEqual(self.last_log()["still_paused"], 2)
+
+    def test_the_press_after_a_void_is_a_fresh_pause_never_a_resume(self):
+        a = self.window("running")
+        b = self.window("running")
+        self.press()
+        for p in (a, b):
+            self.t("set", "-w", "-t", p, "@agent_state", "paused")
+        self.run_script("void", "")
+        c = self.window("running")
+        self.window("idle")
+        self.press()                                       # pauses c alone
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [])
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), sorted([a, b, c]))   # 2 from the first press
+        self.assertEqual([t["pane_id"] for t in self.state()["targets"]], [c])
+        for p in (a, b):                                   # still paused, still orphans
+            self.assertEqual(self.wopt(p, "@agent_state"), "paused")
+            self.assertTrue(self.wopt(p, "@agent_paused"))
+            self.assertTrue(self.wopt(p, "@agent_pause_voided"))
+        self.assertEqual(self.wopt(c, "@agent_pause_voided"), "")
+        self.press()                                       # resumes c, never a or b
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [c])
+        self.assertTrue(self.wopt(a, "@agent_paused"))
+
+    def test_a_voided_agent_that_works_again_is_paused_and_resumed_afresh(self):
+        # A voided window back at work (b never stopped) is a target of the
+        # next press like any other: its flag becomes that press's (the
+        # orphan mark goes), and that set's RESUME clears it.
+        a = self.window("running")
+        self.press()
+        self.run_script("void", "")
+        self.assertTrue(self.wopt(a, "@agent_pause_voided"))
+        self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [a, a])
+        self.assertTrue(self.wopt(a, "@agent_paused"))
+        self.assertEqual(self.wopt(a, "@agent_pause_voided"), "")
+        self.run_script("void", "")                        # voided again, then...
+        self.assertTrue(self.wopt(a, "@agent_pause_voided"))
+        self.press()                                       # ...paused afresh, then resumed
+        self.press()
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [a])
+        self.assertEqual((self.wopt(a, "@agent_paused"), self.wopt(a, "@agent_pause_voided")), ("", ""))
+
+    def test_a_voided_agent_a_fresh_pause_misses_stays_paused(self):
+        # Voided while its workflow is still out: working, so the next press
+        # targets it. A PAUSE it does not take must not un-pause it.
+        a = self.window("running")
+        self.press()
+        self.t("set", "-w", "-t", a, "@agent_state", "paused")
+        self.t("set", "-w", "-t", a, "@agent_workflow", "1")
+        self.run_script("void", "")
+        self.t("set", "-w", "-t", a, "@agent_paused", "100")   # an old stamp the press overwrites
+        b = self.window("running")
+        self.stub.reply = {a: "refuse"}
+        self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), sorted([a, a, b]))
+        self.assertEqual([t["pane_id"] for t in self.state()["targets"]], [b])
+        self.assertNotIn("orphan_flag", json.dumps(self.state()))
+        self.assertEqual(self.wopt(a, "@agent_paused"), "100")   # its own stamp, back
+        self.assertEqual(self.wopt(a, "@agent_state"), "paused")
+        self.assertTrue(self.wopt(a, "@agent_pause_voided"))
+        self.assertEqual(self.wopt(b, "@agent_pause_voided"), "")
+
+    def limit_mark_on_call(self, pane, e):
+        """The stub marks `pane` rate-limited (the indicator's limit_mark) as
+        the PAUSE to it arrives, i.e. during the delivery."""
+        def on_call(args):
+            if args["pane"] == pane:
+                for opt, val in (("@agent_paused", e), ("@agent_limit", "%s five_hour %s" % (int(e) + 3600, e)),
+                                 ("@agent_state", "paused")):
+                    self.t("set", "-w", "-t", pane, opt, val)
+                self.t("set", "-uw", "-t", pane, "@agent_pause_voided")
+        self.stub.on_call = on_call
+
+    def test_a_miss_limited_during_the_delivery_keeps_the_limits_flag(self):
+        # Both kinds of miss: a voided set's agent (whose old stamp would go
+        # back) and a plain one (whose flag would be cleared).
+        a = self.window("running")
+        self.press()
+        self.t("set", "-w", "-t", a, "@agent_workflow", "1")
+        self.run_script("void", "")
+        self.t("set", "-w", "-t", a, "@agent_paused", "100")
+        self.limit_mark_on_call(a, "555")
+        self.stub.reply = {a: "refuse"}
+        self.press()
+        self.assertEqual(self.wopt(a, "@agent_paused"), "555")
+        self.assertEqual(self.wopt(a, "@agent_pause_voided"), "")
+        self.assertEqual(self.wopt(a, "@agent_state"), "paused")
+        b = self.window("running")
+        self.limit_mark_on_call(b, "777")
+        self.stub.reply = {b: "refuse"}
+        self.press()
+        self.assertEqual(self.wopt(b, "@agent_paused"), "777")
+        self.assertEqual(self.wopt(b, "@agent_state"), "paused")
+        # Control: an unlimited plain miss is still cleared.
+        c = self.window("running")
+        self.stub.on_call = None
+        self.stub.reply = {c: "refuse"}
+        self.press()
+        self.assertEqual(self.wopt(c, "@agent_paused"), "")
+
+    def test_void_clears_an_old_pane_that_now_runs_another_session(self):
+        # Gone, as the resume calls it: the old pane runs another agent now
+        # (a /clear the hook missed, another /resume). That conversation is
+        # not the paused one: its flag goes, never marked an orphan.
+        a = self.window("running")
+        b = self.window("running")
+        self.press()
+        for p in (a, b):
+            self.t("set", "-w", "-t", p, "@agent_state", "paused")
+        self.record(a, "sid-someone-else")
+        self.run_script("void", "")
+        self.assertEqual((self.wopt(a, "@agent_paused"), self.wopt(a, "@agent_pause_voided")), ("", ""))
+        self.assertEqual(self.wopt(a, "@agent_state"), "idle")
+        self.assertTrue(self.wopt(b, "@agent_paused"))              # b is still the paused one
+        self.assertTrue(self.wopt(b, "@agent_pause_voided"))
+        last = json.loads((self.dir / "state" / "paused.last.json").read_text())
+        self.assertEqual(last["still_paused"], 1)
+        self.assertIn("1 agent stays paused", self.last_log()["message"])
+
+    def test_mark_paused_drops_the_orphan_mark_both_ways(self):
+        a = self.window("paused")
+        b = self.window("idle")
+        for p in (a, b):
+            self.t("set", "-w", "-t", p, "@agent_paused", "7")
+            self.t("set", "-w", "-t", p, "@agent_pause_voided", "8")
+        env = {k: v for k, v in self.env.items()}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            AP.mark_paused([a], False)
+            AP.mark_paused([b], True, repause=True)
+        self.assertEqual((self.wopt(a, "@agent_paused"), self.wopt(a, "@agent_pause_voided")), ("", ""))
+        self.assertEqual(self.wopt(a, "@agent_state"), "idle")
+        self.assertTrue(self.wopt(b, "@agent_paused") not in ("", "7"))
+        self.assertEqual(self.wopt(b, "@agent_pause_voided"), "")
+        self.assertEqual(self.wopt(b, "@agent_state"), "paused")
+
+    def test_void_of_a_gone_record_still_marks_its_flagged_window(self):
+        # The agent's record is gone (locate finds nothing) but its old pane
+        # still carries the flag: that window is still paused, so it is the
+        # one marked.
+        a = self.window("running")
+        self.press()
+        for f in (self.dir / "rec").iterdir():
+            f.unlink()
+        self.run_script("void", "")
+        self.assertTrue(self.wopt(a, "@agent_paused"))
+        self.assertTrue(self.wopt(a, "@agent_pause_voided"))
 
     def test_pause_is_urgent_resume_is_not(self):
         """The PAUSE overrides tmux-mcp's draft hold (urgent); the RESUME
@@ -938,7 +1095,7 @@ class Popup(Harness):
         r = self.run_script("void", "")
         self.assertEqual(r.returncode, 0, r.stderr)
         # The VOIDED view's own line; HEAD showed NOT RESUMED · dropped 0 here.
-        self.wait_for(lambda: self.popup_up("pause voided — agents left stopped"), "the VOIDED view")
+        self.wait_for(lambda: self.popup_up("pause voided — agents stay paused"), "the VOIDED view")
         self.press_done()
         self.assertFalse(self.popup_up("could be reached"))
         self.assertFalse(self.popup_up("dropped 0"))
@@ -952,7 +1109,7 @@ class Popup(Harness):
         r = self.run_script("void", self.client)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIsNone(self.state())
-        self.wait_for(lambda: self.popup_up("left stopped, not resumed"), "the void's message line")
+        self.wait_for(lambda: self.popup_up("stays paused, won't be resumed"), "the void's message line")
 
     def test_enter_that_reaches_nobody_stays_paused(self):
         a = self.window("running")
@@ -1484,6 +1641,23 @@ class RateLimits(Harness):
         self.assertEqual(self.opt(lim, "@agent_limit"), "%d five_hour %d" % (NOW + 3600, NOW - 600))
         self.assertTrue(self.opt(lim, "@agent_paused"))
 
+    def test_void_leaves_a_target_limited_since_the_pause_to_its_limit(self):
+        # A saved target whose reply's turn hit a usage limit: its flag is
+        # the limit's now (limited.json resumes it), so the void neither
+        # touches it nor marks it an orphan. It still counts as paused.
+        run = self.window("running")
+        other = self.window("running")
+        self.press()
+        self.mark(run, NOW + 3600, "five_hour", NOW - 60)
+        self.t("set", "-w", "-t", other, "@agent_state", "paused")
+        self.run_script("void", "")
+        self.assertEqual(self.opt(run, "@agent_paused"), str(NOW - 60))
+        self.assertEqual(self.opt(run, "@agent_state"), "paused")
+        self.assertEqual(self.opt(run, "@agent_pause_voided"), "")
+        self.assertTrue(self.opt(other, "@agent_pause_voided"))
+        last = json.loads((self.dir / "state" / "paused.last.json").read_text())
+        self.assertEqual(last["still_paused"], 2)
+
     # -- review fixes ---------------------------------------------------------
     def test_a_held_resume_is_reached_never_resent(self):
         p = self.limited(NOW - 1000)
@@ -1765,7 +1939,7 @@ class Units(unittest.TestCase):
         text = "\n".join(lines)
         self.assertEqual(bg, AP.LAVENDER)                  # neither green nor peach
         self.assertTrue(all(r in text for r in AP.block("VOIDED")))
-        self.assertIn("left stopped, not resumed", text)
+        self.assertIn("agents stay paused, won't be resumed", text)
         self.assertNotIn("could be reached", text)
         self.assertEqual(lines[-1].strip(), "closes in 2s · any key to close")
 

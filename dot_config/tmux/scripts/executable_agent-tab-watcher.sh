@@ -718,7 +718,7 @@ limit_end_cmd() {
     lim_cmd=" ; set-option -uw -t $w @agent_limit ; set-option -uw -t $w @agent_limit_lifted"
     read -r _ _ e _ <<<"${W_LIMIT[$w]}" || true
     if [ -n "${W_PAUSED[$w]:-}" ] && [[ $e =~ ^[0-9]{1,12}$ ]] && [ "${W_PAUSED[$w]}" = "$e" ]; then
-        lim_cmd+=" ; set-option -uw -t $w @agent_paused"
+        lim_cmd+=" ; set-option -uw -t $w @agent_paused ; set-option -uw -t $w @agent_pause_voided"
         W_PAUSED[$w]=""
     fi
     return 0
@@ -747,7 +747,7 @@ codex_limit_mark() {
     e="$tick_now"
     c=""
     for o in @agent_pending @agent_held_detail @agent_quiet @agent_limit_lifted @agent_ask_from @agent_ask_bg \
-             @agent_prior_state @agent_prior_since @agent_prior_detail_kind @agent_prior_detail; do
+             @agent_pause_voided @agent_prior_state @agent_prior_since @agent_prior_detail_kind @agent_prior_detail; do
         c+="set-option -uw -t $win $o ; "
     done
     c+="set-option -w -t $win @agent_paused $e ; set-option -w -t $win @agent_limit '$r codex $e'"
@@ -1237,9 +1237,10 @@ wins=()
 ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_prior_since
              @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
              @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused
-             @agent_turn_start @agent_limit @agent_limit_lifted)
+             @agent_pause_voided @agent_turn_start @agent_limit @agent_limit_lifted)
 # (@agent_limit / @agent_limit_lifted: RATE-LIMITED AGENTS, dropped with the
-# session wherever @agent_paused is.)
+# session wherever @agent_paused is; so is @agent_pause_voided, the void's
+# orphan mark - agent-tab-indicator.sh's option table.)
 # prior_restore WIN WAC: one read of the saved fields, one write. Sets
 # r_state (the state written) and r_since; returns 1 when nothing was
 # written: the write failed, or the prior is gone since the tick's read (the

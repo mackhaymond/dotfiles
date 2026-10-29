@@ -289,7 +289,7 @@ ways out besides the resume:
 | action | what changes | what stays | how |
 |---|---|---|---|
 | **dismiss** the glow | paused.json gains `glow_dismissed_at`; the notch's "all paused" ring goes dark | the saved set, `@agent_paused`, the `paused` rows (notch menu, tabs, sidebar cards) and the sidebar's banner | `agent-pause.py dismiss [client]`; a click on the notch while it shows the cyan ring |
-| **void** the pause | paused.json is removed (recorded in paused.last.json as `voided_at`); every target's `@agent_paused` is cleared and a window still `paused` goes `idle`; no RESUME is sent to anyone | the agents themselves: they stay where they stopped, idle, with their notes | `agent-pause.py void [client]`; the sidebar banner's void action (confirmed); the notch menu's "Void pause" |
+| **void** the pause | paused.json is removed (recorded in paused.last.json as `voided_at`, `still_paused` = the windows still flagged); each target window still carrying the flag gets `@agent_pause_voided <epoch>` (not a rate-limited one: its flag is the limit's); no RESUME is sent to anyone, and the next prefix P is a fresh PAUSE | the agents stay PAUSED: `@agent_paused`, `@agent_state paused` and every paused row (tabs, sidebar cards, the notch) until Mack's own prompt into that window | `agent-pause.py void [client]`; the sidebar banner's void action (confirmed); the notch menu's "Void pause" |
 | **resume** | as always | | prefix P; a click on the banner; the notch menu's "Resume" |
 
 - The dismissal lasts until the set is resumed, voided or replaced by a new
@@ -306,10 +306,41 @@ ways out besides the resume:
   its click); the menu's "Paused (N)" row has Resume and a two-press Void
   (0.7–4 s).
 - **The banner stays until resume or void.** It shows whenever paused.json
-  lists targets, dismissed or not. **The notch menu keeps the agents paused**
-  until resume or void: a void removes paused.json, which the notch already
-  treats like a resume for its rows (hook-written `paused` → ready), while
-  nothing is sent to the agents.
+  lists targets, dismissed or not. A void removes paused.json, so the banner,
+  the notch's ring and its "Paused (N)" group go; the agents' paused rows do
+  not (the notch tells a void from a resume by paused.last.json's
+  `voided_at`, and acknowledges no row), while nothing is sent to the agents.
+- **A void forgets the resume, not the pause** (Mack, 2026-10-28: "voiding a
+  pause keeps agents that were paused marked as paused, it just voids the
+  desire to resume"). Before, a void cleared every flag and turned `paused`
+  windows `idle`. Now the flag stays, marked an orphan by
+  `@agent_pause_voided`: no saved set will ever RESUME it. What ends a voided
+  agent's pause:
+  - **Mack's own prompt into that window.** The tab hook's UserPromptSubmit
+    unsets `@agent_paused` and `@agent_pause_voided` in the same command list
+    as its `running` write, so the clean Stop that follows ends `done`
+    (loud), not `paused`. "Mack's own" is the rate-limit hold's test: not a
+    verified agent/peer message nor any prompt opening `[message from @h]`,
+    not a harness wake-up (task-notification, subagent hand-back), not a
+    `source` of `loop_wakeup` / `schedule_wakeup` / `poll_event`. The unset
+    re-checks the mark in the write itself (`if-shell`), so a press's fresh
+    flag landing after the hook's read stands.
+  - Wake-ups, task-notifications and peer messages do **not** end it: those
+    turns end `paused`, as under a live pause.
+  - A fresh PAUSE or RESUME of that window (`mark_paused`, either way: the
+    flag is that press's, or nobody's), a fresh session (`/clear`, startup),
+    the session's end and the watcher's GC drop the mark with the flag; a
+    usage limit marking the window takes the flag over and drops it too.
+  - Without the mark, a live pause's flag is still the pause key's alone:
+    Mack typing into a paused agent whose set is saved leaves it paused.
+  - A target whose old pane now runs ANOTHER agent (locate's "another
+    session" / "something else", as the resume calls it gone) is not the
+    paused one: void clears that pane's flag (and a `paused` there goes
+    `idle`) instead of marking it, unless that window is rate-limited.
+  - A fresh PAUSE that misses a voided agent still busy with a workflow puts
+    its old stamp and the mark back; neither that nor clearing a plain miss
+    touches a window marked rate-limited during the delivery (tmux tests
+    `@agent_limit` in the same call).
 
 ## In the sidebar
 
@@ -607,7 +638,12 @@ as today.)
   press meanwhile is never turned away as busy. They also run after the
   resume's own toast, so their staggers never hold it up: their outcome is a
   second toast, and a `limit-after-resume` log line.
-- **void** and **dismiss** never touch `limited.json` or `@agent_limit`.
+- **void** and **dismiss** never touch `limited.json` or `@agent_limit`, and
+  a void never marks a limited window `@agent_pause_voided`: that window's
+  `@agent_paused` is the limit's, which keeps its own handling (the limit's
+  hold and resume, `limit_end`). A limit marking a voided window takes its
+  flag over and drops the mark; the limit-resume prompt and `limit_end`
+  drop it with the flag.
 - **status** and **dry-run** list the limited set: window, kind, type,
   `resets <time>` or `lifted`, attempts and label (dry-run adds which are
   eligible now, and marks a saved target that resume would hand over).
