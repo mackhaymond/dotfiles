@@ -1207,7 +1207,14 @@ class Roster:
             else:
                 pane, why = agent_pane(w["id"], w.get("kind", ""))
                 if pane:
-                    run_bg("'%s' close '%s'" % (CLOSED, pane))
+                    # As prefix x and agent-ui's x: the close that leaves a
+                    # space with only its home asks, on this client, whether
+                    # the space goes too (docs/spaces.md). No client (the
+                    # strip before it found one): a plain close.
+                    if self.client:
+                        run_bg("'%s' close --ask-space '%s' '%s'" % (CLOSED, self.client, pane))
+                    else:
+                        run_bg("'%s' close '%s'" % (CLOSED, pane))
                     self.say("closed %s · ⌘Z brings it back" % w["label"])
                 else:
                     self.say(why)

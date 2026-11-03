@@ -154,7 +154,8 @@ fn space_scope_keeps_it_in_the_dock() {
 
 /// Pinned, it moves into PINNED like any agent (its space's colour on its
 /// key-cap, `creating` where a space's name would be); its space keeps its
-/// dock row (and, with nothing left to list, no group in AGENTS).
+/// dock row, and its group in AGENTS as a bare header (nothing under it),
+/// at its number, its click the popup.
 #[test]
 fn a_pending_claude_pins() {
     let v = pend("running", &[("pinned", "100")]);
@@ -163,7 +164,10 @@ fn a_pending_claude_pins() {
     assert!(p.len() >= 3 && p[1].covers == [("pending".to_string(), "@6".to_string())], "{:#?}", texts(&f));
     assert!(p[2].text().contains("creating"), "{:?}", p[2].text());
     assert_eq!(p[1].target_at(4), Some(&go6()));
-    assert!(!header_targets(&f).contains(&pending_target()));
+    let heads = header_targets(&f);
+    assert_eq!(heads, [Target::Session("main".into()), Target::Session("work".into()), pending_target(), Target::Session("notes".into())], "{:#?}", texts(&f));
+    let y = f.agents.clone().find(|&y| f.rows[y].target_at(2) == Some(&pending_target())).unwrap();
+    assert!(f.rows[y + 1].covers.is_empty() && !f.rows[y + 1].text().contains("Rust CLI"), "{:#?}", texts(&f));
     assert!(f.rows[f.spaces.clone()].iter().any(|r| r.target_at(2) == Some(&pending_target())));
 }
 

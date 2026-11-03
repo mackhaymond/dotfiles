@@ -138,11 +138,17 @@ fn pins_show_in_every_scope() {
     let v = scoped(ag, "@1", "main", "on", "space", "");
     let t = texts(&layout(&v, 34, 50, &Opts::default()));
     assert!(t.iter().any(|l| l.contains("all pinned above")) && !t.iter().any(|l| l.contains("no agents in this space")), "{t:#?}");
-    // All spaces, every agent pinned: the same words under AGENTS.
+    // All spaces, every agent pinned: each space keeps its header, nothing
+    // under it, and no words (the headers say it).
     let ag = vec![a("main", 1, "idle", "One").with("pinned", "5"), a("bai", 1, "idle", "Two").with("pinned", "6")];
     let v = scoped(ag, "@1", "main", "on", "all", "");
-    let t = texts(&layout(&v, 34, 50, &Opts::default()));
-    assert!(t.iter().any(|l| l.contains("all pinned above")), "{t:#?}");
+    let f = layout(&v, 34, 50, &Opts::default());
+    let t = texts(&f);
+    let names: Vec<String> = heads(&f).into_iter().map(|(_, s)| s).collect();
+    assert_eq!(names, ["bai", "main"], "{t:#?}");
+    assert!(!t.iter().any(|l| l.contains("all pinned above") || l.contains("no agents")), "{t:#?}");
+    let rest = &t[f.pinned.end..f.agents.end];
+    assert!(!rest.iter().any(|l| l.contains("One") || l.contains("Two")), "{rest:#?}");
 }
 
 /// The client's own pinned agent keeps its lift ("you are here") in PINNED;

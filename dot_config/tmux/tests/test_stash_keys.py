@@ -575,7 +575,8 @@ class Keys(unittest.TestCase):
         toasts = self.toasts()
         keep = self.t("display", "-p", "-t", self.wins[2], "#{pane_id}")
         closer = Path(self.tmp, "fake-closer.sh")             # closes every pane but one
-        closer.write_text(f'#!/bin/sh\n[ "$2" = "{keep}" ] || tmux kill-pane -t "$2"\n')
+        # `close` only: sel-kill-go also runs its `ask-space` (no box here, main).
+        closer.write_text(f'#!/bin/sh\n[ "$1" = close ] || exit 0\n[ "$2" = "{keep}" ] || tmux kill-pane -t "$2"\n')
         closer.chmod(0o755)
         self.t("set-environment", "-g", "CLOSED_TABS_SH", str(closer))
         self.t("select-window", "-t", self.wins[1])

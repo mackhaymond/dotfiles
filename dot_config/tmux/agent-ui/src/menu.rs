@@ -216,7 +216,7 @@ impl Effects for Live {
         self.actions.park(&self.snap, win, session)
     }
     fn close(&mut self, win: &str, session: &str) -> Result<String, String> {
-        self.actions.close(&self.snap, win, session)
+        self.actions.close(&self.snap, &self.client, win, session)
     }
     fn restart_watcher(&mut self) -> String {
         self.actions.restart_watcher()

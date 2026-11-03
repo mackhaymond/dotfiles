@@ -5,6 +5,9 @@
 # running in it — enough to resume that conversation.
 #
 #   closed-tabs.sh close <pane_id>                 snapshot, record, kill the pane
+#   closed-tabs.sh close --ask-space <client> <pane_id>   the same, then ask-space
+#   closed-tabs.sh ask-space <client> <session>    only home left? ask to close the space
+#   closed-tabs.sh ask-space-yes <client> <sid>    that box's y: still only home? close it
 #   closed-tabs.sh pick-popup <session_id> <tty>   fzf picker over the history
 #   closed-tabs.sh reopen <session_id> <tty> [id…] reopen these (default: newest)
 #   closed-tabs.sh forget <id…>                    drop entries from the history
@@ -23,7 +26,9 @@
 # doesn't) close through here; prefix X (CMD+Z) opens the picker. Only closes
 # that go through `close` are remembered — a tab that ends because its shell
 # exited never passes through a key binding, and by the time any tmux hook
-# fires its process tree is gone.
+# fires its process tree is gone. The closes made by hand (prefix x / C-l,
+# the agent-ui menu's x, prefix v's range close) also ask whether to close the
+# space when only its home is left (ask_space below); no other close does.
 #
 # Storage, all under ~/.local/state/tmux-closed-tabs/:
 #   history.jsonl        one JSON object per closed tab, oldest first
@@ -583,6 +588,179 @@ do_close() {
     return 0
 }
 
+# --- the last tab of a space ---------------------------------------------------
+#
+# "Closing the last tab in a space prompts to close the space. If you say no,
+# it goes to the home of that space" (Mack, 2026-11-03). Opt-in: only the
+# closes made by hand ask — prefix x / C-l (`close --ask-space`), the agent-ui
+# menu's x (the same) and prefix v's range close (stash.sh, one `ask-space`
+# after all its closes). A plain `close` never does, so space.sh close's own
+# closer, the prune / pause / limit code and a tab whose process exits by
+# itself never prompt.
+#
+# The client lands on the space's home FIRST (switch-client, even from another
+# space: the menu can close any space's tab), then the box opens there. A
+# dismissed menu runs no command, so Cancel, Esc and a click outside all leave
+# it on home with nothing more to do; only y closes, through `ask-space-yes`:
+# it checks the space is still nothing but its home (a tab opened while the
+# box was up would go with it) and runs prefix Q's own command (space.sh
+# close: every pane through this script, ⌘Z reopens). main
+# is never closed: no box, and a client already in main lands on its home.
+# Hidden sessions, a space already closing and spaces off: nothing.
+#
+# tmux refuses a menu, silently and at once, while the client has another
+# overlay up (the agent-ui menu stays open after its x), and a menu that IS up
+# holds the `tmux display-menu` call until it is answered. So a call still
+# running ASK_PROBE ms past one tmux round trip (timed just before, so a slow
+# or stalled server stretches it alike) was shown; one back sooner met an
+# overlay and is retried every ASK_RETRY seconds, up to ASK_TRIES times (a
+# minute), re-checking first that the space still has only its home and the
+# client is still on it. The probe is short because an answer inside it reads
+# as a refusal and would bring the box back once; nothing a hand does lands
+# inside 0.15 s of the box appearing (keys typed before it go to the pane).
+ASK_PROBE=150
+ASK_RETRY=0.2
+ASK_TRIES=120
+US=$'\x1f'
+
+# space_home_only <target>: "<session_id> <name> <home pane>" (US-separated)
+# when the target's session is a space of nothing but its home; else status 1.
+space_home_only() {
+    local info sid name hid closing on nwin hidden_list
+    info=$(tmux display-message -p -t "$1" \
+        "#{session_id}${US}#{session_name}${US}#{@space_hidden}${US}#{@space_closing}${US}#{@spaces}${US}#{session_windows}${US}#{@space_hidden_sessions}" 2>/dev/null)
+    IFS="$US" read -r sid name hid closing on nwin hidden_list <<<"$info"
+    [ -n "$sid" ] && [ "$on" = on ] && [ "$hid" != 1 ] && [ -z "$closing" ] && [ "$nwin" = 1 ] || return 1
+    [[ " $hidden_list " == *" $name "* ]] && return 1
+    local win home pane
+    IFS="$US" read -r win home <<<"$(tmux list-windows -t "$sid" -F "#{window_id}${US}#{@space_home}" 2>/dev/null)"
+    [ "$home" = 1 ] || return 1
+    pane=$(tmux list-panes -t "$win" -F '#{?#{@space_home_pane},#{pane_id},}' 2>/dev/null | grep -m 1 .)
+    [ -n "$pane" ] || return 1
+    printf '%s%s%s%s%s\n' "$sid" "$US" "$name" "$US" "$pane"
+}
+
+# The session client $1 is on; status 1 when it is not attached.
+client_session() {
+    tmux list-clients -F "#{client_name}${US}#{session_id}" 2>/dev/null \
+        | awk -F "$US" -v c="$1" '$1 == c { print $2; f = 1; exit } END { exit !f }'
+}
+
+# ask_space <client> <target>: the target's session after a close (a pane
+# target: a session id, `=name:`, or any window or pane of it; a bare `=name`
+# resolves to nothing). Returns once the box is answered or given up on.
+ask_space() {
+    local client="${1:-}" row sid name pane on
+    [ -n "$client" ] && [ -n "${2:-}" ] || return 0
+    row=$(space_home_only "$2") || return 0
+    IFS="$US" read -r sid name pane <<<"$row"
+    on=$(client_session "$client") || return 0
+    if [ "$name" = main ]; then
+        [ "$on" = "$sid" ] && tmux select-pane -t "$pane" 2>/dev/null
+        return 0
+    fi
+    tmux select-pane -t "$pane" \; switch-client -c "$client" -t "$sid" 2>/dev/null || return 0
+    # One box per space at a time: two closes racing to empty it both get
+    # here, and the second would retry behind the first box and ask again
+    # once it is answered. mkdir is the atomic test; the holder's pid inside
+    # says whether it still lives (its box can stay up as long as it likes).
+    # A dead holder's lock is taken over; a day-old one too, should its pid
+    # have been reused. Released only by its holder.
+    local held="$STATE_DIR/ask.${sid#\$}" owner=""
+    if ! mkdir "$held" 2>/dev/null; then
+        owner=$(cat "$held/pid" 2>/dev/null)
+        # Not written yet: the holder is between its mkdir and its write.
+        [ -z "$owner" ] && [ "$(lock_age "$held")" -lt 5 ] && return 0
+        if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null && [ "$(lock_age "$held")" -lt 86400 ]; then
+            return 0
+        fi
+        mv "$held" "$held.stale.$$" 2>/dev/null && rm -rf "$held.stale.$$"
+        mkdir "$held" 2>/dev/null || return 0
+    fi
+    echo "$$" >"$held/pid"
+    ask_box "$client" "$sid" "$name" "$pane"
+    [ "$(cat "$held/pid" 2>/dev/null)" = "$$" ] && rm -rf "$held"
+    return 0
+}
+
+# Milliseconds since the epoch, in REPLY: bash 5's EPOCHREALTIME, else perl
+# (macOS's /bin/bash is 3.2).
+now_ms() {
+    if [ -n "${EPOCHREALTIME:-}" ]; then
+        local t=${EPOCHREALTIME/[.,]/}
+        REPLY=$(( 10#$t / 1000 ))
+    else
+        REPLY=$(perl -MTime::HiRes=time -e 'printf "%d", time() * 1000')
+    fi
+}
+
+# The box itself, retried while another overlay holds the client.
+ask_box() {
+    local client="$1" sid="$2" name="$3" pane="$4" i=0 mp t0 wait_ms
+    while [ "$i" -lt "$ASK_TRIES" ]; do
+        # One round trip, as the refused menu's would be.
+        now_ms; t0=$REPLY
+        tmux display-message -p '' >/dev/null 2>&1
+        now_ms; wait_ms=$(( REPLY - t0 + ASK_PROBE ))
+        # prefix Q's box (spaces.conf), on this client, formats expanded in
+        # the home pane: #{session_id} is the space, #{client_name} the
+        # client. y re-checks before it closes (ask-space-yes).
+        tmux display-menu -c "$client" -t "$pane" -b rounded -s 'bg=#1e1e2e,fg=#cdd6f4' -S 'fg=#f38ba8' \
+            -H 'bg=#45475a,fg=#cdd6f4,bold' -T "#[align=centre] last tab closed · close space #{session_name}? " \
+            -x "$POPUP_X" -y C "Cancel" n "" \
+            "Close space" y "run-shell -b \"XDG_STATE_HOME='$STATE_HOME' bash '$SELF' ask-space-yes '#{client_name}' '#{session_id}'\"" \
+            </dev/null >/dev/null 2>&1 &
+        mp=$!
+        sleep "$(printf '%d.%03d' $((wait_ms / 1000)) $((wait_ms % 1000)))"
+        if kill -0 "$mp" 2>/dev/null; then
+            log "ask-space $name on $client"
+            wait "$mp"
+            return 0
+        fi
+        wait "$mp"
+        i=$((i + 1))
+        sleep "$ASK_RETRY"
+        space_home_only "$sid" >/dev/null || return 0
+        [ "$(client_session "$client")" = "$sid" ] || return 0
+    done
+    log "ask-space $name: $client never took the box"
+}
+
+# close --ask-space <client> <pane>: the close, then ask_space for the pane's
+# session, both read before the pane goes. Only a close that took its whole
+# WINDOW (a tab) asks: closing a split of the home window in a space that
+# already had nothing but its home leaves the very state that asks, and must
+# not. kill-pane is synchronous, so by the time do_close returns the window
+# is gone or not (a split, a failed kill: then nothing asks).
+do_close_ask() {
+    local client="${1:-}" pane="${2:-}" info="" sid="" win=""
+    [ -n "$pane" ] && info=$(tmux display-message -p -t "$pane" "#{session_id}${US}#{window_id}" 2>/dev/null)
+    IFS="$US" read -r sid win <<<"$info"
+    do_close "$pane" || return
+    [ -n "$sid" ] && [ -n "$win" ] || return 0
+    [ -z "$(tmux display-message -p -t "$win" '#{window_id}' 2>/dev/null)" ] || return 0
+    ask_space "$client" "$sid"
+    return 0
+}
+
+# ask-space-yes <client> <session_id>: the box's y. Closes the space with
+# prefix Q's command (@space_sh close, as run-shell would run it) only while
+# it is still nothing but its home: a tab opened while the box was up says so
+# and nothing closes. A space gone or closing meanwhile: nothing.
+do_ask_space_yes() {
+    local client="${1:-}" sid="${2:-}" n space_sh
+    [ -n "$sid" ] || return 0
+    if ! space_home_only "$sid" >/dev/null; then
+        n=$(tmux display-message -p -t "$sid" '#{?#{@space_closing},,#{session_windows}}' 2>/dev/null)
+        [ -n "$n" ] && [ "$n" -gt 1 ] \
+            && notify_user ${client:+-c "$client"} -k warn -- "space has tabs again · not closed"
+        return 0
+    fi
+    space_sh=$(tmux show-option -gqv @space_sh 2>/dev/null)
+    [ -n "$space_sh" ] || { notify_user ${client:+-c "$client"} -k error -- "space: @space_sh is not set"; return 0; }
+    sh -c "$space_sh close \"\$1\" \"\$2\"" _ "$sid" "$client"
+}
+
 # The conversation behind a closed agent tab as plain "ROLE: text" lines —
 # messages and tool calls, no thinking, tool output or injected context.
 transcript_digest() {
@@ -946,7 +1124,10 @@ do_list() {
 }
 
 case "${1:-}" in
-close)      shift; do_close "$@" ;;
+close)      shift
+            if [ "${1:-}" = --ask-space ]; then shift; do_close_ask "$@"; else do_close "$@"; fi ;;
+ask-space)  shift; ask_space "$@" ;;
+ask-space-yes) shift; do_ask_space_yes "$@" ;;
 pick-popup) shift; do_pick_popup "$@" ;;
 pick)       shift; do_pick "$@" ;;
 preview)    shift; do_preview "$@" ;;

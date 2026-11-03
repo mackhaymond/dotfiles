@@ -411,7 +411,7 @@ fn actions_reach_the_test_server_only() {
     assert!(log.contains(&format!("stash.sh unstash {parked} /dev/ttys999")), "{log}");
     // park refuses a parked tab; close on a split without an agent refuses to guess.
     assert_eq!(actions.park(&snap, &parked, "stash").unwrap_err(), "already parked");
-    assert_eq!(actions.close(&snap, &split, "main").unwrap_err(), PANE_UNSURE);
+    assert_eq!(actions.close(&snap, "/dev/ttys999", &split, "main").unwrap_err(), PANE_UNSURE);
     // Peek: colours kept, trailing blanks dropped.
     let w = snap.windows.iter().find(|w| w.id == peek).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);

@@ -11,7 +11,7 @@
 //! | back (⌥X)         | `bash nav.sh back <tty>` (docs/nav.md)                   | (none)            |
 //! | go to a space     | goto on its HOME window (else its active one), there     | `Strip.click`     |
 //! | park              | `run-shell -b "stash.sh stash <win>"`                    | `Roster.act` H    |
-//! | close             | `run-shell -b "closed-tabs.sh close <pane>"` (agent pane)| `Roster.act` x    |
+//! | close             | `run-shell -b "closed-tabs.sh close --ask-space <tty> <pane>"` (agent pane) | `Roster.act` x |
 //! | discard (parked)  | `run-shell -b "stash.sh kill-many <win>"`                | `Roster.act` x    |
 //! | restart watcher   | `run-shell -b "bash agent-tab-watcher.sh"`               | `Roster.act` r    |
 //! | peek              | `capture-pane -p -e -J -S -N -t <agent pane>`            | `peek_lines`      |
@@ -604,13 +604,21 @@ impl Actions {
         Ok(format!("parking {}…", w.label))
     }
 
-    /// `x` after its y. A parked tab goes through stash.sh's own discard
-    /// (`kill-many`, which logs a suspended conversation's id); anything
-    /// else closes the agent's pane through closed-tabs.sh (⌘Z restores it),
-    /// or is refused when the pane can't be told, or is a space's home shell
-    /// pane (as prefix x refuses it; an agent in a split of the home window
-    /// still closes).
-    pub fn close(&self, snap: &Snapshot, win: &str, session: &str) -> Result<String, String> {
+    /// What [`close`](Self::close) hands `run-shell -b`: `closed-tabs.sh
+    /// close --ask-space <client> <pane>`, prefix x's close, so a close that
+    /// leaves a space with only its home asks on `client` whether the space
+    /// goes too (docs/spaces.md "Home: the space's main shell").
+    pub fn close_line(&self, client: &str, pane: &str) -> String {
+        self.script_line("closed-tabs.sh", &["close", "--ask-space", client, pane])
+    }
+
+    /// `x` after its y, from the menu on `client`. A parked tab goes through
+    /// stash.sh's own discard (`kill-many`, which logs a suspended
+    /// conversation's id); anything else closes the agent's pane through
+    /// closed-tabs.sh (⌘Z restores it), or is refused when the pane can't be
+    /// told, or is a space's home shell pane (as prefix x refuses it; an
+    /// agent in a split of the home window still closes).
+    pub fn close(&self, snap: &Snapshot, client: &str, win: &str, session: &str) -> Result<String, String> {
         let w = self.recheck(snap, win, session)?;
         if w.session == HOLD {
             self.run_bg_script("stash.sh", &["kill-many", &w.id]);
@@ -620,7 +628,7 @@ impl Actions {
         if home {
             return Err(HOME_CLOSE.into());
         }
-        self.run_bg_script("closed-tabs.sh", &["close", &pane]);
+        self.tmux.run_bg(&self.close_line(client, &pane));
         Ok(format!("closed {} · ⌘Z brings it back", w.label))
     }
 
@@ -701,6 +709,14 @@ mod tests {
     use super::*;
 
     const P: &str = "%1\x1f/dev/ttys001\x1f1\n%2\x1f/dev/ttys002\x1f0";
+
+    /// The menu's x closes as prefix x does: opted in to the "close the
+    /// space?" box, on the menu's own client.
+    #[test]
+    fn close_asks_on_the_menus_client() {
+        let a = Actions { tmux: Tmux::with_socket(None), scripts: PathBuf::from("/s") };
+        assert_eq!(a.close_line("/dev/ttys004", "%9"), "'/s/closed-tabs.sh' 'close' '--ask-space' '/dev/ttys004' '%9'");
+    }
 
     #[test]
     fn single_pane_is_it() {

@@ -82,8 +82,11 @@
 //! agents, one row each ([`shell_row`]), with its letter from the same pool
 //! as the agents ([`crate::menu::letters`]); in the steps that fold the idle
 //! agents, two or more shells fold into one line of pills
-//! ([`shells_line`]). A space with only shells still gets its group; a
-//! `@space_hidden` session lists no shells.
+//! ([`shells_line`]). Every space gets its group, even one with nothing but
+//! its home: a BARE space is its header alone, nothing under it, a click on
+//! it the home as any; a `@space_hidden` session lists no shells, and gets
+//! a group only while it holds agents (as does every session with
+//! `@spaces` off: no shells, no homes, the classic sidebar).
 //!
 //! ## Pending spaces
 //!
@@ -155,14 +158,20 @@
 //!    is held back before anything else is laid out;
 //! 2. the blank rows go (the gaps between spaces in AGENTS first, then the
 //!    section gaps: pure decoration goes before anything that says
-//!    something);
-//! 3. the dock's reserve goes (it may fall to chips);
+//!    something); then, as needed, the bare spaces' headers (they say
+//!    least: the dock lists those spaces too), from the end of the list,
+//!    the client's own last, counted on one ` … N empty spaces` line, then
+//!    that line too (with nothing left to list, the empty words are back);
+//! 3. the dock's reserve goes (it may fall to chips); a bare header never
+//!    outlasts the dock's list of every space a row (both list spaces;
+//!    the headers say less);
 //! 4. NEEDS YOU cards go from 2 lines to 1;
 //! 5. only then do the agents compress (below), NEEDS YOU kept to the rows
 //!    the agents' one-line shape leaves (at least 2, and at least a third of
 //!    the body), cut with a `… N more need you` line.
 //!
-//! The agents' own ladder keeps every agent row the same height: the idle
+//! The agents' own ladder keeps every agent row the same height, the bare
+//! spaces' headers already gone (its step 0 drops them, as above); then the idle
 //! agents of a space fold into one `○○○ 3 idle · Name, Name…` tile (and its
 //! shells into one line); then every agent goes to one line (age beside its
 //! state), unfolded, then folded again; then whole spaces collapse to their
@@ -201,9 +210,14 @@
 //! [`crate::view::Scope`] (`@spaces` / `@strip_scope`): in SPACE scope the
 //! agents section shows only the client's session, its agents and shells
 //! (its header and ` no agents in this space` when it has neither); in ALL
-//! scope every space with agents or shells. NEEDS YOU, the spaces and parked
-//! stay global. The AGENTS header's scope word is a toggle once the scope is
-//! a thing.
+//! scope every space, in the space order, a bare one (no agents, no shells,
+//! or all its agents pinned) as its header alone (the classic sidebar,
+//! `@spaces` off: every session with agents). The words under AGENTS
+//! (` no agents running`, ` all pinned above`) then show only when not one
+//! space is listed (none at all, or every bare header made way for rows):
+//! under bare headers they would say nothing new. NEEDS
+//! YOU, the spaces and parked stay global. The AGENTS header's scope word
+//! is a toggle once the scope is a thing.
 //!
 //! ## Pinned
 //!
@@ -2925,6 +2939,13 @@ fn more_row(w: usize, agents: &[&Agent], spaces: usize) -> Row {
     dim_line(w, &text).click(w, Target::Menu(Some("all"))).covering(agents.iter().copied())
 }
 
+/// `… N empty spaces`: the bare spaces' headers the agents section has no
+/// room for. Words, not a button: there is nothing of theirs to open, and
+/// the dock lists each of them.
+fn empty_spaces_row(w: usize, n: usize) -> Row {
+    dim_line(w, &format!(" … {n} empty space{}", if n == 1 { "" } else { "s" }))
+}
+
 /// An agent's identity across frames: (session, window id).
 type Key<'a> = (&'a str, &'a str);
 
@@ -3011,13 +3032,16 @@ fn promotion_rank(a: &Agent, now: f64) -> u8 {
     }
 }
 
-/// The spaces the agents section draws, in [`space_order`]: those with
-/// agents or shells; in space scope, just the client's session, whatever
-/// it holds.
+/// The spaces the agents section draws, in [`space_order`]: every space
+/// (the dock's, [`space_list`]), even one with nothing in it but its home,
+/// and a `@space_hidden` session only while it holds agents; in space
+/// scope, just the client's session, whatever it holds. (`@spaces` off,
+/// the classic sidebar: sessions, not spaces, so only those with agents.)
 fn groups(view: &ViewModel) -> Vec<&Space> {
+    let listed = |s: &Space| view.shells && !s.hidden || !bare_group(view, s);
     let mut v: Vec<&Space> = match &view.scope.session {
         Some(s) => view.spaces.iter().filter(|sp| &sp.name == s).collect(),
-        None => view.spaces.iter().filter(|s| !bare_group(view, s)).collect(),
+        None => view.spaces.iter().filter(|s| listed(s)).collect(),
     };
     v.sort_by_key(|s| space_order(s));
     v
@@ -3030,14 +3054,18 @@ fn bare_group(view: &ViewModel, sp: &Space) -> bool {
 
 /// The agents section's rows when every agent (and shell) is on one line,
 /// nothing folded or collapsed: what step 4 leaves the agents before NEEDS
-/// YOU gets the rest.
+/// YOU gets the rest. (The bare spaces' headers are gone by then:
+/// [`agents_section`] drops them before anything else; with nothing else
+/// to list, the words are back.)
 fn agents_one_line(view: &ViewModel) -> usize {
     let pins = if view.pinned.is_empty() { 0 } else { 1 + view.pinned.len() };
     let groups = groups(view);
+    let space = view.scope.session.is_some();
     if groups.iter().all(|g| bare_group(view, g)) {
-        return pins + 2 + usize::from(view.scope.session.is_some());
+        return pins + 2 + usize::from(space);
     }
-    pins + 1 + groups.iter().map(|g| 1 + g.agents.len() + shells_of(g, view.shells).len()).sum::<usize>()
+    let full = groups.iter().filter(|g| !bare_group(view, g));
+    pins + 1 + full.map(|g| 1 + g.agents.len() + shells_of(g, view.shells).len()).sum::<usize>()
 }
 
 /// A space header in the agents section ([`group_header`]: the whole row
@@ -3154,16 +3182,28 @@ fn agents_header(view: &ViewModel, w: usize) -> Row {
 /// groups when everything else fits (the frame's [`STEPS`] say when).
 ///
 /// Steps: 0 every agent two lines (as asked, then without the gaps between
-/// groups); 1 the same, idle folded; 2 every agent one line; 3 the same,
-/// idle folded; 4 spaces collapsed; 5 `… N more`. Never a mix of heights
-/// in one frame.
+/// groups, then without the bare spaces' headers); 1 the same, idle
+/// folded; 2 every agent one line; 3 the same, idle folded; 4 spaces
+/// collapsed; 5 `… N more`. Never a mix of heights in one frame.
+///
+/// A BARE space (nothing under its header: no agent, no shell; in all
+/// scope) says least, so its header goes first, before any agent loses a
+/// line: from the end of the list, the client's own last, the ones gone
+/// counted on one ` … N empty spaces` line at the section's end (only
+/// when that saves a row: two or more of them); then that line too (with
+/// nothing left, the empty words). Every later step lists only the spaces
+/// with something in them. The dock still lists every space. `heads`: the
+/// bare headers may stand at all; the frame's [`STEPS`] allow them only
+/// while the dock lists every space a row ([`Step::listed`]), and ask for
+/// this step 0 in the rows they leave, so the headers go before the dock's
+/// list and NEEDS YOU's second lines.
 ///
 /// The PINNED block ([`pin_block`]) comes first, above the AGENTS header
 /// (a blank row between them when `spaced`): its cards take the same
 /// height as every other agent row but never fold, and the spaces collapse
 /// before it loses anything; only a frame too short for every pin on one
 /// line cuts it (the first pins, then one `… N agents` line for the rest).
-fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec<Row>, u8) {
+fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: bool) -> (Vec<Row>, u8) {
     if budget == 0 {
         return (vec![], 0);
     }
@@ -3172,9 +3212,13 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
     let space = view.scope.session.is_some();
     let header = agents_header(view, w);
     let pins = !view.pinned.is_empty();
-    // Nothing (else) to list: the space's header even with nothing in it,
-    // so the section says whose it is; the words say why.
-    let bare = if space { groups.iter().all(|g| bare_group(view, g)) } else { groups.is_empty() };
+    // Nothing (else) to list: in space scope the space's header even with
+    // nothing in it, so the section says whose it is; the words say why. In
+    // all scope only when not one space is listed: under bare spaces'
+    // headers the words would say nothing they do not (and back once every
+    // bare header has made way).
+    let none = |gs: &[&Space]| if space { gs.iter().all(|g| bare_group(view, g)) } else { gs.is_empty() };
+    let bare = none(&groups);
     let mine_pinned = view.pinned.iter().any(|a| Some(&a.session) == view.scope.session.as_ref());
     let empty = match (space, pins) {
         (true, _) if mine_pinned => "   all pinned above",
@@ -3182,20 +3226,22 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
         (false, true) => "   all pinned above",
         (false, false) => "   no agents running",
     };
-    let build = |two: &[Key], fold: bool, collapsed: &[bool], spaced: bool| {
+    // `gs`: the groups listed (`collapsed` says which of them are), `gone`
+    // how many bare spaces' headers the end counts.
+    let build = |gs: &[&Space], two: &[Key], fold: bool, collapsed: &[bool], spaced: bool, gone: usize| {
         let mut rows = pin_block(view, cx, two);
         if spaced && pins {
             rows.push(Row::blank(w));
         }
         rows.push(header.clone());
-        if bare {
+        if none(gs) {
             if space {
-                rows.extend(groups.iter().map(|g| group_header(g, cx, false)));
+                rows.extend(gs.iter().map(|g| group_header(g, cx, false)));
             }
             rows.push(dim_line(w, empty));
             return rows;
         }
-        for (k, (sp, &c)) in groups.iter().zip(collapsed).enumerate() {
+        for (k, (sp, &c)) in gs.iter().zip(collapsed).enumerate() {
             if spaced && k > 0 {
                 rows.push(Row::blank(w));
             }
@@ -3204,22 +3250,62 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool) -> (Vec
                 rows.extend(group_rows(sp, cx, two, fold));
             }
         }
+        if gone > 0 {
+            rows.push(empty_spaces_row(w, gone));
+        }
         rows
     };
-    let mut collapsed = vec![false; groups.len()];
-    if bare && !pins {
-        let mut rows = build(&[], false, &collapsed, false);
+    let open = |gs: &[&Space]| vec![false; gs.len()];
+    // The header and the words, nothing to fold. (Cut short: the last
+    // step, so a frame's full-detail search never takes it for a fit.)
+    let words = |gs: &[&Space]| {
+        let mut rows = build(gs, &[], false, &open(gs), false, 0);
+        let step = if rows.len() > budget { 5 } else { 0 };
         rows.truncate(budget);
-        return (rows, 0);
+        (rows, step)
+    };
+    if bare && !pins {
+        return words(&groups);
     }
     let all: Vec<Key> = view.pinned.iter().map(key).chain(groups.iter().flat_map(|g| g.agents.iter().map(key))).collect();
-    // Full detail: the gaps between spaces go first.
-    for sp in [spaced, false] {
-        let rows = build(&all, false, &collapsed, sp);
+    // The bare spaces' headers, in the order they go: from the end of the
+    // list, the client's own last.
+    let mut drop: Vec<usize> = (0..groups.len()).filter(|&i| !bare && bare_group(view, groups[i])).collect();
+    drop.sort_by_key(|&i| (groups[i].is_current, Reverse(i)));
+    let kept = |k: usize| -> Vec<&Space> { (0..groups.len()).filter(|i| !drop[..k].contains(i)).map(|i| groups[i]).collect() };
+    if heads {
+        // Full detail: the gaps between spaces go first.
+        for sp in [spaced, false] {
+            let rows = build(&groups, &all, false, &open(&groups), sp, 0);
+            if rows.len() <= budget {
+                return (rows, 0);
+            }
+        }
+        // Then the bare headers, still at full detail: two or more counted
+        // on one line (one alone saves nothing)...
+        for k in 2..=drop.len() {
+            let gs = kept(k);
+            let rows = build(&gs, &all, false, &open(&gs), false, k);
+            if rows.len() <= budget {
+                return (rows, 0);
+            }
+        }
+    }
+    // ...then none and no line (nothing left to list: the words, as for a
+    // view without a space).
+    let groups = kept(drop.len());
+    let bare = none(&groups);
+    if bare && !pins {
+        return words(&groups);
+    }
+    if !drop.is_empty() || !heads {
+        let rows = build(&groups, &all, false, &open(&groups), false, 0);
         if rows.len() <= budget {
             return (rows, 0);
         }
     }
+    let build = |two: &[Key], fold: bool, collapsed: &[bool], spaced: bool| build(&groups, two, fold, collapsed, spaced, 0);
+    let mut collapsed = open(&groups);
     // Every agent row the same height: all two lines (idle folded), else all one.
     for (step, two, fold) in [(1, &all[..], true), (2, &[][..], false), (3, &[][..], true)] {
         let rows = build(two, fold, &collapsed, false);
@@ -3806,8 +3892,10 @@ pub struct Step {
 
 /// The steps at which agents keep full detail, roomiest first: the gaps
 /// go (pure decoration, before anything that says something; the gaps
-/// between spaces in AGENTS before the section gaps), then the dock's
-/// reserve, then the cards' second lines. The dock takes what each leaves
+/// between spaces in AGENTS before the section gaps), then the bare
+/// spaces' headers as needed (they say least, and stand only while the
+/// dock lists every space a row), then the dock's reserve, then the cards'
+/// second lines. The dock takes what each leaves
 /// over. (No step has pads: list tiles stack edge to edge, in the zebra,
 /// at every height.)
 pub const STEPS: [Step; 4] = [
@@ -3922,12 +4010,29 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     // steps that keep them ([`Step::listed`]) leave the dock its rows; the
     // others only its held-back minimum.
     let reserve = if min == 0 { 0 } else { spaces_listed(view, w).saturating_sub(min) };
+    // The bare spaces' headers (all scope) stand only while the dock lists
+    // every space a row: both list spaces, and the headers say less.
+    let bare = view.scope.session.is_none() && groups(view).iter().any(|g| bare_group(view, g));
+    let reserve_heads = if bare && min > 0 { (spaces_rows(view, w, SpacesForm::Full, false).len() + 3).saturating_sub(min) } else { reserve };
     let fits = STEPS.iter().enumerate().find_map(|(i, &Step { gaps, listed, lines })| {
         let needs = needs_block(view, cx, lines);
-        let agents = agents_section(view, cx, usize::MAX, gaps).0;
         let gap_rows = usize::from(gaps) * 2;
-        let room = if listed { avail.saturating_sub(reserve) } else { avail };
-        (needs.len() + agents.len() + gap_rows <= room).then_some((i as u8, gaps, needs, agents))
+        // (The rows the dock holds back, whether bare headers may stand.)
+        // Past the gaps the agents get, at full detail, the rows left: the
+        // bare headers make way ([`agents_section`]'s step 0) before the
+        // dock's list, so never at the cost of a NEEDS YOU second line.
+        let tries: &[(usize, bool)] = match (gaps, listed) {
+            (true, _) => &[(reserve_heads, true)],
+            (false, true) => &[(reserve_heads, true), (reserve, false)],
+            (false, false) => &[(0, false)],
+        };
+        let agents = tries.iter().find_map(|&(held, heads)| {
+            let room = avail.saturating_sub(held);
+            let budget = if gaps { usize::MAX } else { room.saturating_sub(needs.len()) };
+            let (agents, at) = agents_section(view, cx, budget, gaps, heads);
+            (budget > 0 && at == 0 && needs.len() + agents.len() + gap_rows <= room).then_some(agents)
+        })?;
+        Some((i as u8, gaps, needs, agents))
     });
     let (step, gaps, needs, (mut agents, agents_step)) = match fits {
         Some((i, gaps, needs, agents)) => (i, gaps, needs, (agents, 0)),
@@ -3939,7 +4044,7 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
             let floor = (avail / 3).max(2);
             let room = n1.min(avail.saturating_sub(agents_one_line(view)).max(floor)).min(avail - 1);
             let needs = needs_cut(view, cx, room);
-            let agents = agents_section(view, cx, avail - needs.len(), false);
+            let agents = agents_section(view, cx, avail - needs.len(), false, false);
             (STEPS.len() as u8, false, needs, agents)
         }
     };

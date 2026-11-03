@@ -599,6 +599,15 @@ class ActTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertIn("stash '@1'", self.calls[0][1])
 
+    def test_close_opts_in_to_the_space_prompt_on_its_client(self):
+        self.r.handle(["x"]); self.r.handle(["y"])
+        self.assertEqual(self.calls[-1], ("bg", "'%s' close --ask-space '/dev/ttys999' '%%9'" % R.CLOSED))
+        self.assertTrue(self.r.msg.startswith("closed "))
+        # No client known: the plain close.
+        self.calls.clear(); self.r.client = None
+        self.r.handle(["x"]); self.r.handle(["y"])
+        self.assertEqual(self.calls[-1], ("bg", "'%s' close '%%9'" % R.CLOSED))
+
     def test_stale_confirm_is_cancelled(self):
         # x pressed on @1 in `main`; the tab is parked before the y arrives.
         self.r.handle(["x"])
@@ -622,7 +631,7 @@ class ActTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.r.act("y")
         self.assertEqual(self.calls[0], ("pane", "@1"))
-        self.assertIn("close '%9'", self.calls[1][1])
+        self.assertIn("close --ask-space '/dev/ttys999' '%9'", self.calls[1][1])
         # The window's @agent_kind goes along (pick_agent_pane's kind rule).
         self.assertEqual(self.kinds, [next(w for w in self.r.windows if w["id"] == "@1")["kind"]])
 

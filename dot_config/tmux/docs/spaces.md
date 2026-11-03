@@ -75,7 +75,8 @@ space folder, the space's LOWEST window, named `home`. It is where ⌘N lands
 (also ⌘N for the space you are in: it goes home) and where a click on the
 space lands; it has no shell tab and no letter (the space's chip wears 󰋜
 while you are on it). It is what keeps a space alive: closing the last other
-tab lands you on home, still in the space. It cannot be closed by hand:
+tab lands you on home, still in the space, and asks whether to close the
+space too (below). It cannot be closed by hand:
 
 The WINDOW carries `@space_home`; the home shell's PANE carries
 `@space_home_pane` and a pane-level `remain-on-exit on`. Other panes split
@@ -105,6 +106,64 @@ that shell (a new space does not get a second one); else a new shell is
 inserted as the lowest window. Homes without an agent are dropped from the
 agent roster and the Python strip (`@space_home` is the last field of
 agent-roster.py's FMT).
+
+### Closing the last tab asks to close the space
+
+"Closing the last tab in a space prompts to close the space. If you say no,
+it goes to the home of that space" (Mack, 2026-11-03). A close made by hand
+that takes a TAB (its whole window) and leaves a visible space with no
+window but its home moves the client that closed it to that home
+(switch-client, then the home shell pane), then opens prefix Q's box there:
+same look, `last tab closed · close space NAME?`, Cancel first, `y` "Close
+space". n, Esc or a click outside leave you on home: tmux runs nothing for a
+dismissed menu, so the client is moved BEFORE the box opens, and only y does
+anything more. That holds when the tab was closed from the agent-ui menu
+while you were in another space: you land on that space's home all the same.
+`y` runs `closed-tabs.sh ask-space-yes <client> <session_id>`, which checks
+the space is still nothing but its home and then runs prefix Q's yes
+(`@space_sh close <session_id> <client>`: every pane through closed-tabs.sh,
+⌘Z reopens them); a tab opened while the box was up keeps the space, with
+the toast "space has tabs again · not closed".
+
+- **Who asks.** Only the closes made by hand, which opt in: prefix x (CMD+W)
+  and prefix C-l (CMD+SHIFT+W) run `closed-tabs.sh close --ask-space
+  <client> <pane>`; the agent-ui menu's x runs the same with the menu's
+  client (actions.rs `close_line`), and so does the python fallback roster's
+  x (agent-roster.py) when it knows its client; prefix v's range close
+  (stash.sh `sel-kill-go`) closes its tabs with plain `close` and then runs
+  `closed-tabs.sh ask-space <client> =SESSION:` once, so a selection that
+  empties a space asks once, never once per tab (a selection is one
+  session's, so it can only empty one space). A plain `close <pane>` never
+  asks: space.sh close's own closer, agent-restore-prune, agent-pause, the
+  limit code. A tab whose process exits by itself never goes through
+  closed-tabs.sh at all.
+- **Never:** main (no box; a client already in main just lands on its home
+  pane), a hidden session (`@space_hidden`, or its name in
+  `@space_hidden_sessions`), a space being closed (`@space_closing`), spaces
+  off, a close that did not take its window (a split pane, a split of the
+  home window included, or a kill that failed), a client that is gone.
+- **After the window is gone.** `close --ask-space` reads the pane's window
+  before the close and asks only if that window is gone after it.
+  do_close's `kill-pane` is synchronous, so the check (the session's only
+  window is its `@space_home` one) runs on the state the close left, after
+  the history row is written. Two closes racing to empty a space can both
+  see it: one box per space at a time, a mkdir lock (`ask.<id>` in the
+  closed-tabs state dir) holding its holder's pid, so the second goes away
+  instead of asking again after the first is answered. The lock is the
+  holder's for as long as it lives (its box can stay up indefinitely); a dead
+  holder's, or a day-old one (pid reuse), is taken over.
+- **Another overlay up.** tmux refuses a menu, at once and silently, while
+  the client shows another popup or menu: the agent-ui menu stays open after
+  its x. A menu that is up holds the `tmux display-menu` call until it is
+  answered, so a call still running 0.15 s past one tmux round trip (timed
+  just before each try, so a slow server stretches it) was shown; one back
+  sooner is retried every 0.2 s for up to a minute, each time re-checking
+  that the space still has only its home and the client is still in it
+  (gone to another space meanwhile: no box). The box appears when that
+  popup closes. An answer inside that window reads as a refusal and brings
+  the box back once.
+- `tests/test_close_last_tab.py`: a private server with a nested client;
+  the box is read off its screen.
 
 ## Home: the dashboard
 
@@ -357,7 +416,7 @@ a key table, so the sidebar re-reads `#{client_key_table}` after the next key.
 | ⌥W *digit* | M-w, then key table `jump` 1-9 | the Nth PINNED agent (the agent sidebar's PINNED section, pin order; docs/agent-roster.md "Pinned agents"), in any space: the window whose `@pin_key` is N AND that is still a pinned agent (`@agent_pinned` and a non-empty `@agent_state`), never a home, hidden sessions (the stash among them) skipped (`switch-client -t '$S:@W'`, one step). The sidebar and every pin toggle keep the pins numbered 1..N with no gap; this only reads them. Fork-free on a hit, the letters' way (the digit rides in the global `@space_pin_n`, `@space_pin_hit`'s `S:`/`W:` loop, first match), posting the focus notice like them. A miss runs `agent-ui pin renumber` (a gap no sidebar was open to repair is gone for the next press) and says "no pin N" (`@space_pin_miss`) |
 | ⌥W ⇧*letter* | M-w, then key table `jump` A-Z | that AGENT's uncommitted diff in a popup, and you stay where you are: `agent-ui diff <@W> --client <tty>` (docs/agent-roster.md "Agent insight": only the files its own transcript says it edited, still dirty, since agents share checkouts; delta through less, ` d · title · +A −R · Nf ` in the border, Esc / q close; nothing dirty → "d: no uncommitted changes", no popup). The window is found the lowercase way (the letter, lowercased, in `@space_jump_key`; `@space_diff_hit`'s `S:`/`W:` loop, first match, fork-free) but must have an `@agent_state` (a shell has no transcript), never a home, hidden sessions skipped. A hit forks once, `run-shell -b` (`@space_diff`; no binary: "diff: agent-ui is not installed"); a miss says "diff: no agent on x" (`@space_diff_go`). prefix q's agent menu does the same with Space d on a row (its Space strip: y allow / n deny on a permission prompt, p pin, s park, x close, d diff, v preview) |
 | — | prefix Q | close this space: a y/n menu box in the middle of the window ("close space bai: 2 agents, 1 shell?"; Cancel is first, so only y closes; not `confirm-before`, which draws on the status line), then `space.sh close`: it is marked `@space_closing` (no sync re-registers it or rebuilds its home meanwhile) and unregistered, clients on it move to main (detach-on-destroy would close them), every pane goes through `closed-tabs.sh close` (snapshot + agent session id, so CMD+Z can bring each back; `@space_closer` overrides, `none` skips), the session is killed and unregistered. Never main, never a hidden session |
-| CMD+W, CMD+SHIFT+W | prefix x, C-l | as tmux.conf, except on home (refuse) |
+| CMD+W, CMD+SHIFT+W | prefix x, C-l | as tmux.conf, except on home (refuse), and a close that leaves the space with only its home lands you there and asks "close space NAME?" (prefix Q's box; never for main; "Closing the last tab asks to close the space" above) |
 | CMD+T, CMD+R, CMD+OPT+R | prefix c, k, C-k | the new tab starts in THIS tab's folder (`#{pane_current_path}`), in every space (Mack, 2026-10-21), except on an adopted pending claude's tab still in ~, where it is the project (`@tab_dir`, see adopt-pending); the space's own folder is the SHIFT row's (below). C-k on home adds a tab instead of replacing home |
 | CMD+SHIFT+T, CMD+SHIFT+R | prefix C-t, K | which space? A popup (`space.sh pick-tab shell\|agent`, opened as ⌥N's is): the spaces in ⌘N order (`⌘N  name  folder`, this one marked "(here)" but still a pick), then the zoxide folders (⌥N's candidate list) that are not a space's folder yet; typing filters both, and a typed path that matches no row is taken as a folder. A space gets a new shell / claude tab at its END (`new-window -a -t '$S:{end}' -c <its folder>`) and you are switched to it; the space is never renamed, closed or reordered. A folder goes through `open-dir` first (reuse, else create): a shell in a space made just now lands on its home (its only window, no second shell), otherwise it is as picking that space; claude always adds its tab. The claude tab is born an agent (`@agent_birth` in the same command list as its `new-window`). Esc / ^C: nothing. The preview shows a space's shells (home as `home`, the others by their ⌥W letter, `·` until they have one), then its agents with their ⌥W letter and summary; a folder's listing. Rows carry a hidden key column (`s:N` / `d:/path`, `--with-nth=2`), so a pick is never parsed from its label. `space.sh new-tab shell\|agent SID\|DIR [CLIENT]` is the same without the popup. ⏎ / ^N / the header as ⌥N's: ^N's folder gets the shell / claude tab exactly as if it had been picked |
 

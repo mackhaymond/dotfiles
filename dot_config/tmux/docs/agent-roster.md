@@ -896,10 +896,27 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   agent-jump.sh goto; a right-click never parks it). In the steps that
   fold the idle agents, two or more shells fold into one line of pills
   (`layout::shells_line`: each its cap and label, `+K` for those that do
-  not fit). In ALL scope every space with agents OR shells gets a group,
-  so a space with only shells has one; a `@space_hidden` session lists no
-  shells. There is no SHELLS section any more, and no shells' line in the
-  dock.
+  not fit). In ALL scope EVERY space gets a group, in the ⌘N order, even
+  one with nothing in it: a BARE space (no agents and no shells, only its
+  home; or every agent pinned) is its header alone, nothing under it, the
+  header behaving as any (the click goes to the home, lifted while the
+  client is on the home). A `@space_hidden` session lists no shells and
+  gets a group only while it holds agents; with `@spaces` off (the classic
+  sidebar) every session with agents, as before. The words under AGENTS
+  (`no agents running`, `all pinned above`) show in ALL scope only when not
+  one space is listed (none at all, or every bare header gone for rows):
+  under bare headers they would say nothing new (SPACE scope keeps its
+  header and `no agents in this space` / `all pinned above`). Short of
+  rows the bare headers are the first thing to go after the gaps, before
+  the dock's list of every space a row, before a NEEDS YOU card's second
+  line (a perm prompt's answer chips) and before any agent loses a line:
+  from the end of the list, the client's own last, the ones gone counted
+  on one dim ` … N empty spaces` line at the section's end (two or more:
+  one alone saves no row), then that line too. A bare header stands only
+  while the dock lists every space a row (both list spaces); every later
+  step lists only the spaces with something in them, and the dock still
+  lists every space. There is no SHELLS section any more, and no shells'
+  line in the dock.
 
 - **Pending spaces** (docs/spaces.md "Pending spaces"; `@spaces` on only):
   a claude in the hidden `pending` session building space N (its window
@@ -1197,8 +1214,11 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   - **Ladder**: pins take the frame's one card height (two lines, then one)
     but never fold into an idle line; the spaces collapse before a pin loses
     its card; only a frame too short for every pin on one line cuts them
-    (the first pins, then `… N agents`). With every agent of the scope
-    pinned, AGENTS says `all pinned above`.
+    (the first pins, then `… N agents`). A space whose every agent is
+    pinned keeps its header in ALL scope (a bare space, above); AGENTS says
+    `all pinned above` only where no header is left to say it: in SPACE
+    scope under the space's header, or in ALL scope with not one space
+    listed.
   - **Toggle**: prefix t on the current tab (spaces.conf: `agent-ui pin
     toggle --window <win> --client <tty>`; it replaces tmux's clock-mode,
     which comes back with spaces off; not prefix p, next to prefix P's
@@ -1284,7 +1304,10 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   reserve goes; (4) NEEDS YOU cards go to 1 line. There are no pads at any
   step: list tiles always stack edge to edge, every card one colour, consecutive
   cards alternating `tile` / `tile_lo`.
-  Only then do agents compress (idle folded into a `○○○ 3 idle · …` tile
+  (The bare spaces' headers go right after the gaps, `… N empty spaces`
+  then nothing, every agent still at full detail; none outlasts the dock's
+  list of every space a row.)
+  Only then do the agents compress (idle folded into a `○○○ 3 idle · …` tile
   and a space's 2+ shells into one line, every agent one line, folded
   again, spaces collapsed to their header, their shells gone with it,
   then `… N more`), with NEEDS YOU held to at least 2 rows and a third of

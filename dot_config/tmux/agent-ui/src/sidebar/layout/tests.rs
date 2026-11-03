@@ -3299,6 +3299,7 @@ fn held_rows_are_capped() {
 }
 
 mod answer;
+mod bare;
 mod insight;
 mod pending;
 mod pinned;

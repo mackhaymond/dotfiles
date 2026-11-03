@@ -362,5 +362,5 @@ fn live_effects_through_the_state_machine() {
     menu.frame_shown();
     menu.handle(&[Key::Char('y')], &mut live);
     s.wait_calls("kill-many");
-    assert_eq!(s.calls(), format!("closed-tabs.sh close {pane}\nstash.sh kill-many {parked}\n"));
+    assert_eq!(s.calls(), format!("closed-tabs.sh close --ask-space {FAKE_TTY} {pane}\nstash.sh kill-many {parked}\n"));
 }

@@ -2809,6 +2809,13 @@ do_sel_kill_go() {
     [ $((homes + KILL_HOMES)) -gt 0 ] && what="$what · home stays"
     [ "$n" -gt 0 ] && what="$what · ⌘Z reopens"
     notify_user ${client:+-c "$client"} -k "$kind" -- "$what"
+    # Left the space with only its home: ask ONCE whether the space goes too
+    # (the closes above are plain `close`, which never ask). A selection is
+    # one session's, so this is the one space it can have emptied;
+    # closed-tabs.sh decides (a visible space, never main) and asks on this
+    # client, holding this backgrounded job until the box is answered.
+    [ "$n" -gt 0 ] && [ -n "$client" ] && bash "$CLOSED_TABS_SH" ask-space "$client" "=$sess:" </dev/null >/dev/null 2>&1
+    return 0
 }
 
 # --- sending a selection to another session -----------------------------------
