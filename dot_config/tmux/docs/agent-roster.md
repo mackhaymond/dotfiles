@@ -170,7 +170,7 @@ Python fallback keys:
 | Space / ⏎ | go there (a parked tab comes back via `stash.sh unstash`) |
 | `p` | peek: the last 15 lines of the selected agent's pane, in a panel over the list; any key closes it (and does nothing else) |
 | `d` | next tab that needs you (same as `prefix d`) |
-| `x` | close the agent's pane through `closed-tabs.sh`, after y/n; CMD+Z undoes it. On a parked row: discard it through `stash.sh kill-many` |
+| `x` | close the agent's pane through `closed-tabs.sh close --ask-space`, after y/n; CMD+Z undoes it. If that was the space's last tab, the space's home comes up with the close-space box (docs/spaces.md). On a parked row: discard it through `stash.sh kill-many` |
 | `H` | park the tab (`stash.sh stash`, which suspends the agent), after y/n |
 | `/` | filter by `session:index title`; ⏎ keeps it, esc clears it |
 | `a` | also show windows with no agent |
