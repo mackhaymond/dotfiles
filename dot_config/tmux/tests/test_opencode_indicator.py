@@ -17,6 +17,7 @@ import time
 import unittest
 import uuid
 
+from test_agent_state_notice import no_condenser_path
 from test_codex_indicator import FAKE_TMUX, SOURCE
 
 FAILING_COPILOT = "#!/bin/sh\nexit 1\n"
@@ -38,12 +39,12 @@ class OpencodeIndicatorTests(unittest.TestCase):
             path.chmod(0o755)
         # The OpenCode plugin runs inside the TUI process: it inherits the
         # pane's own TMUX/TMUX_PANE, exactly like a Claude hook.
-        self.env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + ":" + os.environ["PATH"],
+        self.env = dict(os.environ, HOME=str(self.root), PATH=no_condenser_path(self.bin),
                         TMPDIR=str(self.root), TMUX="/fake/owned,12,0", TMUX_PANE="%42",
                         FAKE_TMUX_STATE=str(self.state), AGENT_TAB_CONDENSE_MODEL="",
                         AGENT_STATE_NOTICE="")
         for key in ("AGENT_TAB_SOCKET", "AGENT_TAB_OWNER_SESSION", "AGENT_TAB_OWNER_TOKEN",
-                    "AGENT_TAB_OWNER_BINDING", "AGENT_TAB_OWNER_RECORD"):
+                    "AGENT_TAB_OWNER_BINDING", "AGENT_TAB_OWNER_RECORD", "GROK_HOOK_EVENT"):
             self.env.pop(key, None)
 
     def tearDown(self):
@@ -175,7 +176,7 @@ class OpencodeIndicatorTests(unittest.TestCase):
         tmux = shutil.which("tmux")
         sockdir = tempfile.mkdtemp(prefix="oct")
         server = "oc-" + uuid.uuid4().hex[:8]
-        env = dict(self.env, PATH=os.environ["PATH"], TMUX_TMPDIR=sockdir)
+        env = dict(self.env, PATH=no_condenser_path(), TMUX_TMPDIR=sockdir)
         env.pop("TMUX", None)
         env.pop("TMUX_PANE", None)
         command = [tmux, "-L", server, "-f", "/dev/null"]

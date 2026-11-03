@@ -62,6 +62,17 @@ def write_exe(path, body):
     path.chmod(0o755)
 
 
+def no_condenser_path(first=None):
+    """`first` (if given), then the user's PATH minus every dir holding an `ai-exec`.
+    The title condenser runs only when it finds ai-exec (spawn_condense), and
+    the real one runs the real codex/claude CLIs: a model call, and a detached
+    job writing into the test's temp HOME/TMPDIR after cleanup removed them
+    (the Errno 66 "Directory not empty" teardown flakes)."""
+    keep = [d for d in os.environ.get("PATH", "").split(":")
+            if d and not os.path.exists(os.path.join(d, "ai-exec"))]
+    return ":".join(([str(first)] if first else []) + keep)
+
+
 def notices(log):
     return log.read_text().splitlines() if log.exists() else []
 
@@ -94,12 +105,12 @@ class IndicatorNoticeTests(unittest.TestCase):
         self.pane, self.win, self.socket = r.stdout.strip().split("|", 2)
 
         self.env = dict(os.environ, HOME=str(self.home), TMPDIR=str(self.root) + "/",
-                        PATH=str(self.bin) + ":" + os.environ["PATH"],
+                        PATH=no_condenser_path(self.bin),
                         TMUX="%s,1,0" % self.socket, TMUX_PANE=self.pane,
                         AGENT_STATE_NOTICE=self.name, NOTICE_LOG=str(self.log),
                         AGENT_TAB_CONDENSE_MODEL="", FAKE_FRONT="", FAKE_ACTIVE_CLIENTS="0")
         for key in ("AGENT_TAB_SOCKET", "AGENT_TAB_OWNER_SESSION", "AGENT_TAB_OWNER_TOKEN",
-                    "AGENT_TAB_OWNER_BINDING", "AGENT_TAB_OWNER_RECORD"):
+                    "AGENT_TAB_OWNER_BINDING", "AGENT_TAB_OWNER_RECORD", "GROK_HOOK_EVENT"):
             self.env.pop(key, None)
 
     def kill_server(self):

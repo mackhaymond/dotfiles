@@ -53,7 +53,7 @@
 #                   leaves needs-input (set_state, clear_state, the
 #                   watcher's discharge and GC). A look while the work is
 #                   still out discharges it to running, not idle.
-#   @agent_kind    claude | codex | opencode — which agent's hooks drive this
+#   @agent_kind    claude | codex | opencode | grok — which agent's hooks drive this
 #                   window; written with any state/detail write a hook makes
 #   @agent_detail_kind  perm | ask | fail | done | run — what the last event
 #                   was about (see DETAIL_JQ); @agent_detail = one sanitized
@@ -91,7 +91,10 @@
 #   hooks may run in a shared daemon. OpenCode has no hooks: its plugin
 #   (~/.config/opencode/plugins/tmux-agent-state.js) runs inside the TUI's
 #   own process and calls this with `<mode> opencode` and a Claude-shaped
-#   payload, using the same inherited TMUX_PANE identity as Claude.
+#   payload, using the same inherited TMUX_PANE identity as Claude. Grok
+#   Build's hooks (~/.grok/hooks/tmux-agent.json) call `<mode> grok` from
+#   the TUI's own children, the same inherited identity; its payload quirks
+#   are handled under GROK below (normalized right after stdin is read).
 #
 #   tmux after-select-window hook invokes:  agent-tab-indicator.sh clear-current
 #   (no stdin, no TMUX_PANE → operates on the now-active window).
@@ -146,6 +149,14 @@
 #                                      quiet (AGENT-ORIGINATED TURNS below);
 #                                      a SUBAGENT's open gate stands through
 #                                      it (ASKER GATE)
+#   interrupt    a turn cancelled    → codex/opencode/grok (Grok's
+#                                      StopCancelled): idle, label kept; a
+#                                      grok cancel by the runtime finishes
+#                                      as `done` (see GROK)
+#   settle       Notification(idle_prompt), grok → running → idle ONLY, the
+#                                      backstop for a turn end no Stop
+#                                      reported, once running has stood
+#                                      50 s; inert in every other state
 #   clear        SessionEnd          → remove state (skipped for clear/resume,
 #                                      which are followed by a new SessionStart)
 #   clear-current  focus hook        → attention states → idle once seen;
@@ -233,9 +244,17 @@ fi
 # OpenCode plugin's PARENT_AGENT_ENV skips on the same pair (not on
 # AGENT_PTY: a pty-MCP shell owns its own pane, and a headless claude there
 # paints it). Claude-in-Claude is caught after the pane lookup (nested_agent).
+# A grok in codex's tool shell is the same case.
 case "$agent" in
-    claude|opencode) [ -z "${CODEX_THREAD_ID:-}${CODEX_SANDBOX:-}" ] || exit 0 ;;
+    claude|opencode|grok) [ -z "${CODEX_THREAD_ID:-}${CODEX_SANDBOX:-}" ] || exit 0 ;;
 esac
+# GROK RUNNING CLAUDE'S HOOKS. Grok Build runs every ~/.claude/settings.json
+# hook too while its [compat.claude] hooks are on (the default; dot_zshenv
+# turns them off with GROK_CLAUDE_HOOKS_ENABLED=0). Those call `<mode> claude`
+# with a Grok payload, which double-paints the tab next to Grok's own
+# `<mode> grok` hooks and labels it a claude. Grok's runner sets
+# GROK_HOOK_EVENT in every hook's environment, Claude never does: drop them.
+[ "$agent" != claude ] || [ -z "${GROK_HOOK_EVENT:-}" ] || exit 0
 [ -n "${TMUX:-}" ] || exit 0
 
 # Detached condensers inherit the explicit socket too; a pane/window id by
@@ -353,7 +372,9 @@ ensure_watcher() {
     pidfile="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.pid"
     seen_mark="${pidfile%.pid}.hookseen"
     printf -v now '%(%s)T' -1 2>/dev/null || now=$(date +%s 2>/dev/null || echo 0)
-    read -r seen < "$seen_mark" 2>/dev/null || seen=""
+    # The group: a missing mark is a failed redirect, which bash reports
+    # before a 2>/dev/null on the command itself would take effect.
+    { read -r seen < "$seen_mark"; } 2>/dev/null || seen=""
     case "$seen" in ''|*[!0-9]*) seen=0 ;; esac
     if [ $((now - seen)) -lt 30 ] && [ "$pidfile" -nt "$seen_mark" ]; then
         return 0
@@ -722,7 +743,7 @@ set_state() {
     [ "${#ex[@]}" -gt 0 ] && cmd+=(${cmd[0]+\;} "${ex[@]}")
     [ "${#cmd[@]}" -gt 0 ] || return 0
     case "$agent" in
-        claude|codex|opencode) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
+        claude|codex|opencode|grok) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
     esac
     slot_locked=0
     if [ "$SLOT_OK" = 1 ] && { [ "$cur" != "$new" ] || [ "$po" = set ]; } \
@@ -947,7 +968,8 @@ origin_read() {
 }
 
 # The one jq for a turn event: line 1 the turn id (Claude prompt_id, Codex
-# turn_id, "-" when absent or not a plain token), line 2 the sender handle when
+# turn_id, Grok promptId - Grok has no snake alias for it - "-" when absent
+# or not a plain token), line 2 the sender handle when
 # the prompt opens with "[message from @h]" (after leading whitespace), line 3
 # "sys" when the prompt is harness-injected - a <task-notification> (a
 # background task/agent reporting back; it fires UserPromptSubmit with a new
@@ -960,7 +982,7 @@ origin_read() {
 # prompt alone, exactly as before. `system` is never a wake-up by itself:
 # native auto-continuation arrives as `system`.
 TURN_JQ='
-(.prompt_id // .turn_id // "" | tostring | .[0:128]
+(.prompt_id // .turn_id // .promptId // "" | tostring | .[0:128]
  | if test("^[A-Za-z0-9_.:-]+$") then . else "-" end),
 (.prompt // "" | tostring | .[0:600]
  | ((capture("^[ \\t\\r\\n]*\\[message from @(?<h>[^\\]\\s|]{1,64})\\]") // {h: ""}).h),
@@ -1154,18 +1176,21 @@ prior_restore() {
 }
 
 # stop_fields: S_ID (the turn id, as TURN_JQ's line 1) and S_TP (Claude's
-# transcript_path) from the payload, one jq.
+# transcript_path) from the payload, one jq. Grok's transcript_path is its
+# own updates.jsonl, not a Claude transcript: S_TP stays empty for grok, so
+# no Claude transcript reader (the rate-limit tail, split_classify) gets it.
 stop_fields() {
     local out=""
     s_id=-; s_tp=""
     if [ -n "$JQ" ] && [ -n "$payload" ]; then
-        out=$("$JQ" -r '(.prompt_id // .turn_id // "" | tostring | .[0:128]
+        out=$("$JQ" -r '(.prompt_id // .turn_id // .promptId // "" | tostring | .[0:128]
                          | if test("^[A-Za-z0-9_.:-]+$") then . else "-" end),
                         (.transcript_path // "" | tostring | gsub("[\\r\\n]"; " "))' \
               <<<"$payload" 2>/dev/null || true)
     fi
     { IFS= read -r s_id; IFS= read -r s_tp; } <<<"$out" || true
     [ -n "$s_id" ] || s_id=-
+    [ "$agent" != grok ] || s_tp=""
 }
 
 # A for_user reason as a sidebar detail: DETAIL_JQ's own sanitizer.
@@ -1264,9 +1289,14 @@ ask_raise() {
 # in the background (its limited.json resume engine; fire-and-forget, a
 # missing or failing script costs nothing here). R = resets_at (epoch s, 0 =
 # unknown: a model limit, never auto-resumed), T = five_hour | seven_day |
-# seven_day_opus | seven_day_sonnet | overage | model | codex, E = when it was
-# marked. Idempotent: queued task-notifications each hit the limit again and
-# re-mark, which only refreshes E.
+# seven_day_opus | seven_day_sonnet | overage | model | codex | grok, E = when
+# it was marked. Idempotent: queued task-notifications each hit the limit
+# again and re-mark, which only refreshes E.
+#   GROK sends StopFailure error rate_limit for a usage limit (429) AND for a
+# capacity error (503/529), and neither carries a reset time: its
+# error_details tell them apart (see failed). A 429 marks type `grok`, R 0
+# (the free tier resets over a rolling 24 h, never auto-resumed); capacity is
+# an ordinary red failure.
 #   A prompt while @agent_limit is set (running): a wake-up, task-notification
 # or peer message while @agent_paused is still set and now < R is HELD - the
 # hook writes nothing, so the tab stays paused without a running flicker.
@@ -1302,6 +1332,7 @@ limit_text() {
         seven_day_sonnet) lab="Sonnet weekly limit" ;;
         overage) lab="overage limit" ;;
         codex) lab="Codex limit" ;;
+        grok) lab="Grok limit" ;;
         *) lab="usage limit" ;;
     esac
     if ! [[ $r =~ ^[1-9][0-9]{0,11}$ ]] || ! [[ $now =~ ^[0-9]{1,12}$ ]]; then
@@ -1414,12 +1445,21 @@ codex_limit_parse() {
 
 # limit_type RAW R E: into LIM_TY the @agent_limit type for a transcript's
 # rateLimitType. seven_day_overage_included (and any other seven_day_*) is
-# weekly; an unknown one is guessed from how far out the reset is.
+# weekly; an unknown one is guessed from how far out the reset is: a session
+# (five_hour) limit only when the reset is under 5 h away AND the account
+# still has a session window - the global @codex_session_limit is not "0"
+# (unset = unknown: assume it has one). A weekly-only account (five_hour
+# null) near its weekly reset is a weekly limit, never a "session limit".
+# One show-options, on this rare path only.
 limit_type() {
     case "$1" in
-        five_hour|seven_day|seven_day_opus|seven_day_sonnet|overage|model|codex) LIM_TY="$1" ;;
+        five_hour|seven_day|seven_day_opus|seven_day_sonnet|overage|model|codex|grok) LIM_TY="$1" ;;
         seven_day_*) LIM_TY=seven_day ;;
-        *) if [ $(($2 - $3)) -gt 21600 ]; then LIM_TY=seven_day; else LIM_TY=five_hour; fi ;;
+        *) LIM_TY=seven_day
+           if [ $(($2 - $3)) -lt 18000 ] && \
+              [ "$(tmux show-options -gqv @codex_session_limit 2>/dev/null || true)" != 0 ]; then
+               LIM_TY=five_hour
+           fi ;;
     esac
 }
 
@@ -1454,7 +1494,7 @@ limit_mark() {
     [ "$cur" != needs-input ] || cmd+=(\; set-option -uw -t "$win" @agent_ask_from \;
                                        set-option -uw -t "$win" @agent_ask_bg)
     case "$agent" in
-        claude|codex|opencode) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
+        claude|codex|opencode|grok) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
     esac
     cmd+=(\; set-option -w -t "$win" @agent_paused "$e"
           \; set-option -w -t "$win" @agent_limit "$r $ty $e"
@@ -2014,6 +2054,9 @@ drift_update() {
 #           threads.title (first user message), else the prompt.
 #   opencode: the payload's session_title unless it is OpenCode's
 #           "New session - <date>" placeholder, else the prompt.
+#   grok:   summary.json beside the payload's transcript_path (the session
+#           dir; updates.jsonl itself is never read): generated_title, a
+#           user rename (`custom`) when title_is_manual, else the prompt.
 extract_summary() {
     local payload="$1" title="" src="final" prev=""
     [ -n "$JQ" ] || return 0
@@ -2080,6 +2123,30 @@ extract_summary() {
             if [ -z "$title" ]; then
                 title=$("$JQ" -r '.prompt // empty' <<<"$payload" 2>/dev/null || true)
                 src="interim"
+            fi
+            ;;
+        grok)
+            # Grok writes its title into the session dir's summary.json
+            # (generated_title; /rename sets title_is_manual). transcript_path
+            # is that dir's updates.jsonl - ACP updates, not a Claude
+            # transcript - so only its dirname is used. Two jq, no tail.
+            local g_tp="" g_prompt="" g_out="" g_src=""
+            g_out=$("$JQ" -r 'def one: tostring | gsub("[\\r\\n\\t]"; " ");
+                (.transcript_path // "" | one), (.prompt // "" | tostring | .[0:1200] | one)' \
+                <<<"$payload" 2>/dev/null || true)
+            { IFS= read -r g_tp; IFS= read -r g_prompt; } <<<"$g_out" || true
+            case "$g_tp" in
+                /*/*)
+                    if [ -f "${g_tp%/*}/summary.json" ]; then
+                        g_out=$("$JQ" -r 'def one: tostring | gsub("[\\r\\n\\t]"; " ");
+                            (if .title_is_manual == true then "custom" else "final" end),
+                            (.generated_title // "" | one)' "${g_tp%/*}/summary.json" 2>/dev/null || true)
+                        { IFS= read -r g_src; IFS= read -r title; } <<<"$g_out" || true
+                        [ -z "$title" ] || src="$g_src"
+                    fi ;;
+            esac
+            if [ -z "$title" ]; then
+                title="$g_prompt"; src="interim"
             fi
             ;;
     esac
@@ -2178,7 +2245,7 @@ def detail($mode):
         end
     elif $mode == "failed" then
       "fail\t" + ([(.error | if type == "object" then (.message // .type // "") else str end),
-                   (.error_details | str)]
+                   (.error_details // .errorDetails | str)]
                   | map(select(. != "")) | join(": ") | firstline | clean)
     elif $mode == "done" then "done\t" + (.last_assistant_message | firstline | clean)
     else empty end;
@@ -2478,7 +2545,7 @@ fi
 # Claude-in-Claude (see A FOREIGN AGENT'S TOOL SHELL above): a `claude -p`
 # run from another Claude's Bash tool carries no codex marker, so ask the
 # process tree. nested_agent: walking up from this hook, is there an agent
-# (claude/codex/opencode, or a native claude's version-number comm, as the
+# (claude/codex/opencode/grok, or a native claude's version-number comm, as the
 # watcher's AGENT_PAT) ABOVE a non-agent that is itself above the hook's own
 # agent? That is agent -> tool shell -> agent: this hook's claude was started
 # by another agent, whose tab TMUX_PANE names. An agent's direct agent parent
@@ -2497,7 +2564,7 @@ nested_agent() {
     p="$PPID"
     while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$n" -lt 64 ]; do
         n=$((n + 1))
-        if [[ ${PC[$p]:-} =~ ^(claude|codex|opencode|[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+        if [[ ${PC[$p]:-} =~ ^(claude|codex|opencode|grok(-(macos|linux|windows)-[a-z0-9_]+)?|[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             [ "$gap" = 1 ] && return 0
             seen=1
         elif [ "$seen" = 1 ]; then
@@ -2507,7 +2574,10 @@ nested_agent() {
     done
     return 1
 }
-if [ "$agent" = claude ] && [ "$mode" != heartbeat ] && nested_agent; then
+# Grok's comm is `grok` (a launch through its real path: grok-macos-aarch64;
+# never its `agent` symlink, too generic), and a grok run from another
+# agent's tool shell is the same nesting.
+if { [ "$agent" = claude ] || [ "$agent" = grok ]; } && [ "$mode" != heartbeat ] && nested_agent; then
     exit 0
 fi
 
@@ -2567,9 +2637,23 @@ fi
 # before.
 #   A running window is left alone without a set_state: nothing would be
 # written, and the hot path skips even the call's state re-read.
+#   GROK names a subagent by subagentType (no agent_id), and its key order is
+# not Claude's, so the 8 KB cut proves nothing there: a grok payload is
+# parsed whole (GROK_SUB_JQ), on these two rare states only.
+GROK_SUB_JQ='.subagentType // "" | tostring | .[0:64]'
+# settle's floor: seconds a turn must have been running before Grok's
+# idle_prompt may end it (see settle).
+SETTLE_MIN=50
 hb_who() {
     hb_from=main
     [ "$agent" != codex ] || return 0
+    if [ "$agent" = grok ]; then
+        [ -n "$JQ" ] || return 0
+        hb_from=$("$JQ" -r "$GROK_SUB_JQ" 2>/dev/null || true)
+        hb_from="${hb_from//[^A-Za-z0-9_.-]/}"
+        hb_from="${hb_from:-main}"
+        return 0
+    fi
     hb_head=$(head -c 8192 2>/dev/null || true)
     hb_cut='"hook_event_name"'
     hb_head=${hb_head%%"$hb_cut"*}
@@ -2633,6 +2717,52 @@ if [ "$mode" = "heartbeat" ]; then
 fi
 
 [ "$agent" = codex ] || payload=$(cat 2>/dev/null || true)
+
+# GROK (payload quirks; the rest of this file reads it as Claude-shaped -
+# Grok sends Claude's snake keys as aliases of its camelCase ones):
+#   * a subagent's event carries subagentType, not agent_id: inert for the
+#     main tab exactly like Claude's agent_id events (the guard below), its
+#     permission prompt excepted (the asker is then its subagentType);
+#   * Grok runs one more Stop when the session closes, reason
+#     channel_closed | shutdown; a real turn end says end_turn. Only that
+#     one is a finish: a Stop with any other reason is inert;
+#   * the turn id is promptId (TURN_JQ, stop_fields);
+#   * SessionStart's source is new | load (idle maps them);
+#   * transcript_path is Grok's updates.jsonl, never a Claude transcript:
+#     no Claude transcript reader is given it (stop_fields, done, the
+#     summary's grok branch);
+#   * StopCancelled and StopFailure are reported OFF the turn loop, so one
+#     can land after the NEXT prompt: a cancel or failure naming a turn
+#     other than the window's current one is that older turn's, and inert -
+#     whatever the newer turn shows now (running, its permission prompt,
+#     its finish, its own failure);
+#   * StopCancelled with cancelledBy runtime (max_turns, no_progress,
+#     hook_stopped) is a turn that ended on its own, not one Mack stopped: it
+#     finishes as a Stop does (done, or idle while he is looking), never
+#     quietly idle. user - and unknown, which Grok says to treat as unknown -
+#     stay the interrupt.
+if [ "$agent" = grok ] && [ -n "$JQ" ] && [ -n "$payload" ]; then
+    gk=$("$JQ" -r '('"$GROK_SUB_JQ"' | gsub("[\\r\\n]"; " ")),
+                   (.reason // "" | tostring | .[0:32] | gsub("[\\r\\n]"; " ")),
+                   (.cancelledBy // .cancelled_by // "" | tostring | .[0:32] | gsub("[\\r\\n]"; " "))' \
+         <<<"$payload" 2>/dev/null || true)
+    gk_sub=""; gk_reason=""; gk_by=""
+    { IFS= read -r gk_sub; IFS= read -r gk_reason; IFS= read -r gk_by; } <<<"$gk" || true
+    [ -z "$gk_sub" ] || [ "$mode" = needs-approval ] || exit 0
+    [ "$mode" != done ] || [ -z "$gk_reason" ] || [ "$gk_reason" = end_turn ] || exit 0
+    case "$mode" in
+        interrupt|failed)
+            stop_fields
+            origin_read "$win"
+            if [ "$s_id" != - ] && [ -n "$O_OKIND" ] && [ -n "$O_OTID" ] && [ "$O_OTID" != - ] \
+               && [ "$s_id" != "$O_OTID" ]; then
+                case "$O_STATE" in running|needs-input|done|failed) exit 0 ;; esac
+            fi ;;
+    esac
+    if [ "$mode" = interrupt ] && [ "$gk_by" = runtime ]; then
+        mode=done
+    fi
+fi
 
 # subagent-stop (ASKER GATE): the asking subagent ENDING ends its gate, the
 # way its own next tool call would - for the case that fires no heartbeat:
@@ -2734,8 +2864,9 @@ case "$mode" in
     interrupt)
         # The terminal bridge observes turn/completed with interrupted status;
         # the OpenCode plugin sees the turn end in MessageAbortedError (Esc).
+        # Grok's StopCancelled (Ctrl+C, a declined permission) likewise.
         # Keep the conversation label, but discharge working/attention state.
-        case "$agent" in codex|opencode) ;; *) exit 0 ;; esac
+        case "$agent" in codex|opencode|grok) ;; *) exit 0 ;; esac
         # An interrupted agent-originated turn ends like a quiet one: back to
         # the attention state the window had before it (AGENT-ORIGINATED
         # TURNS), seen-it rules included.
@@ -2758,6 +2889,35 @@ case "$mode" in
         fi
         clear_pending "$win"
         ;;
+    settle)
+        # Grok's idle_prompt Notification: the TUI is sitting at its prompt.
+        # The backstop for a turn end no Stop reported, so it moves ONLY a
+        # running window, to idle: done, needs-input, failed and paused all
+        # say more than this event can, and a Stop held `running` for
+        # background work (@agent_bg_owner) is still waiting on that work.
+        # Nor a turn that started under SETTLE_MIN seconds ago (@agent_since):
+        # the Notification is queued, and one from the idle spell BEFORE a
+        # prompt can land after that prompt's running.
+        # A window @agent_paused flags lands `paused`, as an interrupted turn
+        # does (and with the same in-list re-check of the flag), never idle.
+        # One read; the label and detail stay.
+        st_rd=$(tmux display-message -p -t "$win" "x#{@agent_state}${US}#{@agent_bg_owner}${US}#{@agent_paused}${US}#{@agent_since}" 2>/dev/null || true)
+        case "$st_rd" in "xrunning$US$US"*) ;; *) exit 0 ;; esac
+        st_paused="${st_rd#"xrunning$US$US"}"
+        st_since="${st_paused#*"$US"}"; st_paused="${st_paused%%"$US"*}"
+        st_since="${st_since%% *}"
+        printf -v st_now '%(%s)T' -1 2>/dev/null || st_now=$(now_epoch)
+        [[ $st_since =~ ^[0-9]{1,12}$ ]] && [ $((st_now - 10#$st_since)) -ge "$SETTLE_MIN" ] || exit 0
+        if [ -n "$st_paused" ]; then
+            ss_add if-shell -F -t "$win" '#{?#{@agent_paused},0,1}' \
+                "set-option -w -t $win @agent_state idle"
+            set_state "$win" paused
+            clear_pending "$win"
+            exit 0
+        fi
+        set_state "$win" idle
+        clear_pending "$win"
+        ;;
     reconcile)
         # A new thread's id reaches the terminal bridge after its first hook.
         # Recover the title/presence without downgrading a newer event's state.
@@ -2777,6 +2937,11 @@ case "$mode" in
         if [ -n "$JQ" ] && [ -n "$payload" ]; then
             src=$("$JQ" -r '.source // empty' <<<"$payload" 2>/dev/null || true)
             [ "$src" = "compact" ] && exit 0
+        fi
+        # Grok's sources: new (a fresh session, /new) is a startup, load
+        # (-c, -r, /resume) a resume.
+        if [ "$agent" = grok ]; then
+            case "$src" in new) src=startup ;; load) src=resume ;; esac
         fi
         dkind=-   # SessionStart: a new conversation has no detail yet
         prior_unset "$win"   # no turn is in flight in a fresh/resumed session
@@ -3116,10 +3281,19 @@ case "$mode" in
         # still lands its write.
         take_detail needs-approval perm
         ask_from=""
-        if [ "$dkind" != note ]; then
+        # GROK has no PermissionRequest: its permission Notification (a
+        # "note", naming no tool) is the whole gate, and the only event that
+        # can name the asker (its subagentType, else main). So it records
+        # one, or any agent's tool call would re-arm over the open prompt.
+        if [ "$dkind" != note ] || [ "$agent" = grok ]; then
             ask_from=main
             if [ -n "$JQ" ] && [ -n "$payload" ]; then
-                ask_from=$("$JQ" -r '.agent_id // empty' <<<"$payload" 2>/dev/null || true)
+                # Grok's subagent is its subagentType (GROK, hb_who).
+                if [ "$agent" = grok ]; then
+                    ask_from=$("$JQ" -r "$GROK_SUB_JQ" <<<"$payload" 2>/dev/null || true)
+                else
+                    ask_from=$("$JQ" -r '.agent_id // empty' <<<"$payload" 2>/dev/null || true)
+                fi
                 # Same charset the heartbeat compares in; also keeps a
                 # trailing ';' out of tmux argv.
                 ask_from="${ask_from//[^A-Za-z0-9_.-]/}"
@@ -3180,7 +3354,28 @@ case "$mode" in
                                 (.last_assistant_message // "" | tostring | .[0:600] | gsub("[\\r\\n]"; " "))' \
                       <<<"$payload" 2>/dev/null || true)
             lm_err="${lm_head%%$'\n'*}"
-            if [ "$lm_err" = rate_limit ]; then
+            if [ "$lm_err" = rate_limit ] && [ "$agent" = grok ]; then
+                # GROK (see RATE-LIMITED AGENTS): rate_limit is a usage limit
+                # only when its text says so. errorDetails is optional, so the
+                # final message (the "Turn failed: ..." line) is read too.
+                # Grok's own usage-limit words ("status 429", free-usage,
+                # "rolling 24-hour") decide outright; otherwise a capacity
+                # error (503, 529, "capacity", "overloaded") is the red
+                # failure below, a bare 429 / usage limit / quota is the
+                # limit, and text that says neither is a failure too.
+                lm_det=$("$JQ" -r '[.error_details, .errorDetails,
+                                    (.error | if type == "object" then (.message // null) else null end),
+                                    .last_assistant_message, .lastAssistantMessage]
+                                   | map(select(. != null) | tostring | .[0:2000]) | join(" ")
+                                   | ascii_downcase | gsub("[\\r\\n]"; " ")' <<<"$payload" 2>/dev/null || true)
+                lm_own='status 429|free-usage|rolling 24'
+                lm_cap='(^|[^0-9])(503|529)([^0-9]|$)|capacity|overload'
+                lm_use='(^|[^0-9])429([^0-9]|$)|usage[ _-]?limit|quota'
+                if [[ $lm_det =~ $lm_own ]] || { ! [[ $lm_det =~ $lm_cap ]] && [[ $lm_det =~ $lm_use ]]; }; then
+                    limit_mark "$win" 0 grok "Grok limit · resets over 24h" "$s_id"
+                    exit 0
+                fi
+            elif [ "$lm_err" = rate_limit ]; then
                 lm_lam=""
                 case "$lm_head" in *$'\n'*) lm_lam="${lm_head#*$'\n'}" ;; esac
                 lm_r=0; lm_raw=""; lm_api=""; lm_text=""
@@ -3238,7 +3433,17 @@ case "$mode" in
         # can compare the way it compares duplicated constants, so there is
         # exactly one copy of it and two callers.
         bg_pending=0
-        if [ -n "$JQ" ] && [ -n "$payload" ] && [ -x "$BG_PENDING" ]; then
+        if [ "$agent" = grok ]; then
+            # GROK says so in the Stop itself: backgroundTasks lists the work
+            # still out (agent-bg-pending reads Claude transcripts only).
+            # Its sessionCrons are not work out: a cron never holds a tab.
+            if [ -n "$JQ" ] && [ -n "$payload" ]; then
+                bg_n=$("$JQ" -r '(.backgroundTasks // .background_tasks // [])
+                                 | if type == "array" or type == "object" then length else 0 end' \
+                       <<<"$payload" 2>/dev/null || true)
+                case "$bg_n" in ''|0|*[!0-9]*) ;; *) bg_pending=1 ;; esac
+            fi
+        elif [ -n "$JQ" ] && [ -n "$payload" ] && [ -x "$BG_PENDING" ]; then
             bg_tp=$("$JQ" -r '.transcript_path // empty' <<<"$payload" 2>/dev/null || true)
             bg_sid=$("$JQ" -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)
             bg_cwd=$("$JQ" -r '.cwd // empty' <<<"$payload" 2>/dev/null || true)
@@ -3358,9 +3563,11 @@ case "$mode" in
         # agent-started turn loud (as notify_user does). EXPLICIT ONLY: no
         # marker, no ask - nothing guesses from the reply any more. A
         # subagent's standing gate (sd_hold) or a pause already decides what
-        # the window shows: not asked there.
+        # the window shows: not asked there. Nor for grok: the decider reads
+        # Claude transcripts, and Grok's transcript_path is not one.
         ask_hit=0; ask_line=""; ask_clean=""
-        if [ "$bg_pending" -eq 1 ] && [ "$sd_hold" = running ] && [ -z "$O_PAUSED" ] && [ -n "$JQ" ]; then
+        if [ "$bg_pending" -eq 1 ] && [ "$sd_hold" = running ] && [ -z "$O_PAUSED" ] && [ -n "$JQ" ] \
+           && [ "$agent" != grok ]; then
             ask_since="$O_TSTART"
             ask_run "$ASK_SYNC_BUDGET" --marker-only ${ask_since:+--since "$ask_since"} <<<"$payload"
             if [ "$ask_rc" = 0 ]; then
@@ -3479,7 +3686,7 @@ case "$mode" in
         clear_state "$win"
         ;;
     *)
-        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|subagent-stop|failed|done|interrupt|reconcile|clear|clear-current> [claude|codex|opencode]" >&2
+        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|subagent-stop|failed|done|interrupt|settle|reconcile|clear|clear-current> [claude|codex|opencode|grok]" >&2
         # exit 0, not 1: codex treats a hook's exit status as a GATE (see the
         # header), so a typo'd mode in hooks.json would block every codex
         # event rather than just failing to paint a tab. A silently inert

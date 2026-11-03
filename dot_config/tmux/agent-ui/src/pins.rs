@@ -31,6 +31,14 @@
 //!   under one of the window's panes (libproc's child list, its argv);
 //!   one started without an id has none, and its pin lives as long as its
 //!   window.
+//! - grok: the Grok TUI process under one of the window's panes (argv[0]
+//!   `grok`, the TUI rule of `grok_tui_args`; a subcommand-word "no" is
+//!   overruled by a session record, its `grok-<pid>.json` in the resurrect
+//!   dir or its row in `active_sessions.json`), its id from Grok's
+//!   `~/.grok/active_sessions.json` (`$GROK_HOME`) by that pid, else its own
+//!   `-s <id>`, else `@agent_session_id` (never a claude file naming the
+//!   window); the ids it was started to resume (`-r <id>`, `--resume <id>`)
+//!   re-key an entry, as claude's do.
 //!
 //! The live sidebar syncs the file with the windows ([`reconcile`], at most
 //! every few seconds, only while anything is pinned or stored):
@@ -349,6 +357,64 @@ pub const CLAUDE_RESUME: [&str; 2] = ["--resume", "-r"];
 /// opencode's session flags (`opencode -s <sid>` resumes that session, the
 /// SAME id).
 pub const OPENCODE_SESSION: [&str; 2] = ["-s", "--session"];
+/// grok's resume flags (`grok -r <sid>`; a bare `-r` is its picker).
+pub const GROK_RESUME: [&str; 2] = ["-r", "--resume"];
+/// grok's own-id flags (`grok -s <sid>`: the session gets that id).
+pub const GROK_SESSION: [&str; 2] = ["-s", "--session-id"];
+
+/// Grok's live-session map: `$GROK_HOME/active_sessions.json`, else
+/// `~/.grok/active_sessions.json`.
+pub fn grok_sessions_file() -> PathBuf {
+    match std::env::var("GROK_HOME") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".grok"),
+    }
+    .join("active_sessions.json")
+}
+
+/// The resurrect records' folder, as grok-session-track.sh and
+/// tmux-assistant-resurrect name it: `$TMUX_ASSISTANT_RESURRECT_DIR`, else
+/// `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect`.
+pub fn resurrect_dir() -> PathBuf {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if let Some(d) = env("TMUX_ASSISTANT_RESURRECT_DIR") {
+        return PathBuf::from(d);
+    }
+    PathBuf::from(env("XDG_RUNTIME_DIR").or_else(|| env("TMPDIR")).unwrap_or_else(|| "/tmp".into())).join("tmux-assistant-resurrect")
+}
+
+/// Where the Grok pass of [`sessions_with`] looks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokSources {
+    /// Grok's live-session map ([`grok_sessions_file`]).
+    pub active: PathBuf,
+    /// The resurrect records' folder ([`resurrect_dir`]): a `grok-<pid>.json`
+    /// there marks that pid a TUI (the v2 amendment of the TUI rule).
+    pub records: PathBuf,
+}
+
+impl GrokSources {
+    /// The live paths.
+    pub fn live() -> GrokSources {
+        GrokSources { active: grok_sessions_file(), records: resurrect_dir() }
+    }
+}
+
+/// `active_sessions.json` (`[{session_id, pid, pid_start, cwd, opened_at}]`,
+/// Grok rewrites it on `/new` and `/resume`) → pid → session id. Junk, or a
+/// row missing either, is skipped.
+pub fn grok_active(text: &str) -> HashMap<i32, String> {
+    let Ok(v) = json::parse(text) else { return HashMap::new() };
+    v.as_array()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|e| {
+            let pid = e.get("pid").and_then(Value::as_f64).map(|n| n as i32).filter(|p| *p > 0)?;
+            let sid = e.get("session_id").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+            Some((pid, sid.to_string()))
+        })
+        .collect()
+}
 
 /// Every window's session as the pins see it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -366,8 +432,20 @@ pub struct Sessions {
 ///   still in the window), and the ids its argv resumed;
 /// - codex: `@agent_session_id`, where no claude file spoke;
 /// - opencode (`@agent_kind`): the `-s <id>` of the opencode process under
-///   one of its panes (an opencode started without one has no id here).
+///   one of its panes (an opencode started without one has no id here);
+/// - grok (`@agent_kind`): the Grok TUI process under one of its panes, its
+///   id from Grok's `active_sessions.json` by pid ([`grok_sessions_file`]),
+///   else its own `-s <id>`, else `@agent_session_id`; the ids its argv
+///   resumed (`-r <id>`).
 pub fn sessions(snap: &Snapshot, dir: &Path, procs: &dyn Procs) -> Sessions {
+    sessions_with(snap, dir, Some(&GrokSources::live()), procs)
+}
+
+/// [`sessions`], with the Grok pass reading `grok` (its map read only when a
+/// grok window is in `snap`). None skips the Grok pass entirely (no map
+/// read, no process walk; its windows keep what the claude / codex passes
+/// gave them): for a caller that ignores grok windows (the insight engine).
+pub fn sessions_with(snap: &Snapshot, dir: &Path, grok: Option<&GrokSources>, procs: &dyn Procs) -> Sessions {
     let mut out = Sessions::default();
     let wins: HashMap<&str, &Window> = snap.windows.iter().map(|w| (w.id.as_str(), w)).collect();
     // Claude: the newest live session file naming a pane of the window.
@@ -414,7 +492,62 @@ pub fn sessions(snap: &Snapshot, dir: &Path, procs: &dyn Procs) -> Sessions {
             out.now.insert(w.id.clone(), sid);
         }
     }
+    // Grok: its TUI process under one of its panes; Grok's own map says the
+    // session it runs now, else its `-s <id>`, else the tab hook's
+    // `@agent_session_id`. Never a claude file naming the window (a claude
+    // in a split is not this agent).
+    let mut seen = HashSet::new();
+    let groks: Vec<&Window> = snap.windows.iter().filter(|w| w.kind == "grok" && seen.insert(w.id.as_str())).collect();
+    if let (Some(grok), false) = (grok, groks.is_empty()) {
+        let active = std::fs::read_to_string(&grok.active).map(|t| grok_active(&t)).unwrap_or_default();
+        // The v2 amendment: a session record makes a subcommand-word "no" a
+        // TUI (one stat, asked only for such a verdict).
+        let has_record = |pid: i32| active.contains_key(&pid) || grok.records.join(format!("grok-{pid}.json")).is_file();
+        for w in groks {
+            out.now.remove(&w.id);
+            out.resumed.remove(&w.id);
+            let found =
+                w.pane_list.iter().filter(|p| !p.dash).filter_map(|p| p.pid).find_map(|pid| grok_proc(procs, pid, &has_record));
+            let mut sid = None;
+            if let Some((pid, argv)) = found {
+                sid = active.get(&pid).cloned().or_else(|| resumed_ids(&argv, &GROK_SESSION).into_iter().next());
+                let olds: Vec<String> = resumed_ids(&argv, &GROK_RESUME).into_iter().filter(|o| Some(o) != sid.as_ref()).collect();
+                if !olds.is_empty() {
+                    out.resumed.insert(w.id.clone(), olds);
+                }
+            }
+            if let Some(sid) = sid.or_else(|| Some(w.session_id.clone()).filter(|s| !s.is_empty())) {
+                out.now.insert(w.id.clone(), sid);
+            }
+        }
+    }
     out
+}
+
+/// The first Grok TUI process at or under `pid` (a few levels: the pane's
+/// shell, maybe a wrapper): its pid and argv. Its argv[0]'s basename is a
+/// grok one ([`crate::actions::is_grok_comm`]) and it passes the TUI rule
+/// with its v2 amendment ([`crate::actions::grok_tui`]: never a `grok -p`;
+/// a `grok sessions` only when `has_record` says that pid has a session).
+fn grok_proc(procs: &dyn Procs, pid: i32, has_record: &dyn Fn(i32) -> bool) -> Option<(i32, Vec<String>)> {
+    let mut level = vec![pid];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for p in level {
+            if let Some(a) = procs.argv(p) {
+                let grok = a.first().is_some_and(|x| crate::actions::is_grok_comm(x.rsplit('/').next().unwrap_or(x)));
+                if grok && crate::actions::grok_tui(&a, || has_record(p)) {
+                    return Some((p, a));
+                }
+            }
+            next.extend(procs.children(p));
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
+    None
 }
 
 /// The `-s <id>` of the first opencode process at or under `pid` (a few

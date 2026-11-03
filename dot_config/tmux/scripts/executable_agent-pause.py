@@ -38,15 +38,16 @@ working. needs-input is blocked on Mack already, and tmux-mcp would only hold
 a message behind its dialog.
 
 THE AGENT PANE in a window is the one tmux-mcp itself knows as an agent: a
-live claude-<pid>.json / codex-<pid>.json / opencode-<pid>.json record in
-tmux-assistant-resurrect's dir whose env.tmux_pane names it (the same lookup
-as tmux-mcp's readAgents, same dir search order; an opencode record counts
-only for the interactive TUI, never `opencode serve` or `attach`).
+live claude-<pid>.json / codex-<pid>.json / opencode-<pid>.json /
+grok-<pid>.json record in tmux-assistant-resurrect's dir whose env.tmux_pane
+names it (the same lookup as tmux-mcp's readAgents, same dir search order; an
+opencode or grok record counts only for the interactive TUI, never `opencode
+serve`, `attach` or a headless `grok -p`).
 message_agent refuses any pane without one, so picking by anything else would
 only pick panes that cannot be reached. A window with no record falls back to
 the pane whose command looks like an agent (claude, codex, Claude's
-version-named binary, or opencode in a window marked @agent_kind opencode,
-which tmux-mcp also accepts without a record); other such deliveries will most
+version-named binary, or opencode / grok in a window marked @agent_kind
+opencode / grok, which tmux-mcp also accepts without a record); other such deliveries will most
 likely be refused and are reported as failures, never dropped silently.
 
 Pausing an OpenCode agent is the same text message as for the others, typed
@@ -131,8 +132,14 @@ EXCLUDE = {"agents", "tasks", "stash", "scratch", "btop-popup"}
 # `opencode` pane counts only in a window the watcher or plugin marked
 # @agent_kind opencode (scan): pane_current_command can't tell the TUI from
 # `opencode serve` / `attach`, and the kind is set for the TUI alone (same
-# rule as tmux-mcp's isOpencodeTab).
-AGENT_CMD = re.compile(r"^(claude|codex|opencode|[0-9]+\.[0-9]+\.[0-9]+)$")
+# rule as tmux-mcp's isOpencodeTab). Grok's pane_current_command is its
+# p_comm cut to 15 (`grok-macos-aarc`), so past the platform word (which
+# the cut always keeps) it is a PREFIX match, and like opencode it counts
+# only in an @agent_kind grok window (`grok -p` and `grok sessions` look the
+# same there).
+GROK_CMD = re.compile(r"^grok(-(macos|linux|windows)-.*)?$")
+GROK_PROG = re.compile(r"^grok(-(macos|linux|windows)-[a-z0-9_]+)?$")   # argv0 basename, uncut
+AGENT_CMD = re.compile(r"^(claude|codex|opencode|[0-9]+\.[0-9]+\.[0-9]+)$|" + GROK_CMD.pattern)
 
 # opencode_tui_args in agent-tab-watcher.sh, ported: is this opencode command
 # line the interactive TUI? The first bare word after the program decides;
@@ -162,6 +169,54 @@ def opencode_tui_args(args):
     return True
 
 
+# The Grok TUI rule (grok_tui_args in agent-tab-watcher.sh, and agent-ui's
+# actions.rs, ported identically): a headless turn (-p/--single/--prompt-*),
+# a help/version flag, or a first bare word naming a non-TUI subcommand is
+# not an agent; everything else (`grok`, `grok "fix x"`, `grok -c`,
+# `grok -r ID`, `grok dashboard`) is the interactive TUI. Options in
+# GROK_VALUE_OPTS take a value; -r/--resume and -w/--worktree take an
+# optional one (a following word that is not a subcommand). `ps -o args`
+# loses the quoting, so `grok "help me fix X"` reads as `grok help me fix X`:
+# a subcommand word is only "not a TUI" while the pid has no session record
+# (`recorded`: grok-session-track writes one at SessionStart, which utility
+# subcommands never fire). The flags stay a firm no.
+GROK_VALUE_OPTS = {"--add-dir", "--agent", "--agents", "--allow", "--cwd", "--debug-file", "--deny",
+                   "--disallowed-tools", "--json-schema", "--leader-socket", "-m", "--model",
+                   "--max-turns", "--output-format", "--permission-mode", "--reasoning-effort",
+                   "--effort", "--rules", "-s", "--session-id", "--sandbox",
+                   "--system-prompt-override", "--system-prompt", "--tools", "--worktree-ref", "--ref"}
+GROK_OPTIONAL_VALUE = {"-r", "--resume", "-w", "--worktree"}
+GROK_HEADLESS = {"-p", "--single", "--prompt-file", "--prompt-json", "-h", "--help", "-v", "--version"}
+GROK_NOT_TUI = {"agent", "leader", "worker", "clone", "completions", "doctor", "du", "disk-usage",
+                "export", "help", "inspect", "login", "logout", "mcp", "memory", "models", "plugin",
+                "sessions", "setup", "trace", "update", "usage", "version", "v", "worktree", "wrap"}
+
+
+def grok_tui_args(args, recorded=False):
+    a = args.split()
+    i, first = 1, None
+    while i < len(a):
+        w = a[i]
+        if w == "--":
+            break
+        if w.startswith("-"):
+            name = w.split("=", 1)[0] if w.startswith("--") else w
+            # A glued short flag (`-phi`, `-p=hi`, `-hx`) is still -p/-h/-v.
+            if name in GROK_HEADLESS or (not w.startswith("--") and w[1:2] in ("p", "h", "v")):
+                return False
+            if name in GROK_VALUE_OPTS and "=" not in w:
+                i += 2
+                continue
+            if name in GROK_OPTIONAL_VALUE and "=" not in w and i + 1 < len(a) \
+                    and not a[i + 1].startswith("-") and a[i + 1] not in GROK_NOT_TUI:
+                i += 2
+                continue
+        elif first is None:
+            first = w
+        i += 1
+    return recorded or first not in GROK_NOT_TUI
+
+
 def proc_args(pid):
     """`ps -o args=` for one pid, "" when it can't be read."""
     try:
@@ -173,6 +228,8 @@ def proc_args(pid):
 
 def cmd_kind(cmd):
     """The agent kind a pane_current_command (an AGENT_CMD match) names."""
+    if GROK_CMD.match(cmd):
+        return "grok"
     return cmd if cmd in ("codex", "opencode") else "claude"
 US = "\x1f"
 # @agent_summary is free text, so it goes LAST and the split is bounded.
@@ -375,19 +432,12 @@ def agent_records():
     except OSError:
         return out
     for name in names:
-        m = re.match(r"^(claude|codex|opencode)-(\d+)\.json$", name)
+        m = re.match(r"^(claude|codex|opencode|grok)-(\d+)\.json$", name)
         if not m:
             continue
         kind, pid = m.group(1), int(m.group(2))
         if not alive(pid):
             continue
-        # The resurrect plugin's OpenCode plugin can run in `opencode serve`
-        # (or an attach client) too: only the TUI is an agent. An argv we
-        # cannot read keeps the record (a missed pause is the worse failure).
-        if kind == "opencode":
-            args = proc_args(pid)
-            if args and not opencode_tui_args(args):
-                continue
         try:
             j = json.loads((d / name).read_text())
         except (OSError, ValueError):
@@ -398,7 +448,37 @@ def agent_records():
         sid = j.get("session_id")
         if not pane or not sid:
             continue
-        rec = {"kind": kind, "pid": pid, "session_id": str(sid), "stamp": stamp(j.get("timestamp"))}
+        sid = str(sid)
+        # Grok's compat Claude hooks (tmux-mcp readAgents' guard, ported): the
+        # resurrect plugin files a Grok session as claude-<pid>.json, carrying
+        # Grok's camelCase payload twins (`hookEventName`) that no Claude
+        # payload has. The hook names the pid it finds walking up from itself,
+        # so a `grok -p` in a Claude tab's Bash tool overwrites THAT Claude's
+        # record. The pid decides: a grok process makes it the grok record it
+        # really is (filter and all); anything else stays the Claude it is,
+        # the record's session id unknown (Claude's own sessions file, below,
+        # can still name it).
+        args = None
+        if kind == "claude" and (j.get("tool") == "grok" or "hookEventName" in j):
+            args = proc_args(pid)
+            if GROK_PROG.match(os.path.basename(args.split()[0]) if args else ""):
+                kind = "grok"
+            else:
+                sid = ""
+        # The resurrect plugin's OpenCode plugin can run in `opencode serve`
+        # (or an attach client) too: only the TUI is an agent. Likewise
+        # grok-session-track's records for a headless `grok -p` turn (this
+        # record is the session record, so only the flags can say no). An argv
+        # we cannot read keeps the record (a missed pause is the worse failure).
+        if kind == "opencode":
+            args = proc_args(pid)
+            if args and not opencode_tui_args(args):
+                continue
+        elif kind == "grok":
+            args = proc_args(pid) if args is None else args
+            if args and not grok_tui_args(args, recorded=True):
+                continue
+        rec = {"kind": kind, "pid": pid, "session_id": sid, "stamp": stamp(j.get("timestamp"))}
         if kind == "claude":
             rec["session_id"] = claude_session_id(pid) or rec["session_id"]
         prev = out.get(pane)
@@ -456,7 +536,8 @@ def pick_agent_pane(rows, recs):
                                      r["pane_active"] != "1"))
         return with_rec[0], "record"
     cmd = [r for r in rows if AGENT_CMD.match(r["pane_current_command"])
-           and (r["pane_current_command"] != "opencode" or kind == "opencode")]
+           and (cmd_kind(r["pane_current_command"]) not in ("opencode", "grok")
+                or cmd_kind(r["pane_current_command"]) == kind)]
     cmd.sort(key=lambda r: (cmd_kind(r["pane_current_command"]) != kind if kind else False,
                             r["pane_active"] != "1"))
     return (cmd[0], "command") if cmd else (None, "")
@@ -525,17 +606,24 @@ def locate(t, panes, recs):
     pane (2026-10-22 review). So the pane must also still run the same kind
     of agent (pane_current_command, as saved, else the target's kind) and
     carry no session record: a record there means another, identified agent
-    lives in it now."""
+    lives in it now. A record with no session id (a Claude whose record
+    Grok's compat hooks overwrote) identifies nobody else; and a record that
+    names the target's own pid (live: records count only while their pid
+    is) IS that agent, with or without a session id by now."""
     sid = t.get("session_id") or ""
     pane = t.get("pane_id")
     note = "pane gone"
     if pane in panes:
         if not sid:
+            rec = recs.get(pane, {})
+            if t.get("pid") and rec.get("pid") == t.get("pid"):
+                return pane, ""   # the same live pid there (a record lives only with it)
             row = panes[pane]
             saved = t.get("pane_pid")
             cmd = row.get("pane_current_command") or ""
             kind = cmd_kind(t["pane_cmd"]) if t.get("pane_cmd") else t.get("kind")
-            same = (not saved or row.get("pane_pid") == saved) and pane not in recs \
+            same = (not saved or row.get("pane_pid") == saved) \
+                and not recs.get(pane, {}).get("session_id") \
                 and bool(AGENT_CMD.match(cmd)) and (not kind or cmd_kind(cmd) == kind)
             if same:
                 return pane, ""
@@ -1339,6 +1427,33 @@ LIMIT_EPISODE_GAP = 900
 LIMIT_SWITCH_POLL = 20
 LIMIT_SWITCH_WAIT = 300
 SCOPED_TYPES = ("seven_day_opus", "seven_day_sonnet")
+# THE POOL (docs/agent-pause.md, "Pool-aware resume"). cswap pools Claude
+# accounts; codexbar-usage-status.sh publishes each one's window under
+# usage.json `<family>_pace.members` ({slot, used, cap, resets_at, as_of}).
+# A target limited on account A is free once the account Claude uses NOW
+# (sequence.json's activeAccountNumber: usage.json's `account` lags) is
+# another one with headroom: its window reset POOL_GRACE s ago (no fresh
+# reading needed: a reset is a reset), or a trusted reading taken after the
+# limit shows it POOL_MIN_HEADROOM points under its cap (100 minus its
+# weeklyReservePct; 100 for an account Mack chose inside its reserve).
+POOL_GRACE = 90          # s after a member's reset: cswap's 60 s tick has re-read it
+POOL_MIN_HEADROOM = 2    # points under the effective cap
+USAGE_FRESH = 1800       # s: an older reading (or usage.json) proves nothing
+USAGE_DEAD = 7 * 86400   # s: a usage.json this old is ignored, today's rules only
+SWITCH_SETTLE = 45       # s after a switch: Claude Code's keychain cache (~30 s)
+SWAP_STATE = HOME / ".claude-swap-backup/autoswitch_state.json"   # cswap's reserveOverride
+# The limit dialog (Claude's /rate-limit-options, opened by the limit itself
+# when no native auto-continue armed): tmux-mcp's answer_limit_dialog
+# recognises it and presses one key. At limit-add, "wait" arms Claude's own
+# wait for the reset (auto-resume on) and "dismiss" closes it (off); right
+# before a RESUME it is always "dismiss" (limit_send). Its reply's first line:
+# "answered: …", "no dialog", "unknown: …" (some other screen: send
+# nothing) or "not answered: …"; a missing tool or a refusal falls back to
+# plain delivery (tmux-mcp's draft guard holds a RESUME behind a dialog).
+DIALOG_TOOL = "answer_limit_dialog"
+DIALOG_WAIT, DIALOG_DISMISS = "wait", "dismiss"
+DIALOG_TIMEOUT = 30
+DIALOG_DELAY = float(os.environ.get("AGENT_PAUSE_DIALOG_DELAY") or 2)   # s: it opens after StopFailure
 # A resume press's limit half, queued under the pause lock by finish_resume
 # and run by limit_after_press once the lock is released.
 LIMIT_LATER = []
@@ -1398,7 +1513,15 @@ def resolves(host):
 
 
 def limit_host(t):
+    if "grok" in (t.get("type"), t.get("kind")):
+        return "api.x.ai"
     return "chatgpt.com" if "codex" in (t.get("type"), t.get("kind")) else "api.anthropic.com"
+
+
+def cswap_blind(t):
+    """A target no cswap switch can free: codex, or grok (cswap swaps Claude
+    accounts only). Pure."""
+    return t.get("type") == "codex" or "grok" in (t.get("type"), t.get("kind"))
 
 
 def parse_limit(v):
@@ -1470,32 +1593,270 @@ def limit_family(typ, usage):
     return "weekly"   # seven_day, overage, anything else, or no scoped reading
 
 
-def window_free(fam, seq_mtime, usage):
+def swap_state(now=None):
+    """cswap's own word on the pool -> {active, slots, reserve, mtime,
+    override}: active the slot Claude uses now ("" unknown), slots {n:
+    "<email>/<organizationUuid>"} (limited.json's `account` format),
+    reserve {n: weeklyReservePct}, sequence.json's mtime, and override the
+    slot Mack chose inside its weekly reserve while that still holds
+    (autoswitch_state.json reserveOverride: account, until) or ""."""
+    now = clock() if now is None else now
+    seq = read_json(SWAP_SEQ) or {}
+    try:
+        mtime = SWAP_SEQ.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    accts = seq.get("accounts") if isinstance(seq.get("accounts"), dict) else {}
+    slots, reserve = {}, {}
+    for n, a in accts.items():
+        if isinstance(a, dict):
+            if a.get("email") and a.get("organizationUuid"):
+                slots[str(n)] = "%s/%s" % (a["email"], a["organizationUuid"])
+            if is_num(a.get("weeklyReservePct")):
+                reserve[str(n)] = float(a["weeklyReservePct"])
+    act = seq.get("activeAccountNumber")
+    active = str(act) if is_num(act) or (isinstance(act, str) and act.isdigit()) else ""
+    ov = (read_json(SWAP_STATE) or {}).get("reserveOverride")
+    override = ""
+    if isinstance(ov, dict) and ov.get("account") is not None and is_num(ov.get("until")) \
+            and now < ov["until"] and str(ov["account"]) == active:
+        override = active
+    return {"active": active, "slots": slots, "reserve": reserve, "mtime": mtime, "override": override}
+
+
+def current_account(usage, sw):
+    """The account Claude uses now, as limited.json stores it: cswap's
+    active slot (sequence.json, the ground truth), else usage.json's
+    `account` (it lags a switch). Pure."""
+    return (sw or {}).get("slots", {}).get((sw or {}).get("active")) or usage.get("account")
+
+
+LIMIT_MATCH = 120   # s: a limit's resets_at and its account's published reset agree within this
+
+
+def limit_account(t, usage, sw):
+    """The account a just-marked limit was hit on. Claude keeps the old
+    account's cached token for ~30 s after a cswap switch (SWITCH_SETTLE),
+    so the slot active now may not be it: first the slot whose pooled
+    member for the limit's window resets when the limit does (within
+    LIMIT_MATCH s); else, for a limit hit inside the settle window, not the
+    new active slot (usage.json's lagging `account` if it is another one,
+    or the only other slot; unknown otherwise: None); else the active
+    slot (current_account). Pure."""
+    slots, active = (sw or {}).get("slots", {}), (sw or {}).get("active")
+    resets = num(t.get("resets_at"))
+    if resets > 0:
+        fam = limit_family(t.get("type"), usage)
+        block = usage.get(fam + "_pace") if isinstance(usage.get(fam + "_pace"), dict) else {}
+        hits = {str(m.get("slot")) for m in block.get("members") or []
+                if isinstance(m, dict) and is_num(m.get("resets_at"))
+                and abs(m["resets_at"] - resets) <= LIMIT_MATCH and str(m.get("slot")) in slots}
+        if len(hits) == 1:
+            return slots[hits.pop()]
+    if active and num(t.get("since")) < num((sw or {}).get("mtime")) + SWITCH_SETTLE:
+        others = [a for n, a in slots.items() if n != active]
+        if usage.get("account") in others:
+            return usage["account"]
+        return others[0] if len(others) == 1 else None
+    return current_account(usage, sw)
+
+
+def pool_member(usage, fam, slot):
+    """The `<fam>_pace` member for that slot ({slot, used, cap, resets_at,
+    as_of}) and its block's window_minutes -> (member or None, minutes). Pure."""
+    block = usage.get(fam + "_pace")
+    if not isinstance(block, dict) or not slot:
+        return None, 0
+    for m in block.get("members") or []:
+        if isinstance(m, dict) and str(m.get("slot")) == str(slot):
+            return m, num(block.get("window_minutes"))
+    return None, num(block.get("window_minutes"))
+
+
+def usage_trusted(usage, now):
+    """Are usage.json's readings worth anything? Not in the publisher's
+    error state, and written within USAGE_FRESH s. Pure."""
+    return usage.get("state") != "error" and now - num(usage.get("updated_at")) <= USAGE_FRESH
+
+
+def eff_cap(fam, slot, usage, sw):
+    """The most of a window an account may use: weekly, 100 minus its
+    weeklyReservePct (sequence.json, else the member's published cap), and
+    100 for the active slot Mack chose inside its reserve (cswap will not
+    leave it); 100 for the other families. Pure."""
+    if fam != "weekly":
+        return 100.0
+    if slot and slot == sw.get("override"):
+        return 100.0
+    if slot in sw.get("reserve", {}):
+        return 100.0 - sw["reserve"][slot]
+    m, _ = pool_member(usage, fam, slot)
+    return float(m["cap"]) if m and is_num(m.get("cap")) else 100.0
+
+
+def member_free(m, minutes, fam, now, since, trusted, cap):
+    """Is this pool member's window free for a target limited at `since`?
+    Free: no such window (session, used and resets_at both null: a
+    weekly-only account); or it reset POOL_GRACE s ago and the reading is
+    from that window (as_of within window_minutes of the reset: it has reset
+    since, stale data or not); or a trusted reading taken after the limit
+    shows used <= cap - POOL_MIN_HEADROOM. A missing member is not free. Pure."""
+    if not m:
+        return False
+    used, resets, as_of = m.get("used"), m.get("resets_at"), m.get("as_of")
+    if fam == "session" and used is None and resets is None:
+        return True
+    if is_num(resets) and now >= resets + POOL_GRACE and is_num(as_of) \
+            and as_of >= resets - minutes * 60:
+        return True
+    return (trusted and is_num(used) and is_num(as_of) and now - as_of <= USAGE_FRESH
+            and as_of > since and used <= cap - POOL_MIN_HEADROOM)
+
+
+def pool_families(t, usage, slot):
+    """The windows the active slot must have free for this target: weekly
+    always (a five_hour target too: a free 5 h window on an exhausted week
+    is no headroom); session when that slot has a session reading; scoped
+    for an opus/sonnet limit when it has a scoped one. The publisher never
+    pools the session window (session_pace is null, or holds one slot), so
+    a slot with no session member has no session window to judge: a
+    weekly-only account is judged on its weekly member alone. Pure."""
+    fams = ["weekly"]
+    s, _ = pool_member(usage, "session", slot)
+    if s and (s.get("used") is not None or s.get("resets_at") is not None):
+        fams.append("session")
+    if t.get("type") in SCOPED_TYPES and pool_member(usage, "scoped", slot)[0]:
+        fams.append("scoped")
+    return fams
+
+
+def pool_ready(t, usage, sw, now):
+    """Can the pool rule judge this target at all? A Claude target with a
+    reset and an account, a usage.json from a pool-aware publisher that is
+    not dead, and cswap's active slot known. Pure."""
+    return (not cswap_blind(t) and int(num(t.get("resets_at"))) > 0 and bool(t.get("account"))
+            and isinstance(usage.get("weekly_pace"), dict)
+            and now - num(usage.get("updated_at")) <= USAGE_DEAD and bool(sw and sw.get("active")))
+
+
+def pool_eligible(t, now, usage, sw):
+    """"pool" when the account Claude uses now is not the limited one and
+    has every window the target needs free (member_free), else "". The
+    limited account's own reset stays the clock rule's (LIMIT_GRACE: Claude's
+    native continue goes first), and a switch younger than SWITCH_SETTLE s
+    has not reached Claude yet. Codex and grok never (cswap_blind). Pure."""
+    if not pool_ready(t, usage, sw, now):
+        return ""
+    active = sw["active"]
+    if sw["slots"].get(active) == t.get("account") or now < sw["mtime"] + SWITCH_SETTLE:
+        return ""
+    return "pool" if slot_free(t, usage, sw, active, now) else ""
+
+
+def slot_free(t, usage, sw, slot, now):
+    """Does `slot` have every window this target needs free (pool_families,
+    member_free)? A five_hour target is not judged on the active slot's
+    week alone before usage.json has been written since the switch: until
+    then its session_pace still describes the old slot, so a missing session
+    member there proves nothing (as window_free wants a fetch since the
+    switch). Pure."""
+    trusted, since = usage_trusted(usage, now), num(t.get("since"))
+    fams = pool_families(t, usage, slot)
+    if (t.get("type") == "five_hour" and "session" not in fams and slot == sw.get("active")
+            and num(usage.get("updated_at")) <= num(sw.get("mtime"))):
+        return False
+    for fam in fams:
+        m, minutes = pool_member(usage, fam, slot)
+        if not member_free(m, minutes, fam, now, since, trusted, eff_cap(fam, slot, usage, sw)):
+            return False
+    return True
+
+
+def pool_due(t, now, usage, sw):
+    """The next moment the pool could free this target, or None: the
+    earliest member reset + POOL_GRACE still ahead (weekly members, session
+    ones too for a five_hour limit, scoped ones for an opus/sonnet one), not
+    the limited account's own (the
+    clock rule has that); the end of SWITCH_SETTLE after a switch away from
+    it; and, while another slot has every window the target needs free
+    (slot_free) but is not active, a poll every LIMIT_SWITCH_POLL s (cswap
+    should switch to it within a minute; its sequence.json trigger ticks
+    too) for at most LIMIT_SWITCH_WAIT s after a stable anchor: the limit,
+    the last switch, or that slot's weekly reset, whichever is latest (never
+    the reading's as_of, which cswap moves on every re-read: a cswap that
+    will not switch, autoswitch off or a reserve override, then got a tick
+    every 20 s until the reset). NOT
+    the publisher's horizons: avail(T) counts resets strictly before T, so
+    its first horizon with headroom is the reset AFTER the one that frees
+    the pool. Pure."""
+    if t.get("lifted_at") or not pool_ready(t, usage, sw, now):
+        return None
+    mine = next((n for n, a in sw["slots"].items() if a == t.get("account")), None)
+    fams = (["weekly"] + (["session"] if t.get("type") == "five_hour" else [])
+            + (["scoped"] if t.get("type") in SCOPED_TYPES else []))
+    at = []
+    for fam in fams:
+        block = usage.get(fam + "_pace") if isinstance(usage.get(fam + "_pace"), dict) else {}
+        for m in block.get("members") or []:
+            r = m.get("resets_at") if isinstance(m, dict) else None
+            if is_num(r) and r > now - POOL_GRACE and str(m.get("slot")) != mine:
+                at.append(r + POOL_GRACE)
+    active = sw["active"]
+    if sw["slots"].get(active) != t.get("account") and now < sw["mtime"] + SWITCH_SETTLE:
+        at.append(sw["mtime"] + SWITCH_SETTLE)
+    for n in sw["slots"]:
+        if n in (active, mine) or not slot_free(t, usage, sw, n, now):
+            continue
+        m, _ = pool_member(usage, "weekly", n)
+        r = num((m or {}).get("resets_at"))
+        anchor = max(num(t.get("since")), num(sw["mtime"]), r + POOL_GRACE if r and now >= r + POOL_GRACE else 0)
+        if now < anchor + LIMIT_SWITCH_WAIT:
+            at.append(now + LIMIT_SWITCH_POLL)
+    return min(at) if at else None
+
+
+def window_free(fam, seq_mtime, usage, sw=None):
     """Is that window free on the account usage.json now describes? Its
-    `<fam>_locked` is false AND either its `<fam>_used` is a number under 100,
-    or (no reading) our own fetch landed after the switch. The locked flags
-    alone prove nothing right after a switch: adopting cswap's reading resets
-    them to false and leaves fetched_at behind, so a switch to an exhausted
-    account would pass. Pure."""
+    `<fam>_locked` is false AND either its `<fam>_used` is a number under its
+    cap, or (no reading) our own fetch landed after the switch. The locked
+    flags alone prove nothing right after a switch: adopting cswap's reading
+    resets them to false and leaves fetched_at behind, so a switch to an
+    exhausted account would pass. The cap: under 100 from an old publisher
+    (no `<fam>_pace`); from a pool-aware one, POOL_MIN_HEADROOM under the
+    described member's effective cap (eff_cap: a weekly reserve is not
+    headroom). Pure."""
     if usage.get(fam + "_locked") is not False:
         return False
     used = usage.get(fam + "_used")
     if is_num(used):
-        return used < 100
+        block = usage.get(fam + "_pace")
+        if not isinstance(block, dict):
+            return used < 100
+        act = (sw or {}).get("active")
+        m = (pool_member(usage, fam, act)[0] if act else None) or next(
+            (x for x in block.get("members") or [] if isinstance(x, dict) and x.get("active")), None)
+        slot = str(m.get("slot")) if m else ""
+        cap = eff_cap(fam, slot, usage, sw or {}) if slot else 100.0
+        return used <= cap - POOL_MIN_HEADROOM
     return num(usage.get("fetched_at")) > seq_mtime
 
 
-def swap_freed(t, seq_mtime, usage):
+def swap_freed(t, seq_mtime, usage, sw=None):
     """Did a cswap switch free this target? All four: a switch after it was
     marked (sequence.json newer than `since`), usage.json written after that
-    switch, another account than the one it hit the limit on, and that
-    account's matching window free (window_free). A false lift re-marks it
-    with a new `since`, so only a NEWER switch can free it again. Pure."""
+    switch (and not in the publisher's error state), another account than
+    the one it hit the limit on, and that account's matching window free
+    (window_free; for a five_hour limit its weekly window too, cap and all:
+    a weekly-only account has no session reading, which proves nothing). A
+    false lift re-marks it with a new `since`, so only a NEWER switch can
+    free it again. Pure."""
     acct = usage.get("account")
-    return (t.get("type") != "codex" and seq_mtime > num(t.get("since"))
-            and num(usage.get("updated_at")) > seq_mtime
+    fam = limit_family(t.get("type"), usage)
+    return (not cswap_blind(t) and seq_mtime > num(t.get("since"))
+            and num(usage.get("updated_at")) > seq_mtime and usage.get("state") != "error"
             and bool(acct) and bool(t.get("account")) and acct != t.get("account")
-            and window_free(limit_family(t.get("type"), usage), seq_mtime, usage))
+            and window_free(fam, seq_mtime, usage, sw)
+            and (fam != "session" or window_free("weekly", seq_mtime, usage, sw)))
 
 
 def switch_settling(t, now, seq_mtime, usage):
@@ -1504,19 +1865,21 @@ def switch_settling(t, now, seq_mtime, usage):
     than the switch, and the switch under LIMIT_SWITCH_WAIT s old (a
     usage.json that never settles stops the polling). Regardless of
     auto-resume: with it off, the tick must still see the lift to mark it.
-    Not for a target already waiting for Mack, a codex one or a model
-    limit (neither is freed by a switch). Pure."""
-    return (not t.get("lifted_at") and t.get("type") != "codex"
+    Not for a target already waiting for Mack, a codex or grok one or a
+    model limit (none is freed by a switch). Pure."""
+    return (not t.get("lifted_at") and not cswap_blind(t)
             and int(num(t.get("resets_at"))) > 0
             and seq_mtime > num(t.get("since")) and num(usage.get("updated_at")) <= seq_mtime
             and now < seq_mtime + LIMIT_SWITCH_WAIT)
 
 
-def limit_eligible(t, now, seq_mtime, usage):
+def limit_eligible(t, now, seq_mtime, usage, sw=None):
     """Has this target's limit lifted? -> "lifted" (it was, and nothing has
     re-marked it since), "reset" (resets_at + LIMIT_GRACE has passed),
-    "switch" (swap_freed), or "" (not yet). resets_at 0 is never eligible;
-    codex only by the clock. Pure."""
+    "pool" (pool_eligible: another account Claude uses now has headroom;
+    sw from swap_state, None skips it), "switch" (swap_freed), or "" (not
+    yet). resets_at 0 is never eligible (a grok limit has none: rolling
+    24 h); codex only by the clock. Pure."""
     resets = int(num(t.get("resets_at")))
     if t.get("lifted_at"):
         return "lifted"
@@ -1524,7 +1887,9 @@ def limit_eligible(t, now, seq_mtime, usage):
         return ""
     if now >= resets + LIMIT_GRACE:
         return "reset"
-    return "switch" if swap_freed(t, seq_mtime, usage) else ""
+    if sw and pool_eligible(t, now, usage, sw):
+        return "pool"
+    return "switch" if swap_freed(t, seq_mtime, usage, sw) else ""
 
 
 def capped(t):
@@ -1551,7 +1916,7 @@ def held_stuck(t, row, now):
             and now - num(t.get("last_attempt")) >= LIMIT_HELD_LIFT)
 
 
-def limit_due_at(targets, auto, now, actionable=None, eligible=()):
+def limit_due_at(targets, auto, now, actionable=None, eligible=(), pool_at=None):
     """The earliest moment limit-tick could act on any target (epoch s), or
     None. Not counted: a target waiting for Mack (lifted with auto-resume off
     or past the cap), one with resets_at 0 and nothing lifted, and, when
@@ -1560,8 +1925,10 @@ def limit_due_at(targets, auto, now, actionable=None, eligible=()):
     and limit-add recomputes then. A target in `eligible` (window ids whose
     limit has lifted already, e.g. by a switch) waits only for its backoff,
     never for its reset; one whose held RESUME may still be queued waits for
-    that to expire. Pure."""
+    that to expire. pool_at {window id: moment} (pool_due) can bring a
+    target's own reset forward. Pure."""
     best = None
+    pool_at = pool_at or {}
     for t in targets:
         wid = t.get("window_id")
         if actionable is not None and wid not in actionable:
@@ -1575,7 +1942,10 @@ def limit_due_at(targets, auto, now, actionable=None, eligible=()):
         elif int(num(t.get("resets_at"))) <= 0:
             continue
         else:
-            at = max(int(num(t["resets_at"])) + LIMIT_GRACE, backoff_until(t))
+            own = int(num(t["resets_at"])) + LIMIT_GRACE
+            if pool_at.get(wid) is not None:
+                own = min(own, pool_at[wid])
+            at = max(own, backoff_until(t))
         if held_pending(t, now):
             at = max(at, num(t["held_at"]) + LIMIT_HELD_MAX)
         best = at if best is None else min(best, at)
@@ -1772,7 +2142,11 @@ def limit_merge(d, t, account):
     renewing its limit (limit_renew). Any other entry for the same window or
     session is pruned: its episode has ended, this mark replaced it. An entry
     whose window now runs ANOTHER session starts over as a new target.
+    A grok target never carries a cswap account: it is Claude's, and no
+    switch frees a grok limit (cswap_blind).
     -> (the stored target, renewed?)."""
+    if t.get("kind") == "grok":
+        account = None
     sid = t["session_id"]
     matches = [o for o in d["targets"]
                if o.get("window_id") == t["window_id"] or (sid and o.get("session_id") == sid)]
@@ -1783,24 +2157,29 @@ def limit_merge(d, t, account):
         old = None
     d["targets"] = [o for o in d["targets"] if id(o) not in gone]
     if old is None:
-        t = dict(t, account=account, attempts=0)
+        t = dict(t, attempts=0) if t.get("kind") == "grok" else dict(t, account=account, attempts=0)
         d["targets"].append(t)
         return t, True
     lim = (t.pop("resets_at"), t.pop("type"), t.pop("since"))
     old.update(t)   # where it lives now
+    if old.get("kind") == "grok":
+        old.pop("account", None)
     return old, limit_renew(old, *lim, account)
 
 
-def limit_sync(t, row, account):
+def limit_sync(t, row, usage, sw):
     """The live @agent_limit on its window wins over the stored one, so a
     limit-add that never ran cannot leave a stale since (the cswap rule and
     the flag stamp both read it). The stored account stays: it is the one
-    the limit was hit on, and `account` (now's) only fills a target that has
-    none. -> renewed?"""
+    the limit was hit on. Only a target that has none gets one, judged for
+    the live mark as limit-add would (limit_account: never the slot it
+    ruled out; never for a grok one: limit_merge). -> renewed?"""
     lim = parse_limit(row["agent_limit"]) if row else None
     if not lim or (lim[0], lim[1], lim[2]) == (t.get("resets_at"), t.get("type"), t.get("since")):
         return False
-    renewed = limit_renew(t, lim[0], lim[1], lim[2], None if t.get("account") else account)
+    keep = t.get("account") or t.get("kind") == "grok"
+    account = None if keep else limit_account(dict(t, resets_at=lim[0], type=lim[1], since=lim[2]), usage, sw)
+    renewed = limit_renew(t, lim[0], lim[1], lim[2], account)
     if renewed and row["agent_limit_lifted"]:
         set_window_opt(row["pane_id"], "@agent_limit_lifted", None)
     return renewed
@@ -1812,7 +2191,7 @@ def limit_add_locked(w, panes, recs, d):
     t, row = limit_target(w, panes, recs)
     if t is None:
         return row, None
-    t, renewed = limit_merge(d, t, swap_facts()[1].get("account"))
+    t, renewed = limit_merge(d, t, limit_account(t, swap_facts()[1], swap_state()))
     if renewed and row["agent_limit_lifted"]:
         set_window_opt(t["pane_id"], "@agent_limit_lifted", None)
     save_limited(d)
@@ -1822,14 +2201,82 @@ def limit_add_locked(w, panes, recs, d):
 
 def limit_add(w):
     """`limit-add W`: the indicator just marked W. Waits for a tick in flight
-    (it is a background job; a lost add would leave the agent unresumed)."""
+    (it is a background job; a lost add would leave the agent unresumed).
+    Then, for a Claude agent, the dialog pass (limit_dialog_pass)."""
+    t = None
     with limit_lock(180) as held:
         if not held:
             msg = "limit-add %s: limit.lock busy for 180 s, not added" % w
         else:
-            msg, _t = limit_add_locked(w, list_panes(), agent_records(), load_limited())
+            msg, t = limit_add_locked(w, list_panes(), agent_records(), load_limited())
     log({"mode": "limit-add", "window": w, "message": msg})
+    if t is not None and t.get("kind") == "claude":
+        limit_dialog_pass(t)
     return msg
+
+
+def dialog_reply(resp):
+    """answer_limit_dialog's reply -> (status, first line): answered | none
+    (no dialog) | unknown (some other screen: send nothing) | refused (a
+    "not answered", an error, or no such tool: deliver as before)."""
+    if "error" in resp:
+        return "refused", str((resp["error"] or {}).get("message") or "error")
+    res = resp.get("result") or {}
+    text = " ".join(c.get("text", "") for c in res.get("content") or []
+                    if isinstance(c, dict) and c.get("type") == "text").strip()
+    first = text.split("\n")[0].strip() if text else ""
+    if res.get("isError"):
+        return "refused", first or "error"
+    for prefix, status in (("answered", "answered"), ("no dialog", "none"), ("unknown", "unknown")):
+        if first.startswith(prefix):
+            return status, first
+    return "refused", first or "empty reply"
+
+
+def limit_dialog(mcp, t, pane, choice=None):
+    """Answer Claude's limit dialog in `pane` if it is up: DIALOG_WAIT with
+    auto-resume on, DIALOG_DISMISS off. Recorded in t["dialog"] {at,
+    choice, result} and logged. A call with no usable reply is "unknown"
+    (a key may have gone in: look again before sending). -> (status, detail)."""
+    choice = choice or (DIALOG_WAIT if limit_autoresume() else DIALOG_DISMISS)
+    try:
+        res = dialog_reply(mcp.call(DIALOG_TOOL, {"pane": pane, "choice": choice}, timeout=DIALOG_TIMEOUT))
+    except McpUncertain as e:
+        res = ("unknown", str(e))
+    except McpError as e:
+        res = ("refused", str(e))
+    except Exception as e:
+        res = ("unknown", "%s: %s" % (type(e).__name__, e))
+    t["dialog"] = {"at": clock(), "choice": choice, "result": res[0]}
+    log({"mode": "limit-dialog", "window": t.get("window_id"), "label": t.get("label"),
+         "choice": choice, "result": res[0], "detail": res[1]})
+    return res
+
+
+def limit_dialog_pass(t):
+    """limit-add's dialog pass, after limit.lock is released: the dialog
+    opens just after the StopFailure that marked the window, so wait
+    DIALOG_DELAY s, answer it, and record the answer in limited.json.
+    Never raises (limit-add has done its job)."""
+    try:
+        time.sleep(DIALOG_DELAY)
+        mcp = open_mcp()
+        try:
+            res = limit_dialog(mcp, t, t["pane_id"])
+        finally:
+            mcp.close()
+        with limit_lock(30) as held:
+            if held:
+                d = load_limited()
+                for o in d["targets"]:
+                    if o.get("window_id") == t.get("window_id"):
+                        o["dialog"] = t["dialog"]
+                save_limited(d)
+        return res
+    except Exception as e:
+        log({"mode": "limit-dialog", "window": t.get("window_id"),
+             "result": "skipped", "detail": "%s: %s" % (type(e).__name__, e)})
+        return None
 
 
 def limit_recompute(d, floor=None):
@@ -1845,20 +2292,25 @@ def limit_recompute(d, floor=None):
     wins = window_rows(panes)
     now = clock()
     seq_mtime, usage = swap_facts()
+    sw = swap_state(now)
     # extra: moments limit_due_at does not know of (they need the window rows).
-    actionable, eligible, extra = set(), set(), []
+    actionable, eligible, extra, pool_at = set(), set(), [], {}
     for t in d["targets"]:
         row, _pane = limit_where(dict(t), panes, recs, wins)   # a copy: judged, not moved
         if limit_actionable(row):
             actionable.add(t.get("window_id"))
-            if limit_eligible(t, now, seq_mtime, usage):
+            if limit_eligible(t, now, seq_mtime, usage, sw):
                 eligible.add(t.get("window_id"))
-            elif switch_settling(t, now, seq_mtime, usage):
+                continue
+            p = pool_due(t, now, usage, sw)
+            if p is not None:
+                pool_at[t.get("window_id")] = p
+            if switch_settling(t, now, seq_mtime, usage):
                 extra.append(now + LIMIT_SWITCH_POLL)   # usage.json has not caught up yet
         elif (t.get("last_result") in ("held", "unknown") and not t.get("lifted_at") and row
               and row["agent_state"] != "running" and not row["agent_paused"]):
             extra.append(num(t.get("last_attempt")) + LIMIT_HELD_LIFT)   # held_stuck's moment
-    at = limit_due_at(d["targets"], limit_autoresume(), now, actionable, eligible)
+    at = limit_due_at(d["targets"], limit_autoresume(), now, actionable, eligible, pool_at)
     if extra:
         at = min(extra) if at is None else min(at, min(extra))
     if at is not None and at <= now:
@@ -1883,22 +2335,39 @@ def limit_send(mcp, t, pane):
       refused / failed: the flag goes back on, stamped with the limit's own
         since (the indicator clears only that value), retried after the
         backoff.
+      dialog: a Claude agent's screen shows something the dialog pass could
+        not read (limit_dialog "unknown"): nothing is sent, the flag never
+        went off, retried after the backoff (past the cap: Mack, told why).
+    First, for a Claude agent, its limit dialog is answered (limit_dialog):
+    a RESUME pasted at it would be held behind it at best. Always dismissed
+    here, auto-resume or not: the RESUME follows at once, and "Wait here"
+    would arm Claude's own continue for a moment already past, racing it
+    into a duplicate (limit-add's pass is the one that may choose wait).
     -> (status, detail)."""
-    mark_paused([pane], False)
-    res = deliver(mcp, [(0, pane)], LIMIT_RESUME_MSG).get(0, ("unknown", "no result"))
+    if t.get("kind") == "claude":
+        dia = limit_dialog(mcp, t, pane, DIALOG_DISMISS)
+        if dia[0] == "unknown":
+            res = ("dialog", dia[1])
+    else:
+        dia = None
+    if not (dia and dia[0] == "unknown"):
+        mark_paused([pane], False)
+        res = deliver(mcp, [(0, pane)], LIMIT_RESUME_MSG).get(0, ("unknown", "no result"))
     at = clock()
     t["attempts"] = int(num(t.get("attempts"))) + 1
     t["last_attempt"] = at
     t["last_result"] = res[0]
+    t.pop("held_why", None)
     if res[0] in LIMIT_REACHED:
         t["resumed_at"] = at
         if res[0] == "held":
             t["held_at"] = at
+            t["held_why"] = held_reason(res[1])   # stuck_text says what holds it
         elif res[0] == "sent":
             t.pop("held_at", None)   # pasted: the box was clear, nothing older waits in it
         t.pop("lifted_at", None)
         set_window_opt(pane, "@agent_limit_lifted", None)
-    else:
+    elif res[0] != "dialog":
         mark_paused([pane], True, repause=True, stamp=t.get("since"))
     log({"mode": "limit-send", "window": t.get("window_id"), "label": t.get("label"),
          "attempt": t["attempts"], "result": res[0], "detail": res[1]})
@@ -1916,13 +2385,22 @@ def limit_lift(t, pane, notify=True, text=None):
     t["lifted_at"] = at
     set_window_opt(pane, "@agent_limit_lifted", int(at))
     if notify:
+        if not text and t.get("last_result") == "dialog":
+            text = stuck_text(t)
         display("", text or "limit lifted · resume? %s" % short(t.get("label", "?")))
 
 
 def stuck_text(t):
     """held_stuck's toast: say why, so Mack clears the box instead of
-    clicking resume (that would queue a second copy behind the first)."""
+    clicking resume (that would queue a second copy behind the first). A
+    hold tmux-mcp blamed on a dialog (the limit dialog by name, or "no
+    prompt box … a dialog") says so, never "a draft"."""
     label = short(t.get("label", "?"))
+    why = (t.get("held_why") or "").lower()
+    if t.get("last_result") == "dialog" or (t.get("last_result") == "held" and "limit dialog" in why):
+        return "limit lifted · %s's limit dialog is open" % label
+    if t.get("last_result") == "held" and "dialog" in why:
+        return "limit lifted · a dialog is open in %s's tab" % label
     if t.get("last_result") == "held":
         return "limit lifted · a resume is waiting behind a draft in %s's box" % label
     return "limit lifted · %s's resume got no reply: resume?" % label
@@ -1993,12 +2471,13 @@ def _limit_tick():
     # after its RESUME or the native auto-continue, or Mack's own prompt).
     keep, dropped, where = [], [], {}
     seq_mtime, usage = swap_facts()
+    sw = swap_state(now)
     for t in d["targets"]:
         row, pane = limit_where(t, panes, recs, wins)
         if row is None or not row["agent_limit"]:
             dropped.append(t)
         else:
-            limit_sync(t, row, usage.get("account"))   # the live mark wins
+            limit_sync(t, row, usage, sw)   # the live mark wins
             keep.append(t)
             where[id(t)] = (row, pane)
     d["targets"] = keep
@@ -2026,7 +2505,7 @@ def _limit_tick():
             limit_lift(t, pane or row["pane_id"], text=stuck_text(t))
             lifted.append(t)
             continue
-        if pane is None or not limit_actionable(row) or not limit_eligible(t, now, seq_mtime, usage):
+        if pane is None or not limit_actionable(row) or not limit_eligible(t, now, seq_mtime, usage, sw):
             continue
         h = limit_host(t)
         if h not in hosts:
@@ -2098,13 +2577,14 @@ def limit_resume(w, force=False):
         if pane is None:
             return False, "%s: no agent pane to message" % short(t.get("label", w))
         seq_mtime, usage = swap_facts()
-        limit_sync(t, row, usage.get("account"))
+        sw = swap_state()
+        limit_sync(t, row, usage, sw)
         if held_pending(t, clock()) and not force:
             # tmux-mcp queues, undeduplicated: a click would add a second copy.
-            return False, "a resume is already waiting behind the draft in %s's box" % short(
-                t.get("label", w))
+            return False, "a resume is already waiting behind the %s in %s's box" % (
+                "dialog" if "dialog" in (t.get("held_why") or "") else "draft", short(t.get("label", w)))
         resets = int(num(t.get("resets_at")))
-        if not (force or resets <= 0 or limit_eligible(t, clock(), seq_mtime, usage)):
+        if not (force or resets <= 0 or limit_eligible(t, clock(), seq_mtime, usage, sw)):
             if clock() >= resets:   # just reset: Claude's own auto-continue goes first
                 return False, "limit just reset · auto-continue first, try after %s" % fmt_local(
                     resets + LIMIT_GRACE)
@@ -2163,12 +2643,13 @@ def limit_after_resume(job):
             wins = window_rows(panes)
             now, auto = clock(), limit_autoresume()
             seq_mtime, usage = swap_facts()
+            sw = swap_state(now)
             sends, lifted = [], []
             for t in d["targets"]:
                 row, pane = limit_where(t, panes, recs, wins)
                 if row is not None:
-                    limit_sync(t, row, usage.get("account"))
-                if pane is None or not limit_actionable(row) or not limit_eligible(t, now, seq_mtime, usage):
+                    limit_sync(t, row, usage, sw)
+                if pane is None or not limit_actionable(row) or not limit_eligible(t, now, seq_mtime, usage, sw):
                     continue
                 if auto and not capped(t):
                     if not held_pending(t, now):
@@ -2201,11 +2682,12 @@ def limited_lines(eligibility=False):
     out = ["rate-limited: %d agent%s (auto-resume %s)" % (
         len(targets), "" if len(targets) == 1 else "s", "on" if limit_autoresume() else "off")]
     seq_mtime, usage = swap_facts()
+    sw = swap_state()
     for t in targets:
         resets = int(num(t.get("resets_at")))
         when = ("lifted" if t.get("lifted_at") else "resets %s" % fmt_local(resets) if resets
                 else "resets unknown (only Mack)")
-        why = limit_eligible(t, clock(), seq_mtime, usage) if eligibility else ""
+        why = limit_eligible(t, clock(), seq_mtime, usage, sw) if eligibility else ""
         out.append("  %-6s %-6s %-18s %-24s attempts %d  %s%s" % (
             t.get("window_id", ""), t.get("kind", ""), t.get("type", ""), when,
             int(num(t.get("attempts"))), t.get("label", ""),

@@ -86,6 +86,19 @@ while (r/'block').exists(): time.sleep(.02)
 print('Condensed title')
 (r/'finished').touch()
 '''
+# ai-exec as the condenser calls it (05f9616): the prompt on stdin, the answer
+# into -o's file, exit 0 only when a leg answered. Only the copilot leg, and
+# that is the fake above: the real ai-exec would go on to the real codex and
+# claude CLIs (a model call, and a detached job writing into the test's temp
+# dirs after cleanup).
+FAKE_AI_EXEC = r'''#!/usr/bin/env python3
+import subprocess,sys
+a=sys.argv[1:]
+out=a[a.index('-o')+1]
+r=subprocess.run(['copilot'],stdin=sys.stdin,capture_output=True,text=True)
+if r.returncode or not r.stdout.strip(): sys.exit(1)
+open(out,'w').write(r.stdout)
+'''
 # The real ps and stat, logging their argv (one line per call) to
 # $FAKE_FORK_LOG. ps's process-table listing (the nested_agent walk) can
 # relabel comms: $FAKE_PS_COMM = "pid:comm,pid:comm".
@@ -165,6 +178,7 @@ class IndicatorIntegrationTests(unittest.TestCase):
         self.script = self.root / "agent-tab-indicator.sh"
         shutil.copyfile(SOURCE, self.script)
         for name, source in [("tmux", FAKE_TMUX), ("codex-terminal-owner", FAKE_OWNER), ("copilot", FAKE_COPILOT),
+                             ("ai-exec", FAKE_AI_EXEC),
                              ("ps", FAKE_PS), ("stat", FAKE_STAT)]:
             path = self.bin / name
             path.write_text(source)
@@ -180,7 +194,8 @@ class IndicatorIntegrationTests(unittest.TestCase):
         # CODEX_*: a run from inside a codex tool shell must not read as one
         # (A FOREIGN AGENT'S TOOL SHELL); the tests that want it set it.
         for key in ("AGENT_TAB_SOCKET", "AGENT_TAB_OWNER_SESSION", "AGENT_TAB_OWNER_TOKEN", "AGENT_TAB_OWNER_BINDING",
-                    "AGENT_TAB_OWNER_RECORD", "AGENT_TAB_TITLE_BUDGET", "CODEX_THREAD_ID", "CODEX_SANDBOX"):
+                    "AGENT_TAB_OWNER_RECORD", "AGENT_TAB_TITLE_BUDGET", "CODEX_THREAD_ID", "CODEX_SANDBOX",
+                    "GROK_HOOK_EVENT"):
             self.env.pop(key, None)
         self.bind("aaaa")
 

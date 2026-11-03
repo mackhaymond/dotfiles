@@ -1604,6 +1604,50 @@ fn the_panel_replaces_the_status_line() {
     assert!(!t.iter().any(|l| l.contains("⏵ next") || l.contains("≡")), "{t:#?}");
 }
 
+/// The bar a client row with these usage options builds (the account
+/// `mack`, a session at 13%, a weekly at 60%, Fable at 2%), with
+/// `@codex_session_limit` = `limit`.
+fn session_limit_bar(limit: &str) -> Bar {
+    let n = crate::tmux::STATUS_FORMATS.len();
+    let at = crate::tmux::STATUS_FORMATS.iter().position(|f| *f == "#{@codex_session_limit}").expect("the option");
+    let mut st = vec![""; n];
+    for (i, v) in [(0, "root"), (4, "13% (-38%)"), (5, "green"), (6, "60% (+17%)"), (7, "red"), (8, "F:"), (9, "2%"),
+        (10, "green"), (11, "mack"), (at, limit)] {
+        st[i] = v;
+    }
+    let client = [vec!["", crate::tmux::CLIENT_TAG, CLIENT, "@2", "main", "on", "", "", "4242"], st].concat().join("\x1f");
+    Bar::build(&Snapshot::parse(&[row("main", 1, "@2", &[]), client].join("\n")), Some(CLIENT))
+}
+
+/// A weekly-only account (`@codex_session_limit` 0) has no session window:
+/// the panel draws W and F only, the account label on W, in the meters and
+/// in the one-line usage alike. With a session limit (1) or unknown (""),
+/// the three meters as ever, the label on S.
+#[test]
+fn a_weekly_only_account_drops_the_session_meter() {
+    let v = lettered(quiet());
+    // Weekly-only: two meters, the panel a row shorter.
+    let f = layout(&v, 34, 40, &with_bar(session_limit_bar("0")));
+    let t = texts(&f);
+    assert_eq!((f.card.clone(), f.status.clone()), (0..4, 1..3), "{t:#?}");
+    assert!(t[1].starts_with("  mack W ━") && t[1].contains(" 60%  +17% "), "{:?}", t[1]);
+    assert!(t[2].starts_with("  F ╸━") && t[2].contains("  2% "), "{:?}", t[2]);
+    assert!(!t.iter().any(|l| l.contains(" S ") || l.contains("13%")), "{t:#?}");
+    let one = texts(&layout(&v, 34, 20, &with_bar(session_limit_bar("0"))));
+    assert!(one.iter().any(|l| l.contains(" mack W 60%  F 2%")) && !one.iter().any(|l| l.contains("13%")), "{one:#?}");
+    // A session limit, or not known: three meters, the label on S.
+    for limit in ["1", ""] {
+        let f = layout(&v, 34, 40, &with_bar(session_limit_bar(limit)));
+        let t = texts(&f);
+        assert_eq!((f.card.clone(), f.status.clone()), (0..5, 1..4), "{limit:?} {t:#?}");
+        assert!(t[1].starts_with("  mack S ━") && t[1].contains(" 13%  −38% "), "{limit:?} {:?}", t[1]);
+        assert!(t[2].starts_with("  W ━") && t[2].contains(" 60%  +17% "), "{limit:?} {:?}", t[2]);
+        assert!(t[3].starts_with("  F ╸━") && t[3].contains("  2% "), "{limit:?} {:?}", t[3]);
+        let one = texts(&layout(&v, 34, 20, &with_bar(session_limit_bar(limit))));
+        assert!(one.iter().any(|l| l.contains(" mack S 13%  W 60%  F 2%")), "{limit:?} {one:#?}");
+    }
+}
+
 /// Shells are rows of their SPACE, after its agents: one row each, a
 /// TERMINAL LINE on its sunken strip (`term`, one colour for the row), the
 /// key-cap exactly an agent's quiet cap (as over `tile`), a green bold `❯`,

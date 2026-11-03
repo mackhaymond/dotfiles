@@ -18,7 +18,9 @@
 //!   (`<sid>/subagents/*.jsonl`) add their edits (Mack's agents delegate
 //!   most edits). Codex: `@agent_rollout`, else the rollout named
 //!   `rollout-*-<@agent_session_id>.jsonl` under `~/.codex/sessions` (its
-//!   spawned agents' rollouts are not followed). OpenCode: none.
+//!   spawned agents' rollouts are not followed). OpenCode, Grok: none (a
+//!   Grok's `transcript_path` is its own `updates.jsonl`, never a Claude
+//!   transcript).
 //! - **Incremental** ([`Transcript::sync`]). Each file is read from where the
 //!   last read stopped (just past its last complete line, so a half-written
 //!   last line is read again whole next time); the file's (inode, len,
@@ -1131,14 +1133,19 @@ impl Engine {
     }
 
     /// Every agent window's insight (window id → it): windows with an agent
-    /// state, each id once; one without a transcript found (an OpenCode
-    /// agent, a Claude session not yet written) has none.
+    /// state, each id once; one without a transcript found (an OpenCode or
+    /// Grok agent, a Claude session not yet written) has none.
     pub fn update(&mut self, snap: &Snapshot, now: f64) -> BTreeMap<String, Insight> {
         let mut ids = HashSet::new();
-        let agents: Vec<&Window> =
-            snap.windows.iter().filter(|w| !w.state.is_empty() && w.kind != "opencode" && ids.insert(w.id.as_str())).collect();
+        let agents: Vec<&Window> = snap
+            .windows
+            .iter()
+            .filter(|w| !w.state.is_empty() && !matches!(w.kind.as_str(), "opencode" | "grok") && ids.insert(w.id.as_str()))
+            .collect();
         let sids = if agents.iter().any(|w| w.kind != "codex") {
-            pins::sessions(snap, &self.sessions_dir, &*self.procs).now
+            // (No Grok pass: its windows are skipped above, so its map and
+            // process walk would be thrown away every refresh.)
+            pins::sessions_with(snap, &self.sessions_dir, None, &*self.procs).now
         } else {
             HashMap::new()
         };

@@ -1,7 +1,8 @@
 # Agent tab indicator
 
-Each tmux tab (window) reflects the state of the AI agent (Claude Code or
-Codex CLI) running inside it, rendered through the Catppuccin status bar:
+Each tmux tab (window) reflects the state of the AI agent (Claude Code,
+Codex CLI, OpenCode or Grok Build) running inside it, rendered through the
+Catppuccin status bar:
 
 For Codex 0.160 and newer shared-server launches, see
 [Codex terminal ownership](codex-terminal-ownership.md). Hooks use a verified
@@ -70,7 +71,7 @@ Two per-window tmux user options are the single source of truth:
 - `@agent_workflow` — `1` while a background Claude Workflow is in flight (else unset); set by the watcher, orthogonal to `@agent_state`
 - `@agent_cua` — `1` while the agent is driving an app through cua-driver (lingers up to `CUA_LIVE`, 60 s); set by the watcher
 - `@agent_rollout` — codex only: the thread's rollout path, stashed by the indicator so the watcher can tell a live turn from an interrupted one
-- `@agent_kind` — `claude | codex | opencode`: whose hooks drive the window. Written by any indicator hook that writes state or detail (in the same command list), unset with the state by `clear_state` and the watcher GC. Never written by the focus hook or a no-op heartbeat. Before any hook has fired (Codex's first hook waits for the first prompt), the watcher seeds it from the agent process's own comm; it never overwrites a kind that is already set (see the watcher section).
+- `@agent_kind` — `claude | codex | opencode | grok`: whose hooks drive the window. Written by any indicator hook that writes state or detail (in the same command list), unset with the state by `clear_state` and the watcher GC. Never written by the focus hook or a no-op heartbeat. Before any hook has fired (Codex's first hook waits for the first prompt), the watcher seeds it from the agent process's own comm; it never overwrites a kind that is already set (see the watcher section).
 - `@agent_ask_from` — who a `needs-input` is waiting for: the `PermissionRequest` payload's `agent_id` (a subagent's gate) or `main`. Written by `needs-approval` for a `PermissionRequest` (never its `Notification` twin) in the same command list as the state; unset in `set_state`'s command list by any write that *leaves* `needs-input`, by `clear_state`, and by the watcher's viewed discharge and GC. Read by the heartbeat and by `Stop` (see **Asker gate**). Unset while `needs-input` (a gate raised by the `Notification` alone, a window that went yellow before 2026-10-21, a quiet restore) means *no asker*: the old rule, any tool call re-arms.
 - `@agent_held_detail` — `"<kind>\t<text>"`: the detail a main-agent `Stop` would have written while a subagent's gate held the window at `needs-input`; written back by the heartbeat (or `subagent-stop`) that ends that gate. Unset by the next prompt, Stop, failure, SessionStart, `clear_state` and the watcher GC (see **Asker gate**).
 - `@agent_ask_bg`, `@agent_ask_seen`, `@agent_turn_start` — **Asks while work is out** (2026-10-22). A `Stop` held `running` by background work (agent-bg-pending) asks cua-notch's `~/.local/bin/agent-turn-asks` whether the turn ended asking Mack, synchronously and ONLY for the agent's own marker: `--marker-only --since @agent_turn_start`, SIGTERMed at 300 ms. **Explicit only** (2026-10-26, Mack's call): to be shown as needing him while its work is still out, the agent must run `agent-needs-you "<what>"` right before it ends its turn. There is no model guess any more: the detached full run (agent-turn-asks' copilot model backstop, which judged the last message and raised `needs-input` far too often) is gone, with its `ask-bg` worker, the `@agent_ask_line` stage and `AGENT_TAB_ASK_BG_TIMEOUT`. No marker = the Stop stays `running` and nothing ask-related is written. A marker makes even an agent-started turn loud (as `notify_user` does); a subagent's standing gate or a pause skips all of it. A yes **raises**: `@agent_state needs-input`, `@agent_detail_kind ask`, `@agent_detail` the line (DETAIL_JQ-sanitized), `@agent_ask_from main` (only the main agent's own tool call re-arms it, never a background subagent's), `@agent_ask_bg 1` — in `set_state`'s one command list. Not raised, and nothing ask-related written, when the line equals `@agent_ask_seen` (both sides through the same sanitizer), or while Mack is looking (then the Stop stays `running`, stamped seen, and the line becomes `@agent_ask_seen`). A **look** (`clear-current`, the watcher's viewed-discharge, agent-ui's answer discharge, which is `clear-current`) at an `@agent_ask_bg` window (any non-empty value, `1` or a counted `1 N`) copies `@agent_detail` into `@agent_ask_seen` (only while `@agent_detail_kind` is `ask`) and, while `@agent_workflow` says the work is still out, writes in ONE command list `@agent_seen_at E`, `@agent_state running`, `@agent_since "E running"`, unsets `@agent_detail_kind`, `@agent_ask_bg` and `@agent_ask_from` (`@agent_detail` stays); with nothing out, the ordinary idle + `@agent_pending` discharge. Only a later `Stop` raises again. `@agent_ask_bg` is unset by every write that leaves `needs-input` (`set_state`, `clear_state`, the watcher's discharges, codex turn ends, paused, restores), by a permission gate that lands on it (the gate replaces the ask; a `Notification` twin there writes `perm` and drops the `main` asker), and by the GC; agent-pause.py never counts a `needs-input` window as working, gear or not; the watcher asks agent-bg-pending for a raised ask too, so its gear (`@agent_workflow`) stays true for a background task. `@agent_turn_start` ("<epoch>") is stamped by every prompt that is not a harness wake-up (TURN_JQ's `sys`); `@agent_ask_seen` is unset by Mack's own prompt (not a wake-up, not a verified peer message), a non-compact `SessionStart`, `clear_state` and the GC. agent-ui files such a window under NEEDS YOU (`needs-input` beats in-flight) as `◉ asks · ⚙` (`⚙ N` once a writer puts the count in `@agent_ask_bg`'s second word).
@@ -83,7 +84,7 @@ Two per-window tmux user options are the single source of truth:
   | `perm` | `PermissionRequest` (and `Notification`/`permission_prompt`) | tool name + its most identifying input: `command`, `file_path` (cwd-relative, else `~/…`), `url` (scheme/`www.` stripped), `pattern`, `path`, `query`, `description`… — e.g. `Bash git push origin main`, `Edit scripts/foo.py`, `WebFetch example.com` |
   | `ask` | `PermissionRequest` with `tool_name=AskUserQuestion` | the first question's text |
   | `fail` | `StopFailure` | `<error>: <error_details>` (either half), else `turn failed` |
-  | `limit` | `StopFailure` with `error` `rate_limit`; the watcher's Codex `usage_limit_exceeded` | `weekly limit · resets Tue 1:00 AM`, `session limit · resets 3:30 PM`, `Codex limit · resets Oct 31 11:10 PM`, `Fable limit · /model to switch` (see §7) |
+  | `limit` | `StopFailure` with `error` `rate_limit` (Grok: only a usage limit, not capacity); the watcher's Codex `usage_limit_exceeded` | `weekly limit · resets Tue 1:00 AM`, `session limit · resets 3:30 PM`, `Codex limit · resets Oct 31 11:10 PM`, `Fable limit · /model to switch`, `Grok limit · resets over 24h` (see §7) |
   | `done` | `Stop` | first non-empty line of `last_assistant_message` (Claude, verified 2.1.294; Codex sends the same field); Claude without the field falls back to the last assistant text in the transcript's last 64 KB; else `turn finished` |
 
   Both are written by `set_state` in the **same tmux command list** as `@agent_state`/`@agent_since`, even when the state itself is unchanged, so a reader never pairs a new state with an older event's detail. Unset by `SessionStart` (except `source=compact`, which fires mid-turn), by `clear_state`, and by the watcher GC; the watcher's codex turn-end reconcile also writes them (`done`/`turn finished`, or unset after an abort; see the watcher section); never touched by the heartbeat (it stays fork-free) or the focus discharge — except the heartbeat that ends a subagent's gate a main-agent `Stop` was held on, which writes that Stop's stashed detail (`@agent_held_detail`, see **Asker gate**). A `Notification` names no tool, so it never overwrites a `perm`/`ask` its `PermissionRequest` twin already wrote (one extra `show-options`, only on that event); landing first, it stands in as `perm <Tool>` parsed from "…permission to use <Tool>". The detail of a `Stop` held `running` by background work is still `done`. Text is untrusted and sanitized in the same jq call that extracts it (one fork per event): one line, no `#` `"` `%`, no control characters (C0, DEL, C1, U+2028/9) and no invisible/bidi controls (U+200B–200F, U+202A–202E, U+2060–2069, U+FEFF, U+061C), whitespace collapsed, leading/trailing `;`/space dropped (a tmux argv element ending in `;` terminates the command list), ≤ 80 code points with a trailing `…` when cut. Every value is sliced (4000, then 1000 code points) *before* any per-character work: unbounded, the sanitizer was quadratic (a 152 KB heredoc took 16 s), which blocks a permission dialog or prompt submission and gets a Codex hook killed at its 10 s timeout, state write included; bounded, a 1 MB payload costs ~20 ms of jq, and a jq failure yields the bare kind, never a lost state write. The detail rides in globals (`dkind`/`dtext`, consumed by the next `set_state`), so every call site stays `set_state "$win" <state>` — cua-notch's `dev/check-invariants` pins `        set_state "$win" failed` verbatim. Values reach tmux only as `set-option` argv: stored verbatim, and `list-windows -F '#{@agent_detail}'` expands them without re-parsing formats inside (checked on a scratch tmux 3.7c server).
@@ -283,6 +284,129 @@ so everything downstream (detail kinds, slots, the condenser) is shared:
 - Overrides for tests: `TMUX_AGENT_INDICATOR` (the script the plugin runs
   with bash), `TMUX_AGENT_HEARTBEAT_MS` (the throttle).
 
+**Grok Build** (`~/.grok/hooks/tmux-agent.json`, chezmoi source
+`dot_grok/hooks/tmux-agent.json`; Grok never writes that folder, unlike
+`~/.grok/config.toml`, which it rewrites itself). Every entry calls
+`agent-tab-indicator.sh <mode> grok` with an explicit `timeout` (10 s, 5 s for
+the heartbeat, `settle`, `clear` and the session tracker):
+
+| Grok event | Mode |
+|---|---|
+| `SessionStart` | `grok-session-track.sh start` (the resurrect record, below), then `idle`; Grok's sources `new` (a start, `/new`) and `load` (`-c`, `-r`, `/resume`) are read as `startup` and `resume` |
+| `UserPromptSubmit` | `running` |
+| `PostToolUse`, `PostToolUseFailure` | `heartbeat` |
+| `Notification` matcher `permission_prompt` | `needs-approval` → `needs-input` (Grok has no `PermissionRequest` event: this is its only gate signal) |
+| `Notification` matcher `idle_prompt` | `settle` (below) |
+| `Stop` | `done`, only for `reason` `end_turn` (or none) |
+| `StopFailure` | `failed`, or the rate-limited mark (§7) |
+| `StopCancelled` | `interrupt` |
+| `SessionEnd` | `grok-session-track.sh end`, then `clear` |
+
+- **Where it runs.** Grok's default (shell-route) runner starts each hook as a
+  child of the TUI, which inherits `TMUX` and `TMUX_PANE`, so the pane is
+  addressed exactly as a Claude hook's. Leader mode (`--leader`, `[cli]
+  use_leader=true`) runs hooks in a shared leader with the wrong `TMUX_PANE`,
+  Codex's daemon problem: unsupported. The foreign-tool-shell guards cover
+  grok too: a hook with `CODEX_THREAD_ID`/`CODEX_SANDBOX` exits, and
+  `nested_agent` knows Grok's comm (agent → tool shell → grok is another
+  agent's run, whose tab `TMUX_PANE` names).
+- **Grok would also run Claude's hooks.** Its `[compat.claude] hooks` is on
+  by default and runs every `~/.claude/settings.json` hook: those call
+  `<mode> claude` with a Grok payload (a double paint, labelled claude),
+  `agent-gate.sh` blocks Grok over Claude's weekly reserve, and the resurrect
+  plugin files the session as a `claude-<pid>.json`. `dot_zshenv` exports
+  `GROK_CLAUDE_HOOKS_ENABLED=0`. The safety net if compat is ever back on
+  (a grok started from an environment without that export): Grok's runner
+  sets `GROK_HOOK_EVENT` in every hook's environment and Claude never does,
+  so a `<mode> claude` call that has it exits 0 at once. `GROK_CLAUDE_HOOKS_ENABLED=0
+  grok inspect` in a trusted folder lists only the tmux-agent hooks.
+- **The payload** carries Claude's snake keys as aliases of Grok's camelCase
+  ones, so the script reads it as Claude-shaped, with these exceptions
+  (normalized right after stdin is read, the `GROK` block):
+  - the turn id is `promptId` (no snake alias): `TURN_JQ` and `stop_fields`
+    read `.prompt_id // .turn_id // .promptId`;
+  - a subagent is named by `subagentType`, never `agent_id`. Its events are
+    inert for the main tab like Claude's `agent_id` ones, except
+    `needs-approval`, whose asker (`@agent_ask_from`) is the
+    `subagentType`. Grok's key order is not Claude's, so the heartbeat's
+    8 KB cut proves nothing: on a grok window that is `needs-input` with an
+    asker, or `failed`, the heartbeat parses the whole payload
+    (`GROK_SUB_JQ`, in `hb_who`), on those two rare states only (see
+    **Asker gate**);
+  - Grok runs one more `Stop` when the session closes, `reason`
+    `channel_closed` or `shutdown`: only `end_turn` (or no reason) is a
+    finish, any other reason is inert;
+  - `transcript_path` is Grok's own `updates.jsonl` (ACP updates), never a
+    Claude transcript. No Claude transcript reader is given it: `stop_fields`
+    leaves it empty for grok (no rate-limit tail, no `split_classify`), the
+    background check reads the Stop's own `backgroundTasks` (below), and the
+    held Stop's ask check (`agent-needs-you`, **Asks while work is out**) is
+    skipped for grok;
+  - `StopCancelled` and `StopFailure` are reported OFF the turn loop, so one
+    can land after the NEXT prompt: a cancel or failure whose turn id is not
+    the running turn's (`@agent_turn_origin`) while the window is `running`
+    is that older turn's, and inert;
+  - a `StopCancelled` whose `cancelledBy` is not `user` (`max_turns`,
+    `no_progress`, `hook_stopped`) is a turn that ended on its own, not one
+    Mack stopped: it finishes as a `Stop` does (`done`, or idle while he is
+    looking), never quietly idle. Mack's own cancel (Ctrl+C, a declined
+    permission) is `interrupt`: idle, label kept, as for Codex and OpenCode;
+  - the failure detail reads `error_details // errorDetails`.
+- **Background work.** A Grok `Stop` lists what is still out in
+  `backgroundTasks` (or `background_tasks`); a non-empty one holds the tab
+  `running` exactly as agent-bg-pending's verdict does for Claude
+  (`@agent_bg_owner`, the watcher's release). `sessionCrons` never hold a tab.
+- **`settle`** (Grok's `idle_prompt`: the TUI sits at its prompt). The
+  backstop for a turn end no `Stop` reported. It moves ONLY a `running`
+  window, to idle (`clear_pending` too; label and detail stay): `done`,
+  `needs-input`, `failed` and `paused` all say more than this event can, a
+  window with `@agent_bg_owner` is a Stop held for background work, and a
+  turn that started under `SETTLE_MIN` (50 s, by `@agent_since`) is left
+  alone, because the Notification is queued and one from the idle spell
+  BEFORE a prompt can land after that prompt's `running`. One
+  `display-message`. Claude's `idle_prompt` stays unwired (see the note
+  under the Claude table).
+- **Title**: Grok's own `summary.json` (see **Summary sources** below).
+- **The resurrect record.** `scripts/grok-session-track.sh` is the grok twin
+  of tmux-assistant-resurrect's `claude-session-track.sh`: on `SessionStart`
+  it (re)writes `$STATE_DIR/grok-<pid>.json` (`$TMUX_ASSISTANT_RESURRECT_DIR`,
+  else `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect`), the
+  payload plus `tool: "grok"`, `ppid`, `timestamp` and `env.tmux_pane` (and
+  the `@assistant-resurrect-capture-env` variables), the same shape as a
+  `claude-<pid>.json`. The pid is the grok TUI, found walking up at most three
+  parents to a grok comm; anything else (a hook run by hand, Claude's compat
+  runner) writes nothing. `/new` and `/resume` start a new session id in the
+  same process and the record follows it; `SessionEnd` removes it only when
+  the session it ends is the recorded one (renamed aside first, put back with
+  `mv -n`, so a late end of the old session never deletes the new one's
+  record). Subagent sessions are ignored. Readers: the watcher (below),
+  assistant-save.sh, closed-tabs.sh, tmux-mcp, agent-pause.py and
+  agent-ui's pins. Only a TUI fires `SessionStart`, which is why a record
+  marks a pid as a TUI whatever its argv looks like.
+- **Resurrect and ⌘Z.** tmux-assistant-resurrect knows claude, codex and
+  opencode only, so the grok rows are local: assistant-save.sh adds one per
+  pane running a Grok TUI (its session id from `~/.grok/active_sessions.json`
+  by pid, else the record, else a UUID given to `-r`/`-s`; its cwd the
+  session's own), assistant-restore.sh resumes it as `~/.grok/bin/grok
+  [options] -r <sid>` (`command grok` without that link: the installer puts
+  nothing on PATH), dropping the flags that would fight `-r` (`-r`/`-w` with
+  their optional value, `-c`, `-s`, `--cwd`, `--worktree-ref`/`--ref`, a
+  relative `--add-dir`, `--fork-session`, `--restore-code`), and
+  closed-tabs.sh reopens a grok tab the same way with `@agent_birth grok`.
+  **assistant-restore.sh restores into the default server only** (2026-10-08
+  and again 2026-11-02: a subagent's test server started without `-f
+  /dev/null`, continuum restored the real snapshot into it, and every live
+  Claude session was resumed a second time there): `#{socket_path}`,
+  resolved, must be `/private/tmp/tmux-$UID/default` (deliberately not under `$TMUX_TMPDIR`,
+  where agents' private servers live), else it logs `not the default server:
+  …, restore skipped` and exits 0; `RESURRECT_SAVE_ALLOW_SOCKET=<that exact
+  socket>` opts a test harness in (resurrect-save.sh's `socket_ok` rule).
+
+Tests: `tests/test_grok_indicator.py` (payloads, guards, `settle`, the limit
+split on a private server), `tests/test_grok_watcher.py` (the TUI rule,
+`grok_status`), `tests/test_grok_resurrect.py` (the record, save rows,
+restore lines, the socket guard, closed-tabs).
+
 Subagent-context events (payload has `agent_id`) are ignored so a
 subagent's Stop can't flip the main agent's tab — except its
 `PermissionRequest`, which blocks on the user like the main agent's own and
@@ -369,7 +493,9 @@ only *acknowledges* rows, so this fix does not reach the notch.) Now:
   `@agent_pending` (a prompt already *seen*, so no longer "asks" on any
   surface) is consumed by the first heartbeat, whoever's, as before. Codex
   drops subagent payloads up front and OpenCode sends no `agent_id`, so both
-  are always `main` and behave exactly as before. One asker is tracked: if a
+  are always `main` and behave exactly as before. Grok's asker is its
+  `subagentType`, read from the whole payload (see **Grok Build** above).
+  One asker is tracked: if a
   second gate opens while one stands, the later one owns the re-arm.
 
 Codex background threads
@@ -390,7 +516,11 @@ payload), else `session_title`, else the submitted prompt; Codex — `threads.na
 `session_index.jsonl`), else `threads.title` (the first user message,
 treated as interim), else the prompt; OpenCode — the payload's
 `session_title` unless it is OpenCode's placeholder `New session - <ISO date>`
-(`Child session - …` for subagents), else the prompt (interim).
+(`Child session - …` for subagents), else the prompt (interim); Grok —
+`summary.json` in the session directory (the directory of the payload's
+`transcript_path`; `updates.jsonl` itself is never read): its
+`generated_title`, a `custom` title when `title_is_manual` (a `/rename`),
+else the prompt (interim). Two jq, no tail.
 Sanitized (no `#`/`"`/`%`, one line, ≤60 chars). `extract_summary` tags its
 output `final\t<title>` (the agent's own conversation title),
 `interim\t<title>` (prompt-grade text: the prompt standing in until that title
@@ -658,13 +788,14 @@ the PID file if it still owns it, and signal traps route through `exit` so
 `kill` actually stops the daemon — every `prefix r` reload converges back to
 one watcher (the naive check-then-write version leaked a daemon per reload). It
 matches agent processes to windows by TTY (`ps -o comm` basename
-`claude`/`codex`, plus the bare `N.N.N` pattern — Claude's binary is
+`claude`/`codex`/`opencode`, a grok one (`is_grok_comm`, see "Grok" below),
+plus the bare `N.N.N` pattern — Claude's binary is
 version-named and `#{pane_current_command}` reports that, so formats can't
 detect presence). Reconciles:
 
 - agent present, no state → seed `idle`
-- agent present, no `@agent_kind` → the agent's comm (`codex`, else `claude`;
-  see "Kind at launch" below)
+- agent present, no `@agent_kind` → the agent's comm (`codex`, `opencode`,
+  `grok`, else `claude`; see "Kind at launch" below)
 - state `running` but the session says otherwise → back to `idle` (see below)
 - codex `needs-input`/`running` whose rollout ended the turn after the state
   was stamped → `idle` or `done` (see "Codex turn ends" below)
@@ -801,11 +932,74 @@ none appears anywhere on disk, so none is inferred.
 for the first prompt, so a freshly started codex was seeded `idle` with no
 `@agent_kind` and showed no ⬢ in the sidebar or menu. Discovery already runs
 one single-pid `ps` per new agent pid; it now also records that pid's kind
-(comm `codex`, else `claude`). A live agent window with a state and no kind
+(comm `codex`, `opencode`, a grok comm, else `claude`). A live agent window with a state and no kind
 gets it, riding in the `@agent_since` stamp's tmux call (the idle seed always
 stamps, so a fresh window costs no extra fork; a held state without a kind
 pays one call, once). A kind already set is never overwritten, and none is
 written without a live agent, so it cannot race the GC that unsets it.
+
+**Grok** (2026-11-02). Presence, kind and turn state, as OpenCode has them:
+
+- **Identity** (`is_grok_comm`, builtin regex
+  `^grok(-(macos|linux|windows)-[a-z0-9_]+)?$`): comm basename `grok` (the
+  `~/.grok/bin/grok` symlink) or the real binary's own name when it is
+  launched by its path, `grok-macos-aarch64` (ps/pgrep may hand back its
+  16-char p_comm, `grok-macos-aarch`, which the same shape covers). The
+  platform word is spelled out so `grok-mcp-server` is not a grok. Never
+  `agent`: another symlink to the same binary, far too generic a name.
+  `AGENT_PAT` (the tick's pgrep) carries the same alternative.
+- **Only the TUI is an agent** (`grok_tui_args`, on one more single-pid `ps
+  -ww -o args=` for a NEW grok pid, as for opencode). Firmly not (cached like
+  any verdict): `-p`/`--single`/`--prompt-file`/`--prompt-json` (a headless
+  turn) and `-h`/`--help`/`-v`/`--version` (also `--help=…`/`--version=…`, and
+  any single-dash word starting `-p`, `-h` or `-v`: clap takes a glued value,
+  `-phi`, `-p=hi`). Probably not: the first bare word is a non-TUI
+  subcommand (`agent leader worker clone completions doctor du disk-usage
+  export help inspect login logout mcp memory models plugin sessions setup
+  trace update usage version v worktree wrap`). Options that take a value
+  skip it; `-r`/`--resume` and `-w`/`--worktree` take an OPTIONAL one (the
+  next word, unless it is an option or a subcommand: `grok -r sessions` is
+  the sessions command); `--` only ends the scan (a subcommand word before
+  it still decides; words after it are prompt text). Everything else
+  (`grok`, `grok "fix x"`, `-c`, `-r ID`, `dashboard`) is the TUI.
+- **"Probably"**, because `ps` joins argv with spaces and loses the quoting:
+  `grok "help me fix X"` reads `grok help me fix X`. So a subcommand-word no
+  holds only while the pid has no SESSION RECORD (`grok_has_record`: its
+  `grok-<pid>.json` where grok-session-track.sh writes it,
+  `$TMUX_ASSISTANT_RESURRECT_DIR`, else
+  `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect`; else
+  `~/.grok/active_sessions.json` listing the pid; the record first, since that
+  map has been seen `[]` while a TUI ran). Such a no is remembered in
+  `GK_SOFT` and asked again every tick with a `[ -f ]`, no fork, so a record
+  written later makes it an agent without another `ps`. A headless flag stays
+  a no whatever a record says. The same rule is ported to agent-pause.py,
+  agent-ui (`actions.rs`, on the real argv), assistant-save.sh and
+  closed-tabs.sh.
+- **Ground truth** (`grok_status`, Claude's session-file question answered
+  from Grok's own records). `active_sessions.json` (`[{session_id, pid,
+  pid_start, cwd, opened_at}]`; `/new` and `/resume` rewrite it) maps the
+  pid to its session, re-parsed (builtin) only when it or its directory
+  moved; the session's `~/.grok/sessions/<cwd, URL-encoded>/<sid>/events.jsonl`
+  is found once per id by a glob. Its LAST LINE decides (`GROK_LAST_BYTES`,
+  4096): `turn_ended` (outcome `completed`, `error` or `cancelled`, so an
+  interrupt that fired no hook still ends here) is idle; `turn_started` or
+  any in-turn event (`phase_changed`, `loop_started`, `first_token`,
+  `tool_*`, `permission_*`, `mcp_tool_call_*`) is busy; the session-start
+  `mcp_*` events are unknown. Anything else falls back to one awk over the
+  last 64 KB (`GROK_SCAN_BYTES`) for the last `turn_started`/`turn_ended`;
+  none is unknown. Nothing is written between a `turn_ended` and the next
+  `turn_started` (checked on a live session). `GROK_HOME` (default
+  `~/.grok`) moves the root (tests).
+- **Used** where OpenCode's status file is: the stuck-`running` reconcile
+  (only `running`, state only, three ticks; a grok pid never falls through
+  to the Claude session file or a stale rollout; `needs-input` is never
+  cleared), and the expiring `@agent_pending` of an answered prompt, which
+  becomes `running` while the record says busy. Asked only for a grok window
+  that is `running` or whose pending stamp just expired; cached per window
+  and read again only when the file moved (CHANGE STAMPS). While a turn
+  runs the file grows by ~17 KB a minute, so a running grok tab pays one
+  small `tail` a tick, as a running codex tab does; a stuck one pays
+  nothing. Entries no window asked for are dropped at the tick's end.
 
 **Agent slots** (2026-10-10). The number labels in agent-ui's Option-W menu
 and sidebar are sticky: they are taken lowest first, and while an agent stays
@@ -1195,8 +1389,9 @@ so stale summaries simply vanish.
 
 ### 4. Tick cost (2026-10-07)
 
-A tick is one `LC_ALL=C pgrep -ax 'claude|codex|N.N.N'` (a new pid gets one
-single-pid `ps` for its tty, cached per pid), one `tmux list-panes -a` read
+A tick is one `LC_ALL=C pgrep -ax "$AGENT_PAT"` (claude, codex, opencode,
+the grok forms, `N.N.N`; a new pid gets one single-pid `ps` for its tty,
+cached per pid, and an opencode or grok pid one more for its argv), one `tmux list-panes -a` read
 (US-separated, summary last), then the per-window loop. Windows with no
 agent pane and no `@agent_*` option take a fast path with no writes. The
 subagent verdict is reused until its inputs change, as judged by per-tick
@@ -1542,9 +1737,9 @@ docs/agent-pause.md); this page covers the tab side.
 
 | Option | Value |
 |---|---|
-| `@agent_limit` | `"<resets_at> <type> <since>"`. `resets_at` is epoch seconds, `0` when unknown (a model limit). `type` is `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `overage`, `model` or `codex` (`seven_day_overage_included` and other `seven_day_*` are written `seven_day`; an unknown type is guessed from how far out the reset is). `since` is when it was marked, the same epoch as the mark's `@agent_paused`. Its presence means rate-limited. |
+| `@agent_limit` | `"<resets_at> <type> <since>"`. `resets_at` is epoch seconds, `0` when unknown (a model limit). `type` is `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `overage`, `model`, `codex` or `grok` (`seven_day_overage_included` and other `seven_day_*` are written `seven_day`; an unknown type is guessed, see **Weekly-only plans** below). `since` is when it was marked, the same epoch as the mark's `@agent_paused`. Its presence means rate-limited. |
 | `@agent_limit_lifted` | `<epoch>`: the limit has passed but the agent waits for Mack (auto-resume off or deferred); written by limit-tick. |
-| `@agent_detail_kind` `limit` + `@agent_detail` | `weekly limit · resets Tue 1:00 AM`; `session limit · resets 3:30 PM` (the same day); `Codex limit · resets Oct 31 11:10 PM` (a week or more out); `Opus weekly limit` / `Sonnet weekly limit` / `overage limit`; for a model limit, the agent's own words: `Fable limit · /model to switch` from "You've reached your Fable limit…", else the message itself (cleaned like any detail), else `usage limit`. Times follow the ONE date rule every surface shares (agent-pause.py `fmt_local`, agent-ui `text::when`), by calendar days in local time: the same day `5:31 PM`, one to six days ahead `Tue 5:31 PM`, anything else (a week or more on, or past) `Nov 2 5:31 PM`; C-locale names. |
+| `@agent_detail_kind` `limit` + `@agent_detail` | `weekly limit · resets Tue 1:00 AM`; `session limit · resets 3:30 PM` (the same day); `Codex limit · resets Oct 31 11:10 PM` (a week or more out); `Opus weekly limit` / `Sonnet weekly limit` / `overage limit`; for a model limit, the agent's own words: `Fable limit · /model to switch` from "You've reached your Fable limit…", else the message itself (cleaned like any detail), else `usage limit`; a Grok usage limit is always `Grok limit · resets over 24h`. Times follow the ONE date rule every surface shares (agent-pause.py `fmt_local`, agent-ui `text::when`), by calendar days in local time: the same day `5:31 PM`, one to six days ahead `Tue 5:31 PM`, anything else (a week or more on, or past) `Nov 2 5:31 PM`; C-locale names. |
 | `@agent_turn_result` | `<turn_id> limited <resets_at>`: the cross-surface verdict (no red flare, no notify). |
 | `@agent_limit_due` (global) | the earliest moment any limited agent could resume, or unset; agent-pause.py keeps it, the watcher reads it. |
 | `@agent_limit_autoresume` (global) | `on`/`off`, Mack's setting, read by agent-pause.py. |
@@ -1576,8 +1771,35 @@ then the STATE NOTICE, then `agent-pause.py limit-add <window_id>` through
 nothing; `AGENT_LIMIT_PAUSE_PY` overrides the path). The mark is
 **idempotent**: queued task-notifications each start a turn that hits the
 limit again, and each re-mark writes the same `R` and `T` with a fresh `E`
-(limit-add merges and keeps its attempt count). Every other `StopFailure`
-error is `failed`, exactly as before.
+(limit-add merges and keeps its attempt count). For a Claude agent,
+limit-add then answers Claude's own `/rate-limit-options` dialog, which the
+limit opens over the prompt box (docs/agent-pause.md, "The limit dialog").
+Every other `StopFailure` error is `failed`, exactly as before.
+
+**Weekly-only plans** (2026-11-02). Mack's Claude plan may have no 5-hour
+session window at all: codexbar-usage-status.sh then publishes usage.json
+`session_limit: false` and the global `@codex_session_limit` `"0"` (`"1"`:
+the active account has a session window; `""`: unknown, read as having one).
+`limit_type` used to guess an unknown `rateLimitType` from the reset alone
+(6 h or less: `five_hour`), so a weekly-only account near its weekly reset
+read `session limit`. Now the guess is `five_hour` only when the reset is
+under 5 h away (18000 s) AND `@codex_session_limit` is not `"0"`; anything
+else is `seven_day`. One `show-options`, on that rare path only. A known
+`rateLimitType` is taken as is.
+
+**Grok** sends `StopFailure` `error` `rate_limit` for a usage limit (429)
+AND for a capacity error (503/529), and neither carries a reset time. So
+for grok the `failed` mode reads the text instead of the transcript (no
+Claude transcript exists): `error_details`/`errorDetails`, the error's
+`message`, and the final message (the "Turn failed: …" line; `errorDetails`
+is optional), lowercased. Grok's own usage-limit words (`status 429`,
+`free-usage`, `rolling 24`) decide outright; otherwise a capacity error
+(`503`, `529`, `capacity`, `overload`) is the red `failed`, a bare `429`,
+`usage limit` or `quota` is the limit, and text that says neither is a
+failure too. A limit is the same marking list as Claude's with type `grok`,
+`resets_at` 0 (the free tier resets over a rolling 24 h: never auto-resumed,
+only Mack resumes it) and the detail `Grok limit · resets over 24h`, then
+`limit-add`.
 
 **A prompt while `@agent_limit` is set** (`running` mode):
 
@@ -1668,7 +1890,9 @@ limit-tick` detached, at most once per 20 s, when:
 - `@agent_limit_due` ≤ now;
 - `~/.claude-swap-backup/sequence.json` is newer than its mark
   (`$TMPDIR/agent-limit-seq.$UID.mark`, a builtin `-nt`; rewritten when it
-  fires): cswap switched accounts, which can lift a limit early;
+  fires): cswap switched accounts, which can lift a limit early (agent-pause.py's
+  "Pool-aware resume" also moves `@agent_limit_due` up to the moment another
+  pooled account frees it);
 - the previous tick was more than 30 s ago (the machine slept); remembered
   until it fires.
 
@@ -1734,6 +1958,14 @@ rendered from `tmux.conf.tmpl`).
   established trust hashes should survive; if codex unexpectedly re-prompts
   for chezmoi-guard/NotchBar, re-approving once is safe. Pre-merge backup:
   `~/.codex/hooks.json.bak-agent-tab`.)
+- **Grok tab shows nothing, or reads `claude`** → check the hooks Grok
+  loads: `GROK_CLAUDE_HOOKS_ENABLED=0 grok inspect` in a trusted folder should
+  list the tmux-agent hooks and no `global/settings` ones. A grok started from
+  a shell without that export (dot_zshenv) also runs Claude's hooks; the
+  indicator ignores those (`GROK_HOOK_EVENT`), but agent-gate.sh does not.
+  A grok TUI the watcher does not see (the GC clears its tab within seconds):
+  `ps -ww -o comm=,args= -p <pid>` against the TUI rule in "Grok" above, and
+  whether its `grok-<pid>.json` record exists.
 - **No summary on a fresh Claude session** → no `ai-title` yet; the first
   prompt is used as fallback, the real title appears on later events.
 - **Tabs keep the long raw title (renamer never shortens them)** → the
@@ -1755,4 +1987,5 @@ rendered from `tmux.conf.tmpl`).
   scripts are `executable_*.sh` and the rendering lives in `tmux.conf.tmpl`
   (a chezmoi *template*) — use `chezmoi source-path <deployed-file>` to find
   the source for any of them. (`~/.claude/settings.json` and
-  `~/.codex/hooks.json` are *not* chezmoi-managed.)
+  `~/.codex/hooks.json` are *not* chezmoi-managed; Grok's
+  `~/.grok/hooks/tmux-agent.json` is, as `dot_grok/hooks/tmux-agent.json`.)

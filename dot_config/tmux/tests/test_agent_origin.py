@@ -25,7 +25,8 @@ import unittest
 import uuid
 
 import test_agent_jump_watcher as jw
-from test_agent_state_notice import FAKE_LSAPPINFO, FAKE_TMUX_WRAPPER, write_exe
+# no_condenser_path: why the hook's PATH never holds the real ai-exec.
+from test_agent_state_notice import FAKE_LSAPPINFO, FAKE_TMUX_WRAPPER, no_condenser_path, write_exe
 from test_codex_indicator import FAKE_OWNER
 
 SCRIPTS = Path(os.environ.get(
@@ -68,12 +69,15 @@ class OriginHarness(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.pane, self.win, self.socket = r.stdout.strip().split("|", 2)
         self.env = dict(os.environ, HOME=str(self.home), TMPDIR=str(self.root) + "/",
-                        PATH=str(self.bin) + ":" + os.environ["PATH"],
+                        PATH=no_condenser_path(self.bin),
                         TMUX="%s,1,0" % self.socket, TMUX_PANE=self.pane,
                         AGENT_STATE_NOTICE="", AGENT_TAB_CONDENSE_MODEL="",
                         FAKE_FRONT="", FAKE_ACTIVE_CLIENTS="0")
+        # GROK_HOOK_EVENT: a run from inside a Grok hook must not make every
+        # claude hook here inert (GROK RUNNING CLAUDE'S HOOKS).
         for key in ("AGENT_TAB_SOCKET", "AGENT_TAB_OWNER_SESSION", "AGENT_TAB_OWNER_TOKEN",
-                    "AGENT_TAB_OWNER_BINDING", "AGENT_TAB_OWNER_RECORD", "CODEX_THREAD_ID"):
+                    "AGENT_TAB_OWNER_BINDING", "AGENT_TAB_OWNER_RECORD", "CODEX_THREAD_ID",
+                    "CODEX_SANDBOX", "GROK_HOOK_EVENT"):
             self.env.pop(key, None)
         self.transcript = self.root / "t.jsonl"
         self.transcript.write_text("")

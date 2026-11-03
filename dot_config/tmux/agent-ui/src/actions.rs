@@ -88,22 +88,147 @@ pub fn watcher_problem(age: Option<f64>) -> Option<String> {
 }
 
 /// agent-roster.py `is_agent_comm`: a ps comm whose basename is claude,
-/// codex or opencode, or Claude's version-named binary ("2.1.291").
+/// codex or opencode, Claude's version-named binary ("2.1.291"), or a
+/// [`is_grok_comm`] one.
 pub fn is_agent_comm(comm: &str) -> bool {
     let base = comm.rsplit('/').next().unwrap_or(comm);
-    if matches!(base, "claude" | "codex" | "opencode") {
+    if matches!(base, "claude" | "codex" | "opencode") || is_grok_comm(base) {
         return true;
     }
     let parts: Vec<&str> = base.split('.').collect();
     parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// agent-roster.py `GROK_COMM` (`^grok(-(macos|linux|windows)-[a-z0-9_]+)?$`):
+/// a basename that is the Grok Build CLI, `grok` (the `~/.grok/bin` symlink)
+/// or its real binary (`grok-macos-aarch64`). The os is one of the three, so
+/// `grok-mcp-server` is not it. Never `agent`, the same binary's other, too
+/// generic, name.
+pub fn is_grok_comm(base: &str) -> bool {
+    let Some(rest) = base.strip_prefix("grok") else { return false };
+    if rest.is_empty() {
+        return true;
+    }
+    let Some((os, arch)) = rest.strip_prefix('-').and_then(|r| r.split_once('-')) else { return false };
+    matches!(os, "macos" | "linux" | "windows")
+        && !arch.is_empty()
+        && arch.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// The Grok TUI rule (agent-pause.py `grok_tui_args`, the watcher's own,
+/// ported identically): `argv` (argv[0] first) is the interactive TUI, an
+/// agent, unless it runs a headless turn (`-p`/`--single`/`--prompt-*`),
+/// asks for help or the version, or its first bare word names a non-TUI
+/// subcommand (`grok agent stdio`, `grok sessions`). The [`GROK_VALUE_OPTS`]
+/// take a value; [`GROK_OPTIONAL_VALUE`] take one only when the next word
+/// is not a flag nor a subcommand. Any word starting with `-` (a bare `-`
+/// too) is a flag, never the first word. `grok`, `grok "fix x"`, `grok -c`,
+/// `grok -r ID`, `grok dashboard`: the TUI.
+///
+/// This port reads the REAL argv (`KERN_PROCARGS2`, [`crate::pins::Procs`]),
+/// so a quoted prompt is one word; the bash and Python ports are moving off
+/// splitting `ps -o args` on whitespace to the real argv as well.
+///
+/// Amendment (v2): a subcommand-word "no" is overruled by a session record
+/// ([`grok_tui`]); a headless flag never is.
+pub fn grok_tui_args(argv: &[String]) -> bool {
+    grok_argv_verdict(argv) == GrokArgs::Tui
+}
+
+/// What a Grok argv alone says ([`grok_tui_args`]'s rule, one step finer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokArgs {
+    /// The interactive TUI.
+    Tui,
+    /// A headless turn, help or the version: never an agent.
+    Headless,
+    /// Its first bare word names a non-TUI subcommand: no agent, unless the
+    /// pid has a session record ([`grok_tui`]).
+    Subcommand,
+}
+
+/// The Grok TUI rule with the v2 amendment: [`GrokArgs::Tui`], or a
+/// [`GrokArgs::Subcommand`] verdict whose pid has a session record
+/// (`has_record`: its `grok-<pid>.json` resurrect record, which
+/// grok-session-track.sh writes at SessionStart and no utility subcommand
+/// ever fires, or its row in Grok's `active_sessions.json`). `ps -o args`
+/// loses quoting (`grok "help me"` reads as `grok help me`), so the record
+/// is what tells; a headless flag stays a firm no. `has_record` is only
+/// asked when it matters.
+pub fn grok_tui(argv: &[String], has_record: impl FnOnce() -> bool) -> bool {
+    match grok_argv_verdict(argv) {
+        GrokArgs::Tui => true,
+        GrokArgs::Headless => false,
+        GrokArgs::Subcommand => has_record(),
+    }
+}
+
+/// [`GrokArgs`] for `argv` (argv[0] first). A single-dash word starting
+/// with `-p`, `-h` or `-v` is headless / help / version even with its value
+/// glued on (clap: `-phi`, `-p=hi`, `-hx`). `--` only ends the option scan:
+/// a subcommand word before it still decides (`grok mcp add x -- -y srv`).
+pub fn grok_argv_verdict(argv: &[String]) -> GrokArgs {
+    let (mut i, mut first): (usize, Option<&str>) = (1, None);
+    while i < argv.len() {
+        let w = argv[i].as_str();
+        if w == "--" {
+            break;
+        }
+        if w.starts_with('-') {
+            let glued = w.contains('=');
+            let name = if w.starts_with("--") { w.split('=').next().unwrap_or(w) } else { w };
+            let short_headless = !w.starts_with("--") && ["-p", "-h", "-v"].iter().any(|f| w.starts_with(f));
+            if short_headless || GROK_HEADLESS.contains(&name) {
+                return GrokArgs::Headless;
+            }
+            if GROK_VALUE_OPTS.contains(&name) && !glued {
+                i += 2;
+                continue;
+            }
+            if GROK_OPTIONAL_VALUE.contains(&name)
+                && !glued
+                && argv.get(i + 1).is_some_and(|n| !n.starts_with('-') && !GROK_NOT_TUI.contains(&n.as_str()))
+            {
+                i += 2;
+                continue;
+            }
+        } else if first.is_none() {
+            first = Some(w);
+        }
+        i += 1;
+    }
+    if first.is_some_and(|f| GROK_NOT_TUI.contains(&f)) {
+        GrokArgs::Subcommand
+    } else {
+        GrokArgs::Tui
+    }
+}
+
+/// Grok options that take a value ([`grok_tui_args`]).
+pub const GROK_VALUE_OPTS: [&str; 26] = [
+    "--add-dir", "--agent", "--agents", "--allow", "--cwd", "--debug-file", "--deny", "--disallowed-tools",
+    "--json-schema", "--leader-socket", "-m", "--model", "--max-turns", "--output-format", "--permission-mode",
+    "--reasoning-effort", "--effort", "--rules", "-s", "--session-id", "--sandbox", "--system-prompt-override",
+    "--system-prompt", "--tools", "--worktree-ref", "--ref",
+];
+/// Grok options whose value is optional: `-r [ID]`, `-w [NAME]`.
+pub const GROK_OPTIONAL_VALUE: [&str; 4] = ["-r", "--resume", "-w", "--worktree"];
+/// Grok flags that make it no agent: a headless turn, help, the version.
+pub const GROK_HEADLESS: [&str; 8] = ["-p", "--single", "--prompt-file", "--prompt-json", "-h", "--help", "-v", "--version"];
+/// Grok's first words that are no TUI: its daemons and utility commands.
+pub const GROK_NOT_TUI: [&str; 26] = [
+    "agent", "leader", "worker", "clone", "completions", "doctor", "du", "disk-usage", "export", "help", "inspect",
+    "login", "logout", "mcp", "memory", "models", "plugin", "sessions", "setup", "trace", "update", "usage", "version",
+    "v", "worktree", "wrap",
+];
+
 /// agent-roster.py `comm_kind`: the `@agent_kind` an [`is_agent_comm`] comm
-/// names: codex, opencode, else claude.
+/// names: codex, opencode, grok, else claude.
 pub fn comm_kind(comm: &str) -> &'static str {
     match comm.rsplit('/').next().unwrap_or(comm) {
         "codex" => "codex",
         "opencode" => "opencode",
+        b if is_grok_comm(b) => "grok",
         _ => "claude",
     }
 }
@@ -133,7 +258,10 @@ fn pane_rows(panes_text: &str) -> Vec<Vec<&str>> {
 /// `kind`: the window's `@agent_kind` ("" when unknown).
 ///
 /// An `opencode` comm counts only when `kind` is opencode (`opencode serve`
-/// in a split beside a claude must not be what `x` closes), and among
+/// in a split beside a claude must not be what `x` closes), a `grok` one
+/// only when `kind` is grok (`grok -p`, `grok sessions` alike: only the comm
+/// is read here, never the argv, so the TUI rule and its session-record
+/// amendment do not apply), and among
 /// several agent panes the one whose comm matches `kind` wins before the
 /// active one.
 pub fn pick_agent_pane(panes_text: &str, ps_text: Option<&str>, kind: &str) -> Result<String, &'static str> {
@@ -152,7 +280,7 @@ pub fn pick_agent_pane(panes_text: &str, ps_text: Option<&str>, kind: &str) -> R
             let comm = comm.trim();
             if tty != "??" && is_agent_comm(comm) {
                 let k = comm_kind(comm);
-                if k == "opencode" && kind != "opencode" {
+                if matches!(k, "opencode" | "grok") && kind != k {
                     continue;
                 }
                 agent_ttys.entry(tty).or_default().insert(k);
@@ -604,7 +732,7 @@ mod tests {
     /// agent-roster.py's test fixture `PS`.
     const PS: &str = "??       launchd\nttys001  -zsh\nttys002  /opt/homebrew/bin/codex\nttys002  node\n\
         ttys003  2.1.291\nttys004  /usr/bin/claude\nttys005  10.0.0.1\nttys006  opencode-helper\n\
-        ttys007  /opt/homebrew/bin/opencode";
+        ttys007  /opt/homebrew/bin/opencode\nttys008  /Users/me/.grok/bin/grok";
 
     fn panes(rows: &[(&str, &str, &str)]) -> String {
         rows.iter().map(|(p, t, a)| [*p, *t, *a].join("\x1f")).collect::<Vec<_>>().join("\n")
@@ -624,6 +752,30 @@ mod tests {
         assert_eq!(pick_agent_pane(&p, Some(PS), "claude"), Err(PANE_UNSURE));
         assert_eq!(pick_agent_pane(&p, Some(PS), ""), Err(PANE_UNSURE));
         assert_eq!((comm_kind("/opt/homebrew/bin/opencode"), comm_kind("codex"), comm_kind("2.1.291")), ("opencode", "codex", "claude"));
+    }
+
+    /// agent-roster.py `test_grok_counts_only_in_a_grok_window`.
+    #[test]
+    fn grok_counts_only_in_a_grok_window() {
+        // In a grok window its pane is the one, over an active shell or claude.
+        let p = panes(&[("%1", "/dev/ttys001", "1"), ("%2", "/dev/ttys008", "0")]);
+        assert_eq!(pick_agent_pane(&p, Some(PS), "grok"), Ok("%2".into()));
+        let p = panes(&[("%1", "/dev/ttys008", "0"), ("%2", "/dev/ttys004", "1")]);
+        assert_eq!(pick_agent_pane(&p, Some(PS), "grok"), Ok("%1".into()));
+        // `grok -p` / `grok sessions` split beside a claude / codex (same comm):
+        // the active grok pane is not the agent; the kind's own pane is.
+        for (agent_tty, kind) in [("/dev/ttys004", "claude"), ("/dev/ttys002", "codex"), ("/dev/ttys004", "")] {
+            let p = panes(&[("%1", agent_tty, "0"), ("%2", "/dev/ttys008", "1")]);
+            assert_eq!(pick_agent_pane(&p, Some(PS), kind), Ok("%1".into()), "{kind}");
+        }
+        // A grok pane alone in a non-grok window: nothing to close.
+        let p = panes(&[("%1", "/dev/ttys001", "1"), ("%2", "/dev/ttys008", "0")]);
+        assert_eq!(pick_agent_pane(&p, Some(PS), "opencode"), Err(PANE_UNSURE));
+        assert_eq!(pick_agent_pane(&p, Some(PS), ""), Err(PANE_UNSURE));
+        // agent-roster.py `test_comm_kind`.
+        for c in ["/Users/me/.grok/bin/grok", "/Users/me/.grok/downloads/grok-macos-aarch64", "grok"] {
+            assert_eq!(comm_kind(c), "grok", "{c}");
+        }
     }
 
     /// agent-roster.py `test_kind_match_beats_the_active_pane`.
@@ -701,12 +853,54 @@ mod tests {
 
     #[test]
     fn agent_comms() {
-        for c in ["claude", "/usr/local/bin/codex", "/opt/homebrew/bin/opencode", "2.1.291", "/x/10.0.1"] {
+        for c in ["claude", "/usr/local/bin/codex", "/opt/homebrew/bin/opencode", "2.1.291", "/x/10.0.1",
+                  "grok", "/Users/me/.grok/bin/grok", "grok-macos-aarch64", "grok-linux-x86_64"] {
             assert!(is_agent_comm(c), "{c}");
         }
-        for c in ["node", "claude-code", "opencode-ai", "2.1", "2.1.x", "1..2", "zsh", "v2.1.3"] {
+        // Grok's other name for the same binary (`agent`) is too generic, and
+        // lookalikes off the `grok-<os>-<arch>` shape are not it.
+        for c in ["node", "claude-code", "opencode-ai", "2.1", "2.1.x", "1..2", "zsh", "v2.1.3",
+                  "agent", "/Users/me/.grok/bin/agent", "grok-helper", "grokker", "xgrok", "grok-", "grok--x",
+                  "grok-macos-", "grok-macos-aarch64-x", "grok-MacOS-arm", "grok-mcp-server", "grok-darwin-arm64"] {
             assert!(!is_agent_comm(c), "{c}");
         }
+    }
+
+    /// The Grok TUI rule (agent-pause.py `grok_tui_args`).
+    #[test]
+    fn grok_tui_args_tell_the_tui() {
+        let v = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        for a in ["grok", "grok fix-x", "grok -c", "grok -r abc", "grok -r", "grok --resume=abc dashboard", "grok dashboard",
+                  "grok -m grok-4 sessions-are-a-prompt", "grok -m sessions", "grok -w feat", "grok -r -c",
+                  "grok -- sessions", "grok --cwd /x", "/Users/me/.grok/bin/grok -s sid-1"] {
+            assert!(grok_tui_args(&v(a)), "{a}");
+        }
+        for a in ["grok -p hi", "grok --single hi", "grok --prompt-file=x", "grok --prompt-json x", "grok -h", "grok --version",
+                  "grok agent stdio", "grok leader list", "grok sessions", "grok -r sessions", "grok -w update",
+                  "grok --model x mcp list", "grok --model=x v", "grok worker", "grok -c -p go", "grok - sessions",
+                  "grok --help=all", "grok --version=x"] {
+            assert!(!grok_tui_args(&v(a)), "{a}");
+        }
+        // v2: a session record overrules a subcommand word (`ps -o args`
+        // lost the quotes of `grok "help me"`), never a headless flag; the
+        // record is not even asked of a clear verdict.
+        assert_eq!(grok_argv_verdict(&v("grok help me fix x")), GrokArgs::Subcommand);
+        assert!(grok_tui(&v("grok help me fix x"), || true));
+        assert!(!grok_tui(&v("grok help me fix x"), || false));
+        assert!(!grok_tui(&v("grok -p help"), || panic!("not asked")));
+        assert!(grok_tui(&v("grok -c"), || panic!("not asked")));
+        assert_eq!(grok_argv_verdict(&v("grok --version")), GrokArgs::Headless);
+        assert!(!grok_tui(&v("grok --help=all"), || true), "a record never overrules --help=*");
+        // v3: glued short flags are headless too, whatever a record says;
+        // `--` after a subcommand word keeps the subcommand verdict.
+        for a in ["grok -phi", "grok -p=hi", "grok -c -pgo", "grok -hx", "grok -h=all", "grok -vv", "grok -v=1"] {
+            assert_eq!(grok_argv_verdict(&v(a)), GrokArgs::Headless, "{a}");
+            assert!(!grok_tui(&v(a), || true), "{a}");
+        }
+        assert_eq!(grok_argv_verdict(&v("grok mcp add x -- -y srv")), GrokArgs::Subcommand);
+        assert_eq!(grok_argv_verdict(&v("grok -- -phi")), GrokArgs::Tui, "after `--` nothing is a flag");
+        assert_eq!(grok_argv_verdict(&v("grok -- help")), GrokArgs::Tui, "after `--` a word is prompt text");
+        assert_eq!(grok_argv_verdict(&v("grok -c -r -m x")), GrokArgs::Tui);
     }
 
     #[test]

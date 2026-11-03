@@ -395,6 +395,8 @@ pub fn kind_glyph(kind: &str) -> Option<&'static str> {
         "codex" => Some("⬢"),
         // nf-oct-terminal (U+F489): Nerd Font, one cell like the others.
         "opencode" => Some("\u{f489}"),
+        // Grok Build: four-pointed star (U+2726), one cell.
+        "grok" => Some("✦"),
         _ => None,
     }
 }

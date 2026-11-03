@@ -249,6 +249,85 @@ ignores the status.
     being dropped or rebuilt.
 - **Prune.** The glob is expanded in bash, so it never hits ARG_MAX.
 
+## Grok sessions in the sidecar (2026-11-02)
+
+tmux-assistant-resurrect detects claude, codex and opencode only, so Grok
+Build is saved and restored by local code around it, in the plugin's own
+shapes.
+
+- **The record.** Grok's own hooks (`~/.grok/hooks/tmux-agent.json`) run
+  `scripts/grok-session-track.sh`, the grok twin of the plugin's
+  `claude-session-track.sh`. On `SessionStart` it (re)writes
+  `grok-<pid>.json` in the plugin's state dir
+  (`$TMUX_ASSISTANT_RESURRECT_DIR`, else
+  `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect`): the hook
+  payload plus `tool: "grok"`, `ppid`, `timestamp` and `env` (`tmux_pane`,
+  `shell` and the `@assistant-resurrect-capture-env` variables), one JSON
+  line. The pid is the grok TUI, found walking up at most three parents; a
+  hook with no grok above it writes nothing. `/new` and `/resume` start a new
+  session id in the same process, and the record follows. `SessionEnd`
+  removes it only when the session it ends is the one recorded (the record is
+  renamed aside, judged, and put back with `mv -n`, so a late end of the old
+  session never deletes the new one's record). Subagent sessions are
+  ignored. Only a TUI fires `SessionStart`, so a record also marks its pid as
+  a TUI.
+- **Save** (`assistant-save.sh`, after the plugin's pass, in the
+  post-save-all chain). `grok_rows` adds one row per pane running a Grok
+  TUI, `{pane, tool: "grok", session_id, cwd, pid, model: "", cli_args,
+  env}`:
+  - **The process:** the outermost one in the pane's process tree whose
+    argv0 basename is `grok` or `grok-<os>-<arch>` (never the `agent`
+    symlink to the same binary) and that passes the TUI rule
+    (agent-tab-indicator.md, the watcher's "Grok"). `-p`, `--single`,
+    `--prompt-*`, help and version are never a TUI. A first word that is a
+    subcommand (`grok sessions`, `grok agent stdio`) is a TUI only when its
+    pid has a record or an `active_sessions.json` entry, because `ps`
+    flattens argv (`grok "help me fix X"` reads as the `help` subcommand).
+  - **The session id:** `~/.grok/active_sessions.json` by pid (Grok
+    rewrites it on `/new` and `/resume`), else the record, else a UUID given
+    to `-r`/`--resume` or `-s`/`--session-id`. A pane with none gets no row.
+  - **cwd:** the session's own (a `-w` worktree session lives there), else
+    the pane's. `cli_args` is argv minus argv0, and `env` comes from the
+    record.
+  - **Which row wins a pane:** a grok row replaces a plugin row for the same
+    pane only when that row's process is the grok itself or one of its
+    descendants. The plugin's argv pattern can match grok's own argv
+    (`--add-dir ~/code/claude`), and a `claude -p` can be one of its tools.
+    Any other agent already saved for the pane keeps it.
+  - **Cost:** with no live record and no live `active_sessions.json` entry
+    there is no `ps` and no fork. A record whose pid is dead (a grok killed
+    before its `SessionEnd`) is deleted here, so it cannot hold that fast path
+    off for good. The plugin's `strip_assistant_pane_contents` runs again
+    after rows were added, so grok panes' text leaves the archive like the
+    others' (a resumed TUI redraws anyway).
+    save.log says `saved N grok session(s)`.
+- **Restore** (`assistant-restore.sh`). A grok row resumes as
+  `~/.grok/bin/grok [options] -r <sid>` after a `cd` into the session's
+  cwd. That path is `$GROK_HOME/bin/grok` when set, and `command grok` when
+  the link is missing (the installer puts nothing on PATH). A nu pane gets
+  the same command as `^r###'…'###`. `grokcut` keeps the leading options
+  and drops what would fight `-r`:
+  - `-r`/`--resume` and `-w`/`--worktree`, with their optional value;
+  - `-c`/`--continue`, and `-s`/`--session-id`;
+  - `--worktree-ref`/`--ref` and `--cwd`, with their value;
+  - a relative `--add-dir` (the `cd` would move it), while an absolute one
+    stays;
+  - the one-shot `--fork-session` and `--restore-code`;
+  - any launch prompt.
+
+  Guard 2 (never a second assistant in a pane) sees grok too: `detect_tool`
+  is wrapped so that a pane already running any grok, `grok -p` included,
+  is not free.
+- **⌘W / ⌘Z** (`closed-tabs.sh`). It treats a closed grok tab the way
+  `grok_rows` does. The snapshot copies the record and, because Grok drops
+  its `active_sessions.json` entry as it exits, that file too. The tab is
+  reopened with the same `-r <sid>` line and `@agent_birth grok`. The closed
+  tab's summary reads the conversation through `grok export <sid>`, else
+  the session's `summary.json` title.
+
+Tests: `tests/test_grok_resurrect.py` covers the record hook, save rows,
+restore lines, the socket guard below, and closed-tabs.
+
 ## Costs (measured 2026-10-15, 20-pane test server)
 
 **Fast path:** about 20ms wall, close to 0 CPU, 7.8MB RSS. That breaks down as
@@ -289,6 +368,19 @@ time, outside the broker's bookkeeping.
   named `default`. That covers resurrect-save.sh, resurrect-save-soon.sh,
   continuum-ensure.sh and agent-tab-watcher.sh. Agents' private servers live at
   `$TMUX_TMPDIR/tmux-$UID/default`.
+- **Restores, too.** Any server that loads tmux.conf runs
+  `assistant-restore.sh` as its post-restore-all hook. This went wrong on
+  2026-10-08 and again on 2026-11-02: a subagent's test server started
+  without `-f /dev/null`, continuum restored the real snapshot into it, and
+  every live Claude session was resumed a second time inside it. So the
+  restore checks `#{socket_path}` first. With its directory's symlinks
+  resolved, it must equal `/private/tmp/tmux-$UID/default`, which `/tmp`
+  resolves to. It is deliberately not `$TMUX_TMPDIR`'s: agents' private
+  servers live there, and their hooks inherit it. On any other server, or
+  with tmux unreachable, the script logs `not the default server: <socket>,
+  restore skipped` to assistant-restore.log and exits 0, and the rest of the
+  chain runs. `RESURRECT_SAVE_ALLOW_SOCKET=<that exact socket>` admits one
+  test server, the same opt-in as resurrect-save.sh's `socket_ok`.
 - **Changes the fingerprint cannot see** (a `/clear` that keeps its title, or a
   change of active window) wait for the 15-minute full save, a structural
   event, or a quit.

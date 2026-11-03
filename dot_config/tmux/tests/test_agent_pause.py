@@ -58,6 +58,7 @@ class StubMcp:
     def __init__(self, sse=True):
         self.calls, self.methods, self.deleted = [], [], 0
         self.reply = {}
+        self.dialog_calls, self.dialog = [], {}
         self.slow = 2.5
         self.fail_initialized = False
         self.on_call = None   # f(args), run as each tools/call arrives (before the reply)
@@ -109,6 +110,19 @@ class StubMcp:
                     return
                 assert self.headers.get("mcp-session-id") == "stub-session"
                 args = req["params"]["arguments"]
+                if req["params"]["name"] == "answer_limit_dialog":
+                    # Kept apart from message_agent's calls. stub.dialog
+                    # {pane: first reply line | "missing" (no such tool)}.
+                    with stub.lock:
+                        stub.dialog_calls.append(args)
+                    how = stub.dialog.get(args["pane"], "no dialog")
+                    if how == "missing":
+                        self.send(200, {"jsonrpc": "2.0", "id": req["id"],
+                                        "error": {"code": -32602, "message": "Tool answer_limit_dialog not found"}})
+                    else:
+                        self.send(200, {"jsonrpc": "2.0", "id": req["id"], "result": {"content": [
+                            {"type": "text", "text": how + '\n{"options":[]}'}]}})
+                    return
                 with stub.lock:
                     stub.calls.append(args)
                 if stub.on_call:
@@ -172,6 +186,7 @@ class Harness(unittest.TestCase):
             "TMUX_MCP_TOKEN_FILE": str(self.dir / "token"),
             "TMUX_ASSISTANT_RESURRECT_DIR": str(self.dir / "rec"),
             "AGENT_PAUSE_WEZTERM": "off",      # never the real wezterm CLI
+            "AGENT_PAUSE_DIALOG_DELAY": "0",   # limit-add's dialog pass, at once
             "TERM": "xterm-256color",
         })
         self.sock = None
@@ -209,11 +224,11 @@ class Harness(unittest.TestCase):
         lines = (self.dir / "state" / "log").read_text().splitlines()
         return json.loads(lines[-1])
 
-    def record(self, pane, sid, kind="claude", pid=None):
+    def record(self, pane, sid, kind="claude", pid=None, **extra):
         pid = pid or int(self.t("display", "-p", "-t", pane, "#{pane_pid}"))
-        (self.dir / "rec" / ("%s-%d.json" % (kind, pid))).write_text(json.dumps({
+        (self.dir / "rec" / ("%s-%d.json" % (kind, pid))).write_text(json.dumps(dict({
             "session_id": sid, "cwd": "/x", "timestamp": "2026-10-15T10:00:%02dZ" % self.n,
-            "env": {"tmux_pane": pane}}))
+            "env": {"tmux_pane": pane}}, **extra)))
 
     def window(self, state=None, workflow="", cua="", agent=True, summary=None):
         """A new window -> its pane id; agent=True also writes a session record."""
@@ -301,14 +316,17 @@ class PauseKey(Harness):
 
     # -- opencode -----------------------------------------------------------
     def fake_opencode(self, *args):
-        """A pane whose process is argv `opencode - <args>` (exec -a) and
+        return self.fake_agent("opencode", *args)
+
+    def fake_agent(self, name, *args):
+        """A pane whose process is argv `<name> - <args>` (exec -a) and
         sleeps: python reading its program from stdin (`-`, which the argv
-        rule skips as an option), so any args can follow."""
+        rules skip as an option), so any args can follow."""
         prog = self.dir / "sleep.py"
         prog.write_text("import time\ntime.sleep(600)\n")
-        cmd = "exec -a opencode %s - %s < %s" % (shlex.quote(sys.executable),
-                                                " ".join(shlex.quote(a) for a in args),
-                                                shlex.quote(str(prog)))
+        cmd = "exec -a %s %s - %s < %s" % (name, shlex.quote(sys.executable),
+                                          " ".join(shlex.quote(a) for a in args),
+                                          shlex.quote(str(prog)))
         return self.t("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "main:",
                       "/bin/bash -c %s" % shlex.quote(cmd))
 
@@ -367,6 +385,103 @@ class PauseKey(Harness):
         self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [marked])
         (t,) = self.state()["targets"]
         self.assertEqual((t["kind"], t["found_by"]), ("opencode", "command"))
+        self.assertIn("1 working window had no agent pane", entry["message"])
+
+    # -- grok ---------------------------------------------------------------
+    def test_grok_agent_is_paused_as_grok(self):
+        self.n += 1
+        g = self.fake_agent("grok", "-c")
+        pid = self.wait_args(g, "grok")
+        self.t("set", "-w", "-t", g, "@agent_state", "running")
+        self.t("set", "-w", "-t", g, "@agent_kind", "grok")
+        self.record(g, "019a-grok", kind="grok", pid=pid)
+        self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [g])
+        (t,) = self.state()["targets"]
+        self.assertEqual((t["kind"], t["session_id"], t["found_by"]), ("grok", "019a-grok", "record"))
+
+    def test_grok_headless_records_are_not_agents(self):
+        for args in (("-p", "hi"), ("--single", "hi"), ("--prompt-file", "x.md")):
+            self.n += 1
+            p = self.fake_agent("grok", *args)
+            pid = self.wait_args(p, args[0])
+            self.t("set", "-w", "-t", p, "@agent_state", "running")   # a leftover state
+            self.record(p, "gs_%d" % self.n, kind="grok", pid=pid)
+        entry = self.press()
+        self.assertEqual(self.stub.calls, [])
+        self.assertIsNone(self.state())
+        self.assertIn("3 working windows had no agent pane", entry["message"])
+
+    def test_a_recorded_grok_whose_prompt_reads_like_a_subcommand_is_an_agent(self):
+        # `grok "help me fix X"`: ps loses the quotes. Its session record
+        # proves the TUI (utility subcommands never fire SessionStart).
+        self.n += 1
+        g = self.fake_agent("grok", "help", "me", "fix", "X")
+        pid = self.wait_args(g, "help me")
+        self.t("set", "-w", "-t", g, "@agent_state", "running")
+        self.record(g, "019a-help", kind="grok", pid=pid)
+        self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [g])
+        (t,) = self.state()["targets"]
+        self.assertEqual((t["kind"], t["session_id"]), ("grok", "019a-help"))
+
+    def test_a_compat_claude_record_from_grok_is_grok(self):
+        # Grok's compat Claude hooks filed its session as claude-<pid>.json
+        # (`hookEventName` / "tool":"grok"): a grok pid makes it a grok record,
+        # filter and all.
+        self.n += 1
+        g = self.fake_agent("grok", "-c")
+        pid = self.wait_args(g, "grok")
+        self.t("set", "-w", "-t", g, "@agent_state", "running")
+        self.record(g, "019a-compat", kind="claude", pid=pid, hookEventName="session_start")
+        self.n += 1
+        h = self.fake_agent("grok", "-p", "hi")                  # headless: still dropped
+        hpid = self.wait_args(h, "-p hi")
+        self.t("set", "-w", "-t", h, "@agent_state", "running")
+        self.record(h, "019a-headless", kind="claude", pid=hpid, tool="grok")
+        entry = self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [g])
+        (t,) = self.state()["targets"]
+        self.assertEqual((t["kind"], t["session_id"], t["found_by"]), ("grok", "019a-compat", "record"))
+        self.assertIn("1 working window had no agent pane", entry["message"])
+
+    def test_a_claude_record_overwritten_by_grok_stays_claude_without_its_session(self):
+        # A `grok -p` in a Claude tab's Bash tool overwrote that Claude's
+        # record with Grok's payload: still the Claude pane, session unknown,
+        # and still resumed (a sid-less record identifies nobody else).
+        c = self.window("running", agent=False)
+        self.record(c, "grok-sid-not-claudes", tool="grok", hookEventName="stop")
+        self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [c])
+        (t,) = self.state()["targets"]
+        self.assertEqual((t["kind"], t["session_id"], t["found_by"]), ("claude", "", "record"))
+        self.press()
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [c])
+
+    def test_grok_command_fallback_needs_the_grok_kind(self):
+        # No record: a grok pane (pane_current_command `grok-macos-aarc`, the
+        # real binary's p_comm cut short) is the agent only in a window
+        # marked @agent_kind grok, and the kind is grok.
+        b = self.dir / "bin"; b.mkdir()
+        shutil.copy("/bin/sleep", b / "grok-macos-aarch64")
+        def win(kind):
+            p = self.t("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "main:",
+                       "%s 600" % (b / "grok-macos-aarch64"))
+            self.t("set", "-w", "-t", p, "@agent_state", "running")
+            if kind:
+                self.t("set", "-w", "-t", p, "@agent_kind", kind)
+            return p
+        marked, unmarked = win("grok"), win("")
+        deadline = time.time() + 5
+        while time.time() < deadline and not (
+                self.t("display", "-p", "-t", marked, "#{pane_current_command}").startswith("grok")
+                and self.t("display", "-p", "-t", unmarked, "#{pane_current_command}").startswith("grok")):
+            time.sleep(0.05)
+        self.assertTrue(self.t("display", "-p", "-t", unmarked, "#{pane_current_command}").startswith("grok"))
+        entry = self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [marked])
+        (t,) = self.state()["targets"]
+        self.assertEqual((t["kind"], t["found_by"]), ("grok", "command"))
         self.assertIn("1 working window had no agent pane", entry["message"])
 
     def test_sessionless_target_needs_the_same_pane_process(self):
@@ -1487,6 +1602,150 @@ class RateLimits(Harness):
         self.assertTrue(entry["ok"], entry)
         self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
 
+    # -- the pool (pool-aware resume) ----------------------------------------
+    A1, A2 = "one@x/org-1", "two@x/org-2"
+
+    def seq(self, active, at, reserve1=5):
+        """sequence.json as cswap writes it: slot `active` in use since `at`;
+        slot 1 keeps a weekly reserve."""
+        d = self.dir / "home" / ".claude-swap-backup"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "sequence.json").write_text(json.dumps({
+            "activeAccountNumber": active, "sequence": [1, 2], "accounts": {
+                "1": {"email": "one@x", "organizationUuid": "org-1", "weeklyReservePct": reserve1},
+                "2": {"email": "two@x", "organizationUuid": "org-2"}}}))
+        os.utime(d / "sequence.json", (at, at))
+
+    def override(self, slot, until):
+        """cswap's reserveOverride: Mack chose `slot` inside its reserve."""
+        d = self.dir / "home" / ".claude-swap-backup"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "autoswitch_state.json").write_text(json.dumps({"reserveOverride": {"account": slot, "until": until}}))
+
+    def test_pool_replay_resumes_at_the_other_accounts_reset_on_stale_usage(self):
+        # 2026-11-02: limited on slot 2 (weekly, resets in 40 h); Mack
+        # switched to slot 1 inside its reserve (99 % of a 95 cap); the
+        # publisher froze in its error state before the switch.
+        r1, r2 = NOW + 10800, NOW + 40 * 3600
+        self.seq(2, NOW - 8000)
+        p = self.limited(r2, "seven_day", since=NOW - 7000)
+        self.assertEqual(self.lim()[0]["account"], self.A2)        # cswap's active slot, not usage.json's
+        self.seq(1, NOW - 60)
+        self.override(1, NOW + 86400)
+        self.usage(account=self.A2, state="error", updated_at=NOW - 200, weekly_used=100, weekly_pace={
+            "scope": "pool", "window_minutes": 10080, "members": [
+                {"slot": "1", "used": 99, "cap": 95, "resets_at": r1, "as_of": NOW - 215, "active": False},
+                {"slot": "2", "used": 100, "cap": 100, "resets_at": r2, "as_of": NOW - 200, "active": True}]})
+        self.tick()
+        self.assertEqual(self.stub.calls, [])                      # 99 vs 100 - 2 (override): not free
+        self.at(NOW + 400)                                         # the switch's settling poll is over
+        self.tick()
+        self.assertEqual(self.stub.calls, [])
+        self.assertEqual(self.due(), str(r1 + AP.POOL_GRACE))      # slot 1's reset, not slot 2's
+        self.at(r1 + AP.POOL_GRACE)
+        entry = self.tick()
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+        self.assertIn("resumed 1", entry["message"])
+
+    def test_a_limit_hit_while_a_switch_settles_is_the_old_accounts(self):
+        # Slot 2 hit 100 %, cswap switched to slot 1 ten seconds ago, and
+        # this agent (still on slot 2's cached token) hits its limit now: it
+        # is slot 2's limit, so slot 1's headroom frees it once the switch
+        # has settled, not on Nov 4.
+        r2 = NOW + 40 * 3600
+        self.seq(1, NOW - 10)
+        self.usage(account=self.A2, weekly_pace={"scope": "pool", "window_minutes": 10080, "members": [
+            {"slot": "1", "used": 6, "cap": 95, "resets_at": NOW + 7 * 86400, "as_of": NOW + 50},
+            {"slot": "2", "used": 100, "cap": 100, "resets_at": r2 + 1, "as_of": NOW - 30}]})
+        p = self.limited(r2, "seven_day", since=NOW)
+        self.assertEqual(self.lim()[0]["account"], self.A2)
+        self.tick()
+        self.assertEqual(self.stub.calls, [])                      # inside SWITCH_SETTLE
+        self.at(NOW + 60)
+        self.tick()
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+
+    def test_pool_with_the_limited_account_active_is_the_clock_rule(self):
+        r2 = NOW + 3000
+        self.seq(2, NOW - 8000)
+        p = self.limited(r2, "seven_day")
+        self.usage(account=self.A2, weekly_pace={"scope": "pool", "window_minutes": 10080, "members": [
+            {"slot": "1", "used": 10, "cap": 95, "resets_at": NOW - 200, "as_of": NOW - 30},
+            {"slot": "2", "used": 100, "cap": 100, "resets_at": r2, "as_of": NOW - 30}]})
+        self.tick()
+        self.assertEqual(self.stub.calls, [])                      # slot 1 is free, but not in use
+        self.assertEqual(self.due(), str(NOW + AP.LIMIT_SWITCH_POLL))   # cswap should switch to it
+        self.at(r2 + AP.LIMIT_GRACE)
+        self.tick()
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+
+    # -- the limit dialog ----------------------------------------------------
+    def test_limit_add_answers_the_dialog_wait_or_dismiss(self):
+        p = self.window("paused")
+        self.stub.dialog[p] = "answered: auto-resume (Wait here, then continue automatically at 5:00 PM)"
+        self.mark(p, NOW + 3000)
+        self.limit("limit-add", self.wid(p))
+        self.assertEqual(self.stub.dialog_calls, [{"pane": p, "choice": AP.DIALOG_WAIT}])
+        self.assertEqual(self.lim()[0]["dialog"]["result"], "answered")
+        self.assertEqual(self.stub.calls, [])                      # no message: only the key
+        self.t("set", "-g", "@agent_limit_autoresume", "off")
+        q = self.limited(NOW + 3000)
+        self.assertEqual(self.stub.dialog_calls[-1], {"pane": q, "choice": AP.DIALOG_DISMISS})
+        self.assertEqual(self.lim()[1]["dialog"]["result"], "none")
+
+    def test_an_unreadable_dialog_blocks_the_resume_and_a_missing_tool_does_not(self):
+        p = self.limited(NOW - 1000)                               # reset passed: due
+        self.stub.dialog[p] = "unknown: a dialog that is not the limit dialog"
+        self.at(NOW + 21)
+        entry = self.tick()
+        self.assertEqual(self.stub.calls, [])
+        self.assertEqual(self.stub.dialog_calls[-1]["choice"], AP.DIALOG_DISMISS)   # at send: always
+        (t,) = self.lim()
+        self.assertEqual((t["last_result"], t["attempts"]), ("dialog", 1))
+        self.assertTrue(self.opt(p, "@agent_paused"))             # never unflagged
+        self.assertIn("not taken 1", entry["message"])
+        # tmux-mcp without the tool: today's delivery (its guard holds).
+        self.stub.dialog[p] = "missing"
+        self.at(NOW + 21 + AP.LIMIT_BACKOFF)
+        self.tick()
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+        self.assertEqual(self.log_of("limit-dialog")["result"], "refused")
+
+    def test_a_held_resume_blamed_on_the_dialog_says_so(self):
+        p = self.limited(NOW - 1000)
+        self.stub.reply[p] = "held"
+        self.at(NOW + 21)
+        self.tick()
+        self.edit_lim(held_why="Claude's usage-limit dialog is open")
+        self.t("set", "-wu", "-t", p, "@agent_paused")
+        self.t("set", "-w", "-t", p, "@agent_state", "idle")
+        self.at(NOW + 21 + AP.LIMIT_HELD_LIFT)
+        self.tick()
+        self.assertTrue(self.notified("limit dialog is open"))
+        self.assertFalse(self.notified("behind a draft"))
+
+    def test_a_grok_limit_waits_for_mack_and_carries_no_claude_account(self):
+        # A free-tier 429 has no reset time (R=0): never resumed by the clock
+        # or by a cswap switch (Claude's accounts), and no cswap account.
+        p = self.window("paused", agent=False)
+        self.t("set", "-w", "-t", p, "@agent_kind", "grok")
+        self.record(p, "019a-grok", kind="grok")
+        self.mark(p, 0, "model")
+        self.limit("limit-add", self.wid(p))
+        (t,) = self.lim()
+        self.assertEqual((t["kind"], t["session_id"], t["resets_at"]), ("grok", "019a-grok", 0))
+        self.assertNotIn("account", t)
+        self.assertEqual(self.due(), "")
+        self.switch(NOW - 300)
+        self.usage(account="acct-b", updated_at=NOW - 200)
+        self.at(NOW + 10 ** 6)
+        self.tick()
+        self.assertEqual(self.stub.calls, [])
+        self.assertNotIn("account", self.lim()[0])
+        entry = self.limit("limit-resume", self.wid(p))     # Mack's click still does
+        self.assertTrue(entry["ok"], entry)
+        self.assertEqual(self.stub.panes(AP.LIMIT_RESUME_MSG), [p])
+
     def test_limit_resume_refuses_until_eligible_unless_forced(self):
         p = self.limited(NOW + 3600)
         entry = self.limit("limit-resume", self.wid(p))
@@ -1944,12 +2203,41 @@ class Units(unittest.TestCase):
         self.assertEqual(lines[-1].strip(), "closes in 2s · any key to close")
 
     def test_agent_command_fallback(self):
-        for c in ("claude", "codex", "2.1.170", "opencode"):
+        # grok's pane_current_command is its p_comm cut to 15: a prefix match.
+        for c in ("claude", "codex", "2.1.170", "opencode", "grok", "grok-macos-aarc"):
             self.assertTrue(AP.AGENT_CMD.match(c), c)
-        for c in ("zsh", "sleep", "node", "2.1", "opencode-x"):
+        for c in ("grok-linux-x86_", "grok-windows-x8"):
+            self.assertTrue(AP.AGENT_CMD.match(c), c)
+        for c in ("zsh", "sleep", "node", "2.1", "opencode-x", "agent", "xgrok", "grok-mcp-server",
+                  "grokker", "grok-helper"):
             self.assertFalse(AP.AGENT_CMD.match(c), c)
-        self.assertEqual([AP.cmd_kind(c) for c in ("claude", "2.1.170", "codex", "opencode")],
-                         ["claude", "claude", "codex", "opencode"])
+        self.assertEqual([AP.cmd_kind(c) for c in ("claude", "2.1.170", "codex", "opencode", "grok-macos-aarc")],
+                         ["claude", "claude", "codex", "opencode", "grok"])
+
+    def test_grok_tui_args(self):
+        # The shared Grok TUI rule (agent-tab-watcher.sh grok_tui_args, agent-ui).
+        for a in ("grok", "/Users/me/.grok/bin/grok", "grok fix the tests", "grok -c", "grok -r",
+                  "grok -r 019a-sid", "grok --resume 019a-sid", "grok -w", "grok -w feat fix it",
+                  "grok dashboard", "grok -m grok-4 hi", "grok --model=grok-4 sessions-like",
+                  "grok -s sessions", "grok --cwd /x", "grok - -c", "grok -- -p",
+                  "grok -- help me"):                            # after `--`: prompt text
+            self.assertTrue(AP.grok_tui_args(a), a)
+        flags = ("grok -p hi", "grok --single hi", "grok --prompt-file x.md", "grok --prompt-json=x",
+                 "grok -m grok-4 -p hi", "grok hi -p", "grok -h", "grok --help", "grok -v",
+                 "grok --version", "grok --help=all", "grok --version=x",
+                 "grok -phi", "grok -p=hi", "grok -hx", "grok -vV")        # glued short flags (v3)
+        words = ("grok agent stdio", "grok leader list", "grok worker", "grok help me fix X",
+                 "grok mcp add x -- -y srv",                     # `--` only ends option scanning
+                 "grok sessions", "grok -r sessions", "grok -w mcp list", "grok --cwd /x models",
+                 "grok --model grok-4 usage", "grok v", "grok disk-usage", "grok login")
+        for a in flags + words:
+            self.assertFalse(AP.grok_tui_args(a), a)
+        # A session record (quotes lost: `grok "help me fix X"`) overrides a
+        # subcommand word, never a flag.
+        for a in words:
+            self.assertTrue(AP.grok_tui_args(a, recorded=True), a)
+        for a in flags:
+            self.assertFalse(AP.grok_tui_args(a, recorded=True), a)
 
     def test_opencode_tui_args(self):
         # Same table as the watcher's opencode_tui_args (test_opencode_watcher).
@@ -2245,11 +2533,259 @@ class Units(unittest.TestCase):
         self.assertEqual(E(t=dict(t, type="seven_day_sonnet"), u=dict(no_scoped, weekly_used=100)), "")
         self.assertEqual(E(t=dict(t, type="overage")), "switch")
         self.assertEqual(E(t=dict(t, type="codex")), "")         # codex: the clock only
+        self.assertEqual(E(t=dict(t, kind="grok")), "")          # grok: cswap is Claude's only
+        self.assertEqual(E(t=dict(t, type="grok")), "")
         self.assertEqual(E(t=dict(t, resets_at=0)), "")          # model limits: never
         self.assertEqual(E(t=dict(t, account=None)), "")         # whose limit it was is unknown
         self.assertEqual(AP.limit_eligible(t, 99999 + AP.LIMIT_GRACE, 0, {}), "reset")
         self.assertEqual(AP.limit_eligible(t, 99999 + AP.LIMIT_GRACE - 1, 0, {}), "")
         self.assertEqual(AP.limit_eligible(dict(t, lifted_at=5), 0, 0, {}), "lifted")
+
+    # -- the pool: pure rules -------------------------------------------------
+    P_NOW = 2_000_000_000
+    SLOTS = {"1": "one@x/org-1", "2": "two@x/org-2"}
+
+    def sw(self, active="1", mtime=None, override="", reserve=None):
+        return {"active": active, "slots": dict(self.SLOTS), "reserve": {"1": 5.0} if reserve is None else reserve,
+                "mtime": self.P_NOW - 3600 if mtime is None else mtime, "override": override}
+
+    def pool_usage(self, w1=None, w2=None, state="ok", updated=None, session=None, **kw):
+        n = self.P_NOW
+        mem = lambda slot, d: dict({"slot": slot, "used": 50, "resets_at": n + 86400, "as_of": n - 30}, **(d or {}))
+        u = {"account": self.SLOTS["2"], "state": state, "updated_at": n - 30 if updated is None else updated,
+             "weekly_used": 100, "weekly_locked": False,
+             "weekly_pace": {"scope": "pool", "window_minutes": 10080,
+                             "members": [mem("1", dict({"cap": 95}, **(w1 or {}))), mem("2", w2)]}}
+        if session is not None:
+            u["session_pace"] = {"scope": "account", "window_minutes": 300, "members": session}
+        u.update(kw)
+        return u
+
+    def target(self, **kw):
+        return dict({"kind": "claude", "type": "seven_day", "since": self.P_NOW - 3600,
+                     "resets_at": self.P_NOW + 40 * 3600, "account": self.SLOTS["2"]}, **kw)
+
+    def test_pool_reserve_cap_and_override(self):
+        n, t = self.P_NOW, self.target()
+        E = lambda u, sw=None: AP.pool_eligible(t, n, u, sw or self.sw())
+        self.assertEqual(E(self.pool_usage({"used": 99})), "")            # fresh 99 at cap 95
+        self.assertEqual(E(self.pool_usage({"used": 94})), "")            # 1 under the cap: no headroom
+        self.assertEqual(E(self.pool_usage({"used": 93})), "pool")        # cap - 2
+        ov = self.sw(override="1")                                        # chosen inside its reserve
+        self.assertEqual(E(self.pool_usage({"used": 99}), ov), "")        # 99 vs 98 still not free
+        self.assertEqual(E(self.pool_usage({"used": 98}), ov), "pool")
+        self.assertEqual(AP.limit_eligible(t, n, 0, self.pool_usage({"used": 93}), self.sw()), "pool")
+        self.assertEqual(AP.limit_eligible(t, n, 0, self.pool_usage({"used": 93})), "")   # no sw: old rules
+
+    def test_pool_limited_account_active_is_the_clock_rule(self):
+        n, t = self.P_NOW, self.target()
+        u = self.pool_usage(w2={"resets_at": n - 1000, "used": 0})      # its own window even reset
+        self.assertEqual(AP.pool_eligible(t, n, u, self.sw(active="2")), "")
+        self.assertEqual(AP.limit_eligible(t, n, 0, u, self.sw(active="2")), "")
+        self.assertEqual(AP.limit_eligible(t, t["resets_at"] + AP.LIMIT_GRACE, 0, u, self.sw(active="2")), "reset")
+
+    def test_pool_five_hour_needs_weekly_headroom_too(self):
+        # The publisher's real shapes (usage.json, 2026-11-02): it never pools
+        # the session window. With weekly-only slot 1 active, session_pace is
+        # null; with slot 2 active it is {scope: account, members: [slot 2]}.
+        n, t = self.P_NOW, self.target(type="five_hour", resets_at=self.P_NOW + 3000)
+        E = lambda u: AP.pool_eligible(t, n, u, self.sw())
+        slot2_only = [{"slot": "2", "used": 100, "resets_at": n + 3000, "as_of": n - 30}]
+        for shape in ({"session_pace": None}, {"session": slot2_only}):
+            self.assertEqual(E(self.pool_usage({"used": 40}, **shape)), "pool", shape)
+            self.assertEqual(E(self.pool_usage({"used": 94}, **shape)), "", shape)   # into slot 1's reserve
+            self.assertEqual(E(self.pool_usage({"used": 100}, **shape)), "", shape)
+        nulls = [{"slot": "1", "used": None, "resets_at": None, "as_of": n - 30}]
+        self.assertEqual(E(self.pool_usage({"used": 40}, session=nulls)), "pool")
+        # A slot that does publish a session window must have it free.
+        spent = [{"slot": "1", "used": 100, "resets_at": n + 600, "as_of": n - 30}]
+        self.assertEqual(E(self.pool_usage({"used": 40}, session=spent)), "")
+        s7 = self.target()
+        self.assertEqual(AP.pool_eligible(s7, n, self.pool_usage({"used": 40}, session=spent), self.sw()), "")
+        self.assertEqual(AP.pool_eligible(s7, n, self.pool_usage({"used": 40}), self.sw()), "pool")
+
+    def test_pool_five_hour_waits_for_usage_written_since_the_switch(self):
+        # Right after a switch session_pace still describes the old slot: no
+        # session member for the new one proves nothing yet.
+        n, t = self.P_NOW, self.target(type="five_hour", resets_at=self.P_NOW + 3000)
+        slot2_only = [{"slot": "2", "used": 100, "resets_at": n + 3000, "as_of": n - 30}]
+        u = self.pool_usage({"used": 40}, session=slot2_only, updated=n - 100)
+        self.assertEqual(AP.pool_eligible(t, n, u, self.sw(mtime=n - 60)), "")       # usage older than it
+        self.assertEqual(AP.pool_eligible(t, n, u, self.sw(mtime=n - 3600)), "pool")
+        self.assertEqual(AP.pool_eligible(self.target(), n, u, self.sw(mtime=n - 60)), "pool")   # weekly: as before
+
+    def test_pool_due_switch_poll_stops(self):
+        # The "free but not active" poll: bounded from a stable anchor (never
+        # the reading's as_of, which cswap moves every minute), and only for
+        # a slot with every window the target needs.
+        n, P = self.P_NOW, AP.LIMIT_SWITCH_POLL
+        sw = self.sw(active="1", mtime=n - 7200)
+        weekly = self.target(account=self.SLOTS["1"], since=n - 600, resets_at=n + 3 * 86400)
+        opus = dict(weekly, type="seven_day_opus")
+        for now in range(n - 500, n + 7200, 120):
+            u = self.pool_usage({"used": 100, "resets_at": n + 3 * 86400},
+                                {"used": 30, "as_of": now - 60, "resets_at": n + 6 * 86400}, updated=now - 30,
+                                scoped_pace={"scope": "pool", "window_minutes": 10080, "members": [
+                                    {"slot": "1", "used": 100, "resets_at": n + 3 * 86400, "as_of": now - 60},
+                                    {"slot": "2", "used": 100, "resets_at": n + 5 * 86400, "as_of": now - 60}]})
+            self.assertNotEqual(AP.pool_due(opus, now, u, sw), now + P, now - n)   # slot 2's opus is spent
+            due = AP.pool_due(weekly, now, u, sw)
+            if now < weekly["since"] + AP.LIMIT_SWITCH_WAIT:
+                self.assertEqual(due, now + P, now - n)                              # cswap may switch
+            else:
+                self.assertEqual(due, n + 6 * 86400 + AP.POOL_GRACE, now - n)        # back to the resets
+
+    def test_limit_sync_fills_an_account_as_limit_add_would(self):
+        # limit-add refused to guess inside a switch's settle window: a
+        # re-mark must not store the new active slot it ruled out.
+        n = self.P_NOW
+        t = {"kind": "claude", "type": "seven_day", "since": n - 900, "resets_at": n + 86400}
+        row = {"agent_limit": "%d seven_day %d" % (n + 90000, n), "agent_limit_lifted": "", "pane_id": "%1"}
+        AP.limit_sync(t, row, {"account": self.SLOTS["1"]}, self.sw(active="1", mtime=n - 10))
+        self.assertEqual(t.get("account"), self.SLOTS["2"])
+
+    def test_locate_by_the_same_live_pid_even_once_it_has_a_session(self):
+        panes = {"%7": {"pane_pid": "500", "pane_current_command": "sleep"}}
+        t = {"pane_id": "%7", "session_id": "", "pid": 900, "pane_pid": "500", "kind": "claude"}
+        self.assertEqual(AP.locate(t, panes, {"%7": {"pid": 900, "session_id": ""}}), ("%7", ""))
+        self.assertEqual(AP.locate(t, panes, {"%7": {"pid": 900, "session_id": "sid-later"}}), ("%7", ""))
+        self.assertEqual(AP.locate(t, panes, {"%7": {"pid": 901, "session_id": "sid-x"}}),
+                         (None, "pane now runs something else"))
+
+    def test_switch_rule_five_hour_needs_the_new_accounts_week(self):
+        # swap_freed: no session reading on weekly-only slot 1 proves nothing
+        # about its week, which must be under its (reserve) cap too.
+        t = {"kind": "claude", "type": "five_hour", "since": 1000, "resets_at": 99999, "account": "a"}
+        u = {"account": "b", "updated_at": 1200, "fetched_at": 1150, "session_locked": False, "session_used": None,
+             "weekly_locked": False, "weekly_used": 94, "session_pace": None,
+             "weekly_pace": {"members": [{"slot": "1", "used": 94, "cap": 95, "active": True}]}}
+        E = lambda u: AP.limit_eligible(t, 2000, 1100, u, self.sw())
+        self.assertEqual(E(u), "")                                # 94 of a 95 cap
+        self.assertEqual(E(dict(u, weekly_used=93)), "switch")
+        self.assertEqual(E(dict(u, weekly_used=None, fetched_at=1050)), "")   # no week reading since the switch
+
+    def test_limit_account_is_the_slot_that_hit_it(self):
+        n, sw = self.P_NOW, self.sw(active="1", mtime=self.P_NOW - 10)   # cswap switched 10 s ago
+        r2 = n + 40 * 3600
+        u = self.pool_usage({"resets_at": n + 7 * 86400}, {"resets_at": r2 + 1, "used": 100}, account=self.SLOTS["2"])
+        t = {"type": "seven_day", "since": n, "resets_at": r2}
+        self.assertEqual(AP.limit_account(t, u, sw), self.SLOTS["2"])               # by its reset
+        self.assertEqual(AP.limit_account(dict(t, resets_at=r2 + 1000), u, sw), self.SLOTS["2"])   # settling
+        late = self.sw(active="1", mtime=n - AP.SWITCH_SETTLE - 1)
+        self.assertEqual(AP.limit_account(dict(t, resets_at=r2 + 1000), u, late), self.SLOTS["1"])
+        self.assertEqual(AP.limit_account(t, u, late), self.SLOTS["2"])             # the reset still decides
+        self.assertEqual(AP.limit_account(t, {"account": "x"}, {}), "x")            # no cswap: usage.json
+
+    def test_pool_trusts_only_fresh_readings_from_after_the_limit(self):
+        n, t = self.P_NOW, self.target()
+        E = lambda u: AP.pool_eligible(t, n, u, self.sw())
+        self.assertEqual(E(self.pool_usage({"used": 10, "as_of": t["since"] - 5})), "")   # before the limit
+        self.assertEqual(E(self.pool_usage({"used": 10, "as_of": n - AP.USAGE_FRESH - 5})), "")
+        self.assertEqual(E(self.pool_usage({"used": 10}, state="error")), "")
+        self.assertEqual(E(self.pool_usage({"used": 10}, updated=n - AP.USAGE_FRESH - 5)), "")
+        # ...but a reset is a reset, stale or not, if the reading is from that window.
+        r = n - AP.POOL_GRACE
+        self.assertEqual(E(self.pool_usage({"used": 99, "resets_at": r, "as_of": r - 3600}, state="error")), "pool")
+        self.assertEqual(E(self.pool_usage({"used": 99, "resets_at": r + 1, "as_of": r - 3600}, state="error")), "")
+        self.assertEqual(E(self.pool_usage({"used": 99, "resets_at": r, "as_of": r - 8 * 86400})), "")
+        self.assertEqual(E(self.pool_usage({"used": 10}, updated=n - AP.USAGE_DEAD - 5)), "")   # dead publisher
+
+    def test_pool_waits_for_the_switch_to_settle(self):
+        n, t = self.P_NOW, self.target()
+        u = self.pool_usage({"used": 10})
+        self.assertEqual(AP.pool_eligible(t, n, u, self.sw(mtime=n - AP.SWITCH_SETTLE + 1)), "")
+        self.assertEqual(AP.pool_eligible(t, n, u, self.sw(mtime=n - AP.SWITCH_SETTLE)), "pool")
+        self.assertEqual(AP.pool_due(t, n, u, self.sw(mtime=n - 10)), n - 10 + AP.SWITCH_SETTLE)
+
+    def test_pool_leaves_codex_and_grok_alone(self):
+        n = self.P_NOW
+        u = self.pool_usage({"used": 10, "resets_at": n - 1000, "as_of": n - 2000})
+        for t in (self.target(kind="grok"), self.target(type="grok"), self.target(kind="codex", type="codex"),
+                  self.target(resets_at=0)):
+            self.assertEqual(AP.pool_eligible(t, n, u, self.sw()), "", t)
+            self.assertIsNone(AP.pool_due(t, n, u, self.sw()), t)
+            self.assertEqual(AP.limit_eligible(t, n, 0, u, self.sw()), "", t)
+
+    def test_pool_old_publisher_keeps_todays_rules(self):
+        n, t = self.P_NOW, dict(self.target(), account="a")
+        u = {"account": "b", "updated_at": 1200, "fetched_at": 0, "weekly_locked": False, "weekly_used": 99}
+        self.assertEqual(AP.pool_eligible(t, n, u, self.sw()), "")
+        self.assertIsNone(AP.pool_due(t, n, u, self.sw()))
+        t = dict(t, since=1000, resets_at=n + 99999)
+        self.assertEqual(AP.limit_eligible(t, n, 1100, u, self.sw()), "switch")   # 99 < 100, as before
+        self.assertEqual(AP.limit_eligible(t, n, 1100, dict(u, state="error")), "")   # but not on error
+
+    def test_window_free_honours_the_reserve_cap(self):
+        # The latent bug: a switch into the last 1 % of a reserved account.
+        u = {"weekly_locked": False, "weekly_used": 99, "weekly_pace": {"members": [
+            {"slot": "1", "used": 99, "cap": 95, "active": True}]}}
+        self.assertFalse(AP.window_free("weekly", 0, u, self.sw()))
+        self.assertFalse(AP.window_free("weekly", 0, u, self.sw(override="1")))   # 99 vs 98
+        self.assertTrue(AP.window_free("weekly", 0, dict(u, weekly_used=93), self.sw()))
+        no_pace = {"weekly_locked": False, "weekly_used": 99}
+        self.assertTrue(AP.window_free("weekly", 0, no_pace))
+
+    def test_pool_due_is_the_other_accounts_reset(self):
+        n, t = self.P_NOW, self.target()
+        r1 = n + 10800
+        u = self.pool_usage({"used": 99, "resets_at": r1}, {"resets_at": n + 40 * 3600, "used": 100}, state="error")
+        self.assertEqual(AP.pool_due(t, n, u, self.sw()), r1 + AP.POOL_GRACE)
+        # limit_due_at takes the earlier of its own reset and the pool's.
+        tt = dict(t, window_id="@1")
+        self.assertEqual(AP.limit_due_at([tt], True, n, pool_at={"@1": r1 + AP.POOL_GRACE}), r1 + AP.POOL_GRACE)
+        self.assertEqual(AP.limit_due_at([tt], True, n), t["resets_at"] + AP.LIMIT_GRACE)
+        # Another slot free but not active (limited one in use): poll for cswap's switch.
+        u2 = self.pool_usage({"used": 10, "resets_at": n - 200, "as_of": n - 1000})
+        self.assertEqual(AP.pool_due(t, n, u2, self.sw(active="2")), n + AP.LIMIT_SWITCH_POLL)
+        self.assertIsNone(AP.pool_due(t, n + 600, u2, self.sw(active="2")))   # past LIMIT_SWITCH_WAIT
+        # A scoped (opus/sonnet) limit wakes at the earliest pooled scoped reset.
+        rs = n + 5000
+        us = dict(u, scoped_pace={"scope": "pool", "window_minutes": 10080, "members": [
+            {"slot": "1", "used": 100, "resets_at": rs, "as_of": n - 30}]})
+        self.assertEqual(AP.pool_due(dict(t, type="seven_day_opus"), n, us, self.sw()), rs + AP.POOL_GRACE)
+        self.assertEqual(AP.pool_due(t, n, us, self.sw()), r1 + AP.POOL_GRACE)    # not for a weekly limit
+
+    def test_dialog_reply_and_stuck_text(self):
+        R = lambda text, err=False: {"result": {"content": [{"type": "text", "text": text}], "isError": err}}
+        self.assertEqual(AP.dialog_reply(R("answered: dismiss (Escape)\n{}"))[0], "answered")
+        self.assertEqual(AP.dialog_reply(R("no dialog\n{}"))[0], "none")
+        self.assertEqual(AP.dialog_reply(R("unknown: two captures differ\n{}"))[0], "unknown")
+        self.assertEqual(AP.dialog_reply(R("not answered: not a claude pane"))[0], "refused")
+        self.assertEqual(AP.dialog_reply(R("boom", True))[0], "refused")
+        self.assertEqual(AP.dialog_reply({"error": {"message": "Tool not found"}})[0], "refused")
+        t = {"label": "proj/x", "last_result": "held"}
+        self.assertIn("behind a draft", AP.stuck_text(dict(t, held_why="its prompt box has a half-written draft")))
+        self.assertIn("limit dialog is open", AP.stuck_text(dict(t, held_why="Claude's usage-limit dialog is open")))
+        self.assertIn("a dialog is open", AP.stuck_text(
+            dict(t, held_why="no prompt box on screen (a dialog or menu may be up)")))
+        self.assertIn("limit dialog is open", AP.stuck_text(dict(t, last_result="dialog")))
+
+    def test_grok_limits_are_nobody_elses(self):
+        # The DNS probe asks xAI, a cswap switch never frees (or polls for)
+        # a grok target, and none ever carries a Claude cswap account.
+        self.assertEqual(AP.limit_host({"kind": "grok", "type": "model"}), "api.x.ai")
+        self.assertEqual(AP.limit_host({"kind": "claude", "type": "grok"}), "api.x.ai")
+        self.assertEqual(AP.limit_host({"kind": "codex", "type": "codex"}), "chatgpt.com")
+        self.assertEqual(AP.limit_host({"kind": "claude", "type": "five_hour"}), "api.anthropic.com")
+        t = {"type": "five_hour", "since": 1000, "resets_at": 99999}
+        self.assertTrue(AP.switch_settling(t, 1150, 1100, {"updated_at": 1050}))
+        for g in (dict(t, kind="grok"), dict(t, type="grok")):
+            self.assertFalse(AP.switch_settling(g, 1150, 1100, {"updated_at": 1050}), g)
+        d = {"targets": []}
+        g = {"window_id": "@1", "pane_id": "%1", "session_id": "gs-1", "kind": "grok",
+             "resets_at": 0, "type": "model", "since": 1000}
+        stored, renewed = AP.limit_merge(d, dict(g), "acct-a")
+        self.assertTrue(renewed)
+        self.assertNotIn("account", stored)
+        stored["account"] = "acct-a"                             # a stale one from before
+        stored, _ = AP.limit_merge(d, dict(g, since=2000), "acct-b")
+        self.assertNotIn("account", stored)
+        row = {"agent_limit": "0 model 3000", "agent_limit_lifted": "", "pane_id": "%1"}
+        self.assertTrue(AP.limit_sync(stored, row, {"account": "acct-b"}, {}))
+        self.assertNotIn("account", stored)
+        # A claude target still gets now's account.
+        c, _ = AP.limit_merge(d, dict(g, window_id="@2", session_id="cs-1", kind="claude"), "acct-a")
+        self.assertEqual(c["account"], "acct-a")
 
     def test_fmt_local_one_date_format(self):
         # By calendar days in local time: today "5:31 PM", the next six days

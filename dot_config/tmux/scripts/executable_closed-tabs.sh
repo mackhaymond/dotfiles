@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Reopen closed tabs. Every close is kept for a while (RETAIN_DAYS, at most
 # MAX_ENTRIES) with its cwd, its place in the tab bar, a colour snapshot of the
-# screen as it was, and — if a claude / codex / opencode session was running in
-# it — enough to resume that conversation.
+# screen as it was, and — if a claude / codex / opencode / grok session was
+# running in it — enough to resume that conversation.
 #
 #   closed-tabs.sh close <pane_id>                 snapshot, record, kill the pane
 #   closed-tabs.sh pick-popup <session_id> <tty>   fzf picker over the history
@@ -38,7 +38,8 @@
 # opencode's plugin file and SQLite fallback, and stripping resume flags out of
 # the original command line. That is the same code that resumes these sessions
 # after a reboot, so a reopened tab comes back exactly the way a resurrected
-# one does.
+# one does. Grok, which the plugin does not know, is handled here the way
+# assistant-save.sh's grok post-pass handles it (grok_* below).
 #
 # A reopened tab is a normal login zsh with the agent started through
 # ZSH_AUTOSTART (see the end of .zshrc), same as a CMD+R tab: quitting the
@@ -181,6 +182,75 @@ prune() {
 # SessionStart hook, opencode-<pid>.json from its plugin). Same expression as
 # save-assistant-sessions.sh.
 ASSISTANT_STATE_DIR="${TMUX_ASSISTANT_RESURRECT_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect}"
+GROK_HOME="${GROK_HOME:-$HOME/.grok}"
+
+# Grok's TUI, from argv (words, argv0 first): the interactive session is an
+# agent; -p/--single/--prompt-file/--prompt-json runs, help/version and the
+# utility and daemon subcommands are not. Same rules as the watcher's
+# grok_tui_args and assistant-save.sh's awk; -r/--resume and -w/--worktree take
+# an optional value (a next word that is neither an option nor a subcommand).
+# Returns 0 for a TUI, 1 for headless (final), 2 for a subcommand first word:
+# ps flattens argv, so `grok "help me fix X"` reads as `grok help me fix X`,
+# and is_grok settles that one by whether the pid has a session. The scan goes
+# on past the first bare word (a headless flag later still counts) and stops
+# at `--` (words after it are prompt text). Line for line the watcher's
+# grok_tui_args.
+GROK_SUBCMDS=" agent leader worker clone completions doctor du disk-usage export help inspect login logout mcp memory models plugin sessions setup trace update usage version v worktree wrap "
+grok_tui() {
+    local a i=1 n=$# first=1 sub=0
+    local -a w=("$@")
+    while [ "$i" -lt "$n" ]; do
+        a=${w[i]}
+        case "$a" in
+        --) break ;;
+        # -phi / -p=hi (a glued value) and -h… / -v… are headless too.
+        -p*|--single|--single=*|--prompt-file|--prompt-file=*|--prompt-json|--prompt-json=*|-h*|--help|--help=*|-v*|--version|--version=*)
+            return 1 ;;
+        --add-dir|--agent|--agents|--allow|--cwd|--debug-file|--deny|--disallowed-tools|--json-schema|--leader-socket|-m|--model|--max-turns|--output-format|--permission-mode|--reasoning-effort|--effort|--rules|-s|--session-id|--sandbox|--system-prompt-override|--system-prompt|--tools|--worktree-ref|--ref)
+            i=$((i + 2)); continue ;;
+        -r|--resume|-w|--worktree)
+            i=$((i + 1))
+            a=${w[i]:-}
+            if [ -n "$a" ] && [[ "$a" != -* ]] && [[ "$GROK_SUBCMDS" != *" $a "* ]]; then
+                i=$((i + 1))
+            fi
+            continue ;;
+        -*) i=$((i + 1)); continue ;;
+        esac
+        if [ "$first" = 1 ]; then
+            first=0
+            [[ "$GROK_SUBCMDS" == *" $a "* ]] && sub=1
+        fi
+        i=$((i + 1))
+    done
+    [ "$sub" = 1 ] && return 2
+    return 0
+}
+# grok_has_session <pid>: a grok-<pid>.json record (only a TUI fires
+# SessionStart) or an active_sessions.json entry. No fork.
+grok_has_session() {
+    [ -f "$ASSISTANT_STATE_DIR/grok-$1.json" ] && return 0
+    local a="" re="\"pid\"[[:space:]]*:[[:space:]]*$1([^0-9]|\$)"
+    [ -s "$GROK_HOME/active_sessions.json" ] || return 1
+    read -r -d '' a <"$GROK_HOME/active_sessions.json"
+    [[ "$a" =~ $re ]]
+}
+# is_grok <args> [pid]: a Grok TUI's command line (argv0 basename grok or
+# grok-<os>-<arch>; never the `agent` symlink to the same binary).
+is_grok() {
+    local -a w
+    set -f
+    w=($1)
+    set +f
+    [ "${#w[@]}" -gt 0 ] || return 1
+    [[ "${w[0]##*/}" =~ ^grok(-(macos|linux|windows)-[a-z0-9_]+)?$ ]] || return 1
+    grok_tui "${w[@]}"
+    case $? in
+    0) return 0 ;;
+    2) [ -n "${2:-}" ] && grok_has_session "$2" ;;
+    *) return 1 ;;
+    esac
+}
 
 # The part of the agent lookup that needs the agent ALIVE, kept as small as
 # possible because the tab stays on screen until it's done: find the agent
@@ -200,13 +270,34 @@ agent_snapshot() {
         # it needs.
         local snap; snap=$(ps -t "${pane_tty#/dev/}" -o pid=,ppid=,args= 2>/dev/null)
         [ -n "$snap" ] || exit 0
-        local apid args tool
-        apid=$(pane_has_assistant "$pane_pid" "$snap") || exit 0
-        args=$(awk -v p="$apid" '$1 == p { sub(/^ *[0-9]+ +[0-9]+ /, ""); print; exit }' <<<"$snap")
-        tool=$(detect_tool "$args")
+        # pane_has_assistant's walk (the pane's own pid, then its descendants)
+        # with the plugin's detect_tool, plus a Grok TUI. Done here rather than
+        # through a detect_tool override because the grok check needs the pid
+        # (is_grok's session test).
+        local apid="" args="" tool="" p a
+        while IFS=$'\x1f' read -r p a; do
+            if is_grok "$a" "$p"; then tool=grok
+            else tool=$(detect_tool "$a")
+            fi
+            if [ -n "$tool" ]; then apid=$p args=$a; break; fi
+        done < <(awk -v root="$pane_pid" '
+            { pid = $1; ppid = $2; line = $0; sub(/^ *[0-9]+ +[0-9]+ /, "", line)
+              args[pid] = line; kids[ppid] = kids[ppid] " " pid }
+            END {
+                q[++qe] = root
+                for (qs = 1; qs <= qe; qs++) {
+                    cur = q[qs]
+                    if (cur in args) print cur "\037" args[cur]
+                    n = split(kids[cur], c, " ")
+                    for (j = 1; j <= n; j++) q[++qe] = c[j]
+                }
+            }' <<<"$snap")
         [ -n "$tool" ] || exit 0
         local copy; copy=$(mktemp -d)
         cp "$ASSISTANT_STATE_DIR/$tool-$apid.json" "$copy/" 2>/dev/null
+        # Grok drops its active_sessions.json entry as it exits, and that
+        # entry is where its current session id lives (/new, /resume).
+        [ "$tool" = grok ] && cp "$GROK_HOME/active_sessions.json" "$copy/grok-active.json" 2>/dev/null
         printf '%s\x1f%s\x1f%s\x1f%s\n' "$tool" "$apid" "$args" "$copy"
     )
 }
@@ -214,9 +305,14 @@ agent_snapshot() {
 # The session behind an agent, through the plugin's own resolver (emit_session).
 # With a state dir, reads that copy instead of the live one — which is what
 # lets this run after the agent is gone.
-# Prints "<session_id>\x1f<cli_args>\x1f<model>\x1f<env json>" or nothing.
+# Prints "<session_id>\x1f<cli_args>\x1f<model>\x1f<env json>" or nothing;
+# grok adds a fifth field, the session's own cwd.
 agent_session() {
     local tool="$1" apid="$2" args="$3" cwd="$4" state="${5:-}"
+    if [ "$tool" = grok ]; then
+        grok_session "$apid" "$args" "${state:-}"
+        return 0
+    fi
     [ -r "$RESURRECT_SAVE" ] || return 0
     (
         # The save script turns on errexit/nounset when sourced; its functions
@@ -236,6 +332,46 @@ agent_session() {
             "$PARTS_FILE" 2>/dev/null
         rm -f "$PARTS_FILE"
     )
+}
+
+# A Grok session, the way assistant-save.sh's grok post-pass resolves it: the
+# active_sessions.json entry for the pid (rewritten on /new and /resume), else
+# the grok-<pid>.json record grok-session-track.sh keeps, else a UUID given to
+# -r/--resume or -s/--session-id. From the copies agent_snapshot took when the
+# state dir is given, the live files otherwise. cli_args is argv minus argv0
+# (build_cmd trims it); no model (a -m in argv stays there); env from the record.
+grok_session() {
+    local apid="$1" args="$2" state="${3:-}" act rec
+    if [ -n "$state" ]; then
+        act="$state/grok-active.json" rec="$state/grok-$apid.json"
+    else
+        act="$GROK_HOME/active_sessions.json" rec="$ASSISTANT_STATE_DIR/grok-$apid.json"
+    fi
+    [ -s "$act" ] || act=/dev/null
+    [ -s "$rec" ] || rec=/dev/null
+    jq -rn --arg pid "$apid" --arg args "$args" --slurpfile act "$act" --slurpfile rec "$rec" '
+        def uuid: test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
+        ($args | [splits("[ \t]+")] | map(select(length > 0))) as $w
+        | ([range(0; $w | length) as $i
+            | if ($w[$i] | test("^(-r|--resume|-s|--session-id)$")) then ($w[$i + 1] // "")
+              elif ($w[$i] | test("^(--resume|--session-id)=")) then ($w[$i] | sub("^[^=]*="; ""))
+              else empty end
+            | select(uuid)] | last // "") as $argsid
+        | ((($act[0] // []) | if type == "array" then . else [] end)
+           | map(select((.pid | tostring) == $pid)) | last // {}) as $a
+        | ($rec[0] // {} | if type == "object" then . else {} end) as $r
+        | ([$a.session_id, $r.session_id, $argsid] | map(select(type == "string" and . != "")) | first // "") as $sid
+        | select($sid != "")
+        | [$sid, ($w[1:] | join(" ")), "", ($r.env // {} | tojson),
+           ([$a.cwd, $r.cwd] | map(select(type == "string" and . != "")) | first // "")]
+        | join("\u001f")' 2>/dev/null
+}
+
+# grok_cmd: the grok to resume with. The installer links ~/.grok/bin/grok and
+# puts nothing on PATH, so that link wins when it exists.
+grok_cmd() {
+    if [ -x "$GROK_HOME/bin/grok" ]; then posix_quote "$GROK_HOME/bin/grok"
+    else printf 'command grok'; fi
 }
 
 # The same resume command restore-assistant-sessions.sh builds.
@@ -301,6 +437,37 @@ build_cmd() {
             --model=*) has_model=1 ;;
             esac
         fi
+        # Grok: only the leading options too, minus what would fight the
+        # `-r <sid>` added below: -r/--resume and -w/--worktree with their
+        # optional value (a next word that is no option), -c/--continue,
+        # -s/--session-id, --worktree-ref/--ref and --cwd with theirs, and the
+        # one-shot --fork-session and --restore-code. The tab reopens in the
+        # session's cwd, so --cwd (and a relative --add-dir, dropped too)
+        # would resolve against the wrong directory; an absolute --add-dir
+        # stays. Same rules as grokcut in assistant-restore.sh.
+        if [ "$tool" = grok ]; then
+            case "$a" in
+            -r|--resume|-w|--worktree)
+                [ "$i" -lt "$n" ] && [[ "${words[i]}" != -* ]] && i=$((i + 1))
+                continue ;;
+            -s|--session-id|--worktree-ref|--ref|--cwd) i=$((i + 1)); continue ;;
+            --add-dir)
+                if [ "$i" -lt "$n" ]; then
+                    [[ "${words[i]}" == /* ]] && q_args+=" $(posix_quote "$a") $(posix_quote "${words[i]}")"
+                    i=$((i + 1))
+                fi
+                continue ;;
+            --add-dir=/*) ;;
+            -c|--continue|--fork-session|--restore-code|--resume=*|--worktree=*|--session-id=*|--worktree-ref=*|--ref=*|--cwd=*|--add-dir=*) continue ;;
+            --|[!-]*) break ;;
+            --agent|--agents|--allow|--debug-file|--deny|--disallowed-tools|--json-schema|--leader-socket|-m|--model|--max-turns|--output-format|--permission-mode|--reasoning-effort|--effort|--rules|--sandbox|--system-prompt-override|--system-prompt|--tools)
+                if [ "$i" -lt "$n" ]; then
+                    q_args+=" $(posix_quote "$a") $(posix_quote "${words[i]}")"
+                    i=$((i + 1))
+                    continue
+                fi ;;
+            esac
+        fi
         q_args+=" $(posix_quote "$a")"
     done
     # Only the variables @assistant-resurrect-capture-env lists, as a prefix.
@@ -323,6 +490,7 @@ build_cmd() {
         local codex="command codex"
         [ -x "$HOME/.local/bin/codex" ] && codex=$(posix_quote "$HOME/.local/bin/codex")
         echo "${env_prefix}${codex}${q_args} resume $(posix_quote "$sid")" ;;
+    grok) echo "${env_prefix}$(grok_cmd)${q_args} -r $(posix_quote "$sid")" ;;
     esac
 }
 
@@ -381,7 +549,10 @@ do_close() {
         sess_info=$(agent_session "$tool" "$apid" "$args" "$cwd" "$copy")
     fi
     [ -n "$copy" ] && rm -rf "$copy"
-    [ -n "$sess_info" ] && IFS=$'\x1f' read -r sid cli_args model env_json <<<"$sess_info"
+    local scwd=""
+    [ -n "$sess_info" ] && IFS=$'\x1f' read -r sid cli_args model env_json scwd <<<"$sess_info"
+    # A grok session is looked up under its own cwd (a -w worktree one too).
+    [ -n "$scwd" ] && [ -d "$scwd" ] && cwd="$scwd"
 
     local cmd; cmd=$(build_cmd "$tool" "$sid" "$cli_args" "$model" "$env_json")
     local rec
@@ -443,6 +614,24 @@ transcript_digest() {
             | if .type == "text" then "\($r | ascii_upcase): \(.text[0:800])"
               elif .type == "tool" then "  [\(.tool)]"
               else empty end' 2>/dev/null ;;
+    grok)
+        # `grok export` reads the session off disk and prints Markdown
+        # (~0.2s; no model, no leader): "## User" / "## Assistant" paragraphs
+        # and "## Tools" bullets. Without it, the session's own title.
+        local bin="$GROK_HOME/bin/grok" out=""
+        [ -x "$bin" ] || bin=$(command -v grok 2>/dev/null)
+        [ -n "$bin" ] && out=$(cd / && "$bin" export "$sid" </dev/null 2>/dev/null | awk '
+            /^## User$/ { r = "USER"; next }
+            /^## Assistant$/ { r = "ASSISTANT"; next }
+            /^## / { r = (/^## Tools$/) ? "TOOLS" : ""; next }
+            r == "TOOLS" && /^- / { print "  [" substr($0, 3, 160) "]"; next }
+            r != "" && r != "TOOLS" && NF { print r ": " substr($0, 1, 800) }')
+        if [ -n "$out" ]; then
+            printf '%s\n' "$out"
+        else
+            f=$(ls "$GROK_HOME"/sessions/*/"$sid"/summary.json 2>/dev/null | head -n 1)
+            [ -r "$f" ] && jq -r '(.generated_title // .session_summary // empty) | "TITLE: \(.)"' "$f" 2>/dev/null
+        fi ;;
     esac
 }
 
@@ -594,14 +783,14 @@ reopen_one() {
     fi
     local -a autostart=() birth=()
     [ -n "$cmd" ] && autostart=(-e "ZSH_AUTOSTART=$cmd")
-    # A claude/codex/opencode tab comes back AS an agent, in the new-window's own
+    # A claude/codex/opencode/grok tab comes back AS an agent, in the new-window's own
     # command list (agent-birth.conf; guarded, so a server without
     # @agent_birth still reopens it), wearing the name it had when it closed
     # until the resumed session's hooks retitle it. The name is a set-option
     # argument: one ending in ';' would end the command list, and one starting
     # with '-' would read as a flag, so those are trimmed / skipped.
     case "$tool" in
-    claude|codex|opencode)
+    claude|codex|opencode|grok)
         if [ -n "$cmd" ]; then
             birth=(\; run-shell -C "#{?@agent_birth,#{@agent_birth} $tool,}")
             label="${label%"${label##*[!; ]}"}"

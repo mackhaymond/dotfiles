@@ -26,7 +26,7 @@ MODERN_BASH = bool(BASH) and subprocess.run(
     [BASH, '-c', '((BASH_VERSINFO[0] >= 4))'], capture_output=True).returncode == 0
 
 # Run each script's own code: closed-tabs' build_cmd function, and
-# assistant-restore's codex_cmd lines, JQ program and rows= invocation.
+# assistant-restore's codex_cmd / grok_cmd lines, JQ program and rows= invocation.
 HARNESS = r'''
 set -u
 mode=$1
@@ -39,6 +39,7 @@ else
     src="$SCRIPTS/executable_assistant-restore.sh"
     eval "$(awk "/^read -r -d '' JQ_PROG <<'JQ'\$/{f=1} f{print} f&&/^JQ\$/{exit}" "$src")"
     eval "$(grep -E '^(\[ -x "\$HOME/.local/bin/codex" \] && )?codex_cmd=' "$src")"
+    eval "$(grep -E '^(\[ -x "\$grok_bin" \] && )?grok_cmd=' "$src")"
     capture_json="${CAPTURE_JSON:-[]}"
     eval "$(grep -E '^rows=' "$src")"
     printf '%s\n' "$rows" | awk -F '\037' -v f="${FIELD:-5}" '{print $f}'

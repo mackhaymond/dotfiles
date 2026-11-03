@@ -44,7 +44,8 @@ WATCHER = ao.SCRIPTS / "executable_agent-tab-watcher.sh"
 MARK_ORDER = ["@agent_paused", "@agent_limit", "@agent_detail_kind", "@agent_detail",
               "@agent_turn_result", "@agent_since", "@agent_state"]
 LABEL = {"five_hour": "session limit", "seven_day": "weekly limit", "seven_day_opus": "Opus weekly limit",
-         "seven_day_sonnet": "Sonnet weekly limit", "overage": "overage limit", "codex": "Codex limit"}
+         "seven_day_sonnet": "Sonnet weekly limit", "overage": "overage limit", "codex": "Codex limit",
+         "grok": "Grok limit"}
 STUB = """#!/bin/sh
 echo "$*" >> "%s"
 """
@@ -213,6 +214,23 @@ exec "%s" "$@"
         self.transcript_rows(rec)
         self.stop_failure("u1")
         self.assertEqual(self.limit()[:2], [str(r), "seven_day"])
+
+    def test_unknown_type_is_a_session_limit_only_under_5h_with_a_session_window(self):
+        # A weekly-only account (@codex_session_limit "0": no five_hour window)
+        # near its weekly reset must not read as a "session limit".
+        now = int(time.time())
+        cases = [(now + 3 * 3600, None, "five_hour"),        # unset = unknown: has one
+                 (now + 5 * 3600 + 900, None, "seven_day"),  # 5.25 h out: no session window resets that late
+                 (now + 3 * 3600, "1", "five_hour"),
+                 (now + 3 * 3600, "0", "seven_day")]
+        for i, (r, opt, want) in enumerate(cases):
+            with self.subTest(r=r - now, opt=opt):
+                if opt is not None:
+                    subprocess.run(self.tmuxcmd + ["set-option", "-g", "@codex_session_limit", opt],
+                                   check=True, timeout=5)
+                self.transcript_rows(rl_record(r, rtype="", text="You've hit your limit"))
+                self.stop_failure("u%d" % i)
+                self.assertEqual(self.limit()[:2], [str(r), want])
 
     def test_sidechain_record_is_ignored(self):
         now = int(time.time())
@@ -624,7 +642,7 @@ class LimitCoreTests(unittest.TestCase):
                          re.S | re.M).group(0)
         now = int(time.time())
         cases = [(now + 300, "five_hour"), (now + 2 * 86400, "seven_day"), (now + 10 * 86400, "codex"),
-                 (0, "model"), (now + 86400, "seven_day_opus")]
+                 (0, "model"), (now + 86400, "seven_day_opus"), (0, "grok"), (now + 3600, "grok")]
         script = core + "\n" + "\n".join(
             'limit_text %d %s %d; printf "%%s\\n" "$LIM_TXT"' % (r, t, now) for r, t in cases)
         out = subprocess.run(["bash", "-c", script], text=True, capture_output=True,

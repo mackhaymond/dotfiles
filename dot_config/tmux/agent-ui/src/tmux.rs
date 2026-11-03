@@ -251,7 +251,7 @@ pub const DASH_OPTION: &str = "@space_dash_pane";
 /// Every pane of the window as `<flag><pane_index><pane_id>:<pane_pid> `:
 /// flag `A` / `p` for the active / another pane, `D` / `d` for a dashboard
 /// pane ([`DASH_OPTION`]) that is / is not active; the pid of the pane's
-/// process (the pins find an opencode's session under it). Only
+/// process (the pins find an opencode's or a grok's session under it). Only
 /// `[ADdp%:0-9 ]` is printed, so it needs no guard. Verified on tmux 3.7: a
 /// `#{P:}` loop in a `list-windows` format resolves pane options per pane.
 /// The loop's order is tmux's internal one (pane creation, not
@@ -407,7 +407,7 @@ pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
 /// instead of status-right, read in the same one call (no script runs).
-pub const STATUS_FORMATS: [&str; 35] = [
+pub const STATUS_FORMATS: [&str; 36] = [
     "#{client_key_table}", "#{@sidebar_open}", "#{@sidebar_pids}", "#{@resurrect_stale}",
     "#{@codex_session_text}", "#{@codex_session_color}", "#{@codex_weekly_text}", "#{@codex_weekly_color}",
     "#{@codex_scoped_icon}", "#{@codex_scoped_text}", "#{@codex_scoped_color}", "#{@codex_account_label}",
@@ -436,6 +436,10 @@ pub const STATUS_FORMATS: [&str; 35] = [
     // "off" turns it off; anything else, unset included, is on. The
     // sidebar's rate-limit banner says which.
     "#{@agent_limit_autoresume}",
+    // Whether the active account has a session (5h) window at all: "1" yes,
+    // "0" none (a weekly-only account: the sidebar drops its S meter), ""
+    // unknown (another account's block, an older publisher): as "1".
+    "#{@codex_session_limit}",
 ];
 
 /// One usage window's numeric options (`@codex_<w>_used`, `_expected`,
@@ -501,6 +505,9 @@ pub struct Status {
     pub stale_after: String,
     /// `@agent_limit_autoresume`, raw ("" = unset: on).
     pub limit_autoresume: String,
+    /// `@codex_session_limit`, raw: "1" the active account has a session
+    /// window, "0" it has none (weekly-only), "" unknown ([`Status::no_session_limit`]).
+    pub session_limit: String,
 }
 
 impl Status {
@@ -537,7 +544,15 @@ impl Status {
             server_start: f(32),
             stale_after: f(33),
             limit_autoresume: f(34),
+            session_limit: f(35),
         }
+    }
+
+    /// The active account has NO session window (`@codex_session_limit` is
+    /// "0", trimmed): a weekly-only account. "1" and "" (unknown, an older
+    /// publisher) keep the session meter.
+    pub fn no_session_limit(&self) -> bool {
+        self.session_limit.trim() == "0"
     }
 }
 
@@ -599,7 +614,7 @@ pub struct Window {
     /// included and marked; empty for a row without the field's tokens
     /// (tests, junk).
     pub pane_list: Vec<Pane>,
-    /// @agent_kind: claude | codex | opencode | "".
+    /// @agent_kind: claude | codex | opencode | grok | "".
     pub kind: String,
     /// @agent_detail_kind: perm | ask | fail | done | run | "".
     pub detail_kind: String,
@@ -1043,6 +1058,11 @@ pub(crate) mod tests {
         assert_eq!((c.status.sidebar_width.as_str(), c.status.server_start.as_str()), ("v31", "v32"));
         assert_eq!(c.status.stale_after, "v33");
         assert_eq!(c.status.limit_autoresume, "v34");
+        assert_eq!(c.status.session_limit, "v35");
+        // No session window only for "0" (trimmed); "1" and unknown "" keep it.
+        for (raw, none) in [("0", true), (" 0 ", true), ("1", false), ("", false), ("junk", false)] {
+            assert_eq!(Status { session_limit: raw.into(), ..Status::default() }.no_session_limit(), none, "{raw:?}");
+        }
         // Auto-resume: on unless off / 0 / false / no (trimmed, any case),
         // as agent-pause.py reads it.
         for (raw, on) in [("", true), ("on", true), ("1", true), ("yes", true), ("junk", true), ("off", false),

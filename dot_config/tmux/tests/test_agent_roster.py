@@ -451,7 +451,8 @@ class PaneTests(unittest.TestCase):
     PS = "\n".join(["??       launchd", "ttys001  -zsh", "ttys002  /opt/homebrew/bin/codex",
                     "ttys002  node", "ttys003  2.1.291", "ttys004  /usr/bin/claude",
                     "ttys005  10.0.0.1", "ttys006  opencode-helper",
-                    "ttys007  /opt/homebrew/bin/opencode"])
+                    "ttys007  /opt/homebrew/bin/opencode",
+                    "ttys008  /Users/me/.grok/bin/grok"])
 
     def panes(self, *rows):
         return "\n".join(US.join(r) for r in rows)
@@ -479,6 +480,22 @@ class PaneTests(unittest.TestCase):
         # An opencode pane alone in a non-opencode window: nothing to close.
         panes = self.panes(("%1", "/dev/ttys001", "1"), ("%2", "/dev/ttys007", "0"))
         self.assertEqual(R.pick_agent_pane(panes, self.PS, "claude"), (None, R.PANE_UNSURE))
+        self.assertEqual(R.pick_agent_pane(panes, self.PS), (None, R.PANE_UNSURE))
+
+    def test_grok_counts_only_in_a_grok_window(self):
+        # In a grok window its pane is the one, over an active shell or claude.
+        panes = self.panes(("%1", "/dev/ttys001", "1"), ("%2", "/dev/ttys008", "0"))
+        self.assertEqual(R.pick_agent_pane(panes, self.PS, "grok"), ("%2", None))
+        panes = self.panes(("%1", "/dev/ttys008", "0"), ("%2", "/dev/ttys004", "1"))
+        self.assertEqual(R.pick_agent_pane(panes, self.PS, "grok"), ("%1", None))
+        # `grok -p` / `grok sessions` split beside a claude / codex (same comm):
+        # the active grok pane is not the agent; the kind's own pane is.
+        for agent_tty, kind in (("/dev/ttys004", "claude"), ("/dev/ttys002", "codex"), ("/dev/ttys004", "")):
+            panes = self.panes(("%1", agent_tty, "0"), ("%2", "/dev/ttys008", "1"))
+            self.assertEqual(R.pick_agent_pane(panes, self.PS, kind), ("%1", None), kind)
+        # A grok pane alone in a non-grok window: nothing to close.
+        panes = self.panes(("%1", "/dev/ttys001", "1"), ("%2", "/dev/ttys008", "0"))
+        self.assertEqual(R.pick_agent_pane(panes, self.PS, "opencode"), (None, R.PANE_UNSURE))
         self.assertEqual(R.pick_agent_pane(panes, self.PS), (None, R.PANE_UNSURE))
 
     def test_kind_match_beats_the_active_pane(self):
@@ -509,14 +526,23 @@ class PaneTests(unittest.TestCase):
 
     def test_is_agent_comm(self):
         for c in ("claude", "codex", "/usr/local/bin/codex", "2.1.291",
-                  "opencode", "/opt/homebrew/bin/opencode"):
+                  "opencode", "/opt/homebrew/bin/opencode",
+                  "grok", "/Users/me/.grok/bin/grok", "grok-macos-aarch64", "grok-linux-x86_64"):
             self.assertTrue(R.is_agent_comm(c), c)
-        for c in ("node", "-zsh", "10.0.0.1", "1.2.3-beta", "opencode-helper", "claude-helper"):
+        for c in ("node", "-zsh", "10.0.0.1", "1.2.3-beta", "opencode-helper", "claude-helper",
+                  "agent", "/Users/me/.grok/bin/agent", "grok-helper", "grokker", "xgrok",
+                  "grok-mcp-server", "grok-macos-"):
             self.assertFalse(R.is_agent_comm(c), c)
 
+    def test_comm_kind(self):
+        for c, k in (("claude", "claude"), ("2.1.291", "claude"), ("/usr/local/bin/codex", "codex"),
+                     ("/opt/homebrew/bin/opencode", "opencode"), ("/Users/me/.grok/bin/grok", "grok"),
+                     ("/Users/me/.grok/downloads/grok-macos-aarch64", "grok")):
+            self.assertEqual(R.comm_kind(c), k, c)
+
     def test_kind_glyphs(self):
-        # Parity with agent-ui model.rs kind_glyph (U+F489 for opencode).
-        self.assertEqual(R.KIND_GLYPH, {"claude": "✳", "codex": "⬢", "opencode": ""})
+        # Parity with agent-ui model.rs kind_glyph (U+F489 for opencode, U+2726 for grok).
+        self.assertEqual(R.KIND_GLYPH, {"claude": "✳", "codex": "⬢", "grok": "✦", "opencode":""})
 
 
 class ActTests(unittest.TestCase):

@@ -500,13 +500,18 @@ a digit back, any other key drops it and does its own thing.
 - `x` finds the agent's pane by TTY, the way the watcher does: `list-panes`
   (`pane_id`, `pane_tty`, `pane_active`) plus one `ps -ax -o tty=,comm=`, run
   only on `x` (and on peek) and only for a split window, matching a comm of
-  `claude`, `codex`, `opencode` or a bare version like `2.1.291`.
+  `claude`, `codex`, `opencode`, a grok one (`GROK_COMM`:
+  `^grok(-(macos|linux|windows)-[a-z0-9_]+)?$`, `grok` or the real binary's
+  `grok-macos-aarch64`; never its other symlink `agent`) or a bare version
+  like `2.1.291`.
   `pane_current_command` is not used: codex launched through npm shows there
   as `node`. The window's `@agent_kind` steers it (`pick_agent_pane`'s
   `kind`, mirrored from agent-roster.py with the same tests): an `opencode`
   pane counts only in an opencode window, so `opencode serve` split beside a
-  Claude is never what `x` closes; among several agent panes the one whose
-  comm matches the kind (`comm_kind`: codex, opencode, else claude) wins
+  Claude is never what `x` closes, and a `grok` pane only in a grok window
+  (`grok -p` and `grok sessions` share the TUI's comm, and only the comm is
+  read here); among several agent panes the one whose
+  comm matches the kind (`comm_kind`: codex, opencode, grok, else claude) wins
   before the active-pane fallback. A one-pane window closes that pane; a
   split window where no pane runs an agent, or several do and neither the
   kind nor the active pane picks one, is refused ("can't tell which pane is
@@ -538,7 +543,7 @@ tmux keeps two GLOBAL options, each a window id (`@12`) or empty:
 | `@agent_mru_prev` | the agent window landed on before that; never equal to cur |
 
 - **Agent window** = `@agent_state` is set. It is the one marker present on
-  every live Claude/Codex/OpenCode window, idle ones included: the hooks write it and
+  every live Claude/Codex/OpenCode/Grok window, idle ones included: the hooks write it and
   the watcher seeds `idle` for any agent process it finds without one, and its
   GC unsets it when the agent is gone (the same field the roster and
   agent-jump.sh filter on). `@agent_kind` would mostly work too, but it is a
@@ -693,9 +698,10 @@ described in the rest of this section; it was not changed.**
   are not chosen anywhere new: `Roster.shape()` is `dot()` with the glyph
   swapped and `strip_glyph()` is `glyph()` with ⚙/◎ for the Nerd Font ones,
   so cua-notch's palette check (section 65, which reads `dot()`/`glyph()`)
-  still covers the strip. A dim `✳` (Claude), `⬢` (Codex) or U+F489
-  (OpenCode, Nerd Font nf-oct-terminal) follows the state when
-  `@agent_kind` is set. Titles: `project/` is kept only if it fits
+  still covers the strip. A dim `✳` (Claude), `⬢` (Codex), U+F489
+  (OpenCode, Nerd Font nf-oct-terminal) or `✦` (Grok Build, U+2726, one
+  cell) follows the state when `@agent_kind` is set. `KIND_GLYPH` here and
+  agent-ui's `model::kind_glyph` use the same code points. Titles: `project/` is kept only if it fits
   whole in a third of the width, else the title gets everything
   (`fit_label`).
 - **Branch**: dim `⎇ name` after the session name, when it fits. Read from
@@ -1010,9 +1016,11 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   `turn_aborted`) nothing, so the run detail shows. Inline code (`-c`,
   `-e`, `-m`) is shown as just the interpreter; a script file only by a
   plain, not secret-looking name. `AGENT_UI_CLAUDE_DIR` points the Claude side
-  elsewhere (tests; Codex needs no directory). An OpenCode agent has no
-  blurb (no transcript reader for it yet): its run detail shows, and it
-  never borrows the words of a Claude session naming the same window.
+  elsewhere (tests; Codex needs no directory). An OpenCode or Grok agent
+  has no blurb (no transcript reader for either yet; a Grok's
+  `transcript_path` is its own `updates.jsonl`, not a Claude transcript):
+  its run detail shows, and it never borrows the words of a Claude session
+  naming the same window.
 
 - **Letters**: every agent tile and shell row (both scopes) and every
   NEEDS YOU card starts, after its rail and a pad, with a ` a ` key-cap in
@@ -1060,7 +1068,13 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
     up to 15 points over, red beyond (no pace: the status line's `_color`),
     so "fine" or "over" reads before the number. `_members` (`slot:used:active[:cap],…`, the
     optional cap = 100 − the account's reserve, 100 when absent) is parsed
-    into `status::Member` (not drawn yet);
+    into `status::Member` (not drawn yet). A **weekly-only** account (the
+    active account has no 5-hour session window: `@codex_session_limit`
+    `"0"`, trimmed, on the same client row, `Status::no_session_limit`) has
+    no S meter: it goes, and the account label moves onto W (`mack W`), as
+    the status line's own `codex_session` / `codex_weekly` modules do; `"1"`
+    and `""` (unknown: another account's block, an older publisher) draw all
+    three, the label on S;
   - `@resurrect_stale` as ` ! last save 2h ago` / `save refused`, red;
   - prefix v's range selection (below).
   All of it rides on the client row of the same `list-clients` call
@@ -1230,7 +1244,17 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
     `@agent_session_id`; opencode's `-s <id>` / `--session <id>` from the
     argv of the opencode process under one of its panes (libproc's child
     list from `#{pane_pid}`), so one started without an id has none (its
-    pin lives as long as its window). The live sidebar syncs
+    pin lives as long as its window); grok's from the Grok TUI process
+    under one of its panes (argv[0] a grok one and the TUI rule,
+    `actions::grok_tui`, on the real argv; a subcommand-word "no" is
+    overruled when that pid has a `grok-<pid>.json` resurrect record or a
+    row in `active_sessions.json`), its id from Grok's own
+    `~/.grok/active_sessions.json` (`$GROK_HOME`) by that pid, else its
+    `-s <id>` / `--session-id <id>`, else `@agent_session_id` (never a
+    claude file naming the window), and the ids it was started to resume
+    (`-r <id>` / `--resume <id>`) re-key an entry as claude's do. The
+    insight engine skips the Grok pass (`pins::sessions_with` with no
+    sources: no map read, no process walk). The live sidebar syncs
     (`pins::Sync`: only while anything is pinned or stored, when the windows
     changed or every 10 s, no fork): a pinned window's entry is kept
     current; an entry whose session now runs in an unpinned window is put
@@ -1556,7 +1580,8 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
 ### Rate-limited agents
 
 A usage limit (Claude's StopFailure `rate_limit`, Codex's
-`usage_limit_exceeded`) does not fail the agent: the tab hook marks it a
+`usage_limit_exceeded`, Grok's 429 `rate_limit`; Grok's capacity
+`rate_limit`, a 503/529, stays a red failure) does not fail the agent: the tab hook marks it a
 PAUSED agent with a reason (the contract is
 [agent-tab-indicator.md](agent-tab-indicator.md) and
 [agent-pause.md](agent-pause.md)): `@agent_state paused` and
@@ -1624,7 +1649,10 @@ agent-pause.py reads it; unset = on).
   With no reset time the line is the indicator's `@agent_detail`
   (sanitized, blanks collapsed; `Opus limit · /model to switch` whole when
   it fits, else the part before ` · `, else cut), `model limit` without
-  one (`view::limit_detail`). The ` ⏎ resume ` chip (solid peach) follows
+  one (`view::limit_detail`). A Grok limit always has no reset time (type
+  `grok`, `resets_at` 0: its free tier resets over a rolling 24 h), so its
+  card reads `Grok limit · resets over 24h` (or `Grok limit`) with the
+  chip: only Mack resumes it. The ` ⏎ resume ` chip (solid peach) follows
   whenever the card is resumable. Narrower, `resets` goes, then the time
   (`limit`); the words give way before the chip, then the chip alone, then
   the words without it. Times are local (`text::when`: 12-hour clock, the
@@ -1776,8 +1804,9 @@ context only for `agent-ui insight`, never on a card). On the cards
   (`pins::sessions`), then `~/.claude/projects/<slug>/<sid>.jsonl` (else a
   scan of the project folders, cached), plus `<sid>/subagents/*.jsonl` for
   its subagents' edits. Codex: `@agent_rollout`, else
-  `~/.codex/sessions/*/*/*/rollout-*-<@agent_session_id>.jsonl`. OpenCode:
-  none.
+  `~/.codex/sessions/*/*/*/rollout-*-<@agent_session_id>.jsonl`. OpenCode,
+  Grok: none (a Grok's `transcript_path` is its own `updates.jsonl`, never a
+  Claude transcript; `Engine::update` skips both kinds).
 - **Reads.** Incremental per file by (inode, len, mtime): only appended
   whole lines (a half-written one is read again whole); shrunk, replaced or
   rewritten → parsed again. At most the last 32 MB on first sight (an edit
@@ -1874,7 +1903,7 @@ own; close it as ever: prefix q, Space x, or ⌘W on the tab).
   through Bash, `sed` say, is not attributed). Only a KNOWN answer counts
   (`Insight::diff_known`: every touched file outside any repo, dirty now,
   or shown clean by a whole git answer current since the agent's last edit
-  of it). No insight (an OpenCode agent, a transcript not found yet), or a
+  of it). No insight (an OpenCode or Grok agent, a transcript not found yet), or a
   repo not answered yet: no hint, never a guess.
 - **The hint**, on the card's second line after the diff badge, before the
   age: `close?` in the placeholder's faint ink (`overlay1`; `overlay2` on
@@ -1928,7 +1957,8 @@ Every path runs `answer::answer`, which sends nothing unless it is sure:
 
 1. The window (as the current snapshot has it) is a Claude agent still
    in needs-input on a permission gate. Codex (`answer Codex prompts in its
-   tab`), OpenCode and unknown kinds are refused: Codex's approval overlay
+   tab`), Grok (`answer Grok prompts in its tab`: its approval dialog is not
+   read here either), OpenCode and unknown kinds are refused: Codex's approval overlay
    ("Would you like to run the following command?", `› 1. Yes, proceed`)
    has not been verified on a live pane, so its keys are not guessed.
 2. It is the prompt the click or key saw: a chip and a menu row carry the

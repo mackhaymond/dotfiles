@@ -54,7 +54,8 @@
 //! during a long allowed tool would answer the next prompt.
 //! Codex draws its own approval overlay ("Would you like to run the
 //! following command?" `› 1. Yes, proceed`), not verified on a live pane
-//! here, so a Codex agent is refused (as is OpenCode): go to it.
+//! here, so a Codex agent is refused (as are OpenCode and Grok, whose own
+//! approval dialog is not read here either): go to it.
 //!
 //! The command line refuses through notify.sh (a toast in the sidebar, else
 //! tmux's message; `$NOTIFY_SH` names another, as agent-jump.sh), exit 1;
@@ -233,6 +234,7 @@ fn refuse_window(w: &Window) -> Option<String> {
     match w.kind.as_str() {
         "claude" => {}
         "codex" => return Some(format!("{}: answer Codex prompts in its tab", w.label)),
+        "grok" => return Some(format!("{}: answer Grok prompts in its tab", w.label)),
         _ => return Some(format!("{}: not a Claude agent", w.label)),
     }
     // needs-input too: an answered (discharged) prompt is idle, so a second

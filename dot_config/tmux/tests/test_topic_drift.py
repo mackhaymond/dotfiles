@@ -368,7 +368,9 @@ FAKE_COPILOT = r'''#!/usr/bin/env python3
 import os,re,sys,time
 from pathlib import Path
 r=Path(os.environ['FAKE_CONDENSER'])
-p=sys.argv[sys.argv.index('-p')+1]
+# The prompt arrives on stdin (the condenser pipes it to ai-exec, whose
+# stub in test_codex_indicator hands it to this copilot); -p as a fallback.
+p=sys.argv[sys.argv.index('-p')+1] if '-p' in sys.argv else sys.stdin.read()
 def first(t,n): return ' '.join(re.findall(r'[A-Za-z0-9]+',t)[:n])
 m=re.search(r'at most (\d+) characters',p)
 if 'Current tab label: ' in p:

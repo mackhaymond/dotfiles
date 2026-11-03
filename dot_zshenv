@@ -37,6 +37,11 @@ fi
 # OpenCode beta background subagents
 export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=1
 
+# Grok runs ~/.claude/settings.json's hooks by default; they are Claude's (the
+# usage gate would block Grok over Claude's weekly reserve, the resurrect hook
+# records it as claude). Grok gets its own: ~/.grok/hooks/tmux-agent.json.
+export GROK_CLAUDE_HOOKS_ENABLED=0
+
 # Secrets (chmod 600, gitignored)
 [[ -r "$HOME/.zshenv.private" ]] && source "$HOME/.zshenv.private"
 

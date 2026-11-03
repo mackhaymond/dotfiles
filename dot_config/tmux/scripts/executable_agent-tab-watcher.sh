@@ -11,7 +11,7 @@
 # Every POLL_SECONDS this daemon matches agent processes to tmux windows by
 # TTY and reconciles the per-window @agent_state option:
 #   agent present + no state           → idle    (seed presence)
-#   agent present + no @agent_kind     → its comm's kind (codex|claude|opencode)
+#   agent present + no @agent_kind     → its comm's kind (codex|claude|opencode|grok)
 #   no agent     + any state OR summary → unset @agent_state/@agent_summary (GC)
 #   no agent     + fresh @agent_born    → left alone (BIRTH GRACE: a claude tab
 #                                         marked an agent at creation, before
@@ -62,8 +62,12 @@
 # vendor/<triple>/bin/codex → comm basename "codex" (plus a "node" parent we
 # don't match). OpenCode is one native process, comm "opencode", and counts
 # only as its interactive TUI (opencode_tui_args: `opencode serve` is not an
-# agent). Candidates come from `pgrep` (cheap), and each one's tty+comm
-# from a single-pid ps, cached per pid — see PROCESS DISCOVERY in the loop.
+# agent). Grok Build likewise: comm `grok` (or the real binary's
+# `grok-macos-aarch64`; is_grok_comm), interactive TUI only (grok_tui_args:
+# `grok -p`, `grok agent stdio`, `grok sessions` are not agents), its turn
+# state from its own session records (grok_status). Candidates come from
+# `pgrep` (cheap), and each one's tty+comm from a single-pid ps, cached per
+# pid — see PROCESS DISCOVERY in the loop.
 #
 # TICK TRACE (live measurement, no restart needed). If the file
 #   ${TMPDIR:-/tmp}/agent-tab-watcher.$UID.trace
@@ -329,11 +333,22 @@ is_agent_comm() {
     case "$base" in
         claude|codex|opencode) return 0 ;;
     esac
+    is_grok_comm "$base" && return 0
     # Claude's binary is version-named (e.g. "2.1.170") in case its
     # process-title rename ever stops applying. Anchored regex, digits-only
     # segments — a case glob like [0-9]*.[0-9]*.[0-9]* would also match
     # IP-like or suffixed names ("10.0.0.1", "1.2.3-beta").
     [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+# Grok Build's comm basename ($1, already basenamed): `grok` (~/.grok/bin/grok,
+# the usual symlink) or the real binary's name when launched by its own path,
+# `grok-macos-aarch64` (and ps/pgrep may hand back its 16-char p_comm,
+# `grok-macos-aarch`, which the same shape covers). The platform word is
+# spelled out so a `grok-mcp-server` is not a grok. Never `agent`: another
+# symlink to the same binary, far too generic a name. Builtin regex.
+is_grok_comm() {
+    [[ "$1" =~ ^grok(-(macos|linux|windows)-[a-z0-9_]+)?$ ]]
 }
 
 # Claude Code's own view of whether the session is mid-turn, stored in the
@@ -410,6 +425,210 @@ opencode_tui_args() {
             *) return 0 ;;
         esac
     done
+    return 0
+}
+
+# Is this grok command line ($1, `ps -o args=`) the interactive TUI? Same idea
+# as opencode_tui_args, and the same rule agent-roster.py, agent-pause.py and
+# agent-ui port. Returns 0 = the TUI; 1 = FIRMLY not: the argv has
+# -p/--single/--prompt-file/--prompt-json (a headless single turn; -p also
+# glued, `-phi`, `-p=hi`) or -h/--help/-v/--version (also as --help=/
+# --version=, and any single-dash word starting -h/-v); 2 = PROBABLY not: the
+# first bare word is a subcommand (grok_subcommand: `agent stdio|serve`,
+# `leader ...`, `sessions`, `doctor`, ...). Probably, because ps joins argv
+# with spaces and loses the quoting: `grok "help me fix X"` - a TUI with a
+# prompt - reads `grok help me fix X`. So the caller asks grok_has_record
+# before believing a 2, and keeps asking (GK_SOFT). Everything else -
+# `grok`, `grok "fix x"`, -c, `-r ID`, `dashboard` - is the TUI. Options
+# that take a value skip it (`--opt=value` is one word anyway); -r/--resume
+# and -w/--worktree take an OPTIONAL one: the next word is their value unless
+# it is an option or a subcommand (`grok -r sessions` is the sessions
+# command). `--` only ends option scanning: the first bare word before it
+# still decides (`grok mcp add x -- -y srv` is the mcp subcommand; `grok --
+# mcp` the TUI with a prompt). A quoted prompt holding
+# " -p " reads as headless - a shell, never a wrong agent. Builtins only.
+grok_subcommand() {
+    case "$1" in
+        agent|leader|worker|clone|completions|doctor|du|disk-usage|export|help|inspect|login|logout|mcp|memory|models|plugin|sessions|setup|trace|update|usage|version|v|worktree|wrap)
+            return 0 ;;
+    esac
+    return 1
+}
+grok_tui_args() {
+    local -a a
+    local i=1 w first=1 sub=0
+    read -r -a a <<<"$1"
+    while [ "$i" -lt "${#a[@]}" ]; do
+        w="${a[i]}"
+        case "$w" in
+            --) break ;;
+            # -p*/-h*/-v*: clap takes a short flag's value glued on (`-phi`,
+            # `-p=hi`), and -h/-v cluster the same way.
+            -p*|--single|--single=*|--prompt-file|--prompt-file=*|--prompt-json|--prompt-json=*|-h*|--help|--help=*|-v*|--version|--version=*)
+                return 1 ;;
+            --add-dir|--agent|--agents|--allow|--cwd|--debug-file|--deny|--disallowed-tools|--json-schema|--leader-socket|-m|--model|--max-turns|--output-format|--permission-mode|--reasoning-effort|--effort|--rules|-s|--session-id|--sandbox|--system-prompt-override|--system-prompt|--tools|--worktree-ref|--ref)
+                i=$((i + 2)); continue ;;
+            -r|--resume|-w|--worktree)
+                i=$((i + 1))
+                w="${a[i]:-}"
+                if [ -n "$w" ] && [ "${w#-}" = "$w" ] && ! grok_subcommand "$w"; then
+                    i=$((i + 1))
+                fi
+                continue ;;
+            -*) i=$((i + 1)); continue ;;
+        esac
+        if [ "$first" = 1 ]; then
+            first=0
+            grok_subcommand "$w" && sub=1
+        fi
+        i=$((i + 1))
+    done
+    [ "$sub" = 1 ] && return 2
+    return 0
+}
+
+# Grok's answer to session_status's question, into the caller's `st` the same
+# way: "busy" | "idle" | "" (unknown - left alone). Grok keeps no per-pid
+# status file, but two records it writes itself give the same ground truth:
+#   $GROK_HOME/active_sessions.json  [{session_id, pid, pid_start, cwd, ...}]
+#     (pid = the TUI's; /new and /resume rewrite it), and
+#   $GROK_HOME/sessions/<cwd, URL-encoded>/<session_id>/events.jsonl
+#     one event per line, {"ts":"…","type":"…",…}: turn_started opens a turn,
+#     turn_ended{outcome: completed|error|cancelled} closes it (a cancelled
+#     turn too, so an interrupt that fired no hook still ends here), and
+#     NOTHING is written between a turn_ended and the next turn_started
+#     (checked on a live session, 2026-11-02).
+# So the file's LAST LINE decides: turn_ended is idle; turn_started or any
+# in-turn event (phase_changed, loop_started, first_token, tool_*,
+# permission_*, mcp_tool_call_*) is busy - which also answers a long turn
+# whose turn_started is far back (3 of 9 turns in a live file ran 58-112 KB);
+# the session-start events (the other mcp_*: servers starting before any
+# turn) are "". Anything else - a type this does not know, a last line longer
+# than the read - falls back to one awk pass over a bounded tail for the last
+# turn_started/turn_ended, as codex_tail does; no marker there is "", the
+# conservative failure. GROK_HOME (default ~/.grok) overrides the root (tests).
+#
+# FORK-LIGHT. Only called for a grok window that is `running` or whose idle
+# pending stamp just expired - never for a settled idle/done one. The map is
+# re-parsed (builtin) only when active_sessions.json or its directory moved
+# (CHANGE STAMPS; the directory too because the file may be replaced by
+# rename), and the session's events.jsonl is found once per session id by a
+# glob (no need to re-encode the cwd). The tail is read per window like
+# codex_tail_cached: reused while the file has not moved since the tick it
+# was vouched for, one small `tail` (its only fork, ~2 ms) when it has. While
+# a turn runs the file grows by ~17 KB a minute (phase_changed), so a running
+# grok tab pays that one fork a tick, as a running codex tab does; a stuck
+# one (the case this exists for) has a still file and pays nothing. The last
+# line is cut out with the SHORTEST-suffix removal `%`, never `##*`: that one
+# is quadratic (~1 ms on 4 KB here, against ~60 us). Entries no window asked
+# for this tick are dropped at its end (GK_USED), the id->file map with the
+# pid cache.
+GROK_ROOT="${GROK_HOME:-$HOME/.grok}"
+GROK_ACTIVE="$GROK_ROOT/active_sessions.json"
+GROK_LAST_BYTES=4096      # the last line
+GROK_SCAN_BYTES=65536     # the fallback scan
+declare -A GK_SID=() GK_EV=()          # pid -> session id; session id -> events.jsonl
+gk_map_tick=""                          # tick the map was last vouched for
+declare -A GK_PATH=() GK_TICK=() GK_ST=() GK_USED=()
+grok_tail() {
+    local c p l
+    st=""
+    c=$(tail -c "$GROK_LAST_BYTES" "$1" 2>/dev/null) || return 0
+    [ -n "$c" ] || return 0
+    p="${c%$'\n'*}"                       # (the comsub dropped the final \n)
+    if [ "$p" = "$c" ]; then l="$c"; else l="${c:${#p}+1}"; fi
+    if [[ $l =~ ^\{(\"ts\":\"[^\"]*\",)?\"type\":\"([a-z_]+)\" ]]; then
+        case "${BASH_REMATCH[2]}" in
+            turn_ended) st=idle; return 0 ;;
+            turn_started|phase_changed|loop_started|first_token|tool_*|permission_*|mcp_tool_call_*)
+                st=busy; return 0 ;;
+            mcp_*) return 0 ;;
+        esac
+    fi
+    c=$(tail -c "$GROK_SCAN_BYTES" "$1" 2>/dev/null | awk '
+        /^[{]("ts":"[^"]*",)?"type":"turn_started"/ { m = "busy" }
+        /^[{]("ts":"[^"]*",)?"type":"turn_ended"/   { m = "idle" }
+        END { printf "%s", m }')
+    case "$c" in busy|idle) st="$c" ;; esac
+    return 0
+}
+# The pid -> session id map from active_sessions.json, refreshed only when it
+# (or its directory) moved since the tick it was last vouched for. Builtins.
+grok_map() {
+    local raw o sid
+    local -a objs
+    if [ -z "$gk_map_tick" ] || changed_since "$gk_map_tick" "$GROK_ACTIVE" "${GROK_ACTIVE%/*}"; then
+        GK_SID=()
+        if [ -f "$GROK_ACTIVE" ]; then
+            raw="$(<"$GROK_ACTIVE")"
+            IFS='}' read -r -d '' -a objs <<<"$raw"
+            for o in "${objs[@]}"; do
+                [[ $o =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]] || continue
+                sid="${BASH_REMATCH[1]}"
+                [[ $o =~ \"pid\"[[:space:]]*:[[:space:]]*([0-9]+) ]] || continue
+                GK_SID[${BASH_REMATCH[1]}]="$sid"
+            done
+        fi
+    fi
+    gk_map_tick=$tick_no
+}
+# Does grok pid $1 have a SESSION RECORD - is it a TUI whatever its argv
+# looks like (grok_tui_args' 2)? grok-session-track.sh writes
+#   ${TMPDIR}/tmux-assistant-resurrect/grok-<pid>.json
+# at SessionStart (same dir resolution as its STATE_DIR), which no utility
+# subcommand fires; active_sessions.json listing the pid says the same (but
+# has been seen `[]` while a TUI ran, so the record comes first). A [ -f ]
+# and grok_map: no fork.
+GROK_REC_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+GROK_REC_DIR="${TMUX_ASSISTANT_RESURRECT_DIR:-${GROK_REC_DIR%/}/tmux-assistant-resurrect}"
+declare -A GK_SOFT=()   # grok pid -> its tty, for a cached "probably not" (grok_tui_args 2)
+grok_has_record() {
+    [ -f "$GROK_REC_DIR/grok-$1.json" ] && return 0
+    grok_map
+    [ -n "${GK_SID[$1]:-}" ]
+}
+# grok_rec_sid PID: into sid the session_id of PID's session record, for a
+# pid active_sessions.json does not list (it has been seen `[]` while a TUI
+# ran). Builtin read, cached per pid while the record has not moved since the
+# tick it was read (/new rewrites it); cleared with the pid cache.
+declare -A GK_RSID=() GK_RTICK=()
+grok_rec_sid() {
+    local f="$GROK_REC_DIR/grok-$1.json" raw=""
+    sid=""
+    [ -f "$f" ] || return 0
+    if [ -n "${GK_RTICK[$1]:-}" ] && ! changed_since "${GK_RTICK[$1]}" "$f"; then
+        sid="${GK_RSID[$1]:-}"
+        return 0
+    fi
+    IFS= read -r -d '' raw < "$f" 2>/dev/null || true
+    [[ $raw =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]] && sid="${BASH_REMATCH[1]}"
+    GK_RSID[$1]="$sid"; GK_RTICK[$1]=$tick_no
+    return 0
+}
+grok_status() {
+    local pid="$1" w="$2" sid ev
+    local -a m
+    st=""
+    [ -n "$pid" ] || return 0
+    grok_map
+    sid="${GK_SID[$pid]:-}"
+    [ -n "$sid" ] || grok_rec_sid "$pid"
+    [ -n "$sid" ] || return 0
+    ev="${GK_EV[$sid]:-}"
+    if [ -z "$ev" ] || [ ! -f "$ev" ]; then
+        m=("$GROK_ROOT/sessions"/*/"$sid"/events.jsonl)
+        ev="${m[0]}"
+        [ -f "$ev" ] || return 0              # (an unmatched glob stays literal)
+        GK_EV[$sid]="$ev"
+    fi
+    GK_USED[$w]=1
+    if [ "${GK_PATH[$w]:-}" = "$ev" ] && ! changed_since "${GK_TICK[$w]:-}" "$ev"; then
+        st="${GK_ST[$w]}"
+    else
+        grok_tail "$ev"
+        GK_PATH[$w]="$ev"; GK_ST[$w]="$st"
+    fi
+    GK_TICK[$w]=$tick_no
     return 0
 }
 
@@ -582,6 +801,7 @@ limit_text() {
         seven_day_sonnet) lab="Sonnet weekly limit" ;;
         overage) lab="overage limit" ;;
         codex) lab="Codex limit" ;;
+        grok) lab="Grok limit" ;;
         *) lab="usage limit" ;;
     esac
     if ! [[ $r =~ ^[1-9][0-9]{0,11}$ ]] || ! [[ $now =~ ^[0-9]{1,12}$ ]]; then
@@ -1196,9 +1416,9 @@ birth_fresh() {
 # with `case "$s" in *" ${key} "*`, a linear scan per probe; with ~165
 # windows (most of them pty-MCP shells in `agents`) and four such probes
 # per window that was quadratic, ~20 ms a tick at load 200.
-AGENT_PAT='claude|codex|opencode|[0-9]+\.[0-9]+\.[0-9]+'
+AGENT_PAT='claude|codex|opencode|grok(-(macos|linux|windows)-[a-z0-9_]+)?|[0-9]+\.[0-9]+\.[0-9]+'
 declare -A PID_TTY=() PID_NEXT=() TTY_PID=()   # pid->tty|-, its rebuild, tty->lowest pid
-# pid -> codex|claude|opencode, for agent pids only: written by the same single-pid ps
+# pid -> codex|claude|opencode|grok, for agent pids only: written by the same single-pid ps
 # that fills PID_TTY (no extra fork), dropped with it. A pid that leaves the
 # pgrep set and comes back is ps'd again, so this is overwritten with it.
 declare -A PID_KIND=()
@@ -1708,6 +1928,8 @@ while :; do
     pid_cache_age=$((pid_cache_age + 1))
     if [ "$pid_cache_age" -ge "$PID_CACHE_TICKS" ]; then
         PID_TTY=(); PID_KIND=()
+        GK_EV=(); GK_SOFT=()               # grok: session id -> events.jsonl; soft "no"s
+        GK_RSID=(); GK_RTICK=()            # grok: pid -> its record's session id
         # The subagent verdict cache rides the same clock: dead pids drop
         # out, and every session gets one full look a minute regardless.
         SUB_KEY=(); SUB_TICK=(); SUB_V=()
@@ -1743,28 +1965,45 @@ while :; do
             # (opencode_tui_args): `opencode serve` / `web` / `mcp ...` in a
             # shell tab is a command, not an agent. That needs its argv, so
             # one more single-pid ps - for a NEW opencode pid only (the
-            # verdict is cached in PID_TTY like everything else here).
+            # verdict is cached in PID_TTY like everything else here). A grok
+            # pid the same, through grok_tui_args (`grok -p ...`, `grok agent
+            # stdio`, `grok sessions` are commands) - except that its
+            # subcommand-word "no" (2) holds only while the pid has no
+            # session record (grok_has_record), and is remembered in GK_SOFT
+            # so the pass below asks again each tick, without a fork.
             # An EMPTY answer is no verdict: it is not cached (a cached "-"
             # would hide a live TUI for up to PID_CACHE_TICKS, long enough for
             # the GC to collect its tab), so the pid counts as exited this
             # tick and is looked at again next tick; one that really exited
             # leaves the pgrep set anyway.
             agent_ok=0
+            unset 'GK_SOFT[$pid]'
             if [ -n "$tty" ] && [ "$tty" != "??" ] && is_agent_comm "$comm"; then
                 agent_ok=1
                 if [ "${comm##*/}" = opencode ]; then
                     oc_args=$(ps -ww -o args= -p "$pid" 2>/dev/null)
                     [ -n "$oc_args" ] || continue
                     opencode_tui_args "$oc_args" || agent_ok=0
+                elif is_grok_comm "${comm##*/}"; then
+                    oc_args=$(ps -ww -o args= -p "$pid" 2>/dev/null)
+                    [ -n "$oc_args" ] || continue
+                    gk_rc=0
+                    grok_tui_args "$oc_args" || gk_rc=$?
+                    case "$gk_rc" in
+                        0) ;;
+                        2) grok_has_record "$pid" || { agent_ok=0; GK_SOFT[$pid]="$tty"; } ;;
+                        *) agent_ok=0 ;;
+                    esac
                 fi
             fi
             if [ "$agent_ok" = 1 ]; then
                 PID_TTY[$pid]="$tty"
-                # is_agent_comm's names: codex, opencode, else claude (incl. N.N.N).
+                # is_agent_comm's names: codex, opencode, grok, else claude (incl. N.N.N).
                 case "${comm##*/}" in
                     codex) PID_KIND[$pid]=codex ;;
                     opencode) PID_KIND[$pid]=opencode ;;
-                    *) PID_KIND[$pid]=claude ;;
+                    *) if is_grok_comm "${comm##*/}"; then PID_KIND[$pid]=grok
+                       else PID_KIND[$pid]=claude; fi ;;
                 esac
             else
                 PID_TTY[$pid]=-
@@ -1783,6 +2022,12 @@ EOF
     for pid in $cand; do
         [ -n "${PID_TTY[$pid]+x}" ] || continue   # exited between pgrep and its ps
         tty="${PID_TTY[$pid]}"
+        # A grok whose argv read as a subcommand but that has since written
+        # its session record (grok_has_record) was a TUI after all.
+        if [ "$tty" = - ] && [ -n "${GK_SOFT[$pid]:-}" ] && grok_has_record "$pid"; then
+            tty="${GK_SOFT[$pid]}"; PID_KIND[$pid]=grok
+            unset 'GK_SOFT[$pid]'
+        fi
         PID_NEXT[$pid]="$tty"
         [ "$tty" = - ] && continue
         [ -n "${TTY_PID[$tty]+x}" ] || TTY_PID[$tty]="$pid"
@@ -2075,7 +2320,8 @@ EOF
             if { [ "$state" = running ] || { [ "$state" = needs-input ] && [ -n "${W_ASKBG[$win]:-}" ]; }; } \
                && [ -n "$pid" ] \
                && [ "${PID_KIND[$pid]:-}" != codex ] \
-               && [ "${PID_KIND[$pid]:-}" != opencode ]; then
+               && [ "${PID_KIND[$pid]:-}" != opencode ] \
+               && [ "${PID_KIND[$pid]:-}" != grok ]; then
                 st=""
                 session_status "$pid"
                 case "$st" in
@@ -2155,6 +2401,11 @@ EOF
         # `running`: like Claude's, it is not trusted to clear needs-input.
         # An opencode pid never falls through to the Claude session file or a
         # (stale, earlier-codex) rollout.
+        #
+        # GROK: the same rule, its record read by grok_status (the last
+        # turn_started/turn_ended in the session's events.jsonl, found through
+        # active_sessions.json by pid). Only `running`, state only, three
+        # ticks; never the Claude session file or a stale rollout either.
         fin=""        # the state this agent's own record says, if it disagrees
         cx_full=0     # 1 = a codex turn end after the stamp: the full write
         cx_lim=0      # 1 = that turn end was a usage limit (RATE-LIMITED AGENTS)
@@ -2164,11 +2415,14 @@ EOF
                     st=""
                     if [ "${PID_KIND[$pid]:-}" = opencode ]; then
                         opencode_status "$pid"                      # opencode
+                    elif [ "${PID_KIND[$pid]:-}" = grok ]; then
+                        grok_status "$pid" "$win"                   # grok
                     else
                         [ -n "$pid" ] && session_status "$pid"      # claude
                     fi
                     if [ -z "$st" ] && [ -n "${W_ROLL[$win]:-}" ] \
-                       && [ "${PID_KIND[$pid]:-}" != opencode ]; then   # codex
+                       && [ "${PID_KIND[$pid]:-}" != opencode ] \
+                       && [ "${PID_KIND[$pid]:-}" != grok ]; then       # codex
                         codex_tail_cached "$win" "${W_ROLL[$win]}"
                         # The full turn-end write is for a CODEX agent only: a
                         # claude window with no session file and a stale
@@ -2426,7 +2680,8 @@ EOF
         # when it finishes, so the heartbeat that would re-arm finds bare idle
         # and the rest of the turn read idle (no pulse, slot released) until
         # its Stop. So an expiring stamp whose agent's own record says busy
-        # (Claude's session file, the OpenCode plugin's status; codex has no
+        # (Claude's session file, the OpenCode plugin's status, grok's
+        # events.jsonl; codex has no
         # such record) becomes `running` instead, the way the heartbeat would
         # have made it; a turn that is over idles it again through the stuck-
         # running reconcile above. Both writes are conditional on the window
@@ -2436,6 +2691,7 @@ EOF
             if [ "$has_agent" = 1 ] && [ -n "$pid" ]; then
                 case "${PID_KIND[$pid]:-}" in
                     opencode) opencode_status "$pid" ;;
+                    grok) grok_status "$pid" "$win" ;;
                     codex) ;;
                     *) session_status "$pid" ;;
                 esac
@@ -2472,6 +2728,12 @@ EOF
         unset 'CX_PATH[$win]' 'CX_TICK[$win]' 'CX_MARK[$win]' 'CX_TS[$win]'
     done
     CX_USED=()
+    # The same for grok_status's per-window events answers.
+    for win in "${!GK_PATH[@]}"; do
+        [ -n "${GK_USED[$win]:-}" ] && continue
+        unset 'GK_PATH[$win]' 'GK_TICK[$win]' 'GK_ST[$win]'
+    done
+    GK_USED=()
 
     # The stale-save chip (see STALE-SAVE CHIP): a builtin clock compare on
     # almost every tick, a look at most once per STALE_EVERY seconds.

@@ -30,15 +30,32 @@ tmux-mcp would only hold the message behind its dialog anyway.
 
 **The agent pane** in a working window is the one tmux-mcp itself recognises
 as an agent. That is a pane named by the `env.tmux_pane` of a live
-`claude-<pid>.json`, `codex-<pid>.json` or `opencode-<pid>.json` record in
+`claude-<pid>.json`, `codex-<pid>.json`, `opencode-<pid>.json` or
+`grok-<pid>.json` record in
 tmux-assistant-resurrect's directory, found the same way and in the same search
 order as tmux-mcp's `readAgents`. An opencode record counts only when its
 process is the interactive TUI, never `opencode serve`, `web`, `attach` and the
-like (the same argv rule as agent-tab-watcher.sh). `message_agent` refuses any
+like (the same argv rule as agent-tab-watcher.sh). A grok record
+(grok-session-track.sh writes it at the TUI's SessionStart) is dropped only
+for a headless argv (`grok -p`, `--single`, `--prompt-*`, help or version:
+`grok_tui_args` with `recorded=True`, since the record itself proves a TUI
+against a prompt `ps` makes read like a subcommand). **Grok's compat Claude
+hooks** (on unless `GROK_CLAUDE_HOOKS_ENABLED=0`) make the resurrect plugin
+file a Grok session as `claude-<pid>.json`, recognisable by `"tool":"grok"`
+or Grok's camelCase `hookEventName`, which no Claude payload has. The pid
+decides (tmux-mcp's `readAgents` guard, ported): a grok process makes it the
+grok record it really is (TUI rule and all); anything else, e.g. a `grok -p`
+in a Claude tab's Bash tool that overwrote THAT Claude's record, stays a
+claude record with its session id unknown (Claude's own sessions file can
+still name it). `message_agent` refuses any
 pane without such a record. If a window has no record, the script falls back to
 a pane whose command looks like an agent (`claude`, `codex`, Claude's
-version-named binary, or `opencode` in a window marked `@agent_kind opencode`,
-which tmux-mcp also accepts without a record). The other fallback deliveries
+version-named binary, or `opencode` / grok in a window marked `@agent_kind
+opencode` / `grok`, which tmux-mcp also accepts without a record). Grok's
+`pane_current_command` is its p_comm cut to 15 (`grok-macos-aarc`), so that
+match is a prefix past the platform word (`GROK_CMD`); like opencode it
+counts only in a grok window, because `grok -p` and `grok sessions` look the
+same there. The other fallback deliveries
 will probably be refused, and they show up as failures. Pausing an OpenCode
 agent is the same text message as for the others, with no signal sent. A working window with
 neither is reported as "no agent pane", on the key's message line and in
@@ -225,7 +242,7 @@ Everything lives in `~/.local/state/agent-pause/` (override:
 | `progress.json` | the press in flight, or the last one, for the popup: `press`, `mode`, `done`, `outcome` (`paused`/`failed`, or `resumed`/`not_resumed`/`failed`), `message`, and `targets` with `result` (`sending` until it lands). **Display data only**: the toggle never reads it. |
 | `log` | one JSON line per press (mode, the message shown, every target and its result), plus a `popup` line with the geometry. Rolled to `log.1` at 1 MB. |
 | `lock` | `flock`ed for the whole press |
-| `limited.json` | the rate-limited set (see "Rate-limited agents"): `targets`, one per limited agent window (`pane_id`, `window_id`, `session_id`, `kind`, `label`, `resets_at`, `type`, `since`, `account`, `attempts`, and once they happen `lifted_at`, `resumed_at`, `last_attempt`, `last_result`; plus `location`, `pane_pid` and `pane_cmd` for `locate`; `held_at` while a held RESUME may still be queued in tmux-mcp). Written atomically. Separate from `paused.json`: a limited agent is never in the pause key's saved set. |
+| `limited.json` | the rate-limited set (see "Rate-limited agents"): `targets`, one per limited agent window (`pane_id`, `window_id`, `session_id`, `kind`, `label`, `resets_at`, `type`, `since`, `account` (never on a grok target), `attempts`, and once they happen `lifted_at`, `resumed_at`, `last_attempt`, `last_result`; plus `location`, `pane_pid` and `pane_cmd` for `locate`; `held_at` while a held RESUME may still be queued in tmux-mcp, with `held_why`, tmux-mcp's reason; `dialog` `{at, choice, result}`, the last answer to Claude's limit dialog). Written atomically. Separate from `paused.json`: a limited agent is never in the pause key's saved set. |
 | `limit.lock` | `flock`ed while `limited.json` is read, changed and written (`limit-add`, `limit-tick`, `limit-resume`, and a resume press's limit half, after it has released the pause lock). Never the same lock as the pause key's, and never held together with it. |
 
 The tmux global option `@agents_paused` holds the number of agents still saved
@@ -396,7 +413,16 @@ press resumes. Otherwise it pauses.
   pane now running that session id (a tmux-resurrect restore renumbers panes).
   If neither exists, the agent is reported as *gone*. The session id comes from
   `~/.claude/sessions/<pid>.json` for claude (the convention in
-  `agent-session-lib.sh`) and from the record itself for codex.
+  `agent-session-lib.sh`) and from the record itself for codex, opencode and
+  grok (grok-session-track.sh rewrites a grok record on `/new` and
+  `/resume`). A target saved with no session id keeps its old pane while
+  that pane's live record names the target's own pid, with or without a
+  session id by now: that record IS the agent (records count only while
+  their pid lives). Otherwise `locate`'s same-pane check stands (same
+  `pane_pid`, the same kind of agent command), with only a record that HAS
+  a session id counting as another agent living there; a record without
+  one (a Claude whose record Grok's compat hooks overwrote) identifies
+  nobody else.
 - **Only reached agents leave the saved set.** After a resume, agents that were
   sent, held or unknown move to `paused.last.json`. Every **miss**, whether the
   agent failed or is gone, stays in `paused.json`, with a `miss_count` and a
@@ -423,7 +449,8 @@ text. The design contract is the "Rate-limited agents" contract (v1.1); this
 section covers the script's half of it, the resume engine.
 
 **Who marks it.** The tab indicator (StopFailure `rate_limit`; for codex, the
-watcher's rollout reconcile) writes, in one tmux list, `@agent_paused`,
+watcher's rollout reconcile; for grok, a `rate_limit` whose text says usage
+limit, 429, not capacity) writes, in one tmux list, `@agent_paused`,
 `@agent_limit "<resets_at> <type> <since>"`, the detail, the turn result and
 `@agent_state paused` last, then runs `agent-pause.py limit-add <window_id>`
 in the background. The indicator and agent-tab-watcher.sh are owned by
@@ -433,7 +460,7 @@ cswap switch), or on wake, at most once per 20 s.
 
 | option | meaning |
 |---|---|
-| `@agent_limit` (window) | `"<resets_at> <type> <since>"`. `resets_at` is epoch s, or 0 when unknown (a model/Fable limit). `type` is `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `model`, `overage` or `codex`. `since` is when it was marked. Its presence means rate-limited; a Stop (success) clears it. |
+| `@agent_limit` (window) | `"<resets_at> <type> <since>"`. `resets_at` is epoch s, or 0 when unknown (a model/Fable limit, and every Grok limit: its free tier resets over a rolling 24 h). `type` is `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `model`, `overage`, `codex` or `grok` (an unknown Claude type is `five_hour` only when the reset is under 5 h away and the account has a session window, `@codex_session_limit` not `"0"`; see agent-tab-indicator.md §7, "Weekly-only plans"). `since` is when it was marked. Its presence means rate-limited; a Stop (success) clears it. |
 | `@agent_limit_lifted` (window) | `<epoch>`: the limit has lifted but the agent waits for Mack (auto-resume off, or past the attempt cap). Set by `limit-tick`; unset when a limit RESUME gets through or a re-mark starts a new limit. |
 | `@agent_limit_autoresume` (global) | `on` (agent-pause.conf's default) or `off`. Mack's setting. |
 | `@agent_limit_due` (global) | the earliest epoch at which `limit-tick` could act on anyone, or unset when nothing can happen without Mack (or nothing is limited). Kept by this script, read by the watcher. |
@@ -442,7 +469,23 @@ cswap switch), or on wake, at most once per 20 s.
 
 - **`limit-add W`** (`W` a window id, or one of its panes). Reads the
   window's `@agent_limit`, its agent pane and session id (picked as for a
-  pause target), its label, and `account` from usage.json's root. The merge
+  pause target), its label, and `account`, the account the limit was hit
+  on (`limit_account`, as `<email>/<organizationUuid>`). Claude keeps the
+  old account's cached token for ~30 s after a cswap switch, so the slot
+  active now may not be it. In order:
+  1. the one slot whose pooled member for the limit's window family (see
+     [Pool-aware resume](#pool-aware-resume)) resets within `LIMIT_MATCH`
+     (120 s) of the limit's `resets_at`;
+  2. for a limit marked within `SWITCH_SETTLE` (45 s) of a switch, never the
+     new active slot: usage.json's lagging root `account` if it names
+     another slot, else the only other slot, else unknown (none stored, so
+     until a re-mark fills it neither the pool nor the switch rule can free
+     it: the clock or Mack);
+  3. otherwise cswap's active slot (`sequence.json`'s
+     `activeAccountNumber`), else usage.json's root `account` (which lags a
+     switch).
+
+  A grok target never gets one: no cswap switch frees it. The merge
   is idempotent, by window or session id: a re-mark (queued task
   notifications each hit the limit again) updates `resets_at`, `type`,
   `since` and `account` and keeps `attempts`. A re-mark with a new `since`
@@ -455,7 +498,9 @@ cswap switch), or on wake, at most once per 20 s.
   window now runs another session starts over as a new target. A window
   without `@agent_limit` is not added. It waits up to 180 s for `limit.lock`
   (a background job; a lost add would leave the agent unresumed). Then it
-  recomputes `@agent_limit_due`.
+  recomputes `@agent_limit_due`, and for a Claude agent, once the lock is
+  released, answers Claude's limit dialog ([The limit
+  dialog](#the-limit-dialog)).
 - **`limit-tick`**. One pass over `limited.json` (details below). If another
   run holds `limit.lock`, it does nothing.
 - **`limit-auto on|off|toggle`**. Sets the live global
@@ -464,7 +509,7 @@ cswap switch), or on wake, at most once per 20 s.
   watcher's next tick resumes them. Says the result as a toast.
 - **`limit-resume [--force] W`**. Mack's manual resume of one limited window
   (the sidebar's click on a limited card). Refused with the toast
-  `rate-limited until <local time>` unless the target is eligible by either
+  `rate-limited until <local time>` unless the target is eligible by any
   rule below, or lifted, or `resets_at` is 0 (only Mack can judge a model
   limit), or `--force`. A click in the 120 s just after the reset gets
   `limit just reset · auto-continue first, try after <t>`. It skips the wake
@@ -474,7 +519,8 @@ cswap switch), or on wake, at most once per 20 s.
   `paused`), so an agent left idle by a RESUME that never landed can still
   be resumed by hand. While a held RESUME may still be queued for it, it
   refuses with `a resume is already waiting behind the draft in <label>'s
-  box` unless `--force`: tmux-mcp would queue a second copy behind the
+  box` (`behind the dialog` when tmux-mcp's hold reason, `held_why`, names a
+  dialog) unless `--force`: tmux-mcp would queue a second copy behind the
   first. It delivers the same way as the tick.
 
 All four are hook, watcher and click paths: like the key, they never print
@@ -492,39 +538,57 @@ For each target in `limited.json`:
    The window's live `@agent_limit` then wins over the stored one (the same
    renewal as a re-mark), so a `limit-add` that never ran cannot leave a
    stale `since` for the cswap rule or the flag stamp. The stored `account`
-   stays (it is the one the limit was hit on); now's only fills a target
-   that has none.
+   stays (it is the one the limit was hit on). A target that has none gets
+   one on a renewal, judged for the live mark exactly as `limit-add` would
+   (`limit_account`, so never the slot it ruled out); never a grok one.
 2. **Actionable only while** the window has `@agent_state paused` AND
    `@agent_paused` AND `@agent_limit`. A running window (its RESUME's turn,
    or a prompt Mack typed) is skipped but kept: that turn's outcome decides,
    a Stop drops it, a fresh limit re-marks it.
-3. **Eligible when** either:
+3. **Eligible when** any of (checked in this order, `limit_eligible`'s
+   answer `reset`, `pool` or `switch`):
    - **the clock:** `now >= resets_at + 120`. The 120 s grace lets Claude's
      native auto-continue (reset + 30-90 s) go first, so there is never a
      double prompt; or
+   - **the pool frees it:** the account Claude uses NOW is another pooled
+     account with every window the target needs free (see [Pool-aware
+     resume](#pool-aware-resume)); or
    - **a cswap switch freed it**, which needs all four of:
      - `~/.claude-swap-backup/sequence.json`'s mtime is newer than the
        target's `since`;
      - `~/.cache/codexbar-tmux/usage.json`'s `updated_at` is newer than that
-       mtime (the numbers are the new account's);
+       mtime (the numbers are the new account's), and usage.json is not in
+       the publisher's error state (`state` `error`);
      - usage.json's root `account` differs from the target's `account`;
      - the matching window is free on that account. The family is
        `five_hour` → `session`; `seven_day_opus` / `seven_day_sonnet` →
        `scoped` (or `weekly` while `scoped_used` is null); `seven_day`,
        `overage` and anything else → `weekly`. Free means `<family>_locked`
-       is `false` AND either `<family>_used` is a number under 100, or (no
-       reading) usage.json's `fetched_at` is newer than the switch. The flag
+       is `false` AND either `<family>_used` is a number under its cap, or (no
+       reading) usage.json's `fetched_at` is newer than the switch. The cap:
+       under 100 from an old publisher (no `<family>_pace` block); from a
+       pool-aware one, `used <= cap - 2` (`POOL_MIN_HEADROOM`) with the cap
+       the effective one (`eff_cap`, below: a weekly reserve is not
+       headroom) of cswap's active slot's member, else the member marked
+       `active`, else 100. The flag
        alone proves nothing: right after a switch the publisher adopts
        cswap's reading with every `*_locked` reset to false and `fetched_at`
-       left behind, so a switch to an exhausted account would pass.
+       left behind, so a switch to an exhausted account would pass. A
+       `session`-family (`five_hour`) target also needs the `weekly` window
+       free by the same test, cap and all: a free 5-hour window on an
+       exhausted week is no headroom, and a weekly-only account has no
+       session reading, which proves nothing.
 
-   `resets_at` 0 is **never** eligible by itself. `codex` targets go by the
-   clock only. A target already lifted stays eligible until a re-mark.
+   `resets_at` 0 is **never** eligible by itself (every Grok limit: only
+   Mack resumes it). `codex` and `grok` targets go by the clock only
+   (`cswap_blind`: cswap swaps Claude accounts). A target already lifted
+   stays eligible until a re-mark. `dry-run` names the rule (`reset`,
+   `pool`, `switch`, `lifted`).
 4. **Graces.** The whole tick waits while `now - kern.waketime < 30 s` (the
    later of `kern.waketime` and `kern.boottime`, as the sidebar reads them):
    the network is still coming up. A target is skipped unless its host
-   resolves (`api.anthropic.com`, or `chatgpt.com` for codex), checked with
-   `getaddrinfo` in a thread with a 2 s timeout.
+   resolves (`api.anthropic.com`, `chatgpt.com` for codex, `api.x.ai` for
+   grok), checked with `getaddrinfo` in a thread with a 2 s timeout.
 5. **A manual pause defers everything.** While `paused.json` lists targets,
    or a pause press is still delivering (its `paused.json` is written only
    afterwards, so `progress.json` says it: mode `pause`, `done` false, its
@@ -541,29 +605,37 @@ For each target in `limited.json`:
    1. re-checked right before its delivery: still actionable, `paused.json`
       still empty and no pause press delivering. If a manual pause began,
       the tick **stops** there and the rest wait for its resume;
-   2. `@agent_paused` unset (as for a pause RESUME; `@agent_limit` stays, so
+   2. for a Claude agent, its limit dialog dismissed first ([The limit
+      dialog](#the-limit-dialog)): a RESUME pasted at it would be held behind
+      it at best. If that look cannot tell what the screen is (`unknown`),
+      nothing is sent and the flag never goes off: result `dialog`, an
+      attempt counted, retried after the backoff;
+   3. `@agent_paused` unset (as for a pause RESUME; `@agent_limit` stays, so
       the paste makes it running and the turn's outcome decides);
-   3. the message, through tmux-mcp's `message_agent`, **not urgent** (a
+   4. the message, through tmux-mcp's `message_agent`, **not urgent** (a
       half-typed draft holds it, like the pause RESUME):
       `[limit] Your usage limit has reset. Continue the task you were
       working on when the limit was reached; do not repeat work that is
       already complete.` (the native auto-continue's own words);
-   4. **sent, held or no reply** counts as reached: `resumed_at`,
+   5. **sent, held or no reply** counts as reached: `resumed_at`,
       `@agent_limit_lifted` cleared, the flag left off. A **held** one sits
       in tmux-mcp's per-pane queue, with no dedupe, until the box clears or
       for up to 2 h, so it is never sent again while a copy may be queued
-      (`held_at`). `held_at` goes on any re-mark (a turn has run since, so
+      (`held_at`, and `held_why`, tmux-mcp's reason). `held_at` goes on any re-mark (a turn has run since, so
       the copy has landed) and after a later `sent`. If a held (or
       unanswered) RESUME has not landed 10 min on (the window neither
       running nor paused again), it is lifted for Mack, never resent, with
       one toast that says why: `limit lifted · a resume is waiting behind a
-      draft in <label>'s box` (or, unanswered, `<label>'s resume got no
-      reply: resume?`);
-   5. on a **refusal**, `@agent_paused` goes back on (and `idle` back to
+      draft in <label>'s box`; when the reason names Claude's limit dialog,
+      `limit lifted · <label>'s limit dialog is open`; another dialog, `limit
+      lifted · a dialog is open in <label>'s tab`; unanswered, `<label>'s
+      resume got no reply: resume?`. A target lifted past the cap after a
+      `dialog` result says the limit dialog one too;
+   6. on a **refusal**, `@agent_paused` goes back on (and `idle` back to
       `paused`), stamped with the limit's own `since`, never now: the
       indicator clears the flag on the turn's outcome only when it equals
       that value. Retried after the backoff;
-   6. `attempts` + 1, `last_attempt`, `last_result`.
+   7. `attempts` + 1, `last_attempt`, `last_result`.
 8. Finally `@agent_limit_due` is recomputed.
 
 **Attempts, backoff and the cap.** Each RESUME that goes out counts one
@@ -580,10 +652,12 @@ landed on an account that is out too), the indicator re-marks it with a new
 only a newer switch, or the wall-clock reset, can free it again.
 
 **`@agent_limit_due`** is the minimum, over the actionable targets, of
-`max(resets_at + 120, last_attempt + backoff)`, or the backoff alone for a
-target whose limit has already lifted (eligible now, e.g. freed by a switch,
-or lifted while auto-resume is on): a refused retry of a switch-freed agent
-must not wait for a reset days away. A target with a held copy possibly
+`max(min(resets_at + 120, the pool's moment), last_attempt + backoff)`
+(the pool's moment, `pool_due`, see [Pool-aware
+resume](#pool-aware-resume); without one, just the reset), or the backoff
+alone for a target whose limit has already lifted (eligible now, e.g. freed
+by a switch or the pool, or lifted while auto-resume is on): a refused retry
+of a switch-freed agent must not wait for a reset days away. A target with a held copy possibly
 queued waits until that copy would expire, and a held RESUME still not
 landed counts its 10 min check. A target waiting for Mack, a `resets_at` 0
 target, and one that is not actionable (running) do not count.
@@ -601,14 +675,145 @@ switch, that target's due is at most now + 20 s, so the watcher keeps
 calling until usage.json catches up; for at most 5 min after the switch, so a
 usage.json that never settles stops the polling (back to the normal due).
 This holds with auto-resume off too (the tick must still see the lift to mark
-it), but not for a target already waiting for Mack, a codex target or a
-model limit, none of which a switch frees.
+it), but not for a target already waiting for Mack, a codex or grok target
+or a model limit, none of which a switch frees.
 
 **Times** read the same on every surface (toasts, refusals, the log,
 status/dry-run), by calendar days in local time: today `5:31 PM`, the next six
 days `Tue 5:31 PM`, anything else, a week or more on or in the past, `Nov 2
 5:31 PM`. No leading zeros. (A bare weekday for a reset 6 days 20 h out read
 as today.)
+
+### Pool-aware resume
+
+cswap pools Mack's Claude accounts, and a limit hit on account A is over for
+the agent as soon as Claude runs on another account with room: it need not
+wait for A's own reset, nor for a switch the tick happened to see. The
+switch rule above only looks at usage.json's root (the one account it
+describes, which lags a switch); the pool rule reads every member.
+
+- **The data.** codexbar-usage-status.sh publishes, per window family
+  (`weekly`, `session`, `scoped`), usage.json `<family>_pace` with
+  `window_minutes` and `members` (`{slot, used, cap, resets_at, as_of}`,
+  one per cswap account). `swap_state` reads cswap's own word:
+  `~/.claude-swap-backup/sequence.json`'s `activeAccountNumber` (the slot
+  Claude uses NOW), its `accounts` (slot → `<email>/<organizationUuid>`,
+  limited.json's `account` format, and each one's `weeklyReservePct`) and
+  mtime, and `autoswitch_state.json`'s `reserveOverride` `{account, until}`
+  while it still holds and names the active slot (Mack chose that account
+  inside its weekly reserve).
+- **Effective cap** (`eff_cap`): weekly, `100 − weeklyReservePct` (from
+  sequence.json, else the member's published `cap`), and 100 for the
+  override slot, which cswap will not leave; 100 for the other families.
+- **Judged at all** (`pool_ready`): a Claude target (not codex or grok)
+  with a reset time and an `account`, a usage.json from a pool-aware
+  publisher (it has `weekly_pace`) written within `USAGE_DEAD` (7 days), and
+  cswap's active slot known.
+- **Eligible, `pool`** (`pool_eligible`): the active slot is not the
+  account the limit was hit on, the switch to it is at least `SWITCH_SETTLE`
+  (45 s) old (Claude Code caches the keychain for ~30 s, so a younger switch
+  has not reached it), and every window the target needs is free on that
+  slot (`slot_free`, the same check `pool_due` puts any other slot
+  through). Needed (`pool_families`): weekly always, a `five_hour` target
+  included (a free 5-hour window on an exhausted week is no headroom);
+  session only when that slot has a session member with data (`used` or
+  `resets_at`); scoped for an opus/sonnet limit when it has a scoped member.
+  The publisher never pools the session window (`session_pace` is null, or
+  holds one slot), so a slot with no session member has no session window
+  to judge: a weekly-only account is judged on its weekly member alone,
+  against its reserve cap. Except right after a switch: until usage.json has
+  been written since it (`updated_at` > sequence.json's mtime),
+  `session_pace` still describes the old slot, so a missing session member
+  on the active slot proves nothing, and a `five_hour` target is not freed
+  on that slot's week alone (a weekly target is unaffected). The limited
+  account's OWN reset stays the clock rule's (reset + 120 s: Claude's native
+  continue goes first).
+- **A member is free** (`member_free`) when:
+  - its family is session and both `used` and `resets_at` are null: a
+    weekly-only account, which has no session window to exhaust (usage.json
+    `session_limit: false`, agent-tab-indicator.md §7 "Weekly-only plans");
+  - or its window reset at least `POOL_GRACE` (90 s: cswap's 60 s tick has
+    re-read it) ago and its reading is from that window (`as_of` within
+    `window_minutes` before the reset): a reset is a reset, stale reading or
+    not;
+  - or a trusted reading taken after the limit shows room: usage.json not in
+    the publisher's error state and written within `USAGE_FRESH` (1800 s),
+    the member's `as_of` within 1800 s and later than the target's `since`,
+    and `used <= cap − 2` (`POOL_MIN_HEADROOM`).
+
+  A missing member is not free.
+- **When to look again** (`pool_due`, folded into `@agent_limit_due`; not
+  for a lifted target): the earliest member reset + `POOL_GRACE` still
+  ahead (weekly members, session ones too for a `five_hour` limit, scoped
+  ones for a `seven_day_opus` / `seven_day_sonnet` one), never
+  the limited account's own (the clock rule has it); the end of
+  `SWITCH_SETTLE` after a switch away from it; and, while another slot that
+  is not active has every window the target needs free (`slot_free`), a
+  poll every 20 s (`LIMIT_SWITCH_POLL`: cswap should switch to it within a
+  minute, and its `sequence.json` trigger ticks too) for at most 5 min
+  (`LIMIT_SWITCH_WAIT`) after a stable anchor: the latest of the target's
+  `since`, the last switch (sequence.json's mtime), and that slot's weekly
+  reset + 90 s once it has passed. Never the reading's `as_of`, which cswap
+  moves on every re-read: a cswap that will not switch (autoswitch off, a
+  reserve override) then got a tick every 20 s until the reset. Past the
+  5 min the due falls back to the reset times. Not the publisher's horizons: `avail(T)` counts resets strictly before T,
+  so its first horizon with headroom is the reset AFTER the one that frees
+  the pool.
+
+The pool rule runs wherever eligibility is asked: `limit-tick`,
+`limit-resume`, the resume press's limit half, `@agent_limit_due` and
+`dry-run`.
+
+### The limit dialog
+
+When a turn ends on a usage limit, Claude Code opens its own
+`/rate-limit-options` dialog over the prompt box ("What do you want to
+do?": `Stop and wait for limit to reset`, `Wait here, then continue
+automatically at <t>`, and maybe credits or upgrade rows), unless it armed
+its native auto-continue silently (a reset ≤ 24 h away). While it is up the
+prompt box is gone and tmux-mcp holds every message behind it, so a RESUME
+would wait there and a toast would blame "a draft".
+
+tmux-mcp's **`answer_limit_dialog`** tool (`{pane, choice}`) recognises the
+dialog strictly (the last title row within 30 rows of the bottom,
+contiguous numbered rows, one of them `Stop and wait for limit to reset` or
+`Stop`, nothing below but blanks, borders or the key guide) and presses ONE
+key. Rows are chosen by label, since their order varies:
+
+- `wait`: the digit of the `Wait here, then continue automatically …` row,
+  which arms Claude's own wait for the reset; Escape when the dialog already
+  shows `Don't continue automatically` (a wait is armed, and Escape keeps
+  it) or has no Wait row;
+- `dismiss`: Escape (the dialog's cancel);
+- never Enter (it takes the focused row, which may be the credits one), and
+  never another row's digit.
+
+Its reply's first line is `answered: …`, `no dialog`, `unknown: …` (some
+other screen: nothing pressed) or `not answered: …`. agent-pause.py
+(`limit_dialog`, `DIALOG_*`) answers it for Claude agents only (codex,
+OpenCode and Grok draw no such dialog here), at two moments:
+
+- **limit-add's pass** (`limit_dialog_pass`): after limit.lock is released,
+  it waits `DIALOG_DELAY` (2 s, `AGENT_PAUSE_DIALOG_DELAY`: the dialog opens
+  just after the StopFailure that marked the window), answers `wait` while
+  `@agent_limit_autoresume` is on and `dismiss` while it is off, and records
+  `dialog` `{at, choice, result}` on the target. It never raises: a failure
+  is a `limit-dialog` log line, `skipped`.
+- **before every limit RESUME** (`limit_send`, from the tick, `limit-resume`
+  and the press's limit half), always `dismiss`, auto-resume or not: the
+  RESUME follows at once, and `wait` would arm Claude's own continue for a
+  moment already past, racing the RESUME into a duplicate prompt.
+  `answered` or `no dialog`: the RESUME goes
+  out as usual. A refusal (`not answered`, an error reply, an older tmux-mcp
+  without the tool): plain delivery as before, held behind the dialog by
+  tmux-mcp's draft guard. `unknown` (or a call that timed out after
+  `DIALOG_TIMEOUT`, 30 s, with no usable reply: a key may have gone in):
+  nothing is sent, the flag stays on, the attempt's result is `dialog`, and
+  the next try waits for the backoff (past the cap, lifted for Mack with
+  `limit lifted · <label>'s limit dialog is open`).
+
+Every answer is a `limit-dialog` log line (window, label, choice, result,
+tmux-mcp's line).
 
 ### With the pause key
 
@@ -625,7 +830,7 @@ as today.)
   pressed during a `[limit]` turn) is resumed like any running target: handed
   over, its Stop would clear the limit and leave it paused in neither set.
 - **After the RESUMEs**, the limited agents whose limit has lifted (lifted,
-  or eligible by either rule) get the `[limit]` text, never the pause
+  or eligible by any rule) get the `[limit]` text, never the pause
   RESUME, staggered after (auto-resume on, not past the cap, no held copy
   queued), or are marked lifted without a message (off; the resume's toast
   says so). No wake or DNS grace: Mack pressed the key. This resume's own
@@ -646,13 +851,23 @@ as today.)
   drop it with the flag.
 - **status** and **dry-run** list the limited set: window, kind, type,
   `resets <time>` or `lifted`, attempts and label (dry-run adds which are
-  eligible now, and marks a saved target that resume would hand over).
+  eligible now and by which rule, and marks a saved target that resume
+  would hand over).
 
 Tests: the `RateLimits` class (private server, stub tmux-mcp, a fake
 notify.sh) injects the clock, the last wake and DNS through
 `AGENT_PAUSE_NOW`, `AGENT_PAUSE_WAKETIME` and `AGENT_PAUSE_DNS` (`ok`,
 `fail`, or a comma list of hosts that resolve), and sets
-`AGENT_PAUSE_LIMIT_STAGGER=0`.
+`AGENT_PAUSE_LIMIT_STAGGER=0` (the harness also sets
+`AGENT_PAUSE_DIALOG_DELAY=0`); its pool, dialog and grok cases run against
+the stub's `answer_limit_dialog` (which can also answer "tool not found",
+an older tmux-mcp). The pure rules (`Units`:
+`test_pool_*`, `test_limit_account_is_the_slot_that_hit_it`,
+`test_switch_rule_five_hour_needs_the_new_accounts_week`,
+`test_limit_sync_fills_an_account_as_limit_add_would`,
+`test_locate_by_the_same_live_pid_even_once_it_has_a_session`,
+`test_dialog_reply_and_stuck_text`, `test_grok_tui_args`,
+`test_grok_limits_are_nobody_elses`) need no server.
 
 ## Failure modes
 

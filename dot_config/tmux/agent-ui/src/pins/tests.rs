@@ -165,6 +165,86 @@ fn an_opencode_window_is_known_by_its_session_flag() {
     assert_eq!(got.now, map(&[("@1", "ses_abc")]));
 }
 
+/// Grok: the TUI process under one of its panes, its id from Grok's
+/// `active_sessions.json` by pid (over `@agent_session_id` and a claude file
+/// naming the window), else its own `-s <id>`; its `-r <id>` a resumed id.
+/// A `grok sessions` (no TUI) or a grok in a non-grok window: none; a
+/// subcommand word with a session record (the v2 amendment): a TUI.
+#[test]
+fn a_grok_window_is_known_by_its_active_session() {
+    let d = scratch("grok");
+    let active = d.join("active_sessions.json");
+    std::fs::write(&active, r#"[
+        {"session_id": "new-g", "pid": 101, "pid_start": 1, "cwd": "/x", "opened_at": "2026-11-02T17:43:29Z"},
+        {"session_id": "new-r", "pid": 400},
+        {"session_id": "other", "pid": 501},
+        {"session_id": "act-8", "pid": 801},
+        {"session_id": "", "pid": 999}, {"pid": 998}, "junk"
+    ]"#).unwrap();
+    // A claude in a split of @1 names its pane: the grok's id wins there.
+    let v = obj![("pid", 900), ("sessionId", "cl-1"), ("tmux", "main:@1.%1"), ("startedAt", 5)];
+    std::fs::write(d.join("900.json"), v.to_json()).unwrap();
+    let s = snap(&[
+        row("main", 1, "@1", &[("state", "idle"), ("kind", "grok"), ("session_id", "hook-g"), ("pane_flags", "A0%1:100 ")]),
+        row("main", 2, "@2", &[("state", "idle"), ("kind", "grok"), ("pane_flags", "A0%2:200 ")]),
+        row("main", 3, "@3", &[("state", "idle"), ("kind", "grok"), ("pane_flags", "A0%3:300 ")]),
+        row("main", 4, "@4", &[("state", "idle"), ("kind", "grok"), ("pane_flags", "A0%4:400 ")]), // grok is the pane's process
+        row("main", 5, "@5", &[("state", "idle"), ("pane_flags", "A0%5:500 ")]), // not grok
+        row("main", 6, "@6", &[("state", "idle"), ("kind", "grok"), ("pane_flags", "A0%6:600 ")]),
+        // v2: `grok "help me fix x"` as `ps` would split it, with a resurrect
+        // record (@7) or a row in Grok's map (@8): a TUI after all.
+        row("main", 7, "@7", &[("state", "idle"), ("kind", "grok"), ("pane_flags", "A0%7:700 ")]),
+        row("main", 8, "@8", &[("state", "idle"), ("kind", "grok"), ("pane_flags", "A0%8:800 ")]),
+    ], "A");
+    let records = d.join("records");
+    std::fs::create_dir_all(&records).unwrap();
+    std::fs::write(records.join("grok-701.json"), "{}").unwrap();
+    std::fs::write(records.join("grok-301.json.tmp"), "{}").unwrap(); // not @3's record
+    let src = |active: &Path| GrokSources { active: active.to_path_buf(), records: records.clone() };
+    let mut procs = Fake::default()
+        .with_argv(100, &["-zsh"])
+        .with_argv(101, &["/Users/me/.grok/bin/grok", "-r", "old-g"])
+        .with_argv(200, &["-zsh"])
+        .with_argv(201, &["grok", "-s", "own-id"])
+        .with_argv(300, &["-zsh"])
+        .with_argv(301, &["grok", "sessions"])
+        .with_argv(400, &["/Users/me/.grok/downloads/grok-macos-aarch64", "--resume=new-r"])
+        .with_argv(500, &["-zsh"])
+        .with_argv(501, &["grok"])
+        .with_argv(600, &["-zsh"])
+        .with_argv(601, &["grok", "-r", "old-6"])
+        .with_argv(700, &["-zsh"])
+        .with_argv(701, &["grok", "-r", "old-7", "help", "me", "fix", "x"])
+        .with_argv(800, &["-zsh"])
+        .with_argv(801, &["grok", "usage", "is", "high"])
+        .with_argv(900, &["claude"]);
+    procs.kids = HashMap::from([(100, vec![101]), (200, vec![201]), (300, vec![301]), (500, vec![501]), (600, vec![601]),
+        (700, vec![701]), (800, vec![801])]);
+    let got = sessions_with(&s, &d, Some(&src(&active)), &procs);
+    assert_eq!(got.now, map(&[("@1", "new-g"), ("@2", "own-id"), ("@4", "new-r"), ("@8", "act-8")]));
+    let olds = |pairs: &[(&str, &str)]| pairs.iter().map(|(w, o)| (w.to_string(), vec![o.to_string()])).collect::<HashMap<_, _>>();
+    assert_eq!(got.resumed, olds(&[("@1", "old-g"), ("@6", "old-6"), ("@7", "old-7")]));
+    // No map at all: the `-s` id, else the tab hook's id; never the claude's.
+    // @8 has no record left (no map row, no file): its `grok usage` is no TUI.
+    let bare = sessions_with(&s, &d, Some(&src(&d.join("none.json"))), &procs);
+    assert_eq!(bare.now, map(&[("@1", "hook-g"), ("@2", "own-id")]));
+    // (@4's `--resume=new-r` is now no current id: a resumed one.)
+    assert_eq!(bare.resumed, olds(&[("@1", "old-g"), ("@4", "new-r"), ("@6", "old-6"), ("@7", "old-7")]));
+    // The Grok pass skipped (the insight engine's call): no grok process is
+    // even looked for; @1 keeps what the claude pass gave it.
+    let skipped = sessions_with(&s, &d, None, &procs);
+    assert_eq!(skipped.now, map(&[("@1", "cl-1")]));
+    assert!(skipped.resumed.is_empty());
+    assert!(grok_active("not json").is_empty() && grok_active("{}").is_empty());
+    // A restore: @6's grok resumed the pinned old-6 (its new id not yet in
+    // Grok's map); the pin comes back on it, still under old-6.
+    let mut store = Store { entries: vec![entry("old-6", 50, "B", "@9", 60)] };
+    let plans = reconcile(&mut store, &s, &got, "A", 100);
+    assert_eq!(plans, vec![Plan::Set("@6".into(), 50)]);
+    assert_eq!(store.entries, vec![entry("old-6", 50, "A", "@6", 100)]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// KERN_PROCARGS2's layout: argc, the exec path, NUL padding, the argv,
 /// then the environment (never read).
 #[test]

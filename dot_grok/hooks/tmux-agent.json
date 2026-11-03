@@ -1,0 +1,136 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/grok-session-track.sh\" start", "timeout": 5 },
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" idle grok", "timeout": 10 }
+        ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/mackhaymond/.local/bin/cua-notch-agent-hook", "args": ["grok"], "timeout": 5 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" running grok", "timeout": 10 }
+        ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/mackhaymond/.local/bin/cua-notch-agent-hook", "args": ["grok"], "timeout": 5 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" heartbeat grok", "timeout": 5 }
+        ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/mackhaymond/.local/bin/cua-notch-agent-hook", "args": ["grok"], "timeout": 5 }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" heartbeat grok", "timeout": 5 }
+        ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/mackhaymond/.local/bin/cua-notch-agent-hook", "args": ["grok"], "timeout": 5 }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" needs-approval grok", "timeout": 10 }
+        ]
+      },
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" settle grok", "timeout": 5 }
+        ]
+      },
+      {
+        "matcher": "permission_prompt|idle_prompt",
+        "hooks": [
+          { "type": "command", "command": "/Users/mackhaymond/.local/bin/cua-notch-agent-hook", "args": ["grok"], "timeout": 5 }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/mackhaymond/.local/bin/cua-notch-agent-hook", "args": ["grok"], "timeout": 5 }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/mackhaymond/.local/bin/cua-notch-agent-hook", "args": ["grok"], "timeout": 5 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" done grok", "timeout": 10 }
+        ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/mackhaymond/.local/bin/cua-notch-agent-hook", "args": ["grok"], "timeout": 5 }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" failed grok", "timeout": 10 }
+        ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/mackhaymond/.local/bin/cua-notch-agent-hook", "args": ["grok"], "timeout": 5 }
+        ]
+      }
+    ],
+    "StopCancelled": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" interrupt grok", "timeout": 10 }
+        ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/mackhaymond/.local/bin/cua-notch-agent-hook", "args": ["grok"], "timeout": 5 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/grok-session-track.sh\" end", "timeout": 5 },
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" clear grok", "timeout": 5 }
+        ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/mackhaymond/.local/bin/cua-notch-agent-hook", "args": ["grok"], "timeout": 2 }
+        ]
+      }
+    ]
+  }
+}

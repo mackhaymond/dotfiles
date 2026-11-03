@@ -569,7 +569,7 @@ impl Procs for Alive {
 
 /// Through the engine: two Claude agents in ONE checkout (and one's
 /// subagent) each get their own files' diff; a commit drops them out; a
-/// Codex window reads its rollout; an OpenCode one has none.
+/// Codex window reads its rollout; an OpenCode or Grok one has none.
 #[test]
 fn engine_attributes_per_agent() {
     if !has_git() {
@@ -582,10 +582,13 @@ fn engine_attributes_per_agent() {
     let slug_dir = projects.join(crate::sidebar::activity::project_slug(&cwd));
     fs::create_dir_all(slug_dir.join("sid-a/subagents")).unwrap();
     fs::create_dir_all(&sessions).unwrap();
-    for (pid, sid, win, pane) in [(11, "sid-a", "@1", "%1"), (12, "sid-b", "@2", "%2")] {
+    // (sid-g: a Claude session naming the Grok window @6's pane, which
+    // lends it nothing.)
+    for (pid, sid, win, pane) in [(11, "sid-a", "@1", "%1"), (12, "sid-b", "@2", "%2"), (13, "sid-g", "@6", "%6")] {
         let v = obj![("pid", pid), ("sessionId", sid), ("cwd", cwd.as_str()), ("tmux", format!("main:{win}.{pane}")), ("startedAt", 5)];
         fs::write(sessions.join(format!("{pid}.json")), v.to_json()).unwrap();
     }
+    fs::write(slug_dir.join("sid-g.jsonl"), lines(&[user("not grok's")])).unwrap();
     let p = |f: &str| d.join(f).to_string_lossy().into_owned();
     let usage = asst(vec![], [100, 200, 300], "claude-opus-5-5", Some("claude-opus-5-5[1m]"));
     fs::write(slug_dir.join("sid-a.jsonl"), lines(&[user("refactor a"), edit("e1", &p("a.txt")), usage])).unwrap();
@@ -603,6 +606,7 @@ fn engine_attributes_per_agent() {
         row("main", 3, "@3", &[("state", "idle"), ("kind", "codex"), ("rollout", &rollout.to_string_lossy())]),
         row("main", 4, "@4", &[("state", "idle"), ("kind", "opencode")]),
         row("main", 5, "@5", &[("state", ""), ("pane_flags", "A0%5 ")]),
+        row("main", 6, "@6", &[("state", "running"), ("kind", "grok"), ("pane_flags", "A0%6 "), ("path", &cwd)]),
     ].join("\n"));
     let mut e = Engine::new(root.clone(), sessions, codex_root.clone(), Box::new(Alive));
     let got = e.update(&snap, 1000.0);

@@ -24,12 +24,53 @@ set -uo pipefail
 PLUGIN_DIR="${TMUX_ASSISTANT_RESURRECT_PLUGIN:-$HOME/.config/tmux/plugins/tmux-assistant-resurrect}"
 # shellcheck source=/dev/null
 source "$PLUGIN_DIR/scripts/lib-detect.sh" || exit 1 # detect_tool, pane_has_assistant, posix_quote
+# Upstream's detect_tool knows claude/codex/opencode only; guard 2 below must
+# also see a grok already running in a pane (argv0 basename grok or
+# grok-<os>-<arch>, any mode: a pane busy with `grok -p` is not free either).
+eval "_upstream_detect_tool() $(declare -f detect_tool | tail -n +2)"
+detect_tool() {
+	local w="${1%%[[:space:]]*}"
+	if [[ "${w##*/}" =~ ^grok(-(macos|linux|windows)-[a-z0-9_]+)?$ ]]; then
+		echo grok
+	else
+		_upstream_detect_tool "$1"
+	fi
+}
 
 RESURRECT_DIR="$(tmux show-option -gqv @resurrect-dir 2>/dev/null)"
 RESURRECT_DIR="${RESURRECT_DIR:-$HOME/.tmux/resurrect}"
 RESURRECT_DIR="${RESURRECT_DIR/#\~/$HOME}"
 INPUT_FILE="$RESURRECT_DIR/assistant-sessions.json"
 LOG_FILE="$RESURRECT_DIR/assistant-restore.log"
+
+# Only ever restore into THE default tmux server. Any server that loads
+# tmux.conf runs this as its post-restore hook: on 2026-10-08 and again on
+# 2026-11-02 a subagent's test server started without `-f /dev/null`,
+# continuum restored the real snapshot into it, and this resumed every live
+# Claude session a second time inside the test server. #{socket_path} is the
+# server this script was invoked for (the hook's $TMUX; by hand, whatever the
+# CLI reaches). "Default" is /private/tmp/tmux-$UID/default by resolved path
+# (/tmp is a link to it). Deliberately NOT ${TMUX_TMPDIR}/tmux-$UID/default:
+# agents' private servers live at exactly that under their own TMUX_TMPDIR,
+# and their hooks inherit it, so honouring it would admit the very servers
+# this guard is for. Same rule as resurrect-save.sh's socket_ok, and the same
+# opt-in for test harnesses: RESURRECT_SAVE_ALLOW_SOCKET=<that exact socket>.
+resolved_path() { # <path>: its directory with symlinks resolved, + basename
+	local d
+	d="$(cd -P "${1%/*}" 2>/dev/null && pwd -P)" || return 1
+	printf '%s/%s' "$d" "${1##*/}"
+}
+SOCKET="$(tmux display-message -p '#{socket_path}' 2>/dev/null)"
+sock_real="$(resolved_path "$SOCKET")" || sock_real=""
+default_real="$(resolved_path "/private/tmp/tmux-$UID/default")" || default_real="/private/tmp/tmux-$UID/default"
+allow_real=""
+[ -n "${RESURRECT_SAVE_ALLOW_SOCKET:-}" ] && allow_real="$(resolved_path "$RESURRECT_SAVE_ALLOW_SOCKET")"
+if [ -z "$sock_real" ] || { [ "$sock_real" != "$default_real" ] && [ "$sock_real" != "$allow_real" ]; }; then
+	echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] not the default server: ${SOCKET:-(tmux unreachable)}, restore skipped" \
+		| tee -a "$LOG_FILE" >&2 2>/dev/null
+	exit 0
+fi
+
 EXCLUDE="$(tmux show-option -gqv @resurrect-exclude-sessions 2>/dev/null)"
 EXCLUDE="${EXCLUDE:-agents tasks}"
 # Entries are shell `case` patterns (`ptymcp-*`), as in resurrect-save.sh; an
@@ -140,10 +181,41 @@ def claudecut:
     elif ($w | cvflag) then .out += [$w] | .pend = true
     else .out += [$w] end)
   | .out;
+# Grok rows (assistant-save.sh's post-pass) keep their leading options too, and
+# lose whatever would fight the `-r <sid>` appended here: -r/--resume and
+# -w/--worktree with their optional value (a next word that is no option),
+# -c/--continue, -s/--session-id, --worktree-ref/--ref and --cwd with theirs,
+# and the one-shot --fork-session (a new id on every restore) and
+# --restore-code. The line cd's into the session's cwd first, so --cwd (and a
+# relative --add-dir, which is dropped too) would resolve against the wrong
+# directory; an absolute --add-dir stays. Same rules as build_cmd in
+# closed-tabs.sh; value-taking flags = the TUI filter's list.
+def gvflag: . as $w | any(("--agent", "--agents", "--allow", "--debug-file", "--deny",
+  "--disallowed-tools", "--json-schema", "--leader-socket", "-m", "--model", "--max-turns", "--output-format",
+  "--permission-mode", "--reasoning-effort", "--effort", "--rules", "--sandbox", "--system-prompt-override",
+  "--system-prompt", "--tools"); . == $w);
+def grokcut:
+  reduce .[] as $w ({out: [], pend: false, skip: false, opt: false, add: false, stop: false};
+    if .stop then .
+    elif .pend then .out += [$w] | .pend = false
+    elif .skip then .skip = false
+    elif .add then (if $w | startswith("/") then .out += ["--add-dir", $w] else . end) | .add = false
+    elif .opt and ($w | startswith("-") | not) then .opt = false
+    elif $w == "--" or ($w | startswith("-") | not) then .stop = true
+    elif any(("-r", "--resume", "-w", "--worktree"); . == $w) then .opt = true
+    elif any(("-s", "--session-id", "--worktree-ref", "--ref", "--cwd"); . == $w) then .skip = true | .opt = false
+    elif $w == "--add-dir" then .add = true | .opt = false
+    elif any(("-c", "--continue", "--fork-session", "--restore-code"); . == $w) then .opt = false
+    elif $w | test("^--add-dir=/") then .out += [$w] | .opt = false
+    elif $w | test("^--(resume|worktree|session-id|worktree-ref|ref|cwd|add-dir)=") then .opt = false
+    elif ($w | gvflag) then .out += [$w] | .pend = true | .opt = false
+    else .out += [$w] | .opt = false end)
+  | .out;
 (.sessions // [])[]
 | . as $e
 | ((.cli_args // "") | [splits("[ \t\n]+")] | map(select(length > 0))
-   | if $e.tool == "codex" then ctxdrop elif $e.tool == "claude" then claudecut else . end) as $words
+   | if $e.tool == "codex" then ctxdrop elif $e.tool == "claude" then claudecut
+     elif $e.tool == "grok" then grokcut else . end) as $words
 | ($words | map(" " + q) | join("")) as $args
 | (if (.model // "") != "" and .tool == "claude"
      and ($words | any(. == "--model" or startswith("--model=")) | not)
@@ -153,6 +225,7 @@ def claudecut:
 | (if .tool == "claude" then "command claude" + $args + $model + " --resume " + (.session_id | q)
    elif .tool == "opencode" then "command opencode" + $args + " -s " + (.session_id | q)
    elif .tool == "codex" then $codex + $args + " resume " + (.session_id | q)
+   elif .tool == "grok" then $grok + $args + " -r " + (.session_id | q)
    else "" end) as $cmd
 # The same line for a nu pane (field 6), whole: nu cannot parse the POSIX one
 # (`2>/dev/null`, `command`, a `VAR=x` prefix), so a nu shell typed it and the
@@ -165,6 +238,7 @@ def claudecut:
      | (if .tool == "claude" then "^claude" + $nargs + $nmodel + " --resume " + (.session_id | nq)
         elif .tool == "opencode" then "^opencode" + $nargs + " -s " + (.session_id | nq)
         elif .tool == "codex" then $codexnu + $nargs + " resume " + (.session_id | nq)
+        elif .tool == "grok" then $groknu + $nargs + " -r " + (.session_id | nq)
         else "" end) as $ncmd
      | ([$cap[] as $v | (($e.env // {})[$v] // "") | tostring
          | select(. != "" and . != "null") | $v + ": " + nq] | join(", ")) as $nenv
@@ -181,7 +255,13 @@ JQ
 # ~/.bun/bin's raw CLI first. codex_nu is the same for a nu pane (^ = external).
 codex_cmd="command codex" codex_nu="^codex"
 [ -x "$HOME/.local/bin/codex" ] && codex_cmd="$(posix_quote "$HOME/.local/bin/codex")" && codex_nu="^r###'$HOME/.local/bin/codex'###"
-rows="$(jq -r --argjson cap "$capture_json" --arg codex "$codex_cmd" --arg codexnu "$codex_nu" "$JQ_PROG" "$INPUT_FILE")" || { log "could not parse $INPUT_FILE"; exit 0; }
+# Grok's installer links ~/.grok/bin/grok but puts nothing on PATH, so a grok
+# row resumes through that link when it exists.
+grok_cmd="command grok" grok_nu="^grok" grok_bin="${GROK_HOME:-$HOME/.grok}/bin/grok"
+[ -x "$grok_bin" ] && grok_cmd="$(posix_quote "$grok_bin")" && grok_nu="^r###'$grok_bin'###"
+# One line: tests/test_codex_launchers.py lifts this statement (and the
+# codex_cmd / grok_cmd lines above) out with grep and runs it.
+rows="$(jq -r --argjson cap "$capture_json" --arg codex "$codex_cmd" --arg codexnu "$codex_nu" --arg grok "$grok_cmd" --arg groknu "$grok_nu" "$JQ_PROG" "$INPUT_FILE")" || { log "could not parse $INPUT_FILE"; exit 0; }
 
 count="$(printf '%s\n' "$rows" | grep -c . || true)"
 [ "${count:-0}" -gt 0 ] || { log "no assistant sessions to restore"; exit 0; }

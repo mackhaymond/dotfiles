@@ -451,20 +451,29 @@ impl Bar {
 /// codexbar-usage-status.sh keeps (`@codex_*`: the display provider's
 /// numbers, Claude's here): `--%` while one is unset, as the bar does.
 /// Nothing at all when none of them is set.
+///
+/// A weekly-only account (`@codex_session_limit` "0",
+/// [`crate::tmux::Status::no_session_limit`]) has no session window: the S
+/// meter goes and the account label moves onto W, as the status line's own
+/// modules do. "1" and "" (unknown) draw all three.
 fn usage(st: &crate::tmux::Status) -> Vec<Usage> {
     if [&st.session_text, &st.weekly_text, &st.scoped_text].iter().all(|t| t.trim().is_empty()) {
         return Vec::new();
     }
     let text = |t: &str| if t.trim().is_empty() { "--%".to_string() } else { sanitize(t.trim()) };
     let account = sanitize(st.account_label.trim());
-    let s_label = if account.is_empty() { "S".to_string() } else { format!("{account} S") };
+    let labelled = |w: &str| if account.is_empty() { w.to_string() } else { format!("{account} {w}") };
+    let no_session = st.no_session_limit();
     let icon = sanitize(st.scoped_icon.trim().trim_end_matches(':'));
     let [m0, m1, m2] = &st.meters;
-    vec![
-        Usage::read(s_label, text(&st.session_text), tmux_colour(&st.session_color), m0),
-        Usage::read("W".into(), text(&st.weekly_text), tmux_colour(&st.weekly_color), m1),
-        Usage::read(if icon.is_empty() { "F".into() } else { icon }, text(&st.scoped_text), tmux_colour(&st.scoped_color), m2),
-    ]
+    let mut v = Vec::with_capacity(3);
+    if !no_session {
+        v.push(Usage::read(labelled("S"), text(&st.session_text), tmux_colour(&st.session_color), m0));
+    }
+    let w_label = if no_session { labelled("W") } else { "W".into() };
+    v.push(Usage::read(w_label, text(&st.weekly_text), tmux_colour(&st.weekly_color), m1));
+    v.push(Usage::read(if icon.is_empty() { "F".into() } else { icon }, text(&st.scoped_text), tmux_colour(&st.scoped_color), m2));
+    v
 }
 
 // ---------------------------------------------------------------- the key table
@@ -1098,6 +1107,27 @@ mod tests {
         let bar = Bar::build(&snap, Some("/dev/ttys999"));
         assert_eq!((bar.usage[1].used, bar.usage[1].expected, bar.usage[1].members.len()), (Some(61.0), Some(44.0), 2));
         assert_eq!((bar.usage[0].used, bar.usage[0].expected), (Some(21.0), None));
+    }
+
+    /// `@codex_session_limit`: "0" (a weekly-only account) drops the S meter
+    /// and moves the account label onto W; "1" and "" (unknown) keep three
+    /// meters, the label on S.
+    #[test]
+    fn a_weekly_only_account_has_no_session_meter() {
+        let at = crate::tmux::STATUS_FORMATS.iter().position(|f| *f == "#{@codex_session_limit}").expect("the option");
+        let labels = |limit: &str, account: &str| {
+            let mut st = vec!["root", "", "", "", "n/a", "brightblack", "1% (-9%)", "green", "F:", "0%", "green", account];
+            st.resize(at + 1, "");
+            st[at] = limit;
+            let snap = Snapshot::parse(&[row("main", 1, "@2", &[]), client("main", "@2", &st)].join("\n"));
+            Bar::build(&snap, Some("/dev/ttys999")).usage.into_iter().map(|u| (u.label, u.text)).collect::<Vec<_>>()
+        };
+        let p = |v: &[(&str, &str)]| v.iter().map(|(l, t)| (l.to_string(), t.to_string())).collect::<Vec<_>>();
+        assert_eq!(labels("0", "mack"), p(&[("mack W", "1% (-9%)"), ("F", "0%")]));
+        assert_eq!(labels(" 0 ", ""), p(&[("W", "1% (-9%)"), ("F", "0%")]));
+        for limit in ["1", ""] {
+            assert_eq!(labels(limit, "mack"), p(&[("mack S", "n/a"), ("W", "1% (-9%)"), ("F", "0%")]), "{limit:?}");
+        }
     }
 
     /// The key-table poll: nothing at all in root; started when a refresh

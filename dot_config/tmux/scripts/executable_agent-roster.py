@@ -90,8 +90,12 @@ ESC_WAIT = 0.025            # how long a trailing ESC / partial sequence waits f
 # by argv, which a tty+comm ps can't see; so in pick_agent_pane an opencode
 # pane counts only in a window whose @agent_kind is opencode (the watcher
 # and plugin set that kind for the TUI alone), and a pane whose comm matches
-# the window's kind beats the active pane.
+# the window's kind beats the active pane. Grok's comm is `grok` (the
+# ~/.grok/bin symlink) or the real binary `grok-macos-aarch64` (a platform
+# word, so never `grok-mcp-server`); never its other symlink `agent`. Like opencode, its non-TUI modes (`grok -p`,
+# `grok sessions`) share the comm, so it too counts only in a grok window.
 AGENT_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+GROK_COMM = re.compile(r"^grok(-(macos|linux|windows)-[a-z0-9_]+)?$")
 
 # THIRD SURFACE of the agent colour language: same hex values as the
 # @catppuccin_window_* formats in tmux.conf.tmpl and cua-notch Sources/Constants.swift;
@@ -116,7 +120,7 @@ MIN_FIELDS = 20
 # Then six: window_active and pane_current_path (the window's active pane)
 # give the strip each session's current window and its git branch;
 # window_panes says whether a peek must look for the agent pane; @agent_kind
-# (claude|codex|opencode), @agent_detail_kind (perm|ask|fail|done|run) and @agent_detail
+# (claude|codex|opencode|grok), @agent_detail_kind (perm|ask|fail|done|run) and @agent_detail
 # (one sanitized line, <= 80 chars) are set by agent-tab-indicator.sh and may
 # be empty on any window. Last, @space_home: a space's home shell
 # (docs/spaces.md), not shown here; parse_windows drops it unless an agent
@@ -352,8 +356,8 @@ CAT_GLYPH = {"failed": "✕", "needs-input": "◉", "done": "✓", "working": "�
 CAT_HUE = {"failed": "red", "needs-input": "yellow", "done": "green", "working": "pink", "paused": "violet",
            "idle": "overlay"}
 # opencode: nf-oct-terminal (U+F489), one cell like the others (agent-ui
-# model.rs kind_glyph uses the same codepoint).
-KIND_GLYPH = {"claude": "✳", "codex": "⬢", "opencode": ""}
+# model.rs kind_glyph uses the same codepoint). grok: ✦ (U+2726), likewise.
+KIND_GLYPH = {"claude": "✳", "codex": "⬢", "grok": "✦", "opencode":""}
 DETAIL_WORD = {"perm": "perm", "ask": "asks", "fail": "fail", "done": "done", "run": "run", "limit": "limit"}
 STATE_WORDS = {"failed": "failed", "needs-input": "waiting on you", "done": "done", "paused": "paused"}
 STRIP_GEAR, STRIP_MOUSE = "⚙", "◎"
@@ -862,12 +866,15 @@ def snapshot():
 
 def is_agent_comm(comm):
     base = comm.rsplit("/", 1)[-1]
-    return base in ("claude", "codex", "opencode") or bool(AGENT_VERSION.match(base))
+    return (base in ("claude", "codex", "opencode") or bool(AGENT_VERSION.match(base))
+            or bool(GROK_COMM.match(base)))
 
 
 def comm_kind(comm):
-    """The @agent_kind an is_agent_comm comm names: codex, opencode, else claude."""
+    """The @agent_kind an is_agent_comm comm names: codex, opencode, grok, else claude."""
     base = comm.rsplit("/", 1)[-1]
+    if GROK_COMM.match(base):
+        return "grok"
     return base if base in ("codex", "opencode") else "claude"
 
 
@@ -886,7 +893,8 @@ def pick_agent_pane(panes_text, ps_text, kind=""):
     launched through npm shows up there as `node`, and falling back to the
     active pane then closed the user's shell instead of the agent. An
     `opencode` comm counts only when kind is opencode (`opencode serve` in a
-    split beside a claude must not be what `x` closes), and among several
+    split beside a claude must not be what `x` closes), a `grok` one only
+    when kind is grok (`grok -p`, `grok sessions` alike), and among several
     agent panes the one whose comm matches kind wins before the active one.
     A split window where no pane (or more than one, none of them active)
     runs an agent is refused rather than guessed at."""
@@ -900,7 +908,7 @@ def pick_agent_pane(panes_text, ps_text, kind=""):
         parts = l.strip().split(None, 1)
         if len(parts) == 2 and parts[0] != "??" and is_agent_comm(parts[1].strip()):
             k = comm_kind(parts[1].strip())
-            if k == "opencode" and kind != "opencode":
+            if k in ("opencode", "grok") and kind != k:
                 continue
             agent_ttys.setdefault(parts[0], set()).add(k)
     hits = [(pid, active, agent_ttys[tt]) for pid, t, active in rows

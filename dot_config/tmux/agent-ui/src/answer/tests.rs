@@ -67,7 +67,7 @@ fn keys_for_each_verdict() {
         (Some(Verdict::Allow), Some(Verdict::Deny), None));
 }
 
-/// Codex, OpenCode, an unknown kind and a non-perm detail are refused before
+/// Codex, OpenCode, Grok, an unknown kind and a non-perm detail are refused before
 /// any pane is read; a gone window too. (The server does not exist, so a
 /// window that passed would fail at its pane, never send.)
 #[test]
@@ -77,11 +77,13 @@ fn windows_refused_up_front() {
         row("main", 2, "@2", &[("state", "needs-input"), ("kind", "claude"), ("detail_kind", "ask"), ("summary", "Asks")]),
         row("main", 3, "@3", &[("state", "needs-input"), ("kind", "opencode"), ("detail_kind", "perm"), ("summary", "Oc")]),
         row("main", 4, "@4", &[("state", "needs-input"), ("kind", "claude"), ("detail_kind", "perm"), ("summary", "Ok")]),
+        row("main", 5, "@5", &[("state", "needs-input"), ("kind", "grok"), ("detail_kind", "perm"), ("summary", "Gk")]),
     ].join("\n"));
     let a = Actions::new(Tmux::with_socket(Some(crate::tmux::Socket::Name(format!("agentui-answer-none-{}", std::process::id())))));
     assert_eq!(answer(&a, &snap, "@1", Verdict::Allow, None), Err("Cx: answer Codex prompts in its tab".into()));
     assert_eq!(answer(&a, &snap, "@2", Verdict::Allow, None), Err("Asks: no permission prompt pending".into()));
     assert_eq!(answer(&a, &snap, "@3", Verdict::Deny, None), Err("Oc: not a Claude agent".into()));
+    assert_eq!(answer(&a, &snap, "@5", Verdict::Allow, None), Err("Gk: answer Grok prompts in its tab".into()));
     assert_eq!(answer(&a, &snap, "@9", Verdict::Deny, None), Err(PANE_GONE.into()));
     assert_eq!(answer(&a, &snap, "@4", Verdict::Allow, None), Err(PANE_GONE.into()));
 }

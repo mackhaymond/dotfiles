@@ -226,7 +226,7 @@ pub struct Agent {
     pub age: String,
     /// The state in words ("waiting on you", "done · fleet out", ...).
     pub state_words: &'static str,
-    /// @agent_kind (claude|codex|opencode) and its glyph (✳ ⬢ U+F489).
+    /// @agent_kind (claude|codex|opencode|grok) and its glyph (✳ ⬢ U+F489 ✦).
     pub kind: String,
     pub kind_glyph: Option<&'static str>,
     pub workflow: bool,
