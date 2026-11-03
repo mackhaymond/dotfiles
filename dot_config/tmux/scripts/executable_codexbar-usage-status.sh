@@ -1746,6 +1746,7 @@ load_cache_fields() {
   CACHE_SCOPED_LABEL=''
   CACHE_WEEKLY_POOL_RESETS=''
   CACHE_SCOPED_POOL_RESETS=''
+  CACHE_SESSION_LIMIT=''
   CACHE_OTHER_ACCOUNT=0
 
   [[ -f "$CACHE_FILE" ]] || return 0
@@ -1767,19 +1768,24 @@ load_cache_fields() {
   # second one, because this runs on every status tick. The candidates, not
   # the answer: "past now" needs now, and now is a `date` fork that only the
   # reset view pays (render_text_for_mode), not every tick.
+  #
+  # The last field, appended after those, is session_limit as "1" / "0" / ""
+  # (see "WEEKLY-ONLY ACCOUNTS"). Spelled out with if/elif, not `//`, which
+  # would turn false into "". Anything added later goes AFTER it.
   local parsed
   parsed="$(jq -r --arg p "$provider" --arg primary "$PROVIDER_PRIMARY" \
     'def pool_resets($pc): if ($pc | type) == "object" and $pc.scope == "pool" then ([ ($pc.horizons // []) | arrays | .[] | objects | .at | numbers ] | sort) + [ $pc.resets_at | numbers ] | map(tostring) | join(" ") else "" end;
-    ((.providers[$p]? // (if $p == $primary then . else {} end)) // {}) | [.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//"", .scoped_text//"", .scoped_color//"", .scoped_resets_at//"", .scoped_used//"", .scoped_window_minutes//"", .scoped_label//"", pool_resets(.weekly_pace), pool_resets(.scoped_pace)] | @tsv' \
+    ((.providers[$p]? // (if $p == $primary then . else {} end)) // {}) | [.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//"", .scoped_text//"", .scoped_color//"", .scoped_resets_at//"", .scoped_used//"", .scoped_window_minutes//"", .scoped_label//"", pool_resets(.weekly_pace), pool_resets(.scoped_pace), (.session_limit | if . == false then "0" elif . == true then "1" else "" end)] | @tsv' \
     "$CACHE_FILE" 2>/dev/null | tr '\t' '\037' || true)"
   [[ -n "$parsed" ]] || return 0
-  IFS=$'\037' read -r CACHE_STATE CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES CACHE_SCOPED_TEXT CACHE_SCOPED_COLOR CACHE_SCOPED_RESETS CACHE_SCOPED_USED CACHE_SCOPED_WINDOW_MINUTES CACHE_SCOPED_LABEL CACHE_WEEKLY_POOL_RESETS CACHE_SCOPED_POOL_RESETS <<<"$parsed"
+  IFS=$'\037' read -r CACHE_STATE CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES CACHE_SCOPED_TEXT CACHE_SCOPED_COLOR CACHE_SCOPED_RESETS CACHE_SCOPED_USED CACHE_SCOPED_WINDOW_MINUTES CACHE_SCOPED_LABEL CACHE_WEEKLY_POOL_RESETS CACHE_SCOPED_POOL_RESETS CACHE_SESSION_LIMIT <<<"$parsed"
 
   # Another account's numbers are not this account's usage. Draw them as
   # unknown, in gray, until a fetch (or a live sample) for the account that is
   # logged in now replaces them — normally the very next tick.
   if [[ "$provider" == 'claude' ]] && claude_block_is_other_account; then
     CACHE_OTHER_ACCOUNT=1
+    CACHE_SESSION_LIMIT=''
     CACHE_SESSION_COLOR='brightblack'
     CACHE_WEEKLY_COLOR='brightblack'
     CACHE_SCOPED_COLOR='brightblack'
@@ -1825,7 +1831,10 @@ render_text_for_mode() {
         resets_at="$CACHE_SESSION_RESETS"
         used="$CACHE_SESSION_USED"
         window_minutes="$CACHE_SESSION_WINDOW_MINUTES"
-        if [[ -z "$resets_at" && "$used" == "0" ]]; then
+        if [[ "$CACHE_SESSION_LIMIT" == 0 ]]; then
+          # A weekly-only account: no session window, ever.
+          out='n/a'
+        elif [[ -z "$resets_at" && "$used" == "0" ]]; then
           # No 5-hour window open, so there is no reset to count down to.
           out='idle'
         else
@@ -1937,7 +1946,8 @@ publish_to_tmux_opts() {
   opt_arg @codex_scoped_icon "$(icon_for_label "$CACHE_SCOPED_LABEL")"
 
   # Whose numbers these are: the codex_session module draws the label in
-  # front of "S:" when it is non-empty. Claude only — Codex has no accounts
+  # front of "S:" when it is non-empty (codex_weekly, in front of "W:", when
+  # @codex_session_limit below is "0" and S is hidden). Claude only — Codex has no accounts
   # to switch between here — and always the account logged in NOW, even
   # while the block still holds the previous one's numbers (drawn "--%").
   local account_label='' account_email=''
@@ -1948,6 +1958,17 @@ publish_to_tmux_opts() {
   fi
   opt_arg @codex_account_label "$account_label"
   opt_arg @codex_account "$account_email"
+
+  # Whether the displayed account has a 5-hour session window: "1", "0"
+  # (weekly-only: the status line hides the S module and draws the account
+  # label on W), or "" when not known — no cache, a block from before the
+  # field, another account's block (drawn "--%" until the new one's numbers
+  # land), or a login needed — which keeps the S module as it always was.
+  local session_limit_opt="$CACHE_SESSION_LIMIT"
+  if [[ "$CACHE_STATE" == "auth_required" ]] || (( ${CACHE_OTHER_ACCOUNT:-0} == 1 )); then
+    session_limit_opt=''
+  fi
+  opt_arg @codex_session_limit "$session_limit_opt"
 
   if [[ "$CACHE_STATE" == "auth_required" ]]; then
     opt_arg @codex_session_color "$AUTH_REQUIRED_COLOR"
@@ -2740,6 +2761,9 @@ reset_fetch_outputs() {
   FETCH_SESSION_RESETS_AT=''
   FETCH_WEEKLY_RESETS_AT=''
   FETCH_SCOPED_RESETS_AT=''
+  # Whether the account has a session window: 1, 0 (weekly-only), or ''
+  # (unknown). See "WEEKLY-ONLY ACCOUNTS".
+  FETCH_SESSION_LIMIT=''
   FETCH_SESSION_LABEL='Session'
   FETCH_WEEKLY_LABEL='Weekly'
   FETCH_SCOPED_LABEL=''
@@ -2869,6 +2893,13 @@ fetch_via_codexbar_codex() {
 
   FETCH_SESSION_USED="$session_raw"
   FETCH_WEEKLY_USED="$weekly_raw"
+  # No 5-hour window reported at all: a weekly-only account (today's Codex
+  # plans), published as session_limit false.
+  if [[ "$session_limit" == null ]]; then
+    FETCH_SESSION_LIMIT=0
+  else
+    FETCH_SESSION_LIMIT=1
+  fi
   FETCH_SESSION_WINDOW_MINUTES="$(printf '%s' "$session_limit" | jq -er '.windowMinutes // empty | tonumber' 2>/dev/null || true)"
   FETCH_WEEKLY_WINDOW_MINUTES="$(printf '%s' "$weekly_limit" | jq -er '.windowMinutes // empty | tonumber' 2>/dev/null || true)"
 
@@ -2948,6 +2979,24 @@ claude_oauth_response_is_auth_error() {
   ' >/dev/null 2>&1
 }
 
+# A weekly-only answer (five_hour null): log what .limits[] holds, once per
+# account (the marker keeps the account key), so whether the endpoint still
+# lists a `session` limit for such an account is on record without logging
+# it on every poll. The WARN line for a failed fetch truncates the payload
+# before .limits[], and usage-raw.json keeps only the latest answer.
+claude_log_weekly_only_limits() {
+  local raw="${1:-}" marker="${CACHE_DIR}/claude-weekly-only.logged" key seen='' kinds
+  load_claude_account
+  key="${CLAUDE_ACCOUNT_KEY:-?}"
+  { IFS= read -r seen <"$marker"; } 2>/dev/null || true
+  [[ "$seen" == "$key" ]] && return 0
+  kinds="$(printf '%s' "$raw" | jq -c '[ .limits[]? | objects
+      | {kind, percent, is_active, resets_at} | with_entries(select(.value != null)) ]' 2>/dev/null || true)"
+  log_info "$(truncate_msg "refresh[claude]: weekly-only answer (five_hour null) for ${key}; limits=${kinds:-?}" 600)"
+  printf '%s\n' "$key" >"$marker" 2>/dev/null || true
+  return 0
+}
+
 fetch_via_claude_oauth() {
   reset_fetch_outputs
 
@@ -3020,7 +3069,12 @@ fetch_via_claude_oauth() {
     return 1
   fi
 
-  if ! printf '%s' "$raw" | jq -e '.five_hour and .seven_day' >/dev/null 2>&1; then
+  # The weekly window is required; the 5-hour one is not. A weekly-only
+  # account answers "five_hour": null (first seen 2026-11-02 on a slot that
+  # cswap had already recorded without one), and gating on both failed every
+  # fetch for it into the backoff ladder. See "WEEKLY-ONLY ACCOUNTS".
+  if ! printf '%s' "$raw" | jq -e '(.seven_day | type) == "object"
+                                   and ((.five_hour | type) == "object" or .five_hour == null)' >/dev/null 2>&1; then
     log_warn_trunc "refresh[claude]: missing usage fields out=${raw}" 300
     return 1
   fi
@@ -3030,10 +3084,39 @@ fetch_via_claude_oauth() {
   # Best-effort.
   persist_raw_payload claude "$raw"
 
-  local session_raw weekly_raw
-  if ! session_raw="$(printf '%s' "$raw" | jq -er '.five_hour.utilization' 2>/dev/null)"; then
-    log_warn "refresh[claude]: missing five_hour.utilization"
-    return 1
+  # A five_hour object with a null utilization AND no resets_at says no more
+  # than a null five_hour does, and is read the same way (UsageBar's cswap
+  # bridge agrees: cswap stores that as pct None and the bridge drops it).
+  # {utilization: 0, resets_at: null} is the idle shape, and stays a limit.
+  local session_raw='' weekly_raw session_iso=''
+  if printf '%s' "$raw" | jq -e '(.five_hour | type) == "object"
+        and ((.five_hour.utilization // null) != null or (.five_hour.resets_at // null) != null)' >/dev/null 2>&1; then
+    if ! session_raw="$(printf '%s' "$raw" | jq -er '.five_hour.utilization' 2>/dev/null)"; then
+      log_warn "refresh[claude]: missing five_hour.utilization"
+      return 1
+    fi
+    session_iso="$(printf '%s' "$raw" | jq -er -r '.five_hour.resets_at // empty | tostring' 2>/dev/null || true)"
+    FETCH_SESSION_LIMIT=1
+  else
+    # No five_hour. Should the endpoint ever move the session to .limits[]
+    # only, take it from there; otherwise the account has no session limit.
+    # Only a session entry that shows a WINDOW counts (a reset time, or usage
+    # in it): a 0% entry with no reset is what an idle 5-hour account reports
+    # beside a real five_hour object, so beside a null five_hour it proves
+    # nothing and must not bring the row back.
+    local session_entry
+    session_entry="$(printf '%s' "$raw" | jq -c '
+        [ .limits[]? | objects | select((.kind? // "") == "session")
+          | select((.percent | type) == "number")
+          | select(.percent > 0 or (.resets_at // null) != null) ] | first // empty' 2>/dev/null || true)"
+    if [[ -n "${session_entry:-}" ]]; then
+      session_raw="$(printf '%s' "$session_entry" | jq -er '.percent' 2>/dev/null || true)"
+      session_iso="$(printf '%s' "$session_entry" | jq -er -r '.resets_at // empty | tostring' 2>/dev/null || true)"
+      FETCH_SESSION_LIMIT=1
+    else
+      FETCH_SESSION_LIMIT=0
+    fi
+    claude_log_weekly_only_limits "$raw"
   fi
   if ! weekly_raw="$(printf '%s' "$raw" | jq -er '.seven_day.utilization' 2>/dev/null)"; then
     log_warn "refresh[claude]: missing seven_day.utilization"
@@ -3042,13 +3125,14 @@ fetch_via_claude_oauth() {
 
   FETCH_SESSION_USED="$session_raw"
   FETCH_WEEKLY_USED="$weekly_raw"
-  FETCH_SESSION_WINDOW_MINUTES=300
+  if (( FETCH_SESSION_LIMIT == 1 )); then
+    FETCH_SESSION_WINDOW_MINUTES=300
+  fi
   FETCH_WEEKLY_WINDOW_MINUTES=10080
 
   local iso
-  iso="$(printf '%s' "$raw" | jq -er -r '.five_hour.resets_at // empty | tostring' 2>/dev/null || true)"
-  if [[ -n "${iso:-}" ]]; then
-    FETCH_SESSION_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
+  if [[ -n "${session_iso:-}" ]]; then
+    FETCH_SESSION_RESETS_AT="$(iso_utc_to_epoch "$session_iso" 2>/dev/null || true)"
   fi
   iso="$(printf '%s' "$raw" | jq -er -r '.seven_day.resets_at // empty | tostring' 2>/dev/null || true)"
   if [[ -n "${iso:-}" ]]; then
@@ -3092,6 +3176,9 @@ fetch_via_claude_oauth() {
   local kinds=(session weekly_all weekly_scoped) families=(SESSION WEEKLY SCOPED)
   local i limit_entry severity locked
   for i in 0 1 2; do
+    # A weekly-only account's session stays "normal", unlocked: whatever a
+    # session entry says, it is not a window this account is held to.
+    (( i == 0 && FETCH_SESSION_LIMIT == 0 )) && continue
     limit_entry="$(printf '%s' "$raw" | jq -c --arg k "${kinds[$i]}" \
       '[ .limits[]? | select((.kind? // "") == $k) ] | first // empty' 2>/dev/null || true)"
     [[ -n "${limit_entry:-}" ]] || continue
@@ -3182,6 +3269,23 @@ login_claude_oauth() {
 # a status patch leaves both alone, so a failed fetch never relabels the
 # previous account's numbers as the new one's. A provider that is not configured
 # has NO ENTRY — absence, not a state string, is how "draw nothing" is said.
+#
+# WEEKLY-ONLY ACCOUNTS. `session_limit` says whether the block's account HAS a
+# 5-hour session window at all:
+#   true   it does: session_* as always ("idle" between windows included)
+#   false  it does not (Claude's endpoint answers "five_hour": null, or a
+#          five_hour with utilization null and no resets_at; cswap's lastGood
+#          has no five_hour, or one with pct null and no resets_at; Codex
+#          reports no primary window). {utilization 0, resets_at null} is the
+#          idle shape and stays true:
+#          session_used/_window_minutes/_resets_at null, session_text "n/a",
+#          session_color/_pace_color "brightblack", session_pace null,
+#          severity "normal", locked false, history rows "s":null
+#   null   not known (a block built from a live sample alone, or one written
+#          before the field existed): draw as before
+# A reader hides the session row on false only. Only the endpoint or cswap's
+# reading decides false — never a live sample lacking five_hour, which is
+# also what an idle account's sample looks like once its window closes.
 #
 # Merging, not replacing: a fetch failure for one provider must never blank
 # another's numbers (the 2am bug), so each refresh merges its blocks over what
@@ -3685,6 +3789,7 @@ pool_pace_color() {
 # block is correct) and shows up only as a history file that never grows and
 # a projection that never appears.
 RENDER_BLOCK=''
+RENDER_SESSION_LIMIT='null'
 RENDER_SESSION_USED=''
 RENDER_WEEKLY_USED=''
 RENDER_SCOPED_USED=''
@@ -3696,6 +3801,14 @@ render_provider_block() {
   local provider="$1" updated_at="$2"
 
   RENDER_BLOCK=''
+  # No session limit means no session numbers, whatever else filled them.
+  if [[ "${FETCH_SESSION_LIMIT:-}" == 0 ]]; then
+    FETCH_SESSION_USED=''
+    FETCH_SESSION_WINDOW_MINUTES=''
+    FETCH_SESSION_RESETS_AT=''
+    FETCH_SESSION_SEVERITY='normal'
+    FETCH_SESSION_LOCKED=0
+  fi
   local session_used='' weekly_used='' scoped_used=''
   if [[ -n "${FETCH_SESSION_USED:-}" ]]; then
     session_used="$(clamp_0_100_int "$FETCH_SESSION_USED")" || return 1
@@ -3800,6 +3913,17 @@ render_provider_block() {
     session_pace_color='brightblack'
   fi
 
+  # session_limit (see "WEEKLY-ONLY ACCOUNTS"): what the endpoint or cswap
+  # said; failing that, a session reading in hand is proof enough of a
+  # window, and nothing at all is "not known" (null), never false.
+  local session_limit='null'
+  case "${FETCH_SESSION_LIMIT:-}" in
+    0) session_limit='false' ;;
+    1) session_limit='true' ;;
+    *) [[ -n "$session_used" ]] && session_limit='true' ;;
+  esac
+  RENDER_SESSION_LIMIT="$session_limit"
+
   RENDER_SESSION_USED="$session_used"
   RENDER_WEEKLY_USED="$weekly_used"
   RENDER_SCOPED_USED="$scoped_used"
@@ -3865,6 +3989,7 @@ render_provider_block() {
     --argjson session_delta "$(json_int_or_null "$session_delta")" \
     --argjson weekly_delta "$(json_int_or_null "$weekly_delta")" \
     --argjson scoped_delta "$(json_int_or_null "$scoped_delta")" \
+    --argjson session_limit "$session_limit" \
     '
      # <family>_pace: the pool object when the pool applies, else this
      # account alone (one horizon, the pace_delta delta). See "Pooled pace".
@@ -3895,6 +4020,7 @@ render_provider_block() {
        session_color: $session_color, session_pace_color: $session_pace_color,
        session_label: $session_label,
        session_severity: $session_severity, session_locked: $session_locked,
+       session_limit: $session_limit,
 
        weekly_used: $weekly_used, weekly_window_minutes: $weekly_window,
        weekly_resets_at: $weekly_resets, weekly_text: $weekly_text,
@@ -4005,7 +4131,8 @@ apply_claude_live_sample() {
   out="$(printf '%s' "$sample" | jq -r \
     --argjson now "$(now_epoch)" --argjson base_t "$base_t" --argjson floor_t "$floor_t" \
     --arg su "${FETCH_SESSION_USED:-}" --arg sr "${FETCH_SESSION_RESETS_AT:-}" \
-    --arg wu "${FETCH_WEEKLY_USED:-}" --arg wr "${FETCH_WEEKLY_RESETS_AT:-}" '
+    --arg wu "${FETCH_WEEKLY_USED:-}" --arg wr "${FETCH_WEEKLY_RESETS_AT:-}" \
+    --arg slim "${FETCH_SESSION_LIMIT:-}" '
       def num($s): ($s | tonumber? // null);
       def api($u; $r):
         if num($u) == null then null
@@ -4025,13 +4152,17 @@ apply_claude_live_sample() {
            else {v: $l} end)
         elif $l.resets_at > $a.resets_at then {v: $l}
         else {v: $a} end;
-      pick(api($su; $sr); open(.five_hour)) as $ps
+      # A block with NO session limit (the endpoint or cswap said so) takes
+      # the weekly window alone: a live five_hour is not folded into it, and
+      # its absence is no reason to drop the weekly reading.
+      ($slim == "0") as $nolimit
+      | (if $nolimit then {v: null} else pick(api($su; $sr); open(.five_hour)) end) as $ps
       | pick(api($wu; $wr); open(.seven_day)) as $pw
       | $ps.v as $s | $pw.v as $w
-      | if $s == null or $w == null then empty else
+      | if ($s == null and ($nolimit | not)) or $w == null then empty else
           ({} + (if $ps.over then {five_hour: $ps.over} else {} end)
               + (if $pw.over then {seven_day: $pw.over} else {} end)) as $ov
-          | [ $s.used, ($s.resets_at // ""), $w.used, ($w.resets_at // ""),
+          | [ ($s.used // ""), ($s.resets_at // ""), $w.used, ($w.resets_at // ""),
               ([$s.t, $w.t, $floor_t] | max),
               (if $ov == {} then "-" else ($ov | tojson) end) ]
           | map(tostring) | join("\u001f")
@@ -4151,7 +4282,8 @@ retire_overridden_live_readings() {
 # cap, labels, severities, breakdown — exactly as the last fetch left it.
 # Also sets BLOCK_STATE, BLOCK_UPDATED_AT, BLOCK_FETCHED_AT and
 # BLOCK_ENDPOINT_AT (endpoint_at, else fetched_at for a block written before
-# endpoint_at existed).
+# endpoint_at existed), and FETCH_SESSION_LIMIT from session_limit ('' when
+# the block predates it).
 BLOCK_STATE=''
 BLOCK_UPDATED_AT=0
 BLOCK_FETCHED_AT=0
@@ -4165,7 +4297,9 @@ load_fetch_from_block() {
   # fields a null scoped window produces and shift everything after them.
   line="$(jq -r --arg p "$provider" '
     .providers[$p] // empty
-    | select(.session_used != null and .weekly_used != null)
+    # A weekly-only block (session_limit false) has no session numbers by
+    # design; any other block without them is not one to re-render from.
+    | select(.weekly_used != null and (.session_used != null or .session_limit == false))
     | [ .session_used, .weekly_used, .scoped_used,
         .session_window_minutes, .weekly_window_minutes, .scoped_window_minutes,
         .session_resets_at, .weekly_resets_at, .scoped_resets_at,
@@ -4173,7 +4307,8 @@ load_fetch_from_block() {
         .session_severity, .weekly_severity, .scoped_severity,
         .session_locked, .weekly_locked, .scoped_locked,
         .state, (.updated_at // 0), (.fetched_at // .updated_at // 0),
-        (.endpoint_at // .fetched_at // .updated_at // 0) ]
+        (.endpoint_at // .fetched_at // .updated_at // 0),
+        .session_limit ]
     | map(if . == null then "" elif . == true then "1" elif . == false then "0"
           else tostring end)
     | join("\u001f")
@@ -4187,7 +4322,9 @@ load_fetch_from_block() {
     FETCH_SESSION_LABEL FETCH_WEEKLY_LABEL FETCH_SCOPED_LABEL \
     FETCH_SESSION_SEVERITY FETCH_WEEKLY_SEVERITY FETCH_SCOPED_SEVERITY \
     FETCH_SESSION_LOCKED FETCH_WEEKLY_LOCKED FETCH_SCOPED_LOCKED \
-    BLOCK_STATE BLOCK_UPDATED_AT BLOCK_FETCHED_AT BLOCK_ENDPOINT_AT <<<"$line"
+    BLOCK_STATE BLOCK_UPDATED_AT BLOCK_FETCHED_AT BLOCK_ENDPOINT_AT \
+    FETCH_SESSION_LIMIT <<<"$line"
+  [[ "$FETCH_SESSION_LIMIT" == 0 || "$FETCH_SESSION_LIMIT" == 1 ]] || FETCH_SESSION_LIMIT=''
 
   [[ -n "${FETCH_SESSION_LABEL:-}" ]] || FETCH_SESSION_LABEL='Session'
   [[ -n "${FETCH_WEEKLY_LABEL:-}" ]] || FETCH_WEEKLY_LABEL='Weekly'
@@ -4279,7 +4416,7 @@ merge_live_claude_locked() {
 
   if [[ "$before" != "$after" ]]; then
     commit_claude_rerender "$LIVE_AS_OF" || return 1
-    log_info "live[claude]: from Claude Code session=${RENDER_SESSION_USED}% weekly=${RENDER_WEEKLY_USED}% (endpoint fetched $(( now - BLOCK_FETCHED_AT ))s ago)"
+    log_info "live[claude]: from Claude Code session=${RENDER_SESSION_USED:-n/a}% weekly=${RENDER_WEEKLY_USED}% (endpoint fetched $(( now - BLOCK_FETCHED_AT ))s ago)"
     retire_overridden_live_readings "$overridden" || true
     return 0
   fi
@@ -4301,7 +4438,7 @@ merge_live_claude_locked() {
   seen="$(live_sample_confirmed_at "$sample")" || return 0
   [[ "$seen" =~ ^[0-9]+$ ]] || return 0
   commit_claude_rerender "$seen" || return 1
-  log_info "live[claude]: confirmed by Claude Code session=${RENDER_SESSION_USED}% weekly=${RENDER_WEEKLY_USED}% (seen $(( now - seen ))s ago; endpoint fetched $(( now - BLOCK_FETCHED_AT ))s ago)"
+  log_info "live[claude]: confirmed by Claude Code session=${RENDER_SESSION_USED:-n/a}% weekly=${RENDER_WEEKLY_USED}% (seen $(( now - seen ))s ago; endpoint fetched $(( now - BLOCK_FETCHED_AT ))s ago)"
   return 0
 }
 
@@ -4314,13 +4451,16 @@ merge_live_claude_locked() {
 # about the other. A LOWER live reading never confirms: the endpoint saw usage
 # Claude Code did not (claude.ai, the phone, another machine), and the session
 # repainting its older number is not evidence the endpoint's is still current.
+# A block with no session limit (FETCH_SESSION_LIMIT 0) has no five_hour to
+# agree with, and is confirmed by seven_day alone.
 live_sample_confirmed_at() {
   local sample="${1:-}" out
   [[ -n "${sample:-}" ]] || return 1
   out="$(printf '%s' "$sample" | jq -r \
     --argjson now "$(now_epoch)" --argjson updated "${BLOCK_UPDATED_AT:-0}" \
     --arg su "${FETCH_SESSION_USED:-}" --arg sr "${FETCH_SESSION_RESETS_AT:-}" \
-    --arg wu "${FETCH_WEEKLY_USED:-}" --arg wr "${FETCH_WEEKLY_RESETS_AT:-}" '
+    --arg wu "${FETCH_WEEKLY_USED:-}" --arg wr "${FETCH_WEEKLY_RESETS_AT:-}" \
+    --arg slim "${FETCH_SESSION_LIMIT:-}" '
       def num($s): ($s | tonumber? // null);
       def agrees($x; $u; $r):
         ($x | type) == "object"
@@ -4332,7 +4472,8 @@ live_sample_confirmed_at() {
       (.seen // null) as $seen
       | if ($seen | type) == "number"
            and ($seen | floor) > $updated and ($seen | floor) <= $now
-           and agrees(.five_hour; $su; $sr) and agrees(.seven_day; $wu; $wr)
+           and ($slim == "0" or agrees(.five_hour; $su; $sr))
+           and agrees(.seven_day; $wu; $wr)
         then $seen | floor
         else empty end
     ' 2>/dev/null || true)"
@@ -4406,9 +4547,11 @@ commit_claude_rerender() {
 #   - the slot is matched by the SAME key as CLAUDE_ACCOUNT_KEY (lower-cased
 #     email + "/<org uuid>"); another account's slot is never read
 #   - only when fetchedAt is newer than the block's endpoint_at (the newest
-#     endpoint reading it already has), five_hour and seven_day both exist,
-#     and their windows are still open (a five_hour with no resets_at is
-#     accepted only at 0%: the endpoint's "between windows")
+#     endpoint reading it already has), seven_day exists, and its window and
+#     five_hour's are still open (a five_hour with no resets_at is accepted
+#     only at 0%: the endpoint's "between windows"). NO five_hour at all is a
+#     weekly-only account, adopted as session_limit false (see "WEEKLY-ONLY
+#     ACCOUNTS"); one with a five_hour is adopted as session_limit true
 #   - it replaces the session and weekly used/resets_at, and the scoped cap
 #     when cswap has one matching @codexbar_scoped_model by the fetch's own
 #     rule (case-insensitive prefix); labels, severities, locked flags and the
@@ -4461,8 +4604,8 @@ adopt_cswap_claude_locked() {
     # As in merge_live_claude_locked: nothing of the previous account's block
     # survives. The poll is due at once for a switched account anyway; this
     # only means the bar shows the new account's numbers before it lands.
+    # The session window is set below, and only when cswap has one.
     reset_fetch_outputs
-    FETCH_SESSION_WINDOW_MINUTES=300
     FETCH_WEEKLY_WINDOW_MINUTES=10080
     BLOCK_STATE=''
     BLOCK_UPDATED_AT=0
@@ -4510,27 +4653,52 @@ adopt_cswap_claude_locked() {
       | (.fetchedAt | floor) as $fetched
       | select($fetched > $endpoint and $fetched <= $now)
       | (.lastGood // {}) as $g
+      # No five_hour at all is a weekly-only account (cswap stores the window
+      # only when the endpoint gave one; its "between windows" is {pct: 0}
+      # with no reset, which is still a session limit, and stays "idle"). A
+      # five_hour with a null pct and no reset is no window either, as the
+      # fetch and the UsageBar cswap bridge read it.
+      | ($g.five_hour == null
+         or (($g.five_hour | type) == "object"
+             and ($g.five_hour.pct // null) == null
+             and ($g.five_hour.resets_at // null) == null)) as $nolimit
       | window($g.five_hour) as $s
       | window($g.seven_day) as $w
-      | select($s != null and $w != null)
+      | select(($s != null or $nolimit) and $w != null)
       | select(($w.resets_at // 0) > $now)
-      | select(($s.resets_at != null and $s.resets_at > $now)
+      | select($nolimit
+               or ($s.resets_at != null and $s.resets_at > $now)
                or ($s.resets_at == null and $s.used == 0))
       | ([ ($g.scoped // [])[]? | objects
            | select(((.name // "") | tostring | ascii_downcase) | startswith($m | ascii_downcase))
            | select((.pct | type) == "number")
            | {name: (.name | tostring), used: (.pct | floor), resets_at: (.resets_at | epoch)}
            | select(.resets_at != null and .resets_at > $now) ] | first) as $sc
-      | [ $fetched, $s.used, ($s.resets_at // ""), $w.used, $w.resets_at,
-          ($sc.used // ""), ($sc.resets_at // ""), ($sc.name // "") ]
+      | [ $fetched, ($s.used // ""), ($s.resets_at // ""), $w.used, $w.resets_at,
+          ($sc.used // ""), ($sc.resets_at // ""), ($sc.name // ""),
+          (if $nolimit then "0" else "1" end) ]
       | map(tostring) | join("\u001f")
     ' "$CSWAP_USAGE_CACHE_FILE" 2>/dev/null || true)"
   [[ -n "${line:-}" ]] || return 0
 
-  local fetched su sr wu wr scu scr scn
-  IFS=$'\x1f' read -r fetched su sr wu wr scu scr scn <<<"$line" || true
-  [[ "$fetched" =~ ^[0-9]+$ && "$su" =~ ^[0-9]+$ && "$wu" =~ ^[0-9]+$ ]] || return 0
+  local fetched su sr wu wr scu scr scn slim
+  IFS=$'\x1f' read -r fetched su sr wu wr scu scr scn slim <<<"$line" || true
+  [[ "$fetched" =~ ^[0-9]+$ && "$wu" =~ ^[0-9]+$ ]] || return 0
+  case "$slim" in
+    0) su='' sr='' ;;
+    1) [[ "$su" =~ ^[0-9]+$ ]] || return 0 ;;
+    *) return 0 ;;
+  esac
 
+  # cswap's reading decides whether the account has a session window at all
+  # (see "WEEKLY-ONLY ACCOUNTS"), in both directions: a switch to a
+  # weekly-only account hides the row, a switch back brings it back.
+  FETCH_SESSION_LIMIT="$slim"
+  if [[ "$slim" == 1 ]]; then
+    [[ -n "${FETCH_SESSION_WINDOW_MINUTES:-}" ]] || FETCH_SESSION_WINDOW_MINUTES=300
+  else
+    FETCH_SESSION_WINDOW_MINUTES=''
+  fi
   FETCH_SESSION_USED="$su"
   FETCH_SESSION_RESETS_AT="$sr"
   FETCH_WEEKLY_USED="$wu"
@@ -4560,9 +4728,9 @@ adopt_cswap_claude_locked() {
 
   local shown=''
   if [[ "$RENDER_SESSION_USED" != "$su" || "$RENDER_WEEKLY_USED" != "$wu" ]]; then
-    shown="; Claude Code's live numbers outrank it: session=${RENDER_SESSION_USED}% weekly=${RENDER_WEEKLY_USED}%"
+    shown="; Claude Code's live numbers outrank it: session=${RENDER_SESSION_USED:-n/a}% weekly=${RENDER_WEEKLY_USED}%"
   fi
-  log_info "cswap[claude]: adopted session=${su}% weekly=${wu}% scoped=${scu:-n/a}% (fetched $(( now - fetched ))s ago${shown})"
+  log_info "cswap[claude]: adopted session=${su:-n/a}% weekly=${wu}% scoped=${scu:-n/a}% (fetched $(( now - fetched ))s ago${shown})"
   return 0
 }
 
@@ -4660,7 +4828,7 @@ refresh_one_provider() {
     "$RENDER_SESSION_RESETS" "$RENDER_WEEKLY_RESETS" \
     "$RENDER_SCOPED_USED" "$RENDER_SCOPED_RESETS" || true
 
-  log_info "refresh[${provider}]: success updated_at=${now} session=${RENDER_SESSION_USED}% weekly=${RENDER_WEEKLY_USED}% scoped=${RENDER_SCOPED_USED:-n/a}%"
+  log_info "refresh[${provider}]: success updated_at=${now} session=${RENDER_SESSION_USED:-n/a}% weekly=${RENDER_WEEKLY_USED}% scoped=${RENDER_SCOPED_USED:-n/a}%"
   reset_refresh_backoff
   return 0
 }

@@ -151,12 +151,43 @@ class Home:
 class AccountTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='codexbar-account-')
+        # A cleanup, not tearDown, and registered FIRST so it runs LAST:
+        # cleanups a test adds (a private tmux server's kill-server) still
+        # find their sockets, which live under this directory.
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.home = Home(self.tmp)
 
     def tearDown(self):
         # The status line must never start cswap, in any test.
         self.assertFalse(self.home.cswap_log.exists(), 'cswap was called')
-        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+def private_tmux_server(test, home, name):
+    """Start a PRIVATE tmux server (its own -L socket under the temp HOME's
+    TMUX_TMPDIR, no config) and make sure it dies with the test, pass or fail.
+    Returns the argv prefix that reaches it."""
+    tmux = shutil.which('tmux')
+    env = home.env()
+    real = [tmux, '-L', name, '-f', '/dev/null']
+    pid = []
+
+    def kill():
+        subprocess.run(real + ['kill-server'], env=env, capture_output=True, timeout=10)
+        # Belt and braces: the socket can be gone (or the server wedged), and
+        # a server nobody can reach any more lives for days.
+        for p in pid:
+            try:
+                os.kill(p, 15)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    test.addCleanup(kill)
+    subprocess.run(real + ['new-session', '-d', '-s', 'x'], env=env, check=True, timeout=10)
+    out = subprocess.run(real + ['display-message', '-p', '#{pid}'], env=env,
+                         capture_output=True, text=True, timeout=10).stdout.strip()
+    if out.isdigit():
+        pid.append(int(out))
+    return real, env
 
 
 class LabelTests(AccountTestCase):
@@ -226,6 +257,11 @@ class LabelTests(AccountTestCase):
         # != against empty, not truthiness: a "0" alias is still a label.
         self.assertIn('"#{?#{!=:#{@codex_account_label},},#{@codex_account_label} ,}S:"',
                       module)
+
+    def test_weekly_module_draws_label_only_without_a_session(self):
+        module = (SCRIPTS.parent / 'catppuccin-custom/executable_codex_weekly.sh').read_text()
+        self.assertIn('"#{?#{==:#{@codex_session_limit},0},'
+                      '#{?#{!=:#{@codex_account_label},},#{@codex_account_label} ,},}W:"', module)
 
     def test_label_zero_is_published(self):
         self.home.login('0@example.com')
@@ -530,6 +566,71 @@ class LiveSampleTests(AccountTestCase):
         self.assertEqual(block['scoped_text'], 'n/a')
         self.assertEqual(block['session_severity'], 'normal')
         self.assertEqual(block['fetched_at'], 0)
+
+
+# catppuccin's helpers, stubbed: options read back their defaults, and the
+# module builder makes the same shape as the real one — #[fg=…,bg=…] styles,
+# whose commas are what a conditional around the module trips over. The raw
+# module is also written to $RAW_OUT, to compare the wrapped one against.
+MODULE_PRELUDE = '''
+tmux_batch_setup_status_module() { :; }
+run_tmux_batch_commands() { :; }
+get_tmux_batch_option() { printf '%s\\n' "$2"; }
+build_status_module() {
+  local m="#[fg=$3,bg=default]<#[fg=black,bg=$3]$2 #[fg=white,bg=gray] $4#[fg=gray,bg=default]>"
+  printf '%s' "$m" >"$RAW_OUT"
+  printf '%s\\n' "$m"
+}
+'''
+
+
+@unittest.skipUnless(shutil.which('tmux'), 'needs tmux')
+class StatusModuleTests(AccountTestCase):
+    """The codex_session / codex_weekly modules, rendered by a PRIVATE tmux
+    server (own -L socket under the temp HOME, no config), never the user's."""
+
+    def render(self, name):
+        raw = self.home.root / f'{name}.raw'
+        path = SCRIPTS.parent / f'catppuccin-custom/executable_{name}.sh'
+        out = subprocess.run(['/bin/bash', '-c', MODULE_PRELUDE + f'source "{path}"\nshow_{name} 1\n'],
+                             capture_output=True, text=True, timeout=20,
+                             env=self.home.env(RAW_OUT=str(raw)))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout.rstrip('\n'), raw.read_text()
+
+    def test_session_module_hides_on_no_limit_and_label_moves_to_w(self):
+        session, session_raw = self.render('codex_session')
+        weekly, _ = self.render('codex_weekly')
+        real, env = private_tmux_server(self, self.home, f'cbmod-{os.getpid()}')
+
+        def expand(fmt, **opts):
+            for k, v in opts.items():
+                subprocess.run(real + ['set', '-g', f'@codex_{k}', v], env=env, check=True)
+            return subprocess.run(real + ['display-message', '-p', '-t', 'x', fmt], env=env,
+                                  capture_output=True, text=True, check=True).stdout.rstrip('\n')
+
+        base = dict(account_label='acct', session_text='12%', session_color='red',
+                    weekly_text='1%', weekly_color='green')
+        for limit in ('1', ''):
+            with self.subTest(limit=limit):
+                # Drawn exactly as the bare module, nested conditionals intact.
+                shown = expand(session, session_limit=limit, **base)
+                self.assertEqual(shown, expand(session_raw))
+                self.assertIn('acct S:', shown)
+                self.assertIn(' 12%', shown)
+                self.assertIn('#[fg=red,bg=default]', shown)
+                w = expand(weekly)
+                self.assertIn('W:', w)
+                self.assertNotIn('acct', w)
+        self.assertEqual(expand(session, session_limit='0', **base), '')
+        self.assertIn(']acct W: ', expand(weekly))
+        self.assertIn(' 1%', expand(weekly))
+        # No label, or a "0" alias (tmux's false), at W.
+        self.assertIn(']W: ', expand(weekly, account_label=''))
+        self.assertIn(']0 W: ', expand(weekly, account_label='0'))
+        # And the session module when its own text has no value yet.
+        self.assertIn('acct S:', expand(session, session_limit='1', session_text='',
+                                        account_label='acct'))
 
 
 if __name__ == '__main__':

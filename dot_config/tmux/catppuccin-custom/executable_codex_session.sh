@@ -17,5 +17,41 @@ show_codex_session() {
 
   module=$(build_status_module "$index" "$icon" "$color" "$text")
 
-  echo "$module"
+  # An account with no 5-hour session window at all (@codex_session_limit
+  # "0", published by the refresher for a weekly-only Claude account or a
+  # Codex plan without a primary window) draws no S module, and codex_weekly
+  # takes the account label. "1" and "" (not known yet: another account's
+  # numbers right after a switch, no cache) draw it as always. The weekly
+  # module runs the same --tick, so hiding this one stops nothing.
+  #
+  # The module goes inside a conditional, where a top-level comma would end
+  # the branch: the #[fg=…,bg=…] styles' commas are escaped as "#,". Commas
+  # inside a nested #{…} are NOT — tmux skips over those by brace depth, and
+  # escaping them would break the nested conditionals.
+  echo "#{?#{==:#{@codex_session_limit},0},,$(codex_session_escape_commas "$module")}"
+}
+
+# "#," for every comma outside #{…}, the way tmux's format_skip reads a
+# conditional's branches: #{ opens a level, } closes one, and #, ## #} #:
+# are two-character escapes taken as they stand.
+codex_session_escape_commas() {
+  local s="$1" out='' depth=0 i c next
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:i:1}"
+    next="${s:i+1:1}"
+    if [[ "$c" == '#' && -n "$next" ]]; then
+      case "$next" in
+        '{') depth=$(( depth + 1 )); out+='#{'; i=$(( i + 1 )); continue ;;
+        ','|'#'|'}'|':') out+="#$next"; i=$(( i + 1 )); continue ;;
+      esac
+    fi
+    if [[ "$c" == '}' ]]; then
+      (( depth > 0 )) && depth=$(( depth - 1 ))
+    elif [[ "$c" == ',' ]] && (( depth == 0 )); then
+      out+='#,'
+      continue
+    fi
+    out+="$c"
+  done
+  printf '%s' "$out"
 }

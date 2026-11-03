@@ -15,7 +15,7 @@ import tempfile
 import time
 import unittest
 
-from test_codexbar_account import A_EMAIL, A_ORG, STATUS, AccountTestCase
+from test_codexbar_account import A_EMAIL, A_ORG, STATUS, AccountTestCase, private_tmux_server
 
 JQ = shutil.which('jq')
 TMUX = shutil.which('tmux')
@@ -268,10 +268,7 @@ class ProviderSetTests(AccountTestCase):
 class TickForkTests(AccountTestCase):
     def test_a_tick_with_nothing_due_makes_one_tmux_call(self):
         sock = f'cbfix-{os.getpid()}'
-        env = self.home.env()
-        real = [TMUX, '-L', sock, '-f', '/dev/null']
-        subprocess.run(real + ['new-session', '-d', '-s', 'x'], env=env, check=True)
-        self.addCleanup(lambda: subprocess.run(real + ['kill-server'], env=env, capture_output=True))
+        real, env = private_tmux_server(self, self.home, sock)
         stub = self.home.bin / 'tmux'
         stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >>"$FAKE_TMUX_LOG"\n'
                         f'exec "{TMUX}" -L "{sock}" -f /dev/null "$@"\n')
