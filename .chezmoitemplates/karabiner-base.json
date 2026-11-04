@@ -245,6 +245,15 @@
                                 "type": "basic"
                             },
                             {
+                                "description": "Swallow hyper+period: command+control+option+shift+period is macOS's full-sysdiagnose keychord (fired by accident 2026-11-04, ~400MB archive + Finder reveal).",
+                                "from": {
+                                    "key_code": "period",
+                                    "modifiers": { "mandatory": ["command", "control", "option", "shift"] }
+                                },
+                                "to": [{ "key_code": "vk_none" }],
+                                "type": "basic"
+                            },
+                            {
                                 "description": "Third quick tap of left_control sends control+option+command+0, the camera preview (was BetterTouchTool on right_command, which CuaNotch dictation now owns). One variable per stage: every manipulator's delayed-action cancel runs on every key-down, after the matching one, so a shared variable would be reset right after stage 2 set it.",
                                 "conditions": [{ "type": "variable_if", "name": "left_control_tap2", "value": 1 }],
                                 "from": {
