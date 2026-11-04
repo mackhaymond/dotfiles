@@ -718,6 +718,12 @@ bind-key -n M-w run-shell -C "display-popup -c '#{client_tty}' -E -w 75% -h 75% 
 # (numbers in docs/agent-roster.md). So after installing or removing the
 # binary, reload the config (prefix r) to switch. Force the python fallback:
 # `rm ~/.local/bin/agent-ui`, then prefix r.
+#
+# prefix ?: the key help. Without agent-ui, tmux's own list of the bound keys
+# with their notes (what stock tmux binds it to); the block below makes it
+# `agent-ui keys`, every key of keys.tsv in a popup (docs/spaces.md "Key
+# help: prefix ?").
+bind-key -N "List the keys (agent-ui draws the full help)" ? list-keys -N
 if-shell "test -x '{{ .chezmoi.homeDir }}/.local/bin/agent-ui'" {
     # Width: at most 100 columns (narrower clients get the whole width), so a
     # row's title, project tag and age stay within one glance.
@@ -729,6 +735,12 @@ if-shell "test -x '{{ .chezmoi.homeDir }}/.local/bin/agent-ui'" {
     # as the menu; docs/agent-roster.md "agent-ui sessions".
     bind-key a      run-shell -C "display-popup -c '#{client_tty}' -E -B -w 60% -h 75% -x '##{E:@popup_x}' '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' sessions --client '#{client_tty}'"
     bind-key C-a    run-shell -C "display-popup -c '#{client_tty}' -E -B -w 60% -h 75% -x '##{E:@popup_x}' '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' sessions --client '#{client_tty}'"
+    # prefix ?: `agent-ui keys`, the key help: every key of keys.tsv (WezTerm
+    # chords, root, ⌥W, prefix, the menu's own), two columns, type to filter.
+    # At most 124 columns (narrower clients get the whole width), 85% high;
+    # same launch as the menu. The sidebar opens the same popup itself
+    # (agent_ui::keys::popup_command).
+    bind-key -N "Key help: every key, type to filter" ? run-shell -C "display-popup -c '#{client_tty}' -E -B -w '#{?#{e|<:#{client_width},124},#{client_width},124}' -h 85% -x '##{E:@popup_x}' '{{ .chezmoi.homeDir }}/.local/bin/agent-ui' keys --client '#{client_tty}'"
 }
 
 # Double-tap hyper or right shift in WezTerm (Karabiner, karabiner-base.json) flips

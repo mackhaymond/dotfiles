@@ -1075,6 +1075,17 @@ impl App {
         }
     }
 
+    /// The client's width in columns (a popup's `-w`, [`popup_width`]);
+    /// None when tmux does not say.
+    fn client_cols(&self, client: &str) -> Option<u16> {
+        self.core
+            .tmux
+            .run(&["display-message", "-p", "-c", client, "#{client_width}"])
+            .ok()
+            .filter(|o| o.ok())
+            .and_then(|o| o.stdout.trim().parse::<u16>().ok())
+    }
+
     /// Strip.click: act on a target, then refresh at once after a move so
     /// the highlight follows it.
     fn click(&mut self, t: Target) {
@@ -1144,20 +1155,31 @@ impl App {
             Target::Next => self.actions.next(&client).map(|_| true),
             Target::Back => self.actions.back(&client).map(|_| true),
             Target::Menu(tab) => {
-                let cols = self
-                    .core
-                    .tmux
-                    .run(&["display-message", "-p", "-c", &client, "#{client_width}"])
-                    .ok()
-                    .filter(|o| o.ok())
-                    .and_then(|o| o.stdout.trim().parse::<u16>().ok());
-                let cmd = menu_command(&self.core.tmux, &client, self.exe.as_deref(), tab, &popup_width(cols));
+                let cmd = menu_command(&self.core.tmux, &client, self.exe.as_deref(), tab, &popup_width(self.client_cols(&client)));
                 match proc::spawn_detached(cmd) {
                     Ok(child) => {
                         self.children.push(child);
                         Ok(false)
                     }
                     Err(e) => Err(format!("menu failed: {e}")),
+                }
+            }
+            // PARKED's `⌃S ? keys` hint: the keybind help, exactly prefix
+            // ?'s popup ([`crate::keys::popup_command`]: its size and place,
+            // this binary's `keys --client <client>`), on this client.
+            // Nothing else draws the help, so none without this binary's
+            // path. (Never from the unit tests: their binary is the test
+            // harness.)
+            Target::Keys => {
+                let exe = if cfg!(test) { None } else { self.exe.clone() };
+                let cols = self.client_cols(&client);
+                match exe.map(|exe| proc::spawn_detached(crate::keys::popup_command(&self.core.tmux, &client, &exe, cols))) {
+                    Some(Ok(child)) => {
+                        self.children.push(child);
+                        Ok(false)
+                    }
+                    Some(Err(e)) => Err(format!("keys failed: {e}")),
+                    None => Err("keys: no agent-ui binary".into()),
                 }
             }
             Target::Stash => match proc::spawn_detached(stash_command(&self.core.tmux, &client, &self.actions.scripts)) {
@@ -1458,6 +1480,31 @@ mod tests {
         assert_eq!(&a[a.len() - 7..a.len() - 3], ["-T", " agents ", "/bin/dash", "-c"]);
         assert!(!a.contains(&"-B".to_string()));
         assert!(a[a.len() - 2].ends_with("agent-roster.py") && a[a.len() - 1] == "/dev/ttys999");
+    }
+
+    /// PARKED's keys hint opens the keybind help exactly as prefix ? does
+    /// ([`crate::keys::popup_command`]: its size, not the menu's;
+    /// `agent-ui keys --client <tty>` in it). A click with no client says
+    /// so, like every other action.
+    #[test]
+    fn the_keys_hint_opens_agent_ui_keys() {
+        let t = Tmux::with_socket(Some(Socket::Name("priv".into())));
+        let exe = std::path::Path::new("/x/agent-ui");
+        let c = crate::keys::popup_command(&t, "/dev/ttys999", exe, Some(272));
+        assert_eq!(
+            args(&c),
+            ["-u", "-L", "priv", "display-popup", "-c", "/dev/ttys999", "-E", "-B", "-w",
+                &crate::keys::POPUP_W.to_string(), "-h", crate::keys::POPUP_H, "-x",
+                "#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}",
+                "/x/agent-ui", "--socket", "priv", "keys", "--client", "/dev/ttys999"]
+        );
+        // prefix ?'s size, not the menu's: a narrow client gets its width.
+        let narrow = args(&crate::keys::popup_command(&t, "/dev/ttys999", exe, Some(80)));
+        assert_eq!(narrow[narrow.iter().position(|a| a == "-w").unwrap() + 1], "80");
+        let mut a = app();
+        a.click(Target::Keys);
+        assert_eq!((a.last_act.clone(), a.children.len()), (Some(Target::Keys), 0));
+        assert_eq!(a.msg.as_ref().map(|m| m.0.as_str()), Some("no tmux client"));
     }
 
     /// A card's diff badge: `agent-ui --socket S diff <win> --client <tty>`

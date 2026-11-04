@@ -37,7 +37,7 @@
 //! ## Shape: the usage panel, NEEDS YOU, the agents and shells (the body), the dock
 //!
 //! ```text
-//!  ▄ prefix ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄   the usage panel; the key table's
+//!  ▄ prefix  ? keys ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄   the usage panel; the key table's
 //!   S ━━━━━━━━┃━━━━━━━━━━   21%   −4%    mark a chip on its top cap; one
 //!   W ━━━━━━━━━━━━━┃━━━━━   60%  +17%    meter per window, in its pace's
 //!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   colour (┃ = where the pace is)
@@ -67,8 +67,10 @@
 //!  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄   the dock: every space a row (⌘N
 //!  ▌ 1  main               ◐2 ○3         order; the client's on its band),
 //!    2  cs35l                 ○1         or chips; PARKED one line, its
-//!   PARKED  4                            count, a message or the watcher
-//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   on the right; never its tabs
+//!   PARKED  4              ⌃S ? keys    count; on the right the keybind
+//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   help's hint (a click opens it), a
+//!                                         message or the watcher in its
+//!                                         place; never the parked tabs
 //! ```
 //!
 //! ## Spaces, homes and shells
@@ -122,6 +124,17 @@
 //! always ONE line, its label and count (`none` dim with nothing parked),
 //! at every height: the parked tabs themselves are never listed (prefix
 //! h's picker, or the menu's Parked tab, shows them).
+//!
+//! The keybind help's hint rides on PARKED's right ([`keys_hint`]): `⌃S ?`
+//! bold blue, ` keys` dim, as AGENTS' `⌥V all spaces`; a click opens the
+//! help popup on this client ([`Target::Keys`], prefix ?'s `agent-ui
+//! keys`). It lives there, not on the `▀` cap under it, because PARKED is
+//! the one dock row drawn at every height (the caps go when rows run
+//! short), so the hint is always on screen and never costs a row. It
+//! narrows to `? keys`, then `?`, and goes before PARKED's count would be
+//! clipped; a message or the watcher's warning takes the corner while it
+//! shows. While the prefix is armed the top cap's red ` prefix ` chip says
+//! ` ? keys ` beside it too ([`marks`]).
 //!
 //! ## Toasts: OpenCode's cards over the top, so nothing moves
 //!
@@ -569,6 +582,10 @@ pub enum Target {
     /// PARKED (its one line): the stash picker, exactly prefix h's
     /// `stash.sh unstash '' <client>`.
     Stash,
+    /// The `⌃S ? keys` hint on PARKED's right ([`keys_hint`]): the keybind
+    /// help popup on this sidebar's client, exactly prefix ?'s
+    /// (`agent-ui keys --client <client>`, [`crate::keys::popup_command`]).
+    Keys,
     /// The red watcher warning: restart it (the strip's ⟳, Strip.click "restart").
     Restart,
     /// The scope word (or the classic title): flip the scope (space / all) and
@@ -959,14 +976,22 @@ fn pack(fixed: &[Item], items: &[Item], rank: &[usize], w: usize, lines: usize, 
 }
 
 /// The key-table marks, solid chips: a red ` prefix ` while the client's key
-/// table is `prefix`; a peach ` ⌥W jump ` and `type a letter` while it is
+/// table is `prefix` (and, dim on `surface1`, ` ? keys `: the next key that
+/// lists every other, [`KEYS_HINTS`]); a peach ` ⌥W jump ` and `type a letter` while it is
 /// `jump`. They sit as a tab on the usage panel's top pad, so arming a
 /// table never changes the panel's height; a frame too short for the panel
 /// gives them a row of their own. No space chip: the dock at the bottom
 /// already marks the client's space.
-fn marks(bar: &Bar) -> Vec<Seg> {
+/// `room`: the cells the marks may take (` ? keys ` only whole, never
+/// clipped).
+fn marks(bar: &Bar, room: usize) -> Vec<Seg> {
     if bar.prefix {
-        vec![block(" prefix ", "crust", "red")]
+        let mut v = vec![block(" prefix ", "crust", "red")];
+        let keys = on(" ? keys ", "sub", "surface1");
+        if width(&v) + dwidth(&keys.text) <= room {
+            v.push(keys);
+        }
+        v
     } else if bar.jump {
         vec![block(" ⌥W jump ", "crust", "peach"), on(" type a letter ", "peach", "surface1")]
     } else {
@@ -1324,7 +1349,9 @@ fn top_rows(view: &ViewModel, bar: &Bar, w: usize, h: usize, now: f64) -> Top {
     let paneled = w >= 20 && h >= 16;
     let iw = if paneled { inner(w) } else { w };
     let mut content = Vec::new();
-    let marks = marks(bar);
+    // (On the panel's top pad from its third cell, else a row from the
+    // second: [`pad_with`].)
+    let marks = marks(bar, if paneled { iw.saturating_sub(2) } else { w.saturating_sub(1) });
     let hint = bar.selecting.filter(|_| h >= 6);
     if let Some(n) = hint {
         content.extend(hint_rows(n, iw));
@@ -3780,10 +3807,40 @@ enum SpacesForm {
     Chips(usize),
 }
 
+/// The keybind help's key hint ([`keys_hint`]), richest first: the whole
+/// chord and the word, then the second key and the word, then the key
+/// alone. (⌃S is the prefix: tmux.conf.tmpl's `prefix C-s`.)
+pub const KEYS_HINTS: [(&str, &str); 3] = [("⌃S ?", " keys"), ("?", " keys"), ("?", "")];
+
+/// The cells kept between PARKED's count and the keys hint.
+const KEYS_GAP: usize = 2;
+
+/// The keybind help's hint on the PARKED line's right, herdr-style like
+/// AGENTS' `⌥V all spaces` (the key bold blue, the word dim): the richest
+/// of [`KEYS_HINTS`] that fits in `room` cells with [`KEYS_GAP`] before it
+/// and a cell after it; None when not even `?` does.
+fn keys_hint(room: usize) -> Option<Vec<Seg>> {
+    // (The gap, the hint, then a cell before the margin.)
+    KEYS_HINTS.iter().find(|(k, l)| KEYS_GAP + dwidth(k) + dwidth(l) < room).map(|&(k, l)| {
+        let mut v = vec![bold(k, "blue")];
+        if !l.is_empty() {
+            v.push(seg(l, LABEL));
+        }
+        v
+    })
+}
+
 /// The dock's PARKED line: ` PARKED` and its count as a square mauve chip
 /// (the stash's colour; `none` dim with nothing parked): a click opens the
 /// same popup as prefix h ([`Target::Stash`]). On the right a message
-/// (Roster.say) or the watcher's problem in red (click: restart).
+/// (Roster.say) or the watcher's problem in red (click: restart); else the
+/// keybind help's hint ([`keys_hint`], `⌃S ? keys`: a click opens it,
+/// [`Target::Keys`]), shortened as the line narrows, gone before the count
+/// is ever clipped. The line is drawn at every height (it is the last row
+/// but for the dock's bottom cap, which short frames drop), so the hint
+/// costs no row of its own; a message or the watcher's warning takes the
+/// corner from it while it shows (both say something now; the hint is
+/// always there).
 fn parked_header(view: &ViewModel, w: usize, msg: Option<&str>) -> Row {
     let n = view.parked.len();
     let mut left = vec![bold(" PARKED", LABEL), seg(" ", "text")];
@@ -3792,17 +3849,30 @@ fn parked_header(view: &ViewModel, w: usize, msg: Option<&str>) -> Row {
     } else {
         left.push(seg("none", dim(true)));
     }
-    let (right, restart) = match (msg, watcher_problem(view.watcher_age)) {
-        (Some(m), _) => (vec![seg(format!("{} ", sanitize(m)), "sub")], false),
-        (None, Some(p)) => (vec![seg(format!("watcher {p} "), "red")], true),
-        (None, None) => (vec![], false),
+    let lw = width(&left);
+    let (right, restart, keys) = match (msg, watcher_problem(view.watcher_age)) {
+        (Some(m), _) => (vec![seg(format!("{} ", sanitize(m)), "sub")], false, false),
+        (None, Some(p)) => (vec![seg(format!("watcher {p} "), "red")], true, false),
+        (None, None) => match keys_hint(inner(w).saturating_sub(lw)) {
+            Some(mut hint) => {
+                hint.push(seg(" ", "text"));
+                (hint, false, true)
+            }
+            None => (vec![], false, false),
+        },
     };
     let rw = width(&clip_segs(right.clone(), inner(w)));
     let mut row = tile_row(w, Ink::Pal(PANEL), left, right);
     // The corner (and the margin beside it) is the message's or the
-    // watcher's; the rest of the line is the stash's.
-    let edge = if rw > 0 { (w - margin(w) - rw) as u16 } else { w as u16 };
+    // watcher's; the rest of the line is the stash's. The keys hint is its
+    // own cells only (not the cell after it, not the margin): the line's
+    // ends stay the stash's.
+    let edge = if rw > 0 && !keys { (w - margin(w) - rw) as u16 } else { w as u16 };
     let w16 = w as u16;
+    if keys {
+        let x1 = w - margin(w) - 1;
+        row.targets.push(((x1 + 1 - rw) as u16, x1 as u16, Target::Keys));
+    }
     if edge > 0 {
         row.targets.push((0, edge, Target::Stash));
     }

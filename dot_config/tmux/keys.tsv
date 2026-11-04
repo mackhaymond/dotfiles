@@ -1,0 +1,109 @@
+# keys.tsv: every key of Mack's tmux + WezTerm setup, the ONE list the key
+# help (prefix ?, `agent-ui keys`) draws. Add a row here whenever you add a
+# key. tests/test_keys_catalog.py checks every row that names a tmux table
+# against a private server that loaded the real config (@spaces on).
+#
+# TAB-separated, one key per row, sections in display order (first row of a
+# section places it). Lines starting with # and blank lines are skipped.
+#   1 section      the group it is listed under
+#   2 key          as Mack reads it: ⌘ ⌥ ⌃ ⇧ glyphs, the prefix written ⌃S;
+#                  space-separated parts are drawn as separate key caps
+#                  (a bare "/" or "then" between them stays plain text)
+#   3 description  what it does, short (about 40 cells, at most 50)
+#   4 table        the tmux key table that binds it (root, prefix, jump,
+#                  stash), or empty: WezTerm, Karabiner, a plugin, a popup's
+#                  own keys, the mouse
+#   5 tmux keys    the tmux key names in that table, space-separated;
+#                  `a..z` / `1..9` / `User18..User26` are ranges. A key
+#                  must be bound by OUR config: the test fails a key whose
+#                  binding is still tmux's stock one, unless it is written
+#                  `=key` (a stock binding we list on purpose: `=z`)
+#   6 note        a dim detail after the description (optional)
+#
+# Keys only the classic (spaces off) layout binds are not listed.
+
+Spaces	⌘1-9	Go to space N (lands on its home)	root	User18..User26	⌃S 1-9 too
+Spaces	⌃S 1-9	Go to space N (any terminal)	prefix	1..9
+Spaces	⌥N	New space: folder picker	root	M-n	^N creates
+Spaces	⌥M	Move this tab to another space	root	M-m
+Spaces	⌃S Q	Close this space (y/n; never main)	prefix	Q	⌘Z reopens tabs
+
+Jump	⌥W a-z	Jump to that agent or shell, any space	jump	a..z	the sidebar's letters
+Jump	⌥W 1-9	Jump to pinned agent N	jump	1..9
+Jump	⌥W ⇧A-Z	That agent's uncommitted diff (popup)	jump	A..Z	Esc / q close it
+Jump	⌥W Esc	Cancel the jump	jump	Escape Enter Space C-c
+
+Move around	⌥L	Next of this kind (agent or shell)	root	M-l
+Move around	⌥H	Previous of this kind	root	M-h
+Move around	⌥`	Agent ↔ last shell of this space	root	M-`
+Move around	⌥S	Next tab that needs you	root	M-s	CuaNotch may own it
+Move around	⌥X	Back through visited tabs	root	M-x
+Move around	⌥C	Forward through visited tabs	root	M-c
+Move around	⌃S d	Next tab that needs you	prefix	d C-d
+Move around	⌃S D	Back to where the ⌥S run began	prefix	D
+Move around	hyper ×2	Flip to the previous tab, any space			or right ⇧ ×2 (Karabiner)
+
+Tabs	⌘T	New shell tab, this folder	prefix	c	⌃S c
+Tabs	⌘R	New claude tab, this folder	prefix	k	⌃S k
+Tabs	⌘⇧T	New shell tab in a space… (picker)	prefix	C-t	⌃S ⌃T
+Tabs	⌘⇧R	New claude tab in a space… (picker)	prefix	K	⌃S K
+Tabs	⌘⌥T	Replace this tab with a fresh shell	prefix	R	⌃S R
+Tabs	⌘⌥R	Replace this tab with claude	prefix	C-k	⌃S ⌃K
+Tabs	⌃⌘T	New nushell tab	prefix	N	⌃S N
+Tabs	⌘W	Close tab (y/n; refused on home)	prefix	x	⌃S x
+Tabs	⌘⇧W	Close tab, no y/n	prefix	C-l	⌃S ⌃L
+Tabs	⌘Z	Reopen a closed tab (agent resumed)	prefix	X	⌃S X
+Tabs	click tab	Status line: go to that tab or space	root	MouseDown1Status	[+] opens a shell
+
+Agents	⌃S q	Agent menu	prefix	q C-q
+Agents	⌃S t	Pin / unpin this agent	prefix	t	⌥W 1-9 reach pins
+Agents	⌃S P	Pause working agents; again resumes	prefix	P	before closing the lid
+
+Park	⌃S H	Park this tab	prefix	H
+Park	⌃S h	Unpark (picker)	prefix	h
+Park	⌃S v	Select a range of tabs (again cancels)	prefix	v
+Park	h / l	Range: move its far end left / right	stash	h l j k	k / j too
+Park	H / ⏎	Range: park the selection	stash	H Enter
+Park	m	Range: move it to another space	stash	m a
+Park	x then ⇧Y	Range: close the selection	stash	x	any other key keeps it
+Park	Esc	Range: cancel	stash	Escape q Space C-c
+
+Sidebar	⌘B	Sidebar on / off			WezTerm
+Sidebar	⌥V	Sidebar scope: this space ↔ all	root	M-v
+Sidebar	click	Go to that agent, shell or space
+Sidebar	right-click	Park that agent
+Sidebar	middle-click	Pin / unpin that agent
+Sidebar	click PARKED	Unpark picker
+
+Agent menu	a-z	Go to the agent on that letter
+Agent menu	↑ / ↓	Move			⌃P / ⌃N, PgUp / PgDn
+Agent menu	⏎	Go to the selected row
+Agent menu	⇥ / ⇧⇥	Next / previous filter
+Agent menu	/	Search
+Agent menu	␣	Actions for the row
+Agent menu	␣ y	Allow its permission prompt
+Agent menu	␣ n	Deny its permission prompt
+Agent menu	␣ s	Park it
+Agent menu	␣ x	Close it
+Agent menu	␣ p	Pin / unpin it
+Agent menu	␣ d	Its uncommitted diff
+Agent menu	␣ v	Preview its pane
+Agent menu	⌥S / ⌥X	Next that needs you / back
+Agent menu	Esc	Close the menu
+
+Panes & more	⌃S "	Split down	prefix	"
+Panes & more	⌃S %	Split right	prefix	%
+Panes & more	⌃H/J/K/L	Move between panes (and vim splits)			vim-tmux-navigator
+Panes & more	⌃S z	Zoom this pane	prefix	=z	stock tmux
+Panes & more	⌃S [	Copy mode (scroll back)	prefix	=[	stock tmux
+Panes & more	⌃S ␣	Hints: copy a URL or path			⇧hint opens it (tmux-thumbs)
+Panes & more	⌃S ⌃␣	Hints: open it	prefix	C-Space
+Panes & more	⌥Q	Floating pane			tmux-floax
+Panes & more	⌥A	btop popup	root	M-a
+Panes & more	⌃S u	Usage bar: show reset times			codexbar
+Panes & more	⌃S ⌃S	Save the layout now	prefix	C-s	resurrect
+Panes & more	⌃S r	Reload the tmux config	prefix	r
+Panes & more	⌃S ?	This key help	prefix	?	type to filter
+Panes & more	⌃S T	Session wizard			tmux-session-wizard
+Panes & more	⌃S ⏎	tmux-fzf: commands, windows, panes…			tmux-fzf (⌃S ⌃M)
+Panes & more	⌘Q	Quit WezTerm: press it 5× quickly			WezTerm

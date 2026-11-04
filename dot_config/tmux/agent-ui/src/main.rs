@@ -12,6 +12,7 @@
 //! agent-ui [--socket <name|path>] insight [<@id>] [--json]   (insight.rs: diff, doing, context per agent)
 //! agent-ui [--socket <name|path>] insight-files <@id>        (its dirty files: a repo root, then "\t<file>" lines)
 //! agent-ui [--socket <name|path>] diff <@id> --client <tty>   (diff.rs: those files' diff in a popup; ⌥W ⇧letter)
+//! agent-ui keys [--client <tty>]                              (keys.rs: the key help, prefix ?)
 //! ```
 //!
 //! `needs` prints exactly what `agent-jump.sh list` prints, from the same
@@ -30,7 +31,8 @@ const USAGE: &str = "usage: agent-ui [--socket <name|path>] dump [--client <tty>
        agent-ui answer <@id> allow|deny [--client <tty>] [--since <raw @agent_since>] [--detail <raw @agent_detail>]
        agent-ui insight [<@id>] [--json]
        agent-ui insight-files <@id>
-       agent-ui diff <@id> --client <tty> [--after <pid>] [--print]";
+       agent-ui diff <@id> --client <tty> [--after <pid>] [--print]
+       agent-ui keys [--client <tty>] | --once <W>x<H> [--query <q>] [--ansi]";
 
 fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let i = args.iter().position(|a| a == flag)?;
@@ -66,6 +68,7 @@ fn main() -> ExitCode {
         "insight" => agent_ui::insight::run(tmux, rest),
         "insight-files" => agent_ui::insight::run_files(tmux, rest),
         "diff" => agent_ui::diff::run(tmux, rest),
+        "keys" => agent_ui::keys::run(tmux, rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             ExitCode::SUCCESS

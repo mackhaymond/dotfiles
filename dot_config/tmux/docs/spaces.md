@@ -471,6 +471,35 @@ first; M-f is unbound again, so zsh's `forward-word` and Claude Code's meta+f
 work in the pane. With spaces off tmux.conf's ⌥W menu binding stands and
 there is no `jump` table.
 
+## Key help: prefix ?
+
+`prefix ?` opens a popup with every key of the setup: the WezTerm ⌘ chords,
+the root ⌥ keys, the ⌥W jump table, the prefix keys, the range-select keys,
+the sidebar's clicks and the agent menu's own keys. Two columns when the
+popup is wide enough (one when narrow), sections never split. Typing
+filters: a key, spelled out or not (`opt w`, `cmd t`, `⌥W`), or words of the
+description; Backspace edits; ↑/↓, ⌃P/⌃N, PgUp/PgDn and the wheel scroll;
+Esc clears the filter, then closes; `?` or `q` close while the filter is
+empty. The sidebar opens the same popup (`agent_ui::keys::popup_command`).
+
+- **The catalog is `keys.tsv`** (`~/.config/tmux/keys.tsv`), the ONE list:
+  section, the key as you read it (prefix written `⌃S`), a short
+  description, and, for a key tmux binds, its key table and tmux key names
+  (ranges like `a..z`). Its header documents the columns. `agent-ui keys`
+  reads it at every open (no rebuild needed); a binary with no readable file
+  falls back to the copy built into it.
+- **Add a row to keys.tsv whenever you add or move a key.**
+  `tests/test_keys_catalog.py` loads the real tmux.conf (with spaces on) on
+  a private server and fails for any row whose table and keys are not bound
+  there BY THE CONFIG: a binding still identical to a bare server's (tmux's
+  defaults) fails too, so a key renamed or dropped in the config but not in
+  the catalog is caught. A stock binding listed on purpose is written
+  `=key` (prefix `=z`, `=[`). WezTerm-only, Karabiner, plugin and sidebar
+  rows leave those columns empty.
+- Binding: tmux.conf.tmpl's agent-ui block (`display-popup -B … agent-ui
+  keys --client <tty>`, at most 124 columns, 85% high, `@popup_x`); without
+  the binary, `prefix ?` is tmux's own `list-keys -N`.
+
 ## For the Rust sidebar (agent-ui)
 
 Home windows have no `@agent_state`, so with spaces on they are never agent

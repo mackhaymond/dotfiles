@@ -15,7 +15,8 @@
 # By hand (same thing, ignores the hash):
 #   chezmoi execute-template < ~/.local/share/chezmoi/.chezmoiscripts/run_onchange_after_zz-build-agent-ui.sh.tmpl | bash
 {{- $crate := joinPath .chezmoi.sourceDir "dot_config/tmux/agent-ui" }}
-{{- $files := list (joinPath $crate "Cargo.toml") (joinPath $crate "Cargo.lock") }}
+{{- /* keys.tsv: `agent-ui keys` embeds it (include_str!) as its fallback catalog */ -}}
+{{- $files := list (joinPath $crate "Cargo.toml") (joinPath $crate "Cargo.lock") (joinPath .chezmoi.sourceDir "dot_config/tmux/keys.tsv") }}
 {{- range (glob (joinPath $crate "src/**")) }}
 {{-   if not (stat .).isDir }}{{ $files = append $files . }}{{ end }}
 {{- end }}

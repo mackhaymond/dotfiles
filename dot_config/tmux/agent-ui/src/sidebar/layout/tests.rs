@@ -1583,7 +1583,7 @@ fn the_panel_replaces_the_status_line() {
         (canvas, palette::color(PANEL), palette::color(PANEL), canvas));
     // The red prefix mark, keyed on the client's key table: a tab on the top pad.
     let p = layout(&v, 34, 40, &with_bar(Bar { prefix: true, ..demo_bar() }));
-    assert_eq!(texts(&p)[0], format!(" ▄ prefix {} ", "▄".repeat(23)));
+    assert_eq!(texts(&p)[0], format!(" ▄ prefix  ? keys {} ", "▄".repeat(15)));
     assert!(p.rows[0].segs.contains(&block(" prefix ", "crust", "red")));
     assert_eq!((p.card.clone(), texts(&p)[1..].to_vec()), (f.card.clone(), t[1..].to_vec()), "the panel keeps its rows");
     // 34x20: still a panel, usage in one line.
@@ -3301,6 +3301,7 @@ fn held_rows_are_capped() {
 mod answer;
 mod bare;
 mod insight;
+mod keys;
 mod pending;
 mod pinned;
 mod limit;

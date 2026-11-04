@@ -88,6 +88,7 @@ pub mod git;
 pub mod hotkeys;
 pub mod insight;
 pub mod json;
+pub mod keys;
 pub mod menu;
 pub mod model;
 pub mod palette;
