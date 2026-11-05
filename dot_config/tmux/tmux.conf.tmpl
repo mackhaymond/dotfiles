@@ -7,6 +7,13 @@ set-environment -g PATH "$HOME/.local/share/bob/nvim-bin:$HOME/.pyenv/shims:$HOM
 
 setw -g mode-keys vi
 
+# KEY HELP: every key Mack presses is listed in keys.tsv, which prefix ? shows
+# (`agent-ui keys`, docs/spaces.md "Key help"). Adding, moving, re-purposing or
+# removing a binding here, in spaces.conf, agent-pause.conf,
+# scripts/stash-root-keys.conf, wezterm.lua.tmpl, Karabiner or the agent-ui menu
+# means editing its keys.tsv row in the same change.
+# tests/test_keys_catalog.py fails when the catalog and the config disagree.
+
 unbind r
 bind r source-file ~/.config/tmux/tmux.conf
 

@@ -294,6 +294,17 @@ Hidden-ness of a session: `tmux display -p -t '=stash' '#{@space_hidden}'`
 
 Prefix is **⌃S**. ⌘ chords come from WezTerm.
 
+**The full, authoritative list is `~/.config/tmux/keys.tsv`**, the catalog
+behind Mack's key help (**prefix ?**, `agent-ui keys`; the sidebar's PARKED
+line shows `⌃S ? keys`). This table is a summary. When you are unsure of a
+key, grep keys.tsv: `agent-ui keys --once 100x40 --query '<words>'` renders
+what Mack would see. **If you add, move, re-purpose or remove any key** (a
+tmux binding, a WezTerm chord, a Karabiner rule, an agent-ui menu key),
+edit its keys.tsv row (chezmoi source `dot_config/tmux/keys.tsv`) in the
+same change, and this table too if the key appears here. Then run
+`python -m pytest tests/test_keys_catalog.py` in `dot_config/tmux`. It
+catches tmux drift; WezTerm, Karabiner and menu keys have no check.
+
 | Key | Does |
 |---|---|
 | ⌘1-9 | space N's home (by `@space_index`); in the space you're in, back home. Agents and shells have no number key: ⌥W + letter |
@@ -322,6 +333,7 @@ Prefix is **⌃S**. ⌘ chords come from WezTerm.
 | ⌘W / ⌘Z | close tab (refused on home) / reopen the last closed tab, agent resumed |
 | prefix P | pause every working agent before closing the laptop; again to resume that set |
 | prefix C-s | save the layout now (resurrect) |
+| prefix ? | key help: every key, type to filter (a click on the sidebar's `⌃S ? keys` does the same) |
 
 ## Do not
 

@@ -179,6 +179,11 @@ they name a space, shell, agent, letter, parked tab or NEEDS YOU.
   User-facing messages go through `~/.config/tmux/scripts/notify.sh`, never
   `tmux display-message`. Test tmux only on a private `-L` server
   (`unset TMUX`, `-f /dev/null`).
+- **Keys have one catalog.** `~/.config/tmux/keys.tsv` (chezmoi source
+  `dot_config/tmux/keys.tsv`) is the key help Mack opens with prefix ?.
+  Whenever you add, move, re-purpose or remove a key (tmux, WezTerm,
+  Karabiner, the agent-ui menu), update its row in the same change.
+  `tests/test_keys_catalog.py` catches tmux drift.
 - **NEEDS YOU while still working.** A turn that ends while your
   subagents, workflows or background tasks are still out keeps your tab
   "working", so a question in it is invisible. If you truly need Mack (a

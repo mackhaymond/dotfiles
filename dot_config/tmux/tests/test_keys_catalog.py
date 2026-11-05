@@ -18,6 +18,10 @@ every catalog row that names a table and keys must find each key bound in that
 table BY THE CONFIG: a binding identical to a bare server's (tmux's defaults,
 which `-f /dev/null` keeps) fails, unless the row writes the key `=key` (a
 stock binding listed on purpose), which must then still be the stock one.
+And the other way round: every binding the config makes, in ANY key table
+(one that differs from the bare server's), must be a catalog row's key or in
+NOT_IN_HELP below, so a key added or moved in the config without a keys.tsv
+row fails instead of silently missing from the help.
 Teardown kill-servers exactly that socket (and the server's pid, should
 kill-guard's alias be in the way) and removes the temp dir.
 Run with unittest or pytest.
@@ -39,6 +43,19 @@ CONF = HERE / "tmux.conf.tmpl"
 SOURCED = ("spaces.conf", "agent-birth.conf", "agent-pause.conf")
 TMUX = shutil.which("tmux")
 TABLES = {"root", "prefix", "jump", "stash"}
+
+# Bindings the config makes that the key help deliberately does NOT list, as
+# (table, tmux keys, reason); keys take the catalog's ranges. Keep it small:
+# a key Mack presses gets a keys.tsv row, not an entry here.
+NOT_IN_HELP = (
+    # The leaders themselves: every ⌃S row and every ⌥W row starts with them.
+    ("root", "C-s", "the prefix leader (prefix is None): the ⌃S of every ⌃S row"),
+    ("root", "M-w", "the jump leader: the ⌥W of every ⌥W row"),
+    # spaces.conf: WezTerm sends each digit chord as one User key; these two
+    # rows only hand the pane the key itself, as if tmux were not there.
+    ("root", "User0..User8", "WezTerm ⌃1-9, passed on to the pane as C-1..C-9"),
+    ("root", "User9..User17", "WezTerm ⌥1-9, passed on to the pane as M-1..M-9"),
+)
 
 
 def cells(s):
@@ -75,6 +92,16 @@ def targets(tokens):
         stock = tok.startswith("=") and len(tok) > 1
         out += [(k, stock) for k in expand(tok[1:] if stock else tok)]
     return out
+
+
+def catalogued():
+    """Every (table, tmux key) some catalog row names, `=key`s included."""
+    return {(table, k) for _, _, _, _, table, keys, _ in rows() for k, _ in targets(keys)}
+
+
+def not_in_help():
+    """NOT_IN_HELP expanded → {(table, tmux key)}."""
+    return {(table, k) for table, tok, _ in NOT_IN_HELP for k in expand(tok)}
 
 
 class CatalogShape(unittest.TestCase):
@@ -114,6 +141,12 @@ class CatalogShape(unittest.TestCase):
             if not order or order[-1] != section:
                 self.assertNotIn(section, order, f"{section} appears twice")
                 order.append(section)
+
+    def test_allowlist_has_reasons_and_no_catalog_keys(self):
+        for table, tok, reason in NOT_IN_HELP:
+            self.assertTrue(table and tok and reason.strip(), (table, tok))
+        # A key is either in the help or allowlisted out of it, never both.
+        self.assertEqual(not_in_help() & catalogued(), set())
 
     def test_the_help_lists_itself(self):
         self.assertTrue(any(t == "prefix" and k == ["?"] for _, _, _, _, t, k, _ in rows()))
@@ -261,6 +294,36 @@ class Live(unittest.TestCase):
                     problems.append(f"{where}: only tmux's stock binding ({line})")
         self.assertGreater(checked, 100)
         self.assertEqual(problems, [], "\n".join(problems))
+
+    def config_bindings(self):
+        """{(table, key): line} for every binding the config made, in every
+        key table on the server (custom ones like jump and stash, copy-mode
+        too): those that differ from a bare server's."""
+        stock = self.stock()
+        everything = self.parse_keys(self.t("list-keys"))
+        # The custom tables are in the full listing (sanity: not a parse miss).
+        self.assertIn(("jump", "a"), everything)
+        self.assertIn(("stash", "H"), everything)
+        return {k: line for k, line in everything.items() if line != stock.get(k)}
+
+    def test_every_config_binding_is_in_the_catalog(self):
+        # The reverse direction: a key added or moved in the config without
+        # a keys.tsv row would otherwise pass silently and the help drift.
+        covered = catalogued() | not_in_help()
+        problems = [
+            f"{table} {key} is bound by the config but not in keys.tsv: add a row "
+            f"(or allowlist it in test_keys_catalog.py with a reason)"
+            for (table, key) in sorted(self.config_bindings())
+            if (table, key) not in covered
+        ]
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_allowlisted_keys_are_still_bound_by_the_config(self):
+        # An entry whose binding is gone (or back to stock) is dead weight:
+        # drop it from NOT_IN_HELP so the list stays honest.
+        ours = self.config_bindings()
+        stale = sorted(k for k in not_in_help() if k not in ours)
+        self.assertEqual(stale, [], f"NOT_IN_HELP entries the config no longer binds: {stale}")
 
     def test_prefix_question_mark_opens_agent_ui_keys(self):
         b = self.bound("prefix", "?")

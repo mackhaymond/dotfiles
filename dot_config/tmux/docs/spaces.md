@@ -496,6 +496,14 @@ empty. The sidebar opens the same popup (`agent_ui::keys::popup_command`).
   the catalog is caught. A stock binding listed on purpose is written
   `=key` (prefix `=z`, `=[`). WezTerm-only, Karabiner, plugin and sidebar
   rows leave those columns empty.
+- **The test also checks the other direction.** Every binding the config makes
+  (in the prefix, root, jump, stash and copy-mode tables, compared with a bare
+  server) must be a keys.tsv row or appear in the test's `NOT_IN_HELP`
+  allowlist with a reason. The allowlist holds the ⌃S and ⌥W leader keys and
+  the ⌃1-9 / ⌥1-9 chords (User0..17), which WezTerm sends and tmux passes
+  straight to the pane. So a new tmux key without a row fails the test. Keys
+  in WezTerm, Karabiner and the agent-ui menu have no check: update their rows
+  by hand. Reminders sit in the comments where those keys are defined.
 - Binding: tmux.conf.tmpl's agent-ui block (`display-popup -B … agent-ui
   keys --client <tty>`, at most 124 columns, 85% high, `@popup_x`); without
   the binary, `prefix ?` is tmux's own `list-keys -N`.

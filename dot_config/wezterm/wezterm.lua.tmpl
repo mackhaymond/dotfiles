@@ -270,6 +270,10 @@ local toggle_strip = wezterm.action_callback(function(window, pane)
     pane:activate()
 end)
 
+-- KEY HELP: every chord here that Mack presses has a row in
+-- ~/.config/tmux/keys.tsv (tmux's prefix ? popup). Adding, moving or dropping
+-- a chord means editing that row too. No test covers WezTerm's chords, so
+-- nothing will remind you.
 config.keys = {
     { key = "q", mods = "CMD", action = quit_guard },
     { key = "b", mods = "CMD", action = toggle_strip },

@@ -1,7 +1,8 @@
 # keys.tsv: every key of Mack's tmux + WezTerm setup, the ONE list the key
 # help (prefix ?, `agent-ui keys`) draws. Add a row here whenever you add a
 # key. tests/test_keys_catalog.py checks every row that names a tmux table
-# against a private server that loaded the real config (@spaces on).
+# against a private server that loaded the real config (@spaces on), and
+# every key that config binds against these rows (or its NOT_IN_HELP list).
 #
 # TAB-separated, one key per row, sections in display order (first row of a
 # section places it). Lines starting with # and blank lines are skipped.

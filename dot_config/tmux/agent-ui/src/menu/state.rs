@@ -629,6 +629,11 @@ impl Menu {
         }
     }
 
+    // KEY HELP: the menu's keys (here and in the key handlers below) are
+    // listed in keys.tsv's "Agent menu" section, which the prefix ? popup
+    // shows. Change a key here and you change its row there too; no test
+    // checks this section.
+
     /// Keys while the search has them.
     fn search_key(&mut self, key: Key, fx: &mut dyn Effects) -> bool {
         match key {
