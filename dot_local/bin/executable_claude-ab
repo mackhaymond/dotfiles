@@ -1,37 +1,171 @@
-#!/bin/sh
-# claude-ab: Claude Code running on abliteration.ai instead of Anthropic.
-#
-# Main model: abliterated-model-large-v2 (GLM-5.3, 1M ctx, text-only, the top tier).
-# Background/haiku tasks: abliterated-model-large-flash (cheaper, takes images).
-# Override per run: CLAUDE_AB_MODEL=abliterated-model claude-ab ...
-#
-# Key lookup: $ABLITERATION_API_KEY, else the login keychain item
-# "abliteration-api-key". Store it once with:
-#   security add-generic-password -U -a "$USER" -s abliteration-api-key -w
-# (no value after -w, so it prompts instead of landing in shell history)
-set -eu
+#!/usr/bin/env python3
+"""claude-ab: Claude Code on abliteration.ai models, with your normal setup.
 
-key="${ABLITERATION_API_KEY:-}"
-if [ -z "$key" ]; then
-  key="$(security find-generic-password -a "$USER" -s abliteration-api-key -w 2>/dev/null || true)"
-fi
-if [ -z "$key" ]; then
-  echo "claude-ab: no abliteration.ai key. Add it with:" >&2
-  echo "  security add-generic-password -U -a \"\$USER\" -s abliteration-api-key -w" >&2
-  exit 1
-fi
+Runs `claude` with CLAUDE_CONFIG_DIR=~/.claude-ab. That dir symlinks every
+entry of ~/.claude (CLAUDE.md, hooks, plugins, skills, projects/memory,
+history...) EXCEPT settings.json and .claude.json, which are private copies
+rebuilt from the live ones on each launch. So /model "set as default",
+/autocompact and effort picks stick for claude-ab without ever writing an
+abliteration model into the settings plain `claude` reads.
 
-main="${CLAUDE_AB_MODEL:-abliterated-model-large-v2}"
-fast="${CLAUDE_AB_FAST_MODEL:-abliterated-model-large-flash}"
+Models (from GET /v1/models, 2026-11-09):
+  abliterated-model-large-v2     1M ctx, text only,   $3/$5 per Mtok  (default)
+  abliterated-model-large-flash  1M ctx, text+image,  $1/$2           (haiku/background slot)
+  abliterated-model-large        1M ctx, text only,   $3/$5
+  abliterated-model              256K ctx, text+image, $1/$3
+The 1M ones carry Claude Code's "[1m]" suffix (stripped before sending) so
+it sizes their window right; CLAUDE_CODE_MAX_CONTEXT_TOKENS covers the 256K
+one. Auto-compact defaults to 400K (see AUTO_COMPACT_WINDOW).
 
-# An Anthropic key in the env would win over the bearer token; drop it.
-unset ANTHROPIC_API_KEY
-export ANTHROPIC_BASE_URL="https://api.abliteration.ai"
-export ANTHROPIC_AUTH_TOKEN="$key"
-export ANTHROPIC_MODEL="$main"
-export ANTHROPIC_DEFAULT_OPUS_MODEL="$main"
-export ANTHROPIC_DEFAULT_SONNET_MODEL="$main"
-export ANTHROPIC_DEFAULT_HAIKU_MODEL="$fast"
-export CLAUDE_CODE_SUBAGENT_MODEL="$main"
+Key: $ABLITERATION_API_KEY, else keychain item "abliteration-api-key":
+  security add-generic-password -U -a "$USER" -s abliteration-api-key -w
+One-off model: claude-ab --model abliterated-model  (or CLAUDE_AB_MODEL=...)
+"""
+import copy
+import json
+import os
+import subprocess
+import sys
+import tempfile
 
-exec claude "$@"
+HOME = os.path.expanduser("~")
+SRC = os.path.join(HOME, ".claude")
+DST = os.path.join(HOME, ".claude-ab")
+PRIVATE = {"settings.json"}  # not symlinked; generated below
+
+MAIN = "abliterated-model-large-v2[1m]"
+FAST = "abliterated-model-large-flash[1m]"
+BASE_WINDOW = "262144"  # abliterated-model (the only non-1M model)
+AUTO_COMPACT_WINDOW = 400_000  # 1M models: compact at ~400K, not ~1M
+MAX_OUTPUT = "64000"
+
+PICKER = {
+    "replaceBuiltInOptions": True,
+    "options": [
+        {"model": MAIN, "label": "Large v2",
+         "description": "GLM-5.3 · 1M ctx · text only · $3/$5 per Mtok · best for coding"},
+        {"model": FAST, "label": "Large Flash",
+         "description": "1M ctx · images · $1/$2 · fast and cheap"},
+        {"model": "abliterated-model-large[1m]", "label": "Large",
+         "description": "1M ctx · text only · $3/$5 · previous large"},
+        {"model": "abliterated-model", "label": "Base",
+         "description": "256K ctx · images · $1/$3"},
+    ],
+}
+
+
+def die(msg):
+    print(f"claude-ab: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def api_key():
+    key = os.environ.get("ABLITERATION_API_KEY", "").strip()
+    if key:
+        return key
+    r = subprocess.run(
+        ["security", "find-generic-password", "-a", os.environ.get("USER", ""),
+         "-s", "abliteration-api-key", "-w"],
+        capture_output=True, text=True)
+    key = r.stdout.strip()
+    if not key:
+        die("no abliteration.ai key. Add it with:\n"
+            '  security add-generic-password -U -a "$USER" -s abliteration-api-key -w')
+    return key
+
+
+def load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        print(f"claude-ab: ignoring unreadable {path}: {e}", file=sys.stderr)
+        return {}
+
+
+def write_atomic(path, data):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".claude-ab-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def is_ab(model):
+    return isinstance(model, str) and model.startswith("abliterated-model")
+
+
+def link_tree():
+    os.makedirs(DST, exist_ok=True)
+    for name in os.listdir(SRC):
+        if name in PRIVATE:
+            continue
+        dst = os.path.join(DST, name)
+        if os.path.lexists(dst):
+            continue  # existing link, or something claude-ab made itself
+        os.symlink(os.path.join(SRC, name), dst)
+
+
+def build_settings():
+    live = load(os.path.join(SRC, "settings.json"))
+    path = os.path.join(DST, "settings.json")
+    prev = load(path)
+    s = copy.deepcopy(live)
+
+    s["model"] = prev.get("model") if is_ab(prev.get("model")) else MAIN
+    s["modelPicker"] = PICKER
+    s["autoCompactWindow"] = AUTO_COMPACT_WINDOW
+    # Remote Control and model auto-switching assume a claude.ai account.
+    s["remoteControlAtStartup"] = False
+    s["switchModelsOnFlag"] = False
+    # Keep per-model picks (effort, /autocompact) made inside claude-ab.
+    ms = dict(live.get("modelSettings") or {})
+    ms.update({k: v for k, v in (prev.get("modelSettings") or {}).items() if is_ab(k)})
+    s["modelSettings"] = ms
+    if "effortLevel" in prev:
+        s["effortLevel"] = prev["effortLevel"]
+    write_atomic(path, s)
+
+
+def build_global_config():
+    # ~/.claude.json carries MCP servers, project trust, onboarding state.
+    # A fresh copy each launch; claude-ab's own writes stay in its copy.
+    cfg = load(os.path.join(HOME, ".claude.json"))
+    write_atomic(os.path.join(DST, ".claude.json"), cfg)
+
+
+def main():
+    if not os.path.isdir(SRC):
+        die(f"{SRC} not found")
+    key = api_key()
+    link_tree()
+    build_settings()
+    build_global_config()
+
+    env = os.environ
+    env.pop("ANTHROPIC_API_KEY", None)  # would win over the bearer token
+    env.pop("ANTHROPIC_MODEL", None)    # would pin the model past /model
+    env.update({
+        "CLAUDE_CONFIG_DIR": DST,
+        "ANTHROPIC_BASE_URL": "https://api.abliteration.ai",
+        "ANTHROPIC_AUTH_TOKEN": key,
+        # Aliases used by subagents ("opus"/"sonnet"/"haiku") and background work.
+        "ANTHROPIC_DEFAULT_FABLE_MODEL": MAIN,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": MAIN,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": MAIN,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": FAST,
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": BASE_WINDOW,
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS", MAX_OUTPUT),
+    })
+    args = sys.argv[1:]
+    one_off = env.pop("CLAUDE_AB_MODEL", "")
+    if one_off and "--model" not in args:
+        args = ["--model", one_off] + args
+    os.execvp("claude", ["claude"] + args)
+
+
+if __name__ == "__main__":
+    main()
