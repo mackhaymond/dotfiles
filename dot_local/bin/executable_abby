@@ -58,6 +58,10 @@ GATEWAY_ENV = {
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
 }
 
+FLAGS_FILE = os.path.join(DST, "abby.settings.json")  # passed via --settings
+OWN_DIRS = {"backups", "daemon"}  # abby keeps its own, never shares these
+SKIP_SUFFIXES = (".lock", ".tmp")  # transient; a link to one would dangle
+
 PICKER = {
     "replaceBuiltInOptions": True,
     "options": [
@@ -85,13 +89,17 @@ def check_key():
             '  security add-generic-password -U -a "$USER" -s abliteration-api-key -w')
 
 
-def load(path):
+def load(path, required=False):
     try:
         with open(path) as f:
             return json.load(f)
     except FileNotFoundError:
+        if required:
+            die(f"{path} not found")
         return {}
     except json.JSONDecodeError as e:
+        if required:  # running without its hooks would lose status/restore
+            die(f"can't parse {path} ({e}); try again in a moment")
         print(f"abby: ignoring unreadable {path}: {e}", file=sys.stderr)
         return {}
 
@@ -111,29 +119,53 @@ def is_ab(model):
 
 def link_tree():
     os.makedirs(DST, exist_ok=True)
+    for name in os.listdir(DST):  # drop dangling or no-longer-shared links
+        p = os.path.join(DST, name)
+        if os.path.islink(p) and (not os.path.exists(p) or name in OWN_DIRS
+                                  or name.endswith(SKIP_SUFFIXES)):
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
     for name in os.listdir(SRC):
-        if name in PRIVATE:
+        if name in PRIVATE or name in OWN_DIRS or name.endswith(SKIP_SUFFIXES):
             continue
         dst = os.path.join(DST, name)
         if os.path.lexists(dst):
             continue  # existing link, or something abby made itself
-        os.symlink(os.path.join(SRC, name), dst)
+        try:
+            os.symlink(os.path.join(SRC, name), dst)
+        except FileExistsError:
+            pass  # a second abby launching at the same moment won the race
+
+
+# The gateway overlay. It goes in BOTH the user settings and a --settings
+# file: --settings outranks project settings, and run from ~ the live
+# ~/.claude/settings.json loads as *project* settings, which would otherwise
+# override these (e.g. turn Remote Control back on). The user-settings copy
+# keeps a relaunch that lost the flag on abliteration. model and effort stay
+# out of it so /model and /effort picks can still stick.
+def overlay(live):
+    return {
+        "env": {**(live.get("env") or {}), **GATEWAY_ENV},
+        "apiKeyHelper": shlex.join(KEY_CMD),
+        "modelPicker": PICKER,
+        # Remote Control and model auto-switching assume a claude.ai account.
+        "remoteControlAtStartup": False,
+        "switchModelsOnFlag": False,
+    }
 
 
 def build_settings():
-    live = load(os.path.join(SRC, "settings.json"))
+    """Returns the saved model and effort to pass as flags (see overlay)."""
+    live = load(os.path.join(SRC, "settings.json"), required=True)
     path = os.path.join(DST, "settings.json")
     prev = load(path)
     s = copy.deepcopy(live)
-
-    s["env"] = {**(live.get("env") or {}), **GATEWAY_ENV}
-    s["apiKeyHelper"] = shlex.join(KEY_CMD)
+    ov = overlay(live)
+    s.update(ov)
     s["model"] = prev.get("model") if is_ab(prev.get("model")) else MAIN
-    s["modelPicker"] = PICKER
     s["autoCompactWindow"] = AUTO_COMPACT_WINDOW
-    # Remote Control and model auto-switching assume a claude.ai account.
-    s["remoteControlAtStartup"] = False
-    s["switchModelsOnFlag"] = False
     # Keep per-model picks (effort, /autocompact) made inside abby.
     ms = dict(live.get("modelSettings") or {})
     ms.update({k: v for k, v in (prev.get("modelSettings") or {}).items() if is_ab(k)})
@@ -141,6 +173,8 @@ def build_settings():
     if "effortLevel" in prev:
         s["effortLevel"] = prev["effortLevel"]
     write_atomic(path, s)
+    write_atomic(FLAGS_FILE, ov)
+    return s["model"], s.get("effortLevel")
 
 
 def build_global_config():
@@ -149,6 +183,10 @@ def build_global_config():
     # folder trust given inside abby, carried over so it isn't asked again.
     path = os.path.join(DST, ".claude.json")
     cfg = load(os.path.join(HOME, ".claude.json"))
+    # abby isn't signed in to claude.ai. Leaving the account out also keeps
+    # agent-gate.sh's Anthropic weekly-reserve gate off abby (it exits when
+    # it finds no oauthAccount); abby spends no Anthropic quota.
+    cfg.pop("oauthAccount", None)
     projects = cfg.setdefault("projects", {})
     for proj, st in (load(path).get("projects") or {}).items():
         if isinstance(st, dict) and st.get("hasTrustDialogAccepted"):
@@ -161,7 +199,7 @@ def main():
         die(f"{SRC} not found")
     check_key()
     link_tree()
-    build_settings()
+    model, effort = build_settings()
     build_global_config()
 
     env = os.environ
@@ -169,7 +207,17 @@ def main():
     for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"):
         env.pop(var, None)
     env["CLAUDE_CONFIG_DIR"] = DST
-    os.execvp("claude", ["claude"] + sys.argv[1:])
+
+    args = sys.argv[1:]
+    given = lambda flag: any(a == flag or a.startswith(flag + "=") for a in args)
+    pre = ["--settings", FLAGS_FILE]
+    # Flags so a saved pick beats the live settings' model/effort, which load
+    # as project settings when run from ~. An in-session pick still wins.
+    if not given("--model"):
+        pre += ["--model", model]
+    if effort and not given("--effort"):
+        pre += ["--effort", effort]
+    os.execvp("claude", ["claude"] + pre + args)
 
 
 if __name__ == "__main__":

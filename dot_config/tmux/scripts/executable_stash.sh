@@ -1993,10 +1993,13 @@ resume_agent() {
     # Anthropic. Its transcript says so on every reply ("model":"abliterated-…").
     local launcher=claude f
     for f in "$HOME"/.claude/projects/*/"$sid".jsonl; do
-        [ -f "$f" ] && command -v abby >/dev/null 2>&1 \
-            && grep -m1 -q '"model":"abliterated-model' "$f" && launcher=abby
-        break
+        [ -f "$f" ] && grep -m1 -q '"model":"abliterated-model' "$f" \
+            && { launcher=abby; break; }
     done
+    if [ "$launcher" = abby ] && ! command -v abby >/dev/null 2>&1; then
+        msg -k warn "abby session but abby isn't on PATH — not resumed (abby --resume $sid)"
+        return 1
+    fi
 
     local cmd
     printf -v cmd 'cd %q && %s --resume %q' "$cwd" "$launcher" "$sid"
