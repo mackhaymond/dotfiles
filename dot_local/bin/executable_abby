@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""claude-ab: Claude Code on abliteration.ai models, with your normal setup.
+"""abby: Claude Code on abliteration.ai models, with your normal setup.
 
-Runs `claude` with CLAUDE_CONFIG_DIR=~/.claude-ab. That dir symlinks every
-entry of ~/.claude (CLAUDE.md, hooks, plugins, skills, projects/memory,
-history...) EXCEPT settings.json and .claude.json, which are private copies
-rebuilt from the live ones on each launch. So /model "set as default",
-/autocompact and effort picks stick for claude-ab without ever writing an
+Runs `claude` with CLAUDE_CONFIG_DIR=~/.claude-abby, and that one variable
+is all that makes it abby: the dir's settings.json carries the gateway
+(env block + an apiKeyHelper that reads the keychain), so any path that
+re-launches `claude` with the variable set - tmux restore, CMD+Z reopen,
+unpark (stash.sh) - comes back on abliteration, not Anthropic.
+
+The dir symlinks every entry of ~/.claude (CLAUDE.md, hooks, plugins,
+skills, projects/memory, sessions, history...) EXCEPT settings.json and
+.claude.json, which are private copies rebuilt from the live ones on each
+launch. So hooks and agent status work as usual, and /model "set as
+default", /autocompact and effort picks stick for abby without writing an
 abliteration model into the settings plain `claude` reads.
 
 Models (from GET /v1/models, 2026-11-09):
@@ -17,27 +23,40 @@ The 1M ones carry Claude Code's "[1m]" suffix (stripped before sending) so
 it sizes their window right; CLAUDE_CODE_MAX_CONTEXT_TOKENS covers the 256K
 one. Auto-compact defaults to 400K (see AUTO_COMPACT_WINDOW).
 
-Key: $ABLITERATION_API_KEY, else keychain item "abliteration-api-key":
+Key: keychain item "abliteration-api-key":
   security add-generic-password -U -a "$USER" -s abliteration-api-key -w
-One-off model: claude-ab --model abliterated-model  (or CLAUDE_AB_MODEL=...)
+One-off model: abby --model abliterated-model
 """
 import copy
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 
 HOME = os.path.expanduser("~")
 SRC = os.path.join(HOME, ".claude")
-DST = os.path.join(HOME, ".claude-ab")
+DST = os.path.join(HOME, ".claude-abby")
 PRIVATE = {"settings.json"}  # not symlinked; generated below
+USER = os.environ.get("USER") or os.path.basename(HOME)
+KEY_CMD = ["security", "find-generic-password", "-a", USER,
+           "-s", "abliteration-api-key", "-w"]
 
 MAIN = "abliterated-model-large-v2[1m]"
 FAST = "abliterated-model-large-flash[1m]"
-BASE_WINDOW = "262144"  # abliterated-model (the only non-1M model)
 AUTO_COMPACT_WINDOW = 400_000  # 1M models: compact at ~400K, not ~1M
-MAX_OUTPUT = "64000"
+
+GATEWAY_ENV = {
+    "ANTHROPIC_BASE_URL": "https://api.abliteration.ai",
+    # Aliases used by subagents ("opus"/"sonnet"/"haiku") and background work.
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": MAIN,
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": MAIN,
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": MAIN,
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": FAST,
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "262144",  # abliterated-model, the one non-1M model
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
+}
 
 PICKER = {
     "replaceBuiltInOptions": True,
@@ -55,23 +74,15 @@ PICKER = {
 
 
 def die(msg):
-    print(f"claude-ab: {msg}", file=sys.stderr)
+    print(f"abby: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
-def api_key():
-    key = os.environ.get("ABLITERATION_API_KEY", "").strip()
-    if key:
-        return key
-    r = subprocess.run(
-        ["security", "find-generic-password", "-a", os.environ.get("USER", ""),
-         "-s", "abliteration-api-key", "-w"],
-        capture_output=True, text=True)
-    key = r.stdout.strip()
-    if not key:
-        die("no abliteration.ai key. Add it with:\n"
+def check_key():
+    r = subprocess.run(KEY_CMD, capture_output=True, text=True)
+    if not r.stdout.strip():
+        die("no abliteration.ai key in the keychain. Add it with:\n"
             '  security add-generic-password -U -a "$USER" -s abliteration-api-key -w')
-    return key
 
 
 def load(path):
@@ -81,12 +92,12 @@ def load(path):
     except FileNotFoundError:
         return {}
     except json.JSONDecodeError as e:
-        print(f"claude-ab: ignoring unreadable {path}: {e}", file=sys.stderr)
+        print(f"abby: ignoring unreadable {path}: {e}", file=sys.stderr)
         return {}
 
 
 def write_atomic(path, data):
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".claude-ab-")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".abby-")
     with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
@@ -105,7 +116,7 @@ def link_tree():
             continue
         dst = os.path.join(DST, name)
         if os.path.lexists(dst):
-            continue  # existing link, or something claude-ab made itself
+            continue  # existing link, or something abby made itself
         os.symlink(os.path.join(SRC, name), dst)
 
 
@@ -115,13 +126,15 @@ def build_settings():
     prev = load(path)
     s = copy.deepcopy(live)
 
+    s["env"] = {**(live.get("env") or {}), **GATEWAY_ENV}
+    s["apiKeyHelper"] = shlex.join(KEY_CMD)
     s["model"] = prev.get("model") if is_ab(prev.get("model")) else MAIN
     s["modelPicker"] = PICKER
     s["autoCompactWindow"] = AUTO_COMPACT_WINDOW
     # Remote Control and model auto-switching assume a claude.ai account.
     s["remoteControlAtStartup"] = False
     s["switchModelsOnFlag"] = False
-    # Keep per-model picks (effort, /autocompact) made inside claude-ab.
+    # Keep per-model picks (effort, /autocompact) made inside abby.
     ms = dict(live.get("modelSettings") or {})
     ms.update({k: v for k, v in (prev.get("modelSettings") or {}).items() if is_ab(k)})
     s["modelSettings"] = ms
@@ -132,39 +145,31 @@ def build_settings():
 
 def build_global_config():
     # ~/.claude.json carries MCP servers, project trust, onboarding state.
-    # A fresh copy each launch; claude-ab's own writes stay in its copy.
+    # A fresh copy each launch; abby's own writes stay in its copy, except
+    # folder trust given inside abby, carried over so it isn't asked again.
+    path = os.path.join(DST, ".claude.json")
     cfg = load(os.path.join(HOME, ".claude.json"))
-    write_atomic(os.path.join(DST, ".claude.json"), cfg)
+    projects = cfg.setdefault("projects", {})
+    for proj, st in (load(path).get("projects") or {}).items():
+        if isinstance(st, dict) and st.get("hasTrustDialogAccepted"):
+            projects.setdefault(proj, {})["hasTrustDialogAccepted"] = True
+    write_atomic(path, cfg)
 
 
 def main():
     if not os.path.isdir(SRC):
         die(f"{SRC} not found")
-    key = api_key()
+    check_key()
     link_tree()
     build_settings()
     build_global_config()
 
     env = os.environ
-    env.pop("ANTHROPIC_API_KEY", None)  # would win over the bearer token
-    env.pop("ANTHROPIC_MODEL", None)    # would pin the model past /model
-    env.update({
-        "CLAUDE_CONFIG_DIR": DST,
-        "ANTHROPIC_BASE_URL": "https://api.abliteration.ai",
-        "ANTHROPIC_AUTH_TOKEN": key,
-        # Aliases used by subagents ("opus"/"sonnet"/"haiku") and background work.
-        "ANTHROPIC_DEFAULT_FABLE_MODEL": MAIN,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": MAIN,
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": MAIN,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": FAST,
-        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": BASE_WINDOW,
-        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS", MAX_OUTPUT),
-    })
-    args = sys.argv[1:]
-    one_off = env.pop("CLAUDE_AB_MODEL", "")
-    if one_off and "--model" not in args:
-        args = ["--model", one_off] + args
-    os.execvp("claude", ["claude"] + args)
+    # Any of these in the inherited env would beat the settings above.
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"):
+        env.pop(var, None)
+    env["CLAUDE_CONFIG_DIR"] = DST
+    os.execvp("claude", ["claude"] + sys.argv[1:])
 
 
 if __name__ == "__main__":

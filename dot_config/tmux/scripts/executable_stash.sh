@@ -1988,8 +1988,18 @@ resume_agent() {
     # the pid to differ.
     local before_pid; before_pid=$(sid_pid "$sid")
 
+    # An `abby` session (Claude Code on abliteration.ai, ~/.local/bin/abby) has
+    # to come back through abby: plain `claude --resume` would continue it on
+    # Anthropic. Its transcript says so on every reply ("model":"abliterated-…").
+    local launcher=claude f
+    for f in "$HOME"/.claude/projects/*/"$sid".jsonl; do
+        [ -f "$f" ] && command -v abby >/dev/null 2>&1 \
+            && grep -m1 -q '"model":"abliterated-model' "$f" && launcher=abby
+        break
+    done
+
     local cmd
-    printf -v cmd 'cd %q && claude --resume %q' "$cwd" "$sid"
+    printf -v cmd 'cd %q && %s --resume %q' "$cwd" "$launcher" "$sid"
     tmux send-keys -t "$pane" C-u
     tmux send-keys -t "$pane" "$cmd" Enter
 

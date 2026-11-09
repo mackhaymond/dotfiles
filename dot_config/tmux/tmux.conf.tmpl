@@ -614,7 +614,10 @@ set -g @resurrect-stale-minutes '60'
 
 # Persist and resume assistant CLI sessions with tmux-resurrect/continuum.
 set -g @plugin 'timvw/tmux-assistant-resurrect'
-set -g @assistant-resurrect-capture-env 'VIRTUAL_ENV NODE_ENV CONDA_DEFAULT_ENV OPENCODE_CONFIG'
+# CLAUDE_CONFIG_DIR: an `abby` session (Claude Code on abliteration.ai,
+# ~/.local/bin/abby) is `claude` with CLAUDE_CONFIG_DIR=~/.claude-abby, so
+# restore and closed-tab reopen must carry it or abby comes back as Claude.
+set -g @assistant-resurrect-capture-env 'VIRTUAL_ENV NODE_ENV CONDA_DEFAULT_ENV OPENCODE_CONFIG CLAUDE_CONFIG_DIR'
 
 # prefix a (or C-a): the session picker. These bash + fzf lines are the
 # FALLBACK; with ~/.local/bin/agent-ui installed, `agent-ui sessions` is bound
