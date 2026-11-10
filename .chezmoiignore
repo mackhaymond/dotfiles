@@ -84,6 +84,11 @@ code/various_scripts/.DS_Store
 .claude.json
 .config/claude/**
 .copilot/**
+# The tmux status hooks (docs/agent-tab-indicator.md, "GitHub Copilot CLI"):
+# a hooks/*.json file Copilot never writes (herdr's own hook lives beside it).
+!.copilot
+!.copilot/hooks
+!.copilot/hooks/tmux-agent.json
 .opencode/**
 .config/opencode/node_modules/**
 .config/opencode/cache/**

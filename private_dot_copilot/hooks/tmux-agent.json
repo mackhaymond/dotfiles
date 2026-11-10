@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" idle copilot", "timeoutSec": 10 }
+    ],
+    "userPromptSubmitted": [
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" running copilot", "timeoutSec": 10 }
+    ],
+    "postToolUse": [
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" heartbeat copilot", "timeoutSec": 5 }
+    ],
+    "postToolUseFailure": [
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" heartbeat copilot", "timeoutSec": 5 }
+    ],
+    "notification": [
+      { "type": "command", "matcher": "permission_prompt|elicitation_dialog", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" needs-approval copilot", "timeoutSec": 10 }
+    ],
+    "agentStop": [
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" done copilot", "timeoutSec": 10 }
+    ],
+    "errorOccurred": [
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" failed copilot", "timeoutSec": 10 }
+    ],
+    "sessionEnd": [
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" clear copilot", "timeoutSec": 5 }
+    ]
+  }
+}

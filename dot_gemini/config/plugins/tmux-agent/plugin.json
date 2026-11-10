@@ -1,0 +1,5 @@
+{
+  "name": "tmux-agent",
+  "version": "1.0.0",
+  "description": "Paints agy's state on its tmux tab (~/.config/tmux/docs/agent-tab-indicator.md, \"Antigravity CLI\")."
+}

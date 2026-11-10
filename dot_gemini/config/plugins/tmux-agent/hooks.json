@@ -1,0 +1,21 @@
+{
+  "tmux-agent": {
+    "SessionStart": [
+      { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" idle agy >/dev/null 2>&1; echo '{}'", "timeout": 10 }
+    ],
+    "PreInvocation": [
+      { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" running agy >/dev/null 2>&1; echo '{}'", "timeout": 10 }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" heartbeat agy >/dev/null 2>&1; echo '{}'", "timeout": 5 }
+        ]
+      }
+    ],
+    "Stop": [
+      { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" done agy >/dev/null 2>&1; echo '{\"decision\":\"allow\"}'", "timeout": 10 }
+    ]
+  }
+}
