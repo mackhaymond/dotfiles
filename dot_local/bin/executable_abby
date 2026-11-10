@@ -34,6 +34,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import uuid
 
 HOME = os.path.expanduser("~")
 SRC = os.path.join(HOME, ".claude")
@@ -55,8 +56,28 @@ GATEWAY_ENV = {
     "ANTHROPIC_DEFAULT_SONNET_MODEL": MAIN,
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": FAST,
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "262144",  # abliterated-model, the one non-1M model
-    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
+    # GLM-5.3's max output is 128K and thinking counts against it (max effort
+    # ran ~18K tokens of thinking on one hard prompt); 128000 is CC's cap.
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "128000",
+    # Auto mode's classifier. CC assumes an unknown model can't turn thinking
+    # off, so it sent the classifier no thinking param: GLM then thinks at
+    # length, writes "</block>" inside its thinking, trips the stop sequence,
+    # and stage 1 never answers (2 calls, ~9s, aborted under load: "auto
+    # mode's check had no usable answer"). Marking these models as accepting
+    # disabled thinking makes stage 1 one ~2s call with thinking off (on Large
+    # v2 that means low effort, hidden trace). Measured through a proxy.
+    "CLAUDE_CODE_MODEL_CAPABILITIES": "abliterated-model*=-rejects_disabled_thinking",
+    # Z.ai's recommended Claude Code setting for GLM (slow serving at peak).
+    "API_TIMEOUT_MS": "3000000",
 }
+# Notices acknowledged inside abby (its .claude.json is re-copied from the
+# live one each launch): carried over so they don't come back every launch.
+ACK_SUFFIXES = ("AcknowledgedAt", "Acknowledged", "Noticed", "Dismissed", "DismissedAt")
+# GLM-5.3 is tuned and benchmarked at max effort (Z.ai: "for complex tasks
+# such as coding, we recommend max"; abliteration's default for Large v2).
+# CC would send "high", which measured ~10x less thinking. /effort still
+# overrides it per session, and a level saved there sticks.
+DEFAULT_EFFORT = "max"
 
 FLAGS_FILE = os.path.join(DST, "abby.settings.json")  # passed via --settings
 OWN_DIRS = {"backups", "daemon"}  # abby keeps its own, never shares these
@@ -147,7 +168,10 @@ def link_tree():
 # out of it so /model and /effort picks can still stick.
 def overlay(live):
     return {
-        "env": {**(live.get("env") or {}), **GATEWAY_ENV},
+        "env": {**(live.get("env") or {}), **GATEWAY_ENV,
+                # ABBY_BASE_URL: point one launch at a local logging proxy.
+                **({"ANTHROPIC_BASE_URL": os.environ["ABBY_BASE_URL"]}
+                   if os.environ.get("ABBY_BASE_URL") else {})},
         "apiKeyHelper": shlex.join(KEY_CMD),
         "modelPicker": PICKER,
         # Remote Control and model auto-switching assume a claude.ai account.
@@ -170,11 +194,14 @@ def build_settings():
     ms = dict(live.get("modelSettings") or {})
     ms.update({k: v for k, v in (prev.get("modelSettings") or {}).items() if is_ab(k)})
     s["modelSettings"] = ms
-    if "effortLevel" in prev:
+    # Effort: never the live Claude one, so an effortLevel in abby's own
+    # settings was saved from /effort inside abby and is kept.
+    s.pop("effortLevel", None)
+    if prev.get("effortLevel"):
         s["effortLevel"] = prev["effortLevel"]
     write_atomic(path, s)
     write_atomic(FLAGS_FILE, ov)
-    return s["model"], s.get("effortLevel")
+    return s["model"], s.get("effortLevel") or DEFAULT_EFFORT
 
 
 def build_global_config():
@@ -187,8 +214,12 @@ def build_global_config():
     # agent-gate.sh's Anthropic weekly-reserve gate off abby (it exits when
     # it finds no oauthAccount); abby spends no Anthropic quota.
     cfg.pop("oauthAccount", None)
+    prev = load(path)
+    for k, v in prev.items():
+        if k.endswith(ACK_SUFFIXES) and v and not cfg.get(k):
+            cfg[k] = v
     projects = cfg.setdefault("projects", {})
-    for proj, st in (load(path).get("projects") or {}).items():
+    for proj, st in (prev.get("projects") or {}).items():
         if isinstance(st, dict) and st.get("hasTrustDialogAccepted"):
             projects.setdefault(proj, {})["hasTrustDialogAccepted"] = True
     write_atomic(path, cfg)
@@ -207,6 +238,11 @@ def main():
     for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"):
         env.pop(var, None)
     env["CLAUDE_CONFIG_DIR"] = DST
+
+    # Routing hint so a session's requests land where its prompt cache is
+    # (abliteration docs: x-abliteration-session-id). One id per launch.
+    if "ANTHROPIC_CUSTOM_HEADERS" not in env:
+        env["ANTHROPIC_CUSTOM_HEADERS"] = f"x-abliteration-session-id: abby-{uuid.uuid4()}"
 
     args = sys.argv[1:]
     given = lambda flag: any(a == flag or a.startswith(flag + "=") for a in args)
