@@ -69,8 +69,9 @@ macOS `wcwidth`, which tmux uses, returns 1).
 `<mark>` is any codepoint in the table above except U+10C1FF. The two- and
 three-cell forms are GSUB ligatures (features `liga` and `calt`, scripts
 `DFLT` and `latn`); each is ONE glyph whose advance is 1200 or 1800 units (2
-or 3 cells). "Full row height" is y -260..980 of the -300..1020 line: a
-40-unit margin so the logo never touches the next row. Aspect is kept and the
+or 3 cells). "Row height" is y -170..890 of the -300..1020 line: a
+130-unit margin top and bottom (it was 40 until 2026-11-10, when Mack asked
+for the logos slightly shorter), centred on the line. Aspect is kept and the
 logo is centred in its cells.
 
 - **The longest match wins.** In each ligature set the three-cell rule comes
@@ -123,7 +124,7 @@ Metrics match JetBrains Mono 2.x (1000 upm, 600 advance, ascent 1020, descent
 -300, cap height 730): every one-cell mark is exactly one cell wide and sits
 on the text baseline. A one-cell mark is scaled to fit a 560 x 680 unit box
 (20-unit side bearings), centred on the middle of the cap height; `.mid`
-fits 1100 x 1240 and `.wide` 1200 x 1240, centred in their advance and the
+fits 1100 x 1060 and `.wide` 1200 x 1060, centred in their advance and the
 line. `MARKS` has a per-mark optical scale used by all three forms. Contour
 direction is recomputed from nesting depth, so sources may use either fill
 rule, but contours must not cross each other.

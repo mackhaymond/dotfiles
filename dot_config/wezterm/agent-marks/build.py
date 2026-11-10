@@ -88,8 +88,11 @@ CENTER_Y = CAP_HEIGHT / 2           # 365
 #   <mark> CONT      -> "<name>.mid": one glyph two cells wide, logo at most
 #                       1100 units wide.
 # The longer rule comes first in each ligature set, so it wins when both match.
-# Both fill the row height (descender to ascender minus a margin, so the logo
-# never touches the next row), aspect kept, centred in their cells.
+# Both take most of the row height (descender to ascender minus a margin top
+# and bottom, so the logo never touches the next row and reads a little
+# lighter than the text: Mack asked for "slightly shorter", 2026-11-10, margin
+# 40 -> 130), aspect kept, centred vertically on the row and horizontally in
+# their cells.
 CONT_CP = 0x10C1FF   # "AgentMarks continuation": blank, one cell
 CONT_NAME = "cont"
 MID_CELLS, WIDE_CELLS = 2, 3
@@ -97,8 +100,8 @@ MID_ADVANCE = MID_CELLS * ADVANCE    # 1200
 WIDE_ADVANCE = WIDE_CELLS * ADVANCE  # 1800
 MID_BOX_W = MID_ADVANCE - 100        # 1100
 WIDE_BOX_W = 2 * ADVANCE             # 1200
-WIDE_MARGIN_Y = 40
-WIDE_BOX_H = (ASCENT - DESCENT) - 2 * WIDE_MARGIN_Y  # 1240 (.mid and .wide)
+WIDE_MARGIN_Y = 130
+WIDE_BOX_H = (ASCENT - DESCENT) - 2 * WIDE_MARGIN_Y  # 1060 (.mid and .wide)
 WIDE_CENTER_Y = (ASCENT + DESCENT) / 2               # 360
 
 # Glyph-name suffix -> (cells, advance, logo box w, box h, centre y).
