@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
-# agent-launch.sh — ⌘E: any installed coding agent in a new tab. ⌘E opens the
-# launcher popup (`agent-ui launch`, spaces.conf: one row per installed agent,
-# claude first and preselected; ⏎ or a letter launches, ⇥ picks the space);
-# the popup hands every launch to this script, so what each agent is lives in
-# ONE place: the AGENTS table below. Claude stays primary (⌘R too).
+# agent-launch.sh — ⌘E / ⌘⇧E: any installed coding agent in a new tab. Both
+# open the launcher popup (`agent-ui launch`, spaces.conf: one row per
+# installed agent, claude first and preselected; ⏎ or a letter picks); the
+# popup hands every launch to this script, so what each agent is lives in ONE
+# place: the AGENTS table below. Claude stays primary (⌘R too).
 #
 #   agent-launch.sh refresh                 record the installed set in the
 #                                           global @launch_agents and its size
 #                                           in @launch_count (config load;
 #                                           every miss keeps it current)
 #   agent-launch.sh list                    the installed rows: id letter command
-#   agent-launch.sh go LETTER CLIENT PANE [SPACE]
-#                                           that agent in a new tab after PANE's
-#                                           window, in PANE's folder (the
-#                                           popup's ⏎ / letter, as ⌘R); with
-#                                           SPACE ($N, the popup's ⇥) another
-#                                           than PANE's: at that space's end,
-#                                           in its root (⌘⇧R's half: space.sh
-#                                           new-tab agent, SPACE_LAUNCH=<id>)
+#   agent-launch.sh go LETTER CLIENT PANE   that agent in a new tab after PANE's
+#                                           window, in PANE's folder (⌘E's
+#                                           popup: ⏎ / a letter, as ⌘R)
+#   agent-launch.sh pick [--print] [--after PID] LETTER CLIENT PANE
+#                                           the same agent, ⌘⇧R's space picker
+#                                           first (⌘⇧E's popup: space.sh
+#                                           pick-tab agent, SPACE_LAUNCH=<id>:
+#                                           the spaces, a typed folder, ^N).
+#                                           --after: wait for PID (the
+#                                           launcher, whose popup must close
+#                                           before another can open). --print:
+#                                           the display-popup argv, nothing
+#                                           opened
 #   agent-launch.sh open ID TARGET DIR      new-window -a -t TARGET -c DIR for
 #                                           agent ID, born the agent's way;
 #                                           prints the new window id (space.sh
@@ -54,7 +59,8 @@
 # @launch_agents: "LETTER:ID:COMMAND ..." in table order, the installed ones
 # only (`c:claude:claude a:abby:abby ... u:cursor:cursor-agent`), the popup's
 # rows (agent-ui launch.rs parse_agents). @launch_count: how many, the
-# popup's height (spaces.conf's User27). Each written only when it changed.
+# popup's height (spaces.conf's User27 / User28). Each written only when it
+# changed.
 #
 # Messages go to the client that pressed the key through notify.sh
 # (@notify_sh; tests point it at a stand-in): `launch: agy not installed`
@@ -190,13 +196,9 @@ open_window() {
 }
 
 cmd_go() {
-  local letter="${1:-}" client="${2:-}" pane="${3:-}" space="${4:-}" wid dir sid new
+  local letter="${1:-}" client="${2:-}" pane="${3:-}" wid dir new
   resolve "$letter" "$client" || return 0
-  IFS="$US" read -r wid dir sid <<<"$(t display-message -p -t "$pane" "#{window_id}${US}#{?@tab_dir,#{E:@tab_dir},#{pane_current_path}}${US}#{session_id}" 2>/dev/null)"
-  if [[ -n "$space" && "$space" != "$sid" ]]; then
-    in_space "$space" "$client"
-    return 0
-  fi
+  IFS="$US" read -r wid dir <<<"$(t display-message -p -t "$pane" "#{window_id}${US}#{?@tab_dir,#{E:@tab_dir},#{pane_current_path}}" 2>/dev/null)"
   [[ "$wid" == @* ]] || { say "$client" warn "no tab to open beside"; return 0; }
   [[ -d "$dir" ]] || dir="$HOME"
   new="$(open_window "$wid" "$dir")" || { say "$client" error "could not open $R_ID"; return 0; }
@@ -204,20 +206,45 @@ cmd_go() {
   focus
 }
 
-# in_space SPACE CLIENT: agent R_* at the END of space SPACE ($N), in its
-# root folder, CLIENT switched to it: exactly ⌘⇧R's pick (space.sh new-tab
-# agent), which hands any agent but claude back to `open` (SPACE_LAUNCH), so
-# its birth stays this script's. space.sh says what went wrong itself (a
-# hidden session, a space closed meanwhile); its exit and output are dropped
-# (run-shell -b would show them in the pane's view mode).
-in_space() {
-  local space="$1" client="$2" s
-  local -a cmd
-  [[ "$space" =~ ^\$[0-9]+$ ]] || { say "$client" warn "no space $space"; return 0; }
-  s="$(t show -gqv @space_sh 2>/dev/null)"
-  [[ -n "$s" ]] || s="$HOME/.config/tmux/scripts/space.sh"
-  read -ra cmd <<<"$s"   # a command line, as tmux runs it ("bash /path" in tests)
-  SPACE_LAUNCH="$R_ID" "${cmd[@]}" new-tab agent "$space" "$client" >/dev/null 2>&1
+# wait_gone PID: until PID has exited (at most 3 s), then a beat for tmux to
+# close the popup it ran in (agent-ui diff's --after, the same numbers).
+wait_gone() {
+  local pid="$1" n=0
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  while kill -0 "$pid" 2>/dev/null && ((n++ < 150)); do sleep 0.02; done
+  sleep 0.06
+}
+
+# pick: ⌘⇧E's agent, then ⌘⇧R's own picker (spaces.conf's prefix K popup,
+# plus SPACE_LAUNCH): space.sh new-tab hands any agent but claude back to
+# `open`, so its birth stays this script's.
+cmd_pick() {
+  local dry=0 after=""
+  while (($#)); do
+    case "$1" in
+      --print) dry=1; shift ;;
+      --after) after="${2:-}"; shift; (($#)) && shift ;;
+      *) break ;;
+    esac
+  done
+  local letter="${1:-}" client="${2:-}" pane="${3:-}" spaces tty space_sh
+  resolve "$letter" "$client" || return 0
+  IFS="$US" read -r spaces tty space_sh <<<"$(t display-message -p ${client:+-c "$client"} "#{@spaces}${US}#{client_tty}${US}#{@space_sh}" 2>/dev/null)"
+  if [[ "$spaces" != on ]]; then
+    say "$client" warn "picking a space needs spaces on"
+    return 0
+  fi
+  [[ -n "$space_sh" ]] || space_sh="$HOME/.config/tmux/scripts/space.sh"
+  local -a cmd=(display-popup ${client:+-c "$client"} ${pane:+-t "$pane"} -E -w 80% -h 70%
+    -x '#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}' -d '#{pane_current_path}'
+    -e "SPACE_LAUNCH=$R_ID"
+    "$space_sh pick-tab agent $(printf '%q' "${tty:-$client}")")
+  ((dry)) && { printf '%s\n' "${cmd[@]}"; return 0; }
+  [[ -n "$after" ]] && wait_gone "$after"
+  # Never a nonzero exit or a word on stdout/stderr: run-shell -b would show
+  # it in the pane's view mode ("... returned 1"), e.g. when the picker
+  # itself fails (no fzf, a failed ^N clone) or a popup is still up.
+  t "${cmd[@]}" >/dev/null 2>&1
   return 0
 }
 
@@ -232,15 +259,16 @@ cmd_open() {
   exit 1
 }
 
-# refresh and go are what tmux's run-shell runs: they always exit 0
+# refresh, go and pick are what tmux's run-shell runs: they always exit 0
 # (run-shell -b shows a nonzero exit in the pane's view mode).
 case "${1:-}" in
   refresh) cmd_refresh; exit 0 ;;
   list) cmd_list ;;
   go) shift; cmd_go "$@"; exit 0 ;;
+  pick) shift; cmd_pick "$@"; exit 0 ;;
   open) shift; cmd_open "$@" ;;
   *)
-    echo "usage: agent-launch.sh refresh | list | go LETTER CLIENT PANE [SPACE] | open ID TARGET DIR" >&2
+    echo "usage: agent-launch.sh refresh | list | go LETTER CLIENT PANE | pick [--print] [--after PID] LETTER CLIENT PANE | open ID TARGET DIR" >&2
     exit 2
     ;;
 esac

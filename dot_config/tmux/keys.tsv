@@ -48,7 +48,8 @@ Tabs	⌘T	New shell tab, this folder	prefix	c	⌃S c
 Tabs	⌘R	New claude tab, this folder	prefix	k	⌃S k
 Tabs	⌘⇧T	New shell tab in a space… (picker)	prefix	C-t	⌃S ⌃T
 Tabs	⌘⇧R	New claude tab in a space… (picker)	prefix	K	⌃S K
-Tabs	⌘E	Launch an agent… (launcher popup)	root	User27	⌘E ⏎ = claude, as ⌘R
+Tabs	⌘E	New agent tab, this folder… (launcher)	root	User27	⌘E ⏎ = claude, as ⌘R
+Tabs	⌘⇧E	New agent tab in a space… (launcher, picker)	root	User28	the agent, then ⌘⇧R's picker
 Tabs	⌘⌥T	Replace this tab with a fresh shell	prefix	R	⌃S R
 Tabs	⌘⌥R	Replace this tab with claude	prefix	C-k	⌃S ⌃K
 Tabs	⌃⌘T	New nushell tab	prefix	N	⌃S N
@@ -94,9 +95,8 @@ Agent menu	␣ v	Preview its pane
 Agent menu	⌥S / ⌥X	Next that needs you / back
 Agent menu	Esc	Close the menu
 
-Agent launcher	⏎	Launch the selected agent (claude first)
-Agent launcher	a-z	Launch that agent at once			c claude a abby x codex o opencode g grok y agy u cursor p copilot d aider
-Agent launcher	⇥ / ⇧⇥	Target space: this one or another			this one: beside this tab, as ⌘R
+Agent launcher	a-z	That agent: its key ends its row			c claude a abby x codex o opencode g grok y agy u cursor p copilot d aider
+Agent launcher	⏎	The selected agent (claude first)			⌘⇧E: then pick the space
 Agent launcher	↑ / ↓	Move			⌃P / ⌃N
 Agent launcher	Esc	Close the launcher			q too
 

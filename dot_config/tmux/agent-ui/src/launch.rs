@@ -1,31 +1,37 @@
-//! `agent-ui launch`: ⌘E, the agent launcher popup. One row per INSTALLED
-//! coding agent (claude first and preselected), its logo, name, command and
-//! ⌘E letter; ⏎ or the letter opens it in a new tab.
+//! `agent-ui launch`: ⌘E / ⌘⇧E, the agent launcher popup. One row per
+//! INSTALLED coding agent (claude first and preselected): its logo, name and
+//! command, its letter as a solid key-cap at the row's right end; ⏎ or the
+//! letter opens it in a new tab.
 //!
 //! ```text
-//! agent-ui launch --client <tty> [--pane <%id>]
-//! agent-ui launch --once WxH [--client <tty>] [--pane <%id>] [--plain]
+//! agent-ui launch --client <tty> [--pane <%id>] [--pick-space]
+//! agent-ui launch --once WxH [--client <tty>] [--pane <%id>] [--pick-space] [--plain]
 //! ```
 //!
-//! - **Keys** ([`view::Launcher::key`]): ⏎ launches the selected agent, a
+//! - **Keys** ([`view::Launcher::key`]): ⏎ picks the selected agent, a
 //!   letter that agent at once (either case); ↑/↓, C-p/C-n, Home/End and the
-//!   wheel move; ⇥ / ⇧⇥ cycle the TARGET space (the line under the title;
-//!   this space first); Esc, q, C-c, ⌥W and the ✕ close. ⌘E again cannot
-//!   reach it: tmux drops a user key (User27) inside a popup, so the claude
-//!   double-tap is ⌘E ⏎.
+//!   wheel move; Esc, q, C-c, ⌥W and the ✕ close. Nothing cycles. ⌘E again
+//!   cannot reach it: tmux drops a user key (User27) inside a popup, so the
+//!   claude double-tap is ⌘E ⏎.
+//! - **⌘E** (no flag): the agent in a new tab beside this one, in its
+//!   folder, as ⌘R (`agent-launch.sh go LETTER CLIENT PANE`). The header
+//!   says where: `here  2  notes`.
+//! - **⌘⇧E** (`--pick-space`): the agent, then ⌘⇧R's own space picker
+//!   (`agent-launch.sh pick --after <this pid> LETTER CLIENT PANE`: space.sh
+//!   pick-tab agent with `SPACE_LAUNCH=<id>`, the same list, typed folders
+//!   and ^N). A second popup cannot open while this one is up, so the script
+//!   waits for this process to be gone first.
 //! - **Data**: ONE tmux call ([`QUERY`]): the client's row (its session,
 //!   its pane, the global `@launch_agents` and `@launch_sh`) and every
-//!   session's ⌘N, name, hidden flag and colour. `@launch_agents` is
-//!   agent-launch.sh's installed set (`refresh`: `c:claude:claude
-//!   u:cursor:cursor-agent …`, its table's order), so the script stays the
-//!   one table of agents and the one detector.
-//! - **Launch**: the popup hands the launch to the server and exits
-//!   (`run-shell -b "agent-launch.sh go LETTER CLIENT PANE [SPACE]"`), so
-//!   the birth, `@agent_harness` and the hookless agents stay in the script.
-//!   No SPACE (this space): a new tab beside the current one, in its folder,
-//!   as ⌘R. Another space: at its end, in its root (space.sh new-tab, as
-//!   ⌘⇧R). An agent that vanished since the last refresh: the script says
-//!   "launch: X not installed" (notify.sh) and records the set again.
+//!   session's ⌘N, name, hidden flag and colour (for the header).
+//!   `@launch_agents` is agent-launch.sh's installed set (`refresh`:
+//!   `c:claude:claude u:cursor:cursor-agent …`, its table's order), so the
+//!   script stays the one table of agents and the one detector.
+//! - **Launch**: the popup hands the command to the server (`run-shell -b`)
+//!   and exits, so the birth, `@agent_harness` and the hookless agents stay
+//!   in the script. An agent that vanished since the last refresh: the
+//!   script says "launch: X not installed" (notify.sh) and records the set
+//!   again.
 //!
 //! `--once` renders one frame of the live server to stdout (truecolour SGR,
 //! or `--plain` with each logo as `[I]`) and exits; nothing is launched.
@@ -34,7 +40,7 @@
 
 pub mod view;
 
-use self::view::{render, Act, Agent, Launcher, Target};
+use self::view::{render, Act, Agent, Here, Launcher};
 use crate::menu::keys::{KeyReader, ESC_WAIT};
 use crate::tmux::Tmux;
 use ratatui::buffer::Buffer;
@@ -45,11 +51,11 @@ use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 
-const USAGE: &str = "usage: agent-ui launch --client <tty> [--pane <%id>]
-       agent-ui launch --once WxH [--client <tty>] [--pane <%id>] [--plain]";
+const USAGE: &str = "usage: agent-ui launch --client <tty> [--pane <%id>] [--pick-space]
+       agent-ui launch --once WxH [--client <tty>] [--pane <%id>] [--pick-space] [--plain]";
 
-/// The popup's width (spaces.conf's User27 binding asks for this many
-/// columns, or the whole client when it is narrower). Its height is
+/// The popup's width (spaces.conf's User27 / User28 bindings ask for this
+/// many columns, or the whole client when it is narrower). Its height is
 /// [`view::height_for`] the installed count (`@launch_count`).
 pub const POPUP_W: u16 = 46;
 /// How often the loop wakes with nothing typed (to follow a resize).
@@ -65,6 +71,8 @@ pub struct Args {
     pub pane: Option<String>,
     pub once: Option<(u16, u16)>,
     pub plain: bool,
+    /// ⌘⇧E: the chosen agent goes to ⌘⇧R's space picker.
+    pub pick_space: bool,
 }
 
 pub fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -82,6 +90,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
                 a.once = Some((n(w)?, n(h)?));
             }
             "--plain" => a.plain = true,
+            "--pick-space" => a.pick_space = true,
             _ => return Err(format!("unknown argument {arg:?}")),
         }
     }
@@ -103,7 +112,8 @@ pub const QUERY: [&str; 7] = [
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct State {
     pub agents: Vec<Agent>,
-    pub targets: Vec<Target>,
+    /// The client's session, for the header.
+    pub here: Option<Here>,
     /// The client's pane: the new tab goes beside its window.
     pub pane: String,
     /// `@launch_sh`: agent-launch.sh as a command line.
@@ -139,10 +149,8 @@ fn hex(s: &str) -> Option<Color> {
 
 /// [`QUERY`]'s output → the state, for `client` (its tty; the first client
 /// when None or not found) and `pane` (the binding's `#{pane_id}`; the
-/// client's own when None). The targets are the spaces in ⌘N order
-/// (space.sh `spaces_in_order`: not hidden, numbered), the client's own
-/// marked `here`; a client in a session that is not a space gets that
-/// session first, as `here`, without a number.
+/// client's own when None). `here` is the client's session: its ⌘N and
+/// colour when it is a space (not hidden, numbered), else just its name.
 pub fn parse_state(text: &str, client: Option<&str>, pane: Option<&str>) -> State {
     let mut clients: Vec<Vec<&str>> = Vec::new();
     let mut sessions: Vec<Vec<&str>> = Vec::new();
@@ -159,23 +167,13 @@ pub fn parse_state(text: &str, client: Option<&str>, pane: Option<&str>) -> Stat
         Some(f) => (f[2], f[3], f[4], f[5]),
         None => ("", "", "", ""),
     };
-    let mut spaces: Vec<(u32, Target)> = sessions
-        .iter()
-        .filter(|f| f[4] != "1")
-        .filter_map(|f| {
-            let i = f[1].trim().parse::<u32>().ok()?;
-            Some((i, Target { sid: f[2].into(), name: f[3].into(), index: Some(i), color: hex(f[5]), here: f[2] == cur }))
-        })
-        .collect();
-    spaces.sort_by_key(|(i, _)| *i);
-    let mut targets: Vec<Target> = spaces.into_iter().map(|(_, t)| t).collect();
-    if !cur.is_empty() && !targets.iter().any(|t| t.here) {
-        let name = sessions.iter().find(|f| f[2] == cur).map_or(cur, |f| f[3]);
-        targets.insert(0, Target { sid: cur.into(), name: name.into(), index: None, color: None, here: true });
-    }
+    let here = sessions.iter().find(|f| !cur.is_empty() && f[2] == cur).map(|f| {
+        let index = if f[4] == "1" { None } else { f[1].trim().parse::<u32>().ok() };
+        Here { name: f[3].into(), index, color: index.and_then(|_| hex(f[5])) }
+    });
     State {
         agents: parse_agents(agents),
-        targets,
+        here,
         pane: pane.filter(|p| !p.is_empty()).unwrap_or(mine_pane).into(),
         launch_sh: launch_sh.into(),
     }
@@ -186,23 +184,25 @@ fn q(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The `run-shell -b` command that launches: `agent-launch.sh go LETTER
-/// CLIENT PANE [SPACE]`. `launch_sh` is a command line (`bash /path` in the
-/// tests); unset, the installed script.
-pub fn launch_command(launch_sh: &str, letter: char, client: &str, pane: &str, space: Option<&str>) -> String {
+/// The `run-shell -b` command for `act`: `agent-launch.sh go LETTER CLIENT
+/// PANE` (⌘E), or `agent-launch.sh pick --after PID LETTER CLIENT PANE`
+/// (⌘⇧E: `pid` is this popup's process, which must be gone before the
+/// picker's popup can open). `launch_sh` is a command line (`bash /path` in
+/// the tests); unset, the installed script. None for Close.
+pub fn launch_command(launch_sh: &str, act: &Act, client: &str, pane: &str, pid: u32) -> Option<String> {
     let sh = if launch_sh.trim().is_empty() {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{}/.config/tmux/scripts/agent-launch.sh", home)
     } else {
         launch_sh.to_string()
     };
-    let mut c = format!("{sh} go {letter} {} {}", q(client), q(pane));
-    if let Some(s) = space {
-        c.push(' ');
-        c.push_str(&q(s));
-    }
+    let verb = match act {
+        Act::Launch(l) => format!("go {l}"),
+        Act::Pick(l) => format!("pick --after {pid} {l}"),
+        Act::Close => return None,
+    };
     // run-shell expands formats in its command: a literal `#` stays one.
-    c.replace('#', "##")
+    Some(format!("{sh} {verb} {} {}", q(client), q(pane)).replace('#', "##"))
 }
 
 pub fn run(tmux: Tmux, args: &[String]) -> ExitCode {
@@ -218,7 +218,7 @@ pub fn run(tmux: Tmux, args: &[String]) -> ExitCode {
         _ => String::new(),
     };
     let st = parse_state(&text, a.client.as_deref(), a.pane.as_deref());
-    let mut l = Launcher::new(st.agents.clone(), st.targets.clone());
+    let mut l = Launcher::new(st.agents.clone(), st.here.clone(), a.pick_space);
     if let Some((w, h)) = a.once {
         let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
         render(&mut l, &mut buf);
@@ -231,13 +231,14 @@ pub fn run(tmux: Tmux, args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     match interactive(&mut l) {
-        Ok(Some(Act::Launch { letter, space })) => {
+        Ok(Some(act)) => {
             let client = a.client.clone().unwrap_or_default();
-            let cmd = launch_command(&st.launch_sh, letter, &client, &st.pane, space.as_deref());
-            tmux.run_bg(&cmd);
+            if let Some(cmd) = launch_command(&st.launch_sh, &act, &client, &st.pane, std::process::id()) {
+                tmux.run_bg(&cmd);
+            }
             ExitCode::SUCCESS
         }
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(None) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("agent-ui launch: {e}");
             ExitCode::from(1)
@@ -376,8 +377,9 @@ mod tests {
     fn args() {
         let a = parse_args(&s(&["--client", "/dev/ttys004", "--pane", "%12"])).unwrap();
         assert_eq!((a.client.as_deref(), a.pane.as_deref(), a.once), (Some("/dev/ttys004"), Some("%12"), None));
-        let a = parse_args(&s(&["--once", "60x16", "--plain"])).unwrap();
-        assert_eq!((a.once, a.plain), (Some((60, 16)), true));
+        assert!(!a.pick_space);
+        let a = parse_args(&s(&["--once", "60x16", "--plain", "--pick-space"])).unwrap();
+        assert_eq!((a.once, a.plain, a.pick_space), (Some((60, 16)), true, true));
         assert!(parse_args(&s(&["--once", "60"])).is_err());
         assert!(parse_args(&s(&["--pane"])).is_err());
         assert!(parse_args(&s(&["--bogus"])).is_err());
@@ -415,31 +417,32 @@ mod tests {
         let st = parse_state(&text, Some("/dev/ttys004"), None);
         assert_eq!(st.agents.len(), 2);
         assert_eq!((st.pane.as_str(), st.launch_sh.as_str()), ("%7", "bash /x/agent-launch.sh"));
-        let t: Vec<(&str, Option<u32>, bool)> = st.targets.iter().map(|t| (t.name.as_str(), t.index, t.here)).collect();
-        assert_eq!(t, [("main", Some(1), false), ("notes", Some(2), true), ("cua-notch", Some(3), false)]);
-        assert_eq!(st.targets[0].color, Some(Color::Rgb(0xb4, 0xbe, 0xfe)));
-        assert_eq!(st.targets[1].color, None);
+        assert_eq!(st.here, Some(Here { name: "notes".into(), index: Some(2), color: None })); // "junk" is no colour
+        let st = parse_state(&text, Some("/dev/ttys001"), None);
+        assert_eq!(st.here, Some(Here { name: "main".into(), index: Some(1), color: Some(Color::Rgb(0xb4, 0xbe, 0xfe)) }));
         // The binding's pane wins; an unknown client is the first one.
         let st = parse_state(&text, Some("/dev/nope"), Some("%42"));
         assert_eq!((st.pane.as_str(), st.agents.len()), ("%42", 1));
-        // A client in a hidden session: that session first, unnumbered, here.
-        let text = [c("/dev/ttys001", "$9", "%3", ""), sess("1", "$0", "main", "", ""), sess("", "$9", "agents", "1", "")]
+        // A client in a hidden session: its name, no number, no colour.
+        let text = [c("/dev/ttys001", "$9", "%3", ""), sess("1", "$0", "main", "", ""), sess("7", "$9", "agents", "1", "#94e2d5")]
             .join("\n");
         let st = parse_state(&text, Some("/dev/ttys001"), None);
-        let t: Vec<(&str, Option<u32>, bool)> = st.targets.iter().map(|t| (t.name.as_str(), t.index, t.here)).collect();
-        assert_eq!(t, [("agents", None, true), ("main", Some(1), false)]);
+        assert_eq!(st.here, Some(Here { name: "agents".into(), index: None, color: None }));
         // No server: nothing at all.
         assert_eq!(parse_state("", None, None), State::default());
     }
 
     #[test]
     fn the_launch_command() {
-        assert_eq!(launch_command("bash /x/a.sh", 'x', "/dev/ttys004", "%7", None),
-            "bash /x/a.sh go x '/dev/ttys004' '%7'");
-        assert_eq!(launch_command("/x/a.sh", 'c', "/dev/ttys004", "%7", Some("$5")),
-            "/x/a.sh go c '/dev/ttys004' '%7' '$5'");
-        assert_eq!(launch_command("/x/a#b.sh", 'c', "it's", "%7", None), "/x/a##b.sh go c 'it'\\''s' '%7'");
-        assert!(launch_command("", 'c', "", "", None).ends_with("/.config/tmux/scripts/agent-launch.sh go c '' ''"));
+        let cmd = |sh: &str, act: Act, client: &str| launch_command(sh, &act, client, "%7", 4242);
+        assert_eq!(cmd("bash /x/a.sh", Act::Launch('x'), "/dev/ttys004").as_deref(),
+            Some("bash /x/a.sh go x '/dev/ttys004' '%7'"));
+        // ⌘⇧E: the picker, once this popup (pid 4242) is gone.
+        assert_eq!(cmd("/x/a.sh", Act::Pick('c'), "/dev/ttys004").as_deref(),
+            Some("/x/a.sh pick --after 4242 c '/dev/ttys004' '%7'"));
+        assert_eq!(cmd("/x/a#b.sh", Act::Launch('c'), "it's").as_deref(), Some("/x/a##b.sh go c 'it'\\''s' '%7'"));
+        assert_eq!(cmd("/x/a.sh", Act::Close, ""), None);
+        assert!(cmd("", Act::Launch('c'), "").unwrap().ends_with("/.config/tmux/scripts/agent-launch.sh go c '' '%7'"));
     }
 
     #[test]

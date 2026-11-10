@@ -345,12 +345,19 @@ config.keys = {
     -- sequence, \e[9140~, which tmux reads as one key (User27, set in
     -- spaces.conf above the %if, as the digit chords below): it opens the
     -- launcher popup (`agent-ui launch`), where ⏎ is claude and a letter
-    -- another agent (scripts/agent-launch.sh). Nothing else here, nor
-    -- WezTerm's defaults, uses CMD+E.
+    -- another agent (scripts/agent-launch.sh), in a new tab beside this one.
+    -- CMD+SHIFT+E: the same popup, then CMD+SHIFT+R's space picker for the
+    -- agent chosen: \e[9141~, User28. Nothing else here, nor WezTerm's
+    -- defaults (`wezterm show-keys`), uses CMD+E or CMD+SHIFT+E.
     {
         key = "e",
         mods = "CMD",
         action = wezterm.action.SendString("\x1b[9140~"),
+    },
+    {
+        key = "E",
+        mods = "CMD",
+        action = wezterm.action.SendString("\x1b[9141~"),
     },
 
     -- CMD+OPT+T: replace the current tab with a fresh shell, same cwd.

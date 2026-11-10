@@ -337,10 +337,12 @@ class Live(unittest.TestCase):
         self.assertRegex(notes, r"(?m)^\s*\?\s+Key help: every key, type to filter$")
 
     def test_cmd_e_opens_agent_ui_launch(self):
-        b = self.bound("root", "User27")
-        self.assertIn("display-popup -c '#{client_tty}' -E -B", b)
-        self.assertIn("-x '##{E:@popup_x}'", b)
-        self.assertIn("'#{@space_agent_ui}' launch --client '#{client_tty}' --pane '#{pane_id}'", b)
+        # ⌘E (User27) and ⌘⇧E (User28): the same popup, ⌘⇧E's with --pick-space.
+        for key, flag in (("User27", ""), ("User28", "--pick-space ")):
+            b = self.bound("root", key)
+            self.assertIn("display-popup -c '#{client_tty}' -E -B", b)
+            self.assertIn("-x '##{E:@popup_x}'", b)
+            self.assertIn(f"'#{{@space_agent_ui}}' launch {flag}--client '#{{client_tty}}' --pane '#{{pane_id}}'", b)
 
 
 @unittest.skipIf(TMUX is None, "no tmux")
@@ -357,10 +359,11 @@ class LiveWithoutAgentUi(Live):
         self.assertIn("List the keys (agent-ui draws the full help)", self.t("list-keys", "-N", "-T", "prefix"))
 
     def test_cmd_e_opens_agent_ui_launch(self):
-        # No binary: ⌘E only says so (no popup that would fail to start).
-        b = self.bound("root", "User27")
-        self.assertIn("launch: agent-ui is not installed", b)
-        self.assertNotIn("display-popup", b)
+        # No binary: ⌘E / ⌘⇧E only say so (no popup that would fail to start).
+        for key in ("User27", "User28"):
+            b = self.bound("root", key)
+            self.assertIn("launch: agent-ui is not installed", b)
+            self.assertNotIn("display-popup", b)
 
 
 if __name__ == "__main__":
