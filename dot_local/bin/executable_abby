@@ -94,11 +94,11 @@ GATEWAY_ENV = {
 # Notices acknowledged inside abby (its .claude.json is re-copied from the
 # live one each launch): carried over so they don't come back every launch.
 ACK_SUFFIXES = ("AcknowledgedAt", "Acknowledged", "Noticed", "Dismissed", "DismissedAt")
-# GLM-5.3 is tuned and benchmarked at max effort (Z.ai: "for complex tasks
-# such as coding, we recommend max"; abliteration's default for Large v2).
-# CC would send "high", which measured ~10x less thinking. /effort still
-# overrides it per session, and a level saved there sticks.
-DEFAULT_EFFORT = "max"
+# "high", not GLM's recommended "max" (2026-11-09): on abliteration, max
+# measured ~10x the thinking tokens (it bills by the token) and was the setting
+# its gateway swallowed responses at (see abby-guard). /effort max still works
+# per session, and a level saved there sticks.
+DEFAULT_EFFORT = "high"
 
 FLAGS_FILE = os.path.join(DST, "abby.settings.json")  # passed via --settings
 # abby keeps its own, never shares these. projects/ and history.jsonl keep
