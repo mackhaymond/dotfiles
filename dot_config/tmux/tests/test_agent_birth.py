@@ -83,7 +83,8 @@ class Shape(unittest.TestCase):
     def test_every_claude_tab_site_is_born_an_agent(self):
         sites = [l for p in (CONF, SPACES) for l in p.read_text().splitlines()
                  if "ZSH_AUTOSTART=claude" in l and not l.lstrip().startswith("#")]
-        self.assertEqual(len(sites), 6, sites)   # k + C-k in tmux.conf, spaces on, spaces off
+        # k + C-k in tmux.conf, spaces on, spaces off; ⌘E's ⏎ and ⌘E ⌘E (launch)
+        self.assertEqual(len(sites), 8, sites)
         for l in sites:
             # One birth per new-window, in the same command list.
             self.assertEqual(l.count('run-shell -C "#{?@agent_birth,#{@agent_birth} claude,}"'), l.count("new-window"), l)

@@ -125,6 +125,20 @@ notify_user() {
   fi
   return 0
 }
+# launch_sh ARGS: agent-launch.sh (⌘E: any agent in a new tab), @launch_sh,
+# else beside this script; through SPACE_TMUX_BIN's tmux.
+launch_sh() {
+  local s
+  local -a cmd
+  s="$(t show -gqv @launch_sh 2>/dev/null)"
+  if [[ -n "$s" ]]; then
+    read -ra cmd <<<"$s"   # a command line, as tmux runs it ("bash /path" in tests)
+  else
+    for s in "${SELF%/*}/agent-launch.sh" "${SELF%/*}/executable_agent-launch.sh"; do [[ -f "$s" ]] && break; done
+    cmd=(bash "$s")
+  fi
+  LAUNCH_TMUX_BIN="$TMUX_BIN" "${cmd[@]}" "$@"
+}
 # msg [-k KIND] TEXT: "space: TEXT" to CLIENT (else tmux's pick), through
 # SPACE_TMUX_BIN's tmux.
 msg() {
@@ -1117,7 +1131,10 @@ cmd_new_space() {
 # window, which its sync makes home: CLIENT lands there and no second shell is
 # added. A claude tab is an agent from birth: @agent_birth runs in the SAME
 # command list as its new-window (agent-birth.conf), so it never counts as a
-# shell, even for a moment.
+# shell, even for a moment. SPACE_LAUNCH=<id> in the environment (⌘E then
+# ⇧letter: agent-launch.sh pick opens pick-tab with it, and the picker's own
+# children inherit it) makes the agent tab that agent instead of claude,
+# opened by `agent-launch.sh open` (its command, kind and harness).
 #
 # home_now SID: the space SID made just now gets its home before a second
 # window lands in it (new-tab's claude tab, adopt-pending's window); see the
@@ -1175,7 +1192,13 @@ cmd_new_tab() {
 
   local -a cmd=(new-window -a -t "$sid:{end}" -c "${spath:-$HOME}" -P -F '#{window_id}')
   [[ "$kind" == agent ]] && cmd+=(-e ZSH_AUTOSTART=claude ";" run-shell -C '#{?@agent_birth,#{@agent_birth} claude,}')
-  wid="$(t "${cmd[@]}" 2>/dev/null)"
+  # ⌘E ⇧letter (agent-launch.sh pick): another agent than claude, opened by
+  # agent-launch.sh, which knows how each one is started and born.
+  if [[ "$kind" == agent && -n "${SPACE_LAUNCH:-}" && "$SPACE_LAUNCH" != claude ]]; then
+    wid="$(launch_sh open "$SPACE_LAUNCH" "$sid:{end}" "${spath:-$HOME}")"
+  else
+    wid="$(t "${cmd[@]}" 2>/dev/null)"
+  fi
   wid="${wid%%$'\n'*}"
   [[ "$wid" == @* ]] || { msg -k error "could not open a tab in $name"; return 1; }
   notify
@@ -1231,7 +1254,7 @@ cmd_pick_tab() {
       l = p; if (l == home) l = "~"; else if (index(l, home "/") == 1) l = "~" substr(l, length(home) + 1)
       print "d:" $0 "\t" l }')
 
-  local what=shell; [[ "$kind" == agent ]] && what=claude
+  local what=shell; [[ "$kind" == agent ]] && what="${SPACE_LAUNCH:-claude}"
   local out status query selection target
   picker_binds "$kind" "$client"
   # pipefail off in here: a pick made before every row has streamed in

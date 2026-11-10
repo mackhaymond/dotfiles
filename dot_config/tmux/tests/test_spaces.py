@@ -171,7 +171,10 @@ class ConfigShape(unittest.TestCase):
         got = dict(re.findall(r'^set -s user-keys\[(\d+)\] "\\e(\[\d+~)"$', head, re.M))
         want = {str(i): CHORD[(row, n)][1:] for i, (row, n) in
                 enumerate((row, n) for row in ("CTRL", "ALT", "CMD") for n in range(1, 10))}
+        # User27: CMD+E, the launch leader (agent-launch.sh).
+        want["27"] = "[9140~"
         self.assertEqual(got, want)
+        self.assertIn('SendString("\\x1b[9140~")', WEZTERM.read_text())
 
     def test_no_meta_j_k(self):
         # Claude Code binds meta+j (app:toggleTerminal); next/prev use M-l/M-h.
@@ -186,6 +189,9 @@ class ConfigShape(unittest.TestCase):
         self.assertIn("Enter", keys)
         jump = set(re.findall(r"^bind -T jump (\S+) ", on_branch(), re.M))
         self.assertEqual(set(keys) - jump, set())
+        # The same for ⌘E's `launch` table (above the %if: both modes).
+        launch = set(re.findall(r"^bind -T launch (\S+) ", SPACES.read_text(), re.M))
+        self.assertEqual(set(keys) - launch, set())
 
     def test_off_binds_prefix_meta_digits_to_windows(self):
         self.assertEqual([l.split()[5] for l in OFF_META if l.startswith("bind -N")], [f"M-{n}" for n in range(1, 10)])

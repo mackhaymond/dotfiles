@@ -341,6 +341,18 @@ config.keys = {
         }
     },
 
+    -- CMD+E: the LAUNCH leader (any coding agent in a new tab). ONE private
+    -- sequence, \e[9140~, which tmux reads as one key (User27, set in
+    -- spaces.conf above the %if, as the digit chords below): it arms tmux's
+    -- `launch` table, where ⏎ or CMD+E again is CMD+R's claude and a letter
+    -- another agent (scripts/agent-launch.sh). Nothing else here, nor
+    -- WezTerm's defaults, uses CMD+E.
+    {
+        key = "e",
+        mods = "CMD",
+        action = wezterm.action.SendString("\x1b[9140~"),
+    },
+
     -- CMD+OPT+T: replace the current tab with a fresh shell, same cwd.
     -- Sends `prefix R` to tmux (see `bind R` in tmux.conf).
     {
