@@ -55,7 +55,7 @@ fn pend_with(state: &str, extra: &[(&str, &str)], spaces: &str, scope: &str, str
 }
 
 /// [`pend_with`], `@spaces` on, every space shown.
-fn pend(state: &str, extra: &[(&str, &str)]) -> ViewModel {
+pub(super) fn pend(state: &str, extra: &[(&str, &str)]) -> ViewModel {
     pend_with(state, extra, "on", "all", false)
 }
 

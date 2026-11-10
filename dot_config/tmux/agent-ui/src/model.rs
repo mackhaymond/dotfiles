@@ -401,6 +401,147 @@ pub fn kind_glyph(kind: &str) -> Option<&'static str> {
     }
 }
 
+/// One harness's row of [`HARNESSES`]: its id (the `@agent_harness` /
+/// `@agent_kind` value), its AgentMarks glyph (a plane-16 private-use code
+/// point), its colour (a palette name, [`crate::palette`]) and its one-letter
+/// stand-in for text dumps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HarnessRow {
+    pub id: &'static str,
+    pub glyph: char,
+    pub hue: &'static str,
+    pub initial: char,
+}
+
+const fn h(id: &'static str, glyph: char, hue: &'static str, initial: char) -> HarnessRow {
+    HarnessRow { id, glyph, hue, initial }
+}
+
+/// EVERY harness the sidebar marks, ONE row each: a new harness is one line
+/// here (its id, its AgentMarks code point, its colour, its initial). The
+/// colours are brand-ish, from the palette, each holding 3:1 on every card
+/// surface (the zebra, the client's lift, the NEEDS YOU tints) and never a
+/// state's own hue (no `blue`, `yellow`, `green`, `red`, `violet`): Claude
+/// orange, Codex near-white, opencode teal, Grok grey (`sub`), Abby a true
+/// red (`h_abby`: apart from the failed state's pink-red); the rest grouped
+/// by brand (the monochrome brands near-white, the blue ones `sky` /
+/// `h_sapphire`, purple ones `mauve` / `lavender`, ...). Ids not yet set by
+/// any hook are still listed: the mark is ready when one is. The LAST row is
+/// OTHER, the mark of any id not listed (unset, `agent` included): faint
+/// (`overlay1`).
+pub const HARNESSES: [HarnessRow; 24] = [
+    h("claude", '\u{10C100}', "h_claude", 'C'),
+    h("codex", '\u{10C101}', "h_codex", 'X'),
+    h("opencode", '\u{10C102}', "teal", 'O'),
+    h("grok", '\u{10C103}', "sub", 'G'),
+    h("abby", '\u{10C104}', "h_abby", 'A'),
+    h("gemini", '\u{10C106}', "sky", 'E'),
+    h("cursor", '\u{10C107}', "h_codex", 'U'),
+    h("copilot", '\u{10C108}', "h_codex", 'P'),
+    h("amp", '\u{10C109}', "pink", 'M'),
+    h("cline", '\u{10C10A}', "h_codex", 'L'),
+    h("roo", '\u{10C10B}', "mauve", 'R'),
+    h("kilo", '\u{10C10C}', "h_gold", 'K'),
+    h("goose", '\u{10C10D}', "h_codex", 'H'),
+    h("qwen", '\u{10C10E}', "lavender", 'Q'),
+    h("kimi", '\u{10C10F}', "sub", 'I'),
+    h("warp", '\u{10C110}', "h_sapphire", 'W'),
+    h("windsurf", '\u{10C111}', "teal", 'F'),
+    h("droid", '\u{10C112}', "peach", 'D'),
+    h("devin", '\u{10C113}', "sky", 'V'),
+    h("auggie", '\u{10C114}', "h_flamingo", 'N'),
+    h("vibe", '\u{10C115}', "h_claude", 'Y'),
+    h("deepseek", '\u{10C116}', "h_sapphire", 'S'),
+    h("ollama", '\u{10C117}', "h_codex", 'J'),
+    h("other", '\u{10C105}', "overlay1", '?'),
+];
+
+/// Which HARNESS runs an agent: a row of [`HARNESSES`], what its sidebar
+/// card's harness mark ([`Harness::mark`], [`Harness::hue`]) says, under its
+/// letter. From the window's `@agent_harness` when set (a harness that runs
+/// on another one's hooks says so there: `abby`, whose `@agent_kind` is
+/// `claude`), else its `@agent_kind`; any id not in the table, unset
+/// included, is [`Harness::OTHER`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Harness(usize);
+
+impl std::fmt::Debug for Harness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Harness({})", self.name())
+    }
+}
+
+impl Default for Harness {
+    fn default() -> Harness {
+        Harness::OTHER
+    }
+}
+
+impl Harness {
+    /// The mark of an id the table does not list: its last row.
+    pub const OTHER: Harness = Harness(HARNESSES.len() - 1);
+
+    /// The AgentMarks font's CONTINUATION code point: one cell, blank on
+    /// its own; after a glyph it is part of that glyph's ligature.
+    pub const CONTINUATION: char = '\u{10C1FF}';
+
+    /// Every harness, in table order (OTHER last).
+    pub fn all() -> impl Iterator<Item = Harness> {
+        (0..HARNESSES.len()).map(Harness)
+    }
+
+    /// The harness with this id (trimmed, case-insensitive), else OTHER.
+    pub fn named(id: &str) -> Harness {
+        let id = id.trim();
+        HARNESSES.iter().position(|r| r.id.eq_ignore_ascii_case(id)).map_or(Harness::OTHER, Harness)
+    }
+
+    /// `@agent_harness` (wins when non-empty) else `@agent_kind` → the
+    /// harness ([`Harness::named`]): an unknown id in either place is OTHER.
+    pub fn of(harness: &str, kind: &str) -> Harness {
+        let h = harness.trim();
+        Harness::named(if h.is_empty() { kind } else { h })
+    }
+
+    fn row(self) -> &'static HarnessRow {
+        &HARNESSES[self.0]
+    }
+
+    /// Its id (`claude`, ..., `other`).
+    pub fn name(self) -> &'static str {
+        self.row().id
+    }
+
+    /// The harness's logo: ONE cell, a fixed code point of the AgentMarks
+    /// font (plane-16 private use, U+10C100..; the table row's own code
+    /// point, see the font's README; WezTerm's fallback font
+    /// draws it at a one-cell advance, and [`crate::text::wez::dwidth`]
+    /// counts it one).
+    pub fn glyph(self) -> char {
+        self.row().glyph
+    }
+
+    /// The 3-cell mark: the glyph and two [`Harness::CONTINUATION`]s, which
+    /// WezTerm shapes (one run: same fg, bg and attributes) into ONE logo
+    /// three cells wide and a full cell high. Three cells to
+    /// [`crate::text::wez::dwidth`].
+    pub fn mark(self) -> String {
+        [self.glyph(), Self::CONTINUATION, Self::CONTINUATION].iter().collect()
+    }
+
+    /// The mark's colour, a palette name ([`HARNESSES`]).
+    pub fn hue(self) -> &'static str {
+        self.row().hue
+    }
+
+    /// A one-letter stand-in for the glyph where the font is not there (a
+    /// text dump for people to read): C claude, X codex, O opencode, G grok,
+    /// A abby, ? other.
+    pub fn initial(self) -> char {
+        self.row().initial
+    }
+}
+
 /// agent-roster.py `DETAIL_WORD`: @agent_detail_kind as a word.
 pub fn detail_word(kind: &str) -> Option<&'static str> {
     match kind {
@@ -602,6 +743,64 @@ mod tests {
     use super::*;
     use crate::tmux::tests::row;
     use crate::tmux::Window;
+
+    /// `@agent_harness` beats `@agent_kind` (abby runs on claude's hooks);
+    /// each kind maps to its own; empty, unknown and junk are `Other`.
+    #[test]
+    fn harness_parses() {
+        let n = Harness::named;
+        assert_eq!(Harness::of("abby", "claude"), n("abby"));
+        assert_eq!(Harness::of(" Abby ", ""), n("abby"));
+        assert_eq!(Harness::of("", "claude").name(), "claude");
+        assert_eq!(Harness::of("  ", "codex").name(), "codex");
+        assert_eq!(Harness::of("", "opencode").name(), "opencode");
+        assert_eq!(Harness::of("", "grok").name(), "grok");
+        assert_eq!(Harness::of("", ""), Harness::OTHER);
+        assert_eq!(Harness::of("", "vim"), Harness::OTHER);
+        // A harness the sidebar does not know is no claude, whatever the kind.
+        assert_eq!(Harness::of("nanocoder", "claude"), Harness::OTHER);
+        assert_eq!(Harness::default(), Harness::OTHER);
+        assert_eq!(Harness::OTHER.name(), "other");
+        assert_eq!(format!("{:?}", n("abby")), "Harness(abby)");
+        // The table: ids, glyphs and initials unique; every glyph one cell
+        // of the AgentMarks block (never the continuation); every colour a
+        // palette name; OTHER last.
+        let ids: std::collections::BTreeSet<_> = HARNESSES.iter().map(|r| r.id).collect();
+        let glyphs: std::collections::BTreeSet<_> = HARNESSES.iter().map(|r| r.glyph).collect();
+        let inits: std::collections::BTreeSet<_> = HARNESSES.iter().map(|r| r.initial).collect();
+        assert!(ids.len() == HARNESSES.len() && glyphs.len() == HARNESSES.len() && inits.len() == HARNESSES.len());
+        assert_eq!(Harness::all().count(), HARNESSES.len());
+        assert_eq!(Harness::all().last(), Some(Harness::OTHER));
+        for h in Harness::all() {
+            assert!(crate::text::wez::AGENT_MARKS.contains(&(h.glyph() as u32)) && h.glyph() != Harness::CONTINUATION, "{h:?}");
+            assert_eq!(crate::text::wez::char_width(h.glyph()), 1, "{h:?}");
+            assert_eq!(crate::text::wez::dwidth(&format!(" {} ", h.glyph())), 3, "{h:?}");
+            // The ligature form: three cells, three clusters of one each.
+            assert_eq!(crate::text::wez::dwidth(&h.mark()), 3, "{h:?}");
+            assert_eq!(crate::text::wez::clusters(&h.mark()).iter().map(|c| c.1).collect::<Vec<_>>(), [1, 1, 1], "{h:?}");
+            assert_eq!(Harness::named(h.name()), h);
+            crate::palette::hex(h.hue());
+        }
+        // Today's fixed code points (the font's contract).
+        let mut fixed: Vec<(u32, &str)> = Harness::all().map(|h| (h.glyph() as u32, h.name())).collect();
+        fixed.sort();
+        let font = ["claude", "codex", "opencode", "grok", "abby", "other", "gemini", "cursor", "copilot", "amp", "cline",
+            "roo", "kilo", "goose", "qwen", "kimi", "warp", "windsurf", "droid", "devin", "auggie", "vibe", "deepseek", "ollama"];
+        let want: Vec<(u32, &str)> = font.iter().enumerate().map(|(k, id)| (0x10C100 + k as u32, *id)).collect();
+        assert_eq!(fixed, want);
+        // `agent` (a generic kind) is no harness of its own.
+        assert_eq!(n("agent"), Harness::OTHER);
+        assert_eq!(n(" Gemini "), Harness::of("", "gemini"));
+        // No harness wears a STATE's own colour.
+        for h in Harness::all() {
+            assert!(!["blue", "yellow", "green", "red", "violet", "dimblue", "dimteal"].contains(&h.hue()), "{h:?}");
+        }
+        assert_eq!(n("abby").initial(), 'A');
+        assert_eq!(Harness::CONTINUATION as u32, 0x10C1FF);
+        assert_eq!(crate::text::wez::char_width(Harness::CONTINUATION), 1);
+        assert!(crate::text::wez::AGENT_MARKS.contains(&0x10C1FF));
+        assert_eq!(n("codex").mark(), "\u{10C101}\u{10C1FF}\u{10C1FF}");
+    }
 
     /// ASKS WHILE WORK IS OUT: an agent waiting on Mack lands in NEEDS YOU
     /// (and its count, and its colour) whatever still runs beside it - a

@@ -229,6 +229,9 @@ pub struct Agent {
     /// @agent_kind (claude|codex|opencode|grok) and its glyph (✳ ⬢ U+F489 ✦).
     pub kind: String,
     pub kind_glyph: Option<&'static str>,
+    /// The harness running it (`@agent_harness`, else `@agent_kind`:
+    /// [`model::Harness::of`]): the sidebar card's mark under its letter.
+    pub harness: model::Harness,
     pub workflow: bool,
     pub cua: bool,
     /// `@agent_ask_bg` is set: a needs-input raised by a turn that ended
@@ -417,6 +420,7 @@ impl Agent {
             state_words: model::state_words(w),
             kind: w.kind.clone(),
             kind_glyph: model::kind_glyph(&w.kind),
+            harness: model::Harness::of(&w.harness, &w.kind),
             workflow: !w.workflow.is_empty(),
             cua: !w.cua.is_empty(),
             ask_bg: !w.ask_bg.is_empty(),
@@ -509,7 +513,8 @@ impl Agent {
             ("project", &self.project), ("short_title", &self.short_title),
             ("detail_kind", &self.detail_kind), ("detail_word", self.detail_word), ("detail", &self.detail),
             ("since", self.since), ("age", &self.age), ("state_words", self.state_words),
-            ("kind", &self.kind), ("kind_glyph", self.kind_glyph), ("workflow", self.workflow),
+            ("kind", &self.kind), ("kind_glyph", self.kind_glyph), ("harness", self.harness.name()),
+            ("workflow", self.workflow),
             ("cua", self.cua), ("ask_bg", self.ask_bg), ("bg_count", self.bg_count),
             ("flag", self.flag.map(|(f, c)| obj![
                 ("kind", match f { Flag::Workflow => "workflow", Flag::Cua => "cua" }),

@@ -44,24 +44,27 @@
 //!
 //!  NEEDS YOU                         1   (the count a square chip)
 //!  ▌  g  1Password Sign-ins    ✓ done    a heavy rail in the state colour,
-//!  ▌     Your four calls are done  4m    the key-cap solid
+//!  ▌  ✻  Your four calls are done  4m    the key-cap solid
 //!
 //!  AGENTS                ⌥V all spaces   (the scope: a key hint)
 //! ▌ 1  main   main            ◐2 ○3     the client's space: a BAND of its
 //!  ▎  d  Tmux Agent Sidebar ⠹ working    colour, a ▌ at the edge; ` N `
-//!  ▎     › Running cargo test     26s    solid, the name bold in it. A card:
+//!  ▎  ✻  › Running cargo test     26s    solid, the name bold in it. A card:
 //!  ▎  q  Pause Resume Agents  ✓ done     a rail in its state's colour, the
-//!  ▎     Merged the pause key      2m    key-cap (quiet: the letter in its
+//!  ▎  ⬢  Merged the pause key      2m    key-cap (quiet: the letter in its
 //!     h  Canvas Syllabus                 SPACE's colour on a tint; solid for
-//!        Synced 4 assignments      1h    the client's and asking / failed
+//!     ✻  Synced 4 assignments      1h    the client's and asking / failed
 //!     j  ❯ …/tmux/agent-ui               agents), the title, the state word
 //!     k  ❯ nvim  agent-ui                right; idle: no rail, no word. The
-//!                                        second line: the live blurb after
-//!   2  cs35l   main              ○1     a `›`, else a message; the age.
-//!  ▎  w  Eight Component Va… ✓ done      Then the space's SHELLS, one row
-//!  ▎     I wrote tic-tac-toe.txt  9s     each a sunken strip: the key-cap,
-//!                                        a green `❯`, the cwd, or the
-//!                                        command and its folder.
+//!                                        second line: the HARNESS MARK
+//!   2  cs35l   main              ○1     under the cap (✻ ⬢: its 3 cells,
+//!  ▎  w  Eight Component Va… ✓ done      one AgentMarks ligature), the
+//!  ▎  ✻  I wrote tic-tac-toe.txt  9s     live blurb after a `›`, else a
+//!                                        message; the age. Then the
+//!                                        space's SHELLS, one row each a
+//!                                        sunken strip: the key-cap, a green
+//!                                        `❯`, the cwd, or the command and
+//!                                        its folder (no mark: no harness).
 //!                                        The header IS the space's home.
 //!
 //!  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄   the dock: every space a row (⌘N
@@ -218,6 +221,31 @@
 //! letter on `crust`), a look no calm cap has. Windows without one show the
 //! cap blank; with no letter anywhere the column is not drawn.
 //!
+//! ## Harness marks
+//!
+//! Every FULL agent card (two rows: AGENTS, PINNED, NEEDS YOU, a pending
+//! space's claude) says which harness runs it ([`crate::model::Harness`]:
+//! `@agent_harness` when set, `abby` today, else `@agent_kind`; anything
+//! else is OTHER): its logo from the AgentMarks font (WezTerm's fallback,
+//! plane-16 private use: U+10C100 claude, ..01 codex, ..02 opencode, ..03
+//! grok, ..04 abby, ..05 other), on the second row in the key-cap's 3
+//! cells, exactly under the ` k ` cap ([`mark_lead`]). It is drawn as THREE
+//! code points, the glyph then the continuation U+10C1FF twice (each one
+//! cell; a continuation alone is blank), in ONE segment so the three cells
+//! share fg, bg and attributes: WezTerm shapes that run into one ligature,
+//! a logo 3 cells wide and a full cell high. Without a letter column the
+//! card's indent (3 cells) has no room for the ligature and its pads, so
+//! the bare one-cell glyph sits a pad after the rail. The colour is the
+//! harness's brand colour (`h_claude` orange, `h_codex` near-white,
+//! opencode `teal`, grok `sub`, `h_abby` a true red apart from the failed
+//! state's, other faint `overlay1`) on the card's own colour: the cells
+//! have no fill (one background per card); a selected card inks them crust
+//! like the rest. A PINNED card's ⌥W digit ([`pin_cap`]) therefore sits
+//! BESIDE its letter on the first row (the cells under the letter are the
+//! mark's). One-line cards, the folded idle tile and the shell rows and
+//! pills carry no mark: a mark needs the second row, and a shell has no
+//! harness.
+//!
 //! ## Scope
 //!
 //! [`crate::view::Scope`] (`@spaces` / `@strip_scope`): in SPACE scope the
@@ -241,8 +269,8 @@
 //! order (first pinned first: pinning another never moves one already
 //! there), each exactly as in its space (letter, state, rail, the client's
 //! lift, clicks), the zebra afresh, its second line naming its space before
-//! the age (`main · 4m`), and its ⌥W digit ([`pin_cap`]) under its letter (beside
-//! it on a one-line card). Global in BOTH scopes (that is what a pin is
+//! the age (`main · 4m`), and its ⌥W digit ([`pin_cap`]) beside its letter
+//! (under the letter is its harness mark, as on every card). Global in BOTH scopes (that is what a pin is
 //! for). NEEDS YOU still lists a pinned agent that asks. On the ladder the
 //! pins take the frame's card height but never fold, and the spaces
 //! collapse before a pin loses its card; only a frame too short for every
@@ -2593,8 +2621,8 @@ fn agent_bg(a: &Agent, k: usize, mine: bool) -> Ink {
 /// [`blinks`]), a pad, the title (`text`, bold
 /// for any state and for the client's), a flag (⚙ workflow, ◎ cua), and on
 /// the right the state's glyph and word bold in its colour (nothing when
-/// idle), the age beside it; with `two`, a second line under the title
-/// ([`says`]: `overlay2`, `sub` when it asks or failed, what it does now
+/// idle), the age beside it; with `two`, the harness mark under the
+/// key-cap ([`mark_lead`]) and a second line under the title ([`says`]: `overlay2`, `sub` when it asks or failed, what it does now
 /// after a blue `›`, your last prompt after a faint `> `, else a faint
 /// placeholder) with the age at its end, so every agent row is the same
 /// height; the insight's diff badge ([`extras`]) before
@@ -2631,10 +2659,10 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
         Flag::Workflow => seg(" ⚙", "teal"),
         Flag::Cua => seg(" ◎", if a.attention { "overlay2" } else { "blue" }),
     });
-    // A PINNED card's ⌥W digit ([`pin_cap`]): under its letter on the
-    // second line; on a one-line card, beside it.
+    // A PINNED card's ⌥W digit ([`pin_cap`]): beside its letter (the cap
+    // column's second line is the harness mark's, [`mark_lead`]).
     let pin = a.pin_key.filter(|_| tag.is_some() && cx.b.on).map(|n| pin_cap(n, bg, cx.b.loud));
-    let inline = pin.is_some() && msg.is_none();
+    let inline = pin.is_some();
     let lead = cx.b.lead() + if inline { BADGE_W + 1 } else { 0 };
     // A paused card with its second line says `paused` there: the first
     // line keeps just the ⏸ (one word once, not twice).
@@ -2693,7 +2721,7 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
         };
         left.extend([cap, seg(" ", "text")]);
     }
-    if let Some(p) = pin.clone().filter(|_| inline) {
+    if let Some(p) = pin.filter(|_| inline) {
         left.extend([p, seg(" ", "text")]);
     }
     left.push(title);
@@ -2782,11 +2810,9 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
         .map(|(l, f, t)| (right2(l, f, t), t))
         .find(|(x, t)| fits(x, *t))
         .map_or_else(|| right2(last, gone, None), |(x, _)| x);
-    let mut l2 = match pin {
-        // The ⌥W digit cap under the letter's, on the card grid (c3-c5).
-        Some(p) => vec![rail, seg(" ", "text"), p, seg(" ".repeat(indent - 1 - BADGE_W), "text")],
-        None => vec![rail, seg(" ".repeat(indent), "text")],
-    };
+    // The harness mark under the letter (a pinned card's ⌥W digit sits
+    // beside the letter on the first line, `inline`).
+    let mut l2 = mark_lead(a, rail, indent, cx.b.on);
     let mut chip = None;
     if word_below {
         let (line, at) = below(room(&r2));
@@ -2803,6 +2829,36 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
         second.targets.insert(0, (x0, x1, Target::LimitResume(a.window_id.clone())));
     }
     sel(vec![first, second])
+}
+
+/// The HARNESS MARK ([`crate::model::Harness`]): which harness runs the
+/// agent, its logo in its brand colour ([`crate::model::Harness::hue`]) on
+/// the card's own colour (no cap fill: one background per card). `wide`:
+/// the 3-cell form ([`crate::model::Harness::mark`]: the glyph and two
+/// continuations, ONE segment so all three cells share fg, bg and
+/// attributes, which WezTerm needs to ligate them into one 3-cell,
+/// full-height logo); else the bare one-cell glyph.
+fn harness_mark(a: &Agent, wide: bool) -> Seg {
+    let text = if wide { a.harness.mark() } else { a.harness.glyph().to_string() };
+    seg(text, a.harness.hue())
+}
+
+/// A full card's second-line lead (an agent card's, a NEEDS YOU card's):
+/// the rail, a pad, then the harness mark ([`harness_mark`]) in the key-cap
+/// column, its 3 cells exactly under the ` k ` cap (c3-c5), then pads to
+/// `indent` (`rail` + `indent` cells in all, as the plain indent it
+/// replaces). With no letter column the 3-cell mark sits a pad after the
+/// rail when a pad still follows it before the text; else (the 3-cell
+/// indent of a card without letters) the bare one-cell glyph does. A plain
+/// window (no state) gets the plain indent.
+fn mark_lead(a: &Agent, rail: Seg, indent: usize, letters: bool) -> Vec<Seg> {
+    if a.cat.is_none() || indent < 3 {
+        return vec![rail, seg(" ".repeat(indent), "text")];
+    }
+    // (pad, mark, pad): the wide mark needs a pad on both sides.
+    let wide = letters || indent >= BADGE_W + 2;
+    let w = if wide { BADGE_W } else { 1 };
+    vec![rail, seg(" ", "text"), harness_mark(a, wide), seg(" ".repeat(indent - 1 - w), "text")]
 }
 
 /// A pinned card's digit as a key-cap (` 1 `, [`BADGE_W`] wide): ⌥W then
@@ -3488,7 +3544,9 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
     let mut rows = vec![card(bg, first, right)];
     if lines >= 2 {
         let indent = if cx.b.on { lead - 1 } else { 3 };
-        let mut l2 = vec![rail(), seg(" ".repeat(indent), "text")];
+        // The harness mark under the solid letter cap ([`mark_lead`]).
+        let mut l2 = mark_lead(a, rail(), indent, cx.b.on);
+        let head = l2.len();
         if n.reason.is_empty() {
             l2.push(seg(n.reason_word.clone(), hue));
         } else {
@@ -3498,7 +3556,7 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
             l2.push(seg(plain(&n.reason), "text"));
         }
         if answering {
-            let room = iw.saturating_sub(width(&l2[..2]) + 1);
+            let room = iw.saturating_sub(width(&l2[..head]) + 1);
             let (chips, spans) = answer_chips(room);
             let at = (margin(w) + iw - 1 - width(&chips)) as u16;
             let mut r2 = vec![seg(" ", "text")];
@@ -3515,7 +3573,7 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
         }
         // The diff badge before the age, while the reason keeps its whole
         // or DOING_MIN cells (its file count first to go).
-        let tw = width(&l2[2..]);
+        let tw = width(&l2[head..]);
         let right2 = |level: u8| {
             let (mut r, span) = extras(a, level, bg, dim(true));
             r.extend(age.clone());
@@ -3525,7 +3583,7 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
         let (r2, span) = (0..2)
             .map(right2)
             .find(|(r, span)| {
-                let used = width(&l2[..2]) + width(r);
+                let used = width(&l2[..head]) + width(r);
                 span.is_some() && used <= iw && iw - used >= tw.clamp(1, DOING_MIN)
             })
             .unwrap_or_else(|| right2(EXTRA_LEVELS - 1));

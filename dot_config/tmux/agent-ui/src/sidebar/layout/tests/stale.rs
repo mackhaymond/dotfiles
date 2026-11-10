@@ -27,9 +27,10 @@ fn ins(diff: Option<(u64, u64, usize)>, known: bool) -> Insight {
     }
 }
 
-/// A row's words, single-spaced, past its margin and rail.
+/// A row's words, single-spaced, past its margin and rail (a harness mark
+/// read as a blank, [`unmark`]).
 fn words(l: &str) -> String {
-    body(l).split_whitespace().collect::<Vec<_>>().join(" ")
+    body(&unmark(l)).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Agent @1 in state `st` since `ago` seconds.

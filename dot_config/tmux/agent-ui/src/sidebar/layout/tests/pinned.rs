@@ -243,9 +243,10 @@ fn seg_col(r: &Row, text: &str) -> Option<usize> {
     None
 }
 
-/// ⌥W then 1-9: a two-line pinned card wears its digit as a cap UNDER its
-/// letter (no title room lost); a one-line card beside it; the PINNED
-/// header hints `⌥W 1-2`; no digit anywhere else.
+/// ⌥W then 1-9: a pinned card wears its digit as a cap BESIDE its letter
+/// (two-line and one-line alike: under the letter is the harness mark's
+/// cell, as on every card); the PINNED header hints `⌥W 1-2`; no digit
+/// anywhere else.
 #[test]
 fn pinned_cards_wear_their_key() {
     let v = lettered(keyed(pinned_quiet()));
@@ -256,8 +257,12 @@ fn pinned_cards_wear_their_key() {
     for (y, n) in [(p + 1, 1), (p + 3, 2)] {
         let a = v.pins_split().pinned[n - 1].clone();
         let letter = format!(" {} ", a.letter.unwrap());
-        let (lx, dx) = (seg_col(&f.rows[y], &letter), seg_col(&f.rows[y + 1], &format!(" {n} ")));
-        assert!(lx.is_some() && lx == dx, "{y}: {lx:?} {dx:?} {t:#?}");
+        let (lx, dx) = (seg_col(&f.rows[y], &letter), seg_col(&f.rows[y], &format!(" {n} ")));
+        assert!(lx.is_some() && dx == lx.map(|x| x + BADGE_W + 1), "{y}: {lx:?} {dx:?} {t:#?}");
+        // Under the letter's cap, its 3-cell harness mark; no digit on the
+        // second line.
+        assert_eq!(seg_col(&f.rows[y + 1], &a.harness.mark()), lx, "{y}: {t:#?}");
+        assert_eq!(seg_col(&f.rows[y + 1], &format!(" {n} ")), None, "{y}: {t:#?}");
     }
     // Only PINNED cards wear one.
     // (Cards only: NEEDS YOU's count is a ` 1 ` chip of its own.)
@@ -286,10 +291,10 @@ fn armed_jump_inverts_the_pin_digits() {
     let armed = Opts { bar: Bar { jump: true, ..Bar::default() }, ..Opts::default() };
     let f = layout(&v, 34, 70, &armed);
     let p = f.pinned.start;
-    assert!(f.rows[p + 2].segs.contains(&block(" 1 ", ARMED.0, ARMED.1)), "{:?}", f.rows[p + 2].segs);
-    assert!(f.rows[p + 4].segs.contains(&block(" 2 ", ARMED.0, ARMED.1)), "{:?}", f.rows[p + 4].segs);
+    assert!(f.rows[p + 1].segs.contains(&block(" 1 ", ARMED.0, ARMED.1)), "{:?}", f.rows[p + 1].segs);
+    assert!(f.rows[p + 3].segs.contains(&block(" 2 ", ARMED.0, ARMED.1)), "{:?}", f.rows[p + 3].segs);
     let calm = layout(&v, 34, 70, &Opts::default());
-    assert!(!calm.rows[p + 2].segs.iter().any(|s| s.text == " 1 " && s.fg == Ink::Pal(ARMED.0)), "{:?}", calm.rows[p + 2].segs);
+    assert!(!calm.rows[p + 1].segs.iter().any(|s| s.text == " 1 " && s.fg == Ink::Pal(ARMED.0)), "{:?}", calm.rows[p + 1].segs);
 }
 
 /// While prefix v's selection is live, PINNED goes: every pinned agent sits

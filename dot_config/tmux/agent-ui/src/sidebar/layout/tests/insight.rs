@@ -42,9 +42,10 @@ fn second(x: A, i: Option<Insight>, blurb: Option<&str>) -> (String, Row) {
     (words(&f.rows[y].text()), f.rows[y].clone())
 }
 
-/// A row's words, single-spaced, past its margin and rail.
+/// A row's words, single-spaced, past its margin and rail (a harness mark
+/// read as a blank, [`unmark`]).
 fn words(l: &str) -> String {
-    body(l).split_whitespace().collect::<Vec<_>>().join(" ")
+    body(&unmark(l)).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 const TODO: &str = "Wiring the badge";
@@ -188,7 +189,7 @@ fn the_badge_clicks_into_the_diff() {
         assert_eq!(f.target(x0, y as u16 - 1).cloned(), go("@1"));
         // NEEDS YOU: its reason, then the badge before the age.
         let n = f.needs.clone().find(|&y| f.rows[y].text().contains("Deck")).unwrap() + 1;
-        let l = f.rows[n].text();
+        let l = unmark(&f.rows[n].text());
         assert!(body(&l).starts_with("Which?") && l.contains("+2 −1"), "{width}: {l:?}");
         assert_eq!(f.target(col(&l, "+2"), n as u16).cloned(), diff("@2"));
         assert_eq!(f.target(col(&l, "Which"), n as u16).cloned(), go("@2"));

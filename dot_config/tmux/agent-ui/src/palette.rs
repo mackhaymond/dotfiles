@@ -62,12 +62,27 @@ pub const HEX: [(&str, &str); 18] = [
 /// every paused agent has stopped, and the banner matches. (It was white
 /// for an evening; Mack: "solid white is no good".) Banner chrome, no agent
 /// state: no other surface draws either (a paused card stays `violet`).
-pub const UI: [(&str, &str); 14] = [
+///
+/// `h_*` are HARNESS brand colours, the sidebar card's harness mark under
+/// its letter ([`crate::model::Harness::hue`]; opencode wears `teal`, grok
+/// `sub`, an unknown harness `overlay1`): a mark of WHO runs the agent, never
+/// a state. `h_claude` is Claude's orange (#d97757) lifted a step so it
+/// holds 3:1 on the client's lift (`tile_me`; the brand's own is 2.8:1
+/// there); `h_codex` near-white; `h_abby` a TRUE red (hue 0°), kept apart
+/// from the failed state's catppuccin `red` (a pink red, 343°; ΔRGB 77):
+/// `red` itself or `maroon` (#eba0ac, ΔRGB 23) would read as `✕ error` on a
+/// red NEEDS YOU card. `h_gold` (catppuccin frappé yellow, kilo), `h_sapphire`
+/// (mocha sapphire, the blue brands: warp, deepseek) and `h_flamingo` (mocha
+/// flamingo, auggie) widen the set without wearing a state's hue (`yellow`,
+/// `blue`); the other harnesses reuse palette names ([`crate::model::HARNESSES`]).
+pub const UI: [(&str, &str); 20] = [
     ("base", "#1e1e2e"), ("mantle", "#181825"), ("surface2", "#585b70"),
     ("mauve", "#cba6f7"), ("sel", "#2a2b3d"),
     ("overlay2", "#9399b2"), ("tile", "#30314a"), ("tile_lo", "#28283b"),
     ("tile_hi", "#31394f"), ("overlay1", "#7f849c"), ("tile_me", "#474a66"),
     ("term", "#1e1e2e"), ("dimviolet", "#6c5bd9"), ("cyan", "#00d9ff"),
+    ("h_claude", "#e08560"), ("h_codex", "#e6e6e6"), ("h_abby", "#ff6666"),
+    ("h_gold", "#e5c890"), ("h_sapphire", "#74c7ec"), ("h_flamingo", "#f2cdcd"),
 ];
 
 /// The `#rrggbb` for a palette name ([`HEX`] first, then [`UI`]). Panics on
@@ -282,6 +297,31 @@ mod tests {
         for hue in ["yellow", "red", "green"] {
             assert!(dist(mix_rgb(hue, 14), mix_rgb(hue, 9)) >= 12.0, "{hue}");
         }
+    }
+
+    /// The harness marks read (3:1, the non-text bar) on every card surface
+    /// they sit on: the zebra, the client's lift, the NEEDS YOU tints; the
+    /// unknown harness's faint mark still reads on the zebra. Abby's red
+    /// stays plainly apart from the failed state's `red` (and from Claude).
+    #[test]
+    fn harness_marks_read_on_every_card() {
+        let dist = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            let d = |x: u8, y: u8| (f64::from(x) - f64::from(y)).powi(2);
+            (d(a.0, b.0) + d(a.1, b.1) + d(a.2, b.2)).sqrt()
+        };
+        let cards = [rgb("tile"), rgb("tile_lo"), rgb("tile_me"), mix_rgb("yellow", 14), mix_rgb("yellow", 9),
+            mix_rgb("red", 14), mix_rgb("red", 9), mix_rgb("green", 14), mix_rgb("green", 9)];
+        // Every row of the table but OTHER (its own faint bar below).
+        let marks = crate::model::Harness::all().filter(|&h| h != crate::model::Harness::OTHER).map(|h| h.hue());
+        for h in marks {
+            for bg in cards {
+                assert!(contrast(rgb(h), bg) >= 3.0, "{h} on {bg:?}: {:.2}", contrast(rgb(h), bg));
+            }
+        }
+        for bg in [rgb("tile"), rgb("tile_lo")] {
+            assert!(contrast(rgb("overlay1"), bg) >= 3.0);
+        }
+        assert!(dist(rgb("h_abby"), rgb("red")) >= 60.0 && dist(rgb("h_abby"), rgb("h_claude")) >= 40.0);
     }
 
     #[test]

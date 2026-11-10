@@ -183,8 +183,43 @@ fn all() -> Vec<(&'static str, ViewModel)> {
     vec![("quiet", quiet()), ("busy", busy()), ("extreme", extreme()), ("empty", empty())]
 }
 
+/// Every row's text, a harness mark read as the blank cell it fills
+/// ([`unmark`]): the layout assertions say where things sit; the marks are
+/// asserted on their own (tests/harness.rs).
 fn texts(f: &Frame) -> Vec<String> {
-    f.rows.iter().map(Row::text).collect()
+    f.rows.iter().map(|r| unmark(&r.text())).collect()
+}
+
+/// `s` with each harness mark (the AgentMarks font's one-cell glyphs,
+/// [`crate::model::Harness::glyph`]) as a space: same cells, plain text.
+fn unmark(s: &str) -> String {
+    s.chars().map(|c| if crate::text::wez::AGENT_MARKS.contains(&(c as u32)) { ' ' } else { c }).collect()
+}
+
+/// `s` with each harness mark as its harness's initial (`C` claude, `A`
+/// abby, ...), the 3-cell ligature (glyph + two continuations) as `[C]`, a
+/// stray continuation as a blank: a render people can read without the
+/// font, cell for cell.
+fn initials(s: &str) -> String {
+    use crate::model::Harness;
+    let cont = Harness::CONTINUATION;
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < cs.len() {
+        match Harness::all().find(|h| h.glyph() == cs[i]) {
+            Some(h) if cs.get(i + 1) == Some(&cont) && cs.get(i + 2) == Some(&cont) => {
+                out.push_str(&format!("[{}]", h.initial()));
+                i += 3;
+                continue;
+            }
+            Some(h) => out.push(h.initial()),
+            None if cs[i] == cont => out.push(' '),
+            None => out.push(cs[i]),
+        }
+        i += 1;
+    }
+    out
 }
 
 fn find(f: &Frame, needle: &str) -> usize {
@@ -3300,6 +3335,7 @@ fn held_rows_are_capped() {
 
 mod answer;
 mod bare;
+mod harness;
 mod insight;
 mod keys;
 mod pending;

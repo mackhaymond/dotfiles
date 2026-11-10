@@ -129,7 +129,11 @@ whole UI and the tmux status line is off. Top to bottom:
   lavender right edge). Under it each agent is a two-line tile with its
   letter badge; a working agent's second line is a live activity blurb
   (`› Running cargo test`, `› Editing layout.rs`, read from its transcript),
-  after it finishes the start of its reply. Then the space's non-home
+  after it finishes the start of its reply. Under the letter, on that
+  second line, a 3-cell logo shows the agent's HARNESS (Claude orange,
+  Codex white, Grok grey, OpenCode teal, abby red, robot = unknown), drawn
+  from the AgentMarks font (`dot_config/wezterm/agent-marks/README.md`);
+  the harness is `@agent_harness` (e.g. `abby`) else `@agent_kind`. Then the space's non-home
   shells, one row each: letter cap, a faint terminal glyph (nf-fa-terminal,
   U+F120), the folder (at a prompt) or the running command; Mack's own
   shell lifted like his own agent card. With little room, 2+ shells fold

@@ -463,11 +463,23 @@ pub mod wez {
         (0x11F34, 0x11F35, 0), (0x11F3E, 0x11F3F, 0), (0x16F51, 0x16F87, 0),
     ];
 
+    /// The AgentMarks font's block: the harness glyphs (U+10C100..,
+    /// [`crate::model::Harness::glyph`]) through the continuation U+10C1FF
+    /// ([`crate::model::Harness::CONTINUATION`]), each one cell.
+    pub const AGENT_MARKS: std::ops::RangeInclusive<u32> = 0x10C100..=0x10C1FF;
+
     /// One code point inside a cluster, as WezTerm sums it ([`WEZ_WIDTH`]
     /// first): zero for a joiner, a variation selector, a format character
     /// (the soft hyphen too) or a mark.
     pub fn char_width(c: char) -> usize {
         let o = c as u32;
+        // The AgentMarks font's harness logos ([`crate::model::Harness`]):
+        // plane-16 private use, one cell in WezTerm (East Asian Ambiguous,
+        // narrow by default; the fallback font's advance is one cell). Said
+        // outright so no width table can ever make a card a cell off.
+        if AGENT_MARKS.contains(&o) {
+            return 1;
+        }
         if o >= 0x903 {
             let i = WEZ_WIDTH.partition_point(|&(_, last, _)| last < o);
             if let Some(&(_, _, w)) = WEZ_WIDTH.get(i).filter(|&&(first, _, _)| first <= o) {
