@@ -42,6 +42,7 @@ the sidebar should map to the mark, e.g. as the window's `@agent_kind`.
 | U+10C115  | `vibe`     | Mistral Vibe (`vibe`)          | Mistral pixel "M"                         | Simple Icons `mistralai`                | CC0     |
 | U+10C116  | `deepseek` | DeepSeek                       | DeepSeek whale                            | Simple Icons `deepseek`                 | CC0     |
 | U+10C117  | `ollama`   | Ollama (`ollama`)              | Ollama llama                              | Simple Icons `ollama`                   | CC0     |
+| U+10C118  | `agy`      | Google Antigravity CLI (`agy`) | Antigravity arch                          | antigravity.google `favicon.svg`        | vendor  |
 | U+10C1FF  | `cont`     | (continuation)                 | blank, one cell; only used in sequences   | none                                    |         |
 
 The process names are best-effort detection hints for harnesses that ship a terminal CLI; verify against `ps` before relying on one. They are not part of the font. Simple Icons
@@ -148,6 +149,8 @@ dotfiles setup and is not affiliated with or endorsed by any of them.
   three bars without the background square), `droid`
   (`https://factory.ai/favicon.svg`, the light mark without the black
   square), `auggie` (`https://augmentcode.com/favicon.svg`, both paths, its
-  colour style dropped).
+  colour style dropped), `agy` (`https://antigravity.google/favicon.svg`, the
+  arch outline only, without the background circle and gradient overlays; the
+  same outline as lobe-icons 1.100.0 `antigravity`, MIT).
 - `agent.svg`: drawn for this repo; public domain.
 - `build.py`, `proof.py`: same licence as this repository.

@@ -63,6 +63,7 @@ MARKS = [  # (codepoint, glyph name, svg file stem, optical scale)
     (0x10C115, "vibe", "vibe", 1.00),
     (0x10C116, "deepseek", "deepseek", 1.00),
     (0x10C117, "ollama", "ollama", 1.00),
+    (0x10C118, "agy", "agy", 1.00),
 ]
 
 # JetBrains Mono 2.x metrics (head.unitsPerEm, hmtx advance, hhea/OS2 typo
