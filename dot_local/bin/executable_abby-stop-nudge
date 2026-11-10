@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""abby-stop-nudge: abby's Stop hook (wired by ~/.local/bin/abby; abby-only).
+
+GLM-5.3 (abliterated-model-large-v2) sometimes ends its turn right after
+announcing an action ("Launching it now:") without emitting the tool call, or
+ends with a thinking block and nothing else. Measured 2026-11-09 through a
+logging proxy: the stream really ends there (stop_reason end_turn, output
+tokens match the visible text), so nothing is lost in transit. It is
+self-reinforcing: once one such stop is in the context, "continue" tends to
+produce another.
+
+When the turn's last assistant message has no tool call and either no text or
+text ending in ":", this blocks the stop once with a reason that tells the
+model to make the call. stop_hook_active (set while continuing from a Stop
+hook) means at most one nudge per natural stop, so it can never loop.
+"""
+import json
+import os
+import sys
+
+
+def last_assistant(path):
+    """Content blocks of the transcript's last assistant message (CC writes one
+    line per block, sharing message.id)."""
+    blocks, mid = [], None
+    try:
+        with open(path, errors="replace") as f:
+            lines = f.readlines()[-200:]
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("type") == "user" and not row.get("isMeta"):
+            content = (row.get("message") or {}).get("content")
+            # A real user turn (not a tool result) ends the search.
+            if isinstance(content, str) or not any(
+                    isinstance(b, dict) and b.get("type") == "tool_result" for b in content or []):
+                break
+            if mid is not None:
+                break
+            continue
+        if row.get("type") != "assistant":
+            continue
+        msg = row.get("message") or {}
+        if msg.get("model") == "<synthetic>":
+            continue
+        if mid is None:
+            mid = msg.get("id")
+        elif msg.get("id") != mid:
+            break
+        blocks[:0] = [b for b in msg.get("content") or [] if isinstance(b, dict)]
+    return blocks if mid is not None else None
+
+
+def main():
+    try:
+        hook = json.load(sys.stdin)
+    except ValueError:
+        return
+    if hook.get("stop_hook_active"):
+        return
+    if os.environ.get("ABBY_NUDGE_DEBUG"):
+        with open(os.environ["ABBY_NUDGE_DEBUG"], "a") as f:
+            f.write(json.dumps(hook) + "\n")
+    # CC passes the final message's text; the transcript may not be flushed
+    # yet when Stop fires, so it is only the fallback for older CC builds.
+    text = hook.get("last_assistant_message")
+    if text is None:
+        blocks = last_assistant(hook.get("transcript_path") or "")
+        if blocks is None or any(b.get("type") == "tool_use" for b in blocks):
+            return
+        text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+    text = text.rstrip()
+    if text and not text.endswith(":"):
+        return
+    why = ("Your last message announced a next step but contained no tool call, so the turn "
+           "ended." if text else "Your last message had no visible text and no tool call, so "
+           "the turn ended.")
+    print(json.dumps({
+        "decision": "block",
+        "reason": why + " Make the tool call now. If the task is actually finished or you "
+                  "need the user, say so in one line instead.",
+    }))
+
+
+if __name__ == "__main__":
+    main()

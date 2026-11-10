@@ -123,9 +123,13 @@ TINT_ON = (f'[ -n "$TMUX_PANE" ] && {_tmux} set -p -t "$TMUX_PANE" window-style 
            f'\\; set -p -t "$TMUX_PANE" window-active-style "bg={TINT}" >/dev/null 2>&1; true')
 TINT_OFF = (f'[ -n "$TMUX_PANE" ] && {_tmux} set -pu -t "$TMUX_PANE" window-style '
             f'\\; set -pu -t "$TMUX_PANE" window-active-style >/dev/null 2>&1; true')
+# GLM sometimes ends a turn right after "Doing X now:" with no tool call; this
+# Stop hook nudges it once to make the call (see the script's docstring).
+STOP_NUDGE = os.path.join(HOME, ".local", "bin", "abby-stop-nudge")
 LOOK_HOOKS = {
     "SessionStart": [{"hooks": [{"type": "command", "command": TINT_ON}]}],
     "SessionEnd": [{"hooks": [{"type": "command", "command": TINT_OFF}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": shlex.quote(STOP_NUDGE)}]}],
 }
 # Versioned: bump the name when is_abby_transcript's rule changes, so files
 # cached as "not abby" under the old rule get looked at again.
