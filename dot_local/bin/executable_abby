@@ -35,9 +35,12 @@ Key: keychain item "abliteration-api-key":
 One-off model: abby --model abliterated-model
 """
 import copy
+import hashlib
 import json
 import os
+import plistlib
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -56,8 +59,18 @@ MAIN = "abliterated-model-large-v2[1m]"
 FAST = "abliterated-model-large-flash[1m]"
 AUTO_COMPACT_WINDOW = 400_000  # 1M models: compact at ~400K, not ~1M
 
+UPSTREAM = "https://api.abliteration.ai"
+# abby-guard (its own script): a local pass-through that retries the requests
+# abliteration's gateway answers with nothing (content swallowed, tokens
+# billed). A launchd agent on a fixed port, since settings are shared by every
+# abby session; abby installs it and falls back to UPSTREAM if it won't start.
+GUARD = os.path.join(HOME, ".local", "bin", "abby-guard")
+GUARD_PORT = 8789
+GUARD_LABEL = "com.mackhaymond.abby-guard"
+GUARD_PLIST = os.path.join(HOME, "Library", "LaunchAgents", GUARD_LABEL + ".plist")
+
 GATEWAY_ENV = {
-    "ANTHROPIC_BASE_URL": "https://api.abliteration.ai",
+    "ANTHROPIC_BASE_URL": UPSTREAM,  # or the guard's URL; see main()
     # Aliases used by subagents ("opus"/"sonnet"/"haiku") and background work.
     "ANTHROPIC_DEFAULT_FABLE_MODEL": MAIN,
     "ANTHROPIC_DEFAULT_OPUS_MODEL": MAIN,
@@ -347,9 +360,7 @@ def overlay(live):
     return {
         **look(live),
         "env": {**(live.get("env") or {}), **GATEWAY_ENV,
-                # ABBY_BASE_URL: point one launch at a local logging proxy.
-                **({"ANTHROPIC_BASE_URL": os.environ["ABBY_BASE_URL"]}
-                   if os.environ.get("ABBY_BASE_URL") else {})},
+                "ANTHROPIC_BASE_URL": BASE_URL[0]},
         "apiKeyHelper": shlex.join(KEY_CMD),
         "modelPicker": PICKER,
         # Remote Control and model auto-switching assume a claude.ai account.
@@ -406,10 +417,65 @@ def build_global_config():
     write_atomic(path, cfg)
 
 
+BASE_URL = [UPSTREAM]  # set by main()
+
+
+def guard_up():
+    try:
+        socket.create_connection(("127.0.0.1", GUARD_PORT), timeout=0.3).close()
+        return True
+    except OSError:
+        return False
+
+
+def ensure_guard():
+    """The guard's URL once it answers, else UPSTREAM (abby still works)."""
+    if not os.access(GUARD, os.X_OK):
+        return UPSTREAM
+    with open(GUARD, "rb") as f:
+        rev = hashlib.sha256(f.read()).hexdigest()[:12]
+    want = plistlib.dumps({
+        "Label": GUARD_LABEL,
+        "ProgramArguments": [os.path.realpath(sys.executable), "-I", GUARD],
+        # A new guard script changes the plist, which reloads the agent.
+        "EnvironmentVariables": {"ABBY_GUARD_PORT": str(GUARD_PORT), "ABBY_GUARD_REV": rev},
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardErrorPath": os.path.join(DST, "guard.err"),
+    })
+    try:
+        with open(GUARD_PLIST, "rb") as f:
+            have = f.read()
+    except OSError:
+        have = None
+    domain = f"gui/{os.getuid()}"
+    run = lambda *a: subprocess.run(["launchctl", *a], capture_output=True)
+    if have != want:
+        os.makedirs(os.path.dirname(GUARD_PLIST), exist_ok=True)
+        with open(GUARD_PLIST, "wb") as f:
+            f.write(want)
+        run("bootout", f"{domain}/{GUARD_LABEL}")
+        for _ in range(20):  # bootout returns before the port is free
+            if not guard_up():
+                break
+            time.sleep(0.1)
+        run("bootstrap", domain, GUARD_PLIST)
+    elif not guard_up():
+        run("kickstart", f"{domain}/{GUARD_LABEL}")
+    for _ in range(30):
+        if guard_up():
+            return f"http://127.0.0.1:{GUARD_PORT}"
+        time.sleep(0.1)
+    print(f"abby: abby-guard didn't start (see {DST}/guard.err); going direct", file=sys.stderr)
+    return UPSTREAM
+
+
 def main():
     if not os.path.isdir(SRC):
         die(f"{SRC} not found")
     check_key()
+    # ABBY_BASE_URL: point one launch at a local logging proxy instead.
+    BASE_URL[0] = os.environ.get("ABBY_BASE_URL") or ensure_guard()
     link_tree()
     link_memory(os.getcwd())
     migrate_sessions()
