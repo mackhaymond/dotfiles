@@ -260,6 +260,11 @@ pub struct Bar {
     /// It is `jump` (⌥W armed): the letter key-caps turn peach and the
     /// card says `⌥W jump · type a letter`.
     pub jump: bool,
+    /// It is `launch` (⌘E armed, spaces.conf / agent-launch.sh): the
+    /// installed agents from `@launch_agents`, each its ⌘E letter and its
+    /// harness ([`launch_agents`]), for the ` ⌘E launch ` mark. None while
+    /// another table is.
+    pub launch: Option<Vec<(char, crate::model::Harness)>>,
     /// Empty when no usage option is set at all (no usage line).
     pub usage: Vec<Usage>,
     /// `@resurrect_stale` in words (`last save 2h ago`, `save refused`).
@@ -280,6 +285,11 @@ pub struct Bar {
     /// `@agent_limit_autoresume` is `off` ([`crate::tmux::Status::limit_autoresume`]):
     /// the rate-limit banner says `auto off`. False (on) without a client row.
     pub limit_auto_off: bool,
+    /// `@space_fold_hours` read ([`crate::view::fold_after`], seconds; 0:
+    /// off): how long without a prompt from Mack before a space folds as
+    /// dormant and an idle agent into its idle line. None (no client row):
+    /// the default.
+    pub fold_after: Option<i64>,
 }
 
 // ---------------------------------------------------------------- toasts
@@ -414,6 +424,7 @@ impl Bar {
             };
             bar.toasts = Toast::parse_all(&st.toast).into_iter().filter(|t| t.for_client(client)).collect();
             bar.stale_after = Some(crate::view::stale_after(&st.stale_after));
+            bar.fold_after = Some(crate::view::fold_after(&st.fold_hours));
             bar.limit_auto_off = !st.limit_autoresume();
         }
         let mut flagged: Vec<&str> = snap.windows.iter().filter(|w| w.stash_sel).map(|w| w.id.as_str()).collect();
@@ -426,6 +437,9 @@ impl Bar {
         let Some(me) = me else { return bar };
         bar.prefix = me.status.key_table == "prefix";
         bar.jump = me.status.key_table == "jump";
+        if me.status.key_table == "launch" {
+            bar.launch = Some(launch_agents(&me.status.launch_agents));
+        }
         let session = if me.session.is_empty() {
             snap.rows(&me.window_id).next().map(|w| w.session.clone()).unwrap_or_default()
         } else {
@@ -445,6 +459,21 @@ impl Bar {
         });
         bar
     }
+}
+
+/// `@launch_agents` (agent-launch.sh refresh: `c:claude a:abby x:codex …`,
+/// the installed agents in its table's order) → (letter, harness) pairs. A
+/// word that is not `letter:id` is skipped; an id the harness table does not
+/// list is [`crate::model::Harness::OTHER`] (aider's faint mark).
+pub fn launch_agents(raw: &str) -> Vec<(char, crate::model::Harness)> {
+    raw.split_whitespace()
+        .filter_map(|w| {
+            let (k, id) = w.split_once(':')?;
+            let mut ks = k.chars();
+            let c = ks.next().filter(|c| c.is_ascii_lowercase() && ks.next().is_none())?;
+            (!id.is_empty()).then(|| (c, crate::model::Harness::named(id)))
+        })
+        .collect()
 }
 
 /// status-right's three usage modules, from the options
@@ -1049,9 +1078,24 @@ mod tests {
         assert!(bar.jump && !bar.prefix && bar.usage.is_empty());
         assert!(bar.space.as_ref().is_some_and(|c| c.hidden));
         assert_eq!(bar.stale.as_deref(), Some("save refused"));
+        assert_eq!(bar.launch, None);
         // No client: no chip (the classic header), the global options still read.
         let bar = Bar::build(&snap, Some("/dev/nope"));
         assert_eq!((bar.space.is_none(), bar.stale.as_deref()), (true, Some("save refused")));
+        // ⌘E's launch table: the installed agents from @launch_agents (the
+        // last status field), letter and harness; junk words skipped.
+        use crate::model::Harness;
+        let mut st = vec![""; crate::tmux::STATUS_FORMATS.len()];
+        st[0] = "launch";
+        *st.last_mut().unwrap() = "c:claude x:codex d:aider junk Q:grok m: gg:grok u:cursor";
+        let snap = Snapshot::parse(&[row("main", 1, "@2", &[]), client("main", "@2", &st)].join("\n"));
+        let bar = Bar::build(&snap, Some("/dev/ttys999"));
+        assert!(!bar.jump && !bar.prefix);
+        assert_eq!(bar.launch, Some(vec![('c', Harness::named("claude")), ('x', Harness::named("codex")),
+            ('d', Harness::OTHER), ('u', Harness::named("cursor"))]));
+        // Armed with nothing recorded yet: the mark without its list.
+        let snap = Snapshot::parse(&[row("main", 1, "@2", &[]), client("main", "@2", &["launch"])].join("\n"));
+        assert_eq!(Bar::build(&snap, Some("/dev/ttys999")).launch, Some(vec![]));
     }
 
     /// The meters' numbers: the numeric options when set, else the text

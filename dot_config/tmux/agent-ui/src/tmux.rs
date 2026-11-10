@@ -236,14 +236,16 @@ impl Tmux {
 /// `@agent_limit` `"<resets_at> <type> <since>"` and `@agent_limit_lifted`
 /// `<epoch>`: a RATE-LIMITED agent, [`crate::model::Limit`]), and `harness`
 /// (`@agent_harness`: the harness running the agent when `@agent_kind` does
-/// not say it, `abby` today; [`crate::model::Harness`]).
-pub const FIELDS: [&str; 44] = [
+/// not say it, `abby` today; [`crate::model::Harness`]), and `thread_at`
+/// (`@thread_at`: when Mack last prompted the window himself, stamped by
+/// agent-tab-indicator.sh; the sidebar's dormant spaces and idle fold).
+pub const FIELDS: [&str; 45] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
     "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home", "space_index",
     "space_hidden", "space_color", "stash_sel", "pane_flags", "rollout", "paused", "pinned", "session_id",
     "pin_key", "pending_space", "pending_request", "pending_color", "ask_bg", "limit", "limit_lifted",
-    "harness",
+    "harness", "thread_at",
 ];
 
 /// The pane option space.sh sets (to 1) on a space home's dashboard pane
@@ -265,7 +267,7 @@ pub const PANE_FLAGS: &str =
 
 /// The tmux format of each FIELDS entry, in order. (`#{pane_current_path}`
 /// is printed by [`path_format`], dashboard-aware.)
-pub const FORMATS: [&str; 44] = [
+pub const FORMATS: [&str; 45] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
@@ -274,7 +276,7 @@ pub const FORMATS: [&str; 44] = [
     "#{@agent_mru_prev}", "#{@space_home}", "#{@space_index}", "#{@space_hidden}", "#{@space_color}", "#{@stash_sel}",
     PANE_FLAGS, "#{@agent_rollout}", "#{@agent_paused}", "#{@agent_pinned}", "#{@agent_session_id}",
     "#{@pin_key}", "#{@pending_space}", "#{@pending_request}", "#{@pending_color}", "#{@agent_ask_bg}",
-    "#{@agent_limit}", "#{@agent_limit_lifted}", "#{@agent_harness}",
+    "#{@agent_limit}", "#{@agent_limit_lifted}", "#{@agent_harness}", "#{@thread_at}",
 ];
 
 /// Ends each path in the dashboard case of [`path_format`] (a private-use
@@ -410,7 +412,7 @@ pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
 /// instead of status-right, read in the same one call (no script runs).
-pub const STATUS_FORMATS: [&str; 36] = [
+pub const STATUS_FORMATS: [&str; 38] = [
     "#{client_key_table}", "#{@sidebar_open}", "#{@sidebar_pids}", "#{@resurrect_stale}",
     "#{@codex_session_text}", "#{@codex_session_color}", "#{@codex_weekly_text}", "#{@codex_weekly_color}",
     "#{@codex_scoped_icon}", "#{@codex_scoped_text}", "#{@codex_scoped_color}", "#{@codex_account_label}",
@@ -443,6 +445,14 @@ pub const STATUS_FORMATS: [&str; 36] = [
     // "0" none (a weekly-only account: the sidebar drops its S meter), ""
     // unknown (another account's block, an older publisher): as "1".
     "#{@codex_session_limit}",
+    // Hours without a prompt from Mack before an all-idle space folds to its
+    // header and an idle agent into its space's idle line ("" = the default,
+    // 4; `0` = never; [`crate::view::fold_after`]).
+    "#{@space_fold_hours}",
+    // ⌘E's installed agents (agent-launch.sh refresh: `c:claude x:codex …`),
+    // the sidebar's ` ⌘E launch ` mark while the `launch` table is armed
+    // ([`crate::sidebar::status::launch_agents`]). Keep it LAST.
+    "#{@launch_agents}",
 ];
 
 /// One usage window's numeric options (`@codex_<w>_used`, `_expected`,
@@ -511,6 +521,10 @@ pub struct Status {
     /// `@codex_session_limit`, raw: "1" the active account has a session
     /// window, "0" it has none (weekly-only), "" unknown ([`Status::no_session_limit`]).
     pub session_limit: String,
+    /// `@space_fold_hours`, raw ("" = unset: the default).
+    pub fold_hours: String,
+    /// `@launch_agents`, raw: ⌘E's installed agents, `letter:id` words.
+    pub launch_agents: String,
 }
 
 impl Status {
@@ -548,6 +562,8 @@ impl Status {
             stale_after: f(33),
             limit_autoresume: f(34),
             session_limit: f(35),
+            fold_hours: f(36),
+            launch_agents: f(37),
         }
     }
 
@@ -688,6 +704,10 @@ pub struct Window {
     /// when `@agent_kind` does not name it (`abby`); it wins over `kind`
     /// ([`crate::model::Harness::of`]).
     pub harness: String,
+    /// `@thread_at`: when Mack last prompted this window himself (epoch
+    /// seconds, digits only; None when unset or junk: a restore, an older
+    /// window). agent-tab-indicator.sh stamps it on his own prompts only.
+    pub thread_at: Option<i64>,
 }
 
 fn digits(s: &str) -> bool {
@@ -778,6 +798,7 @@ impl Window {
             ask_bg: p[40].trim().into(),
             limit: crate::model::Limit::parse(p[41], p[42]),
             harness: p[43].trim().into(),
+            thread_at: num(p[44].trim()),
             label: label.into(),
             session,
         })
@@ -1150,19 +1171,52 @@ pub(crate) mod tests {
         assert_eq!((w.session.as_str(), w.label.as_str()), ("日本", "🫠 x\tz"));
     }
 
-    /// A row from an older format (43 fields, before `harness`; 41, before
-    /// `limit` and `limit_lifted`; 40, before `ask_bg`; 37, before the
-    /// pending space's options; 34, before `pinned`, `session_id` and
-    /// `pin_key`) or one with a field too many is no window: never misread by
-    /// position.
+    /// A row from an older format (44 fields, before `thread_at`; 43, before
+    /// `harness`; 41, before `limit` and `limit_lifted`; 40, before
+    /// `ask_bg`; 37, before the pending space's options; 34, before
+    /// `pinned`, `session_id` and `pin_key`) or one with a field too many is
+    /// no window: never misread by position.
     #[test]
     fn rows_of_the_wrong_length_are_rejected() {
-        assert_eq!(FIELDS.len(), 44);
-        for n in [34, 36, 37, 38, 39, 40, 41, 42, 43, 45] {
+        assert_eq!(FIELDS.len(), 45);
+        for n in [34, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46] {
             assert!(Window::parse(&vec!["x"; n].join("\x1f")).is_none(), "{n}");
         }
-        assert!(Window::parse(&vec!["x"; 44].join("\x1f")).is_some());
+        assert!(Window::parse(&vec!["x"; 45].join("\x1f")).is_some());
         assert_ne!(FIELDS.len(), CLIENT_FIELDS);
+    }
+
+    /// `@thread_at` rides last in the same one format (no extra tmux call),
+    /// guarded like the other user options; digits only (trimmed), else
+    /// None (unset, junk: the sidebar reads that as fresh).
+    #[test]
+    fn thread_at_field() {
+        assert_eq!((FIELDS[44], FORMATS[44]), ("thread_at", "#{@thread_at}"));
+        assert!(fmt().ends_with(&guarded("#{@thread_at}")));
+        let at = |v: &str| Window::parse(&row("main", 1, "@1", &[("state", "idle"), ("thread_at", v)])).unwrap().thread_at;
+        assert_eq!(at(" 1792400000 "), Some(1_792_400_000));
+        assert_eq!((at(""), at("soon"), at("-5")), (None, None, None));
+    }
+
+    /// `@space_fold_hours` rides the client row's status tail (field 36;
+    /// ⌘E's `@launch_agents` after it, last).
+    #[test]
+    fn fold_hours_field() {
+        assert_eq!(STATUS_FORMATS[36], "#{@space_fold_hours}");
+        let mut f: Vec<String> = ["", CLIENT_TAG, "/dev/x", "@1", "main", "on", "", "", "1"].map(String::from).to_vec();
+        f.extend((0..STATUS_FORMATS.len()).map(|i| if i == 36 { "6".into() } else { String::new() }));
+        let c = Client::parse(&f.join("\x1f")).unwrap();
+        assert_eq!(c.status.fold_hours, "6");
+    }
+
+    /// ⌘E's `@launch_agents` rides the client row's status tail, last.
+    #[test]
+    fn launch_agents_field() {
+        assert_eq!(STATUS_FORMATS.last(), Some(&"#{@launch_agents}"));
+        let mut f: Vec<String> = ["", CLIENT_TAG, "/dev/x", "@1", "main", "on", "", "", "1"].map(String::from).to_vec();
+        f.extend((0..STATUS_FORMATS.len()).map(|i| if i == STATUS_FORMATS.len() - 1 { "c:claude x:codex".into() } else { String::new() }));
+        let c = Client::parse(&f.join("\x1f")).unwrap();
+        assert_eq!(c.status.launch_agents, "c:claude x:codex");
     }
 
     /// `@agent_harness` rides last in the same one format as `@agent_kind`
@@ -1206,8 +1260,8 @@ pub(crate) mod tests {
         assert_eq!(lim(" 0 model 5 ", " 9 "),
             Some(Limit { resets_at: 0, garbled: false, kind: "model".into(), since: Some(5), lifted: Some(9) }));
         assert_eq!(lim("soon", "yes"), Some(Limit { resets_at: 0, garbled: true, kind: "".into(), since: None, lifted: Some(0) }));
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}", guarded("#{@agent_limit}"), guarded("#{@agent_limit_lifted}"),
-            guarded("#{@agent_harness}"))));
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}", guarded("#{@agent_limit}"), guarded("#{@agent_limit_lifted}"),
+            guarded("#{@agent_harness}"), guarded("#{@thread_at}"))));
     }
 
     /// A pending space's options: only a window of the `pending` session
@@ -1276,10 +1330,10 @@ pub(crate) mod tests {
             guarded("#{@space_hidden}"), guarded("#{@space_color}"), guarded("#{@stash_sel}"), guarded("#{@agent_rollout}"),
             guarded("#{@agent_paused}"), guarded("#{@agent_pinned}"), guarded("#{@agent_session_id}"), guarded("#{@pin_key}"))));
         // Then a pending space's options, the raised ask's flag, the limit
-        // and the harness.
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", guarded("#{@pending_space}"), guarded("#{@pending_request}"),
+        // and the harness, then Mack's last prompt.
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", guarded("#{@pending_space}"), guarded("#{@pending_request}"),
             guarded("#{@pending_color}"), guarded("#{@agent_ask_bg}"), guarded("#{@agent_limit}"), guarded("#{@agent_limit_lifted}"),
-            guarded("#{@agent_harness}"))));
+            guarded("#{@agent_harness}"), guarded("#{@thread_at}"))));
         let s = Snapshot::parse(&row("main", 1, "@1", &[("rollout", "/x/rollout-1.jsonl")]));
         assert_eq!(s.windows[0].rollout, "/x/rollout-1.jsonl");
         let s = Snapshot::parse(&row("main", 1, "@1", &[("space_color", " #f9e2af "), ("stash_sel", "1")]));

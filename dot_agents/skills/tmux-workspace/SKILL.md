@@ -333,6 +333,7 @@ catches tmux drift; WezTerm, Karabiner and menu keys have no check.
 | prefix Q | close this space (y/n; never main) |
 | ⌘T / ⌘R | new shell tab / new claude tab (prefix c / prefix k) in THIS space, in the current tab's folder |
 | ⌘⇧T / ⌘⇧R | picker: which space gets a new shell / claude tab (at its end, in that space's root folder; prefix C-t / prefix K). Type a folder to open or reuse a space for it; ^N creates (as ⌥N's) and the tab opens in the new folder's space |
+| ⌘E then ⏎ / a letter / Shift+letter | launch any installed coding agent in a new tab (`launch` key table, `scripts/agent-launch.sh`): ⏎ or ⌘E again = claude (as ⌘R); `a` abby, `x` codex, `o` opencode, `g` grok, `y` agy (Antigravity; the Gemini CLI is gone), `u` cursor-agent, `p` copilot, `d` aider, in this tab's folder; Shift+letter picks the space first (⌘⇧R's picker); Esc cancels; not installed says "launch: <name> not installed". cursor-agent / aider have no hooks: their tab is a shell row (with the agent's `@agent_harness`), not an agent; cursor-agent's row shows its logo in place of the ❯, aider's (no logo) keeps the ❯ |
 | ⌘⌥R | replace this tab with a claude tab (prefix C-k; on home it adds one) |
 | ⌘W / ⌘Z | close tab (refused on home) / reopen the last closed tab, agent resumed |
 | prefix P | pause every working agent before closing the laptop; again to resume that set |

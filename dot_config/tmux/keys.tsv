@@ -12,7 +12,7 @@
 #                  (a bare "/" or "then" between them stays plain text)
 #   3 description  what it does, short (about 40 cells, at most 50)
 #   4 table        the tmux key table that binds it (root, prefix, jump,
-#                  stash), or empty: WezTerm, Karabiner, a plugin, a popup's
+#                  launch, stash), or empty: WezTerm, Karabiner, a plugin, a popup's
 #                  own keys, the mouse
 #   5 tmux keys    the tmux key names in that table, space-separated;
 #                  `a..z` / `1..9` / `User18..User26` are ranges. A key
@@ -48,6 +48,10 @@ Tabs	⌘T	New shell tab, this folder	prefix	c	⌃S c
 Tabs	⌘R	New claude tab, this folder	prefix	k	⌃S k
 Tabs	⌘⇧T	New shell tab in a space… (picker)	prefix	C-t	⌃S ⌃T
 Tabs	⌘⇧R	New claude tab in a space… (picker)	prefix	K	⌃S K
+Tabs	⌘E ⏎	Launch: new claude tab (as ⌘R)	launch	Enter User27	or ⌘E ⌘E
+Tabs	⌘E a-z	Launch that agent, this folder	launch	a..z	a abby x codex o opencode g grok y agy u cursor p copilot d aider
+Tabs	⌘E ⇧A-Z	Launch that agent in a space… (picker)	launch	A..Z
+Tabs	⌘E Esc	Cancel the launch	launch	Escape Space C-c
 Tabs	⌘⌥T	Replace this tab with a fresh shell	prefix	R	⌃S R
 Tabs	⌘⌥R	Replace this tab with claude	prefix	C-k	⌃S ⌃K
 Tabs	⌃⌘T	New nushell tab	prefix	N	⌃S N
@@ -70,11 +74,12 @@ Park	x then ⇧Y	Range: close the selection	stash	x	any other key keeps it
 Park	Esc	Range: cancel	stash	Escape q Space C-c
 
 Sidebar	⌘B	Sidebar on / off			WezTerm
-Sidebar	⌥V	Sidebar scope: this space ↔ all	root	M-v
+Sidebar	⌥V	Sidebar scope: this space → active → all	root	M-v
 Sidebar	click	Go to that agent, shell or space
 Sidebar	right-click	Park that agent
 Sidebar	middle-click	Pin / unpin that agent
 Sidebar	click PARKED	Unpark picker
+Sidebar	click ▸	Keep a dormant space open (again: let it fold)
 
 Agent menu	a-z	Go to the agent on that letter
 Agent menu	↑ / ↓	Move			⌃P / ⌃N, PgUp / PgDn

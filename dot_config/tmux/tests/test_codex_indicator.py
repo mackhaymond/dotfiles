@@ -43,7 +43,7 @@ with p.with_suffix('.lock').open('a') as lock:
   elif cmd=='show-options': print(s['windows'].get(target,{}).get(a[-1],''))
   elif cmd=='set-option':
    if target not in s['windows']: sys.exit(1)
-   key=next(x for x in a[1:] if x.startswith('@agent_'))
+   key=next(x for x in a[1:] if x.startswith(('@agent_','@thread_')))
    if '-uw' in a: s['windows'][target].pop(key,None)
    else: s['windows'][target][key]=a[-1]
  # Atomic: tests read the state unlocked while detached workers write it.
@@ -259,7 +259,8 @@ class IndicatorIntegrationTests(unittest.TestCase):
         self.assertEqual(self.hook("heartbeat")["@agent_state"], "running")
         self.assertEqual(self.hook("done")["@agent_state"], "done")
         self.assertEqual(self.hook("heartbeat")["@agent_state"], "done")
-        self.assertEqual(set(self.hook("clear")), {"@agent_seen_at"})
+        # (@thread_at, Mack's last prompt, belongs to the window: it stays.)
+        self.assertEqual(set(self.hook("clear")), {"@agent_seen_at", "@thread_at"})
         state = json.loads(self.state.read_text())
         self.assertEqual(state["windows"]["@99"], {"@agent_state": "unrelated"})
         self.assertFalse(any("%999" in call for call in state["calls"]))

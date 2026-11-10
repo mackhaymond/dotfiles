@@ -93,7 +93,8 @@ class OpencodeIndicatorTests(unittest.TestCase):
         self.assertEqual(w["@agent_summary"], "project/Websocket reconnect fix")
         w = self.hook("failed", error="Overloaded (529)")
         self.assertEqual((w["@agent_state"], w["@agent_detail"]), ("failed", "Overloaded (529)"))
-        self.assertEqual(set(self.hook("clear", reason="exit")), {"@agent_seen_at"})
+        # (@thread_at, Mack's last prompt, belongs to the window: it stays.)
+        self.assertEqual(set(self.hook("clear", reason="exit")), {"@agent_seen_at", "@thread_at"})
         self.assertEqual(json.loads(self.state.read_text())["windows"]["@99"], {"@agent_state": "unrelated"})
 
     def test_unknown_agent_still_gets_no_kind(self):

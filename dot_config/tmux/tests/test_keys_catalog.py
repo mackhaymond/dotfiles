@@ -42,7 +42,7 @@ CATALOG = HERE / "keys.tsv"
 CONF = HERE / "tmux.conf.tmpl"
 SOURCED = ("spaces.conf", "agent-birth.conf", "agent-pause.conf")
 TMUX = shutil.which("tmux")
-TABLES = {"root", "prefix", "jump", "stash"}
+TABLES = {"root", "prefix", "jump", "launch", "stash"}
 
 # Bindings the config makes that the key help deliberately does NOT list, as
 # (table, tmux keys, reason); keys take the catalog's ranges. Keep it small:
@@ -51,6 +51,7 @@ NOT_IN_HELP = (
     # The leaders themselves: every ⌃S row and every ⌥W row starts with them.
     ("root", "C-s", "the prefix leader (prefix is None): the ⌃S of every ⌃S row"),
     ("root", "M-w", "the jump leader: the ⌥W of every ⌥W row"),
+    ("root", "User27", "the launch leader (WezTerm ⌘E): the ⌘E of every ⌘E row"),
     # spaces.conf: WezTerm sends each digit chord as one User key; these two
     # rows only hand the pane the key itself, as if tmux were not there.
     ("root", "User0..User8", "WezTerm ⌃1-9, passed on to the pane as C-1..C-9"),
@@ -303,6 +304,7 @@ class Live(unittest.TestCase):
         everything = self.parse_keys(self.t("list-keys"))
         # The custom tables are in the full listing (sanity: not a parse miss).
         self.assertIn(("jump", "a"), everything)
+        self.assertIn(("launch", "x"), everything)
         self.assertIn(("stash", "H"), everything)
         return {k: line for k, line in everything.items() if line != stock.get(k)}
 

@@ -53,7 +53,7 @@
 #                   leaves needs-input (set_state, clear_state, the
 #                   watcher's discharge and GC). A look while the work is
 #                   still out discharges it to running, not idle.
-#   @agent_kind    claude | codex | opencode | grok — which agent's hooks drive this
+#   @agent_kind    claude | codex | opencode | grok | copilot | agy — which agent's hooks drive this
 #                   window; written with any state/detail write a hook makes
 #   @agent_harness  abby | unset — the launcher behind that kind when it is not
 #                   the agent itself (THE HARNESS: a claude hook with
@@ -101,6 +101,11 @@
 #   Build's hooks (~/.grok/hooks/tmux-agent.json) call `<mode> grok` from
 #   the TUI's own children, the same inherited identity; its payload quirks
 #   are handled under GROK below (normalized right after stdin is read).
+#   GitHub Copilot CLI (~/.copilot/hooks/tmux-agent.json) and Google's
+#   Antigravity CLI, agy (~/.gemini/config/plugins/tmux-agent/hooks.json),
+#   call `<mode> copilot` / `<mode> agy` the same way, from children of the
+#   TUI; their camelCase payloads are rewritten into the Claude shape right
+#   after stdin is read (COPILOT AND AGY, below).
 #
 #   tmux after-select-window hook invokes:  agent-tab-indicator.sh clear-current
 #   (no stdin, no TMUX_PANE → operates on the now-active window).
@@ -155,8 +160,9 @@
 #                                      quiet (AGENT-ORIGINATED TURNS below);
 #                                      a SUBAGENT's open gate stands through
 #                                      it (ASKER GATE)
-#   interrupt    a turn cancelled    → codex/opencode/grok (Grok's
-#                                      StopCancelled): idle, label kept; a
+#   interrupt    a turn cancelled    → codex/opencode/grok/agy (Grok's
+#                                      StopCancelled, agy's USER_CANCELED
+#                                      Stop): idle, label kept; a
 #                                      grok cancel by the runtime finishes
 #                                      as `done` (see GROK)
 #   settle       Notification(idle_prompt), grok → running → idle ONLY, the
@@ -250,10 +256,23 @@ fi
 # OpenCode plugin's PARENT_AGENT_ENV skips on the same pair (not on
 # AGENT_PTY: a pty-MCP shell owns its own pane, and a headless claude there
 # paints it). Claude-in-Claude is caught after the pane lookup (nested_agent).
-# A grok in codex's tool shell is the same case.
+# A grok, copilot or agy in codex's tool shell is the same case.
 case "$agent" in
-    claude|opencode|grok) [ -z "${CODEX_THREAD_ID:-}${CODEX_SANDBOX:-}" ] || exit 0 ;;
+    claude|opencode|grok|copilot|agy) [ -z "${CODEX_THREAD_ID:-}${CODEX_SANDBOX:-}" ] || exit 0 ;;
 esac
+# COPILOT AND AGY ARE NEVER HEADLESS HERE. ai-exec (the title condenser's,
+# closed-tabs', stash's and chezmoi-commit's model calls) runs `copilot` with
+# its prompt piped in and CUA_NOTCH_IGNORE=1; that run's hooks fire like a
+# TUI's and must not paint whatever pane its caller sat in. (The rest - `-p`,
+# no tty - is checked after the pane lookup: HEADLESS COPILOT/AGY.)
+case "$agent" in
+    copilot|agy) [ "${CUA_NOTCH_IGNORE:-}" != 1 ] || exit 0 ;;
+esac
+# COPILOT RUNNING CLAUDE'S HOOKS. Copilot CLI also runs the hooks of a repo's
+# .claude/settings.json(.local) as its own; those call `<mode> claude` with a
+# Copilot payload. Copilot sets COPILOT_HOOK_DEPTH in every command hook's
+# environment and Claude never does: drop them, as GROK_HOOK_EVENT below.
+[ "$agent" != claude ] || [ -z "${COPILOT_HOOK_DEPTH:-}" ] || exit 0
 # GROK RUNNING CLAUDE'S HOOKS. Grok Build runs every ~/.claude/settings.json
 # hook too while its [compat.claude] hooks are on (the default; dot_zshenv
 # turns them off with GROK_CLAUDE_HOOKS_ENABLED=0). Those call `<mode> claude`
@@ -282,7 +301,7 @@ fi
 # hook from a known agent. One place for the pair, so the two never part.
 kind_add() {
     case "$agent" in
-        claude|codex|opencode|grok)
+        claude|codex|opencode|grok|copilot|agy)
             cmd+=(\; set-option -w -t "$1" @agent_kind "$agent")
             if [ -n "$HARNESS" ]; then
                 cmd+=(\; set-option -w -t "$1" @agent_harness "$HARNESS")
@@ -1224,7 +1243,7 @@ stop_fields() {
     fi
     { IFS= read -r s_id; IFS= read -r s_tp; } <<<"$out" || true
     [ -n "$s_id" ] || s_id=-
-    [ "$agent" != grok ] || s_tp=""
+    case "$agent" in grok|copilot|agy) s_tp="" ;; esac
 }
 
 # A for_user reason as a sidebar detail: DETAIL_JQ's own sanitizer.
@@ -2089,6 +2108,7 @@ drift_update() {
 #   grok:   summary.json beside the payload's transcript_path (the session
 #           dir; updates.jsonl itself is never read): generated_title, a
 #           user rename (`custom`) when title_is_manual, else the prompt.
+#   copilot, agy: the prompt (COPILOT AND AGY).
 extract_summary() {
     local payload="$1" title="" src="final" prev=""
     [ -n "$JQ" ] || return 0
@@ -2180,6 +2200,13 @@ extract_summary() {
             if [ -z "$title" ]; then
                 title="$g_prompt"; src="interim"
             fi
+            ;;
+        copilot|agy)
+            # Neither hook payload carries a title: the prompt, condensed
+            # like any prompt (agy sends it with every event as
+            # lastUserInput, copilot only with the prompt itself).
+            title=$("$JQ" -r '.prompt // empty | tostring' <<<"$payload" 2>/dev/null || true)
+            src="interim"
             ;;
     esac
 
@@ -2561,6 +2588,16 @@ pane="${TMUX_PANE:-}"
 win=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null || true)
 [ -n "$win" ] || exit 0
 
+# AGY'S PreInvocation runs before EVERY model call and agy's loop waits on
+# it: on a window already running (every call of a turn but its first) it
+# is a no-op (COPILOT AND AGY), decided here with one show-options, before
+# the ps walks and jq. The small payload is read in-process so agy never
+# writes into a closed pipe.
+if [ "$agent" = agy ] && [ "$mode" = running ] && [ "$(window_state "$win")" = running ]; then
+    IFS= read -r -d '' _ || true
+    exit 0
+fi
+
 if [ "$agent" = codex ]; then
     # Ownership may have changed since resolve (or while a detached title
     # condenser was working). Never let an old hook reclaim the window.
@@ -2585,6 +2622,11 @@ fi
 # the heartbeat (every tool call) skips it - from a nested claude it is inert
 # anyway, since the parent's window is running while its tool runs. Any ps
 # failure reads as not nested (the old behavior). Bash 4+ (associative).
+# Copilot CLI (comm `copilot`; its restart supervisor and the CLI under it
+# are both `copilot`, agent over agent, no nesting) and agy are agents too.
+# NA_SELF: the first agent pid the walk met (the hook's own agent), for
+# HEADLESS COPILOT/AGY below.
+NA_SELF=""
 nested_agent() {
     [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || return 1
     local rows pid ppid comm p seen=0 gap=0 n=0
@@ -2596,8 +2638,9 @@ nested_agent() {
     p="$PPID"
     while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$n" -lt 64 ]; do
         n=$((n + 1))
-        if [[ ${PC[$p]:-} =~ ^(claude|codex|opencode|grok(-(macos|linux|windows)-[a-z0-9_]+)?|[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+        if [[ ${PC[$p]:-} =~ ^(claude|codex|opencode|copilot|agy|grok(-(macos|linux|windows)-[a-z0-9_]+)?|[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             [ "$gap" = 1 ] && return 0
+            [ "$seen" = 1 ] || NA_SELF="$p"
             seen=1
         elif [ "$seen" = 1 ]; then
             gap=1
@@ -2609,8 +2652,54 @@ nested_agent() {
 # Grok's comm is `grok` (a launch through its real path: grok-macos-aarch64;
 # never its `agent` symlink, too generic), and a grok run from another
 # agent's tool shell is the same nesting.
-if { [ "$agent" = claude ] || [ "$agent" = grok ]; } && [ "$mode" != heartbeat ] && nested_agent; then
-    exit 0
+case "$agent" in
+    claude|grok|copilot|agy)
+        if [ "$mode" != heartbeat ] && nested_agent; then
+            exit 0
+        fi ;;
+esac
+# HEADLESS COPILOT/AGY. `copilot -p "..."` and `agy -p "..."` fire every
+# lifecycle hook a TUI does (SessionStart, the prompt, Stop, and for copilot
+# a SessionEnd per turn), from whatever pane they were typed in: a shell tab
+# would flash an agent's states. The hook's own agent (NA_SELF, its comm the
+# hook's kind) must look like a TUI: a controlling tty (ai-exec's setsid'd
+# legs have none) and no headless flag (-p/--prompt, agy's --print too, a
+# value glued on or not). One more single-pid ps, lifecycle events only. No
+# agent found above the hook (a hook run by hand, a ps failure): left as is.
+if [ "$mode" != heartbeat ] && [ -n "$NA_SELF" ]; then
+    case "$agent" in
+        copilot|agy)
+            hl_tty=""; hl_comm=""
+            read -r hl_tty hl_comm <<<"$(ps -ww -o tty=,comm= -p "$NA_SELF" 2>/dev/null || true)" || true
+            if [ "${hl_comm##*/}" = "$agent" ]; then
+                case "$hl_tty" in ''|'??'|'?') exit 0 ;; esac
+                hl_args=$(ps -ww -o args= -p "$NA_SELF" 2>/dev/null || true)
+                hl_av=()
+                read -r -a hl_av <<<"$hl_args" || true
+                # Flags only, up to the first positional word (ps lost the
+                # quoting: what follows may be prompt text, `-p` included).
+                # An option that takes a value skips it; -i (an initial
+                # prompt, then the TUI) ends the scan as a TUI.
+                hl_i=1
+                while [ "$hl_i" -lt "${#hl_av[@]}" ]; do
+                    hl_w="${hl_av[hl_i]}"
+                    case "$hl_w" in
+                        --) break ;;
+                        -i|-i=*|--interactive|--interactive=*|-prompt-interactive|-prompt-interactive=*|--prompt-interactive|--prompt-interactive=*)
+                            break ;;
+                        -p|-p=*|--prompt|--prompt=*|-print|-print=*|--print|--print=*|-prompt|-prompt=*) exit 0 ;;
+                        -*=*) hl_i=$((hl_i + 1)) ;;
+                        --model|--reasoning-effort|--context|--auto-tier|--agent|-n|--name|--session-id|-C|--log-dir|--extension-sdk-path|--log-level|--stream|--output-format|--add-dir|--allow-tool|--deny-tool|--available-tools|--excluded-tools|--additional-mcp-config|--config-dir|-model|-agent|-add-dir|-conversation|--conversation|-effort|--effort|-input-format|--input-format|-json-schema|--json-schema|-log-file|--log-file|-mode|--mode|-output-format|-print-timeout|--print-timeout|-project|--project|-settings|--settings)
+                            hl_i=$((hl_i + 2)) ;;
+                        # copilot's -p with its value glued on (clap: -pTEXT);
+                        # agy's Go flags have no such form.
+                        -p*) [ "$agent" != copilot ] || exit 0; hl_i=$((hl_i + 1)) ;;
+                        -*) hl_i=$((hl_i + 1)) ;;
+                        *) break ;;
+                    esac
+                done
+            fi ;;
+    esac
 fi
 
 # Claude heartbeat is the hot path (every tool call): don't wait on stdin — the
@@ -2673,15 +2762,28 @@ fi
 # not Claude's, so the 8 KB cut proves nothing there: a grok payload is
 # parsed whole (GROK_SUB_JQ), on these two rare states only.
 GROK_SUB_JQ='.subagentType // "" | tostring | .[0:64]'
+#   COPILOT names a subagent's tool call by agentId (camelCase, the native
+# payload) and puts it after its own keys: parsed whole the same way. AGY
+# runs a subagent as a conversation of its own: its hook args carry
+# parentConversationId (and a rootConversationId that is not its own
+# conversationId), and the subagent is named by its conversationId.
+COPILOT_SUB_JQ='.agentId // .agent_id // "" | tostring | .[0:64]'
+AGY_SUB_JQ='(.conversationId // "" | tostring) as $c
+  | if ((.parentConversationId // "" | tostring) != "")
+       or ((.rootConversationId // "" | tostring) as $r | $r != "" and $r != $c)
+    then (if $c == "" then "subagent" else $c end) else "" end | .[0:64]'
 # settle's floor: seconds a turn must have been running before Grok's
 # idle_prompt may end it (see settle).
 SETTLE_MIN=50
 hb_who() {
     hb_from=main
     [ "$agent" != codex ] || return 0
-    if [ "$agent" = grok ]; then
+    if [ "$agent" = grok ] || [ "$agent" = copilot ] || [ "$agent" = agy ]; then
         [ -n "$JQ" ] || return 0
-        hb_from=$("$JQ" -r "$GROK_SUB_JQ" 2>/dev/null || true)
+        hb_sub="$GROK_SUB_JQ"
+        [ "$agent" != copilot ] || hb_sub="$COPILOT_SUB_JQ"
+        [ "$agent" != agy ] || hb_sub="$AGY_SUB_JQ"
+        hb_from=$("$JQ" -r "$hb_sub" 2>/dev/null || true)
         hb_from="${hb_from//[^A-Za-z0-9_.-]/}"
         hb_from="${hb_from:-main}"
         return 0
@@ -2749,6 +2851,161 @@ if [ "$mode" = "heartbeat" ]; then
 fi
 
 [ "$agent" = codex ] || payload=$(cat 2>/dev/null || true)
+
+# COPILOT AND AGY (docs/agent-tab-indicator.md, "GitHub Copilot CLI" and
+# "Antigravity CLI"). Both send camelCase payloads with none of Claude's snake
+# keys, so ONE jq rewrites the payload into the Claude shape everything below
+# reads (session_id, cwd, source, prompt, tool_name, tool_input, agent_id,
+# message, error, last_assistant_message), and says what the event is for
+# this window (line 1: keep | drop | done | interrupt | failed):
+#   COPILOT (native events, ~/.copilot/hooks/tmux-agent.json): sessionId,
+#     cwd (the SDK's workingDirectory too), source startup|resume|new (new:
+#     /new or /clear, read as startup), toolName/toolArgs (its native tool
+#     names shown as Claude's: bash -> Bash, view -> Read, ...), agentId on a
+#     subagent's event (inert below, as Claude's agent_id), a Notification's
+#     notification_type + message (elicitation_dialog, the ask_user question,
+#     becomes an AskUserQuestion: the `ask` detail), errorOccurred's error
+#     {message} + recoverable + errorContext: only an unrecoverable model or
+#     system error ends the turn (`failed`); a retried call or a failed tool
+#     (reported to the model, the turn goes on) is dropped.
+#   AGY (~/.gemini/config/plugins/tmux-agent/hooks.json): conversationId,
+#     cwd (else workspacePaths[0]), lastUserInput as the prompt (the text
+#     inside its <USER_REQUEST>...</USER_REQUEST>; what follows, such as
+#     <ADDITIONAL_METADATA>, dropped), toolCall {name, args}, Stop's
+#     finalModelOutput as the reply. A SUBAGENT runs as a conversation of
+#     its own whose hook args carry parentConversationId (AGY_SUB_JQ): its
+#     conversationId becomes agent_id, so the subagent guard below drops its
+#     SessionStart, PreInvocation and Stop like Claude's agent_id. PreInvocation
+#     runs before EVERY model call of a turn and is wired to `running`: on a
+#     window that is already running it is a no-op (the turn's first call
+#     started it). Stop's terminationReason: USER_CANCELED -> interrupt,
+#     ERROR -> failed (its error), anything else (NO_TOOL_CALL, the MAX_*
+#     limits, a terminal step) -> done. fullyIdle false (background tasks
+#     still out) does NOT hold the tab: agy sends no event when they drain.
+#   Their transcripts (copilot's session-state events.jsonl, agy's
+#     brain/<id>/.system_generated/logs/transcript.jsonl) are never a Claude
+#     transcript: transcript_path is emptied, so no Claude reader (stop_fields,
+#     detail_for, the background check, the ask) ever sees one. A Stop's
+#     last_assistant_message (copilot sends none; agy's finalModelOutput,
+#     when absent) is read here from that CLI's own record, bounded, and only
+#     after the turn's own user row: copilot's last assistant.message after
+#     the last user.message, agy's last PLANNER_RESPONSE after the last
+#     USER_INPUT.
+#   No turn ids: TURN_JQ reads "-" for both, so a Stop always matches the
+#     turn its prompt started (@agent_turn_origin "<kind> - <from>").
+CP_NORM_JQ='
+def s: if type == "string" then . elif . == null then "" else tostring end;
+def tname: {bash: "Bash", powershell: "PowerShell", view: "Read", edit: "Edit", create: "Write",
+            glob: "Glob", grep: "Grep", web_fetch: "WebFetch", task: "Task", ask_user: "AskUserQuestion"}[.] // .;
+(.notification_type // .notificationType // "" | s) as $nt
+| (.error | if type == "object" then (.message // .name // "") else . end | s | .[0:2000]) as $err
+| (.errorContext // .error_context // "" | s) as $ectx
+| (.recoverable == true) as $rec
+| {session_id: (.session_id // .sessionId // "" | s),
+   cwd: (.cwd // .workingDirectory // .working_directory // "" | s),
+   source: (.source // "" | s | if . == "new" then "startup" else . end),
+   prompt: (.prompt // null),
+   tool_name: (.tool_name // .toolName // null | if . == null then null else (s | tname) end),
+   tool_input: (.tool_input // .toolArgs // .tool_args // null
+                | if type == "string" then (fromjson? // .) else . end),
+   agent_id: (.agent_id // .agentId // null),
+   notification_type: $nt, message: (.message // null), reason: (.reason // null),
+   error: (if $err == "" then null else $err end),
+   transcript_path: ""}
+  + (if $nt == "elicitation_dialog"
+     then {tool_name: "AskUserQuestion", tool_input: {question: (.message // .title // "" | s)}} else {} end)
+| (if $mode == "failed" and ($rec or ($ectx != "" and $ectx != "model_call" and $ectx != "system"))
+   then "drop" else "keep" end) as $d
+| $d, tojson'
+AGY_NORM_JQ='
+def s: if type == "string" then . elif . == null then "" else tostring end;
+(.terminationReason // .termination_reason // "" | s) as $tr
+| (.transcriptPath // "" | s | gsub("[\\r\\n]"; " ")) as $tp
+| (.error // "" | if type == "object" then (.message // "") else . end | s | .[0:2000]) as $err
+| ('"$AGY_SUB_JQ"') as $sub
+| {session_id: (.conversationId // .conversation_id // "" | s),
+   cwd: (.cwd // (.workspacePaths // [] | if type == "array" then .[0] else null end) // "" | s),
+   source: "startup",
+   prompt: (.lastUserInput // null
+            | if type == "string" then
+                (.[0:200000]
+                 | if test("<USER_REQUEST>") then
+                     (capture("<USER_REQUEST>\\s*(?<r>[\\s\\S]*?)\\s*(?:</USER_REQUEST>|\\z)").r // .)
+                   else . end
+                 | .[0:20000])
+              else . end),
+   tool_name: (.toolCall.name? // null),
+   tool_input: (.toolCall.args? // null),
+   agent_id: (if $sub == "" then null else $sub end),
+   last_assistant_message: (.finalModelOutput // null | if type == "string" and test("\\S") then .[0:4000] else null end),
+   error: (if $err == "" then null else $err end),
+   transcript_path: ""}
+| (if $mode != "done" then "keep"
+   elif $tr == "USER_CANCELED" then "interrupt"
+   elif $tr == "ERROR" then "failed"
+   else "done" end), tojson, $tp'
+cp_tp=""
+if { [ "$agent" = copilot ] || [ "$agent" = agy ]; } && [ -n "$JQ" ] && [ -n "$payload" ]; then
+    if [ "$agent" = copilot ]; then
+        cp_out=$("$JQ" -r --arg mode "$mode" "$CP_NORM_JQ" <<<"$payload" 2>/dev/null || true)
+    else
+        cp_out=$("$JQ" -r --arg mode "$mode" "$AGY_NORM_JQ" <<<"$payload" 2>/dev/null || true)
+    fi
+    cp_dir=""; cp_new=""
+    { IFS= read -r cp_dir; IFS= read -r cp_new; IFS= read -r cp_tp; } <<<"$cp_out" || true
+    # A payload jq can't read is no event this script understands.
+    [ -n "$cp_new" ] || exit 0
+    payload="$cp_new"
+    case "$cp_dir" in
+        drop) exit 0 ;;
+        interrupt|failed|done) mode="$cp_dir" ;;
+    esac
+    if [ "$agent" = agy ] && [ "$mode" = running ] && [ "$(window_state "$win")" = running ]; then
+        exit 0
+    fi
+    # The Stop's reply, from the CLI's own record (bounded tail, one grep, one
+    # jq; Stops only). copilot: <COPILOT_HOME>/session-state/<sid>/events.jsonl
+    # (sid held to a UUID's charset). agy: its transcriptPath, only under
+    # ~/.gemini and named transcript.jsonl.
+    # agy's Stop carries the reply itself (finalModelOutput, already in the
+    # payload): its transcript is read only without one. Only a reply AFTER
+    # the turn's own user row (copilot's last user.message, agy's last
+    # USER_INPUT) counts: none in the tail is no reply ("turn finished"),
+    # never the previous turn's.
+    if [ "$mode" = done ] && { [ "$agent" = copilot ] || [ -z "$("$JQ" -r '.last_assistant_message // empty' <<<"$payload" 2>/dev/null || true)" ]; }; then
+        cp_file=""; cp_pat=""; cp_upat=""; cp_lam=""
+        if [ "$agent" = copilot ]; then
+            cp_sid=$("$JQ" -r '.session_id' <<<"$payload" 2>/dev/null || true)
+            case "$cp_sid" in ''|*[!0-9A-Za-z-]*) ;; *)
+                cp_file="${COPILOT_HOME:-$HOME/.copilot}/session-state/$cp_sid/events.jsonl"
+                cp_pat='"type":"assistant.message"'; cp_upat='"type":"user.message"'
+                cp_get='.data.content' ;;
+            esac
+        else
+            case "$cp_tp" in
+                "$HOME"/.gemini/*/transcript.jsonl)
+                    case "$cp_tp" in */../*) ;; *)
+                        cp_file="$cp_tp"
+                        cp_pat='"type":"PLANNER_RESPONSE"'; cp_upat='"type":"USER_INPUT"'
+                        cp_get='.content' ;;
+                    esac ;;
+            esac
+        fi
+        if [ -n "$cp_file" ] && [ -f "$cp_file" ]; then
+            cp_u="${cp_upat#*:}"; cp_u="${cp_u//\"/}"
+            cp_lam=$(tail -c 262144 "$cp_file" 2>/dev/null | grep -F -e "$cp_pat" -e "$cp_upat" \
+                | "$JQ" -Rrn --arg u "$cp_u" 'def reply: '"$cp_get"';
+                    reduce (inputs | fromjson? | objects) as $r ({seen: false, m: ""};
+                      if ($r.type // "") == $u then {seen: true, m: ""}
+                      elif .seen and (($r | reply) | type == "string" and test("\\S")) then .m = ($r | reply)
+                      else . end) | .m | .[0:4000]' \
+                2>/dev/null || true)
+        fi
+        if [ -n "$cp_lam" ]; then
+            payload=$("$JQ" -c --arg m "$cp_lam" '.last_assistant_message = $m' <<<"$payload" 2>/dev/null || printf '%s' "$payload")
+        fi
+    fi
+fi
 
 # GROK (payload quirks; the rest of this file reads it as Claude-shaped -
 # Grok sends Claude's snake keys as aliases of its camelCase ones):
@@ -2896,9 +3153,10 @@ case "$mode" in
     interrupt)
         # The terminal bridge observes turn/completed with interrupted status;
         # the OpenCode plugin sees the turn end in MessageAbortedError (Esc).
-        # Grok's StopCancelled (Ctrl+C, a declined permission) likewise.
+        # Grok's StopCancelled (Ctrl+C, a declined permission) likewise, and
+        # agy's Stop with terminationReason USER_CANCELED (COPILOT AND AGY).
         # Keep the conversation label, but discharge working/attention state.
-        case "$agent" in codex|opencode|grok) ;; *) exit 0 ;; esac
+        case "$agent" in codex|opencode|grok|agy) ;; *) exit 0 ;; esac
         # An interrupted agent-originated turn ends like a quiet one: back to
         # the attention state the window had before it (AGENT-ORIGINATED
         # TURNS), seen-it rules included.
@@ -3105,6 +3363,17 @@ case "$mode" in
         p_mack=0
         [ "$agent_msg" = 0 ] && [ "$t_sys" != sys ] && [ -z "$t_pre" ] && p_mack=1
         case "$t_src" in loop_wakeup|schedule_wakeup|poll_event) p_mack=0 ;; esac
+        # @thread_at: when MACK last prompted this window himself (the
+        # sidebar's dormant spaces and idle fold, and the Threads spec, read
+        # it). Only p_mack's prompt stamps it - a peer's message_agent or a
+        # harness wake-up never does - in set_state's one command list
+        # below (ss_add: no extra tmux call, no fork). Nor a `system`
+        # source (native auto-continuation: Mack typed nothing), for the
+        # stamp only - p_mack itself still counts it. Never unset: it is
+        # the window's, whatever conversation runs in it.
+        if [ "$p_mack" = 1 ] && [ "$t_src" != system ]; then
+            ss_add set-option -w -t "$win" @thread_at "$t_now"
+        fi
         # RATE-LIMITED AGENTS (see its section): a prompt into a limited
         # window. Held (nothing written: the tab stays paused, no running
         # flicker) while the limit's pause still stands and the reset is
@@ -3482,7 +3751,10 @@ case "$mode" in
                        <<<"$payload" 2>/dev/null || true)
                 case "$bg_n" in ''|0|*[!0-9]*) ;; *) bg_pending=1 ;; esac
             fi
-        elif [ -n "$JQ" ] && [ -n "$payload" ] && [ -x "$BG_PENDING" ]; then
+        elif [ "$agent" != copilot ] && [ "$agent" != agy ] \
+             && [ -n "$JQ" ] && [ -n "$payload" ] && [ -x "$BG_PENDING" ]; then
+            # (copilot/agy: no transcript_path, so no background check -
+            # skip the three reads, COPILOT AND AGY.)
             bg_tp=$("$JQ" -r '.transcript_path // empty' <<<"$payload" 2>/dev/null || true)
             bg_sid=$("$JQ" -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)
             bg_cwd=$("$JQ" -r '.cwd // empty' <<<"$payload" 2>/dev/null || true)
@@ -3725,7 +3997,7 @@ case "$mode" in
         clear_state "$win"
         ;;
     *)
-        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|subagent-stop|failed|done|interrupt|settle|reconcile|clear|clear-current> [claude|codex|opencode|grok]" >&2
+        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|subagent-stop|failed|done|interrupt|settle|reconcile|clear|clear-current> [claude|codex|opencode|grok|copilot|agy]" >&2
         # exit 0, not 1: codex treats a hook's exit status as a GATE (see the
         # header), so a typo'd mode in hooks.json would block every codex
         # event rather than just failing to paint a tab. A silently inert

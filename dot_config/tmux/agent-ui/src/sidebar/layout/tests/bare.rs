@@ -25,7 +25,7 @@ fn bare_fleet(scope: &str) -> ViewModel {
 const BARE: [&str; 4] = ["b1", "b2", "b3", "b4"];
 
 fn cx_of(v: &ViewModel, w: usize) -> Cx<'_> {
-    Cx { w, b: Badge::of(v, &Bar::default()), now: v.now, spin: 0, home: home_of(v), cur: v.cur_win.as_deref(), shells: v.shells, resumes: false, stale_after: crate::view::STALE_AFTER_DEFAULT }
+    Cx { w, b: Badge::of(v, &Bar::default()), now: v.now, spin: 0, home: home_of(v), cur: v.cur_win.as_deref(), shells: v.shells, resumes: false, stale_after: crate::view::STALE_AFTER_DEFAULT, fold_after: crate::view::FOLD_AFTER_DEFAULT }
 }
 
 /// The space headers among `rows`, by name.
@@ -159,9 +159,9 @@ fn bare_headers_go_first() {
     }
     assert!(seen.0 && seen.1, "{seen:?}");
     // The one-line shape NEEDS YOU is weighed against has none of them.
-    let one = agents_section(&v, cx, agents_one_line(&v), false, true);
+    let one = agents_section(&v, cx, agents_one_line(&v, cx), false, true);
     assert!(one.1 <= 2 && names(&one.0, w) == ["main", "work"], "{one:?}");
-    assert_eq!(agents_one_line(&v), 1 + (1 + 3) + (1 + 1));
+    assert_eq!(agents_one_line(&v, cx), 1 + (1 + 3) + (1 + 1));
     // Whole frames: the same, every agent accounted for at every height.
     let mut thinned = false;
     for h in 4u16..=50 {
@@ -232,8 +232,8 @@ fn bare_headers_go_before_the_chips_and_the_dock() {
 fn the_words_come_back_when_every_bare_header_goes() {
     let homes = |names: &[&'static str]| names.iter().map(|s| a(s, 0, "", "zsh").with("home", "1")).collect::<Vec<_>>();
     let v = scoped(homes(&["b1", "b2", "b3", "b4"]), "@1", "b1", "on", "all", "");
-    assert_eq!(agents_one_line(&v), 2);
     let cx = cx_of(&v, 34);
+    assert_eq!(agents_one_line(&v, cx), 2);
     let t: Vec<String> = agents_section(&v, cx, 2, false, true).0.iter().map(Row::text).collect();
     assert!(t.len() == 2 && t[0].starts_with(" AGENTS") && t[1].starts_with("   no agents running"), "{t:#?}");
     // Whole frames: wherever no bare header is left, the words are there.

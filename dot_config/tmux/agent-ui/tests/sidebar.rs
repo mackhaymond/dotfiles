@@ -756,7 +756,9 @@ fn live_loop_draws_follows_notices_and_exits_quietly() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(s.tmux(&["display-message", "-p", "-t", "main:9", "#{pane_dead}"]).trim(), "0");
     // Option-V: the scope toggle, persisted in the global @strip_scope
-    // (nothing set yet: scope "all", so it flips to "space").
+    // (nothing set yet: scope "all", so it goes to "space"; with no client
+    // row to read it back from, the cycle itself is driven in
+    // the_sidebar_leaves_with_its_client).
     send("\x1bv");
     wait_for("the scope option", || s.tmux(&["show-options", "-gqv", "@strip_scope"]).trim() == "space");
 
@@ -841,12 +843,19 @@ fn the_sidebar_leaves_with_its_client() {
     wait_for("the line hidden again", || opt("status") == "off");
     // @strip_scope set from outside (tmux's M-v) plus the focus notice: the
     // agents section follows at once, and back.
-    for (scope, title) in [("space", "this space"), ("all", "all spaces")] {
+    for (scope, title) in [("space", "this space"), ("active", "⌥V active"), ("all", "all spaces")] {
         s.tmux(&["set-option", "-g", "@strip_scope", scope]);
         let t = Instant::now();
         post(&focus);
         wait_for("the scope from outside", || screen().lines().any(|l| l.starts_with(" AGENTS") && l.contains(title)));
         assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
+    }
+    // Option-V in the sidebar: one step of the cycle per press (all → this
+    // space → active → all), persisted and read back before the next.
+    for (want, title) in [("space", "this space"), ("active", "⌥V active"), ("all", "all spaces")] {
+        s.tmux(&["send-keys", "-t", "main:9", "-H", "1b", "76"]);
+        wait_for(want, || s.tmux(&["show-options", "-gqv", "@strip_scope"]).trim() == want);
+        wait_for(title, || screen().lines().any(|l| l.starts_with(" AGENTS") && l.contains(title)));
     }
     // A window switch on the client, then the focus notice (tmux's hooks
     // post it): the lift (and its lavender rail, the agent being idle)

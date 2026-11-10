@@ -224,6 +224,34 @@ fn shells_and_pending_spaces() {
     assert!(f.rows[y + 1].text().contains(Harness::named("claude").glyph()), "{:#?}", texts(&f));
 }
 
+/// A shell running a hookless agent (⌘E's launcher sets `@agent_harness`)
+/// shows that harness's one-cell glyph in its colour where the green `❯`
+/// goes: cursor-agent (`cursor`, an AgentMarks logo) does. aider has no logo
+/// (its `aider` id is not in HARNESSES, so it is OTHER) and keeps the plain
+/// prompt, as a plain shell does.
+#[test]
+fn a_hookless_agents_shell_wears_its_glyph() {
+    assert_eq!(Harness::named("aider"), Harness::OTHER);
+    let v = scoped(
+        vec![
+            a("main", 1, "running", "Busy"),
+            a("main", 2, "", "cursor-agent").with("harness", "cursor"),
+            a("main", 3, "", "zsh"),
+            a("main", 4, "", "aider").with("harness", "aider"),
+        ],
+        "@1", "main", "on", "space", "",
+    );
+    let f = layout(&v, 34, 30, &Opts::default());
+    let shell = |win: &str| f.rows.iter().find(|r| r.targets.iter().any(|t| t.2 == Target::Shell { win: win.into(), session: "main".into() })).unwrap();
+    let cursor = Harness::named("cursor");
+    let g = shell("@2").segs.iter().find(|s| s.text.starts_with(cursor.glyph())).unwrap_or_else(|| panic!("{:?}", shell("@2").text()));
+    assert_eq!((g.text.clone(), g.fg), (format!("{} ", cursor.glyph()), Ink::Pal(cursor.hue())));
+    assert!(!shell("@2").text().contains(PROMPT));
+    for win in ["@3", "@4"] {
+        assert!(shell(win).text().contains(PROMPT), "{win}: {:?}", shell(win).text());
+    }
+}
+
 /// A selected card (prefix v) is solid mauve with crust ink through: the
 /// mark too, one ink on one colour (the other harness's faint mark in the
 /// softer crust, as all dim text there).

@@ -11,7 +11,7 @@ const H: i64 = 3600;
 
 /// An insight with a last prompt, `diff` (added, removed, files) and
 /// whether git has answered for it (`known`).
-fn ins(diff: Option<(u64, u64, usize)>, known: bool) -> Insight {
+pub(super) fn ins(diff: Option<(u64, u64, usize)>, known: bool) -> Insight {
     Insight {
         kind: Kind::Claude,
         transcript: "/nonexistent/t.jsonl".into(),
@@ -125,13 +125,13 @@ fn the_option_overrides_the_threshold() {
     // Through the layout: the bar's value, else the default.
     let v = one(aged("idle", 15 * 60, "Jacket"), clean());
     let line = |bar: Bar| {
-        let f = layout(&v, 44, 30, &Opts { bar, ..Opts::default() });
+        let f = layout(&v, 44, 30, &Opts { bar: Bar { fold_after: Some(0), ..bar }, ..Opts::default() });
         words(&f.rows[find(&f, "Jacket") + 1].text())
     };
     assert_eq!(line(Bar::default()), "> fix the parser 15m");
     assert_eq!(line(Bar { stale_after: Some(600), ..Bar::default() }), "> fix the parser close? · 15m");
     let v = one(aged("idle", 5 * H, "Jacket"), clean());
-    let f = layout(&v, 44, 30, &Opts { bar: Bar { stale_after: Some(0), ..Bar::default() }, ..Opts::default() });
+    let f = layout(&v, 44, 30, &Opts { bar: Bar { stale_after: Some(0), fold_after: Some(0), ..Bar::default() }, ..Opts::default() });
     assert_eq!(words(&f.rows[find(&f, "Jacket") + 1].text()), "> fix the parser 5h");
 }
 
@@ -149,9 +149,15 @@ fn pinned_agents_keep_only_the_unsaved_flag() {
     assert_eq!(words(&f.rows[y].text()), "> fix the parser +5 · 1f unsaved work · main · 5h", "{:#?}", texts(&f));
 }
 
+/// Folding off: these cards sit idle for hours, past `@space_fold_hours`
+/// (the hint is the card's; folding has its own tests, fold.rs).
+fn no_fold() -> Opts {
+    Opts { bar: Bar { fold_after: Some(0), ..Bar::default() }, ..Opts::default() }
+}
+
 /// The second line of agent @1's card at `w` columns: its words and row.
 fn second_at(v: &ViewModel, w: u16) -> (String, Row) {
-    let f = layout(v, w, 30, &Opts::default());
+    let f = layout(v, w, 30, &no_fold());
     let t = texts(&f);
     assert!(t.iter().all(|l| dwidth(l) == usize::from(w)), "{w}: {t:#?}");
     let y = find(&f, "Jacket") + 1;
@@ -205,7 +211,7 @@ fn the_hint_on_the_card_at_every_width() {
     // A one-line card (no second line): no hint, at any width.
     let a1 = close.agents().find(|a| a.window_id == "@1").unwrap();
     for w in 8usize..=60 {
-        let cx = Cx { w, b: Badge::of(&close, &Bar::default()), now: close.now, spin: 0, home: None, cur: None, shells: true, resumes: false, stale_after: STALE_AFTER_DEFAULT };
+        let cx = Cx { w, b: Badge::of(&close, &Bar::default()), now: close.now, spin: 0, home: None, cur: None, shells: true, resumes: false, stale_after: STALE_AFTER_DEFAULT, fold_after: crate::view::FOLD_AFTER_DEFAULT };
         let rows = agent_rows(a1, cx, false, 0, Ink::Pal("peach"), None);
         assert!(rows.len() == 1 && !rows[0].text().contains("close?"), "{w}: {:?}", rows[0].text());
         assert_eq!(dwidth(&rows[0].text()), w);

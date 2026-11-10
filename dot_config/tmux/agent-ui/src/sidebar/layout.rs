@@ -192,11 +192,73 @@
 //! shells into one line); then every agent goes to one line (age beside its
 //! state), unfolded, then folded again; then whole spaces collapse to their
 //! header (with its counts, its shells gone with it), fewest attention
-//! agents first; finally a `… N more` line.
+//! agents first; finally a `… N more` line. (Dormant spaces and idle agents
+//! out of mind are folded at EVERY step, step 0 included: "Dormant
+//! spaces" below.)
 //!
 //! Every agents-section row records the agents it stands for
 //! ([`Row::covers`]), so a test can prove each agent is shown, folded,
 //! collapsed or counted.
+//!
+//! ## Dormant spaces: state and recency fold too, not only rows
+//!
+//! The ladder above folds under ROW pressure; this folds what Mack is not
+//! working on, at every height (2026-11-10). Its clock is `@thread_at`, the
+//! epoch of Mack's OWN last prompt into a window (agent-tab-indicator.sh
+//! stamps it on UserPromptSubmit only when its classifier says the prompt
+//! is his: never a peer's `message_agent`, never a harness wake-up). A
+//! space's last prompt is the newest over its agent windows
+//! ([`crate::view::Space::thread_at`]). A window without a stamp (a
+//! restore, an older window, a tab Mack never typed into) counts from its
+//! `@agent_since` while it is idle ([`crate::view::prompted_at`]: a prompt
+//! would have moved it to running since, so that is never OLDER than the
+//! real last prompt, only fresher; a restore restamps it, so a restore
+//! stays fresh); with neither it counts as just prompted (FAIL SAFE: it
+//! never folds or dims anything). N is `@space_fold_hours` (a global,
+//! hours, default 4, `0` off: the dormant fold, the idle fold and the stale
+//! nudge all; [`Bar::fold_after`], [`Cx::fold_after`]).
+//!
+//! ```text
+//!  ▌ 1  main                  ◐1 ○2     the client's space: never folds
+//!  ▎  d  Tmux Agent Sidebar ⠹ working
+//!  ▎  ✻  › Running cargo test     26s
+//!     ○○ 2 idle · Notch Tasks Orch…     idle and unprompted for N: the line
+//!
+//!    3  schedule               ○3 ▸     DORMANT: its header and counts alone
+//!    4  bai                 3d ○2 ▸     ...and STALE: dimmed, the age
+//!    6  mackhaymond.co         ○2 ▾     dormant but kept open by hand
+//!     ○○ 2 idle · Launchpad catalo…
+//! ```
+//!
+//! - A space is DORMANT ([`dormant`]) when every agent in it is idle (by the
+//!   whole space's counts, pinned ones included: nothing working, asking,
+//!   failed, done or paused; no prompt just answered, no work out) and Mack
+//!   has not prompted it for N. It is its header and counts alone (the
+//!   collapsed form, its shells gone with it; the header stands for all its
+//!   agents), whatever the rows. Never the client's space (⌘N or a header
+//!   click lands there, so it is open on arrival; it folds again once he
+//!   leaves), never a pending space, never one kept open by hand.
+//! - KEEP OPEN by hand: a dormant header ends in a fold chip, `▸` after its
+//!   counts; a click on the counts or the chevron ([`Target::Fold`]) keeps
+//!   the space open (`▾` then), a second lets it fold again. The rest of the
+//!   header still goes home, so "a click on a header goes home" holds
+//!   wherever it did. Kept by space NAME in
+//!   `~/.local/state/agent-ui/space-open.json` ([`super::fold`]: a session
+//!   option would die with its server; a restore brings spaces back by
+//!   name). Only a header that is dormant by the clock carries the chip:
+//!   one collapsed for rows does not (keeping it open would not give rows).
+//! - IDLE FOLD under an open header: an idle agent idle (its state stamp)
+//!   and unprompted (its own `@thread_at`) for N ([`aged`]) folds into the
+//!   space's one `○ K idle · …` line at every height, even alone (the line
+//!   quiets it). Working, asking, done and recently prompted agents keep
+//!   their cards, and so does the client's own. Shells are unchanged.
+//! - STALE: a space Mack has not prompted for [`STALE_SPACE`] (two days),
+//!   with nothing live in it, dims ([`stale_space`]): its number a quiet
+//!   chip (its colour on a tint), its name in the dim ink, the age (`3d`)
+//!   before its counts. A hint only; nothing is done to it.
+//! - ACTIVE scope (⌥V, below) lists every space but the dormant ones (and
+//!   the bare ones), which one ` … K quiet spaces` line counts and stands
+//!   for; a click on it is the next scope, all spaces.
 //!
 //! ## Narrow widths
 //!
@@ -242,9 +304,12 @@
 //! have no fill (one background per card); a selected card inks them crust
 //! like the rest. A PINNED card's ⌥W digit ([`pin_cap`]) therefore sits
 //! BESIDE its letter on the first row (the cells under the letter are the
-//! mark's). One-line cards, the folded idle tile and the shell rows and
-//! pills carry no mark: a mark needs the second row, and a shell has no
-//! harness.
+//! mark's). One-line cards, the folded idle tile and the shell pills carry
+//! no mark: a mark needs the second row. A SHELL row whose window has a
+//! known harness (`@agent_harness`, set by ⌘E's launcher on a hookless
+//! agent's tab) shows its one-cell glyph in its colour where the green `❯`
+//! goes ([`shell_row`]): cursor-agent does; aider has no logo (OTHER) and
+//! keeps the `❯`, as a plain shell does.
 //!
 //! ## Scope
 //!
@@ -256,9 +321,13 @@
 //! `@spaces` off: every session with agents). The words under AGENTS
 //! (` no agents running`, ` all pinned above`) then show only when not one
 //! space is listed (none at all, or every bare header made way for rows):
-//! under bare headers they would say nothing new. NEEDS
-//! YOU, the spaces and parked stay global. The AGENTS header's scope word
-//! is a toggle once the scope is a thing.
+//! under bare headers they would say nothing new. ACTIVE scope (between
+//! the two in ⌥V's cycle: this space → active → all) is all scope less the
+//! dormant and the bare spaces, the dormant ones counted on one ` … K quiet
+//! spaces` line ("Dormant spaces" above; with nothing else listed the
+//! words say ` all quiet`). NEEDS YOU, the spaces and parked stay global.
+//! The AGENTS header's scope word (`⌥V this space`, `⌥V active`, `⌥V all
+//! spaces`) is the next step of the cycle once the scope is a thing.
 //!
 //! ## Pinned
 //!
@@ -616,9 +685,15 @@ pub enum Target {
     Keys,
     /// The red watcher warning: restart it (the strip's ⟳, Strip.click "restart").
     Restart,
-    /// The scope word (or the classic title): flip the scope (space / all) and
-    /// persist it in `@strip_scope` (Strip.toggle_scope).
+    /// The scope word (or the classic title), and active scope's `… K quiet
+    /// spaces` line: the next scope (this space → active → all), persisted
+    /// in `@strip_scope` (Strip.toggle_scope).
     Scope,
+    /// A dormant space header's fold chip (its counts and `▸` / `▾`,
+    /// [`group_header`]): keep that space open by hand, or let it fold again
+    /// (`sidebar::fold`, kept by name across a restore). The rest of the
+    /// header still goes to the space's home.
+    Fold(String),
     /// A toast ([`Toast::id`]): dismissed, in this sidebar only.
     Toast(ToastId),
     /// The pause banner once the pause is settled (safe to close, or ready
@@ -885,6 +960,11 @@ struct Cx<'a> {
     /// The stale-agent sweep's threshold (seconds; 0: off): `@agent_stale_after`
     /// ([`Bar::stale_after`], else [`crate::view::STALE_AFTER_DEFAULT`]).
     stale_after: i64,
+    /// Seconds without a prompt from Mack before a space folds as dormant
+    /// and an idle agent into its space's idle line (0: off):
+    /// `@space_fold_hours` ([`Bar::fold_after`], else
+    /// [`crate::view::FOLD_AFTER_DEFAULT`]).
+    fold_after: i64,
 }
 
 impl Cx<'_> {
@@ -1022,9 +1102,38 @@ fn marks(bar: &Bar, room: usize) -> Vec<Seg> {
         v
     } else if bar.jump {
         vec![block(" ⌥W jump ", "crust", "peach"), on(" type a letter ", "peach", "surface1")]
+    } else if let Some(agents) = &bar.launch {
+        launch_marks(agents, room)
     } else {
         Vec::new()
     }
+}
+
+/// ⌘E armed (key table `launch`, spaces.conf; [`Bar::launch`]): a peach
+/// ` ⌘E launch `, then on `surface1` each installed agent as its one-cell
+/// harness glyph in its brand colour and its letter (`text`), a pad after
+/// each, in agent-launch.sh's order (claude first). Whole items only: as
+/// many as `room` takes, the rest left out, never one cut in half. With no
+/// list yet (`@launch_agents` unset), ` type a letter ` as ⌥W's.
+fn launch_marks(agents: &[(char, crate::model::Harness)], room: usize) -> Vec<Seg> {
+    let mut v = vec![block(" ⌘E launch ", "crust", "peach")];
+    if agents.is_empty() {
+        v.push(on(" type a letter ", "peach", "surface1"));
+        return v;
+    }
+    // The lead pad, then `G k ` per agent (glyph, letter, pad).
+    let mut items = vec![on(" ", "text", "surface1")];
+    for (k, h) in agents {
+        let item = [on(h.glyph().to_string(), h.hue(), "surface1"), on(format!("{k} "), "text", "surface1")];
+        if width(&v) + width(&items) + width(&item) > room {
+            break;
+        }
+        items.extend(item);
+    }
+    if items.len() > 1 {
+        v.extend(items);
+    }
+    v
 }
 
 /// prefix v's range selection is live: ` N selected ` on mauve and stash.sh's
@@ -1994,7 +2103,15 @@ fn shell_row(s: &Agent, cx: Cx, space: Ink) -> Row {
     if cx.b.on {
         left.extend([cx.b.seg(s, space, Ink::Pal(TONES.0), mine), seg(" ", "text")]);
     }
-    left.push(bold(PROMPT, "green"));
+    // A shell running a hookless agent (⌘E's launcher sets its
+    // `@agent_harness`) with a logo (cursor-agent; not aider, whose id is
+    // OTHER): that harness's one-cell glyph in its colour where the prompt
+    // goes; any other shell the prompt.
+    if s.harness != crate::model::Harness::OTHER {
+        left.push(seg(format!("{} ", s.harness.glyph()), s.harness.hue()));
+    } else {
+        left.push(bold(PROMPT, "green"));
+    }
     let mut right = vec![seg(" ", "text")];
     if mine && cx.seconds() {
         right.push(seg(MINE, MINE_HUE));
@@ -2946,20 +3063,54 @@ fn group_header(sp: &Space, cx: Cx, collapsed: bool) -> Row {
     let here = sp.is_current || mine;
     let dimc = if here { "sub" } else { "overlay2" };
     let spin = pending_spins(sp).then(|| SPIN[cx.spin % SPIN.len()]);
-    let mut right = if spin.is_some() { Vec::new() } else { surface_counts(&sp.counts, dimc) };
+    // A space Mack has not prompted for days: the age, dim, before its
+    // counts, and the whole header dimmed ([`stale_space`]).
+    let stale = if here { None } else { stale_space(sp, cx) };
+    let mut right = Vec::new();
+    if let Some(age) = &stale {
+        right.push(seg(age.clone(), "overlay"));
+    }
+    let counts = if spin.is_none() { surface_counts(&sp.counts, dimc) } else { Vec::new() };
+    let counts_w = width(&counts);
+    if !right.is_empty() && !counts.is_empty() {
+        right.push(seg(" ", "text"));
+    }
+    right.extend(counts);
+    // A DORMANT space's fold chip: `▸` folded (a click keeps it open), `▾`
+    // kept open by hand (a click lets it fold again). Only where folding is
+    // the dormancy's, never on a space folded for rows ([`dormant_eligible`]).
+    let chevron = dormant_eligible(sp, cx).then_some(if sp.open { FOLD_OPEN } else { FOLD_SHUT });
+    if let Some(c) = chevron {
+        if !right.is_empty() {
+            right.push(seg(" ", "text"));
+        }
+        right.push(bold(c, dimc));
+    }
     if !right.is_empty() {
         // (A cell between a name cut short and its counts.)
         right.insert(0, seg(" ", "text"));
     }
+    // The fold chip's cells: the counts and the chevron (the age before them
+    // and the pad after are the header's), counted from the right edge.
+    let chip_w = chevron.map_or(0, |c| counts_w + usize::from(counts_w > 0) + dwidth(c));
     right.push(seg(" ", "text"));
     if mine && cx.seconds() {
         // (After the right side's own pad, where an own card's edge is.)
         right.push(seg(MINE, MINE_HUE));
     }
-    let mut left = vec![block(format!(" {} ", space_num(sp)), ink_on(ink), ink), seg(" ", "text")];
+    let num = format!(" {} ", space_num(sp));
+    let mut left = if stale.is_some() {
+        // Dimmed: the number a quiet chip (its colour on a tint, as a quiet
+        // key-cap), the name in the canvas's dim ink.
+        vec![Seg { bold: true, ..on(num, ink, tint(ink, CAP_TINT)) }, seg(" ", "text")]
+    } else {
+        vec![block(num, ink_on(ink), ink), seg(" ", "text")]
+    };
     if sp.pending.is_some() {
         left.push(italic(CREATING, dimc));
         left.extend(spin.map(|g| bold(format!(" {g}"), cat_hue(Cat::Working))));
+    } else if stale.is_some() {
+        left.push(bold(sanitize(&sp.name), LABEL));
     } else {
         left.push(bold(sanitize(&sp.name), name_ink(ink)));
     }
@@ -2982,6 +3133,15 @@ fn group_header(sp: &Space, cx: Cx, collapsed: bool) -> Row {
     }
     if sel {
         row = sel_row(row);
+    }
+    // The fold chip first (a cell's first target wins), then the home.
+    let end = m + inner(w);
+    let chip_w = chip_w.min(end.saturating_sub(m + 1));
+    if chip_w > 0 {
+        // (The pad after the chevron is the right side's last cell before
+        // the margin: the chip ends one cell short of `end`.)
+        let x1 = end - 1;
+        row.targets.push(((x1 - chip_w) as u16, x1 as u16, Target::Fold(sp.name.clone())));
     }
     let mut row = row.click(w, target);
     row.anim = spin.is_some();
@@ -3036,13 +3196,99 @@ fn key(a: &Agent) -> Key<'_> {
     (&a.session, &a.window_id)
 }
 
-/// With `fold`, a space's idle agents (never the client's window, never one
-/// whose prompt was just answered: it is still Active) go into one line,
-/// when there are 2+ of them → (shown in place, folded).
-fn split_idle(sp: &Space, fold: bool, now: f64) -> (Vec<&Agent>, Vec<&Agent>) {
-    let foldable = |a: &Agent| fold && a.cat == Some(Cat::Idle) && !a.is_current && !a.answered && !recent_done(a, now);
-    let (idle, shown): (Vec<&Agent>, Vec<&Agent>) = sp.agents.iter().partition(|a| foldable(a));
-    if idle.len() >= 2 {
+// ---------------------------------------------------------------- dormant spaces
+
+/// A dormant space's fold chip: folded (a click keeps it open) / kept open
+/// by hand (a click lets it fold again).
+pub const FOLD_SHUT: &str = "▸";
+pub const FOLD_OPEN: &str = "▾";
+
+/// How long a space may go without a prompt from Mack before its header
+/// dims and shows the age ([`stale_space`]): two days.
+pub const STALE_SPACE: i64 = 2 * 86_400;
+
+/// Seconds since Mack last prompted `t` at the frame's clock
+/// ([`crate::view::prompted_at`]: the stamp, else an idle window's state
+/// stamp); None: FRESH, never old.
+fn unprompted(t: Option<i64>, cx: Cx) -> Option<i64> {
+    t.map(|t| (cx.now.floor() as i64 - t).max(0))
+}
+
+/// Nothing in the space is live: it has agents, every one idle (by the
+/// whole space's counts, pinned agents included: not working, asking,
+/// failed, done or paused), none with a prompt just answered or work out.
+fn all_idle(sp: &Space) -> bool {
+    sp.counts.total() > 0
+        && sp.counts.total() == sp.counts.get(Cat::Idle)
+        && !sp.agents.iter().any(|a| a.answered || a.in_flight || a.attention)
+}
+
+/// The space folds as DORMANT unless Mack kept it open by hand: all idle
+/// ([`all_idle`]) and not prompted by Mack for `fold_after` (the newest
+/// last prompt of its agent windows, [`Space::thread_at`]: `@thread_at`,
+/// else an idle window's `@agent_since`; a window with neither makes it
+/// fresh). Never the client's space (⌘N or a header
+/// click lands there, so it is open on arrival and folds again once he
+/// leaves), never a pending space, never with `@space_fold_hours` 0.
+fn dormant_eligible(sp: &Space, cx: Cx) -> bool {
+    cx.fold_after > 0
+        && sp.pending.is_none()
+        && !sp.is_current
+        && all_idle(sp)
+        && unprompted(sp.thread_at, cx).is_some_and(|q| q >= cx.fold_after)
+        // (An agent with UNSAVED WORK keeps its card: [`aged`].)
+        && !sp.agents.iter().any(|a| a.stale(cx.now, cx.stale_after) == Some(Stale::Unsaved))
+}
+
+/// [`dormant_eligible`] and not kept open ([`Space::open`]): the space is
+/// its header and counts alone (the collapsed form), whatever the rows.
+fn dormant(sp: &Space, cx: Cx) -> bool {
+    dormant_eligible(sp, cx) && !sp.open
+}
+
+/// A space Mack has not prompted for [`STALE_SPACE`] or more, with nothing
+/// live in it (no agent working, asking, failed or done): its age (`3d`),
+/// for a dimmed header. A hint only, nothing is done to it. Never a pending
+/// space, never a fresh one, never with `@space_fold_hours` 0 (that turns
+/// the whole recency fold off, this nudge with it).
+fn stale_space(sp: &Space, cx: Cx) -> Option<String> {
+    let live = [Cat::Working, Cat::NeedsInput, Cat::Failed, Cat::Done].iter().any(|&c| sp.counts.get(c) > 0);
+    if cx.fold_after <= 0 || sp.pending.is_some() || live || sp.agents.iter().any(|a| a.attention || a.in_flight) {
+        return None;
+    }
+    unprompted(sp.thread_at, cx).filter(|&q| q >= STALE_SPACE).map(|_| crate::text::ago(sp.thread_at, cx.now))
+}
+
+/// An idle agent out of mind: idle (its state stamp) and not prompted by
+/// Mack ([`Agent::prompted_at`]: its `@thread_at`, else its state stamp)
+/// for `fold_after`. It folds into its
+/// space's idle line at EVERY height, not only when rows run short. Never
+/// the client's window, a prompt just answered, a turn just done, nor one
+/// with work out, nor one the stale sweep says has UNSAVED WORK
+/// ([`Agent::stale`]: its card's `unsaved work` hint is a risk worth
+/// seeing; a `close?` one folds, the line is the softer close).
+fn aged(a: &Agent, cx: Cx) -> bool {
+    let old = |t: Option<i64>| unprompted(t, cx).is_some_and(|q| q >= cx.fold_after);
+    cx.fold_after > 0
+        && a.cat == Some(Cat::Idle)
+        && !a.is_current
+        && !a.answered
+        && !a.in_flight
+        && !recent_done(a, cx.now)
+        && old(a.since)
+        && old(a.prompted_at())
+        && a.stale(cx.now, cx.stale_after) != Some(Stale::Unsaved)
+}
+
+/// A space's idle agents that go into its one idle line → (shown in place,
+/// folded): the [`aged`] ones always; with `fold` (the ladder's idle-folding
+/// steps) every idle one too (never the client's window, never one whose
+/// prompt was just answered: it is still Active). A lone idle agent folds
+/// only when it is aged (the line quiets it); else two or more.
+fn split_idle<'a>(sp: &'a Space, fold: bool, cx: Cx) -> (Vec<&'a Agent>, Vec<&'a Agent>) {
+    let foldable = |a: &Agent| fold && a.cat == Some(Cat::Idle) && !a.is_current && !a.answered && !recent_done(a, cx.now);
+    let (idle, shown): (Vec<&Agent>, Vec<&Agent>) = sp.agents.iter().partition(|a| foldable(a) || aged(a, cx));
+    if idle.len() >= 2 || idle.first().is_some_and(|a| aged(a, cx)) {
         (shown, idle)
     } else {
         (sp.agents.iter().collect(), vec![])
@@ -3057,7 +3303,7 @@ fn split_idle(sp: &Space, fold: bool, now: f64) -> (Vec<&Agent>, Vec<&Agent>) {
 /// `fold` (the steps that fold the idle agents), two or more of them in one
 /// line ([`shells_line`]).
 fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool) -> Vec<Row> {
-    let (shown, idle) = split_idle(sp, fold, cx.now);
+    let (shown, idle) = split_idle(sp, fold, cx);
     let ink = space_colour(sp);
     let mut rows: Vec<Row> = Vec::new();
     for (k, a) in shown.iter().enumerate() {
@@ -3135,26 +3381,60 @@ fn bare_group(view: &ViewModel, sp: &Space) -> bool {
     sp.agents.is_empty() && shells_of(sp, view.shells).is_empty()
 }
 
+/// The spaces the agents section draws in the frame's scope, and the ones
+/// it counts on its `… K quiet spaces` line instead. ACTIVE scope
+/// ([`crate::view::Scope::active`]) is all scope less the dormant spaces
+/// (counted on that line) and the bare ones (no agent, no shell: the dock
+/// lists them); any other scope draws [`groups`] and counts none.
+fn scope_groups<'a>(view: &'a ViewModel, cx: Cx) -> (Vec<&'a Space>, Vec<&'a Space>) {
+    let gs = groups(view);
+    if !view.scope.active() || view.scope.session.is_some() {
+        return (gs, Vec::new());
+    }
+    let (quiet, shown): (Vec<&Space>, Vec<&Space>) = gs.into_iter().partition(|g| dormant(g, cx));
+    (shown.into_iter().filter(|g| !bare_group(view, g)).collect(), quiet)
+}
+
+/// ` … K quiet spaces`: active scope's dormant spaces, each a header in all
+/// scope. It stands for their agents; a click is the scope's next step
+/// (all spaces, where they are listed).
+fn quiet_row(w: usize, quiet: &[&Space]) -> Row {
+    let n = quiet.len();
+    let agents = quiet.iter().flat_map(|g| g.agents.iter());
+    dim_line(w, &format!(" … {n} quiet space{}", if n == 1 { "" } else { "s" })).click(w, Target::Scope).covering(agents)
+}
+
 /// The agents section's rows when every agent (and shell) is on one line,
-/// nothing folded or collapsed: what step 4 leaves the agents before NEEDS
-/// YOU gets the rest. (The bare spaces' headers are gone by then:
-/// [`agents_section`] drops them before anything else; with nothing else
-/// to list, the words are back.)
-fn agents_one_line(view: &ViewModel) -> usize {
+/// nothing folded or collapsed for rows: only what folds at every step
+/// does (a dormant space its header alone, the agents out of mind their
+/// space's one idle line; each group exactly as [`group_rows`] lays it out
+/// one line each): what step 4 leaves the agents before NEEDS YOU gets the rest.
+/// (The bare spaces' headers are gone by then: [`agents_section`] drops
+/// them before anything else; with nothing else to list, the words are
+/// back.) Active scope's quiet line counts too.
+fn agents_one_line(view: &ViewModel, cx: Cx) -> usize {
     let pins = if view.pinned.is_empty() { 0 } else { 1 + view.pinned.len() };
-    let groups = groups(view);
+    let (groups, quiet) = scope_groups(view, cx);
+    let quiet = usize::from(!quiet.is_empty());
     let space = view.scope.session.is_some();
     if groups.iter().all(|g| bare_group(view, g)) {
-        return pins + 2 + usize::from(space);
+        return pins + 2 + usize::from(space) + quiet;
     }
     let full = groups.iter().filter(|g| !bare_group(view, g));
-    pins + 1 + full.map(|g| 1 + g.agents.len() + shells_of(g, view.shells).len()).sum::<usize>()
+    let rows = |g: &Space| if dormant(g, cx) { 1 } else { 1 + group_rows(g, cx, &[], false).len() };
+    pins + 1 + quiet + full.map(|g| rows(g)).sum::<usize>()
 }
 
 /// A space header in the agents section ([`group_header`]: the whole row
-/// switches to its space; nothing else there does).
+/// switches to its space; nothing else there does but a dormant space's
+/// fold chip, [`Target::Fold`], the one other target it may carry).
 fn is_group_header(r: &Row, w: usize) -> bool {
-    matches!(r.targets.as_slice(), [(0, x1, Target::Session(_) | Target::Pending(_))] if usize::from(*x1) == w)
+    match r.targets.as_slice() {
+        [(0, x1, Target::Session(_) | Target::Pending(_))] | [(_, _, Target::Fold(_)), (0, x1, Target::Session(_))] => {
+            usize::from(*x1) == w
+        }
+        _ => false,
+    }
 }
 
 /// A blank canvas row that does nothing and stands for no one (a gap).
@@ -3244,12 +3524,19 @@ fn pin_block(view: &ViewModel, cx: Cx, two: &[Key]) -> Vec<Row> {
     rows
 }
 
-/// ` AGENTS` and the scope on the right (`this space` / `all spaces`): a
+/// ` AGENTS` and the scope on the right (`this space` / `active` / `all
+/// spaces`): a
 /// herdr-style key hint once the scope is a thing (`⌥V` bold blue, the
 /// word dim; a click on it flips it too: a hint, not a selection, so no
 /// fill), else the word dim.
 fn agents_header(view: &ViewModel, w: usize) -> Row {
-    let word = if view.scope.session.is_some() { "this space" } else { "all spaces" };
+    let word = if view.scope.session.is_some() {
+        "this space"
+    } else if view.scope.active() {
+        "active"
+    } else {
+        "all spaces"
+    };
     let toggles = view.scope.toggles() && w > dwidth(word) + 14;
     let right = if toggles { vec![bold("⌥V", "blue"), seg(format!(" {word}"), LABEL)] } else { vec![seg(word, LABEL)] };
     let ww = width(&right) + 1;
@@ -3291,7 +3578,8 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
         return (vec![], 0);
     }
     let w = cx.w;
-    let groups = groups(view);
+    // (Active scope: the dormant spaces are `quiet`, one line at the end.)
+    let (groups, quiet) = scope_groups(view, cx);
     let space = view.scope.session.is_some();
     let header = agents_header(view, w);
     let pins = !view.pinned.is_empty();
@@ -3307,6 +3595,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
         (true, _) if mine_pinned => "   all pinned above",
         (true, _) => "   no agents in this space",
         (false, true) => "   all pinned above",
+        (false, false) if !quiet.is_empty() => "   all quiet",
         (false, false) => "   no agents running",
     };
     // `gs`: the groups listed (`collapsed` says which of them are), `gone`
@@ -3322,6 +3611,9 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
                 rows.extend(gs.iter().map(|g| group_header(g, cx, false)));
             }
             rows.push(dim_line(w, empty));
+            if !quiet.is_empty() {
+                rows.push(quiet_row(w, &quiet));
+            }
             return rows;
         }
         for (k, (sp, &c)) in gs.iter().zip(collapsed).enumerate() {
@@ -3336,15 +3628,27 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
         if gone > 0 {
             rows.push(empty_spaces_row(w, gone));
         }
+        if !quiet.is_empty() {
+            rows.push(quiet_row(w, &quiet));
+        }
         rows
     };
-    let open = |gs: &[&Space]| vec![false; gs.len()];
+    // Nothing collapsed for rows yet: only the DORMANT spaces are their
+    // header alone ([`dormant`]), at every step.
+    let open = |gs: &[&Space]| gs.iter().map(|g| dormant(g, cx)).collect::<Vec<bool>>();
     // The header and the words, nothing to fold. (Cut short: the last
     // step, so a frame's full-detail search never takes it for a fit.)
     let words = |gs: &[&Space]| {
         let mut rows = build(gs, &[], false, &open(gs), false, 0);
         let step = if rows.len() > budget { 5 } else { 0 };
         rows.truncate(budget);
+        // (The quiet line cut off: its agents on the last row that is left.)
+        if step == 5 && !quiet.is_empty() {
+            let q: Vec<&Agent> = quiet.iter().flat_map(|g| g.agents.iter()).collect();
+            if let Some(last) = rows.last_mut() {
+                *last = more_row(w, &q, quiet.len());
+            }
+        }
         (rows, step)
     };
     if bare && !pins {
@@ -3398,12 +3702,15 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
     }
     // The pinned block on one line each: what every later step keeps.
     let lead = pin_block(view, cx, &[]).len();
+    // (What a cut counts: the listed spaces, then the quiet ones.)
+    let counted: Vec<&Space> = groups.iter().chain(&quiet).copied().collect();
     if bare {
-        return pins_cut(view, cx, &groups, &header, budget);
+        return pins_cut(view, cx, &counted, &header, budget);
     }
     // Collapse whole spaces: fewest attention agents first, then the client's
-    // space last, then fewest in flight, then from the end of the list.
-    let mut order: Vec<usize> = (0..groups.len()).collect();
+    // space last, then fewest in flight, then from the end of the list. (A
+    // dormant space is collapsed already.)
+    let mut order: Vec<usize> = (0..groups.len()).filter(|&i| !collapsed[i]).collect();
     order.sort_by_key(|&i| {
         let g = groups[i];
         let attn = g.agents.iter().filter(|a| a.attention).count();
@@ -3443,15 +3750,16 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
         rows.splice(at + 1..at + 1, partial_rows(groups[i], cx, spare));
         return (rows, 4);
     }
-    // More spaces than rows: the first ones as headers, the rest counted.
+    // More spaces than rows: the first ones as headers, the rest counted
+    // (active scope's quiet spaces with them, their line cut).
     if budget < lead + 2 {
-        return pins_cut(view, cx, &groups, &header, budget);
+        return pins_cut(view, cx, &counted, &header, budget);
     }
-    let keep = budget - lead - 2;
+    let keep = (budget - lead - 2).min(groups.len());
     let mut rows = build(&[], true, &collapsed, false);
     rows.truncate(lead + 1 + keep);
-    let rest: Vec<&Agent> = groups[keep..].iter().flat_map(|g| g.agents.iter()).collect();
-    rows.push(more_row(w, &rest, groups.len() - keep));
+    let rest: Vec<&Agent> = counted[keep..].iter().flat_map(|g| g.agents.iter()).collect();
+    rows.push(more_row(w, &rest, counted.len() - keep));
     (rows, 5)
 }
 
@@ -4052,6 +4360,7 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
         shells: view.shells,
         resumes: matches!(opts.pause, Some(Phase::Stopping { .. } | Phase::Safe { .. } | Phase::Ready { .. })),
         stale_after: opts.bar.stale_after.unwrap_or(crate::view::STALE_AFTER_DEFAULT),
+        fold_after: opts.bar.fold_after.unwrap_or(crate::view::FOLD_AFTER_DEFAULT),
     };
     // Pinned agents move out of their spaces into PINNED (a view already
     // split is laid out as it is). The letters, the client's own card and
@@ -4140,7 +4449,7 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
     let reserve = if min == 0 { 0 } else { spaces_listed(view, w).saturating_sub(min) };
     // The bare spaces' headers (all scope) stand only while the dock lists
     // every space a row: both list spaces, and the headers say less.
-    let bare = view.scope.session.is_none() && groups(view).iter().any(|g| bare_group(view, g));
+    let bare = view.scope.session.is_none() && scope_groups(view, cx).0.iter().any(|g| bare_group(view, g));
     let reserve_heads = if bare && min > 0 { (spaces_rows(view, w, SpacesForm::Full, false).len() + 3).saturating_sub(min) } else { reserve };
     let fits = STEPS.iter().enumerate().find_map(|(i, &Step { gaps, listed, lines })| {
         let needs = needs_block(view, cx, lines);
@@ -4170,7 +4479,7 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
             // the body), and always leaves the agents a row.
             let n1 = needs_block(view, cx, 1).len();
             let floor = (avail / 3).max(2);
-            let room = n1.min(avail.saturating_sub(agents_one_line(view)).max(floor)).min(avail - 1);
+            let room = n1.min(avail.saturating_sub(agents_one_line(view, cx)).max(floor)).min(avail - 1);
             let needs = needs_cut(view, cx, room);
             let agents = agents_section(view, cx, avail - needs.len(), false, false);
             (STEPS.len() as u8, false, needs, agents)

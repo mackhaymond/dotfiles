@@ -116,7 +116,8 @@ class GrokIndicatorTests(unittest.TestCase):
         self.assertEqual((w["@agent_detail_kind"], w["@agent_detail"]), ("done", "Done, 42 tests pass."))
         w = self.hook("failed", hook_event_name="StopFailure", error="server_error", errorDetails="stream reset")
         self.assertEqual((w["@agent_state"], w["@agent_detail"]), ("failed", "server_error: stream reset"))
-        self.assertEqual(set(self.hook("clear", hook_event_name="SessionEnd", reason="exit")), {"@agent_seen_at"})
+        # (@thread_at, Mack's last prompt, belongs to the window: it stays.)
+        self.assertEqual(set(self.hook("clear", hook_event_name="SessionEnd", reason="exit")), {"@agent_seen_at", "@thread_at"})
         self.assertEqual(json.loads(self.state.read_text())["windows"]["@99"], {"@agent_state": "unrelated"})
 
     def test_usage_names_grok_and_settle(self):

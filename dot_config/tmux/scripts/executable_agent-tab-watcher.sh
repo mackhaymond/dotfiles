@@ -11,7 +11,7 @@
 # Every POLL_SECONDS this daemon matches agent processes to tmux windows by
 # TTY and reconciles the per-window @agent_state option:
 #   agent present + no state           → idle    (seed presence)
-#   agent present + no @agent_kind     → its comm's kind (codex|claude|opencode|grok)
+#   agent present + no @agent_kind     → its comm's kind (codex|claude|opencode|grok|copilot|agy)
 #   no agent     + any state OR summary → unset @agent_state/@agent_summary (GC)
 #   no agent     + fresh @agent_born    → left alone (BIRTH GRACE: a claude tab
 #                                         marked an agent at creation, before
@@ -65,7 +65,10 @@
 # agent). Grok Build likewise: comm `grok` (or the real binary's
 # `grok-macos-aarch64`; is_grok_comm), interactive TUI only (grok_tui_args:
 # `grok -p`, `grok agent stdio`, `grok sessions` are not agents), its turn
-# state from its own session records (grok_status). Candidates come from
+# state from its own session records (grok_status). GitHub Copilot CLI (comm
+# `copilot`) and agy (comm `agy`) count as their interactive TUIs only
+# (copilot_tui_args, agy_tui_args); their states come from hooks alone.
+# Candidates come from
 # `pgrep` (cheap), and each one's tty+comm from a single-pid ps, cached per
 # pid — see PROCESS DISCOVERY in the loop.
 #
@@ -331,7 +334,7 @@ is_agent_comm() {
     # comm values like "-zsh", which basename parses as an option).
     local base="${1##*/}"
     case "$base" in
-        claude|codex|opencode) return 0 ;;
+        claude|codex|opencode|copilot|agy) return 0 ;;
     esac
     is_grok_comm "$base" && return 0
     # Claude's binary is version-named (e.g. "2.1.170") in case its
@@ -421,6 +424,66 @@ opencode_tui_args() {
             --) return 0 ;;
             -*) i=$((i + 1)); continue ;;
             completion|acp|mcp|attach|run|debug|providers|auth|agent|upgrade|uninstall|serve|web|models|stats|export|import|github|session|plugin|plug|db)
+                return 1 ;;
+            *) return 0 ;;
+        esac
+    done
+    return 0
+}
+
+# Is this copilot / agy command line ($1, `ps -o args=`) the interactive TUI?
+# Same idea as opencode_tui_args (0 = the TUI, 1 = not). GitHub Copilot CLI
+# (comm `copilot`: the Homebrew cask's single-executable binary, which runs
+# the CLI under a restart supervisor of the same name): not with -p/--prompt
+# (headless, also glued: -pTEXT), -h/--help, -v/--version, or a first bare
+# word that is one of its subcommands (app, login, help, init, config,
+# update, version, workflow, sessions, memories, plugin, mcp, skill,
+# instruction, lsp, sandbox, completion). agy (Google's Antigravity CLI,
+# comm `agy`, one native Go binary): not with -p/--print/--prompt (its
+# -i/--prompt-interactive IS the TUI), -h/--help, --version, or a
+# subcommand (acp, agent(s), changelog, help, install, mcp, mic-serve,
+# models, plugin(s), remote-control, update); Go takes -flag and --flag
+# alike. Options that take a value skip it; -i (an initial prompt, whose
+# unquoted words follow in ps's argv) is the TUI outright. Builtins only.
+copilot_tui_args() {
+    local -a a
+    local i=1 w
+    read -r -a a <<<"$1"
+    while [ "$i" -lt "${#a[@]}" ]; do
+        w="${a[i]}"
+        case "$w" in
+            --) return 0 ;;
+            # -i PROMPT: the TUI; ps lost the quoting, so the prompt's
+            # words that follow must not read as a subcommand or a flag.
+            -i|-i=*|--interactive|--interactive=*) return 0 ;;
+            -p*|--prompt|--prompt=*|-h|--help|-v|--version) return 1 ;;
+            --model|--reasoning-effort|--context|--auto-tier|--agent|-n|--name|--session-id|-C|--log-dir|--extension-sdk-path|--log-level|--stream|--output-format|--add-dir|--allow-tool|--deny-tool|--available-tools|--excluded-tools|--additional-mcp-config|--config-dir|--mode)
+                i=$((i + 2)); continue ;;
+            -*) i=$((i + 1)); continue ;;
+            app|login|help|init|config|update|version|workflow|sessions|memories|plugin|mcp|skill|instruction|lsp|sandbox|completion)
+                return 1 ;;
+            *) return 0 ;;
+        esac
+    done
+    return 0
+}
+agy_tui_args() {
+    local -a a
+    local i=1 w
+    read -r -a a <<<"$1"
+    while [ "$i" -lt "${#a[@]}" ]; do
+        w="${a[i]}"
+        case "$w" in
+            --) return 0 ;;
+            # -i PROMPT: the TUI (its prompt's words follow, unquoted).
+            -i|-i=*|-prompt-interactive|-prompt-interactive=*|--prompt-interactive|--prompt-interactive=*)
+                return 0 ;;
+            -p|-p=*|-print|-print=*|--print|--print=*|-prompt|-prompt=*|--prompt|--prompt=*|-h|-help|--help|-version|--version)
+                return 1 ;;
+            -add-dir|--add-dir|-agent|--agent|-conversation|--conversation|-effort|--effort|-input-format|--input-format|-json-schema|--json-schema|-log-file|--log-file|-mode|--mode|-model|--model|-output-format|--output-format|-print-timeout|--print-timeout|-project|--project|-settings|--settings)
+                i=$((i + 2)); continue ;;
+            -*) i=$((i + 1)); continue ;;
+            acp|agent|agents|changelog|help|install|mcp|mic-serve|models|plugin|plugins|remote-control|update)
                 return 1 ;;
             *) return 0 ;;
         esac
@@ -1469,9 +1532,9 @@ birth_fresh() {
 # with `case "$s" in *" ${key} "*`, a linear scan per probe; with ~165
 # windows (most of them pty-MCP shells in `agents`) and four such probes
 # per window that was quadratic, ~20 ms a tick at load 200.
-AGENT_PAT='claude|codex|opencode|grok(-(macos|linux|windows)-[a-z0-9_]+)?|[0-9]+\.[0-9]+\.[0-9]+'
+AGENT_PAT='claude|codex|opencode|copilot|agy|grok(-(macos|linux|windows)-[a-z0-9_]+)?|[0-9]+\.[0-9]+\.[0-9]+'
 declare -A PID_TTY=() PID_NEXT=() TTY_PID=()   # pid->tty|-, its rebuild, tty->lowest pid
-# pid -> codex|claude|opencode|grok, for agent pids only: written by the same single-pid ps
+# pid -> codex|claude|opencode|grok|copilot|agy, for agent pids only: written by the same single-pid ps
 # that fills PID_TTY (no extra fork), dropped with it. A pid that leaves the
 # pgrep set and comes back is ps'd again, so this is overwritten with it.
 declare -A PID_KIND=()
@@ -2038,6 +2101,16 @@ while :; do
                     oc_args=$(ps -ww -o args= -p "$pid" 2>/dev/null)
                     [ -n "$oc_args" ] || continue
                     opencode_tui_args "$oc_args" || agent_ok=0
+                elif [ "${comm##*/}" = copilot ] || [ "${comm##*/}" = agy ]; then
+                    # copilot_tui_args / agy_tui_args: `copilot -p`, `agy
+                    # plugin list` are commands, not agents.
+                    oc_args=$(ps -ww -o args= -p "$pid" 2>/dev/null)
+                    [ -n "$oc_args" ] || continue
+                    if [ "${comm##*/}" = copilot ]; then
+                        copilot_tui_args "$oc_args" || agent_ok=0
+                    else
+                        agy_tui_args "$oc_args" || agent_ok=0
+                    fi
                 elif is_grok_comm "${comm##*/}"; then
                     oc_args=$(ps -ww -o args= -p "$pid" 2>/dev/null)
                     [ -n "$oc_args" ] || continue
@@ -2052,10 +2125,13 @@ while :; do
             fi
             if [ "$agent_ok" = 1 ]; then
                 PID_TTY[$pid]="$tty"
-                # is_agent_comm's names: codex, opencode, grok, else claude (incl. N.N.N).
+                # is_agent_comm's names: codex, opencode, copilot, agy, grok,
+                # else claude (incl. N.N.N).
                 case "${comm##*/}" in
                     codex) PID_KIND[$pid]=codex ;;
                     opencode) PID_KIND[$pid]=opencode ;;
+                    copilot) PID_KIND[$pid]=copilot ;;
+                    agy) PID_KIND[$pid]=agy ;;
                     *) if is_grok_comm "${comm##*/}"; then PID_KIND[$pid]=grok
                        else PID_KIND[$pid]=claude; fi ;;
                 esac
@@ -2373,9 +2449,9 @@ EOF
             # is still out" - stays true for a background task too.
             if { [ "$state" = running ] || { [ "$state" = needs-input ] && [ -n "${W_ASKBG[$win]:-}" ]; }; } \
                && [ -n "$pid" ] \
-               && [ "${PID_KIND[$pid]:-}" != codex ] \
-               && [ "${PID_KIND[$pid]:-}" != opencode ] \
-               && [ "${PID_KIND[$pid]:-}" != grok ]; then
+               && [ "${PID_KIND[$pid]:-}" = claude ]; then
+                # Claude only: the session file and agent-bg-pending are
+                # Claude's (codex, opencode, grok, copilot, agy never ask).
                 st=""
                 session_status "$pid"
                 case "$st" in
@@ -2468,6 +2544,15 @@ EOF
         # ticks; never the Claude session file or a stale rollout either.
         # A child subagent still out (grok_bg_pending, bg_held) keeps the
         # tab running whatever events.jsonl says, as for Claude.
+        #
+        # COPILOT AND AGY: no backstop yet. Neither keeps a per-pid status the
+        # way Claude's session file or grok's records do (copilot's
+        # session-state events.jsonl is keyed by session, its turn/idle/
+        # interrupt events are ephemeral, unwritten), so a `running` either
+        # CLI never ended stays running until its next hook; never the Claude
+        # session file or a stale codex rollout. agy's Stop fires on every
+        # loop end (an Esc included); copilot's agentStop does not on an
+        # abort (docs: "Copilot CLI", Esc).
         fin=""        # the state this agent's own record says, if it disagrees
         cx_full=0     # 1 = a codex turn end after the stamp: the full write
         cx_lim=0      # 1 = that turn end was a usage limit (RATE-LIMITED AGENTS)
@@ -2479,12 +2564,16 @@ EOF
                         opencode_status "$pid"                      # opencode
                     elif [ "${PID_KIND[$pid]:-}" = grok ]; then
                         grok_status "$pid" "$win"                   # grok
+                    elif [ "${PID_KIND[$pid]:-}" = copilot ] || [ "${PID_KIND[$pid]:-}" = agy ]; then
+                        :   # no status record (COPILOT AND AGY: hooks only)
                     else
                         [ -n "$pid" ] && session_status "$pid"      # claude
                     fi
                     if [ -z "$st" ] && [ -n "${W_ROLL[$win]:-}" ] \
                        && [ "${PID_KIND[$pid]:-}" != opencode ] \
-                       && [ "${PID_KIND[$pid]:-}" != grok ]; then       # codex
+                       && [ "${PID_KIND[$pid]:-}" != grok ] \
+                       && [ "${PID_KIND[$pid]:-}" != copilot ] \
+                       && [ "${PID_KIND[$pid]:-}" != agy ]; then       # codex
                         codex_tail_cached "$win" "${W_ROLL[$win]}"
                         # The full turn-end write is for a CODEX agent only: a
                         # claude window with no session file and a stale
@@ -2755,7 +2844,7 @@ EOF
                 case "${PID_KIND[$pid]:-}" in
                     opencode) opencode_status "$pid" ;;
                     grok) grok_status "$pid" "$win" ;;
-                    codex) ;;
+                    codex|copilot|agy) ;;
                     *) session_status "$pid" ;;
                 esac
             fi

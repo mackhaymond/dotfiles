@@ -1,7 +1,8 @@
 # Agent tab indicator
 
 Each tmux tab (window) reflects the state of the AI agent (Claude Code,
-Codex CLI, OpenCode or Grok Build) running inside it, rendered through the
+Codex CLI, OpenCode, Grok Build, GitHub Copilot CLI or Google's Antigravity
+CLI, agy) running inside it, rendered through the
 Catppuccin status bar:
 
 For Codex 0.160 and newer shared-server launches, see
@@ -71,11 +72,12 @@ Two per-window tmux user options are the single source of truth:
 - `@agent_workflow` — `1` while a background Claude Workflow is in flight (else unset); set by the watcher, orthogonal to `@agent_state`
 - `@agent_cua` — `1` while the agent is driving an app through cua-driver (lingers up to `CUA_LIVE`, 60 s); set by the watcher
 - `@agent_rollout` — codex only: the thread's rollout path, stashed by the indicator so the watcher can tell a live turn from an interrupted one
-- `@agent_kind` — `claude | codex | opencode | grok`: whose hooks drive the window. Written by any indicator hook that writes state or detail (in the same command list), unset with the state by `clear_state` and the watcher GC. Never written by the focus hook or a no-op heartbeat. Before any hook has fired (Codex's first hook waits for the first prompt), the watcher seeds it from the agent process's own comm; it never overwrites a kind that is already set (see the watcher section).
+- `@agent_kind` — `claude | codex | opencode | grok | copilot | agy`: whose hooks drive the window. Written by any indicator hook that writes state or detail (in the same command list), unset with the state by `clear_state` and the watcher GC. Never written by the focus hook or a no-op heartbeat. Before any hook has fired (Codex's first hook waits for the first prompt), the watcher seeds it from the agent process's own comm; it never overwrites a kind that is already set (see the watcher section).
 - `@agent_harness` — `abby` or unset: the launcher behind `@agent_kind` when it isn't the agent itself. **abby** (`~/.local/bin/abby`, Claude Code on abliteration.ai) execs plain `claude` with `CLAUDE_CONFIG_DIR=~/.claude-abby`, so its hooks arrive as `<mode> claude` and `@agent_kind` reads `claude`. A claude hook whose `CLAUDE_CONFIG_DIR` has the basename `.claude-abby` (trailing `/` stripped; abby sets the absolute `$HOME/.claude-abby`) writes `@agent_harness abby`; every other hook that writes `@agent_kind` (plain claude, a `cswap run N` profile dir, codex, opencode, grok) unsets it, so a window whose pane goes from abby to plain claude is corrected by its next hook. Read from the hook's environment with bash builtins, and written or unset in the SAME command list as every `@agent_kind` write (`kind_add`): no extra tmux call or fork. Unset with `@agent_kind` by `clear_state` and the watcher GC. Neither agent-birth.conf nor the watcher's comm seed writes it (both see only `claude`), so a fresh abby tab reads `claude` until its `SessionStart` hook (1-3 s). Readers' contract (the sidebar's harness logo): harness = `@agent_harness` if non-empty, else `@agent_kind`, else unknown.
 - `@agent_ask_from` — who a `needs-input` is waiting for: the `PermissionRequest` payload's `agent_id` (a subagent's gate) or `main`. Written by `needs-approval` for a `PermissionRequest` (never its `Notification` twin) in the same command list as the state; unset in `set_state`'s command list by any write that *leaves* `needs-input`, by `clear_state`, and by the watcher's viewed discharge and GC. Read by the heartbeat and by `Stop` (see **Asker gate**). Unset while `needs-input` (a gate raised by the `Notification` alone, a window that went yellow before 2026-10-21, a quiet restore) means *no asker*: the old rule, any tool call re-arms.
 - `@agent_held_detail` — `"<kind>\t<text>"`: the detail a main-agent `Stop` would have written while a subagent's gate held the window at `needs-input`; written back by the heartbeat (or `subagent-stop`) that ends that gate. Unset by the next prompt, Stop, failure, SessionStart, `clear_state` and the watcher GC (see **Asker gate**).
 - `@agent_ask_bg`, `@agent_ask_seen`, `@agent_turn_start` — **Asks while work is out** (2026-10-22). A `Stop` held `running` by background work (agent-bg-pending) asks cua-notch's `~/.local/bin/agent-turn-asks` whether the turn ended asking Mack, synchronously and ONLY for the agent's own marker: `--marker-only --since @agent_turn_start`, SIGTERMed at 300 ms. **Explicit only** (2026-10-26, Mack's call): to be shown as needing him while its work is still out, the agent must run `agent-needs-you "<what>"` right before it ends its turn. There is no model guess any more: the detached full run (agent-turn-asks' copilot model backstop, which judged the last message and raised `needs-input` far too often) is gone, with its `ask-bg` worker, the `@agent_ask_line` stage and `AGENT_TAB_ASK_BG_TIMEOUT`. No marker = the Stop stays `running` and nothing ask-related is written. A marker makes even an agent-started turn loud (as `notify_user` does); a subagent's standing gate or a pause skips all of it. A yes **raises**: `@agent_state needs-input`, `@agent_detail_kind ask`, `@agent_detail` the line (DETAIL_JQ-sanitized), `@agent_ask_from main` (only the main agent's own tool call re-arms it, never a background subagent's), `@agent_ask_bg 1` — in `set_state`'s one command list. Not raised, and nothing ask-related written, when the line equals `@agent_ask_seen` (both sides through the same sanitizer), or while Mack is looking (then the Stop stays `running`, stamped seen, and the line becomes `@agent_ask_seen`). A **look** (`clear-current`, the watcher's viewed-discharge, agent-ui's answer discharge, which is `clear-current`) at an `@agent_ask_bg` window (any non-empty value, `1` or a counted `1 N`) copies `@agent_detail` into `@agent_ask_seen` (only while `@agent_detail_kind` is `ask`) and, while `@agent_workflow` says the work is still out, writes in ONE command list `@agent_seen_at E`, `@agent_state running`, `@agent_since "E running"`, unsets `@agent_detail_kind`, `@agent_ask_bg` and `@agent_ask_from` (`@agent_detail` stays); with nothing out, the ordinary idle + `@agent_pending` discharge. Only a later `Stop` raises again. `@agent_ask_bg` is unset by every write that leaves `needs-input` (`set_state`, `clear_state`, the watcher's discharges, codex turn ends, paused, restores), by a permission gate that lands on it (the gate replaces the ask; a `Notification` twin there writes `perm` and drops the `main` asker), and by the GC; agent-pause.py never counts a `needs-input` window as working, gear or not; the watcher asks agent-bg-pending for a raised ask too, so its gear (`@agent_workflow`) stays true for a background task. `@agent_turn_start` ("<epoch>") is stamped by every prompt that is not a harness wake-up (TURN_JQ's `sys`); `@agent_ask_seen` is unset by Mack's own prompt (not a wake-up, not a verified peer message), a non-compact `SessionStart`, `clear_state` and the GC. agent-ui files such a window under NEEDS YOU (`needs-input` beats in-flight) as `◉ asks · ⚙` (`⚙ N` once a writer puts the count in `@agent_ask_bg`'s second word).
+- `@thread_at` — `<epoch>`: when **Mack** last prompted this window himself (2026-11-10). Stamped by `running` (UserPromptSubmit) only when the origin classifier's `p_mack` holds: not a verified peer message (`@agent_inbound` match), no `[message from @h]` opener at all, not a harness wake-up (TURN_JQ's `sys`: a `<task-notification>` or a hand-back), and not a `loop_wakeup` / `schedule_wakeup` / `poll_event` source; nor, for this stamp only, a `system` source (native auto-continuation: Mack typed nothing; `p_mack` itself still counts it). A mid-turn prompt of his restamps it. Written with `ss_add`, so it rides `set_state`'s one command list (no extra tmux call, no fork). Never unset by the indicator, `clear_state` or the GC: it belongs to the window, whatever conversation runs in it (a restore or an older window simply has none). Readers: agent-ui's sidebar (a space's last prompt = the max over its agent windows; a dormant space folds to its header, a long-idle agent into the `+K idle` line; a window WITHOUT a stamp counts from its `@agent_since` while it is `idle` (a prompt would have moved it to running since, so that is never older than the real last prompt; a restore restamps it), else as fresh, never dormant or stale; see `agent-ui/src/sidebar/layout.rs`, "Dormant spaces"), and the Threads spec, which reuses exactly this name and meaning.
 - `@agent_slot` — decimal integer ≥ 1: the window's sticky number in agent-ui's Option-W menu and sidebar. Held only while the window is in the Active set and visible. Stamped by the indicator's `set_state` when a window enters the Active set, and by the watcher as the backstop; released and repaired only by the watcher (see "Agent slots" in the watcher section).
 - `@agent_detail_kind` + `@agent_detail` — what the event that set the state was *about*, for the sidebar (not rendered in the tab bar):
 
@@ -425,6 +427,150 @@ Tests: `tests/test_grok_indicator.py` (payloads, guards, `settle`, the limit
 split on a private server), `tests/test_grok_watcher.py` (the TUI rule,
 `grok_status`), `tests/test_grok_resurrect.py` (the record, save rows,
 restore lines, the socket guard, closed-tabs).
+
+**GitHub Copilot CLI** (2026-11-10; CLI 1.0.108, `@agent_kind copilot`,
+glyph U+10C108). Hooks in `~/.copilot/hooks/tmux-agent.json` (chezmoi source
+`private_dot_copilot/hooks/tmux-agent.json`; `.chezmoiignore` ignores the
+rest of `~/.copilot`, which Copilot writes, and herdr's own
+`herdr-agent-state.sh` lives beside ours). Copilot loads every
+`~/.copilot/hooks/*.json` (and `$COPILOT_HOME/hooks`) on top of the inline
+`hooks` of `~/.copilot/settings.json`, which it rewrites itself, so ours is
+a file of its own. Format `{"version": 1, "hooks": {event: [entries]}}`, each
+entry `{"type": "command", "bash": ..., "timeoutSec": N}` (10 s; 5 s for the
+heartbeat and `clear`). Reference:
+<https://docs.github.com/en/copilot/reference/hooks-configuration> and the
+CLI page <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-hooks-reference>;
+payload types in the CLI's own `copilot-sdk/types.d.ts`.
+
+| Copilot event (native, camelCase) | Mode |
+|---|---|
+| `sessionStart` (source `startup`, `resume`, `new` = `/new`/`/clear`, read as startup) | `idle` |
+| `userPromptSubmitted` | `running` |
+| `postToolUse`, `postToolUseFailure` | `heartbeat` |
+| `notification` matcher `permission_prompt` | `needs-approval` → `needs-input` (the `note` detail: Copilot's message) |
+| `notification` matcher `elicitation_dialog` (its `ask_user` question) | `needs-approval` as an `AskUserQuestion`: the `ask` detail |
+| `agentStop` (main agent only; `stopReason` is always `end_turn`) | `done` |
+| `errorOccurred` | `failed`, only when `recoverable` is false and `errorContext` is `model_call` or `system`; a retried call or a failed tool is dropped |
+| `sessionEnd` (`user_exit`, also on `/clear`, then a `sessionStart`) | `clear` |
+
+- **Payload.** The native (camelCase) event names select the native payload:
+  `sessionId`, `timestamp` (ms), `cwd`, `toolName`/`toolArgs`, `prompt`,
+  `agentId` inside a subagent, a notification's `notification_type`,
+  `message`, `title`. The COPILOT AND AGY block rewrites it into the Claude
+  shape right after stdin is read (one jq), native tool names shown as
+  Claude's (`bash` → `Bash`, `view` → `Read`, `edit` → `Edit`, `create` →
+  `Write`, `web_fetch` → `WebFetch`), so the detail kinds, slots, origin and
+  condenser are shared. A subagent's events (`agentId`) are inert for the tab,
+  its gate excepted, as Claude's `agent_id`; the heartbeat parses the whole
+  payload for `agentId` on the two rare states (`COPILOT_SUB_JQ`, **Asker gate**).
+- **The reply.** `agentStop` carries no message: the `done` detail is the
+  last non-blank `assistant.message` content AFTER the last `user.message` in
+  `~/.copilot/session-state/<sessionId>/events.jsonl` (256 KB tail, Stop
+  only); no reply after it is `turn finished`, never the previous turn's.
+  Copilot's `transcriptPath` is never given to a Claude reader (no
+  rate-limit tail, background check or ask).
+- **Where it runs.** Command hooks run as children of the CLI, which inherits
+  `TMUX`/`TMUX_PANE`. Guards: `CUA_NOTCH_IGNORE=1` (every ai-exec leg, the
+  condenser's own copilot call included) exits at once; HEADLESS COPILOT/AGY
+  drops a hook whose copilot ancestor has no tty or runs `-p`/`--prompt`
+  (flags only up to the first positional word, a value-taking option's value
+  skipped, and `-i` ends the scan as a TUI: `ps` loses the quoting, so
+  `copilot -i "fix the -p flag"` must not read as headless); a copilot in
+  another agent's tool shell is `nested_agent`'s nesting. The watcher's
+  `copilot_tui_args` reads `-i` the same way.
+- **Copilot would also run Claude's hooks.** It reads a repo's
+  `.claude/settings.json` and `.claude/settings.local.json` hooks too, which
+  call `<mode> claude` with a Copilot payload. Copilot sets
+  `COPILOT_HOOK_DEPTH` in every command hook's environment and Claude never
+  does, so a `<mode> claude` call with it exits 0 (the `GROK_HOOK_EVENT` rule).
+- **Not supported (gaps).** Esc mid-turn: `agentStop` fires only on a natural
+  stop, and no abort hook exists, so the tab keeps pulsing until the next
+  prompt (copilot has no per-pid status record for the watcher: its
+  `session.idle`/`agent.interrupted` events are ephemeral, never written).
+  A denied permission ends the turn with no hook either: the yellow stands
+  until the tab is focused. `permissionRequest` is not wired (it fires before
+  the permission service decides, so it would yellow auto-approved tools).
+  Usage limits are a plain `failed`, not the rate-limited mark (§7). No
+  background-work hold, no CuaNotch hook, no resurrect row.
+- **Unverified (no live copilot session was driven).** Whether `agentStop`
+  still fires after an unrecoverable `errorOccurred`: if it does, its `done`
+  overwrites the red `failed` a moment later. And `notification` is
+  fire-and-forget (async): a `permission_prompt` can land after the tool
+  was answered and its `postToolUse` re-armed `running`, painting a late
+  yellow that stands until the tab is focused or the next tool call.
+- **Title**: the prompt, condensed.
+
+**Antigravity CLI** (agy, 2026-11-10; agy 1.5.4, `@agent_kind agy`, glyph
+U+10C118). Google's agy has lifecycle hooks (documented in the binary
+itself: the `hooks.json` and plugin guides). They live in a plugin of our
+own, `~/.gemini/config/plugins/tmux-agent/` (`plugin.json` + `hooks.json`,
+chezmoi source `dot_gemini/config/plugins/tmux-agent/`): `~/.gemini/config` is
+agy's user customization root, and its `hooks.json` there is herdr's (herdr
+rewrites it), while agy never writes into a plugin's folder (a plugin's
+on/off lives in `~/.gemini/config/config.json`). `agy plugin list` shows
+`tmux-agent (enabled)`, 1 hook; `agy plugin validate <dir> --strict` passes.
+Hook format: `{"<hook name>": {event: [handlers]}}`, `PostToolUse` grouped
+under a `matcher`, each handler `{"type": "command", "command": ..., "timeout":
+N}` run by `sh -c` in the plugin folder; every hook must print a JSON object,
+so each command ends `>/dev/null 2>&1; echo '{}'` (`{"decision":"allow"}` for
+`Stop`).
+
+| agy event | Mode |
+|---|---|
+| `SessionStart` (a new conversation; no source: read as startup) | `idle` |
+| `PreInvocation` (before EVERY model call of a turn) | `running`; a no-op on a window already `running` |
+| `PostToolUse` (matcher `*`) | `heartbeat` |
+| `Stop`, `terminationReason` `NO_TOOL_CALL`, `MAX_*`, `TERMINAL_*`, `INJECTED_RESPONSE` | `done` |
+| `Stop`, `USER_CANCELED` (Esc) | `interrupt` |
+| `Stop`, `ERROR` | `failed` (its `error`) |
+
+- **Payload** (protojson camelCase; the binary's `HookArgsCommon`):
+  `conversationId`, `workspacePaths`, `transcriptPath`,
+  `artifactDirectoryPath`, `executionId`, `modelName`, `lastUserInput`
+  (with every event: the prompt is the text inside its
+  `<USER_REQUEST>…</USER_REQUEST>`, an `<ADDITIONAL_METADATA>` tail dropped),
+  `agentName`, `parentConversationId`, `rootConversationId`,
+  `callerContext`, `hookEventName`, `cwd`; plus `toolCall {id, name, args}`,
+  `stepIdx`, `invocationNum`/`initialNumSteps` (PreInvocation),
+  `executionNum`, `terminationReason`, `fullyIdle`, `finalModelOutput`
+  (Stop). Rewritten into the Claude shape like Copilot's.
+- **Subagents** run as conversations of their own and fire the same hooks
+  from the same process: their args carry `parentConversationId` (and a
+  `rootConversationId` that is not their own id). `AGY_SUB_JQ` makes their
+  `conversationId` the payload's `agent_id`, so the subagent guard drops
+  their SessionStart, PreInvocation and Stop (no idle mid-turn, no retitle
+  with the subagent's task, no false `done`), and the heartbeat's asker
+  rules see them (a subagent's tool call never re-arms a `failed` turn).
+- **The reply**: the Stop's own `finalModelOutput`; without one, the last
+  `PLANNER_RESPONSE` content AFTER the last `USER_INPUT` of `transcriptPath`
+  (`~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`;
+  only a path under `~/.gemini` named `transcript.jsonl` is read), else
+  `turn finished`.
+- **Cost.** PreInvocation blocks agy's loop before every model call: the
+  no-op on a running window is decided right after the pane lookup, with one
+  `show-options` (no ps walk, no jq; the payload is read in-process).
+- **Where it runs.** Hooks are children of the agy process and inherit
+  `TMUX_PANE` (herdr's agy hook relies on the same inheritance). The same
+  guards as Copilot's: `CUA_NOTCH_IGNORE`, HEADLESS (no tty, `-p`/`--print`/
+  `--prompt` among the flags; `-i`/`--prompt-interactive` is the TUI),
+  `nested_agent`.
+- **Not supported (gaps).** No permission or question event exists, so a
+  tool approval in agy's TUI leaves the tab `running` (pulsing), never
+  yellow. `fullyIdle` false (background tasks out) does not hold the tab
+  running: no event says when they finish. Usage limits are a plain
+  `failed`. No CuaNotch hook, no resurrect row, no watcher status backstop
+  (agy's Stop already fires on every loop end, Esc included).
+- **Title**: the prompt, condensed.
+
+Not yet taught about copilot or agy (follow-ups): `agent-pause.py` (the
+pause/resume key's targets, rate-limit resume) and `agent-roster.py` (its
+`is_agent_comm`/`comm_kind`, which agent-ui's `actions.rs` ports), plus
+assistant-save/restore and closed-tabs (no resurrect row, ⌘Z reopens a
+shell), tmux-mcp's delivery, and CuaNotch's hook.
+
+Tests: `tests/test_copilot_agy_indicator.py` (payload rewrite, modes, guards,
+the replies, subagents, argv), `tests/test_copilot_agy_watcher.py` (comm
+detection, the TUI rules, kind seeding).
 
 Subagent-context events (payload has `agent_id`) are ignored so a
 subagent's Stop can't flip the main agent's tab — except its
@@ -951,11 +1097,29 @@ none appears anywhere on disk, so none is inferred.
 for the first prompt, so a freshly started codex was seeded `idle` with no
 `@agent_kind` and showed no ⬢ in the sidebar or menu. Discovery already runs
 one single-pid `ps` per new agent pid; it now also records that pid's kind
-(comm `codex`, `opencode`, a grok comm, else `claude`). A live agent window with a state and no kind
+(comm `codex`, `opencode`, `copilot`, `agy`, a grok comm, else `claude`). A live agent window with a state and no kind
 gets it, riding in the `@agent_since` stamp's tmux call (the idle seed always
 stamps, so a fresh window costs no extra fork; a held state without a kind
 pays one call, once). A kind already set is never overwritten, and none is
 written without a live agent, so it cannot race the GC that unsets it.
+
+**Copilot and agy** (2026-11-10). Presence and kind only. Comms `copilot`
+(the Homebrew cask's single-executable `copilot`, which runs the CLI under a
+restart supervisor of the same comm, both on the pane's tty: the lowest pid
+wins, as ever) and `agy` (one native Go binary) are in `is_agent_comm` and
+`AGENT_PAT`, and count only as their TUIs, on one more single-pid `ps -ww -o
+args=` for a new pid (`copilot_tui_args`, `agy_tui_args`): not with
+`-p`/`--prompt` (also glued, `-pTEXT`; agy's `--print` too; agy's
+`-i`/`--prompt-interactive` IS the TUI), `-h`/`--help`, `-v`/`--version`, or
+a first bare word that is one of their subcommands (copilot: `app login help
+init config update version workflow sessions memories plugin mcp skill
+instruction lsp sandbox completion`; agy: `acp agent agents changelog help
+install mcp mic-serve models plugin plugins remote-control update`), options
+with a value skipped. A born `copilot`/`agy` tab (⌘E) therefore keeps its
+birth, and an unhooked one is seeded `idle` with its kind. Their states come
+from hooks alone: neither keeps a per-pid status record, so the stuck-running
+reconcile has nothing to read for them (and they never fall through to the
+Claude session file or a stale codex rollout).
 
 **Grok** (2026-11-02). Presence, kind and turn state, as OpenCode has them:
 

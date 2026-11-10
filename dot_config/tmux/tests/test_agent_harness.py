@@ -64,7 +64,8 @@ class HarnessHookTests(ci.IndicatorIntegrationTests):
         self.claude("running", env=ABBY, prompt="go")
         self.claude("done", env=ABBY, last_assistant_message="ok")
         self.assertEqual(self.window().get("@agent_harness"), "abby")
-        self.assertEqual(set(self.claude("clear", env=ABBY)), {"@agent_seen_at"})
+        # (@thread_at, Mack's last prompt, belongs to the window: it stays.)
+        self.assertEqual(set(self.claude("clear", env=ABBY)), {"@agent_seen_at", "@thread_at"})
 
     def test_noop_heartbeat_writes_nothing(self):
         self.claude("running", env=ABBY, prompt="go")

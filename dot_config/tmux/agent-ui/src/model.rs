@@ -429,7 +429,7 @@ const fn h(id: &'static str, glyph: char, hue: &'static str, initial: char) -> H
 /// any hook are still listed: the mark is ready when one is. The LAST row is
 /// OTHER, the mark of any id not listed (unset, `agent` included): faint
 /// (`overlay1`).
-pub const HARNESSES: [HarnessRow; 24] = [
+pub const HARNESSES: [HarnessRow; 25] = [
     h("claude", '\u{10C100}', "h_claude", 'C'),
     h("codex", '\u{10C101}', "h_codex", 'X'),
     h("opencode", '\u{10C102}', "teal", 'O'),
@@ -453,6 +453,9 @@ pub const HARNESSES: [HarnessRow; 24] = [
     h("vibe", '\u{10C115}', "h_claude", 'Y'),
     h("deepseek", '\u{10C116}', "h_sapphire", 'S'),
     h("ollama", '\u{10C117}', "h_codex", 'J'),
+    // Google's Antigravity CLI (`@agent_kind agy`, its own hooks): the Google
+    // blue of the blue brands, apart from gemini's `sky`.
+    h("agy", '\u{10C118}', "h_sapphire", 'T'),
     h("other", '\u{10C105}', "overlay1", '?'),
 ];
 
@@ -755,6 +758,10 @@ mod tests {
         assert_eq!(Harness::of("  ", "codex").name(), "codex");
         assert_eq!(Harness::of("", "opencode").name(), "opencode");
         assert_eq!(Harness::of("", "grok").name(), "grok");
+        // The two hook kinds that are their own harness (no @agent_harness).
+        assert_eq!(Harness::of("", "copilot").name(), "copilot");
+        assert_eq!(Harness::of("", "agy").name(), "agy");
+        assert_ne!(Harness::of("", "agy"), Harness::of("", "gemini"));
         assert_eq!(Harness::of("", ""), Harness::OTHER);
         assert_eq!(Harness::of("", "vim"), Harness::OTHER);
         // A harness the sidebar does not know is no claude, whatever the kind.
@@ -785,7 +792,8 @@ mod tests {
         let mut fixed: Vec<(u32, &str)> = Harness::all().map(|h| (h.glyph() as u32, h.name())).collect();
         fixed.sort();
         let font = ["claude", "codex", "opencode", "grok", "abby", "other", "gemini", "cursor", "copilot", "amp", "cline",
-            "roo", "kilo", "goose", "qwen", "kimi", "warp", "windsurf", "droid", "devin", "auggie", "vibe", "deepseek", "ollama"];
+            "roo", "kilo", "goose", "qwen", "kimi", "warp", "windsurf", "droid", "devin", "auggie", "vibe", "deepseek", "ollama",
+            "agy"];
         let want: Vec<(u32, &str)> = font.iter().enumerate().map(|(k, id)| (0x10C100 + k as u32, *id)).collect();
         assert_eq!(fixed, want);
         // `agent` (a generic kind) is no harness of its own.

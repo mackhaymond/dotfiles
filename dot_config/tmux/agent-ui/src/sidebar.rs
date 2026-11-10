@@ -23,18 +23,21 @@
 //!   ([`Target`]), resolved against the frame ON SCREEN; a plain RIGHT
 //!   press on an agent row or NEEDS YOU card parks that window (`stash.sh
 //!   stash <win>`), a MIDDLE press there pins or unpins it ([`crate::pins`]:
-//!   the PINNED section), and `PARKED N` opens prefix h's stash picker
-//!   ([`stash_command`]). Every click hands
+//!   the PINNED section), `PARKED N` opens prefix h's stash picker
+//!   ([`stash_command`]), and a dormant space header's fold chip (its
+//!   counts and `▸` / `▾`) keeps that space open or lets it fold again
+//!   ([`fold`]; the rest of the header still goes home). Every click hands
 //!   focus straight back to the tmux pane first (Strip.handle → focus_back),
 //!   and any key that lands here is forwarded there. The wheel does nothing:
 //!   nothing scrolls.
 //! - **Scope.** `@spaces` / `@strip_scope` (globals, read in the same
-//!   snapshot call): "space" shows only the client's session; "all" every
-//!   session
+//!   snapshot call): "space" shows only the client's session; "active"
+//!   every space but the dormant ones; "all" every session
 //!   ([`crate::view::Scope`]). Option-V (ESC v / V), the one key NOT
 //!   forwarded, or a click on the header title (once the scope is a thing)
-//!   flips and persists it, then posts [`notice::FOCUS_NOTICE`] so every
-//!   other sidebar follows at once.
+//!   moves it one step along the cycle (space → active → all → space) and
+//!   persists it, then posts [`notice::FOCUS_NOTICE`] so every other
+//!   sidebar follows at once.
 //! - **Cadence: told, not polling.** The loop sleeps in poll(2) on stdin,
 //!   the signal pipe, the Darwin notice fd ([`notice`]: agent-state and focus
 //!   notices), the insight notice's fd (the server's insight publisher
@@ -80,6 +83,7 @@
 //!   alternate screen, no marker, no mouse (screenshots, tests).
 
 pub mod activity;
+pub mod fold;
 mod input;
 pub mod layout;
 pub mod notice;
@@ -237,6 +241,8 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
     // Letters as the live sidebar would assign them; `--once` never writes.
     let (mut view, _) = build_view(&mut core, client.as_deref(), None);
     activity::Activity::home().apply(&mut view);
+    // The spaces Mack keeps open by hand (read only: `--once` never writes).
+    fold::Store::new(fold::store_for(&core.tmux)).apply(&mut view);
     // The insight read once, here (the live sidebar's worker would; none
     // with $AGENT_UI_NO_INSIGHT).
     if !crate::insight::disabled() {
@@ -535,6 +541,9 @@ struct App {
     pins: Option<crate::pins::Sync>,
     /// The `@pin_key` writes in flight.
     pin_keys: crate::pins::KeyMemo,
+    /// The spaces Mack keeps open by hand ([`fold`]): re-read when the file
+    /// changes, toggled by a dormant header's fold chip.
+    open: fold::Store,
 }
 
 /// How many dismissed toast ids a sidebar remembers at most.
@@ -544,6 +553,8 @@ impl App {
     fn new(tmux: Tmux, link: WeztermLink, notices: Notices) -> App {
         let mut core = Core::new(tmux.clone());
         let (view, _) = build_view(&mut core, None, None);
+        // (Unit tests keep it in memory: never Mack's own file.)
+        let open = fold::Store::new(if cfg!(test) { None } else { fold::store_for(&tmux) });
         App {
             core,
             actions: Actions::new(tmux),
@@ -605,6 +616,7 @@ impl App {
             // (Turned on by `live` only, with the registry: never in tests.)
             pins: None,
             pin_keys: crate::pins::KeyMemo::default(),
+            open,
         }
     }
 
@@ -799,6 +811,9 @@ impl App {
         self.board.refresh(&self.core.snapshot, key.as_deref());
         self.insight_gen = self.board.generation();
         self.board.apply(&mut view);
+        // Kept open by hand: the file re-read only when it changed.
+        self.open.reload();
+        self.open.apply(&mut view);
         self.view = view;
         if !writes.is_empty() {
             crate::menu::store_keys(&self.core.tmux, writes);
@@ -1068,10 +1083,28 @@ impl App {
         match self.core.tmux.run(&["set-option", "-g", SCOPE_OPTION, new]) {
             Ok(o) if o.ok() => {
                 notice::post(&self.focus_notice);
-                self.say(if new == "space" { "showing this space" } else { "showing every space" });
+                self.say(match new {
+                    "space" => "showing this space",
+                    "active" => "showing the active spaces",
+                    _ => "showing every space",
+                });
                 self.refresh();
             }
             _ => self.say(format!("couldn't set {SCOPE_OPTION}")),
+        }
+    }
+
+    /// A dormant header's fold chip ([`Target::Fold`]): keep that space open
+    /// by hand, or let it fold again ([`fold::Store::toggle`], kept by name
+    /// across a restore); then every sidebar redraws (the focus notice).
+    fn toggle_fold(&mut self, name: &str) {
+        match self.open.toggle(name, text::now() as i64) {
+            Ok(open) => {
+                notice::post(&self.focus_notice);
+                self.say(if open { format!("keeping {name} open") } else { format!("{name} folds when quiet") });
+                self.open.apply(&mut self.view);
+            }
+            Err(e) => self.say(format!("couldn't keep {name} open: {e}")),
         }
     }
 
@@ -1097,6 +1130,10 @@ impl App {
         }
         if t == Target::Scope {
             self.toggle_scope();
+            return;
+        }
+        if let Target::Fold(name) = &t {
+            self.toggle_fold(name);
             return;
         }
         if let Target::Toast(id) = t {
@@ -1219,7 +1256,8 @@ impl App {
                 self.void = self.pause_phase.clone().filter(pause::Phase::clickable).map(|phase| VoidArm { at: Instant::now(), phase, stamp });
                 Ok(false)
             }
-            Target::Restart | Target::Scope | Target::Toast(_) | Target::Answer { .. } | Target::Diff(_) | Target::LimitResume(_) => {
+            Target::Restart | Target::Scope | Target::Fold(_) | Target::Toast(_) | Target::Answer { .. } | Target::Diff(_)
+            | Target::LimitResume(_) => {
                 Ok(false)
             }
         };
@@ -1854,6 +1892,42 @@ mod tests {
         a.handle(b"\x1b[<0;3;1M\x1b[<0;3;1m");
         assert_eq!((a.last_act.clone(), a.focus_backs), (Some(Target::Scope), 3));
         assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("couldn't set @strip_scope"));
+    }
+
+    /// A dormant header's fold chip (its counts and `▸`): a left press keeps
+    /// that space open (the view's next frame lists its agents, `▾`), a
+    /// second one lets it fold again; the rest of the header is still the
+    /// home. No tmux client needed (nothing moves).
+    #[test]
+    fn the_fold_chip_keeps_a_dormant_space_open() {
+        let mut a = app();
+        let old = (text::now() as i64 - 10 * 3600).to_string();
+        let since = format!("{old} idle");
+        a.core.snapshot = Snapshot::parse(&[
+            row("main", 1, "@1", &[("state", "running"), ("summary", "Busy")]),
+            row("naps", 1, "@2", &[("state", "idle"), ("summary", "Asleep one"), ("since", &since), ("thread_at", &old)]),
+            row("naps", 2, "@3", &[("state", "idle"), ("summary", "Asleep two"), ("since", &since), ("thread_at", &old)]),
+            "\x1fclient\x1f/dev/ttys999\x1f@1\x1fmain".into(),
+        ].join("\n"));
+        a.view = build_view(&mut a.core, Some("/dev/ttys999"), None).0;
+        a.shown = layout(&a.view, 34, 30, &Opts::default());
+        let lists = |a: &App| layout(&a.view, 34, 30, &Opts::default()).rows.iter().any(|r| r.text().contains("Asleep one"));
+        assert!(!lists(&a), "dormant: folded");
+        let y = a.shown.rows.iter().position(|r| r.targets.iter().any(|t| t.2 == Target::Fold("naps".into()))).expect("a fold chip");
+        let x = a.shown.rows[y].text().chars().position(|c| c == '▸').unwrap();
+        a.handle(format!("\x1b[<0;{};{}M", x + 1, y + 1).as_bytes());
+        assert_eq!(a.last_act, Some(Target::Fold("naps".into())));
+        assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("keeping naps open"));
+        assert!(a.open.is_open("naps") && lists(&a));
+        // Again (the chip now `▾`): it folds when quiet.
+        a.shown = layout(&a.view, 34, 30, &Opts::default());
+        let x = a.shown.rows[y].text().chars().position(|c| c == '▾').unwrap();
+        a.handle(format!("\x1b[<0;{};{}M", x + 1, y + 1).as_bytes());
+        assert_eq!(a.msg.as_ref().map(|(m, _)| m.as_str()), Some("naps folds when quiet"));
+        assert!(!a.open.is_open("naps") && !lists(&a));
+        // A click on the header's name is still the home (here: no client).
+        a.handle(format!("\x1b[<0;6;{}M", y + 1).as_bytes());
+        assert_eq!(a.last_act, Some(Target::Session("naps".into())));
     }
 
     /// The cadence: the fast tick only with no notice fd, the safety net

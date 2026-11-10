@@ -231,6 +231,8 @@ pub struct Agent {
     pub kind_glyph: Option<&'static str>,
     /// The harness running it (`@agent_harness`, else `@agent_kind`:
     /// [`model::Harness::of`]): the sidebar card's mark under its letter.
+    /// A SHELL (no state) reads `@agent_harness` alone (⌘E's hookless
+    /// agents; a stale `@agent_kind` says nothing): its row's glyph.
     pub harness: model::Harness,
     pub workflow: bool,
     pub cua: bool,
@@ -301,6 +303,10 @@ pub struct Agent {
     /// again (running) included. Its mark is [`model::LIMIT_GLYPH`] in
     /// [`model::LIMIT_HUE`], its words `limit`.
     pub limit: Option<model::Limit>,
+    /// `@thread_at` as stamped: when Mack last prompted this window himself
+    /// (epoch seconds; None: a restore, an older window, a peer-only agent).
+    /// The folding reads [`Agent::prompted_at`].
+    pub thread_at: Option<i64>,
 }
 
 /// What a limit with no reset time says when the indicator gave no words
@@ -420,7 +426,7 @@ impl Agent {
             state_words: model::state_words(w),
             kind: w.kind.clone(),
             kind_glyph: model::kind_glyph(&w.kind),
-            harness: model::Harness::of(&w.harness, &w.kind),
+            harness: if w.state.is_empty() { model::Harness::named(&w.harness) } else { model::Harness::of(&w.harness, &w.kind) },
             workflow: !w.workflow.is_empty(),
             cua: !w.cua.is_empty(),
             ask_bg: !w.ask_bg.is_empty(),
@@ -447,7 +453,14 @@ impl Agent {
             pin_key: None,
             pending: None,
             limit,
+            thread_at: w.thread_at,
         }
+    }
+
+    /// Its last prompt from Mack as the folding reads it ([`prompted_at`]):
+    /// `@thread_at`, else `@agent_since` while idle, else None (fresh).
+    pub fn prompted_at(&self) -> Option<i64> {
+        prompted_at(self.thread_at, &self.state, self.since)
     }
 
     /// Rate-limited and lifted: the limit has passed and it waits for Mack
@@ -610,6 +623,56 @@ pub struct Space {
     /// `@pending_color`, its one agent the claude; no shells, no home, no
     /// branch. Going to it opens its popup (`space.sh pending-open`).
     pub pending: Option<String>,
+    /// When Mack last prompted this space ([`last_prompt`]: the newest
+    /// [`prompted_at`] of its agent windows, pinned ones included: the
+    /// `@thread_at`, else an idle window's `@agent_since`). None: FRESH (an
+    /// agent window with neither counts as just prompted), or no agent.
+    pub thread_at: Option<i64>,
+    /// Mack kept this space OPEN by hand (the sidebar's fold chip, kept in
+    /// `~/.local/state/agent-ui/space-open.json` by name: `sidebar::fold`):
+    /// it never folds as dormant. False in a view built as is.
+    pub open: bool,
+}
+
+/// One window's last prompt from Mack, as the folding reads it: its
+/// `@thread_at`; without one (a restore, an older window, a tab Mack never
+/// typed into), its `@agent_since` epoch while it is `idle` (a prompt would
+/// have moved it to running after that, so it is never OLDER than the real
+/// last prompt: it can only make it look fresher, never staler; a restore
+/// restamps it); else None: FRESH.
+pub fn prompted_at(thread_at: Option<i64>, state: &str, since: Option<i64>) -> Option<i64> {
+    thread_at.or(since.filter(|_| state == "idle"))
+}
+
+/// A space's last prompt from Mack over its windows `ws`
+/// ([`Space::thread_at`]): the max over its agent windows of
+/// [`prompted_at`] (shells and the home carry none), but None (fresh) as
+/// soon as one agent window has neither, and None with no agent window.
+pub fn last_prompt<'a>(ws: impl IntoIterator<Item = &'a Window>) -> Option<i64> {
+    let mut max = None;
+    for w in ws.into_iter().filter(|w| !w.state.is_empty() && !w.home) {
+        let t = prompted_at(w.thread_at, &w.state, w.since_t)?;
+        max = Some(max.map_or(t, |m: i64| m.max(t)));
+    }
+    max
+}
+
+/// `@space_fold_hours` unset: 4 hours.
+pub const FOLD_AFTER_DEFAULT: i64 = 4 * 3600;
+
+/// `@space_fold_hours` (raw) → seconds without a prompt from Mack before a
+/// space folds as dormant and an idle agent into its space's idle line:
+/// hours as a decimal (`4`, `0.5`); `0` turns both off; unset or junk, the
+/// default ([`FOLD_AFTER_DEFAULT`]).
+pub fn fold_after(raw: &str) -> i64 {
+    let s = raw.trim();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return FOLD_AFTER_DEFAULT;
+    }
+    match s.parse::<f64>() {
+        Ok(h) if h.is_finite() && h >= 0.0 && h < 1e6 => (h * 3600.0).round() as i64,
+        _ => FOLD_AFTER_DEFAULT,
+    }
 }
 
 /// A shell's label, as spaces.conf's `@space_shell_label`: a shell process
@@ -663,6 +726,8 @@ fn pending_space(w: &Window, a: Agent, cur_win: Option<&str>) -> Space {
         color: w.pending_color.clone(),
         home: None,
         pending: Some(w.id.clone()),
+        thread_at: None,
+        open: false,
     }
 }
 
@@ -855,18 +920,28 @@ pub struct Scope {
     pub counts: Counts,
 }
 
-/// The values `@strip_scope` takes.
-pub const SCOPES: [&str; 2] = ["space", "all"];
+/// The values `@strip_scope` takes, in ⌥V's cycle order: this space, the
+/// ACTIVE spaces (every space but the dormant ones: the sidebar's layout,
+/// "Dormant spaces"), all spaces.
+pub const SCOPES: [&str; 3] = ["space", "active", "all"];
 
 impl Scope {
-    /// `"space"` or `"all"`: `@strip_scope` if set, else by `@spaces`.
+    /// `"space"`, `"active"` or `"all"`: `@strip_scope` if set, else by
+    /// `@spaces`.
     pub fn name(&self) -> &'static str {
         match self.opt.as_str() {
             "space" => "space",
+            "active" => "active",
             "all" => "all",
             _ if self.spaces => "space",
             _ => "all",
         }
+    }
+
+    /// Active scope: every space but the dormant ones (no client session
+    /// needed: like all scope, `session` stays None).
+    pub fn active(&self) -> bool {
+        self.name() == "active"
     }
 
     /// The header title is the scope toggle only once the scope is a thing
@@ -875,12 +950,19 @@ impl Scope {
         self.spaces || SCOPES.contains(&self.opt.as_str())
     }
 
-    /// The scope a toggle sets.
+    /// The scope a toggle (⌥V, the AGENTS hint) sets: the next in the
+    /// cycle, this space → active → all → this space (spaces.conf's M-v
+    /// binding cycles the same). A junk `@strip_scope` (set, but none of
+    /// [`SCOPES`]) goes to this space, as M-v sends it; unset follows the
+    /// scope it reads as.
     pub fn flipped(&self) -> &'static str {
-        if self.name() == "space" {
-            "all"
-        } else {
-            "space"
+        if !self.opt.is_empty() && !SCOPES.contains(&self.opt.as_str()) {
+            return "space";
+        }
+        match self.name() {
+            "space" => "active",
+            "active" => "all",
+            _ => "space",
         }
     }
 }
@@ -981,6 +1063,8 @@ impl ViewModel {
                 color: ws.first().map(|w| w.space_color.clone()).unwrap_or_default(),
                 home: ws.iter().find(|w| w.home).map(|w| w.id.clone()),
                 pending: None,
+                thread_at: last_prompt(ws.iter().copied()),
+                open: false,
             });
         }
 
@@ -1754,9 +1838,60 @@ mod tests {
         // options, but the session is unknown: every session.
         let v = at(&["\x1fclient\x1f/dev/x\x1f@1\x1fproj\x1fon\x1fspace\x1f"], "/dev/me");
         assert_eq!((v.scope.name(), v.scope.session.as_deref(), v.scope.toggles()), ("space", None, true));
-        // Toggling flips the option-level scope.
-        assert_eq!(v.scope.flipped(), "all");
+        // Toggling cycles the option-level scope: space → active → all → space.
+        assert_eq!(v.scope.flipped(), "active");
         assert_eq!(Scope::default().flipped(), "space");
+        let s = |opt: &str| Scope { spaces: true, opt: opt.into(), ..Scope::default() };
+        assert_eq!([s("space").flipped(), s("active").flipped(), s("all").flipped(), s("").flipped()], ["active", "all", "space", "active"]);
+        assert!(s("active").active() && !s("all").active() && !s("").active());
+        assert_eq!(s("active").name(), "active");
+        assert!(Scope { opt: "active".into(), ..Scope::default() }.toggles());
+        // Junk goes to this space, as tmux's M-v does (spaces on or off).
+        assert_eq!((s("junk").flipped(), Scope { opt: "junk".into(), ..Scope::default() }.flipped()), ("space", "space"));
+    }
+
+    /// `@thread_at` → the agent's and its space's last prompt from Mack:
+    /// the max over the space's agent windows; an unstamped window counts
+    /// from its `@agent_since` while idle, else it is FRESH (None) and so is
+    /// its space; shells and the home never count.
+    #[test]
+    fn last_prompt_is_the_newest_stamp_and_a_missing_one_is_fresh() {
+        let build = |rows: &[String]| {
+            ViewModel::build(&Snapshot::parse(&rows.join("\n")), BuildArgs { client: None, now: 9000.0,
+                collator: &Collator::new("C"), git: None, log: vec![], watcher_age: None })
+        };
+        let sp = |v: &ViewModel, n: &str| v.spaces.iter().find(|s| s.name == n).unwrap().thread_at;
+        let v = build(&[
+            row("a", 1, "@1", &[("state", "idle"), ("thread_at", "100")]),
+            row("a", 2, "@2", &[("state", "done"), ("thread_at", "300")]),
+            row("a", 3, "@3", &[]),                                         // a shell: no stamp, no say
+            row("a", 0, "@4", &[("home", "1"), ("state", "idle")]),         // the home: no say
+            row("b", 1, "@5", &[("state", "idle"), ("thread_at", "100")]),
+            row("b", 2, "@6", &[("state", "idle")]),                        // no stamp, no since: fresh
+            row("c", 1, "@7", &[]),                                         // no agent at all
+            // Unstamped and idle: its state stamp stands in (d: 500).
+            row("d", 1, "@8", &[("state", "idle"), ("thread_at", "100")]),
+            row("d", 2, "@9", &[("state", "idle"), ("since", "500 idle")]),
+            // Unstamped and not idle (running, done): fresh, whatever its since.
+            row("e", 1, "@10", &[("state", "idle"), ("thread_at", "100")]),
+            row("e", 2, "@11", &[("state", "running"), ("since", "50 running")]),
+            row("f", 1, "@12", &[("state", "done"), ("since", "50 done")]),
+        ]);
+        assert_eq!((sp(&v, "a"), sp(&v, "b"), sp(&v, "c")), (Some(300), None, None));
+        assert_eq!((sp(&v, "d"), sp(&v, "e"), sp(&v, "f")), (Some(500), None, None));
+        assert_eq!(v.spaces[0].agents.iter().filter(|a| !a.home).map(|a| a.thread_at).collect::<Vec<_>>(), [Some(100), Some(300)]);
+        let d = &v.spaces.iter().find(|s| s.name == "d").unwrap().agents;
+        assert_eq!(d.iter().map(|a| (a.thread_at, a.prompted_at())).collect::<Vec<_>>(), [(Some(100), Some(100)), (None, Some(500))]);
+        assert!(v.spaces.iter().all(|s| !s.open));
+    }
+
+    /// `@space_fold_hours`: decimal hours; 0 off; unset or junk the default.
+    #[test]
+    fn fold_hours() {
+        for (raw, want) in [("", FOLD_AFTER_DEFAULT), ("4", 14_400), (" 6 ", 21_600), ("0.5", 1800), ("0", 0),
+            ("-1", FOLD_AFTER_DEFAULT), ("4h", FOLD_AFTER_DEFAULT), ("1.2.3", FOLD_AFTER_DEFAULT)] {
+            assert_eq!(fold_after(raw), want, "{raw:?}");
+        }
     }
 
     #[test]

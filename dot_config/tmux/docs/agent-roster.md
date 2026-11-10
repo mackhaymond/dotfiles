@@ -636,8 +636,10 @@ described in the rest of this section; it was not changed.**
   Sessions with no agent (and `agents`, `tasks`, `scratch`, `btop-popup`) are
   not shown; parked tabs are the one bottom line. Spare rows sit between the
   last box and `parked`.
-- **Scope** (`Strip.scope`, global option `@strip_scope` = `space` | `all`).
-  `all` is the layout above. `space` shows only the client's current session
+- **Scope** (`Strip.scope`, global option `@strip_scope` = `space` | `all`;
+  agent-ui's sidebar also takes `active`, between the two in ⌥V's cycle,
+  see [Dormant spaces](#dormant-spaces-layoutrs-dormant-spaces-sidebarfoldrs);
+  this Python strip reads it as unset). `all` is the layout above. `space` shows only the client's current session
   (a "space"): its one box, titled `SPACE` with that session's counts
   instead of `AGENTS` and the global ones, shown even when it holds no agent
   (`no agents in this space`), rows in window-index order, each starting with
@@ -1945,6 +1947,41 @@ own; close it as ever: prefix q, Space x, or ⌘W on the tab).
   It rides the sidebar's one snapshot call (the client row's status tail,
   `tmux::STATUS_FORMATS`), so it costs nothing per tick:
   `tmux set -g @agent_stale_after 7200`.
+
+### Dormant spaces (`layout.rs` "Dormant spaces", `sidebar/fold.rs`)
+
+State and recency fold the agents section, not only row pressure
+(2026-11-10). The clock is `@thread_at`, the epoch of Mack's own last
+prompt into a window (docs/agent-tab-indicator.md: a peer's message or a
+harness wake-up never stamps it); a space's last prompt is the newest over
+its agent windows. A window without a stamp (a restore, an older window,
+a tab Mack never typed into) counts from its `@agent_since` while it is
+idle (a prompt would have moved it to running since, so that is never
+older than the real last prompt; a restore restamps it); with neither it
+counts as just prompted and never folds or dims anything.
+
+- **Dormant space**: every agent idle (nothing working, asking, failed,
+  done or paused) and no prompt from Mack for `@space_fold_hours` (global,
+  hours, default 4, `0` off; rides the one snapshot call). Shown as its
+  header and counts alone, with rows to spare. Never the client's space
+  (⌘N or a header click lands there, so it is open on arrival and folds
+  again once he leaves), never a pending space.
+- **Keep open by hand**: a dormant header ends in `▸`; a click on its
+  counts or the chevron keeps the space open (`▾`), a second lets it fold
+  again; anywhere else on the header still goes home. Kept by space name in
+  `~/.local/state/agent-ui/space-open.json` (survives a restore; only the
+  default server's sidebars write it, `$AGENT_UI_SPACE_OPEN` overrides).
+- **Idle fold**: under an open header, an agent idle and unprompted for
+  the same N folds into the space's `○ K idle · …` line at every height.
+  Working, asking, done, recently prompted agents and the client's own keep
+  their cards.
+- **Stale nudge**: a space not prompted for two days with nothing live in
+  it dims and shows the age (`3d`) before its counts. A hint only; off with
+  `@space_fold_hours 0` too.
+- **⌥V** cycles the scope: this space → **active** (every space but the
+  dormant and empty ones, the dormant counted on one `… K quiet spaces`
+  line, a click on it goes on to all) → all spaces. `tmux set -g
+  @space_fold_hours 8` to change N.
 
 ### Answering a permission prompt (`src/answer.rs`)
 
