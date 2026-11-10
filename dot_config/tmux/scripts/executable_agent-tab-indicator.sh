@@ -55,6 +55,12 @@
 #                   still out discharges it to running, not idle.
 #   @agent_kind    claude | codex | opencode | grok — which agent's hooks drive this
 #                   window; written with any state/detail write a hook makes
+#   @agent_harness  abby | unset — the launcher behind that kind when it is not
+#                   the agent itself (THE HARNESS: a claude hook with
+#                   CLAUDE_CONFIG_DIR .../.claude-abby). Written or unset in the
+#                   same command list as every @agent_kind write (kind_add),
+#                   unset with it by clear_state and the watcher GC. Readers:
+#                   harness = @agent_harness if set, else @agent_kind.
 #   @agent_detail_kind  perm | ask | fail | done | run — what the last event
 #                   was about (see DETAIL_JQ); @agent_detail = one sanitized
 #                   line for it (≤80 chars). Both written in set_state's
@@ -256,6 +262,35 @@ esac
 # GROK_HOOK_EVENT in every hook's environment, Claude never does: drop them.
 [ "$agent" != claude ] || [ -z "${GROK_HOOK_EVENT:-}" ] || exit 0
 [ -n "${TMUX:-}" ] || exit 0
+
+# THE HARNESS (@agent_harness). abby (~/.local/bin/abby: Claude Code on
+# abliteration.ai) is plain `claude` run with CLAUDE_CONFIG_DIR=~/.claude-abby,
+# so its hooks arrive as `<mode> claude`. A claude hook whose config dir's
+# basename is .claude-abby (trailing slashes stripped) marks the window
+# @agent_harness abby; every other kind-writing hook unsets it, so a pane that
+# goes from abby to plain claude (or codex) is corrected. Builtins only: this
+# runs on every hook, heartbeat included.
+HARNESS=""
+if [ "$agent" = claude ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    harness_dir="$CLAUDE_CONFIG_DIR"
+    while [ "$harness_dir" != "${harness_dir%/}" ]; do harness_dir="${harness_dir%/}"; done
+    [ "${harness_dir##*/}" != .claude-abby ] || HARNESS=abby
+fi
+
+# kind_add WIN: append @agent_kind (and @agent_harness: set, or unset) to the
+# CALLER's `cmd` (non-empty: these ride its command list after a `;`), for a
+# hook from a known agent. One place for the pair, so the two never part.
+kind_add() {
+    case "$agent" in
+        claude|codex|opencode|grok)
+            cmd+=(\; set-option -w -t "$1" @agent_kind "$agent")
+            if [ -n "$HARNESS" ]; then
+                cmd+=(\; set-option -w -t "$1" @agent_harness "$HARNESS")
+            else
+                cmd+=(\; set-option -uw -t "$1" @agent_harness)
+            fi ;;
+    esac
+}
 
 # Detached condensers inherit the explicit socket too; a pane/window id by
 # itself is not unique across tmux servers.
@@ -742,9 +777,7 @@ set_state() {
     fi
     [ "${#ex[@]}" -gt 0 ] && cmd+=(${cmd[0]+\;} "${ex[@]}")
     [ "${#cmd[@]}" -gt 0 ] || return 0
-    case "$agent" in
-        claude|codex|opencode|grok) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
-    esac
+    kind_add "$win"
     slot_locked=0
     if [ "$SLOT_OK" = 1 ] && { [ "$cur" != "$new" ] || [ "$po" = set ]; } \
        && slot_active "$new" "$pts" "" ""; then
@@ -808,6 +841,7 @@ clear_state() {
     # plus the birth mark (agent-birth.conf): an agent that came and went
     # before the watcher ever saw it must not leave the window held.
     tmux set-option -uw -t "$win" @agent_kind \; \
+         set-option -uw -t "$win" @agent_harness \; \
          set-option -uw -t "$win" @agent_detail_kind \; \
          set-option -uw -t "$win" @agent_detail \; \
          set-option -uw -t "$win" @agent_born \; \
@@ -1493,9 +1527,7 @@ limit_mark() {
     done
     [ "$cur" != needs-input ] || cmd+=(\; set-option -uw -t "$win" @agent_ask_from \;
                                        set-option -uw -t "$win" @agent_ask_bg)
-    case "$agent" in
-        claude|codex|opencode|grok) cmd+=(\; set-option -w -t "$win" @agent_kind "$agent") ;;
-    esac
+    kind_add "$win"
     cmd+=(\; set-option -w -t "$win" @agent_paused "$e"
           \; set-option -w -t "$win" @agent_limit "$r $ty $e"
           \; set-option -w -t "$win" @agent_detail_kind limit

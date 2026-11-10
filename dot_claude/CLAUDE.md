@@ -184,6 +184,14 @@ they name a space, shell, agent, letter, parked tab or NEEDS YOU.
   Whenever you add, move, re-purpose or remove a key (tmux, WezTerm,
   Karabiner, the agent-ui menu), update its row in the same change.
   `tests/test_keys_catalog.py` catches tmux drift.
+- **Agent logos exist as a font.** AgentMarks (chezmoi source
+  `dot_config/wezterm/agent-marks/`, its README is the codepoint table)
+  holds Claude, Codex, Grok, OpenCode, abby (abliteration.ai), Gemini and
+  other harness logos as plane-16 PUA glyphs (U+10C100+), in 1-, 2- and
+  3-cell forms via ligatures with U+10C1FF. Use it whenever a terminal UI
+  should show which agent or harness something is; it is also the source
+  of SVGs for other surfaces. A new harness means a mark in the font plus
+  a row in agent-ui's `Harness` table.
 - **NEEDS YOU while still working.** A turn that ends while your
   subagents, workflows or background tasks are still out keeps your tab
   "working", so a question in it is invisible. If you truly need Mack (a

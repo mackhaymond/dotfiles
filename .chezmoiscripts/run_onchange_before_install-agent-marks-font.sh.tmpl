@@ -1,0 +1,44 @@
+#!/bin/bash
+# AgentMarks: copy the one-cell agent-logo font (the sidebar's harness marks)
+# from dot_config/wezterm/agent-marks/ in the chezmoi SOURCE tree into
+# ~/.local/share/wezterm/fonts, which wezterm.lua lists in config.font_dirs.
+# Docs/codepoints: dot_config/wezterm/agent-marks/README.md
+#
+# NOT ~/Library/Fonts (2026-11-09): a running WezTerm keeps the system font
+# list it read at launch, so a font installed there stays invisible ("No fonts
+# contain glyphs for these codepoints: \u{10c100}") until WezTerm restarts.
+# font_dirs are re-read by WezTerm's own loader on every config reload, so a
+# new or rebuilt AgentMarks shows up as soon as wezterm.lua is reloaded.
+#
+# A script rather than a managed file so the font is in place BEFORE chezmoi
+# writes a wezterm.lua that names it. run_onchange: re-runs whenever the hash below changes,
+# i.e. whenever a rebuilt AgentMarks.ttf is committed (build.py is run by hand;
+# apply needs no fontTools). "before": the font is in place before chezmoi
+# writes a wezterm.lua that names it, so a live config reload never warns
+# about a missing "AgentMarks".
+{{- $ttf := joinPath .chezmoi.sourceDir "dot_config/wezterm/agent-marks/AgentMarks.ttf" }}
+#
+# AgentMarks.ttf sha256 {{ include $ttf | sha256sum }}
+{{- if ne .chezmoi.os "darwin" }}
+echo "[agent-marks] not macOS; nothing to install"
+exit 0
+{{- end }}
+set -euo pipefail
+
+SRC={{ $ttf | quote }}
+DEST_DIR="$HOME/.local/share/wezterm/fonts"
+DEST="$DEST_DIR/AgentMarks.ttf"
+
+# The first version installed into ~/Library/Fonts; one copy is enough.
+rm -f "$HOME/Library/Fonts/AgentMarks.ttf"
+mkdir -p "$DEST_DIR"
+if [ -f "$DEST" ] && cmp -s "$SRC" "$DEST"; then
+    echo "[agent-marks] $DEST is up to date"
+    exit 0
+fi
+# Copy to a temp name and rename, so CoreText never sees a half-written font.
+tmp="$(mktemp "$DEST_DIR/.AgentMarks.ttf.new.XXXXXX")"
+cp "$SRC" "$tmp"
+chmod 644 "$tmp"
+mv -f "$tmp" "$DEST"
+echo "[agent-marks] installed $DEST (WezTerm picks it up on its next config reload)"

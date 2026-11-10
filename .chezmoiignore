@@ -20,6 +20,11 @@ OPERATIONS.md
 .config/broot/launcher/**
 .config/iterm2/**
 .config/wezterm/.git/**
+# AgentMarks font sources (SVGs, build.py, the built .ttf). The font is copied
+# to ~/.local/share/wezterm/fonts (wezterm.lua's font_dirs) by .chezmoiscripts/run_onchange_before_install-agent-marks-font.sh.tmpl;
+# nothing from here belongs in ~/.config. The bare line keeps the empty dir out.
+.config/wezterm/agent-marks
+.config/wezterm/agent-marks/**
 .config/tmux/.git/**
 .config/tmux/.sisyphus/**
 # agent-ui is a Rust crate built FROM the source tree into ~/.local/bin by

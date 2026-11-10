@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <title>Agent (generic)</title>
+  <!-- Original mark for this repo: a robot head (antenna, head with two eye holes). Public domain. -->
+  <path d="M12 0.6a2 2 0 1 1 0 4a2 2 0 1 1 0-4Z"/>
+  <path d="M10.9 4.4H13.1V7.3H10.9Z"/>
+  <path fill-rule="evenodd" d="M6 7H18A3.5 3.5 0 0 1 21.5 10.5V19.5A3.5 3.5 0 0 1 18 23H6A3.5 3.5 0 0 1 2.5 19.5V10.5A3.5 3.5 0 0 1 6 7ZM6.5 11.5V16.5H10V11.5ZM14 11.5V16.5H17.5V11.5Z"/>
+</svg>

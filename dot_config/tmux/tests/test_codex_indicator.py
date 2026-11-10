@@ -195,7 +195,7 @@ class IndicatorIntegrationTests(unittest.TestCase):
         # (A FOREIGN AGENT'S TOOL SHELL); the tests that want it set it.
         for key in ("AGENT_TAB_SOCKET", "AGENT_TAB_OWNER_SESSION", "AGENT_TAB_OWNER_TOKEN", "AGENT_TAB_OWNER_BINDING",
                     "AGENT_TAB_OWNER_RECORD", "AGENT_TAB_TITLE_BUDGET", "CODEX_THREAD_ID", "CODEX_SANDBOX",
-                    "GROK_HOOK_EVENT"):
+                    "GROK_HOOK_EVENT", "CLAUDE_CONFIG_DIR"):
             self.env.pop(key, None)
         self.bind("aaaa")
 

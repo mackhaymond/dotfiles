@@ -2663,6 +2663,7 @@ EOF
                 tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_kind \; \
+                     set-option -uw -t "$win" @agent_harness \; \
                      set-option -uw -t "$win" @agent_detail_kind \; \
                      set-option -uw -t "$win" @agent_detail \; \
                      set-option -uw -t "$win" @agent_born \; \

@@ -34,7 +34,13 @@ config.window_decorations = "RESIZE|MACOS_FORCE_SQUARE_CORNERS"
 config.font = wezterm.font_with_fallback({
     "JetBrains Mono",
     "MesloLGS NF",
+    -- One-cell agent logos for the tmux sidebar (U+10C100..): see agent-marks/README.md in the chezmoi source.
+    "AgentMarks",
 })
+-- AgentMarks lives here, not in ~/Library/Fonts: WezTerm re-reads font_dirs
+-- on every config reload, but it only reads the system font list at launch.
+-- (Installed by .chezmoiscripts/run_onchange_before_install-agent-marks-font.)
+config.font_dirs = { wezterm.home_dir .. "/.local/share/wezterm/fonts" }
 config.font_size = 12
 
 config.window_padding = {
