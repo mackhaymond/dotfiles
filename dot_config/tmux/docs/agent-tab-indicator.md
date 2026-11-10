@@ -352,10 +352,28 @@ the heartbeat, `settle`, `clear` and the session tracker):
     looking), never quietly idle. Mack's own cancel (Ctrl+C, a declined
     permission) is `interrupt`: idle, label kept, as for Codex and OpenCode;
   - the failure detail reads `error_details // errorDetails`.
-- **Background work.** A Grok `Stop` lists what is still out in
-  `backgroundTasks` (or `background_tasks`); a non-empty one holds the tab
-  `running` exactly as agent-bg-pending's verdict does for Claude
-  (`@agent_bg_owner`, the watcher's release). `sessionCrons` never hold a tab.
+- **Background work.** A Grok `Stop` lists what is in flight in
+  `backgroundTasks` (or `background_tasks`), and agent-bg-pending judges it:
+  `--grok-stop`, the payload on stdin, exit 0 + the count when something is
+  out. A shell or subagent is out; a **monitor** is not (nobody waits on it),
+  nor an entry whose status says it ended, nor `sessionCrons`. The notch hook
+  asks the same, so both surfaces agree. Out holds the tab `running` exactly
+  as the Claude verdict does (`@agent_bg_owner`, the watcher's release).
+  (Until 2026-11-09 the indicator counted the list's `length`, so a lone
+  monitor held a grok tab forever; without the program it still counts, monitors
+  left out.)
+- **Subagents out after the turn** (2026-11-09, tab I idled while two
+  subagents thought). Once the turn has ended the session's `events.jsonl`
+  ends in `turn_ended`, which the watcher's un-stick reads as idle. So for a
+  grok window the watcher also asks `agent-bg-pending --grok-session <sid>
+  <cwd>` (the sid `grok_status` resolves; cwd decoded from the session
+  folder's name): exit 0 = a child subagent still out, which holds a
+  `running` tab (`bg_held`) and lights the gear in any state, as a Claude
+  background subagent does. Asked only when the session has a `subagents/`
+  dir, and cached like the Claude ask: again when `subagents/`, a child's
+  dir or its `meta.json` moves, or every `STAMP_RING` ticks
+  (`grok_bg_pending`). Not on the parent's own `events.jsonl`: the verdict
+  does not read it, and a mid-turn parent appends to it every tick.
 - **`settle`** (Grok's `idle_prompt`: the TUI sits at its prompt). The
   backstop for a turn end no `Stop` reported. It moves ONLY a `running`
   window, to idle (`clear_pending` too; label and detail stay): `done`,
@@ -1229,6 +1247,27 @@ workflows' one-hour backstop. The parent transcript is read incrementally
 mtime+size. CuaNotch's `tallyNotifications`/`subagentInterrupted` apply the
 same three rules; `check-invariants` pins the tag, the marker, the tail
 budget and the hour.
+
+**The subagent's own meta comes first** (2026-11-09, Claude Code 2.1.319).
+Beside each transcript sits `agent-<id>.meta.json` (`requestShape`
+`background`|`foreground`, and `"finished": true` once done). A FOREGROUND
+(synchronous) Agent call is never sent a `<task-notification>`, so the rules
+above held every finished one running for the hour: tab B sat `running`
+with the gear after its turn ended. Now `"finished": true` (JSON true, at a
+key position) → finished; anything else (no meta, `finished` absent or
+false, a meta that is not a whole JSON object (torn) or is over
+`SUBAGENT_META_MAX`) keeps the rules above. **`requestShape` is not
+trusted**: Claude Code moves a running foreground call to the background
+(ctrl+b, its 120 s auto-background timer, a queued message) without
+rewriting it, so "foreground, not finished" can be a live agent; reading
+it as finished dropped the gear and let stash.sh's park guard SIGTERM one.
+The metas ride the same one `stat`; the verdict is a builtin read cached
+by the meta's mtime+size (`subagent_meta_done`). Pinned with
+agent-bg-pending's `_meta_done` and CuaNotch (`SUBAGENT_META_MAX`, the
+`"finished"` read).
+A Monitor is never background work on any of these paths: the lib reads
+only subagent transcripts and workflows, and agent-bg-pending's task
+detector counts only a moved MCP call or a Bash `run_in_background`.
 
 **Cost: one `stat` per session.** Sessions carry dozens of subagent
 transcripts, so the subagent check stats the parent transcript and every

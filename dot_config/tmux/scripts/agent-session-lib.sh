@@ -36,6 +36,19 @@
 #      notice lands ~90ms before the agent's own last write (measured
 #      2026-09-29) and both sides are whole seconds here, so an exact test
 #      held every finished background agent "running" for the full hour.
+#      BEFORE all that, the subagent's own META (2026-11-09, Claude Code
+#      2.1.319): agent-<id>.meta.json beside its transcript. `"finished":
+#      true` → finished (a synchronous, foreground Agent call is never sent
+#      a <task-notification>, so the notified rule alone held every finished
+#      foreground agent "running" for the full hour - tab B sat running with
+#      the gear after its turn ended). Anything else - no meta, one that is
+#      not a whole JSON object, `finished` absent or false - → the rules
+#      above, unchanged. `requestShape` is NOT trusted: Claude Code moves a
+#      running foreground call to the background (ctrl+b, its 120 s
+#      auto-background timer, a queued message) without rewriting it, so
+#      "foreground" means nothing about whether it still runs - reading it as
+#      finished dropped the gear and let stash's park guard SIGTERM a live
+#      agent.
 #      A workflow is in-flight iff its runtime dir
 #      subagents/workflows/wf_<id>/ exists without its completion file
 #      workflows/wf_<id>.json, with the same one-hour mtime backstop
@@ -123,8 +136,41 @@ resolve_session_bases() {
 # look, one python over the delta, only when a fresh subagent file makes the
 # answer matter), and the interrupt verdict is cached by mtime+size, so a
 # finished file costs one tail read rather than two forks a second.
-declare -A NOTIF_SIZE NOTIF_WHEN INT_CACHE
+declare -A NOTIF_SIZE NOTIF_WHEN INT_CACHE META_CACHE
 SUBAGENT_NOTIFY_GRACE=10   # see the header's point 2
+# A meta file bigger than this is not one Claude Code wrote (they run ~300 B):
+# read as no meta, i.e. the old rules, never as finished. PINNED
+# (check-invariants) with agent-bg-pending's constant of the same name.
+SUBAGENT_META_MAX=65536
+
+# subagent_meta_done META "MTIME.SIZE" → 0 when the subagent's meta file says
+# it is not out: "finished": true (the header's point 2; requestShape is
+# deliberately not read). 1 = no verdict (no meta, too big, not a whole JSON
+# object, finished absent or not true): the caller goes on to the old
+# rules. PINNED to
+# CuaNotch's agent-bg-pending (subagents_pending): change both together.
+# Fork-free (a builtin read of a ~300-byte file) and cached by the meta's own
+# mtime+size, which the caller's one stat already returned - so a finished
+# rewrite of the meta (it gains "finished") is a fresh look.
+subagent_meta_done() {
+    local m="$1" k="$2" v raw=""
+    v="${META_CACHE[$m]:-}"
+    if [ "${v%=*}" != "$k" ]; then
+        v="$k=0"
+        if [ "${k#*.}" -le "$SUBAGENT_META_MAX" ] 2>/dev/null; then
+            IFS= read -r -d '' raw < "$m" 2>/dev/null || true
+            # A whole object (a torn or truncated write is no verdict), then
+            # the key at a key position: `{` or `,` before it, so a
+            # description quoting it (escaped \") never matches.
+            if [[ $raw =~ ^[[:space:]]*\{.*\}[[:space:]]*$ ]] \
+               && [[ $raw =~ [{,][[:space:]]*\"finished\"[[:space:]]*:[[:space:]]*true[[:space:]]*[,}] ]]; then
+                v="$k=1"
+            fi
+        fi
+        META_CACHE[$m]="$v"
+    fi
+    [ "${v#*=}" = 1 ]
+}
 # The subagent age window. MUST equal the literal in session_has_running_
 # subagent's `[ "$age" -lt … ] || continue` (check-invariants pins that
 # literal against CuaNotch; the unit test pins this against it).
@@ -315,13 +361,15 @@ print(" ".join(ids))' "$p" "$have" "$horizon" "${NOTIF_FIRST_CHUNK:-1048576}" 2>
 
 # True if the claude session owning PID has a background SUBAGENT (the Agent
 # tool) still out. The rules are the header's point 2; the order below is
-# notified → interrupted → running, each `continue` a way to be finished.
+# meta → notified → interrupted → running, each `continue` a way to be
+# finished.
 # Cost per base: ONE stat fork for the parent and every agent-*.jsonl (see
 # the header's COST note), notified_ids at most once and only if some file is
 # inside the age window, tail only for a file whose mtime+size changed.
 session_has_running_subagent() {
-    local f mt size now age base id p psize when v last line dir asked
-    local -a files stats
+    local f mt size now age base id p psize when v last line dir asked m
+    local -a files metas stats
+    local -A mstat
     resolve_session_bases "$1" || return 1
     printf -v now '%(%s)T' -1
     for base in "${SESSION_BASES[@]}"; do
@@ -329,22 +377,35 @@ session_has_running_subagent() {
         [ -d "$dir" ] || continue
         files=("$dir"/agent-*.jsonl)
         [ -e "${files[0]:-}" ] || continue   # no match (or nullglob: empty)
+        metas=("$dir"/agent-*.meta.json)
+        [ -e "${metas[0]:-}" ] || metas=()
         p="$SESSION_PROJ/$base.jsonl"
         # "<mtime> <size> <path>" per file, parent first (stat keeps argument
-        # order; a missing parent just has no line). %N last, so a path with
-        # spaces survives the two-field split below.
-        mapfile -t stats < <(stat -f '%m %z %N' "$p" "${files[@]}" 2>/dev/null)
-        psize=""; asked=""
+        # order; a missing parent just has no line), the metas in the same
+        # call. %N last, so a path with spaces survives the two-field split
+        # below.
+        mapfile -t stats < <(stat -f '%m %z %N' "$p" "${files[@]}" "${metas[@]}" 2>/dev/null)
+        psize=""; asked=""; mstat=()
+        for line in "${stats[@]}"; do          # the metas: path -> "mtime.size"
+            case "$line" in *.meta.json) ;; *) continue ;; esac
+            mt="${line%% *}"; line="${line#* }"
+            mstat["${line#* }"]="$mt.${line%% *}"
+        done
         for line in "${stats[@]}"; do
             mt="${line%% *}"; line="${line#* }"
             size="${line%% *}"; f="${line#* }"
             case "$mt" in ''|*[!0-9]*) continue ;; esac
             case "$size" in ''|*[!0-9]*) continue ;; esac
             if [ "$f" = "$p" ]; then psize="$size"; continue; fi
+            case "$f" in *.meta.json) continue ;; esac
             age=$((now - mt))
             [ "$age" -lt 3600 ] || continue
             [ "$mt" -ge "$SESSION_STARTED" ] || continue   # an earlier process's
             id="${f##*/agent-}"; id="${id%.jsonl}"
+            # 0. Its meta says "finished": true → not out (the header's
+            #    point 2). Anything else → the rules below.
+            m="${f%.jsonl}.meta.json"
+            [ -n "${mstat[$m]:-}" ] && subagent_meta_done "$m" "${mstat[$m]}" && continue
             # 1. Notified since it last moved → finished.
             if [ -z "$asked" ]; then
                 notified_ids "$p" "$psize" "$((now - SUBAGENT_WINDOW - SUBAGENT_NOTIFY_GRACE))"

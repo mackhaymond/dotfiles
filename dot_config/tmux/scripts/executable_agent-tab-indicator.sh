@@ -3434,12 +3434,19 @@ case "$mode" in
         # exactly one copy of it and two callers.
         bg_pending=0
         if [ "$agent" = grok ]; then
-            # GROK says so in the Stop itself: backgroundTasks lists the work
-            # still out (agent-bg-pending reads Claude transcripts only).
-            # Its sessionCrons are not work out: a cron never holds a tab.
-            if [ -n "$JQ" ] && [ -n "$payload" ]; then
+            # GROK says so in the Stop itself: backgroundTasks lists what is
+            # in flight. The same program judges it (--grok-stop, the payload
+            # on stdin), so the notch and this tab agree: a shell or subagent
+            # is out; a MONITOR is not (nobody waits on it - a lone one held
+            # the tab running for good when this counted `length`), nor an
+            # entry whose status says it ended, nor sessionCrons. Without
+            # the program: the old count, monitors left out.
+            if [ -n "$payload" ] && [ -x "$BG_PENDING" ]; then
+                "$BG_PENDING" --grok-stop <<<"$payload" >/dev/null 2>&1 && bg_pending=1
+            elif [ -n "$JQ" ] && [ -n "$payload" ]; then
                 bg_n=$("$JQ" -r '(.backgroundTasks // .background_tasks // [])
-                                 | if type == "array" or type == "object" then length else 0 end' \
+                                 | if type == "array" then map(select((type == "object" and (.type | ascii_downcase? // "") == "monitor") | not)) | length
+                                   elif type == "object" then length else 0 end' \
                        <<<"$payload" 2>/dev/null || true)
                 case "$bg_n" in ''|0|*[!0-9]*) ;; *) bg_pending=1 ;; esac
             fi

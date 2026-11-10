@@ -396,7 +396,7 @@ class GrokServerTests(tl.LimitHookHarness):
     def test_background_tasks_hold_running(self):
         self.prompt_g("p-1")
         self.gk("done", promptId="p-1", reason="end_turn", last_assistant_message="Started the build.",
-                backgroundTasks=[{"id": "bash_1", "command": "make"}])
+                backgroundTasks=[{"id": "bash_1", "type": "shell", "status": "running", "command": "make"}])
         self.assertEqual(self.opt("@agent_state"), "running")
         self.assertEqual(self.opt("@agent_bg_owner"), "user")
         self.assertEqual(self.opt("@agent_turn_result"), "p-1 loud")
@@ -405,6 +405,46 @@ class GrokServerTests(tl.LimitHookHarness):
         self.gk("done", promptId="p-2", reason="end_turn", backgroundTasks=[], sessionCrons=[{"id": "c1"}])
         self.assertEqual(self.opt("@agent_state"), "done")
         self.assertFalse(self.has("@agent_bg_owner"))
+
+    def test_a_lone_monitor_is_not_work_out(self):
+        # No agent-bg-pending (this HOME has none): the jq fallback leaves
+        # monitors out, so a lone one no longer holds the tab for good.
+        self.assertFalse((self.home / ".local/bin/agent-bg-pending").exists())
+        self.prompt_g("p-1")
+        self.gk("done", promptId="p-1", reason="end_turn",
+                backgroundTasks=[{"id": "mon_1", "type": "monitor", "status": "running"}])
+        self.assertEqual(self.opt("@agent_state"), "done")
+        self.assertFalse(self.has("@agent_bg_owner"))
+        # A monitor beside a subagent: the subagent holds.
+        self.prompt_g("p-2")
+        self.gk("done", promptId="p-2", reason="end_turn",
+                backgroundTasks=[{"id": "mon_1", "type": "Monitor"},
+                                 {"id": "sub_1", "type": "subagent", "status": "running"}])
+        self.assertEqual(self.opt("@agent_state"), "running")
+
+    def test_stop_asks_agent_bg_pending_grok_stop(self):
+        # Both callers ask the one program, the Stop payload on stdin: its
+        # verdict holds or finishes the tab, whatever the list's length says.
+        log, rc = self.root / "bg.log", self.root / "bg.rc"
+        stub = ('#!/bin/sh\necho "$*" >> "%s"\ncat >> "%s"\necho >> "%s"\n'
+                'r=$(cat "%s"); [ "$r" = 0 ] && echo 1\nexit "$r"\n') % (log, log, log, rc)
+        path = self.home / ".local/bin/agent-bg-pending"
+        path.write_text(stub)
+        path.chmod(0o755)
+        rc.write_text("1")
+        self.prompt_g("p-1")
+        self.gk("done", promptId="p-1", reason="end_turn",
+                backgroundTasks=[{"id": "x", "type": "shell", "status": "running"}])
+        self.assertEqual(self.opt("@agent_state"), "done")       # the program said none
+        lines = log.read_text().splitlines()
+        self.assertEqual(lines[0], "--grok-stop")
+        self.assertEqual(json.loads(lines[1])["backgroundTasks"][0]["id"], "x")
+        rc.write_text("0")
+        self.prompt_g("p-2")
+        self.gk("done", promptId="p-2", reason="end_turn",
+                backgroundTasks=[{"id": "m", "type": "monitor"}])
+        self.assertEqual(self.opt("@agent_state"), "running")    # ...and here it said one
+        self.assertEqual(self.opt("@agent_bg_owner"), "user")
 
     def test_interrupt_goes_idle(self):
         self.prompt_g("p-1")

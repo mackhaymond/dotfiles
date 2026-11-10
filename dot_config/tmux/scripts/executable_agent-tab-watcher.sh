@@ -605,22 +605,29 @@ grok_rec_sid() {
     GK_RSID[$1]="$sid"; GK_RTICK[$1]=$tick_no
     return 0
 }
-grok_status() {
-    local pid="$1" w="$2" sid ev
+# grok_ev PID: into the caller's sid and ev the session id of grok PID's
+# session and its events.jsonl (both "" when unknown; 1). Builtins and globs.
+grok_ev() {
     local -a m
-    st=""
-    [ -n "$pid" ] || return 0
+    sid=""; ev=""
+    [ -n "$1" ] || return 1
     grok_map
-    sid="${GK_SID[$pid]:-}"
-    [ -n "$sid" ] || grok_rec_sid "$pid"
-    [ -n "$sid" ] || return 0
+    sid="${GK_SID[$1]:-}"
+    [ -n "$sid" ] || grok_rec_sid "$1"
+    [ -n "$sid" ] || return 1
     ev="${GK_EV[$sid]:-}"
     if [ -z "$ev" ] || [ ! -f "$ev" ]; then
         m=("$GROK_ROOT/sessions"/*/"$sid"/events.jsonl)
         ev="${m[0]}"
-        [ -f "$ev" ] || return 0              # (an unmatched glob stays literal)
+        [ -f "$ev" ] || { ev=""; return 1; }  # (an unmatched glob stays literal)
         GK_EV[$sid]="$ev"
     fi
+    return 0
+}
+grok_status() {
+    local pid="$1" w="$2" sid ev
+    st=""
+    grok_ev "$pid" || return 0
     GK_USED[$w]=1
     if [ "${GK_PATH[$w]:-}" = "$ev" ] && ! changed_since "${GK_TICK[$w]:-}" "$ev"; then
         st="${GK_ST[$w]}"
@@ -1165,7 +1172,8 @@ refresh_cua_pids() {
 
 # session_has_running_subagent, skipped when nothing it reads has changed.
 # Its verdict is a function of the session's parent transcript, its
-# subagents/ dir and every agent-*.jsonl in it (mtime, size, contents) -
+# subagents/ dir and every agent-*.jsonl and agent-*.meta.json in it (mtime,
+# size, contents; a meta replaced by rename moves the dir) -
 # plus the clock, which can only move a subagent OUT of the age window
 # (running -> finished), never into it. So an unchanged input set keeps its
 # verdict, and the STAMP_RING-tick expiry bounds how late an age-out is seen
@@ -1184,7 +1192,8 @@ subagent_running() {
     if [ -n "${SUB_TICK[$pid]:-}" ] && [ "${SUB_KEY[$pid]:-}" = "$key" ]; then
         for b in "${SESSION_BASES[@]}"; do
             watch+=("$SESSION_PROJ/$b.jsonl" "$SESSION_PROJ/$b/subagents" \
-                    "$SESSION_PROJ/$b/subagents"/agent-*.jsonl)
+                    "$SESSION_PROJ/$b/subagents"/agent-*.jsonl \
+                    "$SESSION_PROJ/$b/subagents"/agent-*.meta.json)
         done
         if ! changed_since "${SUB_TICK[$pid]}" "${watch[@]}"; then
             return "${SUB_V[$pid]}"
@@ -1226,6 +1235,50 @@ bg_task_pending() {
     v=$?
     [ "$v" = 0 ] || v=1
     BG_KEY[$pid]="$tp"; BG_TICK[$pid]=$tick_no; BG_V[$pid]=$v
+    return "$v"
+}
+
+# GROK SUBAGENTS HOLD A TAB TOO (2026-11-09: tab I's Stop listed two running
+# subagents in backgroundTasks, the indicator held it `running`, and 3 ticks
+# later the un-stick read turn_ended in events.jsonl and idled it while both
+# were still thinking - bg_held was never computed for grok). The same
+# program answers for a grok session: `agent-bg-pending --grok-session <sid>
+# [cwd]`, exit 0 (stdout the count) while a child subagent of that session is
+# still out, 1 for none or unknown. A yes holds a running tab (bg_held) and
+# lights the gear, as a Claude background subagent does. The sid is the one
+# grok_status reads (grok_ev); cwd is the session folder's own name, decoded.
+# Asked only for a session that has a subagents/ dir (none: no child was ever
+# spawned, no fork), and cached per pid like bg_task_pending: asked again
+# when its subagents/ dir, a child's dir or a child's meta.json moves (a
+# child writes output.json as it completes and its meta's status changes),
+# or once STAMP_RING ticks pass - a child that ends only in its own
+# events.jsonl (a sibling session dir, not watched), the program's age
+# backstop, and an answer a failed run got wrong are all seen within those
+# ticks. NOT the parent's own events.jsonl: the verdict does not read it,
+# and a mid-turn parent appends to it every tick, which forked this python
+# (~30-175 ms) every second.
+declare -A GB_KEY=() GB_TICK=() GB_V=()
+grok_bg_pending() {
+    local pid="$1" sid ev dir enc cwd v
+    local -a watch
+    [ -x "$BG_PENDING" ] || return 1
+    grok_ev "$pid" || return 1
+    dir="${ev%/events.jsonl}"
+    [ -d "$dir/subagents" ] || return 1
+    watch=("$dir/subagents" "$dir/subagents"/*/ "$dir/subagents"/*/meta.json)
+    if [ -n "${GB_TICK[$pid]:-}" ] && [ "${GB_KEY[$pid]:-}" = "$dir" ] \
+       && ! changed_since "${GB_TICK[$pid]}" "${watch[@]}"; then
+        return "${GB_V[$pid]}"
+    fi
+    # The folder is the cwd percent-encoded ("%2FUsers%2Fx"): backslashes
+    # doubled first, so %b can only expand the \xHH this makes.
+    enc="${dir%/*}"; enc="${enc##*/}"
+    enc="${enc//\\/\\\\}"
+    printf -v cwd '%b' "${enc//%/\\x}"
+    "$BG_PENDING" --grok-session "$sid" "$cwd" >/dev/null 2>&1
+    v=$?
+    [ "$v" = 0 ] || v=1
+    GB_KEY[$pid]="$dir"; GB_TICK[$pid]=$tick_no; GB_V[$pid]=$v
     return "$v"
 }
 
@@ -1930,6 +1983,7 @@ while :; do
         PID_TTY=(); PID_KIND=()
         GK_EV=(); GK_SOFT=()               # grok: session id -> events.jsonl; soft "no"s
         GK_RSID=(); GK_RTICK=()            # grok: pid -> its record's session id
+        GB_KEY=(); GB_TICK=(); GB_V=()     # grok: pid -> its children-out verdict
         # The subagent verdict cache rides the same clock: dead pids drop
         # out, and every session gets one full look a minute regardless.
         SUB_KEY=(); SUB_TICK=(); SUB_V=()
@@ -2329,6 +2383,12 @@ EOF
                         bg_task_pending "$pid" && { bg_held=1; wf=1; any_workflow=1; } ;;
                 esac
             fi
+            # GROK: a child subagent still out is the gear in any state and
+            # holds a running tab against events.jsonl's turn_ended (GROK
+            # SUBAGENTS HOLD A TAB TOO). Cached; no fork while nothing moves.
+            if [ -n "$pid" ] && [ "${PID_KIND[$pid]:-}" = grok ] && grok_bg_pending "$pid"; then
+                bg_held=1; wf=1; any_workflow=1
+            fi
             case "$cua_pids" in
                 *" ${pid} "*) [ -n "$pid" ] && { cua=1; any_cua=1; } ;;
             esac
@@ -2406,6 +2466,8 @@ EOF
         # turn_started/turn_ended in the session's events.jsonl, found through
         # active_sessions.json by pid). Only `running`, state only, three
         # ticks; never the Claude session file or a stale rollout either.
+        # A child subagent still out (grok_bg_pending, bg_held) keeps the
+        # tab running whatever events.jsonl says, as for Claude.
         fin=""        # the state this agent's own record says, if it disagrees
         cx_full=0     # 1 = a codex turn end after the stamp: the full write
         cx_lim=0      # 1 = that turn end was a usage limit (RATE-LIMITED AGENTS)

@@ -432,6 +432,125 @@ class GrokWatcherTests(unittest.TestCase):
         self.assertEqual(o["@agent_state"], "idle")
         self.assertNotIn("@agent_pending", o)
 
+    # --- child subagents still out (GROK SUBAGENTS HOLD A TAB TOO) ---
+    #
+    # agent-bg-pending is a stub that logs its argv and exits with the
+    # number in $FAKE_BG_RC_FILE: `--grok-session <sid> [cwd]`, exit 0 (stdout
+    # the count) while a child is out, 1 for none.
+
+    BG_STUB = ('#!/bin/sh\necho "$*" >> "$FAKE_BG_LOG"\nrc=$(cat "$FAKE_BG_RC_FILE")\n'
+               '[ "$rc" = 0 ] && echo 2\nexit "$rc"\n')
+
+    def held_tab(self, rc, children=True):
+        now = int(time.time())
+        self.make({"@1": self.gk_window(1, "running", now - 60, **{"@agent_bg_owner": "user"})},
+                  [{"window": "@1", "tty": TUI_TTY}])
+        p = self.session(STARTED + PHASE + ENDED)
+        self.child = p.parent / "subagents" / "01child-1"
+        if children:
+            self.child.mkdir(parents=True)
+            (self.child / "meta.json").write_text("{}")
+        stub = self.f.home / ".local/bin/agent-bg-pending"
+        stub.parent.mkdir(parents=True, exist_ok=True)
+        stub.write_text(self.BG_STUB)
+        stub.chmod(0o755)
+        self.bg_log = self.f.dir / "bg.log"
+        self.bg_rc = self.f.dir / "bg.rc"
+        self.bg_rc.write_text(str(rc))
+        return p
+
+    def bg_env(self):
+        return dict(FAKE_BG_LOG=str(self.bg_log), FAKE_BG_RC_FILE=str(self.bg_rc))
+
+    def asks(self):
+        return self.bg_log.read_text().splitlines() if self.bg_log.exists() else []
+
+    def test_child_out_holds_a_turn_ended_tab_running_with_gear(self):
+        self.held_tab(rc=0)
+        o = self.run_ticks(6, **self.bg_env())["windows"]["@1"]["opts"]
+        self.assertEqual(o["@agent_state"], "running")
+        self.assertEqual(o.get("@agent_workflow"), "1")
+        self.assertEqual(o.get("@agent_bg_owner"), "user")
+        # The parent's session id and its decoded cwd - and cached: nothing
+        # moved, so once for all six ticks.
+        self.assertEqual(self.asks(), ["--grok-session %s %s" % (SID, CWD)])
+
+    def test_parent_events_appends_alone_do_not_re_ask(self):
+        # A mid-turn parent appends to its events.jsonl all the time; the
+        # verdict does not read it, so that alone must not fork the program
+        # again (only subagents/, a child's dir or meta.json, or the
+        # STAMP_RING expiry, which 7 ticks stay inside).
+        ev_path = self.held_tab(rc=0)
+        env = self.f.env(**self.env(7, **self.bg_env()))
+        p = subprocess.Popen(["bash", str(self.f.scripts / "agent-tab-watcher.sh")], env=env,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 15
+            while len(self.asks()) < 1 and time.monotonic() < deadline:
+                time.sleep(.1)
+            while p.poll() is None:
+                with ev_path.open("a") as fh:
+                    fh.write(PHASE)
+                time.sleep(.3)
+            _, err = p.communicate(timeout=30)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        self.assertEqual(p.returncode, 0, err)
+        self.assertEqual(len(self.asks()), 1, self.asks())
+        o = self.f.read()["windows"]["@1"]["opts"]
+        self.assertEqual((o["@agent_state"], o.get("@agent_workflow")), ("running", "1"))
+
+    def test_no_child_out_idles_and_releases(self):
+        self.held_tab(rc=1)
+        o = self.run_ticks(5, **self.bg_env())["windows"]["@1"]["opts"]
+        self.assertEqual(o["@agent_state"], "idle")
+        self.assertNotIn("@agent_workflow", o)
+        self.assertNotIn("@agent_bg_owner", o)
+        # A "none" holds while nothing moves: one ask.
+        self.assertEqual(len(self.asks()), 1, self.asks())
+
+    def test_no_subagents_dir_never_asks(self):
+        self.held_tab(rc=0, children=False)
+        o = self.run_ticks(5, **self.bg_env())["windows"]["@1"]["opts"]
+        self.assertEqual(o["@agent_state"], "idle")
+        self.assertEqual(self.asks(), [])
+
+    def test_child_finishes_then_idles(self):
+        # ONE watcher run: held on the cached yes until the child's dir moves
+        # (it writes output.json as it ends); then asked again, and idled.
+        self.held_tab(rc=0)
+        env = self.f.env(**self.env(9, **self.bg_env()))
+        p = subprocess.Popen(["bash", str(self.f.scripts / "agent-tab-watcher.sh")], env=env,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 15
+            while len(self.asks()) < 1 and time.monotonic() < deadline:
+                time.sleep(.1)
+            time.sleep(3.5)                     # past the 3-tick un-stick, still held
+            o = self.f.read()["windows"]["@1"]["opts"]
+            self.assertEqual((o["@agent_state"], o.get("@agent_workflow")), ("running", "1"))
+            self.bg_rc.write_text("1")
+            (self.child / "output.json").write_text("{}")
+            _, err = p.communicate(timeout=30)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        self.assertEqual(p.returncode, 0, err)
+        o = self.f.read()["windows"]["@1"]["opts"]
+        self.assertEqual(o["@agent_state"], "idle")
+        self.assertNotIn("@agent_workflow", o)
+        self.assertNotIn("@agent_bg_owner", o)
+        self.assertEqual(len(self.asks()), 2, self.asks())
+
+    def test_child_out_lights_the_gear_on_an_idle_tab(self):
+        self.held_tab(rc=0)
+        st = self.f.read()
+        st["windows"]["@1"] = self.gk_window(1, "idle", int(time.time()) - 60)
+        self.f.state.write_text(json.dumps(st))
+        o = self.run_ticks(3, **self.bg_env())["windows"]["@1"]["opts"]
+        self.assertEqual((o["@agent_state"], o.get("@agent_workflow")), ("idle", "1"))
+
     def test_claude_reconcile_unchanged(self):
         now = int(time.time())
         self.make({"@3": jw.W("main", 3, **{"@agent_state": "running", "@agent_kind": "claude",

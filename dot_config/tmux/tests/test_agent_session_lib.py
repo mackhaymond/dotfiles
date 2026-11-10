@@ -349,6 +349,77 @@ class LibCase(unittest.TestCase):
         self.subagent("a1", 30)
         self.assertEqual(self.rc("session_has_running_subagent"), "rc=0")
 
+    # -- the subagent's own meta (Claude Code 2.1.319) --------------------
+    def meta(self, aid, raw=None, **fields):
+        """agent-<aid>.meta.json, Claude Code's compact one-line shape."""
+        d = {"agentType": "general-purpose", "isBuiltIn": True,
+             "description": 'Review "finished":true quoted', "toolUseId": "toolu_x",
+             "spawnDepth": 1}
+        d.update(fields)
+        p = self.proj / SID / "subagents" / f"agent-{aid}.meta.json"
+        p.write_text(raw if raw is not None else json.dumps(d, separators=(",", ":")))
+        return p
+
+    def test_meta_foreground_finished_is_not_running(self):
+        # Tab B: a finished FOREGROUND agent is never notified, so the old
+        # rule alone held it running for the hour.
+        self.subagent("fg", 20)
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=0")   # no meta: old rule
+        self.meta("fg", requestShape="foreground", finished=True)
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=1")
+
+    def test_meta_foreground_unfinished_keeps_the_old_rules(self):
+        # requestShape is not trusted: a running foreground call moved to the
+        # background (ctrl+b, the 120 s auto-background, a queued message)
+        # keeps "foreground", and "finished" stays absent until it ends.
+        self.subagent("fg", 20)
+        self.meta("fg", requestShape="foreground")
+        # Recent, no notification: running, by the old rule.
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=0")
+        # ...which still finishes it once its parent is told.
+        self.notify("fg", self.now - 20)
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=1")
+
+    def test_meta_foreground_finished_absent_unnotified_recent_is_running(self):
+        # The SIGTERM case: stash's park guard must still see it running.
+        self.subagent("fg", 5)
+        self.meta("fg", requestShape="foreground", requestNonInteractive=False)
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=0")
+
+    def test_meta_background_unfinished_is_running(self):
+        # The description quotes "finished":true (escaped): not the key.
+        self.subagent("bg", 20)
+        self.meta("bg", requestShape="background", requestNonInteractive=True)
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=0")
+
+    def test_meta_background_finished_is_not_running(self):
+        self.subagent("bg", 20)
+        self.meta("bg", requestShape="background", finished=True)
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=1")
+
+    def test_meta_finished_false_or_torn_falls_back_to_old_rules(self):
+        self.subagent("bg", 20)
+        for raw in ('{"requestShape":"background","finished":false}',
+                    '{"requestShape":"foreground","finished":true',      # torn write
+                    '', 'not json'):
+            with self.subTest(raw=raw):
+                self.meta("bg", raw=raw)
+                self.assertEqual(self.rc("session_has_running_subagent"), "rc=0")
+        # ...and the old rules still finish it: notified since it last moved.
+        self.notify("bg", self.now - 20)
+        self.assertEqual(self.rc("session_has_running_subagent"), "rc=1")
+
+    def test_meta_rewrite_is_seen_in_one_process(self):
+        # The watcher's long-lived loop: the cache is keyed by the meta's own
+        # mtime+size, so the rewrite that adds "finished" is a fresh look.
+        self.subagent("bg", 20)
+        m = self.meta("bg", requestShape="background")
+        os.utime(m, (self.now - 20, self.now - 20))
+        script = (f'session_has_running_subagent {PID}; echo "rc=$?"; '
+                  f'printf %s \'{{"requestShape":"background","finished":true}}\' > "{m}"; '
+                  f'session_has_running_subagent {PID}; echo "rc=$?"')
+        self.assertEqual(self.bash(script).split(), ["rc=0", "rc=1"])
+
     # -- session_has_running_workflow -----------------------------------
     def workflow(self, wid, age, completed):
         d = self.proj / SID / "subagents/workflows" / f"wf_{wid}"
