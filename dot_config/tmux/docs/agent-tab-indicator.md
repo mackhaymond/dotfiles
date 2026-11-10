@@ -483,15 +483,55 @@ payload types in the CLI's own `copilot-sdk/types.d.ts`.
   call `<mode> claude` with a Copilot payload. Copilot sets
   `COPILOT_HOOK_DEPTH` in every command hook's environment and Claude never
   does, so a `<mode> claude` call with it exits 0 (the `GROK_HOOK_EVENT` rule).
-- **Not supported (gaps).** Esc mid-turn: `agentStop` fires only on a natural
-  stop, and no abort hook exists, so the tab keeps pulsing until the next
-  prompt (copilot has no per-pid status record for the watcher: its
-  `session.idle`/`agent.interrupted` events are ephemeral, never written).
-  A denied permission ends the turn with no hook either: the yellow stands
-  until the tab is focused. `permissionRequest` is not wired (it fires before
-  the permission service decides, so it would yellow auto-approved tools).
-  Usage limits are a plain `failed`, not the rate-limited mark (§7). No
-  background-work hold, no CuaNotch hook, no resurrect row.
+- **The record** (`@agent_record`, 2026-11-10). The hook names the main
+  session's own store for the watcher: `<COPILOT_HOME>/session-state/<sid>/events.jsonl`,
+  written in the state's command list by `sessionStart` and
+  `userPromptSubmitted` (a subagent's event never), unset by `clear` and the
+  GC. Not `@agent_rollout`: agent-ui and resurrect read that as a codex
+  rollout.
+- **Esc mid-turn** (the watcher, `copilot_tail`). `agentStop` fires only on a
+  natural stop and no abort hook exists, but the session store PERSISTS the
+  turn's end. The CLI's own schema (`schemas/session-events.schema.json`,
+  1.0.108) marks `session.idle`, `assistant.idle` and `agent.interrupted`
+  ephemeral, never written, while `abort` (`reason` `user_initiated` |
+  `remote_command` | `user_abort` | `autopilot_credit_limit`) is written,
+  followed at once by `assistant.turn_end` (on disk: two Ctrl-C'd condenser
+  runs, `{"type":"abort","data":{"reason":"user_initiated"},…,"timestamp":…}`),
+  and so is `session.error` after a turn that died (81 `quota_exceeded`
+  ones, each after the turn's `turn_end`). So a `running` copilot window
+  whose events.jsonl's last turn marker is an `abort` or a `session.error`
+  (not one with `eligibleForAutoSwitch` true: copilot is asking whether to
+  switch models) stamped AFTER the state's `@agent_since` is ended the way a
+  codex `turn_aborted` is (the `cx_full` write: idle, detail dropped, three
+  ticks, conditional on the state read); a `needs-input` with an `abort` after
+  its stamp too (Esc on the permission prompt). The turn markers are
+  `user.message`, `assistant.turn_start`/`assistant.message`,
+  `tool.execution_start` and `session.compaction_start`, never
+  `assistant.turn_end` (it closes every model round). Bounded tail (64 KB),
+  cached by mtime like codex's rollout look: a window that is not running or
+  yellow, or whose file has not moved, costs no fork. The presence tracker
+  `noteTurnStarted`/`noteSessionIdle` in the CLI's bundle is Windows-only
+  (taskbar `tasks.json`), and `inuse.<pid>.lock` names the CLI child, not
+  the supervisor pid the watcher sees: neither is used.
+- **Usage limits** (§7). `errorOccurred` for an unrecoverable model/system
+  error whose text is a Copilot limit marks the rate-limited pause, type
+  `copilot` (`kind_limit`): "You have exceeded your monthly quota" (the 402
+  seen on disk) → `Copilot monthly quota`; "weekly rate limit" → `Copilot
+  weekly limit`; "session rate limit" → `Copilot session limit`; "rate limit
+  for this model" → `Copilot model limit · /model to switch`; included AI
+  credits / Copilot Free requests → `Copilot monthly quota`; additional
+  usage / spending limit → `Copilot credit limit`; any other rate limit or
+  quota → `Copilot limit`. A "(current limit resets in ~N hours)" is the
+  reset; otherwise `resets_at` 0 (Mack resumes it). Any other failure stays
+  red.
+- **Not supported (gaps).** A denied permission ends the turn with no hook:
+  the yellow stands until the tab is focused unless an `abort` was written
+  (Esc). `permissionRequest` is not wired (it fires before the permission
+  service decides, so it would yellow auto-approved tools). A recoverable
+  rate limit (copilot's own retry, or its "Switch to the auto model?"
+  question) is not marked: the hook drops recoverable errors. No
+  background-work hold, no CuaNotch hook. (Its resurrect row, ⌘Z reopen and
+  pause target: docs/resurrect-cadence.md "Copilot and agy sessions".)
 - **Unverified (no live copilot session was driven).** Whether `agentStop`
   still fires after an unrecoverable `errorOccurred`: if it does, its `done`
   overwrites the red `failed` a moment later. And `notification` is
@@ -520,9 +560,9 @@ so each command ends `>/dev/null 2>&1; echo '{}'` (`{"decision":"allow"}` for
 | `SessionStart` (a new conversation; no source: read as startup) | `idle` |
 | `PreInvocation` (before EVERY model call of a turn) | `running`; a no-op on a window already `running` |
 | `PostToolUse` (matcher `*`) | `heartbeat` |
-| `Stop`, `terminationReason` `NO_TOOL_CALL`, `MAX_*`, `TERMINAL_*`, `INJECTED_RESPONSE` | `done` |
+| `Stop`, `terminationReason` `NO_TOOL_CALL`, `MAX_*`, `TERMINAL_*`, `INJECTED_RESPONSE` | `done`; held `running` when `fullyIdle` is false |
 | `Stop`, `USER_CANCELED` (Esc) | `interrupt` |
-| `Stop`, `ERROR` | `failed` (its `error`) |
+| `Stop`, `ERROR` | `failed` (its `error`); a usage limit is the rate-limited mark (§7) |
 
 - **Payload** (protojson camelCase; the binary's `HookArgsCommon`):
   `conversationId`, `workspacePaths`, `transcriptPath`,
@@ -547,30 +587,114 @@ so each command ends `>/dev/null 2>&1; echo '{}'` (`{"decision":"allow"}` for
   only a path under `~/.gemini` named `transcript.jsonl` is read), else
   `turn finished`.
 - **Cost.** PreInvocation blocks agy's loop before every model call: the
-  no-op on a running window is decided right after the pane lookup, with one
-  `show-options` (no ps walk, no jq; the payload is read in-process).
+  no-op on a running window is decided right after the pane lookup, with two
+  `show-options` (`@agent_state`, then `@agent_detail_kind`; no ps walk, no
+  jq; the payload is read in-process). Not on a window a Stop holds for
+  background tasks (detail kind `done`): its next PreInvocation is a NEW
+  turn (Mack's prompt, or agy waking on a finished task) and takes the full
+  running mode, so its origin, `@thread_at`, `@agent_turn_start` and `run`
+  detail are written and the watcher's drain release cannot idle it.
 - **Where it runs.** Hooks are children of the agy process and inherit
   `TMUX_PANE` (herdr's agy hook relies on the same inheritance). The same
   guards as Copilot's: `CUA_NOTCH_IGNORE`, HEADLESS (no tty, `-p`/`--print`/
   `--prompt` among the flags; `-i`/`--prompt-interactive` is the TUI),
   `nested_agent`.
-- **Not supported (gaps).** No permission or question event exists, so a
-  tool approval in agy's TUI leaves the tab `running` (pulsing), never
-  yellow. `fullyIdle` false (background tasks out) does not hold the tab
-  running: no event says when they finish. Usage limits are a plain
-  `failed`. No CuaNotch hook, no resurrect row, no watcher status backstop
-  (agy's Stop already fires on every loop end, Esc included).
+- **The record** (`@agent_record`, 2026-11-10): the conversation's step
+  store, `<root>/conversations/<id>.db` beside the `brain/` its
+  `transcriptPath` names (only a transcript path under `~/.gemini` of that
+  exact shape), rewritten by every main-conversation SessionStart and turn
+  start (a turn's first PreInvocation), unset by the GC.
+- **The step store** (the watcher, `agy_status`). agy keeps each
+  conversation's trajectory in that SQLite db (WAL), table `steps` with an
+  indexed integer `status`, `CortexStepStatus` from the binary's own
+  descriptor: 0 UNSPECIFIED, 1 PENDING, 2 RUNNING, 3 DONE, 4 INVALID, 5
+  CLEARED, 6 CANCELED, 7 ERROR, 8 GENERATING, **9 WAITING** ("Step is
+  WAITING for user approval", agy's own tool template), 11 QUEUED, 12
+  INTERRUPTED. Rows change IN PLACE: background commands that read `RUNNING`
+  in transcript.jsonl read DONE / CANCELED here, and two view_file calls
+  cancelled while a denied read was being asked about are CANCELED rows with
+  no transcript line at all. **transcript.jsonl can never show a wait**:
+  agy appends a step to it once (`AppendStepToTranscript`), when it first
+  settles; every transcript on disk has each step_index exactly once and only
+  DONE / RUNNING / ERROR statuses (a denied permission is its final ERROR
+  line). One `sqlite3 -readonly` query, one `status|step_type|hex(toolSummary)|hex(CommandLine)`
+  line per step in flight: `step_payload` is protobuf around the JSON args,
+  so the bytes after a value are binary (invalid UTF-8, newlines), and each
+  value is cut at its closing quote inside SQLite and returned as hex; the
+  decode (builtin `printf %b`) and every match run under `LC_ALL=C` (under
+  tmux's UTF-8 locale a bash regex fails outright on such bytes). Only for
+  an agy window that is `running` (or yellow with a `perm` detail), re-run
+  only when the db or its `-wal` moved (a step parked on an approval writes
+  nothing: a wait costs one look); every answer is cached that way, a failed
+  read too, so a db that will not open never forks sqlite3 every tick.
+  `-readonly` relies on the live `-shm` agy keeps beside an open db; a
+  failed or locked read is unknown and changes nothing.
+- **Tool approvals → yellow.** A WAITING step for two ticks raises
+  `needs-input` over the `running` it was read from, detail `perm` (the
+  step's toolSummary, e.g. `Run uv sync`, held to letters, digits and
+  `._/:@=+,()-`; else `tool approval`), asker `main`; not while Mack is
+  looking at the tab (he is at the prompt). A `needs-input` with a `perm`
+  detail and no step waiting for two ticks (approved and running, or denied)
+  goes back to `running`. Esc on the prompt is the Stop's `USER_CANCELED`.
+- **Background tasks.** A Stop with `fullyIdle` false is held `running`
+  (done mode's `bg_pending`, its reply kept as the `done` detail,
+  `@agent_bg_owner` as for Claude); the watcher lights the gear while the
+  store has a step in flight and releases the hold to idle (state only,
+  three ticks: the bg-pending release) once nothing is PENDING / RUNNING /
+  GENERATING / WAITING / QUEUED. Bounded twice, as agent-bg-pending bounds
+  every still-out: a RUNNING command that is a server, watcher or follower
+  (`npm run dev`, `vite`, `next dev`, `python -m http.server`, `tail -f`,
+  `nodemon`, ...: agent-bg-pending's PTY_SERVER_PATTERNS, the common part,
+  matched on the command's last `&&`/`;` segment, `VAR=value` words dropped,
+  Go's `&` read as `&`) is not work the turn waits on; and the hold
+  ends after `AGY_HOLD_MAX` (3600 s; `AGENT_TAB_AGY_HOLD_MAX`) from the first
+  tick that saw it held, whatever still reads RUNNING (the clock lives in
+  the watcher: a restart only restarts the hour). A plain running turn is never ended from
+  the store (between model calls every step can read DONE; agy's Stop fires
+  on every loop end, Esc included). An expired `@agent_pending` whose store
+  shows a step in flight (an approved command still running) re-arms
+  `running`, as Claude's session file does.
+- **Usage limits** (§7): a Stop `ERROR` whose text is Google's quota
+  ("RESOURCE_EXHAUSTED (code 429): You have exhausted your capacity on this
+  model. Resets in 1h2m5s." - the shape of the one on disk) marks the
+  rate-limited pause, type `agy`, detail `agy model limit` (`agy limit`
+  without "on this model"), the Go-duration reset as `resets_at`; no reset
+  stated: `resets_at` 0. A STATED reset under a minute (`KL_SOON`: "Resets in
+  0s", the very one on disk) is not a limit: the quota is already back and a
+  paused tab would have nothing to wait for and never resume, so it is the
+  red `failed` Mack retries (copilot's "resets in ~N" follows the same rule).
+  UNAVAILABLE / 503 / overloaded stays red.
+- **Not supported (gaps).** A subagent's own approval waits (its
+  conversation is another db) and question prompts other than tool approvals
+  are not seen. Unverified live (no agy session was driven): that a waiting
+  step's row is written while it waits (the in-place updates and the
+  CANCELED never-transcribed rows say the table holds unsettled steps; the
+  status of a row during the wait itself was not observed), and that a
+  background task's step stays RUNNING until the task ends rather than only
+  being settled at shutdown. If either is wrong the tab simply behaves as
+  before (pulsing; a held Stop then waits for the next Stop or Esc). No
+  CuaNotch hook. (Resurrect row, ⌘Z reopen, pause: docs/resurrect-cadence.md
+  "Copilot and agy sessions".)
 - **Title**: the prompt, condensed.
 
-Not yet taught about copilot or agy (follow-ups): `agent-pause.py` (the
-pause/resume key's targets, rate-limit resume) and `agent-roster.py` (its
-`is_agent_comm`/`comm_kind`, which agent-ui's `actions.rs` ports), plus
-assistant-save/restore and closed-tabs (no resurrect row, ⌘Z reopens a
-shell), tmux-mcp's delivery, and CuaNotch's hook.
+Taught about copilot and agy since (2026-11-10, docs/resurrect-cadence.md
+"Copilot and agy sessions"): a session record (`copilot-agy-session-track.sh`,
+one more line in each hooks file), assistant-save/restore and closed-tabs
+(resumed with `--resume <id>` / `--conversation <id>`, ⌘Z born with its
+kind), `agent-pause.py` (records, `AGENT_CMD`/`cmd_kind`, the command
+fallback in a window of that kind), `agent-roster.py` and agent-ui's
+`actions.rs` (`is_agent_comm`/`comm_kind`; a `copilot`/`agy` comm counts only
+in a window of its kind), the menu's kind glyph (the AgentMarks logo), the
+insight engine and the activity blurb (skipped: no Claude reader for their
+transcripts), and tmux-mcp (records, the marked-tab fallback, a prompt-box
+reader for the draft guard). Still not: CuaNotch's hook, rate-limit marks.
 
 Tests: `tests/test_copilot_agy_indicator.py` (payload rewrite, modes, guards,
-the replies, subagents, argv), `tests/test_copilot_agy_watcher.py` (comm
-detection, the TUI rules, kind seeding).
+the replies, subagents, argv, the record, the limit marks, agy's held
+Stop), `tests/test_copilot_agy_watcher.py` (comm detection, the TUI rules,
+kind seeding; copilot's abort / session.error turn ends on an events.jsonl in
+copilot's own line shape; agy's approval waits and bg release on a live WAL
+db with the real `steps` schema, held open by a writer as agy holds it).
 
 Subagent-context events (payload has `agent_id`) are ignored so a
 subagent's Stop can't flip the main agent's tab — except its
@@ -1116,10 +1240,14 @@ init config update version workflow sessions memories plugin mcp skill
 instruction lsp sandbox completion`; agy: `acp agent agents changelog help
 install mcp mic-serve models plugin plugins remote-control update`), options
 with a value skipped. A born `copilot`/`agy` tab (⌘E) therefore keeps its
-birth, and an unhooked one is seeded `idle` with its kind. Their states come
-from hooks alone: neither keeps a per-pid status record, so the stuck-running
-reconcile has nothing to read for them (and they never fall through to the
-Claude session file or a stale codex rollout).
+birth, and an unhooked one is seeded `idle` with its kind. Neither keeps a
+per-pid status record, so they never fall through to the Claude session file
+or a stale codex rollout; their backstops read the session's own store, which
+the hooks name in `@agent_record` (read with the tick's one `list-panes`):
+copilot's events.jsonl (`copilot_tail`: an Esc's persisted `abort`, a
+turn-ending `session.error`) and agy's conversation db (`agy_status`: tool
+approval waits → `needs-input`, the background-task drain of a held Stop).
+See "GitHub Copilot CLI" and "Antigravity CLI" above.
 
 **Grok** (2026-11-02). Presence, kind and turn state, as OpenCode has them:
 
@@ -1941,7 +2069,7 @@ docs/agent-pause.md); this page covers the tab side.
 
 | Option | Value |
 |---|---|
-| `@agent_limit` | `"<resets_at> <type> <since>"`. `resets_at` is epoch seconds, `0` when unknown (a model limit). `type` is `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `overage`, `model`, `codex` or `grok` (`seven_day_overage_included` and other `seven_day_*` are written `seven_day`; an unknown type is guessed, see **Weekly-only plans** below). `since` is when it was marked, the same epoch as the mark's `@agent_paused`. Its presence means rate-limited. |
+| `@agent_limit` | `"<resets_at> <type> <since>"`. `resets_at` is epoch seconds, `0` when unknown (a model limit). `type` is `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `overage`, `model`, `codex`, `grok`, `copilot` or `agy` (`seven_day_overage_included` and other `seven_day_*` are written `seven_day`; an unknown type is guessed, see **Weekly-only plans** below). `since` is when it was marked, the same epoch as the mark's `@agent_paused`. Its presence means rate-limited. |
 | `@agent_limit_lifted` | `<epoch>`: the limit has passed but the agent waits for Mack (auto-resume off or deferred); written by limit-tick. |
 | `@agent_detail_kind` `limit` + `@agent_detail` | `weekly limit · resets Tue 1:00 AM`; `session limit · resets 3:30 PM` (the same day); `Codex limit · resets Oct 31 11:10 PM` (a week or more out); `Opus weekly limit` / `Sonnet weekly limit` / `overage limit`; for a model limit, the agent's own words: `Fable limit · /model to switch` from "You've reached your Fable limit…", else the message itself (cleaned like any detail), else `usage limit`; a Grok usage limit is always `Grok limit · resets over 24h`. Times follow the ONE date rule every surface shares (agent-pause.py `fmt_local`, agent-ui `text::when`), by calendar days in local time: the same day `5:31 PM`, one to six days ahead `Tue 5:31 PM`, anything else (a week or more on, or past) `Nov 2 5:31 PM`; C-locale names. |
 | `@agent_turn_result` | `<turn_id> limited <resets_at>`: the cross-surface verdict (no red flare, no notify). |
@@ -2005,6 +2133,23 @@ failure too. A limit is the same marking list as Claude's with type `grok`,
 `resets_at` 0 (the free tier resets over a rolling 24 h: never auto-resumed,
 only Mack resumes it) and the detail `Grok limit · resets over 24h`, then
 `limit-add`.
+
+**Copilot and agy** (2026-11-10) have no `rate_limit` error code in their
+hooks: the `failed` mode reads the failure's own text (`kind_limit`, before
+the Claude/Grok branch): copilot's `errorOccurred` error (only an
+unrecoverable `model_call`/`system` one reaches `failed`), agy's Stop
+`ERROR` error. The words, labels and reset parsing are under "GitHub
+Copilot CLI" and "Antigravity CLI" above; a limit is the same marking list
+with type `copilot` / `agy`, `resets_at` from the text ("resets in ~3 hours";
+agy's Go duration "Resets in 1h2m5s") or 0 when none is stated (a stated
+reset under a minute is the plain red failure), the detail the label alone or
+`<label> · resets <when>` (limit_text's date rule, its "usage limit" label
+swapped for the CLI's), then `limit-add`. Anything else stays the red
+`failed`. agent-pause.py's `cswap_blind` counts both kinds (no cswap
+switch frees them); its `limit_host` (the wake check's DNS look) and
+`limit_merge`'s no-account rule still name grok alone, so a copilot / agy
+target carries a Claude account and is DNS-checked against Anthropic's
+host. With `resets_at` 0 nothing auto-resumes them either way.
 
 **A prompt while `@agent_limit` is set** (`running` mode):
 

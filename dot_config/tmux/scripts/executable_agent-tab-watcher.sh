@@ -67,7 +67,10 @@
 # `grok -p`, `grok agent stdio`, `grok sessions` are not agents), its turn
 # state from its own session records (grok_status). GitHub Copilot CLI (comm
 # `copilot`) and agy (comm `agy`) count as their interactive TUIs only
-# (copilot_tui_args, agy_tui_args); their states come from hooks alone.
+# (copilot_tui_args, agy_tui_args); their states come from hooks, with
+# backstops from their session's own store that the hooks name in
+# @agent_record (copilot_tail: an Esc's persisted `abort`; agy_status: a
+# tool approval wait, the background-task drain).
 # Candidates come from
 # `pgrep` (cheap), and each one's tty+comm from a single-pid ps, cached per
 # pid — see PROCESS DISCOVERY in the loop.
@@ -777,14 +780,17 @@ codex_tail() {
 # the window left running/needs-input, lost its agent, or is gone - is dropped
 # at the end of that tick (CX_USED).
 declare -A CX_PATH=() CX_TICK=() CX_MARK=() CX_TS=() CX_USED=()
+# (A third argument names another reader with codex_tail's contract:
+# copilot_tail, for a copilot window's events.jsonl. A window is one kind at a
+# time, and its path is the cache key, so the two never answer for each other.)
 codex_tail_cached() {
-    local w="$1" rp="$2"
+    local w="$1" rp="$2" fn="${3:-codex_tail}"
     CX_USED[$w]=1
     if [ "${CX_PATH[$w]:-}" = "$rp" ] && [ -f "$rp" ] \
        && ! changed_since "${CX_TICK[$w]:-}" "$rp"; then
         cx_mark="${CX_MARK[$w]}"; cx_ts="${CX_TS[$w]}"
     else
-        codex_tail "$rp"
+        "$fn" "$rp"
         CX_PATH[$w]="$rp"; CX_MARK[$w]="$cx_mark"; CX_TS[$w]="$cx_ts"
     fi
     CX_TICK[$w]=$tick_no
@@ -805,6 +811,166 @@ cx_after() {
     case "$e" in ''|*[!0-9]*) return 1 ;; esac
     TZ=UTC0 printf -v iso '%(%Y-%m-%dT%H:%M:%S)T' "$e" 2>/dev/null || return 1
     [[ "$cx_ts" > "$iso" ]]
+}
+
+# COPILOT ESC MID-TURN (docs: "GitHub Copilot CLI"). Copilot fires no hook on
+# an abort (agentStop is for a natural stop only), but its session store
+# persists the turn's end: <COPILOT_HOME>/session-state/<sid>/events.jsonl,
+# one JSON event per line, `{"type":"<t>","data":{...},"id":..,"timestamp":
+# "2026-08-31T21:11:23.371Z","parentId":..}`. Its schema
+# (schemas/session-events.schema.json, CLI 1.0.108) marks `session.idle`,
+# `assistant.idle` and `agent.interrupted` ephemeral (never written) but
+# persists `abort` {reason: user_initiated | remote_command | user_abort |
+# autopilot_credit_limit} - followed at once by `assistant.turn_end` - and
+# `session.error` {errorType, errorCode, message, eligibleForAutoSwitch}
+# after a turn died on an error (81 quota_exceeded ones on disk, each after
+# the turn's turn_end). copilot_tail FILE, codex_tail's contract (cx_mark,
+# cx_ts = that event's own UTC second, the line's LAST "timestamp"):
+#   started  the last turn marker is a user.message, assistant.turn_start /
+#            message, tool.execution_start or session.compaction_start (the
+#            turn goes on), or a session.error with eligibleForAutoSwitch
+#            true (copilot asks Mack whether to switch models: still his turn)
+#   aborted  an `abort`
+#   errored  any other session.error
+# Never `assistant.turn_end`: it closes every model round, mid-turn too. The
+# caller acts only on an aborted/errored mark AFTER the state's stamp
+# (cx_after), so a new prompt racing its own user.message write can never be
+# taken for the previous turn's end. Same bounded tail (64 KB) and awk as
+# codex_tail; cached by codex_tail_cached.
+copilot_tail() {
+    local rp="$1" out
+    cx_mark=""; cx_ts=""
+    [ -n "$rp" ] && [ -f "$rp" ] || return 0
+    out=$(tail -c "$CODEX_TAIL_BYTES" "$rp" 2>/dev/null | awk '
+        function ts(  s, t) {
+            s = $0; t = ""
+            while (match(s, /"timestamp":"[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
+                t = substr(s, RSTART + 13, 19); s = substr(s, RSTART + RLENGTH)
+            }
+            return t
+        }
+        /^[{]"type":"(user\.message|assistant\.turn_start|assistant\.message|tool\.execution_start|session\.compaction_start)"/ {
+            m = "started"; t = ""; next }
+        /^[{]"type":"abort"/ { m = "aborted"; t = ts(); next }
+        /^[{]"type":"session\.error"/ {
+            if (index($0, "\"eligibleForAutoSwitch\":true")) { m = "started"; t = "" }
+            else { m = "errored"; t = ts() }
+        }
+        END { printf "%s %s", m, t }
+    ')
+    cx_mark="${out%% *}"; cx_ts="${out#* }"
+    return 0
+}
+
+# AGY'S STEP STORE (docs: "Antigravity CLI"). agy keeps each conversation's
+# trajectory in <root>/conversations/<id>.db (SQLite, WAL), table `steps`
+# (idx, step_type, status, ..., step_payload) with an INDEXED integer status,
+# CortexStepStatus (agy 1.5.4's descriptor): 0 UNSPECIFIED, 1 PENDING,
+# 2 RUNNING, 3 DONE, 4 INVALID, 5 CLEARED, 6 CANCELED, 7 ERROR, 8 GENERATING,
+# 9 WAITING ("Step is WAITING for user approval", its own tool template),
+# 11 QUEUED, 12 INTERRUPTED. Rows are updated IN PLACE as a step moves (a
+# background command's step reads RUNNING in transcript.jsonl, which only
+# APPENDS a step once, at its first settle, and DONE / CANCELED here), and a
+# step that never settled - two view_file calls Esc'd while asking - is a
+# CANCELED row with no transcript line at all. So transcript.jsonl can never
+# show a wait; this table does. agy_status WIN DB: one sqlite3 query, only
+# for an agy window that is running or yellow, re-run only when the db or its
+# -wal moved since the tick it was vouched for (changed_since: a step parked
+# on an approval writes nothing, so a wait costs no fork after its first
+# look), into ag_st:
+#   waiting  a step is WAITING; ag_txt its toolSummary ("Run uv sync", from
+#            the step payload's JSON args; "" when it has none)
+#   busy     no wait, but a step PENDING / RUNNING / GENERATING / QUEUED -
+#            a background command is a RUNNING step until it ends, EXCEPT a
+#            server, watcher or follower nobody waits on (agy_server, below)
+#   idle     nothing in flight
+#   ""       unknown (no db, a failed or locked read)
+# Every answer is cached until the db moves, a failed read too (a db that
+# will not open must not fork sqlite3 every second). -readonly needs the
+# live -shm agy keeps beside a db it has open; a closed db (no agent) is
+# never asked about.
+#   BYTES, NOT TEXT. step_payload is protobuf around the JSON args: what
+# follows a value is binary, invalid UTF-8 and newlines included. So the
+# query cuts each value at its closing quote INSIDE SQLite and hands it back
+# as hex, one "status|step_type|hex(summary)|hex(command)" line per step in
+# flight; the decode and every match below run under LC_ALL=C (a UTF-8
+# locale - tmux's - fails a bash regex on such bytes outright).
+read -r -d '' AGY_Q <<'SQL' || true
+with x as (
+  select idx, step_type, status, step_payload as p,
+         instr(step_payload, cast('"toolSummary":"' as blob)) as ti,
+         instr(step_payload, cast('"CommandLine":"' as blob)) as ci
+  from steps where status in (1, 2, 8, 9, 11)),
+y as (
+  select idx, step_type, status,
+         case when ti > 0 then substr(p, ti + 15, 240) end as ts,
+         case when ci > 0 then substr(p, ci + 15, 400) end as cl
+  from x)
+select status || '|' || step_type || '|'
+       || coalesce(hex(substr(ts, 1, instr(ts, cast('"' as blob)) - 1)), '') || '|'
+       || coalesce(hex(substr(cl, 1, instr(cl, cast('"' as blob)) - 1)), '')
+from y order by idx;
+SQL
+# A RUNNING command step that is a server, a watcher or a follower is not
+# work the turn waits on (`npm run dev` stays RUNNING for as long as it
+# serves): agent-bg-pending's PTY_SERVER_PATTERNS, the common part, matched
+# on the command's last `&&` / `;` segment with leading VAR=value words
+# dropped (Go's JSON writes & as &). A miss errs toward busy, which the
+# hold's one-hour backstop bounds (AGY_HOLD_MAX, in the loop).
+AGY_SERVER_RE='^((npm|pnpm|yarn|bun) (run |run-script )?([^ ]*:)?(dev|start|serve|preview|watch)([^a-z]|$)|(npx |bunx )?(vite( (dev|serve|preview)|$| -)|next (dev|start)|wrangler (pages )?dev|astro (dev|preview)|ng serve|hugo server|jekyll serve|tsx watch|cargo watch|ollama serve|rails (s|server)|mix phx\.server|webpack serve|tsc( .*)? (-w|--watch)( |$))|python[0-9.]* -m http\.server|php -S |(uvicorn|gunicorn|hypercorn|daphne|live-server|http-server|browser-sync|watchexec|nodemon|webpack-dev-server|fswatch|entr)( |$)|tail -[fF]|(node|tsx|ts-node|bun|deno run) ([^ ]*/)?server\.[cm]?[jt]s( |$))'
+agy_server() {
+    local c="$1"
+    c="${c//\\u0026/"&"}"; c="${c##*&&}"; c="${c##*;}"   # ("&" quoted: bash 5.2's patsub_replacement)
+    c="${c#"${c%%[! ]*}"}"
+    while [[ $c =~ ^[A-Za-z_][A-Za-z0-9_]*=[^\ ]*\ +(.*)$ ]]; do c="${BASH_REMATCH[1]}"; done
+    [[ $c =~ $AGY_SERVER_RE ]]
+}
+# agy_hex HEX: into hx the bytes HEX spells (builtin printf %b).
+agy_hex() {
+    local h="$1" e="" i
+    for ((i = 0; i < ${#h}; i += 2)); do e+="\\x${h:i:2}"; done
+    printf -v hx '%b' "$e"
+}
+declare -A AG_PATH=() AG_TICK=() AG_ST=() AG_TXT=() AG_USED=() AG_HOLD=()
+# A held agy Stop's backstop, s (AG_HOLD: window -> the tick_now first seen
+# held; lost with a watcher restart, which only restarts the hour).
+AGY_HOLD_MAX="${AGENT_TAB_AGY_HOLD_MAX:-3600}"
+case "$AGY_HOLD_MAX" in ''|*[!0-9]*) AGY_HOLD_MAX=3600 ;; esac
+agy_status() {
+    local w="$1" db="$2" out line s ty th tc hx busy=0 wait=0 txt=""
+    local LC_ALL=C
+    ag_st=""; ag_txt=""
+    case "$db" in "$HOME"/.gemini/*/conversations/*.db) ;; *) return 0 ;; esac
+    case "$db" in */../*) return 0 ;; esac
+    [ -f "$db" ] || return 0
+    AG_USED[$w]=1
+    if [ "${AG_PATH[$w]:-}" = "$db" ] && ! changed_since "${AG_TICK[$w]:-}" "$db" "$db-wal"; then
+        ag_st="${AG_ST[$w]}"; ag_txt="${AG_TXT[$w]}"
+        AG_TICK[$w]=$tick_no
+        return 0
+    fi
+    if out=$(sqlite3 -readonly -batch -noheader -cmd '.timeout 200' "$db" "$AGY_Q" 2>/dev/null); then
+        while IFS='|' read -r s ty th tc; do
+            case "$s" in
+                9) if [ "$wait" = 0 ]; then
+                       agy_hex "$th"
+                       txt="${hx//[^A-Za-z0-9 ._\/:@=+,()-]/}"
+                   fi
+                   wait=1 ;;
+                2) if [ -n "$tc" ]; then
+                       agy_hex "$tc"
+                       agy_server "$hx" && continue
+                   fi
+                   busy=1 ;;
+                1|8|11) busy=1 ;;
+            esac
+        done <<<"$out"
+        if [ "$wait" = 1 ]; then ag_st=waiting; ag_txt="${txt:0:80}"
+        elif [ "$busy" = 1 ]; then ag_st=busy
+        else ag_st=idle; fi
+    fi
+    AG_PATH[$w]="$db"; AG_ST[$w]="$ag_st"; AG_TXT[$w]="$ag_txt"; AG_TICK[$w]=$tick_no
+    return 0
 }
 
 # ------------------------------------------------------ rate-limited agents
@@ -1449,6 +1615,7 @@ server_gone() { ! tmux list-sessions >/dev/null 2>&1; }
 # turn-end reconcile beside it), carried across ticks as " @win=N @win=N "
 # (see the hysteresis note in the loop).
 idle_streak=" "
+ag_streak=" "   # agy approval waits: "win=raise|clear=n", the same way (AGY APPROVAL WAITS)
 
 # Is a window with this #{window_active_clients} ($1) in front of the user:
 # active for a client AND WezTerm frontmost? The seen-it discharge's test, and
@@ -1551,6 +1718,7 @@ declare -A W_QUIET=() # @agent_quiet: a quiet restore's one-shot log mark
 declare -A W_PAUSED=() # @agent_paused: agent-pause.py's flag (docs/agent-pause.md)
 declare -A W_ASKBG=()  # @agent_ask_bg: the indicator's ASKS WHILE WORK IS OUT raise
 declare -A W_LIMIT=()  # @agent_limit: RATE-LIMITED AGENTS
+declare -A W_REC=()    # @agent_record: copilot's events.jsonl / agy's conversation db (COPILOT AND AGY)
 wins=()
 
 # AGENT-ORIGINATED TURNS (agent-tab-indicator.sh, same heading; the doc's
@@ -2214,7 +2382,7 @@ EOF
     # LIMITED AGENTS): a GLOBAL, which a pane format resolves through the
     # window to the global value - the resume trigger's input at no extra
     # fork, the same on every row.
-    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{@agent_prior_state}${US}#{@agent_quiet}${US}#{@agent_paused}${US}#{@agent_ask_bg}${US}#{@agent_limit}${US}#{@agent_limit_due}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
+    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_record}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{@agent_prior_state}${US}#{@agent_quiet}${US}#{@agent_paused}${US}#{@agent_ask_bg}${US}#{@agent_limit}${US}#{@agent_limit_due}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
@@ -2236,23 +2404,23 @@ EOF
     # pane that runs a headless `claude -p` has an agent pane (W_PID) and
     # gets the full path - seeded, stamped, and garbage-collected once it
     # exits, exactly like any other window.
-    W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_SUM=(); W_DET=()
+    W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_REC=(); W_SUM=(); W_DET=()
     W_DK=(); W_DTXT=(); W_SESS=(); W_IDX=(); W_NAME=(); W_AK=()
     W_PEND=(); W_BORN=(); W_PRIOR=(); W_QUIET=(); W_PAUSED=(); W_ASKBG=(); W_LIMIT=(); S_SLOT=(); S_VIS=(); S_ELIG=()
     wins=()
     lim_due=""
-    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll akind dkind slot pend born prior quiet paused askbg limit ldue sess widx wname dtxt summary; do
+    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll rec akind dkind slot pend born prior quiet paused askbg limit ldue sess widx wname dtxt summary; do
         case "$win" in @*) ;; *) continue ;; esac
         case "$tty" in /dev/?*) ;; *) continue ;; esac
         [ -n "$lim_due" ] || lim_due="$ldue"
         if [ -z "${W_SEEN[$win]+x}" ]; then
             W_SEEN[$win]=1
             wins+=("$win")
-            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${akind}${dkind}${born}${prior}${paused}${limit}${summary}" ]; then
+            if [ -n "${state}${since}${wf_opt}${cua_opt}${roll}${rec}${akind}${dkind}${born}${prior}${paused}${limit}${summary}" ]; then
                 W_PRIOR[$win]="$prior"; W_QUIET[$win]="$quiet"; W_PAUSED[$win]="$paused"
                 W_ASKBG[$win]="$askbg"; W_LIMIT[$win]="$limit"
                 W_STATE[$win]="$state"; W_WAC[$win]="$wac"; W_SINCE[$win]="$since"
-                W_WF[$win]="$wf_opt"; W_CUA[$win]="$cua_opt"; W_ROLL[$win]="$roll"
+                W_WF[$win]="$wf_opt"; W_CUA[$win]="$cua_opt"; W_ROLL[$win]="$roll"; W_REC[$win]="$rec"
                 W_SUM[$win]="$summary"; W_DET[$win]="${akind}${dkind}"; W_AK[$win]="$akind"
                 W_DK[$win]="$dkind"; W_DTXT[$win]="$dtxt"
                 W_SESS[$win]="$sess"; W_IDX[$win]="$widx"; W_NAME[$win]="$wname"
@@ -2295,6 +2463,7 @@ EOF
     # streak only ever counts CONSECUTIVE observations. (Plain strings, not
     # arrays: they only ever hold the few windows mid-hysteresis.)
     idle_streak_next=" "
+    ag_streak_next=" "
     gc_streak_next=" "
     wez_front=""   # per tick, computed at most once, only if a tinted tab is watched
     EV_NEXT=()
@@ -2465,6 +2634,15 @@ EOF
             if [ -n "$pid" ] && [ "${PID_KIND[$pid]:-}" = grok ] && grok_bg_pending "$pid"; then
                 bg_held=1; wf=1; any_workflow=1
             fi
+            # AGY: a Stop held `running` by fullyIdle false (its `done`
+            # detail kept) lights the gear while its step store still has
+            # something in flight (agy_status, cached; the release itself
+            # is the reconcile's, below).
+            if [ "$state" = running ] && [ -n "$pid" ] && [ "${PID_KIND[$pid]:-}" = agy ] \
+               && [ "${W_DK[$win]:-}" = done ] && [ -n "${W_REC[$win]:-}" ]; then
+                agy_status "$win" "${W_REC[$win]}"
+                [ "$ag_st" = busy ] && { wf=1; any_workflow=1; }
+            fi
             case "$cua_pids" in
                 *" ${pid} "*) [ -n "$pid" ] && { cua=1; any_cua=1; } ;;
             esac
@@ -2545,17 +2723,30 @@ EOF
         # A child subagent still out (grok_bg_pending, bg_held) keeps the
         # tab running whatever events.jsonl says, as for Claude.
         #
-        # COPILOT AND AGY: no backstop yet. Neither keeps a per-pid status the
-        # way Claude's session file or grok's records do (copilot's
-        # session-state events.jsonl is keyed by session, its turn/idle/
-        # interrupt events are ephemeral, unwritten), so a `running` either
-        # CLI never ended stays running until its next hook; never the Claude
-        # session file or a stale codex rollout. agy's Stop fires on every
-        # loop end (an Esc included); copilot's agentStop does not on an
-        # abort (docs: "Copilot CLI", Esc).
+        # COPILOT AND AGY: no per-pid status either; their session's own
+        # store, which the indicator names in @agent_record, is read instead
+        # (never the Claude session file or a stale codex rollout):
+        #   COPILOT (copilot_tail on its events.jsonl): an `abort` (Esc
+        #   mid-turn: agentStop is for a natural stop only) or a turn-ending
+        #   `session.error` AFTER the state's stamp (cx_after) ends a running
+        #   turn the way codex's turn_aborted does - the cx_full write, idle,
+        #   detail dropped, three ticks; an abort also ends a needs-input
+        #   (Esc on a permission prompt). Copilot's own failure hook usually
+        #   got there first (failed / the limit mark): the write lands only
+        #   over the state it read.
+        #   AGY (agy_status on its conversation db): agy's Stop fires on every
+        #   loop end, Esc included, so a plain running turn is never ended
+        #   here. Two things the hooks cannot see: a step WAITING on a tool
+        #   approval (agy has no permission event) raises needs-input with a
+        #   `perm` detail, and a needs-input it raised goes back to running
+        #   once no step waits (agy_act, two ticks each way); and a Stop with
+        #   fullyIdle false (held `running`, its `done` detail kept) is
+        #   released to idle once nothing is in flight, the bg-pending
+        #   release's rule (three ticks).
         fin=""        # the state this agent's own record says, if it disagrees
         cx_full=0     # 1 = a codex turn end after the stamp: the full write
         cx_lim=0      # 1 = that turn end was a usage limit (RATE-LIMITED AGENTS)
+        agy_act=""    # raise | clear: an agy approval wait (AGY'S STEP STORE)
         if [ "$has_agent" = 1 ]; then
             case "$state" in
                 running)
@@ -2564,8 +2755,34 @@ EOF
                         opencode_status "$pid"                      # opencode
                     elif [ "${PID_KIND[$pid]:-}" = grok ]; then
                         grok_status "$pid" "$win"                   # grok
-                    elif [ "${PID_KIND[$pid]:-}" = copilot ] || [ "${PID_KIND[$pid]:-}" = agy ]; then
-                        :   # no status record (COPILOT AND AGY: hooks only)
+                    elif [ "${PID_KIND[$pid]:-}" = copilot ]; then
+                        case "${W_REC[$win]:-}" in
+                            */session-state/*/events.jsonl)
+                                codex_tail_cached "$win" "${W_REC[$win]}" copilot_tail
+                                case "$cx_mark" in
+                                    aborted|errored) cx_after && { cx_full=1; cx_mark=aborted; } ;;
+                                esac ;;
+                        esac
+                    elif [ "${PID_KIND[$pid]:-}" = agy ]; then
+                        if [ -n "${W_REC[$win]:-}" ]; then
+                            agy_status "$win" "${W_REC[$win]}"
+                            # A held Stop (its `done` detail): released when
+                            # nothing is in flight, or once it has been held
+                            # AGY_HOLD_MAX s (from the first tick that saw it
+                            # held: every still-out is bounded twice, the
+                            # server rule being the other bound).
+                            if [ "${W_DK[$win]:-}" = done ]; then
+                                [ -n "${AG_HOLD[$win]:-}" ] || AG_HOLD[$win]=$tick_now
+                                [ "$ag_st" != busy ] || [ $((tick_now - AG_HOLD[$win])) -lt "$AGY_HOLD_MAX" ] \
+                                    || ag_st=idle
+                            else
+                                unset 'AG_HOLD[$win]'
+                            fi
+                            case "$ag_st" in
+                                waiting) agy_act=raise ;;
+                                idle) [ "${W_DK[$win]:-}" = done ] && st=idle ;;
+                            esac
+                        fi
                     else
                         [ -n "$pid" ] && session_status "$pid"      # claude
                     fi
@@ -2604,6 +2821,16 @@ EOF
                             complete|aborted) cx_after && cx_full=1 ;;
                             limit) cx_after && cx_lim=1 ;;
                         esac
+                    elif [ "${PID_KIND[$pid]:-}" = copilot ]; then
+                        case "${W_REC[$win]:-}" in
+                            */session-state/*/events.jsonl)
+                                codex_tail_cached "$win" "${W_REC[$win]}" copilot_tail
+                                [ "$cx_mark" = aborted ] && cx_after && cx_full=1 ;;
+                        esac
+                    elif [ "${PID_KIND[$pid]:-}" = agy ] && [ "${W_DK[$win]:-}" = perm ] \
+                         && [ -n "${W_REC[$win]:-}" ]; then
+                        agy_status "$win" "${W_REC[$win]}"
+                        case "$ag_st" in busy|idle) agy_act=clear ;; esac
                     fi
                     ;;
                 done|idle)
@@ -2718,6 +2945,44 @@ EOF
             fi
         fi
 
+        # AGY APPROVAL WAITS (AGY'S STEP STORE): a WAITING step raises
+        # needs-input over the `running` it was read from, with a `perm`
+        # detail (its toolSummary, else "tool approval") and the main agent
+        # as the asker (only its own next tool call re-arms, as for a
+        # Notification gate); a needs-input with a perm detail and no step
+        # waiting any more (approved and running, or denied) goes back to
+        # running, as the heartbeat would once the tool ends. Two consecutive
+        # ticks either way (a wait that clears inside one tick is no wait),
+        # each write conditional on the state it was decided from. Not raised
+        # while Mack is looking at the tab (viewed_now): he is at the prompt,
+        # and the seen-it discharge would only turn the yellow into idle +
+        # pending a tick later; it stays running, and a look away raises it.
+        # The detail rides in the command string, so ag_txt is held
+        # (agy_status) to letters, digits, space and ._/:@=+,()- - no quote,
+        # `#`, `;`, `$`, `\` or brace can reach tmux's parser.
+        [ "$agy_act" = raise ] && viewed_now "$wac" && agy_act=""
+        if [ -n "$agy_act" ]; then
+            n=0
+            for kv in $ag_streak; do
+                case "$kv" in "${win}=${agy_act}="*) n="${kv##*=}"; break ;; esac
+            done
+            n=$((n + 1))
+            if [ "$n" -ge 2 ]; then
+                if [ "$agy_act" = raise ]; then
+                    ag_d="${ag_txt:-tool approval}"
+                    cas_write "$win" "#{==:#{@agent_state},running}" \
+                        "set-option -w -t $win @agent_state needs-input ; set-option -w -t $win @agent_since '$tick_now needs-input' ; set-option -w -t $win @agent_detail_kind perm ; set-option -w -t $win @agent_detail '$ag_d' ; set-option -w -t $win @agent_ask_from main ; set-option -uw -t $win @agent_ask_bg" \
+                        && [ "$state" = needs-input ] && { changed=1; state_moved=1; }
+                else
+                    cas_write "$win" "#{&&:#{==:#{@agent_state},needs-input},#{==:#{@agent_detail_kind},perm}}" \
+                        "set-option -w -t $win @agent_state running ; set-option -w -t $win @agent_since '$tick_now running' ; set-option -uw -t $win @agent_ask_from ; set-option -uw -t $win @agent_ask_bg" \
+                        && [ "$state" = running ] && { changed=1; state_moved=1; }
+                fi
+            else
+                ag_streak_next="${ag_streak_next}${win}=${agy_act}=${n} "
+            fi
+        fi
+
         if [ "$has_agent" = 1 ] && [ -z "$state" ]; then
             # The seed never lands over a first hook's state (CONDITIONAL
             # WRITES); state is whatever the window holds after it.
@@ -2748,7 +3013,8 @@ EOF
                 # running for the dead agent painted its title on the shell.
                 tmux set-option -uw -t "$win" @agent_summary_key 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_pending 2>/dev/null
-                tmux set-option -uw -t "$win" @agent_rollout 2>/dev/null
+                tmux set-option -uw -t "$win" @agent_rollout \; \
+                     set-option -uw -t "$win" @agent_record 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null
                 tmux set-option -uw -t "$win" @agent_kind \; \
@@ -2844,7 +3110,12 @@ EOF
                 case "${PID_KIND[$pid]:-}" in
                     opencode) opencode_status "$pid" ;;
                     grok) grok_status "$pid" "$win" ;;
-                    codex|copilot|agy) ;;
+                    # agy: a step in flight (an approved command still
+                    # running) is busy; a wait is not (the gate is Mack's).
+                    agy) ag_st=""
+                         [ -n "${W_REC[$win]:-}" ] && agy_status "$win" "${W_REC[$win]}"
+                         [ "$ag_st" = busy ] && st=busy ;;
+                    codex|copilot) ;;
                     *) session_status "$pid" ;;
                 esac
             fi
@@ -2873,6 +3144,7 @@ EOF
     EV_SEED=(); EV_SEED_AT=()
 
     idle_streak="$idle_streak_next"
+    ag_streak="$ag_streak_next"
     # Rollout answers no window asked for this tick are dropped (see
     # codex_tail_cached); a window that comes back reads afresh.
     for win in "${!CX_PATH[@]}"; do
@@ -2886,6 +3158,16 @@ EOF
         unset 'GK_PATH[$win]' 'GK_TICK[$win]' 'GK_ST[$win]'
     done
     GK_USED=()
+    # ...and agy_status's step-store answers (and a hold clock whose window
+    # no longer reads its store).
+    for win in "${!AG_HOLD[@]}"; do
+        [ -n "${AG_USED[$win]:-}" ] || unset 'AG_HOLD[$win]'
+    done
+    for win in "${!AG_PATH[@]}"; do
+        [ -n "${AG_USED[$win]:-}" ] && continue
+        unset 'AG_PATH[$win]' 'AG_TICK[$win]' 'AG_ST[$win]' 'AG_TXT[$win]'
+    done
+    AG_USED=()
 
     # The stale-save chip (see STALE-SAVE CHIP): a builtin clock compare on
     # almost every tick, a look at most once per STALE_EVERY seconds.

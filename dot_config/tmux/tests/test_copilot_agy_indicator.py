@@ -131,7 +131,11 @@ class Harness(unittest.TestCase):
 
     def put(self, **options):
         state = json.loads(self.state.read_text())
-        state["windows"]["@7"].update(options)
+        for k, v in options.items():   # None: unset it
+            if v is None:
+                state["windows"]["@7"].pop(k, None)
+            else:
+                state["windows"]["@7"][k] = v
         self.state.write_text(json.dumps(state))
 
     def relabel(self, me, above="zsh", grand="zsh"):
@@ -221,6 +225,60 @@ class CopilotIndicatorTests(Harness):
         self.assertEqual((w["@agent_state"], w["@agent_detail_kind"], w["@agent_detail"]),
                          ("failed", "fail", "model unavailable"))
 
+    def test_usage_limits_are_the_rate_limited_mark(self):
+        # Copilot's own words: the 402 seen 81 times in session-state
+        # (request id redacted), and the runtime's rate-limit strings.
+        now = int(time.time())
+        for msg, want in [
+                ("You have exceeded your monthly quota (Request ID: 0000:000000:0000000:0000000:00000000)",
+                 "Copilot monthly quota"),
+                ("You've reached your weekly rate limit. Learn More (https://docs.github.com/copilot/concepts/rate-limits).",
+                 "Copilot weekly limit"),
+                ("You've hit your session rate limit.", "Copilot session limit"),
+                ("You've hit the rate limit for this model. Please switch models or wait for your limit to reset",
+                 "Copilot model limit · /model to switch"),
+                ("You've run out of your included AI credits for the month. Manage budget: https://github.com/settings/copilot/features",
+                 "Copilot monthly quota"),
+                ("You've hit your rate limit. Please wait for your limit to reset", "Copilot limit")]:
+            with self.subTest(msg=msg[:40]):
+                self.hook("running", prompt="go")
+                w = self.hook("failed", error={"message": msg, "name": "CAPIError"},
+                              errorContext="model_call", recoverable=False)
+                self.assertEqual((w["@agent_state"], w["@agent_detail_kind"], w["@agent_detail"]),
+                                 ("paused", "limit", want))
+                r, typ, e = w["@agent_limit"].split()
+                self.assertEqual((r, typ), ("0", "copilot"))
+                self.assertEqual(w["@agent_paused"], e)
+        # A reset in the message is the limit's resets_at.
+        self.hook("running", prompt="go")
+        w = self.hook("failed", error="Rate limit hit (You've hit your session rate limit.) "
+                                      "(current limit resets in ~3 hours)",
+                      errorContext="model_call", recoverable=False)
+        r = int(w["@agent_limit"].split()[0])
+        self.assertTrue(now + 10800 <= r <= now + 10800 + 30, r)
+        self.assertTrue(w["@agent_detail"].startswith("Copilot session limit · resets "), w["@agent_detail"])
+        # A non-limit failure stays red. (Ending a standing limit reads the
+        # window through display-message formats this fake does not expand:
+        # test_agent_limit covers it on a private tmux server.)
+        self.put(**{"@agent_limit": None})
+        self.hook("running", prompt="go")
+        w = self.hook("failed", error={"message": "model unavailable"}, errorContext="model_call", recoverable=False)
+        self.assertEqual((w["@agent_state"], w["@agent_detail_kind"]), ("failed", "fail"))
+
+    def test_the_record_names_the_session_events(self):
+        ev = str(self.root / ".copilot/session-state" / CSID / "events.jsonl")
+        self.assertEqual(self.hook("idle", source="new")["@agent_record"], ev)
+        self.put(**{"@agent_record": "stale"})
+        self.assertEqual(self.hook("running", prompt="go")["@agent_record"], ev)
+        # A subagent's prompt is inert, record and all; COPILOT_HOME moves it.
+        self.put(**{"@agent_record": "kept"})
+        self.assertEqual(self.hook("running", agentId="sub-1", prompt="sub")["@agent_record"], "kept")
+        env = dict(self.env, COPILOT_HOME=str(self.root / "ch"))
+        self.assertEqual(self.hook("running", env=env, prompt="go")["@agent_record"],
+                         str(self.root / "ch/session-state" / CSID / "events.jsonl"))
+        # The session's end drops it with the rest.
+        self.assertNotIn("@agent_record", self.hook("clear", reason="user_exit"))
+
     def test_subagent_events_are_inert_but_its_gate_paints(self):
         self.hook("running", prompt="main task")
         before = self.window()
@@ -282,6 +340,11 @@ class CopilotIndicatorTests(Harness):
         for event, entries in cfg["hooks"].items():
             for e in entries:
                 self.assertEqual(e["type"], "command")
+                # Other scripts may ride the same events (the resurrect
+                # session tracker); only the indicator's entries are ours.
+                if "agent-tab-indicator.sh" not in e["bash"]:
+                    self.assertLessEqual(e["timeoutSec"], 10)
+                    continue
                 self.assertTrue(e["bash"].startswith('bash "$HOME/.config/tmux/scripts/agent-tab-indicator.sh" '))
                 self.assertTrue(e["bash"].endswith(" copilot"), e)
                 self.assertLessEqual(e["timeoutSec"], 10)
@@ -399,10 +462,84 @@ class AgyIndicatorTests(Harness):
         self.pre("x", n=5)
         self.assertEqual(log.read_text(), "", "no ps walk, no jq: one show-options")
 
-    def test_background_tasks_do_not_hold_the_tab(self):
+    def test_background_tasks_hold_the_tab_running(self):
+        # fullyIdle false: background tasks still out. Held `running` like
+        # Claude's bg hold (the watcher releases it from the step store),
+        # the reply kept as the detail.
         self.pre()
-        self.assertEqual(self.hook("done", terminationReason="NO_TOOL_CALL", fullyIdle=False)["@agent_state"],
-                         "done")
+        w = self.hook("done", terminationReason="NO_TOOL_CALL", fullyIdle=False, finalModelOutput="Started the build.")
+        self.assertEqual((w["@agent_state"], w["@agent_detail_kind"], w["@agent_detail"]),
+                         ("running", "done", "Started the build."))
+        self.assertEqual(w["@agent_bg_owner"], "user")
+        # Mack's NEW prompt on the held tab: its first PreInvocation is a new
+        # turn (the mid-turn fast exit is only for a window not held), so
+        # the detail is his prompt's `run` and the turn stamps move.
+        self.put(**{"@agent_turn_start": "1", "@thread_at": "1"})
+        w = self.pre("<USER_REQUEST>\nNow deploy it\n</USER_REQUEST>", n=0)
+        self.assertEqual((w["@agent_state"], w["@agent_detail_kind"], w["@agent_detail"]),
+                         ("running", "run", "Now deploy it"))
+        self.assertNotEqual(w["@agent_turn_start"], "1")
+        self.assertNotEqual(w["@thread_at"], "1")
+        # ...and its later calls are the fast no-op again.
+        self.assertEqual(self.pre("something else entirely", n=2), w)
+        # fullyIdle true (or absent) finishes as ever.
+        w = self.hook("done", terminationReason="NO_TOOL_CALL", fullyIdle=True, finalModelOutput="Build passed.")
+        self.assertEqual(w["@agent_state"], "done")
+        self.assertNotIn("@agent_bg_owner", w)
+
+    def test_the_record_names_the_conversation_db(self):
+        db = str(self.root / ".gemini/antigravity-cli/conversations" / (CID + ".db"))
+        self.assertEqual(self.hook("idle", hookEventName="SessionStart")["@agent_record"], db)
+        self.put(**{"@agent_record": "stale"})
+        self.assertEqual(self.pre()["@agent_record"], db)
+        # A subagent's conversation never replaces it; nor does a transcript
+        # path outside ~/.gemini or of another shape.
+        self.put(**{"@agent_state": "idle"})
+        sub = dict(conversationId="sub-conv-1", parentConversationId=CID, rootConversationId=CID)
+        self.assertEqual(self.pre(**sub).get("@agent_record"), db)
+        self.put(**{"@agent_state": "idle", "@agent_record": "kept"})
+        self.assertEqual(self.pre(transcriptPath="/tmp/brain/%s/.system_generated/logs/transcript.jsonl" % CID)
+                         ["@agent_record"], "kept")
+
+    def test_usage_limit_is_the_rate_limited_mark(self):
+        # Real agy wording (a transcript ERROR_MESSAGE), its reset a Go duration.
+        self.pre()
+        now = int(time.time())
+        w = self.hook("done", terminationReason="ERROR",
+                      error="API error (attempt 3): RESOURCE_EXHAUSTED (code 429): You have exhausted your "
+                            "capacity on this model. Resets in 1h2m5s.")
+        r, typ, e = w["@agent_limit"].split()
+        self.assertEqual(typ, "agy")
+        self.assertTrue(now + 3725 <= int(r) <= now + 3725 + 5, (r, now))
+        self.assertEqual((w["@agent_state"], w["@agent_detail_kind"]), ("paused", "limit"))
+        self.assertTrue(w["@agent_detail"].startswith("agy model limit · resets "), w["@agent_detail"])
+        self.assertEqual(w["@agent_paused"], e)
+        self.assertEqual(w["@agent_turn_result"], "- limited " + r)
+        # A stated reset under a minute ("Resets in 0s", the one on disk):
+        # the quota is already back, nothing to wait for - the red failure
+        # Mack retries, never a pause that would not resume.
+        for err in ("RESOURCE_EXHAUSTED (code 429): You have exhausted your capacity on this model. Resets in 0s.",
+                    "RESOURCE_EXHAUSTED (code 429): You have exhausted your capacity on this model. Resets in 42.5s."):
+            with self.subTest(err=err[-14:]):
+                self.put(**{"@agent_limit": None, "@agent_paused": None})
+                self.pre()
+                w = self.hook("done", terminationReason="ERROR", error=err)
+                self.assertEqual((w["@agent_state"], w["@agent_detail_kind"]), ("failed", "fail"))
+                self.assertNotIn("@agent_limit", w)
+        # No reset stated at all: a limit with resets_at 0, the label alone.
+        self.pre()
+        w = self.hook("done", terminationReason="ERROR",
+                      error="RESOURCE_EXHAUSTED (code 429): Quota exceeded for this project.")
+        self.assertEqual((w["@agent_state"], w["@agent_detail"], w["@agent_limit"].split()[0]),
+                         ("paused", "agy limit", "0"))
+        # A capacity / availability error is a failure, never a limit.
+        for err in ("UNAVAILABLE (code 503): The model is overloaded. Please try again later.",
+                    "model call failed: 503"):
+            with self.subTest(err=err):
+                self.put(**{"@agent_limit": None, "@agent_paused": None})
+                self.pre()
+                w = self.hook("done", terminationReason="ERROR", error=err)
+                self.assertEqual((w["@agent_state"], w["@agent_detail_kind"]), ("failed", "fail"))
 
     def test_transcript_outside_gemini_is_never_read(self):
         outside = self.root / "elsewhere/transcript.jsonl"
@@ -441,11 +578,15 @@ class AgyIndicatorTests(Harness):
             for e in entries:
                 self.assertEqual(e["type"], "command")
                 cmd = e["command"]
-                self.assertTrue(cmd.startswith('bash "$HOME/.config/tmux/scripts/agent-tab-indicator.sh" '), cmd)
                 # agy wants a JSON object on stdout from every hook.
                 self.assertIn(">/dev/null 2>&1; echo '", cmd)
                 json.loads(cmd.rsplit("echo '", 1)[1].rstrip("'"))
                 self.assertLessEqual(e["timeout"], 10)
+                # Other scripts may ride the same events (the resurrect
+                # session tracker); only the indicator's entries are ours.
+                if "agent-tab-indicator.sh" not in cmd:
+                    continue
+                self.assertTrue(cmd.startswith('bash "$HOME/.config/tmux/scripts/agent-tab-indicator.sh" '), cmd)
                 modes[event] = cmd.split()[2]
                 self.assertEqual(cmd.split()[3], "agy")
         self.assertEqual(modes, {"SessionStart": "idle", "PreInvocation": "running",

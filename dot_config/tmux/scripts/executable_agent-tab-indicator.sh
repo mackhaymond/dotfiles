@@ -55,6 +55,14 @@
 #                   still out discharges it to running, not idle.
 #   @agent_kind    claude | codex | opencode | grok | copilot | agy — which agent's hooks drive this
 #                   window; written with any state/detail write a hook makes
+#   @agent_record  copilot/agy only: the main session's own on-disk store the
+#                   watcher reads (copilot's session-state events.jsonl, agy's
+#                   conversations/<id>.db); rewritten by every main-agent
+#                   SessionStart and turn start (copilot: every
+#                   sessionStart / userPromptSubmitted; agy: SessionStart
+#                   and a turn's first PreInvocation), unset by
+#                   clear_state and the watcher GC. Never @agent_rollout,
+#                   which agent-ui and resurrect read as a codex rollout.
 #   @agent_harness  abby | unset — the launcher behind that kind when it is not
 #                   the agent itself (THE HARNESS: a claude hook with
 #                   CLAUDE_CONFIG_DIR .../.claude-abby). Written or unset in the
@@ -852,7 +860,8 @@ clear_state() {
     tmux set-option -uw -t "$win" @agent_summary_cond \; \
          set-option -uw -t "$win" @agent_summary_key 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_pending 2>/dev/null || true
-    tmux set-option -uw -t "$win" @agent_rollout 2>/dev/null || true
+    tmux set-option -uw -t "$win" @agent_rollout \; \
+         set-option -uw -t "$win" @agent_record 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_session_id 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_owner_token 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_since 2>/dev/null || true
@@ -1578,6 +1587,73 @@ limit_end() {
         ss_add set-option -uw -t "$win" @agent_paused
         ss_add set-option -uw -t "$win" @agent_pause_voided
         LIM_UNPAUSED=1
+    fi
+    return 0
+}
+
+# kind_limit KIND TEXT NOW: is this copilot / agy turn failure a USAGE LIMIT
+# (RATE-LIMITED AGENTS)? 0 = yes, with KL_R (resets_at, 0 = unknown) and
+# KL_TXT (the sidebar line); 1 = an ordinary failure. Builtins only. The
+# words are the CLIs' own:
+#   COPILOT (1.0.108 runtime strings; the 402 one seen 81 times in
+#   ~/.copilot/session-state): "You have exceeded your monthly quota" (402,
+#   errorType quota, errorCode quota_exceeded), "You've reached your weekly
+#   rate limit.", "You've hit your session rate limit.", "You've hit the rate
+#   limit for this model.", "You've hit your rate limit.", "You've run out of
+#   your included AI credits for the month.", "You've reached your additional
+#   usage limit for your plan.", "You've reached the spending limit for this
+#   session.", "You've used all your Copilot Free chat requests for the
+#   month."; a reset as "(current limit resets in ~N <unit>)" when it says.
+#   AGY (Google's API through agy, seen in a transcript ERROR_MESSAGE): "API
+#   error (attempt 1): RESOURCE_EXHAUSTED (code 429): You have exhausted your
+#   capacity on this model. Resets in 0s." - the reset a Go duration. A 503 /
+#   UNAVAILABLE / overloaded model is a failure, never a limit.
+# A STATED reset under KL_SOON s ("Resets in 0s": the quota is already back,
+# the turn died on a momentary 429) is NOT a limit: a paused tab with
+# nothing to wait for would never resume on its own, so it is the plain red
+# failure Mack retries. No reset stated at all is a limit with resets_at 0.
+KL_SOON=60
+kind_limit() {
+    local k="$1" t="${2,,}" now="$3" lab="" secs=0 n u stated=0
+    local re_w='resets? in ~?([0-9]+) ?(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)([^a-z]|$)'
+    local re_g='resets? in ~?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)(\.[0-9]+)?s)?'
+    KL_R=0; KL_TXT=""
+    if [ "$k" = copilot ]; then
+        case "$t" in
+            *"weekly rate limit"*|*weekly_rate_limited*) lab="Copilot weekly limit" ;;
+            *"session rate limit"*|*session_quota_exceeded*|*"spending limit for this session"*)
+                lab="Copilot session limit" ;;
+            *"rate limit for this model"*|*model_rate_limited*) lab="Copilot model limit · /model to switch" ;;
+            *"monthly quota"*|*quota_exceeded*|*"included ai credits"*|*"free chat requests"*)
+                lab="Copilot monthly quota" ;;
+            *"additional usage limit"*|*"spending limit"*|*"ai credits"*) lab="Copilot credit limit" ;;
+            *"hit your rate limit"*|*rate_limited*|*"rate limit"*|*"usage limit"*|*quota*) lab="Copilot limit" ;;
+        esac
+    else
+        case "$t" in
+            *unavailable*|*overload*|*"code 503"*|*"code 529"*) ;;
+            *resource_exhausted*|*"code 429"*|*"exhausted your"*|*quota*|*"rate limit"*|*rate_limit*|*"usage limit"*)
+                lab="agy limit"
+                case "$t" in *"on this model"*) lab="agy model limit" ;; esac ;;
+        esac
+    fi
+    [ -n "$lab" ] || return 1
+    if [[ $t =~ $re_w ]]; then
+        stated=1
+        n=$((10#${BASH_REMATCH[1]})); u="${BASH_REMATCH[2]}"
+        case "$u" in s*) secs=$n ;; m*) secs=$((n * 60)) ;; h*) secs=$((n * 3600)) ;; d*) secs=$((n * 86400)) ;; esac
+    elif [[ $t =~ $re_g ]]; then
+        [ -z "${BASH_REMATCH[1]}${BASH_REMATCH[3]}${BASH_REMATCH[5]}" ] || stated=1
+        secs=$(( 10#${BASH_REMATCH[2]:-0} * 3600 + 10#${BASH_REMATCH[4]:-0} * 60 + 10#${BASH_REMATCH[6]:-0} ))
+        [ -z "${BASH_REMATCH[7]}" ] || secs=$((secs + 1))   # a fraction rounds up
+    fi
+    [ "$stated" = 0 ] || [ "$secs" -ge "$KL_SOON" ] || return 1
+    if [ "$secs" -gt 0 ] && [[ $now =~ ^[0-9]{1,12}$ ]]; then
+        KL_R=$((now + secs))
+        limit_text "$KL_R" "$k" "$now"
+        KL_TXT="$lab${LIM_TXT#usage limit}"
+    else
+        KL_TXT="$lab"
     fi
     return 0
 }
@@ -2592,8 +2668,17 @@ win=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null || true)
 # it: on a window already running (every call of a turn but its first) it
 # is a no-op (COPILOT AND AGY), decided here with one show-options, before
 # the ps walks and jq. The small payload is read in-process so agy never
-# writes into a closed pipe.
-if [ "$agent" = agy ] && [ "$mode" = running ] && [ "$(window_state "$win")" = running ]; then
+# writes into a closed pipe. EXCEPT on a window a Stop holds `running` for
+# background tasks (fullyIdle false: its `done` detail kept): there the next
+# PreInvocation starts a NEW turn (Mack's prompt, or agy waking on a
+# finished task) and takes the full running mode - its origin, @thread_at,
+# @agent_turn_start and a `run` detail, so the watcher's drain release can
+# never idle it. One more show-options, only on a running window.
+agy_fast_exit() {
+    [ "$(window_state "$win")" = running ] || return 1
+    [ "$(tmux show-options -wqv -t "$win" @agent_detail_kind 2>/dev/null || true)" != done ]
+}
+if [ "$agent" = agy ] && [ "$mode" = running ] && agy_fast_exit; then
     IFS= read -r -d '' _ || true
     exit 0
 fi
@@ -2881,7 +2966,20 @@ fi
 #     started it). Stop's terminationReason: USER_CANCELED -> interrupt,
 #     ERROR -> failed (its error), anything else (NO_TOOL_CALL, the MAX_*
 #     limits, a terminal step) -> done. fullyIdle false (background tasks
-#     still out) does NOT hold the tab: agy sends no event when they drain.
+#     still out) HOLDS the tab `running` (directive donebg: done mode's
+#     bg_pending); agy sends no event when they drain, so the watcher
+#     releases it from the conversation's own step store (agy_status).
+#   THE RECORD (@agent_record, for the watcher): the main session's own
+#     store, rewritten by every main-agent SessionStart and turn start
+#     (idle, running; riding the state's command list): copilot's
+#     <COPILOT_HOME>/session-state/<sid>/events.jsonl (Esc mid-turn: its
+#     persisted `abort`), agy's <root>/conversations/<id>.db next to the
+#     brain/ its transcriptPath names (live step statuses: WAITING = a tool
+#     awaiting approval, and the background-task drain). Line 4 of the jq
+#     output: the main session's id, "" for a subagent's event.
+#   USAGE LIMITS (failed): copilot's errorOccurred error text and agy's Stop
+#     ERROR text are read for a usage limit (kind_limit) and marked like
+#     Claude's (RATE-LIMITED AGENTS), types copilot / agy.
 #   Their transcripts (copilot's session-state events.jsonl, agy's
 #     brain/<id>/.system_generated/logs/transcript.jsonl) are never a Claude
 #     transcript: transcript_path is emptied, so no Claude reader (stop_fields,
@@ -2916,10 +3014,12 @@ def tname: {bash: "Bash", powershell: "PowerShell", view: "Read", edit: "Edit", 
      then {tool_name: "AskUserQuestion", tool_input: {question: (.message // .title // "" | s)}} else {} end)
 | (if $mode == "failed" and ($rec or ($ectx != "" and $ectx != "model_call" and $ectx != "system"))
    then "drop" else "keep" end) as $d
-| $d, tojson'
+| $d, tojson, "",
+  (if .agent_id == null then (.session_id | gsub("[^0-9A-Za-z-]"; "") | .[0:64]) else "" end)'
 AGY_NORM_JQ='
 def s: if type == "string" then . elif . == null then "" else tostring end;
 (.terminationReason // .termination_reason // "" | s) as $tr
+| (if has("fullyIdle") then .fullyIdle else .fully_idle end) as $fi   # (`//` drops a false)
 | (.transcriptPath // "" | s | gsub("[\\r\\n]"; " ")) as $tp
 | (.error // "" | if type == "object" then (.message // "") else . end | s | .[0:2000]) as $err
 | ('"$AGY_SUB_JQ"') as $sub
@@ -2943,25 +3043,49 @@ def s: if type == "string" then . elif . == null then "" else tostring end;
 | (if $mode != "done" then "keep"
    elif $tr == "USER_CANCELED" then "interrupt"
    elif $tr == "ERROR" then "failed"
-   else "done" end), tojson, $tp'
+   elif $fi == false then "donebg"
+   else "done" end), tojson, $tp,
+  (if $sub == "" then (.session_id | gsub("[^0-9A-Za-z-]"; "") | .[0:64]) else "" end)'
 cp_tp=""
+agy_bg=0   # 1 = an agy Stop with fullyIdle false (background tasks still out)
 if { [ "$agent" = copilot ] || [ "$agent" = agy ]; } && [ -n "$JQ" ] && [ -n "$payload" ]; then
     if [ "$agent" = copilot ]; then
         cp_out=$("$JQ" -r --arg mode "$mode" "$CP_NORM_JQ" <<<"$payload" 2>/dev/null || true)
     else
         cp_out=$("$JQ" -r --arg mode "$mode" "$AGY_NORM_JQ" <<<"$payload" 2>/dev/null || true)
     fi
-    cp_dir=""; cp_new=""
-    { IFS= read -r cp_dir; IFS= read -r cp_new; IFS= read -r cp_tp; } <<<"$cp_out" || true
+    cp_dir=""; cp_new=""; cp_sid=""
+    { IFS= read -r cp_dir; IFS= read -r cp_new; IFS= read -r cp_tp; IFS= read -r cp_sid; } <<<"$cp_out" || true
     # A payload jq can't read is no event this script understands.
     [ -n "$cp_new" ] || exit 0
     payload="$cp_new"
     case "$cp_dir" in
         drop) exit 0 ;;
         interrupt|failed|done) mode="$cp_dir" ;;
+        donebg) mode=done; agy_bg=1 ;;
     esac
-    if [ "$agent" = agy ] && [ "$mode" = running ] && [ "$(window_state "$win")" = running ]; then
+    if [ "$agent" = agy ] && [ "$mode" = running ] && agy_fast_exit; then
         exit 0
+    fi
+    # THE RECORD (see above): the main session's own store, for the watcher,
+    # in the state's command list (ss_add: no fork of its own). Rewritten by
+    # every main-agent SessionStart and turn start (copilot's every
+    # sessionStart / userPromptSubmitted; agy's SessionStart and a turn's
+    # first PreInvocation), only as a path of the expected shape (the id held
+    # to a UUID's charset by the jq).
+    if [ -n "$cp_sid" ] && { [ "$mode" = running ] || [ "$mode" = idle ]; }; then
+        cp_rec=""
+        if [ "$agent" = copilot ]; then
+            cp_rec="${COPILOT_HOME:-$HOME/.copilot}/session-state/$cp_sid/events.jsonl"
+        else
+            case "$cp_tp" in
+                "$HOME"/.gemini/*/brain/"$cp_sid"/.system_generated/logs/transcript.jsonl)
+                    case "$cp_tp" in */../*) ;; *)
+                        cp_rec="${cp_tp%/brain/*}/conversations/$cp_sid.db" ;;
+                    esac ;;
+            esac
+        fi
+        [ -z "$cp_rec" ] || ss_add set-option -w -t "$win" @agent_record "$cp_rec"
     fi
     # The Stop's reply, from the CLI's own record (bounded tail, one grep, one
     # jq; Stops only). copilot: <COPILOT_HOME>/session-state/<sid>/events.jsonl
@@ -3649,6 +3773,17 @@ case "$mode" in
         # transcripts run to hundreds of MB). A model limit (Fable's
         # model_requires_usage_credits) or a record with no resetsAt is type
         # `model`, R 0: only Mack can fix it, in his own words.
+        # COPILOT and AGY (kind_limit): their failure's own text says so
+        # (copilot's errorOccurred error, agy's Stop ERROR error); the
+        # payload is already the rewritten one, its `error` that text.
+        if { [ "$agent" = copilot ] || [ "$agent" = agy ]; } && [ -n "$JQ" ] && [ -n "$payload" ]; then
+            kl_t=$("$JQ" -r '.error // "" | tostring | .[0:2000] | gsub("[\\r\\n\\t]"; " ")' <<<"$payload" 2>/dev/null || true)
+            printf -v kl_now '%(%s)T' -1 2>/dev/null || kl_now=$(now_epoch)
+            if [ -n "$kl_t" ] && kind_limit "$agent" "$kl_t" "$kl_now"; then
+                limit_mark "$win" "$KL_R" "$agent" "$KL_TXT" "$s_id"
+                exit 0
+            fi
+        fi
         if [ -n "$JQ" ] && [ -n "$payload" ]; then
             lm_head=$("$JQ" -r '(.error | if type == "object" then (.type // .error // "") else (. // "") end
                                  | tostring | .[0:40] | gsub("[\\r\\n]"; " ")),
@@ -3751,10 +3886,16 @@ case "$mode" in
                        <<<"$payload" 2>/dev/null || true)
                 case "$bg_n" in ''|0|*[!0-9]*) ;; *) bg_pending=1 ;; esac
             fi
-        elif [ "$agent" != copilot ] && [ "$agent" != agy ] \
+        elif [ "$agent" = agy ]; then
+            # AGY says so in the Stop too: fullyIdle false = background tasks
+            # still out (COPILOT AND AGY's donebg). Held `running`; the
+            # watcher releases it once the conversation's step store shows
+            # nothing in flight (agy_status), or the next Stop lands.
+            bg_pending=$agy_bg
+        elif [ "$agent" != copilot ] \
              && [ -n "$JQ" ] && [ -n "$payload" ] && [ -x "$BG_PENDING" ]; then
-            # (copilot/agy: no transcript_path, so no background check -
-            # skip the three reads, COPILOT AND AGY.)
+            # (copilot: no transcript_path, so no background check - skip
+            # the three reads, COPILOT AND AGY.)
             bg_tp=$("$JQ" -r '.transcript_path // empty' <<<"$payload" 2>/dev/null || true)
             bg_sid=$("$JQ" -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)
             bg_cwd=$("$JQ" -r '.cwd // empty' <<<"$payload" 2>/dev/null || true)
@@ -3878,7 +4019,7 @@ case "$mode" in
         # Claude transcripts, and Grok's transcript_path is not one.
         ask_hit=0; ask_line=""; ask_clean=""
         if [ "$bg_pending" -eq 1 ] && [ "$sd_hold" = running ] && [ -z "$O_PAUSED" ] && [ -n "$JQ" ] \
-           && [ "$agent" != grok ]; then
+           && [ "$agent" != grok ] && [ "$agent" != copilot ] && [ "$agent" != agy ]; then
             ask_since="$O_TSTART"
             ask_run "$ASK_SYNC_BUDGET" --marker-only ${ask_since:+--since "$ask_since"} <<<"$payload"
             if [ "$ask_rc" = 0 ]; then

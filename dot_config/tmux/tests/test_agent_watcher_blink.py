@@ -359,7 +359,8 @@ class SinceStampTests(unittest.TestCase):
         w = self.hook("heartbeat")
         self.assertEqual(w["@agent_state"], "done")
         self.assertFalse([c for c in self.calls()[n:] if c[0] == "set-option" and "@agent_since" in c])
-        self.assertEqual(set(self.hook("clear")), {"@agent_seen_at"})
+        # @thread_at (Mack's last own prompt) survives clear by design.
+        self.assertEqual(set(self.hook("clear")), {"@agent_seen_at", "@thread_at"})
 
 
 if __name__ == "__main__":

@@ -83,7 +83,7 @@ ARGS = ("7100 /opt/homebrew/bin/copilot --continue\n"
         "7700 copilot-language-server --stdio\n")
 
 
-class CopilotAgyWatcherTests(unittest.TestCase):
+class WatcherBase(unittest.TestCase):
     def make(self, windows, panes):
         self.f = jw.FakeEnv(windows=windows, panes=panes)
         self.f.procs.write_text(PROCS)
@@ -104,6 +104,8 @@ class CopilotAgyWatcherTests(unittest.TestCase):
     def calls(self, s, wid):
         return [c for c in s["calls"] if c[0] == "set-option" and wid in c]
 
+
+class CopilotAgyWatcherTests(WatcherBase):
     def test_tuis_are_seeded_with_their_kind_and_commands_are_shells(self):
         ttys = (CP_TTY, CP_P_TTY, CP_MCP_TTY, AGY_TTY, AGY_P_TTY, AGY_PLUG_TTY, LS_TTY)
         self.make({"@%d" % i: jw.W("main", i) for i in range(1, 8)},
@@ -168,6 +170,260 @@ class CopilotAgyWatcherTests(unittest.TestCase):
         s = self.run_ticks(5)
         for wid in ("@1", "@4"):
             self.assertEqual(s["windows"][wid]["opts"].get("@agent_state"), "running", wid)
+
+
+def iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(epoch)) + ".371Z"
+
+
+def cp_line(typ, data, epoch):
+    # Copilot's own line shape (key order as written): type, data, id,
+    # timestamp, parentId. Ids redacted.
+    return json.dumps({"type": typ, "data": data, "id": "00000000-0000-4000-8000-000000000000",
+                       "timestamp": iso(epoch), "parentId": None}, separators=(",", ":")) + "\n"
+
+
+class CopilotRecordTests(WatcherBase):
+    """COPILOT ESC MID-TURN: the persisted `abort` (or a turn-ending
+    session.error) in the session's events.jsonl, after the state's stamp,
+    ends a running / yellow copilot turn (three ticks)."""
+
+    def setup_copilot(self, state, stamp, tail, detail="run"):
+        self.make({"@1": jw.W("main", 1, **{"@agent_state": state, "@agent_kind": "copilot",
+                                             "@agent_since": "%d %s" % (stamp, state),
+                                             "@agent_detail_kind": detail, "@agent_detail": "go"})},
+                  [{"window": "@1", "tty": CP_TTY}])
+        ev = self.f.home / ".copilot/session-state/5390b68f-fc54-4939-841f-ad0c81359870/events.jsonl"
+        ev.parent.mkdir(parents=True)
+        ev.write_text("".join(tail))
+        st = self.f.read()
+        st["windows"]["@1"]["opts"]["@agent_record"] = str(ev)
+        self.f.state.write_text(json.dumps(st))
+        return ev
+
+    def turn(self, t0):
+        return [cp_line("user.message", {"content": "fix the build"}, t0),
+                cp_line("assistant.turn_start", {"turnId": "0", "interactionId": "x"}, t0 + 1),
+                cp_line("assistant.message", {"messageId": "m", "content": "", "toolRequests": []}, t0 + 2),
+                cp_line("tool.execution_start", {"toolCallId": "c", "toolName": "bash"}, t0 + 3)]
+
+    def opts(self):
+        return self.f.read()["windows"]["@1"]["opts"]
+
+    def test_an_abort_after_the_stamp_ends_a_running_turn(self):
+        now = int(time.time())
+        self.setup_copilot("running", now - 60, self.turn(now - 60) + [
+            cp_line("abort", {"reason": "user_initiated"}, now - 5),
+            cp_line("assistant.turn_end", {"turnId": "0"}, now - 5)])
+        o = self.run_ticks(2)["windows"]["@1"]["opts"]
+        self.assertEqual(o["@agent_state"], "running", "three ticks of hysteresis")
+        o = self.run_ticks(4)["windows"]["@1"]["opts"]
+        self.assertEqual(o["@agent_state"], "idle")
+        self.assertNotIn("@agent_detail_kind", o)
+
+    def test_an_abort_before_the_stamp_is_the_previous_turns(self):
+        # A new prompt whose user.message is not written yet: the last turn
+        # marker is the previous turn's abort, older than the stamp.
+        now = int(time.time())
+        self.setup_copilot("running", now - 5, self.turn(now - 90) + [
+            cp_line("abort", {"reason": "user_initiated"}, now - 60)])
+        self.assertEqual(self.run_ticks(5)["windows"]["@1"]["opts"]["@agent_state"], "running")
+
+    def test_a_turn_going_on_after_an_abort_is_not_ended(self):
+        now = int(time.time())
+        self.setup_copilot("running", now - 60, self.turn(now - 60) + [
+            cp_line("abort", {"reason": "user_initiated"}, now - 30)] + self.turn(now - 20))
+        self.assertEqual(self.run_ticks(5)["windows"]["@1"]["opts"]["@agent_state"], "running")
+
+    def test_an_abort_ends_a_permission_prompt(self):
+        now = int(time.time())
+        self.setup_copilot("needs-input", now - 30, self.turn(now - 60) + [
+            cp_line("permission.requested", {"requestId": "r", "permissionRequest": {"kind": "shell"}}, now - 30),
+            cp_line("abort", {"reason": "user_initiated"}, now - 3)], detail="perm")
+        o = self.run_ticks(5)["windows"]["@1"]["opts"]
+        self.assertEqual(o["@agent_state"], "idle")
+        self.assertNotIn("@agent_detail_kind", o)
+
+    def test_a_turn_ending_error_ends_a_running_turn(self):
+        # The real quota error (request ids redacted), after the turn's end.
+        now = int(time.time())
+        self.setup_copilot("running", now - 60, self.turn(now - 60) + [
+            cp_line("assistant.turn_end", {"turnId": "0"}, now - 10),
+            cp_line("session.error", {"errorType": "quota", "message": "You have exceeded your monthly quota "
+                                      "(Request ID: 0000:000000:0000000:0000000:00000000)", "statusCode": 402,
+                                      "errorCode": "quota_exceeded"}, now - 10)])
+        self.assertEqual(self.run_ticks(5)["windows"]["@1"]["opts"]["@agent_state"], "idle")
+
+    def test_an_auto_switch_question_is_still_the_turn(self):
+        now = int(time.time())
+        self.setup_copilot("running", now - 60, self.turn(now - 60) + [
+            cp_line("session.error", {"errorType": "rate_limit", "message": "You've hit your rate limit.",
+                                      "errorCode": "user_global_rate_limited", "eligibleForAutoSwitch": True},
+                    now - 10)])
+        self.assertEqual(self.run_ticks(5)["windows"]["@1"]["opts"]["@agent_state"], "running")
+
+
+AGY_SCHEMA = ("CREATE TABLE `steps` (`idx` integer,`step_type` integer NOT NULL DEFAULT 0,"
+              "`status` integer NOT NULL DEFAULT 0,`has_subtrajectory` numeric NOT NULL DEFAULT false,"
+              "`metadata` blob,`error_details` blob,`permissions` blob,`task_details` blob,`render_info` blob,"
+              "`step_payload` blob,`step_format` integer NOT NULL DEFAULT 0,PRIMARY KEY (`idx`));"
+              "CREATE INDEX `idx_steps_status` ON `steps`(`status`);")
+
+
+def agy_payload(tool, summary, command="uv sync"):
+    # The shape of a real step_payload (protobuf around the tool call's JSON
+    # args, which carry CommandLine / toolAction / toolSummary; Go's JSON
+    # writes & as &); ids redacted. What follows the JSON is binary, as
+    # in the real rows: invalid UTF-8 and a newline included.
+    args = json.dumps({"CommandLine": command, "toolAction": "Running command", "toolSummary": summary},
+                      separators=(",", ":")).replace("&", "\\u0026")
+    return (b"\x08\x01\x12\x0bcall_000000\x12" + bytes([len(tool)]) + tool.encode() + b"\x1a"
+            + bytes([len(args) % 256]) + args.encode() + b"2\x0c\x08\xc7\xb1\xff\xfe\n\x80\x00tail\xc3")
+
+
+class AgyStepStoreTests(WatcherBase):
+    """AGY'S STEP STORE: a WAITING step in the conversation db raises
+    needs-input (perm) and its end lowers it; a Stop held by fullyIdle false
+    is released once nothing is in flight. The db is live WAL, held open by
+    a writer the whole time (as agy holds it)."""
+
+    CID = "3814da9d-d4f7-4e84-9c03-222335c5e3b3"
+
+    def setup_agy(self, state, detail, steps):
+        import sqlite3
+        now = int(time.time())
+        self.make({"@1": jw.W("main", 1, **{"@agent_state": state, "@agent_kind": "agy",
+                                             "@agent_since": "%d %s" % (now - 30, state),
+                                             "@agent_detail_kind": detail, "@agent_detail": "go"})},
+                  [{"window": "@1", "tty": AGY_TTY}])
+        d = self.f.home / ".gemini/antigravity-cli/conversations"
+        d.mkdir(parents=True)
+        self.db = d / (self.CID + ".db")
+        self.conn = sqlite3.connect(str(self.db), isolation_level=None)
+        self.addCleanup(self.conn.close)
+        self.conn.execute("pragma journal_mode=wal")
+        self.conn.executescript(AGY_SCHEMA)
+        self.conn.execute("insert into steps (idx, step_type, status) values (0, 14, 3)")   # USER_INPUT, DONE
+        for idx, (typ, status, payload) in enumerate(steps, 1):
+            self.conn.execute("insert into steps (idx, step_type, status, step_payload) values (?,?,?,?)",
+                              (idx, typ, status, payload))
+        st = self.f.read()
+        st["windows"]["@1"]["opts"]["@agent_record"] = str(self.db)
+        self.f.state.write_text(json.dumps(st))
+
+    def opts(self):
+        return self.f.read()["windows"]["@1"]["opts"]
+
+    def run_ticks(self, n, **extra):
+        # tmux's own locale: a UTF-8 one (the payload bytes must not break
+        # the parse there).
+        return super().run_ticks(n, LC_ALL="en_US.UTF-8", LANG="en_US.UTF-8", **extra)
+
+    def sqlite_forks(self, ticks):
+        """Count sqlite3 runs over `ticks` ticks (a logging wrapper on PATH)."""
+        log = self.f.dir / "sqlite.log"
+        w = self.f.bin / "sqlite3"
+        w.write_text('#!/bin/sh\necho x >> "%s"\nexec /usr/bin/sqlite3 "$@"\n' % log)
+        w.chmod(0o755)
+        self.run_ticks(ticks)
+        return len(log.read_text().split()) if log.exists() else 0
+
+    def test_a_waiting_step_raises_needs_input_and_its_end_lowers_it(self):
+        self.setup_agy("running", "run", [(15, 3, agy_payload("view_file", "View notes.md")),
+                                          (101, 9, agy_payload("run_command", "Run uv sync"))])
+        self.run_ticks(3)
+        o = self.opts()
+        self.assertEqual((o["@agent_state"], o["@agent_detail_kind"], o["@agent_detail"], o["@agent_ask_from"]),
+                         ("needs-input", "perm", "Run uv sync", "main"))
+        # Approved: the step runs (no PostToolUse until it ends).
+        self.conn.execute("update steps set status = 2 where idx = 2")
+        self.run_ticks(3)
+        o = self.opts()
+        self.assertEqual(o["@agent_state"], "running")
+        self.assertNotIn("@agent_ask_from", o)
+
+    def test_a_wait_that_clears_within_a_tick_never_paints(self):
+        self.setup_agy("running", "run", [(101, 9, agy_payload("run_command", "Run uv sync"))])
+        self.run_ticks(1)
+        self.assertEqual(self.opts()["@agent_state"], "running")
+
+    def test_a_wait_without_a_summary_says_tool_approval(self):
+        self.setup_agy("running", "run", [(101, 9, b"\x08\x01no json here")])
+        self.run_ticks(3)
+        self.assertEqual((self.opts()["@agent_state"], self.opts()["@agent_detail"]),
+                         ("needs-input", "tool approval"))
+
+    def test_a_summary_cannot_reach_tmuxs_parser(self):
+        self.setup_agy("running", "run", [(101, 9, agy_payload("run_command", "Run x'; kill-server; #{y}$z"))])
+        self.run_ticks(3)
+        o = self.opts()
+        self.assertEqual(o["@agent_state"], "needs-input")
+        self.assertEqual(o["@agent_detail"], "Run x kill-server yz")
+
+    def test_a_held_stop_is_released_once_nothing_is_in_flight(self):
+        # fullyIdle false: running with the Stop's done detail; a background
+        # command (a RUNNING step) is still out: held, gear lit.
+        self.setup_agy("running", "done", [(101, 2, agy_payload("run_command", "Run the build"))])
+        self.run_ticks(4)
+        o = self.opts()
+        self.assertEqual((o["@agent_state"], o.get("@agent_workflow")), ("running", "1"))
+        self.conn.execute("update steps set status = 3 where idx = 1")
+        self.run_ticks(5)
+        o = self.opts()
+        self.assertEqual(o["@agent_state"], "idle")
+        self.assertNotIn("@agent_workflow", o)
+
+    def test_a_server_never_holds_the_tab(self):
+        # `npm run dev` stays RUNNING for as long as it serves: not work the
+        # turn waits on (agent-bg-pending's server rule), so the hold drains.
+        for cmd in ("cd /work/app && PORT=3000 npm run dev", "npx vite", "python3 -m http.server 8000",
+                    "tail -f build.log"):
+            with self.subTest(cmd=cmd):
+                self.setup_agy("running", "done", [(101, 2, agy_payload("run_command", "Run server", cmd))])
+                self.run_ticks(4)
+                self.assertEqual(self.opts()["@agent_state"], "idle", cmd)
+                self.f.close()
+        # A build is work: held.
+        self.setup_agy("running", "done", [(101, 2, agy_payload("run_command", "Run build", "npm run build"))])
+        self.run_ticks(4)
+        self.assertEqual(self.opts()["@agent_state"], "running")
+
+    def test_a_held_stop_is_bounded(self):
+        # The backstop: held at most AGY_HOLD_MAX s (an hour; 2 s here) from
+        # the first tick that saw it held, whatever still reads RUNNING.
+        self.setup_agy("running", "done", [(101, 2, agy_payload("run_command", "Run soak", "./soak-test.sh"))])
+        self.run_ticks(7, AGENT_TAB_AGY_HOLD_MAX="2")
+        self.assertEqual(self.opts()["@agent_state"], "idle")
+
+    def test_a_still_store_costs_one_read(self):
+        # Cached until the db or its -wal moves; a failed read too.
+        self.setup_agy("running", "run", [(101, 9, agy_payload("run_command", "Run uv sync"))])
+        self.assertEqual(self.sqlite_forks(4), 1)
+        self.f.close()
+        self.setup_agy("running", "run", [(101, 9, agy_payload("run_command", "Run uv sync"))])
+        self.conn.close()
+        (self.f.home / ".gemini/antigravity-cli/conversations" / (self.CID + ".db-shm")).unlink(missing_ok=True)
+        self.db.write_bytes(b"not a database")
+        self.assertEqual(self.sqlite_forks(4), 1)
+
+    def test_a_plain_turn_is_never_ended_from_the_store(self):
+        # Between model calls every step may read DONE: agy's own Stop ends
+        # a turn, never this.
+        self.setup_agy("running", "run", [(15, 3, agy_payload("view_file", "View notes.md"))])
+        self.run_ticks(5)
+        self.assertEqual(self.opts()["@agent_state"], "running")
+
+    def test_a_db_outside_gemini_is_never_read(self):
+        self.setup_agy("running", "run", [(101, 9, agy_payload("run_command", "Run uv sync"))])
+        st = self.f.read()
+        other = self.f.dir / "conversations" / (self.CID + ".db")
+        other.parent.mkdir()
+        import shutil
+        shutil.copy(self.db, other)
+        st["windows"]["@1"]["opts"]["@agent_record"] = str(other)
+        self.f.state.write_text(json.dumps(st))
+        self.run_ticks(3)
+        self.assertEqual(self.opts()["@agent_state"], "running")
 
 
 if __name__ == "__main__":
