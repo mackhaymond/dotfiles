@@ -129,6 +129,14 @@ resolve_session_bases() {
     # an ASCII letter or digit ('/', '.', '_', ...) becomes '-'.
     proj="${cwd//[^A-Za-z0-9]/-}"
     SESSION_PROJ="$HOME/.claude/projects/$proj"
+    # ABBY (~/.local/bin/abby: Claude Code on abliteration.ai, its own
+    # CLAUDE_CONFIG_DIR=~/.claude-abby) keeps its transcripts in
+    # ~/.claude-abby/projects/<proj>/ while sessions/ stays shared, so a
+    # session whose transcript is only there is read from there. [ -e ]
+    # tests only: this runs on every tick.
+    if [ ! -e "$SESSION_PROJ/$sid.jsonl" ] && [ -e "$HOME/.claude-abby/projects/$proj/$sid.jsonl" ]; then
+        SESSION_PROJ="$HOME/.claude-abby/projects/$proj"
+    fi
     SESSION_BASES=("$sid")
 }
 
