@@ -39,15 +39,17 @@ a message behind its dialog.
 
 THE AGENT PANE in a window is the one tmux-mcp itself knows as an agent: a
 live claude-<pid>.json / codex-<pid>.json / opencode-<pid>.json /
-grok-<pid>.json record in tmux-assistant-resurrect's dir whose env.tmux_pane
-names it (the same lookup as tmux-mcp's readAgents, same dir search order; an
-opencode or grok record counts only for the interactive TUI, never `opencode
-serve`, `attach` or a headless `grok -p`).
+grok-<pid>.json / copilot-<pid>.json / agy-<pid>.json record in
+tmux-assistant-resurrect's dir whose env.tmux_pane names it (the same lookup
+as tmux-mcp's readAgents, same dir search order; an opencode, grok, copilot or
+agy record counts only for the interactive TUI, never `opencode serve`,
+`attach`, a headless `grok -p`, `copilot -p` or `agy --print`).
 message_agent refuses any pane without one, so picking by anything else would
 only pick panes that cannot be reached. A window with no record falls back to
 the pane whose command looks like an agent (claude, codex, Claude's
-version-named binary, or opencode / grok in a window marked @agent_kind
-opencode / grok, which tmux-mcp also accepts without a record); other such deliveries will most
+version-named binary, or opencode / grok / copilot / agy in a window marked
+@agent_kind opencode / grok / copilot / agy, which tmux-mcp also accepts
+without a record); other such deliveries will most
 likely be refused and are reported as failures, never dropped silently.
 
 Pausing an OpenCode agent is the same text message as for the others, typed
@@ -139,7 +141,12 @@ EXCLUDE = {"agents", "tasks", "stash", "scratch", "btop-popup"}
 # same there).
 GROK_CMD = re.compile(r"^grok(-(macos|linux|windows)-.*)?$")
 GROK_PROG = re.compile(r"^grok(-(macos|linux|windows)-[a-z0-9_]+)?$")   # argv0 basename, uncut
-AGENT_CMD = re.compile(r"^(claude|codex|opencode|[0-9]+\.[0-9]+\.[0-9]+)$|" + GROK_CMD.pattern)
+# GitHub Copilot CLI (`copilot`) and Antigravity CLI (`agy`): their comms are
+# their names, and like opencode/grok they count only in a window marked with
+# their kind (`copilot -p`, `agy --print` share the comm).
+AGENT_CMD = re.compile(r"^(claude|codex|opencode|copilot|agy|[0-9]+\.[0-9]+\.[0-9]+)$|" + GROK_CMD.pattern)
+# The kinds whose comm alone does not prove an agent (pick_agent_pane).
+MARKED_KINDS = ("opencode", "grok", "copilot", "agy")
 
 # opencode_tui_args in agent-tab-watcher.sh, ported: is this opencode command
 # line the interactive TUI? The first bare word after the program decides;
@@ -217,6 +224,63 @@ def grok_tui_args(args, recorded=False):
     return recorded or first not in GROK_NOT_TUI
 
 
+# copilot_tui_args / agy_tui_args in agent-tab-watcher.sh, ported: is this
+# `ps -o args` line the CLI's interactive TUI? -i/--interactive (copilot),
+# -i/--prompt-interactive (agy) and `--` end the scan as the TUI (ps lost the
+# quoting of the prompt after them); a headless flag, help or version, or a
+# first bare word naming a subcommand is not. Options in *_VALUE_OPTS skip
+# their value. agy's are Go flags: one dash or two.
+COPILOT_VALUE_OPTS = {"--model", "--reasoning-effort", "--context", "--auto-tier", "--agent", "-n", "--name",
+                      "--session-id", "-C", "--log-dir", "--extension-sdk-path", "--log-level", "--stream",
+                      "--output-format", "--add-dir", "--allow-tool", "--deny-tool", "--available-tools",
+                      "--excluded-tools", "--additional-mcp-config", "--config-dir", "--mode"}
+COPILOT_NOT_TUI = {"app", "login", "help", "init", "config", "update", "version", "workflow", "sessions",
+                   "memories", "plugin", "mcp", "skill", "instruction", "lsp", "sandbox", "completion"}
+AGY_VALUE_OPTS = {d + o for d in ("-", "--") for o in (
+    "add-dir", "agent", "conversation", "effort", "input-format", "json-schema", "log-file", "mode", "model",
+    "output-format", "print-timeout", "project", "settings")}
+AGY_NOT_TUI = {"acp", "agent", "agents", "changelog", "help", "install", "mcp", "mic-serve", "models", "plugin",
+               "plugins", "remote-control", "update"}
+
+
+def copilot_tui_args(args):
+    a = args.split()
+    i = 1
+    while i < len(a):
+        w = a[i]
+        if w == "--" or w in ("-i", "--interactive") or w.startswith(("-i=", "--interactive=")):
+            return True
+        if w.startswith("-p") or w in ("--prompt", "-h", "--help", "-v", "--version") or w.startswith("--prompt="):
+            return False
+        if w in COPILOT_VALUE_OPTS:
+            i += 2
+        elif w.startswith("-"):
+            i += 1
+        else:
+            return w not in COPILOT_NOT_TUI
+    return True
+
+
+def agy_tui_args(args):
+    a = args.split()
+    i = 1
+    while i < len(a):
+        w = a[i]
+        name = w.split("=", 1)[0]
+        if w == "--" or name in ("-i", "-prompt-interactive", "--prompt-interactive"):
+            return True
+        if name in ("-p", "-print", "--print", "-prompt", "--prompt") \
+                or w in ("-h", "-help", "--help", "-version", "--version"):
+            return False
+        if w in AGY_VALUE_OPTS:
+            i += 2
+        elif w.startswith("-"):
+            i += 1
+        else:
+            return w not in AGY_NOT_TUI
+    return True
+
+
 def proc_args(pid):
     """`ps -o args=` for one pid, "" when it can't be read."""
     try:
@@ -230,7 +294,7 @@ def cmd_kind(cmd):
     """The agent kind a pane_current_command (an AGENT_CMD match) names."""
     if GROK_CMD.match(cmd):
         return "grok"
-    return cmd if cmd in ("codex", "opencode") else "claude"
+    return cmd if cmd in ("codex", "opencode", "copilot", "agy") else "claude"
 US = "\x1f"
 # @agent_summary is free text, so it goes LAST and the split is bounded.
 # @agent_limit is "<resets_at> <type> <since>" (RATE LIMITS): no separator in it.
@@ -432,7 +496,7 @@ def agent_records():
     except OSError:
         return out
     for name in names:
-        m = re.match(r"^(claude|codex|opencode|grok)-(\d+)\.json$", name)
+        m = re.match(r"^(claude|codex|opencode|grok|copilot|agy)-(\d+)\.json$", name)
         if not m:
             continue
         kind, pid = m.group(1), int(m.group(2))
@@ -477,6 +541,13 @@ def agent_records():
         elif kind == "grok":
             args = proc_args(pid) if args is None else args
             if args and not grok_tui_args(args, recorded=True):
+                continue
+        elif kind in ("copilot", "agy"):
+            # copilot-agy-session-track.sh writes for the TUI alone; the argv
+            # is checked again in case the pid was reused.
+            args = proc_args(pid)
+            prog = os.path.basename(args.split()[0]) if args else kind
+            if prog != kind or (args and not (copilot_tui_args if kind == "copilot" else agy_tui_args)(args)):
                 continue
         rec = {"kind": kind, "pid": pid, "session_id": sid, "stamp": stamp(j.get("timestamp"))}
         if kind == "claude":
@@ -536,7 +607,7 @@ def pick_agent_pane(rows, recs):
                                      r["pane_active"] != "1"))
         return with_rec[0], "record"
     cmd = [r for r in rows if AGENT_CMD.match(r["pane_current_command"])
-           and (cmd_kind(r["pane_current_command"]) not in ("opencode", "grok")
+           and (cmd_kind(r["pane_current_command"]) not in MARKED_KINDS
                 or cmd_kind(r["pane_current_command"]) == kind)]
     cmd.sort(key=lambda r: (cmd_kind(r["pane_current_command"]) != kind if kind else False,
                             r["pane_active"] != "1"))
@@ -1512,16 +1583,31 @@ def resolves(host):
     return bool(box)
 
 
+# The kinds whose limits are no Claude account's (their own type, set by the
+# indicator's kind_limit): no cswap account is ever stored on them, and their
+# wake check asks their own provider's host.
+OWN_LIMIT_KINDS = ("grok", "copilot", "agy")
+LIMIT_HOSTS = {"grok": "api.x.ai", "copilot": "api.githubcopilot.com", "agy": "cloudcode-pa.googleapis.com",
+               "codex": "chatgpt.com"}
+
+
+def own_limit(t):
+    """A target whose limit no Claude account holds (grok, copilot, agy, by
+    kind or by limit type). Pure."""
+    return any(k in (t.get("type"), t.get("kind")) for k in OWN_LIMIT_KINDS)
+
+
 def limit_host(t):
-    if "grok" in (t.get("type"), t.get("kind")):
-        return "api.x.ai"
-    return "chatgpt.com" if "codex" in (t.get("type"), t.get("kind")) else "api.anthropic.com"
+    for k in (*OWN_LIMIT_KINDS, "codex"):
+        if k in (t.get("type"), t.get("kind")):
+            return LIMIT_HOSTS[k]
+    return "api.anthropic.com"
 
 
 def cswap_blind(t):
-    """A target no cswap switch can free: codex, or grok (cswap swaps Claude
-    accounts only). Pure."""
-    return t.get("type") == "codex" or "grok" in (t.get("type"), t.get("kind"))
+    """A target no cswap switch can free: codex, grok, copilot or agy (cswap
+    swaps Claude accounts only). Pure."""
+    return t.get("type") == "codex" or any(k in (t.get("type"), t.get("kind")) for k in ("grok", "copilot", "agy"))
 
 
 def parse_limit(v):
@@ -2142,10 +2228,10 @@ def limit_merge(d, t, account):
     renewing its limit (limit_renew). Any other entry for the same window or
     session is pruned: its episode has ended, this mark replaced it. An entry
     whose window now runs ANOTHER session starts over as a new target.
-    A grok target never carries a cswap account: it is Claude's, and no
-    switch frees a grok limit (cswap_blind).
+    A grok, copilot or agy target never carries a cswap account: those are
+    Claude's, and no switch frees their limits (own_limit, cswap_blind).
     -> (the stored target, renewed?)."""
-    if t.get("kind") == "grok":
+    if own_limit(t):
         account = None
     sid = t["session_id"]
     matches = [o for o in d["targets"]
@@ -2157,12 +2243,12 @@ def limit_merge(d, t, account):
         old = None
     d["targets"] = [o for o in d["targets"] if id(o) not in gone]
     if old is None:
-        t = dict(t, attempts=0) if t.get("kind") == "grok" else dict(t, account=account, attempts=0)
+        t = dict(t, attempts=0) if own_limit(t) else dict(t, account=account, attempts=0)
         d["targets"].append(t)
         return t, True
     lim = (t.pop("resets_at"), t.pop("type"), t.pop("since"))
     old.update(t)   # where it lives now
-    if old.get("kind") == "grok":
+    if own_limit(old):
         old.pop("account", None)
     return old, limit_renew(old, *lim, account)
 
@@ -2173,11 +2259,11 @@ def limit_sync(t, row, usage, sw):
     the flag stamp both read it). The stored account stays: it is the one
     the limit was hit on. Only a target that has none gets one, judged for
     the live mark as limit-add would (limit_account: never the slot it
-    ruled out; never for a grok one: limit_merge). -> renewed?"""
+    ruled out; never for a grok, copilot or agy one: limit_merge). -> renewed?"""
     lim = parse_limit(row["agent_limit"]) if row else None
     if not lim or (lim[0], lim[1], lim[2]) == (t.get("resets_at"), t.get("type"), t.get("since")):
         return False
-    keep = t.get("account") or t.get("kind") == "grok"
+    keep = t.get("account") or own_limit(t)
     account = None if keep else limit_account(dict(t, resets_at=lim[0], type=lim[1], since=lim[2]), usage, sw)
     renewed = limit_renew(t, lim[0], lim[1], lim[2], account)
     if renewed and row["agent_limit_lifted"]:

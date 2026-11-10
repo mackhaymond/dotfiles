@@ -44,7 +44,8 @@
 # the original command line. That is the same code that resumes these sessions
 # after a reboot, so a reopened tab comes back exactly the way a resurrected
 # one does. Grok, which the plugin does not know, is handled here the way
-# assistant-save.sh's grok post-pass handles it (grok_* below).
+# assistant-save.sh's grok post-pass handles it (grok_* below); GitHub Copilot
+# CLI and Antigravity CLI (agy) the way its ca_rows does (ca_* below).
 #
 # A reopened tab is a normal login zsh with the agent started through
 # ZSH_AUTOSTART (see the end of .zshrc), same as a CMD+R tab: quitting the
@@ -257,6 +258,46 @@ is_grok() {
     esac
 }
 
+# GitHub Copilot CLI and Antigravity CLI (agy). ca_kind <args>: `copilot` or
+# `agy` when the command line is that CLI's TUI (argv0 basename; the watcher's
+# copilot_tui_args / agy_tui_args, line for line: -p/--prompt/--print, help,
+# version and the utility subcommands are not), else nothing.
+COPILOT_HOME="${COPILOT_HOME:-$HOME/.copilot}"
+AGY_HOME="$HOME/.gemini/antigravity-cli"
+ca_kind() {
+    local -a a
+    local i=1 w k
+    read -r -a a <<<"$1"
+    [ "${#a[@]}" -gt 0 ] || return 0
+    k="${a[0]##*/}"
+    case "$k" in copilot|agy) ;; *) return 0 ;; esac
+    while [ "$i" -lt "${#a[@]}" ]; do
+        w="${a[i]}"
+        if [ "$k" = copilot ]; then
+            case "$w" in
+            --|-i|-i=*|--interactive|--interactive=*) break ;;
+            -p*|--prompt|--prompt=*|-h|--help|-v|--version) return 0 ;;
+            --model|--reasoning-effort|--context|--auto-tier|--agent|-n|--name|--session-id|-C|--log-dir|--extension-sdk-path|--log-level|--stream|--output-format|--add-dir|--allow-tool|--deny-tool|--available-tools|--excluded-tools|--additional-mcp-config|--config-dir|--mode)
+                i=$((i + 2)); continue ;;
+            -*) i=$((i + 1)); continue ;;
+            app|login|help|init|config|update|version|workflow|sessions|memories|plugin|mcp|skill|instruction|lsp|sandbox|completion) return 0 ;;
+            *) break ;;
+            esac
+        else
+            case "$w" in
+            --|-i|-i=*|-prompt-interactive|-prompt-interactive=*|--prompt-interactive|--prompt-interactive=*) break ;;
+            -p|-p=*|-print|-print=*|--print|--print=*|-prompt|-prompt=*|--prompt|--prompt=*|-h|-help|--help|-version|--version) return 0 ;;
+            -add-dir|--add-dir|-agent|--agent|-conversation|--conversation|-effort|--effort|-input-format|--input-format|-json-schema|--json-schema|-log-file|--log-file|-mode|--mode|-model|--model|-output-format|--output-format|-print-timeout|--print-timeout|-project|--project|-settings|--settings)
+                i=$((i + 2)); continue ;;
+            -*) i=$((i + 1)); continue ;;
+            acp|agent|agents|changelog|help|install|mcp|mic-serve|models|plugin|plugins|remote-control|update) return 0 ;;
+            *) break ;;
+            esac
+        fi
+    done
+    printf '%s' "$k"
+}
+
 # The part of the agent lookup that needs the agent ALIVE, kept as small as
 # possible because the tab stays on screen until it's done: find the agent
 # process and copy its state file somewhere safe (claude deletes its own as it
@@ -282,7 +323,9 @@ agent_snapshot() {
         local apid="" args="" tool="" p a
         while IFS=$'\x1f' read -r p a; do
             if is_grok "$a" "$p"; then tool=grok
-            else tool=$(detect_tool "$a")
+            else
+                tool=$(ca_kind "$a")
+                [ -n "$tool" ] || tool=$(detect_tool "$a")
             fi
             if [ -n "$tool" ]; then apid=$p args=$a; break; fi
         done < <(awk -v root="$pane_pid" '
@@ -303,6 +346,28 @@ agent_snapshot() {
         # Grok drops its active_sessions.json entry as it exits, and that
         # entry is where its current session id lives (/new, /resume).
         [ "$tool" = grok ] && cp "$GROK_HOME/active_sessions.json" "$copy/grok-active.json" 2>/dev/null
+        # Copilot's own lock for this CLI (any copilot pid on the tty: the
+        # Homebrew one can run under a supervisor of the same name), and agy's
+        # open conversation lock: both only while the CLI lives, and only
+        # when it has no record (which ca_session would read first anyway).
+        if [ -f "$copy/$tool-$apid.json" ]; then
+            :
+        elif [ "$tool" = copilot ]; then
+            local pids f q
+            pids=" $(awk '{ a = $3; sub(/.*\//, "", a); if (a == "copilot") printf "%s ", $1 }' <<<"$snap")"
+            for f in "$COPILOT_HOME"/session-state/*/inuse.*.lock; do
+                [ -e "$f" ] || continue
+                q="${f##*/inuse.}"
+                q="${q%.lock}"
+                [[ "$pids" == *" $q "* ]] || continue
+                f="${f%/inuse.*}"
+                printf '%s\n' "${f##*/}" >"$copy/copilot-lock"
+                break
+            done
+        elif [ "$tool" = agy ]; then
+            lsof -a -p "$apid" -Fn 2>/dev/null \
+                | sed -n 's#^n.*/antigravity-cli/presence/\([0-9A-Fa-f-]*\)\.lock$#\1#p' | head -n 1 >"$copy/agy-presence"
+        fi
         printf '%s\x1f%s\x1f%s\x1f%s\n' "$tool" "$apid" "$args" "$copy"
     )
 }
@@ -316,6 +381,10 @@ agent_session() {
     local tool="$1" apid="$2" args="$3" cwd="$4" state="${5:-}"
     if [ "$tool" = grok ]; then
         grok_session "$apid" "$args" "${state:-}"
+        return 0
+    fi
+    if [ "$tool" = copilot ] || [ "$tool" = agy ]; then
+        ca_session "$tool" "$apid" "$args" "${state:-}"
         return 0
     fi
     [ -r "$RESURRECT_SAVE" ] || return 0
@@ -372,6 +441,50 @@ grok_session() {
         | join("\u001f")' 2>/dev/null
 }
 
+# A Copilot / agy session, the way assistant-save.sh's ca_rows resolves it: the
+# <kind>-<pid>.json record copilot-agy-session-track.sh keeps, else the CLI's
+# own lock agent_snapshot read (copilot's inuse.<pid>.lock, agy's open
+# presence/<id>.lock), else a UUID given to --resume/-r/--session-id (copilot)
+# or --conversation (agy). From the snapshot's copies when the state dir is
+# given, the live files otherwise (no lock then). Same five fields as
+# grok_session; cwd from the record, else copilot's workspace.yaml.
+ca_session() {
+    local kind="$1" apid="$2" args="$3" state="${4:-}" rec lock=""
+    if [ -n "$state" ]; then
+        rec="$state/$kind-$apid.json"
+        [ "$kind" = copilot ] && lock="$state/copilot-lock"
+        [ "$kind" = agy ] && lock="$state/agy-presence"
+    else
+        rec="$ASSISTANT_STATE_DIR/$kind-$apid.json"
+    fi
+    [ -s "$rec" ] || rec=/dev/null
+    local lsid=""
+    [ -n "$lock" ] && [ -s "$lock" ] && IFS= read -r lsid <"$lock"
+    jq -rn --arg kind "$kind" --arg args "$args" --arg lsid "$lsid" --slurpfile rec "$rec" '
+        def uuid: test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
+        ($args | [splits("[ \t]+")] | map(select(length > 0))) as $w
+        | (if $kind == "copilot" then "^(-r|--resume|--session-id)$" else "^--?conversation$" end) as $f
+        | (if $kind == "copilot" then "^(--resume|--session-id)=" else "^--?conversation=" end) as $g
+        | ([range(0; $w | length) as $i
+            | if ($w[$i] | test($f)) then ($w[$i + 1] // "")
+              elif ($w[$i] | test($g)) then ($w[$i] | sub("^[^=]*="; ""))
+              else empty end
+            | select(uuid)] | last // "") as $argsid
+        | ($rec[0] // {} | if type == "object" then . else {} end) as $r
+        | ([$r.session_id, $lsid, $argsid] | map(select(type == "string" and . != "")) | first // "") as $sid
+        | select($sid != "")
+        | [$sid, ($w[1:] | join(" ")), "", ($r.env // {} | tojson), ($r.cwd // "")]
+        | join("\u001f")' 2>/dev/null | {
+        # copilot: the session's own cwd when the record had none.
+        IFS=$'\x1f' read -r s a m e c || exit 0
+        if [ -z "$c" ] && [ "$kind" = copilot ] && [ -f "$COPILOT_HOME/session-state/$s/workspace.yaml" ]; then
+            c=$(sed -n 's/^cwd: //p' "$COPILOT_HOME/session-state/$s/workspace.yaml" | head -n 1)
+            c="${c#\'}"; c="${c%\'}"
+        fi
+        printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$s" "$a" "$m" "$e" "$c"
+    }
+}
+
 # grok_cmd: the grok to resume with. The installer links ~/.grok/bin/grok and
 # puts nothing on PATH, so that link wins when it exists.
 grok_cmd() {
@@ -390,6 +503,31 @@ build_cmd() {
     words=($cli_args)
     set +f
     n=${#words[@]}
+    # Copilot: its options minus what would fight the `--resume <sid>` added
+    # below (-r/--resume, --connect, --session-id, -n/--name, -C, --continue,
+    # --fleet, --attachment, with their values); -i (a launch prompt) and `--`
+    # end it all. Copilot takes no positional argument, so a bare word is the
+    # value of the option before it and goes with it; an option any of whose
+    # words has unbalanced parentheses (a quoted value ps split: `shell(git` `push)`)
+    # is dropped whole. Option by option (a group is its option and the bare
+    # words after it), the same rules as copilotcut in assistant-restore.sh.
+    if [ "$tool" = copilot ]; then
+        local g="" gdrop=0 o c
+        for a in "${words[@]+"${words[@]}"}" $'\x1f'; do
+            if [ "$a" = $'\x1f' ] || [[ "$a" == -* ]]; then
+                [ "$gdrop" = 0 ] && q_args+="$g"
+                g="" gdrop=0
+                case "$a" in
+                $'\x1f'|--|-i|-i=*|--interactive|--interactive=*) break ;;
+                -r|--resume|--connect|--session-id|-n|--name|-C|--continue|--fleet|--attachment|--resume=*|--connect=*|--session-id=*|--name=*|--attachment=*|-C?*) gdrop=1 ;;
+                esac
+            fi
+            o="${a//[^(]/}"; c="${a//[^)]/}"
+            [ "${#o}" = "${#c}" ] || gdrop=1
+            g+=" $(posix_quote "$a")"
+        done
+        n=0
+    fi
     while [ "$i" -lt "$n" ]; do
         a=${words[i]}
         i=$((i + 1))
@@ -473,6 +611,23 @@ build_cmd() {
                 fi ;;
             esac
         fi
+        # agy: its leading options (Go flags) minus --conversation and its
+        # value, -c/--continue and --new-project; -i/--prompt-interactive,
+        # `--` and the first bare word (a positional prompt) end it all. Same
+        # rules as agycut in assistant-restore.sh.
+        if [ "$tool" = agy ]; then
+            case "$a" in
+            --|[!-]*|-i|-i=*|-prompt-interactive|-prompt-interactive=*|--prompt-interactive|--prompt-interactive=*) break ;;
+            -conversation|--conversation) i=$((i + 1)); continue ;;
+            -conversation=*|--conversation=*|-c|-c=*|-continue|-continue=*|--continue|--continue=*|-new-project|-new-project=*|--new-project|--new-project=*) continue ;;
+            -add-dir|--add-dir|-agent|--agent|-effort|--effort|-input-format|--input-format|-json-schema|--json-schema|-log-file|--log-file|-mode|--mode|-model|--model|-output-format|--output-format|-print-timeout|--print-timeout|-project|--project|-settings|--settings)
+                if [ "$i" -lt "$n" ]; then
+                    q_args+=" $(posix_quote "$a") $(posix_quote "${words[i]}")"
+                    i=$((i + 1))
+                    continue
+                fi ;;
+            esac
+        fi
         q_args+=" $(posix_quote "$a")"
     done
     # Only the variables @assistant-resurrect-capture-env lists, as a prefix.
@@ -496,6 +651,8 @@ build_cmd() {
         [ -x "$HOME/.local/bin/codex" ] && codex=$(posix_quote "$HOME/.local/bin/codex")
         echo "${env_prefix}${codex}${q_args} resume $(posix_quote "$sid")" ;;
     grok) echo "${env_prefix}$(grok_cmd)${q_args} -r $(posix_quote "$sid")" ;;
+    copilot) echo "${env_prefix}command copilot${q_args} --resume $(posix_quote "$sid")" ;;
+    agy) echo "${env_prefix}command agy${q_args} --conversation $(posix_quote "$sid")" ;;
     esac
 }
 
@@ -812,6 +969,28 @@ transcript_digest() {
             f=$(ls "$GROK_HOME"/sessions/*/"$sid"/summary.json 2>/dev/null | head -n 1)
             [ -r "$f" ] && jq -r '(.generated_title // .session_summary // empty) | "TITLE: \(.)"' "$f" 2>/dev/null
         fi ;;
+    copilot)
+        # ~/.copilot/session-state/<sid>/events.jsonl: user.message and
+        # assistant.message (its content, and its toolRequests).
+        f="$COPILOT_HOME/session-state/$sid/events.jsonl"
+        [ -r "$f" ] || return 0
+        jq -r 'if .type == "user.message" then "USER: \(.data.content // "" | tostring | .[0:800])"
+            elif .type == "assistant.message" then
+              ((.data.content // "" | tostring | select(test("\\S")) | "ASSISTANT: \(.[0:800])"),
+               (.data.toolRequests // [] | .[] | "  [\(.name // "?")] \(.arguments // "" | tostring | .[0:160])"))
+            else empty end' "$f" 2>/dev/null ;;
+    agy)
+        # The conversation's transcript.jsonl: USER_INPUT (the text inside its
+        # <USER_REQUEST>) and PLANNER_RESPONSE steps.
+        f="$AGY_HOME/brain/$sid/.system_generated/logs/transcript.jsonl"
+        [ -r "$f" ] || return 0
+        jq -r 'if .type == "USER_INPUT" then
+              (.content // "" | tostring | sub("^\\s*<USER_REQUEST>\\s*"; "")
+               | sub("\\s*</USER_REQUEST>[\\s\\S]*$"; "") | sub("\\s*<ADDITIONAL_METADATA>[\\s\\S]*$"; "")
+               | "USER: \(.[0:800])")
+            elif .type == "PLANNER_RESPONSE" then
+              (.content // "" | tostring | select(test("\\S")) | "ASSISTANT: \(.[0:800])")
+            else empty end' "$f" 2>/dev/null ;;
     esac
 }
 
@@ -963,14 +1142,14 @@ reopen_one() {
     fi
     local -a autostart=() birth=()
     [ -n "$cmd" ] && autostart=(-e "ZSH_AUTOSTART=$cmd")
-    # A claude/codex/opencode/grok tab comes back AS an agent, in the new-window's own
+    # A claude/codex/opencode/grok/copilot/agy tab comes back AS an agent, in the new-window's own
     # command list (agent-birth.conf; guarded, so a server without
     # @agent_birth still reopens it), wearing the name it had when it closed
     # until the resumed session's hooks retitle it. The name is a set-option
     # argument: one ending in ';' would end the command list, and one starting
     # with '-' would read as a flag, so those are trimmed / skipped.
     case "$tool" in
-    claude|codex|opencode|grok)
+    claude|codex|opencode|grok|copilot|agy)
         if [ -n "$cmd" ]; then
             birth=(\; run-shell -C "#{?@agent_birth,#{@agent_birth} $tool,}")
             label="${label%"${label##*[!; ]}"}"

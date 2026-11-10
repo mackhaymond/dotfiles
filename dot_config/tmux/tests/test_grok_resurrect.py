@@ -197,7 +197,9 @@ class SaveGrokRows(unittest.TestCase):
         (self.root / "panes.out").write_text("".join(f"{t}{us}{p}{us}{c}\n" for t, p, c in PANES))
         (bin_ / "tmux").write_text(
             f"#!/bin/sh\ncase \"$1\" in list-panes) cat '{self.root}/panes.out' ;; esac\nexit 0\n")
-        for f in ("ps", "tmux"):
+        # No copilot / agy here (assistant-save.sh's ca_rows asks pgrep first).
+        (bin_ / "pgrep").write_text("#!/bin/sh\nexit 1\n")
+        for f in ("ps", "tmux", "pgrep"):
             (bin_ / f).chmod(0o755)
         (self.root / "home/.grok").mkdir(parents=True)
         self.upstream = [dict(pane="main:9.0", tool="claude", session_id="c-9", pid="900"),

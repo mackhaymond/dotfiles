@@ -55,7 +55,17 @@ opencode` / `grok`, which tmux-mcp also accepts without a record). Grok's
 `pane_current_command` is its p_comm cut to 15 (`grok-macos-aarc`), so that
 match is a prefix past the platform word (`GROK_CMD`); like opencode it
 counts only in a grok window, because `grok -p` and `grok sessions` look the
-same there. The other fallback deliveries
+same there. **Copilot and agy** (2026-11-10): a `copilot-<pid>.json` /
+`agy-<pid>.json` record (copilot-agy-session-track.sh; resurrect-cadence.md
+"Copilot and agy sessions") counts when its pid is that CLI's TUI
+(`copilot_tui_args` / `agy_tui_args`, the watcher's rule, ported); without
+one (Copilot files its session only at the first prompt) a `copilot` /
+`agy` pane is the command fallback in a window marked with that kind only
+(`copilot -p`, `agy --print` share the comm; `MARKED_KINDS`). tmux-mcp
+accepts both the same way, and its draft guard reads their prompt boxes, so
+PAUSE/RESUME land as a bracketed paste like the others'. They never carry a
+rate-limit mark (usage limits there are a plain `failed`), and `cswap_blind`
+counts them out of any account switch. The other fallback deliveries
 will probably be refused, and they show up as failures. Pausing an OpenCode
 agent is the same text message as for the others, with no signal sent. A working window with
 neither is reported as "no agent pane", on the key's message line and in

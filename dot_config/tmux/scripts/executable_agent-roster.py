@@ -357,7 +357,12 @@ CAT_HUE = {"failed": "red", "needs-input": "yellow", "done": "green", "working":
            "idle": "overlay"}
 # opencode: nf-oct-terminal (U+F489), one cell like the others (agent-ui
 # model.rs kind_glyph uses the same codepoint). grok: ✦ (U+2726), likewise.
-KIND_GLYPH = {"claude": "✳", "codex": "⬢", "grok": "✦", "opencode":""}
+# copilot / agy: their AgentMarks logos (U+10C108 / U+10C118, agent-ui
+# model.rs HARNESSES; one cell through WezTerm's fallback font).
+KIND_GLYPH = {"claude": "✳", "codex": "⬢", "grok": "✦", "opencode":"", "copilot": "\U0010C108",
+              "agy": "\U0010C118"}
+# The kinds whose comm alone does not prove an agent (pick_agent_pane).
+MARKED_KINDS = ("opencode", "grok", "copilot", "agy")
 DETAIL_WORD = {"perm": "perm", "ask": "asks", "fail": "fail", "done": "done", "run": "run", "limit": "limit"}
 STATE_WORDS = {"failed": "failed", "needs-input": "waiting on you", "done": "done", "paused": "paused"}
 STRIP_GEAR, STRIP_MOUSE = "⚙", "◎"
@@ -866,16 +871,17 @@ def snapshot():
 
 def is_agent_comm(comm):
     base = comm.rsplit("/", 1)[-1]
-    return (base in ("claude", "codex", "opencode") or bool(AGENT_VERSION.match(base))
+    return (base in ("claude", "codex", "opencode", "copilot", "agy") or bool(AGENT_VERSION.match(base))
             or bool(GROK_COMM.match(base)))
 
 
 def comm_kind(comm):
-    """The @agent_kind an is_agent_comm comm names: codex, opencode, grok, else claude."""
+    """The @agent_kind an is_agent_comm comm names: codex, opencode, grok,
+    copilot, agy, else claude."""
     base = comm.rsplit("/", 1)[-1]
     if GROK_COMM.match(base):
         return "grok"
-    return base if base in ("codex", "opencode") else "claude"
+    return base if base in ("codex", "opencode", "copilot", "agy") else "claude"
 
 
 PANE_GONE = "that window is gone"
@@ -894,7 +900,8 @@ def pick_agent_pane(panes_text, ps_text, kind=""):
     active pane then closed the user's shell instead of the agent. An
     `opencode` comm counts only when kind is opencode (`opencode serve` in a
     split beside a claude must not be what `x` closes), a `grok` one only
-    when kind is grok (`grok -p`, `grok sessions` alike), and among several
+    when kind is grok (`grok -p`, `grok sessions` alike), a `copilot` or
+    `agy` one only in a window of that kind, and among several
     agent panes the one whose comm matches kind wins before the active one.
     A split window where no pane (or more than one, none of them active)
     runs an agent is refused rather than guessed at."""
@@ -908,7 +915,7 @@ def pick_agent_pane(panes_text, ps_text, kind=""):
         parts = l.strip().split(None, 1)
         if len(parts) == 2 and parts[0] != "??" and is_agent_comm(parts[1].strip()):
             k = comm_kind(parts[1].strip())
-            if k in ("opencode", "grok") and kind != k:
+            if k in MARKED_KINDS and kind != k:
                 continue
             agent_ttys.setdefault(parts[0], set()).add(k)
     hits = [(pid, active, agent_ttys[tt]) for pid, t, active in rows

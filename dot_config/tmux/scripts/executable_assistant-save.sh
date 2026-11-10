@@ -263,6 +263,203 @@ grok_rows() {
 }
 grok_rows
 
+# Copilot and agy rows (2026-11-10), in upstream's shape, the way grok_rows
+# adds Grok's: one per pane running a GitHub Copilot CLI or Antigravity CLI
+# TUI (argv0 basename `copilot` / `agy`; the watcher's copilot_tui_args /
+# agy_tui_args below, so `copilot -p`, `agy --print`, `copilot sessions`,
+# `agy models` … are not agents). The first such process in the pane's tree
+# wins (BFS, so the outermost). Session id, first found:
+#   1. the <kind>-<pid>.json record copilot-agy-session-track.sh keeps (pid =
+#      that process or one of its descendants: Homebrew's copilot can run the
+#      CLI under a supervisor of the same name);
+#   2. copilot: Copilot's own `~/.copilot/session-state/<sid>/inuse.<pid>.lock`
+#      for one of those pids (held from startup; Copilot fires sessionStart
+#      only at the first prompt, so this is what knows a fresh or resumed TUI);
+#      agy: the conversation lock it holds open,
+#      `~/.gemini/antigravity-cli/presence/<id>.lock` (one lsof, only for an
+#      agy with no record);
+#   3. a UUID given to `--resume`/`-r`/`--session-id` (copilot) or
+#      `--conversation` (agy).
+# cwd: the record's, else (copilot) the session's workspace.yaml `cwd:`, else
+# the pane's. cli_args is argv minus argv0; assistant-restore.sh keeps only the
+# options that can ride along a resume. The pane-takeover rule is grok_rows':
+# a row replaces an upstream row only when that row's process is ours or one
+# of its descendants. Costs no ps at all when neither CLI runs: no live
+# record and one `pgrep -x`; a record whose pid is gone is deleted here.
+ca_rows() {
+	local cop_home="${COPILOT_HOME:-$HOME/.copilot}" f p live=0
+	for f in "$STATE_DIR"/copilot-*.json "$STATE_DIR"/agy-*.json; do
+		[ -f "$f" ] || continue
+		p="${f##*-}"
+		p="${p%.json}"
+		if [[ "$p" =~ ^[0-9]+$ ]] && ! kill -0 "$p" 2>/dev/null; then
+			rm -f "$f"
+			continue
+		fi
+		live=1
+	done
+	# pgrep: 0 = one runs, 1 = none, anything else = it could not tell (under a
+	# UTF-8 locale macOS pgrep exits 3 when any process has a non-UTF-8
+	# argv[0]: the watcher's note on pgrep), and then the scan runs. LC_ALL=C
+	# avoids that in the first place.
+	if [ "$live" = 0 ]; then
+		local prc=0
+		LC_ALL=C pgrep -qx 'copilot|agy' 2>/dev/null || prc=$?
+		[ "$prc" = 1 ] && return 0
+	fi
+	[ -s "$OUTPUT_FILE" ] || return 0
+
+	local US=$'\x1f' matches
+	# Pane list first, then the ps snapshot. Per pane: target, pid, kind,
+	# args minus argv0, pane cwd, the pid's descendants (space-wrapped).
+	matches="$(awk -v us="$US" '
+		function tui(kind, line,    n, w, i, a) {
+			n = split(line, w, /[ \t]+/)
+			for (i = 2; i <= n; ) {
+				a = w[i]
+				if (a == "--") return 1
+				if (kind == "copilot") {
+					if (a ~ /^(-i|--interactive)(=|$)/) return 1
+					if (a ~ /^-p/ || a ~ /^--prompt(=|$)/ || a == "-h" || a == "--help" || a == "-v" || a == "--version") return 0
+					if (a in CVAL) { i += 2; continue }
+					if (a ~ /^-/) { i++; continue }
+					return !(a in CSUB)
+				}
+				if (a ~ /^(-i|-prompt-interactive|--prompt-interactive)(=|$)/) return 1
+				if (a ~ /^(-p|-print|--print|-prompt|--prompt)(=|$)/ || a ~ /^(-h|-help|--help|-version|--version)$/) return 0
+				if (a in AVAL) { i += 2; continue }
+				if (a ~ /^-/) { i++; continue }
+				return !(a in ASUB)
+			}
+			return 1
+		}
+		BEGIN {
+			split("--model --reasoning-effort --context --auto-tier --agent -n --name --session-id -C --log-dir --extension-sdk-path --log-level --stream --output-format --add-dir --allow-tool --deny-tool --available-tools --excluded-tools --additional-mcp-config --config-dir --mode", t, " ")
+			for (k in t) CVAL[t[k]] = 1
+			split("app login help init config update version workflow sessions memories plugin mcp skill instruction lsp sandbox completion", t, " ")
+			for (k in t) CSUB[t[k]] = 1
+			split("add-dir agent conversation effort input-format json-schema log-file mode model output-format print-timeout project settings", t, " ")
+			for (k in t) { AVAL["-" t[k]] = 1; AVAL["--" t[k]] = 1 }
+			split("acp agent agents changelog help install mcp mic-serve models plugin plugins remote-control update", t, " ")
+			for (k in t) ASUB[t[k]] = 1
+		}
+		NR == FNR {
+			split($0, p, us)
+			target[p[2]] = p[1]; pcwd[p[2]] = p[3]; panes[++np] = p[2]
+			next
+		}
+		{
+			pid = $1 + 0; ppid = $2 + 0
+			line = $0
+			sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]*/, "", line)
+			args[pid] = line
+			kids[ppid] = (ppid in kids) ? kids[ppid] " " pid : pid ""
+			split(line, w, /[ \t]+/)
+			base = w[1]; sub(/.*\//, "", base)
+			if ((base == "copilot" || base == "agy") && tui(base, line)) kind[pid] = base
+		}
+		function desc(root,    q, qs, qe, out, cur, n, c, j) {
+			qs = 1; qe = 0; out = ""
+			if (root in kids) { n = split(kids[root], c, " "); for (j = 1; j <= n; j++) q[++qe] = c[j] }
+			while (qs <= qe) {
+				cur = q[qs++]; out = out " " cur
+				if (cur in kids) { n = split(kids[cur], c, " "); for (j = 1; j <= n; j++) q[++qe] = c[j] }
+			}
+			return out " "
+		}
+		END {
+			for (i = 1; i <= np; i++) {
+				root = panes[i] + 0
+				delete q; qs = 1; qe = 0; q[++qe] = root; found = ""
+				while (qs <= qe && found == "") {
+					cur = q[qs++] + 0
+					if (cur in kind) { found = cur; break }
+					if (cur in kids) { n = split(kids[cur], c, " "); for (j = 1; j <= n; j++) q[++qe] = c[j] }
+				}
+				if (found == "") continue
+				a = args[found]; sub(/^[^ \t]+[ \t]*/, "", a)
+				print target[panes[i]] us found us kind[found] us a us pcwd[panes[i]] us desc(found)
+			}
+		}
+	' <(tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}${US}#{pane_pid}${US}#{pane_current_path}" 2>/dev/null) \
+		<(ps -eo pid=,ppid=,args= 2>/dev/null))" || return 0
+	[ -n "$matches" ] || return 0
+
+	# Copilot's own locks, pid -> session id, read only when a copilot runs.
+	local locks=" " s
+	if [[ "$matches" == *"${US}copilot${US}"* ]]; then
+		for f in "$cop_home"/session-state/*/inuse.*.lock; do
+			[ -e "$f" ] || continue
+			p="${f##*/inuse.}"
+			s="${f%/inuse.*}"
+			locks+="${p%.lock}=${s##*/} "
+		done
+	fi
+
+	local rows="" pane pid kind args pcwd dsc sid cwd env_json rec q
+	while IFS="$US" read -r pane pid kind args pcwd dsc; do
+		[ -n "$pane" ] || continue
+		sid="" cwd="" env_json="null"
+		# 1. The record, for the pid or a descendant of it.
+		for q in $pid $dsc; do
+			rec="$STATE_DIR/$kind-$q.json"
+			[ -f "$rec" ] || continue
+			IFS="$US" read -r sid cwd env_json < <(jq -r '[(.session_id // ""), (.cwd // ""), (.env // null | tojson)] | join("\u001f")' "$rec" 2>/dev/null) || true
+			[ -n "$sid" ] && break
+		done
+		# 2. The CLI's own lock.
+		if [ -z "$sid" ] && [ "$kind" = copilot ]; then
+			for q in $pid $dsc; do
+				s="${locks#* "$q="}"
+				[ "$s" != "$locks" ] && sid="${s%% *}" && break
+			done
+		elif [ -z "$sid" ]; then
+			sid="$(lsof -a -p "$pid" -Fn 2>/dev/null | sed -n 's#^n.*/antigravity-cli/presence/\([0-9A-Fa-f-]*\)\.lock$#\1#p' | head -n 1)" || sid=""
+		fi
+		# 3. The argv.
+		if [ -z "$sid" ]; then
+			sid="$(jq -rn --arg a "$args" --arg kind "$kind" '
+				($a | [splits("[ \t]+")]) as $w
+				| (if $kind == "copilot" then "^(-r|--resume|--session-id)$" else "^--?conversation$" end) as $f
+				| (if $kind == "copilot" then "^(--resume|--session-id)=" else "^--?conversation=" end) as $g
+				| [range(0; $w | length) as $i
+				   | if ($w[$i] | test($f)) then ($w[$i + 1] // "")
+				     elif ($w[$i] | test($g)) then ($w[$i] | sub("^[^=]*="; ""))
+				     else empty end
+				   | select(test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))]
+				| last // ""' 2>/dev/null)" || sid=""
+		fi
+		[ -n "$sid" ] || continue
+		if [ -z "$cwd" ] && [ "$kind" = copilot ] && [ -f "$cop_home/session-state/$sid/workspace.yaml" ]; then
+			cwd="$(sed -n 's/^cwd: //p' "$cop_home/session-state/$sid/workspace.yaml" | head -n 1)" || cwd=""
+			cwd="${cwd#\'}"
+			cwd="${cwd%\'}"
+		fi
+		[ -n "$cwd" ] || cwd="$pcwd"
+		[ -n "$env_json" ] || env_json=null
+		rows+="$(jq -cn --arg pane "$pane" --arg tool "$kind" --arg sid "$sid" --arg cwd "$cwd" --arg pid "$pid" \
+			--arg args "$args" --argjson env "$env_json" --arg desc " $pid $dsc" \
+			'{pane: $pane, tool: $tool, session_id: $sid, cwd: $cwd, pid: $pid, model: "", cli_args: $args, env: $env, desc: $desc}' 2>/dev/null)"$'\n' || continue
+	done <<<"$matches"
+	[ -n "$rows" ] || return 0
+
+	local out n
+	out="$(jq --slurpfile g <(printf '%s' "$rows") '
+		(.sessions // []) as $s
+		| ($g | map(. as $row | select(all($s[] | select(.pane == $row.pane);
+		                                    ((.pid // "") | tostring) as $p
+		                                    | $p != "" and ($p == $row.pid or ($row.desc | contains(" " + $p + " "))))))) as $g
+		| .sessions = ($s | map(. as $u | select($g | any(.pane == $u.pane) | not))) + ($g | map(del(.desc)))
+		| {n: ($g | length), doc: .}
+	' "$OUTPUT_FILE" 2>/dev/null)" || { log "copilot/agy: could not merge the rows"; return 0; }
+	n="$(jq -r '.n' <<<"$out")"
+	[ "${n:-0}" -gt 0 ] || return 0
+	jq '.doc' <<<"$out" >"$OUTPUT_FILE.$$" && mv -f "$OUTPUT_FILE.$$" "$OUTPUT_FILE"
+	log "saved $n copilot/agy session(s)"
+	if declare -F strip_assistant_pane_contents >/dev/null; then strip_assistant_pane_contents; fi
+}
+ca_rows
+
 EXCLUDE="$(tmux show-option -gqv @resurrect-exclude-sessions 2>/dev/null || true)"
 EXCLUDE="${EXCLUDE:-agents tasks}"
 # Entries are shell `case` patterns (`ptymcp-*`), as in resurrect-save.sh,

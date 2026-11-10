@@ -484,6 +484,61 @@ class PauseKey(Harness):
         self.assertEqual((t["kind"], t["found_by"]), ("grok", "command"))
         self.assertIn("1 working window had no agent pane", entry["message"])
 
+    # -- copilot / agy ---------------------------------------------------------
+    def test_copilot_and_agy_agents_are_paused_as_their_kinds(self):
+        panes = {}
+        for kind, args in (("copilot", ("--model", "gpt-5")), ("agy", ("--sandbox",))):
+            self.n += 1
+            p = self.fake_agent(kind, *args)
+            pid = self.wait_args(p, kind)
+            self.t("set", "-w", "-t", p, "@agent_state", "running")
+            self.t("set", "-w", "-t", p, "@agent_kind", kind)
+            self.record(p, "%s-sid" % kind, kind=kind, pid=pid)
+            panes[kind] = p
+        self.press()
+        self.assertEqual(sorted(self.stub.panes(AP.PAUSE_MSG)), sorted(panes.values()))
+        got = sorted((t["kind"], t["session_id"], t["found_by"]) for t in self.state()["targets"])
+        self.assertEqual(got, [("agy", "agy-sid", "record"), ("copilot", "copilot-sid", "record")])
+
+    def test_copilot_and_agy_headless_records_are_not_agents(self):
+        for kind, args in (("copilot", ("-p", "hi")), ("copilot", ("--prompt=hi",)), ("agy", ("--print", "hi")),
+                           ("copilot", ("sessions",)), ("agy", ("models",))):
+            self.n += 1
+            p = self.fake_agent(kind, *args)
+            pid = self.wait_args(p, args[0])
+            self.t("set", "-w", "-t", p, "@agent_state", "running")   # a leftover state
+            self.record(p, "s_%d" % self.n, kind=kind, pid=pid)
+        entry = self.press()
+        self.assertEqual(self.stub.calls, [])
+        self.assertIsNone(self.state())
+        self.assertIn("5 working windows had no agent pane", entry["message"])
+
+    def test_copilot_and_agy_command_fallback_needs_their_kind(self):
+        # No record (Copilot files its session only at the first prompt): its
+        # pane (pane_current_command `copilot` / `agy`) is the agent only in a
+        # window marked with that kind.
+        b = self.dir / "bin"; b.mkdir()
+        for kind in ("copilot", "agy"):
+            shutil.copy("/bin/sleep", b / kind)
+        def win(cmd, kind):
+            p = self.t("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "main:", "%s 600" % (b / cmd))
+            self.t("set", "-w", "-t", p, "@agent_state", "running")
+            if kind:
+                self.t("set", "-w", "-t", p, "@agent_kind", kind)
+            return p
+        marked = [win("copilot", "copilot"), win("agy", "agy")]
+        unmarked = [win("copilot", ""), win("agy", "copilot")]
+        deadline = time.time() + 5
+        while time.time() < deadline and any(
+                self.t("display", "-p", "-t", p, "#{pane_current_command}") not in ("copilot", "agy")
+                for p in marked + unmarked):
+            time.sleep(0.05)
+        entry = self.press()
+        self.assertEqual(sorted(self.stub.panes(AP.PAUSE_MSG)), sorted(marked))
+        self.assertEqual(sorted((t["kind"], t["found_by"]) for t in self.state()["targets"]),
+                         [("agy", "command"), ("copilot", "command")])
+        self.assertIn("2 working windows had no agent pane", entry["message"])
+
     def test_sessionless_target_needs_the_same_pane_process(self):
         # A command-fallback target has no session id, only a pane id. After
         # a server restore the same %N can be another agent: it must not get
@@ -2213,6 +2268,12 @@ class Units(unittest.TestCase):
             self.assertFalse(AP.AGENT_CMD.match(c), c)
         self.assertEqual([AP.cmd_kind(c) for c in ("claude", "2.1.170", "codex", "opencode", "grok-macos-aarc")],
                          ["claude", "claude", "codex", "opencode", "grok"])
+        for c in ("copilot", "agy"):
+            self.assertTrue(AP.AGENT_CMD.match(c), c)
+            self.assertEqual(AP.cmd_kind(c), c)
+        for c in ("copilot-cli", "agy-helper", "gh"):
+            self.assertFalse(AP.AGENT_CMD.match(c), c)
+        self.assertTrue(AP.cswap_blind({"kind": "copilot"}) and AP.cswap_blind({"kind": "agy"}))
 
     def test_grok_tui_args(self):
         # The shared Grok TUI rule (agent-tab-watcher.sh grok_tui_args, agent-ui).
@@ -2786,6 +2847,31 @@ class Units(unittest.TestCase):
         # A claude target still gets now's account.
         c, _ = AP.limit_merge(d, dict(g, window_id="@2", session_id="cs-1", kind="claude"), "acct-a")
         self.assertEqual(c["account"], "acct-a")
+
+    def test_copilot_and_agy_limits_are_nobody_elses(self):
+        # Like grok's: their own host for the wake probe, never a cswap switch,
+        # never a Claude account (by kind, or by the limit's own type).
+        self.assertEqual(AP.limit_host({"kind": "copilot", "type": "copilot"}), "api.githubcopilot.com")
+        self.assertEqual(AP.limit_host({"kind": "claude", "type": "copilot"}), "api.githubcopilot.com")
+        self.assertEqual(AP.limit_host({"kind": "agy", "type": "agy"}), "cloudcode-pa.googleapis.com")
+        self.assertEqual(AP.limit_host({"kind": "agy"}), "cloudcode-pa.googleapis.com")
+        t = {"type": "five_hour", "since": 1000, "resets_at": 99999}
+        for k in ("copilot", "agy"):
+            for g in (dict(t, kind=k), dict(t, type=k)):
+                self.assertTrue(AP.cswap_blind(g), g)
+                self.assertFalse(AP.switch_settling(g, 1150, 1100, {"updated_at": 1050}), g)
+            d = {"targets": []}
+            g = {"window_id": "@1", "pane_id": "%1", "session_id": "s-" + k, "kind": k,
+                 "resets_at": 0, "type": k, "since": 1000}
+            stored, renewed = AP.limit_merge(d, dict(g), "acct-a")
+            self.assertTrue(renewed)
+            self.assertNotIn("account", stored)
+            stored["account"] = "acct-a"                         # a stale one from before
+            stored, _ = AP.limit_merge(d, dict(g, since=2000), "acct-b")
+            self.assertNotIn("account", stored)
+            row = {"agent_limit": "0 %s 3000" % k, "agent_limit_lifted": "", "pane_id": "%1"}
+            self.assertTrue(AP.limit_sync(stored, row, {"account": "acct-b"}, {}))
+            self.assertNotIn("account", stored)
 
     def test_fmt_local_one_date_format(self):
         # By calendar days in local time: today "5:31 PM", the next six days

@@ -498,6 +498,21 @@ class PaneTests(unittest.TestCase):
         self.assertEqual(R.pick_agent_pane(panes, self.PS, "opencode"), (None, R.PANE_UNSURE))
         self.assertEqual(R.pick_agent_pane(panes, self.PS), (None, R.PANE_UNSURE))
 
+    def test_copilot_and_agy_count_only_in_their_windows(self):
+        ps = "\n".join(["ttys001  -zsh", "ttys004  /usr/bin/claude", "ttys009  /opt/homebrew/bin/copilot",
+                        "ttys009  copilot", "ttys010  /opt/homebrew/bin/agy"])
+        for tty, kind in (("/dev/ttys009", "copilot"), ("/dev/ttys010", "agy")):
+            panes = self.panes(("%1", "/dev/ttys001", "1"), ("%2", tty, "0"))
+            self.assertEqual(R.pick_agent_pane(panes, ps, kind), ("%2", None), kind)
+            panes = self.panes(("%1", tty, "0"), ("%2", "/dev/ttys004", "1"))
+            self.assertEqual(R.pick_agent_pane(panes, ps, kind), ("%1", None), kind)
+            # `copilot -p` / `agy --print` beside a claude (same comm): not the agent.
+            panes = self.panes(("%1", "/dev/ttys004", "0"), ("%2", tty, "1"))
+            self.assertEqual(R.pick_agent_pane(panes, ps, "claude"), ("%1", None), kind)
+            panes = self.panes(("%1", "/dev/ttys001", "1"), ("%2", tty, "0"))
+            self.assertEqual(R.pick_agent_pane(panes, ps), (None, R.PANE_UNSURE), kind)
+            self.assertEqual(R.pick_agent_pane(panes, ps, "grok"), (None, R.PANE_UNSURE), kind)
+
     def test_kind_match_beats_the_active_pane(self):
         # claude inactive, codex active, window kind claude: the claude pane.
         panes = self.panes(("%1", "/dev/ttys004", "0"), ("%2", "/dev/ttys002", "1"))
@@ -527,22 +542,26 @@ class PaneTests(unittest.TestCase):
     def test_is_agent_comm(self):
         for c in ("claude", "codex", "/usr/local/bin/codex", "2.1.291",
                   "opencode", "/opt/homebrew/bin/opencode",
-                  "grok", "/Users/me/.grok/bin/grok", "grok-macos-aarch64", "grok-linux-x86_64"):
+                  "grok", "/Users/me/.grok/bin/grok", "grok-macos-aarch64", "grok-linux-x86_64",
+                  "copilot", "/opt/homebrew/bin/copilot", "agy"):
             self.assertTrue(R.is_agent_comm(c), c)
         for c in ("node", "-zsh", "10.0.0.1", "1.2.3-beta", "opencode-helper", "claude-helper",
                   "agent", "/Users/me/.grok/bin/agent", "grok-helper", "grokker", "xgrok",
-                  "grok-mcp-server", "grok-macos-"):
+                  "grok-mcp-server", "grok-macos-", "copilot-language-server", "agy-helper"):
             self.assertFalse(R.is_agent_comm(c), c)
 
     def test_comm_kind(self):
         for c, k in (("claude", "claude"), ("2.1.291", "claude"), ("/usr/local/bin/codex", "codex"),
                      ("/opt/homebrew/bin/opencode", "opencode"), ("/Users/me/.grok/bin/grok", "grok"),
-                     ("/Users/me/.grok/downloads/grok-macos-aarch64", "grok")):
+                     ("/Users/me/.grok/downloads/grok-macos-aarch64", "grok"),
+                     ("/opt/homebrew/bin/copilot", "copilot"), ("agy", "agy")):
             self.assertEqual(R.comm_kind(c), k, c)
 
     def test_kind_glyphs(self):
-        # Parity with agent-ui model.rs kind_glyph (U+F489 for opencode, U+2726 for grok).
-        self.assertEqual(R.KIND_GLYPH, {"claude": "✳", "codex": "⬢", "grok": "✦", "opencode":""})
+        # Parity with agent-ui model.rs kind_glyph (U+F489 for opencode, U+2726 for grok,
+        # the AgentMarks logos U+10C108 / U+10C118 for copilot / agy).
+        self.assertEqual(R.KIND_GLYPH, {"claude": "✳", "codex": "⬢", "grok": "✦", "opencode":"", "copilot": "\U0010C108",
+                                        "agy": "\U0010C118"})
 
 
 class ActTests(unittest.TestCase):

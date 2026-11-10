@@ -328,6 +328,82 @@ shapes.
 Tests: `tests/test_grok_resurrect.py` covers the record hook, save rows,
 restore lines, the socket guard below, and closed-tabs.
 
+## Copilot and agy sessions (2026-11-10)
+
+GitHub Copilot CLI (`copilot`, 1.0.108) and Antigravity CLI (`agy`, 1.5.x)
+are saved and restored the way Grok is, by local code around the plugin.
+
+- **The record.** `scripts/copilot-agy-session-track.sh <copilot|agy>
+  <start|end>`, from each CLI's own hooks file
+  (`private_dot_copilot/hooks/tmux-agent.json`: `sessionStart` → start,
+  `sessionEnd` → end; `dot_gemini/config/plugins/tmux-agent/hooks.json`:
+  `SessionStart` and `Stop` → start, agy having no session end and its
+  SessionStart being for a NEW conversation, so every turn's Stop re-files the
+  conversation it ran). It keeps `<kind>-<pid>.json` in the plugin's state
+  dir: `{tool, session_id, cwd, ppid, timestamp, env}` (no `transcript_path`:
+  their transcripts are no Claude reader's). The pid is the outermost
+  process of that comm above the hook (Homebrew's copilot can run the CLI
+  under a supervisor of the same name), and only a TUI one: a tty, the
+  watcher's `copilot_tui_args` / `agy_tui_args`, `TMUX_PANE` set, no
+  `CUA_NOTCH_IGNORE`. A subagent's event (copilot `agentId`, agy
+  `parentConversationId`) is ignored; an unchanged record is not rewritten
+  (agy's per-turn Stop costs one read); `end` removes it only for the session
+  it names (renamed aside first, as for grok).
+- **Observed live (2026-11-10, a private server, no prompt sent):** Copilot
+  fires `sessionStart` only at the FIRST prompt (a fresh TUI fired none,
+  only `sessionEnd` at exit), but holds
+  `~/.copilot/session-state/<sid>/inuse.<pid>.lock` (named by its own pid,
+  one process here, no supervisor) from startup. agy creates no
+  conversation until the first prompt; a running conversation is held as an
+  open `~/.gemini/antigravity-cli/presence/<id>.lock`.
+- **Save** (`assistant-save.sh`, `ca_rows`, after `grok_rows`). One row per
+  pane running a copilot / agy TUI (outermost process in the pane's tree,
+  argv0 basename, the TUI rule), `{pane, tool, session_id, cwd, pid, model:
+  "", cli_args, env}`. Session id: the record (for the pid or a descendant),
+  else the CLI's own lock (copilot's `inuse.<pid>.lock` for the pid or a
+  descendant; agy's presence lock from one `lsof -a -p <pid>`, only for an
+  agy with no record), else a UUID given to `--resume`/`-r`/`--session-id`
+  (copilot) or `--conversation` (agy). No id: no row. cwd: the record's,
+  else (copilot) the session's `workspace.yaml` `cwd:`, else the pane's. The
+  pane-takeover rule and the strip are grok's. Cost when neither runs: no
+  live record and one `LC_ALL=C pgrep -qx 'copilot|agy'` exiting 1, no ps
+  (any other exit, e.g. macOS pgrep's 3 on a non-UTF-8 argv[0], scans);
+  dead records are deleted. An upstream row with no pid never matches a
+  copilot/agy row's process tree. save.log says `saved N copilot/agy session(s)`.
+- **Restore.** `command copilot [options] --resume <sid>` and `command agy
+  [options] --conversation <sid>`, after the `cd` (nu: `^copilot` / `^agy`).
+  `copilotcut` keeps copilot's options minus `-r`/`--resume`, `--connect`
+  (optional values), `--session-id`, `-n`/`--name`, `-C`, `--continue`,
+  `--fleet`, `--attachment`; `-i`/`--interactive` (a launch prompt, its words
+  unquoted by ps) and `--` end it all. Copilot takes no positional argument,
+  so a bare word is the value of the option before it and goes with it.
+  `ps` loses argv's quoting, so a value that held a space comes back split
+  (`--allow-tool 'shell(git push)'` reads `shell(git` `push)`): an option any
+  of whose words has unbalanced parentheses is dropped whole. A split value
+  without parentheses cannot be told apart and is replayed as separate
+  words (a known limit). `agycut` keeps agy's leading Go flags minus `--conversation`, `-c`/
+  `--continue`, `--new-project`; `-i`/`--prompt-interactive`, `--` and the
+  first bare word (a prompt) end it. Guard 2's `detect_tool` sees any
+  copilot / agy in a pane.
+- **⌘W / ⌘Z** (`closed-tabs.sh`, `ca_kind` / `ca_session`). The snapshot
+  copies the record and, while the CLI lives, its lock (copilot: any copilot
+  pid on the tty; agy: lsof). The resume line is restore's (`build_cmd`, same
+  cuts); the tab reopens with `@agent_birth copilot|agy`. The summary reads
+  copilot's `events.jsonl` (`user.message`, `assistant.message` and its
+  `toolRequests`) or agy's `brain/<id>/.system_generated/logs/transcript.jsonl`
+  (`USER_INPUT` inside `<USER_REQUEST>`, `PLANNER_RESPONSE`).
+- **Not driven live** (no prompt was sent to either CLI): that copilot's lock
+  follows a `/new` or `/resume` inside the TUI (assumed), that `copilot
+  --resume <id>` of a session with no prompt yet reopens it (saved by its
+  lock all the same), and whether agy's SessionStart fires on
+  `--conversation` (its Stop record covers it after a turn, the presence lock
+  before).
+
+Tests: `tests/test_copilot_agy_resurrect.py` (the record hook on a pty, save
+rows with fake ps/pgrep/lsof, restore lines and a resume on a throwaway
+server, closed-tabs close/reopen/transcripts, and every port of the TUI rule
+agreeing: watcher, hook, save, closed-tabs, agent-pause).
+
 ## Costs (measured 2026-10-15, 20-pane test server)
 
 **Fast path:** about 20ms wall, close to 0 CPU, 7.8MB RSS. That breaks down as

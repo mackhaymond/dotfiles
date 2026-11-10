@@ -26,12 +26,15 @@ PLUGIN_DIR="${TMUX_ASSISTANT_RESURRECT_PLUGIN:-$HOME/.config/tmux/plugins/tmux-a
 source "$PLUGIN_DIR/scripts/lib-detect.sh" || exit 1 # detect_tool, pane_has_assistant, posix_quote
 # Upstream's detect_tool knows claude/codex/opencode only; guard 2 below must
 # also see a grok already running in a pane (argv0 basename grok or
-# grok-<os>-<arch>, any mode: a pane busy with `grok -p` is not free either).
+# grok-<os>-<arch>, any mode: a pane busy with `grok -p` is not free either),
+# and a copilot or agy (argv0 basename, any mode too).
 eval "_upstream_detect_tool() $(declare -f detect_tool | tail -n +2)"
 detect_tool() {
 	local w="${1%%[[:space:]]*}"
 	if [[ "${w##*/}" =~ ^grok(-(macos|linux|windows)-[a-z0-9_]+)?$ ]]; then
 		echo grok
+	elif [ "${w##*/}" = copilot ] || [ "${w##*/}" = agy ]; then
+		echo "${w##*/}"
 	else
 		_upstream_detect_tool "$1"
 	fi
@@ -211,11 +214,54 @@ def grokcut:
     elif ($w | gvflag) then .out += [$w] | .pend = true | .opt = false
     else .out += [$w] | .opt = false end)
   | .out;
+# Copilot rows (assistant-save.sh's ca_rows) keep their options, minus what
+# would fight the `--resume <sid>` appended here: -r/--resume and --connect
+# with their optional value, --session-id, -n/--name and -C with theirs (the
+# line cd's into the session's cwd), --continue, --fleet and --attachment;
+# -i/--interactive (a launch prompt, its words unquoted by ps) and `--` end it
+# all. Copilot takes no positional argument, so a bare word is always the
+# value of the option before it: kept or dropped with that option (several,
+# for --allow-tool a b). ps loses argv's quoting, so a value that held a
+# space comes back split (`--allow-tool 'shell(git push)'` reads `shell(git`
+# `push)`): an option any of whose words has unbalanced parentheses is dropped
+# whole rather than replayed as different tools. (A split value without
+# parentheses cannot be told apart and is replayed as separate words.) Same
+# rules as build_cmd in closed-tabs.sh.
+def unbal: ([scan("\\(")] | length) != ([scan("\\)")] | length);
+def copilotcut:
+  (reduce .[] as $w ({gs: [], stop: false};
+    if .stop then .
+    elif ($w | startswith("-") | not) then
+      (if (.gs | length) > 0 then .gs[-1].vals += [$w] else .gs += [{opt: null, vals: [$w], drop: false}] end)
+    elif $w == "--" or ($w | test("^(-i|--interactive)(=|$)")) then .stop = true
+    elif ($w | test("^(-r|--resume|--connect|--session-id|-n|--name|-C|--continue|--fleet|--attachment)$|^(--resume|--connect|--session-id|--name|--attachment)=|^-C."))
+      then .gs += [{opt: $w, vals: [], drop: true}]
+    else .gs += [{opt: $w, vals: [], drop: false}] end) | .gs)
+  | map(select((.drop | not) and (any(([.opt // empty] + .vals)[]; unbal) | not)))
+  | map([.opt // empty] + .vals) | add // [];
+# agy rows keep their leading options (Go flags: one or two dashes, a value
+# as the next word or after `=`), minus --conversation and its value, -c/
+# --continue and --new-project; -i/--prompt-interactive (a launch prompt),
+# `--` and the first bare word (a positional prompt) end it all. Same rules as
+# build_cmd in closed-tabs.sh.
+def agycut:
+  reduce .[] as $w ({out: [], pend: "", stop: false};
+    if .stop then .
+    elif .pend == "keep" then .out += [$w] | .pend = ""
+    elif .pend == "drop" then .pend = ""
+    elif $w == "--" or ($w | startswith("-") | not) then .stop = true
+    elif ($w | test("^--?(i|prompt-interactive)(=|$)")) then .stop = true
+    elif ($w | test("^--?conversation$")) then .pend = "drop"
+    elif ($w | test("^--?conversation=|^--?(c|continue|new-project)(=.*)?$")) then .
+    elif ($w | test("^--?(add-dir|agent|effort|input-format|json-schema|log-file|mode|model|output-format|print-timeout|project|settings)$")) then .out += [$w] | .pend = "keep"
+    else .out += [$w] end)
+  | .out;
 (.sessions // [])[]
 | . as $e
 | ((.cli_args // "") | [splits("[ \t\n]+")] | map(select(length > 0))
    | if $e.tool == "codex" then ctxdrop elif $e.tool == "claude" then claudecut
-     elif $e.tool == "grok" then grokcut else . end) as $words
+     elif $e.tool == "grok" then grokcut elif $e.tool == "copilot" then copilotcut
+     elif $e.tool == "agy" then agycut else . end) as $words
 | ($words | map(" " + q) | join("")) as $args
 | (if (.model // "") != "" and .tool == "claude"
      and ($words | any(. == "--model" or startswith("--model=")) | not)
@@ -226,6 +272,8 @@ def grokcut:
    elif .tool == "opencode" then "command opencode" + $args + " -s " + (.session_id | q)
    elif .tool == "codex" then $codex + $args + " resume " + (.session_id | q)
    elif .tool == "grok" then $grok + $args + " -r " + (.session_id | q)
+   elif .tool == "copilot" then "command copilot" + $args + " --resume " + (.session_id | q)
+   elif .tool == "agy" then "command agy" + $args + " --conversation " + (.session_id | q)
    else "" end) as $cmd
 # The same line for a nu pane (field 6), whole: nu cannot parse the POSIX one
 # (`2>/dev/null`, `command`, a `VAR=x` prefix), so a nu shell typed it and the
@@ -239,6 +287,8 @@ def grokcut:
         elif .tool == "opencode" then "^opencode" + $nargs + " -s " + (.session_id | nq)
         elif .tool == "codex" then $codexnu + $nargs + " resume " + (.session_id | nq)
         elif .tool == "grok" then $groknu + $nargs + " -r " + (.session_id | nq)
+        elif .tool == "copilot" then "^copilot" + $nargs + " --resume " + (.session_id | nq)
+        elif .tool == "agy" then "^agy" + $nargs + " --conversation " + (.session_id | nq)
         else "" end) as $ncmd
      | ([$cap[] as $v | (($e.env // {})[$v] // "") | tostring
          | select(. != "" and . != "null") | $v + ": " + nq] | join(", ")) as $nenv
