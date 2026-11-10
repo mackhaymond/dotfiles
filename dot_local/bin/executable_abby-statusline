@@ -1,0 +1,53 @@
+#!/bin/bash
+# abby-statusline: abby's statusline (see ~/.local/bin/abby).
+#   ABBY badge · abliteration balance left · $ used, then the usual statusline.
+# Usage (abby wires it): abby-statusline '<inner statusline command>'
+# Claude Code's JSON arrives on stdin and is passed through to the inner one.
+#
+# The balance comes from GET https://api.abliteration.ai/v1/credits (works
+# with the normal API key; org-wide total_credits / total_usage in USD). The
+# statusline redraws constantly, so it never waits on the network: it prints
+# the cached value and, when that is over REFRESH seconds old, refreshes it in
+# the background (one refresher at a time across every abby session).
+
+input=$(cat)
+cache="$HOME/.claude-abby/.credits"   # "<total_credits> <total_usage> <fetched epoch>"
+lock="$cache.lock"
+REFRESH=60
+now=$(date +%s)
+
+credits="" usage="" fetched=0
+[ -r "$cache" ] && read -r credits usage fetched < "$cache"
+
+# A refresher killed mid-run leaves its lock behind; it is stale after 30s.
+if [ -d "$lock" ] && [ $((now - $(stat -f %m "$lock" 2>/dev/null || echo "$now"))) -gt 30 ]; then
+    rmdir "$lock" 2>/dev/null
+fi
+if [ $((now - ${fetched:-0})) -gt "$REFRESH" ] && mkdir "$lock" 2>/dev/null; then
+    (
+        key=$(security find-generic-password -a "$USER" -s abliteration-api-key -w 2>/dev/null)
+        # The key goes in on stdin (-H @-), never on a command line.
+        line=$(printf 'Authorization: Bearer %s\n' "$key" \
+            | curl -sS -m 10 -H @- https://api.abliteration.ai/v1/credits 2>/dev/null \
+            | jq -r '.data | select(.total_credits != null) | "\(.total_credits) \(.total_usage)"' 2>/dev/null)
+        if [ -n "$line" ]; then
+            printf '%s %s\n' "$line" "$(date +%s)" > "$cache.tmp" && mv "$cache.tmp" "$cache"
+        fi
+        rmdir "$lock" 2>/dev/null
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null
+fi
+
+# Badge: black on neon green (abby's accent).
+printf '\033[1;38;2;8;24;16;48;2;57;255;136m ABBY \033[0m'
+if [ -n "$credits" ]; then
+    read -r left used color <<<"$(awk -v c="$credits" -v u="$usage" 'BEGIN {
+        l = c - u
+        col = (l < 2) ? "38;2;255;85;85" : (l < 5) ? "38;2;249;226;175" : "38;2;57;255;136"
+        printf "%.2f %.2f %s", l, u, col }')"
+    printf ' \033[%sm$%s left\033[0m\033[2m · $%s used\033[0m ' "$color" "$left" "$used"
+else
+    printf ' \033[2m$… balance\033[0m '
+fi
+
+[ -n "$1" ] && printf '%s' "$input" | bash -c "$1"
