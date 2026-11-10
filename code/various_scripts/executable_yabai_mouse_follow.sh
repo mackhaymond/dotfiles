@@ -52,8 +52,11 @@ ty=${target##* }
 case "$tx" in ''|*[!0-9.-]*) exit 0 ;; esac
 case "$ty" in ''|*[!0-9.-]*) exit 0 ;; esac
 
+# `--` is load-bearing: a display left of / above the laptop has NEGATIVE coords,
+# and without it osascript parses "-667" as an option ("illegal option -- 6") and
+# silently never warps.
 osascript -l JavaScript \
   -e 'function run(a){ObjC.import("CoreGraphics");$.CGWarpMouseCursorPosition({x:parseFloat(a[0]),y:parseFloat(a[1])});}' \
-  "$tx" "$ty" >/dev/null 2>&1 || true
+  -- "$tx" "$ty" >/dev/null 2>&1 || true
 
 exit 0
