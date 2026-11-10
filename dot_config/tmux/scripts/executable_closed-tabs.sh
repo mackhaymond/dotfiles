@@ -768,7 +768,9 @@ transcript_digest() {
     [ -n "$sid" ] || return 0
     case "$tool" in
     claude)
-        f=$(ls "$HOME"/.claude/projects/*/"$sid".jsonl 2>/dev/null | head -n 1)
+        # ~/.claude-abby/projects: abby (Claude Code on abliteration.ai) keeps
+        # its conversations apart from Claude's.
+        f=$(ls "$HOME"/.claude/projects/*/"$sid".jsonl "$HOME"/.claude-abby/projects/*/"$sid".jsonl 2>/dev/null | head -n 1)
         [ -r "$f" ] || return 0
         jq -r 'select((.type == "user" or .type == "assistant") and .isMeta != true and .isSidechain != true)
             | .type as $t

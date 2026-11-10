@@ -8,11 +8,18 @@ re-launches `claude` with the variable set - tmux restore, CMD+Z reopen,
 unpark (stash.sh) - comes back on abliteration, not Anthropic.
 
 The dir symlinks every entry of ~/.claude (CLAUDE.md, hooks, plugins,
-skills, projects/memory, sessions, history...) EXCEPT settings.json and
-.claude.json, which are private copies rebuilt from the live ones on each
-launch. So hooks and agent status work as usual, and /model "set as
-default", /autocompact and effort picks stick for abby without writing an
-abliteration model into the settings plain `claude` reads.
+skills, sessions...) EXCEPT settings.json and .claude.json, which are
+private copies rebuilt from the live ones on each launch. So hooks and agent
+status work as usual, and /model "set as default", /autocompact and effort
+picks stick for abby without writing an abliteration model into the
+settings plain `claude` reads.
+
+Conversations are abby's own: projects/ (transcripts) and history.jsonl are
+real, so `abby --continue` / `--resume` and up-arrow see only abby sessions
+and `claude --continue` never picks one up. Memory stays shared: each
+project's memory/ is a link to the one under ~/.claude/projects. Abby
+sessions recorded in ~/.claude/projects before the split move over on
+launch once their process has exited.
 
 Models (from GET /v1/models, 2026-11-09):
   abliterated-model-large-v2     1M ctx, text only,   $3/$5 per Mtok  (default)
@@ -34,6 +41,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 HOME = os.path.expanduser("~")
@@ -80,7 +88,13 @@ ACK_SUFFIXES = ("AcknowledgedAt", "Acknowledged", "Noticed", "Dismissed", "Dismi
 DEFAULT_EFFORT = "max"
 
 FLAGS_FILE = os.path.join(DST, "abby.settings.json")  # passed via --settings
-OWN_DIRS = {"backups", "daemon"}  # abby keeps its own, never shares these
+# abby keeps its own, never shares these. projects/ and history.jsonl keep
+# its conversations apart from Claude's (see the docstring).
+OWN_DIRS = {"backups", "daemon", "projects", "history.jsonl"}
+# Versioned: bump the name when is_abby_transcript's rule changes, so files
+# cached as "not abby" under the old rule get looked at again.
+MIGRATE_CACHE = os.path.join(DST, ".migrate-cache-v2.json")
+MIGRATE_DAYS = 14  # abby predates the split by one day; older can't be abby
 SKIP_SUFFIXES = (".lock", ".tmp")  # transient; a link to one would dangle
 
 PICKER = {
@@ -158,6 +172,107 @@ def link_tree():
             os.symlink(os.path.join(SRC, name), dst)
         except FileExistsError:
             pass  # a second abby launching at the same moment won the race
+    os.makedirs(os.path.join(DST, "projects"), exist_ok=True)
+
+
+def munge(path):
+    # Claude Code's project dir name for a cwd: every non-alphanumeric -> "-".
+    return "".join(c if c.isalnum() else "-" for c in path)
+
+
+def link_memory(cwd):
+    """Share auto-memory: abby's projects/<p>/memory -> ~/.claude/projects/<p>/memory,
+    for every project that has one, plus this cwd's (created if missing)."""
+    src_projects = os.path.join(SRC, "projects")
+    dst_projects = os.path.join(DST, "projects")
+    os.makedirs(os.path.join(src_projects, munge(cwd), "memory"), exist_ok=True)
+    for p in os.scandir(src_projects):
+        mem = os.path.join(p.path, "memory")
+        if not os.path.isdir(mem):
+            continue
+        d = os.path.join(dst_projects, p.name)
+        link = os.path.join(d, "memory")
+        if os.path.lexists(link):
+            continue  # linked already, or a real one abby made (left alone)
+        os.makedirs(d, exist_ok=True)
+        try:
+            os.symlink(mem, link)
+        except FileExistsError:
+            pass
+
+
+def live_session_ids():
+    ids = set()
+    sessions = os.path.join(SRC, "sessions")
+    for f in os.scandir(sessions) if os.path.isdir(sessions) else ():
+        if not f.name.endswith(".json"):
+            continue
+        try:
+            os.kill(int(f.name[:-5]), 0)
+        except (ValueError, ProcessLookupError):
+            continue
+        except PermissionError:
+            pass
+        sid = load(f.path).get("sessionId")
+        if sid:
+            ids.add(sid)
+    return ids
+
+
+def is_abby_transcript(path):
+    # The first real assistant reply records the model ("model":"abliterated-
+    # ..."); "<synthetic>" ones (interrupts, errors) are Claude Code's own.
+    # A session that never got a reply (e.g. its first request failed) is
+    # abby's if an API error row names an abliteration model.
+    errored_on_abby = False
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if '"type":"assistant"' in line and '"model":"<synthetic>"' not in line:
+                    return '"model":"abliterated-model' in line
+                if '"type":"system"' in line and "abliterated-model" in line:
+                    errored_on_abby = True
+    except OSError:
+        return None
+    return True if errored_on_abby else None  # None: decide on a later launch
+
+
+def migrate_sessions():
+    """Move abby transcripts made before the split out of ~/.claude/projects,
+    skipping sessions whose process is still running (it holds the file)."""
+    cache = load(MIGRATE_CACHE)  # path -> [mtime, size] known not to be abby
+    cutoff = time.time() - MIGRATE_DAYS * 86400
+    live = None
+    moved = 0
+    for p in os.scandir(os.path.join(SRC, "projects")):
+        if not p.is_dir():
+            continue
+        for f in os.scandir(p.path):
+            if not f.name.endswith(".jsonl"):
+                continue
+            st = f.stat()
+            if st.st_mtime < cutoff or cache.get(f.path) == [st.st_mtime, st.st_size]:
+                continue
+            verdict = is_abby_transcript(f.path)
+            if verdict is False:
+                cache[f.path] = [st.st_mtime, st.st_size]
+                continue
+            if verdict is None:
+                continue
+            sid = f.name[:-6]
+            if live is None:
+                live = live_session_ids()
+            if sid in live:
+                continue
+            dest = os.path.join(DST, "projects", p.name)
+            os.makedirs(dest, exist_ok=True)
+            for name in (f.name, sid):  # the transcript and its <sid>/ dir
+                src = os.path.join(p.path, name)
+                if os.path.lexists(src) and not os.path.lexists(os.path.join(dest, name)):
+                    os.rename(src, os.path.join(dest, name))
+            moved += 1
+    write_atomic(MIGRATE_CACHE, cache)
+    return moved
 
 
 # The gateway overlay. It goes in BOTH the user settings and a --settings
@@ -230,6 +345,8 @@ def main():
         die(f"{SRC} not found")
     check_key()
     link_tree()
+    link_memory(os.getcwd())
+    migrate_sessions()
     model, effort = build_settings()
     build_global_config()
 

@@ -1579,7 +1579,7 @@ sid_pid() {
 
 transcript_mtime() {
     local f
-    f=$(find "$HOME/.claude/projects" -name "$1.jsonl" -maxdepth 2 2>/dev/null | head -1)
+    f=$(find "$HOME/.claude/projects" "$HOME/.claude-abby/projects" -name "$1.jsonl" -maxdepth 2 2>/dev/null | head -1)
     [ -n "$f" ] && stat -f %m "$f" 2>/dev/null || echo 0
 }
 
@@ -1989,13 +1989,20 @@ resume_agent() {
     local before_pid; before_pid=$(sid_pid "$sid")
 
     # An `abby` session (Claude Code on abliteration.ai, ~/.local/bin/abby) has
-    # to come back through abby: plain `claude --resume` would continue it on
-    # Anthropic. Its transcript says so on every reply ("model":"abliterated-…").
+    # to come back through abby: plain `claude --resume` would not find it
+    # (abby keeps its conversations under ~/.claude-abby/projects) or would
+    # continue it on Anthropic. One recorded before that split still sits in
+    # ~/.claude/projects; its replies say "model":"abliterated-…".
     local launcher=claude f
-    for f in "$HOME"/.claude/projects/*/"$sid".jsonl; do
-        [ -f "$f" ] && grep -m1 -q '"model":"abliterated-model' "$f" \
-            && { launcher=abby; break; }
+    for f in "$HOME"/.claude-abby/projects/*/"$sid".jsonl; do
+        [ -f "$f" ] && { launcher=abby; break; }
     done
+    if [ "$launcher" = claude ]; then
+        for f in "$HOME"/.claude/projects/*/"$sid".jsonl; do
+            [ -f "$f" ] && grep -m1 -q '"model":"abliterated-model' "$f" \
+                && { launcher=abby; break; }
+        done
+    fi
     if [ "$launcher" = abby ] && ! command -v abby >/dev/null 2>&1; then
         msg -k warn "abby session but abby isn't on PATH — not resumed (abby --resume $sid)"
         return 1
