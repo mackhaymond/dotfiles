@@ -68,6 +68,7 @@
 //! - [`insight`]: per agent, from its transcript: its uncommitted diff (the
 //!   files IT edited), what it is doing, how full its context is.
 //! - [`diff`]: that uncommitted diff in a popup (`agent-ui diff`).
+//! - [`launch`]: ⌘E, the agent launcher popup (`agent-ui launch`).
 //! - [`git`]: `git_head` (pure file reads) and the [`GitCache`].
 //! - [`events`]: the event log reader.
 //! - [`text`]: cell widths, `clip`, `fit_label`, `ago`, `sanitize`.
@@ -89,6 +90,7 @@ pub mod hotkeys;
 pub mod insight;
 pub mod json;
 pub mod keys;
+pub mod launch;
 pub mod menu;
 pub mod model;
 pub mod palette;

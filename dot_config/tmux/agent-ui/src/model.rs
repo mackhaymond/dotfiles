@@ -397,6 +397,10 @@ pub fn kind_glyph(kind: &str) -> Option<&'static str> {
         "opencode" => Some("\u{f489}"),
         // Grok Build: four-pointed star (U+2726), one cell.
         "grok" => Some("✦"),
+        // GitHub Copilot CLI and Antigravity CLI: their AgentMarks logos
+        // ([`HARNESSES`]' glyphs, one cell on their own).
+        "copilot" => Some("\u{10C108}"),
+        "agy" => Some("\u{10C118}"),
         _ => None,
     }
 }
@@ -808,6 +812,21 @@ mod tests {
         assert_eq!(crate::text::wez::char_width(Harness::CONTINUATION), 1);
         assert!(crate::text::wez::AGENT_MARKS.contains(&0x10C1FF));
         assert_eq!(n("codex").mark(), "\u{10C101}\u{10C1FF}\u{10C1FF}");
+    }
+
+    /// The menu's one-cell kind glyph (agent-roster.py `KIND_GLYPH`): copilot
+    /// and agy wear their harness logo, one cell; an unknown kind has none.
+    #[test]
+    fn kind_glyphs() {
+        for k in ["copilot", "agy"] {
+            let g = kind_glyph(k).unwrap();
+            assert_eq!(g.chars().collect::<Vec<_>>(), [Harness::named(k).glyph()], "{k}");
+            assert_eq!(crate::text::wez::dwidth(g), 1, "{k}");
+        }
+        for k in ["claude", "codex", "opencode", "grok"] {
+            assert_eq!(crate::text::wez::dwidth(kind_glyph(k).unwrap()), 1, "{k}");
+        }
+        assert_eq!((kind_glyph(""), kind_glyph("gemini")), (None, None));
     }
 
     /// ASKS WHILE WORK IS OUT: an agent waiting on Mack lands in NEEDS YOU

@@ -107,6 +107,19 @@ fn covered(v: &ViewModel, r: &Row) -> Vec<String> {
         .collect()
 }
 
+/// How many rows the agent titled `title` takes (its card: 2; one line: 1;
+/// 0: no row of its own, folded or gone), checking each stands for it alone
+/// and goes to it.
+fn rows_of(v: &ViewModel, f: &Frame, title: &str) -> usize {
+    let a = v.agents().find(|a| a.title == title).unwrap_or_else(|| panic!("no agent {title:?}"));
+    let me = vec![(a.session.clone(), a.window_id.clone())];
+    let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
+    let Some(y) = f.agents.clone().find(|&y| f.rows[y].covers == me) else { return 0 };
+    assert!(f.rows[y].targets.iter().all(|t| t.2 == go || matches!(t.2, Target::Diff(_))), "{title}: {:?}", f.rows[y].targets);
+    let second = f.rows.get(y + 1).is_some_and(|r| r.covers.is_empty() && r.target_at(4) == Some(&go));
+    1 + usize::from(second)
+}
+
 /// The agents listed under `name`'s header: the rows after it to the next
 /// header (or the section's end), as text.
 fn under(f: &Frame, name: &str) -> Vec<String> {
@@ -215,17 +228,42 @@ fn a_pending_space_never_folds() {
 /// neither it is fresh (its card stays).
 #[test]
 fn idle_agents_fold_within_an_open_space() {
-    let v = fleet("all");
+    let v = lettered(fleet("all"));
     let f = layout(&v, 34, 90, &Opts::default());
     let t = texts(&f);
-    let main = under(&f, "main");
-    assert!(main.iter().any(|l| l.contains("Tmux Agent Sidebar")), "{t:#?}");
-    let fold = main.iter().find(|l| l.contains("2 idle")).unwrap_or_else(|| panic!("{t:#?}"));
-    assert!(fold.contains("Notch Tasks"), "{fold:?}");
+    // main: its working agent a card, each agent out of mind ONE row of its
+    // own (letter, title in full, age), never merged into an idle line.
+    assert_eq!(rows_of(&v, &f, "Tmux Agent Sidebar"), 2, "{t:#?}");
+    for title in ["Notch Tasks Orchestrator", "Lost suit jacket"] {
+        assert_eq!(rows_of(&v, &f, title), 1, "{title}: {t:#?}");
+    }
+    assert!(!t.iter().any(|l| l.contains(" idle ·")), "no merged line at full height: {t:#?}");
+    let a = v.agents().find(|a| a.title == "Notch Tasks Orchestrator").unwrap();
+    let y = f.agents.clone().find(|&y| f.rows[y].covers.len() == 1 && f.rows[y].covers[0].1 == a.window_id).unwrap();
+    let l = &t[y];
+    let letter = a.letter.expect("a letter");
+    // (24 cells of title at 34 columns: the age makes way for it.)
+    assert!(l.contains(&format!(" {letter}  Notch Tasks Orchestrator")), "letter and the whole title: {l:?}");
+    assert_eq!(f.rows[y].target_at(20), Some(&Target::Go { win: a.window_id.clone(), session: a.session.clone() }));
+    // A shorter title keeps its age.
+    let lc = &t[find(&f, "Launchpad catalog")];
+    assert!(lc.trim_end().ends_with("5h"), "its age: {lc:?}");
+    // One background per row (no segment paints its own inside the tile
+    // but the key-cap), the zebra going on: neighbours differ.
+    assert!(f.rows[y].bg.is_some());
+    assert_ne!(f.rows[y].bg, f.rows[y + 1].bg, "neighbours differ");
+    assert_ne!(f.rows[y].bg, f.rows[y - 1].bg, "neighbours differ");
+    // A title wider than the row is the row's first claim: the age goes first.
+    let long = "An agent with a very long title that cannot fit at all";
+    let ag: Vec<A<'static>> = fleet_agents().into_iter().map(|x| if x.title == "Lost suit jacket" { A { title: long, ..x } } else { x }).collect();
+    let vl = lettered(scoped(ag, "@2", "main", "on", "all", ""));
+    let fl = layout(&vl, 34, 90, &Opts::default());
+    let yl = find(&fl, "An agent with");
+    assert!(texts(&fl)[yl].contains("An agent with a very lo") && !texts(&fl)[yl].contains("10h"), "{:?}", texts(&fl)[yl]);
     // cua-notch: its idle agent prompted 30 minutes ago keeps its card.
-    assert!(under(&f, "cua-notch").iter().any(|l| l.contains("Popup shadow")) && !under(&f, "cua-notch").iter().any(|l| l.contains(" idle ·")));
-    // Unstamped in main: idle 10h by its state stamp folds; with no state
-    // stamp either it is fresh and keeps its card.
+    assert_eq!(rows_of(&v, &f, "Popup shadow"), 2, "{t:#?}");
+    // Unstamped in main: idle 10h by its state stamp goes to one line; with
+    // no state stamp either it is fresh and keeps its card.
     let strip = |x: A<'static>, keys: &[&str]| { let mut x = x; x.set.retain(|(k, _)| !keys.contains(k)); x };
     let ag: Vec<A<'static>> = fleet_agents().into_iter().map(|x| match x.title {
         "Lost suit jacket" => strip(x, &["thread_at"]),
@@ -234,25 +272,47 @@ fn idle_agents_fold_within_an_open_space() {
     }).collect();
     let v2 = scoped(ag, "@2", "main", "on", "all", "");
     let f2 = layout(&v2, 34, 90, &Opts::default());
-    let m2 = under(&f2, "main");
-    assert!(m2.iter().any(|l| l.contains("1 idle") && l.contains("Lost suit")), "{m2:#?}");
-    assert!(m2.iter().any(|l| l.contains("Notch Tasks") && !l.contains(" idle ·")), "{m2:#?}");
-    // mackhaymond.co, kept open: its two idle agents fold into the line.
-    assert!(under(&f, "mackhaymond.co").iter().any(|l| l.contains("2 idle") && l.contains("Launchpad")), "{t:#?}");
-    // The fold line stands for exactly them.
-    let y = f.agents.clone().find(|&y| t[y].contains("2 idle") && t[y].contains("Notch Tasks")).unwrap();
+    assert_eq!((rows_of(&v2, &f2, "Lost suit jacket"), rows_of(&v2, &f2, "Notch Tasks Orchestrator")), (1, 2), "{:#?}", texts(&f2));
+    // mackhaymond.co, kept open: its two idle agents one line each.
+    assert_eq!((rows_of(&v, &f, "Launchpad catalog"), rows_of(&v, &f, "Tunnel hostname")), (1, 1), "{t:#?}");
+    // A longer N (12h): main's 5h and 10h agents keep their cards.
+    let f = layout(&v, 34, 90, &Opts { bar: Bar { fold_after: Some(12 * H), ..Bar::default() }, ..Opts::default() });
+    assert_eq!((rows_of(&v, &f, "Notch Tasks Orchestrator"), rows_of(&v, &f, "Lost suit jacket")), (2, 2), "{:#?}", texts(&f));
+}
+
+/// Under ROW pressure the ladder still merges idle agents into one line,
+/// and there each name follows its letter (bold, in its space's key-cap
+/// colour), a click on a name going to that agent; the rest of the line is
+/// the menu's Idle tab. The line stands for exactly them.
+#[test]
+fn the_pressure_line_names_each_agent_by_its_letter() {
+    let ag: Vec<A<'static>> = fleet_agents().into_iter().filter(|x| x.s == "main" || x.s == "cua-notch").collect();
+    let v = lettered(scoped(ag, "@2", "main", "on", "all", ""));
+    let (h, f) = (8u16..40).map(|h| (h, layout(&v, 34, h, &Opts::default())))
+        .find(|(_, f)| f.agents_step >= 1 && texts(f).iter().any(|l| l.contains("2 idle ·")))
+        .expect("a height that folds the idle line");
+    let t = texts(&f);
+    let y = t.iter().position(|l| l.contains("2 idle ·")).unwrap();
+    let notch = v.agents().find(|a| a.title == "Notch Tasks Orchestrator").unwrap();
+    let suit = v.agents().find(|a| a.title == "Lost suit jacket").unwrap();
+    let (kn, ks) = (notch.letter.unwrap(), suit.letter.unwrap());
+    assert!(t[y].contains(&format!("2 idle · {kn} Notc")), "{h}: {:?}", t[y]);
     let mut got = covered(&v, &f.rows[y]);
     got.sort();
     assert_eq!(got, ["Lost suit jacket", "Notch Tasks Orchestrator"]);
-    // One aged agent alone folds too: main without Lost suit jacket.
-    let ag: Vec<A<'static>> = fleet_agents().into_iter().filter(|x| x.title != "Lost suit jacket").collect();
-    let v1 = scoped(ag, "@2", "main", "on", "all", "");
-    let f1 = layout(&v1, 34, 90, &Opts::default());
-    assert!(under(&f1, "main").iter().any(|l| l.contains("1 idle") && l.contains("Notch Tasks")), "{:#?}", texts(&f1));
-    // A longer N (12h): main's 5h and 10h agents keep their cards.
-    let f = layout(&v, 34, 90, &Opts { bar: Bar { fold_after: Some(12 * H), ..Bar::default() }, ..Opts::default() });
-    assert!(under(&f, "main").iter().any(|l| l.contains("Lost suit jacket")) && !under(&f, "main").iter().any(|l| l.contains(" idle ·")),
-        "{:#?}", texts(&f));
+    let r = &f.rows[y];
+    let ink = space_colour(v.spaces.iter().find(|s| s.name == "main").unwrap());
+    assert!(r.segs.iter().any(|s| s.text == format!("{kn} ") && s.bold && s.fg == name_ink(ink)), "{:?}", r.segs);
+    let go = |a: &Agent| Target::Go { win: a.window_id.clone(), session: a.session.clone() };
+    assert_eq!(r.target_at(col(&t[y], &format!("{kn} Notc"))), Some(&go(notch)));
+    assert_eq!(r.target_at(col(&t[y], "Notc") + 2), Some(&go(notch)));
+    assert_eq!(r.target_at(3), Some(&Target::Menu(Some("idle"))));
+    // The second name, when the row shows it, goes to its agent.
+    if let Some(i) = t[y].find(&format!("{ks} Lost")) {
+        assert_eq!(r.target_at(t[y][..i].chars().count() as u16), Some(&go(suit)));
+    }
+    assert_eq!(width(&r.segs), 34);
+    check_accounting("pressure", &v, &f);
 }
 
 /// UNSAVED WORK (the stale sweep's dirty verdict) keeps the agent's card and
@@ -277,7 +337,7 @@ fn unsaved_work_never_folds() {
     let main = under(&f, "main");
     assert!(main.iter().any(|l| l.contains("Lost suit jacket")), "{t:#?}");
     assert!(main.iter().any(|l| l.contains("unsaved")), "{t:#?}");
-    assert!(main.iter().any(|l| l.contains("1 idle") && l.contains("Notch Tasks")), "{t:#?}");
+    assert_eq!((rows_of(&v, &f, "Lost suit jacket"), rows_of(&v, &f, "Notch Tasks Orchestrator")), (2, 1), "{t:#?}");
     assert!(!under(&f, "schedule").is_empty(), "schedule holds unsaved work: {t:#?}");
     assert!(under(&f, "canvas").is_empty(), "canvas is clean: {t:#?}");
 }
@@ -288,9 +348,7 @@ fn the_clients_own_agent_never_folds() {
     // The client on main's Lost suit jacket (@4).
     let v = scoped(fleet_agents(), "@4", "main", "on", "all", "");
     let f = layout(&v, 34, 90, &Opts::default());
-    let main = under(&f, "main");
-    assert!(main.iter().any(|l| l.contains("Lost suit jacket")), "{main:#?}");
-    assert!(main.iter().any(|l| l.contains("1 idle") && l.contains("Notch Tasks")), "{main:#?}");
+    assert_eq!((rows_of(&v, &f, "Lost suit jacket"), rows_of(&v, &f, "Notch Tasks Orchestrator")), (2, 1), "{:#?}", texts(&f));
 }
 
 /// A missing `@thread_at` falls back to the idle window's `@agent_since`
@@ -310,7 +368,7 @@ fn missing_stamps_fall_back_to_the_state_stamp_else_fresh() {
         assert!(under(&f, name).is_empty(), "{name}: {t:#?}");
     }
     assert!(header_row(&f, "bai").text().contains("3d"), "{t:#?}");
-    assert!(under(&f, "main").iter().any(|l| l.contains("2 idle")), "{t:#?}");
+    assert_eq!((rows_of(&v, &f, "Lost suit jacket"), rows_of(&v, &f, "Notch Tasks Orchestrator")), (1, 1), "{t:#?}");
     // Neither stamp: fresh.
     let v = scoped(strip(fleet_agents(), &["thread_at", "since"]), "@2", "main", "on", "all", "");
     let f = layout(&v, 34, 90, &Opts::default());
@@ -448,8 +506,7 @@ fn the_one_line_shape_counts_what_folds() {
 /// two-row cards, every agent accounted for.
 #[test]
 fn fleet_frames_hold_at_every_size() {
-    for scope in ["all", "active", "space"] {
-        let v = fleet(scope);
+    for (scope, v) in ["all", "active", "space"].into_iter().flat_map(|s| [(s, fleet(s)), (s, lettered(fleet(s)))]) {
         for w in [16u16, 24, 34, 44] {
             for h in 2u16..=70 {
                 let f = layout(&v, w, h, &Opts::default());
@@ -459,6 +516,34 @@ fn fleet_frames_hold_at_every_size() {
                 }
                 check_accounting(&format!("{scope} {w}x{h}"), &v, &f);
             }
+        }
+    }
+}
+
+/// One space, one working agent and three out of mind, lettered, at 34
+/// columns: roomy (each its own line) and under row pressure (the ladder's
+/// lettered idle line) (`cargo test --lib fold::render_one_line --
+/// --ignored --nocapture`).
+#[test]
+#[ignore]
+fn render_one_line() {
+    let ix = |x: A<'static>| x.with("space_index", "1");
+    let ag = vec![
+        home("main", "1"),
+        ix(prompted(a("main", 1, "running", "Tmux Agent Sidebar"), 60)),
+        ix(quiet("main", 2, "Notch Tasks Orchestrator", 5 * H)),
+        ix(quiet("main", 3, "Lost suit jacket", 10 * H)),
+        ix(quiet("main", 4, "Backyard Halloween", 26 * H)),
+        home("bai", "2"),
+        ix(prompted(a("bai", 1, "needs-input", "Application link"), 600).with("detail_kind", "ask").with("detail", "Which deadline?"))
+            .with("space_index", "2"),
+    ];
+    let v = lettered(scoped(ag, "@2", "main", "on", "all", ""));
+    for h in [30u16, 15] {
+        let f = layout(&v, 34, h, &Opts::default());
+        println!("--- 34x{h} (agents step {})", f.agents_step);
+        for r in &f.rows {
+            println!("|{}|", initials(&r.text()));
         }
     }
 }

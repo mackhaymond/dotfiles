@@ -1,21 +1,25 @@
-"""⌘E, the LAUNCH leader (spaces.conf's `launch` table + scripts/agent-launch.sh).
+"""⌘E, the agent LAUNCHER (spaces.conf's User27 + `agent-ui launch` +
+scripts/agent-launch.sh).
 
-Shape: WezTerm's CMD+E sends one private sequence (User27), the leader arms
-`launch`, ⏎ and ⌘E again are prefix k's claude, every letter and capital is
-bound (so none leaks to the pane or to prefix v's stash root keys).
+Shape: WezTerm's CMD+E sends one private sequence (User27), which opens the
+`agent-ui launch` popup (or, with no agent-ui, says so); no `launch` key table
+is left. The popup hands every launch to `agent-launch.sh go LETTER CLIENT
+PANE [SPACE]`, the one table of agents.
 
 Live, on test_spaces' harness (a PRIVATE `-L` server started with
 `-f /dev/null`, spaces.conf sourced with @spaces on, one client attached from
-a pty this process opens; never the user's server): keys pressed with
-`send-keys -K -c <client>`. No real agent ever runs: the server's
-default-shell is /bin/sh and its default-command only records the new pane's
-ZSH_AUTOSTART into the test's temp dir, then sleeps. Which agents are
-INSTALLED is a fake PATH (LAUNCH_PATH: stub executables in the temp dir) plus
-a fake HOME (~/.grok/bin/grok, ~/.local/bin/cursor-agent), set in the
-server's global environment for the run-shell jobs. Messages go through the
-real notify.sh, whose log (XDG_STATE_HOME, the temp dir) is read back.
-Teardown is test_spaces.Server's: the client killed, kill-server on that
-socket, its file removed. Run with unittest or pytest.
+a pty this process opens; never the user's server): the script driven
+directly, and the real popup driven by keys (`send-keys -K -c <client>`) when
+a built agent-ui is found (AGENT_UI_BIN, else the crate's target/debug or
+target/release). No real agent ever runs: the server's default-shell is
+/bin/sh and its default-command only records the new pane's ZSH_AUTOSTART
+into the test's temp dir, then sleeps. Which agents are INSTALLED is a fake
+PATH (LAUNCH_PATH: stub executables in the temp dir) plus a fake HOME
+(~/.grok/bin/grok, ~/.local/bin/cursor-agent), set in the server's global
+environment for the run-shell jobs. Messages go through the real notify.sh,
+whose log (XDG_STATE_HOME, the temp dir) is read back. Teardown is
+test_spaces.Server's: the client killed, kill-server on that socket, its file
+removed. Run with unittest or pytest (set TMUX_TMPDIR to a short private dir).
 """
 import os
 from pathlib import Path
@@ -36,15 +40,33 @@ SPACES = ts.SPACES
 WEZTERM = ts.WEZTERM
 TMUX = ts.TMUX
 ZSH = shutil.which("zsh")
-FOCUS = 'run-shell -b "notifyutil -p com.mackhaymond.tmux.focus"'
 # A hookless agent's ZSH_AUTOSTART (aider's): the harness mark is unset in an
 # `always` block, so even a ^C'd agent leaves a plain shell.
 UNSET = 'tmux set-option -uw -t "$TMUX_PANE" @agent_harness 2>/dev/null'
 AIDER_AUTOSTART = "{ aider; } always { %s; }" % UNSET
+INSTALLED_SET = "c:claude:claude a:abby:abby x:codex:codex g:grok:grok u:cursor:cursor-agent d:aider:aider"
+
+
+def agent_ui_bin():
+    """A built agent-ui, else None (the popup tests skip)."""
+    env = os.environ.get("AGENT_UI_BIN")
+    cands = [Path(env)] if env else []
+    cands += [HERE / "agent-ui" / "target" / d / "agent-ui" for d in ("debug", "release")]
+    if os.environ.get("CARGO_TARGET_DIR"):
+        cands.append(Path(os.environ["CARGO_TARGET_DIR"]) / "debug" / "agent-ui")
+    for c in cands:
+        if c.is_file() and os.access(c, os.X_OK):
+            r = subprocess.run([str(c), "launch", "--bogus"], capture_output=True, text=True)
+            if "agent-ui launch" in r.stderr:   # a binary that knows the subcommand
+                return str(c)
+    return None
+
+
+AGENT_UI = agent_ui_bin()
 
 
 def on_lines(prefix):
-    return [l for l in ts.on_branch().splitlines() if l.startswith(prefix)]
+    return [l.strip() for l in ts.on_branch().splitlines() if l.strip().startswith(prefix)]
 
 
 @unittest.skipUnless(ZSH, "zsh not installed")
@@ -119,29 +141,34 @@ class Shape(unittest.TestCase):
         head = SPACES.read_text().split('\n%if "#{==:#{@spaces},on}"\n')[0]
         self.assertIn('set -s user-keys[27] "\\e[9140~"', head.splitlines())
 
-    def test_the_leader_arms_launch_and_off_drops_it(self):
-        self.assertEqual(on_lines("bind -n User27 "),
-                         [f"bind -n User27 switch-client -T launch \\; {FOCUS}"])
+    def test_cmd_e_opens_the_launcher_popup(self):
+        # The fallback first (no agent-ui: a notice), then, when the binary
+        # is there at load, the popup: sized to the installed set, centred
+        # on the WezTerm row (@popup_x), the client's pane handed over.
+        binds = on_lines("bind -n User27 ")
+        self.assertEqual(len(binds), 2, binds)
+        self.assertIn("launch: agent-ui is not installed", binds[0])
+        self.assertNotIn("display-popup", binds[0])
+        popup = binds[1]
+        self.assertIn("display-popup -c '#{client_tty}' -E -B", popup)
+        self.assertIn("-w '#{?#{e|<:#{client_width},46},#{client_width},46}'", popup)
+        self.assertIn("-h '#{e|+:#{?#{n:@launch_count},#{@launch_count},9},6}'", popup)
+        self.assertIn("-x '##{E:@popup_x}'", popup)
+        self.assertTrue(popup.endswith("'#{@space_agent_ui}' launch --client '#{client_tty}' --pane '#{pane_id}'\""), popup)
+        on = ts.on_branch()
+        self.assertIn("if-shell \"test -x '#{@space_agent_ui}'\" {\n  " + popup + "\n}", on)
+        # The popup's width and its chrome are agent-ui's numbers.
+        src = (HERE / "agent-ui" / "src" / "launch.rs").read_text()
+        self.assertIn("pub const POPUP_W: u16 = 46;", src)
+        self.assertIn("pub const CHROME_H: u16 = 6;", (HERE / "agent-ui" / "src" / "launch" / "view.rs").read_text())
+
+    def test_no_launch_table_and_off_drops_user27(self):
+        text = SPACES.read_text()
+        self.assertFalse([l for l in text.splitlines() if re.match(r"\s*bind\b.*-T launch\b", l)])
+        self.assertIn("unbind -aq -T launch", on_lines("unbind -aq -T launch"))
         off = ts.else_branch().splitlines()
         self.assertIn("unbind -q -n User27", off)
         self.assertIn("unbind -aq -T launch", off)
-        self.assertFalse([l for l in off if "-T launch" in l and l.startswith("bind")])
-
-    def test_enter_and_cmd_e_again_are_prefix_k(self):
-        k = on_lines("bind k ")[0][len("bind k "):].replace(" \\; ", " ; ")
-        for key in ("Enter", "User27"):
-            self.assertEqual(on_lines(f"bind -T launch {key} "), [f"bind -T launch {key} {{ {k} ; {FOCUS} }}"])
-
-    def test_every_letter_goes_through_the_script(self):
-        for c in "abcdefghijklmnopqrstuvwxyz":
-            self.assertEqual(on_lines(f"bind -T launch {c} "),
-                             [f"bind -T launch {c} {{ run-shell -b \"#{{@launch_sh}} go {c} '#{{client_name}}' '#{{pane_id}}'\" ; {FOCUS} }}"])
-            C = c.upper()
-            self.assertEqual(on_lines(f"bind -T launch {C} "),
-                             [f"bind -T launch {C} {{ run-shell -b \"#{{@launch_sh}} pick {c} '#{{client_name}}' '#{{pane_id}}'\" ; {FOCUS} }}"])
-        for key in ("Escape", "Space", "C-c"):
-            self.assertEqual(on_lines(f"bind -T launch {key} "), [f"bind -T launch {key} {FOCUS}"])
-        self.assertNotIn("bind -T launch Any", SPACES.read_text())
 
     def test_the_table_is_the_scripts_one(self):
         # The letters Mack chose, ollama nowhere.
@@ -169,6 +196,8 @@ class Launch(ts.Server):
         self.attach()
         self.t("select-window", "-t", self.here)
         self.wait(lambda: self.on("#{window_id}|#{pane_current_path}"), f"{self.here}|{self.proj}")
+        self.pane = self.rows()[self.here]["pane_id"]
+        self.sid = self.t("display", "-p", "-t", "main:", "#{session_id}")
 
     def source(self):
         # Before spaces.conf's first load (the server is up, the config not
@@ -190,6 +219,10 @@ class Launch(ts.Server):
             self.t("set-environment", "-g", "LAUNCH_PATH", self.fake)
             self.t("set-environment", "-g", "LAUNCH_HOME", self.fhome)
             self.t("set", "-g", "@launch_sh", f"bash {LAUNCH}")
+            self.ready = os.path.join(base, "launch-ready")
+            if AGENT_UI:
+                self.t("set", "-g", "@space_agent_ui", AGENT_UI)
+                self.t("set-environment", "-g", "AGENT_UI_LAUNCH_TRACE", self.ready)
         super().source()
 
     @staticmethod
@@ -201,14 +234,20 @@ class Launch(ts.Server):
     FIELDS = ["window_id", "window_index", "@agent_state", "@agent_kind", "@agent_harness", "@agent_born",
               "@agent_summary", "pane_id", "pane_current_path"]
 
-    def rows(self):
-        out = self.t("list-windows", "-t", "main", "-F", "|".join("#{%s}" % f for f in self.FIELDS))
+    def rows(self, session="main"):
+        out = self.t("list-windows", "-t", session, "-F", "|".join("#{%s}" % f for f in self.FIELDS))
         return {r.split("|")[0]: dict(zip(self.FIELDS, r.split("|"))) for r in out.splitlines()}
 
-    def new_one(self, before, timeout=4.0):
+    def all_rows(self):
+        out = {}
+        for s in self.t("list-sessions", "-F", "#{session_name}").split():
+            out.update(self.rows(s))
+        return out
+
+    def new_one(self, before, timeout=4.0, session="main"):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            new = {w: r for w, r in self.rows().items() if w not in before}
+            new = {w: r for w, r in self.rows(session).items() if w not in before}
             if new:
                 self.assertEqual(len(new), 1, new)
                 return next(iter(new.values()))
@@ -225,20 +264,16 @@ class Launch(ts.Server):
         log = os.path.join(self.env["XDG_STATE_HOME"], "tmux-notify", "log")
         return [l.split("\t")[1:4] for l in Path(log).read_text().splitlines()] if os.path.exists(log) else []
 
-    def table(self):
-        return self.on("#{client_key_table}")
-
     def script(self, *args, env=None):
         e = dict(self.env, TMUX=f"{self.path},0,0", LAUNCH_HOME=self.fhome, LAUNCH_PATH=self.fake, **(env or {}))
         return subprocess.run(["bash", str(LAUNCH), *args], env=e, capture_output=True, text=True, timeout=20)
 
-    def launch(self, *keys):
-        """⌘E then KEYS; the new window's row (after the current one)."""
-        before = self.rows()
-        self.key("User27")
-        self.wait(self.table, "launch")
-        self.key(*keys)
-        return before, self.new_one(before)
+    def go(self, letter, *space, session="main"):
+        """agent-launch.sh go LETTER (as the popup runs it); the new window's row."""
+        before = self.rows(session)
+        r = self.script("go", letter, self.client, self.pane, *space)
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        return self.new_one(before, session=session)
 
     def assert_after_here(self, row):
         self.assertEqual(int(row["window_index"]), int(self.rows()[self.here]["window_index"]) + 1, row)
@@ -247,71 +282,75 @@ class Launch(ts.Server):
     def assert_born(self, row, kind):
         self.assertEqual((row["@agent_state"], row["@agent_kind"]), ("idle", kind), row)
         self.assertRegex(row["@agent_born"], r"^\d+$")
-        self.assertEqual(row["@agent_summary"], "my-project/New Session")
+        self.assertRegex(row["@agent_summary"], r"/New Session$")
+
+    def other_space(self):
+        """A second space, `notes` (⌘2 once synced): its session id."""
+        notes = os.path.join(os.path.realpath(self.tmp), "notes")
+        os.makedirs(notes, exist_ok=True)
+        self.new_session("notes", path=notes)
+        self.wait_home("notes")
+        self.wait(lambda: self.t("show", "-t", "notes", "-qv", "@space_index") != "", True)
+        return self.t("display", "-p", "-t", "notes:", "#{session_id}"), notes
 
     # -- the installed set -------------------------------------------------
     def test_refresh_records_the_installed_agents_from_path_and_home(self):
         # The load's own refresh already ran on this server (spaces.conf,
         # through the global environment); the script on demand agrees.
-        want = "c:claude a:abby x:codex g:grok u:cursor d:aider"
-        self.wait(lambda: self.t("show", "-gqv", "@launch_agents"), want)
+        self.wait(lambda: self.t("show", "-gqv", "@launch_agents"), INSTALLED_SET)
+        self.assertEqual(self.t("show", "-gqv", "@launch_count"), "6")
         self.t("set", "-gu", "@launch_agents")
+        self.t("set", "-gu", "@launch_count")
         r = self.script("refresh")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.t("show", "-gv", "@launch_agents"), want)
-        # agy installed: its letter joins, in the table's order.
+        self.assertEqual(self.t("show", "-gv", "@launch_agents"), INSTALLED_SET)
+        self.assertEqual(self.t("show", "-gv", "@launch_count"), "6")
+        # agy installed: its row joins, in the table's order.
         self.stub(os.path.join(self.fake, "agy"))
         self.script("refresh")
-        self.assertEqual(self.t("show", "-gv", "@launch_agents"),
-                         "c:claude a:abby x:codex g:grok y:agy u:cursor d:aider")
+        self.assertEqual(self.t("show", "-gv", "@launch_agents"), INSTALLED_SET.replace(" u:", " y:agy:agy u:"))
+        self.assertEqual(self.t("show", "-gv", "@launch_count"), "7")
         self.assertEqual(self.script("list").stdout.split("\n")[0], "claude c claude")
 
-    # -- the keys ----------------------------------------------------------
-    def test_cmd_e_arms_launch_and_escape_cancels(self):
-        before = self.rows()
-        for cancel in ("Escape", "Space", "C-c"):
-            self.key("User27")
-            self.wait(self.table, "launch")
-            self.key(cancel)
-            self.wait(self.table, "root")
-        time.sleep(0.3)
-        self.assertEqual(self.rows().keys(), before.keys())
+    def test_popup_height_follows_the_count_zero_included(self):
+        # The binding's own -h format, evaluated by this server: one row per
+        # agent plus the 6 of chrome; unset (no refresh yet) is 9 agents; a
+        # recorded 0 is 0 (a bare `#{?@launch_count}` read "0" as unset: 15).
+        popup = on_lines("bind -n User27 ")[1]
+        fmt = re.search(r"-h '([^']*)'", popup).group(1)
+        for count, rows in ((None, "15"), ("0", "6"), ("1", "7"), ("6", "12"), ("9", "15")):
+            if count is None:
+                self.t("set", "-gu", "@launch_count")
+            else:
+                self.t("set", "-g", "@launch_count", count)
+            self.assertEqual(self.t("display", "-p", fmt), rows, count)
 
-    def test_enter_opens_claude_born_an_agent(self):
-        _, row = self.launch("Enter")
+    # -- go: what the popup runs ------------------------------------------
+    def test_claude_and_a_letter_open_here_born(self):
+        row = self.go("c")
         self.assert_born(row, "claude")
         self.assert_after_here(row)
-        self.assertEqual(self.autostart(row), "claude")
-        self.assertEqual(row["@agent_harness"], "")
-        self.wait(self.table, "root")
-
-    def test_cmd_e_twice_opens_claude(self):
-        _, row = self.launch("User27")
-        self.assert_born(row, "claude")
-        self.assertEqual(self.autostart(row), "claude")
-
-    def test_a_letter_opens_that_agent_here(self):
-        _, row = self.launch("x")
+        self.assertEqual((self.autostart(row), row["@agent_harness"]), ("claude", ""))
+        self.wait(lambda: self.on("#{window_id}"), row["window_id"])
+        self.t("select-window", "-t", self.here)
+        row = self.go("x")
         self.assert_born(row, "codex")
         self.assert_after_here(row)
         self.assertEqual(self.autostart(row), "codex")
-        self.wait(lambda: self.on("#{window_id}"), row["window_id"])
         # abby: claude's hooks, its own harness mark.
         self.t("select-window", "-t", self.here)
-        _, row = self.launch("a")
+        row = self.go("a")
         self.assert_born(row, "claude")
-        self.assertEqual(row["@agent_harness"], "abby")
-        self.assertEqual(self.autostart(row), "abby")
+        self.assertEqual((row["@agent_harness"], self.autostart(row)), ("abby", "abby"))
         # agy (Antigravity) and copilot: their own kinds, born agents.
         for name, key in (("agy", "y"), ("copilot", "p")):
             self.stub(os.path.join(self.fake, name))
-            self.t("select-window", "-t", self.here)
-            _, row = self.launch(key)
+            row = self.go(key)
             self.assert_born(row, name)
             self.assertEqual((row["@agent_harness"], self.autostart(row)), ("", name))
 
     def test_a_hookless_agent_is_a_shell_wearing_its_harness(self):
-        _, row = self.launch("d")
+        row = self.go("d")
         # Not born an agent (no hooks, no process the watcher knows): no
         # state for the GC to collect, only the harness mark, which the tab's
         # command unsets again when aider exits.
@@ -320,99 +359,159 @@ class Launch(ts.Server):
         self.assert_after_here(row)
         self.assertEqual(self.autostart(row), AIDER_AUTOSTART)
         # cursor-agent (in ~/.local/bin): harness `cursor`, the sidebar's id.
-        self.t("select-window", "-t", self.here)
-        _, row = self.launch("u")
+        row = self.go("u")
         self.assertEqual((row["@agent_state"], row["@agent_harness"]), ("", "cursor"))
         self.assertEqual(self.autostart(row), AIDER_AUTOSTART.replace("aider", "cursor-agent"))
 
+    def test_another_space_gets_it_at_its_end(self):
+        nsid, notes = self.other_space()
+        # codex into notes: at its END, in its root, the client moved there.
+        row = self.go("x", nsid, session="notes")
+        self.assert_born(row, "codex")
+        self.assertEqual(int(row["window_index"]), max(int(w["window_index"]) for w in self.rows("notes").values()))
+        self.assertEqual(row["pane_current_path"], notes)
+        self.assertEqual(self.autostart(row), "codex")
+        self.wait(lambda: self.on("#{window_id}"), row["window_id"])
+        # claude, hookless aider: the same way (space.sh new-tab's claude;
+        # agent-launch.sh open for the rest).
+        row = self.go("c", nsid, session="notes")
+        self.assertEqual((row["@agent_kind"], self.autostart(row)), ("claude", "claude"))
+        row = self.go("d", nsid, session="notes")
+        self.assertEqual((row["@agent_state"], row["@agent_harness"]), ("", "aider"))
+        # The pane's own space named: beside it, as without one.
+        self.t("switch-client", "-c", self.client, "-t", self.here)
+        row = self.go("x", self.sid)
+        self.assert_after_here(row)
+        # Not a session id: says so, opens nothing.
+        before = self.all_rows()
+        self.assertEqual(self.script("go", "x", self.client, self.pane, "notes").returncode, 0)
+        self.wait(lambda: ["warn", self.client, "launch: no space notes"] in self.said(), True)
+        self.assertEqual(self.all_rows().keys(), before.keys())
+
     def test_a_missing_agent_says_so_and_opens_nothing(self):
-        before = self.rows()
+        before = self.all_rows()
         self.t("set", "-g", "@launch_agents", "stale")
         for key, text in (("y", "launch: agy not installed"), ("m", "launch: nothing on m"), ("b", "launch: nothing on b")):
-            self.key("User27")
-            self.wait(self.table, "launch")
-            self.key(key)
+            r = self.script("go", key, self.client, self.pane)
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
             self.wait(lambda: ["warn", self.client, text] in self.said(), True)
+        # Into another space too.
+        r = self.script("go", "y", self.client, self.pane, "$0")
+        self.assertEqual(r.returncode, 0)
         time.sleep(0.3)
-        self.assertEqual(self.rows().keys(), before.keys())
+        self.assertEqual(self.all_rows().keys(), before.keys())
         # A miss refreshed the installed set.
-        self.assertEqual(self.t("show", "-gv", "@launch_agents"), "c:claude a:abby x:codex g:grok u:cursor d:aider")
-
-    def test_shift_letter_opens_the_space_picker_for_that_agent(self):
-        # The popup's argv: ⌘⇧R's picker (space.sh pick-tab agent), plus the agent.
-        pane = self.rows()[self.here]["pane_id"]
-        r = self.script("pick", "--print", "x", self.client, pane)
-        argv = r.stdout.splitlines()
-        self.assertEqual(argv[0], "display-popup")
-        self.assertIn("SPACE_LAUNCH=codex", argv)
-        self.assertEqual(argv[argv.index("SPACE_LAUNCH=codex") - 1], "-e")
-        self.assertRegex(argv[-1], r"pick-tab agent ")
-        # Pressed: the popup runs space.sh (a recorder here) with SPACE_LAUNCH.
-        log = os.path.join(self.tmp, "space-sh.log")
-        rec = os.path.join(self.tmp, "space-sh-rec.sh")
-        Path(rec).write_text(f'printf "%s|%s\\n" "$SPACE_LAUNCH" "$*" >> {log}\n')
-        self.t("set", "-g", "@space_sh", f"bash {rec}")
-        self.key("User27")
-        self.wait(self.table, "launch")
-        self.key("X")
-        calls = lambda: Path(log).read_text().splitlines() if os.path.exists(log) else []
-        self.wait(lambda: [c.split(" ")[0] for c in calls()], ["codex|pick-tab"])
-        self.assertIn("|pick-tab agent ", calls()[0])
-        # Not installed: says so, no popup.
-        self.key("User27")
-        self.wait(self.table, "launch")
-        self.key("Y")
-        self.wait(lambda: ["warn", self.client, "launch: agy not installed"] in self.said(), True)
-        self.assertEqual(len(calls()), 1)
+        self.assertEqual(self.t("show", "-gv", "@launch_agents"), INSTALLED_SET)
 
     def test_run_shell_paths_always_exit_0_and_say_nothing(self):
         # run-shell -b shows a nonzero exit ("... returned 1") or any output
         # in the pane's view mode. A tmux stand-in that fails the call each
-        # path ends on: still 0, still silent.
+        # path ends on: still 0, still silent; a space.sh that fails too.
         fake = os.path.join(self.tmp, "failing-tmux")
         Path(fake).write_text("#!/bin/sh\n"
-                              'case "$1" in display-popup|new-window|set) echo "boom $1" >&2; exit 1 ;; esac\n'
+                              'case "$1" in new-window|set) echo "boom $1" >&2; exit 1 ;; esac\n'
                               f'exec {TMUX} "$@"\n')
         os.chmod(fake, 0o755)
-        pane = self.rows()[self.here]["pane_id"]
-        before = self.rows()
+        before = self.all_rows()
         self.t("set", "-gu", "@launch_agents")
-        for args in (("pick", "x", self.client, pane), ("go", "x", self.client, pane),
-                     ("go", "x", self.client, "%999"), ("go", "m", self.client, pane),
-                     ("pick", "y", self.client, pane), ("refresh",)):
+        self.t("set", "-g", "@space_sh", "sh -c 'echo boom; exit 3' x")
+        for args in (("go", "x", self.client, self.pane), ("go", "x", self.client, "%999"),
+                     ("go", "m", self.client, self.pane), ("go", "x", self.client, self.pane, "$99"),
+                     ("go", "x", self.client, self.pane, "$0"), ("refresh",)):
             r = self.script(*args, env={"LAUNCH_TMUX_BIN": fake})
             self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), args)
-        self.assertEqual(self.rows().keys(), before.keys())
-        # Pressed, with a picker that fails: the pane never enters view mode.
-        self.t("set", "-g", "@space_sh", "false")
-        self.key("User27")
-        self.wait(self.table, "launch")
-        self.key("X")
-        self.wait(self.table, "root")
-        time.sleep(0.5)
-        self.assertEqual(self.t("display", "-p", "-t", pane, "#{pane_in_mode}"), "0")
+        self.assertEqual(self.all_rows().keys(), before.keys())
 
-    def test_the_picker_opens_that_agent_in_the_chosen_space(self):
-        # space.sh new-tab (what the picker runs on a pick) with SPACE_LAUNCH:
-        # the agent's tab at the END of that space, born its way.
-        sid = self.t("display", "-p", "-t", "main:", "#{session_id}")
+    def test_the_picker_half_opens_that_agent_in_the_chosen_space(self):
+        # space.sh new-tab (what `go … SPACE` runs) with SPACE_LAUNCH: the
+        # agent's tab at the END of that space, born its way.
         before = self.rows()
         env = dict(self.env, TMUX=f"{self.path},0,0", SPACE_LAUNCH="codex")
-        r = subprocess.run(["bash", str(ts.SCRIPT), "new-tab", "agent", sid, self.client], env=env,
+        r = subprocess.run(["bash", str(ts.SCRIPT), "new-tab", "agent", self.sid, self.client], env=env,
                            capture_output=True, text=True, timeout=20)
         self.assertEqual(r.returncode, 0, r.stderr)
         row = self.new_one(before)
         self.assertEqual((row["@agent_state"], row["@agent_kind"]), ("idle", "codex"))
         self.assertEqual(int(row["window_index"]), max(int(w["window_index"]) for w in self.rows().values()))
         self.assertEqual(self.autostart(row), "codex")
-        self.wait(lambda: self.on("#{window_id}"), row["window_id"])
         # Without SPACE_LAUNCH (⌘⇧R itself): claude, as before.
         before = self.rows()
         env.pop("SPACE_LAUNCH")
-        subprocess.run(["bash", str(ts.SCRIPT), "new-tab", "agent", sid, self.client], env=env,
+        subprocess.run(["bash", str(ts.SCRIPT), "new-tab", "agent", self.sid, self.client], env=env,
                        capture_output=True, text=True, timeout=20)
         row = self.new_one(before)
         self.assertEqual((row["@agent_kind"], self.autostart(row)), ("claude", "claude"))
+
+    def born_row(self, before, kind, session="main"):
+        """The popup's new window, once its birth (same command list, a
+        moment after the window appears) has landed."""
+        wid = self.new_one(before, session=session)["window_id"]
+        self.wait(lambda: self.rows(session)[wid]["@agent_kind"], kind)
+        row = self.rows(session)[wid]
+        self.assert_born(row, kind)
+        return row
+
+    # -- the popup itself ----------------------------------------------------
+    def open_popup(self):
+        """⌘E; until the popup has drawn (its trace), so keys reach it."""
+        n = len(Path(self.ready).read_text().splitlines()) if os.path.exists(self.ready) else 0
+        self.key("User27")
+        self.wait(lambda: len(Path(self.ready).read_text().splitlines()) if os.path.exists(self.ready) else 0,
+                  n + 1, timeout=6.0)
+
+    @unittest.skipUnless(AGENT_UI, "no built agent-ui with `launch` (cargo build, or AGENT_UI_BIN)")
+    def test_the_popup_launches_by_enter_letter_and_tab(self):
+        self.wait(lambda: self.t("show", "-gqv", "@launch_count"), "6")
+        # ⏎: claude (preselected), beside this tab.
+        before = self.all_rows()
+        self.open_popup()
+        self.key("Enter")
+        row = self.born_row(before, "claude")
+        self.assert_after_here(row)
+        # A letter: that agent at once.
+        self.t("select-window", "-t", self.here)
+        self.wait(lambda: self.on("#{window_id}"), self.here)
+        before = self.all_rows()
+        self.open_popup()
+        self.key("x")
+        row = self.born_row(before, "codex")
+        self.assert_after_here(row)
+        # ↓ ⏎: the second row (abby).
+        self.t("select-window", "-t", self.here)
+        self.wait(lambda: self.on("#{window_id}"), self.here)
+        before = self.all_rows()
+        self.open_popup()
+        # Typed into the client's terminal: `send-keys -K Down` never reaches
+        # a popup's program (tmux 3.7c drops it; a typed ↓ arrives as ESC [ B).
+        os.write(self.fd, b"\x1b[B\r")
+        wid = self.new_one(before)["window_id"]
+        # (The harness mark lands in the same command list as the window,
+        # a moment after it: the server runs the launch once the popup is gone.)
+        self.wait(lambda: (self.rows()[wid]["@agent_kind"], self.rows()[wid]["@agent_harness"]), ("claude", "abby"))
+
+    @unittest.skipUnless(AGENT_UI, "no built agent-ui with `launch` (cargo build, or AGENT_UI_BIN)")
+    def test_the_popup_tab_targets_another_space_and_esc_cancels(self):
+        nsid, notes = self.other_space()
+        self.t("switch-client", "-c", self.client, "-t", self.here)
+        self.wait(lambda: self.on("#{window_id}"), self.here)
+        # Esc, q: closed, nothing opened. ⌘E inside the popup never arrives
+        # (tmux drops a user key while a popup is up): still nothing.
+        before = self.all_rows()
+        for close in ("Escape", "q"):
+            self.open_popup()
+            self.key("User27")
+            time.sleep(0.3)
+            self.assertEqual(self.all_rows().keys(), before.keys())
+            self.key(close)
+            time.sleep(0.3)
+        self.assertEqual(self.all_rows().keys(), before.keys())
+        # ⇥ (main is ⌘1 and here; notes ⌘2), then a letter: notes' end.
+        before = self.rows("notes")
+        self.open_popup()
+        self.key("Tab", "x")
+        row = self.born_row(before, "codex", session="notes")
+        self.assertEqual(row["pane_current_path"], notes)
+        self.wait(lambda: self.on("#{window_id}"), row["window_id"])
 
 
 if __name__ == "__main__":

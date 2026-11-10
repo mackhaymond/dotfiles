@@ -42,7 +42,7 @@ CATALOG = HERE / "keys.tsv"
 CONF = HERE / "tmux.conf.tmpl"
 SOURCED = ("spaces.conf", "agent-birth.conf", "agent-pause.conf")
 TMUX = shutil.which("tmux")
-TABLES = {"root", "prefix", "jump", "launch", "stash"}
+TABLES = {"root", "prefix", "jump", "stash"}
 
 # Bindings the config makes that the key help deliberately does NOT list, as
 # (table, tmux keys, reason); keys take the catalog's ranges. Keep it small:
@@ -51,7 +51,6 @@ NOT_IN_HELP = (
     # The leaders themselves: every ⌃S row and every ⌥W row starts with them.
     ("root", "C-s", "the prefix leader (prefix is None): the ⌃S of every ⌃S row"),
     ("root", "M-w", "the jump leader: the ⌥W of every ⌥W row"),
-    ("root", "User27", "the launch leader (WezTerm ⌘E): the ⌘E of every ⌘E row"),
     # spaces.conf: WezTerm sends each digit chord as one User key; these two
     # rows only hand the pane the key itself, as if tmux were not there.
     ("root", "User0..User8", "WezTerm ⌃1-9, passed on to the pane as C-1..C-9"),
@@ -304,8 +303,9 @@ class Live(unittest.TestCase):
         everything = self.parse_keys(self.t("list-keys"))
         # The custom tables are in the full listing (sanity: not a parse miss).
         self.assertIn(("jump", "a"), everything)
-        self.assertIn(("launch", "x"), everything)
         self.assertIn(("stash", "H"), everything)
+        # ⌘E is a popup now (agent-ui launch): no `launch` key table left.
+        self.assertFalse([k for k in everything if k[0] == "launch"])
         return {k: line for k, line in everything.items() if line != stock.get(k)}
 
     def test_every_config_binding_is_in_the_catalog(self):
@@ -336,6 +336,12 @@ class Live(unittest.TestCase):
         # (No prefix shown: the prefix option is None, C-s is a root binding.)
         self.assertRegex(notes, r"(?m)^\s*\?\s+Key help: every key, type to filter$")
 
+    def test_cmd_e_opens_agent_ui_launch(self):
+        b = self.bound("root", "User27")
+        self.assertIn("display-popup -c '#{client_tty}' -E -B", b)
+        self.assertIn("-x '##{E:@popup_x}'", b)
+        self.assertIn("'#{@space_agent_ui}' launch --client '#{client_tty}' --pane '#{pane_id}'", b)
+
 
 @unittest.skipIf(TMUX is None, "no tmux")
 class LiveWithoutAgentUi(Live):
@@ -349,6 +355,12 @@ class LiveWithoutAgentUi(Live):
         b = self.bound("prefix", "?")
         self.assertTrue(b.endswith(" list-keys -N") and "agent-ui" not in b, b)
         self.assertIn("List the keys (agent-ui draws the full help)", self.t("list-keys", "-N", "-T", "prefix"))
+
+    def test_cmd_e_opens_agent_ui_launch(self):
+        # No binary: ⌘E only says so (no popup that would fail to start).
+        b = self.bound("root", "User27")
+        self.assertIn("launch: agent-ui is not installed", b)
+        self.assertNotIn("display-popup", b)
 
 
 if __name__ == "__main__":

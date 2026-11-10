@@ -3084,7 +3084,7 @@ fn paused_cards_are_violet_and_never_need_you() {
     // Squeezed: the idle agents fold, the paused ones never do.
     let f = (10..70).rev().map(|h| layout(&v, 34, h, &Opts::default())).find(|f| f.agents_step == 1).unwrap();
     let t = texts(&f);
-    assert!(t.iter().any(|l| l.contains("2 idle · Q7, Q8")), "{t:#?}");
+    assert!(t.iter().any(|l| l.contains("2 idle · ") && l.contains("Q7, ") && l.contains("Q8")), "{t:#?}"); // (each after its letter)
     for title in ["Island resize spring", "Census AX sweep", "Kua Yu deck"] {
         assert!(t[f.agents.clone()].iter().any(|l| l.contains(title)), "{title}: {t:#?}");
     }
@@ -3339,7 +3339,6 @@ mod fold;
 mod harness;
 mod insight;
 mod keys;
-mod launch;
 mod pending;
 mod pinned;
 mod limit;

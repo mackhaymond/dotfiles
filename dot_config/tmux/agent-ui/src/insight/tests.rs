@@ -582,13 +582,17 @@ fn engine_attributes_per_agent() {
     let slug_dir = projects.join(crate::sidebar::activity::project_slug(&cwd));
     fs::create_dir_all(slug_dir.join("sid-a/subagents")).unwrap();
     fs::create_dir_all(&sessions).unwrap();
-    // (sid-g: a Claude session naming the Grok window @6's pane, which
-    // lends it nothing.)
-    for (pid, sid, win, pane) in [(11, "sid-a", "@1", "%1"), (12, "sid-b", "@2", "%2"), (13, "sid-g", "@6", "%6")] {
+    // (sid-g / sid-c / sid-y: Claude sessions naming the Grok window @6's,
+    // the Copilot window @7's and the agy window @8's pane, which lend them
+    // nothing: their own transcripts are no Claude reader's.)
+    for (pid, sid, win, pane) in [(11, "sid-a", "@1", "%1"), (12, "sid-b", "@2", "%2"), (13, "sid-g", "@6", "%6"),
+        (14, "sid-c", "@7", "%7"), (15, "sid-y", "@8", "%8")] {
         let v = obj![("pid", pid), ("sessionId", sid), ("cwd", cwd.as_str()), ("tmux", format!("main:{win}.{pane}")), ("startedAt", 5)];
         fs::write(sessions.join(format!("{pid}.json")), v.to_json()).unwrap();
     }
     fs::write(slug_dir.join("sid-g.jsonl"), lines(&[user("not grok's")])).unwrap();
+    fs::write(slug_dir.join("sid-c.jsonl"), lines(&[user("not copilot's")])).unwrap();
+    fs::write(slug_dir.join("sid-y.jsonl"), lines(&[user("not agy's")])).unwrap();
     let p = |f: &str| d.join(f).to_string_lossy().into_owned();
     let usage = asst(vec![], [100, 200, 300], "claude-opus-5-5", Some("claude-opus-5-5[1m]"));
     fs::write(slug_dir.join("sid-a.jsonl"), lines(&[user("refactor a"), edit("e1", &p("a.txt")), usage])).unwrap();
@@ -607,6 +611,8 @@ fn engine_attributes_per_agent() {
         row("main", 4, "@4", &[("state", "idle"), ("kind", "opencode")]),
         row("main", 5, "@5", &[("state", ""), ("pane_flags", "A0%5 ")]),
         row("main", 6, "@6", &[("state", "running"), ("kind", "grok"), ("pane_flags", "A0%6 "), ("path", &cwd)]),
+        row("main", 7, "@7", &[("state", "running"), ("kind", "copilot"), ("pane_flags", "A0%7 "), ("path", &cwd)]),
+        row("main", 8, "@8", &[("state", "running"), ("kind", "agy"), ("pane_flags", "A0%8 "), ("path", &cwd)]),
     ].join("\n"));
     let mut e = Engine::new(root.clone(), sessions, codex_root.clone(), Box::new(Alive));
     let got = e.update(&snap, 1000.0);

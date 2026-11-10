@@ -88,11 +88,11 @@ pub fn watcher_problem(age: Option<f64>) -> Option<String> {
 }
 
 /// agent-roster.py `is_agent_comm`: a ps comm whose basename is claude,
-/// codex or opencode, Claude's version-named binary ("2.1.291"), or a
-/// [`is_grok_comm`] one.
+/// codex, opencode, copilot (GitHub Copilot CLI) or agy (Antigravity CLI),
+/// Claude's version-named binary ("2.1.291"), or a [`is_grok_comm`] one.
 pub fn is_agent_comm(comm: &str) -> bool {
     let base = comm.rsplit('/').next().unwrap_or(comm);
-    if matches!(base, "claude" | "codex" | "opencode") || is_grok_comm(base) {
+    if matches!(base, "claude" | "codex" | "opencode" | "copilot" | "agy") || is_grok_comm(base) {
         return true;
     }
     let parts: Vec<&str> = base.split('.').collect();
@@ -223,11 +223,13 @@ pub const GROK_NOT_TUI: [&str; 26] = [
 ];
 
 /// agent-roster.py `comm_kind`: the `@agent_kind` an [`is_agent_comm`] comm
-/// names: codex, opencode, grok, else claude.
+/// names: codex, opencode, grok, copilot, agy, else claude.
 pub fn comm_kind(comm: &str) -> &'static str {
     match comm.rsplit('/').next().unwrap_or(comm) {
         "codex" => "codex",
         "opencode" => "opencode",
+        "copilot" => "copilot",
+        "agy" => "agy",
         b if is_grok_comm(b) => "grok",
         _ => "claude",
     }
@@ -261,7 +263,8 @@ fn pane_rows(panes_text: &str) -> Vec<Vec<&str>> {
 /// in a split beside a claude must not be what `x` closes), a `grok` one
 /// only when `kind` is grok (`grok -p`, `grok sessions` alike: only the comm
 /// is read here, never the argv, so the TUI rule and its session-record
-/// amendment do not apply), and among
+/// amendment do not apply), a `copilot` or `agy` one only in a window of
+/// that kind (`copilot -p`, `agy --print` alike), and among
 /// several agent panes the one whose comm matches `kind` wins before the
 /// active one.
 pub fn pick_agent_pane(panes_text: &str, ps_text: Option<&str>, kind: &str) -> Result<String, &'static str> {
@@ -280,7 +283,7 @@ pub fn pick_agent_pane(panes_text: &str, ps_text: Option<&str>, kind: &str) -> R
             let comm = comm.trim();
             if tty != "??" && is_agent_comm(comm) {
                 let k = comm_kind(comm);
-                if matches!(k, "opencode" | "grok") && kind != k {
+                if matches!(k, "opencode" | "grok" | "copilot" | "agy") && kind != k {
                     continue;
                 }
                 agent_ttys.entry(tty).or_default().insert(k);
@@ -791,6 +794,34 @@ mod tests {
         // agent-roster.py `test_comm_kind`.
         for c in ["/Users/me/.grok/bin/grok", "/Users/me/.grok/downloads/grok-macos-aarch64", "grok"] {
             assert_eq!(comm_kind(c), "grok", "{c}");
+        }
+    }
+
+    /// agent-roster.py `test_copilot_and_agy_count_only_in_their_windows`.
+    #[test]
+    fn copilot_and_agy_count_only_in_their_windows() {
+        let ps = "ttys001  -zsh\nttys004  /usr/bin/claude\nttys009  /opt/homebrew/bin/copilot\nttys009  copilot\n\
+            ttys010  /opt/homebrew/bin/agy";
+        for (tty, kind) in [("/dev/ttys009", "copilot"), ("/dev/ttys010", "agy")] {
+            // In its own window its pane is the one, over an active shell or claude.
+            let p = panes(&[("%1", "/dev/ttys001", "1"), ("%2", tty, "0")]);
+            assert_eq!(pick_agent_pane(&p, Some(ps), kind), Ok("%2".into()), "{kind}");
+            let p = panes(&[("%1", tty, "0"), ("%2", "/dev/ttys004", "1")]);
+            assert_eq!(pick_agent_pane(&p, Some(ps), kind), Ok("%1".into()), "{kind}");
+            // `copilot -p` / `agy --print` (same comm) beside a claude: not the agent.
+            let p = panes(&[("%1", "/dev/ttys004", "0"), ("%2", tty, "1")]);
+            assert_eq!(pick_agent_pane(&p, Some(ps), "claude"), Ok("%1".into()), "{kind}");
+            // Alone in a window of another kind, or none: nothing to close.
+            let p = panes(&[("%1", "/dev/ttys001", "1"), ("%2", tty, "0")]);
+            assert_eq!(pick_agent_pane(&p, Some(ps), ""), Err(PANE_UNSURE), "{kind}");
+            assert_eq!(pick_agent_pane(&p, Some(ps), "grok"), Err(PANE_UNSURE), "{kind}");
+        }
+        assert_eq!((comm_kind("/opt/homebrew/bin/copilot"), comm_kind("agy")), ("copilot", "agy"));
+        for c in ["copilot", "/opt/homebrew/Caskroom/copilot-cli/1.0.51/copilot", "agy"] {
+            assert!(is_agent_comm(c), "{c}");
+        }
+        for c in ["copilot-cli", "copilot-language-server", "agy-helper", "gh"] {
+            assert!(!is_agent_comm(c), "{c}");
         }
     }
 

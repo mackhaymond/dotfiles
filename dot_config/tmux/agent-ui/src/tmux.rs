@@ -412,7 +412,7 @@ pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
 /// instead of status-right, read in the same one call (no script runs).
-pub const STATUS_FORMATS: [&str; 38] = [
+pub const STATUS_FORMATS: [&str; 37] = [
     "#{client_key_table}", "#{@sidebar_open}", "#{@sidebar_pids}", "#{@resurrect_stale}",
     "#{@codex_session_text}", "#{@codex_session_color}", "#{@codex_weekly_text}", "#{@codex_weekly_color}",
     "#{@codex_scoped_icon}", "#{@codex_scoped_text}", "#{@codex_scoped_color}", "#{@codex_account_label}",
@@ -449,10 +449,6 @@ pub const STATUS_FORMATS: [&str; 38] = [
     // header and an idle agent into its space's idle line ("" = the default,
     // 4; `0` = never; [`crate::view::fold_after`]).
     "#{@space_fold_hours}",
-    // ⌘E's installed agents (agent-launch.sh refresh: `c:claude x:codex …`),
-    // the sidebar's ` ⌘E launch ` mark while the `launch` table is armed
-    // ([`crate::sidebar::status::launch_agents`]). Keep it LAST.
-    "#{@launch_agents}",
 ];
 
 /// One usage window's numeric options (`@codex_<w>_used`, `_expected`,
@@ -523,8 +519,6 @@ pub struct Status {
     pub session_limit: String,
     /// `@space_fold_hours`, raw ("" = unset: the default).
     pub fold_hours: String,
-    /// `@launch_agents`, raw: ⌘E's installed agents, `letter:id` words.
-    pub launch_agents: String,
 }
 
 impl Status {
@@ -563,7 +557,6 @@ impl Status {
             limit_autoresume: f(34),
             session_limit: f(35),
             fold_hours: f(36),
-            launch_agents: f(37),
         }
     }
 
@@ -1198,25 +1191,18 @@ pub(crate) mod tests {
         assert_eq!((at(""), at("soon"), at("-5")), (None, None, None));
     }
 
-    /// `@space_fold_hours` rides the client row's status tail (field 36;
-    /// ⌘E's `@launch_agents` after it, last).
+    /// `@space_fold_hours` rides the client row's status tail (field 36,
+    /// last; ⌘E's `@launch_agents` no longer rides it: the launcher popup,
+    /// `agent-ui launch`, reads it in its own one call).
     #[test]
     fn fold_hours_field() {
         assert_eq!(STATUS_FORMATS[36], "#{@space_fold_hours}");
+        assert_eq!(STATUS_FORMATS.last(), Some(&"#{@space_fold_hours}"));
+        assert!(!STATUS_FORMATS.contains(&"#{@launch_agents}"));
         let mut f: Vec<String> = ["", CLIENT_TAG, "/dev/x", "@1", "main", "on", "", "", "1"].map(String::from).to_vec();
         f.extend((0..STATUS_FORMATS.len()).map(|i| if i == 36 { "6".into() } else { String::new() }));
         let c = Client::parse(&f.join("\x1f")).unwrap();
         assert_eq!(c.status.fold_hours, "6");
-    }
-
-    /// ⌘E's `@launch_agents` rides the client row's status tail, last.
-    #[test]
-    fn launch_agents_field() {
-        assert_eq!(STATUS_FORMATS.last(), Some(&"#{@launch_agents}"));
-        let mut f: Vec<String> = ["", CLIENT_TAG, "/dev/x", "@1", "main", "on", "", "", "1"].map(String::from).to_vec();
-        f.extend((0..STATUS_FORMATS.len()).map(|i| if i == STATUS_FORMATS.len() - 1 { "c:claude x:codex".into() } else { String::new() }));
-        let c = Client::parse(&f.join("\x1f")).unwrap();
-        assert_eq!(c.status.launch_agents, "c:claude x:codex");
     }
 
     /// `@agent_harness` rides last in the same one format as `@agent_kind`

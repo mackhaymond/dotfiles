@@ -141,7 +141,9 @@ impl Activity {
         }
         self.scan_sessions();
         for a in view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()).chain(view.needs.iter_mut().map(|n| &mut n.agent)) {
-            a.blurb = if !working(a) || a.kind == "opencode" || a.kind == "grok" {
+            // (Kinds with transcripts of their own, which no Claude reader
+            // may parse: no blurb.)
+            a.blurb = if !working(a) || crate::insight::OWN_TRANSCRIPT.contains(&a.kind.as_str()) {
                 None
             } else if a.kind == "codex" {
                 // Its rollout path rides on the window (`@agent_rollout`).

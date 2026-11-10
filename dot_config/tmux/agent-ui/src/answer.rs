@@ -235,6 +235,8 @@ fn refuse_window(w: &Window) -> Option<String> {
         "claude" => {}
         "codex" => return Some(format!("{}: answer Codex prompts in its tab", w.label)),
         "grok" => return Some(format!("{}: answer Grok prompts in its tab", w.label)),
+        "copilot" => return Some(format!("{}: answer Copilot prompts in its tab", w.label)),
+        "agy" => return Some(format!("{}: answer Antigravity prompts in its tab", w.label)),
         _ => return Some(format!("{}: not a Claude agent", w.label)),
     }
     // needs-input too: an answered (discharged) prompt is idle, so a second

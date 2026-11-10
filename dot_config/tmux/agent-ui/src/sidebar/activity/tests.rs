@@ -209,8 +209,8 @@ fn apply_fills_only_working_agents() {
     let got: Vec<_> = v.agents().map(|x| (x.window_id.clone(), x.blurb.clone())).collect();
     assert_eq!(got, [("@7".to_string(), Some("Reading a.rs".to_string())), ("@8".to_string(), None), ("@9".to_string(), None)]);
     // Even a live Claude session naming its window (a Claude in another pane
-    // of it) lends an OpenCode or Grok agent nothing.
-    for kind in ["opencode", "grok"] {
+    // of it) lends an OpenCode, Grok, Copilot or agy agent nothing.
+    for kind in ["opencode", "grok", "copilot", "agy"] {
         let args = BuildArgs { client: None, now: 0.0, collator: &c, git: None, log: vec![], watcher_age: Some(1.0) };
         let mut v = ViewModel::build(&Snapshot::parse(&row("work", 1, "@7", &[("state", "running"), ("summary", "Open"), ("kind", kind)])), args);
         a.apply(&mut v);

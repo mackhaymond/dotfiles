@@ -105,6 +105,12 @@ pub const ROOT_TTL: f64 = 30.0;
 pub const KEEP_FOR: f64 = 60.0;
 /// A git command still running after this is killed.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(3);
+/// The `@agent_kind`s whose conversations live in stores of their own (no
+/// Claude session file, no codex rollout): OpenCode's SQLite, Grok's session
+/// dir, Copilot's `session-state/<id>/events.jsonl`, agy's brain transcript.
+/// The insight engine and the sidebar's activity blurb skip their windows, so
+/// no Claude reader is ever handed one of their files.
+pub const OWN_TRANSCRIPT: [&str; 4] = ["opencode", "grok", "copilot", "agy"];
 /// Claude's context windows.
 pub const WINDOW_200K: u64 = 200_000;
 pub const WINDOW_1M: u64 = 1_000_000;
@@ -1133,14 +1139,14 @@ impl Engine {
     }
 
     /// Every agent window's insight (window id → it): windows with an agent
-    /// state, each id once; one without a transcript found (an OpenCode or
-    /// Grok agent, a Claude session not yet written) has none.
+    /// state, each id once; one without a transcript found (an OpenCode,
+    /// Grok, Copilot or agy agent, a Claude session not yet written) has none.
     pub fn update(&mut self, snap: &Snapshot, now: f64) -> BTreeMap<String, Insight> {
         let mut ids = HashSet::new();
         let agents: Vec<&Window> = snap
             .windows
             .iter()
-            .filter(|w| !w.state.is_empty() && !matches!(w.kind.as_str(), "opencode" | "grok") && ids.insert(w.id.as_str()))
+            .filter(|w| !w.state.is_empty() && !OWN_TRANSCRIPT.contains(&w.kind.as_str()) && ids.insert(w.id.as_str()))
             .collect();
         let sids = if agents.iter().any(|w| w.kind != "codex") {
             // (No Grok pass: its windows are skipped above, so its map and

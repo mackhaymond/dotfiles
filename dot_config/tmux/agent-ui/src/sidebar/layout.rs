@@ -192,9 +192,12 @@
 //! shells into one line); then every agent goes to one line (age beside its
 //! state), unfolded, then folded again; then whole spaces collapse to their
 //! header (with its counts, its shells gone with it), fewest attention
-//! agents first; finally a `… N more` line. (Dormant spaces and idle agents
-//! out of mind are folded at EVERY step, step 0 included: "Dormant
-//! spaces" below.)
+//! agents first; finally a `… N more` line. (Dormant spaces are their
+//! header, and idle agents out of mind one line each, at EVERY step, step 0
+//! included: "Dormant spaces" below.) The ladder's idle line names each
+//! agent after its letter (`○○ 2 idle · k Notch Tasks, j Lost suit…`, the
+//! letter bold in its space's key-cap colour), and a click on a name goes
+//! to that agent ([`fold_row`]).
 //!
 //! Every agents-section row records the agents it stands for
 //! ([`Row::covers`]), so a test can prove each agent is shown, folded,
@@ -222,12 +225,14 @@
 //!  ▌ 1  main                  ◐1 ○2     the client's space: never folds
 //!  ▎  d  Tmux Agent Sidebar ⠹ working
 //!  ▎  ✻  › Running cargo test     26s
-//!     ○○ 2 idle · Notch Tasks Orch…     idle and unprompted for N: the line
+//!     k  Notch Tasks Orchestrator  5h   idle and unprompted for N: ONE line
+//!     j  Lost suit jacket         10h   each, letter, title, age
 //!
 //!    3  schedule               ○3 ▸     DORMANT: its header and counts alone
 //!    4  bai                 3d ○2 ▸     ...and STALE: dimmed, the age
 //!    6  mackhaymond.co         ○2 ▾     dormant but kept open by hand
-//!     ○○ 2 idle · Launchpad catalo…
+//!     m  Launchpad catalog         5h
+//!     n  Tunnel hostname           6h
 //! ```
 //!
 //! - A space is DORMANT ([`dormant`]) when every agent in it is idle (by the
@@ -247,11 +252,15 @@
 //!   option would die with its server; a restore brings spaces back by
 //!   name). Only a header that is dormant by the clock carries the chip:
 //!   one collapsed for rows does not (keeping it open would not give rows).
-//! - IDLE FOLD under an open header: an idle agent idle (its state stamp)
-//!   and unprompted (its own `@thread_at`) for N ([`aged`]) folds into the
-//!   space's one `○ K idle · …` line at every height, even alone (the line
-//!   quiets it). Working, asking, done and recently prompted agents keep
-//!   their cards, and so does the client's own. Shells are unchanged.
+//! - ONE LINE under an open header: an agent idle (its state stamp) and
+//!   unprompted (its last prompt, [`Agent::prompted_at`]) for N ([`aged`])
+//!   is its own one-row line at every height ([`aged_row`]: the ladder's
+//!   one-line card, its letter's key-cap, its TITLE first (no diff badge;
+//!   the age goes before the title is cut), its age), in the zebra, a click
+//!   going to it as its card's. Working, asking, done and recently prompted
+//!   agents keep their two-row cards, and so does the client's own and one
+//!   with unsaved work. Only row pressure (the ladder) merges idle agents
+//!   into the `○ K idle · k Name, …` line. Shells are unchanged.
 //! - STALE: a space Mack has not prompted for [`STALE_SPACE`] (two days),
 //!   with nothing live in it, dims ([`stale_space`]): its number a quiet
 //!   chip (its colour on a tint), its name in the dim ink, the age (`3d`)
@@ -1102,38 +1111,9 @@ fn marks(bar: &Bar, room: usize) -> Vec<Seg> {
         v
     } else if bar.jump {
         vec![block(" ⌥W jump ", "crust", "peach"), on(" type a letter ", "peach", "surface1")]
-    } else if let Some(agents) = &bar.launch {
-        launch_marks(agents, room)
     } else {
         Vec::new()
     }
-}
-
-/// ⌘E armed (key table `launch`, spaces.conf; [`Bar::launch`]): a peach
-/// ` ⌘E launch `, then on `surface1` each installed agent as its one-cell
-/// harness glyph in its brand colour and its letter (`text`), a pad after
-/// each, in agent-launch.sh's order (claude first). Whole items only: as
-/// many as `room` takes, the rest left out, never one cut in half. With no
-/// list yet (`@launch_agents` unset), ` type a letter ` as ⌥W's.
-fn launch_marks(agents: &[(char, crate::model::Harness)], room: usize) -> Vec<Seg> {
-    let mut v = vec![block(" ⌘E launch ", "crust", "peach")];
-    if agents.is_empty() {
-        v.push(on(" type a letter ", "peach", "surface1"));
-        return v;
-    }
-    // The lead pad, then `G k ` per agent (glyph, letter, pad).
-    let mut items = vec![on(" ", "text", "surface1")];
-    for (k, h) in agents {
-        let item = [on(h.glyph().to_string(), h.hue(), "surface1"), on(format!("{k} "), "text", "surface1")];
-        if width(&v) + width(&items) + width(&item) > room {
-            break;
-        }
-        items.extend(item);
-    }
-    if items.len() > 1 {
-        v.extend(items);
-    }
-    v
 }
 
 /// prefix v's range selection is live: ` N selected ` on mauve and stash.sh's
@@ -3152,21 +3132,105 @@ fn group_header(sp: &Space, cx: Cx, collapsed: bool) -> Row {
     }
 }
 
-/// `○○○ 3 idle · Name, Name…`: a space's idle agents in one line, a
-/// one-row tile on `bg`. No letters: it stands for several agents.
-fn fold_row(idle: &[&Agent], cx: Cx, bg: Ink) -> Row {
+/// The fewest cells a title keeps in the pressure line ([`fold_row`]) before
+/// its agent goes to its letter alone: `Not…`.
+const FOLD_NAME_MIN: usize = 4;
+
+/// `○○ 2 idle · k Notch Tasks, j Lost suit…`: a space's idle agents in one
+/// line, a one-row tile on `bg`, for the ladder's idle-folding steps (row
+/// pressure) only. Each name after its LETTER, bold in its space's key-cap
+/// colour (`space`), so ⌥W + letter reaches it; a click on a name (its
+/// letter included) goes to that agent ([`Target::Go`], right / middle as
+/// its card), anywhere else on the line opens the menu's Idle tab. It
+/// starts in the key-cap column (with letters; else the title column).
+/// Short of room every LETTER stays: the titles share what is left (each
+/// cut with `…`, none under [`FOLD_NAME_MIN`] cells), and past that the
+/// last ones go to their letter alone.
+fn fold_row(idle: &[&Agent], cx: Cx, bg: Ink, space: Ink) -> Row {
     let k = idle.len();
-    let names: Vec<String> = idle.iter().map(|a| short_title(a)).collect();
-    let indent = " ".repeat(cx.b.lead());
-    tile_row(
-        cx.w,
-        bg,
-        vec![seg(format!("{indent}{} {k} idle · ", "○".repeat(k.min(4))), dim(true)), seg(names.join(", "), "sub")],
-        vec![seg(" ", "text")],
-    )
+    let indent = if cx.b.on { 2 } else { cx.b.lead() };
+    let lead = format!("{}{} {k} idle · ", " ".repeat(indent), "○".repeat(k.min(4)));
+    let m = margin(cx.w);
+    // (The right pad's cell is not the names'.)
+    let end = m + inner(cx.w).saturating_sub(1);
+    let letter = |a: &Agent| a.letter.filter(|_| cx.b.on).map(|l| l.to_string());
+    let titles: Vec<String> = idle.iter().map(|a| short_title(a)).collect();
+    // The fixed cells: each letter and its pad, the `, ` between items.
+    let fixed = idle.iter().map(|a| letter(a).map_or(0, |l| dwidth(&l) + 1)).sum::<usize>() + 2 * k.saturating_sub(1);
+    let avail = end.saturating_sub(m + dwidth(&lead));
+    let full = fixed + titles.iter().map(|t| dwidth(t)).sum::<usize>() <= avail;
+    // Each title's cells: whole; else a fair share of the rest (a title
+    // shorter than its share keeps its own width and leaves the others the
+    // difference); a share under FOLD_NAME_MIN: the first ones as much as
+    // is left, the rest none.
+    let rest = avail.saturating_sub(fixed);
+    let want: Vec<usize> = titles.iter().map(|t| dwidth(t)).collect();
+    let mut budgets = want.clone();
+    if !full {
+        let (mut pool, mut open): (usize, Vec<usize>) = (rest, (0..k).collect());
+        while !open.is_empty() {
+            let s = pool / open.len();
+            let (short, long): (Vec<usize>, Vec<usize>) = open.iter().partition(|&&i| want[i] <= s);
+            if short.is_empty() {
+                let extra = pool % open.len();
+                for (j, &i) in open.iter().enumerate() {
+                    budgets[i] = s + usize::from(j < extra);
+                }
+                break;
+            }
+            for i in short {
+                pool -= want[i];
+            }
+            open = long;
+        }
+        if budgets.iter().zip(&want).any(|(b, w)| b < w && *b < FOLD_NAME_MIN) {
+            let mut left_room = rest;
+            for (b, w) in budgets.iter_mut().zip(&want) {
+                *b = if left_room >= FOLD_NAME_MIN { (*w).min(left_room) } else { 0 };
+                left_room -= *b;
+            }
+        }
+    }
+    let mut x = m + dwidth(&lead);
+    let mut left = vec![seg(lead, dim(true))];
+    let mut spans: Vec<(usize, usize, &Agent)> = Vec::new();
+    for (i, (a, (t, &b))) in idle.iter().zip(titles.iter().zip(&budgets)).enumerate() {
+        if i > 0 {
+            left.push(seg(", ", dim(true)));
+            x += 2;
+        }
+        let x0 = x;
+        let l = letter(a);
+        if let Some(l) = &l {
+            let l = if b > 0 { format!("{l} ") } else { l.clone() };
+            x += dwidth(&l);
+            left.push(bold(l, name_ink(space)));
+        }
+        if b > 0 || l.is_none() {
+            let t = clip(t, b.max(1));
+            x += dwidth(&t);
+            left.push(seg(t, "sub"));
+        }
+        spans.push((x0, x, a));
+    }
+    let mut row = tile_row(cx.w, bg, left, vec![seg(" ", "text")]);
+    // (One the row's own clip cut short still clicks.)
+    for (x0, x1, a) in spans.into_iter().filter(|s| s.0 < end) {
+        row.targets.push((x0 as u16, x1.min(end) as u16, Target::Go { win: a.window_id.clone(), session: a.session.clone() }));
+    }
     // The menu's Idle tab: just the idle agents.
-    .click(cx.w, Target::Menu(Some("idle")))
-    .covering(idle.iter().copied())
+    row.click(cx.w, Target::Menu(Some("idle"))).covering(idle.iter().copied())
+}
+
+/// An agent out of mind ([`aged`]) under an open header: ONE row, the
+/// ladder's one-line card ([`agent_rows`] without its second line: the rail
+/// or indent, its letter's key-cap, its title, its age), at every height.
+/// The title comes first: no diff badge takes its cells (the age goes
+/// before the title is clipped). A click goes to the agent as on its card.
+fn aged_row(a: &Agent, cx: Cx, k: usize, space: Ink) -> Vec<Row> {
+    let mut quiet = a.clone();
+    quiet.insight = None;
+    agent_rows(&quiet, cx, false, k, space, None)
 }
 
 /// `… N more`: the agents nothing above has room for (`spaces`: how many
@@ -3261,12 +3325,12 @@ fn stale_space(sp: &Space, cx: Cx) -> Option<String> {
 
 /// An idle agent out of mind: idle (its state stamp) and not prompted by
 /// Mack ([`Agent::prompted_at`]: its `@thread_at`, else its state stamp)
-/// for `fold_after`. It folds into its
-/// space's idle line at EVERY height, not only when rows run short. Never
+/// for `fold_after`. It is ONE line ([`aged_row`]) at EVERY height, not
+/// only when rows run short. Never
 /// the client's window, a prompt just answered, a turn just done, nor one
 /// with work out, nor one the stale sweep says has UNSAVED WORK
 /// ([`Agent::stale`]: its card's `unsaved work` hint is a risk worth
-/// seeing; a `close?` one folds, the line is the softer close).
+/// seeing; a `close?` one goes to one line, the softer close).
 fn aged(a: &Agent, cx: Cx) -> bool {
     let old = |t: Option<i64>| unprompted(t, cx).is_some_and(|q| q >= cx.fold_after);
     cx.fold_after > 0
@@ -3280,15 +3344,15 @@ fn aged(a: &Agent, cx: Cx) -> bool {
         && a.stale(cx.now, cx.stale_after) != Some(Stale::Unsaved)
 }
 
-/// A space's idle agents that go into its one idle line → (shown in place,
-/// folded): the [`aged`] ones always; with `fold` (the ladder's idle-folding
-/// steps) every idle one too (never the client's window, never one whose
-/// prompt was just answered: it is still Active). A lone idle agent folds
-/// only when it is aged (the line quiets it); else two or more.
+/// With `fold` (the ladder's idle-folding steps, row pressure), a space's
+/// idle agents go into its one idle line ([`fold_row`]), when there are 2+
+/// of them (never the client's window, never one whose prompt was just
+/// answered: it is still Active) → (shown in place, folded). Without, none
+/// (an agent out of mind is its own one-line row: [`aged_row`]).
 fn split_idle<'a>(sp: &'a Space, fold: bool, cx: Cx) -> (Vec<&'a Agent>, Vec<&'a Agent>) {
     let foldable = |a: &Agent| fold && a.cat == Some(Cat::Idle) && !a.is_current && !a.answered && !recent_done(a, cx.now);
-    let (idle, shown): (Vec<&Agent>, Vec<&Agent>) = sp.agents.iter().partition(|a| foldable(a) || aged(a, cx));
-    if idle.len() >= 2 || idle.first().is_some_and(|a| aged(a, cx)) {
+    let (idle, shown): (Vec<&Agent>, Vec<&Agent>) = sp.agents.iter().partition(|a| foldable(a));
+    if idle.len() >= 2 {
         (shown, idle)
     } else {
         (sp.agents.iter().collect(), vec![])
@@ -3299,7 +3363,8 @@ fn split_idle<'a>(sp: &'a Space, fold: bool, cx: Cx) -> (Vec<&'a Agent>, Vec<&'a
 /// stacked edge to edge (no pads: consecutive cards alternate the zebra's
 /// two shades, [`shade`], afresh under each space's header, so each card is
 /// one colour and the next another); the agents in `two` get their second
-/// line. Then its shells ([`shells_of`]), one row each ([`shell_row`]); with
+/// line, an agent out of mind ([`aged`]) never (its one row, [`aged_row`]).
+/// Then its shells ([`shells_of`]), one row each ([`shell_row`]); with
 /// `fold` (the steps that fold the idle agents), two or more of them in one
 /// line ([`shells_line`]).
 fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool) -> Vec<Row> {
@@ -3307,11 +3372,15 @@ fn group_rows(sp: &Space, cx: Cx, two: &[Key], fold: bool) -> Vec<Row> {
     let ink = space_colour(sp);
     let mut rows: Vec<Row> = Vec::new();
     for (k, a) in shown.iter().enumerate() {
-        rows.extend(agent_rows(a, cx, two.contains(&key(a)), k, ink, None));
+        if aged(a, cx) {
+            rows.extend(aged_row(a, cx, k, ink));
+        } else {
+            rows.extend(agent_rows(a, cx, two.contains(&key(a)), k, ink, None));
+        }
     }
     if !idle.is_empty() {
         // The zebra goes on: the fold is the next card.
-        rows.push(fold_row(&idle, cx, shade(shown.len())));
+        rows.push(fold_row(&idle, cx, shade(shown.len()), ink));
     }
     let shells = shells_of(sp, cx.shells);
     if fold && shells.len() >= 2 {
@@ -3406,9 +3475,9 @@ fn quiet_row(w: usize, quiet: &[&Space]) -> Row {
 
 /// The agents section's rows when every agent (and shell) is on one line,
 /// nothing folded or collapsed for rows: only what folds at every step
-/// does (a dormant space its header alone, the agents out of mind their
-/// space's one idle line; each group exactly as [`group_rows`] lays it out
-/// one line each): what step 4 leaves the agents before NEEDS YOU gets the rest.
+/// does (a dormant space its header alone; an agent out of mind is one
+/// line anyway), each group exactly as [`group_rows`] lays it out one line
+/// each: what step 4 leaves the agents before NEEDS YOU gets the rest.
 /// (The bare spaces' headers are gone by then: [`agents_section`] drops
 /// them before anything else; with nothing else to list, the words are
 /// back.) Active scope's quiet line counts too.

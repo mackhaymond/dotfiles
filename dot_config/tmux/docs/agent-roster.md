@@ -500,7 +500,7 @@ a digit back, any other key drops it and does its own thing.
 - `x` finds the agent's pane by TTY, the way the watcher does: `list-panes`
   (`pane_id`, `pane_tty`, `pane_active`) plus one `ps -ax -o tty=,comm=`, run
   only on `x` (and on peek) and only for a split window, matching a comm of
-  `claude`, `codex`, `opencode`, a grok one (`GROK_COMM`:
+  `claude`, `codex`, `opencode`, `copilot`, `agy`, a grok one (`GROK_COMM`:
   `^grok(-(macos|linux|windows)-[a-z0-9_]+)?$`, `grok` or the real binary's
   `grok-macos-aarch64`; never its other symlink `agent`) or a bare version
   like `2.1.291`.
@@ -510,8 +510,9 @@ a digit back, any other key drops it and does its own thing.
   pane counts only in an opencode window, so `opencode serve` split beside a
   Claude is never what `x` closes, and a `grok` pane only in a grok window
   (`grok -p` and `grok sessions` share the TUI's comm, and only the comm is
-  read here); among several agent panes the one whose
-  comm matches the kind (`comm_kind`: codex, opencode, grok, else claude) wins
+  read here), and likewise a `copilot` / `agy` pane only in a window of that
+  kind (`copilot -p`, `agy --print`; `MARKED_KINDS`); among several agent panes the one whose
+  comm matches the kind (`comm_kind`: codex, opencode, grok, copilot, agy, else claude) wins
   before the active-pane fallback. A one-pane window closes that pane; a
   split window where no pane runs an agent, or several do and neither the
   kind nor the active pane picks one, is refused ("can't tell which pane is
@@ -701,8 +702,10 @@ described in the rest of this section; it was not changed.**
   swapped and `strip_glyph()` is `glyph()` with ⚙/◎ for the Nerd Font ones,
   so cua-notch's palette check (section 65, which reads `dot()`/`glyph()`)
   still covers the strip. A dim `✳` (Claude), `⬢` (Codex), U+F489
-  (OpenCode, Nerd Font nf-oct-terminal) or `✦` (Grok Build, U+2726, one
-  cell) follows the state when `@agent_kind` is set. `KIND_GLYPH` here and
+  (OpenCode, Nerd Font nf-oct-terminal), `✦` (Grok Build, U+2726, one
+  cell) or the AgentMarks logo of GitHub Copilot CLI (U+10C108) or
+  Antigravity CLI (agy, U+10C118; agent-ui `HARNESSES`' glyphs, one cell
+  through WezTerm's fallback font) follows the state when `@agent_kind` is set. `KIND_GLYPH` here and
   agent-ui's `model::kind_glyph` use the same code points. Titles: `project/` is kept only if it fits
   whole in a third of the width, else the title gets everything
   (`fit_label`).
@@ -1035,8 +1038,9 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   `turn_aborted`) nothing, so the run detail shows. Inline code (`-c`,
   `-e`, `-m`) is shown as just the interpreter; a script file only by a
   plain, not secret-looking name. `AGENT_UI_CLAUDE_DIR` points the Claude side
-  elsewhere (tests; Codex needs no directory). An OpenCode or Grok agent
-  has no blurb (no transcript reader for either yet; a Grok's
+  elsewhere (tests; Codex needs no directory). An OpenCode, Grok, Copilot
+  or agy agent (`insight::OWN_TRANSCRIPT`; the insight engine skips them
+  too) has no blurb (no transcript reader for any yet; a Grok's
   `transcript_path` is its own `updates.jsonl`, not a Claude transcript):
   its run detail shows, and it never borrows the words of a Claude session
   naming the same window.
