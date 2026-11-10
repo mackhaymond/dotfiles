@@ -90,7 +90,42 @@ DEFAULT_EFFORT = "max"
 FLAGS_FILE = os.path.join(DST, "abby.settings.json")  # passed via --settings
 # abby keeps its own, never shares these. projects/ and history.jsonl keep
 # its conversations apart from Claude's (see the docstring).
-OWN_DIRS = {"backups", "daemon", "projects", "history.jsonl"}
+OWN_DIRS = {"backups", "daemon", "projects", "history.jsonl", "themes"}
+
+# ── Look: abby must be unmistakable at a glance ──────────────────────────────
+# Neon green where Claude is orange: a custom theme, an ABBY badge on the
+# statusline, its own spinner words, and a green-tinted tmux pane background
+# while a session runs (SessionStart/SessionEnd hooks below).
+ACCENT, ACCENT_SOFT, TINT = "#39ff88", "#a8ffcb", "#0d1f16"
+THEME = {
+    "name": "Abby",
+    "base": "dark",
+    "overrides": {
+        "claude": ACCENT, "claudeShimmer": ACCENT_SOFT,
+        "clawd_body": ACCENT,  # the startup logo
+        "rate_limit_fill": ACCENT,
+        "promptBorder": ACCENT, "promptBorderShimmer": ACCENT_SOFT,
+        "permission": "#ff79c6", "permissionShimmer": "#ffb3e0",
+        "suggestion": "#7cf5c4", "remember": "#7cf5c4",
+        "briefLabelClaude": ACCENT,
+        "userMessageBackground": "#12301f", "userMessageBackgroundHover": "#184029",
+        "bashMessageBackgroundColor": "#1a2a12",
+        "selectionBg": "#1f4d33",
+    },
+}
+BADGE = r"printf '\033[1;38;2;8;24;16;48;2;57;255;136m ABBY \033[0m '"
+SPINNER_VERBS = ["Abliterating", "Unshackling", "Going off-script", "Unfiltering",
+                 "Freewheeling", "Jailbreaking the compiler", "Abby-ing", "Off the leash",
+                 "Unmuzzling", "Rule-bending", "Defanging bugs", "Ungating"]
+_tmux = "/opt/homebrew/bin/tmux"
+TINT_ON = (f'[ -n "$TMUX_PANE" ] && {_tmux} set -p -t "$TMUX_PANE" window-style "bg={TINT}" '
+           f'\\; set -p -t "$TMUX_PANE" window-active-style "bg={TINT}" >/dev/null 2>&1; true')
+TINT_OFF = (f'[ -n "$TMUX_PANE" ] && {_tmux} set -pu -t "$TMUX_PANE" window-style '
+            f'\\; set -pu -t "$TMUX_PANE" window-active-style >/dev/null 2>&1; true')
+LOOK_HOOKS = {
+    "SessionStart": [{"hooks": [{"type": "command", "command": TINT_ON}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": TINT_OFF}]}],
+}
 # Versioned: bump the name when is_abby_transcript's rule changes, so files
 # cached as "not abby" under the old rule get looked at again.
 MIGRATE_CACHE = os.path.join(DST, ".migrate-cache-v2.json")
@@ -275,14 +310,38 @@ def migrate_sessions():
     return moved
 
 
+def merged_hooks(base):
+    """base's hooks plus LOOK_HOOKS (CC dedupes identical commands across sources)."""
+    hooks = copy.deepcopy(base or {})
+    for event, groups in LOOK_HOOKS.items():
+        hooks.setdefault(event, [])
+        for g in groups:
+            if g not in hooks[event]:
+                hooks[event].append(copy.deepcopy(g))
+    return hooks
+
+
+def look(live):
+    sl = live.get("statusLine") or {}
+    inner = sl.get("command") if sl.get("type") == "command" else None
+    return {
+        "theme": "custom:abby",
+        "statusLine": {"type": "command", "padding": sl.get("padding", 0),
+                       # badge, then the usual statusline (stdin passes through)
+                       "command": BADGE + (f"; {inner}" if inner else "")},
+        "spinnerVerbs": {"mode": "replace", "verbs": SPINNER_VERBS},
+    }
+
+
 # The gateway overlay. It goes in BOTH the user settings and a --settings
 # file: --settings outranks project settings, and run from ~ the live
 # ~/.claude/settings.json loads as *project* settings, which would otherwise
-# override these (e.g. turn Remote Control back on). The user-settings copy
-# keeps a relaunch that lost the flag on abliteration. model and effort stay
-# out of it so /model and /effort picks can still stick.
+# override these (e.g. turn Remote Control back on, or the theme). The
+# user-settings copy keeps a relaunch that lost the flag on abliteration.
+# model and effort stay out of it so /model and /effort picks can still stick.
 def overlay(live):
     return {
+        **look(live),
         "env": {**(live.get("env") or {}), **GATEWAY_ENV,
                 # ABBY_BASE_URL: point one launch at a local logging proxy.
                 **({"ANTHROPIC_BASE_URL": os.environ["ABBY_BASE_URL"]}
@@ -303,6 +362,7 @@ def build_settings():
     s = copy.deepcopy(live)
     ov = overlay(live)
     s.update(ov)
+    s["hooks"] = merged_hooks(live.get("hooks"))  # live hooks + the pane tint
     s["model"] = prev.get("model") if is_ab(prev.get("model")) else MAIN
     s["autoCompactWindow"] = AUTO_COMPACT_WINDOW
     # Keep per-model picks (effort, /autocompact) made inside abby.
@@ -315,7 +375,9 @@ def build_settings():
     if prev.get("effortLevel"):
         s["effortLevel"] = prev["effortLevel"]
     write_atomic(path, s)
-    write_atomic(FLAGS_FILE, ov)
+    write_atomic(FLAGS_FILE, {**ov, "hooks": LOOK_HOOKS})
+    os.makedirs(os.path.join(DST, "themes"), exist_ok=True)
+    write_atomic(os.path.join(DST, "themes", "abby.json"), THEME)
     return s["model"], s.get("effortLevel") or DEFAULT_EFFORT
 
 
