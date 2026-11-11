@@ -48,8 +48,12 @@ def fake_cli(bin_dir, name):
     """A bash copy named copilot / agy: ps reports its comm as .../<name>."""
     bin_dir.mkdir(parents=True, exist_ok=True)
     g = bin_dir / name
-    shutil.copy(BASH, g)
-    g.chmod(0o755)
+    # Once per name: copying over a binary that has run rewrites it in place,
+    # and macOS then SIGKILLs the next exec of it (its code-signature cache:
+    # `script` exits 9, no stderr), intermittently.
+    if not g.exists():
+        shutil.copy(BASH, g)
+        g.chmod(0o755)
     return g
 
 

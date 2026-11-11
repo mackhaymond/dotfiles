@@ -171,10 +171,13 @@ class ConfigShape(unittest.TestCase):
         got = dict(re.findall(r'^set -s user-keys\[(\d+)\] "\\e(\[\d+~)"$', head, re.M))
         want = {str(i): CHORD[(row, n)][1:] for i, (row, n) in
                 enumerate((row, n) for row in ("CTRL", "ALT", "CMD") for n in range(1, 10))}
-        # User27: CMD+E, the agent launcher popup (agent-ui launch).
+        # User27 / User28: CMD+E / CMD+SHIFT+E, the agent launcher popup
+        # (agent-ui launch; ⌘⇧E with --pick-space).
         want["27"] = "[9140~"
+        want["28"] = "[9141~"
         self.assertEqual(got, want)
-        self.assertIn('SendString("\\x1b[9140~")', WEZTERM.read_text())
+        self.assertRegex(WEZTERM.read_text(), r'key = "e",\s*mods = "CMD",\s*action = wezterm\.action\.SendString\("\\x1b\[9140~"\)')
+        self.assertRegex(WEZTERM.read_text(), r'key = "E",\s*mods = "CMD",\s*action = wezterm\.action\.SendString\("\\x1b\[9141~"\)')
 
     def test_no_meta_j_k(self):
         # Claude Code binds meta+j (app:toggleTerminal); next/prev use M-l/M-h.
@@ -411,12 +414,14 @@ class Server(unittest.TestCase):
             finally:
                 os._exit(127)
         self.child, self.fd = pid, fd
+        self.drawn_at = time.monotonic()      # when the client last drew anything
 
         def drain():
             while True:
                 try:
                     if not os.read(fd, 65536):
                         return
+                    self.drawn_at = time.monotonic()
                 except OSError:
                     return
         threading.Thread(target=drain, daemon=True).start()
@@ -463,6 +468,53 @@ class Server(unittest.TestCase):
             time.sleep(0.03)
             got = fn()
         self.assertEqual(got, want)
+
+    def server_procs(self):
+        """{pid: command line} of every process under THIS server.
+
+        A machine-wide `pgrep -f "space.sh sync"` also sees the processes of
+        every other test server running at the same time (pytest -n)."""
+        server = self.t("display", "-p", "#{pid}")
+        rows = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+        kids, cmd = {}, {}
+        for row in rows.splitlines():
+            parts = row.split(None, 2)
+            if len(parts) < 2:
+                continue
+            kids.setdefault(parts[1], []).append(parts[0])
+            cmd[parts[0]] = parts[2] if len(parts) > 2 else ""
+        todo, seen = [server], set()
+        while todo:
+            pid = todo.pop()
+            for kid in kids.get(pid, ()):
+                if kid not in seen:
+                    seen.add(kid)
+                    todo.append(kid)
+        return {p: cmd[p] for p in seen}
+
+    def syncs_running(self):
+        """Whether any `space.sh sync` this server set off (every one comes
+        from its `run-shell -b`) is still alive."""
+        return any(f"{SCRIPT} sync" in c for c in self.server_procs().values())
+
+    def fzf_running(self):
+        return any(c.split(None, 1)[0].endswith("fzf") for c in self.server_procs().values() if c)
+
+    def fzf_up(self):
+        """Until a popup's fzf runs under this server, plus a moment for it
+        to take the terminal: a fixed sleep is too short under load."""
+        self.wait(self.fzf_running, True, timeout=10)
+        time.sleep(0.3)
+        self.drawn_quiet()
+
+    def drawn_quiet(self, quiet=0.4, timeout=6.0):
+        """Until the client has drawn nothing for QUIET seconds: fzf done
+        filtering what was typed (and its preview), so an Enter picks what
+        the query matches, not what the list showed before. Under load
+        (pytest -n) a fixed sleep after typing is not enough."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() - self.drawn_at < quiet and time.monotonic() < deadline:
+            time.sleep(0.05)
 
     def key(self, *keys):
         self.t("send-keys", "-K", "-c", self.client, *keys)
@@ -973,8 +1025,7 @@ class Spaces(Server):
         home = self.wait_home("ag")
         self.dash("ag")
         self.t("set", "-g", "@space_sh", "true")                         # no hook syncs meanwhile
-        self.wait(lambda: subprocess.run(["pgrep", "-f", f"{SCRIPT} sync"], capture_output=True).returncode, 1,
-                  timeout=10)                                            # nor any still in flight
+        self.wait(self.syncs_running, False, timeout=10)                 # nor any still in flight
         A = self.new_window("ag", "running")
         self.t("kill-window", "-t", home)
         self.assertEqual(self.t("display", "-t", "ag:^", "-p", "#{window_id}"), A)   # the agent is lowest
@@ -1865,11 +1916,13 @@ class Spaces(Server):
     def popup_keys(self, key, *typed):
         """Press prefix KEY, then type into the popup it opens (the client's
         terminal is the popup's while it is up)."""
+        self.wait(self.fzf_running, False, timeout=10)                     # the last popup's is gone
         self.key("C-b", key)
-        time.sleep(1.0)                                                     # fzf up
+        self.fzf_up()
         for s in typed:
             os.write(self.fd, s.encode())
             time.sleep(0.4)
+            self.drawn_quiet()
 
     @unittest.skipUnless(shutil.which("fzf"), "fzf not installed")
     def test_shift_tab_popup_picks_a_space_or_a_typed_folder(self):
@@ -1884,7 +1937,7 @@ class Spaces(Server):
         d = os.path.join(self.home_dir, "typed")
         os.mkdir(d)
         self.popup_keys("K", d, "\r")                                       # CMD+SHIFT+R, a typed folder
-        self.wait(lambda: self.on("#{session_name}"), "typed", timeout=6)
+        self.wait(lambda: self.on("#{session_name}"), "typed", timeout=15)  # a new space: slow under load
         self.wait(lambda: [k for _, k, _, _ in self.windows("typed")], ["s", "a"])
         before = self.t("list-windows", "-a", "-F", "#{window_id}")
         self.popup_keys("C-t", "proj", "\x1b")                              # esc: nothing
@@ -2182,7 +2235,7 @@ class Create(Server):
     @unittest.skipUnless(shutil.which("fzf"), "fzf not installed")
     def test_option_n_popup_enter_stays_ctrl_n_creates(self):
         self.key("M-n")                                                                # ⌥N
-        time.sleep(1.0)                                                                # fzf up
+        self.fzf_up()
         os.write(self.fd, b"e2eproj")
         time.sleep(0.6)
         os.write(self.fd, b"\r")                                                       # nothing matches: stays
@@ -2196,7 +2249,7 @@ class Create(Server):
     @unittest.skipUnless(shutil.which("fzf"), "fzf not installed")
     def test_a_sentence_in_the_popup_opens_a_pending_claude_in_a_new_popup(self):
         self.key("C-b", "C-t")                                                         # ⌘⇧T: the same
-        time.sleep(1.0)
+        self.fzf_up()
         os.write(self.fd, b"make me a todo app")
         time.sleep(0.6)
         os.write(self.fd, b"\r")
@@ -2372,9 +2425,11 @@ class Create(Server):
 
     def test_registry_lock_breaks_a_stale_lock_and_keeps_a_fresh_one(self):
         lock = self.registry + ".lock"
-        deadline = time.time() + 10                                                # setUp's syncs drain
-        while os.path.exists(lock) and time.time() < deadline:
-            time.sleep(0.05)
+
+        def drain():   # the server's own syncs (setUp's, and any the sync below set off) are done
+            self.wait(self.syncs_running, False, timeout=10)
+            self.wait(lambda: os.path.exists(lock), False, timeout=10)
+        drain()
         # A live holder's lock: a waiter (past its first break check) leaves
         # it alone, and gets it once the holder lets go.
         os.mkdir(lock)
@@ -2387,6 +2442,7 @@ class Create(Server):
         self.assertEqual([f for f in os.listdir(self.tmp) if ".lock.stale." in f], [])
         shutil.rmtree(lock)
         self.assertEqual(p.wait(timeout=15), 0)
+        drain()
         # A crashed holder's (older than 15 s): broken, and the sync runs.
         os.mkdir(lock)
         Path(lock, "owner").write_text("dead\n")
@@ -2696,8 +2752,7 @@ class Create(Server):
         r = self.run_sh("adopt-pending", wid, d, SPACE_TMUX_BIN=wrap)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.wait(lambda: self.wopt(wid, "session_name"), "todo")
-        self.wait(lambda: subprocess.run(["pgrep", "-f", f"{SCRIPT} sync"], capture_output=True).returncode, 1,
-                  timeout=10)                                                        # every sync it set off
+        self.wait(self.syncs_running, False, timeout=10)                             # every sync it set off
         self.t("set", "-g", "@space_sh", f"bash {SCRIPT}")
         snap = [(set(w[1:] for w in l.split() if w[:1] == "s" and w[1:]), set(w[1:] for w in l.split() if w[:1] == "w" and w[1:]))
                 for l in Path(snaps).read_text().splitlines()]

@@ -26,8 +26,18 @@ SOCKET_PREFIX = os.environ.get("RESURRECT_TEST_SOCKET_PREFIX", "rtest")
 @unittest.skipUnless(TMUX, "tmux not installed")
 class ThrowawayServer(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
+        # The killed server's zsh writes its history into zdot/ as it dies,
+        # after kill-server has returned, and an rmtree racing it fails
+        # ("Directory not empty", seen under pytest -n): retry, then let go.
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+        def remove(path=self.temp.name):
+            for _ in range(20):
+                shutil.rmtree(path, ignore_errors=True)
+                if not os.path.exists(path):
+                    return
+                time.sleep(0.1)
+        self.addCleanup(remove)
         self.root = Path(self.temp.name)
         self.dir = self.root / "resurrect"
         self.dir.mkdir()

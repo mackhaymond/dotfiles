@@ -364,7 +364,8 @@ class Keys(unittest.TestCase):
         self.wait(self.table, "root")
         self.type(b"\x1b", 0.3)
         self.wait(self.selected, [])
-        self.assertEqual(self.t("show", "-gqv", "@stash_anchor"), "")
+        # The anchor is unset in a second tmux call after sel_clear: wait for it.
+        self.wait(lambda: self.t("show", "-gqv", "@stash_anchor"), "")
         self.type(b"\x1b", 0.3)
         self.type(b"q")
         self.assertEqual(self.read(out), b"\x1bq")             # only the keys after the cancel

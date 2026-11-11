@@ -25,6 +25,10 @@ class Cadence(ThrowawayServer):
         self.tmux("set", "-g", "@resurrect-capture-pane-contents", "off", ";",
                   "set", "-g", "@resurrect-hook-post-save-all", f"echo x >> '{self.hooks}'")
         self.wait_for_prompt("main:")
+        # And main:0 renamed from "tmux" to "zsh": under load (pytest -n) the
+        # rename can land after the prompt, i.e. between a test's first save
+        # and its second, which then sees a changed layout and saves again.
+        self.settle()
 
     def run_save(self, *mode, **extra):
         return subprocess.run(["bash", str(SAVE), *mode], env=dict(self.env, **extra),
@@ -39,9 +43,13 @@ class Cadence(ThrowawayServer):
         return sum(" saved " in f" {line}" for line in log.read_text().splitlines()) if log.exists() else 0
 
     def settle(self):
-        """automatic-rename names a new window "tmux" for a moment."""
+        """automatic-rename names a new window "tmux" for a moment, and under
+        load (pytest -n) whatever else it caught mid-fork ("kernel_task"):
+        wait until every auto-named window is named for its command."""
         for _ in range(50):
-            if "tmux" not in self.tmux("list-windows", "-a", "-F", "#{window_name}").split():
+            rows = self.tmux("list-windows", "-a", "-F",
+                             "#{automatic-rename}\t#{window_name}\t#{pane_current_command}").splitlines()
+            if all(r.split("\t")[1] == r.split("\t")[2] for r in rows if r.split("\t")[0] == "1"):
                 return
             time.sleep(0.1)
 
@@ -445,6 +453,10 @@ class ReviewRound1Tests(Cadence):
         time.sleep(0.8)
         self.tmux("new-window", "-d", "-t", "main:")
         self.settle()
+        # Its zsh at a prompt, too: under load (pytest -n) a shell still
+        # starting when `final` fingerprints changes the layout afterwards,
+        # and `auto` then saves a second time for that, not for the bug.
+        self.wait_for_prompt("main:1")
         lock.rmdir()
         self.assertEqual(proc.wait(timeout=30), 0)
         self.auto()

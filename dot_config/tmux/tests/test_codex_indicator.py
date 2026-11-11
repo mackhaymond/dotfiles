@@ -346,7 +346,10 @@ class IndicatorIntegrationTests(unittest.TestCase):
         # repainted codex's tab as an idle claude and dropped the owner
         # binding; its SessionEnd wiped the window.
         self.hook("running", prompt="Codex task")
-        self.wait_for("finished")          # its title worker is done painting
+        self.wait_for("finished")          # its title worker is done painting:
+        # the paint lands after the condenser's marker, and under load
+        # (pytest -n) later than any fixed sleep, so wait for it.
+        self.summary_after("project/Condensed title")
         time.sleep(.3)
         before = self.window()
         self.assertEqual((before["@agent_state"], before["@agent_kind"]), ("running", "codex"))

@@ -119,6 +119,9 @@ class Nav(unittest.TestCase):
                 client = new.pop()
                 # the attach hook seeds the history with where the client is
                 self.wait(lambda: self.hist(client)["cur"], self.on(client))
+                # ...and every other hook the attach set off is done, or under
+                # load (pytest -n) its late write lands over the test's own.
+                self.wait(self.nav_running, False)
                 return client
             time.sleep(0.05)
         self.fail("test client never attached")
@@ -145,6 +148,25 @@ class Nav(unittest.TestCase):
             time.sleep(0.03)
             got = fn()
         self.assertEqual(got, want)
+
+    def nav_running(self):
+        """Whether a nav.sh this server's hooks ran is still alive (its
+        descendants only: a machine-wide pgrep sees other tests' servers)."""
+        server = self.t("display", "-p", "#{pid}")
+        rows = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+        kids, cmd = {}, {}
+        for row in rows.splitlines():
+            parts = row.split(None, 2)
+            if len(parts) == 3:
+                kids.setdefault(parts[1], []).append(parts[0])
+                cmd[parts[0]] = parts[2]
+        todo, seen = [server], set()
+        while todo:
+            for kid in kids.get(todo.pop(), ()):
+                if kid not in seen:
+                    seen.add(kid)
+                    todo.append(kid)
+        return any(f"{SCRIPT} " in cmd[p] for p in seen)
 
     def on(self, client):
         """"<session_id>:<window_id>" the client is on (list-clients expands per client)."""
