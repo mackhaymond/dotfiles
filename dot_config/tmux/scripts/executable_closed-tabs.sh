@@ -1252,27 +1252,56 @@ ago() {
     fi
 }
 
+# The picker's title for one entry, as "title<US>rest" in REPLY. The stored
+# label is the tab's name at close, which for a shell is "zsh"/"home" and for
+# a fresh agent "New Session" — the same on every row. Those give way to the
+# model's one-liner (desc), so each row names what that tab was doing; a
+# specific label keeps the lead with desc after it. With no desc yet either,
+# the row is named by where it lived (space, slot, directory).
+#   pick_title <label> <desc> <tool> <session> <index> <cwd>
+pick_title() {
+    local label=$1 desc=$2 tool=$3 sess=$4 widx=$5 cwd=$6
+    local bare=${label##*/}
+    case "$bare" in
+    ''|zsh|bash|sh|fish|-zsh|home|login|'New Session'|'New session'|'Claude Code'|\
+    claude|codex|grok|copilot|agy|opencode|abby|gemini|"$tool")
+        if [ -n "$desc" ]; then
+            REPLY="$desc"$'\x1f'
+        else
+            local where=${cwd/#"$HOME"/\~}
+            if [ "$bare" = home ]; then
+                REPLY="home shell of $sess"$'\x1f'
+            else
+                REPLY="${tool:-shell} in ${where##*/} ($sess:$widx)"$'\x1f'
+            fi
+        fi ;;
+    *) REPLY="$label"$'\x1f'"$desc" ;;
+    esac
+}
+
 # Runs inside the popup. Newest first, so CMD+Z then ⏎ is "reopen the last
 # thing I closed". ⌃x forgets instead of reopening, via --expect (which puts
 # the accepting key on the first output line, empty for a plain ⏎) — the same
 # gesture as the stash picker's kill.
 do_pick() {
     local client_sess="${1:-}" client_tty="${2:-}"
-    local id ts tool label cwd desc
+    local id ts tool label cwd desc sess widx
     local dim=$'\e[2m' mauve=$'\e[38;2;203;166;247m' teal=$'\e[38;2;148;226;213m' off=$'\e[0m'
     local sub=$'\e[38;2;166;173;200m'
     local out now; now=$(date +%s)
     # desc is the model's one-liner from do_describe; missing for a close that
     # was just made (still being written) or where the call failed.
-    out=$(jq -r '[.id, .ts, .tool, .label, .cwd, (.desc // "")] | join("\u001f")' "$HISTORY" 2>/dev/null \
+    out=$(jq -r '[.id, .ts, .tool, .label, .cwd, (.desc // ""), .session, .index] | map(tostring) | join("\u001f")' "$HISTORY" 2>/dev/null \
         | tail -r \
-        | while IFS=$'\x1f' read -r id ts tool label cwd desc; do
+        | while IFS=$'\x1f' read -r id ts tool label cwd desc sess widx; do
             [ -n "$id" ] || continue
             local c="$teal"; [ "$tool" = claude ] && c="$mauve"
+            pick_title "$label" "$desc" "$tool" "$sess" "$widx" "$cwd"
+            local title=${REPLY%%$'\x1f'*} rest=${REPLY#*$'\x1f'}
+            [ -n "$rest" ] && rest="  ${sub}— ${rest}${off}"
             ago "$ts" "$now"
-            [ -n "$desc" ] && desc="  ${sub}— ${desc}${off}"
             printf '%s\t%s%-9s%s %s%-9s%s %s%s\t%s%s%s\n' "$id" \
-                "$dim" "$REPLY" "$off" "$c" "${tool:-shell}" "$off" "$label" "$desc" \
+                "$dim" "$REPLY" "$off" "$c" "${tool:-shell}" "$off" "$title" "$rest" \
                 "$dim" "${cwd/#"$HOME"/\~}" "$off"
           done \
         | fzf --ansi --delimiter='\t' --with-nth=2.. --reverse --multi \
