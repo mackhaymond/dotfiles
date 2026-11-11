@@ -175,7 +175,7 @@ def cvflag: . as $w | any(("--model", "--permission-mode", "--add-dir", "--allow
   "--disallowedTools", "--disallowed-tools", "--tools", "--append-system-prompt", "--system-prompt",
   "--append-system-prompt-file", "--system-prompt-file", "--settings", "--setting-sources", "--mcp-config",
   "--agents", "--agent", "--fallback-model", "--session-id", "--output-format", "--input-format",
-  "--max-turns", "--betas", "--plugin-dir"); . == $w);
+  "--max-turns", "--betas", "--plugin-dir", "--effort"); . == $w);
 def claudecut:
   reduce .[] as $w ({out: [], pend: false, stop: false};
     if .stop then .

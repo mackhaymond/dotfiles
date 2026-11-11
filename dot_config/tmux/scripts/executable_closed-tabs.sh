@@ -570,7 +570,7 @@ build_cmd() {
         if [ "$tool" = claude ]; then
             case "$a" in
             --|[!-]*) break ;;
-            --model|--permission-mode|--add-dir|--allowedTools|--allowed-tools|--disallowedTools|--disallowed-tools|--tools|--append-system-prompt|--system-prompt|--append-system-prompt-file|--system-prompt-file|--settings|--setting-sources|--mcp-config|--agents|--agent|--fallback-model|--session-id|--output-format|--input-format|--max-turns|--betas|--plugin-dir)
+            --model|--permission-mode|--add-dir|--allowedTools|--allowed-tools|--disallowedTools|--disallowed-tools|--tools|--append-system-prompt|--system-prompt|--append-system-prompt-file|--system-prompt-file|--settings|--setting-sources|--mcp-config|--agents|--agent|--fallback-model|--session-id|--output-format|--input-format|--max-turns|--betas|--plugin-dir|--effort)
                 [ "$a" = --model ] && has_model=1
                 if [ "$i" -lt "$n" ]; then
                     q_args+=" $(posix_quote "$a") $(posix_quote "${words[i]}")"
@@ -641,6 +641,13 @@ build_cmd() {
          | "\(.key)\u001f\(.value)"' <<<"$env_json" 2>/dev/null)
     case "$tool" in
     claude)
+        # An abby session (Claude Code on abliteration.ai) comes back through
+        # abby, which rebuilds its settings, model, effort and gateway guard
+        # itself — the same rule as stash.sh's unpark.
+        if [[ "$env_prefix" == *"CLAUDE_CONFIG_DIR="*".claude-abby"* ]]; then
+            echo "command abby --resume $(posix_quote "$sid")"
+            return
+        fi
         [ "$has_model" = 0 ] && [ -n "$model" ] && q_args+=" --model $(posix_quote "$model")"
         echo "${env_prefix}command claude${q_args} --resume $(posix_quote "$sid")" ;;
     opencode) echo "${env_prefix}command opencode${q_args} -s $(posix_quote "$sid")" ;;
@@ -1287,15 +1294,18 @@ do_pick() {
     local client_sess="${1:-}" client_tty="${2:-}"
     local id ts tool label cwd desc sess widx
     local dim=$'\e[2m' mauve=$'\e[38;2;203;166;247m' teal=$'\e[38;2;148;226;213m' off=$'\e[0m'
-    local sub=$'\e[38;2;166;173;200m'
+    local sub=$'\e[38;2;166;173;200m' green=$'\e[38;2;57;255;20m'
     local out now; now=$(date +%s)
     # desc is the model's one-liner from do_describe; missing for a close that
     # was just made (still being written) or where the call failed.
-    out=$(jq -r '[.id, .ts, .tool, .label, .cwd, (.desc // ""), .session, .index] | map(tostring) | join("\u001f")' "$HISTORY" 2>/dev/null \
+    # abby (Claude Code on abliteration.ai) is recorded as claude; its resume
+    # command names abby, or its config dir (entries from before that).
+    out=$(jq -r '[.id, .ts, (if .tool == "claude" and ((.cmd // "") | test("claude-abby|^command abby ")) then "abby" else .tool end), .label, .cwd, (.desc // ""), .session, .index] | map(tostring) | join("\u001f")' "$HISTORY" 2>/dev/null \
         | tail -r \
         | while IFS=$'\x1f' read -r id ts tool label cwd desc sess widx; do
             [ -n "$id" ] || continue
-            local c="$teal"; [ "$tool" = claude ] && c="$mauve"
+            local c="$teal"
+            case "$tool" in claude) c="$mauve" ;; abby) c="$green" ;; esac
             pick_title "$label" "$desc" "$tool" "$sess" "$widx" "$cwd"
             local title=${REPLY%%$'\x1f'*} rest=${REPLY#*$'\x1f'}
             [ -n "$rest" ] && rest="  ${sub}— ${rest}${off}"
