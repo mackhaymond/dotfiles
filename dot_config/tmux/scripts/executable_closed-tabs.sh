@@ -34,7 +34,7 @@
 #   history.jsonl        one JSON object per closed tab, oldest first
 #   previews/<id>.ansi   `capture-pane -e` of the screen at close time
 # Pruned on every close and every picker open. A snapshot is the visible screen
-# only (tens of KB), so a full history is a few MB at most.
+# only (~8 KB on average), so a full history is a few MB at most.
 #
 # Agent detection and session-id resolution are NOT reimplemented here: they
 # come from tmux-assistant-resurrect's save script, which is written to be
@@ -66,8 +66,10 @@ HISTORY="$STATE_DIR/history.jsonl"
 PREVIEWS="$STATE_DIR/previews"
 LOCK="$STATE_DIR/lock"
 LOGFILE="$STATE_DIR/log"
-RETAIN_DAYS=7
-MAX_ENTRIES=100
+# A month (Mack, 2026-11-11). The count cap is a backstop, not the limit: a
+# normal week is ~40 closes, so 400 leaves a month room for heavy weeks.
+RETAIN_DAYS=30
+MAX_ENTRIES=400
 PREVIEW_GRACE=120     # seconds an unreferenced snapshot is left for its close to finish (prune)
 # The preview sits UNDER the list so it gets (nearly) the full client width: a
 # snapshot is as wide as the tab was, and anything wider than the preview is
