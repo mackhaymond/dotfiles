@@ -188,7 +188,8 @@ pub enum Act {
 /// A row a permission prompt waits on offers `y` allow and `n` deny first.
 /// A space's home ([`Target::home`]) is never parked, and with no split
 /// never closed (its agent is the home shell pane; prefix Q closes the
-/// space), so neither is offered then (2026-10-22).
+/// space), so neither is offered then (2026-10-22). A stashed entry
+/// ([`Target::entry`]) offers no `d` (no window, no cwd of its own to read).
 pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
     let mut v = Vec::new();
     if t.perm.is_some() && !t.parked() {
@@ -204,7 +205,10 @@ pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
     if t.parked() || !(t.home && t.panes <= 1) {
         v.push(('x', Act::Close, if t.parked() { "discard" } else { "close" }));
     }
-    v.push(('d', Act::Diff, "diff"));
+    // (A stashed entry has no window to diff.)
+    if !t.entry() {
+        v.push(('d', Act::Diff, "diff"));
+    }
     v.push(('v', Act::Peek, "preview"));
     v.push(('r', Act::Restart, "restart watcher"));
     v
@@ -1414,6 +1418,37 @@ pub(crate) mod tests {
         m.handle(&keys(" x"), &mut NoEffects);
         assert!(!m.act(Esc, &mut NoEffects));
         assert!(m.confirm.is_none());
+    }
+
+    /// A stashed entry's row (Parked, after the windows by stash age): ⏎
+    /// hands its `entry:<id>` to go (closed-tabs.sh reopen), x asks
+    /// "discard" and its y hands it to close (closed-tabs.sh unpin); the
+    /// strip offers neither p, s nor d.
+    #[test]
+    fn a_stashed_entry_reopens_and_discards() {
+        let mut d = data();
+        d.view.add_stashed(&crate::stashed::parse_pinned(crate::stashed::tests::HISTORY));
+        let mut m = Menu::new(d, Tab::Parked);
+        draw_all(&mut m);
+        assert_eq!(row_keys(&m).iter().map(|k| k.window().to_string()).collect::<Vec<_>>(),
+            ["@10", "@11", "@12", "@13", "@14", "entry:1790000200-13", "entry:1790000100-12"]);
+        m.act(End, &mut NoEffects);
+        let t = m.selected_target().unwrap();
+        assert!(t.parked() && t.entry());
+        assert_eq!(strip(&t).iter().map(|(k, _, w)| format!("{k} {w}")).collect::<Vec<_>>(),
+            ["x discard", "v preview", "r restart watcher"]);
+        let mut fx = Rec::default();
+        assert!(m.act(Enter, &mut fx));
+        assert_eq!(fx.calls, ["go entry:1790000100-12 stash"]);
+        m.handle(&keys(" x"), &mut fx);
+        assert_eq!(m.confirm.as_ref().map(|c| c.verb()), Some("discard"));
+        m.frame_shown();
+        m.act(Char('y'), &mut fx);
+        assert_eq!(fx.calls[1], "close entry:1790000100-12 stash");
+        // Found by its title (the desc of a generic label), like any row.
+        m.set_tab(Tab::Parked);
+        let rows = super::super::rows::build_rows(&m.data, Tab::Parked, "parser");
+        assert_eq!(rows.iter().filter_map(Row::key).map(|k| k.window().to_string()).collect::<Vec<_>>(), ["entry:1790000100-12"]);
     }
 
     /// A blank snapshot (or a search that matches nothing) keeps the

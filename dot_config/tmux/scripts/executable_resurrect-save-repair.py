@@ -21,6 +21,8 @@ VALUE_FLAGS = {"-c", "--config", "--enable", "--disable", "-C", "--cd", "-m", "-
                "--add-dir", "--local-provider", "--remote"}
 PICKERS = {"--last", "--all", "--include-noninteractive", "--include-non-interactive"}
 SHELLS = {"zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh", "nu"}
+# stash.sh's holding session: its panes are restored as shells (repair()).
+HOLD = "stash"
 # Native subcommands (codex-terminal-owner.interactive_args()): a first
 # positional word naming one is not an interactive session's prompt.
 SUBCOMMANDS = {"exec", "e", "review", "login", "logout", "mcp", "mcp-server", "plugin", "app-server",
@@ -534,7 +536,7 @@ def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_d
               + ", ".join(f"pid {pid} ({pane})" for pid, pane in sorted(set(unresolved))), file=sys.stderr)
     data["sessions"] = sessions + sorted(rebuilt, key=lambda entry: entry["pane"])
     current = {pane["target"]: pane for pane in panes.values()}
-    lines, fixed, parked_cwds = [], 0, 0
+    lines, fixed, parked_cwds, parked_commands = [], 0, 0, 0
     for line in layout.splitlines(keepends=True):
         f = line.rstrip("\r\n").split("\t")
         target = f"{f[1]}:{f[2]}.{f[5]}" if f[0] == "pane" and len(f) >= 6 else ""
@@ -556,11 +558,19 @@ def repair(sidecar, layout, records, panes, socket, owner, codex_home, tracker_d
                 and f[7] != ":" + cwd):
             f[7], changed = ":" + cwd, True
             parked_cwds += 1
+        # Nothing in the stash is running: a parked pane's job is frozen, and
+        # after a restart stash.sh re-runs its recorded command when the tab is
+        # unparked (cold). So a restore must bring parked panes back as plain
+        # shells, never running: their process command is saved empty.
+        if f[0] == "pane" and len(f) == 11 and f[1] == HOLD and f[10] != ":":
+            f[10], changed = ":", True
+            parked_commands += 1
         if changed:
             line = "\t".join(f) + line[len(line.rstrip("\r\n")):]
         lines.append(line)
     report = dict(codex=len(rebuilt), preserved=len(sessions), invalid_bindings=invalid, repaired_panes=fixed,
-                  fallback_bindings=fallback, parked_cwds=parked_cwds, standalone_resumes=standalone,
+                  fallback_bindings=fallback, parked_cwds=parked_cwds, parked_commands=parked_commands,
+                  standalone_resumes=standalone,
                   unresolved_dropped=len(set(unresolved)), kept_unverified=len(kept_unverified))
     return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode(), "".join(lines).encode(), used, report
 

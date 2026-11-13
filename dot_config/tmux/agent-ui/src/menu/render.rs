@@ -363,7 +363,17 @@ fn draw_row(m: &Menu, buf: &mut Buffer, x0: u16, y: u16, cw: u16, row: &Row, sel
         Row::Parked(p) => {
             let a = &p.agent;
             let end = x0 + cw;
-            let x = put(buf, lead, y, end, "▪ ", ov);
+            // A stashed agent (an entry) wears its harness's mark, a kept
+            // shell (an entry with no tool) the shell rows' green prompt,
+            // the rest the stash's square.
+            let x = if p.entry.is_some() && !p.suspended {
+                put(buf, lead, y, end, crate::sidebar::layout::PROMPT, bold(fg("green")))
+            } else if p.entry.is_some() && a.harness != crate::model::Harness::OTHER {
+                let x = put(buf, lead, y, end, &a.harness.glyph().to_string(), fg(a.harness.hue()));
+                put(buf, x, y, end, " ", ov)
+            } else {
+                put(buf, lead, y, end, "▪ ", ov)
+            };
             let mut right = String::new();
             if m.tab == Tab::Parked && cw >= 60 {
                 right = format!("{} · ", p.state_words);

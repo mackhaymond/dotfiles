@@ -153,10 +153,13 @@ bind N new-window -a -c "#{pane_current_path}" nu
 
 # CMD+W (wezterm) → prefix x: close the pane after a y/n, through
 # closed-tabs.sh, which first records the tab in a history of
-# recently closed ones (kept a week): cwd, position in the bar, a snapshot of
+# recently closed ones (kept a month): cwd, position in the bar, a snapshot of
 # the screen, and any claude / codex / opencode session running in it.
-# CMD+Z (wezterm) → prefix X: fzf over that history, newest first, previewing
-# each tab's screen as it was. ⏎ brings it back in the slot it left, same cwd,
+# CMD+Z (wezterm) → prefix X: fzf over that history, previewing each tab's
+# screen as it was: a Stashed section (pinned entries, which never expire, and
+# the windows parked in `stash`) above the backlog, newest first. ⌃s
+# stashes/unstashes a row, ⌃x drops a stashed one into the backlog (or forgets
+# a backlog one). ⏎ brings it back in the slot it left, same cwd,
 # with the agent resumed (`claude --resume <id>` etc.) as a child of zsh via
 # ZSH_AUTOSTART, exactly like a CMD+R tab. So CMD+Z ⏎ undoes the last close.
 # NOT run-shell -b: the popup needs the key press's client to appear on.
@@ -788,11 +791,15 @@ unbind -n M-y
 # set -g @plugin 'git@bitbucket.com:user/plugin'
 
 
-# Park a tab out of the tab bar without stopping it (tmux has no hide/minimize
-# of its own — tmux/tmux#3047 — but move-window to a detached session is exactly
-# that). prefix+H hides, prefix+h brings one back; both verified unbound first.
-# Not `run-shell -b` for unstash: it may need to raise a popup for the picker,
-# and a backgrounded run-shell has no client to raise it on.
+# Park a tab out of the tab bar, with nothing left running (stash.sh): a
+# one-pane agent tab closes into a pinned ⌘Z entry and is resumed by session
+# id; any other tab moves to the detached `stash` session (tmux has no
+# hide/minimize of its own — tmux/tmux#3047) with its jobs frozen (⌃Z or
+# SIGSTOP), thawed with `fg` on unpark, or re-run from the recorded command
+# after a restart. What can't be paused safely (a busy agent, a draft, ssh, a
+# split tab with an agent) is refused, with the reason. prefix+h opens the ⌘Z
+# picker scoped to Stashed. Not `run-shell -b` for unstash: it raises a popup
+# for the picker, and a backgrounded run-shell has no client to raise it on.
 bind-key H run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh stash '#{window_id}'"
 bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash '' '#{client_name}'"
 

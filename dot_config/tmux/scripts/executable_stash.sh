@@ -21,17 +21,41 @@
 # Everything needed to resume is stored ON the window, like @stash_origin, so
 # there is still no state file to go stale or be orphaned.
 #
+# NOTHING IN THE STASH IS RUNNING (2026-11-11; supersedes the two paragraphs
+# above for every NEW park — their machinery stays only for windows suspended
+# before then, until they are migrated). A park now classifies each tab:
+#   - refused, with the reason: the home tab, a working agent, unsent text in
+#     an agent's composer, background workflow / subagent / cua work, ssh /
+#     mosh / et in a pane's foreground, a split tab with an agent in it, a
+#     pane whose process runs with no shell under it;
+#   - a one-pane agent tab (claude, abby, codex, opencode, grok, copilot, agy)
+#     is not parked at all: `closed-tabs.sh close --pin` closes it into a
+#     PINNED history entry that resumes it (the ⌘Z picker's Stashed section);
+#   - anything else moves into the holding session and every pane's
+#     foreground job is FROZEN (⌃Z, SIGSTOP as the fallback), recorded in
+#     @stash_frozen with its exact argv. Unparking types `fg` (warm); after a
+#     tmux restart the process is gone and the recorded command is re-run in
+#     its directory instead (cold, @stash_cold).
+#
 #   stash.sh stash   [<window>]   park it (default: current)
 #   stash.sh unstash [<window>] [<client>]
-#                                 bring one back (no <window>: picker), and
-#                                 take <client> to it if it went home to
-#                                 another session
+#                                 bring one back (no <window>: the merged
+#                                 picker, `closed-tabs.sh pick-popup --stashed`),
+#                                 and take <client> to it if it went home to
+#                                 another session; a frozen job is thawed
 #   stash.sh stash-many <w>...    park a group in one transaction
 #   stash.sh unstash-many [-c <client>] <w>...
 #                                 bring a group back in one transaction
-#   stash.sh kill-many <w>...     destroy parked windows (⌃x in the picker);
-#                                 discarded session ids land in the log with
-#                                 the command that resumes them by hand
+#   stash.sh kill-many <w>...     discard parked windows: each is closed through
+#                                 `closed-tabs.sh close`, so it lands in the ⌘Z
+#                                 backlog; discarded session ids land in the
+#                                 log with the command that resumes them by hand
+#   stash.sh rows                 the parked windows, one \x1f-separated row
+#                                 each: window id, origin, label, park time,
+#                                 frozen|cold|idle, cwd (the merged picker's)
+#   stash.sh publish-count        @stash_count = parked windows + pinned entries
+#   stash.sh thaw <w> [<client>]  bring a frozen window's jobs back (unstash
+#                                 hands off to this)
 #   stash.sh sel-start here|left|right  start a range at the current tab
 #   stash.sh sel-move  left|right grow or shrink it
 #   stash.sh sel-cancel           drop the selection
@@ -42,7 +66,8 @@
 #                                 after a popup only ⇧Y confirms, through
 #                                 closed-tabs.sh
 #   stash.sh sel-kill-prompt <w>  print that menu's question (tests)
-#   stash.sh count                how many are parked (for the status line)
+#   stash.sh count                how many are parked, pinned entries included
+#                                 (for the status line)
 #   stash.sh list                 what is parked, and where each came from
 #   stash.sh restore-state        re-apply parked state after a resurrect restore
 set -uo pipefail
@@ -74,6 +99,15 @@ HOLD=stash          # the detached holding session
 # server without the re-entrant calls silently landing back in the installed
 # one — which would test the old code and report that the new code passed.
 SELF="${STASH_SELF:-$HOME/.config/tmux/scripts/stash.sh}"
+
+# The ⌘Z history: a parked agent tab is closed into it as a pinned entry, a
+# discarded parked window is closed into it, and the unpark picker is its.
+# CLOSED_TABS_SH names another (tests stub it); missing = those paths degrade
+# (an agent tab is refused, a discard is a plain kill-window).
+CLOSED_TABS_SH="${CLOSED_TABS_SH:-$HOME/.config/tmux/scripts/closed-tabs.sh}"
+# Its history file, for the pinned count (publish-count). Where closed-tabs.sh
+# keeps it: $XDG_STATE_HOME/tmux-closed-tabs.
+CLOSED_HISTORY="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-closed-tabs/history.jsonl"
 
 SESS_DIR="$HOME/.claude/sessions"
 TERM_WAIT=12          # seconds to allow for a graceful exit
@@ -178,6 +212,15 @@ lock_release() {
     rm -rf "$dir" 2>/dev/null
 }
 
+# A holder doing a long series of steps (a range park: a pin or a freeze per
+# window) renews the lock's age, so LOCK_STALE measures time since its last
+# step, never the whole series — a range must not be broken into as stale.
+lock_touch() {
+    local dir="${1:-$LOCKDIR}"
+    [ "$(cat "$dir/pid" 2>/dev/null)" = "$$" ] && touch "$dir" 2>/dev/null
+    return 0
+}
+
 hold_exists() { tmux has-session -t "=$HOLD" 2>/dev/null; }
 
 # Every session that is not a place for a tab, one name per line: tmux.conf's
@@ -222,13 +265,27 @@ renumber() {
 # The `&&`/`||` form printed TWO lines when tmux failed: wc still printed 0 and
 # pipefail then propagated tmux's failure, firing the `|| echo 0` as well. A
 # two-line @stash_count broke both the statusline test and `[ "$(count)" -gt 1 ]`.
-count() {
+count_windows() {
     local n
     hold_exists || { printf '0'; return 0; }
     n=$(tmux list-windows -t "=$HOLD" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ')
     case "$n" in ''|*[!0-9]*) n=0 ;; esac
     printf '%s' "$n"
 }
+# Pinned history entries (agent tabs parked through `close --pin`): the other
+# half of what the stash holds. One jq over the file, no lock — a count read
+# mid-append is off by one until the next publish. Lines that do not parse
+# are skipped (fromjson?), so one torn line cannot zero the count.
+pinned_count() {
+    local n=0
+    if [ -s "$CLOSED_HISTORY" ] && command -v jq >/dev/null 2>&1; then
+        n=$(jq -R 'fromjson? | select(type == "object" and .pinned == true) | 1' "$CLOSED_HISTORY" 2>/dev/null | wc -l | tr -d ' ')
+        case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    fi
+    printf '%s' "$n"
+}
+# Everything stashed: parked windows plus pinned entries.
+count() { printf '%s' "$(( $(count_windows) + $(pinned_count) ))"; }
 # Messages go through notify.sh: a toast in the agent sidebar when one is open
 # for the client, else tmux's own display-message (its header has the rest).
 # NOTIFY_SH names another (tests); beside this script it is notify.sh
@@ -273,7 +330,10 @@ log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOGFILE" 2>/d
 # rather than polled with a #() shell call. A #() in the status format re-forks
 # on every redraw forever; this forks only when you actually park or restore
 # something, which on an idle machine is never.
-publish() { tmux set-option -g @stash_count "$(count)" 2>/dev/null; save_state; }
+publish() { publish_count; save_state; }
+# The count alone: no sidecar, no lock — closed-tabs.sh calls it after every
+# pin change, sometimes while a park holds this script's lock.
+publish_count() { tmux set-option -g @stash_count "$(count)" 2>/dev/null; }
 
 # --- surviving a tmux restart -------------------------------------------------
 #
@@ -748,7 +808,7 @@ save_state() {
     local of; of=$(orphan_file)
     local pass=1 first_ident="" s_pid s_start s_adopt s_sock guard adopted keep fresh_sids fresh_keys
     local notes orphan_rows n_orph n_kept lost_idless line key own m row
-    local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_extra
+    local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_frozen o_extra o_tail
     while :; do
         # Every window that matters, not just the parked ones. A window can
         # leave the holding session still carrying @stash_session —
@@ -775,6 +835,13 @@ save_state() {
         # here", and stamping it on a window whose agent was never suspended
         # would lie to every reader of it.
         #
+        # Field 11, @stash_frozen (the parked window's frozen jobs: a JSON
+        # array, so it holds no \x1f or newline), is appended the same way,
+        # and only on rows that have one: a row without it is written with 10
+        # fields exactly as before. restore-state re-applies it and marks the
+        # window @stash_cold — after a restart the processes are gone, and
+        # the unpark re-runs the recorded commands instead of typing `fg`.
+        #
         # The five leading fields are not row data: the answering server's
         # #{pid} and #{start_time} (its identity, for adoption, the settle
         # and the $TMUX test in the header), @kill_guard_shutdown,
@@ -782,7 +849,7 @@ save_state() {
         # every line of the call this already made, so they cost no tmux
         # call; the filter below strips them before anything is written.
         raw=$(tmux list-windows -a -F \
-            "#{pid}${SEP}#{start_time}${SEP}#{@kill_guard_shutdown}${SEP}#{@stash_adopted}${SEP}#{socket_path}${SEP}#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@stash_pane_idx}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}${SEP}#{@stash_ts}${SEP}#{pane_current_path}" \
+            "#{pid}${SEP}#{start_time}${SEP}#{@kill_guard_shutdown}${SEP}#{@stash_adopted}${SEP}#{socket_path}${SEP}#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@stash_pane_idx}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}${SEP}#{@stash_ts}${SEP}#{pane_current_path}${SEP}#{@stash_frozen}" \
             2>/dev/null) || { lock_release "$SAVE_LOCKDIR"; return 0; }   # tmux unreachable: keep what is on disk
         s_pid=""; s_start=""; s_adopt=""; s_sock=""
         IFS="$SEP" read -r s_pid s_start _ s_adopt s_sock _ <<< "$raw"
@@ -843,7 +910,9 @@ save_state() {
         rows=$(printf '%s\n' "$raw" | awk -F"$SEP" -v hold="$HOLD" -v now="${EPOCHSECONDS:-$(date +%s)}" -v fresh="$GUARD_FRESH" '
             $3 ~ /^[0-9]+$/ && now - $3 < fresh && now - $3 >= -5 { g = 1 }
             { $0 = substr($0, length($1) + length($2) + length($3) + length($4) + length($5) + 6) }
-            $7!="" || ($1==hold && ($5!="" || $6!="" || $8!="" || $9!="")) { print }
+            $7!="" || ($1==hold && ($5!="" || $6!="" || $8!="" || $9!="")) {
+                # No field 11: the 10-field row older readers wrote.
+                if ($11 == "") { s = $1; for (i = 2; i <= 10; i++) s = s FS $i; print s } else print }
             END { exit g ? 3 : 0 }') || guard=1
         # Rows the merge cannot account for are kept, not judged (header).
         keep=""; { [ -z "$adopted" ] || [ "$guard" = 1 ]; } && keep=1
@@ -900,8 +969,13 @@ save_state() {
             # o_extra soaks up any field a later format appends, so o_icwd
             # (and, for older rows, o_ts or o_cwd) never carries a stray
             # separator.
-            while IFS="$SEP" read -r o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_extra; do
+            while IFS="$SEP" read -r o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_frozen o_extra; do
                 o_n=$((o_n + 1))
+                # Fields 10 and 11 as a row carried forward writes them:
+                # nothing, icwd, or icwd and the frozen jobs (field 11 needs
+                # field 10 in place, even empty).
+                if [ -n "$o_frozen" ]; then o_tail="${SEP}${o_icwd}${SEP}${o_frozen}"
+                else o_tail="${o_icwd:+${SEP}${o_icwd}}"; fi
                 if [ -z "$o_sid" ]; then
                     # A parked window's origin, label and park time. Not
                     # irreplaceable like a session id, but the same "options do
@@ -913,7 +987,7 @@ save_state() {
                     # resolve_parked_rows can say WHICH window it is
                     # (state-less, unclaimed, no lookalike).
                     if printf '%s\n' "$placed" | awk -F"$SEP" -v n="$o_n" '$1==n{f=1} END{exit !f}'; then
-                        rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${SEP}${o_cwd}${SEP}${o_ts}${o_icwd:+${SEP}${o_icwd}}"
+                        rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${SEP}${o_cwd}${SEP}${o_ts}${o_tail}"
                         continue
                     fi
                     # Otherwise it is dropped, which is NOT a loss when it
@@ -949,7 +1023,7 @@ save_state() {
                         case "$fresh_keys" in
                             *$'\n'"L${SEP}${o_sess}${SEP}${o_idx}"$'\n'*|*$'\n'"D${SEP}${key}"$'\n'*) continue ;;
                         esac
-                        rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${SEP}${o_cwd}${SEP}${o_ts}${o_icwd:+${SEP}${o_icwd}}"
+                        rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${SEP}${o_cwd}${SEP}${o_ts}${o_tail}"
                         n_kept=$((n_kept + 1))
                         continue
                     fi
@@ -967,7 +1041,7 @@ save_state() {
                 # the same id on a parked window too — one conversation resumed
                 # in two places.
                 printf '%s\n' "$live" | grep -q "${SEP}${o_sid}${SEP}" && continue
-                row="${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}${SEP}${o_ts}${o_icwd:+${SEP}${o_icwd}}"
+                row="${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}${SEP}${o_ts}${o_tail}"
                 # Identity, not "some window has that index": after a close,
                 # renumber-windows slides a DIFFERENT window into the vacated
                 # slot, and carrying the row forward there is exactly how a
@@ -1280,8 +1354,15 @@ forget_sids() {
 # resolve_parked_rows, once the session-id rows have claimed their windows —
 # a lookalike in the same directory makes such a row unplaceable rather than
 # a guess.
-apply_row() {   # <win> <origin> <label> <sid> <cwd> <pidx> <ts>
+apply_row() {   # <win> <origin> <label> <sid> <cwd> <pidx> <ts> [<frozen>]
     local win="$1"
+    # Frozen jobs recorded before a restart: the processes died with the old
+    # server and the pane is a plain shell now (resurrect-save-repair.py saves
+    # stash panes with no command), so the unpark re-runs them — cold.
+    if [ -n "${8:-}" ]; then
+        tmux set-option -w -t "$win" @stash_frozen "$8" 2>/dev/null
+        tmux set-option -w -t "$win" @stash_cold 1 2>/dev/null
+    fi
     [ -n "$2" ] && tmux set-option -w -t "$win" @stash_origin   "$2" 2>/dev/null
     [ -n "$3" ] && tmux set-option -w -t "$win" @stash_label    "$3" 2>/dev/null
     [ -n "$4" ] && tmux set-option -w -t "$win" @stash_session  "$4" 2>/dev/null
@@ -1300,7 +1381,7 @@ do_restore_state() {
     # orphans file. It gets nothing, silently.
     server_writes_sidecar || return 0
     local sf of; sf=$(state_file); of=$(orphan_file)
-    local sess idx name pidx origin label sid cwd ts icwd extra win existing kept=""
+    local sess idx name pidx origin label sid cwd ts icwd frozen extra win existing kept="" tail
 
     # Which snapshot was just restored, for resolve_parked_rows (see
     # restored_snapshot_time). As resurrect's post-restore hook this runs with
@@ -1326,7 +1407,7 @@ do_restore_state() {
         # somebody's (below).
         local stale n1=0
         stale=$'\n'$(superseded_sid_rows "$sf")$'\n'
-        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd extra; do
+        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd frozen extra; do
             n1=$((n1 + 1))
             [ -n "$sess" ] && [ -n "$idx" ] && [ -n "$sid" ] || continue
 
@@ -1361,11 +1442,12 @@ do_restore_state() {
             fi
             if [ "$ok" != 1 ]; then
                 # Keep the pointer somewhere durable, and say so loudly.
-                kept="${kept}${sess}${SEP}${idx}${SEP}${name}${SEP}${pidx}${SEP}${origin}${SEP}${label}${SEP}${sid}${SEP}${cwd}${SEP}${ts}${icwd:+${SEP}${icwd}}"$'\n'
+                if [ -n "$frozen" ]; then tail="${SEP}${icwd}${SEP}${frozen}"; else tail="${icwd:+${SEP}${icwd}}"; fi
+                kept="${kept}${sess}${SEP}${idx}${SEP}${name}${SEP}${pidx}${SEP}${origin}${SEP}${label}${SEP}${sid}${SEP}${cwd}${SEP}${ts}${tail}"$'\n'
                 log "could not place suspended session ${sid%%-*} ($sess:$idx) — kept in $(basename "$of"); \`stash.sh list\` shows how to resume it"
                 continue
             fi
-            apply_row "$win" "$origin" "$label" "$sid" "$cwd" "$pidx" "$ts"
+            apply_row "$win" "$origin" "$label" "$sid" "$cwd" "$pidx" "$ts" "$frozen"
             log "restored $sess:$idx — suspended session ${sid%%-*}"
         done < "$sf"
 
@@ -1373,7 +1455,7 @@ do_restore_state() {
         # BEFORE any of it is applied, so one placement cannot change what
         # the next row sees.
         local placed n=0; placed=$(resolve_parked_rows "$sf")
-        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd extra; do
+        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd frozen extra; do
             n=$((n + 1))
             [ -n "$sess" ] && [ -n "$idx" ] && [ -z "$sid" ] || continue
             # Nothing to re-apply (a bare index and name, as older versions
@@ -1393,8 +1475,8 @@ do_restore_state() {
                 log "could not re-apply parked state to $sess:$idx (from ${origin:-?}${label:+, \"$label\"}) — no window can be told apart as its own${icwd:+ (in $icwd)}, or it was parked after the restored snapshot; not re-applied"
                 continue
             fi
-            apply_row "$win" "$origin" "$label" "" "$cwd" "$pidx" "$ts"
-            log "restored $sess:$idx"
+            apply_row "$win" "$origin" "$label" "" "$cwd" "$pidx" "$ts" "$frozen"
+            log "restored $sess:$idx${frozen:+ — its frozen jobs re-run on unpark (cold)}"
         done < "$sf"
     fi
 
@@ -2164,12 +2246,672 @@ agent_running() {
     # the staggered end of a review fleet.
     #
     # The failure this accepts: watcher dead or one tick behind at the moment
-    # of the press → the tab parks with work in flight. That lands on
-    # suspend_agent, which keeps EVERY deep guard (status, caffeinate, the
-    # lineage-aware workflow/subagent walks, the last-moment re-check) — so
-    # the outcome is hidden-but-left-running with a logged reason, never a
-    # killed turn, and prefix+h brings it straight back.
+    # of the press → this says "not running". That lands on classify_window's
+    # agent_guard, which keeps EVERY deep guard (status, caffeinate, the
+    # lineage-aware workflow/subagent walks), and on pin_recheck right before
+    # the close — so the outcome is a refusal with a logged reason, never a
+    # killed turn.
     return 1
+}
+
+# --- classify, freeze, thaw ---------------------------------------------------
+#
+# "Nothing in the stash is running." Every tab a park reaches is classified
+# BEFORE anything moves (classify_window): refused with a reason, closed into
+# a pinned ⌘Z entry (a one-pane agent tab), or parked with its jobs frozen
+# (freeze_window). The guards suspend_agent used to run after the move — and
+# answer with "parked, but left running" — run here, up front, so a refusal
+# leaves the tab exactly where it was. The slow part of the classification
+# runs before the park takes its lock (do_stash_many); under the lock only
+# cheap re-checks and the moves.
+
+SHELL_NAMES=" zsh bash sh fish dash ksh tcsh csh nu "
+REMOTE_NAMES=" ssh mosh mosh-client et autossh "
+# A word that names an agent harness, as argv0 (or argv1 after an interpreter:
+# `node …/codex`, the abby wrapper under bash). claude's process title is its
+# version string, caught separately. It routes a tab to `closed-tabs.sh close
+# --pin`, which does the real detection and the session lookup.
+export STASH_AGENT_RE='^(claude|abby|codex|codex\.js|opencode|grok(-[a-z]+-[a-z0-9_]+)?|copilot|agy)$'
+INTERPRETERS=" node bun deno python python3 bash zsh sh perl ruby "
+FREEZE_TRIES=10       # 0.05s ticks for ⌃Z, then again for SIGSTOP, to take
+
+# What is running on one pane's terminal, from ONE `ps -t` (the pane's tty:
+# 2-3ms, against ~50ms for the whole machine). Lines, tab-separated:
+#   gone                      the pane's process is not on its tty
+#   root  shell|other  NAME   the pane's own process (a shell, or not)
+#   agent NAME                the TAB's agent: the pane's own process, or a
+#                             process the shell started for its foreground job
+#                             (not an agent some other program runs — `make
+#                             review` running `claude -p`, an agent under vim)
+#   fg    PGID  PIDS  NAME    the foreground job, when the shell is not in the
+#                             foreground: its process group, the pids the shell
+#                             started for it (a pipeline's members, comma
+#                             separated) and the first one's name
+#   remote NAME               ssh / mosh / et among that job's processes
+# The foreground is the tty's process group (tpgid), which a shell at its
+# prompt holds itself — so "tpgid differs from the shell's pid" is the test.
+pane_scan() {   # <pane pid> <pane tty>
+    ps -t "${2#/dev/}" -o pid=,ppid=,pgid=,tpgid=,stat=,args= 2>/dev/null |
+        awk -v OFS='\t' -v root="$1" -v shells="$SHELL_NAMES" -v remotes="$REMOTE_NAMES" -v interp="$INTERPRETERS" '
+            function base(w) { sub(/^-/, "", w); sub(/.*\//, "", w); return w }
+            BEGIN { are = ENVIRON["STASH_AGENT_RE"] }
+            $1 ~ /^[0-9]+$/ {
+                pid = $1; pp[pid] = $2; pg[pid] = $3
+                if (pid == root) rtp = $4
+                a = $0; sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+[0-9]+[ \t]+-?[0-9]+[ \t]+[^ \t]+[ \t]*/, "", a)
+                n = split(a, w, /[ \t]+/); w0 = base(w[1]); w1 = (n > 1) ? base(w[2]) : ""
+                nm[pid] = w0
+                if (w0 ~ are) ag[pid] = w0
+                else if (index(interp, " " w0 " ") && w1 ~ are) ag[pid] = w1
+                else if (a ~ /^[0-9]+\.[0-9]+\.[0-9]+/) ag[pid] = "claude"
+                o[++np] = pid
+            }
+            END {
+                if (!(root in pp)) { print "gone"; exit }
+                isshell = index(shells, " " nm[root] " ")
+                print "root", (isshell ? "shell" : "other"), nm[root]
+                agent = (!isshell && (root in ag)) ? ag[root] : ""
+                fg = rtp ""
+                if (fg + 0 > 0 && fg != root) {
+                    mem = ""; rem = ""
+                    for (i = 1; i <= np; i++) { p = o[i]
+                        if (pg[p] == fg && pp[p] == root) mem = mem (mem == "" ? "" : ",") p }
+                    if (mem == "" && (fg in pp)) mem = fg
+                    split(mem, f, ",")
+                    for (k in f) if (agent == "" && (f[k] in ag)) agent = ag[f[k]]
+                    for (i = 1; i <= np; i++) { p = o[i]
+                        if (pg[p] == fg && index(remotes, " " nm[p] " ")) { rem = nm[p]; break } }
+                    print "fg", fg, mem, nm[f[1]]
+                    if (rem != "") print "remote", rem
+                }
+                if (agent != "") print "agent", agent
+            }'
+}
+
+# The deep guards for a window whose agent is a REGISTERED claude (its
+# sessions file, verified to live in this window): exactly what
+# suspend_agent checked after the move, now before anything happens.
+# 0 = refuse (GUARD_WHY says why), 1 = no registered agent, 2 = agent, clear.
+GUARD_WHY=""
+agent_guard() {
+    local win="$1" pid sid status w pane cwd n=0 a_pid="" a_sid="" a_status="" a_pane=""
+    GUARD_WHY=""
+    while IFS="$SEP" read -r pid sid status w pane cwd; do
+        [ "$w" = "$win" ] || continue
+        pid_in_window "$pid" "$win" || continue
+        n=$((n + 1)); a_pid=$pid; a_sid=$sid; a_status=$status; a_pane=$pane
+    done < <(live_sessions)
+    [ "$n" -eq 0 ] && return 1
+    if [ "$n" -gt 1 ]; then GUARD_WHY="that tab holds $n agents"; return 0; fi
+    if is_working "$a_status" "$a_sid" "$a_pid" "$win"; then
+        GUARD_WHY="that agent is still working"; return 0
+    fi
+    if has_unsent_input "$a_pane"; then
+        GUARD_WHY="unsent text in the agent's composer"; return 0
+    fi
+    if [ -n "$(tmux show -wqv -t "$win" @agent_workflow 2>/dev/null)" ] || session_has_running_workflow "$a_pid"; then
+        GUARD_WHY="background work (workflow or subagent) still in flight"; return 0
+    fi
+    if session_has_running_subagent "$a_pid"; then
+        GUARD_WHY="a background subagent is still running"; return 0
+    fi
+    if [ -n "$(tmux show -wqv -t "$win" @agent_cua 2>/dev/null)" ] || has_live_cua "$a_pid"; then
+        GUARD_WHY="it's driving an app through cua"; return 0
+    fi
+    return 2
+}
+
+# Any agent's tab, by the watcher's options: working, or a workflow or cua
+# flag. For the harnesses agent_guard cannot see (codex, opencode, …), whose
+# tab state agent_running ignores because no claude is registered there. Only
+# consulted once the tab's agent was found.
+tab_busy() {
+    case "$(tmux show -wqv -t "$1" @agent_state 2>/dev/null)" in
+        ""|idle|done|paused|needs-*|failed) ;;
+        *) return 0 ;;
+    esac
+    [ -n "$(tmux show -wqv -t "$1" @agent_workflow 2>/dev/null)" ] && return 0
+    [ -n "$(tmux show -wqv -t "$1" @agent_cua 2>/dev/null)" ] && return 0
+    return 1
+}
+
+# The cheap guards, again, right before `close --pin` kills the agent: the
+# classification ran before the lock (and before every earlier tab of a
+# range). Every harness: its tab state. claude and abby (one TUI, so
+# has_unsent_input reads both screens): the composer. A registered claude:
+# its sessions file's `status`, read fresh. 0 = refuse (RECHECK_WHY).
+RECHECK_WHY=""
+pin_recheck() {   # <win> <pane> <agent>
+    RECHECK_WHY=""
+    if tab_busy "$1"; then RECHECK_WHY="that agent is still working"; return 0; fi
+    case "$3" in
+        claude|abby)
+            if has_unsent_input "$2"; then RECHECK_WHY="unsent text in the agent's composer"; return 0; fi ;;
+    esac
+    if live_sessions | awk -F"$SEP" -v w="$1" '$4 == w && $3 == "busy" { f = 1 } END { exit !f }'; then
+        RECHECK_WHY="that agent is still working"; return 0
+    fi
+    return 1
+}
+
+# What a park does with <window>. Sets CL_KIND:
+#   refuse   leave it; CL_WHY says why
+#   pin      a one-pane agent tab: `closed-tabs.sh close --pin` CL_PANE;
+#            CL_AGENT names the harness
+#   park     park it; freeze whatever runs under each pane's shell
+# Agents count only as the tab's agent (pane_scan's `agent`). Anything else
+# in the foreground is parked and frozen, never offered to `close --pin`: a
+# close that found an agent somewhere under the pane would kill the pane.
+CL_KIND=""
+CL_WHY=""
+CL_PANE=""
+CL_AGENT=""
+classify_window() {
+    local win="$1" pane idx ppid tty dead n=0 k a b c
+    local agent="" why="" noshell="" rkind rname members=" " g
+    CL_KIND=refuse; CL_WHY=""; CL_PANE=""; CL_AGENT=""
+    while IFS="$SEP" read -r pane idx ppid tty dead; do
+        [ -n "$pane" ] || continue
+        n=$((n + 1)); CL_PANE="$pane"
+        [ "$dead" = 1 ] && continue
+        case "$ppid" in ''|*[!0-9]*) continue ;; esac
+        [ -n "$tty" ] || continue
+        rkind=""; rname=""
+        while IFS=$'\t' read -r k a b c; do
+            case "$k" in
+                root)   rkind="$a"; rname="$b"; [ "$a" = other ] && members="$members$ppid " ;;
+                agent)  [ -n "$agent" ] || agent="$a" ;;
+                fg)     members="$members${b//,/ } " ;;
+                remote) [ -n "$why" ] || why="$a in the foreground" ;;
+            esac
+        done < <(pane_scan "$ppid" "$tty")
+        [ "$rkind" = other ] && [ -z "$noshell" ] && noshell="${rname:-its program} runs with no shell — can't freeze it"
+    done < <(tmux list-panes -t "$win" -F "#{pane_id}${SEP}#{pane_index}${SEP}#{pane_pid}${SEP}#{pane_tty}${SEP}#{pane_dead}" 2>/dev/null)
+    if [ "$n" -eq 0 ]; then CL_WHY="it's gone"; return 0; fi
+    # A registered claude counts only as the tab's own agent (its process is
+    # the foreground job's), for the same reason.
+    if [ -z "$agent" ]; then
+        g=$(window_agent "$win"); g="${g%%"$SEP"*}"
+        [ -n "$g" ] && case "$members" in *" $g "*) agent=claude ;; esac
+    fi
+
+    if [ -n "$agent" ]; then
+        if [ "$n" -gt 1 ]; then CL_WHY="split tab with an agent — can't park it yet"; return 0; fi
+        agent_guard "$win"
+        [ "$?" = 0 ] && { CL_WHY="$GUARD_WHY"; return 0; }
+        tab_busy "$win" && { CL_WHY="that agent is still working"; return 0; }
+        case "$agent" in
+            claude|abby) has_unsent_input "$CL_PANE" && { CL_WHY="unsent text in the agent's composer"; return 0; } ;;
+        esac
+        CL_KIND=pin; CL_AGENT="$agent"
+        return 0
+    fi
+    [ -n "$why" ] && { CL_WHY="$why"; return 0; }
+    [ -n "$noshell" ] && { CL_WHY="$noshell"; return 0; }
+    CL_KIND=park
+    return 0
+}
+
+# Close a one-pane agent tab into a pinned ⌘Z entry. 0 = closed and pinned;
+# 3 = refused, nothing killed (PIN_WHY: closed-tabs.sh's own reason); 1 =
+# something else went wrong (PIN_WHY).
+PIN_WHY=""
+pin_window() {
+    local pane="$1" err rc
+    PIN_WHY=""
+    [ -f "$CLOSED_TABS_SH" ] || { PIN_WHY="closed-tabs.sh is missing"; return 3; }
+    err=$(bash "$CLOSED_TABS_SH" close --pin "$pane" 2>&1 >/dev/null </dev/null)
+    rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        3) PIN_WHY=$(printf '%s\n' "$err" | sed -n 's/^closed-tabs: not stashed — //p' | tail -n 1)
+           PIN_WHY="${PIN_WHY:-closed-tabs.sh refused it}"
+           return 3 ;;
+        *) PIN_WHY="closed-tabs.sh close --pin failed ($rc)"; return 1 ;;
+    esac
+}
+
+# 0 when every process of <pgid> on <tty> is stopped (T, or a zombie), 2 when
+# there is none left, 1 when one still runs after FREEZE_TRIES ticks.
+pg_wait_stopped() {   # <tty> <pgid>
+    local i=0 r
+    while :; do
+        r=$(ps -t "${1#/dev/}" -o pgid=,stat= 2>/dev/null |
+            awk -v g="$2" '$1 == g { n++; if ($2 !~ /^[TZ]/) run++ } END { print (n == 0) ? 2 : (run ? 1 : 0) }')
+        [ "$r" = 1 ] || return "${r:-1}"
+        i=$((i + 1)); [ "$i" -ge "$FREEZE_TRIES" ] && return 1
+        sleep 0.05
+    done
+}
+
+# Every OTHER process group still running under the pane's shell — a
+# background job (`server &`), or a group the foreground job started of its
+# own (a dev server's workers that setpgid), which ⌃Z does not reach. Each is
+# SIGSTOPped and printed, comma-separated, for the thaw to SIGCONT.
+pg_stop_rest() {   # <pane pid> <tty> [<fg pgid>]
+    local g out=""
+    for g in $(ps -t "${2#/dev/}" -o pid=,ppid=,pgid=,stat= 2>/dev/null | awk -v root="$1" -v fg="${3:-}" '
+            $1 ~ /^[0-9]+$/ { pp[$1] = $2; pg[$1] = $3; st[$1] = $4; o[++n] = $1 }
+            END {
+                m[root] = 1
+                do { ch = 0
+                     for (i = 1; i <= n; i++) { p = o[i]; if (!(p in m) && (pp[p] in m)) { m[p] = 1; ch = 1 } }
+                } while (ch)
+                for (i = 1; i <= n; i++) { p = o[i]
+                    if ((p in m) && p != root && pg[p] != fg && pg[p] != pg[root] && st[p] !~ /^[TZ]/ && !(pg[p] in seen)) {
+                        seen[pg[p]] = 1; print pg[p] } }
+            }'); do
+        kill -STOP -- "-$g" 2>/dev/null && out="${out:+$out,}$g"
+    done
+    printf '%s' "$out"
+}
+
+# Is the terminal generating signals from keys (termios ISIG)? A raw-mode
+# program (vim — in every mode —, a TUI) turns it off and reads ⌃Z as a byte:
+# typed, it lands in the buffer. Unknown (stty could not read it) = no.
+isig_on() {   # <tty>
+    local s
+    s=$(stty -f "$1" -a 2>/dev/null) || return 1
+    s=" ${s//$'\n'/ } "
+    case "$s" in *" -isig "*) return 1 ;; *" isig "*) return 0 ;; esac
+    return 1
+}
+
+# The shell's own working directory: the one its job was typed in, and so the
+# one to re-run it from (the job's leader may have cd'd — `./dev.sh` going
+# into sub/). It cannot change while the job holds the terminal.
+shell_cwd() {   # <shell pid>
+    lsof -a -d cwd -p "$1" -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1
+}
+
+# @stash_frozen's value from "pane_index US pgid US cwd US pids US groups"
+# lines on stdin (pgid 0: nothing in the foreground, only stopped background
+# groups): a JSON array, one object per pane —
+#   {"pane": N, "pgid": N, "cwd": "...", "cmd": "...", "xpg": [N, ...]}
+# cmd is what a cold unpark types: the job's EXACT argv, read with
+# KERN_PROCARGS2 (ps flattens it: `a "b c"` and `a b c` print alike) and
+# quoted for the shell (\$'…' for control characters, so a tab cannot reach
+# the line editor as a completion key). Empty — "command unknown" — when it
+# cannot be trusted: a pipeline (the members' order is not knowable from the
+# process table), an unreadable argv, one a program rewrote (node's
+# process.title: ["npm run dev", "", ""]), a forked subshell. Only cmd is
+# stored, not argv beside it: tmux refuses a command over ~16 KB.
+# JSON keeps the value free of \x1f and newlines, so it rides in the sidecar.
+FROZEN_PY='
+import ctypes, ctypes.util, json, os, re, struct, sys
+libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+def sysctl(mib, size):
+    arr = (ctypes.c_int * len(mib))(*mib)
+    buf = ctypes.create_string_buffer(size)
+    n = ctypes.c_size_t(size)
+    if libc.sysctl(arr, len(mib), buf, ctypes.byref(n), None, ctypes.c_size_t(0)) != 0:
+        return None
+    return buf.raw[:n.value]
+try:
+    ARGMAX = struct.unpack("i", sysctl([1, 8], 4))[0]
+except Exception:
+    ARGMAX = 1 << 20
+def argv(pid):
+    try:
+        raw = sysctl([1, 49, int(pid)], ARGMAX)
+        if not raw or len(raw) < 4:
+            return None
+        argc = struct.unpack("i", raw[:4])[0]
+        i = raw.find(b"\0", 4)
+        if i < 0:
+            return None
+        while i < len(raw) and raw[i] == 0:
+            i += 1
+        out = []
+        for _ in range(argc):
+            j = raw.find(b"\0", i)
+            if j < 0:
+                return None
+            out.append(raw[i:j].decode("utf-8", "replace"))
+            i = j + 1
+        return out
+    except Exception:
+        return None
+SHELLS = set("zsh bash sh fish dash ksh tcsh csh nu".split())
+def trusted(a):
+    if not a or not a[0] or "�" in "".join(a):
+        return False
+    if len(a) == 1 and a[0].lstrip("-").rsplit("/", 1)[-1] in SHELLS:
+        return False
+    if any(c.isspace() for c in a[0]) and not os.path.exists(a[0]):
+        return False
+    # A title written over the argv area: libuv zeroes the rest (["grunt",
+    # "", ""]); perl pads it with spaces, and the parse then runs on into the
+    # environment (["grunt", "      ", "HOME=..."]).
+    if len(a) > 1 and not any(a[1:]):
+        return False
+    if any(w and not w.strip() for w in a[1:]):
+        return False
+    return True
+SAFE = re.compile(r"[A-Za-z0-9_@%+:,./-]+")
+def q(w):
+    if w and SAFE.fullmatch(w):
+        return w
+    if all(" " <= c != "\x7f" for c in w):
+        return "\x27" + w.replace("\x27", "\x27\\\x27\x27") + "\x27"
+    out = []
+    for c in w:
+        if c == "\\": out.append("\\\\")
+        elif c == "\x27": out.append("\\\x27")
+        elif ord(c) < 32 or ord(c) == 127: out.append("\\x%02x" % ord(c))
+        else: out.append(c)
+    return "$\x27" + "".join(out) + "\x27"
+res = []
+for line in sys.stdin.read().split("\n"):
+    f = line.split("\x1f")
+    if len(f) < 5 or not f[0].isdigit() or not f[1].isdigit():
+        continue
+    pids = [x for x in f[3].split(",") if x.isdigit()]
+    cmd = ""
+    if int(f[1]) and len(pids) == 1:
+        a = argv(pids[0])
+        if trusted(a):
+            cmd = " ".join(q(w) for w in a)
+    res.append({"pane": int(f[0]), "pgid": int(f[1]), "cwd": f[2], "cmd": cmd,
+                "xpg": [int(x) for x in f[4].split(",") if x.isdigit()]})
+print(json.dumps(res))
+'
+frozen_json() {
+    local in out
+    in=$(cat)
+    out=$(printf '%s\n' "$in" | python3 -I -c "$FROZEN_PY" 2>/dev/null)
+    [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+    # No command lines without python: the warm `fg` still works, a cold
+    # unpark cannot re-run anything and says so.
+    log "could not read the frozen jobs' argv (python3) — recorded without their commands"
+    printf '%s\n' "$in" | frozen_json_bare
+}
+# The record with no command lines: from frozen_json's input lines, or (with
+# --strip) from an existing record.
+frozen_json_bare() {
+    if [ "${1:-}" = --strip ]; then
+        jq -c 'map(.cmd = "" | del(.cwd))' 2>/dev/null
+    else
+        jq -Rnc '[inputs | split("\u001f") | select(length >= 5)
+                  | {pane: (.[0] | tonumber), pgid: (.[1] | tonumber), cwd: .[2], cmd: "",
+                     xpg: (.[4] | split(",") | map(select(. != "") | tonumber))}]' 2>/dev/null
+    fi
+}
+# Store a record. tmux refuses a command over ~16 KB ("command too long") —
+# a job with a huge argument list — and then it goes again without the
+# command lines, so the warm `fg` still finds its job and a cold unpark says
+# "command unknown". 1 only when even that cannot be stored.
+store_frozen() {   # <win> <json>
+    local win="$1" json="$2" bare
+    tmux set-option -w -t "$win" @stash_frozen "$json" 2>/dev/null && return 0
+    bare=$(printf '%s' "$json" | frozen_json_bare --strip)
+    if [ -n "$bare" ] && tmux set-option -w -t "$win" @stash_frozen "$bare" 2>/dev/null; then
+        log "frozen jobs of $win recorded without their commands (too long for tmux)"
+        return 0
+    fi
+    log "could not record the frozen jobs of $win"
+    return 1
+}
+
+# Keys typed into a window must reach one pane: synchronize-panes would send
+# them to every pane. sync_off <win> remembers the window's own value in
+# SYNC_WAS ("-" = not set locally) and turns it off; sync_restore puts it back.
+SYNC_WAS="-"
+sync_off() {
+    SYNC_WAS="-"
+    [ "$(tmux display-message -p -t "$1" '#{synchronize-panes}' 2>/dev/null)" = 1 ] || return 0
+    SYNC_WAS=$(tmux show -wqv -t "$1" synchronize-panes 2>/dev/null)
+    SYNC_WAS="${SYNC_WAS:-unset}"
+    tmux set-option -w -t "$1" synchronize-panes off 2>/dev/null
+}
+sync_restore() {
+    case "$SYNC_WAS" in
+        -) ;;
+        unset) tmux set-option -uw -t "$1" synchronize-panes 2>/dev/null ;;
+        *) tmux set-option -w -t "$1" synchronize-panes "$SYNC_WAS" 2>/dev/null ;;
+    esac
+    SYNC_WAS="-"
+}
+
+# Freeze everything that runs under each pane's shell in <window>:
+#   - the foreground job: ⌃Z typed into the pane when the terminal turns keys
+#     into signals (ISIG) — the job's own handler runs, a TUI puts the
+#     terminal back, the shell files it as a stopped job, so `fg` brings it
+#     back; SIGSTOP on its group when the terminal is raw (the ⌃Z would be a
+#     byte in vim's buffer) or when something in the group still runs after
+#     FREEZE_TRIES ticks. SIGSTOP cannot be caught, and the shell still sees
+#     a stopped job (zsh keeps the job's terminal modes for its `fg`);
+#   - every other group still running under the shell (pg_stop_rest) —
+#     FIRST: a shell makes the job stopped last its current job (%+), and the
+#     thaw's `fg` must resume the foreground one, not a background job
+#     SIGSTOPped after it.
+# Recorded in @stash_frozen (frozen_json). 1 = something could not be stopped
+# or recorded (FREEZE_WHY); what WAS frozen is still recorded, so the
+# caller's thaw puts it back. A pane whose job will not stop is continued
+# again, groups and all, before giving up.
+FREEZE_WHY=""
+freeze_window() {
+    local win="$1" pane idx ppid tty dead k a b c fgpg mem job rc lines="" xpg scwd g
+    FREEZE_WHY=""
+    # A record left by an earlier park (a thaw that kept a busy pane's entry,
+    # a cold mark) describes jobs that are not this park's: re-used, it would
+    # re-run a command whose job is still stopped, or show an idle tab as
+    # frozen. This park's record is written from scratch.
+    tmux set-option -uw -t "$win" @stash_frozen 2>/dev/null
+    tmux set-option -uw -t "$win" @stash_cold 2>/dev/null
+    sync_off "$win"
+    while IFS="$SEP" read -r pane idx ppid tty dead; do
+        [ -n "$pane" ] && [ "$dead" != 1 ] && [ -n "$tty" ] || continue
+        case "$ppid" in ''|*[!0-9]*) continue ;; esac
+        fgpg=""; mem=""; job=""
+        while IFS=$'\t' read -r k a b c; do
+            [ "$k" = fg ] && { fgpg="$a"; mem="$b"; job="$c"; }
+        done < <(pane_scan "$ppid" "$tty")
+        xpg=$(pg_stop_rest "$ppid" "$tty" "$fgpg")
+        if [ -n "$fgpg" ]; then
+            rc=1
+            if isig_on "$tty"; then
+                # A pane in copy-mode (or any mode) would take the ⌃Z itself.
+                tmux copy-mode -q -t "$pane" 2>/dev/null
+                tmux send-keys -t "$pane" C-z 2>/dev/null
+                pg_wait_stopped "$tty" "$fgpg"; rc=$?
+                [ "$rc" = 1 ] && log "⌃Z did not stop $job (pgid $fgpg) in $win.$idx — SIGSTOP"
+            else
+                log "$job (pgid $fgpg) in $win.$idx has a raw terminal — SIGSTOP, not ⌃Z"
+            fi
+            if [ "$rc" = 1 ]; then
+                kill -STOP -- "-$fgpg" 2>/dev/null
+                pg_wait_stopped "$tty" "$fgpg"; rc=$?
+            fi
+            [ "$rc" = 2 ] && fgpg=""                  # it exited meanwhile
+            if [ "$rc" = 1 ]; then
+                # Not frozen, not recorded: leave nothing of this pane stopped.
+                kill -CONT -- "-$fgpg" 2>/dev/null
+                for g in ${xpg//,/ }; do kill -CONT -- "-$g" 2>/dev/null; done
+                FREEZE_WHY="couldn't stop what runs in pane $idx"
+                break
+            fi
+        fi
+        [ -n "$fgpg$xpg" ] || continue
+        scwd=$(shell_cwd "$ppid")
+        [ -n "$scwd" ] || scwd=$(tmux display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
+        lines="${lines}${idx}${SEP}${fgpg:-0}${SEP}${scwd}${SEP}${mem}${SEP}${xpg}"$'\n'
+    done < <(tmux list-panes -t "$win" -F "#{pane_id}${SEP}#{pane_index}${SEP}#{pane_pid}${SEP}#{pane_tty}${SEP}#{pane_dead}" 2>/dev/null)
+    sync_restore "$win"
+    if [ -n "$lines" ]; then
+        local json; json=$(frozen_json <<< "$lines")
+        if [ -z "$json" ] || ! store_frozen "$win" "$json"; then
+            [ -n "$FREEZE_WHY" ] || FREEZE_WHY="couldn't record its stopped jobs"
+        fi
+    fi
+    [ -z "$FREEZE_WHY" ]
+}
+
+# stopped | running | gone: the processes of <pgid> on <tty>.
+pg_state() {   # <tty> <pgid>
+    ps -t "${1#/dev/}" -o pgid=,stat= 2>/dev/null |
+        awk -v g="$2" '$1 == g { n++; if ($2 !~ /^[TZ]/) run++ }
+                       END { print (n == 0) ? "gone" : (run ? "running" : "stopped") }'
+}
+# The shell owns its terminal again: at a prompt, not running a job.
+shell_at_prompt() {   # <pane pid>
+    [ "$(ps -o tpgid= -p "$1" 2>/dev/null | tr -d ' ')" = "$1" ]
+}
+
+# Type <text> + Enter into <pane> of <win>, but only if the window is still
+# home: under the park lock, so a re-park cannot take it between the test
+# and the keys. 1 = not typed (lock busy, or parked again).
+type_home() {   # <win> <pane> <text>
+    # Already ours (a park's failed freeze thaws what it froze, under its
+    # lock): no second acquire, which would wait on itself.
+    local mine=""
+    [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$$" ] && mine=1
+    [ -n "$mine" ] || lock_acquire || return 1
+    if [ "$(tmux display-message -p -t "$1" '#{session_name}' 2>/dev/null)" = "$HOLD" ]; then
+        [ -n "$mine" ] || lock_release
+        return 1
+    fi
+    tmux copy-mode -q -t "$2" 2>/dev/null
+    # ⌃C first, only while the shell itself holds the terminal (so the
+    # SIGINT reaches nothing but the shell): a half-typed continuation (an
+    # open quote, a trailing \) is abandoned for a fresh prompt, where the
+    # line would otherwise have joined it. The shell is given a moment to
+    # redraw before the line arrives.
+    local ppid; ppid=$(tmux display-message -p -t "$2" '#{pane_pid}' 2>/dev/null)
+    if [ -n "$ppid" ] && shell_at_prompt "$ppid"; then
+        tmux send-keys -t "$2" C-c 2>/dev/null
+        sleep 0.15
+    fi
+    tmux send-keys -t "$2" C-u 2>/dev/null
+    tmux send-keys -t "$2" -l "$3" 2>/dev/null
+    tmux send-keys -t "$2" Enter 2>/dev/null
+    [ -n "$mine" ] || lock_release
+    return 0
+}
+
+# Bring a window's frozen jobs back; unstash hands off to this (`thaw`), in
+# the background, once the window is home. Per frozen pane:
+#   cold — the processes died with the tmux server (@stash_cold, set by
+#          restore-state; or the server is younger than the park). Checked
+#          FIRST: after a reboot a recorded pgid can name something else. The
+#          recorded command is re-run in the shell's directory, and the
+#          client is told; with none, "couldn't re-run: command unknown";
+#   warm — the job is there, stopped: `fg` is typed at the shell's prompt
+#          (only when the shell holds the terminal, i.e. is at one), the
+#          other stopped groups get SIGCONT, and a SIGWINCH a moment later
+#          makes a TUI repaint what a ⌃Z or SIGSTOP left behind;
+#   gone — it ended while parked on a live server: nothing is re-run.
+# A pane that is busy, or whose job did not resume, keeps its entry (and its
+# other groups stay stopped): @stash_frozen goes only once every entry is
+# settled, and @stash_cold with it.
+do_thaw() {
+    local win="${1:-}" client="${2:-}" json cold ts start
+    [ -n "$win" ] || return 0
+    json=$(tmux show -wqv -t "$win" @stash_frozen 2>/dev/null)
+    [ -n "$json" ] || return 0
+    # Parked again since the unpark that handed this off: not ours to thaw.
+    [ "$(tmux display-message -p -t "$win" '#{session_name}' 2>/dev/null)" = "$HOLD" ] && return 0
+    cold=$(tmux show -wqv -t "$win" @stash_cold 2>/dev/null)
+    if [ -z "$cold" ]; then
+        ts=$(tmux show -wqv -t "$win" @stash_ts 2>/dev/null)
+        start=$(tmux display-message -p -t "$win" '#{start_time}' 2>/dev/null)
+        # Both numeric, each on its own: a move-back after a failed freeze
+        # has unset @stash_ts, and "" is no number to compare.
+        case "$ts" in ''|*[!0-9]*) ;; *)
+            case "$start" in ''|*[!0-9]*) ;; *) [ "$start" -gt "$ts" ] && cold=1 ;; esac ;;
+        esac
+    fi
+    local pidx pg cwd cmd xpg obj pane ppid tty state g i keep=() said=() kind=info
+    sync_off "$win"
+    while IFS="$SEP" read -r pidx pg cwd cmd xpg obj; do
+        [ -n "$pidx" ] || continue
+        pane=""; ppid=""; tty=""
+        IFS="$SEP" read -r pane ppid tty < <(tmux list-panes -t "$win" \
+            -F "#{pane_index}${SEP}#{pane_id}${SEP}#{pane_pid}${SEP}#{pane_tty}" 2>/dev/null |
+            awk -F"$SEP" -v OFS="$SEP" -v i="$pidx" '$1 == i { print $2, $3, $4; exit }')
+        [ -n "$pane" ] || { log "thaw $win: pane $pidx is gone"; continue; }
+        if [ -n "$cold" ]; then
+            [ "$pg" = 0 ] && continue                 # background groups only: not re-run
+            if [ -z "$cmd" ]; then
+                said+=("couldn't re-run: command unknown (pane $pidx)"); kind=warn
+            elif ! shell_at_prompt "$ppid"; then
+                said+=("pane $pidx is busy — not restarted yet: $cmd"); kind=warn
+                keep+=("$obj")
+            else
+                local line; printf -v line 'cd %q && %s' "${cwd:-$HOME}" "$cmd"
+                if type_home "$win" "$pane" "$line"; then
+                    said+=("restarted after a tmux restart: $cmd")
+                    log "thaw $win.$pidx: cold — re-ran $line"
+                else
+                    said+=("pane $pidx: busy — not restarted yet: $cmd"); kind=warn
+                    keep+=("$obj")
+                fi
+            fi
+            continue
+        fi
+        state=gone
+        [ "$pg" = 0 ] || state=$(pg_state "$tty" "$pg")
+        case "$state" in
+            stopped)
+                if ! shell_at_prompt "$ppid"; then
+                    said+=("pane $pidx is busy — type fg there to resume it"); kind=warn
+                    keep+=("$obj"); continue
+                fi
+                if ! type_home "$win" "$pane" fg; then
+                    said+=("pane $pidx: busy — type fg there"); kind=warn
+                    keep+=("$obj"); continue
+                fi
+                i=0
+                while [ "$i" -lt 40 ] && [ "$(pg_state "$tty" "$pg")" = stopped ]; do sleep 0.05; i=$((i + 1)); done
+                if [ "$(pg_state "$tty" "$pg")" = stopped ]; then
+                    log "thaw $win.$pidx: fg typed but pgid $pg is still stopped — kept its record"
+                    said+=("pane $pidx did not resume — type fg there"); kind=warn
+                    keep+=("$obj"); continue
+                fi ;;
+            gone)
+                if [ "$pg" != 0 ]; then
+                    log "thaw $win.$pidx: pgid $pg ended while parked — not re-run"
+                    said+=("${cmd:-its job} ended while parked — not restarted"); kind=warn
+                fi ;;
+        esac
+        for g in ${xpg//,/ }; do kill -CONT -- "-$g" 2>/dev/null; done
+        [ "$state" = gone ] || ( sleep 0.3; kill -WINCH -- "-$pg" ) </dev/null >/dev/null 2>&1 &
+    done < <(jq -r '.[] | [(.pane | tostring), (.pgid | tostring), (.cwd // ""), (.cmd // ""),
+                         ((.xpg // []) | map(tostring) | join(",")), tojson] | join("\u001f")' <<< "$json" 2>/dev/null)
+    sync_restore "$win"
+    if [ "${#keep[@]}" -eq 0 ]; then
+        tmux set-option -uw -t "$win" @stash_frozen 2>/dev/null
+        tmux set-option -uw -t "$win" @stash_cold 2>/dev/null
+    else
+        local rest="[" o
+        for o in "${keep[@]}"; do rest="${rest}${o},"; done
+        tmux set-option -w -t "$win" @stash_frozen "${rest%,}]" 2>/dev/null
+    fi
+    if [ "${#said[@]}" -gt 0 ]; then
+        local text="${said[0]}" s
+        for s in "${said[@]:1}"; do text="$text · $s"; done
+        notify_user ${client:+-c "$client"} -k "$kind" -- "stash: $text"
+    fi
+    return 0
+}
+
+# The stash for the merged picker (closed-tabs.sh), one per line,
+# \x1f-separated: window id, origin, label, park time, state, cwd. State is
+# frozen | cold | idle for a parked window — `suspended` for one parked
+# before 2026-11-11 whose agent was suspended (@stash_session) — and
+# `pending` for a window that is
+# home already but whose suspended agent was never resumed (a resume refused
+# because the pane was busy; @stash_session still on it): `unstash` on it
+# runs the resume. Its "origin" is the session it sits in.
+do_rows() {
+    if hold_exists; then
+        tmux list-windows -t "=$HOLD" -F "#{window_id}${SEP}#{@stash_origin}${SEP}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}${SEP}#{@stash_ts}${SEP}#{?#{@stash_session},suspended,#{?#{@stash_cold},cold,#{?#{@stash_frozen},frozen,idle}}}${SEP}#{?#{@stash_cwd},#{@stash_cwd},#{pane_current_path}}" 2>/dev/null
+    fi
+    local p
+    for p in $(pending_windows); do
+        tmux display-message -p -t "$p" "#{window_id}${SEP}#{session_name}${SEP}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}${SEP}#{@stash_ts}${SEP}pending${SEP}#{?#{@stash_cwd},#{@stash_cwd},#{pane_current_path}}" 2>/dev/null
+    done
+    return 0
 }
 
 # Park one or more windows as a single transaction: one lock, one renumber, one
@@ -2178,10 +2920,29 @@ agent_running() {
 # through a group the user selected as one unit.
 do_stash_many() {
     local w s sess="" wins=() total busy=0 homes=0 seen="" note=""
+    # Per accepted window, beside `wins`: what classify_window decided, and
+    # its pane for a pin. Refusals with a reason go to `kept_why`.
+    local kinds=() cpanes=() cagents=() kept_why=() pre="" line
+
+    # The slow part of the classification FIRST, outside the lock: the deep
+    # guards (session files, the transcript, the workflow and subagent walks,
+    # the cua fork) and a ps per pane. Under the lock only the cheap re-checks
+    # (pin_recheck) and the moves run, so a range park holds the lock for
+    # moves and freezes, not for guards. One line per window:
+    # "win SEP kind SEP pane SEP agent SEP why".
+    for w in "$@"; do
+        [ -n "$w" ] || continue
+        case "$pre" in *"$w$SEP"*) continue ;; esac
+        s=$(tmux display-message -p -t "$w" '#{session_name}' 2>/dev/null) || continue
+        [ -n "$s" ] && [ "$s" != "$HOLD" ] || continue
+        [ "$(tmux show -wqv -t "$w" @space_home 2>/dev/null)" = "1" ] && continue
+        classify_window "$w"
+        pre="${pre}${w}${SEP}${CL_KIND}${SEP}${CL_PANE}${SEP}${CL_AGENT}${SEP}${CL_WHY}"$'\n'
+    done
 
     # Everything from here to the moves reads tmux state and then acts on it, so
-    # it runs under the lock. Released before the suspends, which are slow and
-    # touch only windows that are already parked.
+    # it runs under the lock — moves, freezes and pins, each window refreshing
+    # the lock's age (lock_touch) so a long range never reads as stale.
     lock_acquire || { msg -k warn "busy — try again"; return 0; }   # 0: see the note on the refusal below
 
     # Resolve membership UNDER the lock. These ids come from a keypress that may
@@ -2217,12 +2978,38 @@ do_stash_many() {
             log "refused to hide $w — $AGENT_RUNNING_WHY"
             busy=$((busy + 1)); continue
         fi
-        wins+=("$w")
+        # Everything else that would leave something running in the stash,
+        # or lose work, was settled above — before anything moves (the old
+        # "parked, but left running" came from guards that ran after it).
+        line=$(printf '%s' "$pre" | awk -F"$SEP" -v w="$w" '$1 == w { print; exit }')
+        if [ -n "$line" ]; then
+            IFS="$SEP" read -r _ CL_KIND CL_PANE CL_AGENT CL_WHY <<< "$line"
+        else
+            classify_window "$w"
+        fi
+        if [ "$CL_KIND" = refuse ]; then
+            if [ "$CL_WHY" = "that agent is still working" ]; then
+                busy=$((busy + 1))
+            else
+                kept_why+=("$CL_WHY")
+            fi
+            log "refused to hide $w — $CL_WHY"
+            continue
+        fi
+        wins+=("$w"); kinds+=("$CL_KIND"); cpanes+=("$CL_PANE"); cagents+=("$CL_AGENT")
     done
 
     if [ "${#wins[@]}" -eq 0 ]; then
         lock_release
-        if [ "$busy" -eq 1 ]; then
+        local nk="${#kept_why[@]}"
+        if [ "$nk" -gt 0 ] && [ "$busy" -eq 0 ] && [ "$homes" -eq 0 ]; then
+            msg -k warn "$(why_list "${kept_why[@]}") — not parking $([ "$nk" -eq 1 ] && echo it || echo them)"
+        elif [ "$nk" -gt 0 ]; then
+            local parts; parts=$(why_list "${kept_why[@]}")
+            [ "$busy" -gt 0 ]  && parts="$parts; $busy still working"
+            [ "$homes" -gt 0 ] && parts="$parts; the home tab stays"
+            msg -k warn "nothing hidden — $parts"
+        elif [ "$busy" -eq 1 ]; then
             msg -k warn "that agent is still working — not hiding it"
         elif [ "$busy" -gt 1 ]; then
             msg -k warn "all $busy of those agents are still working — not hiding them"
@@ -2258,15 +3045,17 @@ do_stash_many() {
         return 0
     fi
 
-    ensure_hold
-    local parked=() failed=0 left
-    for w in "${wins[@]}"; do
+    local parked=() pinned=0 failed=0 left i kind rc hold_made=""
+    BOOT_WIN=""
+    for i in "${!wins[@]}"; do
+        w="${wins[$i]}"; kind="${kinds[$i]}"
         # Re-check per move, not just once up front. The count above cannot be
         # fooled by duplicates or foreign ids, but nothing stops a window
         # CLOSING on its own between the count and the last move — a shell
         # exiting is not a stash.sh actor and the lock cannot hold it back. With
         # a range that is "N of N+1", so one exit is enough to leave the session
-        # empty, and destroying it drops the attached client to a shell.
+        # empty, and destroying it drops the attached client to a shell. A pin
+        # closes the window, so it counts the same as a move.
         left=$(tmux list-windows -t "=$sess" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ')
         case "$left" in ''|*[!0-9]*) left=0 ;; esac
         if [ "$left" -le 1 ]; then
@@ -2276,7 +3065,61 @@ do_stash_many() {
             note="stopped — the rest is all that's left in this session"
             break
         fi
-        if park_one "$w" "$sess"; then parked+=("$w"); else failed=$((failed + 1)); fi
+
+        lock_touch
+
+        # A one-pane agent tab: not parked, closed into a pinned ⌘Z entry
+        # that resumes it. The cheap guards are read once more right before
+        # (pin_recheck): the classify ran before the lock, and a draft dies
+        # with the close.
+        if [ "$kind" = pin ]; then
+            if pin_recheck "$w" "${cpanes[$i]}" "${cagents[$i]}"; then
+                if [ "$RECHECK_WHY" = "that agent is still working" ]; then busy=$((busy + 1)); else kept_why+=("$RECHECK_WHY"); fi
+                log "refused to hide $w — $RECHECK_WHY (re-check)"
+                continue
+            fi
+            pin_window "${cpanes[$i]}"; rc=$?
+            if [ "$rc" = 0 ]; then
+                pinned=$((pinned + 1)); log "stashed $w as a pinned ⌘Z entry"
+            elif [ -z "$(tmux display-message -p -t "${cpanes[$i]}" '#{pane_id}' 2>/dev/null)" ]; then
+                # Gone even so (a close that failed late).
+                failed=$((failed + 1)); log "close --pin of $w failed ($PIN_WHY) and the tab is gone"
+            else
+                if [ "$rc" = 3 ]; then kept_why+=("$PIN_WHY"); else failed=$((failed + 1)); fi
+                log "refused to hide $w — $PIN_WHY"
+            fi
+            continue
+        fi
+
+        # Where it was, for a move back that puts it in its own slot.
+        local o_idx o_act
+        IFS="$SEP" read -r o_idx o_act < <(tmux display-message -p -t "$w" "#{window_index}${SEP}#{window_active}" 2>/dev/null)
+        if [ -z "$hold_made" ]; then ensure_hold; hold_made=1; fi
+        if ! park_one "$w" "$sess"; then failed=$((failed + 1)); continue; fi
+        if freeze_window "$w"; then
+            parked+=("$w")
+            continue
+        fi
+        # Never leave it running in the stash: back in its own slot, the part
+        # that did freeze thawed, and the reason in the report. A move out of
+        # a session leaves its index free (renumber runs only at the end), so
+        # the slot is normally there; taken, it goes in before whoever holds it
+        # (closed-tabs.sh's reopen does the same).
+        log "could not freeze $w — $FREEZE_WHY; moved it back to $sess"
+        if tmux move-window -d -s "$w" -t "=$sess:$o_idx" 2>/dev/null \
+           || tmux move-window -d -b -s "$w" -t "=$sess:$o_idx" 2>/dev/null \
+           || tmux move-window -d -s "$w" -t "=$sess:" 2>/dev/null; then
+            [ "$o_act" = 1 ] && tmux select-window -t "$w" 2>/dev/null
+            tmux set-option -uw -t "$w" @stash_origin 2>/dev/null
+            tmux set-option -uw -t "$w" @stash_label 2>/dev/null
+            tmux set-option -uw -t "$w" @stash_ts 2>/dev/null
+            do_thaw "$w"
+            kept_why+=("$FREEZE_WHY")
+        else
+            failed=$((failed + 1))
+            log "could not move $w back to $sess — it is parked, partly running"
+            parked+=("$w")
+        fi
     done
 
     if [ "${#parked[@]}" -eq 0 ]; then
@@ -2285,12 +3128,18 @@ do_stash_many() {
         # session whose only window is a stray shell that `count` reports as
         # parked and the next prefix+h would hand you.
         [ -n "$BOOT_WIN" ] && tmux kill-window -t "$BOOT_WIN" 2>/dev/null
+        [ "$pinned" -gt 0 ] && renumber "$sess"
         lock_release
+        [ "$pinned" -gt 0 ] && publish_count
         # Say WHY nothing was parked. "could not park it" on a batch where two
         # tabs were deliberately left working and the third refused to move is
         # both incomplete and, in the stopped case, simply wrong.
-        if [ -n "$note" ]; then
+        if [ "$pinned" -gt 0 ]; then
+            stash_report "$pinned" 0 "$busy" "$homes" "$failed" "$note" ${kept_why[@]+"${kept_why[@]}"}
+        elif [ -n "$note" ]; then
             msg -k warn "nothing hidden: $note"
+        elif [ "${#kept_why[@]}" -gt 0 ] && [ "$failed" -eq 0 ]; then
+            msg -k warn "$(why_list "${kept_why[@]}") — not parking $([ "${#kept_why[@]}" -eq 1 ] && echo it || echo them)"
         elif [ "$busy" -gt 0 ]; then
             msg -k error "could not park it — and left $busy still working"
         else
@@ -2308,37 +3157,44 @@ do_stash_many() {
     renumber "$sess" "$HOLD"
     publish
     lock_release
-    # Never a silent partial: if part of a range stayed behind, say which and
-    # why, or the tab bar just looks like the gesture misfired. ONE message —
-    # see the note on `note` above.
-    if [ "$busy" -gt 0 ] || [ "$homes" -gt 0 ] || [ "$failed" -gt 0 ] || [ -n "$note" ]; then
-        local report="hid ${#parked[@]}"
-        [ "$busy" -gt 0 ]   && report="$report — left $busy still working"
-        [ "$homes" -gt 0 ]  && report="$report — the home tab stays"
-        [ "$failed" -gt 0 ] && report="$report — could not park $failed"
-        [ -n "$note" ]      && report="$report — $note"
-        if [ "$failed" -gt 0 ]; then msg -k error "$report"; else msg -k warn "$report"; fi
-    fi
+    stash_report "$pinned" "${#parked[@]}" "$busy" "$homes" "$failed" "$note" ${kept_why[@]+"${kept_why[@]}"}
 
-    # Detached, and started BEFORE the suspends: describe reads the agent's
-    # session id from its live session file, which the suspend is about to
-    # remove (it falls back to @stash_session, set just before the kill).
+    # Detached: a one-line account of each parked window for the picker.
     for w in "${parked[@]}"; do
         ( "$SELF" describe "$w" </dev/null >/dev/null 2>&1 & )
     done
+    # No suspend_agent any more: an agent tab is pinned, never parked, and
+    # everything parked is frozen. (suspend_agent / resume_agent stay for the
+    # windows suspended before 2026-11-11 until they are migrated.)
+}
 
-    # After the moves, so the tabs disappear immediately and the (slower)
-    # graceful shutdowns happen out of sight. Serial on purpose: each suspend
-    # mirrors the sidecar, and concurrent writers would race a write-then-rename
-    # — the loser's session id simply would not be on disk.
-    for w in "${parked[@]}"; do suspend_agent "$w"; done
+# The reasons tabs were kept, de-duplicated, joined for one message.
+why_list() {
+    local out="" w
+    for w in "$@"; do
+        case "; $out; " in *"; $w; "*) continue ;; esac
+        out="${out:+$out; }$w"
+    done
+    printf '%s' "$out"
+}
 
-    # AGAIN, and this one is not redundant: the publish above ran before the
-    # agents were suspended, so the sidecar it wrote has an empty @stash_session.
-    # Leaving it at that meant a tmux restart came back with a suspended window
-    # and no pointer to its conversation — the single worst outcome this whole
-    # mechanism exists to prevent. Re-mirror once the suspends have had their say.
-    save_state
+# The one message after a park that did something. Silent when it all went
+# (a clean park says nothing, as before); otherwise what happened to each part.
+stash_report() {   # <pinned> <parked> <busy> <homes> <failed> <note> [<why>...]
+    local pinned="$1" n_parked="$2" busy="$3" homes="$4" failed="$5" note="$6"; shift 6
+    [ "$busy" -gt 0 ] || [ "$homes" -gt 0 ] || [ "$failed" -gt 0 ] || [ -n "$note" ] || [ "$#" -gt 0 ] || return 0
+    local report="" s
+    [ "$n_parked" -gt 0 ] && report="hid $n_parked"
+    if [ "$pinned" -gt 0 ]; then
+        s=s; [ "$pinned" -eq 1 ] && s=""
+        report="${report:+$report, }stashed $pinned agent$s"
+    fi
+    [ "$#" -gt 0 ]      && report="$report — kept $#: $(why_list "$@")"
+    [ "$busy" -gt 0 ]   && report="$report — left $busy still working"
+    [ "$homes" -gt 0 ]  && report="$report — the home tab stays"
+    [ "$failed" -gt 0 ] && report="$report — could not park $failed"
+    [ -n "$note" ]      && report="$report — $note"
+    if [ "$failed" -gt 0 ]; then msg -k error "$report"; else msg -k warn "$report"; fi
 }
 
 # The single-window entry point. Resolves its target through sel_win for the
@@ -2638,8 +3494,7 @@ do_sel_commit() {
 # 2026-10-25). Capital Y, and nothing navigable, is the one rule.
 # The binding re-arms the `stash` table before calling this, so a "no" leaves
 # the selection exactly as it was, keys and all. Y hands sel-kill-go the ids
-# the question described, in the background.
-CLOSED_TABS_SH="${CLOSED_TABS_SH:-$HOME/.config/tmux/scripts/closed-tabs.sh}"
+# the question described, in the background. (CLOSED_TABS_SH: at the top.)
 
 # What x would do to the selection in session $1, as globals: KILL_IDS (the
 # non-home selected windows, sel_order), KILL_N, KILL_AGENTS, KILL_RUN
@@ -3111,6 +3966,16 @@ pending_windows() {
 
 do_unstash() {
     local win="${1:-}" client="${2:-}"
+    # No window named: the merged picker, scoped to what is stashed (pinned
+    # ⌘Z entries and the parked windows; `closed-tabs.sh pick-popup
+    # --stashed`). It raises its own popup on the client's terminal. Without
+    # closed-tabs.sh, the old picker below.
+    if [ -z "$win" ] && [ -f "$CLOSED_TABS_SH" ]; then
+        local c_sess c_tty
+        IFS="$SEP" read -r c_sess c_tty < <(tmux display-message -p ${client:+-c "$client"} "#{session_id}${SEP}#{client_tty}" 2>/dev/null)
+        bash "$CLOSED_TABS_SH" pick-popup --stashed "${c_sess:-}" "${c_tty:-$client}" </dev/null
+        return 0
+    fi
     if [ -z "$win" ] && ! hold_exists; then
         # Nothing parked, but a pending resume may still be waiting.
         local p; p=$(pending_windows | head -1)
@@ -3126,7 +3991,7 @@ do_unstash() {
     if [ -z "$win" ]; then
         # The picker lists pending resumes too (do_pick), so they stay
         # reachable while anything else is parked.
-        if [ "$(count)" -ge 1 ]; then
+        if [ "$(count_windows)" -ge 1 ]; then
             # Even for a single parked window: the popup's preview shows what is
             # about to come back, and ⌃x kill is only reachable from here.
             # fzf needs a terminal, so the choosing happens inside a popup that
@@ -3307,6 +4172,12 @@ do_unstash_many() {
     for win in "${restored[@]}"; do
         tmux run-shell -b "'$SELF' resume '$win'"
     done
+    # Frozen jobs come back the same way, backgrounded (do_thaw waits up to
+    # 2s per pane for the job to run again): `fg`, or a re-run after a restart.
+    for win in "${restored[@]}"; do
+        [ -n "$(tmux show -wqv -t "$win" @stash_frozen 2>/dev/null)" ] || continue
+        tmux run-shell -b "'$SELF' thaw '$win' '$client'"
+    done
     # Pending resumes picked alongside: resumed in place, and the client stays
     # on the first window that MOVED (that is what came back on screen).
     for win in ${pend[@]+"${pend[@]}"}; do
@@ -3352,6 +4223,35 @@ resume_pending() {
 #    catches the window still alive would re-mirror them. If the kill then
 #    FAILS, the options and mirror are restored — until then the log line
 #    already holds the pointer, so no window exists where it is nowhere.
+#
+# Discarding is not destroying any more (2026-11-11): each window is closed
+# through `closed-tabs.sh close`, pane by pane, so it lands in the ⌘Z backlog
+# like any closed tab (undoable for a month). It is moved back to its origin
+# first (`-d`: the session's current tab does not change), so the entry
+# remembers the session it belongs to rather than the hidden holding one, and
+# a reopen does not land in `stash`. Without closed-tabs.sh, or if it leaves
+# the window standing, a plain kill-window as before.
+close_parked_window() {   # <win>
+    local win="$1" origin p
+    if [ -f "$CLOSED_TABS_SH" ]; then
+        origin=$(tmux show -wqv -t "$win" @stash_origin 2>/dev/null)
+        if [ -n "$origin" ] && [ "$origin" != "$HOLD" ] && ! is_hidden_session "$origin" \
+           && tmux has-session -t "=$origin" 2>/dev/null; then
+            tmux move-window -d -s "$win" -t "=$origin:" 2>/dev/null \
+                || log "could not move $win to $origin before closing it — its ⌘Z entry says $HOLD"
+        fi
+        # A frozen job dies with its shell's SIGHUP (the shell continues and
+        # hangs up its stopped jobs); nothing to thaw first.
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            bash "$CLOSED_TABS_SH" close "$p" </dev/null >/dev/null 2>&1
+        done < <(tmux list-panes -t "$win" -F '#{pane_id}' 2>/dev/null)
+        [ -z "$(tmux display-message -p -t "$win" '#{window_id}' 2>/dev/null)" ] && return 0
+        log "closed-tabs.sh left $win standing — killing it"
+    fi
+    tmux kill-window -t "$win" 2>/dev/null
+}
+
 do_kill_many() {
     local w win sid cwd lbl pidx apid i killed=0 nsids=0
     hold_exists || { msg -k warn "nothing is parked"; return 0; }
@@ -3382,15 +4282,30 @@ do_kill_many() {
             nsids=$((nsids + 1))
         fi
 
+        # A still-live agent (a window parked "left running" before
+        # 2026-11-11). With closed-tabs.sh the close does the SIGTERM itself,
+        # AFTER copying the agent's state, so its ⌘Z entry resumes the
+        # conversation; a SIGTERM here first would leave it no session id.
+        # A window with a suspended session (@stash_session: dead agent, id on
+        # the window) keeps the old path end to end — the id to the log, a
+        # plain kill-window — until its migration.
         apid=$(agent_pid_in_window "$win")
-        if [ -n "$apid" ]; then
+        local via_closed=""
+        [ -z "$sid" ] && [ -f "$CLOSED_TABS_SH" ] && via_closed=1
+        if [ -n "$apid" ] && [ -z "$via_closed" ]; then
             log "killing parked window $win ($lbl) — its agent (pid $apid) is still live; SIGTERM first"
             kill -TERM "$apid" 2>/dev/null
             i=0
             while [ "$i" -lt 12 ] && kill -0 "$apid" 2>/dev/null; do sleep 0.25; i=$((i + 1)); done
+        elif [ -n "$apid" ]; then
+            log "closing parked window $win ($lbl) through closed-tabs.sh — its live agent (pid $apid) goes to the ⌘Z backlog with its session"
         fi
 
-        if tmux kill-window -t "$win" 2>/dev/null; then
+        local gone=1
+        if [ -n "$via_closed" ]; then close_parked_window "$win" || gone=""
+        else tmux kill-window -t "$win" 2>/dev/null || gone=""
+        fi
+        if [ -n "$gone" ]; then
             killed=$((killed + 1))
             # After the kill, not beside forget_sids: a failed kill restores
             # the record, and its snapshot should still be there to back it.
@@ -3416,7 +4331,7 @@ do_kill_many() {
         if [ "$nsids" -gt 0 ]; then
             msg -k ok "killed $killed — $nsids suspended session(s) discarded, resume commands in $(basename "$LOGFILE")"
         else
-            msg -k ok "killed $killed"
+            msg -k ok "closed $killed · ⌘Z reopens"
         fi
     else
         msg -k error "could not kill it"
@@ -3583,7 +4498,7 @@ do_describe() {
 do_list() {
     if hold_exists; then
         tmux list-windows -t "=$HOLD" \
-            -F '  #{window_id}  from=#{?#{@stash_origin},#{@stash_origin},?}  #{?#{@stash_session},[suspended] ,}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}#{?#{@stash_desc},  — #{@stash_desc},}'
+            -F '  #{window_id}  from=#{?#{@stash_origin},#{@stash_origin},?}  #{?#{@stash_session},[suspended] ,}#{?#{@stash_cold},[cold] ,#{?#{@stash_frozen},[frozen] ,}}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}#{?#{@stash_desc},  — #{@stash_desc},}'
     else
         echo "  nothing parked"
     fi
@@ -3693,6 +4608,9 @@ case "${1:-}" in
     send-many)  shift; do_send_many "$@" ;;
     count)   count ;;
     publish) publish ;;
+    publish-count) publish_count ;;
+    rows)    do_rows ;;
+    thaw)    shift; do_thaw "${1:-}" "${2:-}" ;;
     pick)    shift; do_pick "${1:-}" ;;
     preview) shift; do_preview "${1:-}" ;;
     describe) shift; do_describe "${1:-}" ;;

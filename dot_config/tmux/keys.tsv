@@ -62,14 +62,19 @@ Agents	⌃S q	Agent menu	prefix	q C-q
 Agents	⌃S t	Pin / unpin this agent	prefix	t	⌥W 1-9 reach pins
 Agents	⌃S P	Pause working agents; again resumes	prefix	P	before closing the lid
 
-Park	⌃S H	Park this tab	prefix	H
-Park	⌃S h	Unpark (picker)	prefix	h
+Park	⌃S H	Park this tab (agent kept, jobs frozen)	prefix	H	refused if it can't be paused
+Park	⌃S h	Unpark (⌘Z picker, stashed only)	prefix	h
 Park	⌃S v	Select a range of tabs (again cancels)	prefix	v
 Park	h / l	Range: move its far end left / right	stash	h l j k	k / j too
 Park	H / ⏎	Range: park the selection	stash	H Enter
 Park	m	Range: move it to another space	stash	m a
 Park	x then ⇧Y	Range: close the selection	stash	x	any other key keeps it
 Park	Esc	Range: cancel	stash	Escape q Space C-c
+
+⌘Z picker	⏎	Restore it (agent resumed, jobs thawed)			Stashed above, backlog below
+⌘Z picker	⌃S	Stash / unstash the row			keeps a backlog row past 30 days
+⌘Z picker	⌃X	Stashed → backlog; backlog row: forget			a parked tab closes into the backlog
+⌘Z picker	⇥ / ⇧↑ / ⇧↓	Select several			⌃A all, ⌃D none
 
 Sidebar	⌘B	Sidebar on / off			WezTerm
 Sidebar	⌥V	Sidebar scope: this space → active → all	root	M-v

@@ -6,6 +6,7 @@
 //! |-------------------|----------------------------------------------------------|-------------------|
 //! | go to a window    | `bash agent-jump.sh goto <tty> <win> <session>` (10 s)   | `Roster.go/jump`  |
 //! | go to a parked one| `tmux run-shell -b "stash.sh unstash <win> <tty>"`       | `Roster.go`       |
+//! | go to a stashed entry | `run-shell -b "closed-tabs.sh reopen <sess> <tty> <id>"` | (none)        |
 //! | go to a pending one| `tmux run-shell -b "space.sh pending-open <win> <tty>"` | (none)            |
 //! | next              | `bash agent-jump.sh next <tty>`                          | `Roster.jump`     |
 //! | back (⌥X)         | `bash nav.sh back <tty>` (docs/nav.md)                   | (none)            |
@@ -13,6 +14,7 @@
 //! | park              | `run-shell -b "stash.sh stash <win>"`                    | `Roster.act` H    |
 //! | close             | `run-shell -b "closed-tabs.sh close --ask-space <tty> <pane>"` (agent pane) | `Roster.act` x |
 //! | discard (parked)  | `run-shell -b "stash.sh kill-many <win>"`                | `Roster.act` x    |
+//! | discard (entry)   | `run-shell -b "closed-tabs.sh unpin <id>"` (→ the backlog) | (none)          |
 //! | restart watcher   | `run-shell -b "bash agent-tab-watcher.sh"`               | `Roster.act` r    |
 //! | peek              | `capture-pane -p -e -J -S -N -t <agent pane>`            | `peek_lines`      |
 //!
@@ -20,6 +22,11 @@
 //! snapshot first (a row may come from a frame drawn before the latest
 //! refresh): gone → [`PANE_GONE`]; no longer in the session the row showed
 //! (parked or unparked meanwhile) → [`TAB_MOVED`], and nothing runs.
+//!
+//! A STASHED entry ([`crate::stashed`]: a pinned closed-tabs.sh history
+//! line, no window) is a parked row whose window id is
+//! `entry:<id>`; it is never re-checked against the snapshot (it has no
+//! window): closed-tabs.sh says "nothing to reopen" for one gone meanwhile.
 //!
 //! "Never guess which pane": `x` closes the pane running the agent, matched
 //! by TTY against `ps` like the watcher, never by pane_current_command (codex
@@ -339,6 +346,18 @@ pub fn park_refused_busy(w: &Window) -> bool {
     !quiet || !w.workflow.is_empty() || !w.cua.is_empty()
 }
 
+/// stash.sh's refusal of a SPLIT tab with an agent in it (an agent tab is
+/// parked by closing it into the stash, which only a one-pane tab can be).
+pub const SPLIT_AGENT_PARK: &str = "split tab with an agent — can't park it yet";
+
+/// [`SPLIT_AGENT_PARK`] from the tab's own options: an agent state and more
+/// than one pane (a space home's dashboard not counted, [`Window::panes`]).
+/// The other refusals stash.sh adds (unsent text in the composer, ssh in the
+/// foreground) need the pane's contents or its processes: stash.sh's call.
+pub fn park_refused_split(w: &Window) -> bool {
+    !w.state.is_empty() && w.panes > 1
+}
+
 /// The action runner. Cheap to clone; holds no state.
 #[derive(Debug, Clone)]
 pub struct Actions {
@@ -470,6 +489,10 @@ impl Actions {
     /// session is passed on, so a linked window lands in the session the row
     /// showed, not whichever agent-jump.sh would prefer.
     pub fn go(&self, snap: &Snapshot, client: &str, win: &str, session: &str) -> Result<(), String> {
+        if let Some(id) = crate::stashed::entry_id(win) {
+            self.tmux.run_bg(&self.reopen_line(&client_session(snap, client), client, id));
+            return Ok(());
+        }
         if snap.rows(win).next().is_none() {
             return Err(PANE_GONE.into());
         }
@@ -532,6 +555,21 @@ impl Actions {
         self.run_bg_script("stash.sh", &["unstash", win, client]);
     }
 
+    /// What going to a stashed entry hands `run-shell -b`: `closed-tabs.sh
+    /// reopen <client_session> <client> <id>`, the picker's own reopen of
+    /// that one entry (back in its space, its session id resumed; the
+    /// client's session is where it lands when its space is gone).
+    pub fn reopen_line(&self, client_session: &str, client: &str, id: &str) -> String {
+        self.script_line("closed-tabs.sh", &["reopen", client_session, client, id])
+    }
+
+    /// What discarding a stashed entry hands `run-shell -b`: `closed-tabs.sh
+    /// unpin <id>`: off the shelf into ⌘Z's backlog (undoable, pruned later
+    /// like any closed tab).
+    pub fn unpin_line(&self, id: &str) -> String {
+        self.script_line("closed-tabs.sh", &["unpin", id])
+    }
+
     /// agent-jump.sh next: the next window that needs you.
     pub fn next(&self, client: &str) -> Result<(), String> {
         self.jump("next", client, &[])
@@ -575,6 +613,37 @@ pub fn space_landing<'a>(snap: &'a Snapshot, session: &str) -> Option<&'a Window
     home.or_else(|| ws.find(|w| w.active))
 }
 
+/// The footer after discarding stash window `w` (`stash.sh kill-many`).
+/// - A window suspended the OLDER way (`@stash_session`, before the
+///   migration): kill-many does a plain kill-window (no closed-tabs.sh, so
+///   nothing in ⌘Z's history); its session id is logged to tmux-stash.log.
+/// - A FROZEN or COLD window (`@stash_frozen` / `@stash_cold`): closed
+///   through closed-tabs.sh, but each pane is recorded as a shell (no
+///   command), so ⌘Z reopens a shell in its cwd, never the stopped program
+///   (and a split comes back as one entry per pane).
+/// - Anything else (an idle shell): closed through closed-tabs.sh, ⌘Z
+///   brings it back.
+pub fn discard_words(w: &Window) -> String {
+    if !w.stash_session.is_empty() {
+        format!("discarded {} · its session id is in the stash log", w.label)
+    } else if !w.stash_frozen.trim().is_empty() || !w.stash_cold.trim().is_empty() {
+        format!("closed {} · ⌘Z reopens a shell there", w.label)
+    } else {
+        format!("discarded {} · ⌘Z brings it back", w.label)
+    }
+}
+
+/// The session `client` is on, as `snap` has it: its client row's session,
+/// else its window's session; "" when unknown (closed-tabs.sh then reopens
+/// into the entry's own space only).
+pub fn client_session(snap: &Snapshot, client: &str) -> String {
+    let Some(c) = snap.client(client) else { return String::new() };
+    if !c.session.is_empty() {
+        return c.session.clone();
+    }
+    snap.rows(&c.window_id).next().map(|w| w.session.clone()).unwrap_or_default()
+}
+
 impl Actions {
     /// The current row of `win` in `session`, or the Python's refusal text.
     fn recheck<'a>(&self, snap: &'a Snapshot, win: &str, session: &str) -> Result<&'a Window, String> {
@@ -588,6 +657,9 @@ impl Actions {
     /// an idle agent; it refuses a busy one on the status line). Ok carries
     /// the footer text ("parking <label>…": a request, not a fact).
     pub fn park(&self, snap: &Snapshot, win: &str, session: &str) -> Result<String, String> {
+        if crate::stashed::entry_id(win).is_some() {
+            return Err("already parked".into());
+        }
         let w = self.recheck(snap, win, session)?;
         if w.session == HOLD {
             return Err("already parked".into());
@@ -603,6 +675,9 @@ impl Actions {
         if park_refused_busy(w) {
             return Err(format!("{} is working, can't park", w.label));
         }
+        if park_refused_split(w) {
+            return Err(SPLIT_AGENT_PARK.into());
+        }
         self.tmux.run_bg(&self.park_line(&w.id));
         Ok(format!("parking {}…", w.label))
     }
@@ -615,17 +690,22 @@ impl Actions {
         self.script_line("closed-tabs.sh", &["close", "--ask-space", client, pane])
     }
 
-    /// `x` after its y, from the menu on `client`. A parked tab goes through
-    /// stash.sh's own discard (`kill-many`, which logs a suspended
-    /// conversation's id); anything else closes the agent's pane through
+    /// `x` after its y, from the menu on `client`. A stashed entry is
+    /// unpinned (`closed-tabs.sh unpin`: into ⌘Z's backlog); a parked tab
+    /// goes through stash.sh's own discard (`kill-many`; what ⌘Z gets back
+    /// then: [`discard_words`]); anything else closes the agent's pane through
     /// closed-tabs.sh (⌘Z restores it), or is refused when the pane can't be
     /// told, or is a space's home shell pane (as prefix x refuses it; an
     /// agent in a split of the home window still closes).
     pub fn close(&self, snap: &Snapshot, client: &str, win: &str, session: &str) -> Result<String, String> {
+        if let Some(id) = crate::stashed::entry_id(win) {
+            self.tmux.run_bg(&self.unpin_line(id));
+            return Ok("discarded · ⌘Z brings it back".into());
+        }
         let w = self.recheck(snap, win, session)?;
         if w.session == HOLD {
             self.run_bg_script("stash.sh", &["kill-many", &w.id]);
-            return Ok(format!("discarded {} · its session id is in the stash log", w.label));
+            return Ok(discard_words(w));
         }
         let (pane, home) = self.agent_pane_row(&w.id, &w.kind)?;
         if home {
@@ -1000,6 +1080,76 @@ mod tests {
         // A space's home (an idle agent in it): never parked.
         let home = Snapshot::parse(&row("main", 0, "@14", &[("state", "idle"), ("summary", "Home"), ("home", "1")]));
         assert_eq!(a.park(&home, "@14", "main"), Err(HOME_PARK.to_string()));
+    }
+
+    /// stash.sh's new refusal, mirrored from the tab's options: a SPLIT tab
+    /// with an agent in it (a dashboard pane is no split; a split of plain
+    /// shells parks). A stashed entry is already parked. The server here does
+    /// not exist, so an accepted park runs nothing.
+    #[test]
+    fn park_refuses_a_split_with_an_agent() {
+        use crate::tmux::tests::row;
+        let snap = Snapshot::parse(&[
+            row("main", 1, "@1", &[("state", "idle"), ("summary", "Split"), ("panes", "2")]),
+            row("main", 2, "@2", &[("state", "idle"), ("summary", "Dash"), ("pane_flags", "d0%3 A1%4 ")]),
+            row("main", 3, "@3", &[("summary", "Shells"), ("panes", "2")]),
+            row("main", 4, "@4", &[("state", "idle"), ("summary", "Three"), ("pane_flags", "A0%5 p1%6 p2%7 ")]),
+        ].join("\n"));
+        let a = Actions::new(Tmux::with_socket(Some(crate::tmux::Socket::Name(format!("agentui-split-none-{}", std::process::id())))));
+        assert_eq!(a.park(&snap, "@1", "main"), Err(SPLIT_AGENT_PARK.to_string()));
+        assert_eq!(a.park(&snap, "@4", "main"), Err(SPLIT_AGENT_PARK.to_string()));
+        assert_eq!(a.park(&snap, "@2", "main"), Ok("parking Dash…".to_string()));
+        assert_eq!(a.park(&snap, "@3", "main"), Ok("parking Shells…".to_string()));
+        assert_eq!(a.park(&snap, "entry:1790000100-12", "stash"), Err("already parked".to_string()));
+        // A busy split says it is working first (stash.sh's order).
+        let busy = Snapshot::parse(&row("main", 1, "@1", &[("state", "running"), ("summary", "Busy"), ("panes", "2")]));
+        assert_eq!(a.park(&busy, "@1", "main"), Err("Busy is working, can't park".to_string()));
+    }
+
+    /// A stashed entry (no window): go reopens it through closed-tabs.sh on
+    /// the client's session and tty, discard unpins it into the backlog;
+    /// neither looks for a window. (The server does not exist: nothing runs;
+    /// tests/parity.rs runs both against a real one.)
+    #[test]
+    fn a_stashed_entry_reopens_and_unpins() {
+        use crate::tmux::tests::row;
+        let a = Actions { tmux: Tmux::with_socket(Some(crate::tmux::Socket::Name(format!("agentui-entry-none-{}", std::process::id())))),
+            scripts: PathBuf::from("/s") };
+        assert_eq!(a.reopen_line("main", "/dev/ttys004", "1790000100-12"),
+            "'/s/closed-tabs.sh' 'reopen' 'main' '/dev/ttys004' '1790000100-12'");
+        assert_eq!(a.unpin_line("1790000100-12"), "'/s/closed-tabs.sh' 'unpin' '1790000100-12'");
+        let snap = Snapshot::parse(&[
+            row("main", 1, "@1", &[("state", "idle")]),
+            row("work", 1, "@2", &[]),
+            "\x1fclient\x1f/dev/ttys004\x1f@1\x1fmain".into(),
+            "\x1fclient\x1f/dev/ttys005\x1f@2".into(),
+        ].join("\n"));
+        assert_eq!(client_session(&snap, "/dev/ttys004"), "main");
+        assert_eq!(client_session(&snap, "/dev/ttys005"), "work"); // an old row: its window's session
+        assert_eq!(client_session(&snap, "/dev/ttys999"), "");
+        assert_eq!(a.go(&snap, "/dev/ttys004", "entry:1790000100-12", "stash"), Ok(()));
+        assert_eq!(a.close(&snap, "/dev/ttys004", "entry:1790000100-12", "stash"), Ok("discarded · ⌘Z brings it back".to_string()));
+    }
+
+    /// Discarding a stash window: an idle shell, ⌘Z brings it back; a
+    /// frozen or cold one, ⌘Z reopens only a shell in its cwd; a window
+    /// suspended the older way (`@stash_session`) is a plain kill-window,
+    /// its session id in the stash log. (The server does not exist:
+    /// kill-many runs nowhere.)
+    #[test]
+    fn discard_words_tell_a_legacy_suspend() {
+        use crate::tmux::tests::row;
+        let snap = Snapshot::parse(&[
+            row("stash", 1, "@1", &[("stash_label", "Idle sh")]),
+            row("stash", 2, "@2", &[("stash_label", "Old agent"), ("stash_session", "sid-9")]),
+            row("stash", 3, "@3", &[("stash_label", "Dev server"), ("stash_frozen", "0 42 npm run dev /x")]),
+            row("stash", 4, "@4", &[("stash_label", "Cold vim"), ("stash_cold", "1")]),
+        ].join("\n"));
+        let a = Actions::new(Tmux::with_socket(Some(crate::tmux::Socket::Name(format!("agentui-discard-none-{}", std::process::id())))));
+        assert_eq!(a.close(&snap, "/dev/x", "@1", "stash"), Ok("discarded Idle sh · ⌘Z brings it back".to_string()));
+        assert_eq!(a.close(&snap, "/dev/x", "@2", "stash"), Ok("discarded Old agent · its session id is in the stash log".to_string()));
+        assert_eq!(a.close(&snap, "/dev/x", "@3", "stash"), Ok("closed Dev server · ⌘Z reopens a shell there".to_string()));
+        assert_eq!(a.close(&snap, "/dev/x", "@4", "stash"), Ok("closed Cold vim · ⌘Z reopens a shell there".to_string()));
     }
 
     /// A rate-limited agent is paused: quiet, so parkable like any paused

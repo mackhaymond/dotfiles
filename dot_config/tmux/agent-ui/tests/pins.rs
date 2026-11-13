@@ -56,6 +56,8 @@ impl Server {
             .env("AGENT_UI_SCRIPTS", "/nonexistent")
             .env("AGENT_UI_CLAUDE_DIR", "/nonexistent")
             .env("AGENT_PAUSE_STATE_DIR", "/nonexistent/agent-pause")
+            // (Never Mack's own stash: no stashed entries here.)
+            .env("AGENT_UI_CLOSED_TABS_HISTORY", self.dir.join("no-history.jsonl"))
             // (Never wake the real sidebars.)
             .env("AGENT_STATE_NOTICE", format!("com.mackhaymond.test.{}", self.name))
             .env("AGENT_FOCUS_NOTICE", format!("com.mackhaymond.test.{}.focus", self.name))

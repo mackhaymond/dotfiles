@@ -6,14 +6,49 @@
 #
 #   closed-tabs.sh close <pane_id>                 snapshot, record, kill the pane
 #   closed-tabs.sh close --ask-space <client> <pane_id>   the same, then ask-space
+#   closed-tabs.sh close --pin <pane_id>           stash an agent tab: a pinned entry
 #   closed-tabs.sh ask-space <client> <session>    only home left? ask to close the space
 #   closed-tabs.sh ask-space-yes <client> <sid>    that box's y: still only home? close it
-#   closed-tabs.sh pick-popup <session_id> <tty>   fzf picker over the history
-#   closed-tabs.sh reopen <session_id> <tty> [id…] reopen these (default: newest)
-#   closed-tabs.sh forget <id…>                    drop entries from the history
+#   closed-tabs.sh pick-popup [--stashed] <session_id> <tty>   fzf picker (below)
+#   closed-tabs.sh reopen <session_id> <tty> [id…] reopen these (default: newest unpinned)
+#   closed-tabs.sh pin <id…> / unpin <id…>         keep on the stashed shelf / drop to the backlog
+#   closed-tabs.sh forget <id…>                    pinned: unpin it; unpinned: delete it
+#   closed-tabs.sh pinned-json                     the pinned entries, one JSON array
 #   closed-tabs.sh list                            print the history, newest first
 #   closed-tabs.sh describe <id>                   label an entry (close runs this)
 #   closed-tabs.sh summarize <tool> <sid> <cwd> <label> <screen>   print one
+# Exit codes: 0 ok, 3 refused (nothing changed: `close --pin` on a pane with no
+# agent or no session id), 1 error.
+#
+# The history is the everything-backlog; the STASH is a kept shelf inside it.
+# An entry with "pinned": true (and "stashed_ts", when it was pinned) is
+# stashed: prune never ages it out, never counts it against MAX_ENTRIES and
+# never deletes its snapshot, and a bare `reopen` (⌘Z) skips it. `close --pin`
+# is how stash.sh parks a one-pane agent tab: the agent's session id is
+# resolved BEFORE the pane is killed, for every harness, and only from sources
+# tied to that process (never opencode's or codex's newest-session-in-this-cwd
+# fallbacks, which with two such tabs in one directory name the other one's).
+# With no agent, no id or no tied id it refuses (exit 3) and kills nothing — a
+# stashed agent that comes back as a plain shell, or as another tab's
+# conversation, has lost its own. Unpinning (unpin, forget, the
+# picker's ⌃x) restamps the entry's ts and moves it to the end of the file, so
+# it is the newest backlog entry and gets its full RETAIN_DAYS from then.
+# Reopening a pinned entry by id takes it out of the store like any other: it
+# is back on the tab bar. Every pin-state change refreshes the status line's
+# count through `stash.sh publish-count` (STASH_SH names another, for tests).
+#
+# The picker has two sections: Stashed (pinned entries plus the live windows
+# of the stash session, from `stash.sh rows`, newest stashed first, with their
+# age) above Backlog (unpinned entries, newest closed first); --stashed shows
+# Stashed only (prefix h). ⏎ restores (an entry reopens, a window goes back
+# through `stash.sh unstash`); ⌃s toggles stash/unstash in place (an entry
+# pins/unpins; a live window is already stashed and stays); ⌃x on a stashed
+# row drops it to the backlog (a window: `stash.sh kill-many`, which closes it
+# through here), on a backlog row forgets it. A window's preview comes from
+# `stash.sh preview`. A `pending` window (back on the bar, its agent's resume
+# refused) is listed so ⏎ can retry it; ⌃s and ⌃x leave it alone. No tab is
+# ever reopened into a hidden session (stash, agents…): a gone or hidden one
+# falls back to the client's session, then main.
 #
 # After a close, a detached `describe` has a small model read the tab's
 # transcript — or its screen, for a plain shell — and stores a one-line
@@ -81,8 +116,24 @@ POPUP_H_PCT=85
 POPUP_X='#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}'
 
 RESURRECT_SAVE="$HOME/.config/tmux/plugins/tmux-assistant-resurrect/scripts/save-assistant-sessions.sh"
+# stash.sh, for its live windows (rows), handing a window back (unstash),
+# discarding one (kill-many) and the status-line count (publish-count). STASH_SH
+# names another (tests); it is carried through every re-entry like STATE_HOME.
+STASH_SH="${STASH_SH:-$HOME/.config/tmux/scripts/stash.sh}"
 
 mkdir -p "$STATE_DIR" "$PREVIEWS"
+
+# stash_sh <args…>: run stash.sh, status 1 when there is none.
+stash_sh() { [ -f "$STASH_SH" ] || return 1; bash "$STASH_SH" "$@"; }
+# Refresh @stash_count after a pin-state change. Detached: stash.sh's
+# `stash` calls `close --pin` while it holds its own lock, and a publish-count
+# that waited on that lock must not hold this close up. An older stash.sh
+# without the command just prints its usage, to /dev/null.
+publish_count() {
+    [ -f "$STASH_SH" ] || return 0
+    ( bash "$STASH_SH" publish-count </dev/null >/dev/null 2>&1 & )
+    return 0
+}
 
 # Messages go through notify.sh: a toast in the agent sidebar when one is open
 # for the client, else tmux's own display-message (its header has the rest).
@@ -155,15 +206,27 @@ history_filter() {
 ids_json() { printf '%s\n' "$@" | jq -R . | jq -sc .; }
 
 # Age out old entries, cap the count, and delete snapshots nothing points at
-# (including any left by a close that died halfway). Caller holds the lock.
+# (including any left by a close that died halfway). Both limits apply to
+# UNPINNED entries only: a stashed (pinned) entry and its snapshot stay until
+# it is unpinned, reopened or forgotten. The cap keeps the newest MAX_ENTRIES
+# unpinned entries by file order (an unpin moves its entry to the end), with
+# every pinned one where it was. Caller holds the lock.
 prune() {
     local cutoff=$(( $(date +%s) - RETAIN_DAYS * 86400 ))
-    history_filter --argjson cut "$cutoff" 'select(.ts >= $cut)'
+    history_filter --argjson cut "$cutoff" 'select(.pinned == true or .ts >= $cut)'
     # grep -c prints "0" AND exits 1 on an empty file, so `|| echo 0` would
-    # yield "0\n0"; wc -l always prints exactly one number.
+    # yield "0\n0"; wc -l always prints exactly one number. The line count is
+    # an upper bound on the unpinned count, so the slurping pass below only
+    # runs when the cap can bite.
     local n; n=$(wc -l <"$HISTORY" 2>/dev/null | tr -d ' '); n=${n:-0}
     if [ "$n" -gt "$MAX_ENTRIES" ]; then
-        tail -n "$MAX_ENTRIES" "$HISTORY" >"$HISTORY.tmp" && mv "$HISTORY.tmp" "$HISTORY"
+        history_filter -s --argjson max "$MAX_ENTRIES" '
+            ((map(select(.pinned != true)) | length) - $max) as $drop
+            | reduce .[] as $e ({k: 0, out: []};
+                if $e.pinned == true then .out += [$e]
+                elif .k < $drop then .k += 1
+                else .out += [$e] end)
+            | .out[]'
     fi
     # One jq for the live ids, then in-shell matching: a grep per snapshot
     # was a fork per history entry on every close and every CMD+Z.
@@ -379,8 +442,12 @@ agent_snapshot() {
 # lets this run after the agent is gone.
 # Prints "<session_id>\x1f<cli_args>\x1f<model>\x1f<env json>" or nothing;
 # grok adds a fifth field, the session's own cwd.
+#   agent_session <tool> <pid> <args> <cwd> [<state dir>] [<allow opencode db: 1|0>]
+# The last argument 0 (a pinned close) turns off opencode's newest-session-
+# in-this-cwd DB fallback, the one source of the plugin's that is not tied to
+# the process; what is left (-s/--session in argv, its plugin's state file) is.
 agent_session() {
-    local tool="$1" apid="$2" args="$3" cwd="$4" state="${5:-}"
+    local tool="$1" apid="$2" args="$3" cwd="$4" state="${5:-}" opencode_db="${6:-1}"
     if [ "$tool" = grok ]; then
         grok_session "$apid" "$args" "${state:-}"
         return 0
@@ -403,10 +470,82 @@ agent_session() {
         _SESSION_FLAGS_claude="${SESSION_FLAGS_FALLBACK_claude:-}"
         _SESSION_FLAGS_opencode="${SESSION_FLAGS_FALLBACK_opencode:-}"
         PARTS_FILE=$(mktemp)
-        emit_session "-" "$tool" "$apid" "$args" "$cwd" 1 0 >/dev/null 2>&1
+        emit_session "-" "$tool" "$apid" "$args" "$cwd" "$opencode_db" 0 >/dev/null 2>&1
         jq -r '[.session_id // "", .cli_args // "", .model // "", (.env // {} | tojson)] | join("\u001f")' \
             "$PARTS_FILE" 2>/dev/null
         rm -f "$PARTS_FILE"
+    )
+}
+
+# The codex thread tied to THIS process, for a pinned close; nothing when no
+# tied source has it. The plugin's get_codex_session falls back to the thread
+# DB / rollout files by cwd and recency, which with two codex tabs in one
+# directory names the other tab's thread, and it never reads the tracker
+# record below. Run while the agent lives. In order:
+#   1. codex-session-track's codex-<pid>.json, keyed by the terminal frontend
+#      pid (the agent or a process under it on the pane's tty), trusted only
+#      when its ppid is that pid, its frontend_start is that process's start
+#      time (not a reused pid), and its pane and socket are this pane's — the
+#      checks resurrect-save-repair.py's tracker_session makes. It follows
+#      /new and /resume.
+#   2. ~/.codex/session-tags.jsonl's line for the pid (the plugin's method 1).
+#   3. `resume <uuid>` in the agent's argv (its method 2): what it was
+#      launched on.
+#   codex_tied_sid <pid> <pane_id> <pane_tty>
+codex_tied_sid() {
+    local apid="$1" pane="$2" tty="$3" sock p rec sid rsock start
+    [[ "$apid" =~ ^[0-9]+$ ]] || return 0
+    sock=$(real_path "$(tmux display-message -p '#{socket_path}' 2>/dev/null)")
+    for p in $(ps -t "${tty#/dev/}" -o pid=,ppid= 2>/dev/null | awk -v root="$apid" '
+            { kids[$2] = kids[$2] " " $1 }
+            END {
+                q[++qe] = root
+                for (qs = 1; qs <= qe; qs++) {
+                    print q[qs]
+                    n = split(kids[q[qs]], c, " ")
+                    for (j = 1; j <= n; j++) q[++qe] = c[j]
+                }
+            }'); do
+        rec="$ASSISTANT_STATE_DIR/codex-$p.json"
+        [ -s "$rec" ] || continue
+        # codex-terminal-owner's frontend_start: lstart, whitespace collapsed.
+        start=$(ps -p "$p" -o lstart= 2>/dev/null | xargs)
+        [ -n "$start" ] || continue
+        sid="" rsock=""
+        IFS=$'\x1f' read -r sid rsock < <(jq -r --arg pid "$p" --arg start "$start" --arg pane "$pane" '
+            select((.ppid | tostring) == $pid and .frontend_start == $start
+                   and (.env.tmux_pane // "") == $pane and (.session_id // "") != "")
+            | [.session_id, (.env.tmux_socket // "")] | join("\u001f")' "$rec" 2>/dev/null)
+        if [ -n "$sid" ] && [ -n "$sock" ] && [ "$(real_path "$rsock")" = "$sock" ]; then
+            printf '%s\n' "$sid"
+            return 0
+        fi
+    done
+    local tags="$HOME/.codex/session-tags.jsonl"
+    if [ -s "$tags" ]; then
+        sid=$(grep -E "\"pid\": *${apid}[,}]" "$tags" 2>/dev/null | tail -n 1 | jq -r '.session // empty' 2>/dev/null)
+        [ -n "$sid" ] && { printf '%s\n' "$sid"; return 0; }
+    fi
+    local re='(^|[[:space:]])resume[[:space:]]+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})([[:space:]]|$)'
+    [[ "$(ps -p "$apid" -o args= 2>/dev/null)" =~ $re ]] && printf '%s\n' "${BASH_REMATCH[2]}"
+    return 0
+}
+# real_path <path>: the path with its directory's symlinks resolved (/tmp →
+# /private/tmp); nothing for an empty or unreachable one.
+real_path() {
+    [ -n "${1:-}" ] || return 0
+    local d; d=$(cd "$(dirname "$1")" 2>/dev/null && pwd -P) || return 0
+    printf '%s/%s' "$d" "${1##*/}"
+}
+# The plugin's cli_args for a command line (argv minus argv0 and its session
+# flags), for a codex pin whose tied thread the plugin's own lookup missed.
+plugin_cli_args() {
+    [ -r "$RESURRECT_SAVE" ] || return 0
+    (
+        # shellcheck source=/dev/null
+        source "$RESURRECT_SAVE" 2>/dev/null || exit 0
+        set +e
+        extract_cli_args "$1" "$2" 2>/dev/null
     )
 }
 
@@ -669,19 +808,34 @@ build_cmd() {
 # screen, its agent's session) comes first, then the pane dies, and only then
 # the bookkeeping — building the resume command, writing and pruning the
 # history. The tab is off the bar before any of that starts.
+#
+# --pin (stash.sh parking an agent tab) moves the whole session lookup, and
+# the resume command, ahead of the kill for every harness: the entry is only
+# worth keeping if it resumes, and the tab can only be left alone if nothing
+# has been killed yet. No agent, no session id or no command: exit 3, the
+# snapshot is dropped and the pane is untouched.
 do_close() {
+    local pin=""
+    [ "${1:-}" = --pin ] && { pin=1; shift; }
     local pane="${1:-}"
     # An empty -t resolves to the CURRENT pane, not to nothing.
     [ -n "$pane" ] || { msg -k error "closed-tabs: no pane given"; return 1; }
 
     local info
     info=$(tmux display-message -p -t "$pane" \
-        '#{pane_id}|#{pane_pid}|#{pane_tty}|#{session_name}|#{session_id}|#{session_created}|#{window_index}|#{pane_current_path}|#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}' 2>/dev/null)
+        '#{pane_id}|#{pane_pid}|#{pane_tty}|#{session_name}|#{session_id}|#{session_created}|#{window_index}|#{pane_current_path}|#{@stash_origin}|#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}' 2>/dev/null)
     # display-message against a dead target can succeed with an empty
     # expansion — test the expansion, not the exit status.
-    local pane_id pane_pid pane_tty sess tsess tcreated widx cwd label
-    IFS='|' read -r pane_id pane_pid pane_tty sess tsess tcreated widx cwd label <<<"$info"
+    local pane_id pane_pid pane_tty sess tsess tcreated widx cwd origin label
+    IFS='|' read -r pane_id pane_pid pane_tty sess tsess tcreated widx cwd origin label <<<"$info"
     [ -n "$pane_id" ] || return 1
+    # A window closed out of the stash (stash.sh kill-many, ⌃x in the picker)
+    # belongs to the space it was parked from, not to the hidden session that
+    # held it: recorded there, at the end of its bar, so a reopen lands it
+    # back where it came from rather than in a hidden session.
+    if [ -n "$origin" ] && ! session_visible "$tsess" >/dev/null; then
+        sess=$origin tsess="" tcreated="" widx=99999
+    fi
 
     local ts id
     ts=$(date +%s); id="$ts-$$"
@@ -702,9 +856,53 @@ do_close() {
 
     # codex is the exception that resolves BEFORE the kill: its fallbacks match
     # threads against the live process's start time, which a dead pid no
-    # longer has.
-    local sid="" cli_args="" model="" env_json="" sess_info=""
-    [ "$tool" = codex ] && sess_info=$(agent_session "$tool" "$apid" "$args" "$cwd" "$copy")
+    # longer has. A pinned close resolves every harness here, and only from
+    # sources tied to this process: a stashed entry that resumed another
+    # tab's conversation would be worse than none. claude (its state file,
+    # --resume), grok, copilot and agy (pid-keyed records and locks, argv)
+    # have nothing else; opencode's DB-by-cwd fallback is turned off, and
+    # codex's thread comes from codex_tied_sid instead of the plugin's
+    # DB/rollout heuristics.
+    local sid="" cli_args="" model="" env_json="" sess_info="" scwd="" cmd="" resolved=""
+    if [ -n "$pin" ] || [ "$tool" = codex ]; then
+        [ -n "$tool" ] && sess_info=$(agent_session "$tool" "$apid" "$args" "$cwd" "$copy" "${pin:+0}")
+        resolved=1
+    fi
+    if [ -n "$pin" ]; then
+        local why="" tied=""
+        if [ -z "$tool" ]; then
+            why="no agent in this pane"
+        else
+            [ -n "$sess_info" ] && IFS=$'\x1f' read -r sid cli_args model env_json scwd <<<"$sess_info"
+            if [ "$tool" = codex ]; then
+                tied=$(codex_tied_sid "$apid" "$pane_id" "$pane_tty")
+                # The plugin's lookup may have named a thread by cwd and
+                # recency; the tied one wins, and with none there is no pin.
+                if [ -n "$tied" ] && [ -z "$sid" ]; then
+                    cli_args=$(plugin_cli_args codex "$args") model="" env_json='{}'
+                fi
+                sid=$tied
+            fi
+            # A grok session is looked up under its own cwd (a -w worktree one too).
+            [ -n "$scwd" ] && [ -d "$scwd" ] && cwd="$scwd"
+            cmd=$(build_cmd "$tool" "$sid" "$cli_args" "$model" "$env_json")
+            if [ -z "$sid" ]; then
+                case "$tool" in
+                codex|opencode) why="couldn't tie the session to this tab" ;;
+                *) why="couldn't find the $tool session id" ;;
+                esac
+            elif [ -z "$cmd" ]; then why="couldn't build the $tool resume command"
+            fi
+        fi
+        if [ -n "$why" ]; then
+            wait "$cap_pid"
+            rm -f "$PREVIEWS/$id.ansi"
+            [ -n "$copy" ] && rm -rf "$copy"
+            log "close --pin $sess:$widx refused: $why"
+            printf 'closed-tabs: not stashed — %s\n' "$why" >&2
+            return 3
+        fi
+    fi
     wait "$cap_pid"
 
     # SIGTERM first so the agent starts its own shutdown, then take the pane at
@@ -716,23 +914,26 @@ do_close() {
     fi
     tmux kill-pane -t "$pane_id" 2>/dev/null
 
-    if [ -n "$tool" ] && [ "$tool" != codex ]; then
+    if [ -n "$tool" ] && [ -z "$resolved" ]; then
         sess_info=$(agent_session "$tool" "$apid" "$args" "$cwd" "$copy")
     fi
     [ -n "$copy" ] && rm -rf "$copy"
-    local scwd=""
-    [ -n "$sess_info" ] && IFS=$'\x1f' read -r sid cli_args model env_json scwd <<<"$sess_info"
-    # A grok session is looked up under its own cwd (a -w worktree one too).
-    [ -n "$scwd" ] && [ -d "$scwd" ] && cwd="$scwd"
+    if [ -z "$pin" ]; then
+        [ -n "$sess_info" ] && IFS=$'\x1f' read -r sid cli_args model env_json scwd <<<"$sess_info"
+        # A grok session is looked up under its own cwd (a -w worktree one too).
+        [ -n "$scwd" ] && [ -d "$scwd" ] && cwd="$scwd"
+        cmd=$(build_cmd "$tool" "$sid" "$cli_args" "$model" "$env_json")
+    fi
 
-    local cmd; cmd=$(build_cmd "$tool" "$sid" "$cli_args" "$model" "$env_json")
     local rec
     rec=$(jq -cn --arg id "$id" --arg ts "$ts" --arg sess "$sess" --arg widx "$widx" \
         --arg tsess "$tsess" --arg tcreated "$tcreated" \
         --arg cwd "$cwd" --arg label "$label" --arg tool "$tool" --arg sid "$sid" --arg cmd "$cmd" \
+        --arg pin "$pin" \
         '{id: $id, ts: ($ts|tonumber), session: $sess, tmux_session: $tsess,
           session_created: $tcreated, index: ($widx|tonumber), cwd: $cwd,
-          label: $label, tool: $tool, session_id: $sid, cmd: $cmd}')
+          label: $label, tool: $tool, session_id: $sid, cmd: $cmd}
+         + (if $pin == "1" then {pinned: true, stashed_ts: ($ts|tonumber)} else {} end)')
 
     if lock_acquire; then
         printf '%s\n' "$rec" >>"$HISTORY"
@@ -744,7 +945,8 @@ do_close() {
         printf '%s\n' "$rec" >>"$HISTORY"
         log "history lock busy — appended unlocked"
     fi
-    log "close $sess:$widx cwd=$cwd tool=${tool:--} sid=${sid:--}"
+    log "close${pin:+ --pin} $sess:$widx cwd=$cwd tool=${tool:--} sid=${sid:--}"
+    [ -n "$pin" ] && publish_count
     if [ -n "$tool" ] && [ -z "$sid" ]; then
         msg -k warn "closed-tabs: couldn't find the $tool session id — reopening will give a plain shell"
     fi
@@ -1116,8 +1318,44 @@ EOF
 }
 
 # Recreate one recorded tab. Prints the new window id.
+# session_visible <target>: (a session id, or `=name:` — a bare `=name` is
+# read as a window) the target session's name when it is one a tab may
+# land in — not hidden (@space_hidden, or named in @space_hidden_sessions:
+# stash, agents, tasks…); status 1 otherwise or when there is none. An empty
+# target is none, never tmux's "current" session.
+session_visible() {
+    [ -n "${1:-}" ] || return 1
+    local info name hid list
+    info=$(tmux display-message -p -t "$1" "#{session_name}${US}#{@space_hidden}${US}#{@space_hidden_sessions}" 2>/dev/null)
+    IFS="$US" read -r name hid list <<<"$info"
+    # stash.sh's holding session is never a tab's home, whatever the options.
+    [ -n "$name" ] && [ "$hid" != 1 ] && [ "$name" != stash ] || return 1
+    [[ " $list " == *" $name "* ]] && return 1
+    printf '%s\n' "$name"
+}
+
+# Where a tab goes whose own session is gone or hidden: the session it was
+# reopened from, else the session the client is on (by its tty: the sidebar
+# and run-shell -b hand-offs can pass no session, and tmux's "best" session
+# for an empty target can be `stash` or `agents`), else main, else the first
+# visible session. Never a hidden one; status 1 when there is none at all.
+#   fallback_session <client_session> <client_tty>
+fallback_session() {
+    local s
+    session_visible "${1:-}" && return 0
+    if [ -n "${2:-}" ]; then
+        s=$(tmux display-message -p -c "$2" '#{session_id}' 2>/dev/null)
+        session_visible "$s" && return 0
+    fi
+    session_visible '=main:' && return 0
+    for s in $(tmux list-sessions -F '#{session_id}' 2>/dev/null); do
+        session_visible "$s" && return 0
+    done
+    return 1
+}
+
 reopen_one() {
-    local rec="$1" client_sess="$2"
+    local rec="$1" client_sess="$2" client_tty="${3:-}"
     local sess tsess tcreated idx cwd cmd tool label
     sess=$(jq -r '.session' <<<"$rec"); idx=$(jq -r '.index' <<<"$rec")
     cwd=$(jq -r '.cwd' <<<"$rec");      cmd=$(jq -r '.cmd // empty' <<<"$rec")
@@ -1128,16 +1366,22 @@ reopen_one() {
     # Back in its own session, found by identity first: the tmux id survives a
     # rename, but ids are handed out again after a server restart, so the
     # session's creation time has to match too. Then by name (a session
-    # resurrect recreated after a restart), then wherever you are.
-    local now_created=""
+    # resurrect recreated after a restart), then wherever you are — never a
+    # hidden session (fallback_session).
+    local now_created="" target="" name=""
     [ -n "$tsess" ] && now_created=$(tmux display-message -p -t "$tsess" '#{session_created}' 2>/dev/null)
     if [ -n "$tcreated" ] && [ "$now_created" = "$tcreated" ]; then
-        sess=$(tmux display-message -p -t "$tsess" '#{session_name}' 2>/dev/null)
-    elif ! tmux has-session -t "=$sess" 2>/dev/null; then
-        sess=$(tmux display-message -p -t "$client_sess" '#{session_name}' 2>/dev/null)
-        [ -n "$sess" ] || return 1
-        msg "closed-tabs: its session is gone — reopened in $sess"
+        target="$tsess"
+    elif [ -n "$sess" ] && tmux has-session -t "=$sess" 2>/dev/null; then
+        target="=$sess:"
     fi
+    [ -n "$target" ] && name=$(session_visible "$target")
+    if [ -z "$name" ]; then
+        name=$(fallback_session "$client_sess" "$client_tty") || return 1
+        if [ -n "$target" ]; then msg "closed-tabs: its session is hidden — reopened in $name"
+        else msg "closed-tabs: its session is gone — reopened in $name"; fi
+    fi
+    sess=$name
     [ -d "$cwd" ] || cwd="$HOME"
 
     # Same slot it left: insert before whatever slid into its index (with
@@ -1183,7 +1427,9 @@ do_reopen() {
     if [ "$#" -gt 0 ]; then
         recs=$(jq -c --argjson ids "$(ids_json "$@")" 'select(.id as $i | $ids | index($i))' "$HISTORY" 2>/dev/null)
     else
-        recs=$(tail -n 1 "$HISTORY" 2>/dev/null)
+        # Bare ⌘Z: the newest BACKLOG entry. A stashed one only comes back
+        # when it is asked for by id.
+        recs=$(jq -c 'select(.pinned != true)' "$HISTORY" 2>/dev/null | tail -n 1)
     fi
     if [ -z "$recs" ]; then
         lock_release
@@ -1198,7 +1444,7 @@ do_reopen() {
     local rec win first="" n=0 failed=0 lost=0
     while IFS= read -r rec; do
         [ -n "$rec" ] || continue
-        if win=$(reopen_one "$rec" "$client_sess") && [ -n "$win" ]; then
+        if win=$(reopen_one "$rec" "$client_sess" "$client_tty") && [ -n "$win" ]; then
             [ -n "$first" ] || first="$win"
             n=$((n + 1))
             rm -f "$PREVIEWS/$(jq -r '.id' <<<"$rec").ansi"
@@ -1219,6 +1465,8 @@ do_reopen() {
     done < <(jq -sc 'to_entries | sort_by(-.value.ts, -.key) | .[].value' <<<"$recs")
 
     [ -n "$client_tty" ] && [ -n "$first" ] && tmux switch-client -c "$client_tty" -t "$first" 2>/dev/null
+    # A stashed entry that came back has left the shelf.
+    grep -q '"pinned":true' <<<"$recs" && publish_count
     if [ "$lost" -gt 0 ]; then
         msg -k error "closed-tabs: reopened $n, couldn't recreate $failed ($lost lost: history busy, see log)"
     elif [ "$failed" -gt 0 ]; then
@@ -1226,29 +1474,139 @@ do_reopen() {
     fi
 }
 
+# Pin-state changes, one jq pass over the slurped history for the entries
+# whose id is in $ids:
+#   pin     unpinned → pinned:true, stashed_ts:$now, where it is
+#   unpin   pinned → unpinned with .ts = $now, moved to the end: the newest
+#           backlog entry, with its whole RETAIN_DAYS ahead of it
+#   forget  pinned → as unpin; unpinned → dropped
+PIN_JQ='
+    def hit: .id as $i | $ids | index($i);
+    if $mode == "pin" then
+        map(if hit and .pinned != true then .pinned = true | .stashed_ts = $now else . end)
+    else
+        map(select((hit and .pinned == true) | not)
+            | select($mode != "forget" or (hit | not)))
+        + map(select(hit and .pinned == true) | del(.pinned, .stashed_ts) | .ts = $now)
+    end
+    | .[]'
+
+# set_pins <pin|unpin|forget> <id…>: apply it under the lock. Prints how many
+# of the ids were pinned and how many were not ("<pinned> <unpinned>"; ids not
+# in the history count in neither), status 1 when the history is busy. The
+# snapshots of dropped entries go with them; pinned-state changes publish
+# the count.
+set_pins() {
+    local mode="$1"; shift
+    [ "$#" -gt 0 ] || { echo "0 0"; return 0; }
+    lock_acquire || return 1
+    local ids np nu; ids=$(ids_json "$@")
+    read -r np nu < <(jq -r --argjson ids "$ids" \
+        'select(.id as $i | $ids | index($i)) | if .pinned == true then "p" else "u" end' "$HISTORY" 2>/dev/null \
+        | awk '$1 == "p" { p++ } $1 == "u" { u++ } END { print p + 0, u + 0 }')
+    history_filter -s --arg mode "$mode" --argjson ids "$ids" --argjson now "$(date +%s)" "$PIN_JQ"
+    if [ "$mode" = forget ]; then
+        # Only the dropped (unpinned) ones lose their snapshot.
+        local id
+        while IFS= read -r id; do
+            [ -n "$id" ] && rm -f "$PREVIEWS/$id.ansi"
+        done < <(printf '%s\n' "$@" | grep -vxF -f <(jq -r '.id' "$HISTORY" 2>/dev/null))
+    fi
+    lock_release
+    case "$mode" in
+    pin) [ "$nu" -gt 0 ] && publish_count ;;
+    *)   [ "$np" -gt 0 ] && publish_count ;;
+    esac
+    echo "$np $nu"
+}
+
+# pin <id…> / unpin <id…>. Status 1 when none of the ids is in the history.
+do_pin() {
+    local mode="$1"; shift
+    [ "$#" -gt 0 ] || return 0
+    local counts np nu
+    counts=$(set_pins "$mode" "$@") || { msg -k warn "closed-tabs: history busy"; return 1; }
+    read -r np nu <<<"$counts"
+    if [ $((np + nu)) -eq 0 ]; then
+        msg -k warn "closed-tabs: no such entry"
+        return 1
+    fi
+    if [ "$mode" = pin ]; then
+        [ "$nu" -gt 0 ] && msg -k ok "closed-tabs: stashed $nu"
+    else
+        [ "$np" -gt 0 ] && msg -k ok "closed-tabs: $np moved to the backlog"
+    fi
+    return 0
+}
+
+# forget: a pinned entry is unpinned (it drops into the backlog), an unpinned
+# one is deleted with its snapshot.
 do_forget() {
     [ "$#" -gt 0 ] || return 0
-    lock_acquire || return 1
-    history_filter --argjson ids "$(ids_json "$@")" 'select(.id as $i | $ids | index($i) | not)'
-    local id; for id in "$@"; do rm -f "$PREVIEWS/$id.ansi"; done
-    lock_release
-    msg -k ok "closed-tabs: forgot $# tab(s)"
+    local counts np nu
+    counts=$(set_pins forget "$@") || return 1
+    read -r np nu <<<"$counts"
+    if [ "$np" -gt 0 ] && [ "$nu" -gt 0 ]; then
+        msg -k ok "closed-tabs: forgot $nu tab(s), $np moved to the backlog"
+    elif [ "$np" -gt 0 ]; then
+        msg -k ok "closed-tabs: $np moved to the backlog"
+    else
+        msg -k ok "closed-tabs: forgot $nu tab(s)"
+    fi
+}
+
+# The pinned entries as one JSON array, newest stashed first (agent-ui's
+# Parked section). Read-only, no lock: every write replaces the file whole.
+do_pinned_json() {
+    local out=""
+    [ -s "$HISTORY" ] && out=$(jq -sc 'map(select(.pinned == true)) | sort_by(-(.stashed_ts // .ts // 0))' "$HISTORY" 2>/dev/null)
+    printf '%s\n' "${out:-[]}"
 }
 
 # fzf needs a terminal, so the picker runs inside a popup that re-enters this
 # script as `pick`. Called from a FOREGROUND run-shell: a backgrounded one has
 # no client to raise a popup on.
+#   pick-popup [--stashed] <session_id> <tty>   (--stashed may sit anywhere)
 do_pick_popup() {
-    local client_sess="${1:-}" client_tty="${2:-}"
+    local stashed="" a
+    local -a pos=()
+    for a in "$@"; do
+        if [ "$a" = --stashed ]; then stashed=1; else pos+=("$a"); fi
+    done
+    local client_sess="${pos[0]:-}" client_tty="${pos[1]:-}"
     if lock_acquire; then prune; lock_release; fi
-    if [ ! -s "$HISTORY" ]; then
-        msg -k warn "closed-tabs: nothing to reopen"
+    # Anything to show: an entry (a pinned one, for --stashed) or a live
+    # stash window. The stash.sh fork is paid only when the history has none.
+    local any=""
+    if [ -n "$stashed" ]; then
+        [ -s "$HISTORY" ] && jq -e 'select(.pinned == true)' "$HISTORY" >/dev/null 2>&1 && any=1
+    else
+        [ -s "$HISTORY" ] && any=1
+    fi
+    [ -n "$any" ] || [ -z "$(stash_rows)" ] || any=1
+    if [ -z "$any" ]; then
+        if [ -n "$stashed" ]; then msg -k warn "closed-tabs: nothing stashed"
+        else msg -k warn "closed-tabs: nothing to reopen"; fi
         return 0
     fi
     local -a client=()
     [ -n "$client_tty" ] && client=(-c "$client_tty")
+    local title=' stashed · closed tabs '
+    [ -n "$stashed" ] && title=' stashed '
     tmux display-popup "${client[@]}" -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" -x "$POPUP_X" \
-        -T ' closed tabs ' "XDG_STATE_HOME='$STATE_HOME' '$SELF' pick '$client_sess' '$client_tty'"
+        -T "$title" "$(reenter) pick ${stashed:+--stashed }'$client_sess' '$client_tty'"
+}
+
+# The command line that runs this copy again, with the history and stash.sh
+# it was started with (commands tmux runs get the SERVER's environment).
+reenter() { printf "XDG_STATE_HOME='%s' STASH_SH='%s' bash '%s'" "$STATE_HOME" "$STASH_SH" "$SELF"; }
+
+# The live windows of the stash session, from `stash.sh rows`: one line each,
+# US-separated win_id, origin, label, stashed_ts, state (frozen|cold|idle),
+# cwd. Lines whose first field is no window id are dropped (an older stash.sh
+# answers an unknown command with its usage).
+stash_rows() {
+    stash_sh rows </dev/null 2>/dev/null | awk -F '\037' '$1 ~ /^@[0-9]+$/'
 }
 
 # Sets REPLY rather than printing: $(ago …) would fork once per entry.
@@ -1288,61 +1646,209 @@ pick_title() {
     esac
 }
 
-# Runs inside the popup. Newest first, so CMD+Z then ⏎ is "reopen the last
-# thing I closed". ⌃x forgets instead of reopening, via --expect (which puts
-# the accepting key on the first output line, empty for a plain ⏎) — the same
-# gesture as the stash picker's kill.
-do_pick() {
-    local client_sess="${1:-}" client_tty="${2:-}"
-    local id ts tool label cwd desc sess widx
+# The picker's rows, "<key>\t<when · what · title — more>\t<where>", fzf
+# showing fields 2.. and handing back field 1, the key:
+#   p:<id>   a stashed (pinned) entry       b:<id>   a backlog entry
+#   w:<win>  a window parked in the stash (frozen | cold | idle | suspended)
+#   r:<win>  a `pending` one: back on the bar already, its agent's resume
+#            refused (busy pane); ⏎ retries it, ⌃s and ⌃x leave it alone
+#   -        a section heading
+# Stashed (pinned entries and stash windows, newest stashed first, aged from
+# when they were stashed) comes first, then Backlog (unpinned, newest closed
+# first); --stashed leaves Backlog out. A heading is printed only over a
+# section with rows in it, so the first row under the first heading is always
+# line 2 (where the picker puts the cursor).
+#   pick-rows [--stashed]
+pick_rows() {
+    local only_stashed=""
+    [ "${1:-}" = --stashed ] && only_stashed=1
+    local kind id ts tool label cwd desc sess widx
     local dim=$'\e[2m' mauve=$'\e[38;2;203;166;247m' teal=$'\e[38;2;148;226;213m' off=$'\e[0m'
-    local sub=$'\e[38;2;166;173;200m' green=$'\e[38;2;57;255;20m'
-    local out now; now=$(date +%s)
+    local sub=$'\e[38;2;166;173;200m' green=$'\e[38;2;57;255;20m' peach=$'\e[38;2;250;179;135m'
+    local blue=$'\e[38;2;137;180;250m' gray=$'\e[38;2;127;132;156m' bold=$'\e[1m'
+    local now; now=$(date +%s)
     # desc is the model's one-liner from do_describe; missing for a close that
     # was just made (still being written) or where the call failed.
     # abby (Claude Code on abliteration.ai) is recorded as claude; its resume
     # command names abby, or its config dir (entries from before that).
-    out=$(jq -r '[.id, .ts, (if .tool == "claude" and ((.cmd // "") | test("claude-abby|^command abby ")) then "abby" else .tool end), .label, .cwd, (.desc // ""), .session, .index] | map(tostring) | join("\u001f")' "$HISTORY" 2>/dev/null \
-        | tail -r \
-        | while IFS=$'\x1f' read -r id ts tool label cwd desc sess widx; do
+    # Every source row is "<sort ts> US <kind> US id US tool US label US cwd
+    # US desc US session US index"; a window's tool is its state, its session
+    # where it came from.
+    local entry_jq='[(if .pinned == true then (.stashed_ts // .ts) else .ts end),
+            (if .pinned == true then "p" else "b" end), .id,
+            (if .tool == "claude" and ((.cmd // "") | test("claude-abby|^command abby ")) then "abby" else .tool end),
+            .label, .cwd, (.desc // ""), .session, .index] | map(tostring) | join("\u001f")'
+    local stashed backlog=""
+    stashed=$( {
+        [ -s "$HISTORY" ] && jq -r "select(.pinned == true) | $entry_jq" "$HISTORY" 2>/dev/null
+        stash_rows | awk -F '\037' -v OFS='\037' '{ print ($4 ~ /^[0-9]+$/ ? $4 : 0), ($5 == "pending" ? "r" : "w"), $1, $5, $3, $6, "", $2, "" }'
+    } | LC_ALL=C sort -t $'\x1f' -k1,1nr )
+    if [ -z "$only_stashed" ] && [ -s "$HISTORY" ]; then
+        backlog=$(jq -r "select(.pinned != true) | $entry_jq" "$HISTORY" 2>/dev/null | tail -r)
+    fi
+
+    local section rows
+    for section in stashed backlog; do
+        if [ "$section" = stashed ]; then
+            rows=$stashed
+            [ -n "$rows" ] && printf -- '-\t%s%s󰒲 Stashed%s\t\n' "$bold" "$peach" "$off"
+        else
+            rows=$backlog
+            [ -n "$rows" ] && printf -- '-\t%s%s Backlog%s\t\n' "$bold" "$sub" "$off"
+        fi
+        [ -n "$rows" ] || continue
+        while IFS=$'\x1f' read -r ts kind id tool label cwd desc sess widx; do
             [ -n "$id" ] || continue
-            local c="$teal"
-            case "$tool" in claude) c="$mauve" ;; abby) c="$green" ;; esac
-            pick_title "$label" "$desc" "$tool" "$sess" "$widx" "$cwd"
-            local title=${REPLY%%$'\x1f'*} rest=${REPLY#*$'\x1f'}
+            local c="$teal" title rest
+            if [ "$kind" = w ] || [ "$kind" = r ]; then
+                # The state as stash.sh names it; an unknown one as it comes,
+                # cut to the column.
+                case "$tool" in
+                frozen) c="$blue" ;; cold) c="$gray" ;; suspended) c="$mauve" ;; pending) c="$peach" ;;
+                idle|'') tool=idle ;;
+                *) tool=${tool:0:9} ;;
+                esac
+                # A tab would split the row's fields.
+                title=${label//$'\t'/ }
+                [ -n "$title" ] || title="shell in ${cwd##*/}"
+                if [ "$kind" = r ]; then rest="resuming · on the bar in ${sess:-?}"
+                else rest=${sess:+from $sess}; fi
+            else
+                case "$tool" in claude) c="$mauve" ;; abby) c="$green" ;; esac
+                pick_title "$label" "$desc" "$tool" "$sess" "$widx" "$cwd"
+                title=${REPLY%%$'\x1f'*} rest=${REPLY#*$'\x1f'}
+            fi
             [ -n "$rest" ] && rest="  ${sub}— ${rest}${off}"
-            ago "$ts" "$now"
-            printf '%s\t%s%-9s%s %s%-9s%s %s%s\t%s%s%s\n' "$id" \
+            if [ "$ts" -gt 0 ] 2>/dev/null; then ago "$ts" "$now"; else REPLY="?"; fi
+            printf '%s:%s\t%s%-9s%s %s%-9s%s %s%s\t%s%s%s\n' "$kind" "$id" \
                 "$dim" "$REPLY" "$off" "$c" "${tool:-shell}" "$off" "$title" "$rest" \
                 "$dim" "${cwd/#"$HOME"/\~}" "$off"
-          done \
-        | fzf --ansi --delimiter='\t' --with-nth=2.. --reverse --multi \
-              --prompt='reopen > ' \
-              --expect=ctrl-x \
-              --bind 'shift-down:toggle+down,shift-up:toggle+up,ctrl-a:select-all,ctrl-d:deselect-all' \
-              --preview "XDG_STATE_HOME='$STATE_HOME' '$SELF' preview {1}" \
-              --preview-window 'down,72%,border-top,follow' \
-              --header '⏎ reopen · Tab or ⇧↑/⇧↓ to pick several · ⌃x forget')
-    local key=${out%%$'\n'*}
-    local ids; ids=$(printf '%s\n' "$out" | tail -n +2 | cut -f1 | tr '\n' ' ')
-    [ -n "${ids// /}" ] || return 0
-    # Hand off so the popup closes the moment you pick. The ids are
-    # <epoch>-<pid>, nothing a shell would interpret, so unquoted is fine.
-    if [ "$key" = "ctrl-x" ]; then
-        tmux run-shell -b "XDG_STATE_HOME='$STATE_HOME' '$SELF' forget $ids"
-    else
-        tmux run-shell -b "XDG_STATE_HOME='$STATE_HOME' '$SELF' reopen '$client_sess' '$client_tty' $ids"
-    fi
+        done <<<"$rows"
+    done
 }
 
+# Runs inside the popup. ⏎ restores (pick-act's empty key); ⌃x leaves through
+# --expect too (which puts the accepting key on the first output line, empty
+# for a plain ⏎) — the same gesture as the stash picker's kill; ⌃s toggles in
+# place and reloads the rows. The cursor starts on line 2: the first row under
+# the first heading.
+#   pick [--stashed] <session_id> <tty>
+do_pick() {
+    local stashed="" a
+    local -a pos=()
+    for a in "$@"; do
+        if [ "$a" = --stashed ]; then stashed=1; else pos+=("$a"); fi
+    done
+    local client_sess="${pos[0]:-}" client_tty="${pos[1]:-}"
+    local re flag="" out
+    local hint='⏎ restore · ⌃s stash/unstash · ⌃x stashed→backlog, backlog→forget · Tab or ⇧↑/⇧↓ several'
+    re=$(reenter)
+    if [ -n "$stashed" ]; then
+        flag=--stashed
+        hint='⏎ restore · ⌃x discard (→ backlog) · Tab or ⇧↑/⇧↓ several'
+    fi
+    out=$(pick_rows $flag \
+        | fzf --ansi --delimiter='\t' --with-nth=2.. --reverse --multi \
+              --prompt="${stashed:+stashed }restore > " \
+              --expect=ctrl-x \
+              --bind 'shift-down:toggle+down,shift-up:toggle+up,ctrl-a:select-all,ctrl-d:deselect-all' \
+              --bind 'load:pos(2)+unbind(load)' \
+              --bind "ctrl-s:execute-silent($re pick-act ctrl-s '' '' {+1})+deselect-all+reload($re pick-rows $flag)" \
+              --preview "$re preview {1}" \
+              --preview-window 'down,72%,border-top,follow' \
+              --header "$hint")
+    local key=${out%%$'\n'*}
+    local keys; keys=$(printf '%s\n' "$out" | tail -n +2 | cut -f1 | grep -v '^-$' | tr '\n' ' ')
+    [ -n "${keys// /}" ] || return 0
+    # Hand off so the popup closes the moment you pick. The keys are p:/b:
+    # plus <epoch>-<pid> or w: plus a tmux window id, nothing a shell would
+    # interpret, so unquoted is fine.
+    tmux run-shell -b "$re pick-act '$key' '$client_sess' '$client_tty' $keys"
+}
+
+# What a picker key does, by the key that accepted it:
+#   ""      restore: entries reopen (one `reopen`, so several land in their
+#           slots), then each window (parked or pending) goes back through
+#           `stash.sh unstash`
+#   ctrl-s  toggle: a backlog entry is pinned, a stashed one unpinned; a
+#           window is stashed already (or pending) and is left alone
+#   ctrl-x  a stashed entry is unpinned, a backlog one forgotten, a parked
+#           window discarded through `stash.sh kill-many` (it closes through
+#           here, so it lands in the backlog; a legacy suspended one is
+#           killed with its session id logged); a pending one is on the bar
+#           already and is left for closing there
+#   pick-act <key> <session_id> <tty> <pick key…>
+do_pick_act() {
+    local key="${1:-}" client_sess="${2:-}" client_tty="${3:-}"
+    shift 3 2>/dev/null || return 0
+    local k
+    local -a pinned=() backlog=() wins=() pend=()
+    for k in "$@"; do
+        case "$k" in
+        p:?*) pinned+=("${k#p:}") ;;
+        b:?*) backlog+=("${k#b:}") ;;
+        w:@*) wins+=("${k#w:}") ;;
+        r:@*) pend+=("${k#r:}") ;;
+        esac
+    done
+    case "$key" in
+    ctrl-s)
+        [ "${#backlog[@]}" -gt 0 ] && set_pins pin "${backlog[@]}" >/dev/null
+        [ "${#pinned[@]}" -gt 0 ] && set_pins unpin "${pinned[@]}" >/dev/null
+        ;;
+    ctrl-x)
+        [ "${#pinned[@]}" -gt 0 ] && do_pin unpin "${pinned[@]}"
+        [ "${#backlog[@]}" -gt 0 ] && do_forget "${backlog[@]}"
+        [ "${#wins[@]}" -gt 0 ] && stash_sh kill-many "${wins[@]}" </dev/null
+        [ "${#pend[@]}" -gt 0 ] \
+            && notify_user ${client_tty:+-c "$client_tty"} -k info -- "already back on the bar — close it there"
+        ;;
+    *)
+        if [ "$((${#pinned[@]} + ${#backlog[@]}))" -gt 0 ]; then
+            do_reopen "$client_sess" "$client_tty" ${pinned[@]+"${pinned[@]}"} ${backlog[@]+"${backlog[@]}"}
+        fi
+        local w
+        for w in ${wins[@]+"${wins[@]}"} ${pend[@]+"${pend[@]}"}; do
+            stash_sh unstash "$w" "$client_tty" </dev/null
+        done
+        ;;
+    esac
+    return 0
+}
+
+# The preview for one picker key: an entry's snapshot from its close, a stash
+# window's screen as `stash.sh preview` shows it (the live pane, or for a
+# legacy suspended window — a dead shell by now — the snapshot taken when its
+# agent was suspended; the live pane when there is no stash.sh), trailing
+# blank rows dropped so the followed preview lands on real output, a heading
+# nothing. A bare id is an entry.
 do_preview() {
-    local f="$PREVIEWS/${1:-}.ansi"
+    local k="${1:-}"
+    case "$k" in
+    ''|-) return 0 ;;
+    [wr]:@*)
+        local w=${k#?:} scr=""
+        if [ -f "$STASH_SH" ]; then
+            scr=$(stash_sh preview "$w" </dev/null 2>/dev/null)
+        else
+            # An empty target is the CURRENT pane, not a no-op — never -t ''.
+            scr=$(tmux capture-pane -ep -t "$w" 2>/dev/null)
+        fi
+        [ -n "$scr" ] || { echo "(gone)"; return 0; }
+        printf '%s\n' "$scr" | perl -e '
+            my @l = <STDIN>;
+            while (@l && $l[-1] =~ /^(?:\e\[[0-9;:]*[A-Za-z]|\s)*$/) { pop @l }
+            print @l;'
+        return 0 ;;
+    [pb]:*) k=${k#?:} ;;
+    esac
+    local f="$PREVIEWS/$k.ansi"
     if [ -s "$f" ]; then cat "$f"; else echo "(no snapshot)"; fi
 }
 
 do_list() {
     [ -s "$HISTORY" ] || { echo "(empty)"; return 0; }
-    jq -r '"\(.ts | strflocaltime("%m-%d %H:%M"))  \(.session):\(.index)  \(if .tool == "" then "-" else .tool end)\t\(.label)\t\(.cwd)\(if .desc then "\n    \(.desc)" else "" end)"' "$HISTORY" | tail -r
+    jq -r '"\(.ts | strflocaltime("%m-%d %H:%M"))  \(.session):\(.index)  \(if .tool == "" then "-" else .tool end)\(if .pinned == true then "  [stashed]" else "" end)\t\(.label)\t\(.cwd)\(if .desc then "\n    \(.desc)" else "" end)"' "$HISTORY" | tail -r
 }
 
 case "${1:-}" in
@@ -1352,9 +1858,14 @@ ask-space)  shift; ask_space "$@" ;;
 ask-space-yes) shift; do_ask_space_yes "$@" ;;
 pick-popup) shift; do_pick_popup "$@" ;;
 pick)       shift; do_pick "$@" ;;
+pick-rows)  shift; pick_rows "$@" ;;
+pick-act)   shift; do_pick_act "$@" ;;
 preview)    shift; do_preview "$@" ;;
 reopen)     shift; do_reopen "$@" ;;
+pin)        shift; do_pin pin "$@" ;;
+unpin)      shift; do_pin unpin "$@" ;;
 forget)     shift; do_forget "$@" ;;
+pinned-json) do_pinned_json ;;
 describe)   shift; do_describe "$@" ;;
 summarize)  shift; do_summarize "$@" ;;
 list)       do_list ;;

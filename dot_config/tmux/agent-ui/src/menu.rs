@@ -175,6 +175,8 @@ impl Source {
         let keys = if self.persist { Some(&mut self.keys) } else { None };
         let mut d = Data::build_with(&self.core.snapshot, self.client.as_deref(), text::now(), &self.core.collator,
             Some(&mut self.core.git), actions::watcher_age(), &mut self.core.slots, keys);
+        // The stashed agents that are no window: Parked rows of their own.
+        d.view.add_stashed(self.core.stashed.entries());
         let writes = std::mem::take(&mut d.key_writes);
         if self.persist && !writes.is_empty() {
             store_keys(&self.core.tmux, writes);
@@ -271,7 +273,11 @@ fn once(tmux: Tmux, a: &Args, w: u16, h: u16) -> ExitCode {
     let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
     render(&mut menu, &mut buf, text::now());
     if let Some(PeekWant { target, n }) = menu.peek_want() {
-        if let Some(win) = src.core.snapshot.row_in(&target.win, &target.session) {
+        if let Some(id) = crate::stashed::entry_id(&target.win) {
+            let lines = src.core.stashed.preview(id, n);
+            menu.peek_result(target.win, target.session, PeekData { lines, n });
+            render(&mut menu, &mut buf, text::now());
+        } else if let Some(win) = src.core.snapshot.row_in(&target.win, &target.session) {
             let lines = Actions::new(tmux).peek(win, n);
             menu.peek_result(target.win, target.session, PeekData { lines, n });
             render(&mut menu, &mut buf, text::now());
@@ -460,6 +466,7 @@ fn interactive(tmux: Tmux, client: String, tab: Tab) -> io::Result<()> {
 
     let (tx, rx) = mpsc::channel::<Msg>();
     spawn_reader(tx.clone());
+    let entry_tx = tx.clone();
     let peeker = spawn_peeker(actions, tx);
     let mut reader = KeyReader::new();
     let mut queue: VecDeque<Msg> = VecDeque::new();
@@ -545,7 +552,11 @@ fn interactive(tmux: Tmux, client: String, tab: Tab) -> io::Result<()> {
         }
         if let (Some(due), Some(PeekWant { target, n })) = (peek_due, &want) {
             if now >= due {
-                if let Some(win) = live.snap.row_in(&target.win, &target.session) {
+                if let Some(id) = crate::stashed::entry_id(&target.win) {
+                    // A stashed entry has no pane: the snapshot closed-tabs.sh kept.
+                    let lines = src.core.stashed.preview(id, *n);
+                    let _ = entry_tx.send(Msg::Peek(target.win.clone(), target.session.clone(), PeekData { lines, n: *n }));
+                } else if let Some(win) = live.snap.row_in(&target.win, &target.session) {
                     let _ = peeker.send((win.clone(), target.session.clone(), *n));
                 }
                 peek_due = Some(now + PEEK_EVERY);

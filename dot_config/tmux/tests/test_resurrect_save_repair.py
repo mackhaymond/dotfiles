@@ -196,6 +196,20 @@ class SaveRepairTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "verified against its live shell"):
             self.repaired()
 
+    def test_stash_panes_are_saved_with_no_process_command(self):
+        # Nothing in the stash is running: a frozen job's command must not be
+        # restored, so a restart brings parked panes back as plain shells.
+        self.layout = (self.row("main", 7).replace("\tzsh\t:\n", "\tnode\t:npm run dev\n")
+                       + "pane\tstash\t1\t0\t:\t1\tTitle\t:/shared\t1\tzsh\t:python3 -m http.server 0\n"
+                       + "pane\tstash\t2\t0\t:\t1\tTitle\t:/shared\t1\tzsh\t:\n")
+        _, layout, _, report = self.repaired()
+        rows = [row.split("\t") for row in layout.decode().splitlines()]
+        self.assertEqual(rows[0][10], ":npm run dev")            # not parked: untouched
+        self.assertEqual(rows[1][10], ":")
+        self.assertEqual(rows[1][:10], self.layout.splitlines()[1].split("\t")[:10])
+        self.assertEqual(rows[2], self.layout.splitlines()[2].split("\t"))
+        self.assertEqual(report["parked_commands"], 1)
+
     def test_parked_cwd_never_applies_to_unverified_or_other_panes(self):
         pane = dict(target="stash:1.1", cwd="/home", active="1", command="zsh", pid="201",
                     stash_session="parked-id", stash_pane_idx="1", stash_cwd=str(self.root))

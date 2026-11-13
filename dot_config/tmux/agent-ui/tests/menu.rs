@@ -61,6 +61,12 @@ impl Server {
         self.dir.join("calls.log")
     }
 
+    /// The closed-tabs history the menu reads its stashed entries from
+    /// (never Mack's own): absent unless a test writes it.
+    fn history(&self) -> PathBuf {
+        self.dir.join("history.jsonl")
+    }
+
     fn calls(&self) -> String {
         std::fs::read_to_string(self.log()).unwrap_or_default()
     }
@@ -120,8 +126,8 @@ impl Server {
     fn menu(&self, extra: &str) -> String {
         let trace = self.dir.join("trace");
         let cmd = format!(
-            "AGENT_UI_SCRIPTS='{}' AGENT_UI_MENU_TRACE='{}' '{}' menu --client {FAKE_TTY} {extra}",
-            self.dir.join("scripts").display(), trace.display(), BIN
+            "AGENT_UI_SCRIPTS='{}' AGENT_UI_MENU_TRACE='{}' AGENT_UI_CLOSED_TABS_HISTORY='{}' '{}' menu --client {FAKE_TTY} {extra}",
+            self.dir.join("scripts").display(), trace.display(), self.history().display(), BIN
         );
         self.tmux(&["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "=boot:", "-n", "menu", &cmd])
     }
@@ -177,6 +183,7 @@ fn once(s: &Server, args: &[&str]) -> String {
     let mut c = Command::new(BIN);
     c.args(["--socket", &s.name, "menu", "--plain"]).args(args).env_remove("TMUX");
     c.env("AGENT_UI_SCRIPTS", s.dir.join("scripts"));
+    c.env("AGENT_UI_CLOSED_TABS_HISTORY", s.history());
     let o = c.output().unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     String::from_utf8(o.stdout).unwrap()
@@ -248,6 +255,53 @@ fn once_renders_the_server_and_runs_nothing() {
     for w in [&ask, &run, &fail, &parked] {
         assert_eq!(s.key(w), "", "--once wrote @agent_key on {w}");
     }
+}
+
+/// The stashed agents of closed-tabs.sh's history (its pinned lines) are
+/// Parked rows beside the stash windows: suspended, their harness's mark,
+/// the picker's title (a generic label gives way to the desc), aged from
+/// `stashed_ts`, the oldest stashed first; a garbled or unpinned line is no
+/// row; a frozen stash window says frozen. Nothing runs.
+#[test]
+fn once_lists_stashed_entries() {
+    let s = Server::start("stashed");
+    let [_, _, _, parked] = s.fixture();
+    s.tmux(&["set-option", "-w", "-t", &parked, "@stash_frozen", "0 4242 vim /tmp"]);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let history = [
+        format!(r#"{{"id":"{a}-1","ts":{a},"session":"work","index":3,"cwd":"/tmp/proj","label":"New Session","tool":"claude","session_id":"s1","cmd":"claude --resume s1","desc":"Fix the parser","pinned":true,"stashed_ts":{b}}}"#,
+            a = now - 600, b = now - 120),
+        "{\"id\":\"garbled".to_string(),
+        format!(r#"{{"id":"{a}-2","ts":{a},"session":"main","index":1,"cwd":"/tmp","label":"zsh","tool":"","session_id":"","cmd":""}}"#, a = now - 60),
+        format!(r#"{{"id":"{a}-3","ts":{a},"session":"main","index":5,"cwd":"/tmp/q","label":"proj/Codex thing","tool":"codex","session_id":"s3","cmd":"codex resume s3","pinned":true,"stashed_ts":{a}}}"#,
+            a = now - 7200),
+        // A plain shell kept from the picker (no tool): a kept shell.
+        format!(r#"{{"id":"{a}-4","ts":{a},"session":"main","index":6,"cwd":"/tmp/keep","label":"zsh","tool":"","session_id":"","cmd":"","pinned":true,"stashed_ts":{a}}}"#,
+            a = now - 30),
+    ];
+    std::fs::write(s.history(), history.join("\n") + "\n").unwrap();
+    let f = once(&s, &["--once", "110x34", "--client", FAKE_TTY]);
+    assert!(f.lines().next().unwrap().contains("▪ 4 parked"), "{f}");
+    assert!(f.contains("▪ 4 parked ⇥"), "{f}");
+    let f = once(&s, &["--once", "110x34", "--tab", "parked"]);
+    let l: Vec<&str> = f.lines().collect();
+    let row = |needle: &str| *l.iter().find(|x| x.contains(needle)).unwrap_or_else(|| panic!("{needle}: {f}"));
+    let claude = agent_ui::model::Harness::named("claude").glyph();
+    let codex = agent_ui::model::Harness::named("codex").glyph();
+    let fix = row("Fix the parser");
+    assert!(fix.contains(&format!("{claude} Fix the parser")) && fix.contains("suspended · work") && fix.contains("2m"), "{fix}");
+    let cx = row("proj/Codex thing");
+    assert!(cx.contains(&format!("{codex} proj/Codex thing")) && cx.contains("suspended · main") && cx.contains("2h"), "{cx}");
+    let keep = row("shell in keep (main:6)");
+    assert!(keep.contains("❯ shell in keep") && keep.contains("kept shell · main") && !keep.contains("suspended"), "{keep}");
+    let pitch = row("Pitch deck v2");
+    assert!(pitch.contains("▪ Pitch deck v2") && pitch.contains("frozen · bai"), "{pitch}");
+    // The window first (no @stash_ts), then the entries, oldest stashed first.
+    let at = |needle: &str| l.iter().position(|x| x.contains(needle)).unwrap();
+    assert!(at("Pitch deck v2") < at("proj/Codex thing") && at("proj/Codex thing") < at("Fix the parser"), "{f}");
+    assert!(!f.contains("garbled") && !f.contains("shell in tmp"), "{f}");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(s.calls(), "", "--once ran something");
 }
 
 #[test]
@@ -329,6 +383,8 @@ fn live_effects_through_the_state_machine() {
     let [ask, _, fail, parked] = s.fixture();
     let tmux = s.tmux_handle();
     let mut src = Source::new(tmux.clone(), Some(FAKE_TTY.into()));
+    // (In process: never Mack's own stash.)
+    src.core.stashed = agent_ui::stashed::Stash::at(Some(s.history()));
     let mut menu = Menu::new(src.load(), Tab::All);
     let actions = Actions { tmux: tmux.clone(), scripts: s.dir.join("scripts") };
     let mut live = Live { actions, client: FAKE_TTY.into(), snap: src.core.snapshot.clone() };

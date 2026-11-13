@@ -294,6 +294,8 @@ fn dump_json_over_a_real_server() {
     let (free_ids, nl_dir) = free_text_fixture(&s);
     let mut c = Command::new(BIN);
     c.args(["--socket", &s.name, "dump", "--json", "--client", "/dev/ttys999"]).env_remove("TMUX");
+    // (Never Mack's own stash: no stashed entries here.)
+    c.env("AGENT_UI_CLOSED_TABS_HISTORY", "/nonexistent/history.jsonl");
     let v = json::parse(&run(c)).expect("dump is JSON");
     assert_eq!(v.get("client_gone").and_then(Value::as_bool), Some(true));
     let names: Vec<&str> = v.get("spaces").unwrap().as_array().unwrap().iter().map(|x| x.get("name").unwrap().as_str().unwrap()).collect();
@@ -409,6 +411,16 @@ fn actions_reach_the_test_server_only() {
     actions.go(&snap, "/dev/ttys999", &parked, "stash").unwrap();
     let log = wait_for(&out, "stash.sh unstash");
     assert!(log.contains(&format!("stash.sh unstash {parked} /dev/ttys999")), "{log}");
+    // A stashed entry (no window): reopened, then discarded (unpinned into
+    // the backlog), through closed-tabs.sh, on the test server. The fake
+    // client has no row: no session of its own to land in.
+    actions.go(&snap, "/dev/ttys999", "entry:1790000100-12", "stash").unwrap();
+    let log = wait_for(&out, "closed-tabs.sh reopen");
+    assert!(log.contains("closed-tabs.sh reopen  /dev/ttys999 1790000100-12"), "{log}");
+    assert_eq!(actions.close(&snap, "/dev/ttys999", "entry:1790000100-12", "stash").unwrap(), "discarded · ⌘Z brings it back");
+    let log = wait_for(&out, "closed-tabs.sh unpin");
+    assert!(log.contains("closed-tabs.sh unpin 1790000100-12"), "{log}");
+    assert!(!log.lines().filter(|l| l.contains(".sh ")).any(|l| l.contains("entry:")), "an entry id went out as a window: {log}");
     // park refuses a parked tab; close on a split without an agent refuses to guess.
     assert_eq!(actions.park(&snap, &parked, "stash").unwrap_err(), "already parked");
     assert_eq!(actions.close(&snap, "/dev/ttys999", &split, "main").unwrap_err(), PANE_UNSURE);

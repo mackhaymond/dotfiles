@@ -20,7 +20,9 @@
 //!   own ([`Space::pending`]), at that number, in its `@pending_color`, its
 //!   one agent the claude ([`Agent::pending`]). The session's other windows
 //!   (none, normally) stay as before.
-//! - `parked`: the stash's windows by index.
+//! - `parked`: the stash's windows by index; a UI with a [`Core`] merges in
+//!   the stashed entries (closed-tabs.sh's pinned history, no window) by
+//!   stash age ([`ViewModel::add_stashed`]).
 //! - `log`: the newest events, newest first.
 //! - `counts`: the header's per-state counts over every shown session
 //!   (stash and HIDDEN excluded), each window id once.
@@ -675,6 +677,12 @@ pub fn fold_after(raw: &str) -> i64 {
     }
 }
 
+/// A window name that is a shell process (tmux's automatic name: the
+/// foreground command, a login shell's leading `-` dropped).
+pub fn is_shell_name(name: &str) -> bool {
+    matches!(name.trim().trim_start_matches('-'), "zsh" | "bash" | "sh" | "fish")
+}
+
 /// A shell's label, as spaces.conf's `@space_shell_label`: a shell process
 /// shows where it is (`~`, or the cwd's last part), anything else its name
 /// (tmux's automatic name: the command). The window name stands in for
@@ -685,7 +693,7 @@ pub fn fold_after(raw: &str) -> i64 {
 pub fn shell_label(w: &Window) -> String {
     let name = w.name.trim();
     let dash_active = w.pane_list.iter().any(|p| p.dash && p.active);
-    if dash_active || matches!(name.trim_start_matches('-'), "zsh" | "bash" | "sh" | "fish") {
+    if dash_active || is_shell_name(name) {
         let home = std::env::var("HOME").unwrap_or_default();
         // Unknown (no path) shows the name; `/` trims to "" but is a real
         // cwd, labelled `/` as `#{b:pane_current_path}` does (2026-10-22).
@@ -778,22 +786,118 @@ impl Space {
     }
 }
 
-/// A parked (stash) window.
+/// A PARKED row: a `stash` window, or a STASHED agent that is no window any
+/// more (a pinned closed-tabs.sh history entry, [`crate::stashed`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Parked {
+    /// The row as an agent. An entry's is built from a stand-in window:
+    /// window id [`crate::stashed::ENTRY_PREFIX`]`<id>`, session `stash`,
+    /// its title, cwd and tool (its harness mark).
     pub agent: Agent,
-    /// @stash_origin: the session it came from.
+    /// @stash_origin (an entry: its `session`): the space it came from.
     pub origin: String,
-    /// @stash_session set: the agent was suspended (resumes on unpark).
+    /// Suspended: comes back resumed (an entry: `closed-tabs.sh reopen`; a
+    /// window with @stash_session, the older suspend: `stash.sh unstash`).
     pub suspended: bool,
-    /// The row's state words: the agent state, else "suspended" / "parked".
+    /// The row's state words ([`parked_words`]): frozen, cold, the agent
+    /// state, suspended, else idle shell.
     pub state_words: String,
-    /// @stash_ts, and the age shown (stash time, else @agent_since).
+    /// @stash_ts (an entry: `stashed_ts`, else its close time), and the age
+    /// shown (stash time, else @agent_since).
     pub parked_at: Option<i64>,
     pub age: String,
+    /// The pinned history entry this row is; None for a stash window.
+    pub entry: Option<String>,
+    /// @stash_frozen is set: its foreground jobs are stopped (unpark `fg`s them).
+    pub frozen: bool,
+    /// @stash_cold is set: frozen before a restart; its process is gone,
+    /// its command kept (unpark re-runs it).
+    pub cold: bool,
 }
 
+/// The words a parked row's state says (the menu's Parked tab), the first
+/// that holds: `cold` (@stash_cold), `frozen` (@stash_frozen: a stopped
+/// job's state outranks any agent state left on the window), the agent's
+/// own state words, `suspended` (@stash_session, the older suspend), `idle
+/// shell` when its foreground is a shell ([`is_shell_name`]: the window's
+/// automatic name stands in for `pane_current_command`), else `running`: a
+/// program parked under the OLD rules (before freezing) still runs there.
+pub fn parked_words(w: &Window, agent_words: &str) -> String {
+    let words = if !w.stash_cold.trim().is_empty() {
+        "cold"
+    } else if !w.stash_frozen.trim().is_empty() {
+        "frozen"
+    } else if !w.state.is_empty() {
+        agent_words
+    } else if !w.stash_session.is_empty() {
+        "suspended"
+    } else if is_shell_name(&w.name) {
+        "idle shell"
+    } else {
+        "running"
+    };
+    words.to_string()
+}
+
+/// What a stashed entry with no tool says: a plain shell kept on the shelf
+/// (the picker's ⌃s on a shell's entry), nothing to resume.
+pub const KEPT_SHELL: &str = "kept shell";
+
 impl Parked {
+    /// A `stash` window's row.
+    pub fn of_window(w: &Window, a: Agent, now: f64) -> Parked {
+        let when = w.stash_t.or(w.since_t);
+        Parked {
+            origin: text::sanitize(&w.stash_origin),
+            suspended: !w.stash_session.is_empty(),
+            state_words: parked_words(w, a.state_words),
+            parked_at: w.stash_t,
+            age: text::ago(when, now),
+            entry: None,
+            frozen: !w.stash_frozen.trim().is_empty(),
+            cold: !w.stash_cold.trim().is_empty(),
+            agent: a,
+        }
+    }
+
+    /// A stashed entry's row: a suspended agent, titled as closed-tabs.sh's
+    /// picker titles it ([`crate::stashed::pick_title`]), its harness mark
+    /// the entry's tool (abby told apart), its age the time it was stashed.
+    /// An entry with no tool is a plain shell kept: [`KEPT_SHELL`], never
+    /// suspended (the menu draws it with the shell's prompt mark).
+    pub fn of_entry(e: &crate::stashed::StashEntry, blink: bool, now: f64) -> Parked {
+        let agent_entry = !e.tool.trim().is_empty();
+        let (title, rest) = e.title();
+        let when = e.when();
+        let w = Window {
+            session: HOLD.into(),
+            id: e.window_id(),
+            name: e.tool.clone(),
+            label: title,
+            detail: rest,
+            path: e.cwd.clone(),
+            kind: e.tool.clone(),
+            harness: e.harness().to_string(),
+            stash_origin: e.session.clone(),
+            stash_t: Some(when),
+            since_t: Some(when),
+            panes: 1,
+            ..Window::default()
+        };
+        let agent = Agent::from_window(&w, blink, None, now);
+        Parked {
+            origin: text::sanitize(&e.session),
+            suspended: agent_entry,
+            state_words: if agent_entry { "suspended" } else { KEPT_SHELL }.into(),
+            parked_at: Some(when),
+            age: text::ago(Some(when), now),
+            entry: Some(e.id.clone()),
+            frozen: false,
+            cold: false,
+            agent,
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         let mut v = self.agent.to_json();
         if let Value::Obj(kv) = &mut v {
@@ -802,6 +906,9 @@ impl Parked {
             kv.push(("parked_state".into(), self.state_words.as_str().into()));
             kv.push(("parked_at".into(), self.parked_at.into()));
             kv.push(("parked_age".into(), self.age.as_str().into()));
+            kv.push(("entry".into(), self.entry.clone().into()));
+            kv.push(("frozen".into(), self.frozen.into()));
+            kv.push(("cold".into(), self.cold.into()));
         }
         v
     }
@@ -1070,26 +1177,7 @@ impl ViewModel {
 
         let mut parked_ws: Vec<&Window> = snap.windows.iter().filter(|w| w.session == HOLD).collect();
         parked_ws.sort_by_key(|w| w.index);
-        let parked = parked_ws
-            .into_iter()
-            .map(|w| {
-                let a = agent(w);
-                let words = if w.state.is_empty() {
-                    if w.stash_session.is_empty() { "parked" } else { "suspended" }.to_string()
-                } else {
-                    a.state_words.to_string()
-                };
-                let when = w.stash_t.or(w.since_t);
-                Parked {
-                    origin: text::sanitize(&w.stash_origin),
-                    suspended: !w.stash_session.is_empty(),
-                    state_words: words,
-                    parked_at: w.stash_t,
-                    age: text::ago(when, now),
-                    agent: a,
-                }
-            })
-            .collect();
+        let parked = parked_ws.into_iter().map(|w| Parked::of_window(w, agent(w), now)).collect();
 
         ViewModel {
             now,
@@ -1225,6 +1313,30 @@ impl ViewModel {
         v
     }
 
+    /// The STASHED entries ([`crate::stashed`]) merged into `parked`, each
+    /// once ([`Parked::of_entry`]). The windows keep their order (by window
+    /// index); the entries go in oldest stashed first, each before the first
+    /// window parked after it (a window without `@stash_ts` never moves an
+    /// entry ahead of it), so the list reads by stash age wherever the
+    /// windows do. Calling it again replaces the entries, never doubles them.
+    pub fn add_stashed(&mut self, entries: &[crate::stashed::StashEntry]) {
+        self.parked.retain(|p| p.entry.is_none());
+        if entries.is_empty() {
+            return;
+        }
+        let mut es: Vec<Parked> = entries.iter().map(|e| Parked::of_entry(e, self.blink, self.now)).collect();
+        es.sort_by(|a, b| a.parked_at.cmp(&b.parked_at).then_with(|| a.entry.cmp(&b.entry)));
+        let windows = std::mem::take(&mut self.parked);
+        let mut es = es.into_iter().peekable();
+        for w in windows {
+            while let Some(e) = es.next_if(|e| w.parked_at.is_some_and(|t| e.parked_at.is_some_and(|et| et < t))) {
+                self.parked.push(e);
+            }
+            self.parked.push(w);
+        }
+        self.parked.extend(es);
+    }
+
 
     pub fn to_json(&self) -> Value {
         obj![
@@ -1254,6 +1366,9 @@ pub struct Core {
     pub snapshot: Snapshot,
     /// The provisional slots this UI has shown, across frames.
     pub slots: SlotMemo,
+    /// The stashed entries (closed-tabs.sh's pinned history), read again
+    /// only when the file changed: the Parked rows that are no window.
+    pub stashed: crate::stashed::Stash,
 }
 
 impl Core {
@@ -1268,6 +1383,7 @@ impl Core {
             log_limit: 50,
             snapshot: Snapshot::default(),
             slots: SlotMemo::default(),
+            stashed: crate::stashed::Stash::from_env(),
         }
     }
 
@@ -1286,7 +1402,7 @@ impl Core {
     pub fn rebuild(&mut self, client: Option<&str>) -> ViewModel {
         let now = text::now();
         let log = self.events.newest(self.log_limit);
-        ViewModel::build_with(
+        let mut v = ViewModel::build_with(
             &self.snapshot,
             BuildArgs {
                 client,
@@ -1297,7 +1413,9 @@ impl Core {
                 watcher_age: crate::actions::watcher_age(),
             },
             &mut self.slots,
-        )
+        );
+        v.add_stashed(self.stashed.entries());
+        v
     }
 }
 
@@ -1463,6 +1581,86 @@ mod tests {
         assert_eq!((v.parked[1].state_words.as_str(), v.parked[1].suspended), ("suspended", true));
         assert_eq!((v.parked[1].origin.as_str(), v.parked[1].age.as_str()), ("main", "8m"));
         assert_eq!(v.parked[0].state_words, "waiting on you");
+        assert!(v.parked.iter().all(|p| p.entry.is_none() && !p.frozen && !p.cold));
+    }
+
+    /// A stash window's state: cold (`@stash_cold`) over frozen
+    /// (`@stash_frozen`) over the agent's own state, then the older suspend
+    /// (`@stash_session`), else an idle shell; and the JSON says which.
+    #[test]
+    fn parked_window_states() {
+        let rows = [
+            row("stash", 1, "@1", &[("stash_frozen", "0 4242 python3 -m http.server /tmp"), ("stash_ts", "900")]),
+            row("stash", 2, "@2", &[("stash_frozen", "0 4242 vim /tmp"), ("stash_cold", "1")]),
+            row("stash", 3, "@3", &[("stash_label", "Shell")]),
+            row("stash", 4, "@4", &[("stash_session", "sid")]),
+            row("stash", 5, "@5", &[("state", "idle"), ("stash_frozen", " ")]),
+            row("stash", 6, "@6", &[("state", "idle"), ("stash_frozen", "0 1 btop /")]),
+            // Parked under the old rules, still running (its name: the command).
+            row("stash", 7, "@7", &[("name", "btop")]),
+            row("stash", 8, "@8", &[("name", "-bash")]),
+        ];
+        let v = ViewModel::build(&Snapshot::parse(&rows.join("\n")), BuildArgs { client: None, now: 1000.0,
+            collator: &Collator::new("C"), git: None, log: vec![], watcher_age: None });
+        let got: Vec<(&str, bool, bool)> = v.parked.iter().map(|p| (p.state_words.as_str(), p.frozen, p.cold)).collect();
+        assert_eq!(got, [("frozen", true, false), ("cold", true, true), ("idle shell", false, false), ("suspended", false, false),
+            ("idle", false, false), ("frozen", true, false), ("running", false, false), ("idle shell", false, false)]);
+        assert_eq!(v.parked[0].age, "1m");
+        let j = v.parked[1].to_json();
+        assert_eq!((j.get("parked_state").and_then(Value::as_str), j.get("cold").and_then(Value::as_bool)), (Some("cold"), Some(true)));
+        assert_eq!(j.get("entry"), Some(&Value::Null));
+    }
+
+    /// The stashed entries (closed-tabs.sh's pinned history) are Parked rows
+    /// of their own: suspended, titled as the picker titles them, their
+    /// harness's mark, aged from `stashed_ts`, merged in by stash age (the
+    /// windows keep their index order); a garbled line is no row; adding
+    /// them again replaces them.
+    #[test]
+    fn stashed_entries_join_parked() {
+        let now = 1_790_001_000.0;
+        let rows = [
+            row("stash", 1, "@1", &[("stash_label", "Old"), ("stash_ts", "1790000000")]),
+            row("stash", 2, "@2", &[("stash_label", "Mid"), ("stash_ts", "1790000400")]),
+            row("stash", 3, "@3", &[("stash_label", "New"), ("stash_ts", "1790000900")]),
+            row("main", 1, "@4", &[("state", "idle")]),
+        ];
+        let mut v = ViewModel::build(&Snapshot::parse(&rows.join("\n")), BuildArgs { client: None, now,
+            collator: &Collator::new("C"), git: None, log: vec![], watcher_age: None });
+        let es = crate::stashed::parse_pinned(crate::stashed::tests::HISTORY);
+        v.add_stashed(&es);
+        let order: Vec<&str> = v.parked.iter().map(|p| p.agent.window_id.as_str()).collect();
+        // Entry 13 stashed at …300, entry 12 at …500: between the windows.
+        assert_eq!(order, ["@1", "entry:1790000200-13", "@2", "entry:1790000100-12", "@3"]);
+        let p = &v.parked[3];
+        assert_eq!((p.entry.as_deref(), p.suspended, p.state_words.as_str()), (Some("1790000100-12"), true, "suspended"));
+        // "New Session" is generic: the desc is its title.
+        assert_eq!((p.agent.title.as_str(), p.origin.as_str(), p.age.as_str()), ("Fix the parser", "work", "8m"));
+        assert_eq!((p.agent.session.as_str(), p.agent.path.as_str(), p.parked_at), (HOLD, "/tmp/proj", Some(1_790_000_500)));
+        assert_eq!((p.agent.harness, p.agent.kind_glyph, p.agent.cat), (model::Harness::named("claude"), Some("✳"), None));
+        // A specific label keeps the lead; abby told apart by its command.
+        let q = &v.parked[1];
+        assert_eq!((q.agent.title.as_str(), q.agent.harness, q.age.as_str()), ("proj/Canvas sync", model::Harness::named("abby"), "11m"));
+        let j = p.to_json();
+        assert_eq!(j.get("entry").and_then(Value::as_str), Some("1790000100-12"));
+        // A plain shell kept (no tool): a kept shell, not suspended.
+        let sh = crate::stashed::StashEntry::parse(
+            r#"{"id":"7-7","ts":1790000000,"session":"main","index":2,"cwd":"/tmp/q","label":"zsh","tool":"","pinned":true}"#).unwrap();
+        let k = Parked::of_entry(&sh, false, now);
+        assert_eq!((k.state_words.as_str(), k.suspended, k.agent.title.as_str()), (KEPT_SHELL, false, "shell in q (main:2)"));
+        assert_eq!(k.agent.harness, model::Harness::OTHER);
+        // Again: replaced, never doubled; none: the windows alone.
+        v.add_stashed(&es);
+        assert_eq!(v.parked.len(), 5);
+        v.add_stashed(&[]);
+        assert_eq!(v.parked.iter().map(|p| p.agent.window_id.as_str()).collect::<Vec<_>>(), ["@1", "@2", "@3"]);
+        // Windows without a stash time never let an entry ahead of them.
+        let bare = [row("stash", 1, "@1", &[]), row("stash", 2, "@2", &[])];
+        let mut v = ViewModel::build(&Snapshot::parse(&bare.join("\n")), BuildArgs { client: None, now,
+            collator: &Collator::new("C"), git: None, log: vec![], watcher_age: None });
+        v.add_stashed(&es);
+        let order: Vec<&str> = v.parked.iter().map(|p| p.agent.window_id.as_str()).collect();
+        assert_eq!(order, ["@1", "@2", "entry:1790000200-13", "entry:1790000100-12"]);
     }
 
     /// A shell at the filesystem root is `/` (as `#{b:pane_current_path}`),

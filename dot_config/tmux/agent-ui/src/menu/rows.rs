@@ -216,6 +216,11 @@ impl Target {
         self.session == HOLD
     }
 
+    /// A STASHED entry's row (parked, no window: [`crate::stashed`]).
+    pub fn entry(&self) -> bool {
+        crate::stashed::entry_id(&self.win).is_some()
+    }
+
     pub fn place(&self) -> String {
         format!("{}:{}", self.session, self.index)
     }

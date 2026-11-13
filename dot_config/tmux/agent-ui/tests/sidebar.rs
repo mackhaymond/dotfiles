@@ -77,6 +77,12 @@ impl Server {
     }
 
     fn sidebar(&self, args: &[&str]) -> String {
+        self.sidebar_with(args, std::path::Path::new("/nonexistent/history.jsonl"))
+    }
+
+    /// [`sidebar`](Self::sidebar) with its stashed entries read from the
+    /// closed-tabs history at `history` (never Mack's own).
+    fn sidebar_with(&self, args: &[&str], history: &std::path::Path) -> String {
         let o = Command::new(BIN)
             .args(["--socket", &self.name, "sidebar"])
             .args(args)
@@ -89,6 +95,7 @@ impl Server {
             .env("AGENT_UI_NO_INSIGHT", "1")
             // (Nor Mack's pause state: no pause banner here.)
             .env("AGENT_PAUSE_STATE_DIR", NO_PAUSE)
+            .env("AGENT_UI_CLOSED_TABS_HISTORY", history)
             .output()
             .expect("run agent-ui");
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -249,6 +256,34 @@ fn once_renders_the_fixture() {
     assert!(!lines.iter().any(|l| l.starts_with(" log") || l.contains('═')), "{lines:#?}");
     // `--split` (gone) is ignored, not an error.
     assert_eq!(plain(&s.sidebar(&["--once", "34x30", "--client", CLIENT, "--split", "0.7"])), lines);
+}
+
+/// PARKED counts the stashed agents of closed-tabs.sh's history (its pinned
+/// lines) beside the stash's windows; a garbled or unpinned line counts
+/// nothing, and a history that goes away takes them with it.
+#[test]
+fn once_counts_stashed_entries() {
+    let s = Server::start("stashed", 80, 24);
+    s.fixture();
+    s.agent("stash", 1, &[("state", "idle"), ("summary", "Parked tab")]);
+    let dir = std::env::temp_dir().join(format!("agentui-sb-stashed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let history = dir.join("history.jsonl");
+    std::fs::write(&history, concat!(
+        r#"{"id":"1790000100-12","ts":1790000100,"session":"work","index":3,"cwd":"/tmp","label":"New Session","tool":"claude","desc":"Fix the parser","pinned":true,"stashed_ts":1790000500}"#, "\n",
+        "{\"id\":\"half\n",
+        r#"{"id":"1790000200-13","ts":1790000200,"session":"work","index":4,"cwd":"/tmp","label":"zsh","tool":""}"#, "\n",
+        r#"{"id":"1790000300-14","ts":1790000300,"session":"zeta","index":1,"cwd":"/tmp","label":"proj/Other","tool":"codex","pinned":true,"stashed_ts":1790000600}"#, "\n",
+    )).unwrap();
+    let parked = |h: &std::path::Path| {
+        let lines = plain(&s.sidebar_with(&["--once", "34x30", "--client", CLIENT], h));
+        uncapped(&lines[spaces_at(&lines).1])
+    };
+    assert!(parked(&history).starts_with(" PARKED 3 "), "{:?}", parked(&history));
+    let _ = std::fs::remove_file(&history);
+    assert!(parked(&history).starts_with(" PARKED 1 "), "{:?}", parked(&history));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The scope end to end: a REAL client gives the sidebar its session and the

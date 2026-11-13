@@ -238,14 +238,18 @@ impl Tmux {
 /// (`@agent_harness`: the harness running the agent when `@agent_kind` does
 /// not say it, `abby` today; [`crate::model::Harness`]), and `thread_at`
 /// (`@thread_at`: when Mack last prompted the window himself, stamped by
-/// agent-tab-indicator.sh; the sidebar's dormant spaces and idle fold).
-pub const FIELDS: [&str; 45] = [
+/// agent-tab-indicator.sh; the sidebar's dormant spaces and idle fold), and
+/// `stash_frozen` / `stash_cold` (stash.sh's `@stash_frozen`: a parked
+/// tab whose foreground jobs it stopped; `@stash_cold`: such a tab after a
+/// restart, its process gone and its command kept: the Parked rows' state,
+/// [`crate::view::Parked`]).
+pub const FIELDS: [&str; 47] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
     "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home", "space_index",
     "space_hidden", "space_color", "stash_sel", "pane_flags", "rollout", "paused", "pinned", "session_id",
     "pin_key", "pending_space", "pending_request", "pending_color", "ask_bg", "limit", "limit_lifted",
-    "harness", "thread_at",
+    "harness", "thread_at", "stash_frozen", "stash_cold",
 ];
 
 /// The pane option space.sh sets (to 1) on a space home's dashboard pane
@@ -267,7 +271,7 @@ pub const PANE_FLAGS: &str =
 
 /// The tmux format of each FIELDS entry, in order. (`#{pane_current_path}`
 /// is printed by [`path_format`], dashboard-aware.)
-pub const FORMATS: [&str; 45] = [
+pub const FORMATS: [&str; 47] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
@@ -276,7 +280,8 @@ pub const FORMATS: [&str; 45] = [
     "#{@agent_mru_prev}", "#{@space_home}", "#{@space_index}", "#{@space_hidden}", "#{@space_color}", "#{@stash_sel}",
     PANE_FLAGS, "#{@agent_rollout}", "#{@agent_paused}", "#{@agent_pinned}", "#{@agent_session_id}",
     "#{@pin_key}", "#{@pending_space}", "#{@pending_request}", "#{@pending_color}", "#{@agent_ask_bg}",
-    "#{@agent_limit}", "#{@agent_limit_lifted}", "#{@agent_harness}", "#{@thread_at}",
+    "#{@agent_limit}", "#{@agent_limit_lifted}", "#{@agent_harness}", "#{@thread_at}", "#{@stash_frozen}",
+    "#{@stash_cold}",
 ];
 
 /// Ends each path in the dashboard case of [`path_format`] (a private-use
@@ -701,6 +706,13 @@ pub struct Window {
     /// seconds, digits only; None when unset or junk: a restore, an older
     /// window). agent-tab-indicator.sh stamps it on his own prompts only.
     pub thread_at: Option<i64>,
+    /// `@stash_frozen` (stash.sh: per pane, the stopped job's pane index,
+    /// pgid, argv and cwd), raw; "" = unset. Set: a parked tab whose
+    /// foreground jobs are stopped (unpark `fg`s them).
+    pub stash_frozen: String,
+    /// `@stash_cold`, raw; "" = unset. Set: a frozen tab after a restart:
+    /// its process is gone, its command kept (unpark re-runs it).
+    pub stash_cold: String,
 }
 
 fn digits(s: &str) -> bool {
@@ -792,6 +804,8 @@ impl Window {
             limit: crate::model::Limit::parse(p[41], p[42]),
             harness: p[43].trim().into(),
             thread_at: num(p[44].trim()),
+            stash_frozen: p[45].into(),
+            stash_cold: p[46].into(),
             label: label.into(),
             session,
         })
@@ -1164,28 +1178,45 @@ pub(crate) mod tests {
         assert_eq!((w.session.as_str(), w.label.as_str()), ("日本", "🫠 x\tz"));
     }
 
-    /// A row from an older format (44 fields, before `thread_at`; 43, before
+    /// A row from an older format (45 fields, before `stash_frozen` and
+    /// `stash_cold`; 44, before `thread_at`; 43, before
     /// `harness`; 41, before `limit` and `limit_lifted`; 40, before
     /// `ask_bg`; 37, before the pending space's options; 34, before
     /// `pinned`, `session_id` and `pin_key`) or one with a field too many is
     /// no window: never misread by position.
     #[test]
     fn rows_of_the_wrong_length_are_rejected() {
-        assert_eq!(FIELDS.len(), 45);
-        for n in [34, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46] {
+        assert_eq!(FIELDS.len(), 47);
+        for n in [34, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 48] {
             assert!(Window::parse(&vec!["x"; n].join("\x1f")).is_none(), "{n}");
         }
-        assert!(Window::parse(&vec!["x"; 45].join("\x1f")).is_some());
+        assert!(Window::parse(&vec!["x"; 47].join("\x1f")).is_some());
         assert_ne!(FIELDS.len(), CLIENT_FIELDS);
     }
 
-    /// `@thread_at` rides last in the same one format (no extra tmux call),
+    /// `@stash_frozen` and `@stash_cold` ride last in the same one format
+    /// (no extra tmux call), guarded like the other user options (a frozen
+    /// argv is free text), read raw; unset is "".
+    #[test]
+    fn stash_freeze_fields_are_last() {
+        assert_eq!((FIELDS[45], FORMATS[45]), ("stash_frozen", "#{@stash_frozen}"));
+        assert_eq!((FIELDS[46], FORMATS[46]), ("stash_cold", "#{@stash_cold}"));
+        assert!(fmt().ends_with(&format!("{}\x1f{}", guarded("#{@stash_frozen}"), guarded("#{@stash_cold}"))));
+        let argv = "0\x1f4242\x1fpython3 -m http.server\x1f/tmp/x";
+        let w = Window::parse(&row("stash", 1, "@1", &[("stash_frozen", &argv.replace('\x1f', &US_STANDIN.to_string())),
+            ("stash_cold", "1")])).unwrap();
+        assert_eq!((w.stash_frozen.as_str(), w.stash_cold.as_str()), (argv, "1"));
+        let w = Window::parse(&row("stash", 1, "@1", &[])).unwrap();
+        assert_eq!((w.stash_frozen.as_str(), w.stash_cold.as_str()), ("", ""));
+    }
+
+    /// `@thread_at` rides in the same one format (no extra tmux call),
     /// guarded like the other user options; digits only (trimmed), else
     /// None (unset, junk: the sidebar reads that as fresh).
     #[test]
     fn thread_at_field() {
         assert_eq!((FIELDS[44], FORMATS[44]), ("thread_at", "#{@thread_at}"));
-        assert!(fmt().ends_with(&guarded("#{@thread_at}")));
+        assert!(fmt().contains(&guarded("#{@thread_at}")));
         let at = |v: &str| Window::parse(&row("main", 1, "@1", &[("state", "idle"), ("thread_at", v)])).unwrap().thread_at;
         assert_eq!(at(" 1792400000 "), Some(1_792_400_000));
         assert_eq!((at(""), at("soon"), at("-5")), (None, None, None));
@@ -1246,8 +1277,9 @@ pub(crate) mod tests {
         assert_eq!(lim(" 0 model 5 ", " 9 "),
             Some(Limit { resets_at: 0, garbled: false, kind: "model".into(), since: Some(5), lifted: Some(9) }));
         assert_eq!(lim("soon", "yes"), Some(Limit { resets_at: 0, garbled: true, kind: "".into(), since: None, lifted: Some(0) }));
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}", guarded("#{@agent_limit}"), guarded("#{@agent_limit_lifted}"),
-            guarded("#{@agent_harness}"), guarded("#{@thread_at}"))));
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", guarded("#{@agent_limit}"),
+            guarded("#{@agent_limit_lifted}"), guarded("#{@agent_harness}"), guarded("#{@thread_at}"),
+            guarded("#{@stash_frozen}"), guarded("#{@stash_cold}"))));
     }
 
     /// A pending space's options: only a window of the `pending` session
@@ -1316,10 +1348,11 @@ pub(crate) mod tests {
             guarded("#{@space_hidden}"), guarded("#{@space_color}"), guarded("#{@stash_sel}"), guarded("#{@agent_rollout}"),
             guarded("#{@agent_paused}"), guarded("#{@agent_pinned}"), guarded("#{@agent_session_id}"), guarded("#{@pin_key}"))));
         // Then a pending space's options, the raised ask's flag, the limit
-        // and the harness, then Mack's last prompt.
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", guarded("#{@pending_space}"), guarded("#{@pending_request}"),
-            guarded("#{@pending_color}"), guarded("#{@agent_ask_bg}"), guarded("#{@agent_limit}"), guarded("#{@agent_limit_lifted}"),
-            guarded("#{@agent_harness}"), guarded("#{@thread_at}"))));
+        // and the harness, then Mack's last prompt, then the stash's freeze.
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", guarded("#{@pending_space}"),
+            guarded("#{@pending_request}"), guarded("#{@pending_color}"), guarded("#{@agent_ask_bg}"), guarded("#{@agent_limit}"),
+            guarded("#{@agent_limit_lifted}"), guarded("#{@agent_harness}"), guarded("#{@thread_at}"), guarded("#{@stash_frozen}"),
+            guarded("#{@stash_cold}"))));
         let s = Snapshot::parse(&row("main", 1, "@1", &[("rollout", "/x/rollout-1.jsonl")]));
         assert_eq!(s.windows[0].rollout, "/x/rollout-1.jsonl");
         let s = Snapshot::parse(&row("main", 1, "@1", &[("space_color", " #f9e2af "), ("stash_sel", "1")]));

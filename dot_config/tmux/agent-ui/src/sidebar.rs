@@ -282,6 +282,8 @@ fn build_view(core: &mut Core, client: Option<&str>, keys: Option<&mut KeyMemo>)
     let now = text::now();
     let args = BuildArgs { client, now, collator: &core.collator, git: None, log: Vec::new(), watcher_age: watcher_age() };
     let mut view = ViewModel::build_with(&core.snapshot, args, &mut core.slots);
+    // The stashed agents that are no window (PARKED's count holds them too).
+    view.add_stashed(core.stashed.entries());
     let persist = keys.is_some();
     let assigned = letters::of_view(&core.snapshot, &view, keys);
     let letter = |a: &mut crate::view::Agent| a.letter = assigned.letters.get(&a.window_id).copied();
@@ -935,9 +937,17 @@ impl App {
     /// A park in flight that a snapshot now shows in the stash: say so
     /// (stash.sh refuses some, a working agent or a session's last tab, and
     /// says why on the status line; then the `parking …` note just lapses).
+    /// A one-pane agent tab is parked by closing it into a stashed entry
+    /// (`closed-tabs.sh close --pin`): its window is gone and an entry was
+    /// stashed since the park was asked for.
     fn check_park(&mut self) {
         let Some((win, label, until)) = self.parking.clone() else { return };
-        if self.core.snapshot.row_in(&win, HOLD).is_some() {
+        let asked = until - PARK_WATCH - 1.0;
+        let stashed = || {
+            self.core.snapshot.rows(&win).next().is_none()
+                && self.core.stashed.cached().iter().any(|e| e.stashed_ts.is_some_and(|t| t as f64 >= asked))
+        };
+        if self.core.snapshot.row_in(&win, HOLD).is_some() || stashed() {
             self.parking = None;
             self.say(format!("parked {label}"));
         } else if text::now() > until {

@@ -64,6 +64,8 @@
 //!   and focus hand-back ([`WeztermLink`]).
 //! - [`pins`]: PINNED agents (`@agent_pinned`), toggled and kept across a
 //!   restore in `pins.json` by session id.
+//! - [`stashed`]: the stashed agents that are no window any more: the
+//!   pinned entries of closed-tabs.sh's history, listed as Parked rows.
 //! - [`hotkeys`]: number-key labels and digit matching.
 //! - [`insight`]: per agent, from its transcript: its uncommitted diff (the
 //!   files IT edited), what it is doing, how full its context is.
@@ -98,6 +100,7 @@ pub mod pins;
 pub mod proc;
 pub mod sessions;
 pub mod sidebar;
+pub mod stashed;
 pub mod text;
 pub mod tmux;
 pub mod view;
