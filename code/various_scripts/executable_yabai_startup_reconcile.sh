@@ -28,6 +28,9 @@
 # 2026-08-21 and again 2026-08-28 (Claude floating on `ai` for 34h) while ChatGPT on
 # the same space tiled normally. `manage=on` on the space= rules does NOT fix this --
 # see the comment on unfloat_pins() for why it makes things worse.
+# (2026-11-13: true for UNPATCHED yabai only. The locally patched build tiles a
+# manage=on window on its OWN space, and Claude's pin rule now carries manage=on --
+# YABAI_PINNED_MANAGED in yabai_common.sh; README, "Patched yabai".)
 #
 # WHY A STARTUP POLL ALONE CANNOT FIX (2): yabai CACHES can-move/role/subrole at
 # window creation and refreshes them only on minimize/deminimize/native-fullscreen
@@ -296,6 +299,11 @@ memo_set() {
 #   own space -- window_manager_make_window_floating() ends in
 #   `space_manager_tile_window_on_space(sm, window, space_manager_active_space())`.
 #
+#   (2026-11-13: that is upstream's behaviour. The patched build now installed tiles
+#   a manage=on window on its own space -- README, "Patched yabai" -- so the trap
+#   described here applies as written only to unpatched yabai. The routes below
+#   were not changed for it.)
+#
 # So un-floating a window that lives on a BACKGROUND space silently registers it in
 # the active space's view: two windows on different spaces sharing one stack, and the
 # window that legitimately owned that view gets pushed out. Verified live 2026-08-21
@@ -344,6 +352,12 @@ memo_set() {
 # one-off `rule --apply app=^X$ manage=on` as an escalation is worse still: it is
 # per-APP, sets WINDOW_RULE_MANAGED before the eligibility check, and force-tiles
 # every root window of the app (helpers included) into the ACTIVE view.
+# (2026-11-13: this paragraph describes UNPATCHED yabai. With the patched build a
+# manage=on window is tiled on its own space, not the active one, so the cross-space
+# stack no longer follows from it, and Claude's pin rule now carries manage=on on
+# purpose: YABAI_PINNED_MANAGED in yabai_common.sh; README, "Patched yabai". On an
+# upstream binary -- e.g. after `brew upgrade` relinks one -- all of the above holds
+# again.)
 #
 # Manual escape hatch for a window whose cached flags never refresh (never
 # minimized): `yabai -m window <managed sibling id> --stack <stuck id>` -- SIBLING

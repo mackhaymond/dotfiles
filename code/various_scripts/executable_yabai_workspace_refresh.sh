@@ -46,7 +46,13 @@ jq -e 'type == "array"' >/dev/null 2>&1 <<<"$WINDOWS_JSON" || WINDOWS_JSON='[]'
 DISPLAYS_JSON=$(query_json_array --displays) || exit 0
 # Ignored displays (agent-chrome's virtual screen) don't exist for the cache: no
 # DISPLAY_COUNT bump, never EXTERNAL_DISPLAY_INDEX.
-DISPLAYS_JSON=$(yabai_filter_displays <<<"$DISPLAYS_JSON") || exit 0
+REAL_DISPLAYS_JSON=$(yabai_filter_displays <<<"$DISPLAYS_JSON") || exit 0
+# ...unless nothing else is attached (lid closed, only the virtual screen left): then
+# the ignored display is the only one there is and holds every space. Filtering it out
+# wrote DISPLAY_COUNT=0 with an empty MASTER_DISPLAY_INDEX, yabai_load_cache rejected
+# that for every consumer, and each hyper+<label> ran a full refresh and focused
+# nothing. Keep the unfiltered list in that one case (yabai_master_index does the same).
+[ "$REAL_DISPLAYS_JSON" = "[]" ] || DISPLAYS_JSON=$REAL_DISPLAYS_JSON
 DISPLAY_COUNT=$(jq -r 'length' <<<"$DISPLAYS_JSON")
 MASTER_DISPLAY_INDEX=$(yabai_master_index "$DISPLAYS_JSON")
 # Only meaningful once master is known; computing it against a placeholder master
@@ -62,8 +68,14 @@ else
   EXTERNAL_DISPLAY_INDEX=""
 fi
 
+# Mid-run re-query. NOT fatal, unlike the initial one: by now labels have been moved,
+# and exiting on a bare-"[" answer here skipped the cache write and yabai_pin_rules_add
+# (and, before the reorder in assign_label_to_space, left a label stripped for good).
+# On a bad answer the previous snapshot is kept and 1 returned.
 refresh_spaces_json() {
-  SPACES_JSON=$(query_json_array --spaces) || exit 0
+  local fresh
+  fresh=$(query_json_array --spaces) || return 1
+  SPACES_JSON=$fresh
 }
 
 # Backstop for the create path below: if a `space --create` does not yield a new
@@ -187,13 +199,23 @@ assign_label_to_space() {
     return 0
   fi
 
+  # Strip and re-apply back to back, and only then re-query: a re-query between the
+  # two that hit a bare-"[" episode used to end the run with the label stripped from
+  # its old space and never applied to the new one.
   if [ -n "$current_index" ]; then
     yabai -m space "$current_index" --label >/dev/null 2>&1 || true
-    refresh_spaces_json
   fi
 
   yabai -m space "$index" --label "$label" >/dev/null 2>&1 || true
-  refresh_spaces_json
+  if ! refresh_spaces_json; then
+    # No fresh snapshot: record the move in the old one, or the next label would
+    # still see this space as unlabeled and be handed it too.
+    local patched
+    patched=$(jq -c --arg label "$label" --argjson index "$index" '
+      map(if .index == $index then .label = $label
+          elif .label == $label then .label = ""
+          else . end)' 2>/dev/null <<<"$SPACES_JSON") && [ -n "$patched" ] && SPACES_JSON=$patched
+  fi
 }
 
 # Label-follows-app: move <label> onto the space where its pinned app lives. This is

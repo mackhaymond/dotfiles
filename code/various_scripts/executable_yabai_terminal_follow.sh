@@ -17,18 +17,26 @@ set -u
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export USER="${USER:-$(id -un)}"
 
-# WezTerm's current space (it carries the window into its fullscreen Space).
-wspace=$(yabai -m query --windows 2>/dev/null \
-  | jq -r 'first(.[] | select(.app | test("^(wezterm-gui|WezTerm)$")) | .space) // empty' 2>/dev/null)
+# The space(s) of WezTerm's real windows (it carries the window into its fullscreen
+# Space), space-separated in window order. Only non-minimized standard root windows
+# count: taking the first WezTerm window of ANY kind let a minimized one, or a
+# non-standard helper window parked elsewhere, drag the label off the real terminal.
+wspaces=$(yabai -m query --windows 2>/dev/null \
+  | jq -r '[.[] | select(.app | test("^(wezterm-gui|WezTerm)$"))
+                | select(.subrole == "AXStandardWindow" and ."root-window" and (."is-minimized" | not))
+                | .space] | join(" ")' 2>/dev/null)
 
 # WezTerm not open -> nothing to anchor; leave the label where it is.
-[ -z "$wspace" ] && exit 0
+[ -z "$wspaces" ] && exit 0
 
 # Where the "terminal" label sits right now.
 tspace=$(yabai -m query --spaces --space terminal 2>/dev/null | jq -r '.index // empty' 2>/dev/null)
 
-# Fast path: already correct (every ordinary space switch hits this) -> no-op.
-[ "$wspace" = "$tspace" ] && exit 0
+# Fast path: already correct (every ordinary space switch hits this) -> no-op. ANY
+# WezTerm window on the terminal space counts, so a second window opened elsewhere
+# does not pull the label away from the first.
+case " $wspaces " in *" ${tspace:-none} "*) exit 0 ;; esac
+wspace=${wspaces%% *}
 
 # Stand down while a display hotplug is being reconciled: yabai_displays.sh holds
 # this lock and is itself moving/relabeling/reordering spaces, and its pull-home
@@ -36,6 +44,19 @@ tspace=$(yabai -m query --spaces --space terminal 2>/dev/null | jq -r '.index //
 # final workspace_refresh leaves canonical order, and a later space_changed re-runs
 # us cleanly. Same lock dir as yabai_displays.sh; never present on a stable session.
 [ -d "${TMPDIR:-/tmp}/yabai_displays.lock" ] && exit 0
+
+# Never take a space that already carries ANOTHER canonical label. A WezTerm window
+# dragged onto `main` in Mission Control (or caught there by the launch race) used to
+# get `main` overwritten with `terminal`, leaving the real terminal space unlabeled.
+# That window is the stray, not the label: leave everything as it is and let the pin
+# rule / window_created nudge send WezTerm home. (yabai_common.sh is sourced only
+# here, past the fast path: sourcing it forks, and this runs on every space switch.)
+# shellcheck source=/dev/null
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
+wlabel=$(yabai -m query --spaces --space "$wspace" 2>/dev/null | jq -r '.label // empty' 2>/dev/null)
+if [ -n "$wlabel" ] && [ "$wlabel" != terminal ]; then
+  case " $YABAI_LABELS " in *" $wlabel "*) exit 0 ;; esac
+fi
 
 # Re-pin "terminal" onto WezTerm's current space. A label is unique, so free the
 # old holder (the empty husk, or wherever it drifted) before moving it.

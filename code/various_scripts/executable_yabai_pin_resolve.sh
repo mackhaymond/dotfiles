@@ -22,6 +22,14 @@
 # pinned app just launched.
 #
 # Guards, since the remedy is a full restart:
+#   - LET THE PATCHED YABAI GO FIRST (since 2026-11-13): the installed yabai is a local
+#     patched build that adopts untracked windows by itself -- it re-checks an app's
+#     windows +3, +8, +15 and +30s after the app launches, +5s after yabai starts, and
+#     whenever an unknown window is focused. That makes this script a backstop, so it
+#     defers while the stuck window's app is younger than APP_SETTLE seconds or the
+#     yabai daemon is younger than YABAI_SETTLE, then looks again. Without this a
+#     window that showed up at +3.5s was confirmed and restarted for at ~+7.5s, just
+#     before the +8s check would have adopted it.
 #   - CONFIRM: the same window must still be unresolved CONFIRM_SECONDS later (a window
 #     yabai is mid-resolving via kAXWindowCreated is briefly unresolved too).
 #   - Never during a live startup poll (the poll calls this itself when it ends).
@@ -82,28 +90,71 @@ CONFIRM_SECONDS=2
 MIN_GAP=30
 MAX_PER_WINDOW=2
 MIN_UPTIME=150
+# The patched yabai's last per-app adoption check runs +30s after the app launches and
+# its startup adoption +5s after yabai starts; each gets a margin for the check to
+# finish and the query to reflect it.
+APP_SETTLE=35
+YABAI_SETTLE=12
 
 # Single-flight: a burst of triggers (launch + focus + space change) runs one check.
 # A holder older than 300s is an orphan (a restart kills yabai's process group); the
-# longest legitimate run is ~220s (watch 30 + delay 5 + boot wait <=150 + confirm 2 +
-# gap wait 30).
+# longest legitimate run is ~255s (watch 30 + delay 5 + boot wait <=150 + app/yabai
+# settle <=35 + confirm 2 + gap wait 30).
 if ! mkdir "$LOCK" 2>/dev/null; then
   m=$(stat -f %m "$LOCK" 2>/dev/null || echo 0)
   [ $(( $(date +%s) - m )) -ge 300 ] || exit 0
   rm -rf "$LOCK" 2>/dev/null
   mkdir "$LOCK" 2>/dev/null || exit 0
 fi
-trap 'rm -rf "$LOCK" 2>/dev/null || true' EXIT
+echo $$ >"$LOCK/pid"
+# Release only a lock we still OWN. This script drops its lock just before it restarts
+# yabai, and an orphan reap re-creates the same path, so by the time the EXIT trap runs
+# the directory can belong to ANOTHER run: an unconditional `rm -rf "$LOCK"` deleted
+# that run's lock and let a third check start alongside it (same pattern and reason as
+# owns_lock in yabai_startup_reconcile.sh).
+owns_lock() { [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ]; }
+trap 'owns_lock && rm -rf "$LOCK" 2>/dev/null; true' EXIT
 
-# "<id> <app> <space>" per unresolved pinned window still within its restart budget
-# (one query + one jq + one awk). Budget-spent ids are logged ONCE (marker file) and
-# dropped here, so a permanently stuck helper costs nothing but this look.
+# Seconds since process $1 started; prints nothing when it cannot be read (the process
+# is gone). `ps -o etime=` is [[dd-]hh:]mm:ss -- same conversion as the stale-lock
+# sweep in yabai_startup_reconcile.sh.
+proc_age() {
+  ps -o etime= -p "$1" 2>/dev/null | tr -d ' ' \
+    | awk -F'[-:]' 'NF >= 2 { n = NF; t = $n + 60 * $(n - 1); if (n >= 3) t += 3600 * $(n - 2);
+                              if (n >= 4) t += 86400 * $(n - 3); print t }'
+}
+
+# "<seconds> <reason>" for the longest wait the patched yabai is still owed over the
+# windows in $1 (field 4 = owning pid), or nothing when every app and the daemon are
+# past their adoption checks. An age that cannot be read asks for no wait: that
+# process is gone, and its window drops out of the re-check by itself.
+settle_wait() {
+  local id app space pid age w wait=0 reason=""
+  while read -r id app space pid; do
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    age=$(proc_age "$pid")
+    case "$age" in ''|*[!0-9]*) continue ;; esac
+    w=$(( APP_SETTLE - age ))
+    if [ "$w" -gt "$wait" ]; then wait=$w; reason="app-young"; fi
+  done <<<"$1"
+  # -o: the oldest process named yabai is the daemon, not a `yabai -m` client.
+  age=$(proc_age "$(pgrep -x -o yabai 2>/dev/null)")
+  case "$age" in ''|*[!0-9]*) age=$YABAI_SETTLE ;; esac
+  w=$(( YABAI_SETTLE - age ))
+  if [ "$w" -gt "$wait" ]; then wait=$w; reason="yabai-young"; fi
+  [ "$wait" -gt 0 ] && echo "$wait $reason"
+}
+
+# "<id> <app> <space> <pid>" per unresolved pinned window still within its restart
+# budget (one query + one jq + one awk). Budget-spent ids are logged ONCE (marker file)
+# and dropped here, so a permanently stuck helper costs nothing but this look. The pid
+# is the owning app's, for settle_wait(); everything else keys on field 1.
 unresolved() {
   local now
   now=$(date +%s)
   yabai -m query --windows 2>/dev/null | jq -r --arg re "$YABAI_PINNED_APPS_RE" "
     [ .[] | select(.app | test(\$re)) ] | $YABAI_JQ_PIN_UNRESOLVED
-    | \"\(.id) \(.app | gsub(\" \"; \"_\")) \(.space)\"" 2>/dev/null \
+    | \"\(.id) \(.app | gsub(\" \"; \"_\")) \(.space) \(.pid // 0)\"" 2>/dev/null \
   | awk -v max="$MAX_PER_WINDOW" -v now="$now" -v memo="$MEMO" '
       BEGIN { while ((getline l < memo) > 0) { split(l, f, " "); if (f[3] > now - 86400) n[f[1]] = f[2] } }
       { if (($1 in n) && n[$1] >= max) { print "SPENT " $0 } else print }'
@@ -126,8 +177,8 @@ startup_live() {
 
 # Splits unresolved() output: logs each budget-spent window once, prints the rest.
 actionable() {
-  local tag id app space
-  while read -r tag id app space; do
+  local tag id app space pid
+  while read -r tag id app space pid; do
     [ -n "$tag" ] || continue
     if [ "$tag" = SPENT ]; then
       if [ ! -e "$YABAI_STATE_DIR/resolve_gaveup_$id" ]; then
@@ -136,8 +187,9 @@ actionable() {
       fi
       continue
     fi
-    # Not SPENT: the first field is the id.
-    printf '%s %s %s\n' "$tag" "$id" "$app"
+    # Not SPENT: the line has no tag, so every variable holds the field to its left --
+    # tag is the id, id the app, app the space, space the pid (and pid is empty).
+    printf '%s %s %s %s\n' "$tag" "$id" "$app" "$space"
   done
 }
 
@@ -170,6 +222,21 @@ early=$(( MIN_UPTIME - ($(date +%s) - boot) ))
 if [ "$early" -gt 0 ] && [ "$DRY_RUN" = 0 ]; then
   yabai_log $LOGN "defer ev=$EVENT reason=just-booted wait=${early}s"
   sleep "$early"
+  startup_live && exit 0
+  screen_locked && exit 0
+  first=$(still_stuck "$first" "$(unresolved | actionable)")
+  [ -n "$first" ] || exit 0
+fi
+
+# Give the patched yabai its chance before a restart is even considered (header,
+# first guard): a Claude window that appears +3.5s after launch sits between the +3s
+# and +8s adoption checks, and confirming it 2s later restarted yabai for a window it
+# was about to adopt. One wait covers every stuck window (the longest one owed), and
+# afterwards only windows that are STILL unresolved go on to the confirm.
+settle=$(settle_wait "$first")
+if [ -n "$settle" ] && [ "$DRY_RUN" = 0 ]; then
+  yabai_log $LOGN "defer ev=$EVENT reason=${settle#* } wait=${settle%% *}s stuck=[$(printf '%s' "$first" | tr '\n' ';')]"
+  sleep "${settle%% *}"
   startup_live && exit 0
   screen_locked && exit 0
   first=$(still_stuck "$first" "$(unresolved | actionable)")
@@ -233,5 +300,5 @@ echo "$now" >"$LAST"
   for f in "$YABAI_STATE_DIR"/keep-float/*; do [ -e "$f" ] && echo "float $(basename "$f") keep"; done
 } >"$YABAI_STATE_DIR/restore_after_restart" 2>/dev/null
 yabai_log $LOGN "restart ev=$EVENT stuck=[$summary]"
-rm -rf "$LOCK" 2>/dev/null
+owns_lock && rm -rf "$LOCK" 2>/dev/null
 yabai --restart-service >/dev/null 2>&1 || yabai_log $LOGN "restart-FAILED ev=$EVENT"

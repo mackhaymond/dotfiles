@@ -261,10 +261,17 @@ yabai_is_agent_app() {
 # first, smallest-frame-area fallback. Emits the index, or nothing if it can't be
 # resolved -- callers add their own cache/default fallback where they need one, and
 # choose live-vs-cache ordering by what they pass in.
+#
+# If EVERY attached display is an ignored one (lid closed with only the BetterDisplay
+# virtual screen left), the ignored display is the only one there is and every space
+# lives on it, so it is the master: resolving nothing there left the cache without a
+# MASTER_DISPLAY_INDEX and yabai_load_cache failing for every consumer.
 yabai_master_index() {
-  local djson="${1:-}"
-  [ -n "$djson" ] || djson=$(yabai_displays_json)
-  printf '%s' "$djson" | yabai_filter_displays | jq -r --arg uuid "$YABAI_MASTER_DISPLAY_UUID" '
+  local djson="${1:-}" real
+  [ -n "$djson" ] || djson=$(yabai -m query --displays 2>/dev/null)
+  real=$(printf '%s' "$djson" | yabai_filter_displays)
+  [ "$real" = "[]" ] && real=$djson
+  printf '%s' "$real" | jq -r --arg uuid "$YABAI_MASTER_DISPLAY_UUID" '
     ([.[] | select(.uuid == $uuid) | .index][0]) // (min_by(.frame.w * .frame.h).index) // empty
   ' 2>/dev/null | head -n 1
 }
@@ -333,6 +340,14 @@ yabai_ext_index() {
   yabai -m query --spaces --space ext 2>/dev/null | jq -r '.index // empty' 2>/dev/null | head -n 1
 }
 
+# Every space id as a compact JSON array, or nothing unless the bulk query answered a
+# non-empty array of numeric ids (it intermittently answers a bare "[").
+yabai_space_ids_json() {
+  yabai -m query --spaces 2>/dev/null | jq -c '
+    if type == "array" and length > 0 and all(.[]; (.id | type) == "number")
+    then [.[].id] else empty end' 2>/dev/null
+}
+
 # Ensure an `ext` space exists on external display $1 and emit its index. Reuses an
 # existing `ext`. Otherwise CREATES a space (it lands on whatever display is active
 # -- usually master) and then MOVES it onto the external by its stable id, appending
@@ -341,15 +356,29 @@ yabai_ext_index() {
 # races, and a create that lands on the wrong display silently mislabels the scratch.
 # Needs the SA (space create/move/label).
 yabai_ensure_ext() {
-  local ext="$1" idx before newid d
+  local ext="$1" idx before after="" newid d _try
   idx=$(yabai_ext_index)
   case "$idx" in ''|*[!0-9]*) ;; *) printf '%s' "$idx"; return 0 ;; esac
   case "$ext" in ''|*[!0-9]*) return 1 ;; esac
 
-  before=$(yabai -m query --spaces 2>/dev/null | jq -c '[.[].id]' 2>/dev/null)
+  # The new space is found as "the id that was not there before", so BOTH snapshots
+  # must be real. `query --spaces` intermittently answers a bare "[" (see
+  # yabai_spaces_json): with an empty `before`, every existing space looked new and
+  # the first one -- terminal's -- was moved to the external and relabelled `ext`.
+  # No valid `before` -> create nothing.
+  before=$(yabai_space_ids_json)
+  [ -n "$before" ] || return 1
   yabai -m space --create >/dev/null 2>&1 || true
-  newid=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson before "${before:-[]}" '
-    ([.[].id] - $before)[0] // empty' 2>/dev/null)
+  # The create has already happened, so give the after-query a few tries before
+  # giving up (and leaving the new space unlabeled) on a transient bad answer.
+  for _try in 1 2 3 4 5; do
+    after=$(yabai_space_ids_json)
+    [ -n "$after" ] && break
+    sleep 0.2
+  done
+  [ -n "$after" ] || return 1
+  newid=$(jq -n -r --argjson before "$before" --argjson after "$after" '
+    ($after - $before)[0] // empty' 2>/dev/null)
   case "$newid" in ''|*[!0-9]*) return 1 ;; esac
 
   d=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$newid" '

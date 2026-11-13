@@ -75,9 +75,30 @@ settle_count() {
   printf '%s' "${cur:-}"
 }
 
-cached_count() {
+# The cache's topology as `count:master:external` -- everything it records about the
+# displays -- and the same triple resolved live, exactly as yabai_workspace_refresh.sh
+# resolves it (external = first non-master real display).
+cached_topology() {
   [ -r "$CACHE_FILE" ] || { printf ''; return; }
-  ( . "$CACHE_FILE" 2>/dev/null; printf '%s' "${DISPLAY_COUNT:-}" )
+  ( . "$CACHE_FILE" 2>/dev/null
+    printf '%s:%s:%s' "${DISPLAY_COUNT:-}" "${MASTER_DISPLAY_INDEX:-}" "${EXTERNAL_DISPLAY_INDEX:-}" )
+}
+
+live_topology() {
+  local djson master ext="" count
+  djson=$(yabai_displays_json)
+  # Only ignored displays attached (lid closed): refresh caches the unfiltered list
+  # then, so compare against the same thing or this guard could never match. (A local
+  # `count`: the script-level one is the filtered count the rest of the handler wants.)
+  [ "$djson" = "[]" ] && djson=$(yabai -m query --displays 2>/dev/null)
+  count=$(jq -r 'length' 2>/dev/null <<<"$djson")
+  master=$(yabai_master_index "$djson")
+  case "$master" in
+    ''|*[!0-9]*) master="" ;;
+    *) ext=$(jq -r --argjson m "$master" '.[] | select(.index != $m) | .index' \
+         2>/dev/null <<<"$djson" | head -n 1) ;;
+  esac
+  printf '%s:%s:%s' "$count" "$master" "$ext"
 }
 
 cached_master() {
@@ -96,7 +117,11 @@ esac
 # DISPLAY_COUNT=1 BEFORE this handler reads it; the guard then skipped the pull-home
 # safety net and the `ext` dissolve entirely. Both are idempotent no-ops when there is
 # nothing to do, and the lock above already coalesces duplicate fires.
-if [ "$ACTION" = added ] && [ "$count" = "$(cached_count)" ]; then
+# Compares the master/external INDICES too, not just the count: when an ignored display
+# (agent-chrome's virtual screen) attaches, the real-display count is unchanged but
+# yabai can renumber the displays, and a count-only guard left the cached indices
+# pointing at the wrong display. Any unresolved live value fails the match and refreshes.
+if [ "$ACTION" = added ] && [ "$(live_topology)" = "$(cached_topology)" ]; then
   exit 0
 fi
 
