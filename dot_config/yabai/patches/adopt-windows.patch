@@ -1,0 +1,494 @@
+diff --git a/src/adopt_windows.c b/src/adopt_windows.c
+new file mode 100644
+index 0000000..b068f0c
+--- /dev/null
++++ b/src/adopt_windows.c
+@@ -0,0 +1,415 @@
++//
++// PATCH(adopt-windows): adopt windows of a RUNNING application that yabai never resolved.
++//
++// Upstream only discovers an application's windows (1) when it launches, by reading
++// kAXWindows -- which lists windows on the ACTIVE space that are already ordered in --
++// (2) through kAXCreatedNotification, and (3) for windows on other spaces, by the
++// brute-force in window_manager_add_existing_application_windows(), which runs only
++// when yabai itself starts. A window that an application creates hidden and shows
++// later, shows on an inactive space, or shows at a non-standard level is therefore
++// never tracked: `query --windows` lists it without an AX reference (or not at all),
++// every `window` command fails with "could not locate the window to act on!", no rule
++// can place it, and only restarting yabai fixes it (upstream issue #2833).
++//
++// The recurring case is an Electron application that relaunches itself in the
++// background after an update and brings its window back with
++// setAlwaysOnTop(true, "normal", -1) + showInactive(): CG window level -1.
++// space_window_list_for_connection() only reports unknown windows at level 0, 3 or 8,
++// so that window is invisible even to the startup brute-force until it is focused.
++//
++// Two triggers, both cheap when there is nothing to do:
++//
++//   - APPLICATION_ADOPT_WINDOWS, posted a few times in the 30 seconds after an
++//     application launches (see APPLICATION_LAUNCHED). It asks SkyLight -- no AX call,
++//     so a busy application cannot stall the event loop -- whether the application
++//     owns a window we do not track, and only then reads kAXWindows and, for windows
++//     on other spaces, brute-forces the AX element id the way the startup path does.
++//
++//   - WINDOW_FOCUSED / APPLICATION_FRONT_SWITCHED for a window id we do not know. A
++//     focused window is on the active space, so kAXWindows has it; no brute-force.
++//
++// Adopted windows go through window_manager_create_and_add_window(), so rules apply
++// exactly as for a window seen at creation, and are then tiled on THEIR OWN space.
++//
++
++extern struct event_loop g_event_loop;
++extern struct space_manager g_space_manager;
++extern struct window_manager g_window_manager;
++extern int g_connection;
++
++static void update_window_notifications(void);
++
++#define ADOPT_LOG_SIZE            64
++#define ADOPT_MAX_BRUTE_ATTEMPTS  3
++#define ADOPT_MAX_FOCUS_ATTEMPTS  5
++#define ADOPT_BRUTE_BUDGET_MS     400ULL
++
++struct adopt_log_entry
++{
++    uint32_t wid;
++    int attempts;
++};
++
++struct adopt_log
++{
++    struct adopt_log_entry entry[ADOPT_LOG_SIZE];
++    int next;
++};
++
++//
++// NOTE: An application can own windows that never get an AX element (Electron helper
++// windows), and windows we resolve but refuse to track (AXUnknown). Without a budget
++// each of those would cost a full brute-force, or an AX round-trip, on every trigger.
++// A small ring is enough: an entry that gets evicted simply earns the window another
++// few attempts much later.
++//
++
++static struct adopt_log g_adopt_brute_log;
++static struct adopt_log g_adopt_focus_log;
++
++static int adopt_log_bump(struct adopt_log *log, uint32_t wid)
++{
++    for (int i = 0; i < ADOPT_LOG_SIZE; ++i) {
++        if (log->entry[i].wid == wid) return log->entry[i].attempts++;
++    }
++
++    log->entry[log->next].wid = wid;
++    log->entry[log->next].attempts = 1;
++    log->next = (log->next + 1) % ADOPT_LOG_SIZE;
++    return 0;
++}
++
++static int adopt_log_attempts(struct adopt_log *log, uint32_t wid)
++{
++    for (int i = 0; i < ADOPT_LOG_SIZE; ++i) {
++        if (log->entry[i].wid == wid) return log->entry[i].attempts;
++    }
++
++    return 0;
++}
++
++static void adopt_finish_window(struct window *window, bool use_window_origin)
++{
++    if (window_manager_should_manage_window(window) && !window_manager_find_managed_window(&g_window_manager, window)) {
++        uint64_t sid = window_space(window->id);
++
++        //
++        // NOTE: A window adopted because it was just focused is, in practice, a new
++        // window whose focus event beat its created event; place it exactly as
++        // EVENT_HANDLER(WINDOW_CREATED) would have. A window adopted in the background
++        // stays on the space it is on.
++        //
++
++        if (use_window_origin) {
++            if (g_window_manager.window_origin_mode == WINDOW_ORIGIN_FOCUSED) {
++                sid = g_space_manager.current_space_id;
++            } else if (g_window_manager.window_origin_mode == WINDOW_ORIGIN_CURSOR) {
++                sid = space_manager_cursor_space();
++            }
++        }
++
++        if (sid && space_is_user(sid)) {
++            struct view *view = space_manager_tile_window_on_space(&g_space_manager, window, sid);
++            window_manager_add_managed_window(&g_window_manager, window, view);
++        }
++    }
++
++    if (window_manager_is_window_eligible(window)) {
++        event_signal_push(SIGNAL_WINDOW_CREATED, window);
++    }
++}
++
++static int adopt_application_ax_windows(struct application *application, bool use_window_origin)
++{
++    int window_count = 0;
++    struct window **window_list = window_manager_add_application_windows(&g_space_manager, &g_window_manager, application, &window_count);
++    if (!window_list) return 0;
++
++    for (int i = 0; i < window_count; ++i) {
++        debug("%s: adopted %s %d\n", __FUNCTION__, application->name, window_list[i]->id);
++        adopt_finish_window(window_list[i], use_window_origin);
++    }
++
++    return window_count;
++}
++
++//
++// NOTE: Top-level windows that SkyLight reports for this application's connection,
++// on any space of any display, that we do not track. Same filter as
++// space_window_list_for_connection(.., include_minimized = true), plus level -1 (see
++// the header of this file) and minus windows that have used up their attempts.
++//
++
++static uint32_t *adopt_application_unresolved_window_list(struct application *application, int *window_count)
++{
++    *window_count = 0;
++    uint32_t *window_list = NULL;
++
++    //
++    // NOTE: A connection id of 0 means "any connection" to SkyLight.
++    //
++
++    if (!application->connection) return NULL;
++
++    int display_count = 0;
++    uint32_t *display_list = display_manager_active_display_list(&display_count);
++    if (!display_list) return NULL;
++
++    int space_count = 0;
++    uint64_t *space_list = NULL;
++
++    for (int i = 0; i < display_count; ++i) {
++        int count = 0;
++        uint64_t *list = display_space_list(display_list[i], &count);
++        if (!list) continue;
++
++        //
++        // NOTE: display_space_list(..) uses a linear allocator, so consecutive lists
++        // are contiguous; track the first one and the total (as upstream does).
++        //
++
++        if (!space_list) space_list = list;
++        space_count += count;
++    }
++
++    if (!space_list || !space_count) return NULL;
++
++    uint64_t set_tags = 0;
++    uint64_t clear_tags = 0;
++
++    CFArrayRef space_list_ref = cfarray_of_cfnumbers(space_list, sizeof(uint64_t), space_count, kCFNumberSInt64Type);
++    CFArrayRef window_list_ref = SLSCopyWindowsWithOptionsAndTags(g_connection, application->connection, space_list_ref, 0x7, &set_tags, &clear_tags);
++    if (!window_list_ref) goto err;
++
++    int count = CFArrayGetCount(window_list_ref);
++    if (!count) goto out;
++
++    CFTypeRef query = SLSWindowQueryWindows(g_connection, window_list_ref, count);
++    CFTypeRef iterator = SLSWindowQueryResultCopyWindows(query);
++
++    while (SLSWindowIteratorAdvance(iterator)) {
++        uint64_t tags = SLSWindowIteratorGetTags(iterator);
++        uint64_t attributes = SLSWindowIteratorGetAttributes(iterator);
++        uint32_t parent_wid = SLSWindowIteratorGetParentID(iterator);
++        uint32_t wid = SLSWindowIteratorGetWindowID(iterator);
++        int level = SLSWindowIteratorGetLevel(iterator);
++
++        if (parent_wid != 0) continue;
++        if (level != -1 && level != 0 && level != 3 && level != 8) continue;
++        if (window_manager_find_window(&g_window_manager, wid)) continue;
++
++        bool is_window = false;
++        if (((attributes & 0x2) || (tags & 0x400000000000000)) && (((tags & 0x1)) || ((tags & 0x2) && (tags & 0x80000000)))) {
++            is_window = true;
++        } else if ((attributes == 0x0 || attributes == 0x1) && ((tags & 0x1000000000000000) || (tags & 0x300000000000000)) && (((tags & 0x1)) || ((tags & 0x2) && (tags & 0x80000000)))) {
++            is_window = true;
++        }
++
++        if (!is_window) continue;
++        if (adopt_log_attempts(&g_adopt_brute_log, wid) >= ADOPT_MAX_BRUTE_ATTEMPTS) continue;
++
++        ts_buf_push(window_list, wid);
++    }
++
++    *window_count = ts_buf_len(window_list);
++
++    CFRelease(query);
++    CFRelease(iterator);
++out:
++    CFRelease(window_list_ref);
++err:
++    CFRelease(space_list_ref);
++    return window_list;
++}
++
++static int adopt_application_windows(struct application *application)
++{
++    int unresolved_count = 0;
++    uint32_t *unresolved_list = adopt_application_unresolved_window_list(application, &unresolved_count);
++    if (!unresolved_count) return 0;
++
++    //
++    // NOTE: Windows on the active space are in kAXWindows; take those the normal way.
++    //
++
++    int adopted = adopt_application_ax_windows(application, false);
++
++    for (int i = 0; i < ts_buf_len(unresolved_list); ++i) {
++        if (window_manager_find_window(&g_window_manager, unresolved_list[i])) {
++            ts_buf_del(unresolved_list, i);
++            --i;
++        }
++    }
++
++    if (ts_buf_len(unresolved_list) == 0) return adopted;
++
++    for (int i = 0; i < ts_buf_len(unresolved_list); ++i) {
++        adopt_log_bump(&g_adopt_brute_log, unresolved_list[i]);
++    }
++
++    debug("%s: %s has %d windows that are not resolved, attempting workaround\n", __FUNCTION__, application->name, ts_buf_len(unresolved_list));
++
++    //
++    // NOTE: MacOS API does not return AXUIElementRef of windows on inactive spaces.
++    // Brute-force the element_id and create the AXUIElementRef ourselves; identical to
++    // window_manager_add_existing_application_windows(..).
++    //
++    // :Attribution
++    // https://github.com/decodism
++    // https://github.com/lwouis/alt-tab-macos/issues/1324#issuecomment-2631035482
++    //
++
++    CFMutableDataRef data_ref = CFDataCreateMutable(NULL, 0x14);
++    CFDataIncreaseLength(data_ref, 0x14);
++
++    uint8_t *data = CFDataGetMutableBytePtr(data_ref);
++    *(uint32_t *) (data + 0x0) = application->pid;
++    *(uint32_t *) (data + 0x8) = 0x636f636f;
++
++    //
++    // NOTE: Unlike at startup, this runs while the application may be busy (it just
++    // launched). An application that does not answer costs the AX messaging timeout
++    // PER CALL, so stop at the first such answer and never spend more than
++    // ADOPT_BRUTE_BUDGET_MS on the event-loop thread; the next scheduled check, or the
++    // window receiving focus, tries again.
++    //
++
++    uint64_t brute_start = clock_gettime_nsec_np(CLOCK_MONOTONIC);
++
++    for (uint64_t element_id = 0; element_id < 0x7fff; ++element_id) {
++        int unresolved_len = ts_buf_len(unresolved_list);
++        if (unresolved_len == 0) break;
++
++        if ((element_id & 0x3f) == 0 && (clock_gettime_nsec_np(CLOCK_MONOTONIC) - brute_start) > ADOPT_BRUTE_BUDGET_MS * NSEC_PER_MSEC) {
++            debug("%s: out of time for %s\n", __FUNCTION__, application->name);
++            break;
++        }
++
++        memcpy(data+0xc, &element_id, sizeof(uint64_t));
++        AXUIElementRef element_ref = _AXUIElementCreateWithRemoteToken(data_ref);
++        if (!element_ref) continue;
++
++        const void *role = NULL;
++        AXError error = AXUIElementCopyAttributeValue(element_ref, kAXRoleAttribute, &role);
++        if (error == kAXErrorCannotComplete) {
++            debug("%s: %s is not responding\n", __FUNCTION__, application->name);
++            CFRelease(element_ref);
++            break;
++        }
++
++        bool matched = false;
++        uint32_t element_wid = 0;
++
++        if (role) {
++            if (CFEqual(role, kAXWindowRole)) {
++                element_wid = ax_window_id(element_ref);
++
++                if (element_wid != 0) {
++                    for (int i = 0; i < unresolved_len; ++i) {
++                        if (unresolved_list[i] == element_wid) {
++                            matched = true;
++                            ts_buf_del(unresolved_list, i);
++                            break;
++                        }
++                    }
++                }
++            }
++
++            CFRelease(role);
++        }
++
++        if (!matched) {
++            CFRelease(element_ref);
++            continue;
++        }
++
++        //
++        // NOTE: window_manager_create_and_add_window(..) takes ownership of element_ref.
++        //
++
++        struct window *window = window_manager_create_and_add_window(&g_space_manager, &g_window_manager, application, element_ref, element_wid, false);
++        if (window) {
++            debug("%s: adopted %s %d\n", __FUNCTION__, application->name, window->id);
++            adopt_finish_window(window, false);
++            ++adopted;
++        }
++    }
++
++    CFRelease(data_ref);
++    return adopted;
++}
++
++//
++// NOTE: A window we do not track received focus. If it belongs to an application we
++// do track, read that application's kAXWindows again. The caller has already recorded
++// a lost-focused event for this window id, so window_manager_create_and_add_window(..)
++// re-posts WINDOW_FOCUSED once the window exists and focus handling proceeds normally.
++//
++
++static void adopt_focused_window(uint32_t wid)
++{
++    if (!wid) return;
++    if (window_manager_find_window(&g_window_manager, wid)) return;
++
++    int cid = 0;
++    pid_t pid = 0;
++    SLSGetWindowOwner(g_connection, wid, &cid);
++    if (!cid) return;
++
++    SLSConnectionGetPID(cid, &pid);
++    if (!pid) return;
++
++    struct application *application = window_manager_find_application(&g_window_manager, pid);
++    if (!application) return;
++
++    if (adopt_log_bump(&g_adopt_focus_log, wid) >= ADOPT_MAX_FOCUS_ATTEMPTS) return;
++
++    if (adopt_application_ax_windows(application, true)) {
++        if (workspace_is_macos_sequoia() || workspace_is_macos_tahoe() || workspace_is_macos_goldengate()) {
++            update_window_notifications();
++        }
++    }
++
++    //
++    // NOTE: A failed attempt (AXUnknown, not observable yet) drops the lost-focused
++    // event inside window_manager_create_and_add_window(..); put it back so that a
++    // later WINDOW_CREATED for this window still re-posts the focus.
++    //
++
++    if (!window_manager_find_window(&g_window_manager, wid)) {
++        window_manager_add_lost_focused_event(&g_window_manager, wid);
++    }
++}
++
++static void adopt_schedule_for_application(pid_t pid)
++{
++    static const int64_t delay_ms[] = { 3000, 8000, 15000, 30000 };
++
++    for (int i = 0; i < (int) array_count(delay_ms); ++i) {
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay_ms[i] * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
++            event_loop_post(&g_event_loop, APPLICATION_ADOPT_WINDOWS, (void *)(intptr_t) pid, 0);
++        });
++    }
++}
++
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunused-parameter"
++static EVENT_HANDLER(APPLICATION_ADOPT_WINDOWS)
++{
++    pid_t pid = (pid_t)(intptr_t) context;
++
++    //
++    // NOTE: Looked up by pid, never by pointer: the application may be long gone by
++    // the time a delayed check fires.
++    //
++
++    struct application *application = window_manager_find_application(&g_window_manager, pid);
++    if (!application) return;
++
++    if (adopt_application_windows(application)) {
++        if (workspace_is_macos_sequoia() || workspace_is_macos_tahoe() || workspace_is_macos_goldengate()) {
++            update_window_notifications();
++        }
++    }
++}
++#pragma clang diagnostic pop
+diff --git a/src/event_loop.c b/src/event_loop.c
+index 39ba58c..aca6d8f 100644
+--- a/src/event_loop.c
++++ b/src/event_loop.c
+@@ -172,6 +172,9 @@ static EVENT_HANDLER(APPLICATION_LAUNCHED)
+     window_manager_add_application(&g_window_manager, application);
+     event_signal_push(SIGNAL_APPLICATION_LAUNCHED, application);
+ 
++    // PATCH(adopt-windows): look again for windows that show up late, on another space, or below the normal level.
++    adopt_schedule_for_application(process->pid);
++
+     int window_count;
+     struct window **window_list = window_manager_add_application_windows(&g_space_manager, &g_window_manager, application, &window_count);
+     uint32_t prev_window_id = g_window_manager.focused_window_id;
+@@ -414,6 +417,7 @@ static EVENT_HANDLER(APPLICATION_FRONT_SWITCHED)
+         }
+ 
+         window_manager_add_lost_focused_event(&g_window_manager, application_focused_window_id);
++        adopt_focused_window(application_focused_window_id); // PATCH(adopt-windows)
+         return;
+     }
+ 
+@@ -641,6 +645,7 @@ static EVENT_HANDLER(WINDOW_FOCUSED)
+     struct window *window = window_manager_find_window(&g_window_manager, window_id);
+     if (!window) {
+         window_manager_add_lost_focused_event(&g_window_manager, window_id);
++        adopt_focused_window(window_id); // PATCH(adopt-windows)
+         return;
+     }
+ 
+diff --git a/src/event_loop.h b/src/event_loop.h
+index add0ae4..c067bb7 100644
+--- a/src/event_loop.h
++++ b/src/event_loop.h
+@@ -9,6 +9,7 @@
+     EVENT_TYPE_ENTRY(APPLICATION_FRONT_SWITCHED) \
+     EVENT_TYPE_ENTRY(APPLICATION_VISIBLE) \
+     EVENT_TYPE_ENTRY(APPLICATION_HIDDEN) \
++    EVENT_TYPE_ENTRY(APPLICATION_ADOPT_WINDOWS) \
+     EVENT_TYPE_ENTRY(WINDOW_CREATED) \
+     EVENT_TYPE_ENTRY(WINDOW_DESTROYED) \
+     EVENT_TYPE_ENTRY(WINDOW_FOCUSED) \
+diff --git a/src/manifest.m b/src/manifest.m
+index af3ea7b..868db08 100644
+--- a/src/manifest.m
++++ b/src/manifest.m
+@@ -79,6 +79,7 @@
+ 
+ #include "sa.m"
+ #include "mission_control.c"
++#include "adopt_windows.c"
+ #include "event_loop.c"
+ #include "event_signal.c"
+ #include "workspace.m"
+diff --git a/src/window_manager.c b/src/window_manager.c
+index 8e8a13f..0191430 100644
+--- a/src/window_manager.c
++++ b/src/window_manager.c
+@@ -2205,7 +2205,13 @@ void window_manager_make_window_floating(struct space_manager *sm, struct window
+ 
+         if (!window_check_flag(window, WINDOW_STICKY)) {
+             if ((window_manager_should_manage_window(window)) && (!window_manager_find_managed_window(wm, window))) {
+-                struct view *view = space_manager_tile_window_on_space(sm, window, space_manager_active_space());
++                // PATCH(adopt-windows): on the rule path (force: manage=on, also re-run by every `rule --apply`) tile
++                // on the window's OWN space. Upstream always used the active space, which put a window that lives on
++                // a background space into the active space's view (two spaces sharing one tree). Commands (toggle
++                // float, scratchpad) keep the active space: they act on a window that is, or is being moved, there.
++                uint64_t sid = force ? window_space(window->id) : 0;
++                if (!sid) sid = space_manager_active_space();
++                struct view *view = space_manager_tile_window_on_space(sm, window, sid);
+                 window_manager_add_managed_window(wm, window, view);
+             }
+         }

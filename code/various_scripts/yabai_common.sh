@@ -88,6 +88,18 @@ YABAI_AGENT_APPS_RE="^($(printf '%s' "$YABAI_AGENT_APPS" | sed 's/[()]/\\&/g'))$
 # `case` copies; folding those in is a worthwhile follow-up, not a silent one.
 YABAI_PINNED_HOMES="wezterm-gui:terminal|WezTerm:terminal|Todoist:todo|Granola:schedule|Spark Mail:mail|Notion Calendar:calendar|Messages:messages|Claude:ai|ChatGPT:ai"
 
+# Pinned apps whose rule also carries `manage=on`, `|`-separated. Claude Desktop comes
+# back from its background auto-update at CG window level -1 (it restores level 0 on
+# the first focus), and yabai floats any window whose level is not 0 -- unless a
+# manage=on rule matches, which skips that classification. A standard window only
+# (yabai ignores manage=on for other subroles unless the rule names one), so helper
+# windows and panels are untouched. REQUIRES the patched yabai (README, "Patched
+# yabai"): upstream re-tiles a manage=on window onto the ACTIVE space on every
+# `rule --apply`, which put a background Claude into the focused space's stack. Side
+# effect: hyper+t floating such an app off its home space lasts until the next
+# `rule --apply` (any app launch).
+YABAI_PINNED_MANAGED="Claude"
+
 # Every app the float sweep can act on -- the pinned map's app names plus the agent
 # apps -- as one anchored yabai regex, for the `window_focused` sweep signal's app=
 # filter (yabairc). Same escaping as YABAI_AGENT_APPS_RE.
@@ -104,12 +116,15 @@ YABAI_PINNED_APPS_RE="^($(printf '%s' "$YABAI_PINNED_HOMES" | sed 's/:[^|]*//g')
 # whose label is missing right now fails to parse and leaves the old one in place.
 # Called by yabairc (startup) and yabai_workspace_refresh.sh (after any relabel).
 yabai_pin_rules_add() {
-  local pair app label
+  local pair app label manage
   local IFS='|'
   for pair in $YABAI_PINNED_HOMES; do
     app=${pair%%:*}; label=${pair#*:}
+    case "|$YABAI_PINNED_MANAGED|" in *"|$app|"*) manage="manage=on" ;; *) manage="" ;; esac
+    # $manage unquoted on purpose: it is one word or nothing (IFS is `|` here).
+    # shellcheck disable=SC2086
     yabai -m rule --add label="pin_$(printf '%s' "$app" | tr -cd 'A-Za-z0-9')" \
-      app="^${app}\$" space="$label" >/dev/null 2>&1
+      app="^${app}\$" space="$label" $manage >/dev/null 2>&1
   done
   yabai -m rule --add label=pin_agent app="$YABAI_AGENT_APPS_RE" \
     space="${YABAI_AGENT_LABEL:-agent}" >/dev/null 2>&1
