@@ -4,11 +4,13 @@ set -u
 
 # Reconcile the canonical labeled spaces and refresh the display cache.
 #
-# Jobs (all idempotent, all non-destructive):
+# Jobs (all idempotent; 1-4 are non-destructive, 5 destroys empty spaces):
 #   1. Resolve display topology -> DISPLAY_COUNT / MASTER / EXTERNAL indices.
 #   2. Ensure every canonical label exists (heals a missing label on the laptop).
 #   3. Re-pin each label onto the space where its app actually lives (laptop only).
 #   4. Write the shared cache consumed by the workspace/display/move scripts.
+#   5. Only with --sweep (yabai_heal.sh): destroy surplus EMPTY UNLABELED spaces,
+#      keeping one per display (yabai_sweep_empty_spaces in yabai_common.sh).
 #
 # It NO LONGER moves spaces between displays. Plug/unplug reconciliation lives in
 # yabai_displays.sh; this script never resets a docked layout back to the laptop.
@@ -19,6 +21,41 @@ export USER="${USER:-$(id -un)}"
 # shellcheck source=/dev/null
 . "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
 CACHE_FILE="${YABAI_WORKSPACE_CACHE:-${HOME}/.cache/yabai/workspace_cache.env}"
+
+#   yabai_workspace_refresh.sh [--sweep]
+# --sweep (yabai_heal.sh): after reconciling, trim surplus empty unlabeled spaces.
+SWEEP=0
+[ "${1:-}" = --sweep ] && SWEEP=1
+
+# Single-flight, SERIALIZED rather than coalesced. Refresh is called from heal, the
+# hotplug handler, startup and half the keybinds; two at once (undock fires
+# display_removed AND space_destroyed) each saw the same missing label and each
+# created a space for it, or stripped/re-applied labels over one another.
+# When the lock is held we WAIT for the holder (bounded, ~5s) and then run ourselves:
+#   - not "exit at once": callers (yabai_displays.sh, yabai_workspace.sh on a cache
+#     miss) read the cache/labels the moment we return, so a refresh must have
+#     finished by then;
+#   - not "wait, then return without running": the holder's snapshot may predate
+#     what our caller just did (the pull-home before yabai_displays.sh's final
+#     refresh), so its result is not ours. A refresh is idempotent and ~0.3s.
+# If the holder is still going after the wait (a bare-"[" episode makes every
+# re-query retry), we run WITHOUT the lock -- exactly the pre-lock behaviour --
+# rather than hang or leave the caller with no refresh; the release below is
+# ownership-aware, so it cannot remove the holder's lock. No deadlock with callers:
+# they hold DIFFERENT locks (heal.lock, yabai_displays.lock), and nothing this
+# script runs calls back into it. A holder that died is detected by pid and broken
+# at once (yabai_lock_acquire), so a restart mid-refresh costs no wait.
+REFRESH_LOCK="$YABAI_STATE_DIR/refresh.lock"
+LOCK_HELD=0
+yabai_lock_acquire_wait "$REFRESH_LOCK" 50 && LOCK_HELD=1
+trap 'yabai_lock_release "$REFRESH_LOCK"' EXIT
+[ "$LOCK_HELD" = 1 ] || yabai_log refresh "lock busy after ~5s; running unlocked"
+# Accepted, not closed: an UNLOCKED run can still be between `space --create` and
+# labeling the result (label_space_if_missing) while a locked `--sweep` refresh runs.
+# It takes a holder stuck >5s, a missing label with no unlabeled space to reuse, and
+# a heal landing in that ~0.1s stretch; the worst outcome is the label landing on the
+# other of the two empties and the laptop left with no spare (the next refresh that
+# needs a space creates one). An unlocked run never sweeps (bottom of this file).
 
 # A VALIDATED bulk query, or nothing. `yabai -m query --spaces` intermittently answers a
 # bare "[" with exit 0 (space_manager_query_spaces_for_displays skips the closing "]"
@@ -345,3 +382,10 @@ yabai -m rule --apply >/dev/null 2>&1 || true
 
 # Keep the labeled spaces in their canonical order on each display.
 "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_reorder_spaces.sh" >/dev/null 2>&1 || true
+
+# Last, and only under the lock: with every label settled, what is still empty and
+# unlabeled is a leaked spare. Unlocked (see above) another refresh may be between
+# `space --create` and labeling the result, and the sweep must not race that.
+if [ "$SWEEP" = 1 ] && [ "$LOCK_HELD" = 1 ]; then
+  yabai_sweep_empty_spaces
+fi

@@ -37,20 +37,14 @@ case "$ACTION" in
 esac
 
 # --- single-flight lock (coalesce duplicate hotplug signals) ----------------
-if ! mkdir "$LOCKDIR" 2>/dev/null; then
-  # Break a stale lock (older than ~30s) left by a crashed run, then try once
-  # more. 30s is well above a normal handler's runtime, so a slow-but-live run is
-  # never pre-empted by a concurrent one. Age is computed in seconds via stat:
-  # BSD find rejects a fractional `-mmin +0.5`, so the old form silently never
-  # fired and a crash-orphaned lock would wedge all hotplug handling forever.
-  now=$(date +%s 2>/dev/null)
-  lock_mtime=$(stat -f %m "$LOCKDIR" 2>/dev/null)
-  if [ -n "$now" ] && [ -n "$lock_mtime" ] && [ "$((now - lock_mtime))" -gt 30 ]; then
-    rmdir "$LOCKDIR" 2>/dev/null || true
-  fi
-  mkdir "$LOCKDIR" 2>/dev/null || exit 0
-fi
-trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+# A stale lock (dead owner, or older than ~30s) left by a crashed run is broken.
+# 30s is well above a normal handler's runtime, so a slow-but-live run is not
+# normally pre-empted by a concurrent one -- and if one is, the ownership-aware
+# release keeps its late exit from removing the lock of the run that took over
+# (yabai_lock_* in yabai_common.sh; age is in seconds via BSD stat there, since
+# BSD find rejects a fractional `-mmin +0.5`).
+yabai_lock_acquire "$LOCKDIR" 30 || exit 0
+trap 'yabai_lock_release "$LOCKDIR"' EXIT
 
 # --- settle: wait until the display count is stable across two reads --------
 settle_count() {

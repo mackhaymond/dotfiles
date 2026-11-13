@@ -184,7 +184,12 @@ else
   # Post-restart float state is never the user's choice (yabai re-classified from
   # scratch), and CGWindowIDs are session-scoped, so stale markers only ever block
   # a repair. Same for the backoff memo.
+  # float_borders.grace too: a marker left from the previous yabai is already older than
+  # the grace, so the first sync would border that window (or a reused id) at once.
+  # Its CONTENTS only: removing the directory under a sync that is about to write a
+  # marker makes that write fail, and the window is then bordered at once.
   rm -rf "$KEEP_FLOAT" "$MEMO" 2>/dev/null
+  rm -f "$YABAI_STATE_DIR/float_borders.grace"/* 2>/dev/null
 fi
 echo $$ >"$LOCK/pid"
 # Release only a lock we still OWN: a takeover (startup preempting a previous poll, or
@@ -433,8 +438,10 @@ unfloat_pins() {
 
     # Route, from the focus state as of right now (see focused_now). During a heal
     # (refresh/reorder focusing spaces transiently) never trust "focused": flip.
+    # A heal with a LIVE holder (yabai_lock_live): a heal.lock left by a dead one
+    # is not a heal in progress.
     IFS=$'\x1f' read -r fl ft fd <<<"$(focused_now)"
-    if [ "$fl" = "$label" ] && [ "$fd" = "$disp" ] && [ ! -d "$YABAI_STATE_DIR/heal.lock" ]; then
+    if [ "$fl" = "$label" ] && [ "$fd" = "$disp" ] && ! yabai_lock_live "$YABAI_STATE_DIR/heal.lock"; then
       route=direct
     elif [ "$layout" = stack ] && [ "$ft" = stack ]; then
       route=flip

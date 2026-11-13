@@ -43,16 +43,19 @@ wspace=${wspaces%% *}
 # moves fire space_changed, which re-entrantly invokes us. Let it finish -- its
 # final workspace_refresh leaves canonical order, and a later space_changed re-runs
 # us cleanly. Same lock dir as yabai_displays.sh; never present on a stable session.
-[ -d "${TMPDIR:-/tmp}/yabai_displays.lock" ] && exit 0
+# yabai_lock_live, not a bare `-d`: a lock whose holder died (a yabai restart mid-
+# hotplug) used to keep this hook off until something else reaped the directory.
+# (yabai_common.sh is sourced only here, past the fast path: sourcing it forks, and
+# this runs on every space switch.)
+# shellcheck source=/dev/null
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
+yabai_lock_live "${TMPDIR:-/tmp}/yabai_displays.lock" && exit 0
 
 # Never take a space that already carries ANOTHER canonical label. A WezTerm window
 # dragged onto `main` in Mission Control (or caught there by the launch race) used to
 # get `main` overwritten with `terminal`, leaving the real terminal space unlabeled.
 # That window is the stray, not the label: leave everything as it is and let the pin
-# rule / window_created nudge send WezTerm home. (yabai_common.sh is sourced only
-# here, past the fast path: sourcing it forks, and this runs on every space switch.)
-# shellcheck source=/dev/null
-. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
+# rule / window_created nudge send WezTerm home.
 wlabel=$(yabai -m query --spaces --space "$wspace" 2>/dev/null | jq -r '.label // empty' 2>/dev/null)
 if [ -n "$wlabel" ] && [ "$wlabel" != terminal ]; then
   case " $YABAI_LABELS " in *" $wlabel "*) exit 0 ;; esac
@@ -69,19 +72,13 @@ yabai -m space "$wspace" --label terminal >/dev/null 2>&1 || true
 "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_reorder_spaces.sh" >/dev/null 2>&1 || true
 
 # Sweep husk spaces. Entering/exiting native fullscreen leaves the vacated Space
-# behind as an empty desktop; over time these pile up. Destroy the surplus empty,
-# UNLABELED, NON-fullscreen spaces, keeping exactly ONE empty per display -- enough
-# that the sweep is idempotent and doesn't thrash (macOS recreates a space on
-# fullscreen-exit if none is suitable). group_by(.display) so a fullscreen toggle
-# on the EXTERNAL display is cleaned too, each display keeping its own landing pad.
-# Never touches a labeled or fullscreen Space; a no-op when every display has <=1
-# empty. Indices are destroyed high-to-low so yabai's index compaction on --destroy
-# can't stale a later target.
-surplus=$(yabai -m query --spaces 2>/dev/null | jq -r '
-  [ .[] | select(.label == "" and (.windows | length == 0) and (.["is-native-fullscreen"] == false)) ]
-  | group_by(.display)
-  | map(sort_by(.index) | reverse | .[1:])
-  | flatten | map(.index) | sort | reverse | .[]' 2>/dev/null)
-for sidx in $surplus; do
-  yabai -m space "$sidx" --destroy >/dev/null 2>&1 || true
-done
+# behind as an empty desktop; over time these pile up. Keeps exactly ONE empty,
+# unlabeled space per display (policy + guards: yabai_sweep_empty_spaces in
+# yabai_common.sh, shared with the heal path's `yabai_workspace_refresh.sh --sweep`).
+# Under refresh.lock like that one: a space a refresh or yabai_ensure_ext has created
+# and not yet labeled looks like a husk. If the lock stays busy (~2s) skip the sweep
+# rather than run it unguarded; the next heal or relabel sweeps.
+if yabai_lock_acquire_wait "$YABAI_STATE_DIR/refresh.lock" 20; then
+  yabai_sweep_empty_spaces
+  yabai_lock_release "$YABAI_STATE_DIR/refresh.lock"
+fi

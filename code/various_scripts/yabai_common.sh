@@ -158,6 +158,186 @@ yabai_log_trim() {
   tail -n 2000 "$f" >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null || true
 }
 
+# --- single-flight locks ---------------------------------------------------------
+# mkdir-based (flock does not exist on this machine), with the holder's pid in
+# <dir>/pid so a lock has an OWNER. The old per-script form (`mkdir` + an
+# unconditional `trap 'rmdir "$LOCK"' EXIT`) dropped the single-flight after a
+# takeover: run A stalls past the stale age, run B breaks and re-takes the lock, A
+# finally exits and its trap removes B's lock, and a third run starts alongside B.
+#
+#   yabai_lock_acquire <dir> [stale_seconds=30]   0 = this process now owns <dir>
+#   yabai_lock_release <dir>                      removes <dir> only if we still own it
+#
+# Never blocks and never sleeps on the uncontended path (one mkdir). A held lock is
+# broken when it is STALE: its recorded owner is no longer running (a yabai restart
+# kills every handler; no need to sit out the age), or it is older than
+# stale_seconds by mtime (`stat -f %m`, BSD). Breaking and releasing both happen
+# under a second, momentary mkdir mutex (<dir>.break) and re-check under it, so two
+# runs that judged the same lock stale cannot both take it (the loser would otherwise
+# delete the winner's fresh lock), and a stalled owner's late release cannot land
+# between a breaker's remove and re-create.
+
+# The momentary mutex guarding break/release of lock $1. Held for a few syscalls, so
+# one older than 10s was orphaned by a kill mid-break and is cleared.
+_yabai_lock_mutex() {
+  local m="$1.break" mtime
+  mkdir "$m" 2>/dev/null && return 0
+  mtime=$(stat -f %m "$m" 2>/dev/null) || return 1
+  [ "$(( $(date +%s) - mtime ))" -ge 10 ] || return 1
+  rmdir "$m" 2>/dev/null
+  mkdir "$m" 2>/dev/null
+}
+
+# True if lock $1 (an existing dir) may be broken: dead owner, or older than $2 seconds.
+# A lock with no pid yet (its owner is between mkdir and the write) is judged by age only.
+_yabai_lock_stale() {
+  local owner="" mtime
+  { read -r owner <"$1/pid"; } 2>/dev/null
+  case "$owner" in
+    ''|*[!0-9]*) ;;
+    *) kill -0 "$owner" 2>/dev/null || return 0 ;;
+  esac
+  mtime=$(stat -f %m "$1" 2>/dev/null) || return 1
+  [ "$(( $(date +%s) - mtime ))" -ge "$2" ]
+}
+
+yabai_lock_acquire() {
+  local dir="$1" stale="${2:-30}" got=1
+  if mkdir "$dir" 2>/dev/null; then
+    echo "$$" >"$dir/pid" 2>/dev/null
+    return 0
+  fi
+  if [ ! -d "$dir" ]; then
+    # Not contention: the parent is missing (first run after a cache wipe).
+    mkdir -p "${dir%/*}" 2>/dev/null
+    mkdir "$dir" 2>/dev/null || return 1
+    echo "$$" >"$dir/pid" 2>/dev/null
+    return 0
+  fi
+  _yabai_lock_stale "$dir" "$stale" || return 1
+  _yabai_lock_mutex "$dir" || return 1
+  # Re-check under the mutex: another breaker may have just replaced the stale lock
+  # with its own fresh one, which must survive.
+  if [ ! -d "$dir" ] || _yabai_lock_stale "$dir" "$stale"; then
+    rm -rf "$dir" 2>/dev/null
+    if mkdir "$dir" 2>/dev/null; then
+      echo "$$" >"$dir/pid" 2>/dev/null
+      got=0
+    fi
+  fi
+  rmdir "$dir.break" 2>/dev/null
+  return "$got"
+}
+
+# Safe to call unconditionally (an EXIT trap, a run that never got the lock): it only
+# removes a lock whose pid file names this process. If the mutex stays busy -- someone
+# is breaking our lock right now, so we are stale -- the lock is left for them (or for
+# the dead-owner check once we exit). Always returns 0.
+yabai_lock_release() {
+  local dir="$1" owner="" _try
+  { read -r owner <"$dir/pid"; } 2>/dev/null
+  [ "$owner" = "$$" ] || return 0
+  for _try in 1 2 3 4 5; do
+    if _yabai_lock_mutex "$dir"; then
+      owner=""
+      { read -r owner <"$dir/pid"; } 2>/dev/null
+      [ "$owner" = "$$" ] && rm -rf "$dir" 2>/dev/null
+      rmdir "$dir.break" 2>/dev/null
+      return 0
+    fi
+    sleep 0.02
+  done
+  return 0
+}
+
+# True if lock $1 is held by a run that can still be working: the dir exists AND its
+# recorded owner is running, or (no pid recorded -- the owner is between mkdir and
+# the write, or it is a lock of the older pid-less form) it is younger than
+# $2 (default 30) seconds. For READERS that only ask "is X in progress?": a bare
+# `[ -d "$lock" ]` trusted a lock whose holder a yabai restart had killed, until
+# something else reaped it. No forks when the lock is absent or has a pid.
+yabai_lock_live() {
+  local owner="" mtime
+  [ -d "$1" ] || return 1
+  { read -r owner <"$1/pid"; } 2>/dev/null
+  case "$owner" in
+    ''|*[!0-9]*)
+      mtime=$(stat -f %m "$1" 2>/dev/null) || return 1
+      [ "$(( $(date +%s) - mtime ))" -lt "${2:-30}" ] ;;
+    *) kill -0 "$owner" 2>/dev/null ;;
+  esac
+}
+
+# Take lock $1, waiting up to ~$2 tenths of a second (default 50) for a live holder
+# to finish. 0 = we own it; 1 = still busy after the wait, and the caller decides
+# (the callers here proceed without it rather than hang). No sleep when it is free.
+yabai_lock_acquire_wait() {
+  local _waited=0
+  while :; do
+    yabai_lock_acquire "$1" 30 && return 0
+    [ "$_waited" -ge "${2:-50}" ] && return 1
+    sleep 0.1
+    _waited=$((_waited + 1))
+  done
+}
+
+# Sweep husk spaces: destroy the surplus empty, UNLABELED, NON-fullscreen spaces,
+# keeping exactly ONE empty per display (the SINGLE copy of this policy; it used to
+# live only on yabai_terminal_follow.sh's slow path). Fullscreen enter/exit leaves the
+# vacated Space behind as an empty desktop, and a refresh that raced or was lied to
+# by `query --spaces` leaks spares; over time these pile up. One empty per display is
+# kept on purpose: it makes the sweep idempotent (macOS recreates a space on
+# fullscreen-exit if none is suitable), it is the laptop's spare after the labels and
+# the external's reserved scratch. group_by(.display) so each display keeps its own.
+# The kept one is the display's VISIBLE empty if it has one (never destroy the space
+# the user is looking at); else, on the master, the highest-indexed (the spare after
+# the labels), and on any other display the LOWEST-indexed: that is the external's
+# first-position scratch, the slot macOS destroys on disconnect. Keeping a later husk
+# instead left a labeled space first on the external, with nothing re-running
+# yabai_reorder_spaces.sh afterwards. Which display is the master therefore matters,
+# so if it cannot be resolved nothing is swept. Never touches a labeled space, a
+# space with windows, a visible/focused space or a native-fullscreen Space; a no-op
+# when every display has <=1 empty, and when the bulk query answers a bare "[".
+# Indices are destroyed high-to-low so yabai's index compaction on --destroy can't
+# stale a later target, and each target is re-read by index right before it goes and
+# skipped unless it is still the same space id and still qualifies (another script
+# may have labeled it, or put a window on it, since the snapshot). Needs the SA.
+#
+# A space some script has just created and not yet labeled looks exactly like a husk.
+# The creators that matter take refresh.lock around create -> label (the refresh
+# itself, yabai_ensure_ext), and the heal-path sweep runs under that same lock.
+#
+# The selection, as a jq program over the whole spaces array with $m = master display
+# index, emitting "index:id" per space to destroy, highest index first.
+# shellcheck disable=SC2016  # $m is jq's, bound with --argjson
+YABAI_JQ_SWEEP_SURPLUS='
+  [ .[] | select((.label // "") == "" and (.windows | length == 0)
+                 and (.["is-native-fullscreen"] == false)) ]
+  | group_by(.display)
+  | map((if .[0].display == $m
+         then sort_by([(.["is-visible"] == true), .index]) | reverse
+         else sort_by([(.["is-visible"] != true), .index]) end)
+        | .[1:]
+        | map(select(.["is-visible"] == false and .["has-focus"] == false)))
+  | flatten | sort_by(.index) | reverse | .[] | "\(.index):\(.id)"'
+
+yabai_sweep_empty_spaces() {
+  local surplus sidx sid master
+  master=$(yabai_master_index)
+  case "$master" in ''|*[!0-9]*) return 0 ;; esac
+  surplus=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson m "$master" "$YABAI_JQ_SWEEP_SURPLUS" 2>/dev/null)
+  for sidx in $surplus; do
+    sid=${sidx#*:}; sidx=${sidx%%:*}
+    case "$sidx$sid" in ''|*[!0-9]*) continue ;; esac
+    yabai -m query --spaces --space "$sidx" 2>/dev/null | jq -e --argjson id "$sid" '
+      .id == $id and (.label // "") == "" and (.windows | length == 0)
+      and .["is-native-fullscreen"] == false
+      and .["is-visible"] == false and .["has-focus"] == false' >/dev/null 2>&1 || continue
+    yabai -m space "$sidx" --destroy >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
 # A pinned window an automated un-float may touch -- the SINGLE copy of that filter
 # (yabai_startup_reconcile.sh, both its startup poll and its float sweep). yabai
 # floats plenty of windows ON PURPOSE and every one of them must be left alone: a
@@ -355,8 +535,32 @@ yabai_space_ids_json() {
 # space. We move-by-id rather than focus-then-create because `display --focus`
 # races, and a create that lands on the wrong display silently mislabels the scratch.
 # Needs the SA (space create/move/label).
+#
+# The create -> move -> label stretch runs under refresh.lock. Until the label lands
+# the new space is empty and unlabeled, i.e. indistinguishable from a husk: a heal
+# sweep in flight (yabai_sweep_empty_spaces, which runs under that lock) destroyed it
+# -- the keypress then silently did nothing -- or destroyed the laptop's spare in its
+# place; and a refresh could hand it a missing canonical label. Same bounded wait as
+# the refresh, and like it we go ahead WITHOUT the lock if a live holder outlasts the
+# wait: a keypress must not hang. No self-deadlock: the lock is taken after the
+# reuse check and dropped before returning, nothing in between calls
+# yabai_workspace_refresh.sh, and the one caller (yabai_send_window_external.sh)
+# runs its own refresh before this, not around it.
 yabai_ensure_ext() {
-  local ext="$1" idx before after="" newid d _try
+  local idx got rc
+  idx=$(yabai_ext_index)
+  case "$idx" in ''|*[!0-9]*) ;; *) printf '%s' "$idx"; return 0 ;; esac
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  yabai_lock_acquire_wait "$YABAI_STATE_DIR/refresh.lock"; got=$?
+  _yabai_ensure_ext_create "$1"; rc=$?
+  # Only a lock THIS call took (release would also drop one the caller already held).
+  [ "$got" = 0 ] && yabai_lock_release "$YABAI_STATE_DIR/refresh.lock"
+  return "$rc"
+}
+
+_yabai_ensure_ext_create() {
+  local ext="$1" idx before after="" newid d _try _s
+  # Again, now that we hold the lock: another fling may have created it while we waited.
   idx=$(yabai_ext_index)
   case "$idx" in ''|*[!0-9]*) ;; *) printf '%s' "$idx"; return 0 ;; esac
   case "$ext" in ''|*[!0-9]*) return 1 ;; esac
