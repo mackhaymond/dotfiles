@@ -526,7 +526,7 @@ do_menu() {
         "Tomorrow 9:00" t "$(item tomorrow)"
         "Monday 9:00" m "$(item mon)"
         ""
-        "Custom…" c "command-prompt -c $(tq "$tty") -p $(tq "snooze until:") $(tq "$prompt_tmpl")"
+        "Custom…" c "command-prompt -t $(tq "$tty") -p $(tq "snooze until:") $(tq "$prompt_tmpl")"
     )
     [ "$D_SNOOZED" = 1 ] && items+=("" "Unsnooze" u "run-shell -b $(tq "$prefix apply -c $(sq "$tty") unsnooze$tgt")")
     tmux display-menu -c "$tty" -b rounded -s 'bg=#1e1e2e,fg=#cdd6f4' -S 'fg=#f9e2af' \

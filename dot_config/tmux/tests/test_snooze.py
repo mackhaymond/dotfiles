@@ -504,7 +504,7 @@ class Menu(Base):
         self.assertIn("apply-text -c '/dev/ttys999' '1h' 'w:@7'", items["1 hour"][1])
         self.assertTrue(items["1 hour"][1].startswith("run-shell -b "))
         self.assertIn("'tonight'", items["This evening 18:00"][1])
-        self.assertTrue(items["Custom…"][1].startswith('command-prompt -c "/dev/ttys999" -p "snooze until:" '))
+        self.assertTrue(items["Custom…"][1].startswith('command-prompt -t "/dev/ttys999" -p "snooze until:" '))
         self.assertIn("%%%", items["Custom…"][1])
 
     def test_unsnooze_only_when_snoozed(self):
@@ -583,12 +583,20 @@ class MenuCommandsOnAServer(Base):
     def prompt(self, text):
         """command-prompt's %%% substitution, then the template as tmux runs it."""
         cmd = self.items["Custom…"][1]
-        # command-prompt -c "<tty>" -p "snooze until:" "<template>": let tmux
+        # command-prompt -t "<tty>" -p "snooze until:" "<template>": let tmux
         # unquote the template by echoing it through display-message -p.
         template = cmd.split('-p "snooze until:" ', 1)[1]
         template = self.t("if-shell", "true", f"display-message -p -l {template}")
         esc = "".join("\\" + ch if ch in '"\\$;~' else ch for ch in text)
         self.t("if-shell", "true", template.replace("%%%", esc))
+
+    def test_every_item_parses_as_tmux_commands(self):
+        # A bad flag (command-prompt -c) is a parse error tmux only reports
+        # when the item runs; `source-file -n` parses without running.
+        for name, item in self.items.items():
+            f = Path(self.tmp, "item.conf")
+            f.write_text(item[1] + "\n")
+            self.t("source-file", "-n", str(f))
 
     def test_custom_prompt(self):
         self.prompt("fri 9am")
