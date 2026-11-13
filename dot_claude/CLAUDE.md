@@ -232,6 +232,20 @@ built-in `ListAgents`/`SendMessage` for anything tmux-local — those name peers
   `list_panes` before writing, and prefer `message_agent` (it refuses
   non-agent panes) over `send_keys` when talking to a Claude session.
 
+## Email = Spark CLI
+
+When Mack says "email" (check my email, the old email, my inbox), use the
+`spark` CLI (`/usr/local/bin/spark`, via pty) first, not just the claude.ai
+Gmail connector. Spark covers ALL his accounts (mackhaymond@gmail.com,
+mack.haymond@icloud.com, mackhaymond@g.ucla.edu); the Gmail connector sees
+only the UCLA inbox. Read-only; needs Spark Desktop running.
+
+- `spark search "<topic>"` — semantic search, top 20 with bodies
+- `spark search --filter 'after:2026/10/01 from:x subject:y' [--in <acct>]`
+- `spark thread <messageId>`, `spark events`, `spark meetings`, `spark help <cmd>`
+
+Put these instructions in every email-research subagent brief up front.
+
 ## Launchpad catalog (mackhaymond.co)
 
 `mackhaymond.co` is the user's launchpad for everything they host. Whenever
