@@ -73,6 +73,20 @@
 
 zmodload zsh/datetime 2>/dev/null
 
+# A UTF-8 locale, always (as stash.sh): a tmux client without one prints every
+# control character and non-ASCII byte as "_", so the one-read split on US
+# below fails and the toast degrades to display-message. Callers from launchd
+# (snooze.sh wake-due) or `env -i` have no LANG. tmux reads the first
+# non-empty of LC_ALL, LC_CTYPE, LANG.
+case ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) ;;
+    *)
+        if [[ -n ${LC_ALL:-} ]]; then export LC_ALL=en_US.UTF-8
+        elif [[ -n ${LC_CTYPE:-} ]]; then export LC_CTYPE=en_US.UTF-8
+        else export LANG=en_US.UTF-8
+        fi ;;
+esac
+
 client= kind=info ttl= title=
 while (( $# )); do
     case $1 in

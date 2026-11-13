@@ -296,6 +296,16 @@ fn once_lists_stashed_entries() {
     assert!(keep.contains("❯ shell in keep") && keep.contains("kept shell · main") && !keep.contains("suspended"), "{keep}");
     let pitch = row("Pitch deck v2");
     assert!(pitch.contains("▪ Pitch deck v2") && pitch.contains("frozen · bai"), "{pitch}");
+    // Snoozed: the window goes first, under its own rule, with when it wakes.
+    s.tmux(&["set-option", "-w", "-t", &parked, "@stash_wake", &(now + 7200).to_string()]);
+    let f2 = once(&s, &["--once", "110x34", "--tab", "parked"]);
+    let l2: Vec<&str> = f2.lines().collect();
+    let at2 = |needle: &str| l2.iter().position(|x| x.contains(needle)).unwrap_or_else(|| panic!("{needle}: {f2}"));
+    assert!(at2(" snoozed ") < at2("Pitch deck v2") && at2("Pitch deck v2") < at2(" stashed ")
+        && at2(" stashed ") < at2("proj/Codex thing"), "{f2}");
+    assert!(l2[at2("Pitch deck v2")].trim_end_matches('│').trim_end().ends_with("frozen · bai   2h"), "{f2}");
+    assert!(f2.lines().next().unwrap().contains("▪ 4 parked"), "{f2}");
+    s.tmux(&["set-option", "-wu", "-t", &parked, "@stash_wake"]);
     // The window first (no @stash_ts), then the entries, oldest stashed first.
     let at = |needle: &str| l.iter().position(|x| x.contains(needle)).unwrap();
     assert!(at("Pitch deck v2") < at("proj/Codex thing") && at("proj/Codex thing") < at("Fix the parser"), "{f}");

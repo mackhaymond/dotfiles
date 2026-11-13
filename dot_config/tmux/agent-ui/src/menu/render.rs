@@ -378,11 +378,16 @@ fn draw_row(m: &Menu, buf: &mut Buffer, x0: u16, y: u16, cw: u16, row: &Row, sel
             if m.tab == Tab::Parked && cw >= 60 {
                 right = format!("{} · ", p.state_words);
             }
-            right.push_str(&format!("{} {:>4}", sanitize(&p.origin), p.age));
-            let rw = cells(&right);
+            // A snoozed row ends with when it wakes (peach, the alarm's
+            // colour), where a parked one shows its age.
+            let snoozed = p.wake_at.is_some();
+            right.push_str(&format!("{} ", sanitize(&p.origin)));
+            let when = format!("{:>4}", if snoozed { p.wake.as_str() } else { p.age.as_str() });
+            let rw = cells(&right) + cells(&when);
             let room = end.saturating_sub(x + rw + 2) as usize;
             put(buf, x, y, end, &clip(&sanitize(shown_title(&a.title)), room), if sel { bold(fg("text")) } else { ov });
-            put(buf, end.saturating_sub(rw), y, end, &right, ov);
+            let wx = put(buf, end.saturating_sub(rw), y, end, &right, ov);
+            put(buf, wx, y, end, &when, if snoozed { fg("peach") } else { ov });
         }
         Row::Fold(k) => {
             put(buf, lead, y, x0 + cw, &format!("▪ {k} parked ⇥"), if sel { bold(fg("text")) } else { ov });
@@ -646,7 +651,7 @@ fn footer(m: &Menu, buf: &mut Buffer, w: u16, y: u16, now: f64) {
         items.push(("esc".into(), "cancel".into()));
         // The least needed go first; the answers, the diff and ⏎ go last.
         key_items(buf, cx, y, end, items,
-            &["cancel", "restart watcher", "preview", "park", "discard", "close", "unpin", "pin", "go", "diff"]);
+            &["cancel", "restart watcher", "preview", "snooze", "park", "discard", "close", "unpin", "pin", "go", "diff"]);
         return;
     }
     if !m.msg.is_empty() && now < m.msg_until {
@@ -902,7 +907,7 @@ mod tests {
             (w.state, w.kind, w.detail_kind) = ("needs-input".into(), "claude".into(), "perm".into());
             (w.detail, w.since_t) = ("Bash ls".into(), Some(500));
         }
-        let words = ["allow", "deny", "pin", "park", "close", "diff", "preview", "restart watcher", "go", "cancel"];
+        let words = ["allow", "deny", "pin", "park", "snooze", "close", "diff", "preview", "restart watcher", "go", "cancel"];
         for w in [80u16, 100, 120] {
             let mut m = Menu::new(data_of(&snap), Tab::All);
             m.sel = Some(RowKey::Agent("work".into(), "@6".into()));
@@ -916,7 +921,8 @@ mod tests {
             }
             assert!(words.iter().any(|wd| line.ends_with(wd)), "{w}: cut mid-chip: {line}");
             // Every word shown is whole: its key chip right before it.
-            for (k, wd) in [("p", "pin"), ("s", "park"), ("x", "close"), ("v", "preview"), ("r", "restart watcher"), ("esc", "cancel")] {
+            for (k, wd) in [("p", "pin"), ("s", "park"), ("z", "snooze"), ("x", "close"), ("v", "preview"), ("r", "restart watcher"),
+                ("esc", "cancel")] {
                 let shown = line.contains(&format!(" {k}  {}", &wd[..1]));
                 assert_eq!(shown, line.contains(&format!(" {k}  {wd}")), "{w}: {wd} cut in {line}");
             }
@@ -941,7 +947,7 @@ mod tests {
         m.act(Key::Char(' '), &mut NoEffects);
         let f = frame(&mut m, 110, 34);
         // (At 110 columns `esc cancel` is the first to go.)
-        assert!(f[32].starts_with("│ Kua Yu focus timing  p  pin  s  park  x  close  d  diff  v  preview  r  restart watcher  ⏎  go"),
+        assert!(f[32].starts_with("│ Kua Yu focus timing  p  pin  s  park  z  snooze  x  close  d  diff  v  preview  r  restart watcher  ⏎  go"),
             "{}", f[32]);
         m.act(Key::Char('x'), &mut NoEffects);
         let f = frame(&mut m, 110, 34);

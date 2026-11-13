@@ -1,0 +1,92 @@
+#!/bin/bash
+# snooze timer: install the LaunchAgent com.mackhaymond.tmux-snooze, which runs
+# `~/.config/tmux/scripts/snooze.sh wake-due` every 60 s (and at load). Its
+# fast path reads one small file and exits while nothing is due, so the tick
+# costs one bash start. Docs: the header of dot_config/tmux/scripts/
+# executable_snooze.sh.
+#
+# LANG: launchd gives a job no locale, and a tmux client without a UTF-8 one
+# prints \x1f, tabs and non-ASCII as "_" (snooze.sh guards it too).
+#
+# run_onchange: chezmoi re-runs this whenever the rendered text changes, i.e.
+# whenever the plist below (home, Homebrew prefix) does. The plist is written
+# only when its content differs from what is installed; the agent is then
+# reloaded (bootout + bootstrap). Unchanged but not loaded → loaded.
+#
+# By hand (same thing):
+#   chezmoi execute-template < ~/.local/share/chezmoi/.chezmoiscripts/run_onchange_after_snooze-launchagent.sh.tmpl | bash
+# Off by hand: launchctl bootout gui/$(id -u)/com.mackhaymond.tmux-snooze
+{{- if ne .chezmoi.os "darwin" }}
+echo "[snooze] not macOS; no LaunchAgent"
+exit 0
+{{- end }}
+set -uo pipefail
+
+LABEL=com.mackhaymond.tmux-snooze
+PLIST={{ joinPath .chezmoi.homeDir "Library/LaunchAgents/com.mackhaymond.tmux-snooze.plist" | quote }}
+STATE_DIR={{ joinPath .chezmoi.homeDir ".local/state/tmux-snooze" | quote }}
+DOMAIN="gui/$(id -u)"
+
+mkdir -p "$STATE_DIR" "$(dirname "$PLIST")"
+
+want=$(cat <<'PLIST_EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.mackhaymond.tmux-snooze</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>{{ .chezmoi.homeDir }}/.config/tmux/scripts/snooze.sh</string>
+		<string>wake-due</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>{{ .chezmoi.homeDir }}/.local/bin:{{ .homebrew_prefix }}/bin:/usr/bin:/bin</string>
+		<key>LANG</key>
+		<string>en_US.UTF-8</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>{{ .chezmoi.homeDir }}/.local/state/tmux-snooze/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>{{ .chezmoi.homeDir }}/.local/state/tmux-snooze/launchd.log</string>
+</dict>
+</plist>
+PLIST_EOF
+)
+
+changed=0
+if [ ! -f "$PLIST" ] || [ "$(cat "$PLIST")" != "$want" ]; then
+    printf '%s\n' "$want" >"$PLIST.tmp.$$" && mv -f "$PLIST.tmp.$$" "$PLIST" || {
+        echo "[snooze] could not write $PLIST" >&2; rm -f "$PLIST.tmp.$$"; exit 1; }
+    plutil -lint "$PLIST" >/dev/null || { echo "[snooze] $PLIST does not lint" >&2; exit 1; }
+    changed=1
+    echo "[snooze] wrote $PLIST"
+fi
+
+loaded=0
+launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 && loaded=1
+if [ "$changed" = 0 ] && [ "$loaded" = 1 ]; then
+    echo "[snooze] $LABEL is up to date and loaded"
+    exit 0
+fi
+
+launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null
+# bootout returns before the job is fully gone; bootstrap can then fail with
+# "Input/output error" for a moment.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null; then
+        echo "[snooze] loaded $LABEL (wake-due every 60 s)"
+        exit 0
+    fi
+    sleep 0.5
+done
+echo "[snooze] launchctl bootstrap $DOMAIN $PLIST failed" >&2
+exit 1

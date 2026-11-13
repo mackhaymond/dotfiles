@@ -14,10 +14,12 @@
 //!   the list; ⏎ goes to the selected match; Esc leaves the search and clears
 //!   it (a second Esc closes); Backspace on an empty query leaves it.
 //! - **Actions** (Space): the footer lists what the selected row offers
-//!   (`p` pin / unpin: the sidebar's PINNED section, `s` park, `x` close or
-//!   discard, `d` its uncommitted diff in a popup (closes the menu), `v`
-//!   the preview strip, `r` restart the watcher, ⏎ go; a parked row offers
-//!   neither p nor s, a pending space's claude no s; a Claude agent waiting
+//!   (`p` pin / unpin: the sidebar's PINNED section, `s` park, `z` snooze
+//!   (snooze.sh's durations menu, after this popup closes; on a parked row
+//!   too: set or clear its wake), `x` close or discard, `d` its uncommitted
+//!   diff in a popup (closes the menu), `v` the preview strip, `r` restart
+//!   the watcher, ⏎ go; a parked row offers neither p nor s, a pending
+//!   space's claude and a space's home no s nor z; a Claude agent waiting
 //!   on a permission prompt offers `y` allow and `n` deny first, answered in
 //!   place by [`crate::answer`], no y/n of its own: the capture is the
 //!   check); the next key runs one; Esc or any other key cancels.
@@ -102,6 +104,10 @@ pub trait Effects {
     /// Space d: window `win`'s uncommitted diff in a popup of its own
     /// ([`crate::diff`]), once this menu's popup is gone. Ok closes the menu.
     fn diff(&mut self, win: &str) -> Result<(), String>;
+    /// Space z: snooze.sh's durations menu for window `win` as listed under
+    /// `session` (a stashed entry's `entry:<id>` too), once this menu's
+    /// popup is gone ([`crate::actions::Actions::snooze`]). Ok closes the menu.
+    fn snooze(&mut self, win: &str, session: &str) -> Result<(), String>;
 }
 
 /// Effects that refuse everything: `--once` and tests that must not act.
@@ -133,6 +139,9 @@ impl Effects for NoEffects {
         Err("read-only".into())
     }
     fn diff(&mut self, _: &str) -> Result<(), String> {
+        Err("read-only".into())
+    }
+    fn snooze(&mut self, _: &str, _: &str) -> Result<(), String> {
         Err("read-only".into())
     }
 }
@@ -178,6 +187,8 @@ pub enum Act {
     Deny,
     /// Its uncommitted diff in a popup ([`crate::diff`]).
     Diff,
+    /// snooze.sh's durations menu for it (closes this menu first).
+    Snooze,
 }
 
 /// The actions strip's entries for `t`: (key, act, words). `p` pins (or
@@ -190,6 +201,8 @@ pub enum Act {
 /// never closed (its agent is the home shell pane; prefix Q closes the
 /// space), so neither is offered then (2026-10-22). A stashed entry
 /// ([`Target::entry`]) offers no `d` (no window, no cwd of its own to read).
+/// `z` snoozes (a snooze parks, so never a pending claude or a home); a
+/// parked row offers it too (its wake set, changed or cleared).
 pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
     let mut v = Vec::new();
     if t.perm.is_some() && !t.parked() {
@@ -201,6 +214,9 @@ pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
         if !t.pending && !t.home {
             v.push(('s', Act::Park, "park"));
         }
+    }
+    if t.parked() || (!t.pending && !t.home) {
+        v.push(('z', Act::Snooze, "snooze"));
     }
     if t.parked() || !(t.home && t.panes <= 1) {
         v.push(('x', Act::Close, if t.parked() { "discard" } else { "close" }));
@@ -485,6 +501,11 @@ impl Menu {
             }
             // The diff's popup can only open once this one has closed.
             Act::Diff => match fx.diff(&t.win) {
+                Ok(()) => return true,
+                Err(e) => self.say(e),
+            },
+            // tmux opens snooze.sh's menu only once this popup is gone.
+            Act::Snooze => match fx.snooze(&t.win, &t.session) {
                 Ok(()) => return true,
                 Err(e) => self.say(e),
             },
@@ -852,6 +873,10 @@ pub(crate) mod tests {
             self.calls.push(format!("diff {win}"));
             self.go_err.clone().map_or(Ok(()), Err)
         }
+        fn snooze(&mut self, win: &str, session: &str) -> Result<(), String> {
+            self.calls.push(format!("snooze {win} {session}"));
+            self.go_err.clone().map_or(Ok(()), Err)
+        }
     }
 
     fn keys(s: &str) -> Vec<Key> {
@@ -1174,7 +1199,7 @@ pub(crate) mod tests {
         let mut m = menu();
         let t = m.selected_target().unwrap();
         assert_eq!(strip(&t).iter().map(|(k, _, w)| format!("{k} {w}")).collect::<Vec<_>>(),
-            ["p pin", "s park", "x close", "d diff", "v preview", "r restart watcher"]);
+            ["p pin", "s park", "z snooze", "x close", "d diff", "v preview", "r restart watcher"]);
         assert!(!m.handle(&keys(" p"), &mut fx));
         assert_eq!((fx.calls.as_slice(), m.msg.as_str(), m.confirm.is_none()), (&["pin @6".to_string()][..], "pinned @6", true));
         // The same window, pinned in tmux: p unpins.
@@ -1436,7 +1461,7 @@ pub(crate) mod tests {
         let t = m.selected_target().unwrap();
         assert!(t.parked() && t.entry());
         assert_eq!(strip(&t).iter().map(|(k, _, w)| format!("{k} {w}")).collect::<Vec<_>>(),
-            ["x discard", "v preview", "r restart watcher"]);
+            ["z snooze", "x discard", "v preview", "r restart watcher"]);
         let mut fx = Rec::default();
         assert!(m.act(Enter, &mut fx));
         assert_eq!(fx.calls, ["go entry:1790000100-12 stash"]);
@@ -1449,6 +1474,37 @@ pub(crate) mod tests {
         m.set_tab(Tab::Parked);
         let rows = super::super::rows::build_rows(&m.data, Tab::Parked, "parser");
         assert_eq!(rows.iter().filter_map(Row::key).map(|k| k.window().to_string()).collect::<Vec<_>>(), ["entry:1790000100-12"]);
+    }
+
+    /// Space z: the row's snooze (snooze.sh's menu) closes this menu; an
+    /// agent row and a parked row (window or stashed entry) offer it, a
+    /// space's home does not; a refusal stays, with why.
+    #[test]
+    fn space_z_snoozes() {
+        let mut fx = Rec::default();
+        let mut m = menu();
+        assert!(m.handle(&keys(" z"), &mut fx));
+        assert_eq!(fx.calls, ["snooze @6 work"]);
+        let mut d = data();
+        d.view.add_stashed(&crate::stashed::parse_pinned(crate::stashed::tests::HISTORY));
+        let mut m = Menu::new(d, Tab::Parked);
+        draw_all(&mut m);
+        m.act(End, &mut NoEffects);
+        assert!(m.handle(&keys(" z"), &mut fx));
+        m.act(Home, &mut NoEffects);
+        assert!(m.handle(&keys(" z"), &mut fx));
+        assert_eq!(&fx.calls[1..], ["snooze entry:1790000100-12 stash", "snooze @10 stash"]);
+        let mut fx = Rec { go_err: Some("Busy is working, can't snooze".into()), ..Rec::default() };
+        let mut m = menu();
+        assert!(!m.handle(&keys(" z"), &mut fx));
+        assert_eq!(m.msg, "Busy is working, can't snooze");
+        // A space's home: never snoozed (a snooze parks).
+        let mut snap = fixture();
+        for w in snap.windows.iter_mut().filter(|w| w.id == "@6") {
+            w.home = true;
+        }
+        let t = menu_of(data_of(&snap)).selected_target().unwrap();
+        assert!(t.home && !strip(&t).iter().any(|(k, _, _)| *k == 'z'), "{t:?}");
     }
 
     /// A blank snapshot (or a search that matches nothing) keeps the

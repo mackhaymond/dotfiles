@@ -802,6 +802,11 @@ unbind -n M-y
 # for the picker, and a backgrounded run-shell has no client to raise it on.
 bind-key H run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh stash '#{window_id}'"
 bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash '' '#{client_name}'"
+# Snooze: park this tab with an alarm (snooze.sh menu: 1h, 3h, this evening,
+# tomorrow 9:00, Monday 9:00, custom). At the wake time a LaunchAgent tick
+# (snooze.sh wake-due) puts it back at the end of its space's bar, agent
+# resumed / jobs thawed, without moving anyone's view, and toasts once.
+bind-key Z run-shell "#{HOME}/.config/tmux/scripts/snooze.sh menu '#{client_tty}' '#{window_id}'"
 
 # ...and a range of adjacent tabs at once, vim-visual style. prefix+v enters
 # the mode with just the current tab selected (tinted); the client is then

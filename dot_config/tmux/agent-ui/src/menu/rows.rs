@@ -342,6 +342,11 @@ pub fn matches(a: &Agent, q: &str) -> bool {
         .any(|s| s.to_lowercase().contains(&q))
 }
 
+/// The Parked filter's rules when anything is snoozed: the snoozed block,
+/// then the rest.
+pub const SNOOZED: &str = "snoozed";
+pub const STASHED: &str = "stashed";
+
 /// The list for one filter and search query (see the module docs).
 pub fn build_rows(d: &Data, tab: Tab, query: &str) -> Vec<Row> {
     let v = &d.view;
@@ -382,7 +387,19 @@ pub fn build_rows(d: &Data, tab: Tab, query: &str) -> Vec<Row> {
         rows.push(Row::Fold(parked.len()));
     }
     if tab == Tab::Parked {
-        rows.extend(parked.into_iter().cloned().map(Row::Parked));
+        // The SNOOZED ones first, under their own rule (the view keeps them
+        // first, soonest wake first), then the rest under `stashed`; with
+        // nothing snoozed, no rules at all.
+        let (snoozed, rest): (Vec<&Parked>, Vec<&Parked>) = parked.into_iter().partition(|p| p.wake_at.is_some());
+        let rule = |name: &str| Row::Group { name: name.into(), branch: String::new(), counts: Counts::default(), current: false };
+        if !snoozed.is_empty() {
+            rows.push(rule(SNOOZED));
+            rows.extend(snoozed.into_iter().cloned().map(Row::Parked));
+            if !rest.is_empty() {
+                rows.push(rule(STASHED));
+            }
+        }
+        rows.extend(rest.into_iter().cloned().map(Row::Parked));
     }
     if rows.is_empty() {
         let why = if !query.is_empty() {
@@ -550,6 +567,24 @@ pub(crate) mod tests {
         assert_eq!(shape(&build_rows(&d, Tab::Parked, "sync")), ["parked @13", "parked @14"]);
         assert_eq!(shape(&build_rows(&d, Tab::All, "zzz")), ["(no matches)"]);
         assert_eq!(shape(&build_rows(&d, Tab::Needs, "zzz")), ["(no matches)"]);
+    }
+
+    /// With anything snoozed, the Parked filter shows it first under a
+    /// `snoozed` rule, the rest under `stashed`; the All fold counts both.
+    #[test]
+    fn parked_tab_splits_snoozed() {
+        let mut snap = fixture();
+        for w in snap.windows.iter_mut().filter(|w| w.id == "@13") {
+            w.stash_wake = Some(5000);
+        }
+        let d = data_of(&snap);
+        assert_eq!(shape(&build_rows(&d, Tab::Parked, "")),
+            ["-- snoozed", "parked @13", "-- stashed", "parked @10", "parked @11", "parked @12", "parked @14"]);
+        assert_eq!(shape(&build_rows(&d, Tab::All, "")).last().map(String::as_str), Some("▪5"));
+        // Only snoozed ones match: no `stashed` rule.
+        assert_eq!(shape(&build_rows(&d, Tab::Parked, "calendar")), ["-- snoozed", "parked @13"]);
+        // None snoozed: no rules at all.
+        assert_eq!(shape(&build_rows(&d, Tab::Parked, "pitch")), ["parked @10"]);
     }
 
     #[test]

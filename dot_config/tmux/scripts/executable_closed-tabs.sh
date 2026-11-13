@@ -6,19 +6,26 @@
 #
 #   closed-tabs.sh close <pane_id>                 snapshot, record, kill the pane
 #   closed-tabs.sh close --ask-space <client> <pane_id>   the same, then ask-space
-#   closed-tabs.sh close --pin <pane_id>           stash an agent tab: a pinned entry
+#   closed-tabs.sh close --pin [--wake <epoch>] <pane_id>   stash an agent tab: a
+#                                                  pinned entry (snoozed with --wake);
+#                                                  prints the new entry's id
 #   closed-tabs.sh ask-space <client> <session>    only home left? ask to close the space
 #   closed-tabs.sh ask-space-yes <client> <sid>    that box's y: still only home? close it
 #   closed-tabs.sh pick-popup [--stashed] <session_id> <tty>   fzf picker (below)
 #   closed-tabs.sh reopen <session_id> <tty> [id…] reopen these (default: newest unpinned)
 #   closed-tabs.sh pin <id…> / unpin <id…>         keep on the stashed shelf / drop to the backlog
 #   closed-tabs.sh forget <id…>                    pinned: unpin it; unpinned: delete it
+#   closed-tabs.sh snooze <epoch> <id…>            pin (if not) and set wake_at
+#   closed-tabs.sh unsnooze <id…>                  drop wake_at; it stays pinned
+#   closed-tabs.sh wake <id…>                      bring them back (snooze.sh wake-due);
+#                                                  prints "<label>\t<session>" each
 #   closed-tabs.sh pinned-json                     the pinned entries, one JSON array
 #   closed-tabs.sh list                            print the history, newest first
 #   closed-tabs.sh describe <id>                   label an entry (close runs this)
 #   closed-tabs.sh summarize <tool> <sid> <cwd> <label> <screen>   print one
 # Exit codes: 0 ok, 3 refused (nothing changed: `close --pin` on a pane with no
-# agent or no session id), 1 error.
+# agent or no session id), 1 error (also: snooze/unsnooze/wake/pin on ids none
+# of which is in the history, or nothing woke).
 #
 # The history is the everything-backlog; the STASH is a kept shelf inside it.
 # An entry with "pinned": true (and "stashed_ts", when it was pinned) is
@@ -37,10 +44,19 @@
 # is back on the tab bar. Every pin-state change refreshes the status line's
 # count through `stash.sh publish-count` (STASH_SH names another, for tests).
 #
-# The picker has two sections: Stashed (pinned entries plus the live windows
-# of the stash session, from `stash.sh rows`, newest stashed first, with their
-# age) above Backlog (unpinned entries, newest closed first); --stashed shows
-# Stashed only (prefix h). ⏎ restores (an entry reopens, a window goes back
+# SNOOZED is stashed with an alarm: a pinned entry with "wake_at" (epoch).
+# snooze.sh's timer runs `wake` when it is due: the tab comes back at the end
+# of its own space's bar (main when that is gone or hidden), no client moved,
+# and snooze.sh says so. Unpinning, forgetting or reopening a snoozed entry
+# drops its alarm. Every wake_at change runs `snooze.sh reschedule`, detached
+# (SNOOZE_SH names another, for tests).
+#
+# The picker has three sections: Snoozed (snoozed entries and stash windows,
+# soonest first, with when they come back), Stashed (pinned entries plus the
+# live windows of the stash session, from `stash.sh rows`, newest stashed
+# first, with their age) and Backlog (unpinned entries, newest closed first);
+# --stashed shows the first two (prefix h). ⌃z opens snooze.sh's menu for the
+# picked rows. ⏎ restores (an entry reopens, a window goes back
 # through `stash.sh unstash`); ⌃s toggles stash/unstash in place (an entry
 # pins/unpins; a live window is already stashed and stays); ⌃x on a stashed
 # row drops it to the backlog (a window: `stash.sh kill-many`, which closes it
@@ -88,6 +104,22 @@
 
 set -uo pipefail
 
+# A UTF-8 locale, ALWAYS (stash.sh's guard, same reason). A tmux client whose
+# locale is not UTF-8 prints every control character of a -F format as "_",
+# and the records read from tmux here are split on \x1f (US): under launchd
+# (snooze.sh's wake-due) session_visible read "main__" and every wake failed.
+# Callers outside tmux (launchd, `env -i`) need not have one, so it is fixed
+# here, the way tmux itself decides: the first non-empty of LC_ALL, LC_CTYPE,
+# LANG.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) ;;
+    *)
+        if [ -n "${LC_ALL:-}" ]; then export LC_ALL=en_US.UTF-8
+        elif [ -n "${LC_CTYPE:-}" ]; then export LC_CTYPE=en_US.UTF-8
+        else export LANG=en_US.UTF-8
+        fi ;;
+esac
+
 # Re-entry (popup, preview, hand-offs through `tmux run-shell`) goes through
 # SELF with STATE_HOME carried along explicitly: commands tmux runs get the
 # SERVER's environment, not this process's. With the installed path and an
@@ -120,8 +152,28 @@ RESURRECT_SAVE="$HOME/.config/tmux/plugins/tmux-assistant-resurrect/scripts/save
 # discarding one (kill-many) and the status-line count (publish-count). STASH_SH
 # names another (tests); it is carried through every re-entry like STATE_HOME.
 STASH_SH="${STASH_SH:-$HOME/.config/tmux/scripts/stash.sh}"
+# snooze.sh, for its menu (the picker's ⌃z) and `reschedule` (after any change
+# to an entry's wake_at). SNOOZE_SH names another (tests), carried like STASH_SH.
+SNOOZE_SH="${SNOOZE_SH:-$HOME/.config/tmux/scripts/snooze.sh}"
 
 mkdir -p "$STATE_DIR" "$PREVIEWS"
+
+# snooze_sh <args…>: run snooze.sh with this copy, history and stash.sh as
+# its peers; status 1 when there is none.
+snooze_sh() {
+    [ -f "$SNOOZE_SH" ] || return 1
+    # shellcheck disable=SC2097,SC2098  # the same value, exported for snooze.sh's own re-entry
+    CLOSED_TABS_SH="$SELF" XDG_STATE_HOME="$STATE_HOME" STASH_SH="$STASH_SH" SNOOZE_SH="$SNOOZE_SH" \
+        bash "$SNOOZE_SH" "$@"
+}
+# Recompute snooze.sh's next-wake file after a wake_at changed (snooze,
+# unsnooze, a snoozed entry unpinned, forgotten, reopened or woken).
+# Detached, like publish_count, and harmless without a snooze.sh.
+reschedule() {
+    [ -f "$SNOOZE_SH" ] || return 0
+    ( snooze_sh reschedule </dev/null >/dev/null 2>&1 & )
+    return 0
+}
 
 # stash_sh <args…>: run stash.sh, status 1 when there is none.
 stash_sh() { [ -f "$STASH_SH" ] || return 1; bash "$STASH_SH" "$@"; }
@@ -813,10 +865,23 @@ build_cmd() {
 # the resume command, ahead of the kill for every harness: the entry is only
 # worth keeping if it resumes, and the tab can only be left alone if nothing
 # has been killed yet. No agent, no session id or no command: exit 3, the
-# snapshot is dropped and the pane is untouched.
+# snapshot is dropped and the pane is untouched. A pinned close that succeeds
+# prints the new entry's id on stdout (one line, for stash.sh / snooze.sh);
+# --wake <epoch> (pinned only) snoozes it too: the entry gets wake_at.
+#   close [--pin [--wake <epoch>]] <pane>
 do_close() {
-    local pin=""
-    [ "${1:-}" = --pin ] && { pin=1; shift; }
+    local pin="" wake=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --pin) pin=1; shift ;;
+        --wake)
+            wake="${2:-}"
+            [[ "$wake" =~ ^[0-9]+$ ]] || { printf 'closed-tabs: --wake needs an epoch, got "%s"\n' "$wake" >&2; return 1; }
+            shift 2 ;;
+        *) break ;;
+        esac
+    done
+    [ -n "$wake" ] && [ -z "$pin" ] && { printf 'closed-tabs: --wake goes with --pin\n' >&2; return 1; }
     local pane="${1:-}"
     # An empty -t resolves to the CURRENT pane, not to nothing.
     [ -n "$pane" ] || { msg -k error "closed-tabs: no pane given"; return 1; }
@@ -929,11 +994,12 @@ do_close() {
     rec=$(jq -cn --arg id "$id" --arg ts "$ts" --arg sess "$sess" --arg widx "$widx" \
         --arg tsess "$tsess" --arg tcreated "$tcreated" \
         --arg cwd "$cwd" --arg label "$label" --arg tool "$tool" --arg sid "$sid" --arg cmd "$cmd" \
-        --arg pin "$pin" \
+        --arg pin "$pin" --arg wake "$wake" \
         '{id: $id, ts: ($ts|tonumber), session: $sess, tmux_session: $tsess,
           session_created: $tcreated, index: ($widx|tonumber), cwd: $cwd,
           label: $label, tool: $tool, session_id: $sid, cmd: $cmd}
-         + (if $pin == "1" then {pinned: true, stashed_ts: ($ts|tonumber)} else {} end)')
+         + (if $pin == "1" then {pinned: true, stashed_ts: ($ts|tonumber)} else {} end)
+         + (if $wake != "" then {wake_at: ($wake|tonumber)} else {} end)')
 
     if lock_acquire; then
         printf '%s\n' "$rec" >>"$HISTORY"
@@ -945,8 +1011,10 @@ do_close() {
         printf '%s\n' "$rec" >>"$HISTORY"
         log "history lock busy — appended unlocked"
     fi
-    log "close${pin:+ --pin} $sess:$widx cwd=$cwd tool=${tool:--} sid=${sid:--}"
+    log "close${pin:+ --pin}${wake:+ --wake $wake} $sess:$widx cwd=$cwd tool=${tool:--} sid=${sid:--}"
     [ -n "$pin" ] && publish_count
+    [ -n "$wake" ] && reschedule
+    [ -n "$pin" ] && printf '%s\n' "$id"
     if [ -n "$tool" ] && [ -z "$sid" ]; then
         msg -k warn "closed-tabs: couldn't find the $tool session id — reopening will give a plain shell"
     fi
@@ -1354,8 +1422,13 @@ fallback_session() {
     return 1
 }
 
+# Prints "<window id><US><session name>". With mode `wake` (a snoozed entry
+# coming back by itself) it goes to the END of its own session's bar, or of
+# main (no client is asked), with -d so no client's view moves, and says
+# nothing.
+#   reopen_one <rec> <client_session> <client_tty> [wake]
 reopen_one() {
-    local rec="$1" client_sess="$2" client_tty="${3:-}"
+    local rec="$1" client_sess="$2" client_tty="${3:-}" mode="${4:-}"
     local sess tsess tcreated idx cwd cmd tool label
     sess=$(jq -r '.session' <<<"$rec"); idx=$(jq -r '.index' <<<"$rec")
     cwd=$(jq -r '.cwd' <<<"$rec");      cmd=$(jq -r '.cmd // empty' <<<"$rec")
@@ -1377,18 +1450,24 @@ reopen_one() {
     fi
     [ -n "$target" ] && name=$(session_visible "$target")
     if [ -z "$name" ]; then
-        name=$(fallback_session "$client_sess" "$client_tty") || return 1
-        if [ -n "$target" ]; then msg "closed-tabs: its session is hidden — reopened in $name"
-        else msg "closed-tabs: its session is gone — reopened in $name"; fi
+        if [ "$mode" = wake ]; then
+            name=$(fallback_session "" "") || return 1
+        else
+            name=$(fallback_session "$client_sess" "$client_tty") || return 1
+            if [ -n "$target" ]; then msg "closed-tabs: its session is hidden — reopened in $name"
+            else msg "closed-tabs: its session is gone — reopened in $name"; fi
+        fi
     fi
     sess=$name
     [ -d "$cwd" ] || cwd="$HOME"
 
     # Same slot it left: insert before whatever slid into its index (with
     # renumber-windows on, its right-hand neighbour), or at the end if the bar
-    # is now shorter than that.
-    local -a where
-    if tmux list-windows -t "=$sess" -F '#{window_index}' 2>/dev/null | grep -qx "$idx"; then
+    # is now shorter than that. A wake always takes the end.
+    local -a where quiet=()
+    if [ "$mode" = wake ]; then
+        where=(-t "=$sess:") quiet=(-d)
+    elif tmux list-windows -t "=$sess" -F '#{window_index}' 2>/dev/null | grep -qx "$idx"; then
         where=(-b -t "=$sess:$idx")
     else
         where=(-t "=$sess:")
@@ -1412,7 +1491,8 @@ reopen_one() {
             esac
         fi ;;
     esac
-    tmux new-window -P -F '#{window_id}' "${where[@]}" -c "$cwd" "${autostart[@]}" "${birth[@]}" 2>/dev/null
+    tmux new-window "${quiet[@]}" -P -F "#{window_id}${US}#{session_name}" "${where[@]}" -c "$cwd" \
+        "${autostart[@]}" "${birth[@]}" 2>/dev/null
 }
 
 # Reopen the given entries (default: the newest). Several at once go back
@@ -1445,6 +1525,7 @@ do_reopen() {
     while IFS= read -r rec; do
         [ -n "$rec" ] || continue
         if win=$(reopen_one "$rec" "$client_sess" "$client_tty") && [ -n "$win" ]; then
+            win=${win%%"$US"*}
             [ -n "$first" ] || first="$win"
             n=$((n + 1))
             rm -f "$PREVIEWS/$(jq -r '.id' <<<"$rec").ansi"
@@ -1465,8 +1546,10 @@ do_reopen() {
     done < <(jq -sc 'to_entries | sort_by(-.value.ts, -.key) | .[].value' <<<"$recs")
 
     [ -n "$client_tty" ] && [ -n "$first" ] && tmux switch-client -c "$client_tty" -t "$first" 2>/dev/null
-    # A stashed entry that came back has left the shelf.
+    # A stashed entry that came back has left the shelf (and a snoozed one
+    # its alarm).
     grep -q '"pinned":true' <<<"$recs" && publish_count
+    grep -q '"wake_at":' <<<"$recs" && reschedule
     if [ "$lost" -gt 0 ]; then
         msg -k error "closed-tabs: reopened $n, couldn't recreate $failed ($lost lost: history busy, see log)"
     elif [ "$failed" -gt 0 ]; then
@@ -1480,31 +1563,46 @@ do_reopen() {
 #   unpin   pinned → unpinned with .ts = $now, moved to the end: the newest
 #           backlog entry, with its whole RETAIN_DAYS ahead of it
 #   forget  pinned → as unpin; unpinned → dropped
+#   snooze  pinned if it was not (stashed_ts:$now), and wake_at:$wake
+#   unsnooze  wake_at dropped; it stays pinned
+# A snoozed entry is a pinned one with wake_at, so leaving the shelf (unpin,
+# forget) drops wake_at too.
 PIN_JQ='
     def hit: .id as $i | $ids | index($i);
     if $mode == "pin" then
         map(if hit and .pinned != true then .pinned = true | .stashed_ts = $now else . end)
+    elif $mode == "snooze" then
+        map(if hit then
+                (if .pinned != true then .pinned = true | .stashed_ts = $now else . end)
+                | .wake_at = $wake
+            else . end)
+    elif $mode == "unsnooze" then
+        map(if hit then del(.wake_at) else . end)
     else
         map(select((hit and .pinned == true) | not)
             | select($mode != "forget" or (hit | not)))
-        + map(select(hit and .pinned == true) | del(.pinned, .stashed_ts) | .ts = $now)
+        + map(select(hit and .pinned == true) | del(.pinned, .stashed_ts, .wake_at) | .ts = $now)
     end
     | .[]'
 
-# set_pins <pin|unpin|forget> <id…>: apply it under the lock. Prints how many
-# of the ids were pinned and how many were not ("<pinned> <unpinned>"; ids not
-# in the history count in neither), status 1 when the history is busy. The
-# snapshots of dropped entries go with them; pinned-state changes publish
-# the count.
+# set_pins <pin|unpin|forget|unsnooze> <id…> / set_pins snooze <epoch> <id…>:
+# apply it under the lock. Prints "<pinned> <unpinned> <snoozed>": how many of
+# the ids were pinned, not pinned, and carrying a wake_at, BEFORE the change
+# (ids not in the history count in none); status 1 when the history is busy.
+# The snapshots of dropped entries go with them; pinned-state changes publish
+# the count, wake_at changes reschedule snooze.sh.
 set_pins() {
-    local mode="$1"; shift
-    [ "$#" -gt 0 ] || { echo "0 0"; return 0; }
+    local mode="$1" wake=0; shift
+    if [ "$mode" = snooze ]; then wake="${1:-}"; shift; fi
+    [ "$#" -gt 0 ] || { echo "0 0 0"; return 0; }
     lock_acquire || return 1
-    local ids np nu; ids=$(ids_json "$@")
-    read -r np nu < <(jq -r --argjson ids "$ids" \
-        'select(.id as $i | $ids | index($i)) | if .pinned == true then "p" else "u" end' "$HISTORY" 2>/dev/null \
-        | awk '$1 == "p" { p++ } $1 == "u" { u++ } END { print p + 0, u + 0 }')
-    history_filter -s --arg mode "$mode" --argjson ids "$ids" --argjson now "$(date +%s)" "$PIN_JQ"
+    local ids np nu nw; ids=$(ids_json "$@")
+    read -r np nu nw < <(jq -r --argjson ids "$ids" \
+        'select(.id as $i | $ids | index($i))
+         | (if .pinned == true then "p" else "u" end) + (if .wake_at then " w" else "" end)' "$HISTORY" 2>/dev/null \
+        | awk '$1 == "p" { p++ } $1 == "u" { u++ } $2 == "w" { w++ } END { print p + 0, u + 0, w + 0 }')
+    history_filter -s --arg mode "$mode" --argjson ids "$ids" --argjson now "$(date +%s)" \
+        --argjson wake "$wake" "$PIN_JQ"
     if [ "$mode" = forget ]; then
         # Only the dropped (unpinned) ones lose their snapshot.
         local id
@@ -1514,19 +1612,23 @@ set_pins() {
     fi
     lock_release
     case "$mode" in
-    pin) [ "$nu" -gt 0 ] && publish_count ;;
-    *)   [ "$np" -gt 0 ] && publish_count ;;
+    pin)      [ "$nu" -gt 0 ] && publish_count ;;
+    snooze)   [ "$nu" -gt 0 ] && publish_count
+              [ $((np + nu)) -gt 0 ] && reschedule ;;
+    unsnooze) [ "$nw" -gt 0 ] && reschedule ;;
+    *)        [ "$np" -gt 0 ] && publish_count
+              [ "$nw" -gt 0 ] && reschedule ;;
     esac
-    echo "$np $nu"
+    echo "$np $nu $nw"
 }
 
 # pin <id…> / unpin <id…>. Status 1 when none of the ids is in the history.
 do_pin() {
     local mode="$1"; shift
     [ "$#" -gt 0 ] || return 0
-    local counts np nu
+    local counts np nu nw
     counts=$(set_pins "$mode" "$@") || { msg -k warn "closed-tabs: history busy"; return 1; }
-    read -r np nu <<<"$counts"
+    read -r np nu nw <<<"$counts"
     if [ $((np + nu)) -eq 0 ]; then
         msg -k warn "closed-tabs: no such entry"
         return 1
@@ -1543,9 +1645,9 @@ do_pin() {
 # one is deleted with its snapshot.
 do_forget() {
     [ "$#" -gt 0 ] || return 0
-    local counts np nu
+    local counts np nu nw
     counts=$(set_pins forget "$@") || return 1
-    read -r np nu <<<"$counts"
+    read -r np nu nw <<<"$counts"
     if [ "$np" -gt 0 ] && [ "$nu" -gt 0 ]; then
         msg -k ok "closed-tabs: forgot $nu tab(s), $np moved to the backlog"
     elif [ "$np" -gt 0 ]; then
@@ -1553,6 +1655,74 @@ do_forget() {
     else
         msg -k ok "closed-tabs: forgot $nu tab(s)"
     fi
+}
+
+# snooze <epoch> <id…> / unsnooze <id…>. Quiet (snooze.sh says what it did):
+# errors go to stderr. Status 1 for a bad epoch, a busy history, or when none
+# of the ids is in the history.
+do_snooze() {
+    local wake="${1:-}"
+    [[ "$wake" =~ ^[0-9]+$ ]] || { printf 'closed-tabs: snooze needs an epoch, got "%s"\n' "$wake" >&2; return 1; }
+    shift
+    snooze_set snooze "$wake" "$@"
+}
+do_unsnooze() { snooze_set unsnooze "$@"; }
+snooze_set() {
+    local mode="$1" wake=""; shift
+    if [ "$mode" = snooze ]; then wake="$1"; shift; fi
+    [ "$#" -gt 0 ] || { printf 'closed-tabs: %s: no entry given\n' "$mode" >&2; return 1; }
+    local counts np nu nw
+    counts=$(set_pins "$mode" ${wake:+"$wake"} "$@") || { printf 'closed-tabs: history busy\n' >&2; return 1; }
+    read -r np nu nw <<<"$counts"
+    [ $((np + nu)) -gt 0 ] || { printf 'closed-tabs: no such entry\n' >&2; return 1; }
+    log "$mode${wake:+ $wake} $*"
+    return 0
+}
+
+# wake <id…>: snoozed entries coming back by themselves (snooze.sh wake-due).
+# Each reopens as `reopen` would (resumed agent, its cwd, its name) but at the
+# END of its own session's bar, or of main when that session is gone or
+# hidden, without moving any client, and leaves the history. Quiet: prints one
+# "<label>\t<session>" line per entry that came back, for snooze.sh's toast.
+# One that cannot be recreated goes back into the history as it was (still
+# snoozed, so the next tick tries again). Status 1 when nothing came back.
+do_wake() {
+    [ "$#" -gt 0 ] || return 1
+    lock_acquire || { printf 'closed-tabs: history busy\n' >&2; return 1; }
+    local recs
+    recs=$(jq -c --argjson ids "$(ids_json "$@")" 'select(.id as $i | $ids | index($i))' "$HISTORY" 2>/dev/null)
+    if [ -z "$recs" ]; then
+        lock_release
+        return 1
+    fi
+    local ids; ids=$(jq -r '.id' <<<"$recs")
+    # shellcheck disable=SC2086
+    history_filter --argjson ids "$(ids_json $ids)" 'select(.id as $i | $ids | index($i) | not)'
+    lock_release
+
+    local rec out n=0 label desc tool sess widx cwd
+    while IFS= read -r rec; do
+        [ -n "$rec" ] || continue
+        if out=$(reopen_one "$rec" "" "" wake) && [ -n "$out" ]; then
+            n=$((n + 1))
+            rm -f "$PREVIEWS/$(jq -r '.id' <<<"$rec").ansi"
+            IFS=$'\x1f' read -r label desc tool sess widx cwd < <(jq -r \
+                '[.label, (.desc // ""), .tool, .session, .index, .cwd] | map(tostring | gsub("[\t\n\u001f]"; " ")) | join("\u001f")' <<<"$rec")
+            pick_title "$label" "$desc" "$tool" "$sess" "$widx" "$cwd"
+            printf '%s\t%s\n' "${REPLY%%$'\x1f'*}" "${out#*"$US"}"
+            log "wake $(jq -r '"\(.id) \(.session) cwd=\(.cwd) tool=\(.tool)"' <<<"$rec") → ${out#*"$US"}"
+        else
+            if lock_acquire; then
+                printf '%s\n' "$rec" >>"$HISTORY"; lock_release
+                log "wake failed, kept: $(jq -r '.id' <<<"$rec")"
+            else
+                log "wake failed and history busy, dropped: $rec"
+            fi
+        fi
+    done < <(jq -sc 'sort_by(.wake_at // 0) | .[]' <<<"$recs")
+    publish_count
+    reschedule
+    [ "$n" -gt 0 ]
 }
 
 # The pinned entries as one JSON array, newest stashed first (agent-ui's
@@ -1599,12 +1769,15 @@ do_pick_popup() {
 
 # The command line that runs this copy again, with the history and stash.sh
 # it was started with (commands tmux runs get the SERVER's environment).
-reenter() { printf "XDG_STATE_HOME='%s' STASH_SH='%s' bash '%s'" "$STATE_HOME" "$STASH_SH" "$SELF"; }
+reenter() {
+    printf "XDG_STATE_HOME='%s' STASH_SH='%s' SNOOZE_SH='%s' bash '%s'" "$STATE_HOME" "$STASH_SH" "$SNOOZE_SH" "$SELF"
+}
 
 # The live windows of the stash session, from `stash.sh rows`: one line each,
-# US-separated win_id, origin, label, stashed_ts, state (frozen|cold|idle),
-# cwd. Lines whose first field is no window id are dropped (an older stash.sh
-# answers an unknown command with its usage).
+# US-separated win_id, origin, label, stashed_ts, state (frozen | cold | idle |
+# suspended | pending), cwd, wake epoch (empty unless snoozed; absent from an
+# older stash.sh). Lines whose first field is no window id are dropped (an
+# older stash.sh answers an unknown command with its usage).
 stash_rows() {
     stash_sh rows </dev/null 2>/dev/null | awk -F '\037' '$1 ~ /^@[0-9]+$/'
 }
@@ -1616,6 +1789,32 @@ ago() {
     elif [ "$s" -lt 3600 ];  then REPLY="$((s / 60))m ago"
     elif [ "$s" -lt 86400 ]; then REPLY="$((s / 3600))h ago"
     else                          REPLY="$((s / 86400))d ago"
+    fi
+}
+
+# When a snoozed row comes back, in REPLY: "in 40m" within the hour, "in 3h"
+# later today, "tmrw 9:00", a weekday within the week ("mon 9:00"), else the
+# date ("Nov 20"); "due" once it is past (the next wake-due tick takes it).
+# when_init <now> first, once: today's and tomorrow's dates.
+when_init() {
+    WHEN_TODAY=$(date -r "$1" +%Y%m%d)
+    WHEN_TMRW=$(date -r $(( $1 + 86400 )) +%Y%m%d)
+}
+#   when <wake epoch> <now>
+when() {
+    local s=$(( $1 - $2 )) d day hm mon dd
+    if [ "$s" -le 0 ]; then REPLY=due; return; fi
+    if [ "$s" -lt 3600 ]; then REPLY="in $(( (s + 59) / 60 ))m"; return; fi
+    read -r d day hm mon dd < <(date -r "$1" '+%Y%m%d %a %k:%M %b %e')
+    if [ "$d" = "${WHEN_TODAY:-}" ]; then REPLY="in $(( (s + 1800) / 3600 ))h"
+    elif [ "$d" = "${WHEN_TMRW:-}" ]; then REPLY="tmrw $hm"
+    elif [ "$s" -lt $(( 6 * 86400 )) ]; then
+        case "$day" in
+        Mon) day=mon ;; Tue) day=tue ;; Wed) day=wed ;; Thu) day=thu ;;
+        Fri) day=fri ;; Sat) day=sat ;; Sun) day=sun ;;
+        esac
+        REPLY="$day $hm"
+    else REPLY="$mon $dd"
     fi
 }
 
@@ -1653,11 +1852,12 @@ pick_title() {
 #   r:<win>  a `pending` one: back on the bar already, its agent's resume
 #            refused (busy pane); ⏎ retries it, ⌃s and ⌃x leave it alone
 #   -        a section heading
-# Stashed (pinned entries and stash windows, newest stashed first, aged from
-# when they were stashed) comes first, then Backlog (unpinned, newest closed
-# first); --stashed leaves Backlog out. A heading is printed only over a
-# section with rows in it, so the first row under the first heading is always
-# line 2 (where the picker puts the cursor).
+# Snoozed (pinned entries with a wake_at and stash windows with a wake time,
+# soonest first, labelled with when they come back) comes first, then Stashed
+# (the rest of them, newest stashed first, aged from when they were stashed),
+# then Backlog (unpinned, newest closed first); --stashed leaves Backlog out.
+# A heading is printed only over a section with rows in it, so the first row
+# under the first heading is always line 2 (where the picker puts the cursor).
 #   pick-rows [--stashed]
 pick_rows() {
     local only_stashed=""
@@ -1672,32 +1872,44 @@ pick_rows() {
     # abby (Claude Code on abliteration.ai) is recorded as claude; its resume
     # command names abby, or its config dir (entries from before that).
     # Every source row is "<sort ts> US <kind> US id US tool US label US cwd
-    # US desc US session US index"; a window's tool is its state, its session
-    # where it came from.
+    # US desc US session US index US wake"; a window's tool is its state, its
+    # session where it came from; wake is empty unless it is snoozed (an
+    # entry's wake_at only counts while it is pinned; a window's from the 7th
+    # field of `stash.sh rows`).
     local entry_jq='[(if .pinned == true then (.stashed_ts // .ts) else .ts end),
             (if .pinned == true then "p" else "b" end), .id,
             (if .tool == "claude" and ((.cmd // "") | test("claude-abby|^command abby ")) then "abby" else .tool end),
-            .label, .cwd, (.desc // ""), .session, .index] | map(tostring) | join("\u001f")'
-    local stashed backlog=""
-    stashed=$( {
+            .label, .cwd, (.desc // ""), .session, .index,
+            (if .pinned == true then (.wake_at // "") else "" end)] | map(tostring) | join("\u001f")'
+    local shelf snoozed stashed backlog=""
+    shelf=$( {
         [ -s "$HISTORY" ] && jq -r "select(.pinned == true) | $entry_jq" "$HISTORY" 2>/dev/null
-        stash_rows | awk -F '\037' -v OFS='\037' '{ print ($4 ~ /^[0-9]+$/ ? $4 : 0), ($5 == "pending" ? "r" : "w"), $1, $5, $3, $6, "", $2, "" }'
-    } | LC_ALL=C sort -t $'\x1f' -k1,1nr )
+        stash_rows | awk -F '\037' -v OFS='\037' '{
+            print ($4 ~ /^[0-9]+$/ ? $4 : 0), ($5 == "pending" ? "r" : "w"), $1, $5, $3, $6, "", $2, "",
+                  ($5 != "pending" && $7 ~ /^[0-9]+$/ ? $7 : "") }'
+    } )
+    snoozed=$(awk -F '\037' '$10 != ""' <<<"$shelf" | LC_ALL=C sort -t $'\x1f' -k10,10n)
+    stashed=$(awk -F '\037' 'NF && $10 == ""' <<<"$shelf" | LC_ALL=C sort -t $'\x1f' -k1,1nr)
     if [ -z "$only_stashed" ] && [ -s "$HISTORY" ]; then
         backlog=$(jq -r "select(.pinned != true) | $entry_jq" "$HISTORY" 2>/dev/null | tail -r)
     fi
+    [ -n "$snoozed" ] && when_init "$now"
 
-    local section rows
-    for section in stashed backlog; do
-        if [ "$section" = stashed ]; then
+    local section rows wake
+    for section in snoozed stashed backlog; do
+        case "$section" in
+        snoozed)
+            rows=$snoozed
+            [ -n "$rows" ] && printf -- '-\t%s%s󰀠 Snoozed%s\t\n' "$bold" "$blue" "$off" ;;
+        stashed)
             rows=$stashed
-            [ -n "$rows" ] && printf -- '-\t%s%s󰒲 Stashed%s\t\n' "$bold" "$peach" "$off"
-        else
+            [ -n "$rows" ] && printf -- '-\t%s%s󰒲 Stashed%s\t\n' "$bold" "$peach" "$off" ;;
+        backlog)
             rows=$backlog
-            [ -n "$rows" ] && printf -- '-\t%s%s Backlog%s\t\n' "$bold" "$sub" "$off"
-        fi
+            [ -n "$rows" ] && printf -- '-\t%s%s Backlog%s\t\n' "$bold" "$sub" "$off" ;;
+        esac
         [ -n "$rows" ] || continue
-        while IFS=$'\x1f' read -r ts kind id tool label cwd desc sess widx; do
+        while IFS=$'\x1f' read -r ts kind id tool label cwd desc sess widx wake; do
             [ -n "$id" ] || continue
             local c="$teal" title rest
             if [ "$kind" = w ] || [ "$kind" = r ]; then
@@ -1719,8 +1931,10 @@ pick_rows() {
                 title=${REPLY%%$'\x1f'*} rest=${REPLY#*$'\x1f'}
             fi
             [ -n "$rest" ] && rest="  ${sub}— ${rest}${off}"
-            if [ "$ts" -gt 0 ] 2>/dev/null; then ago "$ts" "$now"; else REPLY="?"; fi
-            printf '%s:%s\t%s%-9s%s %s%-9s%s %s%s\t%s%s%s\n' "$kind" "$id" \
+            if [ -n "$wake" ]; then when "$wake" "$now"
+            elif [ "$ts" -gt 0 ] 2>/dev/null; then ago "$ts" "$now"
+            else REPLY="?"; fi
+            printf '%s:%s\t%s%-10s%s %s%-9s%s %s%s\t%s%s%s\n' "$kind" "$id" \
                 "$dim" "$REPLY" "$off" "$c" "${tool:-shell}" "$off" "$title" "$rest" \
                 "$dim" "${cwd/#"$HOME"/\~}" "$off"
         done <<<"$rows"
@@ -1741,16 +1955,16 @@ do_pick() {
     done
     local client_sess="${pos[0]:-}" client_tty="${pos[1]:-}"
     local re flag="" out
-    local hint='⏎ restore · ⌃s stash/unstash · ⌃x stashed→backlog, backlog→forget · Tab or ⇧↑/⇧↓ several'
+    local hint='⏎ restore · ⌃s stash/unstash · ⌃z snooze · ⌃x stashed→backlog, backlog→forget · Tab/⇧↑/⇧↓ several'
     re=$(reenter)
     if [ -n "$stashed" ]; then
         flag=--stashed
-        hint='⏎ restore · ⌃x discard (→ backlog) · Tab or ⇧↑/⇧↓ several'
+        hint='⏎ restore · ⌃z snooze · ⌃x discard (→ backlog) · Tab or ⇧↑/⇧↓ several'
     fi
     out=$(pick_rows $flag \
         | fzf --ansi --delimiter='\t' --with-nth=2.. --reverse --multi \
               --prompt="${stashed:+stashed }restore > " \
-              --expect=ctrl-x \
+              --expect=ctrl-x,ctrl-z \
               --bind 'shift-down:toggle+down,shift-up:toggle+up,ctrl-a:select-all,ctrl-d:deselect-all' \
               --bind 'load:pos(2)+unbind(load)' \
               --bind "ctrl-s:execute-silent($re pick-act ctrl-s '' '' {+1})+deselect-all+reload($re pick-rows $flag)" \
@@ -1777,6 +1991,10 @@ do_pick() {
 #           here, so it lands in the backlog; a legacy suspended one is
 #           killed with its session id logged); a pending one is on the bar
 #           already and is left for closing there
+#   ctrl-z  `snooze.sh menu <tty> <keys…>` with the picked keys as they are
+#           (p:, b:, w:@N; a pending r: one and headings left out): its
+#           presets, Custom… and Unsnooze. Reached through the run-shell -b
+#           hand-off like the others, so the popup is gone when it opens.
 #   pick-act <key> <session_id> <tty> <pick key…>
 do_pick_act() {
     local key="${1:-}" client_sess="${2:-}" client_tty="${3:-}"
@@ -1792,6 +2010,19 @@ do_pick_act() {
         esac
     done
     case "$key" in
+    ctrl-z)
+        local -a targets=()
+        for k in "$@"; do
+            case "$k" in p:?*|b:?*|w:@*) targets+=("$k") ;; esac
+        done
+        if [ "${#targets[@]}" -gt 0 ] && [ ! -f "$SNOOZE_SH" ]; then
+            notify_user ${client_tty:+-c "$client_tty"} -k error -- "snooze: snooze.sh is not installed"
+        elif [ "${#targets[@]}" -gt 0 ]; then
+            snooze_sh menu "$client_tty" "${targets[@]}" </dev/null
+        elif [ "${#pend[@]}" -gt 0 ]; then
+            notify_user ${client_tty:+-c "$client_tty"} -k info -- "already back on the bar — snooze it there"
+        fi
+        ;;
     ctrl-s)
         [ "${#backlog[@]}" -gt 0 ] && set_pins pin "${backlog[@]}" >/dev/null
         [ "${#pinned[@]}" -gt 0 ] && set_pins unpin "${pinned[@]}" >/dev/null
@@ -1848,7 +2079,7 @@ do_preview() {
 
 do_list() {
     [ -s "$HISTORY" ] || { echo "(empty)"; return 0; }
-    jq -r '"\(.ts | strflocaltime("%m-%d %H:%M"))  \(.session):\(.index)  \(if .tool == "" then "-" else .tool end)\(if .pinned == true then "  [stashed]" else "" end)\t\(.label)\t\(.cwd)\(if .desc then "\n    \(.desc)" else "" end)"' "$HISTORY" | tail -r
+    jq -r '"\(.ts | strflocaltime("%m-%d %H:%M"))  \(.session):\(.index)  \(if .tool == "" then "-" else .tool end)\(if .pinned == true then (if .wake_at then "  [snoozed → \(.wake_at | strflocaltime("%m-%d %H:%M"))]" else "  [stashed]" end) else "" end)\t\(.label)\t\(.cwd)\(if .desc then "\n    \(.desc)" else "" end)"' "$HISTORY" | tail -r
 }
 
 case "${1:-}" in
@@ -1865,6 +2096,9 @@ reopen)     shift; do_reopen "$@" ;;
 pin)        shift; do_pin pin "$@" ;;
 unpin)      shift; do_pin unpin "$@" ;;
 forget)     shift; do_forget "$@" ;;
+snooze)     shift; do_snooze "$@" ;;
+unsnooze)   shift; do_unsnooze "$@" ;;
+wake)       shift; do_wake "$@" ;;
 pinned-json) do_pinned_json ;;
 describe)   shift; do_describe "$@" ;;
 summarize)  shift; do_summarize "$@" ;;

@@ -101,11 +101,19 @@ class Base(unittest.TestCase):
             f'preview) [ -n "$2" ] && tmux capture-pane -ep -t "$2" 2>/dev/null ;;\n'
             f'esac\n'
             "exit 0\n")
+        # snooze.sh, faked the same way: every call logged with the
+        # CLOSED_TABS_SH it was handed.
+        self.snooze_log = Path(self.tmp, "snooze.log")
+        self.snooze = Path(self.tmp, "snooze.sh")
+        self.snooze.write_text(
+            "#!/bin/bash\n"
+            f'printf "%s | %s\\n" "$*" "$CLOSED_TABS_SH" >> "{self.snooze_log}"\n'
+            "exit 0\n")
         self.env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
         self.env.update(HOME=self.tmp, TMPDIR=self.tmp + "/", XDG_STATE_HOME=os.path.join(self.tmp, "state"),
                         PATH=f"{self.bin}:{self.env.get('PATH', '/usr/bin:/bin')}",
                         NOTIFY_SH=os.path.join(self.tmp, "no-notify"), NOTIFY_TMUX="true",
-                        STASH_SH=str(self.stash),
+                        STASH_SH=str(self.stash), SNOOZE_SH=str(self.snooze),
                         TMUX_ASSISTANT_RESURRECT_DIR=os.path.join(self.tmp, "ard"))
         Path(self.tmp, "ard").mkdir()
 
@@ -148,6 +156,18 @@ class Base(unittest.TestCase):
                 return calls
             if time.time() > end:
                 self.fail(f"stash.sh never got {want!r}: {calls}")
+            time.sleep(0.05)
+
+    def snooze_calls(self, want=None, timeout=5.0):
+        """The fake snooze.sh's calls ("<args> | <CLOSED_TABS_SH>"); with
+        `want` (the args), wait until such a call is there."""
+        end = time.time() + timeout
+        while True:
+            calls = self.snooze_log.read_text().splitlines() if self.snooze_log.exists() else []
+            if want is None or any(c.split(" | ")[0] == want for c in calls):
+                return calls
+            if time.time() > end:
+                self.fail(f"snooze.sh never got {want!r}: {calls}")
             time.sleep(0.05)
 
 
@@ -390,9 +410,9 @@ class Bookkeeping(Base):
         self.assertEqual(len(self.popups()), 1)
 
 
-@unittest.skipUnless(TMUX and shutil.which("jq"), "tmux / jq not installed")
-class OnAServer(Base):
-    """close --pin, reopen and the live preview against a private tmux server."""
+class ServerBase(Base):
+    """A private tmux server and the fake agent plugin (no tests of its own;
+    test_closed_tabs_snooze.py builds on it too)."""
 
     def setUp(self):
         super().setUp()
@@ -432,6 +452,11 @@ class OnAServer(Base):
         if sid:
             Path(self.tmp, "ard", f"claude-{pid}.json").write_text(json.dumps({"session_id": sid}))
         return pane
+
+
+@unittest.skipUnless(TMUX and shutil.which("jq"), "tmux / jq not installed")
+class OnAServer(ServerBase):
+    """close --pin, reopen and the live preview against a private tmux server."""
 
     def test_close_pin_resolves_the_session_before_the_kill(self):
         pane = self.agent_tab()

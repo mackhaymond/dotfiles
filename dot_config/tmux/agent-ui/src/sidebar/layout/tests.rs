@@ -3333,6 +3333,38 @@ fn held_rows_are_capped() {
     assert_eq!((held_lines(58), held_lines(16), held_lines(12), held_lines(9)), (HELD_MAX, HELD_MAX, 1, 0));
 }
 
+/// PARKED counts every parked row, snoozed ones too, and with anything
+/// snoozed says when the soonest wakes (peach), only while it fits whole:
+/// the count is never clipped for it.
+#[test]
+fn parked_line_says_the_next_wake() {
+    let mut v = quiet();
+    let base = texts(&layout(&v, 44, 40, &Opts::default()));
+    let line = |t: &[String]| t.iter().find(|l| l.starts_with("  PARKED")).cloned().unwrap();
+    assert!(!line(&base).contains("wakes"), "{:?}", line(&base));
+    v.parked[0].wake_at = Some(NOW + 1800);
+    let f = layout(&v, 44, 40, &Opts::default());
+    let t = texts(&f);
+    assert!(line(&t).starts_with(&format!("{} wakes 30m", parked(1))), "{:?}", line(&t));
+    let y = t.iter().position(|l| l.starts_with("  PARKED")).unwrap();
+    let s = f.rows[y].segs.iter().find(|s| s.text == "wakes 30m").unwrap_or_else(|| panic!("{:?}", f.rows[y]));
+    assert_eq!(s.fg, seg("", "peach").fg);
+    // An overdue one (snooze.sh gave up on it) never hides the next wake;
+    // only overdue ones: no hint at all.
+    let mut late = v.clone();
+    late.parked.push(crate::view::Parked { wake_at: Some(NOW - 600), ..late.parked[0].clone() });
+    let l = line(&texts(&layout(&late, 44, 40, &Opts::default())));
+    assert!(l.starts_with(&format!("{} wakes 30m", parked(2))), "{l:?}");
+    late.parked[0].wake_at = None;
+    let l = line(&texts(&layout(&late, 44, 40, &Opts::default())));
+    assert!(l.starts_with(&parked(2)) && !l.contains("wakes"), "{l:?}");
+    // Too narrow for it: the count alone.
+    for w in [20u16] {
+        let l = line(&texts(&layout(&v, w, 40, &Opts::default())));
+        assert!(l.starts_with(parked(1).trim_end()) && !l.contains("wakes"), "{w}: {l:?}");
+    }
+}
+
 mod answer;
 mod bare;
 mod fold;

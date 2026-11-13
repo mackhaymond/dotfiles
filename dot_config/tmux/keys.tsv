@@ -64,6 +64,7 @@ Agents	⌃S P	Pause working agents; again resumes	prefix	P	before closing the li
 
 Park	⌃S H	Park this tab (agent kept, jobs frozen)	prefix	H	refused if it can't be paused
 Park	⌃S h	Unpark (⌘Z picker, stashed only)	prefix	h
+Park	⌃S Z	Snooze this tab: parked, back on its own	prefix	Z	1h · 3h · evening · tomorrow · Monday · custom
 Park	⌃S v	Select a range of tabs (again cancels)	prefix	v
 Park	h / l	Range: move its far end left / right	stash	h l j k	k / j too
 Park	H / ⏎	Range: park the selection	stash	H Enter
@@ -74,6 +75,7 @@ Park	Esc	Range: cancel	stash	Escape q Space C-c
 ⌘Z picker	⏎	Restore it (agent resumed, jobs thawed)			Stashed above, backlog below
 ⌘Z picker	⌃S	Stash / unstash the row			keeps a backlog row past 30 days
 ⌘Z picker	⌃X	Stashed → backlog; backlog row: forget			a parked tab closes into the backlog
+⌘Z picker	⌃Z	Snooze / unsnooze the row			Snoozed sits on top, soonest first
 ⌘Z picker	⇥ / ⇧↑ / ⇧↓	Select several			⌃A all, ⌃D none
 
 Sidebar	⌘B	Sidebar on / off			WezTerm
@@ -93,6 +95,7 @@ Agent menu	␣	Actions for the row
 Agent menu	␣ y	Allow its permission prompt
 Agent menu	␣ n	Deny its permission prompt
 Agent menu	␣ s	Park it
+Agent menu	␣ z	Snooze it
 Agent menu	␣ x	Close it
 Agent menu	␣ p	Pin / unpin it
 Agent menu	␣ d	Its uncommitted diff

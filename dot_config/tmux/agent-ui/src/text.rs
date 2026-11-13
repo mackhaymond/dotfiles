@@ -645,6 +645,41 @@ pub fn when(at: i64, now: f64) -> String {
     }
 }
 
+/// A SNOOZED row's wake time, compact (`left`: seconds until it): `now`
+/// once due; `45m` under an hour (rounded up); `2h` under six hours (to the
+/// nearest hour); else the clock in 24 h: `18:00` today, `tmrw 9:00`,
+/// `mon 9:00` within the week, `nov 20` further.
+pub fn wake_words(at: Local, now: Local, left: i64) -> String {
+    const WD: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+    const MO: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    if left <= 0 {
+        return "now".into();
+    }
+    if left < 3600 {
+        return format!("{}m", ((left + 59) / 60).max(1));
+    }
+    if left < 6 * 3600 {
+        return format!("{}h", (left + 1800) / 3600);
+    }
+    let clock = format!("{}:{:02}", at.hour, at.min);
+    match at.day - now.day {
+        0 => clock,
+        1 => format!("tmrw {clock}"),
+        2..=6 => format!("{} {clock}", WD[usize::from(at.wday % 7)]),
+        _ => format!("{} {}", MO[usize::from(at.mon % 12)], at.mday),
+    }
+}
+
+/// [`wake_words`] for two epochs in this process's local time ("" if the
+/// C library refused either).
+pub fn wake(at: i64, now: f64) -> String {
+    let n = now.floor() as i64;
+    match (local(at), local(n)) {
+        (Some(a), Some(l)) => wake_words(a, l, at - n),
+        _ => String::new(),
+    }
+}
+
 /// `HH:MM` in local time for an epoch (the event log's time column).
 pub fn clock_hm(epoch: i64) -> String {
     let mut tm = Tm {
@@ -870,6 +905,22 @@ mod tests {
 
     /// A reset time as the cards and the banner say it: 12-hour clock, the
     /// weekday when not today (up to six days ahead), the date further.
+    #[test]
+    fn wake_words_are_compact() {
+        let at = |day: i64, wday: u8, hour: u8, min: u8| Local { day, wday, mon: 10, mday: 20, hour, min };
+        let now = at(100, 4, 10, 0); // Thu 10:00
+        let w = |a: Local, left: i64| wake_words(a, now, left);
+        assert_eq!((w(now, 0), w(now, -60)), ("now".to_string(), "now".to_string()));
+        assert_eq!((w(at(100, 4, 10, 1), 1), w(at(100, 4, 10, 45), 2700)), ("1m".to_string(), "45m".to_string()));
+        // A 2 h snooze seen a second later still says 2h (nearest hour).
+        assert_eq!((w(at(100, 4, 12, 0), 7199), w(at(100, 4, 15, 0), 5 * 3600)), ("2h".to_string(), "5h".to_string()));
+        assert_eq!(w(at(100, 4, 18, 0), 8 * 3600), "18:00");
+        assert_eq!(w(at(101, 5, 9, 0), 23 * 3600), "tmrw 9:00");
+        assert_eq!(w(at(104, 1, 9, 5), 4 * 86_400), "mon 9:05");
+        assert_eq!(w(at(110, 0, 9, 0), 10 * 86_400), "nov 20");
+        assert!(!wake(1_800_000_000 + 3600, 1_800_000_000.0).is_empty());
+    }
+
     #[test]
     fn when_words_say_the_day() {
         let at = |day: i64, wday: u8, hour: u8, min: u8| Local { day, wday, mon: 9, mday: 27, hour, min };

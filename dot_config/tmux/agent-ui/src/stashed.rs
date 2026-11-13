@@ -76,6 +76,9 @@ pub struct StashEntry {
     pub cmd: String,
     /// The model's one-liner (do_describe), "" while missing.
     pub desc: String,
+    /// `wake_at`: a SNOOZED entry's wake time (epoch seconds); None when it
+    /// is only stashed. snooze.sh reopens it then.
+    pub wake_at: Option<i64>,
 }
 
 impl StashEntry {
@@ -101,6 +104,9 @@ impl StashEntry {
             session_id: s("session_id"),
             cmd: s("cmd"),
             desc: s("desc"),
+            // A JSON number only, as snooze.sh reads it: anything else is an
+            // alarm its timer never fires, so it is not shown as snoozed.
+            wake_at: n("wake_at"),
         })
     }
 
@@ -277,6 +283,12 @@ pub(crate) mod tests {
         let e = StashEntry::parse(r#"{"id":"9-9","ts":77,"pinned":true}"#).unwrap();
         assert_eq!((e.when(), e.label.as_str()), (77, ""));
         assert!(StashEntry::parse(r#"{"id":"9-9","ts":77,"pinned":false}"#).is_none());
+        // Snoozed: pinned with wake_at, a JSON number only (snooze.sh's
+        // rule): a string, even of digits, or a negative is none.
+        assert_eq!(e.wake_at, None);
+        let wake = |w: &str| StashEntry::parse(&format!(r#"{{"id":"9-9","ts":77,"pinned":true,"wake_at":{w}}}"#)).unwrap().wake_at;
+        assert_eq!((wake("1790009000"), wake(r#""1790009000""#), wake(r#""soon""#), wake("-5")), (Some(1_790_009_000), None, None, None));
+        assert!(StashEntry::parse(r#"{"id":"9-9","ts":77,"wake_at":1790009000}"#).is_none(), "unpinned is never snoozed");
         assert!(StashEntry::parse(r#"{"id":"","pinned":true}"#).is_none());
     }
 

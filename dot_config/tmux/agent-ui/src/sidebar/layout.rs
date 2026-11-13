@@ -4266,8 +4266,9 @@ fn keys_hint(room: usize) -> Option<Vec<Seg>> {
 }
 
 /// The dock's PARKED line: ` PARKED` and its count as a square mauve chip
-/// (the stash's colour; `none` dim with nothing parked): a click opens the
-/// same popup as prefix h ([`Target::Stash`]). On the right a message
+/// (the stash's colour; `none` dim with nothing parked; snoozed ones
+/// counted too), then, with anything snoozed, `wakes 2h` (the soonest): a
+/// click opens the same popup as prefix h ([`Target::Stash`]). On the right a message
 /// (Roster.say) or the watcher's problem in red (click: restart); else the
 /// keybind help's hint ([`keys_hint`], `⌃S ? keys`: a click opens it,
 /// [`Target::Keys`]), shortened as the line narrows, gone before the count
@@ -4283,6 +4284,18 @@ fn parked_header(view: &ViewModel, w: usize, msg: Option<&str>) -> Row {
         left.extend(module(&n.to_string(), "mauve", vec![]));
     } else {
         left.push(seg("none", dim(true)));
+    }
+    // Anything snoozed: when the next one wakes (`wakes 2h`, peach: the
+    // alarm's colour, as the menu's Snoozed rows), only while it fits whole.
+    // Only wakes still ahead: one overdue (snooze.sh gave up on it after
+    // its failed tries; the menu still lists it, `now`) would otherwise say
+    // `wakes now` for good and hide the real next one.
+    let ahead = view.now.floor() as i64;
+    if let Some(next) = view.snoozed().filter_map(|p| p.wake_at).filter(|t| *t > ahead).min() {
+        let when = vec![seg(" ", "text"), seg(format!("wakes {}", crate::text::wake(next, view.now)), "peach")];
+        if width(&left) + width(&when) < inner(w) {
+            left.extend(when);
+        }
     }
     let lw = width(&left);
     let (right, restart, keys) = match (msg, watcher_problem(view.watcher_age)) {

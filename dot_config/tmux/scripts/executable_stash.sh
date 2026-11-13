@@ -52,7 +52,16 @@
 #                                 log with the command that resumes them by hand
 #   stash.sh rows                 the parked windows, one \x1f-separated row
 #                                 each: window id, origin, label, park time,
-#                                 frozen|cold|idle, cwd (the merged picker's)
+#                                 frozen|cold|idle|suspended|pending, cwd,
+#                                 wake epoch (the merged picker's)
+#   stash.sh snooze <epoch> [<w>] `stash` plus an alarm (agent tab: a pinned
+#                                 entry with wake_at; else @stash_wake);
+#                                 prints p:<entry id> / w:<window id> per
+#                                 thing snoozed
+#   stash.sh set-wake <epoch|""> <w>...  set / clear the alarm on parked windows
+#   stash.sh wake <w>...          the alarm went off: back to its origin at the
+#                                 end of the bar, no client switch, thawed;
+#                                 prints "<label>\t<session>" per window
 #   stash.sh publish-count        @stash_count = parked windows + pinned entries
 #   stash.sh thaw <w> [<client>]  bring a frozen window's jobs back (unstash
 #                                 hands off to this)
@@ -334,6 +343,19 @@ publish() { publish_count; save_state; }
 # The count alone: no sidecar, no lock — closed-tabs.sh calls it after every
 # pin change, sometimes while a park holds this script's lock.
 publish_count() { tmux set-option -g @stash_count "$(count)" 2>/dev/null; }
+
+# SNOOZE. A snoozed window is a parked one with an alarm: @stash_wake, the
+# epoch it comes back at (`snooze`, `set-wake`, `wake` below). snooze.sh's
+# timer reads the earliest alarm from a file of its own, which `snooze.sh
+# reschedule` recomputes — run after every change to @stash_wake, detached
+# (fire-and-forget, like closed-tabs.sh's publish-count), so a park never
+# waits on it. SNOOZE_SH names another (tests); missing = nothing to tell.
+SNOOZE_SH="${SNOOZE_SH:-$HOME/.config/tmux/scripts/snooze.sh}"
+reschedule_snooze() {
+    [ -f "$SNOOZE_SH" ] || return 0
+    ( bash "$SNOOZE_SH" reschedule </dev/null >/dev/null 2>&1 & )
+    return 0
+}
 
 # --- surviving a tmux restart -------------------------------------------------
 #
@@ -795,6 +817,17 @@ server_writes_sidecar() {
     sidecar_socket_ok "${sp%%$'\n'*}"
 }
 
+# The tail of a sidecar row from field 10 on — icwd, frozen jobs, wake time —
+# written only as far as the last field that is set (older readers see the
+# 10- or 11-field rows they always did). In ROW_TAIL, not on stdout: this
+# runs per row inside the merge, and $(…) would fork for each.
+ROW_TAIL=""
+row_tail() {   # <icwd> <frozen> <wake>
+    if [ -n "${3:-}" ]; then ROW_TAIL="${SEP}${1}${SEP}${2}${SEP}${3}"
+    elif [ -n "${2:-}" ]; then ROW_TAIL="${SEP}${1}${SEP}${2}"
+    else ROW_TAIL="${1:+${SEP}${1}}"; fi
+}
+
 save_state() {
     local sf tmp rows live raw
     # Not this server's file to write (see socket_ok): out before the lock, so
@@ -808,7 +841,7 @@ save_state() {
     local of; of=$(orphan_file)
     local pass=1 first_ident="" s_pid s_start s_adopt s_sock guard adopted keep fresh_sids fresh_keys
     local notes orphan_rows n_orph n_kept lost_idless line key own m row
-    local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_frozen o_extra o_tail
+    local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_frozen o_wake o_extra o_tail
     while :; do
         # Every window that matters, not just the parked ones. A window can
         # leave the holding session still carrying @stash_session —
@@ -842,6 +875,11 @@ save_state() {
         # window @stash_cold — after a restart the processes are gone, and
         # the unpark re-runs the recorded commands instead of typing `fg`.
         #
+        # Field 12, @stash_wake (a snoozed window's wake epoch), likewise:
+        # written only when set, with fields 10 and 11 in place (even empty)
+        # in front of it; restore-state puts it back, so a restart keeps the
+        # alarm (row_tail builds that tail for rows carried forward).
+        #
         # The five leading fields are not row data: the answering server's
         # #{pid} and #{start_time} (its identity, for adoption, the settle
         # and the $TMUX test in the header), @kill_guard_shutdown,
@@ -849,7 +887,7 @@ save_state() {
         # every line of the call this already made, so they cost no tmux
         # call; the filter below strips them before anything is written.
         raw=$(tmux list-windows -a -F \
-            "#{pid}${SEP}#{start_time}${SEP}#{@kill_guard_shutdown}${SEP}#{@stash_adopted}${SEP}#{socket_path}${SEP}#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@stash_pane_idx}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}${SEP}#{@stash_ts}${SEP}#{pane_current_path}${SEP}#{@stash_frozen}" \
+            "#{pid}${SEP}#{start_time}${SEP}#{@kill_guard_shutdown}${SEP}#{@stash_adopted}${SEP}#{socket_path}${SEP}#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@stash_pane_idx}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}${SEP}#{@stash_ts}${SEP}#{pane_current_path}${SEP}#{@stash_frozen}${SEP}#{@stash_wake}" \
             2>/dev/null) || { lock_release "$SAVE_LOCKDIR"; return 0; }   # tmux unreachable: keep what is on disk
         s_pid=""; s_start=""; s_adopt=""; s_sock=""
         IFS="$SEP" read -r s_pid s_start _ s_adopt s_sock _ <<< "$raw"
@@ -912,7 +950,9 @@ save_state() {
             { $0 = substr($0, length($1) + length($2) + length($3) + length($4) + length($5) + 6) }
             $7!="" || ($1==hold && ($5!="" || $6!="" || $8!="" || $9!="")) {
                 # No field 11: the 10-field row older readers wrote.
-                if ($11 == "") { s = $1; for (i = 2; i <= 10; i++) s = s FS $i; print s } else print }
+                # Fields 11 and 12 only as far as the last one set.
+                last = ($12 != "") ? 12 : (($11 != "") ? 11 : 10)
+                s = $1; for (i = 2; i <= last; i++) s = s FS $i; print s }
             END { exit g ? 3 : 0 }') || guard=1
         # Rows the merge cannot account for are kept, not judged (header).
         keep=""; { [ -z "$adopted" ] || [ "$guard" = 1 ]; } && keep=1
@@ -969,13 +1009,10 @@ save_state() {
             # o_extra soaks up any field a later format appends, so o_icwd
             # (and, for older rows, o_ts or o_cwd) never carries a stray
             # separator.
-            while IFS="$SEP" read -r o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_frozen o_extra; do
+            while IFS="$SEP" read -r o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd o_ts o_icwd o_frozen o_wake o_extra; do
                 o_n=$((o_n + 1))
-                # Fields 10 and 11 as a row carried forward writes them:
-                # nothing, icwd, or icwd and the frozen jobs (field 11 needs
-                # field 10 in place, even empty).
-                if [ -n "$o_frozen" ]; then o_tail="${SEP}${o_icwd}${SEP}${o_frozen}"
-                else o_tail="${o_icwd:+${SEP}${o_icwd}}"; fi
+                # Fields 10-12 as a row carried forward writes them (row_tail).
+                row_tail "$o_icwd" "$o_frozen" "$o_wake"; o_tail="$ROW_TAIL"
                 if [ -z "$o_sid" ]; then
                     # A parked window's origin, label and park time. Not
                     # irreplaceable like a session id, but the same "options do
@@ -1354,7 +1391,7 @@ forget_sids() {
 # resolve_parked_rows, once the session-id rows have claimed their windows —
 # a lookalike in the same directory makes such a row unplaceable rather than
 # a guess.
-apply_row() {   # <win> <origin> <label> <sid> <cwd> <pidx> <ts> [<frozen>]
+apply_row() {   # <win> <origin> <label> <sid> <cwd> <pidx> <ts> [<frozen>] [<wake>]
     local win="$1"
     # Frozen jobs recorded before a restart: the processes died with the old
     # server and the pane is a plain shell now (resurrect-save-repair.py saves
@@ -1371,8 +1408,12 @@ apply_row() {   # <win> <origin> <label> <sid> <cwd> <pidx> <ts> [<frozen>]
     # Epoch seconds or nothing: the roster and the picker do arithmetic on
     # it, and a hand-edited or torn row must not plant garbage there.
     case "$7" in ''|*[!0-9]*) ;; *) tmux set-option -w -t "$win" @stash_ts "$7" 2>/dev/null ;; esac
+    # A snooze's alarm (field 12): an epoch, or nothing. RESTORED_WAKE tells
+    # the caller to reschedule once it is done.
+    case "${9:-}" in ''|*[!0-9]*) ;; *) tmux set-option -w -t "$win" @stash_wake "$9" 2>/dev/null; RESTORED_WAKE=1 ;; esac
     return 0
 }
+RESTORED_WAKE=""
 
 do_restore_state() {
     # The sidecar and the orphans file are the DEFAULT server's (socket_ok):
@@ -1381,7 +1422,7 @@ do_restore_state() {
     # orphans file. It gets nothing, silently.
     server_writes_sidecar || return 0
     local sf of; sf=$(state_file); of=$(orphan_file)
-    local sess idx name pidx origin label sid cwd ts icwd frozen extra win existing kept="" tail
+    local sess idx name pidx origin label sid cwd ts icwd frozen wake extra win existing kept="" tail
 
     # Which snapshot was just restored, for resolve_parked_rows (see
     # restored_snapshot_time). As resurrect's post-restore hook this runs with
@@ -1407,7 +1448,7 @@ do_restore_state() {
         # somebody's (below).
         local stale n1=0
         stale=$'\n'$(superseded_sid_rows "$sf")$'\n'
-        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd frozen extra; do
+        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd frozen wake extra; do
             n1=$((n1 + 1))
             [ -n "$sess" ] && [ -n "$idx" ] && [ -n "$sid" ] || continue
 
@@ -1442,12 +1483,12 @@ do_restore_state() {
             fi
             if [ "$ok" != 1 ]; then
                 # Keep the pointer somewhere durable, and say so loudly.
-                if [ -n "$frozen" ]; then tail="${SEP}${icwd}${SEP}${frozen}"; else tail="${icwd:+${SEP}${icwd}}"; fi
+                row_tail "$icwd" "$frozen" "$wake"; tail="$ROW_TAIL"
                 kept="${kept}${sess}${SEP}${idx}${SEP}${name}${SEP}${pidx}${SEP}${origin}${SEP}${label}${SEP}${sid}${SEP}${cwd}${SEP}${ts}${tail}"$'\n'
                 log "could not place suspended session ${sid%%-*} ($sess:$idx) — kept in $(basename "$of"); \`stash.sh list\` shows how to resume it"
                 continue
             fi
-            apply_row "$win" "$origin" "$label" "$sid" "$cwd" "$pidx" "$ts" "$frozen"
+            apply_row "$win" "$origin" "$label" "$sid" "$cwd" "$pidx" "$ts" "$frozen" "$wake"
             log "restored $sess:$idx — suspended session ${sid%%-*}"
         done < "$sf"
 
@@ -1455,7 +1496,7 @@ do_restore_state() {
         # BEFORE any of it is applied, so one placement cannot change what
         # the next row sees.
         local placed n=0; placed=$(resolve_parked_rows "$sf")
-        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd frozen extra; do
+        while IFS="$SEP" read -r sess idx name pidx origin label sid cwd ts icwd frozen wake extra; do
             n=$((n + 1))
             [ -n "$sess" ] && [ -n "$idx" ] && [ -z "$sid" ] || continue
             # Nothing to re-apply (a bare index and name, as older versions
@@ -1475,7 +1516,7 @@ do_restore_state() {
                 log "could not re-apply parked state to $sess:$idx (from ${origin:-?}${label:+, \"$label\"}) — no window can be told apart as its own${icwd:+ (in $icwd)}, or it was parked after the restored snapshot; not re-applied"
                 continue
             fi
-            apply_row "$win" "$origin" "$label" "" "$cwd" "$pidx" "$ts" "$frozen"
+            apply_row "$win" "$origin" "$label" "" "$cwd" "$pidx" "$ts" "$frozen" "$wake"
             log "restored $sess:$idx${frozen:+ — its frozen jobs re-run on unpark (cold)}"
         done < "$sf"
     fi
@@ -1526,6 +1567,9 @@ do_restore_state() {
     case "$st" in ''|*[!0-9]*) ;; *) tmux set-option -g @stash_adopted "$st" 2>/dev/null ;; esac
 
     tmux set-option -g @stash_count "$(count)" 2>/dev/null
+    # Alarms put back on restored windows: the snooze timer's next wake.
+    [ -n "$RESTORED_WAKE" ] && reschedule_snooze
+    return 0
 }
 
 # --- agent suspend / resume ---------------------------------------------------
@@ -2178,6 +2222,8 @@ park_one() {
     # after) what it was doing. A description from an earlier park is stale.
     tmux set-option -w -t "$win" @stash_ts "$(date +%s)"
     tmux set-option -uw -t "$win" @stash_desc 2>/dev/null
+    # A plain park has no alarm; a snooze sets it once the park has worked.
+    tmux set-option -uw -t "$win" @stash_wake 2>/dev/null
 
     tmux move-window -s "$win" -t "$HOLD": 2>/dev/null && return 0
 
@@ -2454,14 +2500,21 @@ classify_window() {
 
 # Close a one-pane agent tab into a pinned ⌘Z entry. 0 = closed and pinned;
 # 3 = refused, nothing killed (PIN_WHY: closed-tabs.sh's own reason); 1 =
-# something else went wrong (PIN_WHY).
+# something else went wrong (PIN_WHY). With a snooze (SNOOZE_WAKE) the
+# entry is written with its alarm (`--wake`); PIN_ID is the new entry's id,
+# which closed-tabs.sh prints on success.
 PIN_WHY=""
+PIN_ID=""
 pin_window() {
-    local pane="$1" err rc
-    PIN_WHY=""
+    local pane="$1" err rc errf
+    PIN_WHY=""; PIN_ID=""
     [ -f "$CLOSED_TABS_SH" ] || { PIN_WHY="closed-tabs.sh is missing"; return 3; }
-    err=$(bash "$CLOSED_TABS_SH" close --pin "$pane" 2>&1 >/dev/null </dev/null)
+    errf=$(mktemp "${TMPDIR:-/tmp}/stash-pin.XXXXXX") || errf=/dev/null
+    PIN_ID=$(bash "$CLOSED_TABS_SH" close --pin ${SNOOZE_WAKE:+--wake "$SNOOZE_WAKE"} "$pane" 2>"$errf" </dev/null)
     rc=$?
+    PIN_ID="${PIN_ID##*$'\n'}"
+    err=$(cat "$errf" 2>/dev/null)
+    [ "$errf" = /dev/null ] || rm -f "$errf"
     case "$rc" in
         0) return 0 ;;
         3) PIN_WHY=$(printf '%s\n' "$err" | sed -n 's/^closed-tabs: not stashed — //p' | tail -n 1)
@@ -2896,7 +2949,8 @@ do_thaw() {
 }
 
 # The stash for the merged picker (closed-tabs.sh), one per line,
-# \x1f-separated: window id, origin, label, park time, state, cwd. State is
+# \x1f-separated: window id, origin, label, park time, state, cwd, wake epoch
+# (a snoozed window's @stash_wake; "" for none, and for pending rows). State is
 # frozen | cold | idle for a parked window — `suspended` for one parked
 # before 2026-11-11 whose agent was suspended (@stash_session) — and
 # `pending` for a window that is
@@ -2905,11 +2959,11 @@ do_thaw() {
 # runs the resume. Its "origin" is the session it sits in.
 do_rows() {
     if hold_exists; then
-        tmux list-windows -t "=$HOLD" -F "#{window_id}${SEP}#{@stash_origin}${SEP}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}${SEP}#{@stash_ts}${SEP}#{?#{@stash_session},suspended,#{?#{@stash_cold},cold,#{?#{@stash_frozen},frozen,idle}}}${SEP}#{?#{@stash_cwd},#{@stash_cwd},#{pane_current_path}}" 2>/dev/null
+        tmux list-windows -t "=$HOLD" -F "#{window_id}${SEP}#{@stash_origin}${SEP}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}${SEP}#{@stash_ts}${SEP}#{?#{@stash_session},suspended,#{?#{@stash_cold},cold,#{?#{@stash_frozen},frozen,idle}}}${SEP}#{?#{@stash_cwd},#{@stash_cwd},#{pane_current_path}}${SEP}#{@stash_wake}" 2>/dev/null
     fi
     local p
     for p in $(pending_windows); do
-        tmux display-message -p -t "$p" "#{window_id}${SEP}#{session_name}${SEP}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}${SEP}#{@stash_ts}${SEP}pending${SEP}#{?#{@stash_cwd},#{@stash_cwd},#{pane_current_path}}" 2>/dev/null
+        tmux display-message -p -t "$p" "#{window_id}${SEP}#{session_name}${SEP}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}${SEP}#{@stash_ts}${SEP}pending${SEP}#{?#{@stash_cwd},#{@stash_cwd},#{pane_current_path}}${SEP}" 2>/dev/null
     done
     return 0
 }
@@ -3080,7 +3134,8 @@ do_stash_many() {
             fi
             pin_window "${cpanes[$i]}"; rc=$?
             if [ "$rc" = 0 ]; then
-                pinned=$((pinned + 1)); log "stashed $w as a pinned ⌘Z entry"
+                pinned=$((pinned + 1)); log "stashed $w as a pinned ⌘Z entry${SNOOZE_WAKE:+ ($PIN_ID), waking at $SNOOZE_WAKE}"
+                [ -n "$SNOOZE_WAKE" ] && printf 'p:%s\n' "$PIN_ID"
             elif [ -z "$(tmux display-message -p -t "${cpanes[$i]}" '#{pane_id}' 2>/dev/null)" ]; then
                 # Gone even so (a close that failed late).
                 failed=$((failed + 1)); log "close --pin of $w failed ($PIN_WHY) and the tab is gone"
@@ -3098,6 +3153,11 @@ do_stash_many() {
         if ! park_one "$w" "$sess"; then failed=$((failed + 1)); continue; fi
         if freeze_window "$w"; then
             parked+=("$w")
+            if [ -n "$SNOOZE_WAKE" ]; then
+                tmux set-option -w -t "$w" @stash_wake "$SNOOZE_WAKE" 2>/dev/null
+                printf 'w:%s\n' "$w"
+                log "snoozed $w until $SNOOZE_WAKE"
+            fi
             continue
         fi
         # Never leave it running in the stash: back in its own slot, the part
@@ -3157,6 +3217,7 @@ do_stash_many() {
     renumber "$sess" "$HOLD"
     publish
     lock_release
+    [ -n "$SNOOZE_WAKE" ] && reschedule_snooze
     stash_report "$pinned" "${#parked[@]}" "$busy" "$homes" "$failed" "$note" ${kept_why[@]+"${kept_why[@]}"}
 
     # Detached: a one-line account of each parked window for the picker.
@@ -3213,6 +3274,124 @@ stash_report() {   # <pinned> <parked> <busy> <homes> <failed> <note> [<why>...]
 do_stash() {
     do_sel_cancel
     do_stash_many "$(sel_win "${1:-}")"
+}
+
+# --- snooze -----------------------------------------------------------------
+#
+# snooze <epoch> [<win>]: exactly `stash`, plus the alarm — a one-pane agent
+# tab goes to `closed-tabs.sh close --pin --wake <epoch>`, anything else is
+# parked (and frozen) with @stash_wake. Same classification, refusals and
+# messages as `stash`. Prints what got an alarm, one line each: `p:<entry
+# id>` or `w:<window id>` — nothing means nothing was snoozed (refused, or a
+# failure the usual message has already reported). Exit 0 either way, as
+# stash: a run-shell would put a nonzero status into the pane.
+SNOOZE_WAKE=""
+do_snooze() {
+    local when="${1:-}"
+    case "$when" in
+        ''|*[!0-9]*) msg -k error "snooze: no wake time"; return 0 ;;
+    esac
+    SNOOZE_WAKE="$when"
+    do_stash "${2:-}"
+    SNOOZE_WAKE=""
+}
+
+# set-wake <epoch|""> <win…>: set or clear the alarm on windows already
+# parked; anything not in the holding session is skipped (`snooze` parks).
+# Under the park lock, since `wake` reads the same option under it.
+do_set_wake() {
+    local when="${1:-}" w n=0; shift
+    case "$when" in ''|*[!0-9]*) [ -z "$when" ] || { msg -k error "snooze: bad wake time $when"; return 0; } ;; esac
+    lock_acquire || { msg -k warn "busy — try again"; return 0; }
+    for w in "$@"; do
+        [ "$(tmux display-message -p -t "$w" '#{session_name}' 2>/dev/null)" = "$HOLD" ] || continue
+        if [ -n "$when" ]; then
+            tmux set-option -w -t "$w" @stash_wake "$when" 2>/dev/null
+        else
+            tmux set-option -uw -t "$w" @stash_wake 2>/dev/null
+        fi
+        n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && save_state
+    lock_release
+    [ "$n" -gt 0 ] && reschedule_snooze
+    return 0
+}
+
+# Where a woken window goes: its origin — unless that is gone or a hidden
+# session — else main, else a visible session somebody is attached to, else
+# any visible one. Nothing (empty) when there is no visible session at all;
+# the window then stays parked.
+wake_target() {   # <origin>
+    local o="${1:-}" hidden
+    if [ -n "$o" ] && [ "$o" != "$HOLD" ] && ! is_hidden_session "$o" && tmux has-session -t "=$o" 2>/dev/null; then
+        printf '%s' "$o"; return 0
+    fi
+    if tmux has-session -t "=main" 2>/dev/null && ! is_hidden_session main; then printf 'main'; return 0; fi
+    hidden=$(hidden_sessions)
+    o=$(tmux list-sessions -F '#{?session_attached,#{session_name},}' 2>/dev/null |
+        grep -v '^$' | grep -vxF -f <(printf '%s\n' "$hidden") | head -1)
+    [ -n "$o" ] || o=$(tmux list-sessions -F '#{session_name}' 2>/dev/null |
+                       grep -vxF -f <(printf '%s\n' "$hidden") | head -1)
+    printf '%s' "$o"
+}
+
+# wake <win…>: the alarm went off (snooze.sh wake-due). Each window still
+# parked goes back to its origin (wake_target) at the END of its bar, without
+# becoming that session's current tab and without switching any client; its
+# frozen jobs are thawed (warm `fg`, or the command re-run after a restart)
+# and a suspended agent from before 2026-11-11 is resumed, as an unpark
+# would. Prints "<label>\t<session>" per window woken, for snooze.sh's one
+# toast; wake itself says nothing.
+do_wake() {
+    local w win origin dest label woken=() dests=() lines="" o seen
+    hold_exists || return 0
+    lock_acquire || { log "wake: stash lock busy — skipped $*"; return 0; }
+    local wanted=" $* " ordered=()
+    while read -r w; do
+        [ -n "$w" ] || continue
+        case "$wanted" in *" $w "*) ordered+=("$w") ;; esac
+    done < <(tmux list-windows -t "=$HOLD" -F '#{window_id}' 2>/dev/null)
+    for win in ${ordered[@]+"${ordered[@]}"}; do
+        IFS="$SEP" read -r origin label < <(tmux display-message -p -t "$win" \
+            "#{@stash_origin}${SEP}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}" 2>/dev/null)
+        dest=$(wake_target "$origin")
+        if [ -z "$dest" ]; then
+            log "wake: no session to bring $win back to — left parked"
+            continue
+        fi
+        if ! tmux move-window -d -a -s "$win" -t "=$dest:{end}" 2>/dev/null \
+           && ! tmux move-window -d -s "$win" -t "=$dest:" 2>/dev/null; then
+            log "wake: could not move $win to $dest"
+            continue
+        fi
+        tmux set-option -uw -t "$win" @stash_origin 2>/dev/null
+        tmux set-option -uw -t "$win" @stash_label 2>/dev/null
+        tmux set-option -uw -t "$win" @stash_wake 2>/dev/null
+        woken+=("$win")
+        lines="${lines}${label}"$'\t'"${dest}"$'\n'
+        seen=0
+        for o in ${dests[@]+"${dests[@]}"}; do [ "$o" = "$dest" ] && seen=1; done
+        [ "$seen" = 1 ] || dests+=("$dest")
+        log "woke $win ($label) into $dest"
+    done
+    if [ "${#woken[@]}" -gt 0 ]; then
+        renumber "$HOLD" "${dests[@]}"
+        publish
+    fi
+    lock_release
+    [ "${#woken[@]}" -gt 0 ] || return 0
+    reschedule_snooze
+    # Thawed here, in order (wake-due runs from the timer, not a key, so
+    # nothing waits on it); a suspended agent's resume polls for up to 90s,
+    # so that one is handed off as an unpark does.
+    for win in "${woken[@]}"; do
+        do_thaw "$win"
+        [ -n "$(tmux show -wqv -t "$win" @stash_session 2>/dev/null)" ] \
+            && tmux run-shell -b "'$SELF' resume '$win'"
+    done
+    printf '%s' "$lines"
+    return 0
 }
 
 # --- selecting a range of tabs ------------------------------------------------
@@ -4020,7 +4199,7 @@ do_unstash() {
 do_unstash_many() {
     local client=""
     if [ "${1:-}" = "-c" ]; then client="${2:-}"; shift 2; fi
-    local w win origin origins=() ordered=() wanted=" $* "
+    local w win origin origins=() ordered=() wanted=" $* " unsnoozed=""
 
     # Ids NAMED here that are pending resumes rather than parked windows: home
     # already, agent dead, @stash_session still set (a resume refused because
@@ -4120,6 +4299,11 @@ do_unstash_many() {
         fi
         tmux set-option -uw -t "$win" @stash_origin 2>/dev/null
         tmux set-option -uw -t "$win" @stash_label 2>/dev/null
+        # Brought back before its alarm: the snooze is over too.
+        if [ -n "$(tmux show -wqv -t "$win" @stash_wake 2>/dev/null)" ]; then
+            tmux set-option -uw -t "$win" @stash_wake 2>/dev/null
+            unsnoozed=1
+        fi
         # An ARRAY, not a space-joined string. Session names are user-chosen and
         # may contain spaces (or glob metacharacters), and the string form both
         # word-split `my project` into two bogus targets — silently skipping the
@@ -4153,6 +4337,7 @@ do_unstash_many() {
     renumber "$HOLD" ${origins[@]+"${origins[@]}"}
     publish
     lock_release
+    [ -n "$unsnoozed" ] && reschedule_snooze
     [ "$failed" -gt 0 ] && msg -k error "brought back ${#restored[@]}, could not bring back $failed"
 
     # Handed to a BACKGROUNDED run-shell, never called inline. prefix+h is a
@@ -4266,7 +4451,11 @@ do_kill_many() {
         lock_release; msg -k warn "nothing to kill — not parked any more"; return 0
     fi
 
+    local had_wake=""
     for win in "${ordered[@]}"; do
+        # A snoozed window discarded: its alarm goes with it (rescheduled
+        # below, whether or not the close works — a re-read is harmless).
+        [ -n "$(tmux show -wqv -t "$win" @stash_wake 2>/dev/null)" ] && had_wake=1
         sid=$(tmux show -wqv -t "$win" @stash_session 2>/dev/null)
         cwd=$(tmux show -wqv -t "$win" @stash_cwd 2>/dev/null)
         pidx=$(tmux show -wqv -t "$win" @stash_pane_idx 2>/dev/null)
@@ -4327,6 +4516,7 @@ do_kill_many() {
     renumber "$HOLD"
     publish
     lock_release
+    [ -n "$had_wake" ] && reschedule_snooze
     if [ "$killed" -gt 0 ]; then
         if [ "$nsids" -gt 0 ]; then
             msg -k ok "killed $killed — $nsids suspended session(s) discarded, resume commands in $(basename "$LOGFILE")"
@@ -4591,6 +4781,9 @@ do_list() {
 
 case "${1:-}" in
     stash)   shift; do_stash "${1:-}" ;;
+    snooze)  shift; do_snooze "${1:-}" "${2:-}" ;;
+    set-wake) shift; do_set_wake "$@" ;;
+    wake)    shift; do_wake "$@" ;;
     unstash) shift; do_unstash "${1:-}" "${2:-}" ;;
     stash-many)   shift; do_stash_many "$@" ;;
     unstash-many) shift; do_unstash_many "$@" ;;

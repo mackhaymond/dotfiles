@@ -813,6 +813,17 @@ pub struct Parked {
     /// @stash_cold is set: frozen before a restart; its process is gone,
     /// its command kept (unpark re-runs it).
     pub cold: bool,
+    /// SNOOZED: when it wakes (`@stash_wake`; an entry's `wake_at`), and
+    /// that time compact ([`text::wake`]: `2h`, `tmrw 9:00`, `mon 9:00`).
+    /// None / "" when it is only parked.
+    pub wake_at: Option<i64>,
+    pub wake: String,
+}
+
+/// The parked list's order: the SNOOZED rows first, soonest wake first,
+/// then the rest as they were (a stable sort).
+pub fn order_parked(v: &mut [Parked]) {
+    v.sort_by_key(|p| p.wake_at.map_or((1, 0), |t| (0, t)));
 }
 
 /// The words a parked row's state says (the menu's Parked tab), the first
@@ -856,6 +867,8 @@ impl Parked {
             entry: None,
             frozen: !w.stash_frozen.trim().is_empty(),
             cold: !w.stash_cold.trim().is_empty(),
+            wake_at: w.stash_wake,
+            wake: w.stash_wake.map(|t| text::wake(t, now)).unwrap_or_default(),
             agent: a,
         }
     }
@@ -894,6 +907,8 @@ impl Parked {
             entry: Some(e.id.clone()),
             frozen: false,
             cold: false,
+            wake_at: e.wake_at,
+            wake: e.wake_at.map(|t| text::wake(t, now)).unwrap_or_default(),
             agent,
         }
     }
@@ -909,6 +924,8 @@ impl Parked {
             kv.push(("entry".into(), self.entry.clone().into()));
             kv.push(("frozen".into(), self.frozen.into()));
             kv.push(("cold".into(), self.cold.into()));
+            kv.push(("wake_at".into(), self.wake_at.into()));
+            kv.push(("wake".into(), self.wake.as_str().into()));
         }
         v
     }
@@ -1177,7 +1194,8 @@ impl ViewModel {
 
         let mut parked_ws: Vec<&Window> = snap.windows.iter().filter(|w| w.session == HOLD).collect();
         parked_ws.sort_by_key(|w| w.index);
-        let parked = parked_ws.into_iter().map(|w| Parked::of_window(w, agent(w), now)).collect();
+        let mut parked: Vec<Parked> = parked_ws.into_iter().map(|w| Parked::of_window(w, agent(w), now)).collect();
+        order_parked(&mut parked);
 
         ViewModel {
             now,
@@ -1319,11 +1337,11 @@ impl ViewModel {
     /// window parked after it (a window without `@stash_ts` never moves an
     /// entry ahead of it), so the list reads by stash age wherever the
     /// windows do. Calling it again replaces the entries, never doubles them.
+    /// Then the SNOOZED rows, both sources, go first by wake ([`order_parked`]).
     pub fn add_stashed(&mut self, entries: &[crate::stashed::StashEntry]) {
         self.parked.retain(|p| p.entry.is_none());
-        if entries.is_empty() {
-            return;
-        }
+        // The windows back in index order (the build put the snoozed first).
+        self.parked.sort_by_key(|p| p.agent.index);
         let mut es: Vec<Parked> = entries.iter().map(|e| Parked::of_entry(e, self.blink, self.now)).collect();
         es.sort_by(|a, b| a.parked_at.cmp(&b.parked_at).then_with(|| a.entry.cmp(&b.entry)));
         let windows = std::mem::take(&mut self.parked);
@@ -1335,6 +1353,13 @@ impl ViewModel {
             self.parked.push(w);
         }
         self.parked.extend(es);
+        order_parked(&mut self.parked);
+    }
+
+    /// The SNOOZED parked rows ([`Parked::wake_at`]): the first ones, by
+    /// [`order_parked`].
+    pub fn snoozed(&self) -> impl Iterator<Item = &Parked> {
+        self.parked.iter().filter(|p| p.wake_at.is_some())
     }
 
 
@@ -1661,6 +1686,38 @@ mod tests {
         v.add_stashed(&es);
         let order: Vec<&str> = v.parked.iter().map(|p| p.agent.window_id.as_str()).collect();
         assert_eq!(order, ["@1", "@2", "entry:1790000200-13", "entry:1790000100-12"]);
+    }
+
+    /// SNOOZED rows (a stash window's `@stash_wake`, an entry's `wake_at`)
+    /// go first, soonest wake first, both sources mixed; the rest keep the
+    /// stash order after them; each says when it wakes, compact.
+    #[test]
+    fn snoozed_rows_go_first_by_wake() {
+        let now = 1_790_001_000.0;
+        let rows = [
+            row("stash", 1, "@1", &[("stash_label", "Plain"), ("stash_ts", "1790000000")]),
+            row("stash", 2, "@2", &[("stash_label", "Later"), ("stash_wake", "1790012000")]),
+            row("stash", 3, "@3", &[("stash_label", "Soon"), ("stash_wake", "1790002800")]),
+        ];
+        let mut v = ViewModel::build(&Snapshot::parse(&rows.join("\n")), BuildArgs { client: None, now,
+            collator: &Collator::new("C"), git: None, log: vec![], watcher_age: None });
+        let ids = |v: &ViewModel| v.parked.iter().map(|p| p.agent.window_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&v), ["@3", "@2", "@1"]);
+        assert_eq!((v.parked[0].wake.as_str(), v.parked[1].wake_at, v.parked[2].wake.as_str()), ("30m", Some(1_790_012_000), ""));
+        let snoozed = crate::stashed::StashEntry::parse(
+            r#"{"id":"8-8","ts":1790000000,"session":"work","label":"proj/Nap","tool":"claude","pinned":true,"stashed_ts":1790000100,"wake_at":1790005000}"#).unwrap();
+        let mut es = crate::stashed::parse_pinned(crate::stashed::tests::HISTORY);
+        es.push(snoozed);
+        v.add_stashed(&es);
+        // Snoozed: @3 (…2800), the entry (…5000), @2 (…12000); then the
+        // stash order: @1, then the entries by stash age.
+        assert_eq!(ids(&v), ["@3", "entry:8-8", "@2", "@1", "entry:1790000200-13", "entry:1790000100-12"]);
+        assert_eq!((v.parked[1].wake.as_str(), v.snoozed().count()), ("1h", 3));
+        let j = v.parked[1].to_json();
+        assert_eq!((j.get("wake_at").and_then(Value::as_f64), j.get("wake").and_then(Value::as_str)), (Some(1_790_005_000.0), Some("1h")));
+        // Again: the same, never doubled.
+        v.add_stashed(&es);
+        assert_eq!(ids(&v).len(), 6);
     }
 
     /// A shell at the filesystem root is `/` (as `#{b:pane_current_path}`),

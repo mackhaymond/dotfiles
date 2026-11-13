@@ -248,6 +248,10 @@ impl Effects for Live {
         c.args(["diff", win, "--client", &self.client, "--after", &std::process::id().to_string()]);
         crate::proc::spawn_detached(c).map(drop).map_err(|e| format!("diff: {e}"))
     }
+    fn snooze(&mut self, win: &str, session: &str) -> Result<(), String> {
+        // snooze.sh's menu waits for this process (its popup) to go.
+        self.actions.snooze(&self.snap, &self.client, win, session, Some(std::process::id())).map(drop)
+    }
 }
 
 /// `--once`: one frame of the live server, read-only.

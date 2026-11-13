@@ -362,7 +362,7 @@ fn fake_scripts(dir: &Path, out: &Path) {
         "#!/bin/bash\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> '{o}'\ntmux display-message -p '#{{socket_path}}' >> '{o}' 2>&1\n",
         o = out.display()
     );
-    for n in ["agent-jump.sh", "stash.sh", "closed-tabs.sh"] {
+    for n in ["agent-jump.sh", "stash.sh", "closed-tabs.sh", "snooze.sh"] {
         let p = dir.join(n);
         std::fs::write(&p, &body).unwrap();
         let _ = Command::new("chmod").arg("+x").arg(&p).status();
@@ -420,6 +420,18 @@ fn actions_reach_the_test_server_only() {
     assert_eq!(actions.close(&snap, "/dev/ttys999", "entry:1790000100-12", "stash").unwrap(), "discarded · ⌘Z brings it back");
     let log = wait_for(&out, "closed-tabs.sh unpin");
     assert!(log.contains("closed-tabs.sh unpin 1790000100-12"), "{log}");
+    // Snooze: snooze.sh's menu for a tab (w:@N), once the process it waits
+    // for is gone (a child already reaped stands in for the menu's popup),
+    // and for an entry (p:<id>), on the test server.
+    let mut dead = Command::new("true").spawn().unwrap();
+    let dead_pid = dead.id();
+    let _ = dead.wait();
+    actions.snooze(&snap, "/dev/ttys999", &a1, "main", Some(dead_pid)).unwrap();
+    let log = wait_for(&out, "snooze.sh menu /dev/ttys999 w:");
+    assert!(log.contains(&format!("snooze.sh menu /dev/ttys999 w:{a1}")), "{log}");
+    actions.snooze(&snap, "/dev/ttys999", "entry:1790000100-12", "stash", None).unwrap();
+    let log = wait_for(&out, "snooze.sh menu /dev/ttys999 p:");
+    assert!(log.contains("snooze.sh menu /dev/ttys999 p:1790000100-12"), "{log}");
     assert!(!log.lines().filter(|l| l.contains(".sh ")).any(|l| l.contains("entry:")), "an entry id went out as a window: {log}");
     // park refuses a parked tab; close on a split without an agent refuses to guess.
     assert_eq!(actions.park(&snap, &parked, "stash").unwrap_err(), "already parked");

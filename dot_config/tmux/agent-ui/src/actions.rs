@@ -15,6 +15,7 @@
 //! | close             | `run-shell -b "closed-tabs.sh close --ask-space <tty> <pane>"` (agent pane) | `Roster.act` x |
 //! | discard (parked)  | `run-shell -b "stash.sh kill-many <win>"`                | `Roster.act` x    |
 //! | discard (entry)   | `run-shell -b "closed-tabs.sh unpin <id>"` (→ the backlog) | (none)          |
+//! | snooze            | `run-shell -b "snooze.sh menu <tty> <w:@N or p:id>"` (after the popup) | (none) |
 //! | restart watcher   | `run-shell -b "bash agent-tab-watcher.sh"`               | `Roster.act` r    |
 //! | peek              | `capture-pane -p -e -J -S -N -t <agent pane>`            | `peek_lines`      |
 //!
@@ -613,6 +614,28 @@ pub fn space_landing<'a>(snap: &'a Snapshot, session: &str) -> Option<&'a Window
     home.or_else(|| ws.find(|w| w.active))
 }
 
+/// Why tab `w` (not in the stash) can't be parked, mirroring stash.sh up
+/// front: a hidden session, a space's home, a working agent, a split with
+/// an agent. Snoozing a tab parks it, so the same refusals hold (`verb`:
+/// what the footer says can't be done, park or snooze).
+pub fn park_refusal(w: &Window, verb: &str) -> Result<(), String> {
+    if w.space_hidden || crate::model::HIDDEN.contains(&w.session.as_str()) {
+        return Err(format!("{} isn't in a space, can't {verb}", w.label));
+    }
+    // (2026-10-22: the ⌥W menu lists a home running an agent, and
+    // stash.sh does not check; parked, the space lost its home.)
+    if w.home {
+        return Err(HOME_PARK.into());
+    }
+    if park_refused_busy(w) {
+        return Err(format!("{} is working, can't {verb}", w.label));
+    }
+    if park_refused_split(w) {
+        return Err(SPLIT_AGENT_PARK.into());
+    }
+    Ok(())
+}
+
 /// The footer after discarding stash window `w` (`stash.sh kill-many`).
 /// - A window suspended the OLDER way (`@stash_session`, before the
 ///   migration): kill-many does a plain kill-window (no closed-tabs.sh, so
@@ -664,22 +687,61 @@ impl Actions {
         if w.session == HOLD {
             return Err("already parked".into());
         }
-        if w.space_hidden || crate::model::HIDDEN.contains(&w.session.as_str()) {
-            return Err(format!("{} isn't in a space, can't park", w.label));
-        }
-        // (2026-10-22: the ⌥W menu lists a home running an agent, and
-        // stash.sh does not check; parked, the space lost its home.)
-        if w.home {
-            return Err(HOME_PARK.into());
-        }
-        if park_refused_busy(w) {
-            return Err(format!("{} is working, can't park", w.label));
-        }
-        if park_refused_split(w) {
-            return Err(SPLIT_AGENT_PARK.into());
-        }
+        park_refusal(w, "park")?;
         self.tmux.run_bg(&self.park_line(&w.id));
         Ok(format!("parking {}…", w.label))
+    }
+
+    /// What [`snooze`](Self::snooze) hands `run-shell -b`: `snooze.sh menu
+    /// <client> <target>` (the durations menu on that client; docs: snooze
+    /// plan), once the client has no popup left. tmux draws no menu over a
+    /// popup still up, silently (display-menu still returns 0), and no
+    /// format tells a client's overlay, so with `wait_pid` (the agents
+    /// menu's own process, the popup it runs in):
+    /// 1. wait for that process to go (at most 5 s; tmux has reaped it
+    ///    then), and 0.3 s more for tmux to take its popup down;
+    /// 2. PROBE: a borderless 1×1 popup in the corner whose command touches
+    ///    a marker file; it only runs once no overlay is left (the one
+    ///    signal tmux gives), so no marker within 0.3 s → wait 0.3 s and
+    ///    probe again (8 tries, about 5 s);
+    /// 3. 0.15 s for the probe's own popup to close, then the menu (opened
+    ///    even if every probe failed: nothing is lost by trying).
+    pub fn snooze_line(&self, client: &str, target: &str, wait_pid: Option<u32>) -> String {
+        let menu = self.script_line("snooze.sh", &["menu", client, target]);
+        let Some(pid) = wait_pid else { return menu };
+        let c = sh_quote(client);
+        [
+            format!("n=0; while kill -0 {pid} 2>/dev/null && [ $n -lt 100 ]; do sleep 0.05; n=$((n+1)); done; sleep 0.3"),
+            r#"m=$(mktemp -u "${TMPDIR:-/tmp}/agentui-snooze.XXXXXX"); i=0"#.to_string(),
+            format!("while [ $i -lt 8 ]; do tmux display-popup -c {c} -B -w 1 -h 1 -x 0 -y 0 -E \"touch '$m'\" 2>/dev/null; \
+                j=0; while [ ! -e \"$m\" ] && [ $j -lt 6 ]; do sleep 0.05; j=$((j+1)); done; \
+                [ -e \"$m\" ] && break; sleep 0.3; i=$((i+1)); done"),
+            r#"rm -f "$m"; sleep 0.15"#.to_string(),
+            menu,
+        ]
+        .join("; ")
+    }
+
+    /// Space z: snooze window `win` as listed under `session` (a tab: it is
+    /// parked with a wake time; a stash window: its wake time set) or a
+    /// stashed entry: snooze.sh's durations menu on `client`, after process
+    /// `wait_pid` is gone. A tab not in the stash is refused up front as
+    /// park refuses it (snooze parks it); snooze.sh refuses the rest. Ok =
+    /// the footer text.
+    pub fn snooze(&self, snap: &Snapshot, client: &str, win: &str, session: &str, wait_pid: Option<u32>)
+        -> Result<String, String> {
+        let target = match crate::stashed::entry_id(win) {
+            Some(id) => format!("p:{id}"),
+            None => {
+                let w = self.recheck(snap, win, session)?;
+                if w.session != HOLD {
+                    park_refusal(w, "snooze")?;
+                }
+                format!("w:{}", w.id)
+            }
+        };
+        self.tmux.run_bg(&self.snooze_line(client, &target, wait_pid));
+        Ok("snooze until…".into())
     }
 
     /// What [`close`](Self::close) hands `run-shell -b`: `closed-tabs.sh
@@ -1129,6 +1191,42 @@ mod tests {
         assert_eq!(client_session(&snap, "/dev/ttys999"), "");
         assert_eq!(a.go(&snap, "/dev/ttys004", "entry:1790000100-12", "stash"), Ok(()));
         assert_eq!(a.close(&snap, "/dev/ttys004", "entry:1790000100-12", "stash"), Ok("discarded · ⌘Z brings it back".to_string()));
+    }
+
+    /// Snooze: snooze.sh's menu on the client for `w:@N` (a tab or a stash
+    /// window) or `p:<id>` (a stashed entry), after the menu's popup has
+    /// gone; a tab outside the stash is refused up front as park refuses
+    /// it, a stash window is not (its wake is only set). The server does not
+    /// exist: nothing runs.
+    #[test]
+    fn snooze_opens_snooze_sh_menu() {
+        use crate::tmux::tests::row;
+        let a = Actions { tmux: Tmux::with_socket(Some(crate::tmux::Socket::Name(format!("agentui-snooze-none-{}", std::process::id())))),
+            scripts: PathBuf::from("/s") };
+        assert_eq!(a.snooze_line("/dev/ttys004", "w:@5", None), "'/s/snooze.sh' 'menu' '/dev/ttys004' 'w:@5'");
+        let waited = a.snooze_line("/dev/ttys004", "p:1-2", Some(4242));
+        assert!(waited.starts_with("n=0; while kill -0 4242 2>/dev/null && [ $n -lt 100 ]; do sleep 0.05;"), "{waited}");
+        assert!(waited.ends_with("; '/s/snooze.sh' 'menu' '/dev/ttys004' 'p:1-2'") && !waited.contains('#'), "{waited}");
+        // The probe: a 1×1 popup on that client, retried while it can't open.
+        assert!(waited.contains("done; sleep 0.3; m=$(mktemp -u ") && waited.contains("tmux display-popup -c '/dev/ttys004' -B -w 1 -h 1"),
+            "{waited}");
+        // Valid sh (the line run-shell hands to /bin/sh).
+        let o = std::process::Command::new("/bin/sh").args(["-n", "-c", &waited]).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let snap = Snapshot::parse(&[
+            row("main", 1, "@1", &[("state", "idle"), ("summary", "Quiet")]),
+            row("main", 2, "@2", &[("state", "running"), ("summary", "Busy")]),
+            row("main", 3, "@3", &[("home", "1")]),
+            row("stash", 1, "@4", &[("state", "running"), ("summary", "Parked busy")]),
+        ].join("\n"));
+        let ok = Ok("snooze until…".to_string());
+        assert_eq!(a.snooze(&snap, "/dev/x", "@1", "main", None), ok);
+        assert_eq!(a.snooze(&snap, "/dev/x", "@4", "stash", None), ok);
+        assert_eq!(a.snooze(&snap, "/dev/x", "entry:1-2", "stash", None), ok);
+        assert_eq!(a.snooze(&snap, "/dev/x", "@2", "main", None), Err("Busy is working, can't snooze".to_string()));
+        assert_eq!(a.snooze(&snap, "/dev/x", "@3", "main", None), Err(HOME_PARK.to_string()));
+        assert_eq!(a.snooze(&snap, "/dev/x", "@9", "main", None), Err(PANE_GONE.to_string()));
+        assert_eq!(a.snooze(&snap, "/dev/x", "@1", "work", None), Err(TAB_MOVED.to_string()));
     }
 
     /// Discarding a stash window: an idle shell, ⌘Z brings it back; a
