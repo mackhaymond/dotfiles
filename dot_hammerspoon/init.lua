@@ -22,7 +22,14 @@
 
 require("hs.ipc") -- enables the `hs` command-line tool
 
-local YABAI = "/opt/homebrew/bin/yabai"
+-- Every yabai call is BOUNDED (perl alarm, 2 s). hs.execute is io.popen + read('*a')
+-- on Hammerspoon's MAIN thread, and a `yabai -m` client waits forever if the daemon
+-- accepts the connection and never answers: 2026-11-13 that froze all of Hammerspoon
+-- (hotkeys, overlay, every later `hs -c`) for ~5 minutes behind one query. perl is
+-- part of macOS; a killed call returns empty output, which every caller treats as
+-- "yabai unavailable" and gives up for this pass.
+local YABAI = "/usr/bin/perl -e 'alarm shift; exec @ARGV' 2 /opt/homebrew/bin/yabai"
+local ARC_BUNDLE = "company.thebrowser.Browser"
 local MAIN_LABEL = "main"
 local SCHOOL_LABEL = "school"
 
@@ -64,7 +71,9 @@ end
 -- element. This is FAST (~ms) -- unlike hs.window.allWindows(), which enumerates
 -- EVERY app's windows via AX and takes ~2s on this machine.
 local function arcAxWindows()
-  local arc = hs.application.find("Arc")
+  -- By bundle id: hs.application.find("Arc") is a SUBSTRING match that also returns
+  -- Arc's helper processes (and, with Arc quit, can return a window object).
+  local arc = hs.application.get(ARC_BUNDLE)
   if not arc then return {} end
   local appEl = hs.axuielement.applicationElement(arc)
   return (appEl and appEl:attributeValue("AXWindows")) or {}
@@ -75,15 +84,20 @@ end
 -- yields "unknown", which matches NEITHER branch below -- a deliberate no-op that
 -- preserves a window's prior classification across a transient AX read miss (do not
 -- "simplify" the elseif into a plain else that would nil a known main on a miss).
+-- Returns true if a main window was seen for the first time.
 local function classifyCurrent()
+  local learned = false
   for _, axw in ipairs(arcAxWindows()) do
     local kind = arcKindFromId(axw:attributeValue("AXIdentifier"))
     local hw = axw.asHSWindow and axw:asHSWindow()
     if hw then
-      if kind == "main" then mainSet[hw:id()] = true
+      if kind == "main" then
+        if not mainSet[hw:id()] then learned = true end
+        mainSet[hw:id()] = true
       elseif kind == "little" or kind == "other" then mainSet[hw:id()] = nil end
     end
   end
+  return learned
 end
 
 -- Pin the remembered main windows to main/school, one each, stably. Never moves a
@@ -92,8 +106,12 @@ end
 -- return to their space on exit). Touches ONLY ids in mainSet, so Little Arc and
 -- every other Arc window are never moved.
 local function pinMains()
-  local mIdx, sIdx = labelIndex(MAIN_LABEL), labelIndex(SCHOOL_LABEL)
-  if not mIdx or not sIdx then return end
+  if next(mainSet) == nil then return end -- nothing learned yet: no yabai call at all
+  -- One at a time, so a yabai that is down costs one timeout, not two.
+  local mIdx = labelIndex(MAIN_LABEL)
+  if not mIdx then return end
+  local sIdx = labelIndex(SCHOOL_LABEL)
+  if not sIdx then return end
   local all = decode(yabai("query --windows"))
   if not all then return end
   local byId = {}
@@ -126,15 +144,37 @@ end
 -- the global environment -- a `local function` would be invisible to it. mainSet is
 -- likewise global so it persists across the separate `hs -c` invocations that share
 -- this Lua state; making it local would reset cross-Space main tracking each call.
-function arcSync()
+--
+-- arcSync only SCHEDULES the work (0.3 s, coalesced): `hs -c` returns at once, so a
+-- yabai signal handler never waits on the pin, and a burst -- every app launch, every
+-- Arc window, the startup poll's pass every 2 s -- runs it once instead of queueing
+-- one blocking pass per call on the main thread. Nothing needs it synchronous (the
+-- startup poll does not wait on Arc). arcSyncNow is the synchronous form.
+function arcSyncNow()
   classifyCurrent()
   pinMains()
 end
 
--- One-shot initial pass after load: classify whatever Arc windows are on-screen
--- now and pin. All ongoing re-pinning is driven by yabai signals calling
--- `hs -c "arcSync()"` (see yabairc: application_launched + Arc window_created).
-hs.timer.doAfter(1.0, arcSync)
+arcSyncTimer = nil
+function arcSync()
+  if arcSyncTimer then return end
+  arcSyncTimer = hs.timer.doAfter(0.3, function()
+    arcSyncTimer = nil
+    arcSyncNow()
+  end)
+end
+
+-- Initial pass after load, and whenever the active Space changes. macOS AX only
+-- exposes CURRENT-Space windows, so after a Hammerspoon reload/login a main window
+-- sitting on a Space you are not looking at is unknown until you visit it -- and no
+-- yabai signal fires arcSync on a space switch. The watcher only reads Arc's AX window
+-- list (~ms, no yabai call) and pins just when it LEARNED a main window. Global so it
+-- is not garbage-collected.
+arcSync()
+arcSpaceWatcher = hs.spaces.watcher.new(function()
+  if classifyCurrent() then arcSync() end
+end)
+arcSpaceWatcher:start()
 
 -- Kind of the currently FOCUSED window ("main" | "little" | "other" | "none" |
 -- "notarc"). Kept for an OPTIONAL main-only force-move guard in yabai_send_window.sh;
@@ -145,7 +185,7 @@ function arcFocusedKind()
   local w = hs.window.focusedWindow()
   if not w then return "none" end
   local app = w:application()
-  if not app or app:name() ~= "Arc" then return "notarc" end
+  if not app or app:bundleID() ~= ARC_BUNDLE then return "notarc" end
   return arcKind(w)
 end
 
@@ -157,7 +197,7 @@ function arcDiag()
   local out = { "mainSet: " .. table.concat(set, ",") }
   for _, w in ipairs(hs.window.allWindows()) do
     local app = w:application()
-    if app and app:name() == "Arc" then
+    if app and app:bundleID() == ARC_BUNDLE then
       out[#out + 1] = string.format("hsid=%s kind=%s title=[%s]", tostring(w:id()), arcKind(w), tostring(w:title()))
     end
   end
