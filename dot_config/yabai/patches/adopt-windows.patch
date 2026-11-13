@@ -1,9 +1,9 @@
 diff --git a/src/adopt_windows.c b/src/adopt_windows.c
 new file mode 100644
-index 0000000..b068f0c
+index 0000000..0cf2b89
 --- /dev/null
 +++ b/src/adopt_windows.c
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,431 @@
 +//
 +// PATCH(adopt-windows): adopt windows of a RUNNING application that yabai never resolved.
 +//
@@ -398,6 +398,22 @@ index 0000000..b068f0c
 +    }
 +}
 +
++//
++// NOTE: The startup discovery (window_manager_begin) has the same blind spot for
++// windows below the normal level, so look once more at every application we track
++// shortly after start. One SkyLight query per application when nothing is missing.
++//
++
++static void adopt_schedule_for_all_applications(void)
++{
++    table_for (struct application *application, g_window_manager.application, {
++        pid_t pid = application->pid;
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5000 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
++            event_loop_post(&g_event_loop, APPLICATION_ADOPT_WINDOWS, (void *)(intptr_t) pid, 0);
++        });
++    })
++}
++
 +#pragma clang diagnostic push
 +#pragma clang diagnostic ignored "-Wunused-parameter"
 +static EVENT_HANDLER(APPLICATION_ADOPT_WINDOWS)
@@ -492,3 +508,15 @@ index 8e8a13f..0191430 100644
                  window_manager_add_managed_window(wm, window, view);
              }
          }
+diff --git a/src/yabai.c b/src/yabai.c
+index 1198d7f..22cf4fd 100644
+--- a/src/yabai.c
++++ b/src/yabai.c
+@@ -338,6 +338,7 @@ int main(int argc, char **argv)
+     window_manager_init(&g_window_manager);
+     space_manager_begin(&g_space_manager);
+     window_manager_begin(&g_space_manager, &g_window_manager);
++    adopt_schedule_for_all_applications(); // PATCH(adopt-windows)
+ 
+     if (workspace_is_macos_sequoia() || workspace_is_macos_tahoe() || workspace_is_macos_goldengate()) {
+         update_window_notifications();
