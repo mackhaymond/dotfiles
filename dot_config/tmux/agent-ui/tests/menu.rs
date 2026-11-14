@@ -297,13 +297,20 @@ fn once_lists_stashed_entries() {
     let pitch = row("Pitch deck v2");
     assert!(pitch.contains("▪ Pitch deck v2") && pitch.contains("frozen · bai"), "{pitch}");
     // Snoozed: the window goes first, under its own rule, with when it wakes.
-    s.tmux(&["set-option", "-w", "-t", &parked, "@stash_wake", &(now + 7200).to_string()]);
+    s.tmux(&["set-option", "-w", "-t", &parked, "@stash_wake", &(now + 2700).to_string()]);
     let f2 = once(&s, &["--once", "110x34", "--tab", "parked"]);
     let l2: Vec<&str> = f2.lines().collect();
     let at2 = |needle: &str| l2.iter().position(|x| x.contains(needle)).unwrap_or_else(|| panic!("{needle}: {f2}"));
     assert!(at2(" snoozed ") < at2("Pitch deck v2") && at2("Pitch deck v2") < at2(" stashed ")
         && at2(" stashed ") < at2("proj/Codex thing"), "{f2}");
-    assert!(l2[at2("Pitch deck v2")].trim_end_matches('│').trim_end().ends_with("frozen · bai in 2h"), "{f2}");
+    assert!(l2[at2("Pitch deck v2")].trim_end_matches('│').trim_end().ends_with("frozen · bai in 45m"), "{f2}");
+    // Past 50 minutes: the clock, as the picker and the toasts say it.
+    s.tmux(&["set-option", "-w", "-t", &parked, "@stash_wake", &(now + 7200).to_string()]);
+    let f3 = once(&s, &["--once", "110x34", "--tab", "parked"]);
+    let want = agent_ui::text::wake_phrase(&agent_ui::text::wake((now + 7200) as i64, now as f64));
+    assert!(want.starts_with("at ") || want.starts_with("tmrw "), "{want}");
+    let row3 = f3.lines().find(|x| x.contains("Pitch deck v2")).unwrap();
+    assert!(row3.trim_end_matches('│').trim_end().ends_with(&format!("frozen · bai {want}")), "{f3}");
     // A stashed row's column is an age, as before.
     assert!(l2[at2("proj/Codex thing")].trim_end_matches('│').trim_end().ends_with("suspended · main   2h"), "{f2}");
     assert!(f2.lines().next().unwrap().contains("▪ 4 parked"), "{f2}");

@@ -270,6 +270,44 @@ class SnoozeOnAServer(ServerBase):
         r = self.run_script("wake", "home", rc=1)
         self.assertEqual(r.stdout, "")
 
+    @unittest.skipUnless(os.path.exists("/bin/bash"), "no /bin/bash")
+    def test_close_and_wake_under_macos_bin_bash(self):
+        # macOS's /bin/bash is 3.2, where an empty array is "unbound" under
+        # set -u: reopen_one's "${autostart[@]}" (a plain shell has no resume
+        # command) killed every such wake there. PATH's bash is Homebrew's 5,
+        # so the 3.2 one is run by its path.
+        now = int(time.time())
+        self.t("new-session", "-d", "-s", "proj", "sleep 600")
+        # close: a plain one (no agent: every optional array empty) and a
+        # pinned, snoozed agent tab.
+        pane = self.t("new-window", "-d", "-t", "=proj:", "-P", "-F", "#{pane_id}", "sleep 600")
+        r = self.run_script("close", pane, shell="/bin/bash")
+        self.assertNotIn("unbound", r.stderr)
+        self.assertNotIn(pane, self.panes())
+        r = self.run_script("close", "--pin", "--wake", str(now + 600), self.agent_tab(), shell="/bin/bash")
+        self.assertNotIn("unbound", r.stderr)
+        agent = self.entries()[-1]
+        self.assertEqual((r.stdout, agent["wake_at"], agent["session"]), (agent["id"] + "\n", now + 600, "main"))
+        # wake: the agent entry (a resume command) and a shell entry (none).
+        self.write(dict(agent, wake_at=now - 2),
+                   entry("w", now - 50, session="proj", tmux_session="", cwd=self.tmp, label="plain one",
+                         pinned=True, stashed_ts=now - 50, wake_at=now - 1))
+        proj, main = len(self.windows("proj")), len(self.windows("main"))
+        r = self.run_script("wake", agent["id"], "w", shell="/bin/bash")
+        self.assertNotIn("unbound", r.stderr)
+        lines = r.stdout.splitlines()
+        self.assertEqual(len(lines), 2, r.stdout)
+        self.assertTrue(lines[0].endswith("\tmain"), lines)
+        self.assertEqual(lines[1], "plain one\tproj")
+        self.assertEqual((len(self.windows("proj")), len(self.windows("main"))), (proj + 1, main + 1))
+        self.assertEqual(self.entries(), [])
+        # The popup's command, with no client (an empty array) to name. No
+        # client is attached, so tmux itself may refuse the popup: only the
+        # shell's own failure counts here.
+        self.write(entry("x", now, cwd=self.tmp))
+        r = self.run_script("pick-popup", "main", "", shell="/bin/bash", rc=None)
+        self.assertNotIn("unbound", r.stderr)
+
     def test_wake_works_without_a_locale(self):
         # As launchd runs snooze.sh's wake-due: `env -i`, no LANG / LC_*, no
         # TMUX — a `tmux` on PATH reaching the private server by its socket.

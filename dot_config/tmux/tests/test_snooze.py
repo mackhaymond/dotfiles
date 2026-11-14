@@ -783,18 +783,55 @@ class CustomPopup(Base):
         self.assertEqual(self.calls("closed-tabs.sh"), [])
         self.assertEqual(self.calls("notify.sh"), [])
 
-    def test_garbage_is_a_warning(self):
+    def enter(self, text):
+        """Type text (maybe none), Enter, and wait for the box to close."""
         self.open_box()
-        self.type("zzz")
-        time.sleep(0.2)
+        if text:
+            self.type(text)
+            time.sleep(0.3)
         self.type("\r")
         self.assertEqual(self.popup_gone(), 0)
+
+    def warned(self):
         end = time.time() + 5
         while not self.calls("notify.sh") and time.time() < end:
             time.sleep(0.05)
         notes = self.calls("notify.sh")
+        self.assertEqual(len(notes), 1, notes)
         self.assertEqual(notes[0][:4], ["-c", self.tty, "-k", "warn"], notes)
+        time.sleep(0.3)
         self.assertEqual(self.calls("closed-tabs.sh"), [])
+        return notes[0][-1]
+
+    def test_garbage_is_a_warning(self):
+        self.enter("zzz")
+        self.warned()
+
+    def test_every_suggestion_fits(self):
+        import re
+        self.open_box()
+        time.sleep(0.3)
+        # tmux draws a lone space as a cursor move (ESC [C): that is a space.
+        text = re.sub(rb"\x1b\[C", b" ", bytes(self.screen))
+        text = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", b"", text).decode("utf-8", "replace")
+        for s in ("30m", "tonight", "tomorrow 2pm", "mon", "fri 9am", "1w"):
+            self.assertIn(s + " —", text, s)
+
+    def test_empty_enter_takes_the_highlighted_suggestion(self):
+        self.enter("")
+        end = time.time() + 10
+        while not self.calls("closed-tabs.sh") and time.time() < end:
+            time.sleep(0.05)
+        self.assertEqual(self.calls("closed-tabs.sh"), [["snooze", str(self.now + 1800), "A"]])   # 30m
+
+    def test_a_fuzzy_match_that_is_no_prefix_is_not_taken(self):
+        # "mrw" narrows to "tomorrow" fuzzily, but is not how it starts.
+        self.assertIn("can't read 'mrw'", self.enter("mrw") or self.warned())
+
+    def test_a_bare_number_asks_for_the_unit(self):
+        # "3" starts "3h", but 3 what? Nothing is applied.
+        self.enter("3")
+        self.assertEqual(self.warned(), "snooze: 3 what? say 3m, 3h or 3pm")
 
 
 SCRIPTS = HERE / "scripts"

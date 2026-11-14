@@ -118,8 +118,8 @@ class Base(unittest.TestCase):
         Path(self.tmp, "ard").mkdir()
 
     # -- helpers ---------------------------------------------------------
-    def run_script(self, *args, rc=0):
-        r = subprocess.run(["bash", str(SCRIPT), *args], env=self.script_env(), capture_output=True,
+    def run_script(self, *args, rc=0, shell="bash"):
+        r = subprocess.run([shell, str(SCRIPT), *args], env=self.script_env(), capture_output=True,
                            text=True, timeout=30)
         if rc is not None:
             self.assertEqual(r.returncode, rc, (args, r.stdout, r.stderr))

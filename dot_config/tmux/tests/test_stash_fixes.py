@@ -54,7 +54,8 @@ class Base(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
         self.env.update(TERM="xterm-256color", HOME=self.tmp, TMPDIR=self.tmp + "/",
                         AGENT_FOCUS_NOTICE="", XDG_STATE_HOME=os.path.join(self.tmp, "state"),
-                        NOTIFY_SH=os.path.join(self.tmp, "no-notify"), STASH_SELF=str(rec))
+                        NOTIFY_SH=os.path.join(self.tmp, "no-notify"), STASH_SELF=str(rec),
+                        STASH_LOG=os.path.join(self.tmp, "Library/Logs/tmux-stash.log"), STASH_NO_DESCRIBE="1")
         self.child = None
         self.path = None
         self.addCleanup(self.reap)

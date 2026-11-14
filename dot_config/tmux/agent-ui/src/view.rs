@@ -1712,9 +1712,12 @@ mod tests {
         // Snoozed: @3 (…2800), the entry (…5000), @2 (…12000); then the
         // stash order: @1, then the entries by stash age.
         assert_eq!(ids(&v), ["@3", "entry:8-8", "@2", "@1", "entry:1790000200-13", "entry:1790000100-12"]);
-        assert_eq!((v.parked[1].wake.as_str(), v.snoozed().count()), ("1h", 3));
+        // (Past 50 minutes: a clock time, in this process's zone.)
+        let clock = text::wake(1_790_005_000, now);
+        assert!(clock.contains(':') && !clock.ends_with('m'), "{clock}");
+        assert_eq!((v.parked[1].wake.as_str(), v.snoozed().count()), (clock.as_str(), 3));
         let j = v.parked[1].to_json();
-        assert_eq!((j.get("wake_at").and_then(Value::as_f64), j.get("wake").and_then(Value::as_str)), (Some(1_790_005_000.0), Some("1h")));
+        assert_eq!((j.get("wake_at").and_then(Value::as_f64), j.get("wake").and_then(Value::as_str)), (Some(1_790_005_000.0), Some(clock.as_str())));
         // Again: the same, never doubled.
         v.add_stashed(&es);
         assert_eq!(ids(&v).len(), 6);

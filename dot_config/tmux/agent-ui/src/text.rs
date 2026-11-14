@@ -645,28 +645,29 @@ pub fn when(at: i64, now: f64) -> String {
     }
 }
 
-/// A SNOOZED row's wake time, compact (`left`: seconds until it): `now`
-/// once due; `45m` under an hour (rounded up); `2h` under six hours (to the
-/// nearest hour); else the clock in 24 h: `18:00` today, `tmrw 9:00`,
-/// `mon 9:00` within the week, `nov 20` further.
+/// Up to this many seconds a snooze reads relative (`45m`): closed-tabs.sh's
+/// `WHEN_REL_MAX`, so the picker, the toasts and the menu agree.
+pub const WAKE_REL_MAX: i64 = 3000;
+
+/// A SNOOZED row's wake time, compact (`left`: seconds until it), by
+/// closed-tabs.sh's `when` rule: `now` once due; `45m` up to 50 minutes
+/// (rounded up: never `60m`, never a rounded hour, which beside a `58m` read
+/// as sooner than it was); else the clock (24 h, no padding): `18:09` later
+/// today, `tmrw 9:00`, `mon 9:00` within six days, else `Nov 20`.
 pub fn wake_words(at: Local, now: Local, left: i64) -> String {
     const WD: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
-    const MO: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
     if left <= 0 {
         return "now".into();
     }
-    if left < 3600 {
-        return format!("{}m", ((left + 59) / 60).max(1));
-    }
-    if left < 6 * 3600 {
-        return format!("{}h", (left + 1800) / 3600);
+    if left <= WAKE_REL_MAX {
+        return format!("{}m", (left + 59) / 60);
     }
     let clock = format!("{}:{:02}", at.hour, at.min);
     match at.day - now.day {
         0 => clock,
         1 => format!("tmrw {clock}"),
-        2..=6 => format!("{} {clock}", WD[usize::from(at.wday % 7)]),
-        _ => format!("{} {}", MO[usize::from(at.mon % 12)], at.mday),
+        _ if left < 6 * 86_400 => format!("{} {clock}", WD[usize::from(at.wday % 7)]),
+        _ => format!("{} {}", MON[usize::from(at.mon % 12)], at.mday),
     }
 }
 
@@ -680,13 +681,13 @@ pub fn wake(at: i64, now: f64) -> String {
     }
 }
 
-/// A [`wake_words`] label as a phrase that cannot be read as an age (the
-/// menu's Parked column, where a stashed row's `4m` means "4m ago"): `in
-/// 54m`, `in 2h`, `at 18:00`, `due` once due; a label with a day (`tmrw
-/// 9:00`, `mon 9:00`, `nov 20`) already reads as a time and stays.
+/// A [`wake_words`] label as closed-tabs.sh's picker and the toasts say it
+/// (the menu's Parked column, where a stashed row's `4m` means "4m ago"):
+/// `in 45m`, `at 18:09`, `due` once due; a label with a day (`tmrw 9:00`,
+/// `mon 9:00`, `Nov 20`) stays.
 pub fn wake_phrase(label: &str) -> String {
     let n = label.len();
-    let relative = n > 1 && label[..n - 1].bytes().all(|b| b.is_ascii_digit()) && matches!(label.as_bytes()[n - 1], b'm' | b'h');
+    let relative = n > 1 && label[..n - 1].bytes().all(|b| b.is_ascii_digit()) && label.ends_with('m');
     if label == "now" {
         "due".into()
     } else if relative {
@@ -930,15 +931,16 @@ mod tests {
         let w = |a: Local, left: i64| wake_words(a, now, left);
         assert_eq!((w(now, 0), w(now, -60)), ("now".to_string(), "now".to_string()));
         assert_eq!((w(at(100, 4, 10, 1), 1), w(at(100, 4, 10, 45), 2700)), ("1m".to_string(), "45m".to_string()));
-        // A 2 h snooze seen a second later still says 2h (nearest hour).
-        assert_eq!((w(at(100, 4, 12, 0), 7199), w(at(100, 4, 15, 0), 5 * 3600)), ("2h".to_string(), "5h".to_string()));
-        assert_eq!(w(at(100, 4, 18, 0), 8 * 3600), "18:00");
+        // closed-tabs.sh's rule: relative up to 50 min (never 60m), then the clock.
+        assert_eq!((w(at(100, 4, 10, 50), 3000), w(at(100, 4, 10, 51), 3001)), ("50m".to_string(), "10:51".to_string()));
+        assert_eq!((w(at(100, 4, 11, 0), 3541), w(at(100, 4, 12, 0), 7199)), ("11:00".to_string(), "12:00".to_string()));
+        assert_eq!(w(at(100, 4, 18, 9), 8 * 3600), "18:09");
         assert_eq!(w(at(101, 5, 9, 0), 23 * 3600), "tmrw 9:00");
         assert_eq!(w(at(104, 1, 9, 5), 4 * 86_400), "mon 9:05");
-        assert_eq!(w(at(110, 0, 9, 0), 10 * 86_400), "nov 20");
-        // The menu's phrase: never readable as an age.
-        for (l, p) in [("54m", "in 54m"), ("2h", "in 2h"), ("18:00", "at 18:00"), ("now", "due"), ("tmrw 9:00", "tmrw 9:00"),
-            ("mon 9:05", "mon 9:05"), ("nov 20", "nov 20"), ("", "")] {
+        assert_eq!(w(at(110, 0, 9, 0), 10 * 86_400), "Nov 20");
+        // The menu's phrase, as the picker and the toasts say it.
+        for (l, p) in [("45m", "in 45m"), ("18:09", "at 18:09"), ("now", "due"), ("tmrw 9:00", "tmrw 9:00"),
+            ("mon 9:05", "mon 9:05"), ("Nov 20", "Nov 20"), ("", "")] {
             assert_eq!(wake_phrase(l), p, "{l:?}");
         }
         assert!(!wake(1_800_000_000 + 3600, 1_800_000_000.0).is_empty());

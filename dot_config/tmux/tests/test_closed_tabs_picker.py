@@ -68,12 +68,14 @@ class DrivenPicker(ServerBase):
         self.assertEqual(self.ids(), ["bbb", "zzz"])
 
     def test_enter_with_no_query_takes_the_first_row_under_the_heading(self):
-        before = len(self.t("list-windows", "-t", "=main", "-F", "#{window_id}").split())
         self.open_picker()
+        count = lambda: len(self.t("list-windows", "-t", "=main", "-F", "#{window_id}").split())
+        before = count()                                             # the picker's own window included
         self.key("Enter")
+        # The entry leaves the history before its window is made: wait for both.
         self.wait(lambda: self.ids() != ["aaa", "bbb", "zzz"], "the reopen")
         self.assertEqual(self.ids(), ["aaa", "bbb"])                 # zzz, the newest close
-        self.assertEqual(len(self.t("list-windows", "-t", "=main", "-F", "#{window_id}").split()), before + 1)
+        self.wait(lambda: count() == before + 1, "the reopened window")
 
     def test_a_reload_with_a_query_keeps_the_cursor_on_the_top_match(self):
         self.open_picker()

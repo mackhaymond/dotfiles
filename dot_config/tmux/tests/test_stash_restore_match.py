@@ -233,7 +233,8 @@ class FakeEnv:
     def run(self, *args, tmpdir=None):
         env = {"HOME": str(self.home), "TMPDIR": (tmpdir or str(self.tmp)) + "/",
                "PATH": f"{self.bin}:{BASH_DIR}:/usr/bin:/bin",
-               "FAKE_TMUX_STATE": str(self.state), "STASH_SELF": "/usr/bin/true"}
+               "FAKE_TMUX_STATE": str(self.state), "STASH_SELF": "/usr/bin/true",
+               "STASH_LOG": str(self.home / "Library/Logs/tmux-stash.log"), "STASH_NO_DESCRIBE": "1"}
         if "TZ" in os.environ:      # snapshot stamps are local time on both sides
             env["TZ"] = os.environ["TZ"]
         r = subprocess.run(["bash", str(STASH), *args], env=env,

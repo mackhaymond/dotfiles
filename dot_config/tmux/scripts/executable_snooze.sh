@@ -607,10 +607,13 @@ do_custom() {
     local tty=""
     if [ "${1:-}" = -c ]; then tty="${2:-}"; shift 2 || shift $#; fi
     [ -n "$tty" ] || return 0
-    local cmd i
+    local cmd i h
     cmd="$(reenter) prompt-popup -c $(sq "$tty")$(targets_q "$@")"
+    # Every suggestion shows: one row each, plus the prompt and the header,
+    # the border's two and one to spare.
+    h=$(( ${#SUGGEST[@]} + 5 ))
     for i in 1 2 3 4 5 6 7 8 9 10; do
-        tmux display-popup -c "$tty" -E -w 44 -h 12 -x "$POPUP_X" -T " snooze until " "$cmd" 2>/dev/null && return 0
+        tmux display-popup -c "$tty" -E -w 44 -h "$h" -x "$POPUP_X" -T " snooze until " "$cmd" 2>/dev/null && return 0
         sleep 0.1
     done
     log "custom: no popup on $tty"
@@ -621,10 +624,13 @@ do_custom() {
 # The Custom… box's suggestions: what is typed most, shown with when it lands.
 SUGGEST=(30m 1h 2h 3h tonight tomorrow "tomorrow 2pm" mon "fri 9am" 1w)
 
-# prompt-popup -c <tty> <target…>: inside the popup. fzf as an input box:
-# the typed query wins when it reads as a time, else the highlighted
-# suggestion; Esc cancels. The text never leaves this process: what is handed
-# on (after the popup has closed) is the epoch.
+# prompt-popup -c <tty> <target…>: inside the popup. fzf as an input box.
+# Enter takes, in order: the typed text when it reads as a time; the
+# highlighted suggestion when nothing is typed, or when the text is the start
+# of that suggestion ("tomo" → tomorrow); else nothing, with a warning — a bare
+# number ("3") is never completed (3h? 3pm?), it asks for the unit. Esc
+# cancels. The text never leaves this process: what is handed on (after the
+# popup has closed) is the epoch.
 do_prompt_popup() {
     local tty=""
     if [ "${1:-}" = -c ]; then tty="${2:-}"; shift 2 || shift $#; fi
@@ -649,14 +655,27 @@ EOF
     query="${out%%$'\n'*}"
     sel=""
     case "$out" in *$'\n'*) sel=$(printf '%s\n' "${out#*$'\n'}" | head -1 | cut -f1) ;; esac
-    if [ -n "$query" ] && epoch=$(do_parse "$query" 2>/dev/null); then :
-    elif [ -n "$sel" ] && epoch=$(do_parse "$sel" 2>/dev/null); then :
-    elif [ -z "$query" ]; then return 0
+    local q lsel
+    q=$(lower "$query"); lsel=$(lower "$sel")
+    q="${q#"${q%%[![:space:]]*}"}"                     # leading blanks
+    if [ -n "$q" ] && epoch=$(do_parse "$query" 2>/dev/null); then :
+    elif [ -z "$q" ]; then
+        [ -n "$sel" ] && epoch=$(do_parse "$sel" 2>/dev/null) || return 0
     else
-        err=$(do_parse "$query" 2>&1 >/dev/null)
-        [ -n "$err" ] || err="snooze: no time in that"
-        notify_user ${tty:+-c "$tty"} -k warn -- "$err"
-        return 0
+        case "$q" in
+            *[!0-9\ ]*)
+                if [ -n "$sel" ] && [ "${lsel#"$q"}" != "$lsel" ] && epoch=$(do_parse "$sel" 2>/dev/null); then :
+                else
+                    err=$(do_parse "$query" 2>&1 >/dev/null)
+                    [ -n "$err" ] || err="snooze: no time in that"
+                    notify_user ${tty:+-c "$tty"} -k warn -- "$err"
+                    return 0
+                fi ;;
+            *)
+                q="${q%% *}"
+                notify_user ${tty:+-c "$tty"} -k warn -- "snooze: $q what? say ${q}m, ${q}h or ${q}pm"
+                return 0 ;;
+        esac
     fi
     # Applied after the popup has closed: a park takes a moment.
     tmux run-shell -b "$(reenter) apply ${tty:+-c $(sq "$tty") }$epoch$(targets_q "$@") || true"

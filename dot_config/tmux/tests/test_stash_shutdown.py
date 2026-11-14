@@ -85,6 +85,7 @@ class Server:
         self.env = {"HOME": str(self.home), "TMPDIR": str(self.tmp) + "/",
                     "PATH": f"{self.bin}:{BASH_DIR}:/usr/bin:/bin",
                     "STASH_SELF": "/usr/bin/true", "AGENT_STATE_NOTICE": "", "SHELL": "/bin/sh",
+                    "STASH_LOG": str(self.home / "Library/Logs/tmux-stash.log"), "STASH_NO_DESCRIBE": "1",
                     # A tmux client in a non-UTF-8 locale prints every control
                     # character of a -F format as "_" — the \x1f separators
                     # included. stash.sh now fixes its own locale (see

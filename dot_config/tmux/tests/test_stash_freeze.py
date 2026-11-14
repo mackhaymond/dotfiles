@@ -87,7 +87,8 @@ class Base(unittest.TestCase):
         self.env.update(TERM="xterm-256color", HOME=self.tmp, TMPDIR=self.tmp + "/", ZDOTDIR=self.tmp,
                         AGENT_FOCUS_NOTICE="", XDG_STATE_HOME=os.path.join(self.tmp, "state"),
                         NOTIFY_SH=os.path.join(self.tmp, "no-notify"), STASH_SELF=str(wrapper),
-                        CLOSED_TABS_SH=str(self.stub), SHELL="/bin/zsh")
+                        CLOSED_TABS_SH=str(self.stub), SHELL="/bin/zsh",
+                        STASH_LOG=os.path.join(self.tmp, "Library/Logs/tmux-stash.log"), STASH_NO_DESCRIBE="1")
         self.path = None
         self.addCleanup(self.reap)
         self.start_server()

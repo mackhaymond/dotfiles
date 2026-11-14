@@ -326,13 +326,16 @@ notify_user() {
 msg() {
     local k=info
     [ "${1:-}" = -k ] && { k="$2"; shift 2; }
-    notify_user -k "$k" -- "stash: $*"
+    # A snooze's refusals are the snooze's, not a park's.
+    local who=stash; [ -n "${SNOOZE_WORDS:-}" ] && who=snooze
+    notify_user -k "$k" -- "$who: $*"
 }
 
 # Notes about what suspension decided go to a file, not over the tab bar. They
 # explain a non-event ("parked, but left the agent running because…") which is
 # worth being able to look up and not worth interrupting for.
-LOGFILE="$HOME/Library/Logs/tmux-stash.log"
+# STASH_LOG names another (tests, so a test run never writes Mack's log).
+LOGFILE="${STASH_LOG:-$HOME/Library/Logs/tmux-stash.log}"
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOGFILE" 2>/dev/null; }
 
 # The status line reads @stash_count, which is written here on every change
@@ -2524,6 +2527,55 @@ pin_window() {
     esac
 }
 
+# What `closed-tabs.sh close --pin <pane>` would refuse with, WITHOUT the
+# close: its own session lookup (agent_snapshot, agent_session, the codex
+# tie, build_cmd), run read-only in a subshell that has sourced closed-tabs.sh
+# (its `pinned-json` verb runs on the way in, harmlessly). Prints the reason
+# — the same words close --pin gives — or nothing when it would pin. A
+# closed-tabs.sh without those functions (another version) is not second-
+# guessed: nothing printed, and the park's own close --pin still decides.
+pin_dry_why() {   # <pane>
+    [ -f "$CLOSED_TABS_SH" ] || { printf 'closed-tabs.sh is missing'; return 0; }
+    (
+        # shellcheck source=/dev/null
+        source "$CLOSED_TABS_SH" pinned-json >/dev/null 2>&1 || exit 0
+        set +e
+        for f in agent_snapshot agent_session build_cmd; do declare -F "$f" >/dev/null || exit 0; done
+        info=$(tmux display-message -p -t "$1" '#{pane_id}|#{pane_pid}|#{pane_tty}|#{pane_current_path}' 2>/dev/null)
+        IFS='|' read -r pane_id pane_pid pane_tty cwd <<<"$info"
+        [ -n "$pane_id" ] || exit 0
+        tool="" apid="" args="" copy=""
+        snap=$(agent_snapshot "$pane_pid" "$pane_tty")
+        [ -n "$snap" ] && IFS=$'\x1f' read -r tool apid args copy <<<"$snap"
+        why=""
+        if [ -z "$tool" ]; then
+            why="no agent in this pane"
+        else
+            sid="" cli_args="" model="" env_json="" scwd=""
+            sess_info=$(agent_session "$tool" "$apid" "$args" "$cwd" "$copy" 0)
+            [ -n "$sess_info" ] && IFS=$'\x1f' read -r sid cli_args model env_json scwd <<<"$sess_info"
+            if [ "$tool" = codex ] && declare -F codex_tied_sid >/dev/null; then
+                tied=$(codex_tied_sid "$apid" "$pane_id" "$pane_tty")
+                if [ -n "$tied" ] && [ -z "$sid" ] && declare -F plugin_cli_args >/dev/null; then
+                    cli_args=$(plugin_cli_args codex "$args") model="" env_json='{}'
+                fi
+                sid=$tied
+            fi
+            cmd=$(build_cmd "$tool" "$sid" "$cli_args" "$model" "$env_json")
+            if [ -z "$sid" ]; then
+                case "$tool" in
+                    codex|opencode) why="couldn't tie the session to this tab" ;;
+                    *) why="couldn't find the $tool session id" ;;
+                esac
+            elif [ -z "$cmd" ]; then
+                why="couldn't build the $tool resume command"
+            fi
+        fi
+        [ -n "$copy" ] && [ -d "$copy" ] && rm -rf "$copy"
+        printf '%s' "$why"
+    )
+}
+
 # 0 when every process of <pgid> on <tty> is stopped (T, or a zombie), 2 when
 # there is none left, 1 when one still runs after FREEZE_TRIES ticks.
 pg_wait_stopped() {   # <tty> <pgid>
@@ -3076,6 +3128,12 @@ do_stash_many() {
         else
             classify_window "$w"
         fi
+        # `check` only: a pin's own refusal, up front (pin_dry_why), so a
+        # snooze is refused before a time is picked rather than after.
+        if [ -n "$STASH_DRY" ] && [ "$CL_KIND" = pin ]; then
+            local pwhy; pwhy=$(pin_dry_why "$CL_PANE")
+            [ -n "$pwhy" ] && { CL_KIND=refuse; CL_WHY="$pwhy"; }
+        fi
         if [ "$CL_KIND" = refuse ]; then
             if [ "$CL_WHY" = "that agent is still working" ]; then
                 busy=$((busy + 1))
@@ -3259,9 +3317,12 @@ do_stash_many() {
     stash_report "$pinned" "${#parked[@]}" "$busy" "$homes" "$failed" "$note" ${kept_why[@]+"${kept_why[@]}"}
 
     # Detached: a one-line account of each parked window for the picker.
-    for w in "${parked[@]}"; do
-        ( "$SELF" describe "$w" </dev/null >/dev/null 2>&1 & )
-    done
+    # STASH_NO_DESCRIBE=1 (tests): no model call for a throwaway window.
+    if [ -z "${STASH_NO_DESCRIBE:-}" ]; then
+        for w in "${parked[@]}"; do
+            ( "$SELF" describe "$w" </dev/null >/dev/null 2>&1 & )
+        done
+    fi
     # No suspend_agent any more: an agent tab is pinned, never parked, and
     # everything parked is frozen. (suspend_agent / resume_agent stay for the
     # windows suspended before 2026-11-11 until they are migrated.)
@@ -4695,8 +4756,9 @@ pick_rows() {
 do_describe() {
     local win="${1:-}" agent sid="" cwd label ts shot desc
     [ -n "$win" ] || return 0
-    local summarize="$HOME/.config/tmux/scripts/closed-tabs.sh"
-    [ -x "$summarize" ] || return 0
+    [ -z "${STASH_NO_DESCRIBE:-}" ] || return 0
+    local summarize="$CLOSED_TABS_SH"
+    [ -f "$summarize" ] || return 0
     ts=$(tmux show -wqv -t "$win" @stash_ts 2>/dev/null)
     agent=$(window_agent "$win")
     if [ -n "$agent" ]; then
@@ -4712,7 +4774,7 @@ do_describe() {
     # capture -t ''.
     local pane; pane=$(tmux display-message -p -t "$win" '#{pane_id}' 2>/dev/null)
     [ -n "$pane" ] && tmux capture-pane -ep -t "$pane" >"$shot" 2>/dev/null
-    desc=$("$summarize" summarize "${sid:+claude}" "$sid" "$cwd" "$label" "$shot")
+    desc=$(bash "$summarize" summarize "${sid:+claude}" "$sid" "$cwd" "$label" "$shot")
     rm -f "$shot"
     [ -n "$desc" ] || return 0
     # Only if it's still the same park: a window brought back (or re-parked,

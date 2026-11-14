@@ -276,9 +276,51 @@ class Snooze(Base):
         w = self.new_window()
         self.run_job(self.pane(w), f"'{self.fake('ssh')}' 1000")
         self.script("snooze", self.when, w)
-        self.assertIn("ssh in the foreground — not snoozing it", said.read_text())
+        self.assertIn("snooze: ssh in the foreground — not snoozing it", said.read_text())
         self.script("stash", w)
-        self.assertIn("ssh in the foreground — not parking it", said.read_text().splitlines()[-1])
+        self.assertIn("stash: ssh in the foreground — not parking it", said.read_text().splitlines()[-1])
+
+    # -- polish: check resolves a pin's session up front ---------------------
+    def test_check_refuses_an_agent_close_pin_would_refuse_without_closing_it(self):
+        import subprocess
+        real = Path(STASH_PATH).with_name("executable_closed-tabs.sh")
+        self.env["CLOSED_TABS_SH"] = str(real)
+        self.keep_one()
+        w = self.new_window()
+        p = self.pane(w)
+        job = self.run_job(p, f"'{self.fake('codex')}' 1000")
+        # No harness lookup reachable here (HOME is a temp dir), so close
+        # --pin's own lookup finds no agent: check says the same, first.
+        rc, out = self.check("--snooze", w)
+        self.assertEqual(rc, 3)
+        self.assertTrue(out.endswith(" — not snoozing it\n"), out)
+        why = out[:-len(" — not snoozing it\n")]
+        self.assertEqual(self.session_of(w), "main")                # nothing closed
+        self.assertTrue(self.state(job))
+        r = subprocess.run(["bash", str(real), "close", "--pin", p], env=self.script_env(),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn(f"closed-tabs: not stashed — {why}", r.stderr)  # the very same words
+        self.assertEqual(self.session_of(w), "main")
+
+    def test_check_with_an_agent_close_pin_would_take_is_a_yes(self):
+        # The stub has no lookup functions: not second-guessed.
+        self.keep_one()
+        w = self.new_window()
+        self.run_job(self.pane(w), f"'{self.fake('codex')}' 1000")
+        self.assertEqual(self.check(w), (0, ""))
+        self.assertEqual(self.session_of(w), "main")
+
+    def test_logs_and_describes_stay_out_of_the_real_home(self):
+        out = self.source('printf "%s|%s" "$LOGFILE" "${STASH_NO_DESCRIBE:-}"')
+        self.assertEqual(out, f"{self.env['STASH_LOG']}|1")
+        out = self.source('printf "%s" "$LOGFILE"', env={"STASH_LOG": ""})
+        self.assertEqual(out, f"{self.tmp}/Library/Logs/tmux-stash.log")
+        self.keep_one()
+        w = self.new_window()
+        self.script("stash", w)
+        self.assertEqual(self.source(f"do_describe '{w}'; echo rc=$?"), "rc=0\n")
+        self.assertEqual(self.opt(w, "@stash_desc"), "")
 
     def test_previews_follow_xdg_state_home(self):
         out = self.source('printf "%s" "$PREVIEW_DIR"')

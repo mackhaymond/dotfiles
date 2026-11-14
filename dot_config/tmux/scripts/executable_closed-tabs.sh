@@ -1491,8 +1491,10 @@ reopen_one() {
             esac
         fi ;;
     esac
-    tmux new-window "${quiet[@]}" -P -F "#{window_id}${US}#{session_name}" "${where[@]}" -c "$cwd" \
-        "${autostart[@]}" "${birth[@]}" 2>/dev/null
+    # ${a[@]+"${a[@]}"}: macOS's /bin/bash (3.2) calls an empty array unbound
+    # under set -u.
+    tmux new-window ${quiet[@]+"${quiet[@]}"} -P -F "#{window_id}${US}#{session_name}" "${where[@]}" -c "$cwd" \
+        ${autostart[@]+"${autostart[@]}"} ${birth[@]+"${birth[@]}"} 2>/dev/null
 }
 
 # Reopen the given entries (default: the newest). Several at once go back
@@ -1763,7 +1765,7 @@ do_pick_popup() {
     [ -n "$client_tty" ] && client=(-c "$client_tty")
     local title=' stashed · closed tabs '
     [ -n "$stashed" ] && title=' stashed '
-    tmux display-popup "${client[@]}" -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" -x "$POPUP_X" \
+    tmux display-popup ${client[@]+"${client[@]}"} -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" -x "$POPUP_X" \
         -T "$title" "$(reenter) pick ${stashed:+--stashed }'$client_sess' '$client_tty'"
 }
 
@@ -2035,6 +2037,7 @@ do_pick_act() {
         fi
         ;;
     ctrl-s)
+        # Guarded by their counts, so never expanded empty (bash 3.2, set -u).
         [ "${#backlog[@]}" -gt 0 ] && set_pins pin "${backlog[@]}" >/dev/null
         [ "${#pinned[@]}" -gt 0 ] && set_pins unpin "${pinned[@]}" >/dev/null
         ;;

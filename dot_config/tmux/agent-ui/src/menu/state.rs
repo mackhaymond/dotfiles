@@ -200,8 +200,9 @@ pub enum Act {
 /// A space's home ([`Target::home`]) is never parked, and with no split
 /// never closed (its agent is the home shell pane; prefix Q closes the
 /// space), so neither is offered then (2026-10-22). A stashed entry
-/// ([`Target::entry`]) offers no `d` (no window, no cwd of its own to read)
-/// and no `r` (no agent the watcher tracks): z, x, v only.
+/// ([`Target::entry`]) offers no `d` (no window, no cwd of its own to read),
+/// and no parked row offers `r` (the watcher tracks the bar's agents, none
+/// of them parked): a stash window z, x, d, v; an entry z, x, v.
 /// `z` snoozes (a snooze parks, so never a pending claude or a home); a
 /// parked row offers it too (its wake set, changed or cleared).
 pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
@@ -222,13 +223,14 @@ pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
     if t.parked() || !(t.home && t.panes <= 1) {
         v.push(('x', Act::Close, if t.parked() { "discard" } else { "close" }));
     }
-    // (A stashed entry has no window to diff, and no agent the watcher
-    // tracks: the watcher's restart means nothing on its row.)
+    // (A stashed entry has no window to diff.)
     if !t.entry() {
         v.push(('d', Act::Diff, "diff"));
     }
     v.push(('v', Act::Peek, "preview"));
-    if !t.entry() {
+    // The watcher tracks the bar's agents: no parked row (a stash window, a
+    // stashed entry) is one of them.
+    if !t.parked() {
         v.push(('r', Act::Restart, "restart watcher"));
     }
     v
@@ -1496,6 +1498,10 @@ pub(crate) mod tests {
         m.act(End, &mut NoEffects);
         assert!(m.handle(&keys(" z"), &mut fx));
         m.act(Home, &mut NoEffects);
+        // A parked stash window: its own actions only (no watcher restart).
+        let t = m.selected_target().unwrap();
+        assert_eq!(strip(&t).iter().map(|(k, _, w)| format!("{k} {w}")).collect::<Vec<_>>(),
+            ["z snooze", "x discard", "d diff", "v preview"]);
         assert!(m.handle(&keys(" z"), &mut fx));
         assert_eq!(&fx.calls[1..], ["snooze entry:1790000100-12 stash", "snooze @10 stash"]);
         let mut fx = Rec { go_err: Some("Busy is working, can't snooze".into()), ..Rec::default() };
