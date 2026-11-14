@@ -303,7 +303,9 @@ fn once_lists_stashed_entries() {
     let at2 = |needle: &str| l2.iter().position(|x| x.contains(needle)).unwrap_or_else(|| panic!("{needle}: {f2}"));
     assert!(at2(" snoozed ") < at2("Pitch deck v2") && at2("Pitch deck v2") < at2(" stashed ")
         && at2(" stashed ") < at2("proj/Codex thing"), "{f2}");
-    assert!(l2[at2("Pitch deck v2")].trim_end_matches('│').trim_end().ends_with("frozen · bai   2h"), "{f2}");
+    assert!(l2[at2("Pitch deck v2")].trim_end_matches('│').trim_end().ends_with("frozen · bai in 2h"), "{f2}");
+    // A stashed row's column is an age, as before.
+    assert!(l2[at2("proj/Codex thing")].trim_end_matches('│').trim_end().ends_with("suspended · main   2h"), "{f2}");
     assert!(f2.lines().next().unwrap().contains("▪ 4 parked"), "{f2}");
     s.tmux(&["set-option", "-wu", "-t", &parked, "@stash_wake"]);
     // The window first (no @stash_ts), then the entries, oldest stashed first.

@@ -1792,10 +1792,14 @@ ago() {
     fi
 }
 
-# When a snoozed row comes back, in REPLY: "in 40m" within the hour, "in 3h"
-# later today, "tmrw 9:00", a weekday within the week ("mon 9:00"), else the
-# date ("Nov 20"); "due" once it is past (the next wake-due tick takes it).
+# When a snoozed row comes back, in REPLY: "in 40m" up to WHEN_REL_MAX, a
+# clock time later today ("at 18:00"), "tmrw 9:00", a weekday within the week
+# ("mon 9:00"), else the date ("Nov 20"); "due" once it is past (the next
+# wake-due tick takes it). Never a rounded "in 1h": beside an "in 58m" row it
+# read as sooner than a row that was really later. Stashed rows show an age
+# ("2h ago"), so the two never look alike.
 # when_init <now> first, once: today's and tomorrow's dates.
+WHEN_REL_MAX=3000     # seconds: up to 50 minutes a snoozed row reads "in Nm"
 when_init() {
     WHEN_TODAY=$(date -r "$1" +%Y%m%d)
     WHEN_TMRW=$(date -r $(( $1 + 86400 )) +%Y%m%d)
@@ -1804,9 +1808,9 @@ when_init() {
 when() {
     local s=$(( $1 - $2 )) d day hm mon dd
     if [ "$s" -le 0 ]; then REPLY=due; return; fi
-    if [ "$s" -lt 3600 ]; then REPLY="in $(( (s + 59) / 60 ))m"; return; fi
+    if [ "$s" -le "$WHEN_REL_MAX" ]; then REPLY="in $(( (s + 59) / 60 ))m"; return; fi
     read -r d day hm mon dd < <(date -r "$1" '+%Y%m%d %a %k:%M %b %e')
-    if [ "$d" = "${WHEN_TODAY:-}" ]; then REPLY="in $(( (s + 1800) / 3600 ))h"
+    if [ "$d" = "${WHEN_TODAY:-}" ]; then REPLY="at $hm"
     elif [ "$d" = "${WHEN_TMRW:-}" ]; then REPLY="tmrw $hm"
     elif [ "$s" -lt $(( 6 * 86400 )) ]; then
         case "$day" in
@@ -1944,8 +1948,13 @@ pick_rows() {
 # Runs inside the popup. ⏎ restores (pick-act's empty key); ⌃x leaves through
 # --expect too (which puts the accepting key on the first output line, empty
 # for a plain ⏎) — the same gesture as the stash picker's kill; ⌃s toggles in
-# place and reloads the rows. The cursor starts on line 2: the first row under
-# the first heading.
+# place and reloads the rows.
+#
+# The cursor: on line 2 (the first row under the first heading) when the list
+# loads with no query, on the TOP match whenever the query changes or a reload
+# lands with one. `load:pos(2)` alone left a typed filter on its SECOND match,
+# so ⏎ / ⌃x / ⌃z acted on a row you had not picked (2026-11-13: ⌃x could forget
+# the wrong entry).
 #   pick [--stashed] <session_id> <tty>
 do_pick() {
     local stashed="" a
@@ -1966,7 +1975,9 @@ do_pick() {
               --prompt="${stashed:+stashed }restore > " \
               --expect=ctrl-x,ctrl-z \
               --bind 'shift-down:toggle+down,shift-up:toggle+up,ctrl-a:select-all,ctrl-d:deselect-all' \
-              --bind 'load:pos(2)+unbind(load)' \
+              --with-shell 'sh -c' \
+              --bind 'load:transform:[ -n "$FZF_QUERY" ] && echo first || echo "pos(2)"' \
+              --bind 'change:first' \
               --bind "ctrl-s:execute-silent($re pick-act ctrl-s '' '' {+1})+deselect-all+reload($re pick-rows $flag)" \
               --preview "$re preview {1}" \
               --preview-window 'down,72%,border-top,follow' \

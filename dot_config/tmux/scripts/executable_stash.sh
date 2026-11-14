@@ -136,7 +136,7 @@ POPUP_H_PCT=85
 # (tmux.conf.tmpl's @popup_x); tmux's own centre on a server without it.
 POPUP_X='#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}'
 PREVIEW_PCT=72
-PREVIEW_DIR="$HOME/.local/state/tmux-stash/previews"
+PREVIEW_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-stash/previews"
 
 # Records are delimited with the unit separator, NOT a tab: bash treats tab as
 # IFS whitespace and collapses runs of it, so a session that has not reported a
@@ -2968,12 +2968,47 @@ do_rows() {
     return 0
 }
 
+# The words a refusal uses: a park's ("not parking it", "nothing hidden"), or
+# a snooze's ("not snoozing it", "nothing snoozed") while SNOOZE_WORDS is set.
+# refuse TEXT: the park's toast — or, under `check` (STASH_DRY), the same
+# text on stdout and a verdict of 3, with no toast. slog: the park's log,
+# which `check` does not write (nothing happened).
+STASH_DRY=""
+SNOOZE_WORDS=""
+DRY_RC=0
+ING=parking
+HIDING=hiding
+DONE=hidden
+stash_words() {
+    if [ -n "$SNOOZE_WORDS" ]; then ING=snoozing; HIDING=snoozing; DONE=snoozed
+    else ING=parking; HIDING=hiding; DONE=hidden; fi
+}
+refuse() {
+    if [ -n "$STASH_DRY" ]; then printf '%s\n' "$*"; DRY_RC=3
+    else msg -k warn "$*"; fi
+}
+slog() { [ -n "$STASH_DRY" ] || log "$@"; }
+
+# check [--snooze] [<win>]: would `stash` (or, with --snooze, `snooze`) take
+# this tab? The same classification and refusals — the deep guards included —
+# with no side effect: nothing moves, freezes or closes, no toast, no log
+# line. A refusal prints its reason (the toast's text, no "stash: ") and
+# exits 3; parkable is silent, 0.
+do_check() {
+    [ "${1:-}" = --snooze ] && { SNOOZE_WORDS=1; shift; }
+    STASH_DRY=1; DRY_RC=0
+    do_stash_many "$(sel_win "${1:-}")"
+    STASH_DRY=""
+    return "$DRY_RC"
+}
+
 # Park one or more windows as a single transaction: one lock, one renumber, one
 # publish. Looping the single-window path instead would take and drop the lock
 # per window, renumber per window, and let another park interleave halfway
 # through a group the user selected as one unit.
 do_stash_many() {
     local w s sess="" wins=() total busy=0 homes=0 seen="" note=""
+    stash_words
     # Per accepted window, beside `wins`: what classify_window decided, and
     # its pane for a pin. Refusals with a reason go to `kept_why`.
     local kinds=() cpanes=() cagents=() kept_why=() pre="" line
@@ -2997,7 +3032,7 @@ do_stash_many() {
     # Everything from here to the moves reads tmux state and then acts on it, so
     # it runs under the lock — moves, freezes and pins, each window refreshing
     # the lock's age (lock_touch) so a long range never reads as stale.
-    lock_acquire || { msg -k warn "busy — try again"; return 0; }   # 0: see the note on the refusal below
+    [ -n "$STASH_DRY" ] || lock_acquire || { msg -k warn "busy — try again"; return 0; }   # 0: see the note on the refusal below
 
     # Resolve membership UNDER the lock. These ids come from a keypress that may
     # be seconds old by now, so in between a window can have been closed, parked
@@ -3020,7 +3055,7 @@ do_stash_many() {
         # space.sh's sync kept the lower one, stripped the returning window's
         # markers and killed its dashboard pane.
         if [ "$(tmux show -wqv -t "$w" @space_home 2>/dev/null)" = "1" ]; then
-            log "refused to hide $w — it is its space's home"
+            slog "refused to hide $w — it is its space's home"
             homes=$((homes + 1)); continue
         fi
         # Refuse to hide a working agent at all, rather than hiding it and then
@@ -3029,7 +3064,7 @@ do_stash_many() {
         # core, with nothing on screen to say so. Parking is an explicit "not
         # now", and "not now" is not a thing to say to a turn in flight.
         if agent_running "$w"; then
-            log "refused to hide $w — $AGENT_RUNNING_WHY"
+            slog "refused to hide $w — $AGENT_RUNNING_WHY"
             busy=$((busy + 1)); continue
         fi
         # Everything else that would leave something running in the stash,
@@ -3047,7 +3082,7 @@ do_stash_many() {
             else
                 kept_why+=("$CL_WHY")
             fi
-            log "refused to hide $w — $CL_WHY"
+            slog "refused to hide $w — $CL_WHY"
             continue
         fi
         wins+=("$w"); kinds+=("$CL_KIND"); cpanes+=("$CL_PANE"); cagents+=("$CL_AGENT")
@@ -3057,20 +3092,20 @@ do_stash_many() {
         lock_release
         local nk="${#kept_why[@]}"
         if [ "$nk" -gt 0 ] && [ "$busy" -eq 0 ] && [ "$homes" -eq 0 ]; then
-            msg -k warn "$(why_list "${kept_why[@]}") — not parking $([ "$nk" -eq 1 ] && echo it || echo them)"
+            refuse "$(why_list "${kept_why[@]}") — not $ING $([ "$nk" -eq 1 ] && echo it || echo them)"
         elif [ "$nk" -gt 0 ]; then
             local parts; parts=$(why_list "${kept_why[@]}")
             [ "$busy" -gt 0 ]  && parts="$parts; $busy still working"
             [ "$homes" -gt 0 ] && parts="$parts; the home tab stays"
-            msg -k warn "nothing hidden — $parts"
+            refuse "nothing $DONE — $parts"
         elif [ "$busy" -eq 1 ]; then
-            msg -k warn "that agent is still working — not hiding it"
+            refuse "that agent is still working — not $HIDING it"
         elif [ "$busy" -gt 1 ]; then
-            msg -k warn "all $busy of those agents are still working — not hiding them"
+            refuse "all $busy of those agents are still working — not $HIDING them"
         elif [ "$homes" -gt 0 ]; then
-            msg -k warn "that's the space's home tab — it stays"
+            refuse "that's the space's home tab — it stays"
         else
-            msg -k warn "already parked"
+            refuse "already parked"
         fi
         return 0
     fi
@@ -3084,11 +3119,11 @@ do_stash_many() {
     if [ "$total" -le "${#wins[@]}" ]; then
         lock_release
         if [ "${#wins[@]}" -eq 1 ]; then
-            msg -k warn "that's the only tab in this session — not parking it"
+            refuse "that's the only tab in this session — not $ING it"
         else
             # Refused rather than quietly parking all but one: a partial result
             # nobody asked for is worse than a clear no.
-            msg -k warn "that's every tab in this session — leave one out and try again"
+            refuse "that's every tab in this session — leave one out and try again"
         fi
         # 0, NOT 1. `run-shell` displays the exit status of a failed command IN
         # THE PANE — which puts it into view-mode, so every subsequent keystroke
@@ -3098,6 +3133,9 @@ do_stash_many() {
         # hijacking the focused pane to report it is far worse than the refusal.
         return 0
     fi
+
+    # `check`: everything above is the whole verdict — nothing is acted on.
+    [ -n "$STASH_DRY" ] && return 0
 
     local parked=() pinned=0 failed=0 left i kind rc hold_made=""
     BOOT_WIN=""
@@ -3129,7 +3167,7 @@ do_stash_many() {
         if [ "$kind" = pin ]; then
             if pin_recheck "$w" "${cpanes[$i]}" "${cagents[$i]}"; then
                 if [ "$RECHECK_WHY" = "that agent is still working" ]; then busy=$((busy + 1)); else kept_why+=("$RECHECK_WHY"); fi
-                log "refused to hide $w — $RECHECK_WHY (re-check)"
+                slog "refused to hide $w — $RECHECK_WHY (re-check)"
                 continue
             fi
             pin_window "${cpanes[$i]}"; rc=$?
@@ -3141,7 +3179,7 @@ do_stash_many() {
                 failed=$((failed + 1)); log "close --pin of $w failed ($PIN_WHY) and the tab is gone"
             else
                 if [ "$rc" = 3 ]; then kept_why+=("$PIN_WHY"); else failed=$((failed + 1)); fi
-                log "refused to hide $w — $PIN_WHY"
+                slog "refused to hide $w — $PIN_WHY"
             fi
             continue
         fi
@@ -3197,9 +3235,9 @@ do_stash_many() {
         if [ "$pinned" -gt 0 ]; then
             stash_report "$pinned" 0 "$busy" "$homes" "$failed" "$note" ${kept_why[@]+"${kept_why[@]}"}
         elif [ -n "$note" ]; then
-            msg -k warn "nothing hidden: $note"
+            msg -k warn "nothing $DONE: $note"
         elif [ "${#kept_why[@]}" -gt 0 ] && [ "$failed" -eq 0 ]; then
-            msg -k warn "$(why_list "${kept_why[@]}") — not parking $([ "${#kept_why[@]}" -eq 1 ] && echo it || echo them)"
+            msg -k warn "$(why_list "${kept_why[@]}") — not $ING $([ "${#kept_why[@]}" -eq 1 ] && echo it || echo them)"
         elif [ "$busy" -gt 0 ]; then
             msg -k error "could not park it — and left $busy still working"
         else
@@ -3291,9 +3329,9 @@ do_snooze() {
     case "$when" in
         ''|*[!0-9]*) msg -k error "snooze: no wake time"; return 0 ;;
     esac
-    SNOOZE_WAKE="$when"
+    SNOOZE_WAKE="$when"; SNOOZE_WORDS=1
     do_stash "${2:-}"
-    SNOOZE_WAKE=""
+    SNOOZE_WAKE=""; SNOOZE_WORDS=""
 }
 
 # set-wake <epoch|""> <win…>: set or clear the alarm on windows already
@@ -4782,6 +4820,7 @@ do_list() {
 case "${1:-}" in
     stash)   shift; do_stash "${1:-}" ;;
     snooze)  shift; do_snooze "${1:-}" "${2:-}" ;;
+    check)   shift; do_check "$@"; exit $? ;;
     set-wake) shift; do_set_wake "$@" ;;
     wake)    shift; do_wake "$@" ;;
     unstash) shift; do_unstash "${1:-}" "${2:-}" ;;

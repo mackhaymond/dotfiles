@@ -11,7 +11,8 @@
 #
 #   snooze.sh parse <when…>        the epoch on stdout, or exit 1 + why on
 #                                  stderr. 30m 2h 1d 1w 2h30m "2h 30m" ·
-#                                  tonight / evening (18:00) · tomorrow (9:00)
+#                                  tonight / evening (18:00) · tomorrow (9:00;
+#                                  before 05:00 it is the day just begun)
 #                                  · mon..sun (9:00, the next such day; today
 #                                  only while it is still before 9:00) · 9am
 #                                  9:30am 14:30 2pm noon midnight (the next
@@ -21,12 +22,16 @@
 #   snooze.sh menu <client_tty> <target…>
 #                                  the snooze menu on that client (display-menu
 #                                  -c): 1 hour, 3 hours, This evening 18:00,
-#                                  Tomorrow 9:00, Monday 9:00, Custom… (a
-#                                  "snooze until:" prompt), and Unsnooze when
-#                                  any target is snoozed. Each item re-enters
+#                                  Tomorrow 9:00, Monday 9:00, Custom… (the
+#                                  time box, below), and Unsnooze when any
+#                                  target is snoozed. Each item re-enters
 #                                  here as apply-text, so the time is read
 #                                  when the item is picked, not when the menu
-#                                  opened.
+#                                  opened. A tab not parked yet that stash.sh
+#                                  would refuse (`stash.sh check --snooze`,
+#                                  exit 3) is not offered: its refusal text
+#                                  ("… not snoozing it") is the toast, and no
+#                                  menu opens when nothing is left.
 #   snooze.sh apply [-c <client>] <epoch|unsnooze> <target…>
 #                                  dispatch. p:<id> / b:<id> → closed-tabs.sh
 #                                  snooze <epoch> / unsnooze; w:@N (or a bare
@@ -34,15 +39,25 @@
 #                                  w:@N elsewhere → stash.sh snooze (parks it;
 #                                  unsnooze skips it); r:@N (the picker's
 #                                  pending rows) is ignored. One toast:
-#                                  "⏰ snoozed <what> — back <when>".
+#                                  "⏰ snoozed <what> — back <when>" (when:
+#                                  "in 45m" under 50 minutes, else "at 17:45",
+#                                  "tomorrow 9:00", "Fri 9:00").
 #   snooze.sh apply-text [-c <client>] <text> <target…>
 #                                  parse, then apply; unreadable text → a
-#                                  warning toast and nothing changes
-#   snooze.sh apply-prompt [-c <client>] <@option> <target…>
-#                                  the Custom… prompt's way in: the typed text
-#                                  waits in that global user option (set by
-#                                  the prompt's template, so no shell ever
-#                                  sees it as code); read, unset, apply-text
+#                                  warning toast and nothing changes (exit 0:
+#                                  every verb a menu or popup runs exits 0
+#                                  once it has said what happened)
+#   snooze.sh custom -c <client> <target…>
+#                                  the Custom… time box: a small popup on the
+#                                  client running prompt-popup
+#   snooze.sh prompt-popup -c <client> <target…>
+#                                  inside it: fzf as an input box over a few
+#                                  suggestions, each with when it lands; the
+#                                  typed text wins when it reads as a time,
+#                                  else the highlighted suggestion; Esc
+#                                  cancels. Only the epoch leaves the popup
+#                                  (to `apply`, after it closed); the text
+#                                  is never put on a command line.
 #   snooze.sh wake-due             the timer tick (LaunchAgent
 #                                  com.mackhaymond.tmux-snooze, every 60 s)
 #   snooze.sh reschedule           recompute snooze-next: the earliest wake
@@ -143,9 +158,17 @@ now_epoch() {
 }
 
 # Messages go through notify.sh (a sidebar toast, else display-message), as
-# closed-tabs.sh's notify_user: NOTIFY_SH, else the sibling notify.sh.
+# closed-tabs.sh's notify_user: NOTIFY_SH, else the sibling notify.sh. It
+# expands tmux formats in the text, and ours never mean one: a tab named
+# "a#{client_tty}" must read that way, so every # after `--` is doubled.
 notify_user() {
-    local n="${NOTIFY_SH:-}" d="${BASH_SOURCE[0]%/*}" c=""
+    local n="${NOTIFY_SH:-}" d="${BASH_SOURCE[0]%/*}" c="" a seen="" args=()
+    for a in "$@"; do
+        if [ -n "$seen" ]; then args+=("${a//#/##}")
+        else args+=("$a"); [ "$a" = -- ] && seen=1
+        fi
+    done
+    set -- "${args[@]}"
     [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
     if [ -z "$n" ]; then
         for n in "$d/notify.sh" "$d/executable_notify.sh" "$SCRIPTS/notify.sh"; do
@@ -290,7 +313,13 @@ do_parse() {
         today)
             target=$(at_day "$now" 0 "$h" "$m") || return 1 ;;
         tomorrow|tmrw|tmr|tom)
-            target=$(at_day "$now" 1 "$h" "$m") || return 1 ;;
+            # Before 05:00 "tomorrow" is the day that has just begun (Mack
+            # is up late): 01:30 "tomorrow" = 9:00 today. Still past → the
+            # day after.
+            off=1
+            [ "$((10#$(date -j -r "$now" '+%H')))" -lt "$LATE_NIGHT_END" ] && off=0
+            target=$(at_day "$now" "$off" "$h" "$m") || return 1
+            [ "$target" -gt "$now" ] || target=$(at_day "$now" $((off + 1)) "$h" "$m") || return 1 ;;
         *)
             t=$(weekday "$day")
             off=$(( (t - nd + 7) % 7 ))
@@ -302,24 +331,33 @@ do_parse() {
     fi
     echo "$target"
 }
+LATE_NIGHT_END=5
 bad() { echo "snooze: can't read '$1' (try 45m, 2h, tonight, tomorrow, fri 9am, 14:30)" >&2; }
 
-# when_label <epoch>: "in 45m", "at 18:00", "tomorrow 9:00", "Mon 9:00",
-# "Nov 30 9:00".
+# when_label <epoch>: "in 45m" (under SOON_SECS), else the clock: "at 18:00",
+# "tomorrow 9:00", "Mon 9:00", "Nov 30 9:00". Never "in 60m".
+SOON_SECS=3000
 when_label() {
-    local t="$1" now d ymd hh mm wd today tmrw
+    local t="$1" now d
     now=$(now_epoch); d=$((t - now))
-    if [ "$d" -lt 3600 ]; then
+    if [ "$d" -lt "$SOON_SECS" ]; then
         d=$(( (d + 59) / 60 )); [ "$d" -lt 1 ] && d=1
         echo "in ${d}m"; return 0
     fi
+    clock_label "$t" at
+}
+# clock_label <epoch> [at]: "18:00" (today; "at 18:00" with `at`),
+# "tomorrow 9:00", "Mon 9:00", "Nov 30 9:00".
+clock_label() {
+    local t="$1" now d ymd hh mm wd today tmrw
+    now=$(now_epoch); d=$((t - now))
     read -r ymd hh mm wd <<EOF
 $(date -j -r "$t" '+%Y-%m-%d %H %M %a')
 EOF
     today=$(date -j -r "$now" '+%Y-%m-%d')
     tmrw=$(date -j -r "$now" -v+1d '+%Y-%m-%d')
     hh="${hh#0}"
-    if [ "$ymd" = "$today" ]; then echo "at $hh:$mm"
+    if [ "$ymd" = "$today" ]; then echo "${2:+$2 }$hh:$mm"
     elif [ "$ymd" = "$tmrw" ]; then echo "tomorrow $hh:$mm"
     elif [ "$d" -lt $((6 * 86400)) ]; then echo "$wd $hh:$mm"
     else echo "$(date -j -r "$t" '+%b %e' | tr -s ' ') $hh:$mm"
@@ -352,14 +390,17 @@ entry_info() {
         | @tsv' "$HISTORY" 2>/dev/null
 }
 
-WIN_LABEL_FMT='#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}'
+# A window's label: @stash_label, else @agent_summary, else its name, each
+# read as a plain value (tmux never expands a value's own #{…}) and chosen
+# here, so a tab named "a#{client_tty}" stays exactly that.
+WIN_FIELDS_FMT="#{session_name}${US}#{@stash_wake}${US}#{@stash_label}${US}#{@agent_summary}${US}#{window_name}"
 
 # describe <target…>: sets D_LABELS (one per live target, entries first),
 # D_SNOOZED (1 if any target has an alarm) and D_WSESS (each window's
 # session, beside T_WINS; "" = gone).
 D_LABELS=() D_SNOOZED=0 D_WSESS=()
 describe() {
-    local id label wake w line
+    local id label wake w line sess slabel summary name
     split_targets "$@"
     D_LABELS=() D_SNOOZED=0 D_WSESS=()
     while IFS="$TAB" read -r id label wake; do
@@ -370,12 +411,15 @@ describe() {
 $(entry_info ${T_IDS[@]+"${T_IDS[@]}"})
 EOF
     for w in ${T_WINS[@]+"${T_WINS[@]}"}; do
-        line=$(tmux display-message -p -t "$w" "#{session_name}${US}#{@stash_wake}${US}${WIN_LABEL_FMT}" 2>/dev/null) || line=""
+        line=$(tmux display-message -p -t "$w" "$WIN_FIELDS_FMT" 2>/dev/null) || line=""
         if [ -z "$line" ]; then D_WSESS+=(""); continue; fi
-        D_WSESS+=("${line%%"$US"*}")
-        line="${line#*"$US"}"
-        [ -n "${line%%"$US"*}" ] && D_SNOOZED=1
-        D_LABELS+=("${line#*"$US"}")
+        IFS="$US" read -r sess wake slabel summary name <<EOF
+$line
+EOF
+        D_WSESS+=("$sess")
+        [ -n "$wake" ] && D_SNOOZED=1
+        label="${slabel:-${summary:-$name}}"
+        D_LABELS+=("${label:-$w}")
     done
 }
 
@@ -454,24 +498,12 @@ do_apply_text() {
         err=$(do_parse "$text" 2>&1 >/dev/null)
         [ -n "$err" ] || err="snooze: can't read '$text'"
         notify_user ${client:+-c "$client"} -k warn -- "$err"
-        return 1
+        return 0        # told: a run-shell must not report a status too
     fi
     do_apply ${client:+-c "$client"} "$epoch" "$@"
 }
 
-do_apply_prompt() {
-    local client=""
-    if [ "${1:-}" = -c ]; then client="${2:-}"; shift 2 || shift $#; fi
-    local opt="${1:-}" text
-    [ $# -gt 0 ] && shift
-    case "$opt" in @snooze_prompt_*) ;; *) return 1 ;; esac
-    text=$(tmux show-options -gv "$opt" 2>/dev/null) || text=""
-    tmux set-option -gu "$opt" 2>/dev/null
-    [ -n "$text" ] || return 0          # an empty prompt: nothing
-    do_apply_text ${client:+-c "$client"} "$text" "$@"
-}
-
-# --- menu -------------------------------------------------------------------
+# --- menu and the Custom… box -----------------------------------------------
 
 # sq <word>: single-quoted for sh.  tq <string>: double-quoted for tmux's
 # command parser (\, " and $ escaped).
@@ -482,19 +514,10 @@ tq() {
     printf '"%s"' "$s"
 }
 
-do_menu() {
-    local tty="${1:-}"; [ $# -gt 0 ] && shift
-    [ -n "$tty" ] || { echo "snooze: menu needs a client tty" >&2; return 1; }
-    describe "$@"
-    local targets=() t
-    for t in ${T_IDS[@]+"${T_IDS[@]}"}; do targets+=("p:$t"); done
-    for t in ${T_WINS[@]+"${T_WINS[@]}"}; do targets+=("w:$t"); done
-    if [ ${#targets[@]} -eq 0 ] || [ ${#D_LABELS[@]} -eq 0 ]; then
-        notify_user -c "$tty" -k warn -- "snooze: nothing to snooze here"
-        return 0
-    fi
-    # The script and its overrides, as tmux's server will run it.
-    local self d prefix tgt=""
+# reenter: the command line that runs this copy again with its overrides
+# (commands tmux runs get the SERVER's environment, not this process's).
+reenter() {
+    local self d prefix
     d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
     self="$d/$(basename "${BASH_SOURCE[0]}")"
     prefix="env XDG_STATE_HOME=$(sq "$STATE_HOME")"
@@ -502,36 +525,142 @@ do_menu() {
     [ -n "${CLOSED_TABS_SH:-}" ] && prefix="$prefix CLOSED_TABS_SH=$(sq "$CLOSED_TABS_SH")"
     [ -n "${NOTIFY_SH:-}" ] && prefix="$prefix NOTIFY_SH=$(sq "$NOTIFY_SH")"
     [ -n "${SNOOZE_NOW:-}" ] && prefix="$prefix SNOOZE_NOW=$(sq "$SNOOZE_NOW")"
-    prefix="$prefix bash $(sq "$self")"
-    for t in "${targets[@]}"; do tgt="$tgt $(sq "$t")"; done
-    # item <when text>: the run-shell that applies it.
-    item() { printf 'run-shell -b %s' "$(tq "$prefix apply-text -c $(sq "$tty") $(sq "$1")$tgt")"; }
+    printf '%s bash %s' "$prefix" "$(sq "$self")"
+}
 
-    local hour evening_label evening_text opt prompt_tmpl title what_s
+# targets_q <target…>: the targets, each sh-quoted, each after a space.
+targets_q() { local t; for t in "$@"; do printf ' %s' "$(sq "$t")"; done; }
+
+POPUP_X='#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}'
+
+do_menu() {
+    local tty="${1:-}"; [ $# -gt 0 ] && shift
+    [ -n "$tty" ] || { echo "snooze: menu needs a client tty" >&2; return 0; }
+    describe "$@"
+    local targets=() t j=0 reason rc refused=()
+    for t in ${T_IDS[@]+"${T_IDS[@]}"}; do targets+=("p:$t"); done
+    # A tab not parked yet: would stash.sh refuse it? (`stash.sh check
+    # --snooze`: exit 3 and the refusal, already worded "… not snoozing it";
+    # nothing changed.) Then it is not offered at all.
+    for t in ${T_WINS[@]+"${T_WINS[@]}"}; do
+        case "${D_WSESS[$j]:-}" in
+            '') ;;                                  # gone
+            "$HOLD") targets+=("w:$t") ;;
+            *)
+                reason=$(stash_sh check --snooze "$t" 2>/dev/null); rc=$?
+                [ -n "$reason" ] || reason="not snoozing it"
+                if [ "$rc" = 3 ]; then refused+=("$reason")
+                else targets+=("w:$t")
+                fi ;;
+        esac
+        j=$((j + 1))
+    done
+    if [ ${#refused[@]} -gt 0 ]; then
+        reason="${refused[0]}"
+        [ ${#refused[@]} -gt 1 ] && reason="$reason (${#refused[@]} tabs refused)"
+        notify_user -c "$tty" -k warn -- "$reason"
+        # The rest, described again: labels and alarms of what is offered.
+        [ ${#targets[@]} -gt 0 ] && describe "${targets[@]}"
+    fi
+    if [ ${#targets[@]} -eq 0 ] || [ ${#D_LABELS[@]} -eq 0 ]; then
+        [ ${#refused[@]} -gt 0 ] || notify_user -c "$tty" -k warn -- "snooze: nothing to snooze here"
+        return 0
+    fi
+    local prefix tgt tq_tty
+    prefix=$(reenter)
+    tgt=$(targets_q "${targets[@]}")
+    tq_tty=$(sq "$tty")
+    # item <verb> [arg…]: the run-shell that runs `<verb> -c <tty> [arg…]
+    # <targets>`. `|| true`: the script tells its story in toasts; a failing
+    # run-shell would also put its status into the pane, in view mode.
+    item() { local v="$1"; shift; printf 'run-shell -b %s' "$(tq "$prefix $v -c $tq_tty${*:+ $*}$tgt || true")"; }
+    at_item() { item apply-text "$(sq "$1")"; }
+
+    local hour evening_label evening_text title what_s
     hour=$(date -j -r "$(now_epoch)" '+%H'); hour=$((10#$hour))
     if [ "$hour" -lt 18 ]; then evening_label="This evening 18:00" evening_text="tonight"
     else evening_label="Tomorrow evening 18:00" evening_text="tomorrow 18:00"
     fi
-    opt="@snooze_prompt_$$$RANDOM"
-    # Custom…: the typed text lands in a user option (%%% escapes it for a
-    # tmux double-quoted string), never in a shell command line.
-    prompt_tmpl="set-option -g $opt \"%%%\" ; run-shell -b $(tq "$prefix apply-prompt -c $(sq "$tty") $opt$tgt")"
     what_s=$(what "${D_LABELS[@]}")
     title="#[align=centre] snooze ${what_s//#/##} "
 
     local items=(
-        "1 hour" 1 "$(item 1h)"
-        "3 hours" 3 "$(item 3h)"
-        "$evening_label" e "$(item "$evening_text")"
-        "Tomorrow 9:00" t "$(item tomorrow)"
-        "Monday 9:00" m "$(item mon)"
+        "1 hour" 1 "$(at_item 1h)"
+        "3 hours" 3 "$(at_item 3h)"
+        "$evening_label" e "$(at_item "$evening_text")"
+        "Tomorrow 9:00" t "$(at_item tomorrow)"
+        "Monday 9:00" m "$(at_item mon)"
         ""
-        "Custom…" c "command-prompt -t $(tq "$tty") -p $(tq "snooze until:") $(tq "$prompt_tmpl")"
+        "Custom…" c "$(item custom)"
     )
-    [ "$D_SNOOZED" = 1 ] && items+=("" "Unsnooze" u "run-shell -b $(tq "$prefix apply -c $(sq "$tty") unsnooze$tgt")")
+    [ "$D_SNOOZED" = 1 ] && items+=("" "Unsnooze" u "$(item apply unsnooze)")
     tmux display-menu -c "$tty" -b rounded -s 'bg=#1e1e2e,fg=#cdd6f4' -S 'fg=#f9e2af' \
         -H 'bg=#45475a,fg=#cdd6f4,bold' -T "$title" \
-        -x '#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}' -y C "${items[@]}"
+        -x "$POPUP_X" -y C "${items[@]}"
+    return 0
+}
+
+# custom -c <tty> <target…>: the Custom… box, a small popup on that client
+# running prompt-popup. A menu item runs this after its menu has closed; a
+# popup that will not open at once (an overlay still going) is retried.
+do_custom() {
+    local tty=""
+    if [ "${1:-}" = -c ]; then tty="${2:-}"; shift 2 || shift $#; fi
+    [ -n "$tty" ] || return 0
+    local cmd i
+    cmd="$(reenter) prompt-popup -c $(sq "$tty")$(targets_q "$@")"
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        tmux display-popup -c "$tty" -E -w 44 -h 12 -x "$POPUP_X" -T " snooze until " "$cmd" 2>/dev/null && return 0
+        sleep 0.1
+    done
+    log "custom: no popup on $tty"
+    notify_user -c "$tty" -k warn -- "snooze: couldn't open the time box"
+    return 0
+}
+
+# The Custom… box's suggestions: what is typed most, shown with when it lands.
+SUGGEST=(30m 1h 2h 3h tonight tomorrow "tomorrow 2pm" mon "fri 9am" 1w)
+
+# prompt-popup -c <tty> <target…>: inside the popup. fzf as an input box:
+# the typed query wins when it reads as a time, else the highlighted
+# suggestion; Esc cancels. The text never leaves this process: what is handed
+# on (after the popup has closed) is the epoch.
+do_prompt_popup() {
+    local tty=""
+    if [ "${1:-}" = -c ]; then tty="${2:-}"; shift 2 || shift $#; fi
+    local s e lines="" out rc query sel epoch="" err today at ymd wd hm
+    today=$(date -j -r "$(now_epoch)" '+%Y-%m-%d')
+    for s in "${SUGGEST[@]}"; do
+        e=$(do_parse "$s" 2>/dev/null) || continue
+        # "tonight — 18:00", "fri 9am — Fri 9:00": the clock, with the day
+        # when it is not today.
+        read -r ymd wd hm <<EOF
+$(date -j -r "$e" '+%Y-%m-%d %a %H:%M')
+EOF
+        hm="${hm#0}"
+        if [ "$ymd" = "$today" ]; then at="$hm"; else at="$wd $hm"; fi
+        lines="$lines$s$TAB$s — $at"$'\n'
+    done
+    out=$(printf '%s' "$lines" | fzf --print-query --prompt 'until: ' --delimiter "$TAB" --with-nth 2 \
+            --reverse --no-multi --no-sort --info=hidden --header '⏎ snooze · esc cancel' \
+            --bind 'enter:accept-or-print-query')
+    rc=$?
+    case "$rc" in 0|1) ;; *) return 0 ;; esac          # Esc / ⌃c: nothing
+    query="${out%%$'\n'*}"
+    sel=""
+    case "$out" in *$'\n'*) sel=$(printf '%s\n' "${out#*$'\n'}" | head -1 | cut -f1) ;; esac
+    if [ -n "$query" ] && epoch=$(do_parse "$query" 2>/dev/null); then :
+    elif [ -n "$sel" ] && epoch=$(do_parse "$sel" 2>/dev/null); then :
+    elif [ -z "$query" ]; then return 0
+    else
+        err=$(do_parse "$query" 2>&1 >/dev/null)
+        [ -n "$err" ] || err="snooze: no time in that"
+        notify_user ${tty:+-c "$tty"} -k warn -- "$err"
+        return 0
+    fi
+    # Applied after the popup has closed: a park takes a moment.
+    tmux run-shell -b "$(reenter) apply ${tty:+-c $(sq "$tty") }$epoch$(targets_q "$@") || true"
+    return 0
 }
 
 # --- the timer --------------------------------------------------------------
@@ -754,7 +883,8 @@ case "${1:-}" in
     menu)         shift; do_menu "$@" ;;
     apply)        shift; do_apply "$@" ;;
     apply-text)   shift; do_apply_text "$@" ;;
-    apply-prompt) shift; do_apply_prompt "$@" ;;
+    custom)       shift; do_custom "$@" ;;
+    prompt-popup) shift; do_prompt_popup "$@" ;;
     wake-due)     do_wake_due ;;
     reschedule)   do_reschedule ;;
     next)         do_next ;;

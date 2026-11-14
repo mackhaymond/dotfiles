@@ -140,12 +140,21 @@ class SnoozeBookkeeping(Base):
         # --stashed: Snoozed and Stashed, no Backlog.
         self.assertEqual([r[0] for r in self.rows("--stashed")], keys[:11])
 
-    def test_today_reads_in_hours(self):
-        wake = self.now + 3 * 3600
-        if datetime.datetime.fromtimestamp(wake).date() != datetime.date.today():
-            self.skipTest("3h from now is tomorrow")
-        self.write(entry("s", self.now, pinned=True, stashed_ts=self.now, wake_at=wake))
-        self.assertEqual(self.rows()[1][1].split()[0:2], ["in", "3h"])
+    def test_past_fifty_minutes_reads_as_a_clock_time(self):
+        # Never a rounded "in 1h": beside an "in 50m" row it read as sooner
+        # than a row that was really later. Up to 50 minutes "in Nm"; past
+        # that, today, the clock time it comes back at.
+        near, far = self.now + 50 * 60, self.now + 55 * 60
+        self.write(entry("near", self.now, pinned=True, stashed_ts=self.now, wake_at=near),
+                   entry("far", self.now, pinned=True, stashed_ts=self.now, wake_at=far))
+        when = {r[0]: r[1].split()[0:2] for r in self.rows() if r[0] != "-"}
+        self.assertEqual(when["p:near"], ["in", "50m"])
+        d = datetime.datetime.fromtimestamp(far)
+        hm = f"{d.hour}:{d.minute:02d}"
+        if d.date() == datetime.date.today():
+            self.assertEqual(when["p:far"], ["at", hm])
+        else:
+            self.assertEqual(when["p:far"], ["tmrw", hm])
 
     def test_ctrl_z_hands_the_picked_rows_to_the_snooze_menu(self):
         notes = Path(self.tmp, "notes.log")

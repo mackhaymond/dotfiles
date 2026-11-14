@@ -70,6 +70,7 @@ FAKE_STASH = RECORDER + r'''
 case "$1" in
     rows) cat "$FAKE_DIR/rows" 2>/dev/null ;;
     snooze) [ -e "$FAKE_DIR/refuse" ] || echo "w:$3" ;;
+    check) [ -e "$FAKE_DIR/refuse-check" ] && { echo "an agent is working — not snoozing it"; exit 3; } ;;
     wake)
         shift
         for w in "$@"; do
@@ -213,6 +214,17 @@ class Parse(Base):
         self.check(n, [("sun", local(2026, 11, 22, 9)), ("sat", local(2026, 11, 28, 9)),
                        ("tomorrow", local(2026, 11, 22, 9))])
 
+    def test_tomorrow_late_at_night_is_the_day_just_begun(self):
+        n = local(2026, 11, 17, 1, 30)      # Tue 01:30: still "Monday night"
+        self.check(n, [("tomorrow", local(2026, 11, 17, 9)), ("tomorrow 2pm", local(2026, 11, 17, 14)),
+                       ("tomorrow 2am", local(2026, 11, 17, 2)),
+                       ("tomorrow 1am", local(2026, 11, 18, 1)),       # already past: the day after
+                       ("tonight", local(2026, 11, 17, 18))])
+        n = local(2026, 11, 17, 4, 59)
+        self.check(n, [("tomorrow", local(2026, 11, 17, 9))])
+        n = local(2026, 11, 17, 5, 0)
+        self.check(n, [("tomorrow", local(2026, 11, 18, 9))])
+
     def test_dst_end(self):
         # Sat 2026-10-31 10:00 MDT; DST ends Sun 2026-11-01 02:00.
         n = local(2026, 10, 31, 10, 0)
@@ -294,7 +306,9 @@ class Apply(Base):
         self.assertEqual(self.calls("closed-tabs.sh")[-1], ["snooze", str(local(2026, 11, 20, 9)), "A"])
 
     def test_apply_text_garbage_changes_nothing(self):
-        self.run_script("apply-text", "-c", "/dev/ttys999", "whenever", "p:A", "w:@7", rc=1)
+        # Exit 0 once the toast has said it: a failing run-shell would also
+        # show its status in the pane (view mode).
+        self.run_script("apply-text", "-c", "/dev/ttys999", "whenever", "p:A", "w:@7", rc=0)
         self.assertEqual(self.calls("closed-tabs.sh"), [])
         self.assertEqual(self.calls("stash.sh"), [])
         note = self.calls("notify.sh")
@@ -302,11 +316,17 @@ class Apply(Base):
         self.assertEqual(note[0][:4], ["-c", "/dev/ttys999", "-k", "warn"])
         self.assertIn("can't read 'whenever'", note[0][-1])
 
-    def test_apply_prompt_reads_and_unsets_the_option(self):
-        (self.fake / "option").write_text("3h\n")
-        self.run_script("apply-prompt", "-c", "/dev/ttys999", "@snooze_prompt_42", "p:A")
-        self.assertEqual(self.calls("closed-tabs.sh")[-1], ["snooze", str(self.now + 3 * 3600), "A"])
-        self.assertIn(["set-option", "-gu", "@snooze_prompt_42"], self.calls("tmux"))
+    def test_toast_says_in_minutes_only_under_fifty(self):
+        for mins, want in ((49, "in 49m"), (50, "at 11:05"), (55, "at 11:10"), (60, "at 11:15")):
+            with self.subTest(mins=mins):
+                self.run_script("apply", str(self.now + mins * 60), "p:A")
+                self.assertEqual(self.calls("notify.sh")[-1][-1], f"⏰ snoozed alpha — back {want}")
+
+    def test_hash_in_a_label_is_not_a_format(self):
+        # notify.sh expands formats in its text: a # of a label is doubled.
+        self.window("@7", "main", "", "a#{client_tty}")
+        self.run_script("apply", str(self.now + 7200), "w:@7")
+        self.assertEqual(self.calls("notify.sh")[-1][-1], "⏰ snoozed a##{client_tty} — back at 12:15")
 
     def test_apply_reschedules(self):
         self.run_script("apply", str(self.now + 60), "p:A")
@@ -504,8 +524,37 @@ class Menu(Base):
         self.assertIn("apply-text -c '/dev/ttys999' '1h' 'w:@7'", items["1 hour"][1])
         self.assertTrue(items["1 hour"][1].startswith("run-shell -b "))
         self.assertIn("'tonight'", items["This evening 18:00"][1])
-        self.assertTrue(items["Custom…"][1].startswith('command-prompt -t "/dev/ttys999" -p "snooze until:" '))
-        self.assertIn("%%%", items["Custom…"][1])
+        self.assertTrue(items["Custom…"][1].startswith("run-shell -b "))
+        self.assertIn("custom -c '/dev/ttys999' 'w:@7' || true", items["Custom…"][1])
+        for name, (_, cmd) in items.items():
+            self.assertTrue(cmd.endswith(' || true"'), (name, cmd))
+        # Not parked yet: stash.sh was asked whether it would refuse it.
+        self.assertIn(["check", "--snooze", "@7"], self.calls("stash.sh"))
+
+    def test_refused_tab_gets_no_menu(self):
+        (self.fake / "refuse-check").touch()
+        self.run_script("menu", "/dev/ttys999", "w:@7")
+        self.assertEqual([c for c in self.calls("tmux") if c and c[0] == "display-menu"], [])
+        notes = self.calls("notify.sh")
+        self.assertEqual(len(notes), 1, notes)
+        self.assertEqual(notes[0][:4], ["-c", "/dev/ttys999", "-k", "warn"])
+        self.assertEqual(notes[0][-1], "an agent is working — not snoozing it")   # as-is
+
+    def test_refused_tab_is_left_out_of_a_group(self):
+        (self.fake / "refuse-check").touch()
+        self.run_script("menu", "/dev/ttys999", "p:A", "w:@7", "w:@5")
+        argv = self.menu_call()
+        self.assertIn("snooze 2 tabs", argv[argv.index("-T") + 1])
+        self.assertIn("'p:A' 'w:@5' || true", self.items(argv)["1 hour"][1])
+        self.assertNotIn("@7", self.items(argv)["1 hour"][1])
+        # Parked already (@5): never checked.
+        self.assertFalse([c for c in self.calls("stash.sh") if c[:1] == ["check"] and "@5" in c])
+
+    def test_hash_in_the_title_is_literal(self):
+        self.window("@7", "main", "", "a#{client_tty}")
+        self.run_script("menu", "/dev/ttys999", "w:@7")
+        argv = self.menu_call()
+        self.assertIn("snooze a##{client_tty} ", argv[argv.index("-T") + 1])
 
     def test_unsnooze_only_when_snoozed(self):
         self.run_script("menu", "/dev/ttys999", "p:A", "w:@5")
@@ -580,37 +629,171 @@ class MenuCommandsOnAServer(Base):
         self.t("if-shell", "true", self.items["Tomorrow 9:00"][1])
         self.assertEqual(self.wait_calls("closed-tabs.sh")[0], ["snooze", str(local(2026, 11, 17, 9)), "A"])
 
-    def prompt(self, text):
-        """command-prompt's %%% substitution, then the template as tmux runs it."""
-        cmd = self.items["Custom…"][1]
-        # command-prompt -t "<tty>" -p "snooze until:" "<template>": let tmux
-        # unquote the template by echoing it through display-message -p.
-        template = cmd.split('-p "snooze until:" ', 1)[1]
-        template = self.t("if-shell", "true", f"display-message -p -l {template}")
-        esc = "".join("\\" + ch if ch in '"\\$;~' else ch for ch in text)
-        self.t("if-shell", "true", template.replace("%%%", esc))
-
     def test_every_item_parses_as_tmux_commands(self):
         # A bad flag (command-prompt -c) is a parse error tmux only reports
         # when the item runs; `source-file -n` parses without running.
+        self.assertIn("Custom…", self.items)
         for name, item in self.items.items():
             f = Path(self.tmp, "item.conf")
             f.write_text(item[1] + "\n")
             self.t("source-file", "-n", str(f))
 
-    def test_custom_prompt(self):
-        self.prompt("fri 9am")
-        self.assertEqual(self.wait_calls("closed-tabs.sh")[0], ["snooze", str(local(2026, 11, 20, 9)), "A"])
-        # The prompt's option is gone afterwards.
-        time.sleep(0.2)
-        self.assertNotIn("@snooze_prompt", self.t("show-options", "-g"))
+    def test_garbage_through_a_menu_line_exits_zero(self):
+        # The menu's run-shell line, run in the foreground: a bad time is a
+        # toast, and run-shell sees status 0 (no "returned 1" in a pane).
+        cmd = self.items["1 hour"][1].replace("run-shell -b ", "run-shell ", 1).replace("'1h'", "'whenever'")
+        self.t("if-shell", "true", cmd)
+        self.assertIn("can't read 'whenever'", self.wait_calls("notify.sh")[0][-1])
+        self.assertEqual(self.calls("closed-tabs.sh"), [])
 
-    def test_custom_prompt_is_never_shell_code(self):
-        pwned = Path(self.tmp, "pwned")
-        self.prompt(f'$(touch {pwned}); "x\\ ~ `touch {pwned}`')
-        note = self.wait_calls("notify.sh")[0]
-        self.assertEqual(note[2:4], ["-k", "warn"])
-        self.assertFalse(pwned.exists())
+    def test_hash_label_read_raw_from_tmux(self):
+        w = self.t("new-window", "-d", "-P", "-F", "#{window_id}", "-t", "main:", "sleep 600")
+        self.t("set-option", "-w", "-t", w, "automatic-rename", "off")
+        self.t("rename-window", "-t", w, "a##{client_tty}")      # rename-window expands formats
+        self.assertEqual(self.t("display", "-p", "-t", w, "#{window_name}"), "a#{client_tty}")
+        env = dict(self.env, TMUX=self.t("display", "-p", "#{socket_path}") + ",0,0")
+        subprocess.run([BASH, str(SCRIPT), "apply", str(self.now + 7200), f"w:{w}"], env=env, check=True,
+                       capture_output=True, timeout=30)
+        self.assertEqual(self.calls("stash.sh")[0], ["snooze", str(self.now + 7200), w])
+        self.assertEqual(self.calls("notify.sh")[-1][-1], "⏰ snoozed a##{client_tty} — back at 12:15")
+
+
+@unittest.skipUnless(TMUX and shutil.which("fzf"), "tmux / fzf not installed")
+class CustomPopup(Base):
+    """The Custom… box for real: a private server, a client attached to it in
+    a pty, `custom` opens the popup on that client, keys go in through the
+    client's terminal."""
+
+    def setUp(self):
+        super().setUp()
+        import pty
+        import struct
+        import termios
+        import threading
+        self.history(entry("A", label="alpha"))
+        sockdir = tempfile.mkdtemp(prefix="snp-", dir="/private/tmp")   # short: sun_path
+        self.addCleanup(shutil.rmtree, sockdir, True)
+        sock = os.path.join(sockdir, "s")
+        self.tmux = str(self.script("tmux", f'#!/bin/sh\nexec "{TMUX}" -S "{sock}" -f /dev/null "$@"\n', self.bin))
+        self.env.update(TERM="xterm-256color", SNOOZE_NOW=str(self.now), FZF_DEFAULT_OPTS="",
+                        FZF_DEFAULT_COMMAND="")
+        # The wrapper by its path: never a bare `tmux kill-server`.
+        self.addCleanup(lambda: subprocess.run([self.tmux, "kill-server"], env=self.env,
+                                               capture_output=True, timeout=10))
+        self.t("new-session", "-d", "-s", "main", "-x", "100", "-y", "30", "sleep 600")
+        self.t("set", "-g", "exit-empty", "off")
+        pid, fd = pty.fork()
+        if pid == 0:    # the client
+            try:
+                import fcntl
+                fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+                os.execve(self.tmux, [self.tmux, "attach", "-t", "main"], self.env)
+            finally:
+                os._exit(127)
+        self.fd = fd
+        self.screen = bytearray()
+
+        def drain():
+            while True:
+                try:
+                    b = os.read(fd, 65536)
+                except OSError:
+                    return
+                if not b:
+                    return
+                self.screen.extend(b)
+        threading.Thread(target=drain, daemon=True).start()
+
+        def reap():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        self.addCleanup(reap)   # runs after kill-server (cleanups are LIFO)
+        end = time.time() + 10
+        self.tty = ""
+        while time.time() < end and not self.tty:
+            self.tty = self.t("list-clients", "-F", "#{client_tty}")
+            time.sleep(0.05)
+        self.assertTrue(self.tty, "no client attached")
+
+    def t(self, *args):
+        r = subprocess.run([self.tmux, *args], env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 0, (args, r.stderr))
+        return r.stdout.strip()
+
+    def open_box(self):
+        self.screen.clear()
+        self.custom = subprocess.Popen([BASH, str(SCRIPT), "custom", "-c", self.tty, "p:A"], env=self.env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: self.custom.poll() is None and self.custom.kill())
+        end = time.time() + 10
+        while b"until:" not in self.screen:
+            if time.time() > end:
+                self.fail(f"no time box: {bytes(self.screen)[-500:]!r}")
+            time.sleep(0.05)
+        time.sleep(0.3)     # fzf ready for input
+
+    def type(self, s):
+        os.write(self.fd, s.encode())
+
+    def popup_gone(self, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.custom.poll() is not None:
+                return self.custom.returncode
+            time.sleep(0.05)
+        self.fail("the popup never closed")
+
+    def test_typed_time_is_applied(self):
+        self.open_box()
+        self.assertIn(b"tonight", self.screen)          # the suggestions, with when
+        self.type("1m")
+        time.sleep(0.2)
+        self.type("\r")
+        self.assertEqual(self.popup_gone(), 0)
+        end = time.time() + 10
+        while not self.calls("closed-tabs.sh") and time.time() < end:
+            time.sleep(0.05)
+        self.assertEqual(self.calls("closed-tabs.sh"), [["snooze", str(self.now + 60), "A"]])
+        self.assertEqual(self.calls("notify.sh")[-1][-1], "⏰ snoozed alpha — back in 1m")
+
+    def test_suggestion_is_applied_when_the_text_is_no_time(self):
+        self.open_box()
+        self.type("tomo")           # no time, but it narrows to "tomorrow"
+        time.sleep(0.3)
+        self.type("\r")
+        self.assertEqual(self.popup_gone(), 0)
+        end = time.time() + 10
+        while not self.calls("closed-tabs.sh") and time.time() < end:
+            time.sleep(0.05)
+        self.assertEqual(self.calls("closed-tabs.sh")[0], ["snooze", str(local(2026, 11, 17, 9)), "A"])
+
+    def test_esc_cancels_quietly(self):
+        self.open_box()
+        self.type("2h")
+        time.sleep(0.2)
+        self.type("\x1b")
+        self.assertEqual(self.popup_gone(), 0)
+        time.sleep(0.5)
+        self.assertEqual(self.calls("closed-tabs.sh"), [])
+        self.assertEqual(self.calls("notify.sh"), [])
+
+    def test_garbage_is_a_warning(self):
+        self.open_box()
+        self.type("zzz")
+        time.sleep(0.2)
+        self.type("\r")
+        self.assertEqual(self.popup_gone(), 0)
+        end = time.time() + 5
+        while not self.calls("notify.sh") and time.time() < end:
+            time.sleep(0.05)
+        notes = self.calls("notify.sh")
+        self.assertEqual(notes[0][:4], ["-c", self.tty, "-k", "warn"], notes)
         self.assertEqual(self.calls("closed-tabs.sh"), [])
 
 

@@ -382,7 +382,8 @@ fn draw_row(m: &Menu, buf: &mut Buffer, x0: u16, y: u16, cw: u16, row: &Row, sel
             // colour), where a parked one shows its age.
             let snoozed = p.wake_at.is_some();
             right.push_str(&format!("{} ", sanitize(&p.origin)));
-            let when = format!("{:>4}", if snoozed { p.wake.as_str() } else { p.age.as_str() });
+            // (`in 54m` / `at 18:00`: a stashed row's `4m` is an age.)
+            let when = if snoozed { crate::text::wake_phrase(&p.wake) } else { format!("{:>4}", p.age) };
             let rw = cells(&right) + cells(&when);
             let room = end.saturating_sub(x + rw + 2) as usize;
             put(buf, x, y, end, &clip(&sanitize(shown_title(&a.title)), room), if sel { bold(fg("text")) } else { ov });

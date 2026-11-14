@@ -680,6 +680,24 @@ pub fn wake(at: i64, now: f64) -> String {
     }
 }
 
+/// A [`wake_words`] label as a phrase that cannot be read as an age (the
+/// menu's Parked column, where a stashed row's `4m` means "4m ago"): `in
+/// 54m`, `in 2h`, `at 18:00`, `due` once due; a label with a day (`tmrw
+/// 9:00`, `mon 9:00`, `nov 20`) already reads as a time and stays.
+pub fn wake_phrase(label: &str) -> String {
+    let n = label.len();
+    let relative = n > 1 && label[..n - 1].bytes().all(|b| b.is_ascii_digit()) && matches!(label.as_bytes()[n - 1], b'm' | b'h');
+    if label == "now" {
+        "due".into()
+    } else if relative {
+        format!("in {label}")
+    } else if !label.contains(' ') && label.contains(':') {
+        format!("at {label}")
+    } else {
+        label.to_string()
+    }
+}
+
 /// `HH:MM` in local time for an epoch (the event log's time column).
 pub fn clock_hm(epoch: i64) -> String {
     let mut tm = Tm {
@@ -918,6 +936,11 @@ mod tests {
         assert_eq!(w(at(101, 5, 9, 0), 23 * 3600), "tmrw 9:00");
         assert_eq!(w(at(104, 1, 9, 5), 4 * 86_400), "mon 9:05");
         assert_eq!(w(at(110, 0, 9, 0), 10 * 86_400), "nov 20");
+        // The menu's phrase: never readable as an age.
+        for (l, p) in [("54m", "in 54m"), ("2h", "in 2h"), ("18:00", "at 18:00"), ("now", "due"), ("tmrw 9:00", "tmrw 9:00"),
+            ("mon 9:05", "mon 9:05"), ("nov 20", "nov 20"), ("", "")] {
+            assert_eq!(wake_phrase(l), p, "{l:?}");
+        }
         assert!(!wake(1_800_000_000 + 3600, 1_800_000_000.0).is_empty());
     }
 

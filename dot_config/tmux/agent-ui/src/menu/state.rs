@@ -200,7 +200,8 @@ pub enum Act {
 /// A space's home ([`Target::home`]) is never parked, and with no split
 /// never closed (its agent is the home shell pane; prefix Q closes the
 /// space), so neither is offered then (2026-10-22). A stashed entry
-/// ([`Target::entry`]) offers no `d` (no window, no cwd of its own to read).
+/// ([`Target::entry`]) offers no `d` (no window, no cwd of its own to read)
+/// and no `r` (no agent the watcher tracks): z, x, v only.
 /// `z` snoozes (a snooze parks, so never a pending claude or a home); a
 /// parked row offers it too (its wake set, changed or cleared).
 pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
@@ -221,12 +222,15 @@ pub fn strip(t: &Target) -> Vec<(char, Act, &'static str)> {
     if t.parked() || !(t.home && t.panes <= 1) {
         v.push(('x', Act::Close, if t.parked() { "discard" } else { "close" }));
     }
-    // (A stashed entry has no window to diff.)
+    // (A stashed entry has no window to diff, and no agent the watcher
+    // tracks: the watcher's restart means nothing on its row.)
     if !t.entry() {
         v.push(('d', Act::Diff, "diff"));
     }
     v.push(('v', Act::Peek, "preview"));
-    v.push(('r', Act::Restart, "restart watcher"));
+    if !t.entry() {
+        v.push(('r', Act::Restart, "restart watcher"));
+    }
     v
 }
 
@@ -1461,7 +1465,7 @@ pub(crate) mod tests {
         let t = m.selected_target().unwrap();
         assert!(t.parked() && t.entry());
         assert_eq!(strip(&t).iter().map(|(k, _, w)| format!("{k} {w}")).collect::<Vec<_>>(),
-            ["z snooze", "x discard", "v preview", "r restart watcher"]);
+            ["z snooze", "x discard", "v preview"]);
         let mut fx = Rec::default();
         assert!(m.act(Enter, &mut fx));
         assert_eq!(fx.calls, ["go entry:1790000100-12 stash"]);

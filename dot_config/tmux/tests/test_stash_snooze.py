@@ -11,7 +11,7 @@ from pathlib import Path
 import time
 import unittest
 
-from test_stash_freeze import Base, SEP, STUB
+from test_stash_freeze import Base, SEP, STUB, STASH as STASH_PATH
 
 PIN_STUB = STUB.replace(
     'pin=""; [ "$1" = close ] && [ "$2" = --pin ] && { pin=1; set -- close "$3"; }',
@@ -217,6 +217,72 @@ class Snooze(Base):
         new = self.tpgid(p2)
         self.pids.append(new)
         self.wait_for(lambda: self.argv_of(new) == "sleep 1000", "wrong command re-run")
+
+    # -- check (round 2) ---------------------------------------------------
+    def check(self, *args):
+        import subprocess
+        r = subprocess.run(["bash", str(STASH_PATH), "check", *args], env=self.script_env(),
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout
+
+    def test_check_says_yes_with_no_side_effect(self):
+        self.keep_one()
+        w = self.new_window()
+        job = self.run_job(self.pane(w), "sleep 1000")
+        self.assertEqual(self.check(w), (0, ""))
+        self.assertEqual(self.session_of(w), "main")
+        self.assertFalse(self.state(job).startswith("T"))
+        self.assertEqual(self.opt(w, "@stash_frozen"), "")
+        self.assertNotIn("stash", self.t("list-sessions", "-F", "#{session_name}").split())
+        self.assertEqual(self.log(), "")
+
+    def test_check_gives_the_refusal_and_3(self):
+        self.keep_one()
+        w = self.new_window()
+        job = self.run_job(self.pane(w), f"'{self.fake('ssh')}' 1000")
+        self.assertEqual(self.check(w), (3, "ssh in the foreground — not parking it\n"))
+        self.assertEqual(self.check("--snooze", w), (3, "ssh in the foreground — not snoozing it\n"))
+        self.assertEqual(self.session_of(w), "main")
+        self.assertFalse(self.state(job).startswith("T"))
+        self.assertNotIn("refused", self.log())
+
+    def test_check_covers_home_only_tab_and_already_parked(self):
+        home = self.t("list-windows", "-t", "main", "-F", "#{window_id}").split()[0]
+        self.t("set", "-w", "-t", home, "@space_home", "1")
+        self.assertEqual(self.check(home), (3, "that's the space's home tab — it stays\n"))
+        self.t("new-session", "-d", "-s", "solo")
+        solo = self.t("list-windows", "-t", "solo", "-F", "#{window_id}")
+        self.assertEqual(self.check(solo), (3, "that's the only tab in this session — not parking it\n"))
+        self.keep_one()
+        w = self.new_window()
+        self.script("stash", w)
+        self.assertEqual(self.check(w), (3, "already parked\n"))
+
+    def test_check_runs_the_deep_guards(self):
+        self.keep_one()
+        w = self.new_window()
+        self.run_job(self.pane(w), f"'{self.fake('claude')}' 1000")
+        # A fake claude shows no composer: "a draft may be there" — refused.
+        self.assertEqual(self.check(w), (3, "unsent text in the agent's composer — not parking it\n"))
+        self.assertFalse(self.calls.exists())                     # never offered to close --pin
+
+    def test_a_snooze_refusal_says_not_snoozing(self):
+        said = Path(self.tmp, "said")
+        rec = Path(self.tmp, "notify-rec")
+        rec.write_text(f'#!/bin/sh\necho "$*" >> "{said}"\n')
+        rec.chmod(0o755)
+        self.env["NOTIFY_SH"] = str(rec)
+        self.keep_one()
+        w = self.new_window()
+        self.run_job(self.pane(w), f"'{self.fake('ssh')}' 1000")
+        self.script("snooze", self.when, w)
+        self.assertIn("ssh in the foreground — not snoozing it", said.read_text())
+        self.script("stash", w)
+        self.assertIn("ssh in the foreground — not parking it", said.read_text().splitlines()[-1])
+
+    def test_previews_follow_xdg_state_home(self):
+        out = self.source('printf "%s" "$PREVIEW_DIR"')
+        self.assertEqual(out, str(Path(self.env["XDG_STATE_HOME"], "tmux-stash", "previews")))
 
     def test_a_wake_only_row_keeps_fields_10_and_11_in_place(self):
         self.keep_one()
