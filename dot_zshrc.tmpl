@@ -73,13 +73,18 @@ autoload -Uz compinit
 compinit -C -d "${ZDOTDIR:-$HOME}/.zcompdump"
 
 # ─── Antidote (plugin manager) ────────────────────────────────────────────
+# Plugin clones live outside ~/Library/Caches: macOS / cleaners may purge
+# Caches, which silently dropped vi-mode, highlighting and the prompt
+# (2026-11-15).
+export ANTIDOTE_HOME=$HOME/.local/share/antidote
 source ~/.antidote/antidote.zsh
 
 zsh_plugins=${ZDOTDIR:-~}/.zsh_plugins
 [[ -f ${zsh_plugins}.txt ]] || touch ${zsh_plugins}.txt
 
-# Regenerate static bundle when plugin list changes
-if [[ ! ${zsh_plugins}.zsh -nt ${zsh_plugins}.txt ]]; then
+# Regenerate static bundle when the plugin list changes, or re-clone when the
+# plugin dir has gone missing (bundle points at clones that no longer exist).
+if [[ ! ${zsh_plugins}.zsh -nt ${zsh_plugins}.txt || ! -d $ANTIDOTE_HOME ]]; then
   autoload -Uz antidote
   antidote bundle <${zsh_plugins}.txt >|${zsh_plugins}.zsh
 fi
