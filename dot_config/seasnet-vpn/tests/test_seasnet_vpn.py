@@ -491,5 +491,29 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(vpn.idle_seconds(), vpn.DEFAULT_IDLE_MINUTES * 60)
 
 
+class SnapshotTests(unittest.TestCase):
+    def test_cloned_host_routes_do_not_count_as_route_changes(self):
+        header = "Routing tables\n\nInternet:\nDestination Gateway Flags Netif Expire\n"
+        static = "default link#41 UCSg utun14\n10.21/16 link#14 UCSI en0 !\n"
+
+        def table(cloned):
+            return SimpleNamespace(returncode=0, stdout=header + static + cloned,
+                                   check_returncode=lambda: None)
+
+        def snap(cloned):
+            def fake(argv, *args, **kwargs):
+                if argv[0].endswith("netstat"):
+                    return table(cloned)
+                return SimpleNamespace(returncode=0, stdout="same\n", check_returncode=lambda: None)
+            with patch.object(vpn, "capture", side_effect=fake):
+                return vpn.snapshot()
+
+        before = snap("17.57.144.104 link#41 UHWIig utun14\n")
+        after = snap("104.16.1.34 link#41 UHW3Ig utun14 6\n")
+        self.assertEqual(before["routes"], after["routes"])
+        self.assertNotEqual(snap("")["routes"],
+                            snap("10.9/16 link#50 UCS utun15\n")["routes"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -644,7 +644,11 @@ def snapshot():
         entries = []
         for line in result.stdout.splitlines():
             fields = line.split()
-            if len(fields) >= 4 and "U" in fields[2] and "L" not in fields[2]:
+            # W marks a cloned per-destination cache entry, not configuration.
+            # Behind a Tailscale exit node they churn on utun constantly, so
+            # counting them failed every login's network comparison.
+            if (len(fields) >= 4 and "U" in fields[2] and "L" not in fields[2]
+                    and "W" not in fields[2]):
                 entries.append([fields[0], fields[1], fields[3]])
         routes[family] = sorted(entries)
     dns = capture(["/usr/sbin/scutil", "--dns"])
