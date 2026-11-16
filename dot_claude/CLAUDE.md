@@ -294,3 +294,9 @@ is the orchestrator, not the typist:
   doesn't need any of this; just do it. Run only as many concurrent agents
   as the work needs (each costs battery and usage limit) and say in the plan
   how many you intend to use.
+- **AMSAP = "as many subagents as possible".** When Mack says AMSAP, he is
+  explicitly asking for maximum parallelism on the task at hand: split the
+  work into as many independent pieces as it genuinely divides into and run
+  a subagent on each at once, overriding the "only as many as the work
+  needs" default above. It is still not a licence for duplicate agents on
+  the same piece; say how many you launched and what each one owns.
