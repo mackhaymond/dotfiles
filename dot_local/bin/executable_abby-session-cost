@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""abby-session-cost: what one abby conversation has spent on abliteration.ai.
+Usage: abby-session-cost <transcript.jsonl>   -> prints USD, e.g. 1.2345
+
+The balance endpoint (/v1/credits) is org-wide, so the statusline's "used"
+was every session's spend at once. This prices the session's own replies:
+each assistant message's usage (input, cache read, cache write, output) at
+the model's rate, over the main transcript and its subagents'
+(<transcript dir>/<session id>/subagents/*.jsonl). Claude Code writes one
+line per content block, each carrying the whole message's usage, so a
+message is counted once by its id.
+
+A transcript misses calls that never land in it: the auto-mode classifier,
+titles, compaction, the guard's retries (measured 2026-11-16: transcripts
+held $5.01 of $8.42 billed over the same window). abby-guard sees every
+request and logs each billed response's usage per session to
+~/.claude-abby/.cost/guard/<session id>.jsonl, so once that log exists it is
+the source: the total is the guard's log plus the transcript's messages from
+before the log's first entry (a session older than the guard, or one run
+without it).
+
+Web search fees aren't in either; neither is a session run with
+ABBY_BASE_URL pointed past the guard (then it's transcript-only).
+
+The statusline calls this on every redraw, so it only reads what was
+appended since last time: per file, an offset, the last message id and the
+running total, cached in ~/.claude-abby/.cost/<session id>.json.
+"""
+import datetime
+import glob
+import json
+import os
+import sys
+
+# USD per 1M tokens: input, cache read, cache write, output
+# (docs.abliteration.ai/pricing, 2026-11-16; cache writes bill as input).
+PRICES = {
+    "abliterated-model-large-v2": (3.00, 0.30, 3.00, 5.00),
+    "abliterated-model-large-flash": (1.00, 0.10, 1.00, 2.00),
+    "abliterated-model-large": (3.00, 0.30, 3.00, 5.00),
+    "abliterated-model": (1.00, 0.10, 1.00, 3.00),
+}
+CACHE_DIR = os.path.expanduser("~/.claude-abby/.cost")
+GUARD_DIR = os.path.join(CACHE_DIR, "guard")
+
+
+def rate(model):
+    model = (model or "").split("[")[0]
+    if model in PRICES:
+        return PRICES[model]
+    # Longest known prefix (a dated or suffixed id), else the dearest rate.
+    for k in sorted(PRICES, key=len, reverse=True):
+        if model.startswith(k):
+            return PRICES[k]
+    return PRICES["abliterated-model-large-v2"]
+
+
+def price(msg):
+    u = msg.get("usage") or {}
+    i, cr, cw, o = rate(msg.get("model"))
+    return (u.get("input_tokens", 0) * i + u.get("cache_read_input_tokens", 0) * cr
+            + u.get("cache_creation_input_tokens", 0) * cw + u.get("output_tokens", 0) * o) / 1e6
+
+
+def tail(path, off):
+    """(complete lines past off, new offset); restarts if the file shrank."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None, off
+    if size < off:
+        return None, 0
+    if size == off:
+        return [], off
+    with open(path, "rb") as f:
+        f.seek(off)
+        data = f.read(size - off)
+    end = data.rfind(b"\n") + 1
+    return data[:end].splitlines(), off + end
+
+
+def scan_guard(path, state):
+    """state = [offset, first t, total] over the guard's usage log."""
+    off, first, total = state
+    lines, new_off = tail(path, off)
+    if lines is None:
+        if new_off == off:
+            return state
+        lines, new_off = tail(path, 0)
+        first, total = None, 0.0
+    for line in lines or []:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if first is None:
+            first = r.get("t")
+        total += price({"model": r.get("m"), "usage": r.get("u")})
+    return [new_off, first, total]
+
+
+def scan(path, state, before=None):
+    """state = [offset, last message id, total]; reads complete lines past
+    offset. With before (ISO time), only messages stamped earlier count."""
+    off, last, total = state
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return state
+    if size < off:  # rewritten from scratch: start over
+        off, last, total = 0, None, 0.0
+    if size == off:
+        return [off, last, total]
+    with open(path, "rb") as f:
+        f.seek(off)
+        data = f.read(size - off)
+    end = data.rfind(b"\n") + 1  # a line still being written waits for next time
+    for line in data[:end].splitlines():
+        if b'"assistant"' not in line or b'"usage"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        msg = rec.get("message") if rec.get("type") == "assistant" else None
+        if not isinstance(msg, dict) or not msg.get("usage"):
+            continue
+        mid = msg.get("id")
+        if mid and mid == last:
+            continue
+        last = mid
+        if before and (rec.get("timestamp") or "") >= before:
+            continue
+        total += price(msg)
+    return [off + end, last, total]
+
+
+def main():
+    if len(sys.argv) < 2 or not sys.argv[1]:
+        return
+    transcript = sys.argv[1]
+    sid = os.path.splitext(os.path.basename(transcript))[0]
+    files = [transcript] + sorted(glob.glob(os.path.join(
+        os.path.dirname(transcript), sid, "subagents", "*.jsonl")))
+    cache = os.path.join(CACHE_DIR, sid + ".json")
+    try:
+        with open(cache) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    if not isinstance(st.get("files"), dict):
+        st = {}
+    guard = scan_guard(os.path.join(GUARD_DIR, sid + ".jsonl"), st.get("guard") or [0, None, 0.0])
+    # The transcript covers only what came before the guard's first entry.
+    before = None
+    if guard[1] is not None:
+        before = datetime.datetime.fromtimestamp(guard[1], datetime.timezone.utc) \
+            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    old = st.get("files") if st.get("before") == before else {}
+    files_st = {p: scan(p, old.get(p) or [0, None, 0.0], before) for p in files}
+    new = {"files": files_st, "guard": guard, "before": before}
+    if new != st:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = f"{cache}.{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(new, f)
+        os.replace(tmp, cache)
+    print(f"{sum(v[2] for v in files_st.values()) + guard[2]:.4f}")
+
+
+if __name__ == "__main__":
+    main()

@@ -233,12 +233,35 @@ def munge(path):
     return "".join(c if c.isalnum() else "-" for c in path)
 
 
+def memory_dir(cwd):
+    """The ~/.claude/projects/<p>/memory Claude Code uses for this cwd: keyed by
+    the repo's main checkout (worktrees share it), else the cwd itself (CC's
+    defaultKey: working copy, git, project root). None for a key CC would
+    shorten with a hash, which isn't worth copying here."""
+    root = cwd
+    try:
+        out = subprocess.run(["git", "-C", cwd, "rev-parse", "--path-format=absolute",
+                              "--git-common-dir"], capture_output=True, text=True, timeout=3)
+        common = out.stdout.strip()
+        if out.returncode == 0 and os.path.basename(common) == ".git":
+            root = os.path.dirname(common)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    key = munge(root)
+    if len(key) > 200:
+        return None
+    return os.path.join(SRC, "projects", key, "memory")
+
+
 def link_memory(cwd):
     """Share auto-memory: abby's projects/<p>/memory -> ~/.claude/projects/<p>/memory,
     for every project that has one, plus this cwd's (created if missing)."""
     src_projects = os.path.join(SRC, "projects")
     dst_projects = os.path.join(DST, "projects")
     os.makedirs(os.path.join(src_projects, munge(cwd), "memory"), exist_ok=True)
+    mem = memory_dir(cwd)
+    if mem:
+        os.makedirs(mem, exist_ok=True)
     for p in os.scandir(src_projects):
         mem = os.path.join(p.path, "memory")
         if not os.path.isdir(mem):
@@ -370,7 +393,8 @@ def overlay(live):
 
 
 def build_settings():
-    """Returns the saved model and effort to pass as flags (see overlay)."""
+    """Returns the saved model and effort to pass as flags (see overlay), and
+    the --settings file to launch with."""
     live = load(os.path.join(SRC, "settings.json"), required=True)
     path = os.path.join(DST, "settings.json")
     prev = load(path)
@@ -390,10 +414,21 @@ def build_settings():
     if prev.get("effortLevel"):
         s["effortLevel"] = prev["effortLevel"]
     write_atomic(path, s)
-    write_atomic(FLAGS_FILE, {**ov, "hooks": LOOK_HOOKS})
-    os.makedirs(os.path.join(DST, "themes"), exist_ok=True)
-    write_atomic(os.path.join(DST, "themes", "abby.json"), THEME)
-    return s["model"], s.get("effortLevel") or DEFAULT_EFFORT
+    flags = {**ov, "hooks": LOOK_HOOKS}
+    write_atomic(FLAGS_FILE, flags)  # what older restore commands still name
+    # Auto-memory, pointed at the real ~/.claude/projects/<p>/memory. Through
+    # abby's projects/<p>/memory link every memory write asked first: CC
+    # resolves the link, finds a path under ~/.claude ("a sensitive file",
+    # outside the working dirs; allow rules don't lift that), while its own
+    # memory dir is exempt. Per project, so concurrent sessions in different
+    # repos each keep theirs.
+    mem = memory_dir(os.getcwd())
+    if not mem:
+        return s["model"], s.get("effortLevel") or DEFAULT_EFFORT, FLAGS_FILE
+    path = os.path.join(DST, "flags", os.path.basename(os.path.dirname(mem)) + ".json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_atomic(path, {**flags, "autoMemoryDirectory": mem})
+    return s["model"], s.get("effortLevel") or DEFAULT_EFFORT, path
 
 
 def build_global_config():
@@ -479,7 +514,7 @@ def main():
     link_tree()
     link_memory(os.getcwd())
     migrate_sessions()
-    model, effort = build_settings()
+    model, effort, flags_file = build_settings()
     build_global_config()
 
     env = os.environ
@@ -495,7 +530,7 @@ def main():
 
     args = sys.argv[1:]
     given = lambda flag: any(a == flag or a.startswith(flag + "=") for a in args)
-    pre = ["--settings", FLAGS_FILE]
+    pre = ["--settings", flags_file]
     # Flags so a saved pick beats the live settings' model/effort, which load
     # as project settings when run from ~. An in-session pick still wins.
     if not given("--model"):

@@ -1,6 +1,7 @@
 #!/bin/bash
 # abby-statusline: abby's statusline (see ~/.local/bin/abby).
-#   ABBY badge · abliteration balance left · $ used, then the usual statusline.
+#   ABBY badge · abliteration balance left · $ this session (abby-session-cost),
+#   then the usual statusline.
 # Usage (abby wires it): abby-statusline '<inner statusline command>'
 # Claude Code's JSON arrives on stdin and is passed through to the inner one.
 #
@@ -38,16 +39,24 @@ if [ $((now - ${fetched:-0})) -gt "$REFRESH" ] && mkdir "$lock" 2>/dev/null; the
     disown 2>/dev/null
 fi
 
+# This conversation's own spend, priced from its transcript (the balance above
+# is org-wide, shared by every abby session).
+transcript=$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)
+spent=""
+[ -n "$transcript" ] && spent=$("$HOME/.local/bin/abby-session-cost" "$transcript" 2>/dev/null)
+
 # Badge: black on neon green (abby's accent).
 printf '\033[1;38;2;8;24;16;48;2;57;255;136m ABBY \033[0m'
 if [ -n "$credits" ]; then
-    read -r left used color <<<"$(awk -v c="$credits" -v u="$usage" 'BEGIN {
+    read -r left color <<<"$(awk -v c="$credits" -v u="$usage" 'BEGIN {
         l = c - u
         col = (l < 2) ? "38;2;255;85;85" : (l < 5) ? "38;2;249;226;175" : "38;2;57;255;136"
-        printf "%.2f %.2f %s", l, u, col }')"
-    printf ' \033[%sm$%s left\033[0m\033[2m · $%s used\033[0m ' "$color" "$left" "$used"
+        printf "%.2f %s", l, col }')"
+    printf ' \033[%sm$%s left\033[0m' "$color" "$left"
 else
-    printf ' \033[2m$… balance\033[0m '
+    printf ' \033[2m$… balance\033[0m'
 fi
+[ -n "$spent" ] && printf '\033[2m · $%.2f this session\033[0m' "$spent"
+printf ' '
 
 [ -n "$1" ] && printf '%s' "$input" | bash -c "$1"

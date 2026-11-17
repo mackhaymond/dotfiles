@@ -43,6 +43,29 @@ DROP_RESP = {"transfer-encoding", "content-length", "connection", "content-encod
 CTX = ssl.create_default_context()
 
 
+USAGE_DIR = os.path.expanduser("~/.claude-abby/.cost/guard")
+
+
+def record(sid, model, usage):
+    """One billed response for the abby-statusline's per-session spend:
+    appended to .cost/guard/<session id>.jsonl as {t, m, u}; abby-session-cost
+    prices it. Every request a session makes passes here (the auto-mode
+    classifier, titles, compaction, retries), not only what its transcript
+    keeps. Claude Code names the session in X-Claude-Code-Session-Id."""
+    if not sid or not usage or not all(c.isalnum() or c == "-" for c in sid):
+        return
+    keep = {k: v for k, v in usage.items() if isinstance(v, int) and v}
+    if not keep:
+        return
+    try:
+        os.makedirs(USAGE_DIR, exist_ok=True)
+        # One short line per write in append mode: concurrent writers don't interleave.
+        with open(os.path.join(USAGE_DIR, sid + ".jsonl"), "a") as f:
+            f.write(json.dumps({"t": round(time.time(), 3), "m": model, "u": keep}) + "\n")
+    except OSError:
+        pass
+
+
 def log(**rec):
     rec["t"] = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -186,6 +209,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.single(req, body)
 
+    def bill(self, req, usage):
+        record(self.headers.get("X-Claude-Code-Session-Id"), req.get("model"), usage)
+
     def retry(self, req, usage, stream):
         """Re-ask non-streamed, one effort step lower each time (at most two).
         Returns (resp, message) for the first answer with content, or None."""
@@ -204,6 +230,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 msg = json.loads(data) if resp.status == 200 else None
             except ValueError:
                 msg = None
+            if msg is not None:
+                self.bill(req, msg.get("usage"))
             if msg is None:
                 log(event="retry-error", to=label(req), status=resp.status)
                 return None
@@ -224,6 +252,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             msg = json.loads(data) if resp.status == 200 else None
         except ValueError:
             msg = None
+        if msg is not None:
+            self.bill(req, msg.get("usage"))
         if msg is not None and swallowed(msg.get("usage"), bool(visible(msg.get("content")))):
             got = self.retry(req, msg.get("usage"), stream=False)
             if got:
@@ -239,29 +269,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.start(resp)
                 self.wfile.write(resp.read())
                 return
-            held, usage = [], None
-            while True:
-                raw, ev = read_event(resp)
-                if not raw:
-                    break
+            held, usage, billed = [], None, {}
+
+            def note(ev):
+                # message_start carries the input side, message_delta the final
+                # output count (and sometimes the input side again).
                 kind = (ev or {}).get("type")
-                if kind == "content_block_start":
-                    # Content is flowing: from here on, a plain pass-through.
-                    self.start(resp)
-                    for h in held + [raw]:
-                        self.wfile.write(h)
-                    self.wfile.flush()
-                    while True:
-                        raw, _ = read_event(resp)
-                        if not raw:
-                            return
-                        self.wfile.write(raw)
+                if kind == "message_start":
+                    billed.update((ev.get("message") or {}).get("usage") or {})
+                elif kind == "message_delta":
+                    billed.update(ev.get("usage") or {})
+
+            try:
+                while True:
+                    raw, ev = read_event(resp)
+                    if not raw:
+                        break
+                    note(ev)
+                    kind = (ev or {}).get("type")
+                    if kind == "content_block_start":
+                        # Content is flowing: from here on, a plain pass-through.
+                        self.start(resp)
+                        for h in held + [raw]:
+                            self.wfile.write(h)
                         self.wfile.flush()
-                held.append(raw)
-                if kind == "message_delta":
-                    usage = ev.get("usage")
-                if kind == "message_stop":
-                    break
+                        while True:
+                            raw, ev = read_event(resp)
+                            if not raw:
+                                return
+                            note(ev)
+                            self.wfile.write(raw)
+                            self.wfile.flush()
+                    held.append(raw)
+                    if kind == "message_delta":
+                        usage = ev.get("usage")
+                    if kind == "message_stop":
+                        break
+            finally:
+                # Billed even when Claude Code hung up mid-stream.
+                self.bill(req, billed)
             # The message ended with no content block at all.
             got = self.retry(req, usage, stream=True) if swallowed(usage, False) else None
             self.start(resp)
