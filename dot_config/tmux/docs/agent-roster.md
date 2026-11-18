@@ -1987,6 +1987,59 @@ counts as just prompted and never folds or dims anything.
   line, a click on it goes on to all) → all spaces. `tmux set -g
   @space_fold_hours 8` to change N.
 
+### abby-delegate children (`view.rs` `kids_split` / `kid_needs`, `layout.rs` "Kids")
+
+The Claude agents abby spawns beside its own window are its subagents in
+the sidebar, not agents of their own (2026-11-17). The sidebar trusts only
+the shell reconciler's DERIVED options (never `@agent_parent`):
+`@agent_child` (on a child: its parent's window id, set only while that
+parent is a live agent in a visible space), `@agent_kids` (`"<total>
+<busy>"` on the parent: busy is running, asking, paused or not started)
+and `@agent_kids_ask` (the most urgent asking child; the sidebar does not
+need it).
+
+```text
+ NEEDS YOU                             3
+ ▌  a  Abby orchestrator ◉ perm · ⚙ 2 4m    an asking child: its parent's
+ ▌ [A] ↳ f: perm Ba…  y  allow   n  deny    title, the child's state; ⌥W f,
+ ▌  a  Abby orchestrator ✕ fail · ⚙ 2 6m    a click, y/n go to the child.
+ ▌ [A] ↳ s: fail tests broke         6m    One card per asking child.
+ ▌  h  Plain asker                ◉ asks
+ ▌ [C] Ship it?                       6m
+ AGENTS                        all spaces
+ ▎  a  Abby orchestrator ⚙ 2   ⠋ working    busy children: working, ⚙ N
+ ▎ [A] › Running cargo test           1m
+ ▎  s  ↳ Parser kid                         one dim row per child: its letter,
+ ▎  d  ↳ Docs kid                           ↳, its title; no dot, word or blurb
+ ▎  f  ↳ Tests kid
+```
+
+- **Who is a child** is decided ONCE per view (`view::kid_roots`): its
+  `@agent_child` names a window, it is itself an agent in a shown session,
+  and its parent is a child itself (a grandchild folds under the root) or
+  a shown agent: not a home, not parked or hidden, in ANY space. Otherwise
+  it is a plain agent: own card, counts and NEEDS YOU entry. Counts, NEEDS
+  YOU, pins and the menu read that one verdict, so none of them flips with
+  ⌥V (they match `agent-jump.sh list` and ⌥S). The scope changes only the
+  drawing: in space scope a child in this space whose root lives in
+  another space is drawn as its own card here (it still counts nowhere).
+- **A child** has no card, PINNED entry or ⌥W pin digit (pinning one is
+  refused) and counts in no header: one dim row under its root's full
+  card, on the card's colour and rail. Its letter stays (assigned with
+  every agent, before the fold), so ⌥W + letter and a click on the row
+  reach it. A one-line, folded or collapsed parent (the ladder, the idle
+  fold, a dormant space) folds its children with it.
+- **The parent** reads as working while any child is busy (`⚙ N`, the
+  workflow's gear; a done turn is then no NEEDS YOU entry, like a fleet out).
+- **Every asking child** (its own current state needs-input or failed)
+  is one NEEDS YOU card: its root's title, the child's state, stamp and
+  words after its letter (`↳ f: perm Bash`), sorted as the child (as
+  `agent-jump.sh list` and ⌥S do); the card, its answer chips, a
+  right-click and the menu's Needs row act on the child. A parent asking
+  itself has its own card besides. `agent-ui needs` mirrors `agent-jump.sh
+  list` (`model::needs_order`; `tests/parity.rs` checks it).
+- The menu (prefix q / ⌥W) still lists children as agents.
+
 ### Answering a permission prompt (`src/answer.rs`)
 
 A Claude agent in NEEDS YOU on a tool-permission prompt (`@agent_state`

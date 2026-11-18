@@ -309,6 +309,17 @@ pub struct Agent {
     /// (epoch seconds; None: a restore, an older window, a peer-only agent).
     /// The folding reads [`Agent::prompted_at`].
     pub thread_at: Option<i64>,
+    /// An abby-delegate CHILD by THE verdict ([`kid_roots`]): the ROOT it
+    /// folds under (its parent, or a grandchild's grandparent). No card,
+    /// NEEDS YOU entry or pin of its own: a dim row under the root's card
+    /// ([`ViewModel::kids_split`]).
+    pub child_of: Option<String>,
+    /// A PARENT's children as counted (`@agent_kids`): its card's `⚙ N`
+    /// while any is busy.
+    pub kids: Option<model::Kids>,
+    /// The children nested under this card (set by
+    /// [`ViewModel::kids_split`], in window order; empty otherwise).
+    pub nested: Vec<Agent>,
 }
 
 /// What a limit with no reset time says when the indicator gave no words
@@ -456,7 +467,15 @@ impl Agent {
             pending: None,
             limit,
             thread_at: w.thread_at,
+            child_of: Some(w.child.clone()).filter(|c| !c.is_empty()),
+            kids: w.kids,
+            nested: Vec::new(),
         }
+    }
+
+    /// How many of its children run (0: none, or not a parent).
+    pub fn kids_running(&self) -> u32 {
+        self.kids.map_or(0, |k| k.running)
     }
 
     /// Its last prompt from Mack as the folding reads it ([`prompted_at`]):
@@ -480,9 +499,10 @@ impl Agent {
     }
 
     /// Listed in PINNED: pinned, an agent (a state; a shell's stray pin is
-    /// nothing), never a space's home.
+    /// nothing), never a space's home, never a child (it folds under its
+    /// parent like any other: [`ViewModel::kids_split`]).
     pub fn is_pinned(&self) -> bool {
-        self.pinned.is_some() && !self.state.is_empty() && !self.home
+        self.pinned.is_some() && !self.state.is_empty() && !self.home && self.child_of.is_none()
     }
 
     /// The stale-agent sweep ([`Stale`]) for this agent at `now`, with the
@@ -540,6 +560,8 @@ impl Agent {
             ("path", &self.path), ("slot", self.slot), ("answered", self.answered), ("pinned", self.pinned),
             ("limit", self.limit.as_ref().map(|l| obj![
                 ("resets_at", l.resets_at), ("type", &l.kind), ("since", l.since), ("lifted", l.lifted)])),
+            ("child_of", self.child_of.clone()),
+            ("kids", self.kids.map(|k| obj![("total", k.total), ("running", k.running)])),
         ]
     }
 }
@@ -555,9 +577,19 @@ pub struct Need {
     pub reason: String,
     /// The @agent_since stamp exactly as agent-jump.sh printed it.
     pub stamp: String,
+    /// A ROOT parent standing in for one asking or failed child
+    /// ([`kid_needs`]): the CHILD, where the prompt is. `agent` is the
+    /// parent with the child's state, stamp and detail; every click, answer
+    /// and jump from the card targets this window ([`Need::target`]).
+    pub via: Option<Agent>,
 }
 
 impl Need {
+    /// The window the card acts on: the asking child, else its own agent.
+    pub fn target(&self) -> &Agent {
+        self.via.as_ref().unwrap_or(&self.agent)
+    }
+
     fn new(agent: Agent, stamp: String) -> Need {
         let (word, text) = match agent.detail_word {
             Some(wd) if agent.detail_kind != "run" && !agent.detail.is_empty() => (wd.to_string(), agent.detail.clone()),
@@ -571,7 +603,7 @@ impl Need {
                 (s.to_string(), String::new())
             }
         };
-        Need { agent, reason_word: word, reason: text, stamp }
+        Need { agent, reason_word: word, reason: text, stamp, via: None }
     }
 
     pub fn to_json(&self) -> Value {
@@ -580,6 +612,7 @@ impl Need {
             kv.push(("reason_word".into(), self.reason_word.as_str().into()));
             kv.push(("reason".into(), self.reason.as_str().into()));
             kv.push(("stamp".into(), self.stamp.as_str().into()));
+            kv.push(("via".into(), self.via.as_ref().map(|c| c.window_id.clone()).into()));
         }
         v
     }
@@ -1022,6 +1055,9 @@ pub struct ViewModel {
     /// The PINNED agents once [`pins_split`](Self::pins_split) moved them
     /// out of their spaces (in pin order); empty in a view built as is.
     pub pinned: Vec<Agent>,
+    /// THE kids' verdict this view was built on ([`kid_roots`]): each
+    /// abby-delegate child's window id → the root it folds under.
+    pub kids: HashMap<String, String>,
 }
 
 /// The sidebar's SCOPE (agent-roster.py `Strip.scope`): `"space"` shows only
@@ -1091,6 +1127,134 @@ impl Scope {
     }
 }
 
+impl Scope {
+    /// The scope as read off the snapshot's client rows (`client`'s, else
+    /// any client's: the options are global), the client in `cur_session`;
+    /// no counts. [`ViewModel::build_with`] reads it for the kids' verdict,
+    /// [`ViewModel::apply_scope`] for the view.
+    pub fn read(snap: &Snapshot, client: Option<&str>, cur_session: Option<&str>) -> Scope {
+        let me = client.and_then(|c| snap.client(c));
+        let row = me.or(snap.clients.first());
+        let mut scope = Scope {
+            spaces: row.is_some_and(|c| c.spaces == "on"),
+            opt: row.map(|c| c.strip_scope.clone()).unwrap_or_default(),
+            ..Scope::default()
+        };
+        // A hidden session (spaces.conf's @space_hidden, else the crate's
+        // HIDDEN list) or the stash has no space of its own: scope "all".
+        let hidden = |s: &str| me.is_some_and(|c| c.space_hidden) || model::HIDDEN.contains(&s) || s == HOLD;
+        if scope.name() == "space" {
+            scope.session = cur_session.filter(|s| !hidden(s)).map(String::from);
+        }
+        scope
+    }
+}
+
+/// A row of window `id` that is an AGENT CARD of a drawn group: an agent
+/// state, not a home, in a shown session (not the stash, not a HIDDEN one)
+/// and, in space scope (`scope`: the client's session), in that session or
+/// pinned (PINNED is global).
+fn card_row<'a>(windows: &'a [Window], id: &str, scope: Option<&str>) -> Option<&'a Window> {
+    windows.iter().find(|r| {
+        r.id == id
+            && !r.state.is_empty()
+            && !r.home
+            && !model::HIDDEN.contains(&r.session.as_str())
+            && r.session != HOLD
+            && scope.is_none_or(|s| r.session == s || r.pinned.is_some())
+    })
+}
+
+/// THE KIDS' VERDICT, decided once per view: each abby-delegate CHILD → the
+/// ROOT it folds under. A window is a child when its `@agent_child` names a
+/// window of the snapshot and it is itself an agent in a shown session
+/// (never a home, never parked), and its parent is either a child itself
+/// (then it folds under that one's root: a grandchild under its
+/// grandparent's card) or an agent card of a drawn group ([`card_row`],
+/// `scope` included). Anything else is a plain agent with its own card,
+/// counts and NEEDS YOU entry: abby in a home window, a parent just parked,
+/// a parent in another space under space scope. Counts, NEEDS YOU, the pins
+/// and the nesting all read this one map. `scope` None: every space (the
+/// pins' ⌥W digits, which every client shares).
+pub fn kid_roots(windows: &[Window], scope: Option<&str>) -> HashMap<String, String> {
+    let mut first: HashMap<&str, &Window> = HashMap::new();
+    for w in windows {
+        first.entry(w.id.as_str()).or_insert(w);
+    }
+    let agent = |id: &str| card_row(windows, id, None).is_some();
+    let card = |id: &str| card_row(windows, id, scope).is_some();
+    let up = |id: &str| first.get(id).map(|w| w.child.as_str()).filter(|p| !p.is_empty() && first.contains_key(p));
+    let n = first.len() + 1;
+    // A chain of `@agent_child`s that never reaches a top (a loop, or one
+    // leading into a loop): junk, nothing on it folds.
+    let loops = |id: &str| {
+        let mut at = id;
+        for _ in 0..n {
+            match up(at) {
+                Some(p) => at = p,
+                None => return false,
+            }
+        }
+        true
+    };
+    fn root<'a>(id: &str, up: &dyn Fn(&str) -> Option<&'a str>, agent: &dyn Fn(&str) -> bool,
+        card: &dyn Fn(&str) -> bool) -> Option<String> {
+        if !agent(id) {
+            return None;
+        }
+        let p = up(id)?;
+        root(p, up, agent, card).or_else(|| card(p).then(|| p.to_string()))
+    }
+    first.keys().filter(|id| !loops(id)).filter_map(|&id| root(id, &up, &agent, &card).map(|r| (id.to_string(), r))).collect()
+}
+
+/// One NEEDS YOU entry as [`kid_needs`] queues it: the window it lists (for
+/// a stand-in, the ROOT parent wearing its child's state) and its stamp.
+pub struct Queued {
+    pub window: Option<Window>,
+    pub stamp: String,
+}
+
+/// NEEDS YOU in agent-jump.sh's order ([`model::queue`]) under THE kids'
+/// verdict (`kids`, [`kid_roots`]; `scope` as it was read):
+///
+/// - every CHILD whose own CURRENT state is needs-input or failed is a
+///   STAND-IN entry (any other child is none): sorted as the child (its
+///   stamp, session, index), it is the child's ROOT parent wearing the
+///   child's state, stamp and detail, paired with the CHILD, where every
+///   click and answer goes. A parent asking itself keeps its own entry;
+/// - a window whose turn is done while its children are still busy is not
+///   queued (a fleet out, as [`model::is_attn`] says).
+pub fn kid_needs<'a>(snap: &'a Snapshot, coll: &Collator, kids: &HashMap<String, String>, scope: Option<&str>)
+    -> Vec<(Queued, Option<&'a Window>)> {
+    let skip = |w: &Window, _: &[&str]| w.state == "done" && model::kids_running(w) > 0;
+    let kid = |w: &Window, _: &[&str]| kids.get(&w.id).cloned();
+    model::queue(&snap.windows, coll, &skip, &kid, false)
+        .into_iter()
+        .map(|q| {
+            let w = snap.row_in(&q.row.id, &q.row.session);
+            let stamp = q.row.stamp;
+            let Some(c) = w.filter(|_| q.parent.is_some()) else {
+                return (Queued { window: w.cloned(), stamp }, None);
+            };
+            let stand_in = q.parent.as_deref().and_then(|r| card_row(&snap.windows, r, scope)).map(|r| {
+                let mut p = r.clone();
+                p.state = c.state.clone();
+                p.raw_state = c.state.clone();
+                p.paused.clear();
+                p.ask_bg.clear();
+                p.limit = None;
+                p.since = c.since.clone();
+                p.since_t = c.since_t;
+                p.detail_kind = c.detail_kind.clone();
+                p.detail = c.detail.clone();
+                p
+            });
+            (Queued { window: stand_in, stamp }, Some(c))
+        })
+        .collect()
+}
+
 /// Inputs to [`ViewModel::build`] besides the snapshot.
 pub struct BuildArgs<'a> {
     pub client: Option<&'a str>,
@@ -1129,18 +1293,28 @@ impl ViewModel {
         // `@spaces` on (the global option, off this view's client row, else
         // any client's): shells, and the pending spaces, are a thing.
         let spaces_on = cl.or(snap.clients.first()).is_some_and(|c| c.spaces == "on");
+        // THE kids' verdict, once, over EVERY space: NEEDS YOU, the counts
+        // and the pins are global (agent-jump.sh list, ⌥S), so they never
+        // flip with ⌥V. The scope only changes what is DRAWN ([`ViewModel::kids_split`]).
+        let kids = kid_roots(&snap.windows, None);
+        let kid = |w: &Window| kids.contains_key(&w.id);
         let agent = |w: &Window| Agent {
             slot: slots.get(&w.id).copied(),
             pending: Pending::of(w).filter(|_| spaces_on),
+            child_of: kids.get(&w.id).cloned(),
             ..Agent::from_window(w, blink, cw, now)
         };
 
-        let needs = model::needs_order(&snap.windows, collator)
+        let needs = kid_needs(snap, collator, &kids, None)
             .into_iter()
-            .filter_map(|r| snap.row_in(&r.id, &r.session).map(|w| Need::new(agent(w), r.stamp)))
+            .filter_map(|(q, via)| {
+                let w = q.window?;
+                Some(Need { via: via.map(&agent), ..Need::new(agent(&w), q.stamp) })
+            })
             .collect();
 
-        let shown = |w: &&Window| !model::HIDDEN.contains(&w.session.as_str()) && w.session != HOLD;
+        // (A child is counted in its parent's state, never on its own.)
+        let shown = |w: &&Window| !model::HIDDEN.contains(&w.session.as_str()) && w.session != HOLD && !kid(w);
         let counts = Counts::of(snap.windows.iter().filter(shown));
 
         let mut names: Vec<&str> = snap.windows.iter().filter(shown).map(|w| w.session.as_str()).collect();
@@ -1172,7 +1346,7 @@ impl ViewModel {
             spaces.push(Space {
                 name: name.to_string(),
                 is_current: ws.iter().any(|w| Some(w.id.as_str()) == cw),
-                counts: Counts::of(ws.iter().copied()),
+                counts: Counts::of(ws.iter().copied().filter(|w| !kid(w))),
                 active_window: active.map(|w| w.id.clone()),
                 active_index: active.map(|w| w.index),
                 path_short: text::sanitize(&tilde(&path)),
@@ -1215,6 +1389,7 @@ impl ViewModel {
             scope: Scope::default(),
             shells: spaces_on,
             pinned: Vec::new(),
+            kids,
         }
     }
 
@@ -1253,6 +1428,58 @@ impl ViewModel {
         v
     }
 
+    /// Some agent of the view is a child ([`Agent::child_of`]).
+    pub fn has_kids(&self) -> bool {
+        self.agents().any(|a| a.child_of.is_some())
+    }
+
+    /// The view the sidebar lays out with the KIDS folded like native
+    /// subagents: every child ([`Agent::child_of`]: THE verdict's root,
+    /// [`kid_roots`]) MOVED out of its space's agents into its root's
+    /// [`Agent::nested`] (every copy of a linked root; each child once, in
+    /// THE space order then window order; a grandchild under its
+    /// grandparent's card). A child whose root is no card of the view (a
+    /// race) stays an agent of its own. SCOPE (drawing only): in space scope
+    /// a child in the drawn space whose root is not drawn (another space,
+    /// not pinned) stays in its space's group as a card of its own, so it
+    /// never vanishes; it still counts toward nothing (the counts are the
+    /// every-space verdict's). Letters were assigned before this (a child
+    /// keeps its letter); the spaces keep their counts. Split the pins after
+    /// this ([`pins_split`](Self::pins_split)): a child is never pinned.
+    pub fn kids_split(&self) -> ViewModel {
+        let listed: std::collections::HashSet<&str> =
+            self.agents().chain(&self.pinned).filter(|a| a.child_of.is_none()).map(|a| a.window_id.as_str()).collect();
+        let scope = self.scope.session.as_deref();
+        let drawn = |root: &str| {
+            scope.is_none_or(|s| {
+                self.agents().chain(&self.pinned).any(|a| a.window_id == root && (a.session == s || a.is_pinned()))
+            })
+        };
+        let mut kids: HashMap<String, Vec<Agent>> = HashMap::new();
+        let mut folded = std::collections::HashSet::new();
+        for a in self.ordered_spaces().into_iter().flat_map(|s| s.agents.iter()) {
+            let Some(p) = a.child_of.as_ref().filter(|p| listed.contains(p.as_str())) else { continue };
+            // (Any copy of it in the drawn space: a linked one too.)
+            let here = scope.is_some_and(|s| self.agents().any(|b| b.window_id == a.window_id && b.session == s));
+            if here && !drawn(p) {
+                continue;
+            }
+            if folded.insert(a.window_id.clone()) {
+                kids.entry(p.clone()).or_default().push(Agent { nested: Vec::new(), ..a.clone() });
+            }
+        }
+        let mut v = self.clone();
+        for sp in &mut v.spaces {
+            sp.agents.retain(|a| !folded.contains(&a.window_id));
+        }
+        // (A view already pin-split: its pinned parents nest theirs too.)
+        v.pinned.retain(|a| !folded.contains(&a.window_id));
+        for a in v.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()).chain(v.pinned.iter_mut()) {
+            a.nested = kids.get(&a.window_id).cloned().unwrap_or_default();
+        }
+        v
+    }
+
     /// The sidebar's scope (agent-roster.py `Strip.load` + `strip_model`),
     /// from the snapshot this view was built from. The options ride on the
     /// client rows: this view's client's, else any client's (they are global).
@@ -1264,18 +1491,7 @@ impl ViewModel {
     ///   [`Agent::ordinal`]. Which rows show is the layout's business: NEEDS
     ///   YOU, spaces and parked stay global.
     pub fn apply_scope(&mut self, snap: &Snapshot) {
-        let me = self.client.as_deref().and_then(|c| snap.client(c));
-        let row = me.or(snap.clients.first());
-        let mut scope = Scope {
-            spaces: row.is_some_and(|c| c.spaces == "on"),
-            opt: row.map(|c| c.strip_scope.clone()).unwrap_or_default(),
-            ..Scope::default()
-        };
-        // A hidden session (spaces.conf's @space_hidden, else the crate's
-        // HIDDEN list) or the stash has no space of its own: scope "all".
-        let hidden = |s: &str| {
-            me.is_some_and(|c| c.space_hidden) || model::HIDDEN.contains(&s) || s == HOLD
-        };
+        let mut scope = Scope::read(snap, self.client.as_deref(), self.cur_session.as_deref());
         if scope.spaces {
             // (A pending space's claude is its one card, with a state or not.)
             for sp in self.spaces.iter_mut().filter(|sp| sp.pending.is_none()) {
@@ -1285,16 +1501,13 @@ impl ViewModel {
                 }
             }
         }
-        if scope.name() == "space" {
-            if let Some(s) = self.cur_session.clone().filter(|s| !hidden(s)) {
-                scope.counts = Counts::of(snap.windows.iter().filter(|w| w.session == s));
-                for sp in self.spaces.iter_mut().filter(|sp| sp.name == s) {
-                    // `agents` is already in window-index order.
-                    for (n, a) in sp.agents.iter_mut().filter(|a| !a.state.is_empty()).enumerate() {
-                        a.ordinal = Some(n as u32 + 1);
-                    }
+        if let Some(s) = scope.session.clone() {
+            scope.counts = Counts::of(snap.windows.iter().filter(|w| w.session == s && !self.kids.contains_key(&w.id)));
+            for sp in self.spaces.iter_mut().filter(|sp| sp.name == s) {
+                // `agents` is already in window-index order.
+                for (n, a) in sp.agents.iter_mut().filter(|a| !a.state.is_empty()).enumerate() {
+                    a.ordinal = Some(n as u32 + 1);
                 }
-                scope.session = Some(s);
             }
         }
         self.scope = scope;
@@ -1314,12 +1527,14 @@ impl ViewModel {
 
     /// Every RATE-LIMITED agent ([`Agent::limit`]) of every space, PINNED
     /// included (a split view moves pins out of their spaces), each window
-    /// once: the sidebar's rate-limit banner and the menu's count.
+    /// once: the sidebar's rate-limit banner and the menu's count. The kids
+    /// nested under a card ([`Agent::nested`]) count too.
     pub fn limited(&self) -> Vec<&Agent> {
         let mut seen = std::collections::HashSet::new();
         self.pinned
             .iter()
             .chain(self.agents())
+            .flat_map(|a| std::iter::once(a).chain(&a.nested))
             .filter(|a| a.limit.is_some() && seen.insert(a.window_id.as_str()))
             .collect()
     }

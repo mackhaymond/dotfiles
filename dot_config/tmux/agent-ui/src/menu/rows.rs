@@ -88,7 +88,8 @@ pub fn need_of<'a>(v: &'a ViewModel, a: &Agent) -> Option<&'a Need> {
     if !a.attention {
         return None; // the queue holds attention states only: skip the scan
     }
-    v.needs.iter().find(|n| n.agent.window_id == a.window_id)
+    // (By the window a need acts on: a stand-in is its CHILD's.)
+    v.needs.iter().find(|n| n.target().window_id == a.window_id)
 }
 
 /// The Active filter's set: in flight (the Working bucket), needs you
@@ -140,7 +141,8 @@ impl Row {
     /// The selection key of a selectable row.
     pub fn key(&self) -> Option<RowKey> {
         match self {
-            Row::Need(n) => Some(RowKey::Need(n.agent.window_id.clone())),
+            // (A parent standing in for its asking child: the child's window.)
+            Row::Need(n) => Some(RowKey::Need(n.target().window_id.clone())),
             Row::Agent(a) => Some(RowKey::Agent(a.session.clone(), a.window_id.clone())),
             Row::Parked(p) => Some(RowKey::Parked(p.agent.window_id.clone())),
             Row::Fold(_) => Some(RowKey::Fold),
@@ -160,8 +162,14 @@ impl Row {
 
     /// What a key, a click or a confirm remembers of a window row: enough
     /// to act on it after the list was rebuilt. None for the fold.
+    /// A Needs you row acts on [`crate::view::Need::target`] (a stand-in's
+    /// CHILD, where the prompt is: Enter goes there, y / n answer it) under
+    /// the title it shows (its parent's).
     pub fn target(&self) -> Option<Target> {
-        Some(Target::of(self.key()?, self.agent()?))
+        match self {
+            Row::Need(n) => Some(Target { title: n.agent.title.clone(), ..Target::of(self.key()?, n.target()) }),
+            _ => Some(Target::of(self.key()?, self.agent()?)),
+        }
     }
 }
 

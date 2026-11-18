@@ -31,6 +31,13 @@
 3.8	test_agent_jump_watcher.py::WatcherTests::test_subagent_check_only_reruns_when_its_inputs_change
 5.3	test_agent_jump_watcher.py::WatcherTests::test_subagent_check_sees_a_change_mid_run
 8.7	test_agent_jump_watcher.py::WatcherTests::test_zero_agents_is_not_a_failed_tick
+3.8	test_agent_kids.py::KidsWatcherTests::test_asking_child_keeps_the_parent_held_and_surfaces
+4.6	test_agent_kids.py::KidsWatcherTests::test_child_done_before_the_first_tick_still_finishes_the_parent
+7.1	test_agent_kids.py::KidsWatcherTests::test_gc_drops_the_childs_mark
+10.0	test_agent_kids.py::KidsWatcherTests::test_held_parent_finishes_done_when_its_last_child_is_done
+12.6	test_agent_kids.py::KidsWatcherTests::test_never_started_child_holds_only_for_the_grace_then_is_collected
+4.7	test_agent_kids.py::KidsWatcherTests::test_no_hold_mark_keeps_the_idle_release
+4.5	test_agent_kids.py::KidsWatcherTests::test_running_child_holds_the_parent_with_the_gear
 5.3	test_agent_launch.py::Launch::test_pick_after_waits_for_the_launcher_to_be_gone
 3.4	test_agent_limit.py::CodexLimitTests::test_a_normal_codex_finish_ends_a_kept_limit
 3.5	test_agent_limit.py::CodexLimitTests::test_an_ordinary_task_complete_is_still_done

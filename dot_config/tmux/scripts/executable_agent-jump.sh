@@ -19,6 +19,9 @@
 # LIST FORMAT v1: win_id<TAB>session<TAB>index<TAB>state<TAB>since_epoch<TAB>label (columns only ever appended)
 #   one row per window, best first; since_epoch is 9999999999 when unstamped;
 #   label is @agent_summary, else the window name, with tabs turned to spaces.
+#   A delegated child (@agent_child) that asks (needs-input or failed) is a
+#   row with its own id/session/index/state/stamp and its PARENT's label; a
+#   finished child has no row (see list_needs).
 #
 # JUMP EXIT CODES (only `jump` uses them; next/back/goto always exit 0
 # because tmux's run-shell turns a nonzero exit into a "returned N" view-mode
@@ -203,19 +206,48 @@ say() {
     fi
 }
 
+# DELEGATED CHILDREN (docs/agent-tab-indicator.md, "Delegated children"): a
+# window with @agent_child set (abby-delegate's tab, its parent live) is never
+# a row of its own kind. EVERY such child that is asking (needs-input or
+# failed, its own state as it is now) is one row: the CHILD's window id,
+# session, index, state and stamp (the jump lands where the prompt is), and
+# its ROOT's label: @agent_child names the immediate parent, walked up while
+# that parent is itself a child (a loop back to the child or a chain past 32
+# hops, like no row for the root, falls back to the child's own label). A finished child (done) has no row: its parent
+# finishes for it. Same columns, same order rules; a linked child keeps its
+# first sorted row like any window. (@agent_kids_ask, the parent's single
+# most urgent pointer, is the tab colour's and CuaNotch's, not this list's.)
 list_needs() {
-    tmux list-windows -a -F "#{window_id}${US}#{session_name}${US}#{window_index}${US}#{@agent_state}${US}#{@agent_workflow}${US}#{@agent_since}${US}#{@agent_paused}${US}#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}" 2>/dev/null |
+    tmux list-windows -a -F "#{window_id}${US}#{session_name}${US}#{window_index}${US}#{@agent_state}${US}#{@agent_workflow}${US}#{@agent_since}${US}#{@agent_paused}${US}#{@agent_child}${US}#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}" 2>/dev/null |
     awk -F "$US" -v ex="$EXCLUDE" '
+        function stamp(s,   a) {
+            split(s, a, " ")
+            return (a[1] ~ /^[0-9]+$/) ? a[1] : 9999999999
+        }
+        function row(p, t, sess, idx, id, st, label) {
+            gsub(/\t/, " ", label)
+            printf "%d\t%s\t%s\t%09d\t%s\t%s\t%s\t%s\t%s\t%s\n", p, t, sess, idx, id, sess, idx, st, t, label
+        }
+        !($1 in label) { label[$1] = $9; up[$1] = $8 }   # every window, for its children
         index(ex, " " $2 " ") { next }
         {
             if ($4 == "failed") p = 0
             else if ($4 == "needs-input") p = 1
-            else if ($4 == "done" && $5 == "" && $7 == "") p = 2
+            else if ($4 == "done" && $5 == "" && $7 == "" && $8 == "") p = 2
             else next
-            split($6, a, " ")
-            t = (a[1] ~ /^[0-9]+$/) ? a[1] : 9999999999
-            label = $8; gsub(/\t/, " ", label)
-            printf "%d\t%s\t%s\t%09d\t%s\t%s\t%s\t%s\t%s\t%s\n", p, t, $2, $3, $1, $2, $3, $4, t, label
+            if ($8 == "") { row(p, stamp($6), $2, $3, $1, $4, $9); next }
+            # An asking child: labelled once every row is read.
+            k++; K_p[k] = p; K_t[k] = stamp($6); K_sess[k] = $2; K_idx[k] = $3
+            K_id[k] = $1; K_st[k] = $4; K_par[k] = $8; K_own[k] = $9
+        }
+        END {
+            for (i = 1; i <= k; i++) {
+                r = K_par[i]; hops = 0
+                while ((r in up) && up[r] != "" && up[r] != K_id[i] && hops < 32) { r = up[r]; hops++ }
+                loop = hops >= 32 || ((r in up) && up[r] == K_id[i])
+                row(K_p[i], K_t[i], K_sess[i], K_idx[i], K_id[i], K_st[i],
+                    (!loop && (r in label)) ? label[r] : K_own[i])
+            }
         }' |
     sort -t "$(printf '\t')" -k1,1n -k2,2n -k3,3 -k4,4 |
     # `list-windows -a` prints a linked window once per session it is linked

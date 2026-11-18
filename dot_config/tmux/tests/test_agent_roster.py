@@ -248,9 +248,11 @@ class LimitTests(unittest.TestCase):
         ]))
 
     def test_fields_and_parse(self):
-        self.assertEqual(R.FIELDS[-3:], ["limit", "limit_lifted", "limit_auto"])
+        # The limit block, then the delegated-children pair (test_agent_kids.py).
+        self.assertEqual(R.FIELDS[-5:], ["limit", "limit_lifted", "limit_auto", "child", "kids_ask"])
         self.assertTrue(R.FMT.endswith("#{@agent_paused}" + US + "#{@agent_limit}" + US + "#{@agent_limit_lifted}"
-                                       + US + "#{@agent_limit_autoresume}"))
+                                       + US + "#{@agent_limit_autoresume}" + US + "#{@agent_child}"
+                                       + US + "#{@agent_kids_ask}"))
         by = {w["id"]: w for w in self.ws()}
         self.assertEqual(len(by), 8)
         self.assertEqual(by["@1"]["limit"], {"resets_at": self.NOW + 60, "garbled": False, "type": "five_hour",
@@ -270,7 +272,7 @@ class LimitTests(unittest.TestCase):
         self.assertIsNone(R.parse_limit("  ", "5"))
         # A row of 19 fields, or one too many, is no window.
         self.assertEqual(R.parse_windows(US.join(["x"] * 19)), [])
-        self.assertEqual(R.parse_windows(US.join(["x"] * 26)), [])
+        self.assertEqual(R.parse_windows(US.join(["x"] * (len(R.FIELDS) + 1))), [])
 
     def test_paused_with_a_reason_never_needs_you(self):
         R.collation("C")
@@ -381,7 +383,7 @@ class LimitTests(unittest.TestCase):
         for raw, on in (("", True), ("on", True), ("1", True), ("junk", True), ("off", False), (" OFF ", False),
                         ("0", False), ("false", False), ("False", False), ("no", False), (" No", False)):
             self.assertEqual(R.autoresume_on(raw), on, raw)
-        self.assertTrue(R.FMT.endswith(US + "#{@agent_limit_autoresume}"))
+        self.assertIn(US + "#{@agent_limit_autoresume}" + US, R.FMT)
         ws = R.parse_windows(US.join([limit_line("main", 1, "@1", "paused", "proj/Soon", self.FLAG,
                                                  self.lim(self.NOW + 60)), "off"]))
         r = R.Roster("/dev/ttys999")

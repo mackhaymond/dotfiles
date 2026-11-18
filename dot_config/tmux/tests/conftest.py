@@ -19,7 +19,7 @@ HERE = Path(__file__).resolve().parent
 # catalog, the sidebar's python side, and the launcher.
 SMOKE_FILES = {
     "test_codex_indicator.py", "test_copilot_agy_indicator.py", "test_grok_indicator.py",
-    "test_opencode_indicator.py", "test_agent_state_notice.py", "test_thread_at.py",
+    "test_opencode_indicator.py", "test_agent_state_notice.py", "test_thread_at.py", "test_agent_kids.py",
     "test_agent_jump_watcher.py", "test_codex_watcher_parity.py", "test_copilot_agy_watcher.py",
     "test_grok_watcher.py", "test_opencode_watcher.py",
     "test_keys_catalog.py",

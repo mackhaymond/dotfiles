@@ -232,9 +232,71 @@ pub fn paused_state<'a>(state: &'a str, paused_flag: &str) -> &'a str {
     }
 }
 
-/// agent-roster.py `is_attn`: failed, needs-input, or done with no fleet out.
+/// `@agent_kids` (`"<total> <busy>"`), parsed: an abby-delegate PARENT's
+/// live children, as the shell reconciler counts them. Its children are
+/// folded under its card like native subagents ([`crate::view::ViewModel::kids_split`]);
+/// while any is BUSY, the parent reads as working ([`in_flight`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Kids {
+    pub total: u32,
+    /// The second number: the BUSY children (running, asking, paused, or
+    /// not started yet), as the reconciler counts them; the card's `⚙ N`.
+    pub running: u32,
+}
+
+impl Kids {
+    /// One or two counts (running defaults to 0, and is never more than the
+    /// total); None when unset, junk, or no child at all.
+    pub fn parse(raw: &str) -> Option<Kids> {
+        let n = |s: &str| Some(s).filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).and_then(|s| s.parse::<u32>().ok());
+        let mut it = raw.split_whitespace();
+        let total = it.next().and_then(n)?;
+        let running = match it.next() {
+            Some(s) => n(s)?,
+            None => 0,
+        };
+        (total > 0 && it.next().is_none()).then_some(Kids { total, running: running.min(total) })
+    }
+}
+
+/// `@agent_kids_ask` (`"<child id>\t<state>\t<detail>"`), parsed: the most
+/// urgent asking (`needs-input`) or `failed` child of a parent. Read but not
+/// used for NEEDS YOU: there EVERY asking child is a stand-in entry of its
+/// own, by its own current state ([`crate::view::kid_needs`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KidsAsk {
+    /// The child's window id.
+    pub win: String,
+    /// `needs-input` or `failed`.
+    pub state: String,
+    /// The child's detail as the reconciler wrote it (may be empty).
+    pub detail: String,
+}
+
+impl KidsAsk {
+    /// None unless the first field is a window id and the second an asking
+    /// or failed state.
+    pub fn parse(raw: &str) -> Option<KidsAsk> {
+        let mut it = raw.splitn(3, '\t');
+        let win = it.next()?.trim();
+        let state = it.next()?.trim();
+        let detail = it.next().unwrap_or("").trim();
+        (crate::tmux::is_window_id(win) && matches!(state, "needs-input" | "failed"))
+            .then(|| KidsAsk { win: win.into(), state: state.into(), detail: detail.into() })
+    }
+}
+
+/// How many of a parent's children are busy (`@agent_kids`' second number);
+/// 0 for any other window.
+pub fn kids_running(w: &Window) -> u32 {
+    w.kids.map_or(0, |k| k.running)
+}
+
+/// agent-roster.py `is_attn`: failed, needs-input, or done with no fleet out
+/// (no workflow, no child running: [`kids_running`]).
 pub fn is_attn(w: &Window) -> bool {
-    matches!(w.state.as_str(), "failed" | "needs-input") || (w.state == "done" && w.workflow.is_empty())
+    matches!(w.state.as_str(), "failed" | "needs-input")
+        || (w.state == "done" && w.workflow.is_empty() && kids_running(w) == 0)
 }
 
 /// How much background work a raised ask (`@agent_ask_bg`, agent-tab-
@@ -256,9 +318,10 @@ pub fn bg_tail(cat: Option<Cat>, ask_bg: bool, workflow: bool, count: Option<u32
         .then(|| count.map_or_else(|| format!(" · {STRIP_GEAR}"), |n| format!(" · {STRIP_GEAR} {n}")))
 }
 
-/// agent-roster.py `in_flight`: running, or a workflow / cua flag set.
+/// agent-roster.py `in_flight`: running, or a workflow / cua flag set, or a
+/// child running ([`kids_running`]: its children are its subagents).
 pub fn in_flight(w: &Window) -> bool {
-    w.state == "running" || !w.workflow.is_empty() || !w.cua.is_empty()
+    w.state == "running" || !w.workflow.is_empty() || !w.cua.is_empty() || kids_running(w) > 0
 }
 
 /// agent-roster.py `rank`: 0 failed, 1 needs-input, 2 done, 3 in flight,
@@ -376,10 +439,11 @@ pub enum Flag {
 }
 
 /// agent-roster.py `Roster.glyph` / `strip_glyph`: the flag and its colour.
-/// Workflow: teal/dimteal with the pulse. Cua: overlay while it needs you,
-/// else blue/dimblue with the pulse.
+/// Workflow (a workflow, or children running: one gear for both):
+/// teal/dimteal with the pulse. Cua: overlay while it needs you, else
+/// blue/dimblue with the pulse.
 pub fn flag(w: &Window, blink: bool) -> Option<(Flag, &'static str)> {
-    if !w.workflow.is_empty() {
+    if !w.workflow.is_empty() || kids_running(w) > 0 {
         Some((Flag::Workflow, if blink { "teal" } else { "dimteal" }))
     } else if !w.cua.is_empty() {
         Some((Flag::Cua, if is_attn(w) { "overlay" } else if blink { "blue" } else { "dimblue" }))
@@ -571,7 +635,7 @@ pub fn state_words(w: &Window) -> &'static str {
     match w.state.as_str() {
         "failed" => "failed",
         "needs-input" => "waiting on you",
-        "done" if !w.workflow.is_empty() => "done · fleet out",
+        "done" if !w.workflow.is_empty() || kids_running(w) > 0 => "done · fleet out",
         "done" => "done",
         "running" => "working",
         "idle" => "idle",
@@ -678,9 +742,60 @@ fn awk_int(s: &str) -> i64 {
 /// tabs, as `sort -t TAB` and the second awk see them. So a summary holding
 /// "a\nb" is listed as "a", one holding "a\x1fb" as "a", like the script.
 /// (agent-roster.py did not model this; it dropped such windows.)
+///
+/// DELEGATED CHILDREN (agent-jump.sh `list_needs`): the row has one more
+/// field before the label, the RAW `@agent_child` (9 fields). The first
+/// record of each window id gives that id's label. A record with
+/// `@agent_child` set is a CHILD: no row of its own unless it ASKS (its own
+/// current state failed or needs-input); then, after every record, it is a
+/// row with its own id, session, index, state and stamp and its ROOT's
+/// label: from the id its `@agent_child` names, up each id's first record's
+/// `@agent_child` while it is set, does not lead back to the child and the
+/// walk is under 32 hops; the label of the id it stops at. A loop (back to
+/// the child, or 32 hops) or no record for that id: its own label. Every
+/// asking child is listed, not just the one the parent's `@agent_kids_ask`
+/// points at; the parent's own ask is its own row.
 pub fn needs_order(windows: &[Window], coll: &Collator) -> Vec<NeedRow> {
+    let raw_child = |_: &Window, rec: &[&str]| Some(rec.get(7).copied().unwrap_or("")).filter(|c| !c.is_empty()).map(String::from);
+    queue(windows, coll, &|_, _| false, &raw_child, true).into_iter().map(|q| q.row).collect()
+}
+
+/// agent-jump.sh's hop limit for an asking child's walk to its root.
+pub const ROOT_HOPS: usize = 32;
+
+/// One row of [`queue`]: the row, and for an asking child's row the parent
+/// whose label it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Queued {
+    pub row: NeedRow,
+    pub parent: Option<String>,
+}
+
+/// [`needs_order`]'s pipeline with its kids' rules as arguments, so the
+/// sidebar can run the same queue with its own verdict on who is a child:
+/// `kid(window, record)` → the parent a CHILD's record belongs to
+/// (agent-jump.sh: its raw `@agent_child`, when set); `skip(window,
+/// record)` drops any other record's own row. `record` is the awk's fields:
+/// id, session, index, state, workflow, since, paused, child, label.
+/// `to_root`: label a child's row by walking up from that parent as
+/// [`needs_order`] says (the script's rule); else by that parent itself
+/// (the sidebar's `kid` already names the root).
+pub fn queue(windows: &[Window], coll: &Collator, skip: &dyn Fn(&Window, &[&str]) -> bool,
+    kid: &dyn Fn(&Window, &[&str]) -> Option<String>, to_root: bool) -> Vec<Queued> {
     let us = crate::tmux::US.to_string();
-    let mut lines: Vec<String> = Vec::new();
+    let mut lines: Vec<(String, Option<String>)> = Vec::new();
+    let line = |tier: u8, since: &str, s: &str, idx: &str, id: &str, st: &str, label: &str| {
+        let word = since.split([' ', '\t', '\n']).find(|s| !s.is_empty()).unwrap_or("");
+        let stamp = if !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()) { word } else { NO_STAMP };
+        let label = label.replace('\t', " ");
+        format!("{tier}\t{stamp}\t{s}\t{ix:09}\t{id}\t{s}\t{idx}\t{st}\t{stamp}\t{label}", ix = awk_int(idx))
+    };
+    // Each id's label (its first record's); the asking children's rows wait
+    // for every record: (tier, since, session, index, id, state, own label, parent).
+    let mut labels: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Each id's raw `@agent_child` (its first record's), for the walk.
+    let mut up: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut asking: Vec<(u8, [String; 6], String)> = Vec::new();
     for w in windows {
         let label = if w.summary.is_empty() { &w.name } else { &w.summary };
         // The script's row carries the RAW @agent_state (a paused flag that
@@ -688,12 +803,29 @@ pub fn needs_order(windows: &[Window], coll: &Collator) -> Vec<NeedRow> {
         // there). A state set after parsing (tests) no longer folds from the
         // raw one: then it is the state.
         let state = if paused_state(&w.raw_state, &w.paused) == w.state { &w.raw_state } else { &w.state };
-        let raw = [w.id.as_str(), &w.session, &w.index.to_string(), state, &w.workflow, &w.since, &w.paused, label]
+        let raw = [w.id.as_str(), &w.session, &w.index.to_string(), state, &w.workflow, &w.since, &w.paused, &w.raw_child,
+            label]
             .join(&us);
         for rec in raw.split('\n') {
             let f: Vec<&str> = rec.split(&us).collect();
             let g = |i: usize| f.get(i - 1).copied().unwrap_or("");
+            if !labels.contains_key(g(1)) {
+                labels.insert(g(1).to_string(), g(9).to_string());
+                up.insert(g(1).to_string(), g(8).to_string());
+            }
             if jump_excluded(g(2)) {
+                continue;
+            }
+            if let Some(p) = kid(w, &f) {
+                let tier = match g(4) {
+                    "failed" => 0,
+                    "needs-input" => 1,
+                    _ => continue,
+                };
+                asking.push((tier, [g(6), g(2), g(3), g(1), g(4), g(9)].map(String::from), p));
+                continue;
+            }
+            if skip(w, &f) {
                 continue;
             }
             let tier = match g(4) {
@@ -702,21 +834,26 @@ pub fn needs_order(windows: &[Window], coll: &Collator) -> Vec<NeedRow> {
                 "done" if g(5).is_empty() && g(7).is_empty() => 2,
                 _ => continue,
             };
-            let word = g(6).split([' ', '\t', '\n']).find(|s| !s.is_empty()).unwrap_or("");
-            let stamp = if !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()) { word } else { NO_STAMP };
-            let label = g(8).replace('\t', " ");
-            lines.push(format!(
-                "{tier}\t{stamp}\t{s}\t{ix:09}\t{id}\t{s}\t{idx}\t{st}\t{stamp}\t{label}",
-                s = g(2),
-                ix = awk_int(g(3)),
-                id = g(1),
-                idx = g(3),
-                st = g(4)
-            ));
+            lines.push((line(tier, g(6), g(2), g(3), g(1), g(4), g(9)), None));
         }
     }
+    for (tier, [since, s, idx, id, st, own], p) in asking {
+        // agent-jump.sh's END: up while set, not back to the child, < 32 hops.
+        let mut r = p.as_str();
+        let mut looped = false;
+        if to_root {
+            let mut hops = 0;
+            while let Some(u) = up.get(r).filter(|u| !u.is_empty() && **u != id && hops < ROOT_HOPS) {
+                r = u;
+                hops += 1;
+            }
+            looped = hops >= ROOT_HOPS || up.get(r).is_some_and(|u| *u == id);
+        }
+        let label = labels.get(r).filter(|_| !looped).unwrap_or(&own);
+        lines.push((line(tier, &since, &s, &idx, &id, &st, label), Some(p)));
+    }
     let field = |l: &str, k: usize| l.split('\t').nth(k).unwrap_or("").to_string();
-    lines.sort_by(|a, b| {
+    lines.sort_by(|(a, _), (b, _)| {
         num_cmp(&field(a, 0), &field(b, 0))
             .then_with(|| num_cmp(&field(a, 1), &field(b, 1)))
             .then_with(|| coll.sort_cmp(&field(a, 2), &field(b, 2)))
@@ -726,13 +863,13 @@ pub fn needs_order(windows: &[Window], coll: &Collator) -> Vec<NeedRow> {
     let mut seen = HashSet::new();
     lines
         .into_iter()
-        .filter(|l| seen.insert(field(l, 4)))
-        .map(|l| {
+        .filter(|(l, _)| seen.insert(field(l, 4)))
+        .map(|(l, parent)| {
             let out: Vec<&str> = l.splitn(5, '\t').collect();
             let line = out.get(4).copied().unwrap_or("").to_string();
             let o: Vec<&str> = line.splitn(6, '\t').collect();
             let at = |k: usize| o.get(k).copied().unwrap_or("").to_string();
-            NeedRow {
+            let row = NeedRow {
                 id: at(0),
                 session: at(1),
                 index: at(2).parse().unwrap_or(0),
@@ -740,7 +877,8 @@ pub fn needs_order(windows: &[Window], coll: &Collator) -> Vec<NeedRow> {
                 stamp: at(4),
                 label: at(5),
                 line,
-            }
+            };
+            Queued { row, parent }
         })
         .collect()
 }
@@ -1171,6 +1309,61 @@ mod tests {
         assert_eq!(past.stage(1.0 + LIMIT_HORIZON as f64 + 1.0), Stage::Unknown);
     }
 
+    /// A PARENT with children running is in flight like one with a
+    /// workflow out: working, the gear, a done turn not attention ("fleet
+    /// out"); with no child running (or `@agent_kids` unset) it is what its
+    /// own state says.
+    #[test]
+    fn running_kids_are_the_parents_fleet() {
+        let w = |state: &str, kids: &str| Window::parse(&row("s", 1, "@1", &[("state", state), ("kids", kids)])).unwrap();
+        for state in ["idle", "done", "running"] {
+            let p = w(state, "3 2");
+            assert_eq!((kids_running(&p), in_flight(&p), cat(&p), rank(&p)), (2, true, Some(Cat::Working), 3), "{state}");
+            assert_eq!(flag(&p, true), Some((Flag::Workflow, "teal")), "{state}");
+            assert!(!is_attn(&p), "{state}");
+        }
+        assert_eq!(state_words(&w("done", "3 2")), "done · fleet out");
+        // Asking or failed still wins.
+        assert_eq!(cat(&w("needs-input", "1 1")), Some(Cat::NeedsInput));
+        // No child running: its own state.
+        for kids in ["2 0", "", "junk"] {
+            assert_eq!((cat(&w("done", kids)), is_attn(&w("done", kids))), (Some(Cat::Done), true), "{kids:?}");
+            assert_eq!((cat(&w("idle", kids)), flag(&w("idle", kids), true)), (Some(Cat::Idle), None), "{kids:?}");
+        }
+    }
+
+    /// agent-jump.sh `list_needs`' kids rules: a record with a raw
+    /// `@agent_child` (any value) is a child, listed only while it asks
+    /// (failed or needs-input), under its own id, session, index, stamp and
+    /// state with its PARENT's label (the named id's first record's, even
+    /// in an excluded session; its own when no record has that id); every
+    /// asking child, whatever `@agent_kids_ask` says; a parent asking itself
+    /// keeps its own row; a child in an excluded session is nothing.
+    #[test]
+    fn needs_order_lists_asking_kids_as_the_script() {
+        let w = |s: &str, i: u32, id: &str, set: &[(&str, &str)]| Window::parse(&row(s, i, id, set)).unwrap();
+        let ws = vec![
+            w("main", 1, "@1", &[("state", "idle"), ("summary", "Parent"), ("kids_ask", "@9\tfailed\twhatever")]),
+            w("work", 7, "@3", &[("state", "needs-input"), ("since", "120 needs-input"), ("child", "@1"), ("summary", "Kid")]),
+            w("main", 2, "@4", &[("state", "needs-input"), ("since", "50 x"), ("summary", "Asker")]),
+            w("main", 5, "@5", &[("state", "running"), ("child", "@4")]),
+            w("main", 6, "@6", &[("state", "failed"), ("child", "junk")]),
+            w("stash", 1, "@7", &[("state", "idle"), ("summary", "Hidden parent")]),
+            w("main", 8, "@8", &[("state", "needs-input"), ("child", "@7")]),
+            w("main", 9, "@9", &[("state", "needs-input"), ("child", "@4")]),
+            w("stash", 2, "@10", &[("state", "needs-input"), ("child", "@1")]),
+            w("main", 11, "@11", &[("state", "done"), ("child", "@1")]),
+        ];
+        let got: Vec<String> = needs_order(&ws, &Collator::new("C")).iter().map(|r| r.list_line()).collect();
+        assert_eq!(got, [
+            "@6\tmain\t6\tfailed\t9999999999\tzsh",
+            "@4\tmain\t2\tneeds-input\t50\tAsker",
+            "@3\twork\t7\tneeds-input\t120\tParent",
+            "@8\tmain\t8\tneeds-input\t9999999999\tHidden parent",
+            "@9\tmain\t9\tneeds-input\t9999999999\tAsker",
+        ]);
+    }
+
     #[test]
     fn counting() {
         let ws: Vec<Window> = [("@1", "failed"), ("@2", "idle"), ("@2", "idle"), ("@3", ""), ("@4", "running")]
@@ -1189,10 +1382,15 @@ mod tests {
         for (id, summary, since) in [
             ("@1", "a\nb", "5 x"),
             ("@2", "c\x1fd", "6 x"),
-            ("@3", "x\n@9\x1fmain\x1f7\x1ffailed\x1f\x1f1\x1f\x1ffake", "7 x"),
+            // The script's row is 9 fields (child 8th, label last): a
+            // smuggled 9-field record is listed...
+            ("@3", "x\n@9\x1fmain\x1f7\x1ffailed\x1f\x1f1\x1f\x1f\x1ffake", "7 x"),
+            // ...one whose 8th field (`@agent_child`) is set is a child: done,
+            // it is not.
+            ("@7", "x\n@8\x1fmain\x1f8\x1fdone\x1f\x1f1\x1f\x1fkid", "7 x"),
             ("@4", "tab\there", "8\nx"),
-            // The script's row is 8 fields (paused 7th): a smuggled 7-field
-            // `done` record has "fake" as its paused flag, so it is skipped.
+            // (Paused 7th: a smuggled 7-field `done` record has "fake" as
+            // its paused flag, so it is skipped.)
             ("@5", "x\n@1\x1fmain\x1f1\x1fdone\x1f\x1f1\x1ffake", "9 x"),
         ] {
             let mut w = Window::parse(&row("main", 1, id, &[("state", "failed"), ("since", "0")])).unwrap();
@@ -1203,13 +1401,15 @@ mod tests {
         // done with a paused flag that starts with a newline: folded to
         // paused here, but the script's first record has an empty $7.
         ws.push(Window::parse(&row("main", 1, "@6", &[("state", "done"), ("paused", "\n5"), ("since", "10")])).unwrap());
-        assert_eq!(ws[5].state, "paused");
+        assert_eq!(ws[6].state, "paused");
         let got: Vec<String> = needs_order(&ws, &c).iter().map(|r| r.list_line()).collect();
         assert_eq!(got, [
             "@9\tmain\t7\tfailed\t1\tfake", // a record smuggled in after a newline: awk lists it too
             "@1\tmain\t1\tfailed\t5\ta",
             "@2\tmain\t1\tfailed\t6\tc",
             "@3\tmain\t1\tfailed\t7\tx",
+            "@7\tmain\t1\tfailed\t7\tx", // its smuggled `@8` record has a child: no row
+
             "@4\tmain\t1\tfailed\t8\t", // a newline in since ends the record before the label
             "@5\tmain\t1\tfailed\t9\tx",
             "@6\tmain\t1\tdone\t10\t",

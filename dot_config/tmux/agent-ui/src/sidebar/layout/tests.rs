@@ -1430,6 +1430,9 @@ fn lettered(mut v: ViewModel) -> ViewModel {
     }
     for n in v.needs.iter_mut() {
         n.agent.letter = got.get(&n.agent.window_id).copied();
+        for c in n.via.iter_mut() {
+            c.letter = got.get(&c.window_id).copied();
+        }
     }
     v
 }
@@ -3371,6 +3374,7 @@ mod fold;
 mod harness;
 mod insight;
 mod keys;
+mod kids;
 mod pending;
 mod pinned;
 mod limit;

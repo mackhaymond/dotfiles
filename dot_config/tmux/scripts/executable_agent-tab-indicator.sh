@@ -819,6 +819,11 @@ set_state() {
     ss_wrote=1
     [ "$cur" = "$new" ] || tmux refresh-client -S 2>/dev/null || true
     { [ "$cur" != "$new" ] || [ "$so" = 1 ]; } && notify_state
+    # DELEGATED CHILDREN: a child's state moved, so its parent's @agent_kids /
+    # @agent_kids_ask may have - reconciled now, not a watcher tick later.
+    # KIDS_PARENT is read with the hook body's `watched` (never by the
+    # heartbeat, which stays fork-free; the watcher's tick covers it).
+    [ "$cur" = "$new" ] || [ -z "${KIDS_PARENT:-}" ] || kids_now
     return 0
 }
 
@@ -957,6 +962,11 @@ held_detail_take() {
 #                       release when the work drains. A wake-up (the work
 #                       reporting back) inherits THIS origin, not whatever
 #                       turn ran in between.
+#   @agent_kids_hold    "1": this Stop was held for busy DELEGATED CHILDREN
+#                       (done); the watcher finishes it `done` when they are.
+#                       Unset by any other Stop, a prompt, a non-compact
+#                       SessionStart, a failure, clear_state, every watcher
+#                       turn end and the GC.
 #   @agent_paused       "<epoch>": agent-pause.py's flag (docs/agent-pause.md,
 #                       "The paused state"), set before its PAUSE goes out and
 #                       unset before the RESUME. While it is set, a turn end
@@ -983,7 +993,8 @@ held_detail_take() {
 ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_prior_since
              @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
              @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused
-             @agent_pause_voided @agent_turn_start @agent_limit @agent_limit_lifted)
+             @agent_pause_voided @agent_turn_start @agent_limit @agent_limit_lifted
+             @agent_kids_hold)
 PRIOR_OPTS=(@agent_prior_state @agent_prior_since @agent_prior_detail_kind @agent_prior_detail)
 INBOUND_TTL=180
 US=$'\x1f'
@@ -3269,8 +3280,35 @@ fi
 # scope, so it's robust to multiple attached clients AND to detached sessions
 # (an untargeted display-message would resolve to some other client's window;
 # #{window_active} is 1 even for zero-client sessions — neither is correct).
-watched=$(tmux display-message -p -t "$win" '#{window_active_clients}' 2>/dev/null || true)
+#   DELEGATED CHILDREN (KIDS, agent-session-lib.sh) ride the same read, so
+# they cost no fork: @agent_parent (abby-delegate's mark: this window is a
+# child), @agent_child (the watcher's verdict that its parent is live) and
+# @agent_kids ("<total> <busy>": this window is a live root parent).
+watched=$(tmux display-message -p -t "$win" "#{window_active_clients}${US}#{@agent_parent}${US}#{@agent_child}${US}#{@agent_kids}" 2>/dev/null || true)
+KIDS_PARENT=""; KIDS_CHILD=""; KIDS_KIDS=""
+case "$watched" in
+    *"$US"*"$US"*"$US"*)
+        kids_rest="${watched#*"$US"}"; watched="${watched%%"$US"*}"
+        KIDS_PARENT="${kids_rest%%"$US"*}"; kids_rest="${kids_rest#*"$US"}"
+        KIDS_CHILD="${kids_rest%%"$US"*}"; KIDS_KIDS="${kids_rest#*"$US"}" ;;
+esac
 case "$watched" in ''|*[!0-9]*) watched=0 ;; esac
+# The reconcile (kids_reconcile) runs only on a child's - or a parent's -
+# state change, from set_state / clear: the lib is sourced for those windows
+# alone, and only under bash 4+ (associative arrays). No lib: no reconcile,
+# the watcher's tick still does it.
+KIDS_OK=0
+if [ -n "$KIDS_PARENT$KIDS_KIDS" ] && [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] \
+   && . "$HOME/.config/tmux/scripts/agent-session-lib.sh" 2>/dev/null; then
+    KIDS_OK=1
+fi
+# kids_now: reconcile the derived options at once (one list-windows -a, at
+# most one write) so the parent moves with its child instead of a tick later.
+kids_now() {
+    [ "$KIDS_OK" = 1 ] || return 0
+    kids_reconcile 2>/dev/null || true
+    tmux refresh-client -S 2>/dev/null || true
+}
 # ...and is the user actually LOOKING? See viewing_now (with the helpers).
 
 case "$mode" in
@@ -3373,6 +3411,7 @@ case "$mode" in
                            ss_add set-option -uw -t "$win" @agent_limit_lifted ;;
         esac
         ss_add set-option -uw -t "$win" @agent_held_detail   # HELD DETAIL
+        ss_add set-option -uw -t "$win" @agent_kids_hold     # DELEGATED CHILDREN
         # ASKS WHILE WORK IS OUT: a new or resumed session (compact exited
         # above) has seen no ask of its own yet.
         ss_add set-option -uw -t "$win" @agent_ask_seen
@@ -3639,6 +3678,9 @@ case "$mode" in
         ss_add set-option -uw -t "$win" @agent_quiet
         # Mack has spoken: a held Stop's stash (HELD DETAIL) is history.
         ss_add set-option -uw -t "$win" @agent_held_detail
+        # DELEGATED CHILDREN: a new turn is not the held one; its own Stop
+        # decides again whether children hold it (@agent_kids_hold).
+        ss_add set-option -uw -t "$win" @agent_kids_hold
         # ASKS WHILE WORK IS OUT: a REAL prompt (not a harness wake-up, the
         # same "sys" test as the origin above) starts the turn an ask is
         # scoped to (agent-turn-asks --since: a peer's message counts, as
@@ -3856,6 +3898,7 @@ case "$mode" in
         ss_add set-option -w -t "$win" @agent_turn_result "$s_id loud"
         prior_unset "$win"
         ss_add set-option -uw -t "$win" @agent_held_detail   # HELD DETAIL
+        ss_add set-option -uw -t "$win" @agent_kids_hold     # DELEGATED CHILDREN
         take_detail failed fail "turn failed"
         set_state "$win" failed
         ;;
@@ -3902,6 +3945,26 @@ case "$mode" in
             if [ -n "$bg_tp" ] && "$BG_PENDING" "$bg_tp" "$bg_sid" "$bg_cwd"; then
                 bg_pending=1
             fi
+        fi
+        # DELEGATED CHILDREN (KIDS, agent-session-lib.sh): a BUSY live child
+        # of this window (running, asking, paused, or not started yet) is its
+        # work still out, the same as a background subagent's - held
+        # `running` with its gear, through the same branches below
+        # (@agent_bg_owner, the ask check, a quiet turn's prior), and
+        # stamped @agent_kids_hold so the watcher finishes it (done) once the
+        # last one is done. Asked only of a window with @agent_kids set (it
+        # came with the `watched` read: a plain agent pays nothing), and then
+        # on the children as they are NOW: one kids_reconcile (a
+        # list-windows -a), because two children's reconciles racing can
+        # leave @agent_kids stale. Its write, if any, fixes that too. A
+        # failed read falls back to the option.
+        kids_hold=0
+        if [ -n "$KIDS_KIDS" ]; then
+            kids_busy_n="${KIDS_KIDS#* }"
+            if [ "$KIDS_OK" = 1 ] && kids_reconcile 2>/dev/null; then
+                kids_busy_n="${KIDS_RUN[$win]:-0}"
+            fi
+            case "$kids_busy_n" in ''|0|*[!0-9]*) ;; *) kids_hold=1; bg_pending=1 ;; esac
         fi
         # ASKER GATE (see heartbeat), 2026-10-21: the MAIN agent's reply
         # ending says nothing about a SUBAGENT's gate - a background one can
@@ -4044,6 +4107,14 @@ case "$mode" in
         else
             ss_add set-option -uw -t "$win" @agent_bg_owner
         fi
+        # @agent_kids_hold: this Stop is held FOR its children (see KIDS
+        # above), in the held state's own command list; every other Stop
+        # clears it. The watcher's finish reads it, not its own memory.
+        if [ "$kids_hold" = 1 ]; then
+            ss_add set-option -w -t "$win" @agent_kids_hold 1
+        else
+            ss_add set-option -uw -t "$win" @agent_kids_hold
+        fi
         # PAUSED (docs/agent-pause.md, "The paused state"): agent-pause.py
         # flagged this window before its PAUSE went out, so this turn end -
         # loud, quiet or flagged for Mack alike - is `paused`: not done, no
@@ -4119,7 +4190,12 @@ case "$mode" in
         # Don't tint a window the user is looking at — they saw it finish.
         # Watched AND WezTerm frontmost (see viewing_now): a watched window
         # in a backgrounded terminal was the one way to miss a finish.
-        if viewing_now; then
+        # DELEGATED CHILDREN: a live child (@agent_child) finishes the same
+        # way, as SEEN - idle, @agent_seen_at stamped, its `done` detail
+        # kept - never an unseen green and never a finish of its own (the
+        # notch acks it like any seen finish): its parent is the one that
+        # finishes, once its last running child stops.
+        if [ -n "$KIDS_CHILD" ] || viewing_now; then
             seen_op=1
             set_state "$win" idle
         else
@@ -4136,6 +4212,16 @@ case "$mode" in
             case "$reason" in clear|resume) exit 0 ;; esac
         fi
         clear_state "$win"
+        # DELEGATED CHILDREN: a child that ended leaves its parent's counts
+        # and drops abby-delegate's mark (the claude it named is gone; an
+        # agent started here next is nobody's child); a parent that ended is
+        # no longer live, so its children turn plain.
+        if [ -n "$KIDS_PARENT" ]; then
+            tmux set-option -uw -t "$win" @agent_parent \; \
+                 set-option -uw -t "$win" @agent_parent_pane \; \
+                 set-option -uw -t "$win" @agent_kid_since 2>/dev/null || true
+        fi
+        kids_now
         ;;
     *)
         echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|subagent-stop|failed|done|interrupt|settle|reconcile|clear|clear-current> [claude|codex|opencode|grok|copilot|agy]" >&2

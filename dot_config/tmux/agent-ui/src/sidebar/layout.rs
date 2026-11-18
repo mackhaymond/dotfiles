@@ -354,6 +354,28 @@
 //! collapse before a pin loses its card; only a frame too short for every
 //! pin on one line cuts them ([`pins_cut`]).
 //!
+//! ## Kids
+//!
+//! abby's delegate children are its subagents here, by the reconciler's
+//! derived options alone (`@agent_child`, `@agent_kids`;
+//! docs/agent-roster.md "abby-delegate children"). Before anything is laid
+//! out (and before the pins split) every child MOVES under its parent's
+//! card ([`ViewModel::kids_split`]): under a FULL card one dim row each
+//! ([`kid_row`]: the card's colour and rail, the child's quiet key-cap, `↳`,
+//! its title; no dot, word or blurb; a click goes to the child); a
+//! one-line, folded or collapsed parent folds them with it (whatever stands
+//! for the parent stands for them, [`Row::covering`]). No card, NEEDS YOU
+//! entry, pin or count of its own. Who is a child is decided once per view
+//! ([`crate::view::kid_roots`] over every space: its parent a shown agent,
+//! no home, not parked; never by scope, so NEEDS YOU and the counts never
+//! flip with ⌥V). In space scope a child here whose root is in another
+//! space is drawn as its own card in its space. A parent whose children are
+//! busy reads working with `⚙ N`. EVERY child asking or failed is a NEEDS
+//! YOU card of its root's, with the child's state and words after its
+//! letter (`↳ f: perm Bash`), the card acting on the child ([`Need::via`]).
+//! Not while the selection is live (every tab in its place, as for the
+//! pins).
+//!
 //! ## Space order
 //!
 //! ONE order everywhere: `@space_index` (⌘N), spaces without one after, by
@@ -774,8 +796,12 @@ impl Row {
         self
     }
 
+    /// The row stands for `agents`, and for the children nested under each
+    /// ([`Agent::nested`]: a card, a fold or a count that holds a parent holds
+    /// its kids; their own rows under its card cover nothing).
     fn covering<'a>(mut self, agents: impl IntoIterator<Item = &'a Agent>) -> Row {
-        self.covers.extend(agents.into_iter().map(|a| (a.session.clone(), a.window_id.clone())));
+        let all = agents.into_iter().flat_map(|a| std::iter::once(a).chain(&a.nested));
+        self.covers.extend(all.map(|a| (a.session.clone(), a.window_id.clone())));
         self
     }
 
@@ -2752,7 +2778,9 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     // Dim text on a tile needs the surface's dim; the own card's lift
     // needs `sub` (overlay2 is about 3:1 there).
     let dimc = if mine { MINE_DIM } else { dim(true) };
+    // (Children running: the workflow's gear with how many, `⚙ 2`.)
     let flag = a.flag.map(|(f, _)| match f {
+        Flag::Workflow if a.kids_running() > 0 => seg(format!(" ⚙ {}", a.kids_running()), "teal"),
         Flag::Workflow => seg(" ⚙", "teal"),
         Flag::Cua => seg(" ◎", if a.attention { "overlay2" } else { "blue" }),
     });
@@ -2909,7 +2937,7 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
         .map_or_else(|| right2(last, gone, None), |(x, _)| x);
     // The harness mark under the letter (a pinned card's ⌥W digit sits
     // beside the letter on the first line, `inline`).
-    let mut l2 = mark_lead(a, rail, indent, cx.b.on);
+    let mut l2 = mark_lead(a, rail.clone(), indent, cx.b.on);
     let mut chip = None;
     if word_below {
         let (line, at) = below(room(&r2));
@@ -2925,7 +2953,36 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     if let Some((x0, x1)) = chip.filter(|&(_, x1)| usize::from(x1) <= margin(cx.w) + inner(cx.w)) {
         second.targets.insert(0, (x0, x1, Target::LimitResume(a.window_id.clone())));
     }
-    sel(vec![first, second])
+    // Its children, under the full card only (a one-line card folds them:
+    // its first row stands for them, [`Row::covering`]).
+    let mut rows = vec![first, second];
+    rows.extend(a.nested.iter().map(|k| kid_row(k, cx, bg, space, rail.clone(), marked, dimc)));
+    sel(rows)
+}
+
+/// The arrow before a nested child's title ([`kid_row`]).
+pub const KID_MARK: &str = "↳ ";
+
+/// An abby-delegate CHILD under its parent's full card ([`Agent::nested`],
+/// like a native subagent): ONE dim row on the card's own colour with the
+/// card's rail, so it reads as part of the card: the child's key-cap (quiet;
+/// its letter still reaches it by ⌥W), `↳` and its title dim (`text` while
+/// the client is on it); no state dot, colour, word or blurb. A click goes
+/// to the child ([`Target::Go`]); the row covers nothing (the card's first
+/// row stands for its children).
+fn kid_row(k: &Agent, cx: Cx, bg: Ink, space: Ink, rail: Seg, marked: bool, dimc: Hue) -> Row {
+    let mut left = vec![rail, seg(" ", "text")];
+    if cx.b.on {
+        left.extend([cx.b.seg(k, space, bg, false), seg(" ", "text")]);
+    }
+    left.push(seg(KID_MARK, dimc));
+    let mut right = vec![seg(" ", "text")];
+    if marked {
+        right.push(seg(MINE, MINE_HUE));
+    }
+    let room = inner(cx.w).saturating_sub(width(&left) + width(&right));
+    left.push(seg(clip(&short_title(k), room), if k.is_current { "text" } else { dimc }));
+    tile_row(cx.w, bg, left, right).click(cx.w, Target::Go { win: k.window_id.clone(), session: k.session.clone() })
 }
 
 /// The HARNESS MARK ([`crate::model::Harness`]): which harness runs the
@@ -3807,8 +3864,10 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
                 return (base, 4);
             };
             let mut rows = base;
-            let gone = key(&g.agents[top]);
-            rows[at].covers.retain(|(s, id)| (s.as_str(), id.as_str()) != gone);
+            // (It and its children: its own row stands for them now.)
+            let top_a = &g.agents[top];
+            let gone: Vec<Key> = std::iter::once(top_a).chain(&top_a.nested).map(key).collect();
+            rows[at].covers.retain(|(s, id)| !gone.contains(&(s.as_str(), id.as_str())));
             rows.insert(at + 1, agent_rows(&g.agents[top], cx, false, 0, space_colour(g), None).remove(0));
             return (rows, 4);
         }
@@ -3880,19 +3939,24 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
     let w = cx.w;
     let iw = inner(w);
     let a = &n.agent;
+    // What the card acts on: the window itself, or the CHILD a parent stands
+    // in for ([`Need::target`]: the prompt is there).
+    let t = n.target();
     // (From 26 columns, like an agent card's second line: narrower, no room.)
-    let answering = lines >= 2 && cx.seconds() && crate::answer::answerable(a);
+    let answering = lines >= 2 && cx.seconds() && crate::answer::answerable(t);
     let word = a.cat.map(|c| cat_word(a, c));
     let hue = word.as_ref().map_or(a.color.unwrap_or("overlay2"), |x| x.hue);
     let bg = Ink::Mix(hue, NEED_TINT[tint]);
-    let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
+    let go = Target::Go { win: t.window_id.clone(), session: t.session.clone() };
     let card = |bg: Ink, l: Vec<Seg>, r: Vec<Seg>| tile_row(w, bg, l, r).click(w, go.clone());
     let rail = || seg(RAIL_HEAVY, hue);
     let age = Some(age_of(a, cx)).filter(|g| cx.ages() && !g.is_empty()).map(|g| seg(format!(" {g}"), dim(true)));
     let lead = cx.b.lead();
     // An ask standing while its background work is still out reads
     // `◉ asks · ⚙ N` (model::bg_tail): it asks, and the work goes on.
-    let tail = crate::model::bg_tail(a.cat, a.ask_bg, a.workflow, a.bg_count).unwrap_or_default();
+    // (Children still running are such work: `⚙ N`, N of them.)
+    let kids = Some(a.kids_running()).filter(|&n| n > 0);
+    let tail = crate::model::bg_tail(a.cat, a.ask_bg, a.workflow || kids.is_some(), a.bg_count.or(kids)).unwrap_or_default();
     let state = |full: bool| match &word {
         Some(x) if full => bold(format!("{} {}{tail}", x.glyph, x.word), hue),
         _ => bold(a.glyph, hue),
@@ -3924,6 +3988,12 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
         // The harness mark under the solid letter cap ([`mark_lead`]).
         let mut l2 = mark_lead(a, rail(), indent, cx.b.on);
         let head = l2.len();
+        // A parent standing in for its child: the child's letter first
+        // (`↳ k: perm Bash`), so ⌥W + k reaches the prompt.
+        if let Some(c) = &n.via {
+            let who = c.letter.map_or_else(|| KID_MARK.to_string(), |l| format!("{KID_MARK}{l}: "));
+            l2.push(seg(who, "sub"));
+        }
         if n.reason.is_empty() {
             l2.push(seg(n.reason_word.clone(), hue));
         } else {
@@ -3941,9 +4011,9 @@ fn need_rows(n: &Need, cx: Cx, lines: u8, tint: usize, space: Ink) -> Vec<Row> {
             r2.push(seg(" ", "text"));
             let mut row = card(bg, l2, r2);
             for (k, (x0, x1)) in spans.into_iter().enumerate() {
-                let t = Target::Answer { win: a.window_id.clone(), session: a.session.clone(), allow: k == 0,
-                    prompt: crate::answer::prompt_key(a) };
-                row.targets.insert(k, (at + x0 as u16, at + x1 as u16, t));
+                let ans = Target::Answer { win: t.window_id.clone(), session: t.session.clone(), allow: k == 0,
+                    prompt: crate::answer::prompt_key(t) };
+                row.targets.insert(k, (at + x0 as u16, at + x1 as u16, ans));
             }
             rows.push(row);
             return rows;
@@ -4450,8 +4520,18 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
     // range selection is live ([`Bar::selecting`]) nothing moves: PINNED is
     // not drawn and every pinned agent sits in its space's group, so the
     // selection reads in tab order; PINNED is back once it ends.
-    let split;
+    // The KIDS (abby-delegate children) fold under their parents' cards
+    // first ([`ViewModel::kids_split`]: a child is never pinned), and, like
+    // the pins, not while the selection wants every tab in its place.
+    let kids;
     let selecting = opts.bar.selecting.is_some();
+    let view = if !selecting && view.has_kids() {
+        kids = view.kids_split();
+        &kids
+    } else {
+        view
+    };
+    let split;
     let view = if view.pinned.is_empty() && !selecting && view.agents().any(|a| a.is_pinned()) {
         split = view.pins_split();
         &split

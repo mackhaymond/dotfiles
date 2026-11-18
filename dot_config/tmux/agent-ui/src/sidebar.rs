@@ -289,7 +289,11 @@ fn build_view(core: &mut Core, client: Option<&str>, keys: Option<&mut KeyMemo>)
     let letter = |a: &mut crate::view::Agent| a.letter = assigned.letters.get(&a.window_id).copied();
     // Agents and shells alike (one pool): a shell row shows its letter too.
     view.spaces.iter_mut().flat_map(|s| s.agents.iter_mut().chain(s.plain.iter_mut())).for_each(letter);
-    view.needs.iter_mut().for_each(|n| letter(&mut n.agent));
+    // (A parent's card standing in for its asking child names the child's letter.)
+    view.needs.iter_mut().for_each(|n| {
+        letter(&mut n.agent);
+        n.via.iter_mut().for_each(letter);
+    });
     // The pins' ⌥W digit, as the frame shows them (the live sidebar stores them:
     // App::store_pin_keys).
     crate::view::Agent::set_pin_keys(&mut view, &crate::pins::pin_keys(&core.snapshot));

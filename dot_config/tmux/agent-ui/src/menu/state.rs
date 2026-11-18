@@ -421,7 +421,8 @@ impl Menu {
         let cur_row = || cur.as_deref().and_then(row_for);
         let first_need = || {
             self.data.view.needs.iter().find_map(|n| {
-                let a = &n.agent;
+                // (A stand-in's row is keyed by its child: [`Row::key`].)
+                let a = n.target();
                 [RowKey::Need(a.window_id.clone()), RowKey::Agent(a.session.clone(), a.window_id.clone())]
                     .into_iter()
                     .find(|k| keys.contains(k))

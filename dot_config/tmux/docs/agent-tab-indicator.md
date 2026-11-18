@@ -78,6 +78,7 @@ Two per-window tmux user options are the single source of truth:
 - `@agent_held_detail` — `"<kind>\t<text>"`: the detail a main-agent `Stop` would have written while a subagent's gate held the window at `needs-input`; written back by the heartbeat (or `subagent-stop`) that ends that gate. Unset by the next prompt, Stop, failure, SessionStart, `clear_state` and the watcher GC (see **Asker gate**).
 - `@agent_ask_bg`, `@agent_ask_seen`, `@agent_turn_start` — **Asks while work is out** (2026-10-22). A `Stop` held `running` by background work (agent-bg-pending) asks cua-notch's `~/.local/bin/agent-turn-asks` whether the turn ended asking Mack, synchronously and ONLY for the agent's own marker: `--marker-only --since @agent_turn_start`, SIGTERMed at 300 ms. **Explicit only** (2026-10-26, Mack's call): to be shown as needing him while its work is still out, the agent must run `agent-needs-you "<what>"` right before it ends its turn. There is no model guess any more: the detached full run (agent-turn-asks' copilot model backstop, which judged the last message and raised `needs-input` far too often) is gone, with its `ask-bg` worker, the `@agent_ask_line` stage and `AGENT_TAB_ASK_BG_TIMEOUT`. No marker = the Stop stays `running` and nothing ask-related is written. A marker makes even an agent-started turn loud (as `notify_user` does); a subagent's standing gate or a pause skips all of it. A yes **raises**: `@agent_state needs-input`, `@agent_detail_kind ask`, `@agent_detail` the line (DETAIL_JQ-sanitized), `@agent_ask_from main` (only the main agent's own tool call re-arms it, never a background subagent's), `@agent_ask_bg 1` — in `set_state`'s one command list. Not raised, and nothing ask-related written, when the line equals `@agent_ask_seen` (both sides through the same sanitizer), or while Mack is looking (then the Stop stays `running`, stamped seen, and the line becomes `@agent_ask_seen`). A **look** (`clear-current`, the watcher's viewed-discharge, agent-ui's answer discharge, which is `clear-current`) at an `@agent_ask_bg` window (any non-empty value, `1` or a counted `1 N`) copies `@agent_detail` into `@agent_ask_seen` (only while `@agent_detail_kind` is `ask`) and, while `@agent_workflow` says the work is still out, writes in ONE command list `@agent_seen_at E`, `@agent_state running`, `@agent_since "E running"`, unsets `@agent_detail_kind`, `@agent_ask_bg` and `@agent_ask_from` (`@agent_detail` stays); with nothing out, the ordinary idle + `@agent_pending` discharge. Only a later `Stop` raises again. `@agent_ask_bg` is unset by every write that leaves `needs-input` (`set_state`, `clear_state`, the watcher's discharges, codex turn ends, paused, restores), by a permission gate that lands on it (the gate replaces the ask; a `Notification` twin there writes `perm` and drops the `main` asker), and by the GC; agent-pause.py never counts a `needs-input` window as working, gear or not; the watcher asks agent-bg-pending for a raised ask too, so its gear (`@agent_workflow`) stays true for a background task. `@agent_turn_start` ("<epoch>") is stamped by every prompt that is not a harness wake-up (TURN_JQ's `sys`); `@agent_ask_seen` is unset by Mack's own prompt (not a wake-up, not a verified peer message), a non-compact `SessionStart`, `clear_state` and the GC. agent-ui files such a window under NEEDS YOU (`needs-input` beats in-flight) as `◉ asks · ⚙` (`⚙ N` once a writer puts the count in `@agent_ask_bg`'s second word).
 - `@thread_at` — `<epoch>`: when **Mack** last prompted this window himself (2026-11-10). Stamped by `running` (UserPromptSubmit) only when the origin classifier's `p_mack` holds: not a verified peer message (`@agent_inbound` match), no `[message from @h]` opener at all, not a harness wake-up (TURN_JQ's `sys`: a `<task-notification>` or a hand-back), and not a `loop_wakeup` / `schedule_wakeup` / `poll_event` source; nor, for this stamp only, a `system` source (native auto-continuation: Mack typed nothing; `p_mack` itself still counts it). A mid-turn prompt of his restamps it. Written with `ss_add`, so it rides `set_state`'s one command list (no extra tmux call, no fork). Never unset by the indicator, `clear_state` or the GC: it belongs to the window, whatever conversation runs in it (a restore or an older window simply has none). Readers: agent-ui's sidebar (a space's last prompt = the max over its agent windows; a dormant space folds to its header, a long-idle agent into the `+K idle` line; a window WITHOUT a stamp counts from its `@agent_since` while it is `idle` (a prompt would have moved it to running since, so that is never older than the real last prompt; a restore restamps it), else as fresh, never dormant or stale; see `agent-ui/src/sidebar/layout.rs`, "Dormant spaces"), and the Threads spec, which reuses exactly this name and meaning.
+- `@agent_parent`, `@agent_parent_pane` (written by abby-delegate), the derived `@agent_child`, `@agent_kids`, `@agent_kids_ask` (written only by the kids reconcile, with `@agent_kid_since` on a not-yet-started child) and `@agent_kids_hold` (a Stop held for them) — abby's delegated children, see §8.
 - `@agent_slot` — decimal integer ≥ 1: the window's sticky number in agent-ui's Option-W menu and sidebar. Held only while the window is in the Active set and visible. Stamped by the indicator's `set_state` when a window enters the Active set, and by the watcher as the backstop; released and repaired only by the watcher (see "Agent slots" in the watcher section).
 - `@agent_detail_kind` + `@agent_detail` — what the event that set the state was *about*, for the sidebar (not rendered in the tab bar):
 
@@ -1741,6 +1742,9 @@ under the lock with one extra `list-windows -a`, took 140 ms after against
 When it has to stamp, it costs +19–26 ms (that read, the lock, one
 `list-windows -a` and an `rm`), against a 50–53 ms hook before. A
 heartbeat with no change is unaffected (25–28 ms both).
+Delegated children (2026-11-17, §8) add ten fields to the same read and
+a builtin pass, about 0.5 ms a tick. A tick forks only when a derived option
+changes, and then only once.
 
 ### 5. Agent event log (the sidebar's "log" section)
 
@@ -2273,6 +2277,115 @@ same slept-through-the-reset case.
 Tests: `tests/test_agent_limit.py` (the indicator on a private tmux server;
 the watcher's Codex marking, GC and trigger on the fake harness; the glyph
 rendered from `tmux.conf.tmpl`).
+
+### 8. Delegated children (abby-delegate, 2026-11-17)
+
+abby (Claude Code on abliteration.ai) orchestrates: `abby-delegate spawn`
+opens real `claude` tabs right after abby's window. Each one is marked
+`@agent_parent` (abby's window id) and `@agent_parent_pane` (its pane). Mack's
+ask: these tabs behave like native subagents of the abby window, with no
+progress dot and no status of their own. A child is otherwise a normal claude
+tab: its own hooks, its own `@agent_state`, and a letter.
+
+**The contract** (agent-ui and CuaNotch read it; don't rename or reformat):
+
+- **Live parent.** A child's `@agent_parent` P is live when all of these
+  hold: window P exists; P is not the child itself; P has a non-empty
+  `@agent_state`; P is no space's home window (`@space_home`: the sidebar
+  never draws a home as an agent card); and at least one session P is linked
+  into has no `@space_hidden`. The CHILD must be visible the same way: a
+  parked child is a plain agent and is not counted. A parked, exited or
+  shell-again parent is not live, and its children are plain agents again.
+- **Busy child.** Its turn is not over: `@agent_state` `running`,
+  `needs-input` or `paused`; `idle` with `@agent_pending` (a gate Mack is
+  answering); or not started yet: `idle` with no `@agent_turn_start`
+  (claude is up, its first prompt not submitted), or no `@agent_state` (the
+  tab before claude's SessionStart; abby-delegate skips the birth mark) for
+  at most `KIDS_START_GRACE` (60 s) from `@agent_kid_since`. The reconcile
+  stamps that epoch the first time it sees a marked tab stateless, keeps it,
+  and drops it once the tab has a state or loses its mark. A claude that
+  never starts therefore stops holding the parent after 60 s, and the
+  watcher, which holds such a tab off its GC for the same grace (like a
+  birth), then collects it: `@agent_parent`, `@agent_parent_pane` and
+  `@agent_kid_since` go. `failed` and a finished `idle`/`done` are not busy.
+- **Grandchildren resolve to the ROOT.** A live child whose parent is itself
+  a live child belongs to that child's root (its top live ancestor; a loop,
+  or a chain past 32, has no root and is counted nowhere). `@agent_child`
+  still names the IMMEDIATE parent, but only a root carries `@agent_kids`
+  and `@agent_kids_ask`, taken over ALL its live descendants.
+- **Derived options**, written only by the reconcile below. Readers trust
+  these and never `@agent_parent`:
+  - on the child, `@agent_child` = P (its immediate parent), set only while
+    P is live and the child is visible;
+  - on the root, `@agent_kids` = `"<total> <busy>"`: its live descendants,
+    and the busy ones among them. Unset with none.
+  - on the root, `@agent_kids_ask` =
+    `"<child id>\t<child state>\t<child @agent_detail>"` for the descendant
+    in `needs-input` or `failed` that ranks first: UNSEEN before seen (seen =
+    its `@agent_seen_at` is at or after the epoch of its `@agent_since`: Mack
+    has looked at that ask), then `failed` before `needs-input`, then the
+    oldest `@agent_since`, then the lowest window id. Unset when none asks.
+    It is the ONE most urgent pointer, for the root's tab colour and
+    CuaNotch; NEEDS YOU lists every asking child itself.
+- **`@agent_kids_hold`** (`1`, the indicator's, on the parent): this Stop
+  was held for busy children. Written in the held state's own command list;
+  unset by any other Stop, the next prompt, a non-compact SessionStart, a
+  failure, `clear_state`, every watcher turn end (the finish, the bare
+  release, paused, a prior restore) and the GC (it is in both
+  `ORIGIN_OPTS`).
+- The parent's own `@agent_state` is never written for a child (no
+  `needs-input` on its behalf). Surfacing is the readers' job, so the asker
+  gate and the rest of the parent's machinery are untouched.
+- **abby-delegate's mark goes with its claude.** A child's SessionEnd
+  (`clear`) and the watcher's GC of a window whose agent is gone (or never
+  came, past the grace) unset `@agent_parent`, `@agent_parent_pane` and
+  `@agent_kid_since`, so an agent Mack starts in that
+  tab later is nobody's child.
+
+**The reconcile** is `kids_*` in `scripts/agent-session-lib.sh`: fold rows
+(`kids_row`), plan the writes (`kids_plan`), apply them (`kids_apply`). The
+apply is ONE `\;`-chained tmux command list of `set -w`/`set -wu` argv, so a
+detail is never re-parsed, and it holds only the writes that change
+something. It runs in three places:
+
+- **The watcher, every tick.** Its one `list-panes -a` read carries the
+  extra fields (`@space_hidden`, resolved per row's session, `@space_home`,
+  `@agent_parent`, `@agent_child`, `@agent_kids`, `@agent_turn_start`,
+  `@agent_kids_hold`, `@agent_kid_since`, `@agent_seen_at`,
+  `@agent_kids_ask`), so the reconcile costs no fork
+  unless it writes. Builtins only, measured 2026-11-17: ~0.5 ms a tick with
+  25 agent windows and nobody delegating, ~1 ms with five children. A child
+  that stops asking clears its parent's `@agent_kids_ask` on the next tick.
+- **The indicator, on a child's state change** (`set_state` when the state
+  moves, and `clear`). The `@agent_parent` / `@agent_child` / `@agent_kids`
+  values ride the hook's existing `#{window_active_clients}` read. The lib
+  is sourced only for a window that has one of them, under bash 4. Then
+  `kids_reconcile` makes one `list-windows -a` read and at most one write,
+  so the parent moves with its child. A parent's `clear` reconciles too:
+  its children turn plain at once. The heartbeat never reconciles (it stays
+  fork-free), and the watcher's tick covers it.
+- **The indicator, on a parent's Stop**, only when the window has
+  `@agent_kids` set (a plain agent pays nothing): one `kids_reconcile`, so
+  the hold is decided on the children as they are now. Two children's
+  reconciles racing can leave `@agent_kids` stale, and this write fixes it.
+
+**Behaviour.**
+
+| Where | What |
+|---|---|
+| Parent's `Stop` (indicator, `done`) | A busy live child (from the re-read; the option if the read fails) counts as work still out, like agent-bg-pending's verdict. The Stop is held `running` through the same branches (`@agent_bg_owner`, the `agent-needs-you` ask check, a quiet turn's prior kept), stamps `@agent_kids_hold 1`, and its reply is the `done` detail. A parent that Stops right after spawning is held: its not-started children are busy. |
+| Watcher, a parent with busy children | `@agent_workflow` (the gear, in any state) and `bg_held`, so the un-stick does not idle a held parent. An asking child keeps abby held and working; its ask shows on abby's tab. |
+| Watcher, the last busy child is done | The un-stick (three ticks, as for every turn end) finishes a `running` parent with `@agent_kids_hold`. It writes `done`, or `idle` + `@agent_seen_at` while Mack is looking, unsets `@agent_bg_owner`, `@agent_kids_hold`, `@agent_pending` and `@agent_ask_bg`, and keeps the held Stop's detail. It is a conditional write over `running`. Paused and quiet-prior turns end the usual way (`paused`, `prior_restore`). Without the mark (Esc mid-turn while a child ran; a hold that was agent-bg-pending's alone) the bare idle release stands. The mark is a window option, so a watcher restart or a child done before the first tick changes nothing. |
+| Child's `Stop` | A live child (`@agent_child`) finishes as SEEN: `idle`, `@agent_seen_at` stamped, the `done` detail kept, exactly the `viewing_now` branch. It never gets an unseen green and never a finish of its own; CuaNotch acks it like any seen finish. Its `needs-input` and `failed` are written as usual. |
+| Tab bar (`tmux.conf.tmpl`) | Each `@catppuccin_window_*` format is wrapped, after `@stash_sel`: a child (`@agent_child`) renders as a plain tab (stock body and chip, no glyph) with a grey `↳` before its name. A parent with `@agent_kids_ask`, whose own state is not `needs-*`/`failed`, renders as the child's state: red when the option's second field is `failed` (`#{m/r:^@[0-9]+.failed,…}`), else yellow. It gets a crust chip, crust text, and the gear when its work is out. A parent with busy children is the ordinary gear rendering, since the watcher set `@agent_workflow`. The original formats sit unchanged inside, so cua-notch's `check-invariants` §65 still reads them. |
+| NEEDS YOU / ⌥S (`agent-jump.sh list`, `agent-roster.py` `needs_order`) | Every live child (`@agent_child`) in `needs-input` or `failed`, by its own state, is one row: its own id, session, index, stamp and state, so the jump lands on the prompt, and the ROOT's label (walk `@agent_child` up; a loop, a chain past 32 or a missing root row gives the child's own label). A finished child has no row. The columns are unchanged. |
+| Roster popup and strip (`agent-roster.py`) | Children are folded into their parent: no session-group or strip rows, not in `counts()` or the header counts; an asking one appears only in NEEDS YOU. |
+| Restore, ⌘Z, stash | Nothing saves window user options. tmux-resurrect doesn't, and closed-tabs keeps only the cwd, label and session, so none of these come back after a restore or a reopen (window ids don't survive either). A reopened delegated tab is a plain agent. Parking leaves the options alone: a parked parent or child is simply not live. |
+| Pause (prefix P, `agent-pause.py`) | Not changed. A running child is "working" (`@agent_state running`) and gets its own PAUSE, independently of abby. abby with a gear also counts as working and gets one too. |
+
+Tests: `tests/test_agent_kids.py`. The reconcile, the indicator on a parent
+and on a child, and the tab formats run on private tmux servers. The watcher
+and the needs-you list run on the fake harness.
 
 ## Troubleshooting
 

@@ -216,12 +216,71 @@ fn needs_fixture(s: &Server) {
     s.tmux(&["link-window", "-d", "-s", &w51, "-t", "=yy:51"]);
 }
 
+/// Delegated children (agent-jump.sh `list_needs`): a child (`@agent_child`
+/// set) is listed only while its OWN state asks (failed or needs-input),
+/// under its own id, session, index and stamp with its PARENT's label (the
+/// named window's, even from an excluded session; its own when that window
+/// is gone); every asking child, whatever `@agent_kids_ask` names; a parent
+/// asking itself keeps its own row; a child linked twice is one row.
+fn kids_fixture(s: &Server) {
+    let ask = |p: &str, c: &str, st: &str| s.opt(p, "@agent_kids_ask", &format!("{c}\t{st}\tperm Bash"));
+    // An asking child, in another session than its parent; a second asking
+    // child the option does not name; a done and a running one (no rows).
+    let p1 = s.agent("kids", 1, "idle", Some("100 idle"), "", "Kid parent");
+    let c1 = s.agent("kidwork", 3, "needs-input", Some("120 needs-input"), "", "Kid one");
+    s.opt(&c1, "@agent_child", &p1);
+    ask(&p1, &c1, "needs-input");
+    let c5 = s.agent("kids", 8, "needs-input", Some("170 needs-input"), "", "Kid five");
+    s.opt(&c5, "@agent_child", &p1);
+    let c2 = s.agent("kids", 3, "running", Some("130 running"), "", "Kid two");
+    s.opt(&c2, "@agent_child", &p1);
+    let c7 = s.agent("kids", 10, "done", Some("190 done"), "", "Kid seven");
+    s.opt(&c7, "@agent_child", &p1);
+    // The option says needs-input, the child failed since: failed.
+    let p3 = s.agent("kids", 4, "idle", None, "", "Failing parent");
+    let c3 = s.agent("kids", 5, "failed", Some("140 failed"), "", "Kid three");
+    s.opt(&c3, "@agent_child", &p3);
+    ask(&p3, &c3, "needs-input");
+    // The parent asks too: two rows. Its child is linked into a second session.
+    let p4 = s.agent("kids", 6, "needs-input", Some("150 needs-input"), "", "Asking parent");
+    let c4 = s.agent("kids", 7, "needs-input", Some("160 needs-input"), "", "Kid four");
+    s.opt(&c4, "@agent_child", &p4);
+    ask(&p4, &c4, "needs-input");
+    s.tmux(&["link-window", "-d", "-s", &c4, "-t", "=kidwork:9"]);
+    // A parent in an excluded session still labels its child.
+    let p6 = s.agent("scratch", 4, "idle", None, "", "Hidden parent");
+    let c6 = s.agent("kids", 9, "needs-input", Some("180 needs-input"), "", "Kid six");
+    s.opt(&c6, "@agent_child", &p6);
+    // A parent that is gone: the child's own label.
+    let c8 = s.agent("kids", 11, "needs-input", Some("200 needs-input"), "", "Orphan kid");
+    s.opt(&c8, "@agent_child", "@99999");
+    // A grandchild R <- C <- G, G asking: the ROOT's label.
+    let r = s.agent("kids", 12, "idle", None, "", "Root R");
+    let c = s.agent("kids", 13, "running", None, "", "Mid C");
+    s.opt(&c, "@agent_child", &r);
+    let g = s.agent("kids", 14, "needs-input", Some("210 needs-input"), "", "Grand G");
+    s.opt(&g, "@agent_child", &c);
+    // A loop back to the child: its own label.
+    let l1 = s.agent("kids", 15, "needs-input", Some("220 needs-input"), "", "Loop one");
+    let l2 = s.agent("kids", 16, "idle", None, "", "Loop two");
+    s.opt(&l1, "@agent_child", &l2);
+    s.opt(&l2, "@agent_child", &l1);
+    // A ring above the child (never back to it): 32 hops, its own label.
+    let x = s.agent("kids", 17, "needs-input", Some("230 needs-input"), "", "Ring kid");
+    let y = s.agent("kids", 18, "idle", None, "", "Ring Y");
+    let z = s.agent("kids", 19, "idle", None, "", "Ring Z");
+    s.opt(&x, "@agent_child", &y);
+    s.opt(&y, "@agent_child", &z);
+    s.opt(&z, "@agent_child", &y);
+}
+
 #[test]
 fn needs_matches_agent_jump_list() {
     let s = Server::start("needs");
     // yy must exist before link-window targets it.
     s.window("yy", 0, "plain", LIFE);
     needs_fixture(&s);
+    kids_fixture(&s);
     let (_, nl_dir) = free_text_fixture(&s);
     let sock = s.socket_path();
     for loc in ["en_US.UTF-8", "C"] {
@@ -239,6 +298,18 @@ fn needs_matches_agent_jump_list() {
         assert_eq!(run(env), theirs);
         // The free-text windows are in the queue, labels cut where awk cuts them.
         assert!(theirs.contains("\tmulti\n") && theirs.contains("\tus\n"), "{theirs}");
+        // The kids: every asking one under its own place with its parent's
+        // label, both of the asking parent's rows, no done or running kid.
+        for want in ["\tkidwork\t3\tneeds-input\t120\tKid parent\n", "\tkids\t8\tneeds-input\t170\tKid parent\n",
+            "\tkids\t5\tfailed\t140\tFailing parent\n", "\tkids\t7\tneeds-input\t160\tAsking parent\n",
+            "\tkids\t6\tneeds-input\t150\tAsking parent\n", "\tkids\t9\tneeds-input\t180\tHidden parent\n",
+            "\tkids\t11\tneeds-input\t200\tOrphan kid\n", "\tkids\t14\tneeds-input\t210\tRoot R\n",
+            "\tkids\t15\tneeds-input\t220\tLoop one\n", "\tkids\t17\tneeds-input\t230\tRing kid\n"] {
+            assert!(theirs.contains(want), "{want:?} not in\n{theirs}");
+        }
+        for gone in ["Kid one", "Kid two", "Kid four", "Kid five", "Kid six", "Kid seven"] {
+            assert!(!theirs.contains(gone), "{gone:?} in\n{theirs}");
+        }
     }
     let _ = std::fs::remove_dir_all(nl_dir);
 }

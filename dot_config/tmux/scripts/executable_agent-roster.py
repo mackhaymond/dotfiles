@@ -113,7 +113,7 @@ MOUSE = "\U000F037D"  # nf-md-mouse: driving an app through cua-driver
 FIELDS = ["session", "index", "id", "name", "state", "summary", "workflow", "cua",
           "since", "last_attached", "blink", "stash_label", "stash_session", "stash_ts",
           "active", "panes", "path", "kind", "detail_kind", "detail", "space_home", "paused",
-          "limit", "limit_lifted", "limit_auto"]
+          "limit", "limit_lifted", "limit_auto", "child", "kids_ask"]
 # The oldest window row still read: the tests' 20-field fixtures (the rest
 # is padded empty).
 MIN_FIELDS = 20
@@ -139,7 +139,12 @@ FMT = US.join(["#{session_name}", "#{window_index}", "#{window_id}", "#{window_n
                "#{window_active}", "#{window_panes}", "#{pane_current_path}",
                "#{@agent_kind}", "#{@agent_detail_kind}", "#{@agent_detail}", "#{@space_home}",
                "#{@agent_paused}", "#{@agent_limit}", "#{@agent_limit_lifted}",
-               "#{@agent_limit_autoresume}"])
+               "#{@agent_limit_autoresume}", "#{@agent_child}", "#{@agent_kids_ask}"])
+# Then the delegated-children pair (docs/agent-tab-indicator.md, "Delegated
+# children"): @agent_child (this window is a live parent's child: folded into
+# it - no row, no count; when it asks, NEEDS YOU lists it under the parent's
+# label, needs_order mirroring agent-jump.sh `list`) and @agent_kids_ask
+# (the parent's one most urgent asking child; read, not used here yet).
 # Rides in the same tmux call as FMT, after a `;`. Seven fields where a window
 # row has at least twenty, so parse_windows skips it and parse_clients takes only it.
 # The last three are for the strip's scope (Strip.load): the client's session
@@ -303,20 +308,41 @@ def needs_order(windows):
     Fuzzed against the real sort, 2400 random cases, under both locales."""
     xfrm = _XFRM or collation()
     keyed = []
+
+    def add(w, tier, label):
+        s = w["session"]
+        word = AWK_BLANKS.split(w["since"].strip(" \t\n"))[0]
+        stamp = word if DIGITS.match(word) else str(NO_STAMP)   # awk prints the digits as given
+        ix = "%09d" % w["index"]
+        label = label.replace("\t", " ")
+        line = "\t".join([str(tier), stamp, s, ix, w["id"], s, str(w["index"]), w["state"], stamp, label])
+        key = (tier, int(stamp), xfrm(s), len(s), xfrm(ix), len(ix), xfrm(line), len(line))
+        keyed.append((key, w))
+
+    # DELEGATED CHILDREN: every asking child (@agent_child set, needs-input
+    # or failed by its own state) is a row under its ROOT's label: up the
+    # @agent_child chain (agent-jump.sh's walk: stops at a window that is no
+    # child; a loop back to the child or past 32 hops - like a missing root
+    # row - gives its own label); a finished child has none.
+    labels, up = {}, {}
+    for w in windows:
+        labels.setdefault(w["id"], w["summary"] or w["name"])
+        up.setdefault(w["id"], w.get("child", ""))
+
+    def root_label(w):
+        r, hops = w["child"], 0
+        while up.get(r) and up[r] != w["id"] and hops < 32:
+            r, hops = up[r], hops + 1
+        loop = hops >= 32 or up.get(r) == w["id"]
+        return labels[r] if r in labels and not loop else (w["summary"] or w["name"])
     for w in windows:
         s = w["session"]
         if (" %s " % s) in JUMP_EXCLUDE:
             continue
         tier = NEED_TIER.get(w["state"])
-        if tier is None or (tier == 2 and w["workflow"]):
+        if tier is None or (tier == 2 and (w["workflow"] or w.get("child"))):
             continue
-        word = AWK_BLANKS.split(w["since"].strip(" \t\n"))[0]
-        stamp = word if DIGITS.match(word) else str(NO_STAMP)   # awk prints the digits as given
-        ix = "%09d" % w["index"]
-        label = (w["summary"] or w["name"]).replace("\t", " ")
-        line = "\t".join([str(tier), stamp, s, ix, w["id"], s, str(w["index"]), w["state"], stamp, label])
-        key = (tier, int(stamp), xfrm(s), len(s), xfrm(ix), len(ix), xfrm(line), len(line))
-        keyed.append((key, w))
+        add(w, tier, root_label(w) if w.get("child") else w["summary"] or w["name"])
     keyed.sort(key=lambda kv: kv[0])
     first = {}
     for _, w in keyed:
@@ -471,9 +497,12 @@ def cat(w):
 
 
 def counts(ws):
-    """[(cat, n)] in CATS order, zero counts dropped. Each window id once."""
+    """[(cat, n)] in CATS order, zero counts dropped. Each window id once.
+    A delegated child (@agent_child) is folded into its parent: not counted."""
     seen, n = set(), {}
     for w in ws:
+        if w.get("child"):
+            continue
         c = cat(w)
         if c and w["id"] not in seen:
             seen.add(w["id"])
@@ -637,7 +666,12 @@ def build_items(windows, needs, cur_win, show_all=False, parked_open=False, quer
     else:
         order = sorted(sessions, key=lambda s: (s != cur_sess, -max(w["last_attached"] for w in sessions[s]), s))
     for s in order:
-        ws = sorted(sessions[s], key=lambda w: w["index"])
+        # A delegated child (@agent_child) has no row of its own (folded
+        # into its parent; an asking one is in NEEDS YOU), nor colours the
+        # session's header.
+        ws = sorted((w for w in sessions[s] if not w.get("child")), key=lambda w: w["index"])
+        if not ws:
+            continue
         shown = [w for w in ws if show_all or w["state"] or w["id"] == cur_win]
         if not shown:
             continue
@@ -1419,7 +1453,7 @@ class Roster:
         and anything wider than the screen autowraps and shifts the frame."""
         rows = max(1, rows)
         blink = bool(self.windows) and self.windows[0]["blink"] == "1"   # a global option: same on every row
-        ws = [w for w in self.windows if w["session"] not in HIDDEN]
+        ws = [w for w in self.windows if w["session"] not in HIDDEN and not w.get("child")]
         n_work = sum(1 for w in ws if w["state"] and in_flight(w) and not is_attn(w))
         n_need = len(self.needs)
         # (A rate-limited idle window is limited, not idle.)
@@ -1855,6 +1889,8 @@ class Strip(Roster):
         self.ordinals = agent_ordinals(self.windows, self.cur_sess) if space else None
         by = {}
         for w in self.windows:
+            if w.get("child"):
+                continue        # folded into its parent (no row; NEEDS YOU lists it if it asks)
             if w["session"] not in HIDDEN and w["session"] != HOLD and (not space or w["session"] == self.cur_sess):
                 by.setdefault(w["session"], []).append(w)
         keep_cur = not self.spaces

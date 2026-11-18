@@ -774,10 +774,13 @@ pub const KEYS: usize = 9;
 
 /// The pinned agents' windows in PIN order, as the sidebar's PINNED section
 /// lists them ([`crate::view::ViewModel::pinned_agents`]): `@agent_pinned`
-/// set, an agent (a state), never a home, in a shown session (not the
+/// set, an agent (a state), never a home, never an abby-delegate child
+/// ([`crate::view::kid_roots`] over EVERY space: the digits are global, so
+/// every client must agree on them), in a shown session (not the
 /// stash, not agents / tasks / scratch / btop-popup); first pinned first
 /// (the pin's time, then the window id's number); each window once.
 pub fn pin_order(snap: &Snapshot) -> Vec<&str> {
+    let kids = crate::view::kid_roots(&snap.windows, None);
     let mut seen = HashSet::new();
     let mut v: Vec<&Window> = snap
         .windows
@@ -786,6 +789,7 @@ pub fn pin_order(snap: &Snapshot) -> Vec<&str> {
             w.pinned.is_some()
                 && !w.state.is_empty()
                 && !w.home
+                && !kids.contains_key(&w.id)
                 && w.session != crate::tmux::HOLD
                 && !crate::model::HIDDEN.contains(&w.session.as_str())
         })
@@ -927,6 +931,11 @@ pub fn toggle(tmux: &Tmux, snap: &Snapshot, win: &str, want: Want, now: i64, pat
     let pin = want.unwrap_or(w.pinned.is_none());
     if pin && w.state.is_empty() {
         return Err("only agents pin".into());
+    }
+    // (A kid by the every-space verdict, the ⌥W digits' own; unpinning one
+    // pinned before it became a kid is still allowed.)
+    if pin && crate::view::kid_roots(&snap.windows, None).contains_key(win) {
+        return Err("a delegated child folds under its parent".into());
     }
     if pin && !shown(&w) {
         // (Nothing would list it, and ⌥W's digits never look there.)

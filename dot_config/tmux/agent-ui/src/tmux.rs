@@ -243,14 +243,20 @@ impl Tmux {
 /// tab whose foreground jobs it stopped; `@stash_cold`: such a tab after a
 /// restart, its process gone and its command kept: the Parked rows' state,
 /// [`crate::view::Parked`]), and `stash_wake` (stash.sh's `@stash_wake`:
-/// a SNOOZED stash window's wake epoch; snooze.sh brings it back then).
-pub const FIELDS: [&str; 48] = [
+/// a SNOOZED stash window's wake epoch; snooze.sh brings it back then), and
+/// the KIDS' derived options (abby-delegate children, written by the shell
+/// reconciler; the sidebar trusts only these, never `@agent_parent`):
+/// `child` (`@agent_child`: the live parent's window id, on a child),
+/// `kids` (`@agent_kids` `"<total> <busy>"`, on a parent) and `kids_ask`
+/// (`@agent_kids_ask` `"<child id>\t<state>\t<detail>"`, on a parent whose
+/// child asks or failed): [`crate::model::Kids`], [`crate::model::KidsAsk`].
+pub const FIELDS: [&str; 51] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
     "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home", "space_index",
     "space_hidden", "space_color", "stash_sel", "pane_flags", "rollout", "paused", "pinned", "session_id",
     "pin_key", "pending_space", "pending_request", "pending_color", "ask_bg", "limit", "limit_lifted",
-    "harness", "thread_at", "stash_frozen", "stash_cold", "stash_wake",
+    "harness", "thread_at", "stash_frozen", "stash_cold", "stash_wake", "child", "kids", "kids_ask",
 ];
 
 /// The pane option space.sh sets (to 1) on a space home's dashboard pane
@@ -272,7 +278,7 @@ pub const PANE_FLAGS: &str =
 
 /// The tmux format of each FIELDS entry, in order. (`#{pane_current_path}`
 /// is printed by [`path_format`], dashboard-aware.)
-pub const FORMATS: [&str; 48] = [
+pub const FORMATS: [&str; 51] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
@@ -282,7 +288,7 @@ pub const FORMATS: [&str; 48] = [
     PANE_FLAGS, "#{@agent_rollout}", "#{@agent_paused}", "#{@agent_pinned}", "#{@agent_session_id}",
     "#{@pin_key}", "#{@pending_space}", "#{@pending_request}", "#{@pending_color}", "#{@agent_ask_bg}",
     "#{@agent_limit}", "#{@agent_limit_lifted}", "#{@agent_harness}", "#{@thread_at}", "#{@stash_frozen}",
-    "#{@stash_cold}", "#{@stash_wake}",
+    "#{@stash_cold}", "#{@stash_wake}", "#{@agent_child}", "#{@agent_kids}", "#{@agent_kids_ask}",
 ];
 
 /// Ends each path in the dashboard case of [`path_format`] (a private-use
@@ -413,7 +419,7 @@ pub fn fmt() -> String {
 /// the GLOBAL options the sidebar's status block shows in place of the
 /// hidden status line (usage, the stale-save mark, the open-sidebar count).
 /// Starts with an empty field and has 9 + [`STATUS_FORMATS`] fields where a
-/// window row has [`FIELDS`]' 41, so the two parsers can never take each other's rows.
+/// window row has [`FIELDS`]' 51, so the two parsers can never take each other's rows.
 pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
@@ -717,6 +723,26 @@ pub struct Window {
     /// `@stash_wake`: a SNOOZED stash window's wake time (epoch seconds,
     /// digits only, trimmed; None when unset or junk).
     pub stash_wake: Option<i64>,
+    /// `@agent_child`, when it is a window id (`@N`, never the window's own):
+    /// the window is an abby-delegate CHILD of that live parent, folded under
+    /// its parent's card ([`crate::view::ViewModel::kids_split`]). "" = a
+    /// plain agent (unset, junk, or its parent is not live).
+    pub child: String,
+    /// `@agent_kids` on a parent: how many live children, how many busy
+    /// ([`crate::model::Kids::parse`]); None when unset or junk.
+    pub kids: Option<crate::model::Kids>,
+    /// `@agent_kids_ask` on a parent: the child that asks or failed
+    /// ([`crate::model::KidsAsk::parse`]); None when unset or junk.
+    pub kids_ask: Option<crate::model::KidsAsk>,
+    /// `@agent_child` exactly as tmux printed it (not trimmed or checked):
+    /// [`crate::model::needs_order`] rebuilds agent-jump.sh's own raw row
+    /// from it.
+    pub raw_child: String,
+}
+
+/// A window id as tmux prints it: `@` and digits.
+pub fn is_window_id(s: &str) -> bool {
+    s.strip_prefix('@').is_some_and(digits)
 }
 
 fn digits(s: &str) -> bool {
@@ -811,6 +837,10 @@ impl Window {
             stash_frozen: p[45].into(),
             stash_cold: p[46].into(),
             stash_wake: num(p[47].trim()),
+            child: Some(p[48].trim()).filter(|c| is_window_id(c) && *c != p[2]).unwrap_or("").into(),
+            kids: crate::model::Kids::parse(p[49]),
+            kids_ask: crate::model::KidsAsk::parse(p[50]),
+            raw_child: p[48].into(),
             label: label.into(),
             session,
         })
@@ -1183,28 +1213,29 @@ pub(crate) mod tests {
         assert_eq!((w.session.as_str(), w.label.as_str()), ("日本", "🫠 x\tz"));
     }
 
-    /// A row from an older format (47 fields, before `stash_wake`; 45,
-    /// before `stash_frozen` and `stash_cold`; 44, before `thread_at`; 43,
-    /// before `harness`; 41, before `limit` and `limit_lifted`; 40, before
-    /// `ask_bg`; 37, before the pending space's options; 34, before
-    /// `pinned`, `session_id` and `pin_key`) or one with a field too many is
-    /// no window: never misread by position.
+    /// A row from an older format (48 fields, before the kids' options; 47,
+    /// before `stash_wake`; 45, before `stash_frozen` and `stash_cold`; 44,
+    /// before `thread_at`; 43, before `harness`; 41, before `limit` and
+    /// `limit_lifted`; 40, before `ask_bg`; 37, before the pending space's
+    /// options; 34, before `pinned`, `session_id` and `pin_key`) or one with
+    /// a field too many is no window: never misread by position.
     #[test]
     fn rows_of_the_wrong_length_are_rejected() {
-        assert_eq!(FIELDS.len(), 48);
-        for n in [34, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49] {
+        assert_eq!(FIELDS.len(), 51);
+        for n in [34, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 52] {
             assert!(Window::parse(&vec!["x"; n].join("\x1f")).is_none(), "{n}");
         }
-        assert!(Window::parse(&vec!["x"; 48].join("\x1f")).is_some());
+        assert!(Window::parse(&vec!["x"; 51].join("\x1f")).is_some());
         assert_ne!(FIELDS.len(), CLIENT_FIELDS);
     }
 
-    /// `@stash_wake` rides last (no extra tmux call), guarded; digits only
-    /// (trimmed), else None.
+    /// `@stash_wake` rides after the stash's other options (no extra tmux
+    /// call), guarded; digits only (trimmed), else None.
     #[test]
     fn stash_wake_field_is_last() {
         assert_eq!((FIELDS[47], FORMATS[47]), ("stash_wake", "#{@stash_wake}"));
-        assert!(fmt().ends_with(&format!("\x1f{}", guarded("#{@stash_wake}"))));
+        assert!(fmt().contains(&format!("\x1f{}\x1f", guarded("#{@stash_wake}"))));
+        assert!(fmt().ends_with(&format!("\x1f{}", guarded("#{@agent_kids_ask}"))));
         let at = |v: &str| Window::parse(&row("stash", 1, "@1", &[("stash_wake", v)])).unwrap().stash_wake;
         assert_eq!(at(" 1792400000 "), Some(1_792_400_000));
         assert_eq!((at(""), at("soon"), at("-5")), (None, None, None));
@@ -1265,6 +1296,45 @@ pub(crate) mod tests {
         assert_eq!(w.harness, "");
     }
 
+    /// The format's last three fields: the kids' options, guarded.
+    fn kids_tail() -> String {
+        ["#{@agent_child}", "#{@agent_kids}", "#{@agent_kids_ask}"].map(guarded).join("\x1f")
+    }
+
+    /// The kids' derived options ride last, guarded, and parse defensively:
+    /// `@agent_child` only as another window's id; `@agent_kids` as two
+    /// counts (running never past total); `@agent_kids_ask` only with a
+    /// window id and an asking or failed state. Junk is unset.
+    #[test]
+    fn kids_fields() {
+        use crate::model::{Kids, KidsAsk};
+        assert_eq!(&FIELDS[48..], ["child", "kids", "kids_ask"]);
+        assert_eq!(&FORMATS[48..], ["#{@agent_child}", "#{@agent_kids}", "#{@agent_kids_ask}"]);
+        assert!(fmt().ends_with(&format!("\x1f{}", kids_tail())));
+        let w = |set: &[(&str, &str)]| Window::parse(&row("main", 1, "@1", set)).unwrap();
+        assert_eq!(w(&[("child", " @7 ")]).child, "@7");
+        for junk in ["", "7", "@", "@x", "@1", "%3", "@7 @8"] {
+            assert_eq!(w(&[("child", junk)]).child, "", "{junk:?}");
+        }
+        assert_eq!(w(&[("kids", "2 1")]).kids, Some(Kids { total: 2, running: 1 }));
+        assert_eq!(w(&[("kids", " 3 ")]).kids, Some(Kids { total: 3, running: 0 }));
+        assert_eq!(w(&[("kids", "2 5")]).kids, Some(Kids { total: 2, running: 2 }));
+        for junk in ["", "0 0", "x 1", "-1 0", "2 x", "2 1 9"] {
+            assert_eq!(w(&[("kids", junk)]).kids, None, "{junk:?}");
+        }
+        let ask = w(&[("kids_ask", "@9\tneeds-input\tBash cargo test")]).kids_ask;
+        assert_eq!(ask, Some(KidsAsk { win: "@9".into(), state: "needs-input".into(), detail: "Bash cargo test".into() }));
+        let ask = w(&[("kids_ask", "@9\tfailed")]).kids_ask.unwrap();
+        assert_eq!((ask.state.as_str(), ask.detail.as_str()), ("failed", ""));
+        // A newline in the detail survives the guard (and is the detail's).
+        assert_eq!(w(&[("kids_ask", "@9\tfailed\ta\nb")]).kids_ask.unwrap().detail, "a\nb");
+        for junk in ["", "@9", "9\tfailed\tx", "@9\trunning\tx", "@9\tdone\tx", "@9 failed x"] {
+            assert_eq!(w(&[("kids_ask", junk)]).kids_ask, None, "{junk:?}");
+        }
+        let plain = w(&[("state", "running")]);
+        assert_eq!((plain.child.as_str(), plain.kids, plain.kids_ask), ("", None, None));
+    }
+
     /// `@agent_ask_bg` rides after the pending space's options, guarded like
     /// the other user options, and is read trimmed.
     #[test]
@@ -1293,9 +1363,10 @@ pub(crate) mod tests {
         assert_eq!(lim(" 0 model 5 ", " 9 "),
             Some(Limit { resets_at: 0, garbled: false, kind: "model".into(), since: Some(5), lifted: Some(9) }));
         assert_eq!(lim("soon", "yes"), Some(Limit { resets_at: 0, garbled: true, kind: "".into(), since: None, lifted: Some(0) }));
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", guarded("#{@agent_limit}"),
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{KIDS_TAIL}", guarded("#{@agent_limit}"),
             guarded("#{@agent_limit_lifted}"), guarded("#{@agent_harness}"), guarded("#{@thread_at}"),
-            guarded("#{@stash_frozen}"), guarded("#{@stash_cold}"), guarded("#{@stash_wake}"))));
+            guarded("#{@stash_frozen}"), guarded("#{@stash_cold}"), guarded("#{@stash_wake}"),
+            KIDS_TAIL = kids_tail())));
     }
 
     /// A pending space's options: only a window of the `pending` session
@@ -1365,11 +1436,11 @@ pub(crate) mod tests {
             guarded("#{@agent_paused}"), guarded("#{@agent_pinned}"), guarded("#{@agent_session_id}"), guarded("#{@pin_key}"))));
         // Then a pending space's options, the raised ask's flag, the limit
         // and the harness, then Mack's last prompt, then the stash's freeze
-        // and wake.
-        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", guarded("#{@pending_space}"),
+        // and wake, then the kids' options.
+        assert!(fmt().ends_with(&format!("{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", guarded("#{@pending_space}"),
             guarded("#{@pending_request}"), guarded("#{@pending_color}"), guarded("#{@agent_ask_bg}"), guarded("#{@agent_limit}"),
             guarded("#{@agent_limit_lifted}"), guarded("#{@agent_harness}"), guarded("#{@thread_at}"), guarded("#{@stash_frozen}"),
-            guarded("#{@stash_cold}"), guarded("#{@stash_wake}"))));
+            guarded("#{@stash_cold}"), guarded("#{@stash_wake}"), kids_tail())));
         let s = Snapshot::parse(&row("main", 1, "@1", &[("rollout", "/x/rollout-1.jsonl")]));
         assert_eq!(s.windows[0].rollout, "/x/rollout-1.jsonl");
         let s = Snapshot::parse(&row("main", 1, "@1", &[("space_color", " #f9e2af "), ("stash_sel", "1")]));
