@@ -95,6 +95,12 @@ cmd_spawn() {
     tmux set-option -w -t "$win" @agent_parent "$wid" \; \
         set-option -w -t "$win" @agent_parent_pane "$TMUX_PANE" 2>/dev/null \
         || echo "abby-delegate: warning: couldn't mark $win as abby's subagent" >&2
+    # S's reconciler, once, now (agent-session-lib.sh kids_reconcile, bash
+    # 4+): puts @agent_kids on abby's window at once, so an abby turn that
+    # ends within a second of the spawn (before the watcher's next tick) is
+    # still held working for the child. A no-op if it isn't there.
+    /opt/homebrew/bin/bash -c 'source ~/.config/tmux/scripts/agent-session-lib.sh && kids_reconcile' \
+        </dev/null >/dev/null 2>&1 || true
     printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$pane" "$win" "$dir" >>"$LOG"
     # The letter is handed out by the birth/hooks; give it a moment.
     for _ in 1 2 3 4 5 6 7 8 9 10; do
