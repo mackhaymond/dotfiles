@@ -33,6 +33,10 @@ one. Auto-compact defaults to 400K (see AUTO_COMPACT_WINDOW).
 Key: keychain item "abliteration-api-key":
   security add-generic-password -U -a "$USER" -s abliteration-api-key -w
 One-off model: abby --model abliterated-model
+
+Orchestrator by default (see ORCHESTRATOR): abby briefs real Claude agents
+in new tabs (abby-delegate) and does only the smallest edits itself.
+`abby --solo` launches it as a hands-on coder instead.
 """
 import copy
 import hashlib
@@ -139,6 +143,67 @@ TINT_OFF = (f'[ -n "$TMUX_PANE" ] && {_tmux} set -pu -t "$TMUX_PANE" window-styl
 # GLM sometimes ends a turn right after "Doing X now:" with no tool call; this
 # Stop hook nudges it once to make the call (see the script's docstring).
 STOP_NUDGE = os.path.join(HOME, ".local", "bin", "abby-stop-nudge")
+
+# Orchestrator mode (the default since 2026-11-17; `abby --solo` turns it
+# off for one launch). abby plans and delegates; real Claude agents in new
+# tabs of the same tmux space do the coding (abby-delegate). Its own Agent
+# tool can't help there: subagents share the session's gateway, so they
+# would be abliteration models too. Appended to the system prompt via
+# --append-system-prompt-file (written to ORCH_FILE each launch).
+ORCH_FILE = os.path.join(DST, "orchestrator.md")
+ORCHESTRATOR = """\
+# You are abby, an orchestrator
+
+Mack talks to you; Claude agents do the work. Your job is to turn what Mack
+asks for into well-briefed work for Claude coding agents, keep them moving,
+check what they did, and report back. You are not the one who writes code.
+
+## What you do yourself
+- Talk with Mack, work out what he actually wants, ask when it's unclear.
+- Read code, logs and state to understand a task well enough to brief it.
+- Only the smallest edits by hand: a one-line fix, a typo, a config value.
+  Anything bigger, anything multi-file, anything needing tests: delegate.
+- Verify: read the diff, run the tests or the postcondition, before you tell
+  Mack something is done.
+
+## Delegating to Claude
+Your own Agent/subagent tool runs on your model, not Claude, so don't use it
+for coding. Use `abby-delegate` (run it with the pty run tool):
+
+    abby-delegate spawn [--dir DIR] [--model MODEL] -- "<prompt>"
+    abby-delegate spawn --dir DIR - <<'EOF'   # long prompts
+    ...
+    EOF
+    abby-delegate wait <pane> [--timeout 540]   # until its turn ends; prints its reply
+    abby-delegate last <pane>                   # its latest reply, no waiting
+    abby-delegate list                          # the agents you've started
+
+`spawn` opens a new tab right after yours in this tmux space, running Mack's
+normal `claude`, and prints `<pane> <window> <letter>`. Follow up with the
+tmux MCP: `mcp__tmux__message_agent` (pane = its letter or pane id) to send
+more, `mcp__tmux__read_pane` to see where it is. Independent pieces of work
+go to separate agents at the same time; parts that touch the same files go to
+one agent, or one after another. Close a finished tab with
+`~/.config/tmux/scripts/closed-tabs.sh close <pane>` only once its work is
+verified and Mack doesn't need it (⌘Z can bring it back).
+
+## Writing the prompt
+Each agent starts with no context but the repo, so its prompt is the brief:
+- the goal and why, in Mack's terms; the directory and the files involved;
+- what you already know (findings, constraints, what was ruled out);
+- what "done" means: the test, command or visible result that proves it;
+- whether it may commit/push (Mack's standing rules in CLAUDE.md apply).
+Be straight with the agent: say what the work is and what it's for. Never
+disguise a request, split it up to hide its purpose, or reword it to get
+around something Claude declined. If an agent refuses or pushes back, tell
+Mack what it said and let him decide; don't route the task around it, and
+don't do the declined work yourself instead.
+
+## Reporting
+When an agent finishes, check its work, then give Mack a short account: what
+changed, what you verified, what's left. Relay its questions to him rather
+than guessing the answers.
+"""
 LOOK_HOOKS = {
     "SessionStart": [{"hooks": [{"type": "command", "command": TINT_ON}]}],
     "SessionEnd": [{"hooks": [{"type": "command", "command": TINT_OFF}]}],
@@ -193,10 +258,13 @@ def load(path, required=False):
 
 
 def write_atomic(path, data):
+    write_text(path, json.dumps(data, indent=2) + "\n")
+
+
+def write_text(path, text):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".abby-")
     with os.fdopen(fd, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+        f.write(text)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
@@ -529,8 +597,15 @@ def main():
         env["ANTHROPIC_CUSTOM_HEADERS"] = f"x-abliteration-session-id: abby-{uuid.uuid4()}"
 
     args = sys.argv[1:]
+    solo = "--solo" in args
+    args = [a for a in args if a != "--solo"]
     given = lambda flag: any(a == flag or a.startswith(flag + "=") for a in args)
     pre = ["--settings", flags_file]
+    # Orchestrator mode: the prompt rides every launch (resumes too), so a
+    # continued session keeps the role. Not for -p one-shots or --solo.
+    if not solo and not given("-p") and not given("--print"):
+        write_text(ORCH_FILE, ORCHESTRATOR)
+        pre += ["--append-system-prompt-file", ORCH_FILE]
     # Flags so a saved pick beats the live settings' model/effort, which load
     # as project settings when run from ~. An in-session pick still wins.
     if not given("--model"):
