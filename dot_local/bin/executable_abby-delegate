@@ -12,6 +12,7 @@
 #       window id) and @agent_parent_pane on the new window, which the
 #       sidebar / tab dots / CuaNotch fold under abby. Prints: <pane id>
 #       <window id> <letter or ->.
+#   PANE below is the pane id spawn printed (%123) or the agent's letter.
 #   abby-delegate wait PANE [--timeout SECONDS]
 #       Until that agent's turn ends (done / needs-input / failed / back to
 #       idle after running), at most SECONDS (default 540, under the pty
@@ -106,6 +107,16 @@ cmd_spawn() {
 
 state_of() { tmux show-options -wqv -t "$1" @agent_state 2>/dev/null; }
 
+# PANE as a pane id: a %id as given, or an agent letter looked up by
+# @agent_key. Nothing when no live pane matches. Checked against list-panes,
+# because `display-message -t` on a dead pane still succeeds (it falls back
+# to another target), so it can't tell gone from alive.
+resolve_pane() {
+    local want="$1"
+    tmux list-panes -a -F '#{pane_id} #{@agent_key}' 2>/dev/null | awk -v w="$want" '
+        $1 == w || ($2 == w && w !~ /^%/) { print $1; exit }'
+}
+
 # The transcript of the claude running in PANE (via ~/.claude/sessions/<pid>.json).
 transcript_of() {
     local pane="$1" tty pid sf raw sid="" cwd=""
@@ -128,6 +139,8 @@ transcript_of() {
 cmd_last() {
     local pane="${1:-}" f
     [ -n "$pane" ] || die "usage: abby-delegate last PANE"
+    pane="$(resolve_pane "$pane")"
+    [ -n "$pane" ] || { echo "(no such pane: ${1})"; return 0; }
     f="$(transcript_of "$pane")" || { echo "(no transcript yet)"; return 0; }
     # The last assistant message that has text, from the file's tail.
     tail -n 600 "$f" | jq -rs '
@@ -145,25 +158,56 @@ cmd_wait() {
         esac
     done
     [ -n "$pane" ] || die "usage: abby-delegate wait PANE [--timeout S]"
-    tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || die "no such pane: $pane"
-    local start s seen=0
+    local given="$pane"
+    pane="$(resolve_pane "$pane")"
+    [ -n "$pane" ] || die "no such pane: $given"
+    # A turn has ended when the agent is idle/done with @agent_detail_kind
+    # done and @agent_since (the epoch its state last changed) at or after
+    # that turn's @agent_turn_start. A delegated child's finish goes
+    # running -> idle (the tmux side marks it seen, so it never sits in
+    # NEEDS YOU), so this reads the stamps rather than waiting for "done",
+    # and a turn shorter than one poll still counts: its since is >= the
+    # wait's start. needs-input / failed end the wait at once.
+    #
+    # Already finished when the wait starts: a turn that BEGAN in the last
+    # 30 s is the one abby just kicked off (a short reply can end before
+    # `spawn` even returns: measured ~2 s on Haiku), so it's the answer.
+    # An older finish means either abby just sent a follow-up that hasn't
+    # started yet, or the turn ended a while ago: a new turn shows up within
+    # a few seconds of a message, so give it 15 s (grace); if none starts,
+    # the finish already there is the answer.
+    local start s since kind tstart line grace=15 had_finish=0
     start=$(date +%s)
     while :; do
-        s="$(state_of "$pane")"
+        [ -n "$(resolve_pane "$pane")" ] || { s=gone; break; }
+        line="$(tmux display-message -p -t "$pane" \
+            '#{@agent_state}|#{@agent_since}|#{@agent_detail_kind}|#{@agent_turn_start}' 2>/dev/null)" \
+            || { s=gone; break; }
+        IFS='|' read -r s since kind tstart <<<"$line"
+        since="${since%% *}"
+        [[ "$since" =~ ^[0-9]+$ ]] || since=0
+        [[ "$tstart" =~ ^[0-9]+$ ]] || tstart=0
         case "$s" in
-        running) seen=1 ;;
-        done|needs-input|failed) [ "$seen" = 1 ] || [ $(( $(date +%s) - start )) -gt 20 ] && break ;;
-        idle) [ "$seen" = 1 ] && break ;;
-        "") s="gone"; break ;;
+        needs-input|failed) break ;;
+        running) had_finish=0 ;;
+        idle|done)
+            if [ "$kind" = done ] && [ "$since" -ge "$tstart" ]; then
+                [ "$since" -ge "$start" ] && break
+                [ "$tstart" -ge $(( start - 30 )) ] && break
+                had_finish=1
+                [ $(( $(date +%s) - start )) -ge "$grace" ] && break
+            fi ;;
+        "") s=starting ;;  # claude not up yet (a child has no birth mark)
         esac
         if [ $(( $(date +%s) - start )) -ge "$timeout" ]; then
             printf 'state: %s (still going after %ss; wait again or read_pane)\n' "$s" "$timeout"
             return 0
         fi
-        sleep 3
+        sleep 2
     done
+    [ "$had_finish" = 1 ] && [ "$s" != gone ] && s="$s (finished before this wait)"
     printf 'state: %s\n---\n' "$s"
-    cmd_last "$pane"
+    [ "$s" = gone ] || cmd_last "$pane"
 }
 
 cmd_list() {
