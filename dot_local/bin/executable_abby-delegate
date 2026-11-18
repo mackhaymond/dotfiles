@@ -35,6 +35,27 @@ LOG="$DELEG/spawned.tsv"   # epoch pane window dir
 die() { printf 'abby-delegate: %s\n' "$*" >&2; exit 1; }
 sq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
+# "<window id> <pane id>" of the agent this runs for. abby runs its shell
+# commands through the pty MCP, whose shells live in their own windows (the
+# hidden agents session), so TMUX_PANE is the pty's pane, not abby's. A pty
+# window names its owner in @pty_claude_pid: the agent's tab is the pane on
+# that process's terminal. Anything else (a plain shell in abby's own pane,
+# tests) is TMUX_PANE itself.
+parent_of() {
+    local pane="$1" cpid tty
+    cpid="$(tmux show-options -wqv -t "$pane" @pty_claude_pid 2>/dev/null)"
+    if [[ "$cpid" =~ ^[0-9]+$ ]]; then
+        tty="$(ps -o tty= -p "$cpid" 2>/dev/null | tr -d ' ')"
+        if [ -n "$tty" ] && [ "$tty" != "??" ]; then
+            local hit
+            hit="$(tmux list-panes -a -F '#{pane_tty} #{window_id} #{pane_id}' 2>/dev/null \
+                | awk -v t="/dev/$tty" '$1 == t { print $2, $3; exit }')"
+            [ -n "$hit" ] && { printf '%s\n' "$hit"; return 0; }
+        fi
+    fi
+    tmux display-message -p -t "$pane" '#{window_id} #{pane_id}' 2>/dev/null
+}
+
 need_tmux() {
     [ -n "${TMUX_PANE:-}" ] || die "not inside tmux (no TMUX_PANE): can't open a tab beside abby"
 }
@@ -71,8 +92,9 @@ cmd_spawn() {
     [ -n "$model" ] && auto+=" --model $(sq "$model")"
     auto+=" \"\$(<$(sq "$file"))\""
 
-    local wid
-    wid="$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}')" || die "can't find abby's window"
+    local wid ppane
+    read -r wid ppane <<<"$(parent_of "$TMUX_PANE")"
+    [[ "$wid" == @* ]] || die "can't find abby's window"
     local out
     # -d keeps every client's view where it is. But with -d, commands chained
     # after new-window in its list target the CURRENT window (abby's), not the
@@ -80,7 +102,13 @@ cmd_spawn() {
     # as agent-launch.sh's does; it is skipped (claude's SessionStart marks
     # the tab within 1-3 s) and the parent mark goes in a second call with an
     # explicit -t, long before claude has started in the new shell.
-    out="$(tmux new-window -d -a -t "$wid" -c "$dir" -P -F '#{pane_id} #{window_id}' \
+    # After abby's last child in its session (else right after abby), so
+    # children line up in the order they were started.
+    local after="$wid" w p
+    while read -r w p; do
+        [ "$p" = "$wid" ] && after="$w"
+    done < <(tmux list-windows -t "$wid" -F '#{window_id} #{@agent_parent}' 2>/dev/null)
+    out="$(tmux new-window -d -a -t "$after" -c "$dir" -P -F '#{pane_id} #{window_id}' \
         -e "ZSH_AUTOSTART=$auto" -e AGENT_PTY= 2>&1)" \
         || die "new-window failed: $out"
     out="${out%%$'\n'*}"
@@ -93,7 +121,7 @@ cmd_spawn() {
     # status, no NEEDS YOU of its own; the parent reads as working while it
     # runs). A parent window that is gone makes it a plain agent again.
     tmux set-option -w -t "$win" @agent_parent "$wid" \; \
-        set-option -w -t "$win" @agent_parent_pane "$TMUX_PANE" 2>/dev/null \
+        set-option -w -t "$win" @agent_parent_pane "$ppane" 2>/dev/null \
         || echo "abby-delegate: warning: couldn't mark $win as abby's subagent" >&2
     # S's reconciler, once, now (agent-session-lib.sh kids_reconcile, bash
     # 4+): puts @agent_kids on abby's window at once, so an abby turn that
