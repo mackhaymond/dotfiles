@@ -8,7 +8,10 @@
 #       `claude` with PROMPT as its first message (- = read it from stdin).
 #       Opened in the background (no focus change). Born an agent the
 #       workspace's way (@agent_birth), so it gets a letter, a sidebar row,
-#       status hooks. Prints: <pane id> <window id> <letter or ->.
+#       status hooks. Marked as abby's subagent: @agent_parent (abby's
+#       window id) and @agent_parent_pane on the new window, which the
+#       sidebar / tab dots / CuaNotch fold under abby. Prints: <pane id>
+#       <window id> <letter or ->.
 #   abby-delegate wait PANE [--timeout SECONDS]
 #       Until that agent's turn ends (done / needs-input / failed / back to
 #       idle after running), at most SECONDS (default 540, under the pty
@@ -70,13 +73,27 @@ cmd_spawn() {
     local wid
     wid="$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}')" || die "can't find abby's window"
     local out
+    # -d keeps every client's view where it is. But with -d, commands chained
+    # after new-window in its list target the CURRENT window (abby's), not the
+    # new one (measured on a test server), so @agent_birth can't ride along
+    # as agent-launch.sh's does; it is skipped (claude's SessionStart marks
+    # the tab within 1-3 s) and the parent mark goes in a second call with an
+    # explicit -t, long before claude has started in the new shell.
     out="$(tmux new-window -d -a -t "$wid" -c "$dir" -P -F '#{pane_id} #{window_id}' \
-        -e "ZSH_AUTOSTART=$auto" -e AGENT_PTY= \; run-shell -C "#{?@agent_birth,#{@agent_birth} claude,}" 2>&1)" \
+        -e "ZSH_AUTOSTART=$auto" -e AGENT_PTY= 2>&1)" \
         || die "new-window failed: $out"
     out="${out%%$'\n'*}"
     local pane win key=""
     read -r pane win <<<"$out"
     [[ "$pane" == %* ]] || die "new-window gave no pane: $out"
+    # @agent_parent = abby's window id, @agent_parent_pane = its pane: the
+    # tab is abby's subagent, not an agent of its own. The sidebar, tab
+    # dots, notifications and CuaNotch fold it under the parent (no own
+    # status, no NEEDS YOU of its own; the parent reads as working while it
+    # runs). A parent window that is gone makes it a plain agent again.
+    tmux set-option -w -t "$win" @agent_parent "$wid" \; \
+        set-option -w -t "$win" @agent_parent_pane "$TMUX_PANE" 2>/dev/null \
+        || echo "abby-delegate: warning: couldn't mark $win as abby's subagent" >&2
     printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$pane" "$win" "$dir" >>"$LOG"
     # The letter is handed out by the birth/hooks; give it a moment.
     for _ in 1 2 3 4 5 6 7 8 9 10; do
