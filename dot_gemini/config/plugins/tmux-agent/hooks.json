@@ -2,22 +2,26 @@
   "tmux-agent": {
     "SessionStart": [
       { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" idle agy >/dev/null 2>&1; echo '{}'", "timeout": 10 },
-      { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/copilot-agy-session-track.sh\" agy start >/dev/null 2>&1; echo '{}'", "timeout": 5 }
+      { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/copilot-agy-session-track.sh\" agy start >/dev/null 2>&1; echo '{}'", "timeout": 5 },
+      { "type": "command", "command": "\"$HOME/.local/bin/cua-notch-agent-hook\" agy SessionStart >/dev/null 2>&1; echo '{}'", "timeout": 5 }
     ],
     "PreInvocation": [
-      { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" running agy >/dev/null 2>&1; echo '{}'", "timeout": 10 }
+      { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" running agy >/dev/null 2>&1; echo '{}'", "timeout": 10 },
+      { "type": "command", "command": "\"$HOME/.local/bin/cua-notch-agent-hook\" agy PreInvocation >/dev/null 2>&1; echo '{}'", "timeout": 5 }
     ],
     "PostToolUse": [
       {
         "matcher": "*",
         "hooks": [
-          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" heartbeat agy >/dev/null 2>&1; echo '{}'", "timeout": 5 }
+          { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" heartbeat agy >/dev/null 2>&1; echo '{}'", "timeout": 5 },
+          { "type": "command", "command": "\"$HOME/.local/bin/cua-notch-agent-hook\" agy PostToolUse >/dev/null 2>&1; echo '{}'", "timeout": 5 }
         ]
       }
     ],
     "Stop": [
       { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" done agy >/dev/null 2>&1; echo '{\"decision\":\"allow\"}'", "timeout": 10 },
-      { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/copilot-agy-session-track.sh\" agy start >/dev/null 2>&1; echo '{\"decision\":\"allow\"}'", "timeout": 5 }
+      { "type": "command", "command": "bash \"$HOME/.config/tmux/scripts/copilot-agy-session-track.sh\" agy start >/dev/null 2>&1; echo '{\"decision\":\"allow\"}'", "timeout": 5 },
+      { "type": "command", "command": "\"$HOME/.local/bin/cua-notch-agent-hook\" agy Stop >/dev/null 2>&1; echo '{\"decision\":\"allow\"}'", "timeout": 5 }
     ]
   }
 }

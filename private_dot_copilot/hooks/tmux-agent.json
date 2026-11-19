@@ -3,29 +3,37 @@
   "hooks": {
     "sessionStart": [
       { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" idle copilot", "timeoutSec": 10 },
-      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/copilot-agy-session-track.sh\" copilot start", "timeoutSec": 5 }
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/copilot-agy-session-track.sh\" copilot start", "timeoutSec": 5 },
+      { "type": "command", "bash": "\"$HOME/.local/bin/cua-notch-agent-hook\" copilot sessionStart >/dev/null 2>&1", "timeoutSec": 5 }
     ],
     "userPromptSubmitted": [
-      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" running copilot", "timeoutSec": 10 }
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" running copilot", "timeoutSec": 10 },
+      { "type": "command", "bash": "\"$HOME/.local/bin/cua-notch-agent-hook\" copilot userPromptSubmitted >/dev/null 2>&1", "timeoutSec": 5 }
     ],
     "postToolUse": [
-      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" heartbeat copilot", "timeoutSec": 5 }
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" heartbeat copilot", "timeoutSec": 5 },
+      { "type": "command", "bash": "\"$HOME/.local/bin/cua-notch-agent-hook\" copilot postToolUse >/dev/null 2>&1", "timeoutSec": 5 }
     ],
     "postToolUseFailure": [
-      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" heartbeat copilot", "timeoutSec": 5 }
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" heartbeat copilot", "timeoutSec": 5 },
+      { "type": "command", "bash": "\"$HOME/.local/bin/cua-notch-agent-hook\" copilot postToolUseFailure >/dev/null 2>&1", "timeoutSec": 5 }
     ],
     "notification": [
-      { "type": "command", "matcher": "permission_prompt|elicitation_dialog", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" needs-approval copilot", "timeoutSec": 10 }
+      { "type": "command", "matcher": "permission_prompt|elicitation_dialog", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" needs-approval copilot", "timeoutSec": 10 },
+      { "type": "command", "matcher": "permission_prompt|elicitation_dialog", "bash": "\"$HOME/.local/bin/cua-notch-agent-hook\" copilot notification >/dev/null 2>&1", "timeoutSec": 5 }
     ],
     "agentStop": [
-      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" done copilot", "timeoutSec": 10 }
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" done copilot", "timeoutSec": 10 },
+      { "type": "command", "bash": "\"$HOME/.local/bin/cua-notch-agent-hook\" copilot agentStop >/dev/null 2>&1", "timeoutSec": 5 }
     ],
     "errorOccurred": [
-      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" failed copilot", "timeoutSec": 10 }
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" failed copilot", "timeoutSec": 10 },
+      { "type": "command", "bash": "\"$HOME/.local/bin/cua-notch-agent-hook\" copilot errorOccurred >/dev/null 2>&1", "timeoutSec": 5 }
     ],
     "sessionEnd": [
       { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/agent-tab-indicator.sh\" clear copilot", "timeoutSec": 5 },
-      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/copilot-agy-session-track.sh\" copilot end", "timeoutSec": 5 }
+      { "type": "command", "bash": "bash \"$HOME/.config/tmux/scripts/copilot-agy-session-track.sh\" copilot end", "timeoutSec": 5 },
+      { "type": "command", "bash": "\"$HOME/.local/bin/cua-notch-agent-hook\" copilot sessionEnd >/dev/null 2>&1", "timeoutSec": 5 }
     ]
   }
 }
