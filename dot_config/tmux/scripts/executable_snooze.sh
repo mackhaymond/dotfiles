@@ -73,8 +73,10 @@
 # slow path run: under a non-blocking lock dir (an overlapping tick skips), no
 # tmux server → exit 0 (the file stays, so a wake missed while the server was
 # down — or the laptop asleep or off — fires at the first tick after it is
-# up); the due entries (jq over history.jsonl) go to `closed-tabs.sh wake`,
-# the due windows (`stash.sh rows`) to `stash.sh wake`; their
+# up), and likewise while a restart's restore is pending
+# (@space_restore_pending, docs/spaces.md: a wake then would race resurrect);
+# the due entries (jq over history.jsonl) go to `closed-tabs.sh wake`, the
+# due windows (`stash.sh rows`) to `stash.sh wake`; their
 # "<label>\t<session>" lines make ONE toast ("⏰ back: X in main", or
 # "⏰ back: 3 snoozed tabs — X, Y, Z"); then reschedule.
 # The scripts that change an alarm run `reschedule` themselves (detached);
@@ -812,6 +814,18 @@ do_wake_due() {
     trap 'rmdir "'"$lock"'" 2>/dev/null' EXIT
     tmux list-sessions >/dev/null 2>&1 || return 0  # no server: the next tick
     now=$(now_epoch)
+    # A restart's restore still running (space.sh's @space_restore_pending:
+    # an epoch under 15 min old, not `done`, the rule space.sh's sync uses):
+    # resurrect is rebuilding sessions, and a wake now would land in main or
+    # make a space resurrect is about to make. Nothing this tick — no wakes,
+    # no failure counted — and the alarms stay due, so the next tick after
+    # the restore takes them.
+    local pend
+    pend=$(tmux show -gqv @space_restore_pending 2>/dev/null)
+    case "$pend" in
+        ''|*[!0-9]*) ;;
+        *) if [ $((now - pend)) -lt 900 ]; then log "restore pending — wakes deferred"; return 0; fi ;;
+    esac
     # Due, not given up, and not waiting out a failed try's retry.
     fails_load
     while IFS="$TAB" read -r key wake title; do

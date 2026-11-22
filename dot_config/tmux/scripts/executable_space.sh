@@ -66,6 +66,11 @@
 #                             it back), unregister, kill the session. Never main
 #   move-menu WID CLIENT      menu of spaces; picking one runs move-to
 #   move-to WID SID CLIENT    move window WID to the end of space SID
+#   revive NAME DIR [COLOR]   a snoozed tab's wake, its space gone: print the
+#                             session id it goes to (the session named NAME,
+#                             else the space on DIR, else a new space NAME at
+#                             DIR in COLOR, at the end, with its home); status
+#                             1 when DIR is no folder (see cmd_revive)
 #
 # Outside tmux ($TMUX empty) everything but `preview` refuses: a plain `tmux`
 # there reaches the DEFAULT server, whatever server the caller had in mind.
@@ -2099,6 +2104,103 @@ cmd_adopt_pending() {
   printf 'space %s: %s (%s)\n' "${idx:-?}" "$sname" "$dir"
 }
 
+# revive NAME DIR [COLOR]: the space a snoozed tab woke up for (closed-tabs.sh
+# and stash.sh `wake`, from snooze.sh's timer), when the space it was snoozed
+# from is gone (docs/spaces.md "Snoozed tabs bring their space back"). Prints
+# the session id to put the tab in; status 1 (nothing printed) when there is
+# none, and the caller falls back to main. In order:
+#   1. a visible session named NAME: that one, nothing made (a second tab of
+#      the same closed space lands in the one the first revived);
+#   2. a visible space on DIR (space_for_dir; ~ is main's): that one;
+#   3. DIR not a folder: status 1;
+#   4. else a new space at DIR, named NAME if no session has that name and it
+#      is not a hidden one, else new_space_name DIR. With spaces on it is
+#      made under the registry lock with its registry row already written,
+#      at the END of the order (a new number, nobody renumbered) and in COLOR
+#      when that is a colour (else the usual pick), so the session-created
+#      sync keeps both; then home_now, so its home and dashboard are there
+#      before the tab arrives (no stray extra shell). A name that is still
+#      registered (no session, but not closed) is made again IN PLACE: its
+#      row, number, colour and (if it is one) folder kept. Spaces off: a
+#      plain `new-session -d` at DIR, no registry.
+# snooze.sh defers wakes while a restart's restore is pending, so this never
+# races resurrect rebuilding sessions.
+# No client is switched and nothing is said: the wake is silent and
+# snooze.sh makes its one toast. Like everything here it needs $TMUX; the
+# callers run from launchd and set it to the server they talk to.
+cmd_revive() {
+  local name="${1:-}" dir="${2:-}" color="${3:-}" info sid hid new
+  read_opts || return 1
+  [[ -n "$name" ]] || return 1
+  # Visible session named NAME (`=name:`: a bare `=name` reads as a window).
+  revive_named() {
+    info="$(t display-message -p -t "=$1:" "#{session_id}${US}#{@space_hidden}" 2>/dev/null)" || return 1
+    IFS="$US" read -r sid hid <<<"$info"
+    [[ "$sid" == \$* && "$hid" != 1 ]] && ! is_hidden_name "$1"
+  }
+  revive_named "$name" && { printf '%s\n' "$sid"; return 0; }
+  [[ -n "$dir" && -d "$dir" ]] || return 1
+  dir="$(cd -- "$dir" 2>/dev/null && pwd -P)" || return 1
+  sid="$(space_for_dir "$dir")" || return 1
+  [[ "$sid" == \$* ]] && { printf '%s\n' "$sid"; return 0; }
+  # A free, non-hidden NAME, else what any new space on DIR would be called.
+  revive_name() {
+    new="$name"
+    if is_hidden_name "$new" || t has-session -t "=$new" 2>/dev/null; then
+      new="$(new_space_name "$dir")" || return 1
+    fi
+    [[ -n "$new" ]]
+  }
+  if [[ "$SPACES_ON" != "on" ]]; then
+    revive_name || return 1
+    sid="$(t new-session -d -s "$new" -c "$dir" -P -F '#{session_id}' 2>/dev/null)"
+    sid="${sid%%$'\n'*}"
+    [[ "$sid" == \$* ]] || return 1
+    notify
+    printf '%s\n' "$sid"
+    return 0
+  fi
+  reg_lock || return 1
+  # Again under the lock: a revive racing this one (two snoozed tabs of one
+  # space) may have made it while this one waited.
+  if revive_named "$name"; then reg_unlock; printf '%s\n' "$sid"; return 0; fi
+  sid="$(space_for_dir "$dir")"
+  if [[ "$sid" == \$* ]]; then reg_unlock; printf '%s\n' "$sid"; return 0; fi
+  revive_name || { reg_unlock; return 1; }
+  # Still REGISTERED with no session (not closed: prefix Q unregisters; a
+  # restart's restore not done yet, a kill-session no sync has seen): made
+  # again in place, as sync's reconcile would, at its registered folder when
+  # that is one, keeping its row, its number and its colour. Otherwise a new
+  # row, LAST, in the colour the space had; its session-created sync waits
+  # for this lock and then finds it registered, at this folder, in this
+  # colour.
+  local ri cdir="$dir"
+  reg_load
+  ri="$(reg_find "$new")"
+  ((ri >= 0)) && [[ -d "${R_PATH[ri]}" ]] && cdir="${R_PATH[ri]}"
+  sid="$(t new-session -d -s "$new" -c "$cdir" -P -F '#{session_id}' 2>/dev/null)"
+  sid="${sid%%$'\n'*}"
+  [[ "$sid" == \$* ]] || { reg_unlock; return 1; }
+  if ((ri >= 0)); then
+    R_PATH[ri]="$cdir"
+    if ! is_color "${R_COLOR[ri]:-}"; then
+      if is_color "$color"; then R_COLOR[ri]="$color"; else R_COLOR[ri]="$(pick_color "$new")"; fi
+    fi
+  else
+    R_NAME+=("$new") R_PATH+=("$dir") R_COLOR+=("")
+    if is_color "$color"; then
+      R_COLOR[${#R_NAME[@]} - 1]="$color"
+    else
+      R_COLOR[${#R_NAME[@]} - 1]="$(pick_color "$new")"
+    fi
+  fi
+  reg_save
+  reg_unlock
+  home_now "$sid"
+  notify
+  printf '%s\n' "$sid"
+}
+
 # A folder's listing, for the pickers' previews (~ allowed).
 preview_dir() {
   local d="${1:-}"
@@ -2184,8 +2286,9 @@ main() {
     pending-open) cmd_pending_open "$@" ;;
     pending-go) cmd_pending_go "${1:-}" "${2:-}" ;;
     adopt-pending) cmd_adopt_pending "${1:-}" "${2:-}" ;;
+    revive) cmd_revive "${1:-}" "${2:-}" "${3:-}" ;;
     *)
-      echo "usage: space.sh sync [load|reconcile] | shell N SID [CLIENT] | next|prev SID [CLIENT] | toggle SID [CLIENT] | close SID [CLIENT] | move-menu WID [CLIENT] | move-to WID SID [CLIENT] | respawn-home PANE | new-space CLIENT | open-dir DIR [CLIENT] | pick-tab shell|agent CLIENT | new-tab shell|agent SID|DIR [CLIENT] | preview-tab KEY | create [--name] QUERY [CLIENT] [space|shell|agent] | new-hint MODE on|off QUERY | is-english TEXT | ask-claude [--no-popup] CLIENT TEXT | pending-open [--print] WID [CLIENT] | pending-go N [CLIENT] | adopt-pending WID DIR" >&2
+      echo "usage: space.sh sync [load|reconcile] | shell N SID [CLIENT] | next|prev SID [CLIENT] | toggle SID [CLIENT] | close SID [CLIENT] | move-menu WID [CLIENT] | move-to WID SID [CLIENT] | respawn-home PANE | new-space CLIENT | open-dir DIR [CLIENT] | pick-tab shell|agent CLIENT | new-tab shell|agent SID|DIR [CLIENT] | preview-tab KEY | create [--name] QUERY [CLIENT] [space|shell|agent] | new-hint MODE on|off QUERY | is-english TEXT | ask-claude [--no-popup] CLIENT TEXT | pending-open [--print] WID [CLIENT] | pending-go N [CLIENT] | adopt-pending WID DIR | revive NAME DIR [COLOR]" >&2
       return 2
       ;;
   esac

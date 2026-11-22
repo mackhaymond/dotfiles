@@ -18,7 +18,7 @@ letter; 52 in all).
 |---|---|
 | `tmux.conf.tmpl` | `set -g @spaces on` (the one flag) and `@space_hidden_sessions` (the one hidden list), near the top; `source-file -F "#{d:current_file}/spaces.conf"` as the last line |
 | `spaces.conf` | everything else: hooks, status lines, keys. `%if @spaces on … %else … %endif` |
-| `scripts/space.sh` | the logic a format can't do: `sync`, `shell N` (no key runs it any more; its twin `agent N`, ⌘N's, went when ⌘N became the space key), `next`/`prev`, `toggle`, `close`, `move-menu`/`move-to`, `respawn-home`, `new-space`, `open-dir`, `pick-tab`/`new-tab`, `create` (the pickers' ^N, with `new-hint`/`enter-key`/`new-key`, its fzf helpers, and `catalog-sync`), `ask-claude`/`pending-open`/`pending-go`/`pending-prompt`/`adopt-pending` (pending spaces) |
+| `scripts/space.sh` | the logic a format can't do: `sync`, `shell N` (no key runs it any more; its twin `agent N`, ⌘N's, went when ⌘N became the space key), `next`/`prev`, `toggle`, `close`, `move-menu`/`move-to`, `respawn-home`, `new-space`, `open-dir`, `pick-tab`/`new-tab`, `create` (the pickers' ^N, with `new-hint`/`enter-key`/`new-key`, its fzf helpers, and `catalog-sync`), `ask-claude`/`pending-open`/`pending-go`/`pending-prompt`/`adopt-pending` (pending spaces), `revive` (a snoozed tab's space, below) |
 | `scripts/space-dash.sh` | the home dashboard (below); `--once` draws one frame |
 | `tests/test_spaces.py` | real `-L` servers, keys sent with `send-keys -K`, clicks as SGR reports |
 | `wezterm.lua.tmpl` | the digit rows: CTRL+N, OPT+N and CMD+N each send one private key (below) |
@@ -296,6 +296,44 @@ only marks and numbers: no homes, no registry writes (a pending older than
 the registry or overwrite its folders, since they may run before the
 load-time reconcile. Resurrect saves home windows like any other; they come
 back as shells named `home` and are adopted.
+
+### Snoozed tabs bring their space back
+
+"It should bring back the space" (Mack, 2026-11-18). A snoozed tab whose
+space was closed (prefix Q) while it slept wakes into that space made again,
+not into main. The folder and colour are recorded when the tab leaves,
+because `close` unregisters them: stash.sh's park sets `@stash_origin_dir`
+and `@stash_origin_color` beside `@stash_origin` (unset with it), and every
+`closed-tabs.sh close` writes `space_dir` and `space_color` into the history
+entry (not for a hidden session's tab; a window closed out of the stash
+takes its origin's). Only the WAKE uses them (`closed-tabs.sh wake`'s
+reopen_one, `stash.sh wake`'s wake_target): when the origin session is gone
+(by id and by name) they run `space.sh revive NAME DIR [COLOR]`, which
+prints the session id to use: the visible session named NAME if there is one
+(so several tabs of one closed space wake into one space, and a NAME now
+taken by another folder's space takes them as before), else the visible
+space on DIR, else a new space at DIR named NAME (or `new_space_name` when
+NAME is taken or hidden), made under the registry lock with its row written
+at the END of the order (a new number, nobody renumbered) in COLOR (else the
+usual pick), then `home_now`, so its home and dashboard are there before the
+tab lands. A NAME still in the registry with no session (not closed: a
+restore not done yet) is made again IN PLACE instead, keeping its row,
+number, colour and folder, as the load-time reconcile would. Spaces off: a
+plain `new-session -d` at DIR. No client moves and
+nothing is said (snooze.sh's one toast says "in NAME"). A missing folder, an
+entry or window from before this (no recorded folder), or a session that
+exists but is hidden: main, as before. A hand unpark or ⌘Z reopen never
+revives (it lands where you are). The callers run from launchd with no
+`$TMUX`, which space.sh refuses: they set it, for that call, to the
+`socket_path` of the server their own `tmux` reaches. space.sh is
+`$SPACE_SH`, else the server's `@space_sh`. A snooze across a restart keeps
+them: stash.sh's restart sidecar mirrors them as fields 13 and 14 (after
+`@stash_wake`'s 12) and restore-state puts them back. And no wake runs while
+a restart's restore is pending (`@space_restore_pending` an epoch under
+15 min old, not `done`: the rule sync uses, "Registry" above): snooze.sh's
+`wake-due` logs "restore pending — wakes deferred" and leaves the alarms
+due, uncounted, for the first tick after it, so a wake never races
+resurrect rebuilding the very space it would revive.
 
 ## Status (flag on: ONE line)
 

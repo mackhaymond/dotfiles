@@ -303,8 +303,11 @@ class ColdRestart(Base):
         rows = [r.split(SEP) for r in (self.rdir / "stash-state.tsv").read_text().splitlines()]
         parked = [r for r in rows if r[0] == "stash"]
         self.assertEqual(len(parked), 1)
-        self.assertEqual(len(parked[0]), 11)
+        # Fields 11 (frozen) and 13 (the origin space's folder: main's, the
+        # temp dir); 12 (no alarm) empty in between, 14 (no colour) left off.
+        self.assertEqual(len(parked[0]), 13)
         self.assertEqual(json.loads(parked[0][10]), frozen)
+        self.assertEqual((parked[0][11], parked[0][12]), ("", self.tmp))
         idx = parked[0][1]
 
         # The restart: the server dies with its processes; resurrect rebuilds

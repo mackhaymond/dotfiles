@@ -46,9 +46,11 @@
 #
 # SNOOZED is stashed with an alarm: a pinned entry with "wake_at" (epoch).
 # snooze.sh's timer runs `wake` when it is due: the tab comes back at the end
-# of its own space's bar (main when that is gone or hidden), no client moved,
-# and snooze.sh says so. Unpinning, forgetting or reopening a snoozed entry
-# drops its alarm. Every wake_at change runs `snooze.sh reschedule`, detached
+# of its own space's bar, no client moved, and snooze.sh says so. A space
+# closed meanwhile is brought back (`space.sh revive`, from the entry's
+# space_dir / space_color, which every close records); main when the space
+# is hidden, or the entry predates space_dir, or the revive fails.
+# Unpinning, forgetting or reopening a snoozed entry drops its alarm. Every wake_at change runs `snooze.sh reschedule`, detached
 # (SNOOZE_SH names another, for tests).
 #
 # The picker has three sections: Snoozed (snoozed entries and stash windows,
@@ -177,6 +179,37 @@ reschedule() {
 
 # stash_sh <args…>: run stash.sh, status 1 when there is none.
 stash_sh() { [ -f "$STASH_SH" ] || return 1; bash "$STASH_SH" "$@"; }
+
+# revive_space <name> <dir> [<colour>]: `space.sh revive` (docs/spaces.md
+# "Snoozed tabs bring their space back"): prints the session id a woken entry
+# whose space is gone goes to — that space made again at <dir>, or the one
+# already named <name> or on <dir>; status 1 when there is none. space.sh is
+# SPACE_SH (a path, tests), else the server's @space_sh (a command line,
+# spaces.conf sets it), else the installed one. It refuses to run without
+# $TMUX (a plain `tmux` would mean the default server whatever the caller
+# had in mind), and the wake runs from launchd with none: then $TMUX is set,
+# for that one call, to the server this script's own `tmux` is talking to
+# (its socket_path), so both speak to the same server. stash.sh has the same.
+revive_space() {
+    local t="${TMUX:-}" s out
+    local -a cmd=()
+    [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 1
+    if [ -n "${SPACE_SH:-}" ]; then
+        cmd=(bash "$SPACE_SH")
+    else
+        s=$(tmux show -gqv @space_sh 2>/dev/null)
+        [ -n "$s" ] || s="$HOME/.config/tmux/scripts/space.sh"
+        read -r -a cmd <<<"$s"
+        [ "${#cmd[@]}" -eq 1 ] && cmd=(bash "${cmd[0]}")
+    fi
+    if [ -z "$t" ]; then
+        t=$(tmux display-message -p '#{socket_path},#{pid},0' 2>/dev/null)
+        [ -n "$t" ] || return 1
+    fi
+    out=$(TMUX="$t" "${cmd[@]}" revive "$1" "$2" "${3:-}" </dev/null 2>/dev/null) || return 1
+    out="${out##*$'\n'}"
+    case "$out" in '$'[0-9]*) printf '%s\n' "$out" ;; *) return 1 ;; esac
+}
 # Refresh @stash_count after a pin-state change. Detached: stash.sh's
 # `stash` calls `close --pin` while it holds its own lock, and a publish-count
 # that waited on that lock must not hold this close up. An older stash.sh
@@ -888,18 +921,29 @@ do_close() {
 
     local info
     info=$(tmux display-message -p -t "$pane" \
-        '#{pane_id}|#{pane_pid}|#{pane_tty}|#{session_name}|#{session_id}|#{session_created}|#{window_index}|#{pane_current_path}|#{@stash_origin}|#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}' 2>/dev/null)
+        '#{pane_id}|#{pane_pid}|#{pane_tty}|#{session_name}|#{session_id}|#{session_created}|#{window_index}|#{pane_current_path}|#{@stash_origin}|#{session_path}|#{@space_color}|#{@space_hidden}|#{@space_hidden_sessions}|#{@stash_origin_dir}|#{@stash_origin_color}|#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}' 2>/dev/null)
     # display-message against a dead target can succeed with an empty
     # expansion — test the expansion, not the exit status.
-    local pane_id pane_pid pane_tty sess tsess tcreated widx cwd origin label
-    IFS='|' read -r pane_id pane_pid pane_tty sess tsess tcreated widx cwd origin label <<<"$info"
+    local pane_id pane_pid pane_tty sess tsess tcreated widx cwd origin spath scolor shid hlist odir ocolor label
+    IFS='|' read -r pane_id pane_pid pane_tty sess tsess tcreated widx cwd origin spath scolor shid hlist odir ocolor label <<<"$info"
     [ -n "$pane_id" ] || return 1
+    # The space's folder and colour (space_dir / space_color): if the space
+    # is closed (prefix Q forgets them) before a snoozed entry wakes, the wake
+    # brings it back from these (reopen_one, space.sh revive). Not for a
+    # hidden session's tab: that is no space to bring back.
+    local sdir="" scol=""
+    if [ "$shid" != 1 ] && [ "$sess" != stash ] && [[ " $hlist " != *" $sess "* ]]; then
+        sdir=$spath scol=$scolor
+    fi
     # A window closed out of the stash (stash.sh kill-many, ⌃x in the picker)
     # belongs to the space it was parked from, not to the hidden session that
     # held it: recorded there, at the end of its bar, so a reopen lands it
-    # back where it came from rather than in a hidden session.
+    # back where it came from rather than in a hidden session — with the
+    # folder and colour stash.sh recorded for that space when it parked it.
     if [ -n "$origin" ] && ! session_visible "$tsess" >/dev/null; then
         sess=$origin tsess="" tcreated="" widx=99999
+        sdir=$odir scol=$ocolor
+        [[ " $hlist " == *" $sess "* ]] && sdir="" scol=""
     fi
 
     local ts id
@@ -994,10 +1038,12 @@ do_close() {
     rec=$(jq -cn --arg id "$id" --arg ts "$ts" --arg sess "$sess" --arg widx "$widx" \
         --arg tsess "$tsess" --arg tcreated "$tcreated" \
         --arg cwd "$cwd" --arg label "$label" --arg tool "$tool" --arg sid "$sid" --arg cmd "$cmd" \
-        --arg pin "$pin" --arg wake "$wake" \
+        --arg pin "$pin" --arg wake "$wake" --arg sdir "$sdir" --arg scol "$scol" \
         '{id: $id, ts: ($ts|tonumber), session: $sess, tmux_session: $tsess,
           session_created: $tcreated, index: ($widx|tonumber), cwd: $cwd,
           label: $label, tool: $tool, session_id: $sid, cmd: $cmd}
+         + (if $sdir != "" then {space_dir: $sdir} else {} end)
+         + (if $scol != "" then {space_color: $scol} else {} end)
          + (if $pin == "1" then {pinned: true, stashed_ts: ($ts|tonumber)} else {} end)
          + (if $wake != "" then {wake_at: ($wake|tonumber)} else {} end)')
 
@@ -1423,8 +1469,9 @@ fallback_session() {
 }
 
 # Prints "<window id><US><session name>". With mode `wake` (a snoozed entry
-# coming back by itself) it goes to the END of its own session's bar, or of
-# main (no client is asked), with -d so no client's view moves, and says
+# coming back by itself) it goes to the END of its own session's bar — that
+# space brought back first when it was closed meanwhile (revive_space) — or
+# of main (no client is asked), with -d so no client's view moves, and says
 # nothing.
 #   reopen_one <rec> <client_session> <client_tty> [wake]
 reopen_one() {
@@ -1449,6 +1496,19 @@ reopen_one() {
         target="=$sess:"
     fi
     [ -n "$target" ] && name=$(session_visible "$target")
+    # A wake whose space is GONE (found neither by id nor by name) and whose
+    # entry knows that space's folder brings the space back (space.sh revive:
+    # at that folder, named and coloured as it was, at the end of the order);
+    # a second entry of the same space then finds it by name. A space that
+    # exists but is hidden, an entry from before space_dir, or a revive that
+    # fails: the old fallback (main).
+    if [ -z "$name" ] && [ -z "$target" ] && [ "$mode" = wake ]; then
+        local sdir scol sid
+        sdir=$(jq -r '.space_dir // empty' <<<"$rec"); scol=$(jq -r '.space_color // empty' <<<"$rec")
+        if [ -n "$sess" ] && [ -n "$sdir" ] && sid=$(revive_space "$sess" "$sdir" "$scol"); then
+            name=$(session_visible "$sid")
+        fi
+    fi
     if [ -z "$name" ]; then
         if [ "$mode" = wake ]; then
             name=$(fallback_session "" "") || return 1

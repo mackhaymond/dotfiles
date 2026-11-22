@@ -304,13 +304,20 @@ class Server(unittest.TestCase):
         self.assertEqual(self.first_sighting(before)["@agent_state"], "")   # a plain tab, as before
 
     def reopen(self, rec):
-        fn = 'eval "$(awk \'/^reopen_one\\(\\) \\{/{f=1} f{print} f&&/^\\}/{exit}\' "$1")"\n'
-        prog = 'msg() { :; }\n' + fn + 'reopen_one "$2" main\n'
+        # reopen_one with the helpers it calls, cut out the same way:
+        # session_visible and fallback_session (where the tab may land), and
+        # revive_space stubbed (only a snooze's wake revives a closed space,
+        # and these reopen by hand).
+        cut = lambda name: 'eval "$(awk \'/^%s\\(\\) \\{/{f=1} f{print} f&&/^\\}/{exit}\' "$1")"\n' % name
+        prog = ("msg() { :; }\nrevive_space() { return 1; }\nUS=$'\\x1f'\n"
+                + cut("session_visible") + cut("fallback_session") + cut("reopen_one")
+                + 'reopen_one "$2" main\n')
         before = self.rows()
         r = subprocess.run(["bash", "-c", prog, "reopen", str(CLOSED), json.dumps(rec)],
                            env=self.script_env(), capture_output=True, text=True, timeout=10)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertRegex(r.stdout.strip(), r"^@\d+$")
+        # "<window id><US><session>": the new window, in main (its session).
+        self.assertRegex(r.stdout.strip(), r"^@\d+\x1fmain$")
         return self.first_sighting(before)
 
     def rec(self, **kw):

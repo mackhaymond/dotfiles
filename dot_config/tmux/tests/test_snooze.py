@@ -60,6 +60,8 @@ case "$1" in
         [ -f "$FAKE_DIR/win$w" ] || exit 1
         cat "$FAKE_DIR/win$w"; exit 0 ;;
     show-options) cat "$FAKE_DIR/option" 2>/dev/null; exit 0 ;;
+    # space.sh's restore marker (wake-due defers while it is pending).
+    show) [ "$3" = @space_restore_pending ] && cat "$FAKE_DIR/restore-pending" 2>/dev/null; exit 0 ;;
 esac
 exit 0
 '''
@@ -411,6 +413,33 @@ class WakeDue(Base):
         self.assertEqual(self.calls("closed-tabs.sh"), [])
         self.assertEqual(self.calls("notify.sh"), [])
         self.assertEqual(self.next_file.read_text().strip(), str(self.now - 5))   # kept for the next tick
+
+    def test_a_pending_restore_defers_every_wake(self):
+        # A restart's restore is running (space.sh's @space_restore_pending,
+        # an epoch under 15 min old): nothing wakes, no failure is counted,
+        # the alarm stays due. `done`, or a marker past 15 min: wakes as usual.
+        self.next_file.write_text(f"{self.now - 5}\n")
+        self.history(entry("A", pinned=True, wake_at=self.now - 5))
+        self.rows(("@5", self.now - 5))
+        (self.fake / "restore-pending").write_text(f"{self.now - 60}\n")
+        self.run_script("wake-due")
+        self.assertEqual(self.calls("closed-tabs.sh"), [])
+        self.assertNotIn("wake", [c[0] for c in self.calls("stash.sh")])
+        self.assertEqual(self.calls("notify.sh"), [])
+        self.assertEqual(self.next_file.read_text().strip(), str(self.now - 5))   # still due
+        self.assertFalse((self.sdir / "failures").exists())
+        self.assertIn("restore pending — wakes deferred", (self.sdir / "log").read_text())
+        self.assertFalse((self.sdir / "wake.lock").exists())
+        for marker in ("done", str(self.now - 901)):
+            with self.subTest(marker=marker):
+                (self.fake / "calls.log").unlink(missing_ok=True)
+                self.history(entry("A", pinned=True, wake_at=self.now - 5))
+                self.rows(("@5", self.now - 5))
+                self.next_file.write_text(f"{self.now - 5}\n")
+                (self.fake / "restore-pending").write_text(marker + "\n")
+                self.run_script("wake-due")
+                self.assertEqual(self.calls("closed-tabs.sh"), [["wake", "A"]])
+                self.assertIn(["wake", "@5"], self.calls("stash.sh"))
 
     def test_held_lock_skips(self):
         (self.sdir / "wake.lock").mkdir()

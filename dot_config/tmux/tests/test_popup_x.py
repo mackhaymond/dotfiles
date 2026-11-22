@@ -85,11 +85,13 @@ class ConfigShape(unittest.TestCase):
                 self.assertIn(FALLBACK, text, path.name)
                 self.assertNotRegex(text, r"\(-x C -y C", path.name)
         self.assertEqual(seen, {"codexbar-usage-key.sh", "executable_agent-roster.py", "executable_closed-tabs.sh",
-                                "executable_space.sh", "executable_stash.sh", "executable_toggle-btop-popup.sh"})
+                                "executable_snooze.sh", "executable_space.sh", "executable_stash.sh",
+                                "executable_toggle-btop-popup.sh"})
         # Each popup call in them passes it (space.sh builds its menu's argv);
         # a call may continue over `\`-ended lines (stash.sh's sel-kill box).
+        # snooze.sh: its Custom… prompt popup (its menu passes it too).
         for name, n in (("executable_closed-tabs.sh", 1), ("executable_stash.sh", 3),
-                        ("executable_toggle-btop-popup.sh", 2)):
+                        ("executable_snooze.sh", 1), ("executable_toggle-btop-popup.sh", 2)):
             text = (SCRIPTS / name).read_text()
             calls = re.findall(r"tmux display-popup(?:[^\n]*\\\n)*[^\n]*", text)
             self.assertEqual(len(calls), n, name)

@@ -195,7 +195,7 @@ class Snooze(Base):
         self.script("publish")
         rows = [r.split(SEP) for r in (self.rdir / "stash-state.tsv").read_text().splitlines()]
         parked = [r for r in rows if r[0] == "stash"]
-        self.assertEqual(len(parked[0]), 12)
+        self.assertEqual(len(parked[0]), 13)                       # 13: the origin's folder
         self.assertEqual(parked[0][11], self.when)
         self.assertEqual(json.loads(parked[0][10])[0]["cmd"], "sleep 1000")
 
@@ -333,9 +333,67 @@ class Snooze(Base):
         self.script("publish")
         row = [r.split(SEP) for r in (self.rdir / "stash-state.tsv").read_text().splitlines()
                if r.startswith("stash" + SEP)][0]
-        self.assertEqual(len(row), 12)
-        self.assertEqual((row[10], row[11]), ("", self.when))
+        self.assertEqual(len(row), 13)                             # 13: the origin's folder
+        self.assertEqual((row[10], row[11], row[12]), ("", self.when, self.tmp))
         self.assertTrue(row[9])                                    # icwd still there
+
+    # -- the origin space survives a restart (fields 13, 14) -------------------
+    def restart_into_stash(self):
+        """A restart: a new server whose `stash` holds one shell where the
+        parked window was (as resurrect brings it back); restore-state run."""
+        self.reap()
+        self.start_server()
+        self.keep_one()
+        self.t("new-session", "-d", "-s", "stash", "-c", str(self.work))
+        w = self.t("list-windows", "-t", "stash", "-F", "#{window_id}")
+        self.wait_prompt(self.pane(w))
+        self.script("restore-state")
+        return w
+
+    def test_a_snooze_across_a_restart_still_brings_its_closed_space_back(self):
+        space = Path(self.tmp, "proj dir")
+        space.mkdir()
+        self.t("new-session", "-d", "-s", "work", "-c", str(space))
+        self.t("set", "-t", "work", "@space_color", "#89b4fa")
+        self.new_window("work")                                   # a spare: never the last tab
+        w = self.new_window("work")
+        self.script("snooze", self.when, w)
+        self.assertEqual((self.opt(w, "@stash_origin_dir"), self.opt(w, "@stash_origin_color")),
+                         (str(space), "#89b4fa"))
+        self.script("publish")
+        sidecar = self.rdir / "stash-state.tsv"
+        [row] = [r.split(SEP) for r in sidecar.read_text().splitlines() if r.startswith("stash" + SEP)]
+        self.assertEqual((len(row), row[11], row[12], row[13]), (14, self.when, str(space), "#89b4fa"))
+
+        w2 = self.restart_into_stash()
+        self.assertEqual((self.opt(w2, "@stash_origin"), self.opt(w2, "@stash_wake")), ("work", self.when), self.log())
+        self.assertEqual((self.opt(w2, "@stash_origin_dir"), self.opt(w2, "@stash_origin_color")),
+                         (str(space), "#89b4fa"))
+        # `work` did not come back with the restart: the wake makes it again
+        # at its folder (spaces off on this bare server: a plain session).
+        self.env["SPACE_SH"] = str(STASH_PATH.with_name("executable_space.sh"))
+        out = self.script("wake", w2)
+        self.assertTrue(out.endswith("\twork\n"), out)
+        self.assertEqual(self.session_of(w2), "work")
+        self.assertEqual(self.t("display", "-p", "-t", "=work:", "#{session_path}"), str(space))
+        for o in ("@stash_origin", "@stash_origin_dir", "@stash_origin_color"):
+            self.assertEqual(self.opt(w2, o), "", o)
+
+    def test_a_twelve_field_row_still_restores(self):
+        # A sidecar from before fields 13/14: everything it has comes back,
+        # and the window simply has no recorded folder (a wake then lands in
+        # main, as before).
+        self.keep_one()
+        w = self.new_window()
+        self.script("snooze", self.when, w)
+        self.script("publish")
+        sidecar = self.rdir / "stash-state.tsv"
+        rows = [r.split(SEP) for r in sidecar.read_text().splitlines()]
+        sidecar.write_text("".join(SEP.join(r[:12]) + "\n" for r in rows))
+        w2 = self.restart_into_stash()
+        self.assertEqual((self.opt(w2, "@stash_origin"), self.opt(w2, "@stash_wake")), ("main", self.when), self.log())
+        self.assertEqual(self.opt(w2, "@stash_origin_dir"), "")
+        self.assertTrue(self.script("wake", w2).endswith("\tmain\n"))
 
 
 if __name__ == "__main__":

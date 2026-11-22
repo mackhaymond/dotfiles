@@ -16,6 +16,7 @@ Run with unittest or pytest.
 """
 import fcntl
 import importlib.util
+import json
 import os
 from pathlib import Path
 import pty
@@ -24,6 +25,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import threading
@@ -39,6 +41,7 @@ DASH = HERE / "scripts" / "executable_space-dash.sh"
 NOTIFY = HERE / "scripts" / "executable_notify.sh"
 ROSTER = HERE / "scripts" / "executable_agent-roster.py"
 STASH = HERE / "scripts" / "executable_stash.sh"
+CLOSED = HERE / "scripts" / "executable_closed-tabs.sh"
 STASH_ROOT_CONF = HERE / "scripts" / "stash-root-keys.conf"
 WEZTERM =HERE.parent / "wezterm" / "wezterm.lua.tmpl"
 TMUX = shutil.which("tmux")
@@ -236,7 +239,7 @@ class ConfigShape(unittest.TestCase):
 
     def test_script_refuses_without_tmux(self):
         env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
-        for args in (["sync"], ["close", "$1"], ["move-to", "@1", "$1"], ["shell", "1", "$0"]):
+        for args in (["sync"], ["close", "$1"], ["move-to", "@1", "$1"], ["shell", "1", "$0"], ["revive", "x", "/tmp"]):
             r = subprocess.run(["bash", str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=10)
             self.assertEqual(r.returncode, 3, args)
             self.assertIn("refusing", r.stderr)
@@ -2795,6 +2798,272 @@ class Create(Server):
         self.t("kill-window", "-t", wid)                                               # claude quit, shell exited
         self.wait(lambda: f"pending:{wid}" in self.registry_names(), False)
         self.wait(lambda: self.index_of("other"), "3")
+
+
+# -- snoozed tabs bring their space back (docs/spaces.md) ----------------------
+class ReviveBase(Server):
+    """A space `proj` (and `zed`), real closed-tabs.sh / stash.sh / space.sh.
+
+    The scripts run with HOME in the temp dir (nothing of the real ~ is read or
+    written: stash.sh's log is STASH_LOG, its describe is off, ai-exec is a
+    stub that fails, closed-tabs.sh's state is XDG_STATE_HOME), stash.sh and
+    snooze.sh stand-ins where a script only notifies them, and the panes are a
+    bare zsh (ZDOTDIR in the temp dir)."""
+
+    def setUp(self):
+        super().setUp()
+        self.t("set-environment", "-g", "ZDOTDIR", self.tmp)
+        self.t("set", "-g", "default-shell", "/bin/zsh")
+        bin_ = Path(self.tmp, "bin")
+        bin_.mkdir()
+        (bin_ / "ai-exec").write_text("#!/bin/sh\nexit 1\n")             # describe never leaves
+        (bin_ / "ai-exec").chmod(0o755)
+        (bin_ / "python3").symlink_to(os.path.realpath(sys.executable))   # no pyenv shim with HOME here
+        noop = Path(self.tmp, "noop.sh")
+        noop.write_text("#!/bin/sh\nexit 0\n")
+        noagent = Path(self.tmp, "closed-stub.sh")                        # stash.sh's: no agent anywhere
+        noagent.write_text("#!/bin/sh\necho 'closed-tabs: not stashed — no agent in this pane' >&2\nexit 3\n")
+        stash_self = Path(self.tmp, "stash-self")
+        stash_self.write_text(f'#!/bin/sh\nexec bash "{STASH}" "$@"\n')
+        stash_self.chmod(0o755)
+        Path(self.tmp, "logs").mkdir()
+        Path(self.tmp, "ard").mkdir()
+        self.extra = dict(
+            HOME=self.tmp, TMPDIR=self.tmp + "/", PATH=f"{bin_}:{self.env.get('PATH', '/usr/bin:/bin')}",
+            NOTIFY_SH=os.path.join(self.tmp, "no-notify"), NOTIFY_TMUX="true",
+            STASH_SH=str(noop), SNOOZE_SH=str(noop), CLOSED_TABS_SH=str(noagent), STASH_SELF=str(stash_self),
+            STASH_LOG=os.path.join(self.tmp, "logs", "stash.log"), STASH_NO_DESCRIBE="1",
+            TMUX_ASSISTANT_RESURRECT_DIR=os.path.join(self.tmp, "ard"))
+        self.proj = os.path.realpath(os.path.join(self.tmp, "proj"))
+        os.mkdir(self.proj)
+        self.new_session("proj", self.proj)
+        self.new_session("zed", "/usr")
+        if self.flag == "on":
+            for s in ("proj", "zed"):
+                self.wait_home(s)
+            self.wait(lambda: [r[0] for r in self.registered()], ["main", "proj", "zed"])
+
+    def script_env(self):
+        return dict(super().script_env(), **self.extra)
+
+    def bare_env(self):
+        """As launchd runs snooze.sh's wake-due: `env -i`, no TMUX, no locale;
+        a `tmux` on PATH that reaches this server by its socket."""
+        bare = Path(self.tmp, "bare-bin")
+        bare.mkdir(exist_ok=True)
+        (bare / "tmux").write_text(f'#!/bin/sh\nexec "{TMUX}" -S "{self.path}" "$@"\n')
+        (bare / "tmux").chmod(0o755)
+        env = {k: v for k, v in self.extra.items() if k != "PATH"}
+        env.update(PATH=f"{bare}:{self.tmp}/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+                   XDG_STATE_HOME=self.env["XDG_STATE_HOME"])
+        return ["env", "-i", *(f"{k}={v}" for k, v in env.items())]
+
+    def run_sh(self, script, *args, rc=0, bare=False, shell="bash"):
+        cmd = [shell, str(script), *args]
+        r = subprocess.run([*self.bare_env(), *cmd] if bare else cmd, env=None if bare else self.script_env(),
+                           capture_output=True, text=True, timeout=60)
+        if rc is not None:
+            self.assertEqual(r.returncode, rc, (args, r.stdout, r.stderr))
+        return r.stdout
+
+    def registered(self):
+        try:
+            return [l.split("\t") for l in Path(self.registry).read_text().splitlines()]
+        except FileNotFoundError:
+            return []
+
+    def sessions(self):
+        return self.t("list-sessions", "-F", "#{session_name}").split()
+
+    def opt(self, target, name, w=True):
+        return self.t("show", "-wqv" if w else "-qv", "-t", target, name)
+
+    def entries(self):
+        p = Path(self.env["XDG_STATE_HOME"], "tmux-closed-tabs", "history.jsonl")
+        return [json.loads(l) for l in p.read_text().splitlines() if l.strip()] if p.exists() else []
+
+    def tab(self, session="proj"):
+        w = self.new_window(session)
+        p = self.t("display", "-p", "-t", w, "#{pane_id}")
+        self.wait(lambda: bool(self.t("capture-pane", "-p", "-t", p).strip()), True, timeout=10)
+        return w, p
+
+    def closed_entry(self, session="proj"):
+        """A tab of SESSION closed through closed-tabs.sh, then snoozed."""
+        _, p = self.tab(session)
+        self.run_sh(CLOSED, "close", p)
+        e = self.entries()[-1]
+        self.run_sh(CLOSED, "snooze", str(int(time.time()) + 3600), e["id"])
+        return e
+
+    def close_space(self, name):
+        sid = self.t("display", "-p", "-t", f"={name}:", "#{session_id}")
+        r = self.script("close", sid, "")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait(lambda: name in self.sessions(), False)
+        self.wait(lambda: name in [r[0] for r in self.registered()], False)
+
+    def assert_revived(self, name, folder, color, index, tabs):
+        """NAME is a visible space again: at FOLDER, in COLOR, numbered INDEX
+        (the end), its home + dashboard in front, and TABS other windows."""
+        self.assertEqual(self.sessions().count(name), 1, self.sessions())
+        self.assertEqual(self.opt(f"={name}:", "@space_hidden", w=False), "")
+        self.assertEqual(self.t("display", "-p", "-t", f"={name}:", "#{session_path}"), folder)
+        home = self.wait_home(name)
+        self.assertEqual(self.t("display", "-p", "-t", f"={name}:^", "#{window_id}"), home)
+        self.wait(lambda: len(self.dash_panes(name)), 1)
+        rows = self.t("list-windows", "-t", f"={name}", "-F", "#{window_id}").split()
+        self.assertEqual(len(rows), 1 + tabs, rows)
+        self.assertEqual(self.homes(name), [home])                            # no stray second shell
+        self.wait(lambda: self.opt(f"={name}:", "@space_color", w=False), color)
+        self.wait(lambda: self.opt(f"={name}:", "@space_index", w=False), index)
+        self.assertEqual(self.registered()[-1], [name, folder, color])        # the end of the order
+
+
+@unittest.skipUnless(TMUX and shutil.which("jq") and os.path.exists("/bin/zsh"), "tmux / jq / zsh missing")
+class SnoozeRevivesItsSpace(ReviveBase):
+    def test_a_snoozed_entry_wakes_into_its_closed_space_made_again_from_launchd(self):
+        e = self.closed_entry()
+        self.assertEqual((e["session"], e["space_dir"], e["space_color"]), ("proj", self.proj, "#cba6f7"))
+        self.close_space("proj")
+        # proj's colour goes to the next space: the revived one must get its
+        # own back, not the usual pick (which would now be pink).
+        self.new_session("n4", "/usr")
+        self.wait(lambda: self.opt("=n4:", "@space_color", w=False), "#cba6f7")
+        # space.sh refuses an empty $TMUX: the wake sets it for that call. And
+        # macOS's bash 3.2 (closed-tabs.sh must stay 3.2-safe).
+        out = self.run_sh(CLOSED, "wake", e["id"], bare=True, shell="/bin/bash")
+        self.assertTrue(out.endswith("\tproj\n"), out)
+        self.assert_revived("proj", self.proj, "#cba6f7", index="4", tabs=1)
+        self.assertEqual(self.opt("=n4:", "@space_index", w=False), "3")      # nobody renumbered
+        self.assertEqual(self.entries(), [])
+
+    def test_two_snoozed_windows_of_a_closed_space_wake_into_one(self):
+        when = str(int(time.time()) + 3600)
+        w1, _ = self.tab()
+        w2, _ = self.tab()
+        for w in (w1, w2):
+            self.assertEqual(self.run_sh(STASH, "snooze", when, w), f"w:{w}\n")
+        self.assertEqual((self.opt(w1, "@stash_origin_dir"), self.opt(w1, "@stash_origin_color")),
+                         (self.proj, "#cba6f7"))
+        self.close_space("proj")
+        # As launchd runs it: no $TMUX (stash.sh derives it for space.sh from
+        # its own server's socket_path), no locale, macOS's bash 3.2.
+        out = self.run_sh(STASH, "wake", w1, w2, bare=True, shell="/bin/bash")
+        self.assertEqual([l.split("\t")[1] for l in out.splitlines()], ["proj", "proj"], out)
+        self.assert_revived("proj", self.proj, "#cba6f7", index="3", tabs=2)
+        for w in (w1, w2):
+            self.assertEqual(self.t("display", "-p", "-t", w, "#{session_name}"), "proj")
+            for o in ("@stash_origin", "@stash_origin_dir", "@stash_origin_color", "@stash_wake"):
+                self.assertEqual(self.opt(w, o), "", o)
+        self.assertEqual(self.t("display", "-p", "-t", "=proj:", "#{session_attached}"), "0")   # nobody moved there
+
+    def test_a_space_still_registered_is_made_again_in_place(self):
+        # Registered with no session, NOT closed (a restart's restore still
+        # pending; within the first 90 s a killed session's row stays): made
+        # again in its own row, number and colour, never moved to the end.
+        self.t("set", "-g", "@space_restore_pending", str(int(time.time())))
+        self.t("kill-session", "-t", "=proj")
+        self.wait(lambda: "proj" in self.sessions(), False)
+        self.assertEqual([r[0] for r in self.registered()], ["main", "proj", "zed"])
+        r = self.script("revive", "proj", self.proj, "#f5e0dc")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.t("display", "-p", "-t", r.stdout.strip(), "#{session_name}"), "proj")
+        self.assertEqual(self.registered(), [["main", self.env["HOME"], "#b4befe"], ["proj", self.proj, "#cba6f7"],
+                                             ["zed", "/usr", "#94e2d5"]])
+        self.wait(lambda: (self.opt("=proj:", "@space_index", w=False), self.opt("=zed:", "@space_index", w=False)),
+                  ("2", "3"))
+        self.wait(lambda: self.opt("=proj:", "@space_color", w=False), "#cba6f7")
+        self.assertEqual(self.homes("proj"), [self.t("display", "-p", "-t", "=proj:^", "#{window_id}")])
+
+    def test_a_hand_unpark_never_revives(self):
+        w, _ = self.tab()
+        self.run_sh(STASH, "snooze", str(int(time.time()) + 3600), w)
+        self.close_space("proj")
+        self.run_sh(STASH, "unstash-many", w)
+        self.assertNotIn("proj", self.sessions())
+        self.assertNotEqual(self.t("display", "-p", "-t", w, "#{session_name}"), "stash")
+
+    def test_its_name_taken_by_another_folder_takes_the_tab(self):
+        w, _ = self.tab()
+        self.run_sh(STASH, "snooze", str(int(time.time()) + 3600), w)
+        e = self.closed_entry()
+        self.close_space("proj")
+        other = os.path.realpath(os.path.join(self.tmp, "other"))
+        os.mkdir(other)
+        self.new_session("proj", other)
+        self.wait_home("proj")
+        self.assertTrue(self.run_sh(STASH, "wake", w).endswith("\tproj\n"))
+        self.assertTrue(self.run_sh(CLOSED, "wake", e["id"]).endswith("\tproj\n"))
+        self.assertEqual(self.sessions().count("proj"), 1)
+        self.assertEqual(self.t("display", "-p", "-t", "=proj:", "#{session_path}"), other)
+        self.assertEqual(len(self.t("list-windows", "-t", "=proj", "-F", "#{window_id}").split()), 3)
+
+    def test_a_space_already_on_its_folder_takes_the_tab(self):
+        e = self.closed_entry()
+        self.close_space("proj")
+        self.new_session("mine", self.proj)
+        self.wait_home("mine")
+        self.assertTrue(self.run_sh(CLOSED, "wake", e["id"]).endswith("\tmine\n"))
+        self.assertNotIn("proj", self.sessions())
+
+    def test_no_recorded_folder_or_a_gone_one_lands_in_main(self):
+        # A window parked by an older stash.sh (no folder), an entry from
+        # before space_dir, and one whose folder has gone since: main.
+        w, _ = self.tab()
+        self.run_sh(STASH, "snooze", str(int(time.time()) + 3600), w)
+        self.t("set", "-wu", "-t", w, "@stash_origin_dir")
+        old = self.closed_entry()
+        gone = self.closed_entry()
+        hist = Path(self.env["XDG_STATE_HOME"], "tmux-closed-tabs", "history.jsonl")
+        rows = []
+        for e in self.entries():
+            if e["id"] == old["id"]:
+                del e["space_dir"]
+            if e["id"] == gone["id"]:
+                e["space_dir"] = os.path.join(self.tmp, "no-such-folder")
+            rows.append(json.dumps(e))
+        hist.write_text("\n".join(rows) + "\n")
+        self.close_space("proj")
+        self.assertTrue(self.run_sh(STASH, "wake", w).endswith("\tmain\n"))
+        out = self.run_sh(CLOSED, "wake", old["id"], gone["id"])
+        self.assertEqual([l.split("\t")[1] for l in out.splitlines()], ["main", "main"], out)
+        self.assertNotIn("proj", self.sessions())
+
+    def test_revive_directly(self):
+        # A hidden name is never made: the folder's own name instead. Not a
+        # folder: status 1, nothing printed, nothing made.
+        x = os.path.realpath(os.path.join(self.tmp, "x"))
+        os.mkdir(x)
+        before = self.sessions()
+        r = self.script("revive", "agents", os.path.join(self.tmp, "nope"))
+        self.assertEqual((r.returncode, r.stdout), (1, ""))
+        self.assertEqual(self.sessions(), before)
+        r = self.script("revive", "agents", x, "#f5e0dc")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.t("display", "-p", "-t", r.stdout.strip(), "#{session_name}"), "x")
+        self.assertEqual(self.opt("=x:", "@space_hidden", w=False), "")
+        self.wait(lambda: self.opt("=x:", "@space_color", w=False), "#f5e0dc")
+        # Again: the same session, by its folder.
+        self.assertEqual(self.script("revive", "agents", x).stdout, r.stdout)
+        self.assertEqual(self.sessions().count("x"), 1)
+
+
+@unittest.skipUnless(TMUX and shutil.which("jq") and os.path.exists("/bin/zsh"), "tmux / jq / zsh missing")
+class SnoozeRevivesItsSpaceOff(ReviveBase):
+    flag = "off"
+
+    def test_spaces_off_just_makes_the_session_again(self):
+        e = self.closed_entry()
+        self.assertEqual(e["space_dir"], self.proj)
+        self.assertNotIn("space_color", e)                                    # no colours when off
+        self.t("kill-session", "-t", "=proj")
+        out = self.run_sh(CLOSED, "wake", e["id"])
+        self.assertTrue(out.endswith("\tproj\n"), out)
+        self.assertEqual(self.t("display", "-p", "-t", "=proj:", "#{session_path}"), self.proj)
+        self.assertEqual(len(self.t("list-windows", "-t", "=proj", "-F", "#{window_id}").split()), 2)
+        self.assertEqual(self.homes("proj"), [])
+        self.assertEqual(self.registered(), [])
 
 
 if __name__ == "__main__":
