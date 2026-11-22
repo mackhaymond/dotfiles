@@ -10,7 +10,7 @@
 # `tmux display-message [-c CLIENT] -- TEXT`, so with no sidebar nothing
 # changes.
 #
-#   notify.sh [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [-T TITLE] [--] TEXT...
+#   notify.sh [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [-T TITLE] [-a ACTION] [--] TEXT...
 #
 #   -c CLIENT  a client as `display-message -c` takes it. Without it: the
 #              calling context's client as tmux resolves it (`#{client_name}`;
@@ -27,6 +27,16 @@
 #   -T TITLE   the card's title instead of the kind's (taken literally: no
 #              tmux formats). The display-message fallback shows the text
 #              alone, as before.
+#   -a ACTION  a shell line a click on the toast runs (taken literally here;
+#              tabs, newlines, RS and US become spaces), on the sidebar's
+#              client: the sidebar hands it to `run-shell -b` (silenced),
+#              with `{client}` made that client shell-quoted and
+#              `#{client_name}` / `#{client_tty}` made its name, then
+#              dismisses the toast (any other tmux format in it is expanded
+#              by run-shell). The card's title ends in ` ›`. Without -a a
+#              click only dismisses. The display-message fallback has no
+#              click: the text alone, as before. E.g. review-nudge.sh:
+#              -a "'…/review.sh' open {client}".
 #   TEXT       the words, joined by spaces; tabs, newlines and the ASCII
 #              separators RS / US become spaces. tmux formats in it are
 #              expanded as display-message would. Empty: nothing is shown.
@@ -38,8 +48,9 @@
 #               racing notifies can share one; a toast is (seq, epoch_ms))
 #   @toast      the recent toasts, oldest first, separated by RS (U+001E):
 #               at most 4 records, each
-#                 seq TAB epoch_ms TAB kind TAB ttl_s TAB client TAB text TAB title
-#               (client "" = every sidebar; title "" = the kind's; ttl_s
+#                 seq TAB epoch_ms TAB kind TAB ttl_s TAB client TAB text TAB title [TAB action]
+#               (client "" = every sidebar; title "" = the kind's; action,
+#               only written when -a gave one, "" = none; ttl_s
 #               capped at 3600, as the sidebar caps it). Each post drops the
 #               expired records (epoch_ms + ttl_s*1000 <= now, ttl capped the
 #               same way), those stamped more than 60 s in the future (a
@@ -52,14 +63,15 @@
 #               columns and 4+ free rows; smaller, the newest as one compact
 #               row, in any sidebar of 2+ rows (the free rows are those under
 #               the key-table marks and the selection hint, which stay on
-#               top).
+#               top). (Records without the action field, from before it,
+#               still parse and are carried as they are.)
 # then the sidebar's focus notice is posted (notifyutil, in the background)
 # so open sidebars redraw at once. Which clients have a sidebar is
 # `@sidebar_clients` (kept by the sidebar word for word beside
 # `@sidebar_pids`); a listed sidebar counts only while its pid lives. Every
 # message is also logged: epoch TAB kind TAB client TAB text (TAB title when
-# -T gave one), in ~/.local/state/tmux-notify/log, trimmed to its last 500
-# lines past 1000.
+# -T gave one; TAB title TAB action when -a gave one), in
+# ~/.local/state/tmux-notify/log, trimmed to its last 500 lines past 1000.
 #
 # Cost: two tmux calls (one read: client, sidebars, seq, the current toasts
 # and the expanded text together; one write or the display-message).
@@ -87,16 +99,17 @@ case ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} in
         fi ;;
 esac
 
-client= kind=info ttl= title=
+client= kind=info ttl= title= action=
 while (( $# )); do
     case $1 in
-        -c|-k|-t|-T)
+        -c|-k|-t|-T|-a)
             if (( $# < 2 )); then shift; break; fi
             case $1 in
                 -c) client=$2 ;;
                 -k) kind=$2 ;;
                 -t) ttl=$2 ;;
                 -T) title=$2 ;;
+                -a) action=$2 ;;
             esac
             shift 2 ;;
         --) shift; break ;;
@@ -124,6 +137,8 @@ text=${text//[$'\t\r\n'$RS$US]/ }
 [[ -z ${text//[[:space:]]/} ]] && exit 0
 title=${title//[$'\t\r\n'$RS$US]/ }
 [[ -z ${title//[[:space:]]/} ]] && title=
+action=${action//[$'\t\r\n'$RS$US]/ }
+[[ -z ${action//[[:space:]]/} ]] && action=
 
 # Split like a shell would (a quoted or escaped socket path keeps its spaces).
 tmux_cmd=(${(Q)${(z)${NOTIFY_TMUX:-tmux}}})
@@ -209,11 +224,15 @@ if (( toast )); then
     (( ${#recs} > 3 )) && recs=("${(@)recs[-3,-1]}")
     tttl=$ttl
     (( tttl > 3600 )) && tttl=3600
-    recs+=("$seq"$'\t'"$ms"$'\t'"$kind"$'\t'"$tttl"$'\t'"$target"$'\t'"$shown"$'\t'"$title")
+    rec="$seq"$'\t'"$ms"$'\t'"$kind"$'\t'"$tttl"$'\t'"$target"$'\t'"$shown"$'\t'"$title"
+    # The action, only when given (records without one keep 7 fields).
+    [[ -n $action ]] && rec+=$'\t'"$action"
+    recs+=("$rec")
     payload=${(pj:$RS:)recs}
     # tmux reads an argument ending in `;` as a command separator (the `;`
     # dropped) and one ending in `\;` as a literal `;`: keep the value's own
-    # (only its very end matters, the newest record's title or text).
+    # (only its very end matters, the newest record's action, title or
+    # text).
     [[ $payload == *';' ]] && payload="${payload%;}\\;"
     "${tmux_cmd[@]}" set-option -gq @toast_seq "$seq" \; \
         set-option -gq @toast "$payload" >/dev/null 2>&1
@@ -239,7 +258,11 @@ log=${NOTIFY_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-notify/log}
 {
     [[ -d ${log:h} ]] || mkdir -p -- "${log:h}"
     tab=$'\t'
-    print -r -- "${EPOCHSECONDS:-$(date +%s)}$tab$kind$tab$target$tab$shown${title:+$tab$title}" >>"$log"
+    line="${EPOCHSECONDS:-$(date +%s)}$tab$kind$tab$target$tab$shown"
+    if [[ -n $action ]]; then line+="$tab$title$tab$action"
+    elif [[ -n $title ]]; then line+="$tab$title"
+    fi
+    print -r -- "$line" >>"$log"
     integer n=$(wc -l <"$log")
     if (( n > 1000 )); then
         tail -n 500 -- "$log" >"$log.$$" && mv -f -- "$log.$$" "$log"

@@ -81,7 +81,7 @@ pub struct Held {
     pub session: String,
     /// Its lifetime letter (`@agent_key`), when it is listed (not parked,
     /// not in a hidden session).
-    pub letter: Option<char>,
+    pub letter: Option<crate::menu::letters::Letter>,
 }
 
 impl Phase {
@@ -208,7 +208,7 @@ pub struct Windows {
     /// Every window by id → (its session, its letter when listed): where a
     /// [`Held`] row jumps. A window linked into two sessions: a shown
     /// session's row first.
-    pub places: HashMap<String, (String, Option<char>)>,
+    pub places: HashMap<String, (String, Option<crate::menu::letters::Letter>)>,
 }
 
 /// A row's label: `label` (the agent's `@agent_summary`), else its
@@ -390,7 +390,7 @@ pub fn windows(snap: &Snapshot) -> Windows {
     // A hidden session (the stash, `agents`) letters nothing: a parked
     // window's stale `@agent_key` may name another window by now. (A
     // pending space's claude is the exception: listed, lettered.)
-    let mut places: HashMap<String, (String, Option<char>)> = HashMap::new();
+    let mut places: HashMap<String, (String, Option<crate::menu::letters::Letter>)> = HashMap::new();
     let seen = |w: &&crate::tmux::Window| !w.space_hidden || w.is_pending();
     for w in rows.iter().filter(seen).chain(rows.iter().filter(|w| !seen(w))) {
         let letter = seen(&w).then(|| crate::menu::letters::parse_key(&w.key)).flatten();
@@ -949,7 +949,7 @@ mod tests {
     /// with the letter `places` gives it.
     fn placed(working: &[&str], places: &[(&str, Option<char>)]) -> Windows {
         let ids: Vec<&str> = places.iter().map(|(w, _)| *w).collect();
-        let places = places.iter().map(|(w, c)| (w.to_string(), ("main".to_string(), *c))).collect();
+        let places = places.iter().map(|(w, c)| (w.to_string(), ("main".to_string(), c.map(Into::into)))).collect();
         Windows { places, ..wins(working, &ids) }
     }
 
@@ -973,7 +973,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(st.targets.iter().map(|t| t.held).collect::<Vec<_>>(), [true, false, false]);
-        let p0a = Held { label: "P0a".into(), window_id: "@9".into(), why: "the pane is in copy mode".into(), session: "main".into(), letter: Some('k') };
+        let p0a = Held { label: "P0a".into(), window_id: "@9".into(), why: "the pane is in copy mode".into(), session: "main".into(), letter: Some('k'.into()) };
         let w = placed(&["@9", "@5"], &[("@9", Some('k')), ("@4", Some('a')), ("@5", None)]);
         let got = phase(None, Some(&st), clock(None), &w);
         assert_eq!(got, Some(Phase::Stopping { stopped: 1, n: 3, working: vec!["Busy".into()], held: vec![p0a.clone()] }));
@@ -1092,9 +1092,9 @@ mod tests {
             .join("\n"),
         );
         let p = windows(&snap).places;
-        assert_eq!(p["@1"], ("main".to_string(), Some('k')));
+        assert_eq!(p["@1"], ("main".to_string(), Some('k'.into())));
         assert_eq!(p["@2"], ("stash".to_string(), None));
-        assert_eq!(p["@3"], ("work".to_string(), Some('d')));
+        assert_eq!(p["@3"], ("work".to_string(), Some('d'.into())));
         assert_eq!(p["@4"], ("main".to_string(), None));
     }
 

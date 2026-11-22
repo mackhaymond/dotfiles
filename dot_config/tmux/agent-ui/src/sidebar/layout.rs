@@ -1136,7 +1136,8 @@ fn marks(bar: &Bar, room: usize) -> Vec<Seg> {
         }
         v
     } else if bar.jump {
-        vec![block(" ⌥W jump ", "crust", "peach"), on(" type a letter ", "peach", "surface1")]
+        let chip = if bar.jump2 { " ⌥W ; jump " } else { " ⌥W jump " };
+        vec![block(chip, "crust", "peach"), on(" type a letter ", "peach", "surface1")]
     } else {
         Vec::new()
     }
@@ -1347,7 +1348,8 @@ fn toast_row(w: usize, hue: Hue, left: Vec<Seg>, right: Vec<Seg>) -> Row {
 /// one, else the kind's) bold in its colour on the first row, the local
 /// time it was posted right-aligned (dim; dropped when narrow); the text
 /// word-wrapped under it into at most `lines` rows, `…` on the last when
-/// more is left. Every row of it dismisses it here.
+/// more is left. Every row of it dismisses it here (one with a click action,
+/// `notify.sh -a`, runs that first, and its title ends in ` ›`).
 ///
 /// ```text
 ///  ┃ ✓ Done                         10:42 ┃
@@ -1357,7 +1359,8 @@ fn toast_card(t: &Toast, w: usize, lines: usize) -> Vec<Row> {
     let (glyph, default, hue) = toast_look(t.kind);
     let iw = inner(w);
     let room = iw.saturating_sub(4);
-    let title = bold(format!("{glyph} {}", t.title.as_deref().unwrap_or(default)), hue);
+    let more = if t.action.is_some() { " ›" } else { "" };
+    let title = bold(format!("{glyph} {}{more}", t.title.as_deref().unwrap_or(default)), hue);
     let at = posted_at(t);
     let right = if !at.is_empty() && dwidth(&title.text) + 1 + dwidth(&at) <= room { vec![seg(at, "overlay2")] } else { vec![] };
     let id = Target::Toast(t.id());
@@ -1998,7 +2001,7 @@ fn held_row(h: &Held, w: usize, bg: Ink) -> Row {
     } else if let Some(n) = fits("", 8) {
         vec![title(n), seg("  ", "text"), ask()]
     } else if let Some(c) = h.letter.filter(|_| room >= BADGE_W + 1 + dwidth(&said)) {
-        vec![block(format!(" {c} "), "text", over(Ink::Pal(HELD_HUE), CAP_TINT, bg)), seg(" ", "text"), ask()]
+        vec![block(c.cap(), "text", over(Ink::Pal(HELD_HUE), CAP_TINT, bg)), seg(" ", "text"), ask()]
     } else {
         // What it asks whole, beside a few cells of title; one too long
         // for that (a reason, not an action) is cut by the row instead.
@@ -2303,9 +2306,9 @@ impl Badge {
         // A dark @space_color would not read as a letter on its own tint.
         let letter_ink = if ink_on(space) == Ink::Pal("crust") { space } else { Ink::Pal("text") };
         match a.letter {
-            Some(c) if self.loud => block(format!(" {c} "), ARMED.0, ARMED.1),
-            Some(c) if filled => block(format!(" {c} "), ink_on(space), space),
-            Some(c) => block(format!(" {c} "), letter_ink, tint),
+            Some(c) if self.loud => block(c.cap(), ARMED.0, ARMED.1),
+            Some(c) if filled => block(c.cap(), ink_on(space), space),
+            Some(c) => block(c.cap(), letter_ink, tint),
             // (Armed: no letter to type, but the column stays one look.)
             None if self.loud => on(" · ", "overlay2", ARMED.1),
             None => on(" ".repeat(BADGE_W), "text", if filled { space } else { tint }),
@@ -2490,7 +2493,7 @@ fn blink_cap(b: Badge, a: &Agent, card: Ink, solid: bool) -> Seg {
     let hue = Ink::Pal(cat_hue(Cat::Working));
     match a.letter {
         _ if b.loud || !solid => b.seg(a, hue, card, true),
-        Some(c) => block(format!(" {c} "), hue, "crust"),
+        Some(c) => block(c.cap(), hue, "crust"),
         None => on(" ".repeat(BADGE_W), "text", "crust"),
     }
 }

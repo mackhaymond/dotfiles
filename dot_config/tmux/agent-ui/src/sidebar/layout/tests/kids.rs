@@ -73,7 +73,7 @@ fn wins(r: &Row) -> Vec<&str> {
         .collect()
 }
 
-fn letter_of(v: &ViewModel, win: &str) -> char {
+fn letter_of(v: &ViewModel, win: &str) -> crate::menu::letters::Letter {
     v.agents().find(|a| a.window_id == win).and_then(|a| a.letter).unwrap_or_else(|| panic!("no letter for {win}"))
 }
 
@@ -147,7 +147,7 @@ fn kids_nest_under_their_parent() {
     // Then the next card: no fourth kid row.
     assert!(!t[p + 5].contains(KID_MARK), "{t:#?}");
     // Letters: every child still has its own, none shared.
-    let mut letters: Vec<char> = v.agents().filter_map(|a| a.letter).collect();
+    let mut letters: Vec<_> = v.agents().filter_map(|a| a.letter).collect();
     letters.sort();
     letters.dedup();
     assert_eq!(letters.len(), 6);

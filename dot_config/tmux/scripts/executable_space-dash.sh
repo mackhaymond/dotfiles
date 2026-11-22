@@ -265,8 +265,9 @@ render() {
   done
   # Then one line per agent (⌥W and its letter reach it), as many as fit above
   # the hint row; a last "+N more" when they do not.
-  local rows=$((H - 5)) n=${#A_STATE[@]} i st glyph gc
+  local rows=$((H - 5)) n=${#A_STATE[@]} i st glyph gc kw=1 pk
   ((rows < 0)) && rows=0
+  for ((i = 0; i < n; i++)); do ((${#A_KEY[i]} > kw)) && kw=${#A_KEY[i]}; done
   LINE="" LW=0; emit
   if ((n == 0)); then
     ((rows)) && { seg "" "  "; seg "$C_DIM" "no agents here · ⌘R starts one"; emit; rows=$((rows - 1)); }
@@ -283,7 +284,9 @@ render() {
     elif [[ "$st" == paused ]]; then glyph="⏸" gc="$C_VIO"
     else glyph="○" gc="$C_DIM"; fi
     seg "" "  "; seg "$gc" "$glyph"; seg "" " "
-    if [[ -n "${A_KEY[i]}" ]]; then seg "$C_SPACE" "${A_KEY[i]}"; else seg "" " "; fi
+    # (Padded to the widest key here: an overflow `;a` is two cells.)
+    printf -v pk '%-*s' "$kw" "${A_KEY[i]}"
+    if [[ -n "${A_KEY[i]}" ]]; then seg "$C_SPACE" "$pk"; else seg "" "$pk"; fi
     seg "" "  "; seg "$C_TEXT" "${A_LABEL[i]//$'\t'/ }"
     [[ -n "${A_DETAIL[i]}" ]] && { seg "" "  "; seg "$C_DIM" "${A_DETAIL[i]//$'\t'/ }"; }
     emit

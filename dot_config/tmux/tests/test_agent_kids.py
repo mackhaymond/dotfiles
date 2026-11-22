@@ -401,6 +401,40 @@ class KidsIndicatorTests(ao.OriginHarness):
         self.assertEqual((self.opt("@agent_detail_kind"), self.opt("@agent_detail")), ("done", "All done."))
         self.assertEqual(self.wopt(p, "@agent_kids"), "1 0")         # its turn is over
 
+    def test_child_question_stands_until_a_look(self):
+        # The 2026-11-18 abby-delegate run (@3853): a child's AskUserQuestion
+        # stays needs-input and surfaced on the parent through its own
+        # Notification twin (Mack not looking); only a look discharges it -
+        # there, ⌥S's jump to the child (agent-jump.sh -> clear-current).
+        # Discharged, it is idle + @agent_pending with seen_at on since's
+        # epoch and the question kept, and still BUSY on the parent ("1 1":
+        # a gate Mack is answering), its ask no longer surfaced.
+        p = self.make_child()
+        self.prompt("Delegation test", "u1")
+        cwd = str(self.root)
+        self.hook("needs-approval", "claude", payload={
+            "session_id": "s1", "cwd": cwd, "hook_event_name": "PermissionRequest",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "Pick a colour.", "header": "Colour",
+                                          "options": [{"label": "Red"}, {"label": "Blue"}]}]}})
+        self.hook("needs-approval", "claude", payload={
+            "session_id": "s1", "cwd": cwd, "hook_event_name": "Notification",
+            "notification_type": "permission_prompt",
+            "message": "Claude needs your permission to use AskUserQuestion"})
+        self.assertEqual(self.opt("@agent_state"), "needs-input")
+        self.assertEqual(self.wopt(p, "@agent_kids_ask"), TAB.join([self.win, "needs-input", "Pick a colour."]))
+        self.assertEqual(self.wopt(p, "@agent_kids"), "1 1")
+        self.clear_current()
+        self.assertEqual(self.opt("@agent_state"), "idle")
+        self.assertEqual(self.opt("@agent_since").split(" ")[0], self.opt("@agent_seen_at"))
+        self.assertTrue(self.has("@agent_pending"))
+        self.assertEqual(self.opt("@agent_detail"), "Pick a colour.")
+        r = subprocess.run(["bash", "-c", '. "$1"; kids_reconcile', "_", str(LIB)], env=self.env,
+                           text=True, capture_output=True, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.wopt(p, "@agent_kids"), "1 1")
+        self.assertFalse(self.whas(p, "@agent_kids_ask"))
+
     def test_plain_child_of_a_dead_parent_finishes_done(self):
         p = self.make_child()
         self.prompt("build it", "u1")

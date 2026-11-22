@@ -2118,21 +2118,24 @@ cmd_preview_tab() {
   esac
   local sid="\$${key#s:}" rows k home letter summary state wname cmd path
   rows="$(t list-windows -t "$sid" -F "#{?#{@agent_state},a,s}${US}#{@space_home}${US}#{@agent_key}${US}#{@agent_summary}${US}#{@agent_state}${US}#{window_name}${US}#{pane_current_command}${US}#{pane_current_path}" 2>/dev/null)" || return 0
-  local n=0 mark
+  local n=0 mark sep
   # Shells as the status line marks them: home unlettered (⌘N reaches it),
   # the others by their ⌥W letter, · until they have one.
   printf 'shells\n'
   while IFS="$US" read -r k home letter summary state wname cmd path; do
     [[ "$k" == s ]] || continue
     if [[ "$home" == 1 ]]; then mark=" " cmd=home; else mark="${letter:-·}"; fi
-    printf '  %s  %-10s %s\n' "$mark" "$cmd" "$(printf '%s\n' "$path" | tilde_paths)"
+    # (An overflow key `;a` is two cells: one pad less, the columns kept.)
+    sep="  "; [[ "$mark" == \;? ]] && sep=" "
+    printf '  %s%s%-10s %s\n' "$mark" "$sep" "$cmd" "$(printf '%s\n' "$path" | tilde_paths)"
   done <<<"$rows"
   printf '\nagents\n'
   n=0
   while IFS="$US" read -r k home letter summary state wname cmd path; do
     [[ "$k" == a ]] || continue
     n=$((n + 1))
-    printf '  %s  %s  (%s)\n' "${letter:--}" "${summary:-$wname}" "$state"
+    sep="  "; [[ "$letter" == \;? ]] && sep=" "
+    printf '  %s%s%s  (%s)\n' "${letter:--}" "$sep" "${summary:-$wname}" "$state"
   done <<<"$rows"
   ((n)) || printf '  none\n'
 }

@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# review-nudge — every so often, ask Mack to review his old agents.
+#
+#   review-nudge.sh check            evaluate, and maybe toast (the timer tick:
+#                                    LaunchAgent com.mackhaymond.tmux-review-nudge,
+#                                    every 600 s)
+#   review-nudge.sh check --dry-run  print the decision; post nothing, write
+#   review-nudge.sh --dry-run        nothing (the state file and log untouched)
+#
+# THE RULE. A nudge goes out when
+#     (old agents >= 3  OR  letters ran out)
+#     AND no nudge in the last 4 hours
+#     AND the tmux server runs with at least one client attached.
+#   old agents     idle 8h+, as the review popup counts them: `review.sh count`
+#                  (it runs `agent-ui review --count` and prints an integer);
+#                  anything but an integer counts as 0.
+#   letters ran out  all 26 single letters a-z are held RIGHT NOW: each is the
+#                  @agent_key of some window of a VISIBLE session (not
+#                  @space_hidden, not named in @space_hidden_sessions) that is
+#                  not a home (@space_home unset), i.e. an agent or a shell.
+#                  An overflow key (`;a`, ...) alone is no trigger: a window
+#                  keeps its key for life, so one can outlast the shortage.
+# The cheap test comes first: within the 4 hours the tick reads one small file
+# with builtins and exits, no tmux at all.
+#
+# THE NUDGE. One info toast in every sidebar (`notify.sh -c '*'`; a client
+# with no sidebar gets tmux's own message, the text alone), 45 s, titled
+# "Review agents" (the popup's key is prefix O, ⌃S O):
+#     "9 agents idle 8h+ · click or ⌃S O to review"
+#     "9 agents idle 8h+ · letters ran out · click or ⌃S O to review"
+#     "letters ran out (2 on ; keys) · click or ⌃S O to review"
+#     "letters ran out · click or ⌃S O to review"   (no window on a ; key yet)
+# with a click action (`notify.sh -a`): `review.sh open {client}`, the review
+# popup on the clicking client (the sidebar substitutes {client}). Then
+# last-nudge is written, so the next one waits 4 hours whether or not
+# anyone clicked.
+#
+# State: ${XDG_STATE_HOME:-~/.local/state}/agent-review/ — last-nudge (an
+# epoch), log (one line per tick that got past the cooldown, bounded),
+# launchd.log (the LaunchAgent's stdout/stderr).
+#
+# Environment (tests):
+#   REVIEW_NUDGE_NOW    a fixed "now" epoch
+#   REVIEW_NUDGE_TMUX   the tmux command words (default `tmux`)
+#   REVIEW_COUNT_CMD    the old-agent count command, run by bash -c (default
+#                       `'<review.sh>' count`)
+#   REVIEW_SH           the review.sh path the toast's action runs (default the
+#                       sibling review.sh)
+#   NOTIFY_SH           the notify.sh to post with (default the sibling)
+#   XDG_STATE_HOME
+#
+# Always exits 0. Bash 3.2 (launchd runs /bin/bash): no associative arrays,
+# and an empty array is expanded as ${a[@]+"${a[@]}"} under set -u.
+set -uo pipefail
+
+EVERY=14400     # at most one nudge per 4 hours
+MIN_OLD=3       # this many agents idle 8h+ is worth a nudge
+TTL=45          # seconds the toast shows
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/agent-review"
+LAST_FILE="$STATE_DIR/last-nudge"
+LOGFILE="$STATE_DIR/log"
+
+dry=0 verb=""
+for a in "$@"; do
+    case "$a" in
+        --dry-run|-n) dry=1 ;;
+        check) verb=check ;;
+        -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "review-nudge.sh: unknown argument: $a" >&2; exit 0 ;;
+    esac
+done
+[ -z "$verb" ] && [ "$dry" = 1 ] && verb=check
+if [ "$verb" != check ]; then
+    echo "usage: review-nudge.sh check [--dry-run]" >&2
+    exit 0
+fi
+
+if [ -n "${REVIEW_NUDGE_NOW:-}" ]; then now="$REVIEW_NUDGE_NOW"; else now=$(date +%s); fi
+
+say() {   # the decision: printed on a dry run, logged otherwise
+    if [ "$dry" = 1 ]; then printf '%s\n' "$*"; return 0; fi
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOGFILE" 2>/dev/null
+    local n
+    n=$(wc -l <"$LOGFILE" 2>/dev/null | tr -d ' ')
+    if [ "${n:-0}" -gt 1000 ] 2>/dev/null; then
+        tail -n 500 "$LOGFILE" >"$LOGFILE.$$" 2>/dev/null && mv -f "$LOGFILE.$$" "$LOGFILE"
+    fi
+    return 0
+}
+
+# --- the cooldown: builtins only ---------------------------------------------
+last=""
+[ -f "$LAST_FILE" ] && read -r last <"$LAST_FILE" 2>/dev/null
+case "$last" in
+    ''|*[!0-9]*) last="" ;;
+    *) last=$((10#$last)) ;;   # (a leading 0 is not octal)
+esac
+# (A stamp in the future, from a clock jump, does not hold the nudge back.)
+if [ -n "$last" ] && [ "$last" -le "$now" ] && [ $((now - last)) -lt "$EVERY" ]; then
+    [ "$dry" = 1 ] && say "skip: nudged $(( (now - last) / 60 ))m ago (one per $((EVERY / 3600))h)"
+    exit 0
+fi
+
+# A UTF-8 locale, always (as snooze.sh): launchd gives none, and a tmux
+# client without one prints \x1f, tabs and non-ASCII as "_". Exported, so
+# notify.sh and review.sh inherit it.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) ;;
+    *)
+        if [ -n "${LC_ALL:-}" ]; then export LC_ALL=en_US.UTF-8
+        elif [ -n "${LC_CTYPE:-}" ]; then export LC_CTYPE=en_US.UTF-8
+        else export LANG=en_US.UTF-8
+        fi ;;
+esac
+
+# shellcheck disable=SC2206  # word-split on purpose, as notify.sh's NOTIFY_TMUX
+tmux_cmd=(${REVIEW_NUDGE_TMUX:-tmux})
+t() { "${tmux_cmd[@]}" "$@"; }
+
+# --- the server and its clients ------------------------------------------------
+if ! clients=$(t list-clients -F '#{client_name}' 2>/dev/null); then
+    say "skip: no tmux server"
+    exit 0
+fi
+if [ -z "$clients" ]; then
+    say "skip: no client attached"
+    exit 0
+fi
+
+# --- the triggers --------------------------------------------------------------
+# The letters held by the letter-holders (agents and non-home shells of
+# visible sessions): `held` distinct single letters a-z, `overflow` windows on
+# a 2-char `;x` key. Exhausted only while all 26 singles are held.
+US=$'\x1f'
+held=0 seen="" overflow=0
+rows=$(t list-windows -a -F "#{?#{||:#{@space_hidden},#{m:* #{session_name} *, #{@space_hidden_sessions} }},1,0}${US}#{@space_home}${US}#{@agent_key}" 2>/dev/null)
+while IFS= read -r row; do
+    [ -z "$row" ] && continue
+    hidden=${row%%"$US"*}
+    rest=${row#*"$US"}
+    home=${rest%%"$US"*}
+    key=${rest#*"$US"}
+    [ "$hidden" = 0 ] && [ -z "$home" ] || continue
+    case "$key" in
+        # (Spelled out: a locale's collation can put capitals inside a-z.)
+        [abcdefghijklmnopqrstuvwxyz])
+            case "$seen" in
+                *"$key"*) ;;
+                *) seen="$seen$key"; held=$((held + 1)) ;;
+            esac ;;
+        ';'?*) overflow=$((overflow + 1)) ;;
+    esac
+done <<<"$rows"
+out=0
+[ "$held" -ge 26 ] && out=1
+
+# The scripts beside this one (installed: review.sh; in the chezmoi source:
+# executable_review.sh).
+here=${BASH_SOURCE[0]%/*}
+[ "$here" = "${BASH_SOURCE[0]}" ] && here=.
+here=$(cd "$here" 2>/dev/null && pwd) || here="$HOME/.config/tmux/scripts"
+sibling() {
+    local n
+    for n in "$here/$1" "$here/executable_$1" "$HOME/.config/tmux/scripts/$1"; do
+        [ -f "$n" ] && { printf '%s\n' "$n"; return 0; }
+    done
+    printf '%s\n' "$here/$1"
+}
+REVIEW_SH="${REVIEW_SH:-$(sibling review.sh)}"
+NOTIFY_SH="${NOTIFY_SH:-$(sibling notify.sh)}"
+
+squote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# Old agents, as the review popup counts them.
+count_cmd="${REVIEW_COUNT_CMD:-$(squote "$REVIEW_SH") count}"
+old=$(bash -c "$count_cmd" </dev/null 2>/dev/null | tr -d '[:space:]')
+case "$old" in
+    ''|*[!0-9]*) old=0 ;;
+esac
+old=$((10#$old))
+
+if [ "$old" -lt "$MIN_OLD" ] && [ "$out" = 0 ]; then
+    say "skip: $old idle 8h+ (needs $MIN_OLD), $held/26 letters held"
+    exit 0
+fi
+
+# --- the nudge -----------------------------------------------------------------
+agents="$old agents idle 8h+"
+[ "$old" = 1 ] && agents="1 agent idle 8h+"
+if [ "$old" -ge "$MIN_OLD" ] && [ "$out" = 1 ]; then
+    text="$agents · letters ran out · click or ⌃S O to review"
+elif [ "$old" -ge "$MIN_OLD" ]; then
+    text="$agents · click or ⌃S O to review"
+elif [ "$overflow" -gt 0 ]; then
+    text="letters ran out ($overflow on ; keys) · click or ⌃S O to review"
+else
+    text="letters ran out · click or ⌃S O to review"
+fi
+# The action runs through run-shell, which expands tmux formats: a `#` in the
+# path is doubled. {client} is the sidebar's to fill in.
+hash="#"
+action="$(squote "${REVIEW_SH//$hash/$hash$hash}") open {client}"
+
+if [ "$dry" = 1 ]; then
+    say "nudge: $old idle 8h+, $held/26 letters held, $overflow overflow keys → would toast: $text"
+    say "action: $action"
+    exit 0
+fi
+
+# notify.sh expands formats in the text; ours never means one.
+if [ -x "$NOTIFY_SH" ]; then
+    "$NOTIFY_SH" -c '*' -k info -t "$TTL" -T "Review agents" -a "$action" -- "${text//$hash/$hash$hash}"
+elif [ -f "$NOTIFY_SH" ]; then
+    zsh -f "$NOTIFY_SH" -c '*' -k info -t "$TTL" -T "Review agents" -a "$action" -- "${text//$hash/$hash$hash}"
+else
+    say "error: no notify.sh at $NOTIFY_SH"
+    exit 0
+fi
+mkdir -p "$STATE_DIR" 2>/dev/null
+printf '%s\n' "$now" >"$LAST_FILE.$$" 2>/dev/null && mv -f "$LAST_FILE.$$" "$LAST_FILE"
+say "nudged: $old idle 8h+, $held/26 letters held, $overflow overflow keys"
+exit 0

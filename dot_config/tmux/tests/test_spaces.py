@@ -192,6 +192,9 @@ class ConfigShape(unittest.TestCase):
         self.assertIn("Enter", keys)
         jump = set(re.findall(r"^bind -T jump (\S+) ", on_branch(), re.M))
         self.assertEqual(set(keys) - jump, set())
+        # ⌥W ; (the overflow keys' table jump2) falls back to root the same way.
+        jump2 = set(re.findall(r"^bind -T jump2 (\S+) ", on_branch(), re.M))
+        self.assertEqual(set(keys) - jump2, set())
         # ⌘E is a popup (agent-ui launch), which takes every key while up: no
         # `launch` table left for a key to fall through.
         self.assertNotRegex(SPACES.read_text(), r"(?m)^\s*bind -T launch ")
@@ -1959,6 +1962,10 @@ class Spaces(Server):
         self.t("set", "-w", "-t", self.M3, "@agent_key", "k")
         r = self.script("preview-tab", "s:" + self.sid("main").lstrip("$"))
         self.assertRegex(r.stdout.split("\nagents\n")[0].splitlines()[2], r"^  k  \S")
+        # An overflow key (past the 26 letters) is two cells, the columns kept.
+        self.t("set", "-w", "-t", self.M3, "@agent_key", ";s")
+        r = self.script("preview-tab", "s:" + self.sid("main").lstrip("$"))
+        self.assertRegex(r.stdout.split("\nagents\n")[0].splitlines()[2], r"^  ;s \S")
         self.assertIn("  d  my.proj/Fix it  (needs-input)", agents)
         self.assertEqual(len(agents.strip().splitlines()), 3)
         Path(self.proj, "README").write_text("")

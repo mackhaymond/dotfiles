@@ -144,6 +144,7 @@ agent-ui menu keys:
 |---|---|
 | **Option-W**, or `prefix q` / `prefix C-q` | open the menu |
 | an agent's **letter** (`a s d f g h j k l q w e r t y u i o p z x c v b n m`, capitals too) | go to that agent at once and close; the letter is its lifetime `@agent_key` (see [Letter keys](#agent-ui-menu-letter-keys)) |
+| **`;`** then a letter (an **overflow key** `;a`, past the 26) | go to that window at once and close; Esc, a digit or another `;` after the `;` cancels only the `;` (the key bar says `; a–z go to ;a–z  esc cancel` meanwhile) |
 | **Option-W** inside the menu | go to the [last agent](#last-agent) (so ⌥W ⌥W flips between two agents); with none, close |
 | ↑ / ↓, C-p / C-n, PgUp / PgDn, Home / End, wheel | move (`j` / `k` are letters now) |
 | ⏎ | go to the selected row (a parked tab comes back via `stash.sh unstash`; the `▪ N parked` row opens the Parked filter); a click selects, a second click goes |
@@ -331,14 +332,26 @@ letter pressed there still goes to that shell.
   duplicate goes to the lower window id). spaces.conf's ⌥W `jump` table
   reads the same `@agent_key`, for agents and shells alike (never a home).
 - **Alphabet**, in hand-out order: `a s d f g h j k l q w e r t y u i o p z
-  x c v b n m` (26). Past 26 windows a row has no badge but is still
-  navigable.
+  x c v b n m` (26), then the 26 **overflow keys** `;a ;s ;d … ;m` in the
+  same order (two keystrokes: ⌥W `;` then the letter, spaces.conf's
+  `jump2` table; in the menu `;` then the letter). Every single letter is
+  handed out before any overflow key, agents still before shells. The type
+  is `menu::letters::Letter` (`Single(c)` / `Overflow(c)`); `@agent_key`
+  holds `a` or the two characters `;a`. A badge is always 3 cells: ` a `
+  for a single as ever, `;a ` for an overflow key (its letter in the same
+  column as a single's). An overflow holder keeps its key for life like any
+  other: it is NOT moved to a single letter that frees up later (that goes
+  to the next newcomer); lifetime stability beats a shorter key. The
+  menu's key bar says both ranges (`a–m ;a–f  go`). Past 52 windows a row
+  has no badge but is still navigable.
 - **Stored** on the window as the tmux user option `@agent_key`, read in the
   same snapshot as everything else (no extra tmux call). On each refresh
   (`menu::letters::assign`): a window whose `@agent_key` is a valid letter
   keeps it, unless another listed window holds it too, where the lower
-  numeric window id wins and the other is reassigned; every window without
-  a valid letter takes the lowest free one in alphabet order, windows taken
+  numeric window id wins and the other is reassigned (an overflow `;a` and
+  a single `a` are different keys); every window without a valid key (junk
+  such as `;;`, `;A`, `ab` included) takes the lowest free one in hand-out
+  order (singles, then overflow), windows taken
   in DISPLAY order (spaces in ⌘N order, then by name; in each, its agents by
   window index, then its shells). A letter whose holder is no longer listed
   (closed, parked, made a home) is free at once; if an unlisted window
@@ -1069,16 +1082,18 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   A live sidebar persists the letters it assigns to `@agent_key` exactly
   like the menu (one batched background write, `KeyMemo`), so the ⌥W
   `jump` table, the menu and every sidebar agree; `--once` never writes. While the client's key table is
-  `jump` (⌥W armed) every cap is inverted (a bold peach letter on `crust`,
+  `jump` (⌥W armed) or `jump2` (⌥W `;` armed, an overflow key next) every cap is inverted (a bold peach letter on `crust`,
   darker than any surface: no calm cap looks like it, quiet or solid, a
   peach space's included) and the panel's top cap carries a `⌥W jump │
-  type a letter` tab. No letter (past 26): a blank cap; no letter
+  type a letter` tab (`⌥W ; jump` in `jump2`). An overflow key's cap is
+  `;a ` (3 cells, as every cap). No key (past 52): a blank cap; no letter
   anywhere: no column. The 1-9 ordinals and slot numbers are gone.
 - **Status block** (`status::Bar`, built from the one per-tick snapshot,
   before home windows are hidden; no script runs per frame):
   - a tab on the usage panel's top pad: a red ` prefix ` chip while
     `#{client_key_table}` is `prefix`, a peach ` ⌥W jump ` chip and a
-    ` type a letter ` one while it is `jump` (no panel: a row of their own);
+    ` type a letter ` one while it is `jump` (` ⌥W ; jump ` in `jump2`; no
+    panel: a row of their own);
   - (no shells: they are rows of their space in the agents section now,
     see **Spaces, homes and shells** above);
   - usage meters: `@codex_<w>_used` / `_expected` / `_delta` / `_resets`

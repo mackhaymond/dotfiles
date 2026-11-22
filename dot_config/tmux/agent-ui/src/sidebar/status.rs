@@ -45,7 +45,9 @@
 //! records, oldest first, [`Toast`]) in one tmux call and posts the focus
 //! notice. The sidebar reads `@toast` in the same per-tick snapshot as
 //! everything here; [`Bar::toasts`] keeps the records for this sidebar's
-//! client (or every sidebar's).
+//! client (or every sidebar's). A record may carry a click action
+//! (`notify.sh -a`, [`Toast::action`]): a click on its card runs it on this
+//! sidebar's client, then dismisses it.
 
 use super::layout::Ink;
 use super::term;
@@ -257,9 +259,12 @@ pub struct Bar {
     pub space: Option<Chip>,
     /// `#{client_key_table}` is `prefix`: the red mark.
     pub prefix: bool,
-    /// It is `jump` (⌥W armed): the letter key-caps turn peach and the
-    /// card says `⌥W jump · type a letter`.
+    /// It is `jump` (⌥W armed) or `jump2` (⌥W ; armed, an overflow key
+    /// next): the letter key-caps turn peach and the card says `⌥W jump ·
+    /// type a letter`.
     pub jump: bool,
+    /// It is `jump2`: the card says `⌥W ; jump` instead.
+    pub jump2: bool,
     /// Empty when no usage option is set at all (no usage line).
     pub usage: Vec<Usage>,
     /// `@resurrect_stale` in words (`last save 2h ago`, `save refused`).
@@ -323,7 +328,8 @@ pub const TOAST_RS: char = '\u{1e}';
 /// One toast from notify.sh, as `@toast` holds it (a GLOBAL option, read in
 /// the per-tick snapshot): up to 4 records separated by RS (U+001E), oldest
 /// first, each `seq TAB epoch_ms TAB kind TAB ttl_s TAB client TAB text
-/// [TAB title]` (6-field records, from before titles, still parse).
+/// [TAB title [TAB action]]` (6- and 7-field records, from before titles
+/// and actions, still parse).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Toast {
     /// `@toast_seq` when it was posted.
@@ -340,6 +346,10 @@ pub struct Toast {
     /// `notify.sh -T`: the card's title instead of the kind's own; None
     /// when not given (or blank).
     pub title: Option<String>,
+    /// `notify.sh -a`: a shell line a click on the card runs (`run-shell
+    /// -b`, [`Toast::action_line`]) before dismissing it; None when not
+    /// given (or blank): a click only dismisses.
+    pub action: Option<String>,
 }
 
 /// One line: controls made spaces, runs of spaces one.
@@ -350,9 +360,12 @@ fn one_line(s: &str) -> String {
 impl Toast {
     /// One `@toast` record → the toast; None when malformed or empty.
     pub fn parse(raw: &str) -> Option<Toast> {
-        // The 7th field is the title (notify.sh never writes a tab into
-        // the text, so a 6-field record is one from before titles).
-        let f: Vec<&str> = raw.trim_matches(|c| c == '\n' || c == TOAST_RS).splitn(7, '\t').collect();
+        // The 7th field is the title, the 8th the click action (notify.sh
+        // never writes a tab into the text or title, so a 6-field record is
+        // one from before titles, a 7-field one from before actions). The
+        // action keeps its own spacing (a shell line): controls made
+        // spaces, the ends trimmed.
+        let f: Vec<&str> = raw.trim_matches(|c| c == '\n' || c == TOAST_RS).splitn(8, '\t').collect();
         let [seq, at, kind, ttl, client, text] = f.get(..6).unwrap_or(&[])[..] else { return None };
         let title = f.get(6);
         let text = one_line(text);
@@ -360,6 +373,7 @@ impl Toast {
             return None;
         }
         let title = title.map(|t| one_line(t)).filter(|t| !t.is_empty());
+        let action = f.get(7).map(|a| sanitize(a).trim().to_string()).filter(|a| !a.is_empty());
         let ttl = ttl.trim().parse::<f64>().ok().filter(|t| t.is_finite() && *t > 0.0).unwrap_or(4.0).min(3600.0);
         Some(Toast {
             seq: seq.trim().parse().ok()?,
@@ -369,7 +383,26 @@ impl Toast {
             client: client.trim().to_string(),
             text,
             title,
+            action,
         })
+    }
+
+    /// The shell line a click on this toast runs for `client` (this
+    /// sidebar's; None: "" in its place), or None for a toast with no
+    /// action. `{client}` in the action becomes the client shell-quoted
+    /// (`'#'` doubled, as run-shell expands formats); `#{client_name}` and
+    /// `#{client_tty}` become it as a binding's run-shell would have
+    /// expanded them (the sidebar's `run-shell -b` has no client of its
+    /// own to expand them to).
+    pub fn action_line(&self, client: Option<&str>) -> Option<String> {
+        let a = self.action.as_deref()?;
+        let c = client.unwrap_or("");
+        let raw = c.replace('#', "##");
+        Some(
+            a.replace("{client}", &crate::actions::sh_quote(c))
+                .replace("#{client_name}", &raw)
+                .replace("#{client_tty}", &raw),
+        )
     }
 
     /// All of `@toast`: every well-formed record, oldest first.
@@ -431,7 +464,8 @@ impl Bar {
         }
         let Some(me) = me else { return bar };
         bar.prefix = me.status.key_table == "prefix";
-        bar.jump = me.status.key_table == "jump";
+        bar.jump = matches!(me.status.key_table.as_str(), "jump" | "jump2");
+        bar.jump2 = me.status.key_table == "jump2";
         let session = if me.session.is_empty() {
             snap.rows(&me.window_id).next().map(|w| w.session.clone()).unwrap_or_default()
         } else {
@@ -1052,8 +1086,12 @@ mod tests {
         // The jump table; a hidden session has a dim chip.
         let snap = Snapshot::parse(&[row("agents", 1, "@9", &[]), client("agents", "@9", &["jump", "", "", "refused"])].join("\n"));
         let bar = Bar::build(&snap, Some("/dev/ttys999"));
-        assert!(bar.jump && !bar.prefix && bar.usage.is_empty());
+        assert!(bar.jump && !bar.jump2 && !bar.prefix && bar.usage.is_empty());
         assert!(bar.space.as_ref().is_some_and(|c| c.hidden));
+        // ⌥W ; (an overflow key next): still jump mode, and says so.
+        let two = Snapshot::parse(&[row("main", 1, "@2", &[]), client("main", "@2", &["jump2"])].join("\n"));
+        let b2 = Bar::build(&two, Some("/dev/ttys999"));
+        assert!(b2.jump && b2.jump2 && !b2.prefix);
         assert_eq!(bar.stale.as_deref(), Some("save refused"));
         // No client: no chip (the classic header), the global options still read.
         let bar = Bar::build(&snap, Some("/dev/nope"));
@@ -1237,11 +1275,20 @@ mod tests {
         // A 6-field record (from before titles): no title.
         let t = Toast::parse("12\t1792000000250\tok\t4\t/dev/ttys001\tparked  Canvas \u{7}Syllabus\n").unwrap();
         assert_eq!(t, Toast { seq: 12, at_ms: 1_792_000_000_250, kind: Kind::Ok, ttl: 4.0, client: "/dev/ttys001".into(),
-            text: "parked Canvas Syllabus".into(), title: None });
-        // The 7th field: the title (blank is none).
-        let titled = Toast::parse("12\t1792000000250\tok\t4\t\tparked\tStash  \tx").unwrap();
-        assert_eq!((titled.text.as_str(), titled.title.as_deref()), ("parked", Some("Stash x")));
+            text: "parked Canvas Syllabus".into(), title: None, action: None });
+        // The 7th field: the title (blank is none); a 7-field record has no
+        // action.
+        let titled = Toast::parse("12\t1792000000250\tok\t4\t\tparked\tStash  x").unwrap();
+        assert_eq!((titled.text.as_str(), titled.title.as_deref(), titled.action.as_deref()), ("parked", Some("Stash x"), None));
         assert_eq!(Toast::parse("12\t1\tok\t4\t\tparked\t  ").unwrap().title, None);
+        // The 8th: the click action, its own spacing kept, the ends trimmed,
+        // controls (and any tab past it) made spaces; blank is none.
+        let acted = Toast::parse("12\t1\tinfo\t45\t\t9 agents idle\tReview agents\t sh  'r.sh' open {client}\t\n").unwrap();
+        assert_eq!((acted.title.as_deref(), acted.action.as_deref()), (Some("Review agents"), Some("sh  'r.sh' open {client}")));
+        assert_eq!(Toast::parse("12\t1\tok\t4\t\tx\tT\ta\tb\u{7}c").unwrap().action.as_deref(), Some("a b c"));
+        assert_eq!(Toast::parse("12\t1\tok\t4\t\tx\t\t  ").unwrap().action, None);
+        let untitled = Toast::parse("12\t1\tok\t4\t\tx\t\tgo").unwrap();
+        assert_eq!((untitled.title, untitled.action.as_deref()), (None, Some("go")));
         assert_eq!(t.id(), (12, 1_792_000_000_250));
         assert_eq!((t.until(), t.live(1_792_000_004.0), t.live(1_792_000_004.25)), (1_792_000_004.25, true, false));
         assert!(t.for_client(Some("/dev/ttys001")) && !t.for_client(Some("/dev/ttys002")) && !t.for_client(None));
@@ -1261,6 +1308,24 @@ mod tests {
         assert_eq!(all.iter().map(|t| (t.seq, t.text.as_str(), t.title.as_deref())).collect::<Vec<_>>(),
             [(1, "one", None), (2, "two", Some("Titled"))]);
         assert!(Toast::parse_all("").is_empty());
+        // Mixed 6-, 7- and 8-field records in one stack.
+        let mixed = Toast::parse_all("1\t10\tok\t4\t\tone\u{1e}2\t20\twarn\t4\t\ttwo\tT\u{1e}3\t30\tinfo\t40\t\tthree\tR\techo hi");
+        assert_eq!(mixed.iter().map(|t| (t.seq, t.title.as_deref(), t.action.as_deref())).collect::<Vec<_>>(),
+            [(1, None, None), (2, Some("T"), None), (3, Some("R"), Some("echo hi"))]);
+    }
+
+    /// The line a click runs: `{client}` as the client shell-quoted,
+    /// `#{client_name}` / `#{client_tty}` as the raw name; no client is "";
+    /// no action, no line.
+    #[test]
+    fn a_toast_action_line_names_the_client() {
+        let t = Toast::parse("1\t0\tinfo\t40\t\tx\t\t'/s/review.sh' open {client}").unwrap();
+        assert_eq!(t.action_line(Some("/dev/ttys004")).as_deref(), Some("'/s/review.sh' open '/dev/ttys004'"));
+        assert_eq!(t.action_line(None).as_deref(), Some("'/s/review.sh' open ''"));
+        assert_eq!(t.action_line(Some("it's#1")).as_deref(), Some("'/s/review.sh' open 'it'\\''s##1'"));
+        let f = Toast::parse("1\t0\tinfo\t40\t\tx\t\tr.sh open '#{client_name}' #{client_tty} {client}").unwrap();
+        assert_eq!(f.action_line(Some("/dev/ttys004")).as_deref(), Some("r.sh open '/dev/ttys004' /dev/ttys004 '/dev/ttys004'"));
+        assert_eq!(Toast::parse("1\t0\tinfo\t40\t\tx").unwrap().action_line(Some("/dev/ttys004")), None);
     }
 
     /// The snapshot's toast reaches the bar only for this sidebar's client,

@@ -12,7 +12,8 @@
 #       window id) and @agent_parent_pane on the new window, which the
 #       sidebar / tab dots / CuaNotch fold under abby. Prints: <pane id>
 #       <window id> <letter or ->.
-#   PANE below is the pane id spawn printed (%123) or the agent's letter.
+#   PANE below is the pane id spawn printed (%123) or the agent's letter
+#   (an overflow key past the 26 is two characters: quote it, ';a').
 #   abby-delegate wait PANE [--timeout SECONDS]
 #       Until that agent's turn ends (done / needs-input / failed / back to
 #       idle after running), at most SECONDS (default 540, under the pty
@@ -252,7 +253,7 @@ cmd_list() {
         s="$(state_of "$pane")"
         [ -n "$s" ] || continue  # closed, or no longer an agent
         key="$(tmux show-options -wqv -t "$pane" @agent_key 2>/dev/null)"
-        printf '%s  %s  %-11s %s\n' "$pane" "${key:--}" "$s" "${dir/#"$HOME"/\~}"
+        printf '%s  %-2s %-11s %s\n' "$pane" "${key:--}" "$s" "${dir/#"$HOME"/\~}"
     done < <(awk -F'\t' '{ last[$2] = $0; order[$2] = NR } END { for (p in last) print order[p] "\t" last[p] }' "$LOG" \
              | sort -n | cut -f2-)
 }

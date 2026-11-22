@@ -12,7 +12,7 @@
 #                  (a bare "/" or "then" between them stays plain text)
 #   3 description  what it does, short (about 40 cells, at most 50)
 #   4 table        the tmux key table that binds it (root, prefix, jump,
-#                  stash), or empty: WezTerm, Karabiner, a plugin, a popup's
+#                  jump2, stash), or empty: WezTerm, Karabiner, a plugin, a popup's
 #                  own keys, the mouse
 #   5 tmux keys    the tmux key names in that table, space-separated;
 #                  `a..z` / `1..9` / `User18..User26` are ranges. A key
@@ -33,6 +33,9 @@ Jump	⌥W a-z	Jump to that agent or shell, any space	jump	a..z	the sidebar's let
 Jump	⌥W 1-9	Jump to pinned agent N	jump	1..9
 Jump	⌥W ⇧A-Z	That agent's uncommitted diff (popup)	jump	A..Z	Esc / q close it
 Jump	⌥W Esc	Cancel the jump	jump	Escape Enter Space C-c
+Jump	⌥W ; a-z	Jump to an overflow key (;a), any space	jump2	a..z	past the 26 letters
+Jump	⌥W ; ⇧A-Z	That overflow agent's diff (popup)	jump2	A..Z
+Jump	⌥W ; Esc	Cancel the overflow jump	jump2	Escape Enter Space C-c
 
 Move around	⌥L	Next of this kind (agent or shell)	root	M-l
 Move around	⌥H	Previous of this kind	root	M-h
@@ -61,6 +64,7 @@ Tabs	click tab	Status line: go to that tab or space	root	MouseDown1Status	[+] op
 Agents	⌃S q	Agent menu	prefix	q C-q
 Agents	⌃S t	Pin / unpin this agent	prefix	t	⌥W 1-9 reach pins
 Agents	⌃S P	Pause working agents; again resumes	prefix	P	before closing the lid
+Agents	⌃S O	Review old agents (idle 8h+), one by one	prefix	O	c close · p park · s snooze · k keep
 
 Park	⌃S H	Park this tab (agent kept, jobs frozen)	prefix	H	refused if it can't be paused
 Park	⌃S h	Unpark (⌘Z picker, stashed only)	prefix	h
@@ -87,6 +91,7 @@ Sidebar	click PARKED	Unpark picker
 Sidebar	click ▸	Keep a dormant space open (again: let it fold)
 
 Agent menu	a-z	Go to the agent on that letter
+Agent menu	; a-z	Go to the agent on an overflow key (;a)			past the 26 letters; Esc cancels the ;
 Agent menu	↑ / ↓	Move			⌃P / ⌃N, PgUp / PgDn
 Agent menu	⏎	Go to the selected row
 Agent menu	⇥ / ⇧⇥	Next / previous filter

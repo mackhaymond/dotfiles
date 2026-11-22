@@ -28,7 +28,7 @@
 //! wins: a y/n, the search line, the actions strip, a message, else the key
 //! bar.
 
-use super::letters::ALPHABET;
+use super::letters::{Letter, OVERFLOW_PREFIX};
 use super::rows::{Row, Tab, Target};
 use super::state::{strip, Drawn, Hit, Menu};
 use crate::actions::watcher_problem;
@@ -407,7 +407,7 @@ fn agent_row(m: &Menu, buf: &mut Buffer, x0: u16, y: u16, cw: u16, a: &Agent, pl
     let end = x0 + cw;
     let mut x = x0 + 1;
     if let Some(c) = m.data.letter(&a.window_id) {
-        put(buf, x, y, end, &format!(" {c} "), bold(on("crust", badge_color(a))));
+        put(buf, x, y, end, &c.cap(), bold(on("crust", badge_color(a))));
     }
     x += BADGE_W + 1;
     x = put(buf, x, y, end, a.glyph, fg(a.color.unwrap_or("overlay")));
@@ -575,14 +575,19 @@ fn peek_lines(m: &Menu, buf: &mut Buffer, r: Rect, key: &(String, String), place
 }
 
 /// The letters in play, as the key bar says them: `a`, `a–j` (alphabet
-/// order: the range from the first held letter to the last).
+/// order: the range from the first held letter to the last); with overflow
+/// keys held too, their range after it: `a–m ;a–f`.
 pub fn letter_hint(drawn: &Drawn) -> Option<String> {
-    let held: Vec<char> = ALPHABET.iter().copied().filter(|c| drawn.letters.contains_key(c)).collect();
-    match held.as_slice() {
-        [] => None,
-        [one] => Some(one.to_string()),
-        [first, .., last] => Some(format!("{first}–{last}")),
-    }
+    let range = |overflow: bool| {
+        let held: Vec<Letter> = Letter::all().filter(|k| k.is_overflow() == overflow && drawn.letters.contains_key(k)).collect();
+        match held.as_slice() {
+            [] => None,
+            [one] => Some(one.to_string()),
+            [first, .., last] => Some(format!("{first}–{}", last.char())),
+        }
+    };
+    let parts: Vec<String> = [range(false), range(true)].into_iter().flatten().collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// Key items (`key`, `words`) drawn as ` key  words ` chips, dropping the
@@ -653,6 +658,13 @@ fn footer(m: &Menu, buf: &mut Buffer, w: u16, y: u16, now: f64) {
         // The least needed go first; the answers, the diff and ⏎ go last.
         key_items(buf, cx, y, end, items,
             &["cancel", "restart watcher", "preview", "snooze", "park", "discard", "close", "unpin", "pin", "go", "diff"]);
+        return;
+    }
+    if m.overflow {
+        // `;` armed: the next letter is an overflow key (`;a`).
+        let cx = put(buf, x, y, end, &format!("{OVERFLOW_PREFIX} "), bold(fg("peach")));
+        let items = vec![("a–z".to_string(), format!("go to {OVERFLOW_PREFIX}a–z")), ("esc".to_string(), "cancel".to_string())];
+        key_items(buf, cx + 1, y, end, items, &["cancel"]);
         return;
     }
     if !m.msg.is_empty() && now < m.msg_until {
@@ -813,9 +825,9 @@ mod tests {
         assert_eq!(b[(30, 6)].bg, color("base"));
         // What the keys mean in this frame.
         // (k: main's shell, lettered from the one pool after the agents, though the menu lists no row for it.)
-        assert_eq!(m.drawn.letters.keys().collect::<String>(), "adfghjks");
-        assert_eq!(m.drawn.letters[&'k'].win, "@5");
-        assert_eq!(m.drawn.letters[&'f'].key, RowKey::Agent("main".into(), "@3".into()));
+        assert_eq!(m.drawn.letters.keys().map(|k| k.to_string()).collect::<String>(), "adfghjks");
+        assert_eq!(m.drawn.letters[&'k'.into()].win, "@5");
+        assert_eq!(m.drawn.letters[&'f'.into()].key, RowKey::Agent("main".into(), "@3".into()));
         assert_eq!(m.drawn.rows.len(), 8);
         assert_eq!(m.preview_rows, 0);
         assert_eq!(m.peek_want(), None);
@@ -971,7 +983,8 @@ mod tests {
         assert!(f[18].contains("a–k  go") && f[18].contains("⌥W  last") && !f[18].contains("back"), "{}", f[18]);
     }
 
-    /// Past 26 agents: no badge, the row still drawn and navigable.
+    /// Past 26 agents: the overflow keys `;a ;s` as badges (3 cells, the
+    /// letter in a single's column), the key bar saying both ranges.
     #[test]
     fn past_26_agents() {
         let rows: Vec<String> = (1..=28)
@@ -983,9 +996,18 @@ mod tests {
         m.act(Key::End, &mut NoEffects);
         let f = frame(&mut m, 80, 40);
         assert!(f.iter().any(|l| l.starts_with("│  m  ◐ w26 ")), "{f:#?}");
-        assert!(f.iter().any(|l| l.starts_with("│     ◐ w28 ")), "{f:#?}");
-        assert!(f[38].contains("a–m  go"), "{}", f[38]);
+        assert!(f.iter().any(|l| l.starts_with("│ ;a  ◐ w27 ")), "{f:#?}");
+        assert!(f.iter().any(|l| l.starts_with("│ ;s  ◐ w28 ")), "{f:#?}");
+        assert!(f[38].contains("a–m ;a–s  go"), "{}", f[38]);
         assert_eq!(m.selected_target().map(|t| t.win), Some("@28".into()));
+        // `;` arms the overflow: the key bar says so; Esc cancels only that.
+        m.act(Key::Char(';'), &mut NoEffects);
+        let f = frame(&mut m, 80, 40);
+        assert!(f[38].contains("; ") && f[38].contains("go to ;a–z") && f[38].contains("esc"), "{}", f[38]);
+        assert!(!m.act(Key::Esc, &mut NoEffects), "Esc after ; keeps the menu open");
+        assert!(!m.overflow);
+        let f = frame(&mut m, 80, 40);
+        assert!(f[38].contains("a–m ;a–s  go"), "{}", f[38]);
     }
 
     #[test]

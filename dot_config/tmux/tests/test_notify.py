@@ -381,6 +381,49 @@ class NotifyTests(unittest.TestCase):
         calls = self.notify("-T", "Ignored", "plain")
         self.assertEqual(calls[-1], ["display-message", "--", "plain"])
 
+    def test_an_action_rides_in_the_eighth_field(self):
+        """-a: a click action, taken literally (no formats), one line (tabs,
+        newlines, RS and US made spaces); only then an 8th field."""
+        self.open_sidebar()
+        self.notify("-T", "Review agents", "-a", "'/s/review.sh'\topen\n{client}", "9 idle")
+        self.assertEqual(self.toast()[5:], ["9 idle", "Review agents", "'/s/review.sh' open {client}"])
+        self.notify("-a", "x\x1ey\x1fz #{session_name};", "no title")
+        self.assertEqual(self.toast()[5:], ["no title", "", "x y z #{session_name};"])
+        # Blank: no action, 7 fields as before.
+        self.notify("-a", " \t ", "blank")
+        self.assertEqual(len(self.toast()), 7)
+        recs = self.records()
+        self.assertEqual([len(r) for r in recs], [8, 8, 7], recs)
+        # No sidebar: tmux's own message, the text alone.
+        self.tmux("set-option", "-gu", "@sidebar_pids")
+        self.assertEqual(self.notify("-a", "go", "plain")[-1], ["display-message", "--", "plain"])
+
+    def test_old_records_are_carried_beside_an_action(self):
+        """6- and 7-field records stay as they are beside an 8-field one, and
+        the 4-record cap counts them all alike."""
+        self.open_sidebar()
+        now = int(time.time() * 1000)
+        self.tmux("set-option", "-g", "@toast", "\x1e".join([
+            f"1\t{now}\tok\t60\t\tsix",
+            f"2\t{now}\tok\t60\t\tseven\tT",
+            f"3\t{now}\tok\t60\t\teight\tT\tgo",
+            f"4\t{now}\tok\t60\t\tdropped by the cap",
+        ][::-1]))
+        self.notify("-a", "act", "new")
+        recs = self.records()
+        self.assertEqual([r[5] for r in recs], ["eight", "seven", "six", "new"], recs)
+        self.assertEqual(recs[0][5:], ["eight", "T", "go"])
+        self.assertEqual(recs[1][5:], ["seven", "T"])
+        self.assertEqual(recs[2][5:], ["six"])
+        self.assertEqual(recs[3][5:], ["new", "", "act"])
+
+    def test_the_log_carries_an_action(self):
+        self.open_sidebar()
+        self.notify("-T", "R", "-a", "go", "titled")
+        self.notify("-a", "go", "untitled")
+        self.assertEqual([l.split("\t")[1:] for l in self.log_lines()],
+                         [["info", "", "titled", "R", "go"], ["info", "", "untitled", "", "go"]])
+
     def test_the_log_carries_a_title(self):
         self.open_sidebar()
         self.notify("-T", "Stash", "parked")

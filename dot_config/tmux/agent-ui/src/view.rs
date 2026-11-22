@@ -269,8 +269,9 @@ pub struct Agent {
     pub ordinal: Option<u32>,
     /// The agent's lifetime LETTER (`@agent_key`, [`crate::menu::letters`]):
     /// set by the sidebar (the menu keeps its own map); None from
-    /// [`Agent::from_window`] alone, and past 26 agents.
-    pub letter: Option<char>,
+    /// [`Agent::from_window`] alone, and past 52 (26 single letters, then
+    /// the 26 overflow keys `;a`).
+    pub letter: Option<crate::menu::letters::Letter>,
     /// stash.sh's `@stash_sel`: in prefix v's range selection.
     pub selected: bool,
     /// What a WORKING agent is doing right now, in a few words, from its

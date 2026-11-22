@@ -62,7 +62,7 @@ use self::keys::{KeyReader, ESC_WAIT};
 use self::render::{dump, render};
 use self::letters::{KeyMemo, Write as KeyWrite};
 use self::rows::{Data, Row, Tab};
-use self::state::{letter_key, Effects, Menu, PeekData, PeekWant};
+use self::state::{Effects, Menu, PeekData, PeekWant};
 use crate::actions::{self, Actions};
 use crate::tmux::{Snapshot, Window};
 use crate::{text, Core, Tmux};
@@ -261,9 +261,9 @@ fn once(tmux: Tmux, a: &Args, w: u16, h: u16) -> ExitCode {
     let mut menu = Menu::new(src.load(), a.tab);
     menu.preview = a.preview;
     if let Some(sel) = &a.select {
-        // A letter: the agent's first row in the list.
-        let mut cs = sel.chars();
-        let l = cs.next().and_then(letter_key).filter(|_| cs.next().is_none());
+        // A letter (capitals too) or an overflow key `;a`: the agent's
+        // first row in the list.
+        let l = letters::Letter::parse(&sel.to_ascii_lowercase());
         let win = menu.data.letters.iter().find(|(_, &c)| Some(c) == l).map(|(w, _)| w.clone());
         let key = win.and_then(|w| menu.rows.iter().filter_map(Row::key).find(|k| k.window() == w));
         match key {

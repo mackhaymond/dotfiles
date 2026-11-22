@@ -14,6 +14,7 @@
 //! agent-ui [--socket <name|path>] diff <@id> --client <tty>   (diff.rs: those files' diff in a popup; ⌥W ⇧letter)
 //! agent-ui keys [--client <tty>]                              (keys.rs: the key help, prefix ?)
 //! agent-ui [--socket <name|path>] launch --client <tty> [--pane <%id>]   (launch.rs: ⌘E, the agent launcher)
+//! agent-ui [--socket <name|path>] review --client <tty> | --count       (review.rs: prefix O, review old agents)
 //! ```
 //!
 //! `needs` prints exactly what `agent-jump.sh list` prints, from the same
@@ -34,7 +35,8 @@ const USAGE: &str = "usage: agent-ui [--socket <name|path>] dump [--client <tty>
        agent-ui insight-files <@id>
        agent-ui diff <@id> --client <tty> [--after <pid>] [--print]
        agent-ui keys [--client <tty>] | --once <W>x<H> [--query <q>] [--ansi]
-       agent-ui launch --client <tty> [--pane <%id>] | --once <W>x<H> [--client <tty>] [--plain]";
+       agent-ui launch --client <tty> [--pane <%id>] | --once <W>x<H> [--client <tty>] [--plain]
+       agent-ui review --client <tty> | --count | --once <W>x<H> [--keys <script>] [--plain]  [--min-idle SECS]";
 
 fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let i = args.iter().position(|a| a == flag)?;
@@ -72,6 +74,7 @@ fn main() -> ExitCode {
         "diff" => agent_ui::diff::run(tmux, rest),
         "keys" => agent_ui::keys::run(tmux, rest),
         "launch" => agent_ui::launch::run(tmux, rest),
+        "review" => agent_ui::review::run(tmux, rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             ExitCode::SUCCESS

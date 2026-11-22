@@ -1571,10 +1571,25 @@ fn letter_key_caps_lead_every_agent_row_and_card() {
     let f = layout(&v, 22, 58, &with_bar(Bar { jump: true, ..demo_bar() }));
     let top = f.rows[f.card.start].text();
     assert!(top.starts_with(" ▄ ⌥W jump  type") && top.ends_with("▄ ") && dwidth(&top) == 22, "{top:?}");
-    // Past 26 agents: a blank cap, the title still aligned.
+    // ⌥W ; armed (key table `jump2`): armed the same, the mark says the `;`.
+    let f = layout(&v, 34, 58, &with_bar(Bar { jump: true, jump2: true, ..demo_bar() }));
+    let top = &f.rows[f.card.start];
+    assert!(top.segs.contains(&block(" ⌥W ; jump ", "crust", "peach")), "{:?}", top.segs);
+    assert_eq!(cap_of(&f.rows[find(&f, "Tmux Agent S")]), block(" f ", "peach", "crust"));
+    // Past 26 agents: the overflow keys, `;a ` in the same 3 cells (the
+    // letter in a single's column), the title aligned with every other.
     let x = lettered(extreme());
-    let none = x.agents().find(|a| a.letter.is_none()).expect("an agent past 26");
+    let ov = x.agents().find(|a| a.letter == Some(crate::menu::letters::Letter::Overflow('a'))).expect("an agent on ;a");
     let f = layout(&x, 60, 400, &Opts::default());
+    let k = f.rows.iter().position(|r| r.covers.iter().any(|(s, id)| *s == ov.session && *id == ov.window_id)).unwrap();
+    assert_eq!(cap_of(&f.rows[k]).text, ";a ", "{:?}", f.rows[k].text());
+    let single = f.rows.iter().position(|r| r.segs.len() > 4 && cap_of(r).text == " s ").unwrap();
+    let title_col = |r: &Row| r.segs[..5].iter().map(|s| dwidth(&s.text)).sum::<usize>();
+    assert_eq!(title_col(&f.rows[k]), title_col(&f.rows[single]), "{:?} vs {:?}", f.rows[k].text(), f.rows[single].text());
+    let f2 = layout(&x, 60, 400, &with_bar(Bar { jump: true, ..Bar::default() }));
+    assert_eq!(cap_of(&f2.rows[k]), block(";a ", "peach", "crust"));
+    // Past 52: a blank cap, the title still aligned.
+    let none = x.agents().find(|a| a.letter.is_none()).expect("an agent past 52");
     let k = f.rows.iter().position(|r| r.covers.iter().any(|(s, id)| *s == none.session && *id == none.window_id)).unwrap();
     assert_eq!(cap_of(&f.rows[k]).text, "   ", "{:?}", f.rows[k].text());
     assert!(f.rows[k].text().chars().skip(2).collect::<String>().starts_with("     An agent"), "{:?}", f.rows[k].text());
@@ -2423,7 +2438,7 @@ fn glyph_widths_agree_with_ratatui() {
 
 /// A toast posted at the fixtures' clock (seq 7, 4 s), for every sidebar.
 fn toast(kind: Kind, text: &str) -> Toast {
-    Toast { seq: 7, at_ms: NOW * 1000, kind, ttl: 4.0, client: String::new(), text: text.into(), title: None }
+    Toast { seq: 7, at_ms: NOW * 1000, kind, ttl: 4.0, client: String::new(), text: text.into(), title: None, action: None }
 }
 
 /// Toast `seq`, posted `seq` ms after the fixtures' clock.
@@ -3211,7 +3226,7 @@ const COPY: &str = "the pane is in copy mode";
 /// A held agent in the snapshot's `main`: `label`, window `win`, letter
 /// `c`, held for copy mode.
 fn held(label: &str, win: &str, c: Option<char>) -> Held {
-    Held { label: label.into(), window_id: win.into(), why: COPY.into(), session: "main".into(), letter: c }
+    Held { label: label.into(), window_id: win.into(), why: COPY.into(), session: "main".into(), letter: c.map(Into::into) }
 }
 
 /// Stopping, `working` still working and `held` held by tmux-mcp.

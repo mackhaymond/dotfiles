@@ -26,10 +26,14 @@
 //!    listed window holds the same letter with priority: on a duplicate the
 //!    lower NUMERIC window id keeps it, the other is reassigned.
 //! 2. Every other window (no key, junk, a duplicate's loser) takes the
-//!    lowest free letter in [`ALPHABET`] order: every AGENT first, in
-//!    DISPLAY order ([`lettered`]), then every shell in display order, so
-//!    past 26 a new agent still gets a letter before a shell does.
-//! 3. Past 26 windows there is no letter (the row is still navigable).
+//!    lowest free key in [`Letter::all`] order (the 26 single letters in
+//!    [`ALPHABET`] order, then the 26 OVERFLOW keys `;a ;s ;d …` in the
+//!    same order): every AGENT first, in DISPLAY order ([`lettered`]), then
+//!    every shell in display order, so when keys run short a new agent still
+//!    gets one before a shell does.
+//! 3. Past 52 windows there is no key (the row is still navigable). A window
+//!    holding an overflow key keeps it for life like any other: it is never
+//!    moved to a single letter that frees up later (stability over brevity).
 //! 4. A letter whose holder is no longer listed (closed, parked, made a
 //!    home) is free. An unlisted window that still carries a letter a listed
 //!    window now holds has its stale `@agent_key` unset, so it cannot steal
@@ -56,12 +60,81 @@ pub const ALPHABET: [char; 26] = [
 /// The tmux user option holding a window's letter.
 pub const OPTION: &str = "@agent_key";
 
-/// An `@agent_key` value → its letter, when it is exactly one letter of
-/// [`ALPHABET`] (lowercase; anything else is junk and gets reassigned).
-pub fn parse_key(raw: &str) -> Option<char> {
-    let mut it = raw.chars();
-    let c = it.next()?;
-    (it.next().is_none() && ALPHABET.contains(&c)).then_some(c)
+/// The key before an OVERFLOW letter: ⌥W `;` then the letter
+/// (spaces.conf's `jump2` table).
+pub const OVERFLOW_PREFIX: char = ';';
+
+/// A window's lifetime key: one letter (⌥W a), or past the 26 an OVERFLOW
+/// key, two keystrokes (⌥W ; a). Stored in `@agent_key` as its
+/// [`Display`](std::fmt::Display) form: `a`, or `;a`. Orders singles first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Letter {
+    /// `a`: ⌥W then the letter.
+    Single(char),
+    /// `;a`: ⌥W, `;`, then the letter.
+    Overflow(char),
+}
+
+impl Letter {
+    /// Every key in the order free ones are handed out: the 26 singles in
+    /// [`ALPHABET`] order, then the 26 overflow keys in the same order.
+    pub fn all() -> impl Iterator<Item = Letter> {
+        ALPHABET.iter().map(|&c| Letter::Single(c)).chain(ALPHABET.iter().map(|&c| Letter::Overflow(c)))
+    }
+
+    /// An `@agent_key` value → its key: exactly one letter of [`ALPHABET`]
+    /// (lowercase), or [`OVERFLOW_PREFIX`] and one. Anything else is junk
+    /// and gets reassigned.
+    pub fn parse(raw: &str) -> Option<Letter> {
+        let mut it = raw.chars();
+        let (first, second, rest) = (it.next()?, it.next(), it.next());
+        match (first, second, rest) {
+            (c, None, None) if ALPHABET.contains(&c) => Some(Letter::Single(c)),
+            (OVERFLOW_PREFIX, Some(c), None) if ALPHABET.contains(&c) => Some(Letter::Overflow(c)),
+            _ => None,
+        }
+    }
+
+    /// The letter typed last (`a` for both `a` and `;a`).
+    pub fn char(self) -> char {
+        match self {
+            Letter::Single(c) | Letter::Overflow(c) => c,
+        }
+    }
+
+    pub fn is_overflow(self) -> bool {
+        matches!(self, Letter::Overflow(_))
+    }
+
+    /// Its key-cap, always 3 cells: ` a ` for a single (as ever), `;a ` for
+    /// an overflow key (the letter in the same column as a single's).
+    pub fn cap(self) -> String {
+        match self {
+            Letter::Single(c) => format!(" {c} "),
+            Letter::Overflow(c) => format!("{OVERFLOW_PREFIX}{c} "),
+        }
+    }
+}
+
+impl std::fmt::Display for Letter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Letter::Single(c) => write!(f, "{c}"),
+            Letter::Overflow(c) => write!(f, "{OVERFLOW_PREFIX}{c}"),
+        }
+    }
+}
+
+/// A single letter (tests and callers that only deal in singles).
+impl From<char> for Letter {
+    fn from(c: char) -> Letter {
+        Letter::Single(c)
+    }
+}
+
+/// An `@agent_key` value → its key ([`Letter::parse`]).
+pub fn parse_key(raw: &str) -> Option<Letter> {
+    Letter::parse(raw)
 }
 
 /// The window id's number, `@12` → 12 (unparseable: last).
@@ -69,14 +142,14 @@ fn id_num(id: &str) -> u64 {
     id.strip_prefix('@').and_then(|n| n.parse().ok()).unwrap_or(u64::MAX)
 }
 
-/// One `@agent_key` write: set the letter (Some) or unset a stale one (None).
-pub type Write = (String, Option<char>);
+/// One `@agent_key` write: set the key (Some) or unset a stale one (None).
+pub type Write = (String, Option<Letter>);
 
 /// [`assign`]'s result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Assigned {
-    /// window id → its letter (agents past the 26th have none).
-    pub letters: HashMap<String, char>,
+    /// window id → its key (windows past the 52nd have none).
+    pub letters: HashMap<String, Letter>,
     /// What must be stored for the frame to be true next time, in display
     /// order (then the unsets).
     pub writes: Vec<Write>,
@@ -88,13 +161,13 @@ pub struct Assigned {
 /// other window of the snapshot with its `@agent_key`.
 pub fn assign(listed: &[(String, String)], unlisted: &[(String, String)]) -> Assigned {
     let mut seen: HashSet<&str> = HashSet::new();
-    let agents: Vec<(&str, Option<char>)> = listed
+    let agents: Vec<(&str, Option<Letter>)> = listed
         .iter()
         .filter(|(id, _)| seen.insert(id.as_str()))
         .map(|(id, raw)| (id.as_str(), parse_key(raw)))
         .collect();
     // 1. Valid keys: the lowest numeric window id holds a contested letter.
-    let mut holder: HashMap<char, &str> = HashMap::new();
+    let mut holder: HashMap<Letter, &str> = HashMap::new();
     for &(id, key) in &agents {
         if let Some(c) = key {
             match holder.get(&c) {
@@ -105,9 +178,10 @@ pub fn assign(listed: &[(String, String)], unlisted: &[(String, String)]) -> Ass
             }
         }
     }
-    let mut letters: HashMap<String, char> = holder.iter().map(|(&c, &id)| (id.to_string(), c)).collect();
-    // 2. The rest, in display order: the lowest free letter.
-    let mut free = ALPHABET.iter().copied().filter(|c| !holder.contains_key(c));
+    let mut letters: HashMap<String, Letter> = holder.iter().map(|(&c, &id)| (id.to_string(), c)).collect();
+    // 2. The rest, in display order: the lowest free key (singles, then
+    // overflow).
+    let mut free = Letter::all().filter(|c| !holder.contains_key(c));
     for &(id, _) in &agents {
         if letters.contains_key(id) {
             continue;
@@ -116,7 +190,7 @@ pub fn assign(listed: &[(String, String)], unlisted: &[(String, String)]) -> Ass
             Some(c) => {
                 letters.insert(id.to_string(), c);
             }
-            None => break, // 3. past 26: no letter
+            None => break, // 3. past 52: no key
         }
     }
     let mut writes: Vec<Write> = agents
@@ -127,7 +201,7 @@ pub fn assign(listed: &[(String, String)], unlisted: &[(String, String)]) -> Ass
         })
         .collect();
     // 4. Stale claims on windows that are no longer listed.
-    let held: HashSet<char> = letters.values().copied().collect();
+    let held: HashSet<Letter> = letters.values().copied().collect();
     let mut gone: HashSet<&str> = HashSet::new();
     for (id, raw) in unlisted {
         if seen.contains(id.as_str()) || !gone.insert(id.as_str()) {
@@ -192,7 +266,7 @@ pub fn of_view(snap: &Snapshot, view: &ViewModel, keys: Option<&mut KeyMemo>) ->
     };
     // (A window that is a home in ANY of its links is a home: never listed.)
     // The FILL order: every agent first (display order), then every shell,
-    // so past 26 a new agent still gets a letter before a shell does.
+    // so when keys run short a new agent still gets one before a shell does.
     let (agents, shells): (Vec<&Agent>, Vec<&Agent>) =
         lettered(view).into_iter().filter(|a| !homes.contains(a.window_id.as_str())).partition(|a| !a.state.is_empty());
     let shown: Vec<(String, String)> =
@@ -219,7 +293,9 @@ pub fn of_view(snap: &Snapshot, view: &ViewModel, keys: Option<&mut KeyMemo>) ->
 /// The ONE tmux command line (`;`-separated) that stores `writes`. Every
 /// command is `-q`: tmux aborts a `;` list at its first error, so without
 /// it a window closed since the snapshot (`-t @999`: no such window) would
-/// drop every write after its own.
+/// drop every write after its own. (An overflow value `;a` is one argv word,
+/// never a separator: tmux splits a command list only at a word that ENDS
+/// in `;`.)
 pub fn command(writes: &[Write]) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     for (id, key) in writes {
@@ -242,7 +318,7 @@ pub const RESEND_AFTER: Duration = Duration::from_millis(2500);
 /// has been re-sent already.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Sent {
-    key: Option<char>,
+    key: Option<Letter>,
     at: Instant,
     resent: bool,
 }
@@ -324,87 +400,157 @@ mod tests {
         v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
     }
 
-    fn got(a: &Assigned, id: &str) -> Option<char> {
-        a.letters.get(id).copied()
+    /// `id`'s key as stored (`a`, `;a`; "" none).
+    fn got(a: &Assigned, id: &str) -> String {
+        a.letters.get(id).map(Letter::to_string).unwrap_or_default()
+    }
+
+    fn s(c: char) -> Letter {
+        Letter::Single(c)
+    }
+
+    /// A write of `key` ("" an unset).
+    fn w(id: &str, key: &str) -> Write {
+        (id.into(), Letter::parse(key))
     }
 
     #[test]
     fn keys_parse_strictly() {
         assert_eq!(ALPHABET.iter().collect::<HashSet<_>>().len(), 26);
-        for (raw, want) in [("a", Some('a')), ("m", Some('m')), ("", None), ("A", None), ("ab", None), (" a", None),
-            ("1", None), ("é", None)] {
+        let (s, o) = (Letter::Single, Letter::Overflow);
+        for (raw, want) in [("a", Some(s('a'))), ("m", Some(s('m'))), (";a", Some(o('a'))), (";m", Some(o('m'))),
+            ("", None), ("A", None), ("ab", None), (" a", None), ("1", None), ("é", None), (";", None), (";;", None),
+            (";A", None), (";ab", None), ("a;", None), (":a", None), (" ;a", None)] {
             assert_eq!(parse_key(raw), want, "{raw:?}");
         }
+        // Round trip, the cap's 3 cells, the hand-out order.
+        for k in Letter::all() {
+            assert_eq!(Letter::parse(&k.to_string()), Some(k));
+            assert_eq!(k.cap().chars().count(), 3, "{k}");
+        }
+        assert_eq!((s('a').cap(), o('a').cap(), o('k').to_string()), (" a ".into(), ";a ".into(), ";k".to_string()));
+        let all: Vec<Letter> = Letter::all().collect();
+        assert_eq!((all.len(), all[0], all[25], all[26], all[51]), (52, s('a'), s('m'), o('a'), o('m')));
+        assert!(s('z') < o('a'), "singles sort first");
     }
 
     #[test]
     fn fresh_agents_get_home_row_letters_in_display_order() {
         let a = assign(&l(&[("@5", ""), ("@2", ""), ("@9", "")]), &[]);
-        assert_eq!((got(&a, "@5"), got(&a, "@2"), got(&a, "@9")), (Some('a'), Some('s'), Some('d')));
-        assert_eq!(a.writes, [("@5".into(), Some('a')), ("@2".into(), Some('s')), ("@9".into(), Some('d'))]);
+        assert_eq!([got(&a, "@5"), got(&a, "@2"), got(&a, "@9")], ["a", "s", "d"]);
+        assert_eq!(a.writes, [w("@5", "a"), w("@2", "s"), w("@9", "d")]);
     }
 
     /// Stable across refreshes: once stored, nothing moves and nothing is written.
     #[test]
     fn stored_letters_stick() {
         let a = assign(&l(&[("@5", "a"), ("@2", "s"), ("@9", "d")]), &[]);
-        assert_eq!((got(&a, "@5"), got(&a, "@2"), got(&a, "@9")), (Some('a'), Some('s'), Some('d')));
+        assert_eq!([got(&a, "@5"), got(&a, "@2"), got(&a, "@9")], ["a", "s", "d"]);
         assert!(a.writes.is_empty());
         // A new agent listed FIRST does not take anyone's letter: the lowest free.
         let a = assign(&l(&[("@20", ""), ("@5", "a"), ("@2", "s"), ("@9", "d")]), &[]);
-        assert_eq!(got(&a, "@20"), Some('f'));
-        assert_eq!(a.writes, [("@20".into(), Some('f'))]);
+        assert_eq!(got(&a, "@20"), "f");
+        assert_eq!(a.writes, [w("@20", "f")]);
     }
 
     /// A close frees the letter; the next newcomer reuses the lowest free one.
     #[test]
     fn lowest_free_reuse_after_a_close() {
         let a = assign(&l(&[("@5", "a"), ("@9", "d")]), &[]); // @2 (s) closed
-        assert_eq!((got(&a, "@5"), got(&a, "@9")), (Some('a'), Some('d')));
+        assert_eq!([got(&a, "@5"), got(&a, "@9")], ["a", "d"]);
         let a = assign(&l(&[("@5", "a"), ("@9", "d"), ("@30", "")]), &[]);
-        assert_eq!(got(&a, "@30"), Some('s'));
+        assert_eq!(got(&a, "@30"), "s");
         // A parked agent is unlisted: its letter is free; it keeps the option,
         // which is unset once someone else holds that letter.
         let a = assign(&l(&[("@5", "a"), ("@9", "d"), ("@30", "")]), &l(&[("@2", "s"), ("@7", "k"), ("@8", "")]));
-        assert_eq!(got(&a, "@30"), Some('s'));
-        assert_eq!(a.writes, [("@30".into(), Some('s')), ("@2".into(), None)]); // @7's k is nobody's: left alone
+        assert_eq!(got(&a, "@30"), "s");
+        assert_eq!(a.writes, [w("@30", "s"), w("@2", "")]); // @7's k is nobody's: left alone
         // Back from the stash with its option unset: the lowest free letter.
         let a = assign(&l(&[("@2", ""), ("@5", "a"), ("@9", "d"), ("@30", "s")]), &[]);
-        assert_eq!(got(&a, "@2"), Some('f'));
+        assert_eq!(got(&a, "@2"), "f");
         // ...or, when its letter is still free, its own letter back.
         let a = assign(&l(&[("@2", "s"), ("@5", "a"), ("@9", "d")]), &[]);
-        assert_eq!(got(&a, "@2"), Some('s'));
+        assert_eq!(got(&a, "@2"), "s");
         assert!(a.writes.is_empty());
     }
 
     #[test]
     fn duplicates_go_to_the_lower_window_id() {
         let a = assign(&l(&[("@12", "a"), ("@3", "a"), ("@40", "s")]), &[]);
-        assert_eq!((got(&a, "@3"), got(&a, "@12"), got(&a, "@40")), (Some('a'), Some('d'), Some('s')));
-        assert_eq!(a.writes, [("@12".into(), Some('d'))]);
+        assert_eq!([got(&a, "@3"), got(&a, "@12"), got(&a, "@40")], ["a", "d", "s"]);
+        assert_eq!(a.writes, [w("@12", "d")]);
         // Junk is reassigned like no key; a linked window (listed twice) is one agent.
         let a = assign(&l(&[("@1", "Z"), ("@2", "s"), ("@2", "s"), ("@1", "Z")]), &[]);
-        assert_eq!((got(&a, "@1"), got(&a, "@2"), a.letters.len()), (Some('a'), Some('s'), 2));
-        assert_eq!(a.writes, [("@1".into(), Some('a'))]);
+        assert_eq!([got(&a, "@1"), got(&a, "@2")], ["a", "s"]);
+        assert_eq!(a.letters.len(), 2);
+        assert_eq!(a.writes, [w("@1", "a")]);
         // A listed window is never "unlisted" too.
         let a = assign(&l(&[("@1", "a")]), &l(&[("@1", "a")]));
         assert!(a.writes.is_empty());
     }
 
+    /// Past the 26 singles: the overflow keys `;a ;s ;d …`, in the same
+    /// home-row order; past 52 none.
     #[test]
-    fn past_26_agents_have_no_letter() {
+    fn past_26_windows_get_overflow_keys() {
         let many: Vec<(String, String)> = (1..=30).map(|i| (format!("@{i}"), String::new())).collect();
         let a = assign(&many, &[]);
-        assert_eq!(a.letters.len(), 26);
-        assert_eq!((got(&a, "@1"), got(&a, "@26"), got(&a, "@27"), got(&a, "@30")), (Some('a'), Some('m'), None, None));
-        assert_eq!(a.writes.len(), 26);
-        // One of the 26 closes: the 27th takes its letter.
-        let mut stored: Vec<(String, String)> =
-            many.iter().map(|(id, _)| (id.clone(), got(&a, id).map(String::from).unwrap_or_default())).collect();
+        assert_eq!(a.letters.len(), 30);
+        assert_eq!([got(&a, "@1"), got(&a, "@26")], ["a", "m"]);
+        assert_eq!([got(&a, "@27"), got(&a, "@28"), got(&a, "@29"), got(&a, "@30")], [";a", ";s", ";d", ";f"]);
+        assert_eq!(a.letters.values().filter(|k| !k.is_overflow()).count(), 26);
+        assert_eq!(a.writes.len(), 30);
+        assert_eq!(a.writes[26], w("@27", ";a"));
+        // 60 windows: 52 keys, the last 8 none.
+        let lots: Vec<(String, String)> = (1..=60).map(|i| (format!("@{i}"), String::new())).collect();
+        let b = assign(&lots, &[]);
+        assert_eq!(b.letters.len(), 52);
+        assert_eq!([got(&b, "@52"), got(&b, "@53"), got(&b, "@60")], [";m", "", ""]);
+    }
+
+    /// An overflow holder keeps `;a` for life: a single that frees up goes to
+    /// the NEXT newcomer, never to it.
+    #[test]
+    fn overflow_holder_keeps_its_key_when_a_single_frees() {
+        let many: Vec<(String, String)> = (1..=28).map(|i| (format!("@{i}"), String::new())).collect();
+        let a = assign(&many, &[]);
+        let mut stored: Vec<(String, String)> = many.iter().map(|(id, _)| (id.clone(), got(&a, id))).collect();
+        assert_eq!([&stored[26].1, &stored[27].1], [";a", ";s"]);
         stored.remove(4); // @5 (g) closed
         let b = assign(&stored, &[]);
-        assert_eq!((got(&b, "@27"), got(&b, "@28")), (Some('g'), None));
-        assert_eq!(b.writes, [("@27".into(), Some('g'))]);
+        assert_eq!([got(&b, "@27"), got(&b, "@28")], [";a", ";s"]);
+        assert!(b.writes.is_empty(), "{:?}", b.writes);
+        // The next window takes the freed single, not ;d.
+        stored.push(("@29".into(), String::new()));
+        let c = assign(&stored, &[]);
+        assert_eq!((got(&c, "@29"), c.writes.clone()), ("g".to_string(), vec![w("@29", "g")]));
+        // An overflow holder that closes frees its key for the next one past 26.
+        stored.last_mut().unwrap().1 = "g".into(); // @29's write landed
+        stored.retain(|(id, _)| id != "@27");
+        stored.push(("@30".into(), String::new()));
+        let d = assign(&stored, &[]);
+        assert_eq!(got(&d, "@30"), ";a");
+    }
+
+    /// Duplicates of an overflow key go to the lower window id; junk keys
+    /// (`;;`, `;A`, `ab`, a lone `;`) are reassigned like no key.
+    #[test]
+    fn overflow_duplicates_and_junk() {
+        let mut v: Vec<(String, String)> = ALPHABET.iter().enumerate().map(|(i, c)| (format!("@{}", i + 1), c.to_string())).collect();
+        v.extend(l(&[("@40", ";a"), ("@31", ";a"), ("@32", ";;"), ("@33", ";A"), ("@34", "ab"), ("@35", ";")]));
+        let a = assign(&v, &[]);
+        assert_eq!(got(&a, "@31"), ";a");
+        // In display order: @40 (the duplicate's loser), then the junk.
+        assert_eq!([got(&a, "@40"), got(&a, "@32"), got(&a, "@33"), got(&a, "@34"), got(&a, "@35")],
+            [";s", ";d", ";f", ";g", ";h"]);
+        assert_eq!(a.writes, [w("@40", ";s"), w("@32", ";d"), w("@33", ";f"), w("@34", ";g"), w("@35", ";h")]);
+        // A single and an overflow key of the same letter are different keys.
+        let a = assign(&l(&[("@1", "a"), ("@2", ";a")]), &[]);
+        assert_eq!([got(&a, "@1"), got(&a, "@2")], ["a", ";a"]);
+        assert!(a.writes.is_empty());
+        // A stale overflow claim on an unlisted window is unset once held.
+        let a = assign(&l(&[("@2", ";a")]), &l(&[("@9", ";a"), ("@8", ";s")]));
+        assert_eq!(a.writes, [w("@9", "")]);
     }
 
     /// [`of_view`] over a snapshot, as the menu and the sidebar call it
@@ -454,7 +600,7 @@ mod tests {
     fn shells_share_the_pool_and_homes_never_get_one() {
         let a = of_rows(&pool(&[]));
         let got = |id: &str| a.letters.get(id).copied();
-        assert_eq!([got("@8"), got("@2"), got("@4"), got("@6"), got("@3")], [Some('a'), Some('s'), Some('d'), Some('f'), Some('g')]);
+        assert_eq!([got("@8"), got("@2"), got("@4"), got("@6"), got("@3")], [Some(s('a')), Some(s('s')), Some(s('d')), Some(s('f')), Some(s('g'))]);
         assert_eq!((got("@1"), got("@5"), got("@7")), (None, None, None));
         assert_eq!(a.letters.len(), 5);
         // No letter is both a shell's and an agent's.
@@ -462,14 +608,15 @@ mod tests {
         // A shell holding a letter an agent also claims: one pool, the lower
         // window id keeps it, the other moves.
         let a = of_rows(&pool(&[("@3", "key", "a"), ("@6", "key", "a")]));
-        assert_eq!((a.letters["@3"], a.letters["@6"]), ('a', 'g'));
+        assert_eq!((a.letters["@3"], a.letters["@6"]), (s('a'), s('g')));
         // @spaces off (classic, no ⌥W table): agents only, as before.
         let a = of_rows(&pool(&[("classic", "", "")]));
         assert_eq!((a.letters.len(), a.letters.get("@3"), a.letters.get("@6")), (3, None, None));
     }
 
     /// Past 26: agents before shells. With every letter but one held by
-    /// stored shells, a new agent takes the free one; a new shell gets none.
+    /// stored shells, a new agent takes the free single; a new shell gets the
+    /// first overflow key.
     #[test]
     fn agents_fill_before_shells_past_26() {
         let mut rows: Vec<String> = Vec::new();
@@ -480,10 +627,10 @@ mod tests {
         rows.push(crate::tmux::tests::row("zz", 1, "@27", &[("state", "running")])); // a new agent, last
         rows.push("\x1fclient\x1f/dev/ttys999\x1f@1\x1fmain\x1fon\x1f\x1f".into());
         let a = of_rows(&rows);
-        assert_eq!((a.letters.get("@27"), a.letters.get("@26")), (Some(&'m'), None));
-        assert_eq!(a.writes, [("@27".to_string(), Some('m'))]);
+        assert_eq!([got(&a, "@27"), got(&a, "@26")], ["m", ";a"]);
+        assert_eq!(a.writes, [w("@27", "m"), w("@26", ";a")]);
         // Stored letters still stick: the shells keep all 25.
-        assert_eq!(a.letters.len(), 26);
+        assert_eq!(a.letters.len(), 27);
     }
 
     /// A window keeps its letter for life: a shell where an agent starts, and
@@ -512,16 +659,44 @@ mod tests {
     #[test]
     fn one_batched_command() {
         assert!(command(&[]).is_empty());
-        let c = command(&[("@3".into(), Some('a')), ("@9".into(), None)]);
+        let c = command(&[("@3".into(), Some(s('a'))), ("@9".into(), None)]);
         assert_eq!(c, ["set-option", "-q", "-w", "-t", "@3", "@agent_key", "a", ";", "set-option", "-q", "-wu", "-t",
             "@9", "@agent_key"]);
+        // An overflow key is ONE word `;a` (tmux splits only at a word ending in `;`).
+        let c = command(&[w("@3", ";a"), w("@4", "s")]);
+        assert_eq!(c, ["set-option", "-q", "-w", "-t", "@3", "@agent_key", ";a", ";", "set-option", "-q", "-w", "-t",
+            "@4", "@agent_key", "s"]);
+    }
+
+    /// The memo deals in overflow keys like singles.
+    #[test]
+    fn memo_settles_overflow_keys() {
+        let t = Instant::now();
+        let mut m = KeyMemo::default();
+        assert_eq!(m.fresh(vec![w("@3", ";a")], t).len(), 1);
+        assert_eq!(m.effective("@3", ""), ";a");
+        m.settle([("@3", "a")]); // a single `a` is not `;a`: still in flight
+        assert!(!m.is_empty());
+        m.settle([("@3", ";a")]);
+        assert!(m.is_empty());
+    }
+
+    /// Through [`of_view`]: 28 agents in one space, the last two `;a ;s`.
+    #[test]
+    fn of_view_hands_out_overflow_keys() {
+        let mut rows: Vec<String> =
+            (1..=28).map(|i| crate::tmux::tests::row("main", i, &format!("@{i}"), &[("state", "idle")])).collect();
+        rows.push("\x1fclient\x1f/dev/ttys999\x1f@1\x1fmain\x1fon\x1f\x1f".into());
+        let a = of_rows(&rows);
+        assert_eq!([got(&a, "@1"), got(&a, "@26"), got(&a, "@27"), got(&a, "@28")], ["a", "m", ";a", ";s"]);
+        assert_eq!(a.writes.len(), 28);
     }
 
     /// A target that is gone by the time tmux runs the list (`@999`) must
     /// not abort the writes after it: every command in the list is `-q`.
     #[test]
     fn dead_target_never_aborts_the_batch() {
-        let c = command(&[("@999".into(), Some('a')), ("@4".into(), Some('s')), ("@998".into(), None), ("@5".into(), Some('d'))]);
+        let c = command(&[("@999".into(), Some(s('a'))), ("@4".into(), Some(s('s'))), ("@998".into(), None), ("@5".into(), Some(s('d')))]);
         let cmds: Vec<&[String]> = c.split(|a| a == ";").collect();
         assert_eq!(cmds.len(), 4);
         for cmd in &cmds {
@@ -536,15 +711,15 @@ mod tests {
     fn memo_resends_once_after_the_ttl() {
         let t0 = Instant::now();
         let mut m = KeyMemo::default();
-        assert_eq!(m.fresh(vec![("@4".into(), Some('s'))], t0).len(), 1);
+        assert_eq!(m.fresh(vec![("@4".into(), Some(s('s')))], t0).len(), 1);
         m.settle([("@4", "")]); // not applied yet
         assert!(m.due(t0 + Duration::from_millis(500)).is_empty()); // too early
         assert!(m.due(t0 + RESEND_AFTER - Duration::from_millis(1)).is_empty());
-        assert_eq!(m.due(t0 + RESEND_AFTER), [("@4".to_string(), Some('s'))]);
+        assert_eq!(m.due(t0 + RESEND_AFTER), [("@4".to_string(), Some(s('s')))]);
         // Once only, however long it stays unseen; the letter still holds.
         m.settle([("@4", "")]);
         assert!(m.due(t0 + RESEND_AFTER * 3).is_empty());
-        assert!(m.fresh(vec![("@4".into(), Some('s'))], t0 + RESEND_AFTER * 3).is_empty());
+        assert!(m.fresh(vec![("@4".into(), Some(s('s')))], t0 + RESEND_AFTER * 3).is_empty());
         assert_eq!(m.effective("@4", ""), "s");
         // An unset write the same way.
         let mut m = KeyMemo::default();
@@ -553,14 +728,14 @@ mod tests {
         assert_eq!(m.due(t0 + RESEND_AFTER), [("@6".to_string(), None)]);
         // The window closed: forgotten by settle, never re-sent.
         let mut m = KeyMemo::default();
-        m.fresh(vec![("@7".into(), Some('d')), ("@8".into(), Some('f'))], t0);
+        m.fresh(vec![("@7".into(), Some(s('d'))), ("@8".into(), Some(s('f')))], t0);
         m.settle([("@8", "")]); // @7 is gone
-        assert_eq!(m.due(t0 + RESEND_AFTER * 2), [("@8".to_string(), Some('f'))]);
+        assert_eq!(m.due(t0 + RESEND_AFTER * 2), [("@8".to_string(), Some(s('f')))]);
         m.settle([]);
         assert!(m.is_empty() && m.due(t0 + RESEND_AFTER * 9).is_empty());
         // Seen in time: nothing to re-send.
         let mut m = KeyMemo::default();
-        m.fresh(vec![("@9".into(), Some('g'))], t0);
+        m.fresh(vec![("@9".into(), Some(s('g')))], t0);
         m.settle([("@9", "g")]);
         assert!(m.due(t0 + RESEND_AFTER * 2).is_empty());
     }
@@ -569,7 +744,7 @@ mod tests {
     fn memo_never_resends_and_settles() {
         let t = Instant::now();
         let mut m = KeyMemo::default();
-        let w = vec![("@3".to_string(), Some('a')), ("@9".to_string(), None)];
+        let w = vec![("@3".to_string(), Some(s('a'))), ("@9".to_string(), None)];
         assert_eq!(m.fresh(w.clone(), t), w);
         assert!(m.fresh(w.clone(), t).is_empty()); // tmux has not caught up: not again
         assert_eq!((m.effective("@3", ""), m.effective("@9", "s"), m.effective("@4", "k")), ("a".into(), "".into(), "k".into()));
@@ -580,11 +755,11 @@ mod tests {
         m.settle([("@3", "a"), ("@9", "")]);
         assert!(m.is_empty());
         // A window that closed before its write landed is forgotten too.
-        m.fresh(vec![("@5".into(), Some('d'))], t);
+        m.fresh(vec![("@5".into(), Some(s('d')))], t);
         m.settle([("@3", "a")]);
         assert!(m.is_empty());
         // A different value for the same window is a new write.
-        m.fresh(vec![("@5".into(), Some('d'))], t);
-        assert_eq!(m.fresh(vec![("@5".into(), Some('f'))], t).len(), 1);
+        m.fresh(vec![("@5".into(), Some(s('d')))], t);
+        assert_eq!(m.fresh(vec![("@5".into(), Some(s('f')))], t).len(), 1);
     }
 }

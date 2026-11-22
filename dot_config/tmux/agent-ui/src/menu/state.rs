@@ -51,7 +51,7 @@
 //!   own park/close of the client's window is followed, not closed on.
 
 use super::keys::{Key, Mouse};
-use super::letters::ALPHABET;
+use super::letters::{Letter, ALPHABET, OVERFLOW_PREFIX};
 use super::rows::{build_rows, need_of, Data, Row, RowKey, Tab, Target};
 use crate::actions::TAB_MOVED;
 use crate::ansi::StyledLine;
@@ -64,9 +64,10 @@ use std::collections::{BTreeMap, HashMap};
 pub struct Drawn {
     /// The window rows on screen, in display order.
     pub rows: Vec<Target>,
-    /// Letter → the row it goes to, for every letter in the frame's data:
-    /// its first row on screen, else its first row in the All order.
-    pub letters: BTreeMap<char, Target>,
+    /// Key (a letter, or an overflow `;a`) → the row it goes to, for every
+    /// key in the frame's data: its first row on screen, else its first row
+    /// in the All order.
+    pub letters: BTreeMap<Letter, Target>,
     /// Where ⌥W goes in this frame.
     pub last: Option<Target>,
 }
@@ -294,6 +295,9 @@ pub struct Menu {
     pub prompt_shown: bool,
     /// Space: the actions strip is open for this row.
     pub actions: Option<Target>,
+    /// `;` was typed: the next letter is an OVERFLOW key (`;a`); anything
+    /// else (Esc included) only cancels this.
+    pub overflow: bool,
     /// The bottom preview strip is on (Space p). Off by default.
     pub preview: bool,
     pub msg: String,
@@ -341,6 +345,7 @@ impl Menu {
             confirm: None,
             prompt_shown: false,
             actions: None,
+            overflow: false,
             preview: false,
             msg: String::new(),
             msg_until: 0.0,
@@ -576,8 +581,9 @@ impl Menu {
         }
     }
 
-    /// A letter: the window holding it in the frame on screen.
-    fn letter(&mut self, c: char, fx: &mut dyn Effects) -> bool {
+    /// A letter (or an overflow `;a`): the window holding it in the frame
+    /// on screen.
+    fn letter(&mut self, c: Letter, fx: &mut dyn Effects) -> bool {
         match self.drawn.letters.get(&c).cloned() {
             Some(t) => self.go(&t, fx),
             None => {
@@ -721,6 +727,7 @@ impl Menu {
             return self.mouse(m, fx);
         }
         if key == Key::AltW {
+            self.overflow = false; // a pending `;` is spent either way
             return self.last(fx); // the key that opened the menu: the last agent, or close
         }
         if self.confirm.is_some() {
@@ -740,7 +747,16 @@ impl Menu {
         if self.searching {
             return self.search_key(key, fx);
         }
+        if std::mem::take(&mut self.overflow) {
+            // `;` then a letter (capitals too): that overflow key. Anything
+            // else (Esc, a digit, a second `;`) only cancels the `;`.
+            return match key {
+                Key::Char(c) => letter_key(c).is_some_and(|l| self.letter(Letter::Overflow(l), fx)),
+                _ => false,
+            };
+        }
         match key {
+            Key::Char(OVERFLOW_PREFIX) => self.overflow = true,
             // (On the fold row Space does nothing: it falls through below.)
             Key::Char(' ') if self.sel != Some(RowKey::Fold) => self.actions = self.checked_selection(),
             Key::Char('/') => {
@@ -749,7 +765,7 @@ impl Menu {
             }
             Key::Char(c) => {
                 if let Some(l) = letter_key(c) {
-                    return self.letter(l, fx);
+                    return self.letter(Letter::Single(l), fx);
                 }
             }
             Key::Enter => return self.enter(fx, true),
@@ -778,6 +794,7 @@ impl Menu {
     /// or the actions strip (and only that). The wheel only scrolls.
     fn mouse(&mut self, m: Mouse, fx: &mut dyn Effects) -> bool {
         if let Some(d) = m.wheel() {
+            self.overflow = false; // scrolling drops a pending `;`
             if self.confirm.is_none() {
                 self.scroll(d);
             }
@@ -786,7 +803,7 @@ impl Menu {
         if !m.is_click() {
             return false;
         }
-        if self.confirm.take().is_some() || self.actions.take().is_some() {
+        if self.confirm.take().is_some() || self.actions.take().is_some() || std::mem::take(&mut self.overflow) {
             return false;
         }
         let Some(hit) = self.hit(m.col, m.row).cloned() else { return false };
@@ -1051,6 +1068,65 @@ pub(crate) mod tests {
         assert_eq!(fx.calls[4], "go @8 Alpha");
     }
 
+    /// `;` then a letter: the overflow key `;a`. Esc, a digit or a second
+    /// `;` after the `;` cancels only the `;` (the menu stays, nothing goes).
+    #[test]
+    fn overflow_keys_go_after_a_semicolon() {
+        let mut fx = Rec::default();
+        let overflowed = || {
+            let mut d = data();
+            d.letters.insert("@7".into(), Letter::Overflow('a')); // work's @7: `;a`, not j
+            let mut m = Menu::new(d, Tab::All);
+            draw_all(&mut m);
+            m
+        };
+        assert!(overflowed().handle(&[Char(';'), Char('a')], &mut fx));
+        assert!(overflowed().handle(&[Char(';'), Char('A')], &mut fx)); // capitals too
+        assert_eq!(fx.calls, ["go @7 work", "go @7 work"]);
+        // A plain `a` is still Alpha's single.
+        assert!(overflowed().handle(&[Char('a')], &mut fx));
+        assert_eq!(fx.calls[2], "go @8 Alpha");
+        // Nobody on ;s: says so, stays.
+        let mut m = overflowed();
+        assert!(!m.handle(&[Char(';'), Char('s')], &mut fx));
+        assert_eq!(m.msg, "nothing on ;s");
+        // Cancelled by Esc / a digit / another `;`: the next letter is a single again.
+        for cancel in [Key::Esc, Char('1'), Char(';')] {
+            let mut m = overflowed();
+            assert!(!m.handle(&[Char(';'), cancel], &mut fx), "{cancel:?}");
+            assert!(!m.overflow, "{cancel:?}");
+            assert!(m.handle(&[Char('d')], &mut fx));
+        }
+        assert_eq!(fx.calls[3..], ["go @2 main", "go @2 main", "go @2 main"]);
+        // While searching, `;` is just text.
+        let mut m = overflowed();
+        m.handle(&[Char('/'), Char(';')], &mut fx);
+        assert!(m.searching && !m.overflow && m.query == ";");
+    }
+
+    /// ⌥W after `;` spends the `;`: when its go fails (the menu stays, the
+    /// footer saying why), the next `a` is Alpha's single, not `;a`.
+    #[test]
+    fn alt_w_clears_a_pending_semicolon() {
+        let mut d = data();
+        d.letters.insert("@7".into(), Letter::Overflow('a'));
+        d.last = Some("@2".into());
+        let mut m = Menu::new(d, Tab::All);
+        draw_all(&mut m);
+        let mut fx = Rec { go_err: Some("gone".into()), ..Rec::default() };
+        assert!(!m.handle(&[Char(';'), Key::AltW], &mut fx), "the go failed: the menu stays");
+        assert_eq!(fx.calls, ["go @2 main"]);
+        assert!(!m.overflow, "⌥W spent the `;`");
+        assert_eq!(m.msg, "gone");
+        fx.go_err = None;
+        assert!(m.handle(&[Char('a')], &mut fx));
+        assert_eq!(fx.calls[1], "go @8 Alpha");
+        // A wheel notch drops a pending `;` too.
+        m.overflow = true;
+        m.act(Key::Mouse(crate::menu::keys::Mouse { button: 64, col: 5, row: 5, press: true }), &mut fx);
+        assert!(!m.overflow);
+    }
+
     /// The drawn-frame rule: a letter freed and handed to a newcomer between
     /// frames still means the window that held it when the frame was drawn;
     /// a letter that appeared since the draw does nothing until drawn.
@@ -1059,13 +1135,13 @@ pub(crate) mod tests {
         let mut fx = Rec::default();
         let base = stored(fixture());
         let mut m = menu_of(data_of(&base));
-        assert_eq!(m.drawn.letters[&'a'].win, "@8");
+        assert_eq!(m.drawn.letters[&'a'.into()].win, "@8");
         let mut snap = base.clone();
         snap.windows.retain(|w| w.id != "@8"); // @8 closes...
         snap.windows.push(crate::tmux::Window::parse(&crate::tmux::tests::row("work", 9, "@30",
             &[("state", "running")])).unwrap()); // ...and a newcomer takes a
         m.set_data(data_of(&snap));
-        assert_eq!(m.data.letter("@30"), Some('a'));
+        assert_eq!(m.data.letter("@30"), Some('a'.into()));
         assert!(m.handle(&[Char('a')], &mut fx));
         assert_eq!(fx.calls, ["go @8 Alpha"]); // the old window (gone: the real go refuses), never @30
         draw_all(&mut m);

@@ -416,13 +416,14 @@ fn guarded(t: &Target) -> bool {
         | Target::VoidArmed | Target::LimitResume(_))
 }
 
-/// Every cell of `f` whose click target ([`Frame::target`]) is [`guarded`].
-fn guarded_cells(f: &Frame) -> Vec<((u16, u16), Target)> {
+/// Every cell of `f` whose click target ([`Frame::target`]) is guarded
+/// (`g`: [`guarded`], or [`App::guarded_here`]).
+fn guarded_cells(f: &Frame, g: impl Fn(&Target) -> bool) -> Vec<((u16, u16), Target)> {
     let mut v = Vec::new();
     for (y, r) in f.rows.iter().enumerate() {
-        for (x0, x1, _) in r.targets.iter().filter(|(_, _, t)| guarded(t)) {
+        for (x0, x1, _) in r.targets.iter().filter(|(_, _, t)| g(t)) {
             for x in *x0..*x1 {
-                if let Some(t) = r.target_at(x).filter(|t| guarded(t)) {
+                if let Some(t) = r.target_at(x).filter(|t| g(t)) {
                     v.push(((x, y as u16), t.clone()));
                 }
             }
@@ -542,6 +543,9 @@ struct App {
     /// The last `agent-pause.py` line the banner handed `run-shell -b`
     /// (resume or void; observable for the tests).
     pause_ran: Option<String>,
+    /// The last toast action ([`status::Toast::action_line`]) a click handed
+    /// `run-shell -b` (observable for the tests).
+    toast_ran: Option<String>,
     /// The pins' state file kept in step with the windows ([`crate::pins`]);
     /// None: not this sidebar's job (`--once`, tests, another server).
     pins: Option<crate::pins::Sync>,
@@ -619,6 +623,7 @@ impl App {
             pause_stamp: None,
             void: None,
             pause_ran: None,
+            toast_ran: None,
             // (Turned on by `live` only, with the registry: never in tests.)
             pins: None,
             pin_keys: crate::pins::KeyMemo::default(),
@@ -1053,7 +1058,7 @@ impl App {
                 // A chip that only just arrived under the pointer: the click
                 // was most likely aimed at what was there before.
                 // (A diff badge too: it opens a popup.)
-                0 if t.as_ref().is_some_and(|t| guarded(t) && !self.arrivals.settled((x, y), t, Instant::now())) => {
+                0 if t.as_ref().is_some_and(|t| self.guarded_here(t) && !self.arrivals.settled((x, y), t, Instant::now())) => {
                     (act, unsettled) = (None, true);
                 }
                 0 => (act, unsettled) = (t, false),
@@ -1151,7 +1156,14 @@ impl App {
             return;
         }
         if let Target::Toast(id) = t {
-            // Here only: the other sidebars keep showing it.
+            // A toast with an action (`notify.sh -a`): run it on this
+            // sidebar's client (run-shell -b, silenced), then dismiss it as
+            // any toast. Here only: the other sidebars keep showing it.
+            let line = self.bar.toasts.iter().find(|x| x.id() == id).and_then(|x| x.action_line(self.link.client.as_deref()));
+            if let Some(line) = line {
+                let _ = self.core.tmux.run(&status::run_command(std::slice::from_ref(&line)));
+                self.toast_ran = Some(line);
+            }
             self.dismiss(id);
             return;
         }
@@ -1347,8 +1359,17 @@ impl App {
     /// `frame` is on screen as of `now`: clicks resolve against it, and the
     /// guarded targets' arrival times carry over where they stayed put.
     fn show(&mut self, frame: Frame, now: Instant) {
-        self.arrivals.update(guarded_cells(&frame), now);
+        let cells = guarded_cells(&frame, |t| self.guarded_here(t));
+        self.arrivals.update(cells, now);
         self.shown = frame;
+    }
+
+    /// [`guarded`], plus a toast card with a click action (`notify.sh -a`):
+    /// it runs something (a popup), and a toast lands over the top of the
+    /// sidebar unannounced, right where a click may be on its way. A toast
+    /// that only dismisses stays unguarded.
+    fn guarded_here(&self, t: &Target) -> bool {
+        guarded(t) || matches!(t, Target::Toast(id) if self.bar.toasts.iter().any(|x| x.id() == *id && x.action.is_some()))
     }
 
     /// agent-roster.py `main`'s loop: wait for input, a notice, the client's
@@ -2102,31 +2123,31 @@ mod tests {
         hide_homes(&mut a.core.snapshot);
         let mut keys = KeyMemo::default();
         let (v, writes) = build_view(&mut a.core, Some(cl), Some(&mut keys));
-        let got: Vec<(String, Option<char>)> = v.agents().map(|x| (x.window_id.clone(), x.letter)).collect();
-        assert_eq!(got, [("@1".into(), Some('s')), ("@2".into(), Some('a')), ("@3".into(), Some('d')), ("@4".into(), Some('f'))]);
+        let got: Vec<(String, Option<crate::menu::letters::Letter>)> = v.agents().map(|x| (x.window_id.clone(), x.letter)).collect();
+        assert_eq!(got, [("@1".into(), Some('s'.into())), ("@2".into(), Some('a'.into())), ("@3".into(), Some('d'.into())), ("@4".into(), Some('f'.into()))]);
         for (id, l) in &got {
             assert_eq!(*l, menu.letter(id), "{id}: the menu agrees");
         }
         // main's shell: its letter from the same pool, after every agent.
         let shell = v.spaces.iter().flat_map(|s| s.plain.iter()).find(|x| x.window_id == "@6").map(|x| x.letter);
-        assert_eq!((shell, menu.letter("@6")), (Some(Some('g')), Some('g')));
+        assert_eq!((shell, menu.letter("@6")), (Some(Some('g'.into())), Some('g'.into())));
         assert_eq!((menu.letter("@9"), menu.letter("@5")), (None, None));
         // NEEDS YOU cards carry the same letter.
-        assert_eq!(v.needs.iter().map(|n| n.agent.letter).collect::<Vec<_>>(), [Some('d')]);
+        assert_eq!(v.needs.iter().map(|n| n.agent.letter).collect::<Vec<_>>(), [Some('d'.into())]);
         let want: Vec<KeyWrite> =
-            vec![("@2".into(), Some('a')), ("@3".into(), Some('d')), ("@4".into(), Some('f')), ("@6".into(), Some('g')), ("@5".into(), None)];
+            vec![("@2".into(), Some('a'.into())), ("@3".into(), Some('d'.into())), ("@4".into(), Some('f'.into())), ("@6".into(), Some('g'.into())), ("@5".into(), None)];
         assert_eq!((&writes, &menu.key_writes), (&want, &want));
         // Idempotent: the same snapshot again sends nothing (in flight)...
         assert!(build_view(&mut a.core, Some(cl), Some(&mut keys)).1.is_empty());
         // ...and once tmux shows the writes, nothing either, the memo settled.
         for w in a.core.snapshot.windows.iter_mut() {
             if let Some((_, k)) = want.iter().find(|(id, _)| *id == w.id) {
-                w.key = k.map(String::from).unwrap_or_default();
+                w.key = k.map(|k| k.to_string()).unwrap_or_default();
             }
         }
         let (v2, again) = build_view(&mut a.core, Some(cl), Some(&mut keys));
         assert!(again.is_empty() && keys.is_empty());
-        assert_eq!(v2.agents().map(|x| x.letter).collect::<Vec<_>>(), [Some('s'), Some('a'), Some('d'), Some('f')]);
+        assert_eq!(v2.agents().map(|x| x.letter).collect::<Vec<_>>(), [Some('s'.into()), Some('a'.into()), Some('d'.into()), Some('f'.into())]);
         // `--once` (no memo) computes them but returns nothing to send.
         assert!(build_view(&mut a.core, Some(cl), None).1.is_empty());
     }
@@ -2149,6 +2170,7 @@ mod tests {
             client: String::new(),
             text: format!("parked {seq}"),
             title: None,
+            action: None,
         };
         let seqs = |a: &App| a.shown_bar().toasts.iter().map(|t| t.seq).collect::<Vec<_>>();
         let left = |a: &App| a.toast_due(Instant::now()).expect("a wakeup").saturating_duration_since(Instant::now());
@@ -2161,6 +2183,7 @@ mod tests {
         assert!(l > Duration::from_secs(55) && l <= Duration::from_secs(61), "{l:?}");
         a.handle(b"\x1b[<0;5;2M\x1b[<0;5;2m");
         assert_eq!((a.focus_backs, a.last_act.clone(), a.dismissed.clone()), (1, Some(Target::Toast((3, t0))), vec![(3, t0)]));
+        assert_eq!(a.toast_ran, None, "no action: a dismissal only");
         a.shown = frame(&a);
         assert!(a.shown.toast.is_empty() && seqs(&a).is_empty() && a.toast_due(Instant::now()).is_none());
         assert_eq!(a.bar.toasts.len(), 1, "only the drawing forgets it");
@@ -2181,7 +2204,9 @@ mod tests {
         a.shown = frame(&a);
         assert_eq!(a.shown.toast, 0..6);
         let l = left(&a);
-        assert!(l > Duration::from_secs(20) && l <= Duration::from_secs(26), "{l:?}");
+        // (Earliest deadline = the 20 s card's, t0 + 5 ms + 20 s: whatever
+        // ran since t0 eats into it, so the floor leaves a second of slack.)
+        assert!(l > Duration::from_secs(19) && l <= Duration::from_secs(21), "{l:?}");
         a.handle(b"\x1b[<0;20;5M\x1b[<0;20;5m");
         assert_eq!((a.focus_backs, a.dismissed.clone()), (2, vec![(6, t0 + 5)]));
         a.shown = frame(&a);
@@ -2219,6 +2244,60 @@ mod tests {
         assert!(a.toast_due(now).unwrap() <= now + Duration::from_millis(5));
         a.shown = frame(&a);
         assert_eq!((a.shown.toast.clone(), a.toast_due(now)), (0..0, None));
+    }
+
+    /// A toast with a click action (`notify.sh -a`, e.g. review-nudge.sh's
+    /// "Review agents"): a click runs it through `run-shell -b` (silenced,
+    /// [`status::run_command`]) with this sidebar's client in place of
+    /// `{client}` (the line recorded; the server is missing here, so nothing
+    /// runs), then dismisses it here. Its card is a guarded target (it
+    /// opens a popup, and toasts land unannounced): a click on one that only
+    /// just arrived under the pointer does nothing; a toast with no action
+    /// stays unguarded. Its title ends in ` ›`.
+    #[test]
+    fn a_click_on_an_actionable_toast_runs_it() {
+        use status::{Kind, Toast};
+        let mut a = app();
+        a.link.client = Some("/dev/ttys999".into());
+        let t0 = (text::now() * 1000.0) as i64;
+        let review = Toast {
+            seq: 9,
+            at_ms: t0,
+            kind: Kind::Info,
+            ttl: 45.0,
+            client: String::new(),
+            text: "9 agents idle 8h+".into(),
+            title: Some("Review agents".into()),
+            action: Some("'/s/review.sh' open {client}".into()),
+        };
+        a.bar.toasts = vec![review.clone()];
+        let frame = |a: &App| layout(&a.view, 34, 30, &Opts { bar: a.shown_bar(), now: Some(text::now()), ..Opts::default() });
+        let f = frame(&a);
+        assert!(f.rows[0].text().contains("Review agents ›"), "{:?}", f.rows[0].text());
+        assert!(a.guarded_here(&Target::Toast(review.id())) && !guarded(&Target::Toast(review.id())));
+        // Only just drawn: not trusted yet.
+        a.show(f, Instant::now());
+        a.handle(b"\x1b[<0;5;2M\x1b[<0;5;2m");
+        assert_eq!((a.last_act.clone(), a.toast_ran.clone(), a.dismissed.clone()), (None, None, vec![]));
+        // Settled: runs, then dismissed here.
+        a.arrivals = Default::default();
+        a.show(frame(&a), Instant::now() - crate::answer::SETTLE);
+        a.handle(b"\x1b[<0;5;2M\x1b[<0;5;2m");
+        let line = "'/s/review.sh' open '/dev/ttys999'";
+        assert_eq!((a.last_act.clone(), a.toast_ran.as_deref(), a.dismissed.clone()),
+            (Some(Target::Toast(review.id())), Some(line), vec![review.id()]));
+        assert_eq!(status::run_command(&[line.to_string()]),
+            ["run-shell", "-b", "{ '/s/review.sh' open '/dev/ttys999'\n} </dev/null >/dev/null 2>&1; true"]);
+        a.shown = frame(&a);
+        assert!(a.shown.toast.is_empty());
+        // A plain toast beside it is unguarded and only dismisses.
+        let plain = Toast { seq: 10, at_ms: t0 + 1, action: None, title: None, ..review.clone() };
+        assert!(!a.guarded_here(&Target::Toast(plain.id())));
+        a.toast_ran = None;
+        a.bar.toasts = vec![plain.clone()];
+        a.show(frame(&a), Instant::now());
+        a.handle(b"\x1b[<0;5;2M\x1b[<0;5;2m");
+        assert_eq!((a.toast_ran.clone(), a.dismissed.clone()), (None, vec![review.id(), plain.id()]));
     }
 
     /// A click on a settled pause banner (safe to close, ready) runs prefix
@@ -2283,7 +2362,7 @@ mod tests {
         // An agent whose PAUSE tmux-mcp holds: its row (under the banner's)
         // jumps to its tab, as its card would; a right press there parks
         // nothing.
-        let held = pause::Held { label: "P0a".into(), window_id: "@1".into(), why: "the pane is in copy mode".into(), session: "main".into(), letter: Some('k') };
+        let held = pause::Held { label: "P0a".into(), window_id: "@1".into(), why: "the pane is in copy mode".into(), session: "main".into(), letter: Some('k'.into()) };
         let tab = Target::Held { win: "@1".into(), session: "main".into() };
         a.pause_phase = Some(pause::Phase::Stopping { stopped: 1, n: 2, working: vec![], held: vec![held] });
         a.show(frame(&a), settled);

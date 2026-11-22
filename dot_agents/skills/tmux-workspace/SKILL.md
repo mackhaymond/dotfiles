@@ -87,13 +87,18 @@ tmux server (default socket)
   its letter as an agent, and an agent that exits back to a shell keeps it.
   The alphabet is handed out home row first: `a s d f g h j k l q w e r t y
   u i o p z x c v b n m`, in display order (spaces in ⌘N order; in each,
-  its agents by window index, then its shells). Every agent (not parked,
-  not in a hidden session) and every non-home shell of a space gets one;
-  homes never, parked windows never, and past 26 there are none. Parking
+  its agents by window index, then its shells). Past the 26 single letters
+  come the 26 **overflow keys** `;a ;s ;d … ;m` (same order; `@agent_key`
+  holds the two characters `;a`; reached with ⌥W `;` a; Mack says "agent
+  ;A" or "semicolon A"). Every single is handed out before any overflow
+  key, and an overflow holder keeps its key for life even when a single
+  frees up. Every agent (not parked, not in a hidden session) and every
+  non-home shell of a space gets one; homes never, parked windows never,
+  and past 52 there are none. Parking
   frees the letter: an unparked window gets it back only if nobody took it.
   Closing frees it at once. The sidebar and menu assign letters, so a
   brand-new window can be letterless for a moment (`·` on its status-line
-  tab). Always lowercase in tmux. "Agent D" = `@agent_key` `d` with
+  tab). Always lowercase in tmux (`;a`, never `;A`). "Agent D" = `@agent_key` `d` with
   `@agent_state` set; "shell E" = `@agent_key` `e`, no `@agent_state`, not
   a home. tmux-mcp and the agent recipes trust `@agent_key` as an AGENT's
   only while `@agent_state` is set, so tmux-mcp's pane `"e"` never finds a
@@ -160,6 +165,7 @@ parked. It has no letter, isn't messageable, and isn't listed by
 | They say | Means | Resolve |
 |---|---|---|
 | "agent D", "D", "tell D…" | the agent whose `@agent_key` is `d`, in any space (a bare "D" may be a shell's letter: recipe **letter** says which) | tmux MCP pane `"d"` (or `tmux://d/<handle>`); CLI: recipe **letter** |
+| "agent ;A", "semicolon A", ";a" | the window whose `@agent_key` is the overflow key `;a` (an agent or a shell, as for a letter) | tmux MCP pane `";a"` (or `tmux://;a/<handle>`; agents only); CLI: recipe **letter** with `L=';a'` |
 | "shell E", "E" (a shell) | the non-home shell whose `@agent_key` is `e`, no `@agent_state`, in any space | recipe **letter**, then tmux MCP by its pane id (`"%131"`); tmux-mcp's `"e"` finds agents only |
 | "the sidebar agent", "the tmux-mcp agent" | an agent by its title/topic | `list_panes` filter, or grep `@agent_summary` in recipe **map** |
 | "agent 3" | 3rd agent of the space Mack is looking at (no key does this any more; ask for the letter if unsure) | recipe **where is Mack**, then **ordinal**; then address it by its letter |
@@ -211,6 +217,7 @@ L=d; tmux list-windows -a -F '#{@space_hidden}|#{@agent_key}|#{session_name}:#{w
 ```
 
 For "agent D" only, add `&& $6=="agent"`; for "shell E", `&& $6=="shell"`.
+An overflow key works the same, quoted for the shell: `L=';a'`.
 
 **shell N**: shell N of space S by ordinal (home = 1; prints nothing if there is no such shell):
 
@@ -225,7 +232,7 @@ S=cua-notch N=1; tmux list-windows -t "=$S" -F '#{window_index} #{window_id} #{p
 **space**: space N → session: `tmux list-sessions -F '#{@space_index} #{session_name} #{session_path}' | awk -v n=3 '$1==n'`
 → `3 schedule /Users/mackhaymond/math_econ_sched`
 
-**where is Mack** (the client's space and tab; `table` is `prefix`/`jump` while a key is half-typed):
+**where is Mack** (the client's space and tab; `table` is `prefix`/`jump`/`jump2` while a key is half-typed):
 
 ```sh
 tmux list-clients -F '#{client_name} space=#{@space_index} #{session_name}:#{window_index} #{window_id} key=#{@agent_key} table=#{client_key_table}'
@@ -318,6 +325,7 @@ catches tmux drift; WezTerm, Karabiner and menu keys have no check.
 | ⌥L / ⌥H | next / previous of the same kind (agent→agent, shell→shell), wrapping |
 | ⌥\` | agent ↔ last-visited shell of this space |
 | ⌥W then a letter | jump to that agent or shell, any space; never a home (Esc cancels; a miss says "jump: nothing on x") |
+| ⌥W then `;` then a letter | the same for an overflow key `;a` (past the 26 letters; key table `jump2`, the sidebar's `⌥W ; jump`); ⌥W ; Shift+letter its diff |
 | ⌥W then 1-9 | jump to the Nth pinned agent (`@pin_key`, the sidebar's PINNED section, any space; a miss says "no pin N") |
 | ⌥W then Shift+letter | that agent's uncommitted diff in a popup, only the files IT edited (`agent-ui diff @W`); you stay put; Esc / q close it; nothing dirty says "d: no uncommitted changes", a shell or nobody "diff: no agent on x" |
 | ⌥S | next tab that needs you (CuaNotch owns it; prefix d is tmux's) |
@@ -331,6 +339,7 @@ catches tmux drift; WezTerm, Karabiner and menu keys have no check.
 | prefix H / prefix h | park this tab / unpark (picker) |
 | prefix v | select a range of tabs (h/l extend, H or ⏎ park, m move, x close, ⇧Y confirms, any other key cancels (homes skipped, ⌘Z reopens), Esc) |
 | prefix Q | close this space (y/n; never main) |
+| prefix O | review old agents: a popup walks every agent idle 8h+ (not pinned, not kept), one per screen, space by space: c close / p park / s snooze / k keep (`@review_kept`, until it works again) / v go; emptying a space offers to close it (docs/review.md) |
 | ⌘T / ⌘R | new shell tab / new claude tab (prefix c / prefix k) in THIS space, in the current tab's folder |
 | ⌘⇧T / ⌘⇧R | picker: which space gets a new shell / claude tab (at its end, in that space's root folder; prefix C-t / prefix K). Type a folder to open or reuse a space for it; ^N creates (as ⌥N's) and the tab opens in the new folder's space |
 | ⌘E / ⌘⇧E | the agent launcher popup (`agent-ui launch`; every launch goes through `scripts/agent-launch.sh`): one row per INSTALLED coding agent (logo, name, command, then its letter as a solid key-cap at the row's right end), claude first and preselected, so ⌘E ⏎ = claude (as ⌘R; ⌘E ⌘E no longer works: tmux drops ⌘E inside a popup). A letter picks that agent at once: `c` claude, `a` abby, `x` codex, `o` opencode, `g` grok, `y` agy (Antigravity; the Gemini CLI is gone), `u` cursor-agent, `p` copilot, `d` aider. ⌘E: a new tab beside this one, in its folder (`go`). ⌘⇧E: the launcher closes and ⌘⇧R's own space picker opens for that agent (`pick`: the spaces, a typed folder, ^N; the tab lands at that space's end). ↑↓ move; Esc / q close. An agent gone since the last refresh says "launch: <name> not installed". cursor-agent / aider have no hooks: their tab is a shell row (with the agent's `@agent_harness`), not an agent; cursor-agent's row shows its logo in place of the ❯, aider's (no logo) keeps the ❯ |

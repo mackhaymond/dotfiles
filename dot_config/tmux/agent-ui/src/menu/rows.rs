@@ -26,7 +26,7 @@
 //! linked into two sessions is listed under both, so the window id alone
 //! cannot be the selection.
 
-use super::letters::{self, KeyMemo, Write};
+use super::letters::{self, KeyMemo, Letter, Write};
 use crate::collate::Collator;
 use crate::git::GitCache;
 use crate::model::{Cat, Counts};
@@ -250,7 +250,7 @@ pub struct Data {
     /// cwd → branch for every listed agent's path (the preview's meta line).
     pub branches: HashMap<String, String>,
     /// window id → its lifetime letter ([`letters::assign`]).
-    pub letters: HashMap<String, char>,
+    pub letters: HashMap<String, Letter>,
     /// The window ⌥W goes to: the agent the client was on before this one
     /// (`@agent_mru_cur` / `@agent_mru_prev`; see [`last_agent`]).
     pub last: Option<String>,
@@ -321,7 +321,7 @@ impl Data {
     }
 
     /// The letter of `win`, if it holds one.
-    pub fn letter(&self, win: &str) -> Option<char> {
+    pub fn letter(&self, win: &str) -> Option<Letter> {
         self.letters.get(win).copied()
     }
 
@@ -479,7 +479,7 @@ pub(crate) mod tests {
     pub fn stored(mut snap: Snapshot) -> Snapshot {
         let d = data_of(&snap);
         for w in &mut snap.windows {
-            w.key = d.letter(&w.id).map(String::from).unwrap_or_default();
+            w.key = d.letter(&w.id).map(|k| k.to_string()).unwrap_or_default();
         }
         snap
     }
@@ -621,8 +621,8 @@ pub(crate) mod tests {
     #[test]
     fn letters_from_the_snapshot() {
         let d = data();
-        let got: Vec<(&str, char)> = ["@8", "@1", "@2", "@3", "@4", "@6", "@7", "@5"].iter().map(|w| (*w, d.letter(w).unwrap())).collect();
-        assert_eq!(got, [("@8", 'a'), ("@1", 's'), ("@2", 'd'), ("@3", 'f'), ("@4", 'g'), ("@6", 'h'), ("@7", 'j'), ("@5", 'k')]);
+        let got: Vec<(&str, String)> = ["@8", "@1", "@2", "@3", "@4", "@6", "@7", "@5"].iter().map(|w| (*w, d.letter(w).unwrap().to_string())).collect();
+        assert_eq!(got, [("@8", "a".to_string()), ("@1", "s".to_string()), ("@2", "d".to_string()), ("@3", "f".to_string()), ("@4", "g".to_string()), ("@6", "h".to_string()), ("@7", "j".to_string()), ("@5", "k".to_string())]);
         assert_eq!(d.letters.len(), 8);
         assert_eq!(d.key_writes.len(), 8);
         // The shell is lettered, never listed as a row: its letter goes to
@@ -633,7 +633,7 @@ pub(crate) mod tests {
         // over display order.
         let mut snap = fixture();
         for w in &mut snap.windows {
-            w.key = d.letter(&w.id).map(String::from).unwrap_or_default();
+            w.key = d.letter(&w.id).map(|k| k.to_string()).unwrap_or_default();
         }
         for w in snap.windows.iter_mut().filter(|w| w.id == "@8") {
             w.key.clear(); // Alpha:@8 lost its key: a is taken by nobody now...
@@ -642,8 +642,8 @@ pub(crate) mod tests {
             w.key = "a".into(); // ...and @7 claims a
         }
         let d2 = data_of(&snap);
-        assert_eq!((d2.letter("@7"), d2.letter("@8"), d2.letter("@1")), (Some('a'), Some('j'), Some('s')));
-        assert_eq!(d2.key_writes, [("@8".to_string(), Some('j'))]);
+        assert_eq!((d2.letter("@7"), d2.letter("@8"), d2.letter("@1")), (Some('a'.into()), Some('j'.into()), Some('s'.into())));
+        assert_eq!(d2.key_writes, [("@8".to_string(), Some('j'.into()))]);
         // @spaces off (classic: no ⌥W table): shells are never lettered.
         let mut classic = fixture();
         classic.clients[0].spaces = String::new();
@@ -668,12 +668,12 @@ pub(crate) mod tests {
         s2.windows.retain(|w| w.id != "@8");
         let d2 = b(&s2, &mut keys);
         assert!(d2.key_writes.is_empty(), "{:?}", d2.key_writes);
-        assert_eq!((d2.letter("@1"), d2.letter("@7")), (Some('s'), Some('j')));
+        assert_eq!((d2.letter("@1"), d2.letter("@7")), (Some('s'.into()), Some('j'.into())));
         // A newcomer takes the freed a.
         s2.windows.push(crate::tmux::Window::parse(&row("work", 9, "@30", &[("state", "running")])).unwrap());
         let d3 = b(&s2, &mut keys);
-        assert_eq!(d3.letter("@30"), Some('a'));
-        assert_eq!(d3.key_writes, [("@30".to_string(), Some('a'))]);
+        assert_eq!(d3.letter("@30"), Some('a'.into()));
+        assert_eq!(d3.key_writes, [("@30".to_string(), Some('a'.into()))]);
     }
 
     #[test]
@@ -726,7 +726,7 @@ pub(crate) mod tests {
         ]);
         assert_eq!(shape(&build_rows(&d, Tab::Working, "fizz")), ["-- 2 · creating…", "pending:@40"]);
         // Its letter: after main's agents (a s d f), before work's.
-        assert_eq!(d.letter("@40"), Some('g'));
+        assert_eq!(d.letter("@40"), Some('g'.into()));
         let t = build_rows(&d, Tab::All, "").iter().find(|r| r.agent().is_some_and(|a| a.window_id == "@40")).and_then(Row::target).unwrap();
         assert_eq!((t.win.as_str(), t.session.as_str()), ("@40", "pending"));
         // @spaces off: the hidden `pending` session as before, by name.
