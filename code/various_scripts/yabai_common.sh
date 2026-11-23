@@ -483,6 +483,45 @@ yabai_load_cache() {
   return 1
 }
 
+# The LIVE display topology as `count:master:external` (external = first non-master
+# real display, empty with one display), resolved exactly as yabai_workspace_refresh.sh
+# resolves what it caches. Only ignored displays attached (lid closed): the unfiltered
+# list, as refresh does. Emits nothing if the query or the master cannot be resolved.
+yabai_live_topology() {
+  local djson count master ext=""
+  djson=$(yabai_displays_json) || return 1
+  [ "$djson" = "[]" ] && djson=$(yabai -m query --displays 2>/dev/null)
+  count=$(printf '%s' "$djson" | jq -r 'if type == "array" then length else empty end' 2>/dev/null)
+  case "$count" in ''|0|*[!0-9]*) return 1 ;; esac
+  master=$(yabai_master_index "$djson")
+  case "$master" in ''|*[!0-9]*) return 1 ;; esac
+  ext=$(printf '%s' "$djson" | jq -r --argjson m "$master" \
+    '.[] | select(.index != $m) | .index' 2>/dev/null | head -n 1)
+  [ "$count" -gt 1 ] && [ -z "$ext" ] && return 1
+  printf '%s:%s:%s' "$count" "$master" "$ext"
+}
+
+# Set DISPLAY_COUNT / MASTER_DISPLAY_INDEX / EXTERNAL_DISPLAY_INDEX from the LIVE
+# topology, falling back to the cache (yabai_load_cache). For anything that aims at a
+# display BY INDEX: yabai orders indices by x (display_arrangement_order horizontal),
+# so dragging the external to the laptop's other side -- OpenDisplay does it by itself
+# seconds after connecting -- swaps 1 and 2. The cached pair then named the LAPTOP as
+# the external, and hyper+fn+g built `ext` on the laptop (2026-11-23).
+yabai_load_topology() {
+  local topo rest
+  topo=$(yabai_live_topology) || topo=""
+  if [ -z "$topo" ]; then
+    yabai_load_cache
+    return
+  fi
+  rest=${topo#*:}
+  DISPLAY_COUNT=${topo%%:*}
+  MASTER_DISPLAY_INDEX=${rest%%:*}
+  # shellcheck disable=SC2034  # consumed by the sourcing scripts
+  EXTERNAL_DISPLAY_INDEX=${rest#*:}
+  return 0
+}
+
 # Pull any native-fullscreen Space stranded on a non-master display home to master.
 # A native-fullscreen app (Preview, a browser, etc.) lives in its OWN, UNLABELED
 # macOS Space outside the labeled model, so the label-based pull-home loops miss it
@@ -546,11 +585,20 @@ yabai_space_ids_json() {
 # reuse check and dropped before returning, nothing in between calls
 # yabai_workspace_refresh.sh, and the one caller (yabai_send_window_external.sh)
 # runs its own refresh before this, not around it.
+#
+# An `ext` that exists but is NOT on display $1 (left on the laptop by an older bug or
+# a reparent) is moved over rather than reused where it is. If the move does not land,
+# the new space is left unlabeled (the heal sweep collects it) and 1 is returned: a
+# label on the wrong display is worse than a fling that does nothing. It is NOT
+# destroyed here -- destroying a space right after moving it across displays
+# segfaulted the Dock (2026-11-23).
 yabai_ensure_ext() {
   local idx got rc
-  idx=$(yabai_ext_index)
-  case "$idx" in ''|*[!0-9]*) ;; *) printf '%s' "$idx"; return 0 ;; esac
   case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$(_yabai_ext_display)" = "$1" ]; then
+    idx=$(yabai_ext_index)
+    case "$idx" in ''|*[!0-9]*) ;; *) printf '%s' "$idx"; return 0 ;; esac
+  fi
   yabai_lock_acquire_wait "$YABAI_STATE_DIR/refresh.lock"; got=$?
   _yabai_ensure_ext_create "$1"; rc=$?
   # Only a lock THIS call took (release would also drop one the caller already held).
@@ -558,12 +606,47 @@ yabai_ensure_ext() {
   return "$rc"
 }
 
+# The display index `ext` is on, or nothing if it doesn't exist.
+_yabai_ext_display() {
+  yabai -m query --spaces --space ext 2>/dev/null | jq -r '.display // empty' 2>/dev/null | head -n 1
+}
+
+# Put the space with stable id $1 on display $2; 0 once a query shows it there. The
+# move is retried (yabai refuses it while a display is animating or Mission Control is
+# open), and each try waits for it to land: yabai is busy reindexing right after, and
+# a too-soon follow-up is silently dropped. The index is re-read by id every try.
+_yabai_space_to_display() {
+  local id="$1" disp="$2" info d idx err="" _try _s
+  for _try in 1 2 3 4; do
+    for _s in 1 2 3 4 5; do
+      info=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$id" '
+        .[] | select(.id == $id) | "\(.display) \(.index)"' 2>/dev/null | head -n 1)
+      d=${info%% *}; idx=${info##* }
+      [ "$d" = "$disp" ] && return 0
+      [ "$_s" = 1 ] && case "$idx" in
+        ''|*[!0-9]*) ;;
+        *) err=$(yabai -m space "$idx" --display "$disp" 2>&1) || break ;;
+      esac
+      sleep 0.1
+    done
+    sleep 0.15
+  done
+  yabai_log ext "space id=$id did not reach display $disp (on ${d:-?}): $err"
+  return 1
+}
+
 _yabai_ensure_ext_create() {
-  local ext="$1" idx before after="" newid d _try _s
+  local ext="$1" idx before after="" newid _try
   # Again, now that we hold the lock: another fling may have created it while we waited.
-  idx=$(yabai_ext_index)
-  case "$idx" in ''|*[!0-9]*) ;; *) printf '%s' "$idx"; return 0 ;; esac
-  case "$ext" in ''|*[!0-9]*) return 1 ;; esac
+  newid=$(yabai -m query --spaces --space ext 2>/dev/null | jq -r '.id // empty' 2>/dev/null)
+  case "$newid" in
+    ''|*[!0-9]*) ;;
+    *)
+      _yabai_space_to_display "$newid" "$ext" || return 1
+      yabai_ext_index
+      return 0
+      ;;
+  esac
 
   # The new space is found as "the id that was not there before", so BOTH snapshots
   # must be real. `query --spaces` intermittently answers a bare "[" (see
@@ -585,22 +668,7 @@ _yabai_ensure_ext_create() {
     ($after - $before)[0] // empty' 2>/dev/null)
   case "$newid" in ''|*[!0-9]*) return 1 ;; esac
 
-  d=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$newid" '
-    .[] | select(.id == $id) | .display' 2>/dev/null | head -n 1)
-  if [ "$d" != "$ext" ]; then
-    idx=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$newid" '
-      .[] | select(.id == $id) | .index' 2>/dev/null | head -n 1)
-    case "$idx" in ''|*[!0-9]*) ;; *) yabai -m space "$idx" --display "$ext" >/dev/null 2>&1 || true ;; esac
-    # Wait for the cross-display space move to actually land before we label/use it
-    # -- yabai is busy reindexing right after, and a too-soon follow-up move gets
-    # silently dropped.
-    for _s in 1 2 3 4 5 6; do
-      d=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$newid" '
-        .[] | select(.id == $id) | .display' 2>/dev/null | head -n 1)
-      [ "$d" = "$ext" ] && break
-      sleep 0.1
-    done
-  fi
+  _yabai_space_to_display "$newid" "$ext" || return 1
   idx=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$newid" '
     .[] | select(.id == $id) | .index' 2>/dev/null | head -n 1)
   case "$idx" in ''|*[!0-9]*) return 1 ;; esac

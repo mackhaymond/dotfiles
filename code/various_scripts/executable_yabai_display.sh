@@ -19,7 +19,7 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 
 refresh_cache() {
   "$SCRIPT_DIR/yabai_workspace_refresh.sh" >/dev/null 2>&1 || true
-  yabai_load_cache
+  yabai_load_topology
 }
 
 focused_display_index() {
@@ -28,7 +28,8 @@ focused_display_index() {
     head -n 1
 }
 
-if ! yabai_load_cache; then
+# Live, not cached: display indices swap when the external changes sides.
+if ! yabai_load_topology; then
   refresh_cache || exit 0
 fi
 

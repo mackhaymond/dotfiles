@@ -188,6 +188,11 @@ yabai -m signal --add event=system_woke label=pin_resolve_woke action="'$YABAI_P
 # on disconnect). Replaces the old "reset everything to the laptop" refresh.
 yabai -m signal --add event=display_added label=workspace_display_added action="$YABAI_DISPLAYS added"
 yabai -m signal --add event=display_removed label=workspace_display_removed action="$YABAI_DISPLAYS removed"
+# Display indices follow x (display_arrangement_order horizontal), so dragging the
+# external to the laptop's other side -- which OpenDisplay does by itself right after
+# connecting -- swaps them without any add/remove. Refresh the cached indices then too.
+yabai -m signal --add event=display_moved label=workspace_display_moved action="$YABAI_DISPLAYS moved"
+yabai -m signal --add event=display_resized label=workspace_display_resized action="$YABAI_DISPLAYS moved"
 
 # When the ACTIVE display changes (any cross-display focus: F13/F14, push,
 # home-all, master, or a focus bind whose label lives on the other screen),

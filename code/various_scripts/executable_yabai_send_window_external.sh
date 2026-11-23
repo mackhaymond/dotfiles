@@ -20,9 +20,10 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/yabai_common.sh"
 
-if ! yabai_load_cache; then
+# Live, not cached: display indices swap when the external changes sides.
+if ! yabai_load_topology; then
   "$SCRIPT_DIR/yabai_workspace_refresh.sh" >/dev/null 2>&1 || true
-  yabai_load_cache || exit 0
+  yabai_load_topology || exit 0
 fi
 
 # Single display -> nowhere to fling.

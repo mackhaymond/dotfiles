@@ -1,10 +1,14 @@
 #!/bin/bash
 
 # Debounced display hotplug handler. Wired to yabai's display_added /
-# display_removed signals.
+# display_removed / display_moved / display_resized signals.
 #
 #   yabai_displays.sh added     -> a display was connected
 #   yabai_displays.sh removed   -> a display was disconnected
+#   yabai_displays.sh moved     -> a display was rearranged or changed resolution:
+#               yabai's indices follow x, so the external crossing to the laptop's
+#               other side swaps them. Same handling as `added` (refresh the cache,
+#               move nothing). Log: ~/Library/Logs/yabai/displays.log.
 #
 # Phase 1 policy:
 #   * added   = NON-DESTRUCTIVE. Refresh the cache/labels so the new display is
@@ -32,7 +36,7 @@ LOCKDIR="${TMPDIR:-/tmp}/yabai_displays.lock"
 
 ACTION="${1:-}"
 case "$ACTION" in
-  added|removed) ;;
+  added|removed|moved) ;;
   *) exit 64 ;;
 esac
 
@@ -43,7 +47,13 @@ esac
 # release keeps its late exit from removing the lock of the run that took over
 # (yabai_lock_* in yabai_common.sh; age is in seconds via BSD stat there, since
 # BSD find rejects a fractional `-mmin +0.5`).
-yabai_lock_acquire "$LOCKDIR" 30 || exit 0
+# `removed` WAITS for a live holder instead of dropping: it carries the pull-home, and a
+# disconnect right after a resolution change would otherwise lose it to a `moved` run.
+if [ "$ACTION" = removed ]; then
+  yabai_lock_acquire_wait "$LOCKDIR" 100 || exit 0
+else
+  yabai_lock_acquire "$LOCKDIR" 30 || exit 0
+fi
 trap 'yabai_lock_release "$LOCKDIR"' EXIT
 
 # --- settle: wait until the display count is stable across two reads --------
@@ -70,29 +80,11 @@ settle_count() {
 }
 
 # The cache's topology as `count:master:external` -- everything it records about the
-# displays -- and the same triple resolved live, exactly as yabai_workspace_refresh.sh
-# resolves it (external = first non-master real display).
+# displays -- to compare with yabai_live_topology (yabai_common.sh).
 cached_topology() {
   [ -r "$CACHE_FILE" ] || { printf ''; return; }
   ( . "$CACHE_FILE" 2>/dev/null
     printf '%s:%s:%s' "${DISPLAY_COUNT:-}" "${MASTER_DISPLAY_INDEX:-}" "${EXTERNAL_DISPLAY_INDEX:-}" )
-}
-
-live_topology() {
-  local djson master ext="" count
-  djson=$(yabai_displays_json)
-  # Only ignored displays attached (lid closed): refresh caches the unfiltered list
-  # then, so compare against the same thing or this guard could never match. (A local
-  # `count`: the script-level one is the filtered count the rest of the handler wants.)
-  [ "$djson" = "[]" ] && djson=$(yabai -m query --displays 2>/dev/null)
-  count=$(jq -r 'length' 2>/dev/null <<<"$djson")
-  master=$(yabai_master_index "$djson")
-  case "$master" in
-    ''|*[!0-9]*) master="" ;;
-    *) ext=$(jq -r --argjson m "$master" '.[] | select(.index != $m) | .index' \
-         2>/dev/null <<<"$djson" | head -n 1) ;;
-  esac
-  printf '%s:%s:%s' "$count" "$master" "$ext"
 }
 
 cached_master() {
@@ -106,7 +98,7 @@ case "$count" in
 esac
 
 # --- transition guard: ignore redundant fires that change nothing -----------
-# `added` only. On undock macOS destroys the external's spaces, which fires
+# `added`/`moved` only. On undock macOS destroys the external's spaces, which fires
 # space_destroyed -> yabai_heal.sh -> a refresh that can rewrite the cache to
 # DISPLAY_COUNT=1 BEFORE this handler reads it; the guard then skipped the pull-home
 # safety net and the `ext` dissolve entirely. Both are idempotent no-ops when there is
@@ -115,19 +107,26 @@ esac
 # (agent-chrome's virtual screen) attaches, the real-display count is unchanged but
 # yabai can renumber the displays, and a count-only guard left the cached indices
 # pointing at the wrong display. Any unresolved live value fails the match and refreshes.
-if [ "$ACTION" = added ] && [ "$(live_topology)" = "$(cached_topology)" ]; then
+#
+# Re-checked after the refresh, a bounded number of times: a `moved` that fires while we
+# hold the lock is dropped, and OpenDisplay hops sides within ~2s of connecting.
+if [ "$ACTION" != removed ]; then
+  for _pass in 1 2 3; do
+    live=$(yabai_live_topology)
+    [ -n "$live" ] && [ "$live" = "$(cached_topology)" ] && break
+    yabai_log displays "$ACTION pass=$_pass live=$live cached=$(cached_topology)"
+    "$SCRIPT_DIR/yabai_workspace_refresh.sh" >/dev/null 2>&1 || true
+    sleep 0.5
+  done
   exit 0
 fi
 
 # Refresh first so the cache + labels reflect the new topology (master/external
 # indices, DISPLAY_COUNT). This never moves spaces between displays.
+yabai_log displays "removed count=$count cached=$(cached_topology)"
 "$SCRIPT_DIR/yabai_workspace_refresh.sh" >/dev/null 2>&1 || true
 
 case "$ACTION" in
-  added)
-    # Non-destructive: nothing to move. External is empty-and-ready.
-    :
-    ;;
   removed)
     # A real external is still attached, so what left was an ignored display
     # (agent-chrome's virtual screen) -- never dissolve `ext` or pull home for that.
