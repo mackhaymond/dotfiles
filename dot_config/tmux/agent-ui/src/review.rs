@@ -25,7 +25,7 @@
 //! - **Actions** run as the menu's do, on the server (`run-shell -b`), each
 //!   re-checked against a fresh snapshot first ([`recheck_in`]: gone, moved,
 //!   working again, worked since the card, pinned now: refused, the reason
-//!   in the footer). A close / park / snooze is recorded only once its
+//!   over the key bar). A close / park / snooze is recorded only once its
 //!   window has left its session ([`settle`], polled up to [`SETTLE`]);
 //!   still there means its script refused (its toast says why): nothing is
 //!   recorded and the card stays undecided.
@@ -322,7 +322,7 @@ struct Runner {
 pub const SETTLE: Duration = Duration::from_secs(3);
 
 /// An action out on candidate `i`, recorded as `outcome` / `msg` once its
-/// window has left; `ing` is the footer's word meanwhile, `who` the script
+/// window has left; `ing` is the message meanwhile, `who` the script
 /// named when it did not.
 #[derive(Debug, Clone)]
 struct Pending {
@@ -363,7 +363,7 @@ pub fn left_session(st: &State, id: &str, session: &str) -> bool {
 }
 
 /// The card's window `c` (as the review listed it) as `st` has it now, or
-/// the footer's reason: gone; moved to another session; working again;
+/// the message's reason: gone; moved to another session; working again;
 /// worked since the card was made (its `@agent_since` changed); pinned now.
 pub fn recheck_in<'a>(st: &'a State, c: &Window) -> Result<&'a Window, String> {
     if st.snap.rows(&c.id).next().is_none() {
@@ -1000,7 +1000,7 @@ mod tests {
     }
 
     /// `v` on a card whose window is gone or moved: the reason in the
-    /// footer, the popup stays; a window still there jumps. Keep on an
+    /// message, the popup stays; a window still there jumps. Keep on an
     /// agent that worked since: refused, nothing written.
     #[test]
     fn jump_and_keep_recheck() {

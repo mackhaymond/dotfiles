@@ -35,7 +35,9 @@ two-character overflow key such as `;a` shows whole), its title
 (`@agent_summary`), its space (⌘N and name in its colour), its harness logo,
 its state and how long it has been idle (`idle 2d 3h`), then its last reply
 (`@agent_detail` of a done / ask / fail turn) and the last lines of its pane.
-The header counts `3/9`.
+The header counts `3/9`. The key bar on the last line is always there; a
+message (what was just done, or why not) shows on the rule above it, until
+the next key.
 
 | key | does |
 |---|---|
@@ -43,7 +45,7 @@ The header counts `3/9`.
 | `p` | park it: `stash.sh stash <win>` (prefix H's; prefix h brings it back) |
 | `s` | snooze it: a chooser with snooze.sh's menu (1 hour, 3 hours, this evening 18:00, tomorrow 9:00, Monday 9:00, Custom…); Custom is a typed box read by `snooze.sh parse` (a bad time says why under the box); then `snooze.sh apply -c <client> <epoch> w:@N` parks it with an alarm |
 | `k` / Space | keep it: not asked again until it has worked again (below) |
-| `v` | go to it: the popup closes and the client switches there (a card already closed / parked / snoozed, or a window gone or moved meanwhile, says so in the footer instead) |
+| `v` | go to it: the popup closes and the client switches there (a card already closed / parked / snoozed, or a window gone or moved meanwhile, says so above the key bar instead) |
 | `←` / `h` | back one (a closed / parked / snoozed one shows its badge and stays decided; a kept one can be decided again) |
 | `→` / `l` / Tab | skip it |
 | `q` / Esc | quit |
@@ -51,18 +53,18 @@ The header counts `3/9`.
 Before an action runs, the window is checked again against a fresh
 snapshot: gone, moved to another session, working again, worked since the
 card was made (its `@agent_since` changed), or pinned meanwhile is refused
-with the reason in the footer, and nothing changes (keep too). Park and
+with the reason above the key bar, and nothing changes (keep too). Park and
 snooze also refuse up front what stash.sh would (a split tab with an
 agent, …); close refuses a split tab as well (only the agent's pane would
 go, and the tab would stay in its space).
 
 Close, park and snooze are handed to the tmux server (`run-shell -b`), as
 the agent menu's are, but nothing is recorded until the window has
-actually left its session: the footer says `parking…` (`closing…`,
+actually left its session: the message says `parking…` (`closing…`,
 `snoozing…`) and the popup polls for up to 3 s (`SETTLE`). Gone or moved:
 recorded, and on to the next agent (or the space question). Still there:
 the script refused (stash.sh keeps a half-typed draft, an agent without a
-session id, a busy one…, and says why in a toast), so the footer says
+session id, a busy one…, and says why in a toast), so the message says
 `stash.sh refused (see toast) · left alone` and the card stays undecided.
 While an action is pending only q / Esc get through.
 

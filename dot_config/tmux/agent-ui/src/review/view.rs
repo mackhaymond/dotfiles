@@ -14,8 +14,8 @@
 //! │ The hardened build is installed and …       │
 //! │ screen                                      │   the pane's last lines, dim
 //! │ ❯                                            │
-//! ├─────────────────────────────────────────────┤
-//! │ c close  p park  s snooze  k keep  v go  …  │   key bar (or the last message)
+//! ├ closed … · ⌘Z brings it back ───────────────┤   the last message, on the rule
+//! │ c close  p park  s snooze  k keep  v go  …  │   key bar, always there
 //! ╰─────────────────────────────────────────────╯
 //! ```
 
@@ -156,7 +156,7 @@ pub struct Review {
     /// The candidate on screen.
     pub cur: usize,
     pub mode: Mode,
-    /// One line in place of the key bar until the next key: (text, a warning).
+    /// One line on the rule over the key bar until the next key: (text, a warning).
     pub flash: Option<(String, bool)>,
     pub presets: Vec<Preset>,
     /// Epoch seconds, for "idle 2d 3h".
@@ -503,6 +503,7 @@ pub fn render(r: &Review, buf: &mut Buffer) {
         }
     }
     rule(buf, h - 3, w);
+    message(r, buf, w, h - 3);
     footer(r, buf, w, h - 2);
 }
 
@@ -660,15 +661,19 @@ fn done(r: &Review, buf: &mut Buffer, b: Rect) {
     }
 }
 
-/// The key bar, as many of its keys as fit whole; a message in its place
-/// until the next key.
+/// The last message, until the next key: on the rule over the key bar, so it
+/// never covers the keys and nothing moves. (The end screen's body shows it.)
+fn message(r: &Review, buf: &mut Buffer, w: u16, y: u16) {
+    let Some((m, warn)) = r.flash.as_ref().filter(|_| r.mode != Mode::Done) else { return };
+    let end = w - 2;
+    let text = clip(&sanitize(m), (end - 3) as usize);
+    put(buf, 1, y, end, &format!(" {text} "), fg(if *warn { "peach" } else { "green" }));
+}
+
+/// The key bar, always there: tighter when the popup is narrow, then the
+/// keys without their words.
 fn footer(r: &Review, buf: &mut Buffer, w: u16, y: u16) {
     let end = w - 2;
-    // The end screen keeps its key (its body shows the last message).
-    if let Some((m, warn)) = r.flash.as_ref().filter(|_| r.mode != Mode::Done) {
-        put(buf, 2, y, end, &clip(&sanitize(m), (end - 2) as usize), fg(if *warn { "peach" } else { "green" }));
-        return;
-    }
     let items: &[(&str, &str)] = match &r.mode {
         Mode::Agent => &[("c", "close"), ("p", "park"), ("s", "snooze"), ("k", "keep"), ("v", "go"), ("←→", "move"),
             ("q", "quit")],
@@ -679,15 +684,19 @@ fn footer(r: &Review, buf: &mut Buffer, w: u16, y: u16) {
     };
     let ov = fg("overlay");
     let cap = on("text", "surface0");
+    let width = |gap: u16, words: bool| -> u16 {
+        items.iter().map(|(k, wd)| cells(k) + 2 + gap + if words { 1 + cells(wd) } else { 0 }).sum::<u16>() - gap
+    };
+    let (gap, words) = [(2, true), (1, true)].into_iter().find(|&(g, wd)| width(g, wd) <= end - 2).unwrap_or((1, false));
     let mut x = 2;
     for (k, (key, word)) in items.iter().enumerate() {
-        let gap = if k > 0 { 2 } else { 0 };
-        if x + gap + cells(key) + 2 + 1 + cells(word) > end {
-            break;
+        if k > 0 {
+            x += gap;
         }
-        x += gap;
         x = put(buf, x, y, end, &format!(" {key} "), cap);
-        x = put(buf, x + 1, y, end, word, ov);
+        if words {
+            x = put(buf, x + 1, y, end, word, ov);
+        }
     }
 }
 
@@ -851,7 +860,9 @@ mod tests {
         assert!(f[5].starts_with("│ The hardened build"), "{}", f[5]);
         assert!(f.iter().any(|l| l.starts_with("│ screen")), "{f:#?}");
         assert!(f.iter().any(|l| l.starts_with("│ ❯")), "{f:#?}");
-        assert!(f[18].starts_with("│  c  close   p  park   s  snooze   k  keep   v  go"), "{}", f[18]);
+        assert!(f[18].starts_with("│  c  close  p  park  s  snooze  k  keep  v  go  ←→  move  q  quit "), "{}", f[18]);
+        let wide = &frame(&r, 100, 20)[18];
+        assert!(wide.starts_with("│  c  close   p  park   s  snooze   k  keep   v  go"), "{wide}");
         // A two-char key shows whole.
         r.advance();
         assert!(frame(&r, 72, 20)[1].starts_with("│  ;b  Second"));
@@ -859,7 +870,12 @@ mod tests {
         r.record(1, Outcome::Closed, "closed Second · ⌘Z brings it back".into());
         let f = frame(&r, 72, 20);
         assert!(f[1].ends_with(" closed  │"), "{}", f[1]);
-        assert!(f[18].starts_with("│ closed Second"), "{}", f[18]);
+        // The message sits on the rule; every key stays, at any width.
+        assert!(f[17].starts_with("├ closed Second") && f[17].ends_with("─┤"), "{}", f[17]);
+        assert!(f[18].starts_with("│  c  close") && f[18].contains(" q  quit"), "{}", f[18]);
+        let f = frame(&r, MIN_W, MIN_H);
+        assert!(f[9].starts_with("├ closed Second") && f[9].ends_with('┤'), "{}", f[9]);
+        assert!(f[10].starts_with("│  c   p   s   k   v   ←→   q "), "{}", f[10]);
         r.mode = Mode::Snooze { sel: 1, typing: Some("2h".into()), err: None };
         let f = frame(&r, 72, 20);
         assert!(f[4].starts_with("│ snooze until…"), "{}", f[4]);
