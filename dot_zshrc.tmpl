@@ -202,7 +202,7 @@ zsh-defer source "$HOME/.config/broot/launcher/bash/br"
 export GPG_TTY=$TTY
 
 # ─── Aliases ──────────────────────────────────────────────────────────────
-alias clear="clear && printf '\n%.0s' {1..100}"
+alias clear="clear && printf '\n%.0s' {1..100} && _ZSH_PRISTINE=1"
 alias c=clear
 alias hh="cd ~ && c"
 alias cleardns="sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder"
@@ -847,9 +847,27 @@ if [[ -t 1 ]]; then
     if [[ ! -e $mark ]]; then
       repeat $LINES print
       : >| $mark
+      _ZSH_PRISTINE=1
     fi
   }
 fi
+
+# Keep it pinned through a resize while the screen holds nothing but the
+# prompt (a fresh shell, or right after `clear`, which re-arms this). A space's
+# home shell is born at 80x24 when its space is made detached and grows on
+# the first visit; zsh's own resize redraw then left the prompt mid-screen
+# plus a stray second copy. Any command ends the pristine state (preexec),
+# so a resize never wipes real output.
+typeset -gi _ZSH_PRISTINE=${_ZSH_PRISTINE:-0}
+_zsh_pristine_off() { _ZSH_PRISTINE=0; }
+[[ -z "${preexec_functions[(r)_zsh_pristine_off]}" ]] && \
+  preexec_functions+=(_zsh_pristine_off)
+TRAPWINCH() {
+  (( _ZSH_PRISTINE )) || return 0
+  zle 2>/dev/null && zle -I
+  print -n '\e[H\e[2J'
+  repeat $LINES print
+}
 
 # ─── Profile output ───────────────────────────────────────────────────────
 [[ -n "${ZSH_DEBUGRC+1}" ]] && zprof
