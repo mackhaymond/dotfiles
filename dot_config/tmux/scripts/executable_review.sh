@@ -30,8 +30,8 @@ case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
 esac
 
 SCRIPTS="$HOME/.config/tmux/scripts"
-POPUP_W=76
-POPUP_H=22
+POPUP_W=108
+POPUP_H=32
 # Centred on the whole WezTerm row while a sidebar sits beside the client
 # (tmux.conf.tmpl's @popup_x); tmux's own centre on a server without it.
 POPUP_X='#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}'

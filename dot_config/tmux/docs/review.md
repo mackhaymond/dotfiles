@@ -30,14 +30,24 @@ first. A window linked into two sessions is listed once.
 
 ## The screen
 
-One agent per screen: its letter (`@agent_key`, shown as stored, so a
-two-character overflow key such as `;a` shows whole), its title
-(`@agent_summary`), its space (⌘N and name in its colour), its harness logo,
-its state and how long it has been idle (`idle 2d 3h`), then its last reply
-(`@agent_detail` of a done / ask / fail turn) and the last lines of its pane.
-The header counts `3/9`. The key bar on the last line is always there; a
-message (what was just done, or why not) shows on the rule above it, until
-the next key.
+One agent per screen, in the sidebar's look (its canvas, one-colour tiles,
+square corners). The card is its letter (`@agent_key`, shown as stored, so a
+two-character overflow key such as `;a` shows whole) and title
+(`@agent_summary`), then its harness logo, its space (⌘N and name in its
+colour), its state and since when. Under it: its last reply
+(`@agent_detail` of a done / ask / fail turn) and the last lines of its
+pane on a terminal strip. Those are tidied: Claude's composer and status
+line, rules and runs of blanks go (a typed draft stays), prose wraps, what
+Mack typed is bold.
+
+In a popup at least 88 columns wide (it asks for 108x32) the whole queue is
+on the left by space, the one on screen lifted, the decided ones dim with
+their outcome. The header has a segment per agent in its outcome's colour
+(closed red, parked mauve, snoozed peach, kept teal) and `3 of 9`.
+
+The dock holds the keys and is always there: a narrow popup tightens it,
+then drops words. A message (what was just done, or why not) has its own
+row above it, until the next key.
 
 | key | does |
 |---|---|

@@ -74,12 +74,13 @@ const USAGE: &str = "usage: agent-ui review --client <tty> [--min-idle SECS]
 pub const MIN_IDLE: i64 = 8 * 3600;
 /// The window option `k` sets: the `@agent_since` epoch the agent was kept at.
 pub const KEPT: &str = "@review_kept";
-/// How many of the pane's last lines the card can show.
-pub const PREVIEW_LINES: usize = 12;
+/// How many of the pane's last lines are read (the card drops the agent's
+/// own furniture and shows what fits).
+pub const PREVIEW_LINES: usize = 48;
 /// The popup's size (review.sh asks for this, or the whole client when it
 /// is smaller).
-pub const POPUP_W: u16 = 76;
-pub const POPUP_H: u16 = 22;
+pub const POPUP_W: u16 = 108;
+pub const POPUP_H: u16 = 32;
 const TICK: Duration = Duration::from_millis(250);
 const POLL: Duration = Duration::from_millis(150);
 
@@ -1059,7 +1060,8 @@ mod tests {
         assert!(matches!(&r.mode, view::Mode::Space(i) if i.sid == "$3" && i.wins == ["@4"]));
         go(&mut r, "y");
         assert_eq!(r.mode, view::Mode::Done);
-        assert_eq!(r.summary(), "closed 1 · parked 1 · snoozed 0 · kept 1 · 1 space closed");
+        assert_eq!((r.count(Outcome::Closed), r.count(Outcome::Parked), r.count(Outcome::Snoozed), r.count(Outcome::Kept)), (1, 1, 0, 1));
+        assert_eq!(r.spaces_closed, 1);
         assert_eq!(run.log, [
             format!("tmux set-option -w -t @2 @review_kept {}", NOW - 20 * H),
             "run-shell -b '/s/closed-tabs.sh' close '@3'".to_string(),
