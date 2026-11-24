@@ -76,11 +76,7 @@ pub const MIN_IDLE: i64 = 8 * 3600;
 pub const KEPT: &str = "@review_kept";
 /// How many of the pane's last lines are read (the card drops the agent's
 /// own furniture and shows what fits).
-pub const PREVIEW_LINES: usize = 48;
-/// The popup's size (review.sh asks for this, or the whole client when it
-/// is smaller).
-pub const POPUP_W: u16 = 108;
-pub const POPUP_H: u16 = 32;
+pub const PREVIEW_LINES: usize = 100;
 const TICK: Duration = Duration::from_millis(250);
 const POLL: Duration = Duration::from_millis(150);
 

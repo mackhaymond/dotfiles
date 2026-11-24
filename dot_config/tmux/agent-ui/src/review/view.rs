@@ -467,7 +467,10 @@ struct Parts {
     keys: u16,
 }
 
-const SIDE_W: u16 = 34;
+/// The queue's width: a quarter of the popup, within these.
+const SIDE_W: (u16, u16) = (34, 50);
+/// The longest line of prose that reads well (the reply; the screen gets it all).
+const PROSE_W: u16 = 110;
 const SIDE_MIN_W: u16 = 88;
 const ROOMY_H: u16 = 20;
 
@@ -477,7 +480,7 @@ fn parts(w: u16, h: u16, queue: bool) -> Parts {
     let dock = Rect::new(1, h - 1 - dock_h, w - 2, dock_h);
     let top = if roomy { 3 } else { 2 };
     let msg = dock.y - 1;
-    let side = (queue && w >= SIDE_MIN_W).then(|| Rect::new(1, top, SIDE_W, dock.y - top));
+    let side = (queue && w >= SIDE_MIN_W).then(|| Rect::new(1, top, (w / 4).clamp(SIDE_W.0, SIDE_W.1), dock.y - top));
     let x = side.map_or(2, |s| s.x + s.width + 1);
     Parts { side, main: Rect::new(x, top, w - 2 - x, msg - top), msg, dock, keys: dock.y + dock_h / 2 }
 }
@@ -755,7 +758,7 @@ fn card_body(r: &Review, buf: &mut Buffer, b: Rect) {
         // Up to half the body when there is a screen to show too.
         let room = b.height as usize;
         let max = if shot.as_ref().is_some_and(|s| s.is_empty()) { room - 1 } else { (room / 2).saturating_sub(1).max(1) };
-        for line in wrap(&reply, b.width as usize, max) {
+        for line in wrap(&reply, b.width.min(PROSE_W) as usize, max) {
             if y >= bottom {
                 break;
             }
@@ -778,8 +781,9 @@ fn card_body(r: &Review, buf: &mut Buffer, b: Rect) {
     let start = lines.len().saturating_sub(left);
     let start = start + lines[start..].iter().take_while(|l| l.0.is_empty()).count();
     let empty = shot.is_none_or(|s| s.is_empty());
+    // A panel down to the message row, however few lines there are.
+    band(buf, Rect::new(b.x, y, b.width, bottom - y), "term");
     for (line, typed) in &lines[start..] {
-        band(buf, Rect::new(b.x, y, b.width, 1), "term");
         // What he typed stands out from what it answered.
         let st = match typed {
             _ if empty => on("overlay", "term"),

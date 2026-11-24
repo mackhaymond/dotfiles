@@ -30,8 +30,11 @@ case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
 esac
 
 SCRIPTS="$HOME/.config/tmux/scripts"
-POPUP_W=108
-POPUP_H=32
+# Most of the client, never under MIN (or the whole client when it is smaller).
+POPUP_PCT_W=90
+POPUP_PCT_H=88
+POPUP_MIN_W=108
+POPUP_MIN_H=32
 # Centred on the whole WezTerm row while a sidebar sits beside the client
 # (tmux.conf.tmpl's @popup_x); tmux's own centre on a server without it.
 POPUP_X='#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}'
@@ -64,7 +67,9 @@ do_open() {
     fi
     sock=$(tmux display-message -p '#{socket_path}')
     IFS=' ' read -r cw ch <<<"$(tmux display-message -p -c "$client" '#{client_width} #{client_height}' 2>/dev/null)"
-    w=$POPUP_W; h=$POPUP_H
+    w=$(( ${cw:-0} * POPUP_PCT_W / 100 )); h=$(( ${ch:-0} * POPUP_PCT_H / 100 ))
+    [ "$w" -lt "$POPUP_MIN_W" ] && w=$POPUP_MIN_W
+    [ "$h" -lt "$POPUP_MIN_H" ] && h=$POPUP_MIN_H
     [ -n "${cw:-}" ] && [ "$cw" -lt "$w" ] && w=$cw
     [ -n "${ch:-}" ] && [ "$ch" -lt "$h" ] && h=$ch
     tmux display-popup -c "$client" -E -B -w "$w" -h "$h" -x "$POPUP_X" \

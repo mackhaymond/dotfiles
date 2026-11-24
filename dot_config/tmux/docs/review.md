@@ -40,7 +40,8 @@ pane on a terminal strip. Those are tidied: Claude's composer and status
 line, rules and runs of blanks go (a typed draft stays), prose wraps, what
 Mack typed is bold.
 
-In a popup at least 88 columns wide (it asks for 108x32) the whole queue is
+The popup takes 90% x 88% of the client (at least 108x32, or the whole
+client when that is smaller). At 88 columns or wider the whole queue is
 on the left by space, the one on screen lifted, the decided ones dim with
 their outcome. The header has a segment per agent in its outcome's colour
 (closed red, parked mauve, snoozed peach, kept teal) and `3 of 9`.
