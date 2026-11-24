@@ -32,7 +32,9 @@ All of these must hold:
    plain X.Y.Z, executable and over 10 min old.
 6. Not on screen on any client.
 7. Nothing lives only in the process: no `ScheduleWakeup` still ahead, no cron
-   from the last 8 days that was not deleted, no running `Monitor`, and nothing
+   from the last 8 days that was not deleted, no running `Monitor`, no artifact
+   watched for comments since the last 7 days (a resume brings most back, not
+   all), and nothing
    out by `agent-bg-pending`'s detectors since the process start. They are
    loaded read-only and called directly, because the program answers "nothing
    out" when it fails. Missing, failing or unreadable counts as armed.

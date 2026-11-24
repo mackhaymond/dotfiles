@@ -1238,6 +1238,27 @@ class Scan(unittest.TestCase):
         quoted = tool("Bash", {}, {}, at(9), content=note("bixuukdvg", "completed", at(9))[0]["content"])
         self.assertIn("Monitor", self.scan(live, quoted))
 
+    def test_artifact_watches(self):
+        url = "https://claude.ai/artifact/JVYg"
+        pub = lambda ts=0, sub="connected", u=url: tool("Artifact", {"file_path": "x"}, {"url": u, "liveSubscription": sub}, at(ts))
+        watch = lambda ts=0, u=url, **kw: tool("ArtifactComments", {"action": "watch", "url": u, **kw}, {}, at(ts))
+        lost = lambda u=url: [{"type": "system", "subtype": "informational", "timestamp": at(9),
+                               "content": f"Artifact comment monitor for {u} didn't resume: it couldn't restart in this session."}]
+        for p in (pub(), pub(sub="arming"), pub(-6 * 86400), watch(), watch(on=True)):
+            self.assertIn("watches an artifact", self.scan(p))
+        self.assertEqual(self.scan(pub(-8 * 86400)), "")
+        for over in (lost(), watch(on=False)):
+            self.assertEqual(self.scan(pub(), over), "")
+            self.assertIn("watches an artifact", self.scan(pub(), over, pub(60)))
+        self.assertIn("watches an artifact", self.scan(pub(), lost(url + "2")))
+        self.assertIn("watches an artifact", self.scan(pub(), pub(u=url + "2"), lost()))
+        # A publish without one, a listing, a read, an error, quoted text.
+        for p in (pub(sub=None), tool("ArtifactComments", {"action": "watch"}, {}, at(0)),
+                  tool("ArtifactComments", {"action": "read", "url": url}, {}, at(0)),
+                  tool("ArtifactComments", {"action": "watch", "url": url}, None, at(0), error=True),
+                  tool("Bash", {}, {"stdout": json.dumps({"url": url, "liveSubscription": "connected"})}, at(0))):
+            self.assertEqual(self.scan(p), "")
+
     def test_the_model(self):
         ask = lambda dt, **kw: [{"type": "user", "timestamp": at(dt), "message": {"content": "do it"}, **kw}]
         f52, o55 = said("claude-fable-5-2", at(10)), said("claude-opus-5-5[1m]", at(20))

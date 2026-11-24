@@ -218,7 +218,11 @@ squote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 #                   <task-notification> for that id that carries a <status>
 #                   (one without is an event), a TaskStop of it, or its
 #                   timeout. It dies with its process, so only one started in
-#                   this process's lifetime counts.
+#                   this process's lifetime counts;
+#   artifact watch  a publish's toolUseResult.liveSubscription, or an
+#                   ArtifactComments watch; over when stopped or said not to
+#                   have resumed. --resume brings most back, not all, so one
+#                   counts for 7 days, whichever process made it.
 # THE MODEL is the last assistant record's requestedModel (never a sidechain's
 # or a <synthetic> one, nor an earlier process's). A last turn run under a skill
 # (attributionSkill) may be on the skill's model, and a /model after the last
@@ -268,8 +272,10 @@ def sessions():
 def scan(path, start, now):
     start, now = float(start), float(now)
     KEYS = (b"\"ScheduleWakeup\"", b"\"CronCreate\"", b"\"CronDelete\"", b"\"Monitor\"", b"\"TaskStop\"",
-            b"\"KillShell\"")
-    NAMES = {"ScheduleWakeup", "CronCreate", "CronDelete", "Monitor", "TaskStop", "KillShell"}
+            b"\"KillShell\"", b"\"ArtifactComments\"", b"\"liveSubscription\"", b"Artifact comment monitor for ")
+    NAMES = {"ScheduleWakeup", "CronCreate", "CronDelete", "Monitor", "TaskStop", "KillShell", "ArtifactComments"}
+    watches = {}          # artifact id -> epoch
+    art = lambda url: url.rstrip("/").rsplit("/", 1)[-1] if isinstance(url, str) else "?"
     pending = {}          # tool_use id -> (name, input, epoch)
     pend_b = []           # the same ids, bytes
     wake = 0.0
@@ -332,6 +338,11 @@ def scan(path, start, now):
         elif name in ("TaskStop", "KillShell"):
             for k in ("task_id", "shell_id"):
                 monitors.pop(inp.get(k), None)
+        elif name == "ArtifactComments" and inp.get("action") == "watch" and inp.get("url"):
+            if inp.get("on") is False:
+                watches.pop(art(inp["url"]), None)
+            else:
+                watches[art(inp["url"])] = ts
 
     with open(path, "rb") as f:
         for line in f:
@@ -363,6 +374,13 @@ def scan(path, start, now):
                     model, switched = m, False
             elif t == "user" and prompt and not d.get("isMeta"):
                 turn = True
+            if t == "system" and d.get("subtype") == "informational":
+                m = re.match(r"Artifact comment monitor for (\S+) didn.t resume", str(d.get("content")))
+                if m:
+                    watches.pop(art(m.group(1)), None)
+            tur = d.get("toolUseResult") if t == "user" else None
+            if isinstance(tur, dict) and tur.get("liveSubscription"):
+                watches[art(tur.get("url"))] = ts
             if t == "queue-operation":
                 notices(d.get("content"))
             elif t == "attachment":
@@ -398,6 +416,10 @@ def scan(path, start, now):
     for ts, fire in crons.values():
         if ts is None or now - ts < 8 * 86400 or (fire or 0) > now:
             print("a scheduled job (cron) is set")
+            return 3
+    for ts in watches.values():
+        if ts is None or now - ts < 7 * 86400:
+            print("it watches an artifact for comments")
             return 3
     for ts, limit in monitors.values():
         if ts is not None and ts < start - 1:
