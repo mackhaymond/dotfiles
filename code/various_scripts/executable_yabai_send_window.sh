@@ -48,12 +48,12 @@ if [ -n "$home" ]; then
   [ "$cur_label" = "$home" ] && exit 0
 fi
 
-# Arc's two MAIN browser windows are pinned to main/school, so protect an Arc
+# A main browser's two MAIN windows are pinned to main/school, so protect such a
 # window sitting on main or school from being force-moved off it -- the same home-
 # space guard the other pinned apps get. Pure yabai (no AXIdentifier needed),
 # which keeps it reliable. This also shields a Little Arc that happens to be on
 # main/school (rare); a main-only guard would need Hammerspoon's arcFocusedKind.
-if [ "$app" = "Arc" ]; then
+if yabai_is_browser_app "$app"; then
   cur_label=$(yabai -m query --spaces --space "$cur" 2>/dev/null | jq -r '.label // ""' 2>/dev/null)
   case "$cur_label" in
     main|school) exit 0 ;;

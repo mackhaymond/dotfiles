@@ -1,6 +1,7 @@
 -- Minimal Hammerspoon config (replaces the old, unused Spacehammer setup).
 --
--- Job: pin the two MAIN Arc browser windows to the `main` and `school` yabai
+-- Job: pin the two MAIN windows of Arc (and, once classified, Zen: Arc stops working
+-- 2026-12-22) to the `main` and `school` yabai
 -- spaces (one each, title-independent), while leaving everything else about Arc --
 -- including "Little Arc" popups -- as a normal MANAGED window (tiled, in the
 -- stack, cyclable). Little Arc is NOT floated and NOT pinned; it just lives
@@ -29,11 +30,17 @@ require("hs.ipc") -- enables the `hs` command-line tool
 -- part of macOS; a killed call returns empty output, which every caller treats as
 -- "yabai unavailable" and gives up for this pass.
 local YABAI = "/usr/bin/perl -e 'alarm shift; exec @ARGV' 2 /opt/homebrew/bin/yabai"
-local ARC_BUNDLE = "company.thebrowser.Browser"
+-- The browsers whose two MAIN windows are pinned, each on its own (see pinMains).
+-- TODO 2026-11-24: Zen (Gecko) has no bigBrowserWindow id, so it classifies as
+-- "unknown"/"other" and is NOT pinned until arcKindFromId learns it. Shell twin:
+-- YABAI_BROWSER_APPS in yabai_common.sh.
+local BROWSERS = { "company.thebrowser.Browser", "app.zen-browser.zen" }
+local IS_BROWSER = {}
+for _, b in ipairs(BROWSERS) do IS_BROWSER[b] = true end
 local MAIN_LABEL = "main"
 local SCHOOL_LABEL = "school"
 
--- Remembered ids of Arc MAIN (bigBrowserWindow) windows. Accumulated as we see
+-- Remembered MAIN (bigBrowserWindow) windows: id -> bundle id. Accumulated as we see
 -- them on the current Space; pruned when they close.
 mainSet = mainSet or {}
 
@@ -70,12 +77,14 @@ end
 -- Arc's AX windows (current Space only) read straight off the application's AX
 -- element. This is FAST (~ms) -- unlike hs.window.allWindows(), which enumerates
 -- EVERY app's windows via AX and takes ~2s on this machine.
-local function arcAxWindows()
-  -- By bundle id: hs.application.find("Arc") is a SUBSTRING match that also returns
+local function arcAxWindows(bundle)
+  -- By bundle id: find("Arc") is a SUBSTRING match that also returns
   -- Arc's helper processes (and, with Arc quit, can return a window object).
-  local arc = hs.application.get(ARC_BUNDLE)
-  if not arc then return {} end
-  local appEl = hs.axuielement.applicationElement(arc)
+  -- applicationsForBundleID, not get(): get() on an app that is NOT running falls back
+  -- to a name scan (67-214 ms measured) on this thread, on every Space switch.
+  local app = hs.application.applicationsForBundleID(bundle)[1]
+  if not app then return {} end
+  local appEl = hs.axuielement.applicationElement(app)
   return (appEl and appEl:attributeValue("AXWindows")) or {}
 end
 
@@ -87,14 +96,16 @@ end
 -- Returns true if a main window was seen for the first time.
 local function classifyCurrent()
   local learned = false
-  for _, axw in ipairs(arcAxWindows()) do
-    local kind = arcKindFromId(axw:attributeValue("AXIdentifier"))
-    local hw = axw.asHSWindow and axw:asHSWindow()
-    if hw then
-      if kind == "main" then
-        if not mainSet[hw:id()] then learned = true end
-        mainSet[hw:id()] = true
-      elseif kind == "little" or kind == "other" then mainSet[hw:id()] = nil end
+  for _, bundle in ipairs(BROWSERS) do
+    for _, axw in ipairs(arcAxWindows(bundle)) do
+      local kind = arcKindFromId(axw:attributeValue("AXIdentifier"))
+      local hw = axw.asHSWindow and axw:asHSWindow()
+      if hw then
+        if kind == "main" then
+          if not mainSet[hw:id()] then learned = true end
+          mainSet[hw:id()] = bundle
+        elseif kind == "little" or kind == "other" then mainSet[hw:id()] = nil end
+      end
     end
   end
   return learned
@@ -117,25 +128,29 @@ local function pinMains()
   local byId = {}
   for _, w in ipairs(all) do byId[w.id] = w end
 
-  local onMain, onSchool, pool = {}, {}, {}
-  for id in pairs(mainSet) do
-    local w = byId[id]
-    if not w then
-      mainSet[id] = nil -- window is gone
-    elseif not w["is-native-fullscreen"] then
-      if w.space == mIdx then onMain[#onMain + 1] = id
-      elseif w.space == sIdx then onSchool[#onSchool + 1] = id
-      else pool[#pool + 1] = id end
+  -- Slots are PER BROWSER: one browser on main/school must not fill the other's slots
+  -- or pull its surplus windows into a gap.
+  for _, bundle in ipairs(BROWSERS) do
+    local onMain, onSchool, pool = {}, {}, {}
+    for id, b in pairs(mainSet) do
+      local w = byId[id]
+      if not w then
+        mainSet[id] = nil -- window is gone
+      elseif b == bundle and not w["is-native-fullscreen"] then
+        if w.space == mIdx then onMain[#onMain + 1] = id
+        elseif w.space == sIdx then onSchool[#onSchool + 1] = id
+        else pool[#pool + 1] = id end
+      end
     end
-  end
-  for i = 2, #onMain do pool[#pool + 1] = onMain[i] end
-  for i = 2, #onSchool do pool[#pool + 1] = onSchool[i] end
+    for i = 2, #onMain do pool[#pool + 1] = onMain[i] end
+    for i = 2, #onSchool do pool[#pool + 1] = onSchool[i] end
 
-  if #onMain == 0 and #pool > 0 then
-    yabai("window " .. table.remove(pool, 1) .. " --space " .. MAIN_LABEL)
-  end
-  if #onSchool == 0 and #pool > 0 then
-    yabai("window " .. table.remove(pool, 1) .. " --space " .. SCHOOL_LABEL)
+    if #onMain == 0 and #pool > 0 then
+      yabai("window " .. table.remove(pool, 1) .. " --space " .. MAIN_LABEL)
+    end
+    if #onSchool == 0 and #pool > 0 then
+      yabai("window " .. table.remove(pool, 1) .. " --space " .. SCHOOL_LABEL)
+    end
   end
 end
 
@@ -185,7 +200,7 @@ function arcFocusedKind()
   local w = hs.window.focusedWindow()
   if not w then return "none" end
   local app = w:application()
-  if not app or app:bundleID() ~= ARC_BUNDLE then return "notarc" end
+  if not app or not IS_BROWSER[app:bundleID()] then return "notarc" end
   return arcKind(w)
 end
 
@@ -197,7 +212,7 @@ function arcDiag()
   local out = { "mainSet: " .. table.concat(set, ",") }
   for _, w in ipairs(hs.window.allWindows()) do
     local app = w:application()
-    if app and app:bundleID() == ARC_BUNDLE then
+    if app and IS_BROWSER[app:bundleID()] then
       out[#out + 1] = string.format("hsid=%s kind=%s title=[%s]", tostring(w:id()), arcKind(w), tostring(w:title()))
     end
   end

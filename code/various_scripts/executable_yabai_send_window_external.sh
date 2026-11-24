@@ -52,7 +52,7 @@ esac
 yabai_is_agent_app "$app" && home="$YABAI_AGENT_LABEL"
 cur_label=$(yabai -m query --spaces --space "$cur" 2>/dev/null | jq -r '.label // ""' 2>/dev/null)
 [ -n "$home" ] && [ "$cur_label" = "$home" ] && exit 0
-if [ "$app" = "Arc" ]; then
+if yabai_is_browser_app "$app"; then
   case "$cur_label" in main|school) exit 0 ;; esac
 fi
 

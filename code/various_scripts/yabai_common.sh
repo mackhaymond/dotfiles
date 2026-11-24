@@ -74,6 +74,24 @@ YABAI_AGENT_APPS="Conductor|Claudia|OpenChamber|OpenCode|Jean|T3 Code (Alpha)|T3
 # shellcheck disable=SC2034
 YABAI_AGENT_APPS_RE="^($(printf '%s' "$YABAI_AGENT_APPS" | sed 's/[()]/\\&/g'))$"
 
+# --- main browsers ---------------------------------------------------------------
+# Browsers whose two main windows live on main + school. Pinned per window by
+# Hammerspoon's arcSync() (BROWSERS in dot_hammerspoon/init.lua: keep in step, as
+# with the inline `case` in yabairc's window_created signal), never by a `space=`
+# rule, so never in YABAI_PINNED_HOMES. Exact app names, `|`-separated.
+# Zen joins only once arcSync can classify and pin its windows: the guards would
+# otherwise trap unpinned Zen windows on main/school.
+YABAI_BROWSER_APPS="Arc"
+
+# yabai_is_browser_app <app>: exact match against the list above.
+yabai_is_browser_app() {
+  [ -n "$1" ] || return 1
+  case "|$YABAI_BROWSER_APPS|" in
+    *"|$1|"*) return 0 ;;
+  esac
+  return 1
+}
+
 # --- pinned apps: app -> home space label ---------------------------------------
 # The single SHELL-side source of the pinned-app home map, in the same `|`-delimited
 # no-eval-no-regex shape as YABAI_AGENT_APPS (so names with spaces need no quoting

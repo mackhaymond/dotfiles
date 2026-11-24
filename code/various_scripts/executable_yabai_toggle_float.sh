@@ -64,10 +64,10 @@ if [ "$floating" != "true" ] && [ -n "$home" ]; then
   [ "$cur_label" = "$home" ] && exit 0
 fi
 
-# Arc's two MAIN browser windows are pinned to main/school, so protect an Arc
+# A main browser's two MAIN windows are pinned to main/school, so protect such a
 # window on main or school -- the same home-space guard the other pinned apps get
 # (pure yabai, no AXIdentifier; also shields a rare Little Arc on main/school).
-if [ "$floating" != "true" ] && [ "$app" = "Arc" ]; then
+if [ "$floating" != "true" ] && yabai_is_browser_app "$app"; then
   cur_label=$(yabai -m query --spaces --space "$cur" 2>/dev/null | jq -r '.label // ""' 2>/dev/null)
   case "$cur_label" in
     main|school) exit 0 ;;

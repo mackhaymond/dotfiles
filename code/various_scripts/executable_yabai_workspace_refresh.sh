@@ -183,13 +183,14 @@ space_hosts_app() {
     >/dev/null 2>&1 <<<"$WINDOWS_JSON"
 }
 
-# Does space $1 hold a window of an app whose home is label $2? Arc counts for
+# Does space $1 hold a window of an app whose home is label $2? The main browsers count for
 # main/school (arcSync pins its main windows there; it has no entry in the map).
 space_hosts_label_app() {
-  jq -e --argjson index "$1" --arg label "$2" --argjson home "$HOME_MAP" '
+  jq -e --argjson index "$1" --arg label "$2" --argjson home "$HOME_MAP" --arg browsers "$YABAI_BROWSER_APPS" '
     any(.[]; .space == $index
              and ($home[.app] == $label
-                  or (.app == "Arc" and ($label == "main" or $label == "school"))))' \
+                  or (($label == "main" or $label == "school")
+                      and (.app as $a | $browsers | split("|") | index($a) != null))))' \
     >/dev/null 2>&1 <<<"$WINDOWS_JSON"
 }
 

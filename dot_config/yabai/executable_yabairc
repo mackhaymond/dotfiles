@@ -69,10 +69,10 @@ yabai -m signal --add event=window_created action='
   # A new window may add a stack layer on the focused space -> bump the layers bar.
   /usr/bin/notifyutil -p com.mackhaymond.layerbar.refresh
   app=$(printf "%s" "$info" | jq -r ".app // empty" 2>/dev/null)
-  # New Arc window -> re-pin the Arc MAIN windows via Hammerspoon (only it can
+  # New Arc/Zen window -> re-pin its MAIN windows via Hammerspoon (only it can
   # read AXIdentifier to tell a main window from a Little Arc popup). Same trigger
   # cadence as the other apps re-applying their space= rules. No-op if hs is down.
-  [ "$app" = "Arc" ] && /opt/homebrew/bin/hs -c "arcSync()" >/dev/null 2>&1
+  case "$app" in Arc|Zen) /opt/homebrew/bin/hs -c "arcSync()" >/dev/null 2>&1 ;; esac
   case "$app" in
     wezterm-gui|WezTerm)
       # WezTerm is a normal, NON-fullscreenable window (native_macos_fullscreen_mode
