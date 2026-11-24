@@ -723,7 +723,7 @@ The single most fragile dependency in the whole system is the **scripting additi
 - A cross-display move of a space that is visible but not active now repoints the source display's `_currentSpace`, so the record does not go stale in the first place.
 - `OSAX_VERSION` goes from `2.1.30` to `2.1.30.1`, so the new payload is the one loaded.
 
-State: reviewed, **installed 2026-11-23 16:19** (the Dock loaded payload 2.1.30.1, `sa=ok`), **not yet exercised with two displays**. Installing a new payload version restarts the Dock once. The script rules (`yabai_space_to_display`, destroy and create on the master only) are the first line of defence and stay; this patch is the second.
+State: reviewed, **installed 2026-11-23 16:19** (the Dock loaded payload 2.1.30.1, `sa=ok`), loaded during the two-display run of 16:22-16:25; its guard paths are not known to have fired. Installing a new payload version restarts the Dock once. The script rules (`yabai_space_to_display`, destroy and create on the master only) are the first line of defence and stay; this patch is the second.
 
 **Config that goes with the adopt-windows patch:** `YABAI_PINNED_MANAGED="Claude"` in `yabai_common.sh` adds `manage=on` to Claude's pin rule, which skips the FLOAT classification at level -1. (The "`manage=on` is NOT the fix" notes in §3.1 describe unpatched yabai.) Side effect: a `hyper+t` float of Claude off its home space lasts until the next `rule --apply`.
 
@@ -1106,7 +1106,7 @@ A real dock/undock session exercised the cross-display paths. All passed. This d
 
 ### ⚠️ Still needs testing
 
-From the 2026-11-23 display changes (see §4): push, home-all, undock, `ext` reuse / create / move / dissolve, the side swap (`display_moved`), the push scratch guard and the master-only sweep have been **simulated only** (a fake `yabai`), not yet run on real hardware with two displays. `osax-display-space.patch` is installed but not yet exercised with two displays.
+From the 2026-11-23 display changes (see §4): **run live 2026-11-23 16:22-16:25** on an OpenDisplay external, with yabai state recorded twice a second: connect, fling creating `ext`, fling reusing the empty space, `hyper+0` dissolving `ext` into `main`, push of `school` with follow, and `hyper+0` from the laptop with `school` visible on the external (the case that crashed the Dock at 13:32) twice. All landed right, no Dock crash or restart. **Still simulated only:** the side swap (`display_moved`), undock, the push scratch guard, pushing a display's first space, fullscreen Spaces on the external, and moves refused by Mission Control. `osax-display-space.patch` was loaded during that run; its guard paths were not knowingly exercised (the scripts avoid them).
 
 From the 2026-11-13 second pass (see §4), not yet exercised in real use: a dock/undock with the owned locks and the serialized refresh, `hyper+fn+g` creating `ext` under `refresh.lock`, and a real transient float of a pinned app going through the border grace period. (The sweep's two-display keep rule from that pass is gone: master-only since 2026-11-23.) *(The former "screen-flash under a rapid burst" item is moot — the flash was disabled 2026-06-04. The former "WezTerm fullscreen on the external" item is removed — WezTerm is intentionally not fullscreenable; see the design note above.)*
 
