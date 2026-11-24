@@ -401,7 +401,7 @@ The base config writes these chords as "→ F13/F14/F18/F19" (the names skhdrc b
 
 #### Arc-only Shortcuts (were BetterTouchTool)
 
-BetterTouchTool is no longer running; its Arc shortcuts live in `karabiner-base.json`, active only while Arc is frontmost (`hyper+c` and the double-taps also in Zen, 2026-11-24): `hyper+a` → `option+command+left_arrow`, `hyper+s` → `option+command+right_arrow`, `hyper+c` → `shift+command+c` (copy URL), plus the double-tap caps_lock / right_shift → `ctrl+tab`. **Trap:** the generated skhdrc rule is *prepended*, so an skhdrc bind on `hyper - a`/`s`/`c` would win over these and silently kill the Arc shortcuts — keep those three keys out of skhdrc.
+BetterTouchTool is no longer running; its Arc shortcuts live in `karabiner-base.json`, active only while Arc or Zen is frontmost (Zen 1.24.3b's default Space/copy-URL chords are Arc's; its ctrl+tab is recent-order only with `browser.ctrlTab.sortByRecentlyUsed`, set in the Zen profile's user.js): `hyper+a` → `option+command+left_arrow`, `hyper+s` → `option+command+right_arrow`, `hyper+c` → `shift+command+c` (copy URL), plus the double-tap caps_lock / right_shift → `ctrl+tab`. **Trap:** the generated skhdrc rule is *prepended*, so an skhdrc bind on `hyper - a`/`s`/`c` would win over these and silently kill the Arc shortcuts — keep those three keys out of skhdrc.
 
 #### System FN Row Preservation
 
