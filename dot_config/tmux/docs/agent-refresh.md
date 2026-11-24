@@ -50,6 +50,9 @@ All of these must hold:
 
 At most 3 per tick, one after another, longest idle first. Pinned tabs count.
 
+On battery under 40% a tick begins no restart. It still finishes one it finds
+half done, and `once` by hand ignores the rule.
+
 ### The model
 
 closed-tabs.sh's command carries the model a session *started* on. The resume

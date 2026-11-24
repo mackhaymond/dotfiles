@@ -17,7 +17,8 @@
 # prompt-cache TTL: a resume then costs nothing extra), not on screen, running
 # an older version than ~/.local/bin/claude links to, with nothing inside the
 # process that a restart would lose, and that `stash.sh check` would park.
-# At most 3 per tick, one after another, longest idle first.
+# At most 3 per tick, one after another, longest idle first; none on battery
+# under 40%.
 #
 # A RESTART IS: write a journal record, look again, SIGTERM (never -9), wait for
 # the pane's own shell to be at its prompt, type the resume command there (off
@@ -54,7 +55,7 @@
 # AGENT_REFRESH_ALLOW_SOCKET (the one other server it may run on, its exact
 # socket path), AGENT_REFRESH_MCP_URLS (set = this list, even empty),
 # AGENT_REFRESH_EXIT_TICKS / _BACK_TICKS (0.25 s each), _TMUX_TIMEOUT,
-# _TICK_MAX (s), STASH_SH, CLOSED_TABS_SH, NOTIFY_SH, SAVE_SOON_SH,
+# _TICK_MAX (s), _PMSET (a stand-in for pmset), STASH_SH, CLOSED_TABS_SH, NOTIFY_SH, SAVE_SOON_SH,
 # AGENT_BG_PENDING, AGENT_PAUSE_STATE_DIR, AGENT_STATE_NOTICE, XDG_STATE_HOME.
 #
 # Bash 3.2 (launchd runs /bin/bash): no associative arrays. closed-tabs.sh and
@@ -107,6 +108,7 @@ tmux() { bounded "${AGENT_REFRESH_TMUX_TIMEOUT:-10}" tmux "$@"; }
 MIN_IDLE=7200        # s idle before a restart (past the 1 h prompt cache)
 MIN_INSTALL_AGE=600  # s since the installed binary was written
 MAX_PER_TICK=3
+MIN_BATTERY=40       # %: below it on battery a tick begins no restart (`once` does)
 EXIT_TICKS=${AGENT_REFRESH_EXIT_TICKS:-120}   # 0.25 s each: 30 s to exit, at a prompt
 BACK_TICKS=${AGENT_REFRESH_BACK_TICKS:-360}   # 90 s to come back
 TICK_MAX=${AGENT_REFRESH_TICK_MAX:-480}       # s: the watchdog ends the tick
@@ -757,6 +759,15 @@ mcp_down() {
     printf '%s' "${down# }"
 }
 
+# On battery below MIN_BATTERY: the charge, else nothing. No battery, or no
+# answer, is not low.
+low_battery() {
+    bounded 10 "${AGENT_REFRESH_PMSET:-/usr/bin/pmset}" -g batt 2>/dev/null | awk -v min="$MIN_BATTERY" '
+        /Battery Power/ { b = 1 }
+        match($0, /[0-9]+%/) { p = substr($0, RSTART, RLENGTH - 1); got = 1 }
+        END { if (b && got && p + 0 < min) print p }'
+}
+
 # --- one window, all the rules --------------------------------------------------
 failed_before() { grep -qF -- "$1 $2 $3 " "$FAILED" 2>/dev/null; }
 record_failed() {   # <window> <sid> <version> <why>
@@ -1230,6 +1241,13 @@ fi
 installed || stop "$WHY"
 paused=$(helper tick 2>/dev/null) || paused="its own checks failed"
 [ -n "$paused" ] && [ "$dry" = 0 ] && stop "$paused"
+# (After `recover`: a tab a restart already took down always comes back.)
+low=""
+if [ "$verb" = check ]; then
+    low=$(low_battery)
+    [ -n "$low" ] && low="on battery at $low% (under $MIN_BATTERY%)"
+    [ -n "$low" ] && [ "$dry" = 0 ] && stop "$low"
+fi
 
 # The agents, longest idle first (a window with no idle stamp sorts last).
 agents=$(all_rows | awk -F"$US" -v OFS="$US" -v only="$only" '
@@ -1241,7 +1259,7 @@ agents=$(printf '%s\n' "$agents" | sed "s/^[0-9]*$US//")
 
 if [ "$dry" = 1 ]; then
     down=$(mcp_down)
-    for why in "$paused" "${down:+MCP down: $down}"; do
+    for why in "$paused" "$low" "${down:+MCP down: $down}"; do
         [ -n "$why" ] && echo "nothing would restart now: $why"
     done
     echo "installed: $INSTALLED"

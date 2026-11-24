@@ -196,6 +196,7 @@ class Base(unittest.TestCase):
         self.exe(h / "bg-pending", FAKE_BG)
         self.exe(h / "save-soon.sh", '#!/bin/sh\necho "$@" >> "$HOME/saves"\n')
         (h / ".claude.json").write_text('{"resumeReturnDismissed": true}')
+        self.exe(h / "pmset", '#!/bin/sh\n[ ! -e "$HOME/batt" ] || cat "$HOME/batt"\n')
         self.install(NEW)
         self.env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE", "CLAUDE_CONFIG_DIR")}
         self.sock = f"{self.sockdir}/tmux-{os.getuid()}/default"
@@ -205,7 +206,7 @@ class Base(unittest.TestCase):
             "TMUX_ASSISTANT_RESURRECT_DIR": f"{h}/ard", "AGENT_REFRESH_ALLOW_SOCKET": self.sock,
             "AGENT_REFRESH_MCP_URLS": "", "AGENT_REFRESH_EXIT_TICKS": "40", "AGENT_REFRESH_BACK_TICKS": "40",
             "NOTIFY_SH": f"{h}/notify.sh", "AGENT_BG_PENDING": f"{h}/bg-pending", "AGENT_STATE_NOTICE": "",
-            "SAVE_SOON_SH": f"{h}/save-soon.sh", "AGENT_FOCUS_NOTICE": "", "LANG": "en_US.UTF-8", "BASH_SILENCE_DEPRECATION_WARNING": "1", "PS1": "$ ",
+            "AGENT_REFRESH_PMSET": f"{h}/pmset", "SAVE_SOON_SH": f"{h}/save-soon.sh", "AGENT_FOCUS_NOTICE": "", "LANG": "en_US.UTF-8", "BASH_SILENCE_DEPRECATION_WARNING": "1", "PS1": "$ ",
         })
         for k in ("LC_ALL", "LC_CTYPE", "AGENT_PAUSE_STATE_DIR", "XDG_RUNTIME_DIR", "STASH_SH", "CLOSED_TABS_SH"):
             self.env.pop(k, None)
@@ -682,6 +683,27 @@ class Refusals(Base):
         self.assertEqual(self.journals(), [])
         self.assertIn("MCP down", self.log())
 
+    def test_low_battery(self):
+        win, sid = self.agent()
+        pid = self.records()[sid]["pid"]
+
+        def batt(source, pct, state):
+            (self.home / "batt").write_text(f"Now drawing from '{source}'\n -InternalBattery-0 (id=22216803)\t{pct}%; "
+                                            f"{state}; 1:51 remaining present: true\n")
+        for pct in (9, 25, 39):
+            batt("Battery Power", pct, "discharging")
+            self.assertIn(f"nothing would restart now: on battery at {pct}%", self.run_it("--dry-run"))
+        self.run_it("check")
+        self.assertIn("skip: on battery at 39% (under 40%)", self.log())
+        self.assertEqual((self.records()[sid]["pid"], self.journals()), (pid, []))
+        self.taken(win)                                    # by hand it still goes
+        for args in (("Battery Power", 40, "discharging"), ("Battery Power", 100, "discharging"), ("AC Power", 5, "charging")):
+            batt(*args)
+            self.assertNotIn("nothing would restart", self.run_it("--dry-run"))
+        (self.home / "batt").write_text("Now drawing from 'AC Power'\n")      # no battery
+        self.run_it("check")
+        self.until("the restart", lambda: self.records()[sid]["pid"] != pid)
+
     def test_last_look(self):
         """The guards again after the journal is written, right before the
         kill: a refusal there removes it and leaves the agent running."""
@@ -822,6 +844,7 @@ class Recovery(Base):
     def test_the_resume_is_typed_and_the_options_restored(self):
         win, sid, since = self.crashed()
         self.assertEqual(self.opt(win, "@agent_state"), "")
+        (self.home / "batt").write_text("Now drawing from 'Battery Power'\n -InternalBattery-0\t9%; discharging;\n")   # even so
         self.run_it("check")
         self.assertEqual(self.records()[sid]["version"], NEW)
         self.assertEqual((self.opt(win, "@agent_since"), self.opt(win, "@agent_summary")), (since, "proj/My agent"))
