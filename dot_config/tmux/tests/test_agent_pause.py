@@ -1205,6 +1205,87 @@ class Popup(Harness):
         self.assertTrue([l for l in lines if l["mode"] == "popup"])
         self.press_done()
 
+    # -- the key's confirm box (agent-pause.py key) ----------------------
+    def ask_key(self, want):
+        """prefix P on the real client; returns once the box is up."""
+        self.env["AGENT_PAUSE_POPUP"] = "off"
+        self.out.clear()
+        self.press_proc = subprocess.Popen([sys.executable, str(SCRIPT), "key", self.client],
+                                           env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.wait_for(lambda: self.popup_up(want) and self.popup_up("any other key cancels"), want)
+
+    def ask_done(self):
+        out, err = self.press_proc.communicate(timeout=20)
+        self.assertEqual((self.press_proc.returncode, out), (0, b""), err)
+
+    def test_key_space_pauses_then_space_resumes(self):
+        a = self.window("running")
+        self.ask_key("pause 1 agent?")
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [])     # nothing until Space
+        self.key(b" ")
+        self.ask_done()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [a])
+        self.ask_key("resume 1 agent?")
+        self.key(b" ")
+        self.ask_done()
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [a])
+        self.assertIsNone(self.state())
+
+    def test_key_any_other_key_cancels(self):
+        self.window("running")
+        for k in (b"\r", b"\x1b", b"y", b"P", b"\x03", b"\x1b[A", b"\t", b"\x00"):
+            with self.subTest(key=k):
+                self.ask_key("pause 1 agent?")
+                self.key(k)
+                self.ask_done()
+                self.assertEqual(self.last_log()["mode"], "cancel")
+                self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [])
+                self.assertIsNone(self.state())
+
+    def test_key_cancel_keeps_a_saved_set(self):
+        self.window("running")
+        self.run_script("toggle", "")
+        self.ask_key("resume 1 agent?")
+        self.key(b"x")
+        self.ask_done()
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [])
+        self.assertIsNotNone(self.state())
+
+    def test_key_yes_to_a_stale_question_sends_nothing(self):
+        a = self.window("running")
+        self.ask_key("pause 1 agent?")
+        self.run_script("toggle", "")                      # paused from elsewhere
+        self.key(b" ")
+        self.ask_done()
+        self.assertEqual(self.last_log()["mode"], "stale")
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [a])
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [])
+
+    def test_key_client_lost_while_asking_sends_nothing(self):
+        self.window("running")
+        self.ask_key("pause 1 agent?")
+        self.t("detach-client", "-t", self.client)
+        self.ask_done()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [])
+
+    def test_key_with_nobody_working_does_not_ask(self):
+        self.window("idle")
+        r = self.run_script("key", self.client)
+        self.assertEqual((r.returncode, r.stdout), (0, ""), r.stderr)
+        self.assertIn("no agents are working", self.last_log()["message"])
+
+    def test_key_without_a_client_sends_nothing(self):
+        self.window("running")
+        self.assertEqual(self.run_script("key", "").returncode, 0)
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [])
+
+    def test_key_box_shows_awkward_labels_literally(self):
+        self.window("running", summary="a #{pid} `id` $(id) %s \\033 'q'")
+        self.ask_key("pause 1 agent?")
+        self.wait_for(lambda: self.popup_up("#{pid} `id` $(id) %s"), "the literal label")
+        self.key(b"n")
+        self.ask_done()
+
     def test_pause_popup_ignores_stray_keys_and_esc_keeps_the_set(self):
         a = self.window("running")
         self.press_with_popup()
@@ -2938,7 +3019,7 @@ class Units(unittest.TestCase):
         binds = [l for l in text.splitlines() if l.startswith("bind")]
         self.assertEqual(len(binds), 1)
         self.assertIn("bind-key P run-shell -b", binds[0])
-        self.assertIn("scripts/agent-pause.py toggle '#{client_name}'", binds[0])
+        self.assertIn("scripts/agent-pause.py key '#{client_name}'", binds[0])
         self.assertNotIn("{{", text)
         self.assertTrue(SCRIPT.read_text().startswith("#!/usr/bin/env python3\n"))
 

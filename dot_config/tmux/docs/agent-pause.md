@@ -13,6 +13,18 @@ correction), so a fresh scan would resume the wrong set.
 | script | `dot_config/tmux/scripts/executable_agent-pause.py` (python3, stdlib only) |
 | tests | `dot_config/tmux/tests/test_agent_pause.py` |
 
+## It asks first
+
+`prefix P` runs `agent-pause.py key`, which opens a small box naming the
+agents: **Space** goes ahead, **any other key cancels** (Mack, 2026-11-23).
+Both presses ask, the pause and the resume. With nobody working and nothing
+saved there is nothing to ask, so it only says so. The lock is not held while
+the box is up. `toggle(expect=…)` re-checks afterwards, so a yes to "pause"
+never resumes a set another client saved meanwhile (`stale` in the log; a
+cancel is `cancel`). Only the box's own exit code 42 counts as a yes: a popup
+that failed to open or lost its client sends nothing. The sidebar's click
+(`resume`), the notch and the opt-in popup's Enter do not ask.
+
 ## What counts as working
 
 It reads the per-window options that the tab indicator hooks and

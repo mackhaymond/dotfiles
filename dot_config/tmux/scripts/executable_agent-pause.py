@@ -7,7 +7,8 @@ The next press tells exactly that saved set to resume. Not a fresh scan:
 agents finish while the lid is shut and states move on, and a RESUME must
 reach the agents that were paused, not whatever happens to be running now.
 
-    agent-pause.py toggle <client_name>   the key: pause, or resume a saved set
+    agent-pause.py key <client_name>      the key: ask first (Space = yes), then toggle
+    agent-pause.py toggle <client_name>   pause, or resume a saved set, without asking
     agent-pause.py resume <client_name>   resume a saved set, never pause (the sidebar)
     agent-pause.py dismiss [client_name]  turn off the notch's "all paused" glow; stays paused
     agent-pause.py void [client_name]     forget the pause, message nobody; they stay paused
@@ -1249,13 +1250,16 @@ def finish_resume(client, prog, st, live, gone):
     return msg, bool(ok or handed)
 
 
-def toggle(client, resume_only=False):
+def toggle(client, resume_only=False, expect=None):
     """The key. Under the lock: the cheap plan, progress.json, the popup
     (launched, not waited for), then delivery and the final state. A second
     press while this one delivers finds the lock held ("busy"), so it can
     never read a half-made pause as a resumable set. resume_only (the
     sidebar's click, `resume`): with no saved set it does nothing, so a click
-    on a banner that just went stale can never turn into a fresh pause."""
+    on a banner that just went stale can never turn into a fresh pause.
+    expect ("pause" | "resume" | "none", from press_key): what Mack was asked.
+    If a press would do something else by now (another client paused or
+    resumed meanwhile), nothing is sent, so a yes to PAUSE never RESUMEs."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     lf = open(LOCK, "a")
     popup = None
@@ -1268,7 +1272,10 @@ def toggle(client, resume_only=False):
             return
         st = load_state()
         press = new_press()
-        if st and st["targets"]:
+        if expect and expect != press_mode(st):
+            msg = "⏸ agents changed while asking — nothing done, press again"
+            log({"mode": "stale", "client": client, "asked": expect, "message": msg})
+        elif st and st["targets"]:
             live, gone = plan_resume(st)
             prog = Progress(press, "resume", live, gone)
             popup = open_popup(client, "resume", press)
@@ -1299,6 +1306,79 @@ def toggle(client, resume_only=False):
     tail = limit_after_press()
     if tail:
         display(client, tail.lstrip(" ·"))
+
+
+def press_mode(st):
+    """What a press would do now: "resume", "pause", or "none" (nobody works)."""
+    if st and st["targets"]:
+        return "resume"
+    return "pause" if plan_pause()[0] else "none"
+
+
+# The key asks first (Mack, 2026-11-23): Space goes ahead, any other key
+# cancels. A popup and not a menu (a menu ignores keys it has no item for) or
+# confirm-before (it draws on the status line, which is off with the sidebar).
+# dash, stty and dd rather than this file: the box must be up at once, and a
+# Space typed before it reads is kept (stty does not flush). Only an exit of
+# ASK_YES is a yes, so a popup that never opened, was killed, or lost its
+# client sends nothing.
+ASK_YES = 42
+ASK_ROWS = 6
+ASK_WIDTH = 46
+ASK_SH = ("printf '\\033[?25l'; printf '%%s' \"$1\"; stty raw -echo; "
+          "k=$(dd bs=1 count=1 2>/dev/null; echo .); "
+          "[ \"$k\" = ' .' ] && exit %d; exit 0" % ASK_YES)
+
+
+def ask_lines(mode, targets):
+    """The confirm box's rows: who, then the keys. Pure."""
+    def clean(s):
+        return "".join(c if c.isprintable() else " " for c in s)
+    who = [fit(clean(t["label"]), ASK_WIDTH - 6) for t in targets[:ASK_ROWS]]
+    if len(targets) > ASK_ROWS:
+        who.append("+%d more" % (len(targets) - ASK_ROWS))
+    return ([""] + ["  " + w for w in who] + [""]
+            + ["  \x1b[1mspace\x1b[0m %s  \x1b[2m·  any other key cancels\x1b[0m" % mode])
+
+
+def ask(client, mode, targets):
+    """Show the box on client and wait for one key -> (yes, error text)."""
+    if not client:
+        return False, "no client to ask on"
+    lines = ask_lines(mode, targets)
+    n = len(targets)
+    # A status message showing on the client blanks a popup (open_popup).
+    subprocess.run(["tmux", "display-message", "-c", client, "-d", "1", ""],
+                   capture_output=True, timeout=10)
+    time.sleep(0.05)
+    r = subprocess.run(["tmux", "display-popup", "-c", client, "-E", "-b", "rounded",
+                        "-w", str(ASK_WIDTH), "-h", str(len(lines) + 3),
+                        "-x", "#{?#{@popup_x},#{E:@popup_x},#{popup_centre_x}}", "-y", "C",
+                        "-s", "bg=#1e1e2e,fg=#cdd6f4",
+                        "-S", "fg=%s" % (PEACH if mode == "pause" else GREEN),
+                        "-T", " %s %d agent%s? " % (mode, n, "" if n == 1 else "s"),
+                        "/bin/dash", "-c", ASK_SH, "dash", "\r\n".join(lines)],
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    return r.returncode == ASK_YES, r.stderr.strip()
+
+
+def press_key(client):
+    """prefix P: ask, then toggle. The lock is NOT held while the box is up,
+    so an unanswered one blocks nothing; toggle re-checks what was asked."""
+    st = load_state()
+    if st and st["targets"]:
+        mode, targets = "resume", st["targets"]
+    else:
+        targets = plan_pause()[0]
+        mode = "pause" if targets else "none"
+    if mode != "none":
+        yes, err = ask(client, mode, targets)
+        if not yes:
+            log({"mode": "cancel", "client": client, "asked": mode, "detail": err})
+            if err:
+                display(client, "⏸ could not ask (%s) — nothing done" % err, "warn")
+            return
+    toggle(client, expect=mode)
 
 
 def finished(prog, finish):
@@ -3550,10 +3630,13 @@ def dry_run():
 
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else ""
-    if cmd in ("toggle", "resume"):
+    if cmd in ("key", "toggle", "resume"):
         client = argv[2] if len(argv) > 2 else ""
         try:
-            toggle(client, resume_only=(cmd == "resume"))
+            if cmd == "key":
+                press_key(client)
+            else:
+                toggle(client, resume_only=(cmd == "resume"))
         except Exception as e:   # the keybind path never fails silently
             msg = "⏸ pause key error: %s: %s" % (type(e).__name__, e)
             log({"mode": "error", "client": client, "message": msg})
@@ -3625,7 +3708,7 @@ def main(argv):
             import select
             select.select([sys.stdin], [], [], 30)
         return 0
-    sys.stderr.write("usage: agent-pause.py toggle|resume <client_name> | dismiss|void [client_name]"
+    sys.stderr.write("usage: agent-pause.py key|toggle|resume <client_name> | dismiss|void [client_name]"
                      " | status | dry-run"
                      " | watch pause|resume [--demo] [--press <id>]"
                      " | limit-add <window> | limit-tick | limit-auto on|off|toggle"

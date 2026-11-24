@@ -63,7 +63,7 @@ Tabs	click tab	Status line: go to that tab or space	root	MouseDown1Status	[+] op
 
 Agents	⌃S q	Agent menu	prefix	q C-q
 Agents	⌃S t	Pin / unpin this agent	prefix	t	⌥W 1-9 reach pins
-Agents	⌃S P	Pause working agents; again resumes	prefix	P	before closing the lid
+Agents	⌃S P	Pause working agents; again resumes	prefix	P	asks first: space confirms, any other key cancels
 Agents	⌃S O	Review old agents (idle 8h+), one by one	prefix	O	c close · p park · s snooze · k keep
 
 Park	⌃S H	Park this tab (agent kept, jobs frozen)	prefix	H	refused if it can't be paused
