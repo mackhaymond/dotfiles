@@ -67,7 +67,7 @@ YABAI_LABELS="terminal main school todo schedule mail calendar messages ai agent
 # Add an app HERE and every consumer picks it up. Names are yabai's `.app` field
 # (the app's display name), `|`-separated.
 YABAI_AGENT_LABEL="agent"
-YABAI_AGENT_APPS="Conductor|Claudia|OpenChamber|OpenCode|Jean|T3 Code (Alpha)|Muse"
+YABAI_AGENT_APPS="Conductor|Claudia|OpenChamber|OpenCode|Jean|T3 Code (Alpha)|T3 Code (Beta)|Muse"
 
 # The same list as a yabai `rule --add app=` regex: anchored, with the literal
 # parens of names like "T3 Code (Alpha)" escaped so they aren't read as a group.
@@ -281,27 +281,28 @@ yabai_lock_acquire_wait() {
   done
 }
 
-# Sweep husk spaces: destroy the surplus empty, UNLABELED, NON-fullscreen spaces,
-# keeping exactly ONE empty per display (the SINGLE copy of this policy; it used to
-# live only on yabai_terminal_follow.sh's slow path). Fullscreen enter/exit leaves the
-# vacated Space behind as an empty desktop, and a refresh that raced or was lied to
-# by `query --spaces` leaks spares; over time these pile up. One empty per display is
-# kept on purpose: it makes the sweep idempotent (macOS recreates a space on
-# fullscreen-exit if none is suitable), it is the laptop's spare after the labels and
-# the external's reserved scratch. group_by(.display) so each display keeps its own.
-# The kept one is the display's VISIBLE empty if it has one (never destroy the space
-# the user is looking at); else, on the master, the highest-indexed (the spare after
-# the labels), and on any other display the LOWEST-indexed: that is the external's
-# first-position scratch, the slot macOS destroys on disconnect. Keeping a later husk
-# instead left a labeled space first on the external, with nothing re-running
-# yabai_reorder_spaces.sh afterwards. Which display is the master therefore matters,
-# so if it cannot be resolved nothing is swept. Never touches a labeled space, a
-# space with windows, a visible/focused space or a native-fullscreen Space; a no-op
-# when every display has <=1 empty, and when the bulk query answers a bare "[".
-# Indices are destroyed high-to-low so yabai's index compaction on --destroy can't
-# stale a later target, and each target is re-read by index right before it goes and
-# skipped unless it is still the same space id and still qualifies (another script
-# may have labeled it, or put a window on it, since the snapshot). Needs the SA.
+# Sweep husk spaces: destroy the surplus empty, UNLABELED, NON-fullscreen spaces on the
+# MASTER display, keeping exactly ONE (the SINGLE copy of this policy; it used to live
+# only on yabai_terminal_follow.sh's slow path). Fullscreen enter/exit leaves the
+# vacated Space behind as an empty desktop, and a refresh that raced or was lied to by
+# `query --spaces` leaks spares; over time these pile up. One empty is kept on purpose:
+# it makes the sweep idempotent (macOS recreates a space on fullscreen-exit if none is
+# suitable) and it is the laptop's spare after the labels. The kept one is the VISIBLE
+# empty if there is one (never destroy the space the user is looking at), else the
+# highest-indexed (the spare after the labels).
+#
+# Never on any other display: a destroy there is the call that segfaults the Dock if
+# anything has left that display's Dock record stale (see yabai_space_to_display). The
+# external's empties cost nothing: its first is the reserved scratch, macOS removes or
+# merges the rest on undock, and yabai_ensure_ext reuses one before making another.
+# Which display is the master therefore matters, so if it cannot be resolved nothing is
+# swept. Never touches a labeled space, a space with windows, a visible/focused space or
+# a native-fullscreen Space; a no-op when the master has <=1 empty, and when the bulk
+# query answers a bare "[". Indices are destroyed high-to-low so yabai's index
+# compaction on --destroy can't stale a later target, and each target is re-read by
+# index right before it goes and skipped unless it is still the same space id, still on
+# the master and still qualifies (another script may have labeled it, or put a window on
+# it, since the snapshot). Needs the SA.
 #
 # A space some script has just created and not yet labeled looks exactly like a husk.
 # The creators that matter take refresh.lock around create -> label (the refresh
@@ -312,14 +313,11 @@ yabai_lock_acquire_wait() {
 # shellcheck disable=SC2016  # $m is jq's, bound with --argjson
 YABAI_JQ_SWEEP_SURPLUS='
   [ .[] | select((.label // "") == "" and (.windows | length == 0)
-                 and (.["is-native-fullscreen"] == false)) ]
-  | group_by(.display)
-  | map((if .[0].display == $m
-         then sort_by([(.["is-visible"] == true), .index]) | reverse
-         else sort_by([(.["is-visible"] != true), .index]) end)
-        | .[1:]
-        | map(select(.["is-visible"] == false and .["has-focus"] == false)))
-  | flatten | sort_by(.index) | reverse | .[] | "\(.index):\(.id)"'
+                 and (.["is-native-fullscreen"] == false) and .display == $m) ]
+  | sort_by([(.["is-visible"] == true), .index]) | reverse
+  | .[1:]
+  | map(select(.["is-visible"] == false and .["has-focus"] == false))
+  | sort_by(.index) | reverse | .[] | "\(.index):\(.id)"'
 
 yabai_sweep_empty_spaces() {
   local surplus sidx sid master
@@ -329,8 +327,10 @@ yabai_sweep_empty_spaces() {
   for sidx in $surplus; do
     sid=${sidx#*:}; sidx=${sidx%%:*}
     case "$sidx$sid" in ''|*[!0-9]*) continue ;; esac
-    yabai -m query --spaces --space "$sidx" 2>/dev/null | jq -e --argjson id "$sid" '
-      .id == $id and (.label // "") == "" and (.windows | length == 0)
+    # The external changing sides renumbers the displays (and every space) under us.
+    [ "$(yabai_master_index)" = "$master" ] || return 0
+    yabai -m query --spaces --space "$sidx" 2>/dev/null | jq -e --argjson id "$sid" --argjson m "$master" '
+      .id == $id and .display == $m and (.label // "") == "" and (.windows | length == 0)
       and .["is-native-fullscreen"] == false
       and .["is-visible"] == false and .["has-focus"] == false' >/dev/null 2>&1 || continue
     yabai -m space "$sidx" --destroy >/dev/null 2>&1 || true
@@ -522,6 +522,168 @@ yabai_load_topology() {
   return 0
 }
 
+# The display index holding role $1 (master|external) RIGHT NOW, else $2 if the topology
+# cannot be read. 1 if there is no such display (external with one display attached).
+# For anything that waits (a lock, a retry) between choosing a display and acting on it:
+# the external changing sides meanwhile swaps the indices.
+_yabai_role_display() {
+  local topo rest
+  topo=$(yabai_live_topology) || topo=""
+  [ -n "$topo" ] || { printf '%s' "${2:-}"; return 0; }
+  rest=${topo#*:}
+  case "$1" in
+    master) printf '%s' "${rest%%:*}" ;;
+    *) [ -n "${rest#*:}" ] || return 1
+       printf '%s' "${rest#*:}" ;;
+  esac
+}
+
+# Every space as a JSON array, unlabeled ones included (unlike yabai_spaces_json), or
+# nothing. While the bulk query answers "[", one indexed query per space instead, up to
+# the first index there is none for; dropped if the spaces renumbered meanwhile.
+_yabai_spaces_snapshot() {
+  local out one parts="" n=0
+  out=$(yabai -m query --spaces 2>/dev/null)
+  if ! printf '%s' "$out" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+    while [ "$n" -lt 40 ]; do
+      n=$((n + 1))
+      one=$(yabai -m query --spaces --space "$n" 2>/dev/null) || break
+      parts="$parts$one,"
+    done
+    out=$(printf '[%s]' "${parts%,}" | jq -c '
+      if length > 0 and (map(.id) | unique | length) == length then . else empty end' 2>/dev/null)
+  fi
+  [ -n "$out" ] && printf '%s' "$out"
+}
+
+# The current index of the space with stable id $1 (indices renumber as spaces move).
+yabai_space_index_for_id() {
+  _yabai_spaces_snapshot | jq -r --argjson id "$1" '
+    .[] | select(.id == $id) | .index' 2>/dev/null | head -n 1
+}
+
+# Make the visible space with id $2 (in spaces-JSON $1) hidden, by showing another user
+# space on ITS display: the first hidden one, i.e. the scratch on the external. 0 once a
+# query shows it is no longer visible; 1 if that did not land; 2 if the display has
+# nothing else to show (yabai refuses to move a display's last user space anyway); 3 if
+# yabai refused outright (Mission Control, animating). A fullscreen Space is not a
+# candidate: whenever the move is possible at all, a hidden user space exists.
+# `display --space`, not `space --focus`: the same SA call (it sets the Dock's
+# _currentSpace) without taking keyboard focus to that display, warping the cursor there
+# or posting a click; it also has no gesture fallback, and it refuses when the space is
+# not on that display (the displays renumbered since the snapshot).
+_yabai_hide_space() {
+  local sib _w
+  sib=$(printf '%s' "$1" | jq -r --argjson id "$2" '
+    ([.[] | select(.id == $id) | .display][0]) as $d
+    | [ .[] | select(.display == $d and .id != $id and .["is-visible"] == false
+                     and .["is-native-fullscreen"] == false) | .index ]
+    | min // empty | "\($d) \(.)"' 2>/dev/null)
+  case "$sib" in [0-9]*" "[0-9]*) ;; *) return 2 ;; esac
+  yabai -m display "${sib%% *}" --space "${sib##* }" >/dev/null 2>&1 || return 3
+  for _w in 1 2 3 4 5 6 7 8; do
+    _yabai_spaces_snapshot | jq -e --argjson id "$2" '
+      any(.[]; .id == $id and .["is-visible"] == false)' >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# Put the space with stable id $1 on display $2; 0 once a query shows it there.
+#   yabai_space_to_display <space id> <display index> [master|external] [tries=4]
+# The ONE way these scripts move a space across displays. With a role, the display index
+# is re-resolved live on every try and $2 is only the fallback. The move is retried
+# (yabai refuses it while Mission Control is open), and each try waits for it to land:
+# yabai is busy reindexing right after, and a too-soon follow-up is silently dropped.
+# The index is re-read by id every try.
+#
+# A space that is VISIBLE but not focused is hidden first, and if it cannot be hidden it
+# is NOT moved. The scripting addition finds a display's record inside the Dock through
+# the record's `_currentSpace`. yabai repoints that only when the moved space is the
+# ACTIVE one; moving any other visible space leaves the record naming a space that now
+# lives on another display, the lookup for the old display comes up empty, and the next
+# `space --destroy` or `--create` there hands the Dock a nil and segfaults it -- possibly
+# minutes later (2026-11-23). Hidden spaces and the focused one are safe. Focused means
+# what yabai means by it: `query --spaces --space` with no selector reads the active
+# space live, has-focus only follows events, so both must agree. One focused case is
+# unsafe too: yabai shows `the previous space` in its place, and for a display's FIRST
+# space that is a space of another display (or none), so that one is hidden first as
+# well. A space that was hidden here but then did not move is shown again.
+# Held under refresh.lock by its callers, so it must not linger: four immediate refusals
+# take about a second.
+yabai_space_to_display() {
+  local id="$1" disp="$2" role="${3:-}" tries="${4:-4}"
+  local snap info d="" idx vis foc first active err="" hid=0 _try=0 _s rc
+  case "$id" in ''|*[!0-9]*) return 1 ;; esac
+  while [ "$_try" -lt "$tries" ]; do
+    _try=$((_try + 1))
+    [ -n "$err" ] && sleep 0.12
+    if [ -n "$role" ]; then
+      disp=$(_yabai_role_display "$role" "$disp") || { err="no $role display"; break; }
+    fi
+    case "$disp" in ''|*[!0-9]*) err="no display index"; break ;; esac
+    snap=$(_yabai_spaces_snapshot)
+    info=$(printf '%s' "$snap" | jq -r --argjson id "$id" '
+      . as $all | .[] | select(.id == $id) | .display as $d
+      | "\(.display) \(.index) \(.["is-visible"]) \(.["has-focus"]) \(.index == ([$all[] | select(.display == $d) | .index] | min))"
+      ' 2>/dev/null | head -n 1)
+    d="" idx="" vis="" foc="" first=""
+    read -r d idx vis foc first <<<"$info"
+    case "$idx" in ''|*[!0-9]*) err="not in the spaces query"; continue ;; esac
+    [ "$d" = "$disp" ] && return 0
+
+    if [ "$vis" != false ]; then
+      active=""
+      [ "$foc" = true ] &&
+        active=$(yabai -m query --spaces --space 2>/dev/null | jq -r '.id // empty' 2>/dev/null)
+      if [ "$active" != "$id" ] || [ "$first" = true ]; then
+        _yabai_hide_space "$snap" "$id"; rc=$?
+        case "$rc" in
+          0) # Back to the top for a fresh snapshot; hiding it does not use up a try.
+             err=""
+             [ "$hid" = 0 ] && tries=$((tries + 1))
+             hid=1 ;;
+          2) err="visible, and nothing else on its display to show"; break ;;
+          3) err="visible, and yabai refused to hide it" ;;
+          *) err="visible, and could not be hidden"; break ;;
+        esac
+        continue
+      fi
+    fi
+
+    err=$(yabai -m space "$idx" --display "$disp" 2>&1) || { err=${err:-refused}; continue; }
+    err=${err:-"accepted, but did not land"}
+    for _s in 1 2 3 4 5; do
+      d=$(_yabai_spaces_snapshot | jq -r --argjson id "$id" '
+        .[] | select(.id == $id) | .display' 2>/dev/null | head -n 1)
+      [ "$d" = "$disp" ] && return 0
+      sleep 0.1
+    done
+  done
+  yabai_log space_move "space id=$id did not reach display ${disp:-?}${role:+ ($role)} (on ${d:-?}): $err"
+  if [ "$hid" = 1 ]; then
+    info=$(_yabai_spaces_snapshot | jq -r --argjson id "$id" '
+      .[] | select(.id == $id) | "\(.display) \(.index)"' 2>/dev/null | head -n 1)
+    [ -n "$info" ] && yabai -m display "${info%% *}" --space "${info##* }" >/dev/null 2>&1
+  fi
+  return 1
+}
+
+# Bring every canonical label that is not on the master display home to it.
+# $1 = master display index (a fallback, see yabai_space_to_display). Two tries each, not
+# four: with the external refusing every move, ten labels must not hold the caller's
+# lock past its 30s stale age. A label that cannot move is logged and left.
+yabai_pull_labels_home() {
+  local label info disp id
+  for label in $YABAI_LABELS; do
+    info=$(yabai -m query --spaces --space "$label" 2>/dev/null |
+      jq -r '"\(.display) \(.id)"' 2>/dev/null | head -n 1)
+    disp=${info%% *}; id=${info##* }
+    case "$disp" in ''|*[!0-9]*) continue ;; esac
+    [ "$disp" = "$1" ] || yabai_space_to_display "$id" "$1" master 2 || true
+  done
+}
+
 # Pull any native-fullscreen Space stranded on a non-master display home to master.
 # A native-fullscreen app (Preview, a browser, etc.) lives in its OWN, UNLABELED
 # macOS Space outside the labeled model, so the label-based pull-home loops miss it
@@ -532,16 +694,13 @@ yabai_load_topology() {
 # spaces (reachable via hyper+3-9; yabai_reorder_spaces.sh ignores unlabeled Spaces).
 # $1 = master display index. No-op with a single display (nothing is non-master).
 yabai_pull_fullscreen_home() {
-  local master="$1" ids id idx
+  local master="$1" ids id
   case "$master" in ''|*[!0-9]*) return 0 ;; esac
   ids=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson m "$master" '
     .[] | select(.display != $m and .["is-native-fullscreen"] == true) | .id' 2>/dev/null)
   for id in $ids; do
     case "$id" in ''|*[!0-9]*) continue ;; esac
-    idx=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$id" '
-      .[] | select(.id == $id) | .index' 2>/dev/null | head -n 1)
-    case "$idx" in ''|*[!0-9]*) continue ;; esac
-    yabai -m space "$idx" --display "$master" >/dev/null 2>&1 || true
+    yabai_space_to_display "$id" "$master" master 2 || true
   done
 }
 
@@ -549,8 +708,8 @@ yabai_pull_fullscreen_home() {
 # `ext` is a SPECIAL label, NOT one of the canonical 10 in YABAI_LABELS. It is
 # created on demand on the EXTERNAL display to hold loose, unpinned windows flung
 # there with hyper+fn+g, lives only while docked, and is dissolved back into `main`
-# (its windows moved there, the space destroyed) on home-all / push-while-on-ext /
-# undock. It always sits at a NON-first position on the external (never the
+# (its windows moved there, the label dropped; the space itself is destroyed only if it
+# is on the laptop) on home-all / push-while-on-ext / undock. It always sits at a NON-first position on the external (never the
 # disconnect-fragile scratch space).
 YABAI_EXT_TARGET="main"   # where dissolved ext windows land on the laptop
 
@@ -568,11 +727,12 @@ yabai_space_ids_json() {
 }
 
 # Ensure an `ext` space exists on external display $1 and emit its index. Reuses an
-# existing `ext`. Otherwise CREATES a space (it lands on whatever display is active
-# -- usually master) and then MOVES it onto the external by its stable id, appending
-# after the scratch so `ext` is never the external's first (disconnect-fragile)
-# space. We move-by-id rather than focus-then-create because `display --focus`
-# races, and a create that lands on the wrong display silently mislabels the scratch.
+# existing `ext`; else labels an empty, unlabeled space already sitting on the external
+# after its first one (the husk a dissolve left there); else CREATES one on the MASTER
+# display and MOVES it over by its stable id, appending after the scratch so `ext` is
+# never the external's first (disconnect-fragile) space. Never created on the external:
+# a create is one of the two calls that segfault the Dock if that display's record is
+# stale (yabai_space_to_display), and one without a display lands on whichever is active.
 # Needs the SA (space create/move/label).
 #
 # The create -> move -> label stretch runs under refresh.lock. Until the label lands
@@ -584,14 +744,13 @@ yabai_space_ids_json() {
 # wait: a keypress must not hang. No self-deadlock: the lock is taken after the
 # reuse check and dropped before returning, nothing in between calls
 # yabai_workspace_refresh.sh, and the one caller (yabai_send_window_external.sh)
-# runs its own refresh before this, not around it.
+# runs its own refresh before this, not around it. $1 is re-resolved live once the wait
+# is over (the external may have changed sides or gone), and on every move try.
 #
 # An `ext` that exists but is NOT on display $1 (left on the laptop by an older bug or
 # a reparent) is moved over rather than reused where it is. If the move does not land,
-# the new space is left unlabeled (the heal sweep collects it) and 1 is returned: a
-# label on the wrong display is worse than a fling that does nothing. It is NOT
-# destroyed here -- destroying a space right after moving it across displays
-# segfaulted the Dock (2026-11-23).
+# the new space is left unlabeled on the laptop (the heal sweep collects it) and 1 is
+# returned: a label on the wrong display is worse than a fling that does nothing.
 yabai_ensure_ext() {
   local idx got rc
   case "$1" in ''|*[!0-9]*) return 1 ;; esac
@@ -611,43 +770,48 @@ _yabai_ext_display() {
   yabai -m query --spaces --space ext 2>/dev/null | jq -r '.display // empty' 2>/dev/null | head -n 1
 }
 
-# Put the space with stable id $1 on display $2; 0 once a query shows it there. The
-# move is retried (yabai refuses it while a display is animating or Mission Control is
-# open), and each try waits for it to land: yabai is busy reindexing right after, and
-# a too-soon follow-up is silently dropped. The index is re-read by id every try.
-_yabai_space_to_display() {
-  local id="$1" disp="$2" info d idx err="" _try _s
-  for _try in 1 2 3 4; do
-    for _s in 1 2 3 4 5; do
-      info=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$id" '
-        .[] | select(.id == $id) | "\(.display) \(.index)"' 2>/dev/null | head -n 1)
-      d=${info%% *}; idx=${info##* }
-      [ "$d" = "$disp" ] && return 0
-      [ "$_s" = 1 ] && case "$idx" in
-        ''|*[!0-9]*) ;;
-        *) err=$(yabai -m space "$idx" --display "$disp" 2>&1) || break ;;
-      esac
-      sleep 0.1
-    done
-    sleep 0.15
-  done
-  yabai_log ext "space id=$id did not reach display $disp (on ${d:-?}): $err"
-  return 1
+# Label the space with id $1 `ext` and emit its index. Labels go by index, and `--label`
+# on the wrong space would take that space's own label away, so the index comes from one
+# snapshot in which the space is still unlabeled, and the result is checked by id.
+_yabai_label_ext() {
+  local idx
+  idx=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$1" '
+    .[] | select(.id == $id and (.label // "") == "") | .index' 2>/dev/null | head -n 1)
+  case "$idx" in ''|*[!0-9]*) return 1 ;; esac
+  yabai -m space "$idx" --label ext >/dev/null 2>&1 || true
+  yabai -m query --spaces --space ext 2>/dev/null | jq -e -r --argjson id "$1" '
+    if .id == $id then .index else empty end' 2>/dev/null
 }
 
 _yabai_ensure_ext_create() {
-  local ext="$1" idx before after="" newid _try
+  local ext master before after="" newid _try
+  # The wait for the lock can be seconds: is the external still there, and still at that
+  # index? (Nothing readable -> the caller's index; only one display -> nothing to do.)
+  ext=$(_yabai_role_display external "$1") || return 1
+
   # Again, now that we hold the lock: another fling may have created it while we waited.
   newid=$(yabai -m query --spaces --space ext 2>/dev/null | jq -r '.id // empty' 2>/dev/null)
   case "$newid" in
     ''|*[!0-9]*) ;;
     *)
-      _yabai_space_to_display "$newid" "$ext" || return 1
+      yabai_space_to_display "$newid" "$ext" external || return 1
       yabai_ext_index
       return 0
       ;;
   esac
 
+  # A husk already on the external, past its first space (the reserved scratch).
+  newid=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson d "$ext" '
+    [ .[] | select(.display == $d) ] | sort_by(.index) | .[1:]
+    | [ .[] | select((.label // "") == "" and (.windows | length == 0)
+                     and .["is-native-fullscreen"] == false) | .id ][0] // empty' 2>/dev/null)
+  case "$newid" in
+    ''|*[!0-9]*) ;;
+    *) _yabai_label_ext "$newid" && return 0 ;;
+  esac
+
+  master=$(_yabai_role_display master "${MASTER_DISPLAY_INDEX:-}")
+  case "$master" in ''|*[!0-9]*) return 1 ;; esac
   # The new space is found as "the id that was not there before", so BOTH snapshots
   # must be real. `query --spaces` intermittently answers a bare "[" (see
   # yabai_spaces_json): with an empty `before`, every existing space looked new and
@@ -655,33 +819,36 @@ _yabai_ensure_ext_create() {
   # No valid `before` -> create nothing.
   before=$(yabai_space_ids_json)
   [ -n "$before" ] || return 1
-  yabai -m space --create >/dev/null 2>&1 || true
+  yabai -m space --create "$master" >/dev/null 2>&1 || true
   # The create has already happened, so give the after-query a few tries before
-  # giving up (and leaving the new space unlabeled) on a transient bad answer.
+  # giving up (and leaving the new space unlabeled) on a transient bad answer. EXACTLY
+  # one new id: with two, the other belongs to someone else and either could be ours.
+  newid=""
   for _try in 1 2 3 4 5; do
     after=$(yabai_space_ids_json)
-    [ -n "$after" ] && break
+    [ -n "$after" ] && newid=$(jq -n -r --argjson before "$before" --argjson after "$after" '
+      ($after - $before) | if length == 1 then .[0] elif length > 1 then "many" else empty end' 2>/dev/null)
+    [ -n "$newid" ] && break
     sleep 0.2
   done
-  [ -n "$after" ] || return 1
-  newid=$(jq -n -r --argjson before "$before" --argjson after "$after" '
-    ($after - $before)[0] // empty' 2>/dev/null)
   case "$newid" in ''|*[!0-9]*) return 1 ;; esac
 
-  _yabai_space_to_display "$newid" "$ext" || return 1
-  idx=$(yabai -m query --spaces 2>/dev/null | jq -r --argjson id "$newid" '
-    .[] | select(.id == $id) | .index' 2>/dev/null | head -n 1)
-  case "$idx" in ''|*[!0-9]*) return 1 ;; esac
-  yabai -m space "$idx" --label ext >/dev/null 2>&1 || true
-  printf '%s' "$idx"
+  yabai_space_to_display "$newid" "$ext" external || return 1
+  _yabai_label_ext "$newid"
 }
 
-# Dissolve `ext`: move all its windows to YABAI_EXT_TARGET (main) and destroy the
-# now-empty space. No-op if `ext` doesn't exist (also cleans up an empty `ext`). If
-# `ext` happens to be its display's LAST space (can't be destroyed), the label is
-# dropped instead so no empty `ext` husk lingers. Does NOT change focus.
+# Dissolve `ext`: move all its windows to YABAI_EXT_TARGET (main), then destroy the space
+# if it is on the MASTER display (macOS reparented it there on undock). Anywhere else the
+# label is dropped and the empty space stays where it is, for the next fling to reuse: a
+# destroy on another display is what segfaults the Dock when its record of that display
+# is stale (yabai_space_to_display). The master index must read the same before and
+# after the query that says where `ext` is, so a side swap cannot make us destroy on the
+# external. The label is dropped only once a query shows the space has no windows: with
+# one still on it the label stays (so the window can be found, and the next dissolve
+# retries) and that is logged. Same when a destroy fails. No-op if `ext` doesn't exist
+# (also cleans up an empty `ext`). Does NOT change focus.
 yabai_dissolve_ext() {
-  local idx wids wid
+  local idx wids wid info id left m1 m2 _w
   idx=$(yabai_ext_index)
   case "$idx" in ''|*[!0-9]*) return 0 ;; esac
   wids=$(yabai -m query --windows --space ext 2>/dev/null | jq -r '.[].id' 2>/dev/null)
@@ -689,10 +856,31 @@ yabai_dissolve_ext() {
     case "$wid" in ''|*[!0-9]*) continue ;; esac
     yabai -m window "$wid" --space "$YABAI_EXT_TARGET" >/dev/null 2>&1 || true
   done
-  idx=$(yabai_ext_index)
-  case "$idx" in ''|*[!0-9]*) return 0 ;; esac
-  yabai -m space "$idx" --destroy >/dev/null 2>&1 || true
-  if [ -n "$(yabai_ext_index)" ]; then
-    yabai -m space ext --label >/dev/null 2>&1 || true
+  # A moment for the moves to show. `left` empty = the query never answered.
+  for _w in 1 2 3 4 5; do
+    left=$(_yabai_ext_window_count)
+    [ "$left" = 0 ] && break
+    sleep 0.1
+  done
+  m1=$(yabai_master_index)
+  info=$(yabai -m query --spaces --space ext 2>/dev/null | jq -r '"\(.display) \(.index) \(.id)"' 2>/dev/null)
+  m2=$(yabai_master_index)
+  id=${info##* }; idx=${info#* }; idx=${idx%% *}
+  case "$id$idx" in ''|*[!0-9]*) return 0 ;; esac
+  if [ -n "$m1" ] && [ "$m1" = "$m2" ] && [ "${info%% *}" = "$m1" ]; then
+    yabai -m space "$idx" --destroy >/dev/null 2>&1 || true
+    [ -n "$(yabai_ext_index)" ] || return 0
+    left=$(_yabai_ext_window_count)
   fi
+  if [ "$left" = 0 ]; then
+    yabai -m space ext --label >/dev/null 2>&1 || true
+  else
+    yabai_log space_move "dissolve: ext id=$id kept its label, windows left: ${left:-unknown}"
+  fi
+}
+
+# How many windows `ext` holds, or nothing if it cannot be read.
+_yabai_ext_window_count() {
+  yabai -m query --spaces --space ext 2>/dev/null |
+    jq -r 'if (.windows | type) == "array" then .windows | length else empty end' 2>/dev/null
 }

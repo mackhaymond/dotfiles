@@ -51,9 +51,19 @@ MIN_APP_AGE=35
 
 while IFS= read -r app; do
   [ -n "$app" ] || continue
-  # `"pid"=1234` when running, nothing otherwise: one call answers both "is it running"
-  # and "which process do I age".
-  pid=$(lsappinfo info -only pid -app "$app" 2>/dev/null | sed -n 's/.*"pid"=\([0-9][0-9]*\).*/\1/p' | head -n 1)
+  # The pid of the FOREGROUND app with this name, empty when it is not running: answers
+  # both "is it running" and "which process do I age". Not `lsappinfo info -app "$app"`:
+  # that prints nothing when two registered apps share the name (Messages and its
+  # background "Messages Assistant Extension"). `find` lists every match as
+  # `ASN:0x0-0x17017-"Messages":`, several on one line, names with `_` for spaces -- so
+  # only the ASNs are read.
+  pid=
+  for asn in $(lsappinfo find name="$app" 2>/dev/null | grep -oE 'ASN:0x[0-9a-f]+-0x[0-9a-f]+'); do
+    info=$(lsappinfo info -only ApplicationType,pid "$asn" 2>/dev/null)
+    case "$info" in *'"ApplicationType"="Foreground"'*) ;; *) continue ;; esac
+    pid=$(printf '%s\n' "$info" | sed -n 's/.*"pid"=\([0-9][0-9]*\).*/\1/p' | head -n 1)
+    [ -z "$pid" ] || break
+  done
   [ -n "$pid" ] || continue
   # etime is [[dd-]hh:]mm:ss (same conversion as yabai_startup_reconcile.sh). An age
   # that cannot be read is treated as old, i.e. the pre-existing behaviour.

@@ -1,6 +1,6 @@
 # Yabai + Skhd + Karabiner-Elements + WezTerm: Complete Setup Reference
 
-> *Docs synced to config: **2026-11-13** — yabai is now the locally patched build `HEAD-b2dc8b4-patched` (`yabai_build_patched.sh` + `patches/adopt-windows.patch`), Claude's pin rule carries `manage=on` (`YABAI_PINNED_MANAGED`), and a five-part audit of the whole system was run with its fixes applied (see "Patched yabai" in §5, "2026-11-13 audit fixes" in §4 and "arcSync hardening" in the design notes). A second pass the same day added owned locks, a serialized refresh, the shared empty-space sweep on the heal path and the float-border grace period (see "2026-11-13 second pass" in §4); the patched yabai was rebuilt and installed at 15:43 with both late patch fixes, and `brew pin yabai` has been run. Previous sync **2026-10-06** — after the full-system review fixes (`452312d`) and the unresolved-pin resolver (`473a7e8`/`4f08c37`): labeled pin rules re-registered by refresh, conservative label-follows-app, fullscreen-aware positional labels, resolver guards + layout/float restore, startup lock ownership, `sudo -n --load-sa`; plus doc drift (Karabiner fires the binds, BetterTouchTool → Arc rules in `karabiner-base.json`, `signal --list` works, v7 SA flags, `com.asmvik.yabai`). Previous audit **2026-08-21** — multi-agent review of the stray-float heal (`unfloat_pins`) for conventions, runtime interaction, and source-claim accuracy. Findings folded in: the repair is a view rebuild rather than a cross-space bounce, spaces are addressed by label, non-standard windows are excluded from both the repair and the settle predicate, and the pinned-home map moved into `yabai_common.sh`. Earlier audit 2026-06-06 covered the bsp keybind set + the event-driven self-heal (0 critical/high; no duplicate or then-BetterTouchTool-reserved `hyper+a`/`hyper+s` binds). Pinned-window guards intact — float direction only, since 2026-08-21.*
+> *Docs synced to config: **2026-11-23** — cross-display space moves go through one helper that avoids two Dock crashes seen that day, `ext` and the empty-space sweep no longer destroy anything on the external, display indices are read live, `display_moved` / `display_resized` are handled, and a second yabai patch is written but not installed (see "2026-11-23 audit fixes" in §4, "Patched yabai" in §5 and "Testing status"). Previous sync **2026-11-13** — yabai is now the locally patched build `HEAD-b2dc8b4-patched` (`yabai_build_patched.sh` + `patches/adopt-windows.patch`), Claude's pin rule carries `manage=on` (`YABAI_PINNED_MANAGED`), and a five-part audit of the whole system was run with its fixes applied (see "Patched yabai" in §5, "2026-11-13 audit fixes" in §4 and "arcSync hardening" in the design notes). A second pass the same day added owned locks, a serialized refresh, the shared empty-space sweep on the heal path and the float-border grace period (see "2026-11-13 second pass" in §4); the patched yabai was rebuilt and installed at 15:43 with both late patch fixes, and `brew pin yabai` has been run. Previous sync **2026-10-06** — after the full-system review fixes (`452312d`) and the unresolved-pin resolver (`473a7e8`/`4f08c37`): labeled pin rules re-registered by refresh, conservative label-follows-app, fullscreen-aware positional labels, resolver guards + layout/float restore, startup lock ownership, `sudo -n --load-sa`; plus doc drift (Karabiner fires the binds, BetterTouchTool → Arc rules in `karabiner-base.json`, `signal --list` works, v7 SA flags, `com.asmvik.yabai`). Previous audit **2026-08-21** — multi-agent review of the stray-float heal (`unfloat_pins`) for conventions, runtime interaction, and source-claim accuracy. Findings folded in: the repair is a view rebuild rather than a cross-space bounce, spaces are addressed by label, non-standard windows are excluded from both the repair and the settle predicate, and the pinned-home map moved into `yabai_common.sh`. Earlier audit 2026-06-06 covered the bsp keybind set + the event-driven self-heal (0 critical/high; no duplicate or then-BetterTouchTool-reserved `hyper+a`/`hyper+s` binds). Pinned-window guards intact — float direction only, since 2026-08-21.*
 
 ## 1. Overview & Mental Model
 
@@ -30,8 +30,9 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_workspace_refresh.sh` | `~/code/various_scripts/yabai_workspace_refresh.sh` | Executable script | Reconcile canonical labels, refresh display topology cache |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_display.sh` | `~/code/various_scripts/yabai_display.sh` | Executable script | Focus display by name (master/external) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_space_move.sh` | `~/code/various_scripts/yabai_space_move.sh` | Executable script | Push/pull spaces between displays |
-| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_displays.sh` | `~/code/various_scripts/yabai_displays.sh` | Executable script | Hotplug handler: dock/undock logic |
+| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_displays.sh` | `~/code/various_scripts/yabai_displays.sh` | Executable script | Display handler: dock / undock / rearranged or resized |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_mode.sh` | `~/code/various_scripts/yabai_skhd_mode.sh` | Executable script | Toggle space layout (bsp ↔ stack) |
+| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_resize.sh` | `~/code/various_scripts/yabai_resize.sh` | Executable script | Resize the focused window by 60px (hyper + `[` `]` `;` `'`): tiled → left/top handle, else right/bottom; floating → right/bottom only |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_toggle_float.sh` | `~/code/various_scripts/yabai_toggle_float.sh` | Executable script | Toggle the focused window's float (`hyper+t`); both stack & bsp; refuses to *float* a pinned app on its home space, always allows *un*-floating |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_float_borders.sh` | `~/code/various_scripts/yabai_float_borders.sh` | Executable script | Draw a JankyBorders border around floating windows (drives the `borders` daemon whitelist; runs only while something floats). A pinned app's main window that yabai floated on its own is bordered only after a 2 s grace |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_next.sh` | `~/code/various_scripts/yabai_skhd_stack_next.sh` | Executable script | **`hyper+z`, layout-aware:** STACK → next stack layer; BSP → mirror tree horizontally (`--mirror x-axis`) |
@@ -43,13 +44,14 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `…/code/various_scripts/executable_yabai_reopen_pin.sh` | `~/code/various_scripts/yabai_reopen_pin.sh` | Executable script | **Reopen a hidden pinned app** — `space_changed` signal (label `reopen_pin`): on arriving at a pinned app's home space that has no visible window while the app is running, sends it the `reopen` Apple event a Dock click sends. Skips an app running for less than 35 s. Log `~/Library/Logs/yabai/reopen.log` |
 | `…/code/various_scripts/executable_yabai_build_patched.sh` | `~/code/various_scripts/yabai_build_patched.sh` | Executable script | Build yabai from upstream at a pinned commit plus `patches/*.patch`, sign it, rewrite the sudoers line, install it as its own Homebrew keg (`HEAD-<commit>-patched`) and restart. See "Patched yabai" in §5 |
 | `…/dot_config/yabai/patches/adopt-windows.patch` | `~/.config/yabai/patches/adopt-windows.patch` | Source patch (applied by the build script) | The local yabai patch: adopt windows a running app shows late, on another space, or at window level -1; tile a `manage=on` window on its own space |
+| `…/dot_config/yabai/patches/osax-display-space.patch` | `~/.config/yabai/patches/osax-display-space.patch` | Source patch (applied by the build script) | Scripting-addition patch: no Dock crash when a display record is missing or stale. **Written 2026-11-23, not yet installed** — see "Patched yabai" in §5 |
 | `…/code/various_scripts/executable_display_sleep_lock.sh` | `~/code/various_scripts/display_sleep_lock.sh` | Executable script | **`hyper+fn+s`:** sleep the displays (`pmset displaysleepnow`); the immediate screen-lock policy locks the session with them. Waits until HID input has been quiet for 0.15 s (capped at 1.2 s) so the chord's key releases don't re-wake the display |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_screen_flash.sh` | `~/code/various_scripts/yabai_screen_flash.sh` | Executable script | **DISABLED (dormant)** — was the external-display focus border flash; the signal was removed 2026-06-04 |
 | `…/code/various_scripts/yabai_screen_flash.js` | `~/code/various_scripts/yabai_screen_flash.js` | JXA helper | **DISABLED (dormant)** — drew the border overlay for `yabai_screen_flash.sh` |
 | `…/code/various_scripts/executable_yabai_reorder_spaces.sh` | `~/code/various_scripts/yabai_reorder_spaces.sh` | Executable script | Keep labeled spaces in canonical order per display |
 | `…/code/various_scripts/executable_yabai_fullscreen_focus.sh` | `~/code/various_scripts/yabai_fullscreen_focus.sh` | Executable script | Focus the Nth native-fullscreen app (`hyper+3-9`), WezTerm excluded |
-| `…/code/various_scripts/executable_yabai_terminal_follow.sh` | `~/code/various_scripts/yabai_terminal_follow.sh` | Executable script | Keep `terminal` label on WezTerm in/out of fullscreen; sweep husk spaces |
-| `…/code/various_scripts/yabai_common.sh` | `~/code/various_scripts/yabai_common.sh` | Sourced shell lib (not executable) | **Shared helper** — single source of the master-display UUID, the canonical `YABAI_LABELS` list, the agent apps (`YABAI_AGENT_APPS`/`_RE`), the pinned-home map (`YABAI_PINNED_HOMES`, `YABAI_PINNED_APPS_RE`), the pinned apps whose rule also carries `manage=on` (`YABAI_PINNED_MANAGED`) and the rules generated from them (`yabai_pin_rules_add`), `yabai_home_map_json()`, `yabai_spaces_json()`, the jq filters `YABAI_JQ_PIN_ELIGIBLE` / `YABAI_JQ_PIN_UNRESOLVED`, the state/log dirs (`YABAI_STATE_DIR`, `YABAI_LOG_DIR`) + `yabai_log`, `yabai_master_index()` (UUID-then-area resolver), `yabai_load_cache()`, the owned single-flight locks (`yabai_lock_acquire` / `_release` / `_live` / `_acquire_wait`), the empty-space sweep (`yabai_sweep_empty_spaces`), and the `ext` helpers. Sourced by yabairc and ~14 `yabai_*` scripts; required sibling |
+| `…/code/various_scripts/executable_yabai_terminal_follow.sh` | `~/code/various_scripts/yabai_terminal_follow.sh` | Executable script | Keep `terminal` label on WezTerm in/out of fullscreen; sweep husk spaces (laptop only) |
+| `…/code/various_scripts/yabai_common.sh` | `~/code/various_scripts/yabai_common.sh` | Sourced shell lib (not executable) | **Shared helper** — single source of the master-display UUID, the canonical `YABAI_LABELS` list, the agent apps (`YABAI_AGENT_APPS`/`_RE`), the pinned-home map (`YABAI_PINNED_HOMES`, `YABAI_PINNED_APPS_RE`), the pinned apps whose rule also carries `manage=on` (`YABAI_PINNED_MANAGED`) and the rules generated from them (`yabai_pin_rules_add`), `yabai_home_map_json()`, `yabai_spaces_json()`, the jq filters `YABAI_JQ_PIN_ELIGIBLE` / `YABAI_JQ_PIN_UNRESOLVED`, the state/log dirs (`YABAI_STATE_DIR`, `YABAI_LOG_DIR`) + `yabai_log`, `yabai_master_index()` (UUID-then-area resolver), `yabai_load_cache()`, the live topology (`yabai_live_topology`, `yabai_load_topology`), the one way to move a space across displays (`yabai_space_to_display`, and `yabai_pull_labels_home` / `yabai_pull_fullscreen_home` on top of it), the owned single-flight locks (`yabai_lock_acquire` / `_release` / `_live` / `_acquire_wait`), the empty-space sweep (`yabai_sweep_empty_spaces`), and the `ext` helpers. Sourced by yabairc and ~14 `yabai_*` scripts; required sibling |
 | `…/dot_hammerspoon/init.lua` | `~/.hammerspoon/init.lua` | Lua config | **Hammerspoon**: classify Arc windows via AXIdentifier; pin the two main windows to main/school (Little Arc left managed). Required dependency, launches at login |
 | (unmanaged) `~/code/projects/layerbar` → `~/Applications/LayerBar.app` | LaunchAgent `com.mackhaymond.layerbar` | Native menu bar app | **LayerBar** — the **live** status indicator. Shows current/total stack layer (e.g. `2 / 3`), or `BSP`/`FLOAT`. Refreshed instantly by the yabai signals poking `notifyutil -p com.mackhaymond.layerbar.refresh`; queries yabai over its unix socket. Read-only/passive (no window-manager effect) |
 | `…/swiftbar_plugins/executable_yabai_layers.30s.sh` | `~/swiftbar_plugins/yabai_layers.30s.sh` | Executable plugin | **Dormant/superseded** SwiftBar version of the layer indicator (ignored via `.swiftbarignore`). Kept as the fallback if LayerBar is ever uninstalled |
@@ -68,7 +70,7 @@ EXTERNAL_DISPLAY_INDEX=<index or empty>
 MASTER_DISPLAY_UUID=37D8832A-2D66-02CA-B9F7-8F30A301B230
 ```
 
-**Purpose:** Sourced by all workspace scripts to avoid expensive repeated `yabai -m query --displays` calls. Written atomically by `yabai_workspace_refresh.sh` and `yabai_displays.sh`.
+**Purpose:** The last known topology. Since 2026-11-23 the scripts that aim at a display by index read it live (`yabai_load_topology`) and use this file only when the live query fails; `yabai_workspace.sh` still reads it directly. Written atomically by `yabai_workspace_refresh.sh` and `yabai_displays.sh`.
 
 ## 3. Component Deep-Dives
 
@@ -82,7 +84,7 @@ MASTER_DISPLAY_UUID=37D8832A-2D66-02CA-B9F7-8F30A301B230
 |---------|-------|---------|
 | `layout` | `stack` | Single window visible; others stacked and hidden. Navigate with hyper+z/x. |
 | `window_origin_display` | `focused` | New windows inherit the focused display (not the app's launch display). |
-| `display_arrangement_order` | `horizontal` | External display to the right of laptop. |
+| `display_arrangement_order` | `horizontal` | Display indices follow x position, left to right. The external moving to the other side of the laptop swaps indices 1 and 2. |
 | `window_shadow` | `off` | No drop shadow on borders. |
 | `top_padding` | `0` | No padding above first window; macOS menu bar handles offset. |
 
@@ -108,7 +110,7 @@ These apps automatically appear on their designated space when launched. The rul
 | Messages | messages |
 | ChatGPT | ai |
 | Claude | ai (rule also carries `manage=on`; needs the patched yabai) |
-| Conductor, Claudia, OpenChamber, OpenCode, Jean, T3 Code (Alpha), Muse | agent |
+| Conductor, Claudia, OpenChamber, OpenCode, Jean, T3 Code (Alpha), T3 Code (Beta), Muse | agent |
 
 **`agent` (hyper+esc) — the generic coding-agent view.** Unlike every other label,
 `agent` is not one app's home: it is a *view* that whichever coding-agent GUI is
@@ -148,11 +150,13 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 
 **5. `display_added` (label `workspace_display_added`)** → `yabai_displays.sh added`: debounced hotplug; settles display count and refreshes cache (non-destructive; external comes up empty).
 
-**6. `display_removed` (label `workspace_display_removed`)** → `yabai_displays.sh removed`: pulls all labeled spaces home to the master display.
+**6. `display_removed` (label `workspace_display_removed`)** → `yabai_displays.sh removed`: pulls all labeled spaces home to the master display and dissolves `ext`. Waits up to 10 s for a running handler instead of dropping, and does not pull home if a second display is back by then.
+
+**6b. `display_moved` (label `workspace_display_moved`)** and **`display_resized` (label `workspace_display_resized`)** → `yabai_displays.sh moved` (added 2026-11-23). yabai orders display indices by x, so the external crossing to the laptop's other side swaps them without any add or remove; OpenDisplay does that by itself within seconds of connecting. Handled like `added`: refresh the cache, move nothing. Log `~/Library/Logs/yabai/displays.log`.
 
 **7. `display_changed` (label `mouse_follow_display`)** → `yabai_mouse_follow.sh`: warps cursor to the newly focused display.
 
-**8. `space_destroyed` (label `heal_space_destroyed`)** and **`mission_control_exit` (label `heal_mission_control`)** → `yabai_heal.sh` → `yabai_workspace_refresh.sh --sweep`. Event-driven self-heal: a destroyed/merged labeled space (the classic label-drop — e.g. a fullscreen collapse merging an adjacent space) or a Mission Control exit (it renumbers/merges spaces) reconciles the canonical labels + order. `yabai_heal.sh` single-flights + settles (owned mkdir lock, `YABAI_HEAL_SETTLE`, default 0.4s) so a burst (a Mission Control session churning several spaces) heals exactly **once**. refresh is idempotent (~0.34s) and these events are infrequent → no idle/poll cost. Since 2026-11-13 this path also trims surplus empty unlabeled spaces once the labels are settled (`--sweep`, one kept per display — see "Husk sweep" in the design notes). **Consequence:** an extra empty desktop added by hand in Mission Control is removed when Mission Control closes if that display already has an empty one. **Not** hooked to `space_created` (refresh may create a space → would self-trigger) or `window_destroyed` (too noisy; window closes don't drop labels).
+**8. `space_destroyed` (label `heal_space_destroyed`)** and **`mission_control_exit` (label `heal_mission_control`)** → `yabai_heal.sh` → `yabai_workspace_refresh.sh --sweep`. Event-driven self-heal: a destroyed/merged labeled space (the classic label-drop — e.g. a fullscreen collapse merging an adjacent space) or a Mission Control exit (it renumbers/merges spaces) reconciles the canonical labels + order. `yabai_heal.sh` single-flights + settles (owned mkdir lock, `YABAI_HEAL_SETTLE`, default 0.4s) so a burst (a Mission Control session churning several spaces) heals exactly **once**. refresh is idempotent (~0.34s) and these events are infrequent → no idle/poll cost. Since 2026-11-13 this path also trims surplus empty unlabeled spaces once the labels are settled (`--sweep`, laptop only since 2026-11-23, one kept — see "Husk sweep" in the design notes). **Consequence:** an extra empty desktop added by hand on the laptop in Mission Control is removed when Mission Control closes if the laptop already has an empty one. **Not** hooked to `space_created` (refresh may create a space → would self-trigger) or `window_destroyed` (too noisy; window closes don't drop labels).
 
 **9. ~~`display_changed` (label `flash_external_display`)~~** → **DISABLED** (2026-06-04, user request). The external-display border flash signal was removed from `yabairc`. The helper scripts `yabai_screen_flash.sh` / `.js` remain in `code/various_scripts` as dormant; re-enable by restoring the `YABAI_SCREEN_FLASH` env var + a `display_changed` signal calling it.
 
@@ -222,7 +226,7 @@ Two bugs found while testing this, both pre-dating it and both fixed here:
 | Variable | Value | Consumed By |
 |----------|-------|-------------|
 | `YABAI_WORKSPACE_REFRESH` | `${HOME}/code/various_scripts/yabai_workspace_refresh.sh` | Startup only (the one `"$YABAI_WORKSPACE_REFRESH" startup` call). The hotplug/reader scripts run the refresh script too, but via their own `$SCRIPT_DIR` path, not this env var. |
-| `YABAI_DISPLAYS` | `${HOME}/code/various_scripts/yabai_displays.sh` | `display_added` / `display_removed` signals |
+| `YABAI_DISPLAYS` | `${HOME}/code/various_scripts/yabai_displays.sh` | `display_added` / `display_removed` / `display_moved` / `display_resized` signals |
 | `YABAI_MOUSE_FOLLOW` | `${HOME}/code/various_scripts/yabai_mouse_follow.sh` | `display_changed` signal |
 | `YABAI_HEAL` | `${HOME}/code/various_scripts/yabai_heal.sh` | `space_destroyed` / `mission_control_exit` signals (debounced self-heal) |
 | `YABAI_STARTUP_RECONCILE` | `${HOME}/code/various_scripts/yabai_startup_reconcile.sh` | Backgrounded once at yabai startup (login-race + stray-float fix: polls — re-apply rules + Arc re-pin + un-float misclassified pinned windows — until pinned apps are home and tiled, capped by `YABAI_RECONCILE_CAP` ≈90 s); also the action (`… float`) of the 3 float-sweep signals (`float_sweep_space_changed` / `_deminimized` / `_focused`) |
@@ -292,12 +296,12 @@ Move the focused window to a target space and **follow focus to it** (unless pin
 - Messages → messages
 - ChatGPT → ai
 - Claude → ai
-- Conductor, Claudia, OpenChamber, OpenCode, Jean, T3 Code (Alpha), Muse → agent
+- Conductor, Claudia, OpenChamber, OpenCode, Jean, T3 Code (Alpha), T3 Code (Beta), Muse → agent
 - Arc → protected on `main`/`school` (any Arc window on either is shielded; rare Little-Arc-on-home included)
 
 #### External Scratch-Work Space (`ext`)
 
-Fling a loose, unpinned window onto the external display's on-demand `ext` scratch space (created on first use), or focus it. See the "External scratch-work space (`ext`)" design note. No-op with one display.
+Fling a loose, unpinned window onto the external display's on-demand `ext` scratch space (made on first use: an empty space already there is reused, else a new one), or focus it. See the "External scratch-work space (`ext`)" design note. No-op with one display.
 
 | Keybinding | Key | Script | Action |
 |---|---|---|---|
@@ -319,7 +323,7 @@ Swap the focused window with its neighbor in a direction (bsp).
 
 #### Bsp Focus, Resize & Layout (Hyper)
 
-Bare-hyper bsp cluster: directional focus, resize, balance, split-orientation, and rotate. All are inline `yabai` commands (no script). No-ops / harmless in a stack space. Note `hyper - a`, `hyper - s` and `hyper - c` are **reserved for Arc** — no skhdrc bind may use them (see the §6 note).
+Bare-hyper bsp cluster: directional focus, resize, balance, split-orientation, and rotate. All are inline `yabai` commands except resize (`yabai_resize.sh`). No-ops / harmless in a stack space. Note `hyper - a`, `hyper - s` and `hyper - c` are **reserved for Arc** — no skhdrc bind may use them (see the §6 note).
 
 | Keybinding | Key | Command | Action |
 |---|---|---|---|
@@ -327,19 +331,19 @@ Bare-hyper bsp cluster: directional focus, resize, balance, split-orientation, a
 | `hyper - j` | J | `yabai -m window --focus south` | Focus window to the south |
 | `hyper - k` | K | `yabai -m window --focus north` | Focus window to the north |
 | `hyper - l` | L | `yabai -m window --focus east` | Focus window to the east |
-| `hyper - 0x21` | `[` | `yabai -m window --resize right:-60:0` | Make focused window narrower (bsp) |
-| `hyper - 0x1E` | `]` | `yabai -m window --resize right:60:0` | Make focused window wider |
-| `hyper - 0x29` | `;` | `yabai -m window --resize bottom:0:-60` | Make focused window shorter |
-| `hyper - 0x27` | `'` | `yabai -m window --resize bottom:0:60` | Make focused window taller |
+| `hyper - 0x21` | `[` | `yabai_resize.sh narrower` | Make focused window narrower (bsp) |
+| `hyper - 0x1E` | `]` | `yabai_resize.sh wider` | Make focused window wider |
+| `hyper - 0x29` | `;` | `yabai_resize.sh shorter` | Make focused window shorter |
+| `hyper - 0x27` | `'` | `yabai_resize.sh taller` | Make focused window taller |
 | `hyper - b` | B | `yabai -m space --balance` | Balance splits — equalize all split ratios on the space (bsp) |
 | `hyper - v` | V | `yabai -m window --toggle split` | Toggle the focused window's split orientation: horizontal ↔ vertical (bsp) |
-| `hyper - n` | N | `yabai -m space --rotate 90` | Rotate the whole tree 90° clockwise (bsp); repeat to cycle 90/180/270/0 |
+| `hyper - n` | N | `yabai -m space --rotate 90` | Rotate the whole tree 90° counter-clockwise (bsp); repeat to cycle 90/180/270/0 |
 
 #### Display & Space Movement
 
 | Keybinding | Key | Script/Command | Action |
 |---|---|---|---|
-| `hyper - 0x2A` | Backslash | `yabai_space_move.sh push` | Move focused space to other display; follow |
+| `hyper - 0x2A` | Backslash | `yabai_space_move.sh push` | Move focused space to other display; follow. On `ext`: dissolve it. No-op on the external's unlabeled first space (its reserved scratch) |
 | `hyper - 0` | 0 | `yabai_space_move.sh home-all` | Pull all labeled spaces to laptop |
 | `f13` | Hyper+F1 | `yabai_display.sh master` | Focus laptop display |
 | `f14` | Hyper+F2 | `yabai_display.sh external` | Focus external display |
@@ -468,27 +472,28 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 | `yabai_workspace.sh` | `focus <label>` | Focus workspace by label, wherever it lives (never moves it) |
 | `yabai_send_window.sh` | `<label>` | Move focused window to space and follow focus to it; blocked (focus unchanged) if window is pinned and already on home space |
 | `yabai_display.sh` | `master` \| `external` | Focus the laptop or external display; no-op on single display |
-| `yabai_space_move.sh` | `push` \| `home-all` | Cross-display space movement: push focused space to other display (with follow), or pull all labels home |
-| `yabai_displays.sh` | `added` \| `removed` | Hotplug handler: dock = refresh cache (non-destructive); undock = pull home safety net |
-| `yabai_workspace_refresh.sh` | `[--sweep]` (on-demand) | Reconcile canonical labels on all displays (validated queries; conservative label-follows-app; positional labels skip native-fullscreen Spaces); refresh display topology cache; re-register the pin rules (`yabai_pin_rules_add`) + `rule --apply`; reorder. Serialized on `refresh.lock` (waits up to ~5 s for a holder, then runs unlocked and says so in `refresh.log`). `--sweep` (heal path only): finish by destroying surplus empty unlabeled spaces, one kept per display |
+| `yabai_space_move.sh` | `push` \| `home-all` | Cross-display space movement: push focused space to other display (with follow), or pull all labels and native-fullscreen Spaces home and dissolve `ext`. Moves go through `yabai_space_to_display`, under `refresh.lock` (bounded wait, then unlocked and logged). Never pushes the external's unlabeled first space. Log `space_move.log` |
+| `yabai_displays.sh` | `added` \| `removed` \| `moved` | Display handler: dock, rearrangement or resize = refresh cache (moves nothing); undock = pull home safety net + dissolve `ext`, under `refresh.lock`. Log `displays.log` |
+| `yabai_workspace_refresh.sh` | `[--sweep]` (on-demand) | Reconcile canonical labels on all displays (validated queries; conservative label-follows-app; positional labels skip native-fullscreen Spaces); refresh display topology cache; re-register the pin rules (`yabai_pin_rules_add`) + `rule --apply`; reorder. Serialized on `refresh.lock` (waits up to ~5 s for a holder, then runs unlocked and says so in `refresh.log`). `--sweep` (heal path only): finish by destroying surplus empty unlabeled spaces on the laptop, one kept |
 | `yabai_heal.sh` | (none; signal handler) | Debounced self-heal — single-flight (owned mkdir lock) + settle, then `yabai_workspace_refresh.sh --sweep`. Bound to `space_destroyed` / `mission_control_exit` |
 | `yabai_startup_reconcile.sh` | `[startup]` \| `float [--dry-run]` | **`startup`** (backgrounded from yabairc): clears locks older than this yabai, re-loads the SA (`sudo -n`) + **polls until stable** (re-apply rules + Arc re-pin + un-float misclassified pinned windows, until every running pinned app is home **and tiled**, ~90 s cap), restores bsp layouts + `hyper+t` floats after an automatic restart, then runs `yabai_pin_resolve.sh startup --delay 5`. **`float`**: one un-float pass, run by the 3 float-sweep signals. Single-flighted per mode (pid-owned mkdir locks) |
 | `yabai_pin_resolve.sh` | `<event> [--delay S] [--watch S] [--dry-run]` | Guarded `yabai --restart-service` for a pinned window yabai lists but can't act on (2 s confirm, ≤1/30 s, ≤2 per window, never during the startup poll or behind the lock screen); snapshots layouts/floats first. Log `resolve.log` |
 | `yabai_reopen_pin.sh` | (none; `space_changed` hook) | On an empty pinned-home space whose app is running with no visible window, send the app `reopen` (first running app of the label in `YABAI_PINNED_HOMES` order; skipped while that app is younger than 35 s). Log `reopen.log` |
 | `yabai_build_patched.sh` | `[--build-only] [--allow-adhoc]` | Clone upstream at the pinned `COMMIT`, apply `~/.config/yabai/patches/*.patch`, build, sign, rewrite the sudoers line (one Touch ID), install as keg `HEAD-<commit>-patched` keeping the replaced binary as `yabai.prev`, restart. `--build-only` stops after the build; `--allow-adhoc` installs an ad-hoc-signed build over an identity-signed one |
 | `display_sleep_lock.sh` | (none) | `hyper+fn+s`: wait for HID input to go quiet (0.15 s, cap 1.2 s), then `pmset displaysleepnow`; the screen-lock policy locks the session |
-| `yabai_send_window_external.sh` | (none) | `hyper+fn+g`: fling the focused unpinned window to the external's on-demand `ext` space (create + follow); no-op with one display |
+| `yabai_send_window_external.sh` | (none) | `hyper+fn+g`: fling the focused unpinned window to the external's on-demand `ext` space (reuse or create + follow); an `ext` found on the laptop is moved over; no-op with one display |
 | `restart-yabai.sh` | (none; Raycast) | `yabai --restart-service` from Raycast; not wired to any signal/bind |
 | `yabai_skhd_mode.sh` | (none) | Toggle focused space layout (bsp ↔ stack) |
+| `yabai_resize.sh` | `narrower` \| `wider` \| `shorter` \| `taller` | Resize the focused window by 60px. Tiled: left/top handle, then right/bottom if yabai finds no split on that side (that order avoids a 1px rounding error in yabai that resizes the wrong way). Floating, or the window query failed: right/bottom handle only |
 | `yabai_toggle_float.sh` | (none) | Toggle the focused window's float (`hyper+t`); works in both stack & bsp; **directional guard** — refuses to float a pinned app on its home space + Arc on main/school, always allows un-floating (manage=off apps not guarded); calls `yabai_float_borders.sh sync` after toggling |
 | `yabai_float_borders.sh` | `sync` | Reconcile the JankyBorders daemon to the current floating-window set — start it (subtle white, round, width 2) when ≥1 window floats, live-update its app `whitelist`, kill it when none. **Single-flight (mkdir lock + 0.15 s settle, mirrors `yabai_heal.sh`)** so concurrent syncs can't spawn duplicate daemons (`borders` is not a process-level singleton); a daemon count ≠ 1 is self-healed to one. A sync that loses the lock leaves `float_borders.again` for the holder instead of dropping. Defers the border of a pinned app's self-floated main window for 2 s (`YABAI_BORDERS_GRACE`; see signal #10 in §3.1). Wired to `window_created`/`window_destroyed` + startup + the hyper+t toggle + `yabai_startup_reconcile.sh` after an un-float. No-op if `borders` isn't installed |
 | `yabai_skhd_stack_next.sh` | (none) | **Layout-aware (`hyper+z`):** STACK space → focus next stack layer (wrap to first); BSP space → mirror tree horizontally (`space --mirror x-axis`) |
 | `yabai_skhd_stack_prev.sh` | (none) | **Layout-aware (`hyper+x`):** STACK space → focus previous stack layer (wrap to last); BSP space → mirror tree vertically (`space --mirror y-axis`) |
 | `yabai_mouse_follow.sh` | (none; signal handler) | Warp mouse cursor to focused display center (if not already there) |
 | `yabai_screen_flash.sh` | (none) | **DISABLED (dormant)** — was the external-display focus border flash; signal removed 2026-06-04 |
-| `yabai_reorder_spaces.sh` | (none) | Slide labeled spaces into canonical order per display (reserves non-master's first space as scratch); handles fullscreen spaces; preserves the focused space across the moves |
+| `yabai_reorder_spaces.sh` | (none) | Slide labeled spaces into canonical order per display (reserves non-master's first space as scratch); handles fullscreen spaces; undoes a focus jump caused by one of its own moves, and leaves the user's own switch alone |
 | `yabai_fullscreen_focus.sh` | `<ordinal>` | Focus the Nth native-fullscreen app in mission-control order (`hyper+3-9`); excludes WezTerm |
-| `yabai_terminal_follow.sh` | (none; space_changed hook) | Re-pin `terminal` label onto WezTerm's space (incl. fullscreen) + reorder; sweep surplus empty husk spaces (`yabai_sweep_empty_spaces` under `refresh.lock`, skipped if busy). Follows only non-minimized standard WezTerm windows and never takes a space that carries another canonical label |
+| `yabai_terminal_follow.sh` | (none; space_changed hook) | Re-pin `terminal` label onto WezTerm's space (incl. fullscreen) + reorder; sweep surplus empty husk spaces (`yabai_sweep_empty_spaces` under `refresh.lock`, skipped if busy). Follows only non-minimized standard WezTerm windows and never takes a space that carries another canonical label. Compares space ids from one snapshot, not indices |
 
 #### 2026-11-13 audit fixes (workspace scripts)
 
@@ -502,12 +507,37 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 
 - **Owned locks** (`yabai_common.sh`). `yabai_lock_acquire <dir> [stale=30]` / `yabai_lock_release <dir>`: an mkdir lock with the holder's pid in `<dir>/pid`. A held lock is broken when its owner is no longer running (no need to sit out the age after a yabai restart) or it is older than the stale age; release removes the lock only if this process still owns it. Break and release both run under a momentary second mutex (`<dir>.break`) and re-check there, so two runs that judged the same lock stale cannot both take it. `yabai_lock_live <dir>` answers "is a holder still working?" for readers; `yabai_lock_acquire_wait <dir> [tenths=50]` waits for a live holder. `yabai_heal.sh` and `yabai_displays.sh` use them. Fixes: a run that stalled past 30 s and was taken over used to delete the new owner's lock from its unconditional EXIT trap, letting a third run start alongside.
 - **`yabai_workspace_refresh.sh` is serialized** on `$YABAI_STATE_DIR/refresh.lock`. Two refreshes at once (an undock fires `display_removed` and `space_destroyed`) each saw the same missing label and each created a space for it. A second run waits up to ~5 s for the holder and then runs itself, because callers read the cache and labels the moment it returns and the holder's snapshot may predate what the caller just did. If the holder is still going after the wait it runs **without** the lock (the old behaviour) and logs `lock busy after ~5s; running unlocked` to `~/Library/Logs/yabai/refresh.log`; an unlocked run never sweeps.
-- **One empty-space sweep, two triggers.** The surplus-empty-space sweep moved out of `yabai_terminal_follow.sh` into `yabai_sweep_empty_spaces` (`yabai_common.sh`). It now also runs from the heal path (`space_destroyed` / `mission_control_exit` → `yabai_heal.sh` → `refresh --sweep`), as the last step and only under the lock; the terminal_follow slow path takes `refresh.lock` for it and skips the sweep if the lock stays busy ~2 s. Keep rule: one empty, unlabeled, non-fullscreen space per display, and never destroy a visible or focused one. The master keeps its visible empty, else the highest-indexed (the spare after the labels); any other display keeps its visible empty, else the **lowest**-indexed (the first-position scratch — keeping a later husk left a labeled space first on the external). If the master cannot be resolved nothing is swept; each target is re-read by index and skipped unless it is still the same space id and still qualifies.
+- **One empty-space sweep, two triggers.** The surplus-empty-space sweep moved out of `yabai_terminal_follow.sh` into `yabai_sweep_empty_spaces` (`yabai_common.sh`). It now also runs from the heal path (`space_destroyed` / `mission_control_exit` → `yabai_heal.sh` → `refresh --sweep`), as the last step and only under the lock; the terminal_follow slow path takes `refresh.lock` for it and skips the sweep if the lock stays busy ~2 s. Keep rule: one empty, unlabeled, non-fullscreen space per display, and never destroy a visible or focused one *(master-only since 2026-11-23)*. The master keeps its visible empty, else the highest-indexed (the spare after the labels); any other display keeps its visible empty, else the **lowest**-indexed (the first-position scratch — keeping a later husk left a labeled space first on the external). If the master cannot be resolved nothing is swept; each target is re-read by index and skipped unless it is still the same space id and still qualifies.
 - **`yabai_ensure_ext`** holds `refresh.lock` from create to label (same bounded wait; goes ahead unlocked rather than hang a keypress). Until the label lands the new space is indistinguishable from a husk, so a sweep in flight could destroy the half-made `ext` and `hyper+fn+g` silently did nothing.
 - **`yabai_float_borders.sh`**: the 2 s grace before bordering a pinned app's self-floated window, and the `float_borders.again` hand-over (details under signal #10 in §3.1). `yabai_startup_reconcile.sh` purges `float_borders.grace` at yabai start.
 - **`yabai_reopen_pin.sh`**: investigated, deliberately unchanged (the remaining case is under signal #14 in §3.1).
 - **Still as it was, by design:** `arcSync` pulls a deliberately moved Arc main window back to its home when that home is empty.
 - **Not yet exercised in real use:** the display hotplug paths with the new locks, `yabai_ensure_ext` under the lock, and a real transient float going through the grace period.
+
+#### 2026-11-23 audit fixes (display core)
+
+**Two Dock crashes.** The Dock segfaulted at 13:14:59 and 13:32:18 on 2026-11-23 (`~/Library/Logs/DiagnosticReports/Dock-2026-11-23-131502.ips` and `-133220.ips`; the same top frames, `EXC_BAD_ACCESS` at 0x38, a nil object).
+
+- **Cause.** yabai's scripting addition finds a display's record inside the Dock through the record's `_currentSpace`. yabai repoints that field only when the space it moves to another display is the **active** one. Moving any other **visible** space leaves the old display's record naming a space that now lives elsewhere, so the lookup for that display comes up empty. The next `space --destroy` or `space --create` there passes the Dock a nil. It can happen minutes after the move.
+- **Rule.** Move a space across displays only with `yabai_space_to_display` (`yabai_common.sh`). A hidden space and the focused space are safe to move. A visible space that is not focused is hidden first, by showing another user space on its display with `display <d> --space` (which does not move focus, the cursor or click), and if it cannot be hidden it is not moved. A focused space that is the **first** on its display is hidden first too, because yabai would show the previous space in its place, and that one is on another display or does not exist. Destroy and create spaces only on the master display.
+
+**Changes:**
+
+- **`yabai_space_to_display <id> <display> [master|external] [tries]`** is now the only cross-display move when the target display is known. Given a role it looks up that display's index again on every try; it finds the space by id, retries refusals, and returns 0 only once a query shows the space there. Failures are logged to `~/Library/Logs/yabai/space_move.log`. Used by push, home-all, the undock pull-home, the fullscreen pull-home and `ext`.
+- **Push no longer falls back to `--display next` / `prev`** when the target is known. Those count the ignored displays too, so one refusal sent the space to agent-chrome's virtual screen. They remain only when the topology cannot be read.
+- **Push scratch guard.** The unlabeled first space of the external is its reserved scratch, the slot macOS destroys on disconnect. Pushing it is a no-op, because pushing it home would leave a label in that slot.
+- **Live topology (`f9839b2`).** `yabai_display.sh`, `yabai_space_move.sh` and `yabai_send_window_external.sh` use `yabai_load_topology`: live indices, the cache only as fallback. After OpenDisplay moved the external to the other side, the cached pair named the laptop as the external and `hyper+fn+g` built `ext` on the laptop.
+- **`display_moved` / `display_resized` (`f9839b2`)** run `yabai_displays.sh moved`. `added` and `moved` compare the topology again after their refresh, up to 3 passes, since a signal that arrives while the handler holds its lock is dropped.
+- **`yabai_displays.sh removed`** waits up to 10 s for the handler lock, pulls home under `refresh.lock`, and counts the displays again right before it: if the external is back, its layout is left alone.
+- **`refresh.lock` around moves.** Push, home-all and the undock pull-home hold it, so a refresh or heal sweep cannot relabel or sweep between two moves. Bounded wait (about 5 s), then they go ahead unlocked and log it.
+- **`ext`** reuses an empty space already on the external, is created on the master otherwise, and dissolving it never destroys a space on the external (details in the design notes).
+- **The empty-space sweep is master-only.** It stops if the master's index changes while it runs. The external's empty spaces are left alone.
+- **`yabai_reorder_spaces.sh`** restores focus only if it changed across one of its own `--move` calls. Restoring whatever was focused on entry also undid the user's own switch to another space during the run.
+- **`yabai_terminal_follow.sh`** takes WezTerm's spaces and the `terminal` label's space from one spaces snapshot, by id. Two queries compared by index could put the label on the wrong space when spaces renumbered in between.
+- **`yabai_reopen_pin.sh`** gets the pid from `lsappinfo find` (Foreground type only). `lsappinfo info -app` prints nothing when two registered apps share a name, as Messages and its background extension do.
+- **Resize keys** go through `yabai_resize.sh`: the right/bottom handle alone fails on the rightmost/bottom window.
+- **`T3 Code (Beta)`** added to the agent apps.
+- **Not tested on hardware:** see "Testing status".
 
 ### How It All Connects
 
@@ -521,22 +551,23 @@ yabai_workspace_refresh.sh (cache writer)
     ├── Writes atomically: ~/.cache/yabai/workspace_cache.env
     └── Contents: DISPLAY_COUNT, MASTER_DISPLAY_INDEX, EXTERNAL_DISPLAY_INDEX, MASTER_DISPLAY_UUID
 
-Readers (scripts that `. "$CACHE_FILE"` to resolve topology):
-    ├── yabai_workspace.sh      (focus)
+Readers:
+    ├── yabai_workspace.sh      (focus; yabai_load_cache)
+    ├── yabai_displays.sh       (compares it with the live topology; re-writes it via refresh)
+    │   The next three read the topology LIVE and fall back to the cache (yabai_load_topology):
     ├── yabai_display.sh        (master/external focus)
     ├── yabai_space_move.sh     (push/home-all)
-    ├── yabai_displays.sh       (hotplug; also re-writes it)
     ├── yabai_send_window_external.sh (fling to `ext`)
     └── (yabai_screen_flash.sh was a cache reader too, but the flash is now disabled/dormant)
 
-    Load pattern:
+    Cache load pattern:
         [ -r "$CACHE_FILE" ] && . "$CACHE_FILE"
         [ -n "$DISPLAY_COUNT" ] || call yabai_workspace_refresh.sh && retry
 ```
 
 Not cache readers: `yabai_send_window.sh`, `yabai_reorder_spaces.sh`, and `yabai_fullscreen_focus.sh` work purely off live `yabai -m query` (label/UUID lookups), so they need no topology cache.
 
-**Key insight:** The reader scripts source the cache to avoid expensive repeated `yabai -m query --displays` calls. If the cache is missing or stale, they invoke `yabai_workspace_refresh.sh` to heal it.
+**Key insight:** A cached display index is not safe to act on: the external changing sides swaps the indices with no dock or undock. Anything that aims at a display by index reads the topology live, and anything that waits (a lock, a retry) looks the index up again by role (`_yabai_role_display`). If neither the live query nor the cache is usable, the scripts run `yabai_workspace_refresh.sh`.
 
 #### Labeled Space Stability
 
@@ -590,15 +621,18 @@ After relabeling, refresh re-registers the pin rules (see the `space=` caveat in
    - Writes cache.
 6. User manually pushes workspaces via `hyper+\` (Karabiner → yabai_space_move.sh push) or pulls master workspaces to external display.
 
+**On rearrangement or resize (`display_moved` / `display_resized`):** `yabai_displays.sh moved` does the same as a plug: refresh if the live `count:master:external` differs from the cache, up to 3 passes, and move nothing.
+
 **On Unplug (External Monitor Disconnected):**
 1. macOS emits `display_removed` signal.
 2. yabai's signal handler calls `yabai_displays.sh removed`.
 3. Script acquires lock and settles display count.
 4. Calls `yabai_workspace_refresh.sh` (refresh cache; see topology change).
-5. **Pull-home safety net:**
-   - For each of the 10 canonical labels:
-     - If label lives on non-master display, move it: `yabai -m space <label> --display <master>`
+5. Takes `refresh.lock` and counts the displays again; if a second one is back it stops here (refresh only).
+   **Pull-home safety net** (`yabai_pull_labels_home`):
+   - Each of the 10 canonical labels that is not on the master is moved there with `yabai_space_to_display`.
    - Resolves master by UUID, then area, then cache, then default 1.
+   - Dissolves `ext`.
 6. Applies rules and refreshes again (final settle).
 7. Result: all labeled workspaces are back on the laptop, ready for the next dock.
 
@@ -644,12 +678,12 @@ The 10 spaces are always maintained in the order: terminal, main, school, todo, 
 
 **Result:** Wherever labels roam, they maintain their stable sequence, making the layout predictable and recoverable.
 
-**Focus preservation (why the reorder snapshots the focused space):** a *burst* of `space --move` calls can make macOS yank the **active desktop** onto an unrelated space as a side effect — a yabai/macOS quirk that only surfaces under rapid moves combined with concurrent `yabai -m query` load (i.e. the normal state when the signal handlers are all firing). A single move is silent; the burst is not. Because the reorder fires after a `space_changed` (via `yabai_terminal_follow.sh`) and from the self-heal (`space_destroyed` / `mission_control_exit` → `yabai_workspace_refresh.sh`), the symptom was: press `hyper+<label>`, then the view jumps across a few spaces on its own and lands on the wrong one. (Confirmed by isolation that `space --create` and `space --destroy` of a *non-focused* space are both silent, so the husk-sweep was **not** the cause.) Reordering must never change which space is focused, so `yabai_reorder_spaces.sh`:
+**Focus preservation (why the reorder watches the focused space):** a *burst* of `space --move` calls can make macOS yank the **active desktop** onto an unrelated space as a side effect — a yabai/macOS quirk that only surfaces under rapid moves combined with concurrent `yabai -m query` load (i.e. the normal state when the signal handlers are all firing). A single move is silent; the burst is not. Because the reorder fires after a `space_changed` (via `yabai_terminal_follow.sh`) and from the self-heal (`space_destroyed` / `mission_control_exit` → `yabai_workspace_refresh.sh`), the symptom was: press `hyper+<label>`, then the view jumps across a few spaces on its own and lands on the wrong one. (Confirmed by isolation that `space --create` and `space --destroy` of a *non-focused* space are both silent, so the husk-sweep was **not** the cause.) Reordering must never change which space is focused, so `yabai_reorder_spaces.sh`:
 
-1. Snapshots the focused space's **stable id** on entry (`yabai -m query --spaces --space | jq .id`) and arms an `any_moved` flag.
-2. After the move loop, **only if a move actually drifted focus**, re-focuses the original space — resolved by **id, not index**, since the moves renumbered indices.
+1. Reads the focused space's **stable id** right before and right after each of its own `space --move` calls. A change across one is a jump caused by the move.
+2. After the move loop, if that happened and the view is still where the jump left it, re-focuses the space it left — resolved by **id, not index**, since the moves renumbered indices. If focus changed *between* its moves, that was the user, and it is left alone (since 2026-11-23; before, it always went back to whatever was focused on entry).
 
-This is a no-op in the common already-ordered case (no moves) and when focus held, so the cheap query-only fast path is byte-unchanged. It fixes all reorder callers at once (`terminal_follow`, `workspace_refresh`, `space_move`). It guarantees the view **settles** on the right space; an occasional brief mid-flight flash during the moves is a yabai/macOS internal that can't be suppressed from here. *(Fix: git `957e9ed`, 2026-06-07.)*
+This is a no-op in the common already-ordered case (no moves) and when focus held, so nothing extra is read on the cheap query-only path. It fixes all reorder callers at once (`terminal_follow`, `workspace_refresh`, `space_move`). It guarantees the view **settles** on the right space; an occasional brief mid-flight flash during the moves is a yabai/macOS internal that can't be suppressed from here. *(Fix: git `957e9ed`, 2026-06-07.)*
 
 ## 5. Common Workflows & Runbook
 
@@ -674,7 +708,7 @@ The single most fragile dependency in the whole system is the **scripting additi
 
 **Why.** Claude Desktop's background auto-update ends in a relaunch that brings its window back with `setAlwaysOnTop(true, "normal", -1)` + `showInactive()` — CG window level **-1** — and restores level 0 only on the first focus. Upstream yabai (still true at master `b2dc8b4`, issue #2833 open) handles that badly in three ways: it flags any window whose level isn't 0 as FLOAT (→ the float border); `space_window_list_for_connection()` only reports untracked windows at level 0/3/8, so a level -1 window it missed is invisible to queries *and* to the startup brute-force; and an app's windows are scanned only at launch, on the active space. The scripts above could only react afterwards — reopen, float sweep, and finally a full yabai restart when the window was first clicked, which was the "jumping around".
 
-**What the patch does** (`patches/adopt-windows.patch`, new file `src/adopt_windows.c` + five small hooks):
+**What the adopt-windows patch does** (`patches/adopt-windows.patch`, new file `src/adopt_windows.c` + five small hooks):
 
 - A new event `APPLICATION_ADOPT_WINDOWS`, posted at +3/8/15/30 s after every app launch and once, +5 s, for every app after yabai starts. It asks SkyLight (no AX call) for that app's top-level windows on any space at level -1/0/3/8 that yabai doesn't track; only if there are any does it read `kAXWindows` and brute-force AX element ids for the rest, exactly like the startup path. Bounded: 3 brute-force attempts per window id, 400 ms per run, and it stops at the first `kAXErrorCannotComplete` (a busy app costs one AX timeout, not thousands). A search cut short that way (busy app, or the 400 ms budget) is not charged against the window's 3-attempt budget; only a search that ran to the end counts. Charging it let three early misses (+3/8/15 s) turn the +30 s check into a no-op.
 - `WINDOW_FOCUSED` / `APPLICATION_FRONT_SWITCHED` for an unknown window id re-read the owning app's `kAXWindows` (5 attempts per id) instead of only recording a lost-focus event.
@@ -683,7 +717,15 @@ The single most fragile dependency in the whole system is the **scripting additi
 
 **Installed:** the binary was rebuilt and installed 2026-11-13 15:43 from the patch file at `291f1cd`, so it includes the last two fixes (the fullscreen skip and the uncharged cut-short search).
 
-**Config that goes with it:** `YABAI_PINNED_MANAGED="Claude"` in `yabai_common.sh` adds `manage=on` to Claude's pin rule, which skips the FLOAT classification at level -1. (The "`manage=on` is NOT the fix" notes in §3.1 describe unpatched yabai.) Side effect: a `hyper+t` float of Claude off its home space lasts until the next `rule --apply`.
+**Second patch, not yet installed: `patches/osax-display-space.patch` (2026-11-23).** Changes the scripting addition (the code injected into the Dock), for the two Dock crashes described under "2026-11-23 audit fixes" in §4.
+
+- Space move, destroy, create and focus return early when the display UUID, the space or the display's Dock record is missing, instead of passing nil on.
+- A cross-display move of a space that is visible but not active now repoints the source display's `_currentSpace`, so the record does not go stale in the first place.
+- `OSAX_VERSION` goes from `2.1.30` to `2.1.30.1`, so the new payload is the one loaded.
+
+State: reviewed and compiled, **not installed and not run**. The installed yabai is still the 2026-11-13 build. `yabai_build_patched.sh` applies every file in `patches/`, so the next run of it includes this patch; installing it restarts the Dock once. Until then the script rules (`yabai_space_to_display`, destroy and create on the master only) are what prevents the crash, and they stay afterwards.
+
+**Config that goes with the adopt-windows patch:** `YABAI_PINNED_MANAGED="Claude"` in `yabai_common.sh` adds `manage=on` to Claude's pin rule, which skips the FLOAT classification at level -1. (The "`manage=on` is NOT the fix" notes in §3.1 describe unpatched yabai.) Side effect: a `hyper+t` float of Claude off its home space lasts until the next `rule --apply`.
 
 **Verified live 2026-11-13** with a reproducible stand-in for the update relaunch (quit Claude, write `~/Library/Application Support/Claude/stealth-relaunch` = `{"ts":<now ms>,"windowVisible":true,"windowMinimized":false,"otherAppFullScreen":false}`, `open -g -a Claude`): unpatched, the window sat on `ai` floating at level -1 with the border for the whole 40 s watch; patched, it was on `ai`, tiled, no border, no yabai restart, within 2 s. A yabai restart while that level -1 window existed left `ai` empty before the startup adoption was added and tiled the window ~5 s after start with it. Not exercised: the relaunch variants where Claude stays hidden (window was hidden, or another app was fullscreen) — `yabai_reopen_pin.sh` still covers those, and the focus hook should adopt the window it shows.
 
@@ -757,10 +799,10 @@ hyper - 0x2A (\)       # Push focused workspace to other display
 **What happens:**
 1. Karabiner matches the keybinding (its compiled skhdrc rule).
 2. Karabiner runs `yabai_space_move.sh push`.
-3. Script loads cache; resolves MASTER_DISPLAY_INDEX and EXTERNAL_DISPLAY_INDEX.
-4. Script queries focused space (snapshot id, index, display).
+3. Script reads the live topology (cache as fallback): MASTER_DISPLAY_INDEX and EXTERNAL_DISPLAY_INDEX.
+4. Script queries focused space (snapshot id, index, display). `ext` is dissolved instead; the external's unlabeled first space is left alone.
 5. Script determines target: if on master → external; if on external → master.
-6. Script moves the space: `yabai -m space <index> --display <target>`.
+6. Script takes `refresh.lock` and moves the space with `yabai_space_to_display` (retries that one target). If the space is the first on its display, another space there is shown first.
 7. yabai resizes all windows in the space to fill the new display.
 8. Script follows: resolves the space's new index (indices renumber after move), focuses it (with retry on race condition).
 9. Script reorders spaces to restore canonical order.
@@ -780,13 +822,12 @@ hyper - 0              # Pull all labeled workspaces to laptop
 
 **What happens:**
 1. Karabiner runs `yabai_space_move.sh home-all`.
-2. Script loads cache.
-3. For each of the 10 canonical labels:
-   - Script queries the space's current display.
-   - If on external, moves it: `yabai -m space <label> --display <master>`.
-4. Script focuses master display.
-5. Script reorders spaces to restore canonical order.
-6. Result: All workspaces are back on the laptop.
+2. Script reads the live topology (cache as fallback) and takes `refresh.lock`.
+3. Each of the 10 canonical labels that is not on the laptop is moved home with `yabai_space_to_display`. A label that is visible on the external without focus is hidden first; one that cannot be moved is logged and left.
+4. Native-fullscreen Spaces on the external are pulled home the same way, and `ext` is dissolved into `main` (its empty space stays on the external).
+5. Script focuses master display and re-applies the rules.
+6. Script reorders spaces to restore canonical order.
+7. Result: All workspaces are back on the laptop.
 
 ### Focus the External Display
 
@@ -802,7 +843,7 @@ f14                    # Focus external display
 
 **What happens:**
 1. Karabiner matches hyper+F2 and runs the `f14` bind, `yabai_display.sh external`.
-2. Script loads cache; resolves EXTERNAL_DISPLAY_INDEX.
+2. Script reads the live topology (cache as fallback); resolves EXTERNAL_DISPLAY_INDEX.
 3. Script focuses the display: `yabai -m display --focus <external_idx>`.
 4. yabai's `display_changed` signal fires.
 5. `yabai_mouse_follow.sh` warps cursor to the external display's center.
@@ -830,8 +871,7 @@ f14                    # Focus external display
    - Acquires lock.
    - Polls display count until stable.
    - Calls `yabai_workspace_refresh.sh` (refresh cache; topology is now single-display).
-   - **Pull-home safety net:** For each of the 10 labels:
-     - If on non-master display, move it home: `yabai -m space <label> --display <master>`.
+   - Under `refresh.lock`, unless a second display is back by then: **pull-home safety net** (each label not on the master is moved there with `yabai_space_to_display`), then dissolves `ext`.
    - Applies rules; refreshes again (final settle).
 3. **Result:** All workspaces are safely back on the laptop.
 
@@ -973,7 +1013,7 @@ git push origin main
 | `hyper + fn - d` | Fn+D | Send to messages | Respects pinned homes |
 | `hyper + fn - f` | Fn+F | Send to ai | Respects pinned homes |
 | `f19` | Fn+Caps Lock+Escape | Send to agent | Karabiner-mapped |
-| `hyper + fn - g` | Fn+G | Fling window to external `ext` space | On-demand; stacks; dissolves to main on hyper+0 / push / undock |
+| `hyper + fn - g` | Fn+G | Fling window to external `ext` space | On-demand; stacks; dissolves to main on hyper+0 / push / undock (its empty space stays on the external until undock) |
 | `hyper - g` | G | Focus external `ext` space | No-op if `ext` doesn't exist |
 | **Window Layout & Navigation** |
 | `hyper - z` | Z | Stack: next layer / Bsp: mirror horizontal | Stack-cycle wraps to first; bsp = `space --mirror x-axis` |
@@ -986,13 +1026,13 @@ git push origin main
 | `hyper - j` | J | Focus window south | bsp; no-op in stack |
 | `hyper - k` | K | Focus window north | bsp; no-op in stack |
 | `hyper - l` | L | Focus window east | bsp; no-op in stack |
-| `hyper - 0x21` | `[` | Resize focused window narrower | bsp; `--resize right:-60:0` |
-| `hyper - 0x1E` | `]` | Resize focused window wider | bsp; `--resize right:60:0` |
-| `hyper - 0x29` | `;` | Resize focused window shorter | bsp; `--resize bottom:0:-60` |
-| `hyper - 0x27` | `'` | Resize focused window taller | bsp; `--resize bottom:0:60` |
+| `hyper - 0x21` | `[` | Resize focused window narrower | `yabai_resize.sh narrower`: bsp `--resize left:60:0`, else `right:-60:0`; floating `right:-60:0` |
+| `hyper - 0x1E` | `]` | Resize focused window wider | `yabai_resize.sh wider`: bsp `--resize left:-60:0`, else `right:60:0`; floating `right:60:0` |
+| `hyper - 0x29` | `;` | Resize focused window shorter | `yabai_resize.sh shorter`: bsp `--resize top:0:60`, else `bottom:0:-60`; floating `bottom:0:-60` |
+| `hyper - 0x27` | `'` | Resize focused window taller | `yabai_resize.sh taller`: bsp `--resize top:0:-60`, else `bottom:0:60`; floating `bottom:0:60` |
 | `hyper - b` | B | Balance splits | bsp; `space --balance` |
 | `hyper - v` | V | Toggle split orientation (h ↔ v) | bsp; `window --toggle split` |
-| `hyper - n` | N | Rotate tree 90° clockwise | bsp; `space --rotate 90` (repeat cycles 90/180/270/0) |
+| `hyper - n` | N | Rotate tree 90° counter-clockwise | bsp; `space --rotate 90` (repeat cycles 90/180/270/0) |
 | `hyper - m` | M | Toggle maximize (zoom-fullscreen) | `window --toggle zoom-fullscreen` |
 | `hyper - t` | T | Toggle window float | Both stack & bsp; `yabai_toggle_float.sh` — refuses to *float* pinned-on-home + Arc on main/school; *un*-floating always allowed |
 | `hyper + fn - m` | Fn+M | Toggle native fullscreen | Global; no-op on WezTerm by design |
@@ -1026,11 +1066,11 @@ git push origin main
 - **Native-fullscreen access:** Apps put into macOS native fullscreen (non-pinned apps or the browser) live in their own Spaces *outside* the labeled model, so the `hyper+<label>` keys can't reach them. `hyper+3`…`hyper+9` focus the 1st…7th fullscreen app in mission-control order (display, then index) via `yabai_fullscreen_focus.sh`. Mapping is dynamic by position, not pinned per-app. **WezTerm is excluded** from these ordinals (it's the `terminal` workspace, reached with `hyper+\``, even when fullscreen). Note: yabai *can* label, `--move` (reorder), focus, and move fullscreen Spaces between displays — they are not as locked-down as commonly assumed.
 - **WezTerm is not fullscreenable (by design):** WezTerm lives as a **normal window** on the `terminal` space (canonical index 1), tiled as the single stack window, and is intentionally never fullscreened. `hyper+fn+m` (yabai's `--toggle native-fullscreen`) **no-ops on WezTerm** — confirmed on hardware 2026-06-04 — because its borderless `RESIZE` decoration (no title bar) has no macOS native-fullscreen action; and `native_macos_fullscreen_mode = false` removes the capability outright so its own toggle can't make a fullscreen Space either. (yabai *can* still fullscreen titled apps like Preview; the `hyper+fn+m` bind is global and works for those.)
   - **`yabai_terminal_follow.sh` (the `space_changed` hook) is therefore mostly dormant** but retained because it still does real cross-display work: it keeps the `terminal` label pinned to WezTerm wherever WezTerm's space goes (e.g. when you `hyper+\` **push** the terminal space onto the external — verified 2026-06-04 the label follows), and reorders. It is a cheap no-op on ordinary same-space switches. The `window_created` fullscreen guard and the husk-sweep are kept as defensive/general machinery (they'd handle a fullscreen Space if one ever appeared, e.g. another app's), but WezTerm itself no longer produces fullscreen husks.
-  - **Husk sweep** (general): when the hook relabels, it destroys surplus empty, unlabeled, non-fullscreen spaces, keeping exactly **one empty per display** (`group_by(.display)`; destroyed high-index-first so yabai's index compaction on `--destroy` can't stale a later target; never touches labeled/fullscreen Spaces). Verified on real 2-display multi-husk state 2026-06-04. Since 2026-11-13 the policy is the shared `yabai_sweep_empty_spaces` (`yabai_common.sh`), also run by the heal path (`refresh --sweep`) and always under `refresh.lock`. It never destroys a visible or focused space, and which empty is kept is now defined: the visible one if there is one, else the highest-indexed on the master and the **lowest**-indexed (the first-position scratch) on any other display. So a spare desktop added by hand in Mission Control goes away when Mission Control closes if that display already has an empty one. The new keep rule has not been re-verified on two displays.
+  - **Husk sweep** (general): `yabai_sweep_empty_spaces` (`yabai_common.sh`) destroys surplus empty, unlabeled, non-fullscreen spaces on the **master display only** and keeps exactly **one**: the visible one if there is one, else the highest-indexed (the spare after the labels). Run by this hook when it relabels and by the heal path (`refresh --sweep`), always under `refresh.lock`. It never touches a labeled, visible, focused or fullscreen space, destroys high-index-first (yabai compacts indices on `--destroy`), re-reads each target right before it goes, and stops if the master's index changes. So a spare desktop added by hand on the laptop in Mission Control goes away when Mission Control closes if the laptop already has an empty one. Until 2026-11-23 it also kept one per display on the external; it no longer destroys anything there, because that is the call that crashes the Dock when its record of that display is stale. The external's empty spaces cost nothing: the first is the reserved scratch, `ext` reuses the others, and macOS removes or merges them on undock.
 - **External scratch-work space (`ext`):** A way to fling a loose, unpinned window onto the external monitor *without* pushing any of your labeled spaces over. `ext` is a **special, on-demand label** — NOT one of the canonical 10 (it's absent from `YABAI_LABELS`, so it's never auto-created/healed and never clutters the laptop). It is born the first time you fling a window and lives only on the external.
   - **`hyper+fn+g`** — fling the focused window to `ext` (created on first use) and follow. Pinned-home apps (WezTerm/Messages/etc.) and Arc-on-main/school are guarded out — exactly the "unpinned window" scope. Multiple flung windows **stack** on `ext`; cycle them with `hyper+z/x`. **`hyper+g`** focuses `ext` (no-op if it doesn't exist).
-  - **Disconnect-safe placement:** `ext` is always created at a **non-first** position on the external (the external's first space is the reserved scratch). To dodge yabai's `display --focus`-then-`--create` race (a create that lands on the wrong display silently mislabels the scratch), `ensure_ext` creates the space wherever it lands, then **moves it onto the external by its stable id** and waits for the move to settle before labeling. Since 2026-11-13 the whole create → move → label stretch runs under `refresh.lock`, so a heal sweep or a refresh cannot destroy or relabel the still-unlabeled space.
-  - **Coming home = dissolve into `main` + delete `ext`** (it never lives on the laptop). Three triggers, identical result — every window on `ext` is moved to `main` (reachable with `hyper+1`) and the `ext` space is destroyed: **`hyper+0`** home-all (after pulling `main` home), **`hyper+\` while focused on `ext`** (overloads push — on a normal space `hyper+\` still moves the space), and **undock** (`yabai_displays.sh removed` — if macOS reparents `ext` to the laptop on disconnect it's dissolved; if macOS destroyed it outright, no-op). If `ext` is ever its display's last space (can't be destroyed), the label is dropped instead so no empty `ext` husk lingers. All in `yabai_common.sh` (`yabai_ensure_ext` / `yabai_dissolve_ext`). *(Verified live 2026-06-04: fling places on `ext`; home-all, push-on-ext, AND a real undock all dissolve to `main` and delete `ext`. The undock test had labeled spaces pushed over + a flung window on `ext`: every label came home in canonical order, pinned apps re-pinned, the flung window landed on `main`, `ext` was deleted, no stray spaces — macOS reparented `ext` to the laptop and the handler's dissolve caught it.)*
+  - **Where `ext` comes from** (`yabai_ensure_ext`), in this order: an `ext` already on the external is used as it is; an `ext` on the laptop (a failed move, or macOS reparented it) is **moved** to the external with the windows on it; an empty, unlabeled space on the external after its first one is **reused** by labeling it; otherwise a space is **created on the laptop** and moved over by id. So `ext` is never the external's first space (the reserved scratch), and no space is ever created on the external. The new space is identified as exactly one id that was not there before, and a label is only put on a space that is still unlabeled. If the move does not land, the space is left unlabeled on the laptop for the heal sweep and the fling does nothing. All of it runs under `refresh.lock`, and the external's index is looked up again after the wait for the lock.
+  - **Coming home = dissolve into `main`** (`yabai_dissolve_ext`). Three triggers: **`hyper+0`** home-all (after pulling `main` home), **`hyper+\` while focused on `ext`** (overloads push — on a normal space `hyper+\` still moves the space), and **undock** (`yabai_displays.sh removed`). Every window on `ext` is moved to `main` (reachable with `hyper+1`). Then, if `ext` is on the laptop (macOS reparented it there on undock) the space is destroyed. **On the external it is never destroyed:** only its label is dropped, and the empty space stays there for the next fling to reuse. The label is dropped only once a query shows no windows left; otherwise it stays, so the window can be found and the next dissolve retries, and that is logged to `space_move.log`. *(The 2026-06-04 live test of all three triggers was of the older version, which deleted `ext` on the external too; see "Testing status".)*
 - **Arc window pinning (Hammerspoon, `dot_hammerspoon/init.lua`):** The two main Arc browser windows are pinned one-to-`main`, one-to-`school` (title-independent — it doesn't matter which goes where). Everything else about Arc, **including Little Arc popups, is left fully MANAGED** (tiled, in the stack, cyclable with `hyper+z/x`) — Little Arc is *not* floated and *not* pinned; it just lives wherever it opens.
   - The hard part: a **Little Arc** popup is byte-identical to a main window in *every* yabai field (subrole, floating, even title is the page title), so yabai cannot tell them apart. The only reliable discriminator is `AXIdentifier` (`bigBrowserWindow-*` vs `littleBrowserWindow-*`), which **yabai cannot read but Hammerspoon can**. macOS AX only exposes *current-Space* windows, so Hammerspoon reads the identifier off whatever Arc windows are on-screen and remembers which window ids are "main" (`mainSet`), accumulated as Spaces are visited.
   - It then pins **only** the remembered main ids to `main`/`school` via yabai (which *can* report any window's Space by id, cross-Space): **stably** (never disturbs a correctly-placed window; only fills an empty target; recovers drift) and **fullscreen-safe** (a fullscreen Arc window — e.g. video — is left alone, reachable via `hyper+3-9`, and returns to its space on exit). Because only `mainSet` ids are ever moved, Little Arc (never in the set) is never touched.
@@ -1049,7 +1089,7 @@ git push origin main
 
 ### ✅ Verified live on dual-display hardware (2026-06-04)
 
-A real dock/undock session exercised the cross-display paths. All passed:
+A real dock/undock session exercised the cross-display paths. All passed. This describes the code of that day: the space moves, `ext`, the husk sweep and the hotplug handler were changed on 2026-11-23 and have not been run on two displays since (next heading).
 
 - **Dock** (`display_added`) — **non-destructive**: all 10 labels stayed home on the laptop; the external came up with a single empty space (scratch), ready for manual `hyper+\` push. Cache updated to `DISPLAY_COUNT=2` / `EXTERNAL_DISPLAY_INDEX` correctly.
 - **Undock** (`display_removed`) — pull-home safety net worked: every label back on the laptop in canonical order, cache reset to `DISPLAY_COUNT=1`, WezTerm intact on `terminal`.
@@ -1057,7 +1097,7 @@ A real dock/undock session exercised the cross-display paths. All passed:
 - `hyper+0` **home-all** — pulled every label home and re-pinned all apps (`rule --apply`). Now resolves master from **live topology** (UUID-first).
 - `yabai_reorder_spaces.sh` external scratch — reserves the external's **first space as scratch** (`pos=lo+1`); labels order from the second space. The **retry convergence fix** was verified by scrambling the external (including parking a label on the scratch slot) → **one** `reorder` call fully normalized it.
 - `f13`/`f14` display focus → **mouse-follow warp** (cursor jumps to the focused display, both directions). *(The external screen-flash, also verified at the time, was subsequently disabled by user request — see the Mouse Follow section.)*
-- `yabai_terminal_follow.sh` — the `terminal` label **follows WezTerm onto the external** (verified by pushing the terminal space to display 2). The **per-display husk-sweep fix** (`group_by(.display)`) was verified on a real 2-display multi-husk state: it keeps exactly one empty pad **per display** and destroys the rest high-index-first.
+- `yabai_terminal_follow.sh` — the `terminal` label **follows WezTerm onto the external** (verified by pushing the terminal space to display 2). The **per-display husk-sweep fix** (`group_by(.display)`) was verified on a real 2-display multi-husk state: it keeps exactly one empty pad **per display** and destroys the rest high-index-first. *(Master-only since 2026-11-23.)*
 - **Cross-display `yabai -m space --focus <idx>`** — *previously flagged as "the single thing that can't be verified without hardware."* **Now verified**: it reliably lands focus on the external. The defensive `display --focus` fallback in `yabai_fullscreen_focus.sh` is therefore not needed (kept as belt-and-suspenders if ever wanted).
 - **`yabai_send_window.sh` cross-display follow** (the verify-by-label + `space --focus` fallback) — verified **both directions** with a movable non-pinned window (Preview): laptop→external and external→laptop, focus follows the window each time.
 - **Shared `yabai_common.sh` helper (DRY refactor)** — re-verified on dock that the consolidated `yabai_master_index()` / `yabai_load_cache()` behave identically: dock cache-write (`DC=2/MASTER=1/EXTERNAL=2`), push, external scratch + reorder convergence, and home-all + re-home all pass through the helper unchanged. (The undock removed-branch shares the same resolver + pull-home loop → verified by equivalence.)
@@ -1066,7 +1106,9 @@ A real dock/undock session exercised the cross-display paths. All passed:
 
 ### ⚠️ Still needs testing
 
-From the 2026-11-13 second pass (see §4), not yet exercised in real use: a dock/undock with the owned locks and the serialized refresh, `hyper+fn+g` creating `ext` under `refresh.lock`, the sweep's keep rule on two displays, and a real transient float of a pinned app going through the border grace period. Nothing else outstanding. *(The former "screen-flash under a rapid burst" item is moot — the flash was disabled 2026-06-04. The former "WezTerm fullscreen on the external" item is removed — WezTerm is intentionally not fullscreenable; see the design note above.)*
+From the 2026-11-23 display changes (see §4): push, home-all, undock, `ext` reuse / create / move / dissolve, the side swap (`display_moved`), the push scratch guard and the master-only sweep have been **simulated only** (a fake `yabai`), not yet run on real hardware with two displays. `osax-display-space.patch` is compiled but not installed.
+
+From the 2026-11-13 second pass (see §4), not yet exercised in real use: a dock/undock with the owned locks and the serialized refresh, `hyper+fn+g` creating `ext` under `refresh.lock`, and a real transient float of a pinned app going through the border grace period. (The sweep's two-display keep rule from that pass is gone: master-only since 2026-11-23.) *(The former "screen-flash under a rapid burst" item is moot — the flash was disabled 2026-06-04. The former "WezTerm fullscreen on the external" item is removed — WezTerm is intentionally not fullscreenable; see the design note above.)*
 
 ### ✅ Verified single-display (2026-06-04)
 - **WezTerm startup placement** — starts as a **normal window** (auto-fullscreen removed); lands on `terminal` at canonical index 1 via the `space=terminal` rule + `window_created` hook. Intentionally **not** fullscreenable (`hyper+fn+m` no-ops on it — see the design note).

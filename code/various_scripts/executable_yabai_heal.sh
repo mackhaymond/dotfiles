@@ -8,8 +8,8 @@
 # Single-flight via an mkdir lock: the first event takes the lock, waits a short
 # settle for the burst to finish, then refreshes; concurrent events drop (the
 # in-flight refresh captures the settled end state). refresh is idempotent (~0.34s),
-# and the only thing this path destroys is surplus EMPTY UNLABELED spaces (`--sweep`
-# below, one kept per display), so an occasional redundant run is harmless.
+# and the only thing this path destroys is surplus EMPTY UNLABELED spaces on the master
+# display (`--sweep` below, one kept), so an occasional redundant run is harmless.
 #
 #   yabai_heal.sh            (bound to space_destroyed / mission_control_exit)
 
@@ -40,8 +40,8 @@ trap 'yabai_lock_release "$LOCK"' EXIT
 # state, so we reconcile the final topology exactly once.
 sleep "$SETTLE"
 
-# --sweep: also trim surplus empty unlabeled spaces (one kept per display) once the
-# labels are settled. Asked for here, not on every refresh: this is the path that
+# --sweep: also trim surplus empty unlabeled spaces on the master display (one kept)
+# once the labels are settled. Asked for here, not on every refresh: this is the path that
 # runs after spaces were destroyed or rearranged, and it is debounced; a refresh
 # fired from a keybind mid-operation should not be destroying spaces.
 "$SCRIPT_DIR/yabai_workspace_refresh.sh" --sweep >/dev/null 2>&1 || true

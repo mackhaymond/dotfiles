@@ -54,7 +54,9 @@ if [ "$ACTION" = removed ]; then
 else
   yabai_lock_acquire "$LOCKDIR" 30 || exit 0
 fi
-trap 'yabai_lock_release "$LOCKDIR"' EXIT
+# refresh.lock too: the pull-home below holds it (the release is a no-op when we do not).
+REFRESH_LOCK="$YABAI_STATE_DIR/refresh.lock"
+trap 'yabai_lock_release "$REFRESH_LOCK"; yabai_lock_release "$LOCKDIR"' EXIT
 
 # --- settle: wait until the display count is stable across two reads --------
 settle_count() {
@@ -142,17 +144,28 @@ case "$ACTION" in
     master=$(yabai_master_index)
     case "$master" in ''|*[!0-9]*) master=$(cached_master) ;; esac
     case "$master" in ''|*[!0-9]*) master=1 ;; esac
-    for label in $YABAI_LABELS; do
-      disp=$(yabai -m query --spaces --space "$label" 2>/dev/null | jq -r '.display // empty' 2>/dev/null)
-      [ -n "$disp" ] && [ "$disp" != "$master" ] &&
-        yabai -m space "$label" --display "$master" >/dev/null 2>&1 || true
-    done
-    # Clean up the on-demand `ext` scratch-work space exactly as home-all does:
-    # move its windows to main and destroy it. If macOS already reparented `ext`
-    # onto the laptop on disconnect it gets dissolved here; if macOS destroyed it
-    # outright this is a no-op.
-    yabai_dissolve_ext
-    yabai -m rule --apply >/dev/null 2>&1 || true
+    # Under refresh.lock (bounded wait, then unlocked), so a heal refresh cannot relabel
+    # or sweep between these moves.
+    yabai_lock_acquire_wait "$REFRESH_LOCK" ||
+      yabai_log displays "removed: refresh.lock busy; pulling home unlocked"
+    # Re-read right before acting: settle, the refresh and the lock wait above take
+    # seconds, and a replug in that time (macOS has put the external's spaces back by
+    # now) must not have its layout pulled home. Its own `added` was dropped, because
+    # this run holds the single-flight lock, so refresh for it here.
+    now=$(yabai_displays_json | jq -r 'length' 2>/dev/null)
+    case "$now" in ''|*[!0-9]*) now="$count" ;; esac
+    if [ "$now" -gt 1 ]; then
+      yabai_log displays "removed: $now displays again; not pulling home"
+    else
+      yabai_pull_labels_home "$master"
+      # Clean up the on-demand `ext` scratch-work space exactly as home-all does: move
+      # its windows to main. If macOS already reparented `ext` onto the laptop on
+      # disconnect it is destroyed here; if macOS destroyed it outright this is a no-op.
+      yabai_dissolve_ext
+      yabai -m rule --apply >/dev/null 2>&1 || true
+    fi
+    # Before the refresh, which takes this same lock.
+    yabai_lock_release "$REFRESH_LOCK"
     # Final refresh so labels/cache settle after the pull-home.
     "$SCRIPT_DIR/yabai_workspace_refresh.sh" >/dev/null 2>&1 || true
     ;;

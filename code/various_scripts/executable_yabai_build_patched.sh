@@ -12,8 +12,11 @@
 #
 # Why a patched build: upstream cannot adopt a window that a running app shows late,
 # on another space, or below the normal window level (upstream #2833) -- see
-# patches/adopt-windows.patch and the README ("Patched yabai"). To move to a newer
-# upstream, bump COMMIT, run this, and fix the patch if it no longer applies.
+# patches/adopt-windows.patch and the README ("Patched yabai"). A second patch,
+# patches/osax-display-space.patch, guards the scripting addition against the Dock
+# crashes of 2026-11-23 (its version bump makes --load-sa reinstall it, which restarts
+# the Dock once). To move to a newer upstream, bump COMMIT, run this, and fix the
+# patches if they no longer apply.
 #
 # `brew upgrade` can relink an UNPATCHED yabai over this one: the formula is still
 # installed as far as Homebrew knows, and a new release replaces the bin/opt symlinks

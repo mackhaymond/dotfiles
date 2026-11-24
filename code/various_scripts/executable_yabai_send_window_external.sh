@@ -56,8 +56,13 @@ if [ "$app" = "Arc" ]; then
   case "$cur_label" in main|school) exit 0 ;; esac
 fi
 
-# Already on ext -> nothing to do.
-[ "$cur_label" = "ext" ] && exit 0
+# Already on ext, and ext really is on the external -> nothing to do. An ext stuck on the
+# laptop (its move failed, or macOS reparented it) falls through: yabai_ensure_ext moves
+# it over, with the window on it. Exiting on the label alone left it stuck for good.
+if [ "$cur_label" = "ext" ]; then
+  cur_disp=$(yabai -m query --spaces --space "$cur" 2>/dev/null | jq -r '.display // empty' 2>/dev/null)
+  [ "$cur_disp" = "$ext_disp" ] && exit 0
+fi
 
 # Ensure the ext space exists on the external. Creating/relocating it churns yabai,
 # so move the window onto ext with a short verify+retry (compared by label), then

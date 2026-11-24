@@ -9,8 +9,8 @@ set -u
 #   2. Ensure every canonical label exists (heals a missing label on the laptop).
 #   3. Re-pin each label onto the space where its app actually lives (laptop only).
 #   4. Write the shared cache consumed by the workspace/display/move scripts.
-#   5. Only with --sweep (yabai_heal.sh): destroy surplus EMPTY UNLABELED spaces,
-#      keeping one per display (yabai_sweep_empty_spaces in yabai_common.sh).
+#   5. Only with --sweep (yabai_heal.sh): destroy surplus EMPTY UNLABELED spaces on the
+#      master display, keeping one (yabai_sweep_empty_spaces in yabai_common.sh).
 #
 # It NO LONGER moves spaces between displays. Plug/unplug reconciliation lives in
 # yabai_displays.sh; this script never resets a docked layout back to the laptop.

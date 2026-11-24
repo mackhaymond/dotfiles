@@ -23,14 +23,34 @@ displays=$(yabai_displays_json) || exit 0
 
 master=$(yabai_master_index "$displays")
 
-# Remember which space is focused on entry (by its STABLE id -- indices renumber as
-# spaces move). Reordering must never change the focused space; a burst of `space
-# --move` can make macOS yank the ACTIVE desktop to some other space (a yabai/macOS
-# quirk that surfaces under rapid moves + concurrent queries), so the user who just
-# pressed hyper+<space> would see the view jump off their target. We snap back at the
-# end if that happened. Captured here, before any move; empty -> we skip the restore.
-focus_id=$(yabai -m query --spaces --space 2>/dev/null | jq -r '.id // empty' 2>/dev/null)
-any_moved=0
+# Reordering must never change the focused space; a burst of `space --move` can make
+# macOS yank the ACTIVE desktop to some other space (a yabai/macOS quirk that surfaces
+# under rapid moves + concurrent queries), so the user who just pressed hyper+<space>
+# would see the view jump off their target. We snap back at the end if that happened.
+#
+# Only for a change seen ACROSS one of our own --move calls (focus read right before and
+# right after it, by STABLE id -- indices renumber as spaces move). Restoring to whatever
+# was focused on entry also undid the user's own switch to another space mid-run. If
+# focus moves between our calls instead, that was the user: forget the earlier yank.
+# Nothing is read when nothing moves.
+focused_id() {
+  yabai -m query --spaces --space 2>/dev/null | jq -r '.id // empty' 2>/dev/null
+}
+drift_from=""   # focused before the first yank
+drift_to=""     # where the latest yank left it
+move_space() {
+  local before after rc
+  before=$(focused_id)
+  [ -n "$before" ] && [ -n "$drift_to" ] && [ "$before" != "$drift_to" ] &&
+    { drift_from=""; drift_to=""; }
+  yabai -m space "$1" --move "$2" >/dev/null 2>&1; rc=$?
+  after=$(focused_id)
+  if [ -n "$before" ] && [ -n "$after" ] && [ "$before" != "$after" ]; then
+    drift_from=${drift_from:-$before}
+    drift_to=$after
+  fi
+  return "$rc"
+}
 
 # Each `space --move` renumbers indices on its display, so a single pass that
 # derives the target `pos` from a pre-move snapshot can leave a genuinely scrambled
@@ -64,21 +84,21 @@ while [ "$moved" = "1" ] && [ "$attempt" -lt 4 ]; do
       cur=$(printf '%s' "$info" | jq -r '.index // empty' 2>/dev/null)
       case "$cur" in ''|*[!0-9]*) pos=$((pos + 1)); continue ;; esac
       if [ "$cur" != "$pos" ]; then
-        yabai -m space "$label" --move "$pos" >/dev/null 2>&1 && moved=1 && any_moved=1
+        move_space "$label" "$pos" && moved=1
       fi
       pos=$((pos + 1))
     done
   done
 done
 
-# Restore focus if a move drifted the active desktop. No-op when nothing moved (the
-# common already-ordered case stays a cheap query-only pass) or focus held. Matched
-# by id, not index, because the moves renumbered the spaces.
-if [ "$any_moved" = "1" ] && [ -n "${focus_id:-}" ]; then
-  cur_id=$(yabai -m query --spaces --space 2>/dev/null | jq -r '.id // empty' 2>/dev/null)
-  if [ -n "$cur_id" ] && [ "$cur_id" != "$focus_id" ]; then
+# Restore focus if a move of ours drifted the active desktop, and the user has not gone
+# elsewhere since. No-op when nothing moved (the common already-ordered case stays a
+# cheap query-only pass) or focus held. Matched by id, not index, because the moves
+# renumbered the spaces.
+if [ -n "$drift_to" ] && [ "$drift_to" != "$drift_from" ]; then
+  if [ "$(focused_id)" = "$drift_to" ]; then
     tgt=$(yabai -m query --spaces 2>/dev/null |
-      jq -r --argjson id "$focus_id" '([.[] | select(.id == $id) | .index][0]) // empty' 2>/dev/null)
+      jq -r --argjson id "$drift_from" '([.[] | select(.id == $id) | .index][0]) // empty' 2>/dev/null)
     [ -n "$tgt" ] && yabai -m space --focus "$tgt" >/dev/null 2>&1 || true
   fi
 fi
