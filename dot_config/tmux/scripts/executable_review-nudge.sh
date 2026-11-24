@@ -3,14 +3,17 @@
 #
 #   review-nudge.sh check            evaluate, and maybe toast (the timer tick:
 #                                    LaunchAgent com.mackhaymond.tmux-review-nudge,
-#                                    every 600 s)
+#                                    every 300 s)
 #   review-nudge.sh check --dry-run  print the decision; post nothing, write
 #   review-nudge.sh --dry-run        nothing (the state file and log untouched)
 #
 # THE RULE. A nudge goes out when
 #     (old agents >= 3  OR  letters ran out)
 #     AND no nudge in the last 4 hours
-#     AND the tmux server runs with at least one client attached.
+#     AND the tmux server runs with at least one client attached
+#     AND Mack is at it: some client had input in the last 5 minutes
+#         (#{client_activity}). Nobody there: nothing, and the 4 hours do not
+#         restart, so it waits for him instead of firing at 3am.
 #   old agents     idle 8h+, as the review popup counts them: `review.sh count`
 #                  (it runs `agent-ui review --count` and prints an integer);
 #                  anything but an integer counts as 0.
@@ -24,12 +27,14 @@
 # with builtins and exits, no tmux at all.
 #
 # THE NUDGE. One info toast in every sidebar (`notify.sh -c '*'`; a client
-# with no sidebar gets tmux's own message, the text alone), 45 s, titled
-# "Review agents" (the popup's key is prefix O, ⌃S O):
-#     "9 agents idle 8h+ · click or ⌃S O to review"
-#     "9 agents idle 8h+ · letters ran out · click or ⌃S O to review"
-#     "letters ran out (2 on ; keys) · click or ⌃S O to review"
-#     "letters ran out · click or ⌃S O to review"   (no window on a ; key yet)
+# with no sidebar gets tmux's own message, the text alone, for 30 s), up for
+# 5 minutes or until the review popup opens (review.sh open takes it down),
+# titled "Review agents" (the popup's key is prefix O, ⌃S O). With its click
+# action the sidebar draws it as a solid card:
+#     "9 agents idle 8h+ · ⌃S O or click to review"
+#     "9 agents idle 8h+ · letters ran out · ⌃S O or click to review"
+#     "letters ran out (2 on ; keys) · ⌃S O or click to review"
+#     "letters ran out · ⌃S O or click to review"   (no window on a ; key yet)
 # with a click action (`notify.sh -a`): `review.sh open {client}`, the review
 # popup on the clicking client (the sidebar substitutes {client}). Then
 # last-nudge is written, so the next one waits 4 hours whether or not
@@ -46,6 +51,7 @@
 #                       `'<review.sh>' count`)
 #   REVIEW_SH           the review.sh path the toast's action runs (default the
 #                       sibling review.sh)
+#   REVIEW_NUDGE_ACTIVE how recent a client's input must be (seconds)
 #   NOTIFY_SH           the notify.sh to post with (default the sibling)
 #   XDG_STATE_HOME
 #
@@ -55,7 +61,9 @@ set -uo pipefail
 
 EVERY=14400     # at most one nudge per 4 hours
 MIN_OLD=3       # this many agents idle 8h+ is worth a nudge
-TTL=45          # seconds the toast shows
+TTL=300         # seconds the toast shows (review.sh open takes it down)
+MSG_TTL=30      # seconds tmux's own message shows, on a client with no sidebar
+ACTIVE="${REVIEW_NUDGE_ACTIVE:-300}"   # a client with input this recent: he is there
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/agent-review"
 LAST_FILE="$STATE_DIR/last-nudge"
@@ -120,12 +128,23 @@ tmux_cmd=(${REVIEW_NUDGE_TMUX:-tmux})
 t() { "${tmux_cmd[@]}" "$@"; }
 
 # --- the server and its clients ------------------------------------------------
-if ! clients=$(t list-clients -F '#{client_name}' 2>/dev/null); then
+if ! clients=$(t list-clients -F '#{client_activity}' 2>/dev/null); then
     say "skip: no tmux server"
     exit 0
 fi
 if [ -z "$clients" ]; then
     say "skip: no client attached"
+    exit 0
+fi
+
+# The newest input on any client (an epoch). Unreadable: taken as there.
+newest=0
+while IFS= read -r a; do
+    case "$a" in ''|*[!0-9]*) newest=$now; continue ;; esac
+    [ "$a" -gt "$newest" ] && newest=$a
+done <<<"$clients"
+if [ $((now - newest)) -gt "$ACTIVE" ]; then
+    say "skip: no input for $(( (now - newest) / 60 ))m"
     exit 0
 fi
 
@@ -190,13 +209,13 @@ fi
 agents="$old agents idle 8h+"
 [ "$old" = 1 ] && agents="1 agent idle 8h+"
 if [ "$old" -ge "$MIN_OLD" ] && [ "$out" = 1 ]; then
-    text="$agents · letters ran out · click or ⌃S O to review"
+    text="$agents · letters ran out · ⌃S O or click to review"
 elif [ "$old" -ge "$MIN_OLD" ]; then
-    text="$agents · click or ⌃S O to review"
+    text="$agents · ⌃S O or click to review"
 elif [ "$overflow" -gt 0 ]; then
-    text="letters ran out ($overflow on ; keys) · click or ⌃S O to review"
+    text="letters ran out ($overflow on ; keys) · ⌃S O or click to review"
 else
-    text="letters ran out · click or ⌃S O to review"
+    text="letters ran out · ⌃S O or click to review"
 fi
 # The action runs through run-shell, which expands tmux formats: a `#` in the
 # path is doubled. {client} is the sidebar's to fill in.
@@ -211,9 +230,9 @@ fi
 
 # notify.sh expands formats in the text; ours never means one.
 if [ -x "$NOTIFY_SH" ]; then
-    "$NOTIFY_SH" -c '*' -k info -t "$TTL" -T "Review agents" -a "$action" -- "${text//$hash/$hash$hash}"
+    "$NOTIFY_SH" -c '*' -k info -t "$TTL" -m "$MSG_TTL" -T "Review agents" -a "$action" -- "${text//$hash/$hash$hash}"
 elif [ -f "$NOTIFY_SH" ]; then
-    zsh -f "$NOTIFY_SH" -c '*' -k info -t "$TTL" -T "Review agents" -a "$action" -- "${text//$hash/$hash$hash}"
+    zsh -f "$NOTIFY_SH" -c '*' -k info -t "$TTL" -m "$MSG_TTL" -T "Review agents" -a "$action" -- "${text//$hash/$hash$hash}"
 else
     say "error: no notify.sh at $NOTIFY_SH"
     exit 0

@@ -178,6 +178,12 @@ class NotifyTests(unittest.TestCase):
         for junk in ("0", "junk"):
             self.assertEqual(self.notify("-t", junk, "y")[-1], ["display-message", "--", "y"])
 
+    def test_the_message_can_be_shorter_than_the_toast(self):
+        """-m: tmux's own message shows that long, whatever -t says."""
+        self.assertEqual(self.notify("-t", "300", "-m", "30", "x")[-1], ["display-message", "-d", "30000", "--", "x"])
+        self.assertEqual(self.notify("-t", "300", "-m", "junk", "x")[-1], ["display-message", "-d", "300000", "--", "x"])
+        self.assertEqual(self.notify("-m", "2", "x")[-1], ["display-message", "-d", "2000", "--", "x"])
+
     def test_open_sidebar_without_a_client_toasts_everywhere(self):
         self.open_sidebar()
         before = int(time.time() * 1000)

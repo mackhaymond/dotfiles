@@ -154,7 +154,9 @@
 //! Square `┃` bars in the kind's colour down a `surface0` fill, a canvas
 //! margin each side; the glyph and title (notify.sh `-T`, else Info / Done
 //! / Warning / Error) bold on the first row, the local time it was posted
-//! right-aligned; the text wrapped into at most [`TOAST_LINES`] rows. The
+//! right-aligned; the text wrapped into at most [`TOAST_LINES`] rows. A
+//! toast with a click action (`notify.sh -a`) asks for something, so it is
+//! louder: a solid [`ASK_BG`] block with half-row pads ([`ask_card`]). The
 //! rows beneath keep their place and what they stand for. A click anywhere
 //! on a card dismisses that toast in this sidebar ([`Target::Toast`]); each
 //! expires at its own deadline by the frame's clock, and
@@ -1319,6 +1321,11 @@ fn toast_look(k: Kind) -> (&'static str, &'static str, Hue) {
 /// carry the kind's colour).
 const TOAST_BG: Hue = "surface0";
 
+/// The fill of a toast with a click action: a solid block, its text in ink
+/// picked to read on it ([`ink_on`]). The one solid surface at the top of
+/// the frame, so it is seen without being read.
+const ASK_BG: Hue = "mauve";
+
 /// The bar down each side of a toast (OpenCode's `SplitBorder`).
 const TOAST_BAR: &str = "┃";
 
@@ -1348,19 +1355,21 @@ fn toast_row(w: usize, hue: Hue, left: Vec<Seg>, right: Vec<Seg>) -> Row {
 /// one, else the kind's) bold in its colour on the first row, the local
 /// time it was posted right-aligned (dim; dropped when narrow); the text
 /// word-wrapped under it into at most `lines` rows, `…` on the last when
-/// more is left. Every row of it dismisses it here (one with a click action,
-/// `notify.sh -a`, runs that first, and its title ends in ` ›`).
+/// more is left. Every row of it dismisses it here. One with a click action
+/// is an [`ask_card`] instead.
 ///
 /// ```text
 ///  ┃ ✓ Done                         10:42 ┃
 ///  ┃ parked Canvas Syllabus               ┃
 /// ```
 fn toast_card(t: &Toast, w: usize, lines: usize) -> Vec<Row> {
+    if t.action.is_some() {
+        return ask_card(t, w, lines);
+    }
     let (glyph, default, hue) = toast_look(t.kind);
     let iw = inner(w);
     let room = iw.saturating_sub(4);
-    let more = if t.action.is_some() { " ›" } else { "" };
-    let title = bold(format!("{glyph} {}{more}", t.title.as_deref().unwrap_or(default)), hue);
+    let title = bold(format!("{glyph} {}", t.title.as_deref().unwrap_or(default)), hue);
     let at = posted_at(t);
     let right = if !at.is_empty() && dwidth(&title.text) + 1 + dwidth(&at) <= room { vec![seg(at, "overlay2")] } else { vec![] };
     let id = Target::Toast(t.id());
@@ -1368,6 +1377,40 @@ fn toast_card(t: &Toast, w: usize, lines: usize) -> Vec<Row> {
     for l in wrap(&t.text, room, lines) {
         rows.push(toast_row(w, hue, vec![seg(l, "text")], vec![]));
     }
+    rows.into_iter().map(|r| r.click(w, id.clone())).collect()
+}
+
+/// One row of an [`ask_card`]: a solid fill, two cells of padding each side.
+fn ask_row(w: usize, left: Vec<Seg>, right: Vec<Seg>) -> Row {
+    let mut l = vec![seg("  ", "text")];
+    l.extend(left);
+    let mut r = right;
+    r.push(seg("  ", "text"));
+    tile_row(w, Ink::Pal(ASK_BG), l, r)
+}
+
+/// A toast with a click action (`notify.sh -a`) as a solid card: the title
+/// (ending in ` ›`) and time, then the text, all in one dark ink on
+/// [`ASK_BG`], between half-row pads (dropped with the body cut to one line,
+/// so the smallest card is as tall as a plain one). Every row of it runs the
+/// action and dismisses it here.
+fn ask_card(t: &Toast, w: usize, lines: usize) -> Vec<Row> {
+    let bg = Ink::Pal(ASK_BG);
+    let ink = ink_on(bg);
+    let (glyph, default, _) = toast_look(t.kind);
+    let room = inner(w).saturating_sub(4);
+    let title = bold(format!("{glyph} {} ›", t.title.as_deref().unwrap_or(default)), ink);
+    let at = posted_at(t);
+    let right = if !at.is_empty() && dwidth(&title.text) + 1 + dwidth(&at) <= room { vec![seg(at, ink)] } else { vec![] };
+    let mut rows = vec![ask_row(w, vec![title], right)];
+    for l in wrap(&t.text, room, lines) {
+        rows.push(ask_row(w, vec![seg(l, ink)], vec![]));
+    }
+    if lines > 1 {
+        rows.insert(0, pad_row(w, bg, PAD_TOP));
+        rows.push(pad_row(w, bg, PAD_BOTTOM));
+    }
+    let id = Target::Toast(t.id());
     rows.into_iter().map(|r| r.click(w, id.clone())).collect()
 }
 
@@ -1379,6 +1422,11 @@ const TOAST_CARD_W: usize = 16;
 /// (clipped). The row dismisses it.
 fn toast_compact(t: &Toast, w: usize) -> Row {
     let (glyph, _, hue) = toast_look(t.kind);
+    if t.action.is_some() {
+        let ink = ink_on(Ink::Pal(ASK_BG));
+        let left = vec![bold(format!("{glyph} {}", t.text), ink)];
+        return tile_row(w, Ink::Pal(ASK_BG), left, vec![]).click(w, Target::Toast(t.id()));
+    }
     let left = vec![bold(format!("{glyph} "), hue), seg(t.text.clone(), "text")];
     let row = if inner(w) >= 6 { toast_row(w, hue, left, vec![]) } else { tile_row(w, Ink::Pal(TOAST_BG), left, vec![]) };
     row.click(w, Target::Toast(t.id()))

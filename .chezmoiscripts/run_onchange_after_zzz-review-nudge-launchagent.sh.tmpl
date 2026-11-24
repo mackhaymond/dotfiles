@@ -1,6 +1,6 @@
 #!/bin/bash
 # review nudge timer: install the LaunchAgent com.mackhaymond.tmux-review-nudge,
-# which runs `~/.config/tmux/scripts/review-nudge.sh check` every 600 s. Within
+# which runs `~/.config/tmux/scripts/review-nudge.sh check` every 300 s. Within
 # 4 hours of the last nudge it reads one small file and exits, so most ticks
 # cost one bash start. Docs: the header of
 # dot_config/tmux/scripts/executable_review-nudge.sh and
@@ -8,7 +8,7 @@
 # run_onchange_after_snooze-launchagent.sh.tmpl.
 #
 # ORDER: named `zzz-` so it runs after run_onchange_after_zz-build-agent-ui,
-# and no RunAtLoad, so the first check comes 600 s after load. A nudge's click
+# and no RunAtLoad, so the first check comes 300 s after load. A nudge's click
 # action (the 8th @toast field) needs the new agent-ui binary; a sidebar still
 # on the old one folds that field into the title and the click does nothing,
 # so a nudge must not fire before the build has run. (Sidebars already running
@@ -52,7 +52,7 @@ want=$(cat <<'PLIST_EOF'
 		<string>check</string>
 	</array>
 	<key>StartInterval</key>
-	<integer>600</integer>
+	<integer>300</integer>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
@@ -90,7 +90,7 @@ launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null
 # "Input/output error" for a moment.
 for i in 1 2 3 4 5 6 7 8 9 10; do
     if launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null; then
-        echo "[review-nudge] loaded $LABEL (review-nudge check every 600 s)"
+        echo "[review-nudge] loaded $LABEL (review-nudge check every 300 s)"
         exit 0
     fi
     sleep 0.5

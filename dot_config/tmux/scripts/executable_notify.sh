@@ -10,7 +10,7 @@
 # `tmux display-message [-c CLIENT] -- TEXT`, so with no sidebar nothing
 # changes.
 #
-#   notify.sh [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [-T TITLE] [-a ACTION] [--] TEXT...
+#   notify.sh [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS] [-m SECONDS] [-T TITLE] [-a ACTION] [--] TEXT...
 #
 #   -c CLIENT  a client as `display-message -c` takes it. Without it: the
 #              calling context's client as tmux resolves it (`#{client_name}`;
@@ -24,6 +24,9 @@
 #   -t SECONDS how long the toast shows (default 4; error 8). Given (and
 #              valid), the display-message fallback shows that long too
 #              (`-d`); without it, display-time as before.
+#   -m SECONDS how long the display-message fallback shows, when that should
+#              not be -t's (tmux holds a client's panes still under a message,
+#              so a toast of minutes wants a short one).
 #   -T TITLE   the card's title instead of the kind's (taken literally: no
 #              tmux formats). The display-message fallback shows the text
 #              alone, as before.
@@ -99,15 +102,16 @@ case ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} in
         fi ;;
 esac
 
-client= kind=info ttl= title= action=
+client= kind=info ttl= mttl= title= action=
 while (( $# )); do
     case $1 in
-        -c|-k|-t|-T|-a)
+        -c|-k|-t|-m|-T|-a)
             if (( $# < 2 )); then shift; break; fi
             case $1 in
                 -c) client=$2 ;;
                 -k) kind=$2 ;;
                 -t) ttl=$2 ;;
+                -m) mttl=$2 ;;
                 -T) title=$2 ;;
                 -a) action=$2 ;;
             esac
@@ -128,6 +132,10 @@ else
     # An explicit duration holds for tmux's own message too (milliseconds).
     integer dms=$(( ttl * 1000 ))
     (( dms > 0 )) && dopt=(-d $dms)
+fi
+if [[ $mttl =~ '^[0-9]{1,9}([.][0-9]{1,6})?$' ]] && (( mttl > 0 )); then
+    integer mms=$(( mttl * 1000 ))
+    (( mms > 0 )) && dopt=(-d $mms)
 fi
 
 # One line: tabs, CRs, newlines and the record/field separators → spaces.

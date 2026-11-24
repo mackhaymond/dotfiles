@@ -2509,6 +2509,39 @@ fn a_toast_is_a_card_over_the_top() {
     assert!(top.starts_with(" ┃ ✓ Done ") && top.ends_with(" ┃ ") && !top.contains(':'), "{top:?}");
 }
 
+/// A toast with a click action is louder: a solid block in one colour with
+/// half-row pads, every row its click target; short frames drop the pads
+/// before it goes, and a tiny sidebar still gets a solid row.
+#[test]
+fn a_toast_with_an_action_is_a_solid_card() {
+    let v = lettered(quiet());
+    let ask = Toast { title: Some("Review agents".into()), action: Some("r.sh".into()), ..toast(Kind::Info, "9 agents idle 8h+ · ⌃S O or click to review") };
+    let show = |w: u16, h: u16| layout(&v, w, h, &with_bar(Bar { toasts: vec![ask.clone()], ..demo_bar() }));
+    let f = show(42, 40);
+    let t = texts(&f);
+    let time = posted_at(&ask);
+    assert_eq!(f.toast, 0..6, "{t:#?}");
+    assert!(t[0].trim().chars().all(|c| c == '▄') && t[4].trim().chars().all(|c| c == '▀'), "{t:#?}");
+    assert!(t[1].starts_with("   ● Review agents ›") && t[1].trim_end().ends_with(&time), "{t:#?}");
+    assert!(t[2].contains("9 agents idle 8h+") && t[3].contains("review"), "{t:#?}");
+    let ink = ink_on(Ink::Pal("mauve"));
+    assert!(f.rows[1..4].iter().all(|r| r.bg == Some(Ink::Pal("mauve"))));
+    assert!(f.rows[1].segs.contains(&bold("● Review agents ›", ink)) && f.rows[1].segs.contains(&seg(time, ink)));
+    for y in 0..5u16 {
+        assert_eq!(f.target(20, y), Some(&Target::Toast(TOAST_ID)), "{y}");
+    }
+    assert_eq!(f.target(20, 5), None);
+    let mut buf = Buffer::empty(Rect::new(0, 0, 42, 40));
+    paint(&f, &mut buf);
+    assert_eq!((buf[(0, 1)].bg, buf[(1, 1)].bg, buf[(40, 2)].bg), (palette::color("mantle"), palette::color("mauve"), palette::color("mauve")));
+    // Always there, whatever the size, and never past the frame.
+    for (w, h) in [(34u16, 4u16), (34, 6), (20, 10), (16, 5), (12, 12)] {
+        let f = show(w, h);
+        assert!(f.rows.iter().any(|r| r.bg == Some(Ink::Pal("mauve"))) || f.toast.is_empty(), "{w}x{h}");
+        assert!(f.rows.len() == usize::from(h), "{w}x{h}");
+    }
+}
+
 /// Up to three cards at once, stacked from the top like nvim-notify's:
 /// oldest on top, the newest below it; each its own to dismiss; the frame
 /// wakes at the earliest deadline. Short frames drop the oldest first, then

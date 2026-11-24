@@ -2,7 +2,7 @@
 
 The rule: (agents idle 8h+ >= 3, or some visible window holds a 2-char
 overflow key `;x`) AND no nudge in the last 4 hours AND a tmux server with a
-client attached. The nudge is one info toast for every client (`notify.sh -c
+client attached, with input in the last 5 minutes. The nudge is one info toast for every client (`notify.sh -c
 '*'`) whose click action opens the review popup (`review.sh open {client}`).
 
 Every test drives the real script under /bin/bash (3.2, as the LaunchAgent
@@ -52,6 +52,7 @@ class ReviewNudgeTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.state),
             "REVIEW_NUDGE_NOW": str(NOW),
             "REVIEW_NUDGE_TMUX": self.tmux_words,
+            "REVIEW_NUDGE_ACTIVE": "999999999",   # the clients' clock is real, NOW is not
             "NOTIFY_TMUX": self.tmux_words,
             "NOTIFY_SH": str(NOTIFY),
             "NOTIFY_LOG": str(self.root / "notify.log"),
@@ -119,7 +120,7 @@ class ReviewNudgeTests(unittest.TestCase):
         recs = self.records()
         self.assertEqual(len(recs), 1, recs)
         _seq, _ms, kind, ttl, client, shown, title, action = recs[0]
-        self.assertEqual((kind, ttl, client, shown, title), ("info", "45", "", text, "Review agents"))
+        self.assertEqual((kind, ttl, client, shown, title), ("info", "300", "", text, "Review agents"))
         self.assertEqual(action, f"'{REVIEW_SH}' open {{client}}")
         self.assertEqual(self.last_file.read_text().strip(), str(NOW))
 
@@ -141,7 +142,7 @@ class ReviewNudgeTests(unittest.TestCase):
     def test_three_old_agents_toast_with_the_review_action(self):
         self.with_sidebar()
         self.nudge(old=9)
-        self.assert_nudged("9 agents idle 8h+ · click or ⌃S O to review")
+        self.assert_nudged("9 agents idle 8h+ · ⌃S O or click to review")
         log = (self.state / "agent-review" / "log").read_text()
         self.assertIn("nudged: 9 idle 8h+, 0/26 letters held, 0 overflow keys", log)
 
@@ -184,7 +185,7 @@ class ReviewNudgeTests(unittest.TestCase):
         # Four hours on: again.
         self.last_file.write_text(f"{NOW - 4 * 3600}\n")
         self.nudge(old=9)
-        self.assert_nudged("9 agents idle 8h+ · click or ⌃S O to review")
+        self.assert_nudged("9 agents idle 8h+ · ⌃S O or click to review")
         # And now, straight after, nothing more.
         self.tmux("set-option", "-gu", "@toast")
         self.nudge(old=9)
@@ -207,6 +208,18 @@ class ReviewNudgeTests(unittest.TestCase):
         self.assert_quiet()
         self.assertEqual(self.nudge("--dry-run", old=9), "skip: no client attached\n")
 
+    def test_nobody_at_the_terminal_nothing(self):
+        """No client input lately: no toast, and the 4 hours do not start;
+        back at it, the next tick nudges."""
+        tty = self.with_sidebar()
+        act = int(self.tmux("display-message", "-p", "-c", tty, "#{client_activity}"))
+        away = {"REVIEW_NUDGE_ACTIVE": "300", "REVIEW_NUDGE_NOW": str(act + 60 * 60)}
+        self.assertEqual(self.nudge("--dry-run", old=9, env=away), "skip: no input for 60m\n")
+        self.nudge(old=9, env=away)
+        self.assert_quiet()
+        self.nudge(old=9, env=dict(away, REVIEW_NUDGE_NOW=str(act + 299)))
+        self.assertEqual(len(self.records()), 1)
+
     def test_no_server_nothing(self):
         self.tmux("kill-server")
         self.assertEqual(self.nudge("--dry-run", old=9), "skip: no tmux server\n")
@@ -217,7 +230,7 @@ class ReviewNudgeTests(unittest.TestCase):
         self.with_sidebar()
         out = self.nudge("check", "--dry-run", old=7)
         self.assertEqual(out.splitlines(), [
-            "nudge: 7 idle 8h+, 0/26 letters held, 0 overflow keys → would toast: 7 agents idle 8h+ · click or ⌃S O to review",
+            "nudge: 7 idle 8h+, 0/26 letters held, 0 overflow keys → would toast: 7 agents idle 8h+ · ⌃S O or click to review",
             f"action: '{REVIEW_SH}' open {{client}}",
         ])
         self.assert_quiet()
@@ -231,7 +244,7 @@ class ReviewNudgeTests(unittest.TestCase):
         self.assertEqual(self.records(), [])
         self.assertTrue(self.last_file.exists())
         t = time.time() + 5
-        while not any(f"{tty} message: " in l and l.endswith("3 agents idle 8h+ · click or ⌃S O to review")
+        while not any(f"{tty} message: " in l and l.endswith("3 agents idle 8h+ · ⌃S O or click to review")
                       for l in self.tmux("show-messages").splitlines()):
             self.assertLess(time.time(), t)
             time.sleep(0.02)
@@ -258,7 +271,7 @@ class ReviewNudgeTests(unittest.TestCase):
 # a notify.sh that logs its argv. No server, no ptys.
 FAKE_TMUX = """#!/bin/sh
 case "$1" in
-    list-clients) echo /dev/ttys999 ;;
+    list-clients) echo "$REVIEW_NUDGE_NOW" ;;
     list-windows) cat "$ROWS" ;;
     *) exit 1 ;;
 esac
@@ -318,16 +331,16 @@ class LettersRanOutTests(unittest.TestCase):
             return None
         stamp.unlink()
         argv = self.calls.read_text().split("\n")[0].split("\x1f")[:-1]
-        self.assertEqual(argv[:9], ["-c", "*", "-k", "info", "-t", "45", "-T", "Review agents", "-a"])
-        self.assertEqual(argv[9:11], [f"'{REVIEW_SH}' open {{client}}", "--"])
-        return argv[11]
+        self.assertEqual(argv[:11], ["-c", "*", "-k", "info", "-t", "300", "-m", "30", "-T", "Review agents", "-a"])
+        self.assertEqual(argv[11:13], [f"'{REVIEW_SH}' open {{client}}", "--"])
+        return argv[13]
 
     def test_all_26_held_is_out_of_letters(self):
         self.windows(*LETTERS)
-        self.assertEqual(self.nudge(), "letters ran out · click or ⌃S O to review")
+        self.assertEqual(self.nudge(), "letters ran out · ⌃S O or click to review")
         self.windows(*LETTERS, ";a", ";b")
-        self.assertEqual(self.nudge(old=1), "letters ran out (2 on ; keys) · click or ⌃S O to review")
-        self.assertEqual(self.nudge(old=4), "4 agents idle 8h+ · letters ran out · click or ⌃S O to review")
+        self.assertEqual(self.nudge(old=1), "letters ran out (2 on ; keys) · ⌃S O or click to review")
+        self.assertEqual(self.nudge(old=4), "4 agents idle 8h+ · letters ran out · ⌃S O or click to review")
 
     def test_an_overflow_key_with_a_free_letter_is_no_trigger(self):
         """Overflow keys are kept for life: once a letter frees up, a `;x`
@@ -341,7 +354,7 @@ class LettersRanOutTests(unittest.TestCase):
         self.windows(*LETTERS[:-1], "Z", "zz", ";", "")
         self.assertIsNone(self.nudge())
         # ... and the old-agent trigger still works on its own.
-        self.assertEqual(self.nudge(old=3), "3 agents idle 8h+ · click or ⌃S O to review")
+        self.assertEqual(self.nudge(old=3), "3 agents idle 8h+ · ⌃S O or click to review")
 
 
 if __name__ == "__main__":

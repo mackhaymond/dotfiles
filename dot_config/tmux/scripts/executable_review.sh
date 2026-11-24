@@ -53,6 +53,20 @@ notify() {
     return 0
 }
 
+# The nudge's toast (review-nudge.sh, titled "Review agents") asks for the
+# popup that is opening: take it down in every sidebar.
+clear_nudge() {
+    local raw kept
+    raw=$(opt @toast)
+    case "$raw" in *$'\tReview agents\t'*) ;; *) return 0 ;; esac
+    kept=$(printf '%s' "$raw" | awk -v RS=$'\x1e' -v sep=$'\x1e' -F'\t' '$7 != "Review agents" { printf "%s%s", s, $0; s = sep }')
+    # (An argument ending in `;` is a tmux command separator.)
+    case "$kept" in *';') kept="${kept%;}\\;" ;; esac
+    tmux set -gq @toast "$kept"
+    [ -n "${AGENT_FOCUS_NOTICE-x}" ] || return 0
+    notifyutil -p "${AGENT_FOCUS_NOTICE-com.mackhaymond.tmux.focus}" </dev/null >/dev/null 2>&1 &
+}
+
 # sq <word>: single-quoted for sh.
 sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
@@ -65,6 +79,7 @@ do_open() {
         notify -k warn -c "$client" -- "review: agent-ui is not installed"
         return 0
     fi
+    clear_nudge
     sock=$(tmux display-message -p '#{socket_path}')
     IFS=' ' read -r cw ch <<<"$(tmux display-message -p -c "$client" '#{client_width} #{client_height}' 2>/dev/null)"
     w=$(( ${cw:-0} * POPUP_PCT_W / 100 )); h=$(( ${ch:-0} * POPUP_PCT_H / 100 ))

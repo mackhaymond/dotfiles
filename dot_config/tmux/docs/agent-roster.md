@@ -1421,7 +1421,7 @@ Python strip above. Code: `agent-ui/src/sidebar.rs`, `src/sidebar/layout.rs`,
   with the status line off, `tmux display-message` draws on the client's
   bottom line, which reads as the status line coming back. Scripts say
   things through `notify.sh [-c CLIENT] [-k info|ok|warn|error] [-t SECONDS]
-  [-T TITLE] [--] TEXT...` instead. One tmux read (`display -p` of the
+  [-m SECONDS] [-T TITLE] [--] TEXT...` instead. One tmux read (`display -p` of the
   client's name, `@sidebar_pids`, `@sidebar_clients`, `@toast_seq`, the
   current `@toast` and the text expanded as display-message would) decides:
   a LIVE sidebar (its paired pid passes `kill -0`, so a SIGKILLed one still

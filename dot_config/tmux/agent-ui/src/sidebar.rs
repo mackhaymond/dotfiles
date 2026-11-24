@@ -2273,7 +2273,7 @@ mod tests {
         a.bar.toasts = vec![review.clone()];
         let frame = |a: &App| layout(&a.view, 34, 30, &Opts { bar: a.shown_bar(), now: Some(text::now()), ..Opts::default() });
         let f = frame(&a);
-        assert!(f.rows[0].text().contains("Review agents ›"), "{:?}", f.rows[0].text());
+        assert!(f.rows[1].text().contains("Review agents ›"), "{:?}", f.rows[1].text());
         assert!(a.guarded_here(&Target::Toast(review.id())) && !guarded(&Target::Toast(review.id())));
         // Only just drawn: not trusted yet.
         a.show(f, Instant::now());

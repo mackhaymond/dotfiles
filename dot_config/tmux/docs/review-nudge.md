@@ -1,29 +1,34 @@
 ## Nudge
 
 Every so often the system asks Mack to review his old agents, so stale tabs
-don't pile up until the letters run out. A timer checks every 10 minutes and,
-when it is worth it, puts one toast in every sidebar:
+don't pile up until the letters run out. A timer checks every 5 minutes and,
+when it is worth it and he is at the terminal, puts one toast in every
+sidebar, a solid mauve card (any toast with a click action is one):
 
 ```text
- ┃ ● Review agents ›              14:02 ┃
- ┃ 9 agents idle 8h+ · click or ⌃S O to ┃
- ┃ review                               ┃
+ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+ ██● Review agents ›             14:02██
+ ██9 agents idle 8h+ · ⌃S O or click ██
+ ██to review                         ██
+ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 ```
 
 **Clicking the toast opens the review popup** on the client that clicked
 (`review.sh open <client>`). Clicking it also dismisses it, as with any toast.
-`⌃S O` (prefix O) opens the same popup. If nobody clicks, the toast goes away after 45 s.
+`⌃S O` (prefix O) opens the same popup. The toast stays for 5 minutes, or
+until the popup opens on any client (`review.sh open` takes it out of
+`@toast`, so every sidebar drops it).
 
 | piece | source (chezmoi) |
 |---|---|
 | script | `dot_config/tmux/scripts/executable_review-nudge.sh` (bash 3.2, as launchd runs it) |
-| timer | LaunchAgent `com.mackhaymond.tmux-review-nudge`, `review-nudge.sh check` every 600 s (no RunAtLoad: the first check comes 10 min after load); installed by `.chezmoiscripts/run_onchange_after_zzz-review-nudge-launchagent.sh.tmpl` (the snooze timer's pattern) |
+| timer | LaunchAgent `com.mackhaymond.tmux-review-nudge`, `review-nudge.sh check` every 300 s (no RunAtLoad: the first check comes 5 min after load); installed by `.chezmoiscripts/run_onchange_after_zzz-review-nudge-launchagent.sh.tmpl` (the snooze timer's pattern) |
 | toast click action | `notify.sh -a ACTION` (8th `@toast` field); agent-ui `src/sidebar/status.rs` `Toast::action_line`, `src/sidebar.rs` `App::click` |
 | tests | `dot_config/tmux/tests/test_review_nudge.py`, `test_notify.py` (`-a`), agent-ui `cargo test toast` |
 
 ### When it nudges
 
-All three must hold:
+All four must hold:
 
 1. **There is something to review.** Either at least **3 agents have been idle
    8h+**, or **the letters ran out**. "Idle 8h+" is the review popup's own rule:
@@ -43,20 +48,26 @@ All three must hold:
 3. **Someone is there.** The tmux server must be running with at least one
    client attached. No server, or no client, means no nudge, and the 4 hours
    do not restart.
+4. **Mack is at it.** Some client had input in the last 5 minutes
+   (`#{client_activity}`). The timer also fires overnight and on dark wakes;
+   without this, a nudge at 3am nobody saw used up the 4 hours. Away, the 4
+   hours do not restart, so the nudge waits: it shows within 5 minutes of him
+   coming back.
 
 The text names whichever trigger fired:
 
 | trigger | text |
 |---|---|
-| ≥ 3 idle 8h+ | `9 agents idle 8h+ · click or ⌃S O to review` |
-| both | `9 agents idle 8h+ · letters ran out · click or ⌃S O to review` |
-| letters only | `letters ran out (2 on ; keys) · click or ⌃S O to review` |
-| letters only, no window on a `;` key yet | `letters ran out · click or ⌃S O to review` |
+| ≥ 3 idle 8h+ | `9 agents idle 8h+ · ⌃S O or click to review` |
+| both | `9 agents idle 8h+ · letters ran out · ⌃S O or click to review` |
+| letters only | `letters ran out (2 on ; keys) · ⌃S O or click to review` |
+| letters only, no window on a `;` key yet | `letters ran out · ⌃S O or click to review` |
 
-The toast goes out as `notify.sh -c '*' -k info -t 45 -T "Review agents" -a
+The toast goes out as `notify.sh -c '*' -k info -t 300 -m 30 -T "Review agents" -a
 "'<review.sh>' open {client}"`, which means one toast for every sidebar. A
 client with no sidebar gets tmux's own `display-message` with the text alone,
-and it has nothing to click.
+for 30 s (`-m`: tmux holds the panes still under a message), and it has
+nothing to click.
 
 ### Toast click actions (`notify.sh -a`)
 
@@ -65,7 +76,8 @@ ACTION` stores a shell line as the 8th field of the toast's `@toast` record.
 Records with 6 or 7 fields, from before this field existed, still parse
 everywhere. When a toast has an action:
 
-- its card's title ends in ` ›`;
+- its card is a solid mauve block (`ask_card`, agent-ui
+  `src/sidebar/layout.rs`) and its title ends in ` ›`;
 - a click runs the action on the clicking sidebar's client through `tmux
   run-shell -b`, with its output and exit status silenced, then dismisses the
   toast in that sidebar only. In the action, `{client}` becomes the client,
@@ -101,5 +113,5 @@ The log is trimmed to its last 500 lines once it passes 1000. The
 LaunchAgent's stdout and stderr go to `launchd.log` beside it.
 
 Environment overrides, for tests: `REVIEW_NUDGE_NOW`, `REVIEW_NUDGE_TMUX`,
-`REVIEW_COUNT_CMD` (run by `bash -c`, default `'<review.sh>' count`),
+`REVIEW_NUDGE_ACTIVE`, `REVIEW_COUNT_CMD` (run by `bash -c`, default `'<review.sh>' count`),
 `REVIEW_SH`, `NOTIFY_SH`, `XDG_STATE_HOME`.
