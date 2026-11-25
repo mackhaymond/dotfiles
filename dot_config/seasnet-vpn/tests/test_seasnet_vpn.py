@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -108,6 +109,7 @@ for n, step in enumerate(json.load(open(D + "/steps" + W))):
     elif step == "cancel": sys.exit(1)
     elif step == "prepared": emit(event="prepared")
     elif step == "show": assert listen() == {"do": "show"}; open(D + "/shown", "w")
+    elif isinstance(step, dict): emit(**step)
     elif step == "unknown": emit(event="unknown"); hang()
     elif step == "late": time.sleep(1); emit(event="signed", challenge="A" * 42 + "_", signature="S" * 86); hang()
     elif step == "deliver": emit(event="delivered"); sys.exit(0)
@@ -547,6 +549,7 @@ sys.exit(1 if "code" in answer else 0)
         code, run = self.signin(["approve"], [self.CHALLENGE, {"callback": self.CALLBACK}], listener="404 Not Found")
         self.assertEqual(code, 0)
         self.assert_web(run, "recognize")
+        self.assertIn("openconnect answered 404", (self.state / "events.log").read_text())
 
     def test_unanswered_delivery_is_unknown_not_gone(self):
         for steps, answers, web in ((["approve"], [self.CHALLENGE, {"callback": self.CALLBACK}], ("deliver",)),
@@ -570,6 +573,38 @@ sys.exit(1 if "code" in answer else 0)
                 if steps == ["approve"]:
                     self.assertEqual((len(self.received), self.told_web), (1, []))
                 self.assertFalse(self.alive())
+
+    def test_trace_keeps_the_chain_and_nothing_private(self):
+        good = {"event": "trace", "kind": "nav", "ms": "1234", "verdict": "handoff", "method": "POST", "frame": "main", "by": "form",
+                "origin": "https://v2.ssl.vpn.ucla.edu", "path": "/+CSCOE+/saml/sp/acs"}
+        secret = {name: "SECRETTOKEN?return=x#f" for name in vpn.SignInTrace.FIELDS}
+        sneaky = {**good, "origin": "https://v2.ssl.vpn.ucla.edu/SECRET", "path": "/+CSCOE+/SECRET", "ms": "12SECRET", "extra": "SECRET",
+                  "by": ["SECRET"], "verdict": "handoff\nSECRET"}
+        lost = {"event": "trace", "kind": "lost", "ms": "9", "lost": "refused", "status": "404"}
+        for attempt in range(5):
+            code, _ = self.signin(["web:key"], [self.CHALLENGE], web=(good, {"event": "trace", **secret}, sneaky, lost, "deliver"))
+            self.assertEqual(code, 0)
+        trace = self.state / "signin-trace.log"
+        self.assertEqual(trace.stat().st_mode & 0o777, 0o600)
+        text = trace.read_text()
+        self.assertNotIn("SECRET", text)
+        self.assertEqual(text.count("== "), 3)  # The last three attempts.
+        self.assertEqual(text.count("ms=1234 kind=nav verdict=handoff method=POST frame=main by=form "
+                                    "origin=https://v2.ssl.vpn.ucla.edu path=/+CSCOE+/saml/sp/acs\n"), 3)
+        self.assertIn("web sign-in lost: status=404 lost=refused", (self.state / "events.log").read_text())
+        code, _ = self.signin(["web:key"], [self.CHALLENGE], web=(*[good] * 320, "deliver"))
+        self.assertLess(len(trace.read_text().split("== ")[-1].splitlines()), 305)
+        # The card has nothing to trace.
+        before = trace.read_text()
+        self.signin([good, "approve"], [self.CHALLENGE, {"callback": self.CALLBACK}])
+        self.assertEqual(trace.read_text(), before)
+        # Every path the window may name is one the trace accepts.
+        swift = (source.parents[2] / "dot_config/seasnet-vpn/signin/Web.swift")
+        swift = swift if swift.exists() else Path.home() / ".config/seasnet-vpn/signin/Web.swift"
+        listed = re.findall(r'"(/[^"]*)"', swift.read_text().split("static let paths")[1].split("]\n")[0])
+        self.assertGreater(len(listed), 10)
+        for path in listed:
+            self.assertTrue(re.fullmatch(vpn.SignInTrace.FIELDS["path"], path), path)
 
     def test_proceeding_is_seen_from_the_listener_alone(self):
         with socket.create_server(("::1", 0), family=socket.AF_INET6) as server, \

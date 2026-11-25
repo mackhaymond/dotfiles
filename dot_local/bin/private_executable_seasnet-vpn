@@ -848,12 +848,52 @@ class ResultUnknown(Exception):
     """The callback may or may not have reached openconnect."""
 
 
+class SignInTrace:
+    """The web sign-in's steps, for when one goes wrong: signin-trace.log, the last three
+    attempts. Only these fields in these shapes get in, so no query, token or page text
+    can, whatever the window says."""
+    FIELDS = {
+        "ms": r"\d{1,7}", "kind": "load|nav|redirect|response|loaded|failed|answer|lost",
+        "verdict": "allow|callback|finished|handoff|block|closed", "method": "GET|POST|other", "frame": "main|sub|new",
+        "by": "link|form|history|reload|other|server", "status": r"-?\d{1,5}|none", "lost": "refused|silent|closed|gone|unknown",
+        "origin": r"(?:https?|about|other)://(?:none|other|duo|localhost|127\.0\.0\.1|(?:[a-z0-9-]{1,30}\.){0,5}ucla\.edu)(?::29786|:other)?",
+        "path": r"other|/|/api/sso|/\+CSCOE\+/(?:saml/sp/(?:login|acs)|saml_ac_login\.html|message\.html|logon\.html|portal\.html|blank\.html)"
+                r"|/\+webvpn\+/index\.html|/shibboleth-idp/profile/SAML2/(?:Redirect|POST)/SSO"
+                r"|/frame/(?:frameless/v4/auth|v4/(?:auth/prompt(?:/data)?|preauth/healthcheck|exit))",
+    }
+    KEEP, LINES = 3, 300
+
+    def __init__(self):
+        self.path, self.lines = STATE / "signin-trace.log", 0
+        try:
+            runs = self.path.read_text().split("== ")[1:] if self.path.exists() else []
+            runs = runs[-(self.KEEP - 1):] + [f"{time.strftime('%Y-%m-%d %H:%M:%S')} web sign-in\n"]
+            write_text_atomic(self.path, "".join("== " + run for run in runs))
+        except (OSError, ValueError):
+            pass
+
+    def add(self, event):
+        self.lines += 1
+        if self.lines > self.LINES:
+            return
+        words = [f"{name}={event[name]}" for name, shape in self.FIELDS.items()
+                 if isinstance(event.get(name), str) and re.fullmatch(shape, event[name])]
+        try:
+            with self.path.open("a") as log:
+                log.write(" ".join(words) + "\n")
+        except OSError:
+            pass
+        if event.get("kind") == "lost":
+            log_event("web sign-in lost: " + " ".join(word for word in words if word.startswith(("lost=", "status="))))
+
+
 class SignInWindow:
     """One of our windows: JSON lines both ways, and EOF closes either side."""
 
     def __init__(self, binary, wanted, *arguments):
         self.wanted, self.events, self.buffer = wanted, [], b""
         self.card = not arguments
+        self.trace = None if self.card else SignInTrace()
         self.process = subprocess.Popen([str(binary), *arguments], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL)
 
@@ -879,7 +919,10 @@ class SignInWindow:
                     event = json.loads(line)
                 except ValueError:
                     continue
-                if isinstance(event, dict):
+                if isinstance(event, dict) and event.get("event") == "trace":
+                    if self.trace:
+                        self.trace.add(event)
+                elif isinstance(event, dict):
                     self.events.append(event)
                     if self.card and event.get("event") == "web":
                         raise UseWeb(event.get("why"))
@@ -1025,7 +1068,11 @@ def deliver_callback(callback):
             pass
     if not answer.startswith(b"HTTP/1.") or b"\r\n" not in answer:
         return "unknown"
-    return "ok" if re.match(rb"HTTP/1\.[01] (302|200) ", answer) else "refused"
+    status = re.match(rb"HTTP/1\.[01] (\d{3})\b", answer)
+    if not status:
+        return "unknown"
+    log_event(f"openconnect answered {int(status[1])}")
+    return "ok" if status[1] in (b"302", b"200") else "refused"
 
 
 def callback_listeners():

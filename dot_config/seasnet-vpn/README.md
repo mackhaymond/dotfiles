@@ -69,8 +69,12 @@ lost answer from vlt.
 
 - Password and Duo push work there. Passkeys, security keys and Touch ID don't:
   they need an Apple entitlement. ⌘\ may fill from 1Password.
-- It hides in the same callback that gives it the login result, so Cisco's "you
-  can close this" page never loads.
+- Once UCLA's VPN server has the sign-in, its own pages run behind the Connecting
+  panel and are never shown. The window hides in the same callback that gives it
+  the login result, and nothing loads after that.
+- `~/.local/state/seasnet-vpn/signin-trace.log` keeps the last three attempts' steps:
+  verdict, method, host, a known path or "other", status and time. No queries,
+  tokens or page text.
 - Only HTTPS on `ucla.edu` and Duo's `api-*.duosecurity.com` opens, plus the one
   `localhost:29786` request. Anything else, pop-ups included, is blocked with a
   message.

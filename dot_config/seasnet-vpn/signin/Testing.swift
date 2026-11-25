@@ -324,7 +324,9 @@ func renderWebPreviews(to out: URL) {
         ("web-3-login-blocked-link", .login, ucla, 0, "Blocked example.com. Only UCLA and Duo pages open here.", ""),
         ("web-4-duo", .duo, duo, 1, nil, "Touch ID isn’t available, so sign in here."),
         ("web-5-connecting", .connecting, "", 2, nil, ""),
-        ("web-6-error", error, "", 0, nil, ""), ("web-7-handoff-error", WebController.lost, "", 2, nil, ""),
+        ("web-6-error", error, "", 0, nil, ""), ("web-7-handoff-error", WebController.Lost.closed.phase, "", 2, nil, ""),
+        ("web-9-went-quiet", WebController.Lost.silent.phase, "", 2, nil, ""),
+        ("web-10-refused", WebController.Lost.refused(404).phase, "", 2, nil, ""),
         ("web-8-cancelled", .ended, "", 2, nil, ""),
     ]
     for (scheme, name) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
@@ -383,6 +385,209 @@ final class FakeListener {
         }
     }
     var seen: [String] { lock.withLock { requests } }
+}
+
+/// UCLA's VPN server after the assertion: plain HTTP on 127.0.0.1, one answer per path.
+final class MockGateway {
+    private let fd = socket(AF_INET, SOCK_STREAM, 0)
+    private(set) var port = 0
+    private var log: [String] = []
+    private let lock = NSLock()
+    private let answer: (String, String) -> String
+    var seen: [String] { lock.withLock { log } }
+
+    static func page(_ body: String, headers: String = "") -> String {
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n\(headers)Content-Length: \(body.utf8.count)\r\n\r\n\(body)"
+    }
+    static func redirect(_ to: String) -> String {
+        "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: \(to)\r\nContent-Length: 0\r\n\r\n"
+    }
+
+    init(_ answer: @escaping (String, String) -> String) {
+        self.answer = answer
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
+                _ = bind(fd, raw, length)
+                _ = getsockname(fd, raw, &length)
+            }
+        }
+        port = Int(UInt16(bigEndian: address.sin_port))
+        listen(fd, 16)
+        Thread.detachNewThread { [self] in
+            while true {
+                let client = accept(fd, nil, nil)
+                guard client >= 0 else { return }
+                var on: Int32 = 1
+                setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+                Thread.detachNewThread { [self] in
+                    var data = Data(), buffer = [UInt8](repeating: 0, count: 8192)
+                    while data.range(of: Data("\r\n\r\n".utf8)) == nil {
+                        let count = read(client, &buffer, buffer.count)
+                        guard count > 0 else { close(client); return }
+                        data.append(contentsOf: buffer[0..<count])
+                    }
+                    let words = String(decoding: data, as: UTF8.self).split(separator: " ")
+                    let path = String(words[1].split(separator: "?")[0])
+                    lock.withLock { log.append("\(words[0]) \(path)") }
+                    _ = self.answer(String(words[0]), path).withCString { write(client, $0, strlen($0)) }
+                    close(client)
+                }
+            }
+        }
+    }
+}
+
+/// Every order the gateway could hand the result on in, against a fake openconnect.
+func gatewaySelfTest(_ check: @escaping (Bool, String) -> Void, callbackQuery: String) {
+    let idp = URL(string: "https://shb.ais.ucla.edu/shibboleth-idp/profile/SAML2/Redirect/SSO?secret=query")!
+    let acs = "/+CSCOE+/saml/sp/acs", closing = "/+CSCOE+/saml_ac_login.html"
+    struct Run {
+        let controller: WebController, gateway: MockGateway, code: () -> Int32?, trace: () -> [[String: String]], shown: () -> Bool
+    }
+    /// The IdP's page posts the assertion, as UCLA's does; from there the gateway decides.
+    func run(_ listener: FakeListener, patience: TimeInterval = 8, limit: TimeInterval = 20,
+             _ answer: @escaping (String, String, String) -> String) -> Run {
+        let callback = "http://localhost:\(listener.port)\(callbackQuery)"
+        let gateway = MockGateway { answer($0, $1, callback) }
+        var policy = Policy(callbackPort: listener.port)
+        policy.mockGateway = gateway.port
+        let controller = WebController(start: idp, policy: policy, store: .nonPersistent(), interactive: false)
+        (controller.handoffPatience, controller.handoffLimit) = (patience, limit)
+        var code: Int32?, trace: [[String: String]] = [], shown = false, posted = false
+        controller.finish = { code = $0 }
+        controller.emitTrace = { line in
+            trace.append(line)
+            // From the line after the POST, nothing of the VPN server's is ever visible.
+            defer { if line["verdict"] == "handoff" { posted = true } }
+            if posted, controller.web.alphaValue > 0 || controller.model.phase.showsPage { shown = true }
+        }
+        controller.web.loadHTMLString("<form id=f method=post action='http://127.0.0.1:\(gateway.port)\(acs)?tgname=secret'>"
+            + "<input name=SAMLResponse value=secret-assertion></form><script>setTimeout(()=>f.submit(),400)</script>", baseURL: idp)
+        return Run(controller: controller, gateway: gateway, code: { code }, trace: { trace }, shown: { shown })
+    }
+    func settle(_ one: Run, _ seconds: TimeInterval = 10) {
+        spin(seconds) {
+            if one.code() != nil { return true }
+            if case .failed = one.controller.model.phase { return true }
+            return false
+        }
+    }
+    let hop = "<html><head></head><body>secret page text"
+    let forms: [(String, (String) -> String)] = [
+        ("location.href", { "\(hop)<script>location.href='\($0)'</script>" }),
+        ("location.replace", { "\(hop)<script>location.replace('\($0)')</script>" }),
+        ("a script after a second", { "\(hop)<script>setTimeout(()=>location.assign('\($0)'),900)</script>" }),
+        ("meta refresh", { "<html><head><meta http-equiv=refresh content=\"0;url=\($0)\"></head><body>secret page text" }),
+        ("GET form", { callback in
+            let parts = callback.components(separatedBy: "?return=")
+            return "\(hop)<form id=g method=get action='\(parts[0])'><input name=return value='\(parts[1].removingPercentEncoding!)'></form><script>g.submit()</script>"
+        }),
+        ("iframe", { "\(hop)<iframe src='\($0)'></iframe>" }),
+    ]
+    // The order the first live run points to: ACS, then the closing page, whose script hands over.
+    for (name, page) in forms {
+        let listener = FakeListener()
+        let one = run(listener) { method, path, callback in
+            path == acs ? MockGateway.redirect(closing) : path == closing ? MockGateway.page(page(callback)) : MockGateway.page("")
+        }
+        settle(one)
+        check(one.code() == 0 && listener.seen.count == 1 && listener.seen[0].hasPrefix("GET /api/sso/") && listener.seen[0].contains("?return=https"),
+              "closing page, \(name): delivered once")
+        check(one.controller.events.prefix(2) == ["hide", "deliver"] && !one.shown(), "closing page, \(name): hidden at the callback, page never shown")
+        let seen = one.gateway.seen
+        spin(0.4)
+        check(one.gateway.seen == seen && listener.seen.count == 1, "closing page, \(name): nothing loads afterwards")
+    }
+    // The old order, and the shortest.
+    for (name, reply) in [("ACS page's script", { MockGateway.page("\(hop)<script>location.href='\($0)'</script>") }),
+                          ("ACS redirect", { MockGateway.redirect($0) })] as [(String, (String) -> String)] {
+        let listener = FakeListener()
+        let one = run(listener) { _, path, callback in path == acs ? reply(callback) : MockGateway.page("late") }
+        settle(one)
+        check(one.code() == 0 && listener.seen.count == 1 && !one.shown() && one.gateway.seen == ["POST \(acs)"], "\(name): delivered, no closing page")
+        check(one.controller.events == ["hide", "deliver", "delivered"], "\(name): hidden first")
+    }
+    // Three pages of the gateway's own before the result.
+    let long = FakeListener()
+    let chain = run(long) { _, path, callback in
+        switch path {
+        case acs: return MockGateway.redirect("/+webvpn+/index.html")
+        case "/+webvpn+/index.html": return MockGateway.page("\(hop)<script>setTimeout(()=>location.href='\(closing)',700)</script>")
+        default: return MockGateway.page("\(hop)<script>location.href='\(callback)'</script>")
+        }
+    }
+    settle(chain)
+    check(chain.code() == 0 && !chain.shown() && long.seen.count == 1, "a longer chain is run unseen")
+
+    // Each way to lose it says its own thing, and never shows the gateway's page.
+    let quiet = FakeListener()
+    let closedRun = run(quiet, patience: 0.5) { _, path, _ in path == acs ? MockGateway.redirect(closing) : MockGateway.page("Please close this browser window.") }
+    settle(closedRun)
+    let silentRun = run(quiet, limit: 1) { _, _, _ in MockGateway.page("secret page text") }
+    settle(silentRun)
+    let no = FakeListener(reply: "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+    let refusedRun = run(no) { _, path, callback in path == acs ? MockGateway.redirect(callback) : MockGateway.page("late") }
+    settle(refusedRun)
+    for (one, lost) in [(closedRun, WebController.Lost.closed), (silentRun, .silent), (refusedRun, .refused(404))] {
+        check(one.controller.model.phase == lost.phase && one.code() == nil && !one.controller.hidden && !one.shown()
+              && one.controller.web.alphaValue == 0, "lost (\(lost.name)) shows its own error, not the page")
+        let lines = one.trace().filter { $0["kind"] == "lost" }
+        check(lines.count == 1 && lines[0]["lost"] == lost.name && lines[0]["status"] == (lost.name == "refused" ? "404" : nil),
+              "lost (\(lost.name)) is traced once")
+    }
+    check(Set([WebController.Lost.closed, .silent, .refused(404)].map { "\($0.phase)" }).count == 3, "three different wordings")
+    refusedRun.controller.web.evaluateJavaScript("location.href='http://127.0.0.1:\(refusedRun.gateway.port)\(closing)'")
+    spin(0.6)
+    check(!refusedRun.gateway.seen.contains("GET \(closing)"), "nothing loads after a refused result either")
+    // A result that comes after the error still counts.
+    closedRun.controller.web.evaluateJavaScript("location.href='http://localhost:\(quiet.port)\(callbackQuery)'")
+    settle(closedRun)
+    spin(4) { closedRun.code() != nil }
+    check(closedRun.code() == 0 && quiet.seen.count == 1, "a late result is still delivered")
+
+    // Sent back to the IdP: there is a page to see again.
+    let again = run(FakeListener()) { _, _, _ in MockGateway.page("\(hop)<script>location.href='about:blank'</script>") }
+    spin(6) { again.controller.model.phase == .connecting }
+    again.controller.web.loadHTMLString("log in again", baseURL: idp)
+    spin(6) { again.controller.model.phase == .login }
+    check(again.controller.model.phase == .login && again.controller.web.alphaValue == 1, "back at the IdP, its page shows again")
+
+    // The trace: the chain in order, and nothing private.
+    let traced = chain.trace() + closedRun.trace() + refusedRun.trace()
+    let text = "\(traced)"
+    for secret in ["secret", "AAEAAQ", "return", "tgname", "?", "#", "saml2response", "\(hop)"] {
+        check(!text.lowercased().contains(secret.lowercased()), "trace carries no \(secret.prefix(12))")
+    }
+    let order = chain.trace().filter { $0["kind"] == "nav" }.map { "\($0["verdict"]!) \($0["method"]!) \($0["frame"]!) \($0["path"]!)" }
+    check(order == ["allow GET main /shibboleth-idp/profile/SAML2/Redirect/SSO", "handoff POST main \(acs)", "allow GET main /+webvpn+/index.html",
+                    "finished GET main \(closing)", "callback GET main /api/sso"], "trace is the chain in order: \(order)")
+    check(chain.trace().contains { $0["kind"] == "response" && $0["status"] == "200" && $0["path"] == closing }
+          && chain.trace().contains { $0["kind"] == "redirect" && $0["by"] == "server" }
+          && chain.trace().allSatisfy { Int($0["ms"] ?? "") != nil }
+          && chain.trace().contains { $0["kind"] == "answer" && $0["status"] == "302" }, "trace has statuses, redirects and times")
+    for (raw, origin, path) in [("https://evil.example.com/a?b=c#d", "https://other", "other"), ("https://api-0a1b2c3d.duosecurity.com/frame/v4/secret", "https://duo", "other"),
+                                ("http://localhost:29786/api/sso/TOKEN?return=x", "http://localhost:29786", "/api/sso"), ("javascript:alert(1)", "other://none", "other"),
+                                ("https://v2.ssl.vpn.ucla.edu/+CSCOE+/unknown-token", "https://v2.ssl.vpn.ucla.edu", "other"),
+                                ("https://user:pw@shb.ais.ucla.edu/", "https://shb.ais.ucla.edu", "/")] {
+        let url = URL(string: raw)!
+        check(Redacted.origin(url) == origin && Redacted.path(url) == path, "redacts \(raw): \(Redacted.origin(url)) \(Redacted.path(url))")
+    }
+
+    // What no policy decision ever sees. Printed, not judged: it is WebKit's to change.
+    for (name, script) in [("fetch", "fetch('CB').catch(()=>{})"), ("XHR", "x=new XMLHttpRequest();x.open('GET','CB');x.send()"),
+                           ("img", "new Image().src='CB'"), ("beacon", "navigator.sendBeacon('CB')")] {
+        let listener = FakeListener()
+        let controller = WebController(start: idp, policy: Policy(callbackPort: listener.port), store: .nonPersistent(), interactive: false)
+        var sawCallback = false
+        controller.emitTrace = { if $0["verdict"] == "callback" { sawCallback = true } }
+        controller.web.loadHTMLString("x<script>\(script.replacingOccurrences(of: "CB", with: "http://localhost:\(listener.port)/api/sso/AAAA"))</script>", baseURL: idp)
+        spin(2) { !listener.seen.isEmpty }
+        print("note \(name) to localhost from an https page: \(sawCallback ? "seen by the policy" : "not seen by the policy"), \(listener.seen.isEmpty ? "blocked by WebKit" : "reached the listener")")
+    }
 }
 
 func webSelfTest(_ check: @escaping (Bool, String) -> Void) {
@@ -447,14 +652,7 @@ func webSelfTest(_ check: @escaping (Bool, String) -> Void) {
     spin(12) { late.events.contains("reappear") }
     check(late.model.phase == .ended && lateCode() == nil && !late.hidden, "refused hand-off reappears as cancelled")
 
-    // Cisco's page with no callback first: hidden on sight, back after the wait.
-    let (cisco, ciscoCode) = make(listener)
-    cisco.handoffPatience = 0.5
-    cisco.web.loadHTMLString(page("location.href='https://v2.ssl.vpn.ucla.edu/+CSCOE+/saml_ac_login.html'"), baseURL: base)
-    spin(8) { cisco.hidden }
-    check(cisco.hidden && cisco.web.url?.host != "v2.ssl.vpn.ucla.edu", "hidden on first sight of the Cisco page")
-    spin(3) { !cisco.hidden }
-    check(cisco.model.phase == WebController.lost && ciscoCode() == nil, "returns with an error if no result arrived")
+    gatewaySelfTest(check, callbackQuery: "/api/sso/\(token)\(query)")
 
     // Anything else opens nowhere and says so.
     let (blocked, blockedCode) = make(listener)
@@ -476,7 +674,7 @@ func webSelfTest(_ check: @escaping (Bool, String) -> Void) {
     spin(8) { stuck.model.phase == .login }
     stuck.beginHandoff()
     spin(4) { stuck.model.phase != .connecting }
-    check(stuck.model.phase == WebController.lost && stuckCode() == nil, "a hand-off that goes nowhere ends in the error")
+    check(stuck.model.phase == WebController.Lost.silent.phase && stuckCode() == nil, "a hand-off that goes nowhere ends in the error")
     // Bytes sent, no answer: neither "gone" nor a fresh start, and nothing on screen.
     let mute = FakeListener(reply: "")
     let (unsure, unsureCode) = make(mute)

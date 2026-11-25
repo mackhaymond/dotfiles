@@ -12,7 +12,7 @@
 //           {"do":"done"}; --web shows itself only on {"do":"show"}. EOF closes either.
 //   stdout  JSON lines {"event": ready | approved | signed | unsigned | web} from
 //           the card ("n" ties a signing request to its approval; "why" goes with
-//           web), and prepared | ready | delivered | unknown from --web
+//           web), and prepared | ready | delivered | unknown | trace from --web
 //   exit    0 done, 1 closed by the person, 4 stdin closed, 64 bad input;
 //           anything else means it could not run
 //

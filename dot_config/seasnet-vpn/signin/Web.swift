@@ -4,9 +4,16 @@
 //
 // openconnect (9.21, hpke.c) waits on [::1]:29786 for exactly one
 // GET /api/sso/<token>?return=<page>. UCLA's VPN server sends the signed-in page
-// there; openconnect answers 302 to Cisco's "you can close this" page. This
-// window hides inside the navigation callback for that GET, sends the GET itself
-// without following the redirect, and quits, so the Cisco page is never loaded.
+// there, perhaps by way of its own closing page, whose script then does it; so pages
+// of the VPN server run behind the Connecting panel and are never shown. openconnect
+// answers 302 to Cisco's "you can close this" page. This window hides inside the
+// navigation callback for that GET, sends the GET itself without following the
+// redirect, and quits, so nothing loads after it.
+//
+// The callback is caught as any navigation of any frame: location, replace, meta
+// refresh, a GET form, a server redirect, an iframe. A fetch, XHR, image or beacon
+// to localhost is not a navigation and WebKit offers no way to see one; if the
+// gateway used that, seasnet-vpn would notice openconnect moving on instead.
 //
 // Nothing here logs URLs, injects script, or bridges to the page.
 import Cocoa
@@ -21,7 +28,7 @@ struct Policy {
     enum Verdict: Equatable {
         case allow
         case callback            // openconnect's listener: hide and deliver
-        case finished            // Cisco's closing page: hide, never load
+        case finished            // Cisco's closing page: run it, never show it
         case handoff             // the VPN server is taking the signed-in response
         case block(String)
     }
@@ -35,8 +42,25 @@ struct Policy {
 
     static func isVPN(_ host: String) -> Bool { host == "vpn.ucla.edu" || host.hasSuffix(".vpn.ucla.edu") }
 
+    #if TESTING
+    /// A plain-http gateway on 127.0.0.1 that stands for the VPN server.
+    var mockGateway: Int?
+    #endif
+
+    /// The URL as the policy sees it; only test builds ever change it.
+    func seen(_ url: URL?) -> URL? {
+        #if TESTING
+        if let url, let mockGateway, url.host == "127.0.0.1", url.port == mockGateway,
+           var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            (parts.scheme, parts.host, parts.port) = ("https", "v2.ssl.vpn.ucla.edu", nil)
+            return parts.url
+        }
+        #endif
+        return url
+    }
+
     func verdict(_ url: URL?, method: String = "GET", mainFrame: Bool = true) -> Verdict {
-        guard let url, let scheme = url.scheme?.lowercased() else { return .block("That link") }
+        guard let url = seen(url), let scheme = url.scheme?.lowercased() else { return .block("That link") }
         if scheme == "about" {
             return ["about:blank", "about:srcdoc"].contains(url.absoluteString) ? .allow : .block("That link")
         }
@@ -57,6 +81,31 @@ struct Policy {
             if path.hasPrefix("/+CSCOE+/saml/sp/acs") { return .handoff }
         }
         return .allow
+    }
+}
+
+/// What a trace line may say about a URL: never a query, a fragment or an unknown path.
+enum Redacted {
+    static let paths: Set<String> = [
+        "/", "/+CSCOE+/saml/sp/login", "/+CSCOE+/saml/sp/acs", "/+CSCOE+/saml_ac_login.html", "/+CSCOE+/message.html",
+        "/+CSCOE+/logon.html", "/+CSCOE+/portal.html", "/+CSCOE+/blank.html", "/+webvpn+/index.html",
+        "/shibboleth-idp/profile/SAML2/Redirect/SSO", "/shibboleth-idp/profile/SAML2/POST/SSO",
+        "/frame/frameless/v4/auth", "/frame/v4/auth/prompt", "/frame/v4/auth/prompt/data", "/frame/v4/preauth/healthcheck",
+        "/frame/v4/exit",
+    ]
+
+    static func origin(_ url: URL) -> String {
+        let scheme = url.scheme?.lowercased() ?? "", host = url.host?.lowercased() ?? ""
+        let named = scheme == "https" || scheme == "http" ? scheme : scheme == "about" ? "about" : "other"
+        let place = Policy.isDuo(host) ? "duo" : Policy.isUCLA(host) || ["localhost", "127.0.0.1", "::1", "[::1]"].contains(host)
+            ? host + (url.port == 29786 ? ":29786" : url.port == nil || url.port == 443 ? "" : ":other")
+            : host.isEmpty ? "none" : "other"
+        return "\(named)://\(place)"
+    }
+
+    static func path(_ url: URL) -> String {
+        if url.path.hasPrefix("/api/sso/") { return "/api/sso" }
+        return paths.contains(url.path) ? url.path : "other"
     }
 }
 
@@ -371,12 +420,14 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
     let window: EscapeWindow
     let web: WKWebView
     let interactive: Bool
-    /// How long a hand-off may stay out of sight before the window comes back.
+    /// How long the closing page may take, once loaded, to send its result on.
     var handoffPatience: TimeInterval = 8
     /// How long the VPN server may take over the signed-in response.
     var handoffLimit: TimeInterval = 20
     /// Called once with the exit code; the window is already hidden.
     var finish: (Int32) -> Void = { exit($0) }
+    /// Redacted steps of the sign-in, for seasnet-vpn's trace file.
+    var emitTrace: ([String: String]) -> Void = { _ in }
     /// The GET may or may not have arrived; the window stays hidden meanwhile.
     var unknown: () -> Void = {}
     /// Self-test trace.
@@ -385,6 +436,11 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
     private(set) var hidden = false
     private(set) var over = false
     private var delivering = false
+    /// The result was sent on: from here nothing loads until a Retry.
+    private var called = false
+    /// The VPN server has the signed-in response; its pages run unseen.
+    private var handoff = false
+    private let began = Date()
     private var pageShown = false
     private var patience: Timer?
     private var noticeTimer: Timer?
@@ -484,7 +540,8 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
     func load() {
         guard !over, !delivering else { return }
         patience?.invalidate()
-        pageShown = false
+        (called, handoff, pageShown) = (false, false, false)
+        trace("load", start)
         setPhase(.opening)
         model.notice = nil
         web.load(URLRequest(url: start, timeoutInterval: 30))
@@ -543,18 +600,20 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
     }
 
     private func phase(for url: URL?) -> WebPhase? {
-        guard let host = url?.host?.lowercased() else { return nil }
+        guard let host = policy.seen(url)?.host?.lowercased() else { return nil }
         if Policy.isDuo(host) { return .duo }
         guard Policy.isUCLA(host) else { return nil }
-        if case .handoff = policy.verdict(url) { return .connecting }
-        return .login
+        switch policy.verdict(url) {
+        case .handoff, .finished: return .connecting
+        default: return .login
+        }
     }
 
     private func showPage() {
-        guard !over, !hidden, let phase = phase(for: web.url), phase.showsPage else { return }
+        guard !over, !hidden, !handoff, !called, let phase = phase(for: web.url), phase.showsPage else { return }
         showTimer?.invalidate()
         setPhase(phase)
-        model.host = web.url?.host?.lowercased() ?? ""
+        model.host = policy.seen(web.url)?.host?.lowercased() ?? ""
         if !pageShown {
             pageShown = true
             if interactive { window.makeFirstResponder(web) }
@@ -580,21 +639,64 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
                          detail: "It led to \(what), which this window doesn’t open.\nRetry to start the sign-in over."))
     }
 
-    /// The VPN server has the signed-in response; its next step should come at once.
+    /// The VPN server has the signed-in response; the callback should come at once.
     func beginHandoff() {
+        showTimer?.invalidate()
         setPhase(.connecting)
-        wait(handoffLimit, then: WebController.lost)
+        guard !handoff else { return }
+        handoff = true
+        wait(handoffLimit, then: .silent)
     }
 
-    private func wait(_ seconds: TimeInterval, then phase: WebPhase) {
-        patience?.invalidate()
-        patience = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
-            self?.reappear(phase)
+    enum Lost: Equatable {
+        case refused(Int), silent, closed
+
+        var name: String {
+            switch self {
+            case .refused: return "refused"
+            case .silent: return "silent"
+            case .closed: return "closed"
+            }
+        }
+        var phase: WebPhase {
+            switch self {
+            case .refused(let status):
+                return .failed(title: "The VPN refused the sign-in",
+                               detail: "It answered UCLA’s result with \(status).\nTry signing in again.")
+            case .silent:
+                return .failed(title: "UCLA’s VPN server went quiet",
+                               detail: "It took the sign-in but never sent a result.\nTry signing in again.")
+            case .closed:
+                return .failed(title: "UCLA finished without a result",
+                               detail: "Its closing page came up, but sent nothing to the VPN.\nTry signing in again.")
+            }
         }
     }
 
-    static let lost = WebPhase.failed(title: "The sign-in didn’t reach the VPN",
-                                   detail: "UCLA accepted it, but the VPN never got the result.\nTry signing in again.")
+    private func lose(_ lost: Lost) {
+        guard !over else { return }
+        var more = ["lost": lost.name]
+        if case .refused(let status) = lost { more["status"] = String(status) }
+        trace("lost", nil, more)
+        web.stopLoading()
+        reappear(lost.phase)
+    }
+
+    private func wait(_ seconds: TimeInterval, then lost: Lost) {
+        patience?.invalidate()
+        patience = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in self?.lose(lost) }
+    }
+
+    private func trace(_ kind: String, _ url: URL?, _ more: [String: String] = [:]) {
+        var line = more
+        line["kind"] = kind
+        line["ms"] = String(Int(Date().timeIntervalSince(began) * 1000))
+        if let url = policy.seen(url) {
+            line["origin"] = Redacted.origin(url)
+            line["path"] = Redacted.path(url)
+        }
+        emitTrace(line)
+    }
 
     // MARK: hand-off
 
@@ -602,24 +704,30 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
     /// follows its redirect and the window can already be gone.
     private func deliver(_ url: URL) {
         guard !delivering, !over else { return }
-        delivering = true
+        (delivering, called) = (true, true)
         patience?.invalidate()
+        showTimer?.invalidate()
         setPhase(.connecting)
         events.append("deliver")
+        web.stopLoading()
         let port = policy.callbackPort
         Thread.detachNewThread { [weak self] in
             let outcome = Callback.send(url, port: port)
             DispatchQueue.main.async {
                 guard let self, !self.over else { return }
                 switch outcome {
-                case .delivered:
+                case .delivered(let status):
                     self.events.append("delivered")
+                    self.trace("answer", nil, ["status": String(status)])
                     self.end(0)
                 case .unknown:
                     self.events.append("unknown")
+                    self.trace("answer", nil, ["lost": "unknown"])
                     self.unknown()
-                case .refused: self.reappear(WebController.lost)
-                case .gone: self.reappear(.ended)
+                case .refused(let status): self.lose(.refused(status))
+                case .gone:
+                    self.trace("lost", nil, ["lost": "gone"])
+                    self.reappear(.ended)
                 }
             }
         }
@@ -629,28 +737,38 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                  decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
-        guard !over, !delivering, !action.shouldPerformDownload else { decisionHandler(.cancel); return }
+        let url = action.request.url, method = action.request.httpMethod ?? "GET"
         let mainFrame = action.targetFrame?.isMainFrame ?? false
+        let verdict = policy.verdict(url, method: method, mainFrame: mainFrame)
+        let closed = over || called || action.shouldPerformDownload
+        trace("nav", url, ["verdict": closed ? "closed" : verdict.name, "method": ["GET", "POST"].contains(method) ? method : "other",
+                           "frame": action.targetFrame == nil ? "new" : mainFrame ? "main" : "sub",
+                           "by": action.navigationType.name])
+        guard !closed else { decisionHandler(.cancel); return }
+        if verdict == .callback {  // Whatever frame, or none: this is the result.
+            hide()
+            decisionHandler(.cancel)
+            deliver(url!)
+            return
+        }
         guard action.targetFrame != nil else {  // A new window or tab.
-            notice(action.request.url?.host ?? "A pop-up")
+            notice(url?.host ?? "A pop-up")
             decisionHandler(.cancel)
             return
         }
-        switch policy.verdict(action.request.url, method: action.request.httpMethod ?? "GET", mainFrame: mainFrame) {
+        switch verdict {
         case .allow:
+            if mainFrame, handoff, let host = policy.seen(url)?.host?.lowercased(), !Policy.isVPN(host) {
+                // Back to UCLA or Duo: there is a page to see again.
+                handoff = false
+                patience?.invalidate()
+            }
             decisionHandler(.allow)
-        case .handoff:
+        case .handoff, .finished:
             beginHandoff()
             decisionHandler(.allow)
         case .callback:
-            hide()
             decisionHandler(.cancel)
-            deliver(action.request.url!)
-        case .finished:
-            hide()
-            decisionHandler(.cancel)
-            setPhase(.connecting)
-            wait(handoffPatience, then: WebController.lost)
         case .block(let what):
             decisionHandler(.cancel)
             if mainFrame { blocked(what) }
@@ -659,6 +777,9 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
 
     func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse,
                  decisionHandler: @escaping @MainActor (WKNavigationResponsePolicy) -> Void) {
+        let status = (response.response as? HTTPURLResponse)?.statusCode
+        trace("response", response.response.url, ["frame": response.isForMainFrame ? "main" : "sub", "status": status.map(String.init) ?? "none"])
+        guard !called else { decisionHandler(.cancel); return }
         decisionHandler(response.canShowMIMEType ? .allow : .cancel)
         if !response.canShowMIMEType, response.isForMainFrame { blocked("a download") }
     }
@@ -667,8 +788,12 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
         if !pageShown { showTimer?.invalidate() }  // Only passing through; keep the opening panel.
     }
 
+    func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
+        trace("redirect", webView.url, ["by": "server"])
+    }
+
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        guard !over, !hidden else { return }
+        guard !over, !hidden, !handoff else { return }
         pageShown ? showPage() : show(after: 1.5)
     }
 
@@ -680,20 +805,15 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard !over, !hidden else { return }
-        guard phase(for: web.url) == .connecting else {
-            let relay = Policy.isVPN(web.url?.host?.lowercased() ?? "")
+        trace("loaded", web.url)
+        guard !over, !hidden, !called else { return }
+        guard handoff else {
+            let relay = Policy.isVPN(policy.seen(web.url)?.host?.lowercased() ?? "")
             pageShown ? showPage() : show(after: relay ? 1.5 : 0.15)
             return
         }
-        // The VPN server's page should move on by itself at once. If it is an
-        // error page instead, let it be read.
-        patience?.invalidate()
-        patience = Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { [weak self] _ in
-            guard let self, !self.over, !self.hidden else { return }
-            self.setPhase(.login)
-            self.model.host = self.web.url?.host?.lowercased() ?? ""
-        }
+        // Still unseen. The closing page is the last stop, so it gets less time.
+        if policy.verdict(web.url) == .finished { wait(handoffPatience, then: .closed) }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -706,10 +826,12 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
 
     private func failed(_ error: Error) {
         let error = error as NSError
+        trace("failed", nil, ["status": String(error.code)])
         // A redirect, a retry or our own policy cancelled the old load.
         if error.domain == NSURLErrorDomain && error.code == NSURLErrorCancelled { return }
         if error.domain == "WebKitErrorDomain" && error.code == 102 { return }
-        guard !over, !hidden else { return }
+        guard !over, !hidden, !called else { return }
+        patience?.invalidate()
         let detail: String
         switch error.code {
         case NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost:
@@ -728,7 +850,8 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        guard !over, !hidden else { return }
+        guard !over, !hidden, !called else { return }
+        patience?.invalidate()
         setPhase(.failed(title: "The sign-in page stopped", detail: "Its web process quit.\nRetry to start the sign-in over."))
     }
 
@@ -748,14 +871,14 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
 /// The GET openconnect waits for, on a plain socket to [::1]: URLSession would send
 /// it again by itself when the answer goes missing.
 enum Callback {
-    case delivered, refused
+    case delivered(Int), refused(Int)
     case gone       // Nobody was listening; nothing was sent.
     case unknown    // Sent, perhaps, and not answered. seasnet-vpn finds out.
 
     static func send(_ url: URL, port: Int) -> Callback {
-        guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return .refused }
+        guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return .refused(0) }
         let target = parts.percentEncodedPath + (parts.percentEncodedQuery.map { "?" + $0 } ?? "")
-        guard target.utf8.count < 4000, target.utf8.allSatisfy({ $0 > 32 && $0 < 127 }) else { return .refused }
+        guard target.utf8.count < 4000, target.utf8.allSatisfy({ $0 > 32 && $0 < 127 }) else { return .refused(0) }
         let fd = socket(AF_INET6, SOCK_STREAM, 0)
         guard fd >= 0 else { return .gone }
         defer { close(fd) }
@@ -786,9 +909,37 @@ enum Callback {
             guard count > 0 else { return .unknown }
             answer.append(contentsOf: buffer[0..<count])
         }
-        let status = String(decoding: answer.prefix(13), as: UTF8.self)
-        guard status.hasPrefix("HTTP/1.") else { return .unknown }
-        return status.hasSuffix(" 302 ") || status.hasSuffix(" 200 ") ? .delivered : .refused
+        let words = String(decoding: answer, as: UTF8.self).split(separator: "\r\n")[0].split(separator: " ")
+        guard let version = words.first, version.hasPrefix("HTTP/1."), words.count > 1, let status = Int(words[1]),
+              (100..<600).contains(status) else { return .unknown }
+        return status == 302 || status == 200 ? .delivered(status) : .refused(status)
+    }
+}
+
+extension Policy.Verdict {
+    var name: String {
+        switch self {
+        case .allow: return "allow"
+        case .callback: return "callback"
+        case .finished: return "finished"
+        case .handoff: return "handoff"
+        case .block: return "block"
+        }
+    }
+}
+
+extension WKNavigationType {
+    /// Script, meta refresh and server redirects are all "other" to WebKit; a server
+    /// redirect also leaves a "redirect" line.
+    var name: String {
+        switch self {
+        case .linkActivated: return "link"
+        case .formSubmitted: return "form"
+        case .formResubmitted: return "form"
+        case .backForward: return "history"
+        case .reload: return "reload"
+        default: return "other"
+        }
     }
 }
 
@@ -852,6 +1003,7 @@ func runWeb() -> Never {
     // with nobody there, and a person completes every login.
     let controller = WebController(start: url, store: .nonPersistent(), interactive: true)
     controller.model.reason = String((request["reason"] as? String ?? "").prefix(90))
+    controller.emitTrace = { writeLine(["event": "trace"].merging($0) { mine, _ in mine }) }
     controller.unknown = { writeLine(["event": "unknown"]) }
     controller.finish = { code in
         if code == 0 { writeLine(["event": "delivered"]) }
