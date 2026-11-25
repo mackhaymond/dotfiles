@@ -175,6 +175,8 @@ they name a space, shell, agent, letter, parked tab or NEEDS YOU.
   = 1, not tmux window 2; find "shell e" with the skill's recipe);
   `read_pane` to see what it is doing, `message_agent` to tell it. Never
   send_keys into an agent's pane.
+- **External subagents** (a child agent of any harness in its own tab):
+  load the `agent-spawn` skill, also when you are one (`[task from @…]`).
 - Don't close, kill, park, move or rename tabs or spaces you don't own.
   User-facing messages go through `~/.config/tmux/scripts/notify.sh`, never
   `tmux display-message`. Test tmux only on a private `-L` server
@@ -201,8 +203,8 @@ they name a space, shell, agent, letter, parked tab or NEEDS YOU.
   closing text for questions. Don't run it for optional offers ("want me
   to also…?") or status updates, or for a turn that ends with nothing
   still out (that finish already notifies him). Main agent only: a
-  subagent or workflow agent never runs it; it reports to its
-  orchestrator, which decides.
+  subagent or workflow agent (a tab child counts as a subagent) never runs
+  it; it reports to its orchestrator, which decides.
 
 ## Referencing other agents and panes (`tmux` MCP server)
 
@@ -269,6 +271,8 @@ is the orchestrator, not the typist:
   Mark which units are independent (dispatch those together in one message)
   and which wait on others. Parallel implementers must own disjoint files or
   run with `isolation: "worktree"`, and each uses its own named pty.
+  A unit that needs another harness, or its own tab Mack can watch, can go
+  to a tab subagent instead (the `agent-spawn` skill).
 - **The main agent coordinates.** Dispatch units, read the diffs that come
   back, integrate, resolve conflicts, keep the user posted. Don't take over
   the bulk edits yourself; if a result is wrong, send it back to that agent

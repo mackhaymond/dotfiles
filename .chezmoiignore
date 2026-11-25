@@ -89,6 +89,13 @@ code/various_scripts/.DS_Store
 !.copilot
 !.copilot/hooks
 !.copilot/hooks/tmux-agent.json
+# The shared agent-spawn skill (a link into ~/.agents/skills; the other
+# skills there are Copilot's own).
+!.copilot/skills
+!.copilot/skills/agent-spawn
+# The user MCP servers: the tmux MCP over stdio (private_dot_copilot/
+# mcp-config.json.tmpl says why not HTTP).
+!.copilot/mcp-config.json
 .opencode/**
 .config/opencode/node_modules/**
 .config/opencode/cache/**

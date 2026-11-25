@@ -1,6 +1,6 @@
 ---
 name: tmux-workspace
-description: How Mack's tmux workspace is organized (spaces, homes, shells, agents, the letters agents and shells share, the sidebar, parking/stash, NEEDS YOU) and how to find and reach any pane in it. Load whenever the user says things like "agent D", "shell E", "tell S to…", "ask the sidebar agent", "shell 2 in cua-notch", "the home shell", "space 3", "⌘3/⌥W e", "park it", "unpark", "it's in needs-you", "the sidebar", or asks you to message, check on, find, or read another agent, tab, or pane, or to say which key to press.
+description: How Mack's tmux workspace is organized (spaces, homes, shells, agents, the letters agents and shells share, the sidebar, parking/stash, NEEDS YOU) and how to find and reach any pane in it. Load whenever the user says things like "agent D", "shell E", "tell S to…", "ask the sidebar agent", "shell 2 in cua-notch", "the home shell", "space 3", "⌘3/⌥W e", "park it", "unpark", "it's in needs-you", "the sidebar", "D's kids", "the child tab", or asks you to message, check on, find, or read another agent, tab, or pane, or to say which key to press.
 ---
 
 # Mack's tmux workspace
@@ -180,6 +180,7 @@ parked. It has no letter, isn't messageable, and isn't listed by
 | "close the space" | prefix Q (y/n; every tab goes through closed-tabs, ⌘Z reopens) | never main, never hidden ones |
 | "this space" / "all spaces" (sidebar) | the scope, ⌥V | `tmux show -gv @strip_scope` |
 | "the menu" | the agent menu: prefix q | |
+| "child", "kid", "D's kids", "the ↳ tabs", "subagent tab" | an external subagent: an agent tab another agent started with `agent-spawn` (any harness). Its window has `@agent_child` = its IMMEDIATE parent's window id (`@agent_parent` is the raw link), `@agent_spawn_id`, `@agent_spawn_task` (its title). It has NO letter and no tab in the tab bar (the parent's tab shows `↳3`); the sidebar folds a family into the parent card's chip `↳ 3 · 2 working`. Mack reaches one by clicking that chip (a row per child), in the prefix q / ⌥W menu (nested under the parent; arrows + Enter), or from the parent's NEEDS YOU card (a child's prompt shows there, titled with the parent). Never NEEDS YOU of its own. `↳ (parent gone)` = an orphan (`@agent_kid_orphan`) | recipe **children of agent D**; tmux MCP `list_panes` nests them under the parent (`- ↳ @handle — codex · running · <task> · s-… · main:4.1`; no `[k]`, children have no key), and a parent's own `list_subagents` lists its children. Address one by its pane id (`"%214"`), never a letter. Spawning one: the `agent-spawn` skill |
 | "the dashboard" | the top pane of a home window | |
 
 ## Recipes (read-only; tested on the live server 2026-10-16, the shell-letter forms of **map** and **letter** written 2026-10-19 from the config, not yet run live)
@@ -228,6 +229,21 @@ S=cua-notch N=1; tmux list-windows -t "=$S" -F '#{window_index} #{window_id} #{p
 ```
 
 **ordinal**: agent N of space S: same as **shell N**, with `$4=="a"`.
+
+**children of agent D** (its external subagents, grandchildren indented;
+fields: parent window, window, pane, harness, state, spawn id, result
+`ready`/`read`, task; prints nothing when it has none):
+
+```sh
+L=d; W=$(tmux list-windows -a -F '#{@space_hidden}|#{@agent_key}|#{window_id}|#{@agent_state}' | awk -F'|' -v l="$L" '$1=="" && $2==l && $4!="" {print $3; exit}')
+tmux list-windows -a -F '#{@agent_child}|#{window_id}|#{pane_id}|#{@agent_harness}#{?#{@agent_harness},,#{@agent_kind}}|#{@agent_state}|#{@agent_spawn_id}|#{@agent_spawn_result}|#{@agent_spawn_task}' |
+  awk -F'|' -v w="$W" '{p[NR]=$1; id[NR]=$2; r[NR]=$0} END {for (i=1;i<=NR;i++) if (p[i]==w) {print "↳ " r[i]; for (j=1;j<=NR;j++) if (p[j]==id[i]) print "  ↳ " r[j]}}'
+# → ↳ @16|@97|%214|codex|running|s-mf3k2a7x||Review parser diff
+```
+
+The parent's own counts: `#{@agent_kids}` / `#{@agent_kids_sub}` (`"<total> <busy>"`).
+The durable record of every spawn, tab open or closed: `agent-spawn list
+--all` (registry `~/.local/state/agent-spawn/<id>/`).
 
 **space**: space N → session: `tmux list-sessions -F '#{@space_index} #{session_name} #{session_path}' | awk -v n=3 '$1==n'`
 → `3 schedule /Users/mackhaymond/math_econ_sched`

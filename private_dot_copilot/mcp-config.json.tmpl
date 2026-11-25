@@ -1,0 +1,50 @@
+{{- /*
+GitHub Copilot CLI: ~/.copilot/mcp-config.json, the user-scope MCP servers.
+
+tmux: the tmux MCP server (spawn_subagent, wait_subagents, list_panes,
+message_agent, ...; see ~/code/tmux-mcp/README.md). Wired here for the
+external-subagents feature (plan U9).
+
+Why stdio and not the shared HTTP server on 127.0.0.1:7998:
+  The HTTP server wants `Authorization: Bearer <token>`, with the token in
+  ~/.local/state/tmux-mcp/token. Copilot (checked on 1.0.114) can only send
+  static `headers` from this file, with ${VAR} expansion from its own
+  environment. It has no token-file or headers-helper option for MCP (the
+  dynamic headers in its SDK belong to embedding hosts, not this file), and
+  no shell exports the token. Writing the header here would inline the
+  secret, which this repo never does. So Copilot runs its own copy of the same
+  server over stdio (`server.ts --stdio`, the transport the test suite
+  uses). A local child process needs no token. Same tools; the caller's tab
+  comes from TMUX_PANE when Copilot passes its env on, otherwise from process
+  ancestry (Copilot -> bun).
+  Cost: one bun process per Copilot session, idle between calls.
+
+env: PATH and TMUX_MCP_HIDE_SESSIONS match the LaunchAgent
+(com.mackhaymond.tmux-mcp), so tmux and agent-spawn resolve the same way.
+timeout: wait_subagents blocks up to 540 s, so allow 600 s per call.
+
+Managed by chezmoi (the .chezmoiignore exception `!.copilot/mcp-config.json`).
+`copilot mcp add` also writes to this file, so add any other server here,
+or `chezmoi apply` will drop it.
+Without MCP, Copilot still has the CLI: `agent-spawn` and
+~/.agents/skills/tmux-workspace/scripts/tmux-mcp-call.py.
+*/ -}}
+{
+  "mcpServers": {
+    "tmux": {
+      "type": "local",
+      "command": {{ joinPath .chezmoi.homeDir ".bun/bin/bun" | toJson }},
+      "args": [
+        {{ joinPath .chezmoi.homeDir "code/tmux-mcp/src/server.ts" | toJson }},
+        "--stdio"
+      ],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "TMUX_MCP_HIDE_SESSIONS": "agents,stash,scratch,tasks",
+        "LANG": "en_US.UTF-8"
+      },
+      "tools": ["*"],
+      "timeout": 600000
+    }
+  }
+}

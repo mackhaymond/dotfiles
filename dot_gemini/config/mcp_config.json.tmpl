@@ -1,0 +1,46 @@
+{{- /*
+agy (Antigravity CLI): ~/.gemini/config/mcp_config.json, the global MCP servers
+(see the "MCP Servers (mcp_config.json)" doc embedded in agy; checked on 1.5.12).
+
+tmux: the tmux MCP server (spawn_subagent, wait_subagents, list_panes,
+message_agent, ...; see ~/code/tmux-mcp/README.md). Wired here for the
+external-subagents feature (plan U9).
+
+Why stdio and not the shared HTTP server on 127.0.0.1:7998:
+  The HTTP server wants `Authorization: Bearer <token>`, with the token in
+  ~/.local/state/tmux-mcp/token. agy supports a `url` with static `headers`
+  only. Its MCP configs do NOT expand environment variables, and it has no
+  token-file or headers-helper option, so the only HTTP form would inline the
+  secret, which this repo never does. agy runs its own copy of the same server
+  over stdio instead (`server.ts --stdio`, the transport the test suite
+  uses). A local child process needs no token. Same tools; the caller's tab
+  comes from TMUX_PANE when agy passes its env on, otherwise from process
+  ancestry (agy -> bun).
+  Cost: one bun process per agy session, idle between calls.
+
+env: PATH and TMUX_MCP_HIDE_SESSIONS match the LaunchAgent
+(com.mackhaymond.tmux-mcp), so tmux and agent-spawn resolve the same way.
+No per-call timeout key is documented for agy. Keep wait_subagents calls at
+the default 45 s timeout_s and call again.
+
+Managed by chezmoi: `agy mcp add` writes here too, so add any other server
+in this template, or `chezmoi apply` will drop it.
+Without MCP, agy still has the CLI: `agent-spawn` and
+~/.agents/skills/tmux-workspace/scripts/tmux-mcp-call.py.
+*/ -}}
+{
+  "mcpServers": {
+    "tmux": {
+      "command": {{ joinPath .chezmoi.homeDir ".bun/bin/bun" | toJson }},
+      "args": [
+        {{ joinPath .chezmoi.homeDir "code/tmux-mcp/src/server.ts" | toJson }},
+        "--stdio"
+      ],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "TMUX_MCP_HIDE_SESSIONS": "agents,stash,scratch,tasks",
+        "LANG": "en_US.UTF-8"
+      }
+    }
+  }
+}

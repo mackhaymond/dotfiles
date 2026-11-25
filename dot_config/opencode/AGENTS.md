@@ -133,6 +133,14 @@ agent, letter, parked tab or NEEDS YOU.
   `python3 ~/.agents/skills/tmux-workspace/scripts/tmux-mcp-call.py
   read_pane '{"pane": "d"}'` (also `list_panes`, `message_agent`). Read-only
   `tmux list-windows -a -F …` always works. Never type into an agent's pane.
+- **External subagents**: any agent can start a child agent of any harness
+  (claude, codex, opencode, grok, copilot, agy, abby) in its own background
+  tab, with `tmux_spawn_subagent` / `tmux_wait_subagents` /
+  `tmux_subagent_result` or the `agent-spawn` CLI. Load the `agent-spawn`
+  skill (`~/.agents/skills/agent-spawn/SKILL.md`) before you do, and also
+  when your prompt starts `[task from @… · agent-spawn s-…]`: you are a
+  child, so your final reply is your report, you never ask Mack, and you
+  don't commit unless the brief says so.
 - Don't close, kill, park, move or rename tabs or spaces you don't own.
   User-facing messages go through `~/.config/tmux/scripts/notify.sh`, never
   `tmux display-message`. Test tmux only on a private `-L` server

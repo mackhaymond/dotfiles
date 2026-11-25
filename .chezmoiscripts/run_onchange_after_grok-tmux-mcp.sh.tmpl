@@ -1,0 +1,119 @@
+#!/bin/bash
+# Grok CLI: register the tmux MCP server (spawn_subagent, wait_subagents,
+# list_panes, message_agent, ...; ~/code/tmux-mcp/README.md) in
+# ~/.grok/config.toml. Part of the external-subagents feature (plan U9).
+#
+# Grok reaches the shared HTTP server on 127.0.0.1:7998 with
+# `bearer_token_file`, which Grok re-reads on every request (docs:
+# ~/.grok/docs/user-guide/07-mcp-servers.md, "bearer_token_file"). The token
+# stays in ~/.local/state/tmux-mcp/token and is never written to config.toml or
+# to this repo.
+#
+# Why this edits config.toml instead of running `grok mcp add`: `grok mcp add`
+# (checked on 1.0.92) can set only --header and --env, so the only way to auth
+# through it is to write the token into the header verbatim. Grok owns the
+# rest of config.toml (and rewrites it), so chezmoi can't manage the whole file.
+# This script appends one table and leaves the rest alone:
+#
+#   [mcp_servers.tmux]
+#   url = "http://127.0.0.1:7998/mcp"
+#   bearer_token_file = "~/.local/state/tmux-mcp/token"
+#
+# Idempotent: if a tmux server is already configured (by this script or by
+# hand), it is left as it is. To re-wire it, `grok mcp remove tmux` and run this
+# again. It never fails `chezmoi apply`: every problem is a note and exit 0.
+# The edit is atomic (temp file + rename). The result must parse as TOML when a
+# python3 with tomllib is around; if it doesn't, the original stays.
+#
+# Unverified (no Grok session was started): whether a call over Grok's
+# daemon/leader route resolves the caller's tab. The server finds the caller by
+# process ancestry, and a daemon is no descendant of the pane. Without MCP, Grok
+# still has the CLI: `agent-spawn` and
+# ~/.agents/skills/tmux-workspace/scripts/tmux-mcp-call.py.
+#
+# By hand (same thing):
+#   chezmoi execute-template < ~/.local/share/chezmoi/.chezmoiscripts/run_onchange_after_grok-tmux-mcp.sh.tmpl | bash
+set -u
+# chezmoi re-runs this script only when its rendered text changes; the next
+# line changes when Grok appears, so a later install still gets wired.
+# grok-present: {{ if stat (joinPath .chezmoi.homeDir ".grok") }}yes{{ else }}no{{ end }}
+
+GROK_DIR={{ joinPath .chezmoi.homeDir ".grok" | quote }}
+CONF="$GROK_DIR/config.toml"
+note() { echo "[grok-tmux-mcp] $*"; }
+
+if [ ! -d "$GROK_DIR" ]; then
+  note "no $GROK_DIR (Grok not installed); skipping"
+  exit 0
+fi
+
+# Present already? Ask TOML (python3 with tomllib, 3.11+) when we can; fall
+# back to the table header otherwise.
+PY=""
+for c in python3 /opt/homebrew/bin/python3 /usr/bin/python3; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import tomllib' >/dev/null 2>&1; then
+    PY=$c
+    break
+  fi
+done
+
+if [ -f "$CONF" ]; then
+  if [ -n "$PY" ]; then
+    state=$("$PY" - "$CONF" <<'EOF' 2>/dev/null
+import sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as f:
+        d = tomllib.load(f)
+except Exception:
+    print("unparseable"); sys.exit()
+print("present" if "tmux" in (d.get("mcp_servers") or {}) else "absent")
+EOF
+)
+  else
+    # Without tomllib we can't tell an inline `tmux = {...}` entry from a
+    # missing one, nor check the result, so an append could duplicate a key.
+    note "no python3 with tomllib; not editing $CONF (run by hand later)"
+    exit 0
+  fi
+  case "$state" in
+    present) note "tmux MCP already in $CONF; leaving it"; exit 0 ;;
+    unparseable) note "$CONF does not parse as TOML; not touching it"; exit 0 ;;
+    absent) ;;
+    *) note "could not read $CONF; skipping"; exit 0 ;;
+  esac
+fi
+
+tmp=$(mktemp "$GROK_DIR/.config.toml.tmux-mcp.XXXXXX") || { note "mktemp failed; skipping"; exit 0; }
+{
+  if [ -f "$CONF" ]; then
+    cat "$CONF"
+    # Start the new table on its own line, after a blank one.
+    [ -n "$(tail -c1 "$CONF")" ] && echo
+    echo
+  fi
+  cat <<'EOF'
+# tmux MCP (external subagents). Token read per request from the file below;
+# written by chezmoi's run_onchange_after_grok-tmux-mcp.sh. Remove with
+# `grok mcp remove tmux`.
+[mcp_servers.tmux]
+url = "http://127.0.0.1:7998/mcp"
+bearer_token_file = "~/.local/state/tmux-mcp/token"
+EOF
+} >"$tmp" || { rm -f "$tmp"; note "write failed; skipping"; exit 0; }
+
+if [ -n "$PY" ]; then
+  if ! "$PY" -c 'import sys, tomllib; d = tomllib.load(open(sys.argv[1], "rb")); assert d["mcp_servers"]["tmux"]["bearer_token_file"]' "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    note "the edited config did not parse; $CONF left as it was"
+    exit 0
+  fi
+fi
+
+[ -f "$CONF" ] && chmod "$(stat -f '%Lp' "$CONF" 2>/dev/null || echo 644)" "$tmp" 2>/dev/null
+if mv -f "$tmp" "$CONF"; then
+  note "added [mcp_servers.tmux] (bearer_token_file) to $CONF"
+else
+  rm -f "$tmp"
+  note "could not replace $CONF; skipping"
+fi
+exit 0

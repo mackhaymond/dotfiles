@@ -34,8 +34,9 @@ Key: keychain item "abliteration-api-key":
   security add-generic-password -U -a "$USER" -s abliteration-api-key -w
 One-off model: abby --model abliterated-model
 
-Orchestrator by default (see ORCHESTRATOR): abby briefs real Claude agents
-in new tabs (abby-delegate) and does only the smallest edits itself.
+Orchestrator by default (see ORCHESTRATOR): abby briefs real agents (Claude
+by default, any harness) in child tabs (agent-spawn) and does only the
+smallest edits itself.
 `abby --solo` launches it as a hands-on coder instead.
 """
 import copy
@@ -145,18 +146,20 @@ TINT_OFF = (f'[ -n "$TMUX_PANE" ] && {_tmux} set -pu -t "$TMUX_PANE" window-styl
 STOP_NUDGE = os.path.join(HOME, ".local", "bin", "abby-stop-nudge")
 
 # Orchestrator mode (the default since 2026-11-17; `abby --solo` turns it
-# off for one launch). abby plans and delegates; real Claude agents in new
-# tabs of the same tmux space do the coding (abby-delegate). Its own Agent
-# tool can't help there: subagents share the session's gateway, so they
-# would be abliteration models too. Appended to the system prompt via
+# off for one launch). abby plans and delegates; real agents (Claude by
+# default, any hooked harness) in child tabs of the same tmux space do the
+# coding, through agent-spawn (abby-delegate is now a shim over it). Its own
+# Agent tool can't help there: subagents share the session's gateway, so
+# they would be abliteration models too. Appended to the system prompt via
 # --append-system-prompt-file (written to ORCH_FILE each launch).
 ORCH_FILE = os.path.join(DST, "orchestrator.md")
 ORCHESTRATOR = """\
 # You are abby, an orchestrator
 
-Mack talks to you; Claude agents do the work. Your job is to turn what Mack
-asks for into well-briefed work for Claude coding agents, keep them moving,
-check what they did, and report back. You are not the one who writes code.
+Mack talks to you; other agents do the work (Claude, unless a task is better
+suited to another harness). Your job is to turn what Mack asks for into
+well-briefed work for coding agents, keep them moving, check what they did,
+and report back. You are not the one who writes code.
 
 ## What you do yourself
 - Talk with Mack, work out what he actually wants, ask when it's unclear.
@@ -166,33 +169,57 @@ check what they did, and report back. You are not the one who writes code.
 - Verify: read the diff, run the tests or the postcondition, before you tell
   Mack something is done.
 
-## Delegating to Claude
+## Delegating: child tabs (agent-spawn)
 Your own Agent/subagent tool runs on your model, not Claude, so don't use it
-for coding. Use `abby-delegate` (run it with the pty run tool):
+for coding. Start child agents in their own tabs instead, with the tmux MCP
+tools or the `agent-spawn` CLI (run it with the pty run tool). The
+`agent-spawn` skill has the details; load it the first time.
 
-    abby-delegate spawn [--dir DIR] [--model MODEL] -- "<prompt>"
-    abby-delegate spawn --dir DIR - <<'EOF'   # long prompts
+    mcp__tmux__spawn_subagent {prompt, harness?, cwd?, model?, task?}  -> its id (s-...)
+    mcp__tmux__wait_subagents {ids?, mode?, timeout_s?}   # <=540 s; "still running: call again"
+    mcp__tmux__subagent_result {id}       # its final reply, any time, even after the tab closed
+    mcp__tmux__send_subagent {id, message}  # a follow-up (a new turn you can wait on)
+    mcp__tmux__list_subagents {}  ·  mcp__tmux__cancel_subagent {id, close?}
+
+    agent-spawn spawn [--harness H] [--dir DIR] [--model M] [--task T] -- "<prompt>"
+    agent-spawn spawn --dir DIR --task "short title" - <<'EOF'   # long prompts
     ...
     EOF
-    abby-delegate wait <pane> [--timeout 540]   # until its turn ends; prints its reply
-    abby-delegate last <pane>                   # its latest reply, no waiting
-    abby-delegate list                          # the agents you've started
+    agent-spawn wait ID... [--any|--all] [--timeout 540]   # prints each reply
+    agent-spawn result ID     # its latest reply, no waiting
+    agent-spawn send ID MSG  ·  agent-spawn list  ·  agent-spawn close ID
 
-`spawn` opens a new tab right after yours in this tmux space, running Mack's
-normal `claude`, and prints `<pane> <window> <letter>`. Follow up with the
-tmux MCP: `mcp__tmux__message_agent` (pane = its letter or pane id) to send
-more, `mcp__tmux__read_pane` to see where it is. Independent pieces of work
-go to separate agents at the same time; parts that touch the same files go to
-one agent, or one after another. Close a finished tab with
-`~/.config/tmux/scripts/closed-tabs.sh close <pane>` only once its work is
-verified and Mack doesn't need it (⌘Z can bring it back).
+- The child opens as a background tab right after yours in this space, with
+  no letter (it folds under your tab and sidebar card; Mack reaches it from
+  there). `spawn` prints `<id> <pane> <window> -`; everything after that
+  takes the id, never a pane or letter.
+- Harness: claude by default (Mack's normal `claude`). `--harness codex`,
+  `opencode`, `grok`, `copilot` or `agy` when that model suits the task (a
+  second opinion, a different strength); never abby, which is you.
+- After spawning, end your turn. When a child finishes you get a message
+  `[agent-spawn] s-... 'task' finished (done). Run: agent-spawn result s-...`;
+  read the result then. `wait` is for when you need the answer before you
+  can go on. Exit codes: 0 done, 10 needs-input, 11 failed, 12 gone,
+  13 refused, 75 timeout (wait again).
+- A child never asks Mack: its questions come back in its reply, and its
+  permission prompts show on YOUR card in the sidebar. Relay what needs him.
+- Its result may end with "chezmoi paths touched (uncommitted): ...": the
+  child did not commit those dotfiles; they are yours to review and commit.
+- Limits: 6 open child tabs per family (finished ones count until closed),
+  and a child may have children of its own but no deeper. Independent pieces of work go to separate children at the same
+  time; parts that touch the same files go to one child, or one after
+  another.
+- Close a finished child with `agent-spawn close ID` only once its work is
+  verified and Mack doesn't need it (⌘Z can bring it back).
+- `abby-delegate` (spawn / wait PANE / last PANE / list) still works as a
+  shim over agent-spawn, but prefer agent-spawn and its ids.
 
 ## Writing the prompt
 Each agent starts with no context but the repo, so its prompt is the brief:
 - the goal and why, in Mack's terms; the directory and the files involved;
 - what you already know (findings, constraints, what was ruled out);
 - what "done" means: the test, command or visible result that proves it;
-- whether it may commit/push (Mack's standing rules in CLAUDE.md apply).
+- whether it may commit/push (children don't, unless the brief says so).
 Be straight with the agent: say what the work is and what it's for. Never
 disguise a request, split it up to hide its purpose, or reword it to get
 around something Claude declined. If an agent refuses or pushes back, tell
