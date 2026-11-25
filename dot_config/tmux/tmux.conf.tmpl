@@ -171,7 +171,13 @@ bind N new-window -a -c "#{pane_current_path}" nu
 # or pane by its command); Cancel is the first item, so ⏎ / n / Esc / q keep
 # it and only y closes, as before. prefix Q (spaces.conf) asks the same way.
 set -g @close_title '#[align=centre]#{?#{@agent_state}, close agent #{?#{@agent_key},#{@agent_key} · ,}#{=/30/…:#{?#{@agent_summary},#{s|^[^/]*/||:@agent_summary},#{window_name}}} , close #{?#{==:#{window_panes},1},tab,pane} #{=/24/…:pane_current_command} }'
-bind x display-menu -b rounded -s 'bg=#1e1e2e,fg=#cdd6f4' -S 'fg=#f38ba8' -H 'bg=#45475a,fg=#cdd6f4,bold' -T "#{E:@close_title}" -x '#{E:@popup_x}' -y C "Cancel" n "" "Close" y "run-shell -b '#{HOME}/.config/tmux/scripts/closed-tabs.sh close #{pane_id}'"
+#
+# An agent with external subagents (@agent_kids / @agent_kids_sub) asks more:
+# closed-tabs.sh close-ask raises "close + N children / keep them (they
+# become orphans) / cancel" (Cancel first again; y closes the family as one
+# ⌘Z group, k the parent alone). C-l asks it too: a family never closes
+# without a word. docs/spaces.md "Closing a parent".
+bind x if -F "#{||:#{@agent_kids_sub},#{@agent_kids}}" { run-shell -b "#{HOME}/.config/tmux/scripts/closed-tabs.sh close-ask --yn '#{client_name}' '#{pane_id}'" } { display-menu -b rounded -s 'bg=#1e1e2e,fg=#cdd6f4' -S 'fg=#f38ba8' -H 'bg=#45475a,fg=#cdd6f4,bold' -T "#{E:@close_title}" -x '#{E:@popup_x}' -y C "Cancel" n "" "Close" y "run-shell -b '#{HOME}/.config/tmux/scripts/closed-tabs.sh close #{pane_id}'" }
 bind X run-shell "#{HOME}/.config/tmux/scripts/closed-tabs.sh pick-popup '#{session_id}' '#{client_tty}'"
 
 set -g status-position bottom
@@ -985,7 +991,7 @@ bind-key -T stash Space  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-ca
 # which is after this line, so for a long time this key silently cleared the
 # screen instead of closing anything. The option below turns that mapping off.
 set -g @vim_navigator_prefix_mapping_clear_screen ""
-bind C-l run-shell -b "#{HOME}/.config/tmux/scripts/closed-tabs.sh close '#{pane_id}'"
+bind C-l if -F "#{||:#{@agent_kids_sub},#{@agent_kids}}" { run-shell -b "#{HOME}/.config/tmux/scripts/closed-tabs.sh close-ask '#{client_name}' '#{pane_id}'" } { run-shell -b "#{HOME}/.config/tmux/scripts/closed-tabs.sh close '#{pane_id}'" }
 # Initialize TMUX plugin manager (keep this line at the very bottom of tmux.conf)
 run '~/.tmux/plugins/tpm/tpm'
 

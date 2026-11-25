@@ -881,20 +881,86 @@ cmd_close() {
     [[ -n "$c" && "$csid" == "$sid" && -n "$dest" ]] && t switch-client -c "$c" -t "$dest"
   done <<<"$rows"
 
+  # External subagents (closed-tabs.sh FAMILIES): a family in this space
+  # closes together, as one ⌘Z group per root (CLOSED_TABS_GROUP, its tree
+  # order as CLOSED_TABS_GROUP_ORD), and a child whose parent is in this space
+  # closes with CLOSED_TABS_PARENT_CLOSING (nobody is told: the parent goes
+  # too). One read: "win US group US ord US parent-closing" per window of a
+  # family, and the children still working, for the toast.
+  local fam busy_kids
+  fam="$(space_families "$sid")"
+  busy_kids="$(awk -F"$US" '$5 == 1' <<<"$fam" | grep -c .)"
+
   # Every tab through the closer (closed-tabs.sh: snapshot, agent session id,
   # CMD+Z reopens it), home too, in parallel; then the session.
   local closer="${CLOSER_OPT:-$HOME/.config/tmux/scripts/closed-tabs.sh close}"
   if [[ "$closer" != "none" ]]; then
-    local p
-    while IFS= read -r p; do
+    local p w row g o pc
+    while IFS="$US" read -r p w; do
       [[ -n "$p" ]] || continue
-      bash -c "$closer \"\$1\"" _ "$p" </dev/null >/dev/null 2>&1 &
-    done < <(t list-panes -s -t "$sid" -f '#{!:#{@space_dash_pane}}' -F '#{pane_id}')   # a dashboard is not a tab
+      g="" o="" pc=""
+      if [[ -n "$fam" ]]; then
+        row="$(awk -F"$US" -v w="$w" '$1 == w { print; exit }' <<<"$fam")"
+        [[ -n "$row" ]] && IFS="$US" read -r _ g o pc _ <<<"$row"
+      fi
+      CLOSED_TABS_GROUP="$g" CLOSED_TABS_GROUP_ORD="$o" CLOSED_TABS_PARENT_CLOSING="$pc" \
+        bash -c "$closer \"\$1\"" _ "$p" </dev/null >/dev/null 2>&1 &
+    done < <(t list-panes -s -t "$sid" -f '#{!:#{@space_dash_pane}}' -F "#{pane_id}${US}#{window_id}")   # a dashboard is not a tab
     wait
+    # Each family's entries get their parent_sid / child_sids from the
+    # group's own entries (closed-tabs.sh family-link), once all are written.
+    # Only a closed-tabs.sh closer has the verb; fail-open.
+    if [[ -n "$fam" && "$closer" == *" close" ]]; then
+      for g in $(awk -F"$US" '{ print $2 }' <<<"$fam" | sort -u); do
+        bash -c "${closer% close} family-link \"\$1\"" _ "$g" </dev/null >/dev/null 2>&1
+      done
+    fi
   fi
   t kill-session -t "$sid" 2>/dev/null
   notify
-  msg -k ok "closed $name"
+  if ((busy_kids > 0)); then
+    msg -k warn "closed $name · $busy_kids subagent$( ((busy_kids == 1)) || echo s) still working went with it · ⌘Z reopens"
+  else
+    msg -k ok "closed $name"
+  fi
+}
+
+# space_families <session>: the session's windows that are in a family of
+# external subagents (closed-tabs.sh FAMILIES; the same link rule: the
+# derived @agent_child, else a raw @agent_parent that is no orphan), one line
+# each: "win US group US ord US parent-closing US busy". group: one id per
+# root (a window with no parent in this session); ord: its place in the
+# family in tree order (0 = the root, siblings in bar order, a child's own
+# children right after it: closed-tabs.sh family_rows' order, which ⌘Z
+# replays); parent-closing: 1 for a child (its parent is in this session, so
+# it closes too); busy: 1 for a child running, asking or paused. Windows in
+# no family (and a loop, which has no root): no line.
+space_families() {
+  t list-windows -t "$1" -F "#{window_id}${US}#{?#{@agent_child},#{@agent_child},#{?#{@agent_kid_orphan},,#{@agent_parent}}}${US}#{@agent_state}" 2>/dev/null \
+    | awk -F"$US" -v OFS="$US" -v g="g-$(date +%s)-$$-" '
+      !($1 in here) { n++; id[n] = $1; par[$1] = $2; st[$1] = $3; here[$1] = 1 }
+      END {
+        # Children in bar order (list-windows is in index order).
+        for (i = 1; i <= n; i++) {
+          w = id[i]; p = par[w]
+          if (p != "" && p != w && (p in here)) { nk[p]++; kid[p, nk[p]] = w } else root[w] = 1
+        }
+        for (i = 1; i <= n; i++) {
+          r = id[i]
+          if (!(r in root) || !(r in nk)) continue
+          rid = r; sub(/^@/, "", rid)
+          ord = 0; sp = 1; stk[1] = r; dep[1] = 0
+          while (sp > 0) {
+            w = stk[sp]; d = dep[sp]; sp--
+            if (w in done) continue
+            done[w] = 1
+            b = (w != r && (st[w] == "running" || st[w] == "paused" || st[w] ~ /^needs-/)) ? 1 : 0
+            print w, g rid, ord++, (w != r ? 1 : ""), b
+            if (d >= 32) continue
+            for (k = nk[w]; k >= 1; k--) { c = kid[w, k]; if (!(c in done)) { stk[++sp] = c; dep[sp] = d + 1 } }
+          }
+        }
+      }'
 }
 
 # ── move a tab to another space ────────────────────────────────────────────
@@ -944,7 +1010,41 @@ cmd_move_to() {
   info="$(t display-message -p -t "$dst" "#{@space_hidden}${US}#{session_name}")" || { msg -k warn "no such space"; return 1; }
   IFS="$US" read -r dhid dname <<<"$info"
   [[ "$dhid" == "1" ]] && { msg -k warn "not a space: $dname"; return 1; }
-  t move-window -d -a -s "$wid" -t "$dst:{end}" && { notify; msg -k ok "moved to $dname"; }
+  # Its external subagents go along (space_families' link rule), each right
+  # after the one before, in tree order: a child stays in its parent's space.
+  local kids k prev n=0
+  kids="$(space_kids "$sid" "$wid")"
+  [[ -n "$kids" ]] && n="$(grep -c . <<<"$kids")"
+  ((nwin > n + 1)) || { msg -k warn "the last window would end this space"; return 1; }
+  t move-window -d -a -s "$wid" -t "$dst:{end}" || return 1
+  prev="$wid"
+  while IFS= read -r k; do
+    [[ -n "$k" ]] || continue
+    t move-window -d -a -s "$k" -t "$prev" 2>/dev/null && prev="$k"
+  done <<<"$kids"
+  notify
+  if ((n > 0)); then msg -k ok "moved to $dname with $n subagent$( ((n == 1)) || echo s)"
+  else msg -k ok "moved to $dname"; fi
+}
+
+# space_kids <session> <win>: <win>'s external subagents in <session>, all
+# levels, tree order (bar order among siblings), one window id per line.
+space_kids() {
+  t list-windows -t "$1" -F "#{window_id}${US}#{?#{@agent_child},#{@agent_child},#{?#{@agent_kid_orphan},,#{@agent_parent}}}${US}#{window_index}" 2>/dev/null \
+    | awk -F"$US" -v root="$2" '
+      { n++; id[n] = $1; par[$1] = $2; idx[$1] = $3 + 0 }
+      END {
+        for (i = 1; i <= n; i++) { w = id[i]; p = par[w]; if (p != "" && p != w) { nk[p]++; kid[p, nk[p]] = w } }
+        for (p in nk) for (a = 2; a <= nk[p]; a++)
+          for (b = a; b > 1 && idx[kid[p, b]] < idx[kid[p, b - 1]]; b--) { t = kid[p, b]; kid[p, b] = kid[p, b - 1]; kid[p, b - 1] = t }
+        sp = 1; stk[1] = root; dep[1] = 0; done[root] = 1
+        while (sp > 0) {
+          w = stk[sp]; d = dep[sp]; sp--
+          if (w != root) print w
+          if (d >= 32) continue
+          for (k = nk[w]; k >= 1; k--) { c = kid[w, k]; if (!(c in done)) { done[c] = 1; stk[++sp] = c; dep[sp] = d + 1 } }
+        }
+      }'
 }
 
 # ── new space ──────────────────────────────────────────────────────────────

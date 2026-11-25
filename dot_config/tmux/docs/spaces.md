@@ -181,6 +181,64 @@ the toast "space has tabs again · not closed".
 - `tests/test_close_last_tab.py`: a private server with a nested client;
   the box is read off its screen.
 
+### Closing a parent: its subagents go together
+
+External subagents (agent-spawn children, docs/agent-tab-indicator.md §8)
+live in their parent's space and follow it (plan §2.5). A window's FAMILY is
+it and every window under it in the same session (closed-tabs.sh
+`family_rows`: the derived `@agent_child`, else a raw `@agent_parent` that is
+no orphan). Every way a family leaves together records it as ONE ⌘Z group:
+each history entry gets `group` (one id) and `group_ord` (0 = the parent,
+then tree order), and reopening (⌘Z, the picker's ⏎), a snooze's wake, a
+snooze, pin or unpin of any one entry takes the whole group, parent first,
+each child placed right after the one before it (forget unpins the pinned
+ones and never deletes the rest). They come back as plain agents: the link
+itself never survives a close.
+
+- **Closed by hand** (prefix x, C-l, the agent-ui menu's x, the review
+  popup's c) on a window with `@agent_kids` / `@agent_kids_sub`: a box
+  instead of the y/n, `close + N children / keep them (they become orphans)
+  / cancel`, through `closed-tabs.sh close-ask <client> <pane>` (the keys:
+  tmux.conf's `if -F`; agent-ui `close_ask_line`, raised once its menu is
+  down, retried like the last-tab box). Cancel is first, so ⏎ / n / Esc keep
+  everything. y runs `close-family --ask-space`: the children close first, in
+  parallel, then the parent, then the last-tab question. k closes the parent
+  alone (`close --ask-space`); the reconcile orphans its children (they show
+  `↳ (parent gone)`). The review popup asks the same in itself (y / k / n).
+  N is counted at the press, from the windows, not the derived options.
+- **A child closed** through closed-tabs.sh (any path: a hand close, `agent-spawn
+  close`, a park) tells its parent: `agent-spawn _notify-closed <id>
+  --busy|--idle [--result R]`, detached and fail-open, after the kill.
+  agent-spawn words it only if the child was busy or its result was not
+  collected, and never with `--parent-closing`: a family close, a space close
+  with the parent in it, a family park.
+- **Space close** (prefix Q, space.sh close): its question adds `· N subagents
+  still working` when children are busy (`@space_n_kids_busy`); every family in
+  it closes as one group per root (`CLOSED_TABS_GROUP` / `_GROUP_ORD` for the
+  closer), a child with `CLOSED_TABS_PARENT_CLOSING`, and the closing toast
+  warns when working children went with it.
+- **Move a tab** (M-m, space.sh move-to): a parent's subagents move with it,
+  right after it, in tree order.
+- **Park or snooze a parent** (prefix H, the review's p / s, snooze.sh
+  apply): stash.sh pins the family, children first and the parent last, into
+  one group; it unparks or wakes together, parent first. Whole or not at
+  all: a working child, one close --pin would refuse (asked up front,
+  `pin_dry_why`), or one with no agent left (it would park as a window,
+  outside the group; named in the message) keeps the family, "its subagent
+  is still working — not parking it". A refusal at the commit itself (the
+  re-check, close --pin) skips the rest of that family, the parent included
+  (it comes last), as does a family that would empty the session; children
+  pinned before it stay pinned. Each group pinned then gets its sids
+  (`closed-tabs.sh family-link`, as space close does). Parking a CHILD alone is
+  allowed: it takes its own subtree, its link drops, and its parent is told as
+  for a close.
+- **Recorded for later** (U11 relink, unused now): `window`,
+  `parent_window`, `spawn_id`, `parent_sid` (a child: its parent's session
+  id) and `child_sids` (a parent: its children's), from the group's own
+  entries when it closed together, else from agent-spawn's registry.
+- `tests/test_agent_family.py`: all of the above on a private server, the
+  close box driven by real keys.
+
 ## Home: the dashboard
 
 The home window is two panes: on top, full width and 9 rows, the

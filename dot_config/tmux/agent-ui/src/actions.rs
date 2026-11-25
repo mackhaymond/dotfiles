@@ -752,6 +752,16 @@ impl Actions {
         self.script_line("closed-tabs.sh", &["close", "--ask-space", client, pane])
     }
 
+    /// What [`close`](Self::close) hands `run-shell -b` for an agent with
+    /// external subagents (or a child, which may have its own):
+    /// `closed-tabs.sh close-ask <client> <pane>`, which asks on `client`
+    /// "close + N children / keep them / cancel" once this menu is down, and
+    /// closes as `close --ask-space` when there are none (docs/spaces.md
+    /// "Closing a parent").
+    pub fn close_ask_line(&self, client: &str, pane: &str) -> String {
+        self.script_line("closed-tabs.sh", &["close-ask", client, pane])
+    }
+
     /// `x` after its y, from the menu on `client`. A stashed entry is
     /// unpinned (`closed-tabs.sh unpin`: into ⌘Z's backlog); a parked tab
     /// goes through stash.sh's own discard (`kill-many`; what ⌘Z gets back
@@ -772,6 +782,13 @@ impl Actions {
         let (pane, home) = self.agent_pane_row(&w.id, &w.kind)?;
         if home {
             return Err(HOME_CLOSE.into());
+        }
+        let kids = w.kids.map_or(0, |k| k.total);
+        if kids > 0 || !w.child.is_empty() {
+            // Neutral: close-ask counts the children itself and, with none
+            // in this space, closes at once without a box.
+            self.tmux.run_bg(&self.close_ask_line(client, &pane));
+            return Ok(format!("closing {} · asks first if its subagents are here", w.label));
         }
         self.tmux.run_bg(&self.close_line(client, &pane));
         Ok(format!("closed {} · ⌘Z brings it back", w.label))

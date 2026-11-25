@@ -404,12 +404,16 @@ do_apply() {
     fi
     # stash.sh snooze parks one window and prints what got the alarm
     # (p:<id> / w:<win>); nothing printed = refused (it has said why). Each
-    # session one of them left is noted once, for --ask-space.
+    # session one of them left is noted once, for --ask-space. A parent goes
+    # with its subagents, one alarm for the family (stash.sh FAMILIES): one
+    # line each, counted apart (kids_n) so the toast still names the parent.
+    local kids_n=0
     i=0
     for w in ${park_wins[@]+"${park_wins[@]}"}; do
         out=$(stash_sh snooze "$when" "$w" 2>/dev/null) || out=""
         if [ -n "$out" ]; then
             done_n=$((done_n + 1))
+            kids_n=$((kids_n + $(grep -c . <<<"$out") - 1))
             seen=0
             for s in ${left[@]+"${left[@]}"}; do [ "$s" = "${park_sess[$i]}" ] && seen=1; done
             [ "$seen" = 1 ] || left+=("${park_sess[$i]}")
@@ -421,6 +425,9 @@ do_apply() {
         local w_label
         if [ "$done_n" -eq 1 ] && [ ${#D_LABELS[@]} -eq 1 ]; then w_label=$(what "${D_LABELS[0]}")
         else w_label="$done_n tabs"; [ "$done_n" -eq 1 ] && w_label="1 tab"
+        fi
+        if [ "$kids_n" -gt 0 ]; then
+            w_label="$w_label + $kids_n subagent"; [ "$kids_n" -gt 1 ] && w_label="${w_label}s"
         fi
         if [ "$when" = unsnooze ]; then
             notify_user ${client:+-c "$client"} -k ok -- "⏰ unsnoozed $w_label — still stashed"

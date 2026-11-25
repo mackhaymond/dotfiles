@@ -25,6 +25,19 @@
 #   closed-tabs.sh list                            print the history, newest first
 #   closed-tabs.sh describe <id>                   label an entry (close runs this)
 #   closed-tabs.sh summarize <tool> <sid> <cwd> <label> <screen>   print one
+#   closed-tabs.sh close-family [--ask-space <client>] <pane>   close an agent
+#                                                  and every subagent under it
+#                                                  as ONE ⌘Z group (FAMILIES below)
+#   closed-tabs.sh close-ask [--yn] <client> <pane>   a parent: "close + N
+#                                                  children / keep them / cancel";
+#                                                  anything else: close --ask-space
+#   closed-tabs.sh family <win…>                   the windows and their subagents,
+#                                                  tree order (stash.sh reads it)
+#   closed-tabs.sh family-link <group>             fill a group's parent_sid /
+#                                                  child_sids (stash.sh, space.sh)
+# close also takes --group G [--group-ord N] [--parent-window W]
+# [--parent-closing] (or CLOSED_TABS_GROUP / _GROUP_ORD / _PARENT_CLOSING in
+# the environment: space.sh close passes them that way).
 # Exit codes: 0 ok, 3 refused (nothing changed: `close --pin` on a pane with no
 # agent or no session id), 1 error (also: snooze/unsnooze/wake/pin on ids none
 # of which is in the history, or nothing woke).
@@ -162,6 +175,11 @@ STASH_SH="${STASH_SH:-$HOME/.config/tmux/scripts/stash.sh}"
 # snooze.sh, for its menu (the picker's ⌃z) and `reschedule` (after any change
 # to an entry's wake_at). SNOOZE_SH names another (tests), carried like STASH_SH.
 SNOOZE_SH="${SNOOZE_SH:-$HOME/.config/tmux/scripts/snooze.sh}"
+# agent-spawn, told when one of its children closes (`_notify-closed`), and
+# its registry (a child's parent session id, a parent's children's). Either
+# may be absent: then nothing is told and nothing more recorded.
+AGENT_SPAWN_BIN="${AGENT_SPAWN_BIN:-$HOME/.local/bin/agent-spawn}"
+AGENT_SPAWN_DIR="${AGENT_SPAWN_DIR:-${AGENT_SPAWN_STATE:-$HOME/.local/state/agent-spawn}}"
 
 mkdir -p "$STATE_DIR" "$PREVIEWS"
 
@@ -894,6 +912,80 @@ build_cmd() {
     esac
 }
 
+# --- FAMILIES (external subagents) --------------------------------------------
+#
+# docs/agent-tab-indicator.md §8: an agent-spawn child carries @agent_parent
+# (its parent's window id) and, while that parent is live, the derived
+# @agent_child. A window's FAMILY is it and every window under it: a child is
+# one whose @agent_child names its parent or, with none yet (born before the
+# first reconcile, or its parent not live), whose raw @agent_parent does and
+# that is no orphan (@agent_kid_orphan). Only descendants in the root's own
+# session come along (one moved to another space stays), 32 levels at most,
+# each window once.
+#
+# A family that goes together (close-family, space.sh close, a park or snooze
+# of the parent) is ONE ⌘Z group: every entry gets the same "group" id and a
+# "group_ord" (0 = the root, then tree order), and reopening, waking,
+# snoozing or (un)pinning any one of them takes the whole group, root first,
+# each later one placed right after the one before it (forget only unpins the
+# pinned ones; it never deletes the rest). Entries also record the link, for
+# U11's relink and unused until then: "window", "parent_window", "spawn_id",
+# "parent_sid" (a child: its parent's session id) and "child_sids" (a parent:
+# its children's) — from the group's own entries when it closed together
+# (family_link), else from agent-spawn's registry. They come back as plain
+# agents: the link itself never survives a close (§8).
+#
+# A closing child tells its parent (`agent-spawn _notify-closed`, detached,
+# fail-open), except with --parent-closing: its parent goes in the same batch.
+
+FAM_US=$'\x1f'
+FAM_FMT="#{window_id}${FAM_US}#{@agent_child}${FAM_US}#{@agent_parent}${FAM_US}#{@agent_kid_orphan}${FAM_US}#{session_id}${FAM_US}#{window_index}${FAM_US}#{@agent_state}${FAM_US}#{?#{@agent_pending},1,}${FAM_US}#{@agent_spawn_id}"
+
+# family_rows <win…>: every named window's family, one TAB-separated line per
+# window in tree order: win, root (the named window it came with), ord (0 =
+# the root), parent ("" for the root), busy (1: running, asking, paused, or a
+# gate pending), spawn id, session id. A named window under another named one
+# is listed in that one's family only; a missing one, not at all.
+family_rows() {
+    [ $# -gt 0 ] || return 0
+    tmux list-windows -a -F "$FAM_FMT" 2>/dev/null | awk -F $'\x1f' -v want="$*" '
+        !($1 in seen) {
+            seen[$1] = 1; n++; id[n] = $1; sess[$1] = $5; idx[$1] = $6 + 0
+            busy[$1] = ($7 == "running" || $7 == "paused" || $7 ~ /^needs-/ || $8 == "1") ? 1 : 0
+            spawn[$1] = $9
+            p = $2; if (p == "" && $4 == "") p = $3
+            if (p != "" && p != $1) par[$1] = p
+        }
+        END {
+            for (i = 1; i <= n; i++) { w = id[i]; if (w in par) { p = par[w]; nk[p]++; kid[p, nk[p]] = w } }
+            # Each parent'"'"'s children in bar order (window index).
+            for (p in nk) for (a = 2; a <= nk[p]; a++)
+                for (b = a; b > 1 && idx[kid[p, b]] < idx[kid[p, b - 1]]; b--) { t = kid[p, b]; kid[p, b] = kid[p, b - 1]; kid[p, b - 1] = t }
+            m = split(want, ws, " ")
+            for (j = 1; j <= m; j++) named[ws[j]] = 1
+            for (j = 1; j <= m; j++) {
+                r = ws[j]
+                if (!(r in seen) || (r in done)) continue
+                # Under another named window: listed in its family instead.
+                a = par[r]; up = 0; under = 0
+                while (a != "" && up < 32) { if (a in named) { under = 1; break }; a = par[a]; up++ }
+                if (under) continue
+                ord = 0; sp = 1; stk[1] = r; dep[1] = 0
+                while (sp > 0) {
+                    w = stk[sp]; d = dep[sp]; sp--
+                    if (w in done) continue
+                    done[w] = 1
+                    printf "%s\t%s\t%d\t%s\t%d\t%s\t%s\n", w, r, ord++, (w == r ? "" : par[w]), busy[w], spawn[w], sess[w]
+                    if (d >= 32) continue
+                    for (k = nk[w]; k >= 1; k--) {
+                        c = kid[w, k]
+                        if (!(c in done) && sess[c] == sess[r]) { stk[++sp] = c; dep[sp] = d + 1 }
+                    }
+                }
+            }
+        }'
+}
+
 # Ordered for latency: everything that has to be read from the live pane (its
 # screen, its agent's session) comes first, then the pane dies, and only then
 # the bookkeeping — building the resume command, writing and pruning the
@@ -907,8 +999,11 @@ build_cmd() {
 # prints the new entry's id on stdout (one line, for stash.sh / snooze.sh);
 # --wake <epoch> (pinned only) snoozes it too: the entry gets wake_at.
 #   close [--pin [--wake <epoch>]] <pane>
+# A family's members also take --group / --group-ord / --parent-window /
+# --parent-closing (FAMILIES above).
 do_close() {
     local pin="" wake=""
+    local group="${CLOSED_TABS_GROUP:-}" gord="${CLOSED_TABS_GROUP_ORD:-}" pwin="" pclosing="${CLOSED_TABS_PARENT_CLOSING:-}"
     while [ $# -gt 0 ]; do
         case "$1" in
         --pin) pin=1; shift ;;
@@ -916,9 +1011,14 @@ do_close() {
             wake="${2:-}"
             [[ "$wake" =~ ^[0-9]+$ ]] || { printf 'closed-tabs: --wake needs an epoch, got "%s"\n' "$wake" >&2; return 1; }
             shift 2 ;;
+        --group) group="${2:-}"; shift 2 ;;
+        --group-ord) gord="${2:-}"; shift 2 ;;
+        --parent-window) pwin="${2:-}"; shift 2 ;;
+        --parent-closing) pclosing=1; shift ;;
         *) break ;;
         esac
     done
+    [[ "$gord" =~ ^[0-9]+$ ]] || gord=0
     [ -n "$wake" ] && [ -z "$pin" ] && { printf 'closed-tabs: --wake goes with --pin\n' >&2; return 1; }
     local pane="${1:-}"
     # An empty -t resolves to the CURRENT pane, not to nothing.
@@ -926,12 +1026,26 @@ do_close() {
 
     local info
     info=$(tmux display-message -p -t "$pane" \
-        '#{pane_id}|#{pane_pid}|#{pane_tty}|#{session_name}|#{session_id}|#{session_created}|#{window_index}|#{pane_current_path}|#{@stash_origin}|#{session_path}|#{@space_color}|#{@space_hidden}|#{@space_hidden_sessions}|#{@stash_origin_dir}|#{@stash_origin_color}|#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}' 2>/dev/null)
+        '#{pane_id}|#{pane_pid}|#{pane_tty}|#{session_name}|#{session_id}|#{session_created}|#{window_index}|#{pane_current_path}|#{@stash_origin}|#{session_path}|#{@space_color}|#{@space_hidden}|#{@space_hidden_sessions}|#{@stash_origin_dir}|#{@stash_origin_color}|#{window_id}|#{@agent_spawn_id}|#{@agent_state}|#{?#{@agent_pending},1,}|#{@agent_spawn_result}|#{?#{@agent_child},#{@agent_child},#{?#{@agent_kid_orphan},,#{@agent_parent}}}|#{?#{||:#{@agent_kids_sub},#{@agent_kids}},1,}|#{?#{n:#{@agent_summary}},#{@agent_summary},#{window_name}}' 2>/dev/null)
     # display-message against a dead target can succeed with an empty
     # expansion — test the expansion, not the exit status.
     local pane_id pane_pid pane_tty sess tsess tcreated widx cwd origin spath scolor shid hlist odir ocolor label
-    IFS='|' read -r pane_id pane_pid pane_tty sess tsess tcreated widx cwd origin spath scolor shid hlist odir ocolor label <<<"$info"
+    local win_id spid astate apending sres linkp haskids
+    IFS='|' read -r pane_id pane_pid pane_tty sess tsess tcreated widx cwd origin spath scolor shid hlist odir ocolor \
+        win_id spid astate apending sres linkp haskids label <<<"$info"
     [ -n "$pane_id" ] || return 1
+    # An agent-spawn child (FAMILIES): its registry id, held to agent-spawn's
+    # own shape; its parent as linked now, unless the caller named it (a
+    # family closing together: the reconcile may cut the link mid-batch).
+    [[ "$spid" =~ ^s-[a-z0-9]+$ ]] || spid=""
+    [ -n "$pwin" ] || pwin="$linkp"
+    [[ "$pwin" =~ ^@[0-9]+$ ]] || pwin=""
+    # A parent closed on its own: its direct children's spawn ids, read while
+    # the links still stand (its kill orphans them at once), for child_sids.
+    local kid_spawns=""
+    if [ "$haskids" = 1 ] && [ -z "$group" ] && [ -n "$win_id" ]; then
+        kid_spawns=$(family_rows "$win_id" | awk -F '\t' -v w="$win_id" '$4 == w && $6 ~ /^s-[a-z0-9]+$/ { print $6 }')
+    fi
     # The space's folder and colour (space_dir / space_color): if the space
     # is closed (prefix Q forgets them) while an entry of it is snoozed, its
     # wake, or its reopen by hand, brings it back from these (reopen_one,
@@ -1040,18 +1154,46 @@ do_close() {
         cmd=$(build_cmd "$tool" "$sid" "$cli_args" "$model" "$env_json")
     fi
 
+    # The family link, recorded for U11 (FAMILIES): a lone child's parent
+    # session and a lone parent's children's, from agent-spawn's registry; a
+    # group closing together fills both from its own entries (family_link).
+    local psid="" csids="[]"
+    if [ -z "$group" ]; then
+        if [ -n "$spid" ] && [ -s "$AGENT_SPAWN_DIR/$spid/meta.json" ]; then
+            psid=$(jq -r '((.turns // []) | last | .parent_session_id?) // .parent.session_id // empty' \
+                "$AGENT_SPAWN_DIR/$spid/meta.json" 2>/dev/null)
+        fi
+        if [ -n "$kid_spawns" ]; then
+            local k metas=()
+            for k in $kid_spawns; do
+                [ -s "$AGENT_SPAWN_DIR/$k/meta.json" ] && metas+=("$AGENT_SPAWN_DIR/$k/meta.json")
+            done
+            [ "${#metas[@]}" -gt 0 ] && csids=$(jq -sc '[.[] | .child.session_id // empty | select(. != "")]' "${metas[@]}" 2>/dev/null)
+            [ -n "$csids" ] || csids="[]"
+        fi
+    fi
+
     local rec
     rec=$(jq -cn --arg id "$id" --arg ts "$ts" --arg sess "$sess" --arg widx "$widx" \
         --arg tsess "$tsess" --arg tcreated "$tcreated" \
         --arg cwd "$cwd" --arg label "$label" --arg tool "$tool" --arg sid "$sid" --arg cmd "$cmd" \
         --arg pin "$pin" --arg wake "$wake" --arg sdir "$sdir" --arg scol "$scol" \
+        --arg win "$win_id" --arg group "$group" --arg gord "$gord" --arg pwin "$pwin" --arg spid "$spid" \
+        --arg psid "$psid" --argjson csids "$csids" \
         '{id: $id, ts: ($ts|tonumber), session: $sess, tmux_session: $tsess,
           session_created: $tcreated, index: ($widx|tonumber), cwd: $cwd,
           label: $label, tool: $tool, session_id: $sid, cmd: $cmd}
          + (if $sdir != "" then {space_dir: $sdir} else {} end)
          + (if $scol != "" then {space_color: $scol} else {} end)
          + (if $pin == "1" then {pinned: true, stashed_ts: ($ts|tonumber)} else {} end)
-         + (if $wake != "" then {wake_at: ($wake|tonumber)} else {} end)')
+         + (if $wake != "" then {wake_at: ($wake|tonumber)} else {} end)
+         + (if $group != "" then {group: $group, group_ord: ($gord|tonumber)} else {} end)
+         + (if $win != "" and ($group != "" or $pwin != "" or $spid != "" or ($csids|length) > 0)
+            then {window: $win} else {} end)
+         + (if $pwin != "" then {parent_window: $pwin} else {} end)
+         + (if $spid != "" then {spawn_id: $spid} else {} end)
+         + (if $psid != "" then {parent_sid: $psid} else {} end)
+         + (if ($csids|length) > 0 then {child_sids: $csids} else {} end)')
 
     if lock_acquire; then
         printf '%s\n' "$rec" >>"$HISTORY"
@@ -1063,7 +1205,18 @@ do_close() {
         printf '%s\n' "$rec" >>"$HISTORY"
         log "history lock busy — appended unlocked"
     fi
-    log "close${pin:+ --pin}${wake:+ --wake $wake} $sess:$widx cwd=$cwd tool=${tool:--} sid=${sid:--}"
+    log "close${pin:+ --pin}${wake:+ --wake $wake} $sess:$widx cwd=$cwd tool=${tool:--} sid=${sid:--}${group:+ group=$group/$gord}${spid:+ spawn=$spid}"
+    # A child closed: its parent is told (agent-spawn decides whether it is
+    # worth a word: only a busy child or an uncollected result, never with
+    # the parent going in the same batch). Busy as read before the kill.
+    # Detached and fail-open: the close never waits on it.
+    if [ -n "$spid" ] && [ -x "$AGENT_SPAWN_BIN" ]; then
+        local bflag=--idle
+        case "$astate" in running|paused|needs-*) bflag=--busy ;; esac
+        [ "$apending" = 1 ] && bflag=--busy
+        ( AGENT_SPAWN_DIR="$AGENT_SPAWN_DIR" "$AGENT_SPAWN_BIN" _notify-closed "$spid" "$bflag" \
+            ${sres:+--result "$sres"} ${pclosing:+--parent-closing} </dev/null >/dev/null 2>&1 & )
+    fi
     [ -n "$pin" ] && publish_count
     [ -n "$wake" ] && reschedule
     [ -n "$pin" ] && printf '%s\n' "$id"
@@ -1234,15 +1387,153 @@ ask_box() {
 # already had nothing but its home leaves the very state that asks, and must
 # not. kill-pane is synchronous, so by the time do_close returns the window
 # is gone or not (a split, a failed kill: then nothing asks).
+#   close --ask-space <client> <pane> [<close option>…]   (the options: a
+#   family root's --group / --group-ord, from close-family)
 do_close_ask() {
     local client="${1:-}" pane="${2:-}" info="" sid="" win=""
+    if [ $# -ge 2 ]; then shift 2; else set --; fi
     [ -n "$pane" ] && info=$(tmux display-message -p -t "$pane" "#{session_id}${US}#{window_id}" 2>/dev/null)
     IFS="$US" read -r sid win <<<"$info"
-    do_close "$pane" || return
+    do_close "$@" "$pane" || return
+    [ -n "${FAMILY_GROUP:-}" ] && family_link "$FAMILY_GROUP"
     [ -n "$sid" ] && [ -n "$win" ] || return 0
     [ -z "$(tmux display-message -p -t "$win" '#{window_id}' 2>/dev/null)" ] || return 0
     ask_space "$client" "$sid"
     return 0
+}
+
+# --- closing a family (FAMILIES above) -----------------------------------------
+
+# family_link <group>: fill each of the group's entries' parent_sid (its
+# parent's entry's session id) and child_sids (its children's), matched on
+# the recorded window ids. Under the lock; nothing when it is busy.
+family_link() {
+    local g="${1:-}"
+    [ -n "$g" ] || return 0
+    log "family-link $g"
+    [ -s "$HISTORY" ] || return 0
+    lock_acquire || return 0
+    jq -cs --arg g "$g" '
+        map(select(.group == $g)) as $m
+        | (reduce $m[] as $e ({}; if ($e.window // "") != "" then .[$e.window] = ($e.session_id // "") else . end)) as $sid
+        | .[]
+        | if .group == $g then
+            (if (.parent_window // "") != "" and ($sid[.parent_window] // "") != ""
+             then .parent_sid = $sid[.parent_window] else . end)
+            | (.window as $w | [$m[] | select($w != null and .parent_window == $w) | (.session_id // "") | select(. != "")]) as $k
+            | (if ($k | length) > 0 then .child_sids = $k else . end)
+          else . end' "$HISTORY" >"$HISTORY.tmp" 2>/dev/null && mv "$HISTORY.tmp" "$HISTORY"
+    lock_release
+}
+
+# close-family [--ask-space <client>] <pane>: the pane's agent and every
+# subagent under it, as one ⌘Z group. The children go first, in parallel,
+# each with --parent-closing (its parent goes too, so nobody is told) and its
+# parent named (the reconcile may cut a grandchild's link while its parent
+# closes); the parent last, so its tab leaves the bar once the family is
+# recorded. Then family_link, then (--ask-space) the last-tab question. With
+# no subagent found it is a plain close.
+FAMILY_GROUP=""
+do_close_family() {
+    local client="" ask=""
+    if [ "${1:-}" = --ask-space ]; then
+        ask=1 client="${2:-}"
+        if [ $# -ge 2 ]; then shift 2; else set --; fi
+    fi
+    local pane="${1:-}" win rows g="" n=0 w ord par p
+    [ -n "$pane" ] || { msg -k error "closed-tabs: no pane given"; return 1; }
+    win=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null)
+    [ -n "$win" ] || return 1
+    rows=$(family_rows "$win")
+    if [ "$(grep -c . <<<"$rows")" -gt 1 ]; then
+        g="g-$(date +%s)-$$"
+        while IFS=$'\t' read -r w _ ord par _; do
+            [ -n "$w" ] && [ "$w" != "$win" ] || continue
+            for p in $(tmux list-panes -t "$w" -F '#{pane_id}' 2>/dev/null); do
+                ( do_close --group "$g" --group-ord "$ord" ${par:+--parent-window "$par"} --parent-closing "$p" \
+                    </dev/null >/dev/null 2>&1 ) &
+                n=$((n + 1))
+            done
+        done <<<"$rows"
+        wait
+        log "close-family $win: $n subagent pane(s) as group $g"
+    fi
+    FAMILY_GROUP="$g"
+    if [ -n "$ask" ]; then
+        do_close_ask "$client" "$pane" ${g:+--group "$g" --group-ord 0}
+    else
+        do_close ${g:+--group "$g" --group-ord 0} "$pane" || return
+        [ -n "$g" ] && family_link "$g"
+    fi
+    return 0
+}
+
+# family_box <client> <pane> <title> <menu item…>: a display-menu (prefix
+# Q's look) on <client>, drawn at <pane>, retried while another overlay holds
+# the client the way ask_box is (the agent-ui menu stays up after its x), as
+# long as the pane lives. Returns once answered or given up on.
+family_box() {
+    local client="$1" pane="$2" title="$3" i=0 mp t0 wait_ms
+    shift 3
+    while [ "$i" -lt "$ASK_TRIES" ]; do
+        now_ms; t0=$REPLY
+        tmux display-message -p '' >/dev/null 2>&1
+        now_ms; wait_ms=$(( REPLY - t0 + ASK_PROBE ))
+        tmux display-menu ${client:+-c "$client"} -t "$pane" -b rounded -s 'bg=#1e1e2e,fg=#cdd6f4' -S 'fg=#f38ba8' \
+            -H 'bg=#45475a,fg=#cdd6f4,bold' -T "$title" -x "$POPUP_X" -y C "$@" </dev/null >/dev/null 2>&1 &
+        mp=$!
+        sleep "$(printf '%d.%03d' $((wait_ms / 1000)) $((wait_ms % 1000)))"
+        if kill -0 "$mp" 2>/dev/null; then
+            wait "$mp"
+            return 0
+        fi
+        wait "$mp"
+        i=$((i + 1))
+        sleep "$ASK_RETRY"
+        [ -n "$(tmux display-message -p -t "$pane" '#{pane_id}' 2>/dev/null)" ] || return 0
+    done
+    log "close-ask $pane: $client never took the box"
+}
+
+# close-ask [--yn] <client> <pane>: a hand close of an agent that has
+# subagents asks first (docs/spaces.md "Closing a parent"): prefix x and C-l
+# route a window with @agent_kids / @agent_kids_sub here (tmux.conf.tmpl,
+# spaces.conf), agent-ui's x after its own y, the review popup's c in-popup.
+#   Cancel                            n   nothing (as are Esc and a click away)
+#   Close + N children                y   close-family --ask-space
+#   Keep them (they become orphans)   k   close --ask-space of the parent only;
+#                                         the reconcile orphans its children
+# N is counted here (family_rows), not from the derived options. None found
+# (the last one closed meanwhile): --yn (prefix x) shows prefix x's own y/n,
+# without it (C-l, agent-ui) the plain close runs at once.
+do_close_ask_family() {
+    local yn=""
+    [ "${1:-}" = --yn ] && { yn=1; shift; }
+    local client="${1:-}" pane="${2:-}" win rows n busy
+    [ -n "$pane" ] || { msg -k error "closed-tabs: no pane given"; return 1; }
+    win=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null)
+    [ -n "$win" ] || return 0
+    rows=$(family_rows "$win")
+    n=$(( $(grep -c . <<<"$rows") - 1 ))
+    busy=$(awk -F '\t' -v w="$win" '$1 != w && $5 == 1' <<<"$rows" | grep -c .)
+    local env="XDG_STATE_HOME='$STATE_HOME' AGENT_SPAWN_BIN='$AGENT_SPAWN_BIN' AGENT_SPAWN_DIR='$AGENT_SPAWN_DIR'"
+    local close_one="run-shell -b \"$env bash '$SELF' close --ask-space '#{client_name}' '$pane'\""
+    if [ "$n" -le 0 ]; then
+        if [ -n "$yn" ]; then
+            family_box "$client" "$pane" "#{E:@close_title}" "Cancel" n "" "Close" y "$close_one"
+        else
+            do_close_ask "$client" "$pane"
+        fi
+        return 0
+    fi
+    local kids="$n children" keep="Keep them (they become orphans)" working=""
+    [ "$n" -eq 1 ] && kids="1 child" keep="Keep it (it becomes an orphan)"
+    [ "$busy" -gt 0 ] && working=" · $busy working"
+    local title="#[align=centre] close #{?#{@agent_key},#{@agent_key} · ,}#{=/24/…:#{?#{@agent_summary},#{s|^[^/]*/||:@agent_summary},#{window_name}}} + $kids$working? "
+    log "close-ask $pane: $n subagent(s), $busy working"
+    family_box "$client" "$pane" "$title" "Cancel" n "" \
+        "Close + $kids" y "run-shell -b \"$env bash '$SELF' close-family --ask-space '#{client_name}' '$pane'\"" \
+        "$keep" k "$close_one"
 }
 
 # ask-space-yes <client> <session_id>: the box's y. Closes the space with
@@ -1504,9 +1795,11 @@ fallback_session() {
 # while a restart's restore is pending). With mode `wake` (one coming back by itself) it goes to the END of its own session's
 # bar, or of main (no client is asked), with -d so no client's view moves, and
 # says nothing.
-#   reopen_one <rec> <client_session> <client_tty> [wake]
+# <after>: a window this one goes right after when it lands in that window's
+# session (a family's member after the one before it; not with wake).
+#   reopen_one <rec> <client_session> <client_tty> [wake] [<after>]
 reopen_one() {
-    local rec="$1" client_sess="$2" client_tty="${3:-}" mode="${4:-}"
+    local rec="$1" client_sess="$2" client_tty="${3:-}" mode="${4:-}" after="${5:-}"
     local sess tsess tcreated idx cwd cmd tool label
     sess=$(jq -r '.session' <<<"$rec"); idx=$(jq -r '.index' <<<"$rec")
     cwd=$(jq -r '.cwd' <<<"$rec");      cmd=$(jq -r '.cmd // empty' <<<"$rec")
@@ -1571,6 +1864,8 @@ reopen_one() {
     local -a where quiet=()
     if [ "$mode" = wake ]; then
         where=(-t "=$sess:") quiet=(-d)
+    elif [ -n "$after" ] && [ "$(tmux display-message -p -t "$after" '#{session_name}' 2>/dev/null)" = "$sess" ]; then
+        where=(-a -t "$after")
     elif tmux list-windows -t "=$sess" -F '#{window_index}' 2>/dev/null | grep -qx "$idx"; then
         where=(-b -t "=$sess:$idx")
     else
@@ -1622,16 +1917,28 @@ do_reopen() {
         msg -k warn "closed-tabs: nothing to reopen"
         return 0
     fi
+    # A family's entry brings its whole group (FAMILIES above).
+    local groups
+    groups=$(jq -sc '[.[] | .group // empty | select(. != "")] | unique' <<<"$recs" 2>/dev/null)
+    if [ -n "$groups" ] && [ "$groups" != "[]" ]; then
+        recs=$(jq -c --argjson gs "$groups" --argjson ids "$(jq -sc 'map(.id)' <<<"$recs")" \
+            'select((.id as $i | $ids | index($i)) or ((.group // "") as $g | $g != "" and ($gs | index($g))))' "$HISTORY" 2>/dev/null)
+    fi
     local ids; ids=$(jq -r '.id' <<<"$recs")
     # shellcheck disable=SC2086
     history_filter --argjson ids "$(ids_json $ids)" 'select(.id as $i | $ids | index($i) | not)'
     lock_release
 
-    local rec win first="" n=0 failed=0 lost=0
+    local rec win first="" n=0 failed=0 lost=0 rgroup prev_group="" prev_win=""
     while IFS= read -r rec; do
         [ -n "$rec" ] || continue
-        if win=$(reopen_one "$rec" "$client_sess" "$client_tty") && [ -n "$win" ]; then
+        # A group's later entries go right after the one before (its root
+        # first): their recorded slots were taken with the family around them.
+        rgroup=$(jq -r '.group // empty' <<<"$rec")
+        [ -n "$rgroup" ] && [ "$rgroup" = "$prev_group" ] || prev_win=""
+        if win=$(reopen_one "$rec" "$client_sess" "$client_tty" "" "$prev_win") && [ -n "$win" ]; then
             win=${win%%"$US"*}
+            prev_group="$rgroup" prev_win="$win"
             [ -n "$first" ] || first="$win"
             n=$((n + 1))
             rm -f "$PREVIEWS/$(jq -r '.id' <<<"$rec").ansi"
@@ -1648,8 +1955,15 @@ do_reopen() {
         fi
     # Newest close first. Ties on .ts (two closes in the same second) fall
     # back to file order, reversed — sort_by is stable, so -.ts alone would
-    # replay same-second closes oldest first and swap their slots.
-    done < <(jq -sc 'to_entries | sort_by(-.value.ts, -.key) | .[].value' <<<"$recs")
+    # replay same-second closes oldest first and swap their slots. A group
+    # sorts as one, at its newest entry's time, its entries by group_ord.
+    done < <(jq -sc 'to_entries
+        | (reduce (.[] | select((.value.group // "") != "")) as $e ({};
+            .[$e.value.group] = ([.[$e.value.group] // 0, $e.value.ts] | max))) as $gts
+        | sort_by(if (.value.group // "") != ""
+                  then [-($gts[.value.group]), .value.group, (.value.group_ord // 0), 0]
+                  else [-.value.ts, "", 0, -.key] end)
+        | .[].value' <<<"$recs")
 
     [ -n "$client_tty" ] && [ -n "$first" ] && tmux switch-client -c "$client_tty" -t "$first" 2>/dev/null
     # A stashed entry that came back has left the shelf (and a snoozed one
@@ -1707,6 +2021,17 @@ set_pins() {
         'select(.id as $i | $ids | index($i))
          | (if .pinned == true then "p" else "u" end) + (if .wake_at then " w" else "" end)' "$HISTORY" 2>/dev/null \
         | awk '$1 == "p" { p++ } $1 == "u" { u++ } $2 == "w" { w++ } END { print p + 0, u + 0, w + 0 }')
+    # A family's entry takes its group along (FAMILIES above); forget only
+    # unpins the group's pinned ones, never deletes the rest. The counts
+    # above stay the named entries'.
+    local fam
+    fam=$(jq -sc --argjson ids "$ids" --arg mode "$mode" '
+        ([.[] | select(.id as $i | $ids | index($i)) | .group // empty | select(. != "")] | unique) as $gs
+        | if ($gs | length) == 0 then $ids
+          else [.[] | select((.id as $i | $ids | index($i))
+                  or (((.group // "") as $g | $g != "" and ($gs | index($g))) and ($mode != "forget" or .pinned == true)))
+                | .id] end' "$HISTORY" 2>/dev/null)
+    [ -n "$fam" ] && ids="$fam"
     history_filter -s --arg mode "$mode" --argjson ids "$ids" --argjson now "$(date +%s)" \
         --argjson wake "$wake" "$PIN_JQ"
     if [ "$mode" = forget ]; then
@@ -1825,7 +2150,8 @@ do_wake() {
                 log "wake failed and history busy, dropped: $rec"
             fi
         fi
-    done < <(jq -sc 'sort_by(.wake_at // 0) | .[]' <<<"$recs")
+    # Soonest first; a family (one alarm) root first, then tree order.
+    done < <(jq -sc 'sort_by([(.wake_at // 0), (.group // ""), (.group_ord // 0)]) | .[]' <<<"$recs")
     publish_count
     reschedule
     [ "$n" -gt 0 ]
@@ -2203,6 +2529,10 @@ do_list() {
 case "${1:-}" in
 close)      shift
             if [ "${1:-}" = --ask-space ]; then shift; do_close_ask "$@"; else do_close "$@"; fi ;;
+close-family) shift; do_close_family "$@" ;;
+close-ask)  shift; do_close_ask_family "$@" ;;
+family)     shift; family_rows "$@" ;;
+family-link) shift; family_link "${1:-}" ;;
 ask-space)  shift; ask_space "$@" ;;
 ask-space-yes) shift; do_ask_space_yes "$@" ;;
 pick-popup) shift; do_pick_popup "$@" ;;

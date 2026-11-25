@@ -31,8 +31,12 @@
 //!   recorded and the card stays undecided.
 //!   - `c`: `closed-tabs.sh close <agent pane>` (⌘Z reopens it; no
 //!     `--ask-space`: this popup asks itself, below); a split tab is
-//!     refused ([`close_refusal`]);
-//!   - `p`: `stash.sh stash <win>` ([`Actions::park_line`], prefix H);
+//!     refused ([`close_refusal`]); on a parent (`↳ N kids`) it asks first
+//!     ([`view::Mode::Family`]): y `closed-tabs.sh close-family <pane>` (it
+//!     and every subagent, one ⌘Z group), k the plain close (its children
+//!     become orphans), n back;
+//!   - `p`: `stash.sh stash <win>` ([`Actions::park_line`], prefix H); a
+//!     parent parks with its subagents (stash.sh FAMILIES), as does `s`;
 //!   - `s` + a preset or a typed time: `snooze.sh parse` here (a bad time
 //!     says why under the box), then `snooze.sh apply -c <client> <epoch>
 //!     w:@N` (park with an alarm);
@@ -505,7 +509,11 @@ impl Runner {
                 }
                 return Flow::Jump(i);
             }
-            Req::Close(i) => match self.close(i) {
+            Req::Close(i) => match self.close(i, false) {
+                Ok(m) => self.start(r, Pending::new(i, Outcome::Closed, m, "closing", "closed-tabs.sh")),
+                Err(e) => r.refused(e),
+            },
+            Req::CloseFamily(i) => match self.close(i, true) {
                 Ok(m) => self.start(r, Pending::new(i, Outcome::Closed, m, "closing", "closed-tabs.sh")),
                 Err(e) => r.refused(e),
             },
@@ -513,7 +521,9 @@ impl Runner {
                 Ok(w) => {
                     let line = self.actions.park_line(&w.id);
                     self.bg(line);
-                    let m = format!("parked {} · prefix h brings it back", text::sanitize(&r.cands[i].title));
+                    // stash.sh parks a parent with its subagents (FAMILIES).
+                    let m = format!("parked {}{} · prefix h brings it back", text::sanitize(&r.cands[i].title),
+                        kids_words(r.cands[i].kids));
                     self.start(r, Pending::new(i, Outcome::Parked, m, "parking", "stash.sh"));
                 }
                 Err(e) => r.refused(e),
@@ -530,7 +540,8 @@ impl Runner {
                             sh_quote(&format!("w:{}", w.id)));
                         self.bg(line);
                         let back = text::wake_phrase(&text::wake(t, text::now()));
-                        let m = format!("snoozed {} · back {back}", text::sanitize(&r.cands[i].title));
+                        let m = format!("snoozed {}{} · back {back}", text::sanitize(&r.cands[i].title),
+                            kids_words(r.cands[i].kids));
                         self.start(r, Pending::new(i, Outcome::Snoozed, m, "snoozing", "stash.sh"));
                     }
                     Err(e) => r.refused(e),
@@ -577,13 +588,28 @@ impl Runner {
     }
 
     /// `c`: the agent's pane through closed-tabs.sh (no `--ask-space`).
-    fn close(&mut self, i: usize) -> Result<String, String> {
+    /// `family` (y in [`view::Mode::Family`]): `close-family`, the agent and
+    /// every subagent under it as one ⌘Z group; k closed the parent alone
+    /// (its children become orphans).
+    fn close(&mut self, i: usize, family: bool) -> Result<String, String> {
         let w = self.recheck(i)?;
         close_refusal(&w)?;
         let pane = if self.dry { w.id.clone() } else { self.actions.agent_pane(&w.id, &w.kind)? };
-        let line = format!("{} close {}", self.script("closed-tabs.sh"), sh_quote(&pane));
+        let verb = if family { "close-family" } else { "close" };
+        let line = format!("{} {verb} {}", self.script("closed-tabs.sh"), sh_quote(&pane));
         self.bg(line);
-        Ok(format!("closed {} · ⌘Z brings it back", text::sanitize(&w.label)))
+        let with = if family { kids_words(w.kids.map_or(0, |k| k.total)) } else { String::new() };
+        Ok(format!("closed {}{with} · ⌘Z brings it back", text::sanitize(&w.label)))
+    }
+}
+
+/// " + N subagents" for a parent that takes them along (park, snooze, a
+/// family close); "" for none.
+fn kids_words(n: u32) -> String {
+    match n {
+        0 => String::new(),
+        1 => " + 1 subagent".into(),
+        n => format!(" + {n} subagents"),
     }
 }
 

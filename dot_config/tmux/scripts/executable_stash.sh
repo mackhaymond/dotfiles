@@ -2571,12 +2571,20 @@ classify_window() {
 # which closed-tabs.sh prints on success.
 PIN_WHY=""
 PIN_ID=""
+# A family member's ⌘Z group (FAMILIES, at do_stash_many): set by the caller
+# around one pin_window call, empty otherwise.
+PIN_GROUP="" PIN_ORD="" PIN_PARENT=""
 pin_window() {
     local pane="$1" err rc errf
+    local -a fam=()
     PIN_WHY=""; PIN_ID=""
     [ -f "$CLOSED_TABS_SH" ] || { PIN_WHY="closed-tabs.sh is missing"; return 3; }
+    if [ -n "$PIN_GROUP" ]; then
+        fam=(--group "$PIN_GROUP" --group-ord "${PIN_ORD:-0}")
+        [ -n "$PIN_PARENT" ] && fam+=(--parent-window "$PIN_PARENT" --parent-closing)
+    fi
     errf=$(mktemp "${TMPDIR:-/tmp}/stash-pin.XXXXXX") || errf=/dev/null
-    PIN_ID=$(bash "$CLOSED_TABS_SH" close --pin ${SNOOZE_WAKE:+--wake "$SNOOZE_WAKE"} "$pane" 2>"$errf" </dev/null)
+    PIN_ID=$(bash "$CLOSED_TABS_SH" close --pin ${SNOOZE_WAKE:+--wake "$SNOOZE_WAKE"} ${fam[@]+"${fam[@]}"} "$pane" 2>"$errf" </dev/null)
     rc=$?
     PIN_ID="${PIN_ID##*$'\n'}"
     err=$(cat "$errf" 2>/dev/null)
@@ -3117,6 +3125,46 @@ do_check() {
     return "$DRY_RC"
 }
 
+# fam_order <family rows> <win…>: the windows to park, in order: each named
+# family's members deepest and last-born first, its root last (so no parent
+# goes while a child of it is still on the bar); a window in no family as it
+# was. Rows: closed-tabs.sh `family` (win, root, ord, parent, …; TAB).
+fam_order() {
+    local rows="$1"; shift
+    awk -F '\t' -v want="$*" '
+        { root[$1] = $2; c[$2]++; mem[$2, c[$2]] = $1 }
+        END {
+            m = split(want, ws, " ")
+            for (j = 1; j <= m; j++) {
+                x = ws[j]
+                if (x in root) {
+                    r = root[x]
+                    for (k = c[r]; k >= 1; k--) { y = mem[r, k]; if (!(y in out)) { out[y] = 1; print y } }
+                } else if (!(x in out)) { out[x] = 1; print x }
+            }
+        }' <<< "$rows"
+}
+# fam_get <win>: "root<TAB>ord<TAB>parent" of a window in $fam_rows (the
+# caller's), nothing when it is in no family.
+fam_get() {
+    [ -n "${fam_rows:-}" ] || return 0
+    awk -F '\t' -v w="$1" '$1 == w { print $2 "\t" $3 "\t" $4; exit }' <<< "$fam_rows"
+}
+# fam_name <win>: a family member as a refusal names it: its task title, else
+# its summary, else its window name, quoted.
+fam_name() {
+    local n
+    n=$(tmux display-message -p -t "$1" '#{?#{@agent_spawn_task},#{@agent_spawn_task},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}' 2>/dev/null)
+    [ ${#n} -gt 30 ] && n="${n:0:29}…"
+    printf '“%s”' "${n:-$1}"
+}
+# fam_members <root> <win…>: how many of the windows are in <root>'s family.
+fam_members() {
+    local r="$1" w n=0; shift
+    for w in "$@"; do [ "$(fam_get "$w" | cut -f1)" = "$r" ] && n=$((n + 1)); done
+    printf '%s' "$n"
+}
+
 # Park one or more windows as a single transaction: one lock, one renumber, one
 # publish. Looping the single-window path instead would take and drop the lock
 # per window, renumber per window, and let another park interleave halfway
@@ -3127,6 +3175,28 @@ do_stash_many() {
     # Per accepted window, beside `wins`: what classify_window decided, and
     # its pane for a pin. Refusals with a reason go to `kept_why`.
     local kinds=() cpanes=() cagents=() kept_why=() pre="" line
+
+    # FAMILIES (external subagents, docs/agent-tab-indicator.md §8): a parent
+    # parks with every subagent under it (closed-tabs.sh `family`: the same
+    # session, tree order), the children first and the parent last, all
+    # pinned into ONE ⌘Z group (--group; a child with --parent-closing, so
+    # no parent is told), which unparks together, root first (closed-tabs.sh
+    # reopen / wake). Whole or not at all: a member that is working, or that
+    # the classification refuses, keeps the whole family (fam_bad). Parking a
+    # child alone is allowed: it takes its own subtree, and its parent is told
+    # as for a close. Only looked up while any window has a parent link
+    # (@agent_kids_any), so it costs nothing otherwise.
+    local fam_rows="" fam_bad="" fam_ts="" fr fo fp
+    if [ -f "$CLOSED_TABS_SH" ] && [ -n "$(tmux show -gqv @agent_kids_any 2>/dev/null)" ]; then
+        fam_rows=$(bash "$CLOSED_TABS_SH" family "$@" 2>/dev/null </dev/null | awk -F '\t' '
+            $1 ~ /^@[0-9]+$/ && $3 ~ /^[0-9]+$/ { n++; r[n] = $0; root[n] = $2; if ($3 > 0) has[$2] = 1 }
+            END { for (i = 1; i <= n; i++) if (root[i] in has) print r[i] }')
+    fi
+    if [ -n "$fam_rows" ]; then
+        fam_ts=$(date +%s)
+        # shellcheck disable=SC2046  # window ids: no spaces, no globs
+        set -- $(fam_order "$fam_rows" "$@")
+    fi
 
     # The slow part of the classification FIRST, outside the lock: the deep
     # guards (session files, the transcript, the workflow and subagent walks,
@@ -3148,6 +3218,37 @@ do_stash_many() {
     # it runs under the lock — moves, freezes and pins, each window refreshing
     # the lock's age (lock_touch) so a long range never reads as stale.
     [ -n "$STASH_DRY" ] || lock_acquire || { msg -k warn "busy — try again"; return 0; }   # 0: see the note on the refusal below
+
+    # A family goes whole or not at all (FAMILIES above): one reason per
+    # root, "root SEP why" lines, read under the lock like agent_running is.
+    if [ -n "$fam_rows" ]; then
+        local fw fwhy fk fpane
+        while IFS=$'\t' read -r fw fr _; do
+            [ -n "$fw" ] || continue
+            case "$fam_bad" in *"$fr$SEP"*) continue ;; esac
+            fwhy=""
+            if agent_running "$fw"; then
+                fwhy="that agent is still working"
+                [ "$fw" = "$fr" ] || fwhy="its subagent is still working"
+            else
+                line=$(printf '%s' "$pre" | awk -F"$SEP" -v w="$fw" '$1 == w { print; exit }')
+                IFS="$SEP" read -r _ fk fpane _ fwhy <<< "$line"
+                case "$fk" in
+                    refuse) ;;
+                    # What close --pin would refuse, asked now (both modes):
+                    # a refusal at the commit would leave this one behind.
+                    pin) fwhy=$(pin_dry_why "$fpane") ;;
+                    # No agent left in it (a shell): it would be parked as a
+                    # window, outside the group, and come back apart.
+                    park) fwhy="$(fam_name "$fw") has no agent left" ;;
+                    *) fwhy="" ;;
+                esac
+                [ -n "$fwhy" ] && [ "$fw" != "$fr" ] && fwhy="its subagent: $fwhy"
+                [ "$fwhy" = "its subagent: that agent is still working" ] && fwhy="its subagent is still working"
+            fi
+            [ -n "$fwhy" ] && fam_bad="${fam_bad}${fr}${SEP}${fwhy}"$'\n'
+        done <<< "$fam_rows"
+    fi
 
     # Resolve membership UNDER the lock. These ids come from a keypress that may
     # be seconds old by now, so in between a window can have been closed, parked
@@ -3172,6 +3273,19 @@ do_stash_many() {
         if [ "$(tmux show -wqv -t "$w" @space_home 2>/dev/null)" = "1" ]; then
             slog "refused to hide $w — it is its space's home"
             homes=$((homes + 1)); continue
+        fi
+        # A family kept whole (FAMILIES above): said once, at its root.
+        if [ -n "$fam_bad" ]; then
+            fr=$(fam_get "$w" | cut -f1)
+            fwhy=""
+            [ -n "$fr" ] && fwhy=$(awk -F"$SEP" -v r="$fr" '$1 == r { print $2; exit }' <<< "$fam_bad")
+            if [ -n "$fwhy" ]; then
+                if [ "$w" = "$fr" ]; then
+                    if [ "$fwhy" = "that agent is still working" ]; then busy=$((busy + 1)); else kept_why+=("$fwhy"); fi
+                    slog "refused to hide $w and its subagents — $fwhy"
+                fi
+                continue
+            fi
         fi
         # Refuse to hide a working agent at all, rather than hiding it and then
         # declining to suspend it. That combination is the worst of both: the
@@ -3259,9 +3373,35 @@ do_stash_many() {
     [ -n "$STASH_DRY" ] && return 0
 
     local parked=() pinned=0 failed=0 left i kind rc hold_made=""
+    # Families at the commit (FAMILIES above): fam_dead = roots a refusal
+    # here keeps whole (the rest of the family is skipped: the parent comes
+    # last, so nothing of it has gone but the children already pinned before
+    # it, which the up-front check makes rare); fam_started = roots begun;
+    # fam_groups = the groups pinned, linked after the loop.
+    local fam_dead=" " fam_started=" " fam_groups=" " g nf
     BOOT_WIN=""
     for i in "${!wins[@]}"; do
         w="${wins[$i]}"; kind="${kinds[$i]}"
+        fr=""
+        [ -n "$fam_rows" ] && fr=$(fam_get "$w" | cut -f1)
+        if [ -n "$fr" ]; then
+            case "$fam_dead" in *" $fr "*) slog "kept $w — its family stays"; continue ;; esac
+            case "$fam_started" in
+                *" $fr "*) ;;
+                *)  fam_started="$fam_started$fr "
+                    # The whole family must go with a window to spare, or none
+                    # of it does (the per-move check below would stop halfway).
+                    nf=$(fam_members "$fr" "${wins[@]:$i}")
+                    left=$(tmux list-windows -t "=$sess" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ')
+                    case "$left" in ''|*[!0-9]*) left=0 ;; esac
+                    if [ "$left" -le "$nf" ]; then
+                        fam_dead="$fam_dead$fr "
+                        kept_why+=("$(fam_name "$fr") and its subagents are all that's left in this session")
+                        slog "refused to hide $fr and its subagents — all that's left in $sess"
+                        continue
+                    fi ;;
+            esac
+        fi
         # Re-check per move, not just once up front. The count above cannot be
         # fooled by duplicates or foreign ids, but nothing stops a window
         # CLOSING on its own between the count and the last move — a shell
@@ -3287,20 +3427,38 @@ do_stash_many() {
         # with the close.
         if [ "$kind" = pin ]; then
             if pin_recheck "$w" "${cpanes[$i]}" "${cagents[$i]}"; then
-                if [ "$RECHECK_WHY" = "that agent is still working" ]; then busy=$((busy + 1)); else kept_why+=("$RECHECK_WHY"); fi
-                slog "refused to hide $w — $RECHECK_WHY (re-check)"
+                if [ -n "$fr" ] && [ "$w" != "$fr" ]; then
+                    # A child refused: the rest of its family stays too.
+                    fam_dead="$fam_dead$fr "
+                    if [ "$RECHECK_WHY" = "that agent is still working" ]; then kept_why+=("its subagent is still working")
+                    else kept_why+=("its subagent: $RECHECK_WHY"); fi
+                elif [ "$RECHECK_WHY" = "that agent is still working" ]; then busy=$((busy + 1)); else kept_why+=("$RECHECK_WHY"); fi
+                slog "refused to hide $w — $RECHECK_WHY (re-check)${fr:+; its family stays}"
                 continue
             fi
+            # A family's member: one ⌘Z group per root (FAMILIES above).
+            PIN_GROUP="" PIN_ORD="" PIN_PARENT=""
+            if [ -n "$fam_rows" ]; then
+                IFS=$'\t' read -r fr fo fp <<< "$(fam_get "$w")"
+                [ -n "$fr" ] && PIN_GROUP="g-$fam_ts-$$-${fr#@}" PIN_ORD="$fo" PIN_PARENT="$fp"
+            fi
             pin_window "${cpanes[$i]}"; rc=$?
+            g="$PIN_GROUP"
+            PIN_GROUP="" PIN_ORD="" PIN_PARENT=""
             if [ "$rc" = 0 ]; then
-                pinned=$((pinned + 1)); log "stashed $w as a pinned ⌘Z entry${SNOOZE_WAKE:+ ($PIN_ID), waking at $SNOOZE_WAKE}"
+                pinned=$((pinned + 1)); log "stashed $w as a pinned ⌘Z entry${SNOOZE_WAKE:+ ($PIN_ID), waking at $SNOOZE_WAKE}${g:+ (group $g)}"
                 [ -n "$SNOOZE_WAKE" ] && printf 'p:%s\n' "$PIN_ID"
+                [ -n "$g" ] && case "$fam_groups" in *" $g "*) ;; *) fam_groups="$fam_groups$g " ;; esac
             elif [ -z "$(tmux display-message -p -t "${cpanes[$i]}" '#{pane_id}' 2>/dev/null)" ]; then
                 # Gone even so (a close that failed late).
                 failed=$((failed + 1)); log "close --pin of $w failed ($PIN_WHY) and the tab is gone"
             else
-                if [ "$rc" = 3 ]; then kept_why+=("$PIN_WHY"); else failed=$((failed + 1)); fi
-                slog "refused to hide $w — $PIN_WHY"
+                if [ -n "$fr" ] && [ "$w" != "$fr" ]; then
+                    # A child the close refused: the rest of its family stays.
+                    fam_dead="$fam_dead$fr "
+                    kept_why+=("its subagent: $PIN_WHY")
+                elif [ "$rc" = 3 ]; then kept_why+=("$PIN_WHY"); else failed=$((failed + 1)); fi
+                slog "refused to hide $w — $PIN_WHY${fr:+; its family stays}"
             fi
             continue
         fi
@@ -3339,6 +3497,11 @@ do_stash_many() {
             log "could not move $w back to $sess — it is parked, partly running"
             parked+=("$w")
         fi
+    done
+    # Each family pinned: its entries' parent_sid / child_sids from the
+    # group's own entries (closed-tabs.sh family-link; fail-open).
+    for g in $fam_groups; do
+        bash "$CLOSED_TABS_SH" family-link "$g" </dev/null >/dev/null 2>&1
     done
 
     if [ "${#parked[@]}" -eq 0 ]; then

@@ -56,8 +56,8 @@ Tabs	⌘⇧E	New agent tab in a space… (launcher, picker)	root	User28	the agen
 Tabs	⌘⌥T	Replace this tab with a fresh shell	prefix	R	⌃S R
 Tabs	⌘⌥R	Replace this tab with claude	prefix	C-k	⌃S ⌃K
 Tabs	⌃⌘T	New nushell tab	prefix	N	⌃S N
-Tabs	⌘W	Close tab (y/n; refused on home)	prefix	x	⌃S x
-Tabs	⌘⇧W	Close tab, no y/n	prefix	C-l	⌃S ⌃L
+Tabs	⌘W	Close tab (y/n; refused on home)	prefix	x	⌃S x · a parent asks: + children / keep / cancel
+Tabs	⌘⇧W	Close tab, no y/n	prefix	C-l	⌃S ⌃L · a parent still asks about its children
 Tabs	⌘Z	Reopen a closed tab (agent resumed)	prefix	X	⌃S X
 Tabs	click tab	Status line: go to that tab or space	root	MouseDown1Status	[+] opens a shell
 

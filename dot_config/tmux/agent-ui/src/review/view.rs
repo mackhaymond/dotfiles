@@ -147,6 +147,10 @@ pub enum Mode {
     Snooze { sel: usize, typing: Option<String>, err: Option<String> },
     /// "No agents left in X. Close the space? y/n".
     Space(SpaceInfo),
+    /// `c` on a parent (external subagents): "close + N children (y) / keep
+    /// them, they become orphans (k) / cancel (n)", closed-tabs.sh close-ask's
+    /// question asked in the popup.
+    Family(usize),
     /// The summary (or "Nothing to review"); any key closes.
     Done,
 }
@@ -155,6 +159,8 @@ pub enum Mode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Req {
     Close(usize),
+    /// Close candidate `.0` with every subagent under it, as one ⌘Z group.
+    CloseFamily(usize),
     Park(usize),
     /// Snooze candidate `.0` until the time `.1` reads as (`snooze.sh parse`).
     Snooze(usize, String),
@@ -296,6 +302,15 @@ impl Review {
                 }
                 _ => None,
             },
+            Mode::Family(i) => match k {
+                Key::Char('y' | 'Y') => Some(Req::CloseFamily(i)),
+                Key::Char('k' | 'K') => Some(Req::Close(i)),
+                Key::Char('n' | 'N' | 'q') | Key::Esc | Key::CtrlC => {
+                    self.mode = Mode::Agent;
+                    None
+                }
+                _ => None,
+            },
             Mode::Snooze { sel, typing, err } => self.snooze_key(k, sel, typing, err),
             Mode::Agent => self.agent_key(k),
         }
@@ -310,6 +325,7 @@ impl Review {
             Key::Char('c' | 'p' | 's' | 'k' | ' ' | 'v') if done.is_some() => {
                 self.flash = Some((final_word(done.unwrap_or(Outcome::Closed)), true));
             }
+            Key::Char('c') if self.cands.get(i).is_some_and(|c| c.kids > 0) => self.mode = Mode::Family(i),
             Key::Char('c') => return Some(Req::Close(i)),
             Key::Char('p') => return Some(Req::Park(i)),
             Key::Char('s') => self.mode = Mode::Snooze { sel: 0, typing: None, err: None },
@@ -517,6 +533,7 @@ pub fn render(r: &Review, buf: &mut Buffer) {
         let body = Rect::new(m.x, m.y + 3, m.width, m.height - 3);
         match &r.mode {
             Mode::Space(info) => space_prompt(info, buf, body),
+            Mode::Family(i) => family_prompt(r.cands.get(*i).map_or(0, |c| c.kids), buf, body),
             Mode::Snooze { sel, typing, err } => snooze(r, *sel, typing.as_deref(), err.as_deref(), buf, body),
             _ => card_body(r, buf, body),
         }
@@ -854,6 +871,15 @@ fn space_prompt(info: &SpaceInfo, buf: &mut Buffer, b: Rect) {
     put(buf, b.x, b.y + 3, end, "every tab goes through ⌘W's close · ⌘Z reopens", fg("overlay2"));
 }
 
+/// `c` on a parent: what goes with it.
+fn family_prompt(kids: u32, buf: &mut Buffer, b: Rect) {
+    let end = b.x + b.width;
+    let (n, them) = if kids == 1 { ("1 child".to_string(), "it becomes an orphan") } else { (format!("{kids} children"), "they become orphans") };
+    put(buf, b.x, b.y, end, &format!("It has {n} (external subagents)."), fg("sub"));
+    put(buf, b.x, b.y + 2, end, &format!("Close it + {n}?"), bold(fg("peach")));
+    put(buf, b.x, b.y + 3, end, &format!("y closes them all as one ⌘Z group · k keeps them ({them})"), fg("overlay2"));
+}
+
 /// The end: a row per outcome, then what the last action said.
 fn done(r: &Review, buf: &mut Buffer, b: Rect) {
     let end = b.x + b.width;
@@ -907,6 +933,7 @@ fn footer(r: &Review, buf: &mut Buffer, w: u16, y: u16) {
         Mode::Snooze { typing: Some(_), .. } => &[("⏎", "snooze", Some("peach")), ("esc", "back", None)],
         Mode::Snooze { .. } => &[("⏎", "snooze", Some("peach")), ("↑↓", "move", None), ("esc", "back", None)],
         Mode::Space(_) => &[("y", "close the space", Some("red")), ("n", "keep it", Some("teal"))],
+        Mode::Family(_) => &[("y", "close + children", Some("red")), ("k", "keep them", Some("teal")), ("n", "cancel", None)],
         Mode::Done => &[("any key", "close", None)],
     };
     // Words: 2 on every key, 1 on the actions only, 0 on none.
