@@ -1,6 +1,6 @@
 -- Minimal Hammerspoon config (replaces the old, unused Spacehammer setup).
 --
--- Job: pin the two MAIN windows of Arc (and, once classified, Zen: Arc stops working
+-- Job: pin the two MAIN windows of Arc and of Zen (Arc stops working
 -- 2026-12-22) to the `main` and `school` yabai
 -- spaces (one each, title-independent), while leaving everything else about Arc --
 -- including "Little Arc" popups -- as a normal MANAGED window (tiled, in the
@@ -31,12 +31,14 @@ require("hs.ipc") -- enables the `hs` command-line tool
 -- "yabai unavailable" and gives up for this pass.
 local YABAI = "/usr/bin/perl -e 'alarm shift; exec @ARGV' 2 /opt/homebrew/bin/yabai"
 -- The browsers whose two MAIN windows are pinned, each on its own (see pinMains).
--- TODO 2026-11-24: Zen (Gecko) has no bigBrowserWindow id, so it classifies as
--- "unknown"/"other" and is NOT pinned until arcKindFromId learns it. Shell twin:
--- YABAI_BROWSER_APPS in yabai_common.sh.
+-- Arc: classified by AXIdentifier. Zen (Gecko) exposes no AXIdentifier, and nothing
+-- else in AX tells its main windows from a popup (checked 2026-11-25), so for an app
+-- listed in OLDEST_ARE_MAIN the mains are its two OLDEST standard windows by window id
+-- (see oldestMains). Shell twin: YABAI_BROWSER_APPS in yabai_common.sh.
 local BROWSERS = { "company.thebrowser.Browser", "app.zen-browser.zen" }
 local IS_BROWSER = {}
 for _, b in ipairs(BROWSERS) do IS_BROWSER[b] = true end
+local OLDEST_ARE_MAIN = { ["app.zen-browser.zen"] = "Zen" } -- bundle -> yabai app name
 local MAIN_LABEL = "main"
 local SCHOOL_LABEL = "school"
 
@@ -97,7 +99,8 @@ end
 local function classifyCurrent()
   local learned = false
   for _, bundle in ipairs(BROWSERS) do
-    for _, axw in ipairs(arcAxWindows(bundle)) do
+    -- OLDEST_ARE_MAIN browsers are read from yabai in pinMains, never from AX.
+    for _, axw in ipairs(OLDEST_ARE_MAIN[bundle] and {} or arcAxWindows(bundle)) do
       local kind = arcKindFromId(axw:attributeValue("AXIdentifier"))
       local hw = axw.asHSWindow and axw:asHSWindow()
       if hw then
@@ -111,13 +114,43 @@ local function classifyCurrent()
   return learned
 end
 
+-- Ids of the two oldest standard windows of a yabai app (window ids grow, so a popup is
+-- newer than the mains). Stateless: no AX, works across Spaces. Returns nil when any real-
+-- size window is not AX-resolved by yabai yet (no usable subrole): ranking without it would
+-- promote a newer window into its slot, so that pass is skipped. Minimized, fullscreen and
+-- floating windows keep their rank (they still are mains) but pinMains won't move them.
+-- LIMITS: when a main closes, the next-oldest window is promoted and can be moved; a
+-- session restore that re-creates a popup before a main ranks the popup as a main.
+local function oldestMains(all, appName)
+  local ids = {}
+  for _, w in ipairs(all) do
+    if w.app == appName then
+      if w["root-window"] and not w["has-ax-reference"]
+         and w.frame.w >= 300 and w.frame.h >= 200 then
+        return nil
+      end
+      if w.role == "AXWindow" and w.subrole == "AXStandardWindow"
+         and w.title ~= "Picture-in-Picture" then
+        ids[#ids + 1] = w.id
+      end
+    end
+  end
+  table.sort(ids)
+  return { ids[1], ids[2] }
+end
+
 -- Pin the remembered main windows to main/school, one each, stably. Never moves a
 -- window already on a target; only fills an empty target from off-target/surplus
 -- windows. Fullscreen main windows are left alone (reachable via hyper+3-9, they
 -- return to their space on exit). Touches ONLY ids in mainSet, so Little Arc and
 -- every other Arc window are never moved.
 local function pinMains()
-  if next(mainSet) == nil then return end -- nothing learned yet: no yabai call at all
+  -- Nothing learned and no OLDEST_ARE_MAIN browser running: no yabai call at all.
+  local wanted = next(mainSet) ~= nil
+  for bundle in pairs(OLDEST_ARE_MAIN) do
+    wanted = wanted or hs.application.applicationsForBundleID(bundle)[1] ~= nil
+  end
+  if not wanted then return end
   -- One at a time, so a yabai that is down costs one timeout, not two.
   local mIdx = labelIndex(MAIN_LABEL)
   if not mIdx then return end
@@ -131,19 +164,36 @@ local function pinMains()
   -- Slots are PER BROWSER: one browser on main/school must not fill the other's slots
   -- or pull its surplus windows into a gap.
   for _, bundle in ipairs(BROWSERS) do
-    local onMain, onSchool, pool = {}, {}, {}
-    for id, b in pairs(mainSet) do
+    local onMain, onSchool, pool, mains = {}, {}, {}, {}
+    if OLDEST_ARE_MAIN[bundle] then
+      mains = oldestMains(all, OLDEST_ARE_MAIN[bundle]) or {}
+    else
+      for id, b in pairs(mainSet) do
+        if not byId[id] then mainSet[id] = nil -- window is gone
+        elseif b == bundle then mains[#mains + 1] = id end
+      end
+    end
+    for _, id in ipairs(mains) do
       local w = byId[id]
-      if not w then
-        mainSet[id] = nil -- window is gone
-      elseif b == bundle and not w["is-native-fullscreen"] then
+      local still = OLDEST_ARE_MAIN[bundle] and (w["is-minimized"] or w["is-floating"])
+      if not w["is-native-fullscreen"] and not still then
         if w.space == mIdx then onMain[#onMain + 1] = id
         elseif w.space == sIdx then onSchool[#onSchool + 1] = id
         else pool[#pool + 1] = id end
       end
     end
-    for i = 2, #onMain do pool[#pool + 1] = onMain[i] end
-    for i = 2, #onSchool do pool[#pool + 1] = onSchool[i] end
+    -- A surplus window is never taken from under the user where it may be a popup
+    -- (OLDEST_ARE_MAIN: e.g. a sign-in popup while there is one main); it is split at a
+    -- later trigger, once it has no focus.
+    local function surplus(list)
+      for i = 2, #list do
+        if not (OLDEST_ARE_MAIN[bundle] and byId[list[i]]["has-focus"]) then
+          pool[#pool + 1] = list[i]
+        end
+      end
+    end
+    surplus(onMain)
+    surplus(onSchool)
 
     if #onMain == 0 and #pool > 0 then
       yabai("window " .. table.remove(pool, 1) .. " --space " .. MAIN_LABEL)
