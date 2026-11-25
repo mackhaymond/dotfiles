@@ -408,9 +408,11 @@ The base config writes these chords as "→ F13/F14/F18/F19" (the names skhdrc b
 
 BetterTouchTool is no longer running; its Arc shortcuts live in `karabiner-base.json`, active only while Arc or Zen is frontmost (Zen 1.24.3b's default Space/copy-URL chords are Arc's; its ctrl+tab is recent-order only with `browser.ctrlTab.sortByRecentlyUsed`, set in the Zen profile's user.js): `hyper+a` → `option+command+left_arrow`, `hyper+s` → `option+command+right_arrow`, `hyper+c` → `shift+command+c` (copy URL), plus the double-tap caps_lock / right_shift → `ctrl+tab`. **Trap:** the generated skhdrc rule is *prepended*, so an skhdrc bind on `hyper - a`/`s`/`c` would win over these and silently kill the Arc shortcuts — keep those three keys out of skhdrc.
 
-#### Minimize key (pinned apps + Arc/Zen)
+#### Minimize and hide keys (pinned apps + Arc/Zen)
 
 `cmd+m` (either side; no other modifier, so `hyper+m` is untouched) runs `yabai_minimize.sh` while a pinned app or Arc/Zen is frontmost: nothing for a pinned window, else yabai does the minimize (only for a window that has a minimize button). The bundle ids are written out in `karabiner-base.json`; keep them in step with `YABAI_PINNED_HOMES`, `YABAI_AGENT_APPS` and `YABAI_BROWSER_APPS`. `cmd+option+m` is deliberately not bound: it is Zen's Responsive Design Mode and Google Docs' insert comment, and signal #15 covers a real Minimize All.
+
+`cmd+h` is swallowed in the same apps (hiding is per app, so it would take the pinned windows along). Not covered: the Hide menu item, and `cmd+option+h` (Hide Others) from another app. The yellow button cannot be disabled from outside: `AXEnabled` on `AXMinimizeButton` is not settable (checked 2026-11-25 in eight of these apps), so signal #15 undoes it.
 
 #### System FN Row Preservation
 
