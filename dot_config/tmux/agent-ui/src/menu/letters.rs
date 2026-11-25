@@ -260,7 +260,7 @@ pub fn of_view(snap: &Snapshot, view: &ViewModel, keys: Option<&mut KeyMemo>) ->
         if w.home {
             homes.insert(w.id.as_str());
         }
-        if !w.raw_parent.is_empty() || !w.spawn_id.is_empty() {
+        if !w.raw_parent.is_empty() || (!w.spawn_id.is_empty() && w.kid_orphan.is_empty()) {
             kids.insert(w.id.as_str());
         }
     }
@@ -271,12 +271,14 @@ pub fn of_view(snap: &Snapshot, view: &ViewModel, keys: Option<&mut KeyMemo>) ->
     // (A window that is a home in ANY of its links is a home: never listed.)
     // Nor is a delegated CHILD: `@agent_child` (the reconciler's verdict), the
     // raw `@agent_parent` (from its birth on, before the first reconcile, and
-    // while its parent is parked) or `@agent_spawn_id` (agent-spawn's child,
-    // orphaned or not). It is reached through its parent (the nested rows,
-    // the menu, the parent's ask jump), so it holds no pool letter; a key it
-    // still carries is free and is unset once another window takes it (rule
-    // 4). An ex-child of abby-delegate's era (no spawn id), once orphaned,
-    // is listed again like any agent.
+    // while its parent is parked) or `@agent_spawn_id` without
+    // `@agent_kid_orphan` (agent-spawn's child whose parent is still there).
+    // It is reached through its parent (the nested rows, the menu, the
+    // parent's ask jump), so it holds no pool letter; a key it still carries
+    // is free and is unset once another window takes it (rule 4). An ORPHAN
+    // (`@agent_kid_orphan` set: its parent's agent is gone, or Mack chose
+    // "keep them") is nested under nobody, so it is listed and lettered again
+    // like any agent; so is an abby-era ex-child (no spawn id, no link).
     // The FILL order: every agent first (display order), then every shell,
     // so when keys run short a new agent still gets one before a shell does.
     let (agents, shells): (Vec<&Agent>, Vec<&Agent>) = lettered(view)
@@ -649,9 +651,14 @@ mod tests {
         let a = of_rows(&pool(&[("@4", "parent", "@2")]));
         assert_eq!(a.letters.get("@4"), None);
         assert_eq!(a.letters.len(), 4);
-        // agent-spawn's child, orphaned (link gone, identity kept): still none.
+        // agent-spawn's child whose parent is still there (identity, no
+        // verdict yet, e.g. a parked parent): none.
         let a = of_rows(&pool(&[("@4", "spawn_id", "s-ab1")]));
         assert_eq!(a.letters.get("@4"), None);
+        // The same child orphaned (parent gone, "keep them"): nested under
+        // nobody, so it is lettered again.
+        let a = of_rows(&pool(&[("@4", "spawn_id", "s-ab1"), ("@4", "kid_orphan", "a")]));
+        assert!(a.letters.contains_key("@4"));
         // An abby-era ex-child (no link, no spawn id): listed again.
         let a = of_rows(&pool(&[]));
         assert!(a.letters.contains_key("@4"));
