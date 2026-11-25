@@ -75,7 +75,7 @@ class LifecycleTests(unittest.TestCase):
         vpn.write_login_result("failed", attempt="old-attempt")
         self.assertFalse((self.state / "login-result.json").exists())
 
-    def test_arc_opens_url_as_argv(self):
+    def test_zen_opens_url_as_argv(self):
         vpn.write_json(self.state / "login-attempt.json", {"id": "a"})
         with patch.dict(os.environ, {"SEASNET_VPN_LOGIN_ATTEMPT": "a"}), \
                 patch.object(vpn.subprocess, "run", return_value=Mock(returncode=0)) as run, \
@@ -83,12 +83,12 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(vpn.browser_login('https://shb.ais.ucla.edu/login?x="end tell'), 0)
         args = run.call_args.args[0]
         self.assertEqual(args[-1], 'https://shb.ais.ucla.edu/login?x="end tell')
-        self.assertNotIn("shb.ais", " ".join(args[:-1]))
+        self.assertEqual(args[:-1], [vpn.OPEN, "-b", "app.zen-browser.zen"])
         self.assertFalse(vpn.login_cancelled())
 
-    def test_arc_failure_reports_cancellation(self):
+    def test_zen_failure_reports_cancellation(self):
         vpn.write_json(self.state / "login-attempt.json", {"id": "a"})
-        for outcome in (Mock(returncode=1), OSError("no osascript")):
+        for outcome in (Mock(returncode=1), OSError("no open")):
             with self.subTest(outcome=outcome), patch.dict(os.environ, {"SEASNET_VPN_LOGIN_ATTEMPT": "a"}), \
                     patch.object(vpn.subprocess, "run", side_effect=[outcome] if isinstance(outcome, Exception) else None,
                                  return_value=outcome), redirect_stderr(io.StringIO()):

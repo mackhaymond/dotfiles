@@ -9,7 +9,7 @@ and system traffic use their normal connections.
 A foreground command on a terminal, typed by you or run by an agent in its pty:
 `seasnet-vpn start`, or `ssh seasnet` / `relayctl …` when the VPN is down. That
 opens UCLA sign-in in a
-**Little Arc** window, so 1Password fills it, then Duo. Ctrl-C in the terminal
+**Zen** tab (it comes to the front), so 1Password fills it, then Duo. Ctrl-C in the terminal
 cancels; an unfinished login times out after 5 minutes. Login progress and refusals
 are written to your terminal even when the caller hides ssh's stderr, which
 relayctl does.
