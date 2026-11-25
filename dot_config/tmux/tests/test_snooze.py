@@ -21,6 +21,7 @@ Run with unittest or pytest.
 """
 import json
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 import shutil
@@ -140,7 +141,10 @@ class Base(unittest.TestCase):
 
     def calls(self, who=None):
         p = self.fake / "calls.log"
-        lines = p.read_text().splitlines() if p.exists() else []
+        # A recorder writes its line in pieces: one still being written is not
+        # a call yet.
+        text = p.read_text() if p.exists() else ""
+        lines = text[:text.rfind("\n") + 1].splitlines()
         out = [l.split(US) for l in lines]
         return [c[1:] for c in out if who is None or c[0] == who] if who else out
 
@@ -241,6 +245,65 @@ class Parse(Base):
                 self.assertEqual(r.returncode, 1, (text, r.stdout))
                 self.assertEqual(r.stdout, "")
                 self.assertIn("snooze:", r.stderr)
+
+    def test_freeform(self):
+        # The grammar is test_snooze_when.py's; this is the way through the shell.
+        self.check(MON_1015, [
+            ("next monday", local(2026, 11, 23, 9)), ("tomorrow morning", local(2026, 11, 17, 9)),
+            ("dec 3 at 2pm", local(2026, 12, 3, 14)), ("an hour and a half", MON_1015 + 5400),
+            ("tonight at 9", local(2026, 11, 16, 21)), ("a week from friday 3pm", local(2026, 11, 27, 15)),
+            ("tonight 9:30", local(2026, 11, 16, 21, 30)), ("friday next", local(2026, 11, 27, 9)),
+        ])
+        self.assertEqual(self.run_script("parse", "next\nmonday").stdout, f"{local(2026, 11, 23, 9)}\n")
+        self.assertEqual(self.run_script("parse", " Next ", "MONDAY,").stdout, f"{local(2026, 11, 23, 9)}\n")
+        self.assertEqual(self.run_script("parse", "5 o'clock").stdout, f"{local(2026, 11, 16, 17)}\n")
+
+    def test_text_is_only_text(self):
+        touched = Path(self.tmp, "touched")
+        for text in (f"$(touch {touched})", f"`touch {touched}`", f"2h; touch {touched}", f"2h && touch {touched}",
+                     f"2h\ntouch {touched}", '"', "'", "2h'", '2h"', "-5m", "--", "-", "-c", "--help", "parse", "batch",
+                     "box", "*", "?", "~", "$HOME", "\\", "%s", "2h|", "#{pid}", "2h\t\x1b[31m", "\u00e9", "\u23f0 2h"):
+            with self.subTest(text=text):
+                r = self.run_script("parse", text, rc=1)
+                self.assertEqual(r.stdout, "")
+                why = "when? (try" if text in ("?", "-") else "can't read '"
+                self.assertTrue(r.stderr.startswith("snooze: " + why), r.stderr)
+                self.assertEqual(r.stderr.count("\n"), 1)
+                self.assertNotIn("\x1b", r.stderr)
+        self.assertFalse(touched.exists())
+        self.run_script("apply-text", "-c", "/dev/ttys999", f"$(touch {touched})", "p:A")
+        self.assertFalse(touched.exists())
+
+    def test_a_broken_reader_is_said_and_never_a_time(self):
+        good = str(MON_1015 + 60)
+        readers = {"crash": "raise SystemError", "syntax": "def (", "usage": "import sys; sys.exit(2)",
+                   "silent": "", "silent failure": "import sys; sys.exit(1)",
+                   "words": "print('tomorrow')", "negative": "print(-5)", "two lines": f"print({good}); print({good})",
+                   "a time, then a crash": f"print({good}); raise SystemError",
+                   "a time and exit 2": f"import sys; print({good}); sys.exit(2)",
+                   "killed": f"import os; print({good}, flush=True); os.kill(os.getpid(), 9)"}
+        paths = {name: str(self.script(f"when-{i}.py", text + "\n"))
+                 for i, (name, text) in enumerate(readers.items())}
+        paths["missing"] = self.tmp + "/nowhere.py"
+        self.fake_tmux()
+        for name, path in paths.items():
+            with self.subTest(reader=name):
+                (self.fake / "calls.log").unlink(missing_ok=True)
+                self.env["SNOOZE_WHEN"] = path
+                r = self.run_script("parse", "1h", rc=1)
+                self.assertEqual((r.stdout, r.stderr), ("", "snooze: the time reader isn't working\n"))
+                self.run_script("apply-text", "-c", "/dev/ttys999", "1h", "p:A")
+                self.assertEqual(self.calls("closed-tabs.sh"), [])
+                self.assertEqual(self.calls("notify.sh")[-1][-1], "snooze: the time reader isn't working")
+                self.run_script("prompt-popup", "-c", "/dev/ttys999", "p:A")      # no box to be stuck in
+                self.assertEqual(self.calls("notify.sh")[-1][-1], "snooze: the time reader isn't working")
+                self.assertEqual(self.calls("closed-tabs.sh"), [])
+
+    def test_never_the_python_on_path(self):
+        # A pyenv shim costs 130 ms a keystroke.
+        self.script("python3", RECORDER + "exit 1\n", self.bin)
+        self.assertEqual(self.run_script("parse", "1h").stdout, f"{MON_1015 + 3600}\n")
+        self.assertEqual(self.calls("python3"), [])
 
 
 class Apply(Base):
@@ -440,6 +503,14 @@ class WakeDue(Base):
                 self.history(entry("A", pinned=True, wake_at=self.now - 10))   # stale file: still no work
                 self.run_script("wake-due")
                 self.assertEqual(self.calls(), [])
+
+    def test_fast_path_starts_no_python(self):
+        mark = Path(self.tmp, "python-ran")
+        self.env["SNOOZE_WHEN"] = str(self.script("when.py", f"open({str(mark)!r}, 'w')\n"))
+        self.sdir.mkdir(parents=True, exist_ok=True)
+        self.next_file.write_text(f"{self.now + 60}\n")
+        self.run_script("wake-due")
+        self.assertFalse(mark.exists())
 
     def test_due_wakes_both_kinds_with_one_toast(self):
         self.next_file.write_text(f"{self.now - 5}\n")
@@ -720,6 +791,31 @@ class MenuCommandsOnAServer(Base):
         self.t("if-shell", "true", self.items["Tomorrow 9:00"][1])
         self.assertEqual(self.wait_calls("closed-tabs.sh")[0], ["snooze", str(local(2026, 11, 17, 9)), "A"])
 
+    def test_every_preset_lands_where_it_says(self):
+        for i, (item, want) in enumerate((("1 hour", self.now + 3600), ("3 hours", self.now + 3 * 3600),
+                                          ("This evening 18:00", local(2026, 11, 16, 18)),
+                                          ("Tomorrow 9:00", local(2026, 11, 17, 9)),
+                                          ("Monday 9:00", local(2026, 11, 23, 9)))):
+            with self.subTest(item=item):
+                self.t("if-shell", "true", self.items[item][1])
+                self.assertEqual(self.wait_calls("closed-tabs.sh", i + 1)[-1], ["snooze", str(want), "A"])
+
+    def test_evening_preset_and_the_reader_override_reach_the_server(self):
+        # SNOOZE_WHEN is carried through the menu, as the other overrides are.
+        mark = Path(self.tmp, "reader")
+        wrap = self.script("when.py", f"open({str(mark)!r}, 'a').write('x')\n"
+                           f"exec(compile(open({str(HERE / 'scripts' / 'executable_snooze-when.py')!r}).read(), 'w', 'exec'))\n")
+        now = local(2026, 11, 16, 19)
+        env = dict(self.env, PATH=f"{Path(self.tmp, 'recbin')}:{self.env['PATH']}", SNOOZE_NOW=str(now),
+                   SNOOZE_WHEN=str(wrap))
+        subprocess.run([BASH, str(SCRIPT), "menu", "/dev/ttys999", "p:A"], env=env, check=True,
+                       capture_output=True, timeout=30)
+        menu = [c for c in self.calls("tmux") if c and c[0] == "display-menu"][-1]
+        self.assertFalse(mark.exists())
+        self.t("if-shell", "true", Menu.items(None, menu)["Tomorrow evening 18:00"][1])
+        self.assertEqual(self.wait_calls("closed-tabs.sh")[-1], ["snooze", str(local(2026, 11, 17, 18)), "A"])
+        self.assertTrue(mark.exists())
+
     def test_preset_item_asks_about_the_space_it_parked_from(self):
         w = self.t("new-window", "-d", "-P", "-F", "#{window_id}", "-t", "main:", "sleep 600")
         self.window(w, "main", "", "seven")             # for the recording tmux that builds the menu
@@ -762,7 +858,7 @@ class MenuCommandsOnAServer(Base):
 
 
 @unittest.skipUnless(TMUX and shutil.which("fzf"), "tmux / fzf not installed")
-class CustomPopup(Base):
+class Popup(Base):
     """The Custom… box for real: a private server, a client attached to it in
     a pty, `custom` opens the popup on that client, keys go in through the
     client's terminal."""
@@ -809,6 +905,10 @@ class CustomPopup(Base):
 
         def reap():
             try:
+                os.kill(pid, 9)     # its server is gone; on its own it takes 3 s to leave
+            except ProcessLookupError:
+                pass
+            try:
                 os.close(fd)
             except OSError:
                 pass
@@ -852,6 +952,8 @@ class CustomPopup(Base):
             time.sleep(0.05)
         self.fail("the popup never closed")
 
+
+class CustomPopup(Popup):
     def test_typed_time_is_applied(self):
         self.open_box()
         self.assertIn(b"tonight", self.screen)          # the suggestions, with when
@@ -913,30 +1015,34 @@ class CustomPopup(Base):
         self.type("\r")
         self.assertEqual(self.popup_gone(), 0)
 
-    def warned(self):
-        end = time.time() + 5
-        while not self.calls("notify.sh") and time.time() < end:
-            time.sleep(0.05)
-        notes = self.calls("notify.sh")
-        self.assertEqual(len(notes), 1, notes)
-        self.assertEqual(notes[0][:4], ["-c", self.tty, "-k", "warn"], notes)
+    def stays(self, text, why):
+        """Type text, Enter: the box says why and stays; Esc then leaves quietly."""
+        self.open_box()
+        self.type(text)
+        time.sleep(0.3)
+        self.type("\r")
+        time.sleep(0.6)
+        self.assertIsNone(self.custom.poll(), "the box closed")
+        self.assertIn(why, self.text())
+        self.type("\x1b")
+        self.assertEqual(self.popup_gone(), 0)
         time.sleep(0.3)
         self.assertEqual(self.calls("closed-tabs.sh"), [])
-        return notes[0][-1]
+        self.assertEqual(self.calls("notify.sh"), [])
 
-    def test_garbage_is_a_warning(self):
-        self.enter("zzz")
-        self.warned()
-
-    def test_every_suggestion_fits(self):
-        import re
-        self.open_box()
-        time.sleep(0.3)
+    def text(self):
         # tmux draws a lone space as a cursor move (ESC [C): that is a space.
         text = re.sub(rb"\x1b\[C", b" ", bytes(self.screen))
-        text = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", b"", text).decode("utf-8", "replace")
-        for s in ("30m", "tonight", "tomorrow 2pm", "mon", "fri 9am", "1w"):
-            self.assertIn(s + " —", text, s)
+        return re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", b"", text).decode("utf-8", "replace")
+
+    def test_garbage_keeps_the_box_open(self):
+        self.stays("zzz", "try 2h, fri 9am, next monday")
+
+    def test_every_suggestion_fits(self):
+        self.open_box()
+        time.sleep(0.3)
+        for x in ("30m", "tonight", "tomorrow morning", "tomorrow 2pm", "mon", "fri 9am", "next monday", "1w"):
+            self.assertIn(x + " \u2014", self.text(), x)
 
     def test_empty_enter_takes_the_highlighted_suggestion(self):
         self.enter("")
@@ -947,12 +1053,194 @@ class CustomPopup(Base):
 
     def test_a_fuzzy_match_that_is_no_prefix_is_not_taken(self):
         # "mrw" narrows to "tomorrow" fuzzily, but is not how it starts.
-        self.assertIn("can't read 'mrw'", self.enter("mrw") or self.warned())
+        self.stays("mrw", "try 2h, fri 9am, next monday")
 
     def test_a_bare_number_asks_for_the_unit(self):
         # "3" starts "3h", but 3 what? Nothing is applied.
-        self.enter("3")
-        self.assertEqual(self.warned(), "snooze: 3 what? say 3m, 3h or 3pm")
+        self.stays("3", "3 what? say 3m, 3h or 3pm")
+
+
+@unittest.skipUnless(TMUX and shutil.which("fzf"), "tmux / fzf missing")
+class BoxOnScreen(Popup):
+    """The box as it is seen: the client runs in a pane of a second private
+    server (capture-pane does not see a popup; the pane it is drawn in does)."""
+    COLS, ROWS = 100, 30
+
+    def outer(self, *args):
+        r = subprocess.run([TMUX, "-S", self.outer_sock, "-f", "/dev/null", *args], env=self.env,
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout
+
+    def box(self, cols=None, rows=None, *args):
+        d = tempfile.mkdtemp(prefix="sno-", dir="/private/tmp")     # short: sun_path
+        self.addCleanup(shutil.rmtree, d, True)
+        self.outer_sock = os.path.join(d, "s")
+        self.addCleanup(lambda: self.outer("kill-server"))
+        self.outer("new-session", "-d", "-x", str(cols or self.COLS), "-y", str(rows or self.ROWS),
+                   f"exec env -u TMUX '{self.tmux}' attach -t main")
+        end = time.time() + 10
+        tty = []
+        while not tty and time.time() < end:
+            tty = [t for t in self.t("list-clients", "-F", "#{client_tty}").split() if t != self.tty]
+            time.sleep(0.05)
+        self.assertTrue(tty, "no client in the outer pane")
+        self.custom = subprocess.Popen([BASH, str(SCRIPT), "custom", "-c", tty[0], *(args or ["p:A"])],
+                                       env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: self.custom.poll() is None and self.custom.kill())
+        self.shows("type a time, or pick one", "esc cancel")
+
+    def lines(self):
+        return [x.strip().strip("\u2502").strip() for x in self.outer("capture-pane", "-p").splitlines() if x.strip()]
+
+    def live(self):
+        """The prompt's text, and the line under it."""
+        ls = self.lines()
+        i = [k for k, x in enumerate(ls) if x.startswith("until:")]
+        return (ls[i[0]][len("until:"):].strip(), ls[i[0] + 2]) if i and len(ls) > i[0] + 2 else ("", "")
+
+    def shows(self, *want, timeout=10):
+        end = time.time() + timeout
+        while True:
+            text = "\n".join(self.lines())
+            if all(w in text for w in want):
+                return text
+            if time.time() > end:
+                self.fail(f"{want} not on screen:\n{text}")
+            time.sleep(0.03)
+
+    def keys(self, text, *named):
+        if text:
+            self.outer("send-keys", "-l", "--", text)
+        if named:
+            self.outer("send-keys", *named)
+
+    def says(self, text, want, timeout=10):
+        """Replace what is typed by text: the line under it becomes want."""
+        self.keys("", "C-u")
+        self.keys(text)
+        end = time.time() + timeout
+        while self.live() != (text, want):
+            if time.time() > end:
+                self.assertEqual(self.live(), (text, want))
+            time.sleep(0.03)
+
+    def applied(self, epoch):
+        self.assertEqual(self.popup_gone(), 0)
+        end = time.time() + 10
+        while not self.calls("closed-tabs.sh") and time.time() < end:
+            time.sleep(0.05)
+        self.assertEqual(self.calls("closed-tabs.sh"), [["snooze", str(epoch), "A"]])
+
+    def nothing_applied(self):
+        self.assertEqual(self.popup_gone(), 0)
+        time.sleep(0.5)
+        self.assertEqual(self.calls("closed-tabs.sh"), [])
+        self.assertEqual(self.calls("notify.sh"), [])
+
+    def test_it_opens_with_every_suggestion(self):
+        self.box()
+        text = self.shows("next monday \u2014 Mon Nov 23 9:00", "1w \u2014 Mon Nov 23 10:15", "\u23ce snooze")
+        for x in ("30m \u2014 10:45", "tonight \u2014 18:00", "tomorrow morning \u2014 Tue 9:00", "fri 9am \u2014 Fri 9:00"):
+            self.assertIn(x, text)
+        self.keys("", "Escape")
+        self.nothing_applied()
+
+    def test_next_monday(self):
+        self.box()
+        self.says("next monday", "\u2192 Mon Nov 23 9:00 \u00b7 in 7 days")
+        self.shows("esc cancel")                # the keys stay
+        self.keys("", "Enter")
+        self.applied(local(2026, 11, 23, 9))
+
+    def test_typed_time_wins_over_the_highlight(self):
+        # "tom" reads as tomorrow 9:00 and arrows move over "tomorrow 2pm".
+        self.box()
+        self.says("tom", "\u2192 Tue Nov 17 9:00 \u00b7 in 22h 45m")
+        self.keys("", "Down")
+        self.keys("", "Down")
+        self.keys("", "Enter")
+        self.applied(local(2026, 11, 17, 9))
+
+    def test_tomorrow_morning_at_once(self):
+        # Enter straight after the last letter: no wait for the live line.
+        self.box()
+        self.keys("tomorrow morning", "Enter")
+        self.applied(local(2026, 11, 17, 9))
+
+    def test_a_time_no_suggestion_is_like(self):
+        self.box()
+        self.says("dec 3 at 2:30pm", "\u2192 Thu Dec 3 14:30 \u00b7 in 17 days")
+        self.keys("", "Enter")
+        self.applied(local(2026, 12, 3, 14, 30))
+
+    def test_the_start_of_a_suggestion_completes_it(self):
+        self.box()
+        self.says("tomorrow morn", "\u2192 tomorrow morning \u00b7 Tue Nov 17 9:00 \u00b7 in 22h 45m")
+        self.keys("", "Enter")
+        self.applied(local(2026, 11, 17, 9))
+
+    def test_a_suggestion_by_arrow(self):
+        self.box()
+        self.keys("", "Down", "Down")
+        time.sleep(0.3)
+        self.keys("", "Enter")
+        self.applied(self.now + 2 * 3600)
+
+    def test_unreadable_stays_and_can_be_mended(self):
+        self.box()
+        self.says("next mondayy", "can't read that")
+        self.keys("", "Enter")
+        self.shows("can't read that \u00b7 try 2h, fri 9am, next monday")
+        self.assertIsNone(self.custom.poll())
+        self.keys("", "BSpace")
+        self.shows("\u2192 Mon Nov 23 9:00")
+        self.keys("", "Enter")
+        self.applied(local(2026, 11, 23, 9))
+
+    def test_reasons(self):
+        self.box()
+        for text, want in (("3", "3 what? say 3m, 3h or 3pm"), ("45", "45 what? say 45m or 45h"),
+                           ("yesterday", "already passed"), ("0m", "no time at all"), ("99999y", "too far off")):
+            with self.subTest(text=text):
+                self.says(text, want)
+                self.keys("", "Enter")
+                time.sleep(0.3)
+                self.assertIsNone(self.custom.poll())
+                self.assertEqual(self.live(), (text, want))
+        self.keys("", "Escape")
+        self.nothing_applied()
+
+    def test_odd_text_is_only_text(self):
+        self.box()
+        touched = Path(self.outer_sock).with_name("t")          # short: the line must fit
+        for text in (f"$(touch {touched})", f"`touch {touched}`", f"';touch {touched};'", f'";touch {touched};"',
+                     "2h)+abort", "become(echo 1)", "-5m", "--", "{q} {1}", "\\", "#{pid}"):
+            with self.subTest(text=text):
+                self.says(text, "can't read that")
+                self.keys("", "Enter")
+                self.shows("can't read that \u00b7 try")
+                self.assertIsNone(self.custom.poll())
+        self.assertFalse(touched.exists())
+        self.keys("", "Escape")
+        self.nothing_applied()
+
+    def test_cleared_and_entered_at_once_is_not_the_old_row(self):
+        # ^U and Enter in one burst: fzf still shows the old text's rows.
+        self.box()
+        self.says("1w", "\u2192 Mon Nov 23 10:15 \u00b7 in 7 days")
+        self.keys("", "C-u", "Enter")
+        time.sleep(0.8)
+        if self.custom.poll() is None:              # not settled: Enter waits to be asked again
+            self.assertEqual(self.calls("closed-tabs.sh"), [])
+            self.keys("", "Enter")
+        self.applied(self.now + 1800)               # 30m, the first row
+
+    def test_a_small_client_still_gets_the_box(self):
+        self.box(40, 14)
+        self.says("next monday", "\u2192 Mon Nov 23 9:00 \u00b7 in 7 days")
+        self.shows("esc cancel")
+        self.keys("", "Enter")
+        self.applied(local(2026, 11, 23, 9))
 
 
 SCRIPTS = HERE / "scripts"

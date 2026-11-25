@@ -10,15 +10,12 @@
 # when, dispatches to those two scripts, and runs the timer.
 #
 #   snooze.sh parse <when…>        the epoch on stdout, or exit 1 + why on
-#                                  stderr. 30m 2h 1d 1w 2h30m "2h 30m" ·
-#                                  tonight / evening (18:00) · tomorrow (9:00;
-#                                  before 05:00 it is the day just begun)
-#                                  · mon..sun (9:00, the next such day; today
-#                                  only while it is still before 9:00) · 9am
-#                                  9:30am 14:30 2pm noon midnight (the next
-#                                  occurrence) · "fri 9am" · "tomorrow 2pm" ·
-#                                  "today 5pm". Local time (date -j); always in
-#                                  the future.
+#                                  stderr. The reading is snooze-when.py's
+#                                  (its header lists what it takes): 2h30m ·
+#                                  an hour and a half · tonight · tomorrow
+#                                  morning · fri 9am · next monday · a week
+#                                  from friday 3pm · dec 3 at 2pm · end of
+#                                  the month. Local time; always in the future.
 #   snooze.sh menu <client_tty> <target…>
 #                                  the snooze menu on that client (display-menu
 #                                  -c): 1 hour, 3 hours, This evening 18:00,
@@ -61,12 +58,15 @@
 #                                  client running prompt-popup
 #   snooze.sh prompt-popup -c <client> [--ask-space] <target…>
 #                                  inside it: fzf as an input box over a few
-#                                  suggestions, each with when it lands; the
-#                                  typed text wins when it reads as a time,
-#                                  else the highlighted suggestion; Esc
-#                                  cancels. Only the epoch leaves the popup
-#                                  (to `apply`, after it closed); the text
-#                                  is never put on a command line.
+#                                  suggestions, each with when it lands; a
+#                                  line under the prompt says, as you type,
+#                                  what Enter would take. The typed text wins
+#                                  when it reads as a time, else the
+#                                  highlighted suggestion it is the start of;
+#                                  unreadable text keeps the box open and says
+#                                  why; Esc cancels. Only the epoch leaves the
+#                                  popup (to `apply`, after it closed); the
+#                                  text is never put on a command line.
 #   snooze.sh wake-due             the timer tick (LaunchAgent
 #                                  com.mackhaymond.tmux-snooze, every 60 s)
 #   snooze.sh reschedule           recompute snooze-next: the earliest wake
@@ -107,8 +107,9 @@
 # resched.lock.
 #
 # Environment (tests): SNOOZE_NOW (a fixed "now" epoch), STASH_SH,
-# CLOSED_TABS_SH, NOTIFY_SH (scripts to call instead of the installed ones),
-# XDG_STATE_HOME. All but SNOOZE_NOW are carried into the menu's re-entry:
+# CLOSED_TABS_SH, NOTIFY_SH, SNOOZE_WHEN (scripts to call instead of the
+# installed ones; SNOOZE_WHEN is the time reader, else the snooze-when.py
+# beside this script), XDG_STATE_HOME. All but SNOOZE_NOW are carried into the menu's re-entry:
 # commands tmux runs get the SERVER's environment, not this process's.
 #
 # Bash 3.2 (launchd runs /bin/bash): no associative arrays, no ${x,,}, and an
@@ -204,146 +205,52 @@ notify_user() {
 stash_sh()  { [ -f "$STASH_SH" ] || return 1; bash "$STASH_SH" "$@"; }
 closed_sh() { [ -f "$CLOSED_TABS_SH" ] || return 1; bash "$CLOSED_TABS_SH" "$@"; }
 
-lower() { printf '%s' "$*" | tr '[:upper:]' '[:lower:]'; }
-
 # --- parse ------------------------------------------------------------------
 
-# at_day <now> <days ahead> <H> <M>: the epoch of that local wall-clock time.
-at_day() {
-    local ymd
-    ymd=$(date -j -r "$1" -v+"$2"d '+%Y-%m-%d') || return 1
-    date -j -f '%Y-%m-%d %H:%M:%S' "$ymd $(printf '%02d:%02d' "$3" "$4"):00" '+%s'
-}
-
-# parse_time <word>: sets PT_H PT_M, or fails. 9am 9:30am 9a 2pm 14:30 noon
-# midnight. A bare number ("9") is refused: am or pm is a guess.
-PT_H=0 PT_M=0
-parse_time() {
-    local w="$1" re='^([0-9]{1,2})(:([0-9]{2}))?(am|pm|a|p)?$' h m ap
-    case "$w" in
-        noon) PT_H=12 PT_M=0; return 0 ;;
-        midnight) PT_H=0 PT_M=0; return 0 ;;
-    esac
-    [[ "$w" =~ $re ]] || return 1
-    h=$((10#${BASH_REMATCH[1]})); m="${BASH_REMATCH[3]}"; ap="${BASH_REMATCH[4]}"
-    [ -n "$m" ] && m=$((10#$m)) || m=0
-    if [ -n "$ap" ]; then
-        [ "$h" -ge 1 ] && [ "$h" -le 12 ] || return 1
-        [ "$h" -eq 12 ] && h=0
-        case "$ap" in p*) h=$((h + 12)) ;; esac
-    else
-        [ -n "${BASH_REMATCH[2]}" ] || return 1
-        [ "$h" -le 23 ] || return 1
-    fi
-    [ "$m" -le 59 ] || return 1
-    PT_H=$h PT_M=$m
-}
-
-# weekday <word>: 1 (mon) .. 7 (sun), or fails.
-weekday() {
-    case "$1" in
-        mon|monday) echo 1 ;; tue|tues|tuesday) echo 2 ;; wed|weds|wednesday) echo 3 ;;
-        thu|thur|thurs|thursday) echo 4 ;; fri|friday) echo 5 ;;
-        sat|saturday) echo 6 ;; sun|sunday) echo 7 ;;
-        *) return 1 ;;
-    esac
-}
-
-# duration <word>: seconds, or fails. 30m 2h 1d 1w 2h30m 90min 1hr
-duration() {
-    local w="$1" re='^([0-9]+)(minutes|minute|mins|min|m|hours|hour|hrs|hr|h|days|day|d|weeks|week|wks|wk|w)(.*)$' n u s=0
-    [ -n "$w" ] || return 1
-    while [ -n "$w" ]; do
-        [[ "$w" =~ $re ]] || return 1
-        n=$((10#${BASH_REMATCH[1]})); u="${BASH_REMATCH[2]}"; w="${BASH_REMATCH[3]}"
-        case "$u" in
-            m|min*) s=$((s + n * 60)) ;;
-            h*) s=$((s + n * 3600)) ;;
-            d|day|days) s=$((s + n * 86400)) ;;
-            *) s=$((s + n * 604800)) ;;
-        esac
+# when_py: sets W_PY (the interpreter) and W_FILE (snooze-when.py), or fails.
+# Never `python3` off PATH: the pyenv shim costs 130 ms, and this runs on every
+# keystroke of the time box. Both interpreters run the same file.
+W_PY="" W_FILE=""
+when_py() {
+    [ -n "$W_PY" ] && return 0
+    local p d="${BASH_SOURCE[0]%/*}" f=""
+    [ "$d" = "${BASH_SOURCE[0]}" ] && d=.
+    for f in "${SNOOZE_WHEN:-}" "$d/snooze-when.py" "$d/executable_snooze-when.py" "$SCRIPTS/snooze-when.py"; do
+        [ -n "$f" ] && { [ -f "$f" ] || [ "$f" = "${SNOOZE_WHEN:-}" ]; } && break
     done
-    echo "$s"
+    [ -f "$f" ] || return 1
+    for p in /opt/homebrew/bin/python3 /usr/bin/python3; do
+        [ -x "$p" ] && { W_PY="$p" W_FILE="$f"; return 0; }
+    done
+    return 1
 }
+# The text is data: after --, nothing in it is an option or a verb.
+run_when() { when_py && "$W_PY" -I -S "$W_FILE" "$@"; }
 
-# do_parse <when…> → epoch, or exit status 1 with the reason on stderr.
+# do_parse <when…> → epoch, or exit status 1 with the reason on stderr. What
+# snooze-when.py says is believed only in its two shapes, digits with exit 0
+# or a "snooze: …" line with exit 1: a crash or a missing reader is said as
+# such, never taken for a time.
+BROKEN="snooze: the time reader isn't working"
 do_parse() {
-    local text now words=() w day="" tod="" secs=0 alldur=1 d
-    text=$(lower "$*")
-    now=$(now_epoch)
-    # Filler words go; a bare number joins the word after it ("45 min").
-    local num=""
-    set -f
-    for w in $text; do
-        case "$w" in in|at|until|this|on|next|for) continue ;; esac
-        case "$w" in ''|*[!0-9]*) ;; *) [ -z "$num" ] && { num="$w"; continue; } ;; esac
-        words+=("$num$w"); num=""
-    done
-    set +f
-    [ -n "$num" ] && words+=("$num")
-    if [ ${#words[@]} -eq 0 ]; then
-        echo "snooze: when? (try 45m, 2h, tonight, tomorrow, fri 9am, 14:30)" >&2; return 1
-    fi
-    for w in "${words[@]}"; do
-        d=$(duration "$w") || { alldur=0; break; }
-        secs=$((secs + d))
-    done
-    if [ "$alldur" = 1 ]; then
-        [ "$secs" -gt 0 ] || { echo "snooze: '$text' is no time at all" >&2; return 1; }
-        echo $((now + secs)); return 0
-    fi
-    # Otherwise at most one day word and at most one time of day.
-    for w in "${words[@]}"; do
-        case "$w" in
-            tonight|evening) [ -z "$tod" ] && tod=evening ;;     # "tonight 9pm": the 9pm
-            today|tomorrow|tmrw|tmr|tom) [ -z "$day" ] || { bad "$text"; return 1; }; day="$w" ;;
-            *)
-                if weekday "$w" >/dev/null; then
-                    [ -z "$day" ] || { bad "$text"; return 1; }; day="$w"
-                elif parse_time "$w"; then
-                    [ -z "$tod" ] || [ "$tod" = evening ] || { bad "$text"; return 1; }
-                    tod="$PT_H:$PT_M"
-                else
-                    bad "$text"; return 1
-                fi ;;
+    local out
+    when_py
+    if out=$(run_when parse -- "$*" 2>/dev/null); then
+        case "$out" in
+            ''|*[!0-9]*) ;;
+            *) printf '%s\n' "$out"; return 0 ;;
         esac
-    done
-    local h m nd t off target
-    case "$tod" in
-        evening) h=18 m=0 ;;
-        '') h=9 m=0 ;;
-        *) h="${tod%%:*}" m="${tod##*:}" ;;
-    esac
-    # Time words alone ("9am", "tonight"): the next occurrence.
-    [ -z "$day" ] && day="next_occurrence"
-    nd=$(date -j -r "$now" '+%u')
-    case "$day" in
-        next_occurrence)
-            target=$(at_day "$now" 0 "$h" "$m") || return 1
-            [ "$target" -gt "$now" ] || target=$(at_day "$now" 1 "$h" "$m") || return 1 ;;
-        today)
-            target=$(at_day "$now" 0 "$h" "$m") || return 1 ;;
-        tomorrow|tmrw|tmr|tom)
-            # Before 05:00 "tomorrow" is the day that has just begun (Mack
-            # is up late): 01:30 "tomorrow" = 9:00 today. Still past → the
-            # day after.
-            off=1
-            [ "$((10#$(date -j -r "$now" '+%H')))" -lt "$LATE_NIGHT_END" ] && off=0
-            target=$(at_day "$now" "$off" "$h" "$m") || return 1
-            [ "$target" -gt "$now" ] || target=$(at_day "$now" $((off + 1)) "$h" "$m") || return 1 ;;
-        *)
-            t=$(weekday "$day")
-            off=$(( (t - nd + 7) % 7 ))
-            target=$(at_day "$now" "$off" "$h" "$m") || return 1
-            [ "$target" -gt "$now" ] || target=$(at_day "$now" $((off + 7)) "$h" "$m") || return 1 ;;
-    esac
-    if [ "$target" -le "$now" ]; then
-        echo "snooze: '$text' has already passed" >&2; return 1
+    else
+        out=$(run_when parse -- "$*" 2>&1 >/dev/null)
+        case "$out" in
+            *$'\n'*) ;;
+            'snooze: '?*) printf '%s\n' "$out" >&2; return 1 ;;
+        esac
     fi
-    echo "$target"
+    log "parse: no answer from '${W_FILE:-snooze-when.py}' (${W_PY:-no python3})"
+    echo "$BROKEN" >&2
+    return 1
 }
-LATE_NIGHT_END=5
-bad() { echo "snooze: can't read '$1' (try 45m, 2h, tonight, tomorrow, fri 9am, 14:30)" >&2; }
 
 # when_label <epoch>: "in 45m" (under SOON_SECS), else the clock: "at 18:00",
 # "tomorrow 9:00", "Mon 9:00", "Nov 30 9:00". Never "in 60m".
@@ -567,6 +474,7 @@ reenter() {
     [ -n "${STASH_SH:-}" ] && prefix="$prefix STASH_SH=$(sq "$STASH_SH")"
     [ -n "${CLOSED_TABS_SH:-}" ] && prefix="$prefix CLOSED_TABS_SH=$(sq "$CLOSED_TABS_SH")"
     [ -n "${NOTIFY_SH:-}" ] && prefix="$prefix NOTIFY_SH=$(sq "$NOTIFY_SH")"
+    [ -n "${SNOOZE_WHEN:-}" ] && prefix="$prefix SNOOZE_WHEN=$(sq "$SNOOZE_WHEN")"
     [ -n "${SNOOZE_NOW:-}" ] && prefix="$prefix SNOOZE_NOW=$(sq "$SNOOZE_NOW")"
     printf '%s bash %s' "$prefix" "$(sq "$self")"
 }
@@ -652,13 +560,19 @@ do_custom() {
     opts "$@"; shift "$O_N"
     local tty="$O_CLIENT" ask="$O_ASK"
     [ -n "$tty" ] || return 0
-    local cmd i h
+    local cmd i w=58 h cw="" ch=""
     cmd="$(reenter) prompt-popup -c $(sq "$tty")${ask:+ $ask}$(targets_q "$@")"
-    # Every suggestion shows: one row each, plus the prompt and the header,
-    # the border's two and one to spare.
-    h=$(( ${#SUGGEST[@]} + 5 ))
+    # Every suggestion shows: one row each, plus the prompt, its rule, the
+    # live line and the keys, and the border's two. tmux refuses a popup bigger
+    # than its client ("width too large"), so a small client gets less.
+    h=$(( ${#SUGGEST[@]} + 6 ))
+    IFS=' ' read -r cw ch <<EOF
+$(tmux display-message -p -c "$tty" '#{client_width} #{client_height}' 2>/dev/null)
+EOF
+    case "$cw" in ''|*[!0-9]*) ;; *) [ "$cw" -gt 0 ] && [ "$cw" -lt "$w" ] && w=$cw ;; esac
+    case "$ch" in ''|*[!0-9]*) ;; *) [ "$ch" -gt 0 ] && [ "$ch" -lt "$h" ] && h=$ch ;; esac
     for i in 1 2 3 4 5 6 7 8 9 10; do
-        tmux display-popup -c "$tty" -E -w 44 -h "$h" -x "$POPUP_X" -T " snooze until " "$cmd" 2>/dev/null && return 0
+        tmux display-popup -c "$tty" -E -w "$w" -h "$h" -x "$POPUP_X" -T " snooze until " "$cmd" 2>/dev/null && return 0
         sleep 0.1
     done
     log "custom: no popup on $tty"
@@ -667,61 +581,41 @@ do_custom() {
 }
 
 # The Custom… box's suggestions: what is typed most, shown with when it lands.
-SUGGEST=(30m 1h 2h 3h tonight tomorrow "tomorrow 2pm" mon "fri 9am" 1w)
+SUGGEST=(30m 1h 2h 3h tonight tomorrow "tomorrow morning" "tomorrow 2pm" mon "fri 9am" "next monday" 1w)
 
 # prompt-popup -c <tty> [--ask-space] <target…>: inside the popup. fzf as an
-# input box. Enter takes, in order: the typed text when it reads as a time;
-# the highlighted suggestion when nothing is typed, or when the text is the
-# start of that suggestion ("tomo" → tomorrow); else nothing, with a warning —
-# a bare number ("3") is never completed (3h? 3pm?), it asks for the unit. Esc
-# cancels. The text never leaves this process: what is handed on (after the
-# popup has closed) is the epoch.
+# input box; what Enter takes is snooze-when.py's `box` / `enter` (one rule for
+# the live line and for Enter, its header has it). Unreadable text keeps the
+# box open with the reason, Esc cancels. fzf hands both to the reader in its own
+# quoting ({q} also makes it run with no row left, {1} then being empty); what
+# leaves fzf (become) is the epoch alone.
 do_prompt_popup() {
     opts "$@"; shift "$O_N"
     local tty="$O_CLIENT" ask="$O_ASK"
-    local s e lines="" out rc query sel epoch="" err today at ymd wd hm
-    today=$(date -j -r "$(now_epoch)" '+%Y-%m-%d')
-    for s in "${SUGGEST[@]}"; do
-        e=$(do_parse "$s" 2>/dev/null) || continue
-        # "tonight — 18:00", "fri 9am — Fri 9:00": the clock, with the day
-        # when it is not today.
-        read -r ymd wd hm <<EOF
-$(date -j -r "$e" '+%Y-%m-%d %a %H:%M')
-EOF
-        hm="${hm#0}"
-        if [ "$ymd" = "$today" ]; then at="$hm"; else at="$wd $hm"; fi
+    local s e at lines="" epoch live
+    when_py                                 # here, not in a subshell: exported below
+    while IFS="$TAB" read -r s e at; do
+        case "$e" in ''|*[!0-9]*) continue ;; esac
         lines="$lines$s$TAB$s — $at"$'\n'
-    done
-    out=$(printf '%s' "$lines" | fzf --print-query --prompt 'until: ' --delimiter "$TAB" --with-nth 2 \
-            --reverse --no-multi --no-sort --info=hidden --header '⏎ snooze · esc cancel' \
-            --bind 'enter:accept-or-print-query')
-    rc=$?
-    case "$rc" in 0|1) ;; *) return 0 ;; esac          # Esc / ⌃c: nothing
-    query="${out%%$'\n'*}"
-    sel=""
-    case "$out" in *$'\n'*) sel=$(printf '%s\n' "${out#*$'\n'}" | head -1 | cut -f1) ;; esac
-    local q lsel
-    q=$(lower "$query"); lsel=$(lower "$sel")
-    q="${q#"${q%%[![:space:]]*}"}"                     # leading blanks
-    if [ -n "$q" ] && epoch=$(do_parse "$query" 2>/dev/null); then :
-    elif [ -z "$q" ]; then
-        [ -n "$sel" ] && epoch=$(do_parse "$sel" 2>/dev/null) || return 0
-    else
-        case "$q" in
-            *[!0-9\ ]*)
-                if [ -n "$sel" ] && [ "${lsel#"$q"}" != "$lsel" ] && epoch=$(do_parse "$sel" 2>/dev/null); then :
-                else
-                    err=$(do_parse "$query" 2>&1 >/dev/null)
-                    [ -n "$err" ] || err="snooze: no time in that"
-                    notify_user ${tty:+-c "$tty"} -k warn -- "$err"
-                    return 0
-                fi ;;
-            *)
-                q="${q%% *}"
-                notify_user ${tty:+-c "$tty"} -k warn -- "snooze: $q what? say ${q}m, ${q}h or ${q}pm"
-                return 0 ;;
-        esac
+    done <<EOF
+$(printf '%s\n' "${SUGGEST[@]}" | run_when batch 2>/dev/null)
+EOF
+    # No suggestion read: the reader is broken, and no Enter would do anything.
+    if [ -z "$lines" ]; then
+        notify_user ${tty:+-c "$tty"} -k warn -- "$BROKEN"
+        return 0
     fi
+    export W_PY W_FILE
+    [ -n "${SNOOZE_NOW:-}" ] && export SNOOZE_NOW
+    # bg-: typing never waits for it, and a newer line cancels an older one.
+    live='bg-cancel+bg-transform-header:exec "$W_PY" -I -S "$W_FILE" box -- {q} {1}'
+    epoch=$(printf '%s' "$lines" | fzf --with-shell '/bin/sh -c' \
+            --prompt 'until: ' --delimiter "$TAB" --with-nth 2 \
+            --reverse --no-multi --no-sort --info=hidden --header 'type a time, or pick one' \
+            --footer '⏎ snooze · esc cancel' --footer-border=none \
+            --bind "result:$live" --bind "focus:$live" \
+            --bind 'enter:transform:exec "$W_PY" -I -S "$W_FILE" enter -- {q} {1}')
+    case "$epoch" in ''|*[!0-9]*) return 0 ;; esac      # Esc / ⌃c: nothing
     # Applied after the popup has closed: a park takes a moment.
     tmux run-shell -b "$(reenter) apply ${tty:+-c $(sq "$tty") }${ask:+$ask }$epoch$(targets_q "$@") || true"
     return 0

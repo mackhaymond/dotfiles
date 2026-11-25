@@ -54,7 +54,7 @@ row above it, until the next key.
 |---|---|
 | `c` | close it: `closed-tabs.sh close <agent pane>` (⌘Z reopens it, agent resumed) |
 | `p` | park it: `stash.sh stash <win>` (prefix H's; prefix h brings it back) |
-| `s` | snooze it: a chooser with snooze.sh's menu (1 hour, 3 hours, this evening 18:00, tomorrow 9:00, Monday 9:00, Custom…); Custom is a typed box read by `snooze.sh parse` (a bad time says why under the box); then `snooze.sh apply -c <client> <epoch> w:@N` parks it with an alarm |
+| `s` | snooze it: a chooser with snooze.sh's menu (1 hour, 3 hours, this evening 18:00, tomorrow 9:00, Monday 9:00, Custom…); Custom is a typed box read by `snooze.sh parse`, so it takes free text ("next monday", "dec 3 at 2pm"; the forms are in snooze-when.py's header; a bad time says why under the box); then `snooze.sh apply -c <client> <epoch> w:@N` parks it with an alarm |
 | `k` / Space | keep it: not asked again until it has worked again (below) |
 | `v` | go to it: the popup closes and the client switches there (a card already closed / parked / snoozed, or a window gone or moved meanwhile, says so above the key bar instead) |
 | `←` / `h` | back one (a closed / parked / snoozed one shows its badge and stays decided; a kept one can be decided again) |

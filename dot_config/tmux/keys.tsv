@@ -68,7 +68,7 @@ Agents	⌃S O	Review old agents (idle 8h+), one by one	prefix	O	c close · p par
 
 Park	⌃S H	Park this tab (agent kept, jobs frozen)	prefix	H	refused if it can't be paused
 Park	⌃S h	Unpark (⌘Z picker, stashed only)	prefix	h
-Park	⌃S Z	Snooze this tab: parked, back on its own	prefix	Z	1h · 3h · evening · tomorrow · Monday · custom
+Park	⌃S Z	Snooze this tab: parked, back on its own	prefix	Z	1h · 3h · evening · tomorrow · Monday · custom ("next monday")
 Park	⌃S v	Select a range of tabs (again cancels)	prefix	v
 Park	h / l	Range: move its far end left / right	stash	h l j k	k / j too
 Park	H / ⏎	Range: park the selection	stash	H Enter
