@@ -71,7 +71,7 @@ FAKE_JQ = RECORDER + "exit 1\n"
 FAKE_STASH = RECORDER + r'''
 case "$1" in
     rows) cat "$FAKE_DIR/rows" 2>/dev/null ;;
-    snooze) [ -e "$FAKE_DIR/refuse" ] || echo "w:$3" ;;
+    snooze) [ -e "$FAKE_DIR/refuse" ] || [ -e "$FAKE_DIR/refuse$3" ] || echo "w:$3" ;;
     check) [ -e "$FAKE_DIR/refuse-check" ] && { echo "an agent is working — not snoozing it"; exit 3; } ;;
     wake)
         shift
@@ -330,6 +330,65 @@ class Apply(Base):
         self.run_script("apply", str(self.now + 7200), "w:@7")
         self.assertEqual(self.calls("notify.sh")[-1][-1], "⏰ snoozed a##{client_tty} — back at 12:15")
 
+    # -- --ask-space: a park may have emptied its space -----------------------
+    TTY = "/dev/ttys999"
+
+    def asks(self):
+        return [c for c in self.calls("closed-tabs.sh") if c[0] == "ask-space"]
+
+    def test_ask_space_once_per_session_it_parked_from(self):
+        e = str(self.now + 7200)
+        self.window("@8", "main", "", "eight")
+        self.window("@9", "my proj", "", "nine")
+        for opts in (["-c", self.TTY, "--ask-space"], ["--ask-space", "-c", self.TTY]):
+            with self.subTest(opts=opts):
+                (self.fake / "calls.log").unlink(missing_ok=True)
+                self.run_script("apply", *opts, e, "w:@7", "w:@9", "w:@8")
+                self.assertEqual(self.asks(), [["ask-space", "--snoozed", self.TTY, "=main:"],
+                                               ["ask-space", "--snoozed", self.TTY, "=my proj:"]])
+                # Last of all (it holds until the box is answered): after the
+                # toast and the reschedule, which reads `stash.sh rows`.
+                order = [c[:2] for c in self.calls() if c[0] in ("notify.sh", "stash.sh", "closed-tabs.sh")]
+                first = order.index(["closed-tabs.sh", "ask-space"])
+                self.assertLess(order.index(["stash.sh", "rows"]), first)
+                self.assertLess([o[0] for o in order].index("notify.sh"), first)
+                self.assertEqual(self.next_file.read_text().strip(), str(self.now + 50))
+                self.assertEqual(self.calls("notify.sh")[0][:2], ["-c", self.TTY])
+
+    def test_ask_space_only_for_what_was_really_parked(self):
+        e = str(self.now + 7200)
+        self.window("@9", "proj", "", "nine")
+        (self.fake / "refuse@9").touch()
+        self.run_script("apply", "-c", self.TTY, "--ask-space", e, "w:@9", "w:@7", "w:@5", "w:@99", "p:A")
+        self.assertEqual(self.asks(), [["ask-space", "--snoozed", self.TTY, "=main:"]])
+
+    def test_ask_space_never(self):
+        e = str(self.now + 7200)
+        c = ["-c", self.TTY]
+        for name, args in (("no flag", [*c, e, "w:@7"]), ("no client", ["--ask-space", e, "w:@7"]),
+                           ("unsnooze", [*c, "--ask-space", "unsnooze", "w:@7", "w:@5", "p:B"]),
+                           ("already stashed", [*c, "--ask-space", e, "w:@5", "p:B", "b:A"])):
+            with self.subTest(name):
+                self.run_script("apply", *args)
+                self.assertEqual(self.asks(), [])
+        (self.fake / "refuse").touch()
+        self.run_script("apply", *c, "--ask-space", e, "w:@7")
+        self.run_script("apply-text", *c, "--ask-space", "whenever", "w:@7")
+        self.assertEqual(self.asks(), [])
+        # A failing ask-space is not the snooze's failure.
+        (self.fake / "refuse").unlink()
+        self.script("closed-tabs.sh", RECORDER + "exit 1\n")
+        self.run_script("apply", *c, "--ask-space", e, "w:@7", rc=0)
+        self.assertEqual(len(self.asks()), 1)
+
+    def test_apply_text_passes_ask_space_on(self):
+        for opts in (["-c", self.TTY, "--ask-space"], ["--ask-space", "-c", self.TTY]):
+            with self.subTest(opts=opts):
+                (self.fake / "calls.log").unlink(missing_ok=True)
+                self.run_script("apply-text", *opts, "2h", "w:@7")
+                self.assertEqual(self.calls("stash.sh")[0], ["snooze", str(self.now + 7200), "@7"])
+                self.assertEqual(self.asks(), [["ask-space", "--snoozed", self.TTY, "=main:"]])
+
     def test_apply_reschedules(self):
         self.run_script("apply", str(self.now + 60), "p:A")
         self.assertEqual(self.next_file.read_text().strip(), str(self.now + 50))   # B's wake_at
@@ -550,11 +609,13 @@ class Menu(Base):
         items = self.items(argv)
         self.assertEqual(list(items), ["1 hour", "3 hours", "This evening 18:00", "Tomorrow 9:00",
                                        "Monday 9:00", "Custom…"])
-        self.assertIn("apply-text -c '/dev/ttys999' '1h' 'w:@7'", items["1 hour"][1])
+        self.assertIn("apply-text -c '/dev/ttys999' --ask-space '1h' 'w:@7'", items["1 hour"][1])
+        for name in list(items)[:5]:
+            self.assertIn(" apply-text -c '/dev/ttys999' --ask-space '", items[name][1], name)
         self.assertTrue(items["1 hour"][1].startswith("run-shell -b "))
         self.assertIn("'tonight'", items["This evening 18:00"][1])
         self.assertTrue(items["Custom…"][1].startswith("run-shell -b "))
-        self.assertIn("custom -c '/dev/ttys999' 'w:@7' || true", items["Custom…"][1])
+        self.assertIn("custom -c '/dev/ttys999' --ask-space 'w:@7' || true", items["Custom…"][1])
         for name, (_, cmd) in items.items():
             self.assertTrue(cmd.endswith(' || true"'), (name, cmd))
         # Not parked yet: stash.sh was asked whether it would refuse it.
@@ -593,6 +654,7 @@ class Menu(Base):
         argv = self.menu_call()
         self.assertIn("snooze 2 tabs", argv[argv.index("-T") + 1])
         self.assertIn("apply -c '/dev/ttys999' unsnooze 'p:A' 'p:B'", self.items(argv)["Unsnooze"][1])
+        self.assertNotIn("--ask-space", self.items(argv)["Unsnooze"][1])
         (self.fake / "calls.log").unlink()
         self.run_script("menu", "/dev/ttys999", "w:@9")
         self.assertIn("Unsnooze", self.items(self.menu_call()))
@@ -657,6 +719,18 @@ class MenuCommandsOnAServer(Base):
     def test_preset_item(self):
         self.t("if-shell", "true", self.items["Tomorrow 9:00"][1])
         self.assertEqual(self.wait_calls("closed-tabs.sh")[0], ["snooze", str(local(2026, 11, 17, 9)), "A"])
+
+    def test_preset_item_asks_about_the_space_it_parked_from(self):
+        w = self.t("new-window", "-d", "-P", "-F", "#{window_id}", "-t", "main:", "sleep 600")
+        self.window(w, "main", "", "seven")             # for the recording tmux that builds the menu
+        env = dict(self.env, PATH=f"{Path(self.tmp, 'recbin')}:{self.env['PATH']}")
+        subprocess.run([BASH, str(SCRIPT), "menu", "/dev/ttys999", f"w:{w}"], env=env, check=True,
+                       capture_output=True, timeout=30)
+        menu = [c for c in self.calls("tmux") if c and c[0] == "display-menu"][0]
+        self.t("if-shell", "true", Menu.items(None, menu)["1 hour"][1])
+        self.assertEqual(self.wait_calls("closed-tabs.sh")[0],
+                         ["ask-space", "--snoozed", "/dev/ttys999", "=main:"])
+        self.assertIn(["snooze", str(self.now + 3600), w], self.calls("stash.sh"))
 
     def test_every_item_parses_as_tmux_commands(self):
         # A bad flag (command-prompt -c) is a parse error tmux only reports
@@ -755,9 +829,9 @@ class CustomPopup(Base):
         self.assertEqual(r.returncode, 0, (args, r.stderr))
         return r.stdout.strip()
 
-    def open_box(self):
+    def open_box(self, *args):
         self.screen.clear()
-        self.custom = subprocess.Popen([BASH, str(SCRIPT), "custom", "-c", self.tty, "p:A"], env=self.env,
+        self.custom = subprocess.Popen([BASH, str(SCRIPT), "custom", "-c", self.tty, *(args or ["p:A"])], env=self.env,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: self.custom.poll() is None and self.custom.kill())
         end = time.time() + 10
@@ -786,10 +860,28 @@ class CustomPopup(Base):
         self.type("\r")
         self.assertEqual(self.popup_gone(), 0)
         end = time.time() + 10
-        while not self.calls("closed-tabs.sh") and time.time() < end:
+        while not self.calls("notify.sh") and time.time() < end:     # the toast comes after the dispatch
             time.sleep(0.05)
         self.assertEqual(self.calls("closed-tabs.sh"), [["snooze", str(self.now + 60), "A"]])
         self.assertEqual(self.calls("notify.sh")[-1][-1], "⏰ snoozed alpha — back in 1m")
+
+    def test_ask_space_reaches_apply_through_the_popup(self):
+        w = self.t("new-window", "-d", "-P", "-F", "#{window_id}", "-t", "main:", "sleep 600")
+        for args, want in ((["--ask-space", f"w:{w}"], [["ask-space", "--snoozed", self.tty, "=main:"]]),
+                           ([f"w:{w}"], [])):
+            with self.subTest(args=args):
+                (self.fake / "calls.log").unlink(missing_ok=True)
+                self.open_box(*args)
+                self.type("1m")
+                time.sleep(0.2)
+                self.type("\r")
+                self.assertEqual(self.popup_gone(), 0)
+                end = time.time() + 10
+                while ["rows"] not in self.calls("stash.sh") and time.time() < end:
+                    time.sleep(0.05)
+                time.sleep(0.5)
+                self.assertEqual(self.calls("stash.sh")[0], ["snooze", str(self.now + 60), w])
+                self.assertEqual(self.calls("closed-tabs.sh"), want)
 
     def test_suggestion_is_applied_when_the_text_is_no_time(self):
         self.open_box()

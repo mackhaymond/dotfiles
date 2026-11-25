@@ -42,7 +42,8 @@
 #                                 bring one back (no <window>: the merged
 #                                 picker, `closed-tabs.sh pick-popup --stashed`),
 #                                 and take <client> to it if it went home to
-#                                 another session; a frozen job is thawed
+#                                 another session; a frozen job is thawed; a
+#                                 snoozed one brings its closed space back
 #   stash.sh stash-many <w>...    park a group in one transaction
 #   stash.sh unstash-many [-c <client>] <w>...
 #                                 bring a group back in one transaction
@@ -256,7 +257,7 @@ hidden_sessions() {
 is_hidden_session() { [ -n "${1:-}" ] && grep -qxF -- "$1" <<< "$(hidden_sessions)"; }
 
 # revive_space <name> <dir> [<colour>]: `space.sh revive` (docs/spaces.md
-# "Snoozed tabs bring their space back"): prints the session id a woken tab
+# "Snoozed tabs bring their space back"): prints the session id a snoozed tab
 # whose space is gone goes to — that space made again at <dir>, or the one
 # already named <name> or on <dir>; status 1 when there is none. space.sh is
 # SPACE_SH (a path, tests), else the server's @space_sh (a command line,
@@ -2266,7 +2267,7 @@ park_one() {
     tmux set-option -w -t "$win" @stash_origin "$sess"
     # And that space's folder and colour, read before the move: if the space
     # is closed (prefix Q unregisters it) while the tab sleeps, a snooze's
-    # wake brings it back from these (wake_target, space.sh revive).
+    # wake, or its unpark by hand, brings it back from these (revive_origin).
     local odir="" ocolor=""
     IFS="$SEP" read -r odir ocolor < <(tmux display-message -p -t "$win" "#{session_path}${SEP}#{@space_color}" 2>/dev/null)
     if [ -n "$odir" ]; then tmux set-option -w -t "$win" @stash_origin_dir "$odir"
@@ -3479,32 +3480,65 @@ do_set_wake() {
     return 0
 }
 
-# Where a woken window goes: its origin — unless that is gone or a hidden
-# session. Gone, with the folder park_one recorded (@stash_origin_dir): that
-# space brought back (revive_space), named and coloured as it was. Else main,
-# else a visible session somebody is attached to, else any visible one.
-# Nothing (empty) when there is no visible session at all; the window then
-# stays parked. Only a wake revives: a hand unpark lands where you are.
+# A session a tab may be put in, by name: it is there, and is not a space being
+# closed (space.sh close marks it @space_closing; its kill-session would take
+# the tab with it, on no record).
+session_open() {
+    tmux has-session -t "=$1" 2>/dev/null \
+        && [ -z "$(tmux display-message -p -t "=$1:" '#{@space_closing}' 2>/dev/null)" ]
+}
+
+# A restart's restore still running (space.sh's @space_restore_pending: an
+# epoch under 15 min old, not `done`, snooze.sh wake-due's rule).
+restore_pending() {
+    local p; p=$(tmux show -gqv @space_restore_pending 2>/dev/null)
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    [ $(( $(date +%s) - p )) -lt 900 ]
+}
+
+# The visible session for a tab that has none to go to: one somebody is
+# attached to first, else any; never one being closed. Empty when there is none.
+any_session() {
+    local hidden o
+    hidden=$(hidden_sessions)
+    o=$(tmux list-sessions -F '#{?#{@space_closing},,#{?session_attached,#{session_name},}}' 2>/dev/null |
+        grep -v '^$' | grep -vxF -f <(printf '%s\n' "$hidden") | head -1)
+    [ -n "$o" ] || o=$(tmux list-sessions -F '#{?#{@space_closing},,#{session_name}}' 2>/dev/null |
+                       grep -v '^$' | grep -vxF -f <(printf '%s\n' "$hidden") | head -1)
+    printf '%s' "$o"
+}
+
+# revive_origin <origin> [<origin dir> [<origin colour>]]: a snoozed window's
+# closed origin space brought back (revive_space) from the folder park_one
+# recorded, named and coloured as it was: prints its name. Status 1 for a
+# hidden origin, no recorded folder, a revive that fails or a hidden result.
+revive_origin() {
+    local sid name
+    [ -n "${1:-}" ] && [ "$1" != "$HOLD" ] && ! is_hidden_session "$1" || return 1
+    sid=$(revive_space "$1" "${2:-}" "${3:-}") || return 1
+    name=$(tmux display-message -p -t "$sid" '#{session_name}' 2>/dev/null)
+    [ -n "$name" ] && ! is_hidden_session "$name" || return 1
+    printf '%s' "$name"
+}
+
+# Where a woken window goes: its origin — unless that is gone, a hidden
+# session or being closed. Gone, with the folder park_one recorded (@stash_origin_dir): that
+# space brought back (revive_origin). Else main, else a visible session
+# somebody is attached to, else any visible one. Nothing (empty) when there is
+# no visible session at all; the window then stays parked. A snoozed window
+# unparked by hand brings its space back too (do_unstash_many); a plain
+# stashed one lands where you are.
 wake_target() {   # <origin> [<origin dir> [<origin colour>]]
-    local o="${1:-}" hidden sid name
+    local o="${1:-}"
     if [ -n "$o" ] && [ "$o" != "$HOLD" ] && ! is_hidden_session "$o"; then
-        if tmux has-session -t "=$o" 2>/dev/null; then
+        if session_open "$o"; then
             printf '%s' "$o"; return 0
         fi
-        if [ -n "${2:-}" ] && sid=$(revive_space "$o" "$2" "${3:-}"); then
-            name=$(tmux display-message -p -t "$sid" '#{session_name}' 2>/dev/null)
-            if [ -n "$name" ] && ! is_hidden_session "$name"; then
-                printf '%s' "$name"; return 0
-            fi
-        fi
+        # (A closing one is refused by space.sh revive too.)
+        revive_origin "$o" "${2:-}" "${3:-}" && return 0
     fi
-    if tmux has-session -t "=main" 2>/dev/null && ! is_hidden_session main; then printf 'main'; return 0; fi
-    hidden=$(hidden_sessions)
-    o=$(tmux list-sessions -F '#{?session_attached,#{session_name},}' 2>/dev/null |
-        grep -v '^$' | grep -vxF -f <(printf '%s\n' "$hidden") | head -1)
-    [ -n "$o" ] || o=$(tmux list-sessions -F '#{session_name}' 2>/dev/null |
-                       grep -vxF -f <(printf '%s\n' "$hidden") | head -1)
-    printf '%s' "$o"
+    if session_open main && ! is_hidden_session main; then printf 'main'; return 0; fi
+    any_session
 }
 
 # wake <win…>: the alarm went off (snooze.sh wake-due). Each window still
@@ -3526,10 +3560,12 @@ do_wake() {
         case "$wanted" in *" $w "*) ordered+=("$w") ;; esac
     done < <(tmux list-windows -t "=$HOLD" -F '#{window_id}' 2>/dev/null)
     for win in ${ordered[@]+"${ordered[@]}"}; do
+        lock_touch                       # a revive per window can add up
         odir="" ocolor=""
         IFS="$SEP" read -r origin odir ocolor label < <(tmux display-message -p -t "$win" \
             "#{@stash_origin}${SEP}#{@stash_origin_dir}${SEP}#{@stash_origin_color}${SEP}#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}" 2>/dev/null)
         dest=$(wake_target "$origin" "$odir" "$ocolor")
+        lock_touch
         if [ -z "$dest" ]; then
             log "wake: no session to bring $win back to — left parked"
             continue
@@ -4373,7 +4409,7 @@ do_unstash() {
 do_unstash_many() {
     local client=""
     if [ "${1:-}" = "-c" ]; then client="${2:-}"; shift 2; fi
-    local w win origin origins=() ordered=() wanted=" $* " unsnoozed=""
+    local w win origin wake odir ocolor origins=() ordered=() wanted=" $* " unsnoozed=""
 
     # Ids NAMED here that are pending resumes rather than parked windows: home
     # already, agent dead, @stash_session still set (a resume refused because
@@ -4420,18 +4456,36 @@ do_unstash_many() {
 
     local restored=() failed=0
     for win in "${ordered[@]}"; do
-        # Home if it still exists, otherwise wherever we are now — a parked
-        # window must never become unreachable because its origin session was
-        # closed. Resolved per window: a batch can span origins.
+        lock_touch                       # a revive per window can add up
+        # Home if it still exists (or, snoozed, can be brought back),
+        # otherwise wherever we are now — a parked window must never become
+        # unreachable because its origin session was closed. Resolved per
+        # window: a batch can span origins.
         origin=$(tmux show -wqv -t "$win" @stash_origin 2>/dev/null)
-        if [ -z "$origin" ] || [ "$origin" = "$HOLD" ] || ! tmux has-session -t "=$origin" 2>/dev/null; then
+        if [ -z "$origin" ] || [ "$origin" = "$HOLD" ] || ! session_open "$origin"; then
+            # A SNOOZED one brings its closed space back (revive_origin), as
+            # its wake would (Mack, 2026-11-23); a plain stashed one does not.
+            # Not while a restart's restore is pending: it would race
+            # resurrect making that session (snooze.sh defers the wakes).
+            wake="" odir="" ocolor=""
+            IFS="$SEP" read -r wake odir ocolor < <(tmux display-message -p -t "$win" \
+                "#{@stash_wake}${SEP}#{@stash_origin_dir}${SEP}#{@stash_origin_color}" 2>/dev/null)
+            case "$wake" in
+                ''|*[!0-9]*) origin="" ;;
+                *)
+                    if restore_pending; then origin=""
+                    else
+                        origin=$(revive_origin "$origin" "$odir" "$ocolor") || origin=""
+                        lock_touch
+                    fi ;;
+            esac
             # The session the CLIENT is looking at first, when there is one —
             # that is "wherever we are now". The bare display-message below is
             # only right inside tmux: from the sidebar (run-shell sent from
             # outside tmux) it answered tmux's best session, which was `agents`
             # whenever tmux-pty-mcp had just opened a window there.
-            origin=""
-            [ -n "$client" ] && origin=$(tmux display-message -p -c "$client" '#{client_session}' 2>/dev/null)
+            [ -z "$origin" ] && [ -n "$client" ] \
+                && origin=$(tmux display-message -p -c "$client" '#{client_session}' 2>/dev/null)
             [ -n "$origin" ] || origin=$(tmux display-message -p '#{session_name}' 2>/dev/null)
             # ...but the bare form resolves by tmux's most-recently-active
             # rules, not "the session the client is looking at", and the
@@ -4454,12 +4508,9 @@ do_unstash_many() {
             # user-chosen and may contain regex metacharacters. With no visible
             # session left at all the window stays parked (counted as failed):
             # still reachable, unlike one moved into a hidden session.
-            if [ -z "$origin" ] || is_hidden_session "$origin"; then
-                local hidden; hidden=$(hidden_sessions)
-                origin=$(tmux list-sessions -F '#{?session_attached,#{session_name},}' 2>/dev/null |
-                         grep -v '^$' | grep -vxF -f <(printf '%s\n' "$hidden") | head -1)
-                [ -n "$origin" ] || origin=$(tmux list-sessions -F '#{session_name}' 2>/dev/null |
-                                             grep -vxF -f <(printf '%s\n' "$hidden") | head -1)
+            # A space being closed is refused like a hidden one.
+            if [ -z "$origin" ] || is_hidden_session "$origin" || ! session_open "$origin"; then
+                origin=$(any_session)
             fi
         fi
         if [ -z "$origin" ]; then
@@ -4595,7 +4646,7 @@ close_parked_window() {   # <win>
     if [ -f "$CLOSED_TABS_SH" ]; then
         origin=$(tmux show -wqv -t "$win" @stash_origin 2>/dev/null)
         if [ -n "$origin" ] && [ "$origin" != "$HOLD" ] && ! is_hidden_session "$origin" \
-           && tmux has-session -t "=$origin" 2>/dev/null; then
+           && session_open "$origin"; then
             tmux move-window -d -s "$win" -t "=$origin:" 2>/dev/null \
                 || log "could not move $win to $origin before closing it — its ⌘Z entry says $HOLD"
         fi

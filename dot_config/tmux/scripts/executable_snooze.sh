@@ -27,12 +27,14 @@
 #                                  target is snoozed. Each item re-enters
 #                                  here as apply-text, so the time is read
 #                                  when the item is picked, not when the menu
-#                                  opened. A tab not parked yet that stash.sh
-#                                  would refuse (`stash.sh check --snooze`,
-#                                  exit 3) is not offered: its refusal text
-#                                  ("… not snoozing it") is the toast, and no
-#                                  menu opens when nothing is left.
-#   snooze.sh apply [-c <client>] <epoch|unsnooze> <target…>
+#                                  opened; all but Unsnooze with --ask-space
+#                                  (see apply). A tab not parked yet that
+#                                  stash.sh would refuse (`stash.sh check
+#                                  --snooze`, exit 3) is not offered: its
+#                                  refusal text ("… not snoozing it") is the
+#                                  toast, and no menu opens when nothing is
+#                                  left.
+#   snooze.sh apply [-c <client>] [--ask-space] <epoch|unsnooze> <target…>
 #                                  dispatch. p:<id> / b:<id> → closed-tabs.sh
 #                                  snooze <epoch> / unsnooze; w:@N (or a bare
 #                                  @N) already in `stash` → stash.sh set-wake;
@@ -41,16 +43,23 @@
 #                                  pending rows) is ignored. One toast:
 #                                  "⏰ snoozed <what> — back <when>" (when:
 #                                  "in 45m" under 50 minutes, else "at 17:45",
-#                                  "tomorrow 9:00", "Fri 9:00").
-#   snooze.sh apply-text [-c <client>] <text> <target…>
+#                                  "tomorrow 9:00", "Fri 9:00"). With
+#                                  --ask-space (either side of -c), a space
+#                                  this park left with only its home gets
+#                                  "last tab snoozed · close space NAME until
+#                                  it wakes?" on that client (closed-tabs.sh
+#                                  ask-space --snoozed), last of all: it holds
+#                                  until the box is answered. Without it,
+#                                  never (agent-ui's review asks itself).
+#   snooze.sh apply-text [-c <client>] [--ask-space] <text> <target…>
 #                                  parse, then apply; unreadable text → a
 #                                  warning toast and nothing changes (exit 0:
 #                                  every verb a menu or popup runs exits 0
 #                                  once it has said what happened)
-#   snooze.sh custom -c <client> <target…>
+#   snooze.sh custom -c <client> [--ask-space] <target…>
 #                                  the Custom… time box: a small popup on the
 #                                  client running prompt-popup
-#   snooze.sh prompt-popup -c <client> <target…>
+#   snooze.sh prompt-popup -c <client> [--ask-space] <target…>
 #                                  inside it: fzf as an input box over a few
 #                                  suggestions, each with when it lands; the
 #                                  typed text wins when it reads as a time,
@@ -438,9 +447,26 @@ what() {
 
 # --- apply ------------------------------------------------------------------
 
+# opts <arg…>: the options in front of a verb's arguments, in any order:
+# O_CLIENT (-c <client>), O_ASK (--ask-space, "" without it) and O_N, how many
+# arguments they took (the caller shifts them).
+O_CLIENT="" O_ASK="" O_N=0
+opts() {
+    O_CLIENT="" O_ASK="" O_N=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -c) O_CLIENT="${2:-}"; O_N=$((O_N + 1)); shift
+                [ $# -gt 0 ] && { O_N=$((O_N + 1)); shift; } ;;
+            --ask-space) O_ASK="$1"; O_N=$((O_N + 1)); shift ;;
+            *) return 0 ;;
+        esac
+    done
+    return 0
+}
+
 do_apply() {
-    local client=""
-    if [ "${1:-}" = -c ]; then client="${2:-}"; shift 2 || shift $#; fi
+    opts "$@"; shift "$O_N"
+    local client="$O_CLIENT" ask="$O_ASK"
     local when="${1:-}"; [ $# -gt 0 ] && shift
     case "$when" in
         unsnooze) ;;
@@ -449,7 +475,7 @@ do_apply() {
     describe "$@"
     local ids=(${T_IDS[@]+"${T_IDS[@]}"}) wins=(${T_WINS[@]+"${T_WINS[@]}"})
     local wsess=(${D_WSESS[@]+"${D_WSESS[@]}"})
-    local done_n=0 i w out set_wins=() park_wins=()
+    local done_n=0 i w s seen out set_wins=() park_wins=() park_sess=() left=()
     if [ ${#ids[@]} -gt 0 ]; then
         if [ "$when" = unsnooze ]; then closed_sh unsnooze "${ids[@]}" >/dev/null
         else closed_sh snooze "$when" "${ids[@]}" >/dev/null
@@ -460,7 +486,7 @@ do_apply() {
         case "${wsess[$i]:-}" in
             '') ;;
             "$HOLD") set_wins+=("$w") ;;
-            *) [ "$when" = unsnooze ] || park_wins+=("$w") ;;
+            *) [ "$when" = unsnooze ] || { park_wins+=("$w"); park_sess+=("${wsess[$i]}"); } ;;
         esac
         i=$((i + 1))
     done
@@ -470,10 +496,18 @@ do_apply() {
         fi && done_n=$((done_n + ${#set_wins[@]}))
     fi
     # stash.sh snooze parks one window and prints what got the alarm
-    # (p:<id> / w:<win>); nothing printed = refused (it has said why).
+    # (p:<id> / w:<win>); nothing printed = refused (it has said why). Each
+    # session one of them left is noted once, for --ask-space.
+    i=0
     for w in ${park_wins[@]+"${park_wins[@]}"}; do
         out=$(stash_sh snooze "$when" "$w" 2>/dev/null) || out=""
-        [ -n "$out" ] && done_n=$((done_n + 1))
+        if [ -n "$out" ]; then
+            done_n=$((done_n + 1))
+            seen=0
+            for s in ${left[@]+"${left[@]}"}; do [ "$s" = "${park_sess[$i]}" ] && seen=1; done
+            [ "$seen" = 1 ] || left+=("${park_sess[$i]}")
+        fi
+        i=$((i + 1))
     done
     log "apply $when ${*:-} → $done_n"
     if [ "$done_n" -gt 0 ]; then
@@ -488,12 +522,19 @@ do_apply() {
         fi
     fi
     do_reschedule
+    # Last: it holds until the box is answered. closed-tabs.sh decides whether
+    # there is one (a visible space left with only its home, never main).
+    if [ -n "$ask" ] && [ -n "$client" ]; then
+        for s in ${left[@]+"${left[@]}"}; do
+            closed_sh ask-space --snoozed "$client" "=$s:" </dev/null >/dev/null 2>&1
+        done
+    fi
     return 0
 }
 
 do_apply_text() {
-    local client=""
-    if [ "${1:-}" = -c ]; then client="${2:-}"; shift 2 || shift $#; fi
+    opts "$@"; shift "$O_N"
+    local client="$O_CLIENT" ask="$O_ASK"
     local text="${1:-}" epoch err
     [ $# -gt 0 ] && shift
     if ! epoch=$(do_parse "$text" 2>/dev/null); then
@@ -502,7 +543,7 @@ do_apply_text() {
         notify_user ${client:+-c "$client"} -k warn -- "$err"
         return 0        # told: a run-shell must not report a status too
     fi
-    do_apply ${client:+-c "$client"} "$epoch" "$@"
+    do_apply ${client:+-c "$client"} ${ask:+"$ask"} "$epoch" "$@"
 }
 
 # --- menu and the Custom… box -----------------------------------------------
@@ -575,8 +616,9 @@ do_menu() {
     # item <verb> [arg…]: the run-shell that runs `<verb> -c <tty> [arg…]
     # <targets>`. `|| true`: the script tells its story in toasts; a failing
     # run-shell would also put its status into the pane, in view mode.
+    # --ask-space on every item that can park a space's last tab.
     item() { local v="$1"; shift; printf 'run-shell -b %s' "$(tq "$prefix $v -c $tq_tty${*:+ $*}$tgt || true")"; }
-    at_item() { item apply-text "$(sq "$1")"; }
+    at_item() { item apply-text --ask-space "$(sq "$1")"; }
 
     local hour evening_label evening_text title what_s
     hour=$(date -j -r "$(now_epoch)" '+%H'); hour=$((10#$hour))
@@ -593,7 +635,7 @@ do_menu() {
         "Tomorrow 9:00" t "$(at_item tomorrow)"
         "Monday 9:00" m "$(at_item mon)"
         ""
-        "Custom…" c "$(item custom)"
+        "Custom…" c "$(item custom --ask-space)"
     )
     [ "$D_SNOOZED" = 1 ] && items+=("" "Unsnooze" u "$(item apply unsnooze)")
     tmux display-menu -c "$tty" -b rounded -s 'bg=#1e1e2e,fg=#cdd6f4' -S 'fg=#f9e2af' \
@@ -602,15 +644,16 @@ do_menu() {
     return 0
 }
 
-# custom -c <tty> <target…>: the Custom… box, a small popup on that client
-# running prompt-popup. A menu item runs this after its menu has closed; a
-# popup that will not open at once (an overlay still going) is retried.
+# custom -c <tty> [--ask-space] <target…>: the Custom… box, a small popup on
+# that client running prompt-popup. A menu item runs this after its menu has
+# closed; a popup that will not open at once (an overlay still going) is
+# retried.
 do_custom() {
-    local tty=""
-    if [ "${1:-}" = -c ]; then tty="${2:-}"; shift 2 || shift $#; fi
+    opts "$@"; shift "$O_N"
+    local tty="$O_CLIENT" ask="$O_ASK"
     [ -n "$tty" ] || return 0
     local cmd i h
-    cmd="$(reenter) prompt-popup -c $(sq "$tty")$(targets_q "$@")"
+    cmd="$(reenter) prompt-popup -c $(sq "$tty")${ask:+ $ask}$(targets_q "$@")"
     # Every suggestion shows: one row each, plus the prompt and the header,
     # the border's two and one to spare.
     h=$(( ${#SUGGEST[@]} + 5 ))
@@ -626,16 +669,16 @@ do_custom() {
 # The Custom… box's suggestions: what is typed most, shown with when it lands.
 SUGGEST=(30m 1h 2h 3h tonight tomorrow "tomorrow 2pm" mon "fri 9am" 1w)
 
-# prompt-popup -c <tty> <target…>: inside the popup. fzf as an input box.
-# Enter takes, in order: the typed text when it reads as a time; the
-# highlighted suggestion when nothing is typed, or when the text is the start
-# of that suggestion ("tomo" → tomorrow); else nothing, with a warning — a bare
-# number ("3") is never completed (3h? 3pm?), it asks for the unit. Esc
+# prompt-popup -c <tty> [--ask-space] <target…>: inside the popup. fzf as an
+# input box. Enter takes, in order: the typed text when it reads as a time;
+# the highlighted suggestion when nothing is typed, or when the text is the
+# start of that suggestion ("tomo" → tomorrow); else nothing, with a warning —
+# a bare number ("3") is never completed (3h? 3pm?), it asks for the unit. Esc
 # cancels. The text never leaves this process: what is handed on (after the
 # popup has closed) is the epoch.
 do_prompt_popup() {
-    local tty=""
-    if [ "${1:-}" = -c ]; then tty="${2:-}"; shift 2 || shift $#; fi
+    opts "$@"; shift "$O_N"
+    local tty="$O_CLIENT" ask="$O_ASK"
     local s e lines="" out rc query sel epoch="" err today at ymd wd hm
     today=$(date -j -r "$(now_epoch)" '+%Y-%m-%d')
     for s in "${SUGGEST[@]}"; do
@@ -680,7 +723,7 @@ EOF
         esac
     fi
     # Applied after the popup has closed: a park takes a moment.
-    tmux run-shell -b "$(reenter) apply ${tty:+-c $(sq "$tty") }$epoch$(targets_q "$@") || true"
+    tmux run-shell -b "$(reenter) apply ${tty:+-c $(sq "$tty") }${ask:+$ask }$epoch$(targets_q "$@") || true"
     return 0
 }
 

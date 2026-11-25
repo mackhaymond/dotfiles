@@ -270,6 +270,131 @@ class SnoozeOnAServer(ServerBase):
         r = self.run_script("wake", "home", rc=1)
         self.assertEqual(r.stdout, "")
 
+    # -- reopened by hand before the alarm -------------------------------------
+    def fake_space_sh(self):
+        """SPACE_SH: `revive` makes the session (or fails / makes a hidden
+        one), and is logged; notify.sh logs what is said."""
+        self.revives = Path(self.tmp, "revives")
+        self.revive_mode = Path(self.tmp, "revive-mode")
+        self.revive_mode.write_text("ok")
+        sh = Path(self.tmp, "space.sh")
+        sh.write_text(
+            "#!/bin/bash\n"
+            f'printf "%s\\n" "$*" >> "{self.revives}"\n'
+            f'case "$(cat "{self.revive_mode}")" in fail) exit 1 ;; esac\n'
+            """sid=$(tmux new-session -d -s "$2" -c "$3" -P -F '#{session_id}' "sleep 600") || exit 1\n"""
+            f'[ "$(cat "{self.revive_mode}")" = hidden ] && tmux set-option -t "$sid" @space_hidden 1\n'
+            'echo "$sid"\n')
+        self.notes = Path(self.tmp, "notes.log")
+        self.notes.write_text("")
+        Path(self.env["NOTIFY_SH"]).write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{self.notes}"\n')
+        Path(self.env["NOTIFY_SH"]).chmod(0o755)
+        self.env["SPACE_SH"] = str(sh)
+
+    def gone(self, id_="s", **kw):
+        """An entry whose space is gone and whose folder is on record."""
+        now = int(time.time())
+        e = dict(session="vanished", tmux_session="", index=2, cwd=self.tmp, label="zsh", pinned=True,
+                 stashed_ts=now - 50, wake_at=now + 3600, space_dir=self.tmp, space_color="#cba6f7")
+        e.update(kw)
+        return entry(id_, now - 50, **{k: v for k, v in e.items() if v is not None})
+
+    def test_a_snoozed_entry_reopened_by_hand_brings_its_space_back(self):
+        for shell in ("bash", "/bin/bash"):
+            with self.subTest(shell=shell):
+                self.fake_space_sh()
+                self.write(self.gone("s1", space_color=None), self.gone("s2", index=3))
+                r = self.run_script("reopen", "main", "", "s1", "s2", shell=shell)
+                self.assertNotIn("unbound", r.stderr)
+                # Newest-closed first: s2 makes it again, s1 finds it by name.
+                self.assertEqual(self.revives.read_text().splitlines(), [f"revive vanished {self.tmp} #cba6f7"])
+                self.assertEqual(len(self.windows("vanished")), 3)
+                self.assertEqual(len(self.windows("main")), 1)
+                self.assertTrue(self.windows("vanished")[-1].endswith(" 1"), "the reopened tab is current")
+                self.assertEqual(self.entries(), [])
+                self.assertNotIn("session is gone", self.notes.read_text())
+                self.snooze_calls("reschedule")
+                self.t("kill-session", "-t", "=vanished")
+                self.revives.unlink()
+
+    def test_only_a_snoozed_entry_is_revived_by_hand(self):
+        for name, kw in (("plain stashed", dict(wake_at=None)), ("backlog", dict(pinned=None, stashed_ts=None, wake_at=None)),
+                         ("backlog, stray wake_at", dict(pinned=None, stashed_ts=None)),
+                         ("wake_at no number", dict(wake_at="soon"))):
+            with self.subTest(name):
+                self.fake_space_sh()
+                self.write(self.gone(**kw))
+                before = len(self.windows("main"))
+                self.run_script("reopen", "main", "", "s")
+                self.assertFalse(self.revives.exists())
+                self.assertEqual(len(self.windows("main")), before + 1)
+                self.assertIn("its session is gone — reopened in main", self.notes.read_text())
+
+    def test_a_hand_revive_that_cannot_work_lands_where_you_are(self):
+        for name, mode, kw, why in (("fails", "fail", {}, "gone"), ("hidden result", "hidden", {}, "gone"),
+                                    ("no folder", "ok", dict(space_dir=None), "gone"),
+                                    ("hidden session", "ok", dict(session="stash"), "hidden")):
+            with self.subTest(name):
+                self.fake_space_sh()
+                self.revive_mode.write_text(mode)
+                if name == "hidden session":
+                    self.t("new-session", "-d", "-s", "stash", "sleep 600")
+                self.write(self.gone(**kw))
+                before = len(self.windows("main"))
+                self.run_script("reopen", "main", "", "s")
+                self.assertEqual(len(self.windows("main")), before + 1)
+                self.assertIn(f"its session is {why} — reopened in main", self.notes.read_text())
+                self.assertEqual(self.entries(), [])
+                self.assertEqual(self.revives.exists(), name in ("fails", "hidden result"))
+                if name == "hidden result":
+                    self.t("kill-session", "-t", "=vanished")
+                self.revives.unlink(missing_ok=True)
+
+    def test_no_hand_revive_while_a_restore_is_pending(self):
+        for pending, revived in ((str(int(time.time()) - 60), False), ("done", True),
+                                 (str(int(time.time()) - 901), True)):
+            with self.subTest(pending=pending):
+                self.fake_space_sh()
+                self.t("set", "-g", "@space_restore_pending", pending)
+                self.write(self.gone())
+                before = len(self.windows("main"))
+                self.run_script("reopen", "main", "", "s")
+                self.assertEqual(self.revives.exists(), revived)
+                self.assertEqual(len(self.windows("main")), before + (not revived))
+                self.assertEqual("is gone — reopened in main" in self.notes.read_text(), not revived)
+                if revived:
+                    self.t("kill-session", "-t", "=vanished")
+                    self.revives.unlink()
+
+    def test_a_space_being_closed_takes_no_tab(self):
+        # @space_closing: its kill-session would take the tab, on no record.
+        self.fake_space_sh()
+        self.t("new-session", "-d", "-s", "vanished", "sleep 600")
+        self.t("set", "-t", "vanished", "@space_closing", "1")
+        for name, kw in (("snoozed", {}), ("plain", dict(wake_at=None)), ("backlog", dict(pinned=None, wake_at=None))):
+            with self.subTest(name):
+                self.notes.write_text("")
+                self.write(self.gone(**kw))
+                before = len(self.windows("main"))
+                # From the closing space itself, too: the fallback skips it.
+                self.run_script("reopen", "=vanished:", "", "s")
+                self.assertEqual(len(self.windows("main")), before + 1)
+                self.assertIn("its session is closing — reopened in main", self.notes.read_text())
+        self.write(self.gone(label="back", wake_at=int(time.time()) - 5))
+        self.assertEqual(self.run_script("wake", "s").stdout, "back\tmain\n")
+        self.assertEqual(len(self.windows("vanished")), 1)
+        self.assertEqual(self.entries(), [])
+        self.assertFalse(self.revives.exists())
+
+    def test_closing_a_tab_of_a_closing_space_still_records_that_space(self):
+        # space.sh close runs this on every pane once it has marked the space:
+        # a window with a leftover @stash_origin is that space's all the same.
+        pane = self.t("new-session", "-d", "-s", "proj", "-P", "-F", "#{pane_id}", "sleep 600")
+        self.t("set", "-t", "proj", "@space_closing", "1")
+        self.t("set", "-w", "-t", pane, "@stash_origin", "elsewhere")
+        self.run_script("close", pane)
+        self.assertEqual(self.entries()[-1]["session"], "proj")
+
     @unittest.skipUnless(os.path.exists("/bin/bash"), "no /bin/bash")
     def test_close_and_wake_under_macos_bin_bash(self):
         # macOS's /bin/bash is 3.2, where an empty array is "unbound" under

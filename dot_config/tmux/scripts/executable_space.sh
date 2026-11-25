@@ -66,11 +66,13 @@
 #                             it back), unregister, kill the session. Never main
 #   move-menu WID CLIENT      menu of spaces; picking one runs move-to
 #   move-to WID SID CLIENT    move window WID to the end of space SID
-#   revive NAME DIR [COLOR]   a snoozed tab's wake, its space gone: print the
-#                             session id it goes to (the session named NAME,
-#                             else the space on DIR, else a new space NAME at
-#                             DIR in COLOR, at the end, with its home); status
-#                             1 when DIR is no folder (see cmd_revive)
+#   revive NAME DIR [COLOR]   a snoozed tab back (its wake, or by hand before
+#                             it), its space gone: print the session id it
+#                             goes to (the session named NAME, else the space
+#                             on DIR, else a new space NAME at DIR in COLOR,
+#                             at the end, with its home); status 1 when DIR
+#                             is no folder or that session is being closed
+#                             (see cmd_revive)
 #
 # Outside tmux ($TMUX empty) everything but `preview` refuses: a plain `tmux`
 # there reaches the DEFAULT server, whatever server the caller had in mind.
@@ -2104,14 +2106,17 @@ cmd_adopt_pending() {
   printf 'space %s: %s (%s)\n' "${idx:-?}" "$sname" "$dir"
 }
 
-# revive NAME DIR [COLOR]: the space a snoozed tab woke up for (closed-tabs.sh
-# and stash.sh `wake`, from snooze.sh's timer), when the space it was snoozed
-# from is gone (docs/spaces.md "Snoozed tabs bring their space back"). Prints
-# the session id to put the tab in; status 1 (nothing printed) when there is
-# none, and the caller falls back to main. In order:
+# revive NAME DIR [COLOR]: the space a snoozed tab comes back to, when the one
+# it was snoozed from is gone (docs/spaces.md "Snoozed tabs bring their space
+# back"): its wake (closed-tabs.sh and stash.sh `wake`, from snooze.sh's timer)
+# or a hand reopen / unstash before it. Prints the session id to put the tab
+# in; status 1 (nothing printed) when there is none, and the caller falls back
+# (a wake to main, by hand to where you are). In order:
 #   1. a visible session named NAME: that one, nothing made (a second tab of
 #      the same closed space lands in the one the first revived);
 #   2. a visible space on DIR (space_for_dir; ~ is main's): that one;
+#      either being closed (@space_closing): status 1, or its kill-session
+#      would take the tab with it;
 #   3. DIR not a folder: status 1;
 #   4. else a new space at DIR, named NAME if no session has that name and it
 #      is not a hidden one, else new_space_name DIR. With spaces on it is
@@ -2123,26 +2128,39 @@ cmd_adopt_pending() {
 #      registered (no session, but not closed) is made again IN PLACE: its
 #      row, number, colour and (if it is one) folder kept. Spaces off: a
 #      plain `new-session -d` at DIR, no registry.
-# snooze.sh defers wakes while a restart's restore is pending, so this never
-# races resurrect rebuilding sessions.
-# No client is switched and nothing is said: the wake is silent and
-# snooze.sh makes its one toast. Like everything here it needs $TMUX; the
-# callers run from launchd and set it to the server they talk to.
+# Never called while a restart's restore is pending, so it never races
+# resurrect rebuilding sessions: snooze.sh defers its wakes, and the hand
+# callers fall back without asking for a revive.
+# It switches no client and says nothing: a wake is silent (snooze.sh makes
+# its one toast) and moves nobody; a hand caller takes its client to the tab
+# itself. Like everything here it needs $TMUX: a hand caller has its client's
+# server's, a wake (from launchd, with none) sets it to the server it talks to.
 cmd_revive() {
-  local name="${1:-}" dir="${2:-}" color="${3:-}" info sid hid new
+  local name="${1:-}" dir="${2:-}" color="${3:-}" info sid hid closing new rc
   read_opts || return 1
   [[ -n "$name" ]] || return 1
-  # Visible session named NAME (`=name:`: a bare `=name` reads as a window).
+  # Visible session named NAME (`=name:`: a bare `=name` reads as a window);
+  # status 2 when it is being closed.
   revive_named() {
-    info="$(t display-message -p -t "=$1:" "#{session_id}${US}#{@space_hidden}" 2>/dev/null)" || return 1
-    IFS="$US" read -r sid hid <<<"$info"
-    [[ "$sid" == \$* && "$hid" != 1 ]] && ! is_hidden_name "$1"
+    info="$(t display-message -p -t "=$1:" "#{session_id}${US}#{@space_hidden}${US}#{@space_closing}" 2>/dev/null)" || return 1
+    IFS="$US" read -r sid hid closing <<<"$info"
+    [[ "$sid" == \$* && "$hid" != 1 ]] && ! is_hidden_name "$1" || return 1
+    [[ -z "$closing" ]] || return 2
   }
-  revive_named "$name" && { printf '%s\n' "$sid"; return 0; }
+  # Visible space on DIR: sid, "" when there is none; status 2 when it is
+  # being closed, 1 when that could not be read.
+  revive_on_dir() {
+    sid="$(space_for_dir "$dir")" || return 1
+    [[ "$sid" == \$* ]] || { sid=""; return 0; }
+    [[ -z "$(t display-message -p -t "$sid" '#{@space_closing}' 2>/dev/null)" ]] || return 2
+  }
+  revive_named "$name"; rc=$?
+  ((rc == 0)) && { printf '%s\n' "$sid"; return 0; }
+  ((rc == 2)) && return 1
   [[ -n "$dir" && -d "$dir" ]] || return 1
   dir="$(cd -- "$dir" 2>/dev/null && pwd -P)" || return 1
-  sid="$(space_for_dir "$dir")" || return 1
-  [[ "$sid" == \$* ]] && { printf '%s\n' "$sid"; return 0; }
+  revive_on_dir || return 1
+  [[ -n "$sid" ]] && { printf '%s\n' "$sid"; return 0; }
   # A free, non-hidden NAME, else what any new space on DIR would be called.
   revive_name() {
     new="$name"
@@ -2163,9 +2181,11 @@ cmd_revive() {
   reg_lock || return 1
   # Again under the lock: a revive racing this one (two snoozed tabs of one
   # space) may have made it while this one waited.
-  if revive_named "$name"; then reg_unlock; printf '%s\n' "$sid"; return 0; fi
-  sid="$(space_for_dir "$dir")"
-  if [[ "$sid" == \$* ]]; then reg_unlock; printf '%s\n' "$sid"; return 0; fi
+  revive_named "$name"; rc=$?
+  if ((rc == 0)); then reg_unlock; printf '%s\n' "$sid"; return 0; fi
+  if ((rc == 2)); then reg_unlock; return 1; fi
+  revive_on_dir; (($? == 2)) && { reg_unlock; return 1; }
+  if [[ -n "$sid" ]]; then reg_unlock; printf '%s\n' "$sid"; return 0; fi
   revive_name || { reg_unlock; return 1; }
   # Still REGISTERED with no session (not closed: prefix Q unregisters; a
   # restart's restore not done yet, a kill-session no sync has seen): made

@@ -2976,13 +2976,136 @@ class SnoozeRevivesItsSpace(ReviveBase):
         self.wait(lambda: self.opt("=proj:", "@space_color", w=False), "#cba6f7")
         self.assertEqual(self.homes("proj"), [self.t("display", "-p", "-t", "=proj:^", "#{window_id}")])
 
-    def test_a_hand_unpark_never_revives(self):
+    def on_session(self):
+        return self.t("display", "-p", "-c", self.client, "#{client_session}")
+
+    def snoozed_window(self):
         w, _ = self.tab()
         self.run_sh(STASH, "snooze", str(int(time.time()) + 3600), w)
+        return w
+
+    def test_a_snoozed_window_unparked_by_hand_brings_its_space_back(self):
+        self.attach()
+        w = self.snoozed_window()
         self.close_space("proj")
-        self.run_sh(STASH, "unstash-many", w)
+        self.run_sh(STASH, "unstash", w, self.client, shell="/bin/bash")
+        self.assert_revived("proj", self.proj, "#cba6f7", index="3", tabs=1)
+        self.assertEqual(self.t("display", "-p", "-t", w, "#{session_name}"), "proj")
+        self.wait(self.on_session, "proj")                                    # and you are taken there
+        self.assertEqual(self.t("display", "-p", "-t", "=proj:", "#{window_id}"), w)
+        for o in ("@stash_origin", "@stash_origin_dir", "@stash_origin_color", "@stash_wake"):
+            self.assertEqual(self.opt(w, o), "", o)
+
+    def test_a_snoozed_entry_reopened_by_hand_brings_its_space_back(self):
+        notes = Path(self.tmp, "notes.log")
+        Path(self.extra["NOTIFY_SH"]).write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{notes}"\n')
+        Path(self.extra["NOTIFY_SH"]).chmod(0o755)
+        self.attach()
+        e = self.closed_entry()
+        self.close_space("proj")
+        self.run_sh(CLOSED, "reopen", "main", self.client, e["id"], shell="/bin/bash")
+        self.assert_revived("proj", self.proj, "#cba6f7", index="3", tabs=1)
+        self.wait(self.on_session, "proj")
+        [tab] = set(self.t("list-windows", "-t", "=proj", "-F", "#{window_id}").split()) - set(self.homes("proj"))
+        self.assertEqual(self.t("display", "-p", "-t", "=proj:", "#{window_id}"), tab)
+        self.assertEqual(self.entries(), [])
+        self.assertNotIn("is gone", notes.read_text() if notes.exists() else "")
+
+    def test_the_picker_brings_both_kinds_back_into_one_space(self):
+        # ⌘Z's ⏎ on a snoozed entry and a snoozed window of one closed space.
+        self.extra["STASH_SH"] = self.extra["STASH_SELF"]
+        self.attach()
+        w = self.snoozed_window()
+        e = self.closed_entry()
+        self.close_space("proj")
+        self.run_sh(CLOSED, "pick-act", "", "main", self.client, "p:" + e["id"], "w:" + w)
+        self.assert_revived("proj", self.proj, "#cba6f7", index="3", tabs=2)
+        self.wait(self.on_session, "proj")
+
+    def test_by_hand_only_what_is_still_snoozed_revives(self):
+        # A plain stashed window, an unsnoozed one, a pinned entry, an
+        # unsnoozed one and a backlog one: where you are, as before.
+        self.attach()
+        plain, _ = self.tab()
+        self.run_sh(STASH, "stash", plain)
+        off = self.snoozed_window()
+        self.run_sh(STASH, "set-wake", "", off)
+        pinned, backlog = self.closed_entry(), self.closed_entry()
+        self.run_sh(CLOSED, "unsnooze", pinned["id"])
+        self.run_sh(CLOSED, "unpin", backlog["id"])
+        self.close_space("proj")
+        for w in (plain, off):
+            self.run_sh(STASH, "unstash-many", "-c", self.client, w)
+            self.assertEqual(self.t("display", "-p", "-t", w, "#{session_name}"), "main")
+        for e in (pinned, backlog):
+            self.run_sh(CLOSED, "reopen", "main", self.client, e["id"])
         self.assertNotIn("proj", self.sessions())
-        self.assertNotEqual(self.t("display", "-p", "-t", w, "#{session_name}"), "stash")
+        self.assertEqual(self.on_session(), "main")
+        self.assertNotIn(pinned["id"], [e["id"] for e in self.entries()])
+        self.assertNotIn(backlog["id"], [e["id"] for e in self.entries()])
+
+    def test_by_hand_nothing_is_revived_while_a_restore_is_pending(self):
+        self.attach()
+        for pending, want in ((str(int(time.time())), "main"), ("done", "proj")):
+            with self.subTest(pending=pending):
+                w = self.snoozed_window()
+                e = self.closed_entry()
+                self.close_space("proj")
+                self.t("set", "-g", "@space_restore_pending", pending)
+                self.run_sh(STASH, "unstash-many", "-c", self.client, w)
+                self.assertEqual(self.t("display", "-p", "-t", w, "#{session_name}"), want)
+                self.assertEqual("proj" in self.sessions(), want == "proj")
+                self.run_sh(CLOSED, "reopen", "main", self.client, e["id"])
+                self.assertEqual("proj" in self.sessions(), want == "proj")
+                self.assertEqual(self.entries(), [])
+                self.wait(self.on_session, want)
+                self.t("set", "-gu", "@space_restore_pending")
+                if want == "main":
+                    self.new_session("proj", self.proj)
+                    self.wait_home("proj")
+                    self.wait(lambda: "proj" in [r[0] for r in self.registered()], True)
+
+    def test_a_space_being_closed_takes_no_tab(self):
+        # Mid-close (prefix Q's closers at work): the tab would go down with
+        # the session. Every way back lands in main instead, and revive says no.
+        self.attach()
+        hand, woken = self.snoozed_window(), self.snoozed_window()
+        e1, e2 = self.closed_entry(), self.closed_entry()
+        self.t("set", "-t", "=proj:", "@space_closing", "1")
+        before = self.t("list-windows", "-t", "=proj", "-F", "#{window_id}")
+        self.run_sh(STASH, "unstash-many", "-c", self.client, hand)
+        self.assertTrue(self.run_sh(STASH, "wake", woken).endswith("\tmain\n"))
+        self.run_sh(CLOSED, "reopen", "main", self.client, e1["id"])
+        self.assertTrue(self.run_sh(CLOSED, "wake", e2["id"]).endswith("\tmain\n"))
+        for w in (hand, woken):
+            self.assertEqual(self.t("display", "-p", "-t", w, "#{session_name}"), "main")
+        self.assertEqual(self.entries(), [])
+        self.assertEqual(self.t("list-windows", "-t", "=proj", "-F", "#{window_id}"), before)
+        self.assertEqual(self.on_session(), "main")
+
+    def test_revive_refuses_a_closing_space(self):
+        sessions = self.sessions()
+        self.t("set", "-t", "=proj:", "@space_closing", "1")
+        for name in ("proj", "elsewhere"):                   # by its name, then by its folder
+            r = self.script("revive", name, self.proj, "#cba6f7")
+            self.assertEqual((r.returncode, r.stdout), (1, ""), name)
+        self.assertEqual(self.sessions(), sessions)
+        self.t("set", "-u", "-t", "=proj:", "@space_closing")
+        self.assertEqual(self.script("revive", "elsewhere", self.proj).stdout.strip(),
+                         self.t("display", "-p", "-t", "=proj:", "#{session_id}"))
+
+    def test_by_hand_with_the_folder_gone_lands_where_you_are(self):
+        self.attach()
+        w = self.snoozed_window()
+        e = self.closed_entry()
+        self.close_space("proj")
+        shutil.rmtree(self.proj)
+        self.run_sh(STASH, "unstash-many", "-c", self.client, w)
+        self.run_sh(CLOSED, "reopen", "main", self.client, e["id"])
+        self.assertNotIn("proj", self.sessions())
+        self.assertEqual(self.t("display", "-p", "-t", w, "#{session_name}"), "main")
+        self.assertEqual(self.on_session(), "main")
+        self.assertEqual(self.opt(w, "@stash_wake"), "")
 
     def test_its_name_taken_by_another_folder_takes_the_tab(self):
         w, _ = self.tab()

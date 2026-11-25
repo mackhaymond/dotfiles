@@ -306,8 +306,8 @@ class Server(unittest.TestCase):
     def reopen(self, rec):
         # reopen_one with the helpers it calls, cut out the same way:
         # session_visible and fallback_session (where the tab may land), and
-        # revive_space stubbed (only a snooze's wake revives a closed space,
-        # and these reopen by hand).
+        # revive_space stubbed (only a snoozed entry revives a closed space,
+        # and these are not snoozed).
         cut = lambda name: 'eval "$(awk \'/^%s\\(\\) \\{/{f=1} f{print} f&&/^\\}/{exit}\' "$1")"\n' % name
         prog = ("msg() { :; }\nrevive_space() { return 1; }\nUS=$'\\x1f'\n"
                 + cut("session_visible") + cut("fallback_session") + cut("reopen_one")

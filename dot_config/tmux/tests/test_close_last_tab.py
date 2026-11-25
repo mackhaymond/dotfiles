@@ -1,6 +1,7 @@
 """Closing the last tab of a space asks to close the space (docs/spaces.md
 "Home: the space's main shell"): closed-tabs.sh `close --ask-space` /
-`ask-space`, and stash.sh's range close calling it once.
+`ask-space`, and stash.sh's range close calling it once; and snoozing it does
+too (`ask-space --snoozed`, snooze.sh's `--ask-space`).
 
 A PRIVATE tmux server (`-L close-last-<uuid>`, `-f /dev/null`, its own
 TMUX_TMPDIR, never the user's) with spaces faked by their options (@spaces on,
@@ -17,6 +18,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -25,6 +27,7 @@ import uuid
 HERE = Path(__file__).resolve().parents[1]
 CLOSED = HERE / "scripts" / "executable_closed-tabs.sh"
 STASH = HERE / "scripts" / "executable_stash.sh"
+SNOOZE = HERE / "scripts" / "executable_snooze.sh"
 SPACES = HERE / "spaces.conf"
 TMUX = shutil.which("tmux")
 LIFE = "sleep 600"
@@ -127,10 +130,13 @@ class CloseLastTab(unittest.TestCase):
                 return tuple(rest)
         return None
 
-    def box(self):
-        return "close space" in subprocess.run(
+    def screen(self):
+        return subprocess.run(
             [TMUX, "-L", self.sock, "-f", "/dev/null", "capture-pane", "-p", "-t", "host:"], env=self.env,
             capture_output=True, text=True, timeout=10).stdout
+
+    def box(self):
+        return "close space" in self.screen()
 
     def asks(self):
         log = Path(self.tmp, "state", "tmux-closed-tabs", "log")
@@ -194,6 +200,107 @@ class CloseLastTab(unittest.TestCase):
         p.wait(timeout=5)
         self.wait(lambda: self.space_log.exists() and self.space_log.read_text())
         self.assertEqual(self.space_log.read_text(), f"close {sid} {self.client}\n")
+
+    def test_snoozed_says_so_and_is_otherwise_the_same_box(self):
+        home, hpane, [tab] = self.space("proj", 1)
+        sid = self.t("display", "-p", "-t", "=proj:", "#{session_id}")
+        p = self.start("close", "--ask-space", self.client, tab)
+        self.wait(self.box)
+        self.wait(self.asks, 1)
+        self.assertIn("last tab closed · close space proj? ", self.screen())
+        self.key("n")
+        p.wait(timeout=5)
+        for n, k in enumerate(("n", "Escape", "y"), 2):
+            with self.subTest(k):
+                self.t("switch-client", "-c", self.client, "-t", "main")
+                p = self.start("ask-space", "--snoozed", self.client, "=proj:")
+                self.wait(self.box)
+                self.wait(self.asks, n)
+                self.assertIn("last tab snoozed · close space proj until it wakes? ", self.screen())
+                self.assertEqual(self.where(), ("proj", home, hpane))
+                self.assertFalse(self.space_log.exists())
+                self.key(k)
+                self.wait(self.box, False)
+                p.wait(timeout=5)
+                self.assertEqual(self.where(), ("proj", home, hpane))
+        self.wait(lambda: self.space_log.exists() and self.space_log.read_text())
+        self.assertEqual(self.space_log.read_text(), f"close {sid} {self.client}\n")
+
+    def test_snoozed_never_asks_where_a_close_would_not(self):
+        self.space("two", 1)
+        self.run_script("ask-space", "--snoozed", self.client, "=two:")      # a tab remains
+        self.space("scratch", 0)                                             # hidden by its name
+        self.run_script("ask-space", "--snoozed", self.client, "=scratch:")
+        self.run_script("ask-space", "--snoozed", self.client, "=gone:")
+        self.run_script("ask-space", "--snoozed", self.client, "=main:")     # main: on its home already
+        self.assert_no_box()
+        self.assertEqual(self.where(), ("main", self.main[0], self.main[1]))
+
+    # -- the real snooze.sh and stash.sh -------------------------------------
+    def real_snooze(self):
+        """The environment for real parks: stash.sh's re-entry, log and state in
+        the temp dir, no model call, snooze.sh for its reschedule."""
+        wrap = Path(self.tmp, "stash-self")
+        wrap.write_text(f'#!/bin/sh\nexec bash "{STASH}" "$@"\n')
+        wrap.chmod(0o755)
+        # A plain python3: a pyenv shim cannot find its root with HOME here.
+        py = Path(self.tmp, "bin", "python3")
+        if not py.exists():
+            py.symlink_to(os.path.realpath(sys.executable))
+        self.env.update(STASH_SH=str(STASH), STASH_SELF=str(wrap), STASH_LOG=os.path.join(self.tmp, "stash.log"),
+                        STASH_NO_DESCRIBE="1", STASH_ALLOW_SOCKET=self.path, SNOOZE_SH=str(SNOOZE))
+
+    def shell_tab(self, session):
+        """A tab a park takes: a plain idle shell."""
+        w = self.t("new-window", "-d", "-t", f"={session}:", "-P", "-F", "#{window_id}", "/bin/zsh -f")
+        self.wait(lambda: self.t("capture-pane", "-p", "-t", w))
+        return w
+
+    def session_of(self, w):
+        return self.t("display", "-p", "-t", w, "#{session_name}")
+
+    def test_snoozing_the_last_tab_parks_it_then_asks(self):
+        self.real_snooze()
+        home, hpane, _ = self.space("proj", 0)
+        sid = self.t("display", "-p", "-t", "=proj:", "#{session_id}")
+        a, b = self.shell_tab("proj"), self.shell_tab("proj")
+        self.t("switch-client", "-c", self.client, "-t", a)
+        # Not the last yet: parked, nothing asked.
+        self.run_script("apply-text", "-c", self.client, "--ask-space", "1h", f"w:{a}", script=SNOOZE)
+        self.assertEqual(self.session_of(a), "stash")
+        self.assert_no_box()
+        p = self.start("apply-text", "-c", self.client, "--ask-space", "1h", f"w:{b}", script=SNOOZE)
+        self.wait(self.box)
+        self.wait(self.asks, 1)
+        self.assertIn("last tab snoozed · close space proj until it wakes? ", self.screen())
+        self.assertEqual((self.session_of(b), self.windows("proj")), ("stash", [home]))
+        self.assertTrue(self.t("show", "-wqv", "-t", b, "@stash_wake").isdigit())
+        self.assertEqual(self.where(), ("proj", home, hpane))
+        # The alarm is on record before the box is answered.
+        self.assertTrue(Path(self.tmp, "state", "tmux-snooze", "snooze-next").exists())
+        self.key("y")
+        p.wait(timeout=5)
+        self.assertEqual(p.returncode, 0)
+        self.wait(lambda: self.space_log.exists() and self.space_log.read_text())
+        self.assertEqual(self.space_log.read_text(), f"close {sid} {self.client}\n")
+
+    def test_a_plain_apply_or_a_refused_snooze_never_asks(self):
+        self.real_snooze()
+        home, _, [tab] = self.space("proj", 1)          # its process is the pane's own: refused
+        w = self.t("display", "-p", "-t", tab, "#{window_id}")
+        self.run_script("apply-text", "-c", self.client, "--ask-space", "1h", f"w:{w}", script=SNOOZE)
+        self.assertEqual(self.session_of(w), "proj")
+        self.assert_no_box()
+        self.run_script("close", tab)
+        b = self.shell_tab("proj")
+        # As agent-ui's review runs it: it asks itself.
+        when = str(int(time.time()) + 3600)
+        self.run_script("apply", "-c", self.client, when, f"w:{b}", script=SNOOZE)
+        self.assertEqual((self.session_of(b), self.windows("proj")), ("stash", [home]))
+        # Re-timing it, stashed already: no box either.
+        self.run_script("apply-text", "-c", self.client, "--ask-space", "2h", f"w:{b}", script=SNOOZE)
+        self.assert_no_box()
+        self.assertEqual(self.where()[0], "main")
 
     def test_yes_rechecks_and_a_tab_opened_meanwhile_keeps_the_space(self):
         notes = Path(self.tmp, "notify.log")

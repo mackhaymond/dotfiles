@@ -176,6 +176,148 @@ class Snooze(Base):
         self.assertEqual(self.opt(w, "@stash_wake"), "")
         self.rescheduled(2)
 
+    def fake_space_sh(self, mode="ok"):
+        """SPACE_SH: `revive` makes the session (or fails / makes a hidden
+        one), and is logged."""
+        self.revives = Path(self.tmp, "revives")
+        self.revives.unlink(missing_ok=True)
+        sh = Path(self.tmp, "space.sh")
+        sh.write_text(
+            "#!/bin/bash\n"
+            f'printf "%s\\n" "$*" >> "{self.revives}"\n'
+            + ("exit 1\n" if mode == "fail" else "")
+            + """sid=$(tmux new-session -d -s "$2" -c "$3" -P -F '#{session_id}') || exit 1\n"""
+            + ('tmux set-option -t "$sid" @space_hidden 1\n' if mode == "hidden" else "")
+            + 'echo "$sid"\n')
+        self.env["SPACE_SH"] = str(sh)
+
+    def parked_then_gone(self, verb=("snooze",), color="#89b4fa"):
+        """A tab of `work` (at its own folder) parked, and `work` closed."""
+        self.t("new-session", "-d", "-s", "work", "-c", str(self.work))
+        if color:
+            self.t("set", "-t", "work", "@space_color", color)
+        self.new_window("work")                                    # never the last tab
+        w = self.new_window("work")
+        self.script(*verb, *([self.when] if verb == ("snooze",) else []), w)
+        self.assertEqual(self.session_of(w), "stash")
+        self.t("kill-session", "-t", "=work")
+        return w
+
+    def test_a_snoozed_window_unparked_by_hand_brings_its_space_back(self):
+        for n, (cmd, color) in enumerate((("unstash-many", "#89b4fa"), ("unstash", ""))):
+            with self.subTest(cmd):
+                self.keep_one()
+                w = self.parked_then_gone(color=color)
+                self.fake_space_sh()
+                self.script(cmd, w)
+                self.assertEqual(self.revives.read_text(), f"revive work {self.work} {color}\n")
+                self.assertEqual(self.session_of(w), "work")
+                self.assertEqual(self.t("display", "-p", "-t", "=work:", "#{window_id}"), w)   # current there
+                for o in ("@stash_wake", "@stash_origin", "@stash_origin_dir", "@stash_origin_color"):
+                    self.assertEqual(self.opt(w, o), "", o)
+                self.rescheduled(2 * (n + 1))
+                self.t("kill-session", "-t", "=work")
+
+    def test_a_snoozed_window_unparked_under_macos_bin_bash(self):
+        import subprocess
+        self.keep_one()
+        w = self.parked_then_gone(color="")                        # an empty last field
+        self.fake_space_sh()
+        r = subprocess.run(["/bin/bash", str(STASH_PATH), "unstash-many", w], env=self.script_env(),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        self.assertEqual(self.revives.read_text(), f"revive work {self.work} \n")
+        self.assertEqual(self.session_of(w), "work")
+
+    def test_only_a_snoozed_window_is_revived_by_hand(self):
+        self.keep_one()
+        for name in ("plain stashed", "unsnoozed"):
+            with self.subTest(name):
+                w = self.parked_then_gone(("stash",) if name == "plain stashed" else ("snooze",))
+                if name == "unsnoozed":
+                    self.script("set-wake", "", w)
+                self.fake_space_sh()
+                self.script("unstash-many", w)
+                self.assertFalse(self.revives.exists())
+                self.assertEqual(self.session_of(w), "main")
+
+    def test_a_hand_revive_that_cannot_work_lands_where_you_are(self):
+        self.keep_one()
+        for name, mode in (("fails", "fail"), ("hidden result", "hidden"), ("no folder", "ok"),
+                           ("hidden origin", "ok"), ("the stash itself", "ok"), ("origin there", "ok")):
+            with self.subTest(name):
+                w = self.parked_then_gone()
+                want = "main"
+                if name == "no folder":
+                    self.t("set", "-wu", "-t", w, "@stash_origin_dir")
+                elif name == "hidden origin":
+                    self.t("set", "-w", "-t", w, "@stash_origin", "agents")    # hidden, and gone
+                elif name == "the stash itself":
+                    self.t("set", "-w", "-t", w, "@stash_origin", "stash")
+                elif name == "origin there":
+                    self.t("new-session", "-d", "-s", "work", "-c", str(self.work))
+                    want = "work"
+                self.fake_space_sh(mode)
+                self.script("unstash-many", w)
+                self.assertEqual(self.session_of(w), want)
+                self.assertEqual(self.opt(w, "@stash_wake"), "")
+                self.assertEqual(self.revives.exists(), name in ("fails", "hidden result"))
+                if name in ("hidden result", "origin there"):
+                    self.t("kill-session", "-t", "=work")
+
+    def test_no_hand_revive_while_a_restore_is_pending(self):
+        self.keep_one()
+        for pending, want in ((str(int(time.time()) - 60), "main"), ("done", "work"),
+                              (str(int(time.time()) - 901), "work")):
+            with self.subTest(pending=pending):
+                w = self.parked_then_gone()
+                self.fake_space_sh()
+                self.t("set", "-g", "@space_restore_pending", pending)
+                self.script("unstash-many", w)
+                self.assertEqual(self.session_of(w), want)
+                self.assertEqual(self.revives.exists(), want == "work")
+                self.assertEqual(self.opt(w, "@stash_wake"), "")
+                if want == "work":
+                    self.t("kill-session", "-t", "=work")
+
+    def test_a_space_being_closed_takes_no_tab(self):
+        # @space_closing: its kill-session would take the tab, on no record.
+        self.keep_one()
+        for verb in ("wake", "unstash-many"):
+            for park in (("snooze",), ("stash",)):
+                with self.subTest(verb=verb, park=park):
+                    w = self.parked_then_gone(park)
+                    self.t("new-session", "-d", "-s", "work", "-c", str(self.work))
+                    self.t("set", "-t", "work", "@space_closing", "1")
+                    self.fake_space_sh()                      # `revive` fails: the name is taken
+                    self.script(verb, w)
+                    self.assertEqual(self.session_of(w), "main")
+                    self.t("kill-session", "-t", "=work")
+
+    def test_the_fallback_skips_a_space_being_closed(self):
+        # "Where you are" is closing too: the next visible session, never it.
+        self.keep_one()
+        self.t("new-session", "-d", "-s", "other")
+        self.fake_space_sh("fail")
+        for verb in ("wake", "unstash-many"):
+            with self.subTest(verb):
+                w = self.parked_then_gone()
+                self.t("set", "-t", "main", "@space_closing", "1")
+                self.script(verb, w)
+                self.assertEqual(self.session_of(w), "other")
+                self.t("set", "-u", "-t", "main", "@space_closing")
+
+    def test_nowhere_open_leaves_it_parked(self):
+        self.keep_one()
+        w = self.parked_then_gone()
+        self.fake_space_sh("fail")
+        self.t("set", "-t", "main", "@space_closing", "1")
+        for verb in ("wake", "unstash-many"):
+            with self.subTest(verb):
+                self.script(verb, w)
+                self.assertEqual(self.session_of(w), "stash")
+                self.assertEqual(self.opt(w, "@stash_wake"), self.when)
+
     def test_kill_many_of_a_snoozed_window_reschedules(self):
         self.keep_one()
         w = self.new_window()

@@ -9,7 +9,9 @@
 #   closed-tabs.sh close --pin [--wake <epoch>] <pane_id>   stash an agent tab: a
 #                                                  pinned entry (snoozed with --wake);
 #                                                  prints the new entry's id
-#   closed-tabs.sh ask-space <client> <session>    only home left? ask to close the space
+#   closed-tabs.sh ask-space [--snoozed] <client> <session>   only home left? ask to
+#                                                  close the space (--snoozed: until
+#                                                  its snoozed tab wakes)
 #   closed-tabs.sh ask-space-yes <client> <sid>    that box's y: still only home? close it
 #   closed-tabs.sh pick-popup [--stashed] <session_id> <tty>   fzf picker (below)
 #   closed-tabs.sh reopen <session_id> <tty> [id…] reopen these (default: newest unpinned)
@@ -49,7 +51,9 @@
 # of its own space's bar, no client moved, and snooze.sh says so. A space
 # closed meanwhile is brought back (`space.sh revive`, from the entry's
 # space_dir / space_color, which every close records); main when the space
-# is hidden, or the entry predates space_dir, or the revive fails.
+# is hidden, or the entry predates space_dir, or the revive fails. A snoozed
+# entry reopened by hand before its alarm brings its closed space back too,
+# and the client goes there; a stashed or backlog one never does.
 # Unpinning, forgetting or reopening a snoozed entry drops its alarm. Every wake_at change runs `snooze.sh reschedule`, detached
 # (SNOOZE_SH names another, for tests).
 #
@@ -81,7 +85,8 @@
 # exited never passes through a key binding, and by the time any tmux hook
 # fires its process tree is gone. The closes made by hand (prefix x / C-l,
 # the agent-ui menu's x, prefix v's range close) also ask whether to close the
-# space when only its home is left (ask_space below); no other close does.
+# space when only its home is left (ask_space below), as does snooze.sh's menu
+# after it parks the last tab; no other close does.
 #
 # Storage, all under ~/.local/state/tmux-closed-tabs/:
 #   history.jsonl        one JSON object per closed tab, oldest first
@@ -181,7 +186,7 @@ reschedule() {
 stash_sh() { [ -f "$STASH_SH" ] || return 1; bash "$STASH_SH" "$@"; }
 
 # revive_space <name> <dir> [<colour>]: `space.sh revive` (docs/spaces.md
-# "Snoozed tabs bring their space back"): prints the session id a woken entry
+# "Snoozed tabs bring their space back"): prints the session id a snoozed entry
 # whose space is gone goes to — that space made again at <dir>, or the one
 # already named <name> or on <dir>; status 1 when there is none. space.sh is
 # SPACE_SH (a path, tests), else the server's @space_sh (a command line,
@@ -928,19 +933,20 @@ do_close() {
     IFS='|' read -r pane_id pane_pid pane_tty sess tsess tcreated widx cwd origin spath scolor shid hlist odir ocolor label <<<"$info"
     [ -n "$pane_id" ] || return 1
     # The space's folder and colour (space_dir / space_color): if the space
-    # is closed (prefix Q forgets them) before a snoozed entry wakes, the wake
-    # brings it back from these (reopen_one, space.sh revive). Not for a
-    # hidden session's tab: that is no space to bring back.
-    local sdir="" scol=""
+    # is closed (prefix Q forgets them) while an entry of it is snoozed, its
+    # wake, or its reopen by hand, brings it back from these (reopen_one,
+    # space.sh revive). Not for a hidden session's tab: that is no space to
+    # bring back. A space being closed is one still (its closer runs this).
+    local sdir="" scol="" inspace=""
     if [ "$shid" != 1 ] && [ "$sess" != stash ] && [[ " $hlist " != *" $sess "* ]]; then
-        sdir=$spath scol=$scolor
+        sdir=$spath scol=$scolor inspace=1
     fi
     # A window closed out of the stash (stash.sh kill-many, ⌃x in the picker)
     # belongs to the space it was parked from, not to the hidden session that
     # held it: recorded there, at the end of its bar, so a reopen lands it
     # back where it came from rather than in a hidden session — with the
     # folder and colour stash.sh recorded for that space when it parked it.
-    if [ -n "$origin" ] && ! session_visible "$tsess" >/dev/null; then
+    if [ -n "$origin" ] && [ -z "$inspace" ]; then
         sess=$origin tsess="" tcreated="" widx=99999
         sdir=$odir scol=$ocolor
         [[ " $hlist " == *" $sess "* ]] && sdir="" scol=""
@@ -1073,12 +1079,19 @@ do_close() {
 # --- the last tab of a space ---------------------------------------------------
 #
 # "Closing the last tab in a space prompts to close the space. If you say no,
-# it goes to the home of that space" (Mack, 2026-11-03). Opt-in: only the
-# closes made by hand ask — prefix x / C-l (`close --ask-space`), the agent-ui
+# it goes to the home of that space" (Mack, 2026-11-03). Opt-in. Of closes,
+# only those made by hand ask — prefix x / C-l (`close --ask-space`), the agent-ui
 # menu's x (the same) and prefix v's range close (stash.sh, one `ask-space`
 # after all its closes). A plain `close` never does, so space.sh close's own
 # closer, the prune / pause / limit code and a tab whose process exits by
 # itself never prompt.
+#
+# "snoozing the last agent/tab in a space should also ask to close that space"
+# (Mack, 2026-11-23): snooze.sh's menu, after it parked a tab, runs `ask-space
+# --snoozed` (snooze.sh apply --ask-space): the same box, titled "last tab
+# snoozed · close space NAME until it wakes?". The space comes back with its
+# snoozed tab, at the alarm or reopened by hand before it (reopen_one, stash.sh
+# unstash). A plain park never asks.
 #
 # The client lands on the space's home FIRST (switch-client, even from another
 # space: the menu can close any space's tab), then the box opens there. A
@@ -1128,10 +1141,16 @@ client_session() {
         | awk -F "$US" -v c="$1" '$1 == c { print $2; f = 1; exit } END { exit !f }'
 }
 
-# ask_space <client> <target>: the target's session after a close (a pane
-# target: a session id, `=name:`, or any window or pane of it; a bare `=name`
-# resolves to nothing). Returns once the box is answered or given up on.
+# ask_space [--snoozed] <client> <target>: the target's session after a close
+# (a pane target: a session id, `=name:`, or any window or pane of it; a bare
+# `=name` resolves to nothing). --snoozed: after a snooze, the box says so.
+# Returns once the box is answered or given up on.
 ask_space() {
+    local title='last tab closed · close space #{session_name}?'
+    if [ "${1:-}" = --snoozed ]; then
+        title='last tab snoozed · close space #{session_name} until it wakes?'
+        shift
+    fi
     local client="${1:-}" row sid name pane on
     [ -n "$client" ] && [ -n "${2:-}" ] || return 0
     row=$(space_home_only "$2") || return 0
@@ -1160,7 +1179,7 @@ ask_space() {
         mkdir "$held" 2>/dev/null || return 0
     fi
     echo "$$" >"$held/pid"
-    ask_box "$client" "$sid" "$name" "$pane"
+    ask_box "$client" "$sid" "$name" "$pane" "$title"
     [ "$(cat "$held/pid" 2>/dev/null)" = "$$" ] && rm -rf "$held"
     return 0
 }
@@ -1177,8 +1196,9 @@ now_ms() {
 }
 
 # The box itself, retried while another overlay holds the client.
+#   ask_box <client> <sid> <name> <home pane> <title>
 ask_box() {
-    local client="$1" sid="$2" name="$3" pane="$4" i=0 mp t0 wait_ms
+    local client="$1" sid="$2" name="$3" pane="$4" title="$5" i=0 mp t0 wait_ms
     while [ "$i" -lt "$ASK_TRIES" ]; do
         # One round trip, as the refused menu's would be.
         now_ms; t0=$REPLY
@@ -1188,7 +1208,7 @@ ask_box() {
         # the home pane: #{session_id} is the space, #{client_name} the
         # client. y re-checks before it closes (ask-space-yes).
         tmux display-menu -c "$client" -t "$pane" -b rounded -s 'bg=#1e1e2e,fg=#cdd6f4' -S 'fg=#f38ba8' \
-            -H 'bg=#45475a,fg=#cdd6f4,bold' -T "#[align=centre] last tab closed · close space #{session_name}? " \
+            -H 'bg=#45475a,fg=#cdd6f4,bold' -T "#[align=centre] $title " \
             -x "$POPUP_X" -y C "Cancel" n "" \
             "Close space" y "run-shell -b \"XDG_STATE_HOME='$STATE_HOME' bash '$SELF' ask-space-yes '#{client_name}' '#{session_id}'\"" \
             </dev/null >/dev/null 2>&1 &
@@ -1435,24 +1455,35 @@ EOF
 # session_visible <target>: (a session id, or `=name:` — a bare `=name` is
 # read as a window) the target session's name when it is one a tab may
 # land in — not hidden (@space_hidden, or named in @space_hidden_sessions:
-# stash, agents, tasks…); status 1 otherwise or when there is none. An empty
-# target is none, never tmux's "current" session.
+# stash, agents, tasks…), and not a space being closed (@space_closing: its
+# kill-session would take the tab with it, on no record); status 1 otherwise
+# or when there is none. An empty target is none, never tmux's "current"
+# session.
 session_visible() {
     [ -n "${1:-}" ] || return 1
-    local info name hid list
-    info=$(tmux display-message -p -t "$1" "#{session_name}${US}#{@space_hidden}${US}#{@space_hidden_sessions}" 2>/dev/null)
-    IFS="$US" read -r name hid list <<<"$info"
+    local info name hid closing list
+    info=$(tmux display-message -p -t "$1" "#{session_name}${US}#{@space_hidden}${US}#{@space_closing}${US}#{@space_hidden_sessions}" 2>/dev/null)
+    IFS="$US" read -r name hid closing list <<<"$info"
     # stash.sh's holding session is never a tab's home, whatever the options.
-    [ -n "$name" ] && [ "$hid" != 1 ] && [ "$name" != stash ] || return 1
+    [ -n "$name" ] && [ "$hid" != 1 ] && [ -z "$closing" ] && [ "$name" != stash ] || return 1
     [[ " $list " == *" $name "* ]] && return 1
     printf '%s\n' "$name"
 }
 
-# Where a tab goes whose own session is gone or hidden: the session it was
-# reopened from, else the session the client is on (by its tty: the sidebar
-# and run-shell -b hand-offs can pass no session, and tmux's "best" session
-# for an empty target can be `stash` or `agents`), else main, else the first
-# visible session. Never a hidden one; status 1 when there is none at all.
+# A restart's restore still running (space.sh's @space_restore_pending: an
+# epoch under 15 min old, not `done`, snooze.sh wake-due's rule).
+restore_pending() {
+    local p; p=$(tmux show -gqv @space_restore_pending 2>/dev/null)
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    [ $(( $(date +%s) - p )) -lt 900 ]
+}
+
+# Where a tab goes whose own session is gone, hidden or being closed: the
+# session it was reopened from, else the session the client is on (by its tty:
+# the sidebar and run-shell -b hand-offs can pass no session, and tmux's "best"
+# session for an empty target can be `stash` or `agents`), else main, else the
+# first visible session. Never a hidden or closing one; status 1 when there is none
+# at all.
 #   fallback_session <client_session> <client_tty>
 fallback_session() {
     local s
@@ -1468,11 +1499,11 @@ fallback_session() {
     return 1
 }
 
-# Prints "<window id><US><session name>". With mode `wake` (a snoozed entry
-# coming back by itself) it goes to the END of its own session's bar — that
-# space brought back first when it was closed meanwhile (revive_space) — or
-# of main (no client is asked), with -d so no client's view moves, and says
-# nothing.
+# Prints "<window id><US><session name>". A snoozed entry's own space is
+# brought back first when it was closed meanwhile (revive_space; by hand, not
+# while a restart's restore is pending). With mode `wake` (one coming back by itself) it goes to the END of its own session's
+# bar, or of main (no client is asked), with -d so no client's view moves, and
+# says nothing.
 #   reopen_one <rec> <client_session> <client_tty> [wake]
 reopen_one() {
     local rec="$1" client_sess="$2" client_tty="${3:-}" mode="${4:-}"
@@ -1496,13 +1527,25 @@ reopen_one() {
         target="=$sess:"
     fi
     [ -n "$target" ] && name=$(session_visible "$target")
-    # A wake whose space is GONE (found neither by id nor by name) and whose
-    # entry knows that space's folder brings the space back (space.sh revive:
-    # at that folder, named and coloured as it was, at the end of the order);
-    # a second entry of the same space then finds it by name. A space that
-    # exists but is hidden, an entry from before space_dir, or a revive that
-    # fails: the old fallback (main).
-    if [ -z "$name" ] && [ -z "$target" ] && [ "$mode" = wake ]; then
+    # A wake, or a snoozed entry reopened by hand, whose space is GONE (found
+    # neither by id nor by name) and whose entry knows that space's folder
+    # brings the space back (space.sh revive: at that folder, named and
+    # coloured as it was, at the end of the order); a second entry of the same
+    # space then finds it by name. A space that exists but is hidden or being
+    # closed, an entry from before space_dir, or a revive that fails: the old
+    # fallback (main, or wherever you are). Stashed and backlog entries never
+    # bring it back; nor does a hand reopen while a restart's restore is
+    # pending (it would race resurrect making that session; snooze.sh defers
+    # the wakes itself).
+    local revive=""
+    if [ -z "$name" ] && [ -z "$target" ]; then
+        if [ "$mode" = wake ]; then revive=1
+        else
+            revive=$(jq -r 'select(.pinned == true and (.wake_at | type) == "number") | 1' <<<"$rec")
+            [ -n "$revive" ] && restore_pending && revive=""
+        fi
+    fi
+    if [ -n "$revive" ]; then
         local sdir scol sid
         sdir=$(jq -r '.space_dir // empty' <<<"$rec"); scol=$(jq -r '.space_color // empty' <<<"$rec")
         if [ -n "$sess" ] && [ -n "$sdir" ] && sid=$(revive_space "$sess" "$sdir" "$scol"); then
@@ -1514,8 +1557,9 @@ reopen_one() {
             name=$(fallback_session "" "") || return 1
         else
             name=$(fallback_session "$client_sess" "$client_tty") || return 1
-            if [ -n "$target" ]; then msg "closed-tabs: its session is hidden — reopened in $name"
-            else msg "closed-tabs: its session is gone — reopened in $name"; fi
+            local why=gone
+            [ -n "$target" ] && why=$(tmux display-message -p -t "$target" '#{?#{@space_closing},closing,hidden}' 2>/dev/null)
+            msg "closed-tabs: its session is ${why:-gone} — reopened in $name"
         fi
     fi
     sess=$name

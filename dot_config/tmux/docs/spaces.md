@@ -127,7 +127,21 @@ the space is still nothing but its home and then runs prefix Q's yes
 ⌘Z reopens them); a tab opened while the box was up keeps the space, with
 the toast "space has tabs again · not closed".
 
-- **Who asks.** Only the closes made by hand, which opt in: prefix x (CMD+W)
+- **Snoozing the last tab asks too.** "snoozing the last agent/tab in a space
+  should also ask to close that space and it'll be rbought back on szooze
+  reopen" (Mack, 2026-11-23). snooze.sh's menu (prefix Z, the agent-ui menu's
+  z), presets and Custom…, runs `apply-text` / `custom` with `--ask-space`
+  (the ⌘Z picker's ⌃z opens the same menu, but its rows are stashed or closed
+  already, so there is never anything to ask): once the park has worked and the toast is out, it runs
+  `closed-tabs.sh ask-space --snoozed <client> =SESSION:` once per session a
+  tab was parked from. Same box, rules, lock and landing on home, titled
+  `last tab snoozed · close space NAME until it wakes?`; the space comes back
+  with the tab ("Snoozed tabs bring their space back", below). "Last tab" is
+  the same test as a close's: nothing left but the home. A refused snooze, an
+  unsnooze, a new time for something already stashed, and a plain park never
+  ask. agent-ui's review (prefix O) runs plain `snooze.sh apply`, which never
+  asks: the review asks itself (docs/review.md).
+- **Which closes ask.** Only those made by hand, which opt in: prefix x (CMD+W)
   and prefix C-l (CMD+SHIFT+W) run `closed-tabs.sh close --ask-space
   <client> <pane>`; the agent-ui menu's x runs the same with the menu's
   client (actions.rs `close_line`), and so does the python fallback roster's
@@ -306,10 +320,10 @@ because `close` unregisters them: stash.sh's park sets `@stash_origin_dir`
 and `@stash_origin_color` beside `@stash_origin` (unset with it), and every
 `closed-tabs.sh close` writes `space_dir` and `space_color` into the history
 entry (not for a hidden session's tab; a window closed out of the stash
-takes its origin's). Only the WAKE uses them (`closed-tabs.sh wake`'s
-reopen_one, `stash.sh wake`'s wake_target): when the origin session is gone
-(by id and by name) they run `space.sh revive NAME DIR [COLOR]`, which
-prints the session id to use: the visible session named NAME if there is one
+takes its origin's). Only a SNOOZED tab uses them (`closed-tabs.sh`'s
+reopen_one, `stash.sh`'s revive_origin), at its wake or brought back by hand
+(below): when the origin session is gone (by id and by name) they run
+`space.sh revive NAME DIR [COLOR]`, which prints the session id to use: the visible session named NAME if there is one
 (so several tabs of one closed space wake into one space, and a NAME now
 taken by another folder's space takes them as before), else the visible
 space on DIR, else a new space at DIR named NAME (or `new_space_name` when
@@ -322,10 +336,22 @@ number, colour and folder, as the load-time reconcile would. Spaces off: a
 plain `new-session -d` at DIR. No client moves and
 nothing is said (snooze.sh's one toast says "in NAME"). A missing folder, an
 entry or window from before this (no recorded folder), or a session that
-exists but is hidden: main, as before. A hand unpark or ⌘Z reopen never
-revives (it lands where you are). The callers run from launchd with no
-`$TMUX`, which space.sh refuses: they set it, for that call, to the
-`socket_path` of the server their own `tmux` reaches. space.sh is
+exists but is hidden or being closed (`@space_closing`: prefix Q's closer
+still at work, and its kill-session would take the tab with it): main, as
+before; no tab is ever put in a closing space. By HAND, before the alarm, a snoozed
+tab brings its space back the same way ("it'll be rbought back on szooze
+reopen", Mack, 2026-11-23): a snoozed entry reopened (the ⌘Z picker, the
+agent lists) and a snoozed window unparked (`stash.sh unstash`) land in the
+space made again, the client goes there, and where it goes on the bar is the
+hand reopen's as ever; a revive that fails, or a restart's restore still
+pending (below), lands where you are. A plain stashed, unsnoozed or backlog
+one never revives (it lands where you are). A batch mixing snoozed and plain
+tabs of a closed space resolves each one in turn: a plain one handled before
+the snoozed one that brings the space back stays where you are, one handled
+after it goes home, and the client may stay where the first one landed. The
+wake's callers run from launchd with no `$TMUX`, which space.sh refuses: they
+set it, for that call, to the `socket_path` of the server their own `tmux`
+reaches. space.sh is
 `$SPACE_SH`, else the server's `@space_sh`. A snooze across a restart keeps
 them: stash.sh's restart sidecar mirrors them as fields 13 and 14 (after
 `@stash_wake`'s 12) and restore-state puts them back. And no wake runs while
@@ -333,7 +359,9 @@ a restart's restore is pending (`@space_restore_pending` an epoch under
 15 min old, not `done`: the rule sync uses, "Registry" above): snooze.sh's
 `wake-due` logs "restore pending — wakes deferred" and leaves the alarms
 due, uncounted, for the first tick after it, so a wake never races
-resurrect rebuilding the very space it would revive.
+resurrect rebuilding the very space it would revive. A hand reopen or unstash
+does not wait: while it is pending it brings no space back (the tab lands
+where you are).
 
 ## Status (flag on: ONE line)
 
