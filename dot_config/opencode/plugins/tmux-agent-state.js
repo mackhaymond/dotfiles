@@ -41,7 +41,7 @@
 // bash), TMUX_AGENT_HEARTBEAT_MS = the heartbeat throttle.
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -163,6 +163,62 @@ function runIndicator(mode, payload) {
   });
 }
 
+// ------------------------------------------------------------ the notch
+// CuaNotch's row for this pane: `cua-notch-agent-hook opencode` (see its
+// OPENCODE header) gets each indicator call as the Claude event it stands
+// for, with the same payload. Fire and forget - detached, never awaited, so
+// it is never on OpenCode's path nor in the chain's time. Nothing when the
+// hook is not installed. CUA_NOTCH_AGENT_HOOK overrides the path ("" = off);
+// a test run (TMUX_AGENT_INDICATOR set) never reaches the real notch.
+const NOTCH_EVENTS = {
+  idle: "SessionStart",
+  running: "UserPromptSubmit",
+  heartbeat: "PostToolUse",
+  "needs-approval": "PermissionRequest",
+  done: "Stop",
+  failed: "StopFailure",
+  interrupt: "StopCancelled",
+  clear: "SessionEnd",
+};
+
+function notchHookPath() {
+  if (process.env.CUA_NOTCH_AGENT_HOOK !== undefined) return process.env.CUA_NOTCH_AGENT_HOOK;
+  if (process.env.TMUX_AGENT_INDICATOR) return "";
+  return join(homedir(), ".local/bin/cua-notch-agent-hook");
+}
+
+// `sync` (the exit's SessionEnd): the payload goes in whole before this
+// returns - an async pipe could be torn down mid-write by the exit (the
+// indicator's own clear right after it blocks), so it runs as that clear
+// does, spawnSync with input and a short timeout.
+function runNotch(event, payload, sync = false) {
+  const hook = notchHookPath();
+  if (!hook || !payload.session_id || !existsSync(hook)) return;
+  const input = JSON.stringify({ ...payload, hook_event_name: event });
+  if (sync) {
+    try {
+      spawnSync(hook, [AGENT], {
+        env: indicatorEnv(),
+        input,
+        stdio: ["pipe", "ignore", "ignore"],
+        timeout: 3_000,
+      });
+    } catch {}
+    return;
+  }
+  try {
+    const child = spawn(hook, [AGENT], {
+      env: indicatorEnv(),
+      stdio: ["pipe", "ignore", "ignore"],
+      detached: true,
+    });
+    child.on("error", () => {});
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(input);
+    child.unref();
+  } catch {}
+}
+
 function textOf(parts) {
   return (Array.isArray(parts) ? parts : [])
     .filter((p) => p?.type === "text" && !p.synthetic && !p.ignored && typeof p.text === "string")
@@ -258,7 +314,21 @@ export const TmuxAgentState = async ({ client, directory }) => {
   // running (awaiting a fetch, say) must not paint over that clear.
   function send(mode, fields) {
     if (stopped) return Promise.resolve();
+    notch(mode, fields);
     return runIndicator(mode, { cwd, ...fields });
+  }
+
+  // The notch's row is the root conversation this pane last spoke for; a
+  // heartbeat (no session of its own) is that one's.
+  let notchSession = "";
+  function notch(mode, fields) {
+    const event = NOTCH_EVENTS[mode];
+    if (!event) return;
+    const sid = fields.session_id || (mode === "heartbeat" || mode === "clear" ? notchSession : "");
+    if (!sid) return;
+    if (mode !== "clear") notchSession = sid;
+    runNotch(event, { cwd, ...fields, session_id: sid, ...(mode === "idle" ? { source: "startup" } : {}) },
+      mode === "clear");
   }
 
   function heartbeat(force) {
@@ -334,6 +404,8 @@ export const TmuxAgentState = async ({ client, directory }) => {
     stopped = true;
     removeStatus();
     await Promise.race([pending, new Promise((r) => setTimeout(r, EXIT_WAIT_MS))]);
+    // The notch's row goes with the TUI (synchronous: written before exit).
+    notch("clear", {});
     try {
       spawnSync("bash", [indicatorPath(), "clear", AGENT], {
         env: indicatorEnv(),
