@@ -13,7 +13,7 @@
 //!   session, not a space's home), its state idle, done, failed or
 //!   needs-input (never running, paused or unknown; no workflow / cua work
 //!   out), idle for at least [`MIN_IDLE`] by its `@agent_since` epoch, not
-//!   pinned (`@agent_pinned`), not an abby-delegate child (its parent's card
+//!   pinned (`@agent_pinned`), not a delegated child (an external subagent; its parent's card
 //!   owns it), and not KEPT: `@review_kept` holds the `@agent_since` epoch
 //!   it was kept at, so it comes back only once the agent has changed state
 //!   since. Order ([`candidates`]): space by space in THE space order
@@ -237,6 +237,7 @@ pub fn cand_of(w: &Window) -> Cand {
         since: w.since_t.unwrap_or(0),
         reply,
         preview: None,
+        kids: w.kids.map_or(0, |k| k.total),
     }
 }
 

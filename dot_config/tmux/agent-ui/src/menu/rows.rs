@@ -345,7 +345,8 @@ pub fn matches(a: &Agent, q: &str) -> bool {
         return true;
     }
     let q = q.to_lowercase();
-    [a.title.as_str(), a.session.as_str(), a.detail.as_str(), a.path.as_str(), &a.place()]
+    // (A child's task too: its row's title.)
+    [a.title.as_str(), a.task.as_str(), a.session.as_str(), a.detail.as_str(), a.path.as_str(), &a.place()]
         .iter()
         .any(|s| s.to_lowercase().contains(&q))
 }
@@ -374,17 +375,65 @@ pub fn build_rows(d: &Data, tab: Tab, query: &str) -> Vec<Row> {
             }
     };
     if matches!(tab, Tab::All | Tab::Active | Tab::Working | Tab::Idle) {
+        // A CHILD (THE verdict's, [`Agent::child_of`]: it holds no letter)
+        // is listed right under its ROOT, its whole family in family order
+        // ([`crate::view::family_order`]: each child after its own parent),
+        // wherever the root is listed in this filter (under the root's first
+        // copy); a child whose root this filter leaves out is listed in its
+        // own space like any agent.
+        let roots: HashSet<&str> =
+            listed(v).filter(|a| a.child_of.is_none() && keep(a)).map(|a| a.window_id.as_str()).collect();
+        let under = |a: &Agent| a.child_of.as_deref().is_some_and(|r| roots.contains(r));
+        // Each row's DRAWN depth (its `↳` indent, menu/render.rs): 1 + how
+        // many of its ancestors below the root this filter shows, so a
+        // grandchild whose parent is filtered out sits right under the root.
+        let family = |root: &str| -> Vec<Agent> {
+            let mut seen = HashSet::new();
+            let kids: Vec<&Agent> = listed(v)
+                .filter(|k| k.child_of.as_deref() == Some(root) && keep(k) && seen.insert(k.window_id.as_str()))
+                .collect();
+            let shown: HashSet<&str> = kids.iter().map(|k| k.window_id.as_str()).collect();
+            let parent_of = |id: &str| listed(v).find(|x| x.window_id == id).and_then(|x| x.parent.clone());
+            crate::view::family_order(root, kids.iter().copied())
+                .into_iter()
+                .map(|k| {
+                    let mut d = 1u8;
+                    let mut at = k.parent.clone();
+                    for _ in 0..8 {
+                        match at {
+                            Some(p) if p != root => {
+                                if shown.contains(p.as_str()) {
+                                    d += 1;
+                                }
+                                at = parent_of(&p);
+                            }
+                            _ => break,
+                        }
+                    }
+                    Agent { depth: d, ..k.clone() }
+                })
+                .collect()
+        };
+        let mut nested: HashSet<&str> = HashSet::new();
         // THE space order (⌘N, then by name: the sidebar's and the
         // letters'), never the attach recency, so switching sessions moves
         // nothing.
         for s in v.ordered_spaces() {
-            let shown: Vec<&Agent> = s.agents.iter().filter(|a| keep(a)).collect();
+            let shown: Vec<&Agent> = s.agents.iter().filter(|a| keep(a) && !under(a)).collect();
             if shown.is_empty() {
                 continue;
             }
             // (A pending space is named by its number: `3 · creating…`.)
             rows.push(Row::Group { name: s.label(), branch: s.branch.clone(), counts: s.counts, current: s.is_current });
-            rows.extend(shown.into_iter().cloned().map(Row::Agent));
+            for a in shown {
+                // (A child listed in its own place, its root filtered out:
+                // depth 0, no `↳`.)
+                let depth = if a.child_of.is_some() { 0 } else { a.depth };
+                rows.push(Row::Agent(Agent { depth, ..a.clone() }));
+                if roots.contains(a.window_id.as_str()) && nested.insert(a.window_id.as_str()) {
+                    rows.extend(family(&a.window_id).into_iter().map(Row::Agent));
+                }
+            }
         }
     }
     if tab == Tab::Needs {
@@ -506,6 +555,61 @@ pub(crate) mod tests {
                 Row::Empty(s) => format!("({s})"),
             })
             .collect()
+    }
+
+    /// A CHILD (an external subagent) is listed right under its ROOT, its
+    /// whole family in family order (a grandchild right after its parent),
+    /// never in its own space's place; it holds no letter (arrows and Enter
+    /// reach it), and its row is titled by its task. A filter that leaves
+    /// the root out lists the child where it is.
+    #[test]
+    fn kids_nest_under_their_root() {
+        let rows = [
+            row("main", 1, "@1", &[("state", "running"), ("summary", "Root"), ("kids", "3 2")]),
+            row("main", 2, "@2", &[("state", "idle"), ("summary", "Plain")]),
+            row("main", 3, "@3", &[("state", "running"), ("summary", "Kid A"), ("child", "@1"), ("spawn_task", "Task A")]),
+            row("work", 1, "@4", &[("state", "needs-input"), ("summary", "Kid B"), ("child", "@1")]),
+            row("main", 4, "@5", &[("state", "running"), ("summary", "Grand"), ("child", "@3")]),
+            row("work", 2, "@6", &[("state", "idle"), ("summary", "Other")]),
+            "\x1fclient\x1f/dev/ttys999\x1f@2\x1fmain\x1fon\x1f\x1f".into(),
+        ];
+        let d = data_of(&Snapshot::parse(&rows.join("\n")));
+        assert_eq!(shape(&build_rows(&d, Tab::All, "")),
+            ["-- main", "main:@1", "main:@3", "main:@5", "work:@4", "main:@2", "-- work", "work:@6"]);
+        assert_eq!(shape(&build_rows(&d, Tab::Working, "")), ["-- main", "main:@1", "main:@3", "main:@5"]);
+        for kid in ["@3", "@4", "@5"] {
+            assert_eq!(d.letter(kid), None, "{kid}");
+        }
+        assert!(d.letter("@1").is_some() && d.letter("@2").is_some());
+        let depth = |id: &str| d.view.agents().find(|a| a.window_id == id).map(|a| a.depth);
+        assert_eq!((depth("@3"), depth("@4"), depth("@5")), (Some(1), Some(1), Some(2)));
+        let a = d.view.agents().find(|a| a.window_id == "@3").unwrap();
+        assert_eq!(crate::menu::render::title_and_tag(a).0, "Task A");
+        // The Needs filter: the asking child as its root's stand-in.
+        assert_eq!(shape(&build_rows(&d, Tab::Needs, "")), ["need @1"]);
+        // A filter without the root (Idle: the root works): none nested.
+        assert_eq!(shape(&build_rows(&d, Tab::Idle, "")), ["-- main", "main:@2", "-- work", "work:@6"]);
+        // The search finds a child by its task.
+        assert_eq!(shape(&build_rows(&d, Tab::All, "task a")), ["-- main", "main:@3"]);
+        // Drawn depths: the grandchild 2 under its parent; with its parent
+        // filtered out (Working, the parent asking), 1, right under the root;
+        // a child listed in its own place (its root filtered out), 0.
+        let depths = |rows: &[Row]| -> Vec<(String, u8)> {
+            rows.iter().filter_map(|r| match r {
+                Row::Agent(a) => Some((a.window_id.clone(), a.depth)),
+                _ => None,
+            }).collect()
+        };
+        let all = depths(&build_rows(&d, Tab::All, ""));
+        assert!(all.contains(&("@3".into(), 1)) && all.contains(&("@5".into(), 2)) && all.contains(&("@1".into(), 0)), "{all:?}");
+        let mut snap = Snapshot::parse(&rows.join("\n"));
+        for w in snap.windows.iter_mut().filter(|w| w.id == "@3") {
+            w.state = "needs-input".into();
+        }
+        let d2 = data_of(&snap);
+        assert_eq!(depths(&build_rows(&d2, Tab::Working, "")), [("@1".into(), 0), ("@5".into(), 1)]);
+        assert_eq!(depths(&build_rows(&d2, Tab::Active, "")).iter().find(|(w, _)| w == "@5").map(|x| x.1), Some(2));
+        assert_eq!(depths(&build_rows(&d, Tab::All, "grand")), [("@5".into(), 0)]);
     }
 
     /// All: spaces by name (Alpha, main, work: the core's order, not the

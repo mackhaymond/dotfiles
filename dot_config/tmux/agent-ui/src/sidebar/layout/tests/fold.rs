@@ -469,7 +469,7 @@ fn the_one_line_shape_counts_what_folds() {
     for scope in ["all", "active"] {
         let v = fleet(scope);
         let cx = Cx { w: 34, b: Badge::of(&v, &Bar::default()), now: v.now, spin: 0, home: home_of(&v), cur: v.cur_win.as_deref(),
-            shells: v.shells, resumes: false, stale_after: crate::view::STALE_AFTER_DEFAULT, fold_after: crate::view::FOLD_AFTER_DEFAULT };
+            shells: v.shells, resumes: false, stale_after: crate::view::STALE_AFTER_DEFAULT, fold_after: crate::view::FOLD_AFTER_DEFAULT, open: &[], kids: KidForm::Fold };
         let n = agents_one_line(&v, cx);
         let (rows, step) = agents_section(&v, cx, n, false, false);
         assert!(step <= 2 && rows.len() == n, "{scope}: {n} vs {} at step {step}: {:#?}", rows.len(), rows.iter().map(Row::text).collect::<Vec<_>>());

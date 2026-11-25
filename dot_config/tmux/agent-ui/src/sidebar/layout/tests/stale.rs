@@ -211,7 +211,7 @@ fn the_hint_on_the_card_at_every_width() {
     // A one-line card (no second line): no hint, at any width.
     let a1 = close.agents().find(|a| a.window_id == "@1").unwrap();
     for w in 8usize..=60 {
-        let cx = Cx { w, b: Badge::of(&close, &Bar::default()), now: close.now, spin: 0, home: None, cur: None, shells: true, resumes: false, stale_after: STALE_AFTER_DEFAULT, fold_after: crate::view::FOLD_AFTER_DEFAULT };
+        let cx = Cx { w, b: Badge::of(&close, &Bar::default()), now: close.now, spin: 0, home: None, cur: None, shells: true, resumes: false, stale_after: STALE_AFTER_DEFAULT, fold_after: crate::view::FOLD_AFTER_DEFAULT, open: &[], kids: KidForm::Fold };
         let rows = agent_rows(a1, cx, false, 0, Ink::Pal("peach"), None);
         assert!(rows.len() == 1 && !rows[0].text().contains("close?"), "{w}: {:?}", rows[0].text());
         assert_eq!(dwidth(&rows[0].text()), w);

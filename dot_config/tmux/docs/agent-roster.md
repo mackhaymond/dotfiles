@@ -2002,32 +2002,45 @@ counts as just prompted and never folds or dims anything.
   line, a click on it goes on to all) → all spaces. `tmux set -g
   @space_fold_hours 8` to change N.
 
-### abby-delegate children (`view.rs` `kids_split` / `kid_needs`, `layout.rs` "Kids")
+### External subagents (`view.rs` `kids_split` / `kid_needs`, `layout.rs` "Kids")
 
-The Claude agents abby spawns beside its own window are its subagents in
-the sidebar, not agents of their own (2026-11-17). The sidebar trusts only
-the shell reconciler's DERIVED options (never `@agent_parent`):
-`@agent_child` (on a child: its parent's window id, set only while that
-parent is a live agent in a visible space), `@agent_kids` (`"<total>
-<busy>"` on the parent: busy is running, asking, paused or not started)
-and `@agent_kids_ask` (the most urgent asking child; the sidebar does not
-need it).
+A parent agent's CHILD tabs (external subagents of any harness: claude,
+abby, codex, opencode, grok, copilot, agy, spawned by `agent-spawn` or
+abby-delegate; docs/agent-tab-indicator.md §8) are its subagents in the
+sidebar and the menu, not agents of their own (Mack's direction,
+2026-11-23: like native subagents, folded by default). The sidebar trusts
+only the shell reconciler's DERIVED options (never `@agent_parent`):
+`@agent_child` (on a child: its IMMEDIATE parent's window id, set only while
+that parent is a live agent in a visible space), `@agent_kids` (`"<total>
+<busy>"` on the root: busy is running, asking, paused or not started) and
+`@agent_kids_ask` (the most urgent asking child; the sidebar does not need
+it). Drawing only: `@agent_spawn_task` (a child's one-line task, its row's
+title), `@agent_spawn_result` (`ready` / `read`: its ✓ green or dim) and
+`@agent_kid_orphan` (an ex-child's tag). The snapshot reads all of them in
+its one call (agent-ui `tmux.rs` FIELDS, 56).
 
 ```text
- NEEDS YOU                             3
- ▌  a  Abby orchestrator ◉ perm · ⚙ 2 4m    an asking child: its parent's
- ▌ [A] ↳ f: perm Ba…  y  allow   n  deny    title, the child's state; ⌥W f,
- ▌  a  Abby orchestrator ✕ fail · ⚙ 2 6m    a click, y/n go to the child.
- ▌ [A] ↳ s: fail tests broke         6m    One card per asking child.
- ▌  h  Plain asker                ◉ asks
- ▌ [C] Ship it?                       6m
+ NEEDS YOU                             2
+ ▌  a  Abby orchestrator ◉ perm · ⚙ 3 4m    an asking child: its root's
+ ▌ [A] ↳ perm Bash ca…  y  allow   n  deny   title, the child's state; a
+ ▌  h  Plain asker                ◉ asks    click, y/n go to the CHILD.
+ ▌ [C] Ship it?                       6m    One card per asking child.
  AGENTS                        all spaces
- ▎  a  Abby orchestrator ⚙ 2   ⠋ working    busy children: working, ⚙ N
- ▎ [A] › Running cargo test           1m
- ▎  s  ↳ Parser kid                         one dim row per child: its letter,
- ▎  d  ↳ Docs kid                           ↳, its title; no dot, word or blurb
- ▎  f  ↳ Tests kid
+ ▎  a  Abby orchestrator ↳ 4 · 3 working ⠋  FOLDED (the default): one chip;
+ ▎ [A] › Bash cargo test                1m  line 2 the busiest child's doing
+
+ ▎  a  Abby orchestrator ↳ 4 · 3 working ⠋  OPEN (a click on the chip):
+ ▎ [A] › Bash cargo test                1m  a live row per child, family
+ ▎     ↳ C Parser rewrite              ⠋ 2m  order, a grandchild 2 cells in;
+ ▎       ↳ C Fixture gen               ⠋ 5m  its cap blinks while it works,
+ ▎     ↳ X Docs pass                   ✓ 3m  solid while it asks; ✓ green
+ ▎     ↳ C Tests for parser          ◉ perm  until the parent reads it
+
+ ▎  ↳  C ⠋  C ⠋  X ✓  C ◉ perm               short of rows: ONE strip row
 ```
+
+(`[A]`, `C` and `X` stand for the AgentMarks logos: abby's 3-cell mark, the
+1-cell claude and codex glyphs.)
 
 - **Who is a child** is decided ONCE per view (`view::kid_roots`): its
   `@agent_child` names a window, it is itself an agent in a shown session,
@@ -2035,25 +2048,49 @@ need it).
   a shown agent: not a home, not parked or hidden, in ANY space. Otherwise
   it is a plain agent: own card, counts and NEEDS YOU entry. Counts, NEEDS
   YOU, pins and the menu read that one verdict, so none of them flips with
-  ⌥V (they match `agent-jump.sh list` and ⌥S). The scope changes only the
-  drawing: in space scope a child in this space whose root lives in
-  another space is drawn as its own card here (it still counts nowhere).
-- **A child** has no card, PINNED entry or ⌥W pin digit (pinning one is
-  refused) and counts in no header: one dim row under its root's full
-  card, on the card's colour and rail. Its letter stays (assigned with
-  every agent, before the fold), so ⌥W + letter and a click on the row
-  reach it. A one-line, folded or collapsed parent (the ladder, the idle
-  fold, a dormant space) folds its children with it.
-- **The parent** reads as working while any child is busy (`⚙ N`, the
-  workflow's gear; a done turn is then no NEEDS YOU entry, like a fleet out).
+  ⌥V (they match `agent-jump.sh list` and ⌥S).
+- **A child** has no card, PINNED entry, ⌥W pin digit (pinning one is
+  refused) or pool letter (`menu/letters.rs` skips it from birth: the raw
+  `@agent_parent` / `@agent_spawn_id`), and counts in no header. Ways in: a
+  click on its row under an open family, the menu (below), and its root's
+  NEEDS YOU card while it asks.
+- **Folded by default**: the root's card carries one chip after its title,
+  ` ↳ 3 · 2 working` (shorter as room runs out: ` ↳ 2/3`, ` ↳ 3`; the state
+  word goes to its glyph first), and no child rows; its first row stands
+  for the whole family. The workflow's gear is not drawn while a child is
+  busy (the watcher lights it for busy children too; a workflow with no
+  child busy keeps it).
+- **Open**: a click on the chip opens the family in THIS sidebar (view
+  state, never a tmux option; a second click folds it; `agent-ui sidebar
+  --once WxH --kids-open @1` previews it): a live row per child (Design A)
+  under the full card, each a click to the child's pane. Short of rows the
+  family goes to one STRIP row (Design B: a pill a child, its mark and
+  state, `+N` for the rest; a pill goes to its child, the `↳` folds), before
+  the cards go to one line, and keeps it under a one-line card; from the
+  spaces' collapse on it folds like a closed one.
+- **The root** reads as working while any child is busy (a done turn is
+  then no NEEDS YOU entry, like a fleet out). Held for them (no run of its
+  own), its second line says what its busiest child does now, else
+  `waiting on N subagents`.
 - **Every asking child** (its own current state needs-input or failed)
   is one NEEDS YOU card: its root's title, the child's state, stamp and
-  words after its letter (`↳ f: perm Bash`), sorted as the child (as
-  `agent-jump.sh list` and ⌥S do); the card, its answer chips, a
-  right-click and the menu's Needs row act on the child. A parent asking
-  itself has its own card besides. `agent-ui needs` mirrors `agent-jump.sh
-  list` (`model::needs_order`; `tests/parity.rs` checks it).
-- The menu (prefix q / ⌥W) still lists children as agents.
+  words after `↳` (`↳ perm Bash`), sorted as the child (as `agent-jump.sh
+  list` and ⌥S do); the card, its answer chips, a right-click and the
+  menu's Needs row act on the child's pane. Never a card of the child's
+  own. A parent asking itself has its own card besides. `agent-ui needs`
+  mirrors `agent-jump.sh list` (`model::needs_order`; `tests/parity.rs`
+  checks it).
+- **Kin tags**: in space scope a child in this space whose root lives in
+  another space is drawn as its own card here (it still counts nowhere),
+  its second line tagged `↳ a · work` (the root's letter and space); an
+  ex-child whose parent's agent is gone (`@agent_kid_orphan`) is a plain
+  agent tagged `↳ (parent gone)`.
+- **The menu** (prefix q / ⌥W): a child is listed right under its root
+  (its family in family order, `↳` and indented 2 cells a level past the
+  first, titled by its task); it has no letter, so the arrows and Enter
+  reach it. A filter that leaves the root out lists it in its own space.
+- **The review popup** (prefix O) never offers a child; a parent's card
+  says `↳ N kids`.
 
 ### Answering a permission prompt (`src/answer.rs`)
 

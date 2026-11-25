@@ -232,7 +232,7 @@ pub fn paused_state<'a>(state: &'a str, paused_flag: &str) -> &'a str {
     }
 }
 
-/// `@agent_kids` (`"<total> <busy>"`), parsed: an abby-delegate PARENT's
+/// `@agent_kids` (`"<total> <busy>"`), parsed: a delegating PARENT's
 /// live children, as the shell reconciler counts them. Its children are
 /// folded under its card like native subagents ([`crate::view::ViewModel::kids_split`]);
 /// while any is BUSY, the parent reads as working ([`in_flight`]).

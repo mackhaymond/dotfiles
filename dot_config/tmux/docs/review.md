@@ -21,7 +21,7 @@ An agent window (`@agent_state` set) is up for review when all of these hold:
 | no `@agent_workflow` / `@agent_cua` | background work is still out |
 | idle through at least **8 hours of use** by its `@agent_since` epoch | time Mack was at tmux, not wall-clock: a shut laptop ages nobody. `review.sh` passes it as `--min-idle` (below) |
 | not pinned (`@agent_pinned`) | a pin says "keep this one" |
-| not an abby-delegate child (`@agent_child`) | its parent's card owns it |
+| not a delegated child, an external subagent of any harness (`@agent_child`) | its parent's card owns it |
 | not **kept** (below) | |
 
 Order: space by space in ⌘N order (THE space order, `view::space_order`:
@@ -34,7 +34,8 @@ One agent per screen, in the sidebar's look (its canvas, one-colour tiles,
 square corners). The card is its letter (`@agent_key`, shown as stored, so a
 two-character overflow key such as `;a` shows whole) and title
 (`@agent_summary`), then its harness logo, its space (⌘N and name in its
-colour), its state and since when. Under it: its last reply
+colour), a parent's `↳ N kids` (`@agent_kids`' total, teal, where it fits:
+the children it would leave behind), its state and since when. Under it: its last reply
 (`@agent_detail` of a done / ask / fail turn) and the last lines of its
 pane on a terminal strip. Those are tidied: Claude's composer and status
 line, rules and runs of blanks go (a typed draft stays), prose wraps, what

@@ -774,7 +774,7 @@ pub const KEYS: usize = 9;
 
 /// The pinned agents' windows in PIN order, as the sidebar's PINNED section
 /// lists them ([`crate::view::ViewModel::pinned_agents`]): `@agent_pinned`
-/// set, an agent (a state), never a home, never an abby-delegate child
+/// set, an agent (a state), never a home, never a delegated child (an external subagent)
 /// ([`crate::view::kid_roots`] over EVERY space: the digits are global, so
 /// every client must agree on them), in a shown session (not the
 /// stash, not agents / tasks / scratch / btop-popup); first pinned first

@@ -24,7 +24,10 @@
 //! shows inline; a pinned agent (the sidebar's PINNED section, Space p) wears
 //! a dim pin glyph after its title, its row where it always is. The preview
 //! is OFF by default; Space v turns on a strip of up to 10 lines under the
-//! list, full width. The footer shows, first match
+//! list, full width. A CHILD (an external subagent) holds no letter: it is
+//! listed right under its root, `↳` and indented 2 cells a level past the
+//! first, its task as its title, and reached with the arrows and Enter
+//! ([`super::rows::build_rows`]). The footer shows, first match
 //! wins: a y/n, the search line, the actions strip, a message, else the key
 //! bar.
 
@@ -132,6 +135,10 @@ pub fn shown_title(t: &str) -> &str {
 /// A row's title and its project tag: `proj/Title` → ("Title", "proj"); a
 /// bare `~/` (an agent started in $HOME) is no project.
 pub fn title_and_tag(a: &Agent) -> (String, String) {
+    // (A child's task, when it has one: what it was asked to do.)
+    if a.child_of.is_some() && !a.task.is_empty() {
+        return (sanitize(&a.task), String::new());
+    }
     let p = a.project.trim_end_matches('/');
     if p.is_empty() || p == "~" {
         (sanitize(shown_title(&a.title)), String::new())
@@ -410,6 +417,11 @@ fn agent_row(m: &Menu, buf: &mut Buffer, x0: u16, y: u16, cw: u16, a: &Agent, pl
         put(buf, x, y, end, &c.cap(), bold(on("crust", badge_color(a))));
     }
     x += BADGE_W + 1;
+    // A child, nested under its root (no letter: arrows and Enter reach it).
+    if a.child_of.is_some() && place.is_none() && a.depth > 0 {
+        x += 2 * u16::from(a.depth.max(1) - 1).min(2);
+        x = put(buf, x, y, end, crate::sidebar::layout::KID_MARK, ov);
+    }
     x = put(buf, x, y, end, a.glyph, fg(a.color.unwrap_or("overlay")));
     x = put(buf, x, y, end, " ", ov);
 

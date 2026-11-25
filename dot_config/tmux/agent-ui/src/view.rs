@@ -310,18 +310,52 @@ pub struct Agent {
     /// (epoch seconds; None: a restore, an older window, a peer-only agent).
     /// The folding reads [`Agent::prompted_at`].
     pub thread_at: Option<i64>,
-    /// An abby-delegate CHILD by THE verdict ([`kid_roots`]): the ROOT it
-    /// folds under (its parent, or a grandchild's grandparent). No card,
-    /// NEEDS YOU entry or pin of its own: a dim row under the root's card
+    /// A delegated CHILD (an external subagent: agent-spawn, abby-delegate)
+    /// by THE verdict ([`kid_roots`]): the ROOT it folds under (its parent,
+    /// or a grandchild's grandparent). No card, NEEDS YOU entry, pin or
+    /// letter of its own: it folds into its root's card
     /// ([`ViewModel::kids_split`]).
     pub child_of: Option<String>,
     /// A PARENT's children as counted (`@agent_kids`): its card's `⚙ N`
     /// while any is busy.
     pub kids: Option<model::Kids>,
     /// The children nested under this card (set by
-    /// [`ViewModel::kids_split`], in window order; empty otherwise).
+    /// [`ViewModel::kids_split`], in window order; empty otherwise). Every
+    /// descendant, grandchildren included; [`Agent::family`] orders them.
     pub nested: Vec<Agent>,
+    /// `@agent_child` as read: the IMMEDIATE parent's window id (a
+    /// grandchild's names its parent, where [`Agent::child_of`] names the
+    /// root). None for any window that is no child.
+    pub parent: Option<String>,
+    /// How far under its root a child of THE verdict sits ([`kid_depth`]: 1
+    /// the root's own child, 2 a grandchild); 0 for any other window. Set by
+    /// [`ViewModel::build`].
+    pub depth: u8,
+    /// `@agent_spawn_task`, scrubbed: an agent-spawn child's one-line task,
+    /// the title its kid row shows ([`Agent::kid_title`]). "" = none.
+    pub task: String,
+    /// `@agent_spawn_result`: `ready` (a finish its parent has not
+    /// collected), `read`, or "".
+    pub result: String,
+    /// `@agent_kid_orphan`, scrubbed: set on an EX-child whose parent's
+    /// agent is gone (the old parent's letter, else its window id); its
+    /// card says [`ORPHAN_TAG`].
+    pub orphan: String,
+    /// A child drawn as its OWN card away from its root (space scope, the
+    /// root in another space: [`ViewModel::kids_split`]): its `↳ a · work`
+    /// tag (the root's letter and space). None otherwise.
+    pub away: Option<String>,
 }
+
+/// What an ex-child's card says once its parent's agent is gone
+/// (`@agent_kid_orphan`, [`Agent::kin_tag`]).
+pub const ORPHAN_TAG: &str = "↳ (parent gone)";
+
+/// [`ORPHAN_TAG`]'s short form, where a narrow card has no room for it.
+pub const ORPHAN_SHORT: &str = "↳ gone";
+
+/// The arrow a kin tag starts with ([`Agent::away`], [`ORPHAN_TAG`]).
+pub const KIN_MARK: &str = "↳ ";
 
 /// What a limit with no reset time says when the indicator gave no words
 /// (`@agent_detail` empty): neutral, never a guessed model name.
@@ -471,7 +505,46 @@ impl Agent {
             child_of: Some(w.child.clone()).filter(|c| !c.is_empty()),
             kids: w.kids,
             nested: Vec::new(),
+            parent: Some(w.child.clone()).filter(|c| !c.is_empty()),
+            depth: 0,
+            task: text::sanitize(w.spawn_task.trim()),
+            result: w.spawn_result.clone(),
+            orphan: text::sanitize(&w.kid_orphan),
+            away: None,
         }
+    }
+
+    /// The title a kid row shows: its task (`@agent_spawn_task`), else its
+    /// title without its `project/`.
+    pub fn kid_title(&self) -> &str {
+        if !self.task.is_empty() {
+            &self.task
+        } else if !self.short_title.is_empty() {
+            &self.short_title
+        } else {
+            &self.title
+        }
+    }
+
+    /// The kin tag its own card wears: [`Agent::away`] (a child drawn away
+    /// from its root), else [`ORPHAN_TAG`] for an ex-child.
+    pub fn kin_tag(&self) -> Option<String> {
+        self.away.clone().or_else(|| (!self.orphan.is_empty() && self.child_of.is_none()).then(|| ORPHAN_TAG.to_string()))
+    }
+
+    /// Its kin tag's short form, for a narrow card: `↳ a·work` (away),
+    /// [`ORPHAN_SHORT`] (an ex-child).
+    pub fn kin_short(&self) -> Option<String> {
+        match &self.away {
+            Some(t) => Some(t.replace(" · ", "·")),
+            None => (!self.orphan.is_empty() && self.child_of.is_none()).then(|| ORPHAN_SHORT.to_string()),
+        }
+    }
+
+    /// The children nested under this card ([`Agent::nested`]) in FAMILY
+    /// order ([`family_order`]): each right after its own parent.
+    pub fn family(&self) -> Vec<&Agent> {
+        family_order(&self.window_id, &self.nested)
     }
 
     /// How many of its children run (0: none, or not a parent).
@@ -1057,7 +1130,7 @@ pub struct ViewModel {
     /// out of their spaces (in pin order); empty in a view built as is.
     pub pinned: Vec<Agent>,
     /// THE kids' verdict this view was built on ([`kid_roots`]): each
-    /// abby-delegate child's window id → the root it folds under.
+    /// delegated child's (an external subagent's) window id → the root it folds under.
     pub kids: HashMap<String, String>,
 }
 
@@ -1166,7 +1239,7 @@ fn card_row<'a>(windows: &'a [Window], id: &str, scope: Option<&str>) -> Option<
     })
 }
 
-/// THE KIDS' VERDICT, decided once per view: each abby-delegate CHILD → the
+/// THE KIDS' VERDICT, decided once per view: each delegated CHILD (an external subagent of any harness) → the
 /// ROOT it folds under. A window is a child when its `@agent_child` names a
 /// window of the snapshot and it is itself an agent in a shown session
 /// (never a home, never parked), and its parent is either a child itself
@@ -1207,6 +1280,53 @@ pub fn kid_roots(windows: &[Window], scope: Option<&str>) -> HashMap<String, Str
         root(p, up, agent, card).or_else(|| card(p).then(|| p.to_string()))
     }
     first.keys().filter(|id| !loops(id)).filter_map(|&id| root(id, &up, &agent, &card).map(|r| (id.to_string(), r))).collect()
+}
+
+/// How many `@agent_child` hops window `id` is from the root THE verdict
+/// (`kids`, [`kid_roots`]) gives it: 1 for the root's own child, 2 for a
+/// grandchild; 0 for a window that is no child. Capped (a chain that never
+/// reaches the root stops counting).
+pub fn kid_depth(windows: &[Window], id: &str, kids: &HashMap<String, String>) -> u8 {
+    let Some(root) = kids.get(id) else { return 0 };
+    let up = |at: &str| windows.iter().find(|w| w.id == at).map(|w| w.child.as_str()).filter(|p| !p.is_empty());
+    let mut at = id;
+    let mut d = 1u8;
+    while d < 8 {
+        match up(at) {
+            Some(p) if p != root.as_str() => {
+                at = p;
+                d += 1;
+            }
+            _ => break,
+        }
+    }
+    d
+}
+
+/// A root's descendants (`kids`, in the order given: window order) in
+/// FAMILY order: the root's own children, each followed at once by its own
+/// children ([`Agent::parent`]), depth first. A kid whose parent is not among
+/// them (a link mid-change) goes after, at the top level. Each once.
+pub fn family_order<'a>(root: &str, kids: impl IntoIterator<Item = &'a Agent>) -> Vec<&'a Agent> {
+    let kids: Vec<&'a Agent> = kids.into_iter().collect();
+    fn walk<'a>(at: &str, kids: &[&'a Agent], seen: &mut std::collections::HashSet<&'a str>, out: &mut Vec<&'a Agent>) {
+        for &k in kids.iter().filter(|k| k.parent.as_deref() == Some(at)) {
+            if seen.insert(k.window_id.as_str()) {
+                out.push(k);
+                walk(&k.window_id, kids, seen, out);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    walk(root, &kids, &mut seen, &mut out);
+    for &k in &kids {
+        if seen.insert(k.window_id.as_str()) {
+            out.push(k);
+            walk(&k.window_id, &kids, &mut seen, &mut out);
+        }
+    }
+    out
 }
 
 /// One NEEDS YOU entry as [`kid_needs`] queues it: the window it lists (for
@@ -1303,6 +1423,7 @@ impl ViewModel {
             slot: slots.get(&w.id).copied(),
             pending: Pending::of(w).filter(|_| spaces_on),
             child_of: kids.get(&w.id).cloned(),
+            depth: kid_depth(&snap.windows, &w.id, &kids),
             ..Agent::from_window(w, blink, cw, now)
         };
 
@@ -1458,11 +1579,21 @@ impl ViewModel {
         };
         let mut kids: HashMap<String, Vec<Agent>> = HashMap::new();
         let mut folded = std::collections::HashSet::new();
+        // A child left as its own card away from its root: `↳ a · work`.
+        let mut away: HashMap<String, String> = HashMap::new();
         for a in self.ordered_spaces().into_iter().flat_map(|s| s.agents.iter()) {
             let Some(p) = a.child_of.as_ref().filter(|p| listed.contains(p.as_str())) else { continue };
             // (Any copy of it in the drawn space: a linked one too.)
             let here = scope.is_some_and(|s| self.agents().any(|b| b.window_id == a.window_id && b.session == s));
             if here && !drawn(p) {
+                if let Some(r) = self.agents().chain(&self.pinned).find(|r| r.window_id == *p) {
+                    let space = text::sanitize(&r.session);
+                    let tag = match r.letter {
+                        Some(l) => format!("{KIN_MARK}{l} · {space}"),
+                        None => format!("{KIN_MARK}{space}"),
+                    };
+                    away.insert(a.window_id.clone(), tag);
+                }
                 continue;
             }
             if folded.insert(a.window_id.clone()) {
@@ -1477,6 +1608,9 @@ impl ViewModel {
         v.pinned.retain(|a| !folded.contains(&a.window_id));
         for a in v.spaces.iter_mut().flat_map(|s| s.agents.iter_mut()).chain(v.pinned.iter_mut()) {
             a.nested = kids.get(&a.window_id).cloned().unwrap_or_default();
+            if let Some(t) = away.get(&a.window_id) {
+                a.away = Some(t.clone());
+            }
         }
         v
     }

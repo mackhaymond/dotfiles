@@ -25,7 +25,7 @@ fn bare_fleet(scope: &str) -> ViewModel {
 const BARE: [&str; 4] = ["b1", "b2", "b3", "b4"];
 
 fn cx_of(v: &ViewModel, w: usize) -> Cx<'_> {
-    Cx { w, b: Badge::of(v, &Bar::default()), now: v.now, spin: 0, home: home_of(v), cur: v.cur_win.as_deref(), shells: v.shells, resumes: false, stale_after: crate::view::STALE_AFTER_DEFAULT, fold_after: crate::view::FOLD_AFTER_DEFAULT }
+    Cx { w, b: Badge::of(v, &Bar::default()), now: v.now, spin: 0, home: home_of(v), cur: v.cur_win.as_deref(), shells: v.shells, resumes: false, stale_after: crate::view::STALE_AFTER_DEFAULT, fold_after: crate::view::FOLD_AFTER_DEFAULT, open: &[], kids: KidForm::Fold }
 }
 
 /// The space headers among `rows`, by name.

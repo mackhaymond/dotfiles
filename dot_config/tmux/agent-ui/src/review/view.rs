@@ -66,6 +66,9 @@ pub struct Cand {
     pub reply: String,
     /// The pane's last lines; None until the runner captured them.
     pub preview: Option<Vec<String>>,
+    /// How many children (external subagents) it has (`@agent_kids`' total;
+    /// 0: none): its card says `↳ N kids`.
+    pub kids: u32,
 }
 
 /// What was done to a candidate.
@@ -671,6 +674,11 @@ fn card(r: &Review, buf: &mut Buffer, m: Rect) {
     if room >= 4 {
         let st = c.space_color.map_or(on("sub", bg), |col| Style::new().fg(col).bg(color(bg)));
         x = put(buf, x, y, end, &clip(&sanitize(&c.session), room.min(28)), st) + 2;
+    }
+    // A parent: how many children it has, where it fits.
+    let kids = format!("↳ {} kid{}", c.kids, if c.kids == 1 { "" } else { "s" });
+    if c.kids > 0 && x + cells(&kids) + 2 + tail <= end {
+        x = put(buf, x, y, end, &kids, on("teal", bg)) + 2;
     }
     put(buf, x, y, end, &format!("{g} {words}"), on(shue, bg));
 }

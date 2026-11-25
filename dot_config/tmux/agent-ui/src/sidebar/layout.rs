@@ -358,25 +358,68 @@
 //!
 //! ## Kids
 //!
-//! abby's delegate children are its subagents here, by the reconciler's
-//! derived options alone (`@agent_child`, `@agent_kids`;
-//! docs/agent-roster.md "abby-delegate children"). Before anything is laid
-//! out (and before the pins split) every child MOVES under its parent's
-//! card ([`ViewModel::kids_split`]): under a FULL card one dim row each
-//! ([`kid_row`]: the card's colour and rail, the child's quiet key-cap, `↳`,
-//! its title; no dot, word or blurb; a click goes to the child); a
-//! one-line, folded or collapsed parent folds them with it (whatever stands
-//! for the parent stands for them, [`Row::covering`]). No card, NEEDS YOU
-//! entry, pin or count of its own. Who is a child is decided once per view
+//! A delegated CHILD (an external subagent: any harness's tab spawned by
+//! `agent-spawn`, abby-delegate's among them) is its parent's subagent
+//! here, by the reconciler's derived options alone (`@agent_child`,
+//! `@agent_kids`; docs/agent-roster.md "External subagents"). Before
+//! anything is laid out (and before the pins split) every child MOVES under
+//! its ROOT's card ([`ViewModel::kids_split`]): no card, NEEDS YOU entry,
+//! pin, letter or count of its own. Who is a child is decided once per view
 //! ([`crate::view::kid_roots`] over every space: its parent a shown agent,
 //! no home, not parked; never by scope, so NEEDS YOU and the counts never
-//! flip with ⌥V). In space scope a child here whose root is in another
-//! space is drawn as its own card in its space. A parent whose children are
-//! busy reads working with `⚙ N`. EVERY child asking or failed is a NEEDS
-//! YOU card of its root's, with the child's state and words after its
-//! letter (`↳ f: perm Bash`), the card acting on the child ([`Need::via`]).
-//! Not while the selection is live (every tab in its place, as for the
-//! pins).
+//! flip with ⌥V). Not while the selection is live (every tab in its place,
+//! as for the pins).
+//!
+//! ```text
+//!  ▎  a  Abby orchestrator ↳ 4 · 3 working ⠋    FOLDED (the default): one chip
+//!  ▎  Ⓐ  › Bash cargo test                5m    ([`kid_chips`]); line 2 the
+//!                                                busiest child's doing
+//!  ▎  a  Abby orchestrator ↳ 4 · 3 working ⠋    OPEN (a click on the chip,
+//!  ▎  Ⓐ  › Bash cargo test                5m    [`Target::Kids`]): a row a
+//!  ▎     ↳ ✻ Parser rewrite             ⠋ 2m    child ([`kid_row`]), family
+//!  ▎       ↳ ✻ Fixture gen              ⠋ 7m    order, a grandchild 2 cells
+//!  ▎     ↳ ⬢ Docs pass                  ✓ 3m    in
+//!  ▎     ↳ ✻ Tests for parser         ◉ perm
+//!
+//!  ▎  ↳  ✻ ⠋  ✻ ⠋  ⬢ ✓  ✻ ◉ perm                ...short of rows: the STRIP
+//! ```
+//!
+//! - FOLDED, by default: the parent's card carries one chip after its title,
+//!   ` ↳ 3 · 2 working` (`@agent_kids`' total and busy; shorter forms ` ↳
+//!   2/3`, ` ↳ 3` as room runs out, the state word going to its glyph
+//!   first), and no child rows; its first row stands for every child
+//!   ([`Row::covering`]). The workflow's gear is not drawn while a child is
+//!   busy (the watcher lights it for busy children too): only for a workflow
+//!   with no child busy.
+//! - OPEN: a click on the chip opens the family in THIS sidebar
+//!   ([`Opts::kids_open`], view state, never a tmux option); a second folds
+//!   it. Under the full card, one live row per child ([`kid_row`], Design
+//!   A): its key-cap (no letter: blinking to the working blue while it works,
+//!   solid in its state's colour while it asks or failed), `↳`, its one-cell
+//!   harness mark, its task (`@agent_spawn_task`), bright while working or
+//!   asking and dim once done; its state on the right (the spinner and age,
+//!   `◉ perm`, `✕ error`, a `✓` green while its parent has not collected the
+//!   result, `@agent_spawn_result` ready, dim once read). A grandchild is
+//!   indented 2 cells a level (capped at 2 levels). A click on a row goes to
+//!   that child's pane.
+//! - The LADDER: an open family keeps its rows at full detail; short of
+//!   rows it goes to ONE strip row ([`kid_strip`], Design B: a pill a child,
+//!   its mark and state, `+N` for the rest; a click on a pill goes to that
+//!   child, on the `↳` folds the family) before the cards go to one line,
+//!   and keeps its strip under a one-line card; from the spaces' collapse on
+//!   it folds like a closed one ([`KidForm`]).
+//! - A HELD parent (busy children, no run of its own) says on its second
+//!   line what its busiest child does now (`› Bash cargo test`), else
+//!   `waiting on N subagents`.
+//! - NEEDS YOU: EVERY child asking or failed is a NEEDS YOU card of its
+//!   root's (the root's title, the child's state and words after `↳`:
+//!   `↳ perm Bash`), the card, its answer chips and a jump acting on the
+//!   CHILD's pane ([`Need::via`]). Never a card of the child's own.
+//! - KIN TAGS on a card of its own: in space scope a child here whose root
+//!   lives in another space is drawn as its own card, its second line
+//!   tagged `↳ a · work` (the root's letter and space, [`Agent::away`]); an
+//!   ex-child whose parent's agent is gone (`@agent_kid_orphan`) is a plain
+//!   agent tagged `↳ (parent gone)`.
 //!
 //! ## Space order
 //!
@@ -757,6 +800,11 @@ pub enum Target {
     /// key's `resume` (docs/agent-roster.md "Rate-limited agents"). The rest
     /// of the card still goes to the window.
     LimitResume(String),
+    /// A parent card's family chip (`↳ 3 · 2 working`, [`kid_chips`]), or
+    /// the `↳` at the head of its strip ([`kid_strip`]): show or fold that
+    /// window's children under its card. View state of THIS sidebar only
+    /// ([`Opts::kids_open`]), never a tmux option; folded by default.
+    Kids(String),
 }
 
 /// One screen line.
@@ -903,6 +951,10 @@ pub struct Opts {
     /// a settled banner says `glow off`, dim, on its second row. The banner
     /// itself stays either way.
     pub glow_off: bool,
+    /// The parents whose children this sidebar shows (window ids: a click
+    /// on a family chip, [`Target::Kids`]); every other family is folded
+    /// into its parent's chip.
+    pub kids_open: Vec<String>,
 }
 
 /// The working spinner: braille, one cell, ten frames.
@@ -1002,6 +1054,23 @@ struct Cx<'a> {
     /// `@space_fold_hours` ([`Bar::fold_after`], else
     /// [`crate::view::FOLD_AFTER_DEFAULT`]).
     fold_after: i64,
+    /// The parents whose families are open ([`Opts::kids_open`]).
+    open: &'a [String],
+    /// How an OPEN family is drawn at this rung of the ladder ([`KidForm`]).
+    kids: KidForm,
+}
+
+/// How an open family ([`Target::Kids`]) is drawn under its parent's card:
+/// the ladder's rungs, roomiest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KidForm {
+    /// Design A: one live row per child under a full card ([`kid_row`]).
+    Rows,
+    /// Design B: the whole family on ONE row ([`kid_strip`]), under a full
+    /// or a one-line card.
+    Strip,
+    /// Folded into the parent's chip, as a closed family always is.
+    Fold,
 }
 
 impl Cx<'_> {
@@ -2631,6 +2700,26 @@ fn says(a: &Agent, now: f64) -> Says {
         if let Some(t) = some(ins.and_then(|i| i.todo.as_deref())).or_else(|| some(live_blurb(a))) {
             return Says::Now(t);
         }
+        // A parent HELD for its children (busy children, no turn of its own
+        // running: its own turn ended, or its Stop was held `running` with
+        // its reply as the `done` detail; no blurb or todo of its own, above):
+        // what its busiest child does now, else that it waits on them. A
+        // parent mid-turn of its own never describes a child's work as its own.
+        let held = a.state != "running" || a.detail_kind == "done";
+        if a.kids_running() > 0 && held && message(a, now).is_none() {
+            let doing = |k: &&Agent| {
+                let t = k.insight.as_ref().and_then(|i| i.todo.as_deref()).or_else(|| live_blurb(k));
+                some(t.or_else(|| k.run_detail.then_some(k.detail.as_str())))
+            };
+            let busy = a.family().into_iter().filter(|k| k.cat == Some(Cat::Working)).find_map(|k| doing(&k));
+            return match busy {
+                Some(t) => Says::Now(t),
+                None => {
+                    let n = a.kids_running();
+                    Says::Said(format!("waiting on {n} subagent{}", if n == 1 { "" } else { "s" }))
+                }
+            };
+        }
     }
     // A pending space's claude: what it asks or why it failed, else what
     // it was asked to build (your words, as a prompt).
@@ -2805,7 +2894,11 @@ fn agent_bg(a: &Agent, k: usize, mine: bool) -> Ink {
 /// before the second line's age (a PINNED card's space, `cs35l · 4m`),
 /// dropped when it would leave the line under [`TAG_ROOM`] cells. A stale
 /// agent's hint ([`stale_hint`]: `close?`, `unsaved work`) sits after the
-/// badge on the second line (`close? · 4h`); a one-line card has none.
+/// badge on the second line (`close? · 4h`); a one-line card has none. A
+/// parent's family ([`Agent::nested`]) is its chip after the title
+/// ([`kid_chips`], a click opens it), and, open, its rows or strip under the
+/// card by the rung's [`KidForm`]; a child drawn on its own card (away from
+/// its root, or orphaned) wears its kin tag ([`Agent::kin_tag`]) as the tag.
 fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&str>) -> Vec<Row> {
     let w = inner(cx.w);
     let go = Target::Go { win: a.window_id.clone(), session: a.session.clone() };
@@ -2829,15 +2922,50 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     // Dim text on a tile needs the surface's dim; the own card's lift
     // needs `sub` (overlay2 is about 3:1 there).
     let dimc = if mine { MINE_DIM } else { dim(true) };
-    // (Children running: the workflow's gear with how many, `⚙ 2`.)
-    let flag = a.flag.map(|(f, _)| match f {
-        Flag::Workflow if a.kids_running() > 0 => seg(format!(" ⚙ {}", a.kids_running()), "teal"),
-        Flag::Workflow => seg(" ⚙", "teal"),
-        Flag::Cua => seg(" ◎", if a.attention { "overlay2" } else { "blue" }),
+    // A family: its chip after the title ([`kid_chips`], a click opens it).
+    // The watcher lights the workflow's gear for busy children too, so with
+    // a child busy the chip says it and no gear shows; the gear stays for a
+    // workflow with no child busy. (Children that fold under no card here:
+    // the gear with how many, `⚙ 2`.)
+    let family = !a.nested.is_empty();
+    let flag = a.flag.and_then(|(f, _)| match f {
+        Flag::Workflow if family && a.kids_running() > 0 => None,
+        Flag::Workflow if a.kids_running() > 0 => Some(seg(format!(" ⚙ {}", a.kids_running()), "teal")),
+        Flag::Workflow => Some(seg(" ⚙", "teal")),
+        Flag::Cua => Some(seg(" ◎", if a.attention { "overlay2" } else { "blue" })),
     });
+    // (Bold "open" only when this rung draws the family under the card: its
+    // rows under a full card, or its strip; else the folded look, so a
+    // click reads as what it will do.)
+    let shown_open = expanded(a, cx)
+        && match cx.kids {
+            KidForm::Rows => msg.is_some(),
+            KidForm::Strip => true,
+            KidForm::Fold => false,
+        };
+    let chips = kid_chips(a, shown_open);
     // A PINNED card's ⌥W digit ([`pin_cap`]): beside its letter (the cap
     // column's second line is the harness mark's, [`mark_lead`]).
     let pin = a.pin_key.filter(|_| tag.is_some() && cx.b.on).map(|n| pin_cap(n, bg, cx.b.loud));
+    // Its kin tag ([`Agent::kin_tag`]: `↳ a · work`, a child drawn away from
+    // its root; `↳ (parent gone)`, an ex-child) rides as the second line's
+    // tag, before a PINNED card's space, and gets wider room ([`KIN_W`]).
+    // Short of room it takes the age's place, then its short form
+    // ([`Agent::kin_short`]: `↳ a·work`, `↳ gone`), before it goes.
+    let kin = a.kin_tag();
+    let tag_w = if kin.is_some() { KIN_W } else { TAG_W };
+    let with_pin = |k: String| match tag {
+        Some(t) => format!("{k} · {t}"),
+        None => k,
+    };
+    let tag_text: Option<String> = kin.clone().map(with_pin).or_else(|| tag.map(String::from));
+    let kin_forms: Vec<(String, bool)> = match &kin {
+        Some(k) => {
+            let short = a.kin_short().unwrap_or_else(|| k.clone());
+            vec![(with_pin(k.clone()), false), (with_pin(short.clone()), true), (short.clone(), true), (short, false)]
+        }
+        None => Vec::new(),
+    };
     let inline = pin.is_some();
     let lead = cx.b.lead() + if inline { BADGE_W + 1 } else { 0 };
     // A paused card with its second line says `paused` there: the first
@@ -2867,25 +2995,39 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
         r.push(seg(" ", "text"));
         r
     };
-    let fixed = |r: &[Seg]| lead + flag.as_ref().map_or(0, |f| dwidth(&f.text)) + width(r) + 1 + usize::from(marked);
+    let fixed = |r: &[Seg], chip: usize| lead + flag.as_ref().map_or(0, |f| dwidth(&f.text)) + chip + width(r) + 1 + usize::from(marked);
     let full = short_title(a);
-    // The richest extras that leave the title its whole or DOING_MIN cells.
-    // (Never wider than the tile; an empty title still keeps a cell.)
-    let level = (0..EXTRA_LEVELS).find(|&l| {
-        let f = fixed(&right_of(true, true, l));
-        f <= w && w - f >= dwidth(&full).clamp(1, DOING_MIN)
-    });
-    let level = level.unwrap_or(EXTRA_LEVELS - 1);
+    // The richest chip, then the richest extras, that leave the title its
+    // whole or DOING_MIN cells. (Never wider than the tile; an empty title
+    // still keeps a cell.)
+    // (A family's chip says the work: the state word goes to its glyph
+    // before the chip shortens.)
+    let chip_w = |i: usize| chips.get(i).map_or(0, |c| dwidth(&c.text));
+    let forms = chips.len().max(1);
+    let tries: Vec<(usize, bool)> =
+        (0..forms).flat_map(|i| if chips.is_empty() { vec![(i, true)] } else { vec![(i, true), (i, false)] }).collect();
+    let (ci, words, level) = tries
+        .iter()
+        .find_map(|&(i, wf)| {
+            (0..EXTRA_LEVELS)
+                .find(|&l| {
+                    let f = fixed(&right_of(wf, true, l), chip_w(i));
+                    f <= w && w - f >= dwidth(&full).clamp(1, DOING_MIN)
+                })
+                .map(|l| (i, wf, l))
+        })
+        .unwrap_or((forms - 1, true, EXTRA_LEVELS - 1));
+    let (chip, cw) = (chips.get(ci).cloned(), chip_w(ci));
     // The title before the age: an age that would clip it goes (a working
     // agent's age is the least of what the row says).
-    let mut right = right_of(true, true, level);
-    if fixed(&right) + dwidth(&full) > w {
-        right = right_of(true, false, level);
+    let mut right = right_of(words, true, level);
+    if fixed(&right, cw) + dwidth(&full) > w {
+        right = right_of(words, false, level);
     }
-    if w < fixed(&right) + 6 {
+    if w < fixed(&right, cw) + 6 {
         right = right_of(false, false, level);
     }
-    let room = w.saturating_sub(fixed(&right));
+    let room = w.saturating_sub(fixed(&right, cw));
     let title = clip(&full, room);
     let title = if busy.is_some() || mine { bold(title, "text") } else { seg(title, "text") };
     let mut left = vec![rail.clone(), seg(" ", "text")];
@@ -2901,6 +3043,9 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
         left.extend([p, seg(" ", "text")]);
     }
     left.push(title);
+    // (The chip's cells on the row: past the margin and what is left of it.)
+    let chip_x = margin(cx.w) + width(&left);
+    left.extend(chip);
     left.extend(flag);
     // The client's own card: a full lavender cell down its right edge
     // (both rows), where no state rail ever is.
@@ -2916,9 +3061,20 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     let span = if msg.is_none() { extras(a, level, bg, dimc).1 } else { None };
     let first = tile_row(cx.w, bg, left, right).click(cx.w, go.clone());
     let mut first = diff_click(first, cx.w, rw, span, &a.window_id).covering([a]);
+    if cw > 0 && chip_x + cw <= margin(cx.w) + inner(cx.w) {
+        first.targets.insert(0, (chip_x as u16, (chip_x + cw) as u16, Target::Kids(a.window_id.clone())));
+    }
     first.anim = word.as_ref().is_some_and(Word::working);
     let sel = |rows: Vec<Row>| if a.selected { rows.into_iter().map(sel_row).collect() } else { rows };
-    let Some(m) = msg else { return sel(vec![first]) };
+    let Some(m) = msg else {
+        // A one-line card keeps an open family as its strip on the rungs
+        // that allow one ([`KidForm::Strip`]).
+        let mut rows = vec![first];
+        if cx.kids == KidForm::Strip && expanded(a, cx) {
+            rows.push(kid_strip(a, cx, bg, rail, marked, dimc));
+        }
+        return sel(rows);
+    };
     // Under the title (past the key-cap); without letters, indented anyway,
     // so a message never reads as another agent.
     let indent = if cx.b.on { lead - 1 } else { 3 };
@@ -2948,7 +3104,7 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     let stale = a.stale(cx.now, cx.stale_after);
     // The right side: the extras ([`extras`]), the sweep's hint, the tag,
     // the age (after a ` ·` when a hint or tag stands before it).
-    let right2 = |level: u8, form: usize, tag: Option<&str>| {
+    let right2 = |level: u8, form: usize, tag: Option<&str>, aged: bool| {
         let (mut r, span) = extras(a, level, bg, dimc);
         let hint = stale_hint(stale, form, bg, faint);
         let some = !r.is_empty() || hint.is_some();
@@ -2961,9 +3117,10 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
             if dot {
                 r.push(seg(" ·", dimc));
             }
-            r.push(seg(format!(" {}", clip(&sanitize(t), TAG_W)), dimc));
+            r.push(seg(format!(" {}", clip(&sanitize(t), tag_w)), dimc));
             dot = true;
         }
+        let age = age.as_ref().filter(|_| aged);
         if dot && age.is_some() {
             r.push(seg(" ·", dimc));
         }
@@ -2977,15 +3134,24 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     // tag only while the text keeps TAG_ROOM.
     let room = |r: &[Seg]| inner(cx.w).saturating_sub(1 + indent + width(r));
     let (last, gone) = (EXTRA_LEVELS - 1, GIVE_WAY[GIVE_WAY.len() - 1].1 + 1);
-    let tries = GIVE_WAY.map(|(l, f)| (l, f, tag)).into_iter().chain([(last, gone - 1, None), (last, gone, None)]);
+    // (A kin tag, short of room: in the age's place, then short, with the
+    // age and without; the extras and the hint give way to it first.)
+    let kin_tries = kin_forms.iter().flat_map(|(t, aged)| {
+        [(last, gone - 1, Some(t.as_str()), *aged), (last, gone, Some(t.as_str()), *aged)]
+    });
+    let tries = GIVE_WAY
+        .map(|(l, f)| (l, f, tag_text.as_deref(), true))
+        .into_iter()
+        .chain(kin_tries)
+        .chain([(last, gone - 1, None, true), (last, gone, None, true)]);
     let fits = |(r, _, some): &(Vec<Seg>, Option<(usize, usize)>, bool), t: Option<&str>| {
         let fit = 1 + indent + width(r) <= inner(cx.w);
         (!some || fit && room(r) >= mark + tw.clamp(1, DOING_MIN)) && (t.is_none() || room(r) >= TAG_ROOM)
     };
     let (r2, span, _) = tries
-        .map(|(l, f, t)| (right2(l, f, t), t))
+        .map(|(l, f, t, aged)| (right2(l, f, t, aged), t))
         .find(|(x, t)| fits(x, *t))
-        .map_or_else(|| right2(last, gone, None), |(x, _)| x);
+        .map_or_else(|| right2(last, gone, None, true), |(x, _)| x);
     // The harness mark under the letter (a pinned card's ⌥W digit sits
     // beside the letter on the first line, `inline`).
     let mut l2 = mark_lead(a, rail.clone(), indent, cx.b.on);
@@ -3004,36 +3170,192 @@ fn agent_rows(a: &Agent, cx: Cx, two: bool, k: usize, space: Ink, tag: Option<&s
     if let Some((x0, x1)) = chip.filter(|&(_, x1)| usize::from(x1) <= margin(cx.w) + inner(cx.w)) {
         second.targets.insert(0, (x0, x1, Target::LimitResume(a.window_id.clone())));
     }
-    // Its children, under the full card only (a one-line card folds them:
-    // its first row stands for them, [`Row::covering`]).
+    // Its children, while its family is open: one live row each (Design
+    // A), or the one-row strip on a tighter rung (Design B). Folded (the
+    // default, and every one-line card but a strip's), the card's first row
+    // stands for them ([`Row::covering`]); the rows under it cover nothing.
     let mut rows = vec![first, second];
-    rows.extend(a.nested.iter().map(|k| kid_row(k, cx, bg, space, rail.clone(), marked, dimc)));
+    if expanded(a, cx) {
+        match cx.kids {
+            KidForm::Rows => rows.extend(a.family().into_iter().map(|k| kid_row(k, cx, bg, space, rail.clone(), marked, dimc))),
+            KidForm::Strip => rows.push(kid_strip(a, cx, bg, rail, marked, dimc)),
+            KidForm::Fold => {}
+        }
+    }
     sel(rows)
 }
 
-/// The arrow before a nested child's title ([`kid_row`]).
+/// The arrow before a nested child's title ([`kid_row`]) and in a family's
+/// chip ([`kid_chips`]).
 pub const KID_MARK: &str = "↳ ";
 
-/// An abby-delegate CHILD under its parent's full card ([`Agent::nested`],
-/// like a native subagent): ONE dim row on the card's own colour with the
-/// card's rail, so it reads as part of the card: the child's key-cap (quiet;
-/// its letter still reaches it by ⌥W), `↳` and its title dim (`text` while
-/// the client is on it); no state dot, colour, word or blurb. A click goes
-/// to the child ([`Target::Go`]); the row covers nothing (the card's first
-/// row stands for its children).
+/// `a`'s family is OPEN in this frame: it has children folded under it
+/// ([`Agent::nested`]) and a click opened them ([`Cx::open`]).
+fn expanded(a: &Agent, cx: Cx) -> bool {
+    !a.nested.is_empty() && cx.open.iter().any(|w| *w == a.window_id)
+}
+
+/// A parent card's FAMILY CHIP, after its title (teal; bold while the family
+/// is open), richest first: ` ↳ 3 · 2 working` (how many children, how many
+/// busy: `@agent_kids`, else the children folded here), ` ↳ 2/3`, ` ↳ 3`;
+/// with none busy, ` ↳ 3` alone. A click on it opens or folds the family
+/// ([`Target::Kids`]). Empty for a card with no children under it.
+fn kid_chips(a: &Agent, open: bool) -> Vec<Seg> {
+    if a.nested.is_empty() {
+        return Vec::new();
+    }
+    let total = a.kids.map_or(a.nested.len() as u32, |k| k.total).max(1);
+    let busy = a.kids_running().min(total);
+    let mk = |t: String| if open { bold(t, "teal") } else { seg(t, "teal") };
+    let mut v = Vec::new();
+    if busy > 0 {
+        v.push(mk(format!(" {KID_MARK}{total} · {busy} working")));
+        v.push(mk(format!(" {KID_MARK}{busy}/{total}")));
+    }
+    v.push(mk(format!(" {KID_MARK}{total}")));
+    v
+}
+
+/// A child's state as its kid row or strip pill says it: the mark, whether
+/// its title is BRIGHT (working or asking), and whether its age follows.
+/// Asking or failed: `◉ perm` / `◉ asks` / `✕ error` bold in the state's
+/// colour (no age: the ask is what matters). Working: the blue spinner.
+/// Paused: ⏸ (or the limit's mark). Finished: `✓`, green while its parent
+/// has not collected the result (`@agent_spawn_result` ready, or an unseen
+/// done), dim once read; idle with no finish yet (born, not started): a dim
+/// `○`.
+fn kid_state(k: &Agent, cx: Cx, dimc: Hue) -> (Seg, bool, bool) {
+    match k.cat {
+        Some(c @ (Cat::NeedsInput | Cat::Failed)) => {
+            let w = cat_word(k, c);
+            (bold(format!("{} {}", w.glyph, w.word), w.hue), true, false)
+        }
+        _ if k.in_flight || k.cat == Some(Cat::Working) => (bold(SPIN[cx.spin % SPIN.len()], "blue"), true, true),
+        Some(c @ Cat::Paused) => {
+            let w = cat_word(k, c);
+            (bold(w.glyph, w.hue), false, true)
+        }
+        // (Working is the spinner above.)
+        Some(Cat::Done | Cat::Idle | Cat::Working) => {
+            let ready = k.result == "ready" || (k.result.is_empty() && k.cat == Some(Cat::Done));
+            let finished = ready || k.result == "read" || k.detail_kind == "done";
+            if ready {
+                (bold("✓", "green"), false, true)
+            } else if finished {
+                (seg("✓", dimc), false, true)
+            } else {
+                (seg("○", dimc), false, true)
+            }
+        }
+        None => (seg(" ", "text"), false, false),
+    }
+}
+
+/// A child's key-cap in its kid row: it holds no letter (the pool skips
+/// children), so the cap speaks by its fill: SOLID in the state's colour
+/// while it asks or failed, BLINKING to the working blue while it works
+/// ([`blink_on`], as an agent card's cap), else the quiet tint of its
+/// space's colour. While ⌥W is armed, the armed look.
+fn kid_cap(k: &Agent, cx: Cx, space: Ink, bg: Ink) -> Seg {
+    let text = k.letter.map_or_else(|| " ".repeat(BADGE_W), |c| c.cap());
+    match k.cat {
+        _ if cx.b.loud => cx.b.seg(k, space, bg, false),
+        Some(c @ (Cat::NeedsInput | Cat::Failed)) => block(text, "crust", cat_hue(c)),
+        _ if (k.in_flight || k.cat == Some(Cat::Working)) && blink_on(cx.now) => block(text, "crust", cat_hue(Cat::Working)),
+        _ => cx.b.seg(k, space, bg, false),
+    }
+}
+
+/// A CHILD under its parent's full card while the family is open (Design
+/// A, [`KidForm::Rows`]): ONE live row on the card's own colour with the
+/// card's rail, so it reads as part of the card: the child's key-cap
+/// ([`kid_cap`]), its depth's indent (2 cells a level past the first,
+/// capped at 2 levels), `↳`, its one-cell harness mark ([`harness_mark`]),
+/// its task (`@agent_spawn_task`, else its title: [`Agent::kid_title`]),
+/// `text` while working or asking, dim once done; on the right its state
+/// ([`kid_state`]) and age. A click goes to the child's pane
+/// ([`Target::Go`]); the row covers nothing (the card's first row stands
+/// for its children).
 fn kid_row(k: &Agent, cx: Cx, bg: Ink, space: Ink, rail: Seg, marked: bool, dimc: Hue) -> Row {
+    let (state, bright, aged) = kid_state(k, cx, dimc);
     let mut left = vec![rail, seg(" ", "text")];
     if cx.b.on {
-        left.extend([cx.b.seg(k, space, bg, false), seg(" ", "text")]);
+        left.extend([kid_cap(k, cx, space, bg), seg(" ", "text")]);
     }
-    left.push(seg(KID_MARK, dimc));
+    let indent = 2 * usize::from(k.depth.max(1) - 1).min(2);
+    if indent > 0 {
+        left.push(seg(" ".repeat(indent), "text"));
+    }
+    left.extend([seg(KID_MARK, dimc), harness_mark(k, false), seg(" ", "text")]);
+    let mut right = vec![state];
+    if let Some(ag) = Some(age_of(k, cx)).filter(|g| aged && cx.ages() && !g.is_empty()) {
+        right.push(seg(format!(" {ag}"), dimc));
+    }
+    right.push(seg(" ", "text"));
+    if marked {
+        right.push(seg(MINE, MINE_HUE));
+    }
+    let room = inner(cx.w).saturating_sub(width(&left) + width(&right));
+    let ink = if bright || k.is_current { "text" } else { dimc };
+    left.push(seg(clip(&sanitize(k.kid_title()), room), ink));
+    let mut row = tile_row(cx.w, bg, left, right).click(cx.w, Target::Go { win: k.window_id.clone(), session: k.session.clone() });
+    row.anim = k.in_flight || k.cat == Some(Cat::Working);
+    row
+}
+
+/// An open family on ONE row (Design B, [`KidForm::Strip`]: the ladder's
+/// rung before its children lose their rows): the card's rail, a teal `↳`
+/// in the key-cap column (a click folds the family, [`Target::Kids`]), then
+/// one pill per child in family order, its harness mark and its state
+/// ([`kid_state`]: `✻ ⠋  ⬢ ✓  ✻ ◉ perm`), as many as fit and `+N` for the
+/// rest. A click on a pill goes to that child; anywhere else to the parent.
+/// Covers nothing (the card's first row stands for the family).
+fn kid_strip(a: &Agent, cx: Cx, bg: Ink, rail: Seg, marked: bool, dimc: Hue) -> Row {
+    let kids = a.family();
+    let m = margin(cx.w);
+    let mut left = vec![rail, seg(" ", "text")];
+    let head_x = m + width(&left);
+    left.push(seg(if cx.b.on { " ↳ " } else { "↳" }, "teal"));
+    let head = (head_x, m + width(&left));
+    left.push(seg(" ", "text"));
     let mut right = vec![seg(" ", "text")];
     if marked {
         right.push(seg(MINE, MINE_HUE));
     }
     let room = inner(cx.w).saturating_sub(width(&left) + width(&right));
-    left.push(seg(clip(&short_title(k), room), if k.is_current { "text" } else { dimc }));
-    tile_row(cx.w, bg, left, right).click(cx.w, Target::Go { win: k.window_id.clone(), session: k.session.clone() })
+    let more = |n: usize| format!("  +{n}");
+    let mut used = 0;
+    let mut spans = Vec::new();
+    let mut shown = 0;
+    let mut working = false;
+    for (i, k) in kids.iter().enumerate() {
+        let (state, ..) = kid_state(k, cx, dimc);
+        let pill = vec![harness_mark(k, false), seg(" ", "text"), state];
+        let sep = if i > 0 { 2 } else { 0 };
+        let rest = kids.len() - i - 1;
+        let reserve = if rest > 0 { dwidth(&more(rest)) } else { 0 };
+        if used + sep + width(&pill) + reserve > room {
+            break;
+        }
+        if sep > 0 {
+            left.push(seg("  ", "text"));
+        }
+        let x0 = m + width(&left);
+        left.extend(pill);
+        spans.push((x0, m + width(&left), Target::Go { win: k.window_id.clone(), session: k.session.clone() }));
+        used += sep + width(&left[left.len() - 3..]);
+        shown += 1;
+        working |= k.in_flight || k.cat == Some(Cat::Working);
+    }
+    if shown < kids.len() {
+        left.push(seg(if shown == 0 { format!("+{}", kids.len()) } else { more(kids.len() - shown) }, dimc));
+    }
+    let mut row = tile_row(cx.w, bg, left, right);
+    row.targets.push((head.0 as u16, head.1 as u16, Target::Kids(a.window_id.clone())));
+    row.targets.extend(spans.into_iter().map(|(x0, x1, t)| (x0 as u16, x1 as u16, t)));
+    let mut row = row.click(cx.w, Target::Go { win: a.window_id.clone(), session: a.session.clone() });
+    row.anim = working;
+    row
 }
 
 /// The HARNESS MARK ([`crate::model::Harness`]): which harness runs the
@@ -3083,6 +3405,8 @@ fn pin_cap(n: u8, card: Ink, loud: bool) -> Seg {
 /// A second line's tag ([`agent_rows`]) is at most this many cells, and
 /// goes when the line's text would keep fewer than [`TAG_ROOM`].
 const TAG_W: usize = 10;
+/// A kin tag's cells at most ([`Agent::kin_tag`]): `↳ (parent gone)` whole.
+const KIN_W: usize = 18;
 const TAG_ROOM: usize = 10;
 
 /// A space's counts: the idle glyph's `overlay` lifted to `dimc` (the dim
@@ -3777,7 +4101,9 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
     };
     // `gs`: the groups listed (`collapsed` says which of them are), `gone`
     // how many bare spaces' headers the end counts.
-    let build = |gs: &[&Space], two: &[Key], fold: bool, collapsed: &[bool], spaced: bool, gone: usize| {
+    // (`kf`: how the open families are drawn at this rung, [`KidForm`].)
+    let build = |gs: &[&Space], two: &[Key], fold: bool, collapsed: &[bool], spaced: bool, gone: usize, kf: KidForm| {
+        let cx = Cx { kids: kf, ..cx };
         let mut rows = pin_block(view, cx, two);
         if spaced && pins {
             rows.push(Row::blank(w));
@@ -3816,7 +4142,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
     // The header and the words, nothing to fold. (Cut short: the last
     // step, so a frame's full-detail search never takes it for a fit.)
     let words = |gs: &[&Space]| {
-        let mut rows = build(gs, &[], false, &open(gs), false, 0);
+        let mut rows = build(gs, &[], false, &open(gs), false, 0, KidForm::Fold);
         let step = if rows.len() > budget { 5 } else { 0 };
         rows.truncate(budget);
         // (The quiet line cut off: its agents on the last row that is left.)
@@ -3840,7 +4166,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
     if heads {
         // Full detail: the gaps between spaces go first.
         for sp in [spaced, false] {
-            let rows = build(&groups, &all, false, &open(&groups), sp, 0);
+            let rows = build(&groups, &all, false, &open(&groups), sp, 0, KidForm::Rows);
             if rows.len() <= budget {
                 return (rows, 0);
             }
@@ -3849,7 +4175,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
         // on one line (one alone saves nothing)...
         for k in 2..=drop.len() {
             let gs = kept(k);
-            let rows = build(&gs, &all, false, &open(&gs), false, k);
+            let rows = build(&gs, &all, false, &open(&gs), false, k, KidForm::Rows);
             if rows.len() <= budget {
                 return (rows, 0);
             }
@@ -3863,16 +4189,22 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
         return words(&groups);
     }
     if !drop.is_empty() || !heads {
-        let rows = build(&groups, &all, false, &open(&groups), false, 0);
+        let rows = build(&groups, &all, false, &open(&groups), false, 0, KidForm::Rows);
         if rows.len() <= budget {
             return (rows, 0);
         }
     }
-    let build = |two: &[Key], fold: bool, collapsed: &[bool], spaced: bool| build(&groups, two, fold, collapsed, spaced, 0);
+    let build = |two: &[Key], fold: bool, collapsed: &[bool], spaced: bool, kf: KidForm| build(&groups, two, fold, collapsed, spaced, 0, kf);
     let mut collapsed = open(&groups);
-    // Every agent row the same height: all two lines (idle folded), else all one.
-    for (step, two, fold) in [(1, &all[..], true), (2, &[][..], false), (3, &[][..], true)] {
-        let rows = build(two, fold, &collapsed, false);
+    // Every agent row the same height: all two lines (idle folded), else all
+    // one. An open family keeps its rows, then its strip (before the cards
+    // go to one line), and its strip under one-line cards; from the spaces'
+    // collapse on, it folds like any other.
+    let opened = groups.iter().flat_map(|g| g.agents.iter()).chain(&view.pinned).any(|a| expanded(a, cx));
+    let rungs = [(1, &all[..], true, KidForm::Rows), (1, &all[..], true, KidForm::Strip), (2, &[][..], false, KidForm::Strip),
+        (3, &[][..], true, KidForm::Strip)];
+    for (step, two, fold, kf) in rungs.into_iter().filter(|r| opened || r.3 != KidForm::Strip || r.0 > 1) {
+        let rows = build(two, fold, &collapsed, false, kf);
         if rows.len() <= budget {
             return (rows, step);
         }
@@ -3896,7 +4228,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
     });
     for &i in &order {
         collapsed[i] = true;
-        let base = build(&[], true, &collapsed, false);
+        let base = build(&[], true, &collapsed, false, KidForm::Fold);
         if base.len() > budget {
             continue;
         }
@@ -3935,7 +4267,7 @@ fn agents_section(view: &ViewModel, cx: Cx, budget: usize, spaced: bool, heads: 
         return pins_cut(view, cx, &counted, &header, budget);
     }
     let keep = (budget - lead - 2).min(groups.len());
-    let mut rows = build(&[], true, &collapsed, false);
+    let mut rows = build(&[], true, &collapsed, false, KidForm::Fold);
     rows.truncate(lead + 1 + keep);
     let rest: Vec<&Agent> = counted[keep..].iter().flat_map(|g| g.agents.iter()).collect();
     rows.push(more_row(w, &rest, counted.len() - keep));
@@ -3972,7 +4304,10 @@ const NEED_TINT: [u8; 2] = [14, 9];
 /// A NEEDS YOU card on the card grid, a tile of 2 or 1 lines all on its
 /// state's colour mixed over the canvas (`tint`: [`NEED_TINT`]'s index,
 /// the zebra's), a heavy `▌` rail in that colour down both rows; the
-/// key-cap always solid (the letter you will press), the title bold, and
+/// key-cap always solid (the letter you will press; on a parent-titled
+/// card standing in for an asking child, the PARENT's letter, while a
+/// click, Enter and the answer chips act on the CHILD's pane, which has no
+/// letter of its own), the title bold, and
 /// on the right the state's glyph and word bold in its colour (the age
 /// beside it on a one-line card). Line 2: the reason in `text` (here the
 /// detail IS the content; a `perm` prompt says so), or the state in words;
@@ -4564,6 +4899,9 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
         resumes: matches!(opts.pause, Some(Phase::Stopping { .. } | Phase::Safe { .. } | Phase::Ready { .. })),
         stale_after: opts.bar.stale_after.unwrap_or(crate::view::STALE_AFTER_DEFAULT),
         fold_after: opts.bar.fold_after.unwrap_or(crate::view::FOLD_AFTER_DEFAULT),
+        open: &opts.kids_open,
+        // (The agents section opens the families it has room for: [`agents_section`].)
+        kids: KidForm::Fold,
     };
     // Pinned agents move out of their spaces into PINNED (a view already
     // split is laid out as it is). The letters, the client's own card and
@@ -4571,7 +4909,7 @@ pub fn layout(view: &ViewModel, width: u16, height: u16, opts: &Opts) -> Frame {
     // range selection is live ([`Bar::selecting`]) nothing moves: PINNED is
     // not drawn and every pinned agent sits in its space's group, so the
     // selection reads in tab order; PINNED is back once it ends.
-    // The KIDS (abby-delegate children) fold under their parents' cards
+    // The KIDS (external subagents: children of any harness) fold under their parents' cards
     // first ([`ViewModel::kids_split`]: a child is never pinned), and, like
     // the pins, not while the selection wants every tab in its place.
     let kids;
@@ -4692,7 +5030,8 @@ fn sections(view: &ViewModel, frame: &mut Frame, opts: &Opts, cx: Cx) -> usize {
             // the body), and always leaves the agents a row.
             let n1 = needs_block(view, cx, 1).len();
             let floor = (avail / 3).max(2);
-            let room = n1.min(avail.saturating_sub(agents_one_line(view, cx)).max(floor)).min(avail - 1);
+            let one = Cx { kids: KidForm::Strip, ..cx };
+            let room = n1.min(avail.saturating_sub(agents_one_line(view, one)).max(floor)).min(avail - 1);
             let needs = needs_cut(view, cx, room);
             let agents = agents_section(view, cx, avail - needs.len(), false, false);
             (STEPS.len() as u8, false, needs, agents)

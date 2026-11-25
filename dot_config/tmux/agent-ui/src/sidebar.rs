@@ -145,7 +145,7 @@ struct VoidArm {
 }
 
 const USAGE: &str = "usage: agent-ui sidebar [--client <tty>] [--tmux-pane <id>] [--wezterm <path>]
-       agent-ui sidebar --once <W>x<H> [--client <tty>] [--void-armed]
+       agent-ui sidebar --once <W>x<H> [--client <tty>] [--void-armed] [--kids-open <win>[,<win>...]]
        agent-ui sidebar --repair [-v]";
 
 fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
@@ -237,6 +237,10 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
     // (`--void-armed`, for previews: the banner as a first click on its
     // void chip leaves it.)
     let void_armed = args.iter().any(|a| a == "--void-armed");
+    // (`--kids-open @1,@4`, for previews: those parents' families open, as
+    // a click on their chips leaves them.)
+    let kids_open: Vec<String> =
+        arg_after(args, "--kids-open").map(|s| s.split(',').map(str::trim).filter(|w| !w.is_empty()).map(String::from).collect()).unwrap_or_default();
     hide_homes(&mut core.snapshot);
     // Letters as the live sidebar would assign them; `--once` never writes.
     let (mut view, _) = build_view(&mut core, client.as_deref(), None);
@@ -248,7 +252,7 @@ fn once(tmux: Tmux, args: &[String], (w, h): (u16, u16)) -> ExitCode {
     if !crate::insight::disabled() {
         crate::insight::fill(&mut view, &crate::insight::Engine::home().update(&core.snapshot, text::now()));
     }
-    let opts = Opts { msg: None, bar, spin: 0, now: None, pause, void_armed, glow_off };
+    let opts = Opts { msg: None, bar, spin: 0, now: None, pause, void_armed, glow_off, kids_open };
     let frame = layout(&view, w, h, &opts);
     let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
     layout::paint(&frame, &mut buf);
@@ -554,6 +558,10 @@ struct App {
     /// The spaces Mack keeps open by hand ([`fold`]): re-read when the file
     /// changes, toggled by a dormant header's fold chip.
     open: fold::Store,
+    /// The parents whose children this sidebar shows ([`Target::Kids`]: a
+    /// click on a family chip). View state of this sidebar alone, never a
+    /// tmux option: every family starts folded.
+    kids_open: Vec<String>,
 }
 
 /// How many dismissed toast ids a sidebar remembers at most.
@@ -628,6 +636,7 @@ impl App {
             pins: None,
             pin_keys: crate::pins::KeyMemo::default(),
             open,
+            kids_open: Vec::new(),
         }
     }
 
@@ -1029,6 +1038,12 @@ impl App {
                 let row = self.shown.rows.get(y as usize)?;
                 row.targets.iter().map(|(_, _, t)| t).find(|t| matches!(t, Target::Go { .. })).cloned()
             }
+            // A family chip, or a strip's `↳`: the PARENT (the strip's first
+            // Go is its first child's pill).
+            Some(Target::Kids(win)) => {
+                let row = self.shown.rows.get(y as usize)?;
+                row.targets.iter().map(|(_, _, t)| t).find(|t| matches!(t, Target::Go { win: w, .. } if w == win)).cloned()
+            }
             _ => None,
         }
     }
@@ -1153,6 +1168,17 @@ impl App {
         }
         if let Target::Fold(name) = &t {
             self.toggle_fold(name);
+            return;
+        }
+        if let Target::Kids(win) = &t {
+            // A family chip: show or fold that parent's children here (the
+            // next draw lays them out; no tmux call, no other sidebar).
+            match self.kids_open.iter().position(|w| w == win) {
+                Some(k) => {
+                    self.kids_open.remove(k);
+                }
+                None => self.kids_open.push(win.clone()),
+            }
             return;
         }
         if let Target::Toast(id) = t {
@@ -1283,7 +1309,7 @@ impl App {
                 Ok(false)
             }
             Target::Restart | Target::Scope | Target::Fold(_) | Target::Toast(_) | Target::Answer { .. } | Target::Diff(_)
-            | Target::LimitResume(_) => {
+            | Target::LimitResume(_) | Target::Kids(_) => {
                 Ok(false)
             }
         };
@@ -1333,6 +1359,7 @@ impl App {
             pause: self.pause_phase.clone(),
             void_armed: self.void_armed(Instant::now()),
             glow_off: self.glow_off,
+            kids_open: self.kids_open.clone(),
         };
         let frame = layout(&self.view, size.width, size.height, &opts);
         let mut buf = Buffer::empty(Rect::new(0, 0, size.width, size.height));
@@ -1834,6 +1861,29 @@ mod tests {
         assert_eq!(a.card_at(x, y), Some(Target::Go { win: "@1".into(), session: "main".into() }));
         a.handle(format!("\x1b[<2;{};{}M", x + 1, y + 1).as_bytes());
         assert_eq!(a.last_park, Some(("@1".into(), "main".into())));
+    }
+
+    /// A family chip or a strip's `↳` ([`Target::Kids`]): a left press
+    /// opens or folds the family here; a right or middle press acts on the
+    /// PARENT, never on the strip's first child.
+    #[test]
+    fn kids_head_presses_act_on_the_parent() {
+        let mut a = app();
+        let go = |w: &str| Target::Go { win: w.into(), session: "main".into() };
+        // A strip row: the `↳` head, two pills, the row's own (the parent).
+        let strip = crate::sidebar::layout::Row {
+            targets: vec![(3, 6, Target::Kids("@1".into())), (7, 10, go("@2")), (12, 15, go("@3")), (0, 34, go("@1"))],
+            ..Default::default()
+        };
+        a.show(Frame { width: 34, height: 1, rows: vec![strip], ..Frame::default() }, Instant::now() - Duration::from_secs(2));
+        assert_eq!(a.card_at(4, 0), Some(go("@1")), "the head: the parent");
+        assert_eq!(a.card_at(8, 0), Some(go("@2")), "a pill: its child");
+        assert_eq!(a.card_at(20, 0), Some(go("@1")));
+        // A left press on the head opens the family; a second folds it.
+        a.handle(b"\x1b[<0;5;1M");
+        assert_eq!(a.kids_open, ["@1"]);
+        a.handle(b"\x1b[<0;5;1M");
+        assert!(a.kids_open.is_empty());
     }
 
     /// `PARKED N` runs exactly prefix h's line (tmux.conf.tmpl, read when
