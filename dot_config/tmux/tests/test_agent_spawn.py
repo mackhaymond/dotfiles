@@ -242,7 +242,10 @@ class FakeMcp:
                 if body.get("method") == "tools/call":
                     calls.append({"auth": self.headers.get("Authorization"), "pane": self.headers.get("X-Tmux-Pane"),
                                   "name": body["params"]["name"], "args": body["params"]["arguments"]})
-                    res = {"content": [{"type": "text", "text": replies.pop(0) if replies else "delivered"}]}
+                    rp = replies.pop(0) if replies else "delivered"
+                    if isinstance(rp, str):
+                        rp = {"text": rp}
+                    res = {"content": [{"type": "text", "text": rp["text"]}], "isError": rp.get("isError", False)}
                 else:
                     res = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "fake"}}
                 data = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": res}).encode()
@@ -301,7 +304,7 @@ class Live(unittest.TestCase):
         self.fake.mkdir()
         write_exe(self.tmp / "harness.sh", FAKE_HARNESS)
         write_exe(self.tmp / "closed-tabs.sh",
-                  '#!/bin/sh\necho "$@" >> "%s/closed.log"\n[ "$1" = close ] && tmux kill-pane -t "$2"\nexit 0\n' % self.fake)
+                  '#!/bin/sh\necho "$@" >> "%s/closed.log"\ncase "$1" in close|close-family) tmux kill-pane -t "$2" ;; esac\nexit 0\n' % self.fake)
         self.res = self.tmp / "r"
         self.res.mkdir()
         self.tmpdir = self.tmp / "t"
@@ -709,11 +712,44 @@ class Live(unittest.TestCase):
         who = json.loads(self.cli("whoami", "--json", TMUX_PANE=p).stdout)
         self.assertEqual((who["spawn_id"], who["parent"]["window"]), (s, self.pwin))
         self.assertIn("you are subagent %s of @a" % s, self.cli("whoami", TMUX_PANE=p).stdout)
+        # Cancel: marked before the interrupt, so its turn end wakes nobody
+        # and lights no ✓.
+        self.start_turn(w, "p1")
         self.assertEqual(self.cli("cancel", s).returncode, 0)
+        self.assertEqual(self.opt(w, "@agent_spawn_result"), "read")
+        self.end_turn(w, "p1")
+        self.assertEqual(self.cli("_deliver", s).returncode, 0)
+        self.assertEqual(self.mcp.calls, [])
         self.assertEqual(self.cli("wait", s).returncode, 12)
         self.assertEqual(self.cli("close", s).returncode, 0)
         self.assertIn("close %s" % p, (self.fake / "closed.log").read_text())
         self.assertEqual(self.cli("close", s).returncode, 12)
+        # A child with children of its own closes as a family.
+        s3, p3, w3 = self.spawn("--", "has kids")
+        self.setw(w3, **{"@agent_kids_sub": "1 0"})
+        self.assertEqual(self.cli("close", s3).returncode, 0)
+        self.assertIn("close-family %s" % p3, (self.fake / "closed.log").read_text())
+
+    def test_reopened_parent_keeps_its_children_by_session(self):
+        s, p, w = self.spawn("--", "x")
+        m = self.meta(s)
+        m["parent"]["session_id"] = "sid-parent"
+        (self.state / s / "meta.json").write_text(json.dumps(m))
+        # ⌘Z brought the parent back as a new window, same session.
+        np_, nw = self.agent_window()
+        pid = self.tm("display-message", "-p", "-t", np_, "#{pane_pid}").stdout.strip()
+        (self.res / ("claude-%s.json" % pid)).write_text(json.dumps(
+            {"session_id": "sid-parent", "env": {"tmux_pane": np_}}))
+        r = self.cli("result", s, "--json", TMUX_PANE=np_)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.meta(s)["parent"]["window"], self.meta(s)["parent"]["pane"]), (nw, np_))
+        # Another session in that new window is still refused.
+        (self.res / ("claude-%s.json" % pid)).write_text(json.dumps(
+            {"session_id": "sid-other", "env": {"tmux_pane": np_}}))
+        m = self.meta(s)
+        m["parent"]["window"] = self.pwin
+        (self.state / s / "meta.json").write_text(json.dumps(m))
+        self.assertEqual(self.cli("result", s, TMUX_PANE=np_).returncode, 13)
 
     def test_follow_up_without_send_is_its_own_turn(self):
         s, p, w = self.spawn("--", "first")
@@ -744,17 +780,25 @@ class Live(unittest.TestCase):
         s, p, w = self.spawn("--", "x")
         self.start_turn(w, "p1")
         self.end_turn(w, "p1")
-        self.mcp.replies[:] = ["pane %s has no agent session" % self.ppane]
+        self.mcp.replies[:] = [{"text": "pane %s has no agent session" % self.ppane, "isError": True}]
         self.assertEqual(self.cli("_deliver", s, AGENT_SPAWN_RETRY_S="0.1").returncode, 0)
-        self.assertEqual(len(self.mcp.calls), 2)                # refused, then delivered
+        self.assertEqual(len(self.mcp.calls), 2)                # refused (isError), then delivered
         self.assertEqual(list((self.state / "_outbox").glob("*/*.json")), [])
         s2, _, w2 = self.spawn("--", "y")
         self.start_turn(w2, "p1")
         self.end_turn(w2, "p1")
-        self.mcp.replies[:] = ["error: nope"] * 3
+        self.mcp.replies[:] = [{"text": "error: nope", "isError": True}] * 3
         self.cli("_deliver", s2, AGENT_SPAWN_RETRY_S="0.1")
         self.assertEqual(len(self.mcp.calls), 5)                # three tries, then dropped
         self.assertIn("dropped after 3 tries", (self.state / s2 / "events.log").read_text())
+        self.assertEqual(list((self.state / "_outbox").glob("*/*.json")), [])
+        # Success text is never read as a refusal, whatever the handle says.
+        s3, _, w3 = self.spawn("--", "z")
+        self.start_turn(w3, "p1")
+        self.end_turn(w3, "p1")
+        self.mcp.replies[:] = ["sent to @stash-refusal-toast (could not wait: cannot)"]
+        self.cli("_deliver", s3, AGENT_SPAWN_RETRY_S="0.1")
+        self.assertEqual(len(self.mcp.calls), 6)                # once
         self.assertEqual(list((self.state / "_outbox").glob("*/*.json")), [])
 
     def test_birth_failure_takes_the_window_back(self):

@@ -1133,11 +1133,6 @@ def outbox_key(meta):
     return re.sub(r"[^A-Za-z0-9]", "_", "%s-%s" % ((meta.get("server") or {}).get("start_time", ""), p.get("window", "")))
 
 
-# tmux-mcp answers some refusals as plain text, without isError.
-REFUSAL_RE = re.compile(r"has no agent session|is not an agent|not an agent (pane|tab|window)|no such pane"
-                        r"|unknown pane|refus|could not|couldn't|cannot|can't|not delivered|^\s*error", re.I)
-
-
 def enqueue(meta, text):
     d = os.path.join(STATE, "_outbox", outbox_key(meta))
     os.makedirs(d, exist_ok=True)
@@ -1186,11 +1181,12 @@ def flush_outbox(meta):
             hint = next((i["pane"] for _, i in items if i.get("pane") in (rows or {})
                          and rows[i["pane"]]["spawn_id"] == i["id"]), None)
             try:
-                text = mcp_call("message_agent", {"pane": parent["pane"],
-                                                  "message": "\n".join(i["text"] for _, i in items)},
-                                pane_hint=hint)
-                if REFUSAL_RE.search(text or ""):
-                    raise Fail(EXIT_ERR, "refused: " + one_line(text, 200))
+                # Delivered unless tmux-mcp says isError (mcp_call raises): its
+                # success text names the parent's handle and may say anything
+                # (`sent to @stash-refusal-toast`, `held for @x: could not …`).
+                mcp_call("message_agent", {"pane": parent["pane"],
+                                           "message": "\n".join(i["text"] for _, i in items)},
+                         pane_hint=hint)
             except Fail as e:
                 for f, i in items:
                     i["tries"] = i.get("tries", 0) + 1
@@ -1530,10 +1526,27 @@ def caller_of(a):
     return resolve_caller(getattr(a, "parent", None), required=bool(getattr(a, "parent", None)))
 
 
+SESSION_KINDS = ("claude", "codex", "opencode", "grok", "copilot", "agy")
+
+
 def owner_ok(m, c):
-    if c is not None and c[1] != (m.get("parent") or {}).get("window"):
-        raise Fail(EXIT_REFUSED, "%s is not your child (its parent is %s, you are %s)"
-                   % (m["id"], (m.get("parent") or {}).get("window"), c[1]))
+    """The caller's window is the record's parent window; else (⌘Z, an unpark
+    or a snooze wake reopen the parent as a NEW window) its agent session id
+    is the parent's recorded one, and the record moves to the new window."""
+    p = m.get("parent") or {}
+    if c is None or c[1] == p.get("window"):
+        return
+    rec = session_record(c[2], "", SESSION_KINDS)
+    sid = (rec or {}).get("session_id") or ""
+    known = {p.get("session_id")} | {t.get("parent_session_id") for t in m.get("turns") or []}
+    if sid and sid in known:
+        def fn(x):
+            x["parent"].update(window=c[1], pane=c[2])
+        update_meta(m["id"], fn)
+        m["parent"].update(window=c[1], pane=c[2])
+        log_event(m["id"], "parent reopened as %s %s (session %s)" % (c[1], c[2], sid))
+        return
+    raise Fail(EXIT_REFUSED, "%s is not your child (its parent is %s, you are %s)" % (m["id"], p.get("window"), c[1]))
 
 
 def check_owner(m, a):
@@ -1576,10 +1589,13 @@ def close_child(m, tm, row, by="parent"):
         x["closed_at"] = now()
         x["closed_by"] = by
     update_meta(m["id"], fn)
+    # A child with children of its own goes with them (one ⌘Z group).
+    verb = "close-family" if (tm.out("show-options", "-wqv", "-t", row["win"], "@agent_kids_sub") or "").strip() \
+        else "close"
     try:
-        r = subprocess.run(["bash", CLOSED_TABS, "close", row["pane"]], env=tm.env(), capture_output=True,
+        r = subprocess.run(["bash", CLOSED_TABS, verb, row["pane"]], env=tm.env(), capture_output=True,
                            text=True, timeout=60, stdin=subprocess.DEVNULL)
-        log_event(m["id"], "closed by %s (closed-tabs rc %d)" % (by, r.returncode))
+        log_event(m["id"], "closed by %s (closed-tabs %s rc %d)" % (by, verb, r.returncode))
         return r.returncode == 0
     except (OSError, subprocess.SubprocessError) as e:
         log_event(m["id"], "close failed: %s" % e)
@@ -1593,17 +1609,22 @@ def cmd_cancel(a):
     row = child_row(m, rows)
     if row is None:
         raise Fail(EXIT_GONE, "%s's tab is gone" % a.id)
+
+    # Cancelled BEFORE the interrupt: the turn end Escape causes must not
+    # wake the parent ("finished (done)") or light a ✓.
+    def fn(x):
+        x["cancelled_at"] = now()
+        if x.get("turns"):
+            t = x["turns"][-1]
+            t["status"] = "cancelled"
+            t["notified"] = sorted(set(t.get("notified") or []) | {"done", "failed", "cancelled"})
+    update_meta(a.id, fn)
+    log_event(a.id, "cancelled")
+    tm.run("set-option", "-w", "-t", row["win"], "@agent_spawn_result", "read")
     for k, key in enumerate(CANCEL_KEYS.get((m.get("child") or {}).get("kind"), ["Escape"])):
         if k:
             time.sleep(0.3)
         tm.run("send-keys", "-t", row["pane"], key)
-
-    def fn(x):
-        x["cancelled_at"] = now()
-        if x.get("turns"):
-            x["turns"][-1]["status"] = "cancelled"
-    update_meta(a.id, fn)
-    log_event(a.id, "cancelled")
     if a.close:
         close_child(m, tm, row)
     if a.json:
@@ -1695,7 +1716,7 @@ def cmd_deliver(a):
     m, st, state, detail = look(m, row, tm)
     if row is not None and row.get("result") == "read":
         return 0
-    if st not in FINAL:
+    if st not in FINAL or st == "cancelled" or (m.get("turns") or [{}])[-1].get("status") == "cancelled":
         return 0
     # Once per (turn, status): an indicator Stop and the watcher's restore can
     # both fire for one finish.

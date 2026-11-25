@@ -115,10 +115,13 @@ child, so your woken turn ends quietly):
 
 ```
 [agent-spawn] s-mf3k2a7x (codex child %214) 'Review parser diff' finished (done). Run: agent-spawn result s-mf3k2a7x
-[agent-spawn] s-… (claude child %215) 'Docs pass' needs input (<what it waits on>). Run: agent-spawn result s-…
 [agent-spawn] s-… (…) '…' finished (failed: weekly reserve). Run: agent-spawn result s-…
 [agent-spawn] s-… (…) '…' closed while still working. agent-spawn result s-… still works
 ```
+
+A child's **ask does not wake you**: a permission prompt or startup dialog
+shows on YOUR NEEDS YOU card (Mack answers it there), and a `wait` on that
+child returns `needs-input` (exit 10). Nor does a child you cancelled.
 
 Children finishing within ~5 s of each other arrive as one message, one line
 each. Then read the result (`agent-spawn result ID` or `subagent_result`),
@@ -167,11 +170,14 @@ there is. Ignore other dirty paths.
   `message_agent`: send records a new turn, so `wait`, `result` and the wake
   track it. It also clears the child's `✓`.
 - `cancel ID` sends the harness's interrupt (Escape); `--close` also closes it.
-- `close ID` closes the tab through closed-tabs (⌘Z brings it back). Finished
+- `close ID` closes the tab through closed-tabs (⌘Z brings it back), with its
+  own children when it has any (close-family). Finished
   tabs stay open (✓) until you or Mack close them; close a child once its work
   is verified and Mack doesn't need it. The registry keeps every record
   (`~/.local/state/agent-spawn/<id>/`), so `result` works after the close.
-- You act only on your own children (exit 13 otherwise).
+- You act only on your own children (exit 13 otherwise). After ⌘Z, an unpark
+  or a snooze wake you are a new tab; your children still count as yours by
+  your session id.
 
 ## Limits and refusals (exit 13)
 
@@ -201,7 +207,8 @@ there is. Ignore other dirty paths.
   unread, and never when you closed it yourself or you close in the same
   batch (a space close). If your agent exits, your children
   are cut loose (orphans, `↳ (parent gone)`); closing you by hand asks Mack
-  what to do with them; parking or snoozing you takes them along.
+  what to do with them; parking or snoozing you takes them along, and a
+  working child refuses the whole park (as a busy parent does).
 
 ## When you are the child
 
