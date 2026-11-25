@@ -83,6 +83,31 @@ agent is the same text message as for the others, with no signal sent. A working
 neither is reported as "no agent pane", on the key's message line and in
 `dry-run`.
 
+### External subagents
+
+A child tab opened by `agent-spawn` (agent-tab-indicator.md §8, "External
+subagents") is an agent window of its own, so the rule above applies to it
+as is. What changes is its parent (plan §2.5, "Pause all"):
+
+| window | pause press |
+|---|---|
+| a working child (`@agent_child` set) | paused like any working agent, alone or with its family; its saved target also records `parent` (the live parent's window id) for the log |
+| a parent running a turn of its own | paused as usual; its busy children are working agents too, so they are paused with it |
+| a parent held ONLY by its children: `@agent_kids_hold` set, a busy child (`@agent_kids_sub`'s second number, else `@agent_kids`'), no `@agent_cua` | **not** paused. Its own turn is over (the Stop was held for the children), so its `running` and its gear are the hold, and a PAUSE would land as a new prompt on a finished turn. Its busy children get the PAUSE instead; once every busy child is paused, the watcher's PAUSED DRAIN shows the parent `paused` |
+| a child that asks (`needs-input`) | not working, as for any agent; it is the parent's ask |
+
+`held_by_kids` in the script is that third row; `dry-run` lists such a parent
+under "skipped, not working" as `held by N subagents`, so the dry run stays
+the safe way to check who would be told. The RESUME goes to the saved set,
+so it mirrors the pause: the children come back, the held parent is never
+messaged, and the watcher puts it back to `running` as soon as a child runs
+again. Pausing one child alone (a rate-limited child, say) touches nothing
+else in its family.
+
+One limit: `@agent_workflow` is one gear for a native background workflow
+and for busy children, so a held parent that ALSO has a native workflow out
+is not messaged either; its children still are.
+
 ## Messages and delivery
 
 Delivery goes through tmux-mcp's `message_agent` tool, with `raw: true` and its

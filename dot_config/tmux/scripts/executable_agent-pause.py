@@ -38,6 +38,14 @@ Anything else (idle, done, needs-input, failed with neither flag) is not
 working. needs-input is blocked on Mack already, and tmux-mcp would only hold
 a message behind its dialog.
 
+EXTERNAL SUBAGENTS (agent-spawn child tabs; docs "External subagents"): a
+child is paused like any working agent, alone or with its family. A parent
+held only by its children (@agent_kids_hold, a busy child, no cua) is NOT
+working: its turn is over, so it gets no PAUSE; its busy children do, and the
+watcher then shows it `paused`. RESUME goes to the saved set, so it mirrors:
+the children, never that parent. A parent running a turn of its own is
+paused as usual, and its busy children with it.
+
 THE AGENT PANE in a window is the one tmux-mcp itself knows as an agent: a
 live claude-<pid>.json / codex-<pid>.json / opencode-<pid>.json /
 grok-<pid>.json / copilot-<pid>.json / agy-<pid>.json record in
@@ -299,10 +307,15 @@ def cmd_kind(cmd):
 US = "\x1f"
 # @agent_summary is free text, so it goes LAST and the split is bounded.
 # @agent_limit is "<resets_at> <type> <since>" (RATE LIMITS): no separator in it.
+# The kids fields (external subagents, docs/agent-tab-indicator.md §8):
+# @agent_child (a live parent's child), @agent_kids_hold (a parent whose Stop
+# is held for busy children), @agent_kids_sub / @agent_kids ("<total> <busy>").
 PANE_FIELDS = ("pane_id", "window_id", "session_name", "window_index", "pane_index",
                "pane_pid", "pane_current_command", "pane_active", "@agent_state",
                "@agent_workflow", "@agent_cua", "@agent_kind", "@agent_paused",
-               "@agent_limit", "@agent_limit_lifted", "@agent_pause_voided", "@agent_summary")
+               "@agent_limit", "@agent_limit_lifted", "@agent_pause_voided",
+               "@agent_child", "@agent_kids_hold", "@agent_kids_sub", "@agent_kids",
+               "@agent_summary")
 PANE_FMT = US.join("#{%s}" % f for f in PANE_FIELDS)
 DISPLAY_MS = "6000"
 # Messages go through notify.sh: a toast in the agent-ui sidebar when one
@@ -583,6 +596,27 @@ def working_reasons(row):
     return why
 
 
+def kids_busy(row):
+    """The busy count of a parent's own subtree: @agent_kids_sub's second
+    number, else the root-only @agent_kids'; 0 when neither parses."""
+    for f in ("agent_kids_sub", "agent_kids"):
+        parts = (row.get(f) or "").split()
+        if len(parts) == 2 and parts[1].isdigit():
+            return int(parts[1])
+    return 0
+
+
+def held_by_kids(row):
+    """A parent held ONLY by its external subagents (docs/agent-pause.md,
+    "External subagents"): its own turn is over (@agent_kids_hold: the Stop
+    was held for busy children), some child is still busy, and it drives no
+    app. Its `running` and its gear are the hold, not work of its own, so a
+    PAUSE would land as a new prompt on a finished turn; its busy children are
+    paused instead (each is a working agent of its own), and the watcher's
+    PAUSED DRAIN then shows the parent `paused`."""
+    return bool(row.get("agent_kids_hold")) and kids_busy(row) > 0 and not row.get("agent_cua")
+
+
 def label_of(row):
     return (row["agent_summary"].strip() or row["pane_current_command"] or row["pane_id"])
 
@@ -641,6 +675,13 @@ def scan(panes, recs):
         if not (head["agent_state"] or head["agent_kind"] or any(r["pane_id"] in recs for r in rows)):
             continue   # not an agent window at all
         why = working_reasons(head)
+        if why and held_by_kids(head):
+            # Not working itself: its busy children are (and are targets).
+            n = kids_busy(head)
+            idle.append({"window_id": wid, "location": head["location"],
+                         "state": "held by %d subagent%s" % (n, "" if n == 1 else "s"),
+                         "label": label_of(head)})
+            continue
         if not why:
             idle.append({"window_id": wid, "location": head["location"],
                          "state": head["agent_state"] or "(no state)", "label": label_of(head)})
@@ -651,6 +692,10 @@ def scan(panes, recs):
                                  "why": "+".join(why), "label": label_of(head)})
             continue
         t = dict(agent_target(pick, head, recs), why="+".join(why), found_by=how)
+        if head.get("agent_child"):
+            # An external subagent: paused as itself (alone, or because its
+            # parent's family is paused); its live parent, for the log.
+            t["parent"] = head["agent_child"]
         if head.get("agent_pause_voided") and head["agent_paused"].isdigit():
             # Still paused from a voided set (its workflow or cua is out):
             # a PAUSE this agent does not take must leave it so (finish_pause).

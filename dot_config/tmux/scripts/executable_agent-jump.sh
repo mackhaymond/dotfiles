@@ -19,9 +19,10 @@
 # LIST FORMAT v1: win_id<TAB>session<TAB>index<TAB>state<TAB>since_epoch<TAB>label (columns only ever appended)
 #   one row per window, best first; since_epoch is 9999999999 when unstamped;
 #   label is @agent_summary, else the window name, with tabs turned to spaces.
-#   A delegated child (@agent_child) that asks (needs-input or failed) is a
-#   row with its own id/session/index/state/stamp and its PARENT's label; a
-#   finished child has no row (see list_needs).
+#   A delegated child (@agent_child) never has a row of its own: one that
+#   asks (needs-input or failed) is its ROOT parent's row, with the child's
+#   id/session/index/state/stamp (the jump lands on the child's pane) and the
+#   root's label; a finished child has no row (see list_needs).
 #
 # JUMP EXIT CODES (only `jump` uses them; next/back/goto always exit 0
 # because tmux's run-shell turns a nonzero exit into a "returned N" view-mode
@@ -206,9 +207,12 @@ say() {
     fi
 }
 
-# DELEGATED CHILDREN (docs/agent-tab-indicator.md, "Delegated children"): a
-# window with @agent_child set (abby-delegate's tab, its parent live) is never
-# a row of its own kind. EVERY such child that is asking (needs-input or
+# DELEGATED CHILDREN (docs/agent-tab-indicator.md §8, "External subagents"): a
+# window with @agent_child set (an agent-spawn child, its parent live) is never
+# a row of its own kind: no own card, no own ⌥S entry (Mack, 2026-11-23: its
+# ask goes through the parent, like a native subagent's). That row is the
+# PARENT's card, titled by the root, landing on the child's pane where the
+# prompt is. EVERY such child that is asking (needs-input or
 # failed, its own state as it is now) is one row: the CHILD's window id,
 # session, index, state and stamp (the jump lands where the prompt is), and
 # its ROOT's label: @agent_child names the immediate parent, walked up while

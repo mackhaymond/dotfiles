@@ -504,8 +504,27 @@ set -g @catppuccin_window_current_color "#{?#{@stash_sel},#11111b,#{?#{@agent_ch
 # checker reads the hex from the @agent_limit_fg line: change both or neither.
 set -g @agent_limit_fg "#fab387"
 set -g @agent_limit_glyph "󱎫"
-set -g @catppuccin_window_default_text "#{?#{@agent_child},#[fg=#{?#{@stash_sel},#11111b,#6c7086}]↳ #[fg=#{?#{@stash_sel},#11111b,#cdd6f4}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W},#{?#{&&:#{@agent_kids_ask},#{!:#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}}},#{?#{@agent_workflow},#[fg=#11111b]󰒓 ,}#[fg=#11111b]#{?#{n:#{@agent_summary}},#{@agent_summary},#W},#{?#{@agent_workflow},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_blink},#94e2d5,#659a91}}]󰒓 ,#{?#{&&:#{@agent_limit},#{||:#{==:#{@agent_state},paused},#{==:#{@agent_state},idle}}},#[fg=#{?#{@stash_sel},#11111b,#{@agent_limit_fg}}]#{@agent_limit_glyph} ,#{?#{==:#{@agent_state},paused},#[fg=#{?#{@stash_sel},#11111b,#7f6bff}]⏸ ,#{?#{@agent_cua},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{==:#{@agent_state},done},#11111b,#{?#{@agent_blink},#89b4fa,#5d7aaa}}}]󰍽 ,}}}}#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}}}"
-set -g @catppuccin_window_current_text "#{?#{@agent_child},#[fg=#{?#{@stash_sel},#11111b,#6c7086}]↳ #[fg=#{?#{@stash_sel},#11111b,#cdd6f4}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W},#{?#{&&:#{@agent_kids_ask},#{!:#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}}},#{?#{@agent_workflow},#[fg=#11111b]󰒓 ,}#[fg=#11111b]#{?#{n:#{@agent_summary}},#{@agent_summary},#W},#{?#{@agent_workflow},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_blink},#94e2d5,#659a91}}]󰒓 ,#{?#{&&:#{@agent_limit},#{||:#{==:#{@agent_state},paused},#{==:#{@agent_state},idle}}},#[fg=#{?#{@stash_sel},#11111b,#{@agent_limit_fg}}]#{@agent_limit_glyph} ,#{?#{==:#{@agent_state},paused},#[fg=#{?#{@stash_sel},#11111b,#7f6bff}]⏸ ,#{?#{@agent_cua},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{==:#{@agent_state},done},#11111b,#{?#{@agent_blink},#89b4fa,#5d7aaa}}}]󰍽 ,}}}}#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}}}"
+#
+# EXTERNAL SUBAGENTS (docs/agent-tab-indicator.md §8; Mack, 2026-11-23). A
+# child tab (@agent_child) is not drawn: the wrapper below the tpm line
+# renders nothing for it unless it is the current window (or under the stash
+# tint), and its index still exists. Its parent carries the
+# family instead: " ↳3" after the label, 3 = the total of its own subtree
+# (@agent_kids_sub "<total> <busy>", else the root-only @agent_kids), and
+# " ↳3?" while @agent_kids_ask names an asking or failed descendant. The ask's
+# colour stays where it was (the yellow/red body tint above); the mark adds no
+# tint and never pulses. Ink: crust on every tinted body (the same dark-ink
+# test as the label: @stash_sel, an ask, needs-*/failed, a green done with no
+# workflow), grey #6c7086 (the child ↳'s grey) otherwise; a child's body is
+# never tinted, so on a child it is grey but for @stash_sel. Both _text
+# formats end BOTH branches with #{E:@agent_kids_tab} (an intermediate child
+# drawn while current shows its own subtree's ↳N), so this is the one
+# place it is defined (catppuccin's batch reader never sees it; it is expanded
+# per window). It tests no new @agent_state, so cua-notch check-invariants §65
+# has nothing new to pair.
+set -g @agent_kids_tab "#{?#{||:#{@agent_kids_sub},#{@agent_kids}},#[fg=#{?#{@stash_sel},#11111b,#{?#{@agent_child},#6c7086,#{?#{||:#{@agent_kids_ask},#{||:#{m:needs-*,#{@agent_state}},#{||:#{==:#{@agent_state},failed},#{&&:#{==:#{@agent_state},done},#{!:#{@agent_workflow}}}}}},#11111b,#6c7086}}}] ↳#{?#{@agent_kids_sub},#{s/[^0-9].*//:@agent_kids_sub},#{s/[^0-9].*//:@agent_kids}}#{?#{@agent_kids_ask},?,},}"
+set -g @catppuccin_window_default_text "#{?#{@agent_child},#[fg=#{?#{@stash_sel},#11111b,#6c7086}]↳ #[fg=#{?#{@stash_sel},#11111b,#cdd6f4}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}#{E:@agent_kids_tab},#{?#{&&:#{@agent_kids_ask},#{!:#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}}},#{?#{@agent_workflow},#[fg=#11111b]󰒓 ,}#[fg=#11111b]#{?#{n:#{@agent_summary}},#{@agent_summary},#W},#{?#{@agent_workflow},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_blink},#94e2d5,#659a91}}]󰒓 ,#{?#{&&:#{@agent_limit},#{||:#{==:#{@agent_state},paused},#{==:#{@agent_state},idle}}},#[fg=#{?#{@stash_sel},#11111b,#{@agent_limit_fg}}]#{@agent_limit_glyph} ,#{?#{==:#{@agent_state},paused},#[fg=#{?#{@stash_sel},#11111b,#7f6bff}]⏸ ,#{?#{@agent_cua},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{==:#{@agent_state},done},#11111b,#{?#{@agent_blink},#89b4fa,#5d7aaa}}}]󰍽 ,}}}}#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}}#{E:@agent_kids_tab}}"
+set -g @catppuccin_window_current_text "#{?#{@agent_child},#[fg=#{?#{@stash_sel},#11111b,#6c7086}]↳ #[fg=#{?#{@stash_sel},#11111b,#cdd6f4}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}#{E:@agent_kids_tab},#{?#{&&:#{@agent_kids_ask},#{!:#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}}},#{?#{@agent_workflow},#[fg=#11111b]󰒓 ,}#[fg=#11111b]#{?#{n:#{@agent_summary}},#{@agent_summary},#W},#{?#{@agent_workflow},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_blink},#94e2d5,#659a91}}]󰒓 ,#{?#{&&:#{@agent_limit},#{||:#{==:#{@agent_state},paused},#{==:#{@agent_state},idle}}},#[fg=#{?#{@stash_sel},#11111b,#{@agent_limit_fg}}]#{@agent_limit_glyph} ,#{?#{==:#{@agent_state},paused},#[fg=#{?#{@stash_sel},#11111b,#7f6bff}]⏸ ,#{?#{@agent_cua},#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{==:#{@agent_state},done},#11111b,#{?#{@agent_blink},#89b4fa,#5d7aaa}}}]󰍽 ,}}}}#[fg=#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}}#{E:@agent_kids_tab}}"
 # end catppuccin
 
 # Agent tab indicator runtime: presence/GC watcher daemon (singleton), and
@@ -976,6 +995,30 @@ run '~/.tmux/plugins/tpm/tpm'
 # state owns the tab colors; bell monitoring remains enabled.
 set -gw window-status-bell-style default
 set -gw window-status-activity-style default
+
+# Child tabs are not drawn (EXTERNAL SUBAGENTS, at the _text formats above;
+# docs/agent-tab-indicator.md §8). After tpm, because catppuccin builds
+# window-status-format / -current-format while tpm sources it: its two
+# strings are kept as they are in @agent_tab_default / @agent_tab_current
+# (set -F reads an option's value, it does not expand it), and each format
+# becomes "nothing for a child, else catppuccin's tab". #{E:} expands the kept
+# string in the window's own context, so no comma of catppuccin's needs
+# escaping. A child is drawn while it IS the current window (the current
+# format is never wrapped): a jump onto a child's ask (NEEDS YOU, ⌥S, a kid
+# row) must land on a highlighted tab. A child under the stash range tint
+# (@stash_sel, prefix v) is drawn too: "about to be parked" must show on
+# everything it covers. The guard
+# keeps a reload whose tpm did not rebuild the formats from capturing the
+# wrapper itself. The window-status-separator is empty (catppuccin's
+# default), so a hidden tab leaves no gap; spaces.conf's own tab line skips
+# every agent already and its stash-selection line goes through these same
+# formats.
+if -F '#{!:#{m:*@agent_tab_*,#{window-status-format}}}' {
+  set -gF @agent_tab_default '#{window-status-format}'
+  set -gF @agent_tab_current '#{window-status-current-format}'
+}
+set -gw window-status-format '#{?#{&&:#{@agent_child},#{!:#{@stash_sel}}},,#{E:@agent_tab_default}}'
+set -gw window-status-current-format '#{E:@agent_tab_current}'
 
 # After tpm, because catppuccin builds status-right while tpm sources it — this
 # prepends the stash indicator to the left end of it. See the script for why it

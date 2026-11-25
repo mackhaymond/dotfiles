@@ -185,18 +185,23 @@ VISIBLE=0
 render() {
   local out
   out="$(t display-message -p -t "$PANE" "S${US}#{pane_id}${US}#{session_name}${US}#{session_path}${US}#{@space_color}${US}#{@space_key}${US}#{pane_width}${US}#{pane_height}${US}#{&&:#{session_attached},#{window_active}}${US}#{?window_zoomed_flag,0,#{window_height}}" \
-    ";" list-windows -t "$PANE" -F "W${US}#{?#{&&:#{@agent_paused},#{m/r:^(done|idle)$,#{@agent_state}}},paused,#{@agent_state}}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_key}${US}#{@agent_summary}${US}#{window_name}${US}#{@agent_detail}" \
+    ";" list-windows -t "$PANE" -F "W${US}#{?#{&&:#{@agent_paused},#{m/r:^(done|idle)$,#{@agent_state}}},paused,#{@agent_state}}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_key}${US}#{@agent_summary}${US}#{window_name}${US}#{window_id}${US}#{@agent_child}${US}#{@agent_detail}" \
     ";" list-windows -t "=stash" -F "P${US}#{@stash_origin}" 2>/dev/null)"
   [[ -n "$out" ]] || return 1
-  local kind me="" name="" path="" color="" key="" H=9 WH=0 a b c d e f g h
-  local -a A_STATE=() A_WF=() A_CUA=() A_KEY=() A_LABEL=() A_DETAIL=()
+  # W rows: the window id and @agent_child (its live parent's id: an
+  # external subagent, docs/agent-tab-indicator.md §8) ride BEFORE the free-
+  # text detail, so the read's last variable (j) still soaks up a detail that
+  # holds the separator itself.
+  local kind me="" name="" path="" color="" key="" H=9 WH=0 a b c d e f g h i j
+  local -a A_STATE=() A_WF=() A_CUA=() A_KEY=() A_LABEL=() A_DETAIL=() A_WID=() A_UP=()
   local shells=0 parked=0 origins=()
-  while IFS="$US" read -r kind a b c d e f g h; do
+  while IFS="$US" read -r kind a b c d e f g h i j; do
     case "$kind" in
-      S) IFS="$US" read -r me name path color key W H VISIBLE WH <<<"$a$US$b$US$c$US$d$US$e$US$f$US$g$US$h" ;;
+      S) IFS="$US" read -r me name path color key W H VISIBLE WH <<<"$a$US$b$US$c$US$d$US$e$US$f$US$g$US$h$US$i" ;;
       W)
         if [[ -n "$a" ]]; then
-          A_STATE+=("$a") A_WF+=("$b") A_CUA+=("$c") A_KEY+=("$d") A_LABEL+=("${e:-$f}") A_DETAIL+=("$g${h:+ $h}")
+          A_STATE+=("$a") A_WF+=("$b") A_CUA+=("$c") A_KEY+=("$d") A_LABEL+=("${e:-$f}")
+          A_WID+=("$g") A_UP+=("$h") A_DETAIL+=("$i${j:+ $j}")
         else
           shells=$((shells + 1))
         fi
@@ -223,6 +228,41 @@ render() {
   [[ "$shown" == "$HOME" ]] && shown="~"
   [[ "$shown" == "$HOME/"* ]] && shown="~/${shown#"$HOME"/}"
   [[ "$VISIBLE" == 1 || "$G_DIR" != "$path" ]] && git_info "$path"
+
+  # The agent lines' order: each agent, then its children right under it,
+  # depth first (a child's @agent_child names a window listed here). A child
+  # whose parent is not in this space is drawn as an agent of its own. A loop
+  # (which the reconcile never writes) has no top: the last pass starts it at
+  # its first window, drawn and counted as an agent, the rest nested under
+  # it. Children are folded into the count as the roster folds them: "2
+  # agents" are the tops, the children ride under them. Bash 3.2: no
+  # associative arrays.
+  local -a ORD=() DEP=() PLACED=()
+  local n=${#A_STATE[@]} i jj tops=0
+  for ((i = 0; i < n; i++)); do PLACED[i]=0; done
+  dash_tree() {
+    local at=$1 d=$2 k
+    ((PLACED[at])) && return 0
+    PLACED[at]=1 ORD+=("$at") DEP+=("$d")
+    for ((k = 0; k < n; k++)); do
+      [[ -n "${A_UP[k]}" && "${A_UP[k]}" == "${A_WID[at]}" ]] && dash_tree "$k" $((d + 1))
+    done
+    return 0
+  }
+  for ((i = 0; i < n; i++)); do
+    local up="${A_UP[i]}" found=0
+    if [[ -n "$up" ]]; then
+      for ((jj = 0; jj < n; jj++)); do
+        ((jj != i)) && [[ "${A_WID[jj]}" == "$up" ]] && { found=1; break; }
+      done
+    fi
+    ((found)) && continue
+    tops=$((tops + 1))
+    dash_tree "$i" 0
+  done
+  for ((i = 0; i < n; i++)); do
+    ((PLACED[i])) || { tops=$((tops + 1)); dash_tree "$i" 0; }
+  done
 
   FRAME=()
   # Rows 1-3: the name, large (or plain and bold when the pane is too narrow
@@ -253,10 +293,10 @@ render() {
         fi
         ;;
       2)
-        local n=${#A_STATE[@]} sa=s ss=s
-        ((n == 1)) && sa=""
+        local sa=s ss=s
+        ((tops == 1)) && sa=""
         ((shells == 1)) && ss=""
-        seg "$C_TEXT" "$n"; seg "$C_DIM" " agent$sa · "
+        seg "$C_TEXT" "$tops"; seg "$C_DIM" " agent$sa · "
         seg "$C_TEXT" "$shells"; seg "$C_DIM" " shell$ss · "
         seg "$C_TEXT" "$parked"; seg "$C_DIM" " parked"
         ;;
@@ -264,18 +304,27 @@ render() {
     emit
   done
   # Then one line per agent (⌥W and its letter reach it), as many as fit above
-  # the hint row; a last "+N more" when they do not.
-  local rows=$((H - 5)) n=${#A_STATE[@]} i st glyph gc kw=1 pk
+  # the hint row; a last "+N more" when they do not. A child (no letter of
+  # its own) sits under its parent: its key column blank, then "↳ " indented
+  # two more cells per level past the first (capped at 2, as the sidebar).
+  local rows=$((H - 5)) st glyph gc kw=1 pk o dep
   ((rows < 0)) && rows=0
-  for ((i = 0; i < n; i++)); do ((${#A_KEY[i]} > kw)) && kw=${#A_KEY[i]}; done
+  # The key column is as wide as the widest TOP row's key (an overflow `;a`
+  # is two cells); a child never shows one, so a stale key on it is ignored.
+  for ((o = 0; o < n; o++)); do
+    ((DEP[o])) && continue
+    i=${ORD[o]}
+    ((${#A_KEY[i]} > kw)) && kw=${#A_KEY[i]}
+  done
   LINE="" LW=0; emit
   if ((n == 0)); then
     ((rows)) && { seg "" "  "; seg "$C_DIM" "no agents here · ⌘R starts one"; emit; rows=$((rows - 1)); }
   fi
-  for ((i = 0; i < n && rows > 0; i++)); do
-    if ((rows == 1 && i < n - 1)); then
-      seg "" "  "; seg "$C_DIM" "+$((n - i)) more"; emit; rows=0; break
+  for ((o = 0; o < n && rows > 0; o++)); do
+    if ((rows == 1 && o < n - 1)); then
+      seg "" "  "; seg "$C_DIM" "+$((n - o)) more"; emit; rows=0; break
     fi
+    i=${ORD[o]} dep=${DEP[o]}
     st="${A_STATE[i]}"
     if [[ "$st" == failed ]]; then glyph="✕" gc="$C_RED"
     elif [[ "$st" == needs-* ]]; then glyph="◉" gc="$C_YEL"
@@ -286,8 +335,16 @@ render() {
     seg "" "  "; seg "$gc" "$glyph"; seg "" " "
     # (Padded to the widest key here: an overflow `;a` is two cells.)
     printf -v pk '%-*s' "$kw" "${A_KEY[i]}"
-    if [[ -n "${A_KEY[i]}" ]]; then seg "$C_SPACE" "$pk"; else seg "" "$pk"; fi
-    seg "" "  "; seg "$C_TEXT" "${A_LABEL[i]//$'\t'/ }"
+    if ((dep)); then
+      printf -v pk '%-*s' "$kw" ""
+      seg "" "$pk"; seg "" "  "
+      ((dep > 1)) && seg "" "  "
+      seg "$C_DIM" "↳ "
+    else
+      if [[ -n "${A_KEY[i]}" ]]; then seg "$C_SPACE" "$pk"; else seg "" "$pk"; fi
+      seg "" "  "
+    fi
+    seg "$C_TEXT" "${A_LABEL[i]//$'\t'/ }"
     [[ -n "${A_DETAIL[i]}" ]] && { seg "" "  "; seg "$C_DIM" "${A_DETAIL[i]//$'\t'/ }"; }
     emit
     rows=$((rows - 1))

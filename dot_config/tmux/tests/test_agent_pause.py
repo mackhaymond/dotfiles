@@ -1090,6 +1090,60 @@ class PauseKey(Harness):
         self.assertIn("paused since", self.run_script("status").stdout)
         self.assertEqual(len(self.stub.calls), 1)       # only the press sent anything
 
+    # -- external subagents (docs "External subagents") -------------------
+    def family(self, parent_state, held):
+        """A parent with a running child, an asking child and a finished
+        one -> (parent pane, parent window id, running child, asking child)."""
+        parent = self.window(parent_state, workflow="1")
+        pwin = self.t("display", "-p", "-t", parent, "#{window_id}")
+        self.t("set", "-w", "-t", parent, "@agent_kids_sub", "3 2")
+        self.t("set", "-w", "-t", parent, "@agent_kids", "3 2")
+        if held:
+            self.t("set", "-w", "-t", parent, "@agent_kids_hold", "1")
+        run = self.window("running")
+        ask = self.window("needs-input")
+        fin = self.window("idle")
+        for k in (run, ask, fin):
+            self.t("set", "-w", "-t", k, "@agent_child", pwin)
+        return parent, pwin, run, ask
+
+    def test_a_parent_held_only_by_its_children_pauses_them_not_itself(self):
+        parent, pwin, run, ask = self.family("running", held=True)
+        r = self.run_script("dry-run")
+        self.assertIn("would pause 1:", r.stdout)
+        self.assertIn(run, r.stdout)
+        self.assertIn("held by 2 subagents", r.stdout)
+        self.assertEqual(self.stub.methods, [])
+        self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [run])          # never the parent, never the ask
+        st = self.state()
+        self.assertEqual([(t["pane_id"], t.get("parent")) for t in st["targets"]], [(run, pwin)])
+        self.assertEqual(self.t("display", "-p", "-t", parent, "#{@agent_paused}"), "")
+        # The drain: the watcher shows the held parent paused; resume mirrors.
+        self.t("set", "-w", "-t", parent, "@agent_state", "paused")
+        self.press()
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), [run])
+        self.assertIsNone(self.state())
+
+    def test_a_parent_with_a_turn_of_its_own_is_paused_with_its_children(self):
+        parent, _, run, ask = self.family("running", held=False)
+        self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), sorted([parent, run]))
+        self.press()
+        self.assertEqual(self.stub.panes(AP.RESUME_MSG), sorted([parent, run]))
+
+    def test_a_held_parent_driving_an_app_is_still_working(self):
+        parent, _, run, _ = self.family("running", held=True)
+        self.t("set", "-w", "-t", parent, "@agent_cua", "Safari")
+        self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), sorted([parent, run]))
+
+    def test_pausing_a_child_alone_touches_no_one_else(self):
+        parent, _, run, _ = self.family("idle", held=False)
+        self.t("set", "-wu", "-t", parent, "@agent_workflow")      # nothing of its own out
+        self.press()
+        self.assertEqual(self.stub.panes(AP.PAUSE_MSG), [run])
+
 
 @unittest.skipUnless(TMUX, "tmux not installed")
 class Popup(Harness):

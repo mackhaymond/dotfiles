@@ -319,8 +319,11 @@ def needs_order(windows):
         key = (tier, int(stamp), xfrm(s), len(s), xfrm(ix), len(ix), xfrm(line), len(line))
         keyed.append((key, w))
 
-    # DELEGATED CHILDREN: every asking child (@agent_child set, needs-input
-    # or failed by its own state) is a row under its ROOT's label: up the
+    # DELEGATED CHILDREN (docs/agent-tab-indicator.md §8): a child never has
+    # a row of its own (Mack, 2026-11-23: its ask goes through the parent).
+    # Every asking child (@agent_child set, needs-input or failed by its own
+    # state) is the PARENT's row - the child's id, so the jump lands on its
+    # pane - under its ROOT's label: up the
     # @agent_child chain (agent-jump.sh's walk: stops at a window that is no
     # child; a loop back to the child or past 32 hops - like a missing root
     # row - gives its own label); a finished child has none.

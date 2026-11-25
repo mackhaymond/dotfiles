@@ -24,6 +24,8 @@
 #                  @agent_key of some window of a VISIBLE session (not
 #                  @space_hidden, not named in @space_hidden_sessions) that is
 #                  not a home (@space_home unset), i.e. an agent or a shell.
+#                  Not a child tab either (@agent_child, @agent_parent or
+#                  @agent_spawn_id): subagents get no letter.
 #                  An overflow key (`;a`, ...) alone is no trigger: a window
 #                  keeps its key for life, so one can outlast the shortage.
 # Within the 4 hours a tick is one tmux call (for the use log) and exits.
@@ -174,8 +176,12 @@ fi
 # visible sessions): `held` distinct single letters a-z, `overflow` windows on
 # a 2-char `;x` key. Exhausted only while all 26 singles are held.
 US=$'\x1f'
+# An external subagent holds no letter (docs/agent-tab-indicator.md §8,
+# "Letters"): the allocator skips a window with @agent_child, the raw
+# @agent_parent or @agent_spawn_id, and a key one still carries is free. Such
+# a window is folded into the first field as if hidden, so it never counts.
 held=0 seen="" overflow=0
-rows=$(t list-windows -a -F "#{?#{||:#{@space_hidden},#{m:* #{session_name} *, #{@space_hidden_sessions} }},1,0}${US}#{@space_home}${US}#{@agent_key}" 2>/dev/null)
+rows=$(t list-windows -a -F "#{?#{||:#{@space_hidden},#{||:#{m:* #{session_name} *, #{@space_hidden_sessions} },#{||:#{@agent_child},#{||:#{@agent_parent},#{@agent_spawn_id}}}}},1,0}${US}#{@space_home}${US}#{@agent_key}" 2>/dev/null)
 while IFS= read -r row; do
     [ -z "$row" ] && continue
     hidden=${row%%"$US"*}

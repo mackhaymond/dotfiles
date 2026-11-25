@@ -44,7 +44,8 @@ is_valid_session_name() {
 # while @agent_workflow is set — that tab renders untinted) > in flight (pink:
 # running, a workflow, or driving an app) > idle. Paused (`paused`, or done/
 # idle with the pause key's @agent_paused flag, folded in the format) ranks
-# with idle, never as needing you (docs/agent-pause.md). One list-windows for all
+# with idle, never as needing you (docs/agent-pause.md). A child tab
+# (@agent_child) counts only while it asks or failed. One list-windows for all
 # sessions; fields split on US because an empty option must stay a field.
 decorate() {
   local us=$'\x1f'
@@ -52,7 +53,7 @@ decorate() {
   # EMPTY, NR == FNR then holds for the session list too, every row was
   # swallowed into d[] and the picker showed nothing at all.
   awk -F '\t' 'FILENAME == ARGV[1] { d[$1] = $2; next } { print $1 "\t" d[$1] }' \
-    <(tmux list-windows -a -F "#{session_name}${us}#{?#{&&:#{@agent_paused},#{m/r:^(done|idle)$,#{@agent_state}}},paused,#{@agent_state}}${us}#{@agent_workflow}${us}#{@agent_cua}" 2>/dev/null |
+    <(tmux list-windows -a -F "#{session_name}${us}#{?#{&&:#{@agent_paused},#{m/r:^(done|idle)$,#{@agent_state}}},paused,#{@agent_state}}${us}#{@agent_workflow}${us}#{@agent_cua}${us}#{@agent_child}" 2>/dev/null |
       awk -F "$us" '
         function rank(st, wf, cua) {
           if (st == "failed") return 0
@@ -65,6 +66,10 @@ decorate() {
         {
           r = rank($2, $3, $4)
           if (r == 9) next
+          # An external subagent (@agent_child: its parent is live;
+          # docs/agent-tab-indicator.md §8) is folded into its parent, whose
+          # gear already counts its work: counted only while it asks or failed.
+          if ($5 != "" && r > 1) next
           seen[$1] = 1
           if (!($1 in best) || r < best[$1]) best[$1] = r
           if (r <= 2) need[$1]++

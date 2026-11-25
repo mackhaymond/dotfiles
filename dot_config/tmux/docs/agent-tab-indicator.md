@@ -157,7 +157,7 @@ payload on stdin. Hook processes are children of the agent, so
 |---|---|
 | `SessionStart` | `idle` (skips `source=compact` — fires mid-turn; a fresh session shows `project/New Session` until the first turn titles it) |
 | `UserPromptSubmit` | `running` |
-| `PostToolUse`, `PostToolUseFailure` | `heartbeat` (re-arms `running` *only* from `running`/`failed`/`needs-input`, or idle + `@agent_pending`, so a late tool call can't resurrect a finished tab — never from `paused`; from `needs-input` only for the agent that asked, from `failed` only for the main agent — see **Asker gate** below; never parses stdin — `tool_response` can be huge — and peeks at its first 8 KB only while the window is `needs-input` or `failed`) |
+| `PostToolUse`, `PostToolUseFailure` | `heartbeat` (re-arms `running` *only* from `running`/`failed`/`needs-input`, or idle + `@agent_pending`, so a late tool call can't resurrect a finished tab — never from `paused`; from `done`/bare idle only for a claude main-agent tool call whose transcript's last turn mark is "Stop hook feedback", i.e. another Stop hook blocked that stop and the turn went on (**A BLOCKED STOP** in the script); from `needs-input` only for the agent that asked, from `failed` only for the main agent — see **Asker gate** below; never parses stdin — `tool_response` can be huge — and peeks at its first 8 KB only while the window is `needs-input`, `failed` or, for claude, `done`/idle) |
 | `PermissionRequest`, `Notification` (matcher `permission_prompt`) | `needs-approval` → `needs-input` (yellow: approvals and questions are one state since 2026-08-21) |
 | `SubagentStop` | `subagent-stop` (the asking subagent's end ends its gate; see **Asker gate**) |
 | `StopFailure` | `failed` (red) — except `error` `rate_limit`, which marks the window **rate-limited** (`paused` + `@agent_limit`, §7) |
@@ -2454,15 +2454,16 @@ something). It runs in four places:
 | Parent's agent exits | SessionEnd (not `/clear`, `--resume`) or the GC clears its state; the reconcile (at once from the indicator's `clear`) stamps `@agent_kid_orphan_at` on its children and orphans them once the parent has stayed stateless 5 s (the watcher's ticks). A parent window that closed orphans them at once. |
 | Window killed outright | `window-unlinked[3]` reconciles at once (guarded by `@agent_kids_any`); the watcher's tick otherwise. |
 | Letters (agent-ui) | Children get none, from birth (raw link or spawn id); abby-era orphans do. |
-| Tab bar (`tmux.conf.tmpl`) | Each `@catppuccin_window_*` format is wrapped: a child renders as a plain tab with a grey `↳`; a parent with `@agent_kids_ask`, its own state not `needs-*`/`failed`, renders as the child's state (red for `failed`, else yellow). The original formats sit unchanged inside (cua-notch `check-invariants` §65). U6 changes this (children hidden, `↳N` on the parent). |
+| Tab bar (`tmux.conf.tmpl`) | A child (`@agent_child`) is NOT DRAWN: after tpm, catppuccin's built `window-status-format` is kept in `@agent_tab_default` and wrapped to render nothing for a child; its index still exists. It is drawn only while it is the current window (`window-status-current-format`, `@agent_tab_current`, is never wrapped, so a jump onto a child's ask lands on a highlighted tab) or under the stash range tint (`@stash_sel`); then it is the plain tab with a grey `↳`. The parent's tab ends with ` ↳N` (`@agent_kids_tab`): N = the total of `@agent_kids_sub`, else `@agent_kids`, and ` ↳N?` while `@agent_kids_ask` is set; the mark adds no tint and never pulses (crust ink on a tinted body, grey otherwise). A parent with `@agent_kids_ask`, its own state not `needs-*`/`failed`, still renders as the child's state (red for `failed`, else yellow). The `@catppuccin_window_*` formats keep their structure (cua-notch `check-invariants` §65). |
 | NEEDS YOU / ⌥S (`agent-jump.sh list`, `agent-roster.py` `needs_order`) | Every live child in `needs-input`/`failed` is one row with its own id, session, index, stamp and state and the ROOT's label. |
 | Roster (`agent-roster.py`) | Children fold into their parent: no own rows, not counted. |
 | Restore, ⌘Z, stash, snooze | They open new windows, so a reopened child or parent comes back plain (the registry keeps the history). Parking a parent makes it not live (its children plain, not orphaned) while parked in place. |
 | Pause (`agent-pause.py`) | A child is paused like any working agent; a parent held only by children is drained to `paused` by the watcher (above). |
 
 Tests: `tests/test_agent_kids.py`. The reconcile, the indicator on a parent
-and on a child, the hook line and the tab formats run on private tmux
-servers; the watcher and the needs-you list on the fake harness.
+and on a child and the hook line run on private tmux servers; the watcher
+and the needs-you list on the fake harness. The tab formats, the wrapper
+and a real catppuccin render are `tests/test_agent_kids_tabs.py`.
 
 ## Troubleshooting
 
