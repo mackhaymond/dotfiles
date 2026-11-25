@@ -245,6 +245,28 @@
                                 "type": "basic"
                             },
                             {
+                                "description": "Pinned apps + Arc/Zen: cmd+m minimizes the window unless it is pinned (yabai_minimize.sh). Bundle ids of YABAI_PINNED_HOMES + YABAI_AGENT_APPS + YABAI_BROWSER_APPS: keep in step.",
+                                "conditions": [
+                                    {
+                                        "type": "frontmost_application_if",
+                                        "bundle_identifiers": [
+                                            "^company\\.thebrowser\\.Browser$", "^app\\.zen-browser\\.zen$", "^com\\.github\\.wez\\.wezterm$",
+                                            "^com\\.todoist\\.mac\\.Todoist$", "^com\\.granola\\.app$", "^com\\.readdle\\.SparkDesktop-setapp$",
+                                            "^com\\.cron\\.electron$", "^com\\.apple\\.MobileSMS$", "^com\\.anthropic\\.claudefordesktop$",
+                                            "^com\\.openai\\.codex$", "^com\\.conductor\\.app$", "^claudia\\.asterisk\\.so$",
+                                            "^ai\\.opencode\\.openchamber$", "^ai\\.opencode\\.desktop$", "^com\\.jean\\.desktop$",
+                                            "^com\\.t3tools\\.t3code$", "^com\\.meta\\.endo$"
+                                        ]
+                                    }
+                                ],
+                                "from": {
+                                    "key_code": "m",
+                                    "modifiers": { "mandatory": ["command"], "optional": ["caps_lock"] }
+                                },
+                                "to": [{ "shell_command": "$HOME/code/various_scripts/yabai_minimize.sh" }],
+                                "type": "basic"
+                            },
+                            {
                                 "description": "Swallow hyper+period: command+control+option+shift+period is macOS's full-sysdiagnose keychord (fired by accident 2026-11-04, ~400MB archive + Finder reveal).",
                                 "from": {
                                     "key_code": "period",

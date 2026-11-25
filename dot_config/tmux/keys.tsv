@@ -129,3 +129,4 @@ Panes & more	⌃S ?	This key help	prefix	?	type to filter
 Panes & more	⌃S T	Session wizard			tmux-session-wizard
 Panes & more	⌃S ⏎	tmux-fzf: commands, windows, panes…			tmux-fzf (⌃S ⌃M)
 Panes & more	⌘Q	Quit WezTerm: press it 5× quickly			WezTerm
+Panes & more	⌘M	Minimize, but never a pinned window			pinned apps and browsers (Karabiner)

@@ -122,6 +122,27 @@ YABAI_PINNED_MANAGED="Claude"
 # shellcheck disable=SC2034
 YABAI_PINNED_APPS_RE="^($(printf '%s' "$YABAI_PINNED_HOMES" | sed 's/:[^|]*//g')|$(printf '%s' "$YABAI_AGENT_APPS" | sed 's/[()]/\\&/g'))$"
 
+# The same plus the main browsers: every app that can own a pinned window, for the
+# `window_minimized` signal's app= filter (yabairc).
+# shellcheck disable=SC2034
+YABAI_PINNED_OR_BROWSER_RE="${YABAI_PINNED_APPS_RE%)\$}|$YABAI_BROWSER_APPS)$"
+
+# yabai_is_pinned_at <app> <space label>: true if a window of <app> on that space is
+# pinned there -- the app's home is that label, or it is a main browser on main/school.
+# Exact names. `|` and `:` are the lists' separators, so an argument holding one (or an
+# empty one) never matches.
+yabai_is_pinned_at() {
+  local app="${1:-}" label="${2:-}"
+  case "$app" in ''|*[\|:]*) return 1 ;; esac
+  case "$label" in ''|*[\|:]*) return 1 ;; esac
+  case "|$YABAI_PINNED_HOMES|" in *"|$app:$label|"*) return 0 ;; esac
+  if [ "$label" = "${YABAI_AGENT_LABEL:-agent}" ] && yabai_is_agent_app "$app"; then return 0; fi
+  case "$label" in
+    main|school) yabai_is_browser_app "$app" && return 0 ;;
+  esac
+  return 1
+}
+
 # (Re)register the app -> space pinning rules from the map above, one LABELED rule per
 # app (`pin_<app>`, `pin_agent`). Labels matter because yabai resolves `space=<label>`
 # to a space ID when the rule is ADDED (message.c, parse_space_selector -> effects.sid),

@@ -23,6 +23,8 @@ YABAI_STARTUP_RECONCILE="${HOME}/code/various_scripts/yabai_startup_reconcile.sh
 # Restarts yabai (guarded) when a pinned app's window is UNRESOLVED -- listed by
 # yabai but un-actionable, so no rule can home it. See yabai_pin_resolve.sh.
 YABAI_PIN_RESOLVE="${HOME}/code/various_scripts/yabai_pin_resolve.sh"
+# Restores a pinned window that got minimized. See yabai_unminimize.sh.
+YABAI_UNMINIMIZE="${HOME}/code/various_scripts/yabai_unminimize.sh"
 # Draw a JankyBorders border around FLOATING windows only (scope = all is-floating,
 # incl. manage=off apps). `sync` reconciles the borders daemon to the current
 # floating set; no-op if `borders` isn't installed. See yabai_float_borders.sh.
@@ -161,9 +163,22 @@ yabai -m signal --add event=space_changed      label=float_sweep_space_changed a
 yabai -m signal --add event=window_deminimized label=float_sweep_deminimized   action="YABAI_EVENT=window_deminimized '$YABAI_STARTUP_RECONCILE' float"
 yabai -m signal --add event=window_focused     label=float_sweep_focused app="$YABAI_PINNED_APPS_RE" action="YABAI_EVENT=window_focused '$YABAI_STARTUP_RECONCILE' float"
 
+# A pinned window cannot stay minimized (yellow button, Window menu, the app itself; the
+# cmd+M key is stopped earlier, by Karabiner -> yabai_minimize.sh). Filtered in yabai
+# to the apps that can own one; the script checks app + space and restores it without
+# touching focus. Only on a visible space: one left for later (or missed, like a yabai
+# restart mid-animation) is picked up by the sweep, on the next space change or at start.
+# Log: ~/Library/Logs/yabai/unminimize.log.
+yabai -m signal --add event=window_minimized label=unminimize_pinned app="$YABAI_PINNED_OR_BROWSER_RE" action="'$YABAI_UNMINIMIZE'"
+yabai -m signal --add event=space_changed label=unminimize_space_changed action="'$YABAI_UNMINIMIZE' sweep"
+
 # Border any floating windows that already exist at startup (e.g. a manage=off app
 # that macOS restored). Backgrounded; no-op if nothing floats / borders absent.
 "$YABAI_FLOAT_BORDERS" sync &
+
+# Restore any pinned window that is minimized right now (a restart while one was
+# minimizing). Backgrounded; one query when there is none.
+"$YABAI_UNMINIMIZE" sweep &
 
 # Belt-and-suspenders: re-fire rules on any app launch in case the
 # window_created event is lost.
