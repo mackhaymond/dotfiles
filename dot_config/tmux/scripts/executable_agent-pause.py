@@ -1441,10 +1441,10 @@ def finished(prog, finish):
 
 
 # ------------------------------------------------- dismiss and void
-# After the lid opens (Mack, 2026-10-21): the notch's strong cyan "all paused"
-# ring can be DISMISSED without resuming anyone - the saved set, the sidebar's
-# banner and every paused row stay - and the whole pause can be VOIDED: the
-# set is forgotten and nobody is messaged, so the next press is a fresh PAUSE,
+# After the lid opens, or when a pause never settles (Mack, 2026-10-21 and
+# 11-25): the notch's ring, cyan or still violet, can be DISMISSED without
+# resuming anyone - the saved set, the sidebar's banner and every paused row
+# stay - and the whole pause can be VOIDED: the set is forgotten and nobody is messaged, so the next press is a fresh PAUSE,
 # never a RESUME of them. The agents themselves stay paused (Mack,
 # 2026-10-28: a void cancels the resume, not the pause): @agent_paused and the
 # `paused` state are left, and @agent_pause_voided marks the flag an orphan
@@ -1473,7 +1473,8 @@ def post_state_change():
 
 
 def dismiss_glow(client):
-    """Turn off the notch's "all paused" ring: `glow_dismissed_at` in
+    """Turn off the notch's pause ring, the violet pulse of a pause that never
+    settles as well as the cyan "all paused": `glow_dismissed_at` in
     paused.json, until the set is resumed, voided or replaced. Nothing else
     changes. -> message."""
     def run():

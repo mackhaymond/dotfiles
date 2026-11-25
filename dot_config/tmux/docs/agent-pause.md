@@ -352,22 +352,26 @@ ways out besides the resume:
 
 | action | what changes | what stays | how |
 |---|---|---|---|
-| **dismiss** the glow | paused.json gains `glow_dismissed_at`; the notch's "all paused" ring goes dark | the saved set, `@agent_paused`, the `paused` rows (notch menu, tabs, sidebar cards) and the sidebar's banner | `agent-pause.py dismiss [client]`; a click on the notch while it shows the cyan ring |
+| **dismiss** the glow | paused.json gains `glow_dismissed_at`; the notch's ring goes dark in both phases (the violet pulse and the cyan) | the saved set, `@agent_paused`, the `paused` rows (notch menu, tabs, sidebar cards) and the sidebar's banner | `agent-pause.py dismiss [client]`; a click on the notch while it shows the violet pulse or the cyan ring |
 | **void** the pause | paused.json is removed (recorded in paused.last.json as `voided_at`, `still_paused` = the windows still flagged); each target window still carrying the flag gets `@agent_pause_voided <epoch>` (not a rate-limited one: its flag is the limit's); no RESUME is sent to anyone, and the next prefix P is a fresh PAUSE | the agents stay PAUSED: `@agent_paused`, `@agent_state paused` and every paused row (tabs, sidebar cards, the notch) until Mack's own prompt into that window | `agent-pause.py void [client]`; the sidebar banner's void action (confirmed); the notch menu's "Void pause" |
 | **resume** | as always | | prefix P; a click on the banner; the notch menu's "Resume" |
 
 - The dismissal lasts until the set is resumed, voided or replaced by a new
-  pause; the violet pulse while pausing cannot be dismissed (it ends by
-  itself). Both commands take the press lock and post
+  pause. The violet pulse can be dismissed too (Mack, 2026-11-25: "in the
+  event of a failure of pause, I want to be able to make the glow stop while
+  leaving current paused agents paused"; before, one agent that never stopped
+  left only a void). It needs a saved set: while the press is still sending
+  there is nothing to dismiss. A dismissed set stays dark even if a target
+  starts working again. Both commands take the press lock and post
   `com.mackhaymond.tmux.agent-state`, so the sidebar and the notch redraw at
   once.
 - **Where the actions live.** Sidebar (720b0f1): a plain click on the
   settled banner resumes; its `✕ void` chip (just `✕` at 34 columns) arms on
   the first click (red "void? click again") and voids on a second click
   0.7–3 s later; a dismissed glow shows as a dim "glow off". CuaNotch
-  (cua-notch 160164e): a click on the notch while the cyan ring is the TOP
-  glow dismisses it (a failure, question, finished agent or ask on top keeps
-  its click); the menu's "Paused (N)" row has Resume and a two-press Void
+  (cua-notch 160164e): a click on the notch while the cyan ring or the violet
+  pulse is the TOP glow dismisses it (a failure, question, finished agent or
+  ask on top keeps its click); the menu's "Paused (N)" row has Resume and a two-press Void
   (0.7–4 s).
 - **The banner stays until resume or void.** It shows whenever paused.json
   lists targets, dismissed or not. A void removes paused.json, so the banner,
