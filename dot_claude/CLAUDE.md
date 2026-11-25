@@ -44,7 +44,7 @@ report the issue and fall back to normal file inspection.
 The user works at this machine while agents drive it: GUI work is
 BACKGROUND-ONLY. The cua plugin injects a live briefing per session and a
 playbook when GUI work is detected; skills carry the mechanics
-(cua:drive-app, cua:browse, cua:arc, cua:electron-door). The always-true
+(cua:drive-app, cua:browse, cua:zen, cua:electron-door). The always-true
 core, even if the plugin is absent:
 
 - `open` is allowed, but it brings its target to the front: use it to show
@@ -53,7 +53,7 @@ core, even if the plugin is absent:
   apps for background driving with `cua-bg-launch`, drive with `mcp__cua__*`
   (start_session first, end_session when done).
 - Browsers: `agent-browser` (headless) for web tasks; `agent-chrome` for
-  bot-blocked sites; the user's Arc via cua AX tools only.
+  bot-blocked sites; the user's browser is Zen (cua:zen), cua AX tools only.
 - Never kill -9 a GUI app, never trigger a modal sheet on a background
   window, never `screencapture -v -R` while the user is present.
 - delivery_mode stays "background"; watch mode only on the user's explicit
