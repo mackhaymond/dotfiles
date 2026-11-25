@@ -1133,13 +1133,31 @@ def outbox_key(meta):
     return re.sub(r"[^A-Za-z0-9]", "_", "%s-%s" % ((meta.get("server") or {}).get("start_time", ""), p.get("window", "")))
 
 
-def enqueue(meta, text):
+def enqueue(meta, text, turn=None):
+    """Queue one line for the parent. `turn` marks a finish notice for turn
+    N: it is dropped at flush time if the parent collected that turn
+    meanwhile (a `wait` that returned before the 5 s batch went out)."""
     d = os.path.join(STATE, "_outbox", outbox_key(meta))
     os.makedirs(d, exist_ok=True)
     write_file(os.path.join(d, "%.6f-%s.json" % (time.time(), meta["id"])),
                json.dumps({"id": meta["id"], "text": text, "pane": (meta.get("child") or {}).get("pane"),
-                           "tries": 0}))
+                           "turn": turn, "tries": 0}))
     flush_outbox(meta)
+
+
+def already_collected(item):
+    """True for a finish notice whose turn the parent has read since."""
+    n = item.get("turn")
+    if not n:
+        return False
+    try:
+        m = load_meta(item["id"])
+    except Exception:
+        return False
+    for t in (m or {}).get("turns") or []:
+        if t.get("n") == n:
+            return bool(t.get("collected"))
+    return False
 
 
 def flush_outbox(meta):
@@ -1162,10 +1180,13 @@ def flush_outbox(meta):
                     i = json.loads(read_file(f) or "{}")
                 except ValueError:
                     i = {}
-                if i.get("text"):
-                    items.append((f, i))
-                else:
+                if not i.get("text"):
                     os.unlink(f)
+                elif already_collected(i):
+                    log_event(i["id"], "notice dropped: the parent already read turn %s" % i.get("turn"))
+                    os.unlink(f)
+                else:
+                    items.append((f, i))
             if not items:
                 return
             parent = meta.get("parent") or {}
@@ -1736,7 +1757,8 @@ def cmd_deliver(a):
     word = {"done": "finished (done)", "failed": "finished (failed%s)" % (": " + one_line(detail, 60) if detail else ""),
             "needs-input": "needs input (%s)" % one_line(detail, 60), "gone": "is gone",
             "cancelled": "was cancelled"}[st]
-    enqueue(m, "[agent-spawn] %s '%s' %s. Run: agent-spawn result %s" % (child_label(m), m.get("task") or "", word, m["id"]))
+    enqueue(m, "[agent-spawn] %s '%s' %s. Run: agent-spawn result %s" % (child_label(m), m.get("task") or "", word, m["id"]),
+            turn=n)
     return 0
 
 

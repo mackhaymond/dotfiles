@@ -177,6 +177,10 @@ they name a space, shell, agent, letter, parked tab or NEEDS YOU.
   send_keys into an agent's pane.
 - **External subagents** (a child agent of any harness in its own tab):
   load the `agent-spawn` skill, also when you are one (`[task from @…]`).
+  Routing: `agy` (free Gemini quota) for bulk mechanical edits, test
+  scaffolding, repo skims and video/audio input; keep design, vision,
+  research and judgment work on Claude; Copilot only for cloud PR
+  delegation (metered). Codex and Grok are fallbacks, never defaults.
 - Don't close, kill, park, move or rename tabs or spaces you don't own.
   User-facing messages go through `~/.config/tmux/scripts/notify.sh`, never
   `tmux display-message`. Test tmux only on a private `-L` server

@@ -30,6 +30,31 @@ abby spends abliteration.ai money, and every tab is one more thing on Mack's
 screen. Don't spawn for a one-liner. Only abby has a special reason to always
 use it: its own Agent tool runs on its own model, never Claude.
 
+## Which harness for what (Mack's setup, 2026-11-25)
+
+Mack pays for Claude. `agy` (Google Antigravity CLI) is on his Google AI
+Pro **student trial**, which Antigravity treats as a promotional tier: it
+gets Gemini 4 Hydrogen (and 3.8 Flash until 2026-11-30), not Carbon, Argon
+or Neon, on a free weekly quota that does not touch his Claude limits.
+Copilot CLI is metered (AI credits). He does not pay for Codex and is
+cancelling Grok: both stay installed as fallbacks, never a default.
+
+| Work | Send it to | Why |
+|---|---|---|
+| Visual/UI design, frontend look, screenshots and image understanding | **Claude** (your own Agent tool, or a Claude child if it needs its own tab) | Claude Fable/Opus lead the blind design, WebDev and vision arenas; Hydrogen is far down them. Mack's hunch that Gemini is "the visual one" did not survive the research (arena.ai, designarena.ai, Nov 2026). |
+| Backend/systems code, careful long-context reads, research, planning, review | **Claude** | Terminal-Bench and long-context (MRCR) leads. |
+| Bulk mechanical edits, test scaffolding, fixture generation, a repo skim, anything high-volume and low-judgment | **agy** (`--harness agy`) | Free quota, ~2.5x faster than Flash, cheap. Hand it a tight brief and review the diff. |
+| Video or audio input (screen recordings, voice notes) | **agy** | Hydrogen takes video and audio; Claude takes text and images only. |
+| A second opinion from another model family (plan review, "poke holes in this") | **agy**, or **Copilot** with GPT-6.2 if credits are fine | A different family catches different mistakes. |
+| Cloud-side work that should land as a draft PR, or other vendors' top models (GPT-6.2, Gemini 4 Carbon, Kimi) | **Copilot** (`/delegate`, `/fleet`) | Metered; ask Mack before spending credits. |
+
+Default for "run this unit in another harness": **agy**. If Mack ever moves
+to paid AI Pro, agy gains Carbon (a real design second opinion:
+`--model "Orchestrator (Carbon)"`) and this table should be revisited.
+OpenCode's Google provider (the `opencode-antigravity-auth` plugin) violates
+Google's ToS and has cost people their accounts: run Gemini through agy, not
+through OpenCode.
+
 ## The two front doors
 
 - **MCP** (Claude Code, abby and Codex: `mcp__tmux__*`; OpenCode's
