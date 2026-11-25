@@ -1,0 +1,1801 @@
+#!/usr/bin/env python3
+"""agent-spawn: start another agent (any hooked harness) as a CHILD tab of the
+calling agent, wait for it, read its result. Any agent can be the parent.
+
+  agent-spawn spawn  [--harness claude|abby|codex|opencode|grok|copilot|agy]
+                     [--dir D] [--model M] [--task T] [--notify|--no-notify]
+                     [--close-on-done] [--auto] [--space NAME] [--parent PANE]
+                     [--force] [--json] -- PROMPT|-
+        -> "<id> <pane> <window> <letter>" | {id,pane,window,letter,harness,dir}
+  agent-spawn run    (spawn's flags) [--timeout S]   spawn --no-notify, then wait
+  agent-spawn wait   ID... [--any|--all] [--timeout S=540] [--json]
+  agent-spawn result ID [--turn N] [--max-chars N] [--json]
+  agent-spawn list   [--all] [--parent PANE] [--json]   default: YOUR children
+  agent-spawn send   ID MSG|- [--parent PANE] [--json]   a follow-up (tmux-mcp)
+  agent-spawn cancel ID [--close] [--parent PANE]   interrupt (Escape)
+  agent-spawn close  ID [--parent PANE]           closed-tabs.sh close (⌘Z-able)
+  agent-spawn report [--status ok|blocked|failed] [--file F|-] [TEXT]   (child)
+  agent-spawn whoami [--parent PANE] [--json]
+  agent-spawn _deliver ID          internal: the async "finished" wake message
+  agent-spawn _notify-closed ID [--busy|--idle] [--result R] [--parent-closing]
+
+Every verb but _deliver/_notify-closed takes --parent PANE (the calling
+agent's pane; tmux-mcp passes its callerPane) and --json. `-` as the whole
+prompt or message reads it from stdin. JSON results carry id, harness,
+status, state, detail, reply, reply_source, truncated, result (the child's
+@agent_spawn_result), session_id, transcript, pane, window, letter, task,
+started, ended, turns; wait --json prints an array of them, run --json one.
+
+Turns: spawn and send each record one; a turn the child starts otherwise (a
+message_agent follow-up, a wake-up: a newer @agent_turn_start, or a new turn
+id after a finished turn) is recorded as the next turn by any read. A turn is
+over at an @agent_turn_end that matches it (by turn id; by epoch when the id
+is `-`) while @agent_state is not running or paused and no @agent_kids_hold
+is set; a `paused` verdict is reported as paused, never done. result reads
+the latest turn (--turn N an earlier one). wait ends at once on needs-input or
+failed, even with --all; on a child whose latest turn was already collected
+it first gives a new turn AGENT_SPAWN_FOLLOWUP_GRACE (15) s to start.
+
+Ownership: send, cancel, close, wait and result refuse a caller that resolves
+to an agent window other than the child's parent (13). A caller that resolves
+to no agent window (Mack's own shell) is allowed.
+
+Exit codes: 0 done, 10 needs-input, 11 failed, 12 gone/cancelled, 13 refused,
+75 timeout, 2 usage, 1 error (no tmux, no such id, tmux-mcp unreachable).
+The registry is $AGENT_SPAWN_DIR (default ~/.local/state/agent-spawn).
+
+The child opens in the background (focus never moves) right after the
+parent's last child in the parent's space, born an agent in one targeted tmux
+call (@agent_state idle, @agent_born, @agent_kind, @agent_harness,
+@agent_parent, @agent_parent_pane, @agent_kid_since, @agent_spawn_id,
+@agent_spawn_task, @agent_spawn_mode), with no pool letter (prints `-`). Its
+prompt is a file the tab reads as "$(<task.md)", never shell-parsed. Records
+live in ~/.local/state/agent-spawn/<id>/ (task.md, meta.json, reply.md written
+by the indicator, report.json, events.log; mode 0600) and outlive the tab;
+every read or write on a tab first checks its @agent_spawn_id. Plan:
+~/.claude/projects/-Users-mackhaymond--config-tmux/1947d30c-*/external-
+subagents/plan.md §2. Python 3 stdlib only.
+"""
+import argparse
+import fcntl
+import glob
+import json
+import os
+import random
+import re
+import string
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+EXIT_DONE, EXIT_ERR, EXIT_USAGE = 0, 1, 2
+EXIT_NEEDS, EXIT_FAILED, EXIT_GONE, EXIT_REFUSED, EXIT_TIMEOUT = 10, 11, 12, 13, 75
+STATUS_EXIT = {"done": EXIT_DONE, "needs-input": EXIT_NEEDS, "failed": EXIT_FAILED,
+               "gone": EXIT_GONE, "cancelled": EXIT_GONE}
+FINAL = ("done", "needs-input", "failed", "gone", "cancelled")
+
+HOME = os.path.expanduser("~")
+STATE = (os.environ.get("AGENT_SPAWN_DIR") or os.environ.get("AGENT_SPAWN_STATE")
+         or os.path.join(HOME, ".local/state/agent-spawn"))
+SCRIPTS = os.path.join(HOME, ".config/tmux/scripts")
+LAUNCH = os.environ.get("AGENT_SPAWN_LAUNCH") or os.path.join(SCRIPTS, "agent-launch.sh")
+SELF_LIB = os.environ.get("AGENT_SPAWN_SELF_LIB") or os.path.join(SCRIPTS, "agent-self-lib.sh")
+SESSION_LIB = os.environ.get("AGENT_SPAWN_SESSION_LIB") or os.path.join(SCRIPTS, "agent-session-lib.sh")
+CLOSED_TABS = os.environ.get("AGENT_SPAWN_CLOSED_TABS") or os.path.join(SCRIPTS, "closed-tabs.sh")
+TMUX_BIN = os.environ.get("LAUNCH_TMUX_BIN") or "tmux"
+GRACE = int(os.environ.get("AGENT_SPAWN_START_GRACE") or 60)   # KIDS_START_GRACE
+DIALOG_AFTER = float(os.environ.get("AGENT_SPAWN_DIALOG_AFTER") or 5)
+POLL = float(os.environ.get("AGENT_SPAWN_POLL") or 1.0)
+BATCH = float(os.environ.get("AGENT_SPAWN_BATCH_S") or 5)
+RETRY = float(os.environ.get("AGENT_SPAWN_RETRY_S") or 2)
+# A wait on a child whose latest turn was already collected first gives a
+# follow-up (message_agent, not `send`) this long to start (abby-delegate's).
+FOLLOWUP_GRACE = float(os.environ.get("AGENT_SPAWN_FOLLOWUP_GRACE") or 15)
+MCP_URL = os.environ.get("TMUX_MCP_URL", "http://127.0.0.1:7998/mcp")
+MAX_DEPTH, MAX_KIDS = 2, 6
+US = "\x1f"
+HARNESSES = ("claude", "abby", "codex", "opencode", "grok", "copilot", "agy")
+# --auto: each harness's own "don't ask me" flag (none known for opencode;
+# codex already runs approval_policy=never here).
+AUTO = {"claude": ["--permission-mode", "acceptEdits"], "abby": ["--permission-mode", "acceptEdits"],
+        "copilot": ["--allow-all-tools"], "agy": ["--mode", "auto"], "grok": ["--always-approve"],
+        "codex": [], "opencode": []}
+# Interrupt keys per harness (OpenCode wants Escape twice).
+CANCEL_KEYS = {"opencode": ["Escape", "Escape"]}
+# A child that fires no hook may be sitting on a startup dialog (trust,
+# onboarding, login, a model or version notice): tmux-mcp's readBox treats
+# "no recognisable prompt box" as such; these are the dialogs' own words.
+DIALOG_RE = re.compile(
+    r"do you trust|trust (the files|this folder|the contents|this directory|this workspace)"
+    r"|yes, proceed|press enter to continue|select login method|choose the text style"
+    r"|sign in with|log ?in to continue|update available|what's new in|choose (a|your) model"
+    r"|allow .{0,20} to work in this folder|confirm folder trust", re.I)
+
+
+class Fail(Exception):
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code, self.msg = code, msg
+
+
+def now():
+    return int(time.time())
+
+
+def digits(s):
+    s = (s or "").strip().split(" ", 1)[0]
+    return int(s) if s.isdigit() else 0
+
+
+def one_line(s, n=80):
+    """One sanitized line: no controls, `|` or `#`, collapsed spaces, at most
+    n chars, no trailing `;` (an argv element ending in `;` ends a tmux list)."""
+    s = re.sub(r"[\x00-\x1f\x7f|#]+", " ", s or "")
+    s = re.sub(r" +", " ", s).strip()[:n]
+    return s.rstrip(" ;")
+
+
+def sq(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+# ---------------------------------------------------------------- tmux
+
+class Tmux:
+    def __init__(self, socket=""):
+        self.socket = socket or ""
+
+    def argv(self, *a):
+        return [TMUX_BIN] + (["-S", self.socket] if self.socket else []) + list(a)
+
+    def run(self, *a):
+        try:
+            return subprocess.run(self.argv(*a), capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as e:
+            return subprocess.CompletedProcess(a, 1, "", str(e))
+
+    def out(self, *a):
+        r = self.run(*a)
+        return r.stdout if r.returncode == 0 else None
+
+    def env(self):
+        """Env for a script that runs plain `tmux` against this server."""
+        e = dict(os.environ)
+        if self.socket:
+            e["TMUX"] = "%s,0,0" % self.socket
+        return e
+
+
+def server_of(tm):
+    """{start_time, socket} of tm's server, or None."""
+    o = tm.out("display-message", "-p", "#{start_time}" + US + "#{socket_path}")
+    if not o or US not in o:
+        return None
+    st, sock = o.rstrip("\n").split(US, 1)
+    return {"start_time": st, "socket": os.path.realpath(sock)}
+
+
+ROW_FIELDS = ("start", "pane", "win", "spawn_id", "state", "since", "turn_start", "turn_origin",
+              "turn_end", "kid_since", "result", "reply_at", "kind", "harness", "key", "tty",
+              "rollout", "record", "cwd", "kids_hold", "limit", "detail")
+ROW_FMT = US.join("#{%s}" % f for f in (
+    "start_time", "pane_id", "window_id", "@agent_spawn_id", "@agent_state", "@agent_since",
+    "@agent_turn_start", "@agent_turn_origin", "@agent_turn_end", "@agent_kid_since",
+    "@agent_spawn_result", "@agent_reply_at", "@agent_kind", "@agent_harness", "@agent_key",
+    "pane_tty", "@agent_rollout", "@agent_record", "pane_current_path", "@agent_kids_hold", "@agent_limit",
+    "@agent_detail"))
+
+
+def pane_rows(tm):
+    """pane id -> row dict, for every pane of tm's server (one fork); None
+    when the server can't be read."""
+    o = tm.out("list-panes", "-a", "-F", ROW_FMT)
+    if o is None:
+        return None
+    rows = {}
+    for line in o.splitlines():
+        parts = line.split(US)
+        if len(parts) < len(ROW_FIELDS):
+            continue
+        r = dict(zip(ROW_FIELDS, parts[:len(ROW_FIELDS) - 1] + [US.join(parts[len(ROW_FIELDS) - 1:])]))
+        rows.setdefault(r["pane"], r)
+    return rows
+
+
+WIN_FIELDS = ("win", "sid", "sname", "hidden", "home", "state", "parent", "index")
+WIN_FMT = US.join("#{%s}" % f for f in ("window_id", "session_id", "session_name", "@space_hidden",
+                                       "@space_home", "@agent_state", "@agent_parent", "window_index"))
+
+
+def window_rows(tm):
+    o = tm.out("list-windows", "-a", "-F", WIN_FMT) or ""
+    return [dict(zip(WIN_FIELDS, l.split(US))) for l in o.splitlines() if l.count(US) >= len(WIN_FIELDS) - 1]
+
+
+def hidden(v):
+    return v not in ("", "0")
+
+
+# ---------------------------------------------------------------- registry
+
+def reg(sid, *parts):
+    return os.path.join(STATE, sid, *parts)
+
+
+def valid_id(sid):
+    return bool(re.fullmatch(r"s-[0-9a-z]{4,40}", sid or ""))
+
+
+def new_id():
+    n, b = now(), ""
+    while n:
+        n, r = divmod(n, 36)
+        b = "0123456789abcdefghijklmnopqrstuvwxyz"[r] + b
+    return "s-" + b + "".join(random.choice(string.digits + string.ascii_lowercase) for _ in range(4))
+
+
+def write_file(path, text):
+    tmp = "%s.tmp%d" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def read_file(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def mtime(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0
+
+
+class Lock:
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+def load_meta(sid):
+    if not valid_id(sid):
+        return None
+    t = read_file(reg(sid, "meta.json"))
+    try:
+        return json.loads(t) if t else None
+    except ValueError:
+        return None
+
+
+def need_meta(sid):
+    m = load_meta(sid)
+    if not m:
+        raise Fail(EXIT_ERR, "no such spawn id: %s" % sid)
+    return m
+
+
+def update_meta(sid, fn):
+    with Lock(reg(sid, ".lock")):
+        m = load_meta(sid)
+        if m is None:
+            return None
+        fn(m)
+        write_file(reg(sid, "meta.json"), json.dumps(m, indent=1, ensure_ascii=False) + "\n")
+        return m
+
+
+def log_event(sid, text):
+    try:
+        fd = os.open(reg(sid, "events.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write("%d %s\n" % (now(), one_line(text, 400)))
+    except OSError:
+        pass
+
+
+def all_ids():
+    out = []
+    for d in sorted(glob.glob(os.path.join(STATE, "s-*"))):
+        sid = os.path.basename(d)
+        if valid_id(sid) and os.path.isfile(os.path.join(d, "meta.json")):
+            out.append(sid)
+    return out
+
+
+# ---------------------------------------------------------------- who am I
+
+def resolve_self():
+    """(window, pane, socket) of the calling agent through agent-self-lib.sh,
+    or raise Fail(13)."""
+    script = ('. "$1" || exit 3; agent_self_window || { printf "%s\\n" "$AGENT_SELF_ERR" >&2; exit 1; }; '
+              'printf "%s\\t%s\\t%s\\n" "$AGENT_SELF_WIN" "$AGENT_SELF_PANE" "$AGENT_SELF_SOCKET"')
+    try:
+        r = subprocess.run(["bash", "-c", script, "_", SELF_LIB], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Fail(EXIT_ERR, "agent-self-lib.sh failed: %s" % e)
+    if r.returncode == 3:
+        raise Fail(EXIT_ERR, "can't load %s" % SELF_LIB)
+    if r.returncode != 0:
+        raise Fail(EXIT_REFUSED, "can't tell which agent this is: %s (pass --parent PANE)" % r.stderr.strip())
+    win, pane, sock = (r.stdout.rstrip("\n").split("\t") + ["", "", ""])[:3]
+    return win, pane, sock
+
+
+def resolve_caller(parent_arg, required=True):
+    """The calling agent as (Tmux, window, pane), from --parent or the lib.
+    With required=False, None when it can't be told."""
+    if parent_arg:
+        tm = Tmux()
+        o = tm.out("display-message", "-p", "-t", parent_arg, "#{pane_id}" + US + "#{window_id}")
+        rows = tm.out("list-panes", "-a", "-F", "#{pane_id}")
+        if not o or rows is None:
+            raise Fail(EXIT_ERR, "no tmux server (is this inside tmux?)")
+        pane, win = o.strip().split(US)
+        if pane not in rows.split() or (parent_arg.startswith("%") and pane != parent_arg):
+            raise Fail(EXIT_REFUSED, "no such pane: %s" % parent_arg)
+        return tm, win, pane
+    try:
+        win, pane, sock = resolve_self()
+    except Fail:
+        if required:
+            raise
+        return None
+    return Tmux(sock), win, pane
+
+
+def live_tm(meta):
+    """(Tmux on the record's server, live rows) - rows None when that server
+    is gone or is a different (restarted) server."""
+    srv = meta.get("server") or {}
+    tm = Tmux(srv.get("socket", ""))
+    rows = pane_rows(tm)
+    if not rows:
+        return tm, None
+    any_row = next(iter(rows.values()))
+    if any_row["start"] != srv.get("start_time"):
+        return tm, None
+    return tm, rows
+
+
+def child_row(meta, rows):
+    if rows is None:
+        return None
+    r = rows.get((meta.get("child") or {}).get("pane", ""))
+    return r if r and r["spawn_id"] == meta["id"] else None
+
+
+# ---------------------------------------------------------------- harnesses
+
+def harness_table():
+    try:
+        r = subprocess.run(["bash", LAUNCH, "table"], capture_output=True, text=True, timeout=15,
+                           env=dict(os.environ, LAUNCH_TMUX_BIN=TMUX_BIN))
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Fail(EXIT_ERR, "agent-launch.sh table failed: %s" % e)
+    t = {}
+    for line in r.stdout.splitlines():
+        f = line.split()
+        if len(f) == 8:
+            t[f[0]] = dict(zip(("id", "letter", "cmd", "kind", "harness", "prompt", "model", "installed"), f))
+    if not t:
+        raise Fail(EXIT_ERR, "agent-launch.sh table printed nothing (%s)" % r.stderr.strip())
+    return t
+
+
+def codex_trust():
+    """None when the tab hooks in ~/.codex/hooks.json are trusted (a
+    [hooks.state."<file>:<event>:<i>:<j>"] trusted_hash for each
+    agent-tab-indicator hook in ~/.codex/config.toml), else why not. Codex
+    runs untrusted hooks never, silently: such a child would never report."""
+    try:
+        import tomllib
+    except ImportError:
+        return None
+    hp = os.path.join(HOME, ".codex", "hooks.json")
+    try:
+        with open(hp) as f:
+            hooks = json.load(f).get("hooks") or {}
+        with open(os.path.join(HOME, ".codex", "config.toml"), "rb") as f:
+            state = ((tomllib.load(f).get("hooks") or {}).get("state") or {})
+    except (OSError, ValueError) as e:
+        return "can't read Codex's hooks or config (%s)" % e
+    seen = 0
+    for ev, groups in hooks.items():
+        snake = re.sub(r"(?<!^)(?=[A-Z])", "_", ev).lower()
+        for i, g in enumerate(groups or []):
+            for j, h in enumerate((g or {}).get("hooks") or []):
+                if "agent-tab-indicator" not in str((h or {}).get("command", "")):
+                    continue
+                seen += 1
+                if not (state.get("%s:%s:%d:%d" % (hp, snake, i, j)) or {}).get("trusted_hash"):
+                    return "Codex's %s tab hook is not trusted (run codex once and approve its hooks)" % ev
+    return None if seen else "no agent-tab-indicator hook in ~/.codex/hooks.json"
+
+
+def grok_leader():
+    try:
+        import tomllib
+        with open(os.path.join(os.environ.get("GROK_HOME") or os.path.join(HOME, ".grok"), "config.toml"), "rb") as f:
+            return bool(((tomllib.load(f).get("cli") or {}).get("use_leader")))
+    except (ImportError, OSError, ValueError):
+        return False
+
+
+def launch_line(row, task_path, model="", auto=False):
+    """The ZSH_AUTOSTART line that starts harness ROW with the task file as
+    its first prompt. Refuses headless (-p) lines."""
+    hid = row["id"]
+    pre = ""
+    if hid == "claude":
+        pre = "unset CLAUDE_CONFIG_DIR ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS; "
+    if hid == "codex" and os.access(os.path.join(HOME, ".local/bin/codex"), os.X_OK):
+        exe = sq(os.path.join(HOME, ".local/bin/codex"))   # the wrapper: --no-daemon, max context
+    elif hid == "grok" and os.access(os.path.join(os.environ.get("GROK_HOME") or os.path.join(HOME, ".grok"), "bin/grok"), os.X_OK):
+        exe = sq(os.path.join(os.environ.get("GROK_HOME") or os.path.join(HOME, ".grok"), "bin/grok"))
+    else:
+        exe = "command " + row["cmd"]
+    args = []
+    if model:
+        if row["model"] == "-":
+            raise Fail(EXIT_REFUSED, "%s takes no --model" % hid)
+        args += [row["model"], sq(model)]
+    if auto:
+        args += AUTO.get(hid, [])
+    prompt = '"$(<%s)"' % sq(task_path)
+    pf = row["prompt"]
+    if pf == "-":
+        raise Fail(EXIT_REFUSED, "%s takes no launch prompt" % hid)
+    args += [prompt] if pf == "pos" else ["--", prompt] if pf == "--" else [pf, prompt]
+    line = pre + exe + " " + " ".join(args)
+    if re.search(r"(^|\s)(-p|--print|--prompt-file)(\s|=|$)", line.replace(prompt, "")):
+        raise Fail(EXIT_REFUSED, "refusing a headless launch line for %s: %s" % (hid, line))
+    return line
+
+
+PREAMBLE = """---
+[agent-spawn] You are a subagent: another agent (@{handle}) started you with the task above, not Mack.
+- Your final reply in this turn IS your report to that agent: make it complete and self-contained.
+- Don't commit or push unless the task above says to.
+- Never ask Mack (the user) anything and never run agent-needs-you. If you have a question or are blocked, put it in your final reply; your parent decides whether to bring Mack in.
+- Optional: `agent-spawn report --status ok|blocked|failed --file F` hands back a structured report."""
+
+
+# ---------------------------------------------------------------- sessions
+
+def resurrect_dirs():
+    suffix = "tmux-assistant-resurrect"
+    if os.environ.get("TMUX_ASSISTANT_RESURRECT_DIR"):   # the plugin's own override: only it
+        d = os.environ["TMUX_ASSISTANT_RESURRECT_DIR"]
+        return [d] if os.path.isdir(d) else []
+    c = []
+    for k in ("XDG_RUNTIME_DIR", "TMPDIR"):
+        if os.environ.get(k):
+            c.append(os.path.join(os.environ[k], suffix))
+    c.append(os.path.join("/tmp", suffix))
+    return [d for d in c if os.path.isdir(d)]
+
+
+def pid_tty(pid):
+    try:
+        return subprocess.run(["ps", "-o", "tty=", "-p", str(pid)], capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def session_record(pane, tty, kinds):
+    """The newest live resurrect record (<kind>-<pid>.json, written by every
+    harness's session tracker) for PANE whose pid is on PANE's tty."""
+    best = None
+    for d in resurrect_dirs():
+        for path in glob.glob(os.path.join(d, "*-*.json")):
+            m = re.fullmatch(r"(claude|codex|opencode|grok|copilot|agy)-(\d+)\.json", os.path.basename(path))
+            if not m or m.group(1) not in kinds:
+                continue
+            try:
+                with open(path) as f:
+                    rec = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if ((rec.get("env") or {}).get("tmux_pane")) != pane or not rec.get("session_id"):
+                continue
+            t = mtime(path)
+            if best and t <= best[0]:
+                continue
+            pt = pid_tty(m.group(2))
+            if not pt or pt == "??" or (tty and "/dev/" + pt != tty):
+                continue
+            best = (t, rec)
+    return best[1] if best else None
+
+
+def agy_home():
+    return os.path.join(HOME, ".gemini", "antigravity-cli")
+
+
+def find_session(kind, pane, row):
+    """(session_id, transcript path) for the agent in PANE, best effort."""
+    sid = path = ""
+    rk = {"claude": ("claude",), "codex": ("codex",), "opencode": ("opencode",), "grok": ("grok",),
+          "copilot": ("copilot",), "agy": ("agy",)}.get(kind, (kind,))
+    rec = session_record(pane, (row or {}).get("tty", ""), rk) if pane else None
+    if rec:
+        sid, path = rec.get("session_id") or "", rec.get("transcript_path") or ""
+    if kind == "codex" and row and row.get("rollout"):
+        path = row["rollout"]
+        m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$", path)
+        sid = sid or (m.group(1) if m else "")
+    if kind == "copilot" and row and row.get("record"):
+        path = row["record"]
+        sid = sid or os.path.basename(os.path.dirname(path))
+    if kind == "agy" and row and row.get("record"):
+        sid = sid or re.sub(r"\.db$", "", os.path.basename(row["record"]))
+    if kind == "agy" and sid and not path:
+        path = os.path.join(agy_home(), "brain", sid, ".system_generated/logs/transcript.jsonl")
+    if kind == "claude" and sid and not (path and os.path.isfile(path)):
+        hits = glob.glob(os.path.join(HOME, ".claude/projects/*/%s.jsonl" % sid)) + \
+            glob.glob(os.path.join(HOME, ".claude-abby/projects/*/%s.jsonl" % sid))
+        path = hits[0] if hits else path
+    if kind == "codex" and sid and not (path and os.path.isfile(path)):
+        hits = glob.glob(os.path.join(HOME, ".codex/sessions/**/rollout-*%s.jsonl" % sid), recursive=True)
+        path = hits[0] if hits else path
+    if kind == "copilot" and sid and not path:
+        path = os.path.join(os.environ.get("COPILOT_HOME") or os.path.join(HOME, ".copilot"),
+                            "session-state", sid, "events.jsonl")
+    return sid, path
+
+
+# ---------------------------------------------------------------- transcript readers
+# The FINAL reply of the latest turn: every assistant text after the last real
+# user prompt. Ported from closed-tabs.sh transcript_digest (one reader per
+# harness, fixtures in tests/fixtures/agent-spawn/).
+
+def jsonl(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        yield json.loads(line)
+                    except ValueError:
+                        continue
+    except OSError:
+        return
+
+
+def read_claude(path):
+    texts = []
+    for e in jsonl(path):
+        if not isinstance(e, dict) or e.get("isSidechain") or e.get("isMeta"):
+            continue
+        c = (e.get("message") or {}).get("content")
+        if e.get("type") == "user":
+            if isinstance(c, str):
+                texts = []
+            elif isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "text" for b in c):
+                texts = []
+        elif e.get("type") == "assistant" and isinstance(c, list):
+            texts += [b["text"] for b in c if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()]
+    return "\n\n".join(texts) or None
+
+
+CODEX_CTX = re.compile(r"^\s*<(environment_context|user_instructions|permissions)|^# AGENTS\.md")
+
+
+def read_codex(path):
+    texts, final = [], None
+    for e in jsonl(path):
+        p = e.get("payload") or {}
+        if e.get("type") == "response_item" and p.get("type") == "message":
+            parts = [c.get("text", "") for c in p.get("content") or [] if isinstance(c, dict)
+                     and c.get("type") in ("input_text", "output_text")]
+            if p.get("role") == "user" and any(not CODEX_CTX.search(t) for t in parts):
+                texts, final = [], None
+            elif p.get("role") == "assistant":
+                texts += [t for t in parts if t.strip()]
+        elif e.get("type") == "event_msg" and p.get("type") == "task_complete" and p.get("last_agent_message"):
+            final = p["last_agent_message"]
+    return final or ("\n\n".join(texts) or None)
+
+
+def read_copilot(path):
+    texts = []
+    for e in jsonl(path):
+        if e.get("type") == "user.message":
+            texts = []
+        elif e.get("type") == "assistant.message":
+            c = (e.get("data") or {}).get("content")
+            if isinstance(c, str) and c.strip():
+                texts.append(c)
+    return "\n\n".join(texts) or None
+
+
+def read_agy(path):
+    texts = []
+    for e in jsonl(path):
+        if e.get("type") == "USER_INPUT":
+            texts = []
+        elif e.get("type") == "PLANNER_RESPONSE":
+            c = e.get("content")
+            if isinstance(c, str) and c.strip():
+                texts.append(c)
+    return "\n\n".join(texts) or None
+
+
+def read_opencode_export(text):
+    try:
+        msgs = json.loads(text).get("messages") or []
+    except (ValueError, AttributeError):
+        return None
+    texts = []
+    for m in msgs:
+        role = (m.get("info") or {}).get("role")
+        parts = [p.get("text", "") for p in m.get("parts") or [] if p.get("type") == "text"]
+        if role == "user":
+            texts = []
+        elif role == "assistant":
+            texts += [t for t in parts if t.strip()]
+    return "\n\n".join(texts) or None
+
+
+def read_grok_export(text):
+    texts, role, para = [], "", []
+
+    def flush():
+        if role == "ASSISTANT" and para:
+            s = "\n".join(para).strip()
+            if s:
+                texts.append(s)
+    for line in (text or "").splitlines():
+        if line.startswith("## "):
+            flush()
+            para = []
+            role = {"## User": "USER", "## Assistant": "ASSISTANT"}.get(line.strip(), "")
+            if role == "USER":
+                texts = []
+            continue
+        if role:
+            para.append(line)
+    flush()
+    return "\n\n".join(texts) or None
+
+
+def run_export(argv):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=20, cwd="/",
+                              stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def read_transcript(kind, sid, path):
+    if kind in ("claude", "abby") and path:
+        return read_claude(path)
+    if kind == "codex" and path:
+        return read_codex(path)
+    if kind == "copilot" and path:
+        return read_copilot(path)
+    if kind == "agy" and path:
+        return read_agy(path)
+    if kind == "opencode" and sid:
+        return read_opencode_export(run_export(["opencode", "export", sid]))
+    if kind == "grok" and sid:
+        gh = os.environ.get("GROK_HOME") or os.path.join(HOME, ".grok")
+        exe = os.path.join(gh, "bin/grok")
+        return read_grok_export(run_export([exe if os.access(exe, os.X_OK) else "grok", "export", sid]))
+    return None
+
+
+# ---------------------------------------------------------------- observe
+
+def origin_tid(row):
+    o = (row.get("turn_origin") or "").split()
+    return o[1] if len(o) >= 2 and o[1] != "-" else None
+
+
+def turn_ended(row, ts):
+    """The end of the turn that started at TS, from @agent_turn_end "<epoch>
+    <id|-> <verdict>", or None. With a turn id on both sides only the ids are
+    compared (A13); with `-` on either (copilot, agy, the watcher's own ends)
+    the end must be at or after TS."""
+    end = (row.get("turn_end") or "").split()
+    if len(end) < 3 or not end[0].isdigit():
+        return None
+    tid = origin_tid(row)
+    if tid and end[1] != "-":
+        ok = end[1] == tid
+    else:
+        ok = int(end[0]) >= ts
+    return (int(end[0]), end[1], end[2]) if ok else None
+
+
+def startup_dialog(tm, pane):
+    o = tm.out("capture-pane", "-p", "-t", pane) or ""
+    for line in o.splitlines():
+        if DIALOG_RE.search(line):
+            return one_line(line, 80)
+    return None
+
+
+def refresh(meta, row):
+    """Record a turn the child started without `send` (a message_agent
+    follow-up, a wake-up) as turn n+1: its @agent_turn_start is newer than
+    the latest recorded turn's, or a new turn id follows a finished turn.
+    Returns the (possibly updated) meta."""
+    if row is None or not meta.get("turns"):
+        return meta
+    ts, tid = digits(row["turn_start"]), origin_tid(row)
+
+    def new_turn(m):
+        last = m["turns"][-1]
+        lts = last.get("turn_start")
+        if not lts or not ts:
+            return False
+        if ts > lts:
+            return True
+        return bool(tid and last.get("turn_id") and tid != last["turn_id"]
+                    and last.get("status") in ("done", "failed", "paused", "cancelled"))
+    if not new_turn(meta):
+        return meta
+
+    def fn(m):
+        if new_turn(m):
+            n = m["turns"][-1]["n"] + 1
+            m["turns"].append({"n": n, "sent_at": ts, "turn_start": ts, "turn_id": tid, "turn_end": None,
+                               "status": "running", "implicit": True})
+    m = update_meta(meta["id"], fn) or meta
+    log_event(meta["id"], "turn %d started without send (turn_start %d)" % (m["turns"][-1]["n"], ts))
+    return m
+
+
+def observe(meta, row, tm=None, t=None):
+    """The latest turn's (status, state, detail, changes) from a live row
+    (None: the tab is gone); changes = turn fields to record. Call refresh()
+    first so a turn started without `send` is its own turn."""
+    t = t or now()
+    turns = meta.get("turns") or [{}]
+    turn = turns[-1]
+    sent = turn.get("sent_at") or meta.get("created") or 0
+    ch = {}
+    if turn.get("status") == "cancelled":
+        return "cancelled", (row or {}).get("state", ""), "cancelled by the parent", ch
+    if row is None:
+        if turn.get("status") in ("done", "failed"):
+            return turn["status"], "", "finished; the tab is gone", ch
+        why = "closed" if meta.get("closed_at") else "the tab is gone"
+        return "gone", "", why, ch
+    state = row["state"]
+    since = digits(row["since"])
+    ts = digits(row["turn_start"])
+    tid = origin_tid(row)
+    prev_ts = turns[-2].get("turn_start") if len(turns) > 1 else None
+    if turn.get("implicit"):
+        started = ts >= sent > 0
+    elif len(turns) > 1 and not tid:
+        # A `send` follow-up with no turn id: strictly after the message, or
+        # running a turn newer than the previous one.
+        started = ts > sent or (state == "running" and bool(prev_ts) and ts > prev_ts)
+    else:
+        started = ts >= sent and ts > 0
+    fresh = started or since >= sent
+    detail = row.get("detail", "")
+    if state == "needs-input" and fresh:
+        return "needs-input", state, detail, ch
+    if state == "failed" and fresh:
+        return "failed", state, detail or "failed", ch
+    if started:
+        if turn.get("turn_start") != ts:
+            ch["turn_start"] = ts
+        if tid and turn.get("turn_id") != tid:
+            ch["turn_id"] = tid
+        end = turn_ended(row, ts)
+        # Not over while running or paused or held for its own kids
+        # (@agent_kids_hold): a held Stop writes its turn end (real id,
+        # `loud`) while the state stays running, and the paused drain can then
+        # flip it to paused. A `paused` verdict is not over either.
+        held = state in ("running", "paused") or bool(row.get("kids_hold"))
+        if end and (end[2] == "paused" or state == "paused"):
+            if turn.get("status") != "paused":
+                ch["status"] = "paused"
+            return "paused", state, detail or "paused by agent-pause", ch
+        if end and not held:
+            st = "failed" if end[2] in ("failed", "limited") else "done"
+            det = "rate limited" if end[2] == "limited" else detail
+            if turn.get("status") != st or turn.get("turn_end") != end[0]:
+                ch.update(status=st, turn_end=end[0])
+            return st, state, det, ch
+        if row.get("limit"):
+            return "failed", state, "rate limited: " + one_line(row["limit"]), ch
+        if turn.get("status") != "running":
+            ch["status"] = "running"
+        return ("paused" if state == "paused" else "running"), state, detail, ch
+    # Not started. A child still busy (an earlier turn, a held one, paused)
+    # has the message queued: running, no grace, no dialog scan.
+    if state in ("running", "paused") or row.get("kids_hold"):
+        return ("paused" if state == "paused" else "running"), state, detail, ch
+    if row.get("limit") and fresh:
+        return "failed", state, "rate limited: " + one_line(row["limit"]), ch
+    if tm is not None and t - sent >= DIALOG_AFTER:
+        d = startup_dialog(tm, row["pane"])
+        if d:
+            return "needs-input", state, "startup dialog: " + d, ch
+    ref = sent
+    if len(turns) == 1 and digits(row.get("kid_since")):
+        ref = digits(row["kid_since"])
+    if t - ref >= GRACE:
+        if len(turns) == 1:
+            return "failed", state, "not started %ds after the spawn (no hook fired)" % GRACE, ch
+        return "failed", state, "no turn started %ds after the message (a draft may be holding it)" % GRACE, ch
+    return "starting", state, detail, ch
+
+
+def record_changes(sid, n, ch):
+    if not ch:
+        return
+
+    def fn(m):
+        for tr in m.get("turns") or []:
+            if tr.get("n") == n:
+                tr.update(ch)
+    update_meta(sid, fn)
+
+
+def look(meta, row, tm=None):
+    """refresh + observe + record: (meta, status, state, detail)."""
+    meta = refresh(meta, row)
+    st, state, detail, ch = observe(meta, row, tm)
+    if ch:
+        record_changes(meta["id"], meta["turns"][-1]["n"], ch)
+        meta = load_meta(meta["id"]) or meta
+    return meta, st, state, detail
+
+
+# ---------------------------------------------------------------- result
+
+def reply_for(meta, n, status, row, tm):
+    """(reply, source, freeze) for turn N. Order: a collected snapshot,
+    report.json, reply.md, the harness transcript, the screen. freeze = the
+    reply is known to belong to this turn (safe to snapshot)."""
+    sid = meta["id"]
+    turns = meta.get("turns") or []
+    turn = next((x for x in turns if x.get("n") == n), None)
+    if turn is None:
+        return None, "none", False
+    snap = read_file(reg(sid, "reply-%d.md" % n))
+    if snap is not None:
+        return snap, turn.get("reply_source") or "reply", False
+    if n != turns[-1].get("n") or status in ("running", "starting", "paused"):
+        return None, "none", False
+    sent = turn.get("sent_at") or 0
+    tstart = turn.get("turn_start") or sent
+    rep = read_file(reg(sid, "report.json"))
+    if rep:
+        try:
+            r = json.loads(rep)
+            if r.get("at", 0) >= sent and r.get("text"):
+                return (("[%s] %s" % (r["status"], r["text"])) if r.get("status") not in (None, "ok")
+                        else r["text"]), "report", True
+        except ValueError:
+            pass
+    # reply.md is the indicator's; a turn the watcher ended (no Stop) leaves
+    # the previous one there, so it counts only when @agent_reply_at (live)
+    # or its mtime (tab gone) is at or after this turn's start.
+    rp = reg(sid, "reply.md")
+    at = digits((row or {}).get("reply_at")) if row is not None else int(mtime(rp))
+    if at and at >= tstart:
+        t = read_file(rp)
+        if t and t.strip():
+            return t, "reply", True
+    if status != "needs-input":
+        child = meta.get("child") or {}
+        kind = child.get("harness") or child.get("kind")
+        tsid, path = child.get("session_id") or "", child.get("transcript") or ""
+        if row is not None and not (tsid and (path or kind in ("opencode", "grok"))):
+            tsid2, path2 = find_session(child.get("kind"), child.get("pane"), row)
+            tsid, path = tsid or tsid2, path or path2
+            if tsid or path:
+                def fn(m):
+                    m["child"]["session_id"] = tsid
+                    m["child"]["transcript"] = path
+                update_meta(sid, fn)
+        t = read_transcript("claude" if kind == "abby" else (child.get("kind") or kind), tsid, path)
+        if t:
+            # Frozen only when the transcript was written after this turn
+            # started (a later second: a same-second write proves nothing).
+            return t, "transcript", bool(path and int(mtime(path)) > tstart)
+    if row is not None:
+        o = tm.out("capture-pane", "-p", "-J", "-t", row["pane"], "-S", "-60")
+        if o and o.strip():
+            return o.rstrip("\n"), "screen", False
+    return None, "none", False
+
+
+def collect(meta, rows, tm, turn_n=None, max_chars=None, mark_read=True):
+    """The result dict for one spawn (and the side effects of reading it):
+    the latest turn unless TURN_N."""
+    sid = meta["id"]
+    row = child_row(meta, rows)
+    meta, st, state, detail = look(meta, row, tm)
+    turns = meta.get("turns") or []
+    latest = turns[-1]["n"] if turns else 1
+    n = turn_n or latest
+    reply, src, freeze = reply_for(meta, n, st if n == latest else "done", row, tm)
+    meta = load_meta(sid) or meta          # reply_for may have recorded the session
+    turns = meta.get("turns") or turns
+    # The turn is over (not paused): reading it collects it, reply or not.
+    final = n == latest and st in ("done", "failed")
+    if final and freeze and reply is not None and not os.path.exists(reg(sid, "reply-%d.md" % n)):
+        write_file(reg(sid, "reply-%d.md" % n), reply)
+
+    def fn(m):
+        for x in m.get("turns") or []:
+            if x.get("n") == n:
+                x["reply_source"] = src
+                x["collected"] = x.get("collected") or now()
+    if final and mark_read:
+        update_meta(sid, fn)
+        if row is not None:
+            tm.run("set-option", "-w", "-t", row["win"], "@agent_spawn_result", "read")
+        log_event(sid, "result collected (turn %d, %s)" % (n, src))
+        if meta.get("close_on_done") and st == "done" and row is not None:
+            close_child(meta, tm, row, by="parent")
+    truncated = False
+    if reply is not None and max_chars and len(reply) > max_chars:
+        reply = reply[:max_chars] + "\n[truncated %d chars]" % (len(reply) - max_chars)
+        truncated = True
+    child = meta.get("child") or {}
+    latest_tr = turns[-1] if turns else {}
+    return {
+        "id": sid, "harness": child.get("harness"), "status": st, "state": state, "detail": detail,
+        "reply": reply, "reply_source": src, "reply_turn": n, "truncated": truncated,
+        "session_id": child.get("session_id") or None, "transcript": child.get("transcript") or None,
+        "pane": child.get("pane"), "window": child.get("window"), "letter": (row or {}).get("key") or None,
+        "result": ("read" if final and mark_read and row is not None else (row or {}).get("result") or None),
+        "task": meta.get("task"), "started": latest_tr.get("turn_start"), "ended": latest_tr.get("turn_end"),
+        "turns": turns,
+    }
+
+
+def print_result(r):
+    head = "%s %s" % (r["id"], r["status"])
+    if r["state"] and r["state"] != r["status"]:
+        head += " (%s)" % r["state"]
+    if r["detail"] and r["status"] != "done":
+        head += ": " + r["detail"]
+    src = r["reply_source"]
+    head += " · %s · reply: %s" % (r["harness"], src)
+    if r["reply_turn"] != (r["turns"][-1]["n"] if r["turns"] else 1):
+        head += " (turn %d)" % r["reply_turn"]
+    print(head)
+    print("---")
+    print(r["reply"] if r["reply"] is not None else "(no reply yet)")
+
+
+# ---------------------------------------------------------------- tmux-mcp
+
+def mcp_call(tool, args, pane_hint=None, timeout=60):
+    """One tool call on the shared tmux-mcp server (the same protocol and
+    token file as tmux-workspace's tmux-mcp-call.py; the token is never on a
+    command line). pane_hint goes out as X-Tmux-Pane: the pane the call is
+    made on behalf of, which the server verifies. Returns the tool's text;
+    raises Fail(1) on any failure."""
+    token_file = os.path.join(os.path.expanduser("~"), ".local/state/tmux-mcp/token")
+    try:
+        with open(token_file) as f:
+            token = f.read().strip()
+    except OSError:
+        raise Fail(EXIT_ERR, "no tmux-mcp token at %s" % token_file)
+
+    def send(sid, payload, method="POST", t=timeout):
+        h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+             "Authorization": "Bearer " + token}
+        if pane_hint:
+            h["X-Tmux-Pane"] = pane_hint
+        if sid:
+            h["mcp-session-id"] = sid
+            h["mcp-protocol-version"] = "2025-06-18"
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(MCP_URL, data=data, method=method, headers=h)
+        with urllib.request.urlopen(req, timeout=t) as r:
+            return r.headers, r.read().decode("utf-8", "replace")
+
+    def response(body, want):
+        docs, s = [], body.strip()
+        if s[:1] in "{[":
+            docs.append(json.loads(s))
+        else:
+            data = []
+            for line in body.replace("\r\n", "\n").split("\n") + [""]:
+                if line.startswith("data:"):
+                    data.append(line[5:].lstrip())
+                elif not line.strip() and data:
+                    docs.append(json.loads("\n".join(data)))
+                    data = []
+        for d in docs:
+            for m in d if isinstance(d, list) else [d]:
+                if isinstance(m, dict) and m.get("id") == want:
+                    return m
+        raise Fail(EXIT_ERR, "tmux-mcp sent no response to request %s" % want)
+
+    sid = None
+    try:
+        hdrs, body = send(None, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "agent-spawn", "version": "1"}}}, t=10)
+        response(body, 1)
+        sid = hdrs.get("mcp-session-id")
+        send(sid, {"jsonrpc": "2.0", "method": "notifications/initialized"}, t=10)
+        _, body = send(sid, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                             "params": {"name": tool, "arguments": args}})
+        m = response(body, 2)
+    except urllib.error.HTTPError as e:
+        raise Fail(EXIT_ERR, "tmux-mcp HTTP %d" % e.code)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise Fail(EXIT_ERR, "tmux-mcp unreachable (%s)" % e)
+    finally:
+        if sid:
+            try:
+                send(sid, None, method="DELETE", t=5)
+            except Exception:
+                pass
+    if "error" in m:
+        raise Fail(EXIT_ERR, (m["error"] or {}).get("message", "tmux-mcp error"))
+    res = m.get("result") or {}
+    text = "\n".join(c.get("text", "") for c in res.get("content") or [] if c.get("type") == "text")
+    if res.get("isError"):
+        raise Fail(EXIT_ERR, text or "tmux-mcp tool error")
+    return text
+
+
+# ---------------------------------------------------------------- outbox
+# Wake messages to a parent, batched: every notice is a file under
+# _outbox/<parent>/; whoever holds that parent's lock waits until the oldest
+# is BATCH s old, then sends them all as ONE message_agent.
+
+def outbox_key(meta):
+    p = meta.get("parent") or {}
+    return re.sub(r"[^A-Za-z0-9]", "_", "%s-%s" % ((meta.get("server") or {}).get("start_time", ""), p.get("window", "")))
+
+
+# tmux-mcp answers some refusals as plain text, without isError.
+REFUSAL_RE = re.compile(r"has no agent session|is not an agent|not an agent (pane|tab|window)|no such pane"
+                        r"|unknown pane|refus|could not|couldn't|cannot|can't|not delivered|^\s*error", re.I)
+
+
+def enqueue(meta, text):
+    d = os.path.join(STATE, "_outbox", outbox_key(meta))
+    os.makedirs(d, exist_ok=True)
+    write_file(os.path.join(d, "%.6f-%s.json" % (time.time(), meta["id"])),
+               json.dumps({"id": meta["id"], "text": text, "pane": (meta.get("child") or {}).get("pane"),
+                           "tries": 0}))
+    flush_outbox(meta)
+
+
+def flush_outbox(meta):
+    """Send everything queued for this parent as one message. Entries are
+    removed only once tmux-mcp took the message; a failure keeps them
+    (tries + 1) for a retry here or by the next flush, at most 3 tries."""
+    key = outbox_key(meta)
+    d = os.path.join(STATE, "_outbox", key)
+    with Lock(os.path.join(STATE, "_outbox", key + ".lock")):
+        files = sorted(glob.glob(os.path.join(d, "*.json")))
+        if not files:
+            return
+        wait = min(mtime(f) for f in files) + BATCH - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        for attempt in range(3):
+            items = []
+            for f in sorted(glob.glob(os.path.join(d, "*.json"))):
+                try:
+                    i = json.loads(read_file(f) or "{}")
+                except ValueError:
+                    i = {}
+                if i.get("text"):
+                    items.append((f, i))
+                else:
+                    os.unlink(f)
+            if not items:
+                return
+            parent = meta.get("parent") or {}
+            tm, rows = live_tm(meta)
+            prow = (rows or {}).get(parent.get("pane", ""))
+            if not prow or prow["win"] != parent.get("window") or not prow["state"]:
+                for f, i in items:
+                    log_event(i["id"], "notice dropped: the parent is gone")
+                    os.unlink(f)
+                return
+            # Attribution (X-Tmux-Pane): a child of this batch whose tab still
+            # lives, else none. Every line names its child anyway.
+            hint = next((i["pane"] for _, i in items if i.get("pane") in (rows or {})
+                         and rows[i["pane"]]["spawn_id"] == i["id"]), None)
+            try:
+                text = mcp_call("message_agent", {"pane": parent["pane"],
+                                                  "message": "\n".join(i["text"] for _, i in items)},
+                                pane_hint=hint)
+                if REFUSAL_RE.search(text or ""):
+                    raise Fail(EXIT_ERR, "refused: " + one_line(text, 200))
+            except Fail as e:
+                for f, i in items:
+                    i["tries"] = i.get("tries", 0) + 1
+                    log_event(i["id"], "notice failed (try %d): %s" % (i["tries"], e.msg))
+                    if i["tries"] >= 3:
+                        os.unlink(f)
+                        log_event(i["id"], "notice dropped after 3 tries")
+                    else:
+                        write_file(f, json.dumps(i))
+                if attempt < 2:
+                    time.sleep(RETRY)
+                continue
+            for f, i in items:
+                os.unlink(f)
+                log_event(i["id"], "parent notified: " + i["text"])
+            return
+
+
+# ---------------------------------------------------------------- verbs
+
+def cmd_spawn(a, mode="async"):
+    if a.harness not in HARNESSES:
+        raise Fail(EXIT_REFUSED, "%s has no hooks agent-spawn can follow (hookless or unknown); "
+                   "children can be: %s" % (a.harness, ", ".join(HARNESSES)))
+    words = a.prompt or []
+    if words[:1] == ["--"]:
+        words = words[1:]
+    prompt = sys.stdin.read() if words == ["-"] else " ".join(words)
+    if not prompt.strip():
+        raise Fail(EXIT_USAGE, "empty prompt")
+    tm, pwin, ppane = resolve_caller(a.parent)
+    srv = server_of(tm)
+    if not srv:
+        raise Fail(EXIT_ERR, "no tmux server")
+    tm = Tmux(srv["socket"])
+    o = tm.out("display-message", "-p", "-t", ppane, US.join((
+        "#{window_id}", "#{session_id}", "#{session_name}", "#{@space_hidden}", "#{@space_home}",
+        "#{@agent_state}", "#{@agent_kind}", "#{@agent_harness}", "#{@agent_key}", "#{@pane_alias}",
+        "#{pane_current_path}", "#{@pty_claude_sid}")))
+    if not o:
+        raise Fail(EXIT_ERR, "can't read the parent pane %s" % ppane)
+    (pwin, psid, psname, phid, phome, pstate, pkind, pharn, pkey, palias, pcwd,
+     ppty_sid) = (o.rstrip("\n").split(US) + [""] * 12)[:12]
+    if not pstate:
+        raise Fail(EXIT_REFUSED, "the parent %s is not an agent window (no @agent_state)" % ppane)
+    wins = window_rows(tm)
+    # Hidden / home parent: the child would be invisible, or not a child.
+    vis = [w for w in wins if w["win"] == pwin and not hidden(w["hidden"])]
+    if not a.space and (phome or not vis):
+        raise Fail(EXIT_REFUSED, "the parent is %s; a child would not show there (pass --space NAME)"
+                   % ("a space's home tab" if phome else "in a hidden session"))
+    # Depth and fan-out limits, over the @agent_parent links that exist.
+    parent_of = {}
+    for w in wins:
+        parent_of.setdefault(w["win"], w["parent"])
+    chain, cur = [], pwin
+    while parent_of.get(cur) and parent_of[cur] in parent_of and parent_of[cur] not in chain and len(chain) < 32:
+        cur = parent_of[cur]
+        chain.append(cur)
+    root = chain[-1] if chain else pwin
+    depth = len(chain) + 1
+    if depth > MAX_DEPTH and not a.force:
+        raise Fail(EXIT_REFUSED, "a child here would be %d deep (limit %d; --force to go past)" % (depth, MAX_DEPTH))
+
+    def root_of(w):
+        seen = set()
+        while parent_of.get(w) in parent_of and w not in seen:
+            seen.add(w)
+            w = parent_of[w]
+        return w
+    kids = sum(1 for w in parent_of if w != root and parent_of.get(w) and root_of(w) == root)
+    if kids >= MAX_KIDS and not a.force:
+        raise Fail(EXIT_REFUSED, "%s already has %d live children (limit %d; --force to go past)" % (root, kids, MAX_KIDS))
+    table = harness_table()
+    row = table.get(a.harness)
+    if not row or row["kind"] == "-":
+        raise Fail(EXIT_REFUSED, "%s is hookless: agent-spawn could never tell when it finished" % a.harness)
+    if row["installed"] != "1":
+        raise Fail(EXIT_REFUSED, "%s is not installed" % a.harness)
+    if a.harness == "codex" and not a.force:
+        why = codex_trust()
+        if why:
+            raise Fail(EXIT_REFUSED, why)
+    if a.harness == "grok" and grok_leader():
+        raise Fail(EXIT_REFUSED, "grok runs in leader mode ([cli] use_leader): its hooks name the wrong pane")
+    # Where: the parent's space (or --space), right after its last child there.
+    if a.space:
+        sess = [w for w in wins if w["sname"] == a.space]
+        if not sess:
+            raise Fail(EXIT_REFUSED, "no space named %s" % a.space)
+        if hidden(sess[0]["hidden"]):
+            raise Fail(EXIT_REFUSED, "%s is a hidden session" % a.space)
+        tsid = sess[0]["sid"]
+    else:
+        tsid = psid if any(w["sid"] == psid for w in vis) else vis[0]["sid"]
+    in_sess = sorted((w for w in wins if w["sid"] == tsid), key=lambda w: int(w["index"] or 0))
+    after = None
+    for w in in_sess:
+        if w["parent"] == pwin:
+            after = w["win"]
+    if after is None:
+        after = pwin if any(w["win"] == pwin for w in in_sess) else in_sess[-1]["win"]
+    d = a.dir or (pcwd if a.parent else os.getcwd())
+    if not os.path.isdir(d):
+        raise Fail(EXIT_USAGE, "no such directory: %s" % d)
+    d = os.path.realpath(d)
+    sid = new_id()
+    while os.path.exists(reg(sid)):
+        sid = new_id()
+    os.makedirs(reg(sid), mode=0o700)
+    handle = palias or pkey or pwin.lstrip("@")
+    task = one_line(a.task or next((l for l in prompt.splitlines() if l.strip()), ""), 80)
+    body = "[task from @%s · agent-spawn %s]\n\n%s\n\n%s\n" % (handle, sid, prompt.strip("\n"),
+                                                              PREAMBLE.format(handle=handle))
+    write_file(reg(sid, "task.md"), body)
+    auto = launch_line(row, reg(sid, "task.md"), a.model or "", a.auto)
+    t0 = now()
+    psess_rec = session_record(ppane, "", ("claude", "codex", "opencode", "grok", "copilot", "agy"))
+    meta = {
+        "id": sid, "created": t0, "mode": mode, "notify": bool(a.notify and mode == "async"),
+        "close_on_done": bool(a.close_on_done), "cwd": d, "task": task, "server": srv,
+        "parent": {"window": pwin, "pane": ppane, "kind": pkind, "harness": pharn or pkind,
+                   "handle": handle, "key": pkey,
+                   "session_id": (psess_rec or {}).get("session_id", ""),
+                   "claude_sid": os.environ.get("CLAUDE_CODE_SESSION_ID") or ppty_sid or "",
+                   "cua_agent_id": os.environ.get("CUA_AGENT_ID", "")},
+        "child": {"pane": "", "window": "", "kind": row["kind"], "harness": a.harness, "letter": "",
+                  "session_id": "", "transcript": "", "model": a.model or "", "auto": bool(a.auto)},
+        "turns": [{"n": 1, "sent_at": t0, "turn_start": None, "turn_id": None, "turn_end": None,
+                   "status": "pending", "parent_session_id": (psess_rec or {}).get("session_id", "")}],
+    }
+    write_file(reg(sid, "meta.json"), json.dumps(meta, indent=1, ensure_ascii=False) + "\n")
+    log_event(sid, "spawn %s by %s (%s) in %s" % (a.harness, pwin, ppane, d))
+    # -d: no client's view moves. With -d the rest of new-window's own
+    # command list targets the CURRENT window, not the new one, so the birth
+    # is a second call with an explicit -t (all of it in that one call).
+    r = tm.run("new-window", "-d", "-a", "-t", "%s:%s" % (tsid, after), "-c", d, "-P", "-F",
+               "#{pane_id} #{window_id}", "-e", "ZSH_AUTOSTART=" + auto, "-e", "AGENT_PTY=",
+               "-e", "AGENT_ROLE=child", "-e", "AGENT_SPAWN_ID=" + sid, "-e", "AGENT_PARENT_PANE=" + ppane,
+               "-e", "AGENT_PARENT_KEY=" + pkey)
+    out = (r.stdout or "").strip().split()
+    if r.returncode != 0 or len(out) < 2 or not out[0].startswith("%"):
+        log_event(sid, "new-window failed: " + (r.stderr or r.stdout))
+        raise Fail(EXIT_ERR, "new-window failed: %s" % (r.stderr or r.stdout).strip())
+    pane, win = out[0], out[1]
+    t1 = now()
+    proj = "~" if d == os.path.realpath(HOME) else os.path.basename(d)[:20]
+    birth = [("@agent_state", "idle"), ("@agent_born", str(t1)), ("@agent_since", "%d idle" % t1),
+             ("@agent_summary", one_line(proj, 20) + "/New Session"), ("@agent_kind", row["kind"])]
+    if row["harness"] != "-":
+        birth.append(("@agent_harness", row["harness"]))
+    birth += [("@agent_parent", pwin), ("@agent_parent_pane", ppane), ("@agent_kid_since", str(t1)),
+              ("@agent_spawn_id", sid), ("@agent_spawn_task", task or a.harness), ("@agent_spawn_mode", mode)]
+    argv = []
+    for k, v in birth:
+        argv += (([";"] if argv else []) + ["set-option", "-w", "-t", win, k, v])
+    r = tm.run(*argv)
+    if r.returncode != 0:
+        log_event(sid, "birth failed: " + r.stderr)
+        # Nothing claimed the window yet (no state): take it back.
+        if not (tm.out("show-options", "-wqv", "-t", win, "@agent_state") or "").strip():
+            tm.run("kill-window", "-t", win)
+        raise Fail(EXIT_ERR, "could not mark %s as a child (%s); nothing was started" % (win, r.stderr.strip()))
+
+    def fn(m):
+        m["child"].update(pane=pane, window=win)
+    update_meta(sid, fn)
+    # KIDS' reconcile, once, now and synchronously, before the id is printed:
+    # the parent's @agent_kids moves at once (a parent turn ending within a
+    # second is still held for the child), and @agent_child, which the letter
+    # allocator keys off, exists before anyone draws the tab.
+    bash = "/opt/homebrew/bin/bash" if os.access("/opt/homebrew/bin/bash", os.X_OK) else "bash"
+    try:
+        subprocess.run([bash, "-c", '. "$1" && kids_reconcile', "_", SESSION_LIB], env=tm.env(),
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    log_event(sid, "born %s %s" % (pane, win))
+    return {"id": sid, "pane": pane, "window": win, "letter": "-", "harness": a.harness, "dir": d}
+
+
+def wait_ids(ids, mode="all", timeout=540, mark_read=True):
+    """Poll until all (or any) of IDS reach a final status; --all ends at
+    once when one asks (needs-input) or failed. Returns (results,
+    timed_out)."""
+    ids = list(dict.fromkeys(ids))
+    metas = {i: need_meta(i) for i in ids}
+    start = time.time()
+    deadline = start + timeout
+    graced = {}
+    for i, m in metas.items():
+        last = (m.get("turns") or [{}])[-1]
+        if last.get("collected") and last.get("status") == "done":
+            graced[i] = last.get("n")
+    while True:
+        done, cache = {}, {}
+        for i, m in list(metas.items()):
+            key = (m.get("server") or {}).get("socket", "")
+            if key not in cache:
+                cache[key] = live_tm(m)
+            tm, rows = cache[key]
+            m, st, state, detail = look(m, child_row(m, rows), tm)
+            metas[i] = m
+            if i in graced:
+                if m["turns"][-1]["n"] == graced[i] and st == "done" \
+                        and time.time() - start < min(FOLLOWUP_GRACE, timeout):
+                    continue
+                graced.pop(i)
+            if st in FINAL:
+                done[i] = st
+        urgent = any(v in ("needs-input", "failed") for v in done.values())
+        finished = (len(done) == len(ids) or urgent) if mode == "all" else bool(done)
+        timed = time.time() >= deadline
+        if finished or timed:
+            res = {}
+            for i, m in metas.items():
+                tm, rows = cache[(m.get("server") or {}).get("socket", "")]
+                res[i] = collect(m, rows, tm, mark_read=mark_read and i in done)
+            return [res[i] for i in ids], (timed and not finished)
+        time.sleep(POLL)
+
+
+def exit_for(results, timed_out, mode="all"):
+    if timed_out:
+        return EXIT_TIMEOUT
+    codes = [STATUS_EXIT.get(r["status"]) for r in results if r["status"] in FINAL]
+    if mode == "any" or not codes:
+        return codes[0] if codes else EXIT_TIMEOUT
+    for c in (EXIT_FAILED, EXIT_NEEDS, EXIT_GONE):
+        if c in codes:
+            return c
+    return EXIT_DONE
+
+
+def emit_wait(results, timed_out, a, timeout):
+    if a.json:
+        print(json.dumps(results if len(results) != 1 or not getattr(a, "single", False) else results[0],
+                         ensure_ascii=False))
+        return
+    for k, r in enumerate(results):
+        if k:
+            print()
+        if r["status"] not in FINAL and timed_out:
+            print("%s %s (still going after %ss; wait again)" % (r["id"], r["status"], timeout))
+            continue
+        print_result(r)
+
+
+def cmd_wait(a):
+    ids = a.ids
+    for i in ids:
+        if not valid_id(i):
+            raise Fail(EXIT_USAGE, "not a spawn id: %s" % i)
+    mode = "any" if a.any else "all"
+    caller = caller_of(a)
+    for i in dict.fromkeys(ids):
+        owner_ok(need_meta(i), caller)
+    res, timed = wait_ids(ids, mode, a.timeout)
+    emit_wait(res, timed, a, a.timeout)
+    return exit_for(res, timed, mode)
+
+
+def cmd_run(a):
+    info = cmd_spawn(a, mode="sync")
+    if not a.json:
+        print("%s %s %s %s" % (info["id"], info["pane"], info["window"], info["letter"]), file=sys.stderr)
+    res, timed = wait_ids([info["id"]], "all", a.timeout)
+    a.single = True
+    emit_wait(res, timed, a, a.timeout)
+    return exit_for(res, timed)
+
+
+def cmd_result(a):
+    m = need_meta(a.id)
+    owner_ok(m, caller_of(a))
+    tm, rows = live_tm(m)
+    r = collect(m, rows, tm, turn_n=a.turn, max_chars=a.max_chars)
+    if a.json:
+        print(json.dumps(r, ensure_ascii=False))
+    else:
+        print_result(r)
+    return STATUS_EXIT.get(r["status"], EXIT_DONE) if r["status"] in FINAL else EXIT_DONE
+
+
+def list_rows(a):
+    caller = None
+    if not a.all:
+        caller = resolve_caller(a.parent)
+        tm = caller[0]
+    else:
+        caller = resolve_caller(a.parent, required=False)
+        tm = caller[0] if caller else Tmux()
+    srv = server_of(tm)
+    out = []
+    cache = {}
+    for i in all_ids():
+        m = load_meta(i)
+        if not m:
+            continue
+        same = srv and (m.get("server") or {}).get("start_time") == srv["start_time"] \
+            and (m.get("server") or {}).get("socket") == srv["socket"]
+        if not a.all and (not same or (m.get("parent") or {}).get("window") != caller[1]):
+            continue
+        if not same and not a.all:
+            continue
+        key = (m.get("server") or {}).get("socket", "")
+        if key not in cache:
+            cache[key] = live_tm(m)
+        ltm, rows = cache[key]
+        row = child_row(m, rows)
+        m, st, state, detail = look(m, row, ltm)
+        out.append({"id": i, "harness": (m.get("child") or {}).get("harness"),
+                    "pane": (m.get("child") or {}).get("pane"), "window": (m.get("child") or {}).get("window"),
+                    "status": st, "state": state, "detail": detail,
+                    "result": (row or {}).get("result") or None, "task": m.get("task"),
+                    "parent": (m.get("parent") or {}).get("window"), "created": m.get("created"),
+                    "live": row is not None})
+    return out
+
+
+def cmd_list(a):
+    rows = list_rows(a)
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("(none)")
+    for r in rows:
+        print("%s  %-8s %-5s %-11s %-6s %s" % (r["id"], r["harness"], r["pane"] or "-", r["status"],
+                                             r["result"] or "-", r["task"] or ""))
+    return 0
+
+
+def caller_of(a):
+    """The caller (Tmux, window, pane), or None when it is no agent window
+    (Mack's shell). --parent must resolve."""
+    return resolve_caller(getattr(a, "parent", None), required=bool(getattr(a, "parent", None)))
+
+
+def owner_ok(m, c):
+    if c is not None and c[1] != (m.get("parent") or {}).get("window"):
+        raise Fail(EXIT_REFUSED, "%s is not your child (its parent is %s, you are %s)"
+                   % (m["id"], (m.get("parent") or {}).get("window"), c[1]))
+
+
+def check_owner(m, a):
+    """send/cancel/close, and wait/result (which mark read and may close),
+    act only on the caller's own children. A caller that is no agent window
+    (Mack's shell) may act on any."""
+    owner_ok(m, caller_of(a))
+
+
+def cmd_send(a):
+    m = need_meta(a.id)
+    check_owner(m, a)
+    words = a.msg[1:] if a.msg[:1] == ["--"] else a.msg
+    msg = sys.stdin.read() if words == ["-"] else " ".join(words)
+    if not msg.strip():
+        raise Fail(EXIT_USAGE, "empty message")
+    tm, rows = live_tm(m)
+    row = child_row(m, rows)
+    if row is None:
+        raise Fail(EXIT_GONE, "%s's tab is gone" % a.id)
+    t0 = now()
+
+    def fn(x):
+        tr = x.setdefault("turns", [])
+        n = (tr[-1]["n"] + 1) if tr else 1
+        psr = session_record(x["parent"]["pane"], "", ("claude", "codex", "opencode", "grok", "copilot", "agy"))
+        tr.append({"n": n, "sent_at": t0, "turn_start": None, "turn_id": None, "turn_end": None,
+                   "status": "pending", "parent_session_id": (psr or {}).get("session_id", "")})
+    update_meta(a.id, fn)
+    tm.run("set-option", "-uw", "-t", row["win"], "@agent_spawn_result")
+    text = mcp_call("message_agent", {"pane": row["pane"], "message": msg},
+                    pane_hint=(m.get("parent") or {}).get("pane"))
+    log_event(a.id, "send: " + msg)
+    print(json.dumps({"id": a.id, "status": "sent", "detail": text}) if a.json else (text or "sent"))
+    return 0
+
+
+def close_child(m, tm, row, by="parent"):
+    def fn(x):
+        x["closed_at"] = now()
+        x["closed_by"] = by
+    update_meta(m["id"], fn)
+    try:
+        r = subprocess.run(["bash", CLOSED_TABS, "close", row["pane"]], env=tm.env(), capture_output=True,
+                           text=True, timeout=60, stdin=subprocess.DEVNULL)
+        log_event(m["id"], "closed by %s (closed-tabs rc %d)" % (by, r.returncode))
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError) as e:
+        log_event(m["id"], "close failed: %s" % e)
+        return False
+
+
+def cmd_cancel(a):
+    m = need_meta(a.id)
+    check_owner(m, a)
+    tm, rows = live_tm(m)
+    row = child_row(m, rows)
+    if row is None:
+        raise Fail(EXIT_GONE, "%s's tab is gone" % a.id)
+    for k, key in enumerate(CANCEL_KEYS.get((m.get("child") or {}).get("kind"), ["Escape"])):
+        if k:
+            time.sleep(0.3)
+        tm.run("send-keys", "-t", row["pane"], key)
+
+    def fn(x):
+        x["cancelled_at"] = now()
+        if x.get("turns"):
+            x["turns"][-1]["status"] = "cancelled"
+    update_meta(a.id, fn)
+    log_event(a.id, "cancelled")
+    if a.close:
+        close_child(m, tm, row)
+    if a.json:
+        print(json.dumps({"id": a.id, "status": "cancelled", "closed": bool(a.close)}))
+    else:
+        print("%s cancelled%s" % (a.id, " and closed" if a.close else ""))
+    return 0
+
+
+def cmd_close(a):
+    m = need_meta(a.id)
+    check_owner(m, a)
+    tm, rows = live_tm(m)
+    row = child_row(m, rows)
+    if row is None:
+        raise Fail(EXIT_GONE, "%s's tab is gone" % a.id)
+    ok = close_child(m, tm, row)
+    if a.json:
+        print(json.dumps({"id": a.id, "status": "closed" if ok else "close-failed"}))
+    else:
+        print("%s %s" % (a.id, "closed (⌘Z brings it back)" if ok else "close failed"))
+    return 0 if ok else EXIT_ERR
+
+
+def cmd_report(a):
+    sid = ""
+    try:
+        tm, win, pane = resolve_caller(a.parent)
+        sid = (tm.out("show-options", "-wqv", "-t", win, "@agent_spawn_id") or "").strip()
+    except Fail:
+        pass
+    sid = sid or os.environ.get("AGENT_SPAWN_ID", "")
+    m = load_meta(sid) if sid else None
+    if not m:
+        raise Fail(EXIT_REFUSED, "this agent is no agent-spawn child (no @agent_spawn_id)")
+    if a.file == "-":
+        text = sys.stdin.read()
+    elif a.file:
+        text = read_file(a.file)
+        if text is None:
+            raise Fail(EXIT_USAGE, "can't read %s" % a.file)
+    else:
+        text = " ".join(a.text)
+    if not text.strip():
+        raise Fail(EXIT_USAGE, "empty report")
+    n = (m.get("turns") or [{"n": 1}])[-1]["n"]
+    write_file(reg(sid, "report.json"), json.dumps({"status": a.status, "text": text, "at": now(), "turn": n},
+                                                   ensure_ascii=False))
+    log_event(sid, "report (%s)" % a.status)
+    if a.json:
+        print(json.dumps({"id": sid, "status": "reported"}))
+        return 0
+    print("reported to @%s (%s)" % ((m.get("parent") or {}).get("handle"), sid))
+    return 0
+
+
+def cmd_whoami(a):
+    tm, win, pane = resolve_caller(a.parent)
+    sid = (tm.out("show-options", "-wqv", "-t", win, "@agent_spawn_id") or "").strip()
+    m = load_meta(sid) if sid else None
+    a.all = False
+    kids = list_rows(a)
+    info = {"window": win, "pane": pane, "spawn_id": sid or None,
+            "parent": (m or {}).get("parent"), "children": kids}
+    if a.json:
+        print(json.dumps(info, ensure_ascii=False))
+        return 0
+    print("you: %s %s" % (win, pane))
+    if m:
+        p = m.get("parent") or {}
+        print("you are subagent %s of @%s (%s %s)" % (sid, p.get("handle"), p.get("window"), p.get("pane")))
+    print("children: %s" % (len(kids) or "none"))
+    for r in kids:
+        print("  %s  %-8s %-5s %-11s %s" % (r["id"], r["harness"], r["pane"] or "-", r["status"], r["task"] or ""))
+    return 0
+
+
+def child_label(m):
+    c = m.get("child") or {}
+    return "%s (%s child %s)" % (m["id"], c.get("harness") or "?", c.get("pane") or "-")
+
+
+def cmd_deliver(a):
+    m = need_meta(a.id)
+    if m.get("mode") != "async" or not m.get("notify"):
+        return 0
+    tm, rows = live_tm(m)
+    row = child_row(m, rows)
+    m, st, state, detail = look(m, row, tm)
+    if row is not None and row.get("result") == "read":
+        return 0
+    if st not in FINAL:
+        return 0
+    # Once per (turn, status): an indicator Stop and the watcher's restore can
+    # both fire for one finish.
+    n = m["turns"][-1]["n"]
+    dup = {}
+
+    def fn(x):
+        t = x["turns"][-1]
+        sent = t.setdefault("notified", [])
+        if t.get("n") != n or st in sent:
+            dup["yes"] = 1
+        else:
+            sent.append(st)
+    update_meta(a.id, fn)
+    if dup:
+        return 0
+    word = {"done": "finished (done)", "failed": "finished (failed%s)" % (": " + one_line(detail, 60) if detail else ""),
+            "needs-input": "needs input (%s)" % one_line(detail, 60), "gone": "is gone",
+            "cancelled": "was cancelled"}[st]
+    enqueue(m, "[agent-spawn] %s '%s' %s. Run: agent-spawn result %s" % (child_label(m), m.get("task") or "", word, m["id"]))
+    return 0
+
+
+def cmd_notify_closed(a):
+    """A child tab closed (U10's closed-tabs/stash hooks, A9): tell the parent
+    once, only if the child was busy or its result was not collected, and
+    never when the parent closes in the same batch or closed it itself."""
+    m = need_meta(a.id)
+
+    def fn(x):
+        x["closed_at"] = x.get("closed_at") or now()
+    by_parent = m.get("closed_by") == "parent" and now() - (m.get("closed_at") or 0) < 120
+    update_meta(a.id, fn)
+    log_event(a.id, "tab closed%s" % (" with its parent" if a.parent_closing else ""))
+    if a.parent_closing or by_parent:
+        return 0
+    tm, rows = live_tm(m)
+    row = child_row(m, rows)
+    busy = a.busy
+    result = a.result
+    if row is not None:
+        if busy is None:
+            m, st, _, _ = look(m, row, None)
+            busy = st in ("running", "starting", "needs-input")
+        if result is None:
+            result = row.get("result") or ""
+    if busy is None:
+        busy = (m.get("turns") or [{}])[-1].get("status") in ("pending", "running")
+    if result is None:
+        result = "read" if (m.get("turns") or [{}])[-1].get("collected") else ""
+    if not busy and result == "read":
+        return 0
+    enqueue(m, "[agent-spawn] %s '%s' closed%s. agent-spawn result %s still works" % (
+        child_label(m), m.get("task") or "", " while still working" if busy else "", m["id"]))
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+def parser():
+    p = argparse.ArgumentParser(prog="agent-spawn", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sub = p.add_subparsers(dest="verb", required=True)
+
+    def spawn_flags(s):
+        s.add_argument("--harness", default="claude")
+        s.add_argument("--dir")
+        s.add_argument("--model")
+        s.add_argument("--task")
+        s.add_argument("--notify", dest="notify", action="store_true", default=True)
+        s.add_argument("--no-notify", dest="notify", action="store_false")
+        s.add_argument("--close-on-done", action="store_true")
+        s.add_argument("--auto", action="store_true")
+        s.add_argument("--space")
+        s.add_argument("--parent")
+        s.add_argument("--force", action="store_true")
+        s.add_argument("--json", action="store_true")
+        s.add_argument("prompt", nargs=argparse.REMAINDER)
+    spawn_flags(sub.add_parser("spawn"))
+    r = sub.add_parser("run")
+    r.add_argument("--timeout", type=float, default=540)
+    spawn_flags(r)
+    w = sub.add_parser("wait")
+    w.add_argument("ids", nargs="+")
+    g = w.add_mutually_exclusive_group()
+    g.add_argument("--any", action="store_true")
+    g.add_argument("--all", action="store_true")
+    w.add_argument("--timeout", type=float, default=540)
+    w.add_argument("--json", action="store_true")
+    w.add_argument("--parent")
+    s = sub.add_parser("result")
+    s.add_argument("id")
+    s.add_argument("--turn", type=int)
+    s.add_argument("--max-chars", type=int)
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--parent")
+    s = sub.add_parser("list")
+    s.add_argument("--all", action="store_true")
+    s.add_argument("--parent")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("send")
+    s.add_argument("id")
+    s.add_argument("--parent")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("msg", nargs="*")
+    s = sub.add_parser("cancel")
+    s.add_argument("id")
+    s.add_argument("--close", action="store_true")
+    s.add_argument("--parent")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("close")
+    s.add_argument("id")
+    s.add_argument("--parent")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("report")
+    s.add_argument("--status", choices=("ok", "blocked", "failed"), default="ok")
+    s.add_argument("--file")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--parent")
+    s.add_argument("text", nargs="*")
+    s = sub.add_parser("whoami")
+    s.add_argument("--parent")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("_deliver")
+    s.add_argument("id")
+    s = sub.add_parser("_notify-closed")
+    s.add_argument("id")
+    b = s.add_mutually_exclusive_group()
+    b.add_argument("--busy", dest="busy", action="store_true", default=None)
+    b.add_argument("--idle", dest="busy", action="store_false")
+    s.add_argument("--result")
+    s.add_argument("--parent-closing", action="store_true")
+    return p
+
+
+def main(argv=None):
+    os.umask(0o077)
+    a = parser().parse_args(argv)
+    try:
+        os.makedirs(STATE, mode=0o700, exist_ok=True)
+        v = a.verb
+        if v == "spawn":
+            info = cmd_spawn(a)
+            if a.json:
+                print(json.dumps(info))
+            else:
+                print("%s %s %s %s" % (info["id"], info["pane"], info["window"], info["letter"]))
+            return 0
+        if v in ("send", "cancel", "close", "result", "_deliver", "_notify-closed") and not valid_id(a.id):
+            raise Fail(EXIT_USAGE, "not a spawn id: %s" % a.id)
+        return {"run": cmd_run, "wait": cmd_wait, "result": cmd_result, "list": cmd_list, "send": cmd_send,
+                "cancel": cmd_cancel, "close": cmd_close, "report": cmd_report, "whoami": cmd_whoami,
+                "_deliver": cmd_deliver, "_notify-closed": cmd_notify_closed}[v](a)
+    except Fail as e:
+        print("agent-spawn: %s" % e.msg, file=sys.stderr)
+        return e.code
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -10,6 +10,10 @@
 #                                           in @launch_count (config load;
 #                                           every miss keeps it current)
 #   agent-launch.sh list                    the installed rows: id letter command
+#   agent-launch.sh table                   every row with its launch columns:
+#                                           id letter command kind harness
+#                                           prompt model installed(1|0)
+#                                           (agent-spawn's harness table)
 #   agent-launch.sh go LETTER CLIENT PANE   that agent in a new tab after PANE's
 #                                           window, in PANE's folder (⌘E's
 #                                           popup: ⏎ / a letter, as ⌘R)
@@ -47,6 +51,15 @@
 #              with @agent_harness set to the agent's id, which no GC touches
 #              on a window with no agent state; the command unsets it again
 #              when the agent exits, so the shell left behind is a plain one.
+# AGENT_ARGS (below the table) is how agent-spawn (~/.local/bin) hands each
+# agent a first prompt and a model; ⌘E uses neither:
+#   prompt:  --        `CMD -- PROMPT` (the prompt after end-of-options)
+#            pos       `CMD PROMPT` (abby: its wrapper passes argv to claude)
+#            -i | --prompt   `CMD -i PROMPT`: that flag's value, the TUI
+#                      with a first message (never -p: headless, which the
+#                      hooks drop)
+#            -         takes no prompt (hookless: agent-spawn refuses it)
+#   model:   the flag that picks a model (--model | -m), - for none.
 # Ollama is not a coding agent: not listed.
 #
 # INSTALLED means `command -v` finds the command's binary in tmux's PATH
@@ -85,6 +98,31 @@ AGENTS=(
   "copilot    p       copilot        copilot   -"
   "aider      d       aider          -         aider"
 )
+
+# LAUNCH ARGS, per id (agent-spawn's `table` columns): how a first prompt and
+# a model reach the agent. Its own table so the AGENTS rows keep their shape.
+#   id        prompt    model
+AGENT_ARGS=(
+  "claude     --        --model"
+  "abby       pos       --model"
+  "codex      --        -m"
+  "opencode   --prompt  -m"
+  "grok       --        -m"
+  "agy        -i        --model"
+  "cursor     -         -"
+  "copilot    -i        --model"
+  "aider      -         -"
+)
+
+# args_of ID: "<prompt> <model>" for ID, "- -" when it has no row.
+args_of() {
+  local r id pf mf
+  for r in "${AGENT_ARGS[@]}"; do
+    read -r id pf mf <<<"$r"
+    [[ "$id" == "$1" ]] && { printf '%s %s' "$pf" "$mf"; return 0; }
+  done
+  printf -- '- -'
+}
 
 DETECT_HOME="${LAUNCH_HOME:-$HOME}"
 DETECT_PATH="${LAUNCH_PATH:-$PATH}:$DETECT_HOME/.grok/bin:$DETECT_HOME/.local/bin:$DETECT_HOME/.pyenv/shims:$DETECT_HOME/.bun/bin:$DETECT_HOME/.cargo/bin"
@@ -128,6 +166,21 @@ cmd_refresh() {
   [[ "$now" == "$was" ]] || t set -g @launch_agents "$now" 2>/dev/null
   was="$(t show -gqv @launch_count 2>/dev/null)"
   [[ "$n" == "$was" ]] || t set -g @launch_count "$n" 2>/dev/null
+  return 0
+}
+
+# table: every row (installed or not) with its launch columns, for agent-spawn
+# (~/.local/bin), which starts a child agent with a first prompt and needs no
+# fifth copy of this table: "id letter command kind harness prompt model
+# installed(1|0)", one per line, in table order.
+cmd_table() {
+  local r id key cmd kind harness pflag mflag
+  for r in "${AGENTS[@]}"; do
+    read -r id key cmd kind harness <<<"$r"
+    read -r pflag mflag <<<"$(args_of "$id")"
+    if installed "$cmd"; then r=1; else r=0; fi
+    printf '%s %s %s %s %s %s %s %s\n' "$id" "$key" "$cmd" "$kind" "$harness" "$pflag" "$mflag" "$r"
+  done
   return 0
 }
 
@@ -254,7 +307,7 @@ cmd_open() {
   open_window "$target" "$dir"
 }
 
-[[ -n "${TMUX:-}${LAUNCH_TMUX_BIN:-}" ]] || [[ "${1:-}" == list ]] || {
+[[ -n "${TMUX:-}${LAUNCH_TMUX_BIN:-}" ]] || [[ "${1:-}" == list || "${1:-}" == table ]] || {
   echo "agent-launch: not inside tmux" >&2
   exit 1
 }
@@ -264,11 +317,12 @@ cmd_open() {
 case "${1:-}" in
   refresh) cmd_refresh; exit 0 ;;
   list) cmd_list ;;
+  table) cmd_table ;;
   go) shift; cmd_go "$@"; exit 0 ;;
   pick) shift; cmd_pick "$@"; exit 0 ;;
   open) shift; cmd_open "$@" ;;
   *)
-    echo "usage: agent-launch.sh refresh | list | go LETTER CLIENT PANE | pick [--print] [--after PID] LETTER CLIENT PANE | open ID TARGET DIR" >&2
+    echo "usage: agent-launch.sh refresh | list | table | go LETTER CLIENT PANE | pick [--print] [--after PID] LETTER CLIENT PANE | open ID TARGET DIR" >&2
     exit 2
     ;;
 esac

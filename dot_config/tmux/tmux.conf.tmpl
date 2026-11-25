@@ -1113,6 +1113,15 @@ set-hook -g 'window-unlinked[1]' 'run-shell -b "#{HOME}/.config/tmux/scripts/sta
 set-hook -g 'window-linked[1]' 'run-shell -b "notifyutil -p com.mackhaymond.tmux.agent-state"'
 set-hook -g 'window-unlinked[2]' 'run-shell -b "notifyutil -p com.mackhaymond.tmux.agent-state"'
 
+# KIDS reconcile on an unlink (docs/agent-tab-indicator.md §8 "External
+# subagents"): a parent or child tab closing has to re-count @agent_kids and
+# orphan the children of a gone parent, without waiting for the watcher tick.
+# The format guard costs nothing while no child exists (@agent_kids_any is set
+# by kids_plan only while some window carries @agent_parent), so the many pty
+# windows unlinking all day fork nothing. The hook line is tested verbatim by
+# tests/test_agent_kids.py, which reads it from the doc.
+set-hook -g 'window-unlinked[3]' { if -F '#{@agent_kids_any}' { run-shell -b "bash -c '[ \"\${BASH_VERSINFO[0]}\" -ge 4 ] && . \"\$HOME/.config/tmux/scripts/agent-session-lib.sh\" && kids_reconcile'" } }
+
 # Where Mack IS moved: the agent-ui sidebar (CMD+B) waits on this notice
 # instead of polling, so its "here" row follows a switch in ~10 ms
 # (docs/agent-roster.md "agent-ui sidebar: layout, sync, lifecycle").

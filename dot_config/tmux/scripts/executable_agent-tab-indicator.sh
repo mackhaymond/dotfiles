@@ -990,11 +990,24 @@ held_detail_take() {
 #                       written in a woken turn after it still counts.
 #   @agent_limit / @agent_limit_lifted   RATE-LIMITED AGENTS (below): dropped
 #                       wherever @agent_paused is, plus by a successful Stop.
+#   @agent_turn_end     "<epoch> <turn_id|-> <loud|quiet|paused|limited|failed>":
+#                       EVERY turn end, written in the same command list as
+#                       @agent_turn_result (turn_result_add), plus an
+#                       interrupt (loud, or quiet/paused as it restored) and
+#                       the watcher's turn ends that no Stop recorded. The
+#                       only turn-end signal agent-spawn's `wait` trusts: a
+#                       quiet finish restores @agent_since, so the old
+#                       since-based wait hung on it (EXTERNAL SUBAGENTS).
+#   @agent_reply_at     "<epoch>" of the last reply.md write (EXTERNAL
+#                       SUBAGENTS, child_reply).
+#   @agent_spawn_result "ready": a child's turn ended and its parent has not
+#                       collected it (agent-spawn result/wait set `read`,
+#                       send clears it).
 ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_prior_since
              @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
              @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused
              @agent_pause_voided @agent_turn_start @agent_limit @agent_limit_lifted
-             @agent_kids_hold)
+             @agent_kids_hold @agent_turn_end @agent_reply_at @agent_spawn_result)
 PRIOR_OPTS=(@agent_prior_state @agent_prior_since @agent_prior_detail_kind @agent_prior_detail)
 INBOUND_TTL=180
 US=$'\x1f'
@@ -1003,6 +1016,15 @@ US=$'\x1f'
 ss_add() {
     [ "${#ss_extra[@]}" -eq 0 ] || ss_extra+=(\;)
     ss_extra+=("$@")
+}
+# turn_result_add WIN TID REST [VERDICT]: @agent_turn_result "<TID> <REST>"
+# and, in the same command list, @agent_turn_end "<epoch> <TID> <VERDICT>"
+# (default: REST's first word - loud, quiet or paused).
+turn_result_add() {
+    local e v="${4:-${3%% *}}"
+    printf -v e '%(%s)T' -1 2>/dev/null || e=$(now_epoch)
+    ss_add set-option -w -t "$1" @agent_turn_result "$2 $3"
+    ss_add set-option -w -t "$1" @agent_turn_end "$e $2 $v"
 }
 prior_unset() {
     local o
@@ -1029,9 +1051,12 @@ origin_read() {
     O_LIMIT=""; O_LIFTED=""
     # PAUSE VOIDED (@agent_pause_voided, an epoch) is one more bare field.
     O_VOIDED=""
-    out=$(tmux display-message -p -t "$1" "x${US}#{@agent_turn_origin}${US}#{@agent_state}${US}#{@agent_since}${US}#{@agent_detail_kind}${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_result}${US}#{@agent_bg_owner}${US}#{@agent_paused}${US}#{@agent_turn_start}${US}#{@agent_limit}${US}#{@agent_limit_lifted}${US}#{@agent_pause_voided}${US}#{@agent_inbound}${US}#{@agent_inbound_seen}${US}#{@agent_detail}${US}#{@agent_prior_detail}${US}#{@agent_ask_seen}${US}#{@agent_for_user}" 2>/dev/null || true)
+    # @agent_turn_end ("<epoch> <id> <verdict>", bare tokens): child_reply's
+    # once-per-turn check.
+    O_TEND=""
+    out=$(tmux display-message -p -t "$1" "x${US}#{@agent_turn_origin}${US}#{@agent_state}${US}#{@agent_since}${US}#{@agent_detail_kind}${US}#{@agent_prior_state}${US}#{@agent_prior_since}${US}#{@agent_prior_detail_kind}${US}#{@agent_turn_result}${US}#{@agent_bg_owner}${US}#{@agent_paused}${US}#{@agent_turn_start}${US}#{@agent_limit}${US}#{@agent_limit_lifted}${US}#{@agent_pause_voided}${US}#{@agent_turn_end}${US}#{@agent_inbound}${US}#{@agent_inbound_seen}${US}#{@agent_detail}${US}#{@agent_prior_detail}${US}#{@agent_ask_seen}${US}#{@agent_for_user}" 2>/dev/null || true)
     case "$out" in "x$US"*) ;; *) return 0 ;; esac
-    IFS="$US" read -r x O_ORIGIN O_STATE O_SINCE O_DK O_PSTATE O_PSINCE O_PDK O_RESULT O_BGOWN O_PAUSED O_TSTART O_LIMIT O_LIFTED O_VOIDED O_INB O_SEEN O_DT O_PDT O_ASKSEEN O_FORUSER <<<"$out" || true
+    IFS="$US" read -r x O_ORIGIN O_STATE O_SINCE O_DK O_PSTATE O_PSINCE O_PDK O_RESULT O_BGOWN O_PAUSED O_TSTART O_LIMIT O_LIFTED O_VOIDED O_TEND O_INB O_SEEN O_DT O_PDT O_ASKSEEN O_FORUSER <<<"$out" || true
     case "$O_TSTART" in *[!0-9]*) O_TSTART="" ;; esac
     case "$O_BGOWN" in user|agent) ;; *) O_BGOWN="" ;; esac
     O_OKIND=""; O_OTID=""; O_OFROM=""
@@ -1572,6 +1597,7 @@ limit_mark() {
           \; set-option -w -t "$win" @agent_detail_kind limit
           \; set-option -w -t "$win" @agent_detail "$txt"
           \; set-option -w -t "$win" @agent_turn_result "$tid limited $r"
+          \; set-option -w -t "$win" @agent_turn_end "$e $tid limited"
           \; set-option -w -t "$win" @agent_since "$e paused"
           \; set-option -w -t "$win" @agent_state paused)
     tmux "${cmd[@]}" 2>/dev/null || true
@@ -3048,7 +3074,7 @@ def s: if type == "string" then . elif . == null then "" else tostring end;
    tool_name: (.toolCall.name? // null),
    tool_input: (.toolCall.args? // null),
    agent_id: (if $sub == "" then null else $sub end),
-   last_assistant_message: (.finalModelOutput // null | if type == "string" and test("\\S") then .[0:4000] else null end),
+   last_assistant_message: (.finalModelOutput // null | if type == "string" and test("\\S") then .[0:$cap] else null end),
    error: (if $err == "" then null else $err end),
    transcript_path: ""}
 | (if $mode != "done" then "keep"
@@ -3057,13 +3083,19 @@ def s: if type == "string" then . elif . == null then "" else tostring end;
    elif $fi == false then "donebg"
    else "done" end), tojson, $tp,
   (if $sub == "" then (.session_id | gsub("[^0-9A-Za-z-]"; "") | .[0:64]) else "" end)'
+# The reply these CLIs' Stops are given is capped at 4000 code points (only
+# its first line is shown); an agent-spawn child's (AGENT_SPAWN_ID in its env,
+# agent-spawn's new-window -e: the `watched` read comes later) is kept whole
+# up to the copilot tail's own 256 KiB, for its reply.md (EXTERNAL SUBAGENTS).
+REPLY_CAP=4000
+[ -z "${AGENT_SPAWN_ID:-}" ] || REPLY_CAP=262144
 cp_tp=""
 agy_bg=0   # 1 = an agy Stop with fullyIdle false (background tasks still out)
 if { [ "$agent" = copilot ] || [ "$agent" = agy ]; } && [ -n "$JQ" ] && [ -n "$payload" ]; then
     if [ "$agent" = copilot ]; then
         cp_out=$("$JQ" -r --arg mode "$mode" "$CP_NORM_JQ" <<<"$payload" 2>/dev/null || true)
     else
-        cp_out=$("$JQ" -r --arg mode "$mode" "$AGY_NORM_JQ" <<<"$payload" 2>/dev/null || true)
+        cp_out=$("$JQ" -r --arg mode "$mode" --argjson cap "$REPLY_CAP" "$AGY_NORM_JQ" <<<"$payload" 2>/dev/null || true)
     fi
     cp_dir=""; cp_new=""; cp_sid=""
     { IFS= read -r cp_dir; IFS= read -r cp_new; IFS= read -r cp_tp; IFS= read -r cp_sid; } <<<"$cp_out" || true
@@ -3129,11 +3161,11 @@ if { [ "$agent" = copilot ] || [ "$agent" = agy ]; } && [ -n "$JQ" ] && [ -n "$p
         if [ -n "$cp_file" ] && [ -f "$cp_file" ]; then
             cp_u="${cp_upat#*:}"; cp_u="${cp_u//\"/}"
             cp_lam=$(tail -c 262144 "$cp_file" 2>/dev/null | grep -F -e "$cp_pat" -e "$cp_upat" \
-                | "$JQ" -Rrn --arg u "$cp_u" 'def reply: '"$cp_get"';
+                | "$JQ" -Rrn --arg u "$cp_u" --argjson cap "$REPLY_CAP" 'def reply: '"$cp_get"';
                     reduce (inputs | fromjson? | objects) as $r ({seen: false, m: ""};
                       if ($r.type // "") == $u then {seen: true, m: ""}
                       elif .seen and (($r | reply) | type == "string" and test("\\S")) then .m = ($r | reply)
-                      else . end) | .m | .[0:4000]' \
+                      else . end) | .m | .[0:$cap]' \
                 2>/dev/null || true)
         fi
         if [ -n "$cp_lam" ]; then
@@ -3284,21 +3316,29 @@ fi
 # they cost no fork: @agent_parent (abby-delegate's mark: this window is a
 # child), @agent_child (the watcher's verdict that its parent is live) and
 # @agent_kids ("<total> <busy>": this window is a live root parent).
-watched=$(tmux display-message -p -t "$win" "#{window_active_clients}${US}#{@agent_parent}${US}#{@agent_child}${US}#{@agent_kids}" 2>/dev/null || true)
-KIDS_PARENT=""; KIDS_CHILD=""; KIDS_KIDS=""
+#   EXTERNAL SUBAGENTS (agent-spawn) ride it too: @agent_kids_sub (a live
+# parent at any depth: an intermediate's Stop is held for its own subtree),
+# @agent_spawn_id (this window is agent-spawn's child: its Stop writes
+# reply.md) and @agent_spawn_mode (async: its finish wakes the parent).
+watched=$(tmux display-message -p -t "$win" "#{window_active_clients}${US}#{@agent_parent}${US}#{@agent_child}${US}#{@agent_kids}${US}#{@agent_kids_sub}${US}#{@agent_spawn_id}${US}#{@agent_spawn_mode}" 2>/dev/null || true)
+KIDS_PARENT=""; KIDS_CHILD=""; KIDS_KIDS=""; KIDS_SUB=""; KIDS_SPAWN=""; KIDS_SPAWN_MODE=""
 case "$watched" in
-    *"$US"*"$US"*"$US"*)
-        kids_rest="${watched#*"$US"}"; watched="${watched%%"$US"*}"
-        KIDS_PARENT="${kids_rest%%"$US"*}"; kids_rest="${kids_rest#*"$US"}"
-        KIDS_CHILD="${kids_rest%%"$US"*}"; KIDS_KIDS="${kids_rest#*"$US"}" ;;
+    *"$US"*"$US"*"$US"*"$US"*"$US"*"$US"*)
+        IFS="$US" read -r watched KIDS_PARENT KIDS_CHILD KIDS_KIDS KIDS_SUB KIDS_SPAWN KIDS_SPAWN_MODE <<<"$watched" || true ;;
 esac
 case "$watched" in ''|*[!0-9]*) watched=0 ;; esac
+# The spawn id names a registry dir (~/.local/state/agent-spawn/<id>): held
+# to `s-` + letters and digits, else it is no child of agent-spawn's.
+case "$KIDS_SPAWN" in
+    s-?*) case "${KIDS_SPAWN#s-}" in *[!0-9A-Za-z]*) KIDS_SPAWN="" ;; esac ;;
+    *) KIDS_SPAWN="" ;;
+esac
 # The reconcile (kids_reconcile) runs only on a child's - or a parent's -
 # state change, from set_state / clear: the lib is sourced for those windows
 # alone, and only under bash 4+ (associative arrays). No lib: no reconcile,
 # the watcher's tick still does it.
 KIDS_OK=0
-if [ -n "$KIDS_PARENT$KIDS_KIDS" ] && [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] \
+if [ -n "$KIDS_PARENT$KIDS_KIDS$KIDS_SUB" ] && [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] \
    && . "$HOME/.config/tmux/scripts/agent-session-lib.sh" 2>/dev/null; then
     KIDS_OK=1
 fi
@@ -3308,6 +3348,60 @@ kids_now() {
     [ "$KIDS_OK" = 1 ] || return 0
     kids_reconcile 2>/dev/null || true
     tmux refresh-client -S 2>/dev/null || true
+}
+
+# EXTERNAL SUBAGENTS (docs/agent-tab-indicator.md §8). A window agent-spawn
+# opened carries @agent_spawn_id (KIDS_SPAWN, from the read above); its
+# registry dir is $AGENT_SPAWN_DIR/<id> (else $AGENT_SPAWN_STATE/<id>, else
+# ~/.local/state/agent-spawn/<id>, as agent-spawn and tmux-mcp resolve it;
+# created by agent-spawn: never here). agent-spawn's per-turn reply-<n>.md
+# snapshots are its own; only reply.md is written here.
+#   child_reply WIN: at a Stop, the turn's final message (the payload's
+#     last_assistant_message, whole, up to 1 MiB) into <dir>/reply.md, mode
+#     0600, atomically (tmp + mv), and @agent_reply_at in the Stop's own
+#     command list. ONCE PER TURN: a Stop whose turn id the window's
+#     @agent_turn_end already names (O_TEND, origin_read) wrote it already.
+#     Held Stops write it too (the reply is final; the turn ends later).
+#   spawn_ready WIN: @agent_spawn_result ready, in the command list of a turn
+#     end that leaves the window not running (a done/idle/failed finish; not
+#     a held Stop, not paused); spawn_deliver, after that write, wakes the
+#     parent for an async child (agent-spawn _deliver ID, detached through
+#     tmux run-shell -b, as limit_add: the hook's process group may be reaped).
+# Children only, Stops and failures only: no heartbeat cost.
+AGENT_SPAWN_DIR="${AGENT_SPAWN_DIR:-${AGENT_SPAWN_STATE:-$HOME/.local/state/agent-spawn}}"
+AGENT_SPAWN_BIN="${AGENT_SPAWN_BIN:-$HOME/.local/bin/agent-spawn}"
+spawn_go=0
+child_reply() {
+    local win="$1" dir tmp e te_id=""
+    [ -n "$KIDS_SPAWN" ] && [ -n "$JQ" ] && [ -n "$payload" ] || return 0
+    dir="$AGENT_SPAWN_DIR/$KIDS_SPAWN"
+    [ -d "$dir" ] || return 0
+    read -r _ te_id _ <<<"$O_TEND" || true
+    [ "$s_id" != - ] && [ "$te_id" = "$s_id" ] && return 0
+    tmp="$dir/.reply.$$"
+    if ( umask 077; "$JQ" -j '.last_assistant_message // ""
+                             | if type == "string" then . else tostring end | .[0:1048576]' \
+             <<<"$payload" > "$tmp" ) 2>/dev/null \
+       && mv -f "$tmp" "$dir/reply.md" 2>/dev/null; then
+        printf -v e '%(%s)T' -1 2>/dev/null || e=$(now_epoch)
+        ss_add set-option -w -t "$win" @agent_reply_at "$e"
+    else
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+}
+spawn_ready() {
+    [ -n "$KIDS_SPAWN" ] || return 0
+    ss_add set-option -w -t "$1" @agent_spawn_result ready
+    spawn_go=1
+}
+spawn_deliver() {
+    local launch
+    [ "$spawn_go" = 1 ] && [ "$KIDS_SPAWN_MODE" = async ] && [ -x "$AGENT_SPAWN_BIN" ] || return 0
+    spawn_go=0
+    printf -v launch '%q ' env "HOME=$HOME" "PATH=$PATH" "TMPDIR=${TMPDIR:-/tmp}" \
+        "AGENT_SPAWN_DIR=$AGENT_SPAWN_DIR" "$AGENT_SPAWN_BIN" _deliver "$KIDS_SPAWN"
+    launch+=' >/dev/null 2>&1'
+    tmux run-shell -b "$launch" >/dev/null 2>&1 || true
 }
 # ...and is the user actually LOOKING? See viewing_now (with the helpers).
 
@@ -3327,18 +3421,31 @@ case "$mode" in
         # limit (and the limit's own pause flag) like a Stop does.
         limit_end "$win" "$O_LIMIT" "$O_LIFTED" "$O_PAUSED"
         [ "$LIM_UNPAUSED" = 0 ] || O_PAUSED=""
+        # EXTERNAL SUBAGENTS: an interrupt ends the turn too (@agent_turn_end;
+        # no @agent_turn_result is written for it, as before), so a `wait`
+        # on an Esc'd child returns.
+        stop_fields
         if [ -n "$O_PAUSED" ]; then
             # Paused beats idle and the restore; flag re-checked in the same
             # command list, as the Stop does.
             ss_add if-shell -F -t "$win" '#{?#{@agent_paused},0,1}' \
                 "set-option -w -t $win @agent_state idle"
+            printf -v it_e '%(%s)T' -1 2>/dev/null || it_e=$(now_epoch)
+            ss_add set-option -w -t "$win" @agent_turn_end "$it_e $s_id paused"
             set_state "$win" paused
         elif [ -n "$O_PSTATE" ]; then
             prior_restore "$win"
+            printf -v it_e '%(%s)T' -1 2>/dev/null || it_e=$(now_epoch)
+            ss_add set-option -w -t "$win" @agent_turn_end "$it_e $s_id quiet"
+            spawn_ready "$win"
             set_state "$win" "$R_STATE"
         else
+            printf -v it_e '%(%s)T' -1 2>/dev/null || it_e=$(now_epoch)
+            ss_add set-option -w -t "$win" @agent_turn_end "$it_e $s_id loud"
+            spawn_ready "$win"
             set_state "$win" idle
         fi
+        spawn_deliver
         clear_pending "$win"
         ;;
     settle)
@@ -3895,12 +4002,14 @@ case "$mode" in
                 lf_lim="${lf%%"$US"*}"; lf="${lf#*"$US"}"
                 limit_end "$win" "$lf_lim" "${lf%%"$US"*}" "${lf#*"$US"}" ;;
         esac
-        ss_add set-option -w -t "$win" @agent_turn_result "$s_id loud"
+        turn_result_add "$win" "$s_id" loud failed
         prior_unset "$win"
         ss_add set-option -uw -t "$win" @agent_held_detail   # HELD DETAIL
         ss_add set-option -uw -t "$win" @agent_kids_hold     # DELEGATED CHILDREN
+        spawn_ready "$win"                                   # EXTERNAL SUBAGENTS
         take_detail failed fail "turn failed"
         set_state "$win" failed
+        spawn_deliver
         ;;
     done)
         # A turn that ended WAITING on work it launched has not finished, and
@@ -3958,11 +4067,15 @@ case "$mode" in
         # list-windows -a), because two children's reconciles racing can
         # leave @agent_kids stale. Its write, if any, fixes that too. A
         # failed read falls back to the option.
+        # EXTERNAL SUBAGENTS: any live parent, an INTERMEDIATE child included
+        # (@agent_kids_sub, its own subtree), not only a root. Children that
+        # are all paused hold it too; the watcher then drains it to `paused`.
         kids_hold=0
-        if [ -n "$KIDS_KIDS" ]; then
-            kids_busy_n="${KIDS_KIDS#* }"
+        if [ -n "$KIDS_KIDS$KIDS_SUB" ]; then
+            kids_busy_n="${KIDS_SUB#* }"
+            [ -n "$KIDS_SUB" ] || kids_busy_n="${KIDS_KIDS#* }"
             if [ "$KIDS_OK" = 1 ] && kids_reconcile 2>/dev/null; then
-                kids_busy_n="${KIDS_RUN[$win]:-0}"
+                kids_busy_n=$(( ${KIDS_RUN[$win]:-0} + ${KIDS_PAUSE[$win]:-0} ))
             fi
             case "$kids_busy_n" in ''|0|*[!0-9]*) ;; *) kids_hold=1; bg_pending=1 ;; esac
         fi
@@ -4041,6 +4154,8 @@ case "$mode" in
         fi
         limit_end "$win" "$O_LIMIT" "$O_LIFTED" "$O_PAUSED"
         [ "$LIM_UNPAUSED" = 0 ] || O_PAUSED=""
+        # EXTERNAL SUBAGENTS: an agent-spawn child's reply.md (see child_reply).
+        child_reply "$win"
         s_cls=user; s_unseen=0
         if [ -n "$O_OKIND" ] && [ "$s_id" = "$O_OTID" ]; then
             s_cls="$O_OKIND"
@@ -4124,7 +4239,7 @@ case "$mode" in
         # paused when it drains. The prior an agent turn saved is KEPT for
         # after the resume (see prior_save); the log mark never applies.
         if [ -n "$O_PAUSED" ]; then
-            ss_add set-option -w -t "$win" @agent_turn_result "$s_id paused"
+            turn_result_add "$win" "$s_id" paused
             ss_add set-option -uw -t "$win" @agent_quiet
             if [ "$bg_pending" -eq 1 ]; then
                 set_held
@@ -4148,28 +4263,34 @@ case "$mode" in
                 # Held running for its background work, prior kept: the
                 # watcher restores it when the work drains (or a wake-up
                 # turn's own quiet Stop does).
-                ss_add set-option -w -t "$win" @agent_turn_result "$s_id quiet $sd_hold"
+                turn_result_add "$win" "$s_id" "quiet $sd_hold"
                 set_held
             elif [ "$s_unseen" = 1 ] && [ -z "$O_PSTATE" ]; then
                 # A split-case turn that never went `running`: there is
                 # nothing to restore - leave the window exactly as it is.
                 dkind=""; dtext=""
                 cur_st=$(window_state "$win")
-                ss_add set-option -w -t "$win" @agent_turn_result "$s_id quiet ${cur_st:-idle}"
+                turn_result_add "$win" "$s_id" "quiet ${cur_st:-idle}"
+                [ "$cur_st" = running ] || spawn_ready "$win"
                 set_state "$win" "${cur_st:-idle}"
             else
                 prior_restore "$win"
-                ss_add set-option -w -t "$win" @agent_turn_result "$s_id quiet $R_STATE"
+                # EXTERNAL SUBAGENTS: the quiet follow-up a parent sent ends
+                # here with the prior's own @agent_since - @agent_turn_end
+                # is what says the turn is over (the abby-delegate wait hang).
+                turn_result_add "$win" "$s_id" "quiet $R_STATE"
+                spawn_ready "$win"
                 # The watcher's event log describes this transition as the
                 # reply it was ("↩ replied to @from"), not as a fresh finish
                 # carrying the restored detail; it consumes the mark.
                 ss_add set-option -w -t "$win" @agent_quiet "${O_OFROM:--}"
                 set_state "$win" "$R_STATE"
             fi
+            spawn_deliver
             compose_summary "$win" "$(extract_summary "$payload")" "$payload"
             exit 0
         fi
-        ss_add set-option -w -t "$win" @agent_turn_result "$s_id loud"
+        turn_result_add "$win" "$s_id" loud
         ss_add set-option -uw -t "$win" @agent_quiet   # never logged as a reply
         prior_unset "$win"
         if [ "$bg_pending" -eq 1 ]; then
@@ -4195,12 +4316,14 @@ case "$mode" in
         # kept - never an unseen green and never a finish of its own (the
         # notch acks it like any seen finish): its parent is the one that
         # finishes, once its last running child stops.
+        spawn_ready "$win"                                   # EXTERNAL SUBAGENTS
         if [ -n "$KIDS_CHILD" ] || viewing_now; then
             seen_op=1
             set_state "$win" idle
         else
             set_state "$win" "done"
         fi
+        spawn_deliver
         clear_pending "$win"
         compose_summary "$win" "$(extract_summary "$payload")" "$payload"
         ;;
@@ -4213,14 +4336,25 @@ case "$mode" in
         fi
         clear_state "$win"
         # DELEGATED CHILDREN: a child that ended leaves its parent's counts
-        # and drops abby-delegate's mark (the claude it named is gone; an
-        # agent started here next is nobody's child); a parent that ended is
-        # no longer live, so its children turn plain.
-        if [ -n "$KIDS_PARENT" ]; then
-            tmux set-option -uw -t "$win" @agent_parent \; \
-                 set-option -uw -t "$win" @agent_parent_pane \; \
-                 set-option -uw -t "$win" @agent_kid_since 2>/dev/null || true
-        fi
+        # and drops its link (the agent it named is gone; an agent started
+        # here next is nobody's child), and with it agent-spawn's identity
+        # and an ex-child's orphan label (EXTERNAL SUBAGENTS: the registry
+        # keeps the record). A parent that ended has no state now, so the
+        # reconcile below starts its children's orphan grace (kids_plan:
+        # orphaned for good once it stays stateless KIDS_ORPHAN_GRACE s). A
+        # SessionEnd for /clear or --resume exited above: both keep them.
+        # (Not in clear_state: codex's session switch runs that on a
+        # child's first hook, and the identity must survive it.) One call,
+        # whoever ended: SessionEnd is rare, and an orphan's label is not in
+        # the `watched` read.
+        tmux set-option -uw -t "$win" @agent_parent \; \
+             set-option -uw -t "$win" @agent_parent_pane \; \
+             set-option -uw -t "$win" @agent_kid_since \; \
+             set-option -uw -t "$win" @agent_kid_orphan \; \
+             set-option -uw -t "$win" @agent_kid_orphan_at \; \
+             set-option -uw -t "$win" @agent_spawn_id \; \
+             set-option -uw -t "$win" @agent_spawn_task \; \
+             set-option -uw -t "$win" @agent_spawn_mode 2>/dev/null || true
         kids_now
         ;;
     *)

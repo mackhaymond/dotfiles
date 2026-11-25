@@ -513,12 +513,12 @@ session_has_running_workflow() {
 #                            answering); or NOT STARTED - idle with no
 #                            @agent_turn_start (claude up, its first prompt
 #                            not submitted), or no @agent_state yet (the tab
-#                            before claude's SessionStart) for at most
-#                            KIDS_START_GRACE s from @agent_kid_since, which
-#                            this plan stamps the first time it sees the
-#                            marked tab stateless (and drops once it has a
-#                            state or loses its mark): a claude that never
-#                            starts must not hold the parent forever.
+#                            before claude's SessionStart) - either one for at
+#                            most KIDS_START_GRACE s from @agent_kid_since,
+#                            which this plan stamps the first time it sees the
+#                            marked tab not started (and drops once it starts
+#                            or loses its mark): a child that never starts
+#                            must not hold the parent forever.
 #                            `failed` and a finished `idle` / `done` are not
 #                            busy.
 #   root   @agent_kids_ask = "<child id>\t<child state>\t<child @agent_detail>"
@@ -531,14 +531,48 @@ session_has_running_workflow() {
 #                            when no child asks. The ONE
 #                            most urgent pointer (tab colour, CuaNotch);
 #                            NEEDS YOU lists every asking child itself.
+#   parent @agent_kids_sub = "<total> <busy>" over its OWN subtree, on EVERY
+#                            live parent (a root and an intermediate child
+#                            alike; on a root it equals @agent_kids). BUSY as
+#                            above. It is what holds an intermediate's Stop
+#                            (the indicator) and lights its gear (the watcher).
+#   ex-child @agent_kid_orphan = "<the old parent's letter, else its window
+#                            id>": written when the PARENT'S AGENT IS GONE -
+#                            its window closed (at once), or no @agent_state
+#                            any more (its SessionEnd's clear_state, the
+#                            watcher's GC) for KIDS_ORPHAN_GRACE s, from the
+#                            first plan that saw it so: that sighting is
+#                            @agent_kid_orphan_at "<epoch>" on the child,
+#                            unset again if the parent gets a state back.
+#                            The same write unsets the child's @agent_parent,
+#                            @agent_parent_pane, @agent_child and
+#                            @agent_kid_since, so an agent started in that
+#                            window later never adopts it. The child keeps its
+#                            @agent_spawn_* identity (agent-spawn result still
+#                            finds it). A parked (hidden) or home parent is
+#                            not gone: not live, but not severed either.
+#   global @agent_kids_any = 1 while any window carries an @agent_parent link,
+#                            unset when none does: the in-format guard of
+#                            tmux.conf's window-unlinked reconcile hook, so
+#                            that hook costs nothing while nobody delegates.
+#
+# BUSY is split for the HOLD (not for the counts above, which stay as they
+# were): KIDS_RUN[P] = P's busy descendants that are NOT paused, and
+# KIDS_PAUSE[P] = the paused ones, for every live parent P. A parent held only
+# by paused children drains to `paused` (the watcher), and back to `running`
+# when one resumes. A never-started child (no state, or idle with no
+# @agent_turn_start: targeted birth makes it idle + @agent_born at once) is
+# busy only for KIDS_START_GRACE s from @agent_kid_since, which this plan
+# stamps for exactly that window and drops once it starts.
 #
 # LIVE PARENT: window P exists, is not the child itself, has a non-empty
 # @agent_state, is no space's home window (@space_home: the sidebar never
 # draws a home as an agent), and at least one session it is linked into has
 # no @space_hidden (a parked parent sits in stash, which is hidden). The
 # CHILD must be visible the same way: a parked child is a plain agent and is
-# not counted. A parent that exited, was parked, or went back to being a
-# shell makes its children plain agents again at the next reconcile. The
+# not counted. A parked parent makes its children plain agents until it is
+# back; a parent whose agent exited (or whose window closed) ORPHANS them for
+# good (@agent_kid_orphan above). The
 # parent's own @agent_state is never written here: surfacing a child's ask is
 # the readers' job.
 #
@@ -547,28 +581,46 @@ session_has_running_workflow() {
 #   kids_reset; kids_row ... (one per list-windows / list-panes row); kids_plan
 # kids_plan leaves KIDS_CMD, ONE `\;`-chained tmux command list holding only
 # the writes that change something (argv, never re-parsed by tmux: details are
-# free text), and KIDS_RUN[P] = P's busy live children (parents only).
+# free text), and KIDS_RUN[P] / KIDS_PAUSE[P] = P's busy live descendants,
+# not paused / paused (every live parent, see BUSY above).
 # kids_apply runs KIDS_CMD. Requires bash 4 (associative arrays): callers on
 # an older bash must not source this for kids (the indicator checks).
 KIDS_US=$'\x1f'
 # Bare tokens first; the free text (@agent_detail, @agent_kids_ask) rides
 # last. The indicator strips controls from details, so neither holds a US.
-KIDS_FMT="#{window_id}${KIDS_US}#{@space_hidden}${KIDS_US}#{@agent_state}${KIDS_US}#{@agent_parent}${KIDS_US}#{@agent_child}${KIDS_US}#{@agent_kids}${KIDS_US}#{@agent_since}${KIDS_US}#{@agent_turn_start}${KIDS_US}#{@agent_pending}${KIDS_US}#{@space_home}${KIDS_US}#{@agent_kid_since}${KIDS_US}#{@agent_seen_at}${KIDS_US}#{@agent_detail}${KIDS_US}#{@agent_kids_ask}"
+# The four bare fields after @agent_seen_at (2026-11-24, external
+# subagents): @agent_kids_sub (to write only what changed), @agent_key (the
+# orphan label), the GLOBAL @agent_kids_any (a window format resolves it
+# to the global value, so it costs no call of its own) and
+# @agent_kid_orphan_at (the orphan grace's first sighting, digits).
+KIDS_FMT="#{window_id}${KIDS_US}#{@space_hidden}${KIDS_US}#{@agent_state}${KIDS_US}#{@agent_parent}${KIDS_US}#{@agent_child}${KIDS_US}#{@agent_kids}${KIDS_US}#{@agent_since}${KIDS_US}#{@agent_turn_start}${KIDS_US}#{@agent_pending}${KIDS_US}#{@space_home}${KIDS_US}#{@agent_kid_since}${KIDS_US}#{@agent_seen_at}${KIDS_US}#{@agent_kids_sub}${KIDS_US}#{@agent_key}${KIDS_US}#{@agent_kids_any}${KIDS_US}#{@agent_kid_orphan_at}${KIDS_US}#{@agent_detail}${KIDS_US}#{@agent_kids_ask}"
 declare -A K_SEEN K_VIS K_STATE K_PARENT K_CHILD K_KIDS K_SINCE K_DET K_ASK K_TSTART K_PEND K_HOME K_KSINCE K_SEENAT KIDS_RUN
-# How long a marked tab with no @agent_state yet counts as busy (see BUSY).
+declare -A K_SUB K_KEY K_OAT KIDS_PAUSE
+# K_EXIST: every window the read listed, kid fields or not (the caller sets
+# it for EVERY row, before its filter): a parent missing from it is GONE.
+declare -A K_EXIST
+# How long a marked tab that has not started counts as busy (see BUSY).
 KIDS_START_GRACE=60
+# How long a parent that still exists may have no @agent_state before its
+# children are orphaned (see ORPHAN): a codex session switch runs
+# clear_state and writes the new state only after its own reads, and a /clear
+# or --resume must keep the children.
+KIDS_ORPHAN_GRACE=5
 K_WINS=()
 KIDS_CMD=()
 K_ANY=""   # some row carried a kid field: without one, kids_plan is a no-op
+K_KANY=""  # @agent_kids_any (global) as read
 
 kids_reset() {
     K_SEEN=(); K_VIS=(); K_STATE=(); K_PARENT=(); K_CHILD=(); K_KIDS=()
     K_SINCE=(); K_DET=(); K_ASK=(); K_TSTART=(); K_PEND=(); K_HOME=(); K_KSINCE=(); K_SEENAT=()
-    KIDS_RUN=(); K_WINS=(); KIDS_CMD=(); K_ANY=""
+    K_SUB=(); K_KEY=(); K_OAT=(); K_EXIST=(); KIDS_PAUSE=()
+    KIDS_RUN=(); K_WINS=(); KIDS_CMD=(); K_ANY=""; K_KANY=""
 }
 
 # kids_row WIN HIDDEN STATE PARENT CHILD KIDS SINCE DETAIL ASK TURN_START
-# PENDING HOME KID_SINCE SEEN_AT: one row of a window (a window linked into several sessions
+# PENDING HOME KID_SINCE SEEN_AT [KIDS_SUB KEY KIDS_ANY ORPHAN_AT]: one row of a window
+# (a window linked into several sessions
 # comes once per link: its fields are taken from the first, and it is visible
 # if ANY link's session is not hidden). Callers may skip rows with no state
 # and no kid field at all: such a window can be neither a parent nor a child,
@@ -582,19 +634,27 @@ kids_row() {
         K_SINCE[$w]="$7"; K_DET[$w]="$8"; K_ASK[$w]="$9"
         K_TSTART[$w]="${10:-}"; K_PEND[$w]="${11:-}"; K_HOME[$w]="${12:-}"
         K_KSINCE[$w]="${13:-}"; K_SEENAT[$w]="${14:-}"
-        [ -z "$4$5$6$9${13:-}" ] || K_ANY=1
+        K_SUB[$w]="${15:-}"; K_KEY[$w]="${16:-}"; K_OAT[$w]="${18:-}"
+        [ -z "$4$5$6$9${13:-}${15:-}${18:-}" ] || K_ANY=1
     fi
+    [ -z "${17:-}" ] || { K_KANY=1; K_ANY=1; }
     # tmux's truth: hidden = non-empty and not "0".
     case "$2" in ''|0) K_VIS[$w]=1 ;; esac
 }
 
 # kids_busy WIN NOW KID_SINCE: is this child's turn not over (see BUSY
-# above)? KID_SINCE is the (planned) @agent_kid_since, digits.
+# above)? 0 = busy, 2 = busy but PAUSED, 1 = not busy. KID_SINCE is the
+# (planned) @agent_kid_since, digits. (Callers under set -e: `|| rc=$?`.)
 kids_busy() {
     case "${K_STATE[$1]}" in
-        running|needs-input|paused) return 0 ;;
+        running|needs-input) return 0 ;;
+        paused) return 2 ;;
         '') [ $(( $2 - 10#${3:-0} )) -lt "$KIDS_START_GRACE" ] ;;
-        idle) [ -n "${K_PEND[$1]}" ] || [ -z "${K_TSTART[$1]}" ] ;;
+        idle) [ -n "${K_PEND[$1]}" ] && return 0
+              [ -z "${K_TSTART[$1]}" ] || return 1
+              # Born (or up) but its first prompt never went in: busy for
+              # the grace only (A2), the same clock as a stateless tab's.
+              [ $(( $2 - 10#${3:-0} )) -lt "$KIDS_START_GRACE" ] ;;
         *) return 1 ;;
     esac
 }
@@ -611,9 +671,10 @@ kids_set() {
 }
 
 kids_plan() {
-    local w p r st e rk sa cur want now ks n
+    local w p r st e rk sa cur want now ks n rc any=""
     local -A want_child=() root=() want_ks=() n_tot=() n_run=() ask_w=() ask_r=() ask_e=() seen=()
-    KIDS_CMD=(); KIDS_RUN=()
+    local -A sever=() s_tot=() s_busy=() s_run=() s_pause=() want_oat=()
+    KIDS_CMD=(); KIDS_RUN=(); KIDS_PAUSE=()
     # COST: the watcher plans every tick. Nobody delegating (no kid field
     # anywhere) is the common case, and returns here; otherwise only the
     # windows involved reach kids_set. Measured 2026-11-17, builtins only:
@@ -622,15 +683,41 @@ kids_plan() {
     [ -n "$K_ANY" ] || return 0
     printf -v now '%(%s)T' -1
     # 1. Who is a live child of whom (the immediate parent), and the
-    #    not-started stamp of every marked, stateless tab (kept, or now).
+    #    not-started stamp of every marked tab that has not started - no
+    #    state, or idle with no @agent_turn_start (kept, or now).
     for w in ${K_WINS[@]+"${K_WINS[@]}"}; do
         p="${K_PARENT[$w]}"
-        if [ -n "$p" ] && [ -z "${K_STATE[$w]}" ]; then
+        [ -n "$p" ] || continue
+        # ORPHAN: the parent's agent is gone. Its window closed (not in the
+        # read at all): severed at once. Its window there with no state (its
+        # SessionEnd or the watcher's GC cleared it): severed once it has
+        # stayed so for KIDS_ORPHAN_GRACE s, counted from the first plan
+        # that saw it (@agent_kid_orphan_at on the child, dropped if the
+        # parent has a state again) - a codex session switch is stateless
+        # for a moment and keeps its children. Severed for good: an agent
+        # started in that window later adopts nobody. (A self-link is junk,
+        # never live, and left alone.)
+        if [ "$p" != "$w" ]; then
+            if [ -z "${K_EXIST[$p]+x}" ]; then
+                sever[$w]="${K_KEY[$p]:-$p}"
+                continue
+            elif [ -z "${K_SEEN[$p]+x}" ] || [ -z "${K_STATE[$p]}" ]; then
+                ks="${K_OAT[$w]}"
+                if [[ $ks =~ ^[0-9]{1,12}$ ]] && [ $(( now - 10#$ks )) -ge "$KIDS_ORPHAN_GRACE" ]; then
+                    sever[$w]="${K_KEY[$p]:-$p}"
+                    continue
+                fi
+                [[ $ks =~ ^[0-9]{1,12}$ ]] || ks="$now"
+                want_oat[$w]="$ks"
+            fi
+        fi
+        any=1
+        if [ -z "${K_STATE[$w]}" ] || { [ "${K_STATE[$w]}" = idle ] && [ -z "${K_TSTART[$w]}" ]; }; then
             ks="${K_KSINCE[$w]}"
             case "$ks" in ''|*[!0-9]*) ks="$now" ;; esac
             want_ks[$w]="$ks"
         fi
-        [ -n "$p" ] && [ "$p" != "$w" ] && [ -n "${K_SEEN[$p]+x}" ] \
+        [ "$p" != "$w" ] && [ -n "${K_SEEN[$p]+x}" ] \
             && [ -n "${K_STATE[$p]}" ] && [ -z "${K_HOME[$p]}" ] \
             && [ -n "${K_VIS[$p]+x}" ] && [ -n "${K_VIS[$w]+x}" ] || continue
         want_child[$w]="$p"
@@ -648,7 +735,20 @@ kids_plan() {
     for w in "${!root[@]}"; do
         r="${root[$w]}"
         n_tot[$r]=$(( ${n_tot[$r]:-0} + 1 ))
-        kids_busy "$w" "$now" "${want_ks[$w]:-}" && n_run[$r]=$(( ${n_run[$r]:-0} + 1 ))
+        rc=0; kids_busy "$w" "$now" "${want_ks[$w]:-}" || rc=$?
+        [ "$rc" = 1 ] || n_run[$r]=$(( ${n_run[$r]:-0} + 1 ))
+        # Every ancestor's own subtree (@agent_kids_sub, KIDS_RUN/PAUSE):
+        # up the immediate parents to the root (step 2 bounded the chain).
+        p="${want_child[$w]}"; n=0
+        while [ -n "$p" ] && [ "$n" -lt 33 ]; do
+            s_tot[$p]=$(( ${s_tot[$p]:-0} + 1 ))
+            case "$rc" in
+                0) s_busy[$p]=$(( ${s_busy[$p]:-0} + 1 )); s_run[$p]=$(( ${s_run[$p]:-0} + 1 )) ;;
+                2) s_busy[$p]=$(( ${s_busy[$p]:-0} + 1 )); s_pause[$p]=$(( ${s_pause[$p]:-0} + 1 )) ;;
+            esac
+            [ "$p" != "$r" ] || break
+            p="${want_child[$p]:-}"; n=$((n + 1))
+        done
         st="${K_STATE[$w]}"
         case "$st" in
             needs-input|failed)
@@ -671,13 +771,25 @@ kids_plan() {
         esac
     done
     for w in ${K_WINS[@]+"${K_WINS[@]}"}; do
-        [ -n "${want_child[$w]:-}${K_CHILD[$w]}${n_tot[$w]:-}${K_KIDS[$w]}${K_ASK[$w]}${want_ks[$w]:-}${K_KSINCE[$w]}" ] || continue
+        [ -n "${want_child[$w]:-}${K_CHILD[$w]}${n_tot[$w]:-}${K_KIDS[$w]}${K_ASK[$w]}${want_ks[$w]:-}${K_KSINCE[$w]}${s_tot[$w]:-}${K_SUB[$w]}${sever[$w]:-}${want_oat[$w]:-}${K_OAT[$w]}" ] || continue
+        if [ -n "${sever[$w]:-}" ]; then
+            # The orphan write (see ORPHAN above): the label, then the link.
+            KIDS_CMD+=(${KIDS_CMD[0]+\;} set-option -w -t "$w" @agent_kid_orphan "${sever[$w]}"
+                       \; set-option -uw -t "$w" @agent_parent \; set-option -uw -t "$w" @agent_parent_pane)
+        fi
+        kids_set "$w" @agent_kid_orphan_at "${want_oat[$w]:-}" "${K_OAT[$w]}"
         kids_set "$w" @agent_child "${want_child[$w]:-}" "${K_CHILD[$w]}"
         kids_set "$w" @agent_kid_since "${want_ks[$w]:-}" "${K_KSINCE[$w]}"
         want=""
+        if [ -n "${s_tot[$w]:-}" ]; then
+            want="${s_tot[$w]} ${s_busy[$w]:-0}"
+            KIDS_RUN[$w]="${s_run[$w]:-0}"
+            KIDS_PAUSE[$w]="${s_pause[$w]:-0}"
+        fi
+        kids_set "$w" @agent_kids_sub "$want" "${K_SUB[$w]}"
+        want=""
         if [ -n "${n_tot[$w]:-}" ]; then
             want="${n_tot[$w]} ${n_run[$w]:-0}"
-            KIDS_RUN[$w]="${n_run[$w]:-0}"
         fi
         kids_set "$w" @agent_kids "$want" "${K_KIDS[$w]}"
         want=""
@@ -687,6 +799,13 @@ kids_plan() {
         fi
         kids_set "$w" @agent_kids_ask "$want" "${K_ASK[$w]}"
     done
+    # The window-unlinked hook's guard (@agent_kids_any): set while any link
+    # is left after the severing above, unset when none is.
+    if [ -n "$any" ] && [ -z "$K_KANY" ]; then
+        KIDS_CMD+=(${KIDS_CMD[0]+\;} set-option -g @agent_kids_any 1)
+    elif [ -z "$any" ] && [ -n "$K_KANY" ]; then
+        KIDS_CMD+=(${KIDS_CMD[0]+\;} set-option -gu @agent_kids_any)
+    fi
     return 0
 }
 
@@ -703,12 +822,15 @@ kids_apply() {
 # instead folds its own per-tick read through kids_row (no extra fork).
 # Returns 1 when the read failed (nothing is known).
 kids_reconcile() {
-    local rows w h st p c k si ts pd hm ks sa d a
+    local rows w h st p c k si ts pd hm ks sa sub key kany oat d a
     rows=$(tmux list-windows -a -F "$KIDS_FMT" 2>/dev/null) || return 1
     kids_reset
-    while IFS="$KIDS_US" read -r w h st p c k si ts pd hm ks sa d a; do
-        [ -n "$st$p$c$k$a$ks" ] || continue
-        kids_row "$w" "$h" "$st" "$p" "$c" "$k" "$si" "$d" "$a" "$ts" "$pd" "$hm" "$ks" "$sa"
+    while IFS="$KIDS_US" read -r w h st p c k si ts pd hm ks sa sub key kany oat d a; do
+        [ -z "$w" ] || K_EXIST[$w]=1
+        # (kany: the global, on every row - so a stale guard is cleared here
+        # even when no window carries a kid field any more.)
+        [ -n "$st$p$c$k$a$ks$sub$kany" ] || continue
+        kids_row "$w" "$h" "$st" "$p" "$c" "$k" "$si" "$d" "$a" "$ts" "$pd" "$hm" "$ks" "$sa" "$sub" "$key" "$kany" "$oat"
     done <<<"$rows"
     kids_plan
     kids_apply

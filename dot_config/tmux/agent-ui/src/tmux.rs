@@ -250,13 +250,19 @@ impl Tmux {
 /// `kids` (`@agent_kids` `"<total> <busy>"`, on a parent) and `kids_ask`
 /// (`@agent_kids_ask` `"<child id>\t<state>\t<detail>"`, on a parent whose
 /// child asks or failed): [`crate::model::Kids`], [`crate::model::KidsAsk`].
-pub const FIELDS: [&str; 51] = [
+/// Then the RAW link, `parent` (`@agent_parent`) and `spawn_id`
+/// (`@agent_spawn_id`, agent-spawn's child): read ONLY by the letter
+/// allocator ([`crate::menu::letters::of_view`]: a child holds no pool
+/// letter from its birth on, before the reconciler's `@agent_child`, and
+/// while its parent is parked). Nothing else trusts them.
+pub const FIELDS: [&str; 53] = [
     "session", "index", "id", "name", "state", "summary", "workflow", "cua", "since", "last_attached",
     "blink", "stash_label", "stash_session", "stash_ts", "active", "panes", "path", "kind", "detail_kind",
     "detail", "stash_origin", "slot", "pending", "key", "mru_cur", "mru_prev", "home", "space_index",
     "space_hidden", "space_color", "stash_sel", "pane_flags", "rollout", "paused", "pinned", "session_id",
     "pin_key", "pending_space", "pending_request", "pending_color", "ask_bg", "limit", "limit_lifted",
     "harness", "thread_at", "stash_frozen", "stash_cold", "stash_wake", "child", "kids", "kids_ask",
+    "parent", "spawn_id",
 ];
 
 /// The pane option space.sh sets (to 1) on a space home's dashboard pane
@@ -278,7 +284,7 @@ pub const PANE_FLAGS: &str =
 
 /// The tmux format of each FIELDS entry, in order. (`#{pane_current_path}`
 /// is printed by [`path_format`], dashboard-aware.)
-pub const FORMATS: [&str; 51] = [
+pub const FORMATS: [&str; 53] = [
     "#{session_name}", "#{window_index}", "#{window_id}", "#{window_name}", "#{@agent_state}",
     "#{@agent_summary}", "#{@agent_workflow}", "#{@agent_cua}", "#{@agent_since}", "#{session_last_attached}",
     "#{@agent_blink}", "#{@stash_label}", "#{@stash_session}", "#{@stash_ts}", "#{window_active}",
@@ -289,6 +295,7 @@ pub const FORMATS: [&str; 51] = [
     "#{@pin_key}", "#{@pending_space}", "#{@pending_request}", "#{@pending_color}", "#{@agent_ask_bg}",
     "#{@agent_limit}", "#{@agent_limit_lifted}", "#{@agent_harness}", "#{@thread_at}", "#{@stash_frozen}",
     "#{@stash_cold}", "#{@stash_wake}", "#{@agent_child}", "#{@agent_kids}", "#{@agent_kids_ask}",
+    "#{@agent_parent}", "#{@agent_spawn_id}",
 ];
 
 /// Ends each path in the dashboard case of [`path_format`] (a private-use
@@ -419,7 +426,7 @@ pub fn fmt() -> String {
 /// the GLOBAL options the sidebar's status block shows in place of the
 /// hidden status line (usage, the stale-save mark, the open-sidebar count).
 /// Starts with an empty field and has 9 + [`STATUS_FORMATS`] fields where a
-/// window row has [`FIELDS`]' 51, so the two parsers can never take each other's rows.
+/// window row has [`FIELDS`]' 53, so the two parsers can never take each other's rows.
 pub const CLIENT_TAG: &str = "client";
 
 /// The client row's tail, in [`Status`] field order: what the sidebar draws
@@ -738,6 +745,10 @@ pub struct Window {
     /// [`crate::model::needs_order`] rebuilds agent-jump.sh's own raw row
     /// from it.
     pub raw_child: String,
+    /// `@agent_parent` / `@agent_spawn_id` as printed (trimmed): the raw
+    /// link and agent-spawn's identity, for the letter filter only.
+    pub raw_parent: String,
+    pub spawn_id: String,
 }
 
 /// A window id as tmux prints it: `@` and digits.
@@ -841,6 +852,8 @@ impl Window {
             kids: crate::model::Kids::parse(p[49]),
             kids_ask: crate::model::KidsAsk::parse(p[50]),
             raw_child: p[48].into(),
+            raw_parent: p[51].trim().into(),
+            spawn_id: p[52].trim().into(),
             label: label.into(),
             session,
         })
@@ -1213,7 +1226,8 @@ pub(crate) mod tests {
         assert_eq!((w.session.as_str(), w.label.as_str()), ("日本", "🫠 x\tz"));
     }
 
-    /// A row from an older format (48 fields, before the kids' options; 47,
+    /// A row from an older format (51 fields, before `parent` and `spawn_id`;
+    /// 48, before the kids' options; 47,
     /// before `stash_wake`; 45, before `stash_frozen` and `stash_cold`; 44,
     /// before `thread_at`; 43, before `harness`; 41, before `limit` and
     /// `limit_lifted`; 40, before `ask_bg`; 37, before the pending space's
@@ -1221,11 +1235,11 @@ pub(crate) mod tests {
     /// a field too many is no window: never misread by position.
     #[test]
     fn rows_of_the_wrong_length_are_rejected() {
-        assert_eq!(FIELDS.len(), 51);
-        for n in [34, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 52] {
+        assert_eq!(FIELDS.len(), 53);
+        for n in [34, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 54] {
             assert!(Window::parse(&vec!["x"; n].join("\x1f")).is_none(), "{n}");
         }
-        assert!(Window::parse(&vec!["x"; 51].join("\x1f")).is_some());
+        assert!(Window::parse(&vec!["x"; 53].join("\x1f")).is_some());
         assert_ne!(FIELDS.len(), CLIENT_FIELDS);
     }
 
@@ -1235,7 +1249,7 @@ pub(crate) mod tests {
     fn stash_wake_field_is_last() {
         assert_eq!((FIELDS[47], FORMATS[47]), ("stash_wake", "#{@stash_wake}"));
         assert!(fmt().contains(&format!("\x1f{}\x1f", guarded("#{@stash_wake}"))));
-        assert!(fmt().ends_with(&format!("\x1f{}", guarded("#{@agent_kids_ask}"))));
+        assert!(fmt().ends_with(&format!("\x1f{}", guarded("#{@agent_spawn_id}"))));
         let at = |v: &str| Window::parse(&row("stash", 1, "@1", &[("stash_wake", v)])).unwrap().stash_wake;
         assert_eq!(at(" 1792400000 "), Some(1_792_400_000));
         assert_eq!((at(""), at("soon"), at("-5")), (None, None, None));
@@ -1296,9 +1310,12 @@ pub(crate) mod tests {
         assert_eq!(w.harness, "");
     }
 
-    /// The format's last three fields: the kids' options, guarded.
+    /// The format's last five fields: the kids' options, then the raw link
+    /// and agent-spawn's id (the letter filter's), guarded.
     fn kids_tail() -> String {
-        ["#{@agent_child}", "#{@agent_kids}", "#{@agent_kids_ask}"].map(guarded).join("\x1f")
+        ["#{@agent_child}", "#{@agent_kids}", "#{@agent_kids_ask}", "#{@agent_parent}", "#{@agent_spawn_id}"]
+            .map(guarded)
+            .join("\x1f")
     }
 
     /// The kids' derived options ride last, guarded, and parse defensively:
@@ -1308,8 +1325,11 @@ pub(crate) mod tests {
     #[test]
     fn kids_fields() {
         use crate::model::{Kids, KidsAsk};
-        assert_eq!(&FIELDS[48..], ["child", "kids", "kids_ask"]);
-        assert_eq!(&FORMATS[48..], ["#{@agent_child}", "#{@agent_kids}", "#{@agent_kids_ask}"]);
+        assert_eq!(&FIELDS[48..], ["child", "kids", "kids_ask", "parent", "spawn_id"]);
+        assert_eq!(&FORMATS[48..], ["#{@agent_child}", "#{@agent_kids}", "#{@agent_kids_ask}", "#{@agent_parent}",
+            "#{@agent_spawn_id}"]);
+        let link = Window::parse(&row("main", 1, "@1", &[("parent", " @7 "), ("spawn_id", "s-ab1")])).unwrap();
+        assert_eq!((link.raw_parent.as_str(), link.spawn_id.as_str(), link.child.as_str()), ("@7", "s-ab1", ""));
         assert!(fmt().ends_with(&format!("\x1f{}", kids_tail())));
         let w = |set: &[(&str, &str)]| Window::parse(&row("main", 1, "@1", set)).unwrap();
         assert_eq!(w(&[("child", " @7 ")]).child, "@7");

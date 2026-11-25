@@ -1,0 +1,5 @@
+{"type":"USER_INPUT","content":"<USER_REQUEST>\n[task from @a · agent-spawn s-test0006] first\n</USER_REQUEST>"}
+{"type":"PLANNER_RESPONSE","content":"Old agy answer."}
+{"type":"USER_INPUT","content":"<USER_REQUEST>\n[message from @a] again\n</USER_REQUEST>"}
+{"type":"TOOL_CALL","content":"run ls"}
+{"type":"PLANNER_RESPONSE","content":"Agy final answer."}

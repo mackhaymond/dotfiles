@@ -254,10 +254,14 @@ pub fn of_view(snap: &Snapshot, view: &ViewModel, keys: Option<&mut KeyMemo>) ->
     }
     let mut raw: HashMap<&str, &str> = HashMap::new();
     let mut homes: HashSet<&str> = HashSet::new();
+    let mut kids: HashSet<&str> = HashSet::new();
     for w in &snap.windows {
         raw.entry(w.id.as_str()).or_insert(w.key.as_str());
         if w.home {
             homes.insert(w.id.as_str());
+        }
+        if !w.raw_parent.is_empty() || !w.spawn_id.is_empty() {
+            kids.insert(w.id.as_str());
         }
     }
     let eff = |id: &str| {
@@ -265,10 +269,23 @@ pub fn of_view(snap: &Snapshot, view: &ViewModel, keys: Option<&mut KeyMemo>) ->
         keys.as_deref().map_or_else(|| r.to_string(), |k| k.effective(id, r))
     };
     // (A window that is a home in ANY of its links is a home: never listed.)
+    // Nor is a delegated CHILD: `@agent_child` (the reconciler's verdict), the
+    // raw `@agent_parent` (from its birth on, before the first reconcile, and
+    // while its parent is parked) or `@agent_spawn_id` (agent-spawn's child,
+    // orphaned or not). It is reached through its parent (the nested rows,
+    // the menu, the parent's ask jump), so it holds no pool letter; a key it
+    // still carries is free and is unset once another window takes it (rule
+    // 4). An ex-child of abby-delegate's era (no spawn id), once orphaned,
+    // is listed again like any agent.
     // The FILL order: every agent first (display order), then every shell,
     // so when keys run short a new agent still gets one before a shell does.
-    let (agents, shells): (Vec<&Agent>, Vec<&Agent>) =
-        lettered(view).into_iter().filter(|a| !homes.contains(a.window_id.as_str())).partition(|a| !a.state.is_empty());
+    let (agents, shells): (Vec<&Agent>, Vec<&Agent>) = lettered(view)
+        .into_iter()
+        .filter(|a| {
+            let id = a.window_id.as_str();
+            !homes.contains(id) && !kids.contains(id) && a.child_of.is_none()
+        })
+        .partition(|a| !a.state.is_empty());
     let shown: Vec<(String, String)> =
         agents.into_iter().chain(shells).map(|a| (a.window_id.clone(), eff(&a.window_id))).collect();
     let ids: HashSet<&str> = shown.iter().map(|(id, _)| id.as_str()).collect();
@@ -612,6 +629,32 @@ mod tests {
         // @spaces off (classic, no ⌥W table): agents only, as before.
         let a = of_rows(&pool(&[("classic", "", "")]));
         assert_eq!((a.letters.len(), a.letters.get("@3"), a.letters.get("@6")), (3, None, None));
+    }
+
+    /// A delegated child (`@agent_child` naming its live parent, or the raw
+    /// `@agent_parent` / `@agent_spawn_id`) holds no pool letter: skipped
+    /// like a home, its old key free for the next window. An abby-era
+    /// ex-child with neither is an agent again.
+    #[test]
+    fn children_get_no_pool_letter() {
+        let a = of_rows(&pool(&[("@4", "child", "@2")]));
+        let got = |id: &str| a.letters.get(id).copied();
+        assert_eq!([got("@8"), got("@2"), got("@6"), got("@3")], [Some(s('a')), Some(s('s')), Some(s('d')), Some(s('f'))]);
+        assert_eq!(got("@4"), None);
+        // A child still carrying a key: free, unset once someone holds it.
+        let a = of_rows(&pool(&[("@4", "child", "@2"), ("@4", "key", "a")]));
+        assert_eq!(a.letters.get("@8"), Some(&s('a')));
+        assert!(a.writes.contains(&("@4".to_string(), None)), "{:?}", a.writes);
+        // The birth gap (and a parked parent): the raw link, no verdict yet.
+        let a = of_rows(&pool(&[("@4", "parent", "@2")]));
+        assert_eq!(a.letters.get("@4"), None);
+        assert_eq!(a.letters.len(), 4);
+        // agent-spawn's child, orphaned (link gone, identity kept): still none.
+        let a = of_rows(&pool(&[("@4", "spawn_id", "s-ab1")]));
+        assert_eq!(a.letters.get("@4"), None);
+        // An abby-era ex-child (no link, no spawn id): listed again.
+        let a = of_rows(&pool(&[]));
+        assert!(a.letters.contains_key("@4"));
     }
 
     /// Past 26: agents before shells. With every letter but one held by

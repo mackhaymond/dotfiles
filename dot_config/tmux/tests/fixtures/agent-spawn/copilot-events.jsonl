@@ -1,0 +1,7 @@
+{"type":"session.start","data":{"sessionId":"cop-1"}}
+{"type":"user.message","data":{"content":"[task from @a · agent-spawn s-test0005] first"}}
+{"type":"assistant.message","data":{"content":"Old Copilot answer."}}
+{"type":"user.message","data":{"content":"[message from @a] again"}}
+{"type":"assistant.message","data":{"content":"","toolRequests":[{"name":"bash","arguments":{"command":"ls"}}]}}
+{"type":"tool.execution_complete","data":{"result":"x"}}
+{"type":"assistant.message","data":{"content":"Copilot final answer."}}

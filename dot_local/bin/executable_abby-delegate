@@ -1,267 +1,107 @@
 #!/usr/bin/env bash
-# abby-delegate: abby's hands. abby (Claude Code on abliteration.ai) runs as
-# an orchestrator; the coding is done by real Claude agents (Anthropic
-# models, Mack's normal `claude`) in new tabs of abby's own tmux space.
+# abby-delegate: abby's hands, now a shim over agent-spawn (~/.local/bin),
+# which any agent can use to start a child agent of any hooked harness. Kept
+# one release so abby's prompt keeps working; prefer agent-spawn's ids.
 #
 #   abby-delegate spawn [--dir DIR] [--model MODEL] [--] PROMPT|-
-#       New tab right after abby's, in DIR (default: abby's cwd), running
-#       `claude` with PROMPT as its first message (- = read it from stdin).
-#       Opened in the background (no focus change). Born an agent the
-#       workspace's way (@agent_birth), so it gets a letter, a sidebar row,
-#       status hooks. Marked as abby's subagent: @agent_parent (abby's
-#       window id) and @agent_parent_pane on the new window, which the
-#       sidebar / tab dots / CuaNotch fold under abby. Prints: <pane id>
-#       <window id> <letter or ->.
-#   PANE below is the pane id spawn printed (%123) or the agent's letter
-#   (an overflow key past the 26 is two characters: quote it, ';a').
+#       = agent-spawn spawn --harness claude: a claude child in a background
+#       tab right after abby's last child. Prints "<pane id> <window id> -"
+#       (children get no letter) and then "id: <spawn id>".
+#   PANE below is the pane id spawn printed (%123), or a letter; it must be
+#   an agent-spawn child (@agent_spawn_id on its window), else refused.
 #   abby-delegate wait PANE [--timeout SECONDS]
-#       Until that agent's turn ends (done / needs-input / failed / back to
-#       idle after running), at most SECONDS (default 540, under the pty
-#       tool's 600 s cap; call again to keep waiting). Prints the state and
-#       the agent's last reply.
-#   abby-delegate last PANE        the agent's last reply, no waiting
-#   abby-delegate list             agents this abby spawned (pane, letter, state, dir)
+#       = agent-spawn wait <id>: until that child's turn ends (default 540 s).
+#       Prints "state: <status>", "---", then its reply.
+#   abby-delegate last PANE        its last reply (agent-spawn result <id>)
+#   abby-delegate list             this abby's children (agent-spawn list)
 #
-# Follow-ups go through the tmux MCP: mcp__tmux__message_agent (pane = the
-# letter or pane id), mcp__tmux__read_pane to look in. A tab can be closed
-# with ~/.config/tmux/scripts/closed-tabs.sh close PANE (⌘Z brings it back).
-#
-# The prompt is written to ~/.claude-abby/delegations/<id>.md and the tab
-# runs `claude "$(<that file)"`, so nothing in it is ever shell-parsed.
+# Follow-ups: agent-spawn send <id> MSG. Close: agent-spawn close <id>.
 
 set -u
-DELEG="$HOME/.claude-abby/delegations"
-LOG="$DELEG/spawned.tsv"   # epoch pane window dir
+AS="${AGENT_SPAWN_BIN:-$(dirname "$0")/agent-spawn}"
+[ -x "$AS" ] || AS=agent-spawn
 
 die() { printf 'abby-delegate: %s\n' "$*" >&2; exit 1; }
-sq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
-# "<window id> <pane id>" of the agent this runs for. abby runs its shell
-# commands through the pty MCP, whose shells live in their own windows (the
-# hidden agents session), so TMUX_PANE is the pty's pane, not abby's. A pty
-# window names its owner in @pty_claude_pid: the agent's tab is the pane on
-# that process's terminal. Anything else (a plain shell in abby's own pane,
-# tests) is TMUX_PANE itself.
-parent_of() {
-    local pane="$1" cpid tty
-    cpid="$(tmux show-options -wqv -t "$pane" @pty_claude_pid 2>/dev/null)"
-    if [[ "$cpid" =~ ^[0-9]+$ ]]; then
-        tty="$(ps -o tty= -p "$cpid" 2>/dev/null | tr -d ' ')"
-        if [ -n "$tty" ] && [ "$tty" != "??" ]; then
-            local hit
-            hit="$(tmux list-panes -a -F '#{pane_tty} #{window_id} #{pane_id}' 2>/dev/null \
-                | awk -v t="/dev/$tty" '$1 == t { print $2, $3; exit }')"
-            [ -n "$hit" ] && { printf '%s\n' "$hit"; return 0; }
-        fi
-    fi
-    tmux display-message -p -t "$pane" '#{window_id} #{pane_id}' 2>/dev/null
+# id_of PANE: the @agent_spawn_id of the live pane PANE (a %id, or an agent
+# letter matched against @agent_key). Nothing when there is none.
+id_of() {
+    local want="$1"
+    tmux list-panes -a -F "#{pane_id}"$'\t'"#{@agent_key}"$'\t'"#{@agent_spawn_id}" 2>/dev/null | awk -F'\t' -v w="$want" '
+        ($1 == w || ($2 == w && w !~ /^%/)) { print $3; exit }'
 }
 
-need_tmux() {
-    [ -n "${TMUX_PANE:-}" ] || die "not inside tmux (no TMUX_PANE): can't open a tab beside abby"
+need_id() {
+    local id
+    [ -n "${1:-}" ] || die "usage: abby-delegate $2 PANE"
+    id="$(id_of "$1")"
+    [[ "$id" == s-* ]] || die "$1 is not an agent-spawn child (no @agent_spawn_id); use agent-spawn ids"
+    printf '%s' "$id"
+}
+
+# fmt: agent-spawn's --json result(s) as the old "state: …\n---\nreply".
+fmt() {
+    python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+r = d[0] if isinstance(d, list) else d
+print("state: %s" % r["status"] + (" (%s)" % r["detail"] if r["status"] not in ("done",) and r.get("detail") else ""))
+print("---")
+print(r["reply"] if r.get("reply") is not None else "(no reply yet)")'
 }
 
 cmd_spawn() {
-    local dir="" model="" prompt=""
+    local -a args=(spawn --harness claude)
     while [ $# -gt 0 ]; do
         case "$1" in
-        --dir) dir="${2:-}"; shift 2 ;;
-        --model) model="${2:-}"; shift 2 ;;
+        --dir|--model) args+=("$1" "${2:-}"); shift 2 ;;
         --) shift; break ;;
         -) break ;;
         -*) die "unknown option $1" ;;
         *) break ;;
         esac
     done
-    if [ "${1:-}" = - ]; then prompt="$(cat)"; else prompt="$*"; fi
-    [ -n "${prompt//[[:space:]]/}" ] || die "empty prompt"
-    need_tmux
-    [ -n "$dir" ] || dir="$PWD"
-    [ -d "$dir" ] || die "no such directory: $dir"
-    dir="$(cd "$dir" && pwd -P)"
-
-    mkdir -p "$DELEG"
-    local id file
-    id="$(date +%Y%m%d-%H%M%S)-$$"
-    file="$DELEG/$id.md"
-    printf '%s\n' "$prompt" >"$file"
-
-    # A plain claude, never abby's: the tab's shell starts from the tmux
-    # server's environment, not abby's, but unset abby's variables anyway in
-    # case a session env carries them.
-    local auto="unset CLAUDE_CONFIG_DIR ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS; command claude"
-    [ -n "$model" ] && auto+=" --model $(sq "$model")"
-    auto+=" \"\$(<$(sq "$file"))\""
-
-    local wid ppane
-    read -r wid ppane <<<"$(parent_of "$TMUX_PANE")"
-    [[ "$wid" == @* ]] || die "can't find abby's window"
-    local out
-    # -d keeps every client's view where it is. But with -d, commands chained
-    # after new-window in its list target the CURRENT window (abby's), not the
-    # new one (measured on a test server), so @agent_birth can't ride along
-    # as agent-launch.sh's does; it is skipped (claude's SessionStart marks
-    # the tab within 1-3 s) and the parent mark goes in a second call with an
-    # explicit -t, long before claude has started in the new shell.
-    # After abby's last child in its session (else right after abby), so
-    # children line up in the order they were started.
-    local after="$wid" w p
-    while read -r w p; do
-        [ "$p" = "$wid" ] && after="$w"
-    done < <(tmux list-windows -t "$wid" -F '#{window_id} #{@agent_parent}' 2>/dev/null)
-    out="$(tmux new-window -d -a -t "$after" -c "$dir" -P -F '#{pane_id} #{window_id}' \
-        -e "ZSH_AUTOSTART=$auto" -e AGENT_PTY= 2>&1)" \
-        || die "new-window failed: $out"
-    out="${out%%$'\n'*}"
-    local pane win key=""
-    read -r pane win <<<"$out"
-    [[ "$pane" == %* ]] || die "new-window gave no pane: $out"
-    # @agent_parent = abby's window id, @agent_parent_pane = its pane: the
-    # tab is abby's subagent, not an agent of its own. The sidebar, tab
-    # dots, notifications and CuaNotch fold it under the parent (no own
-    # status, no NEEDS YOU of its own; the parent reads as working while it
-    # runs). A parent window that is gone makes it a plain agent again.
-    tmux set-option -w -t "$win" @agent_parent "$wid" \; \
-        set-option -w -t "$win" @agent_parent_pane "$ppane" 2>/dev/null \
-        || echo "abby-delegate: warning: couldn't mark $win as abby's subagent" >&2
-    # S's reconciler, once, now (agent-session-lib.sh kids_reconcile, bash
-    # 4+): puts @agent_kids on abby's window at once, so an abby turn that
-    # ends within a second of the spawn (before the watcher's next tick) is
-    # still held working for the child. A no-op if it isn't there.
-    /opt/homebrew/bin/bash -c 'source ~/.config/tmux/scripts/agent-session-lib.sh && kids_reconcile' \
-        </dev/null >/dev/null 2>&1 || true
-    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$pane" "$win" "$dir" >>"$LOG"
-    # The letter is handed out by the birth/hooks; give it a moment.
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        key="$(tmux show-options -wqv -t "$pane" @agent_key 2>/dev/null)"
-        [ -n "$key" ] && break
-        sleep 0.3
-    done
-    printf '%s %s %s\n' "$pane" "$win" "${key:--}"
-}
-
-state_of() { tmux show-options -wqv -t "$1" @agent_state 2>/dev/null; }
-
-# PANE as a pane id: a %id as given, or an agent letter looked up by
-# @agent_key. Nothing when no live pane matches. Checked against list-panes,
-# because `display-message -t` on a dead pane still succeeds (it falls back
-# to another target), so it can't tell gone from alive.
-resolve_pane() {
-    local want="$1"
-    tmux list-panes -a -F '#{pane_id} #{@agent_key}' 2>/dev/null | awk -v w="$want" '
-        $1 == w || ($2 == w && w !~ /^%/) { print $1; exit }'
-}
-
-# The transcript of the claude running in PANE (via ~/.claude/sessions/<pid>.json).
-transcript_of() {
-    local pane="$1" tty pid sf raw sid="" cwd=""
-    tty="$(tmux display-message -p -t "$pane" '#{pane_tty}' 2>/dev/null)" || return 1
-    [ -n "$tty" ] || return 1
-    for pid in $(ps -t "${tty#/dev/}" -o pid=,comm= 2>/dev/null | awk '$2 ~ /claude/ {print $1}'); do
-        sf="$HOME/.claude/sessions/$pid.json"
-        [ -f "$sf" ] || continue
-        raw="$(<"$sf")"
-        [[ $raw =~ \"sessionId\":\"([^\"]+)\" ]] && sid="${BASH_REMATCH[1]}"
-        [[ $raw =~ \"cwd\":\"([^\"]+)\" ]] && cwd="${BASH_REMATCH[1]}"
-        [ -n "$sid" ] && break
-    done
-    [ -n "$sid" ] || return 1
-    local f="$HOME/.claude/projects/${cwd//[^A-Za-z0-9]/-}/$sid.jsonl"
-    [ -f "$f" ] || f="$(ls "$HOME"/.claude/projects/*/"$sid".jsonl 2>/dev/null | head -n 1)"
-    [ -n "$f" ] && printf '%s\n' "$f"
-}
-
-cmd_last() {
-    local pane="${1:-}" f
-    [ -n "$pane" ] || die "usage: abby-delegate last PANE"
-    pane="$(resolve_pane "$pane")"
-    [ -n "$pane" ] || { echo "(no such pane: ${1})"; return 0; }
-    f="$(transcript_of "$pane")" || { echo "(no transcript yet)"; return 0; }
-    # The last assistant message that has text, from the file's tail.
-    tail -n 600 "$f" | jq -rs '
-        [ .[] | select(.type == "assistant")
-              | [ .message.content[]? | select(.type == "text") | .text ] | join("\n")
-              | select(length > 0) ] | last // "(no reply yet)"' 2>/dev/null | tail -c 6000
+    local out id pane win key rc
+    out="$("$AS" "${args[@]}" -- "$@")"
+    rc=$?
+    [ $rc -eq 0 ] || exit $rc
+    read -r id pane win key <<<"$out"
+    printf '%s %s %s\nid: %s\n' "$pane" "$win" "${key:--}" "$id"
 }
 
 cmd_wait() {
-    local pane="" timeout=540
+    local pane="" timeout=540 id out rc
     while [ $# -gt 0 ]; do
         case "$1" in
         --timeout) timeout="${2:-540}"; shift 2 ;;
         *) pane="$1"; shift ;;
         esac
     done
-    [ -n "$pane" ] || die "usage: abby-delegate wait PANE [--timeout S]"
-    local given="$pane"
-    pane="$(resolve_pane "$pane")"
-    [ -n "$pane" ] || die "no such pane: $given"
-    # A turn has ended when the agent is idle/done with @agent_detail_kind
-    # done and @agent_since (the epoch its state last changed) at or after
-    # that turn's @agent_turn_start. A delegated child's finish goes
-    # running -> idle (the tmux side marks it seen, so it never sits in
-    # NEEDS YOU), so this reads the stamps rather than waiting for "done",
-    # and a turn shorter than one poll still counts: its since is >= the
-    # wait's start. needs-input / failed end the wait at once.
-    #
-    # Already finished when the wait starts: a turn that BEGAN in the last
-    # 30 s is the one abby just kicked off (a short reply can end before
-    # `spawn` even returns: measured ~2 s on Haiku), so it's the answer.
-    # An older finish means either abby just sent a follow-up that hasn't
-    # started yet, or the turn ended a while ago: a new turn shows up within
-    # a few seconds of a message, so give it 15 s (grace); if none starts,
-    # the finish already there is the answer.
-    local start s since kind tstart line grace=15 had_finish=0
-    start=$(date +%s)
-    while :; do
-        [ -n "$(resolve_pane "$pane")" ] || { s=gone; break; }
-        line="$(tmux display-message -p -t "$pane" \
-            '#{@agent_state}|#{@agent_since}|#{@agent_detail_kind}|#{@agent_turn_start}' 2>/dev/null)" \
-            || { s=gone; break; }
-        IFS='|' read -r s since kind tstart <<<"$line"
-        since="${since%% *}"
-        [[ "$since" =~ ^[0-9]+$ ]] || since=0
-        [[ "$tstart" =~ ^[0-9]+$ ]] || tstart=0
-        case "$s" in
-        needs-input|failed) break ;;
-        running) had_finish=0 ;;
-        idle|done)
-            if [ "$kind" = done ] && [ "$since" -ge "$tstart" ]; then
-                [ "$since" -ge "$start" ] && break
-                [ "$tstart" -ge $(( start - 30 )) ] && break
-                had_finish=1
-                [ $(( $(date +%s) - start )) -ge "$grace" ] && break
-            fi ;;
-        "") s=starting ;;  # claude not up yet (a child has no birth mark)
-        esac
-        if [ $(( $(date +%s) - start )) -ge "$timeout" ]; then
-            printf 'state: %s (still going after %ss; wait again or read_pane)\n' "$s" "$timeout"
-            return 0
-        fi
-        sleep 2
-    done
-    [ "$had_finish" = 1 ] && [ "$s" != gone ] && s="$s (finished before this wait)"
-    printf 'state: %s\n---\n' "$s"
-    [ "$s" = gone ] || cmd_last "$pane"
+    id="$(need_id "$pane" wait)" || exit 1
+    out="$("$AS" wait "$id" --timeout "$timeout" --json)"
+    rc=$?
+    if [ $rc -eq 75 ]; then
+        printf 'state: %s (still going after %ss; wait again or read_pane)\n' \
+            "$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["status"])' 2>/dev/null || echo running)" "$timeout"
+        exit $rc
+    fi
+    [ -n "$out" ] || exit $rc
+    printf '%s' "$out" | fmt
+    exit $rc
 }
 
-cmd_list() {
-    [ -s "$LOG" ] || { echo "(none)"; return 0; }
-    local ts pane win dir key s
-    # A pane id can come back after a server restart: newest record per pane.
-    while IFS=$'\t' read -r ts pane win dir; do
-        s="$(state_of "$pane")"
-        [ -n "$s" ] || continue  # closed, or no longer an agent
-        key="$(tmux show-options -wqv -t "$pane" @agent_key 2>/dev/null)"
-        printf '%s  %-2s %-11s %s\n' "$pane" "${key:--}" "$s" "${dir/#"$HOME"/\~}"
-    done < <(awk -F'\t' '{ last[$2] = $0; order[$2] = NR } END { for (p in last) print order[p] "\t" last[p] }' "$LOG" \
-             | sort -n | cut -f2-)
+cmd_last() {
+    local id out
+    id="$(need_id "${1:-}" last)" || exit 1
+    out="$("$AS" result "$id" --json)"
+    [ -n "$out" ] || exit 1
+    printf '%s' "$out" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["reply"] if r.get("reply") is not None else "(no reply yet)")'
 }
 
 case "${1:-}" in
 spawn) shift; cmd_spawn "$@" ;;
 wait)  shift; cmd_wait "$@" ;;
 last)  shift; cmd_last "$@" ;;
-list)  cmd_list ;;
+list)  shift; exec "$AS" list "$@" ;;
 *) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac

@@ -161,7 +161,31 @@ class KidsReconcileTests(unittest.TestCase):
             self.assertFalse(self.s.has(w, "@agent_child"), w)
         for w in (p, hidden_p, selfish):
             self.assertFalse(self.s.has(w, "@agent_kids"), w)
-        self.assertEqual(self.writes(), [])
+            self.assertFalse(self.s.has(w, "@agent_kids_sub"), w)
+        # No window at all: an ORPHAN at once, for good. A parent window
+        # with no agent (a shell): the orphan grace starts (its first
+        # sighting stamped), and only once it has run out is it orphaned.
+        # A parked parent and a self-link: left as they are.
+        self.assertEqual(self.s.opt(ghost, "@agent_kid_orphan"), "@9999")
+        self.assertFalse(self.s.has(a, "@agent_kid_orphan"))
+        self.assertEqual(self.s.opt(a, "@agent_parent"), p)
+        stamp = self.s.opt(a, "@agent_kid_orphan_at")
+        self.assertLessEqual(abs(int(stamp) - time.time()), 5)
+        self.reconcile()
+        self.assertEqual(self.s.opt(a, "@agent_kid_orphan_at"), stamp)       # kept, not restamped
+        self.s.set(a, **{"@agent_kid_orphan_at": str(int(time.time()) - 6)})
+        self.reconcile()
+        self.assertEqual(self.s.opt(a, "@agent_kid_orphan"), p)
+        self.assertFalse(self.s.has(a, "@agent_kid_orphan_at"))
+        for w in (a, ghost):
+            self.assertFalse(self.s.has(w, "@agent_parent"), w)
+            self.assertFalse(self.s.has(w, "@agent_parent_pane"), w)
+        self.assertEqual(self.s.opt(parked, "@agent_parent"), hidden_p)
+        self.assertEqual(self.s.opt(selfish, "@agent_parent"), selfish)
+        self.assertFalse(self.s.has(parked, "@agent_kid_orphan"))
+        self.log.unlink()
+        self.reconcile()
+        self.assertEqual(self.writes(), [])                 # settled: nothing more
 
     def test_hidden_session_link_does_not_hide_a_visible_parent(self):
         p = self.parent()
@@ -172,32 +196,76 @@ class KidsReconcileTests(unittest.TestCase):
         self.assertEqual(self.s.opt(a, "@agent_child"), p)
         self.assertEqual(self.s.opt(p, "@agent_kids"), "1 1")
 
-    def test_parent_going_away_makes_children_plain(self):
+    def test_parent_stateless_for_a_moment_keeps_its_children(self):
+        # A codex session switch (/new): clear_state, then the new state a
+        # moment later. A plan in that gap must not orphan the children.
+        p = self.parent()
+        a = self.child(p, "running")
+        self.reconcile()
+        self.s.set(p, **{"@agent_state": None})
+        self.reconcile()
+        self.assertFalse(self.s.has(a, "@agent_child"))               # not live meanwhile
+        self.assertTrue(self.s.has(a, "@agent_kid_orphan_at"))
+        self.assertEqual(self.s.opt(a, "@agent_parent"), p)
+        self.s.set(p, **{"@agent_state": "idle"})
+        self.reconcile()
+        self.assertEqual(self.s.opt(a, "@agent_child"), p)            # back, linked
+        self.assertFalse(self.s.has(a, "@agent_kid_orphan_at"))
+        self.assertFalse(self.s.has(a, "@agent_kid_orphan"))
+        self.assertEqual(self.s.opt(p, "@agent_kids"), "1 1")
+
+    def test_parked_parent_makes_children_plain_and_killed_one_orphans_them(self):
         p = self.s.window()
         self.s.set(p, **{"@agent_state": "running"})
         a = self.child(p, "running")
         self.reconcile()
         self.assertEqual(self.s.opt(a, "@agent_child"), p)
-        # Back to a shell: not live.
-        self.s.set(p, **{"@agent_state": None})
-        self.reconcile()
-        self.assertFalse(self.s.has(a, "@agent_child"))
-        self.assertFalse(self.s.has(p, "@agent_kids"))
-        # Live again, then parked (moved into a hidden session), then gone.
-        self.s.set(p, **{"@agent_state": "idle"})
-        self.reconcile()
-        self.assertEqual(self.s.opt(a, "@agent_child"), p)
+        # Parked (moved into a hidden session): plain while away, linked again
+        # once back.
         self.s.session("stash", hidden=True)
         self.s.tmux("move-window", "-d", "-s", p, "-t", "stash:")
         self.reconcile()
         self.assertFalse(self.s.has(a, "@agent_child"))
+        self.assertEqual(self.s.opt(a, "@agent_parent"), p)
         self.s.tmux("move-window", "-d", "-s", p, "-t", "s:")
         self.reconcile()
         self.assertEqual(self.s.opt(a, "@agent_child"), p)
+        # Killed: orphaned by window id (no letter known).
         self.s.tmux("kill-window", "-t", p)
         self.reconcile()
+        for o in ("@agent_child", "@agent_parent", "@agent_parent_pane"):
+            self.assertFalse(self.s.has(a, o), o)
+        self.assertEqual(self.s.opt(a, "@agent_kid_orphan"), p)
+
+    def test_parent_exit_orphans_children_and_a_new_agent_adopts_none(self):
+        p = self.s.window()
+        self.s.set(p, **{"@agent_state": "running", "@agent_key": "q"})
+        a = self.child(p, "running", **{"@agent_spawn_id": "s-abc1", "@agent_spawn_task": "Parser"})
+        g = self.child(a, "running")                         # a grandchild stays a's
+        self.reconcile()
+        self.assertEqual(self.s.opt(p, "@agent_kids"), "2 2")
+        # The parent's agent exits (its SessionEnd's clear_state, or the GC),
+        # and stays gone past the orphan grace.
+        self.s.set(p, **{"@agent_state": None})
+        self.reconcile()
+        self.assertFalse(self.s.has(a, "@agent_kid_orphan"))           # the grace runs
+        self.s.set(a, **{"@agent_kid_orphan_at": str(int(time.time()) - 6)})
+        self.reconcile()
+        self.assertEqual(self.s.opt(a, "@agent_kid_orphan"), "q")    # its letter
+        for o in ("@agent_parent", "@agent_parent_pane", "@agent_child", "@agent_kid_since"):
+            self.assertFalse(self.s.has(a, o), o)
+        self.assertEqual(self.s.opt(a, "@agent_spawn_id"), "s-abc1")  # the identity stays
+        for o in ("@agent_kids", "@agent_kids_sub", "@agent_kids_ask"):
+            self.assertFalse(self.s.has(p, o), o)
+        # a is a root now: its own child is counted under it.
+        self.assertEqual(self.s.opt(g, "@agent_child"), a)
+        self.assertEqual(self.s.opt(a, "@agent_kids"), "1 1")
+        # A new agent in the parent's window adopts nobody.
+        self.s.set(p, **{"@agent_state": "running"})
+        self.reconcile()
         self.assertFalse(self.s.has(a, "@agent_child"))
-        self.assertEqual(self.s.opt(a, "@agent_parent"), p)      # abby's mark is left alone
+        self.assertFalse(self.s.has(p, "@agent_kids"))
+        self.assertFalse(self.s.has(p, "@agent_kids_sub"))
 
     # --- the ask ---
 
@@ -249,19 +317,96 @@ class KidsReconcileTests(unittest.TestCase):
         self.assertEqual(self.s.opt(p, "@agent_kids"), "1 1")
         self.reconcile()
         self.assertEqual(self.s.opt(c, "@agent_kid_since"), stamp)   # kept, not restamped
-        self.s.set(c, **{"@agent_kid_since": str(int(time.time()) - 61)})
+        old = str(int(time.time()) - 61)
+        self.s.set(c, **{"@agent_kid_since": old})
         self.reconcile()
         self.assertEqual(self.s.opt(p, "@agent_kids"), "1 0")       # claude never came: not busy
-        # It starts after all: a state, so the stamp goes.
+        # Up at last, but its first prompt never went in: still not started,
+        # on the same clock (A2).
         self.s.set(c, **{"@agent_state": "idle"})
         self.reconcile()
+        self.assertEqual(self.s.opt(c, "@agent_kid_since"), old)
+        self.assertEqual(self.s.opt(p, "@agent_kids"), "1 0")
+        # Its first prompt goes in: started, so the stamp goes.
+        self.s.set(c, **{"@agent_state": "running", "@agent_turn_start": str(int(time.time()))})
+        self.reconcile()
         self.assertFalse(self.s.has(c, "@agent_kid_since"))
-        self.assertEqual(self.s.opt(p, "@agent_kids"), "1 1")       # up, first prompt not in yet
+        self.assertEqual(self.s.opt(p, "@agent_kids"), "1 1")
         # A stamp on a tab that lost its mark goes too.
         d = self.s.window()
         self.s.set(d, **{"@agent_kid_since": "5"})
         self.reconcile()
         self.assertFalse(self.s.has(d, "@agent_kid_since"))
+
+    def test_born_child_that_never_starts(self):
+        # A2: agent-spawn's targeted birth makes the child idle + @agent_born
+        # at once; with no @agent_turn_start it is busy for the grace only.
+        p = self.parent()
+        born = str(int(time.time()) - 5)        # agent-spawn stamps it in the birth call
+        c = self.child(p, "idle", started=False, **{"@agent_born": born, "@agent_kid_since": born})
+        self.reconcile()
+        stamp = self.s.opt(c, "@agent_kid_since")
+        self.assertEqual(stamp, born)                               # kept until it starts
+        self.assertEqual(self.s.opt(p, "@agent_kids"), "1 1")       # held: it is starting
+        self.reconcile()
+        self.assertEqual(self.s.opt(c, "@agent_kid_since"), stamp)   # kept
+        self.s.set(c, **{"@agent_kid_since": str(int(time.time()) - 61)})
+        self.reconcile()
+        self.assertEqual(self.s.opt(p, "@agent_kids"), "1 0")       # never started: not busy
+        self.assertEqual(self.s.opt(c, "@agent_child"), p)          # still its child
+        out = self.plan("${KIDS_RUN[%s]:-x} ${KIDS_PAUSE[%s]:-x}" % (p, p))
+        self.assertEqual(out, "0 0")
+
+    def plan(self, expr):
+        """kids_reconcile, then print EXPR (bash) - KIDS_RUN / KIDS_PAUSE."""
+        r = subprocess.run(["bash", "-c", '. "$1"; kids_reconcile; eval "echo \"$2\""', "_", str(LIB), expr],
+                           env=clean_env(PATH="%s:%s" % (self.bin, os.environ["PATH"])),
+                           text=True, capture_output=True, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def test_every_live_parent_carries_its_own_subtree(self):
+        p = self.parent()
+        c = self.child(p, "running")                  # an intermediate: its Stop held for g
+        g = self.child(c, "running")
+        h = self.child(c, "idle")                     # finished
+        self.reconcile()
+        self.assertEqual(self.s.opt(p, "@agent_kids"), "3 2")
+        self.assertEqual(self.s.opt(p, "@agent_kids_sub"), "3 2")    # a root: the same
+        self.assertEqual(self.s.opt(c, "@agent_kids_sub"), "2 1")
+        self.assertFalse(self.s.has(c, "@agent_kids"))               # still root-only
+        for w in (g, h):
+            self.assertFalse(self.s.has(w, "@agent_kids_sub"))
+        self.assertEqual(self.plan("${KIDS_RUN[%s]} ${KIDS_RUN[%s]}" % (p, c)), "2 1")
+        self.s.set(g, **{"@agent_state": "idle"})
+        self.reconcile()
+        self.assertEqual(self.s.opt(c, "@agent_kids_sub"), "2 0")
+
+    def test_paused_children_are_busy_but_split_for_the_hold(self):
+        p = self.parent()
+        self.child(p, "paused"); self.child(p, "paused"); self.child(p, "idle")
+        self.reconcile()
+        self.assertEqual(self.s.opt(p, "@agent_kids"), "3 2")        # counts as before
+        self.assertEqual(self.s.opt(p, "@agent_kids_sub"), "3 2")
+        self.assertEqual(self.plan("${KIDS_RUN[%s]} ${KIDS_PAUSE[%s]}" % (p, p)), "0 2")
+
+    def test_kids_any_guard_follows_the_links(self):
+        p = self.parent()
+        self.assertEqual(self.s.tmux("show-options", "-gqv", "@agent_kids_any"), "")
+        a = self.child(p, "running")
+        self.reconcile()
+        self.assertEqual(self.s.tmux("show-options", "-gqv", "@agent_kids_any"), "1")
+        self.log.unlink()
+        self.reconcile()
+        self.assertEqual(self.writes(), [])                          # read back: no rewrite
+        self.s.set(a, **{"@agent_parent": None})
+        self.reconcile()
+        self.assertEqual(self.s.tmux("show-options", "-gqv", "@agent_kids_any"), "")
+        # Gone even when no window carries a kid field any more.
+        self.s.tmux("set-option", "-g", "@agent_kids_any", "1")
+        self.s.set(a, **{"@agent_child": None}); self.s.set(p, **{"@agent_kids": None, "@agent_kids_sub": None})
+        self.reconcile()
+        self.assertEqual(self.s.tmux("show-options", "-gqv", "@agent_kids_any"), "")
 
     def test_grandchildren_belong_to_the_root(self):
         p = self.parent()
@@ -541,18 +686,175 @@ class KidsIndicatorTests(ao.OriginHarness):
                                                          "source": "startup"})
                 self.assertFalse(self.has("@agent_kids_hold"))
 
-    def test_parent_session_end_turns_its_children_plain(self):
+    def test_parent_session_end_orphans_its_children(self):
         c = self.make_parent("running")
         self.set_opt("@agent_state", "idle")
+        self.set_opt("@agent_key", "a")
         self.t("set-option", "-w", "-t", c, "@agent_child", self.win)
         self.set_opt("@agent_kids", "1 1")
+        self.set_opt("@agent_kids_sub", "1 1")
         self.set_opt("@agent_kids_hold", "1")
+        # /clear and --resume keep them (A8): the SessionEnd exits early.
+        for reason in ("clear", "resume"):
+            self.hook("clear", "claude", payload={"session_id": "s1", "reason": reason})
+            self.assertEqual(self.wopt(c, "@agent_parent"), self.win)
+            self.assertEqual(self.wopt(c, "@agent_child"), self.win)
         self.hook("clear", "claude", payload={"session_id": "s1", "reason": "other"})
         self.assertFalse(self.has("@agent_state"))
         self.assertFalse(self.has("@agent_kids_hold"))
         self.assertFalse(self.whas(c, "@agent_child"))
-        self.assertTrue(self.whas(c, "@agent_parent"))      # the child's own mark: only its own end drops it
+        self.assertTrue(self.whas(c, "@agent_kid_orphan_at"))         # the orphan grace runs
+        self.t("set-option", "-w", "-t", c, "@agent_kid_orphan_at", str(int(time.time()) - 6))
+        r = subprocess.run(["bash", "-c", '. "$1"; kids_reconcile', "_", str(LIB)], env=self.env,
+                           text=True, capture_output=True, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for o in ("@agent_child", "@agent_parent", "@agent_parent_pane", "@agent_kid_orphan_at"):
+            self.assertFalse(self.whas(c, o), o)
+        self.assertEqual(self.wopt(c, "@agent_kid_orphan"), "a")
         self.assertFalse(self.has("@agent_kids"))
+        self.assertFalse(self.has("@agent_kids_sub"))
+        # The next agent in this window is nobody's parent.
+        self.prompt("fresh start", "u9")
+        self.stop("u9")
+        self.assertFalse(self.whas(c, "@agent_child"))
+        self.assertEqual(self.opt("@agent_state"), "done")
+
+    # --- turn ends and results (EXTERNAL SUBAGENTS) ---
+
+    def spawned(self, mode="async"):
+        """This window as agent-spawn's child of a fresh parent: the registry
+        dir, the identity, and a stub agent-spawn that logs its argv."""
+        p = self.make_child()
+        sid = "s-k3x9ab12"
+        self.reg = self.home / ".local/state/agent-spawn" / sid
+        self.reg.mkdir(parents=True)
+        self.set_opt("@agent_spawn_id", sid)
+        self.set_opt("@agent_spawn_mode", mode)
+        self.deliver_log = self.root / "deliver.log"
+        stub = self.root / "agent-spawn"
+        stub.write_text('#!/bin/sh\necho "$*" >> "%s"\n' % self.deliver_log)
+        stub.chmod(0o755)
+        self.env["AGENT_SPAWN_BIN"] = str(stub)
+        return p, sid
+
+    def delivered(self, n, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            got = self.deliver_log.read_text().splitlines() if self.deliver_log.exists() else []
+            if len(got) >= n:
+                return got
+            time.sleep(.1)
+        return self.deliver_log.read_text().splitlines() if self.deliver_log.exists() else []
+
+    def turn_end(self):
+        e, tid, v = self.opt("@agent_turn_end").split(" ")
+        self.assertLessEqual(abs(int(e) - time.time()), 5)
+        return tid, v
+
+    def test_reply_md_written_once_per_turn(self):
+        p, sid = self.spawned()
+        self.prompt("build it", "u1")
+        self.stop("u1", msg="Result: parser rewritten.\nDetails follow.\n" + "x" * 5000)
+        reply = self.reg / "reply.md"
+        body = reply.read_text()
+        self.assertTrue(body.startswith("Result: parser rewritten.\nDetails follow.\n"))
+        self.assertEqual(len(body), len("Result: parser rewritten.\nDetails follow.\n") + 5000)   # whole
+        self.assertEqual(reply.stat().st_mode & 0o777, 0o600)
+        self.assertRegex(self.opt("@agent_reply_at"), r"^\d+$")
+        self.assertEqual(self.opt("@agent_spawn_result"), "ready")
+        self.assertEqual(self.turn_end(), ("u1", "loud"))
+        self.assertEqual(self.opt("@agent_state"), "idle")          # a child: seen
+        self.assertEqual(self.delivered(1), ["_deliver " + sid])
+        # The same turn's Stop again: reply.md stays as it was.
+        self.set_opt("@agent_spawn_result", "read")
+        self.stop("u1", msg="a stray second Stop")
+        self.assertEqual(reply.read_text(), body)
+        # The next turn writes its own.
+        self.prompt("and the tests", "u2")
+        self.stop("u2", msg="Tests added.")
+        self.assertEqual(reply.read_text(), "Tests added.")
+        self.assertEqual(self.turn_end(), ("u2", "loud"))
+        self.assertEqual(self.opt("@agent_spawn_result"), "ready")
+        self.assertEqual(len(self.delivered(3)), 3)
+        self.assertEqual(sorted(p.name for p in self.reg.iterdir()), ["reply.md"])   # no tmp left
+
+    def test_sync_child_is_ready_but_wakes_nobody(self):
+        p, sid = self.spawned(mode="sync")
+        self.prompt("build it", "u1")
+        self.stop("u1", msg="ok")
+        self.assertEqual(self.opt("@agent_spawn_result"), "ready")
+        time.sleep(.5)
+        self.assertFalse(self.deliver_log.exists())
+
+    def test_quiet_follow_up_still_ends_a_turn(self):
+        # The abby-delegate wait-hang repro: a parent's follow-up (an agent
+        # message) finishes QUIET, restoring the idle and @agent_since the
+        # child had - a since-based wait never saw it end. @agent_turn_end
+        # does.
+        p, sid = self.spawned()
+        self.prompt("build it", "u1")
+        self.stop("u1", msg="first")
+        since = self.opt("@agent_since")
+        time.sleep(1.1)
+        text = self.deliver("now the docs", frm="parent")
+        self.prompt(text, "u2")
+        self.assertEqual(self.opt("@agent_state"), "running")
+        self.stop("u2", msg="docs done")
+        self.assertEqual(self.opt("@agent_state"), "idle")
+        self.assertEqual(self.opt("@agent_since"), since)          # restored: the old signal is blind
+        self.assertEqual(self.turn_end(), ("u2", "quiet"))
+        self.assertGreaterEqual(int(self.opt("@agent_turn_end").split()[0]), int(self.opt("@agent_turn_start")))
+        self.assertEqual((self.reg / "reply.md").read_text(), "docs done")
+        self.assertEqual(self.opt("@agent_spawn_result"), "ready")
+
+    def test_every_turn_end_is_recorded_for_any_agent(self):
+        # Not only children: a plain agent's loud finish, a failure, an
+        # interrupt.
+        self.prompt("go", "u1")
+        self.stop("u1")
+        self.assertEqual(self.turn_end(), ("u1", "loud"))
+        self.prompt("again", "u2")
+        self.hook("failed", "claude", payload={"session_id": "s1", "prompt_id": "u2", "error": "overloaded"})
+        self.assertEqual(self.turn_end(), ("u2", "failed"))
+        self.assertFalse(self.has("@agent_spawn_result"))          # no child: no result
+        self.prompt("and again", "u3", agent="opencode")
+        self.hook("interrupt", "opencode", payload={"session_id": "s1", "cwd": str(self.root), "turn_id": "u3"})
+        self.assertEqual(self.opt("@agent_state"), "idle")
+        self.assertEqual(self.turn_end(), ("u3", "loud"))
+        # Per session: SessionEnd drops it (ORIGIN_OPTS).
+        self.hook("clear", "claude", payload={"session_id": "s1", "reason": "other"})
+        self.assertFalse(self.has("@agent_turn_end"))
+
+    def test_child_session_end_drops_its_identity(self):
+        p, sid = self.spawned()
+        self.prompt("build it", "u1")
+        self.stop("u1")
+        self.hook("clear", "claude", payload={"session_id": "s1", "reason": "other"})
+        for o in ("@agent_spawn_id", "@agent_spawn_mode", "@agent_spawn_result", "@agent_reply_at",
+                  "@agent_turn_end", "@agent_parent"):
+            self.assertFalse(self.has(o), o)
+        self.assertTrue((self.reg / "reply.md").exists())           # the registry keeps it
+
+    def test_intermediate_is_held_while_its_grandchild_runs(self):
+        p = self.make_child()                       # this window: a child of p ...
+        g = self.make_parent("running")             # ... and the parent of g
+        self.prompt("delegate further", "u1")       # (a child's event: reconciles)
+        self.assertEqual(self.opt("@agent_kids_sub"), "1 1")
+        self.assertFalse(self.has("@agent_kids"))   # not a root
+        self.assertEqual(self.wopt(p, "@agent_kids"), "2 2")
+        self.stop("u1", msg="Spawned the grandchild.")
+        self.assertEqual(self.opt("@agent_state"), "running")
+        self.assertEqual(self.opt("@agent_kids_hold"), "1")
+        self.assertEqual(self.opt("@agent_detail"), "Spawned the grandchild.")
+        self.assertEqual(self.wopt(p, "@agent_kids"), "2 2")         # the root still waits
+
+    def test_parent_held_by_paused_children_only(self):
+        self.make_parent("paused")
+        self.prompt("delegate it", "u1")
+        self.set_opt("@agent_kids", "1 1")
+        self.stop("u1")
+        self.assertEqual(self.opt("@agent_state"), "running")       # held; the watcher drains it
+        self.assertEqual(self.opt("@agent_kids_hold"), "1")
 
 
 class KidsWatcherTests(unittest.TestCase):
@@ -699,6 +1001,243 @@ class KidsWatcherTests(unittest.TestCase):
         for o in ("@agent_state", "@agent_parent", "@agent_parent_pane", "@agent_child"):
             self.assertNotIn(o, c)
         self.assertNotIn("@agent_kids", self.opts("@1"))
+
+    # --- EXTERNAL SUBAGENTS ---
+
+    def test_paused_children_drain_the_held_parent(self):
+        def child(state):
+            self.edit(lambda s: s["windows"]["@2"]["opts"].update({"@agent_state": state}))
+        child("paused")
+        self.ticks(2)
+        p = self.opts("@1")
+        self.assertEqual(p["@agent_state"], "paused")
+        self.assertEqual(p.get("@agent_kids_hold"), "1")             # still held for them
+        self.assertEqual(p.get("@agent_workflow"), "1")
+        self.assertEqual(p.get("@agent_kids"), "1 1")
+        child("running")                                             # resumed
+        self.ticks(1)
+        self.assertEqual(self.opts("@1")["@agent_state"], "running")
+        child("paused")
+        self.ticks(1)
+        self.assertEqual(self.opts("@1")["@agent_state"], "paused")
+        child("idle")                                                # done while drained
+        self.ticks(1)
+        p = self.opts("@1")
+        self.assertEqual(p["@agent_state"], "done")
+        self.assertNotIn("@agent_kids_hold", p)
+        self.assertRegex(p.get("@agent_turn_end", ""), r"^\d+ - loud$")
+
+    def test_own_pause_flag_is_not_drained_here(self):
+        self.edit(lambda s: (s["windows"]["@2"]["opts"].update({"@agent_state": "paused"}),
+                             s["windows"]["@1"]["opts"].update({"@agent_paused": "5"})))
+        self.ticks(2)
+        self.assertEqual(self.opts("@1")["@agent_state"], "running")
+
+    def test_intermediate_is_held_then_finishes_seen(self):
+        now = int(time.time())
+        self.f.procs.write_text("ttys902 4242 claude\nttys903 4343 claude\nttys904 4444 claude\n")
+        (self.f.home / ".claude/sessions/4343.json").write_text(json.dumps(
+            {"pid": 4343, "sessionId": "22222222-aaaa-bbbb-cccc-000000000003", "cwd": "/Users/x/proj",
+             "status": "shell"}, separators=(",", ":")))
+        def add(s):
+            s["windows"]["@2"]["opts"].update({"@agent_kids_hold": "1", "@agent_bg_owner": "user",
+                                               "@agent_detail_kind": "done", "@agent_detail": "Spawned g."})
+            s["windows"]["@3"] = jw.W("main", 3, **{"@agent_state": "running", "@agent_kind": "claude",
+                                                    "@agent_since": "%d running" % (now - 10),
+                                                    "@agent_parent": "@2", "@agent_parent_pane": "%2",
+                                                    "@agent_turn_start": str(now - 10)})
+            s["panes"].append({"window": "@3", "tty": "/dev/ttys904"})
+        self.edit(add)
+        self.ticks(3)
+        c, p = self.opts("@2"), self.opts("@1")
+        self.assertEqual(c["@agent_state"], "running")               # held for its grandchild
+        self.assertEqual(c.get("@agent_kids_sub"), "1 1")
+        self.assertEqual(c.get("@agent_workflow"), "1")
+        self.assertNotIn("@agent_kids", c)
+        self.assertEqual(p.get("@agent_kids"), "2 2")
+        self.assertEqual(self.opts("@3").get("@agent_child"), "@2")
+        self.edit(lambda s: s["windows"]["@3"]["opts"].update({"@agent_state": "idle"}))
+        self.ticks(9)
+        c, p = self.opts("@2"), self.opts("@1")
+        self.assertEqual(c["@agent_state"], "idle")                  # a child: seen, never green
+        self.assertIn("@agent_seen_at", c)
+        self.assertEqual(c["@agent_detail"], "Spawned g.")
+        self.assertEqual(c.get("@agent_kids_sub"), "1 0")
+        self.assertEqual(p["@agent_state"], "done")                  # then the root
+
+    def test_parent_gc_orphans_its_children_for_good(self):
+        self.f.procs.write_text("ttys903 4343 claude\n")              # the parent's claude exited
+        self.ticks(7)
+        p, c = self.opts("@1"), self.opts("@2")
+        self.assertNotIn("@agent_state", p)
+        self.assertRegex(c.get("@agent_kid_orphan_at", ""), r"^\d+$")   # the grace runs
+        self.assertEqual(c.get("@agent_parent"), "@1")
+        self.edit(lambda s: s["windows"]["@2"]["opts"].update({"@agent_kid_orphan_at": str(int(time.time()) - 6)}))
+        self.ticks(1)
+        p, c = self.opts("@1"), self.opts("@2")
+        self.assertEqual(c.get("@agent_kid_orphan"), "@1")
+        self.assertNotIn("@agent_kid_orphan_at", c)
+        for o in ("@agent_parent", "@agent_parent_pane", "@agent_child"):
+            self.assertNotIn(o, c)
+        for o in ("@agent_kids", "@agent_kids_sub"):
+            self.assertNotIn(o, p)
+        # A new agent in the old parent's window adopts nobody.
+        self.f.procs.write_text("ttys902 4242 claude\nttys903 4343 claude\n")
+        self.edit(lambda s: s["windows"]["@1"]["opts"].update({"@agent_state": "running"}))
+        self.ticks(2)
+        self.assertNotIn("@agent_child", self.opts("@2"))
+        self.assertNotIn("@agent_kids", self.opts("@1"))
+
+    def test_born_child_that_never_starts_holds_only_for_the_grace(self):
+        # A2: agent-spawn's targeted birth (idle + @agent_born, the birth
+        # grace long gone), its harness never up: held off the GC and busy
+        # for KIDS_START_GRACE from @agent_kid_since, then collected.
+        now = int(time.time())
+        self.edit(lambda s: (s["windows"].update({"@3": jw.W("main", 3, **{
+                                 "@agent_state": "idle", "@agent_born": str(now - 100),
+                                 "@agent_since": "%d idle" % (now - 100), "@agent_parent": "@1",
+                                 "@agent_parent_pane": "%1", "@agent_spawn_id": "s-born1"})}),
+                             s["panes"].append({"window": "@3", "tty": "/dev/ttys999"})))
+        self.ticks(6)
+        p, c = self.opts("@1"), self.opts("@3")
+        self.assertRegex(c.get("@agent_kid_since", ""), r"^\d+$")
+        self.assertEqual(c.get("@agent_parent"), "@1")
+        self.assertEqual(c.get("@agent_state"), "idle")
+        self.assertEqual(p.get("@agent_kids"), "2 2")                 # starting: busy
+        self.edit(lambda s: s["windows"]["@3"]["opts"].update({"@agent_kid_since": str(int(time.time()) - 61)}))
+        self.ticks(7)
+        p, c = self.opts("@1"), self.opts("@3")
+        for o in ("@agent_state", "@agent_parent", "@agent_kid_since", "@agent_spawn_id"):
+            self.assertNotIn(o, c)
+        self.assertEqual(p.get("@agent_kids"), "1 1")
+        self.assertEqual(p["@agent_state"], "running")               # @2 still runs
+
+
+class KidsCodexChildTests(unittest.TestCase):
+    """A codex child's finish on the watcher's rollout path (no Stop seen):
+    SEEN, recorded as a turn end, ready, and its parent woken; an aborted
+    turn is the child's failure."""
+
+    def setUp(self):
+        import test_codex_watcher_parity as cx
+        self.cx = cx
+        self.f = jw.FakeEnv(windows={}, panes=[])
+        self.addCleanup(self.f.close)
+        self.f.procs.write_text(cx.PROCS)
+        self.log = self.f.dir / "deliver.log"
+        self.stub = self.f.dir / "agent-spawn"
+        self.stub.write_text('#!/bin/sh\necho "$*" >> "%s"\n' % self.log)
+        self.stub.chmod(0o755)
+
+    def run_child(self, end, ticks=4):
+        cx, now = self.cx, int(time.time())
+        rp = self.f.home / ".codex/sessions/2026/11/24/rollout-k.jsonl"
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text(cx.ev(now - 90, "task_started") + cx.filler() + end(now - 10))
+        st = self.f.read()
+        st["windows"] = {
+            "@1": jw.W("main", 1, **{"@agent_state": "idle", "@agent_kind": "claude",
+                                     "@agent_since": "%d idle" % (now - 100)}),
+            "@2": jw.W("main", 2, **{"@agent_state": "running", "@agent_kind": "codex",
+                                     "@agent_since": "%d running" % (now - 60), "@agent_rollout": str(rp),
+                                     "@agent_detail_kind": "run", "@agent_detail": "do it",
+                                     "@agent_parent": "@1", "@agent_parent_pane": "%1",
+                                     "@agent_turn_start": str(now - 60), "@agent_spawn_id": "s-cx1",
+                                     "@agent_spawn_mode": "async"}),
+        }
+        st["panes"] = [{"window": "@1", "tty": cx.CLAUDE_TTY}, {"window": "@2", "tty": cx.CODEX_TTY}]
+        self.f.state.write_text(json.dumps(st))
+        r = self.f.run("agent-tab-watcher.sh", timeout=10 + 2 * ticks, AGENT_TAB_WATCHER_MAX_TICKS=str(ticks),
+                       AGENT_SPAWN_BIN=str(self.stub))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return self.f.read()["windows"]
+
+    def delivered(self):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not self.log.exists():
+            time.sleep(.1)
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def test_codex_child_finish_is_seen_and_ready(self):
+        w = self.run_child(lambda t: self.cx.ev(t, "task_complete", last_agent_message="All set."))
+        c = w["@2"]["opts"]
+        self.assertEqual(c["@agent_state"], "idle")                  # not an unseen green
+        self.assertIn("@agent_seen_at", c)
+        self.assertEqual((c["@agent_detail_kind"], c["@agent_detail"]), ("done", "turn finished"))
+        self.assertRegex(c.get("@agent_turn_end", ""), r"^\d+ - loud$")
+        self.assertEqual(c.get("@agent_spawn_result"), "ready")
+        self.assertEqual(self.delivered(), ["_deliver s-cx1"])
+
+    def test_codex_child_aborted_turn_is_failed(self):
+        w = self.run_child(lambda t: self.cx.ev(t, "turn_aborted", reason="interrupted"), ticks=5)
+        c, p = w["@2"]["opts"], w["@1"]["opts"]
+        self.assertEqual(c["@agent_state"], "failed")
+        self.assertEqual((c["@agent_detail_kind"], c["@agent_detail"]), ("fail", "turn aborted"))
+        self.assertRegex(c.get("@agent_turn_end", ""), r"^\d+ - failed$")
+        self.assertEqual(p.get("@agent_kids_ask"), "@2\tfailed\tturn aborted")   # surfaced on the parent
+
+
+@unittest.skipUnless(REAL_TMUX, "tmux executable required")
+class KidsUnlinkHookTests(unittest.TestCase):
+    """The window-unlinked[3] line documented in agent-tab-indicator.md §8
+    (copied verbatim into tmux.conf.tmpl), on a private server."""
+
+    DOC = ao.SCRIPTS.parent / "docs/agent-tab-indicator.md"
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="kh-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.sock = str(self.dir / "s")
+        self.tm = [REAL_TMUX, "-S", self.sock, "-f", "/dev/null"]
+        home = self.dir / "home"; lib = home / ".config/tmux/scripts"; lib.mkdir(parents=True)
+        shutil.copyfile(LIB, lib / "agent-session-lib.sh")
+        b = self.dir / "bin"; b.mkdir()
+        # The lib's bare `tmux` must reach THIS server, never the default one.
+        (b / "tmux").write_text("#!/bin/sh\nexec %s -S %s \"$@\"\n" % (REAL_TMUX, self.sock))
+        (b / "tmux").chmod(0o755)
+        self.env = clean_env(HOME=str(home), PATH="%s:%s:%s" % (b, jw.BASH_DIR, os.environ["PATH"]))
+        self.addCleanup(lambda: subprocess.run(self.tm + ["kill-server"], capture_output=True, timeout=5))
+        self.t("new-session", "-d", "-s", "s", "/bin/sleep 600")
+        m = re.search(r"^  (set-hook -g 'window-unlinked\[3\]'.*)$", self.DOC.read_text(), re.M)
+        self.assertTrue(m, "hook line missing from the doc")
+        conf = self.dir / "hook.conf"; conf.write_text(m.group(1) + "\n")
+        self.t("source-file", str(conf))
+
+    def t(self, *args):
+        r = subprocess.run(self.tm + list(args), text=True, capture_output=True, env=self.env, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.rstrip("\n")
+
+    def pair(self):
+        p = self.t("new-window", "-d", "-P", "-F", "#{window_id}", "/bin/sleep 600")
+        c = self.t("new-window", "-d", "-P", "-F", "#{window_id}", "/bin/sleep 600")
+        self.t("set-option", "-w", "-t", p, "@agent_state", "running")
+        for k, v in (("@agent_parent", p), ("@agent_state", "running"), ("@agent_turn_start", "100")):
+            self.t("set-option", "-w", "-t", c, k, v)
+        return p, c
+
+    def test_killed_parent_orphans_at_once_only_while_guarded(self):
+        # Unguarded (nobody reconciled: @agent_kids_any unset): the hook runs nothing.
+        q, d = self.pair()
+        self.t("kill-window", "-t", q)
+        time.sleep(1)
+        self.assertEqual(self.t("show-options", "-wqv", "-t", d, "@agent_parent"), q)
+        self.t("set-option", "-wu", "-t", d, "@agent_parent")
+        # Guarded: a reconcile sets the global; killing the parent orphans now.
+        p, c = self.pair()
+        r = subprocess.run(["bash", "-c", '. "$1" && kids_reconcile', "_", str(LIB)], env=self.env,
+                           text=True, capture_output=True, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.t("show-options", "-gqv", "@agent_kids_any"), "1")
+        self.assertEqual(self.t("show-options", "-wqv", "-t", c, "@agent_child"), p)
+        self.t("kill-window", "-t", p)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not self.t("show-options", "-wqv", "-t", c, "@agent_kid_orphan"):
+            time.sleep(.1)
+        self.assertEqual(self.t("show-options", "-wqv", "-t", c, "@agent_kid_orphan"), p)
+        self.assertEqual(self.t("show-options", "-wqv", "-t", c, "@agent_parent"), "")
+        # No link left anywhere: the guard is down again.
+        self.assertEqual(self.t("show-options", "-gqv", "@agent_kids_any"), "")
 
 
 class KidsNeedsListTests(unittest.TestCase):

@@ -1209,6 +1209,7 @@ codex_limit_mark() {
     c+="set-option -w -t $win @agent_paused $e ; set-option -w -t $win @agent_limit '$r codex $e'"
     c+=" ; set-option -w -t $win @agent_detail_kind limit ; set-option -w -t $win @agent_detail '$LIM_TXT'"
     c+=" ; set-option -w -t $win @agent_turn_result '$tid limited $r'"
+    c+=" ; set-option -w -t $win @agent_turn_end '$e $tid limited'"
     c+=" ; set-option -w -t $win @agent_since '$e paused' ; set-option -w -t $win @agent_state paused"
     cas_write "$win" "#{==:#{@agent_state},$was}" "$c" || return 1
     [ "$state" = paused ] || return 1
@@ -1255,7 +1256,7 @@ if ! . "$HOME/.config/tmux/scripts/agent-session-lib.sh" 2>/dev/null; then
     session_has_running_subagent() { return 1; }
     resolve_session_bases() { return 1; }   # subagent_running's gate
     # KIDS: no lib, no children (every child reads as a plain agent).
-    declare -A KIDS_RUN=()
+    declare -A KIDS_RUN=() KIDS_PAUSE=() K_EXIST=()
     KIDS_START_GRACE=60
     KIDS_CMD=()
     kids_reset() { :; }
@@ -1725,6 +1726,11 @@ declare -A W_PRIOR=() # @agent_prior_state (AGENT-ORIGINATED TURNS)
 declare -A W_QUIET=() # @agent_quiet: a quiet restore's one-shot log mark
 declare -A W_KHOLD=() # @agent_kids_hold: the indicator held this Stop for busy children (KIDS)
 declare -A W_KPAR=() W_KSINCE=() # @agent_parent / @agent_kid_since (KIDS: a never-started child's GC)
+declare -A W_KCHILD=() # @agent_child: a live child finishes SEEN on every path (KIDS)
+# EXTERNAL SUBAGENTS: @agent_spawn_id / @agent_spawn_mode (an agent-spawn
+# child: ready + the parent's wake), @agent_turn_end / @agent_turn_start
+# (whether a turn end here still has to be recorded: turn_end_cmd).
+declare -A W_SPAWN=() W_SPMODE=() W_TEND=() W_TSTART=()
 declare -A W_PAUSED=() # @agent_paused: agent-pause.py's flag (docs/agent-pause.md)
 declare -A W_ASKBG=()  # @agent_ask_bg: the indicator's ASKS WHILE WORK IS OUT raise
 declare -A W_LIMIT=()  # @agent_limit: RATE-LIMITED AGENTS
@@ -1752,7 +1758,9 @@ ORIGIN_OPTS=(@agent_turn_origin @agent_turn_result @agent_prior_state @agent_pri
              @agent_prior_detail_kind @agent_prior_detail @agent_inbound @agent_inbound_seen
              @agent_for_user @agent_awaiting @agent_quiet @agent_bg_owner @agent_paused
              @agent_pause_voided @agent_turn_start @agent_limit @agent_limit_lifted
-             @agent_kids_hold)
+             @agent_kids_hold @agent_turn_end @agent_reply_at @agent_spawn_result)
+# (@agent_turn_end / @agent_reply_at / @agent_spawn_result: EXTERNAL
+# SUBAGENTS, the indicator's option table; per session like the rest.)
 # (@agent_limit / @agent_limit_lifted: RATE-LIMITED AGENTS, dropped with the
 # session wherever @agent_paused is; so is @agent_pause_voided, the void's
 # orphan mark - agent-tab-indicator.sh's option table.)
@@ -1778,7 +1786,11 @@ prior_restore() {
     read -r _ _ ofrom _ <<<"$origin" || true
     ofrom="${ofrom//[^A-Za-z0-9_.-]/}"
     case "$ps" in idle|done|needs-input|failed) ;; *) ps=idle ;; esac
-    case "$ps" in done|needs-input) viewed_now "$wac" && { ps=idle; seen=1; } ;; esac
+    # (A live child's done comes back SEEN, viewed or not: KIDS.)
+    case "$ps" in
+        done) { [ -n "${W_KCHILD[$win]:-}" ] || viewed_now "$wac"; } && { ps=idle; seen=1; } ;;
+        needs-input) viewed_now "$wac" && { ps=idle; seen=1; } ;;
+    esac
     r_since="$tick_now $ps"
     if [[ $psince =~ ^[0-9]{1,18}\ (.+)$ ]] && [ "${BASH_REMATCH[1]}" = "$ps" ]; then
         r_since="$psince"
@@ -1796,11 +1808,59 @@ prior_restore() {
     [ "$seen" = 1 ] && c+=" ; set-option -w -t $win @agent_seen_at $tick_now"
     c+=" ; set-option -w -t $win @agent_quiet ${ofrom:--}"
     c+="${lim_cmd:-}"   # RATE-LIMITED AGENTS: a turn end ends the limit (limit_end_cmd)
+    turn_end_cmd "$win" quiet   # EXTERNAL SUBAGENTS
+    c+="$te_cmd"
     cas_write "$win" "#{&&:#{==:#{@agent_state},$was},#{!=:#{@agent_prior_state},}}" "$c" || return 1
     # Still a prior: the guard was false (a hook moved the state), nothing
     # written. Gone: restored - here, or by the indicator's quiet Stop.
     [ -z "${W_PRIOR[$win]:-}" ] || return 1
     r_state="$state"; r_since="$since"
+    spawn_wake "$win"
+}
+
+# EXTERNAL SUBAGENTS (agent-tab-indicator.sh's section, docs §8). Every turn
+# end this loop writes also records @agent_turn_end, the one turn-end signal
+# agent-spawn's `wait` trusts - unless the turn's own Stop recorded it already
+# (a held Stop, released here: its end, with the real turn id, is newer than
+# the turn's @agent_turn_start). One written here has no turn id ("-": the
+# wait falls back to the epoch). An agent-spawn child's turn end also says
+# @agent_spawn_result ready, and an async one's wakes its parent.
+# turn_end_cmd WIN VERDICT: te_cmd = the " ; ..." to append to a turn end's
+# write (builtins only; the fields came with the tick's one read).
+turn_end_cmd() {
+    local w="$1" v="$2" te="${W_TEND[$1]:-}" ts="${W_TSTART[$1]:-}"
+    te_cmd=""
+    te="${te%% *}"
+    case "$te" in ''|*[!0-9]*) te="" ;; esac
+    case "$ts" in *[!0-9]*) ts="" ;; esac
+    if [ -z "$te" ] || { [ -n "$ts" ] && [ "$((10#$te))" -le "$((10#$ts))" ]; }; then
+        te_cmd=" ; set-option -w -t $w @agent_turn_end '$tick_now - $v'"
+    fi
+    [ -z "${W_SPAWN[$w]:-}" ] || [ "$v" = paused ] || te_cmd+=" ; set-option -w -t $w @agent_spawn_result ready"
+}
+# spawn_wake WIN: after a child's turn end landed, an ASYNC child wakes its
+# parent (agent-spawn _deliver ID, detached like limit_spawn; it batches).
+spawn_wake() {
+    local id="${W_SPAWN[$1]:-}" bin="${AGENT_SPAWN_BIN:-$HOME/.local/bin/agent-spawn}"
+    [ -n "$id" ] && [ "${W_SPMODE[$1]:-}" = async ] && [ -x "$bin" ] || return 0
+    case "$id" in s-?*) case "${id#s-}" in *[!0-9A-Za-z]*) return 0 ;; esac ;; *) return 0 ;; esac
+    ( "$bin" _deliver "$id" </dev/null >/dev/null 2>&1 & ) 2>/dev/null
+    return 0
+}
+# kids_finish WIN WAC WAS: a Stop held for its children (@agent_kids_hold)
+# whose last child stopped finishes now, as that Stop would have with
+# nothing out - done, or idle and seen while Mack is looking at it, or (a
+# live CHILD itself, an intermediate) idle and seen always - and nobody's
+# work is out any more (@agent_bg_owner). Only over WAS, with lim_cmd.
+kids_finish() {
+    local win="$1" wac="$2" was="${3//[^a-z-]/}" kf=done kf_seen=""
+    { [ -n "${W_KCHILD[$win]:-}" ] || viewed_now "$wac"; } \
+        && { kf=idle; kf_seen=" ; set-option -w -t $win @agent_seen_at $tick_now"; }
+    turn_end_cmd "$win" loud
+    cas_write "$win" "#{==:#{@agent_state},$was}" \
+        "set-option -w -t $win @agent_state $kf ; set-option -w -t $win @agent_since '$tick_now $kf' ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_bg_owner ; set-option -uw -t $win @agent_kids_hold ; set-option -uw -t $win @agent_ask_bg${kf_seen}${lim_cmd:-}${te_cmd}" \
+        && [ "$state" = "$kf" ] && { changed=1; state_moved=1; spawn_wake "$win"; }
+    return 0
 }
 
 # AGENT SLOTS (see the header). In the tick, the fold fills S_SLOT/S_VIS
@@ -2400,7 +2460,11 @@ EOF
     # @agent_kid_since and @agent_seen_at (ids, digits and flags) with the
     # bare tokens, and @agent_kids_ask
     # (it carries a child's detail: free text) just before the free text.
-    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_record}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{@agent_prior_state}${US}#{@agent_quiet}${US}#{@agent_paused}${US}#{@agent_ask_bg}${US}#{@agent_limit}${US}#{@agent_limit_due}${US}#{@space_hidden}${US}#{@agent_parent}${US}#{@agent_child}${US}#{@agent_kids}${US}#{@agent_turn_start}${US}#{@space_home}${US}#{@agent_kids_hold}${US}#{@agent_kid_since}${US}#{@agent_seen_at}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_kids_ask}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
+    # EXTERNAL SUBAGENTS add seven bare fields after @agent_seen_at:
+    # @agent_kids_sub, @agent_key, the GLOBAL @agent_kids_any and
+    # @agent_kid_orphan_at (kids_row's, see KIDS_FMT), @agent_spawn_id and @agent_spawn_mode (ids and words),
+    # and @agent_turn_end ("<epoch> <id> <verdict>": tokens and spaces).
+    if ! rows=$(tmux list-panes -a -F "#{window_id}${US}#{pane_tty}${US}#{@agent_state}${US}#{window_active_clients}${US}#{@agent_since}${US}#{@agent_workflow}${US}#{@agent_cua}${US}#{@agent_rollout}${US}#{@agent_record}${US}#{@agent_kind}${US}#{@agent_detail_kind}${US}#{@agent_slot}${US}#{@agent_pending}${US}#{@agent_born}${US}#{@agent_prior_state}${US}#{@agent_quiet}${US}#{@agent_paused}${US}#{@agent_ask_bg}${US}#{@agent_limit}${US}#{@agent_limit_due}${US}#{@space_hidden}${US}#{@agent_parent}${US}#{@agent_child}${US}#{@agent_kids}${US}#{@agent_turn_start}${US}#{@space_home}${US}#{@agent_kids_hold}${US}#{@agent_kid_since}${US}#{@agent_seen_at}${US}#{@agent_kids_sub}${US}#{@agent_key}${US}#{@agent_kids_any}${US}#{@agent_kid_orphan_at}${US}#{@agent_spawn_id}${US}#{@agent_spawn_mode}${US}#{@agent_turn_end}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{@agent_kids_ask}${US}#{@agent_detail}${US}#{@agent_summary}" 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
@@ -2425,19 +2489,23 @@ EOF
     W_SEEN=(); W_PID=(); W_STATE=(); W_WAC=(); W_SINCE=(); W_WF=(); W_CUA=(); W_ROLL=(); W_REC=(); W_SUM=(); W_DET=()
     W_DK=(); W_DTXT=(); W_SESS=(); W_IDX=(); W_NAME=(); W_AK=()
     W_PEND=(); W_BORN=(); W_PRIOR=(); W_QUIET=(); W_PAUSED=(); W_ASKBG=(); W_LIMIT=(); W_KHOLD=(); W_KPAR=(); W_KSINCE=(); S_SLOT=(); S_VIS=(); S_ELIG=()
+    W_KCHILD=(); W_SPAWN=(); W_SPMODE=(); W_TEND=(); W_TSTART=()
     wins=()
     lim_due=""
     kids_reset
-    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll rec akind dkind slot pend born prior quiet paused askbg limit ldue khid kpar kchild kkids ktstart khome khold kksince kseen sess widx wname kask dtxt summary; do
+    while IFS="$US" read -r win tty state wac since wf_opt cua_opt roll rec akind dkind slot pend born prior quiet paused askbg limit ldue khid kpar kchild kkids ktstart khome khold kksince kseen ksub kkey kany koat spid spmode tend sess widx wname kask dtxt summary; do
         case "$win" in @*) ;; *) continue ;; esac
         case "$tty" in /dev/?*) ;; *) continue ;; esac
         [ -n "$lim_due" ] || lim_due="$ldue"
         # KIDS: every row of a window that has a state or a kid field (one
         # per link: kids_row ORs the links' visibility); the rest - the
         # `agents` shells - can be neither parent nor child.
-        [ -z "$state$kpar$kchild$kkids$kask$kksince" ] \
+        # Every row's window exists (K_EXIST: a parent missing from the
+        # read is GONE, the orphan rule's at-once case). One builtin store.
+        K_EXIST[$win]=1
+        [ -z "$state$kpar$kchild$kkids$kask$kksince$ksub" ] \
             || kids_row "$win" "$khid" "$state" "$kpar" "$kchild" "$kkids" "$since" "$dtxt" "$kask" \
-                        "$ktstart" "$pend" "$khome" "$kksince" "$kseen"
+                        "$ktstart" "$pend" "$khome" "$kksince" "$kseen" "$ksub" "$kkey" "$kany" "$koat"
         if [ -z "${W_SEEN[$win]+x}" ]; then
             W_SEEN[$win]=1
             wins+=("$win")
@@ -2453,6 +2521,8 @@ EOF
                 W_SESS[$win]="$sess"; W_IDX[$win]="$widx"; W_NAME[$win]="$wname"
                 W_PEND[$win]="$pend"; W_BORN[$win]="$born"
                 W_KHOLD[$win]="$khold"; W_KPAR[$win]="$kpar"; W_KSINCE[$win]="$kksince"
+                W_KCHILD[$win]="$kchild"; W_SPAWN[$win]="$spid"; W_SPMODE[$win]="$spmode"
+                W_TEND[$win]="$tend"; W_TSTART[$win]="$ktstart"
             fi
             # Not part of the fast-path test above: a window holding only a
             # slot (or only a pending stamp) has nothing for the loop to do,
@@ -2635,7 +2705,11 @@ EOF
         # the first time it sees the tab stateless - this very tick if the
         # read had none). Past that, a claude that never started is gone:
         # the GC below drops the mark, and the parent is not held for it.
-        if [ "$has_agent" = 0 ] && [ -n "${W_KPAR[$win]:-}" ] && [ -z "$state" ]; then
+        # A child born by agent-spawn is idle + @agent_born from its first
+        # frame (targeted birth): idle and not started yet (kids_plan keeps
+        # its @agent_kid_since exactly then) counts the same (A2).
+        if [ "$has_agent" = 0 ] && [ -n "${W_KPAR[$win]:-}" ] \
+           && { [ -z "$state" ] || { [ "$state" = idle ] && [ -n "${W_KSINCE[$win]:-}" ]; }; }; then
             ks="${W_KSINCE[$win]:-}"
             if ! [[ $ks =~ ^[0-9]{1,18}$ ]] || [ $((tick_now - 10#$ks)) -lt "$KIDS_START_GRACE" ]; then
                 birth_hold=1
@@ -2717,8 +2791,38 @@ EOF
         # the children is the indicator's @agent_kids_hold, stamped by the
         # Stop itself; the un-stick that fires once the last one is done
         # finishes such a turn as that Stop would have (done, below).
-        if [ "${KIDS_RUN[$win]:-0}" -gt 0 ]; then
+        # EXTERNAL SUBAGENTS: any live parent (KIDS_RUN/KIDS_PAUSE are per
+        # subtree: an intermediate child is held for its grandchildren), and
+        # PAUSED children hold it too - the gear stays, the turn stays out.
+        k_run="${KIDS_RUN[$win]:-0}"; k_pause="${KIDS_PAUSE[$win]:-0}"
+        if [ "$k_run" -gt 0 ] || [ "$k_pause" -gt 0 ]; then
             wf=1; any_workflow=1; bg_held=1
+        fi
+        # PAUSED DRAIN (docs/agent-pause.md; §8 of the indicator doc): a Stop
+        # held for its children (@agent_kids_hold) whose busy children are
+        # ALL paused reads `paused` itself, back to `running` once one runs
+        # again, and finishes (as the KIDS release below would) when none is
+        # busy any more. Never over its own pause flag (@agent_paused: that
+        # turn end is agent-pause.py's). Each write lands only over the state
+        # it was decided from, with the hold still set (CONDITIONAL WRITES).
+        if [ -n "${W_KHOLD[$win]:-}" ] && [ -z "${W_PAUSED[$win]:-}" ]; then
+            if [ "$state" = running ] && [ "$k_run" = 0 ] && [ "$k_pause" -gt 0 ]; then
+                cas_write "$win" "#{&&:#{==:#{@agent_state},running},#{!=:#{@agent_kids_hold},}}" \
+                    "set-option -w -t $win @agent_state paused ; set-option -w -t $win @agent_since '$tick_now paused'" \
+                    && [ "$state" = paused ] && { changed=1; state_moved=1; }
+            elif [ "$state" = paused ] && [ "$k_run" -gt 0 ]; then
+                cas_write "$win" "#{&&:#{==:#{@agent_state},paused},#{!=:#{@agent_kids_hold},}}" \
+                    "set-option -w -t $win @agent_state running ; set-option -w -t $win @agent_since '$tick_now running'" \
+                    && [ "$state" = running ] && { changed=1; state_moved=1; }
+            elif [ "$state" = paused ] && [ "$k_run" = 0 ] && [ "$k_pause" = 0 ]; then
+                lim_cmd=""
+                if [ -n "${W_PRIOR[$win]:-}" ]; then
+                    # An agent-originated turn's quiet restore, as below.
+                    prior_restore "$win" "$wac" paused && { changed=1; state_moved=1; W_PRIOR[$win]=""; }
+                else
+                    kids_finish "$win" "$wac" paused
+                fi
+            fi
         fi
         if [ "$cua" = 1 ] && [ "$had_cua" = 0 ]; then
             tmux set-option -w -t "$win" @agent_cua 1 2>/dev/null && changed=1
@@ -2860,7 +2964,15 @@ EOF
                         # codex "done" it did not have.
                         case "$cx_mark" in
                             complete|aborted|limit)
-                                if [ "${PID_KIND[$pid]:-}" = codex ] && cx_after; then
+                                if [ "$cx_mark" = complete ] && [ -n "${W_KHOLD[$win]:-}" ]; then
+                                    # A codex PARENT's Stop held for its
+                                    # children (EXTERNAL SUBAGENTS): its own
+                                    # task_complete is that Stop, not the end
+                                    # of the hold - the idle rule (bg_held
+                                    # keeps it while they run; the KIDS
+                                    # release finishes it).
+                                    st=idle
+                                elif [ "${PID_KIND[$pid]:-}" = codex ] && cx_after; then
                                     cx_full=1
                                     [ "$cx_mark" = limit ] && cx_lim=1
                                 else
@@ -2930,6 +3042,14 @@ EOF
             elif [ "$cx_full" = 1 ]; then
                 fin=idle
                 [ "$cx_mark" = complete ] && fin=done
+                # EXTERNAL SUBAGENTS: codex has no failure hook, so an
+                # agent-spawn (or delegated) CODEX child's aborted turn - Esc,
+                # or the error that ends a turn - is its failure, best effort:
+                # the parent then hears of it (its ask, a failed result).
+                if [ "$cx_mark" = aborted ] && [ "${PID_KIND[$pid]:-}" = codex ] \
+                   && [ -n "${W_SPAWN[$win]:-}${W_KCHILD[$win]:-}" ]; then
+                    fin=failed
+                fi
             fi
         fi
         if [ -n "$fin" ]; then
@@ -2958,8 +3078,9 @@ EOF
                     # decided from (CONDITIONAL WRITES, 2026-10-22): a gate
                     # that just landed keeps its yellow, since and pending.
                     cas_was="$state"
+                    turn_end_cmd "$win" paused   # EXTERNAL SUBAGENTS
                     cas_write "$win" "#{==:#{@agent_state},$cas_was}" \
-                        "set-option -w -t $win @agent_state paused ; set-option -w -t $win @agent_since '$tick_now paused' ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_bg_owner ; set-option -uw -t $win @agent_kids_hold ; set-option -uw -t $win @agent_ask_bg${lim_cmd} ; if-shell -F -t $win '#{?#{@agent_paused},0,1}' 'set-option -w -t $win @agent_state idle'" \
+                        "set-option -w -t $win @agent_state paused ; set-option -w -t $win @agent_since '$tick_now paused' ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_bg_owner ; set-option -uw -t $win @agent_kids_hold ; set-option -uw -t $win @agent_ask_bg${lim_cmd}${te_cmd} ; if-shell -F -t $win '#{?#{@agent_paused},0,1}' 'set-option -w -t $win @agent_state idle'" \
                         && [ "$state" != "$cas_was" ] && { changed=1; state_moved=1; }
                     fin="$state"
                 elif [ -n "${W_PRIOR[$win]:-}" ]; then
@@ -2973,21 +3094,27 @@ EOF
                     fi
                 elif [ "$cx_full" = 1 ]; then
                     # The Stop path's viewing_now: a finish the user is
-                    # looking at is not tinted.
+                    # looking at is not tinted. Nor a live CHILD's, ever
+                    # (KIDS: its parent is the one that finishes).
                     cx_seen=0
-                    [ "$fin" = done ] && viewed_now "$wac" && { fin=idle; cx_seen=1; }
+                    [ "$fin" = done ] && { [ -n "${W_KCHILD[$win]:-}" ] || viewed_now "$wac"; } \
+                        && { fin=idle; cx_seen=1; }
                     cx_cmd="set-option -w -t $win @agent_state $fin ; set-option -w -t $win @agent_since '$tick_now $fin' ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_ask_bg"
                     [ "$cx_seen" = 1 ] && cx_cmd+=" ; set-option -w -t $win @agent_seen_at $tick_now"
                     if [ "$cx_mark" = complete ]; then
                         cx_cmd+=" ; set-option -w -t $win @agent_detail_kind done ; set-option -w -t $win @agent_detail 'turn finished'"
+                    elif [ "$fin" = failed ]; then
+                        cx_cmd+=" ; set-option -w -t $win @agent_detail_kind fail ; set-option -w -t $win @agent_detail 'turn aborted'"
                     else
                         cx_cmd+=" ; set-option -uw -t $win @agent_detail_kind ; set-option -uw -t $win @agent_detail"
                     fi
                     cx_cmd+="$lim_cmd"
+                    if [ "$fin" = failed ]; then turn_end_cmd "$win" failed; else turn_end_cmd "$win" loud; fi
+                    cx_cmd+="$te_cmd"
                     # CONDITIONAL WRITES: only over the state this was decided from.
                     cas_was="$state"
                     cas_write "$win" "#{==:#{@agent_state},$cas_was}" "$cx_cmd" \
-                        && [ "$state" != "$cas_was" ] && { changed=1; state_moved=1; }
+                        && [ "$state" != "$cas_was" ] && { changed=1; state_moved=1; spawn_wake "$win"; }
                     fin="$state"
                 elif [ "$state" = running ] && [ -n "${W_KHOLD[$win]:-}" ]; then
                     # DELEGATED CHILDREN (KIDS): the Stop was held `running`
@@ -2997,12 +3124,9 @@ EOF
                     # done, or idle and seen while Mack is looking at it -
                     # and nobody's work is out any more (@agent_bg_owner).
                     # The gear went with the children above. Same
-                    # CONDITIONAL WRITE as the release below.
-                    kf=done; kf_seen=""
-                    viewed_now "$wac" && { kf=idle; kf_seen=" ; set-option -w -t $win @agent_seen_at $tick_now"; }
-                    cas_write "$win" "#{==:#{@agent_state},running}" \
-                        "set-option -w -t $win @agent_state $kf ; set-option -w -t $win @agent_since '$tick_now $kf' ; set-option -uw -t $win @agent_pending ; set-option -uw -t $win @agent_bg_owner ; set-option -uw -t $win @agent_kids_hold ; set-option -uw -t $win @agent_ask_bg${kf_seen}${lim_cmd}" \
-                        && [ "$state" = "$kf" ] && { changed=1; state_moved=1; }
+                    # CONDITIONAL WRITE as the release below (kids_finish;
+                    # an intermediate CHILD finishes seen).
+                    kids_finish "$win" "$wac" running
                     fin="$state"
                 else
                     # The bg-pending release lands here (and in prior_restore):
@@ -3010,9 +3134,10 @@ EOF
                     # (@agent_bg_owner, AGENT-ORIGINATED TURNS). Same call,
                     # and only over the `running` it was decided from
                     # (CONDITIONAL WRITES) - never over a gate that just landed.
+                    turn_end_cmd "$win" loud   # EXTERNAL SUBAGENTS
                     cas_write "$win" "#{==:#{@agent_state},running}" \
-                        "set-option -w -t $win @agent_state idle ; set-option -uw -t $win @agent_bg_owner ; set-option -uw -t $win @agent_kids_hold$lim_cmd" \
-                        && [ "$state" = idle ] && { changed=1; state_moved=1; }
+                        "set-option -w -t $win @agent_state idle ; set-option -uw -t $win @agent_bg_owner ; set-option -uw -t $win @agent_kids_hold$lim_cmd$te_cmd" \
+                        && [ "$state" = idle ] && { changed=1; state_moved=1; spawn_wake "$win"; }
                     fin="$state"
                 fi
                 state=$fin
@@ -3113,6 +3238,13 @@ EOF
                 # nobody's child (the next reconcile drops @agent_child).
                 gc_cmd+=(\; set-option -uw -t "$win" @agent_parent \; set-option -uw -t "$win" @agent_parent_pane
                          \; set-option -uw -t "$win" @agent_kid_since)
+                # EXTERNAL SUBAGENTS: agent-spawn's identity and an ex-child's
+                # orphan label go too (the registry keeps the record). A
+                # PARENT collected here has no state now: the next plans
+                # orphan its children after KIDS_ORPHAN_GRACE (kids_plan).
+                gc_cmd+=(\; set-option -uw -t "$win" @agent_kid_orphan \; set-option -uw -t "$win" @agent_kid_orphan_at
+                         \; set-option -uw -t "$win" @agent_spawn_id
+                         \; set-option -uw -t "$win" @agent_spawn_task \; set-option -uw -t "$win" @agent_spawn_mode)
                 tmux "${gc_cmd[@]}" 2>/dev/null
                 # A discharge, as clear_state's: the stamp outlives the unsets.
                 if [ -n "$state" ]; then

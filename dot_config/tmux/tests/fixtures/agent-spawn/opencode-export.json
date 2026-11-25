@@ -1,0 +1,6 @@
+{"info":{"id":"ses_test"},"messages":[
+ {"info":{"role":"user"},"parts":[{"type":"text","text":"[task from @a · agent-spawn s-test0003] first"}]},
+ {"info":{"role":"assistant"},"parts":[{"type":"text","text":"Old OpenCode answer."}]},
+ {"info":{"role":"user"},"parts":[{"type":"text","text":"[message from @a] again"}]},
+ {"info":{"role":"assistant"},"parts":[{"type":"step-start"},{"type":"tool","tool":"bash"},{"type":"text","text":"OpenCode final answer."}]}
+]}
