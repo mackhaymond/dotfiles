@@ -2846,8 +2846,9 @@ EOF
         # own status write race, so one tick can legitimately see
         # state=running with a stale idle status. Acting on that would clear
         # the tab for the WHOLE turn — heartbeat re-arms running only from
-        # running/needs-input, never from bare idle, so nothing would put it
-        # back. Three consecutive idle ticks costs 3s of latency on a fix for
+        # running/needs-input, never from bare idle (a blocked Stop aside),
+        # so nothing would put it back.
+        # Three consecutive idle ticks costs 3s of latency on a fix for
         # a tab that was previously stuck for the rest of the session, and
         # makes the race require three impossible coincidences in a row.
         #

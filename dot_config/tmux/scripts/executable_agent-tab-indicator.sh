@@ -135,12 +135,13 @@
 #                                      the asker's own (@agent_ask_from), or
 #                                      from idle when
 #                                      @agent_pending marks an answered
-#                                      permission prompt — never from bare
-#                                      idle/done, so a late tool call can't
-#                                      resurrect a finished tab; never parses
-#                                      stdin — payloads can be huge (only
-#                                      needs-input and failed peek at its
-#                                      first 8 KB)
+#                                      permission prompt — from bare
+#                                      idle/done only when another Stop hook
+#                                      blocked that stop (A BLOCKED STOP), so
+#                                      a late tool call can't resurrect a
+#                                      finished tab; never parses stdin —
+#                                      payloads can be huge (a peek at its
+#                                      first 8 KB, never while running)
 #   needs-approval  PermissionRequest, and Notification(permission_prompt)
 #                → sets needs-input (YELLOW). Both events describe the SAME
 #                                      gate: PermissionRequest is structural
@@ -2829,7 +2830,8 @@ fi
 # drain consumes the pipe so the writer never sees EPIPE (codex's tolerance
 # for a hook that abandons its stdin is undocumented), without blocking us.
 # Only re-arm running from running/needs-input — a late PostToolUse landing
-# after Stop's `done` must NOT resurrect a finished tab. Codex reads its
+# after Stop's `done` must NOT resurrect a finished tab (one whose stop was
+# blocked is not finished: A BLOCKED STOP below). Codex reads its
 # payload earlier to validate session ownership and reject subagents.
 # The drain's `<&0` is load-bearing: without job control, bash points an
 # async command's stdin at /dev/null unless it names one itself, so the bare
@@ -2868,9 +2870,9 @@ fi
 # is escaped (\"agent_id\"), which the pattern can't match anyway. No
 # agent_id = the main agent. Codex rejects subagent payloads up top and
 # OpenCode sends none, so both are always "main" and behave as before.
-# The payload is read only when the window is needs-input with an asker, or
-# failed. Ending a held gate, and consuming a fresh @agent_pending, add one
-# show-options (HELD DETAIL).
+# The payload is read only when the window is needs-input with an asker,
+# failed, or (claude) done/idle. Ending a held gate, and consuming a fresh
+# @agent_pending, add one show-options (HELD DETAIL).
 #   FAILED IS MAIN'S (2026-10-22). A StopFailure (529) kills the MAIN turn;
 # background subagents keep working, and their PostToolUse (and
 # PostToolUseFailure, wired to heartbeat) re-armed `running` over the red
@@ -2919,8 +2921,40 @@ hb_who() {
         hb_from="${hb_from:-main}"
     fi
 }
+#   A BLOCKED STOP (2026-11-25). Stop hooks run in parallel, so when another
+# one blocks the stop (chezmoi-guard's "unfinished dotfile work"; 56 of 1612
+# turns in 14 days, up to 220 s), this script has already written done (or
+# idle, watched) for a turn that goes on: "finished", still working. No prompt
+# event follows a block, so the continuation's first tool call re-arms
+# `running` - the main agent's only, claude's only, and only when the
+# transcript says the turn is still open: the last of its turn marks is the
+# harness's own "Stop hook feedback" record, with no turn_duration (a real
+# end) and no interrupt after it. That keeps the rule above: a late tool event
+# after a real Stop still resurrects nothing. A quiet turn's Stop restored its
+# prior and dropped it, so it is saved again for the Stop that really ends the
+# turn (not when a permission gate comes before any tool call: that path ends
+# as a plain needs-input). The blocked Stop's turn end and a child's `ready`
+# are taken back with it, or the real Stop, same turn id, would leave the
+# child's reply.md at the pre-block text (child_reply). Costs a tail, on a
+# main-agent tool call in a done/idle window only.
+# hb_head must hold the payload's head (hb_who).
+STOP_MARKS='"role":"user","content":"Stop hook feedback:|"type":"system","subtype":"turn_duration"|"type":"text","text":"\[Request interrupted by user'
+stop_blocked() {
+    local tp_re='"transcript_path"[[:space:]]*:[[:space:]]*"([^"]*)"' last
+    [[ $hb_head =~ $tp_re ]] || return 1
+    [ -f "${BASH_REMATCH[1]}" ] || return 1
+    # api-request records repeat the conversation unescaped: not turn marks.
+    last=$(tail -c 262144 "${BASH_REMATCH[1]}" 2>/dev/null \
+           | LC_ALL=C grep -aE "$STOP_MARKS" | LC_ALL=C grep -av '"type":"api-request' \
+           | tail -n 1 || true)
+    case "$last" in
+        *'"content":"Stop hook feedback:'*) return 0 ;;
+    esac
+    return 1
+}
 if [ "$mode" = "heartbeat" ]; then
     hb_state=$(window_state "$win")
+    hb_blocked=0
     hb_ok=1
     case "$hb_state" in
         needs-*)
@@ -2933,6 +2967,13 @@ if [ "$mode" = "heartbeat" ]; then
         failed)
             hb_who
             [ "$hb_from" = main ] || hb_ok=0
+            ;;
+        "done"|idle)
+            if [ "$agent" = claude ]; then
+                hb_head=""
+                hb_who
+                if [ "$hb_from" = main ] && stop_blocked; then hb_blocked=1; fi
+            fi
             ;;
     esac
     [ "$agent" = codex ] || ( cat <&0 >/dev/null 2>&1 & ) 2>/dev/null
@@ -2969,6 +3010,16 @@ if [ "$mode" = "heartbeat" ]; then
             fi
             ;;
     esac
+    if [ "$hb_blocked" = 1 ] && [ "$ss_wrote" != 1 ]; then
+        origin_read "$win"
+        case "$O_STATE" in
+            "done"|idle)
+                case "$O_RESULT" in *" quiet "*) prior_save "$win" ;; esac
+                ss_add set-option -uw -t "$win" @agent_turn_end
+                ss_add set-option -uw -t "$win" @agent_spawn_result
+                set_state "$win" running ;;
+        esac
+    fi
     exit 0
 fi
 
