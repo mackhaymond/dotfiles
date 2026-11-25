@@ -249,8 +249,15 @@ func selfTest(_ directory: String) -> Never {
 
     // The real enclave, with interaction forbidden throughout.
     let path = directory + "/approve-key.json"
+    // With the screen locked the enclave makes no keys (errSecInteractionNotAllowed):
+    // skip then. Any other failure to make one is a failure.
+    var fresh: Data?
     if SecureEnclave.isAvailable, LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) {
-        let made = try! EnclaveKey.create(path)
+        do { fresh = try EnclaveKey.create(path) } catch {
+            check((error as NSError).code == Int(errSecInteractionNotAllowed), "the enclave makes a key")
+        }
+    }
+    if let made = fresh {
         var info = stat()
         check(stat(path, &info) == 0 && info.st_mode & 0o777 == 0o600, "key file is mode 600")
         check(made.count == 65 && made[0] == 4 && (try? EnclaveKey.publicKey(path)) == made, "public key is x963 and stable")
