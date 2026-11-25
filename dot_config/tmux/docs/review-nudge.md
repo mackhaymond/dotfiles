@@ -8,8 +8,8 @@ sidebar, a solid mauve card (any toast with a click action is one):
 ```text
  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
  ██● Review agents ›             14:02██
- ██9 agents idle 8h+ · ⌃S O or click ██
- ██to review                         ██
+ ██9 agents idle 8h+ of use · ⌃S O   ██
+ ██or click to review                ██
  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 ```
 
@@ -31,7 +31,9 @@ until the popup opens on any client (`review.sh open` takes it out of
 All four must hold:
 
 1. **There is something to review.** Either at least **3 agents have been idle
-   8h+**, or **the letters ran out**. "Idle 8h+" is the review popup's own rule:
+   8h+ of use** (time Mack was at tmux, so a night with the laptop shut counts
+   for nothing), or **the letters ran out**. It is the review popup's own rule
+   (docs/review.md, "8 hours of use"):
    the nudge asks `review.sh count`, which runs `agent-ui review --count`. The
    letters have run out only while **all 26 single letters a–z are held right
    now**: each is the `@agent_key` of some window in a visible session (not
@@ -42,9 +44,8 @@ All four must hold:
 2. **No nudge in the last 4 hours.** The time of the last nudge is in
    `~/.local/state/agent-review/last-nudge` (an epoch). Every nudge restarts
    the 4 hours, whether or not anyone clicked. A junk stamp, or one in the
-   future after a clock jump, does not hold the nudge back. This check runs
-   first, with shell builtins only, so a tick inside the 4 hours costs one
-   bash start and never calls tmux.
+   future after a clock jump, does not hold the nudge back. A tick
+   inside the 4 hours costs one tmux call: it still keeps the use log.
 3. **Someone is there.** The tmux server must be running with at least one
    client attached. No server, or no client, means no nudge, and the 4 hours
    do not restart.
@@ -58,8 +59,8 @@ The text names whichever trigger fired:
 
 | trigger | text |
 |---|---|
-| ≥ 3 idle 8h+ | `9 agents idle 8h+ · ⌃S O or click to review` |
-| both | `9 agents idle 8h+ · letters ran out · ⌃S O or click to review` |
+| ≥ 3 idle 8h+ of use | `9 agents idle 8h+ of use · ⌃S O or click to review` |
+| both | `9 agents idle 8h+ of use · letters ran out · ⌃S O or click to review` |
 | letters only | `letters ran out (2 on ; keys) · ⌃S O or click to review` |
 | letters only, no window on a `;` key yet | `letters ran out · ⌃S O or click to review` |
 

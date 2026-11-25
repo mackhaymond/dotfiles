@@ -8,6 +8,7 @@
 #   review.sh open [<client>]      the popup on that client (default: the
 #                                  most recently active one), 76x22 or the
 #                                  whole client when it is smaller
+#                                  (8h+ of use; none that old: 2h+ of use)
 #   review.sh count [--min-idle SECS]
 #                                  how many agents are up for review
 #                                  (`agent-ui review --count`)
@@ -17,6 +18,13 @@
 #                                  session any more and no other agent is
 #                                  there (else a warn toast, nothing closes;
 #                                  see do_close_space)
+#
+# IDLE MEANS IDLE WHILE MACK WAS HERE. The threshold is 8 hours of USE (time
+# with input at tmux), not wall-clock hours: a shut laptop ages nobody. The
+# record is review-nudge.sh's use log (~/.local/state/agent-review/in-use: an
+# epoch per 5-minute tick with him there). min_idle walks it back from now
+# to the moment that many hours of use ago and passes that as --min-idle, so
+# the popup's "idle 2d+" is the real time back to it.
 #
 # The binary is the server's @space_agent_ui (spaces.conf), else
 # ~/.local/bin/agent-ui; space.sh is @space_sh, else the installed one.
@@ -67,11 +75,37 @@ clear_nudge() {
     notifyutil -p "${AGENT_FOCUS_NOTICE-com.mackhaymond.tmux.focus}" </dev/null >/dev/null 2>&1 &
 }
 
+USE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/agent-review/in-use"
+USE_TICK=300                # a use-log line is worth this many seconds
+OLD_USE=28800               # old: idle through 8h of use
+LESS_USE=7200               # nothing that old: the popup shows 2h of use
+NO_LOG_IDLE=172800          # no (or too short a) use log: two days, wall-clock
+
+# min_idle <use secs>: the wall-clock seconds back to when that much use ago was.
+min_idle() {
+    awk -v need="$1" -v tick="$USE_TICK" -v now="${REVIEW_NOW:-$(date +%s)}" -v none="$NO_LOG_IDLE" '
+        /^[0-9]+$/ && $1 <= now { e[++n] = $1 }
+        END {
+            hi = now; left = need
+            for (i = n; i > 0; i--) {
+                b = e[i] < hi ? e[i] : hi       # overlapping ticks count once
+                a = e[i] - tick
+                if (b <= a) continue
+                if (b - a >= left) { printf "%d\n", now - (b - left); exit }
+                left -= b - a
+                hi = a
+            }
+            # The log is shorter than that: never less than it covers.
+            w = n ? now - e[1] + tick : 0
+            printf "%d\n", (w > none ? w : none)
+        }' "$([ -f "$USE_FILE" ] && printf '%s' "$USE_FILE" || echo /dev/null)"
+}
+
 # sq <word>: single-quoted for sh.
 sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 do_open() {
-    local client="${1:-}" b sock cw ch w h
+    local client="${1:-}" b sock cw ch w h idle
     [ -n "$client" ] || client=$(tmux display-message -p '#{client_name}' 2>/dev/null)
     [ -n "$client" ] || { echo "review: no client" >&2; return 1; }
     b=$(agent_ui)
@@ -87,14 +121,21 @@ do_open() {
     [ "$h" -lt "$POPUP_MIN_H" ] && h=$POPUP_MIN_H
     [ -n "${cw:-}" ] && [ "$cw" -lt "$w" ] && w=$cw
     [ -n "${ch:-}" ] && [ "$ch" -lt "$h" ] && h=$ch
+    idle=$(min_idle "$OLD_USE")
+    if [ "$("$b" --socket "$sock" review --count --min-idle "$idle" 2>/dev/null)" = 0 ]; then
+        idle=$(min_idle "$LESS_USE")
+    fi
     tmux display-popup -c "$client" -E -B -w "$w" -h "$h" -x "$POPUP_X" \
-        "$(sq "$b") --socket $(sq "$sock") review --client $(sq "$client")"
+        "$(sq "$b") --socket $(sq "$sock") review --client $(sq "$client") --min-idle $idle"
 }
 
 do_count() {
     local b; b=$(agent_ui)
     [ -x "$b" ] || { echo "review: agent-ui is not installed" >&2; return 1; }
-    "$b" review --count "$@"
+    case " $* " in
+        *" --min-idle "*) "$b" review --count "$@" ;;
+        *) "$b" review --count --min-idle "$(min_idle "$OLD_USE")" "$@" ;;
+    esac
 }
 
 # still_in <list> <win…>: the first <win> that is a line of <list>, if any.

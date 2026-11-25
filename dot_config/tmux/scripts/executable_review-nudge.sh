@@ -14,25 +14,27 @@
 #     AND Mack is at it: some client had input in the last 5 minutes
 #         (#{client_activity}). Nobody there: nothing, and the 4 hours do not
 #         restart, so it waits for him instead of firing at 3am.
-#   old agents     idle 8h+, as the review popup counts them: `review.sh count`
-#                  (it runs `agent-ui review --count` and prints an integer);
-#                  anything but an integer counts as 0.
+#   old agents     idle through 8h+ OF USE, as the review popup counts them:
+#                  `review.sh count` (an integer; anything else counts as 0).
+#                  Only time Mack was at tmux counts, so a night with the
+#                  laptop shut ages nobody. This script keeps the record:
+#                  every tick with him there appends its epoch to the use log,
+#                  and review.sh turns 8h of it into a cutoff.
 #   letters ran out  all 26 single letters a-z are held RIGHT NOW: each is the
 #                  @agent_key of some window of a VISIBLE session (not
 #                  @space_hidden, not named in @space_hidden_sessions) that is
 #                  not a home (@space_home unset), i.e. an agent or a shell.
 #                  An overflow key (`;a`, ...) alone is no trigger: a window
 #                  keeps its key for life, so one can outlast the shortage.
-# The cheap test comes first: within the 4 hours the tick reads one small file
-# with builtins and exits, no tmux at all.
+# Within the 4 hours a tick is one tmux call (for the use log) and exits.
 #
 # THE NUDGE. One info toast in every sidebar (`notify.sh -c '*'`; a client
 # with no sidebar gets tmux's own message, the text alone, for 30 s), up for
 # 5 minutes or until the review popup opens (review.sh open takes it down),
 # titled "Review agents" (the popup's key is prefix O, ⌃S O). With its click
 # action the sidebar draws it as a solid card:
-#     "9 agents idle 8h+ · ⌃S O or click to review"
-#     "9 agents idle 8h+ · letters ran out · ⌃S O or click to review"
+#     "9 agents idle 8h+ of use · ⌃S O or click to review"
+#     "9 agents idle 8h+ of use · letters ran out · ⌃S O or click to review"
 #     "letters ran out (2 on ; keys) · ⌃S O or click to review"
 #     "letters ran out · ⌃S O or click to review"   (no window on a ; key yet)
 # with a click action (`notify.sh -a`): `review.sh open {client}`, the review
@@ -41,7 +43,8 @@
 # anyone clicked.
 #
 # State: ${XDG_STATE_HOME:-~/.local/state}/agent-review/ — last-nudge (an
-# epoch), log (one line per tick that got past the cooldown, bounded),
+# epoch), in-use (the use log: one epoch per tick that found Mack at tmux, each
+# worth the 300 s before it, bounded; review.sh reads it), log (one line per tick that got past the cooldown, bounded),
 # launchd.log (the LaunchAgent's stdout/stderr).
 #
 # Environment (tests):
@@ -67,6 +70,7 @@ ACTIVE="${REVIEW_NUDGE_ACTIVE:-300}"   # a client with input this recent: he is 
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/agent-review"
 LAST_FILE="$STATE_DIR/last-nudge"
+USE_FILE="$STATE_DIR/in-use"
 LOGFILE="$STATE_DIR/log"
 
 dry=0 verb=""
@@ -98,19 +102,6 @@ say() {   # the decision: printed on a dry run, logged otherwise
     return 0
 }
 
-# --- the cooldown: builtins only ---------------------------------------------
-last=""
-[ -f "$LAST_FILE" ] && read -r last <"$LAST_FILE" 2>/dev/null
-case "$last" in
-    ''|*[!0-9]*) last="" ;;
-    *) last=$((10#$last)) ;;   # (a leading 0 is not octal)
-esac
-# (A stamp in the future, from a clock jump, does not hold the nudge back.)
-if [ -n "$last" ] && [ "$last" -le "$now" ] && [ $((now - last)) -lt "$EVERY" ]; then
-    [ "$dry" = 1 ] && say "skip: nudged $(( (now - last) / 60 ))m ago (one per $((EVERY / 3600))h)"
-    exit 0
-fi
-
 # A UTF-8 locale, always (as snooze.sh): launchd gives none, and a tmux
 # client without one prints \x1f, tabs and non-ASCII as "_". Exported, so
 # notify.sh and review.sh inherit it.
@@ -127,8 +118,45 @@ esac
 tmux_cmd=(${REVIEW_NUDGE_TMUX:-tmux})
 t() { "${tmux_cmd[@]}" "$@"; }
 
-# --- the server and its clients ------------------------------------------------
-if ! clients=$(t list-clients -F '#{client_activity}' 2>/dev/null); then
+# --- the server, its clients, and whether he is there ---------------------------
+clients="" server=1
+clients=$(t list-clients -F '#{client_activity}' 2>/dev/null) || server=0
+# The newest input on any client (an epoch). Unreadable: taken as there (but
+# not logged as use).
+newest=0 guess=0
+while IFS= read -r a; do
+    case "$a" in ''|*[!0-9]*) guess=1; continue ;; esac
+    [ "$a" -gt "$newest" ] && newest=$a
+done <<<"$clients"
+here_now=0
+[ $((now - newest)) -le "$ACTIVE" ] && here_now=1
+
+# The use log: one epoch per tick that found him there, each worth the TICK
+# seconds before it. Every tick, the 4 hours or not; never on a dry run.
+if [ "$server" = 1 ] && [ "$here_now" = 1 ] && [ "$dry" = 0 ]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    printf '%s\n' "$now" >>"$USE_FILE" 2>/dev/null
+    n=$(wc -l <"$USE_FILE" 2>/dev/null | tr -d ' ')
+    if [ "${n:-0}" -gt 12000 ] 2>/dev/null; then
+        tail -n 10000 "$USE_FILE" >"$USE_FILE.$$" 2>/dev/null && mv -f "$USE_FILE.$$" "$USE_FILE"
+    fi
+fi
+[ "$guess" = 1 ] && [ "$newest" = 0 ] && here_now=1
+
+# --- the cooldown ------------------------------------------------------------
+last=""
+[ -f "$LAST_FILE" ] && read -r last <"$LAST_FILE" 2>/dev/null
+case "$last" in
+    ''|*[!0-9]*) last="" ;;
+    *) last=$((10#$last)) ;;   # (a leading 0 is not octal)
+esac
+# (A stamp in the future, from a clock jump, does not hold the nudge back.)
+if [ -n "$last" ] && [ "$last" -le "$now" ] && [ $((now - last)) -lt "$EVERY" ]; then
+    [ "$dry" = 1 ] && say "skip: nudged $(( (now - last) / 60 ))m ago (one per $((EVERY / 3600))h)"
+    exit 0
+fi
+
+if [ "$server" = 0 ]; then
     say "skip: no tmux server"
     exit 0
 fi
@@ -136,14 +164,7 @@ if [ -z "$clients" ]; then
     say "skip: no client attached"
     exit 0
 fi
-
-# The newest input on any client (an epoch). Unreadable: taken as there.
-newest=0
-while IFS= read -r a; do
-    case "$a" in ''|*[!0-9]*) newest=$now; continue ;; esac
-    [ "$a" -gt "$newest" ] && newest=$a
-done <<<"$clients"
-if [ $((now - newest)) -gt "$ACTIVE" ]; then
+if [ "$here_now" = 0 ]; then
     say "skip: no input for $(( (now - newest) / 60 ))m"
     exit 0
 fi
@@ -206,8 +227,8 @@ if [ "$old" -lt "$MIN_OLD" ] && [ "$out" = 0 ]; then
 fi
 
 # --- the nudge -----------------------------------------------------------------
-agents="$old agents idle 8h+"
-[ "$old" = 1 ] && agents="1 agent idle 8h+"
+agents="$old agents idle 8h+ of use"
+[ "$old" = 1 ] && agents="1 agent idle 8h+ of use"
 if [ "$old" -ge "$MIN_OLD" ] && [ "$out" = 1 ]; then
     text="$agents · letters ran out · ⌃S O or click to review"
 elif [ "$old" -ge "$MIN_OLD" ]; then

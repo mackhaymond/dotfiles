@@ -96,6 +96,48 @@ class CloseSpace(unittest.TestCase):
         self.t("kill-session", "-t", sid)
         self.assertEqual(self.close_space("@999"), "")
 
+    # -- the threshold: 8h of use, from the use log ---------------------------
+
+    def min_idle(self, ticks, now):
+        """`review.sh count` at `now` with this use log → the --min-idle it
+        passes to agent-ui (a stub that says its arguments)."""
+        stub = os.path.join(self.tmp, "agent-ui")
+        Path(stub).write_text('#!/bin/sh\necho "$@"\n')
+        os.chmod(stub, 0o755)
+        self.t("set", "-g", "@space_agent_ui", stub)
+        log = Path(self.tmp) / "state" / "agent-review" / "in-use"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.unlink(missing_ok=True)
+        if ticks is not None:
+            log.write_text("".join(f"{t}\n" for t in ticks))
+        env = dict(self.env, TMUX=f"{self.sock},0,0", XDG_STATE_HOME=f"{self.tmp}/state", REVIEW_NOW=str(now))
+        out = subprocess.run(["bash", str(REVIEW), "count"], env=env, check=True, capture_output=True, text=True)
+        words = out.stdout.split()
+        self.assertEqual(words[:3], ["review", "--count", "--min-idle"])
+        return int(words[3])
+
+    def test_a_night_away_is_not_idle_time(self):
+        H, NOW = 3600, 1_800_000_000
+        ticks = lambda start, end: range(start + 300, end + 1, 300)
+        # 8h of use straight up to now: 8h.
+        self.assertEqual(self.min_idle(ticks(NOW - 20 * H, NOW), NOW), 8 * H)
+        # Used until 12h ago (shut overnight), and 1h this morning: 8h of use
+        # ago is 1h + a 11h night + 7h before it.
+        day = [*ticks(NOW - 30 * H, NOW - 12 * H), *ticks(NOW - H, NOW)]
+        self.assertEqual(self.min_idle(day, NOW), 1 * H + 11 * H + 7 * H)
+        # Ticks closer than 5 minutes count the overlap once.
+        half = [t - d for t in ticks(NOW - 20 * H, NOW) for d in (150, 0)]
+        self.assertEqual(self.min_idle(half, NOW), 8 * H)
+        # Junk and future lines are nothing.
+        self.assertEqual(self.min_idle([*ticks(NOW - 20 * H, NOW), "x", NOW + 900], NOW), 8 * H)
+
+    def test_a_short_or_missing_use_log_is_two_days(self):
+        H, NOW = 3600, 1_800_000_000
+        self.assertEqual(self.min_idle(None, NOW), 48 * H)
+        self.assertEqual(self.min_idle([], NOW), 48 * H)
+        self.assertEqual(self.min_idle([NOW - 300, NOW], NOW), 48 * H)
+        self.assertEqual(self.min_idle([NOW - 90 * H, NOW], NOW), 90 * H + 300)
+
 
 if __name__ == "__main__":
     unittest.main()

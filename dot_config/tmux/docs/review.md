@@ -19,7 +19,7 @@ An agent window (`@agent_state` set) is up for review when all of these hold:
 | not a space's home window | a home is never parked or closed |
 | state is `idle`, `done`, `failed` or `needs-input` | never `running`, `paused` or an unknown state |
 | no `@agent_workflow` / `@agent_cua` | background work is still out |
-| idle at least **8 hours** by its `@agent_since` epoch | `MIN_IDLE` in review.rs; `--min-idle SECS` overrides |
+| idle through at least **8 hours of use** by its `@agent_since` epoch | time Mack was at tmux, not wall-clock: a shut laptop ages nobody. `review.sh` passes it as `--min-idle` (below) |
 | not pinned (`@agent_pinned`) | a pin says "keep this one" |
 | not an abby-delegate child (`@agent_child`) | its parent's card owns it |
 | not **kept** (below) | |
@@ -116,6 +116,17 @@ the review. tests/test_review.py covers both refusals.
 After the last agent: `closed 3 · parked 2 · snoozed 1 · kept 2` (and the
 spaces closed); any key closes. With nothing to review it says so and any
 key closes.
+
+## 8 hours of use
+
+`review-nudge.sh` logs an epoch to `~/.local/state/agent-review/in-use` on each
+5-minute tick that finds client input in the last 5 minutes. `review.sh`
+(`min_idle`) walks that log back from now to the moment 8 hours of use ago and
+passes the wall-clock distance as `--min-idle`, so the popup's `idle 2d+` is the
+real time back to it. Nothing that old: the popup opens at 2 hours of use
+instead. No log, or one with under 8 hours in it: 2 days (or as far as the log
+reaches). `agent-ui review` run directly still defaults to 8 wall-clock hours
+(`MIN_IDLE`).
 
 ## For scripts
 
