@@ -129,7 +129,9 @@ local function oldestMains(all, appName)
          and w.frame.w >= 300 and w.frame.h >= 200 then
         return nil
       end
-      if w.role == "AXWindow" and w.subrole == "AXStandardWindow"
+      -- yabai reports a MINIMIZED window's subrole as AXDialog (measured 2026-11-25), so
+      -- minimized counts too, or a minimized main loses its rank to a newer window.
+      if w.role == "AXWindow" and (w.subrole == "AXStandardWindow" or w["is-minimized"])
          and w.title ~= "Picture-in-Picture" then
         ids[#ids + 1] = w.id
       end
