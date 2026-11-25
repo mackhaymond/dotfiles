@@ -926,7 +926,18 @@ def reply_for(meta, n, status, row, tm):
     if row is not None:
         o = tm.out("capture-pane", "-p", "-J", "-t", row["pane"], "-S", "-60")
         if o and o.strip():
-            return o.rstrip("\n"), "screen", False
+            # A TUI screen is mostly padding: drop trailing spaces and fold
+            # runs of blank lines, so the parent reads the words, not the box.
+            lines, blank = [], False
+            for ln in o.split("\n"):
+                ln = ln.rstrip()
+                if ln:
+                    lines.append(ln)
+                    blank = False
+                elif not blank and lines:
+                    lines.append("")
+                    blank = True
+            return "\n".join(lines).rstrip("\n"), "screen", False
     return None, "none", False
 
 
