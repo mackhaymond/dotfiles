@@ -283,6 +283,22 @@ if [ -f "$FAKE_DIR/auto" ]; then
          set -w -t "$w" @agent_turn_end "$now p1 loud" \; set -w -t "$w" @agent_reply_at "$now" \; \
          set -w -t "$w" @agent_spawn_result ready
 fi
+if [ -f "$FAKE_DIR/esc" ]; then
+    # vim-mode Claude: the first Escape only leaves INSERT; the second ends the turn.
+    stty raw -echo
+    n=0
+    while :; do
+        c=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+        [ -n "$c" ] || break
+        [ "$c" = 1b ] || continue
+        n=$((n + 1))
+        echo "$n" > "$FAKE_DIR/esc-$AGENT_SPAWN_ID"
+        if [ "$n" -ge 2 ]; then
+            w=$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}')
+            tmux set -w -t "$w" @agent_state idle \; set -w -t "$w" @agent_turn_end "$(date +%s) p1 loud"
+        fi
+    done
+fi
 exec sleep 600
 """
 
@@ -330,7 +346,7 @@ class Live(unittest.TestCase):
                         AGENT_SPAWN_SESSION_LIB=str(SCRIPTS / "agent-session-lib.sh"),
                         AGENT_SPAWN_CLOSED_TABS=str(self.tmp / "closed-tabs.sh"),
                         AGENT_SPAWN_POLL="0.1", AGENT_SPAWN_BATCH_S="0", AGENT_SPAWN_DIALOG_AFTER="0",
-                        AGENT_SPAWN_FOLLOWUP_GRACE="1", AGENT_SPAWN_RETRY_S="0.1",
+                        AGENT_SPAWN_FOLLOWUP_GRACE="1", AGENT_SPAWN_RETRY_S="0.1", AGENT_SPAWN_CANCEL_WAIT="0.1",
                         TMUX_MCP_URL=self.mcp.url, TMUX_ASSISTANT_RESURRECT_DIR=str(self.res),
                         AGENT_SPAWN_BIN=str(self.bin / "agent-spawn"))
         self.env.pop("AGENT_SPAWN_STATE", None)
@@ -720,7 +736,10 @@ class Live(unittest.TestCase):
         self.end_turn(w, "p1")
         self.assertEqual(self.cli("_deliver", s).returncode, 0)
         self.assertEqual(self.mcp.calls, [])
-        self.assertEqual(self.cli("wait", s).returncode, 12)
+        r = self.cli("wait", s, "--json")
+        self.assertEqual(r.returncode, 12)
+        r = json.loads(r.stdout)[0]
+        self.assertEqual((r["status"], r["reply"], r["reply_source"]), ("cancelled", "", "none"))  # never the screen
         self.assertEqual(self.cli("close", s).returncode, 0)
         self.assertIn("close %s" % p, (self.fake / "closed.log").read_text())
         self.assertEqual(self.cli("close", s).returncode, 12)
@@ -729,6 +748,37 @@ class Live(unittest.TestCase):
         self.setw(w3, **{"@agent_kids_sub": "1 0"})
         self.assertEqual(self.cli("close", s3).returncode, 0)
         self.assertIn("close-family %s" % p3, (self.fake / "closed.log").read_text())
+
+    def test_cancel_resends_escape_while_the_turn_runs(self):
+        (self.fake / "esc").write_text("")
+        s, p, w = self.spawn("--", "x")
+        for _ in range(50):
+            if (self.fake / ("autostart-" + s)).exists():
+                break
+            time.sleep(0.1)
+        time.sleep(0.3)
+        self.start_turn(w, "p1")
+        r = self.cli("cancel", s, AGENT_SPAWN_CANCEL_WAIT="0.3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.fake / ("esc-" + s)).read_text().strip(), "2")   # one more, then it stopped
+        self.assertEqual(self.opt(w, "@agent_state"), "idle")
+
+    def test_stored_turn_reads_after_the_tab_is_gone(self):
+        s, p, w = self.spawn("--", "x")
+        self.start_turn(w, "t1")
+        (self.state / s / "reply.md").write_text("kept\n")
+        self.setw(w, **{"@agent_reply_at": int(time.time())})
+        self.end_turn(w, "t1")
+        self.assertEqual(self.cli("wait", s).returncode, 0)
+        self.tm("kill-window", "-t", w)
+        r = self.cli("result", s, "--turn", "1", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["reply"], "kept\n")
+        self.assertEqual(self.cli("result", s).returncode, 0)
+        # Nothing stored: gone.
+        s2, _, w2 = self.spawn("--", "y")
+        self.tm("kill-window", "-t", w2)
+        self.assertEqual(self.cli("result", s2, "--turn", "1").returncode, 12)
 
     def test_reopened_parent_keeps_its_children_by_session(self):
         s, p, w = self.spawn("--", "x")

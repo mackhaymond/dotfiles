@@ -107,6 +107,10 @@ AUTO = {"claude": ["--permission-mode", "acceptEdits"], "abby": ["--permission-m
         "codex": [], "opencode": []}
 # Interrupt keys per harness (OpenCode wants Escape twice).
 CANCEL_KEYS = {"opencode": ["Escape", "Escape"]}
+# Claude with vim keys (editorMode "vim") spends the first Escape leaving
+# INSERT mode: cancel re-reads the state after this long and, while the turn
+# still runs, sends Escape again (at most twice more), on every harness.
+CANCEL_WAIT = float(os.environ.get("AGENT_SPAWN_CANCEL_WAIT") or 0.4)
 # A child that fires no hook may be sitting on a startup dialog (trust,
 # onboarding, login, a model or version notice): tmux-mcp's readBox treats
 # "no recognisable prompt box" as such; these are the dialogs' own words.
@@ -886,6 +890,7 @@ def reply_for(meta, n, status, row, tm):
         return snap, turn.get("reply_source") or "reply", False
     if n != turns[-1].get("n") or status in ("running", "starting", "paused"):
         return None, "none", False
+    cancelled = status == "cancelled" or turn.get("status") == "cancelled"
     sent = turn.get("sent_at") or 0
     tstart = turn.get("turn_start") or sent
     rep = read_file(reg(sid, "report.json"))
@@ -906,6 +911,8 @@ def reply_for(meta, n, status, row, tm):
         t = read_file(rp)
         if t and t.strip():
             return t, "reply", True
+    if cancelled:      # an interrupted turn has no reply (the screen is not one)
+        return "", "none", False
     if status != "needs-input":
         child = meta.get("child") or {}
         kind = child.get("harness") or child.get("kind")
@@ -1485,10 +1492,18 @@ def cmd_result(a):
     owner_ok(m, caller_of(a))
     tm, rows = live_tm(m)
     r = collect(m, rows, tm, turn_n=a.turn, max_chars=a.max_chars)
+    # A turn whose reply is stored reads after the tab is gone: its own
+    # status decides the exit (0 for a stored done turn), not the tab's.
+    tr = next((x for x in r["turns"] if x.get("n") == r["reply_turn"]), {})
+    stored = r["reply_source"] != "none" and r["reply"] is not None
+    if stored and tr.get("status") in ("done", "failed") and (a.turn or r["status"] in ("gone", "cancelled")):
+        r["turn_status"] = tr["status"]
     if a.json:
         print(json.dumps(r, ensure_ascii=False))
     else:
         print_result(r)
+    if r.get("turn_status"):
+        return STATUS_EXIT[r["turn_status"]]
     return STATUS_EXIT.get(r["status"], EXIT_DONE) if r["status"] in FINAL else EXIT_DONE
 
 
@@ -1642,10 +1657,19 @@ def cmd_cancel(a):
     update_meta(a.id, fn)
     log_event(a.id, "cancelled")
     tm.run("set-option", "-w", "-t", row["win"], "@agent_spawn_result", "read")
+    end0 = row.get("turn_end", "")
     for k, key in enumerate(CANCEL_KEYS.get((m.get("child") or {}).get("kind"), ["Escape"])):
         if k:
             time.sleep(0.3)
         tm.run("send-keys", "-t", row["pane"], key)
+    for _ in range(2):
+        time.sleep(CANCEL_WAIT)
+        o = (tm.out("display-message", "-p", "-t", row["pane"], "#{@agent_state}" + US + "#{@agent_turn_end}")
+             or "").rstrip("\n").split(US)
+        if len(o) < 2 or o[0] != "running" or o[1] != end0:
+            break
+        tm.run("send-keys", "-t", row["pane"], "Escape")
+        log_event(a.id, "still running after Escape: sent another")
     if a.close:
         close_child(m, tm, row)
     if a.json:
