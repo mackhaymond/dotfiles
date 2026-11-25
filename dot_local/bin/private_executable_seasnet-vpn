@@ -3,9 +3,11 @@
 
 Who may start it: a foreground command on a terminal (`seasnet-vpn start`, or
 an interactive `ssh seasnet`), typed by Mack or run by an agent in its pty;
-either way Mack finishes UCLA login and Duo in Zen. Every other SSH --
-Mutagen, BatchMode, background jobs, anything without a controlling terminal --
-rides an existing tunnel or fails fast, and never opens the login window.
+either way Mack approves it with Touch ID in a small card and vlt does UCLA login
+and Duo, or, where that can't work, signs in on UCLA's pages in a window of ours
+(both in ~/.config/seasnet-vpn/signin). Every other SSH -- Mutagen, BatchMode, background
+jobs, anything without a controlling terminal -- rides an existing tunnel or fails
+fast, and never opens the sign-in window.
 
 When it stops: after idle_minutes (config.toml) with no SSH transport besides
 Mutagen's and no change to any file a running seasnet Mutagen session syncs.
@@ -14,22 +16,29 @@ sessions are paused before the disconnect, and also when Mutagen finds the
 tunnel gone, so Mutagen never retries in a loop. The next start resumes exactly
 the sessions this helper paused.
 """
+import base64
+import binascii
 import fcntl
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import plistlib
 import re
+import select
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import uuid
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 HOME = Path.home()
 STATE = Path(os.environ.get("SEASNET_VPN_STATE") or HOME / ".local/state/seasnet-vpn")
@@ -38,12 +47,23 @@ BASELINE = STATE / "network-before.json"
 CONFIG = HOME / ".config/seasnet-vpn/config.toml"
 PORT = int(os.environ.get("SEASNET_VPN_PORT") or 42235)
 TARGET = "cs35l.seas.ucla.edu"
-# Test rigs point this at stub binaries. Normal use never sets it.
-TEST_BIN = os.environ.get("SEASNET_VPN_TEST_BIN")
-OPENCONNECT = f"{TEST_BIN}/openconnect" if TEST_BIN else "/opt/homebrew/bin/openconnect"
-OCPROXY = f"{TEST_BIN}/ocproxy" if TEST_BIN else "/opt/homebrew/bin/ocproxy"
-OPEN = f"{TEST_BIN}/open" if TEST_BIN else "/usr/bin/open"
-BROWSER = "app.zen-browser.zen"
+# Fixed paths: nothing in the environment can swap in another program.
+OPENCONNECT = "/opt/homebrew/bin/openconnect"
+OCPROXY = "/opt/homebrew/bin/ocproxy"
+OPEN = "/usr/bin/open"
+BROWSER = "app.zen-browser.zen"  # Only when our own window cannot run.
+VLT = str(HOME / ".local/bin/vlt")
+LOGIN_HOST, LOGIN_PATH = "v2.ssl.vpn.ucla.edu", "/+CSCOE+/saml/sp/login"
+CALLBACK_PORT = 29786  # openconnect's external-browser listener, on ::1 only.
+SIGNIN_SOURCE = HOME / ".config/seasnet-vpn/signin"
+SIGNIN_APP = HOME / ".local/share/seasnet-vpn/UCLA VPN Sign-In.app"
+SIGNIN_NAME = "UCLA VPN Sign-In"
+SIGNIN_BUNDLE = "co.mackhaymond.seasnet-vpn-signin"
+APPROVE_KEY = HOME / ".local/share/seasnet-vpn/approve-key.json"
+SIGNIN_CANCELLED, SIGNIN_READY_SECONDS = 1, 15
+CHALLENGE_TIMEOUT, VLT_LOGIN_TIMEOUT, CALLBACK_TIMEOUT = 12, 100, 10
+SIGN_SECONDS, PROCEED_SECONDS = 10, 5
+CHALLENGE_MARGIN = 20  # Seconds a challenge must still have when it is signed.
 MUTAGEN = "/opt/homebrew/bin/mutagen"
 # Mutagen resolves ssh through MUTAGEN_SSH_PATH; ask the same ssh about routing.
 SSH = os.path.join(os.environ.get("MUTAGEN_SSH_PATH") or "/usr/bin", "ssh")
@@ -473,8 +493,13 @@ def attempt_current(attempt):
     if attempt is None:  # Explicit browser-login diagnostic invocation.
         return has_tty()
     try:
-        return json.loads((STATE / "login-attempt.json").read_text()).get("id") == attempt
-    except (FileNotFoundError, ValueError):
+        data = json.loads((STATE / "login-attempt.json").read_text())
+        if data.get("id") != attempt:
+            return False
+        if isinstance(data.get("pid"), int):  # The `start` behind it, gone if killed outright.
+            os.kill(data["pid"], 0)
+        return True
+    except (OSError, ValueError):
         return False
 
 
@@ -531,7 +556,7 @@ def caller_kind(parent):
     if re.search(r"batchmode\s*[= ]\s*(yes|true)\b", parent, re.IGNORECASE):
         return "batch"
     # Agents count as interactive: they run commands in a foreground pty, and
-    # the Zen login they open still needs Mack for 1Password and Duo.
+    # the sign-in window they open still needs Mack's fingerprint or password.
     return "interactive" if has_tty() else "batch"
 
 
@@ -632,6 +657,12 @@ def kill_strays():
         if not any(ours(pid) for pid in pids):
             break
         time.sleep(0.2)
+    for pid in pids:
+        if ours(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     if pids:
         log_event(f"terminated stray VPN processes {pids}")
     return pids
@@ -678,35 +709,816 @@ def verify():
     return 0 if unchanged else 1
 
 
+def signin_sources():
+    """The app's Info.plist and source, read once so what is hashed is what is built."""
+    info = {"CFBundleIdentifier": SIGNIN_BUNDLE, "CFBundleName": SIGNIN_NAME,
+            "CFBundleDisplayName": SIGNIN_NAME, "CFBundleExecutable": SIGNIN_NAME,
+            "CFBundlePackageType": "APPL", "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0",
+            "LSMinimumSystemVersion": "15.0", "LSUIElement": True, "NSHighResolutionCapable": True}
+    sources = {path.name: path.read_bytes() for path in sorted(SIGNIN_SOURCE.glob("*.swift"))}
+    if "main.swift" not in sources:
+        raise FileNotFoundError(SIGNIN_SOURCE / "main.swift")
+    digest = hashlib.sha256(repr(sorted(info.items())).encode())
+    for name, text in sources.items():
+        digest.update(f"{name} {len(text)}\n".encode() + text)
+    info["SEASnetSource"] = digest.hexdigest()
+    return info, sources
+
+
+def compile_signin(info, sources, work):
+    """A signed app bundle in `work`, a private directory."""
+    bundle = work / SIGNIN_APP.name
+    (bundle / "Contents/MacOS").mkdir(parents=True)
+    (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
+    (work / "source").mkdir()
+    for name, text in sources.items():
+        (work / "source" / name).write_bytes(text)
+    subprocess.run(["/usr/bin/xcrun", "swiftc", "-O", "-wmo", *(str(work / "source" / name) for name in sources),
+                    "-o", str(bundle / "Contents/MacOS" / SIGNIN_NAME)],
+                   check=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
+    # Ad hoc, with a requirement that names only the bundle id: the app keeps one
+    # identity across rebuilds instead of a new one each time.
+    subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-",
+                    f'--requirements==designated => identifier "{SIGNIN_BUNDLE}"', str(bundle)],
+                   check=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=30)
+    return bundle
+
+
+def signin_record(binary):
+    """What identifies this very executable, or None when it isn't a private file of ours."""
+    try:
+        if any(path.is_symlink() for path in (binary, binary.parent, binary.parents[1], binary.parents[2])):
+            return None
+        info = binary.stat()
+        if not binary.is_file() or info.st_uid != os.getuid() or info.st_mode & 0o022 or not info.st_mode & 0o100:
+            return None
+        return hashlib.sha256(binary.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def build_signin():
+    """The sign-in app's executable, compiled once per version of its source. It must
+    be the very file we built: another one in its place is rebuilt, never run."""
+    info, sources = signin_sources()
+    binary = SIGNIN_APP / "Contents/MacOS" / SIGNIN_NAME
+    built = STATE / "signin-build.json"
+
+    def current():
+        record = read_json(built, {})
+        return (isinstance(record, dict) and record.get("source") == info["SEASnetSource"]
+                and record.get("binary") is not None and record["binary"] == signin_record(binary))
+
+    if current():
+        return binary
+    SIGNIN_APP.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (STATE / "build.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if current():
+            return binary
+        print("Building the sign-in window (first use of this version)...", file=sys.stderr, flush=True)
+        work = Path(tempfile.mkdtemp(prefix=".build-", dir=SIGNIN_APP.parent))
+        try:
+            bundle = compile_signin(info, sources, work)
+            record = {"source": info["SEASnetSource"], "binary": signin_record(bundle / "Contents/MacOS" / SIGNIN_NAME)}
+            if SIGNIN_APP.is_symlink() or SIGNIN_APP.exists():
+                SIGNIN_APP.rename(work / "old.app")
+            bundle.rename(SIGNIN_APP)
+            write_json(built, record)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    if not current():
+        raise OSError("the sign-in app is not the one just built")
+    return binary
+
+
+@contextmanager
+def fresh_signin():
+    """A one-off build, run from its own private directory and then removed."""
+    SIGNIN_APP.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    work = Path(tempfile.mkdtemp(prefix=".build-", dir=SIGNIN_APP.parent))
+    try:
+        print("Building the key maker...", file=sys.stderr, flush=True)
+        yield compile_signin(*signin_sources(), work) / "Contents/MacOS" / SIGNIN_NAME
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+class SlotTaken(Exception):
+    pass
+
+
+@contextmanager
+def signin_slot():
+    """One sign-in window at a time. An older one closes once its attempt is over."""
+    with (STATE / "signin.lock").open("w") as lock:
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SlotTaken("Another UCLA sign-in window is already open.")
+                time.sleep(0.05)
+        yield
+
+
+class WindowClosed(Exception):
+    """The sign-in window quit: closed by the person, or crashed."""
+
+
+class NotWanted(Exception):
+    """The attempt ended (Ctrl-C, timeout, openconnect gone)."""
+
+
+class UseWeb(Exception):
+    """The web window should take this login; str() is a HAND_OVER key."""
+
+
+class UseZen(Exception):
+    """Neither of our windows can run."""
+
+
+class Cancelled(Exception):
+    """The person cancelled in the card while it was handing over."""
+
+
+class ResultUnknown(Exception):
+    """The callback may or may not have reached openconnect."""
+
+
+class SignInWindow:
+    """One of our windows: JSON lines both ways, and EOF closes either side."""
+
+    def __init__(self, binary, wanted, *arguments):
+        self.wanted, self.events, self.buffer = wanted, [], b""
+        self.card = not arguments
+        self.process = subprocess.Popen([str(binary), *arguments], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL)
+
+    def tell(self, **message):
+        try:
+            self.process.stdin.write(json.dumps(message).encode() + b"\n")
+            self.process.stdin.flush()  # And left open: EOF would close the window.
+        except OSError:
+            raise WindowClosed
+
+    def pump(self, *others, timeout=0.2):
+        """Collect the window's events for a moment; the others that are readable."""
+        if not self.wanted():
+            raise NotWanted
+        ready = select.select([self.process.stdout, *others], [], [], timeout)[0]
+        if self.process.stdout in ready:
+            data = os.read(self.process.stdout.fileno(), 4096)
+            if not data:
+                raise WindowClosed
+            *lines, self.buffer = (self.buffer + data).split(b"\n")
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict):
+                    self.events.append(event)
+                    if self.card and event.get("event") == "web":
+                        raise UseWeb(event.get("why"))
+        return [other for other in ready if other is not self.process.stdout]
+
+    def next(self, *names, timeout=None):
+        """The next event with one of these names; None after the timeout."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            while self.events:
+                event = self.events.pop(0)
+                if event.get("event") in names:
+                    return event
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            self.pump()
+
+    def exit_code(self):
+        try:
+            return self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def close(self):
+        """EOF on its stdin closes the window at once, so it cannot outlive us either."""
+        try:
+            self.process.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=5)
+        self.process.stdout.close()
+        return self.process.returncode
+
+
+def vlt(window, *args, payload=None, timeout):
+    """One `vlt vpn` call as a dict; failures are {"code": ...}. The window stays
+    live meanwhile, and closing it kills the call. Secrets travel on stdin only."""
+    try:
+        call = subprocess.Popen([VLT, "vpn", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL if payload is None else subprocess.PIPE)
+    except OSError:
+        return {"code": "vlt_unreachable"}
+    output = {call.stdout: b"", call.stderr: b""}
+    try:
+        if payload is not None:
+            try:
+                call.stdin.write(json.dumps(payload).encode() + b"\n")
+                call.stdin.close()
+            except OSError:
+                pass  # It will say why on its way out.
+        deadline = time.monotonic() + timeout
+        streams = list(output)
+        while streams:
+            if time.monotonic() >= deadline:
+                return {"code": "vlt_unreachable"}
+            for stream in window.pump(*streams):
+                data = os.read(stream.fileno(), 65536)
+                output[stream] += data
+                if not data or len(output[stream]) > 262144:
+                    streams.remove(stream)
+        # Closed streams do not promise an exit; keep to the same deadline.
+        while call.poll() is None:
+            if time.monotonic() >= deadline:
+                return {"code": "vlt_unreachable"}
+            window.pump(timeout=0.02)
+    finally:
+        if call.poll() is None:
+            call.kill()
+        call.wait()
+        for stream in (call.stdin, call.stdout, call.stderr):
+            if stream is not None:
+                stream.close()
+    for text in (output[call.stdout], *reversed(output[call.stderr].splitlines())):
+        try:
+            result = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(result, dict) and ((call.returncode == 0) != isinstance(result.get("code"), str)):
+            return result
+    if call.returncode == 2 and b"unknown command" in output[call.stderr]:
+        return {"code": "vpn_not_configured"}  # A vlt from before `vlt vpn`.
+    return {"code": "vlt_unreachable"}
+
+
+def vpn_challenge(window):
+    """(challenge, usable until), or a failure dict."""
+    asked = time.monotonic()
+    result = vlt(window, "challenge", timeout=CHALLENGE_TIMEOUT)
+    challenge, lifetime = result.get("challenge"), result.get("expires_in")
+    if "code" in result:
+        return result
+    if (not isinstance(challenge, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", challenge)
+            or isinstance(lifetime, bool) or not isinstance(lifetime, (int, float)) or lifetime <= 0):
+        return {"code": "vlt_unexpected_answer"}
+    return challenge, asked + lifetime
+
+
+# vlt's own rule (src/vpn/policy.ts), so neither side accepts what the other refuses.
+CALLBACK = re.compile(r"/api/sso/((?:[A-Za-z0-9+/=]|%[0-9A-Fa-f]{2})+)"
+                      r"\?return=((?:[A-Za-z0-9._~:/?=+,;@!*()-]|%[0-9A-Fa-f]{2}){1,1024})")
+RETURN_HOSTS = ("v2.ssl.vpn.ucla.edu", "ssl.vpn.ucla.edu")
+
+
+def callback_ok(callback):
+    """Exactly what openconnect accepts: /api/sso/<base64>?return=<closing page>, the
+    page being an https one on UCLA's two VPN hosts. It is never opened."""
+    match = CALLBACK.fullmatch(callback) if isinstance(callback, str) and len(callback) <= 4000 else None
+    if not match:
+        return False
+    try:
+        token, page = (unquote(part, errors="strict") for part in match.groups())
+        back = urlsplit(page)
+        return (len(base64.b64decode(token, validate=True)) >= 16
+                and page.startswith("https://") and all(32 < ord(c) != 127 and c not in "\\#" for c in page)
+                and back.hostname in RETURN_HOSTS and "@" not in back.netloc
+                and back.netloc.lower() in (back.hostname, f"{back.hostname}:", f"{back.hostname}:443"))
+    except (ValueError, binascii.Error):
+        return False
+
+
+def deliver_callback(callback):
+    """The one GET openconnect waits for, redirects not followed. 'gone': nobody was
+    listening, nothing was sent. 'refused': openconnect said no. 'unknown': it may have it."""
+    request = f"GET {callback} HTTP/1.1\r\nHost: localhost:{CALLBACK_PORT}\r\nConnection: close\r\n\r\n"
+    try:
+        listener = socket.create_connection(("::1", CALLBACK_PORT), timeout=CALLBACK_TIMEOUT)
+    except OSError:
+        return "gone"
+    answer = b""
+    with listener:
+        try:
+            listener.sendall(request.encode())
+            while b"\r\n" not in answer and len(answer) < 4096:
+                data = listener.recv(4096)
+                if not data:
+                    break
+                answer += data
+        except OSError:
+            pass
+    if not answer.startswith(b"HTTP/1.") or b"\r\n" not in answer:
+        return "unknown"
+    return "ok" if re.match(rb"HTTP/1\.[01] (302|200) ", answer) else "refused"
+
+
+def callback_listeners():
+    """PIDs listening for the callback. A look from outside: connecting would disturb it."""
+    output = capture(["/usr/sbin/lsof", "-nP", f"-iTCP:{CALLBACK_PORT}", "-sTCP:LISTEN", "-Fp"]).stdout
+    return [int(line[1:]) for line in output.splitlines() if re.fullmatch(r"p\d+", line)]
+
+
+def openconnect_proceeded():
+    """Whether openconnect stopped listening, which it does the moment it has its GET."""
+    deadline = time.monotonic() + PROCEED_SECONDS
+    while True:
+        try:
+            if not callback_listeners():
+                return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.3)
+
+
+REPLACE_KEY = "seasnet-vpn approve-key --create --replace, then enroll it in vlt"
+# Where Touch ID and vlt can't do it: the line in the window, and what to add to it
+# in the terminal.
+HAND_OVER = {
+    "chosen": ("", ""),
+    "nokey": ("No Touch ID approval key yet", "set one up with seasnet-vpn approve-key --create"),
+    "card": ("The Touch ID window couldn’t run", ""),
+    "touchid": ("Touch ID isn’t available", ""),
+    "fingerprints": ("No fingerprints are enrolled", f"after adding one: {REPLACE_KEY}"),
+    "key": ("The approval key no longer works", f"fingerprints changed or it is damaged; make a new one: {REPLACE_KEY}"),
+    "keyfile": ("The approval key file isn’t private", "it must be a regular file of yours with mode 600"),
+    "refused": ("The approval key refused the touch", ""),
+    "vlt_unreachable": ("vlt couldn’t be reached", ""),
+    "transport_error": ("vlt couldn’t be reached", ""),
+    "unavailable": ("vlt is unavailable", ""),
+    "keychain_unreadable": ("vlt can’t read its Keychain entry", "unlock the login keychain"),
+    "credentials_invalid": ("vlt’s VPN credentials are invalid", "renew them with vlt vpn grant"),
+    "credentials_missing": ("vlt has no VPN credentials here", "add them with vlt vpn grant"),
+    "access_blocked": ("Cloudflare Access blocked vlt", "renew its VPN credentials with vlt vpn grant"),
+    "client_error": ("vlt couldn’t run the sign-in", ""),
+    "bad_request": ("vlt refused the request", ""),
+    "too_large": ("vlt refused the request", ""),
+    "unsupported_media_type": ("vlt refused the request", ""),
+    "unauthorized": ("vlt’s VPN grant isn’t valid", "renew it with vlt vpn grant"),
+    "forbidden": ("vlt’s VPN grant isn’t valid", "renew it with vlt vpn grant"),
+    "not_found": ("vlt has no VPN login set up", ""),
+    "vpn_private_state_unavailable": ("vlt can’t open its UCLA login", ""),
+    "vlt_unexpected_answer": ("vlt gave an unexpected answer", ""),
+    "vpn_not_configured": ("vlt has no VPN login set up", ""),
+    "vpn_action_required": ("UCLA needs you to sign in yourself", "then clear it with vlt vpn reset"),
+    "vpn_signature_invalid": ("vlt doesn’t know this Mac’s key", "enroll the one seasnet-vpn approve-key --show prints"),
+    "vpn_url_denied": ("vlt refused this sign-in", ""),
+    "vpn_callback_unrecognized": ("vlt didn’t recognize UCLA’s answer", ""),
+}
+# Not for the web window by itself, but always with it as a button. Retry is only for
+# what another touch can fix: a UCLA login that has started has used its URL up.
+PROBLEMS = {
+    "vpn_challenge_invalid": ("The approval expired", "vlt didn’t accept its challenge. Touch again to retry.", True),
+    "vpn_rate_limited": ("Too many sign-ins", "vlt is limiting VPN logins.", False),
+    "vpn_policy_changed": ("vlt’s settings changed", "The sign-in was stopped. Run the command again to start fresh.", False),
+    "vpn_login_failed": ("UCLA sign-in failed", "vlt couldn’t finish the UCLA login. Run the command again to start fresh.", False),
+    "vlt_lost": ("vlt’s answer was lost", "The sign-in may have run, so it won’t be sent again. Run the command again to start fresh.", False),
+}
+# vlt's client_error details with a reason of their own; the rest stay client_error.
+CLIENT_DETAILS = ("keychain_unreadable", "credentials_invalid", "credentials_missing", "access_blocked")
+RATE_WAIT_MAX = 120  # Longer than this, and the login itself runs out first.
+
+
+def show_problem(window, failure):
+    """Tell the card what went wrong, or leave for the web window where a touch can't help."""
+    code = failure.get("code")
+    if code == "client_error" and failure.get("detail") in CLIENT_DETAILS:
+        code = failure["detail"]
+    known = isinstance(code, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code)
+    log_event(f"sign-in problem: {code if known else 'unrecognized'}")
+    if code in HAND_OVER:
+        raise UseWeb(code)
+    title, detail, retry = (PROBLEMS.get(code) if known else None) or (
+        "UCLA sign-in failed", "vlt gave an answer this version doesn’t know. Run the command again to start fresh.", False)
+    message = {"do": "problem", "title": title, "detail": detail, "retry": retry, "web": True}
+    wait = failure.get("retry_after_s")
+    if code == "vpn_rate_limited" and isinstance(wait, int) and not isinstance(wait, bool) and wait > 0:
+        if wait <= RATE_WAIT_MAX:
+            message.update(retry=True, wait=wait)
+        else:
+            message["detail"] = f"vlt allows the next VPN login in about {math.ceil(wait / 60)} minutes."
+    window.tell(**message)
+
+
+def signed_login(window, url, challenge, approval):
+    """vlt's answer to this approval, or None when the window has moved on from it.
+    A challenge that ran out is replaced once."""
+    for attempt in range(2):
+        if isinstance(challenge, dict):
+            return challenge
+        if time.monotonic() > challenge[1] - CHALLENGE_MARGIN:
+            challenge = vpn_challenge(window)
+            if isinstance(challenge, dict):
+                return challenge
+        window.tell(do="sign", challenge=challenge[0], n=approval)
+        # "unsigned" means the card already shows why, with a retry.
+        until = time.monotonic() + SIGN_SECONDS
+        while True:
+            signed = window.next("signed", "unsigned", "approved", timeout=max(0, until - time.monotonic()))
+            if signed is None:
+                window.tell(do="problem", title="The key didn’t answer", detail="Nothing was sent. Touch again to retry.",
+                            retry=True, web=True)
+                return None
+            if signed["event"] == "approved":
+                window.events.insert(0, signed)
+                return None
+            if signed["event"] == "unsigned":
+                return None
+            if signed.get("challenge") == challenge[0]:
+                break
+        signature = signed.get("signature")
+        if not isinstance(signature, str) or not re.fullmatch(r"[A-Za-z0-9_-]{86}", signature):
+            return {"code": "vpn_signature_invalid"}
+        # Hanging up does not stop vlt, so a cancel from here on has more to say.
+        sent = STATE / "login-sent"
+        write_text_atomic(sent, os.environ.get("SEASNET_VPN_LOGIN_ATTEMPT", "") + "\n")
+        result = vlt(window, "login", "--input-stdin", timeout=VLT_LOGIN_TIMEOUT,
+                     payload={"url": url, "challenge": challenge[0], "signature": signature})
+        sent.unlink(missing_ok=True)
+        if (result.get("code") in ("vlt_unreachable", "transport_error")
+                or result.get("code") == "client_error" and result.get("detail") in ("invalid_response", "other", None)):
+            return {"code": "vlt_lost"}  # It may have run; a login is never sent twice.
+        # The one exception: vlt refuses a dead challenge before it contacts UCLA or
+        # counts an attempt, so a new challenge is not a second login.
+        if result.get("code") != "vpn_challenge_invalid" or attempt:
+            return result
+        challenge = vpn_challenge(window)
+    return result
+
+
+def approve_and_login(window, url):
+    """Until the callback is delivered. Each pass is one Touch ID approval."""
+    # Asked for while the window waits, so a vlt that cannot help is known early
+    # and a quick touch signs at once. One that ages out is replaced before use.
+    challenge = vpn_challenge(window)
+    if isinstance(challenge, dict) and challenge.get("code") != "vpn_challenge_invalid":
+        show_problem(window, challenge)
+        challenge = None
+    while True:
+        approval = window.next("approved").get("n")
+        result = signed_login(window, url, challenge or vpn_challenge(window), approval)
+        challenge = None
+        if result is None:
+            continue
+        if "code" in result:
+            show_problem(window, result)
+            continue
+        if not callback_ok(result.get("callback")):
+            show_problem(window, {"code": "vpn_callback_unrecognized"})
+            continue
+        window.pump(timeout=0)  # A cancel that came with vlt's answer wins.
+        delivered = deliver_callback(result["callback"])
+        if delivered == "ok":
+            try:
+                window.tell(do="done")
+            except WindowClosed:
+                pass  # Closed in the same moment; openconnect has its answer.
+            return
+        log_event(f"openconnect's listener: {delivered}")
+        if delivered == "unknown":
+            raise ResultUnknown
+        if delivered == "gone":
+            window.tell(do="problem", title="The VPN stopped waiting", detail="Start it again from the terminal.",
+                        retry=False, web=False)
+        else:
+            show_problem(window, {"code": "vpn_callback_unrecognized"})
+
+
+def notify(text):
+    """One line for the terminal. openconnect owns our stderr, so `start` relays it."""
+    write_text_atomic(STATE / "login-notice", text + "\n")
+
+
+def run_signin(url, attempt, asker):
+    """Get this login done: 'done', 'cancelled' or 'stale'. UseZen when neither
+    window can run. The Touch ID card comes first, the web window if it can't."""
+    parent = os.getppid()
+    deadline = time.monotonic() + LOGIN_TIMEOUT
+
+    def wanted():
+        # openconnect is our parent; when it ends, nobody is waiting any more.
+        return attempt_current(attempt) and os.getppid() == parent and time.monotonic() < deadline
+
+    try:
+        binary = build_signin()
+    except (OSError, subprocess.SubprocessError) as error:
+        log_event(f"building the sign-in window failed: {type(error).__name__}")
+        raise UseZen from None
+    card = None
+    try:
+        why = "nokey"
+        if APPROVE_KEY.exists():
+            why = "card"
+            try:
+                card = SignInWindow(binary, wanted)
+                card.tell(url=url, key=str(APPROVE_KEY), **asker)
+                if card.next("ready", timeout=SIGNIN_READY_SECONDS) is not None:
+                    approve_and_login(card, url)
+                    return "done"
+                log_event("approval card did not open in time")
+            except UseWeb as hand_over:
+                why = str(hand_over) if str(hand_over) in HAND_OVER else "card"
+            except WindowClosed:
+                code = card.exit_code()
+                if code == SIGNIN_CANCELLED:
+                    return "cancelled"
+                log_event(f"approval card failed (exit {code})")
+            except OSError as error:
+                log_event(f"approval card failed: {type(error).__name__}")
+            if card is not None and why != "card":
+                try:
+                    card.tell(do="web")  # It waits for the web window, and can still cancel.
+                except WindowClosed:
+                    pass
+            elif card is not None and card.close() == SIGNIN_CANCELLED:
+                return "cancelled"
+        log_event(f"web sign-in: {why}")
+        return web_login(binary, url, why, card, wanted)
+    except NotWanted:
+        return "stale"
+    except Cancelled:
+        return "cancelled"
+    finally:
+        if card is not None:
+            card.close()
+
+
+def web_login(binary, url, why, card, wanted):
+    """UCLA's own pages, in a process that has neither the approval key nor vlt."""
+    reason, more = HAND_OVER[why]
+
+    def still_wanted():
+        # A card that was cancelled meanwhile ends the hand-over on the spot.
+        if card is not None and card.process.poll() == SIGNIN_CANCELLED:
+            raise Cancelled
+        return wanted()
+
+    def use_zen(event):
+        log_event(event)
+        if card is not None and card.close() == SIGNIN_CANCELLED:
+            raise Cancelled
+        raise UseZen from None
+
+    try:
+        window = SignInWindow(binary, still_wanted, "--web")
+    except OSError as error:
+        use_zen(f"web sign-in failed: {type(error).__name__}")
+    try:
+        window.tell(url=url, reason=f"{reason}, so sign in here." if reason else "")
+        if window.next("prepared", timeout=SIGNIN_READY_SECONDS) is None:
+            use_zen("web sign-in did not open in time")
+        # The card goes first: once it is gone it can't be cancelled any more, so a
+        # cancelled hand-over never shows the web window.
+        if card is not None and card.close() == SIGNIN_CANCELLED:
+            raise Cancelled
+        if reason:
+            notify(f"{reason}{f' ({more})' if more else ''}; sign in in the window.")
+        window.tell(do="show")
+        if window.next("ready", timeout=SIGNIN_READY_SECONDS) is None:
+            use_zen("web sign-in did not open in time")
+        if window.next("delivered", "unknown")["event"] == "unknown":
+            raise ResultUnknown
+        return "done"
+    except WindowClosed:
+        code = window.exit_code()
+        if code == SIGNIN_CANCELLED:
+            return "cancelled"
+        if code == 0:
+            return "done"
+        use_zen(f"web sign-in failed (exit {code})")
+    finally:
+        window.close()
+
+
+def login_url_ok(url):
+    """Same gate as the windows' Contract.accepts: UCLA's VPN login and nothing else."""
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme == "https" and parsed.hostname == LOGIN_HOST and parsed.path == LOGIN_PATH
+                and parsed.username is None and parsed.password is None and parsed.port in (None, 443)
+                and len(url) < 8192 and all(32 < ord(c) < 127 for c in url))
+    except ValueError:
+        return False
+
+
+AGENTS = {"claude": "Claude", "codex": "Codex", "opencode": "OpenCode", "grok": "Grok"}
+
+
+def tmux(*args):
+    try:
+        return subprocess.run(["/opt/homebrew/bin/tmux", *args], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def process_table():
+    table = {}
+    for line in capture(["/bin/ps", "-axo", "pid=,ppid=,ucomm="]).stdout.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) == 3:
+            table[int(fields[0])] = (int(fields[1]), fields[2].strip())
+    return table
+
+
+def ancestors(table, pid):
+    chain = []
+    while pid in table and pid > 1 and pid not in chain:
+        chain.append(pid)
+        pid = table[pid][0]
+    return chain
+
+
+def asking_command(commands):
+    """What was run, from this process's ancestors (argv strings, nearest first).
+    Only fixed words and simple subcommands are shown, never arguments."""
+    found = "seasnet-vpn start"
+    for args in commands:
+        words = [Path(word).name for word in args.split()[:3]]
+        if words and words[0] == "ssh":
+            found = "ssh seasnet" if re.search(r"(^|\s)(\S+@)?seasnet(\s|$)", args) else "ssh"
+        for i, word in enumerate(words[:2]):
+            if word == "relayctl":
+                after = words[i + 1:i + 2]
+                return f"relayctl {after[0]}" if after and re.fullmatch(r"[a-z][a-z-]{0,20}", after[0]) else "relayctl"
+    return found
+
+
+def who_asks():
+    """The command and, when certain, the agent or space behind it. For show only."""
+    asker = {"command": "seasnet-vpn start", "by": "", "agent": False}
+    try:
+        table = process_table()
+        chain = ancestors(table, os.getpid())
+        args = {}
+        for line in capture(["/bin/ps", "-ww", "-o", "pid=,args=", "-p", ",".join(map(str, chain))]).stdout.splitlines():
+            pid, _, rest = line.strip().partition(" ")
+            args[int(pid)] = rest.strip()
+        asker["command"] = asking_command([args.get(pid, "") for pid in chain[1:]])
+
+        def agent_name(pid):
+            # Claude's own executable is named for its version, so go by argv.
+            if pid not in args and pid in table:
+                args[pid] = capture(["/bin/ps", "-ww", "-o", "args=", "-p", str(pid)]).stdout.strip()
+            words = args.get(pid, "").split()
+            return AGENTS.get(Path(words[0]).name) if words else None
+
+        pane = os.environ.get("TMUX_PANE", "")
+        pane = pane if re.fullmatch(r"%\d+", pane) else ""
+        agent = next((pid for pid in chain if agent_name(pid)), None)
+        # The pty server's shells are run by agents only, and say which one.
+        shell = any(os.environ.get(name) for name in
+                    ("AGENT_PTY", "AGENT_SHELL", "OPENCODE", "OPENCODE_TERMINAL", "CLAUDECODE"))
+        if agent is None and os.environ.get("AGENT_PTY") and pane:
+            owner = tmux("show-options", "-wqv", "-t", pane, "@pty_claude_pid").strip()
+            agent = int(owner) if owner.isdigit() and agent_name(int(owner)) else None
+        if agent is not None or shell:
+            asker["agent"] = True
+            asker["by"] = "An agent"
+            if agent is not None:
+                asker["by"] = f"An agent: {agent_name(agent)}"
+                lineage = ancestors(table, agent)
+                for line in tmux("list-panes", "-a", "-F", "#{pane_pid} #{@agent_key}").splitlines():
+                    fields = line.split()
+                    if len(fields) == 2 and fields[0].isdigit() and int(fields[0]) in lineage \
+                            and re.fullmatch(r"[a-z]", fields[1]):
+                        asker["by"] += f", agent {fields[1].upper()}"
+                        break
+        elif pane:
+            space = tmux("display-message", "-p", "-t", pane, "#{?@space_hidden,,#{session_name}}").strip()
+            if re.fullmatch(r"[\w .+-]{1,30}", space):
+                asker["by"] = f"In the {space} space"
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        pass
+    return asker
+
+
+def approve_key(args):
+    """Make this Mac's approval key, or print its public half for vlt."""
+    action, replace = args[0], args[1:] == ["--replace"]
+    APPROVE_KEY.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if action == "--show":
+        return subprocess.run([str(build_signin()), "--show-key", str(APPROVE_KEY)],
+                              stdin=subprocess.DEVNULL, timeout=30).returncode
+    kept = None
+    # The key that will stand for Mack's finger is made by a program built here and
+    # now, not by whatever sits in the app's place.
+    with fresh_signin() as binary:
+        if replace and APPROVE_KEY.exists():
+            kept = APPROVE_KEY.with_name(f"approve-key.{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}.old.json")
+            APPROVE_KEY.rename(kept)
+        code = 1
+        try:
+            code = subprocess.run([str(binary), "--create-key", str(APPROVE_KEY)],
+                                  stdin=subprocess.DEVNULL, timeout=30).returncode
+        finally:
+            if code and kept:
+                kept.rename(APPROVE_KEY)
+    if not code:
+        log_event("created an approval key" + (f"; the old one is {kept.name}" if kept else ""))
+    return code
+
+
+def fail_attempt(attempt, line, request_id=None):
+    """End this login now, with one line in the terminal instead of a silent wait."""
+    if attempt is None:
+        print(line, file=sys.stderr, flush=True)
+    elif attempt_current(attempt):
+        request_id = request_id or str(uuid.uuid4())
+        notify(line)
+        write_json(STATE / "login-request.json", {"id": request_id, "attempt": attempt})
+        write_login_result("failed", request_id=request_id)
+    return 1
+
+
 def browser_login(url):
-    parsed = urlsplit(url)
-    if (parsed.scheme != "https" or not (parsed.hostname or "").endswith(".ucla.edu")
-            or parsed.username is not None or parsed.password is not None):
-        print("Refusing an unexpected browser-login URL.", file=sys.stderr)
-        return 1
     attempt = os.environ.get("SEASNET_VPN_LOGIN_ATTEMPT")
+    try:
+        return try_browser_login(url, attempt)
+    except Exception as error:
+        # Never the message: it could carry the URL.
+        log_event(f"sign-in stopped: {type(error).__name__}")
+        return fail_attempt(attempt, f"UCLA sign-in stopped unexpectedly ({type(error).__name__}); run it again.")
+
+
+def try_browser_login(url, attempt):
     if not attempt_current(attempt):
         print("Ignoring an expired UCLA login attempt.", file=sys.stderr)
         return 1
+    if not login_url_ok(url):
+        log_event("refused an unexpected login URL")
+        return fail_attempt(attempt, "Refusing an unexpected login page: it isn’t UCLA’s VPN login. Nothing was opened.")
     request_id = str(uuid.uuid4())
-    write_json(STATE / "login-request.json", {"id": request_id, "url": url, "attempt": attempt})
+    asker = read_json(STATE / "login-attempt.json", {}).get("asker") if attempt else None
+    if not isinstance(asker, dict) or not asker.get("command"):
+        asker = who_asks()
+        if attempt is None:
+            asker["command"] = "seasnet-vpn browser-login"
+    log_event("opening UCLA sign-in for an interactive start")
     try:
-        log_event("opening UCLA login in Zen for an interactive start")
-        # A normal tab in Zen, which comes to the front and carries 1Password; the
-        # SSO's final redirect lands on openconnect's localhost listener. Zen has no
-        # popup window to ask for (Little Zen: not in 1.24). The URL is one argv item.
+        with signin_slot():
+            write_json(STATE / "login-request.json", {"id": request_id, "attempt": attempt})
+            try:
+                outcome = run_signin(url, attempt, asker) if attempt_current(attempt) else "stale"
+            except UseZen:
+                outcome = "zen"
+            except ResultUnknown:
+                outcome = "done" if openconnect_proceeded() else "unknown"
+    except SlotTaken as error:
+        return fail_attempt(attempt, str(error), request_id)
+    log_event(f"sign-in: {outcome}")
+    if outcome == "done":
+        return 0
+    if outcome == "cancelled":
+        write_json(STATE / "login-cancel.json", {"id": request_id, "result": "cancelled"})
+        return 1
+    if outcome == "unknown":
+        return fail_attempt(attempt, "It is unknown whether the sign-in reached the VPN, and it has not connected; "
+                                     "run it again.", request_id)
+    if outcome == "stale" or not attempt_current(attempt):
+        return 1
+    return open_in_zen(url, attempt, request_id)
+
+
+def open_in_zen(url, attempt, request_id):
+    try:
+        # The URL is one argv item, never spliced into a script.
         result = subprocess.run([OPEN, "-b", BROWSER, url],
                                 capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         result = None
     if result is None or result.returncode:
-        write_login_result("failed", request_id=request_id)
-        print("Zen could not be opened for UCLA login. Check that Zen is installed and retry.",
-              file=sys.stderr, flush=True)
-        return 1
-    print("UCLA login opened in Zen. Complete sign-in and Duo there; Ctrl-C here cancels.",
-          file=sys.stderr, flush=True)
+        return fail_attempt(attempt, "Neither the sign-in window nor Zen could be opened for UCLA login.", request_id)
+    notify("The sign-in window could not run, so UCLA login opened in Zen. Ctrl-C here cancels.")
     return 0
+
+
+def relay_notice():
+    notice = STATE / "login-notice"
+    try:
+        text = notice.read_text().strip()
+        notice.unlink()
+    except OSError:
+        return False
+    print(text, flush=True)
+    return True
 
 
 def terminate_auth(auth):
@@ -718,6 +1530,32 @@ def terminate_auth(auth):
             # Only this authentication subprocess, never the login GUI.
             auth.kill()
             auth.wait(timeout=5)
+
+
+def callback_port_free():
+    with socket.socket(socket.AF_INET6) as check:
+        check.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            check.bind(("::1", CALLBACK_PORT))
+            return True
+        except OSError:
+            return False
+
+
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def ignore_signals():
+    """Nothing interrupts cleanup. Returns what to put back."""
+    try:
+        return [(number, signal.signal(number, signal.SIG_IGN)) for number in STOP_SIGNALS]
+    except ValueError:  # Not the main thread, so no signal arrives here anyway.
+        return []
+
+
+def restore_signals(previous):
+    for number, handler in previous:
+        signal.signal(number, handler)
 
 
 def start(username=None, terminal_auth=False):
@@ -749,13 +1587,30 @@ def start(username=None, terminal_auth=False):
             if not kill_strays():
                 print(f"Port {PORT} is already occupied; refusing to reuse it.", file=sys.stderr)
                 return 1
+    # openconnect listens here for the login's result. An orphan of ours is cleared;
+    # anyone else's listener is left alone.
+    if not terminal_auth and not callback_port_free():
+        kill_strays()
+        if not callback_port_free():
+            print(f"Port {CALLBACK_PORT} is in use by another program (another VPN login?); leaving it alone.",
+                  file=sys.stderr)
+            return 1
     BASELINE.write_text(json.dumps(snapshot(), indent=2) + "\n")
     PIDFILE.unlink(missing_ok=True)
     (STATE / "login-request.json").unlink(missing_ok=True)
     (STATE / "login-result.json").unlink(missing_ok=True)
     (STATE / "login-cancel.json").unlink(missing_ok=True)
+    (STATE / "login-notice").unlink(missing_ok=True)
+    (STATE / "login-sent").unlink(missing_ok=True)
+    if not terminal_auth:
+        try:
+            build_signin()  # Before openconnect, whose login clock is UCLA's.
+        except (OSError, subprocess.SubprocessError) as error:
+            # browser_login falls back to Zen and says so.
+            log_event(f"building the sign-in window failed: {type(error).__name__}")
     attempt = str(uuid.uuid4())
-    write_json(STATE / "login-attempt.json", {"id": attempt})
+    write_json(STATE / "login-attempt.json", {"id": attempt, "pid": os.getpid(),
+                                              "asker": None if terminal_auth else who_asks()})
     args = [OPENCONNECT, "--protocol=anyconnect", "--disable-ipv6",
             "--script-tun", "--script", f"{OCPROXY} -L {PORT}:{TARGET}:22 -k 30",
             "--background", "--pid-file", str(PIDFILE), "--reconnect-timeout=60"]
@@ -769,7 +1624,7 @@ def start(username=None, terminal_auth=False):
     if terminal_auth:
         print("Enter your UCLA Logon credentials and Duo response as required by UCLA.", flush=True)
     else:
-        print("Opening UCLA login; complete sign-in and Duo in Zen.", flush=True)
+        print("Opening UCLA VPN sign-in in its own window. Cancel there or Ctrl-C here.", flush=True)
     # The daemon must not retain an SSH caller's stdout/stderr pipes after
     # login. Browser authentication and subsequent VPN logs stay in this file.
     log = None if terminal_auth else (STATE / "openconnect.log").open("w")
@@ -787,8 +1642,10 @@ def start(username=None, terminal_auth=False):
         deadline = time.monotonic() + LOGIN_TIMEOUT
         while auth.poll() is None:
             if login_cancelled() or time.monotonic() >= deadline:
-                print("UCLA login cancelled or timed out.", file=sys.stderr)
+                if not relay_notice():
+                    print("UCLA login cancelled or timed out.", file=sys.stderr)
                 return 1
+            relay_notice()
             time.sleep(0.2)
         if auth.returncode:
             print(f"VPN login failed. Diagnostic log: {STATE / 'openconnect.log'}", file=sys.stderr)
@@ -820,27 +1677,50 @@ def start(username=None, terminal_auth=False):
         print("VPN started but the restricted forward is unavailable; stopping it.", file=sys.stderr)
         return 1
     finally:
-        if not connected:
-            try:
-                write_login_result("failed", attempt=attempt)
-                record_login(False)
-            except (OSError, ValueError, KeyError):
-                # A diagnostic write must not prevent auth/daemon cleanup.
-                pass
-            try:
-                if attempt_current(attempt):
-                    (STATE / "login-attempt.json").unlink(missing_ok=True)
-            except OSError:
-                pass
-            try:
-                if auth is not None:
-                    terminate_auth(auth)
-            finally:
-                # Authentication may fork its daemon just before cancellation.
-                # This start had no prior owned VPN, and control.lock serializes
-                # other starts, so any daemon now in our pidfile is this attempt.
-                if owned_pid():
-                    stop()
+        try:
+            previous = ignore_signals()
+        except KeyboardInterrupt:  # It landed right here; interrupt_on_hangup raises only once.
+            previous = ignore_signals()
+        try:
+            if not connected:
+                abandon_login(attempt, auth)
+        finally:
+            restore_signals(previous)
+
+
+def abandon_login(attempt, auth):
+    sent = STATE / "login-sent"
+    try:
+        if sent.read_text().strip() == attempt:
+            sent.unlink()
+            print("The sign-in vlt had started may still finish at UCLA, but this Mac won't connect.",
+                  file=sys.stderr, flush=True)
+    except OSError:  # Not sent, or no terminal left to tell.
+        pass
+    try:
+        write_login_result("failed", attempt=attempt)
+        record_login(False)
+    except (OSError, ValueError, KeyError):
+        # A diagnostic write must not prevent auth/daemon cleanup.
+        pass
+    try:
+        if attempt_current(attempt):
+            (STATE / "login-attempt.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        if auth is not None:
+            terminate_auth(auth)
+    finally:
+        # Authentication may fork its daemon just before cancellation, or a signal
+        # may land while it is being started. This start had no prior owned VPN, and
+        # control.lock serializes other starts, so anything of ours is this attempt's.
+        if owned_pid():
+            stop()
+        try:
+            kill_strays()
+        except (OSError, subprocess.SubprocessError) as error:
+            log_event(f"could not look for strays: {type(error).__name__}")
 
 
 def stop():
@@ -910,14 +1790,22 @@ def idle_watch():
     return 0
 
 
+def interrupt_on_hangup():
+    """Closing the terminal cleans up like Ctrl-C does. Only the first signal counts:
+    a second one must not cut that cleanup short."""
+    def interrupted(signum, frame):
+        for number in STOP_SIGNALS:
+            signal.signal(number, signal.SIG_IGN)
+        raise KeyboardInterrupt
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, interrupted)
+
+
 def proxy(host, port):
     if host != TARGET or port != "22":
         print("This forward only accepts cs35l.seas.ucla.edu:22.", file=sys.stderr)
         return 1
-    def interrupted(signum, frame):
-        raise KeyboardInterrupt
-    for signum in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(signum, interrupted)
+    interrupt_on_hangup()
     parent = parent_args()
     kind = caller_kind(parent)
     if not tunnel_up():
@@ -1028,7 +1916,8 @@ def main():
     os.umask(0o077)
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     if len(sys.argv) < 2:
-        print("Usage: seasnet-vpn {start [--terminal] [UCLA_LOGON]|stop|status|verify|proxy HOST PORT}")
+        print("Usage: seasnet-vpn {start [--terminal] [UCLA_LOGON]|stop|status|verify|proxy HOST PORT|"
+              "approve-key {--create [--replace]|--show}}")
         return 2
     command = sys.argv[1]
     if command.startswith("https://") and len(sys.argv) == 2:
@@ -1043,6 +1932,8 @@ def main():
         return idle_watch()
     if command == "pause-sync" and len(sys.argv) == 2:
         return pause_after_refusal()
+    if command == "approve-key" and sys.argv[2:] in (["--create"], ["--create", "--replace"], ["--show"]):
+        return approve_key(sys.argv[2:])
     if command == "verify" and len(sys.argv) == 2:
         return verify()
     remaining = sys.argv[2:]
@@ -1050,6 +1941,7 @@ def main():
     if terminal_auth:
         remaining.remove("--terminal")
     if command == "start" and len(remaining) <= 1:
+        interrupt_on_hangup()
         with control_lock():
             return start(remaining[0] if remaining else None, terminal_auth)
     if command == "stop" and not remaining and not terminal_auth:

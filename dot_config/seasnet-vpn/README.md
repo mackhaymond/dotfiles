@@ -8,9 +8,9 @@ and system traffic use their normal connections.
 
 A foreground command on a terminal, typed by you or run by an agent in its pty:
 `seasnet-vpn start`, or `ssh seasnet` / `relayctl …` when the VPN is down. That
-opens UCLA sign-in in a
-**Zen** tab (it comes to the front), so 1Password fills it, then Duo. Ctrl-C in the terminal
-cancels; an unfinished login times out after 5 minutes. Login progress and refusals
+opens the **UCLA VPN Sign-In** window on the current Space: a Touch ID card, or UCLA's
+pages where that can't work (see below). Cancel, Esc, ⌘W or Ctrl-C in the terminal cancels
+at once; an unfinished login times out after 5 minutes and the window closes. Login progress and refusals
 are written to your terminal even when the caller hides ssh's stderr, which
 relayctl does.
 
@@ -29,6 +29,70 @@ controlling terminal" and is refused.
 
 After a failed or cancelled login, SSH stops reopening the login for 1, 2, 4,
 … up to 30 minutes. `seasnet-vpn start` always tries right away.
+
+## The sign-in window
+
+**Touch ID card.** It says what asked (`ssh seasnet`, `relayctl …` or
+`seasnet-vpn start`, and the agent or space when that is certain) and takes your
+fingerprint in the window itself. vlt then does UCLA login and Duo, `seasnet-vpn`
+sends openconnect the one request it waits for on `[::1]:29786`, and the card
+closes at once.
+
+The fingerprint is enforced by the Secure Enclave: the approval key signs only
+after a match, has no password path, and stops working if the enrolled
+fingerprints change. vlt accepts a login only with its signature over a one-time
+challenge and that exact login URL. Set up once, or again after changing
+fingerprints:
+
+- `seasnet-vpn approve-key --create` makes the key and prints its public half;
+  enroll that in vlt. It never overwrites a key; `--create --replace` makes a new
+  one and keeps the old file aside.
+- `seasnet-vpn approve-key --show` prints the public half again.
+
+The key file is `~/.local/share/seasnet-vpn/approve-key.json` (mode 600). It works
+on this Mac only, and only with your finger.
+
+A vlt login is sent once. After it fails, or its answer is lost, there is no Retry:
+run the command again to start fresh. Cancelling one already sent doesn't stop it
+at UCLA, but this Mac won't connect; the terminal says so. If it is unclear whether
+the result reached openconnect, `seasnet-vpn` checks whether openconnect moved on,
+and otherwise ends the attempt.
+
+**Web sign-in.** When a touch can't do it, UCLA's own pages open in a window of
+ours in the same place, for the same login, and the terminal says why in one line.
+That happens by itself when there is no key or it no longer works, Touch ID is
+unavailable (lid closed), or vlt can't be reached, has no valid VPN credentials,
+doesn't know the key, refuses, needs you to act (then `vlt vpn reset`), or doesn't
+recognize UCLA's answer. Otherwise it is the **Sign in here instead** button:
+wrong finger, locked or interrupted Touch ID, a failed login, a rate limit, or a
+lost answer from vlt.
+
+- Password and Duo push work there. Passkeys, security keys and Touch ID don't:
+  they need an Apple entitlement. ⌘\ may fill from 1Password.
+- It hides in the same callback that gives it the login result, so Cisco's "you
+  can close this" page never loads.
+- Only HTTPS on `ucla.edu` and Duo's `api-*.duosecurity.com` opens, plus the one
+  `localhost:29786` request. Anything else, pop-ups included, is blocked with a
+  message.
+- It remembers nothing: no cookies, no Duo "remember this device". A remembered
+  session could let a later login finish with nobody there. An earlier build's
+  store is never read.
+- It is a separate process with neither the approval key nor vlt, and the card
+  never creates a web view.
+
+The login opens in Zen only if neither window can be built or run.
+
+`signin/*.swift` is compiled on first use (a few seconds, again after any change)
+into `~/.local/share/seasnet-vpn/UCLA VPN Sign-In.app`, and only the very file that
+was built is run. `approve-key --create` always builds afresh, in a private folder.
+Window title and app name: `UCLA VPN Sign-In`; bundle id: `co.mackhaymond.seasnet-vpn-signin`. No URLs,
+tokens or signatures are logged or put on a command line of ours; only
+openconnect's own call to `seasnet-vpn` and the Zen fallback carry the login URL.
+
+To check it without opening a window, build it with
+`xcrun swiftc -D TESTING signin/*.swift -o /tmp/signin-testing` and run that with
+`--self-test DIR` or `--render-previews DIR`. The app `seasnet-vpn` builds has
+neither, nor the software key they use.
 
 ## When it stops
 
