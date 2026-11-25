@@ -24,7 +24,10 @@ agent's pane; tmux-mcp passes its callerPane) and --json. `-` as the whole
 prompt or message reads it from stdin. JSON results carry id, harness,
 status, state, detail, reply, reply_source, truncated, result (the child's
 @agent_spawn_result), session_id, transcript, pane, window, letter, task,
-started, ended, turns; wait --json prints an array of them, run --json one.
+started, ended, turns, chezmoi_paths (the dotfiles the child's chezmoi-guard
+recorded for that turn, <dir>/chezmoi-paths.json; also appended to the reply
+as "chezmoi paths touched (uncommitted): ..."); wait --json prints an array
+of them, run --json one.
 
 Turns: spawn and send each record one; a turn the child starts otherwise (a
 message_agent follow-up, a wake-up: a newer @agent_turn_start, or a new turn
@@ -927,6 +930,46 @@ def reply_for(meta, n, status, row, tm):
     return None, "none", False
 
 
+CHEZMOI_SRC = os.path.join(HOME, ".local/share/chezmoi")
+
+
+def chezmoi_paths(sid, turns, n):
+    """The chezmoi source paths the child's chezmoi-guard recorded at a Stop
+    of turn N (<dir>/chezmoi-paths.json {paths, exact, at}, written instead of
+    blocking the child's Stop: the guard hands them to the parent's guard,
+    and this tells the parent in the result). Only a record from inside that
+    turn (at or after its start, before the next one's) counts. Shown
+    source-relative, else ~-relative."""
+    raw = read_file(reg(sid, "chezmoi-paths.json"))
+    if not raw:
+        return []
+    try:
+        j = json.loads(raw)
+    except ValueError:
+        return []
+    at, paths = (j.get("at"), j.get("paths")) if isinstance(j, dict) else (None, None)
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not isinstance(paths, list):
+        return []
+    turn = next((x for x in turns if x.get("n") == n), None)
+    if turn is None:
+        return []
+    start = turn.get("turn_start") or turn.get("sent_at") or 0
+    nxt = next((x for x in turns if x.get("n") == n + 1), None)
+    end = (nxt.get("turn_start") or nxt.get("sent_at")) if nxt else None
+    if at < start or (end and at >= end):
+        return []
+    out = []
+    for p in paths:
+        if not isinstance(p, str) or not p:
+            continue
+        if p.startswith(CHEZMOI_SRC + "/"):
+            p = p[len(CHEZMOI_SRC) + 1:]
+        elif p.startswith(HOME + "/"):
+            p = "~" + p[len(HOME):]
+        out.append("".join(c if c.isprintable() else "?" for c in p)[:200])
+    return out[:40]
+
+
 def collect(meta, rows, tm, turn_n=None, max_chars=None, mark_read=True):
     """The result dict for one spawn (and the side effects of reading it):
     the latest turn unless TURN_N."""
@@ -960,6 +1003,11 @@ def collect(meta, rows, tm, turn_n=None, max_chars=None, mark_read=True):
     if reply is not None and max_chars and len(reply) > max_chars:
         reply = reply[:max_chars] + "\n[truncated %d chars]" % (len(reply) - max_chars)
         truncated = True
+    # After the cut, so the parent always sees which dotfiles are its to commit.
+    cpaths = chezmoi_paths(sid, turns, n)
+    if cpaths:
+        sec = "chezmoi paths touched (uncommitted): " + ", ".join(cpaths)
+        reply = (reply.rstrip("\n") + "\n\n" + sec) if reply else sec
     child = meta.get("child") or {}
     latest_tr = turns[-1] if turns else {}
     return {
@@ -969,7 +1017,7 @@ def collect(meta, rows, tm, turn_n=None, max_chars=None, mark_read=True):
         "pane": child.get("pane"), "window": child.get("window"), "letter": (row or {}).get("key") or None,
         "result": ("read" if final and mark_read and row is not None else (row or {}).get("result") or None),
         "task": meta.get("task"), "started": latest_tr.get("turn_start"), "ended": latest_tr.get("turn_end"),
-        "turns": turns,
+        "turns": turns, "chezmoi_paths": cpaths,
     }
 
 

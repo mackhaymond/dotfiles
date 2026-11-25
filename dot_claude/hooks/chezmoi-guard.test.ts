@@ -8,7 +8,7 @@
 // real source repo, or the real home.
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { execFileSync, spawnSync } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -87,6 +87,11 @@ function runHook(
       READ_ONLY_CLASSIFIER: CLASSIFIER,
       TMUX_SESSION: "chezmoi-guard-test-no-such-session",
       PTY_CWDS_FILE: ptyCwds,
+      // agent-spawn child mode: a stub stands in for tmux (written per test;
+      // absent = every tmux read fails), plus a temp registry and inbox.
+      TMUX_BIN: join(root, "tmux-stub"),
+      SPAWN_DIR: join(root, "spawn"),
+      HANDOFF_DIR: join(root, "handoff"),
     }),
   )
   const r = spawnSync(process.execPath, [GUARD, `--test-env=${testEnv}`], {
@@ -779,4 +784,129 @@ test("7: touched paths with a space or non-ASCII byte survive the dirty-set reco
   const ctx = JSON.parse(ups.stdout).hookSpecificOutput.additionalContext
   expect(ctx).toContain("a b.txt")
   expect(ctx).toContain("café.txt")
+})
+
+// ---------------------------------------------------------------------------
+// agent-spawn CHILD mode. The child's pane is %9 in window @9; its parent is
+// window @1, pane %1, a Claude session "parent-sid" (registry meta.json).
+// ---------------------------------------------------------------------------
+
+const SPAWN_ID = "s-test1234"
+const CHILD_ENV = { TMUX_PANE: "%9", AGENT_ROLE: "child", AGENT_SPAWN_ID: SPAWN_ID, AGENT_PARENT_PANE: "%1", AGENT_PARENT_KEY: "a" }
+
+function childWorld(opts: { linked?: boolean; orphan?: boolean; parentAlive?: boolean } = {}) {
+  const { linked = true, orphan = false, parentAlive = true } = opts
+  mkdirSync(join(root, "spawn", SPAWN_ID), { recursive: true })
+  writeFileSync(
+    join(root, "spawn", SPAWN_ID, "meta.json"),
+    JSON.stringify({
+      id: SPAWN_ID,
+      parent: { window: "@1", pane: "%1", kind: "claude", harness: "claude", handle: "a", key: "a", session_id: "parent-sid" },
+      turns: [{ n: 1, parent_session_id: "parent-sid" }],
+    }),
+  )
+  // The reconcile unsets the raw link when it orphans a child.
+  const own = `@9\\t${linked ? "@1" : ""}\\t${orphan ? "a" : ""}\\t${SPAWN_ID}\\t${linked ? "%%1" : ""}`
+  const parent = parentAlive ? "printf '@1 %%1\\n'" : "echo 'no such pane' >&2; exit 1"
+  const stub = join(root, "tmux-stub")
+  writeFileSync(stub, `#!/bin/sh\ncase "$4" in\n  %9) printf '${own}\\n' ;;\n  %1|@1) ${parent} ;;\n  *) exit 1 ;;\nesac\n`)
+  execFileSync("chmod", ["755", stub])
+}
+
+// A child session whose tool call wrote b.txt by name (an exact claim).
+function childWrote(sid: string, env: Record<string, string>) {
+  const p = join(src, "b.txt")
+  writeFileSync(p, `child work ${sid}\n`)
+  const r = runHook(
+    { hook_event_name: "PostToolUse", session_id: sid, tool_use_id: `toolu_c_${sid}`, tool_name: "Write", tool_input: { file_path: p, content: "x" }, tool_response: "ok", cwd: project },
+    { env },
+  )
+  expect(r.status).toBe(0)
+}
+
+const stopAs = (sid: string, env: Record<string, string>) =>
+  runHook({ hook_event_name: "Stop", session_id: sid, stop_hook_active: false }, { env })
+
+const isNormalBlock = (stdout: string) => /^chezmoi-guard: unfinished dotfile work/.test(JSON.parse(stdout).reason)
+
+const mode = (p: string) => statSync(p).mode & 0o777
+
+test("C1: a linked child's Stop never blocks: its paths go to the parent's inbox and to agent-spawn's record", () => {
+  childWorld()
+  const sid = "child-sid-1"
+  childWrote(sid, CHILD_ENV)
+  const before = Math.floor(Date.now() / 1000)
+  // No block: the indicator's once-per-turn reply capture keeps the real report.
+  expect(stopAs(sid, CHILD_ENV).stdout).toBe("")
+  // agent-spawn's record of the turn (result/wait append it), private.
+  const recFile = join(root, "spawn", SPAWN_ID, "chezmoi-paths.json")
+  const rec = JSON.parse(readFileSync(recFile, "utf-8"))
+  expect(rec.paths).toEqual([join(src, "b.txt")])
+  expect(rec.exact).toEqual([join(src, "b.txt")])
+  expect(rec.at).toBeGreaterThanOrEqual(before)
+  expect(mode(recFile)).toBe(0o600)
+  // The inbox holds it for the parent's owner, private too...
+  const box = readdirSync(join(root, "handoff"))
+  expect(box.length).toBe(1)
+  expect(mode(join(root, "handoff", box[0]))).toBe(0o700)
+  const inbox = readdirSync(join(root, "handoff", box[0]))
+  expect(inbox.length).toBe(1)
+  expect(mode(join(root, "handoff", box[0], inbox[0]))).toBe(0o600)
+  // ...a second Stop stays silent too...
+  expect(stopAs(sid, CHILD_ENV).stdout).toBe("")
+  // ...and the parent's next prompt absorbs it and nags the PARENT to commit.
+  const ups = runHook({ hook_event_name: "UserPromptSubmit", session_id: "parent-sid", prompt: "[agent-spawn] finished" })
+  const ctx = JSON.parse(ups.stdout).hookSpecificOutput.additionalContext
+  expect(ctx).toContain("CHEZMOI-GUARD")
+  expect(ctx).toContain("b.txt")
+  expect(touched("parent-sid")).toContain(join(src, "b.txt"))
+  expect(readdirSync(join(root, "handoff", box[0])).length).toBe(0)
+  // A child's prompt gets no commit complaint either.
+  expect(runHook({ hook_event_name: "UserPromptSubmit", session_id: sid, prompt: "more" }, { env: CHILD_ENV }).stdout).toBe("")
+})
+
+test("C2: parent gone (orphaned, or its pane missing): today's commit demand", () => {
+  childWorld({ linked: false, orphan: true })
+  childWrote("child-sid-2", CHILD_ENV)
+  const r1 = stopAs("child-sid-2", CHILD_ENV)
+  expect(isNormalBlock(r1.stdout)).toBe(true)
+  childWorld({ parentAlive: false })
+  childWrote("child-sid-3", CHILD_ENV)
+  expect(isNormalBlock(stopAs("child-sid-3", CHILD_ENV).stdout)).toBe(true)
+  expect(existsSync(join(root, "handoff"))).toBe(false)
+})
+
+test("C3: AGENT_CHILD_COMMITS=1, or the env alone without a registry record: today's commit demand", () => {
+  childWorld()
+  const commits = { ...CHILD_ENV, AGENT_CHILD_COMMITS: "1" }
+  childWrote("child-sid-4", commits)
+  expect(isNormalBlock(stopAs("child-sid-4", commits).stdout)).toBe(true)
+  // A project .env claiming to be a child (no tmux pane, unknown spawn id).
+  const spoof = { AGENT_ROLE: "child", AGENT_SPAWN_ID: "s-nosuch99" }
+  childWrote("child-sid-5", spoof)
+  expect(isNormalBlock(stopAs("child-sid-5", spoof).stdout)).toBe(true)
+})
+
+test("C4: the inbox write fails: the child is asked (once) to list its paths instead", () => {
+  childWorld()
+  writeFileSync(join(root, "handoff"), "not a dir\n") // every inbox mkdir fails
+  const sid = "child-sid-6"
+  childWrote(sid, CHILD_ENV)
+  const out = JSON.parse(stopAs(sid, CHILD_ENV).stdout)
+  expect(out.decision).toBe("block")
+  expect(out.reason).toContain(`agent-spawn subagent (${SPAWN_ID}) of [a]`)
+  expect(out.reason).toContain("don't commit or push")
+  expect(out.reason).toContain("- b.txt")
+  expect(out.reason).not.toContain("CHEZMOI-GUARD")
+  expect(stopAs(sid, CHILD_ENV).stdout).toBe("") // asked once
+})
+
+test("C5: the env path (no TMUX_PANE) needs the registry's parent pane alive", () => {
+  const envOnly = { AGENT_ROLE: "child", AGENT_SPAWN_ID: SPAWN_ID, AGENT_PARENT_KEY: "a" }
+  childWorld()
+  childWrote("child-sid-7", envOnly)
+  expect(stopAs("child-sid-7", envOnly).stdout).toBe("") // child mode: handed over
+  childWorld({ parentAlive: false })
+  childWrote("child-sid-8", envOnly)
+  expect(isNormalBlock(stopAs("child-sid-8", envOnly).stdout)).toBe(true)
 })

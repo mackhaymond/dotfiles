@@ -43,5 +43,46 @@ case $used$resets in '' | *[!0-9]*) exit 0 ;; esac
 if [ -f "$OVERRIDE" ] && [ "$(stat -f %m "$OVERRIDE")" -ge $((resets - 604800)) ]; then
 	exit 0
 fi
+
+# 3. An agent-spawn CHILD stopped by the reserve (2026-11-25): nobody is
+#    watching its tab, so say why on the tab itself - `failed` with the
+#    reason, which agent-spawn wait reports and the parent's ask surfaces
+#    (docs/agent-tab-indicator.md §8). Only a child: its window has the raw
+#    link @agent_parent, or its @agent_spawn_id is this env's AGENT_SPAWN_ID
+#    (an orphaned child keeps its spawn id). Fail-open: no tmux, no pane, any
+#    error - the block below still stands.
+#    The indicator's own hook for this same UserPromptSubmit / PreToolUse
+#    runs in PARALLEL and writes `running` (and the blocked prompt's
+#    @agent_turn_start), which can land after the mark. So the mark is
+#    re-asserted once, 2 s later, by a detached tmux job (it outlives this
+#    hook): only if the tab still reads `running` and its @agent_turn_start
+#    is no later than this block (+1 s), i.e. no real turn has started since.
+mark_child_failed() {
+	[ -n "${TMUX_PANE:-}" ] || return 0
+	command -v tmux >/dev/null 2>&1 || return 0
+	row=$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}	#{@agent_parent}	#{@agent_spawn_id}	#{socket_path}' 2>/dev/null) || return 0
+	win=${row%%	*}
+	rest=${row#*	}
+	parent=${rest%%	*}
+	rest=${rest#*	}
+	spawn=${rest%%	*}
+	sock=${rest#*	}
+	case $win in @[0-9]*) ;; *) return 0 ;; esac
+	if [ -z "$parent" ]; then
+		[ -n "${AGENT_SPAWN_ID:-}" ] && [ "$spawn" = "$AGENT_SPAWN_ID" ] || return 0
+	fi
+	now=$(date +%s)
+	tmux set-option -w -t "$win" @agent_state failed \; \
+		set-option -w -t "$win" @agent_detail 'weekly reserve' \; \
+		set-option -w -t "$win" @agent_since "$now failed" 2>/dev/null || true
+	# The re-assert. No '#' in it (run-shell expands formats) and an explicit
+	# socket (a job may not inherit $TMUX); a quote in the path: skip it.
+	case $sock in /*) ;; *) return 0 ;; esac
+	case $sock in *"'"*) return 0 ;; esac
+	tm="tmux -S '$sock'"
+	tmux run-shell -b -t "$TMUX_PANE" "sleep 2; s=\$($tm show-options -wqv -t $win @agent_state); t=\$($tm show-options -wqv -t $win @agent_turn_start); t=\${t%%[!0-9]*}; [ \"\$s\" = running ] && [ \"\${t:-0}\" -le $((now + 1)) ] && $tm set-option -w -t $win @agent_state failed \\; set-option -w -t $win @agent_detail 'weekly reserve' \\; set-option -w -t $win @agent_since '$now failed'; true" 2>/dev/null || true
+}
+mark_child_failed
+
 printf '{"continue":false,"stopReason":"Weekly reserve: %s is at %s%% (reserve starts at %s%%). touch ~/.claude/reserve-override to keep going until the reset."}\n' \
 	"$MAIN" "$used" "$RESERVE_PCT"

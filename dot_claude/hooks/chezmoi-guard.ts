@@ -190,7 +190,7 @@ function isExecutable(p: string): boolean {
 const CHEZMOI_BIN =
   ENV("CHEZMOI_BIN") ??
   (isExecutable("/opt/homebrew/bin/chezmoi") ? "/opt/homebrew/bin/chezmoi" : "chezmoi")
-const TMUX_BIN = isExecutable("/opt/homebrew/bin/tmux") ? "/opt/homebrew/bin/tmux" : "tmux"
+const TMUX_BIN = ENV("TMUX_BIN") ?? (isExecutable("/opt/homebrew/bin/tmux") ? "/opt/homebrew/bin/tmux" : "tmux")
 
 // ---------------------------------------------------------------------------
 // Path normalization (verbatim from source, HOME-based realpath/expansion)
@@ -2766,6 +2766,355 @@ function handlePostToolUse(input: any): void {
   process.exit(0) // EMPTY stdout
 }
 
+// ---------------------------------------------------------------------------
+// External subagents: agent-spawn CHILD mode (2026-11-25)
+//
+// A tab agent that another agent started with `agent-spawn` (born with env
+// AGENT_ROLE=child, AGENT_SPAWN_ID, AGENT_PARENT_PANE, AGENT_PARENT_KEY and
+// the window options @agent_parent / @agent_parent_pane / @agent_spawn_id;
+// see ~/.config/tmux/docs/agent-tab-indicator.md §8) is a worker: its parent
+// reviews its changes and commits them, as a native subagent's writes are its
+// parent's to finish. So while a child's parent is there:
+//   - Stop demands no commit and does NOT block. It hands the child's pending
+//     chezmoi paths (uncommitted, unpushed or drifted) to the PARENT's
+//     session state through the handoff inbox below, and records them in the
+//     child's agent-spawn dir, <spawn dir>/<id>/chezmoi-paths.json (0600,
+//     {paths:[abs], exact:[abs], at:<epoch s>}), which `agent-spawn
+//     result`/`wait` append to the child's reply for that turn. No block:
+//     the indicator's Stop (a parallel hook) captures the turn's reply and
+//     wakes the parent once per turn, so a block's follow-up reply would
+//     never reach the parent (or would overwrite the real report).
+//   - Only when that hand-over fails (the inbox write; or, for a parent with
+//     no guard port, the record) does it block, once per newly pending path,
+//     asking the child to list the paths in its final reply instead.
+//   - UserPromptSubmit injects no commit complaint.
+// Today's behaviour applies when the parent is gone (@agent_kid_orphan set,
+// the raw link unset, or the parent's pane missing) or AGENT_CHILD_COMMITS=1
+// is in the env. The tmux window decides when it can be read; the env alone
+// (no TMUX_PANE: a Codex app-server child) counts only with a real
+// agent-spawn registry record for its spawn id (bun loads a project's .env,
+// which must not be able to switch the nag off) whose parent.pane tmux still
+// finds. Every check here runs only for a session with chezmoi work on
+// record, so no other session pays the tmux read.
+// Known gap (accepted): a parent that ran /clear has a new session id, while
+// the registry may still name the old one until its next turn; a handoff to
+// the old owner is then not absorbed - as the parent's own pre-/clear guard
+// state is lost on /clear today.
+//
+// THE HANDOFF INBOX, shared by the three guard ports (Claude, codex,
+// opencode), whatever harness the parent runs:
+//   HANDOFF_DIR/<sha256(parent owner)[:32]>/<sha256(child owner)[:32]>.json
+//     { owner, from, spawn_id, paths:[abs], exact:[abs], live:[abs], at }
+// Owners are the claims-ledger owners (claude:<sid>, codex:<sid>,
+// opencode:<root id>); the parent's session id comes from the registry's
+// meta.json (the latest turn's parent_session_id, else parent.session_id,
+// else parent.claude_sid). One file per child, rewritten whole, so children
+// never race each other. The parent's guard absorbs its inbox at its next
+// prompt or Stop (opencode: idle or system transform), renaming each file
+// aside first, so a child's later rewrite lands as a new file, never lost.
+// A parent with no guard port (grok, copilot, agy) gets no inbox: the
+// chezmoi-paths.json record (in its result) is what it has. Inbox files are
+// 0600 in 0700 dirs.
+// ---------------------------------------------------------------------------
+
+// agent-spawn's own dir: $AGENT_SPAWN_DIR, else $AGENT_SPAWN_STATE, as it reads them.
+const SPAWN_DIR =
+  ENV("SPAWN_DIR") ??
+  [process.env.AGENT_SPAWN_DIR, process.env.AGENT_SPAWN_STATE].find((d) => d && d.startsWith("/")) ??
+  "/Users/mackhaymond/.local/state/agent-spawn"
+const HANDOFF_DIR = ENV("HANDOFF_DIR") ?? "/Users/mackhaymond/.local/state/chezmoi-guard/handoff"
+const SPAWN_ID_RE = /^s-[A-Za-z0-9]{4,40}$/
+const CHILD_TMUX_TIMEOUT_MS = 1500
+
+type ChildCtx = { spawnId: string; parentOwner: string; parentLabel: string; hasMeta: boolean }
+
+// Write a small private file atomically: 0600, in a 0700 dir.
+function writePrivate(target: string, contents: string): void {
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 })
+  const tmp = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
+  writeFileSync(tmp, contents, { mode: 0o600 })
+  renameSync(tmp, target)
+}
+
+function shortHash(s: string): string {
+  return createHash("sha256").update(s).digest("hex").slice(0, 32)
+}
+
+function tmuxRead(args: string[]): string | undefined {
+  try {
+    return execFileSync(TMUX_BIN, args, {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: CHILD_TMUX_TIMEOUT_MS,
+    })
+  } catch {
+    return undefined
+  }
+}
+
+function readSpawnMeta(id: string): any {
+  if (!SPAWN_ID_RE.test(id)) return undefined
+  try {
+    const j = JSON.parse(readFileSync(`${SPAWN_DIR}/${id}/meta.json`, "utf-8"))
+    return j && typeof j === "object" && j.id === id ? j : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// The parent's claims-ledger owner, or "" (no guard port for its harness, or
+// no session id on record).
+function parentOwnerOf(meta: any): string {
+  const parent = meta?.parent ?? {}
+  const kind = String(parent.harness || parent.kind || "")
+  const prefix =
+    kind === "claude" || kind === "abby" ? "claude" : kind === "codex" ? "codex" : kind === "opencode" ? "opencode" : ""
+  if (!prefix) return ""
+  const turns = Array.isArray(meta?.turns) ? meta.turns : []
+  const last = turns.length > 0 ? turns[turns.length - 1] : undefined
+  const sid = [last?.parent_session_id, parent.session_id, prefix === "claude" ? parent.claude_sid : ""].find(
+    (s) => typeof s === "string" && s,
+  )
+  return sid ? `${prefix}:${sid}` : ""
+}
+
+// This session's agent-spawn child context while its parent is there, else
+// undefined (not a child, parent gone, or AGENT_CHILD_COMMITS=1).
+function childContext(): ChildCtx | undefined {
+  if (process.env.AGENT_CHILD_COMMITS === "1") return undefined
+  const pane = process.env.TMUX_PANE ?? ""
+  const own = /^%\d+$/.test(pane)
+    ? tmuxRead([
+        "display-message", "-p", "-t", pane,
+        "#{window_id}\t#{@agent_parent}\t#{@agent_kid_orphan}\t#{@agent_spawn_id}\t#{@agent_parent_pane}",
+      ])
+    : undefined
+  let spawnId = ""
+  let parentTarget = ""
+  let tmuxKnows = false
+  if (own !== undefined) {
+    const [win, parent, orphan, sid, parentPane] = own.replace(/\n$/, "").split("\t")
+    if (win?.startsWith("@")) {
+      tmuxKnows = true
+      if (orphan || !parent) return undefined // orphaned, or never (no longer) a child
+      parentTarget = parentPane || parent
+      spawnId = sid ?? ""
+    }
+  }
+  if (!tmuxKnows) {
+    if (process.env.AGENT_ROLE !== "child") return undefined
+    spawnId = process.env.AGENT_SPAWN_ID ?? ""
+  }
+  const meta = readSpawnMeta(spawnId)
+  if (!tmuxKnows) {
+    if (!meta) return undefined
+    // Env path: the registry's parent pane must still be there (no pane on
+    // record, or tmux can't find it: the parent counts as gone).
+    parentTarget = typeof meta.parent?.pane === "string" && /^%\d+$/.test(meta.parent.pane) ? meta.parent.pane : ""
+    if (!parentTarget) return undefined
+  }
+  if (parentTarget) {
+    const out = tmuxRead(["display-message", "-p", "-t", parentTarget, "#{window_id} #{pane_id}"])
+    if (!out || !out.trim().split(/\s+/).includes(parentTarget)) return undefined // parent's pane is gone
+  }
+  const p = meta?.parent ?? {}
+  const envKey = process.env.AGENT_PARENT_KEY ?? ""
+  const parentLabel = p.key ? `[${p.key}]` : p.handle ? `@${p.handle}` : envKey ? `[${envKey}]` : "your parent"
+  return { spawnId: spawnId || "?", parentOwner: meta ? parentOwnerOf(meta) : "", parentLabel, hasMeta: !!meta }
+}
+
+// The turn's pending paths, for `agent-spawn result` (see the header).
+function writePathsRecord(ctx: ChildCtx, paths: string[], exact: string[]): boolean {
+  if (!ctx.hasMeta) return false
+  try {
+    writePrivate(
+      `${SPAWN_DIR}/${ctx.spawnId}/chezmoi-paths.json`,
+      JSON.stringify({ paths, exact, at: Math.floor(Date.now() / 1000) }),
+    )
+    return true
+  } catch (e) {
+    debugLog("child paths record write failed", { error: String(e) })
+    return false
+  }
+}
+
+function inboxDir(owner: string): string {
+  return `${HANDOFF_DIR}/${shortHash(owner)}`
+}
+
+function strings(a: unknown): string[] {
+  return Array.isArray(a) ? a.filter((x): x is string => typeof x === "string") : []
+}
+
+// Append this child's pending paths to its parent's inbox. True if written.
+function writeHandoff(ctx: ChildCtx, paths: string[], exact: string[], live: string[]): boolean {
+  if (!ctx.parentOwner || !OWNER || ctx.parentOwner === OWNER) return false
+  try {
+    const f = `${inboxDir(ctx.parentOwner)}/${shortHash(OWNER)}.json`
+    let prev: any = {}
+    try {
+      prev = JSON.parse(readFileSync(f, "utf-8"))
+    } catch {
+      /* none yet, or the parent took it */
+    }
+    const union = (a: unknown, b: string[]) => [...new Set([...strings(a), ...b])]
+    writePrivate(
+      f,
+      JSON.stringify({
+        owner: ctx.parentOwner,
+        from: OWNER,
+        spawn_id: ctx.spawnId,
+        paths: union(prev.paths, paths),
+        exact: union(prev.exact, exact),
+        live: union(prev.live, live),
+        at: Date.now(),
+      }),
+    )
+    return true
+  } catch (e) {
+    debugLog("child handoff write failed", { error: String(e) })
+    return false
+  }
+}
+
+// Fold the paths this session's children handed over into its own state.
+// Exact paths stay exact (never suppressed as another session's claim).
+function absorbHandoffs(state: SessionState): void {
+  if (!OWNER) return
+  const dir = inboxDir(OWNER)
+  let entries: string[]
+  try {
+    entries = readdirSync(dir)
+  } catch {
+    return // no inbox: the common case
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue
+    const taken = `${dir}/${entry}.${process.pid}.taken`
+    try {
+      renameSync(`${dir}/${entry}`, taken)
+    } catch {
+      continue // another hook of ours took it
+    }
+    try {
+      const j = JSON.parse(readFileSync(taken, "utf-8"))
+      if (j?.owner !== OWNER) continue
+      const exactIn = new Set(strings(j.exact))
+      const touched = new Set(state.touchedPaths)
+      const exact = new Set(state.exactPaths)
+      let n = 0
+      for (const raw of strings(j.paths)) {
+        const p = normalizePath(raw)
+        if (!isInChezmoiSource(p)) continue
+        touched.add(p)
+        if (exactIn.has(raw)) exact.add(p)
+        n++
+      }
+      state.touchedPaths = [...touched]
+      state.exactPaths = [...exact]
+      state.liveTouched = [...new Set([...state.liveTouched, ...strings(j.live).map(normalizePath)])]
+      debugLog("absorbed child handoff", { from: j.from, spawn_id: j.spawn_id, paths: n })
+    } catch {
+      /* torn or foreign: dropped */
+    } finally {
+      try {
+        unlinkSync(taken)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+function hasInbox(): boolean {
+  return !!OWNER && existsSync(inboxDir(OWNER))
+}
+
+// The child's memory of what it already handed over: path -> epoch ms. A path
+// counts as new again once its mtime passes that (written again since).
+function handedFile(sid: string): string {
+  return `${SESSIONS_DIR}/${sessionKey(sid)}.handed.json`
+}
+
+function handleChildStop(sid: string, ctx: ChildCtx): void {
+  let pending: string[] = []
+  let exactPending: string[] = []
+  let live: string[] = []
+  let drifted: string[] = []
+  withSessionLock(sid, (state) => {
+    sweepLingering(state)
+    absorbHandoffs(state) // an intermediate child passes its own children's paths up
+    const foreign = foreignClaimed(state)
+    state.touchedPaths = state.touchedPaths.filter((p) => !foreign.has(p))
+    try {
+      let keepSources: Set<string>
+      ;({ drifted, keepSources } = driftedTargets(state))
+      pendingTouchedPaths(state, keepSources) // prunes what is committed + pushed
+    } finally {
+      pending = [...state.touchedPaths]
+      state.touchedPaths = [...new Set([...state.touchedPaths, ...foreign])]
+    }
+    const ex = new Set(state.exactPaths)
+    exactPending = pending.filter((p) => ex.has(p))
+    live = [...state.liveTouched]
+  })
+  if (pending.length === 0 && drifted.length === 0) {
+    debugLog("child stop: nothing pending", { session_id: sid, spawn_id: ctx.spawnId })
+    process.exit(0)
+  }
+  // Hand over every Stop (idempotent unions), and record the turn's list
+  // for `agent-spawn result`. Done: no block (see the header).
+  const handed = writeHandoff(ctx, pending, exactPending, live)
+  const recorded = writePathsRecord(ctx, pending, exactPending)
+  if (handed || (!ctx.parentOwner && recorded)) {
+    debugLog("child stop: handed over", { session_id: sid, spawn_id: ctx.spawnId, paths: pending.length, handed, recorded })
+    process.exit(0)
+  }
+  // FALLBACK, the hand-over failed: ask the child itself to list them, once
+  // per newly pending path (a path is new again once written since).
+  let memo: Record<string, number> = {}
+  try {
+    const j = JSON.parse(readFileSync(handedFile(sid), "utf-8"))
+    if (j && typeof j === "object") memo = j
+  } catch {
+    /* never asked yet */
+  }
+  const fresh = pending.filter((p) => {
+    const at = memo[p]
+    if (typeof at !== "number") return true
+    try {
+      return lstatSync(p).mtimeMs > at
+    } catch {
+      return false // deleted after we asked: nothing new to say
+    }
+  })
+  const driftKey = `drift:${drifted.join("\n")}`
+  if (fresh.length === 0 && (drifted.length === 0 || typeof memo[driftKey] === "number")) process.exit(0)
+  const now = Date.now()
+  const nextMemo: Record<string, number> = {}
+  for (const p of pending) nextMemo[p] = now
+  if (drifted.length > 0) nextMemo[driftKey] = now
+  try {
+    atomicWrite(handedFile(sid), JSON.stringify(nextMemo))
+  } catch {
+    /* worst case: asked again next Stop */
+  }
+  const rels = pending.map(sourceRelativePath).filter((p) => p && !p.startsWith("..")).sort()
+  const shown = rels.slice(0, 20).map((p) => `- ${p}`).join("\n") + (rels.length > 20 ? `\n- ...and ${rels.length - 20} more` : "")
+  let reason =
+    `chezmoi-guard: you are an agent-spawn subagent (${ctx.spawnId}) of ${ctx.parentLabel}, so don't commit or push ` +
+    `your dotfile changes: your parent reviews and commits them. ` +
+    `In your final reply, list the chezmoi source paths you changed (one line each, saying what changed), then stop.`
+  if (rels.length > 0) reason += `\n${shown}`
+  if (drifted.length > 0) {
+    reason += `\nLIVE != SOURCE drift on paths you worked on (home-relative): ${drifted.slice(0, 12).join(", ")}. Say in your reply which side is right.`
+  }
+  reason += `\n(If your task explicitly told you to commit, do that instead.)`
+  debugLog("child stop: hand-over failed, asking the child", { session_id: sid, spawn_id: ctx.spawnId, paths: pending.length })
+  process.stdout.write(JSON.stringify({ decision: "block", reason }))
+  process.exit(0)
+}
+
 function handleUserPromptSubmit(input: any): void {
   const sid = input.session_id
   if (VERBOSE) debugLog("userpromptsubmit", { session_id: sid })
@@ -2773,8 +3122,18 @@ function handleUserPromptSubmit(input: any): void {
   let complaint: string | undefined
   withSessionLock(sid, (state) => {
     sweepLingering(state)
+    absorbHandoffs(state)
     complaint = uncommittedChezmoiComplaint(state) // calls pendingTouchedPaths -> prune + persist
   })
+  // A child whose parent is there commits nothing: no complaint (see CHILD
+  // mode). Asked only when there is one, so other sessions pay nothing.
+  if (complaint) {
+    try {
+      if (childContext()) complaint = undefined
+    } catch {
+      /* fail open: the complaint stands */
+    }
+  }
   if (!complaint) {
     process.exit(0) // EMPTY stdout — omit additionalContext entirely
   }
@@ -2800,12 +3159,25 @@ function handleStop(input: any): void {
 
   refreshManagedIfStale()
 
+  // CHILD MODE (see above): asked only for a session with chezmoi work on
+  // record (its own, or its children's in its inbox).
+  try {
+    const pre = readSessionState(sid)
+    if (pre.touchedPaths.length > 0 || pre.liveTouched.length > 0 || hasInbox()) {
+      const ctx = childContext()
+      if (ctx) handleChildStop(sid, ctx) // exits
+    }
+  } catch (e) {
+    debugLog("child check failed (normal stop)", { session_id: sid, error: String(e) })
+  }
+
   let prompt: string | undefined
   let block = false
   let lockedOk = true
   try {
     withSessionLock(sid, (state) => {
       sweepLingering(state)
+      absorbHandoffs(state)
       const now = Date.now()
       // GUARD 2a: within the 2-min window -> allow stop.
       if (state.continuationFiredAt && now - state.continuationFiredAt < CONTINUATION_WINDOW_MS) {
@@ -2918,6 +3290,26 @@ function opportunisticGc(): void {
         const full = `${CLAIMS_DIR}/${entry}`
         try {
           if (now - statSync(full).mtimeMs > CLAIM_TTL_MS) unlinkSync(full)
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    // Child handoffs nobody absorbed (the parent session ended first), and
+    // `.taken` leftovers of a crashed absorb. Shared with the other guards.
+    if (existsSync(HANDOFF_DIR)) {
+      for (const sub of readdirSync(HANDOFF_DIR)) {
+        const d = `${HANDOFF_DIR}/${sub}`
+        try {
+          for (const entry of readdirSync(d)) {
+            try {
+              if (now - statSync(`${d}/${entry}`).mtimeMs > sessionMaxAge) unlinkSync(`${d}/${entry}`)
+            } catch {
+              /* ignore */
+            }
+          }
+          // An idle day old, so a child's mkdir-then-write never loses the dir.
+          if (now - statSync(d).mtimeMs > CLAIM_TTL_MS) rmdirSync(d) // throws if non-empty: fine
         } catch {
           /* ignore */
         }

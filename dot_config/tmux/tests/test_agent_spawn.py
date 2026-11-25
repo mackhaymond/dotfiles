@@ -620,6 +620,28 @@ class Live(unittest.TestCase):
         self.assertEqual(r["reply_source"], "screen")
         self.assertIn("fake screen text", r["reply"])
 
+    def test_result_appends_chezmoi_paths(self):
+        # The child's chezmoi-guard records its pending dotfiles at Stop
+        # (chezmoi-paths.json) instead of blocking; result tells the parent.
+        s, p, w = self.spawn("--", "x")
+        ts = self.start_turn(w, "c1")
+        self.end_turn(w, "c1")
+        (self.state / s / "reply.md").write_text("did it\n")
+        self.setw(w, **{"@agent_reply_at": int(time.time())})
+        rec = self.state / s / "chezmoi-paths.json"
+        src = self.home / ".local/share/chezmoi"
+        paths = [str(src / "dot_zshrc"), str(self.home / "notes.txt")]
+        rec.write_text(json.dumps({"paths": paths, "exact": paths[:1], "at": ts}))
+        r = json.loads(self.cli("result", s, "--json").stdout)
+        self.assertEqual(r["reply"], "did it\n\nchezmoi paths touched (uncommitted): dot_zshrc, ~/notes.txt")
+        self.assertEqual(r["chezmoi_paths"], ["dot_zshrc", "~/notes.txt"])
+        out = self.cli("result", s).stdout
+        self.assertIn("chezmoi paths touched (uncommitted): dot_zshrc, ~/notes.txt", out)
+        # A record from before this turn started is not this turn's.
+        rec.write_text(json.dumps({"paths": paths, "exact": [], "at": ts - 100}))
+        r = json.loads(self.cli("result", s, "--json").stdout)
+        self.assertEqual((r["reply"], r["chezmoi_paths"]), ("did it\n", []))
+
     def test_run_end_to_end_with_the_fake_harness(self):
         (self.fake / "auto").write_text("")
         r = self.cli("run", "--json", "--timeout", "20", "--", "do it")
