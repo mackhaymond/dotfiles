@@ -297,7 +297,7 @@ sys.exit(1 if "code" in answer else 0)
                                      ({"code": "vpn_new_code"}, False, fresh), ({"code": "Weird \u001b[31m"}, False, fresh),
                                      ({"code": "transport_error"}, False, "won’t be sent again"),
                                      ({"code": "client_error", "detail": "invalid_response"}, False, "won’t be sent again"),
-                                     ({"code": "client_error", "detail": "other"}, False, "won’t be sent again"), ("no-json", False, "won’t be sent again")):
+                                     ({"code": "client_error", "detail": "other"}, False, "won’t be sent again"), ({"code": "unavailable"}, False, "won’t be sent again"), ("no-json", False, "won’t be sent again")):
             for on_stderr in (False, True):
                 with self.subTest(answer=answer, on_stderr=on_stderr):
                     reply = {**answer, "on_stderr": on_stderr} if isinstance(answer, dict) else answer
@@ -313,6 +313,32 @@ sys.exit(1 if "code" in answer else 0)
                     self.assertEqual(problem.get("wait"), 42 if retry else None)
                     self.assertNotIn("Weird", (self.state / "events.log").read_text())
 
+    def test_the_callback_process_lets_go_of_openconnects_listener(self):
+        # As openconnect does it: the helper inherits the listening socket. Once the
+        # parent closes its copy, nobody may still be listening. The URL is refused by
+        # the gate, so nothing is opened; a FIFO keeps the helper alive meanwhile.
+        listener = socket.socket(socket.AF_INET6)
+        self.addCleanup(listener.close)
+        listener.bind(("::1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        os.set_inheritable(listener.fileno(), True)
+        code = ("import importlib.machinery, importlib.util, sys, time\n"
+                f"l = importlib.machinery.SourceFileLoader('h', {str(source)!r})\n"
+                "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('h', l)); l.exec_module(m)\n"
+                "m.browser_login = lambda url: (print('in', flush=True), sys.stdin.read(), 0)[2]\n"
+                "sys.argv = ['seasnet-vpn', 'https://refused.invalid/']; m.main()\n")
+        with tempfile.TemporaryDirectory() as home:
+            child = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     close_fds=False, env={**os.environ, "HOME": home})
+            try:
+                self.assertEqual(child.stdout.readline(), b"in\n")
+                listener.close()
+                with self.assertRaises(ConnectionRefusedError):
+                    socket.create_connection(("::1", port), timeout=2).close()
+            finally:
+                child.communicate(b"", timeout=10)
+
     def test_error_codes_that_hand_over(self):
         for code, words in {"vpn_not_configured": "no VPN login", "vpn_action_required": "sign in yourself",
                             "vpn_signature_invalid": "know this Mac", "vpn_url_denied": "refused",
@@ -321,6 +347,8 @@ sys.exit(1 if "code" in answer else 0)
                             "forbidden": "grant", "not_found": "no VPN login", "unavailable": "unavailable",
                             "vpn_private_state_unavailable": "UCLA login"}.items():
             for answers in ([{"code": code}], [self.CHALLENGE, {"code": code}]):
+                if code == "unavailable" and len(answers) == 2:
+                    continue  # After the login was sent it is a lost answer, not a hand-over.
                 with self.subTest(code=code, answers=len(answers)):
                     result, run = self.signin(["approve"], answers)
                     self.assertEqual(result, 0)

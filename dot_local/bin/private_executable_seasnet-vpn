@@ -1152,7 +1152,8 @@ def signed_login(window, url, challenge, approval):
         result = vlt(window, "login", "--input-stdin", timeout=VLT_LOGIN_TIMEOUT,
                      payload={"url": url, "challenge": challenge[0], "signature": signature})
         sent.unlink(missing_ok=True)
-        if (result.get("code") in ("vlt_unreachable", "transport_error")
+        # "unavailable" here is a 5xx after the request left: vlt may still finish.
+        if (result.get("code") in ("vlt_unreachable", "transport_error", "unavailable")
                 or result.get("code") == "client_error" and result.get("detail") in ("invalid_response", "other", None)):
             return {"code": "vlt_lost"}  # It may have run; a login is never sent twice.
         # The one exception: vlt refuses a dead challenge before it contacts UCLA or
@@ -1446,6 +1447,13 @@ def fail_attempt(attempt, line, request_id=None):
         write_json(STATE / "login-request.json", {"id": request_id, "attempt": attempt})
         write_login_result("failed", request_id=request_id)
     return 1
+
+
+def drop_inherited_fds():
+    """openconnect spawns us with its SSO listener (29786) still open: no CLOEXEC on macOS.
+    Holding it would keep the port listening after openconnect is done, so the check
+    for whether openconnect proceeded, and an immediate rerun, would both go wrong."""
+    os.closerange(3, 1024)
 
 
 def browser_login(url):
@@ -1921,8 +1929,10 @@ def main():
         return 2
     command = sys.argv[1]
     if command.startswith("https://") and len(sys.argv) == 2:
+        drop_inherited_fds()  # First, before anything of ours is open.
         return browser_login(command)
     if command == "browser-login" and len(sys.argv) == 3:
+        drop_inherited_fds()
         return browser_login(sys.argv[2])
     if command == "proxy" and len(sys.argv) == 4:
         return proxy(*sys.argv[2:])
