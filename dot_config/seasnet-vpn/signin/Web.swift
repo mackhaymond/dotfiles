@@ -944,75 +944,37 @@ extension WKNavigationType {
 }
 
 final class WebAppDelegate: NSObject, NSApplicationDelegate {
-    private let makeWeb: () -> WebController
-    private(set) var browser: BrowserController?
-    private(set) var controller: WebController?
-    private var shown = false
-
-    init(_ controller: WebController) {
-        self.makeWeb = { controller }
-    }
-
-    init(browser: BrowserController?, web: @escaping () -> WebController) {
-        self.browser = browser
-        self.makeWeb = web
-        super.init()
-        browser?.fallBack = { [weak self] _ in self?.startWeb() }
-    }
+    let controller: WebController
+    init(_ controller: WebController) { self.controller = controller }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.mainMenu = WebAppDelegate.menu(for: controller)
         writeLine(["event": "prepared"])
-        Thread.detachNewThread { [weak self] in
+        Thread.detachNewThread { [controller] in
             while let line = readLine() {
-                guard let command = parse(line)?["do"] as? String else { continue }
-                DispatchQueue.main.async { self?.handle(command) }
+                guard let command = parse(line), command["do"] as? String == "show" else { continue }
+                DispatchQueue.main.async { WebAppDelegate.show(controller) }
             }
             // The supervisor only ever closes this pipe, by hand or by dying.
-            DispatchQueue.main.async { self?.closeAll() }
-        }
-    }
-
-    func handle(_ command: String) {
-        switch command {
-        case "show": show()
-        case "done": if let browser, !browser.over { browser.done() }
-        default: break
+            DispatchQueue.main.async { controller.end(4) }
         }
     }
 
     /// Nothing is on screen or loaded before seasnet-vpn says so.
-    func show() {
-        guard !shown else { return }
-        shown = true
-        guard let browser else { return startWeb() }
-        browser.present()
-        guard browser.window.isVisible || !browser.interactive else { exit(70) }
-        writeLine(["event": "ready"])
-        browser.begin()
-    }
-
-    /// Our own web window: from the start, or when the browser can't do it.
-    func startWeb() {
-        guard controller == nil else { return }
-        let controller = makeWeb()
-        self.controller = controller
-        NSApp.mainMenu = WebAppDelegate.menu(for: controller)
+    static func show(_ controller: WebController) {
+        guard !controller.over, !controller.window.isVisible else { return }
         controller.present()
-        guard controller.window.isVisible || !controller.interactive else { exit(70) }
-        if browser == nil { writeLine(["event": "ready"]) }
+        guard controller.window.isVisible else { exit(70) }
+        writeLine(["event": "ready"])
         controller.load()
     }
 
-    private func closeAll() {
-        if let browser, !browser.over { browser.end(4) } else if let controller { controller.end(4) } else { exit(4) }
-    }
-
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if let browser, !browser.over { browser.end(1) } else { controller?.cancel() }
+        controller.cancel()
         return .terminateCancel
     }
 
-    @objc func startOver(_ sender: Any?) { controller?.load() }
+    @objc func startOver(_ sender: Any?) { controller.load() }
 
     /// An accessory app shows no menu bar, but these key equivalents still work.
     static func menu(for controller: WebController) -> NSMenu {
@@ -1037,31 +999,15 @@ final class WebAppDelegate: NSObject, NSApplicationDelegate {
 func runWeb() -> Never {
     guard let line = readLine(), let request = parse(line), let raw = request["url"] as? String,
           Contract.accepts(raw), let url = URL(string: raw) else { exit(64) }
-    let reason = String((request["reason"] as? String ?? "").prefix(90))
-    let trace: ([String: String]) -> Void = { writeLine(["event": "trace"].merging($0) { mine, _ in mine }) }
-    let web = { () -> WebController in
-        // In memory only. A remembered UCLA or Duo session would let a later login finish
-        // with nobody there, and a person completes every login.
-        let controller = WebController(start: url, store: .nonPersistent(), interactive: true)
-        controller.model.reason = reason.isEmpty ? "" : reason + ", so sign in here."
-        controller.emitTrace = trace
-        controller.unknown = { writeLine(["event": "unknown"]) }
-        controller.finish = { code in
-            if code == 0 { writeLine(["event": "delivered"]) }
-            exit(code)
-        }
-        return controller
+    // In memory only. A remembered UCLA or Duo session would let a later login finish
+    // with nobody there, and a person completes every login.
+    let controller = WebController(start: url, store: .nonPersistent(), interactive: true)
+    controller.model.reason = String((request["reason"] as? String ?? "").prefix(90))
+    controller.emitTrace = { writeLine(["event": "trace"].merging($0) { mine, _ in mine }) }
+    controller.unknown = { writeLine(["event": "unknown"]) }
+    controller.finish = { code in
+        if code == 0 { writeLine(["event": "delivered"]) }
+        exit(code)
     }
-    // The person's own browser when it can take the sign-in, so 1Password works there.
-    var browser: BrowserController?
-    let found = DefaultBrowser.current()
-    if let found, found.supported {
-        browser = BrowserController(browser: found, reason: reason, interactive: true) { anchor, ended in
-            SystemBrowserAuth(url: url, anchor: anchor, ended: ended)
-        }
-        browser?.emitTrace = trace
-    } else {
-        trace(["kind": "zen", "zen": found == nil ? "no-browser" : "unsupported", "browser": found?.traceName ?? "other"])
-    }
-    runAccessoryApp(WebAppDelegate(browser: browser, web: web))
+    runAccessoryApp(WebAppDelegate(controller))
 }
