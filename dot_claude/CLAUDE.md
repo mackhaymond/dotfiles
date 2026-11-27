@@ -53,7 +53,7 @@ core, even if the plugin is absent:
   apps for background driving with `cua-bg-launch`, drive with `mcp__cua__*`
   (start_session first, end_session when done).
 - Browsers: `agent-browser` (headless) for web tasks; `agent-chrome` for
-  bot-blocked sites; the user's browser is Zen (cua:zen), cua AX tools only.
+  bot-blocked sites; the user's browser is Zen (cua:zen): FoxMCP for pages, cua AX otherwise.
 - Never kill -9 a GUI app, never trigger a modal sheet on a background
   window, never `screencapture -v -R` while the user is present.
 - delivery_mode stays "background"; watch mode only on the user's explicit
