@@ -1253,8 +1253,10 @@ class SignInWindowTests(unittest.TestCase):
             real, outputs = subprocess.run, []
 
             def run(*args, **kwargs):
-                outputs.append(real(*args, **kwargs))
-                return outputs[-1]
+                result = real(*args, **kwargs)
+                if args[0][0] != "/usr/bin/security":  # The signer lookup runs on every start.
+                    outputs.append(result)
+                return result
 
             with patch.object(vpn, "STATE", state), patch.object(vpn, "SIGNIN_SOURCE", swift), \
                     patch.object(vpn, "SIGNIN_APP", app), \

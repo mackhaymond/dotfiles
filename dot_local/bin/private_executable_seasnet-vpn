@@ -736,12 +736,33 @@ def compile_signin(info, sources, work):
     subprocess.run(["/usr/bin/xcrun", "swiftc", "-O", "-wmo", *(str(work / "source" / name) for name in sources),
                     "-o", str(bundle / "Contents/MacOS" / SIGNIN_NAME)],
                    check=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
-    # Ad hoc, with a requirement that names only the bundle id: the app keeps one
-    # identity across rebuilds instead of a new one each time.
+    # 1Password's Universal Autofill (Cmd-\) refuses ad hoc signed apps, so sign with
+    # Mack's Apple Development certificate when there is one: its default requirement
+    # (bundle id + that certificate) stays the same across rebuilds. Without one, ad
+    # hoc with a requirement that names only the bundle id.
+    identity = signing_identity()
+    if identity:
+        signed = subprocess.run(["/usr/bin/codesign", "--force", "--sign", identity, "--timestamp=none", str(bundle)],
+                                capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+        if signed.returncode == 0:
+            return bundle
+        log_event(f"sign-in app: Apple Development signing failed, ad hoc instead "
+                  f"({signed.stderr.decode(errors='replace').strip()[:200]})")
     subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-",
                     f'--requirements==designated => identifier "{SIGNIN_BUNDLE}"', str(bundle)],
                    check=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=30)
     return bundle
+
+
+def signing_identity():
+    """The SHA-1 of the first valid Apple Development identity, or None."""
+    try:
+        listed = subprocess.run(["/usr/bin/security", "find-identity", "-v", "-p", "codesigning"],
+                                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r'^\s*\d+\)\s+([0-9A-F]{40})\s+"Apple Development: ', listed, re.M)
+    return match.group(1) if match else None
 
 
 def signin_record(binary):
@@ -763,10 +784,12 @@ def build_signin():
     info, sources = signin_sources()
     binary = SIGNIN_APP / "Contents/MacOS" / SIGNIN_NAME
     built = STATE / "signin-build.json"
+    signer = signing_identity()  # A new or expired certificate means a re-sign.
 
     def current():
         record = read_json(built, {})
         return (isinstance(record, dict) and record.get("source") == info["SEASnetSource"]
+                and record.get("signer") == signer
                 and record.get("binary") is not None and record["binary"] == signin_record(binary))
 
     if current():
@@ -780,7 +803,8 @@ def build_signin():
         work = Path(tempfile.mkdtemp(prefix=".build-", dir=SIGNIN_APP.parent))
         try:
             bundle = compile_signin(info, sources, work)
-            record = {"source": info["SEASnetSource"], "binary": signin_record(bundle / "Contents/MacOS" / SIGNIN_NAME)}
+            record = {"source": info["SEASnetSource"], "signer": signer,
+                      "binary": signin_record(bundle / "Contents/MacOS" / SIGNIN_NAME)}
             if SIGNIN_APP.is_symlink() or SIGNIN_APP.exists():
                 SIGNIN_APP.rename(work / "old.app")
             bundle.rename(SIGNIN_APP)
