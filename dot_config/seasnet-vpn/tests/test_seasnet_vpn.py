@@ -519,7 +519,7 @@ sys.exit(1 if "code" in answer else 0)
         run.assert_not_called()
 
     def test_nothing_is_delivered_after_the_attempt_ended(self):
-        with patch.object(vpn, "callback_ok", side_effect=lambda c: (self.state / "login-attempt.json").unlink() or True):
+        with patch.object(vpn, "callback_ok", side_effect=lambda c, g: (self.state / "login-attempt.json").unlink() or True):
             code, run = self.signin(["approve"], [self.CHALLENGE, {"callback": self.CALLBACK}])
         self.assertEqual((code, self.received), (1, []))
         run.assert_not_called()
@@ -699,11 +699,40 @@ sys.exit(1 if "code" in answer else 0)
         self.assertTrue(runs[0].strip())
         self.assertEqual(runs[0], runs[1])
 
+    def test_numbered_gateways(self):
+        """UCLA spreads logins over v2, v5, v6 …; each attempt keeps to its own."""
+        login = "https://{}/+CSCOE+/saml/sp/login?tgname=x&acsamlcap=v2"
+        for host in ("v2.ssl.vpn.ucla.edu", "v5.ssl.vpn.ucla.edu", "v6.ssl.vpn.ucla.edu", "v1.ssl.vpn.ucla.edu", "v99.ssl.vpn.ucla.edu"):
+            self.assertTrue(vpn.login_url_ok(login.format(host)), host)
+        for host in ("v0.ssl.vpn.ucla.edu", "v100.ssl.vpn.ucla.edu", "vx.ssl.vpn.ucla.edu", "v06.ssl.vpn.ucla.edu", "v.ssl.vpn.ucla.edu",
+                     "v6.ssl.vpn.ucla.edu.evil.com", "v6.ds.ssl.vpn.ucla.edu", "x.v6.ssl.vpn.ucla.edu", "v6.ssl.vpn.ucla.edu.",
+                     "ssl.vpn.ucla.edu", "v6-ssl.vpn.ucla.edu", "v6.ssl.vpn.ucla.edu:444", "a@v6.ssl.vpn.ucla.edu"):
+            self.assertFalse(vpn.login_url_ok(login.format(host)), host)
+        token = "QUFB" * 8
+        for back, gateway, ok in (("v6.ssl.vpn.ucla.edu", "v6.ssl.vpn.ucla.edu", True), ("ssl.vpn.ucla.edu", "v6.ssl.vpn.ucla.edu", True),
+                                  ("v5.ssl.vpn.ucla.edu", "v6.ssl.vpn.ucla.edu", False), ("v2.ssl.vpn.ucla.edu", "v6.ssl.vpn.ucla.edu", False),
+                                  ("v6.ds.ssl.vpn.ucla.edu", "v6.ssl.vpn.ucla.edu", False),
+                                  ("v6.ssl.vpn.ucla.edu", "v6.ds.ssl.vpn.ucla.edu", False), ("v6.ssl.vpn.ucla.edu", None, False),
+                                  ("ssl.vpn.ucla.edu", "ssl.vpn.ucla.edu", False)):
+            with self.subTest(back=back, gateway=gateway):
+                self.assertEqual(vpn.callback_ok(f"/api/sso/{token}?return=https%3A%2F%2F{back}%2Fx", gateway), ok)
+        # End to end on v6: its own return page is delivered; another gateway's is not.
+        v6 = login.format("v6.ssl.vpn.ucla.edu")
+        good = f"/api/sso/{token}?return=https%3A%2F%2Fv6.ssl.vpn.ucla.edu%2F%2BCSCOE%2B%2Fsaml_ac_login.html"
+        code, _ = self.signin(["approve"], [self.CHALLENGE, {"callback": good}], url=v6)
+        self.assertEqual((code, len(self.received)), (0, 1))
+        self.assertEqual(json.loads(self.calls[1][1])["url"], v6)
+        code, run = self.signin(["approve"], [self.CHALLENGE, {"callback": good.replace("v6.", "v5.")}], url=v6)
+        self.assertEqual((code, self.received), (0, []))
+        run.assert_not_called()
+        self.assertEqual(self.told_web[0]["url"], v6)  # Our window takes over, on the same gateway.
+        self.assertIn("recognize", self.told_web[0]["reason"])
+
     def test_callback_validation(self):
-        self.assertTrue(vpn.callback_ok(self.CALLBACK))
+        self.assertTrue(vpn.callback_ok(self.CALLBACK, "v2.ssl.vpn.ucla.edu"))
         for host in ("ssl.vpn.ucla.edu", "v2.ssl.vpn.ucla.edu:443", "v2.ssl.vpn.ucla.edu:"):
-            self.assertTrue(vpn.callback_ok("/api/sso/" + "QUFB" * 8 + f"?return=https://{host}/x?y=z"))
-        self.assertTrue(vpn.callback_ok("/api/sso/" + "QUFB" * 8 + "?return=https://v2.ssl.vpn.ucla.edu/+CSCOE+/x.html"))
+            self.assertTrue(vpn.callback_ok("/api/sso/" + "QUFB" * 8 + f"?return=https://{host}/x?y=z", "v2.ssl.vpn.ucla.edu"))
+        self.assertTrue(vpn.callback_ok("/api/sso/" + "QUFB" * 8 + "?return=https://v2.ssl.vpn.ucla.edu/+CSCOE+/x.html", "v2.ssl.vpn.ucla.edu"))
         token, page = "QUFB" * 8, "https%3A%2F%2Fv2.ssl.vpn.ucla.edu%2Fx"
         for bad in (None, 5, "", "/api/sso/", f"/api/sso/{token}", f"/api/sso/?return={page}", f"/other/{token}?return={page}",
                     f"http://localhost:29786/api/sso/{token}?return={page}", f"/api/sso/{token}?return=",
@@ -723,7 +752,7 @@ sys.exit(1 if "code" in answer else 0)
                     f"/api/sso/{token}\n?return={page}", f"/api/sso/{token}?return={page}\n", f"/api/sso/{token}?return=javascript:1",
                     f"/api/sso/{token}/../x?return={page}", f"/api/sso/{token * 200}?return={page}", f"/api/sso/{token}?return=%ff"):
             with self.subTest(bad=bad):
-                self.assertFalse(vpn.callback_ok(bad))
+                self.assertFalse(vpn.callback_ok(bad, "v2.ssl.vpn.ucla.edu"))
         for bad in ("/api/sso/x", {"a": 1}, None):
             code, run = self.signin(["approve"], [self.CHALLENGE, {"callback": bad}])
             self.assertEqual((code, self.received), (0, []))

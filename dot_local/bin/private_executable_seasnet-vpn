@@ -53,7 +53,10 @@ OCPROXY = "/opt/homebrew/bin/ocproxy"
 OPEN = "/usr/bin/open"
 BROWSER = "app.zen-browser.zen"  # Only when our own window cannot run.
 VLT = str(HOME / ".local/bin/vlt")
-LOGIN_HOST, LOGIN_PATH = "v2.ssl.vpn.ucla.edu", "/+CSCOE+/saml/sp/login"
+# UCLA spreads VPN logins over numbered gateways (v2, v5, v6 … seen): an attempt's
+# gateway is the host of its own login URL.
+GATEWAY, LOGIN_PATH = re.compile(r"v[1-9][0-9]?\.ssl\.vpn\.ucla\.edu"), "/+CSCOE+/saml/sp/login"
+RETURN_HOST = "ssl.vpn.ucla.edu"  # The closing page may also be on the common host.
 CALLBACK_PORT = 29786  # openconnect's external-browser listener, on ::1 only.
 SIGNIN_SOURCE = HOME / ".config/seasnet-vpn/signin"
 SIGNIN_APP = HOME / ".local/share/seasnet-vpn/UCLA VPN Sign-In.app"
@@ -1051,12 +1054,13 @@ def vpn_challenge(window):
 # vlt's own rule (src/vpn/policy.ts), so neither side accepts what the other refuses.
 CALLBACK = re.compile(r"/api/sso/((?:[A-Za-z0-9+/=]|%[0-9A-Fa-f]{2})+)"
                       r"\?return=((?:[A-Za-z0-9._~:/?=+,;@!*()-]|%[0-9A-Fa-f]{2}){1,1024})")
-RETURN_HOSTS = ("v2.ssl.vpn.ucla.edu", "ssl.vpn.ucla.edu")
 
 
-def callback_ok(callback):
+def callback_ok(callback, gateway):
     """Exactly what openconnect accepts: /api/sso/<base64>?return=<closing page>, the
-    page being an https one on UCLA's two VPN hosts. It is never opened."""
+    page being an https one on this attempt's gateway or ssl.vpn.ucla.edu. It is never opened."""
+    if not isinstance(gateway, str) or not GATEWAY.fullmatch(gateway):
+        return False
     match = CALLBACK.fullmatch(callback) if isinstance(callback, str) and len(callback) <= 4000 else None
     if not match:
         return False
@@ -1065,7 +1069,7 @@ def callback_ok(callback):
         back = urlsplit(page)
         return (len(base64.b64decode(token, validate=True)) >= 16
                 and page.startswith("https://") and all(32 < ord(c) != 127 and c not in "\\#" for c in page)
-                and back.hostname in RETURN_HOSTS and "@" not in back.netloc
+                and back.hostname in (gateway, RETURN_HOST) and "@" not in back.netloc
                 and back.netloc.lower() in (back.hostname, f"{back.hostname}:", f"{back.hostname}:443"))
     except (ValueError, binascii.Error):
         return False
@@ -1252,7 +1256,7 @@ def approve_and_login(window, url):
         if "code" in result:
             show_problem(window, result)
             continue
-        if not callback_ok(result.get("callback")):
+        if not callback_ok(result.get("callback"), urlsplit(url).hostname):
             show_problem(window, {"code": "vpn_callback_unrecognized"})
             continue
         window.pump(timeout=0)  # A cancel that came with vlt's answer wins.
@@ -1383,7 +1387,7 @@ def login_url_ok(url):
     """Same gate as the windows' Contract.accepts: UCLA's VPN login and nothing else."""
     try:
         parsed = urlsplit(url)
-        return (parsed.scheme == "https" and parsed.hostname == LOGIN_HOST and parsed.path == LOGIN_PATH
+        return (parsed.scheme == "https" and GATEWAY.fullmatch(parsed.hostname or "") is not None and parsed.path == LOGIN_PATH
                 and parsed.username is None and parsed.password is None and parsed.port in (None, 443)
                 and len(url) < 8192 and all(32 < ord(c) < 127 for c in url))
     except ValueError:

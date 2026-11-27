@@ -5,15 +5,25 @@ import SwiftUI
 let windowTitle = "UCLA VPN Sign-In"
 
 enum Contract {
-    static let loginHost = "v2.ssl.vpn.ucla.edu"
+    /// UCLA spreads VPN logins over numbered gateways (v2, v5, v6 … seen).
+    static let gatewayPattern = #"^v[1-9][0-9]?\.ssl\.vpn\.ucla\.edu$"#
     static let loginPath = "/+CSCOE+/saml/sp/login"
+
+    static func isGateway(_ host: String) -> Bool {
+        host.range(of: gatewayPattern, options: .regularExpression) != nil
+    }
+
+    /// The attempt's gateway: the host of its login URL, if that URL is one.
+    static func gateway(of raw: String) -> String? {
+        accepts(raw) ? URLComponents(string: raw)?.host?.lowercased() : nil
+    }
 
     /// Same gate as seasnet-vpn's login_url_ok.
     static func accepts(_ raw: String) -> Bool {
         guard !raw.isEmpty, raw.count < 8192,
               raw.unicodeScalars.allSatisfy({ $0.value > 32 && $0.value < 127 }),
               let url = URLComponents(string: raw), url.scheme?.lowercased() == "https",
-              url.host?.lowercased() == loginHost, url.percentEncodedPath == loginPath,
+              isGateway(url.host?.lowercased() ?? ""), url.percentEncodedPath == loginPath,
               url.user == nil, url.password == nil, url.port == nil || url.port == 443 else { return false }
         return true
     }

@@ -24,6 +24,10 @@ import WebKit
 
 struct Policy {
     var callbackPort = 29786
+    /// This attempt's gateway, the host of its login URL. Its ACS, closing page and the
+    /// callback's return page must be on it, or on ssl.vpn.ucla.edu; other VPN hosts are
+    /// refused, so one attempt never wanders between gateways.
+    var gateway = ""
 
     enum Verdict: Equatable {
         case allow
@@ -42,6 +46,17 @@ struct Policy {
 
     static func isVPN(_ host: String) -> Bool { host == "vpn.ucla.edu" || host.hasSuffix(".vpn.ucla.edu") }
 
+    func ours(_ host: String) -> Bool { (!gateway.isEmpty && host == gateway) || host == "ssl.vpn.ucla.edu" }
+
+    /// The callback's return page, as openconnect will redirect to it.
+    func returnOK(_ url: URL) -> Bool {
+        guard let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
+              items.count == 1, items[0].name == "return", let raw = items[0].value,
+              raw.unicodeScalars.allSatisfy({ $0.value > 32 && $0.value != 127 && $0 != "\\" && $0 != "#" }),
+              raw.hasPrefix("https://"), let page = URL(string: raw), let host = page.host?.lowercased() else { return false }
+        return ours(host) && page.user == nil && page.password == nil && (page.port == nil || page.port == 443)
+    }
+
     #if TESTING
     /// A plain-http gateway on 127.0.0.1 that stands for the VPN server.
     var mockGateway: Int?
@@ -52,7 +67,7 @@ struct Policy {
         #if TESTING
         if let url, let mockGateway, url.host == "127.0.0.1", url.port == mockGateway,
            var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) {
-            (parts.scheme, parts.host, parts.port) = ("https", "v2.ssl.vpn.ucla.edu", nil)
+            (parts.scheme, parts.host, parts.port) = ("https", gateway, nil)
             return parts.url
         }
         #endif
@@ -68,14 +83,15 @@ struct Policy {
         guard url.user == nil, url.password == nil else { return .block(host) }
         if scheme == "http", host == "localhost", url.port == callbackPort {
             let token = url.path(percentEncoded: true).dropFirst("/api/sso/".count)
-            return method == "GET" && url.path.hasPrefix("/api/sso/") && !token.isEmpty && url.fragment == nil
+            return method == "GET" && url.path.hasPrefix("/api/sso/") && !token.isEmpty && url.fragment == nil && returnOK(url)
                 ? .callback : .block(host)
         }
         guard scheme == "https", url.port == nil || url.port == 443,
               Policy.isUCLA(host) || Policy.isDuo(host) else {
             return .block(host.isEmpty ? "A \(scheme): link" : host)
         }
-        if mainFrame, Policy.isVPN(host) {
+        if Policy.isVPN(host), !ours(host) { return .block(host) }
+        if mainFrame, ours(host) {
             let path = url.path
             if path == "/+CSCOE+/saml_ac_login.html" { return .finished }
             if path.hasPrefix("/+CSCOE+/saml/sp/acs") { return .handoff }
@@ -448,6 +464,8 @@ final class WebController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKU
 
     init(start: URL, policy: Policy = Policy(), store: WKWebsiteDataStore, interactive: Bool) {
         self.start = start
+        var policy = policy
+        if policy.gateway.isEmpty, let gateway = Contract.gateway(of: start.absoluteString) { policy.gateway = gateway }
         self.policy = policy
         self.interactive = interactive
         let config = WKWebViewConfiguration()

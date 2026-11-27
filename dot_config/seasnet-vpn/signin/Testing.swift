@@ -460,7 +460,7 @@ func gatewaySelfTest(_ check: @escaping (Bool, String) -> Void, callbackQuery: S
              _ answer: @escaping (String, String, String) -> String) -> Run {
         let callback = "http://localhost:\(listener.port)\(callbackQuery)"
         let gateway = MockGateway { answer($0, $1, callback) }
-        var policy = Policy(callbackPort: listener.port)
+        var policy = Policy(callbackPort: listener.port, gateway: "v2.ssl.vpn.ucla.edu")
         policy.mockGateway = gateway.port
         let controller = WebController(start: idp, policy: policy, store: .nonPersistent(), interactive: false)
         (controller.handoffPatience, controller.handoffLimit) = (patience, limit)
@@ -588,17 +588,17 @@ func gatewaySelfTest(_ check: @escaping (Bool, String) -> Void, callbackQuery: S
     for (name, script) in [("fetch", "fetch('CB').catch(()=>{})"), ("XHR", "x=new XMLHttpRequest();x.open('GET','CB');x.send()"),
                            ("img", "new Image().src='CB'"), ("beacon", "navigator.sendBeacon('CB')")] {
         let listener = FakeListener()
-        let controller = WebController(start: idp, policy: Policy(callbackPort: listener.port), store: .nonPersistent(), interactive: false)
+        let controller = WebController(start: idp, policy: Policy(callbackPort: listener.port, gateway: "v2.ssl.vpn.ucla.edu"), store: .nonPersistent(), interactive: false)
         var sawCallback = false
         controller.emitTrace = { if $0["verdict"] == "callback" { sawCallback = true } }
-        controller.web.loadHTMLString("x<script>\(script.replacingOccurrences(of: "CB", with: "http://localhost:\(listener.port)/api/sso/AAAA"))</script>", baseURL: idp)
+        controller.web.loadHTMLString("x<script>\(script.replacingOccurrences(of: "CB", with: "http://localhost:\(listener.port)/api/sso/AAAA?return=https://v2.ssl.vpn.ucla.edu/x"))</script>", baseURL: idp)
         spin(2) { !listener.seen.isEmpty }
         print("note \(name) to localhost from an https page: \(sawCallback ? "seen by the policy" : "not seen by the policy"), \(listener.seen.isEmpty ? "blocked by WebKit" : "reached the listener")")
     }
 }
 
 func webSelfTest(_ check: @escaping (Bool, String) -> Void) {
-    let policy = Policy()
+    let policy = Policy(gateway: "v2.ssl.vpn.ucla.edu")
     func verdict(_ raw: String, method: String = "GET", mainFrame: Bool = true) -> Policy.Verdict {
         policy.verdict(URL(string: raw), method: method, mainFrame: mainFrame)
     }
@@ -620,9 +620,42 @@ func webSelfTest(_ check: @escaping (Bool, String) -> Void) {
     check(verdict("https://v2.ssl.vpn.ucla.edu/+CSCOE+/saml_ac_login.html") == .finished, "Cisco page")
     check(verdict("https://shb.ais.ucla.edu/+CSCOE+/saml_ac_login.html") == .allow, "Cisco page only on the VPN host")
     check(verdict("https://v2.ssl.vpn.ucla.edu/+CSCOE+/saml/sp/acs?tgname=x", method: "POST") == .handoff, "hand-off")
+    // UCLA's numbered gateways: each attempt keeps to its own.
+    for raw in ["https://v2.ssl.vpn.ucla.edu/+CSCOE+/saml/sp/login?x=1", "https://v5.ssl.vpn.ucla.edu/+CSCOE+/saml/sp/login",
+                "https://v6.ssl.vpn.ucla.edu/+CSCOE+/saml/sp/login", "https://v99.ssl.vpn.ucla.edu/+CSCOE+/saml/sp/login",
+                "https://V6.SSL.VPN.UCLA.EDU/+CSCOE+/saml/sp/login"] {
+        check(Contract.accepts(raw) && Contract.gateway(of: raw) == URL(string: raw)!.host!.lowercased(), "accepts the gateway in \(raw)")
+    }
+    for host in ["v0.ssl.vpn.ucla.edu", "v100.ssl.vpn.ucla.edu", "vx.ssl.vpn.ucla.edu", "v06.ssl.vpn.ucla.edu", "v6.ssl.vpn.ucla.edu.evil.com",
+                 "v6.ds.ssl.vpn.ucla.edu", "x.v6.ssl.vpn.ucla.edu", "v6.ssl.vpn.ucla.edu.", "v6-ssl.vpn.ucla.edu", "ssl.vpn.ucla.edu"] {
+        check(!Contract.accepts("https://\(host)/+CSCOE+/saml/sp/login") && Contract.gateway(of: "https://\(host)/+CSCOE+/saml/sp/login") == nil,
+              "refuses the gateway \(host)")
+    }
+    let v6 = Policy(gateway: "v6.ssl.vpn.ucla.edu")
+    check(v6.verdict(URL(string: "https://v6.ssl.vpn.ucla.edu/+CSCOE+/saml/sp/acs?tgname=x"), method: "POST") == .handoff
+          && v6.verdict(URL(string: "https://v6.ssl.vpn.ucla.edu/+CSCOE+/saml_ac_login.html")) == .finished
+          && v6.verdict(URL(string: "https://ssl.vpn.ucla.edu/+CSCOE+/saml_ac_login.html")) == .finished, "v6: its own ACS and closing page")
+    for raw in ["https://v2.ssl.vpn.ucla.edu/+CSCOE+/saml/sp/acs?tgname=x", "https://v5.ssl.vpn.ucla.edu/+CSCOE+/saml_ac_login.html",
+                "https://v6.ds.ssl.vpn.ucla.edu/+CSCOE+/saml/sp/acs", "https://v5.ssl.vpn.ucla.edu/+webvpn+/index.html"] {
+        for main in [true, false] {
+            if case .block = v6.verdict(URL(string: raw), method: "POST", mainFrame: main) { check(true, "v6 refuses \(raw)") }
+            else { check(false, "v6 refuses \(raw)") }
+        }
+    }
+    let cb = "http://localhost:29786/api/sso/AAAA?return="
+    for (page, ok) in [("https%3A%2F%2Fv6.ssl.vpn.ucla.edu%2F%2BCSCOE%2B%2Fsaml_ac_login.html", true), ("https://ssl.vpn.ucla.edu/x", true),
+                       ("https://v6.ssl.vpn.ucla.edu:443/x", true), ("https%3A%2F%2Fv5.ssl.vpn.ucla.edu%2Fx", false), ("https://v2.ssl.vpn.ucla.edu/x", false),
+                       ("http://v6.ssl.vpn.ucla.edu/x", false), ("https://a@v6.ssl.vpn.ucla.edu/x", false), ("https://v6.ssl.vpn.ucla.edu:8443/x", false),
+                       ("https%3A%2F%2Fv6.ssl.vpn.ucla.edu%2Fx%23f", false), ("https://evil.com/", false), ("", false)] {
+        check((v6.verdict(URL(string: cb + page)) == .callback) == ok, "v6 callback returning to \(page): \(ok ? "taken" : "refused")")
+    }
+    check(v6.verdict(URL(string: "http://localhost:29786/api/sso/AAAA")) != .callback
+          && v6.verdict(URL(string: cb + "https://v6.ssl.vpn.ucla.edu/x&return=https://evil.com/")) != .callback, "a callback needs exactly one return page")
+    let derived = WebController(start: URL(string: "https://v5.ssl.vpn.ucla.edu/+CSCOE+/saml/sp/login?a=b")!, store: .nonPersistent(), interactive: false)
+    check(derived.policy.gateway == "v5.ssl.vpn.ucla.edu", "the window takes its gateway from the login URL")
     let base = URL(string: "https://shb.ais.ucla.edu/idp")!
     func make(_ listener: FakeListener) -> (WebController, () -> Int32?) {
-        let controller = WebController(start: base, policy: Policy(callbackPort: listener.port),
+        let controller = WebController(start: base, policy: Policy(callbackPort: listener.port, gateway: "v2.ssl.vpn.ucla.edu"),
                                           store: .nonPersistent(), interactive: false)
         var code: Int32?
         controller.finish = { code = $0 }
@@ -655,7 +688,7 @@ func webSelfTest(_ check: @escaping (Bool, String) -> Void) {
     // Nobody listening: the window comes back instead of vanishing.
     let gone = FakeListener(answer: false)
     let (late, lateCode) = make(gone)
-    late.web.loadHTMLString(page("location.href='http://localhost:\(gone.port)/api/sso/AAAA'"), baseURL: base)
+    late.web.loadHTMLString(page("location.href='http://localhost:\(gone.port)/api/sso/AAAA?return=https://v2.ssl.vpn.ucla.edu/x'"), baseURL: base)
     spin(12) { late.events.contains("reappear") }
     check(late.model.phase == .ended && lateCode() == nil && !late.hidden, "refused hand-off reappears as cancelled")
 
@@ -687,7 +720,7 @@ func webSelfTest(_ check: @escaping (Bool, String) -> Void) {
     let (unsure, unsureCode) = make(mute)
     var asked = 0
     unsure.unknown = { asked += 1 }
-    unsure.web.loadHTMLString(page("location.href='http://localhost:\(mute.port)/api/sso/AAAA'"), baseURL: base)
+    unsure.web.loadHTMLString(page("location.href='http://localhost:\(mute.port)/api/sso/AAAA?return=https://v2.ssl.vpn.ucla.edu/x'"), baseURL: base)
     spin(12) { asked > 0 }
     spin(0.5)
     check(asked == 1 && unsure.hidden && unsureCode() == nil && !unsure.events.contains("reappear") && mute.seen.count == 1, "an unanswered GET is reported as unknown")
